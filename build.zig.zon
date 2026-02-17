@@ -1,0 +1,17 @@
+.{
+    .name = .mlx_serve,
+    .version = "0.1.0",
+    .fingerprint = 0x4f7c897092edeafd,
+    .minimum_zig_version = "0.15.2",
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+    .dependencies = .{
+        .vibe_jinja = .{
+            .url = "https://github.com/gremlin-labs/vibe-jinja/archive/refs/heads/main.tar.gz",
+            .hash = "vibe_jinja-1.1.0-2xE3_tpsEwCrdKz6UIafOulHQS_UKWhJ-rmxhtaaRT35",
+        },
+    },
+}
