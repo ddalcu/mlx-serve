@@ -32,6 +32,6 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.version.outputs.tag }}
-          name: mlxint ${{ steps.version.outputs.tag }}
+          name: mlx-serve ${{ steps.version.outputs.tag }}
           generate_release_notes: true
-          files: zig-out/bin/mlxint
+          files: zig-out/bin/mlx-serve
