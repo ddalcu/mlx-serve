@@ -38,10 +38,28 @@ pub const ModelConfig = struct {
     // Architectural differences between model families
     tie_word_embeddings: bool = false,
     hidden_act: HiddenAct = .gelu_approx,
-    norm_has_offset: bool = true, // Gemma: (1+weight)*rms_norm(x), Llama-family: weight*rms_norm(x)
-    scale_embeddings: bool = true, // Gemma: multiply by sqrt(hidden_size)
-    has_pre_ff_norm: bool = true, // Gemma has 4 norms per layer, Llama-family has 2
+    norm_has_offset: bool = true,
+    scale_embeddings: bool = true,
+    has_pre_ff_norm: bool = true,
     has_qk_norm: bool = true,
+
+    // MoE
+    num_experts: u32 = 0,
+    num_experts_per_tok: u32 = 0,
+    moe_intermediate_size: u32 = 0,
+    shared_expert_intermediate_size: u32 = 0,
+
+    // Linear attention (GatedDeltaNet)
+    linear_num_key_heads: u32 = 0,
+    linear_num_value_heads: u32 = 0,
+    linear_key_head_dim: u32 = 128,
+    linear_value_head_dim: u32 = 128,
+    linear_conv_kernel_dim: u32 = 4,
+
+    // Hybrid attention
+    full_attention_interval: u32 = 0,
+    partial_rotary_factor: f32 = 1.0,
+    attn_output_gate: bool = false,
 
     // Stop tokens (populated from config.json)
     eos_token_ids: [8]u32 = .{0} ** 8,
@@ -50,6 +68,15 @@ pub const ModelConfig = struct {
     pub fn isGlobalLayer(self: ModelConfig, layer_idx: u32) bool {
         if (!self.has_sliding_window) return true;
         return (layer_idx % self.sliding_window_pattern) == 0;
+    }
+
+    pub fn isLinearLayer(self: ModelConfig, layer_idx: u32) bool {
+        if (self.full_attention_interval == 0) return false;
+        return ((layer_idx + 1) % self.full_attention_interval) != 0;
+    }
+
+    pub fn isMoe(self: *const ModelConfig) bool {
+        return self.num_experts > 0;
     }
 
     pub fn addEosToken(self: *ModelConfig, id: u32) void {
@@ -104,6 +131,33 @@ pub fn parseConfig(allocator: std.mem.Allocator, model_dir: []const u8) !ModelCo
     if (cfg_obj.get("rms_norm_eps")) |v| config.rms_norm_eps = jsonFloat(v);
     if (cfg_obj.get("rope_theta")) |v| config.rope_theta = jsonFloat(v);
     if (cfg_obj.get("query_pre_attn_scalar")) |v| config.query_pre_attn_scalar = @intCast(v.integer);
+
+    // MoE fields
+    if (cfg_obj.get("num_experts")) |v| config.num_experts = @intCast(v.integer);
+    if (cfg_obj.get("num_experts_per_tok")) |v| config.num_experts_per_tok = @intCast(v.integer);
+    if (cfg_obj.get("moe_intermediate_size")) |v| config.moe_intermediate_size = @intCast(v.integer);
+    if (cfg_obj.get("shared_expert_intermediate_size")) |v| config.shared_expert_intermediate_size = @intCast(v.integer);
+
+    // Linear attention (GatedDeltaNet) fields
+    if (cfg_obj.get("linear_num_key_heads")) |v| config.linear_num_key_heads = @intCast(v.integer);
+    if (cfg_obj.get("linear_num_value_heads")) |v| config.linear_num_value_heads = @intCast(v.integer);
+    if (cfg_obj.get("linear_key_head_dim")) |v| config.linear_key_head_dim = @intCast(v.integer);
+    if (cfg_obj.get("linear_value_head_dim")) |v| config.linear_value_head_dim = @intCast(v.integer);
+    if (cfg_obj.get("linear_conv_kernel_dim")) |v| config.linear_conv_kernel_dim = @intCast(v.integer);
+
+    // Hybrid attention
+    if (cfg_obj.get("full_attention_interval")) |v| config.full_attention_interval = @intCast(v.integer);
+    if (cfg_obj.get("attn_output_gate")) |v| {
+        if (v == .bool) config.attn_output_gate = v.bool;
+    }
+
+    // Rope parameters (nested for Qwen3.5)
+    if (cfg_obj.get("rope_parameters")) |rp_val| {
+        if (rp_val == .object) {
+            if (rp_val.object.get("rope_theta")) |v| config.rope_theta = jsonFloat(v);
+            if (rp_val.object.get("partial_rotary_factor")) |v| config.partial_rotary_factor = jsonFloat(v);
+        }
+    }
 
     // Sliding window
     if (cfg_obj.get("sliding_window")) |v| {
@@ -180,9 +234,42 @@ pub fn parseConfig(allocator: std.mem.Allocator, model_dir: []const u8) !ModelCo
             config.addEosToken(1); // EOS
             config.addEosToken(106); // END_OF_TURN
         }
+    } else if (std.mem.eql(u8, model_type, "qwen3_5_moe") or
+        std.mem.eql(u8, model_type, "qwen3_5") or
+        std.mem.eql(u8, model_type, "qwen3_5_moe_text"))
+    {
+        config.model_type = "qwen3_5_moe";
+        config.weight_prefix = "language_model.model";
+        config.norm_has_offset = false;
+        config.scale_embeddings = false;
+        config.has_pre_ff_norm = false;
+        config.has_qk_norm = true;
+        config.hidden_act = .silu;
+        config.has_sliding_window = false;
+        config.attn_output_gate = true;
+        config.rope_scaling_factor = 1.0;
+        config.rope_local_base_freq = config.rope_theta;
+        if (cfg_obj.get("query_pre_attn_scalar") == null) {
+            config.query_pre_attn_scalar = config.head_dim;
+        }
+    } else if (std.mem.eql(u8, model_type, "qwen3_next")) {
+        config.model_type = "qwen3_next";
+        config.weight_prefix = "model";
+        config.norm_has_offset = false;
+        config.scale_embeddings = false;
+        config.has_pre_ff_norm = false;
+        config.has_qk_norm = true;
+        config.hidden_act = .silu;
+        config.has_sliding_window = false;
+        config.attn_output_gate = true;
+        config.rope_scaling_factor = 1.0;
+        config.rope_local_base_freq = config.rope_theta;
+        if (cfg_obj.get("partial_rotary_factor")) |v| config.partial_rotary_factor = jsonFloat(v);
+        if (cfg_obj.get("query_pre_attn_scalar") == null) {
+            config.query_pre_attn_scalar = config.head_dim;
+        }
     } else {
         // Llama-family defaults (qwen3, llama, mistral, etc.)
-        // Use string literals to avoid use-after-free (model_type points into parsed JSON)
         if (std.mem.eql(u8, model_type, "qwen3")) {
             config.model_type = "qwen3";
         } else if (std.mem.eql(u8, model_type, "llama")) {
@@ -198,9 +285,8 @@ pub fn parseConfig(allocator: std.mem.Allocator, model_dir: []const u8) !ModelCo
         config.has_pre_ff_norm = false;
         config.has_qk_norm = false;
         config.rope_scaling_factor = 1.0;
-        config.rope_local_base_freq = config.rope_theta; // no dual RoPE
+        config.rope_local_base_freq = config.rope_theta;
 
-        // hidden_act
         if (cfg_obj.get("hidden_act")) |v| {
             if (v == .string) {
                 if (std.mem.eql(u8, v.string, "silu")) {
@@ -211,12 +297,10 @@ pub fn parseConfig(allocator: std.mem.Allocator, model_dir: []const u8) !ModelCo
             }
         }
 
-        // query_pre_attn_scalar defaults to head_dim for non-Gemma
         if (cfg_obj.get("query_pre_attn_scalar") == null) {
             config.query_pre_attn_scalar = config.head_dim;
         }
 
-        // Qwen3 has Q/K norms
         if (std.mem.eql(u8, model_type, "qwen3")) {
             config.has_qk_norm = true;
         }

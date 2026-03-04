@@ -104,7 +104,7 @@ pub fn main() !void {
             .{ .role = "user", .content = user_prompt },
         };
 
-        const prompt_ids = try chat_mod.formatChat(allocator, &tok, &messages, &chat_config);
+        const prompt_ids = try chat_mod.formatChat(allocator, &tok, &messages, &chat_config, null);
         defer allocator.free(prompt_ids);
 
         // Reset peak memory before generation

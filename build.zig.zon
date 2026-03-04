@@ -8,10 +8,5 @@
         "build.zig.zon",
         "src",
     },
-    .dependencies = .{
-        .vibe_jinja = .{
-            .url = "https://github.com/gremlin-labs/vibe-jinja/archive/refs/heads/main.tar.gz",
-            .hash = "vibe_jinja-1.1.0-2xE3_tpsEwCrdKz6UIafOulHQS_UKWhJ-rmxhtaaRT35",
-        },
-    },
+    .dependencies = .{},
 }

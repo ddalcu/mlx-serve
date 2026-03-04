@@ -190,8 +190,21 @@ pub extern "c" fn mlx_less_equal(res: *mlx_array, a: mlx_array, b: mlx_array, s:
 // Quantized matmul
 pub extern "c" fn mlx_quantized_matmul(res: *mlx_array, x: mlx_array, w: mlx_array, scales: mlx_array, biases: mlx_array, transpose_w: bool, group_size: mlx_optional_int, bits: mlx_optional_int, mode: [*:0]const u8, s: mlx_stream) c_int;
 
+// Gathered quantized matmul (for MoE expert dispatch)
+pub extern "c" fn mlx_gather_qmm(res: *mlx_array, x: mlx_array, w: mlx_array, scales: mlx_array, biases: mlx_array, lhs_indices: mlx_array, rhs_indices: mlx_array, transpose_w: bool, group_size: mlx_optional_int, bits: mlx_optional_int, mode: [*:0]const u8, sorted_indices: bool, s: mlx_stream) c_int;
+
 // Dequantize (fallback)
 pub extern "c" fn mlx_dequantize(res: *mlx_array, w: mlx_array, scales: mlx_array, biases: mlx_array, group_size: mlx_optional_int, bits: mlx_optional_int, mode: [*:0]const u8, dtype: mlx_optional_dtype, s: mlx_stream) c_int;
+
+// Additional ops for MoE / GatedDeltaNet
+pub extern "c" fn mlx_sigmoid(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_sum_axis(res: *mlx_array, a: mlx_array, axis: c_int, keepdims: bool, s: mlx_stream) c_int;
+pub extern "c" fn mlx_conv1d(res: *mlx_array, input: mlx_array, weight: mlx_array, stride: c_int, padding: c_int, dilation: c_int, groups: c_int, s: mlx_stream) c_int;
+pub extern "c" fn mlx_argpartition_axis(res: *mlx_array, a: mlx_array, kth: c_int, axis: c_int, s: mlx_stream) c_int;
+pub extern "c" fn mlx_take_along_axis(res: *mlx_array, a: mlx_array, indices: mlx_array, axis: c_int, s: mlx_stream) c_int;
+pub extern "c" fn mlx_repeat_axis(res: *mlx_array, arr: mlx_array, repeats: c_int, axis: c_int, s: mlx_stream) c_int;
+pub extern "c" fn mlx_log1p(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_stack_axis(res: *mlx_array, arrays: mlx_vector_array, axis: c_int, s: mlx_stream) c_int;
 
 pub const mlx_optional_dtype = extern struct {
     value: mlx_dtype = .float32,

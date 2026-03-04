@@ -39,7 +39,7 @@ huggingface-cli download mlx-community/gemma-3-12b-it-qat-4bit --local-dir /path
 **Qwen3-4B (4-bit, ~2 GB):**
 
 ```bash
-huggingface-cli download lmstudio-community/Qwen3-4B-Instruct-2507-MLX-4bit --local-dir /path/to/qwen3-4b
+huggingface-cli download mlx-community/Qwen3.5-35B-A3B-4bit --local-dir ./models/Qwen3.5-35B-A3B-4bit
 ```
 
 ## Build

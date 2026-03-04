@@ -5,10 +5,12 @@ const tokenizer_mod = @import("tokenizer.zig");
 const generate_mod = @import("generate.zig");
 const chat_mod = @import("chat.zig");
 const model_mod = @import("model.zig");
+const status_mod = @import("status.zig");
 
 const Transformer = transformer_mod.Transformer;
 const Tokenizer = tokenizer_mod.Tokenizer;
 const Generator = generate_mod.Generator;
+const StatusBar = status_mod.StatusBar;
 
 /// Start the HTTP server on the given port.
 pub fn serve(
@@ -28,10 +30,13 @@ pub fn serve(
     std.debug.print("  POST /v1/chat/completions  (stream=true)\n", .{});
     std.debug.print("  GET  /v1/models\n\n", .{});
 
+    var status = StatusBar.init();
+    defer status.deinit();
+
     while (true) {
         const conn = try server.accept();
         defer conn.stream.close();
-        handleConnection(allocator, conn.stream, xfm, tok, chat_config, config) catch |err| {
+        handleConnection(allocator, conn.stream, xfm, tok, chat_config, config, status) catch |err| {
             switch (err) {
                 error.BrokenPipe, error.ConnectionResetByPeer => {
                     std.debug.print("  -> client disconnected\n", .{});
@@ -41,6 +46,7 @@ pub fn serve(
                 },
             }
         };
+        status.update(.idle, null);
     }
 }
 
@@ -51,6 +57,7 @@ fn handleConnection(
     tok: *const Tokenizer,
     chat_config: *const chat_mod.ChatConfig,
     config: *const model_mod.ModelConfig,
+    status: StatusBar,
 ) !void {
     // Read the full HTTP request
     var buf: [65536]u8 = undefined;
@@ -87,7 +94,7 @@ fn handleConnection(
     } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/chat/completions")) {
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
         const body = request[header_end + 4 .. total_read];
-        try handleChatCompletions(allocator, stream, body, xfm, tok, chat_config, config);
+        try handleChatCompletions(allocator, stream, body, xfm, tok, chat_config, config, status);
     } else if (std.mem.eql(u8, method, "OPTIONS")) {
         std.debug.print("OPTIONS {s} -> 204\n", .{path});
         try sendResponse(stream, "204 No Content", "text/plain", "");
@@ -113,8 +120,8 @@ fn handleChatCompletions(
     tok: *const Tokenizer,
     chat_config: *const chat_mod.ChatConfig,
     config: *const model_mod.ModelConfig,
+    status: StatusBar,
 ) !void {
-    // Parse JSON body
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch {
         std.debug.print("POST /v1/chat/completions -> 400 (invalid JSON)\n", .{});
         try sendResponse(stream, "400 Bad Request", "application/json", "{\"error\":\"invalid JSON\"}");
@@ -124,22 +131,32 @@ fn handleChatCompletions(
 
     const root = parsed.value.object;
 
-    // Extract messages
     const messages_val = root.get("messages") orelse {
         std.debug.print("POST /v1/chat/completions -> 400 (missing messages)\n", .{});
         try sendResponse(stream, "400 Bad Request", "application/json", "{\"error\":\"missing messages\"}");
         return;
     };
 
+    // Extract tools array from request (passed as structured data to chat template)
+    const tools_val: ?std.json.Value = if (root.get("tools")) |tv|
+        (if (tv == .array) tv else null)
+    else
+        null;
+
+    // Parse messages with tool call support
     var messages = std.ArrayList(chat_mod.Message).empty;
     defer messages.deinit(allocator);
+    var tool_calls_storage = std.ArrayList(chat_mod.ToolCall).empty;
+    defer tool_calls_storage.deinit(allocator);
 
     for (messages_val.array.items) |msg_val| {
+        if (msg_val != .object) continue;
         const obj = msg_val.object;
         const role_val = obj.get("role") orelse continue;
-        const content_val = obj.get("content") orelse continue;
+        if (role_val != .string) continue;
 
-        const content = switch (content_val) {
+        // Content can be string, array, or null
+        const content: ?[]const u8 = if (obj.get("content")) |cv| switch (cv) {
             .string => |s| s,
             .array => |arr| blk: {
                 for (arr.items) |part| {
@@ -149,15 +166,41 @@ fn handleChatCompletions(
                     const text = part.object.get("text") orelse continue;
                     if (text == .string) break :blk text.string;
                 }
-                continue;
+                break :blk null;
             },
-            else => continue,
-        };
+            else => null,
+        } else null;
 
-        if (role_val != .string) continue;
+        // Parse tool_calls from assistant messages
+        var msg_tool_calls: ?[]const chat_mod.ToolCall = null;
+        if (obj.get("tool_calls")) |tc_val| {
+            if (tc_val == .array) {
+                const tc_start = tool_calls_storage.items.len;
+                for (tc_val.array.items) |tc| {
+                    if (tc != .object) continue;
+                    const fn_val = tc.object.get("function") orelse continue;
+                    if (fn_val != .object) continue;
+                    const fn_name = (fn_val.object.get("name") orelse continue);
+                    if (fn_name != .string) continue;
+                    const fn_args = fn_val.object.get("arguments") orelse continue;
+                    if (fn_args != .string) continue;
+                    try tool_calls_storage.append(allocator, .{
+                        .name = fn_name.string,
+                        .arguments = fn_args.string,
+                    });
+                }
+                if (tool_calls_storage.items.len > tc_start)
+                    msg_tool_calls = tool_calls_storage.items[tc_start..];
+            }
+        }
+
+        if (content == null and msg_tool_calls == null) continue;
+
         try messages.append(allocator, .{
             .role = role_val.string,
             .content = content,
+            .tool_calls = msg_tool_calls,
+            .tool_call_id = if (obj.get("tool_call_id")) |v| (if (v == .string) v.string else null) else null,
         });
     }
 
@@ -170,10 +213,10 @@ fn handleChatCompletions(
     const max_tokens: u32 = if (root.get("max_tokens")) |v|
         switch (v) {
             .integer => |i| @intCast(i),
-            else => 256,
+            else => 4096,
         }
     else
-        256;
+        4096;
 
     const is_stream = if (root.get("stream")) |v| v == .bool and v.bool else false;
 
@@ -183,28 +226,29 @@ fn handleChatCompletions(
         else => 1.0,
     } else 1.0;
 
-    // Log the request
     const last_msg = messages.items[messages.items.len - 1];
-    const preview_len = @min(last_msg.content.len, 80);
-    std.debug.print("POST /v1/chat/completions ({d} msgs, max_tokens={d}, temp={d:.2}, stream={}) \n", .{ messages.items.len, max_tokens, temperature, is_stream });
-    std.debug.print("  > \"{s}{s}\"\n", .{ last_msg.content[0..preview_len], if (last_msg.content.len > 80) "..." else "" });
+    const last_content = last_msg.content orelse "(tool_calls)";
+    const preview_len = @min(last_content.len, 80);
+    std.debug.print("POST /v1/chat/completions ({d} msgs, max_tokens={d}, temp={d:.2}, stream={})", .{ messages.items.len, max_tokens, temperature, is_stream });
+    if (tools_val) |tv| std.debug.print(", tools={d}", .{tv.array.items.len});
+    std.debug.print("\n  > \"{s}{s}\"\n", .{ last_content[0..preview_len], if (last_content.len > 80) "..." else "" });
 
-    // Format chat template
-    const prompt_ids = try chat_mod.formatChat(allocator, tok, messages.items, chat_config);
+    const prompt_ids = try chat_mod.formatChat(allocator, tok, messages.items, chat_config, tools_val);
     defer allocator.free(prompt_ids);
 
-    // Reset KV cache for new request
-    xfm.cache.deinit();
-    xfm.cache = try transformer_mod.KVCache.init(allocator, xfm.config.num_hidden_layers);
+    try xfm.resetCache();
 
     const eos_slice = config.eosTokenSlice();
+    const has_tools = tools_val != null;
+    const thinking = chat_config.chat_template.len > 0 and
+        std.mem.indexOf(u8, chat_config.chat_template, "enable_thinking") != null;
 
     if (is_stream) {
-        handleStreamingGeneration(allocator, stream, xfm, tok, prompt_ids, max_tokens, temperature, eos_slice) catch |err| {
+        handleStreamingGeneration(allocator, stream, xfm, tok, prompt_ids, max_tokens, temperature, eos_slice, has_tools, thinking, status) catch |err| {
             std.debug.print("  -> streaming error: {}\n", .{err});
         };
     } else {
-        handleNonStreamingGeneration(allocator, stream, xfm, tok, prompt_ids, max_tokens, temperature, eos_slice) catch |err| {
+        handleNonStreamingGeneration(allocator, stream, xfm, tok, prompt_ids, max_tokens, temperature, eos_slice, has_tools, thinking, status) catch |err| {
             std.debug.print("  -> 500 ({s})\n", .{@errorName(err)});
             const err_body = std.fmt.allocPrint(allocator, "{{\"error\":\"{s}\"}}", .{@errorName(err)}) catch return;
             defer allocator.free(err_body);
@@ -222,10 +266,15 @@ fn handleNonStreamingGeneration(
     max_tokens: u32,
     temperature: f32,
     eos_token_ids: []const u32,
+    has_tools: bool,
+    thinking: bool,
+    status: StatusBar,
 ) !void {
+    status.update(.prefill, null);
     var timer = try std.time.Timer.start();
 
     const result = try generate_mod.generate(allocator, xfm, tok, prompt_ids, max_tokens, temperature, eos_token_ids);
+    status.update(.idle, null);
     defer allocator.free(result.text);
     defer allocator.free(result.token_ids);
 
@@ -235,14 +284,53 @@ fn handleNonStreamingGeneration(
         result.prompt_tokens, result.completion_tokens, elapsed_ms, tps, result.finish_reason,
     });
 
-    const escaped_text = jsonEscape(allocator, result.text) catch "\"\"";
+    const split = chat_mod.splitThinkBlock(result.text, thinking);
+    const clean_text = split.content;
+
+    // Parse tool calls from output if tools were provided
+    if (has_tools) {
+        var parsed_resp = try chat_mod.parseToolCalls(allocator, clean_text);
+        defer parsed_resp.deinit();
+
+        std.debug.print("\n── TOOL CALL PARSE ──\n  content: {s}\n  tool_calls: {d}\n", .{
+            if (parsed_resp.content) |c| c else "(null)",
+            if (parsed_resp.tool_calls) |tcs| tcs.len else 0,
+        });
+        if (parsed_resp.tool_calls) |tcs| {
+            for (tcs, 0..) |tc, i| {
+                std.debug.print("  [{d}] name={s} arguments={s}\n", .{ i, tc.name, tc.arguments });
+            }
+
+            const response = try buildToolCallResponse(allocator, tcs, parsed_resp.content, result, result.finish_reason);
+            defer allocator.free(response);
+            std.debug.print("\n── RESPONSE JSON ──\n{s}\n", .{response});
+            try sendResponse(stream, "200 OK", "application/json", response);
+            return;
+        }
+    }
+
+    const escaped_text = jsonEscape(allocator, clean_text) catch "\"\"";
     defer if (!std.mem.eql(u8, escaped_text, "\"\"")) allocator.free(escaped_text);
 
+    // Build message with optional reasoning_content
+    var msg_buf = std.ArrayList(u8).empty;
+    defer msg_buf.deinit(allocator);
+    try msg_buf.appendSlice(allocator, "{\"role\":\"assistant\"");
+    if (split.reasoning_content) |rc| {
+        const escaped_rc = try jsonEscape(allocator, rc);
+        defer allocator.free(escaped_rc);
+        try msg_buf.appendSlice(allocator, ",\"reasoning_content\":");
+        try msg_buf.appendSlice(allocator, escaped_rc);
+    }
+    try msg_buf.appendSlice(allocator, ",\"content\":");
+    try msg_buf.appendSlice(allocator, escaped_text);
+    try msg_buf.appendSlice(allocator, "}");
+
     const response = try std.fmt.allocPrint(allocator,
-        \\{{"id":"chatcmpl-{d}","object":"chat.completion","choices":[{{"index":0,"message":{{"role":"assistant","content":{s}}},"finish_reason":"{s}"}}],"usage":{{"prompt_tokens":{d},"completion_tokens":{d},"total_tokens":{d}}}}}
+        \\{{"id":"chatcmpl-{d}","object":"chat.completion","choices":[{{"index":0,"message":{s},"finish_reason":"{s}"}}],"usage":{{"prompt_tokens":{d},"completion_tokens":{d},"total_tokens":{d}}}}}
     , .{
         std.time.milliTimestamp(),
-        escaped_text,
+        msg_buf.items,
         result.finish_reason,
         result.prompt_tokens,
         result.completion_tokens,
@@ -250,7 +338,69 @@ fn handleNonStreamingGeneration(
     });
     defer allocator.free(response);
 
+    std.debug.print("\n── RESPONSE JSON ──\n{s}\n", .{response});
     try sendResponse(stream, "200 OK", "application/json", response);
+}
+
+fn buildToolCallResponse(
+    allocator: std.mem.Allocator,
+    tool_calls: []const chat_mod.ParsedToolCall,
+    content: ?[]const u8,
+    result: generate_mod.GenerationResult,
+    finish_reason: []const u8,
+) ![]const u8 {
+    var resp = std.ArrayList(u8).empty;
+    errdefer resp.deinit(allocator);
+
+    var ts_buf: [32]u8 = undefined;
+    const ts = std.fmt.bufPrint(&ts_buf, "{d}", .{std.time.milliTimestamp()}) catch "0";
+
+    try resp.appendSlice(allocator, "{\"id\":\"chatcmpl-");
+    try resp.appendSlice(allocator, ts);
+    try resp.appendSlice(allocator, "\",\"object\":\"chat.completion\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\"");
+
+    // Content field
+    if (content) |c| {
+        const esc = try jsonEscape(allocator, c);
+        defer allocator.free(esc);
+        try resp.appendSlice(allocator, ",\"content\":");
+        try resp.appendSlice(allocator, esc);
+    } else {
+        try resp.appendSlice(allocator, ",\"content\":null");
+    }
+
+    // Tool calls array
+    try resp.appendSlice(allocator, ",\"tool_calls\":[");
+    for (tool_calls, 0..) |tc, i| {
+        if (i > 0) try resp.append(allocator, ',');
+        const escaped_args = try jsonEscape(allocator, tc.arguments);
+        defer allocator.free(escaped_args);
+        try resp.appendSlice(allocator, "{\"id\":\"call_");
+        try resp.appendSlice(allocator, ts);
+        var idx_buf: [8]u8 = undefined;
+        const idx_s = std.fmt.bufPrint(&idx_buf, "_{d}", .{i}) catch "_0";
+        try resp.appendSlice(allocator, idx_s);
+        try resp.appendSlice(allocator, "\",\"type\":\"function\",\"function\":{\"name\":\"");
+        try resp.appendSlice(allocator, tc.name);
+        try resp.appendSlice(allocator, "\",\"arguments\":");
+        try resp.appendSlice(allocator, escaped_args);
+        try resp.appendSlice(allocator, "}}");
+    }
+
+    _ = finish_reason;
+    try resp.appendSlice(allocator, "]},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":");
+    var num_buf: [16]u8 = undefined;
+    var s = std.fmt.bufPrint(&num_buf, "{d}", .{result.prompt_tokens}) catch "0";
+    try resp.appendSlice(allocator, s);
+    try resp.appendSlice(allocator, ",\"completion_tokens\":");
+    s = std.fmt.bufPrint(&num_buf, "{d}", .{result.completion_tokens}) catch "0";
+    try resp.appendSlice(allocator, s);
+    try resp.appendSlice(allocator, ",\"total_tokens\":");
+    s = std.fmt.bufPrint(&num_buf, "{d}", .{result.prompt_tokens + result.completion_tokens}) catch "0";
+    try resp.appendSlice(allocator, s);
+    try resp.appendSlice(allocator, "}}");
+
+    return resp.toOwnedSlice(allocator);
 }
 
 fn handleStreamingGeneration(
@@ -262,15 +412,14 @@ fn handleStreamingGeneration(
     max_tokens: u32,
     temperature: f32,
     eos_token_ids: []const u32,
+    has_tools: bool,
+    thinking: bool,
+    status: StatusBar,
 ) !void {
     const chat_id = std.time.milliTimestamp();
     var timer = try std.time.Timer.start();
 
-    // Prefill + init generator
-    var gen = try Generator.init(allocator, xfm, tok, prompt_ids, max_tokens, temperature, eos_token_ids);
-
-    // Send SSE headers (no Content-Length — we stream until done)
-    const header =
+    const sse_header =
         "HTTP/1.1 200 OK\r\n" ++
         "Content-Type: text/event-stream\r\n" ++
         "Cache-Control: no-cache\r\n" ++
@@ -279,30 +428,124 @@ fn handleStreamingGeneration(
         "Access-Control-Allow-Methods: POST, GET, OPTIONS\r\n" ++
         "Access-Control-Allow-Headers: Content-Type\r\n" ++
         "\r\n";
-    try stream.writeAll(header);
 
-    // First chunk: role announcement
+    status.update(.prefill, null);
+    var gen = try Generator.init(allocator, xfm, tok, prompt_ids, max_tokens, temperature, eos_token_ids);
+    status.update(.decode, null);
+
+    try stream.writeAll(sse_header);
     try sendSSEChunk(allocator, stream, chat_id, .{ .role = "assistant", .content = "" }, null);
 
-    // Generate tokens and stream each one
+    // Stream reasoning_content token-by-token for think blocks.
+    // After </think>, either stream content directly (!has_tools)
+    // or buffer it for tool call parsing (has_tools).
+    var think_buf = std.ArrayList(u8).empty;
+    defer think_buf.deinit(allocator);
+    var content_buf = std.ArrayList(u8).empty;
+    defer content_buf.deinit(allocator);
+    var inside_think = thinking;
+    var past_think = !thinking;
+
     while (try gen.next()) |token_id| {
-        // Decode single token to text
-        const strip = tok.tok_type == .sentencepiece_bpe;
-        const token_text = try tok.decode(allocator, &[_]u32{token_id}, strip and false);
+        const strip_bpe = tok.tok_type == .sentencepiece_bpe;
+        const token_text = try tok.decode(allocator, &[_]u32{token_id}, strip_bpe and false);
         defer allocator.free(token_text);
 
-        try sendSSEChunk(allocator, stream, chat_id, .{ .role = null, .content = token_text }, null);
+        if (past_think) {
+            if (has_tools) {
+                try content_buf.appendSlice(allocator, token_text);
+            } else {
+                try sendSSEChunk(allocator, stream, chat_id, .{ .role = null, .content = token_text }, null);
+            }
+            continue;
+        }
+
+        try think_buf.appendSlice(allocator, token_text);
+
+        if (inside_think) {
+            if (std.mem.indexOf(u8, think_buf.items, "</think>")) |end| {
+                if (end > 0) {
+                    try sendSSEChunk(allocator, stream, chat_id, .{ .role = null, .content = null, .reasoning_content = think_buf.items[0..end] }, null);
+                }
+                const after = std.mem.trimLeft(u8, think_buf.items[end + 8 ..], "\n ");
+                if (after.len > 0) {
+                    if (has_tools) {
+                        try content_buf.appendSlice(allocator, after);
+                    } else {
+                        try sendSSEChunk(allocator, stream, chat_id, .{ .role = null, .content = after }, null);
+                    }
+                }
+                past_think = true;
+            } else if (think_buf.items.len > 8) {
+                const safe_end = think_buf.items.len - 8;
+                try sendSSEChunk(allocator, stream, chat_id, .{ .role = null, .content = null, .reasoning_content = think_buf.items[0..safe_end] }, null);
+                std.mem.copyForwards(u8, think_buf.items[0..8], think_buf.items[safe_end..]);
+                think_buf.items.len = 8;
+            }
+            continue;
+        }
+
+        // Detect model-generated <think> prefix
+        if (think_buf.items.len < 7) {
+            if (!std.mem.startsWith(u8, "<think>", think_buf.items)) {
+                if (has_tools) {
+                    try content_buf.appendSlice(allocator, think_buf.items);
+                } else {
+                    try sendSSEChunk(allocator, stream, chat_id, .{ .role = null, .content = think_buf.items }, null);
+                }
+                past_think = true;
+            }
+            continue;
+        }
+
+        if (std.mem.startsWith(u8, think_buf.items, "<think>")) {
+            inside_think = true;
+            const remaining = think_buf.items.len - 7;
+            std.mem.copyForwards(u8, think_buf.items[0..remaining], think_buf.items[7..]);
+            think_buf.items.len = remaining;
+        } else {
+            if (has_tools) {
+                try content_buf.appendSlice(allocator, think_buf.items);
+            } else {
+                try sendSSEChunk(allocator, stream, chat_id, .{ .role = null, .content = think_buf.items }, null);
+            }
+            past_think = true;
+        }
     }
 
-    // Final chunk with finish_reason
-    try sendSSEChunk(allocator, stream, chat_id, .{ .role = null, .content = null }, gen.finish_reason);
+    // Flush remaining think buffer
+    if (!past_think and think_buf.items.len > 0) {
+        if (inside_think) {
+            try sendSSEChunk(allocator, stream, chat_id, .{ .role = null, .content = null, .reasoning_content = think_buf.items }, null);
+        } else if (has_tools) {
+            try content_buf.appendSlice(allocator, think_buf.items);
+        } else {
+            try sendSSEChunk(allocator, stream, chat_id, .{ .role = null, .content = think_buf.items }, null);
+        }
+    }
 
-    // Done sentinel
+    // Parse tool calls from buffered content, or send finish
+    if (has_tools and content_buf.items.len > 0) {
+        var parsed_resp = try chat_mod.parseToolCalls(allocator, content_buf.items);
+        defer parsed_resp.deinit();
+        if (parsed_resp.tool_calls) |tcs| {
+            try sendSSEToolCallChunks(allocator, stream, chat_id, tcs, parsed_resp.content);
+        } else {
+            const text = parsed_resp.content orelse content_buf.items;
+            if (text.len > 0) {
+                try sendSSEChunk(allocator, stream, chat_id, .{ .role = null, .content = text }, null);
+            }
+            try sendSSEChunk(allocator, stream, chat_id, .{ .role = null, .content = null }, gen.finish_reason);
+        }
+    } else {
+        try sendSSEChunk(allocator, stream, chat_id, .{ .role = null, .content = null }, gen.finish_reason);
+    }
+
     try stream.writeAll("data: [DONE]\n\n");
 
     const elapsed_ms = timer.read() / std.time.ns_per_ms;
     const tps = if (elapsed_ms > 0) @as(u64, gen.completion_tokens) * 1000 / elapsed_ms else 0;
-    std.debug.print("  <- {d}+{d} tokens streamed ({d}ms, ~{d} tok/s) [{s}]\n", .{
+    std.debug.print("  <- {d}+{d} tokens ({d}ms, ~{d} tok/s) [{s}]\n", .{
         gen.prompt_tokens, gen.completion_tokens, elapsed_ms, tps, gen.finish_reason,
     });
 }
@@ -310,6 +553,7 @@ fn handleStreamingGeneration(
 const DeltaFields = struct {
     role: ?[]const u8,
     content: ?[]const u8,
+    reasoning_content: ?[]const u8 = null,
 };
 
 fn sendSSEChunk(
@@ -330,6 +574,15 @@ fn sendSSEChunk(
         try delta_buf.appendSlice(allocator, "\"role\":\"");
         try delta_buf.appendSlice(allocator, role);
         try delta_buf.appendSlice(allocator, "\"");
+        need_comma = true;
+    }
+
+    if (delta.reasoning_content) |rc| {
+        if (need_comma) try delta_buf.appendSlice(allocator, ",");
+        try delta_buf.appendSlice(allocator, "\"reasoning_content\":");
+        const escaped_rc = try jsonEscape(allocator, rc);
+        defer allocator.free(escaped_rc);
+        try delta_buf.appendSlice(allocator, escaped_rc);
         need_comma = true;
     }
 
@@ -357,10 +610,68 @@ fn sendSSEChunk(
     defer allocator.free(chunk);
 
     // Write as SSE event
-    var line_buf: [32]u8 = undefined;
-    const prefix = std.fmt.bufPrint(&line_buf, "data: ", .{}) catch unreachable;
-    try stream.writeAll(prefix);
+    try stream.writeAll("data: ");
     try stream.writeAll(chunk);
+    try stream.writeAll("\n\n");
+}
+
+fn sendSSEToolCallChunks(
+    allocator: std.mem.Allocator,
+    stream: std.net.Stream,
+    chat_id: i64,
+    tool_calls: []const chat_mod.ParsedToolCall,
+    content: ?[]const u8,
+) !void {
+    var tc_buf = std.ArrayList(u8).empty;
+    defer tc_buf.deinit(allocator);
+
+    var ts_buf: [32]u8 = undefined;
+    const ts = std.fmt.bufPrint(&ts_buf, "{d}", .{chat_id}) catch "0";
+
+    try tc_buf.appendSlice(allocator, "[");
+    for (tool_calls, 0..) |tc, i| {
+        if (i > 0) try tc_buf.append(allocator, ',');
+        const escaped_args = try jsonEscape(allocator, tc.arguments);
+        defer allocator.free(escaped_args);
+
+        var idx_buf: [8]u8 = undefined;
+        var s = std.fmt.bufPrint(&idx_buf, "{d}", .{i}) catch "0";
+        try tc_buf.appendSlice(allocator, "{\"index\":");
+        try tc_buf.appendSlice(allocator, s);
+        try tc_buf.appendSlice(allocator, ",\"id\":\"call_");
+        try tc_buf.appendSlice(allocator, ts);
+        s = std.fmt.bufPrint(&idx_buf, "_{d}", .{i}) catch "_0";
+        try tc_buf.appendSlice(allocator, s);
+        try tc_buf.appendSlice(allocator, "\",\"type\":\"function\",\"function\":{\"name\":\"");
+        try tc_buf.appendSlice(allocator, tc.name);
+        try tc_buf.appendSlice(allocator, "\",\"arguments\":");
+        try tc_buf.appendSlice(allocator, escaped_args);
+        try tc_buf.appendSlice(allocator, "}}");
+    }
+    try tc_buf.appendSlice(allocator, "]");
+
+    var content_json: []const u8 = "null";
+    var content_alloc: ?[]const u8 = null;
+    defer if (content_alloc) |c| allocator.free(c);
+    if (content) |c| {
+        content_alloc = try jsonEscape(allocator, c);
+        content_json = content_alloc.?;
+    }
+
+    const chunk = try std.fmt.allocPrint(allocator,
+        \\{{"id":"chatcmpl-{d}","object":"chat.completion.chunk","choices":[{{"index":0,"delta":{{"role":"assistant","content":{s},"tool_calls":{s}}},"finish_reason":null}}]}}
+    , .{ chat_id, content_json, tc_buf.items });
+    defer allocator.free(chunk);
+    try stream.writeAll("data: ");
+    try stream.writeAll(chunk);
+    try stream.writeAll("\n\n");
+
+    const final = try std.fmt.allocPrint(allocator,
+        \\{{"id":"chatcmpl-{d}","object":"chat.completion.chunk","choices":[{{"index":0,"delta":{{}},"finish_reason":"tool_calls"}}]}}
+    , .{chat_id});
+    defer allocator.free(final);
+    try stream.writeAll("data: ");
+    try stream.writeAll(final);
     try stream.writeAll("\n\n");
 }
 
