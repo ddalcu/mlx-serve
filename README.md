@@ -7,7 +7,7 @@ A native Zig binary that runs MLX-format language models on Apple Silicon. Wraps
 | Architecture | Tested with | Chat format |
 |---|---|---|
 | **Gemma-3** | `gemma-3-12b-it-qat-4bit` | Gemma turns |
-| **Qwen3** | `Qwen3-4B-Instruct-2507-MLX-4bit` | ChatML |
+| **Qwen3 / Qwen3.5** | `Qwen3-4B-Instruct-2507-MLX-4bit`, `Qwen3.5-35B-A3B-4bit` | ChatML (Jinja2) |
 | **Llama-family** | Llama, Mistral (same architecture) | ChatML |
 
 Any 4-bit quantized MLX model using one of the above architectures should work.
@@ -145,6 +145,7 @@ curl http://localhost:8080/v1/chat/completions \
 |---|---|---|---|
 | `messages` | array | required | Array of `{"role": "...", "content": "..."}` objects |
 | `max_tokens` | int | `256` | Maximum tokens to generate |
+| `stream` | bool | `false` | If true, stream responses as SSE (OpenAI-compatible chunks). Supports thinking/reasoning tags where the model exposes them. |
 
 ## Performance
 
@@ -180,12 +181,12 @@ src/
   generate.zig      Autoregressive generation with temperature sampling
   chat.zig          Chat template formatting (Gemma turns, ChatML)
   server.zig        HTTP server with OpenAI-compatible JSON API
+  status.zig        TUI status bar (CPU, memory, prefill/decode state)
 ```
 
 ## Limitations
 
 - Single-threaded server (one request at a time)
-- No streaming responses
 - No top-k or top-p sampling (temperature only)
 - Quantized models only (bits and group size read from config)
 

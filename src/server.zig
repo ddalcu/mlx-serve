@@ -236,7 +236,10 @@ fn handleChatCompletions(
     const prompt_ids = try chat_mod.formatChat(allocator, tok, messages.items, chat_config, tools_val);
     defer allocator.free(prompt_ids);
 
-    try xfm.resetCache();
+    const cached_len = try xfm.tryRestoreCache(prompt_ids);
+    if (cached_len > 0) {
+        std.debug.print("  prompt cache hit: {d}/{d} tokens\n", .{ cached_len, prompt_ids.len });
+    }
 
     const eos_slice = config.eosTokenSlice();
     const has_tools = tools_val != null;
@@ -244,11 +247,11 @@ fn handleChatCompletions(
         std.mem.indexOf(u8, chat_config.chat_template, "enable_thinking") != null;
 
     if (is_stream) {
-        handleStreamingGeneration(allocator, stream, xfm, tok, prompt_ids, max_tokens, temperature, eos_slice, has_tools, thinking, status) catch |err| {
+        handleStreamingGeneration(allocator, stream, xfm, tok, prompt_ids, cached_len, max_tokens, temperature, eos_slice, has_tools, thinking, status) catch |err| {
             std.debug.print("  -> streaming error: {}\n", .{err});
         };
     } else {
-        handleNonStreamingGeneration(allocator, stream, xfm, tok, prompt_ids, max_tokens, temperature, eos_slice, has_tools, thinking, status) catch |err| {
+        handleNonStreamingGeneration(allocator, stream, xfm, tok, prompt_ids, cached_len, max_tokens, temperature, eos_slice, has_tools, thinking, status) catch |err| {
             std.debug.print("  -> 500 ({s})\n", .{@errorName(err)});
             const err_body = std.fmt.allocPrint(allocator, "{{\"error\":\"{s}\"}}", .{@errorName(err)}) catch return;
             defer allocator.free(err_body);
@@ -263,6 +266,7 @@ fn handleNonStreamingGeneration(
     xfm: *Transformer,
     tok: *const Tokenizer,
     prompt_ids: []const u32,
+    cached_len: usize,
     max_tokens: u32,
     temperature: f32,
     eos_token_ids: []const u32,
@@ -273,21 +277,36 @@ fn handleNonStreamingGeneration(
     status.update(.prefill, null);
     var timer = try std.time.Timer.start();
 
-    const result = try generate_mod.generate(allocator, xfm, tok, prompt_ids, max_tokens, temperature, eos_token_ids);
-    status.update(.idle, null);
-    defer allocator.free(result.text);
-    defer allocator.free(result.token_ids);
+    const suffix_ids = prompt_ids[cached_len..];
+    var gen = try Generator.init(allocator, xfm, tok, suffix_ids, max_tokens, temperature, eos_token_ids);
+    gen.prompt_tokens = @intCast(prompt_ids.len);
+    xfm.savePromptCache(prompt_ids);
 
-    const elapsed_ms = timer.read() / std.time.ns_per_ms;
-    const tps = if (elapsed_ms > 0) @as(u64, result.completion_tokens) * 1000 / elapsed_ms else 0;
+    const prefill_ns = timer.read();
+    status.update(.decode, null);
+
+    var output_ids = std.ArrayList(u32).empty;
+    defer output_ids.deinit(allocator);
+    timer.reset();
+    while (try gen.next()) |token_id| {
+        try output_ids.append(allocator, token_id);
+    }
+    status.update(.idle, null);
+
+    const decode_ns = timer.read();
+    const elapsed_ms = (prefill_ns + decode_ns) / std.time.ns_per_ms;
+    const tps = if (elapsed_ms > 0) @as(u64, gen.completion_tokens) * 1000 / elapsed_ms else 0;
     std.debug.print("  <- {d}+{d} tokens ({d}ms, ~{d} tok/s) [{s}]\n", .{
-        result.prompt_tokens, result.completion_tokens, elapsed_ms, tps, result.finish_reason,
+        gen.prompt_tokens, gen.completion_tokens, elapsed_ms, tps, gen.finish_reason,
     });
 
-    const split = chat_mod.splitThinkBlock(result.text, thinking);
+    const strip_leading = tok.tok_type == .sentencepiece_bpe;
+    const text = try tok.decode(allocator, output_ids.items, strip_leading);
+    defer allocator.free(text);
+
+    const split = chat_mod.splitThinkBlock(text, thinking);
     const clean_text = split.content;
 
-    // Parse tool calls from output if tools were provided
     if (has_tools) {
         var parsed_resp = try chat_mod.parseToolCalls(allocator, clean_text);
         defer parsed_resp.deinit();
@@ -301,7 +320,16 @@ fn handleNonStreamingGeneration(
                 std.debug.print("  [{d}] name={s} arguments={s}\n", .{ i, tc.name, tc.arguments });
             }
 
-            const response = try buildToolCallResponse(allocator, tcs, parsed_resp.content, result, result.finish_reason);
+            const result = generate_mod.GenerationResult{
+                .text = text,
+                .token_ids = output_ids.items,
+                .prompt_tokens = gen.prompt_tokens,
+                .completion_tokens = gen.completion_tokens,
+                .finish_reason = gen.finish_reason,
+                .prefill_tps = 0,
+                .decode_tps = 0,
+            };
+            const response = try buildToolCallResponse(allocator, tcs, parsed_resp.content, result, gen.finish_reason);
             defer allocator.free(response);
             std.debug.print("\n── RESPONSE JSON ──\n{s}\n", .{response});
             try sendResponse(stream, "200 OK", "application/json", response);
@@ -312,7 +340,6 @@ fn handleNonStreamingGeneration(
     const escaped_text = jsonEscape(allocator, clean_text) catch "\"\"";
     defer if (!std.mem.eql(u8, escaped_text, "\"\"")) allocator.free(escaped_text);
 
-    // Build message with optional reasoning_content
     var msg_buf = std.ArrayList(u8).empty;
     defer msg_buf.deinit(allocator);
     try msg_buf.appendSlice(allocator, "{\"role\":\"assistant\"");
@@ -331,10 +358,10 @@ fn handleNonStreamingGeneration(
     , .{
         std.time.milliTimestamp(),
         msg_buf.items,
-        result.finish_reason,
-        result.prompt_tokens,
-        result.completion_tokens,
-        result.prompt_tokens + result.completion_tokens,
+        gen.finish_reason,
+        gen.prompt_tokens,
+        gen.completion_tokens,
+        gen.prompt_tokens + gen.completion_tokens,
     });
     defer allocator.free(response);
 
@@ -409,6 +436,7 @@ fn handleStreamingGeneration(
     xfm: *Transformer,
     tok: *const Tokenizer,
     prompt_ids: []const u32,
+    cached_len: usize,
     max_tokens: u32,
     temperature: f32,
     eos_token_ids: []const u32,
@@ -430,7 +458,10 @@ fn handleStreamingGeneration(
         "\r\n";
 
     status.update(.prefill, null);
-    var gen = try Generator.init(allocator, xfm, tok, prompt_ids, max_tokens, temperature, eos_token_ids);
+    const suffix_ids = prompt_ids[cached_len..];
+    var gen = try Generator.init(allocator, xfm, tok, suffix_ids, max_tokens, temperature, eos_token_ids);
+    gen.prompt_tokens = @intCast(prompt_ids.len);
+    xfm.savePromptCache(prompt_ids);
     status.update(.decode, null);
 
     try stream.writeAll(sse_header);
@@ -445,11 +476,25 @@ fn handleStreamingGeneration(
     defer content_buf.deinit(allocator);
     var inside_think = thinking;
     var past_think = !thinking;
+    var utf8_pending = std.ArrayList(u8).empty;
+    defer utf8_pending.deinit(allocator);
 
     while (try gen.next()) |token_id| {
         const strip_bpe = tok.tok_type == .sentencepiece_bpe;
-        const token_text = try tok.decode(allocator, &[_]u32{token_id}, strip_bpe and false);
+        const raw_decoded = try tok.decode(allocator, &[_]u32{token_id}, strip_bpe and false);
+        defer allocator.free(raw_decoded);
+
+        // Buffer decoded bytes until we have complete UTF-8 sequences
+        // (byte-level BPE can split multi-byte chars like emojis across tokens)
+        try utf8_pending.appendSlice(allocator, raw_decoded);
+        const complete = validUtf8Len(utf8_pending.items);
+        if (complete == 0) continue;
+
+        const token_text = try allocator.dupe(u8, utf8_pending.items[0..complete]);
         defer allocator.free(token_text);
+        const tail = utf8_pending.items.len - complete;
+        if (tail > 0) std.mem.copyForwards(u8, utf8_pending.items[0..tail], utf8_pending.items[complete..]);
+        utf8_pending.items.len = tail;
 
         if (past_think) {
             if (has_tools) {
@@ -477,10 +522,13 @@ fn handleStreamingGeneration(
                 }
                 past_think = true;
             } else if (think_buf.items.len > 8) {
-                const safe_end = think_buf.items.len - 8;
-                try sendSSEChunk(allocator, stream, chat_id, .{ .role = null, .content = null, .reasoning_content = think_buf.items[0..safe_end] }, null);
-                std.mem.copyForwards(u8, think_buf.items[0..8], think_buf.items[safe_end..]);
-                think_buf.items.len = 8;
+                const safe_end = validUtf8Len(think_buf.items[0 .. think_buf.items.len - 8]);
+                if (safe_end > 0) {
+                    try sendSSEChunk(allocator, stream, chat_id, .{ .role = null, .content = null, .reasoning_content = think_buf.items[0..safe_end] }, null);
+                    const remaining = think_buf.items.len - safe_end;
+                    std.mem.copyForwards(u8, think_buf.items[0..remaining], think_buf.items[safe_end..]);
+                    think_buf.items.len = remaining;
+                }
             }
             continue;
         }
@@ -706,6 +754,21 @@ fn findContentLength(headers: []const u8) ?usize {
         }
     }
     return null;
+}
+
+/// Returns the length of the longest prefix ending on a complete UTF-8 codepoint boundary.
+/// Bytes beyond that point are an incomplete trailing multi-byte sequence.
+fn validUtf8Len(bytes: []const u8) usize {
+    if (bytes.len == 0) return 0;
+    var i = bytes.len;
+    while (i > 0 and bytes.len - i < 4) {
+        i -= 1;
+        if (bytes[i] & 0xC0 != 0x80) {
+            const expected = std.unicode.utf8ByteSequenceLength(bytes[i]) catch return bytes.len;
+            return if (i + expected <= bytes.len) bytes.len else i;
+        }
+    }
+    return bytes.len;
 }
 
 fn jsonEscape(allocator: std.mem.Allocator, input: []const u8) ![]const u8 {

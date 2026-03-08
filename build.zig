@@ -29,6 +29,9 @@ pub fn build(b: *std.Build) void {
         .root_module = mod,
     });
 
+    exe.linkFramework("IOKit");
+    exe.linkFramework("CoreFoundation");
+
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);

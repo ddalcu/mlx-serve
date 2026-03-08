@@ -106,6 +106,32 @@ const SSMCacheEntry = struct {
     initialized: bool,
 };
 
+// ── Prompt Cache (snapshot of KV + SSM state for prefix reuse) ──
+
+pub const PrefillCache = struct {
+    tokens: []u32,
+    kv_entries: []KVCacheEntry,
+    ssm_entries: ?[]SSMCacheEntry,
+    moe_seq_offset: usize,
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *PrefillCache) void {
+        self.allocator.free(self.tokens);
+        for (self.kv_entries) |*e| {
+            _ = mlx.mlx_array_free(e.keys);
+            _ = mlx.mlx_array_free(e.values);
+        }
+        self.allocator.free(self.kv_entries);
+        if (self.ssm_entries) |entries| {
+            for (entries) |*e| {
+                _ = mlx.mlx_array_free(e.conv_state);
+                _ = mlx.mlx_array_free(e.ssm_state);
+            }
+            self.allocator.free(entries);
+        }
+    }
+};
+
 // ── Standard model per-layer weights ──
 
 const LayerWeights = struct {
@@ -249,6 +275,9 @@ pub const Transformer = struct {
     moe_layers: ?[]MoeLayerWeights,
     ssm_entries: ?[]SSMCacheEntry,
     moe_seq_offset: usize,
+
+    // Prompt cache for prefix reuse across requests
+    prompt_cache: ?PrefillCache,
 
     pub fn init(allocator: std.mem.Allocator, config: ModelConfig, weights: *const Weights) !Transformer {
         const s = mlx.mlx_default_gpu_stream_new();
@@ -401,6 +430,7 @@ pub const Transformer = struct {
             .moe_layers = moe_layers,
             .ssm_entries = ssm_entries,
             .moe_seq_offset = 0,
+            .prompt_cache = null,
         };
     }
 
@@ -420,7 +450,107 @@ pub const Transformer = struct {
         self.moe_seq_offset = 0;
     }
 
+    /// Try to restore state from prompt cache if the cached tokens are an exact
+    /// prefix of new_ids. Returns the number of matched (restored) tokens, or 0
+    /// if the cache missed and a full reset was performed.
+    pub fn tryRestoreCache(self: *Transformer, new_ids: []const u32) !usize {
+        const pc = self.prompt_cache orelse {
+            try self.resetCache();
+            return 0;
+        };
+
+        const match_limit = @min(pc.tokens.len, new_ids.len);
+        var matched: usize = 0;
+        while (matched < match_limit) : (matched += 1) {
+            if (pc.tokens[matched] != new_ids[matched]) break;
+        }
+
+        if (matched < pc.tokens.len or matched >= new_ids.len) {
+            try self.resetCache();
+            return 0;
+        }
+
+        // Full prefix match with tokens remaining — restore cached state.
+        self.cache.deinit();
+        self.cache = try KVCache.init(self.allocator, self.config.num_hidden_layers);
+        for (pc.kv_entries, 0..) |src, i| {
+            if (src.initialized) {
+                try mlx.check(mlx.mlx_array_set(&self.cache.entries[i].keys, src.keys));
+                try mlx.check(mlx.mlx_array_set(&self.cache.entries[i].values, src.values));
+                self.cache.entries[i].initialized = true;
+            }
+        }
+
+        if (pc.ssm_entries) |ssm_src| {
+            if (self.ssm_entries) |ssm_dst| {
+                for (ssm_src, ssm_dst) |src, *dst| {
+                    _ = mlx.mlx_array_free(dst.conv_state);
+                    _ = mlx.mlx_array_free(dst.ssm_state);
+                    dst.conv_state = mlx.mlx_array_new();
+                    dst.ssm_state = mlx.mlx_array_new();
+                    if (src.initialized) {
+                        try mlx.check(mlx.mlx_array_set(&dst.conv_state, src.conv_state));
+                        try mlx.check(mlx.mlx_array_set(&dst.ssm_state, src.ssm_state));
+                        dst.initialized = true;
+                    } else {
+                        dst.initialized = false;
+                    }
+                }
+            }
+        }
+
+        self.moe_seq_offset = pc.moe_seq_offset;
+        return matched;
+    }
+
+    /// Snapshot the current KV cache + SSM state so the next request can reuse
+    /// them if its prompt starts with the same token prefix.
+    pub fn savePromptCache(self: *Transformer, prompt_ids: []const u32) void {
+        if (self.prompt_cache) |*pc| pc.deinit();
+        self.prompt_cache = null;
+
+        const tokens = self.allocator.dupe(u32, prompt_ids) catch return;
+        const num_layers = self.cache.entries.len;
+        const kv = self.allocator.alloc(KVCacheEntry, num_layers) catch {
+            self.allocator.free(tokens);
+            return;
+        };
+        for (self.cache.entries, kv) |src, *dst| {
+            dst.keys = mlx.mlx_array_new();
+            dst.values = mlx.mlx_array_new();
+            if (src.initialized) {
+                _ = mlx.mlx_array_set(&dst.keys, src.keys);
+                _ = mlx.mlx_array_set(&dst.values, src.values);
+            }
+            dst.initialized = src.initialized;
+        }
+
+        var ssm: ?[]SSMCacheEntry = null;
+        if (self.ssm_entries) |entries| {
+            const ssm_copy = self.allocator.alloc(SSMCacheEntry, entries.len) catch return;
+            for (entries, ssm_copy) |src, *dst| {
+                dst.conv_state = mlx.mlx_array_new();
+                dst.ssm_state = mlx.mlx_array_new();
+                if (src.initialized) {
+                    _ = mlx.mlx_array_set(&dst.conv_state, src.conv_state);
+                    _ = mlx.mlx_array_set(&dst.ssm_state, src.ssm_state);
+                }
+                dst.initialized = src.initialized;
+            }
+            ssm = ssm_copy;
+        }
+
+        self.prompt_cache = .{
+            .tokens = tokens,
+            .kv_entries = kv,
+            .ssm_entries = ssm,
+            .moe_seq_offset = self.moe_seq_offset,
+            .allocator = self.allocator,
+        };
+    }
+
     pub fn deinit(self: *Transformer) void {
+        if (self.prompt_cache) |*pc| pc.deinit();
         self.cache.deinit();
         if (self.emb_scale) |es| _ = mlx.mlx_array_free(es);
         if (self.owns_norms) _ = mlx.mlx_array_free(self.final_norm);
@@ -570,6 +700,8 @@ pub const Transformer = struct {
     // ── Forward dispatch ──
 
     const EVAL_EVERY_N_LAYERS: u32 = 48;
+    const MOE_EVAL_EVERY_N_LAYERS: u32 = 4;
+    const RECURRENCE_EVAL_INTERVAL: usize = 32;
 
     pub fn forward(self: *Transformer, token_ids: mlx.mlx_array) !mlx.mlx_array {
         if (self.config.isMoe()) return self.forwardMoe(token_ids);
@@ -827,7 +959,7 @@ pub const Transformer = struct {
             _ = mlx.mlx_array_free(h);
             h = h_next;
 
-            if (is_prefill and (layer_idx + 1) % EVAL_EVERY_N_LAYERS == 0) {
+            if (is_prefill and (layer_idx + 1) % MOE_EVAL_EVERY_N_LAYERS == 0) {
                 try mlx.check(mlx.mlx_array_eval(h));
             }
         }
@@ -1343,6 +1475,10 @@ pub const Transformer = struct {
             try mlx.check(mlx.mlx_sum_axis(&y_t, state_q, -1, false, self.s)); // [B,Hv,Dv]
             _ = mlx.mlx_vector_array_append_value(out_vec, y_t);
             _ = mlx.mlx_array_free(y_t);
+
+            if ((t + 1) % RECURRENCE_EVAL_INTERVAL == 0) {
+                try mlx.check(mlx.mlx_array_eval(ssm.ssm_state));
+            }
         }
 
         // Stack outputs: [B, Hv, Dv] * T → [T, B, Hv, Dv] → transpose to [B, T, Hv, Dv]
