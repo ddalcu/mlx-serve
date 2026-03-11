@@ -9,8 +9,11 @@ const Weights = model_mod.Weights;
 // ── KV Cache (standard attention) ──
 
 const KVCacheEntry = struct {
-    keys: mlx.mlx_array,
+    keys: mlx.mlx_array, // pre-allocated buffer [B, heads, capacity, head_dim]
     values: mlx.mlx_array,
+    key_view: mlx.mlx_array, // sliced view [B, heads, offset, head_dim]
+    value_view: mlx.mlx_array,
+    offset: usize, // logical token count (may be < buffer capacity)
     initialized: bool,
 };
 
@@ -24,6 +27,9 @@ pub const KVCache = struct {
             e.* = .{
                 .keys = mlx.mlx_array_new(),
                 .values = mlx.mlx_array_new(),
+                .key_view = mlx.mlx_array_new(),
+                .value_view = mlx.mlx_array_new(),
+                .offset = 0,
                 .initialized = false,
             };
         }
@@ -34,98 +40,208 @@ pub const KVCache = struct {
         for (self.entries) |*e| {
             _ = mlx.mlx_array_free(e.keys);
             _ = mlx.mlx_array_free(e.values);
+            _ = mlx.mlx_array_free(e.key_view);
+            _ = mlx.mlx_array_free(e.value_view);
         }
         self.allocator.free(self.entries);
     }
 
+    const chunk_step = 256;
+
     pub fn update(self: *KVCache, layer: u32, new_k: mlx.mlx_array, new_v: mlx.mlx_array, s: mlx.mlx_stream, max_seq: u32) !struct { mlx.mlx_array, mlx.mlx_array } {
         const entry = &self.entries[layer];
 
-        if (!entry.initialized) {
-            try mlx.check(mlx.mlx_array_set(&entry.keys, new_k));
-            try mlx.check(mlx.mlx_array_set(&entry.values, new_v));
-            entry.initialized = true;
-            return .{ entry.keys, entry.values };
-        }
+        // 1. Free stale views — drops refcount on buffer → enables buffer donation
+        _ = mlx.mlx_array_free(entry.key_view);
+        _ = mlx.mlx_array_free(entry.value_view);
+        entry.key_view = mlx.mlx_array_new();
+        entry.value_view = mlx.mlx_array_new();
 
-        const k_arr = [_]mlx.mlx_array{ entry.keys, new_k };
-        const v_arr = [_]mlx.mlx_array{ entry.values, new_v };
-        const k_vec = mlx.mlx_vector_array_new_data(&k_arr, 2);
-        defer _ = mlx.mlx_vector_array_free(k_vec);
-        const v_vec = mlx.mlx_vector_array_new_data(&v_arr, 2);
-        defer _ = mlx.mlx_vector_array_free(v_vec);
+        // 2. Get shape info from new_k: [B, heads, new_len, head_dim]
+        const new_shape = mlx.getShape(new_k);
+        const new_len: usize = @intCast(new_shape[2]);
+        const dtype = mlx.mlx_array_dtype(new_k);
 
-        var new_keys = mlx.mlx_array_new();
-        var new_values = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_concatenate_axis(&new_keys, k_vec, 2, s));
-        try mlx.check(mlx.mlx_concatenate_axis(&new_values, v_vec, 2, s));
+        // 3. Grow buffer if needed
+        if (!entry.initialized or entry.offset + new_len > bufferCapacity(entry.keys)) {
+            const B = new_shape[0];
+            const heads = new_shape[1];
+            const head_dim = new_shape[3];
+            const needed = entry.offset + new_len;
+            const n_chunks = (needed + chunk_step - 1) / chunk_step;
+            const new_cap: c_int = @intCast(n_chunks * chunk_step);
+            const buf_shape = [_]c_int{ B, heads, new_cap, head_dim };
 
-        _ = mlx.mlx_array_free(entry.keys);
-        _ = mlx.mlx_array_free(entry.values);
-        entry.keys = new_keys;
-        entry.values = new_values;
+            var new_k_buf = mlx.mlx_array_new();
+            var new_v_buf = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_zeros(&new_k_buf, &buf_shape, 4, dtype, s));
+            try mlx.check(mlx.mlx_zeros(&new_v_buf, &buf_shape, 4, dtype, s));
 
-        if (max_seq > 0) {
-            const shape = mlx.getShape(entry.keys);
-            const current_seq = shape[2];
-            const max_s: c_int = @intCast(max_seq);
-            if (current_seq > max_s) {
-                const trim_start = current_seq - max_s;
-                const start = [_]c_int{ 0, 0, trim_start, 0 };
-                const stop = [_]c_int{ shape[0], shape[1], current_seq, shape[3] };
-                const strides = [_]c_int{ 1, 1, 1, 1 };
+            if (entry.initialized and entry.offset > 0) {
+                // Copy existing data into new buffer via slice_update
+                const off: c_int = @intCast(entry.offset);
+                const su_start = [_]c_int{ 0, 0, 0, 0 };
+                const su_stop = [_]c_int{ B, heads, off, head_dim };
+                const su_strides = [_]c_int{ 1, 1, 1, 1 };
 
-                var trimmed_k = mlx.mlx_array_new();
-                try mlx.check(mlx.mlx_slice(&trimmed_k, entry.keys, &start, 4, &stop, 4, &strides, 4, s));
-                _ = mlx.mlx_array_free(entry.keys);
-                entry.keys = trimmed_k;
+                // Slice existing data
+                var old_k_data = mlx.mlx_array_new();
+                var old_v_data = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_slice(&old_k_data, entry.keys, &su_start, 4, &su_stop, 4, &su_strides, 4, s));
+                try mlx.check(mlx.mlx_slice(&old_v_data, entry.values, &su_start, 4, &su_stop, 4, &su_strides, 4, s));
 
-                var trimmed_v = mlx.mlx_array_new();
-                try mlx.check(mlx.mlx_slice(&trimmed_v, entry.values, &start, 4, &stop, 4, &strides, 4, s));
-                _ = mlx.mlx_array_free(entry.values);
-                entry.values = trimmed_v;
+                var updated_k = mlx.mlx_array_new();
+                var updated_v = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_slice_update(&updated_k, new_k_buf, old_k_data, &su_start, 4, &su_stop, 4, &su_strides, 4, s));
+                try mlx.check(mlx.mlx_slice_update(&updated_v, new_v_buf, old_v_data, &su_start, 4, &su_stop, 4, &su_strides, 4, s));
+
+                _ = mlx.mlx_array_free(old_k_data);
+                _ = mlx.mlx_array_free(old_v_data);
+                _ = mlx.mlx_array_free(new_k_buf);
+                _ = mlx.mlx_array_free(new_v_buf);
+                new_k_buf = updated_k;
+                new_v_buf = updated_v;
             }
+
+            _ = mlx.mlx_array_free(entry.keys);
+            _ = mlx.mlx_array_free(entry.values);
+            entry.keys = new_k_buf;
+            entry.values = new_v_buf;
+            entry.initialized = true;
         }
 
-        return .{ entry.keys, entry.values };
+        // 4. slice_update — write new_k/new_v at [0, 0, offset, 0]:[B, heads, offset+new_len, head_dim]
+        {
+            const shape = mlx.getShape(entry.keys);
+            const off: c_int = @intCast(entry.offset);
+            const off_end: c_int = @intCast(entry.offset + new_len);
+            const su_start = [_]c_int{ 0, 0, off, 0 };
+            const su_stop = [_]c_int{ shape[0], shape[1], off_end, shape[3] };
+            const su_strides = [_]c_int{ 1, 1, 1, 1 };
+
+            var updated_k = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_slice_update(&updated_k, entry.keys, new_k, &su_start, 4, &su_stop, 4, &su_strides, 4, s));
+            _ = mlx.mlx_array_free(entry.keys);
+            entry.keys = updated_k;
+
+            var updated_v = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_slice_update(&updated_v, entry.values, new_v, &su_start, 4, &su_stop, 4, &su_strides, 4, s));
+            _ = mlx.mlx_array_free(entry.values);
+            entry.values = updated_v;
+        }
+
+        // 5. Update offset
+        entry.offset += new_len;
+
+        // 6. max_seq trimming
+        if (max_seq > 0 and entry.offset > max_seq) {
+            const shape = mlx.getShape(entry.keys);
+            const max_s: c_int = @intCast(max_seq);
+            const current: c_int = @intCast(entry.offset);
+            const trim_start = current - max_s;
+            const start = [_]c_int{ 0, 0, trim_start, 0 };
+            const stop = [_]c_int{ shape[0], shape[1], current, shape[3] };
+            const strides = [_]c_int{ 1, 1, 1, 1 };
+
+            var trimmed_k = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_slice(&trimmed_k, entry.keys, &start, 4, &stop, 4, &strides, 4, s));
+            _ = mlx.mlx_array_free(entry.keys);
+            entry.keys = trimmed_k;
+
+            var trimmed_v = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_slice(&trimmed_v, entry.values, &start, 4, &stop, 4, &strides, 4, s));
+            _ = mlx.mlx_array_free(entry.values);
+            entry.values = trimmed_v;
+
+            entry.offset = max_seq;
+        }
+
+        // 7. Create views — slice [0:B, 0:heads, 0:offset, 0:head_dim]
+        {
+            const shape = mlx.getShape(entry.keys);
+            const off: c_int = @intCast(entry.offset);
+            const v_start = [_]c_int{ 0, 0, 0, 0 };
+            const v_stop = [_]c_int{ shape[0], shape[1], off, shape[3] };
+            const v_strides = [_]c_int{ 1, 1, 1, 1 };
+
+            _ = mlx.mlx_array_free(entry.key_view);
+            _ = mlx.mlx_array_free(entry.value_view);
+            entry.key_view = mlx.mlx_array_new();
+            entry.value_view = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_slice(&entry.key_view, entry.keys, &v_start, 4, &v_stop, 4, &v_strides, 4, s));
+            try mlx.check(mlx.mlx_slice(&entry.value_view, entry.values, &v_start, 4, &v_stop, 4, &v_strides, 4, s));
+        }
+
+        // 8. Return views — callers do NOT free (same contract as before)
+        return .{ entry.key_view, entry.value_view };
+    }
+
+    fn bufferCapacity(arr: mlx.mlx_array) usize {
+        const shape = mlx.getShape(arr);
+        if (shape.len < 3) return 0;
+        return @intCast(shape[2]);
     }
 
     pub fn seqLen(self: *const KVCache, layer: u32) usize {
         const entry = &self.entries[layer];
         if (!entry.initialized) return 0;
-        const shape = mlx.getShape(entry.keys);
-        if (shape.len < 3) return 0;
-        return @intCast(shape[2]);
+        return entry.offset;
+    }
+
+    /// Evaluate all KV cache entries to materialize them on GPU.
+    /// Called after prefill to ensure the cache is in optimal memory layout for decode.
+    pub fn evalState(self: *KVCache) void {
+        // Collect all initialized entries into a vector and batch-eval them.
+        // This matches mlx_lm's `mx.eval([c.state for c in cache])` pattern.
+        const vec = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(vec);
+        var count: usize = 0;
+        for (self.entries) |*entry| {
+            if (!entry.initialized) continue;
+            _ = mlx.mlx_vector_array_append_value(vec, entry.keys);
+            _ = mlx.mlx_vector_array_append_value(vec, entry.values);
+            count += 1;
+        }
+        if (count > 0) {
+            _ = mlx.mlx_eval(vec);
+        }
     }
 
     /// Truncate the KV cache to keep only the first `len` tokens on the sequence axis.
     pub fn truncate(self: *KVCache, len: usize, s: mlx.mlx_stream) !void {
         for (self.entries) |*entry| {
             if (!entry.initialized) continue;
-            const shape = mlx.getShape(entry.keys);
-            if (shape.len < 4) continue;
-            const current_seq: usize = @intCast(shape[2]);
-            if (len >= current_seq) continue;
+            if (len >= entry.offset) continue;
+
+            // Free stale views
+            _ = mlx.mlx_array_free(entry.key_view);
+            _ = mlx.mlx_array_free(entry.value_view);
+            entry.key_view = mlx.mlx_array_new();
+            entry.value_view = mlx.mlx_array_new();
+
             if (len == 0) {
                 _ = mlx.mlx_array_free(entry.keys);
                 _ = mlx.mlx_array_free(entry.values);
                 entry.keys = mlx.mlx_array_new();
                 entry.values = mlx.mlx_array_new();
                 entry.initialized = false;
+                entry.offset = 0;
                 continue;
             }
+
+            // Just update offset — the buffer still holds data but views will
+            // only expose [0:len]. No need to shrink the pre-allocated buffer.
+            entry.offset = len;
+
+            // Recreate views for the truncated range
+            const shape = mlx.getShape(entry.keys);
+            if (shape.len < 4) continue;
             const seq_end: c_int = @intCast(len);
-            const start = [_]c_int{ 0, 0, 0, 0 };
-            const stop = [_]c_int{ shape[0], shape[1], seq_end, shape[3] };
-            const strides = [_]c_int{ 1, 1, 1, 1 };
-            var trimmed_k = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_slice(&trimmed_k, entry.keys, &start, 4, &stop, 4, &strides, 4, s));
-            _ = mlx.mlx_array_free(entry.keys);
-            entry.keys = trimmed_k;
-            var trimmed_v = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_slice(&trimmed_v, entry.values, &start, 4, &stop, 4, &strides, 4, s));
-            _ = mlx.mlx_array_free(entry.values);
-            entry.values = trimmed_v;
+            const v_start = [_]c_int{ 0, 0, 0, 0 };
+            const v_stop = [_]c_int{ shape[0], shape[1], seq_end, shape[3] };
+            const v_strides = [_]c_int{ 1, 1, 1, 1 };
+            try mlx.check(mlx.mlx_slice(&entry.key_view, entry.keys, &v_start, 4, &v_stop, 4, &v_strides, 4, s));
+            try mlx.check(mlx.mlx_slice(&entry.value_view, entry.values, &v_start, 4, &v_stop, 4, &v_strides, 4, s));
         }
     }
 };
@@ -143,6 +259,7 @@ const SSMCacheEntry = struct {
 pub const PrefillCache = struct {
     tokens: []u32,
     kv_entries: []KVCacheEntry,
+    offsets: []usize,
     ssm_entries: ?[]SSMCacheEntry,
     moe_seq_offset: usize,
     allocator: std.mem.Allocator,
@@ -152,8 +269,11 @@ pub const PrefillCache = struct {
         for (self.kv_entries) |*e| {
             _ = mlx.mlx_array_free(e.keys);
             _ = mlx.mlx_array_free(e.values);
+            _ = mlx.mlx_array_free(e.key_view);
+            _ = mlx.mlx_array_free(e.value_view);
         }
         self.allocator.free(self.kv_entries);
+        self.allocator.free(self.offsets);
         if (self.ssm_entries) |entries| {
             for (entries) |*e| {
                 _ = mlx.mlx_array_free(e.conv_state);
@@ -312,6 +432,7 @@ pub const Transformer = struct {
 
     owns_lm_head: bool,
     owns_norms: bool,
+    embedding_mode: bool = false,
 
     gelu_coeff: ?mlx.mlx_array,
     gelu_inner: ?mlx.mlx_array,
@@ -530,6 +651,8 @@ pub const Transformer = struct {
                 try mlx.check(mlx.mlx_array_set(&self.cache.entries[i].keys, src.keys));
                 try mlx.check(mlx.mlx_array_set(&self.cache.entries[i].values, src.values));
                 self.cache.entries[i].initialized = true;
+                self.cache.entries[i].offset = pc.offsets[i];
+                // key_view/value_view left as mlx_array_new() — will be created on next update()
             }
         }
 
@@ -567,14 +690,23 @@ pub const Transformer = struct {
             self.allocator.free(tokens);
             return;
         };
-        for (self.cache.entries, kv) |src, *dst| {
+        const offsets = self.allocator.alloc(usize, num_layers) catch {
+            self.allocator.free(tokens);
+            self.allocator.free(kv);
+            return;
+        };
+        for (self.cache.entries, kv, 0..) |src, *dst, i| {
             dst.keys = mlx.mlx_array_new();
             dst.values = mlx.mlx_array_new();
+            dst.key_view = mlx.mlx_array_new();
+            dst.value_view = mlx.mlx_array_new();
+            dst.offset = src.offset;
             if (src.initialized) {
                 _ = mlx.mlx_array_set(&dst.keys, src.keys);
                 _ = mlx.mlx_array_set(&dst.values, src.values);
             }
             dst.initialized = src.initialized;
+            offsets[i] = src.offset;
         }
 
         var ssm: ?[]SSMCacheEntry = null;
@@ -595,6 +727,7 @@ pub const Transformer = struct {
         self.prompt_cache = .{
             .tokens = tokens,
             .kv_entries = kv,
+            .offsets = offsets,
             .ssm_entries = ssm,
             .moe_seq_offset = self.moe_seq_offset,
             .allocator = self.allocator,
@@ -1012,6 +1145,7 @@ pub const Transformer = struct {
 
         const final_normed = try self.rmsNorm(h, self.final_norm);
         _ = mlx.mlx_array_free(h);
+        if (self.embedding_mode) return final_normed;
         const logits = try self.qmatmul(final_normed, self.lm_head_w, self.lm_head_s, self.lm_head_b);
         _ = mlx.mlx_array_free(final_normed);
         return logits;
@@ -1075,9 +1209,18 @@ pub const Transformer = struct {
 
         const final_normed = try self.rmsNorm(h, self.final_norm);
         _ = mlx.mlx_array_free(h);
+        if (self.embedding_mode) return final_normed;
         const logits = try self.qmatmul(final_normed, self.lm_head_w, self.lm_head_s, self.lm_head_b);
         _ = mlx.mlx_array_free(final_normed);
         return logits;
+    }
+
+    /// Forward pass that returns hidden states (after final_norm, before lm_head).
+    /// Output shape: [1, seq_len, hidden_size]. Caller must free.
+    pub fn forwardEmbedding(self: *Transformer, token_ids: mlx.mlx_array) !mlx.mlx_array {
+        self.embedding_mode = true;
+        defer self.embedding_mode = false;
+        return self.forward(token_ids);
     }
 
     // ── Full Attention for MoE models (with optional output gate) ──

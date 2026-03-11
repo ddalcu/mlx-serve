@@ -476,7 +476,9 @@ pub fn splitThinkBlock(text: []const u8, thinking: bool) ThinkSplit {
         };
     }
     if (thinking) {
-        return .{ .reasoning_content = text, .content = "" };
+        const start: usize = if (std.mem.startsWith(u8, text, "<think>")) 7 else 0;
+        const reasoning = std.mem.trimLeft(u8, text[start..], "\n ");
+        return .{ .reasoning_content = if (reasoning.len > 0) reasoning else null, .content = "" };
     }
     return .{ .reasoning_content = null, .content = text };
 }
@@ -656,4 +658,245 @@ fn appendToolSystemPrompt(allocator: std.mem.Allocator, result_buf: *std.ArrayLi
     if (tool_choice_instruction) |instr| {
         try result_buf.appendSlice(allocator, instr);
     }
+}
+
+// ── Tests ──
+
+const testing = std.testing;
+
+test "stripThinkBlock removes think tags" {
+    try testing.expectEqualStrings("Hello", stripThinkBlock("<think>reasoning</think>Hello"));
+    try testing.expectEqualStrings("Hello", stripThinkBlock("<think>reasoning</think>\nHello"));
+    try testing.expectEqualStrings("Hello", stripThinkBlock("<think>reasoning</think>\n\nHello"));
+}
+
+test "stripThinkBlock returns empty for open think tag" {
+    try testing.expectEqualStrings("", stripThinkBlock("<think>still thinking..."));
+}
+
+test "stripThinkBlock returns text when no think tags" {
+    try testing.expectEqualStrings("Hello world", stripThinkBlock("Hello world"));
+}
+
+test "splitThinkBlock with complete think block" {
+    const result = splitThinkBlock("<think>reasoning here</think>answer here", false);
+    try testing.expectEqualStrings("reasoning here", result.reasoning_content.?);
+    try testing.expectEqualStrings("answer here", result.content);
+}
+
+test "splitThinkBlock with empty reasoning" {
+    const result = splitThinkBlock("<think>\n\n</think>\n\nactual content", false);
+    try testing.expect(result.reasoning_content == null);
+    try testing.expectEqualStrings("actual content", result.content);
+}
+
+test "splitThinkBlock thinking=true no close tag" {
+    const result = splitThinkBlock("<think>partial reasoning", true);
+    try testing.expectEqualStrings("partial reasoning", result.reasoning_content.?);
+    try testing.expectEqualStrings("", result.content);
+}
+
+test "splitThinkBlock thinking=false no tags" {
+    const result = splitThinkBlock("just content", false);
+    try testing.expect(result.reasoning_content == null);
+    try testing.expectEqualStrings("just content", result.content);
+}
+
+test "splitThinkBlock strips think prefix in thinking mode" {
+    const result = splitThinkBlock("<think>my reasoning", true);
+    try testing.expectEqualStrings("my reasoning", result.reasoning_content.?);
+    try testing.expectEqualStrings("", result.content);
+}
+
+test "parseToolCalls JSON format" {
+    const allocator = testing.allocator;
+    const text = "<tool_call>\n{\"name\": \"get_weather\", \"arguments\": {\"location\": \"Tokyo\"}}\n</tool_call>";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("get_weather", calls[0].name);
+    // arguments should be valid JSON
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("Tokyo", parsed.value.object.get("location").?.string);
+}
+
+test "parseToolCalls multiple calls" {
+    const allocator = testing.allocator;
+    const text =
+        \\<tool_call>
+        \\{"name": "func_a", "arguments": {"x": 1}}
+        \\</tool_call>
+        \\<tool_call>
+        \\{"name": "func_b", "arguments": {"y": 2}}
+        \\</tool_call>
+    ;
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 2), calls.len);
+    try testing.expectEqualStrings("func_a", calls[0].name);
+    try testing.expectEqualStrings("func_b", calls[1].name);
+}
+
+test "parseToolCalls returns null for no tool calls" {
+    const allocator = testing.allocator;
+    const result = try parseToolCalls(allocator, "Hello, how can I help you?");
+    try testing.expect(result == null);
+}
+
+test "parseToolCalls with think block" {
+    const allocator = testing.allocator;
+    const text = "<think>reasoning</think>\n<tool_call>\n{\"name\": \"search\", \"arguments\": {\"q\": \"test\"}}\n</tool_call>";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("search", calls[0].name);
+}
+
+test "parseToolCalls raw JSON without tags" {
+    const allocator = testing.allocator;
+    const text = "{\"name\": \"get_time\", \"arguments\": {}}";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("get_time", calls[0].name);
+}
+
+test "parseToolCalls Hermes format" {
+    const allocator = testing.allocator;
+    const text = "<tool_call><function=get_weather><parameter=location>Tokyo</parameter></function></tool_call>";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("get_weather", calls[0].name);
+    // Should have {"location":"Tokyo"}
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("Tokyo", parsed.value.object.get("location").?.string);
+}
+
+test "isJsonLiteral" {
+    try testing.expect(isJsonLiteral("true"));
+    try testing.expect(isJsonLiteral("false"));
+    try testing.expect(isJsonLiteral("null"));
+    try testing.expect(isJsonLiteral("{\"key\":1}"));
+    try testing.expect(isJsonLiteral("[1,2,3]"));
+    try testing.expect(isJsonLiteral("42"));
+    try testing.expect(isJsonLiteral("3.14"));
+    try testing.expect(!isJsonLiteral("hello"));
+    try testing.expect(!isJsonLiteral(""));
+}
+
+test "appendJsonString escapes special chars" {
+    const allocator = testing.allocator;
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(allocator);
+
+    try appendJsonString(allocator, &buf, "hello \"world\"\nnew\\line");
+    try testing.expectEqualStrings("\"hello \\\"world\\\"\\nnew\\\\line\"", buf.items);
+}
+
+test "appendJsonString empty string" {
+    const allocator = testing.allocator;
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(allocator);
+
+    try appendJsonString(allocator, &buf, "");
+    try testing.expectEqualStrings("\"\"", buf.items);
+}
+
+test "serializeExtraContext with thinking enabled" {
+    const allocator = testing.allocator;
+    var config = ChatConfig{
+        .chat_template = "",
+        .bos_token = null,
+        .eos_token = null,
+        .add_bos_token = false,
+        .allocator = allocator,
+    };
+    _ = &config;
+
+    const result = try serializeExtraContext(allocator, &config, true);
+    defer allocator.free(result);
+    // Should contain enable_thinking:true
+    try testing.expect(std.mem.indexOf(u8, result, "\"enable_thinking\":true") != null);
+}
+
+test "serializeExtraContext with thinking disabled" {
+    const allocator = testing.allocator;
+    var config = ChatConfig{
+        .chat_template = "",
+        .bos_token = null,
+        .eos_token = null,
+        .add_bos_token = false,
+        .allocator = allocator,
+    };
+    _ = &config;
+
+    const result = try serializeExtraContext(allocator, &config, false);
+    defer allocator.free(result);
+    try testing.expect(std.mem.indexOf(u8, result, "\"enable_thinking\":false") != null);
+}
+
+test "serializeMessagesJson basic" {
+    const allocator = testing.allocator;
+    const messages = [_]Message{
+        .{ .role = "user", .content = "Hello" },
+        .{ .role = "assistant", .content = "Hi there" },
+    };
+    const result = try serializeMessagesJson(allocator, &messages);
+    defer allocator.free(result);
+
+    // Parse it back to verify valid JSON
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, result, .{});
+    defer parsed.deinit();
+    try testing.expectEqual(@as(usize, 2), parsed.value.array.items.len);
+    try testing.expectEqualStrings("user", parsed.value.array.items[0].object.get("role").?.string);
+    try testing.expectEqualStrings("Hello", parsed.value.array.items[0].object.get("content").?.string);
+}
+
+test "serializeMessagesJson with tool_calls" {
+    const allocator = testing.allocator;
+    const tool_calls = [_]ToolCall{
+        .{ .id = "call_1", .name = "get_weather", .arguments = "{\"location\":\"Tokyo\"}" },
+    };
+    const messages = [_]Message{
+        .{ .role = "assistant", .content = "", .tool_calls = &tool_calls },
+    };
+    const result = try serializeMessagesJson(allocator, &messages);
+    defer allocator.free(result);
+
+    // Should contain tool_calls array
+    try testing.expect(std.mem.indexOf(u8, result, "\"tool_calls\"") != null);
+    try testing.expect(std.mem.indexOf(u8, result, "get_weather") != null);
 }

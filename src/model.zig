@@ -62,6 +62,9 @@ pub const ModelConfig = struct {
     partial_rotary_factor: f32 = 1.0,
     attn_output_gate: bool = false,
 
+    // Context length from config.json (0 = unknown)
+    max_position_embeddings: u32 = 0,
+
     // Stop tokens (populated from config.json)
     eos_token_ids: [8]u32 = .{0} ** 8,
     num_eos_tokens: u32 = 0,
@@ -129,6 +132,7 @@ pub fn parseConfig(allocator: std.mem.Allocator, model_dir: []const u8) !ModelCo
     if (cfg_obj.get("num_attention_heads")) |v| config.num_attention_heads = @intCast(v.integer);
     if (cfg_obj.get("num_key_value_heads")) |v| config.num_key_value_heads = @intCast(v.integer);
     if (cfg_obj.get("head_dim")) |v| config.head_dim = @intCast(v.integer);
+    if (cfg_obj.get("max_position_embeddings")) |v| config.max_position_embeddings = @intCast(v.integer);
     if (cfg_obj.get("rms_norm_eps")) |v| config.rms_norm_eps = jsonFloat(v);
     if (cfg_obj.get("rope_theta")) |v| config.rope_theta = jsonFloat(v);
     if (cfg_obj.get("query_pre_attn_scalar")) |v| config.query_pre_attn_scalar = @intCast(v.integer);
@@ -185,6 +189,13 @@ pub fn parseConfig(allocator: std.mem.Allocator, model_dir: []const u8) !ModelCo
     }
     if (cfg_obj.get("tie_word_embeddings")) |v| {
         if (v == .bool) config.tie_word_embeddings = v.bool;
+    }
+
+    // Check root level for max_position_embeddings (may not be in text_config)
+    if (config.max_position_embeddings == 0) {
+        if (root.get("max_position_embeddings")) |v| {
+            if (v == .integer) config.max_position_embeddings = @intCast(v.integer);
+        }
     }
 
     // Parse quantization from top level
@@ -417,4 +428,110 @@ fn loadSafetensorsFile(
         const owned_key = try allocator.dupe(u8, key_str);
         try weights.map.put(owned_key, value);
     }
+}
+
+// ── Tests ──
+
+const testing = std.testing;
+
+test "ModelConfig defaults" {
+    const config = ModelConfig{};
+    try testing.expectEqual(@as(u32, 0), config.num_eos_tokens);
+    try testing.expectEqual(@as(u32, 0), config.max_position_embeddings);
+    try testing.expectEqual(@as(u32, 4), config.quant_bits);
+    try testing.expectEqual(@as(u32, 64), config.quant_group_size);
+    try testing.expect(!config.tie_word_embeddings);
+}
+
+test "ModelConfig addEosToken" {
+    var config = ModelConfig{};
+    config.addEosToken(1);
+    config.addEosToken(106);
+    try testing.expectEqual(@as(u32, 2), config.num_eos_tokens);
+    try testing.expect(config.isEosToken(1));
+    try testing.expect(config.isEosToken(106));
+    try testing.expect(!config.isEosToken(42));
+}
+
+test "ModelConfig addEosToken max capacity" {
+    var config = ModelConfig{};
+    // Fill all 8 slots
+    for (0..8) |i| {
+        config.addEosToken(@intCast(i + 100));
+    }
+    try testing.expectEqual(@as(u32, 8), config.num_eos_tokens);
+    // 9th should be silently dropped
+    config.addEosToken(999);
+    try testing.expectEqual(@as(u32, 8), config.num_eos_tokens);
+    try testing.expect(!config.isEosToken(999));
+}
+
+test "ModelConfig eosTokenSlice" {
+    var config = ModelConfig{};
+    config.addEosToken(10);
+    config.addEosToken(20);
+    const slice = config.eosTokenSlice();
+    try testing.expectEqual(@as(usize, 2), slice.len);
+    try testing.expectEqual(@as(u32, 10), slice[0]);
+    try testing.expectEqual(@as(u32, 20), slice[1]);
+}
+
+test "ModelConfig isGlobalLayer with sliding window" {
+    var config = ModelConfig{};
+    config.has_sliding_window = true;
+    config.sliding_window_pattern = 6;
+    // Layer 0: 0 % 6 == 0 → global
+    try testing.expect(config.isGlobalLayer(0));
+    // Layer 1: 1 % 6 != 0 → local
+    try testing.expect(!config.isGlobalLayer(1));
+    // Layer 6: 6 % 6 == 0 → global
+    try testing.expect(config.isGlobalLayer(6));
+    // Layer 12: 12 % 6 == 0 → global
+    try testing.expect(config.isGlobalLayer(12));
+}
+
+test "ModelConfig isGlobalLayer without sliding window" {
+    var config = ModelConfig{};
+    config.has_sliding_window = false;
+    // All layers should be global
+    try testing.expect(config.isGlobalLayer(0));
+    try testing.expect(config.isGlobalLayer(1));
+    try testing.expect(config.isGlobalLayer(5));
+}
+
+test "ModelConfig isLinearLayer" {
+    var config = ModelConfig{};
+    config.full_attention_interval = 4;
+    // Layer 0: (0+1) % 4 == 1 != 0 → linear
+    try testing.expect(config.isLinearLayer(0));
+    // Layer 3: (3+1) % 4 == 0 → NOT linear (full attention)
+    try testing.expect(!config.isLinearLayer(3));
+    // Layer 7: (7+1) % 4 == 0 → NOT linear
+    try testing.expect(!config.isLinearLayer(7));
+    // Layer 4: (4+1) % 4 == 1 → linear
+    try testing.expect(config.isLinearLayer(4));
+}
+
+test "ModelConfig isLinearLayer disabled" {
+    var config = ModelConfig{};
+    config.full_attention_interval = 0;
+    try testing.expect(!config.isLinearLayer(0));
+    try testing.expect(!config.isLinearLayer(5));
+}
+
+test "ModelConfig isMoe" {
+    var config = ModelConfig{};
+    try testing.expect(!config.isMoe());
+    config.num_experts = 8;
+    try testing.expect(config.isMoe());
+}
+
+test "jsonFloat converts integer" {
+    const val = std.json.Value{ .integer = 42 };
+    try testing.expectApproxEqAbs(@as(f32, 42.0), jsonFloat(val), 0.001);
+}
+
+test "jsonFloat converts float" {
+    const val = std.json.Value{ .float = 3.14 };
+    try testing.expectApproxEqAbs(@as(f32, 3.14), jsonFloat(val), 0.01);
 }

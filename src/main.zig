@@ -119,7 +119,7 @@ pub fn main() !void {
     _ = mlx.mlx_random_seed(@intCast(std.time.milliTimestamp()));
 
     // Parse config
-    const config = try model_mod.parseConfig(allocator, model_dir);
+    var config = try model_mod.parseConfig(allocator, model_dir);
     log.info("Model: {s} ({d} layers, {d}-dim, head_dim={d}, {d}h/{d}kv, {d}-bit quant)\n", .{
         config.model_type,
         config.num_hidden_layers,
@@ -138,6 +138,22 @@ pub fn main() !void {
     // Load chat config
     var chat_config = try chat_mod.loadChatConfig(allocator, model_dir);
     defer chat_config.deinit();
+
+    // Resolve EOS tokens from tokenizer if config.json didn't specify any
+    if (config.num_eos_tokens == 0) {
+        if (chat_config.eos_token) |eos_str| {
+            if (tok.special_tokens.get(eos_str)) |eos_id| {
+                config.addEosToken(eos_id);
+                log.info("EOS token from tokenizer: {s} (id={d})\n", .{ eos_str, eos_id });
+            }
+        }
+        // Also add <|endoftext|> if it exists and wasn't already added
+        if (tok.special_tokens.get("<|endoftext|>")) |eot_id| {
+            if (!config.isEosToken(eot_id)) {
+                config.addEosToken(eot_id);
+            }
+        }
+    }
 
     // Load weights
     log.info("Loading weights...\n", .{});

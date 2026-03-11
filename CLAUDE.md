@@ -25,9 +25,17 @@ Native Zig server that runs MLX-format LMs on Apple Silicon and exposes an OpenA
 | `src/log.zig` | Leveled logging (error, warn, info, debug) |
 | `build.zig` | Zig build; links mlx-c and Jinja_cpp |
 
+## Testing
+
+- `zig build test` — 69 unit tests (log, chat, model, generate, server)
+- `./tests/integration_test.sh [model_dir] [port]` — 36 end-to-end API tests (needs a model)
+- Always run unit tests before submitting changes
+- Add tests for new pure logic functions in the same source file
+
 ## Conventions
 
 - Prefer minimal, DRY Zig; avoid unnecessary abstraction.
 - Chat templates live in model dirs; Jinja_cpp renders them (with fallback formatting).
 - Server supports concurrent health checks via threaded connections, single-slot generation.
 - KV cache reuse across requests via prompt prefix matching.
+- Tests go at the bottom of each source file (Zig convention).

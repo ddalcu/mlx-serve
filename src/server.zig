@@ -36,7 +36,6 @@ fn getTimeoutNs() u64 {
 
 /// Cached prompt IDs from the last request (for KV cache reuse).
 var cached_prompt_ids: ?[]u32 = null;
-var cached_prompt_allocator: ?std.mem.Allocator = null;
 
 /// Start the HTTP server on the given host and port.
 pub fn serve(
@@ -81,11 +80,19 @@ pub fn serve(
     if (request_timeout_sec > 0) {
         log.info("Request timeout: {d}s\n", .{request_timeout_sec});
     }
+    const model_ctx = config.max_position_embeddings;
+    if (model_ctx > 0) {
+        log.info("Model context length: {d} tokens\n", .{model_ctx});
+    }
     log.info("\nServer listening on http://{s}:{d}\n", .{ host, port });
     log.info("  GET  /health\n", .{});
+    log.info("  GET  /props\n", .{});
     log.info("  GET  /v1/models\n", .{});
     log.info("  POST /v1/chat/completions\n", .{});
-    log.info("  POST /v1/completions\n\n", .{});
+    log.info("  POST /v1/completions\n", .{});
+    log.info("  POST /v1/embeddings\n", .{});
+    log.info("  POST /tokenize\n", .{});
+    log.info("  POST /detokenize\n\n", .{});
 
     var status = StatusBar.init();
     defer status.deinit();
@@ -121,6 +128,12 @@ pub fn serve(
             continue;
         };
         thread.detach();
+    }
+
+    // Free cached prompt on shutdown
+    if (cached_prompt_ids) |old| {
+        allocator.free(old);
+        cached_prompt_ids = null;
     }
 
     log.info("\nShutting down gracefully...\n", .{});
@@ -190,6 +203,9 @@ fn handleConnection(
     } else if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/v1/models")) {
         log.debug("GET  /v1/models -> 200\n", .{});
         try handleModels(allocator, stream, config);
+    } else if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/props")) {
+        log.debug("GET  /props -> 200\n", .{});
+        try handleProps(allocator, stream, config);
     } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/chat/completions")) {
         if (request_in_progress.swap(true, .acq_rel)) {
             log.warn("POST /v1/chat/completions -> 503 (busy)\n", .{});
@@ -210,6 +226,24 @@ fn handleConnection(
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
         const body = request[header_end + 4 .. total_read];
         try handleCompletions(allocator, stream, body, xfm, tok, config);
+    } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/embeddings")) {
+        if (request_in_progress.load(.acquire)) {
+            try sendErrorResponse(allocator, stream, "503 Service Unavailable", "server_error", "Server is busy processing another request", null);
+            return;
+        }
+        request_in_progress.store(true, .release);
+        defer request_in_progress.store(false, .release);
+        const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
+        const body = request[header_end + 4 .. total_read];
+        try handleEmbeddings(allocator, stream, body, xfm, tok, config);
+    } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/tokenize")) {
+        const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
+        const body = request[header_end + 4 .. total_read];
+        try handleTokenize(allocator, stream, body, tok);
+    } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/detokenize")) {
+        const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
+        const body = request[header_end + 4 .. total_read];
+        try handleDetokenize(allocator, stream, body, tok);
     } else if (std.mem.eql(u8, method, "OPTIONS")) {
         log.debug("OPTIONS {s} -> 204\n", .{path});
         try sendResponse(stream, "204 No Content", "text/plain", "");
@@ -219,17 +253,248 @@ fn handleConnection(
     }
 }
 
+fn getEffectiveContextLength(config: *const model_mod.ModelConfig) u32 {
+    if (max_context_size > 0) return max_context_size;
+    return config.max_position_embeddings;
+}
+
+/// Clamp max_tokens so prompt + completion doesn't exceed context length.
+fn clampMaxTokens(max_tokens: u32, prompt_len: usize) u32 {
+    if (max_context_size == 0) return max_tokens;
+    const prompt: u32 = @intCast(@min(prompt_len, max_context_size));
+    if (prompt >= max_context_size) return 1; // at least 1 token
+    const remaining = max_context_size - prompt;
+    if (max_tokens > remaining) {
+        log.debug("  max_tokens clamped: {d} -> {d} (ctx_size={d}, prompt={d})\n", .{ max_tokens, remaining, max_context_size, prompt });
+        return remaining;
+    }
+    return max_tokens;
+}
+
 fn handleModels(allocator: std.mem.Allocator, stream: std.net.Stream, config: *const model_mod.ModelConfig) !void {
-    const ctx_str = if (max_context_size > 0) blk: {
-        break :blk try std.fmt.allocPrint(allocator, "{d}", .{max_context_size});
+    const ctx_len = getEffectiveContextLength(config);
+    const ctx_str = if (ctx_len > 0) blk: {
+        break :blk try std.fmt.allocPrint(allocator, "{d}", .{ctx_len});
     } else try std.fmt.allocPrint(allocator, "null", .{});
     defer allocator.free(ctx_str);
 
     const body = try std.fmt.allocPrint(allocator,
-        \\{{"object":"list","data":[{{"id":"{s}","object":"model","created":0,"owned_by":"mlx-serve","meta":{{"vocab_size":{d},"hidden_size":{d},"num_layers":{d},"quantization":"{d}-bit","context_length":{s}}}}}]}}
-    , .{ config.model_type, config.vocab_size, config.hidden_size, config.num_hidden_layers, config.quant_bits, ctx_str });
+        \\{{"object":"list","data":[{{"id":"{s}","object":"model","created":{d},"owned_by":"mlx-serve","meta":{{"vocab_size":{d},"hidden_size":{d},"num_layers":{d},"quantization":"{d}-bit","context_length":{s}}}}}]}}
+    , .{ config.model_type, std.time.timestamp(), config.vocab_size, config.hidden_size, config.num_hidden_layers, config.quant_bits, ctx_str });
     defer allocator.free(body);
     try sendResponse(stream, "200 OK", "application/json", body);
+}
+
+fn handleProps(allocator: std.mem.Allocator, stream: std.net.Stream, config: *const model_mod.ModelConfig) !void {
+    const ctx_len = getEffectiveContextLength(config);
+    const ctx_str = if (ctx_len > 0) blk: {
+        break :blk try std.fmt.allocPrint(allocator, "{d}", .{ctx_len});
+    } else try std.fmt.allocPrint(allocator, "0", .{});
+    defer allocator.free(ctx_str);
+
+    const body = try std.fmt.allocPrint(allocator,
+        \\{{"default_generation_settings":{{"model":"{s}","n_ctx":{s}}},"total_slots":1,"chat_template":"chatml"}}
+    , .{ config.model_type, ctx_str });
+    defer allocator.free(body);
+    try sendResponse(stream, "200 OK", "application/json", body);
+}
+
+fn handleEmbeddings(
+    allocator: std.mem.Allocator,
+    stream: std.net.Stream,
+    body: []const u8,
+    xfm: *Transformer,
+    tok: *const Tokenizer,
+    config: *const model_mod.ModelConfig,
+) !void {
+    const gen_mod = @import("generate.zig");
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch {
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Invalid JSON in request body", null);
+        return;
+    };
+    defer parsed.deinit();
+    const root = parsed.value.object;
+
+    // Parse input — can be a string or array of strings
+    const input_val = root.get("input") orelse {
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Missing 'input' field", null);
+        return;
+    };
+
+    const model_name = if (root.get("model")) |m| (if (m == .string) m.string else config.model_type) else config.model_type;
+
+    // Collect input texts
+    var texts = std.ArrayList([]const u8).empty;
+    defer texts.deinit(allocator);
+
+    switch (input_val) {
+        .string => |s| try texts.append(allocator, s),
+        .array => |arr| {
+            for (arr.items) |item| {
+                if (item == .string) {
+                    try texts.append(allocator, item.string);
+                }
+            }
+        },
+        else => {
+            try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "'input' must be a string or array of strings", null);
+            return;
+        },
+    }
+
+    if (texts.items.len == 0) {
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "'input' must not be empty", null);
+        return;
+    }
+
+    log.info("POST /v1/embeddings ({d} inputs)\n", .{texts.items.len});
+
+    // Build response JSON
+    var resp_buf = std.ArrayList(u8).empty;
+    defer resp_buf.deinit(allocator);
+
+    try resp_buf.appendSlice(allocator, "{\"object\":\"list\",\"data\":[");
+
+    var total_tokens: usize = 0;
+    for (texts.items, 0..) |text, idx| {
+        // Tokenize
+        const ids = try tok.encode(allocator, text);
+        defer allocator.free(ids);
+        total_tokens += ids.len;
+
+        // Reset KV cache for each embedding (no carry-over state)
+        try xfm.resetCache();
+
+        // Compute embedding
+        const embedding = gen_mod.computeEmbedding(allocator, xfm, ids) catch |err| {
+            log.err("  embedding error: {}\n", .{err});
+            try sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", "Failed to compute embedding", null);
+            return;
+        };
+        defer allocator.free(embedding);
+
+        if (idx > 0) try resp_buf.appendSlice(allocator, ",");
+
+        // Format: {"object":"embedding","embedding":[...floats...],"index":N}
+        const idx_str = try std.fmt.allocPrint(allocator, "{d}", .{idx});
+        defer allocator.free(idx_str);
+        try resp_buf.appendSlice(allocator, "{\"object\":\"embedding\",\"embedding\":[");
+
+        for (embedding, 0..) |val, i| {
+            if (i > 0) try resp_buf.appendSlice(allocator, ",");
+            var buf: [32]u8 = undefined;
+            const float_str = std.fmt.bufPrint(&buf, "{d:.8}", .{val}) catch "0";
+            try resp_buf.appendSlice(allocator, float_str);
+        }
+
+        try resp_buf.appendSlice(allocator, "],\"index\":");
+        try resp_buf.appendSlice(allocator, idx_str);
+        try resp_buf.appendSlice(allocator, "}");
+    }
+
+    const total_str = try std.fmt.allocPrint(allocator, "{d}", .{total_tokens});
+    defer allocator.free(total_str);
+    const model_escaped = try jsonEscape(allocator, model_name);
+    defer allocator.free(model_escaped);
+
+    try resp_buf.appendSlice(allocator, "],\"model\":");
+    try resp_buf.appendSlice(allocator, model_escaped);
+    try resp_buf.appendSlice(allocator, ",\"usage\":{\"prompt_tokens\":");
+    try resp_buf.appendSlice(allocator, total_str);
+    try resp_buf.appendSlice(allocator, ",\"total_tokens\":");
+    try resp_buf.appendSlice(allocator, total_str);
+    try resp_buf.appendSlice(allocator, "}}");
+
+    try sendResponse(stream, "200 OK", "application/json", resp_buf.items);
+    log.info("  <- {d} embeddings ({d} tokens)\n", .{ texts.items.len, total_tokens });
+}
+
+fn handleTokenize(
+    allocator: std.mem.Allocator,
+    stream: std.net.Stream,
+    body: []const u8,
+    tok: *const Tokenizer,
+) !void {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch {
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Invalid JSON", 400);
+        return;
+    };
+    defer parsed.deinit();
+    const root = parsed.value.object;
+
+    const content = if (root.get("content")) |v| (if (v == .string) v.string else null) else null;
+    if (content == null) {
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "'content' is required", 400);
+        return;
+    }
+
+    const ids = try tok.encode(allocator, content.?);
+    defer allocator.free(ids);
+
+    var result = std.ArrayList(u8).empty;
+    defer result.deinit(allocator);
+    try result.appendSlice(allocator, "{\"tokens\":[");
+    for (ids, 0..) |id, i| {
+        if (i > 0) try result.append(allocator, ',');
+        var num_buf: [12]u8 = undefined;
+        const num = std.fmt.bufPrint(&num_buf, "{d}", .{id}) catch continue;
+        try result.appendSlice(allocator, num);
+    }
+    try result.appendSlice(allocator, "]}");
+
+    log.debug("POST /tokenize -> {d} tokens\n", .{ids.len});
+    try sendResponse(stream, "200 OK", "application/json", result.items);
+}
+
+fn handleDetokenize(
+    allocator: std.mem.Allocator,
+    stream: std.net.Stream,
+    body: []const u8,
+    tok: *const Tokenizer,
+) !void {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch {
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Invalid JSON", 400);
+        return;
+    };
+    defer parsed.deinit();
+    const root = parsed.value.object;
+
+    const tokens_val = root.get("tokens") orelse {
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "'tokens' is required", 400);
+        return;
+    };
+    if (tokens_val != .array) {
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "'tokens' must be an array", 400);
+        return;
+    }
+
+    var ids = std.ArrayList(u32).empty;
+    defer ids.deinit(allocator);
+    for (tokens_val.array.items) |item| {
+        if (item == .integer) try ids.append(allocator, @intCast(item.integer));
+    }
+
+    const text = try tok.decode(allocator, ids.items, false);
+    defer allocator.free(text);
+
+    // JSON-escape the text
+    var result = std.ArrayList(u8).empty;
+    defer result.deinit(allocator);
+    try result.appendSlice(allocator, "{\"content\":\"");
+    for (text) |c| {
+        switch (c) {
+            '"' => try result.appendSlice(allocator, "\\\""),
+            '\\' => try result.appendSlice(allocator, "\\\\"),
+            '\n' => try result.appendSlice(allocator, "\\n"),
+            '\r' => try result.appendSlice(allocator, "\\r"),
+            '\t' => try result.appendSlice(allocator, "\\t"),
+            else => try result.append(allocator, c),
+        }
+    }
+    try result.appendSlice(allocator, "\"}");
+
+    log.debug("POST /detokenize -> {d} tokens -> {d} chars\n", .{ ids.items.len, text.len });
+    try sendResponse(stream, "200 OK", "application/json", result.items);
 }
 
 fn handleChatCompletions(
@@ -263,7 +528,10 @@ fn handleChatCompletions(
 
     // Parse tool call structs for assistant messages (stored temporarily)
     var tool_call_lists = std.ArrayList([]const chat_mod.ToolCall).empty;
-    defer tool_call_lists.deinit(allocator);
+    defer {
+        for (tool_call_lists.items) |tcs| allocator.free(tcs);
+        tool_call_lists.deinit(allocator);
+    }
 
     for (messages_val.array.items) |msg_val| {
         const obj = msg_val.object;
@@ -390,6 +658,10 @@ fn handleChatCompletions(
     var tools_json: ?[]const u8 = null;
     var has_tools = root.get("tools") != null;
     var tool_choice_instruction: ?[]const u8 = null;
+    var tool_choice_allocated = false;
+    defer if (tool_choice_allocated) {
+        if (tool_choice_instruction) |tci| allocator.free(tci);
+    };
 
     if (has_tools) {
         // Parse tool_choice: "none" | "auto" | "required" | {"type":"function","function":{"name":"..."}}
@@ -409,6 +681,7 @@ fn handleChatCompletions(
                             if (name_val == .string) {
                                 tool_choice_instruction = try std.fmt.allocPrint(allocator,
                                     "\nYou MUST call the function \"{s}\". Do not respond with text.", .{name_val.string});
+                                tool_choice_allocated = true;
                             }
                         }
                     }
@@ -445,6 +718,13 @@ fn handleChatCompletions(
     else
         config.model_type;
 
+    // Track allocations from response_format injection so we can free them
+    var rf_allocs = std.ArrayList([]const u8).empty;
+    defer {
+        for (rf_allocs.items) |a| allocator.free(a);
+        rf_allocs.deinit(allocator);
+    }
+
     // Parse response_format — inject JSON schema constraint into system message
     if (root.get("response_format")) |rf| {
         if (rf == .object) {
@@ -458,7 +738,6 @@ fn handleChatCompletions(
                 if (rf.object.get("json_schema")) |js| {
                     if (js == .object) {
                         if (js.object.get("schema")) |schema_val| {
-                            // Stringify the schema value using Zig's JSON Stringify
                             var out: std.io.Writer.Allocating = .init(allocator);
                             defer out.deinit();
                             var jws: std.json.Stringify = .{ .writer = &out.writer, .options = .{} };
@@ -469,20 +748,20 @@ fn handleChatCompletions(
                     }
                 }
 
-                // Prepend as system message or modify existing system message
                 const instruction = try allocator.dupe(u8, schema_instruction.items);
+                try rf_allocs.append(allocator, instruction);
                 if (messages.items.len > 0 and std.mem.eql(u8, messages.items[0].role, "system")) {
-                    // Append to existing system message
                     const combined = try std.fmt.allocPrint(allocator, "{s}\n\n{s}", .{ messages.items[0].content, instruction });
+                    try rf_allocs.append(allocator, combined);
                     messages.items[0].content = combined;
                 } else {
-                    // Insert system message at beginning
                     try messages.insert(allocator, 0, .{ .role = "system", .content = instruction, .tool_calls = null, .tool_call_id = null });
                 }
             } else if (std.mem.eql(u8, rf_type, "json_object")) {
                 const instruction = "Respond with valid JSON only. No other text, no markdown, no explanation.";
                 if (messages.items.len > 0 and std.mem.eql(u8, messages.items[0].role, "system")) {
                     const combined = try std.fmt.allocPrint(allocator, "{s}\n\n{s}", .{ messages.items[0].content, instruction });
+                    try rf_allocs.append(allocator, combined);
                     messages.items[0].content = combined;
                 } else {
                     try messages.insert(allocator, 0, .{ .role = "system", .content = instruction, .tool_calls = null, .tool_call_id = null });
@@ -520,6 +799,9 @@ fn handleChatCompletions(
         return;
     }
 
+    // Clamp max_tokens to stay within context window
+    const effective_max_tokens = clampMaxTokens(max_tokens, prompt_ids.len);
+
     // Prompt caching: reuse KV cache for shared prefix
     const cache_result = try reuseKVCache(allocator, xfm, prompt_ids);
 
@@ -535,11 +817,11 @@ fn handleChatCompletions(
     };
 
     if (is_stream) {
-        handleStreamingGeneration(allocator, stream, xfm, tok, cache_result.new_tokens, max_tokens, sampling, eos_slice, stop_sequences.items, model_name, include_usage, has_tools, cache_result.cached_tokens, logprobs_n, enable_thinking) catch |err| {
+        handleStreamingGeneration(allocator, stream, xfm, tok, cache_result.new_tokens, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, include_usage, has_tools, cache_result.cached_tokens, logprobs_n, enable_thinking) catch |err| {
             log.err("  -> streaming error: {}\n", .{err});
         };
     } else {
-        handleNonStreamingGeneration(allocator, stream, xfm, tok, cache_result.new_tokens, max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, cache_result.cached_tokens, logprobs_n, enable_thinking) catch |err| {
+        handleNonStreamingGeneration(allocator, stream, xfm, tok, cache_result.new_tokens, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, cache_result.cached_tokens, logprobs_n, enable_thinking) catch |err| {
             log.err("  -> 500 ({s})\n", .{@errorName(err)});
             sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", @errorName(err), 500) catch {};
         };
@@ -673,6 +955,9 @@ fn handleCompletions(
         return;
     }
 
+    // Clamp max_tokens to stay within context window
+    const effective_max_tokens = clampMaxTokens(max_tokens, prompt_ids.len);
+
     // Prompt caching: reuse KV cache for shared prefix
     const cache_result = try reuseKVCache(allocator, xfm, prompt_ids);
 
@@ -687,11 +972,11 @@ fn handleCompletions(
     };
 
     if (is_stream) {
-        handleStreamingCompletion(allocator, stream, xfm, tok, cache_result.new_tokens, max_tokens, sampling, eos_slice, stop_sequences.items, model_name, include_usage, cache_result.cached_tokens) catch |err| {
+        handleStreamingCompletion(allocator, stream, xfm, tok, cache_result.new_tokens, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, include_usage, cache_result.cached_tokens) catch |err| {
             log.err("  -> streaming error: {}\n", .{err});
         };
     } else {
-        handleNonStreamingCompletion(allocator, stream, xfm, tok, cache_result.new_tokens, max_tokens, sampling, eos_slice, stop_sequences.items, model_name, cache_result.cached_tokens) catch |err| {
+        handleNonStreamingCompletion(allocator, stream, xfm, tok, cache_result.new_tokens, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, cache_result.cached_tokens) catch |err| {
             log.err("  -> 500 ({s})\n", .{@errorName(err)});
             sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", @errorName(err), 500) catch {};
         };
@@ -741,9 +1026,10 @@ fn handleNonStreamingCompletion(
     defer if (!std.mem.eql(u8, escaped_text, "\"\"")) allocator.free(escaped_text);
 
     const response = try std.fmt.allocPrint(allocator,
-        \\{{"id":"cmpl-{d}","object":"text_completion","model":"{s}","choices":[{{"index":0,"text":{s},"finish_reason":"{s}"}}],"usage":{{"prompt_tokens":{d},"completion_tokens":{d},"total_tokens":{d}}}}}
+        \\{{"id":"cmpl-{d}","object":"text_completion","created":{d},"model":"{s}","system_fingerprint":"mlx-serve","choices":[{{"index":0,"text":{s},"finish_reason":"{s}"}}],"usage":{{"prompt_tokens":{d},"completion_tokens":{d},"total_tokens":{d}}}}}
     , .{
         std.time.milliTimestamp(),
+        std.time.timestamp(),
         model_name,
         escaped_text,
         finish_reason,
@@ -771,6 +1057,7 @@ fn handleStreamingCompletion(
     cached_tokens: u32,
 ) !void {
     const cmpl_id = std.time.milliTimestamp();
+    const created_ts = std.time.timestamp();
     var timer = try std.time.Timer.start();
 
     var gen = try Generator.init(allocator, xfm, tok, prompt_ids, max_tokens, sampling, eos_token_ids);
@@ -812,8 +1099,8 @@ fn handleStreamingCompletion(
         const escaped = try jsonEscape(allocator, token_text);
         defer allocator.free(escaped);
         const chunk = try std.fmt.allocPrint(allocator,
-            \\{{"id":"cmpl-{d}","object":"text_completion.chunk","model":"{s}","choices":[{{"index":0,"text":{s},"finish_reason":null}}]}}
-        , .{ cmpl_id, model_name, escaped });
+            \\{{"id":"cmpl-{d}","object":"text_completion.chunk","created":{d},"model":"{s}","system_fingerprint":"mlx-serve","choices":[{{"index":0,"text":{s},"finish_reason":null}}]}}
+        , .{ cmpl_id, created_ts, model_name, escaped });
         defer allocator.free(chunk);
 
         try stream.writeAll("data: ");
@@ -832,8 +1119,8 @@ fn handleStreamingCompletion(
     defer allocator.free(usage_str);
 
     const final_chunk = try std.fmt.allocPrint(allocator,
-        \\{{"id":"cmpl-{d}","object":"text_completion.chunk","model":"{s}","choices":[{{"index":0,"text":"","finish_reason":"{s}"}}]{s}}}
-    , .{ cmpl_id, model_name, finish_reason, usage_str });
+        \\{{"id":"cmpl-{d}","object":"text_completion.chunk","created":{d},"model":"{s}","system_fingerprint":"mlx-serve","choices":[{{"index":0,"text":"","finish_reason":"{s}"}}]{s}}}
+    , .{ cmpl_id, created_ts, model_name, finish_reason, usage_str });
     defer allocator.free(final_chunk);
 
     try stream.writeAll("data: ");
@@ -925,9 +1212,10 @@ fn handleNonStreamingGeneration(
             try tc_buf.appendSlice(allocator, "]");
 
             const response = try std.fmt.allocPrint(allocator,
-                \\{{"id":"chatcmpl-{d}","object":"chat.completion","model":"{s}","choices":[{{"index":0,"message":{{"role":"assistant","content":null,"tool_calls":{s}}},"finish_reason":"tool_calls"}}],"usage":{{"prompt_tokens":{d},"completion_tokens":{d},"total_tokens":{d}}}}}
+                \\{{"id":"chatcmpl-{d}","object":"chat.completion","created":{d},"model":"{s}","system_fingerprint":"mlx-serve","choices":[{{"index":0,"message":{{"role":"assistant","content":null,"tool_calls":{s}}},"finish_reason":"tool_calls"}}],"usage":{{"prompt_tokens":{d},"completion_tokens":{d},"total_tokens":{d}}}}}
             , .{
                 std.time.milliTimestamp(),
+                std.time.timestamp(),
                 model_name,
                 tc_buf.items,
                 result.prompt_tokens,
@@ -974,9 +1262,10 @@ fn handleNonStreamingGeneration(
     defer if (reasoning_allocated) allocator.free(reasoning_json);
 
     const response = try std.fmt.allocPrint(allocator,
-        \\{{"id":"chatcmpl-{d}","object":"chat.completion","model":"{s}","choices":[{{"index":0,"message":{{"role":"assistant","content":{s}{s}}},"logprobs":{s},"finish_reason":"{s}"}}],"usage":{{"prompt_tokens":{d},"completion_tokens":{d},"total_tokens":{d}}}}}
+        \\{{"id":"chatcmpl-{d}","object":"chat.completion","created":{d},"model":"{s}","system_fingerprint":"mlx-serve","choices":[{{"index":0,"message":{{"role":"assistant","content":{s}{s}}},"logprobs":{s},"finish_reason":"{s}"}}],"usage":{{"prompt_tokens":{d},"completion_tokens":{d},"total_tokens":{d}}}}}
     , .{
         std.time.milliTimestamp(),
+        std.time.timestamp(),
         model_name,
         escaped_text,
         reasoning_json,
@@ -1032,11 +1321,10 @@ fn handleStreamingGeneration(
     // First chunk: role announcement
     try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = "assistant", .content = "" }, null, null);
 
-    // Buffer for stop sequence, tool call, and think block detection
+    // Buffer for stop sequence and tool call detection
     var text_buf = std.ArrayList(u8).empty;
     defer text_buf.deinit(allocator);
-    const needs_buffering = has_tools or stop_sequences.len > 0 or enable_thinking;
-    // When buffering, store individual token texts for deferred streaming
+    // When tools are present, buffer individual token texts for deferred streaming
     var token_texts = std.ArrayList([]const u8).empty;
     defer {
         for (token_texts.items) |t| allocator.free(t);
@@ -1044,13 +1332,20 @@ fn handleStreamingGeneration(
     }
     var stopped = false;
 
+    // Thinking state for real-time streaming of reasoning_content vs content
+    var in_think_block = enable_thinking; // starts true when thinking enabled (model outputs <think> first)
+    var think_buf = std.ArrayList(u8).empty; // buffer to detect </think> across token boundaries
+    defer think_buf.deinit(allocator);
+    const think_close_tag = "</think>";
+    var skipped_think_open = false; // track if we've skipped the initial <think> tag
+
     // Generate tokens
     while (try gen.next(allocator)) |token_id| {
         const strip = tok.tok_type == .sentencepiece_bpe;
         const token_text = try tok.decode(allocator, &[_]u32{token_id}, strip and false);
 
-        // Accumulate for detection
-        if (needs_buffering) {
+        // Accumulate for stop sequence and tool call detection
+        if (has_tools or stop_sequences.len > 0) {
             try text_buf.appendSlice(allocator, token_text);
         }
 
@@ -1070,16 +1365,75 @@ fn handleStreamingGeneration(
             }
         }
 
-        if (has_tools or enable_thinking) {
-            // Buffer tokens — we'll process them after generation
+        if (has_tools) {
+            // Buffer tokens — we'll emit them after generation if no tool calls found
             try token_texts.append(allocator, token_text);
+        } else if (enable_thinking and in_think_block) {
+            // Inside <think> block — stream as reasoning_content with </think> detection
+            defer allocator.free(token_text);
+            try think_buf.appendSlice(allocator, token_text);
+
+            // Skip the initial <think>\n prefix
+            if (!skipped_think_open and think_buf.items.len >= 7) {
+                if (std.mem.startsWith(u8, think_buf.items, "<think>")) {
+                    // Remove <think> prefix and any leading newline
+                    var skip: usize = 7;
+                    while (skip < think_buf.items.len and think_buf.items[skip] == '\n') skip += 1;
+                    const remaining = try allocator.dupe(u8, think_buf.items[skip..]);
+                    think_buf.clearAndFree(allocator);
+                    try think_buf.appendSlice(allocator, remaining);
+                    allocator.free(remaining);
+                }
+                skipped_think_open = true;
+            }
+
+            // Check for </think> in buffer
+            if (std.mem.indexOf(u8, think_buf.items, think_close_tag)) |close_pos| {
+                // Flush reasoning before </think>
+                if (close_pos > 0) {
+                    try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = think_buf.items[0..close_pos] }, null, null);
+                }
+                // Content after </think>
+                const after = close_pos + think_close_tag.len;
+                const content_after = std.mem.trimLeft(u8, think_buf.items[after..], "\n ");
+                if (content_after.len > 0) {
+                    try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = content_after }, null, null);
+                }
+                think_buf.clearRetainingCapacity();
+                in_think_block = false;
+            } else if (skipped_think_open) {
+                // Flush reasoning tokens that can't be part of </think>
+                // Keep last (think_close_tag.len - 1) bytes as they might be a partial tag
+                const safe_len = if (think_buf.items.len > think_close_tag.len - 1)
+                    think_buf.items.len - (think_close_tag.len - 1)
+                else
+                    0;
+                if (safe_len > 0) {
+                    try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = think_buf.items[0..safe_len] }, null, null);
+                    // Shift remaining bytes to front
+                    const remaining = try allocator.dupe(u8, think_buf.items[safe_len..]);
+                    think_buf.clearRetainingCapacity();
+                    try think_buf.appendSlice(allocator, remaining);
+                    allocator.free(remaining);
+                }
+            }
         } else {
             defer allocator.free(token_text);
             try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = token_text }, null, null);
         }
     }
 
-    // After generation: process buffered output
+    // Flush any remaining think buffer
+    if (enable_thinking and think_buf.items.len > 0) {
+        if (in_think_block) {
+            // Never found </think> — flush as reasoning
+            try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = think_buf.items }, null, null);
+        } else {
+            try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = think_buf.items }, null, null);
+        }
+    }
+
+    // After generation: check for tool calls in accumulated text
     var finish_reason: []const u8 = if (stopped) "stop" else gen.finish_reason;
     if (has_tools) {
         if (try chat_mod.parseToolCalls(allocator, text_buf.items)) |tool_calls| {
@@ -1121,29 +1475,11 @@ fn handleStreamingGeneration(
                 }
             }
             finish_reason = "tool_calls";
-        } else if (enable_thinking) {
-            // No tool calls but thinking enabled — split and stream
-            const think_split = chat_mod.splitThinkBlock(text_buf.items, true);
-            if (think_split.reasoning_content) |reasoning| {
-                try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = reasoning }, null, null);
-            }
-            if (think_split.content.len > 0) {
-                try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = think_split.content }, null, null);
-            }
         } else {
-            // No tool calls, no thinking — flush buffered tokens as content
+            // No tool calls found — flush buffered tokens as content
             for (token_texts.items) |t| {
                 try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = t }, null, null);
             }
-        }
-    } else if (enable_thinking) {
-        // Thinking enabled (no tools) — split reasoning from content
-        const think_split = chat_mod.splitThinkBlock(text_buf.items, true);
-        if (think_split.reasoning_content) |reasoning| {
-            try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = reasoning }, null, null);
-        }
-        if (think_split.content.len > 0) {
-            try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = think_split.content }, null, null);
         }
     }
 
@@ -1238,8 +1574,8 @@ fn sendSSEChunk(
 
     // Build the full SSE chunk
     const chunk = try std.fmt.allocPrint(allocator,
-        \\{{"id":"chatcmpl-{d}","object":"chat.completion.chunk","model":"{s}","choices":[{{"index":0,"delta":{s},"finish_reason":{s}}}],"usage":{s}}}
-    , .{ chat_id, model_name, delta_buf.items, fr_str, usage_str });
+        \\{{"id":"chatcmpl-{d}","object":"chat.completion.chunk","created":{d},"model":"{s}","system_fingerprint":"mlx-serve","choices":[{{"index":0,"delta":{s},"finish_reason":{s}}}],"usage":{s}}}
+    , .{ chat_id, std.time.timestamp(), model_name, delta_buf.items, fr_str, usage_str });
     defer allocator.free(chunk);
 
     // Write as SSE event
@@ -1518,4 +1854,184 @@ fn parseJsonFloat(root: std.json.ObjectMap, key: []const u8, default: f32, min: 
         else => default,
     } else default;
     return std.math.clamp(raw, min, max);
+}
+
+// ── Tests ──
+
+const testing = std.testing;
+
+test "findContentLength parses header" {
+    try testing.expectEqual(@as(?usize, 42), findContentLength("Host: localhost\r\nContent-Length: 42\r\nAccept: */*"));
+}
+
+test "findContentLength case insensitive" {
+    try testing.expectEqual(@as(?usize, 100), findContentLength("content-length: 100"));
+    try testing.expectEqual(@as(?usize, 100), findContentLength("Content-Length: 100"));
+    try testing.expectEqual(@as(?usize, 100), findContentLength("CONTENT-LENGTH: 100"));
+}
+
+test "findContentLength returns null when missing" {
+    try testing.expect(findContentLength("Host: localhost\r\nAccept: */*") == null);
+    try testing.expect(findContentLength("") == null);
+}
+
+test "extractJsonField extracts array" {
+    const body =
+        \\{"messages":[{"role":"user","content":"hi"}],"temperature":0.7}
+    ;
+    const result = extractJsonField(body, "messages").?;
+    try testing.expect(std.mem.startsWith(u8, result, "["));
+    try testing.expect(std.mem.endsWith(u8, result, "]"));
+}
+
+test "extractJsonField extracts nested object" {
+    const body =
+        \\{"response_format":{"type":"json_schema","json_schema":{"schema":{"type":"object"}}}}
+    ;
+    const result = extractJsonField(body, "response_format").?;
+    try testing.expect(std.mem.startsWith(u8, result, "{"));
+    try testing.expect(std.mem.endsWith(u8, result, "}"));
+}
+
+test "extractJsonField returns null for missing field" {
+    const body = "{\"messages\":[]}";
+    try testing.expect(extractJsonField(body, "tools") == null);
+}
+
+test "extractJsonField handles escaped quotes in strings" {
+    const body =
+        \\{"tools":[{"type":"function","function":{"name":"say_\"hello\""}}]}
+    ;
+    const result = extractJsonField(body, "tools").?;
+    try testing.expect(std.mem.startsWith(u8, result, "["));
+    try testing.expect(std.mem.endsWith(u8, result, "]"));
+}
+
+test "jsonEscape basic string" {
+    const allocator = testing.allocator;
+    const result = try jsonEscape(allocator, "hello");
+    defer allocator.free(result);
+    try testing.expectEqualStrings("\"hello\"", result);
+}
+
+test "jsonEscape special characters" {
+    const allocator = testing.allocator;
+    const result = try jsonEscape(allocator, "line1\nline2\t\"quoted\"\\back");
+    defer allocator.free(result);
+    try testing.expectEqualStrings("\"line1\\nline2\\t\\\"quoted\\\"\\\\back\"", result);
+}
+
+test "jsonEscape control characters" {
+    const allocator = testing.allocator;
+    const input = &[_]u8{ 0x01, 0x02 };
+    const result = try jsonEscape(allocator, input);
+    defer allocator.free(result);
+    try testing.expectEqualStrings("\"\\u0001\\u0002\"", result);
+}
+
+test "jsonEscape empty string" {
+    const allocator = testing.allocator;
+    const result = try jsonEscape(allocator, "");
+    defer allocator.free(result);
+    try testing.expectEqualStrings("\"\"", result);
+}
+
+test "parseJsonFloat returns value when present" {
+    const allocator = testing.allocator;
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, "{\"temp\":0.7}", .{});
+    defer parsed.deinit();
+    const result = parseJsonFloat(parsed.value.object, "temp", 1.0, 0.0, 2.0);
+    try testing.expectApproxEqAbs(@as(f32, 0.7), result, 0.001);
+}
+
+test "parseJsonFloat returns default when missing" {
+    const allocator = testing.allocator;
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, "{}", .{});
+    defer parsed.deinit();
+    const result = parseJsonFloat(parsed.value.object, "temp", 1.0, 0.0, 2.0);
+    try testing.expectApproxEqAbs(@as(f32, 1.0), result, 0.001);
+}
+
+test "parseJsonFloat clamps to range" {
+    const allocator = testing.allocator;
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, "{\"temp\":5.0}", .{});
+    defer parsed.deinit();
+    const result = parseJsonFloat(parsed.value.object, "temp", 1.0, 0.0, 2.0);
+    try testing.expectApproxEqAbs(@as(f32, 2.0), result, 0.001);
+}
+
+test "parseJsonFloat handles integer value" {
+    const allocator = testing.allocator;
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, "{\"temp\":1}", .{});
+    defer parsed.deinit();
+    const result = parseJsonFloat(parsed.value.object, "temp", 0.5, 0.0, 2.0);
+    try testing.expectApproxEqAbs(@as(f32, 1.0), result, 0.001);
+}
+
+test "getEffectiveContextLength uses ctx_size override" {
+    const original = max_context_size;
+    defer max_context_size = original;
+
+    max_context_size = 4096;
+    var config = model_mod.ModelConfig{};
+    config.max_position_embeddings = 32768;
+    try testing.expectEqual(@as(u32, 4096), getEffectiveContextLength(&config));
+}
+
+test "getEffectiveContextLength falls back to model config" {
+    const original = max_context_size;
+    defer max_context_size = original;
+
+    max_context_size = 0;
+    var config = model_mod.ModelConfig{};
+    config.max_position_embeddings = 32768;
+    try testing.expectEqual(@as(u32, 32768), getEffectiveContextLength(&config));
+}
+
+test "clampMaxTokens no limit when ctx_size=0" {
+    const original = max_context_size;
+    defer max_context_size = original;
+    max_context_size = 0;
+
+    try testing.expectEqual(@as(u32, 1000), clampMaxTokens(1000, 500));
+}
+
+test "clampMaxTokens clamps when would exceed" {
+    const original = max_context_size;
+    defer max_context_size = original;
+    max_context_size = 4096;
+
+    // prompt=3000, max_tokens=2000 → clamp to 1096
+    try testing.expectEqual(@as(u32, 1096), clampMaxTokens(2000, 3000));
+}
+
+test "clampMaxTokens no clamp when fits" {
+    const original = max_context_size;
+    defer max_context_size = original;
+    max_context_size = 4096;
+
+    // prompt=100, max_tokens=200 → fits, no clamp
+    try testing.expectEqual(@as(u32, 200), clampMaxTokens(200, 100));
+}
+
+test "clampMaxTokens at boundary" {
+    const original = max_context_size;
+    defer max_context_size = original;
+    max_context_size = 4096;
+
+    // prompt=4096 → only 1 token allowed
+    try testing.expectEqual(@as(u32, 1), clampMaxTokens(100, 4096));
+    // prompt=4095 → only 1 token remaining
+    try testing.expectEqual(@as(u32, 1), clampMaxTokens(100, 4095));
+}
+
+test "getTimeoutNs computes correctly" {
+    const original = request_timeout_sec;
+    defer request_timeout_sec = original;
+
+    request_timeout_sec = 300;
+    try testing.expectEqual(@as(u64, 300_000_000_000), getTimeoutNs());
+
+    request_timeout_sec = 0;
+    try testing.expectEqual(@as(u64, 0), getTimeoutNs());
 }

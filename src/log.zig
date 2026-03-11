@@ -44,3 +44,37 @@ pub fn debug(comptime fmt: []const u8, args: anytype) void {
         std.debug.print(fmt, args);
     }
 }
+
+// ── Tests ──
+
+const testing = std.testing;
+
+test "Level.fromString valid levels" {
+    try testing.expectEqual(Level.err, Level.fromString("error").?);
+    try testing.expectEqual(Level.warn, Level.fromString("warn").?);
+    try testing.expectEqual(Level.info, Level.fromString("info").?);
+    try testing.expectEqual(Level.debug, Level.fromString("debug").?);
+}
+
+test "Level.fromString invalid returns null" {
+    try testing.expect(Level.fromString("verbose") == null);
+    try testing.expect(Level.fromString("") == null);
+    try testing.expect(Level.fromString("INFO") == null);
+}
+
+test "Level ordering" {
+    // err < warn < info < debug
+    try testing.expect(@intFromEnum(Level.err) < @intFromEnum(Level.warn));
+    try testing.expect(@intFromEnum(Level.warn) < @intFromEnum(Level.info));
+    try testing.expect(@intFromEnum(Level.info) < @intFromEnum(Level.debug));
+}
+
+test "setLevel changes current level" {
+    const original = current_level;
+    defer setLevel(original); // restore
+
+    setLevel(.debug);
+    try testing.expectEqual(Level.debug, current_level);
+    setLevel(.err);
+    try testing.expectEqual(Level.err, current_level);
+}

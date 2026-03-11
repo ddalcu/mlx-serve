@@ -118,6 +118,7 @@ pub extern "c" fn mlx_vector_array_new_data(data: [*]const mlx_array, size: usiz
 pub extern "c" fn mlx_vector_array_free(vec: mlx_vector_array) c_int;
 pub extern "c" fn mlx_vector_array_size(vec: mlx_vector_array) usize;
 pub extern "c" fn mlx_vector_array_get(res: *mlx_array, vec: mlx_vector_array, idx: usize) c_int;
+pub extern "c" fn mlx_vector_array_new_value(val: mlx_array) mlx_vector_array;
 pub extern "c" fn mlx_vector_array_append_value(vec: mlx_vector_array, val: mlx_array) c_int;
 
 // Closure + compile
@@ -155,6 +156,7 @@ pub extern "c" fn mlx_subtract(res: *mlx_array, a: mlx_array, b: mlx_array, s: m
 pub extern "c" fn mlx_multiply(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
 pub extern "c" fn mlx_divide(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
 pub extern "c" fn mlx_negative(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_maximum(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
 pub extern "c" fn mlx_matmul(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
 pub extern "c" fn mlx_square(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
 pub extern "c" fn mlx_sqrt(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
@@ -197,6 +199,7 @@ pub extern "c" fn mlx_full(res: *mlx_array, shape: [*]const c_int, shape_num: us
 pub extern "c" fn mlx_zeros(res: *mlx_array, shape: [*]const c_int, shape_num: usize, dtype: mlx_dtype, s: mlx_stream) c_int;
 
 pub extern "c" fn mlx_slice(res: *mlx_array, a: mlx_array, start: [*]const c_int, start_num: usize, stop: [*]const c_int, stop_num: usize, strides: [*]const c_int, strides_num: usize, s: mlx_stream) c_int;
+pub extern "c" fn mlx_slice_update(res: *mlx_array, src: mlx_array, update: mlx_array, start: [*]const c_int, start_num: usize, stop: [*]const c_int, stop_num: usize, strides: [*]const c_int, strides_num: usize, s: mlx_stream) c_int;
 
 pub extern "c" fn mlx_triu(res: *mlx_array, x: mlx_array, k: c_int, s: mlx_stream) c_int;
 pub extern "c" fn mlx_tril(res: *mlx_array, x: mlx_array, k: c_int, s: mlx_stream) c_int;
@@ -243,8 +246,10 @@ pub extern "c" fn mlx_random_seed(seed: u64) c_int;
 
 // ── Batch eval ──
 pub extern "c" fn mlx_eval(outputs: mlx_vector_array) c_int;
+pub extern "c" fn mlx_async_eval(outputs: mlx_vector_array) c_int;
 
 // ── Memory management ──
+pub extern "c" fn mlx_clear_cache() c_int;
 pub extern "c" fn mlx_set_memory_limit(res: *usize, limit: usize) c_int;
 pub extern "c" fn mlx_set_cache_limit(res: *usize, limit: usize) c_int;
 pub extern "c" fn mlx_get_active_memory(res: *usize) c_int;

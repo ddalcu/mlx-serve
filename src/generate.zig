@@ -43,6 +43,8 @@ pub const GenerationResult = struct {
 };
 
 /// Step-based generator. Call `init` to prefill, then `next` per token.
+/// Uses async eval pipelining: pre-computes the next forward pass on GPU while
+/// the caller handles I/O (HTTP streaming, token decoding, etc.).
 pub const Generator = struct {
     xfm: *Transformer,
     tok: *const Tokenizer,
@@ -60,6 +62,9 @@ pub const Generator = struct {
     timer: std.time.Timer,
     logprobs_n: u32 = 0, // 0 = disabled, >0 = number of top_logprobs to return
     last_logprob: ?LogprobResult = null, // logprob result for the most recently returned token
+    // Async pipeline state: pre-computed forward pass logits for next decode step
+    pending_logits: mlx.mlx_array = .{},
+    has_pending_logits: bool = false,
 
     /// Prefill the prompt and prepare for token-by-token generation.
     pub fn init(
@@ -90,11 +95,11 @@ pub const Generator = struct {
         const first_result = try sampleToken(allocator, logits, sampling, null, 0, s);
         _ = mlx.mlx_array_free(logits);
 
-        // NOTE: mlx_compile disabled — it causes incorrect output on some models (Qwen3)
-        // due to Metal kernel fusion not handling KV cache state changes correctly.
-        // The 6% decode speedup isn't worth the correctness risk.
+        // Materialize KV cache state on GPU after prefill.
+        // This ensures optimal memory layout for subsequent decode steps.
+        xfm.cache.evalState();
 
-        return .{
+        var gen = Generator{
             .xfm = xfm,
             .tok = tok,
             .next_token_id = first_result.token_id,
@@ -110,11 +115,21 @@ pub const Generator = struct {
             .timeout_ns = 0,
             .timer = try std.time.Timer.start(),
         };
+
+        // Pipeline: speculatively start the forward pass for the first decode step.
+        // This overlaps GPU computation with the caller's setup work.
+        gen.startAsyncForward(first_result.token_id);
+
+        return gen;
     }
 
     pub fn deinit(self: *Generator, allocator: std.mem.Allocator) void {
         if (self.last_logprob) |*lp| {
             allocator.free(lp.top_logprobs);
+        }
+        if (self.has_pending_logits) {
+            _ = mlx.mlx_array_free(self.pending_logits);
+            self.has_pending_logits = false;
         }
         self.generated_ids.deinit(allocator);
     }
@@ -151,14 +166,20 @@ pub const Generator = struct {
         self.step += 1;
         try self.generated_ids.append(allocator, token);
 
-        // Forward pass for next prediction
-        const tok_i32: i32 = @intCast(token);
-        const tok_shape = [_]c_int{ 1, 1 };
-        const tok_input = mlx.mlx_array_new_data(&tok_i32, &tok_shape, 2, .int32);
-        defer _ = mlx.mlx_array_free(tok_input);
-
-        const step_logits = try self.xfm.forward(tok_input);
+        // Use pre-computed logits if available (async pipeline), otherwise compute synchronously
+        const step_logits = if (self.has_pending_logits) blk: {
+            const logits = self.pending_logits;
+            self.has_pending_logits = false;
+            break :blk logits;
+        } else blk: {
+            const tok_i32: i32 = @intCast(token);
+            const tok_shape = [_]c_int{ 1, 1 };
+            const tok_input = mlx.mlx_array_new_data(&tok_i32, &tok_shape, 2, .int32);
+            defer _ = mlx.mlx_array_free(tok_input);
+            break :blk try self.xfm.forward(tok_input);
+        };
         defer _ = mlx.mlx_array_free(step_logits);
+
         const result = try sampleToken(allocator, step_logits, self.sampling, self.generated_ids.items, self.logprobs_n, self.xfm.s);
         self.next_token_id = result.token_id;
 
@@ -168,7 +189,37 @@ pub const Generator = struct {
         }
         self.last_logprob = result.logprob_result;
 
+        // Pipeline: start computing the next forward pass on GPU while caller does I/O.
+        // Skip on the last step (we know we'll stop next iteration).
+        if (self.step < self.max_tokens) {
+            self.startAsyncForward(result.token_id);
+        }
+
+        // Periodic cache clear to prevent memory fragmentation on long sequences
+        if (self.step % 256 == 0) {
+            _ = mlx.mlx_clear_cache();
+        }
+
         return token;
+    }
+
+    /// Speculatively start the forward pass for the given token on the GPU.
+    /// The result (logits) will be consumed by the next call to next().
+    fn startAsyncForward(self: *Generator, token_id: u32) void {
+        const tok_i32: i32 = @intCast(token_id);
+        const tok_shape = [_]c_int{ 1, 1 };
+        const tok_input = mlx.mlx_array_new_data(&tok_i32, &tok_shape, 2, .int32);
+        defer _ = mlx.mlx_array_free(tok_input);
+
+        const logits = self.xfm.forward(tok_input) catch return;
+        // Kick off GPU computation asynchronously
+        const arr = [_]mlx.mlx_array{logits};
+        const vec = mlx.mlx_vector_array_new_data(&arr, 1);
+        _ = mlx.mlx_async_eval(vec);
+        _ = mlx.mlx_vector_array_free(vec);
+
+        self.pending_logits = logits;
+        self.has_pending_logits = true;
     }
 };
 
@@ -251,6 +302,70 @@ pub fn generate(
     };
 }
 
+/// Compute mean-pooled, L2-normalized embedding from token IDs.
+/// Returns a float32 array of shape [hidden_size]. Caller must free the returned slice.
+pub fn computeEmbedding(
+    allocator: std.mem.Allocator,
+    xfm: *Transformer,
+    token_ids: []const u32,
+) ![]f32 {
+    const s = xfm.s;
+    const prompt_len: c_int = @intCast(token_ids.len);
+    const shape = [_]c_int{ 1, prompt_len };
+
+    const ids_i32 = try allocator.alloc(i32, token_ids.len);
+    defer allocator.free(ids_i32);
+    for (token_ids, 0..) |id, i| {
+        ids_i32[i] = @intCast(id);
+    }
+
+    const input = mlx.mlx_array_new_data(ids_i32.ptr, &shape, 2, .int32);
+    defer _ = mlx.mlx_array_free(input);
+
+    // Get hidden states: [1, seq_len, hidden_size]
+    const hidden = try xfm.forwardEmbedding(input);
+    defer _ = mlx.mlx_array_free(hidden);
+
+    // Mean pool over sequence dimension (axis=1): [1, hidden_size]
+    var pooled = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(pooled);
+    try mlx.check(mlx.mlx_mean_axis(&pooled, hidden, 1, false, s));
+
+    // L2 normalize: pooled / sqrt(sum(pooled^2))
+    var squared = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(squared);
+    try mlx.check(mlx.mlx_multiply(&squared, pooled, pooled, s));
+
+    var sum_sq = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sum_sq);
+    try mlx.check(mlx.mlx_sum_axis(&sum_sq, squared, -1, true, s));
+
+    var norm = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(norm);
+    try mlx.check(mlx.mlx_sqrt(&norm, sum_sq, s));
+
+    // Add epsilon to avoid division by zero
+    const eps = mlx.mlx_array_new_float(1e-12);
+    defer _ = mlx.mlx_array_free(eps);
+    var norm_safe = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(norm_safe);
+    try mlx.check(mlx.mlx_maximum(&norm_safe, norm, eps, s));
+
+    var normalized = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(normalized);
+    try mlx.check(mlx.mlx_divide(&normalized, pooled, norm_safe, s));
+
+    // Eval and extract float data
+    try mlx.check(mlx.mlx_array_eval(normalized));
+    const n_shape = mlx.getShape(normalized);
+    const dim: usize = @intCast(n_shape[n_shape.len - 1]);
+    const data_ptr = mlx.mlx_array_data_float32(normalized) orelse return error.MlxError;
+
+    const result = try allocator.alloc(f32, dim);
+    @memcpy(result, data_ptr[0..dim]);
+    return result;
+}
+
 const SampleResult = struct {
     token_id: u32,
     logprob_result: ?LogprobResult = null,
@@ -282,81 +397,94 @@ fn sampleToken(allocator: std.mem.Allocator, logits: mlx.mlx_array, sampling: Sa
         try mlx.check(mlx.mlx_reshape(&last_logits, sliced, &sq_shape, 2, s));
     }
 
+    // Track current working logits (avoid copies when no transform needed)
+    var current = last_logits;
+
     // Apply repeat penalty to already-generated tokens
     var penalized = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(penalized);
+    var penalized_owned = false;
+    defer if (penalized_owned) {
+        _ = mlx.mlx_array_free(penalized);
+    };
 
-    const needs_penalty = sampling.repeat_penalty != 1.0 or sampling.presence_penalty != 0.0;
+    const needs_penalty = (sampling.repeat_penalty != 1.0 or sampling.presence_penalty != 0.0);
     if (needs_penalty) {
         if (generated_ids) |ids| {
             if (ids.len > 0) {
-                try applyRepeatPenalty(&penalized, last_logits, ids, sampling.repeat_penalty, sampling.presence_penalty, s);
-            } else {
-                try mlx.check(mlx.mlx_copy(&penalized, last_logits, s));
+                try applyRepeatPenalty(&penalized, current, ids, sampling.repeat_penalty, sampling.presence_penalty, s);
+                current = penalized;
+                penalized_owned = true;
             }
-        } else {
-            try mlx.check(mlx.mlx_copy(&penalized, last_logits, s));
         }
-    } else {
-        try mlx.check(mlx.mlx_copy(&penalized, last_logits, s));
     }
 
     // Greedy if temperature is ~0
     if (sampling.temperature < 0.01) {
-        const token_id = try argmax(penalized, s);
+        const token_id = try argmax(current, s);
         var logprob_result: ?LogprobResult = null;
         if (logprobs_n > 0) {
-            logprob_result = try computeLogprobs(allocator, penalized, token_id, logprobs_n, s);
+            logprob_result = try computeLogprobs(allocator, current, token_id, logprobs_n, s);
         }
         return .{ .token_id = token_id, .logprob_result = logprob_result };
     }
 
     // Scale logits by 1/temperature
-    const temp_arr = mlx.mlx_array_new_float(sampling.temperature);
-    defer _ = mlx.mlx_array_free(temp_arr);
-
     var scaled = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(scaled);
-    try mlx.check(mlx.mlx_divide(&scaled, penalized, temp_arr, s));
+    var scaled_owned = false;
+    defer if (scaled_owned) {
+        _ = mlx.mlx_array_free(scaled);
+    };
 
-    // Compute logprobs from scaled logits (before top-k/top-p filtering)
-    // This captures the actual probability distribution the model sees.
-    var logprob_result: ?LogprobResult = null;
+    if (sampling.temperature != 1.0) {
+        const temp_arr = mlx.mlx_array_new_float(sampling.temperature);
+        defer _ = mlx.mlx_array_free(temp_arr);
+        try mlx.check(mlx.mlx_divide(&scaled, current, temp_arr, s));
+        current = scaled;
+        scaled_owned = true;
+    }
+
+    // For logprobs, remember the logits after temp scaling but before filtering
+    const logprobs_logits = current;
 
     // Apply top-k filtering
     var after_topk = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(after_topk);
+    var topk_owned = false;
+    defer if (topk_owned) {
+        _ = mlx.mlx_array_free(after_topk);
+    };
 
     if (sampling.top_k > 0) {
-        try applyTopK(&after_topk, scaled, sampling.top_k, s);
-    } else {
-        try mlx.check(mlx.mlx_copy(&after_topk, scaled, s));
+        try applyTopK(&after_topk, current, sampling.top_k, s);
+        current = after_topk;
+        topk_owned = true;
     }
 
     // Apply top-p (nucleus) sampling
-    var final_logits = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(final_logits);
+    var after_topp = mlx.mlx_array_new();
+    var topp_owned = false;
+    defer if (topp_owned) {
+        _ = mlx.mlx_array_free(after_topp);
+    };
 
     if (sampling.top_p < 1.0) {
-        try applyTopP(&final_logits, after_topk, sampling.top_p, s);
-    } else {
-        try mlx.check(mlx.mlx_copy(&final_logits, after_topk, s));
+        try applyTopP(&after_topp, current, sampling.top_p, s);
+        current = after_topp;
+        topp_owned = true;
     }
 
     // Sample from categorical distribution
     var sampled = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(sampled);
 
-    // Use seed if provided, otherwise null key for random
     if (sampling.seed) |seed| {
         var key = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(key);
         try mlx.check(mlx.mlx_random_key(&key, seed));
-        try mlx.check(mlx.mlx_random_categorical(&sampled, final_logits, -1, key, s));
+        try mlx.check(mlx.mlx_random_categorical(&sampled, current, -1, key, s));
     } else {
         const null_key = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(null_key);
-        try mlx.check(mlx.mlx_random_categorical(&sampled, final_logits, -1, null_key, s));
+        try mlx.check(mlx.mlx_random_categorical(&sampled, current, -1, null_key, s));
     }
 
     // Eval and extract
@@ -367,8 +495,9 @@ fn sampleToken(allocator: std.mem.Allocator, logits: mlx.mlx_array, sampling: Sa
     const token_id: u32 = @intCast(val);
 
     // Compute logprobs after sampling (we now know the token_id)
+    var logprob_result: ?LogprobResult = null;
     if (logprobs_n > 0) {
-        logprob_result = try computeLogprobs(allocator, scaled, token_id, logprobs_n, s);
+        logprob_result = try computeLogprobs(allocator, logprobs_logits, token_id, logprobs_n, s);
     }
 
     return .{ .token_id = token_id, .logprob_result = logprob_result };
@@ -554,15 +683,12 @@ fn applyTopP(res: *mlx.mlx_array, logits: mlx.mlx_array, top_p: f32, s: mlx.mlx_
 }
 
 /// Apply repeat penalty to already-generated tokens.
+/// Uses pure MLX GPU ops — no CPU readback, preserves lazy evaluation graph.
 fn applyRepeatPenalty(res: *mlx.mlx_array, logits: mlx.mlx_array, generated_ids: []const u32, repeat_penalty: f32, presence_penalty: f32, s: mlx.mlx_stream) !void {
-    // Build a penalty mask on GPU using MLX ops
-    // For each token id that appeared in generated_ids, apply penalties
-
-    // Get vocab size from logits shape
     const shape = mlx.getShape(logits);
     const vocab_size: usize = @intCast(shape[shape.len - 1]);
 
-    // Collect unique token ids that appeared
+    // Collect unique token ids
     var seen_set = std.AutoHashMap(u32, void).init(std.heap.page_allocator);
     defer seen_set.deinit();
     for (generated_ids) |id| {
@@ -571,58 +697,87 @@ fn applyRepeatPenalty(res: *mlx.mlx_array, logits: mlx.mlx_array, generated_ids:
         }
     }
 
-    if (seen_set.count() == 0) {
-        try mlx.check(mlx.mlx_copy(res, logits, s));
-        return;
-    }
+    if (seen_set.count() == 0) return;
 
-    // Build a float32 penalty multiplier array: 1.0 everywhere, penalty at seen positions
-    // And a float32 additive array: 0.0 everywhere, -presence_penalty at seen positions
-    const mult_data = try std.heap.page_allocator.alloc(f32, vocab_size);
-    defer std.heap.page_allocator.free(mult_data);
-    @memset(mult_data, 1.0);
+    // Build boolean mask: true at positions of seen tokens
+    const mask_data = try std.heap.page_allocator.alloc(u8, vocab_size);
+    defer std.heap.page_allocator.free(mask_data);
+    @memset(mask_data, 0);
 
-    const add_data = try std.heap.page_allocator.alloc(f32, vocab_size);
-    defer std.heap.page_allocator.free(add_data);
-    @memset(add_data, 0.0);
-
-    // Need to eval logits to check sign for repeat penalty
-    if (repeat_penalty != 1.0) {
-        try mlx.check(mlx.mlx_array_eval(logits));
-        const logit_ptr = mlx.mlx_array_data_float32(logits);
-        if (logit_ptr) |ptr| {
-            var it = seen_set.keyIterator();
-            while (it.next()) |id_ptr| {
-                const id = id_ptr.*;
-                if (ptr[id] > 0) {
-                    mult_data[id] = 1.0 / repeat_penalty;
-                } else {
-                    mult_data[id] = repeat_penalty;
-                }
-            }
-        }
-    }
-
-    if (presence_penalty != 0.0) {
-        var it = seen_set.keyIterator();
-        while (it.next()) |id_ptr| {
-            add_data[id_ptr.*] = -presence_penalty;
-        }
+    var it = seen_set.keyIterator();
+    while (it.next()) |id_ptr| {
+        mask_data[id_ptr.*] = 1;
     }
 
     const arr_shape = [_]c_int{ 1, @intCast(vocab_size) };
+    const mask_arr = mlx.mlx_array_new_data(mask_data.ptr, &arr_shape, 2, .bool_);
+    defer _ = mlx.mlx_array_free(mask_arr);
 
-    // Create MLX arrays for mult and add
-    const mult_arr = mlx.mlx_array_new_data(mult_data.ptr, &arr_shape, 2, .float32);
-    defer _ = mlx.mlx_array_free(mult_arr);
-    const add_arr = mlx.mlx_array_new_data(add_data.ptr, &arr_shape, 2, .float32);
-    defer _ = mlx.mlx_array_free(add_arr);
+    var current = logits;
 
-    // result = logits * mult + add
-    var multiplied = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(multiplied);
-    try mlx.check(mlx.mlx_multiply(&multiplied, logits, mult_arr, s));
-    try mlx.check(mlx.mlx_add(res, multiplied, add_arr, s));
+    // Repeat penalty: multiply seen tokens by 1/penalty (positive) or penalty (negative)
+    // This is equivalent to: where(mask & logits > 0, logits / penalty, where(mask, logits * penalty, logits))
+    // Simplified: where(mask, where(logits > 0, logits / penalty, logits * penalty), logits)
+    var penalized = mlx.mlx_array_new();
+    var penalized_owned = false;
+    defer if (penalized_owned) {
+        _ = mlx.mlx_array_free(penalized);
+    };
+
+    if (repeat_penalty != 1.0) {
+        const rp = mlx.mlx_array_new_float(repeat_penalty);
+        defer _ = mlx.mlx_array_free(rp);
+        const inv_rp = mlx.mlx_array_new_float(1.0 / repeat_penalty);
+        defer _ = mlx.mlx_array_free(inv_rp);
+        const zero = mlx.mlx_array_new_float(0.0);
+        defer _ = mlx.mlx_array_free(zero);
+
+        // positive_mask = logits > 0
+        var positive_mask = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(positive_mask);
+        try mlx.check(mlx.mlx_greater(&positive_mask, current, zero, s));
+
+        // penalized_positive = logits * (1/penalty)
+        var pen_pos = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(pen_pos);
+        try mlx.check(mlx.mlx_multiply(&pen_pos, current, inv_rp, s));
+
+        // penalized_negative = logits * penalty
+        var pen_neg = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(pen_neg);
+        try mlx.check(mlx.mlx_multiply(&pen_neg, current, rp, s));
+
+        // sign_selected = where(positive, logits/penalty, logits*penalty)
+        var sign_selected = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(sign_selected);
+        try mlx.check(mlx.mlx_where(&sign_selected, positive_mask, pen_pos, pen_neg, s));
+
+        // result = where(mask, sign_selected, logits)
+        try mlx.check(mlx.mlx_where(&penalized, mask_arr, sign_selected, current, s));
+        current = penalized;
+        penalized_owned = true;
+    }
+
+    // Presence penalty: subtract from seen tokens
+    if (presence_penalty != 0.0) {
+        const pp = mlx.mlx_array_new_float(presence_penalty);
+        defer _ = mlx.mlx_array_free(pp);
+
+        // Cast mask to float for arithmetic
+        var mask_float = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(mask_float);
+        try mlx.check(mlx.mlx_astype(&mask_float, mask_arr, .float16, s));
+
+        // subtract = mask * presence_penalty
+        var subtract = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(subtract);
+        try mlx.check(mlx.mlx_multiply(&subtract, mask_float, pp, s));
+
+        // result = current - subtract
+        try mlx.check(mlx.mlx_subtract(res, current, subtract, s));
+    } else {
+        try mlx.check(mlx.mlx_copy(res, current, s));
+    }
 }
 
 /// Greedy argmax over the last axis.
@@ -636,4 +791,227 @@ fn argmax(last_logits: mlx.mlx_array, s: mlx.mlx_stream) !u32 {
     try mlx.check(mlx.mlx_array_item_int32(&val, argmax_arr));
 
     return @intCast(val);
+}
+
+// ── Tests ──
+
+const testing = std.testing;
+
+test "SamplingParams defaults" {
+    const params = SamplingParams{};
+    try testing.expectApproxEqAbs(@as(f32, 1.0), params.temperature, 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 1.0), params.top_p, 0.001);
+    try testing.expectEqual(@as(u32, 0), params.top_k);
+    try testing.expectApproxEqAbs(@as(f32, 1.0), params.repeat_penalty, 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 0.0), params.presence_penalty, 0.001);
+    try testing.expect(params.seed == null);
+}
+
+test "SamplingParams custom values" {
+    const params = SamplingParams{
+        .temperature = 0.7,
+        .top_p = 0.9,
+        .top_k = 40,
+        .repeat_penalty = 1.1,
+        .presence_penalty = 0.5,
+        .seed = 42,
+    };
+    try testing.expectApproxEqAbs(@as(f32, 0.7), params.temperature, 0.001);
+    try testing.expectApproxEqAbs(@as(f32, 0.9), params.top_p, 0.001);
+    try testing.expectEqual(@as(u32, 40), params.top_k);
+    try testing.expectEqual(@as(u64, 42), params.seed.?);
+}
+
+test "GenerationResult fields" {
+    // Just verifying the struct shape compiles correctly with all fields
+    const result = GenerationResult{
+        .text = @constCast("hello"),
+        .token_ids = @constCast(&[_]u32{ 1, 2, 3 }),
+        .prompt_tokens = 10,
+        .completion_tokens = 3,
+        .finish_reason = "stop",
+        .prefill_tps = 100.0,
+        .decode_tps = 35.0,
+        .logprobs = null,
+    };
+    try testing.expectEqual(@as(u32, 10), result.prompt_tokens);
+    try testing.expectEqual(@as(u32, 3), result.completion_tokens);
+    try testing.expectEqualStrings("stop", result.finish_reason);
+    try testing.expect(result.logprobs == null);
+}
+
+test "argmax selects highest value" {
+    // Create a simple logits array [1, 5] with values [0.1, 0.5, 0.9, 0.2, 0.3]
+    const data = [_]f32{ 0.1, 0.5, 0.9, 0.2, 0.3 };
+    const shape = [_]c_int{ 1, 5 };
+    const s = mlx.gpuStream();
+    const arr = mlx.mlx_array_new_data(&data, &shape, 2, .float32);
+    defer _ = mlx.mlx_array_free(arr);
+
+    const result = try argmax(arr, s);
+    try testing.expectEqual(@as(u32, 2), result); // index 2 has value 0.9
+}
+
+test "argmax with negative values" {
+    const data = [_]f32{ -5.0, -1.0, -3.0, -0.5, -2.0 };
+    const shape = [_]c_int{ 1, 5 };
+    const s = mlx.gpuStream();
+    const arr = mlx.mlx_array_new_data(&data, &shape, 2, .float32);
+    defer _ = mlx.mlx_array_free(arr);
+
+    const result = try argmax(arr, s);
+    try testing.expectEqual(@as(u32, 3), result); // index 3 has value -0.5 (highest)
+}
+
+test "applyRepeatPenalty reduces seen token logits" {
+    const s = mlx.gpuStream();
+    // logits: [1.0, 2.0, 3.0, 4.0, 5.0]
+    const data = [_]f32{ 1.0, 2.0, 3.0, 4.0, 5.0 };
+    const shape = [_]c_int{ 1, 5 };
+    const logits = mlx.mlx_array_new_data(&data, &shape, 2, .float32);
+    defer _ = mlx.mlx_array_free(logits);
+
+    // Penalize tokens at indices 1 and 3
+    const generated = [_]u32{ 1, 3 };
+    var res = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(res);
+
+    try applyRepeatPenalty(&res, logits, &generated, 2.0, 0.0, s);
+    try mlx.check(mlx.mlx_array_eval(res));
+
+    const res_data = mlx.mlx_array_data_float32(res).?;
+    // Index 0: untouched → 1.0
+    try testing.expectApproxEqAbs(@as(f32, 1.0), res_data[0], 0.01);
+    // Index 1: positive, divided by 2.0 → 1.0
+    try testing.expectApproxEqAbs(@as(f32, 1.0), res_data[1], 0.01);
+    // Index 2: untouched → 3.0
+    try testing.expectApproxEqAbs(@as(f32, 3.0), res_data[2], 0.01);
+    // Index 3: positive, divided by 2.0 → 2.0
+    try testing.expectApproxEqAbs(@as(f32, 2.0), res_data[3], 0.01);
+    // Index 4: untouched → 5.0
+    try testing.expectApproxEqAbs(@as(f32, 5.0), res_data[4], 0.01);
+}
+
+test "applyRepeatPenalty with negative logits" {
+    const s = mlx.gpuStream();
+    // Mix of positive and negative logits
+    const data = [_]f32{ -2.0, 3.0, -1.0, 4.0 };
+    const shape = [_]c_int{ 1, 4 };
+    const logits = mlx.mlx_array_new_data(&data, &shape, 2, .float32);
+    defer _ = mlx.mlx_array_free(logits);
+
+    // Penalize all tokens
+    const generated = [_]u32{ 0, 1, 2, 3 };
+    var res = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(res);
+
+    try applyRepeatPenalty(&res, logits, &generated, 2.0, 0.0, s);
+    try mlx.check(mlx.mlx_array_eval(res));
+
+    const res_data = mlx.mlx_array_data_float32(res).?;
+    // Index 0: negative, multiplied by 2.0 → -4.0
+    try testing.expectApproxEqAbs(@as(f32, -4.0), res_data[0], 0.01);
+    // Index 1: positive, divided by 2.0 → 1.5
+    try testing.expectApproxEqAbs(@as(f32, 1.5), res_data[1], 0.01);
+    // Index 2: negative, multiplied by 2.0 → -2.0
+    try testing.expectApproxEqAbs(@as(f32, -2.0), res_data[2], 0.01);
+    // Index 3: positive, divided by 2.0 → 2.0
+    try testing.expectApproxEqAbs(@as(f32, 2.0), res_data[3], 0.01);
+}
+
+test "applyRepeatPenalty presence penalty" {
+    const s = mlx.gpuStream();
+    const data = [_]f32{ 1.0, 2.0, 3.0, 4.0 };
+    const shape = [_]c_int{ 1, 4 };
+    const logits = mlx.mlx_array_new_data(&data, &shape, 2, .float32);
+    defer _ = mlx.mlx_array_free(logits);
+
+    const generated = [_]u32{ 0, 2 };
+    var res = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(res);
+
+    try applyRepeatPenalty(&res, logits, &generated, 1.0, 0.5, s);
+    try mlx.check(mlx.mlx_array_eval(res));
+
+    const res_data = mlx.mlx_array_data_float32(res).?;
+    // Index 0: seen, presence penalty subtracted → 1.0 - 0.5 = 0.5
+    try testing.expectApproxEqAbs(@as(f32, 0.5), res_data[0], 0.01);
+    // Index 1: unseen → 2.0
+    try testing.expectApproxEqAbs(@as(f32, 2.0), res_data[1], 0.01);
+    // Index 2: seen → 3.0 - 0.5 = 2.5
+    try testing.expectApproxEqAbs(@as(f32, 2.5), res_data[2], 0.01);
+    // Index 3: unseen → 4.0
+    try testing.expectApproxEqAbs(@as(f32, 4.0), res_data[3], 0.01);
+}
+
+test "applyRepeatPenalty combined penalties" {
+    const s = mlx.gpuStream();
+    const data = [_]f32{ 2.0, -1.0, 3.0 };
+    const shape = [_]c_int{ 1, 3 };
+    const logits = mlx.mlx_array_new_data(&data, &shape, 2, .float32);
+    defer _ = mlx.mlx_array_free(logits);
+
+    const generated = [_]u32{ 0, 1 };
+    var res = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(res);
+
+    try applyRepeatPenalty(&res, logits, &generated, 2.0, 1.0, s);
+    try mlx.check(mlx.mlx_array_eval(res));
+
+    const res_data = mlx.mlx_array_data_float32(res).?;
+    // Index 0: positive, divide by 2.0 = 1.0, then - 1.0 = 0.0
+    try testing.expectApproxEqAbs(@as(f32, 0.0), res_data[0], 0.01);
+    // Index 1: negative, multiply by 2.0 = -2.0, then - 1.0 = -3.0
+    try testing.expectApproxEqAbs(@as(f32, -3.0), res_data[1], 0.01);
+    // Index 2: unseen → 3.0
+    try testing.expectApproxEqAbs(@as(f32, 3.0), res_data[2], 0.01);
+}
+
+test "sampleToken greedy selects argmax" {
+    const allocator = testing.allocator;
+    const s = mlx.gpuStream();
+
+    // Create logits [1, 1, 5] — 5 vocab entries, token at index 3 has highest
+    const data = [_]f32{ 1.0, 0.5, 0.1, 5.0, 0.2 };
+    const logits_shape = [_]c_int{ 1, 1, 5 };
+    const logits = mlx.mlx_array_new_data(&data, &logits_shape, 3, .float32);
+    defer _ = mlx.mlx_array_free(logits);
+
+    const params = SamplingParams{ .temperature = 0.0 };
+    const result = try sampleToken(allocator, logits, params, null, 0, s);
+    try testing.expectEqual(@as(u32, 3), result.token_id);
+}
+
+test "sampleToken with temperature produces valid token" {
+    const allocator = testing.allocator;
+    const s = mlx.gpuStream();
+
+    const data = [_]f32{ 1.0, 2.0, 3.0 };
+    const logits_shape = [_]c_int{ 1, 1, 3 };
+    const logits = mlx.mlx_array_new_data(&data, &logits_shape, 3, .float32);
+    defer _ = mlx.mlx_array_free(logits);
+
+    const params = SamplingParams{ .temperature = 0.5 };
+    const result = try sampleToken(allocator, logits, params, null, 0, s);
+    // Token should be in valid range
+    try testing.expect(result.token_id < 3);
+}
+
+test "sampleToken from prefill logits (seq_len > 1)" {
+    const allocator = testing.allocator;
+    const s = mlx.gpuStream();
+
+    // [1, 3, 4] — 3 positions, 4 vocab, should take last position
+    const data = [_]f32{
+        0.1, 0.2, 0.3, 0.4, // pos 0
+        0.5, 0.6, 0.7, 0.8, // pos 1
+        9.0, 0.1, 0.1, 0.1, // pos 2 — token 0 is clearly highest
+    };
+    const logits_shape = [_]c_int{ 1, 3, 4 };
+    const logits = mlx.mlx_array_new_data(&data, &logits_shape, 3, .float32);
+    defer _ = mlx.mlx_array_free(logits);
+
+    const params = SamplingParams{ .temperature = 0.0 };
+    const result = try sampleToken(allocator, logits, params, null, 0, s);
+    try testing.expectEqual(@as(u32, 0), result.token_id); // pos 2, index 0 = 9.0
 }
