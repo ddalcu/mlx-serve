@@ -195,14 +195,13 @@ pub const Generator = struct {
             self.startAsyncForward(result.token_id);
         }
 
-        // Periodic cache clear to prevent memory fragmentation on long sequences
-        if (self.step % 256 == 0) {
-            _ = mlx.mlx_clear_cache();
-        }
-
         return token;
     }
 
+    /// Start the full pipeline: forward(token) → sample → next_forward(sampled) → async_eval.
+    /// The sampled token feeds directly into the next forward pass as a lazy array,
+    /// avoiding the GPU→CPU→GPU round-trip that would occur if we eval'd the token first.
+    /// This matches mlx_lm's pipeline: _step(y) where y is the lazy sampled array.
     /// Speculatively start the forward pass for the given token on the GPU.
     /// The result (logits) will be consumed by the next call to next().
     fn startAsyncForward(self: *Generator, token_id: u32) void {
@@ -474,7 +473,6 @@ fn sampleToken(allocator: std.mem.Allocator, logits: mlx.mlx_array, sampling: Sa
 
     // Sample from categorical distribution
     var sampled = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(sampled);
 
     if (sampling.seed) |seed| {
         var key = mlx.mlx_array_new();
@@ -500,6 +498,7 @@ fn sampleToken(allocator: std.mem.Allocator, logits: mlx.mlx_array, sampling: Sa
         logprob_result = try computeLogprobs(allocator, logprobs_logits, token_id, logprobs_n, s);
     }
 
+    _ = mlx.mlx_array_free(sampled);
     return .{ .token_id = token_id, .logprob_result = logprob_result };
 }
 

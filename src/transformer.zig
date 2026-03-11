@@ -54,19 +54,17 @@ pub const KVCache = struct {
         // 1. Free stale views — drops refcount on buffer → enables buffer donation
         _ = mlx.mlx_array_free(entry.key_view);
         _ = mlx.mlx_array_free(entry.value_view);
-        entry.key_view = mlx.mlx_array_new();
-        entry.value_view = mlx.mlx_array_new();
 
         // 2. Get shape info from new_k: [B, heads, new_len, head_dim]
         const new_shape = mlx.getShape(new_k);
         const new_len: usize = @intCast(new_shape[2]);
-        const dtype = mlx.mlx_array_dtype(new_k);
 
         // 3. Grow buffer if needed
         if (!entry.initialized or entry.offset + new_len > bufferCapacity(entry.keys)) {
             const B = new_shape[0];
             const heads = new_shape[1];
             const head_dim = new_shape[3];
+            const dtype = mlx.mlx_array_dtype(new_k);
             const needed = entry.offset + new_len;
             const n_chunks = (needed + chunk_step - 1) / chunk_step;
             const new_cap: c_int = @intCast(n_chunks * chunk_step);
@@ -84,7 +82,6 @@ pub const KVCache = struct {
                 const su_stop = [_]c_int{ B, heads, off, head_dim };
                 const su_strides = [_]c_int{ 1, 1, 1, 1 };
 
-                // Slice existing data
                 var old_k_data = mlx.mlx_array_new();
                 var old_v_data = mlx.mlx_array_new();
                 try mlx.check(mlx.mlx_slice(&old_k_data, entry.keys, &su_start, 4, &su_stop, 4, &su_strides, 4, s));
@@ -110,25 +107,23 @@ pub const KVCache = struct {
             entry.initialized = true;
         }
 
-        // 4. slice_update — write new_k/new_v at [0, 0, offset, 0]:[B, heads, offset+new_len, head_dim]
-        {
-            const shape = mlx.getShape(entry.keys);
-            const off: c_int = @intCast(entry.offset);
-            const off_end: c_int = @intCast(entry.offset + new_len);
-            const su_start = [_]c_int{ 0, 0, off, 0 };
-            const su_stop = [_]c_int{ shape[0], shape[1], off_end, shape[3] };
-            const su_strides = [_]c_int{ 1, 1, 1, 1 };
+        // 4. slice_update — write new_k/new_v into buffer at offset
+        const buf_shape = mlx.getShape(entry.keys);
+        const off: c_int = @intCast(entry.offset);
+        const off_end: c_int = @intCast(entry.offset + new_len);
+        const su_start = [_]c_int{ 0, 0, off, 0 };
+        const su_stop = [_]c_int{ buf_shape[0], buf_shape[1], off_end, buf_shape[3] };
+        const su_strides = [_]c_int{ 1, 1, 1, 1 };
 
-            var updated_k = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_slice_update(&updated_k, entry.keys, new_k, &su_start, 4, &su_stop, 4, &su_strides, 4, s));
-            _ = mlx.mlx_array_free(entry.keys);
-            entry.keys = updated_k;
+        var updated_k = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_slice_update(&updated_k, entry.keys, new_k, &su_start, 4, &su_stop, 4, &su_strides, 4, s));
+        _ = mlx.mlx_array_free(entry.keys);
+        entry.keys = updated_k;
 
-            var updated_v = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_slice_update(&updated_v, entry.values, new_v, &su_start, 4, &su_stop, 4, &su_strides, 4, s));
-            _ = mlx.mlx_array_free(entry.values);
-            entry.values = updated_v;
-        }
+        var updated_v = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_slice_update(&updated_v, entry.values, new_v, &su_start, 4, &su_stop, 4, &su_strides, 4, s));
+        _ = mlx.mlx_array_free(entry.values);
+        entry.values = updated_v;
 
         // 5. Update offset
         entry.offset += new_len;
@@ -156,23 +151,18 @@ pub const KVCache = struct {
             entry.offset = max_seq;
         }
 
-        // 7. Create views — slice [0:B, 0:heads, 0:offset, 0:head_dim]
-        {
-            const shape = mlx.getShape(entry.keys);
-            const off: c_int = @intCast(entry.offset);
-            const v_start = [_]c_int{ 0, 0, 0, 0 };
-            const v_stop = [_]c_int{ shape[0], shape[1], off, shape[3] };
-            const v_strides = [_]c_int{ 1, 1, 1, 1 };
+        // 7. Create views — slice [0:offset] for attention
+        const cur_shape = mlx.getShape(entry.keys);
+        const v_off: c_int = @intCast(entry.offset);
+        const v_start = [_]c_int{ 0, 0, 0, 0 };
+        const v_stop = [_]c_int{ cur_shape[0], cur_shape[1], v_off, cur_shape[3] };
+        const v_strides = [_]c_int{ 1, 1, 1, 1 };
 
-            _ = mlx.mlx_array_free(entry.key_view);
-            _ = mlx.mlx_array_free(entry.value_view);
-            entry.key_view = mlx.mlx_array_new();
-            entry.value_view = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_slice(&entry.key_view, entry.keys, &v_start, 4, &v_stop, 4, &v_strides, 4, s));
-            try mlx.check(mlx.mlx_slice(&entry.value_view, entry.values, &v_start, 4, &v_stop, 4, &v_strides, 4, s));
-        }
+        entry.key_view = mlx.mlx_array_new();
+        entry.value_view = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_slice(&entry.key_view, entry.keys, &v_start, 4, &v_stop, 4, &v_strides, 4, s));
+        try mlx.check(mlx.mlx_slice(&entry.value_view, entry.values, &v_start, 4, &v_stop, 4, &v_strides, 4, s));
 
-        // 8. Return views — callers do NOT free (same contract as before)
         return .{ entry.key_view, entry.value_view };
     }
 
