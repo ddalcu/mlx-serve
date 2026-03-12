@@ -756,6 +756,35 @@ test "parseToolCalls returns null for no tool calls" {
     try testing.expect(result == null);
 }
 
+test "splitThinkBlock with think block before tool call" {
+    const text = "<think>I need to call the calculator</think>\n<tool_call>\n{\"name\": \"calc\", \"arguments\": {\"a\": 5}}\n</tool_call>";
+    const result = splitThinkBlock(text, false);
+    try testing.expectEqualStrings("I need to call the calculator", result.reasoning_content.?);
+    // Content should be the tool call text
+    try testing.expect(std.mem.startsWith(u8, result.content, "<tool_call>"));
+}
+
+test "splitThinkBlock with think block before regular content" {
+    const text = "<think>Let me think about this</think>\n\nThe answer is 42.";
+    const result = splitThinkBlock(text, false);
+    try testing.expectEqualStrings("Let me think about this", result.reasoning_content.?);
+    try testing.expectEqualStrings("The answer is 42.", result.content);
+}
+
+test "splitThinkBlock with empty think block" {
+    const text = "<think>\n\n</think>\n\nJust content here.";
+    const result = splitThinkBlock(text, false);
+    try testing.expect(result.reasoning_content == null);
+    try testing.expectEqualStrings("Just content here.", result.content);
+}
+
+test "splitThinkBlock no think tags with tool call" {
+    const text = "<tool_call>\n{\"name\": \"search\", \"arguments\": {}}\n</tool_call>";
+    const result = splitThinkBlock(text, false);
+    try testing.expect(result.reasoning_content == null);
+    try testing.expectEqualStrings(text, result.content);
+}
+
 test "parseToolCalls with think block" {
     const allocator = testing.allocator;
     const text = "<think>reasoning</think>\n<tool_call>\n{\"name\": \"search\", \"arguments\": {\"q\": \"test\"}}\n</tool_call>";

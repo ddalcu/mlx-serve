@@ -6,18 +6,56 @@ const generate_mod = @import("generate.zig");
 const chat_mod = @import("chat.zig");
 const model_mod = @import("model.zig");
 const log = @import("log.zig");
-const status_mod = @import("status.zig");
+const metrics = @import("status.zig");
 
 const Transformer = transformer_mod.Transformer;
 const Tokenizer = tokenizer_mod.Tokenizer;
 const Generator = generate_mod.Generator;
-const StatusBar = status_mod.StatusBar;
-
 /// Global flag set by signal handler for graceful shutdown.
 var shutdown_requested = std.atomic.Value(bool).init(false);
 
-/// Flag indicating a request is currently being processed (single-slot server).
-var request_in_progress = std.atomic.Value(bool).init(false);
+/// Single-slot inference gate: mutex + condition variable for request queuing.
+/// Requests wait in line instead of getting 503 when the server is busy.
+var inference_mutex: std.Thread.Mutex = .{};
+var inference_cond: std.Thread.Condition = .{};
+var inference_busy: bool = false;
+var inference_queue_len: u32 = 0;
+const max_queue_size: u32 = 32;
+
+/// Acquire the inference slot, blocking until available.
+/// Returns false if the queue is full or shutdown was requested.
+fn acquireInferenceSlot() bool {
+    inference_mutex.lock();
+    defer inference_mutex.unlock();
+
+    if (inference_queue_len >= max_queue_size) return false;
+    inference_queue_len += 1;
+
+    if (inference_busy) {
+        log.info("  queued (position {d})\n", .{inference_queue_len});
+    }
+
+    while (inference_busy) {
+        if (shutdown_requested.load(.acquire)) {
+            inference_queue_len -= 1;
+            return false;
+        }
+        inference_cond.wait(&inference_mutex);
+    }
+
+    inference_queue_len -= 1;
+    inference_busy = true;
+    return true;
+}
+
+/// Release the inference slot and wake the next waiting request.
+fn releaseInferenceSlot() void {
+    inference_mutex.lock();
+    defer inference_mutex.unlock();
+
+    inference_busy = false;
+    inference_cond.signal();
+}
 
 fn signalHandler(_: c_int) callconv(.c) void {
     shutdown_requested.store(true, .release);
@@ -28,6 +66,9 @@ var max_context_size: u32 = 0;
 
 /// Request timeout in seconds (0 = no timeout). Set by --timeout flag.
 var request_timeout_sec: u32 = 300;
+
+/// Default reasoning budget in tokens (-1 = unlimited). Set by --reasoning-budget flag.
+var default_reasoning_budget: i32 = -1;
 
 fn getTimeoutNs() u64 {
     if (request_timeout_sec == 0) return 0;
@@ -48,9 +89,11 @@ pub fn serve(
     port: u16,
     ctx_size: u32,
     timeout: u32,
+    reasoning_budget: i32,
 ) !void {
     max_context_size = ctx_size;
     request_timeout_sec = timeout;
+    default_reasoning_budget = reasoning_budget;
     // Install signal handlers for graceful shutdown
     const sigact = std.posix.Sigaction{
         .handler = .{ .handler = signalHandler },
@@ -84,6 +127,11 @@ pub fn serve(
     if (model_ctx > 0) {
         log.info("Model context length: {d} tokens\n", .{model_ctx});
     }
+    if (default_reasoning_budget >= 0) {
+        log.info("Reasoning budget: {d} tokens\n", .{default_reasoning_budget});
+    } else {
+        log.info("Reasoning budget: unlimited\n", .{});
+    }
     log.info("\nServer listening on http://{s}:{d}\n", .{ host, port });
     log.info("  GET  /health\n", .{});
     log.info("  GET  /props\n", .{});
@@ -94,8 +142,18 @@ pub fn serve(
     log.info("  POST /tokenize\n", .{});
     log.info("  POST /detokenize\n\n", .{});
 
-    var status = StatusBar.init();
-    defer status.deinit();
+    // Print system metrics once at startup
+    const rss = metrics.getAppRssMb();
+    if (rss >= 1024) {
+        log.info("RSS: {d}.{d}G  Mem: {d}%  CPU: {d}%  GPU: {d}%\n", .{
+            rss / 1024, (rss % 1024) * 10 / 1024,
+            metrics.getSysMemPct(), metrics.getCpuPct(), metrics.getGpuPct(),
+        });
+    } else {
+        log.info("RSS: {d}M  Mem: {d}%  CPU: {d}%  GPU: {d}%\n", .{
+            rss, metrics.getSysMemPct(), metrics.getCpuPct(), metrics.getGpuPct(),
+        });
+    }
 
     var poll_fds = [_]std.posix.pollfd{.{
         .fd = server.stream.handle,
@@ -205,34 +263,42 @@ fn handleConnection(
         try handleModels(allocator, stream, config);
     } else if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/props")) {
         log.debug("GET  /props -> 200\n", .{});
-        try handleProps(allocator, stream, config);
+        try handleProps(allocator, stream, config, chat_config);
     } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/chat/completions")) {
-        if (request_in_progress.swap(true, .acq_rel)) {
-            log.warn("POST /v1/chat/completions -> 503 (busy)\n", .{});
-            try sendErrorResponse(allocator, stream, "503 Service Unavailable", "server_error", "Server is busy processing another request. Try again shortly.", 503);
+        if (config.is_encoder_only) {
+            try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Encoder-only models do not support text generation. Use /v1/embeddings instead.", 400);
             return;
         }
-        defer request_in_progress.store(false, .release);
+        if (!acquireInferenceSlot()) {
+            log.warn("POST /v1/chat/completions -> 503 (queue full)\n", .{});
+            try sendErrorResponse(allocator, stream, "503 Service Unavailable", "server_error", "Server request queue is full. Try again shortly.", 503);
+            return;
+        }
+        defer releaseInferenceSlot();
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
         const body = request[header_end + 4 .. total_read];
         try handleChatCompletions(allocator, stream, body, xfm, tok, chat_config, config);
     } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/completions")) {
-        if (request_in_progress.swap(true, .acq_rel)) {
-            log.warn("POST /v1/completions -> 503 (busy)\n", .{});
-            try sendErrorResponse(allocator, stream, "503 Service Unavailable", "server_error", "Server is busy processing another request. Try again shortly.", 503);
+        if (config.is_encoder_only) {
+            try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Encoder-only models do not support text generation. Use /v1/embeddings instead.", 400);
             return;
         }
-        defer request_in_progress.store(false, .release);
+        if (!acquireInferenceSlot()) {
+            log.warn("POST /v1/completions -> 503 (queue full)\n", .{});
+            try sendErrorResponse(allocator, stream, "503 Service Unavailable", "server_error", "Server request queue is full. Try again shortly.", 503);
+            return;
+        }
+        defer releaseInferenceSlot();
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
         const body = request[header_end + 4 .. total_read];
         try handleCompletions(allocator, stream, body, xfm, tok, config);
     } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/embeddings")) {
-        if (request_in_progress.load(.acquire)) {
-            try sendErrorResponse(allocator, stream, "503 Service Unavailable", "server_error", "Server is busy processing another request", null);
+        if (!acquireInferenceSlot()) {
+            log.warn("POST /v1/embeddings -> 503 (queue full)\n", .{});
+            try sendErrorResponse(allocator, stream, "503 Service Unavailable", "server_error", "Server request queue is full. Try again shortly.", 503);
             return;
         }
-        request_in_progress.store(true, .release);
-        defer request_in_progress.store(false, .release);
+        defer releaseInferenceSlot();
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
         const body = request[header_end + 4 .. total_read];
         try handleEmbeddings(allocator, stream, body, xfm, tok, config);
@@ -285,16 +351,35 @@ fn handleModels(allocator: std.mem.Allocator, stream: std.net.Stream, config: *c
     try sendResponse(stream, "200 OK", "application/json", body);
 }
 
-fn handleProps(allocator: std.mem.Allocator, stream: std.net.Stream, config: *const model_mod.ModelConfig) !void {
+fn handleProps(allocator: std.mem.Allocator, stream: std.net.Stream, config: *const model_mod.ModelConfig, chat_config: *const chat_mod.ChatConfig) !void {
     const ctx_len = getEffectiveContextLength(config);
     const ctx_str = if (ctx_len > 0) blk: {
         break :blk try std.fmt.allocPrint(allocator, "{d}", .{ctx_len});
     } else try std.fmt.allocPrint(allocator, "0", .{});
     defer allocator.free(ctx_str);
 
+    // Query MLX memory usage
+    var active_mem: usize = 0;
+    var peak_mem: usize = 0;
+    _ = mlx.mlx_get_active_memory(&active_mem);
+    _ = mlx.mlx_get_peak_memory(&peak_mem);
+
+    // JSON-escape the chat template
+    const escaped_template = try jsonEscape(allocator, chat_config.chat_template);
+    defer allocator.free(escaped_template);
+
     const body = try std.fmt.allocPrint(allocator,
-        \\{{"default_generation_settings":{{"model":"{s}","n_ctx":{s}}},"total_slots":1,"chat_template":"chatml"}}
-    , .{ config.model_type, ctx_str });
+        \\{{"default_generation_settings":{{"model":"{s}","n_ctx":{s}}},"total_slots":1,"chat_template":{s},"model_info":{{"vocab_size":{d},"hidden_size":{d},"num_hidden_layers":{d},"num_attention_heads":{d},"num_key_value_heads":{d},"head_dim":{d},"quantization_bits":{d},"quantization_group_size":{d},"max_position_embeddings":{d}}},"memory":{{"active_bytes":{d},"peak_bytes":{d}}}}}
+    , .{
+        config.model_type,        ctx_str,
+        escaped_template,
+        config.vocab_size,        config.hidden_size,
+        config.num_hidden_layers, config.num_attention_heads,
+        config.num_key_value_heads, config.head_dim,
+        config.quant_bits,        config.quant_group_size,
+        config.max_position_embeddings,
+        active_mem,               peak_mem,
+    });
     defer allocator.free(body);
     try sendResponse(stream, "200 OK", "application/json", body);
 }
@@ -782,10 +867,33 @@ fn handleChatCompletions(
     // Parse enable_thinking (default: false — strips <think> blocks from output)
     const enable_thinking = if (root.get("enable_thinking")) |v| v == .bool and v.bool else false;
 
+    // Parse reasoning_budget_tokens: max tokens in <think> block (-1 = unlimited)
+    // Per-request override, falls back to server --reasoning-budget flag
+    const reasoning_budget: i32 = if (root.get("reasoning_budget_tokens")) |v| switch (v) {
+        .integer => |i| @intCast(i),
+        else => default_reasoning_budget,
+    } else default_reasoning_budget;
+
     // Log the request
     const last_msg = messages.items[messages.items.len - 1];
     const preview_len = @min(last_msg.content.len, 80);
-    log.info("POST /v1/chat/completions ({d} msgs, max_tokens={d}, temp={d:.2}, top_p={d:.2}, stream={}) \n", .{ messages.items.len, max_tokens, temperature, top_p, is_stream });
+
+    // Compute sizes for debug info
+    var system_chars: usize = 0;
+    var user_chars: usize = 0;
+    var tool_msg_count: usize = 0;
+    for (messages.items) |msg| {
+        if (std.mem.eql(u8, msg.role, "system")) {
+            system_chars += msg.content.len;
+        } else if (std.mem.eql(u8, msg.role, "user")) {
+            user_chars += msg.content.len;
+        } else if (std.mem.eql(u8, msg.role, "tool")) {
+            tool_msg_count += 1;
+        }
+    }
+    const tools_len = if (tools_json) |tj| tj.len else 0;
+
+    log.info("POST /v1/chat/completions ({d} msgs, max_tokens={d}, temp={d:.2}, top_p={d:.2}, stream={}, thinking={}, sys={d}b, user={d}b, tools={d}b, tool_msgs={d}) \n", .{ messages.items.len, max_tokens, temperature, top_p, is_stream, enable_thinking, system_chars, user_chars, tools_len, tool_msg_count });
     log.info("  > \"{s}{s}\"\n", .{ last_msg.content[0..preview_len], if (last_msg.content.len > 80) "..." else "" });
 
     // Format chat template
@@ -817,11 +925,11 @@ fn handleChatCompletions(
     };
 
     if (is_stream) {
-        handleStreamingGeneration(allocator, stream, xfm, tok, cache_result.new_tokens, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, include_usage, has_tools, cache_result.cached_tokens, logprobs_n, enable_thinking) catch |err| {
+        handleStreamingGeneration(allocator, stream, xfm, tok, cache_result.new_tokens, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, include_usage, has_tools, cache_result.cached_tokens, logprobs_n, enable_thinking, reasoning_budget) catch |err| {
             log.err("  -> streaming error: {}\n", .{err});
         };
     } else {
-        handleNonStreamingGeneration(allocator, stream, xfm, tok, cache_result.new_tokens, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, cache_result.cached_tokens, logprobs_n, enable_thinking) catch |err| {
+        handleNonStreamingGeneration(allocator, stream, xfm, tok, cache_result.new_tokens, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, cache_result.cached_tokens, logprobs_n, enable_thinking, reasoning_budget) catch |err| {
             log.err("  -> 500 ({s})\n", .{@errorName(err)});
             sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", @errorName(err), 500) catch {};
         };
@@ -1079,10 +1187,40 @@ fn handleStreamingCompletion(
     var text_buf = std.ArrayList(u8).empty;
     defer text_buf.deinit(allocator);
     var stopped = false;
+    var utf8_carry_c: [3]u8 = undefined;
+    var utf8_carry_c_len: u8 = 0;
 
     while (try gen.next(allocator)) |token_id| {
         const strip = tok.tok_type == .sentencepiece_bpe;
-        const token_text = try tok.decode(allocator, &[_]u32{token_id}, strip and false);
+        const raw_decoded_c = try tok.decode(allocator, &[_]u32{token_id}, strip and false);
+
+        // Handle incomplete UTF-8 sequences across token boundaries
+        const token_text = blk: {
+            const with_carry = if (utf8_carry_c_len > 0) cc: {
+                const combined = try allocator.alloc(u8, utf8_carry_c_len + raw_decoded_c.len);
+                @memcpy(combined[0..utf8_carry_c_len], utf8_carry_c[0..utf8_carry_c_len]);
+                @memcpy(combined[utf8_carry_c_len..], raw_decoded_c);
+                allocator.free(raw_decoded_c);
+                utf8_carry_c_len = 0;
+                break :cc combined;
+            } else raw_decoded_c;
+
+            const tail = utf8TrailingIncomplete(with_carry);
+            if (tail > 0) {
+                @memcpy(utf8_carry_c[0..tail], with_carry[with_carry.len - tail ..]);
+                utf8_carry_c_len = @intCast(tail);
+            }
+            if (with_carry.len == tail) {
+                allocator.free(with_carry);
+                continue;
+            }
+            if (tail > 0) {
+                const trimmed = try allocator.dupe(u8, with_carry[0 .. with_carry.len - tail]);
+                allocator.free(with_carry);
+                break :blk trimmed;
+            }
+            break :blk with_carry;
+        };
         defer allocator.free(token_text);
 
         if (stop_sequences.len > 0) {
@@ -1150,6 +1288,7 @@ fn handleNonStreamingGeneration(
     cached_tokens: u32,
     logprobs_n: u32,
     enable_thinking: bool,
+    reasoning_budget: i32,
 ) !void {
     var timer = try std.time.Timer.start();
 
@@ -1170,6 +1309,30 @@ fn handleNonStreamingGeneration(
             final_text = final_text[0..idx];
             finish_reason = "stop";
             break;
+        }
+    }
+
+    // Apply reasoning budget: truncate reasoning by token count
+    // For non-streaming, we truncate after generation since we can't interrupt mid-generation
+    var budget_truncated_reasoning: ?[]const u8 = null;
+    var budget_reasoning_allocated = false;
+    defer if (budget_reasoning_allocated) allocator.free(budget_truncated_reasoning.?);
+
+    if (enable_thinking and reasoning_budget >= 0) {
+        const think_split = chat_mod.splitThinkBlock(final_text, true);
+        if (think_split.reasoning_content) |reasoning| {
+            // Count tokens in reasoning by encoding it
+            const reasoning_ids = try tok.encode(allocator, reasoning);
+            defer allocator.free(reasoning_ids);
+            if (reasoning_ids.len > @as(usize, @intCast(reasoning_budget))) {
+                // Truncate: decode only budget-many tokens
+                const budget_usize: usize = @intCast(reasoning_budget);
+                const truncated_ids = reasoning_ids[0..budget_usize];
+                const truncated_text = try tok.decode(allocator, truncated_ids, false);
+                budget_truncated_reasoning = truncated_text;
+                budget_reasoning_allocated = true;
+                log.info("  reasoning budget truncated ({d}/{d} tokens)\n", .{ budget_usize, reasoning_ids.len });
+            }
         }
     }
 
@@ -1252,7 +1415,9 @@ fn handleNonStreamingGeneration(
     var reasoning_json: []const u8 = "";
     var reasoning_allocated = false;
     if (enable_thinking) {
-        if (think_split.reasoning_content) |reasoning| {
+        // Use budget-truncated reasoning if available, otherwise use full reasoning
+        const reasoning_text = if (budget_truncated_reasoning) |tr| tr else think_split.reasoning_content;
+        if (reasoning_text) |reasoning| {
             const escaped_reasoning = try jsonEscape(allocator, reasoning);
             reasoning_json = try std.fmt.allocPrint(allocator, ",\"reasoning_content\":{s}", .{escaped_reasoning});
             allocator.free(escaped_reasoning);
@@ -1296,6 +1461,7 @@ fn handleStreamingGeneration(
     cached_tokens: u32,
     logprobs_n: u32,
     enable_thinking: bool,
+    reasoning_budget: i32,
 ) !void {
     const chat_id = std.time.milliTimestamp();
     var timer = try std.time.Timer.start();
@@ -1332,17 +1498,59 @@ fn handleStreamingGeneration(
     }
     var stopped = false;
 
+    // Buffer for incomplete UTF-8 sequences split across BPE tokens
+    var utf8_carry: [3]u8 = undefined;
+    var utf8_carry_len: u8 = 0;
+
     // Thinking state for real-time streaming of reasoning_content vs content
     var in_think_block = enable_thinking; // starts true when thinking enabled (model outputs <think> first)
     var think_buf = std.ArrayList(u8).empty; // buffer to detect </think> across token boundaries
     defer think_buf.deinit(allocator);
     const think_close_tag = "</think>";
     var skipped_think_open = false; // track if we've skipped the initial <think> tag
+    var think_tokens: i32 = 0; // count of tokens generated in <think> block
+    var budget_exhausted = false; // true when reasoning budget hit
 
     // Generate tokens
     while (try gen.next(allocator)) |token_id| {
         const strip = tok.tok_type == .sentencepiece_bpe;
-        const token_text = try tok.decode(allocator, &[_]u32{token_id}, strip and false);
+        const raw_decoded = try tok.decode(allocator, &[_]u32{token_id}, strip and false);
+
+        // Prepend any carried-over bytes from a previous incomplete UTF-8 sequence,
+        // then strip any new trailing incomplete bytes into the carry buffer.
+        const token_text = blk: {
+            // Step 1: prepend carry-over from previous token
+            const with_carry = if (utf8_carry_len > 0) cc: {
+                const combined = try allocator.alloc(u8, utf8_carry_len + raw_decoded.len);
+                @memcpy(combined[0..utf8_carry_len], utf8_carry[0..utf8_carry_len]);
+                @memcpy(combined[utf8_carry_len..], raw_decoded);
+                allocator.free(raw_decoded);
+                utf8_carry_len = 0;
+                break :cc combined;
+            } else raw_decoded;
+
+            // Step 2: check for trailing incomplete UTF-8 sequence
+            const tail = utf8TrailingIncomplete(with_carry);
+            if (tail > 0) {
+                @memcpy(utf8_carry[0..tail], with_carry[with_carry.len - tail ..]);
+                utf8_carry_len = @intCast(tail);
+            }
+
+            // Step 3: if everything was incomplete, skip this iteration
+            if (with_carry.len == tail) {
+                allocator.free(with_carry);
+                continue;
+            }
+
+            // Step 4: if we trimmed trailing bytes, reallocate to the complete prefix
+            if (tail > 0) {
+                const trimmed = try allocator.dupe(u8, with_carry[0 .. with_carry.len - tail]);
+                allocator.free(with_carry);
+                break :blk trimmed;
+            }
+
+            break :blk with_carry;
+        };
 
         // Accumulate for stop sequence and tool call detection
         if (has_tools or stop_sequences.len > 0) {
@@ -1372,6 +1580,7 @@ fn handleStreamingGeneration(
             // Inside <think> block — stream as reasoning_content with </think> detection
             defer allocator.free(token_text);
             try think_buf.appendSlice(allocator, token_text);
+            think_tokens += 1;
 
             // Skip the initial <think>\n prefix
             if (!skipped_think_open and think_buf.items.len >= 7) {
@@ -1385,6 +1594,19 @@ fn handleStreamingGeneration(
                     allocator.free(remaining);
                 }
                 skipped_think_open = true;
+            }
+
+            // Check if reasoning budget exhausted
+            if (!budget_exhausted and reasoning_budget >= 0 and think_tokens >= reasoning_budget and skipped_think_open) {
+                budget_exhausted = true;
+                // Flush all buffered reasoning
+                if (think_buf.items.len > 0) {
+                    try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = think_buf.items }, null, null);
+                }
+                think_buf.clearRetainingCapacity();
+                in_think_block = false;
+                log.info("  reasoning budget exhausted ({d}/{d} tokens)\n", .{ think_tokens, reasoning_budget });
+                continue;
             }
 
             // Check for </think> in buffer
@@ -1445,6 +1667,29 @@ fn handleStreamingGeneration(
                 allocator.free(tool_calls);
             }
 
+            // Emit reasoning_content before tool calls if thinking is enabled
+            if (enable_thinking) {
+                const think_split = chat_mod.splitThinkBlock(text_buf.items, false);
+                if (think_split.reasoning_content) |reasoning| {
+                    // Apply reasoning budget truncation if set
+                    const final_reasoning = if (reasoning_budget >= 0) blk: {
+                        const r_ids = try tok.encode(allocator, reasoning);
+                        defer allocator.free(r_ids);
+                        const budget_usize: usize = @intCast(reasoning_budget);
+                        if (r_ids.len > budget_usize) {
+                            const truncated = try tok.decode(allocator, r_ids[0..budget_usize], false);
+                            defer allocator.free(truncated);
+                            try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = truncated }, null, null);
+                            break :blk @as(?[]const u8, null);
+                        }
+                        break :blk @as(?[]const u8, reasoning);
+                    } else @as(?[]const u8, reasoning);
+                    if (final_reasoning) |r| {
+                        try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = r }, null, null);
+                    }
+                }
+            }
+
             // Emit tool call deltas in OpenAI streaming format
             for (tool_calls, 0..) |tc, i| {
                 const tc_id = try std.fmt.allocPrint(allocator, "call_{d}_{d}", .{ chat_id, i });
@@ -1477,8 +1722,39 @@ fn handleStreamingGeneration(
             finish_reason = "tool_calls";
         } else {
             // No tool calls found — flush buffered tokens as content
-            for (token_texts.items) |t| {
-                try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = t }, null, null);
+            if (enable_thinking) {
+                // Concatenate all buffered tokens and split thinking from content
+                var full_text = std.ArrayList(u8).empty;
+                defer full_text.deinit(allocator);
+                for (token_texts.items) |t| {
+                    try full_text.appendSlice(allocator, t);
+                }
+                const think_split = chat_mod.splitThinkBlock(full_text.items, false);
+                if (think_split.reasoning_content) |reasoning| {
+                    // Apply reasoning budget truncation if set
+                    const final_reasoning = if (reasoning_budget >= 0) blk: {
+                        const r_ids = try tok.encode(allocator, reasoning);
+                        defer allocator.free(r_ids);
+                        const budget_usize: usize = @intCast(reasoning_budget);
+                        if (r_ids.len > budget_usize) {
+                            const truncated = try tok.decode(allocator, r_ids[0..budget_usize], false);
+                            defer allocator.free(truncated);
+                            try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = truncated }, null, null);
+                            break :blk @as(?[]const u8, null);
+                        }
+                        break :blk @as(?[]const u8, reasoning);
+                    } else @as(?[]const u8, reasoning);
+                    if (final_reasoning) |r| {
+                        try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = r }, null, null);
+                    }
+                }
+                if (think_split.content.len > 0) {
+                    try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = think_split.content }, null, null);
+                }
+            } else {
+                for (token_texts.items) |t| {
+                    try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = t }, null, null);
+                }
             }
         }
     }
@@ -1726,6 +2002,32 @@ fn sendErrorResponse(allocator: std.mem.Allocator, stream: std.net.Stream, statu
     try sendResponse(stream, status, "application/json", body);
 }
 
+/// Returns the number of trailing bytes that form an incomplete UTF-8 sequence.
+/// If the string ends with a complete codepoint (or is empty), returns 0.
+fn utf8TrailingIncomplete(s: []const u8) usize {
+    if (s.len == 0) return 0;
+    // Walk backwards to find the last leading byte (one with bit pattern 11xxxxxx or 0xxxxxxx)
+    var i: usize = s.len;
+    // Check up to 3 trailing continuation bytes (10xxxxxx)
+    var cont: usize = 0;
+    while (cont < 3 and i > 0) {
+        i -= 1;
+        if (s[i] & 0xC0 != 0x80) break; // found a non-continuation byte
+        cont += 1;
+    }
+    // i now points to the last leading byte (or the byte that broke the loop)
+    if (i >= s.len) return 0;
+    const lead = s[i];
+    // Determine expected sequence length from leading byte
+    const expected: usize = if (lead & 0x80 == 0) 1 // 0xxxxxxx — ASCII
+    else if (lead & 0xE0 == 0xC0) 2 // 110xxxxx
+    else if (lead & 0xF0 == 0xE0) 3 // 1110xxxx
+    else if (lead & 0xF8 == 0xF0) 4 // 11110xxx
+    else return 0; // invalid leading byte, don't buffer
+    const actual = s.len - i;
+    return if (actual < expected) actual else 0;
+}
+
 fn jsonEscape(allocator: std.mem.Allocator, input: []const u8) ![]const u8 {
     var result = std.ArrayList(u8).empty;
     errdefer result.deinit(allocator);
@@ -1934,6 +2236,33 @@ test "jsonEscape empty string" {
     const result = try jsonEscape(allocator, "");
     defer allocator.free(result);
     try testing.expectEqualStrings("\"\"", result);
+}
+
+test "utf8TrailingIncomplete complete ASCII" {
+    try testing.expectEqual(@as(usize, 0), utf8TrailingIncomplete("hello"));
+}
+
+test "utf8TrailingIncomplete complete multibyte" {
+    // 🎉 = F0 9F 8E 89 (4-byte sequence, complete)
+    try testing.expectEqual(@as(usize, 0), utf8TrailingIncomplete("\xF0\x9F\x8E\x89"));
+}
+
+test "utf8TrailingIncomplete partial 4-byte" {
+    // First 3 bytes of a 4-byte sequence
+    try testing.expectEqual(@as(usize, 3), utf8TrailingIncomplete("\xF0\x9F\x8E"));
+    // First 2 bytes
+    try testing.expectEqual(@as(usize, 2), utf8TrailingIncomplete("\xF0\x9F"));
+    // First 1 byte
+    try testing.expectEqual(@as(usize, 1), utf8TrailingIncomplete("\xF0"));
+}
+
+test "utf8TrailingIncomplete partial after complete" {
+    // "hi" + first 2 bytes of emoji
+    try testing.expectEqual(@as(usize, 2), utf8TrailingIncomplete("hi\xF0\x9F"));
+}
+
+test "utf8TrailingIncomplete empty" {
+    try testing.expectEqual(@as(usize, 0), utf8TrailingIncomplete(""));
 }
 
 test "parseJsonFloat returns value when present" {

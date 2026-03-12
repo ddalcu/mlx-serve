@@ -13,7 +13,7 @@ Native Zig server that runs MLX-format LMs on Apple Silicon and exposes an OpenA
 
 | Path | Role |
 |------|------|
-| `src/main.zig` | Entry, CLI (`--model`, `--serve`, `--host`, `--port`, `--prompt`, `--max-tokens`, `--temp`, `--ctx-size`, `--timeout`, `--log-level`, `--version`, `--help`) |
+| `src/main.zig` | Entry, CLI (`--model`, `--serve`, `--host`, `--port`, `--prompt`, `--max-tokens`, `--temp`, `--ctx-size`, `--timeout`, `--reasoning-budget`, `--log-level`, `--version`, `--help`) |
 | `src/mlx.zig` | mlx-c FFI |
 | `src/model.zig` | Config + safetensors loading; supports Gemma-3, Qwen3, Qwen3.5 MoE, Qwen3-next, Llama, Mistral |
 | `src/tokenizer.zig` | BPE tokenizer |
@@ -31,6 +31,11 @@ Native Zig server that runs MLX-format LMs on Apple Silicon and exposes an OpenA
 - `./tests/integration_test.sh [model_dir] [port]` — 36 end-to-end API tests (needs a model)
 - Always run unit tests before submitting changes
 - Add tests for new pure logic functions in the same source file
+
+## Building
+
+- Always build with release-fast: `zig build -Doptimize=ReleaseFast`
+- For tests: `zig build test`
 
 ## Conventions
 

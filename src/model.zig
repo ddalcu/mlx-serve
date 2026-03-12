@@ -62,6 +62,11 @@ pub const ModelConfig = struct {
     partial_rotary_factor: f32 = 1.0,
     attn_output_gate: bool = false,
 
+    // BERT encoder-only
+    is_encoder_only: bool = false,
+    layer_norm_eps: f32 = 1e-12,
+    type_vocab_size: u32 = 0,
+
     // Context length from config.json (0 = unknown)
     max_position_embeddings: u32 = 0,
 
@@ -278,6 +283,25 @@ pub fn parseConfig(allocator: std.mem.Allocator, model_dir: []const u8) !ModelCo
         if (cfg_obj.get("query_pre_attn_scalar") == null) {
             config.query_pre_attn_scalar = config.head_dim;
         }
+    } else if (std.mem.eql(u8, model_type, "bert")) {
+        config.model_type = "bert";
+        config.is_encoder_only = true;
+        config.weight_prefix = "";
+        config.hidden_act = .gelu_approx;
+        config.tie_word_embeddings = true;
+        config.has_sliding_window = false;
+        config.has_pre_ff_norm = false;
+        config.has_qk_norm = false;
+        config.scale_embeddings = false;
+        config.norm_has_offset = false;
+        config.head_dim = config.hidden_size / config.num_attention_heads;
+        config.num_key_value_heads = config.num_attention_heads;
+        config.query_pre_attn_scalar = config.head_dim;
+        if (cfg_obj.get("layer_norm_eps")) |v| config.layer_norm_eps = jsonFloat(v);
+        if (cfg_obj.get("type_vocab_size")) |v| config.type_vocab_size = switch (v) {
+            .integer => |i| @intCast(i),
+            else => 2,
+        };
     } else {
         // Llama-family defaults (qwen3, llama, mistral, etc.)
         if (std.mem.eql(u8, model_type, "qwen3")) {
@@ -534,4 +558,34 @@ test "jsonFloat converts integer" {
 test "jsonFloat converts float" {
     const val = std.json.Value{ .float = 3.14 };
     try testing.expectApproxEqAbs(@as(f32, 3.14), jsonFloat(val), 0.01);
+}
+
+test "ModelConfig BERT defaults" {
+    var config = ModelConfig{};
+    config.is_encoder_only = true;
+    config.model_type = "bert";
+    config.hidden_size = 384;
+    config.num_attention_heads = 12;
+    config.head_dim = 384 / 12;
+    config.num_key_value_heads = 12;
+
+    try testing.expect(config.is_encoder_only);
+    try testing.expectEqual(@as(u32, 32), config.head_dim);
+    try testing.expectEqual(@as(u32, 12), config.num_key_value_heads);
+    try testing.expectApproxEqAbs(@as(f32, 1e-12), config.layer_norm_eps, 1e-15);
+}
+
+test "ModelConfig BERT is not MoE" {
+    var config = ModelConfig{};
+    config.is_encoder_only = true;
+    config.model_type = "bert";
+    try testing.expect(!config.isMoe());
+}
+
+test "ModelConfig BERT has no sliding window" {
+    var config = ModelConfig{};
+    config.is_encoder_only = true;
+    config.has_sliding_window = false;
+    try testing.expect(config.isGlobalLayer(0));
+    try testing.expect(config.isGlobalLayer(5));
 }

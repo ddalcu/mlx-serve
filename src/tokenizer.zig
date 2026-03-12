@@ -1,7 +1,7 @@
 const std = @import("std");
 const log = @import("log.zig");
 
-pub const TokenizerType = enum { sentencepiece_bpe, byte_level_bpe };
+pub const TokenizerType = enum { sentencepiece_bpe, byte_level_bpe, wordpiece };
 
 /// BPE tokenizer supporting both SentencePiece (Gemma) and byte-level (GPT-2/Qwen3) modes.
 pub const Tokenizer = struct {
@@ -66,11 +66,21 @@ pub const Tokenizer = struct {
         self.unicode_to_byte.deinit();
     }
 
-    /// Encode text to token IDs (no BOS/EOS added).
+    /// Encode text to token IDs (no BOS/EOS added, except WordPiece adds [CLS]/[SEP]).
     pub fn encode(self: *const Tokenizer, allocator: std.mem.Allocator, text: []const u8) ![]u32 {
         // Split text around special tokens, encode segments with BPE, insert special token IDs
         var result = std.ArrayList(u32).empty;
         errdefer result.deinit(allocator);
+
+        // WordPiece (BERT): wrap with [CLS] ... [SEP]
+        if (self.tok_type == .wordpiece) {
+            if (self.bos_id) |cls_id| try result.append(allocator, cls_id);
+            const ids = try self.encodeWordPiece(allocator, text);
+            defer allocator.free(ids);
+            try result.appendSlice(allocator, ids);
+            if (self.eos_id) |sep_id| try result.append(allocator, sep_id);
+            return result.toOwnedSlice(allocator);
+        }
 
         var pos: usize = 0;
         while (pos < text.len) {
@@ -115,11 +125,12 @@ pub const Tokenizer = struct {
         return result.toOwnedSlice(allocator);
     }
 
-    /// Encode a text segment (no special tokens) using the appropriate BPE method.
+    /// Encode a text segment (no special tokens) using the appropriate method.
     fn encodeSegment(self: *const Tokenizer, allocator: std.mem.Allocator, text: []const u8) ![]u32 {
         return switch (self.tok_type) {
             .sentencepiece_bpe => self.encodeSentencePiece(allocator, text),
             .byte_level_bpe => self.encodeByteLevel(allocator, text),
+            .wordpiece => self.encodeWordPiece(allocator, text),
         };
     }
 
@@ -128,6 +139,7 @@ pub const Tokenizer = struct {
         return switch (self.tok_type) {
             .sentencepiece_bpe => self.decodeSentencePiece(allocator, ids, strip_leading_space),
             .byte_level_bpe => self.decodeByteLevel(allocator, ids),
+            .wordpiece => self.decodeWordPiece(allocator, ids),
         };
     }
 
@@ -260,6 +272,103 @@ pub const Tokenizer = struct {
         }
 
         return output.toOwnedSlice(allocator);
+    }
+
+    // ── WordPiece (BERT) ──
+
+    fn encodeWordPiece(self: *const Tokenizer, allocator: std.mem.Allocator, text: []const u8) ![]u32 {
+        var result = std.ArrayList(u32).empty;
+        errdefer result.deinit(allocator);
+
+        // Lowercase
+        var lower = std.ArrayList(u8).empty;
+        defer lower.deinit(allocator);
+        for (text) |c| {
+            try lower.append(allocator, if (c >= 'A' and c <= 'Z') c + 32 else c);
+        }
+
+        // Split on whitespace and punctuation
+        var words = std.ArrayList([]const u8).empty;
+        defer words.deinit(allocator);
+
+        var start: usize = 0;
+        var i: usize = 0;
+        while (i < lower.items.len) {
+            const c = lower.items[i];
+            if (c == ' ' or c == '\t' or c == '\n' or c == '\r') {
+                if (i > start) try words.append(allocator, lower.items[start..i]);
+                i += 1;
+                start = i;
+            } else if (isPunct(c)) {
+                if (i > start) try words.append(allocator, lower.items[start..i]);
+                try words.append(allocator, lower.items[i .. i + 1]);
+                i += 1;
+                start = i;
+            } else {
+                i += 1;
+            }
+        }
+        if (start < lower.items.len) try words.append(allocator, lower.items[start..]);
+
+        const unk_id = self.vocab.get("[UNK]") orelse 0;
+
+        // WordPiece: greedy longest-match with ## prefix
+        for (words.items) |word| {
+            var pos: usize = 0;
+            while (pos < word.len) {
+                var end: usize = word.len;
+                var found = false;
+                while (end > pos) {
+                    // Build candidate: "##substr" for continuations, "substr" for first piece
+                    var candidate = std.ArrayList(u8).empty;
+                    defer candidate.deinit(allocator);
+                    if (pos > 0) try candidate.appendSlice(allocator, "##");
+                    try candidate.appendSlice(allocator, word[pos..end]);
+
+                    if (self.vocab.get(candidate.items)) |id| {
+                        try result.append(allocator, id);
+                        pos = end;
+                        found = true;
+                        break;
+                    }
+                    // Shrink by one UTF-8 character from the end
+                    end -= 1;
+                    while (end > pos and (word[end] & 0xC0) == 0x80) end -= 1;
+                }
+                if (!found) {
+                    try result.append(allocator, unk_id);
+                    break;
+                }
+            }
+        }
+
+        return result.toOwnedSlice(allocator);
+    }
+
+    fn decodeWordPiece(self: *const Tokenizer, allocator: std.mem.Allocator, ids: []const u32) ![]u8 {
+        var output = std.ArrayList(u8).empty;
+        defer output.deinit(allocator);
+
+        for (ids, 0..) |id, idx| {
+            if (self.id_to_token.get(id)) |token| {
+                // Skip [CLS], [SEP], [PAD], [UNK] etc.
+                if (token.len > 0 and token[0] == '[') continue;
+                if (std.mem.startsWith(u8, token, "##")) {
+                    try output.appendSlice(allocator, token[2..]);
+                } else {
+                    if (idx > 0 and output.items.len > 0) try output.append(allocator, ' ');
+                    try output.appendSlice(allocator, token);
+                }
+            }
+        }
+        return output.toOwnedSlice(allocator);
+    }
+
+    fn isPunct(c: u8) bool {
+        return switch (c) {
+            '!', '"', '#', '$', '%', '&', '\'', '(', ')', '*', '+', ',', '-', '.', '/', ':', ';', '<', '=', '>', '?', '@', '[', '\\', ']', '^', '_', '`', '{', '|', '}', '~' => true,
+            else => false,
+        };
     }
 
     // ── Shared BPE merge logic ──
@@ -540,11 +649,17 @@ pub fn loadTokenizer(allocator: std.mem.Allocator, model_dir: []const u8) !Token
 
     // Detect tokenizer type
     var tok_type: TokenizerType = .sentencepiece_bpe;
-    if (root.get("pre_tokenizer")) |pt| {
-        if (pt == .object) {
-            // Check for ByteLevel pre-tokenizer (directly or in a Sequence)
-            if (hasByteLevel(pt)) {
-                tok_type = .byte_level_bpe;
+    if (model_obj.get("type")) |mt| {
+        if (mt == .string and std.mem.eql(u8, mt.string, "WordPiece")) {
+            tok_type = .wordpiece;
+        }
+    }
+    if (tok_type != .wordpiece) {
+        if (root.get("pre_tokenizer")) |pt| {
+            if (pt == .object) {
+                if (hasByteLevel(pt)) {
+                    tok_type = .byte_level_bpe;
+                }
             }
         }
     }
@@ -570,15 +685,17 @@ pub fn loadTokenizer(allocator: std.mem.Allocator, model_dir: []const u8) !Token
         std.hash_map.default_max_load_percentage,
     ).init(allocator);
 
-    const merges_arr = model_obj.get("merges").?.array;
-    for (merges_arr.items, 0..) |merge_val, rank| {
-        const pair = merge_val.array;
-        const left = try allocator.dupe(u8, pair.items[0].string);
-        const right = try allocator.dupe(u8, pair.items[1].string);
-        try merge_ranks.put(
-            .{ .left = left, .right = right },
-            @intCast(rank),
-        );
+    if (model_obj.get("merges")) |merges_val| {
+        const merges_arr = merges_val.array;
+        for (merges_arr.items, 0..) |merge_val, rank| {
+            const pair = merge_val.array;
+            const left = try allocator.dupe(u8, pair.items[0].string);
+            const right = try allocator.dupe(u8, pair.items[1].string);
+            try merge_ranks.put(
+                .{ .left = left, .right = right },
+                @intCast(rank),
+            );
+        }
     }
 
     // Parse added_tokens
@@ -605,8 +722,8 @@ pub fn loadTokenizer(allocator: std.mem.Allocator, model_dir: []const u8) !Token
     }
 
     // Try to find BOS/EOS from common special token patterns
-    bos_id = special_tokens.get("<bos>") orelse special_tokens.get("<|startoftext|>");
-    eos_id = special_tokens.get("<eos>") orelse special_tokens.get("<|im_end|>") orelse special_tokens.get("<|endoftext|>");
+    bos_id = special_tokens.get("<bos>") orelse special_tokens.get("<|startoftext|>") orelse special_tokens.get("[CLS]");
+    eos_id = special_tokens.get("<eos>") orelse special_tokens.get("<|im_end|>") orelse special_tokens.get("<|endoftext|>") orelse special_tokens.get("[SEP]");
 
     // Build byte-to-unicode mapping
     const byte_to_unicode = buildBytesToUnicode();
@@ -619,7 +736,11 @@ pub fn loadTokenizer(allocator: std.mem.Allocator, model_dir: []const u8) !Token
         vocab.count(),
         merge_ranks.count(),
         special_tokens.count(),
-        if (tok_type == .byte_level_bpe) "byte-level BPE" else "SentencePiece BPE",
+        switch (tok_type) {
+            .byte_level_bpe => "byte-level BPE",
+            .sentencepiece_bpe => "SentencePiece BPE",
+            .wordpiece => "WordPiece",
+        },
     });
 
     return .{
@@ -652,4 +773,280 @@ fn hasByteLevel(pt: std.json.Value) bool {
         }
     }
     return false;
+}
+
+// ── Tests ──
+
+const testing = std.testing;
+
+test "isPunct identifies punctuation" {
+    try testing.expect(Tokenizer.isPunct('.'));
+    try testing.expect(Tokenizer.isPunct(','));
+    try testing.expect(Tokenizer.isPunct('!'));
+    try testing.expect(Tokenizer.isPunct('('));
+    try testing.expect(!Tokenizer.isPunct('a'));
+    try testing.expect(!Tokenizer.isPunct('0'));
+    try testing.expect(!Tokenizer.isPunct(' '));
+}
+
+test "WordPiece encode basic" {
+    const allocator = testing.allocator;
+
+    var vocab = std.StringHashMap(u32).init(allocator);
+    defer vocab.deinit();
+    const words = [_]struct { k: []const u8, v: u32 }{
+        .{ .k = "[CLS]", .v = 101 },
+        .{ .k = "[SEP]", .v = 102 },
+        .{ .k = "[UNK]", .v = 0 },
+        .{ .k = "hello", .v = 10 },
+        .{ .k = "world", .v = 11 },
+        .{ .k = "hel", .v = 12 },
+        .{ .k = "##lo", .v = 13 },
+    };
+    for (words) |w| try vocab.put(w.k, w.v);
+
+    var id_to_token = std.AutoHashMap(u32, []const u8).init(allocator);
+    defer id_to_token.deinit();
+    for (words) |w| try id_to_token.put(w.v, w.k);
+
+    var special_tokens = std.StringHashMap(u32).init(allocator);
+    defer special_tokens.deinit();
+    try special_tokens.put("[CLS]", 101);
+    try special_tokens.put("[SEP]", 102);
+
+    var merge_ranks = std.HashMap(Tokenizer.MergePair, u32, Tokenizer.MergePairContext, std.hash_map.default_max_load_percentage).init(allocator);
+    defer merge_ranks.deinit();
+
+    var tok = Tokenizer{
+        .vocab = vocab,
+        .id_to_token = id_to_token,
+        .merge_ranks = merge_ranks,
+        .allocator = allocator,
+        .special_tokens = special_tokens,
+        .tok_type = .wordpiece,
+        .byte_to_unicode = buildBytesToUnicode(),
+        .unicode_to_byte = std.AutoHashMap(u21, u8).init(allocator),
+        .bos_id = 101,
+        .eos_id = 102,
+    };
+    defer tok.unicode_to_byte.deinit();
+
+    const ids = try tok.encode(allocator, "hello world");
+    defer allocator.free(ids);
+
+    // Should be: [CLS]=101, hello=10, world=11, [SEP]=102
+    try testing.expectEqual(@as(usize, 4), ids.len);
+    try testing.expectEqual(@as(u32, 101), ids[0]);
+    try testing.expectEqual(@as(u32, 10), ids[1]);
+    try testing.expectEqual(@as(u32, 11), ids[2]);
+    try testing.expectEqual(@as(u32, 102), ids[3]);
+}
+
+test "WordPiece encode with subword split" {
+    const allocator = testing.allocator;
+
+    var vocab = std.StringHashMap(u32).init(allocator);
+    defer vocab.deinit();
+    const words = [_]struct { k: []const u8, v: u32 }{
+        .{ .k = "[UNK]", .v = 0 },
+        .{ .k = "un", .v = 10 },
+        .{ .k = "##like", .v = 11 },
+        .{ .k = "##ly", .v = 12 },
+    };
+    for (words) |w| try vocab.put(w.k, w.v);
+
+    var id_to_token = std.AutoHashMap(u32, []const u8).init(allocator);
+    defer id_to_token.deinit();
+    for (words) |w| try id_to_token.put(w.v, w.k);
+
+    var special_tokens = std.StringHashMap(u32).init(allocator);
+    defer special_tokens.deinit();
+    var merge_ranks = std.HashMap(Tokenizer.MergePair, u32, Tokenizer.MergePairContext, std.hash_map.default_max_load_percentage).init(allocator);
+    defer merge_ranks.deinit();
+
+    var tok = Tokenizer{
+        .vocab = vocab,
+        .id_to_token = id_to_token,
+        .merge_ranks = merge_ranks,
+        .allocator = allocator,
+        .special_tokens = special_tokens,
+        .tok_type = .wordpiece,
+        .byte_to_unicode = buildBytesToUnicode(),
+        .unicode_to_byte = std.AutoHashMap(u21, u8).init(allocator),
+        .bos_id = null,
+        .eos_id = null,
+    };
+    defer tok.unicode_to_byte.deinit();
+
+    const ids = try tok.encode(allocator, "unlikely");
+    defer allocator.free(ids);
+
+    // un=10, ##like=11, ##ly=12
+    try testing.expectEqual(@as(usize, 3), ids.len);
+    try testing.expectEqual(@as(u32, 10), ids[0]);
+    try testing.expectEqual(@as(u32, 11), ids[1]);
+    try testing.expectEqual(@as(u32, 12), ids[2]);
+}
+
+test "WordPiece encode unknown word falls back to UNK" {
+    const allocator = testing.allocator;
+
+    var vocab = std.StringHashMap(u32).init(allocator);
+    defer vocab.deinit();
+    try vocab.put("[UNK]", 0);
+    try vocab.put("hello", 10);
+
+    var id_to_token = std.AutoHashMap(u32, []const u8).init(allocator);
+    defer id_to_token.deinit();
+    try id_to_token.put(0, "[UNK]");
+    try id_to_token.put(10, "hello");
+
+    var special_tokens = std.StringHashMap(u32).init(allocator);
+    defer special_tokens.deinit();
+    var merge_ranks = std.HashMap(Tokenizer.MergePair, u32, Tokenizer.MergePairContext, std.hash_map.default_max_load_percentage).init(allocator);
+    defer merge_ranks.deinit();
+
+    var tok = Tokenizer{
+        .vocab = vocab,
+        .id_to_token = id_to_token,
+        .merge_ranks = merge_ranks,
+        .allocator = allocator,
+        .special_tokens = special_tokens,
+        .tok_type = .wordpiece,
+        .byte_to_unicode = buildBytesToUnicode(),
+        .unicode_to_byte = std.AutoHashMap(u21, u8).init(allocator),
+        .bos_id = null,
+        .eos_id = null,
+    };
+    defer tok.unicode_to_byte.deinit();
+
+    const ids = try tok.encode(allocator, "hello xyz");
+    defer allocator.free(ids);
+
+    try testing.expectEqual(@as(usize, 2), ids.len);
+    try testing.expectEqual(@as(u32, 10), ids[0]);
+    try testing.expectEqual(@as(u32, 0), ids[1]);
+}
+
+test "WordPiece encode handles punctuation splitting" {
+    const allocator = testing.allocator;
+
+    var vocab = std.StringHashMap(u32).init(allocator);
+    defer vocab.deinit();
+    try vocab.put("[UNK]", 0);
+    try vocab.put("hello", 10);
+    try vocab.put(",", 11);
+    try vocab.put("world", 12);
+
+    var id_to_token = std.AutoHashMap(u32, []const u8).init(allocator);
+    defer id_to_token.deinit();
+    try id_to_token.put(0, "[UNK]");
+    try id_to_token.put(10, "hello");
+    try id_to_token.put(11, ",");
+    try id_to_token.put(12, "world");
+
+    var special_tokens = std.StringHashMap(u32).init(allocator);
+    defer special_tokens.deinit();
+    var merge_ranks = std.HashMap(Tokenizer.MergePair, u32, Tokenizer.MergePairContext, std.hash_map.default_max_load_percentage).init(allocator);
+    defer merge_ranks.deinit();
+
+    var tok = Tokenizer{
+        .vocab = vocab,
+        .id_to_token = id_to_token,
+        .merge_ranks = merge_ranks,
+        .allocator = allocator,
+        .special_tokens = special_tokens,
+        .tok_type = .wordpiece,
+        .byte_to_unicode = buildBytesToUnicode(),
+        .unicode_to_byte = std.AutoHashMap(u21, u8).init(allocator),
+        .bos_id = null,
+        .eos_id = null,
+    };
+    defer tok.unicode_to_byte.deinit();
+
+    const ids = try tok.encode(allocator, "hello, world");
+    defer allocator.free(ids);
+
+    try testing.expectEqual(@as(usize, 3), ids.len);
+    try testing.expectEqual(@as(u32, 10), ids[0]);
+    try testing.expectEqual(@as(u32, 11), ids[1]);
+    try testing.expectEqual(@as(u32, 12), ids[2]);
+}
+
+test "WordPiece decode skips special tokens and joins subwords" {
+    const allocator = testing.allocator;
+
+    var id_to_token = std.AutoHashMap(u32, []const u8).init(allocator);
+    defer id_to_token.deinit();
+    try id_to_token.put(101, "[CLS]");
+    try id_to_token.put(102, "[SEP]");
+    try id_to_token.put(10, "hello");
+    try id_to_token.put(11, "##ly");
+    try id_to_token.put(12, "world");
+
+    var vocab = std.StringHashMap(u32).init(allocator);
+    defer vocab.deinit();
+    var special_tokens = std.StringHashMap(u32).init(allocator);
+    defer special_tokens.deinit();
+    var merge_ranks = std.HashMap(Tokenizer.MergePair, u32, Tokenizer.MergePairContext, std.hash_map.default_max_load_percentage).init(allocator);
+    defer merge_ranks.deinit();
+
+    var tok = Tokenizer{
+        .vocab = vocab,
+        .id_to_token = id_to_token,
+        .merge_ranks = merge_ranks,
+        .allocator = allocator,
+        .special_tokens = special_tokens,
+        .tok_type = .wordpiece,
+        .byte_to_unicode = buildBytesToUnicode(),
+        .unicode_to_byte = std.AutoHashMap(u21, u8).init(allocator),
+        .bos_id = 101,
+        .eos_id = 102,
+    };
+    defer tok.unicode_to_byte.deinit();
+
+    const ids = [_]u32{ 101, 10, 11, 12, 102 };
+    const text = try tok.decode(allocator, &ids, false);
+    defer allocator.free(text);
+
+    try testing.expectEqualStrings("helloly world", text);
+}
+
+test "WordPiece encode lowercases input" {
+    const allocator = testing.allocator;
+
+    var vocab = std.StringHashMap(u32).init(allocator);
+    defer vocab.deinit();
+    try vocab.put("[UNK]", 0);
+    try vocab.put("hello", 10);
+
+    var id_to_token = std.AutoHashMap(u32, []const u8).init(allocator);
+    defer id_to_token.deinit();
+    try id_to_token.put(0, "[UNK]");
+    try id_to_token.put(10, "hello");
+
+    var special_tokens = std.StringHashMap(u32).init(allocator);
+    defer special_tokens.deinit();
+    var merge_ranks = std.HashMap(Tokenizer.MergePair, u32, Tokenizer.MergePairContext, std.hash_map.default_max_load_percentage).init(allocator);
+    defer merge_ranks.deinit();
+
+    var tok = Tokenizer{
+        .vocab = vocab,
+        .id_to_token = id_to_token,
+        .merge_ranks = merge_ranks,
+        .allocator = allocator,
+        .special_tokens = special_tokens,
+        .tok_type = .wordpiece,
+        .byte_to_unicode = buildBytesToUnicode(),
+        .unicode_to_byte = std.AutoHashMap(u21, u8).init(allocator),
+        .bos_id = null,
+        .eos_id = null,
+    };
+    defer tok.unicode_to_byte.deinit();
+
+    const ids = try tok.encode(allocator, "HELLO");
+    defer allocator.free(ids);
+
+    try testing.expectEqual(@as(usize, 1), ids.len);
+    try testing.expectEqual(@as(u32, 10), ids[0]);
 }

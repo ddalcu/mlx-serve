@@ -30,6 +30,7 @@ fn printUsage() void {
         \\  --max-tokens <n>    Max tokens to generate (default: 100)
         \\  --temp <f>          Temperature (default: 0.0)
         \\  --timeout <n>       Request timeout in seconds (default: 300, 0=none)
+        \\  --reasoning-budget <n>  Max thinking tokens per request (default: unlimited)
         \\  --log-level <lvl>   Log level: error, warn, info, debug (default: info)
         \\  --version           Print version and exit
         \\  --help              Show this help
@@ -55,6 +56,7 @@ pub fn main() !void {
     var temperature: f32 = 0.0;
     var ctx_size: u32 = 0; // 0 = use model default
     var timeout: u32 = 300; // seconds, 0 = no timeout
+    var reasoning_budget: i32 = -1; // -1 = unlimited
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--version")) {
@@ -90,6 +92,9 @@ pub fn main() !void {
         } else if (std.mem.eql(u8, args[i], "--timeout") and i + 1 < args.len) {
             i += 1;
             timeout = try std.fmt.parseInt(u32, args[i], 10);
+        } else if (std.mem.eql(u8, args[i], "--reasoning-budget") and i + 1 < args.len) {
+            i += 1;
+            reasoning_budget = try std.fmt.parseInt(i32, args[i], 10);
         } else if (std.mem.eql(u8, args[i], "--log-level") and i + 1 < args.len) {
             i += 1;
             if (log.Level.fromString(args[i])) |level| {
@@ -171,7 +176,7 @@ pub fn main() !void {
 
     if (serve_mode) {
         // Start HTTP server
-        try server_mod.serve(allocator, &xfm, &tok, &chat_config, &config, host, port, ctx_size, timeout);
+        try server_mod.serve(allocator, &xfm, &tok, &chat_config, &config, host, port, ctx_size, timeout, reasoning_budget);
     } else {
         const user_prompt = prompt orelse "What is 2+2? Answer in one sentence.";
         const messages = [_]chat_mod.Message{

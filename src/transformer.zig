@@ -276,6 +276,43 @@ pub const PrefillCache = struct {
 
 // ── Standard model per-layer weights ──
 
+// ── BERT encoder-only layer weights ──
+
+const BertLayerWeights = struct {
+    // Self-attention (separate Q/K/V projections with real bias)
+    q_w: mlx.mlx_array,
+    q_s: mlx.mlx_array,
+    q_b: mlx.mlx_array,
+    q_bias: mlx.mlx_array,
+    k_w: mlx.mlx_array,
+    k_s: mlx.mlx_array,
+    k_b: mlx.mlx_array,
+    k_bias: mlx.mlx_array,
+    v_w: mlx.mlx_array,
+    v_s: mlx.mlx_array,
+    v_b: mlx.mlx_array,
+    v_bias: mlx.mlx_array,
+    o_w: mlx.mlx_array,
+    o_s: mlx.mlx_array,
+    o_b: mlx.mlx_array,
+    o_bias: mlx.mlx_array,
+    attn_norm_w: mlx.mlx_array,
+    attn_norm_b: mlx.mlx_array,
+    // MLP: intermediate -> GELU -> output
+    inter_w: mlx.mlx_array,
+    inter_s: mlx.mlx_array,
+    inter_b: mlx.mlx_array,
+    inter_bias: mlx.mlx_array,
+    out_w: mlx.mlx_array,
+    out_s: mlx.mlx_array,
+    out_b: mlx.mlx_array,
+    out_bias: mlx.mlx_array,
+    out_norm_w: mlx.mlx_array,
+    out_norm_b: mlx.mlx_array,
+};
+
+// ── Standard decoder-only layer weights ──
+
 const LayerWeights = struct {
     input_norm: mlx.mlx_array,
     post_attn_norm: mlx.mlx_array,
@@ -431,6 +468,17 @@ pub const Transformer = struct {
     three: ?mlx.mlx_array,
     neg_one: ?mlx.mlx_array,
 
+    // BERT encoder-only (null for decoder models)
+    bert_layers: ?[]BertLayerWeights,
+    bert_pos_w: mlx.mlx_array,
+    bert_pos_s: mlx.mlx_array,
+    bert_pos_b: mlx.mlx_array,
+    bert_toktype_w: mlx.mlx_array,
+    bert_toktype_s: mlx.mlx_array,
+    bert_toktype_b: mlx.mlx_array,
+    bert_emb_norm_w: mlx.mlx_array,
+    bert_emb_norm_b: mlx.mlx_array,
+
     // MoE-specific (null/empty for standard models)
     moe_layers: ?[]MoeLayerWeights,
     ssm_entries: ?[]SSMCacheEntry,
@@ -447,6 +495,9 @@ pub const Transformer = struct {
         const prefix = config.weight_prefix;
 
         var name_buf: [256]u8 = undefined;
+
+        if (config.is_encoder_only) return initBert(allocator, config, weights, &name_buf, s);
+
         const emb_w = getWeightFmt(weights, &name_buf, "{s}.embed_tokens.weight", prefix);
         const emb_s_arr = getWeightFmt(weights, &name_buf, "{s}.embed_tokens.scales", prefix);
         const emb_b_arr = getWeightFmt(weights, &name_buf, "{s}.embed_tokens.biases", prefix);
@@ -590,6 +641,15 @@ pub const Transformer = struct {
             .one = bf16Scalar(1.0, s),
             .three = if (need_gelu) bf16Scalar(3.0, s) else null,
             .neg_one = if (need_silu) bf16Scalar(-1.0, s) else null,
+            .bert_layers = null,
+            .bert_pos_w = mlx.mlx_array_new(),
+            .bert_pos_s = mlx.mlx_array_new(),
+            .bert_pos_b = mlx.mlx_array_new(),
+            .bert_toktype_w = mlx.mlx_array_new(),
+            .bert_toktype_s = mlx.mlx_array_new(),
+            .bert_toktype_b = mlx.mlx_array_new(),
+            .bert_emb_norm_w = mlx.mlx_array_new(),
+            .bert_emb_norm_b = mlx.mlx_array_new(),
             .moe_layers = moe_layers,
             .ssm_entries = ssm_entries,
             .moe_seq_offset = 0,
@@ -821,6 +881,20 @@ pub const Transformer = struct {
         return result;
     }
 
+    inline fn layerNorm(self: *const Transformer, x: mlx.mlx_array, w: mlx.mlx_array, b: mlx.mlx_array) !mlx.mlx_array {
+        var result = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_fast_layer_norm(&result, x, w, b, self.config.layer_norm_eps, self.s));
+        return result;
+    }
+
+    inline fn qmatmulAddBias(self: *const Transformer, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, bias: mlx.mlx_array) !mlx.mlx_array {
+        const mm = try self.qmatmul(x, w, sc, bi);
+        defer _ = mlx.mlx_array_free(mm);
+        var result = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_add(&result, mm, bias, self.s));
+        return result;
+    }
+
     fn embedding(self: *const Transformer, token_ids: mlx.mlx_array) !mlx.mlx_array {
         const id_shape = mlx.getShape(token_ids);
         const batch = id_shape[0];
@@ -931,8 +1005,183 @@ pub const Transformer = struct {
     const RECURRENCE_EVAL_INTERVAL: usize = 32;
 
     pub fn forward(self: *Transformer, token_ids: mlx.mlx_array) !mlx.mlx_array {
+        if (self.bert_layers != null) return self.forwardBert(token_ids);
         if (self.moe_layers != null) return self.forwardMoe(token_ids);
         return self.forwardStandard(token_ids);
+    }
+
+    // ── BERT encoder-only forward pass ──
+
+    fn bertEmbedding(self: *const Transformer, token_ids: mlx.mlx_array) !mlx.mlx_array {
+        const id_shape = mlx.getShape(token_ids);
+        const batch = id_shape[0];
+        const seq_len = id_shape[1];
+
+        const flat_shape = [_]c_int{batch * seq_len};
+        var flat_ids = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(flat_ids);
+        try mlx.check(mlx.mlx_reshape(&flat_ids, token_ids, &flat_shape, 1, self.s));
+
+        // Word embeddings
+        const word_emb = try self.dequantTake(self.emb_w, self.emb_s, self.emb_b, flat_ids);
+        defer _ = mlx.mlx_array_free(word_emb);
+
+        // Position IDs: [0, 1, 2, ..., seq_len-1]
+        var pos_ids = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(pos_ids);
+        try mlx.check(mlx.mlx_arange(&pos_ids, 0, @as(f64, @floatFromInt(seq_len)), 1, .int32, self.s));
+
+        const pos_emb = try self.dequantTake(self.bert_pos_w, self.bert_pos_s, self.bert_pos_b, pos_ids);
+        defer _ = mlx.mlx_array_free(pos_emb);
+
+        // Token type IDs: all zeros
+        var toktype_ids = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(toktype_ids);
+        try mlx.check(mlx.mlx_zeros(&toktype_ids, &flat_shape, 1, .int32, self.s));
+
+        const toktype_emb = try self.dequantTake(self.bert_toktype_w, self.bert_toktype_s, self.bert_toktype_b, toktype_ids);
+        defer _ = mlx.mlx_array_free(toktype_emb);
+
+        // Sum: word + position + token_type
+        var wp = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(wp);
+        try mlx.check(mlx.mlx_add(&wp, word_emb, pos_emb, self.s));
+        var sum = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(sum);
+        try mlx.check(mlx.mlx_add(&sum, wp, toktype_emb, self.s));
+
+        // Reshape to [B, S, H]
+        const out_shape = [_]c_int{ batch, seq_len, @intCast(self.config.hidden_size) };
+        var reshaped = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(reshaped);
+        try mlx.check(mlx.mlx_reshape(&reshaped, sum, &out_shape, 3, self.s));
+
+        // LayerNorm
+        return self.layerNorm(reshaped, self.bert_emb_norm_w, self.bert_emb_norm_b);
+    }
+
+    fn dequantTake(self: *const Transformer, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, ids: mlx.mlx_array) !mlx.mlx_array {
+        var tw = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(tw);
+        try mlx.check(mlx.mlx_take_axis(&tw, w, ids, 0, self.s));
+        var ts = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(ts);
+        try mlx.check(mlx.mlx_take_axis(&ts, sc, ids, 0, self.s));
+        var tb = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(tb);
+        try mlx.check(mlx.mlx_take_axis(&tb, bi, ids, 0, self.s));
+        var result = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_dequantize(
+            &result,
+            tw,
+            ts,
+            tb,
+            mlx.mlx_optional_int.some(@intCast(self.config.quant_group_size)),
+            mlx.mlx_optional_int.some(@intCast(self.config.quant_bits)),
+            "affine",
+            .{ .value = .bfloat16, .has_value = true },
+            self.s,
+        ));
+        return result;
+    }
+
+    fn forwardBert(self: *Transformer, token_ids: mlx.mlx_array) !mlx.mlx_array {
+        const bert_layers = self.bert_layers.?;
+        const h_count = self.config.num_attention_heads;
+        const head_dim = self.config.head_dim;
+        const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
+        const id_shape = mlx.getShape(token_ids);
+        const batch = id_shape[0];
+        const seq_len = id_shape[1];
+
+        var h = try self.bertEmbedding(token_ids);
+
+        for (bert_layers) |lw| {
+            // Self-attention
+            const q = try self.qmatmulAddBias(h, lw.q_w, lw.q_s, lw.q_b, lw.q_bias);
+            defer _ = mlx.mlx_array_free(q);
+            const k = try self.qmatmulAddBias(h, lw.k_w, lw.k_s, lw.k_b, lw.k_bias);
+            defer _ = mlx.mlx_array_free(k);
+            const v = try self.qmatmulAddBias(h, lw.v_w, lw.v_s, lw.v_b, lw.v_bias);
+            defer _ = mlx.mlx_array_free(v);
+
+            // Reshape [B, S, H] -> [B, S, heads, head_dim] -> [B, heads, S, head_dim]
+            const qkv_shape = [_]c_int{ batch, seq_len, @intCast(h_count), @intCast(head_dim) };
+            var q_r = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(q_r);
+            try mlx.check(mlx.mlx_reshape(&q_r, q, &qkv_shape, 4, self.s));
+            var k_r = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(k_r);
+            try mlx.check(mlx.mlx_reshape(&k_r, k, &qkv_shape, 4, self.s));
+            var v_r = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(v_r);
+            try mlx.check(mlx.mlx_reshape(&v_r, v, &qkv_shape, 4, self.s));
+
+            const perm = [_]c_int{ 0, 2, 1, 3 };
+            var q_t = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(q_t);
+            try mlx.check(mlx.mlx_transpose_axes(&q_t, q_r, &perm, 4, self.s));
+            var k_t = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(k_t);
+            try mlx.check(mlx.mlx_transpose_axes(&k_t, k_r, &perm, 4, self.s));
+            var v_t = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(v_t);
+            try mlx.check(mlx.mlx_transpose_axes(&v_t, v_r, &perm, 4, self.s));
+
+            // Bidirectional attention (no causal mask)
+            var attn = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(attn);
+            try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(
+                &attn,
+                q_t,
+                k_t,
+                v_t,
+                scale,
+                "",
+                mlx.mlx_array_new(),
+                mlx.mlx_array_new(),
+                self.s,
+            ));
+
+            // Transpose back [B, heads, S, head_dim] -> [B, S, heads, head_dim] -> [B, S, H]
+            var attn_t = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(attn_t);
+            try mlx.check(mlx.mlx_transpose_axes(&attn_t, attn, &perm, 4, self.s));
+            const flat_shape = [_]c_int{ batch, seq_len, @intCast(self.config.hidden_size) };
+            var attn_flat = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(attn_flat);
+            try mlx.check(mlx.mlx_reshape(&attn_flat, attn_t, &flat_shape, 3, self.s));
+
+            // Output projection
+            const o = try self.qmatmulAddBias(attn_flat, lw.o_w, lw.o_s, lw.o_b, lw.o_bias);
+            defer _ = mlx.mlx_array_free(o);
+
+            // Residual + LayerNorm
+            var h_plus_attn = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(h_plus_attn);
+            try mlx.check(mlx.mlx_add(&h_plus_attn, h, o, self.s));
+            _ = mlx.mlx_array_free(h);
+
+            h = try self.layerNorm(h_plus_attn, lw.attn_norm_w, lw.attn_norm_b);
+
+            // MLP: intermediate (GELU) -> output
+            const inter = try self.qmatmulAddBias(h, lw.inter_w, lw.inter_s, lw.inter_b, lw.inter_bias);
+            defer _ = mlx.mlx_array_free(inter);
+            const activated = try self.gelu(inter);
+            defer _ = mlx.mlx_array_free(activated);
+            const out = try self.qmatmulAddBias(activated, lw.out_w, lw.out_s, lw.out_b, lw.out_bias);
+            defer _ = mlx.mlx_array_free(out);
+
+            // Residual + LayerNorm
+            var h_plus_out = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(h_plus_out);
+            try mlx.check(mlx.mlx_add(&h_plus_out, h, out, self.s));
+            _ = mlx.mlx_array_free(h);
+
+            h = try self.layerNorm(h_plus_out, lw.out_norm_w, lw.out_norm_b);
+        }
+
+        return h; // [B, S, H] — hidden states for mean pooling
     }
 
     // ── Standard forward pass (Gemma / Llama / Qwen3) ──
@@ -2320,6 +2569,151 @@ fn bf16Scalar(val: f32, s: mlx.mlx_stream) mlx.mlx_array {
     var bf16_arr = mlx.mlx_array_new();
     _ = mlx.mlx_astype(&bf16_arr, f32_arr, .bfloat16, s);
     return bf16_arr;
+}
+
+fn getBertWeight(weights: *const Weights, buf: *[256]u8, name: []const u8) mlx.mlx_array {
+    const n = std.fmt.bufPrint(buf, "{s}", .{name}) catch unreachable;
+    return weights.get(n) orelse {
+        log.err("MISSING WEIGHT: {s}\n", .{n});
+        unreachable;
+    };
+}
+
+fn getBertLayerWeight(weights: *const Weights, buf: *[256]u8, layer: u32, suffix: []const u8) mlx.mlx_array {
+    const name = std.fmt.bufPrint(buf, "encoder.layer.{d}.{s}", .{ layer, suffix }) catch unreachable;
+    return weights.get(name) orelse {
+        log.err("MISSING WEIGHT: {s}\n", .{name});
+        unreachable;
+    };
+}
+
+fn initBertLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *const Weights, name_buf: *[256]u8) ![]BertLayerWeights {
+    log.info("Precomputing BERT layer weights...\n", .{});
+    const layers = try allocator.alloc(BertLayerWeights, config.num_hidden_layers);
+
+    for (0..config.num_hidden_layers) |i| {
+        const li: u32 = @intCast(i);
+        const lw = &layers[i];
+
+        lw.q_w = getBertLayerWeight(weights, name_buf, li, "attention.self.query.weight");
+        lw.q_s = getBertLayerWeight(weights, name_buf, li, "attention.self.query.scales");
+        lw.q_b = getBertLayerWeight(weights, name_buf, li, "attention.self.query.biases");
+        lw.q_bias = getBertLayerWeight(weights, name_buf, li, "attention.self.query.bias");
+        lw.k_w = getBertLayerWeight(weights, name_buf, li, "attention.self.key.weight");
+        lw.k_s = getBertLayerWeight(weights, name_buf, li, "attention.self.key.scales");
+        lw.k_b = getBertLayerWeight(weights, name_buf, li, "attention.self.key.biases");
+        lw.k_bias = getBertLayerWeight(weights, name_buf, li, "attention.self.key.bias");
+        lw.v_w = getBertLayerWeight(weights, name_buf, li, "attention.self.value.weight");
+        lw.v_s = getBertLayerWeight(weights, name_buf, li, "attention.self.value.scales");
+        lw.v_b = getBertLayerWeight(weights, name_buf, li, "attention.self.value.biases");
+        lw.v_bias = getBertLayerWeight(weights, name_buf, li, "attention.self.value.bias");
+        lw.o_w = getBertLayerWeight(weights, name_buf, li, "attention.output.dense.weight");
+        lw.o_s = getBertLayerWeight(weights, name_buf, li, "attention.output.dense.scales");
+        lw.o_b = getBertLayerWeight(weights, name_buf, li, "attention.output.dense.biases");
+        lw.o_bias = getBertLayerWeight(weights, name_buf, li, "attention.output.dense.bias");
+        lw.attn_norm_w = getBertLayerWeight(weights, name_buf, li, "attention.output.LayerNorm.weight");
+        lw.attn_norm_b = getBertLayerWeight(weights, name_buf, li, "attention.output.LayerNorm.bias");
+        lw.inter_w = getBertLayerWeight(weights, name_buf, li, "intermediate.dense.weight");
+        lw.inter_s = getBertLayerWeight(weights, name_buf, li, "intermediate.dense.scales");
+        lw.inter_b = getBertLayerWeight(weights, name_buf, li, "intermediate.dense.biases");
+        lw.inter_bias = getBertLayerWeight(weights, name_buf, li, "intermediate.dense.bias");
+        lw.out_w = getBertLayerWeight(weights, name_buf, li, "output.dense.weight");
+        lw.out_s = getBertLayerWeight(weights, name_buf, li, "output.dense.scales");
+        lw.out_b = getBertLayerWeight(weights, name_buf, li, "output.dense.biases");
+        lw.out_bias = getBertLayerWeight(weights, name_buf, li, "output.dense.bias");
+        lw.out_norm_w = getBertLayerWeight(weights, name_buf, li, "output.LayerNorm.weight");
+        lw.out_norm_b = getBertLayerWeight(weights, name_buf, li, "output.LayerNorm.bias");
+    }
+    return layers;
+}
+
+fn initBert(allocator: std.mem.Allocator, config: ModelConfig, weights: *const Weights, name_buf: *[256]u8, s: mlx.mlx_stream) !Transformer {
+    // Word embeddings (reuse standard emb_w/s/b fields)
+    const emb_w = getBertWeight(weights, name_buf, "embeddings.word_embeddings.weight");
+    const emb_s = getBertWeight(weights, name_buf, "embeddings.word_embeddings.scales");
+    const emb_b = getBertWeight(weights, name_buf, "embeddings.word_embeddings.biases");
+
+    // Position embeddings
+    const pos_w = getBertWeight(weights, name_buf, "embeddings.position_embeddings.weight");
+    const pos_s = getBertWeight(weights, name_buf, "embeddings.position_embeddings.scales");
+    const pos_b = getBertWeight(weights, name_buf, "embeddings.position_embeddings.biases");
+
+    // Token type embeddings
+    const toktype_w = getBertWeight(weights, name_buf, "embeddings.token_type_embeddings.weight");
+    const toktype_s = getBertWeight(weights, name_buf, "embeddings.token_type_embeddings.scales");
+    const toktype_b = getBertWeight(weights, name_buf, "embeddings.token_type_embeddings.biases");
+
+    // Embedding LayerNorm
+    const emb_norm_w = getBertWeight(weights, name_buf, "embeddings.LayerNorm.weight");
+    const emb_norm_b = getBertWeight(weights, name_buf, "embeddings.LayerNorm.bias");
+
+    const bert_layers = try initBertLayers(allocator, config, weights, name_buf);
+
+    // Batch eval all BERT weights
+    {
+        var eval_timer = std.time.Timer.start() catch unreachable;
+        const all_vec = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(all_vec);
+
+        _ = mlx.mlx_vector_array_append_value(all_vec, emb_w);
+        _ = mlx.mlx_vector_array_append_value(all_vec, emb_s);
+        _ = mlx.mlx_vector_array_append_value(all_vec, emb_b);
+        _ = mlx.mlx_vector_array_append_value(all_vec, pos_w);
+        _ = mlx.mlx_vector_array_append_value(all_vec, pos_s);
+        _ = mlx.mlx_vector_array_append_value(all_vec, pos_b);
+        _ = mlx.mlx_vector_array_append_value(all_vec, toktype_w);
+        _ = mlx.mlx_vector_array_append_value(all_vec, emb_norm_w);
+        _ = mlx.mlx_vector_array_append_value(all_vec, emb_norm_b);
+
+        for (bert_layers) |lw| {
+            inline for (std.meta.fields(BertLayerWeights)) |field| {
+                _ = mlx.mlx_vector_array_append_value(all_vec, @field(lw, field.name));
+            }
+        }
+
+        try mlx.check(mlx.mlx_eval(all_vec));
+        const eval_ms = eval_timer.read() / std.time.ns_per_ms;
+        log.info("Batch eval all weights: {d}ms\n", .{eval_ms});
+    }
+
+    const cache = try KVCache.init(allocator, 0);
+
+    return .{
+        .config = config,
+        .cache = cache,
+        .s = s,
+        .allocator = allocator,
+        .emb_w = emb_w,
+        .emb_s = emb_s,
+        .emb_b = emb_b,
+        .emb_scale = null,
+        .final_norm = mlx.mlx_array_new(),
+        .lm_head_w = mlx.mlx_array_new(),
+        .lm_head_s = mlx.mlx_array_new(),
+        .lm_head_b = mlx.mlx_array_new(),
+        .layers = &.{},
+        .owns_lm_head = false,
+        .owns_norms = false,
+        .gelu_coeff = bf16Scalar(0.7978845608028654, s),
+        .gelu_inner = bf16Scalar(0.044715, s),
+        .half = bf16Scalar(0.5, s),
+        .one = bf16Scalar(1.0, s),
+        .three = bf16Scalar(3.0, s),
+        .neg_one = null,
+        .bert_layers = bert_layers,
+        .bert_pos_w = pos_w,
+        .bert_pos_s = pos_s,
+        .bert_pos_b = pos_b,
+        .bert_toktype_w = toktype_w,
+        .bert_toktype_s = toktype_s,
+        .bert_toktype_b = toktype_b,
+        .bert_emb_norm_w = emb_norm_w,
+        .bert_emb_norm_b = emb_norm_b,
+        .moe_layers = null,
+        .ssm_entries = null,
+        .moe_seq_offset = 0,
+        .prompt_cache = null,
+    };
 }
 
 fn addOne(arr: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
