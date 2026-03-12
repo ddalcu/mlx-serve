@@ -135,9 +135,6 @@ jobs:
             --team-id "$APPLE_TEAM_ID" \
             --wait
 
-          # Staple the binary so it works offline
-          xcrun stapler staple "mlx-serve-macos-arm64/mlx-serve"
-
       - name: Package tarball
         run: tar -czf "mlx-serve-bin-macos-arm64.tar.gz" "mlx-serve-macos-arm64"
 
