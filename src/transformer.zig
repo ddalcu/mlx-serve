@@ -19,6 +19,7 @@ const KVCacheEntry = struct {
 
 pub const KVCache = struct {
     entries: []KVCacheEntry,
+    step: usize, // absolute sequence position (not affected by sliding window trimming)
     allocator: std.mem.Allocator,
 
     pub fn init(allocator: std.mem.Allocator, num_layers: u32) !KVCache {
@@ -33,7 +34,7 @@ pub const KVCache = struct {
                 .initialized = false,
             };
         }
-        return .{ .entries = entries, .allocator = allocator };
+        return .{ .entries = entries, .step = 0, .allocator = allocator };
     }
 
     pub fn deinit(self: *KVCache) void {
@@ -125,8 +126,9 @@ pub const KVCache = struct {
         _ = mlx.mlx_array_free(entry.values);
         entry.values = updated_v;
 
-        // 5. Update offset
+        // 5. Update offset and absolute step
         entry.offset += new_len;
+        if (layer == 0) self.step += new_len;
 
         // 6. max_seq trimming
         if (max_seq > 0 and entry.offset > max_seq) {
@@ -199,6 +201,7 @@ pub const KVCache = struct {
 
     /// Truncate the KV cache to keep only the first `len` tokens on the sequence axis.
     pub fn truncate(self: *KVCache, len: usize, s: mlx.mlx_stream) !void {
+        self.step = len;
         for (self.entries) |*entry| {
             if (!entry.initialized) continue;
             if (len >= entry.offset) continue;
@@ -250,6 +253,7 @@ pub const PrefillCache = struct {
     tokens: []u32,
     kv_entries: []KVCacheEntry,
     offsets: []usize,
+    kv_step: usize,
     ssm_entries: ?[]SSMCacheEntry,
     moe_seq_offset: usize,
     allocator: std.mem.Allocator,
@@ -785,6 +789,7 @@ pub const Transformer = struct {
         // Full prefix match with tokens remaining — restore cached state.
         self.cache.deinit();
         self.cache = try KVCache.init(self.allocator, self.config.num_hidden_layers);
+        self.cache.step = pc.kv_step;
         for (pc.kv_entries, 0..) |src, i| {
             if (src.initialized) {
                 try mlx.check(mlx.mlx_array_set(&self.cache.entries[i].keys, src.keys));
@@ -867,6 +872,7 @@ pub const Transformer = struct {
             .tokens = tokens,
             .kv_entries = kv,
             .offsets = offsets,
+            .kv_step = self.cache.step,
             .ssm_entries = ssm,
             .moe_seq_offset = self.moe_seq_offset,
             .allocator = self.allocator,
@@ -1400,7 +1406,7 @@ pub const Transformer = struct {
     // ── Standard forward pass (Gemma / Llama / Qwen3 / Gemma4) ──
 
     fn forwardStandard(self: *Transformer, token_ids: mlx.mlx_array) !mlx.mlx_array {
-        const offset = self.cache.seqLen(0);
+        const offset = self.cache.step;
         const cfg = &self.config;
         const h_count = cfg.num_attention_heads;
         const kv_h = cfg.num_key_value_heads;
@@ -1445,12 +1451,14 @@ pub const Transformer = struct {
 
         if (cfg.has_sliding_window) {
             const sw: c_int = @intCast(cfg.sliding_window);
+            // Use the post-trim KV length for local layers: after cache.update()
+            // trims to sw, the K tensor has min(total_kv, sw) entries.
+            const local_kv_len: c_int = @min(total_kv, sw);
             if (is_prefill) {
-                local_prefill_mask = try self.createSlidingWindowMask(seq_len, total_kv, sw);
+                local_prefill_mask = try self.createSlidingWindowMask(seq_len, local_kv_len, sw);
             }
-            const local_total_kv: c_int = @min(total_kv, sw);
-            if (!is_prefill and local_total_kv > sw) {
-                local_decode_mask = try self.createSlidingWindowDecodeMask(local_total_kv, sw);
+            if (!is_prefill and total_kv > sw) {
+                local_decode_mask = try self.createSlidingWindowDecodeMask(local_kv_len, sw);
             }
         }
 
@@ -3073,4 +3081,127 @@ fn addOne(arr: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
     var result = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_add(&result, one, arr, s));
     return result;
+}
+
+// ── Tests ──
+
+const testing = std.testing;
+
+/// Helper: create a dummy K or V tensor of shape [1, 1, seq_len, 1].
+fn testKV(seq_len: usize, s: mlx.mlx_stream) mlx.mlx_array {
+    const sl: c_int = @intCast(seq_len);
+    const shape = [_]c_int{ 1, 1, sl, 1 };
+    var arr = mlx.mlx_array_new();
+    _ = mlx.mlx_zeros(&arr, &shape, 4, .float32, s);
+    return arr;
+}
+
+test "KVCache step tracks absolute position through sliding window trimming" {
+    const s = mlx.gpuStream();
+    var cache = try KVCache.init(testing.allocator, 1);
+    defer cache.deinit();
+
+    // Simulate 3 prefill tokens (max_seq=4 sliding window)
+    {
+        const k = testKV(3, s);
+        defer _ = mlx.mlx_array_free(k);
+        const v = testKV(3, s);
+        defer _ = mlx.mlx_array_free(v);
+        _ = try cache.update(0, k, v, s, 4);
+    }
+    // After prefill: offset=3, step should be 3
+    try testing.expectEqual(@as(usize, 3), cache.entries[0].offset);
+    try testing.expectEqual(@as(usize, 3), cache.step);
+
+    // Decode token 4 — still within window
+    {
+        const k = testKV(1, s);
+        defer _ = mlx.mlx_array_free(k);
+        const v = testKV(1, s);
+        defer _ = mlx.mlx_array_free(v);
+        _ = try cache.update(0, k, v, s, 4);
+    }
+    // offset=4 (at max_seq), step=4
+    try testing.expectEqual(@as(usize, 4), cache.entries[0].offset);
+    try testing.expectEqual(@as(usize, 4), cache.step);
+
+    // Decode token 5 — triggers trimming, offset caps at 4, step must be 5
+    {
+        const k = testKV(1, s);
+        defer _ = mlx.mlx_array_free(k);
+        const v = testKV(1, s);
+        defer _ = mlx.mlx_array_free(v);
+        _ = try cache.update(0, k, v, s, 4);
+    }
+    // BUG before fix: offset would be 4, and seqLen(0) returns 4 — RoPE sees position 4 forever
+    // After fix: offset=4 (buffer capped), step=5 (absolute position keeps growing)
+    try testing.expectEqual(@as(usize, 4), cache.entries[0].offset);
+    try testing.expectEqual(@as(usize, 5), cache.step);
+
+    // Decode tokens 6,7,8 — step keeps incrementing
+    for (0..3) |_| {
+        const k = testKV(1, s);
+        defer _ = mlx.mlx_array_free(k);
+        const v = testKV(1, s);
+        defer _ = mlx.mlx_array_free(v);
+        _ = try cache.update(0, k, v, s, 4);
+    }
+    try testing.expectEqual(@as(usize, 4), cache.entries[0].offset);
+    try testing.expectEqual(@as(usize, 8), cache.step);
+}
+
+test "KVCache step resets on truncate" {
+    const s = mlx.gpuStream();
+    var cache = try KVCache.init(testing.allocator, 1);
+    defer cache.deinit();
+
+    // Add 5 tokens
+    {
+        const k = testKV(5, s);
+        defer _ = mlx.mlx_array_free(k);
+        const v = testKV(5, s);
+        defer _ = mlx.mlx_array_free(v);
+        _ = try cache.update(0, k, v, s, 0);
+    }
+    try testing.expectEqual(@as(usize, 5), cache.step);
+
+    // Truncate to 3 (simulating KV cache reuse)
+    try cache.truncate(3, s);
+    try testing.expectEqual(@as(usize, 3), cache.entries[0].offset);
+    try testing.expectEqual(@as(usize, 3), cache.step);
+}
+
+test "KVCache step without trimming matches offset" {
+    const s = mlx.gpuStream();
+    var cache = try KVCache.init(testing.allocator, 1);
+    defer cache.deinit();
+
+    // Add tokens without max_seq (no trimming)
+    for (0..10) |_| {
+        const k = testKV(1, s);
+        defer _ = mlx.mlx_array_free(k);
+        const v = testKV(1, s);
+        defer _ = mlx.mlx_array_free(v);
+        _ = try cache.update(0, k, v, s, 0);
+    }
+    // Without trimming, step and offset should be equal
+    try testing.expectEqual(@as(usize, 10), cache.entries[0].offset);
+    try testing.expectEqual(@as(usize, 10), cache.step);
+}
+
+test "KVCache step with multi-layer only increments once per update" {
+    const s = mlx.gpuStream();
+    var cache = try KVCache.init(testing.allocator, 3);
+    defer cache.deinit();
+
+    // Update all 3 layers with 2 tokens each
+    for (0..3) |layer| {
+        const k = testKV(2, s);
+        defer _ = mlx.mlx_array_free(k);
+        const v = testKV(2, s);
+        defer _ = mlx.mlx_array_free(v);
+        _ = try cache.update(@intCast(layer), k, v, s, 0);
+    }
+    // step should be 2 (one sequence worth), not 6 (3 layers × 2)
+    try testing.expectEqual(@as(usize, 2), cache.step);
 }

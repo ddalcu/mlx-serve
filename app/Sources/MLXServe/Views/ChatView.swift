@@ -120,6 +120,7 @@ struct ChatDetailView: View {
     @State private var enableThinking = false
     @State private var isAgentMode = false
     @State private var executingPlanMessageId: UUID?
+    @State private var generationTask: Task<Void, Never>?
     @FocusState private var inputFocused: Bool
 
     private var inputHeight: CGFloat {
@@ -138,28 +139,11 @@ struct ChatDetailView: View {
                 ScrollView {
                     LazyVStack(spacing: 12) {
                         ForEach(session?.messages ?? []) { message in
-                            VStack(spacing: 8) {
+                            // Hide tool response messages (role: system with toolCallId)
+                            if message.toolCallId == nil {
                                 MessageBubble(message: message)
-
-                                if let plan = message.agentPlan {
-                                    let results = liveResults(for: message)
-
-                                    PlanCardView(
-                                        plan: plan,
-                                        results: results,
-                                        currentStepIndex: executingPlanMessageId == message.id ? toolExecutor.currentStepIndex : nil,
-                                        onApprove: { approvePlan(messageId: message.id) },
-                                        onReject: { rejectPlan(messageId: message.id) }
-                                    )
-
-                                    ForEach(Array(plan.steps.enumerated()), id: \.element.id) { index, step in
-                                        if index < results.count {
-                                            ToolResultBlockView(step: step, result: results[index])
-                                        }
-                                    }
-                                }
+                                    .id(message.id)
                             }
-                            .id(message.id)
                         }
                         Color.clear.frame(height: 1).id("bottom")
                     }
@@ -243,7 +227,11 @@ struct ChatDetailView: View {
                     )
 
                     Button {
-                        sendMessage()
+                        if isGenerating {
+                            stopGenerating()
+                        } else {
+                            sendMessage()
+                        }
                     } label: {
                         Image(systemName: isGenerating ? "stop.circle.fill" : "arrow.up.circle.fill")
                             .font(.system(size: 28))
@@ -266,12 +254,17 @@ struct ChatDetailView: View {
                 Circle()
                     .fill(server.status == .running ? .green : .red)
                     .frame(width: 8, height: 8)
+                    .padding(.horizontal, 6)
                     .help(server.status == .running ? "Server running" : "Server stopped")
             }
         }
         .onAppear {
             inputFocused = true
             isAgentMode = session?.mode == .agent
+        }
+        .onDisappear {
+            generationTask?.cancel()
+            generationTask = nil
         }
         .onChange(of: isAgentMode) { _, newValue in
             if let idx = appState.chatSessions.firstIndex(where: { $0.id == sessionId }) {
@@ -291,12 +284,6 @@ struct ChatDetailView: View {
         }
     }
 
-    private func liveResults(for message: ChatMessage) -> [StepResult] {
-        if executingPlanMessageId == message.id {
-            return toolExecutor.results
-        }
-        return message.toolResults ?? []
-    }
 
     private var workingDirectoryBinding: Binding<String?> {
         Binding(
@@ -310,6 +297,16 @@ struct ChatDetailView: View {
                 }
             }
         )
+    }
+
+    // MARK: - Stop Generation
+
+    private func stopGenerating() {
+        generationTask?.cancel()
+        generationTask = nil
+        appState.updateLastMessage(in: sessionId, streaming: false)
+        appState.saveChatHistory()
+        isGenerating = false
     }
 
     // MARK: - Send Message
@@ -341,33 +338,42 @@ struct ChatDetailView: View {
         }.dropLast() // Drop the empty assistant message we just added
         let messagesArray = Array(messages) + [["role": "user", "content": text] as [String: Any]]
 
-        Task {
+        generationTask = Task {
             do {
                 let stream = api.streamChat(
                     port: server.port,
                     messages: messagesArray,
+                    maxTokens: appState.maxTokens,
                     enableThinking: enableThinking
                 )
                 for try await event in stream {
+                    try Task.checkCancellation()
                     switch event {
                     case .content(let text):
                         appState.updateLastMessage(in: sessionId, content: text)
                     case .reasoning(let text):
                         appState.updateLastMessage(in: sessionId, reasoning: text)
+                    case .usage(let usage):
+                        appState.updateLastMessage(in: sessionId, usage: usage)
+                    case .toolCalls:
+                        break
                     case .done:
                         break
                     }
                 }
+            } catch is CancellationError {
+                // Stopped by user
             } catch {
                 appState.updateLastMessage(in: sessionId, content: "\n\n[Error: \(error.localizedDescription)]")
             }
             appState.updateLastMessage(in: sessionId, streaming: false)
             appState.saveChatHistory()
             isGenerating = false
+            generationTask = nil
         }
     }
 
-    // MARK: - Agent Mode
+    // MARK: - Agent Mode (Native Tool Calling)
 
     private func sendAgentMessage() {
         let text = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -377,145 +383,195 @@ struct ChatDetailView: View {
         let userMsg = ChatMessage(role: .user, content: text)
         appState.appendMessage(to: sessionId, message: userMsg)
 
-        var assistantMsg = ChatMessage(role: .assistant, content: "")
-        assistantMsg.isStreaming = true
-        appState.appendMessage(to: sessionId, message: assistantMsg)
-
         isGenerating = true
         let api = APIClient()
+        let workDir = session?.workingDirectory
 
-        // Build conversation history (exclude the empty assistant we just added)
-        let history: [[String: Any]] = (session?.messages ?? [])
-            .dropLast()
-            .compactMap { msg -> [String: Any]? in
-                if msg.role == .assistant && msg.content.isEmpty { return nil }
-                return ["role": msg.role.rawValue, "content": msg.content]
-            }
-
-        let systemPrompt = AgentPrompt.systemPrompt + appState.agentMemory.contextSnippet()
-
-        Task {
-            var fullContent = ""
+        generationTask = Task {
             do {
-                let stream = api.streamAgentChat(
-                    port: server.port,
-                    messages: history,
-                    systemPrompt: systemPrompt
-                )
-                for try await event in stream {
-                    switch event {
-                    case .content(let chunk):
-                        fullContent += chunk
-                        appState.updateLastMessage(in: sessionId, content: chunk)
-                    case .reasoning(let chunk):
-                        appState.updateLastMessage(in: sessionId, reasoning: chunk)
-                    case .done:
-                        break
-                    }
-                }
+                try await runAgentLoop(api: api, workingDirectory: workDir)
+            } catch is CancellationError {
+                // Stopped by user
             } catch {
-                appState.updateLastMessage(in: sessionId, content: "\n\n[Error: \(error.localizedDescription)]")
+                var errorMsg = ChatMessage(role: .assistant, content: "[Error: \(error.localizedDescription)]")
+                errorMsg.isStreaming = false
+                appState.appendMessage(to: sessionId, message: errorMsg)
             }
-
-            // Check for plan in response
-            if let plan = AgentPrompt.parsePlan(from: fullContent) {
-                let cleanContent = AgentPrompt.stripPlanTag(from: fullContent)
-                if let sIdx = appState.chatSessions.firstIndex(where: { $0.id == sessionId }) {
-                    let mIdx = appState.chatSessions[sIdx].messages.count - 1
-                    appState.chatSessions[sIdx].messages[mIdx].content = cleanContent
-                    appState.chatSessions[sIdx].messages[mIdx].agentPlan = plan
-                }
-            }
-
-            appState.updateLastMessage(in: sessionId, streaming: false)
             appState.saveChatHistory()
             isGenerating = false
+            generationTask = nil
         }
     }
 
-    private func approvePlan(messageId: UUID) {
-        guard !isGenerating else { return }
-        guard let sIdx = appState.chatSessions.firstIndex(where: { $0.id == sessionId }),
-              let mIdx = appState.chatSessions[sIdx].messages.firstIndex(where: { $0.id == messageId }),
-              let plan = appState.chatSessions[sIdx].messages[mIdx].agentPlan,
-              plan.status == .pending else { return }
+    /// Agent loop: call model with tools (streaming), execute tool calls, feed results back, repeat.
+    /// Stops when the model responds with content (no tool calls) or after 10 iterations.
+    private func runAgentLoop(api: APIClient, workingDirectory: String?) async throws {
+        let maxIterations = 10
+        var padRetries = 0
+        let maxPadRetries = 2
 
-        appState.chatSessions[sIdx].messages[mIdx].agentPlan?.status = .executing
-        executingPlanMessageId = messageId
-        isGenerating = true
+        for _ in 0..<maxIterations {
+            try Task.checkCancellation()
 
-        Task {
-            let results = await toolExecutor.executePlan(plan, workingDirectory: session?.workingDirectory)
+            // Build message history for API
+            let history = buildAgentHistory()
+            let systemPrompt = AgentPrompt.systemPrompt + appState.agentMemory.contextSnippet()
+            var messages: [[String: Any]] = [["role": "system", "content": systemPrompt]]
+            messages.append(contentsOf: history)
 
-            // Save results to the message
-            if let sIdx = appState.chatSessions.firstIndex(where: { $0.id == sessionId }),
-               let mIdx = appState.chatSessions[sIdx].messages.firstIndex(where: { $0.id == messageId }) {
-                appState.chatSessions[sIdx].messages[mIdx].toolResults = results
-                let allOk = results.allSatisfy { $0.status == .success }
-                appState.chatSessions[sIdx].messages[mIdx].agentPlan?.status = allOk ? .completed : .failed
-            }
+            // Add streaming assistant message
+            var streamMsg = ChatMessage(role: .assistant, content: "")
+            streamMsg.isStreaming = true
+            appState.appendMessage(to: sessionId, message: streamMsg)
 
-            executingPlanMessageId = nil
-
-            // Record successful shell commands in memory
-            for (step, result) in zip(plan.steps, results) where step.tool == .shell && result.status == .success {
-                if let cmd = step.parameters["command"] {
-                    appState.agentMemory.recordCommand(cmd)
-                }
-            }
-
-            // Send results to model for summary
-            await sendResultsSummary(results: results, plan: plan)
-        }
-    }
-
-    private func rejectPlan(messageId: UUID) {
-        guard let sIdx = appState.chatSessions.firstIndex(where: { $0.id == sessionId }),
-              let mIdx = appState.chatSessions[sIdx].messages.firstIndex(where: { $0.id == messageId }) else { return }
-        appState.chatSessions[sIdx].messages[mIdx].agentPlan?.status = .rejected
-        appState.saveChatHistory()
-    }
-
-    private func sendResultsSummary(results: [StepResult], plan: AgentPlan) async {
-        let formatted = AgentPrompt.formatResults(results, plan: plan)
-
-        var summaryMsg = ChatMessage(role: .assistant, content: "")
-        summaryMsg.isStreaming = true
-        summaryMsg.isAgentSummary = true
-        appState.appendMessage(to: sessionId, message: summaryMsg)
-
-        let api = APIClient()
-        let history: [[String: Any]] = (session?.messages ?? [])
-            .dropLast() // Exclude the empty summary message
-            .compactMap { msg -> [String: Any]? in
-                if msg.role == .assistant && msg.content.isEmpty { return nil }
-                return ["role": msg.role.rawValue, "content": msg.content]
-            }
-        let allMessages = history + [
-            ["role": "user", "content": "Tool execution results:\n\n\(formatted)\n\nBriefly summarize what was accomplished."] as [String: Any]
-        ]
-
-        let systemPrompt = AgentPrompt.systemPrompt + appState.agentMemory.contextSnippet()
-
-        do {
-            let stream = api.streamAgentChat(port: server.port, messages: allMessages, systemPrompt: systemPrompt)
+            // Stream model response with tools
+            var receivedToolCalls: [APIClient.ToolCall] = []
+            let stream = api.streamChat(
+                port: server.port,
+                messages: messages,
+                maxTokens: appState.maxTokens,
+                temperature: 0.7,
+                tools: AgentPrompt.toolDefinitions
+            )
             for try await event in stream {
+                try Task.checkCancellation()
                 switch event {
                 case .content(let text):
                     appState.updateLastMessage(in: sessionId, content: text)
                 case .reasoning(let text):
                     appState.updateLastMessage(in: sessionId, reasoning: text)
+                case .usage(let usage):
+                    appState.updateLastMessage(in: sessionId, usage: usage)
+                case .toolCalls(let calls):
+                    receivedToolCalls = calls
                 case .done:
                     break
                 }
             }
-        } catch {
-            appState.updateLastMessage(in: sessionId, content: "\n\n[Error: \(error.localizedDescription)]")
+            appState.updateLastMessage(in: sessionId, streaming: false)
+
+            // Check for pad-only or empty responses — retry limited times
+            if receivedToolCalls.isEmpty {
+                let lastContent = appState.chatSessions
+                    .first(where: { $0.id == sessionId })?.messages.last?.content ?? ""
+                let cleaned = lastContent
+                    .replacingOccurrences(of: "<pad>", with: "")
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                if cleaned.isEmpty {
+                    // Remove the empty/pad message
+                    if let sIdx = appState.chatSessions.firstIndex(where: { $0.id == sessionId }),
+                       !appState.chatSessions[sIdx].messages.isEmpty {
+                        appState.chatSessions[sIdx].messages.removeLast()
+                    }
+                    padRetries += 1
+                    if padRetries <= maxPadRetries {
+                        continue // retry
+                    }
+                    // Give up — show error
+                    let errorMsg = ChatMessage(role: .assistant, content: "The model couldn't generate a response. Try rephrasing or starting a new chat.")
+                    appState.appendMessage(to: sessionId, message: errorMsg)
+                    return
+                }
+            }
+
+            // If no tool calls, we're done
+            guard !receivedToolCalls.isEmpty else { return }
+
+            // Show tool call summary
+            let callSummary = receivedToolCalls.map { tc in
+                let args = tc.arguments.map { "\($0.key): \($0.value.prefix(80))" }.joined(separator: ", ")
+                return "**\(tc.name)**(\(args))"
+            }.joined(separator: "\n")
+            appState.updateLastMessage(in: sessionId, content: "\n\n" + callSummary)
+
+            // Execute each tool call
+            var toolResults: [(id: String, name: String, output: String)] = []
+            for tc in receivedToolCalls {
+                try Task.checkCancellation()
+                let tool = AgentToolKind(rawValue: tc.name)
+
+                // Smart fallback: editFile with content but no find → writeFile
+                let effectiveTool: AgentToolKind?
+                if tool == .editFile && tc.arguments["content"] != nil && tc.arguments["find"] == nil {
+                    effectiveTool = .writeFile
+                } else {
+                    effectiveTool = tool
+                }
+
+                let output: String
+                if let effectiveTool, let handler = toolHandlers[effectiveTool] {
+                    do {
+                        output = try await handler.execute(parameters: tc.arguments, workingDirectory: workingDirectory)
+                        // Record shell commands
+                        if effectiveTool == .shell, let cmd = tc.arguments["command"] {
+                            appState.agentMemory.recordCommand(cmd)
+                        }
+                    } catch {
+                        output = "Error: \(error.localizedDescription)"
+                    }
+                } else {
+                    output = "Error: Unknown tool '\(tc.name)'"
+                }
+
+                toolResults.append((id: tc.id, name: tc.name, output: output))
+
+                // Show result in chat (display-only, marked so it's excluded from API history)
+                var resultMsg = ChatMessage(role: .assistant, content: "**\(tc.name)** → \(String(output.prefix(500)))")
+                resultMsg.isAgentSummary = true // reuse flag to mark as display-only
+                appState.appendMessage(to: sessionId, message: resultMsg)
+            }
+
+            // Add tool results as tool role messages to the session
+            for tr in toolResults {
+                var toolMsg = ChatMessage(role: .system, content: "")
+                toolMsg.toolCallId = tr.id
+                toolMsg.toolName = tr.name
+                toolMsg.content = String(tr.output.prefix(2000))
+                appState.appendMessage(to: sessionId, message: toolMsg)
+            }
         }
 
-        appState.updateLastMessage(in: sessionId, streaming: false)
-        appState.saveChatHistory()
-        isGenerating = false
+        // Max iterations reached
+        let msg = ChatMessage(role: .assistant, content: "(Agent stopped after \(maxIterations) tool call rounds)")
+        appState.appendMessage(to: sessionId, message: msg)
+    }
+
+    private func buildAgentHistory() -> [[String: Any]] {
+        (session?.messages ?? [])
+            .suffix(30)
+            .compactMap { msg -> [String: Any]? in
+                // Tool response messages
+                if let callId = msg.toolCallId {
+                    return [
+                        "role": "tool",
+                        "tool_call_id": callId,
+                        "content": String(msg.content.prefix(2000))
+                    ]
+                }
+                if msg.role == .system { return nil }
+                if msg.isAgentSummary { return nil } // display-only tool result messages
+                if msg.role == .assistant && msg.content.isEmpty { return nil }
+                var content = msg.content
+                    .replacingOccurrences(of: "<pad>", with: "")
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                if msg.role == .assistant && content.count > 500 {
+                    content = String(content.prefix(500)) + "..."
+                }
+                if content.isEmpty { return nil }
+                return ["role": msg.role.rawValue, "content": content]
+            }
+    }
+
+    private var toolHandlers: [AgentToolKind: any ToolHandler] {
+        [
+            .shell: ShellHandler(),
+            .readFile: ReadFileHandler(),
+            .writeFile: WriteFileHandler(),
+            .editFile: EditFileHandler(),
+            .searchFiles: SearchFilesHandler(),
+            .browse: BrowseHandler(),
+            .webSearch: WebSearchHandler(),
+        ]
     }
 }
 
@@ -573,6 +629,19 @@ struct MessageBubble: View {
                     .foregroundStyle(message.role == .user ? .white : .primary)
                     .clipShape(RoundedRectangle(cornerRadius: 14))
                 }
+
+                // Token usage stats
+                if message.role == .assistant, !message.isStreaming,
+                   let prompt = message.promptTokens, let completion = message.completionTokens {
+                    HStack(spacing: 8) {
+                        Text("\(prompt)+\(completion) tokens")
+                        if let tps = message.tokensPerSecond, tps > 0 {
+                            Text("~\(Int(tps)) tok/s")
+                        }
+                    }
+                    .font(.caption2.monospaced())
+                    .foregroundStyle(.tertiary)
+                }
             }
 
             if message.role == .assistant { Spacer(minLength: 60) }
@@ -590,12 +659,184 @@ struct MarkdownText: View {
     }
 
     var body: some View {
-        if let attributed = try? AttributedString(markdown: source, options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)) {
-            Text(attributed)
-                .font(.body)
-        } else {
-            Text(source)
-                .font(.body)
+        VStack(alignment: .leading, spacing: 6) {
+            ForEach(Array(parseBlocks().enumerated()), id: \.offset) { _, block in
+                blockView(block)
+            }
         }
+    }
+
+    private enum Block {
+        case paragraph(String)
+        case heading(Int, String)      // level, text
+        case code(String, String)      // language, content
+        case listItem(String)
+        case xmlBlock(String)          // raw XML/tag content
+    }
+
+    private func parseBlocks() -> [Block] {
+        var blocks: [Block] = []
+        let lines = source.components(separatedBy: "\n")
+        var i = 0
+
+        while i < lines.count {
+            let line = lines[i]
+
+            // XML-like tag block (<plan>...</plan>, <pad>, etc.)
+            if let match = line.range(of: "^<([a-zA-Z_]+)>", options: .regularExpression) {
+                let tag = String(line[match]).dropFirst().dropLast() // extract tag name
+                let closeTag = "</\(tag)>"
+                if line.contains(closeTag) {
+                    // Single-line tag block
+                    blocks.append(.xmlBlock(line))
+                    i += 1
+                    continue
+                }
+                // Multi-line: collect until closing tag
+                var xmlLines: [String] = [line]
+                i += 1
+                while i < lines.count {
+                    xmlLines.append(lines[i])
+                    if lines[i].contains(closeTag) {
+                        i += 1
+                        break
+                    }
+                    i += 1
+                }
+                blocks.append(.xmlBlock(xmlLines.joined(separator: "\n")))
+                continue
+            }
+
+            // Standalone tags like <pad><pad><pad>
+            if line.hasPrefix("<") && line.contains(">") && !line.hasPrefix("<http") {
+                let stripped = line.trimmingCharacters(in: .whitespaces)
+                if stripped.range(of: "^(<[a-zA-Z_/]+>\\s*)+$", options: .regularExpression) != nil {
+                    blocks.append(.xmlBlock(stripped))
+                    i += 1
+                    continue
+                }
+            }
+
+            // Fenced code block
+            if line.hasPrefix("```") {
+                let lang = String(line.dropFirst(3)).trimmingCharacters(in: .whitespaces)
+                var code: [String] = []
+                i += 1
+                while i < lines.count && !lines[i].hasPrefix("```") {
+                    code.append(lines[i])
+                    i += 1
+                }
+                i += 1 // skip closing ```
+                blocks.append(.code(lang, code.joined(separator: "\n")))
+                continue
+            }
+
+            // Heading
+            if line.hasPrefix("#") {
+                let level = line.prefix(while: { $0 == "#" }).count
+                if level <= 6 {
+                    let text = String(line.dropFirst(level)).trimmingCharacters(in: .whitespaces)
+                    if !text.isEmpty {
+                        blocks.append(.heading(level, text))
+                        i += 1
+                        continue
+                    }
+                }
+            }
+
+            // List item
+            if line.starts(with: "- ") || line.starts(with: "* ") ||
+               (line.count >= 3 && line.first?.isNumber == true && line.contains(". ")) {
+                let text: String
+                if line.starts(with: "- ") || line.starts(with: "* ") {
+                    text = String(line.dropFirst(2))
+                } else if let dotIdx = line.firstIndex(of: "."), line[line.index(after: dotIdx)] == " " {
+                    text = String(line[line.index(dotIdx, offsetBy: 2)...])
+                } else {
+                    text = line
+                }
+                blocks.append(.listItem(text))
+                i += 1
+                continue
+            }
+
+            // Empty line — skip
+            if line.trimmingCharacters(in: .whitespaces).isEmpty {
+                i += 1
+                continue
+            }
+
+            // Paragraph — collect consecutive non-empty lines
+            var para: [String] = [line]
+            i += 1
+            while i < lines.count {
+                let next = lines[i]
+                if next.trimmingCharacters(in: .whitespaces).isEmpty ||
+                   next.hasPrefix("#") || next.hasPrefix("```") ||
+                   next.starts(with: "- ") || next.starts(with: "* ") ||
+                   next.hasPrefix("<") {
+                    break
+                }
+                para.append(next)
+                i += 1
+            }
+            blocks.append(.paragraph(para.joined(separator: "\n")))
+        }
+
+        return blocks
+    }
+
+    @ViewBuilder
+    private func blockView(_ block: Block) -> some View {
+        switch block {
+        case .paragraph(let text):
+            inlineMarkdown(text)
+
+        case .heading(let level, let text):
+            Text(text)
+                .font(level == 1 ? .title2.bold() : level == 2 ? .title3.bold() : .headline)
+                .padding(.top, level == 1 ? 4 : 2)
+
+        case .code(_, let content):
+            ScrollView(.horizontal, showsIndicators: false) {
+                Text(content)
+                    .font(.system(size: 12, design: .monospaced))
+                    .textSelection(.enabled)
+            }
+            .padding(10)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color(nsColor: NSColor(white: 0.08, alpha: 1)))
+            .clipShape(RoundedRectangle(cornerRadius: 8))
+
+        case .listItem(let text):
+            HStack(alignment: .top, spacing: 6) {
+                Text("\u{2022}")
+                    .foregroundStyle(.secondary)
+                inlineMarkdown(text)
+            }
+
+        case .xmlBlock(let content):
+            ScrollView(.horizontal, showsIndicators: false) {
+                Text(content)
+                    .font(.system(size: 11, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+            }
+            .padding(8)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(Color.purple.opacity(0.1))
+            .clipShape(RoundedRectangle(cornerRadius: 8))
+            .overlay(
+                RoundedRectangle(cornerRadius: 8)
+                    .stroke(Color.purple.opacity(0.3), lineWidth: 0.5)
+            )
+        }
+    }
+
+    private func inlineMarkdown(_ text: String) -> Text {
+        if let attributed = try? AttributedString(markdown: text, options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)) {
+            return Text(attributed)
+        }
+        return Text(text)
     }
 }

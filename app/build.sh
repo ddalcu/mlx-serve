@@ -12,7 +12,12 @@ TEAM_ID="${APPLE_TEAM_ID:?Set APPLE_TEAM_ID in env}"
 
 cd "$SCRIPT_DIR"
 
-echo "=== Building MLX Claw ==="
+# Set calver version (YYYY.M.D)
+CALVER="$(date +%Y.%-m.%-d)"
+/usr/libexec/PlistBuddy -c "Set :CFBundleVersion $CALVER" Info.plist
+/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $CALVER" Info.plist
+
+echo "=== Building MLX Claw $CALVER ==="
 
 # ── Phase 1: Build Swift app ──
 echo "→ Compiling Swift..."

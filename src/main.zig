@@ -27,6 +27,7 @@ fn printUsage() void {
         \\  --port <n>          Bind port (default: 8080)
         \\  --ctx-size <n>      Maximum context length (default: model max)
         \\  --prompt <text>     Run single prompt (interactive mode)
+        \\  --stream            Stream tokens as they are generated (with --prompt)
         \\  --max-tokens <n>    Max tokens to generate (default: 100)
         \\  --temp <f>          Temperature (default: 0.0)
         \\  --timeout <n>       Request timeout in seconds (default: 300, 0=none)
@@ -51,6 +52,7 @@ pub fn main() !void {
     var port: u16 = 8080;
     var host: []const u8 = "0.0.0.0";
     var serve_mode = false;
+    var stream_mode = false;
     var prompt: ?[]const u8 = null;
     var max_tokens: u32 = 100;
     var temperature: f32 = 0.0;
@@ -77,6 +79,8 @@ pub fn main() !void {
             host = args[i];
         } else if (std.mem.eql(u8, args[i], "--serve")) {
             serve_mode = true;
+        } else if (std.mem.eql(u8, args[i], "--stream")) {
+            stream_mode = true;
         } else if (std.mem.eql(u8, args[i], "--prompt") and i + 1 < args.len) {
             i += 1;
             prompt = args[i];
@@ -160,6 +164,15 @@ pub fn main() !void {
         }
     }
 
+    // Treat <pad> as a stop token, but only if it's not token ID 0
+    // (ID 0 can be produced spuriously by models under long/confusing prompts)
+    if (tok.special_tokens.get("<pad>")) |pad_id| {
+        if (pad_id > 0 and !config.isEosToken(pad_id)) {
+            config.addEosToken(pad_id);
+            log.info("Added <pad> as stop token (id={d})\n", .{pad_id});
+        }
+    }
+
     // Load weights
     log.info("Loading weights...\n", .{});
     var weights = try model_mod.loadWeights(allocator, model_dir);
@@ -191,26 +204,67 @@ pub fn main() !void {
 
         const eos_slice = config.eosTokenSlice();
         const sampling = generate_mod.SamplingParams{ .temperature = temperature };
-        const result = try generate_mod.generate(allocator, &xfm, &tok, prompt_ids, max_tokens, sampling, eos_slice, 0, 0);
-        defer allocator.free(result.text);
-        defer allocator.free(result.token_ids);
-
-        // Print mlx_lm-style output to stdout
         const stdout = std.fs.File.stdout();
-        try stdout.writeAll("==========\n");
-        try stdout.writeAll(result.text);
-        try stdout.writeAll("\n==========\n");
 
-        var stat_buf: [256]u8 = undefined;
-        var msg = std.fmt.bufPrint(&stat_buf, "Prompt: {d} tokens, {d:.3} tokens-per-sec\n", .{ result.prompt_tokens, result.prefill_tps }) catch unreachable;
-        try stdout.writeAll(msg);
-        msg = std.fmt.bufPrint(&stat_buf, "Generation: {d} tokens, {d:.3} tokens-per-sec\n", .{ result.completion_tokens, result.decode_tps }) catch unreachable;
-        try stdout.writeAll(msg);
+        if (stream_mode) {
+            // Streaming: print tokens as they're generated
+            var timer = try std.time.Timer.start();
+            var gen = try generate_mod.Generator.init(allocator, &xfm, &tok, prompt_ids, max_tokens, sampling, eos_slice);
+            defer gen.deinit(allocator);
+
+            const prefill_ns = timer.read();
+            const prefill_tps: f64 = if (prefill_ns > 0)
+                @as(f64, @floatFromInt(prompt_ids.len)) * @as(f64, @floatFromInt(std.time.ns_per_s)) / @as(f64, @floatFromInt(prefill_ns))
+            else
+                0.0;
+
+            try stdout.writeAll("==========\n");
+            var decode_timer = try std.time.Timer.start();
+            var completion_tokens: u32 = 0;
+            while (try gen.next(allocator)) |token_id| {
+                const ids = [_]u32{token_id};
+                const piece = try tok.decode(allocator, &ids, completion_tokens == 0);
+                defer allocator.free(piece);
+                if (piece.len > 0) {
+                    try stdout.writeAll(piece);
+                }
+                completion_tokens += 1;
+            }
+            const decode_ns = decode_timer.read();
+            const decode_tps: f64 = if (decode_ns > 0)
+                @as(f64, @floatFromInt(completion_tokens)) * @as(f64, @floatFromInt(std.time.ns_per_s)) / @as(f64, @floatFromInt(decode_ns))
+            else
+                0.0;
+
+            try stdout.writeAll("\n==========\n");
+
+            var stat_buf: [256]u8 = undefined;
+            var msg = std.fmt.bufPrint(&stat_buf, "Prompt: {d} tokens, {d:.3} tokens-per-sec\n", .{ prompt_ids.len, prefill_tps }) catch unreachable;
+            try stdout.writeAll(msg);
+            msg = std.fmt.bufPrint(&stat_buf, "Generation: {d} tokens, {d:.3} tokens-per-sec\n", .{ completion_tokens, decode_tps }) catch unreachable;
+            try stdout.writeAll(msg);
+        } else {
+            // Non-streaming: generate all tokens then print
+            const result = try generate_mod.generate(allocator, &xfm, &tok, prompt_ids, max_tokens, sampling, eos_slice, 0, 0);
+            defer allocator.free(result.text);
+            defer allocator.free(result.token_ids);
+
+            try stdout.writeAll("==========\n");
+            try stdout.writeAll(result.text);
+            try stdout.writeAll("\n==========\n");
+
+            var stat_buf: [256]u8 = undefined;
+            var msg = std.fmt.bufPrint(&stat_buf, "Prompt: {d} tokens, {d:.3} tokens-per-sec\n", .{ result.prompt_tokens, result.prefill_tps }) catch unreachable;
+            try stdout.writeAll(msg);
+            msg = std.fmt.bufPrint(&stat_buf, "Generation: {d} tokens, {d:.3} tokens-per-sec\n", .{ result.completion_tokens, result.decode_tps }) catch unreachable;
+            try stdout.writeAll(msg);
+        }
 
         var peak_mem: usize = 0;
         _ = mlx.mlx_get_peak_memory(&peak_mem);
         const peak_gb = @as(f64, @floatFromInt(peak_mem)) / (1024.0 * 1024.0 * 1024.0);
-        msg = std.fmt.bufPrint(&stat_buf, "Peak memory: {d:.3} GB\n", .{peak_gb}) catch unreachable;
-        try stdout.writeAll(msg);
+        var stat_buf2: [256]u8 = undefined;
+        const msg2 = std.fmt.bufPrint(&stat_buf2, "Peak memory: {d:.3} GB\n", .{peak_gb}) catch unreachable;
+        try stdout.writeAll(msg2);
     }
 }

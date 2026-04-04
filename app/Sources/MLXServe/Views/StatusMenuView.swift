@@ -6,26 +6,17 @@ struct StatusMenuView: View {
     @EnvironmentObject var downloads: DownloadManager
     @State private var showDownloads = false
     let openChat: () -> Void
+    let openBrowser: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
             // Header
             HStack {
-                Group {
-                    if let url = Bundle.module.url(forResource: "appiconb", withExtension: "png", subdirectory: "Resources"),
-                       let nsImg = NSImage(contentsOf: url) {
-                        Image(nsImage: nsImg)
-                            .resizable()
-                            .frame(width: 20, height: 20)
-                            .clipShape(RoundedRectangle(cornerRadius: 4))
-                    } else {
-                        Image(systemName: "brain.head.profile")
-                            .font(.title3)
-                            .foregroundStyle(.secondary)
-                    }
-                }
                 Text("MLX Claw")
                     .font(.headline)
+                Text(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
                 Spacer()
                 StatusDot(status: server.status)
             }
@@ -133,6 +124,12 @@ struct StatusMenuView: View {
                 .padding(.horizontal, 16)
                 .padding(.vertical, 10)
 
+                // Max Tokens
+                Divider().padding(.horizontal, 12)
+                MaxTokensSection(maxTokens: $appState.maxTokens)
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 10)
+
                 // Endpoints
                 Divider().padding(.horizontal, 12)
                 EndpointsSection(baseURL: server.baseURL)
@@ -169,8 +166,8 @@ struct StatusMenuView: View {
 
             Divider().padding(.horizontal, 12)
 
-            // Chat & Quit
-            HStack(spacing: 10) {
+            // Chat, Browser & Quit
+            HStack(spacing: 8) {
                 Button {
                     openChat()
                 } label: {
@@ -184,13 +181,21 @@ struct StatusMenuView: View {
                 .disabled(server.status != .running)
 
                 Button {
-                    NSApplication.shared.terminate(nil)
+                    openBrowser()
                 } label: {
                     HStack {
-                        Image(systemName: "power")
-                        Text("Quit")
+                        Image(systemName: "globe")
+                        Text("Browser")
                     }
                     .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+
+                Button {
+                    server.stop()
+                    NSApplication.shared.terminate(nil)
+                } label: {
+                    Image(systemName: "power")
                 }
                 .buttonStyle(.bordered)
             }
@@ -275,5 +280,47 @@ struct EndpointsSection: View {
                 .padding(.vertical, 1)
             }
         }
+    }
+}
+
+struct MaxTokensSection: View {
+    @Binding var maxTokens: Int
+
+    private let presets: [(String, Int)] = [
+        ("2K", 2048),
+        ("4K", 4096),
+        ("8K", 8192),
+        ("16K", 16384),
+        ("32K", 32768),
+    ]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text("Max Tokens")
+                    .font(.subheadline.weight(.medium))
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Text(formatted)
+                    .font(.caption.monospaced())
+            }
+            HStack(spacing: 4) {
+                ForEach(presets, id: \.1) { label, value in
+                    Button(label) {
+                        maxTokens = value
+                    }
+                    .buttonStyle(.bordered)
+                    .tint(maxTokens == value ? .accentColor : nil)
+                    .controlSize(.mini)
+                }
+            }
+        }
+    }
+
+    private var formatted: String {
+        if maxTokens >= 1024 {
+            return "\(maxTokens / 1024)K"
+        }
+        return "\(maxTokens)"
     }
 }

@@ -11,6 +11,9 @@ class AppState: ObservableObject {
     @Published var activeChatId: UUID?
     @Published var agentMemory = AgentMemory()
     @Published var toolExecutor = ToolExecutor()
+    @Published var maxTokens: Int {
+        didSet { UserDefaults.standard.set(maxTokens, forKey: "maxTokens") }
+    }
 
     private let historyPath: String = {
         let dir = NSString(string: "~/.mlx-serve").expandingTildeInPath
@@ -19,6 +22,8 @@ class AppState: ObservableObject {
     }()
 
     init() {
+        let stored = UserDefaults.standard.integer(forKey: "maxTokens")
+        self.maxTokens = stored > 0 ? stored : 8192
         refreshModels()
         loadChatHistory()
     }
@@ -70,11 +75,16 @@ class AppState: ObservableObject {
         }
     }
 
-    func updateLastMessage(in sessionId: UUID, content: String? = nil, reasoning: String? = nil, streaming: Bool? = nil) {
+    func updateLastMessage(in sessionId: UUID, content: String? = nil, reasoning: String? = nil, streaming: Bool? = nil, usage: TokenUsage? = nil) {
         guard let sIdx = chatSessions.firstIndex(where: { $0.id == sessionId }),
               !chatSessions[sIdx].messages.isEmpty else { return }
         let mIdx = chatSessions[sIdx].messages.count - 1
         if let content { chatSessions[sIdx].messages[mIdx].content += content }
+        if let usage {
+            chatSessions[sIdx].messages[mIdx].promptTokens = usage.promptTokens
+            chatSessions[sIdx].messages[mIdx].completionTokens = usage.completionTokens
+            chatSessions[sIdx].messages[mIdx].tokensPerSecond = usage.tokensPerSecond
+        }
         if let reasoning { chatSessions[sIdx].messages[mIdx].reasoningContent = (chatSessions[sIdx].messages[mIdx].reasoningContent ?? "") + reasoning }
         if let streaming { chatSessions[sIdx].messages[mIdx].isStreaming = streaming }
     }

@@ -18,7 +18,7 @@ struct MLXClawApp: App {
 
     var body: some Scene {
         MenuBarExtra {
-            StatusMenuView(openChat: { openWindow(id: "chat") })
+            StatusMenuView(openChat: { openWindow(id: "chat") }, openBrowser: { openWindow(id: "browser") })
                 .environmentObject(appState)
                 .environmentObject(appState.server)
                 .environmentObject(appState.downloads)
@@ -36,5 +36,10 @@ struct MLXClawApp: App {
                 .frame(minWidth: 700, minHeight: 500)
         }
         .defaultSize(width: 900, height: 650)
+
+        Window("Browser", id: "browser") {
+            BrowserView()
+        }
+        .defaultSize(width: 1024, height: 768)
     }
 }

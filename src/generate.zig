@@ -58,6 +58,7 @@ pub const Generator = struct {
     done: bool,
     eos_token_ids: []const u32,
     generated_ids: std.ArrayList(u32),
+    consecutive_pad: u32 = 0, // count of consecutive token-0 (pad) generations
     timeout_ns: u64, // 0 = no timeout
     timer: std.time.Timer,
     logprobs_n: u32 = 0, // 0 = disabled, >0 = number of top_logprobs to return
@@ -159,6 +160,18 @@ pub const Generator = struct {
                 self.finish_reason = "stop";
                 return null;
             }
+        }
+
+        // Stop on repeated pad tokens (token ID 0)
+        if (self.next_token_id == 0) {
+            self.consecutive_pad += 1;
+            if (self.consecutive_pad >= 3) {
+                self.done = true;
+                self.finish_reason = "stop";
+                return null;
+            }
+        } else {
+            self.consecutive_pad = 0;
         }
 
         const token = self.next_token_id;

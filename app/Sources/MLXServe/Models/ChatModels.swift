@@ -16,7 +16,9 @@ struct ChatSession: Identifiable, Codable {
         self.createdAt = Date()
         self.updatedAt = Date()
         self.mode = .chat
-        self.workingDirectory = nil
+        let wsDir = NSString(string: "~/.mlx-serve/workspace").expandingTildeInPath
+        try? FileManager.default.createDirectory(atPath: wsDir, withIntermediateDirectories: true)
+        self.workingDirectory = wsDir
     }
 
     enum CodingKeys: String, CodingKey {
@@ -45,6 +47,11 @@ struct ChatMessage: Identifiable, Codable {
     var agentPlan: AgentPlan?
     var toolResults: [StepResult]?
     var isAgentSummary: Bool
+    var promptTokens: Int?
+    var completionTokens: Int?
+    var tokensPerSecond: Double?
+    var toolCallId: String?   // For tool response messages
+    var toolName: String?     // For tool response messages
 
     enum Role: String, Codable {
         case system, user, assistant
@@ -65,6 +72,8 @@ struct ChatMessage: Identifiable, Codable {
     enum CodingKeys: String, CodingKey {
         case id, role, content, reasoningContent, isStreaming, timestamp
         case agentPlan, toolResults, isAgentSummary
+        case promptTokens, completionTokens, tokensPerSecond
+        case toolCallId, toolName
     }
 
     init(from decoder: Decoder) throws {
@@ -78,6 +87,11 @@ struct ChatMessage: Identifiable, Codable {
         agentPlan = try c.decodeIfPresent(AgentPlan.self, forKey: .agentPlan)
         toolResults = try c.decodeIfPresent([StepResult].self, forKey: .toolResults)
         isAgentSummary = try c.decodeIfPresent(Bool.self, forKey: .isAgentSummary) ?? false
+        promptTokens = try c.decodeIfPresent(Int.self, forKey: .promptTokens)
+        completionTokens = try c.decodeIfPresent(Int.self, forKey: .completionTokens)
+        tokensPerSecond = try c.decodeIfPresent(Double.self, forKey: .tokensPerSecond)
+        toolCallId = try c.decodeIfPresent(String.self, forKey: .toolCallId)
+        toolName = try c.decodeIfPresent(String.self, forKey: .toolName)
     }
 }
 

@@ -77,6 +77,7 @@ fn getTimeoutNs() u64 {
 
 /// Cached prompt IDs from the last request (for KV cache reuse).
 var cached_prompt_ids: ?[]u32 = null;
+var cached_has_tools: bool = false;
 
 /// Start the HTTP server on the given host and port.
 pub fn serve(
@@ -343,7 +344,12 @@ fn handleConnection(
 
 fn getEffectiveContextLength(config: *const model_mod.ModelConfig) u32 {
     if (max_context_size > 0) return max_context_size;
-    return config.max_position_embeddings;
+    // Cap at 16K by default to prevent GPU OOM on consumer hardware.
+    // The model may advertise 128K+ but that requires more VRAM than most Macs have.
+    // Use --ctx-size to override if you have enough memory.
+    const safe_default: u32 = 16384;
+    if (config.max_position_embeddings == 0) return safe_default;
+    return @min(config.max_position_embeddings, safe_default);
 }
 
 /// Clamp max_tokens so prompt + completion doesn't exceed context length.
@@ -923,8 +929,9 @@ fn handleChatCompletions(
     defer allocator.free(prompt_ids);
 
     // Enforce context size limit
-    if (max_context_size > 0 and prompt_ids.len > max_context_size) {
-        log.warn("POST /v1/chat/completions -> 400 (prompt {d} tokens exceeds ctx_size {d})\n", .{ prompt_ids.len, max_context_size });
+    const effective_ctx = getEffectiveContextLength(config);
+    if (prompt_ids.len > effective_ctx) {
+        log.warn("POST /v1/chat/completions -> 400 (prompt {d} tokens exceeds ctx_size {d})\n", .{ prompt_ids.len, effective_ctx });
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Prompt exceeds maximum context length", 400);
         return;
     }
@@ -933,7 +940,7 @@ fn handleChatCompletions(
     const effective_max_tokens = clampMaxTokens(max_tokens, prompt_ids.len);
 
     // Prompt caching: reuse KV cache for shared prefix
-    const cache_result = try reuseKVCache(allocator, xfm, prompt_ids);
+    const cache_result = try reuseKVCache(allocator, xfm, prompt_ids, has_tools);
 
     const eos_slice = config.eosTokenSlice();
 
@@ -949,6 +956,13 @@ fn handleChatCompletions(
     if (is_stream) {
         handleStreamingGeneration(allocator, stream, xfm, tok, cache_result.new_tokens, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, include_usage, has_tools, cache_result.cached_tokens, logprobs_n, enable_thinking, reasoning_budget) catch |err| {
             log.err("  -> streaming error: {}\n", .{err});
+            // Send SSE error event so the client gets a proper error instead of a dropped connection
+            const err_chunk = std.fmt.allocPrint(allocator,
+                \\data: {{"error":{{"message":"Internal server error: {s}","type":"server_error"}}}}
+            , .{@errorName(err)}) catch return;
+            defer allocator.free(err_chunk);
+            stream.writeAll(err_chunk) catch {};
+            stream.writeAll("\n\ndata: [DONE]\n\n") catch {};
         };
     } else {
         handleNonStreamingGeneration(allocator, stream, xfm, tok, cache_result.new_tokens, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, cache_result.cached_tokens, logprobs_n, enable_thinking, reasoning_budget) catch |err| {
@@ -958,7 +972,7 @@ fn handleChatCompletions(
     }
 
     // Store prompt IDs for next request's cache comparison
-    updateCachedPrompt(allocator, prompt_ids);
+    updateCachedPrompt(allocator, prompt_ids, has_tools);
 }
 
 fn handleCompletions(
@@ -1079,8 +1093,9 @@ fn handleCompletions(
     defer allocator.free(prompt_ids);
 
     // Enforce context size limit
-    if (max_context_size > 0 and prompt_ids.len > max_context_size) {
-        log.warn("POST /v1/completions -> 400 (prompt {d} tokens exceeds ctx_size {d})\n", .{ prompt_ids.len, max_context_size });
+    const effective_ctx = getEffectiveContextLength(config);
+    if (prompt_ids.len > effective_ctx) {
+        log.warn("POST /v1/completions -> 400 (prompt {d} tokens exceeds ctx_size {d})\n", .{ prompt_ids.len, effective_ctx });
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Prompt exceeds maximum context length", 400);
         return;
     }
@@ -1088,8 +1103,9 @@ fn handleCompletions(
     // Clamp max_tokens to stay within context window
     const effective_max_tokens = clampMaxTokens(max_tokens, prompt_ids.len);
 
-    // Prompt caching: reuse KV cache for shared prefix
-    const cache_result = try reuseKVCache(allocator, xfm, prompt_ids);
+    // Prompt caching: reuse KV cache for shared prefix (completions never have tools)
+    const has_tools = false;
+    const cache_result = try reuseKVCache(allocator, xfm, prompt_ids, has_tools);
 
     const eos_slice = config.eosTokenSlice();
     const sampling = generate_mod.SamplingParams{
@@ -1113,7 +1129,7 @@ fn handleCompletions(
     }
 
     // Store prompt IDs for next request's cache comparison
-    updateCachedPrompt(allocator, prompt_ids);
+    updateCachedPrompt(allocator, prompt_ids, has_tools);
 }
 
 fn handleNonStreamingCompletion(
@@ -1199,7 +1215,7 @@ fn handleStreamingCompletion(
         "HTTP/1.1 200 OK\r\n" ++
         "Content-Type: text/event-stream\r\n" ++
         "Cache-Control: no-cache\r\n" ++
-        "Connection: keep-alive\r\n" ++
+        "Connection: close\r\n" ++
         "Access-Control-Allow-Origin: *\r\n" ++
         "Access-Control-Allow-Methods: POST, GET, OPTIONS\r\n" ++
         "Access-Control-Allow-Headers: Content-Type, Authorization\r\n" ++
@@ -1499,7 +1515,7 @@ fn handleStreamingGeneration(
         "HTTP/1.1 200 OK\r\n" ++
         "Content-Type: text/event-stream\r\n" ++
         "Cache-Control: no-cache\r\n" ++
-        "Connection: keep-alive\r\n" ++
+        "Connection: close\r\n" ++
         "Access-Control-Allow-Origin: *\r\n" ++
         "Access-Control-Allow-Methods: POST, GET, OPTIONS\r\n" ++
         "Access-Control-Allow-Headers: Content-Type, Authorization\r\n" ++
@@ -1908,7 +1924,16 @@ const CacheResult = struct {
     cached_tokens: u32, // how many tokens were reused from cache
 };
 
-fn reuseKVCache(allocator: std.mem.Allocator, xfm: *Transformer, prompt_ids: []const u32) !CacheResult {
+fn reuseKVCache(allocator: std.mem.Allocator, xfm: *Transformer, prompt_ids: []const u32, has_tools: bool) !CacheResult {
+    // Invalidate cache if tool configuration changed between requests
+    if (has_tools != cached_has_tools) {
+        if (cached_prompt_ids) |old| {
+            allocator.free(old);
+            cached_prompt_ids = null;
+        }
+        log.debug("  [cache] invalidated — tools config changed\n", .{});
+    }
+
     if (cached_prompt_ids) |cached| {
         // Find shared prefix length
         const max_shared = @min(cached.len, prompt_ids.len);
@@ -1934,17 +1959,17 @@ fn reuseKVCache(allocator: std.mem.Allocator, xfm: *Transformer, prompt_ids: []c
     }
 
     // No cache hit — reset completely
-    _ = allocator;
     xfm.cache.deinit();
     xfm.cache = try transformer_mod.KVCache.init(xfm.cache.allocator, xfm.config.num_hidden_layers);
     return .{ .new_tokens = prompt_ids, .cached_tokens = 0 };
 }
 
-fn updateCachedPrompt(allocator: std.mem.Allocator, prompt_ids: []const u32) void {
+fn updateCachedPrompt(allocator: std.mem.Allocator, prompt_ids: []const u32, has_tools: bool) void {
     if (cached_prompt_ids) |old| {
         allocator.free(old);
     }
     cached_prompt_ids = allocator.dupe(u32, prompt_ids) catch null;
+    cached_has_tools = has_tools;
 }
 
 fn sendResponse(stream: std.net.Stream, status: []const u8, content_type: []const u8, body: []const u8) !void {
@@ -2346,13 +2371,18 @@ test "getEffectiveContextLength uses ctx_size override" {
     try testing.expectEqual(@as(u32, 4096), getEffectiveContextLength(&config));
 }
 
-test "getEffectiveContextLength falls back to model config" {
+test "getEffectiveContextLength caps at safe default" {
     const original = max_context_size;
     defer max_context_size = original;
 
     max_context_size = 0;
     var config = model_mod.ModelConfig{};
     config.max_position_embeddings = 32768;
+    // Capped at 16K safe default
+    try testing.expectEqual(@as(u32, 16384), getEffectiveContextLength(&config));
+
+    // Explicit --ctx-size overrides the cap
+    max_context_size = 32768;
     try testing.expectEqual(@as(u32, 32768), getEffectiveContextLength(&config));
 }
 

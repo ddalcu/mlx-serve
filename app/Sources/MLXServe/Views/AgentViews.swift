@@ -204,7 +204,7 @@ struct WorkingDirectoryIndicator: View {
         Button {
             pickDirectory()
         } label: {
-            HStack(spacing: 4) {
+            HStack(spacing: 6) {
                 Image(systemName: "folder")
                     .font(.caption)
                 if let path {
@@ -217,6 +217,7 @@ struct WorkingDirectoryIndicator: View {
                         .foregroundStyle(.secondary)
                 }
             }
+            .padding(.horizontal, 8)
         }
         .buttonStyle(.borderless)
         .help("Working directory for agent commands")

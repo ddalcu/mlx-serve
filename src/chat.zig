@@ -618,16 +618,98 @@ fn parseGemma4ToolCall(allocator: std.mem.Allocator, content: []const u8) ?Parse
     const name = std.mem.trim(u8, after_prefix[0..brace_pos], " \t\n\r");
     if (name.len == 0) return null;
 
-    const json_str = after_prefix[brace_pos..];
-    // Validate it's valid JSON
-    const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_str, .{}) catch return null;
-    defer parsed.deinit();
-    if (parsed.value != .object) return null;
+    const args_str = after_prefix[brace_pos..];
 
+    // Try JSON first (some models output valid JSON)
+    if (std.json.parseFromSlice(std.json.Value, allocator, args_str, .{})) |parsed| {
+        defer parsed.deinit();
+        if (parsed.value == .object) {
+            return .{
+                .name = allocator.dupe(u8, name) catch return null,
+                .arguments = allocator.dupe(u8, args_str) catch return null,
+            };
+        }
+    } else |_| {}
+
+    // Convert Gemma 4 custom format to JSON:
+    // {key:<|"|>value<|"|>,key2:<|"|>value2<|"|>} → {"key":"value","key2":"value2"}
+    const json = convertGemma4ArgsToJson(allocator, args_str) orelse return null;
     return .{
         .name = allocator.dupe(u8, name) catch return null,
-        .arguments = allocator.dupe(u8, json_str) catch return null,
+        .arguments = json,
     };
+}
+
+/// Convert Gemma 4's custom key-value format to JSON.
+/// Input:  {key:<|"|>value<|"|>,key2:<|"|>value2<|"|>}
+/// Output: {"key":"value","key2":"value2"}
+fn convertGemma4ArgsToJson(allocator: std.mem.Allocator, input: []const u8) ?[]const u8 {
+    const str_delim = "<|\"|>";
+    var result = std.ArrayList(u8).empty;
+    errdefer result.deinit(allocator);
+    result.append(allocator, '{') catch return null;
+
+    // Strip outer braces
+    var body = input;
+    if (body.len >= 2 and body[0] == '{') {
+        body = body[1..];
+        if (body[body.len - 1] == '}') body = body[0 .. body.len - 1];
+    }
+
+    var first = true;
+    var pos: usize = 0;
+    while (pos < body.len) {
+        // Skip whitespace and commas
+        while (pos < body.len and (body[pos] == ' ' or body[pos] == ',' or body[pos] == '\n' or body[pos] == '\t')) : ({
+            pos += 1;
+        }) {}
+        if (pos >= body.len) break;
+
+        // Find key (everything before ':')
+        const colon = std.mem.indexOf(u8, body[pos..], ":") orelse break;
+        const key = std.mem.trim(u8, body[pos .. pos + colon], " \t\n\r");
+        pos = pos + colon + 1;
+
+        if (!first) result.append(allocator, ',') catch return null;
+        first = false;
+
+        // Output key
+        result.append(allocator, '"') catch return null;
+        result.appendSlice(allocator, key) catch return null;
+        result.appendSlice(allocator, "\":") catch return null;
+
+        // Check if value starts with <|"|> delimiter
+        if (pos + str_delim.len <= body.len and std.mem.eql(u8, body[pos .. pos + str_delim.len], str_delim)) {
+            pos += str_delim.len;
+            // Find closing delimiter
+            const end = std.mem.indexOf(u8, body[pos..], str_delim) orelse break;
+            const value = body[pos .. pos + end];
+            pos = pos + end + str_delim.len;
+
+            // JSON-escape the value
+            result.append(allocator, '"') catch return null;
+            for (value) |c| {
+                switch (c) {
+                    '"' => result.appendSlice(allocator, "\\\"") catch return null,
+                    '\\' => result.appendSlice(allocator, "\\\\") catch return null,
+                    '\n' => result.appendSlice(allocator, "\\n") catch return null,
+                    '\r' => result.appendSlice(allocator, "\\r") catch return null,
+                    '\t' => result.appendSlice(allocator, "\\t") catch return null,
+                    else => result.append(allocator, c) catch return null,
+                }
+            }
+            result.append(allocator, '"') catch return null;
+        } else {
+            // Bare value (number, boolean)
+            const val_end = std.mem.indexOfAny(u8, body[pos..], ",}") orelse body.len - pos;
+            const value = std.mem.trim(u8, body[pos .. pos + val_end], " \t\n\r");
+            result.appendSlice(allocator, value) catch return null;
+            pos = pos + val_end;
+        }
+    }
+
+    result.append(allocator, '}') catch return null;
+    return result.toOwnedSlice(allocator) catch return null;
 }
 
 fn parseHermesToolCall(allocator: std.mem.Allocator, block: []const u8) ?ParsedToolCall {

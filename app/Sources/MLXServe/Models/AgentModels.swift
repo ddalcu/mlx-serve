@@ -11,10 +11,8 @@ enum AgentToolKind: String, Codable, CaseIterable {
     case writeFile
     case editFile
     case searchFiles
-    case webFetch
     case browse
-    case browseChrome
-    case applescript
+    case webSearch
 
     var icon: String {
         switch self {
@@ -23,10 +21,8 @@ enum AgentToolKind: String, Codable, CaseIterable {
         case .writeFile: "doc.text.fill"
         case .editFile: "pencil"
         case .searchFiles: "magnifyingglass"
-        case .webFetch: "globe"
-        case .browse: "safari"
-        case .browseChrome: "network"
-        case .applescript: "gearshape"
+        case .browse: "globe"
+        case .webSearch: "magnifyingglass"
         }
     }
 
@@ -37,10 +33,8 @@ enum AgentToolKind: String, Codable, CaseIterable {
         case .writeFile: "Write File"
         case .editFile: "Edit File"
         case .searchFiles: "Search Files"
-        case .webFetch: "Web Fetch"
-        case .browse: "Safari"
-        case .browseChrome: "Chrome"
-        case .applescript: "AppleScript"
+        case .browse: "Browse"
+        case .webSearch: "Web Search"
         }
     }
 }

@@ -169,25 +169,26 @@ class ServerManager: ObservableObject {
     }
 
     private func resolveBinaryPath() -> String {
-        // 1. Inside .app bundle: Contents/MacOS/mlx-serve (same dir as the Swift binary)
+        // 1. Bundled: Contents/MacOS/mlx-serve (same dir as the Swift binary)
         if let execURL = Bundle.main.executableURL {
             let bundled = execURL.deletingLastPathComponent().appendingPathComponent("mlx-serve").path
             if FileManager.default.fileExists(atPath: bundled) {
                 return bundled
             }
         }
-        // 2. Development: look for zig-out relative to working directory
-        let cwd = FileManager.default.currentDirectoryPath
-        let zigOut = (cwd as NSString).appendingPathComponent("zig-out/bin/mlx-serve")
+        // 2. Development: zig-out/bin/mlx-serve relative to this source file's repo root
+        //    The Swift package lives in app/, so the repo root is one level up.
+        let repoRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent() // Services/
+            .deletingLastPathComponent() // MLXServe/
+            .deletingLastPathComponent() // Sources/
+            .deletingLastPathComponent() // app/
+            .path
+        let zigOut = (repoRoot as NSString).appendingPathComponent("zig-out/bin/mlx-serve")
         if FileManager.default.fileExists(atPath: zigOut) {
             return zigOut
         }
-        // 3. Check common dev location under home
-        let homeBin = NSString(string: "~/code/mlx-serve/zig-out/bin/mlx-serve").expandingTildeInPath
-        if FileManager.default.fileExists(atPath: homeBin) {
-            return homeBin
-        }
-        return "mlx-serve" // last resort: hope it's in PATH
+        return "mlx-serve"
     }
 
     deinit {

@@ -7,4 +7,5 @@ test {
     _ = @import("server.zig");
     _ = @import("model.zig");
     _ = @import("generate.zig");
+    _ = @import("transformer.zig");
 }

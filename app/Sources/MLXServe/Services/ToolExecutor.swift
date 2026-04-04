@@ -159,185 +159,65 @@ struct SearchFilesHandler: ToolHandler {
     }
 }
 
-// MARK: - Web Fetch
 
-struct WebFetchHandler: ToolHandler {
+// MARK: - Web Search (DuckDuckGo)
+
+struct WebSearchHandler: ToolHandler {
     func execute(parameters: [String: String], workingDirectory: String?) async throws -> String {
-        guard let urlStr = parameters["url"], let url = URL(string: urlStr) else {
-            throw ToolError.missingParameter("url")
+        guard let query = parameters["query"] else {
+            throw ToolError.missingParameter("query")
         }
+        let encoded = query.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? query
+        let url = "https://html.duckduckgo.com/html/?q=\(encoded)"
 
-        let (data, _) = try await URLSession.shared.data(from: url)
-        var text = String(data: data, encoding: .utf8) ?? ""
-
-        // Strip HTML tags and collapse whitespace
-        text = text.replacingOccurrences(of: "<script[^>]*>[\\s\\S]*?</script>", with: "", options: .regularExpression)
-        text = text.replacingOccurrences(of: "<style[^>]*>[\\s\\S]*?</style>", with: "", options: .regularExpression)
-        text = text.replacingOccurrences(of: "<[^>]+>", with: " ", options: .regularExpression)
-        text = text.replacingOccurrences(of: "\\s+", with: " ", options: .regularExpression)
-        text = text.trimmingCharacters(in: .whitespacesAndNewlines)
-
-        return String(text.prefix(8192))
+        let browser = await BrowserManager.shared
+        if await browser.webView == nil {
+            throw ToolError.executionFailed("Browser window is not open. Open it from the menu bar dropdown.")
+        }
+        return try await browser.navigate(to: url)
     }
 }
 
-// MARK: - Safari Browse (AppleScript)
+// MARK: - Built-in Browser (WKWebView)
 
-struct SafariBrowseHandler: ToolHandler {
+struct BrowseHandler: ToolHandler {
     func execute(parameters: [String: String], workingDirectory: String?) async throws -> String {
         let action = parameters["action"] ?? "navigate"
+        let browser = await BrowserManager.shared
 
-        let script: String
+        // Check browser window is open
+        if await browser.webView == nil {
+            throw ToolError.executionFailed("Browser window is not open. Open it from the menu bar dropdown.")
+        }
+
         switch action {
         case "navigate":
             guard let url = parameters["url"] else { throw ToolError.missingParameter("url") }
-            let escaped = url.replacingOccurrences(of: "\"", with: "\\\"")
-            script = """
-            tell application "Safari"
-                activate
-                if (count of windows) = 0 then make new document
-                set URL of document 1 to "\(escaped)"
-                delay 2
-                return URL of document 1
-            end tell
-            """
-
+            return try await browser.navigate(to: url)
         case "readText":
-            script = """
-            tell application "Safari"
-                do JavaScript "document.body.innerText.substring(0, 8000)" in document 1
-            end tell
-            """
-
+            return try await browser.readText()
+        case "readHTML":
+            return try await browser.readHTML()
         case "click":
             guard let selector = parameters["selector"] else { throw ToolError.missingParameter("selector") }
-            let escaped = selector.replacingOccurrences(of: "'", with: "\\'").replacingOccurrences(of: "\"", with: "\\\"")
-            script = """
-            tell application "Safari"
-                do JavaScript "document.querySelector('\(escaped)').click(); 'clicked'" in document 1
-            end tell
-            """
-
+            return try await browser.click(selector: selector)
         case "getInfo":
-            script = """
-            tell application "Safari"
-                set pageTitle to name of document 1
-                set pageURL to URL of document 1
-                return "Title: " & pageTitle & linefeed & "URL: " & pageURL
-            end tell
-            """
-
+            return try await browser.getInfo()
         case "executeJS":
-            guard let js = parameters["script"] else { throw ToolError.missingParameter("script") }
-            let escaped = js.replacingOccurrences(of: "\"", with: "\\\"")
-            script = """
-            tell application "Safari"
-                do JavaScript "\(escaped)" in document 1
-            end tell
-            """
-
-        default:
-            throw ToolError.executionFailed("Unknown browse action: \(action)")
-        }
-
-        return try await runAppleScript(script)
-    }
-}
-
-// MARK: - Chrome CDP (DevTools Protocol)
-
-struct ChromeCDPHandler: ToolHandler {
-    func execute(parameters: [String: String], workingDirectory: String?) async throws -> String {
-        let action = parameters["action"] ?? "navigate"
-
-        // Discover debugging target
-        let discoveryURL = URL(string: "http://localhost:9222/json")!
-        let (data, _) = try await URLSession.shared.data(from: discoveryURL)
-        guard let tabs = try JSONSerialization.jsonObject(with: data) as? [[String: Any]],
-              let wsURLStr = tabs.first?["webSocketDebuggerUrl"] as? String,
-              let wsURL = URL(string: wsURLStr) else {
-            throw ToolError.executionFailed("No Chrome debugging tabs found. Launch Chrome with --remote-debugging-port=9222")
-        }
-
-        // Connect WebSocket
-        let ws = URLSession.shared.webSocketTask(with: wsURL)
-        ws.resume()
-        defer { ws.cancel(with: .normalClosure, reason: nil) }
-
-        switch action {
-        case "navigate":
-            guard let url = parameters["url"] else { throw ToolError.missingParameter("url") }
-            _ = try await sendCDP(ws: ws, method: "Page.navigate", params: ["url": url])
-            // Wait for page load
-            try await Task.sleep(nanoseconds: 2_000_000_000)
-            return "Navigated to \(url)"
-
-        case "readText":
-            let result = try await sendCDP(ws: ws, method: "Runtime.evaluate",
-                                           params: ["expression": "document.body.innerText.substring(0, 8000)"])
-            return extractCDPValue(result)
-
-        case "evaluate":
-            guard let expression = parameters["expression"] else { throw ToolError.missingParameter("expression") }
-            let result = try await sendCDP(ws: ws, method: "Runtime.evaluate", params: ["expression": expression])
-            return extractCDPValue(result)
-
-        case "click":
-            guard let selector = parameters["selector"] else { throw ToolError.missingParameter("selector") }
-            let js = "document.querySelector('\(selector.replacingOccurrences(of: "'", with: "\\'"))').click(); 'clicked'"
-            let result = try await sendCDP(ws: ws, method: "Runtime.evaluate", params: ["expression": js])
-            return "Clicked \(selector). \(extractCDPValue(result))"
-
-        default:
-            throw ToolError.executionFailed("Unknown Chrome action: \(action)")
-        }
-    }
-
-    private func sendCDP(ws: URLSessionWebSocketTask, method: String, params: [String: Any]) async throws -> [String: Any] {
-        let id = Int.random(in: 1...999999)
-        let command: [String: Any] = ["id": id, "method": method, "params": params]
-        let json = try JSONSerialization.data(withJSONObject: command)
-        try await ws.send(.string(String(data: json, encoding: .utf8)!))
-
-        // Read responses until we find matching ID (skip CDP events)
-        let deadline = Date().addingTimeInterval(10)
-        while Date() < deadline {
-            let message = try await ws.receive()
-            let responseData: Data
-            switch message {
-            case .string(let text): responseData = text.data(using: .utf8) ?? Data()
-            case .data(let d): responseData = d
-            @unknown default: continue
+            guard let script = parameters["script"] ?? parameters["expression"] else {
+                throw ToolError.missingParameter("script")
             }
-            guard let result = try? JSONSerialization.jsonObject(with: responseData) as? [String: Any],
-                  let responseId = result["id"] as? Int, responseId == id else {
-                continue
+            return try await browser.evaluateJS(script)
+        default:
+            // Fallback: if URL is present, treat as navigate
+            if let url = parameters["url"] {
+                return try await browser.navigate(to: url)
             }
-            return result
+            return try await browser.readText()
         }
-        throw ToolError.executionFailed("CDP command timed out")
-    }
-
-    private func extractCDPValue(_ response: [String: Any]) -> String {
-        if let result = response["result"] as? [String: Any],
-           let inner = result["result"] as? [String: Any],
-           let value = inner["value"] {
-            return String(describing: value).prefix(8192).description
-        }
-        return String(describing: response).prefix(8192).description
     }
 }
 
-// MARK: - Generic AppleScript
-
-struct AppleScriptHandler: ToolHandler {
-    func execute(parameters: [String: String], workingDirectory: String?) async throws -> String {
-        guard let source = parameters["source"] else {
-            throw ToolError.missingParameter("source")
-        }
-        return try await runAppleScript(source)
-    }
-}
 
 // MARK: - Shared Helpers
 
@@ -349,25 +229,6 @@ private func resolvePath(_ path: String, workingDirectory: String?) -> String {
         return (wd as NSString).appendingPathComponent(path)
     }
     return path
-}
-
-private func runAppleScript(_ source: String) async throws -> String {
-    try await withCheckedThrowingContinuation { continuation in
-        DispatchQueue.global(qos: .userInitiated).async {
-            var error: NSDictionary?
-            guard let script = NSAppleScript(source: source) else {
-                continuation.resume(throwing: ToolError.executionFailed("Failed to create AppleScript"))
-                return
-            }
-            let result = script.executeAndReturnError(&error)
-            if let error {
-                let msg = error[NSAppleScript.errorMessage] as? String ?? "\(error)"
-                continuation.resume(throwing: ToolError.executionFailed("AppleScript: \(msg)"))
-            } else {
-                continuation.resume(returning: result.stringValue ?? "(no output)")
-            }
-        }
-    }
 }
 
 // MARK: - Executor
@@ -384,10 +245,8 @@ class ToolExecutor: ObservableObject {
         .writeFile: WriteFileHandler(),
         .editFile: EditFileHandler(),
         .searchFiles: SearchFilesHandler(),
-        .webFetch: WebFetchHandler(),
-        .browse: SafariBrowseHandler(),
-        .browseChrome: ChromeCDPHandler(),
-        .applescript: AppleScriptHandler(),
+        .browse: BrowseHandler(),
+        .webSearch: WebSearchHandler(),
     ]
 
     func executePlan(_ plan: AgentPlan, workingDirectory: String?) async -> [StepResult] {
@@ -399,7 +258,14 @@ class ToolExecutor: ObservableObject {
             let start = DispatchTime.now()
 
             do {
-                guard let handler = handlers[step.tool] else {
+                // Smart fallback: if editFile is called with content but no find/replace, use writeFile
+                let effectiveTool: AgentToolKind
+                if step.tool == .editFile && step.parameters["content"] != nil && step.parameters["find"] == nil {
+                    effectiveTool = .writeFile
+                } else {
+                    effectiveTool = step.tool
+                }
+                guard let handler = handlers[effectiveTool] else {
                     throw ToolError.unsupportedTool(step.tool.rawValue)
                 }
                 let output = try await handler.execute(parameters: step.parameters, workingDirectory: workingDirectory)
