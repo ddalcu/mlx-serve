@@ -73,7 +73,9 @@ jobs:
 
       - name: Build Swift app
         working-directory: app
-        run: swift build -c release
+        run: |
+          swift build -c release
+          echo "SWIFT_BIN_PATH=$(swift build -c release --show-bin-path)" >> "$GITHUB_ENV"
 
       # ── CLI tarball (standalone binary + libs) ──
       - name: Package CLI binary
@@ -115,7 +117,7 @@ jobs:
           mkdir -p "$CONTENTS/MacOS" "$CONTENTS/Frameworks" "$CONTENTS/Resources"
 
           # Executables
-          cp app/.build/release/MLXClaw "$CONTENTS/MacOS/MLXClaw"
+          cp "$SWIFT_BIN_PATH/MLXClaw" "$CONTENTS/MacOS/MLXClaw"
           cp zig-out/bin/mlx-serve "$CONTENTS/MacOS/mlx-serve"
 
           # Info.plist
