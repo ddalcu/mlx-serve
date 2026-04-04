@@ -450,12 +450,18 @@ fn fallbackFormatChat(
     return result.toOwnedSlice(allocator);
 }
 
-/// Strip `<think>...</think>` block from model output.
+/// Strip `<think>...</think>` or `<|channel>thought\n...<channel|>` block from model output.
 pub fn stripThinkBlock(text: []const u8) []const u8 {
+    // Gemma 4 style: <|channel>thought\n...<channel|>
+    if (std.mem.indexOf(u8, text, "<channel|>")) |end| {
+        return std.mem.trimLeft(u8, text[end + 10 ..], "\n ");
+    }
+    // Standard style: <think>...</think>
     if (std.mem.indexOf(u8, text, "</think>")) |think_end| {
         return std.mem.trimLeft(u8, text[think_end + 8 ..], "\n ");
     }
     if (std.mem.startsWith(u8, text, "<think>")) return text[0..0];
+    if (std.mem.startsWith(u8, text, "<|channel>thought")) return text[0..0];
     return text;
 }
 
@@ -465,7 +471,20 @@ pub const ThinkSplit = struct {
 };
 
 /// Split model output into reasoning_content and content.
+/// Handles both `<think>...</think>` and Gemma 4's `<|channel>thought\n...<channel|>`.
 pub fn splitThinkBlock(text: []const u8, thinking: bool) ThinkSplit {
+    // Gemma 4 style: <|channel>thought\n...<channel|>
+    if (std.mem.indexOf(u8, text, "<channel|>")) |end| {
+        const think_tag = "<|channel>thought\n";
+        const reasoning_start: usize = if (std.mem.startsWith(u8, text, think_tag)) think_tag.len else if (std.mem.startsWith(u8, text, "<|channel>thought")) "<|channel>thought".len else 0;
+        const reasoning = std.mem.trim(u8, text[reasoning_start..end], "\n ");
+        const content = std.mem.trimLeft(u8, text[end + 10 ..], "\n ");
+        return .{
+            .reasoning_content = if (reasoning.len > 0) reasoning else null,
+            .content = content,
+        };
+    }
+    // Standard style: <think>...</think>
     if (std.mem.indexOf(u8, text, "</think>")) |end| {
         const reasoning_start: usize = if (std.mem.startsWith(u8, text, "<think>")) 7 else 0;
         const reasoning = std.mem.trim(u8, text[reasoning_start..end], "\n ");
@@ -476,7 +495,7 @@ pub fn splitThinkBlock(text: []const u8, thinking: bool) ThinkSplit {
         };
     }
     if (thinking) {
-        const start: usize = if (std.mem.startsWith(u8, text, "<think>")) 7 else 0;
+        const start: usize = if (std.mem.startsWith(u8, text, "<think>")) 7 else if (std.mem.startsWith(u8, text, "<|channel>thought\n")) "<|channel>thought\n".len else if (std.mem.startsWith(u8, text, "<|channel>thought")) "<|channel>thought".len else 0;
         const reasoning = std.mem.trimLeft(u8, text[start..], "\n ");
         return .{ .reasoning_content = if (reasoning.len > 0) reasoning else null, .content = "" };
     }
@@ -485,9 +504,11 @@ pub fn splitThinkBlock(text: []const u8, thinking: bool) ThinkSplit {
 
 /// Parse tool calls from model output text.
 pub fn parseToolCalls(allocator: std.mem.Allocator, text: []const u8) !?[]ParsedToolCall {
-    // Strip <think>...</think> block if present
+    // Strip thinking blocks if present
     var effective_text = text;
-    if (std.mem.indexOf(u8, text, "</think>")) |think_end| {
+    if (std.mem.indexOf(u8, text, "<channel|>")) |end| {
+        effective_text = std.mem.trimLeft(u8, text[end + 10 ..], "\n ");
+    } else if (std.mem.indexOf(u8, text, "</think>")) |think_end| {
         effective_text = std.mem.trimLeft(u8, text[think_end + 8 ..], "\n ");
     }
 
@@ -518,6 +539,22 @@ pub fn parseToolCalls(allocator: std.mem.Allocator, text: []const u8) !?[]Parsed
         // Fall back to Hermes format: <function=name><parameter=name>value</parameter></function>
         if (parseHermesToolCall(allocator, content)) |tc| {
             try calls.append(allocator, tc);
+        }
+    }
+
+    // Gemma 4 format: <|tool_call>call:name{args}<tool_call|>
+    if (calls.items.len == 0) {
+        search_pos = 0;
+        while (search_pos < effective_text.len) {
+            const tag_start = std.mem.indexOf(u8, effective_text[search_pos..], "<|tool_call>") orelse break;
+            const content_start = search_pos + tag_start + "<|tool_call>".len;
+            const tag_end = std.mem.indexOf(u8, effective_text[content_start..], "<tool_call|>") orelse break;
+            const content = std.mem.trim(u8, effective_text[content_start .. content_start + tag_end], " \t\n\r");
+            search_pos = content_start + tag_end + "<tool_call|>".len;
+
+            if (parseGemma4ToolCall(allocator, content)) |tc| {
+                try calls.append(allocator, tc);
+            }
         }
     }
 
@@ -567,6 +604,29 @@ fn tryParseJsonToolCall(allocator: std.mem.Allocator, text: []const u8) ?ParsedT
             return null;
         },
         .arguments = args_str,
+    };
+}
+
+/// Parse Gemma 4 tool call format: "call:function_name{json_args}"
+fn parseGemma4ToolCall(allocator: std.mem.Allocator, content: []const u8) ?ParsedToolCall {
+    const prefix = "call:";
+    if (!std.mem.startsWith(u8, content, prefix)) return null;
+    const after_prefix = content[prefix.len..];
+
+    // Find the opening brace
+    const brace_pos = std.mem.indexOf(u8, after_prefix, "{") orelse return null;
+    const name = std.mem.trim(u8, after_prefix[0..brace_pos], " \t\n\r");
+    if (name.len == 0) return null;
+
+    const json_str = after_prefix[brace_pos..];
+    // Validate it's valid JSON
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_str, .{}) catch return null;
+    defer parsed.deinit();
+    if (parsed.value != .object) return null;
+
+    return .{
+        .name = allocator.dupe(u8, name) catch return null,
+        .arguments = allocator.dupe(u8, json_str) catch return null,
     };
 }
 
@@ -832,6 +892,57 @@ test "parseToolCalls Hermes format" {
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
     defer parsed.deinit();
     try testing.expectEqualStrings("Tokyo", parsed.value.object.get("location").?.string);
+}
+
+test "stripThinkBlock Gemma 4 channel tags" {
+    try testing.expectEqualStrings("Hello", stripThinkBlock("<|channel>thought\nreasoning here<channel|>Hello"));
+    try testing.expectEqualStrings("Hello", stripThinkBlock("<|channel>thought\nreasoning<channel|>\nHello"));
+    try testing.expectEqualStrings("", stripThinkBlock("<|channel>thought\nstill thinking..."));
+}
+
+test "splitThinkBlock Gemma 4 channel tags" {
+    const result = splitThinkBlock("<|channel>thought\nmy reasoning<channel|>answer here", false);
+    try testing.expectEqualStrings("my reasoning", result.reasoning_content.?);
+    try testing.expectEqualStrings("answer here", result.content);
+}
+
+test "splitThinkBlock Gemma 4 thinking in progress" {
+    const result = splitThinkBlock("<|channel>thought\npartial reasoning", true);
+    try testing.expectEqualStrings("partial reasoning", result.reasoning_content.?);
+    try testing.expectEqualStrings("", result.content);
+}
+
+test "parseToolCalls Gemma 4 format" {
+    const allocator = testing.allocator;
+    const text = "<|tool_call>call:get_weather{\"location\": \"Tokyo\"}<tool_call|>";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("get_weather", calls[0].name);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("Tokyo", parsed.value.object.get("location").?.string);
+}
+
+test "parseToolCalls Gemma 4 with channel thinking" {
+    const allocator = testing.allocator;
+    const text = "<|channel>thought\nLet me check the weather<channel|>\n<|tool_call>call:get_weather{\"city\": \"Paris\"}<tool_call|>";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("get_weather", calls[0].name);
 }
 
 test "isJsonLiteral" {

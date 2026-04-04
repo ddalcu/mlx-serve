@@ -74,9 +74,57 @@ pub const ModelConfig = struct {
     eos_token_ids: [8]u32 = .{0} ** 8,
     num_eos_tokens: u32 = 0,
 
+    // Gemma 4: explicit layer type map (bit = 1 means full/global attention)
+    has_explicit_layer_types: bool = false,
+    layer_is_global: [128]bool = .{false} ** 128,
+
+    // Gemma 4: dual head dimensions and KV sharing
+    global_head_dim: u32 = 0, // 0 = same as head_dim
+    num_global_key_value_heads: u32 = 0, // 0 = same as num_key_value_heads
+    num_kv_shared_layers: u32 = 0,
+    final_logit_softcapping: f32 = 0.0, // 0 = disabled
+    hidden_size_per_layer_input: u32 = 0, // >0 enables PLE
+    partial_rotary_factor_global: f32 = 1.0, // for global/full attention layers
+    has_v_norm: bool = false, // parameter-free RMS norm on values
+
     pub fn isGlobalLayer(self: ModelConfig, layer_idx: u32) bool {
         if (!self.has_sliding_window) return true;
+        if (self.has_explicit_layer_types and layer_idx < 128) {
+            return self.layer_is_global[layer_idx];
+        }
         return (layer_idx % self.sliding_window_pattern) == 0;
+    }
+
+    /// For Gemma 4 KV sharing: get the source layer index for a shared layer.
+    /// Returns null if the layer computes its own KV (not shared).
+    pub fn getKVSourceLayer(self: ModelConfig, layer_idx: u32) ?u32 {
+        if (self.num_kv_shared_layers == 0) return null;
+        const first_shared = self.num_hidden_layers - self.num_kv_shared_layers;
+        if (layer_idx < first_shared) return null;
+        const is_global = self.isGlobalLayer(layer_idx);
+        // Find last concrete layer of the same type (scanning downward)
+        var j: u32 = first_shared;
+        while (j > 0) {
+            j -= 1;
+            if (self.isGlobalLayer(j) == is_global) return j;
+        }
+        return null;
+    }
+
+    /// Get effective head_dim for a layer (global layers may use global_head_dim).
+    pub fn layerHeadDim(self: ModelConfig, layer_idx: u32) u32 {
+        if (self.global_head_dim > 0 and self.isGlobalLayer(layer_idx)) {
+            return self.global_head_dim;
+        }
+        return self.head_dim;
+    }
+
+    /// Get effective num_kv_heads for a layer.
+    pub fn layerKVHeads(self: ModelConfig, layer_idx: u32) u32 {
+        if (self.num_global_key_value_heads > 0 and self.isGlobalLayer(layer_idx)) {
+            return self.num_global_key_value_heads;
+        }
+        return self.num_key_value_heads;
     }
 
     pub fn isLinearLayer(self: ModelConfig, layer_idx: u32) bool {
@@ -188,6 +236,57 @@ pub fn parseConfig(allocator: std.mem.Allocator, model_dir: []const u8) !ModelCo
         }
     }
 
+    // Gemma 4: explicit layer_types array
+    if (cfg_obj.get("layer_types")) |lt_val| {
+        if (lt_val == .array) {
+            config.has_explicit_layer_types = true;
+            for (lt_val.array.items, 0..) |item, i| {
+                if (i >= 128) break;
+                if (item == .string) {
+                    config.layer_is_global[i] = std.mem.eql(u8, item.string, "full_attention");
+                }
+            }
+        }
+    }
+
+    // Gemma 4: dual head dimensions and KV sharing
+    if (cfg_obj.get("global_head_dim")) |v| {
+        if (v == .integer) config.global_head_dim = @intCast(v.integer);
+    }
+    if (cfg_obj.get("num_global_key_value_heads")) |v| {
+        if (v == .integer) config.num_global_key_value_heads = @intCast(v.integer);
+    }
+    if (cfg_obj.get("num_kv_shared_layers")) |v| {
+        if (v == .integer) config.num_kv_shared_layers = @intCast(v.integer);
+    }
+    if (cfg_obj.get("final_logit_softcapping")) |v| {
+        config.final_logit_softcapping = jsonFloat(v);
+    }
+    if (cfg_obj.get("hidden_size_per_layer_input")) |v| {
+        if (v == .integer) config.hidden_size_per_layer_input = @intCast(v.integer);
+    }
+
+    // Gemma 4: nested rope_parameters with per-attention-type config
+    if (cfg_obj.get("rope_parameters")) |rp_val| {
+        if (rp_val == .object) {
+            // Gemma 4 style: { "full_attention": {...}, "sliding_attention": {...} }
+            if (rp_val.object.get("full_attention")) |fa| {
+                if (fa == .object) {
+                    if (fa.object.get("rope_theta")) |v| config.rope_theta = jsonFloat(v);
+                    if (fa.object.get("partial_rotary_factor")) |v| config.partial_rotary_factor_global = jsonFloat(v);
+                }
+            }
+            if (rp_val.object.get("sliding_attention")) |sa| {
+                if (sa == .object) {
+                    if (sa.object.get("rope_theta")) |v| config.rope_local_base_freq = jsonFloat(v);
+                }
+            }
+            // Qwen3.5 style: { "rope_theta": ..., "partial_rotary_factor": ... }
+            if (rp_val.object.get("rope_theta")) |v| config.rope_theta = jsonFloat(v);
+            if (rp_val.object.get("partial_rotary_factor")) |v| config.partial_rotary_factor = jsonFloat(v);
+        }
+    }
+
     // Tie word embeddings
     if (root.get("tie_word_embeddings")) |v| {
         if (v == .bool) config.tie_word_embeddings = v.bool;
@@ -248,6 +347,19 @@ pub fn parseConfig(allocator: std.mem.Allocator, model_dir: []const u8) !ModelCo
         if (config.num_eos_tokens == 0) {
             config.addEosToken(1);
             config.addEosToken(106);
+        }
+    } else if (std.mem.eql(u8, model_type, "gemma4") or std.mem.eql(u8, model_type, "gemma4_text")) {
+        config.model_type = "gemma4";
+        config.weight_prefix = "language_model.model";
+        config.hidden_act = .gelu_approx;
+        config.norm_has_offset = false; // Gemma 4 norms have NO offset (plain weight, not 1+weight)
+        config.scale_embeddings = true;
+        config.has_pre_ff_norm = true;
+        config.has_qk_norm = true;
+        config.has_v_norm = true; // Parameter-free RMS norm on values
+        config.rope_scaling_factor = 1.0; // No scaling, uses proportional RoPE via theta
+        if (config.num_eos_tokens == 0) {
+            config.addEosToken(1); // eos_token_id
         }
     } else if (std.mem.eql(u8, model_type, "qwen3_5_moe") or
         std.mem.eql(u8, model_type, "qwen3_5") or
@@ -441,9 +553,12 @@ fn loadSafetensorsFile(
 
         const key_str = std.mem.span(key.?);
 
-        // Skip non-text-model weights (vision_tower, multi_modal_projector, etc.)
+        // Skip non-text-model weights (vision, audio, multi-modal projector, etc.)
         if (std.mem.startsWith(u8, key_str, "vision_tower.") or
-            std.mem.startsWith(u8, key_str, "multi_modal_projector."))
+            std.mem.startsWith(u8, key_str, "multi_modal_projector.") or
+            std.mem.startsWith(u8, key_str, "audio_tower.") or
+            std.mem.startsWith(u8, key_str, "language_model.multi_modal_projector.") or
+            std.mem.startsWith(u8, key_str, "language_model.audio_multi_modal_projector."))
         {
             _ = mlx.mlx_array_free(value);
             continue;
@@ -558,6 +673,52 @@ test "jsonFloat converts integer" {
 test "jsonFloat converts float" {
     const val = std.json.Value{ .float = 3.14 };
     try testing.expectApproxEqAbs(@as(f32, 3.14), jsonFloat(val), 0.01);
+}
+
+test "ModelConfig isGlobalLayer with explicit layer_types" {
+    var config = ModelConfig{};
+    config.has_sliding_window = true;
+    config.has_explicit_layer_types = true;
+    // Set layer 4 and 9 as global (like Gemma 4 E2B pattern)
+    config.layer_is_global[4] = true;
+    config.layer_is_global[9] = true;
+    try testing.expect(!config.isGlobalLayer(0));
+    try testing.expect(!config.isGlobalLayer(3));
+    try testing.expect(config.isGlobalLayer(4));
+    try testing.expect(!config.isGlobalLayer(5));
+    try testing.expect(config.isGlobalLayer(9));
+}
+
+test "ModelConfig getKVSourceLayer" {
+    var config = ModelConfig{};
+    config.num_hidden_layers = 35;
+    config.num_kv_shared_layers = 20;
+    config.has_sliding_window = true;
+    config.has_explicit_layer_types = true;
+    // E2B pattern: every 5th layer starting from 4 is global
+    for (0..35) |i| {
+        config.layer_is_global[i] = (i % 5 == 4);
+    }
+    // Layers 0-14 are concrete (no source)
+    try testing.expect(config.getKVSourceLayer(0) == null);
+    try testing.expect(config.getKVSourceLayer(14) == null);
+    // Layer 15 (sliding) -> should map to layer 13 (last concrete sliding)
+    try testing.expectEqual(@as(?u32, 13), config.getKVSourceLayer(15));
+    // Layer 19 (full) -> should map to layer 14 (last concrete full)
+    try testing.expectEqual(@as(?u32, 14), config.getKVSourceLayer(19));
+    // Layer 20 (sliding) -> should also map to layer 13
+    try testing.expectEqual(@as(?u32, 13), config.getKVSourceLayer(20));
+}
+
+test "ModelConfig layerHeadDim" {
+    var config = ModelConfig{};
+    config.head_dim = 256;
+    config.global_head_dim = 512;
+    config.has_sliding_window = true;
+    config.has_explicit_layer_types = true;
+    config.layer_is_global[4] = true;
+    try testing.expectEqual(@as(u32, 256), config.layerHeadDim(0));
+    try testing.expectEqual(@as(u32, 512), config.layerHeadDim(4));
 }
 
 test "ModelConfig BERT defaults" {

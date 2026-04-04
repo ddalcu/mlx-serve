@@ -7,7 +7,7 @@
 
 set -euo pipefail
 
-MODEL_DIR="${1:-/Users/david/.cache/mlx-models/qwen3-4b}"
+MODEL_DIR="${1:-${MLX_SERVE_TEST_MODEL:-$HOME/.mlx-serve/models/qwen3-4b}}"
 PORT="${2:-8095}"
 BASE="http://localhost:$PORT"
 BINARY="./zig-out/bin/mlx-serve"

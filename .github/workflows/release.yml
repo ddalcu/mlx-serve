@@ -33,7 +33,6 @@ jobs:
           APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
         run: |
-          # Create temporary keychain
           KEYCHAIN_PATH=$RUNNER_TEMP/signing.keychain-db
           KEYCHAIN_PASSWORD=$(openssl rand -hex 16)
 
@@ -41,7 +40,6 @@ jobs:
           security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
           security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
 
-          # Import certificate
           echo "$APPLE_CERTIFICATE_BASE64" | base64 --decode > $RUNNER_TEMP/certificate.p12
           security import $RUNNER_TEMP/certificate.p12 \
             -P "$APPLE_CERTIFICATE_PASSWORD" \
@@ -49,13 +47,8 @@ jobs:
             -f pkcs12 \
             -k "$KEYCHAIN_PATH"
 
-          # Allow codesign to access the keychain without prompts
           security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-
-          # Add to search list
           security list-keychains -d user -s "$KEYCHAIN_PATH" login.keychain-db
-
-          # Verify identity is available
           security find-identity -v -p codesigning "$KEYCHAIN_PATH"
 
       - name: Extract version
@@ -75,68 +68,135 @@ jobs:
           git tag v${{ steps.version.outputs.version }}
           git push origin v${{ steps.version.outputs.version }}
 
-      - name: Build
+      - name: Build mlx-serve (Zig)
         run: zig build -Doptimize=ReleaseFast -Dversion=${{ steps.version.outputs.version }}
 
-      - name: Package and sign binary
+      - name: Build Swift app
+        working-directory: app
+        run: swift build -c release
+
+      # ── CLI tarball (standalone binary + libs) ──
+      - name: Package CLI binary
         env:
           SIGNING_IDENTITY: "Developer ID Application: David Dalcu (${{ secrets.APPLE_TEAM_ID }})"
         run: |
           STAGING="mlx-serve-macos-arm64"
           mkdir -p "$STAGING/lib"
 
-          # Copy binary
           cp zig-out/bin/mlx-serve "$STAGING/"
-
-          # Bundle required dylibs and Metal shader library
           cp /opt/homebrew/opt/mlx-c/lib/libmlxc.dylib "$STAGING/lib/"
           cp /opt/homebrew/opt/mlx/lib/libmlx.dylib "$STAGING/lib/"
           cp /opt/homebrew/opt/mlx/lib/mlx.metallib "$STAGING/lib/"
 
-          # Fix rpaths so binary finds bundled dylibs
           install_name_tool -change \
             /opt/homebrew/opt/mlx-c/lib/libmlxc.dylib \
             @executable_path/lib/libmlxc.dylib \
             "$STAGING/mlx-serve"
 
-          # Fix libmlxc to find bundled libmlx
           install_name_tool -change \
             /opt/homebrew/opt/mlx/lib/libmlx.dylib \
             @loader_path/libmlx.dylib \
             "$STAGING/lib/libmlxc.dylib"
 
-          # Sign with Developer ID
           codesign --force --options runtime --sign "$SIGNING_IDENTITY" "$STAGING/lib/libmlx.dylib"
           codesign --force --options runtime --sign "$SIGNING_IDENTITY" "$STAGING/lib/libmlxc.dylib"
           codesign --force --options runtime --sign "$SIGNING_IDENTITY" "$STAGING/mlx-serve"
 
-          # Verify
-          echo "=== Signature ==="
           codesign --verify --deep --strict --verbose=2 "$STAGING/mlx-serve"
-          echo "=== Binary deps ==="
-          otool -L "$STAGING/mlx-serve"
-          echo "=== libmlxc deps ==="
-          otool -L "$STAGING/lib/libmlxc.dylib"
-          echo "=== Version ==="
-          "$STAGING/mlx-serve" --version
+          ditto -c -k --keepParent "$STAGING" "mlx-serve-cli.zip"
 
-          # Create zip for notarization (notarytool requires zip, not tar)
-          ditto -c -k --keepParent "$STAGING" "mlx-serve-macos-arm64.zip"
+      # ── .app bundle (menu bar app with everything inside) ──
+      - name: Package app bundle
+        env:
+          SIGNING_IDENTITY: "Developer ID Application: David Dalcu (${{ secrets.APPLE_TEAM_ID }})"
+        run: |
+          APP="MLX Claw.app"
+          CONTENTS="$APP/Contents"
+          mkdir -p "$CONTENTS/MacOS" "$CONTENTS/Frameworks" "$CONTENTS/Resources"
 
-      - name: Notarize
+          # Executables
+          cp app/.build/release/MLXClaw "$CONTENTS/MacOS/MLXClaw"
+          cp zig-out/bin/mlx-serve "$CONTENTS/MacOS/mlx-serve"
+
+          # Info.plist
+          cp app/Info.plist "$CONTENTS/"
+
+          # App icon
+          if [ -f app/appicon.png ]; then
+            ICON_DIR=$(mktemp -d)
+            ICONSET="$ICON_DIR/AppIcon.iconset"
+            mkdir -p "$ICONSET"
+            for size in 16 32 64 128 256 512; do
+              sips -z $size $size app/appicon.png --out "$ICONSET/icon_${size}x${size}.png" > /dev/null 2>&1
+              double=$((size * 2))
+              sips -z $double $double app/appicon.png --out "$ICONSET/icon_${size}x${size}@2x.png" > /dev/null 2>&1
+            done
+            iconutil -c icns "$ICONSET" -o "$CONTENTS/Resources/AppIcon.icns" 2>/dev/null || true
+            rm -rf "$ICON_DIR"
+          fi
+
+          # Bundled libraries
+          cp /opt/homebrew/opt/mlx-c/lib/libmlxc.dylib "$CONTENTS/Frameworks/"
+          cp /opt/homebrew/opt/mlx/lib/libmlx.dylib "$CONTENTS/Frameworks/"
+          cp /opt/homebrew/opt/mlx/lib/mlx.metallib "$CONTENTS/Frameworks/"
+
+          # Fix rpaths
+          install_name_tool -change \
+            "$(otool -L "$CONTENTS/MacOS/mlx-serve" | grep libmlxc | awk '{print $1}')" \
+            "@executable_path/../Frameworks/libmlxc.dylib" \
+            "$CONTENTS/MacOS/mlx-serve" 2>/dev/null || true
+
+          install_name_tool -change \
+            "$(otool -L "$CONTENTS/Frameworks/libmlxc.dylib" | grep libmlx.dylib | head -1 | awk '{print $1}')" \
+            "@loader_path/libmlx.dylib" \
+            "$CONTENTS/Frameworks/libmlxc.dylib" 2>/dev/null || true
+
+          # Sign inside-out
+          chmod -R u+w "$APP"
+          for fw in "$CONTENTS/Frameworks/"*.metallib "$CONTENTS/Frameworks/"*.dylib; do
+            [ -f "$fw" ] && codesign --force --options runtime --sign "$SIGNING_IDENTITY" "$fw"
+          done
+          codesign --force --options runtime --sign "$SIGNING_IDENTITY" "$CONTENTS/MacOS/mlx-serve"
+          codesign --force --options runtime --sign "$SIGNING_IDENTITY" "$CONTENTS/MacOS/MLXClaw"
+          codesign --force --options runtime --sign "$SIGNING_IDENTITY" "$APP"
+
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          ditto -c -k --keepParent "$APP" "MLXClaw-app.zip"
+
+      # ── Notarize both ──
+      - name: Notarize CLI
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
-          # Submit for notarization and wait
-          xcrun notarytool submit "mlx-serve-macos-arm64.zip" \
+          xcrun notarytool submit "mlx-serve-cli.zip" \
             --apple-id "$APPLE_ID" \
             --password "$APPLE_ID_PASSWORD" \
             --team-id "$APPLE_TEAM_ID" \
             --wait
 
-      - name: Package tarball
+      - name: Notarize app bundle
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          xcrun notarytool submit "MLXClaw-app.zip" \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_ID_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait
+
+          # Staple the app bundle
+          xcrun stapler staple "MLX Claw.app"
+
+          # Re-zip after stapling
+          rm -f "MLXClaw-app.zip"
+          ditto -c -k --keepParent "MLX Claw.app" "MLXClaw-app.zip"
+
+      # ── Package final artifacts ──
+      - name: Package CLI tarball
         run: tar -czf "mlx-serve-bin-macos-arm64.tar.gz" "mlx-serve-macos-arm64"
 
       - name: Cleanup keychain
@@ -149,4 +209,6 @@ jobs:
           tag_name: ${{ steps.version.outputs.tag }}
           name: mlx-serve v${{ steps.version.outputs.version }}
           generate_release_notes: true
-          files: mlx-serve-bin-macos-arm64.tar.gz
+          files: |
+            mlx-serve-bin-macos-arm64.tar.gz
+            MLXClaw-app.zip

@@ -226,25 +226,47 @@ fn handleConnection(
     chat_config: *const chat_mod.ChatConfig,
     config: *const model_mod.ModelConfig,
 ) !void {
-    // Read the full HTTP request (up to 1MB for large tool definitions / conversation history)
-    var buf: [1024 * 1024]u8 = undefined;
+    // Read HTTP headers first (up to 16KB), then allocate for the full body based on Content-Length.
+    var hdr_buf: [16 * 1024]u8 = undefined;
     var total_read: usize = 0;
+    var content_length: ?usize = null;
+    var header_end_pos: usize = 0;
 
-    while (total_read < buf.len) {
-        const n = try stream.read(buf[total_read..]);
+    // Phase 1: Read until we have complete headers
+    while (total_read < hdr_buf.len) {
+        const n = try stream.read(hdr_buf[total_read..]);
         if (n == 0) break;
         total_read += n;
 
-        if (std.mem.indexOf(u8, buf[0..total_read], "\r\n\r\n")) |header_end| {
-            const headers = buf[0..header_end];
-            if (findContentLength(headers)) |cl| {
-                const body_start = header_end + 4;
-                const body_received = total_read - body_start;
-                if (body_received >= cl) break;
-            } else {
-                break;
-            }
+        if (std.mem.indexOf(u8, hdr_buf[0..total_read], "\r\n\r\n")) |he| {
+            header_end_pos = he + 4;
+            content_length = findContentLength(hdr_buf[0..he]);
+            break;
         }
+    }
+
+    if (header_end_pos == 0) {
+        // No complete headers found
+        return;
+    }
+
+    // Phase 2: Allocate buffer for full request and read remaining body
+    const cl = content_length orelse 0;
+    const total_size = header_end_pos + cl;
+    const max_request_size = 64 * 1024 * 1024; // 64MB hard limit
+    if (total_size > max_request_size) {
+        try sendErrorResponse(allocator, stream, "413 Payload Too Large", "invalid_request_error", "Request body too large (max 64MB)", 413);
+        return;
+    }
+
+    const buf = try allocator.alloc(u8, total_size);
+    defer allocator.free(buf);
+    @memcpy(buf[0..total_read], hdr_buf[0..total_read]);
+
+    while (total_read < total_size) {
+        const n = try stream.read(buf[total_read..total_size]);
+        if (n == 0) break;
+        total_read += n;
     }
 
     const request = buf[0..total_read];
@@ -1503,12 +1525,13 @@ fn handleStreamingGeneration(
     var utf8_carry_len: u8 = 0;
 
     // Thinking state for real-time streaming of reasoning_content vs content
+    // Supports both <think>...</think> and Gemma 4's <|channel>thought\n...<channel|>
     var in_think_block = enable_thinking; // starts true when thinking enabled (model outputs <think> first)
-    var think_buf = std.ArrayList(u8).empty; // buffer to detect </think> across token boundaries
+    var think_buf = std.ArrayList(u8).empty; // buffer to detect close tag across token boundaries
     defer think_buf.deinit(allocator);
-    const think_close_tag = "</think>";
-    var skipped_think_open = false; // track if we've skipped the initial <think> tag
-    var think_tokens: i32 = 0; // count of tokens generated in <think> block
+    var think_close_tag: []const u8 = "</think>"; // will be updated if Gemma 4 format detected
+    var skipped_think_open = false; // track if we've skipped the initial think tag
+    var think_tokens: i32 = 0; // count of tokens generated in think block
     var budget_exhausted = false; // true when reasoning budget hit
 
     // Generate tokens
@@ -1582,7 +1605,7 @@ fn handleStreamingGeneration(
             try think_buf.appendSlice(allocator, token_text);
             think_tokens += 1;
 
-            // Skip the initial <think>\n prefix
+            // Skip the initial think tag prefix (<think> or <|channel>thought\n)
             if (!skipped_think_open and think_buf.items.len >= 7) {
                 if (std.mem.startsWith(u8, think_buf.items, "<think>")) {
                     // Remove <think> prefix and any leading newline
@@ -1592,8 +1615,24 @@ fn handleStreamingGeneration(
                     think_buf.clearAndFree(allocator);
                     try think_buf.appendSlice(allocator, remaining);
                     allocator.free(remaining);
+                    skipped_think_open = true;
+                } else if (think_buf.items.len >= 18 and std.mem.startsWith(u8, think_buf.items, "<|channel>thought")) {
+                    // Gemma 4 think format — switch close tag
+                    think_close_tag = "<channel|>";
+                    var skip: usize = 17; // len of "<|channel>thought"
+                    while (skip < think_buf.items.len and think_buf.items[skip] == '\n') skip += 1;
+                    const remaining = try allocator.dupe(u8, think_buf.items[skip..]);
+                    think_buf.clearAndFree(allocator);
+                    try think_buf.appendSlice(allocator, remaining);
+                    allocator.free(remaining);
+                    skipped_think_open = true;
+                } else if (!std.mem.startsWith(u8, "<think>", think_buf.items) and
+                    !std.mem.startsWith(u8, "<|channel>thought", think_buf.items))
+                {
+                    // Not a think block at all — flush as content
+                    skipped_think_open = true;
+                    in_think_block = false;
                 }
-                skipped_think_open = true;
             }
 
             // Check if reasoning budget exhausted

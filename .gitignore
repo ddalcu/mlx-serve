@@ -1,5 +1,22 @@
 .zig-cache/
 zig-out/
 .claude/
-models/
+/models/
 *.safetensors
+
+# Swift / app build
+app/.build/
+app/.swiftpm/
+app/MLX Claw.app/
+app/MLX Serve.app/
+app/*.zip
+
+# macOS
+.DS_Store
+
+# Python
+scripts/__pycache__/
+*.pyc
+
+# Images (tracked via releases, not git)
+mlx-logo.png

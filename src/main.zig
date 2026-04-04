@@ -11,7 +11,7 @@ const log = @import("log.zig");
 
 pub const VERSION: []const u8 = build_options.version;
 
-const DEFAULT_MODEL_DIR = "/Volumes/Sandisk_1TB/Models/mlx-community/gemma-3-12b-it-qat-4bit";
+const DEFAULT_MODEL_DIR = ""; // pass --model <path> to specify
 
 fn printUsage() void {
     const stdout = std.fs.File.stdout();

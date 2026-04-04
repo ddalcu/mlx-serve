@@ -1,0 +1,122 @@
+import Foundation
+import SwiftUI
+
+@MainActor
+class AppState: ObservableObject {
+    @Published var server = ServerManager()
+    @Published var downloads = DownloadManager()
+    @Published var localModels: [LocalModel] = []
+    @Published var selectedModelPath: String = ""
+    @Published var chatSessions: [ChatSession] = []
+    @Published var activeChatId: UUID?
+    @Published var agentMemory = AgentMemory()
+    @Published var toolExecutor = ToolExecutor()
+
+    private let historyPath: String = {
+        let dir = NSString(string: "~/.mlx-serve").expandingTildeInPath
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        return (dir as NSString).appendingPathComponent("chat-history.json")
+    }()
+
+    init() {
+        refreshModels()
+        loadChatHistory()
+    }
+
+    func refreshModels() {
+        localModels = downloads.discoverLocalModels()
+        if selectedModelPath.isEmpty, let first = localModels.first {
+            selectedModelPath = first.path
+        }
+    }
+
+    // MARK: - Chat Session Management
+
+    func newChatSession() -> UUID {
+        let session = ChatSession()
+        chatSessions.insert(session, at: 0)
+        activeChatId = session.id
+        saveChatHistory()
+        return session.id
+    }
+
+    func deleteSession(_ id: UUID) {
+        chatSessions.removeAll { $0.id == id }
+        if activeChatId == id {
+            activeChatId = chatSessions.first?.id
+        }
+        saveChatHistory()
+    }
+
+    var activeSession: ChatSession? {
+        get { chatSessions.first { $0.id == activeChatId } }
+        set {
+            if let newValue, let idx = chatSessions.firstIndex(where: { $0.id == newValue.id }) {
+                chatSessions[idx] = newValue
+            }
+        }
+    }
+
+    func appendMessage(to sessionId: UUID, message: ChatMessage) {
+        guard let idx = chatSessions.firstIndex(where: { $0.id == sessionId }) else { return }
+        chatSessions[idx].messages.append(message)
+        chatSessions[idx].updatedAt = Date()
+        // Auto-title from first user message
+        if chatSessions[idx].title == "New Chat",
+           message.role == .user,
+           !message.content.isEmpty {
+            let title = String(message.content.prefix(40))
+            chatSessions[idx].title = title + (message.content.count > 40 ? "..." : "")
+        }
+    }
+
+    func updateLastMessage(in sessionId: UUID, content: String? = nil, reasoning: String? = nil, streaming: Bool? = nil) {
+        guard let sIdx = chatSessions.firstIndex(where: { $0.id == sessionId }),
+              !chatSessions[sIdx].messages.isEmpty else { return }
+        let mIdx = chatSessions[sIdx].messages.count - 1
+        if let content { chatSessions[sIdx].messages[mIdx].content += content }
+        if let reasoning { chatSessions[sIdx].messages[mIdx].reasoningContent = (chatSessions[sIdx].messages[mIdx].reasoningContent ?? "") + reasoning }
+        if let streaming { chatSessions[sIdx].messages[mIdx].isStreaming = streaming }
+    }
+
+    // MARK: - Agent Helpers
+
+    func updatePlanStatus(in sessionId: UUID, planId: UUID, status: PlanStatus) {
+        guard let sIdx = chatSessions.firstIndex(where: { $0.id == sessionId }) else { return }
+        for mIdx in chatSessions[sIdx].messages.indices {
+            if chatSessions[sIdx].messages[mIdx].agentPlan?.id == planId {
+                chatSessions[sIdx].messages[mIdx].agentPlan?.status = status
+                break
+            }
+        }
+    }
+
+    func appendToolResults(to sessionId: UUID, results: [StepResult]) {
+        guard let sIdx = chatSessions.firstIndex(where: { $0.id == sessionId }) else { return }
+        for mIdx in chatSessions[sIdx].messages.indices.reversed() {
+            if chatSessions[sIdx].messages[mIdx].role == .assistant {
+                chatSessions[sIdx].messages[mIdx].toolResults = results
+                break
+            }
+        }
+    }
+
+    // MARK: - Persistence
+
+    func saveChatHistory() {
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        encoder.outputFormatting = .prettyPrinted
+        guard let data = try? encoder.encode(chatSessions) else { return }
+        try? data.write(to: URL(fileURLWithPath: historyPath))
+    }
+
+    private func loadChatHistory() {
+        guard FileManager.default.fileExists(atPath: historyPath),
+              let data = try? Data(contentsOf: URL(fileURLWithPath: historyPath)) else { return }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        chatSessions = (try? decoder.decode([ChatSession].self, from: data)) ?? []
+        activeChatId = chatSessions.first?.id
+    }
+}

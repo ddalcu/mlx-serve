@@ -341,6 +341,17 @@ const LayerWeights = struct {
     down_w: mlx.mlx_array,
     down_s: mlx.mlx_array,
     down_b: mlx.mlx_array,
+    // Gemma 4: per-layer scalar, PLE weights
+    layer_scalar: ?mlx.mlx_array = null,
+    ple_gate_w: ?mlx.mlx_array = null,
+    ple_gate_s: ?mlx.mlx_array = null,
+    ple_gate_b: ?mlx.mlx_array = null,
+    ple_proj_w: ?mlx.mlx_array = null,
+    ple_proj_s: ?mlx.mlx_array = null,
+    ple_proj_b: ?mlx.mlx_array = null,
+    ple_norm: ?mlx.mlx_array = null,
+    // KV sharing: source layer index (null = compute own KV)
+    kv_source: ?u32 = null,
 };
 
 // ── MoE model per-layer weights ──
@@ -468,6 +479,20 @@ pub const Transformer = struct {
     three: ?mlx.mlx_array,
     neg_one: ?mlx.mlx_array,
 
+    // Gemma 4 PLE (Per-Layer Embeddings) global weights
+    ple_emb_w: mlx.mlx_array, // embed_tokens_per_layer
+    ple_emb_s: mlx.mlx_array,
+    ple_emb_b: mlx.mlx_array,
+    ple_proj_w: mlx.mlx_array, // per_layer_model_projection
+    ple_proj_s: mlx.mlx_array,
+    ple_proj_b: mlx.mlx_array,
+    ple_proj_norm: mlx.mlx_array, // per_layer_projection_norm
+    ple_proj_quantized: bool, // whether per_layer_model_projection is quantized
+    // Gemma 4: logit softcapping scalar and v_norm weight (ones)
+    softcap_scalar: ?mlx.mlx_array,
+    v_norm_weight: ?mlx.mlx_array, // ones(head_dim) for param-free RMS norm
+    v_norm_weight_global: ?mlx.mlx_array, // ones(global_head_dim)
+
     // BERT encoder-only (null for decoder models)
     bert_layers: ?[]BertLayerWeights,
     bert_pos_w: mlx.mlx_array,
@@ -559,6 +584,51 @@ pub const Transformer = struct {
             layers = try initStandardLayers(allocator, config, weights, &name_buf, s);
         }
 
+        // Gemma 4: load PLE global weights
+        var ple_emb_w = mlx.mlx_array_new();
+        var ple_emb_s = mlx.mlx_array_new();
+        var ple_emb_b = mlx.mlx_array_new();
+        var ple_proj_w_g = mlx.mlx_array_new();
+        var ple_proj_s_g = mlx.mlx_array_new();
+        var ple_proj_b_g = mlx.mlx_array_new();
+        var ple_proj_norm = mlx.mlx_array_new();
+        var ple_proj_quantized = false;
+        if (config.hidden_size_per_layer_input > 0) {
+            ple_emb_w = getWeightFmt(weights, &name_buf, "{s}.embed_tokens_per_layer.weight", prefix);
+            ple_emb_s = getWeightFmt(weights, &name_buf, "{s}.embed_tokens_per_layer.scales", prefix);
+            ple_emb_b = getWeightFmt(weights, &name_buf, "{s}.embed_tokens_per_layer.biases", prefix);
+            ple_proj_w_g = getWeightFmt(weights, &name_buf, "{s}.per_layer_model_projection.weight", prefix);
+            // per_layer_model_projection may be unquantized (no scales/biases)
+            if (getWeightFmtOpt(weights, &name_buf, "{s}.per_layer_model_projection.scales", prefix)) |sc| {
+                ple_proj_s_g = sc;
+                ple_proj_b_g = getWeightFmt(weights, &name_buf, "{s}.per_layer_model_projection.biases", prefix);
+                ple_proj_quantized = true;
+            }
+            ple_proj_norm = getWeightFmt(weights, &name_buf, "{s}.per_layer_projection_norm.weight", prefix);
+        }
+
+        // Gemma 4: logit softcapping scalar
+        var softcap_scalar: ?mlx.mlx_array = null;
+        if (config.final_logit_softcapping > 0) {
+            softcap_scalar = bf16Scalar(config.final_logit_softcapping, s);
+        }
+
+        // Gemma 4: v_norm weights (parameter-free: ones vectors)
+        var v_norm_weight: ?mlx.mlx_array = null;
+        var v_norm_weight_global: ?mlx.mlx_array = null;
+        if (config.has_v_norm) {
+            const one_val = bf16Scalar(1.0, s);
+            defer _ = mlx.mlx_array_free(one_val);
+            const hd_shape = [_]c_int{@intCast(config.head_dim)};
+            v_norm_weight = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_full(&v_norm_weight.?, &hd_shape, 1, one_val, .bfloat16, s));
+            if (config.global_head_dim > 0 and config.global_head_dim != config.head_dim) {
+                const ghd_shape = [_]c_int{@intCast(config.global_head_dim)};
+                v_norm_weight_global = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_full(&v_norm_weight_global.?, &ghd_shape, 1, one_val, .bfloat16, s));
+            }
+        }
+
         // Batch eval all weights
         {
             var eval_timer = std.time.Timer.start() catch unreachable;
@@ -611,6 +681,14 @@ pub const Transformer = struct {
                     _ = mlx.mlx_vector_array_append_value(all_vec, lw.down_w);
                     _ = mlx.mlx_vector_array_append_value(all_vec, lw.down_s);
                     _ = mlx.mlx_vector_array_append_value(all_vec, lw.down_b);
+                    if (lw.layer_scalar) |ls| _ = mlx.mlx_vector_array_append_value(all_vec, ls);
+                    if (lw.ple_gate_w) |w| _ = mlx.mlx_vector_array_append_value(all_vec, w);
+                    if (lw.ple_gate_s) |sc| _ = mlx.mlx_vector_array_append_value(all_vec, sc);
+                    if (lw.ple_gate_b) |bi| _ = mlx.mlx_vector_array_append_value(all_vec, bi);
+                    if (lw.ple_proj_w) |w| _ = mlx.mlx_vector_array_append_value(all_vec, w);
+                    if (lw.ple_proj_s) |sc| _ = mlx.mlx_vector_array_append_value(all_vec, sc);
+                    if (lw.ple_proj_b) |bi| _ = mlx.mlx_vector_array_append_value(all_vec, bi);
+                    if (lw.ple_norm) |n| _ = mlx.mlx_vector_array_append_value(all_vec, n);
                 }
             }
 
@@ -641,6 +719,17 @@ pub const Transformer = struct {
             .one = bf16Scalar(1.0, s),
             .three = if (need_gelu) bf16Scalar(3.0, s) else null,
             .neg_one = if (need_silu) bf16Scalar(-1.0, s) else null,
+            .ple_emb_w = ple_emb_w,
+            .ple_emb_s = ple_emb_s,
+            .ple_emb_b = ple_emb_b,
+            .ple_proj_w = ple_proj_w_g,
+            .ple_proj_s = ple_proj_s_g,
+            .ple_proj_b = ple_proj_b_g,
+            .ple_proj_norm = ple_proj_norm,
+            .ple_proj_quantized = ple_proj_quantized,
+            .softcap_scalar = softcap_scalar,
+            .v_norm_weight = v_norm_weight,
+            .v_norm_weight_global = v_norm_weight_global,
             .bert_layers = null,
             .bert_pos_w = mlx.mlx_array_new(),
             .bert_pos_s = mlx.mlx_array_new(),
@@ -1184,14 +1273,145 @@ pub const Transformer = struct {
         return h; // [B, S, H] — hidden states for mean pooling
     }
 
-    // ── Standard forward pass (Gemma / Llama / Qwen3) ──
+    // ── Gemma 4: Per-Layer Embeddings (PLE) ──
+
+    /// Compute PLE input once before the layer loop.
+    /// Returns [B, S, num_layers, ple_dim] combining projected main embeddings + per-layer embeddings.
+    fn computePLEInput(self: *Transformer, token_ids: mlx.mlx_array, h: mlx.mlx_array, batch: c_int, seq_len: c_int) !mlx.mlx_array {
+        const cfg = &self.config;
+        const ple_dim: c_int = @intCast(cfg.hidden_size_per_layer_input);
+        const n_layers: c_int = @intCast(cfg.num_hidden_layers);
+        const total_ple = n_layers * ple_dim;
+
+        // 1. Per-layer embedding lookup: embed_tokens_per_layer[token_ids] -> [B*S, total_ple]
+        const id_shape = mlx.getShape(token_ids);
+        const flat_count = id_shape[0] * id_shape[1];
+        const flat_shape = [_]c_int{flat_count};
+        var flat_ids = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(flat_ids);
+        try mlx.check(mlx.mlx_reshape(&flat_ids, token_ids, &flat_shape, 1, self.s));
+
+        const ple_emb_raw = try self.dequantTake(self.ple_emb_w, self.ple_emb_s, self.ple_emb_b, flat_ids);
+        defer _ = mlx.mlx_array_free(ple_emb_raw);
+
+        // Reshape to [B, S, n_layers, ple_dim] and scale by sqrt(ple_dim)
+        const ple_4d_shape = [_]c_int{ batch, seq_len, n_layers, ple_dim };
+        var ple_emb = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(ple_emb);
+        try mlx.check(mlx.mlx_reshape(&ple_emb, ple_emb_raw, &ple_4d_shape, 4, self.s));
+
+        const emb_scale = bf16Scalar(@sqrt(@as(f32, @floatFromInt(cfg.hidden_size_per_layer_input))), self.s);
+        defer _ = mlx.mlx_array_free(emb_scale);
+        var ple_emb_scaled = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(ple_emb_scaled);
+        try mlx.check(mlx.mlx_multiply(&ple_emb_scaled, ple_emb, emb_scale, self.s));
+
+        // 2. Project main embeddings: h -> [B, S, total_ple]
+        const proj_raw = if (self.ple_proj_quantized)
+            try self.qmatmul(h, self.ple_proj_w, self.ple_proj_s, self.ple_proj_b)
+        else blk: {
+            // Unquantized: regular matmul with transposed weight
+            var wt = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(wt);
+            try mlx.check(mlx.mlx_transpose(&wt, self.ple_proj_w, self.s));
+            var result = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_matmul(&result, h, wt, self.s));
+            break :blk result;
+        };
+        defer _ = mlx.mlx_array_free(proj_raw);
+
+        // Scale by hidden_size^-0.5
+        const proj_scale = bf16Scalar(1.0 / @sqrt(@as(f32, @floatFromInt(cfg.hidden_size))), self.s);
+        defer _ = mlx.mlx_array_free(proj_scale);
+        var proj_scaled = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(proj_scaled);
+        try mlx.check(mlx.mlx_multiply(&proj_scaled, proj_raw, proj_scale, self.s));
+
+        // Reshape to [B, S, n_layers, ple_dim]
+        var proj_4d = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(proj_4d);
+        try mlx.check(mlx.mlx_reshape(&proj_4d, proj_scaled, &ple_4d_shape, 4, self.s));
+
+        // RMS norm on last dim (ple_dim)
+        var proj_normed = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(proj_normed);
+        try mlx.check(mlx.mlx_fast_rms_norm(&proj_normed, proj_4d, self.ple_proj_norm, cfg.rms_norm_eps, self.s));
+
+        // 3. Combine: (proj_normed + ple_emb_scaled) * (1/sqrt(2))
+        var combined = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(combined);
+        try mlx.check(mlx.mlx_add(&combined, proj_normed, ple_emb_scaled, self.s));
+
+        const inv_sqrt2 = bf16Scalar(1.0 / @sqrt(2.0), self.s);
+        defer _ = mlx.mlx_array_free(inv_sqrt2);
+        var result = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_multiply(&result, combined, inv_sqrt2, self.s));
+
+        _ = &total_ple;
+        return result; // [B, S, n_layers, ple_dim]
+    }
+
+    /// Apply PLE gating and projection for one layer, modifying h in-place.
+    fn applyPLE(self: *Transformer, h_in: mlx.mlx_array, lw: *const LayerWeights, ple_input: mlx.mlx_array, layer_idx: u32, batch: c_int, seq_len: c_int) !mlx.mlx_array {
+        const cfg = &self.config;
+        const ple_dim: c_int = @intCast(cfg.hidden_size_per_layer_input);
+
+        // Slice ple_input[:, :, layer_idx, :] -> [B, S, ple_dim]
+        const li_c: c_int = @intCast(layer_idx);
+        const slice_start = [_]c_int{ 0, 0, li_c, 0 };
+        const slice_stop = [_]c_int{ batch, seq_len, li_c + 1, ple_dim };
+        const slice_strides = [_]c_int{ 1, 1, 1, 1 };
+        var ple_slice = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(ple_slice);
+        try mlx.check(mlx.mlx_slice(&ple_slice, ple_input, &slice_start, 4, &slice_stop, 4, &slice_strides, 4, self.s));
+
+        // Reshape to [B, S, ple_dim]
+        const ple_3d_shape = [_]c_int{ batch, seq_len, ple_dim };
+        var ple_3d = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(ple_3d);
+        try mlx.check(mlx.mlx_reshape(&ple_3d, ple_slice, &ple_3d_shape, 3, self.s));
+
+        // gate = gelu(per_layer_input_gate(h))
+        const gate_raw = try self.qmatmul(h_in, lw.ple_gate_w.?, lw.ple_gate_s.?, lw.ple_gate_b.?);
+        defer _ = mlx.mlx_array_free(gate_raw);
+        const gate = try self.gelu(gate_raw);
+        defer _ = mlx.mlx_array_free(gate);
+
+        // gated = gate * ple_slice
+        var gated = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(gated);
+        try mlx.check(mlx.mlx_multiply(&gated, gate, ple_3d, self.s));
+
+        // projected = per_layer_projection(gated) -> [B, S, hidden_size]
+        const projected = try self.qmatmul(gated, lw.ple_proj_w.?, lw.ple_proj_s.?, lw.ple_proj_b.?);
+        defer _ = mlx.mlx_array_free(projected);
+
+        // normed = rms_norm(projected)
+        const normed = try self.rmsNorm(projected, lw.ple_norm.?);
+        defer _ = mlx.mlx_array_free(normed);
+
+        // h = h + normed
+        var result = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_add(&result, h_in, normed, self.s));
+        _ = mlx.mlx_array_free(h_in);
+        return result;
+    }
+
+    // ── Standard forward pass (Gemma / Llama / Qwen3 / Gemma4) ──
 
     fn forwardStandard(self: *Transformer, token_ids: mlx.mlx_array) !mlx.mlx_array {
         const offset = self.cache.seqLen(0);
-        const h_count = self.config.num_attention_heads;
-        const kv_h = self.config.num_key_value_heads;
-        const hd = self.config.head_dim;
-        const attn_scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(self.config.query_pre_attn_scalar)));
+        const cfg = &self.config;
+        const h_count = cfg.num_attention_heads;
+        const kv_h = cfg.num_key_value_heads;
+        const hd = cfg.head_dim;
+        const has_dual_hd = cfg.global_head_dim > 0 and cfg.global_head_dim != hd;
+        // Gemma 4: scale = 1.0 because QK-norm handles normalization
+        // Gemma 3 and others: 1/sqrt(query_pre_attn_scalar)
+        const attn_scale: f32 = if (std.mem.eql(u8, cfg.model_type, "gemma4"))
+            1.0
+        else
+            1.0 / @sqrt(@as(f32, @floatFromInt(cfg.query_pre_attn_scalar)));
 
         var h = try self.embedding(token_ids);
 
@@ -1200,11 +1420,19 @@ pub const Transformer = struct {
         const seq_len: c_int = x_shape[1];
         const is_prefill = seq_len > 1;
 
+        // Shapes for sliding-window layers (default)
         const q_shape = [_]c_int{ batch, seq_len, @intCast(h_count), @intCast(hd) };
         const kv_shape = [_]c_int{ batch, seq_len, @intCast(kv_h), @intCast(hd) };
+        const out_shape = [_]c_int{ batch, seq_len, @intCast(h_count * hd) };
+        // Shapes for global/full-attention layers (only if dual head dims)
+        const ghd: u32 = if (has_dual_hd) cfg.global_head_dim else hd;
+        const gkv_h: u32 = if (cfg.num_global_key_value_heads > 0) cfg.num_global_key_value_heads else kv_h;
+        const q_shape_g = [_]c_int{ batch, seq_len, @intCast(h_count), @intCast(ghd) };
+        const kv_shape_g = [_]c_int{ batch, seq_len, @intCast(gkv_h), @intCast(ghd) };
+        const out_shape_g = [_]c_int{ batch, seq_len, @intCast(h_count * ghd) };
+
         const perm = [_]c_int{ 0, 2, 1, 3 };
         const perm_back = [_]c_int{ 0, 2, 1, 3 };
-        const out_shape = [_]c_int{ batch, seq_len, @intCast(h_count * hd) };
 
         const none_mask = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(none_mask);
@@ -1215,8 +1443,8 @@ pub const Transformer = struct {
         var local_decode_mask = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(local_decode_mask);
 
-        if (self.config.has_sliding_window) {
-            const sw: c_int = @intCast(self.config.sliding_window);
+        if (cfg.has_sliding_window) {
+            const sw: c_int = @intCast(cfg.sliding_window);
             if (is_prefill) {
                 local_prefill_mask = try self.createSlidingWindowMask(seq_len, total_kv, sw);
             }
@@ -1226,102 +1454,169 @@ pub const Transformer = struct {
             }
         }
 
-        for (0..self.config.num_hidden_layers) |layer_idx| {
+        // Gemma 4 PLE: compute per-layer input embeddings once before the layer loop
+        var ple_input: ?mlx.mlx_array = null;
+        defer {
+            if (ple_input) |p| _ = mlx.mlx_array_free(p);
+        }
+        if (cfg.hidden_size_per_layer_input > 0) {
+            ple_input = try self.computePLEInput(token_ids, h, batch, seq_len);
+        }
+
+        for (0..cfg.num_hidden_layers) |layer_idx| {
             const li: u32 = @intCast(layer_idx);
             const lw = &self.layers[layer_idx];
-            const is_global = self.config.isGlobalLayer(li);
+            const is_global = cfg.isGlobalLayer(li);
+            const is_kv_shared = lw.kv_source != null;
 
             const normed = try self.rmsNorm(h, lw.input_norm);
             defer _ = mlx.mlx_array_free(normed);
 
+            // Pick shapes based on layer type
+            const cur_q_shape: *const [4]c_int = if (has_dual_hd and is_global) &q_shape_g else &q_shape;
+            const cur_kv_shape: *const [4]c_int = if (has_dual_hd and is_global) &kv_shape_g else &kv_shape;
+            const cur_out_shape: *const [3]c_int = if (has_dual_hd and is_global) &out_shape_g else &out_shape;
+            const cur_hd: u32 = if (has_dual_hd and is_global) ghd else hd;
+            // RoPE dims: for global layers with partial rotary, only rotate part of head_dim
+            const rope_dims: c_int = if (is_global and cfg.partial_rotary_factor_global < 1.0)
+                @intCast(@as(u32, @intFromFloat(@as(f32, @floatFromInt(cur_hd)) * cfg.partial_rotary_factor_global)))
+            else
+                @intCast(cur_hd);
+
+            // Q projection
             const q = try self.qmatmul(normed, lw.q_w, lw.q_s, lw.q_b);
             defer _ = mlx.mlx_array_free(q);
-            const k = try self.qmatmul(normed, lw.k_w, lw.k_s, lw.k_b);
-            defer _ = mlx.mlx_array_free(k);
-            const v = try self.qmatmul(normed, lw.v_w, lw.v_s, lw.v_b);
-            defer _ = mlx.mlx_array_free(v);
 
             var q_r = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(q_r);
-            var k_r = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(k_r);
-            var v_r = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(v_r);
-            try mlx.check(mlx.mlx_reshape(&q_r, q, &q_shape, 4, self.s));
-            try mlx.check(mlx.mlx_reshape(&k_r, k, &kv_shape, 4, self.s));
-            try mlx.check(mlx.mlx_reshape(&v_r, v, &kv_shape, 4, self.s));
+            try mlx.check(mlx.mlx_reshape(&q_r, q, cur_q_shape, 4, self.s));
 
+            // Q norm
             const q_normed: ?mlx.mlx_array = if (lw.q_norm) |qn| try self.rmsNorm(q_r, qn) else null;
             defer {
                 if (q_normed) |qn| _ = mlx.mlx_array_free(qn);
             }
-            const k_normed: ?mlx.mlx_array = if (lw.k_norm) |kn| try self.rmsNorm(k_r, kn) else null;
-            defer {
-                if (k_normed) |kn| _ = mlx.mlx_array_free(kn);
-            }
-
-            const q_for_rope = q_normed orelse q_r;
-            const k_for_rope = k_normed orelse k_r;
-
             var q_t = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(q_t);
-            var k_t = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(k_t);
-            var v_t = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(v_t);
-            try mlx.check(mlx.mlx_transpose_axes(&q_t, q_for_rope, &perm, 4, self.s));
-            try mlx.check(mlx.mlx_transpose_axes(&k_t, k_for_rope, &perm, 4, self.s));
-            try mlx.check(mlx.mlx_transpose_axes(&v_t, v_r, &perm, 4, self.s));
+            try mlx.check(mlx.mlx_transpose_axes(&q_t, q_normed orelse q_r, &perm, 4, self.s));
 
-            const rope_base: f32 = if (is_global) self.config.rope_theta else self.config.rope_local_base_freq;
-            const rope_scale: f32 = if (is_global) (1.0 / self.config.rope_scaling_factor) else 1.0;
-
+            // RoPE on Q
+            const rope_base: f32 = if (is_global) cfg.rope_theta else cfg.rope_local_base_freq;
+            const rope_scale: f32 = if (is_global) (1.0 / cfg.rope_scaling_factor) else 1.0;
             var q_rope = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(q_rope);
-            var k_rope = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(k_rope);
+            try mlx.check(mlx.mlx_fast_rope(&q_rope, q_t, rope_dims, false, mlx.mlx_optional_float.some(rope_base), rope_scale, @intCast(offset), .{ .ctx = null }, self.s));
 
-            try mlx.check(mlx.mlx_fast_rope(&q_rope, q_t, @intCast(hd), false, mlx.mlx_optional_float.some(rope_base), rope_scale, @intCast(offset), .{ .ctx = null }, self.s));
-            try mlx.check(mlx.mlx_fast_rope(&k_rope, k_t, @intCast(hd), false, mlx.mlx_optional_float.some(rope_base), rope_scale, @intCast(offset), .{ .ctx = null }, self.s));
+            // K, V and cache — either compute or read from shared source
+            var full_k: mlx.mlx_array = undefined;
+            var full_v: mlx.mlx_array = undefined;
+            // Temp arrays that need cleanup (only if we computed K,V ourselves)
+            var own_k = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(own_k);
+            var own_v = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(own_v);
+            var own_k_r = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(own_k_r);
+            var own_v_r = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(own_v_r);
+            var own_k_normed_arr = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(own_k_normed_arr);
+            var own_v_normed_arr = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(own_v_normed_arr);
+            var own_k_t = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(own_k_t);
+            var own_v_t = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(own_v_t);
+            var own_k_rope = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(own_k_rope);
 
-            const max_kv: u32 = if (is_global) 0 else if (self.config.has_sliding_window) self.config.sliding_window else 0;
-            const kv = try self.cache.update(li, k_rope, v_t, self.s, max_kv);
-            const full_k = kv[0];
-            const full_v = kv[1];
+            if (is_kv_shared) {
+                // KV sharing: read from source layer's cache
+                const src = lw.kv_source.?;
+                const entry = &self.cache.entries[src];
+                full_k = entry.key_view;
+                full_v = entry.value_view;
+            } else {
+                // Compute K, V
+                own_k = try self.qmatmul(normed, lw.k_w, lw.k_s, lw.k_b);
+                own_v = try self.qmatmul(normed, lw.v_w, lw.v_s, lw.v_b);
 
+                try mlx.check(mlx.mlx_reshape(&own_k_r, own_k, cur_kv_shape, 4, self.s));
+                try mlx.check(mlx.mlx_reshape(&own_v_r, own_v, cur_kv_shape, 4, self.s));
+
+                // K norm
+                if (lw.k_norm) |kn| {
+                    own_k_normed_arr = try self.rmsNorm(own_k_r, kn);
+                }
+                const k_for_rope = if (lw.k_norm != null) own_k_normed_arr else own_k_r;
+
+                // V norm (Gemma 4: parameter-free RMS norm on values)
+                if (cfg.has_v_norm) {
+                    const vnw = if (has_dual_hd and is_global)
+                        (self.v_norm_weight_global orelse self.v_norm_weight.?)
+                    else
+                        self.v_norm_weight.?;
+                    own_v_normed_arr = try self.rmsNorm(own_v_r, vnw);
+                }
+                const v_after_norm = if (cfg.has_v_norm) own_v_normed_arr else own_v_r;
+
+                try mlx.check(mlx.mlx_transpose_axes(&own_k_t, k_for_rope, &perm, 4, self.s));
+                try mlx.check(mlx.mlx_transpose_axes(&own_v_t, v_after_norm, &perm, 4, self.s));
+
+                // RoPE on K
+                try mlx.check(mlx.mlx_fast_rope(&own_k_rope, own_k_t, rope_dims, false, mlx.mlx_optional_float.some(rope_base), rope_scale, @intCast(offset), .{ .ctx = null }, self.s));
+
+                // Update KV cache
+                const max_kv: u32 = if (is_global) 0 else if (cfg.has_sliding_window) cfg.sliding_window else 0;
+                const kv = try self.cache.update(li, own_k_rope, own_v_t, self.s, max_kv);
+                full_k = kv[0];
+                full_v = kv[1];
+            }
+
+            // Scaled dot-product attention
             var attn_out = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(attn_out);
 
-            if (!self.config.has_sliding_window) {
+            if (!cfg.has_sliding_window) {
                 if (is_prefill) {
                     try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "causal", none_mask, .{ .ctx = null }, self.s));
                 } else {
                     try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "", none_mask, .{ .ctx = null }, self.s));
                 }
             } else {
-                const sw: c_int = @intCast(self.config.sliding_window);
+                const sw: c_int = @intCast(cfg.sliding_window);
                 if (is_prefill and is_global) {
                     try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "causal", none_mask, .{ .ctx = null }, self.s));
                 } else if (is_prefill) {
                     try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "array", local_prefill_mask, .{ .ctx = null }, self.s));
-                } else if (is_global or @as(c_int, @intCast(self.cache.seqLen(li))) <= sw) {
+                } else if (is_global) {
+                    // Global layers: full attention, no mask
+                    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "", none_mask, .{ .ctx = null }, self.s));
+                } else if (blk: {
+                    // Check if within sliding window (use source layer's cache for shared layers)
+                    const check_layer = if (is_kv_shared) lw.kv_source.? else li;
+                    break :blk @as(c_int, @intCast(self.cache.seqLen(check_layer))) <= sw;
+                }) {
+                    // Within window: no mask needed
                     try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "", none_mask, .{ .ctx = null }, self.s));
                 } else {
                     try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "array", local_decode_mask, .{ .ctx = null }, self.s));
                 }
             }
 
+            // Reshape attention output
             var attn_t = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(attn_t);
             try mlx.check(mlx.mlx_transpose_axes(&attn_t, attn_out, &perm_back, 4, self.s));
             var attn_flat = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(attn_flat);
-            try mlx.check(mlx.mlx_reshape(&attn_flat, attn_t, &out_shape, 3, self.s));
+            try mlx.check(mlx.mlx_reshape(&attn_flat, attn_t, cur_out_shape, 3, self.s));
 
             const o_out = try self.qmatmul(attn_flat, lw.o_w, lw.o_s, lw.o_b);
             defer _ = mlx.mlx_array_free(o_out);
 
-            if (self.config.has_pre_ff_norm) {
+            // MLP with pre/post FF norms (Gemma 3/4 style) or simple residual (Llama style)
+            if (cfg.has_pre_ff_norm) {
                 const attn_normed = try self.rmsNorm(o_out, lw.post_attn_norm);
                 defer _ = mlx.mlx_array_free(attn_normed);
                 var h_new = mlx.mlx_array_new();
@@ -1377,6 +1672,19 @@ pub const Transformer = struct {
                 h = h_next;
             }
 
+            // Gemma 4 PLE: apply per-layer embedding gate + projection (AFTER attention+MLP)
+            if (ple_input != null and lw.ple_gate_w != null) {
+                h = try self.applyPLE(h, lw, ple_input.?, li, batch, seq_len);
+            }
+
+            // Gemma 4: layer_scalar
+            if (lw.layer_scalar) |ls| {
+                var h_scaled = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_multiply(&h_scaled, h, ls, self.s));
+                _ = mlx.mlx_array_free(h);
+                h = h_scaled;
+            }
+
             if (is_prefill and (layer_idx + 1) % EVAL_EVERY_N_LAYERS == 0) {
                 try mlx.check(mlx.mlx_array_eval(h));
             }
@@ -1385,8 +1693,23 @@ pub const Transformer = struct {
         const final_normed = try self.rmsNorm(h, self.final_norm);
         _ = mlx.mlx_array_free(h);
         if (self.embedding_mode) return final_normed;
-        const logits = try self.qmatmul(final_normed, self.lm_head_w, self.lm_head_s, self.lm_head_b);
+        var logits = try self.qmatmul(final_normed, self.lm_head_w, self.lm_head_s, self.lm_head_b);
         _ = mlx.mlx_array_free(final_normed);
+
+        // Gemma 4: logit softcapping — tanh(logits / cap) * cap
+        if (self.softcap_scalar) |cap| {
+            var scaled = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_divide(&scaled, logits, cap, self.s));
+            _ = mlx.mlx_array_free(logits);
+            var tanh_val = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_tanh(&tanh_val, scaled, self.s));
+            _ = mlx.mlx_array_free(scaled);
+            var capped = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_multiply(&capped, tanh_val, cap, self.s));
+            _ = mlx.mlx_array_free(tanh_val);
+            logits = capped;
+        }
+
         return logits;
     }
 
@@ -2308,6 +2631,23 @@ fn initStandardLayers(allocator: std.mem.Allocator, config: ModelConfig, weights
         lw.down_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.down_proj.weight");
         lw.down_s = getLayerWeight(weights, name_buf, prefix, li, "mlp.down_proj.scales");
         lw.down_b = getLayerWeight(weights, name_buf, prefix, li, "mlp.down_proj.biases");
+
+        // Gemma 4: per-layer scalar
+        lw.layer_scalar = getLayerWeightOpt(weights, name_buf, prefix, li, "layer_scalar");
+
+        // Gemma 4: PLE per-layer weights
+        if (config.hidden_size_per_layer_input > 0) {
+            lw.ple_gate_w = getLayerWeightOpt(weights, name_buf, prefix, li, "per_layer_input_gate.weight");
+            lw.ple_gate_s = getLayerWeightOpt(weights, name_buf, prefix, li, "per_layer_input_gate.scales");
+            lw.ple_gate_b = getLayerWeightOpt(weights, name_buf, prefix, li, "per_layer_input_gate.biases");
+            lw.ple_proj_w = getLayerWeightOpt(weights, name_buf, prefix, li, "per_layer_projection.weight");
+            lw.ple_proj_s = getLayerWeightOpt(weights, name_buf, prefix, li, "per_layer_projection.scales");
+            lw.ple_proj_b = getLayerWeightOpt(weights, name_buf, prefix, li, "per_layer_projection.biases");
+            lw.ple_norm = getLayerWeightOpt(weights, name_buf, prefix, li, "post_per_layer_input_norm.weight");
+        }
+
+        // Gemma 4: KV sharing source layer
+        lw.kv_source = config.getKVSourceLayer(li);
     }
     return layers;
 }
@@ -2700,6 +3040,17 @@ fn initBert(allocator: std.mem.Allocator, config: ModelConfig, weights: *const W
         .one = bf16Scalar(1.0, s),
         .three = bf16Scalar(3.0, s),
         .neg_one = null,
+        .ple_emb_w = mlx.mlx_array_new(),
+        .ple_emb_s = mlx.mlx_array_new(),
+        .ple_emb_b = mlx.mlx_array_new(),
+        .ple_proj_w = mlx.mlx_array_new(),
+        .ple_proj_s = mlx.mlx_array_new(),
+        .ple_proj_b = mlx.mlx_array_new(),
+        .ple_proj_norm = mlx.mlx_array_new(),
+        .ple_proj_quantized = false,
+        .softcap_scalar = null,
+        .v_norm_weight = null,
+        .v_norm_weight_global = null,
         .bert_layers = bert_layers,
         .bert_pos_w = pos_w,
         .bert_pos_s = pos_s,
