@@ -158,7 +158,6 @@ jobs:
           for fw in "$CONTENTS/Frameworks/"*.metallib "$CONTENTS/Frameworks/"*.dylib; do
             [ -f "$fw" ] && codesign --force --options runtime --sign "$SIGNING_IDENTITY" "$fw"
           done
-          codesign --force --options runtime --sign "$SIGNING_IDENTITY" "$APP/MLXClaw_MLXClaw.bundle"
           codesign --force --options runtime --sign "$SIGNING_IDENTITY" "$CONTENTS/MacOS/mlx-serve"
           codesign --force --options runtime --sign "$SIGNING_IDENTITY" "$CONTENTS/MacOS/MLXClaw"
           codesign --force --options runtime --sign "$SIGNING_IDENTITY" "$APP"
