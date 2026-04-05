@@ -1613,8 +1613,27 @@ fn handleStreamingGeneration(
         }
 
         if (has_tools) {
-            // Buffer tokens — we'll emit them after generation if no tool calls found
+            // Stream tokens until we detect a tool call pattern starting, then buffer.
+            // Tool call prefixes: <tool_call>, <|tool_call>, {"name":
             try token_texts.append(allocator, token_text);
+            // text_buf already updated above
+
+            const buf = text_buf.items;
+            const maybe_tool = std.mem.indexOf(u8, buf, "<tool_call") != null or
+                std.mem.indexOf(u8, buf, "<|tool_call") != null or
+                (buf.len > 0 and buf[0] == '{' and std.mem.indexOf(u8, buf, "\"name\"") != null) or
+                // Partial prefix at the end that could become a tool call tag
+                (buf.len >= 1 and buf[buf.len - 1] == '<');
+
+            if (!maybe_tool) {
+                // No tool call pattern — flush all buffered tokens as streamed content
+                for (token_texts.items) |tt| {
+                    defer allocator.free(tt);
+                    try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = tt }, null, null);
+                }
+                token_texts.clearRetainingCapacity();
+            }
+            // Otherwise keep buffering — tool call may be in progress
         } else if (enable_thinking and in_think_block) {
             // Inside <think> block — stream as reasoning_content with </think> detection
             defer allocator.free(token_text);
@@ -1962,8 +1981,7 @@ fn reuseKVCache(allocator: std.mem.Allocator, xfm: *Transformer, prompt_ids: []c
                     allocator.free(old);
                     cached_prompt_ids = null;
                 }
-                xfm.cache.deinit();
-                xfm.cache = try transformer_mod.KVCache.init(xfm.cache.allocator, xfm.config.num_hidden_layers);
+                try xfm.resetCache();
                 return .{ .new_tokens = prompt_ids, .cached_tokens = 0 };
             }
         }
@@ -1971,6 +1989,7 @@ fn reuseKVCache(allocator: std.mem.Allocator, xfm: *Transformer, prompt_ids: []c
         if (shared > 0) {
             // Truncate KV cache to the shared prefix
             try xfm.cache.truncate(shared, xfm.s);
+            xfm.moe_seq_offset = shared;
             log.debug("  [cache] reusing {d}/{d} tokens from previous prompt\n", .{ shared, prompt_ids.len });
             return .{
                 .new_tokens = prompt_ids[shared..],
@@ -1983,8 +2002,7 @@ fn reuseKVCache(allocator: std.mem.Allocator, xfm: *Transformer, prompt_ids: []c
     if (cached_prompt_ids != null) {
         log.info("  [cache] reset — no shared prefix\n", .{});
     }
-    xfm.cache.deinit();
-    xfm.cache = try transformer_mod.KVCache.init(xfm.cache.allocator, xfm.config.num_hidden_layers);
+    try xfm.resetCache();
     return .{ .new_tokens = prompt_ids, .cached_tokens = 0 };
 }
 

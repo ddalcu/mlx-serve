@@ -23,6 +23,8 @@ pub const ModelConfig = struct {
     rope_theta: f32 = 1000000.0,
     rope_local_base_freq: f32 = 10000.0,
     rope_scaling_factor: f32 = 1.0,
+    rope_proportional: bool = false, // Gemma 4: full attention uses proportional RoPE
+    rope_proportional_factor: f32 = 1.0,
 
     // Sliding window attention
     has_sliding_window: bool = true,
@@ -190,11 +192,12 @@ pub fn parseConfig(allocator: std.mem.Allocator, model_dir: []const u8) !ModelCo
     if (cfg_obj.get("rope_theta")) |v| config.rope_theta = jsonFloat(v);
     if (cfg_obj.get("query_pre_attn_scalar")) |v| config.query_pre_attn_scalar = @intCast(v.integer);
 
-    // MoE fields
-    if (cfg_obj.get("num_experts")) |v| config.num_experts = @intCast(v.integer);
-    if (cfg_obj.get("num_experts_per_tok")) |v| config.num_experts_per_tok = @intCast(v.integer);
-    if (cfg_obj.get("moe_intermediate_size")) |v| config.moe_intermediate_size = @intCast(v.integer);
-    if (cfg_obj.get("shared_expert_intermediate_size")) |v| config.shared_expert_intermediate_size = @intCast(v.integer);
+    // MoE fields (guard against JSON null values)
+    if (cfg_obj.get("num_experts")) |v| { if (v == .integer) config.num_experts = @intCast(v.integer); }
+    if (cfg_obj.get("num_experts_per_tok")) |v| { if (v == .integer) config.num_experts_per_tok = @intCast(v.integer); }
+    if (cfg_obj.get("top_k_experts")) |v| { if (v == .integer) config.num_experts_per_tok = @intCast(v.integer); }
+    if (cfg_obj.get("moe_intermediate_size")) |v| { if (v == .integer) config.moe_intermediate_size = @intCast(v.integer); }
+    if (cfg_obj.get("shared_expert_intermediate_size")) |v| { if (v == .integer) config.shared_expert_intermediate_size = @intCast(v.integer); }
 
     // Linear attention (GatedDeltaNet) fields
     if (cfg_obj.get("linear_num_key_heads")) |v| config.linear_num_key_heads = @intCast(v.integer);
@@ -274,6 +277,12 @@ pub fn parseConfig(allocator: std.mem.Allocator, model_dir: []const u8) !ModelCo
                 if (fa == .object) {
                     if (fa.object.get("rope_theta")) |v| config.rope_theta = jsonFloat(v);
                     if (fa.object.get("partial_rotary_factor")) |v| config.partial_rotary_factor_global = jsonFloat(v);
+                    if (fa.object.get("rope_type")) |v| {
+                        if (v == .string and std.mem.eql(u8, v.string, "proportional")) {
+                            config.rope_proportional = true;
+                            if (fa.object.get("factor")) |fv| config.rope_proportional_factor = jsonFloat(fv);
+                        }
+                    }
                 }
             }
             if (rp_val.object.get("sliding_attention")) |sa| {

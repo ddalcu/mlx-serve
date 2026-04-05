@@ -379,6 +379,8 @@ struct ChatDetailView: View {
             } catch is CancellationError {
                 // Stopped by user
             } catch {
+                print("[ChatView] Chat error: \(error)")
+                try? "Chat error: \(error)\n".write(toFile: NSString(string: "~/.mlx-serve/debug.log").expandingTildeInPath, atomically: true, encoding: .utf8)
                 appState.updateLastMessage(in: sessionId, content: "\n\n[Error: \(error.localizedDescription)]")
             }
             appState.updateLastMessage(in: sessionId, streaming: false)
@@ -408,6 +410,8 @@ struct ChatDetailView: View {
             } catch is CancellationError {
                 // Stopped by user
             } catch {
+                print("[ChatView] Agent error: \(error)")
+                try? "Agent error: \(error)\n".write(toFile: NSString(string: "~/.mlx-serve/debug.log").expandingTildeInPath, atomically: true, encoding: .utf8)
                 var errorMsg = ChatMessage(role: .assistant, content: "[Error: \(error.localizedDescription)]")
                 errorMsg.isStreaming = false
                 appState.appendMessage(to: sessionId, message: errorMsg)
@@ -464,6 +468,7 @@ struct ChatDetailView: View {
                 messages: messages,
                 maxTokens: appState.maxTokens,
                 temperature: 0.7,
+                enableThinking: enableThinking,
                 tools: AgentPrompt.toolDefinitions
             )
             for try await event in stream {

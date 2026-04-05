@@ -41,6 +41,9 @@ pub fn build(b: *std.Build) void {
     exe.linkFramework("IOKit");
     exe.linkFramework("CoreFoundation");
 
+    // Ensure Mach-O header has room for install_name_tool path changes (app bundling)
+    exe.headerpad_max_install_names = true;
+
     b.installArtifact(exe);
 
     const run_cmd = b.addRunArtifact(exe);

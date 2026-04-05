@@ -80,9 +80,17 @@ if [ -f "$ICON_DIR/AppIcon.icns" ]; then
     cp "$ICON_DIR/AppIcon.icns" "$CONTENTS/Resources/"
 fi
 
-# Bundle dylibs (find them from Homebrew)
-MLXC_LIB=$(brew --prefix mlx-c 2>/dev/null || echo "/opt/homebrew/opt/mlx-c")/lib
-MLX_LIB=$(brew --prefix mlx 2>/dev/null || echo "/opt/homebrew/opt/mlx")/lib
+# Bundle dylibs (prefer /opt/homebrew/lib for source-built versions, then Homebrew Cellar)
+if [ -f "/opt/homebrew/lib/libmlxc.dylib" ]; then
+    MLXC_LIB="/opt/homebrew/lib"
+else
+    MLXC_LIB=$(brew --prefix mlx-c 2>/dev/null || echo "/opt/homebrew/opt/mlx-c")/lib
+fi
+if [ -f "/opt/homebrew/lib/libmlx.dylib" ]; then
+    MLX_LIB="/opt/homebrew/lib"
+else
+    MLX_LIB=$(brew --prefix mlx 2>/dev/null || echo "/opt/homebrew/opt/mlx")/lib
+fi
 
 for lib in libmlxc.dylib; do
     if [ -f "$MLXC_LIB/$lib" ]; then

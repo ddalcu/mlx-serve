@@ -436,9 +436,13 @@ const MoeMlpWeights = struct {
     shared_down_w: mlx.mlx_array,
     shared_down_s: mlx.mlx_array,
     shared_down_b: mlx.mlx_array,
-    shared_expert_gate_w: mlx.mlx_array,
-    shared_expert_gate_s: mlx.mlx_array,
-    shared_expert_gate_b: mlx.mlx_array,
+    // Shared expert gating (Qwen3.5; null for Gemma 4)
+    shared_expert_gate_w: ?mlx.mlx_array = null,
+    shared_expert_gate_s: ?mlx.mlx_array = null,
+    shared_expert_gate_b: ?mlx.mlx_array = null,
+    // Sigma-MoE routing (Gemma 4; null for Qwen3.5)
+    router_scale: ?mlx.mlx_array = null,
+    per_expert_scale: ?mlx.mlx_array = null,
 };
 
 const HybridMlpWeights = union(enum) {
@@ -452,6 +456,15 @@ const MoeLayerWeights = struct {
     is_linear: bool,
     attn: union(enum) { full: FullAttnWeights, linear: LinearAttnWeights },
     mlp: HybridMlpWeights,
+    // Gemma 4 MoE: separate shared expert MLP (null for Qwen3.5)
+    shared_mlp: ?DenseMlpWeights = null,
+    // Gemma 4 feedforward norms (null for Qwen3.5)
+    pre_ff_norm: ?mlx.mlx_array = null,
+    post_ff_norm: ?mlx.mlx_array = null,
+    pre_ff_norm_2: ?mlx.mlx_array = null,
+    post_ff_norm_1: ?mlx.mlx_array = null,
+    post_ff_norm_2: ?mlx.mlx_array = null,
+    layer_scalar: ?mlx.mlx_array = null,
 };
 
 // ── Transformer ──
@@ -496,6 +509,9 @@ pub const Transformer = struct {
     softcap_scalar: ?mlx.mlx_array,
     v_norm_weight: ?mlx.mlx_array, // ones(head_dim) for param-free RMS norm
     v_norm_weight_global: ?mlx.mlx_array, // ones(global_head_dim)
+
+    // Proportional RoPE frequencies for global/full attention layers (Gemma 4)
+    rope_freqs_global: ?mlx.mlx_array,
 
     // BERT encoder-only (null for decoder models)
     bert_layers: ?[]BertLayerWeights,
@@ -633,6 +649,65 @@ pub const Transformer = struct {
             }
         }
 
+        // Gemma 4: proportional RoPE frequencies for global/full attention layers
+        // freqs = factor * base^(arange(0, rotated_dims, 2) / full_dims)
+        // padded with inf for non-rotated dimensions
+        var rope_freqs_global: ?mlx.mlx_array = null;
+        if (config.rope_proportional) {
+            const ghd: u32 = if (config.global_head_dim > 0) config.global_head_dim else config.head_dim;
+            const rotated_dims: u32 = @intFromFloat(@as(f32, @floatFromInt(ghd)) * config.partial_rotary_factor_global);
+            const n_rotated: u32 = rotated_dims / 2;
+            const n_pad: u32 = (ghd - rotated_dims) / 2;
+            const total: u32 = n_rotated + n_pad;
+
+            const freq_shape = [_]c_int{@intCast(total)};
+            var freqs_arr = mlx.mlx_array_new();
+
+            // Compute rotated part: factor * base^(arange(0, rotated_dims, 2) / ghd)
+            var arange_arr = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(arange_arr);
+            try mlx.check(mlx.mlx_arange(&arange_arr, 0, @floatFromInt(rotated_dims), 2, .float32, s));
+
+            const ghd_scalar = mlx.mlx_array_new_float(@floatFromInt(ghd));
+            defer _ = mlx.mlx_array_free(ghd_scalar);
+            var exponents = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(exponents);
+            try mlx.check(mlx.mlx_divide(&exponents, arange_arr, ghd_scalar, s));
+
+            const base_scalar = mlx.mlx_array_new_float(config.rope_theta);
+            defer _ = mlx.mlx_array_free(base_scalar);
+            var base_pow = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(base_pow);
+            try mlx.check(mlx.mlx_power(&base_pow, base_scalar, exponents, s));
+
+            if (config.rope_proportional_factor != 1.0) {
+                const factor_scalar = mlx.mlx_array_new_float(config.rope_proportional_factor);
+                defer _ = mlx.mlx_array_free(factor_scalar);
+                var scaled = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_multiply(&scaled, base_pow, factor_scalar, s));
+                _ = mlx.mlx_array_free(base_pow);
+                base_pow = scaled;
+            }
+
+            if (n_pad > 0) {
+                // Pad with inf for non-rotated dims
+                const pad_shape = [_]c_int{@intCast(n_pad)};
+                const inf_val = mlx.mlx_array_new_float(std.math.inf(f32));
+                defer _ = mlx.mlx_array_free(inf_val);
+                var inf_arr = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(inf_arr);
+                try mlx.check(mlx.mlx_full(&inf_arr, &pad_shape, 1, inf_val, .float32, s));
+                const vec = mlx.mlx_vector_array_new();
+                defer _ = mlx.mlx_vector_array_free(vec);
+                _ = mlx.mlx_vector_array_append_value(vec, base_pow);
+                _ = mlx.mlx_vector_array_append_value(vec, inf_arr);
+                try mlx.check(mlx.mlx_concatenate_axis(&freqs_arr, vec, 0, s));
+            } else {
+                try mlx.check(mlx.mlx_reshape(&freqs_arr, base_pow, &freq_shape, 1, s));
+            }
+            rope_freqs_global = freqs_arr;
+        }
+
         // Batch eval all weights
         {
             var eval_timer = std.time.Timer.start() catch unreachable;
@@ -650,7 +725,18 @@ pub const Transformer = struct {
                 for (ml) |lw| {
                     _ = mlx.mlx_vector_array_append_value(all_vec, lw.input_norm);
                     _ = mlx.mlx_vector_array_append_value(all_vec, lw.post_attn_norm);
+                    if (lw.pre_ff_norm) |n| _ = mlx.mlx_vector_array_append_value(all_vec, n);
+                    if (lw.post_ff_norm) |n| _ = mlx.mlx_vector_array_append_value(all_vec, n);
+                    if (lw.pre_ff_norm_2) |n| _ = mlx.mlx_vector_array_append_value(all_vec, n);
+                    if (lw.post_ff_norm_1) |n| _ = mlx.mlx_vector_array_append_value(all_vec, n);
+                    if (lw.post_ff_norm_2) |n| _ = mlx.mlx_vector_array_append_value(all_vec, n);
+                    if (lw.layer_scalar) |n| _ = mlx.mlx_vector_array_append_value(all_vec, n);
                     appendHybridMlpWeights(all_vec, &lw.mlp);
+                    if (lw.shared_mlp) |smlp| {
+                        inline for (std.meta.fields(DenseMlpWeights)) |field| {
+                            _ = mlx.mlx_vector_array_append_value(all_vec, @field(smlp, field.name));
+                        }
+                    }
                     switch (lw.attn) {
                         .full => |fa| appendFullAttnWeights(all_vec, &fa),
                         .linear => |la| appendLinearAttnWeights(all_vec, &la),
@@ -734,6 +820,7 @@ pub const Transformer = struct {
             .softcap_scalar = softcap_scalar,
             .v_norm_weight = v_norm_weight,
             .v_norm_weight_global = v_norm_weight_global,
+            .rope_freqs_global = rope_freqs_global,
             .bert_layers = null,
             .bert_pos_w = mlx.mlx_array_new(),
             .bert_pos_s = mlx.mlx_array_new(),
@@ -967,7 +1054,8 @@ pub const Transformer = struct {
     // ── Core ops ──
 
     inline fn qmatmul(self: *const Transformer, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array) !mlx.mlx_array {
-        return qmatmulBits(x, w, sc, bi, self.config.quant_bits, self.config.quant_group_size, self.s);
+        const bits = detectQuantBits(w, sc, self.config.quant_group_size);
+        return qmatmulBits(x, w, sc, bi, bits, self.config.quant_group_size, self.s);
     }
 
     inline fn rmsNorm(self: *const Transformer, x: mlx.mlx_array, w: mlx.mlx_array) !mlx.mlx_array {
@@ -1508,12 +1596,19 @@ pub const Transformer = struct {
             defer _ = mlx.mlx_array_free(q_t);
             try mlx.check(mlx.mlx_transpose_axes(&q_t, q_normed orelse q_r, &perm, 4, self.s));
 
-            // RoPE on Q
-            const rope_base: f32 = if (is_global) cfg.rope_theta else cfg.rope_local_base_freq;
-            const rope_scale: f32 = if (is_global) (1.0 / cfg.rope_scaling_factor) else 1.0;
+            // RoPE on Q (proportional for global layers when available)
+            const use_prop_rope = is_global and self.rope_freqs_global != null;
+            const rope_base_opt = mlx.mlx_optional_float{
+                .value = if (is_global) cfg.rope_theta else cfg.rope_local_base_freq,
+                .has_value = !use_prop_rope,
+            };
+            const rope_scale: f32 = if (use_prop_rope) 1.0 else if (is_global) (1.0 / cfg.rope_scaling_factor) else 1.0;
+            const rope_freqs: mlx.mlx_array = if (use_prop_rope) self.rope_freqs_global.? else .{ .ctx = null };
+            // When using proportional RoPE, pass full head_dim (freqs handle partial rotation via inf padding)
+            const effective_rope_dims: c_int = if (use_prop_rope) @intCast(cur_hd) else rope_dims;
             var q_rope = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(q_rope);
-            try mlx.check(mlx.mlx_fast_rope(&q_rope, q_t, rope_dims, false, mlx.mlx_optional_float.some(rope_base), rope_scale, @intCast(offset), .{ .ctx = null }, self.s));
+            try mlx.check(mlx.mlx_fast_rope(&q_rope, q_t, effective_rope_dims, false, rope_base_opt, rope_scale, @intCast(offset), rope_freqs, self.s));
 
             // K, V and cache — either compute or read from shared source
             var full_k: mlx.mlx_array = undefined;
@@ -1572,7 +1667,7 @@ pub const Transformer = struct {
                 try mlx.check(mlx.mlx_transpose_axes(&own_v_t, v_after_norm, &perm, 4, self.s));
 
                 // RoPE on K
-                try mlx.check(mlx.mlx_fast_rope(&own_k_rope, own_k_t, rope_dims, false, mlx.mlx_optional_float.some(rope_base), rope_scale, @intCast(offset), .{ .ctx = null }, self.s));
+                try mlx.check(mlx.mlx_fast_rope(&own_k_rope, own_k_t, effective_rope_dims, false, rope_base_opt, rope_scale, @intCast(offset), rope_freqs, self.s));
 
                 // Update KV cache
                 const max_kv: u32 = if (is_global) 0 else if (cfg.has_sliding_window) cfg.sliding_window else 0;
@@ -1721,12 +1816,13 @@ pub const Transformer = struct {
         return logits;
     }
 
-    // ── MoE forward pass (Qwen3.5) ──
+    // ── MoE forward pass (Qwen3.5 + Gemma 4) ──
 
     fn forwardMoe(self: *Transformer, token_ids: mlx.mlx_array) !mlx.mlx_array {
         const ml = self.moe_layers.?;
         const offset = self.moe_seq_offset;
         const cfg = &self.config;
+        const is_gemma4 = std.mem.eql(u8, cfg.model_type, "gemma4");
 
         var h = try self.embedding(token_ids);
 
@@ -1734,6 +1830,24 @@ pub const Transformer = struct {
         const batch: c_int = x_shape[0];
         const seq_len: c_int = x_shape[1];
         const is_prefill = seq_len > 1;
+
+        // Precompute sliding window masks (Gemma 4)
+        var local_prefill_mask = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(local_prefill_mask);
+        var local_decode_mask = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(local_decode_mask);
+
+        if (is_gemma4 and cfg.has_sliding_window) {
+            const sw: c_int = @intCast(cfg.sliding_window);
+            const total_kv: c_int = @as(c_int, @intCast(offset)) + seq_len;
+            const local_kv_len: c_int = @min(total_kv, sw);
+            if (is_prefill) {
+                local_prefill_mask = try self.createSlidingWindowMask(seq_len, local_kv_len, sw);
+            }
+            if (!is_prefill and total_kv > sw) {
+                local_decode_mask = try self.createSlidingWindowDecodeMask(local_kv_len, sw);
+            }
+        }
 
         for (0..cfg.num_hidden_layers) |layer_idx| {
             const li: u32 = @intCast(layer_idx);
@@ -1745,30 +1859,94 @@ pub const Transformer = struct {
             // Attention: linear (GatedDeltaNet) or full
             const attn_out = switch (lw.attn) {
                 .linear => |la| try self.gatedDeltaNet(normed, &la, &self.ssm_entries.?[layer_idx], batch, seq_len),
-                .full => |fa| try self.gatedFullAttn(normed, &fa, li, @intCast(offset), batch, seq_len, is_prefill),
+                .full => |fa| if (is_gemma4)
+                    try self.gemma4MoeAttn(normed, &fa, li, @intCast(offset), batch, seq_len, is_prefill, local_prefill_mask, local_decode_mask)
+                else
+                    try self.gatedFullAttn(normed, &fa, li, @intCast(offset), batch, seq_len, is_prefill),
             };
             defer _ = mlx.mlx_array_free(attn_out);
 
-            // h = h + attn_out
-            var h_new = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_add(&h_new, h, attn_out, self.s));
-            _ = mlx.mlx_array_free(h);
-            h = h_new;
+            if (is_gemma4) {
+                // Gemma 4 layer structure (from HF reference):
+                //   h = residual + post_attn_norm(attn(input_norm(residual)))
+                //   residual = h
+                //   shared = post_ff_norm_1(mlp(pre_ff_norm(h)))
+                //   experts = post_ff_norm_2(moe(pre_ff_norm_2(residual)))
+                //   h = residual + post_ff_norm(shared + experts)
+                //   h *= layer_scalar
 
-            // MLP (MoE or dense)
-            const ff_normed = try self.rmsNorm(h, lw.post_attn_norm);
-            defer _ = mlx.mlx_array_free(ff_normed);
-            const mlp_out = switch (lw.mlp) {
-                .moe => |*mw| try self.moeMLP(ff_normed, mw),
-                .dense => |*dw| try self.denseMLP(ff_normed, dw),
-            };
-            defer _ = mlx.mlx_array_free(mlp_out);
+                // Attention residual
+                const attn_normed = try self.rmsNorm(attn_out, lw.post_attn_norm);
+                defer _ = mlx.mlx_array_free(attn_normed);
+                var h_new = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_add(&h_new, h, attn_normed, self.s));
+                _ = mlx.mlx_array_free(h);
+                h = h_new;
+                // h is now the residual for the feedforward block
 
-            // h = h + mlp_out
-            var h_next = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_add(&h_next, h, mlp_out, self.s));
-            _ = mlx.mlx_array_free(h);
-            h = h_next;
+                // Shared expert: pre_ff_norm → mlp → post_ff_norm_1
+                const shared_in = try self.rmsNorm(h, lw.pre_ff_norm.?);
+                defer _ = mlx.mlx_array_free(shared_in);
+                const shared_out = if (lw.shared_mlp) |smlp|
+                    try self.denseMLP(shared_in, &smlp)
+                else
+                    try self.denseMLP(shared_in, &(switch (lw.mlp) {
+                        .dense => |dw| dw,
+                        .moe => unreachable,
+                    }));
+                defer _ = mlx.mlx_array_free(shared_out);
+                const shared_normed = try self.rmsNorm(shared_out, lw.post_ff_norm_1.?);
+                defer _ = mlx.mlx_array_free(shared_normed);
+
+                // Routed experts: router gets raw residual, experts get pre_ff_norm_2(residual)
+                const expert_in = try self.rmsNorm(h, lw.pre_ff_norm_2.?);
+                defer _ = mlx.mlx_array_free(expert_in);
+                const expert_out = switch (lw.mlp) {
+                    .moe => |*mw| try self.moeMLP2(h, expert_in, mw),
+                    .dense => |*dw| try self.denseMLP(expert_in, dw),
+                };
+                defer _ = mlx.mlx_array_free(expert_out);
+                const expert_normed = try self.rmsNorm(expert_out, lw.post_ff_norm_2.?);
+                defer _ = mlx.mlx_array_free(expert_normed);
+
+                // Combine: shared + experts → post_ff_norm → residual add
+                var combined = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(combined);
+                try mlx.check(mlx.mlx_add(&combined, shared_normed, expert_normed, self.s));
+                const combined_normed = try self.rmsNorm(combined, lw.post_ff_norm.?);
+                defer _ = mlx.mlx_array_free(combined_normed);
+                var h_ff = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_add(&h_ff, h, combined_normed, self.s));
+                _ = mlx.mlx_array_free(h);
+                h = h_ff;
+
+                // Layer scalar
+                if (lw.layer_scalar) |ls| {
+                    var h_scaled = mlx.mlx_array_new();
+                    try mlx.check(mlx.mlx_multiply(&h_scaled, h, ls, self.s));
+                    _ = mlx.mlx_array_free(h);
+                    h = h_scaled;
+                }
+            } else {
+                // Qwen3.5: simple residual + post_attn_norm before MLP
+                var h_new = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_add(&h_new, h, attn_out, self.s));
+                _ = mlx.mlx_array_free(h);
+                h = h_new;
+
+                const ff_normed = try self.rmsNorm(h, lw.post_attn_norm);
+                defer _ = mlx.mlx_array_free(ff_normed);
+                const mlp_out = switch (lw.mlp) {
+                    .moe => |*mw| try self.moeMLP(ff_normed, mw),
+                    .dense => |*dw| try self.denseMLP(ff_normed, dw),
+                };
+                defer _ = mlx.mlx_array_free(mlp_out);
+
+                var h_next = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_add(&h_next, h, mlp_out, self.s));
+                _ = mlx.mlx_array_free(h);
+                h = h_next;
+            }
 
             if (is_prefill and (layer_idx + 1) % MOE_EVAL_EVERY_N_LAYERS == 0) {
                 try mlx.check(mlx.mlx_array_eval(h));
@@ -1780,8 +1958,23 @@ pub const Transformer = struct {
         const final_normed = try self.rmsNorm(h, self.final_norm);
         _ = mlx.mlx_array_free(h);
         if (self.embedding_mode) return final_normed;
-        const logits = try self.qmatmul(final_normed, self.lm_head_w, self.lm_head_s, self.lm_head_b);
+        var logits = try self.qmatmul(final_normed, self.lm_head_w, self.lm_head_s, self.lm_head_b);
         _ = mlx.mlx_array_free(final_normed);
+
+        // Gemma 4: logit softcapping — tanh(logits / cap) * cap
+        if (self.softcap_scalar) |cap| {
+            var scaled = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_divide(&scaled, logits, cap, self.s));
+            _ = mlx.mlx_array_free(logits);
+            var tanh_val = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_tanh(&tanh_val, scaled, self.s));
+            _ = mlx.mlx_array_free(scaled);
+            var capped = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_multiply(&capped, tanh_val, cap, self.s));
+            _ = mlx.mlx_array_free(tanh_val);
+            logits = capped;
+        }
+
         return logits;
     }
 
@@ -1925,6 +2118,150 @@ pub const Transformer = struct {
             try mlx.check(mlx.mlx_multiply(&gated, attn_flat, gate_sig, self.s));
             return self.qmatmul(gated, fa.o_w, fa.o_s, fa.o_b);
         }
+
+        return self.qmatmul(attn_flat, fa.o_w, fa.o_s, fa.o_b);
+    }
+
+    // ── Gemma 4 Full Attention for MoE layers ──
+    // Handles dual head dims, v_norm, sliding window, per-layer RoPE.
+
+    fn gemma4MoeAttn(
+        self: *Transformer,
+        x: mlx.mlx_array,
+        fa: *const FullAttnWeights,
+        layer: u32,
+        offset: c_int,
+        batch: c_int,
+        seq_len: c_int,
+        is_prefill: bool,
+        local_prefill_mask: mlx.mlx_array,
+        local_decode_mask: mlx.mlx_array,
+    ) !mlx.mlx_array {
+        const cfg = &self.config;
+        const is_global = cfg.isGlobalLayer(layer);
+        const h_count: c_int = @intCast(cfg.num_attention_heads);
+
+        // Per-layer dimensions
+        const cur_hd: u32 = cfg.layerHeadDim(layer);
+        const cur_kv_h: u32 = cfg.layerKVHeads(layer);
+        const q_shape = [_]c_int{ batch, seq_len, h_count, @intCast(cur_hd) };
+        const kv_shape = [_]c_int{ batch, seq_len, @intCast(cur_kv_h), @intCast(cur_hd) };
+        const flat_shape = [_]c_int{ batch, seq_len, @intCast(@as(u32, @intCast(h_count)) * cur_hd) };
+
+        // Per-layer RoPE
+        // RoPE: proportional for global layers (custom freqs), standard for local
+        const use_prop_rope = is_global and self.rope_freqs_global != null;
+        const rope_dims: c_int = @intCast(cur_hd); // full head dim for proportional (freqs handle partial)
+        const rope_base = mlx.mlx_optional_float{ .value = if (is_global) cfg.rope_theta else cfg.rope_local_base_freq, .has_value = !use_prop_rope };
+        const rope_scale: f32 = if (use_prop_rope) 1.0 else if (is_global) (1.0 / cfg.rope_scaling_factor) else 1.0;
+        const rope_freqs: mlx.mlx_array = if (use_prop_rope) self.rope_freqs_global.? else .{ .ctx = null };
+
+        // Gemma 4: scale = 1.0 (QK-norm handles normalization)
+        const attn_scale: f32 = 1.0;
+
+        const perm = [_]c_int{ 0, 2, 1, 3 };
+        const none_mask = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(none_mask);
+
+        // Q projection + norm + RoPE
+        const q_proj = try self.qmatmul(x, fa.q_w, fa.q_s, fa.q_b);
+        defer _ = mlx.mlx_array_free(q_proj);
+        var q_r = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(q_r);
+        try mlx.check(mlx.mlx_reshape(&q_r, q_proj, &q_shape, 4, self.s));
+        const q_normed = try self.rmsNorm(q_r, fa.q_norm);
+        defer _ = mlx.mlx_array_free(q_normed);
+        var q_t = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(q_t);
+        try mlx.check(mlx.mlx_transpose_axes(&q_t, q_normed, &perm, 4, self.s));
+        var q_rope = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(q_rope);
+        try mlx.check(mlx.mlx_fast_rope(&q_rope, q_t, rope_dims, false, rope_base, rope_scale, offset, rope_freqs, self.s));
+
+        // K, V projections
+        const k_proj = try self.qmatmul(x, fa.k_w, fa.k_s, fa.k_b);
+        defer _ = mlx.mlx_array_free(k_proj);
+        const v_proj = try self.qmatmul(x, fa.v_w, fa.v_s, fa.v_b);
+        defer _ = mlx.mlx_array_free(v_proj);
+        var k_r = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(k_r);
+        var v_r = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(v_r);
+        try mlx.check(mlx.mlx_reshape(&k_r, k_proj, &kv_shape, 4, self.s));
+        try mlx.check(mlx.mlx_reshape(&v_r, v_proj, &kv_shape, 4, self.s));
+
+        // K norm
+        const k_normed = try self.rmsNorm(k_r, fa.k_norm);
+        defer _ = mlx.mlx_array_free(k_normed);
+
+        // V norm (parameter-free RMS norm)
+        var v_after_norm = v_r;
+        var v_normed_arr = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(v_normed_arr);
+        if (cfg.has_v_norm) {
+            const has_dual_hd = cfg.global_head_dim > 0 and cfg.global_head_dim != cfg.head_dim;
+            const vnw = if (has_dual_hd and is_global)
+                (self.v_norm_weight_global orelse self.v_norm_weight.?)
+            else
+                self.v_norm_weight.?;
+            v_normed_arr = try self.rmsNorm(v_r, vnw);
+            v_after_norm = v_normed_arr;
+        }
+
+        // Transpose K, V to [B, H, S, D]
+        var k_t = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(k_t);
+        var v_t = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(v_t);
+        try mlx.check(mlx.mlx_transpose_axes(&k_t, k_normed, &perm, 4, self.s));
+        try mlx.check(mlx.mlx_transpose_axes(&v_t, v_after_norm, &perm, 4, self.s));
+
+        // RoPE on K
+        var k_rope = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(k_rope);
+        try mlx.check(mlx.mlx_fast_rope(&k_rope, k_t, rope_dims, false, rope_base, rope_scale, offset, rope_freqs, self.s));
+
+        // Update KV cache (trim to sliding window for local layers)
+        const max_kv: u32 = if (is_global) 0 else if (cfg.has_sliding_window) cfg.sliding_window else 0;
+        const kv = try self.cache.update(layer, k_rope, v_t, self.s, max_kv);
+        const full_k = kv[0];
+        const full_v = kv[1];
+
+        // Scaled dot-product attention with sliding window masking
+        var attn_out = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(attn_out);
+
+        if (!cfg.has_sliding_window) {
+            if (is_prefill) {
+                try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "causal", none_mask, .{ .ctx = null }, self.s));
+            } else {
+                try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "", none_mask, .{ .ctx = null }, self.s));
+            }
+        } else {
+            const sw: c_int = @intCast(cfg.sliding_window);
+            const total_kv: c_int = offset + seq_len;
+            if (is_prefill and is_global) {
+                try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "causal", none_mask, .{ .ctx = null }, self.s));
+            } else if (is_prefill) {
+                try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "array", local_prefill_mask, .{ .ctx = null }, self.s));
+            } else if (is_global) {
+                try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "", none_mask, .{ .ctx = null }, self.s));
+            } else if (@as(c_int, @intCast(self.cache.seqLen(layer))) <= sw) {
+                try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "", none_mask, .{ .ctx = null }, self.s));
+            } else {
+                _ = total_kv;
+                try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "array", local_decode_mask, .{ .ctx = null }, self.s));
+            }
+        }
+
+        // Reshape: [B,H,S,D] → [B,S,H*D]
+        const perm_back = [_]c_int{ 0, 2, 1, 3 };
+        var attn_t = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(attn_t);
+        try mlx.check(mlx.mlx_transpose_axes(&attn_t, attn_out, &perm_back, 4, self.s));
+        var attn_flat = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(attn_flat);
+        try mlx.check(mlx.mlx_reshape(&attn_flat, attn_t, &flat_shape, 3, self.s));
 
         return self.qmatmul(attn_flat, fa.o_w, fa.o_s, fa.o_b);
     }
@@ -2340,36 +2677,71 @@ pub const Transformer = struct {
         defer _ = mlx.mlx_array_free(gate);
         const up = try self.qmatmul(x, dw.up_w, dw.up_s, dw.up_b);
         defer _ = mlx.mlx_array_free(up);
-        const activated = try self.swiglu(gate, up);
+        const activated = try self.gatedMlpAct(gate, up);
         defer _ = mlx.mlx_array_free(activated);
         return self.qmatmul(activated, dw.down_w, dw.down_s, dw.down_b);
+    }
+
+    /// Gated MLP activation: activation(gate) * up, using the model's configured activation.
+    fn gatedMlpAct(self: *const Transformer, gate: mlx.mlx_array, up: mlx.mlx_array) !mlx.mlx_array {
+        const activated = try self.mlpActivation(gate);
+        defer _ = mlx.mlx_array_free(activated);
+        var result = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_multiply(&result, activated, up, self.s));
+        return result;
     }
 
     // ── Sparse MoE MLP ──
 
     fn moeMLP(self: *Transformer, x: mlx.mlx_array, mw: *const MoeMlpWeights) !mlx.mlx_array {
+        return self.moeMLP2(x, x, mw);
+    }
+
+    /// MoE MLP with separate router and expert inputs.
+    /// router_x: input for routing (raw hidden states).
+    /// expert_x: input for expert computation (possibly normalized).
+    fn moeMLP2(self: *Transformer, router_x: mlx.mlx_array, expert_x: mlx.mlx_array, mw: *const MoeMlpWeights) !mlx.mlx_array {
         const cfg = &self.config;
         const k: c_int = @intCast(cfg.num_experts_per_tok);
         const bits = cfg.quant_bits;
         const gs = cfg.quant_group_size;
 
-        // Router: softmax(gate(x)) → [B, S, num_experts]
-        // Detect router bits from weight/scales shapes
-        const router_bits = detectQuantBits(mw.router_w, mw.router_s, gs);
-        const router_logits = try qmatmulBits(x, mw.router_w, mw.router_s, mw.router_b, router_bits, gs, self.s);
+        // Router: compute logits and top-K selection
+        var router_logits: mlx.mlx_array = undefined;
         defer _ = mlx.mlx_array_free(router_logits);
-        var scores = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(scores);
-        try mlx.check(mlx.mlx_softmax_axis(&scores, router_logits, -1, true, self.s));
 
-        // Top-K: argpartition then slice last K
+        if (mw.router_scale) |rs| {
+            // Sigma-MoE: rms_norm(x, scale * hidden_size^-0.5, eps) then project
+            const root_size: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(cfg.hidden_size)));
+            var norm_weight = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(norm_weight);
+            const root_scalar = bf16Scalar(root_size, self.s);
+            defer _ = mlx.mlx_array_free(root_scalar);
+            try mlx.check(mlx.mlx_multiply(&norm_weight, rs, root_scalar, self.s));
+
+            var normed_input = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(normed_input);
+            try mlx.check(mlx.mlx_fast_rms_norm(&normed_input, router_x, norm_weight, cfg.rms_norm_eps, self.s));
+
+            const router_bits = detectQuantBits(mw.router_w, mw.router_s, gs);
+            router_logits = try qmatmulBits(normed_input, mw.router_w, mw.router_s, mw.router_b, router_bits, gs, self.s);
+        } else {
+            // Qwen3.5: direct projection
+            const router_bits = detectQuantBits(mw.router_w, mw.router_s, gs);
+            router_logits = try qmatmulBits(router_x, mw.router_w, mw.router_s, mw.router_b, router_bits, gs, self.s);
+        }
+
+        // Top-K: select on raw logits (negate for argpartition which finds smallest)
+        var neg_logits = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(neg_logits);
+        try mlx.check(mlx.mlx_negative(&neg_logits, router_logits, self.s));
+
         var partitioned = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(partitioned);
-        try mlx.check(mlx.mlx_argpartition_axis(&partitioned, scores, -k, -1, self.s));
+        try mlx.check(mlx.mlx_argpartition_axis(&partitioned, neg_logits, k - 1, -1, self.s));
 
-        // Slice [..., -K:] from partitioned
+        // Slice [..., :K] from partitioned (first K = top-K of original logits)
         const p_shape = mlx.getShape(partitioned);
-        const p_last = p_shape[p_shape.len - 1];
         var inds: mlx.mlx_array = undefined;
         defer _ = mlx.mlx_array_free(inds);
         {
@@ -2377,45 +2749,65 @@ pub const Transformer = struct {
             var stop_arr: [4]c_int = undefined;
             var strides_arr: [4]c_int = undefined;
             for (0..p_shape.len) |d| {
-                start_arr[d] = if (d == p_shape.len - 1) p_last - k else 0;
-                stop_arr[d] = p_shape[d];
+                start_arr[d] = 0;
+                stop_arr[d] = if (d == p_shape.len - 1) k else p_shape[d];
                 strides_arr[d] = 1;
             }
             inds = mlx.mlx_array_new();
             try mlx.check(mlx.mlx_slice(&inds, partitioned, &start_arr, p_shape.len, &stop_arr, p_shape.len, &strides_arr, p_shape.len, self.s));
         }
 
-        // Gather top-K scores and normalize
-        var top_scores = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(top_scores);
-        try mlx.check(mlx.mlx_take_along_axis(&top_scores, scores, inds, -1, self.s));
-        var score_sum_raw = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(score_sum_raw);
-        try mlx.check(mlx.mlx_sum_axis(&score_sum_raw, top_scores, -1, false, self.s));
-        var score_sum = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(score_sum);
-        try mlx.check(mlx.mlx_expand_dims(&score_sum, score_sum_raw, -1, self.s));
+        // Weights from softmax probabilities at selected indices
+        var probs = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(probs);
+        try mlx.check(mlx.mlx_softmax_axis(&probs, router_logits, -1, true, self.s));
+
+        var top_weights = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(top_weights);
+        try mlx.check(mlx.mlx_take_along_axis(&top_weights, probs, inds, -1, self.s));
+
+        // Renormalize top-K weights
+        var weight_sum_raw = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(weight_sum_raw);
+        try mlx.check(mlx.mlx_sum_axis(&weight_sum_raw, top_weights, -1, false, self.s));
+        var weight_sum = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(weight_sum);
+        try mlx.check(mlx.mlx_expand_dims(&weight_sum, weight_sum_raw, -1, self.s));
         var norm_scores = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(norm_scores);
-        try mlx.check(mlx.mlx_divide(&norm_scores, top_scores, score_sum, self.s));
+        try mlx.check(mlx.mlx_divide(&norm_scores, top_weights, weight_sum, self.s));
+
+        // Sigma-MoE: per-expert scale on selected indices (pes[inds])
+        if (mw.per_expert_scale) |pes| {
+            var selected_scales = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(selected_scales);
+            try mlx.check(mlx.mlx_take(
+                &selected_scales,
+                pes,
+                inds,
+                self.s,
+            ));
+            var scaled_scores = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_multiply(&scaled_scores, norm_scores, selected_scales, self.s));
+            _ = mlx.mlx_array_free(norm_scores);
+            norm_scores = scaled_scores;
+        }
 
         // Expert computation using gather_qmm
-        // x: [B, S, D] → add K and M dims → [B, S, 1, 1, D]
-        // batch dims [B, S, 1] broadcast with gathered w batch dims [B, S, K]
+        // expert_x: [B, S, D] → [B, S, 1, 1, D] for gather_qmm
         var x_e1 = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(x_e1);
-        try mlx.check(mlx.mlx_expand_dims(&x_e1, x, -1, self.s)); // [B, S, D, 1]
+        try mlx.check(mlx.mlx_expand_dims(&x_e1, expert_x, -1, self.s)); // [B, S, D, 1]
         var x_e2 = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(x_e2);
         try mlx.check(mlx.mlx_expand_dims(&x_e2, x_e1, -1, self.s)); // [B, S, D, 1, 1]
 
-        // Transpose to [B, S, 1, 1, D]
-        const x_shape = mlx.getShape(x);
+        const x_shape = mlx.getShape(expert_x);
         const D = x_shape[x_shape.len - 1];
         const exp_shape = [_]c_int{ x_shape[0], x_shape[1], 1, 1, D };
         var x_exp = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(x_exp);
-        try mlx.check(mlx.mlx_reshape(&x_exp, x, &exp_shape, 5, self.s));
+        try mlx.check(mlx.mlx_reshape(&x_exp, expert_x, &exp_shape, 5, self.s));
 
         const no_idx = mlx.mlx_array{ .ctx = null };
 
@@ -2435,8 +2827,8 @@ pub const Transformer = struct {
         defer _ = mlx.mlx_array_free(up_out);
         try mlx.check(mlx.mlx_squeeze(&up_out, up_out_5d, self.s));
 
-        // SwiGLU: silu(gate) * up → [B, S, K, intermediate]
-        const expert_act = try self.swiglu(gate_out, up_out);
+        // Gated activation: activation(gate) * up → [B, S, K, intermediate]
+        const expert_act = try self.gatedMlpAct(gate_out, up_out);
         defer _ = mlx.mlx_array_free(expert_act);
 
         // down_out: expert_act [B,S,K,intermediate] → expand M → [B,S,K,1,intermediate]
@@ -2459,22 +2851,25 @@ pub const Transformer = struct {
         defer _ = mlx.mlx_array_free(weighted);
         try mlx.check(mlx.mlx_multiply(&weighted, down_out, scores_exp, self.s));
         var expert_sum = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(expert_sum);
         try mlx.check(mlx.mlx_sum_axis(&expert_sum, weighted, -2, false, self.s)); // [B, S, hidden]
 
-        // Shared expert: silu(gate_proj(x)) * up_proj(x) → down_proj(...)
-        const sh_gate = try self.qmatmul(x, mw.shared_gate_w, mw.shared_gate_s, mw.shared_gate_b);
+        // Gemma 4: shared expert is handled separately in forwardMoe, just return expert_sum
+        if (mw.shared_expert_gate_w == null) return expert_sum;
+        defer _ = mlx.mlx_array_free(expert_sum);
+
+        // Qwen3.5: shared expert + gated combination
+        const sh_gate = try self.qmatmul(expert_x, mw.shared_gate_w, mw.shared_gate_s, mw.shared_gate_b);
         defer _ = mlx.mlx_array_free(sh_gate);
-        const sh_up = try self.qmatmul(x, mw.shared_up_w, mw.shared_up_s, mw.shared_up_b);
+        const sh_up = try self.qmatmul(expert_x, mw.shared_up_w, mw.shared_up_s, mw.shared_up_b);
         defer _ = mlx.mlx_array_free(sh_up);
-        const sh_act = try self.swiglu(sh_gate, sh_up);
+        const sh_act = try self.gatedMlpAct(sh_gate, sh_up);
         defer _ = mlx.mlx_array_free(sh_act);
         const sh_down = try self.qmatmul(sh_act, mw.shared_down_w, mw.shared_down_s, mw.shared_down_b);
         defer _ = mlx.mlx_array_free(sh_down);
 
-        // Shared expert gate: sigmoid(gate(x)) * shared_output
-        const seg_bits = detectQuantBits(mw.shared_expert_gate_w, mw.shared_expert_gate_s, gs);
-        const sh_gate_logit = try qmatmulBits(x, mw.shared_expert_gate_w, mw.shared_expert_gate_s, mw.shared_expert_gate_b, seg_bits, gs, self.s);
+        const seg_w = mw.shared_expert_gate_w.?;
+        const seg_bits = detectQuantBits(seg_w, mw.shared_expert_gate_s.?, gs);
+        const sh_gate_logit = try qmatmulBits(expert_x, seg_w, mw.shared_expert_gate_s.?, mw.shared_expert_gate_b.?, seg_bits, gs, self.s);
         defer _ = mlx.mlx_array_free(sh_gate_logit);
         var sh_gate_sig = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(sh_gate_sig);
@@ -2482,8 +2877,6 @@ pub const Transformer = struct {
         var shared_gated = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(shared_gated);
         try mlx.check(mlx.mlx_multiply(&shared_gated, sh_gate_sig, sh_down, self.s));
-
-        // Combine: expert_sum + shared_gated
         var result = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_add(&result, expert_sum, shared_gated, self.s));
         return result;
@@ -2665,6 +3058,7 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
     const prefix = config.weight_prefix;
     const moe_layers = try allocator.alloc(MoeLayerWeights, config.num_hidden_layers);
     const ssm_entries = try allocator.alloc(SSMCacheEntry, config.num_hidden_layers);
+    const is_gemma4 = std.mem.eql(u8, config.model_type, "gemma4");
 
     for (0..config.num_hidden_layers) |i| {
         const li: u32 = @intCast(i);
@@ -2674,6 +3068,27 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
         lw.input_norm = getLayerWeight(weights, name_buf, prefix, li, "input_layernorm.weight");
         lw.post_attn_norm = getLayerWeight(weights, name_buf, prefix, li, "post_attention_layernorm.weight");
         lw.is_linear = is_linear;
+
+        // Gemma 4 MoE: extra feedforward norms, layer scalar, shared expert MLP
+        if (is_gemma4) {
+            lw.pre_ff_norm = getLayerWeightOpt(weights, name_buf, prefix, li, "pre_feedforward_layernorm.weight");
+            lw.post_ff_norm = getLayerWeightOpt(weights, name_buf, prefix, li, "post_feedforward_layernorm.weight");
+            lw.pre_ff_norm_2 = getLayerWeightOpt(weights, name_buf, prefix, li, "pre_feedforward_layernorm_2.weight");
+            lw.post_ff_norm_1 = getLayerWeightOpt(weights, name_buf, prefix, li, "post_feedforward_layernorm_1.weight");
+            lw.post_ff_norm_2 = getLayerWeightOpt(weights, name_buf, prefix, li, "post_feedforward_layernorm_2.weight");
+            lw.layer_scalar = getLayerWeightOpt(weights, name_buf, prefix, li, "layer_scalar");
+            lw.shared_mlp = .{
+                .gate_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.gate_proj.weight"),
+                .gate_s = getLayerWeight(weights, name_buf, prefix, li, "mlp.gate_proj.scales"),
+                .gate_b = getLayerWeight(weights, name_buf, prefix, li, "mlp.gate_proj.biases"),
+                .up_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.up_proj.weight"),
+                .up_s = getLayerWeight(weights, name_buf, prefix, li, "mlp.up_proj.scales"),
+                .up_b = getLayerWeight(weights, name_buf, prefix, li, "mlp.up_proj.biases"),
+                .down_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.down_proj.weight"),
+                .down_s = getLayerWeight(weights, name_buf, prefix, li, "mlp.down_proj.scales"),
+                .down_b = getLayerWeight(weights, name_buf, prefix, li, "mlp.down_proj.biases"),
+            };
+        }
 
         if (is_linear) {
             // Detect combined (qkvz+ba) vs separate (qkv+z+a+b) projections
@@ -2725,16 +3140,23 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
                 } };
             }
         } else {
+            const k_w = getLayerWeight(weights, name_buf, prefix, li, "self_attn.k_proj.weight");
+            const k_s = getLayerWeight(weights, name_buf, prefix, li, "self_attn.k_proj.scales");
+            const k_b = getLayerWeight(weights, name_buf, prefix, li, "self_attn.k_proj.biases");
+            // Gemma 4 MoE: global layers use K=V (no separate v_proj)
+            const v_w = getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.v_proj.weight") orelse k_w;
+            const v_s = getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.v_proj.scales") orelse k_s;
+            const v_b = getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.v_proj.biases") orelse k_b;
             lw.attn = .{ .full = .{
                 .q_w = getLayerWeight(weights, name_buf, prefix, li, "self_attn.q_proj.weight"),
                 .q_s = getLayerWeight(weights, name_buf, prefix, li, "self_attn.q_proj.scales"),
                 .q_b = getLayerWeight(weights, name_buf, prefix, li, "self_attn.q_proj.biases"),
-                .k_w = getLayerWeight(weights, name_buf, prefix, li, "self_attn.k_proj.weight"),
-                .k_s = getLayerWeight(weights, name_buf, prefix, li, "self_attn.k_proj.scales"),
-                .k_b = getLayerWeight(weights, name_buf, prefix, li, "self_attn.k_proj.biases"),
-                .v_w = getLayerWeight(weights, name_buf, prefix, li, "self_attn.v_proj.weight"),
-                .v_s = getLayerWeight(weights, name_buf, prefix, li, "self_attn.v_proj.scales"),
-                .v_b = getLayerWeight(weights, name_buf, prefix, li, "self_attn.v_proj.biases"),
+                .k_w = k_w,
+                .k_s = k_s,
+                .k_b = k_b,
+                .v_w = v_w,
+                .v_s = v_s,
+                .v_b = v_b,
                 .o_w = getLayerWeight(weights, name_buf, prefix, li, "self_attn.o_proj.weight"),
                 .o_s = getLayerWeight(weights, name_buf, prefix, li, "self_attn.o_proj.scales"),
                 .o_b = getLayerWeight(weights, name_buf, prefix, li, "self_attn.o_proj.biases"),
@@ -2743,7 +3165,36 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
             } };
         }
 
-        if (config.isMoe()) {
+        if (config.isMoe() and is_gemma4) {
+            // Gemma 4 MoE: different weight naming, Sigma-MoE routing, no shared expert gate
+            lw.mlp = .{ .moe = .{
+                .router_w = getLayerWeight(weights, name_buf, prefix, li, "router.proj.weight"),
+                .router_s = getLayerWeight(weights, name_buf, prefix, li, "router.proj.scales"),
+                .router_b = getLayerWeight(weights, name_buf, prefix, li, "router.proj.biases"),
+                .router_scale = getLayerWeightOpt(weights, name_buf, prefix, li, "router.scale"),
+                .per_expert_scale = getLayerWeightOpt(weights, name_buf, prefix, li, "router.per_expert_scale"),
+                .switch_gate_w = getLayerWeight(weights, name_buf, prefix, li, "experts.switch_glu.gate_proj.weight"),
+                .switch_gate_s = getLayerWeight(weights, name_buf, prefix, li, "experts.switch_glu.gate_proj.scales"),
+                .switch_gate_b = getLayerWeight(weights, name_buf, prefix, li, "experts.switch_glu.gate_proj.biases"),
+                .switch_up_w = getLayerWeight(weights, name_buf, prefix, li, "experts.switch_glu.up_proj.weight"),
+                .switch_up_s = getLayerWeight(weights, name_buf, prefix, li, "experts.switch_glu.up_proj.scales"),
+                .switch_up_b = getLayerWeight(weights, name_buf, prefix, li, "experts.switch_glu.up_proj.biases"),
+                .switch_down_w = getLayerWeight(weights, name_buf, prefix, li, "experts.switch_glu.down_proj.weight"),
+                .switch_down_s = getLayerWeight(weights, name_buf, prefix, li, "experts.switch_glu.down_proj.scales"),
+                .switch_down_b = getLayerWeight(weights, name_buf, prefix, li, "experts.switch_glu.down_proj.biases"),
+                // Shared expert handled via lw.shared_mlp for Gemma 4 (separate branch in forward)
+                .shared_gate_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.gate_proj.weight"),
+                .shared_gate_s = getLayerWeight(weights, name_buf, prefix, li, "mlp.gate_proj.scales"),
+                .shared_gate_b = getLayerWeight(weights, name_buf, prefix, li, "mlp.gate_proj.biases"),
+                .shared_up_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.up_proj.weight"),
+                .shared_up_s = getLayerWeight(weights, name_buf, prefix, li, "mlp.up_proj.scales"),
+                .shared_up_b = getLayerWeight(weights, name_buf, prefix, li, "mlp.up_proj.biases"),
+                .shared_down_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.down_proj.weight"),
+                .shared_down_s = getLayerWeight(weights, name_buf, prefix, li, "mlp.down_proj.scales"),
+                .shared_down_b = getLayerWeight(weights, name_buf, prefix, li, "mlp.down_proj.biases"),
+            } };
+        } else if (config.isMoe()) {
+            // Qwen3.5 MoE
             lw.mlp = .{ .moe = .{
                 .router_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.gate.weight"),
                 .router_s = getLayerWeight(weights, name_buf, prefix, li, "mlp.gate.scales"),
@@ -2816,7 +3267,11 @@ fn appendHybridMlpWeights(vec: mlx.mlx_vector_array, hw: *const HybridMlpWeights
     switch (hw.*) {
         .moe => |*mw| {
             inline for (std.meta.fields(MoeMlpWeights)) |field| {
-                _ = mlx.mlx_vector_array_append_value(vec, @field(mw, field.name));
+                if (field.type == ?mlx.mlx_array) {
+                    if (@field(mw, field.name)) |arr| _ = mlx.mlx_vector_array_append_value(vec, arr);
+                } else {
+                    _ = mlx.mlx_vector_array_append_value(vec, @field(mw, field.name));
+                }
             }
         },
         .dense => |*dw| {
@@ -3059,6 +3514,7 @@ fn initBert(allocator: std.mem.Allocator, config: ModelConfig, weights: *const W
         .softcap_scalar = null,
         .v_norm_weight = null,
         .v_norm_weight_global = null,
+        .rope_freqs_global = null,
         .bert_layers = bert_layers,
         .bert_pos_w = pos_w,
         .bert_pos_s = pos_s,
