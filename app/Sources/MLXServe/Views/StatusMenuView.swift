@@ -77,6 +77,12 @@ struct StatusMenuView: View {
                         .help("Server Log")
                     }
 
+                    Toggle("Auto-start on launch", isOn: $appState.autoStartServer)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .toggleStyle(.switch)
+                        .controlSize(.mini)
+
                     if showLog {
                         ServerLogView(log: server.serverLog)
                     }
@@ -208,16 +214,13 @@ struct StatusMenuView: View {
                 .buttonStyle(.bordered)
 
                 Button {
-                    let path = NSString(string: "~/.mlx-serve/skills").expandingTildeInPath
-                    if !FileManager.default.fileExists(atPath: path) {
-                        try? FileManager.default.createDirectory(atPath: path, withIntermediateDirectories: true)
-                    }
+                    let path = NSString(string: "~/.mlx-serve").expandingTildeInPath
                     NSWorkspace.shared.open(URL(fileURLWithPath: path))
                 } label: {
                     Image(systemName: "folder.badge.gearshape")
                 }
                 .buttonStyle(.bordered)
-                .help("Agent Skills Folder")
+                .help("MLX Serve Folder")
 
                 Button {
                     server.stop()

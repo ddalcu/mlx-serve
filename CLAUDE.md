@@ -5,8 +5,8 @@ Native Zig server that runs MLX-format LMs on Apple Silicon and exposes an OpenA
 ## Stack
 
 - **Zig** 0.15+
-- **mlx-c** (Apple) via Homebrew; FFI in `src/mlx.zig`
-- **Jinja_cpp** (lib/jinja_cpp): chat templates; replaces previous vibe-based Jinja (macros caused infinite loop)
+- **mlx-c** 0.5.0 / MLX 0.30.6 (Apple) via Homebrew; FFI in `src/mlx.zig`. **mlx-c 0.6.0 / MLX 0.31.1 crashes in `mlx_dequantize` — do not upgrade until upstream fix.**
+- **Jinja engine** (lib/jinja_cpp): llama.cpp's C++17 Jinja2 implementation with nlohmann/json. Pre-compiled as `libjinja.a` (rebuild: see comment in `build.zig`).
 - **safetensors** for weights; BPE tokenizers (SentencePiece / byte-level)
 
 ## Layout
@@ -19,11 +19,11 @@ Native Zig server that runs MLX-format LMs on Apple Silicon and exposes an OpenA
 | `src/tokenizer.zig` | BPE tokenizer |
 | `src/transformer.zig` | Forward pass (embedding, attention, MLP, MoE, GatedDeltaNet); architecture dispatch |
 | `src/generate.zig` | Autoregressive generation, sampling (temperature, top-k, top-p, repeat penalty, presence penalty, logprobs) |
-| `src/chat.zig` | Chat template formatting (ChatML, Gemma turns, Llama-3, Jinja2 via Jinja_cpp); thinking/reasoning tags; tool call parsing |
+| `src/chat.zig` | Chat template formatting (ChatML, Gemma turns, Llama-3, Jinja2 via llama.cpp engine); thinking/reasoning tags; tool call parsing |
 | `src/server.zig` | HTTP server: `/health`, `/v1/models`, `/v1/chat/completions`, `/v1/completions` (stream + non-stream, tool calling, KV cache) |
 | `src/status.zig` | TUI status bar (CPU, memory, GPU metrics) |
 | `src/log.zig` | Leveled logging (error, warn, info, debug) |
-| `build.zig` | Zig build; links mlx-c and Jinja_cpp |
+| `build.zig` | Zig build; links mlx-c and pre-compiled libjinja.a |
 
 ### MLX Claw (Swift macOS app)
 
@@ -38,7 +38,8 @@ Native Zig server that runs MLX-format LMs on Apple Silicon and exposes an OpenA
 | `app/Sources/MLXServe/Services/AgentPrompt.swift` | System prompt, tool definitions (7 tools), `SkillManager` (prompt-based skills from `~/.mlx-serve/skills/`) |
 | `app/Sources/MLXServe/Services/ToolExecutor.swift` | Tool handlers: shell, readFile, writeFile, editFile, searchFiles, browse, webSearch |
 | `app/Sources/MLXServe/Services/BrowserManager.swift` | WKWebView (headless, created eagerly for background browsing) |
-| `app/Sources/MLXServe/Services/ServerManager.swift` | mlx-serve process lifecycle, stderr capture (`serverLog`) |
+| `app/Sources/MLXServe/Services/ServerManager.swift` | mlx-serve process lifecycle, stderr capture (`serverLog`), auto-start |
+| `app/Sources/MLXServe/Services/TestServer.swift` | Embedded HTTP server (port 8090) for test automation — same code path as UI |
 | `app/Sources/MLXServe/Services/AgentMemory.swift` | Agent context memory (recent dirs, commands) |
 | `app/Sources/MLXServe/Views/ChatView.swift` | Chat UI + `runAgentLoop()` + `buildAgentHistory()` |
 | `app/Sources/MLXServe/Views/StatusMenuView.swift` | Menu bar UI, server log viewer |
@@ -61,29 +62,32 @@ Native Zig server that runs MLX-format LMs on Apple Silicon and exposes an OpenA
 - Zig server only: `zig build -Doptimize=ReleaseFast`
 - Swift app only: `cd app && swift build -c release`
 - For tests: `zig build test` (Zig) and `cd app && swift test` (Swift)
+- **Rebuild Jinja library** (after changing `lib/jinja_cpp/*.cpp`): `cd lib/jinja_cpp && for f in jinja_wrapper caps lexer parser runtime jinja_string value; do clang++ -std=c++17 -O2 -DNDEBUG -I . -c $f.cpp -o obj/$f.o; done && ar rcs libjinja.a obj/*.o`
 
 ## Conventions
 
 - Prefer minimal, DRY Zig; avoid unnecessary abstraction.
-- Chat templates live in model dirs; Jinja_cpp renders them (with fallback formatting).
+- Chat templates live in model dirs; llama.cpp's Jinja engine renders them (with fallback formatting).
 - Server supports concurrent health checks via threaded connections, single-slot generation.
-- KV cache reuse across requests via prompt prefix matching.
+- KV cache reuse across requests via prompt prefix matching; invalidated after tool-calling requests and pad-only generations.
 - Tests go at the bottom of each source file (Zig convention).
+- Jinja static library must be rebuilt with system clang++ after changing `lib/jinja_cpp/*.cpp` (see build command in `build.zig`).
 
 ## Tool Calling Architecture
 
 ### Server side (Zig)
-- **Tool call detection**: When `tools` param is present in request, server buffers ALL generated tokens (doesn't stream immediately). After generation completes, `chat.parseToolCalls()` checks the buffered text for tool call patterns (`<tool_call>`, Hermes XML, Gemma 4 `<|tool_call>`, raw JSON). If found, emits as `finish_reason: "tool_calls"`. If not found, flushes buffered tokens as regular content.
-- **Message serialization for Jinja** (`chat.serializeMessagesJson`): Converts `Message` structs to JSON for Jinja templates. For `role: "tool"` messages, also adds `tool_responses` field (needed by Gemma 4 templates). Looks up tool name by matching `tool_call_id` to preceding assistant's `tool_calls`.
-- **Gemma 4 template adaptation** (`chat.renderChatTemplate`): Detects templates using `tool_responses` (Gemma 4). Transforms `role: "tool"` → `role: "assistant"` with null content so the template produces `<|turn>model` (known role) instead of `<|turn>tool` (unknown). Content is carried via `tool_responses` field.
+- **Tool call detection**: When `tools` param is present, server buffers tokens and checks for tool call patterns. If thinking is enabled, thinking tokens are buffered separately and not flushed as content. After generation, `chat.parseToolCalls()` checks for patterns (`<tool_call>`, Hermes XML, Gemma 4 `<|tool_call>`, raw JSON). Gemma 4 double-brace args (`{{"key":"value"}}`) are unwrapped before JSON parsing.
+- **Message serialization** (`chat.serializeMessagesJson`): Converts `Message` structs to JSON for Jinja templates. `role: "tool"` messages are passed natively (no transformation) — Gemma 4 templates handle them directly as `<|turn>tool`. Tool call `arguments` are serialized as JSON strings (not objects) so templates render them correctly.
+- **Streaming SSE**: Tool call arguments are sent in a single delta (name + id + full args) to prevent client-side accumulation bugs. Thinking content (`<|channel>thought`) is detected during streaming and buffered until the closing tag, then emitted as `reasoning_content`.
 - **Fallback formatter** (`chat.fallbackFormatChat`): Used when Jinja fails. Handles ChatML (`<tool_call>/<tool_response>`), Llama (`ipython` role), Gemma (`Tool result:` in user turn).
-- **KV cache**: `reuseKVCache()` compares token-by-token prefix with previous request. `updateCachedPrompt()` stores the prompt IDs after generation.
+- **KV cache**: `reuseKVCache()` compares token-by-token prefix. Cache is automatically invalidated after tool-calling requests (generated tool-call tokens corrupt the cache for the next request) and after pad-only generations. Sliding window layers keep full buffers (no trimming) — views return the last `sw` entries during decode, all entries during prefill.
 
 ### Client side (Swift)
-- **Agent loop** (`ChatView.runAgentLoop`): Up to 10 iterations. Calls model with tools → parses tool calls → executes locally → feeds results back → repeats until model responds without tool calls.
-- **History builder** (`ChatView.buildAgentHistory`): Converts `ChatMessage` array to OpenAI API format. Assistant messages include `tool_calls` array. Tool responses include `role: "tool"` with `tool_call_id`.
-- **SSE parsing** (`APIClient.performStream`): Accumulates streamed tool call deltas (name, arguments chunks). Preserves server-generated tool call IDs. Emits `.toolCalls` event on `finish_reason: "tool_calls"`. Fallback emission if stream drops without finish_reason.
+- **Agent loop** (`ChatView.runAgentLoop`): Up to 30 iterations. Calls model with tools → parses tool calls → executes locally → feeds results back → repeats until model responds without tool calls. Adds synthetic user nudge after tool results for models that need it.
+- **History builder** (`ChatView.buildAgentHistory`): Converts `ChatMessage` array to OpenAI API format. Filters out error messages, pad-only content, and agent summaries. Truncates assistant messages at 500 chars. Last 30 messages max.
+- **SSE parsing** (`APIClient.performStream`): Accumulates streamed tool call deltas. Server sends full arguments in one delta. Emits `.toolCalls` event on `finish_reason: "tool_calls"`. Fallback emission if stream drops without finish_reason.
 - **Tool call storage**: `SerializedToolCall` (id, name, arguments as JSON string) stored on `ChatMessage.toolCalls`. Persisted via Codable for history replay. Backwards-compatible with old history files (field is optional).
+- **Error recovery**: Tool execution errors include what args were sent and ask the model to retry, enabling self-correction in the agent loop.
 
 ## Prompt-based Skills
 
@@ -104,7 +108,7 @@ When asked to deploy:
 - A short skill index (name + description) is always included so the model knows what's available
 - `SkillManager` in `AgentPrompt.swift` scans the directory on each agent loop iteration (re-scans when dir modification date changes)
 - Skills are injected in `ChatView.runAgentLoop()` between the base system prompt and agent memory context
-- UI: folder icon button in menu bar (always) and chat toolbar (agent mode) opens the skills folder in Finder
+- UI: folder icon button in menu bar and chat toolbar opens `~/.mlx-serve/` in Finder
 
 ## Resumable Downloads
 
@@ -143,20 +147,26 @@ Large model downloads (e.g., 26B at ~15 GB) use streaming writes to `.partial` f
 
 ## Gotchas
 
-### KV cache poisoning (KNOWN BUG)
-When the model generates pad-only output (e.g., from a confusing prompt), `updateCachedPrompt()` still stores the prompt IDs. The KV cache now contains corrupted attention state from the failed generation. ALL subsequent requests that share a prefix with the failed prompt will reuse this corrupted cache and also produce pad-only output, even if they would succeed on a fresh server. **Workaround**: restart the server. **Fix needed**: skip `updateCachedPrompt()` when `completion_tokens` <= pad threshold, or invalidate cache after pad-only generation.
+### KV cache after tool calls
+After a tool-calling request, the KV cache is automatically invalidated. The generated tool-call tokens are in the cache but not in `cached_prompt_ids`, so reusing the cache for the next request (which includes tool results) would corrupt attention. Similarly, pad-only generations trigger cache invalidation.
+
+### Sliding window KV cache
+Models with sliding window attention (e.g., Gemma 4 E4B with 512-token window) keep the full KV buffer — no trimming. During prefill, all entries are returned so Q and K dimensions match. During decode, views return only the last `sw` entries. The sliding window mask handles attention scope. This matches mlx-lm's `RotatingKVCache` behavior.
 
 ### Gemma 4 tool calling format
-Gemma 4 Jinja templates use `tool_responses` (not `role: "tool"`) and `<|tool_call>` / `<|tool_response>` tags (not `<tool_call>`). The template does NOT handle `role: "tool"` — it passes the role through as `<|turn>tool` which the model has never seen, causing immediate EOS. The server transforms `role: "tool"` → `role: "assistant"` for templates that contain "tool_responses".
+Gemma 4 templates handle `role: "tool"` natively (producing `<|turn>tool`). No transformation is needed — the server passes tool messages through as-is. The `tool_responses` field is NOT added (it causes duplicate content in rendered prompts). Tool call arguments are serialized as JSON strings so the template renders them verbatim.
 
-### Streaming vs non-streaming with tools
-When `tools` are present and `stream: true`, the server buffers ALL tokens before checking for tool calls. This means no tokens are streamed until generation is complete. The client must wait for the full response. The buffered path and the non-streaming path share the same KV cache, so a failure in one affects the other.
+### Streaming with tools and thinking
+When `tools` are present, the server buffers tokens to detect tool call patterns. If thinking is also enabled, `<|channel>thought` tokens are detected and kept buffered (not flushed as content) until the closing `<channel|>` tag. After generation, thinking content is split from visible content and emitted as `reasoning_content`. Channel tags (`<|channel>`, `<channel|>`) are stripped from visible content.
+
+### mlx-c 0.6.0 crash
+mlx-c 0.6.0 (MLX 0.31.1) segfaults in `mlx_dequantize` during embedding lookup. Use mlx-c 0.5.0 (MLX 0.30.6) until upstream fixes this. The source-built 0.5.0 libraries live in `/opt/homebrew/lib/`; brew's 0.6.0 is in `/opt/homebrew/opt/mlx-c/lib/`.
 
 ### Two binaries in the app bundle
 The MLX Claw `.app` bundle contains TWO binaries: `MLXClaw` (Swift UI) and `mlx-serve` (Zig server). Both must be updated when making changes. The Swift app starts the Zig server as a child process. Forgetting to copy one binary after a rebuild is a common source of "it still doesn't work."
 
-### DuckDuckGo HTML content noise
-The `webSearch` tool uses DuckDuckGo HTML search and extracts text via WKWebView JavaScript. The extracted content often has excessive whitespace (`\n \n \n`) from the HTML structure. Combined with the 2000-char truncation in `buildAgentHistory`, this can produce prompts that confuse small models (especially Gemma 4 E2B/E4B). The `readText()` JS in `BrowserManager` strips some elements but DuckDuckGo's HTML structure defeats most cleanup.
+### WebSearch and Browse
+The `webSearch` tool navigates to DuckDuckGo HTML search and extracts structured results (titles, URLs, snippets) via JavaScript. The `browse` tool's `readText` action navigates to the URL first, then extracts text — this ensures each browse returns the correct page content (not the previous page's).
 
 ### WKWebView requires main thread
 `BrowserManager` is `@MainActor`. All WKWebView operations (navigate, readText, evaluateJS) must happen on the main thread. The WKWebView is created eagerly at app launch so tools work without the Browser window being open.

@@ -253,10 +253,7 @@ struct ChatDetailView: View {
             ToolbarItem(placement: .automatic) {
                 if isAgentMode {
                     Button {
-                        let path = NSString(string: "~/.mlx-serve/skills").expandingTildeInPath
-                        if !FileManager.default.fileExists(atPath: path) {
-                            try? FileManager.default.createDirectory(atPath: path, withIntermediateDirectories: true)
-                        }
+                        let path = NSString(string: "~/.mlx-serve").expandingTildeInPath
                         NSWorkspace.shared.open(URL(fileURLWithPath: path))
                     } label: {
                         Image(systemName: "folder.badge.gearshape")
@@ -379,6 +376,8 @@ struct ChatDetailView: View {
             } catch is CancellationError {
                 // Stopped by user
             } catch {
+                print("[ChatView] Chat error: \(error)")
+                try? "Chat error: \(error)\n".write(toFile: NSString(string: "~/.mlx-serve/debug.log").expandingTildeInPath, atomically: true, encoding: .utf8)
                 appState.updateLastMessage(in: sessionId, content: "\n\n[Error: \(error.localizedDescription)]")
             }
             appState.updateLastMessage(in: sessionId, streaming: false)
@@ -408,6 +407,8 @@ struct ChatDetailView: View {
             } catch is CancellationError {
                 // Stopped by user
             } catch {
+                print("[ChatView] Agent error: \(error)")
+                try? "Agent error: \(error)\n".write(toFile: NSString(string: "~/.mlx-serve/debug.log").expandingTildeInPath, atomically: true, encoding: .utf8)
                 var errorMsg = ChatMessage(role: .assistant, content: "[Error: \(error.localizedDescription)]")
                 errorMsg.isStreaming = false
                 appState.appendMessage(to: sessionId, message: errorMsg)
@@ -419,9 +420,9 @@ struct ChatDetailView: View {
     }
 
     /// Agent loop: call model with tools (streaming), execute tool calls, feed results back, repeat.
-    /// Stops when the model responds with content (no tool calls) or after 10 iterations.
+    /// Stops when the model responds with content (no tool calls) or after 30 iterations.
     private func runAgentLoop(api: APIClient, workingDirectory: String?) async throws {
-        let maxIterations = 10
+        let maxIterations = 30
         var padRetries = 0
         let maxPadRetries = 2
 
@@ -429,11 +430,16 @@ struct ChatDetailView: View {
             try Task.checkCancellation()
 
             // Build message history for API
-            let history = buildAgentHistory()
+            var history = buildAgentHistory()
             let userMsg = history.last { ($0["role"] as? String) == "user" }?["content"] as? String ?? ""
             let skills = AgentPrompt.skillManager.matchingSkills(for: userMsg)
             let systemPrompt = AgentPrompt.systemPrompt + skills + appState.agentMemory.contextSnippet()
             var messages: [[String: Any]] = [["role": "system", "content": systemPrompt]]
+            // Some models (e.g. Gemma 4 E4B) can't generate after tool results without
+            // a user message. Add a nudge so the model knows to synthesize a response.
+            if let lastRole = history.last?["role"] as? String, lastRole == "tool" {
+                history.append(["role": "user", "content": "Process the tool results above and respond."])
+            }
             messages.append(contentsOf: history)
 
             // Debug: dump the exact request body to file for analysis
@@ -464,6 +470,7 @@ struct ChatDetailView: View {
                 messages: messages,
                 maxTokens: appState.maxTokens,
                 temperature: 0.7,
+                enableThinking: enableThinking,
                 tools: AgentPrompt.toolDefinitions
             )
             for try await event in stream {
@@ -553,7 +560,9 @@ struct ChatDetailView: View {
                             appState.agentMemory.recordCommand(cmd)
                         }
                     } catch {
-                        output = "Error: \(error.localizedDescription)"
+                        // Include the args the model sent so it can see what went wrong
+                        let argsDesc = tc.arguments.isEmpty ? "none" : tc.arguments.map { "\($0.key)=\($0.value.prefix(30))" }.joined(separator: ", ")
+                        output = "Error: \(error.localizedDescription). You sent args: [\(argsDesc)]. Please retry with all required parameters as JSON."
                     }
                 } else {
                     output = "Error: Unknown tool '\(tc.name)'"
@@ -596,6 +605,8 @@ struct ChatDetailView: View {
                 }
                 if msg.role == .system { return nil }
                 if msg.isAgentSummary { return nil }
+                // Skip error messages from failed generations — they confuse the model
+                if msg.role == .assistant && msg.content.contains("couldn't generate a response") { return nil }
 
                 // Assistant messages with tool_calls: include tool_calls in OpenAI format
                 if msg.role == .assistant, let tcs = msg.toolCalls, !tcs.isEmpty {
@@ -674,7 +685,7 @@ struct MessageBubble: View {
                 if !message.content.isEmpty || message.isStreaming {
                     VStack(alignment: .leading, spacing: 4) {
                         if message.isAgentSummary {
-                            Label("Summary", systemImage: "text.document")
+                            Label("Tool Call", systemImage: "wrench.and.screwdriver")
                                 .font(.caption2.weight(.medium))
                                 .foregroundStyle(.secondary)
                         }

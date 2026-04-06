@@ -227,6 +227,12 @@ class APIClient {
         let streamStart = Date()
         let (bytes, response) = try await session.bytes(for: request)
         guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+            let statusCode = (response as? HTTPURLResponse)?.statusCode ?? -1
+            print("[APIClient] Bad response: HTTP \(statusCode)")
+            try? "Bad response: HTTP \(statusCode)\n".write(toFile: NSString(string: "~/.mlx-serve/debug.log").expandingTildeInPath, atomically: true, encoding: .utf8)
+            if let http = response as? HTTPURLResponse, let data = try? await URLSession.shared.data(for: request).0 {
+                print("[APIClient] Body: \(String(data: data, encoding: .utf8) ?? "n/a")")
+            }
             continuation.finish(throwing: URLError(.badServerResponse))
             return
         }

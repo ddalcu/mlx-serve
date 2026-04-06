@@ -102,6 +102,7 @@ pub fn formatChat(
     const rendered = try renderChatTemplate(allocator, messages, chat_config, tools_json, tool_choice_instruction, enable_thinking);
     defer allocator.free(rendered);
 
+
     var ids = std.ArrayList(u32).empty;
     errdefer ids.deinit(allocator);
 
@@ -130,35 +131,9 @@ fn renderChatTemplate(
         return fallbackFormatChat(allocator, messages, chat_config, tools_json, tool_choice_instruction, enable_thinking);
     }
 
-    // Templates that use tool_responses (e.g. Gemma 4) don't understand role:"tool".
-    // They expect role:"assistant" with tool_responses and null content so the model
-    // turn stays open for generation. Transform tool messages for these templates.
-    const uses_tool_responses = std.mem.indexOf(u8, chat_config.chat_template, "tool_responses") != null;
-    var jinja_messages: ?[]Message = null;
-    defer if (jinja_messages) |jm| allocator.free(jm);
-
-    if (uses_tool_responses) {
-        var transformed = try allocator.alloc(Message, messages.len);
-        for (messages, 0..) |msg, idx| {
-            if (std.mem.eql(u8, msg.role, "tool") and msg.tool_call_id != null) {
-                // Change role to "assistant" (template maps to "model").
-                // Keep tool_call_id so serializeMessagesJson builds tool_responses from content.
-                transformed[idx] = .{
-                    .role = "assistant",
-                    .content = msg.content,
-                    .tool_calls = null,
-                    .tool_call_id = msg.tool_call_id,
-                };
-            } else {
-                transformed[idx] = msg;
-            }
-        }
-        jinja_messages = transformed;
-    }
-
-    // Serialize messages to JSON
-    const effective_messages = jinja_messages orelse messages;
-    const messages_json = try serializeMessagesJson(allocator, effective_messages);
+    // Serialize messages to JSON — Gemma 4 templates handle role:"tool" natively
+    // (producing <|turn>tool in the rendered output). No transformation needed.
+    const messages_json = try serializeMessagesJson(allocator, messages);
     defer allocator.free(messages_json);
 
     // Build extra context (bos_token, eos_token, enable_thinking)
@@ -209,13 +184,7 @@ fn serializeMessagesJson(allocator: std.mem.Allocator, messages: []const Message
         try appendJsonString(allocator, &buf, msg.role);
 
         try buf.appendSlice(allocator, ",\"content\":");
-        // For tool response messages transformed to role:"assistant" (Gemma path),
-        // set content to null so the Jinja template leaves the turn open for generation.
-        // The actual content is carried in tool_responses.
-        const is_transformed_tool = msg.tool_call_id != null and std.mem.eql(u8, msg.role, "assistant");
-        if (is_transformed_tool) {
-            try buf.appendSlice(allocator, "null");
-        } else if (msg.content.len > 0) {
+        if (msg.content.len > 0) {
             try appendJsonString(allocator, &buf, msg.content);
         } else {
             try buf.appendSlice(allocator, "null");
@@ -228,7 +197,9 @@ fn serializeMessagesJson(allocator: std.mem.Allocator, messages: []const Message
                 try buf.appendSlice(allocator, "{\"type\":\"function\",\"function\":{\"name\":");
                 try appendJsonString(allocator, &buf, tc.name);
                 try buf.appendSlice(allocator, ",\"arguments\":");
-                try buf.appendSlice(allocator, tc.arguments);
+                // Arguments must be a JSON string (not parsed object) for templates
+                // that format tool calls themselves (e.g. Gemma 4).
+                try appendJsonString(allocator, &buf, tc.arguments);
                 try buf.appendSlice(allocator, "}}");
             }
             try buf.append(allocator, ']');
@@ -237,35 +208,9 @@ fn serializeMessagesJson(allocator: std.mem.Allocator, messages: []const Message
         if (msg.tool_call_id) |tid| {
             try buf.appendSlice(allocator, ",\"tool_call_id\":");
             try appendJsonString(allocator, &buf, tid);
-
-            // Also include tool_responses for Jinja templates that use it (e.g. Gemma 4).
-            // Look up the tool name from the preceding assistant message's tool_calls.
-            var tool_name: []const u8 = "unknown";
-            if (i > 0) {
-                // Search backwards for the nearest assistant message with tool_calls
-                var j: usize = i;
-                while (j > 0) {
-                    j -= 1;
-                    if (messages[j].tool_calls) |prev_tcs| {
-                        for (prev_tcs) |tc| {
-                            if (std.mem.eql(u8, tc.id, tid)) {
-                                tool_name = tc.name;
-                                break;
-                            }
-                        }
-                        break; // Only check the nearest assistant with tool_calls
-                    }
-                }
-            }
-            try buf.appendSlice(allocator, ",\"tool_responses\":[{\"name\":");
-            try appendJsonString(allocator, &buf, tool_name);
-            try buf.appendSlice(allocator, ",\"response\":");
-            if (msg.content.len > 0) {
-                try appendJsonString(allocator, &buf, msg.content);
-            } else {
-                try buf.appendSlice(allocator, "\"\"");
-            }
-            try buf.appendSlice(allocator, "}]");
+            // No tool_responses field needed — Gemma 4 templates handle role:"tool"
+            // natively via the content field. Adding tool_responses causes the template
+            // to render duplicate content, wasting tokens.
         }
 
         try buf.append(allocator, '}');
@@ -535,12 +480,19 @@ pub const ThinkSplit = struct {
 /// Split model output into reasoning_content and content.
 /// Handles both `<think>...</think>` and Gemma 4's `<|channel>thought\n...<channel|>`.
 pub fn splitThinkBlock(text: []const u8, thinking: bool) ThinkSplit {
-    // Gemma 4 style: <|channel>thought\n...<channel|>
+    // Gemma 4 style: <|channel>thought\n...<channel|>\n<|channel>\ncontent
     if (std.mem.indexOf(u8, text, "<channel|>")) |end| {
         const think_tag = "<|channel>thought\n";
         const reasoning_start: usize = if (std.mem.startsWith(u8, text, think_tag)) think_tag.len else if (std.mem.startsWith(u8, text, "<|channel>thought")) "<|channel>thought".len else 0;
         const reasoning = std.mem.trim(u8, text[reasoning_start..end], "\n ");
-        const content = std.mem.trimLeft(u8, text[end + 10 ..], "\n ");
+        var content = std.mem.trimLeft(u8, text[end + 10 ..], "\n ");
+        // Strip the content channel tag: <|channel>\n or <|channel>
+        if (std.mem.startsWith(u8, content, "<|channel>\n")) {
+            content = content[11..];
+        } else if (std.mem.startsWith(u8, content, "<|channel>")) {
+            content = content[10..];
+        }
+        content = std.mem.trimLeft(u8, content, "\n ");
         return .{
             .reasoning_content = if (reasoning.len > 0) reasoning else null,
             .content = content,
@@ -624,6 +576,8 @@ pub fn parseToolCalls(allocator: std.mem.Allocator, text: []const u8) !?[]Parsed
 
             if (parseGemma4ToolCall(allocator, content)) |tc| {
                 try calls.append(allocator, tc);
+            } else {
+                log.info("  [tool-parse] Gemma4 parse FAILED for: {s}\n", .{content[0..@min(content.len, 200)]});
             }
         }
     }
@@ -688,9 +642,15 @@ fn parseGemma4ToolCall(allocator: std.mem.Allocator, content: []const u8) ?Parse
     const name = std.mem.trim(u8, after_prefix[0..brace_pos], " \t\n\r");
     if (name.len == 0) return null;
 
-    const args_str = after_prefix[brace_pos..];
+    var args_str = after_prefix[brace_pos..];
 
-    // Try JSON first (some models output valid JSON)
+    // Gemma 4 uses {{ }} (double braces) for literal braces in Jinja templates.
+    // The model often generates {{"key":"value"}} — unwrap the outer braces.
+    if (args_str.len >= 4 and std.mem.startsWith(u8, args_str, "{{") and std.mem.endsWith(u8, args_str, "}}")) {
+        args_str = args_str[1 .. args_str.len - 1]; // strip one layer of braces
+    }
+
+    // Try JSON first (model sometimes outputs valid JSON arguments)
     if (std.json.parseFromSlice(std.json.Value, allocator, args_str, .{})) |parsed| {
         defer parsed.deinit();
         if (parsed.value == .object) {
@@ -703,7 +663,10 @@ fn parseGemma4ToolCall(allocator: std.mem.Allocator, content: []const u8) ?Parse
 
     // Convert Gemma 4 custom format to JSON:
     // {key:<|"|>value<|"|>,key2:<|"|>value2<|"|>} → {"key":"value","key2":"value2"}
-    const json = convertGemma4ArgsToJson(allocator, args_str) orelse return null;
+    const json = convertGemma4ArgsToJson(allocator, args_str) orelse {
+        log.info("  [tool-parse] convertGemma4ArgsToJson FAILED for: {s}\n", .{args_str[0..@min(args_str.len, 200)]});
+        return null;
+    };
     return .{
         .name = allocator.dupe(u8, name) catch return null,
         .arguments = json,
@@ -1238,7 +1201,7 @@ test "serializeMessagesJson with tool_calls" {
     try testing.expect(std.mem.indexOf(u8, result, "get_weather") != null);
 }
 
-test "serializeMessagesJson tool response includes tool_responses for Jinja" {
+test "serializeMessagesJson tool response has tool_call_id and content" {
     const allocator = testing.allocator;
     const tool_calls = [_]ToolCall{
         .{ .id = "call_1", .name = "shell", .arguments = "{\"command\":\"ls\"}" },
@@ -1250,51 +1213,13 @@ test "serializeMessagesJson tool response includes tool_responses for Jinja" {
     const result = try serializeMessagesJson(allocator, &messages);
     defer allocator.free(result);
 
-    // Must contain tool_responses for Gemma-style Jinja templates
-    try testing.expect(std.mem.indexOf(u8, result, "\"tool_responses\"") != null);
-    // Must contain the tool name looked up from preceding assistant's tool_calls
-    try testing.expect(std.mem.indexOf(u8, result, "\"shell\"") != null);
-    // Must contain the response content
-    try testing.expect(std.mem.indexOf(u8, result, "file1.txt") != null);
-    // Must also keep tool_call_id for OpenAI-style templates
+    // Must contain tool_call_id
     try testing.expect(std.mem.indexOf(u8, result, "\"tool_call_id\"") != null);
     try testing.expect(std.mem.indexOf(u8, result, "\"call_1\"") != null);
-}
-
-test "serializeMessagesJson tool response name lookup matches by id" {
-    const allocator = testing.allocator;
-    const tool_calls = [_]ToolCall{
-        .{ .id = "call_A", .name = "readFile", .arguments = "{\"path\":\"a.txt\"}" },
-        .{ .id = "call_B", .name = "shell", .arguments = "{\"command\":\"ls\"}" },
-    };
-    const messages = [_]Message{
-        .{ .role = "assistant", .content = "", .tool_calls = &tool_calls },
-        // Response for call_B (shell), not call_A (readFile)
-        .{ .role = "tool", .content = "dir_listing", .tool_call_id = "call_B" },
-    };
-    const result = try serializeMessagesJson(allocator, &messages);
-    defer allocator.free(result);
-
-    // The tool_responses name should be "shell" (matched by id "call_B"), not "readFile"
-    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, result, .{});
-    defer parsed.deinit();
-    const tool_msg = parsed.value.array.items[1].object;
-    const tool_responses = tool_msg.get("tool_responses").?.array;
-    try testing.expectEqualStrings("shell", tool_responses.items[0].object.get("name").?.string);
-}
-
-test "serializeMessagesJson tool response falls back to unknown when no match" {
-    const allocator = testing.allocator;
-    // No preceding assistant message with tool_calls
-    const messages = [_]Message{
-        .{ .role = "tool", .content = "result", .tool_call_id = "call_orphan" },
-    };
-    const result = try serializeMessagesJson(allocator, &messages);
-    defer allocator.free(result);
-
-    // Should fall back to "unknown" tool name
-    try testing.expect(std.mem.indexOf(u8, result, "\"unknown\"") != null);
-    try testing.expect(std.mem.indexOf(u8, result, "\"tool_responses\"") != null);
+    // Must contain the response content
+    try testing.expect(std.mem.indexOf(u8, result, "file1.txt") != null);
+    // Must NOT contain tool_responses (templates handle role:"tool" natively)
+    try testing.expect(std.mem.indexOf(u8, result, "\"tool_responses\"") == null);
 }
 
 test "serializeMessagesJson full tool calling conversation" {
@@ -1325,13 +1250,11 @@ test "serializeMessagesJson full tool calling conversation" {
     const assistant = parsed.value.array.items[2].object;
     try testing.expect(assistant.get("tool_calls") != null);
 
-    // Verify tool message has both tool_call_id AND tool_responses
+    // Verify tool message has tool_call_id and content, no tool_responses
     const tool_msg = parsed.value.array.items[3].object;
     try testing.expectEqualStrings("call_99_0", tool_msg.get("tool_call_id").?.string);
-    try testing.expect(tool_msg.get("tool_responses") != null);
-    const tool_responses = tool_msg.get("tool_responses").?.array;
-    try testing.expectEqualStrings("shell", tool_responses.items[0].object.get("name").?.string);
-    try testing.expectEqualStrings("hello", tool_responses.items[0].object.get("response").?.string);
+    try testing.expectEqualStrings("hello", tool_msg.get("content").?.string);
+    try testing.expect(tool_msg.get("tool_responses") == null);
 }
 
 test "serializeMessagesJson multiple parallel tool responses" {
@@ -1351,15 +1274,13 @@ test "serializeMessagesJson multiple parallel tool responses" {
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, result, .{});
     defer parsed.deinit();
 
-    // First tool response should have name "readFile"
+    // Both tool messages should have tool_call_id and content
     const tool1 = parsed.value.array.items[1].object;
-    const tr1 = tool1.get("tool_responses").?.array.items[0].object;
-    try testing.expectEqualStrings("readFile", tr1.get("name").?.string);
+    try testing.expectEqualStrings("call_1", tool1.get("tool_call_id").?.string);
+    try testing.expectEqualStrings("file content", tool1.get("content").?.string);
 
-    // Second tool response should have name "shell"
     const tool2 = parsed.value.array.items[2].object;
-    const tr2 = tool2.get("tool_responses").?.array.items[0].object;
-    try testing.expectEqualStrings("shell", tr2.get("name").?.string);
+    try testing.expectEqualStrings("call_2", tool2.get("tool_call_id").?.string);
 }
 
 test "serializeMessagesJson tool response with empty content" {
@@ -1374,9 +1295,9 @@ test "serializeMessagesJson tool response with empty content" {
     const result = try serializeMessagesJson(allocator, &messages);
     defer allocator.free(result);
 
-    // Should still have tool_responses with empty response string
-    try testing.expect(std.mem.indexOf(u8, result, "\"tool_responses\"") != null);
-    try testing.expect(std.mem.indexOf(u8, result, "\"shell\"") != null);
+    // Should have tool_call_id but no tool_responses
+    try testing.expect(std.mem.indexOf(u8, result, "\"tool_call_id\"") != null);
+    try testing.expect(std.mem.indexOf(u8, result, "\"tool_responses\"") == null);
 }
 
 // ── Fallback formatter tests ──

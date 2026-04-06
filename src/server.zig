@@ -79,6 +79,9 @@ fn getTimeoutNs() u64 {
 var cached_prompt_ids: ?[]u32 = null;
 var cached_has_tools: bool = false;
 
+/// Set by generation handlers when output is pad-only (signals bad KV cache state).
+var last_generation_was_pad: bool = false;
+
 /// Start the HTTP server on the given host and port.
 pub fn serve(
     allocator: std.mem.Allocator,
@@ -971,8 +974,25 @@ fn handleChatCompletions(
         };
     }
 
-    // Store prompt IDs for next request's cache comparison
-    updateCachedPrompt(allocator, prompt_ids, has_tools);
+    // Store prompt IDs for next request's cache comparison — but NOT if generation
+    // produced pad-only output, which indicates corrupted KV cache state.
+    // Also invalidate after tool-calling requests: the generated tool call tokens
+    // are in the KV cache but not in cached_prompt_ids, so the next request
+    // (which includes tool results) would reuse a cache with stale attention state.
+    if (last_generation_was_pad or has_tools) {
+        if (last_generation_was_pad) {
+            log.info("  [cache] invalidating cache after pad-only generation\n", .{});
+        } else {
+            log.info("  [cache] invalidating cache after tool-calling request\n", .{});
+        }
+        try xfm.resetCache();
+        if (cached_prompt_ids) |old| {
+            allocator.free(old);
+            cached_prompt_ids = null;
+        }
+    } else {
+        updateCachedPrompt(allocator, prompt_ids, has_tools);
+    }
 }
 
 fn handleCompletions(
@@ -1339,6 +1359,18 @@ fn handleNonStreamingGeneration(
         allocator.free(lps);
     };
 
+    // Detect pad-only output (all token IDs are 0) — signals corrupted KV cache
+    if (result.token_ids.len > 0) {
+        var all_pad = true;
+        for (result.token_ids) |tid| {
+            if (tid != 0) { all_pad = false; break; }
+        }
+        last_generation_was_pad = all_pad;
+        if (all_pad) {
+            log.info("  [cache] pad-only output detected ({d} tokens) — will invalidate cache\n", .{result.token_ids.len});
+        }
+    }
+
     // Apply stop sequences: truncate text at first match
     var final_text: []const u8 = result.text;
     var finish_reason = result.finish_reason;
@@ -1550,8 +1582,14 @@ fn handleStreamingGeneration(
     var think_tokens: i32 = 0; // count of tokens generated in think block
     var budget_exhausted = false; // true when reasoning budget hit
 
+    // Pad-only detection: track if all generated tokens are pad (token ID 0)
+    var all_pad = true;
+    var gen_token_count: u32 = 0;
+
     // Generate tokens
     while (try gen.next(allocator)) |token_id| {
+        gen_token_count += 1;
+        if (token_id != 0) all_pad = false;
         const strip = tok.tok_type == .sentencepiece_bpe;
         const raw_decoded = try tok.decode(allocator, &[_]u32{token_id}, strip and false);
 
@@ -1613,8 +1651,39 @@ fn handleStreamingGeneration(
         }
 
         if (has_tools) {
-            // Buffer tokens — we'll emit them after generation if no tool calls found
+            // Stream tokens until we detect a tool call pattern starting, then buffer.
+            // Tool call prefixes: <tool_call>, <|tool_call>, {"name":
             try token_texts.append(allocator, token_text);
+            // text_buf already updated above
+
+            const buf = text_buf.items;
+            const maybe_tool = std.mem.indexOf(u8, buf, "<tool_call") != null or
+                std.mem.indexOf(u8, buf, "<|tool_call") != null or
+                (buf.len > 0 and buf[0] == '{' and std.mem.indexOf(u8, buf, "\"name\"") != null) or
+                // Partial prefix at the end that could become a tool call tag
+                (buf.len >= 1 and buf[buf.len - 1] == '<');
+
+            if (!maybe_tool) {
+                // No tool call pattern — flush buffered tokens as streamed content.
+                // But if thinking is enabled, keep buffering if a thinking block might be starting.
+                const maybe_thinking = enable_thinking and (
+                    std.mem.indexOf(u8, buf, "<|channel>thought") != null or
+                    std.mem.indexOf(u8, buf, "<think>") != null or
+                    // Partial: <|channel> arrived but "thought" not yet
+                    (std.mem.startsWith(u8, buf, "<|channel>") and buf.len < 18) or
+                    (std.mem.startsWith(u8, buf, "<think") and buf.len < 7)
+                );
+                if (maybe_thinking) {
+                    // Keep buffering — thinking block in progress, will be split at end
+                } else {
+                    for (token_texts.items) |tt| {
+                        defer allocator.free(tt);
+                        try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = tt }, null, null);
+                    }
+                    token_texts.clearRetainingCapacity();
+                }
+            }
+            // Otherwise keep buffering — tool call may be in progress
         } else if (enable_thinking and in_think_block) {
             // Inside <think> block — stream as reasoning_content with </think> detection
             defer allocator.free(token_text);
@@ -1670,9 +1739,16 @@ fn handleStreamingGeneration(
                 if (close_pos > 0) {
                     try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = think_buf.items[0..close_pos] }, null, null);
                 }
-                // Content after </think>
+                // Content after </think> or <channel|>
                 const after = close_pos + think_close_tag.len;
-                const content_after = std.mem.trimLeft(u8, think_buf.items[after..], "\n ");
+                var content_after = std.mem.trimLeft(u8, think_buf.items[after..], "\n ");
+                // Strip Gemma 4 content channel tag: <|channel>\n or <|channel>
+                if (std.mem.startsWith(u8, content_after, "<|channel>\n")) {
+                    content_after = content_after[11..];
+                } else if (std.mem.startsWith(u8, content_after, "<|channel>")) {
+                    content_after = content_after[10..];
+                }
+                content_after = std.mem.trimLeft(u8, content_after, "\n ");
                 if (content_after.len > 0) {
                     try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = content_after }, null, null);
                 }
@@ -1696,8 +1772,20 @@ fn handleStreamingGeneration(
             }
         } else {
             defer allocator.free(token_text);
+            // Skip Gemma 4 channel tags that leak after thinking blocks
+            if (std.mem.eql(u8, token_text, "<|channel>") or std.mem.eql(u8, token_text, "<channel|>")) {
+                continue;
+            }
             try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = token_text }, null, null);
         }
+    }
+
+    // Detect pad-only generation
+    if (gen_token_count > 0 and all_pad) {
+        last_generation_was_pad = true;
+        log.info("  [cache] pad-only output detected ({d} tokens) — will invalidate cache\n", .{gen_token_count});
+    } else {
+        last_generation_was_pad = false;
     }
 
     // Flush any remaining think buffer
@@ -1724,7 +1812,7 @@ fn handleStreamingGeneration(
 
             // Emit reasoning_content before tool calls if thinking is enabled
             if (enable_thinking) {
-                const think_split = chat_mod.splitThinkBlock(text_buf.items, false);
+                const think_split = chat_mod.splitThinkBlock(text_buf.items, true);
                 if (think_split.reasoning_content) |reasoning| {
                     // Apply reasoning budget truncation if set
                     const final_reasoning = if (reasoning_budget >= 0) blk: {
@@ -1749,30 +1837,22 @@ fn handleStreamingGeneration(
             for (tool_calls, 0..) |tc, i| {
                 const tc_id = try std.fmt.allocPrint(allocator, "call_{d}_{d}", .{ chat_id, i });
                 defer allocator.free(tc_id);
+
+                // Escape the full arguments string for embedding in JSON
+                const escaped_args = try jsonEscape(allocator, tc.arguments);
+                defer allocator.free(escaped_args);
+                // Strip outer quotes from jsonEscape result (it wraps in "...")
+                const args_inner = if (escaped_args.len >= 2 and escaped_args[0] == '"')
+                    escaped_args[1 .. escaped_args.len - 1]
+                else
+                    escaped_args;
+
+                // First delta: name + id + full arguments (clients accumulate these)
                 const first_delta = try std.fmt.allocPrint(allocator,
-                    \\[{{"index":{d},"id":"{s}","type":"function","function":{{"name":"{s}","arguments":""}}}}]
-                , .{ i, tc_id, tc.name });
+                    \\[{{"index":{d},"id":"{s}","type":"function","function":{{"name":"{s}","arguments":"{s}"}}}}]
+                , .{ i, tc_id, tc.name, args_inner });
                 defer allocator.free(first_delta);
                 try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .tool_calls_json = first_delta }, null, null);
-
-                const chunk_size: usize = 20;
-                var arg_pos: usize = 0;
-                while (arg_pos < tc.arguments.len) {
-                    const end = @min(arg_pos + chunk_size, tc.arguments.len);
-                    const arg_chunk = tc.arguments[arg_pos..end];
-                    const escaped_chunk = try jsonEscape(allocator, arg_chunk);
-                    defer allocator.free(escaped_chunk);
-                    const inner = if (escaped_chunk.len >= 2 and escaped_chunk[0] == '"')
-                        escaped_chunk[1 .. escaped_chunk.len - 1]
-                    else
-                        escaped_chunk;
-                    const arg_delta = try std.fmt.allocPrint(allocator,
-                        \\[{{"index":{d},"function":{{"arguments":"{s}"}}}}]
-                    , .{ i, inner });
-                    defer allocator.free(arg_delta);
-                    try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .tool_calls_json = arg_delta }, null, null);
-                    arg_pos = end;
-                }
             }
             finish_reason = "tool_calls";
         } else {
@@ -1784,7 +1864,7 @@ fn handleStreamingGeneration(
                 for (token_texts.items) |t| {
                     try full_text.appendSlice(allocator, t);
                 }
-                const think_split = chat_mod.splitThinkBlock(full_text.items, false);
+                const think_split = chat_mod.splitThinkBlock(full_text.items, true);
                 if (think_split.reasoning_content) |reasoning| {
                     // Apply reasoning budget truncation if set
                     const final_reasoning = if (reasoning_budget >= 0) blk: {
@@ -1948,22 +2028,25 @@ fn reuseKVCache(allocator: std.mem.Allocator, xfm: *Transformer, prompt_ids: []c
         }
 
         // For models with sliding window attention: if the previous prompt exceeded
-        // the window size, sliding window layers have trimmed their buffers and
-        // buffer indices no longer map to sequence positions (buffer[0] != position[0]).
-        // Truncation assumes buffer[i] == position[i], so reuse is invalid.
-        // Fall through to full reset instead.
+        // the window size, local-attention layers have trimmed their KV buffers.
+        // After trimming, buffer[i] no longer maps to position[i] — the RoPE
+        // embeddings baked into the cached K vectors are at the ORIGINAL positions,
+        // not the buffer indices. Truncating to a shared prefix would produce
+        // garbage attention because the position encoding is wrong.
+        // Additionally, if the NEW prompt exceeds the window, we must reset because
+        // the shared prefix tokens will be at different buffer positions after trimming.
+        // Safe rule: if either prompt exceeds the sliding window, don't reuse cache.
         if (shared > 0 and xfm.config.has_sliding_window) {
             const sw = xfm.config.sliding_window;
-            if (cached.len + 1 > sw and shared < sw) {
-                // Previous prompt was longer than sliding window — buffer positions are shifted.
-                // Truncation would keep K/V with wrong RoPE positions. Full reset is needed.
-                log.info("  [cache] reset — sliding window position shift (cached={d}, shared={d}, sw={d})\n", .{ cached.len, shared, sw });
+            const prev_exceeded = cached.len > sw;
+            const next_will_exceed = prompt_ids.len > sw;
+            if (prev_exceeded or next_will_exceed) {
+                log.info("  [cache] reset — sliding window exceeded (cached={d}, new={d}, sw={d})\n", .{ cached.len, prompt_ids.len, sw });
                 if (cached_prompt_ids) |old| {
                     allocator.free(old);
                     cached_prompt_ids = null;
                 }
-                xfm.cache.deinit();
-                xfm.cache = try transformer_mod.KVCache.init(xfm.cache.allocator, xfm.config.num_hidden_layers);
+                try xfm.resetCache();
                 return .{ .new_tokens = prompt_ids, .cached_tokens = 0 };
             }
         }
@@ -1971,6 +2054,7 @@ fn reuseKVCache(allocator: std.mem.Allocator, xfm: *Transformer, prompt_ids: []c
         if (shared > 0) {
             // Truncate KV cache to the shared prefix
             try xfm.cache.truncate(shared, xfm.s);
+            xfm.moe_seq_offset = shared;
             log.debug("  [cache] reusing {d}/{d} tokens from previous prompt\n", .{ shared, prompt_ids.len });
             return .{
                 .new_tokens = prompt_ids[shared..],
@@ -1983,8 +2067,7 @@ fn reuseKVCache(allocator: std.mem.Allocator, xfm: *Transformer, prompt_ids: []c
     if (cached_prompt_ids != null) {
         log.info("  [cache] reset — no shared prefix\n", .{});
     }
-    xfm.cache.deinit();
-    xfm.cache = try transformer_mod.KVCache.init(xfm.cache.allocator, xfm.config.num_hidden_layers);
+    try xfm.resetCache();
     return .{ .new_tokens = prompt_ids, .cached_tokens = 0 };
 }
 
