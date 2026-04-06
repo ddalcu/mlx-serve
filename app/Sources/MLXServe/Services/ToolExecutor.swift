@@ -164,14 +164,44 @@ struct SearchFilesHandler: ToolHandler {
 
 struct WebSearchHandler: ToolHandler {
     func execute(parameters: [String: String], workingDirectory: String?) async throws -> String {
-        guard let query = parameters["query"] else {
+        guard let query = parameters["query"], !query.isEmpty else {
             throw ToolError.missingParameter("query")
         }
         let encoded = query.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? query
         let url = "https://html.duckduckgo.com/html/?q=\(encoded)"
 
         let browser = await BrowserManager.shared
-        return try await browser.navigate(to: url)
+        _ = try await browser.navigate(to: url)
+        // Wait for search results to render
+        try await Task.sleep(nanoseconds: 500_000_000)
+
+        // Extract structured search results instead of raw page text
+        let js = """
+        (function() {
+            var results = [];
+            var links = document.querySelectorAll('.result__a, .result__title a, a.result-link');
+            if (links.length === 0) links = document.querySelectorAll('a[href*="//"]');
+            var seen = new Set();
+            for (var i = 0; i < Math.min(links.length, 8); i++) {
+                var a = links[i];
+                var href = a.href || '';
+                if (href.includes('duckduckgo.com') || seen.has(href)) continue;
+                seen.add(href);
+                var title = (a.textContent || '').trim();
+                var snippet = '';
+                var parent = a.closest('.result') || a.closest('.web-result') || a.parentElement;
+                if (parent) {
+                    var snipEl = parent.querySelector('.result__snippet, .result-snippet');
+                    if (snipEl) snippet = snipEl.textContent.trim();
+                }
+                if (title && href) results.push(title + '\\n' + href + (snippet ? '\\n' + snippet : ''));
+            }
+            return results.length > 0 ? results.join('\\n\\n') : document.body.innerText.substring(0, 2000);
+        })()
+        """
+        let result = try await browser.webView.evaluateJavaScript(js)
+        let text = (result as? String) ?? "No search results found"
+        return "Search results for '\(query)':\n\n\(text)"
     }
 }
 
@@ -187,8 +217,15 @@ struct BrowseHandler: ToolHandler {
             guard let url = parameters["url"] else { throw ToolError.missingParameter("url") }
             return try await browser.navigate(to: url)
         case "readText":
+            // Navigate to URL first if provided, then read text
+            if let url = parameters["url"] {
+                _ = try await browser.navigate(to: url)
+            }
             return try await browser.readText()
         case "readHTML":
+            if let url = parameters["url"] {
+                _ = try await browser.navigate(to: url)
+            }
             return try await browser.readHTML()
         case "click":
             guard let selector = parameters["selector"] else { throw ToolError.missingParameter("selector") }

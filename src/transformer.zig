@@ -130,34 +130,20 @@ pub const KVCache = struct {
         entry.offset += new_len;
         if (layer == 0) self.step += new_len;
 
-        // 6. max_seq trimming
-        if (max_seq > 0 and entry.offset > max_seq) {
-            const shape = mlx.getShape(entry.keys);
-            const max_s: c_int = @intCast(max_seq);
-            const current: c_int = @intCast(entry.offset);
-            const trim_start = current - max_s;
-            const start = [_]c_int{ 0, 0, trim_start, 0 };
-            const stop = [_]c_int{ shape[0], shape[1], current, shape[3] };
-            const strides = [_]c_int{ 1, 1, 1, 1 };
-
-            var trimmed_k = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_slice(&trimmed_k, entry.keys, &start, 4, &stop, 4, &strides, 4, s));
-            _ = mlx.mlx_array_free(entry.keys);
-            entry.keys = trimmed_k;
-
-            var trimmed_v = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_slice(&trimmed_v, entry.values, &start, 4, &stop, 4, &strides, 4, s));
-            _ = mlx.mlx_array_free(entry.values);
-            entry.values = trimmed_v;
-
-            entry.offset = max_seq;
-        }
-
-        // 7. Create views — slice [0:offset] for attention
+        // 6. Create views for attention.
+        //    During PREFILL (new_len > 1): return ALL entries. The sliding window mask
+        //    handles attention scope. This matches mlx-lm's RotatingKVCache behavior.
+        //    During DECODE (new_len == 1): return only the last max_seq entries for
+        //    sliding window layers, since decode doesn't use a mask.
         const cur_shape = mlx.getShape(entry.keys);
-        const v_off: c_int = @intCast(entry.offset);
-        const v_start = [_]c_int{ 0, 0, 0, 0 };
-        const v_stop = [_]c_int{ cur_shape[0], cur_shape[1], v_off, cur_shape[3] };
+        const total: c_int = @intCast(entry.offset);
+        const is_decode = new_len == 1;
+        const view_start: c_int = if (is_decode and max_seq > 0 and entry.offset > max_seq)
+            total - @as(c_int, @intCast(max_seq))
+        else
+            0;
+        const v_start = [_]c_int{ 0, 0, view_start, 0 };
+        const v_stop = [_]c_int{ cur_shape[0], cur_shape[1], total, cur_shape[3] };
         const v_strides = [_]c_int{ 1, 1, 1, 1 };
 
         entry.key_view = mlx.mlx_array_new();
@@ -1539,13 +1525,14 @@ pub const Transformer = struct {
 
         if (cfg.has_sliding_window) {
             const sw: c_int = @intCast(cfg.sliding_window);
-            // Use the post-trim KV length for local layers: after cache.update()
-            // trims to sw, the K tensor has min(total_kv, sw) entries.
-            const local_kv_len: c_int = @min(total_kv, sw);
             if (is_prefill) {
-                local_prefill_mask = try self.createSlidingWindowMask(seq_len, local_kv_len, sw);
+                // During prefill, K has all total_kv entries (no windowing in views).
+                // The sliding window mask limits attention scope.
+                local_prefill_mask = try self.createSlidingWindowMask(seq_len, total_kv, sw);
             }
             if (!is_prefill and total_kv > sw) {
+                // During decode, K view has min(total_kv, sw) entries.
+                const local_kv_len: c_int = @min(total_kv, sw);
                 local_decode_mask = try self.createSlidingWindowDecodeMask(local_kv_len, sw);
             }
         }
@@ -1840,11 +1827,11 @@ pub const Transformer = struct {
         if (is_gemma4 and cfg.has_sliding_window) {
             const sw: c_int = @intCast(cfg.sliding_window);
             const total_kv: c_int = @as(c_int, @intCast(offset)) + seq_len;
-            const local_kv_len: c_int = @min(total_kv, sw);
             if (is_prefill) {
-                local_prefill_mask = try self.createSlidingWindowMask(seq_len, local_kv_len, sw);
+                local_prefill_mask = try self.createSlidingWindowMask(seq_len, total_kv, sw);
             }
             if (!is_prefill and total_kv > sw) {
+                const local_kv_len: c_int = @min(total_kv, sw);
                 local_decode_mask = try self.createSlidingWindowDecodeMask(local_kv_len, sw);
             }
         }
@@ -3552,7 +3539,7 @@ fn testKV(seq_len: usize, s: mlx.mlx_stream) mlx.mlx_array {
     return arr;
 }
 
-test "KVCache step tracks absolute position through sliding window trimming" {
+test "KVCache sliding window views return last max_seq entries" {
     const s = mlx.gpuStream();
     var cache = try KVCache.init(testing.allocator, 1);
     defer cache.deinit();
@@ -3565,7 +3552,7 @@ test "KVCache step tracks absolute position through sliding window trimming" {
         defer _ = mlx.mlx_array_free(v);
         _ = try cache.update(0, k, v, s, 4);
     }
-    // After prefill: offset=3, step should be 3
+    // After prefill: offset=3, step=3
     try testing.expectEqual(@as(usize, 3), cache.entries[0].offset);
     try testing.expectEqual(@as(usize, 3), cache.step);
 
@@ -3577,32 +3564,36 @@ test "KVCache step tracks absolute position through sliding window trimming" {
         defer _ = mlx.mlx_array_free(v);
         _ = try cache.update(0, k, v, s, 4);
     }
-    // offset=4 (at max_seq), step=4
     try testing.expectEqual(@as(usize, 4), cache.entries[0].offset);
     try testing.expectEqual(@as(usize, 4), cache.step);
 
-    // Decode token 5 — triggers trimming, offset caps at 4, step must be 5
+    // Decode token 5 — exceeds window, but buffer grows (no trimming)
+    // Views return last 4 entries only
     {
         const k = testKV(1, s);
         defer _ = mlx.mlx_array_free(k);
         const v = testKV(1, s);
         defer _ = mlx.mlx_array_free(v);
-        _ = try cache.update(0, k, v, s, 4);
+        const kv = try cache.update(0, k, v, s, 4);
+        // View should be 4 entries (max_seq), not 5
+        const view_shape = mlx.getShape(kv[0]);
+        try testing.expectEqual(@as(c_int, 4), view_shape[2]);
     }
-    // BUG before fix: offset would be 4, and seqLen(0) returns 4 — RoPE sees position 4 forever
-    // After fix: offset=4 (buffer capped), step=5 (absolute position keeps growing)
-    try testing.expectEqual(@as(usize, 4), cache.entries[0].offset);
+    // Buffer has 5 entries, but view shows 4. step=5 (absolute).
+    try testing.expectEqual(@as(usize, 5), cache.entries[0].offset);
     try testing.expectEqual(@as(usize, 5), cache.step);
 
-    // Decode tokens 6,7,8 — step keeps incrementing
+    // Decode tokens 6,7,8 — step keeps incrementing, views stay at max_seq
     for (0..3) |_| {
         const k = testKV(1, s);
         defer _ = mlx.mlx_array_free(k);
         const v = testKV(1, s);
         defer _ = mlx.mlx_array_free(v);
-        _ = try cache.update(0, k, v, s, 4);
+        const kv = try cache.update(0, k, v, s, 4);
+        const view_shape = mlx.getShape(kv[0]);
+        try testing.expectEqual(@as(c_int, 4), view_shape[2]);
     }
-    try testing.expectEqual(@as(usize, 4), cache.entries[0].offset);
+    try testing.expectEqual(@as(usize, 8), cache.entries[0].offset);
     try testing.expectEqual(@as(usize, 8), cache.step);
 }
 

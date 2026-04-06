@@ -6,11 +6,17 @@ class AppState: ObservableObject {
     @Published var server = ServerManager()
     @Published var downloads = DownloadManager()
     @Published var localModels: [LocalModel] = []
-    @Published var selectedModelPath: String = ""
+    @Published var selectedModelPath: String = "" {
+        didSet { UserDefaults.standard.set(selectedModelPath, forKey: "selectedModelPath") }
+    }
     @Published var chatSessions: [ChatSession] = []
     @Published var activeChatId: UUID?
     @Published var agentMemory = AgentMemory()
     @Published var toolExecutor = ToolExecutor()
+    let testServer = TestServer()
+    @Published var autoStartServer: Bool {
+        didSet { UserDefaults.standard.set(autoStartServer, forKey: "autoStartServer") }
+    }
     @Published var maxTokens: Int {
         didSet { UserDefaults.standard.set(maxTokens, forKey: "maxTokens") }
     }
@@ -22,10 +28,34 @@ class AppState: ObservableObject {
     }()
 
     init() {
+        self.autoStartServer = UserDefaults.standard.bool(forKey: "autoStartServer")
+        self.selectedModelPath = UserDefaults.standard.string(forKey: "selectedModelPath") ?? ""
         let stored = UserDefaults.standard.integer(forKey: "maxTokens")
         self.maxTokens = stored > 0 ? stored : 8192
         refreshModels()
         loadChatHistory()
+        testServer.start(appState: self)
+
+        // Auto-start server if enabled and a model is available
+        if autoStartServer, !selectedModelPath.isEmpty {
+            server.start(modelPath: selectedModelPath)
+        }
+
+        // Fallback health detection — runs detached to avoid blocking MainActor
+        if autoStartServer {
+            let checkPort = server.port
+            let mgr = server
+            Task.detached {
+                let api = APIClient()
+                for _ in 0..<120 {
+                    try? await Task.sleep(nanoseconds: 1_000_000_000)
+                    if let ok = try? await api.checkHealth(port: checkPort), ok {
+                        await mgr.forceRunning()
+                        return
+                    }
+                }
+            }
+        }
     }
 
     func refreshModels() {

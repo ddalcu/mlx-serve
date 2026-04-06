@@ -4,18 +4,24 @@ enum AgentPrompt {
 
     static let skillManager = SkillManager()
 
-    static let systemPrompt = "You are a helpful macOS assistant. Use tools for tasks. Answer directly when no tools needed. For web search use webSearch tool."
+    static let systemPrompt = """
+        You are a helpful macOS assistant with tool access. \
+        When calling tools, ALWAYS pass arguments as JSON like {"key": "value"}. \
+        Never omit required parameters — every tool call must include all required fields. \
+        After receiving tool results, summarize what happened and answer the user. \
+        For multi-step tasks, call tools one at a time.
+        """
 
-    /// OpenAI-format tool definitions — kept minimal to reduce prompt tokens for small models.
+    /// OpenAI-format tool definitions with descriptions that guide parameter usage.
     static let toolDefinitions: [[String: Any]] = [
         [
             "type": "function",
             "function": [
                 "name": "shell",
-                "description": "Run a command",
+                "description": "Run a shell command. Example: {\"command\": \"ls -la /tmp\"}",
                 "parameters": [
                     "type": "object",
-                    "properties": ["command": ["type": "string"]],
+                    "properties": ["command": ["type": "string", "description": "The shell command to execute"]],
                     "required": ["command"]
                 ]
             ] as [String: Any]
@@ -24,12 +30,12 @@ enum AgentPrompt {
             "type": "function",
             "function": [
                 "name": "writeFile",
-                "description": "Write a file",
+                "description": "Write content to a file. Example: {\"path\": \"/tmp/f.txt\", \"content\": \"hello\"}",
                 "parameters": [
                     "type": "object",
                     "properties": [
-                        "path": ["type": "string"],
-                        "content": ["type": "string"]
+                        "path": ["type": "string", "description": "Absolute file path"],
+                        "content": ["type": "string", "description": "File content to write"]
                     ],
                     "required": ["path", "content"]
                 ]
@@ -39,10 +45,10 @@ enum AgentPrompt {
             "type": "function",
             "function": [
                 "name": "readFile",
-                "description": "Read a file",
+                "description": "Read a file's contents. Example: {\"path\": \"/tmp/f.txt\"}",
                 "parameters": [
                     "type": "object",
-                    "properties": ["path": ["type": "string"]],
+                    "properties": ["path": ["type": "string", "description": "Absolute file path to read"]],
                     "required": ["path"]
                 ]
             ] as [String: Any]
@@ -51,13 +57,13 @@ enum AgentPrompt {
             "type": "function",
             "function": [
                 "name": "editFile",
-                "description": "Find and replace in file",
+                "description": "Find and replace text in a file. Example: {\"path\": \"/tmp/f.txt\", \"find\": \"old\", \"replace\": \"new\"}",
                 "parameters": [
                     "type": "object",
                     "properties": [
-                        "path": ["type": "string"],
-                        "find": ["type": "string"],
-                        "replace": ["type": "string"]
+                        "path": ["type": "string", "description": "Absolute file path"],
+                        "find": ["type": "string", "description": "Text to find"],
+                        "replace": ["type": "string", "description": "Replacement text"]
                     ],
                     "required": ["path", "find", "replace"]
                 ]
@@ -67,10 +73,10 @@ enum AgentPrompt {
             "type": "function",
             "function": [
                 "name": "searchFiles",
-                "description": "Grep for pattern",
+                "description": "Search files for a text pattern (grep). Example: {\"pattern\": \"TODO\"}",
                 "parameters": [
                     "type": "object",
-                    "properties": ["pattern": ["type": "string"]],
+                    "properties": ["pattern": ["type": "string", "description": "Text pattern to search for"]],
                     "required": ["pattern"]
                 ]
             ] as [String: Any]
@@ -79,14 +85,14 @@ enum AgentPrompt {
             "type": "function",
             "function": [
                 "name": "browse",
-                "description": "Browse a URL",
+                "description": "Browse a URL. Use action 'navigate' to visit, 'readText' to extract page text. Example: {\"action\": \"readText\", \"url\": \"https://example.com\"}",
                 "parameters": [
                     "type": "object",
                     "properties": [
-                        "action": ["type": "string"],
-                        "url": ["type": "string"]
+                        "action": ["type": "string", "description": "navigate or readText"],
+                        "url": ["type": "string", "description": "URL to browse"]
                     ],
-                    "required": ["action"]
+                    "required": ["action", "url"]
                 ]
             ] as [String: Any]
         ],
@@ -94,10 +100,10 @@ enum AgentPrompt {
             "type": "function",
             "function": [
                 "name": "webSearch",
-                "description": "Search the web",
+                "description": "Search the web using DuckDuckGo. Example: {\"query\": \"latest news\"}",
                 "parameters": [
                     "type": "object",
-                    "properties": ["query": ["type": "string"]],
+                    "properties": ["query": ["type": "string", "description": "Search query"]],
                     "required": ["query"]
                 ]
             ] as [String: Any]

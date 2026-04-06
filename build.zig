@@ -20,13 +20,11 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    // jinja.cpp (C++ Jinja2 engine compiled by Zig)
-    mod.addCSourceFiles(.{
-        .files = &.{"lib/jinja_cpp/jinja_wrapper.cpp"},
-        .flags = &.{ "-std=c++11", "-DNDEBUG" },
-    });
+    // Jinja2 template engine (from llama.cpp's common/jinja + nlohmann/json).
+    // Pre-compiled as a static library with system clang++ (C++17 requires system libc++).
+    // Rebuild with: cd lib/jinja_cpp && for f in jinja_wrapper caps lexer parser runtime jinja_string value; do clang++ -std=c++17 -O2 -DNDEBUG -I . -c $f.cpp -o obj/$f.o; done && ar rcs libjinja.a obj/*.o
+    mod.addObjectFile(b.path("lib/jinja_cpp/libjinja.a"));
     mod.addIncludePath(b.path("lib/jinja_cpp"));
-    mod.addIncludePath(b.path("lib/jinja_cpp/third_party"));
 
     // mlx-c include/lib paths (homebrew)
     mod.addIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
@@ -66,12 +64,9 @@ pub fn build(b: *std.Build) void {
         },
     });
 
-    test_mod.addCSourceFiles(.{
-        .files = &.{"lib/jinja_cpp/jinja_wrapper.cpp"},
-        .flags = &.{ "-std=c++11", "-DNDEBUG" },
-    });
+    test_mod.addObjectFile(b.path("lib/jinja_cpp/libjinja.a"));
     test_mod.addIncludePath(b.path("lib/jinja_cpp"));
-    test_mod.addIncludePath(b.path("lib/jinja_cpp/third_party"));
+    test_mod.linkSystemLibrary("c++", .{});
     test_mod.addIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
     test_mod.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
     test_mod.linkSystemLibrary("mlxc", .{});

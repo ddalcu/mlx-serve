@@ -1,0 +1,895 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MLX Serve — Run LLMs natively on your Mac</title>
+  <meta name="description" content="Native Zig inference server for Apple Silicon. OpenAI-compatible API. No Python. Just fast.">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <style>
+    :root {
+      --white: #ffffff;
+      --bg-alt: #f5f5f7;
+      --text-primary: #1d1d1f;
+      --text-secondary: #6e6e73;
+      --text-tertiary: #86868b;
+      --blue: #0071e3;
+      --blue-hover: #0077ed;
+      --blue-subtle: rgba(0, 113, 227, 0.08);
+      --zig-orange: #f7a41d;
+      --border: rgba(0, 0, 0, 0.08);
+      --radius: 16px;
+      --radius-sm: 10px;
+      --code-bg: #1d1d1f;
+      --code-text: #e5e5e7;
+      --shadow-card: 0 2px 20px rgba(0, 0, 0, 0.04), 0 0 0 1px rgba(0, 0, 0, 0.04);
+      --shadow-elevated: 0 8px 40px rgba(0, 0, 0, 0.08), 0 0 0 1px rgba(0, 0, 0, 0.04);
+    }
+
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    html {
+      scroll-behavior: smooth;
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+    }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'SF Pro Text', 'Helvetica Neue', Helvetica, Arial, sans-serif;
+      color: var(--text-primary);
+      background: var(--white);
+      line-height: 1.5;
+      overflow-x: hidden;
+    }
+
+    /* ─── NAV ─── */
+    nav {
+      position: fixed;
+      top: 0;
+      left: 0;
+      right: 0;
+      z-index: 100;
+      height: 52px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 max(24px, calc((100vw - 980px) / 2));
+      background: rgba(255, 255, 255, 0.72);
+      backdrop-filter: saturate(180%) blur(20px);
+      -webkit-backdrop-filter: saturate(180%) blur(20px);
+      border-bottom: 0.5px solid var(--border);
+    }
+
+    .nav-logo {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      text-decoration: none;
+      color: var(--text-primary);
+    }
+
+    .nav-logo-img {
+      width: 28px;
+      height: 28px;
+      border-radius: 7px;
+    }
+
+    .nav-logo span {
+      font-size: 15px;
+      font-weight: 600;
+      letter-spacing: -0.01em;
+    }
+
+    .nav-links {
+      display: flex;
+      align-items: center;
+      gap: 28px;
+      list-style: none;
+    }
+
+    .nav-links a {
+      font-size: 13px;
+      color: var(--text-secondary);
+      text-decoration: none;
+      transition: color 0.2s;
+    }
+
+    .nav-links a:hover { color: var(--text-primary); }
+
+    .nav-github {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .nav-github svg {
+      width: 18px;
+      height: 18px;
+      fill: var(--text-primary);
+      transition: fill 0.2s;
+    }
+
+    .nav-github:hover svg { fill: var(--blue); }
+
+    /* ─── HERO ─── */
+    .hero {
+      padding: 140px 24px 80px;
+      text-align: center;
+      position: relative;
+      overflow: hidden;
+    }
+
+    .hero::before {
+      content: '';
+      position: absolute;
+      top: -20%;
+      left: 50%;
+      transform: translateX(-50%);
+      width: 800px;
+      height: 600px;
+      background: radial-gradient(ellipse at center, rgba(0, 113, 227, 0.06) 0%, transparent 70%);
+      pointer-events: none;
+    }
+
+    .hero-badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 5px 14px 5px 8px;
+      background: var(--blue-subtle);
+      border-radius: 100px;
+      font-size: 13px;
+      font-weight: 500;
+      color: var(--blue);
+      margin-bottom: 28px;
+      animation: fadeUp 0.6s ease both;
+    }
+
+    .hero-badge svg { width: 18px; height: 18px; }
+
+    .hero h1 {
+      font-size: clamp(44px, 7vw, 72px);
+      font-weight: 700;
+      letter-spacing: -0.035em;
+      line-height: 1.05;
+      max-width: 700px;
+      margin: 0 auto 20px;
+      animation: fadeUp 0.6s ease 0.1s both;
+    }
+
+    .hero-sub {
+      font-size: clamp(17px, 2.2vw, 21px);
+      color: var(--text-secondary);
+      max-width: 520px;
+      margin: 0 auto 40px;
+      line-height: 1.45;
+      font-weight: 400;
+      animation: fadeUp 0.6s ease 0.2s both;
+    }
+
+    .hero-ctas {
+      display: flex;
+      gap: 14px;
+      justify-content: center;
+      flex-wrap: wrap;
+      animation: fadeUp 0.6s ease 0.3s both;
+    }
+
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 13px 26px;
+      border-radius: 100px;
+      font-size: 15px;
+      font-weight: 500;
+      text-decoration: none;
+      transition: all 0.2s ease;
+      cursor: pointer;
+      border: none;
+    }
+
+    .btn-primary {
+      background: var(--blue);
+      color: var(--white);
+    }
+
+    .btn-primary:hover {
+      background: var(--blue-hover);
+      transform: scale(1.02);
+    }
+
+    .btn-secondary {
+      background: transparent;
+      color: var(--blue);
+      border: 1.5px solid var(--border);
+    }
+
+    .btn-secondary:hover {
+      border-color: var(--blue);
+      background: var(--blue-subtle);
+    }
+
+    .btn svg { width: 18px; height: 18px; }
+
+    .hero-meta {
+      margin-top: 48px;
+      display: flex;
+      justify-content: center;
+      gap: 32px;
+      animation: fadeUp 0.6s ease 0.4s both;
+    }
+
+    .hero-meta-item {
+      font-size: 13px;
+      color: var(--text-tertiary);
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .hero-meta-item strong {
+      color: var(--text-secondary);
+      font-weight: 600;
+    }
+
+    /* ─── SCREENSHOT ─── */
+    .screenshot-section {
+      padding: 20px 24px 100px;
+    }
+
+    .screenshot-wrap {
+      max-width: 920px;
+      margin: 0 auto;
+      border-radius: 12px;
+      overflow: hidden;
+      box-shadow: var(--shadow-elevated), 0 20px 80px rgba(0, 0, 0, 0.12);
+      animation: fadeUp 0.8s ease 0.5s both;
+    }
+
+    .screenshot-wrap img {
+      width: 100%;
+      display: block;
+    }
+
+    /* ─── SECTION SHARED ─── */
+    .section {
+      padding: 100px 24px;
+    }
+
+    .section-alt { background: var(--bg-alt); }
+
+    .section-header {
+      text-align: center;
+      max-width: 600px;
+      margin: 0 auto 60px;
+    }
+
+    .section-label {
+      font-size: 13px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--blue);
+      margin-bottom: 12px;
+    }
+
+    .section-title {
+      font-size: clamp(32px, 4.5vw, 44px);
+      font-weight: 700;
+      letter-spacing: -0.03em;
+      line-height: 1.1;
+      margin-bottom: 14px;
+    }
+
+    .section-desc {
+      font-size: 17px;
+      color: var(--text-secondary);
+      line-height: 1.5;
+    }
+
+    /* ─── FEATURES ─── */
+    .features-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 20px;
+      max-width: 980px;
+      margin: 0 auto;
+    }
+
+    .feature-card {
+      padding: 32px 28px;
+      background: var(--white);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow-card);
+      transition: transform 0.25s ease, box-shadow 0.25s ease;
+    }
+
+    .feature-card:hover {
+      transform: translateY(-3px);
+      box-shadow: var(--shadow-elevated);
+    }
+
+    .feature-icon {
+      width: 44px;
+      height: 44px;
+      border-radius: 11px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      margin-bottom: 18px;
+    }
+
+    .feature-icon svg { width: 22px; height: 22px; }
+
+    .fi-perf { background: linear-gradient(135deg, #ff9500, #ff6723); }
+    .fi-api { background: linear-gradient(135deg, var(--blue), #00c6fb); }
+    .fi-agent { background: linear-gradient(135deg, #af52de, #5e5ce6); }
+    .fi-app { background: linear-gradient(135deg, #30d158, #34c759); }
+    .fi-stream { background: linear-gradient(135deg, #ff375f, #ff6482); }
+    .fi-skills { background: linear-gradient(135deg, #ffd60a, #ff9f0a); }
+
+    .feature-card h3 {
+      font-size: 17px;
+      font-weight: 600;
+      letter-spacing: -0.01em;
+      margin-bottom: 8px;
+    }
+
+    .feature-card p {
+      font-size: 14px;
+      color: var(--text-secondary);
+      line-height: 1.5;
+    }
+
+    /* ─── QUICK START ─── */
+    .quickstart-wrap {
+      max-width: 640px;
+      margin: 0 auto;
+    }
+
+    .code-block {
+      background: var(--code-bg);
+      border-radius: var(--radius-sm);
+      overflow: hidden;
+      margin-bottom: 16px;
+    }
+
+    .code-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 12px 18px;
+      border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+    }
+
+    .code-header span {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 12px;
+      color: var(--text-tertiary);
+      font-weight: 500;
+    }
+
+    .copy-btn {
+      background: none;
+      border: none;
+      cursor: pointer;
+      padding: 4px;
+      color: var(--text-tertiary);
+      transition: color 0.2s;
+      display: flex;
+      align-items: center;
+    }
+
+    .copy-btn:hover { color: var(--white); }
+    .copy-btn svg { width: 16px; height: 16px; fill: currentColor; }
+
+    .code-body {
+      padding: 18px;
+      overflow-x: auto;
+    }
+
+    .code-body pre {
+      font-family: 'JetBrains Mono', monospace;
+      font-size: 13.5px;
+      line-height: 1.7;
+      color: var(--code-text);
+      white-space: pre;
+    }
+
+    .code-body .comment { color: #6e6e73; }
+    .code-body .cmd { color: #30d158; }
+    .code-body .flag { color: #64d2ff; }
+    .code-body .string { color: #ffd60a; }
+    .code-body .url { color: #ff9f0a; }
+
+    .quickstart-note {
+      text-align: center;
+      font-size: 14px;
+      color: var(--text-tertiary);
+      margin-top: 24px;
+    }
+
+    .quickstart-note a {
+      color: var(--blue);
+      text-decoration: none;
+    }
+
+    .quickstart-note a:hover { text-decoration: underline; }
+
+    /* ─── APP DOWNLOAD CARD ─── */
+    .app-download-card {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      max-width: 360px;
+      margin: 32px auto 0;
+      padding: 14px 18px;
+      background: var(--bg-alt);
+      border-radius: 16px;
+      border: 1px solid var(--border);
+      text-decoration: none;
+      color: var(--text-primary);
+      transition: transform 0.2s ease, box-shadow 0.2s ease;
+    }
+
+    .app-download-card:hover {
+      transform: scale(1.02);
+      box-shadow: var(--shadow-elevated);
+    }
+
+    .app-download-icon {
+      width: 52px;
+      height: 52px;
+      border-radius: 12px;
+      flex-shrink: 0;
+    }
+
+    .app-download-info {
+      flex: 1;
+      min-width: 0;
+    }
+
+    .app-download-name {
+      font-size: 16px;
+      font-weight: 600;
+      letter-spacing: -0.01em;
+    }
+
+    .app-download-desc {
+      font-size: 13px;
+      color: var(--text-tertiary);
+      margin-top: 1px;
+    }
+
+    .app-download-btn {
+      padding: 6px 18px;
+      background: var(--blue);
+      color: var(--white);
+      border-radius: 100px;
+      font-size: 14px;
+      font-weight: 600;
+      flex-shrink: 0;
+      transition: background 0.2s;
+    }
+
+    .app-download-card:hover .app-download-btn {
+      background: var(--blue-hover);
+    }
+
+    /* ─── MODELS ─── */
+    .models-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      gap: 16px;
+      max-width: 860px;
+      margin: 0 auto;
+    }
+
+    .model-card {
+      display: flex;
+      align-items: center;
+      gap: 14px;
+      padding: 20px 22px;
+      background: var(--white);
+      border-radius: var(--radius-sm);
+      box-shadow: var(--shadow-card);
+      transition: transform 0.2s ease;
+    }
+
+    .model-card:hover { transform: translateY(-2px); }
+
+    .model-logo {
+      width: 36px;
+      height: 36px;
+      border-radius: 8px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 18px;
+      font-weight: 700;
+      flex-shrink: 0;
+    }
+
+    .ml-gemma { background: linear-gradient(135deg, #4285f4, #34a853); color: white; }
+    .ml-qwen { background: linear-gradient(135deg, #6366f1, #8b5cf6); color: white; }
+    .ml-llama { background: linear-gradient(135deg, #0668e1, #1877f2); color: white; }
+    .ml-mistral { background: linear-gradient(135deg, #ff7000, #ff9a00); color: white; }
+
+    .model-info h3 {
+      font-size: 15px;
+      font-weight: 600;
+      letter-spacing: -0.01em;
+    }
+
+    .model-info p {
+      font-size: 12px;
+      color: var(--text-tertiary);
+      margin-top: 2px;
+    }
+
+    /* ─── PERFORMANCE BAR ─── */
+    .perf-section {
+      padding: 80px 24px;
+      text-align: center;
+    }
+
+    .perf-stats {
+      display: flex;
+      justify-content: center;
+      gap: 64px;
+      flex-wrap: wrap;
+      max-width: 800px;
+      margin: 0 auto;
+    }
+
+    .perf-stat {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+    }
+
+    .perf-number {
+      font-size: clamp(40px, 6vw, 56px);
+      font-weight: 700;
+      letter-spacing: -0.04em;
+      line-height: 1;
+      background: linear-gradient(135deg, var(--blue), #00c6fb);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+    }
+
+    .perf-label {
+      font-size: 14px;
+      color: var(--text-tertiary);
+      margin-top: 8px;
+    }
+
+    /* ─── FOOTER ─── */
+    footer {
+      padding: 40px 24px;
+      text-align: center;
+      border-top: 0.5px solid var(--border);
+    }
+
+    .footer-links {
+      display: flex;
+      justify-content: center;
+      gap: 24px;
+      margin-bottom: 16px;
+      list-style: none;
+    }
+
+    .footer-links a {
+      font-size: 13px;
+      color: var(--text-secondary);
+      text-decoration: none;
+      transition: color 0.2s;
+    }
+
+    .footer-links a:hover { color: var(--blue); }
+
+    .footer-copy {
+      font-size: 12px;
+      color: var(--text-tertiary);
+    }
+
+    /* ─── ANIMATIONS ─── */
+    @keyframes fadeUp {
+      from { opacity: 0; transform: translateY(20px); }
+      to { opacity: 1; transform: translateY(0); }
+    }
+
+    .reveal {
+      opacity: 0;
+      transform: translateY(24px);
+      transition: opacity 0.6s ease, transform 0.6s ease;
+    }
+
+    .reveal.visible {
+      opacity: 1;
+      transform: translateY(0);
+    }
+
+    /* ─── RESPONSIVE ─── */
+    @media (max-width: 768px) {
+      nav { padding: 0 16px; }
+
+      .nav-links { gap: 18px; }
+      .nav-links .hide-mobile { display: none; }
+
+      .hero { padding: 120px 20px 60px; }
+      .hero-meta { gap: 16px; flex-wrap: wrap; }
+
+      .section { padding: 72px 20px; }
+
+      .features-grid { grid-template-columns: 1fr 1fr; gap: 14px; }
+
+      .perf-stats { gap: 36px; }
+
+      .models-grid { grid-template-columns: 1fr 1fr; }
+    }
+
+    @media (max-width: 480px) {
+      .features-grid { grid-template-columns: 1fr; }
+      .models-grid { grid-template-columns: 1fr; }
+      .hero-ctas { flex-direction: column; align-items: center; }
+    }
+  </style>
+</head>
+<body>
+
+  <!-- NAV -->
+  <nav>
+    <a href="#" class="nav-logo">
+      <img src="appiconb.png" alt="MLX Claw" class="nav-logo-img">
+      <span>mlx-serve</span>
+    </a>
+    <ul class="nav-links">
+      <li><a href="#features" class="hide-mobile">Features</a></li>
+      <li><a href="#quickstart" class="hide-mobile">Quick Start</a></li>
+      <li><a href="#models" class="hide-mobile">Models</a></li>
+      <li>
+        <a href="https://github.com/ddalcu/mlx-serve" class="nav-github" target="_blank" rel="noopener">
+          <svg viewBox="0 0 16 16"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+        </a>
+      </li>
+    </ul>
+  </nav>
+
+  <!-- HERO -->
+  <section class="hero">
+    <div class="hero-badge">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg>
+      Built for Apple Silicon
+    </div>
+    <h1>Run LLMs natively on your Mac</h1>
+    <p class="hero-sub">Native Zig inference server with a macOS menu bar app. OpenAI-compatible API. No Python. Just fast.</p>
+    <div class="hero-ctas">
+      <a href="https://github.com/ddalcu/mlx-serve/releases" class="btn btn-primary">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+        Download
+      </a>
+      <a href="https://github.com/ddalcu/mlx-serve" class="btn btn-secondary" target="_blank" rel="noopener">
+        View on GitHub
+      </a>
+    </div>
+    <div class="hero-meta">
+      <div class="hero-meta-item"><strong>macOS 14+</strong></div>
+      <div class="hero-meta-item"><strong>M1 / M2 / M3 / M4</strong></div>
+      <div class="hero-meta-item"><strong>MIT License</strong></div>
+    </div>
+  </section>
+
+  <!-- SCREENSHOT -->
+  <section class="screenshot-section">
+    <div class="screenshot-wrap">
+      <img src="mlxclaw-screenshot-1.png" alt="MLX Claw app — chat interface with model browser and server controls" loading="lazy">
+    </div>
+  </section>
+
+  <!-- PERFORMANCE -->
+  <section class="perf-section reveal">
+    <div class="perf-stats">
+      <div class="perf-stat">
+        <div class="perf-number">37</div>
+        <div class="perf-label">tokens/sec decode</div>
+      </div>
+      <div class="perf-stat">
+        <div class="perf-number">220</div>
+        <div class="perf-label">tokens/sec prefill</div>
+      </div>
+      <div class="perf-stat">
+        <div class="perf-number">0</div>
+        <div class="perf-label">Python dependencies</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- FEATURES -->
+  <section class="section section-alt" id="features">
+    <div class="section-header reveal">
+      <div class="section-label">Features</div>
+      <h2 class="section-title">Everything you need to run local AI</h2>
+      <p class="section-desc">A complete inference stack from server to UI, built from scratch in Zig and Swift.</p>
+    </div>
+    <div class="features-grid">
+      <div class="feature-card reveal">
+        <div class="feature-icon fi-perf">
+          <svg viewBox="0 0 24 24" fill="white" xmlns="http://www.w3.org/2000/svg"><path d="m23.53 1.02-7.686 3.45h-7.06l-2.98 3.452h7.173L.47 22.98l7.681-3.607h7.065v-.002l2.978-3.45-7.148-.001 12.482-14.9zM0 4.47v14.901h1.883l2.98-3.45H3.451v-8h.942l2.824-3.45H0zm22.117 0-2.98 3.608h1.412v7.844h-.942l-2.98 3.45H24V4.47h-1.883z"/></svg>
+        </div>
+        <h3>Native Performance</h3>
+        <p>Written in Zig with direct MLX-C bindings. No Python runtime, no overhead. KV cache reuse across requests for instant multi-turn.</p>
+      </div>
+      <div class="feature-card reveal">
+        <div class="feature-icon fi-api">
+          <svg viewBox="0 0 256 260" fill="white" xmlns="http://www.w3.org/2000/svg"><path d="M239.184 106.203c5.87-17.679 3.838-37.03-5.577-53.103-14.156-24.641-42.608-37.316-70.395-31.36C147.554 4.321 123.795-3.424 100.879 1.419 77.963 6.261 59.369 22.957 52.096 45.221c-18.252 3.743-34.006 15.172-43.229 31.361C-5.443 101.183-2.195 132.215 16.899 153.32c-5.893 17.671-3.874 37.024 5.525 53.103 14.174 24.649 42.644 37.324 70.445 31.36 12.366 13.925 30.131 21.848 48.754 21.744 28.481.025 53.714-18.361 62.414-41.481 18.249-3.749 34-15.176 43.229-31.36 13.838-24.641 10.862-55.218-8.083-76.483zm-97.56 136.338a48.393 48.393 0 01-31.105-11.255l1.535-.87 51.67-29.825a8.595 8.595 0 004.247-7.367V120.374l21.845 12.636c.218.111.37.32.409.563v59.367c-.057 26.818-21.783 48.545-48.6 48.601zM37.158 197.93a48.345 48.345 0 01-5.781-32.589l1.534.921 51.722 29.826a8.339 8.339 0 008.441 0l63.181-36.425v25.221a.87.87 0 01-.358.665l-52.335 30.184c-23.257 13.398-52.97 5.431-66.404-17.803zM23.549 85.381a48.35 48.35 0 0125.58-21.333v61.39a8.288 8.288 0 004.195 7.316l62.874 36.272-21.845 12.636a.819.819 0 01-.767 0L41.353 151.53C18.142 138.076 10.182 108.386 23.549 85.125zm179.466 41.695l-62.874-36.63 21.794-12.584a.82.82 0 01.767 0l52.233 30.184c16.302 9.407 25.707 27.382 24.141 46.138-1.566 18.757-13.82 34.923-31.457 41.497v-61.39a8.544 8.544 0 00-4.604-7.215zm21.742-32.69l-1.535-.921-51.627-30.082a8.58 8.58 0 00-8.441 0L99.981 99.808V74.587a.856.856 0 01.307-.665l52.233-30.133c16.342-9.414 36.653-8.536 52.122 2.255 15.468 10.79 23.306 29.549 20.114 48.137zM88.061 139.098l-21.845-12.585a.84.84 0 01-.409-.563V65.685c.025-18.857 10.943-36 28.02-43.997 17.077-7.996 37.237-5.404 51.736 6.651l-1.535.87-51.67 29.825a8.595 8.595 0 00-4.246 7.367l-.051 72.697zM99.93 113.519l28.136-16.217 28.188 16.218v32.434l-28.086 16.218-28.188-16.218-.05-32.435z"/></svg>
+        </div>
+        <h3>OpenAI-Compatible API</h3>
+        <p>Drop-in replacement. Chat completions, streaming, tool calling, embeddings, logprobs. Works with any OpenAI client library.</p>
+      </div>
+      <div class="feature-card reveal">
+        <div class="feature-icon fi-agent">
+          <svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 8V4H8"/><rect width="16" height="12" x="4" y="8" rx="2"/><path d="M2 14h2"/><path d="M20 14h2"/><path d="M15 13v2"/><path d="M9 13v2"/></svg>
+        </div>
+        <h3>Built-in Agent</h3>
+        <p>7 built-in tools: shell, file read/write/edit, search, web browse, web search. Extend with prompt-based skills — just drop a markdown file.</p>
+      </div>
+      <div class="feature-card reveal">
+        <div class="feature-icon fi-app">
+          <svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="M10 4v4"/><path d="M2 8h20"/><path d="M6 4v4"/></svg>
+        </div>
+        <h3>Menu Bar App</h3>
+        <p>Native macOS app lives in your menu bar. Download models from HuggingFace with resumable transfers. Chat, browse, and manage from one place.</p>
+      </div>
+      <div class="feature-card reveal">
+        <div class="feature-icon fi-stream">
+          <svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 14a1 1 0 0 1-.78-1.63l9.9-10.2a.5.5 0 0 1 .86.46l-1.92 6.02A1 1 0 0 0 13 10h7a1 1 0 0 1 .78 1.63l-9.9 10.2a.5.5 0 0 1-.86-.46l1.92-6.02A1 1 0 0 0 11 14z"/></svg>
+        </div>
+        <h3>Streaming &amp; Tool Calling</h3>
+        <p>Real-time SSE streaming with automatic tool call detection. The model can call functions, get results, and continue reasoning — all in one request.</p>
+      </div>
+      <div class="feature-card reveal">
+        <div class="feature-icon fi-skills">
+          <svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15.39 4.39a1 1 0 0 0 1.68-.474 2.5 2.5 0 1 1 3.014 3.015 1 1 0 0 0-.474 1.68l1.683 1.682a2.414 2.414 0 0 1 0 3.414L19.61 15.39a1 1 0 0 1-1.68-.474 2.5 2.5 0 1 0-3.014 3.015 1 1 0 0 1 .474 1.68l-1.683 1.682a2.414 2.414 0 0 1-3.414 0L8.61 19.61a1 1 0 0 0-1.68.474 2.5 2.5 0 1 1-3.014-3.015 1 1 0 0 0 .474-1.68l-1.683-1.682a2.414 2.414 0 0 1 0-3.414L4.39 8.61a1 1 0 0 1 1.68.474 2.5 2.5 0 1 0 3.014-3.015 1 1 0 0 1-.474-1.68l1.683-1.682a2.414 2.414 0 0 1 3.414 0z"/></svg>
+        </div>
+        <h3>Extensible Skills</h3>
+        <p>Teach the agent new capabilities by dropping markdown files in a folder. No code needed — just describe the workflow and the agent follows it.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- QUICK START -->
+  <section class="section" id="quickstart">
+    <div class="section-header reveal">
+      <div class="section-label">Quick Start</div>
+      <h2 class="section-title">Up and running in seconds</h2>
+    </div>
+    <div class="quickstart-wrap reveal">
+      <div class="code-block">
+        <div class="code-header">
+          <span>Terminal</span>
+          <button class="copy-btn" onclick="copyCode(this)" aria-label="Copy code">
+            <svg viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>
+          </button>
+        </div>
+        <div class="code-body">
+<pre><span class="comment"># Download a release or build from source</span>
+<span class="cmd">git clone</span> https://github.com/ddalcu/mlx-serve
+<span class="cmd">cd</span> mlx-serve
+<span class="cmd">zig build</span> <span class="flag">-Doptimize=ReleaseFast</span>
+
+<span class="comment"># Start the server</span>
+<span class="cmd">./zig-out/bin/mlx-serve</span> \
+  <span class="flag">--model</span> <span class="string">~/models/gemma-4-4b-it-4bit</span> \
+  <span class="flag">--serve</span> <span class="flag">--port</span> <span class="string">8080</span></pre>
+        </div>
+      </div>
+
+      <div class="code-block">
+        <div class="code-header">
+          <span>Use the API</span>
+          <button class="copy-btn" onclick="copyCode(this)" aria-label="Copy code">
+            <svg viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>
+          </button>
+        </div>
+        <div class="code-body">
+<pre><span class="cmd">curl</span> <span class="url">http://localhost:8080/v1/chat/completions</span> \
+  <span class="flag">-H</span> <span class="string">"Content-Type: application/json"</span> \
+  <span class="flag">-d</span> <span class="string">'{
+    "messages": [{"role": "user", "content": "Hello!"}],
+    "stream": true
+  }'</span></pre>
+        </div>
+      </div>
+
+      <a href="https://github.com/ddalcu/mlx-serve/releases" class="app-download-card">
+        <img src="appiconb.png" alt="MLX Claw" class="app-download-icon">
+        <div class="app-download-info">
+          <div class="app-download-name">MLX Claw</div>
+          <div class="app-download-desc">Desktop app for macOS</div>
+        </div>
+        <div class="app-download-btn">Get</div>
+      </a>
+    </div>
+  </section>
+
+  <!-- MODELS -->
+  <section class="section section-alt" id="models">
+    <div class="section-header reveal">
+      <div class="section-label">Models</div>
+      <h2 class="section-title">Run the latest open models</h2>
+      <p class="section-desc">Supports quantized MLX-format models. Download directly from HuggingFace in the app.</p>
+    </div>
+    <div class="models-grid reveal">
+      <div class="model-card">
+        <div class="model-logo ml-gemma">G</div>
+        <div class="model-info">
+          <h3>Gemma 4</h3>
+          <p>Google &middot; 4B, 12B, 27B</p>
+        </div>
+      </div>
+      <div class="model-card">
+        <div class="model-logo ml-qwen">Q</div>
+        <div class="model-info">
+          <h3>Qwen 3.5</h3>
+          <p>Alibaba &middot; MoE &middot; 4B, 14B, 32B</p>
+        </div>
+      </div>
+      <div class="model-card">
+        <div class="model-logo ml-llama">L</div>
+        <div class="model-info">
+          <h3>Llama 3</h3>
+          <p>Meta &middot; 8B, 70B</p>
+        </div>
+      </div>
+      <div class="model-card">
+        <div class="model-logo ml-mistral">M</div>
+        <div class="model-info">
+          <h3>Mistral</h3>
+          <p>Mistral AI &middot; 7B, 8x7B</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- FOOTER -->
+  <footer>
+    <ul class="footer-links">
+      <li><a href="https://github.com/ddalcu/mlx-serve" target="_blank" rel="noopener">GitHub</a></li>
+      <li><a href="https://github.com/ddalcu/mlx-serve/releases" target="_blank" rel="noopener">Releases</a></li>
+      <li><a href="https://github.com/ddalcu/mlx-serve/issues" target="_blank" rel="noopener">Issues</a></li>
+    </ul>
+    <p class="footer-copy">MIT License &middot; mlx-serve</p>
+  </footer>
+
+  <script>
+    // Scroll reveal
+    const observer = new IntersectionObserver((entries) => {
+      entries.forEach(entry => {
+        if (entry.isIntersecting) {
+          entry.target.classList.add('visible');
+          observer.unobserve(entry.target);
+        }
+      });
+    }, { threshold: 0.15, rootMargin: '0px 0px -40px 0px' });
+
+    document.querySelectorAll('.reveal').forEach(el => observer.observe(el));
+
+    // Copy code
+    function copyCode(btn) {
+      const pre = btn.closest('.code-block').querySelector('pre');
+      navigator.clipboard.writeText(pre.textContent).then(() => {
+        btn.innerHTML = '<svg viewBox="0 0 24 24" fill="currentColor"><path d="M9 16.17L4.83 12l-1.42 1.41L9 19 21 7l-1.41-1.41z"/></svg>';
+        setTimeout(() => {
+          btn.innerHTML = '<svg viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>';
+        }, 2000);
+      });
+    }
+  </script>
+
+</body>
+</html>

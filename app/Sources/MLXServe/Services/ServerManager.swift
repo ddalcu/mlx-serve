@@ -12,6 +12,8 @@ class ServerManager: ObservableObject {
 
     private var process: Process?
     private var healthTimer: Timer?
+    private var healthTask: Task<Void, Never>?
+    private var pollSource: DispatchSourceTimer?
     private let api = APIClient()
     @Published var serverLog = ""
 
@@ -86,6 +88,10 @@ class ServerManager: ObservableObject {
     }
 
     func stop() {
+        pollSource?.cancel()
+        pollSource = nil
+        healthTask?.cancel()
+        healthTask = nil
         healthTimer?.invalidate()
         healthTimer = nil
 
@@ -110,6 +116,10 @@ class ServerManager: ObservableObject {
     }
 
     private func handleTermination(exitCode: Int32) {
+        pollSource?.cancel()
+        pollSource = nil
+        healthTask?.cancel()
+        healthTask = nil
         healthTimer?.invalidate()
         healthTimer = nil
         process = nil
@@ -129,37 +139,58 @@ class ServerManager: ObservableObject {
     }
 
     private func startHealthPolling() {
-        healthTimer?.invalidate()
-        healthTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
-            guard let self else { return }
-            Task { @MainActor in
-                await self.pollHealth()
+        healthTask?.cancel()
+        let checkPort = port
+        // Use a GCD timer on the main queue — guaranteed to fire even during init.
+        // URLSession completion runs on a background queue and dispatches back to main.
+        let source = DispatchSource.makeTimerSource(queue: .main)
+        source.schedule(deadline: .now() + 1, repeating: 1.0)
+        source.setEventHandler { [weak self] in
+            guard let self else { source.cancel(); return }
+            let url = URL(string: "http://127.0.0.1:\(checkPort)/health")!
+            URLSession.shared.dataTask(with: url) { data, response, error in
+                guard let http = response as? HTTPURLResponse, http.statusCode == 200,
+                      let data, let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                      json["status"] as? String == "ok" else { return }
+                DispatchQueue.main.async { [weak self] in
+                    guard let self else { return }
+                    if self.status != .running {
+                        self.transitionToRunning()
+                    }
+                    // Switch to slow polling
+                    source.cancel()
+                    self.startSlowPolling()
+                }
+            }.resume()
+        }
+        source.resume()
+        self.pollSource = source
+    }
+
+    private func startSlowPolling() {
+        let source = DispatchSource.makeTimerSource(queue: .main)
+        source.schedule(deadline: .now() + 3, repeating: 3.0)
+        source.setEventHandler { [weak self] in
+            guard let self else { source.cancel(); return }
+            Task { await self.refreshStatus() }
+        }
+        source.resume()
+        self.pollSource = source
+    }
+
+    private func transitionToRunning() {
+        guard status != .running else { return }
+        status = .running
+        Task {
+            if let info = try? await api.fetchModels(port: port) {
+                modelInfo = info
             }
         }
     }
 
-    private func pollHealth() async {
-        do {
-            let healthy = try await api.checkHealth(port: port)
-            if healthy && status != .running {
-                status = .running
-                if let info = try? await api.fetchModels(port: port) {
-                    modelInfo = info
-                }
-                // Slow down polling once running
-                healthTimer?.invalidate()
-                healthTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: true) { [weak self] _ in
-                    guard let self else { return }
-                    Task { @MainActor in
-                        await self.refreshStatus()
-                    }
-                }
-            }
-        } catch {
-            if case .running = status {
-                status = .error("Lost connection")
-            }
-        }
+    /// Called by TestServer when it detects health is ok but status is still starting
+    func forceRunning() {
+        transitionToRunning()
     }
 
     private func refreshStatus() async {
@@ -192,6 +223,8 @@ class ServerManager: ObservableObject {
     }
 
     deinit {
+        pollSource?.cancel()
+        healthTask?.cancel()
         healthTimer?.invalidate()
         if let proc = process, proc.isRunning {
             proc.terminate()
