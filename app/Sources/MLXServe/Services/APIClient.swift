@@ -318,11 +318,7 @@ class APIClient {
             if let fr = choices.first?["finish_reason"] as? String, fr == "tool_calls" {
                 var calls: [ToolCall] = []
                 for (_, tc) in pendingToolCalls.sorted(by: { $0.key < $1.key }) {
-                    var args: [String: String] = [:]
-                    if let data = tc.args.data(using: .utf8),
-                       let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-                        for (k, v) in dict { args[k] = "\(v)" }
-                    }
+                    let args = Self.parseToolCallArgs(tc.args, toolName: tc.name)
                     calls.append(ToolCall(id: tc.id, name: tc.name, arguments: args))
                 }
                 if !calls.isEmpty {
@@ -337,11 +333,7 @@ class APIClient {
             var calls: [ToolCall] = []
             for (_, tc) in pendingToolCalls.sorted(by: { $0.key < $1.key }) {
                 if tc.name.isEmpty { continue }
-                var args: [String: String] = [:]
-                if let data = tc.args.data(using: .utf8),
-                   let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any] {
-                    for (k, v) in dict { args[k] = "\(v)" }
-                }
+                let args = Self.parseToolCallArgs(tc.args, toolName: tc.name)
                 calls.append(ToolCall(id: tc.id, name: tc.name, arguments: args))
             }
             if !calls.isEmpty {
@@ -350,5 +342,22 @@ class APIClient {
         }
 
         continuation.finish()
+    }
+
+    /// Parse tool call arguments JSON string into a dictionary.
+    /// Logs a warning when parsing fails so we can diagnose intermittent issues.
+    private static func parseToolCallArgs(_ argsString: String, toolName: String) -> [String: String] {
+        guard !argsString.isEmpty else {
+            print("[APIClient] WARNING: empty arguments for tool '\(toolName)'")
+            return [:]
+        }
+        guard let data = argsString.data(using: .utf8),
+              let dict = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            print("[APIClient] WARNING: failed to parse arguments for tool '\(toolName)': \(argsString.prefix(200))")
+            return [:]
+        }
+        var result: [String: String] = [:]
+        for (k, v) in dict { result[k] = "\(v)" }
+        return result
     }
 }

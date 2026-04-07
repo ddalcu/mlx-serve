@@ -393,7 +393,7 @@ class TestServer {
             var history = buildAgentHistory(appState: appState, sessionId: sessionId)
             let userContent = history.last { ($0["role"] as? String) == "user" }?["content"] as? String ?? ""
             let skills = AgentPrompt.skillManager.matchingSkills(for: userContent)
-            let systemPrompt = AgentPrompt.systemPrompt + skills + appState.agentMemory.contextSnippet()
+            let systemPrompt = AgentPrompt.systemPrompt + skills + AgentPrompt.memory + appState.agentMemory.contextSnippet()
             var messages: [[String: Any]] = [["role": "system", "content": systemPrompt]]
             if let lastRole = history.last?["role"] as? String, lastRole == "tool" {
                 history.append(["role": "user", "content": "Process the tool results above and respond."])

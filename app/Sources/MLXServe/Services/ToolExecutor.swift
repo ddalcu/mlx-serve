@@ -62,6 +62,8 @@ struct ShellHandler: ToolHandler {
                     if !errStr.isEmpty { result += "\n[stderr]: \(errStr)" }
                     if process.terminationStatus != 0 {
                         result += "\n[exit code: \(process.terminationStatus)]"
+                    } else if result.isEmpty {
+                        result = "OK"
                     }
 
                     continuation.resume(returning: String(result.prefix(8192)))
@@ -248,6 +250,18 @@ struct BrowseHandler: ToolHandler {
 }
 
 
+// MARK: - Save Memory
+
+struct SaveMemoryHandler: ToolHandler {
+    func execute(parameters: [String: String], workingDirectory: String?) async throws -> String {
+        guard let memory = parameters["memory"] else {
+            throw ToolError.missingParameter("memory")
+        }
+        AgentPrompt.saveMemory(memory)
+        return "OK"
+    }
+}
+
 // MARK: - Shared Helpers
 
 private func resolvePath(_ path: String, workingDirectory: String?) -> String {
@@ -276,6 +290,7 @@ class ToolExecutor: ObservableObject {
         .searchFiles: SearchFilesHandler(),
         .browse: BrowseHandler(),
         .webSearch: WebSearchHandler(),
+        .saveMemory: SaveMemoryHandler(),
     ]
 
     func executePlan(_ plan: AgentPlan, workingDirectory: String?) async -> [StepResult] {

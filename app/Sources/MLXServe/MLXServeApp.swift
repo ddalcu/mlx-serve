@@ -22,9 +22,21 @@ struct MLXClawApp: App {
     @StateObject private var appState = AppState()
     @Environment(\.openWindow) private var openWindow
 
+    private func openAndFocus(_ id: String) {
+        openWindow(id: id)
+        NSApplication.shared.activate(ignoringOtherApps: true)
+        // Bring the specific window to front
+        DispatchQueue.main.async {
+            let title = id == "chat" ? "MLX Claw" : "Browser"
+            NSApplication.shared.windows
+                .first { $0.title == title }?
+                .makeKeyAndOrderFront(nil)
+        }
+    }
+
     var body: some Scene {
         MenuBarExtra {
-            StatusMenuView(openChat: { openWindow(id: "chat") }, openBrowser: { openWindow(id: "browser") })
+            StatusMenuView(openChat: { openAndFocus("chat") }, openBrowser: { openAndFocus("browser") })
                 .environmentObject(appState)
                 .environmentObject(appState.server)
                 .environmentObject(appState.downloads)
@@ -47,5 +59,26 @@ struct MLXClawApp: App {
             BrowserView()
         }
         .defaultSize(width: 1024, height: 768)
+        .commands {
+            CommandMenu("Agent") {
+                Button("Edit System Prompt") {
+                    AgentPrompt.openSystemPromptInEditor()
+                }
+                .keyboardShortcut("p", modifiers: [.command, .shift])
+
+                Button("Open Memory File") {
+                    let path = NSString(string: "~/.mlx-serve/memory.md").expandingTildeInPath
+                    if !FileManager.default.fileExists(atPath: path) {
+                        try? "".write(toFile: path, atomically: true, encoding: .utf8)
+                    }
+                    NSWorkspace.shared.open(URL(fileURLWithPath: path))
+                }
+
+                Button("Open MLX Serve Folder") {
+                    let path = NSString(string: "~/.mlx-serve").expandingTildeInPath
+                    NSWorkspace.shared.open(URL(fileURLWithPath: path))
+                }
+            }
+        }
     }
 }

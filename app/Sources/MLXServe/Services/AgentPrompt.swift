@@ -1,16 +1,74 @@
 import Foundation
+import AppKit
 
 enum AgentPrompt {
 
     static let skillManager = SkillManager()
 
-    static let systemPrompt = """
-        You are a helpful macOS assistant with tool access. \
-        When calling tools, ALWAYS pass arguments as JSON like {"key": "value"}. \
-        Never omit required parameters — every tool call must include all required fields. \
-        After receiving tool results, summarize what happened and answer the user. \
-        For multi-step tasks, call tools one at a time.
+    private static let mlxServeDir = NSString(string: "~/.mlx-serve").expandingTildeInPath
+    private static let promptPath = (mlxServeDir as NSString).appendingPathComponent("system-prompt.md")
+    private static let memoryPath = (mlxServeDir as NSString).appendingPathComponent("memory.md")
+
+    private static let defaultPromptFile = """
+        # System Prompt
+
+        You are an autonomous macOS agent. Act independently to complete tasks — do not ask the user for confirmation or permission between steps.
+        When a task requires multiple steps, execute them all without pausing.
+        If a command fails, diagnose the issue and retry with a corrected approach.
+        If you need information, use your tools to find it rather than asking the user.
+        Only respond to the user when the task is fully complete or if you hit a genuine ambiguity that cannot be resolved with tools.
+        Tool arguments must be JSON: {"key": "value"}. Never omit required parameters.
+
+        You have a `saveMemory` tool — use it to remember important context: user preferences, project details, recurring patterns, or anything that would help in future conversations. Memories persist across sessions.
+
+        ## Soul
+
+        You are precise, resourceful, and action-oriented. You prefer doing over discussing.
+        You treat the user's time as valuable — don't narrate what you're about to do, just do it.
+        When you encounter obstacles, you adapt and find a way forward.
+        You are honest about limitations and errors rather than hiding them.
         """
+
+    /// Load system prompt from `~/.mlx-serve/system-prompt.md`, seeding the file on first run.
+    static var systemPrompt: String {
+        ensureFile(at: promptPath, defaultContent: defaultPromptFile)
+        return (try? String(contentsOfFile: promptPath, encoding: .utf8)) ?? defaultPromptFile
+    }
+
+    /// Load persistent memory from `~/.mlx-serve/memory.md`.
+    static var memory: String {
+        ensureFile(at: memoryPath, defaultContent: "")
+        let content = (try? String(contentsOfFile: memoryPath, encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return content.isEmpty ? "" : "\n[Memories]\n\(content)"
+    }
+
+    /// Append a memory entry to `~/.mlx-serve/memory.md`.
+    static func saveMemory(_ entry: String) {
+        ensureFile(at: memoryPath, defaultContent: "")
+        let timestamp = ISO8601DateFormatter().string(from: Date())
+        let line = "- [\(timestamp)] \(entry)\n"
+        if let handle = FileHandle(forWritingAtPath: memoryPath) {
+            handle.seekToEndOfFile()
+            handle.write(line.data(using: .utf8) ?? Data())
+            handle.closeFile()
+        } else {
+            try? line.write(toFile: memoryPath, atomically: true, encoding: .utf8)
+        }
+    }
+
+    /// Open `system-prompt.md` in the user's default editor.
+    static func openSystemPromptInEditor() {
+        ensureFile(at: promptPath, defaultContent: defaultPromptFile)
+        NSWorkspace.shared.open(URL(fileURLWithPath: promptPath))
+    }
+
+    private static func ensureFile(at path: String, defaultContent: String) {
+        let fm = FileManager.default
+        if !fm.fileExists(atPath: path) {
+            try? fm.createDirectory(atPath: mlxServeDir, withIntermediateDirectories: true)
+            try? defaultContent.write(toFile: path, atomically: true, encoding: .utf8)
+        }
+    }
 
     /// OpenAI-format tool definitions with descriptions that guide parameter usage.
     static let toolDefinitions: [[String: Any]] = [
@@ -105,6 +163,18 @@ enum AgentPrompt {
                     "type": "object",
                     "properties": ["query": ["type": "string", "description": "Search query"]],
                     "required": ["query"]
+                ]
+            ] as [String: Any]
+        ],
+        [
+            "type": "function",
+            "function": [
+                "name": "saveMemory",
+                "description": "Save a memory for future sessions. Use for user preferences, project context, or important facts. Example: {\"memory\": \"User prefers dark mode themes\"}",
+                "parameters": [
+                    "type": "object",
+                    "properties": ["memory": ["type": "string", "description": "The memory to save"]],
+                    "required": ["memory"]
                 ]
             ] as [String: Any]
         ],

@@ -1,5 +1,7 @@
 # mlx-serve
 
+**[ddalcu.github.io/mlx-serve](https://ddalcu.github.io/mlx-serve/)**
+
 Native Zig server that runs MLX-format language models on Apple Silicon and exposes an OpenAI-compatible HTTP API. No Python. Comes with **MLX Claw**, a macOS menu bar app with built-in chat, agent mode, and model management.
 
 ![MLX Claw](docs/mlxclaw-screenshot-1.png)
@@ -21,7 +23,9 @@ Menu bar app that wraps the server with a full UI:
 
 - **Model browser** -- download models from HuggingFace with resumable downloads
 - **Chat interface** -- multi-session chat with markdown rendering
-- **Agent mode** -- 7 built-in tools (shell, readFile, writeFile, editFile, searchFiles, browse, webSearch) with automatic tool calling loop
+- **Agent mode** -- 8 built-in tools (shell, readFile, writeFile, editFile, searchFiles, browse, webSearch, saveMemory) with automatic tool calling loop
+- **Editable system prompt** -- customize agent behavior via `~/.mlx-serve/system-prompt.md` (Agent menu → Edit System Prompt)
+- **Persistent memory** -- agent can save memories across sessions to `~/.mlx-serve/memory.md`
 - **Prompt-based skills** -- drop `.md` files in `~/.mlx-serve/skills/` to teach the agent custom capabilities
 - **Server management** -- start/stop server, view logs, configure max tokens
 
@@ -31,7 +35,7 @@ Menu bar app that wraps the server with a full UI:
 |---|---|---|
 | **Gemma 4** | `gemma-4-e2b-it-4bit`, `gemma-4-e4b-it-8bit`, `gemma-4-26b-a4b-it-4bit` | Gemma turns |
 | **Gemma 3** | `gemma-3-12b-it-qat-4bit` | Gemma turns |
-| **Qwen 3 / 3.5** | `Qwen3-4B`, `Qwen3.5-MoE` | ChatML |
+| **Qwen 3 / 3.5** | `Qwen3-4B`, `Qwen3.5-MoE`, `Qwen3-next` | ChatML |
 | **Llama / Mistral** | Llama 3, Mistral | ChatML / Llama-3 |
 
 Any quantized MLX model using one of the above architectures should work.
@@ -129,9 +133,9 @@ Supports `messages`, `max_tokens`, `temperature`, `top_p`, `top_k`, `stream`, `t
 
 Benchmarked on Apple M4 (16 GB unified memory), 256-token generation:
 
-| Model | Prefill | Decode | Peak Memory |
+| Model | Prefill | Decode | Memory |
 |---|---|---|---|
-| Gemma-3 12B (4-bit) | ~29 tok/s | ~13.5 tok/s | 6.75 GB |
+| Gemma-4 E4B (4-bit) | ~298 tok/s | ~27 tok/s | 4.0 GB |
 | Qwen3-4B (4-bit) | ~220 tok/s | ~37 tok/s | 2.17 GB |
 
 ## License

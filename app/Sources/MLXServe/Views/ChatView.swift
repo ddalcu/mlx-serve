@@ -1,5 +1,10 @@
 import SwiftUI
 
+private struct ScrollOffsetKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = nextValue() }
+}
+
 struct ChatView: View {
     @EnvironmentObject var appState: AppState
     @EnvironmentObject var server: ServerManager
@@ -55,7 +60,7 @@ struct ChatSidebar: View {
                             .font(.subheadline.weight(isSelected ? .semibold : .regular))
                             .lineLimit(1)
                             .foregroundStyle(isSelected ? .white : .primary)
-                        Text(session.updatedAt, style: .relative)
+                        Text(relativeTime(session.updatedAt))
                             .font(.caption2)
                             .foregroundStyle(isSelected ? Color.white.opacity(0.7) : Color.secondary.opacity(0.5))
                     }
@@ -80,13 +85,15 @@ struct ChatSidebar: View {
                 .listRowBackground(
                     Group {
                         if isSelected {
-                            RoundedRectangle(cornerRadius: 10)
+                            RoundedRectangle(cornerRadius: 8)
                                 .fill(Color.accentColor)
+                                .padding(.horizontal, 6)
                         } else {
                             Color.clear
                         }
                     }
                 )
+                .listRowSeparator(.visible)
                 .contextMenu {
                     Button("Delete", role: .destructive) {
                         appState.deleteSession(session.id)
@@ -106,6 +113,17 @@ struct ChatSidebar: View {
             .padding(10)
         }
     }
+
+    private func relativeTime(_ date: Date) -> String {
+        let seconds = Int(-date.timeIntervalSinceNow)
+        if seconds < 60 { return "just now" }
+        let minutes = seconds / 60
+        if minutes < 60 { return "\(minutes)m ago" }
+        let hours = minutes / 60
+        if hours < 24 { return "\(hours)h ago" }
+        let days = hours / 24
+        return "\(days)d ago"
+    }
 }
 
 // MARK: - Chat Detail
@@ -121,12 +139,9 @@ struct ChatDetailView: View {
     @State private var isAgentMode = false
     @State private var executingPlanMessageId: UUID?
     @State private var generationTask: Task<Void, Never>?
+    @State private var isNearBottom = true
     @FocusState private var inputFocused: Bool
 
-    private var inputHeight: CGFloat {
-        let lineCount = max(1, inputText.components(separatedBy: "\n").count)
-        return min(300, CGFloat(lineCount) * 20 + 16)
-    }
 
     private var session: ChatSession? {
         appState.chatSessions.first { $0.id == sessionId }
@@ -148,12 +163,30 @@ struct ChatDetailView: View {
                         Color.clear.frame(height: 1).id("bottom")
                     }
                     .padding(16)
+                    .background(
+                        GeometryReader { content in
+                            Color.clear.preference(
+                                key: ScrollOffsetKey.self,
+                                value: content.frame(in: .named("chatScroll")).maxY
+                            )
+                        }
+                    )
+                }
+                .coordinateSpace(name: "chatScroll")
+                .onPreferenceChange(ScrollOffsetKey.self) { maxY in
+                    // Content maxY relative to the scroll view frame:
+                    // when scrolled to bottom, maxY ≈ scroll view height.
+                    // "near bottom" = within 5% of the total content height.
+                    if let height = NSApp.keyWindow?.contentView?.frame.height {
+                        let threshold = height * 0.05
+                        isNearBottom = maxY < height + threshold
+                    }
                 }
                 .onChange(of: session?.messages.count) { _, _ in
-                    scrollToBottom(proxy)
+                    if isNearBottom { scrollToBottom(proxy) }
                 }
                 .onChange(of: session?.messages.last?.content) { _, _ in
-                    scrollToBottom(proxy)
+                    if isNearBottom { scrollToBottom(proxy) }
                 }
             }
 
@@ -193,38 +226,34 @@ struct ChatDetailView: View {
                     .buttonStyle(.plain)
                     .help("Agent Mode — plan & execute shell, files, web, AppleScript (\(isAgentMode ? "ON" : "OFF"))")
 
-                    // Dark pill — computed height from line count
-                    ZStack(alignment: .topLeading) {
-                        if inputText.isEmpty {
-                            Text("Message")
-                                .foregroundStyle(Color(.placeholderTextColor))
-                                .padding(.leading, 16)
-                                .padding(.top, 10)
-                                .allowsHitTesting(false)
-                        }
-                        TextEditor(text: $inputText)
-                            .font(.body)
-                            .scrollContentBackground(.hidden)
-                            .scrollIndicators(inputHeight >= 300 ? .automatic : .hidden)
-                            .padding(.horizontal, 12)
-                            .padding(.vertical, 6)
-                            .focused($inputFocused)
-                            .disabled(server.status != .running || isGenerating)
-                            .onKeyPress(.return, phases: .down) { press in
-                                if press.modifiers.contains(.shift) {
-                                    return .ignored // Shift+Return → newline
-                                }
-                                sendMessage()
-                                return .handled // Return → send
+                    // Dark pill input
+                    TextField("Message", text: $inputText, axis: .vertical)
+                        .font(.body)
+                        .textFieldStyle(.plain)
+                        .lineLimit(1...15)
+                        .padding(.horizontal, 12)
+                        .padding(.vertical, 8)
+                        .focused($inputFocused)
+                        .disabled(server.status != .running || isGenerating)
+                        .onKeyPress(.return, phases: .down) { press in
+                            if press.modifiers.contains(.shift) {
+                                inputText += "\n"
+                                return .handled
                             }
-                    }
-                    .frame(height: inputHeight)
-                    .background(Color(nsColor: NSColor(white: 0.10, alpha: 1)))
-                    .clipShape(RoundedRectangle(cornerRadius: 20))
-                    .overlay(
-                        RoundedRectangle(cornerRadius: 20)
-                            .stroke(Color.secondary.opacity(0.25), lineWidth: 0.5)
-                    )
+                            sendMessage()
+                            return .handled
+                        }
+                        .onAppear {
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
+                                inputFocused = true
+                            }
+                        }
+                        .background(Color(nsColor: NSColor(white: 0.10, alpha: 1)))
+                        .clipShape(RoundedRectangle(cornerRadius: 20))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 20)
+                                .stroke(Color.secondary.opacity(0.25), lineWidth: 0.5)
+                        )
 
                     Button {
                         if isGenerating {
@@ -324,6 +353,7 @@ struct ChatDetailView: View {
     // MARK: - Send Message
 
     private func sendMessage() {
+        isNearBottom = true // snap to bottom on send
         if isAgentMode {
             sendAgentMessage()
             return
@@ -433,12 +463,12 @@ struct ChatDetailView: View {
             var history = buildAgentHistory()
             let userMsg = history.last { ($0["role"] as? String) == "user" }?["content"] as? String ?? ""
             let skills = AgentPrompt.skillManager.matchingSkills(for: userMsg)
-            let systemPrompt = AgentPrompt.systemPrompt + skills + appState.agentMemory.contextSnippet()
+            let systemPrompt = AgentPrompt.systemPrompt + skills + AgentPrompt.memory + appState.agentMemory.contextSnippet()
             var messages: [[String: Any]] = [["role": "system", "content": systemPrompt]]
             // Some models (e.g. Gemma 4 E4B) can't generate after tool results without
             // a user message. Add a nudge so the model knows to synthesize a response.
             if let lastRole = history.last?["role"] as? String, lastRole == "tool" {
-                history.append(["role": "user", "content": "Process the tool results above and respond."])
+                history.append(["role": "user", "content": "Continue. If the task is done, summarize the result. If not, take the next step."])
             }
             messages.append(contentsOf: history)
 
@@ -649,6 +679,7 @@ struct ChatDetailView: View {
             .searchFiles: SearchFilesHandler(),
             .browse: BrowseHandler(),
             .webSearch: WebSearchHandler(),
+            .saveMemory: SaveMemoryHandler(),
         ]
     }
 }

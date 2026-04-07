@@ -700,7 +700,12 @@ fn convertGemma4ArgsToJson(allocator: std.mem.Allocator, input: []const u8) ?[]c
 
         // Find key (everything before ':')
         const colon = std.mem.indexOf(u8, body[pos..], ":") orelse break;
-        const key = std.mem.trim(u8, body[pos .. pos + colon], " \t\n\r");
+        const key_raw = std.mem.trim(u8, body[pos .. pos + colon], " \t\n\r");
+        // Strip surrounding quotes if present (model sometimes quotes keys in custom format)
+        const key = if (key_raw.len >= 2 and key_raw[0] == '"' and key_raw[key_raw.len - 1] == '"')
+            key_raw[1 .. key_raw.len - 1]
+        else
+            key_raw;
         pos = pos + colon + 1;
 
         if (!first) result.append(allocator, ',') catch return null;
@@ -736,10 +741,14 @@ fn convertGemma4ArgsToJson(allocator: std.mem.Allocator, input: []const u8) ?[]c
             }
             result.append(allocator, '"') catch return null;
         } else {
-            // Bare value (number, boolean)
+            // Bare value (number, boolean, or unquoted string)
             const val_end = std.mem.indexOfAny(u8, body[pos..], ",}") orelse body.len - pos;
             const value = std.mem.trim(u8, body[pos .. pos + val_end], " \t\n\r");
-            result.appendSlice(allocator, value) catch return null;
+            if (isJsonLiteral(value)) {
+                result.appendSlice(allocator, value) catch return null;
+            } else {
+                appendJsonString(allocator, &result, value) catch return null;
+            }
             pos = pos + val_end;
         }
     }
@@ -1103,6 +1112,47 @@ test "parseToolCalls Gemma 4 truncated mid-value" {
     try testing.expectEqualStrings("navigate", parsed.value.object.get("action").?.string);
     // URL should be present (truncated but captured)
     try testing.expect(parsed.value.object.get("url") != null);
+}
+
+test "parseToolCalls Gemma 4 quoted keys with custom delimiters" {
+    const allocator = testing.allocator;
+    // Model mixes JSON-style quoted keys with <|"|> delimiters — JSON parse fails,
+    // convertGemma4ArgsToJson must strip quotes from keys to produce valid JSON.
+    const text =
+        \\<|tool_call>call:shell{"command":<|"|>ls -la<|"|>}<tool_call|>
+    ;
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("shell", calls[0].name);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("ls -la", parsed.value.object.get("command").?.string);
+}
+
+test "parseToolCalls Gemma 4 quoted keys with bare values" {
+    const allocator = testing.allocator;
+    // Model uses quoted keys but bare (non-JSON, non-delimited) values
+    const text = "<|tool_call>call:shell{\"command\":ls -la}<tool_call|>";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("shell", calls[0].name);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("ls -la", parsed.value.object.get("command").?.string);
 }
 
 test "isJsonLiteral" {
