@@ -78,6 +78,7 @@ pub extern "c" fn mlx_set_default_device(dev: mlx_device) c_int;
 
 // Stream
 pub extern "c" fn mlx_stream_new() mlx_stream;
+pub extern "c" fn mlx_stream_new_device(dev: mlx_device) mlx_stream;
 pub extern "c" fn mlx_stream_free(s: mlx_stream) c_int;
 pub extern "c" fn mlx_default_cpu_stream_new() mlx_stream;
 pub extern "c" fn mlx_default_gpu_stream_new() mlx_stream;
@@ -253,9 +254,17 @@ pub extern "c" fn mlx_async_eval(outputs: mlx_vector_array) c_int;
 pub extern "c" fn mlx_clear_cache() c_int;
 pub extern "c" fn mlx_set_memory_limit(res: *usize, limit: usize) c_int;
 pub extern "c" fn mlx_set_cache_limit(res: *usize, limit: usize) c_int;
+pub extern "c" fn mlx_set_wired_limit(res: *usize, limit: usize) c_int;
 pub extern "c" fn mlx_get_active_memory(res: *usize) c_int;
 pub extern "c" fn mlx_get_peak_memory(res: *usize) c_int;
 pub extern "c" fn mlx_reset_peak_memory() c_int;
+
+// ── Device info ──
+pub const mlx_device_info = extern struct { ctx: ?*anyopaque = null };
+pub extern "c" fn mlx_device_info_new() mlx_device_info;
+pub extern "c" fn mlx_device_info_get(info: *mlx_device_info, dev: mlx_device) c_int;
+pub extern "c" fn mlx_device_info_free(info: mlx_device_info) c_int;
+pub extern "c" fn mlx_device_info_get_size(res: *usize, info: mlx_device_info, key: [*:0]const u8) c_int;
 
 // ── Error handler ──
 pub const mlx_error_handler_func = ?*const fn ([*:0]const u8, ?*anyopaque) callconv(.c) void;

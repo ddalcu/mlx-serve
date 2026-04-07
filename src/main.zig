@@ -182,6 +182,31 @@ pub fn main() !void {
     var xfm = try transformer_mod.Transformer.init(allocator, config, &weights);
     defer xfm.deinit();
 
+    // Wire model weights into GPU memory (prevents paging, matches mlx-lm behavior)
+    {
+        var dev = mlx.mlx_device{ .ctx = null };
+        _ = mlx.mlx_get_default_device(&dev);
+        var info = mlx.mlx_device_info_new();
+        if (mlx.mlx_device_info_get(&info, dev) == 0) {
+            var max_rec: usize = 0;
+            if (mlx.mlx_device_info_get_size(&max_rec, info, "max_recommended_working_set_size") == 0 and max_rec > 0) {
+                var old_limit: usize = 0;
+                _ = mlx.mlx_set_wired_limit(&old_limit, max_rec);
+                log.debug("Wired limit set to {d} MB\n", .{max_rec / (1024 * 1024)});
+            }
+            _ = mlx.mlx_device_info_free(info);
+        }
+    }
+
+    // JIT-compile activation functions (fuses ops → single kernels, matching mlx-lm)
+    if (config.hidden_act == .gelu_approx) {
+        xfm.compileGelu();
+        xfm.compileGeglu(); // gelu(gate) * up → 1 kernel
+    }
+    if (config.final_logit_softcapping > 0.0) {
+        xfm.compileSoftcap(); // tanh(x/cap) * cap → 1 kernel
+    }
+
     if (ctx_size > 0) {
         log.info("Context size: {d} tokens\n", .{ctx_size});
     }

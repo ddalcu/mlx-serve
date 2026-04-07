@@ -43,8 +43,9 @@ pub const GenerationResult = struct {
 };
 
 /// Step-based generator. Call `init` to prefill, then `next` per token.
-/// Uses async eval pipelining: pre-computes the next forward pass on GPU while
-/// the caller handles I/O (HTTP streaming, token decoding, etc.).
+/// Uses a fully-lazy async pipeline matching mlx-lm: sample + next forward are
+/// built as a single lazy computation graph, async_eval'd together. The GPU
+/// never idles between token generation steps.
 pub const Generator = struct {
     xfm: *Transformer,
     tok: *const Tokenizer,
@@ -66,6 +67,9 @@ pub const Generator = struct {
     // Async pipeline state: pre-computed forward pass logits for next decode step
     pending_logits: mlx.mlx_array = .{},
     has_pending_logits: bool = false,
+    // Deferred token: lazy array from async pipeline, eval'd at start of next iteration
+    pending_token: mlx.mlx_array = .{},
+    has_pending_token: bool = false,
 
     /// Prefill the prompt and prepare for token-by-token generation.
     pub fn init(
@@ -93,17 +97,32 @@ pub const Generator = struct {
         defer _ = mlx.mlx_array_free(input);
 
         const logits = try xfm.forward(input);
-        const first_result = try sampleToken(allocator, logits, sampling, null, 0, s);
+
+        // Sample first token lazily, then build the next forward pass as part
+        // of the same lazy graph so async_eval kicks off the whole chain.
+        const lazy_token = sampleTokenLazy(logits, sampling, s);
         _ = mlx.mlx_array_free(logits);
 
-        // Materialize KV cache state on GPU after prefill.
-        // This ensures optimal memory layout for subsequent decode steps.
+        // Reshape lazy token [1] -> [1, 1] and feed into next forward pass
+        const next_logits = try lazyForward(xfm, lazy_token);
+
+        // Eval the cache + lazy token + next logits together
         xfm.cache.evalState();
+        const arr = [_]mlx.mlx_array{ lazy_token, next_logits };
+        const vec = mlx.mlx_vector_array_new_data(&arr, 2);
+        _ = mlx.mlx_async_eval(vec);
+        _ = mlx.mlx_vector_array_free(vec);
+
+        // Now sync to get the first token value (GPU is already computing next_logits)
+        try mlx.check(mlx.mlx_array_eval(lazy_token));
+        var val: i32 = 0;
+        try mlx.check(mlx.mlx_array_item_int32(&val, lazy_token));
+        _ = mlx.mlx_array_free(lazy_token);
 
         var gen = Generator{
             .xfm = xfm,
             .tok = tok,
-            .next_token_id = first_result.token_id,
+            .next_token_id = @intCast(val),
             .step = 0,
             .max_tokens = max_tokens,
             .sampling = sampling,
@@ -117,9 +136,8 @@ pub const Generator = struct {
             .timer = try std.time.Timer.start(),
         };
 
-        // Pipeline: speculatively start the forward pass for the first decode step.
-        // This overlaps GPU computation with the caller's setup work.
-        gen.startAsyncForward(first_result.token_id);
+        gen.pending_logits = next_logits;
+        gen.has_pending_logits = true;
 
         return gen;
     }
@@ -132,12 +150,34 @@ pub const Generator = struct {
             _ = mlx.mlx_array_free(self.pending_logits);
             self.has_pending_logits = false;
         }
+        if (self.has_pending_token) {
+            _ = mlx.mlx_array_free(self.pending_token);
+            self.has_pending_token = false;
+        }
         self.generated_ids.deinit(allocator);
+    }
+
+    /// Resolve the deferred pending token: eval the lazy array and extract the u32 value.
+    /// This is called at the START of each iteration, giving the GPU maximum time
+    /// to compute since the async_eval at the END of the previous iteration.
+    fn resolvePendingToken(self: *Generator) !void {
+        if (!self.has_pending_token) return;
+        try mlx.check(mlx.mlx_array_eval(self.pending_token));
+        var val: i32 = 0;
+        try mlx.check(mlx.mlx_array_item_int32(&val, self.pending_token));
+        _ = mlx.mlx_array_free(self.pending_token);
+        self.has_pending_token = false;
+        self.next_token_id = @intCast(val);
     }
 
     /// Returns the next token ID, or null when generation is finished.
     pub fn next(self: *Generator, allocator: std.mem.Allocator) !?u32 {
         if (self.done) return null;
+
+        // Resolve deferred token from previous async pipeline step.
+        // By deferring eval to here, the GPU has had the entire caller's
+        // processing time (HTTP streaming, token decoding, etc.) to compute.
+        try self.resolvePendingToken();
 
         // Check stop conditions
         if (self.step >= self.max_tokens) {
@@ -179,6 +219,11 @@ pub const Generator = struct {
         self.step += 1;
         try self.generated_ids.append(allocator, token);
 
+        // Periodic memory cleanup (matches mlx-lm's pattern)
+        if (self.step % 256 == 0) {
+            _ = mlx.mlx_clear_cache();
+        }
+
         // Use pre-computed logits if available (async pipeline), otherwise compute synchronously
         const step_logits = if (self.has_pending_logits) blk: {
             const logits = self.pending_logits;
@@ -191,32 +236,65 @@ pub const Generator = struct {
             defer _ = mlx.mlx_array_free(tok_input);
             break :blk try self.xfm.forward(tok_input);
         };
-        defer _ = mlx.mlx_array_free(step_logits);
 
-        const result = try sampleToken(allocator, step_logits, self.sampling, self.generated_ids.items, self.logprobs_n, self.xfm.s);
-        self.next_token_id = result.token_id;
+        // If logprobs requested, compute them synchronously (needs eval)
+        if (self.logprobs_n > 0) {
+            defer _ = mlx.mlx_array_free(step_logits);
+            const result = try sampleToken(allocator, step_logits, self.sampling, self.generated_ids.items, self.logprobs_n, self.xfm.s);
+            self.next_token_id = result.token_id;
 
-        // Free previous logprob result before storing new one
-        if (self.last_logprob) |*lp| {
-            allocator.free(lp.top_logprobs);
+            if (self.last_logprob) |*lp| {
+                allocator.free(lp.top_logprobs);
+            }
+            self.last_logprob = result.logprob_result;
+
+            if (self.step < self.max_tokens) {
+                self.startAsyncForward(result.token_id);
+            }
+            return token;
         }
-        self.last_logprob = result.logprob_result;
 
-        // Pipeline: start computing the next forward pass on GPU while caller does I/O.
-        // Skip on the last step (we know we'll stop next iteration).
+        // Fast path: fully-lazy pipeline (no logprobs).
+        // Build sample + next forward as one lazy graph, async_eval together.
+        // DON'T eval the token here — defer to start of next iteration for maximum overlap.
+        const lazy_token = sampleTokenLazy(step_logits, self.sampling, self.xfm.s);
+        _ = mlx.mlx_array_free(step_logits);
+
         if (self.step < self.max_tokens) {
-            self.startAsyncForward(result.token_id);
+            const next_logits = lazyForward(self.xfm, lazy_token) catch {
+                // Forward failed — fall back to sync eval
+                try mlx.check(mlx.mlx_array_eval(lazy_token));
+                var val: i32 = 0;
+                try mlx.check(mlx.mlx_array_item_int32(&val, lazy_token));
+                _ = mlx.mlx_array_free(lazy_token);
+                self.next_token_id = @intCast(val);
+                return token;
+            };
+
+            // Kick off the full pipeline: sample + next forward
+            const arr = [_]mlx.mlx_array{ lazy_token, next_logits };
+            const vec = mlx.mlx_vector_array_new_data(&arr, 2);
+            _ = mlx.mlx_async_eval(vec);
+            _ = mlx.mlx_vector_array_free(vec);
+
+            // DEFER token eval to next iteration (maximum GPU overlap)
+            self.pending_token = lazy_token;
+            self.has_pending_token = true;
+            self.pending_logits = next_logits;
+            self.has_pending_logits = true;
+        } else {
+            // Last step — sync immediately
+            try mlx.check(mlx.mlx_array_eval(lazy_token));
+            var val: i32 = 0;
+            try mlx.check(mlx.mlx_array_item_int32(&val, lazy_token));
+            _ = mlx.mlx_array_free(lazy_token);
+            self.next_token_id = @intCast(val);
         }
 
         return token;
     }
 
-    /// Start the full pipeline: forward(token) → sample → next_forward(sampled) → async_eval.
-    /// The sampled token feeds directly into the next forward pass as a lazy array,
-    /// avoiding the GPU→CPU→GPU round-trip that would occur if we eval'd the token first.
-    /// This matches mlx_lm's pipeline: _step(y) where y is the lazy sampled array.
-    /// Speculatively start the forward pass for the given token on the GPU.
-    /// The result (logits) will be consumed by the next call to next().
+    /// Legacy sync forward for logprobs path.
     fn startAsyncForward(self: *Generator, token_id: u32) void {
         const tok_i32: i32 = @intCast(token_id);
         const tok_shape = [_]c_int{ 1, 1 };
@@ -224,7 +302,6 @@ pub const Generator = struct {
         defer _ = mlx.mlx_array_free(tok_input);
 
         const logits = self.xfm.forward(tok_input) catch return;
-        // Kick off GPU computation asynchronously
         const arr = [_]mlx.mlx_array{logits};
         const vec = mlx.mlx_vector_array_new_data(&arr, 1);
         _ = mlx.mlx_async_eval(vec);
@@ -234,6 +311,109 @@ pub const Generator = struct {
         self.has_pending_logits = true;
     }
 };
+
+/// Build forward pass from a lazy sampled token array.
+/// Reshapes [1] -> [1, 1] and calls transformer forward. All lazy (no eval).
+fn lazyForward(xfm: *Transformer, lazy_token: mlx.mlx_array) !mlx.mlx_array {
+    const tok_shape = [_]c_int{ 1, 1 };
+    var reshaped = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(reshaped);
+    try mlx.check(mlx.mlx_reshape(&reshaped, lazy_token, &tok_shape, 2, xfm.s));
+    return try xfm.forward(reshaped);
+}
+
+/// Sample a token lazily from logits — returns a lazy MLX array (no eval).
+/// Handles temperature scaling, top-k, and top-p, but defers materialization.
+/// The returned array has shape [1] with the sampled token ID.
+/// Caller must free the returned array.
+fn sampleTokenLazy(logits: mlx.mlx_array, sampling: SamplingParams, s: mlx.mlx_stream) mlx.mlx_array {
+    const shape = mlx.getShape(logits);
+    const seq_len = shape[1];
+
+    // Extract last position: [1, seq_len, vocab] -> [1, vocab]
+    var last_logits = mlx.mlx_array_new();
+
+    if (seq_len == 1) {
+        const sq_shape = [_]c_int{ 1, shape[2] };
+        _ = mlx.mlx_reshape(&last_logits, logits, &sq_shape, 2, s);
+    } else {
+        const start = [_]c_int{ 0, seq_len - 1, 0 };
+        const stop = [_]c_int{ 1, seq_len, shape[2] };
+        const strides = [_]c_int{ 1, 1, 1 };
+        var sliced = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(sliced);
+        _ = mlx.mlx_slice(&sliced, logits, &start, 3, &stop, 3, &strides, 3, s);
+
+        const sq_shape = [_]c_int{ 1, shape[2] };
+        _ = mlx.mlx_reshape(&last_logits, sliced, &sq_shape, 2, s);
+    }
+
+    // Greedy: argmax (no temperature)
+    if (sampling.temperature < 0.01) {
+        var result = mlx.mlx_array_new();
+        _ = mlx.mlx_argmax_axis(&result, last_logits, -1, false, s);
+        _ = mlx.mlx_array_free(last_logits);
+        return result;
+    }
+
+    // Scale by 1/temperature
+    var current = last_logits;
+    var scaled = mlx.mlx_array_new();
+    var scaled_owned = false;
+
+    if (sampling.temperature != 1.0) {
+        const temp_arr = mlx.mlx_array_new_float(sampling.temperature);
+        defer _ = mlx.mlx_array_free(temp_arr);
+        _ = mlx.mlx_divide(&scaled, current, temp_arr, s);
+        _ = mlx.mlx_array_free(current);
+        current = scaled;
+        scaled_owned = true;
+    }
+
+    // Apply top-k filtering (lazy)
+    var after_topk = mlx.mlx_array_new();
+    var topk_owned = false;
+
+    if (sampling.top_k > 0) {
+        applyTopK(&after_topk, current, sampling.top_k, s) catch {};
+        if (topk_owned or (!scaled_owned and current.ctx != last_logits.ctx)) {
+            _ = mlx.mlx_array_free(current);
+        } else if (scaled_owned) {
+            _ = mlx.mlx_array_free(current);
+        }
+        current = after_topk;
+        topk_owned = true;
+        scaled_owned = false;
+    }
+
+    // Apply top-p filtering (lazy)
+    var after_topp = mlx.mlx_array_new();
+    var topp_owned = false;
+
+    if (sampling.top_p < 1.0) {
+        applyTopP(&after_topp, current, sampling.top_p, s) catch {};
+        if (topk_owned) _ = mlx.mlx_array_free(current)
+        else if (scaled_owned) _ = mlx.mlx_array_free(current);
+        current = after_topp;
+        topp_owned = true;
+        topk_owned = false;
+        scaled_owned = false;
+    }
+
+    // Sample from categorical distribution (lazy — no eval!)
+    var sampled = mlx.mlx_array_new();
+    const null_key = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(null_key);
+    _ = mlx.mlx_random_categorical(&sampled, current, -1, null_key, s);
+
+    // Clean up intermediates
+    if (topp_owned) _ = mlx.mlx_array_free(current)
+    else if (topk_owned) _ = mlx.mlx_array_free(current)
+    else if (scaled_owned) _ = mlx.mlx_array_free(current)
+    else _ = mlx.mlx_array_free(last_logits);
+
+    return sampled; // Shape [1], lazy
+}
 
 /// Convenience: generate all tokens at once (non-streaming).
 pub fn generate(

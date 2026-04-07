@@ -131,25 +131,32 @@ pub const KVCache = struct {
         if (layer == 0) self.step += new_len;
 
         // 6. Create views for attention.
-        //    During PREFILL (new_len > 1): return ALL entries. The sliding window mask
-        //    handles attention scope. This matches mlx-lm's RotatingKVCache behavior.
-        //    During DECODE (new_len == 1): return only the last max_seq entries for
-        //    sliding window layers, since decode doesn't use a mask.
-        const cur_shape = mlx.getShape(entry.keys);
+        //    Skip slicing when the view covers the entire buffer — just reference it directly.
+        //    This saves 2 C API calls per layer per token (84 calls/token for 42-layer models).
+        const buf_cap = bufferCapacity(entry.keys);
         const total: c_int = @intCast(entry.offset);
         const is_decode = new_len == 1;
         const view_start: c_int = if (is_decode and max_seq > 0 and entry.offset > max_seq)
             total - @as(c_int, @intCast(max_seq))
         else
             0;
-        const v_start = [_]c_int{ 0, 0, view_start, 0 };
-        const v_stop = [_]c_int{ cur_shape[0], cur_shape[1], total, cur_shape[3] };
-        const v_strides = [_]c_int{ 1, 1, 1, 1 };
 
-        entry.key_view = mlx.mlx_array_new();
-        entry.value_view = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_slice(&entry.key_view, entry.keys, &v_start, 4, &v_stop, 4, &v_strides, 4, s));
-        try mlx.check(mlx.mlx_slice(&entry.value_view, entry.values, &v_start, 4, &v_stop, 4, &v_strides, 4, s));
+        if (view_start == 0 and entry.offset == buf_cap) {
+            // View covers the entire buffer — no slice needed (matches mlx-lm optimization)
+            entry.key_view = mlx.mlx_array_new();
+            entry.value_view = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_array_set(&entry.key_view, entry.keys));
+            try mlx.check(mlx.mlx_array_set(&entry.value_view, entry.values));
+        } else {
+            const cur_shape = mlx.getShape(entry.keys);
+            const v_start = [_]c_int{ 0, 0, view_start, 0 };
+            const v_stop = [_]c_int{ cur_shape[0], cur_shape[1], total, cur_shape[3] };
+            const v_strides = [_]c_int{ 1, 1, 1, 1 };
+            entry.key_view = mlx.mlx_array_new();
+            entry.value_view = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_slice(&entry.key_view, entry.keys, &v_start, 4, &v_stop, 4, &v_strides, 4, s));
+            try mlx.check(mlx.mlx_slice(&entry.value_view, entry.values, &v_start, 4, &v_stop, 4, &v_strides, 4, s));
+        }
 
         return .{ entry.key_view, entry.value_view };
     }
@@ -521,8 +528,17 @@ pub const Transformer = struct {
     // Compiled forward pass closure (JIT-compiled for Metal kernel fusion)
     compiled_forward: ?mlx.mlx_closure = null,
 
+    // Compiled closures (fuse ops into single kernels, matching mlx-lm's @mx.compile)
+    compiled_gelu: ?mlx.mlx_closure = null,
+    compiled_geglu: ?mlx.mlx_closure = null, // gelu(gate) * up → 1 kernel
+    compiled_softcap: ?mlx.mlx_closure = null, // tanh(x/cap) * cap → 1 kernel
+
     pub fn init(allocator: std.mem.Allocator, config: ModelConfig, weights: *const Weights) !Transformer {
-        const s = mlx.mlx_default_gpu_stream_new();
+        // Create a dedicated GPU stream for generation (matches mlx-lm pattern).
+        // This allows better scheduling of computation vs memory operations.
+        var dev = mlx.mlx_device{ .ctx = null };
+        _ = mlx.mlx_get_default_device(&dev);
+        const s = mlx.mlx_stream_new_device(dev);
         const prefix = config.weight_prefix;
 
         var name_buf: [256]u8 = undefined;
@@ -970,6 +986,120 @@ pub const Transformer = struct {
         }
     }
 
+    /// Compile GELU activation for kernel fusion.
+    /// Fuses 8 separate ops into 1 GPU kernel, matching mlx-lm's @mx.compile behavior.
+    pub fn compileGelu(self: *Transformer) void {
+        const raw_closure = mlx.mlx_closure_new_func_payload(
+            &geluClosureCallback,
+            @ptrCast(self),
+            null,
+        );
+        var compiled = mlx.mlx_closure{ .ctx = null };
+        const rc = mlx.mlx_compile(&compiled, raw_closure, true); // shapeless=true
+        _ = mlx.mlx_closure_free(raw_closure);
+        if (rc == 0 and compiled.ctx != null) {
+            self.compiled_gelu = compiled;
+            log.info("GELU compiled (kernel fusion enabled)\n", .{});
+        } else {
+            log.warn("GELU compilation failed, using uncompiled path\n", .{});
+        }
+    }
+
+    /// Compile GeGLU: gelu(gate) * up → single fused kernel.
+    pub fn compileGeglu(self: *Transformer) void {
+        const raw_closure = mlx.mlx_closure_new_func_payload(
+            &gegluClosureCallback,
+            @ptrCast(self),
+            null,
+        );
+        var compiled = mlx.mlx_closure{ .ctx = null };
+        const rc = mlx.mlx_compile(&compiled, raw_closure, true);
+        _ = mlx.mlx_closure_free(raw_closure);
+        if (rc == 0 and compiled.ctx != null) {
+            self.compiled_geglu = compiled;
+            log.info("GeGLU compiled (kernel fusion enabled)\n", .{});
+        }
+    }
+
+    fn gegluClosureCallback(res: *mlx.mlx_vector_array, input: mlx.mlx_vector_array, payload: ?*anyopaque) callconv(.c) c_int {
+        const self: *Transformer = @ptrCast(@alignCast(payload.?));
+        var gate = mlx.mlx_array_new();
+        var up = mlx.mlx_array_new();
+        if (mlx.mlx_vector_array_get(&gate, input, 0) != 0) return -1;
+        if (mlx.mlx_vector_array_get(&up, input, 1) != 0) {
+            _ = mlx.mlx_array_free(gate);
+            return -1;
+        }
+        defer _ = mlx.mlx_array_free(gate);
+        defer _ = mlx.mlx_array_free(up);
+
+        // geglu(gate, up) = gelu_approx(gate) * up
+        const activated = self.geluUncompiled(gate) catch return -1;
+        defer _ = mlx.mlx_array_free(activated);
+        var result = mlx.mlx_array_new();
+        mlx.check(mlx.mlx_multiply(&result, activated, up, self.s)) catch return -1;
+
+        const out_arr = [_]mlx.mlx_array{result};
+        res.* = mlx.mlx_vector_array_new_data(&out_arr, 1);
+        _ = mlx.mlx_array_free(result);
+        return 0;
+    }
+
+    /// Compile logit softcap: tanh(x/cap) * cap → single fused kernel.
+    pub fn compileSoftcap(self: *Transformer) void {
+        const raw_closure = mlx.mlx_closure_new_func_payload(
+            &softcapClosureCallback,
+            @ptrCast(self),
+            null,
+        );
+        var compiled = mlx.mlx_closure{ .ctx = null };
+        const rc = mlx.mlx_compile(&compiled, raw_closure, true);
+        _ = mlx.mlx_closure_free(raw_closure);
+        if (rc == 0 and compiled.ctx != null) {
+            self.compiled_softcap = compiled;
+            log.info("Softcap compiled (kernel fusion enabled)\n", .{});
+        }
+    }
+
+    fn softcapClosureCallback(res: *mlx.mlx_vector_array, input: mlx.mlx_vector_array, payload: ?*anyopaque) callconv(.c) c_int {
+        const self: *Transformer = @ptrCast(@alignCast(payload.?));
+        var x = mlx.mlx_array_new();
+        if (mlx.mlx_vector_array_get(&x, input, 0) != 0) return -1;
+        defer _ = mlx.mlx_array_free(x);
+
+        const cap = self.softcap_scalar orelse return -1;
+        // tanh(x / cap) * cap
+        var scaled = mlx.mlx_array_new();
+        mlx.check(mlx.mlx_divide(&scaled, x, cap, self.s)) catch return -1;
+        defer _ = mlx.mlx_array_free(scaled);
+        var tanh_val = mlx.mlx_array_new();
+        mlx.check(mlx.mlx_tanh(&tanh_val, scaled, self.s)) catch return -1;
+        defer _ = mlx.mlx_array_free(tanh_val);
+        var result = mlx.mlx_array_new();
+        mlx.check(mlx.mlx_multiply(&result, tanh_val, cap, self.s)) catch return -1;
+
+        const out_arr = [_]mlx.mlx_array{result};
+        res.* = mlx.mlx_vector_array_new_data(&out_arr, 1);
+        _ = mlx.mlx_array_free(result);
+        return 0;
+    }
+
+    fn geluClosureCallback(res: *mlx.mlx_vector_array, input: mlx.mlx_vector_array, payload: ?*anyopaque) callconv(.c) c_int {
+        const self: *Transformer = @ptrCast(@alignCast(payload.?));
+        var x = mlx.mlx_array_new();
+        const get_rc = mlx.mlx_vector_array_get(&x, input, 0);
+        if (get_rc != 0) return get_rc;
+        defer _ = mlx.mlx_array_free(x);
+
+        // gelu_approx(x) = 0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x³)))
+        const result = self.geluUncompiled(x) catch return -1;
+
+        const out_arr = [_]mlx.mlx_array{result};
+        res.* = mlx.mlx_vector_array_new_data(&out_arr, 1);
+        _ = mlx.mlx_array_free(result);
+        return 0;
+    }
+
     fn forwardClosureCallback(res: *mlx.mlx_vector_array, input: mlx.mlx_vector_array, payload: ?*anyopaque) callconv(.c) c_int {
         const self: *Transformer = @ptrCast(@alignCast(payload.?));
         var token_ids = mlx.mlx_array_new();
@@ -1005,6 +1135,9 @@ pub const Transformer = struct {
 
     pub fn deinit(self: *Transformer) void {
         if (self.compiled_forward) |cf| _ = mlx.mlx_closure_free(cf);
+        if (self.compiled_gelu) |cg| _ = mlx.mlx_closure_free(cg);
+        if (self.compiled_geglu) |cg| _ = mlx.mlx_closure_free(cg);
+        if (self.compiled_softcap) |cs| _ = mlx.mlx_closure_free(cs);
         if (self.prompt_cache) |*pc| pc.deinit();
         self.cache.deinit();
         if (self.emb_scale) |es| _ = mlx.mlx_array_free(es);
@@ -1040,8 +1173,7 @@ pub const Transformer = struct {
     // ── Core ops ──
 
     inline fn qmatmul(self: *const Transformer, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array) !mlx.mlx_array {
-        const bits = detectQuantBits(w, sc, self.config.quant_group_size);
-        return qmatmulBits(x, w, sc, bi, bits, self.config.quant_group_size, self.s);
+        return qmatmulBits(x, w, sc, bi, self.config.quant_bits, self.config.quant_group_size, self.s);
     }
 
     inline fn rmsNorm(self: *const Transformer, x: mlx.mlx_array, w: mlx.mlx_array) !mlx.mlx_array {
@@ -1116,7 +1248,24 @@ pub const Transformer = struct {
 
     // ── Activation functions ──
 
+    /// GELU approximate: dispatches to compiled (fused kernel) when available.
     fn gelu(self: *const Transformer, x: mlx.mlx_array) !mlx.mlx_array {
+        if (self.compiled_gelu) |compiled| {
+            const in_arr = [_]mlx.mlx_array{x};
+            const in_vec = mlx.mlx_vector_array_new_data(&in_arr, 1);
+            defer _ = mlx.mlx_vector_array_free(in_vec);
+            var out_vec = mlx.mlx_vector_array{ .ctx = null };
+            try mlx.check(mlx.mlx_closure_apply(&out_vec, compiled, in_vec));
+            defer _ = mlx.mlx_vector_array_free(out_vec);
+            var result = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_vector_array_get(&result, out_vec, 0));
+            return result;
+        }
+        return self.geluUncompiled(x);
+    }
+
+    /// Raw GELU implementation (8 ops, used as fallback and as compilation source).
+    fn geluUncompiled(self: *const Transformer, x: mlx.mlx_array) !mlx.mlx_array {
         var x3 = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(x3);
         try mlx.check(mlx.mlx_power(&x3, x, self.three.?, self.s));
@@ -1126,12 +1275,12 @@ pub const Transformer = struct {
         var sum = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(sum);
         try mlx.check(mlx.mlx_add(&sum, x, inner, self.s));
-        var scaled = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(scaled);
-        try mlx.check(mlx.mlx_multiply(&scaled, self.gelu_coeff.?, sum, self.s));
+        var scaled_val = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(scaled_val);
+        try mlx.check(mlx.mlx_multiply(&scaled_val, self.gelu_coeff.?, sum, self.s));
         var tanh_val = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(tanh_val);
-        try mlx.check(mlx.mlx_tanh(&tanh_val, scaled, self.s));
+        try mlx.check(mlx.mlx_tanh(&tanh_val, scaled_val, self.s));
         var one_plus = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(one_plus);
         try mlx.check(mlx.mlx_add(&one_plus, self.one, tanh_val, self.s));
@@ -1157,6 +1306,54 @@ pub const Transformer = struct {
             .gelu_approx => self.gelu(x),
             .silu => self.silu(x),
         };
+    }
+
+    /// Fused GeGLU: gelu(gate) * up in a single compiled kernel.
+    /// Falls back to separate ops if not compiled.
+    fn computeGeglu(self: *const Transformer, gate: mlx.mlx_array, up: mlx.mlx_array) !mlx.mlx_array {
+        if (self.compiled_geglu) |compiled| {
+            const in_arr = [_]mlx.mlx_array{ gate, up };
+            const in_vec = mlx.mlx_vector_array_new_data(&in_arr, 2);
+            defer _ = mlx.mlx_vector_array_free(in_vec);
+            var out_vec = mlx.mlx_vector_array{ .ctx = null };
+            try mlx.check(mlx.mlx_closure_apply(&out_vec, compiled, in_vec));
+            defer _ = mlx.mlx_vector_array_free(out_vec);
+            var result = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_vector_array_get(&result, out_vec, 0));
+            return result;
+        }
+        // Fallback: separate gelu + multiply
+        const activated = try self.mlpActivation(gate);
+        defer _ = mlx.mlx_array_free(activated);
+        var result = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_multiply(&result, activated, up, self.s));
+        return result;
+    }
+
+    /// Fused logit softcap: tanh(x/cap) * cap in a single compiled kernel.
+    fn applySoftcap(self: *const Transformer, logits: mlx.mlx_array) !mlx.mlx_array {
+        if (self.compiled_softcap) |compiled| {
+            const in_arr = [_]mlx.mlx_array{logits};
+            const in_vec = mlx.mlx_vector_array_new_data(&in_arr, 1);
+            defer _ = mlx.mlx_vector_array_free(in_vec);
+            var out_vec = mlx.mlx_vector_array{ .ctx = null };
+            try mlx.check(mlx.mlx_closure_apply(&out_vec, compiled, in_vec));
+            defer _ = mlx.mlx_vector_array_free(out_vec);
+            var result = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_vector_array_get(&result, out_vec, 0));
+            return result;
+        }
+        // Fallback: separate ops
+        const cap = self.softcap_scalar.?;
+        var scaled = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_divide(&scaled, logits, cap, self.s));
+        defer _ = mlx.mlx_array_free(scaled);
+        var tanh_val = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_tanh(&tanh_val, scaled, self.s));
+        defer _ = mlx.mlx_array_free(tanh_val);
+        var result = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_multiply(&result, tanh_val, cap, self.s));
+        return result;
     }
 
     /// SwiGLU: silu(gate) * x
@@ -1721,13 +1918,10 @@ pub const Transformer = struct {
 
                 const gate_raw = try self.qmatmul(ff_normed, lw.gate_w, lw.gate_s, lw.gate_b);
                 defer _ = mlx.mlx_array_free(gate_raw);
-                const gate = try self.mlpActivation(gate_raw);
-                defer _ = mlx.mlx_array_free(gate);
                 const up = try self.qmatmul(ff_normed, lw.up_w, lw.up_s, lw.up_b);
                 defer _ = mlx.mlx_array_free(up);
-                var gate_up = mlx.mlx_array_new();
+                const gate_up = try self.computeGeglu(gate_raw, up);
                 defer _ = mlx.mlx_array_free(gate_up);
-                try mlx.check(mlx.mlx_multiply(&gate_up, gate, up, self.s));
                 const down = try self.qmatmul(gate_up, lw.down_w, lw.down_s, lw.down_b);
                 defer _ = mlx.mlx_array_free(down);
 
@@ -1748,13 +1942,10 @@ pub const Transformer = struct {
 
                 const gate_raw = try self.qmatmul(ff_normed, lw.gate_w, lw.gate_s, lw.gate_b);
                 defer _ = mlx.mlx_array_free(gate_raw);
-                const gate = try self.mlpActivation(gate_raw);
-                defer _ = mlx.mlx_array_free(gate);
                 const up = try self.qmatmul(ff_normed, lw.up_w, lw.up_s, lw.up_b);
                 defer _ = mlx.mlx_array_free(up);
-                var gate_up = mlx.mlx_array_new();
+                const gate_up = try self.computeGeglu(gate_raw, up);
                 defer _ = mlx.mlx_array_free(gate_up);
-                try mlx.check(mlx.mlx_multiply(&gate_up, gate, up, self.s));
                 const down = try self.qmatmul(gate_up, lw.down_w, lw.down_s, lw.down_b);
                 defer _ = mlx.mlx_array_free(down);
 
@@ -1789,16 +1980,9 @@ pub const Transformer = struct {
         _ = mlx.mlx_array_free(final_normed);
 
         // Gemma 4: logit softcapping — tanh(logits / cap) * cap
-        if (self.softcap_scalar) |cap| {
-            var scaled = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_divide(&scaled, logits, cap, self.s));
+        if (self.softcap_scalar != null) {
+            const capped = try self.applySoftcap(logits);
             _ = mlx.mlx_array_free(logits);
-            var tanh_val = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_tanh(&tanh_val, scaled, self.s));
-            _ = mlx.mlx_array_free(scaled);
-            var capped = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_multiply(&capped, tanh_val, cap, self.s));
-            _ = mlx.mlx_array_free(tanh_val);
             logits = capped;
         }
 
@@ -1951,16 +2135,9 @@ pub const Transformer = struct {
         _ = mlx.mlx_array_free(final_normed);
 
         // Gemma 4: logit softcapping — tanh(logits / cap) * cap
-        if (self.softcap_scalar) |cap| {
-            var scaled = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_divide(&scaled, logits, cap, self.s));
+        if (self.softcap_scalar != null) {
+            const capped = try self.applySoftcap(logits);
             _ = mlx.mlx_array_free(logits);
-            var tanh_val = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_tanh(&tanh_val, scaled, self.s));
-            _ = mlx.mlx_array_free(scaled);
-            var capped = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_multiply(&capped, tanh_val, cap, self.s));
-            _ = mlx.mlx_array_free(tanh_val);
             logits = capped;
         }
 
