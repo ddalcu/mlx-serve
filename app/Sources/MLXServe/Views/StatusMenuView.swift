@@ -157,6 +157,7 @@ struct StatusMenuView: View {
                 EndpointsSection(baseURL: server.baseURL)
                     .padding(.horizontal, 16)
                     .padding(.vertical, 10)
+
             }
 
             Divider().padding(.horizontal, 12)
@@ -391,3 +392,4 @@ struct ServerLogView: View {
         }
     }
 }
+

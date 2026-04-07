@@ -160,7 +160,7 @@ class DownloadManager: ObservableObject {
                 downloads[repoId]?.statusText = "\(filePath) (\(sizeStr))"
 
                 let fileURL = URL(string: "https://huggingface.co/\(repoId)/resolve/main/\(filePath)")!
-                let maxRetries = 3
+                let maxRetries = 20
 
                 for attempt in 0..<maxRetries {
                     try Task.checkCancellation()
@@ -212,8 +212,10 @@ class DownloadManager: ObservableObject {
                     } catch {
                         // Partial file stays on disk — next attempt resumes from it
                         if attempt < maxRetries - 1 {
-                            let delay = Double(attempt + 1) * 2.0
-                            downloads[repoId]?.statusText = "Connection lost, retrying in \(Int(delay))s... (\(attempt + 2)/\(maxRetries))"
+                            let isStall = error is DownloadStallError
+                            let delay = isStall ? 2.0 : Double(attempt + 1) * 2.0
+                            let reason = isStall ? "Download stalled" : "Connection lost"
+                            downloads[repoId]?.statusText = "\(reason), retrying in \(Int(delay))s... (\(attempt + 2)/\(maxRetries))"
                             try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
                         } else {
                             throw error
@@ -247,7 +249,7 @@ class DownloadManager: ObservableObject {
     ) async throws {
         let delegate = StreamingDelegate(fileHandle: fileHandle, existingBytes: existingBytes)
         let config = URLSessionConfiguration.default
-        config.timeoutIntervalForRequest = 300
+        config.timeoutIntervalForRequest = 60
         config.timeoutIntervalForResource = 7200
         let session = URLSession(configuration: config, delegate: delegate, delegateQueue: nil)
         defer { session.finishTasksAndInvalidate() }
@@ -337,6 +339,11 @@ class DownloadManager: ObservableObject {
 
 // MARK: - Streaming Download Delegate
 
+/// Thrown when a download stalls (speed below threshold for too long) — triggers auto-retry.
+private struct DownloadStallError: Error, LocalizedError {
+    var errorDescription: String? { "Download stalled — server stopped sending data" }
+}
+
 /// Writes received data directly to a file handle as it arrives.
 /// If the server returns 200 instead of 206, truncates the file (Range was ignored).
 private class StreamingDelegate: NSObject, URLSessionDataDelegate {
@@ -350,9 +357,56 @@ private class StreamingDelegate: NSObject, URLSessionDataDelegate {
     private let startTime = Date()
     private var lastProgressUpdate = Date.distantPast
 
+    // Stall detection — cancels the task if speed stays below threshold
+    private weak var activeTask: URLSessionDataTask?
+    private(set) var stalledOut = false
+    private var stallTimer: DispatchSourceTimer?
+    private var stallCheckBytes: Int64 = 0
+    private var slowSince: Date?
+    private static let stallSpeedThreshold: Double = 10_000  // 10 KB/s
+    private static let stallTimeout: TimeInterval = 30
+
     init(fileHandle: FileHandle, existingBytes: Int64) {
         self.fileHandle = fileHandle
         self.existingBytes = existingBytes
+    }
+
+    deinit {
+        stallTimer?.cancel()
+    }
+
+    private func startStallDetection(task: URLSessionDataTask) {
+        activeTask = task
+        stallCheckBytes = bytesReceived
+        let timer = DispatchSource.makeTimerSource(queue: .global(qos: .utility))
+        timer.schedule(deadline: .now() + 5, repeating: 5)
+        timer.setEventHandler { [weak self] in
+            self?.checkForStall()
+        }
+        timer.resume()
+        stallTimer = timer
+    }
+
+    private func checkForStall() {
+        let currentBytes = bytesReceived
+        let bytesSinceCheck = currentBytes - stallCheckBytes
+        let recentSpeed = Double(bytesSinceCheck) / 5.0  // ~5s interval
+        stallCheckBytes = currentBytes
+
+        // Push real-time speed to UI (prevents stale speed when data stops flowing)
+        onProgress?(existingBytes + currentBytes, recentSpeed)
+
+        if recentSpeed < Self.stallSpeedThreshold {
+            if slowSince == nil {
+                slowSince = Date()
+            } else if Date().timeIntervalSince(slowSince!) > Self.stallTimeout {
+                stalledOut = true
+                activeTask?.cancel()
+                stallTimer?.cancel()
+            }
+        } else {
+            slowSince = nil
+        }
     }
 
     func urlSession(_ session: URLSession, dataTask: URLSessionDataTask,
@@ -370,8 +424,10 @@ private class StreamingDelegate: NSObject, URLSessionDataDelegate {
                 completionHandler(.cancel)
                 return
             }
+            startStallDetection(task: dataTask)
             completionHandler(.allow)
         } else if statusCode == 206 {
+            startStallDetection(task: dataTask)
             completionHandler(.allow)
         } else {
             completionHandler(.cancel)
@@ -397,9 +453,12 @@ private class StreamingDelegate: NSObject, URLSessionDataDelegate {
     }
 
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+        stallTimer?.cancel()
         try? fileHandle.close()
         let effectiveError = writeError ?? error
-        if effectiveError != nil {
+        if stalledOut {
+            onComplete?(DownloadStallError())
+        } else if effectiveError != nil {
             onComplete?(effectiveError)
         } else if statusCode != 0 && statusCode != 200 && statusCode != 206 {
             onComplete?(URLError(.badServerResponse, userInfo: [
