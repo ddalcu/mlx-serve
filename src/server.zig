@@ -143,6 +143,7 @@ pub fn serve(
     log.info("  POST /v1/chat/completions\n", .{});
     log.info("  POST /v1/completions\n", .{});
     log.info("  POST /v1/embeddings\n", .{});
+    log.info("  POST /v1/messages (Anthropic)\n", .{});
     log.info("  POST /tokenize\n", .{});
     log.info("  POST /detokenize\n\n", .{});
 
@@ -279,9 +280,15 @@ fn handleConnection(
 
     var line_iter = std.mem.splitScalar(u8, first_line, ' ');
     const method = line_iter.next() orelse return;
-    const path = line_iter.next() orelse return;
+    const raw_path = line_iter.next() orelse return;
+    // Strip query string for route matching (e.g. /v1/messages?beta=true -> /v1/messages)
+    const path = if (std.mem.indexOf(u8, raw_path, "?")) |qpos| raw_path[0..qpos] else raw_path;
 
-    if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/health")) {
+    if (std.mem.eql(u8, method, "HEAD") and std.mem.eql(u8, path, "/")) {
+        // Connectivity check (Claude Code sends HEAD / before any API call)
+        log.debug("HEAD / -> 200\n", .{});
+        try sendResponse(stream, "200 OK", "text/plain", "");
+    } else if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/health")) {
         log.debug("GET  /health -> 200\n", .{});
         try sendResponse(stream, "200 OK", "application/json", "{\"status\":\"ok\"}");
     } else if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/v1/models")) {
@@ -328,6 +335,20 @@ fn handleConnection(
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
         const body = request[header_end + 4 .. total_read];
         try handleEmbeddings(allocator, stream, body, xfm, tok, config);
+    } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/messages")) {
+        if (config.is_encoder_only) {
+            try sendAnthropicError(allocator, stream, "invalid_request_error", "Encoder-only models do not support text generation. Use /v1/embeddings instead.", 400);
+            return;
+        }
+        if (!acquireInferenceSlot()) {
+            log.warn("POST /v1/messages -> 529 (queue full)\n", .{});
+            try sendAnthropicError(allocator, stream, "overloaded_error", "Server is overloaded. Try again shortly.", 529);
+            return;
+        }
+        defer releaseInferenceSlot();
+        const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
+        const body = request[header_end + 4 .. total_read];
+        try handleAnthropicMessages(allocator, stream, body, xfm, tok, chat_config, config);
     } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/tokenize")) {
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
         const body = request[header_end + 4 .. total_read];
@@ -2328,6 +2349,1077 @@ fn parseJsonFloat(root: std.json.ObjectMap, key: []const u8, default: f32, min: 
         else => default,
     } else default;
     return std.math.clamp(raw, min, max);
+}
+
+// ── Anthropic Messages API ──
+
+fn sendAnthropicError(allocator: std.mem.Allocator, stream: std.net.Stream, err_type: []const u8, message: []const u8, status_code: u32) !void {
+    const escaped_msg = try jsonEscape(allocator, message);
+    defer allocator.free(escaped_msg);
+    const body = try std.fmt.allocPrint(allocator,
+        \\{{"type":"error","error":{{"type":"{s}","message":{s}}}}}
+    , .{ err_type, escaped_msg });
+    defer allocator.free(body);
+    var status_buf: [32]u8 = undefined;
+    const status = std.fmt.bufPrint(&status_buf, "{d} Error", .{status_code}) catch "500 Error";
+    try sendResponse(stream, status, "application/json", body);
+}
+
+fn sendAnthropicEvent(stream: std.net.Stream, event_name: []const u8, data: []const u8) !void {
+    try stream.writeAll("event: ");
+    try stream.writeAll(event_name);
+    try stream.writeAll("\ndata: ");
+    try stream.writeAll(data);
+    try stream.writeAll("\n\n");
+}
+
+fn mapFinishToStopReason(finish_reason: []const u8) []const u8 {
+    if (std.mem.eql(u8, finish_reason, "stop")) return "end_turn";
+    if (std.mem.eql(u8, finish_reason, "length")) return "max_tokens";
+    if (std.mem.eql(u8, finish_reason, "tool_calls")) return "tool_use";
+    return "end_turn";
+}
+
+/// Serialize a std.json.Value to JSON text, appending to buf.
+fn serializeJsonValue(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), value: std.json.Value) !void {
+    switch (value) {
+        .null => try buf.appendSlice(allocator, "null"),
+        .bool => |b| try buf.appendSlice(allocator, if (b) "true" else "false"),
+        .integer => |i| {
+            var num_buf: [24]u8 = undefined;
+            const s = std.fmt.bufPrint(&num_buf, "{d}", .{i}) catch "0";
+            try buf.appendSlice(allocator, s);
+        },
+        .float => |f| {
+            var num_buf: [32]u8 = undefined;
+            const s = std.fmt.bufPrint(&num_buf, "{d}", .{f}) catch "0";
+            try buf.appendSlice(allocator, s);
+        },
+        .string => |s| {
+            const escaped = try jsonEscape(allocator, s);
+            defer allocator.free(escaped);
+            try buf.appendSlice(allocator, escaped);
+        },
+        .array => |arr| {
+            try buf.append(allocator, '[');
+            for (arr.items, 0..) |item, idx| {
+                if (idx > 0) try buf.append(allocator, ',');
+                try serializeJsonValue(allocator, buf, item);
+            }
+            try buf.append(allocator, ']');
+        },
+        .object => |obj| {
+            try buf.append(allocator, '{');
+            var iter = obj.iterator();
+            var first = true;
+            while (iter.next()) |entry| {
+                if (!first) try buf.append(allocator, ',');
+                first = false;
+                const ek = try jsonEscape(allocator, entry.key_ptr.*);
+                defer allocator.free(ek);
+                try buf.appendSlice(allocator, ek);
+                try buf.append(allocator, ':');
+                try serializeJsonValue(allocator, buf, entry.value_ptr.*);
+            }
+            try buf.append(allocator, '}');
+        },
+        .number_string => |s| try buf.appendSlice(allocator, s),
+    }
+}
+
+/// Convert Anthropic tools format to OpenAI tools format for chat template compatibility.
+fn buildOpenAIToolsJson(allocator: std.mem.Allocator, tools_array: std.json.Array) ![]const u8 {
+    var buf = std.ArrayList(u8).empty;
+    errdefer buf.deinit(allocator);
+    try buf.append(allocator, '[');
+    for (tools_array.items, 0..) |tool_val, i| {
+        if (i > 0) try buf.append(allocator, ',');
+        if (tool_val != .object) continue;
+        const tool = tool_val.object;
+        const name = if (tool.get("name")) |v| (if (v == .string) v.string else "") else "";
+        const desc = if (tool.get("description")) |v| (if (v == .string) v.string else "") else "";
+        const esc_n = try jsonEscape(allocator, name);
+        defer allocator.free(esc_n);
+        const esc_d = try jsonEscape(allocator, desc);
+        defer allocator.free(esc_d);
+        try buf.appendSlice(allocator, "{\"type\":\"function\",\"function\":{\"name\":");
+        try buf.appendSlice(allocator, esc_n);
+        try buf.appendSlice(allocator, ",\"description\":");
+        try buf.appendSlice(allocator, esc_d);
+        try buf.appendSlice(allocator, ",\"parameters\":");
+        if (tool.get("input_schema")) |schema_val| {
+            try serializeJsonValue(allocator, &buf, schema_val);
+        } else {
+            try buf.appendSlice(allocator, "{}");
+        }
+        try buf.appendSlice(allocator, "}}");
+    }
+    try buf.append(allocator, ']');
+    return try buf.toOwnedSlice(allocator);
+}
+
+fn handleAnthropicMessages(
+    allocator: std.mem.Allocator,
+    stream: std.net.Stream,
+    body: []const u8,
+    xfm: *Transformer,
+    tok: *const Tokenizer,
+    chat_config: *const chat_mod.ChatConfig,
+    config: *const model_mod.ModelConfig,
+) !void {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch {
+        log.warn("POST /v1/messages -> 400 (invalid JSON)\n", .{});
+        try sendAnthropicError(allocator, stream, "invalid_request_error", "Invalid JSON in request body", 400);
+        return;
+    };
+    defer parsed.deinit();
+    const root = parsed.value.object;
+
+    // max_tokens is required in Anthropic API
+    const max_tokens: u32 = if (root.get("max_tokens")) |v| switch (v) {
+        .integer => |i| @intCast(i),
+        else => 0,
+    } else 0;
+    if (max_tokens == 0) {
+        try sendAnthropicError(allocator, stream, "invalid_request_error", "'max_tokens' is required and must be > 0", 400);
+        return;
+    }
+
+    // Parse messages array (required)
+    const messages_val = root.get("messages") orelse {
+        try sendAnthropicError(allocator, stream, "invalid_request_error", "'messages' is required", 400);
+        return;
+    };
+    if (messages_val != .array) {
+        try sendAnthropicError(allocator, stream, "invalid_request_error", "'messages' must be an array", 400);
+        return;
+    }
+
+    var messages = std.ArrayList(chat_mod.Message).empty;
+    defer messages.deinit(allocator);
+
+    // Track allocations for serialized tool arguments (need to outlive generation)
+    var arg_allocs = std.ArrayList([]const u8).empty;
+    defer {
+        for (arg_allocs.items) |a| allocator.free(a);
+        arg_allocs.deinit(allocator);
+    }
+    var tool_call_lists = std.ArrayList([]const chat_mod.ToolCall).empty;
+    defer {
+        for (tool_call_lists.items) |tcs| allocator.free(tcs);
+        tool_call_lists.deinit(allocator);
+    }
+    // Track allocated content strings (concatenated text)
+    var content_allocs = std.ArrayList([]const u8).empty;
+    defer {
+        for (content_allocs.items) |s| allocator.free(s);
+        content_allocs.deinit(allocator);
+    }
+
+    // System prompt (Anthropic puts it at top level)
+    if (root.get("system")) |sys_val| {
+        const sys_text: []const u8 = switch (sys_val) {
+            .string => |s| s,
+            .array => |arr| blk: {
+                for (arr.items) |block| {
+                    if (block != .object) continue;
+                    const btype = block.object.get("type") orelse continue;
+                    if (btype != .string or !std.mem.eql(u8, btype.string, "text")) continue;
+                    const text = block.object.get("text") orelse continue;
+                    if (text == .string) break :blk text.string;
+                }
+                break :blk "";
+            },
+            else => "",
+        };
+        if (sys_text.len > 0) {
+            try messages.append(allocator, .{ .role = "system", .content = sys_text, .tool_calls = null, .tool_call_id = null });
+        }
+    }
+
+    // Convert Anthropic messages to internal format
+    for (messages_val.array.items) |msg_val| {
+        if (msg_val != .object) continue;
+        const msg_obj = msg_val.object;
+        const role_val = msg_obj.get("role") orelse continue;
+        if (role_val != .string) continue;
+        const role = role_val.string;
+        const content_val = msg_obj.get("content");
+
+        if (std.mem.eql(u8, role, "user")) {
+            if (content_val) |cv| switch (cv) {
+                .string => |s| {
+                    try messages.append(allocator, .{ .role = "user", .content = s, .tool_calls = null, .tool_call_id = null });
+                },
+                .array => |arr| {
+                    // Process tool_result blocks first, then text blocks
+                    for (arr.items) |block| {
+                        if (block != .object) continue;
+                        const btype = if (block.object.get("type")) |t| (if (t == .string) t.string else "") else "";
+                        if (!std.mem.eql(u8, btype, "tool_result")) continue;
+
+                        const tool_use_id = if (block.object.get("tool_use_id")) |v| (if (v == .string) v.string else "") else "";
+                        var result_text: []const u8 = "";
+                        if (block.object.get("content")) |rc| switch (rc) {
+                            .string => |s| result_text = s,
+                            .array => |result_arr| {
+                                for (result_arr.items) |rb| {
+                                    if (rb != .object) continue;
+                                    const rtype = if (rb.object.get("type")) |t| (if (t == .string) t.string else "") else "";
+                                    if (std.mem.eql(u8, rtype, "text")) {
+                                        if (rb.object.get("text")) |t| {
+                                            if (t == .string) { result_text = t.string; break; }
+                                        }
+                                    }
+                                }
+                            },
+                            else => {},
+                        };
+                        try messages.append(allocator, .{ .role = "tool", .content = result_text, .tool_calls = null, .tool_call_id = tool_use_id });
+                    }
+                    // Collect text blocks
+                    for (arr.items) |block| {
+                        if (block != .object) continue;
+                        const btype = if (block.object.get("type")) |t| (if (t == .string) t.string else "") else "";
+                        if (!std.mem.eql(u8, btype, "text")) continue;
+                        const text = if (block.object.get("text")) |t| (if (t == .string) t.string else "") else "";
+                        if (text.len > 0) {
+                            try messages.append(allocator, .{ .role = "user", .content = text, .tool_calls = null, .tool_call_id = null });
+                        }
+                    }
+                },
+                else => {},
+            };
+        } else if (std.mem.eql(u8, role, "assistant")) {
+            if (content_val) |cv| switch (cv) {
+                .string => |s| {
+                    try messages.append(allocator, .{ .role = "assistant", .content = s, .tool_calls = null, .tool_call_id = null });
+                },
+                .array => |arr| {
+                    // Extract text and tool_use blocks
+                    var text_content = std.ArrayList(u8).empty;
+                    defer text_content.deinit(allocator);
+                    var tcs = std.ArrayList(chat_mod.ToolCall).empty;
+
+                    for (arr.items) |block| {
+                        if (block != .object) continue;
+                        const btype = if (block.object.get("type")) |t| (if (t == .string) t.string else "") else "";
+
+                        if (std.mem.eql(u8, btype, "text")) {
+                            const text = if (block.object.get("text")) |t| (if (t == .string) t.string else "") else "";
+                            try text_content.appendSlice(allocator, text);
+                        } else if (std.mem.eql(u8, btype, "tool_use")) {
+                            const tc_id = if (block.object.get("id")) |v| (if (v == .string) v.string else "") else "";
+                            const tc_name = if (block.object.get("name")) |v| (if (v == .string) v.string else "") else "";
+                            // Serialize input object to JSON string
+                            var args_buf = std.ArrayList(u8).empty;
+                            if (block.object.get("input")) |input_val| {
+                                try serializeJsonValue(allocator, &args_buf, input_val);
+                            } else {
+                                try args_buf.appendSlice(allocator, "{}");
+                            }
+                            const args_str = try args_buf.toOwnedSlice(allocator);
+                            try arg_allocs.append(allocator, args_str);
+                            try tcs.append(allocator, .{ .id = tc_id, .name = tc_name, .arguments = args_str });
+                        }
+                        // Skip "thinking" and "redacted_thinking" — model generates its own
+                    }
+
+                    var msg_tool_calls: ?[]const chat_mod.ToolCall = null;
+                    if (tcs.items.len > 0) {
+                        const owned = try tcs.toOwnedSlice(allocator);
+                        try tool_call_lists.append(allocator, owned);
+                        msg_tool_calls = owned;
+                    } else {
+                        tcs.deinit(allocator);
+                    }
+
+                    const content: []const u8 = if (text_content.items.len > 0) blk: {
+                        const duped = try allocator.dupe(u8, text_content.items);
+                        try content_allocs.append(allocator, duped);
+                        break :blk duped;
+                    } else "";
+                    try messages.append(allocator, .{ .role = "assistant", .content = content, .tool_calls = msg_tool_calls, .tool_call_id = null });
+                },
+                else => {},
+            };
+        }
+    }
+
+    if (messages.items.len == 0) {
+        try sendAnthropicError(allocator, stream, "invalid_request_error", "No valid messages found in request", 400);
+        return;
+    }
+
+    // Sampling parameters
+    const temperature = parseJsonFloat(root, "temperature", 1.0, 0.0, 2.0);
+    const top_p = parseJsonFloat(root, "top_p", 1.0, 0.0, 1.0);
+    const top_k: u32 = if (root.get("top_k")) |v| switch (v) {
+        .integer => |i| if (i > 0) @intCast(@min(i, 1000)) else 0,
+        else => 0,
+    } else 0;
+    const seed: ?u64 = if (root.get("seed")) |v| switch (v) {
+        .integer => |i| @intCast(i),
+        else => null,
+    } else null;
+
+    // Tools
+    var tools_json: ?[]const u8 = null;
+    var tools_json_allocated = false;
+    defer if (tools_json_allocated) allocator.free(tools_json.?);
+    var has_tools = false;
+    var tool_choice_instruction: ?[]const u8 = null;
+    var tool_choice_allocated = false;
+    defer if (tool_choice_allocated) {
+        if (tool_choice_instruction) |tci| allocator.free(tci);
+    };
+
+    if (root.get("tools")) |tools_val| {
+        if (tools_val == .array and tools_val.array.items.len > 0) {
+            has_tools = true;
+            // Convert Anthropic tools to OpenAI format for chat template
+            tools_json = try buildOpenAIToolsJson(allocator, tools_val.array);
+            tools_json_allocated = true;
+
+            // Parse tool_choice
+            if (root.get("tool_choice")) |tc| {
+                if (tc == .object) {
+                    const tc_type = if (tc.object.get("type")) |t| (if (t == .string) t.string else "auto") else "auto";
+                    if (std.mem.eql(u8, tc_type, "none")) {
+                        has_tools = false;
+                    } else if (std.mem.eql(u8, tc_type, "any")) {
+                        tool_choice_instruction = "\nYou MUST call one of the available functions. Do not respond with text.";
+                    } else if (std.mem.eql(u8, tc_type, "tool")) {
+                        if (tc.object.get("name")) |name_val| {
+                            if (name_val == .string) {
+                                tool_choice_instruction = try std.fmt.allocPrint(allocator,
+                                    "\nYou MUST call the function \"{s}\". Do not respond with text.", .{name_val.string});
+                                tool_choice_allocated = true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Stop sequences
+    var stop_sequences = std.ArrayList([]const u8).empty;
+    defer stop_sequences.deinit(allocator);
+    if (root.get("stop_sequences")) |stop_val| {
+        if (stop_val == .array) {
+            for (stop_val.array.items) |item| {
+                if (item == .string) try stop_sequences.append(allocator, item.string);
+            }
+        }
+    }
+
+    // Thinking config
+    var enable_thinking = false;
+    var reasoning_budget: i32 = default_reasoning_budget;
+    if (root.get("thinking")) |think_val| {
+        if (think_val == .object) {
+            const think_type = if (think_val.object.get("type")) |t| (if (t == .string) t.string else "") else "";
+            if (std.mem.eql(u8, think_type, "enabled") or std.mem.eql(u8, think_type, "adaptive")) {
+                enable_thinking = true;
+            }
+            if (think_val.object.get("budget_tokens")) |bt| {
+                if (bt == .integer) reasoning_budget = @intCast(bt.integer);
+            }
+        }
+    }
+
+    const is_stream = if (root.get("stream")) |v| v == .bool and v.bool else false;
+    const model_name = if (root.get("model")) |v| (if (v == .string) v.string else config.model_type) else config.model_type;
+
+    // Log request
+    const last_msg = messages.items[messages.items.len - 1];
+    const preview_len = @min(last_msg.content.len, 80);
+    var tool_msg_count: usize = 0;
+    for (messages.items) |msg| {
+        if (std.mem.eql(u8, msg.role, "tool")) tool_msg_count += 1;
+    }
+    const tools_len = if (tools_json) |tj| tj.len else 0;
+    log.info("POST /v1/messages ({d} msgs, max_tokens={d}, temp={d:.2}, stream={}, thinking={}, tools={d}b, tool_msgs={d})\n", .{
+        messages.items.len, max_tokens, temperature, is_stream, enable_thinking, tools_len, tool_msg_count,
+    });
+    log.info("  > \"{s}{s}\"\n", .{ last_msg.content[0..preview_len], if (last_msg.content.len > 80) "..." else "" });
+
+    // Format chat template
+    const prompt_ids = try chat_mod.formatChat(allocator, tok, messages.items, chat_config, if (has_tools) tools_json else null, tool_choice_instruction, enable_thinking);
+    defer allocator.free(prompt_ids);
+
+    // Context size enforcement
+    const effective_ctx = getEffectiveContextLength(config);
+    if (prompt_ids.len > effective_ctx) {
+        log.warn("POST /v1/messages -> 400 (prompt {d} tokens exceeds ctx_size {d})\n", .{ prompt_ids.len, effective_ctx });
+        try sendAnthropicError(allocator, stream, "invalid_request_error", "Prompt exceeds maximum context length", 400);
+        return;
+    }
+    const effective_max_tokens = clampMaxTokens(max_tokens, prompt_ids.len);
+    log.info("  prompt={d} tokens, max_gen={d}, ctx={d}\n", .{ prompt_ids.len, effective_max_tokens, effective_ctx });
+
+    // KV cache
+    const cache_result = try reuseKVCache(allocator, xfm, prompt_ids, has_tools);
+    const eos_slice = config.eosTokenSlice();
+    const sampling = generate_mod.SamplingParams{
+        .temperature = temperature,
+        .top_p = top_p,
+        .top_k = top_k,
+        .repeat_penalty = 1.0,
+        .presence_penalty = 0.0,
+        .seed = seed,
+    };
+
+    if (is_stream) {
+        handleAnthropicStreaming(allocator, stream, xfm, tok, cache_result.new_tokens, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, cache_result.cached_tokens, enable_thinking, reasoning_budget, @intCast(prompt_ids.len)) catch |err| {
+            log.err("  -> streaming error: {}\n", .{err});
+            const err_data = std.fmt.allocPrint(allocator,
+                \\{{"type":"error","error":{{"type":"api_error","message":"Internal server error: {s}"}}}}
+            , .{@errorName(err)}) catch return;
+            defer allocator.free(err_data);
+            sendAnthropicEvent(stream, "error", err_data) catch {};
+        };
+    } else {
+        handleAnthropicNonStreaming(allocator, stream, xfm, tok, cache_result.new_tokens, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, cache_result.cached_tokens, enable_thinking, reasoning_budget, @intCast(prompt_ids.len)) catch |err| {
+            log.err("  -> 500 ({s})\n", .{@errorName(err)});
+            sendAnthropicError(allocator, stream, "api_error", @errorName(err), 500) catch {};
+        };
+    }
+
+    // Update cached prompt
+    if (last_generation_was_pad) {
+        log.info("  [cache] invalidating cache after pad-only generation\n", .{});
+        try xfm.resetCache();
+        if (cached_prompt_ids) |old| {
+            allocator.free(old);
+            cached_prompt_ids = null;
+        }
+    } else {
+        updateCachedPrompt(allocator, prompt_ids, has_tools);
+    }
+}
+
+fn handleAnthropicNonStreaming(
+    allocator: std.mem.Allocator,
+    stream: std.net.Stream,
+    xfm: *Transformer,
+    tok: *const Tokenizer,
+    prompt_ids: []const u32,
+    max_tokens: u32,
+    sampling: generate_mod.SamplingParams,
+    eos_token_ids: []const u32,
+    stop_sequences: []const []const u8,
+    model_name: []const u8,
+    has_tools: bool,
+    cached_tokens: u32,
+    enable_thinking: bool,
+    reasoning_budget: i32,
+    prompt_token_count: u32,
+) !void {
+    var timer = try std.time.Timer.start();
+
+    var result = try generate_mod.generate(allocator, xfm, tok, prompt_ids, max_tokens, sampling, eos_token_ids, getTimeoutNs(), 0);
+    result.prompt_tokens += cached_tokens;
+    defer allocator.free(result.text);
+    defer allocator.free(result.token_ids);
+
+    // Pad-only detection
+    if (result.token_ids.len > 0) {
+        var all_pad = true;
+        for (result.token_ids) |tid| {
+            if (tid != 0) { all_pad = false; break; }
+        }
+        last_generation_was_pad = all_pad;
+    }
+
+    // Apply stop sequences
+    var final_text: []const u8 = result.text;
+    var finish_reason = result.finish_reason;
+    for (stop_sequences) |stop_seq| {
+        if (std.mem.indexOf(u8, final_text, stop_seq)) |idx| {
+            final_text = final_text[0..idx];
+            finish_reason = "stop";
+            break;
+        }
+    }
+
+    const elapsed_ms = timer.read() / std.time.ns_per_ms;
+    const tps = if (elapsed_ms > 0) @as(u64, result.completion_tokens) * 1000 / elapsed_ms else 0;
+
+    // Build content blocks array
+    var content = std.ArrayList(u8).empty;
+    defer content.deinit(allocator);
+    try content.append(allocator, '[');
+
+    var block_count: u32 = 0;
+
+    // Thinking block
+    if (enable_thinking) {
+        const think_split = chat_mod.splitThinkBlock(final_text, true);
+        if (think_split.reasoning_content) |reasoning| {
+            // Apply budget truncation
+            var truncated_reasoning = reasoning;
+            var trunc_allocated = false;
+            defer if (trunc_allocated) allocator.free(truncated_reasoning);
+            if (reasoning_budget >= 0) {
+                const r_ids = try tok.encode(allocator, reasoning);
+                defer allocator.free(r_ids);
+                const budget_usize: usize = @intCast(reasoning_budget);
+                if (r_ids.len > budget_usize) {
+                    truncated_reasoning = try tok.decode(allocator, r_ids[0..budget_usize], false);
+                    trunc_allocated = true;
+                }
+            }
+            const esc_r = try jsonEscape(allocator, truncated_reasoning);
+            defer allocator.free(esc_r);
+            const thinking_block = try std.fmt.allocPrint(allocator,
+                \\{{"type":"thinking","thinking":{s},"signature":"mlx-serve-local"}}
+            , .{esc_r});
+            defer allocator.free(thinking_block);
+            try content.appendSlice(allocator, thinking_block);
+            block_count += 1;
+            final_text = think_split.content;
+        } else {
+            final_text = chat_mod.stripThinkBlock(final_text);
+        }
+    } else {
+        final_text = chat_mod.stripThinkBlock(final_text);
+    }
+
+    // Check for tool calls
+    if (has_tools) {
+        if (try chat_mod.parseToolCalls(allocator, final_text)) |tool_calls| {
+            defer {
+                for (tool_calls) |tc| {
+                    allocator.free(tc.name);
+                    allocator.free(tc.arguments);
+                }
+                allocator.free(tool_calls);
+            }
+
+            log.info("  <- {d}+{d} tokens ({d}ms, ~{d} tok/s) [tool_use: {d}]\n", .{
+                result.prompt_tokens, result.completion_tokens, elapsed_ms, tps, tool_calls.len,
+            });
+
+            // Emit tool_use content blocks
+            for (tool_calls, 0..) |tc, i| {
+                if (block_count > 0) try content.append(allocator, ',');
+                const tc_id = try std.fmt.allocPrint(allocator, "toolu_{d}_{d}", .{ std.time.milliTimestamp(), i });
+                defer allocator.free(tc_id);
+                const esc_name = try jsonEscape(allocator, tc.name);
+                defer allocator.free(esc_name);
+                const tc_block = try std.fmt.allocPrint(allocator,
+                    \\{{"type":"tool_use","id":"{s}","name":{s},"input":{s}}}
+                , .{ tc_id, esc_name, tc.arguments });
+                defer allocator.free(tc_block);
+                try content.appendSlice(allocator, tc_block);
+                block_count += 1;
+            }
+            finish_reason = "tool_calls";
+        } else {
+            // No tool calls — emit text block
+            if (block_count > 0) try content.append(allocator, ',');
+            const esc_text = try jsonEscape(allocator, final_text);
+            defer allocator.free(esc_text);
+            const text_block = try std.fmt.allocPrint(allocator,
+                \\{{"type":"text","text":{s}}}
+            , .{esc_text});
+            defer allocator.free(text_block);
+            try content.appendSlice(allocator, text_block);
+        }
+    } else {
+        // No tools — emit text block
+        if (block_count > 0) try content.append(allocator, ',');
+        const esc_text = try jsonEscape(allocator, final_text);
+        defer allocator.free(esc_text);
+        const text_block = try std.fmt.allocPrint(allocator,
+            \\{{"type":"text","text":{s}}}
+        , .{esc_text});
+        defer allocator.free(text_block);
+        try content.appendSlice(allocator, text_block);
+    }
+
+    try content.append(allocator, ']');
+
+    const stop_reason = mapFinishToStopReason(finish_reason);
+    log.info("  <- {d}+{d} tokens ({d}ms, ~{d} tok/s) [{s}]\n", .{
+        result.prompt_tokens, result.completion_tokens, elapsed_ms, tps, stop_reason,
+    });
+
+    const response = try std.fmt.allocPrint(allocator,
+        \\{{"id":"msg_{d}","type":"message","role":"assistant","content":{s},"model":"{s}","stop_reason":"{s}","stop_sequence":null,"usage":{{"input_tokens":{d},"output_tokens":{d}}}}}
+    , .{
+        std.time.milliTimestamp(),
+        content.items,
+        model_name,
+        stop_reason,
+        prompt_token_count,
+        result.completion_tokens,
+    });
+    defer allocator.free(response);
+    try sendResponse(stream, "200 OK", "application/json", response);
+}
+
+fn handleAnthropicStreaming(
+    allocator: std.mem.Allocator,
+    stream: std.net.Stream,
+    xfm: *Transformer,
+    tok: *const Tokenizer,
+    prompt_ids: []const u32,
+    max_tokens: u32,
+    sampling: generate_mod.SamplingParams,
+    eos_token_ids: []const u32,
+    stop_sequences: []const []const u8,
+    model_name: []const u8,
+    has_tools: bool,
+    cached_tokens: u32,
+    enable_thinking: bool,
+    reasoning_budget: i32,
+    prompt_token_count: u32,
+) !void {
+    var timer = try std.time.Timer.start();
+    var gen = try Generator.init(allocator, xfm, tok, prompt_ids, max_tokens, sampling, eos_token_ids);
+    gen.timeout_ns = getTimeoutNs();
+    defer gen.deinit(allocator);
+
+    // SSE headers
+    const header =
+        "HTTP/1.1 200 OK\r\n" ++
+        "Content-Type: text/event-stream\r\n" ++
+        "Cache-Control: no-cache\r\n" ++
+        "Connection: close\r\n" ++
+        "Access-Control-Allow-Origin: *\r\n" ++
+        "Access-Control-Allow-Methods: POST, GET, OPTIONS\r\n" ++
+        "Access-Control-Allow-Headers: Content-Type, Authorization, x-api-key, anthropic-version\r\n" ++
+        "\r\n";
+    try stream.writeAll(header);
+
+    // message_start
+    {
+        const data = try std.fmt.allocPrint(allocator,
+            \\{{"type":"message_start","message":{{"id":"msg_{d}","type":"message","role":"assistant","content":[],"model":"{s}","stop_reason":null,"stop_sequence":null,"usage":{{"input_tokens":{d},"output_tokens":1}}}}}}
+        , .{ std.time.milliTimestamp(), model_name, prompt_token_count });
+        defer allocator.free(data);
+        try sendAnthropicEvent(stream, "message_start", data);
+    }
+    try sendAnthropicEvent(stream, "ping", "{\"type\":\"ping\"}");
+
+    // State
+    var block_index: u32 = 0;
+    var text_block_open = false;
+    var thinking_block_open = false;
+    var in_think_block = enable_thinking;
+    var think_buf = std.ArrayList(u8).empty;
+    defer think_buf.deinit(allocator);
+    var think_close_tag: []const u8 = "</think>";
+    var skipped_think_open = false;
+    var think_tokens: i32 = 0;
+    var budget_exhausted = false;
+
+    var text_buf = std.ArrayList(u8).empty;
+    defer text_buf.deinit(allocator);
+    var token_texts = std.ArrayList([]const u8).empty;
+    defer {
+        for (token_texts.items) |t| allocator.free(t);
+        token_texts.deinit(allocator);
+    }
+    var stopped = false;
+    var utf8_carry: [3]u8 = undefined;
+    var utf8_carry_len: u8 = 0;
+    var all_pad = true;
+    var gen_token_count: u32 = 0;
+
+    while (try gen.next(allocator)) |token_id| {
+        gen_token_count += 1;
+        if (token_id != 0) all_pad = false;
+        const strip = tok.tok_type == .sentencepiece_bpe;
+        const raw_decoded = try tok.decode(allocator, &[_]u32{token_id}, strip and false);
+
+        // UTF-8 carry handling
+        const token_text = blk: {
+            const with_carry = if (utf8_carry_len > 0) cc: {
+                const combined = try allocator.alloc(u8, utf8_carry_len + raw_decoded.len);
+                @memcpy(combined[0..utf8_carry_len], utf8_carry[0..utf8_carry_len]);
+                @memcpy(combined[utf8_carry_len..], raw_decoded);
+                allocator.free(raw_decoded);
+                utf8_carry_len = 0;
+                break :cc combined;
+            } else raw_decoded;
+            const tail = utf8TrailingIncomplete(with_carry);
+            if (tail > 0) {
+                @memcpy(utf8_carry[0..tail], with_carry[with_carry.len - tail ..]);
+                utf8_carry_len = @intCast(tail);
+            }
+            if (with_carry.len == tail) { allocator.free(with_carry); continue; }
+            if (tail > 0) {
+                const trimmed = try allocator.dupe(u8, with_carry[0 .. with_carry.len - tail]);
+                allocator.free(with_carry);
+                break :blk trimmed;
+            }
+            break :blk with_carry;
+        };
+
+        if (has_tools or stop_sequences.len > 0) {
+            try text_buf.appendSlice(allocator, token_text);
+        }
+
+        // Stop sequences
+        if (stop_sequences.len > 0) {
+            for (stop_sequences) |stop_seq| {
+                if (std.mem.indexOf(u8, text_buf.items, stop_seq) != null) {
+                    stopped = true;
+                    break;
+                }
+            }
+            if (stopped) { allocator.free(token_text); break; }
+        }
+
+        if (has_tools) {
+            // Buffer for tool detection
+            try token_texts.append(allocator, token_text);
+            const buf = text_buf.items;
+            const maybe_tool = std.mem.indexOf(u8, buf, "<tool_call") != null or
+                std.mem.indexOf(u8, buf, "<|tool_call") != null or
+                (buf.len > 0 and buf[0] == '{' and std.mem.indexOf(u8, buf, "\"name\"") != null) or
+                (buf.len >= 1 and buf[buf.len - 1] == '<');
+
+            if (!maybe_tool) {
+                const maybe_thinking = enable_thinking and (
+                    std.mem.indexOf(u8, buf, "<|channel>thought") != null or
+                    std.mem.indexOf(u8, buf, "<think>") != null or
+                    (std.mem.startsWith(u8, buf, "<|channel>") and buf.len < 18) or
+                    (std.mem.startsWith(u8, buf, "<think") and buf.len < 7));
+                if (!maybe_thinking) {
+                    // Flush buffered tokens as text
+                    for (token_texts.items) |tt| {
+                        if (!text_block_open) {
+                            const sd = try std.fmt.allocPrint(allocator,
+                                \\{{"type":"content_block_start","index":{d},"content_block":{{"type":"text","text":""}}}}
+                            , .{block_index});
+                            defer allocator.free(sd);
+                            try sendAnthropicEvent(stream, "content_block_start", sd);
+                            text_block_open = true;
+                        }
+                        try emitAnthropicTextDelta(allocator, stream, block_index, tt);
+                        allocator.free(tt);
+                    }
+                    token_texts.clearRetainingCapacity();
+                }
+            }
+        } else if (enable_thinking and in_think_block) {
+            // Thinking block handling
+            defer allocator.free(token_text);
+            try think_buf.appendSlice(allocator, token_text);
+            think_tokens += 1;
+
+            if (!skipped_think_open and think_buf.items.len >= 7) {
+                if (std.mem.startsWith(u8, think_buf.items, "<think>")) {
+                    var skip: usize = 7;
+                    while (skip < think_buf.items.len and think_buf.items[skip] == '\n') skip += 1;
+                    const remaining = try allocator.dupe(u8, think_buf.items[skip..]);
+                    think_buf.clearAndFree(allocator);
+                    try think_buf.appendSlice(allocator, remaining);
+                    allocator.free(remaining);
+                    skipped_think_open = true;
+                    if (!thinking_block_open) {
+                        const sd = try std.fmt.allocPrint(allocator,
+                            \\{{"type":"content_block_start","index":{d},"content_block":{{"type":"thinking","thinking":"","signature":""}}}}
+                        , .{block_index});
+                        defer allocator.free(sd);
+                        try sendAnthropicEvent(stream, "content_block_start", sd);
+                        thinking_block_open = true;
+                    }
+                } else if (think_buf.items.len >= 18 and std.mem.startsWith(u8, think_buf.items, "<|channel>thought")) {
+                    think_close_tag = "<channel|>";
+                    var skip: usize = 17;
+                    while (skip < think_buf.items.len and think_buf.items[skip] == '\n') skip += 1;
+                    const remaining = try allocator.dupe(u8, think_buf.items[skip..]);
+                    think_buf.clearAndFree(allocator);
+                    try think_buf.appendSlice(allocator, remaining);
+                    allocator.free(remaining);
+                    skipped_think_open = true;
+                    if (!thinking_block_open) {
+                        const sd = try std.fmt.allocPrint(allocator,
+                            \\{{"type":"content_block_start","index":{d},"content_block":{{"type":"thinking","thinking":"","signature":""}}}}
+                        , .{block_index});
+                        defer allocator.free(sd);
+                        try sendAnthropicEvent(stream, "content_block_start", sd);
+                        thinking_block_open = true;
+                    }
+                } else if (!std.mem.startsWith(u8, "<think>", think_buf.items) and
+                    !std.mem.startsWith(u8, "<|channel>thought", think_buf.items))
+                {
+                    skipped_think_open = true;
+                    in_think_block = false;
+                }
+            }
+
+            // Budget check
+            if (!budget_exhausted and reasoning_budget >= 0 and think_tokens >= reasoning_budget and skipped_think_open) {
+                budget_exhausted = true;
+                if (thinking_block_open and think_buf.items.len > 0) {
+                    try emitAnthropicThinkingDelta(allocator, stream, block_index, think_buf.items);
+                }
+                think_buf.clearRetainingCapacity();
+                if (thinking_block_open) {
+                    try closeAnthropicThinkingBlock(allocator, stream, block_index);
+                    thinking_block_open = false;
+                    block_index += 1;
+                }
+                in_think_block = false;
+                continue;
+            }
+
+            // Check for close tag
+            if (std.mem.indexOf(u8, think_buf.items, think_close_tag)) |close_pos| {
+                if (thinking_block_open and close_pos > 0) {
+                    try emitAnthropicThinkingDelta(allocator, stream, block_index, think_buf.items[0..close_pos]);
+                }
+                if (thinking_block_open) {
+                    try closeAnthropicThinkingBlock(allocator, stream, block_index);
+                    thinking_block_open = false;
+                    block_index += 1;
+                }
+                // Content after close tag
+                const after = close_pos + think_close_tag.len;
+                var content_after = std.mem.trimLeft(u8, think_buf.items[after..], "\n ");
+                if (std.mem.startsWith(u8, content_after, "<|channel>\n")) content_after = content_after[11..];
+                if (std.mem.startsWith(u8, content_after, "<|channel>")) content_after = content_after[10..];
+                content_after = std.mem.trimLeft(u8, content_after, "\n ");
+                if (content_after.len > 0) {
+                    if (!text_block_open) {
+                        const sd = try std.fmt.allocPrint(allocator,
+                            \\{{"type":"content_block_start","index":{d},"content_block":{{"type":"text","text":""}}}}
+                        , .{block_index});
+                        defer allocator.free(sd);
+                        try sendAnthropicEvent(stream, "content_block_start", sd);
+                        text_block_open = true;
+                    }
+                    try emitAnthropicTextDelta(allocator, stream, block_index, content_after);
+                }
+                think_buf.clearRetainingCapacity();
+                in_think_block = false;
+            } else if (skipped_think_open and thinking_block_open) {
+                // Stream safe thinking content
+                const safe_len = if (think_buf.items.len > think_close_tag.len - 1)
+                    think_buf.items.len - (think_close_tag.len - 1)
+                else
+                    0;
+                if (safe_len > 0) {
+                    try emitAnthropicThinkingDelta(allocator, stream, block_index, think_buf.items[0..safe_len]);
+                    const remaining = try allocator.dupe(u8, think_buf.items[safe_len..]);
+                    think_buf.clearRetainingCapacity();
+                    try think_buf.appendSlice(allocator, remaining);
+                    allocator.free(remaining);
+                }
+            }
+        } else {
+            // Regular content token
+            defer allocator.free(token_text);
+            if (std.mem.eql(u8, token_text, "<|channel>") or std.mem.eql(u8, token_text, "<channel|>")) continue;
+            if (!text_block_open) {
+                const sd = try std.fmt.allocPrint(allocator,
+                    \\{{"type":"content_block_start","index":{d},"content_block":{{"type":"text","text":""}}}}
+                , .{block_index});
+                defer allocator.free(sd);
+                try sendAnthropicEvent(stream, "content_block_start", sd);
+                text_block_open = true;
+            }
+            try emitAnthropicTextDelta(allocator, stream, block_index, token_text);
+        }
+    }
+
+    // Pad-only detection
+    last_generation_was_pad = gen_token_count > 0 and all_pad;
+
+    // Flush remaining think buffer
+    if (enable_thinking and thinking_block_open and think_buf.items.len > 0) {
+        try emitAnthropicThinkingDelta(allocator, stream, block_index, think_buf.items);
+    }
+    if (thinking_block_open) {
+        try closeAnthropicThinkingBlock(allocator, stream, block_index);
+        block_index += 1;
+    }
+
+    // Post-generation: handle tool calls
+    var finish_reason: []const u8 = if (stopped) "stop" else gen.finish_reason;
+
+    if (has_tools) {
+        if (try chat_mod.parseToolCalls(allocator, text_buf.items)) |tool_calls| {
+            defer {
+                for (tool_calls) |tc| { allocator.free(tc.name); allocator.free(tc.arguments); }
+                allocator.free(tool_calls);
+            }
+
+            // Emit thinking from buffered text if needed
+            if (enable_thinking) {
+                const think_split = chat_mod.splitThinkBlock(text_buf.items, true);
+                if (think_split.reasoning_content) |reasoning| {
+                    const sd = try std.fmt.allocPrint(allocator,
+                        \\{{"type":"content_block_start","index":{d},"content_block":{{"type":"thinking","thinking":"","signature":""}}}}
+                    , .{block_index});
+                    defer allocator.free(sd);
+                    try sendAnthropicEvent(stream, "content_block_start", sd);
+                    try emitAnthropicThinkingDelta(allocator, stream, block_index, reasoning);
+                    try closeAnthropicThinkingBlock(allocator, stream, block_index);
+                    block_index += 1;
+                }
+            }
+
+            if (text_block_open) {
+                const sd = try std.fmt.allocPrint(allocator, "{{\"type\":\"content_block_stop\",\"index\":{d}}}", .{block_index});
+                defer allocator.free(sd);
+                try sendAnthropicEvent(stream, "content_block_stop", sd);
+                block_index += 1;
+                text_block_open = false;
+            }
+
+            for (tool_calls, 0..) |tc, i| {
+                const tc_id = try std.fmt.allocPrint(allocator, "toolu_{d}_{d}", .{ std.time.milliTimestamp(), i });
+                defer allocator.free(tc_id);
+                const esc_name = try jsonEscape(allocator, tc.name);
+                defer allocator.free(esc_name);
+
+                // content_block_start
+                const start = try std.fmt.allocPrint(allocator,
+                    \\{{"type":"content_block_start","index":{d},"content_block":{{"type":"tool_use","id":"{s}","name":{s},"input":{{}}}}}}
+                , .{ block_index, tc_id, esc_name });
+                defer allocator.free(start);
+                try sendAnthropicEvent(stream, "content_block_start", start);
+
+                // input_json_delta
+                const esc_args_full = try jsonEscape(allocator, tc.arguments);
+                defer allocator.free(esc_args_full);
+                const args_inner = esc_args_full[1 .. esc_args_full.len - 1];
+                const delta = try std.fmt.allocPrint(allocator,
+                    \\{{"type":"content_block_delta","index":{d},"delta":{{"type":"input_json_delta","partial_json":"{s}"}}}}
+                , .{ block_index, args_inner });
+                defer allocator.free(delta);
+                try sendAnthropicEvent(stream, "content_block_delta", delta);
+
+                // content_block_stop
+                const stop = try std.fmt.allocPrint(allocator, "{{\"type\":\"content_block_stop\",\"index\":{d}}}", .{block_index});
+                defer allocator.free(stop);
+                try sendAnthropicEvent(stream, "content_block_stop", stop);
+                block_index += 1;
+            }
+            finish_reason = "tool_calls";
+        } else {
+            // No tool calls — flush buffered tokens
+            if (enable_thinking) {
+                var full_text = std.ArrayList(u8).empty;
+                defer full_text.deinit(allocator);
+                for (token_texts.items) |t| try full_text.appendSlice(allocator, t);
+                const think_split = chat_mod.splitThinkBlock(full_text.items, true);
+                if (think_split.reasoning_content) |reasoning| {
+                    const sd = try std.fmt.allocPrint(allocator,
+                        \\{{"type":"content_block_start","index":{d},"content_block":{{"type":"thinking","thinking":"","signature":""}}}}
+                    , .{block_index});
+                    defer allocator.free(sd);
+                    try sendAnthropicEvent(stream, "content_block_start", sd);
+                    try emitAnthropicThinkingDelta(allocator, stream, block_index, reasoning);
+                    try closeAnthropicThinkingBlock(allocator, stream, block_index);
+                    block_index += 1;
+                }
+                if (think_split.content.len > 0) {
+                    if (!text_block_open) {
+                        const sd2 = try std.fmt.allocPrint(allocator,
+                            \\{{"type":"content_block_start","index":{d},"content_block":{{"type":"text","text":""}}}}
+                        , .{block_index});
+                        defer allocator.free(sd2);
+                        try sendAnthropicEvent(stream, "content_block_start", sd2);
+                        text_block_open = true;
+                    }
+                    try emitAnthropicTextDelta(allocator, stream, block_index, think_split.content);
+                }
+            } else {
+                for (token_texts.items) |t| {
+                    if (!text_block_open) {
+                        const sd = try std.fmt.allocPrint(allocator,
+                            \\{{"type":"content_block_start","index":{d},"content_block":{{"type":"text","text":""}}}}
+                        , .{block_index});
+                        defer allocator.free(sd);
+                        try sendAnthropicEvent(stream, "content_block_start", sd);
+                        text_block_open = true;
+                    }
+                    try emitAnthropicTextDelta(allocator, stream, block_index, t);
+                }
+            }
+        }
+    }
+
+    // Close text block if open
+    if (text_block_open) {
+        const sd = try std.fmt.allocPrint(allocator, "{{\"type\":\"content_block_stop\",\"index\":{d}}}", .{block_index});
+        defer allocator.free(sd);
+        try sendAnthropicEvent(stream, "content_block_stop", sd);
+    }
+
+    // Ensure at least one content block
+    if (!text_block_open and block_index == 0) {
+        const sd = try std.fmt.allocPrint(allocator,
+            \\{{"type":"content_block_start","index":0,"content_block":{{"type":"text","text":""}}}}
+        , .{});
+        defer allocator.free(sd);
+        try sendAnthropicEvent(stream, "content_block_start", sd);
+        const sd2 = "{\"type\":\"content_block_stop\",\"index\":0}";
+        try sendAnthropicEvent(stream, "content_block_stop", sd2);
+    }
+
+    // message_delta
+    const stop_reason = mapFinishToStopReason(finish_reason);
+    const total_prompt = gen.prompt_tokens + cached_tokens;
+    {
+        const md = try std.fmt.allocPrint(allocator,
+            \\{{"type":"message_delta","delta":{{"stop_reason":"{s}","stop_sequence":null}},"usage":{{"output_tokens":{d}}}}}
+        , .{ stop_reason, gen.completion_tokens });
+        defer allocator.free(md);
+        try sendAnthropicEvent(stream, "message_delta", md);
+    }
+    try sendAnthropicEvent(stream, "message_stop", "{\"type\":\"message_stop\"}");
+
+    const elapsed_ms = timer.read() / std.time.ns_per_ms;
+    const tps = if (elapsed_ms > 0) @as(u64, gen.completion_tokens) * 1000 / elapsed_ms else 0;
+    log.info("  <- {d}+{d} tokens streamed ({d}ms, ~{d} tok/s) [{s}]\n", .{
+        total_prompt, gen.completion_tokens, elapsed_ms, tps, stop_reason,
+    });
+}
+
+/// Emit a text_delta event for Anthropic streaming.
+fn emitAnthropicTextDelta(allocator: std.mem.Allocator, stream: std.net.Stream, index: u32, text: []const u8) !void {
+    const esc = try jsonEscape(allocator, text);
+    defer allocator.free(esc);
+    const inner = esc[1 .. esc.len - 1];
+    const data = try std.fmt.allocPrint(allocator,
+        \\{{"type":"content_block_delta","index":{d},"delta":{{"type":"text_delta","text":"{s}"}}}}
+    , .{ index, inner });
+    defer allocator.free(data);
+    try sendAnthropicEvent(stream, "content_block_delta", data);
+}
+
+/// Emit a thinking_delta event for Anthropic streaming.
+fn emitAnthropicThinkingDelta(allocator: std.mem.Allocator, stream: std.net.Stream, index: u32, thinking: []const u8) !void {
+    const esc = try jsonEscape(allocator, thinking);
+    defer allocator.free(esc);
+    const inner = esc[1 .. esc.len - 1];
+    const data = try std.fmt.allocPrint(allocator,
+        \\{{"type":"content_block_delta","index":{d},"delta":{{"type":"thinking_delta","thinking":"{s}"}}}}
+    , .{ index, inner });
+    defer allocator.free(data);
+    try sendAnthropicEvent(stream, "content_block_delta", data);
+}
+
+/// Close a thinking block with a fake signature and content_block_stop.
+fn closeAnthropicThinkingBlock(allocator: std.mem.Allocator, stream: std.net.Stream, index: u32) !void {
+    const sig = try std.fmt.allocPrint(allocator,
+        \\{{"type":"content_block_delta","index":{d},"delta":{{"type":"signature_delta","signature":"mlx-serve-local"}}}}
+    , .{index});
+    defer allocator.free(sig);
+    try sendAnthropicEvent(stream, "content_block_delta", sig);
+    const stop = try std.fmt.allocPrint(allocator, "{{\"type\":\"content_block_stop\",\"index\":{d}}}", .{index});
+    defer allocator.free(stop);
+    try sendAnthropicEvent(stream, "content_block_stop", stop);
 }
 
 // ── Tests ──

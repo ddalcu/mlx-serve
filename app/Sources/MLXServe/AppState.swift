@@ -20,6 +20,9 @@ class AppState: ObservableObject {
     @Published var maxTokens: Int {
         didSet { UserDefaults.standard.set(maxTokens, forKey: "maxTokens") }
     }
+    @Published var contextSize: Int {
+        didSet { UserDefaults.standard.set(contextSize, forKey: "contextSize") }
+    }
 
     private let historyPath: String = {
         let dir = NSString(string: "~/.mlx-serve").expandingTildeInPath
@@ -32,13 +35,15 @@ class AppState: ObservableObject {
         self.selectedModelPath = UserDefaults.standard.string(forKey: "selectedModelPath") ?? ""
         let stored = UserDefaults.standard.integer(forKey: "maxTokens")
         self.maxTokens = stored > 0 ? stored : 8192
+        let storedCtx = UserDefaults.standard.integer(forKey: "contextSize")
+        self.contextSize = storedCtx > 0 ? storedCtx : 16384
         refreshModels()
         loadChatHistory()
         testServer.start(appState: self)
 
         // Auto-start server if enabled and a model is available
         if autoStartServer, !selectedModelPath.isEmpty {
-            server.start(modelPath: selectedModelPath)
+            server.start(modelPath: selectedModelPath, contextSize: contextSize)
         }
 
         // Fallback health detection — runs detached to avoid blocking MainActor

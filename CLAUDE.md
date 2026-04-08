@@ -1,6 +1,6 @@
 # mlx-serve – project context for AI
 
-Native Zig server that runs MLX-format LMs on Apple Silicon and exposes an OpenAI-compatible HTTP API. No Python.
+Native Zig server that runs MLX-format LMs on Apple Silicon and exposes OpenAI-compatible and Anthropic-compatible HTTP APIs. No Python.
 
 ## Stack
 
@@ -20,7 +20,7 @@ Native Zig server that runs MLX-format LMs on Apple Silicon and exposes an OpenA
 | `src/transformer.zig` | Forward pass (embedding, attention, MLP, MoE, GatedDeltaNet); architecture dispatch |
 | `src/generate.zig` | Autoregressive generation, sampling (temperature, top-k, top-p, repeat penalty, presence penalty, logprobs) |
 | `src/chat.zig` | Chat template formatting (ChatML, Gemma turns, Llama-3, Jinja2 via llama.cpp engine); thinking/reasoning tags; tool call parsing |
-| `src/server.zig` | HTTP server: `/health`, `/v1/models`, `/v1/chat/completions`, `/v1/completions` (stream + non-stream, tool calling, KV cache) |
+| `src/server.zig` | HTTP server: `/health`, `/v1/models`, `/v1/chat/completions`, `/v1/completions`, `/v1/messages` (OpenAI + Anthropic compat, stream + non-stream, tool calling, KV cache) |
 | `src/status.zig` | TUI status bar (CPU, memory, GPU metrics) |
 | `src/log.zig` | Leveled logging (error, warn, info, debug) |
 | `build.zig` | Zig build; links mlx-c and pre-compiled libjinja.a |
@@ -42,7 +42,7 @@ Native Zig server that runs MLX-format LMs on Apple Silicon and exposes an OpenA
 | `app/Sources/MLXServe/Services/TestServer.swift` | Embedded HTTP server (port 8090) for test automation — same code path as UI |
 | `app/Sources/MLXServe/Services/AgentMemory.swift` | Agent context memory (recent dirs, commands) |
 | `app/Sources/MLXServe/Views/ChatView.swift` | Chat UI + `runAgentLoop()` + `buildAgentHistory()` |
-| `app/Sources/MLXServe/Views/StatusMenuView.swift` | Menu bar UI, server log viewer |
+| `app/Sources/MLXServe/Views/StatusMenuView.swift` | Menu bar UI, server log viewer, Claude Code launcher |
 | `app/Sources/MLXServe/Views/BrowserView.swift` | Browser window (uses shared WKWebView) |
 
 ## Testing
@@ -52,6 +52,7 @@ Native Zig server that runs MLX-format LMs on Apple Silicon and exposes an OpenA
 - `./tests/integration_test.sh [model_dir] [port]` — 36 end-to-end API tests (needs a model)
 - `./tests/test_tool_response.sh [port]` — tool calling round-trip tests (needs running server)
 - `./tests/test_kv_cache_poison.sh [port]` — KV cache poisoning regression test (needs running server)
+- `./tests/test_anthropic_api.sh [port]` — Anthropic Messages API integration tests (needs running server)
 - Always run `zig build test` and `swift test` before submitting changes
 - Add tests for new pure logic functions in the same source file (Zig convention)
 - Shell integration tests go in `tests/` and need a running server with a loaded model
@@ -72,6 +73,28 @@ Native Zig server that runs MLX-format LMs on Apple Silicon and exposes an OpenA
 - KV cache reuse across requests via prompt prefix matching; invalidated after tool-calling requests and pad-only generations.
 - Tests go at the bottom of each source file (Zig convention).
 - Jinja static library must be rebuilt with system clang++ after changing `lib/jinja_cpp/*.cpp` (see build command in `build.zig`).
+
+## Anthropic Messages API
+
+The server exposes `POST /v1/messages` for Anthropic API compatibility, enabling Claude Code and other Anthropic SDK clients to use local models.
+
+### Request/Response mapping
+- **System prompt**: Anthropic puts `system` at top level → converted to internal system message
+- **Content blocks**: Anthropic messages use typed content blocks (`text`, `tool_use`, `tool_result`, `thinking`) → converted to internal `Message` structs
+- **Tools**: Anthropic `input_schema` → converted to OpenAI `parameters` format for chat template compatibility
+- **Tool results**: Anthropic `tool_result` in user messages → internal `role: "tool"` messages
+- **Thinking**: `thinking` config parsed → maps to `enable_thinking` + `reasoning_budget`; thinking blocks emitted with fake `signature` field
+- **Stop reasons**: `stop` → `end_turn`, `length` → `max_tokens`, `tool_calls` → `tool_use`
+
+### Streaming format
+Anthropic SSE uses named events: `message_start`, `content_block_start`, `content_block_delta` (with `text_delta`, `thinking_delta`, `signature_delta`, `input_json_delta`), `content_block_stop`, `message_delta`, `message_stop`. Each content block has an explicit start/stop lifecycle with an index.
+
+### Claude Code integration
+The MLX Claw app has a "Launch Claude Code" button (visible when server is running) that opens Terminal with the `claude` CLI configured to use the local server:
+- `ANTHROPIC_BASE_URL` → local server URL
+- `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` → dummy values (local server, no auth)
+- `ANTHROPIC_DEFAULT_*_MODEL` → `mlx-serve` (routes all model tiers through local)
+- `CLAUDE_CODE_SUBAGENT_MODEL` → `mlx-serve`
 
 ## Tool Calling Architecture
 

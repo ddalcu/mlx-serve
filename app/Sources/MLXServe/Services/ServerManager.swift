@@ -19,7 +19,7 @@ class ServerManager: ObservableObject {
 
     var baseURL: String { "http://localhost:\(port)" }
 
-    func start(modelPath: String) {
+    func start(modelPath: String, contextSize: Int = 16384) {
         guard status != .running, status != .starting else { return }
 
         // Resolve symlinks for the model path
@@ -42,6 +42,7 @@ class ServerManager: ObservableObject {
             "--model", resolvedModel,
             "--serve",
             "--port", "\(port)",
+            "--ctx-size", "\(contextSize)",
             "--log-level", "info"
         ]
 
@@ -107,11 +108,11 @@ class ServerManager: ObservableObject {
         memoryInfo = nil
     }
 
-    func toggle(modelPath: String) {
+    func toggle(modelPath: String, contextSize: Int = 16384) {
         if status == .running || status == .starting {
             stop()
         } else {
-            start(modelPath: modelPath)
+            start(modelPath: modelPath, contextSize: contextSize)
         }
     }
 

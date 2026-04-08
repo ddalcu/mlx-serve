@@ -52,9 +52,11 @@ struct StatusMenuView: View {
                     .labelsHidden()
                     .pickerStyle(.menu)
 
+                    ContextSizeSection(contextSize: $appState.contextSize, isRunning: server.status == .running || server.status == .starting)
+
                     HStack(spacing: 6) {
                         Button {
-                            server.toggle(modelPath: appState.selectedModelPath)
+                            server.toggle(modelPath: appState.selectedModelPath, contextSize: appState.contextSize)
                         } label: {
                             HStack {
                                 Image(systemName: server.status == .running || server.status == .starting ? "stop.fill" : "play.fill")
@@ -189,7 +191,7 @@ struct StatusMenuView: View {
 
             Divider().padding(.horizontal, 12)
 
-            // Chat, Browser & Quit
+            // Chat, Browser, Claude Code & Quit
             HStack(spacing: 8) {
                 Button {
                     openChat()
@@ -233,7 +235,30 @@ struct StatusMenuView: View {
             }
             .padding(.horizontal, 16)
             .padding(.top, 6)
-            .padding(.bottom, 14)
+            .padding(.bottom, 4)
+
+            // Claude Code launcher
+            if case .running = server.status {
+                Button {
+                    launchClaudeCode(baseURL: server.baseURL)
+                } label: {
+                    HStack {
+                        Image(systemName: "terminal")
+                        Text("Launch Claude Code")
+                        Spacer()
+                        Image(systemName: "arrow.up.forward.square")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                .tint(.purple)
+                .padding(.horizontal, 16)
+                .padding(.bottom, 14)
+            } else {
+                Spacer().frame(height: 10)
+            }
         }
         .frame(width: 320)
     }
@@ -276,6 +301,7 @@ struct EndpointsSection: View {
         ("POST", "/v1/chat/completions"),
         ("POST", "/v1/completions"),
         ("POST", "/v1/embeddings"),
+        ("POST", "/v1/messages"),
     ]
 
     var body: some View {
@@ -355,6 +381,76 @@ struct MaxTokensSection: View {
         }
         return "\(maxTokens)"
     }
+}
+
+struct ContextSizeSection: View {
+    @Binding var contextSize: Int
+    var isRunning: Bool
+
+    private let presets: [(String, Int)] = [
+        ("16K", 16384),
+        ("32K", 32768),
+        ("64K", 65536),
+        ("128K", 131072),
+    ]
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text("Context Size")
+                    .font(.subheadline.weight(.medium))
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Text(formatted)
+                    .font(.caption.monospaced())
+            }
+            HStack(spacing: 4) {
+                ForEach(presets, id: \.1) { label, value in
+                    Button(label) {
+                        contextSize = value
+                    }
+                    .buttonStyle(.bordered)
+                    .tint(contextSize == value ? .accentColor : nil)
+                    .controlSize(.mini)
+                    .disabled(isRunning)
+                }
+            }
+            if isRunning {
+                Text("Restart server to apply")
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+            }
+        }
+    }
+
+    private var formatted: String {
+        if contextSize >= 1024 {
+            return "\(contextSize / 1024)K"
+        }
+        return "\(contextSize)"
+    }
+}
+
+/// Launch Claude Code CLI configured to use the local mlx-serve server.
+private func launchClaudeCode(baseURL: String) {
+    let model = "mlx-serve"
+    let scriptContent = """
+    #!/bin/zsh -l
+    export ANTHROPIC_BASE_URL='\(baseURL)'
+    export ANTHROPIC_API_KEY=
+    export ANTHROPIC_AUTH_TOKEN=mlx-serve
+    export CLAUDE_CODE_ATTRIBUTION_HEADER=0
+    export ANTHROPIC_DEFAULT_OPUS_MODEL=\(model)
+    export ANTHROPIC_DEFAULT_SONNET_MODEL=\(model)
+    export ANTHROPIC_DEFAULT_HAIKU_MODEL=\(model)
+    export CLAUDE_CODE_SUBAGENT_MODEL=\(model)
+    claude --model \(model)
+    """
+
+    let path = NSTemporaryDirectory() + "mlx-claude-code.command"
+    try? scriptContent.write(toFile: path, atomically: true, encoding: .utf8)
+    try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: path)
+    NSWorkspace.shared.open(URL(fileURLWithPath: path))
 }
 
 struct ServerLogView: View {
