@@ -2,11 +2,11 @@
 
 **[ddalcu.github.io/mlx-serve](https://ddalcu.github.io/mlx-serve/)**
 
-Native Zig server that runs MLX-format language models on Apple Silicon and exposes OpenAI-compatible and Anthropic-compatible HTTP APIs. No Python. Comes with **MLX Claw**, a macOS menu bar app with built-in chat, agent mode, and model management.
+Native Zig server that runs MLX-format language models on Apple Silicon and exposes OpenAI-compatible and Anthropic-compatible HTTP APIs. No Python. Comes with **MLX Core**, a macOS menu bar app with built-in chat, agent mode, and model management.
 
-![MLX Claw](docs/mlxclaw-screenshot-1.png)
+![MLX Core](docs/mlxcore-screenshot-1.png)
 
-[<img src="docs/appiconb.png" width="48" align="center">](https://github.com/ddalcu/mlx-serve/releases/latest) **[Download MLX Claw.app](https://github.com/ddalcu/mlx-serve/releases/latest)** — latest release for macOS (Apple Silicon)
+[<img src="docs/appiconb.png" width="48" align="center">](https://github.com/ddalcu/mlx-serve/releases/latest) **[Download MLX Core.app](https://github.com/ddalcu/mlx-serve/releases/latest)** — latest release for macOS (Apple Silicon)
 
 ## Features
 
@@ -20,7 +20,7 @@ Native Zig server that runs MLX-format language models on Apple Silicon and expo
 - Chat templates via Jinja2 (Jinja_cpp) with fallback formatting
 - TUI status bar with CPU, memory, and GPU metrics
 
-## MLX Claw (macOS App)
+## MLX Core (macOS App)
 
 Menu bar app that wraps the server with a full UI:
 
@@ -57,7 +57,7 @@ brew install mlx-c
 
 ### Download a model
 
-The MLX Claw app can download models directly, or use the CLI:
+The MLX Core app can download models directly, or use the CLI:
 
 ```bash
 pip install huggingface-hub
@@ -75,7 +75,7 @@ zig build -Doptimize=ReleaseFast
 
 ```bash
 cd app && SKIP_NOTARIZE=1 bash build.sh
-open "MLX Claw.app"
+open "MLX Core.app"
 ```
 
 Requires `APPLE_DEVELOPER_ID` and `APPLE_TEAM_ID` environment variables for code signing.

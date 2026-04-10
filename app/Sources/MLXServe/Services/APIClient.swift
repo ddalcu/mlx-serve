@@ -15,6 +15,21 @@ enum SSEEvent {
     case done
 }
 
+struct RetryPolicy {
+    let maxRetries: Int
+    let baseDelayMs: Int
+    let maxDelayMs: Int
+
+    static let `default` = RetryPolicy(maxRetries: 5, baseDelayMs: 500, maxDelayMs: 16_000)
+    static let aggressive = RetryPolicy(maxRetries: 3, baseDelayMs: 200, maxDelayMs: 4_000)
+
+    func delay(for attempt: Int) -> UInt64 {
+        let base = min(baseDelayMs * Int(pow(2.0, Double(attempt - 1))), maxDelayMs)
+        let jitter = Int.random(in: 0..<max(1, base / 4))
+        return UInt64(base + jitter) * 1_000_000  // nanoseconds
+    }
+}
+
 class APIClient {
     private let session: URLSession = {
         let config = URLSessionConfiguration.ephemeral
@@ -164,18 +179,13 @@ class APIClient {
         maxTokens: Int = 2048,
         temperature: Double = 0.8,
         enableThinking: Bool = false,
-        tools: [[String: Any]]? = nil
+        tools: [[String: Any]]? = nil,
+        retryPolicy: RetryPolicy = .default
     ) -> AsyncThrowingStream<SSEEvent, Error> {
         AsyncThrowingStream { continuation in
             Task {
-                do {
-                    try await self.performStream(
-                        port: port, messages: messages,
-                        maxTokens: maxTokens, temperature: temperature,
-                        enableThinking: enableThinking, tools: tools,
-                        continuation: continuation
-                    )
-                } catch let error as URLError where error.code == .networkConnectionLost {
+                var lastError: Error?
+                for attempt in 0...retryPolicy.maxRetries {
                     do {
                         try await self.performStream(
                             port: port, messages: messages,
@@ -183,13 +193,31 @@ class APIClient {
                             enableThinking: enableThinking, tools: tools,
                             continuation: continuation
                         )
+                        return  // success
+                    } catch let error as URLError where Self.isRetryable(error) {
+                        lastError = error
+                        if attempt < retryPolicy.maxRetries {
+                            let delay = retryPolicy.delay(for: attempt + 1)
+                            print("[APIClient] Retry \(attempt + 1)/\(retryPolicy.maxRetries) after \(delay / 1_000_000)ms: \(error.code.rawValue)")
+                            try? await Task.sleep(nanoseconds: delay)
+                        }
                     } catch {
                         continuation.finish(throwing: error)
+                        return
                     }
-                } catch {
-                    continuation.finish(throwing: error)
                 }
+                continuation.finish(throwing: lastError ?? URLError(.unknown))
             }
+        }
+    }
+
+    private static func isRetryable(_ error: URLError) -> Bool {
+        switch error.code {
+        case .networkConnectionLost, .notConnectedToInternet,
+             .timedOut, .cannotConnectToHost, .cannotFindHost:
+            return true
+        default:
+            return false
         }
     }
 
@@ -359,7 +387,14 @@ class APIClient {
             return [:]
         }
         var result: [String: String] = [:]
-        for (k, v) in dict { result[k] = "\(v)" }
+        for (k, v) in dict {
+            var s = "\(v)"
+            // Strip surrounding quotes that smaller models sometimes add
+            if s.count >= 2 && s.hasPrefix("\"") && s.hasSuffix("\"") {
+                s = String(s.dropFirst().dropLast())
+            }
+            result[k] = s
+        }
         return result
     }
 }

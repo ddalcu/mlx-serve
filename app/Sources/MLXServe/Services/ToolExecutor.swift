@@ -66,7 +66,7 @@ struct ShellHandler: ToolHandler {
                         result = "OK"
                     }
 
-                    continuation.resume(returning: String(result.prefix(8192)))
+                    continuation.resume(returning: result)
                 } catch {
                     continuation.resume(throwing: error)
                 }
@@ -90,11 +90,29 @@ struct ReadFileHandler: ToolHandler {
         }
 
         let lines = content.components(separatedBy: "\n")
+        let totalLines = lines.count
         let startLine = Int(parameters["startLine"] ?? "1") ?? 1
-        let endLine = Int(parameters["endLine"] ?? "\(lines.count)") ?? lines.count
+        let endLine = Int(parameters["endLine"] ?? "\(totalLines)") ?? totalLines
+        let actualStart = max(1, startLine)
+        let actualEnd = min(totalLines, endLine)
 
-        let slice = lines[max(0, startLine - 1)..<min(lines.count, endLine)]
-        return String(slice.joined(separator: "\n").prefix(8192))
+        let slice = lines[actualStart - 1..<actualEnd]
+        // Add line numbers so the model can reference specific lines for editFile
+        var numbered = slice.enumerated().map { (i, line) in
+            "\(actualStart + i)| \(line)"
+        }.joined(separator: "\n")
+
+        // Add metadata header for large files so model knows to use line ranges
+        if totalLines > 200 || content.utf8.count > 6000 {
+            let header = "[File: \(path) | Lines: \(actualStart)-\(actualEnd) of \(totalLines) | \(content.utf8.count) bytes"
+            if actualEnd < totalLines {
+                numbered = header + " | Use startLine/endLine to read more]\n" + numbered
+            } else {
+                numbered = header + "]\n" + numbered
+            }
+        }
+
+        return numbered
     }
 }
 
@@ -102,9 +120,15 @@ struct ReadFileHandler: ToolHandler {
 
 struct WriteFileHandler: ToolHandler {
     func execute(parameters: [String: String], workingDirectory: String?) async throws -> String {
-        guard let path = parameters["path"], let content = parameters["content"] else {
+        guard let path = parameters["path"], var content = parameters["content"] else {
             throw ToolError.missingParameter("path and content")
         }
+
+        // Unescape common sequences that smaller models double-escape
+        content = content
+            .replacingOccurrences(of: "\\n", with: "\n")
+            .replacingOccurrences(of: "\\t", with: "\t")
+            .replacingOccurrences(of: "\\\"", with: "\"")
 
         let fullPath = resolvePath(path, workingDirectory: workingDirectory)
         let dir = (fullPath as NSString).deletingLastPathComponent
@@ -150,9 +174,31 @@ struct SearchFilesHandler: ToolHandler {
             throw ToolError.missingParameter("pattern")
         }
         let path = parameters["path"] ?? "."
+        let maxResults = Int(parameters["maxResults"] ?? "100") ?? 100
         let escaped = shellEscape(pattern)
         let escapedPath = shellEscape(path)
-        let command = "grep -rn \(escaped) \(escapedPath) 2>/dev/null | head -100"
+
+        // Use ripgrep if available, fallback to grep
+        let useRg = FileManager.default.fileExists(atPath: "/opt/homebrew/bin/rg")
+            || FileManager.default.fileExists(atPath: "/usr/local/bin/rg")
+
+        var command: String
+        if useRg {
+            command = "rg -n --no-heading"
+            if let include = parameters["include"] {
+                command += " -g \(shellEscape(include))"
+            }
+            if let context = parameters["context"], let ctx = Int(context), ctx > 0 {
+                command += " -C \(min(ctx, 10))"
+            }
+            command += " \(escaped) \(escapedPath) 2>/dev/null | head -\(maxResults)"
+        } else {
+            command = "grep -rn"
+            if let include = parameters["include"] {
+                command += " --include=\(shellEscape(include))"
+            }
+            command += " \(escaped) \(escapedPath) 2>/dev/null | head -\(maxResults)"
+        }
         return try await shellHandler.execute(parameters: ["command": command], workingDirectory: workingDirectory)
     }
 
@@ -161,6 +207,95 @@ struct SearchFilesHandler: ToolHandler {
     }
 }
 
+
+// MARK: - List Files
+
+struct ListFilesHandler: ToolHandler {
+    func execute(parameters: [String: String], workingDirectory: String?) async throws -> String {
+        let path = parameters["path"] ?? "."
+        let fullPath = resolvePath(path, workingDirectory: workingDirectory)
+        let pattern = parameters["pattern"]
+        let recursive = parameters["recursive"]?.lowercased() == "true"
+
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: fullPath) else {
+            throw ToolError.executionFailed("Directory not found: \(fullPath)")
+        }
+
+        var entries: [String] = []
+
+        if recursive {
+            guard let enumerator = fm.enumerator(atPath: fullPath) else {
+                throw ToolError.executionFailed("Cannot enumerate: \(fullPath)")
+            }
+            // If pattern has no path separators (e.g. "*.swift"), match filename only
+            let matchFilenameOnly = pattern != nil && !pattern!.contains("/")
+            while let item = enumerator.nextObject() as? String {
+                if let pattern {
+                    let target = matchFilenameOnly ? (item as NSString).lastPathComponent : item
+                    if matchesGlob(target, pattern: pattern) {
+                        entries.append(item)
+                    }
+                } else {
+                    entries.append(item)
+                }
+                if entries.count >= 200 { break }
+            }
+        } else {
+            let items = try fm.contentsOfDirectory(atPath: fullPath)
+            for item in items.sorted() {
+                if let pattern {
+                    if matchesGlob(item, pattern: pattern) {
+                        entries.append(item)
+                    }
+                } else {
+                    entries.append(item)
+                }
+                if entries.count >= 200 { break }
+            }
+        }
+
+        if entries.isEmpty {
+            return "No files found in \(path)" + (pattern != nil ? " matching '\(pattern!)'" : "")
+        }
+        let result = entries.joined(separator: "\n")
+        let suffix = entries.count >= 200 ? "\n[... truncated at 200 entries]" : ""
+        return result + suffix
+    }
+
+    /// Simple glob matching supporting * and ** wildcards.
+    private func matchesGlob(_ path: String, pattern: String) -> Bool {
+        // Convert glob to regex: * matches non-slash, ** matches anything
+        var regex = "^"
+        var i = pattern.startIndex
+        while i < pattern.endIndex {
+            let c = pattern[i]
+            if c == "*" {
+                let next = pattern.index(after: i)
+                if next < pattern.endIndex && pattern[next] == "*" {
+                    regex += ".*"
+                    i = pattern.index(after: next)
+                    // Skip trailing slash after **
+                    if i < pattern.endIndex && pattern[i] == "/" {
+                        i = pattern.index(after: i)
+                    }
+                    continue
+                } else {
+                    regex += "[^/]*"
+                }
+            } else if c == "?" {
+                regex += "[^/]"
+            } else if c == "." {
+                regex += "\\."
+            } else {
+                regex += String(c)
+            }
+            i = pattern.index(after: i)
+        }
+        regex += "$"
+        return path.range(of: regex, options: .regularExpression) != nil
+    }
+}
 
 // MARK: - Web Search (DuckDuckGo)
 
@@ -288,6 +423,7 @@ class ToolExecutor: ObservableObject {
         .writeFile: WriteFileHandler(),
         .editFile: EditFileHandler(),
         .searchFiles: SearchFilesHandler(),
+        .listFiles: ListFilesHandler(),
         .browse: BrowseHandler(),
         .webSearch: WebSearchHandler(),
         .saveMemory: SaveMemoryHandler(),

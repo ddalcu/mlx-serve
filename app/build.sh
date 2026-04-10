@@ -3,8 +3,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-APP_NAME="MLX Claw"
-BUNDLE_ID="com.dalcu.mlx-claw"
+APP_NAME="MLX Core"
+BUNDLE_ID="com.dalcu.mlx-core"
 
 # Signing identity from env (set in ~/.zshrc or CI)
 IDENTITY="${APPLE_DEVELOPER_ID:?Set APPLE_DEVELOPER_ID in env (e.g. 'Developer ID Application: Name (TEAMID)')}"
@@ -17,12 +17,12 @@ CALVER="$(date +%Y.%-m.%-d)"
 /usr/libexec/PlistBuddy -c "Set :CFBundleVersion $CALVER" Info.plist
 /usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $CALVER" Info.plist
 
-echo "=== Building MLX Claw $CALVER ==="
+echo "=== Building MLX Core $CALVER ==="
 
 # ── Phase 1: Build Swift app ──
 echo "→ Compiling Swift..."
 swift build -c release 2>&1 | tail -5
-SWIFT_BIN="$(swift build -c release --show-bin-path)/MLXClaw"
+SWIFT_BIN="$(swift build -c release --show-bin-path)/MLXCore"
 if [ ! -f "$SWIFT_BIN" ]; then
     echo "ERROR: Swift build failed"
     exit 1
@@ -64,7 +64,7 @@ mkdir -p "$CONTENTS/Frameworks"
 mkdir -p "$CONTENTS/Resources"
 
 # Main Swift executable
-cp "$SWIFT_BIN" "$CONTENTS/MacOS/MLXClaw"
+cp "$SWIFT_BIN" "$CONTENTS/MacOS/MLXCore"
 
 # App resources (tray icon etc.)
 cp -R "$SCRIPT_DIR/Sources/MLXServe/Resources/"* "$CONTENTS/Resources/" 2>/dev/null || true
@@ -139,7 +139,7 @@ done
 
 # Sign executables
 codesign --force --options runtime --sign "$IDENTITY" "$CONTENTS/MacOS/mlx-serve" && echo "  Signed: mlx-serve"
-codesign --force --options runtime --sign "$IDENTITY" "$CONTENTS/MacOS/MLXClaw" && echo "  Signed: MLXClaw"
+codesign --force --options runtime --sign "$IDENTITY" "$CONTENTS/MacOS/MLXCore" && echo "  Signed: MLXCore"
 codesign --force --options runtime --sign "$IDENTITY" "$APP" && echo "  Signed: $APP_NAME.app"
 
 # Verify
@@ -153,7 +153,7 @@ else
     APPLE_ID="${APPLE_ID:?Set APPLE_ID in env for notarization}"
     APPLE_ID_PASSWORD="${APPLE_ID_PASSWORD:?Set APPLE_ID_PASSWORD in env (app-specific password)}"
 
-    ZIP_PATH="$SCRIPT_DIR/MLXClaw.zip"
+    ZIP_PATH="$SCRIPT_DIR/MLXCore.zip"
     ditto -c -k --keepParent "$APP" "$ZIP_PATH"
 
     xcrun notarytool submit "$ZIP_PATH" \
@@ -167,6 +167,12 @@ else
     rm -f "$ZIP_PATH"
 fi
 
+# ── Phase 7: Create DMG installer ──
+echo "→ Creating DMG..."
+DMG_PATH="$SCRIPT_DIR/MLXCore.dmg"
+bash "$PROJECT_ROOT/scripts/create-dmg.sh" "$APP" "$DMG_PATH"
+
 echo ""
 echo "=== Build complete! ==="
 echo "App: $APP"
+echo "DMG: $DMG_PATH"

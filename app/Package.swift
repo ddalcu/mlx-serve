@@ -2,17 +2,17 @@
 import PackageDescription
 
 let package = Package(
-    name: "MLXClaw",
+    name: "MLXCore",
     platforms: [.macOS(.v14)],
     targets: [
         .executableTarget(
-            name: "MLXClaw",
+            name: "MLXCore",
             path: "Sources/MLXServe",
             exclude: ["Resources"]
         ),
         .testTarget(
-            name: "MLXClawTests",
-            path: "Tests/MLXClawTests"
+            name: "MLXCoreTests",
+            path: "Tests/MLXCoreTests"
         ),
     ]
 )

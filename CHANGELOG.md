@@ -1,5 +1,54 @@
 # Changelog
 
+## 2026.4.12 — MLX Core Rename, Agent Overhaul
+
+### Rename: MLX Claw → MLX Core
+- **Full rebrand**: App renamed from "MLX Claw" to "MLX Core" across all source, build scripts, CI/CD, docs, tests, and bundle identifiers (`com.dalcu.mlx-core`)
+
+### New Tool: listFiles
+- **Dedicated file listing**: `listFiles` tool with glob pattern matching and recursive traversal — replaces shell `ls`/`find` in agent workflows
+- **Tool routing guidance**: System prompt now directs the model to use dedicated tools (`readFile`, `writeFile`, `editFile`, `searchFiles`, `listFiles`) instead of shell equivalents
+
+### Agent Loop Improvements
+- **150 max iterations** (up from 30): Supports complex multi-step agent tasks
+- **Token-aware context management**: `buildAgentHistory()` now estimates token costs per message and fits history to the context budget instead of using a fixed 28-message window
+- **Tool result overflow**: Oversized tool results saved to `~/.mlx-serve/tool-output/` with a truncated preview in context plus a pointer to the full file — prevents context blowout from large shell output or file reads
+- **Per-tool context caps**: shell 6K, readFile 8K, searchFiles/listFiles 4K, browse 3K, webSearch 2K, editFile/writeFile 2K
+- **Working directory injection**: Agent system prompt now includes the working directory path so relative paths resolve correctly
+- **Pad retry with backoff**: Failed empty generations use exponential backoff (`RetryPolicy.aggressive`) instead of immediate retry
+
+### System Prompt Redesign
+- **Hardcoded base + additive user customization**: Base system prompt is no longer editable — `~/.mlx-serve/system-prompt.md` now contains only user additions appended via `# User Instructions`
+- **File editing rules**: Explicit instructions for readFile → editFile workflow (line numbers, exact match, startLine/endLine for large files)
+- **Error recovery section**: Structured guidance for tool failure diagnosis
+- **Memory cap**: Memory entries capped at last 30 lines / 2000 chars to prevent context bloat
+
+### Tool Enhancements
+- **readFile with line numbers**: Output now shows `N| text` format so the model can reference specific lines for editFile
+- **readFile large file headers**: Files >200 lines or >6KB show metadata header with total line count and byte size
+- **searchFiles upgrade**: Uses ripgrep when available, supports `include` glob filter, `context` lines, and `maxResults` parameter
+- **writeFile unescape**: Handles `\\n`, `\\t`, `\\\"` double-escaping from smaller models
+- **Shell output uncapped**: Removed 8KB truncation on shell results (overflow system handles large output instead)
+
+### API Client
+- **Retry with exponential backoff**: Network errors (connection lost, timeout, cannot connect) retry up to 5 times with jitter — replaces single-retry on connection lost
+- **Tool call argument cleanup**: Strips surrounding quotes from tool call parameter values that smaller models add
+
+### Claude Code Launcher
+- **Folder picker**: Claude Code button in chat toolbar opens NSOpenPanel to select working directory before launch
+- **Working directory support**: `launchClaudeCode()` now accepts and `cd`s into the chosen directory
+- **Claude icon**: Custom SwiftUI `ClaudeShape` renders the official Claude AI logo SVG as a native Shape
+
+### UI
+- **Scroll tracking fix**: Replaced window-frame-based scroll detection with proper GeometryReader preference keys; upward mouse scroll disengages auto-scroll, scrolling back to bottom re-engages
+- **Compact bottom bar**: Browser and Claude Code buttons use icon-only style with tooltips
+- **Overflow file cleanup**: Old tool-output files (>24h) cleaned up on session start
+
+### TestServer
+- **Non-blocking agent jobs**: `POST /test/agent` now returns immediately with a `job_id`; poll `GET /test/agent/status` for progress and results
+
+---
+
 ## 2026.4.11 — Anthropic API, Claude Code, KV Cache Fix
 
 ### Anthropic Messages API
@@ -11,7 +60,7 @@
 - **Query string stripping**: `POST /v1/messages?beta=true` now correctly routes (Claude Code appends `?beta=true`)
 
 ### Claude Code Integration
-- **Launch button**: "Launch Claude Code" button in MLX Claw menu bar (visible when server is running) — opens Terminal with `claude` CLI configured to use the local server via `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, model tier overrides
+- **Launch button**: "Launch Claude Code" button in MLX Core menu bar (visible when server is running) — opens Terminal with `claude` CLI configured to use the local server via `ANTHROPIC_BASE_URL`, `ANTHROPIC_AUTH_TOKEN`, model tier overrides
 - **Binary detection**: Finds `claude` via login shell PATH (`/bin/zsh -l -c "which claude"`) with fallback to `~/.local/bin/claude`
 - **`.command` file approach**: Uses `NSWorkspace.open()` on a temp `.command` file — no AppleScript permissions needed
 
@@ -21,7 +70,7 @@
 - **Context size auto-detection**: Default context size computed from GPU memory at startup (replaces hardcoded 16K cap). Logged as `Context size: N tokens (auto, from GPU memory)`
 
 ### Context Size UI
-- **Context size selector**: New UI in MLX Claw server block with Auto/16K/32K/64K/128K presets
+- **Context size selector**: New UI in MLX Core server block with Auto/16K/32K/64K/128K presets
 - **Auto mode**: When set to Auto (default), server computes safe max from model architecture + available GPU memory
 - **GPU safe max indicator**: Shows "GPU safe max: XXK" under buttons; turns orange when selected size exceeds safe limit
 - **`--ctx-size` passed to server**: Only when manually selected (Auto = no flag, server computes)
@@ -126,7 +175,7 @@
 - **Partial thinking detection**: Buffers tokens when `<|channel>` prefix detected (before `thought` suffix arrives) to prevent premature flushing
 - **`splitThinkBlock` fixes**: Correct handling of Gemma 4's `<|channel>thought...<channel|>\n<|channel>\ncontent` format
 
-### MLX Claw App
+### MLX Core App
 - **Auto-start server on launch**: Toggle in menu bar, persists selected model in UserDefaults
 - **Selected model persistence**: Last used model path saved across launches
 - **Test API server** (port 8090): REST endpoints for automated testing (`/test/start`, `/test/stop`, `/test/reset`, `/test/chat`, `/test/agent`, `/test/history`, `/test/status`)
@@ -158,7 +207,7 @@
 - **Tool calling reliability**: Improved tool call parsing, agent harness stability
 - **App bundle packaging**: Removed Bundle.module dependency, fixed codesigning
 
-## 2026.4.3 — MLX Claw Major Update
+## 2026.4.3 — MLX Core Major Update
 
 - **Native tool calling UI**: 7 built-in tools (shell, readFile, writeFile, editFile, searchFiles, browse, webSearch)
 - **Agent mode**: Automatic ReAct loop with tool execution and result feeding
@@ -166,7 +215,7 @@
 - **Streaming chat**: SSE parsing with delta reconstruction for real-time responses
 - **Multi-session chat**: Persistent chat history with session management
 
-## 2026.4.2 — MLX Claw Initial Release
+## 2026.4.2 — MLX Core Initial Release
 
 - **Swift macOS menu bar application**: Server management, model selection, chat interface
 - **Server lifecycle**: Subprocess launch/termination with stderr capture

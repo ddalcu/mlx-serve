@@ -2,7 +2,7 @@ import XCTest
 import Foundation
 
 // =============================================================================
-// MARK: - Minimal type replicas (matching the fixed MLX Claw agent harness)
+// MARK: - Minimal type replicas (matching the fixed MLX Core agent harness)
 // =============================================================================
 
 enum TestRole: String, Codable {

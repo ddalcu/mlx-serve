@@ -1,5 +1,94 @@
 import SwiftUI
 
+/// Claude logo icon from the official Claude AI symbol SVG.
+struct ClaudeIcon: View {
+    var size: CGFloat = 14
+
+    var body: some View {
+        ClaudeShape()
+            .frame(width: size, height: size)
+    }
+}
+
+private struct ClaudeShape: Shape {
+    // SVG path coordinates from the official Claude AI symbol (1200x1200 viewBox).
+    // One M, many L, one C, one Z — stored as (x,y) pairs for compact code.
+    private static let points: [(CGFloat, CGFloat)] = [
+        (233.96, 800.21), (468.64, 668.54), (472.59, 657.10), (468.64, 650.74),
+        (457.21, 650.74), (417.99, 648.32), (283.89, 644.70), (167.60, 639.87),
+        (54.93, 633.83), (26.58, 627.79), (0, 592.75), (2.74, 575.28),
+        (26.58, 559.25), (60.72, 562.23), (136.19, 567.38), (249.42, 575.19),
+        (331.57, 580.03), (453.26, 592.67), (472.59, 592.67), (475.33, 584.86),
+        (468.72, 580.03), (463.57, 575.19), (346.39, 495.79), (219.54, 411.87),
+        (153.10, 363.54), (117.18, 339.06), (99.06, 316.11), (91.25, 266.01),
+        (123.87, 230.09), (167.68, 233.07), (178.87, 236.05), (223.25, 270.20),
+        (318.04, 343.57), (441.83, 434.74), (459.95, 449.80), (467.19, 444.64),
+        (468.08, 441.02), (459.95, 427.41), (392.62, 305.72), (320.78, 181.93),
+        (288.81, 130.63), (280.35, 99.87),
+    ]
+    // C 277.37 87.22 275.19 76.59 275.19 63.62 (cubic bezier)
+    private static let curveEnd: (c1: (CGFloat, CGFloat), c2: (CGFloat, CGFloat), to: (CGFloat, CGFloat)) =
+        ((277.37, 87.22), (275.19, 76.59), (275.19, 63.62))
+    private static let points2: [(CGFloat, CGFloat)] = [
+        (312.32, 13.21), (332.86, 6.60), (382.39, 13.21), (403.25, 31.33),
+        (434.01, 101.72), (483.87, 212.54), (561.18, 363.22), (583.81, 407.92),
+        (595.89, 449.32), (600.40, 461.96), (608.21, 461.96), (608.21, 454.71),
+        (614.58, 369.83), (626.34, 265.61), (637.77, 131.52), (641.72, 93.75),
+        (660.40, 48.48), (697.53, 24.00), (726.52, 37.85), (750.36, 72.00),
+        (747.06, 94.07), (732.89, 186.20), (705.10, 330.52), (686.98, 427.17),
+        (697.53, 427.17), (709.61, 415.09), (758.50, 350.17), (840.64, 247.49),
+        (876.89, 206.74), (919.17, 161.72), (946.31, 140.30), (997.61, 140.30),
+        (1035.38, 196.43), (1018.47, 254.42), (965.64, 321.42), (921.83, 378.20),
+        (859.01, 462.77), (819.79, 530.42), (823.41, 535.81), (832.75, 534.93),
+        (974.66, 504.72), (1051.33, 490.87), (1142.82, 475.17), (1184.21, 494.50),
+        (1188.72, 514.15), (1172.46, 554.34), (1074.60, 578.50), (959.84, 601.45),
+        (788.94, 641.88), (786.85, 643.41), (789.26, 646.39), (866.26, 653.64),
+        (899.19, 655.41), (979.81, 655.41), (1129.93, 666.60), (1169.15, 692.54),
+        (1192.67, 724.27), (1188.72, 748.43), (1128.32, 779.19), (1046.82, 759.87),
+        (856.59, 714.60), (791.36, 698.34), (782.34, 698.34), (782.34, 703.73),
+        (836.70, 756.89), (936.32, 846.85), (1061.07, 962.82), (1067.44, 991.49),
+        (1051.41, 1014.12), (1034.50, 1011.70), (924.89, 929.23), (882.60, 892.11),
+        (786.85, 811.49), (780.48, 811.49), (780.48, 819.95), (802.55, 852.24),
+        (919.09, 1027.41), (925.13, 1081.13), (916.67, 1098.60), (886.47, 1109.15),
+        (853.29, 1103.11), (785.07, 1007.36), (714.68, 899.52), (657.91, 802.87),
+        (650.98, 806.82), (617.48, 1167.70), (601.77, 1186.15), (565.53, 1200.00),
+        (535.33, 1177.05), (519.30, 1139.92), (535.33, 1066.55), (554.66, 970.79),
+        (570.36, 894.68), (584.54, 800.13), (593.00, 768.72), (592.43, 766.63),
+        (585.50, 767.52), (514.23, 865.37), (405.83, 1011.87), (320.05, 1103.68),
+        (299.52, 1111.81), (263.92, 1093.37), (267.22, 1060.43), (287.11, 1031.11),
+        (405.83, 880.11), (477.42, 786.52), (523.65, 732.48), (523.33, 724.67),
+        (520.59, 724.67), (205.29, 929.40), (149.15, 936.64), (125.00, 914.01),
+        (127.97, 876.89), (139.41, 864.81), (234.20, 799.57),
+    ]
+
+    func path(in rect: CGRect) -> Path {
+        let sx = rect.width / 1200
+        let sy = rect.height / 1200
+
+        var p = Path()
+        let first = Self.points[0]
+        p.move(to: CGPoint(x: first.0 * sx, y: first.1 * sy))
+
+        for pt in Self.points.dropFirst() {
+            p.addLine(to: CGPoint(x: pt.0 * sx, y: pt.1 * sy))
+        }
+
+        let c = Self.curveEnd
+        p.addCurve(
+            to: CGPoint(x: c.to.0 * sx, y: c.to.1 * sy),
+            control1: CGPoint(x: c.c1.0 * sx, y: c.c1.1 * sy),
+            control2: CGPoint(x: c.c2.0 * sx, y: c.c2.1 * sy)
+        )
+
+        for pt in Self.points2 {
+            p.addLine(to: CGPoint(x: pt.0 * sx, y: pt.1 * sy))
+        }
+
+        p.closeSubpath()
+        return p
+    }
+}
+
 struct StatusMenuView: View {
     @EnvironmentObject var appState: AppState
     @EnvironmentObject var server: ServerManager
@@ -13,7 +102,7 @@ struct StatusMenuView: View {
         VStack(alignment: .leading, spacing: 0) {
             // Header
             HStack {
-                Text("MLX Claw")
+                Text("MLX Core")
                     .font(.headline)
                 Text(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "")
                     .font(.caption)
@@ -208,13 +297,10 @@ struct StatusMenuView: View {
                 Button {
                     openBrowser()
                 } label: {
-                    HStack {
-                        Image(systemName: "globe")
-                        Text("Browser")
-                    }
-                    .frame(maxWidth: .infinity)
+                    Image(systemName: "globe")
                 }
                 .buttonStyle(.bordered)
+                .help("Browser")
 
                 Button {
                     let path = NSString(string: "~/.mlx-serve").expandingTildeInPath
@@ -226,6 +312,17 @@ struct StatusMenuView: View {
                 .help("MLX Serve Folder")
 
                 Button {
+                    let ws = NSString(string: "~/.mlx-serve/workspace").expandingTildeInPath
+                    try? FileManager.default.createDirectory(atPath: ws, withIntermediateDirectories: true)
+                    launchClaudeCode(baseURL: server.baseURL, workingDirectory: ws)
+                } label: {
+                    ClaudeIcon(size: 16)
+                }
+                .buttonStyle(.bordered)
+                .disabled(server.status != .running)
+                .help("Launch Claude Code")
+
+                Button {
                     server.stop()
                     NSApplication.shared.terminate(nil)
                 } label: {
@@ -235,30 +332,7 @@ struct StatusMenuView: View {
             }
             .padding(.horizontal, 16)
             .padding(.top, 6)
-            .padding(.bottom, 4)
-
-            // Claude Code launcher
-            if case .running = server.status {
-                Button {
-                    launchClaudeCode(baseURL: server.baseURL)
-                } label: {
-                    HStack {
-                        Image(systemName: "terminal")
-                        Text("Launch Claude Code")
-                        Spacer()
-                        Image(systemName: "arrow.up.forward.square")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                    }
-                    .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.bordered)
-                .tint(.purple)
-                .padding(.horizontal, 16)
-                .padding(.bottom, 14)
-            } else {
-                Spacer().frame(height: 10)
-            }
+            .padding(.bottom, 14)
         }
         .frame(width: 320)
     }
@@ -444,8 +518,9 @@ struct ContextSizeSection: View {
 }
 
 /// Launch Claude Code CLI configured to use the local mlx-serve server.
-private func launchClaudeCode(baseURL: String) {
+func launchClaudeCode(baseURL: String, workingDirectory: String? = nil) {
     let model = "mlx-serve"
+    let cdLine = workingDirectory.map { "cd '\($0)'" } ?? ""
     let scriptContent = """
     #!/bin/zsh -l
     export ANTHROPIC_BASE_URL='\(baseURL)'
@@ -456,6 +531,7 @@ private func launchClaudeCode(baseURL: String) {
     export ANTHROPIC_DEFAULT_SONNET_MODEL=\(model)
     export ANTHROPIC_DEFAULT_HAIKU_MODEL=\(model)
     export CLAUDE_CODE_SUBAGENT_MODEL=\(model)
+    \(cdLine)
     claude --model \(model)
     """
 

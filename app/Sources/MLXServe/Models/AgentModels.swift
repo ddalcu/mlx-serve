@@ -11,6 +11,7 @@ enum AgentToolKind: String, Codable, CaseIterable {
     case writeFile
     case editFile
     case searchFiles
+    case listFiles
     case browse
     case webSearch
     case saveMemory
@@ -22,6 +23,7 @@ enum AgentToolKind: String, Codable, CaseIterable {
         case .writeFile: "doc.text.fill"
         case .editFile: "pencil"
         case .searchFiles: "magnifyingglass"
+        case .listFiles: "folder"
         case .browse: "globe"
         case .webSearch: "magnifyingglass"
         case .saveMemory: "brain"
@@ -35,6 +37,7 @@ enum AgentToolKind: String, Codable, CaseIterable {
         case .writeFile: "Write File"
         case .editFile: "Edit File"
         case .searchFiles: "Search Files"
+        case .listFiles: "List Files"
         case .browse: "Browse"
         case .webSearch: "Web Search"
         case .saveMemory: "Save Memory"

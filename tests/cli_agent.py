@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-CLI agent that replicates MLX Claw's agent loop against a running mlx-serve.
+CLI agent that replicates MLX Core's agent loop against a running mlx-serve.
 
 Usage:
     python3 tests/cli_agent.py [--port 8080] [--max-rounds 10] "your prompt here"

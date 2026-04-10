@@ -25,11 +25,11 @@ Native Zig server that runs MLX-format LMs on Apple Silicon and exposes OpenAI-c
 | `src/log.zig` | Leveled logging (error, warn, info, debug) |
 | `build.zig` | Zig build; links mlx-c and pre-compiled libjinja.a |
 
-### MLX Claw (Swift macOS app)
+### MLX Core (Swift macOS app)
 
 | Path | Role |
 |------|------|
-| `app/Package.swift` | Swift package; `MLXClaw` executable + `MLXClawTests` test target |
+| `app/Package.swift` | Swift package; `MLXCore` executable + `MLXCoreTests` test target |
 | `app/Sources/MLXServe/MLXServeApp.swift` | App entry, menu bar + Chat/Browser windows |
 | `app/Sources/MLXServe/AppState.swift` | Global state, chat session management, persistence |
 | `app/Sources/MLXServe/Models/ChatModels.swift` | `ChatMessage`, `SerializedToolCall`, `ChatSession` |
@@ -90,7 +90,7 @@ The server exposes `POST /v1/messages` for Anthropic API compatibility, enabling
 Anthropic SSE uses named events: `message_start`, `content_block_start`, `content_block_delta` (with `text_delta`, `thinking_delta`, `signature_delta`, `input_json_delta`), `content_block_stop`, `message_delta`, `message_stop`. Each content block has an explicit start/stop lifecycle with an index.
 
 ### Claude Code integration
-The MLX Claw app has a "Launch Claude Code" button (visible when server is running) that opens Terminal with the `claude` CLI configured to use the local server:
+The MLX Core app has a "Launch Claude Code" button (visible when server is running) that opens Terminal with the `claude` CLI configured to use the local server:
 - `ANTHROPIC_BASE_URL` → local server URL
 - `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` → dummy values (local server, no auth)
 - `ANTHROPIC_DEFAULT_*_MODEL` → `mlx-serve` (routes all model tiers through local)
@@ -106,7 +106,7 @@ The MLX Claw app has a "Launch Claude Code" button (visible when server is runni
 - **KV cache**: `reuseKVCache()` compares token-by-token prefix. Cache is automatically invalidated after tool-calling requests (generated tool-call tokens corrupt the cache for the next request) and after pad-only generations. Sliding window layers keep full buffers (no trimming) — views return the last `sw` entries during decode, all entries during prefill.
 
 ### Client side (Swift)
-- **Agent loop** (`ChatView.runAgentLoop`): Up to 30 iterations. Calls model with tools → parses tool calls → executes locally → feeds results back → repeats until model responds without tool calls. Adds synthetic user nudge after tool results for models that need it.
+- **Agent loop** (`ChatView.runAgentLoop`): Up to 150 iterations. Calls model with tools → parses tool calls → executes locally → feeds results back → repeats until model responds without tool calls. Adds synthetic user nudge after tool results for models that need it.
 - **History builder** (`ChatView.buildAgentHistory`): Converts `ChatMessage` array to OpenAI API format. Filters out error messages, pad-only content, and agent summaries. Truncates assistant messages at 500 chars. Last 30 messages max.
 - **SSE parsing** (`APIClient.performStream`): Accumulates streamed tool call deltas. Server sends full arguments in one delta. Emits `.toolCalls` event on `finish_reason: "tool_calls"`. Fallback emission if stream drops without finish_reason.
 - **Tool call storage**: `SerializedToolCall` (id, name, arguments as JSON string) stored on `ChatMessage.toolCalls`. Persisted via Codable for history replay. Backwards-compatible with old history files (field is optional).
@@ -149,7 +149,7 @@ Large model downloads (e.g., 26B at ~15 GB) use streaming writes to `.partial` f
 
 ### Server logs
 - Start server with `--log-level debug` for verbose output (Jinja errors, cache hits, token counts)
-- The MLX Claw app starts the server as a subprocess; stderr is captured in `ServerManager.serverLog` (64KB rolling buffer). View it via the log button (text-align icon) next to Start/Stop in the menu bar.
+- The MLX Core app starts the server as a subprocess; stderr is captured in `ServerManager.serverLog` (64KB rolling buffer). View it via the log button (text-align icon) next to Start/Stop in the menu bar.
 - To see logs from a manually-started server: `./zig-out/bin/mlx-serve --model <path> --serve --port 8080 --log-level debug 2>&1`
 - Key log patterns:
   - `jinja error: ..., using fallback` — Jinja template failed, check template compatibility
@@ -186,7 +186,7 @@ When `tools` are present, the server buffers tokens to detect tool call patterns
 mlx-c 0.6.0 added a `global_scale` parameter (may be null) to `mlx_dequantize` between `mode` and `dtype`. The FFI declaration in `mlx.zig` must match the installed header. When upgrading mlx-c, diff the headers in `/opt/homebrew/include/mlx/c/ops.h` against the `extern "c"` declarations in `src/mlx.zig`.
 
 ### Two binaries in the app bundle
-The MLX Claw `.app` bundle contains TWO binaries: `MLXClaw` (Swift UI) and `mlx-serve` (Zig server). Both must be updated when making changes. The Swift app starts the Zig server as a child process. Forgetting to copy one binary after a rebuild is a common source of "it still doesn't work."
+The MLX Core `.app` bundle contains TWO binaries: `MLXCore` (Swift UI) and `mlx-serve` (Zig server). Both must be updated when making changes. The Swift app starts the Zig server as a child process. Forgetting to copy one binary after a rebuild is a common source of "it still doesn't work."
 
 ### WebSearch and Browse
 The `webSearch` tool navigates to DuckDuckGo HTML search and extracts structured results (titles, URLs, snippets) via JavaScript. The `browse` tool's `readText` action navigates to the URL first, then extracts text — this ensures each browse returns the correct page content (not the previous page's).

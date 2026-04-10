@@ -39,6 +39,7 @@ class AppState: ObservableObject {
         refreshModels()
         loadChatHistory()
         testServer.start(appState: self)
+        ChatDetailView.cleanupOverflowFiles()
 
         // Auto-start server if enabled and a model is available
         if autoStartServer, !selectedModelPath.isEmpty {

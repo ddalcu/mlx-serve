@@ -20,8 +20,8 @@ jobs:
         with:
           version: 0.15.2
 
-      - name: Install mlx-c
-        run: brew install mlx-c
+      - name: Install dependencies
+        run: brew install mlx-c create-dmg
 
       - name: Import signing certificate
         env:
@@ -109,12 +109,12 @@ jobs:
         env:
           SIGNING_IDENTITY: "Developer ID Application: David Dalcu (${{ secrets.APPLE_TEAM_ID }})"
         run: |
-          APP="MLX Claw.app"
+          APP="MLX Core.app"
           CONTENTS="$APP/Contents"
           mkdir -p "$CONTENTS/MacOS" "$CONTENTS/Frameworks" "$CONTENTS/Resources"
 
           # Executables
-          cp "$SWIFT_BIN_PATH/MLXClaw" "$CONTENTS/MacOS/MLXClaw"
+          cp "$SWIFT_BIN_PATH/MLXCore" "$CONTENTS/MacOS/MLXCore"
           cp zig-out/bin/mlx-serve "$CONTENTS/MacOS/mlx-serve"
 
           # App resources (tray icon etc.)
@@ -159,11 +159,11 @@ jobs:
             [ -f "$fw" ] && codesign --force --options runtime --sign "$SIGNING_IDENTITY" "$fw"
           done
           codesign --force --options runtime --sign "$SIGNING_IDENTITY" "$CONTENTS/MacOS/mlx-serve"
-          codesign --force --options runtime --sign "$SIGNING_IDENTITY" "$CONTENTS/MacOS/MLXClaw"
+          codesign --force --options runtime --sign "$SIGNING_IDENTITY" "$CONTENTS/MacOS/MLXCore"
           codesign --force --options runtime --sign "$SIGNING_IDENTITY" "$APP"
 
           codesign --verify --deep --strict --verbose=2 "$APP"
-          ditto -c -k --keepParent "$APP" "MLXClaw-app.zip"
+          ditto -c -k --keepParent "$APP" "MLXCore-app.zip"
 
       # ── Notarize both ──
       - name: Notarize CLI
@@ -184,18 +184,18 @@ jobs:
           APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
-          xcrun notarytool submit "MLXClaw-app.zip" \
+          xcrun notarytool submit "MLXCore-app.zip" \
             --apple-id "$APPLE_ID" \
             --password "$APPLE_ID_PASSWORD" \
             --team-id "$APPLE_TEAM_ID" \
             --wait
 
           # Staple the app bundle
-          xcrun stapler staple "MLX Claw.app"
+          xcrun stapler staple "MLX Core.app"
+          rm -f "MLXCore-app.zip"
 
-          # Re-zip after stapling
-          rm -f "MLXClaw-app.zip"
-          ditto -c -k --keepParent "MLX Claw.app" "MLXClaw-app.zip"
+      - name: Create DMG installer
+        run: bash scripts/create-dmg.sh "MLX Core.app" MLXCore.dmg
 
       # ── Package final artifacts ──
       - name: Package CLI tarball
@@ -213,4 +213,4 @@ jobs:
           generate_release_notes: true
           files: |
             mlx-serve-bin-macos-arm64.tar.gz
-            MLXClaw-app.zip
+            MLXCore.dmg

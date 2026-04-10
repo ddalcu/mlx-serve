@@ -1,18 +1,18 @@
 #!/bin/bash
-# End-to-end test for MLX Claw app via AppleScript UI automation + API monitoring.
+# End-to-end test for MLX Core app via AppleScript UI automation + API monitoring.
 #
 # Requires:
-#   - MLX Claw app running with a model loaded
+#   - MLX Core app running with a model loaded
 #   - Accessibility permissions for Terminal (System Settings → Privacy → Accessibility)
 #
 # What it does:
-#   1. Opens a chat window in MLX Claw
+#   1. Opens a chat window in MLX Core
 #   2. Enables agent mode
 #   3. Types test prompts and sends them
 #   4. Monitors server logs, chat history, and API requests
 #   5. Validates tool calls and responses
 #
-# Usage: ./tests/test_mlxclaw.sh [port]
+# Usage: ./tests/test_mlxcore.sh [port]
 
 set -uo pipefail
 
@@ -20,7 +20,7 @@ PORT=${1:-8080}
 BASE="http://127.0.0.1:$PORT"
 HISTORY="$HOME/.mlx-serve/chat-history.json"
 LAST_REQ="$HOME/.mlx-serve/last-agent-request.json"
-LOG_FILE="/tmp/mlxclaw-test.log"
+LOG_FILE="/tmp/mlxcore-test.log"
 GREEN='\033[0;32m'
 RED='\033[0;31m'
 YELLOW='\033[0;33m'
@@ -36,7 +36,7 @@ pass() { PASS=$((PASS+1)); echo -e "  ${GREEN}PASS${NC} $1" | tee -a "$LOG_FILE"
 fail() { FAIL=$((FAIL+1)); echo -e "  ${RED}FAIL${NC} $1" | tee -a "$LOG_FILE"; [ -n "${2:-}" ] && echo "    $2" | tee -a "$LOG_FILE"; }
 
 echo "═══════════════════════════════════════════════"
-echo "  MLX Claw End-to-End Test"
+echo "  MLX Core End-to-End Test"
 echo "═══════════════════════════════════════════════"
 echo ""
 
@@ -44,22 +44,22 @@ echo ""
 log "Checking prerequisites..."
 
 # App running?
-if ! pgrep -q MLXClaw; then
-    echo -e "${RED}MLX Claw is not running. Launch it first.${NC}"
+if ! pgrep -q MLXCore; then
+    echo -e "${RED}MLX Core is not running. Launch it first.${NC}"
     exit 1
 fi
-pass "MLX Claw app is running"
+pass "MLX Core app is running"
 
 # Server running?
 if curl -sf "$BASE/health" > /dev/null 2>&1; then
     pass "Server is healthy on port $PORT"
 else
-    fail "Server not responding on port $PORT" "Start a model in MLX Claw first"
+    fail "Server not responding on port $PORT" "Start a model in MLX Core first"
     exit 1
 fi
 
 # Check accessibility
-if osascript -e 'tell application "System Events" to get name of process "MLXClaw"' &>/dev/null; then
+if osascript -e 'tell application "System Events" to get name of process "MLXCore"' &>/dev/null; then
     pass "Accessibility access granted"
     HAS_ACCESSIBILITY=true
 else
@@ -131,10 +131,10 @@ send_chat_message() {
     local message="$1"
     if [ "$HAS_ACCESSIBILITY" = "true" ]; then
         osascript <<EOF
-tell application "MLX Claw" to activate
+tell application "MLX Core" to activate
 delay 0.5
 tell application "System Events"
-    tell process "MLXClaw"
+    tell process "MLXCore"
         -- Click on the text field (chat input)
         keystroke "$message"
         delay 0.3
@@ -153,10 +153,10 @@ EOF
 new_chat_session() {
     if [ "$HAS_ACCESSIBILITY" = "true" ]; then
         osascript <<EOF
-tell application "MLX Claw" to activate
+tell application "MLX Core" to activate
 delay 0.5
 tell application "System Events"
-    tell process "MLXClaw"
+    tell process "MLXCore"
         -- Cmd+N for new chat
         keystroke "n" using command down
         delay 0.5
@@ -383,10 +383,10 @@ else
     fail "mlx-serve process still alive" "process died during testing"
 fi
 
-if pgrep -q MLXClaw; then
-    pass "MLXClaw process still alive"
+if pgrep -q MLXCore; then
+    pass "MLXCore process still alive"
 else
-    fail "MLXClaw process still alive" "app crashed during testing"
+    fail "MLXCore process still alive" "app crashed during testing"
 fi
 
 # ── Summary ──

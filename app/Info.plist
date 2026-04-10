@@ -3,23 +3,23 @@
 <plist version="1.0">
 <dict>
 	<key>CFBundleDisplayName</key>
-	<string>MLX Claw</string>
+	<string>MLX Core</string>
 	<key>CFBundleExecutable</key>
-	<string>MLXClaw</string>
+	<string>MLXCore</string>
 	<key>CFBundleIconFile</key>
 	<string>AppIcon</string>
 	<key>CFBundleIdentifier</key>
-	<string>com.dalcu.mlx-claw</string>
+	<string>com.dalcu.mlx-core</string>
 	<key>CFBundleInfoDictionaryVersion</key>
 	<string>6.0</string>
 	<key>CFBundleName</key>
-	<string>MLX Claw</string>
+	<string>MLX Core</string>
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>2026.4.8</string>
+	<string>2026.4.9</string>
 	<key>CFBundleVersion</key>
-	<string>2026.4.8</string>
+	<string>2026.4.9</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>14.0</string>
 	<key>LSUIElement</key>
@@ -30,7 +30,7 @@
 		<true/>
 	</dict>
 	<key>NSAppleEventsUsageDescription</key>
-	<string>MLX Claw uses AppleScript to control Safari and other apps in agent mode.</string>
+	<string>MLX Core uses AppleScript to control Safari and other apps in agent mode.</string>
 	<key>NSHumanReadableCopyright</key>
 	<string>Copyright 2026 David Dalcu. All rights reserved.</string>
 </dict>

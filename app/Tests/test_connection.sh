@@ -44,17 +44,17 @@ text = '''summarize this: <?xml version=\"1.0\" encoding=\"UTF-8\"?>
 <plist version=\"1.0\">
 <dict>
     <key>CFBundleName</key>
-    <string>MLX Claw</string>
+    <string>MLX Core</string>
     <key>CFBundleDisplayName</key>
-    <string>MLX Claw</string>
+    <string>MLX Core</string>
     <key>CFBundleIdentifier</key>
-    <string>com.dalcu.mlx-claw</string>
+    <string>com.dalcu.mlx-core</string>
     <key>CFBundleVersion</key>
     <string>1.0.0</string>
     <key>CFBundleShortVersionString</key>
     <string>1.0.0</string>
     <key>CFBundleExecutable</key>
-    <string>MLXClaw</string>
+    <string>MLXCore</string>
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>CFBundleInfoDictionaryVersion</key>
@@ -71,7 +71,7 @@ text = '''summarize this: <?xml version=\"1.0\" encoding=\"UTF-8\"?>
         <true/>
     </dict>
     <key>NSAppleEventsUsageDescription</key>
-    <string>MLX Claw uses AppleScript to control Safari and other apps in agent mode.</string>
+    <string>MLX Core uses AppleScript to control Safari and other apps in agent mode.</string>
     <key>NSHumanReadableCopyright</key>
     <string>Copyright 2026 David Dalcu. All rights reserved.</string>
 </dict>

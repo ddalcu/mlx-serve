@@ -2,12 +2,12 @@ import SwiftUI
 import AppKit
 
 @main
-struct MLXClawApp: App {
+struct MLXCoreApp: App {
     private static let menuBarIcon: NSImage = {
         // Try Bundle.main (works in .app bundles) then SPM bundle (works in dev builds)
         let candidates: [URL?] = [
             Bundle.main.resourceURL?.appendingPathComponent("tray.png"),
-            Bundle.main.bundleURL.appendingPathComponent("MLXClaw_MLXClaw.bundle/Resources/tray.png"),
+            Bundle.main.bundleURL.appendingPathComponent("MLXCore_MLXCore.bundle/Resources/tray.png"),
         ]
         for case let url? in candidates {
             if let img = NSImage(contentsOf: url) {
@@ -16,7 +16,7 @@ struct MLXClawApp: App {
                 return img
             }
         }
-        return NSImage(systemSymbolName: "brain.head.profile", accessibilityDescription: "MLX Claw")!
+        return NSImage(systemSymbolName: "brain.head.profile", accessibilityDescription: "MLX Core")!
     }()
 
     @StateObject private var appState = AppState()
@@ -27,7 +27,7 @@ struct MLXClawApp: App {
         NSApplication.shared.activate(ignoringOtherApps: true)
         // Bring the specific window to front
         DispatchQueue.main.async {
-            let title = id == "chat" ? "MLX Claw" : "Browser"
+            let title = id == "chat" ? "MLX Core" : "Browser"
             NSApplication.shared.windows
                 .first { $0.title == title }?
                 .makeKeyAndOrderFront(nil)
@@ -45,7 +45,7 @@ struct MLXClawApp: App {
         }
         .menuBarExtraStyle(.window)
 
-        Window("MLX Claw", id: "chat") {
+        Window("MLX Core", id: "chat") {
             ChatView()
                 .environmentObject(appState)
                 .environmentObject(appState.server)

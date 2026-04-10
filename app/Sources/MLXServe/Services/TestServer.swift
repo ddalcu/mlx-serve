@@ -5,16 +5,23 @@ import Foundation
 /// (streaming, tool calling, tool execution, history management) without UI automation.
 ///
 /// Endpoints:
-///   POST /test/chat     — Send a message in chat mode (no tools)
-///   POST /test/agent    — Send a message in agent mode (with tool calling loop)
-///   POST /test/reset    — Clear chat history and start fresh
-///   GET  /test/history  — Get current chat session messages
-///   GET  /test/status   — Get server/model status
+///   POST /test/chat          — Send a message in chat mode (no tools)
+///   POST /test/agent         — Start agent job (non-blocking, returns job_id)
+///   GET  /test/agent/status  — Poll agent job progress/result
+///   POST /test/reset         — Clear chat history and start fresh
+///   GET  /test/history       — Get current chat session messages
+///   GET  /test/status        — Get server/model status
 @MainActor
 class TestServer {
     private var listener: Task<Void, Never>?
     private let port: UInt16 = 8090
     weak var appState: AppState?
+
+    /// Background agent job state — allows non-blocking /test/agent requests
+    private var agentJobId: String?
+    private var agentJobResult: [String: Any]?
+    private var agentJobRunning = false
+    private var agentJobTask: Task<Void, Never>?
 
     func start(appState: AppState) {
         self.appState = appState
@@ -140,7 +147,9 @@ class TestServer {
                             case ("POST", "/test/chat"):
                                 responseBody = await self.handleChat(body: body)
                             case ("POST", "/test/agent"):
-                                responseBody = await self.handleAgent(body: body)
+                                responseBody = self.startAgentJob(body: body)
+                            case ("GET", "/test/agent/status"):
+                                responseBody = self.getAgentJobStatus()
                             default:
                                 responseBody = self.jsonResponse(["error": "Not found: \(method) \(path)"])
                             }
@@ -337,6 +346,40 @@ class TestServer {
         return jsonResponse(["status": "ok", "content": finalContent])
     }
 
+    /// Start agent job in a background Task so it doesn't block other endpoints.
+    private func startAgentJob(body: String) -> String {
+        if agentJobRunning {
+            return jsonResponse(["status": "busy", "job_id": agentJobId ?? ""])
+        }
+        let jobId = UUID().uuidString
+        agentJobId = jobId
+        agentJobResult = nil
+        agentJobRunning = true
+
+        agentJobTask = Task { [weak self] in
+            guard let self else { return }
+            let result = await self.handleAgent(body: body)
+            self.agentJobResult = (try? JSONSerialization.jsonObject(with: result.data(using: .utf8) ?? Data())) as? [String: Any]
+            self.agentJobRunning = false
+        }
+
+        return jsonResponse(["status": "started", "job_id": jobId])
+    }
+
+    /// Poll for agent job result.
+    private func getAgentJobStatus() -> String {
+        if agentJobRunning {
+            // Include current round count from session history for progress monitoring
+            let msgCount = appState?.chatSessions
+                .first(where: { $0.id == appState?.activeChatId })?.messages.count ?? 0
+            return jsonResponse(["status": "running", "job_id": agentJobId ?? "", "message_count": msgCount])
+        }
+        if let result = agentJobResult {
+            return jsonResponse(result)
+        }
+        return jsonResponse(["status": "idle"])
+    }
+
     private func handleAgent(body: String) async -> String {
         guard let appState else { return jsonError("No app state") }
         if case .running = appState.server.status {
@@ -384,8 +427,10 @@ class TestServer {
             .writeFile: WriteFileHandler(),
             .editFile: EditFileHandler(),
             .searchFiles: SearchFilesHandler(),
+            .listFiles: ListFilesHandler(),
             .browse: BrowseHandler(),
             .webSearch: WebSearchHandler(),
+            .saveMemory: SaveMemoryHandler(),
         ]
 
         for iteration in 0..<maxIterations {
@@ -505,12 +550,12 @@ class TestServer {
                 appState.appendMessage(to: sessionId, message: resultMsg)
             }
 
-            // Add tool results to history
+            // Add tool results to history with overflow-to-disk truncation
             for tr in toolResults {
                 var toolMsg = ChatMessage(role: .system, content: "")
                 toolMsg.toolCallId = tr.id
                 toolMsg.toolName = tr.name
-                toolMsg.content = String(tr.output.prefix(2000))
+                toolMsg.content = ChatDetailView.truncateWithOverflow(tr.output, toolCallId: tr.id, toolName: tr.name)
                 appState.appendMessage(to: sessionId, message: toolMsg)
             }
 

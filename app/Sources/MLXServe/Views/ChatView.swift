@@ -1,6 +1,11 @@
 import SwiftUI
 
-private struct ScrollOffsetKey: PreferenceKey {
+private struct ContentBottomKey: PreferenceKey {
+    static var defaultValue: CGFloat = 0
+    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = nextValue() }
+}
+
+private struct ScrollViewHeightKey: PreferenceKey {
     static var defaultValue: CGFloat = 0
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = nextValue() }
 }
@@ -140,6 +145,8 @@ struct ChatDetailView: View {
     @State private var executingPlanMessageId: UUID?
     @State private var generationTask: Task<Void, Never>?
     @State private var isNearBottom = true
+    @State private var scrollViewHeight: CGFloat = 0
+    @State private var scrollMonitor: Any?
     @FocusState private var inputFocused: Bool
 
 
@@ -166,21 +173,27 @@ struct ChatDetailView: View {
                     .background(
                         GeometryReader { content in
                             Color.clear.preference(
-                                key: ScrollOffsetKey.self,
+                                key: ContentBottomKey.self,
                                 value: content.frame(in: .named("chatScroll")).maxY
                             )
                         }
                     )
                 }
                 .coordinateSpace(name: "chatScroll")
-                .onPreferenceChange(ScrollOffsetKey.self) { maxY in
-                    // Content maxY relative to the scroll view frame:
-                    // when scrolled to bottom, maxY ≈ scroll view height.
-                    // "near bottom" = within 5% of the total content height.
-                    if let height = NSApp.keyWindow?.contentView?.frame.height {
-                        let threshold = height * 0.05
-                        isNearBottom = maxY < height + threshold
+                .background(
+                    GeometryReader { scrollFrame in
+                        Color.clear.preference(
+                            key: ScrollViewHeightKey.self,
+                            value: scrollFrame.size.height
+                        )
                     }
+                )
+                .onPreferenceChange(ScrollViewHeightKey.self) { scrollViewHeight = $0 }
+                .onPreferenceChange(ContentBottomKey.self) { contentBottom in
+                    guard scrollViewHeight > 0 else { return }
+                    let overshoot = contentBottom - scrollViewHeight
+                    // Re-engage auto-scroll only when user scrolls back to bottom
+                    if overshoot < 60 { isNearBottom = true }
                 }
                 .onChange(of: session?.messages.count) { _, _ in
                     if isNearBottom { scrollToBottom(proxy) }
@@ -292,6 +305,16 @@ struct ChatDetailView: View {
                 }
             }
             ToolbarItem(placement: .automatic) {
+                if isAgentMode && server.status == .running {
+                    Button {
+                        launchClaudeCodeWithPicker()
+                    } label: {
+                        ClaudeIcon(size: 12)
+                    }
+                    .help("Launch Claude Code")
+                }
+            }
+            ToolbarItem(placement: .automatic) {
                 Circle()
                     .fill(server.status == .running ? .green : .red)
                     .frame(width: 8, height: 8)
@@ -302,10 +325,22 @@ struct ChatDetailView: View {
         .onAppear {
             inputFocused = true
             isAgentMode = session?.mode == .agent
+            scrollMonitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { event in
+                // Only disengage on upward scroll (viewing earlier messages).
+                // Scrolling down toward the bottom lets the preference handler re-engage.
+                if event.scrollingDeltaY > 0 {
+                    isNearBottom = false
+                }
+                return event
+            }
         }
         .onDisappear {
             generationTask?.cancel()
             generationTask = nil
+            if let monitor = scrollMonitor {
+                NSEvent.removeMonitor(monitor)
+                scrollMonitor = nil
+            }
         }
         .onChange(of: isAgentMode) { _, newValue in
             if let idx = appState.chatSessions.firstIndex(where: { $0.id == sessionId }) {
@@ -449,12 +484,28 @@ struct ChatDetailView: View {
         }
     }
 
+    /// Show folder picker and launch Claude Code in the selected directory.
+    private func launchClaudeCodeWithPicker() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Open"
+        panel.message = "Select working directory for Claude Code"
+        // Default to session's working directory if set
+        if let wd = session?.workingDirectory {
+            panel.directoryURL = URL(fileURLWithPath: wd)
+        }
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        launchClaudeCode(baseURL: server.baseURL, workingDirectory: url.path)
+    }
+
     /// Agent loop: call model with tools (streaming), execute tool calls, feed results back, repeat.
-    /// Stops when the model responds with content (no tool calls) or after 30 iterations.
+    /// Stops when the model responds with content (no tool calls) or after 150 iterations.
     private func runAgentLoop(api: APIClient, workingDirectory: String?) async throws {
-        let maxIterations = 30
+        let maxIterations = 150
         var padRetries = 0
-        let maxPadRetries = 2
+        let padRetryPolicy = RetryPolicy.aggressive
 
         for _ in 0..<maxIterations {
             try Task.checkCancellation()
@@ -463,7 +514,10 @@ struct ChatDetailView: View {
             var history = buildAgentHistory()
             let userMsg = history.last { ($0["role"] as? String) == "user" }?["content"] as? String ?? ""
             let skills = AgentPrompt.skillManager.matchingSkills(for: userMsg)
-            let systemPrompt = AgentPrompt.systemPrompt + skills + AgentPrompt.memory + appState.agentMemory.contextSnippet()
+            var systemPrompt = AgentPrompt.systemPrompt + skills + AgentPrompt.memory + appState.agentMemory.contextSnippet()
+            if let wd = workingDirectory {
+                systemPrompt += "\n\n# Working Directory\nYour working directory is `\(wd)`. All relative paths resolve against it. Use relative paths for files inside this directory. Shell commands run here by default."
+            }
             var messages: [[String: Any]] = [["role": "system", "content": systemPrompt]]
             // Some models (e.g. Gemma 4 E4B) can't generate after tool results without
             // a user message. Add a nudge so the model knows to synthesize a response.
@@ -534,8 +588,10 @@ struct ChatDetailView: View {
                         appState.chatSessions[sIdx].messages.removeLast()
                     }
                     padRetries += 1
-                    if padRetries <= maxPadRetries {
-                        continue // retry
+                    if padRetries <= padRetryPolicy.maxRetries {
+                        let delay = padRetryPolicy.delay(for: padRetries)
+                        try? await Task.sleep(nanoseconds: delay)
+                        continue // retry with backoff
                     }
                     // Give up — show error
                     let errorMsg = ChatMessage(role: .assistant, content: "The model couldn't generate a response. Try rephrasing or starting a new chat.")
@@ -616,7 +672,7 @@ struct ChatDetailView: View {
                 var toolMsg = ChatMessage(role: .system, content: "")
                 toolMsg.toolCallId = tr.id
                 toolMsg.toolName = tr.name
-                toolMsg.content = String(tr.output.prefix(2000))
+                toolMsg.content = Self.truncateWithOverflow(tr.output, toolCallId: tr.id, toolName: tr.name)
                 appState.appendMessage(to: sessionId, message: toolMsg)
             }
         }
@@ -626,20 +682,117 @@ struct ChatDetailView: View {
         appState.appendMessage(to: sessionId, message: msg)
     }
 
+    // MARK: - Tool Result Overflow
+
+    /// Per-tool context caps (chars). Oversized results are saved to disk.
+    static let toolResultCaps: [String: Int] = [
+        "shell": 6000,
+        "readFile": 8000,
+        "searchFiles": 4000,
+        "listFiles": 4000,
+        "webSearch": 2000,
+        "browse": 3000,
+        "editFile": 2000,
+        "writeFile": 2000,
+        "saveMemory": 500,
+    ]
+
+    /// Truncate tool output, saving full result to disk if oversized.
+    /// Returns the (possibly truncated) output for context inclusion.
+    static func truncateWithOverflow(_ output: String, toolCallId: String, toolName: String) -> String {
+        let maxChars = toolResultCaps[toolName] ?? 4000
+        guard output.count > maxChars else { return output }
+
+        let dir = NSString(string: "~/.mlx-serve/tool-output").expandingTildeInPath
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true, attributes: nil)
+        let path = (dir as NSString).appendingPathComponent("\(toolCallId).txt")
+        try? output.write(toFile: path, atomically: true, encoding: .utf8)
+
+        let preview = String(output.prefix(maxChars - 200))
+        return "\(preview)\n\n[... truncated at \(maxChars) chars. Full output (\(output.count) chars) saved to: \(path) — use readFile to see the rest]"
+    }
+
+    /// Clean up overflow files older than 24 hours. Called on session start.
+    static func cleanupOverflowFiles() {
+        let dir = NSString(string: "~/.mlx-serve/tool-output").expandingTildeInPath
+        let fm = FileManager.default
+        guard let files = try? fm.contentsOfDirectory(atPath: dir) else { return }
+        let cutoff = Date().addingTimeInterval(-86400)
+        for file in files {
+            let path = (dir as NSString).appendingPathComponent(file)
+            if let attrs = try? fm.attributesOfItem(atPath: path),
+               let modified = attrs[.modificationDate] as? Date,
+               modified < cutoff {
+                try? fm.removeItem(atPath: path)
+            }
+        }
+    }
+
+    // MARK: - Token-Aware Context Management
+
+    /// Rough token estimation: ~4 bytes per token (no tokenizer needed).
+    private func roughTokenCount(_ s: String) -> Int {
+        max(1, s.utf8.count / 4)
+    }
+
+    /// Estimate token cost for a message including role/format overhead.
+    private func tokenCostForMessage(_ msg: ChatMessage) -> Int {
+        var cost = 4  // role + formatting envelope
+        cost += roughTokenCount(msg.content)
+        if let tcs = msg.toolCalls {
+            for tc in tcs {
+                cost += roughTokenCount(tc.name) + roughTokenCount(tc.arguments) + 8
+            }
+        }
+        return cost
+    }
+
+    /// Determine effective context length from user config or model metadata.
+    private var effectiveContextLength: Int {
+        if appState.contextSize > 0 { return appState.contextSize }
+        if let modelCtx = server.modelInfo?.contextLength, modelCtx > 0 { return modelCtx }
+        return 32768  // safe default
+    }
+
     private func buildAgentHistory() -> [[String: Any]] {
         let allMessages = session?.messages ?? []
 
-        // Always include the first user message (the original task) so the model
-        // never loses context even in deep agent loops.
+        // Compute token budget for history
+        let contextLength = effectiveContextLength
+        let safetyBuffer = 1024
+        // System prompt is assembled in runAgentLoop; estimate its cost here
+        let systemPromptCost = roughTokenCount(AgentPrompt.systemPrompt + AgentPrompt.memory)
+        let budget = max(1024, contextLength - appState.maxTokens - safetyBuffer - systemPromptCost)
+
+        // Always pin the first user message (the original task)
         let firstUserIdx = allMessages.firstIndex { $0.role == .user && $0.toolCallId == nil }
+        var pinnedCost = 0
+        if let idx = firstUserIdx {
+            pinnedCost = roughTokenCount(allMessages[idx].content) + 4
+        }
 
-        // Take the last 28 messages (reserving room for the pinned first user message)
-        let windowStart = max(0, allMessages.count - 28)
-        let window = Array(allMessages.suffix(28))
+        // Walk backward from newest message, accumulating token costs
+        var remainingBudget = budget - pinnedCost
+        var includeStartIdx = allMessages.count  // exclusive start (will walk backward)
 
-        let needsPin = firstUserIdx != nil && firstUserIdx! < windowStart
+        for i in stride(from: allMessages.count - 1, through: 0, by: -1) {
+            let msg = allMessages[i]
+            // Skip messages that won't be included in history
+            if msg.role == .system && msg.toolCallId == nil { continue }
+            if msg.isAgentSummary { continue }
+            if msg.role == .assistant && msg.content.contains("couldn't generate a response") { continue }
 
-        // Count tool results in window for progressive truncation
+            let cost = tokenCostForMessage(msg)
+            if cost > remainingBudget { break }
+            remainingBudget -= cost
+            includeStartIdx = i
+        }
+
+        // Determine if first user message needs pinning (fell outside included range)
+        let needsPin = firstUserIdx != nil && firstUserIdx! < includeStartIdx
+
+        // Count tool results in included range for progressive truncation
+        let window = Array(allMessages[includeStartIdx..<allMessages.count])
         let totalToolResults = window.filter { $0.toolCallId != nil }.count
         var toolResultsSeen = 0
 
@@ -665,7 +818,6 @@ struct ChatDetailView: View {
             }
             if msg.role == .system { continue }
             if msg.isAgentSummary { continue }
-            // Skip error messages from failed generations — they confuse the model
             if msg.role == .assistant && msg.content.contains("couldn't generate a response") { continue }
 
             // Assistant messages with tool_calls: include tool_calls in OpenAI format
@@ -737,6 +889,7 @@ struct ChatDetailView: View {
             .writeFile: WriteFileHandler(),
             .editFile: EditFileHandler(),
             .searchFiles: SearchFilesHandler(),
+            .listFiles: ListFilesHandler(),
             .browse: BrowseHandler(),
             .webSearch: WebSearchHandler(),
             .saveMemory: SaveMemoryHandler(),

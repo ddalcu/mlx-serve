@@ -10,36 +10,84 @@ enum AgentPrompt {
     private static let memoryPath = (mlxServeDir as NSString).appendingPathComponent("memory.md")
 
     private static let defaultPromptFile = """
-        # System Prompt
+        # System
 
-        You are an autonomous macOS agent. Act independently to complete tasks — do not ask the user for confirmation or permission between steps.
-        When a task requires multiple steps, execute them all without pausing.
-        If a command fails, diagnose the issue and retry with a corrected approach.
-        If you need information, use your tools to find it rather than asking the user.
-        Only respond to the user when the task is fully complete or if you hit a genuine ambiguity that cannot be resolved with tools.
-        Tool arguments must be JSON: {"key": "value"}. Never omit required parameters.
+        You are an autonomous macOS agent running on Apple Silicon. Act independently to complete tasks — do not ask the user for confirmation between steps. Execute multi-step tasks without pausing. Only respond to the user when the task is fully complete or if you hit a genuine ambiguity that cannot be resolved with tools.
 
-        You have a `saveMemory` tool — use it to remember important context: user preferences, project details, recurring patterns, or anything that would help in future conversations. Memories persist across sessions.
+        # Using Your Tools
 
-        ## Soul
+        IMPORTANT: Use dedicated tools instead of shell equivalents:
+        - readFile instead of `cat`, `head`, `tail`
+        - writeFile instead of `echo >` or `cat <<EOF`
+        - editFile instead of `sed` or `awk`
+        - searchFiles instead of `grep` or `rg`
+        - listFiles instead of `find` or `ls -R`
+
+        Use shell only for: build/test commands, git operations, process management, installing packages, and commands with no dedicated tool equivalent.
+
+        Tool arguments must be valid JSON: {"key": "value"}. Never omit required parameters.
+
+        # File Editing Rules
+
+        - ALWAYS readFile before editFile — you must see the exact text to match
+        - readFile shows line numbers as "N| text". The `find` param must match the actual text AFTER the "N| " prefix, not including the line number
+        - The `find` parameter must match the file content exactly, including whitespace and indentation
+        - If editFile fails with "Pattern not found", readFile again to check the actual content
+        - For large files, readFile shows a header with total line count. Use startLine/endLine to read the section you need to edit
+        - writeFile overwrites the entire file — use editFile for partial modifications
+
+        # Error Recovery
+
+        - When a tool fails: 1) Read the error message 2) Check your parameters 3) Try a different approach
+        - Do NOT repeat the same failing call with identical parameters
+        - If a shell command fails, check the exit code and stderr for clues
+        - If a file can't be read, verify the path exists with listFiles
+
+        # Output Style
+
+        - Be concise. Lead with actions, not reasoning
+        - Don't narrate what you're about to do — just do it
+        - When done, briefly summarize: what changed, which files, what to verify
+
+        # Memory
+
+        You have a saveMemory tool — use it to remember important context: user preferences, project details, recurring patterns. Memories persist across sessions.
+
+        # Soul
 
         You are precise, resourceful, and action-oriented. You prefer doing over discussing.
-        You treat the user's time as valuable — don't narrate what you're about to do, just do it.
-        When you encounter obstacles, you adapt and find a way forward.
+        You treat the user's time as valuable. When you encounter obstacles, you adapt and find a way forward.
         You are honest about limitations and errors rather than hiding them.
         """
 
-    /// Load system prompt from `~/.mlx-serve/system-prompt.md`, seeding the file on first run.
+    private static let defaultUserPromptFile = """
+        # Custom Instructions
+        Add your project-specific rules, preferences, or personality tweaks here.
+        These are appended to the base system prompt.
+        """
+
+    /// Load system prompt: hardcoded base + additive user customizations from `~/.mlx-serve/system-prompt.md`.
     static var systemPrompt: String {
-        ensureFile(at: promptPath, defaultContent: defaultPromptFile)
-        return (try? String(contentsOfFile: promptPath, encoding: .utf8)) ?? defaultPromptFile
+        var prompt = defaultPromptFile
+        ensureFile(at: promptPath, defaultContent: defaultUserPromptFile)
+        let userPrompt = (try? String(contentsOfFile: promptPath, encoding: .utf8))?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        if !userPrompt.isEmpty {
+            prompt += "\n\n# User Instructions\n" + userPrompt
+        }
+        return prompt
     }
 
-    /// Load persistent memory from `~/.mlx-serve/memory.md`.
+    /// Load persistent memory from `~/.mlx-serve/memory.md`, capped at last 30 entries / ~2000 chars.
     static var memory: String {
         ensureFile(at: memoryPath, defaultContent: "")
         let content = (try? String(contentsOfFile: memoryPath, encoding: .utf8))?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        return content.isEmpty ? "" : "\n[Memories]\n\(content)"
+        guard !content.isEmpty else { return "" }
+        // Keep only the last 30 entries to avoid bloating context
+        let lines = content.components(separatedBy: "\n").filter { !$0.isEmpty }
+        let capped = lines.suffix(30).joined(separator: "\n")
+        let truncated = String(capped.prefix(2000))
+        return "\n[Memories]\n\(truncated)"
     }
 
     /// Append a memory entry to `~/.mlx-serve/memory.md`.
@@ -88,11 +136,11 @@ enum AgentPrompt {
             "type": "function",
             "function": [
                 "name": "writeFile",
-                "description": "Write content to a file. Example: {\"path\": \"/tmp/f.txt\", \"content\": \"hello\"}",
+                "description": "Write content to a file (overwrites entire file). Use editFile for partial modifications. Example: {\"path\": \"src/main.swift\", \"content\": \"hello\"}",
                 "parameters": [
                     "type": "object",
                     "properties": [
-                        "path": ["type": "string", "description": "Absolute file path"],
+                        "path": ["type": "string", "description": "File path (relative to working directory, or absolute)"],
                         "content": ["type": "string", "description": "File content to write"]
                     ],
                     "required": ["path", "content"]
@@ -103,10 +151,14 @@ enum AgentPrompt {
             "type": "function",
             "function": [
                 "name": "readFile",
-                "description": "Read a file's contents. Example: {\"path\": \"/tmp/f.txt\"}",
+                "description": "Read a file's contents with optional line range. For large files, use startLine/endLine to read specific sections. Example: {\"path\": \"src/main.swift\", \"startLine\": \"10\", \"endLine\": \"50\"}",
                 "parameters": [
                     "type": "object",
-                    "properties": ["path": ["type": "string", "description": "Absolute file path to read"]],
+                    "properties": [
+                        "path": ["type": "string", "description": "File path (relative to working directory, or absolute)"],
+                        "startLine": ["type": "string", "description": "First line to read (1-based, default: 1)"],
+                        "endLine": ["type": "string", "description": "Last line to read (default: end of file)"]
+                    ],
                     "required": ["path"]
                 ]
             ] as [String: Any]
@@ -115,12 +167,12 @@ enum AgentPrompt {
             "type": "function",
             "function": [
                 "name": "editFile",
-                "description": "Find and replace text in a file. Example: {\"path\": \"/tmp/f.txt\", \"find\": \"old\", \"replace\": \"new\"}",
+                "description": "Find and replace text in a file. You MUST provide all three params: path, find, replace. The find string must match the file content exactly. Always readFile first. Example: {\"path\": \"src/main.swift\", \"find\": \"old text\", \"replace\": \"new text\"}",
                 "parameters": [
                     "type": "object",
                     "properties": [
-                        "path": ["type": "string", "description": "Absolute file path"],
-                        "find": ["type": "string", "description": "Text to find"],
+                        "path": ["type": "string", "description": "File path (relative to working directory, or absolute)"],
+                        "find": ["type": "string", "description": "Exact text to find (must match file content)"],
                         "replace": ["type": "string", "description": "Replacement text"]
                     ],
                     "required": ["path", "find", "replace"]
@@ -131,11 +183,33 @@ enum AgentPrompt {
             "type": "function",
             "function": [
                 "name": "searchFiles",
-                "description": "Search files for a text pattern (grep). Example: {\"pattern\": \"TODO\"}",
+                "description": "Search file contents for a pattern (uses ripgrep if available). Returns matching lines with file paths and line numbers. Example: {\"pattern\": \"TODO\", \"include\": \"*.swift\"}",
                 "parameters": [
                     "type": "object",
-                    "properties": ["pattern": ["type": "string", "description": "Text pattern to search for"]],
+                    "properties": [
+                        "pattern": ["type": "string", "description": "Text or regex pattern to search for"],
+                        "path": ["type": "string", "description": "Directory to search in (default: working directory)"],
+                        "include": ["type": "string", "description": "File glob filter (e.g. '*.swift', '*.ts')"],
+                        "context": ["type": "string", "description": "Number of context lines around matches (0-10, default: 0)"],
+                        "maxResults": ["type": "string", "description": "Max matches to return (default: 100)"]
+                    ],
                     "required": ["pattern"]
+                ]
+            ] as [String: Any]
+        ],
+        [
+            "type": "function",
+            "function": [
+                "name": "listFiles",
+                "description": "List files and directories. Use to explore project structure instead of shell ls/find. Returns paths matching the optional glob pattern. Example: {\"path\": \"src\", \"pattern\": \"*.swift\", \"recursive\": \"true\"}",
+                "parameters": [
+                    "type": "object",
+                    "properties": [
+                        "path": ["type": "string", "description": "Directory to list (default: working directory)"],
+                        "pattern": ["type": "string", "description": "Glob pattern to filter (e.g. '*.swift', '**/*.ts')"],
+                        "recursive": ["type": "string", "description": "If 'true', search recursively (default: false)"]
+                    ],
+                    "required": [] as [String]
                 ]
             ] as [String: Any]
         ],
