@@ -214,3 +214,21 @@ jobs:
           files: |
             mlx-serve-bin-macos-arm64.tar.gz
             MLXCore.dmg
+
+      - name: Update Homebrew formulas
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          DMG_SHA=$(shasum -a 256 MLXCore.dmg | awk '{print $1}')
+          CLI_SHA=$(shasum -a 256 mlx-serve-bin-macos-arm64.tar.gz | awk '{print $1}')
+
+          sed -i '' "s/version \".*\"/version \"$VERSION\"/" Casks/mlx-core.rb
+          sed -i '' "s/sha256 \".*\"/sha256 \"$DMG_SHA\"/" Casks/mlx-core.rb
+
+          sed -i '' "s/version \".*\"/version \"$VERSION\"/" Formula/mlx-serve.rb
+          sed -i '' "s/sha256 \".*\"/sha256 \"$CLI_SHA\"/" Formula/mlx-serve.rb
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Casks/mlx-core.rb Formula/mlx-serve.rb
+          git commit -m "brew: update to v$VERSION"
+          git push origin HEAD:main

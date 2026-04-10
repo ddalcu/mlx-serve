@@ -8,6 +8,14 @@ Native Zig server that runs MLX-format language models on Apple Silicon and expo
 
 [<img src="docs/appiconb.png" width="48" align="center">](https://github.com/ddalcu/mlx-serve/releases/latest) **[Download MLX Core.app](https://github.com/ddalcu/mlx-serve/releases/latest)** — latest release for macOS (Apple Silicon)
 
+### Install via Homebrew
+
+```bash
+brew tap ddalcu/mlx-serve https://github.com/ddalcu/mlx-serve
+brew install --cask mlx-core   # GUI menu bar app
+brew install mlx-serve          # CLI server only
+```
+
 ## Features
 
 - OpenAI-compatible API (`/v1/chat/completions`, `/v1/completions`, `/v1/models`)
