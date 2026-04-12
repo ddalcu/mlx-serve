@@ -1,5 +1,10 @@
 # mlx-serve
 
+[![Release](https://img.shields.io/github/v/release/ddalcu/mlx-serve?style=flat-square)](https://github.com/ddalcu/mlx-serve/releases/latest)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
+[![macOS](https://img.shields.io/badge/macOS-Apple%20Silicon-black?style=flat-square&logo=apple)](https://github.com/ddalcu/mlx-serve/releases/latest)
+[![Zig](https://img.shields.io/badge/built%20with-Zig-f7a41d?style=flat-square&logo=zig)](https://ziglang.org)
+
 **[ddalcu.github.io/mlx-serve](https://ddalcu.github.io/mlx-serve/)**
 
 Native Zig server that runs MLX-format language models on Apple Silicon and exposes OpenAI-compatible and Anthropic-compatible HTTP APIs. No Python. Comes with **MLX Core**, a macOS menu bar app with built-in chat, agent mode, and model management.
