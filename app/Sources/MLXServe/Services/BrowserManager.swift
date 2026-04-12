@@ -29,11 +29,22 @@ class BrowserManager: ObservableObject {
             throw ToolError.executionFailed("Invalid URL: \(urlString)")
         }
 
-        let navResult = try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<String, Error>) in
-            let delegate = NavigationDelegate(continuation: continuation)
-            webView.navigationDelegate = delegate
-            objc_setAssociatedObject(webView, "navDelegate", delegate, .OBJC_ASSOCIATION_RETAIN)
-            webView.load(URLRequest(url: url))
+        let navResult = try await withThrowingTaskGroup(of: String.self) { group in
+            group.addTask { @MainActor in
+                try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<String, Error>) in
+                    let delegate = NavigationDelegate(continuation: continuation)
+                    self.webView.navigationDelegate = delegate
+                    objc_setAssociatedObject(self.webView, "navDelegate", delegate, .OBJC_ASSOCIATION_RETAIN)
+                    self.webView.load(URLRequest(url: url))
+                }
+            }
+            group.addTask {
+                try await Task.sleep(nanoseconds: 30_000_000_000)
+                throw ToolError.executionFailed("Navigation timed out after 30s: \(urlString)")
+            }
+            let result = try await group.next()!
+            group.cancelAll()
+            return result
         }
 
         // Auto-read page content after navigation

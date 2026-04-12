@@ -23,18 +23,35 @@ enum AgentPrompt {
         - searchFiles instead of `grep` or `rg`
         - listFiles instead of `find` or `ls -R`
 
-        Use shell only for: build/test commands, git operations, process management, installing packages, and commands with no dedicated tool equivalent.
+        Use shell only for: build/test commands, git operations, process management, installing packages, and commands with no dedicated tool equivalent. Shell commands run as a login shell — your PATH includes user tools (node, npm, python, brew, etc.).
 
-        Tool arguments must be valid JSON: {"key": "value"}. Never omit required parameters.
+        # Workspace Confinement
+
+        All file operations (readFile, writeFile, editFile, searchFiles, listFiles) are confined to the working directory. You CANNOT read, write, or search outside it. Use relative paths — they resolve against the working directory automatically. Absolute paths are allowed only if they point inside the workspace. Do not attempt to access /tmp, /etc, ~, or any path outside the workspace — the tool will reject it.
+
+        Tool arguments must be valid JSON: {"key": "value"}. NEVER call a tool with empty arguments {}. Every tool call MUST include at least the required parameters. If you are unsure what parameters to use, use readFile or listFiles first to gather information — do not guess with empty calls.
+
+        CRITICAL: writeFile has a size limit — content longer than ~150 lines will be truncated and the write will fail. For large files (HTML pages, long scripts, etc.), use shell with a heredoc instead:
+        shell: {"command": "cat > file.html << 'HEREDOC'\n<html>...</html>\nHEREDOC"}
+        Use writeFile only for small files (< 100 lines). For anything larger, always use shell with cat heredoc. This is the most reliable approach for creating files with substantial content.
 
         # File Editing Rules
 
-        - ALWAYS readFile before editFile — you must see the exact text to match
-        - readFile shows line numbers as "N| text". The `find` param must match the actual text AFTER the "N| " prefix, not including the line number
-        - The `find` parameter must match the file content exactly, including whitespace and indentation
-        - If editFile fails with "Pattern not found", readFile again to check the actual content
-        - For large files, readFile shows a header with total line count. Use startLine/endLine to read the section you need to edit
+        - ALWAYS readFile before editFile — you must see the line numbers
+        - readFile shows line numbers as "N| text"
+        - editFile supports two modes:
+          1. **Line-based (preferred)**: provide startLine, endLine, and replace. Use line numbers from readFile output. This is the most reliable approach.
+          2. **Text-based**: provide find and replace. The find string must match file content exactly.
+        - If editFile fails, readFile the file again and use line-based editing instead
         - writeFile overwrites the entire file — use editFile for partial modifications
+
+        # Shell Rules
+
+        - Each shell command runs in a fresh login shell. `cd` does NOT persist between calls.
+        - To run a command in a subdirectory, use: `cd subdir && command` (all in one shell call)
+        - Shell output includes `[cwd: /path]` so you can see where the command ran
+        - Do NOT run long-lived processes (servers) without backgrounding them: `node server.js &`
+        - To start and test a server: `node server.js & sleep 1 && curl ... && kill %1`
 
         # Error Recovery
 
@@ -118,141 +135,32 @@ enum AgentPrompt {
         }
     }
 
-    /// OpenAI-format tool definitions with descriptions that guide parameter usage.
-    static let toolDefinitions: [[String: Any]] = [
-        [
-            "type": "function",
-            "function": [
-                "name": "shell",
-                "description": "Run a shell command. Example: {\"command\": \"ls -la /tmp\"}",
-                "parameters": [
-                    "type": "object",
-                    "properties": ["command": ["type": "string", "description": "The shell command to execute"]],
-                    "required": ["command"]
-                ]
-            ] as [String: Any]
-        ],
-        [
-            "type": "function",
-            "function": [
-                "name": "writeFile",
-                "description": "Write content to a file (overwrites entire file). Use editFile for partial modifications. Example: {\"path\": \"src/main.swift\", \"content\": \"hello\"}",
-                "parameters": [
-                    "type": "object",
-                    "properties": [
-                        "path": ["type": "string", "description": "File path (relative to working directory, or absolute)"],
-                        "content": ["type": "string", "description": "File content to write"]
-                    ],
-                    "required": ["path", "content"]
-                ]
-            ] as [String: Any]
-        ],
-        [
-            "type": "function",
-            "function": [
-                "name": "readFile",
-                "description": "Read a file's contents with optional line range. For large files, use startLine/endLine to read specific sections. Example: {\"path\": \"src/main.swift\", \"startLine\": \"10\", \"endLine\": \"50\"}",
-                "parameters": [
-                    "type": "object",
-                    "properties": [
-                        "path": ["type": "string", "description": "File path (relative to working directory, or absolute)"],
-                        "startLine": ["type": "string", "description": "First line to read (1-based, default: 1)"],
-                        "endLine": ["type": "string", "description": "Last line to read (default: end of file)"]
-                    ],
-                    "required": ["path"]
-                ]
-            ] as [String: Any]
-        ],
-        [
-            "type": "function",
-            "function": [
-                "name": "editFile",
-                "description": "Find and replace text in a file. You MUST provide all three params: path, find, replace. The find string must match the file content exactly. Always readFile first. Example: {\"path\": \"src/main.swift\", \"find\": \"old text\", \"replace\": \"new text\"}",
-                "parameters": [
-                    "type": "object",
-                    "properties": [
-                        "path": ["type": "string", "description": "File path (relative to working directory, or absolute)"],
-                        "find": ["type": "string", "description": "Exact text to find (must match file content)"],
-                        "replace": ["type": "string", "description": "Replacement text"]
-                    ],
-                    "required": ["path", "find", "replace"]
-                ]
-            ] as [String: Any]
-        ],
-        [
-            "type": "function",
-            "function": [
-                "name": "searchFiles",
-                "description": "Search file contents for a pattern (uses ripgrep if available). Returns matching lines with file paths and line numbers. Example: {\"pattern\": \"TODO\", \"include\": \"*.swift\"}",
-                "parameters": [
-                    "type": "object",
-                    "properties": [
-                        "pattern": ["type": "string", "description": "Text or regex pattern to search for"],
-                        "path": ["type": "string", "description": "Directory to search in (default: working directory)"],
-                        "include": ["type": "string", "description": "File glob filter (e.g. '*.swift', '*.ts')"],
-                        "context": ["type": "string", "description": "Number of context lines around matches (0-10, default: 0)"],
-                        "maxResults": ["type": "string", "description": "Max matches to return (default: 100)"]
-                    ],
-                    "required": ["pattern"]
-                ]
-            ] as [String: Any]
-        ],
-        [
-            "type": "function",
-            "function": [
-                "name": "listFiles",
-                "description": "List files and directories. Use to explore project structure instead of shell ls/find. Returns paths matching the optional glob pattern. Example: {\"path\": \"src\", \"pattern\": \"*.swift\", \"recursive\": \"true\"}",
-                "parameters": [
-                    "type": "object",
-                    "properties": [
-                        "path": ["type": "string", "description": "Directory to list (default: working directory)"],
-                        "pattern": ["type": "string", "description": "Glob pattern to filter (e.g. '*.swift', '**/*.ts')"],
-                        "recursive": ["type": "string", "description": "If 'true', search recursively (default: false)"]
-                    ],
-                    "required": [] as [String]
-                ]
-            ] as [String: Any]
-        ],
-        [
-            "type": "function",
-            "function": [
-                "name": "browse",
-                "description": "Browse a URL. Use action 'navigate' to load a page, then 'readText' to extract its text. Example: {\"action\": \"navigate\", \"url\": \"https://example.com\"}",
-                "parameters": [
-                    "type": "object",
-                    "properties": [
-                        "action": ["type": "string", "description": "navigate or readText"],
-                        "url": ["type": "string", "description": "URL to browse"]
-                    ],
-                    "required": ["action", "url"]
-                ]
-            ] as [String: Any]
-        ],
-        [
-            "type": "function",
-            "function": [
-                "name": "webSearch",
-                "description": "Search the web using DuckDuckGo. Example: {\"query\": \"latest news\"}",
-                "parameters": [
-                    "type": "object",
-                    "properties": ["query": ["type": "string", "description": "Search query"]],
-                    "required": ["query"]
-                ]
-            ] as [String: Any]
-        ],
-        [
-            "type": "function",
-            "function": [
-                "name": "saveMemory",
-                "description": "Save a memory for future sessions. Use for user preferences, project context, or important facts. Example: {\"memory\": \"User prefers dark mode themes\"}",
-                "parameters": [
-                    "type": "object",
-                    "properties": ["memory": ["type": "string", "description": "The memory to save"]],
-                    "required": ["memory"]
-                ]
-            ] as [String: Any]
-        ],
+    /// Pre-serialized tool definitions JSON with guaranteed property key order.
+    /// Critical: `path` appears before `content` in file tools so that if the model's
+    /// output is truncated at max_tokens, the path is already emitted.
+    static let toolDefinitionsJSON: String = #"""
+    [
+      {"type":"function","function":{"name":"shell","description":"Run a shell command. Example: {\"command\": \"ls -la /tmp\"}","parameters":{"type":"object","properties":{"command":{"type":"string","description":"The shell command to execute"}},"required":["command"]}}},
+      {"type":"function","function":{"name":"writeFile","description":"Write content to a file (overwrites). Only for SMALL files (under 100 lines). For large files use shell with cat heredoc instead. Example: {\"path\": \"src/main.swift\", \"content\": \"hello\"}","parameters":{"type":"object","properties":{"path":{"type":"string","description":"File path relative to working directory (must stay within workspace)"},"content":{"type":"string","description":"File content to write (keep under 100 lines — use shell cat heredoc for larger files)"}},"required":["path","content"]}}},
+      {"type":"function","function":{"name":"readFile","description":"Read a file's contents with optional line range. For large files, use startLine/endLine to read specific sections. Example: {\"path\": \"src/main.swift\", \"startLine\": \"10\", \"endLine\": \"50\"}","parameters":{"type":"object","properties":{"path":{"type":"string","description":"File path relative to working directory (must stay within workspace)"},"startLine":{"type":"string","description":"First line to read (1-based, default: 1)"},"endLine":{"type":"string","description":"Last line to read (default: end of file)"}},"required":["path"]}}},
+      {"type":"function","function":{"name":"editFile","description":"Edit a file. Two modes: (1) Line-based: provide path, startLine, endLine, replace — replaces those lines. (2) Text-based: provide path, find, replace — find must match exactly. Prefer line-based editing. Always readFile first to see line numbers. Example line-based: {\"path\": \"src/main.js\", \"startLine\": \"5\", \"endLine\": \"8\", \"replace\": \"new code here\"}. Example text-based: {\"path\": \"src/main.js\", \"find\": \"old text\", \"replace\": \"new text\"}","parameters":{"type":"object","properties":{"path":{"type":"string","description":"File path relative to working directory (must stay within workspace)"},"startLine":{"type":"string","description":"First line to replace (1-based, from readFile output)"},"endLine":{"type":"string","description":"Last line to replace (1-based, defaults to startLine)"},"find":{"type":"string","description":"Exact text to find (for text-based mode)"},"replace":{"type":"string","description":"Replacement text"}},"required":["path"]}}},
+      {"type":"function","function":{"name":"searchFiles","description":"Search file contents for a pattern (uses ripgrep if available). Returns matching lines with file paths and line numbers. Example: {\"pattern\": \"TODO\", \"include\": \"*.swift\"}","parameters":{"type":"object","properties":{"pattern":{"type":"string","description":"Text or regex pattern to search for"},"path":{"type":"string","description":"Directory to search in (default: working directory)"},"include":{"type":"string","description":"File glob filter (e.g. '*.swift', '*.ts')"},"context":{"type":"string","description":"Number of context lines around matches (0-10, default: 0)"},"maxResults":{"type":"string","description":"Max matches to return (default: 100)"}},"required":["pattern"]}}},
+      {"type":"function","function":{"name":"listFiles","description":"List files and directories. Use to explore project structure instead of shell ls/find. Returns paths matching the optional glob pattern. Example: {\"path\": \"src\", \"pattern\": \"*.swift\", \"recursive\": \"true\"}","parameters":{"type":"object","properties":{"path":{"type":"string","description":"Directory to list (default: working directory)"},"pattern":{"type":"string","description":"Glob pattern to filter (e.g. '*.swift', '**/*.ts')"},"recursive":{"type":"string","description":"If 'true', search recursively (default: false)"}},"required":[]}}},
+      {"type":"function","function":{"name":"browse","description":"Browse a URL. Use action 'navigate' to load a page, then 'readText' to extract its text. Example: {\"action\": \"navigate\", \"url\": \"https://example.com\"}","parameters":{"type":"object","properties":{"action":{"type":"string","description":"navigate or readText"},"url":{"type":"string","description":"URL to browse"}},"required":["action","url"]}}},
+      {"type":"function","function":{"name":"webSearch","description":"Search the web using DuckDuckGo. Example: {\"query\": \"latest news\"}","parameters":{"type":"object","properties":{"query":{"type":"string","description":"Search query"}},"required":["query"]}}},
+      {"type":"function","function":{"name":"saveMemory","description":"Save a memory for future sessions. Use for user preferences, project context, or important facts. Example: {\"memory\": \"User prefers dark mode themes\"}","parameters":{"type":"object","properties":{"memory":{"type":"string","description":"The memory to save"}},"required":["memory"]}}}
     ]
+    """#
+
+    /// Parsed tool definitions for param validation and example extraction.
+    /// Key order is NOT preserved here (Swift dictionaries); use `toolDefinitionsJSON` for API requests.
+    static let toolDefinitions: [[String: Any]] = {
+        guard let data = toolDefinitionsJSON.data(using: .utf8),
+              let arr = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
+            fatalError("Invalid toolDefinitionsJSON")
+        }
+        return arr
+    }()
 }
 
 // MARK: - Prompt-based Skills

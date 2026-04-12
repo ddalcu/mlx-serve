@@ -312,11 +312,10 @@ struct StatusMenuView: View {
                 .help("MLX Serve Folder")
 
                 Button {
-                    let ws = NSString(string: "~/.mlx-serve/workspace").expandingTildeInPath
-                    try? FileManager.default.createDirectory(atPath: ws, withIntermediateDirectories: true)
-                    launchClaudeCode(baseURL: server.baseURL, workingDirectory: ws)
+                    launchClaudeCodeWithPicker(baseURL: server.baseURL)
                 } label: {
-                    ClaudeIcon(size: 16)
+                    ClaudeIcon(size: 12)
+                        .foregroundStyle(.white)
                 }
                 .buttonStyle(.bordered)
                 .disabled(server.status != .running)
@@ -515,6 +514,21 @@ struct ContextSizeSection: View {
         if tokens >= 1024 { return "\(tokens / 1024)K" }
         return "\(tokens)"
     }
+}
+
+/// Show folder picker and launch Claude Code in the selected directory.
+func launchClaudeCodeWithPicker(baseURL: String) {
+    let panel = NSOpenPanel()
+    panel.canChooseDirectories = true
+    panel.canChooseFiles = false
+    panel.allowsMultipleSelection = false
+    panel.prompt = "Open"
+    panel.message = "Select working directory for Claude Code"
+    let defaultWS = NSString(string: "~/.mlx-serve/workspace").expandingTildeInPath
+    try? FileManager.default.createDirectory(atPath: defaultWS, withIntermediateDirectories: true)
+    panel.directoryURL = URL(fileURLWithPath: defaultWS)
+    guard panel.runModal() == .OK, let url = panel.url else { return }
+    launchClaudeCode(baseURL: baseURL, workingDirectory: url.path)
 }
 
 /// Launch Claude Code CLI configured to use the local mlx-serve server.

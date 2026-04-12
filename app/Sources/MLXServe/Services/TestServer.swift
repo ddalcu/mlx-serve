@@ -55,7 +55,7 @@ class TestServer {
                 var addr = sockaddr_in()
                 addr.sin_family = sa_family_t(AF_INET)
                 addr.sin_port = listenPort.bigEndian
-                addr.sin_addr.s_addr = INADDR_ANY
+                addr.sin_addr.s_addr = UInt32(INADDR_LOOPBACK).bigEndian
 
                 let bindResult = withUnsafePointer(to: &addr) { ptr in
                     ptr.withMemoryRebound(to: sockaddr.self, capacity: 1) { Darwin.bind(serverSocket, $0, socklen_t(MemoryLayout<sockaddr_in>.size)) }
@@ -216,6 +216,13 @@ class TestServer {
 
     private func handleReset() async -> String {
         guard let appState else { return jsonError("No app state") }
+        // Cancel any running agent job
+        agentJobTask?.cancel()
+        agentJobTask = nil
+        agentJobRunning = false
+        agentJobResult = nil
+        agentJobId = nil
+
         appState.chatSessions = []
         appState.activeChatId = nil
         let sessionId = appState.newChatSession()
@@ -330,7 +337,7 @@ class TestServer {
                     appState.updateLastMessage(in: sessionId, reasoning: text)
                 case .usage(let usage):
                     appState.updateLastMessage(in: sessionId, usage: usage)
-                case .toolCalls, .done:
+                case .toolCalls, .maxTokensReached, .done:
                     break
                 }
             }
@@ -433,6 +440,8 @@ class TestServer {
             .saveMemory: SaveMemoryHandler(),
         ]
 
+        var recentToolNames: [String] = []
+        var permanentlyBlocked: Set<String> = []
         for iteration in 0..<maxIterations {
             // Build history — same as ChatView.buildAgentHistory()
             var history = buildAgentHistory(appState: appState, sessionId: sessionId)
@@ -458,7 +467,7 @@ class TestServer {
                 maxTokens: appState.maxTokens,
                 temperature: 0.7,
                 enableThinking: enableThinking && iteration == 0,
-                tools: AgentPrompt.toolDefinitions
+                toolsJSON: AgentPrompt.toolDefinitionsJSON
             )
 
             do {
@@ -472,6 +481,8 @@ class TestServer {
                         appState.updateLastMessage(in: sessionId, usage: usage)
                     case .toolCalls(let calls):
                         receivedToolCalls = calls
+                    case .maxTokensReached:
+                        appState.updateLastMessage(in: sessionId, content: "\n\n⚠️ *Output truncated — max tokens reached.*")
                     case .done:
                         break
                     }
@@ -513,6 +524,18 @@ class TestServer {
                 }
             }
 
+            // Repetition detection: track tool names over sliding window
+            let writeTools: Set<String> = ["writeFile", "editFile", "shell"]
+            let uniqueNames = Set(receivedToolCalls.map { $0.name })
+            recentToolNames.append(contentsOf: uniqueNames)
+            if recentToolNames.count > 6 { recentToolNames = Array(recentToolNames.suffix(6)) }
+            for name in uniqueNames {
+                if recentToolNames.filter({ $0 == name }).count >= 4 && !writeTools.contains(name) {
+                    permanentlyBlocked.insert(name)
+                }
+            }
+            let blockedTools = permanentlyBlocked
+
             // Execute tools — same as ChatView
             var toolResults: [(id: String, name: String, output: String)] = []
             for tc in receivedToolCalls {
@@ -524,24 +547,27 @@ class TestServer {
                     effectiveTool = tool
                 }
 
-                // Pre-validate required params
-                let missing = Self.missingRequiredParams(for: tc.name, arguments: tc.arguments)
                 let output: String
-                if !missing.isEmpty {
-                    let example = Self.toolExample(for: tc.name)
-                    output = "Error: \(tc.name) missing required params: \(missing.joined(separator: ", ")). Example: \(example)"
-                } else if let effectiveTool, let handler = toolHandlers[effectiveTool] {
-                    do {
-                        output = try await handler.execute(parameters: tc.arguments, workingDirectory: workDir)
-                        if effectiveTool == .shell, let cmd = tc.arguments["command"] {
-                            appState.agentMemory.recordCommand(cmd)
-                        }
-                    } catch {
-                        let argsDesc = tc.arguments.isEmpty ? "none" : tc.arguments.map { "\($0.key)=\($0.value.prefix(30))" }.joined(separator: ", ")
-                        output = "Error: \(error.localizedDescription). You sent args: [\(argsDesc)]. Example: \(Self.toolExample(for: tc.name))"
-                    }
+                if blockedTools.contains(tc.name) {
+                    output = "BLOCKED: \(tc.name) has been called too many times in a row. This tool is now disabled for this task. Use writeFile to create files, readFile to read them, editFile to modify them, and shell for commands."
                 } else {
-                    output = "Error: Unknown tool '\(tc.name)'"
+                    let missing = Self.missingRequiredParams(for: tc.name, arguments: tc.arguments)
+                    if !missing.isEmpty {
+                        let example = Self.toolExample(for: tc.name)
+                        output = "Error: \(tc.name) missing required params: \(missing.joined(separator: ", ")). Example: \(example)"
+                    } else if let effectiveTool, let handler = toolHandlers[effectiveTool] {
+                        do {
+                            output = try await handler.execute(parameters: tc.arguments, workingDirectory: workDir)
+                            if effectiveTool == .shell, let cmd = tc.arguments["command"] {
+                                appState.agentMemory.recordCommand(cmd)
+                            }
+                        } catch {
+                            let argsDesc = tc.arguments.isEmpty ? "none" : tc.arguments.map { "\($0.key)=\($0.value.prefix(30))" }.joined(separator: ", ")
+                            output = "Error: \(error.localizedDescription). You sent args: [\(argsDesc)]. Example: \(Self.toolExample(for: tc.name))"
+                        }
+                    } else {
+                        output = "Error: Unknown tool '\(tc.name)'"
+                    }
                 }
                 toolResults.append((id: tc.id, name: tc.name, output: output))
 

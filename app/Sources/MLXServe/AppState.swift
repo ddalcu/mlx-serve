@@ -34,11 +34,13 @@ class AppState: ObservableObject {
         self.autoStartServer = UserDefaults.standard.bool(forKey: "autoStartServer")
         self.selectedModelPath = UserDefaults.standard.string(forKey: "selectedModelPath") ?? ""
         let stored = UserDefaults.standard.integer(forKey: "maxTokens")
-        self.maxTokens = stored > 0 ? stored : 8192
+        self.maxTokens = stored > 0 ? stored : 32768
         self.contextSize = UserDefaults.standard.integer(forKey: "contextSize") // 0 = auto
         refreshModels()
         loadChatHistory()
-        testServer.start(appState: self)
+        if ProcessInfo.processInfo.environment["TESTING_MODE"] != nil {
+            testServer.start(appState: self)
+        }
         ChatDetailView.cleanupOverflowFiles()
 
         // Auto-start server if enabled and a model is available

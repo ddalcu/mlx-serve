@@ -35,7 +35,7 @@ struct ShellHandler: ToolHandler {
                 do {
                     let process = Process()
                     process.executableURL = URL(fileURLWithPath: "/bin/zsh")
-                    process.arguments = ["-c", command]
+                    process.arguments = ["-l", "-c", command]
                     if let wd = workingDirectory {
                         process.currentDirectoryURL = URL(fileURLWithPath: wd)
                     }
@@ -47,9 +47,13 @@ struct ShellHandler: ToolHandler {
 
                     try process.run()
 
-                    // 30s timeout
+                    // 30s soft timeout (SIGTERM), 35s hard timeout (SIGKILL)
+                    let pid = process.processIdentifier
                     DispatchQueue.global().asyncAfter(deadline: .now() + 30) {
                         if process.isRunning { process.terminate() }
+                    }
+                    DispatchQueue.global().asyncAfter(deadline: .now() + 35) {
+                        if process.isRunning { kill(pid, SIGKILL) }
                     }
 
                     process.waitUntilExit()
@@ -65,6 +69,9 @@ struct ShellHandler: ToolHandler {
                     } else if result.isEmpty {
                         result = "OK"
                     }
+                    // Prepend cwd so the model knows where the command ran
+                    let cwd = process.currentDirectoryURL?.path ?? FileManager.default.currentDirectoryPath
+                    result = "[cwd: \(cwd)]\n\(result)"
 
                     continuation.resume(returning: result)
                 } catch {
@@ -83,7 +90,7 @@ struct ReadFileHandler: ToolHandler {
             throw ToolError.missingParameter("path")
         }
 
-        let fullPath = resolvePath(path, workingDirectory: workingDirectory)
+        let fullPath = try resolveAndConfine(path, workingDirectory: workingDirectory)
         guard let data = FileManager.default.contents(atPath: fullPath),
               let content = String(data: data, encoding: .utf8) else {
             throw ToolError.executionFailed("Cannot read file: \(fullPath)")
@@ -95,6 +102,10 @@ struct ReadFileHandler: ToolHandler {
         let endLine = Int(parameters["endLine"] ?? "\(totalLines)") ?? totalLines
         let actualStart = max(1, startLine)
         let actualEnd = min(totalLines, endLine)
+
+        guard actualStart <= actualEnd else {
+            return "Invalid line range: \(startLine)-\(endLine) (file has \(totalLines) lines)"
+        }
 
         let slice = lines[actualStart - 1..<actualEnd]
         // Add line numbers so the model can reference specific lines for editFile
@@ -120,17 +131,11 @@ struct ReadFileHandler: ToolHandler {
 
 struct WriteFileHandler: ToolHandler {
     func execute(parameters: [String: String], workingDirectory: String?) async throws -> String {
-        guard let path = parameters["path"], var content = parameters["content"] else {
+        guard let path = parameters["path"], let content = parameters["content"] else {
             throw ToolError.missingParameter("path and content")
         }
 
-        // Unescape common sequences that smaller models double-escape
-        content = content
-            .replacingOccurrences(of: "\\n", with: "\n")
-            .replacingOccurrences(of: "\\t", with: "\t")
-            .replacingOccurrences(of: "\\\"", with: "\"")
-
-        let fullPath = resolvePath(path, workingDirectory: workingDirectory)
+        let fullPath = try resolveAndConfine(path, workingDirectory: workingDirectory)
         let dir = (fullPath as NSString).deletingLastPathComponent
         try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
         try content.write(toFile: fullPath, atomically: true, encoding: .utf8)
@@ -142,20 +147,54 @@ struct WriteFileHandler: ToolHandler {
 
 struct EditFileHandler: ToolHandler {
     func execute(parameters: [String: String], workingDirectory: String?) async throws -> String {
-        guard let path = parameters["path"],
-              let find = parameters["find"],
-              let replace = parameters["replace"] else {
-            throw ToolError.missingParameter("path, find, and replace")
+        guard let path = parameters["path"] else {
+            throw ToolError.missingParameter("path")
         }
 
-        let fullPath = resolvePath(path, workingDirectory: workingDirectory)
+        let fullPath = try resolveAndConfine(path, workingDirectory: workingDirectory)
         guard let data = FileManager.default.contents(atPath: fullPath),
               var content = String(data: data, encoding: .utf8) else {
             throw ToolError.executionFailed("Cannot read file: \(fullPath)")
         }
 
+        // Line-number-based editing: startLine/endLine + replace
+        if let startStr = parameters["startLine"], let startLine = Int(startStr) {
+            guard let replace = parameters["replace"] else {
+                throw ToolError.executionFailed("editFile with startLine/endLine requires 'replace' parameter. You sent startLine=\(startStr) but no replace content. Example: {\"path\": \"file.js\", \"startLine\": \"5\", \"endLine\": \"8\", \"replace\": \"new code\"}")
+            }
+            let lines = content.components(separatedBy: "\n")
+            let endLine = Int(parameters["endLine"] ?? startStr) ?? startLine
+            let actualStart = max(1, startLine)
+            let actualEnd = min(lines.count, endLine)
+
+            guard actualStart <= actualEnd else {
+                throw ToolError.executionFailed("Invalid line range: \(startLine)-\(endLine) (file has \(lines.count) lines)")
+            }
+
+            var newLines = Array(lines[0..<(actualStart - 1)])
+            newLines.append(contentsOf: replace.components(separatedBy: "\n"))
+            if actualEnd < lines.count {
+                newLines.append(contentsOf: lines[actualEnd...])
+            }
+            content = newLines.joined(separator: "\n")
+            try content.write(toFile: fullPath, atomically: true, encoding: .utf8)
+            return "Edited \(path) (replaced lines \(actualStart)-\(actualEnd))"
+        }
+
+        // Text-based editing: find + replace
+        guard let find = parameters["find"], !find.isEmpty else {
+            throw ToolError.missingParameter("Either 'find' or 'startLine' is required")
+        }
+        let replace = parameters["replace"] ?? ""
+
         guard content.contains(find) else {
-            throw ToolError.executionFailed("Pattern not found in \(path)")
+            // Show nearby content to help the model correct its find pattern
+            let lines = content.components(separatedBy: "\n")
+            let preview = lines.prefix(10).enumerated()
+                .map { "\($0.offset + 1)| \($0.element)" }.joined(separator: "\n")
+            throw ToolError.executionFailed(
+                "Pattern not found in \(path). Use readFile first to see exact content, or use startLine/endLine for line-based editing. First 10 lines:\n\(preview)"
+            )
         }
 
         content = content.replacingOccurrences(of: find, with: replace)
@@ -174,9 +213,11 @@ struct SearchFilesHandler: ToolHandler {
             throw ToolError.missingParameter("pattern")
         }
         let path = parameters["path"] ?? "."
+        // Confine search path to workspace
+        let confinedPath = try resolveAndConfine(path, workingDirectory: workingDirectory)
         let maxResults = Int(parameters["maxResults"] ?? "100") ?? 100
         let escaped = shellEscape(pattern)
-        let escapedPath = shellEscape(path)
+        let escapedPath = shellEscape(confinedPath)
 
         // Use ripgrep if available, fallback to grep
         let useRg = FileManager.default.fileExists(atPath: "/opt/homebrew/bin/rg")
@@ -213,7 +254,7 @@ struct SearchFilesHandler: ToolHandler {
 struct ListFilesHandler: ToolHandler {
     func execute(parameters: [String: String], workingDirectory: String?) async throws -> String {
         let path = parameters["path"] ?? "."
-        let fullPath = resolvePath(path, workingDirectory: workingDirectory)
+        let fullPath = try resolveAndConfine(path, workingDirectory: workingDirectory)
         let pattern = parameters["pattern"]
         let recursive = parameters["recursive"]?.lowercased() == "true"
 
@@ -407,6 +448,31 @@ private func resolvePath(_ path: String, workingDirectory: String?) -> String {
         return (wd as NSString).appendingPathComponent(path)
     }
     return path
+}
+
+/// Resolve a path and verify it stays within the working directory.
+/// Returns the resolved absolute path, or throws if it escapes the workspace.
+private func resolveAndConfine(_ path: String, workingDirectory: String?) throws -> String {
+    let resolved: String
+    if path.hasPrefix("/") || path.hasPrefix("~") {
+        resolved = NSString(string: path).expandingTildeInPath
+    } else if let wd = workingDirectory {
+        resolved = (wd as NSString).appendingPathComponent(path)
+    } else {
+        return path // no workspace set, can't enforce
+    }
+
+    // Normalize to resolve ".." and symlinks for accurate prefix check
+    let normalizedResolved = (resolved as NSString).standardizingPath
+
+    guard let wd = workingDirectory else { return normalizedResolved }
+    let normalizedWd = (wd as NSString).standardizingPath
+
+    guard normalizedResolved == normalizedWd || normalizedResolved.hasPrefix(normalizedWd + "/") else {
+        throw ToolError.executionFailed("Access denied: path '\(path)' resolves to '\(normalizedResolved)' which is outside the workspace '\(normalizedWd)'")
+    }
+
+    return normalizedResolved
 }
 
 // MARK: - Executor

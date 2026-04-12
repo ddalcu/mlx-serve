@@ -740,8 +740,30 @@ fn convertGemma4ArgsToJson(allocator: std.mem.Allocator, input: []const u8) ?[]c
                 }
             }
             result.append(allocator, '"') catch return null;
+        } else if (pos < body.len and (body[pos] == '{' or body[pos] == '[')) {
+            // Nested object or array — match braces to find the full value
+            const open = body[pos];
+            const close: u8 = if (open == '{') '}' else ']';
+            var depth: usize = 0;
+            var end: usize = pos;
+            var in_str = false;
+            while (end < body.len) : (end += 1) {
+                if (body[end] == '"' and (end == 0 or body[end - 1] != '\\')) {
+                    in_str = !in_str;
+                } else if (!in_str) {
+                    if (body[end] == open) depth += 1
+                    else if (body[end] == close) {
+                        depth -= 1;
+                        if (depth == 0) { end += 1; break; }
+                    }
+                }
+            }
+            const value = body[pos..end];
+            // Pass through as-is (already JSON-like structure)
+            result.appendSlice(allocator, value) catch return null;
+            pos = end;
         } else {
-            // Bare value (number, boolean, or unquoted string)
+            // Bare value (number, boolean, or unquoted string) — terminates at , or }
             const val_end = std.mem.indexOfAny(u8, body[pos..], ",}") orelse body.len - pos;
             const value = std.mem.trim(u8, body[pos .. pos + val_end], " \t\n\r");
             if (isJsonLiteral(value)) {
@@ -810,7 +832,7 @@ fn parseHermesToolCall(allocator: std.mem.Allocator, block: []const u8) ?ParsedT
 fn isJsonLiteral(s: []const u8) bool {
     if (s.len == 0) return false;
     if (std.mem.eql(u8, s, "true") or std.mem.eql(u8, s, "false") or std.mem.eql(u8, s, "null")) return true;
-    if (s[0] == '{' or s[0] == '[') return true;
+    // Objects/arrays are handled by brace-matching in the caller, not here
     _ = std.fmt.parseFloat(f64, s) catch return false;
     return true;
 }
@@ -1155,12 +1177,51 @@ test "parseToolCalls Gemma 4 quoted keys with bare values" {
     try testing.expectEqualStrings("ls -la", parsed.value.object.get("command").?.string);
 }
 
+test "convertGemma4ArgsToJson nested braces in value" {
+    const allocator = testing.allocator;
+    // Content value contains JSON-like structures (e.g., JavaScript code with objects)
+    const input = "{path:<|\"|>server.js<|\"|>,content:<|\"|>const x = {a: 1, b: {c: 2}};<|\"|>}";
+    const result = convertGemma4ArgsToJson(allocator, input).?;
+    defer allocator.free(result);
+    // Verify it produces valid JSON
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, result, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("server.js", parsed.value.object.get("path").?.string);
+    const content = parsed.value.object.get("content").?.string;
+    try testing.expect(std.mem.indexOf(u8, content, "{a: 1") != null);
+}
+
+test "convertGemma4ArgsToJson bare array value" {
+    const allocator = testing.allocator;
+    // Bare array value should be preserved via brace-matching
+    const input = "{stops:[\"Rome\",\"Venice\",\"Athens\"],price:1200}";
+    const result = convertGemma4ArgsToJson(allocator, input).?;
+    defer allocator.free(result);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, result, .{});
+    defer parsed.deinit();
+    try testing.expectEqual(@as(usize, 3), parsed.value.object.get("stops").?.array.items.len);
+    try testing.expectEqual(@as(i64, 1200), parsed.value.object.get("price").?.integer);
+}
+
+test "convertGemma4ArgsToJson bare nested object value" {
+    const allocator = testing.allocator;
+    // Bare nested object should be preserved via brace-matching
+    const input = "{name:test,config:{\"port\":3000,\"host\":\"localhost\"}}";
+    const result = convertGemma4ArgsToJson(allocator, input).?;
+    defer allocator.free(result);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, result, .{});
+    defer parsed.deinit();
+    const config = parsed.value.object.get("config").?.object;
+    try testing.expectEqual(@as(i64, 3000), config.get("port").?.integer);
+}
+
 test "isJsonLiteral" {
     try testing.expect(isJsonLiteral("true"));
     try testing.expect(isJsonLiteral("false"));
     try testing.expect(isJsonLiteral("null"));
-    try testing.expect(isJsonLiteral("{\"key\":1}"));
-    try testing.expect(isJsonLiteral("[1,2,3]"));
+    // Objects/arrays are now handled by brace-matching in convertGemma4ArgsToJson, not isJsonLiteral
+    try testing.expect(!isJsonLiteral("{\"key\":1}"));
+    try testing.expect(!isJsonLiteral("[1,2,3]"));
     try testing.expect(isJsonLiteral("42"));
     try testing.expect(isJsonLiteral("3.14"));
     try testing.expect(!isJsonLiteral("hello"));

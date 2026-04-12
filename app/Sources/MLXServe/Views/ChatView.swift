@@ -305,16 +305,6 @@ struct ChatDetailView: View {
                 }
             }
             ToolbarItem(placement: .automatic) {
-                if isAgentMode && server.status == .running {
-                    Button {
-                        launchClaudeCodeWithPicker()
-                    } label: {
-                        ClaudeIcon(size: 12)
-                    }
-                    .help("Launch Claude Code")
-                }
-            }
-            ToolbarItem(placement: .automatic) {
                 Circle()
                     .fill(server.status == .running ? .green : .red)
                     .frame(width: 8, height: 8)
@@ -434,6 +424,8 @@ struct ChatDetailView: View {
                         appState.updateLastMessage(in: sessionId, usage: usage)
                     case .toolCalls:
                         break
+                    case .maxTokensReached:
+                        appState.updateLastMessage(in: sessionId, content: "\n\n⚠️ *Output truncated — max tokens (\(appState.maxTokens)) reached.*")
                     case .done:
                         break
                     }
@@ -484,21 +476,6 @@ struct ChatDetailView: View {
         }
     }
 
-    /// Show folder picker and launch Claude Code in the selected directory.
-    private func launchClaudeCodeWithPicker() {
-        let panel = NSOpenPanel()
-        panel.canChooseDirectories = true
-        panel.canChooseFiles = false
-        panel.allowsMultipleSelection = false
-        panel.prompt = "Open"
-        panel.message = "Select working directory for Claude Code"
-        // Default to session's working directory if set
-        if let wd = session?.workingDirectory {
-            panel.directoryURL = URL(fileURLWithPath: wd)
-        }
-        guard panel.runModal() == .OK, let url = panel.url else { return }
-        launchClaudeCode(baseURL: server.baseURL, workingDirectory: url.path)
-    }
 
     /// Agent loop: call model with tools (streaming), execute tool calls, feed results back, repeat.
     /// Stops when the model responds with content (no tool calls) or after 150 iterations.
@@ -506,6 +483,8 @@ struct ChatDetailView: View {
         let maxIterations = 150
         var padRetries = 0
         let padRetryPolicy = RetryPolicy.aggressive
+        var recentToolNames: [String] = [] // sliding window for repetition detection
+        var permanentlyBlocked: Set<String> = [] // tools blocked for the rest of this loop
 
         for _ in 0..<maxIterations {
             try Task.checkCancellation()
@@ -516,7 +495,7 @@ struct ChatDetailView: View {
             let skills = AgentPrompt.skillManager.matchingSkills(for: userMsg)
             var systemPrompt = AgentPrompt.systemPrompt + skills + AgentPrompt.memory + appState.agentMemory.contextSnippet()
             if let wd = workingDirectory {
-                systemPrompt += "\n\n# Working Directory\nYour working directory is `\(wd)`. All relative paths resolve against it. Use relative paths for files inside this directory. Shell commands run here by default."
+                systemPrompt += "\n\n# Working Directory\nYour working directory is `\(wd)`. All file tool operations are confined to this directory — paths that resolve outside it will be rejected. Use relative paths. Shell commands run here by default."
             }
             var messages: [[String: Any]] = [["role": "system", "content": systemPrompt]]
             // Some models (e.g. Gemma 4 E4B) can't generate after tool results without
@@ -527,19 +506,13 @@ struct ChatDetailView: View {
             messages.append(contentsOf: history)
 
             // Debug: dump the exact request body to file for analysis
+            // Uses pre-serialized tools JSON to preserve property key order (path before content)
             do {
-                let debugBody: [String: Any] = [
-                    "messages": messages,
-                    "tools": AgentPrompt.toolDefinitions,
-                    "max_tokens": appState.maxTokens,
-                    "temperature": 0.7,
-                    "top_p": 0.95,
-                    "stream": true,
-                    "model": "mlx-serve"
-                ]
-                let debugData = try JSONSerialization.data(withJSONObject: debugBody, options: .prettyPrinted)
                 let debugPath = NSString(string: "~/.mlx-serve/last-agent-request.json").expandingTildeInPath
-                try debugData.write(to: URL(fileURLWithPath: debugPath))
+                let messagesData = try JSONSerialization.data(withJSONObject: messages, options: .prettyPrinted)
+                let messagesStr = String(data: messagesData, encoding: .utf8) ?? "[]"
+                let debugJSON = "{\n  \"model\": \"mlx-serve\",\n  \"max_tokens\": \(appState.maxTokens),\n  \"temperature\": 0.7,\n  \"stream\": true,\n  \"messages\": \(messagesStr),\n  \"tools\": \(AgentPrompt.toolDefinitionsJSON)\n}"
+                try debugJSON.data(using: .utf8)?.write(to: URL(fileURLWithPath: debugPath))
             } catch { /* ignore debug errors */ }
 
             // Add streaming assistant message
@@ -555,7 +528,7 @@ struct ChatDetailView: View {
                 maxTokens: appState.maxTokens,
                 temperature: 0.7,
                 enableThinking: enableThinking,
-                tools: AgentPrompt.toolDefinitions
+                toolsJSON: AgentPrompt.toolDefinitionsJSON
             )
             for try await event in stream {
                 try Task.checkCancellation()
@@ -568,6 +541,8 @@ struct ChatDetailView: View {
                     appState.updateLastMessage(in: sessionId, usage: usage)
                 case .toolCalls(let calls):
                     receivedToolCalls = calls
+                case .maxTokensReached:
+                    appState.updateLastMessage(in: sessionId, content: "\n\n⚠️ *Output truncated — max tokens (\(appState.maxTokens)) reached. Try breaking the task into smaller steps.*")
                 case .done:
                     break
                 }
@@ -602,6 +577,20 @@ struct ChatDetailView: View {
 
             // If no tool calls, we're done
             guard !receivedToolCalls.isEmpty else { return }
+
+            // Repetition detection: track tool names per round (deduplicated).
+            // If same read-only tool appears 4+ times in last 6 rounds, permanently block it.
+            // Write tools (writeFile, editFile, shell) are never permanently blocked since the model needs them to make progress.
+            let writeTools: Set<String> = ["writeFile", "editFile", "shell"]
+            let uniqueNames = Set(receivedToolCalls.map { $0.name })
+            recentToolNames.append(contentsOf: uniqueNames)
+            if recentToolNames.count > 6 { recentToolNames = Array(recentToolNames.suffix(6)) }
+            for name in uniqueNames {
+                if recentToolNames.filter({ $0 == name }).count >= 4 && !writeTools.contains(name) {
+                    permanentlyBlocked.insert(name)
+                }
+            }
+            let blockedTools = permanentlyBlocked
 
             // Store tool calls on the assistant message for history replay
             if let sIdx = appState.chatSessions.firstIndex(where: { $0.id == sessionId }),
@@ -638,27 +627,30 @@ struct ChatDetailView: View {
                     effectiveTool = tool
                 }
 
-                // Pre-validate required params — give the model the expected format on failure
-                let missing = Self.missingRequiredParams(for: tc.name, arguments: tc.arguments)
+                // Block tools that have been called too many times in a row
                 let output: String
-                if !missing.isEmpty {
-                    let example = Self.toolExample(for: tc.name)
-                    output = "Error: \(tc.name) missing required params: \(missing.joined(separator: ", ")). Example: \(example)"
-                } else if let effectiveTool, let handler = toolHandlers[effectiveTool] {
-                    do {
-                        output = try await handler.execute(parameters: tc.arguments, workingDirectory: workingDirectory)
-                        // Record shell commands
-                        if effectiveTool == .shell, let cmd = tc.arguments["command"] {
-                            appState.agentMemory.recordCommand(cmd)
-                        }
-                    } catch {
-                        let argsDesc = tc.arguments.isEmpty ? "none" : tc.arguments.map { "\($0.key)=\($0.value.prefix(30))" }.joined(separator: ", ")
-                        output = "Error: \(error.localizedDescription). You sent args: [\(argsDesc)]. Example: \(Self.toolExample(for: tc.name))"
-                    }
+                if blockedTools.contains(tc.name) {
+                    output = "BLOCKED: \(tc.name) has been called too many times in a row. This tool is now disabled for this task. Use writeFile to create files, readFile to read them, editFile to modify them, and shell for commands."
                 } else {
-                    output = "Error: Unknown tool '\(tc.name)'"
+                    // Pre-validate required params
+                    let missing = Self.missingRequiredParams(for: tc.name, arguments: tc.arguments)
+                    if !missing.isEmpty {
+                        let example = Self.toolExample(for: tc.name)
+                        output = "Error: \(tc.name) missing required params: \(missing.joined(separator: ", ")). Example: \(example)"
+                    } else if let effectiveTool, let handler = toolHandlers[effectiveTool] {
+                        do {
+                            output = try await handler.execute(parameters: tc.arguments, workingDirectory: workingDirectory)
+                            if effectiveTool == .shell, let cmd = tc.arguments["command"] {
+                                appState.agentMemory.recordCommand(cmd)
+                            }
+                        } catch {
+                            let argsDesc = tc.arguments.isEmpty ? "none" : tc.arguments.map { "\($0.key)=\($0.value.prefix(30))" }.joined(separator: ", ")
+                            output = "Error: \(error.localizedDescription). You sent args: [\(argsDesc)]. Example: \(Self.toolExample(for: tc.name))"
+                        }
+                    } else {
+                        output = "Error: Unknown tool '\(tc.name)'"
+                    }
                 }
-
                 toolResults.append((id: tc.id, name: tc.name, output: output))
 
                 // Show result in chat (display-only, marked so it's excluded from API history)
@@ -703,13 +695,15 @@ struct ChatDetailView: View {
         let maxChars = toolResultCaps[toolName] ?? 4000
         guard output.count > maxChars else { return output }
 
+        // Save full output to disk for debugging, but don't tell the model to read it
+        // (the file is outside the workspace so readFile would be blocked by confinement)
         let dir = NSString(string: "~/.mlx-serve/tool-output").expandingTildeInPath
         try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true, attributes: nil)
         let path = (dir as NSString).appendingPathComponent("\(toolCallId).txt")
         try? output.write(toFile: path, atomically: true, encoding: .utf8)
 
-        let preview = String(output.prefix(maxChars - 200))
-        return "\(preview)\n\n[... truncated at \(maxChars) chars. Full output (\(output.count) chars) saved to: \(path) — use readFile to see the rest]"
+        let preview = String(output.prefix(maxChars))
+        return "\(preview)\n\n[... truncated at \(maxChars) of \(output.count) chars]"
     }
 
     /// Clean up overflow files older than 24 hours. Called on session start.

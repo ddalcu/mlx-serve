@@ -1565,12 +1565,27 @@ fn handleNonStreamingGeneration(
             }
             try tc_buf.appendSlice(allocator, "]");
 
+            // Extract reasoning_content if thinking is enabled
+            var tc_reasoning_json: []const u8 = "";
+            var tc_reasoning_allocated = false;
+            if (enable_thinking) {
+                const tc_think_split = chat_mod.splitThinkBlock(final_text, true);
+                if (tc_think_split.reasoning_content) |reasoning| {
+                    const escaped_reasoning = try jsonEscape(allocator, reasoning);
+                    tc_reasoning_json = try std.fmt.allocPrint(allocator, ",\"reasoning_content\":{s}", .{escaped_reasoning});
+                    allocator.free(escaped_reasoning);
+                    tc_reasoning_allocated = true;
+                }
+            }
+            defer if (tc_reasoning_allocated) allocator.free(tc_reasoning_json);
+
             const response = try std.fmt.allocPrint(allocator,
-                \\{{"id":"chatcmpl-{d}","object":"chat.completion","created":{d},"model":"{s}","system_fingerprint":"mlx-serve","choices":[{{"index":0,"message":{{"role":"assistant","content":null,"tool_calls":{s}}},"finish_reason":"tool_calls"}}],"usage":{{"prompt_tokens":{d},"completion_tokens":{d},"total_tokens":{d}}}}}
+                \\{{"id":"chatcmpl-{d}","object":"chat.completion","created":{d},"model":"{s}","system_fingerprint":"mlx-serve","choices":[{{"index":0,"message":{{"role":"assistant","content":null{s},"tool_calls":{s}}},"finish_reason":"tool_calls"}}],"usage":{{"prompt_tokens":{d},"completion_tokens":{d},"total_tokens":{d}}}}}
             , .{
                 std.time.milliTimestamp(),
                 std.time.timestamp(),
                 model_name,
+                tc_reasoning_json,
                 tc_buf.items,
                 result.prompt_tokens,
                 result.completion_tokens,
@@ -1787,18 +1802,42 @@ fn handleStreamingGeneration(
             if (!maybe_tool) {
                 // No tool call pattern — flush buffered tokens as streamed content.
                 // But if thinking is enabled, keep buffering if a thinking block might be starting.
-                const maybe_thinking = enable_thinking and (
-                    std.mem.indexOf(u8, buf, "<|channel>thought") != null or
+                // Detect thinking blocks even when thinking is disabled — models may emit
+                // them regardless, and we need to strip them from content.
+                const has_thinking = std.mem.indexOf(u8, buf, "<|channel>thought") != null or
                     std.mem.indexOf(u8, buf, "<think>") != null or
-                    // Partial: <|channel> arrived but "thought" not yet
                     (std.mem.startsWith(u8, buf, "<|channel>") and buf.len < 18) or
-                    (std.mem.startsWith(u8, buf, "<think") and buf.len < 7)
-                );
-                if (maybe_thinking) {
-                    // Keep buffering — thinking block in progress, will be split at end
+                    (std.mem.startsWith(u8, buf, "<think") and buf.len < 7);
+                if (has_thinking) {
+                    // Check if the thinking block is complete (has closing tag)
+                    const has_close = std.mem.indexOf(u8, buf, "<channel|>") != null or
+                        std.mem.indexOf(u8, buf, "</think>") != null;
+                    if (!has_close) {
+                        // Incomplete thinking block — keep buffering until closed
+                    } else {
+                        // Complete thinking block — split into reasoning + content
+                        const split = chat_mod.splitThinkBlock(buf, enable_thinking);
+                        for (token_texts.items) |tt| allocator.free(tt);
+                        token_texts.clearRetainingCapacity();
+                        text_buf.clearRetainingCapacity();
+                        if (enable_thinking) {
+                            if (split.reasoning_content) |rc| {
+                                try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = rc }, null, null);
+                            }
+                        }
+                        if (split.content.len > 0) {
+                            try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = split.content }, null, null);
+                        }
+                    }
                 } else {
                     for (token_texts.items) |tt| {
                         defer allocator.free(tt);
+                        // Skip bare channel/think tags that leak without a full block
+                        if (std.mem.eql(u8, tt, "<|channel>") or std.mem.eql(u8, tt, "<channel|>") or
+                            std.mem.eql(u8, tt, "<think>") or std.mem.eql(u8, tt, "</think>"))
+                        {
+                            continue;
+                        }
                         try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = tt }, null, null);
                     }
                     token_texts.clearRetainingCapacity();

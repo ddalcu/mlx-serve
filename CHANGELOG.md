@@ -1,5 +1,43 @@
 # Changelog
 
+## v26.4.20 — Tool Reliability, Thinking+Tools, Truncation Recovery
+
+### Tool Parameter Key Order (3-layer fix)
+- **Pre-serialized tool JSON**: `toolDefinitionsJSON` is a hand-crafted JSON string with guaranteed `path` before `content` in all file tools — bypasses `JSONSerialization`'s non-deterministic key ordering
+- **Request body splicing**: `streamChat()` splices the pre-serialized tools JSON directly into the HTTP body instead of letting Swift re-order keys
+- **Truncated JSON recovery**: `extractPathFromTruncatedJSON()` uses string search to find `"path":"..."` in malformed/truncated args even when JSON parsing fails entirely
+- **Improved JSON repair**: Repair block now tracks unmatched `{`/`[` openers respecting quoted regions and appends correct closing characters (was blindly appending single `}`)
+- **Path cleaning**: `cleanPath()` strips spurious surrounding quotes from paths — models sometimes generate `"\"app.py\""` which becomes `"app.py"` with literal quotes after JSON unescaping
+
+### Thinking + Tools Fix
+- **Streaming**: When `has_tools=true`, thinking blocks were detected and **stripped** via `stripThinkBlock()` but never emitted as `reasoning_content`. Now uses `splitThinkBlock()` to separate reasoning from content and emits both
+- **Non-streaming**: Tool call responses had `"content":null` with no `reasoning_content` field. Now includes `reasoning_content` when thinking is enabled
+- **Root cause**: The `if/else if` control flow meant the thinking branch could never execute when the tools branch was active
+
+### Gemma 4 Tool Call Parsing
+- **Nested brace/array values**: `convertGemma4ArgsToJson()` now handles bare nested objects (`{config:{"port":3000}}`) and arrays (`{stops:["Rome","Venice"]}`) via depth-tracked brace matching — was previously falling through to bare-value parsing and producing invalid JSON
+
+### Agent Prompt & Token Limits
+- **Default max_tokens**: 8192 → 32768 — prevents tool call argument truncation for large file writes
+- **writeFile size guidance**: System prompt and tool description now direct models to use `shell` with `cat` heredoc for files over 100 lines — writeFile's JSON-escaped content inflates token cost ~30% vs raw heredoc
+- **Max tokens warning**: New `SSEEvent.maxTokensReached` emitted when server returns `finish_reason: "length"` — chat shows "Output truncated — max tokens (N) reached"
+- **Tool output overflow**: Truncation message no longer tells model to `readFile` the overflow file (which is outside the workspace and gets blocked by confinement) — just shows `[... truncated at N of M chars]`
+
+### Claude Code Launcher
+- **Removed from chat toolbar**: Claude Code button removed from ChatView — only in tray menu now
+- **Directory picker**: Tray menu button shows `NSOpenPanel` folder picker before launching (defaults to `~/.mlx-serve/workspace`)
+- **White icon**: Uses `ClaudeIcon(size: 12)` with `.foregroundStyle(.white)` matching the chat icon style
+
+### Dead Code Removal
+- **Removed `chatWithTools()`**: Non-streaming tool call method was never called — app uses streaming-only. Removed along with `ToolCallResult` struct
+
+### Testing
+- **`tests/test_thinking_tools.sh`**: 27 integration tests covering all 8 permutations of thinking × tools × streaming, plus mixed-mode scenarios
+- **`tests/test_swift_agent.sh`**: Comprehensive Swift agent harness test — exercises all 9 tools (writeFile, readFile, editFile, shell, searchFiles, listFiles, webSearch, browse, saveMemory) through the TestServer API
+- **`ToolKeyOrderTests.swift`**: 34 unit tests for JSON key order, request body splicing, `extractPathFromTruncatedJSON` edge cases, JSON repair, and end-to-end `parseToolCallArgs` integration
+
+---
+
 ## 2026.4.12 — MLX Core Rename, Agent Overhaul
 
 ### Rename: MLX Claw → MLX Core
