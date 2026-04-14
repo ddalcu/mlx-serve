@@ -8,4 +8,5 @@ test {
     _ = @import("model.zig");
     _ = @import("generate.zig");
     _ = @import("transformer.zig");
+    _ = @import("vision.zig");
 }

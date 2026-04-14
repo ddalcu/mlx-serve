@@ -5,12 +5,16 @@ const tokenizer_mod = @import("tokenizer.zig");
 const generate_mod = @import("generate.zig");
 const chat_mod = @import("chat.zig");
 const model_mod = @import("model.zig");
+const vision_mod = @import("vision.zig");
 const log = @import("log.zig");
+const stb = @cImport({ @cInclude("stb_image.h"); });
+const webp = @cImport({ @cInclude("webp/decode.h"); });
 const metrics = @import("status.zig");
 
 const Transformer = transformer_mod.Transformer;
 const Tokenizer = tokenizer_mod.Tokenizer;
 const Generator = generate_mod.Generator;
+const VisionEncoder = vision_mod.VisionEncoder;
 /// Global flag set by signal handler for graceful shutdown.
 var shutdown_requested = std.atomic.Value(bool).init(false);
 
@@ -82,6 +86,9 @@ var cached_has_tools: bool = false;
 /// Set by generation handlers when output is pad-only (signals bad KV cache state).
 var last_generation_was_pad: bool = false;
 
+/// Vision encoder (null if model has no vision support).
+var global_vision_encoder: ?*VisionEncoder = null;
+
 /// Start the HTTP server on the given host and port.
 pub fn serve(
     allocator: std.mem.Allocator,
@@ -89,12 +96,14 @@ pub fn serve(
     tok: *const Tokenizer,
     chat_config: *const chat_mod.ChatConfig,
     config: *const model_mod.ModelConfig,
+    vision_encoder: ?*VisionEncoder,
     host: []const u8,
     port: u16,
     ctx_size: u32,
     timeout: u32,
     reasoning_budget: i32,
 ) !void {
+    global_vision_encoder = vision_encoder;
     max_context_size = ctx_size;
     request_timeout_sec = timeout;
     default_reasoning_budget = reasoning_budget;
@@ -774,17 +783,77 @@ fn handleChatCompletions(
 
         // Content can be null for assistant messages with tool_calls
         const content_val = obj.get("content");
+        var msg_images: ?[]const chat_mod.ImageData = null;
         const content: []const u8 = if (content_val) |cv| switch (cv) {
             .string => |s| s,
             .array => |arr| blk: {
+                var text_content: []const u8 = "";
+                var image_list = std.ArrayList(chat_mod.ImageData).empty;
                 for (arr.items) |part| {
                     if (part != .object) continue;
                     const ptype = part.object.get("type") orelse continue;
-                    if (ptype != .string or !std.mem.eql(u8, ptype.string, "text")) continue;
-                    const text = part.object.get("text") orelse continue;
-                    if (text == .string) break :blk text.string;
+                    if (ptype != .string) continue;
+                    if (std.mem.eql(u8, ptype.string, "text")) {
+                        const text = part.object.get("text") orelse continue;
+                        if (text == .string) text_content = text.string;
+                    } else if (std.mem.eql(u8, ptype.string, "image_url")) {
+                        // Parse image_url content block
+                        const img_obj = part.object.get("image_url") orelse continue;
+                        if (img_obj != .object) continue;
+                        const url_val = img_obj.object.get("url") orelse continue;
+                        if (url_val != .string) continue;
+                        const url = url_val.string;
+                        // Decode image from data URL — supports:
+                        //   data:image/x-mlx-pixels;base64,... (preprocessed float32 CHW)
+                        //   data:image/jpeg;base64,...          (JPEG, decoded via stb_image)
+                        //   data:image/png;base64,...           (PNG, decoded via stb_image)
+                        if (std.mem.indexOf(u8, url, ";base64,")) |sep| {
+                            const b64_data = url[sep + 8 ..];
+                            const decoded_size = std.base64.standard.Decoder.calcSizeForSlice(b64_data) catch continue;
+                            const raw_buf = allocator.alloc(u8, decoded_size) catch continue;
+                            std.base64.standard.Decoder.decode(raw_buf, b64_data) catch {
+                                allocator.free(raw_buf);
+                                continue;
+                            };
+
+                            const mime = url[0..sep];
+                            if (std.mem.eql(u8, mime, "data:image/x-mlx-pixels")) {
+                                // Already preprocessed float32 CHW pixels
+                                const n_pixels = raw_buf.len / 4;
+                                const per_channel = n_pixels / 3;
+                                const side = std.math.sqrt(per_channel);
+                                if (side * side == per_channel and n_pixels == 3 * side * side) {
+                                    image_list.append(allocator, .{
+                                        .pixels = raw_buf,
+                                        .width = @intCast(side),
+                                        .height = @intCast(side),
+                                    }) catch { allocator.free(raw_buf); continue; };
+                                } else {
+                                    allocator.free(raw_buf);
+                                }
+                            } else if (std.mem.startsWith(u8, mime, "data:image/")) {
+                                // JPEG/PNG/etc — decode with stb_image, resize, convert to float32 CHW
+                                if (decodeImageToPixels(allocator, raw_buf)) |img| {
+                                    allocator.free(raw_buf);
+                                    image_list.append(allocator, img) catch {
+                                        allocator.free(img.pixels);
+                                        continue;
+                                    };
+                                } else {
+                                    allocator.free(raw_buf);
+                                }
+                            } else {
+                                allocator.free(raw_buf);
+                            }
+                        }
+                    }
                 }
-                break :blk "";
+                if (image_list.items.len > 0) {
+                    msg_images = image_list.toOwnedSlice(allocator) catch null;
+                } else {
+                    image_list.deinit(allocator);
+                }
+                break :blk text_content;
             },
             .null => "",
             else => "",
@@ -822,14 +891,15 @@ fn handleChatCompletions(
         else
             null;
 
-        // Skip messages with no content and no tool_calls
-        if (content.len == 0 and msg_tool_calls == null and !std.mem.eql(u8, role_val.string, "tool")) continue;
+        // Skip messages with no content, no tool_calls, and no images
+        if (content.len == 0 and msg_tool_calls == null and msg_images == null and !std.mem.eql(u8, role_val.string, "tool")) continue;
 
         try messages.append(allocator, .{
             .role = role_val.string,
             .content = content,
             .tool_calls = msg_tool_calls,
             .tool_call_id = tool_call_id,
+            .images = msg_images,
         });
     }
 
@@ -1046,8 +1116,31 @@ fn handleChatCompletions(
     log.info("  > \"{s}{s}\"\n", .{ last_msg.content[0..preview_len], if (last_msg.content.len > 80) "..." else "" });
 
     // Format chat template
-    const prompt_ids = try chat_mod.formatChat(allocator, tok, messages.items, chat_config, tools_json, tool_choice_instruction, enable_thinking);
+    var prompt_ids_raw = try chat_mod.formatChat(allocator, tok, messages.items, chat_config, tools_json, tool_choice_instruction, enable_thinking);
+
+    // Run vision encoder if any messages contain images
+    var vision_prompt_ids: ?[]u32 = null;
+    if (global_vision_encoder) |ve| {
+        processVisionImages(allocator, ve, xfm, messages.items) catch |err| {
+            log.warn("Vision encoding failed: {}\n", .{err});
+        };
+        // If vision embeddings were set, insert image tokens into the prompt
+        // Use the actual encoder output token count
+        if (xfm.vision_embeddings != null) {
+            const ve_shape = mlx.getShape(xfm.vision_embeddings.?);
+            const n_img_tokens: usize = @intCast(ve_shape[1]);
+            vision_prompt_ids = try insertImageTokens(allocator, prompt_ids_raw, config.image_token_id, n_img_tokens, config);
+            allocator.free(prompt_ids_raw);
+            prompt_ids_raw = vision_prompt_ids.?;
+        }
+    }
+    const prompt_ids = prompt_ids_raw;
     defer allocator.free(prompt_ids);
+    // Clear vision embeddings after prefill (defer ensures cleanup even on error)
+    defer {
+        if (xfm.vision_embeddings) |ve| _ = mlx.mlx_array_free(ve);
+        xfm.vision_embeddings = null;
+    }
 
     // Enforce context size limit
     const effective_ctx = getEffectiveContextLength(config);
@@ -1064,7 +1157,18 @@ fn handleChatCompletions(
     const effective_max_tokens = clampMaxTokens(max_tokens, prompt_ids.len);
     log.info("  prompt={d} tokens, max_gen={d}, ctx={d}\n", .{ prompt_ids.len, effective_max_tokens, effective_ctx });
 
-    // Prompt caching: reuse KV cache for shared prefix
+    // Prompt caching: reuse KV cache for shared prefix.
+    // Force invalidation when images are present — image tokens have identical IDs
+    // but different vision embeddings, so prefix matching would reuse stale features.
+    const has_images = xfm.vision_embeddings != null;
+    if (has_images) {
+        if (cached_prompt_ids) |old| {
+            allocator.free(old);
+            cached_prompt_ids = null;
+        }
+        try xfm.resetCache();
+        log.info("  [cache] reset — image request\n", .{});
+    }
     const cache_result = try reuseKVCache(allocator, xfm, prompt_ids, has_tools);
 
     const eos_slice = config.eosTokenSlice();
@@ -1303,9 +1407,8 @@ fn handleNonStreamingCompletion(
     }
 
     const elapsed_ms = timer.read() / std.time.ns_per_ms;
-    const tps = if (elapsed_ms > 0) @as(u64, result.completion_tokens) * 1000 / elapsed_ms else 0;
-    log.info("  <- {d}+{d} tokens ({d}ms, ~{d} tok/s) [{s}]\n", .{
-        result.prompt_tokens, result.completion_tokens, elapsed_ms, tps, finish_reason,
+    log.info("  <- {d}+{d} tokens ({d}ms) [prefill: {d:.1} tok/s, decode: {d:.1} tok/s] [{s}]\n", .{
+        result.prompt_tokens, result.completion_tokens, elapsed_ms, result.prefill_tps, result.decode_tps, finish_reason,
     });
 
     const escaped_text = jsonEscape(allocator, final_text) catch "\"\"";
@@ -1349,6 +1452,13 @@ fn handleStreamingCompletion(
     var gen = try Generator.init(allocator, xfm, tok, prompt_ids, max_tokens, sampling, eos_token_ids);
     gen.timeout_ns = getTimeoutNs();
     defer gen.deinit(allocator);
+
+    const prefill_ns = timer.read();
+    const prefill_tps: f64 = if (prefill_ns > 0)
+        @as(f64, @floatFromInt(prompt_ids.len)) * @as(f64, @floatFromInt(std.time.ns_per_s)) / @as(f64, @floatFromInt(prefill_ns))
+    else
+        0.0;
+    timer.reset();
 
     // SSE headers
     const header =
@@ -1444,10 +1554,14 @@ fn handleStreamingCompletion(
     try stream.writeAll("\n\n");
     try stream.writeAll("data: [DONE]\n\n");
 
-    const elapsed_ms = timer.read() / std.time.ns_per_ms;
-    const tps = if (elapsed_ms > 0) @as(u64, gen.completion_tokens) * 1000 / elapsed_ms else 0;
-    log.info("  <- {d}+{d} tokens streamed ({d}ms, ~{d} tok/s) [{s}]\n", .{
-        gen.prompt_tokens, gen.completion_tokens, elapsed_ms, tps, finish_reason,
+    const decode_ns = timer.read();
+    const decode_tps: f64 = if (decode_ns > 0)
+        @as(f64, @floatFromInt(gen.completion_tokens)) * @as(f64, @floatFromInt(std.time.ns_per_s)) / @as(f64, @floatFromInt(decode_ns))
+    else
+        0.0;
+    const elapsed_ms = (prefill_ns + decode_ns) / std.time.ns_per_ms;
+    log.info("  <- {d}+{d} tokens streamed ({d}ms) [prefill: {d:.1} tok/s, decode: {d:.1} tok/s] [{s}]\n", .{
+        gen.prompt_tokens, gen.completion_tokens, elapsed_ms, prefill_tps, decode_tps, finish_reason,
     });
 }
 
@@ -1527,7 +1641,6 @@ fn handleNonStreamingGeneration(
     }
 
     const elapsed_ms = timer.read() / std.time.ns_per_ms;
-    const tps = if (elapsed_ms > 0) @as(u64, result.completion_tokens) * 1000 / elapsed_ms else 0;
 
     // Check for tool calls in the output
     if (has_tools) {
@@ -1541,8 +1654,8 @@ fn handleNonStreamingGeneration(
                 allocator.free(tool_calls);
             }
 
-            log.info("  <- {d}+{d} tokens ({d}ms, ~{d} tok/s) [tool_calls: {d}]\n", .{
-                result.prompt_tokens, result.completion_tokens, elapsed_ms, tps, tool_calls.len,
+            log.info("  <- {d}+{d} tokens ({d}ms) [prefill: {d:.1} tok/s, decode: {d:.1} tok/s] [tool_calls: {d}]\n", .{
+                result.prompt_tokens, result.completion_tokens, elapsed_ms, result.prefill_tps, result.decode_tps, tool_calls.len,
             });
 
             // Build tool_calls JSON array
@@ -1597,8 +1710,8 @@ fn handleNonStreamingGeneration(
         }
     }
 
-    log.info("  <- {d}+{d} tokens ({d}ms, ~{d} tok/s) [{s}]\n", .{
-        result.prompt_tokens, result.completion_tokens, elapsed_ms, tps, finish_reason,
+    log.info("  <- {d}+{d} tokens ({d}ms) [prefill: {d:.1} tok/s, decode: {d:.1} tok/s] [{s}]\n", .{
+        result.prompt_tokens, result.completion_tokens, elapsed_ms, result.prefill_tps, result.decode_tps, finish_reason,
     });
 
     // Split thinking content from response
@@ -1677,6 +1790,13 @@ fn handleStreamingGeneration(
     gen.timeout_ns = getTimeoutNs();
     gen.logprobs_n = logprobs_n;
     defer gen.deinit(allocator);
+
+    const prefill_ns = timer.read();
+    const prefill_tps: f64 = if (prefill_ns > 0)
+        @as(f64, @floatFromInt(prompt_ids.len)) * @as(f64, @floatFromInt(std.time.ns_per_s)) / @as(f64, @floatFromInt(prefill_ns))
+    else
+        0.0;
+    timer.reset();
 
     // Send SSE headers (no Content-Length — we stream until done)
     const header =
@@ -2071,10 +2191,14 @@ fn handleStreamingGeneration(
     // Done sentinel
     try stream.writeAll("data: [DONE]\n\n");
 
-    const elapsed_ms = timer.read() / std.time.ns_per_ms;
-    const tps = if (elapsed_ms > 0) @as(u64, gen.completion_tokens) * 1000 / elapsed_ms else 0;
-    log.info("  <- {d}+{d} tokens streamed ({d}ms, ~{d} tok/s) [{s}]\n", .{
-        total_prompt, gen.completion_tokens, elapsed_ms, tps, finish_reason,
+    const decode_ns = timer.read();
+    const decode_tps: f64 = if (decode_ns > 0)
+        @as(f64, @floatFromInt(gen.completion_tokens)) * @as(f64, @floatFromInt(std.time.ns_per_s)) / @as(f64, @floatFromInt(decode_ns))
+    else
+        0.0;
+    const elapsed_ms = (prefill_ns + decode_ns) / std.time.ns_per_ms;
+    log.info("  <- {d}+{d} tokens streamed ({d}ms) [prefill: {d:.1} tok/s, decode: {d:.1} tok/s] [{s}]\n", .{
+        total_prompt, gen.completion_tokens, elapsed_ms, prefill_tps, decode_tps, finish_reason,
     });
 }
 
@@ -2470,6 +2594,214 @@ fn parseJsonFloat(root: std.json.ObjectMap, key: []const u8, default: f32, min: 
         else => default,
     } else default;
     return std.math.clamp(raw, min, max);
+}
+
+// ── Vision Processing ──
+
+/// Collect images from messages, run vision encoder, set embeddings on transformer.
+fn processVisionImages(
+    allocator: std.mem.Allocator,
+    vision_enc: *VisionEncoder,
+    xfm: *Transformer,
+    msgs: []const chat_mod.Message,
+) !void {
+    // Only process images from the LAST user message.
+    // Previous turns' images were already processed in their original request;
+    // re-processing them wastes context and causes stale feature confusion.
+    var last_user_images: ?[]const chat_mod.ImageData = null;
+    var i = msgs.len;
+    while (i > 0) {
+        i -= 1;
+        if (std.mem.eql(u8, msgs[i].role, "user")) {
+            last_user_images = msgs[i].images;
+            break;
+        }
+    }
+
+    const images = last_user_images orelse return;
+    if (images.len == 0) return;
+
+    log.info("Vision: processing {d} image(s)\n", .{images.len});
+
+    // Encode each image and concatenate embeddings along the token dimension.
+    // Each image produces [1, N, hidden], concatenated → [1, total_tokens, hidden].
+    var emb_parts = std.ArrayList(mlx.mlx_array).empty;
+    defer {
+        for (emb_parts.items) |e| _ = mlx.mlx_array_free(e);
+        emb_parts.deinit(allocator);
+    }
+
+    for (images) |img| {
+        const h: c_int = @intCast(img.height);
+        const w: c_int = @intCast(img.width);
+        const shape = [_]c_int{ 1, 3, h, w };
+        const pixel_arr = mlx.mlx_array_new_data(img.pixels.ptr, &shape, 4, .float32);
+        defer _ = mlx.mlx_array_free(pixel_arr);
+        const emb = try vision_enc.forward(pixel_arr);
+        try emb_parts.append(allocator, emb);
+    }
+
+    if (emb_parts.items.len == 1) {
+        // Single image — use directly
+        const ve_shape = mlx.getShape(emb_parts.items[0]);
+        log.debug("  Vision: [{d},{d},{d}] tokens\n", .{ ve_shape[0], ve_shape[1], ve_shape[2] });
+        xfm.vision_embeddings = emb_parts.items[0];
+        // Prevent the defer from freeing the one we're using
+        emb_parts.items[0] = mlx.mlx_array_new();
+    } else {
+        // Multiple images — concatenate along token dim (axis=1)
+        const cat_vec = mlx.mlx_vector_array_new_data(emb_parts.items.ptr, emb_parts.items.len);
+        defer _ = mlx.mlx_vector_array_free(cat_vec);
+        var combined = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_concatenate_axis(&combined, cat_vec, 1, vision_enc.s));
+        const ve_shape = mlx.getShape(combined);
+        log.info("  Vision: {d} images → [{d},{d},{d}] tokens\n", .{ emb_parts.items.len, ve_shape[0], ve_shape[1], ve_shape[2] });
+        xfm.vision_embeddings = combined;
+    }
+}
+
+/// Insert BOI + N×image_token + EOI into the prompt before the last user turn's content.
+/// n_tokens: the expected image_seq_length (e.g. 280 from config).
+fn insertImageTokens(allocator: std.mem.Allocator, prompt_ids: []const u32, image_token_id: u32, n_tokens: usize, config: *const model_mod.ModelConfig) ![]u32 {
+    if (image_token_id == 0 or n_tokens == 0) return try allocator.dupe(u32, prompt_ids);
+
+    // Find the last USER turn to insert image tokens.
+    // For Gemma 4: pattern is <start_of_turn>(106) user(1645) \n(108).
+    // Scan backward to find the last user turn (not model turn).
+    var insert_pos: usize = 0;
+    var found_turn = false;
+    if (prompt_ids.len >= 3) {
+        var i = prompt_ids.len - 3;
+        while (true) {
+            if (prompt_ids[i] == 106 and prompt_ids[i + 1] == 1645) {
+                // Found <start_of_turn> user — insert after user\n
+                insert_pos = @min(i + 3, prompt_ids.len);
+                found_turn = true;
+                break;
+            }
+            if (i == 0) break;
+            i -= 1;
+        }
+    }
+    if (!found_turn) {
+        // Fallback: insert after BOS + system prompt, before last few tokens
+        insert_pos = if (prompt_ids.len > 5) prompt_ids.len - 5 else 0;
+    }
+
+    // Insert: BOI + n_tokens × image_token + EOI
+    const boi: u32 = config.boi_token_id;
+    const eoi: u32 = config.eoi_token_id;
+    const has_boi = boi > 0;
+    const has_eoi = eoi > 0;
+    const extra = n_tokens + (if (has_boi) @as(usize, 1) else 0) + (if (has_eoi) @as(usize, 1) else 0);
+    const new_len = prompt_ids.len + extra;
+    const result = try allocator.alloc(u32, new_len);
+
+    @memcpy(result[0..insert_pos], prompt_ids[0..insert_pos]);
+    var pos = insert_pos;
+    if (has_boi) {
+        result[pos] = boi;
+        pos += 1;
+    }
+    @memset(result[pos .. pos + n_tokens], image_token_id);
+    pos += n_tokens;
+    if (has_eoi) {
+        result[pos] = eoi;
+        pos += 1;
+    }
+    @memcpy(result[pos..], prompt_ids[insert_pos..]);
+
+    log.info("  Inserted {s}{d} image tokens{s} at position {d} (prompt: {d} -> {d} tokens)\n", .{
+        if (has_boi) "BOI + " else "", n_tokens, if (has_eoi) " + EOI" else "", insert_pos, prompt_ids.len, new_len,
+    });
+    return result;
+}
+
+/// Decode a JPEG/PNG image buffer to float32 CHW pixels, resized to target_size.
+/// Uses stb_image for decoding, then nearest-neighbor resize + CHW conversion.
+fn decodeImageToPixels(allocator: std.mem.Allocator, encoded: []const u8) ?chat_mod.ImageData {
+    const target: u32 = 768; // Gemma 4 default for square images
+
+    // Try stb_image first (JPEG/PNG) — request 4 channels to handle transparency
+    var w: c_int = 0;
+    var h: c_int = 0;
+    var channels: c_int = 0;
+    const pixels_rgba: ?[*]u8 = stb.stbi_load_from_memory(encoded.ptr, @intCast(encoded.len), &w, &h, &channels, 4);
+    var pixels: ?[*]u8 = null;
+    var free_fn: enum { stb_free, webp_free, alloc_free } = .stb_free;
+
+    // Composite RGBA onto white background → RGB
+    if (pixels_rgba) |rgba| {
+        const total_px: usize = @intCast(w * h);
+        const rgb_buf = allocator.alloc(u8, total_px * 3) catch {
+            stb.stbi_image_free(rgba);
+            return null;
+        };
+        for (0..total_px) |i| {
+            const a = @as(u16, rgba[i * 4 + 3]);
+            const inv_a = 255 - a;
+            rgb_buf[i * 3 + 0] = @intCast((a * @as(u16, rgba[i * 4 + 0]) + inv_a * 255) / 255);
+            rgb_buf[i * 3 + 1] = @intCast((a * @as(u16, rgba[i * 4 + 1]) + inv_a * 255) / 255);
+            rgb_buf[i * 3 + 2] = @intCast((a * @as(u16, rgba[i * 4 + 2]) + inv_a * 255) / 255);
+        }
+        stb.stbi_image_free(rgba);
+        pixels = rgb_buf.ptr;
+        free_fn = .alloc_free;
+    }
+
+    // If stb_image failed, try WebP
+    if (pixels == null) {
+        var webp_w: c_int = 0;
+        var webp_h: c_int = 0;
+        pixels = webp.WebPDecodeRGB(encoded.ptr, encoded.len, &webp_w, &webp_h);
+        if (pixels != null) {
+            w = webp_w;
+            h = webp_h;
+            free_fn = .webp_free;
+        }
+    }
+    if (pixels == null) return null;
+    const px = pixels.?;
+    defer switch (free_fn) {
+        .stb_free => stb.stbi_image_free(px),
+        .webp_free => webp.WebPFree(px),
+        .alloc_free => {
+            const src_total: usize = @intCast(w * h * 3);
+            allocator.free(px[0..src_total]);
+        },
+    };
+
+    const src_w: u32 = @intCast(w);
+    const src_h: u32 = @intCast(h);
+
+    // Allocate float32 CHW output: [3, target, target]
+    const out_size = 3 * target * target;
+    const out_buf = allocator.alloc(u8, out_size * 4) catch return null;
+    const float_buf: [*]f32 = @alignCast(@ptrCast(out_buf.ptr));
+
+    // Bilinear resize + HWC→CHW + rescale to [0,1]
+    for (0..target) |ty| {
+        for (0..target) |tx| {
+            // Map target pixel to source coordinates
+            const sx_f: f32 = @as(f32, @floatFromInt(tx)) * @as(f32, @floatFromInt(src_w)) / @as(f32, @floatFromInt(target));
+            const sy_f: f32 = @as(f32, @floatFromInt(ty)) * @as(f32, @floatFromInt(src_h)) / @as(f32, @floatFromInt(target));
+
+            // Nearest-neighbor for simplicity (bilinear adds complexity for marginal benefit here)
+            const sx: u32 = @min(@as(u32, @intFromFloat(sx_f)), src_w - 1);
+            const sy: u32 = @min(@as(u32, @intFromFloat(sy_f)), src_h - 1);
+
+            const src_idx = (sy * src_w + sx) * 3;
+            const dst_idx = ty * target + tx;
+
+            // CHW: channel 0 (R), channel 1 (G), channel 2 (B)
+            float_buf[0 * target * target + dst_idx] = @as(f32, @floatFromInt(px[src_idx + 0])) / 255.0;
+            float_buf[1 * target * target + dst_idx] = @as(f32, @floatFromInt(px[src_idx + 1])) / 255.0;
+            float_buf[2 * target * target + dst_idx] = @as(f32, @floatFromInt(px[src_idx + 2])) / 255.0;
+        }
+    }
+
+    log.info("  Decoded {d}x{d} image → {d}x{d} float32 CHW\n", .{ src_w, src_h, target, target });
+    return .{ .pixels = out_buf, .width = target, .height = target };
 }
 
 // ── Anthropic Messages API ──
@@ -2970,7 +3302,6 @@ fn handleAnthropicNonStreaming(
     }
 
     const elapsed_ms = timer.read() / std.time.ns_per_ms;
-    const tps = if (elapsed_ms > 0) @as(u64, result.completion_tokens) * 1000 / elapsed_ms else 0;
 
     // Build content blocks array
     var content = std.ArrayList(u8).empty;
@@ -3023,8 +3354,8 @@ fn handleAnthropicNonStreaming(
                 allocator.free(tool_calls);
             }
 
-            log.info("  <- {d}+{d} tokens ({d}ms, ~{d} tok/s) [tool_use: {d}]\n", .{
-                result.prompt_tokens, result.completion_tokens, elapsed_ms, tps, tool_calls.len,
+            log.info("  <- {d}+{d} tokens ({d}ms) [prefill: {d:.1} tok/s, decode: {d:.1} tok/s] [tool_use: {d}]\n", .{
+                result.prompt_tokens, result.completion_tokens, elapsed_ms, result.prefill_tps, result.decode_tps, tool_calls.len,
             });
 
             // Emit tool_use content blocks
@@ -3068,8 +3399,8 @@ fn handleAnthropicNonStreaming(
     try content.append(allocator, ']');
 
     const stop_reason = mapFinishToStopReason(finish_reason);
-    log.info("  <- {d}+{d} tokens ({d}ms, ~{d} tok/s) [{s}]\n", .{
-        result.prompt_tokens, result.completion_tokens, elapsed_ms, tps, stop_reason,
+    log.info("  <- {d}+{d} tokens ({d}ms) [prefill: {d:.1} tok/s, decode: {d:.1} tok/s] [{s}]\n", .{
+        result.prompt_tokens, result.completion_tokens, elapsed_ms, result.prefill_tps, result.decode_tps, stop_reason,
     });
 
     const response = try std.fmt.allocPrint(allocator,
@@ -3107,6 +3438,13 @@ fn handleAnthropicStreaming(
     var gen = try Generator.init(allocator, xfm, tok, prompt_ids, max_tokens, sampling, eos_token_ids);
     gen.timeout_ns = getTimeoutNs();
     defer gen.deinit(allocator);
+
+    const prefill_ns = timer.read();
+    const prefill_tps: f64 = if (prefill_ns > 0)
+        @as(f64, @floatFromInt(prompt_ids.len)) * @as(f64, @floatFromInt(std.time.ns_per_s)) / @as(f64, @floatFromInt(prefill_ns))
+    else
+        0.0;
+    timer.reset();
 
     // SSE headers
     const header =
@@ -3504,10 +3842,14 @@ fn handleAnthropicStreaming(
     }
     try sendAnthropicEvent(stream, "message_stop", "{\"type\":\"message_stop\"}");
 
-    const elapsed_ms = timer.read() / std.time.ns_per_ms;
-    const tps = if (elapsed_ms > 0) @as(u64, gen.completion_tokens) * 1000 / elapsed_ms else 0;
-    log.info("  <- {d}+{d} tokens streamed ({d}ms, ~{d} tok/s) [{s}]\n", .{
-        total_prompt, gen.completion_tokens, elapsed_ms, tps, stop_reason,
+    const decode_ns = timer.read();
+    const decode_tps: f64 = if (decode_ns > 0)
+        @as(f64, @floatFromInt(gen.completion_tokens)) * @as(f64, @floatFromInt(std.time.ns_per_s)) / @as(f64, @floatFromInt(decode_ns))
+    else
+        0.0;
+    const elapsed_ms = (prefill_ns + decode_ns) / std.time.ns_per_ms;
+    log.info("  <- {d}+{d} tokens streamed ({d}ms) [prefill: {d:.1} tok/s, decode: {d:.1} tok/s] [{s}]\n", .{
+        total_prompt, gen.completion_tokens, elapsed_ms, prefill_tps, decode_tps, stop_reason,
     });
 }
 

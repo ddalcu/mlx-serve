@@ -408,6 +408,15 @@ struct BrowseHandler: ToolHandler {
         case "click":
             guard let selector = parameters["selector"] else { throw ToolError.missingParameter("selector") }
             return try await browser.click(selector: selector)
+        case "screenshot":
+            if let url = parameters["url"] {
+                _ = try await browser.navigate(to: url)
+            }
+            guard let data = await browser.takeScreenshot() else {
+                return "Failed to capture screenshot"
+            }
+            let base64 = data.base64EncodedString()
+            return "[screenshot:\(data.count) bytes]\ndata:image/jpeg;base64,\(base64)"
         case "getInfo":
             return try await browser.getInfo()
         case "executeJS":

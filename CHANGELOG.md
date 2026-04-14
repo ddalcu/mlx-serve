@@ -1,5 +1,52 @@
 # Changelog
 
+## v26.4.21 — Vision Pipeline, Prefill/Decode Metrics, Async Eval
+
+### Vision Encoder (Gemma 4 SigLIP)
+- **Full vision pipeline**: Gemma 4 models can now process images end-to-end — SigLIP vision encoder with patch embedding, 2D RoPE, clipped linears, position pooling, and embedding projection
+- **Image decoding**: JPEG/PNG via stb_image, WebP via libwebp — decoded, resized to model's expected resolution, converted to float32 CHW format
+- **OpenAI `image_url` content blocks**: Supports `data:image/jpeg;base64,...` and preprocessed `data:image/x-mlx-pixels;base64,...` in chat completion requests
+- **`--no-vision` flag**: Disables vision encoder at startup to save ~340MB GPU memory when not needed
+- **KV cache invalidation on image requests**: Image tokens have identical IDs but different vision embeddings — cache is reset to prevent stale feature reuse
+- **New FFI bindings**: `mlx_equal`, `mlx_remainder`, `mlx_ones`, `mlx_minimum`, `mlx_cos`, `mlx_sin`, `mlx_array_data_bool` added to `mlx.zig`
+- **Build changes**: Links stb_image and libwebp; `build.zig` updated for both exe and test targets
+
+### Prefill/Decode Metrics
+- **Separate timing in server logs**: All 6 handler paths (non-streaming/streaming × completions/chat/Anthropic) now report prefill and decode tok/s independently instead of a single combined figure
+- **Old**: `<- 1133+256 tokens (5906ms, ~43 tok/s) [length]`
+- **New**: `<- 1133+256 tokens (5906ms) [prefill: 606 tok/s, decode: 63 tok/s] [length]`
+
+### Async Eval Optimization
+- **Removed synchronous `evalState()` bottleneck**: `Generator.init()` now bundles KV cache state + sampled token + next forward pass into a single `async_eval` call, avoiding a synchronous GPU stall that blocked the async pipeline
+- **KV cache buffer allocation cleanup**: Separated fresh-buffer and grow-existing-buffer paths in `KVCache.update()` for clarity
+
+### MLX Core App — Image Support
+- **Image attachment UI**: Drag-and-drop or paste images into the chat input; thumbnails with remove buttons shown before sending
+- **`ImagePreprocessor`**: Resizes and converts images to float32 CHW pixel data for the vision encoder
+- **`ChatImage` model**: JPEG image data attached to `ChatMessage`, persisted via Codable
+- **Multimodal content blocks**: `buildMultimodalContent()` constructs OpenAI-format `image_url` content blocks with preprocessed pixel data
+- **Screenshot capture from browse tool**: Browse results can include screenshots sent as vision input
+
+### MLX Core App — Agent Improvements
+- **`cwd` tool**: New "Change Directory" tool lets the agent switch working directory for subsequent shell commands
+- **Shell output includes cwd**: Shell tool results now show `[cwd: /path]` prefix so the model knows where commands ran
+- **Context monitor**: Real-time prompt token / context length usage bar shown above the input area
+- **Context-aware image handling**: Images stripped from history replay to avoid stale vision features and context waste
+
+### MLX Core App — UI Refinements
+- **StatusMenuView cleanup**: Streamlined server controls layout
+- **TestServer vision support**: Test API endpoints handle image content blocks for automated vision testing
+
+### Model Support
+- **Vision config parsing**: `ModelConfig` now parses `vision_config` from `config.json` (hidden_size, num_layers, num_heads, head_dim, intermediate_size, patch_size, pooling, position_embedding_size, etc.)
+- **`loadWeightsWithVision()`**: Loads both language model and vision tower weights from safetensors
+
+### Testing
+- **`tests/test_vision.sh`**: Vision pipeline integration tests
+- **`tests/fixtures/`**: Test image fixtures for vision tests
+
+---
+
 ## v26.4.20 — Tool Reliability, Thinking+Tools, Truncation Recovery
 
 ### Tool Parameter Key Order (3-layer fix)

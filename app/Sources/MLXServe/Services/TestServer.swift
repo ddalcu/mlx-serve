@@ -150,6 +150,8 @@ class TestServer {
                                 responseBody = self.startAgentJob(body: body)
                             case ("GET", "/test/agent/status"):
                                 responseBody = self.getAgentJobStatus()
+                            case ("GET", "/test/context"):
+                                responseBody = await self.handleContext()
                             default:
                                 responseBody = self.jsonResponse(["error": "Not found: \(method) \(path)"])
                             }
@@ -243,6 +245,9 @@ class TestServer {
                 "isStreaming": msg.isStreaming,
                 "isAgentSummary": msg.isAgentSummary,
             ]
+            if let pt = msg.promptTokens { d["promptTokens"] = pt }
+            if let ct = msg.completionTokens { d["completionTokens"] = ct }
+            if let tps = msg.tokensPerSecond { d["tokensPerSecond"] = tps }
             if let tcId = msg.toolCallId { d["toolCallId"] = tcId }
             if let tcs = msg.toolCalls {
                 d["toolCalls"] = tcs.map { ["id": $0.id, "name": $0.name, "arguments": $0.arguments] }
@@ -254,6 +259,42 @@ class TestServer {
             return str
         }
         return jsonError("Serialization failed")
+    }
+
+    private func handleContext() async -> String {
+        guard let appState else { return jsonError("No app state") }
+        guard let session = appState.chatSessions.first(where: { $0.id == appState.activeChatId }) else {
+            return jsonResponse(["error": "No active session"])
+        }
+
+        // Find last message with usage data
+        let lastWithUsage = session.messages.last(where: { $0.promptTokens != nil && $0.promptTokens! > 0 })
+        let promptTokens = lastWithUsage?.promptTokens ?? 0
+        let completionTokens = lastWithUsage?.completionTokens ?? 0
+
+        // Effective context length (same logic as ChatView)
+        let contextLength: Int
+        if appState.contextSize > 0 {
+            contextLength = appState.contextSize
+        } else if let modelCtx = appState.server.modelInfo?.contextLength, modelCtx > 0 {
+            contextLength = modelCtx
+        } else {
+            contextLength = 32768
+        }
+
+        let usageRatio = contextLength > 0 ? Double(promptTokens) / Double(contextLength) : 0
+        let remaining = max(0, contextLength - promptTokens)
+        let genBudget = min(remaining, appState.maxTokens)
+
+        return jsonResponse([
+            "context_length": contextLength,
+            "prompt_tokens": promptTokens,
+            "completion_tokens": completionTokens,
+            "max_tokens": appState.maxTokens,
+            "usage_ratio": Int(usageRatio * 100),
+            "generation_budget": genBudget,
+            "status": usageRatio > 0.80 ? "critical" : usageRatio > 0.60 ? "warning" : "ok",
+        ])
     }
 
     private func handleStatus() async -> String {
@@ -404,7 +445,7 @@ class TestServer {
         }
 
         let enableThinking = json["thinking"] as? Bool ?? false
-        let workDir = json["working_directory"] as? String ?? NSString(string: "~/.mlx-serve/workspace").expandingTildeInPath
+        var workDir = json["working_directory"] as? String ?? NSString(string: "~/.mlx-serve/workspace").expandingTildeInPath
 
         // Ensure we have an active session in agent mode
         let sessionId: UUID
@@ -442,6 +483,7 @@ class TestServer {
 
         var recentToolNames: [String] = []
         var permanentlyBlocked: Set<String> = []
+        var truncationRetries = 0
         for iteration in 0..<maxIterations {
             // Build history — same as ChatView.buildAgentHistory()
             var history = buildAgentHistory(appState: appState, sessionId: sessionId)
@@ -461,6 +503,7 @@ class TestServer {
 
             // Stream model response with tools
             var receivedToolCalls: [APIClient.ToolCall] = []
+            var maxTokensHit = false
             let stream = api.streamChat(
                 port: appState.server.port,
                 messages: messages,
@@ -482,6 +525,7 @@ class TestServer {
                     case .toolCalls(let calls):
                         receivedToolCalls = calls
                     case .maxTokensReached:
+                        maxTokensHit = true
                         appState.updateLastMessage(in: sessionId, content: "\n\n⚠️ *Output truncated — max tokens reached.*")
                     case .done:
                         break
@@ -492,6 +536,19 @@ class TestServer {
                 break
             }
             appState.updateLastMessage(in: sessionId, streaming: false)
+
+            // Truncation recovery: if max_tokens was hit AND tool calls were received,
+            // the tool call args are likely truncated. Don't execute them — retry.
+            if maxTokensHit && !receivedToolCalls.isEmpty && truncationRetries < 2 {
+                truncationRetries += 1
+                if let sIdx = appState.chatSessions.firstIndex(where: { $0.id == sessionId }),
+                   !appState.chatSessions[sIdx].messages.isEmpty {
+                    appState.chatSessions[sIdx].messages.removeLast()
+                }
+                let nudge = ChatMessage(role: .user, content: "[System: Your last response was cut off because the output was too long. The tool call was NOT executed. To avoid this, write shorter responses: use shell with heredoc (cat << 'EOF' > file) for file content instead of writeFile, or break large files into smaller pieces.]")
+                appState.appendMessage(to: sessionId, message: nudge)
+                continue
+            }
 
             // Pad detection
             if receivedToolCalls.isEmpty {
@@ -525,12 +582,19 @@ class TestServer {
             }
 
             // Repetition detection: track tool names over sliding window
+            // Write tools (writeFile, editFile, shell) are never blocked — they make progress.
+            // Browse/webSearch get a higher threshold (8 in 12) since they're inherently multi-step.
+            // Other read-only tools use a tight threshold (4 in 6).
             let writeTools: Set<String> = ["writeFile", "editFile", "shell"]
+            let browseTools: Set<String> = ["browse", "webSearch"]
             let uniqueNames = Set(receivedToolCalls.map { $0.name })
             recentToolNames.append(contentsOf: uniqueNames)
-            if recentToolNames.count > 6 { recentToolNames = Array(recentToolNames.suffix(6)) }
+            if recentToolNames.count > 12 { recentToolNames = Array(recentToolNames.suffix(12)) }
             for name in uniqueNames {
-                if recentToolNames.filter({ $0 == name }).count >= 4 && !writeTools.contains(name) {
+                if writeTools.contains(name) { continue }
+                let count = recentToolNames.filter({ $0 == name }).count
+                let threshold = browseTools.contains(name) ? 8 : 4
+                if count >= threshold {
                     permanentlyBlocked.insert(name)
                 }
             }
@@ -547,14 +611,38 @@ class TestServer {
                     effectiveTool = tool
                 }
 
+                // Handle cwd tool: change working directory for subsequent calls
                 let output: String
-                if blockedTools.contains(tc.name) {
+                if effectiveTool == .cwd {
+                    if let path = tc.arguments["path"] {
+                        let resolved: String
+                        if path.hasPrefix("/") || path.hasPrefix("~") {
+                            resolved = NSString(string: path).expandingTildeInPath
+                        } else {
+                            resolved = (workDir as NSString).appendingPathComponent(path)
+                        }
+                        let normalized = (resolved as NSString).standardizingPath
+                        var isDir: ObjCBool = false
+                        if FileManager.default.fileExists(atPath: normalized, isDirectory: &isDir), isDir.boolValue {
+                            workDir = normalized
+                            output = "Changed working directory to \(normalized)"
+                        } else {
+                            output = "Error: '\(normalized)' is not a directory"
+                        }
+                    } else {
+                        output = "Error: cwd requires a path parameter. Example: {\"path\": \"myproject\"}"
+                    }
+                } else if blockedTools.contains(tc.name) {
                     output = "BLOCKED: \(tc.name) has been called too many times in a row. This tool is now disabled for this task. Use writeFile to create files, readFile to read them, editFile to modify them, and shell for commands."
                 } else {
                     let missing = Self.missingRequiredParams(for: tc.name, arguments: tc.arguments)
                     if !missing.isEmpty {
-                        let example = Self.toolExample(for: tc.name)
-                        output = "Error: \(tc.name) missing required params: \(missing.joined(separator: ", ")). Example: \(example)"
+                        if (tc.name == "writeFile" || tc.name == "editFile") && missing.contains("content") && tc.arguments["path"] != nil {
+                            output = "Error: \(tc.name) content was truncated — your output was too long and got cut off before the content was complete. The file was NOT written. To fix this, use shell with a heredoc instead: {\"command\": \"cat << 'FILEEOF' > \(tc.arguments["path"] ?? "path")\\nfile content here\\nFILEEOF\"}"
+                        } else {
+                            let example = Self.toolExample(for: tc.name)
+                            output = "Error: \(tc.name) missing required params: \(missing.joined(separator: ", ")). Example: \(example)"
+                        }
                     } else if let effectiveTool, let handler = toolHandlers[effectiveTool] {
                         do {
                             output = try await handler.execute(parameters: tc.arguments, workingDirectory: workDir)
@@ -607,16 +695,50 @@ class TestServer {
 
     // MARK: - Helpers
 
-    /// Replicates ChatView.buildAgentHistory() exactly
+    /// Budget-aware history builder — matches ChatView.buildAgentHistory().
     private func buildAgentHistory(appState: AppState, sessionId: UUID) -> [[String: Any]] {
         guard let session = appState.chatSessions.first(where: { $0.id == sessionId }) else { return [] }
         let allMessages = session.messages
 
-        let firstUserIdx = allMessages.firstIndex { $0.role == .user && $0.toolCallId == nil }
-        let windowStart = max(0, allMessages.count - 28)
-        let window = Array(allMessages.suffix(28))
-        let needsPin = firstUserIdx != nil && firstUserIdx! < windowStart
+        // Token budget
+        let contextLength: Int
+        if appState.contextSize > 0 { contextLength = appState.contextSize }
+        else if let modelCtx = appState.server.modelInfo?.contextLength, modelCtx > 0 { contextLength = modelCtx }
+        else { contextLength = 32768 }
+        let systemCost = max(1, (AgentPrompt.systemPrompt + AgentPrompt.memory).utf8.count / 4)
+        let budget = max(1024, contextLength - appState.maxTokens - 1024 - systemCost)
 
+        let firstUserIdx = allMessages.firstIndex { $0.role == .user && $0.toolCallId == nil }
+        var pinnedCost = 0
+        if let idx = firstUserIdx {
+            pinnedCost = max(1, allMessages[idx].content.utf8.count / 4) + 4
+        }
+
+        // Walk backward, accumulating costs
+        var remainingBudget = budget - pinnedCost
+        var includeStartIdx = allMessages.count
+        for i in stride(from: allMessages.count - 1, through: 0, by: -1) {
+            let msg = allMessages[i]
+            if msg.role == .system && msg.toolCallId == nil { continue }
+            if msg.isAgentSummary { continue }
+            if msg.role == .assistant && msg.content.contains("couldn't generate a response") { continue }
+            var cost = 4 + max(1, msg.content.utf8.count / 4)
+            if let tcs = msg.toolCalls {
+                for tc in tcs { cost += max(1, tc.name.utf8.count / 4) + max(1, tc.arguments.utf8.count / 4) + 8 }
+            }
+            if cost > remainingBudget { break }
+            remainingBudget -= cost
+            includeStartIdx = i
+        }
+
+        let needsPin = firstUserIdx != nil && firstUserIdx! < includeStartIdx
+
+        // Auto-compact: squeeze tool results when budget is tight
+        let freeRatio = Double(remainingBudget + pinnedCost) / Double(budget + pinnedCost)
+        let recentLimit = freeRatio < 0.25 ? 500 : 2000
+        let olderLimit = freeRatio < 0.25 ? 100 : 500
+
+        let window = Array(allMessages[includeStartIdx..<allMessages.count])
         let totalToolResults = window.filter { $0.toolCallId != nil }.count
         var toolResultsSeen = 0
 
@@ -629,7 +751,7 @@ class TestServer {
         for msg in window {
             if let callId = msg.toolCallId {
                 let isRecent = toolResultsSeen >= totalToolResults - 2
-                let limit = isRecent ? 2000 : 500
+                let limit = isRecent ? recentLimit : olderLimit
                 toolResultsSeen += 1
                 history.append([
                     "role": "tool",

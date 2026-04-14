@@ -71,16 +71,16 @@ pub const KVCache = struct {
             const new_cap: c_int = @intCast(n_chunks * chunk_step);
             const buf_shape = [_]c_int{ B, heads, new_cap, head_dim };
 
-            var new_k_buf = mlx.mlx_array_new();
-            var new_v_buf = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_zeros(&new_k_buf, &buf_shape, 4, dtype, s));
-            try mlx.check(mlx.mlx_zeros(&new_v_buf, &buf_shape, 4, dtype, s));
-
             if (entry.initialized and entry.offset > 0) {
-                // Copy existing data into new buffer via slice_update
-                const off: c_int = @intCast(entry.offset);
+                // Growing existing buffer — create zeros and copy old data
+                var new_k_buf = mlx.mlx_array_new();
+                var new_v_buf = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_zeros(&new_k_buf, &buf_shape, 4, dtype, s));
+                try mlx.check(mlx.mlx_zeros(&new_v_buf, &buf_shape, 4, dtype, s));
+
+                const off_c: c_int = @intCast(entry.offset);
                 const su_start = [_]c_int{ 0, 0, 0, 0 };
-                const su_stop = [_]c_int{ B, heads, off, head_dim };
+                const su_stop = [_]c_int{ B, heads, off_c, head_dim };
                 const su_strides = [_]c_int{ 1, 1, 1, 1 };
 
                 var old_k_data = mlx.mlx_array_new();
@@ -97,14 +97,22 @@ pub const KVCache = struct {
                 _ = mlx.mlx_array_free(old_v_data);
                 _ = mlx.mlx_array_free(new_k_buf);
                 _ = mlx.mlx_array_free(new_v_buf);
-                new_k_buf = updated_k;
-                new_v_buf = updated_v;
-            }
 
-            _ = mlx.mlx_array_free(entry.keys);
-            _ = mlx.mlx_array_free(entry.values);
-            entry.keys = new_k_buf;
-            entry.values = new_v_buf;
+                _ = mlx.mlx_array_free(entry.keys);
+                _ = mlx.mlx_array_free(entry.values);
+                entry.keys = updated_k;
+                entry.values = updated_v;
+            } else {
+                // Fresh buffer — create zeros directly (no copy needed)
+                _ = mlx.mlx_array_free(entry.keys);
+                _ = mlx.mlx_array_free(entry.values);
+                var new_k_buf = mlx.mlx_array_new();
+                var new_v_buf = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_zeros(&new_k_buf, &buf_shape, 4, dtype, s));
+                try mlx.check(mlx.mlx_zeros(&new_v_buf, &buf_shape, 4, dtype, s));
+                entry.keys = new_k_buf;
+                entry.values = new_v_buf;
+            }
             entry.initialized = true;
         }
 
@@ -527,6 +535,10 @@ pub const Transformer = struct {
 
     // Compiled forward pass closure (JIT-compiled for Metal kernel fusion)
     compiled_forward: ?mlx.mlx_closure = null,
+
+    // Vision: set before prefill when images are present, cleared after.
+    // Shape: [B, num_image_tokens, hidden_size]. Spliced at image_token_id positions.
+    vision_embeddings: ?mlx.mlx_array = null,
 
     // Compiled closures (fuse ops into single kernels, matching mlx-lm's @mx.compile)
     compiled_gelu: ?mlx.mlx_closure = null,
@@ -1246,6 +1258,125 @@ pub const Transformer = struct {
         return result;
     }
 
+    /// Splice vision embeddings into text embeddings at image_token_id positions.
+    /// h: [B, seq_len, hidden] text embeddings
+    /// token_ids: [B, seq_len] original token IDs
+    /// vision_emb: [B, N_img, hidden] vision embeddings
+    /// Returns new h with vision embeddings replacing image token positions.
+    /// masked_scatter: replaces image token positions with vision features.
+    /// Matches Python reference: cumsum-based indexing into flattened source.
+    fn spliceVisionEmbeddings(self: *Transformer, h: mlx.mlx_array, token_ids: mlx.mlx_array, vision_emb: mlx.mlx_array, image_token_id: u32) !mlx.mlx_array {
+        const h_shape = mlx.getShape(h);
+
+        // mask = (token_ids == image_token_id): [B, seq_len] bool
+        const img_id_arr = mlx.mlx_array_new_int(@intCast(image_token_id));
+        defer _ = mlx.mlx_array_free(img_id_arr);
+        var mask_2d = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(mask_2d);
+        try mlx.check(mlx.mlx_equal(&mask_2d, token_ids, img_id_arr, self.s));
+
+        // Expand mask to [B, seq_len, hidden] via broadcast
+        const expand_shape = [_]c_int{ h_shape[0], h_shape[1], 1 };
+        var mask_3d = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(mask_3d);
+        try mlx.check(mlx.mlx_reshape(&mask_3d, mask_2d, &expand_shape, 3, self.s));
+
+        // Broadcast to full shape via logical and with ones
+        var mask_expanded = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(mask_expanded);
+        {
+            var ones_h = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(ones_h);
+            try mlx.check(mlx.mlx_ones(&ones_h, h_shape.ptr, 3, .bool_, self.s));
+            try mlx.check(mlx.mlx_multiply(&mask_expanded, mask_3d, ones_h, self.s));
+        }
+
+        // Flatten everything
+        const total = h_shape[0] * h_shape[1] * h_shape[2];
+        const flat_shape = [_]c_int{total};
+
+        var mask_flat = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(mask_flat);
+        try mlx.check(mlx.mlx_reshape(&mask_flat, mask_expanded, &flat_shape, 1, self.s));
+
+        // mask_int = mask_flat.astype(int32)
+        var mask_int = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(mask_int);
+        try mlx.check(mlx.mlx_astype(&mask_int, mask_flat, .int32, self.s));
+
+        // indices = cumsum(mask_int, axis=0) - 1
+        var cumsum_arr = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(cumsum_arr);
+        try mlx.check(mlx.mlx_cumsum(&cumsum_arr, mask_int, 0, false, true, self.s));
+        const one_i = mlx.mlx_array_new_int(1);
+        defer _ = mlx.mlx_array_free(one_i);
+        var indices = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(indices);
+        try mlx.check(mlx.mlx_subtract(&indices, cumsum_arr, one_i, self.s));
+
+        // source = vision_emb.flatten()
+        const ve_shape = mlx.getShape(vision_emb);
+        const source_size = ve_shape[0] * ve_shape[1] * ve_shape[2];
+        const source_shape = [_]c_int{source_size};
+        var source_flat = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(source_flat);
+        try mlx.check(mlx.mlx_reshape(&source_flat, vision_emb, &source_shape, 1, self.s));
+
+        // indices_mod = indices % source_size
+        const source_size_arr = mlx.mlx_array_new_int(source_size);
+        defer _ = mlx.mlx_array_free(source_size_arr);
+        var indices_mod = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(indices_mod);
+        try mlx.check(mlx.mlx_remainder(&indices_mod, indices, source_size_arr, self.s));
+
+        // aligned = source[indices_mod]
+        var aligned = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(aligned);
+        try mlx.check(mlx.mlx_take(&aligned, source_flat, indices_mod, self.s));
+
+        // Cast aligned to bf16 to match h
+        var aligned_bf = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(aligned_bf);
+        try mlx.check(mlx.mlx_astype(&aligned_bf, aligned, .bfloat16, self.s));
+
+        // input_flat = h.flatten()
+        var input_flat = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(input_flat);
+        try mlx.check(mlx.mlx_reshape(&input_flat, h, &flat_shape, 1, self.s));
+
+        // result_flat = where(mask_flat, aligned_bf, input_flat)
+        var result_flat = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(result_flat);
+        try mlx.check(mlx.mlx_where(&result_flat, mask_flat, aligned_bf, input_flat, self.s));
+
+        // Reshape back to [B, seq_len, hidden]
+        var result = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_reshape(&result, result_flat, h_shape.ptr, 3, self.s));
+        _ = mlx.mlx_array_free(h);
+        return result;
+    }
+
+    /// Apply vision embeddings to text embeddings during prefill.
+    /// Handles scaling and splicing at image_token_id positions.
+    /// Returns the (potentially modified) h; caller should replace their h with the result.
+    fn applyVisionEmbeddings(self: *Transformer, h: mlx.mlx_array, token_ids: mlx.mlx_array) !mlx.mlx_array {
+        const cfg = &self.config;
+        const h_shape = mlx.getShape(h);
+        // Only during prefill (seq_len > 1)
+        if (h_shape[1] <= 1) return h;
+        const ve = self.vision_embeddings orelse return h;
+        if (cfg.image_token_id == 0) return h;
+
+        if (self.emb_scale) |scale| {
+            var ve_scaled = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(ve_scaled);
+            try mlx.check(mlx.mlx_multiply(&ve_scaled, ve, scale, self.s));
+            return self.spliceVisionEmbeddings(h, token_ids, ve_scaled, cfg.image_token_id);
+        } else {
+            return self.spliceVisionEmbeddings(h, token_ids, ve, cfg.image_token_id);
+        }
+    }
+
     // ── Activation functions ──
 
     /// GELU approximate: dispatches to compiled (fused kernel) when available.
@@ -1694,6 +1825,9 @@ pub const Transformer = struct {
 
         var h = try self.embedding(token_ids);
 
+        // Splice vision embeddings at image_token_id positions (prefill only)
+        h = try self.applyVisionEmbeddings(h, token_ids);
+
         const x_shape = mlx.getShape(h);
         const batch: c_int = x_shape[0];
         const seq_len: c_int = x_shape[1];
@@ -1736,13 +1870,39 @@ pub const Transformer = struct {
             }
         }
 
-        // Gemma 4 PLE: compute per-layer input embeddings once before the layer loop
+        // Gemma 4 PLE: compute per-layer input embeddings once before the layer loop.
+        // For vision: zero out image token IDs before PLE (reference: text_mask = ~image_mask).
         var ple_input: ?mlx.mlx_array = null;
         defer {
             if (ple_input) |p| _ = mlx.mlx_array_free(p);
         }
         if (cfg.hidden_size_per_layer_input > 0) {
-            ple_input = try self.computePLEInput(token_ids, h, batch, seq_len);
+            if (self.vision_embeddings != null and cfg.image_token_id > 0) {
+                // Zero out image tokens: per_layer_inputs_tokens = where(text_mask, ids, zeros)
+                const img_id = mlx.mlx_array_new_int(@intCast(cfg.image_token_id));
+                defer _ = mlx.mlx_array_free(img_id);
+                var img_mask = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(img_mask);
+                try mlx.check(mlx.mlx_equal(&img_mask, token_ids, img_id, self.s));
+                // text_mask = NOT image_mask (invert: 1 where text, 0 where image)
+                var text_mask_int = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(text_mask_int);
+                try mlx.check(mlx.mlx_astype(&text_mask_int, img_mask, .int32, self.s));
+                var ones_int = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(ones_int);
+                const ones_s = [_]c_int{ batch, seq_len };
+                try mlx.check(mlx.mlx_ones(&ones_int, &ones_s, 2, .int32, self.s));
+                var text_mask = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(text_mask);
+                try mlx.check(mlx.mlx_subtract(&text_mask, ones_int, text_mask_int, self.s));
+                // ple_ids = token_ids * text_mask (zeros at image positions)
+                var ple_ids = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(ple_ids);
+                try mlx.check(mlx.mlx_multiply(&ple_ids, token_ids, text_mask, self.s));
+                ple_input = try self.computePLEInput(ple_ids, h, batch, seq_len);
+            } else {
+                ple_input = try self.computePLEInput(token_ids, h, batch, seq_len);
+            }
         }
 
         for (0..cfg.num_hidden_layers) |layer_idx| {
@@ -1998,6 +2158,9 @@ pub const Transformer = struct {
         const is_gemma4 = std.mem.eql(u8, cfg.model_type, "gemma4");
 
         var h = try self.embedding(token_ids);
+
+        // Splice vision embeddings at image_token_id positions (prefill only)
+        h = try self.applyVisionEmbeddings(h, token_ids);
 
         const x_shape = mlx.getShape(h);
         const batch: c_int = x_shape[0];

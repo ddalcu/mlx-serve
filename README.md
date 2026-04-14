@@ -29,6 +29,7 @@ brew install mlx-serve          # CLI server only
 - Tool calling (function calling) with automatic detection
 - KV cache reuse across requests for fast multi-turn conversations
 - Sampling: temperature, top-k, top-p, repeat penalty, presence penalty
+- Vision/image support (Gemma 4 SigLIP encoder) — send images via `image_url` content blocks
 - Reasoning/thinking mode support
 - Chat templates via Jinja2 (Jinja_cpp) with fallback formatting
 - TUI status bar with CPU, memory, and GPU metrics
@@ -39,7 +40,7 @@ Menu bar app that wraps the server with a full UI:
 
 - **Model browser** -- download models from HuggingFace with resumable downloads
 - **Chat interface** -- multi-session chat with markdown rendering
-- **Agent mode** -- 8 built-in tools (shell, readFile, writeFile, editFile, searchFiles, browse, webSearch, saveMemory) with automatic tool calling loop
+- **Agent mode** -- 10 built-in tools (shell, cwd, readFile, writeFile, editFile, searchFiles, listFiles, browse, webSearch, saveMemory) with automatic tool calling loop
 - **Editable system prompt** -- customize agent behavior via `~/.mlx-serve/system-prompt.md` (Agent menu → Edit System Prompt)
 - **Persistent memory** -- agent can save memories across sessions to `~/.mlx-serve/memory.md`
 - **Prompt-based skills** -- drop `.md` files in `~/.mlx-serve/skills/` to teach the agent custom capabilities
@@ -60,10 +61,10 @@ Any quantized MLX model using one of the above architectures should work.
 
 - macOS with Apple Silicon (M1/M2/M3/M4)
 - [Zig 0.15+](https://ziglang.org/download/)
-- mlx-c:
+- mlx-c and libwebp:
 
 ```bash
-brew install mlx-c
+brew install mlx-c webp
 ```
 
 ## Quick Start
@@ -121,6 +122,7 @@ Requires `APPLE_DEVELOPER_ID` and `APPLE_TEAM_ID` environment variables for code
 | `--ctx-size N` | auto | Context window size (auto = computed from GPU memory) |
 | `--timeout N` | `300` | Request timeout in seconds |
 | `--reasoning-budget N` | `0` | Thinking token budget (0 = disabled) |
+| `--no-vision` | off | Disable vision encoder even if model supports it |
 | `--log-level` | `info` | Log level (error, warn, info, debug) |
 
 ## API
@@ -137,7 +139,7 @@ curl http://localhost:8080/v1/chat/completions \
   }'
 ```
 
-Supports `messages`, `max_tokens`, `temperature`, `top_p`, `top_k`, `stream`, `tools`, `repetition_penalty`, `presence_penalty`, and `logprobs`.
+Supports `messages`, `max_tokens`, `temperature`, `top_p`, `top_k`, `stream`, `tools`, `repetition_penalty`, `presence_penalty`, and `logprobs`. Messages can include `image_url` content blocks (base64 or URL) for vision-capable models.
 
 ### POST /v1/messages (Anthropic)
 

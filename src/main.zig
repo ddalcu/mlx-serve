@@ -7,6 +7,7 @@ const transformer_mod = @import("transformer.zig");
 const generate_mod = @import("generate.zig");
 const chat_mod = @import("chat.zig");
 const server_mod = @import("server.zig");
+const vision_mod = @import("vision.zig");
 const log = @import("log.zig");
 
 pub const VERSION: []const u8 = build_options.version;
@@ -32,6 +33,7 @@ fn printUsage() void {
         \\  --temp <f>          Temperature (default: 0.0)
         \\  --timeout <n>       Request timeout in seconds (default: 300, 0=none)
         \\  --reasoning-budget <n>  Max thinking tokens per request (default: unlimited)
+        \\  --no-vision         Disable vision encoder (saves memory)
         \\  --log-level <lvl>   Log level: error, warn, info, debug (default: info)
         \\  --version           Print version and exit
         \\  --help              Show this help
@@ -59,6 +61,7 @@ pub fn main() !void {
     var ctx_size: u32 = 0; // 0 = use model default
     var timeout: u32 = 300; // seconds, 0 = no timeout
     var reasoning_budget: i32 = -1; // -1 = unlimited
+    var no_vision = false;
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--version")) {
@@ -96,6 +99,8 @@ pub fn main() !void {
         } else if (std.mem.eql(u8, args[i], "--timeout") and i + 1 < args.len) {
             i += 1;
             timeout = try std.fmt.parseInt(u32, args[i], 10);
+        } else if (std.mem.eql(u8, args[i], "--no-vision")) {
+            no_vision = true;
         } else if (std.mem.eql(u8, args[i], "--reasoning-budget") and i + 1 < args.len) {
             i += 1;
             reasoning_budget = try std.fmt.parseInt(i32, args[i], 10);
@@ -173,14 +178,33 @@ pub fn main() !void {
         }
     }
 
-    // Load weights
+    // Load weights (include vision weights if model has vision config and not disabled)
+    const load_vision = config.has_vision and !no_vision;
     log.info("Loading weights...\n", .{});
-    var weights = try model_mod.loadWeights(allocator, model_dir);
+    var weights = if (load_vision)
+        try model_mod.loadWeightsWithVision(allocator, model_dir)
+    else
+        try model_mod.loadWeights(allocator, model_dir);
     defer weights.deinit();
 
     // Initialize transformer
     var xfm = try transformer_mod.Transformer.init(allocator, config, &weights);
     defer xfm.deinit();
+
+    // Initialize vision encoder if model supports it (and not disabled)
+    var vision_enc: ?vision_mod.VisionEncoder = if (load_vision) blk: {
+        log.info("Initializing vision encoder...\n", .{});
+        break :blk vision_mod.VisionEncoder.init(allocator, config, &weights) catch |err| {
+            if (err == error.MissingVisionWeights) {
+                log.warn("Vision weights missing — vision disabled (model may have been quantized without vision tower)\n", .{});
+                break :blk null;
+            }
+            return err;
+        };
+    } else null;
+    defer {
+        if (vision_enc) |*ve| ve.deinit();
+    }
 
     // Wire model weights into GPU memory (prevents paging, matches mlx-lm behavior)
     {
@@ -211,7 +235,7 @@ pub fn main() !void {
 
     if (serve_mode) {
         // Start HTTP server
-        try server_mod.serve(allocator, &xfm, &tok, &chat_config, &config, host, port, ctx_size, timeout, reasoning_budget);
+        try server_mod.serve(allocator, &xfm, &tok, &chat_config, &config, if (vision_enc) |*ve| ve else null, host, port, ctx_size, timeout, reasoning_budget);
     } else {
         const user_prompt = prompt orelse "What is 2+2? Answer in one sentence.";
         const messages = [_]chat_mod.Message{

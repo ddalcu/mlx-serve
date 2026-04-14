@@ -97,8 +97,30 @@ class BrowserManager: ObservableObject {
     }
 
     func evaluateJS(_ script: String) async throws -> String {
-        let result = try await webView.evaluateJavaScript(script)
+        // Strip leading "return" — WKWebView evaluates expressions, not function bodies,
+        // so bare "return" causes a SyntaxError. Models often add it by habit.
+        var js = script.trimmingCharacters(in: .whitespacesAndNewlines)
+        if js.hasPrefix("return ") || js.hasPrefix("return\n") {
+            js = String(js.dropFirst(7))
+        }
+        let result = try await webView.evaluateJavaScript(js)
         return jsResultToString(result)
+    }
+
+    func takeScreenshot() async -> Data? {
+        let config = WKSnapshotConfiguration()
+        config.snapshotWidth = NSNumber(value: 1024)
+        do {
+            let image = try await webView.takeSnapshot(configuration: config)
+            guard let tiff = image.tiffRepresentation,
+                  let bitmap = NSBitmapImageRep(data: tiff),
+                  let jpeg = bitmap.representation(using: .jpeg, properties: [.compressionFactor: 0.8]) else {
+                return nil
+            }
+            return jpeg
+        } catch {
+            return nil
+        }
     }
 
     func getInfo() async throws -> String {

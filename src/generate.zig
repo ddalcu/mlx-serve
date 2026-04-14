@@ -106,12 +106,22 @@ pub const Generator = struct {
         // Reshape lazy token [1] -> [1, 1] and feed into next forward pass
         const next_logits = try lazyForward(xfm, lazy_token);
 
-        // Eval the cache + lazy token + next logits together
-        xfm.cache.evalState();
-        const arr = [_]mlx.mlx_array{ lazy_token, next_logits };
-        const vec = mlx.mlx_vector_array_new_data(&arr, 2);
-        _ = mlx.mlx_async_eval(vec);
-        _ = mlx.mlx_vector_array_free(vec);
+        // Eval the cache state + token + next logits together via async_eval.
+        // Bundling everything into one async_eval lets MLX schedule the full
+        // graph (prefill -> sample -> decode-step-0) on the GPU at once,
+        // avoiding a synchronous stall from separate evalState() + async_eval.
+        {
+            const eval_vec = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(eval_vec);
+            for (xfm.cache.entries) |*entry| {
+                if (!entry.initialized) continue;
+                _ = mlx.mlx_vector_array_append_value(eval_vec, entry.keys);
+                _ = mlx.mlx_vector_array_append_value(eval_vec, entry.values);
+            }
+            _ = mlx.mlx_vector_array_append_value(eval_vec, lazy_token);
+            _ = mlx.mlx_vector_array_append_value(eval_vec, next_logits);
+            _ = mlx.mlx_async_eval(eval_vec);
+        }
 
         // Now sync to get the first token value (GPU is already computing next_logits)
         try mlx.check(mlx.mlx_array_eval(lazy_token));

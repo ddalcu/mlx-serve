@@ -44,6 +44,20 @@ struct SerializedToolCall: Codable, Equatable {
     let arguments: String // JSON string
 }
 
+struct ChatImage: Identifiable, Codable, Equatable {
+    let id: UUID
+    let data: Data  // JPEG bytes
+
+    init(data: Data) {
+        self.id = UUID()
+        self.data = data
+    }
+
+    var base64URL: String {
+        "data:image/jpeg;base64,\(data.base64EncodedString())"
+    }
+}
+
 struct ChatMessage: Identifiable, Codable {
     let id: UUID
     var role: Role
@@ -60,6 +74,7 @@ struct ChatMessage: Identifiable, Codable {
     var toolCallId: String?   // For tool response messages
     var toolName: String?     // For tool response messages
     var toolCalls: [SerializedToolCall]? // Tool calls made BY this assistant message
+    var images: [ChatImage]?  // Images attached to this message
 
     enum Role: String, Codable {
         case system, user, assistant
@@ -81,7 +96,7 @@ struct ChatMessage: Identifiable, Codable {
         case id, role, content, reasoningContent, isStreaming, timestamp
         case agentPlan, toolResults, isAgentSummary
         case promptTokens, completionTokens, tokensPerSecond
-        case toolCallId, toolName, toolCalls
+        case toolCallId, toolName, toolCalls, images
     }
 
     init(from decoder: Decoder) throws {
@@ -101,6 +116,7 @@ struct ChatMessage: Identifiable, Codable {
         toolCallId = try c.decodeIfPresent(String.self, forKey: .toolCallId)
         toolName = try c.decodeIfPresent(String.self, forKey: .toolName)
         toolCalls = try c.decodeIfPresent([SerializedToolCall].self, forKey: .toolCalls)
+        images = try c.decodeIfPresent([ChatImage].self, forKey: .images)
     }
 }
 
@@ -178,4 +194,7 @@ let gemmaModelOptions: [GemmaModelOption] = [
     // 26B-A4B: 25.2B MoE, only 3.8B active per token — fits 24 GB+ Macs (4-bit) or 36 GB+ (8-bit)
     GemmaModelOption(id: "26b-a4b-4bit", displayName: "Gemma 4 26B-A4B (4-bit)", repoId: "mlx-community/gemma-4-26b-a4b-it-4bit", sizeEstimate: "~15.6 GB, needs 24 GB+ RAM"),
     GemmaModelOption(id: "26b-a4b-8bit", displayName: "Gemma 4 26B-A4B (8-bit)", repoId: "mlx-community/gemma-4-26b-a4b-it-8bit", sizeEstimate: "~28 GB, needs 36 GB+ RAM"),
+    // 31B: 31B dense — fits 36 GB+ Macs (4-bit) or 48 GB+ (8-bit)
+    GemmaModelOption(id: "31b-4bit", displayName: "Gemma 4 31B (4-bit)", repoId: "mlx-community/gemma-4-31b-it-4bit", sizeEstimate: "~18.4 GB, needs 36 GB+ RAM"),
+    GemmaModelOption(id: "31b-8bit", displayName: "Gemma 4 31B (8-bit)", repoId: "mlx-community/gemma-4-31b-it-8bit", sizeEstimate: "~33.8 GB, needs 48 GB+ RAM"),
 ]

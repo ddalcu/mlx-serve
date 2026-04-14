@@ -147,6 +147,7 @@ struct ChatDetailView: View {
     @State private var isNearBottom = true
     @State private var scrollViewHeight: CGFloat = 0
     @State private var scrollMonitor: Any?
+    @State private var pendingImages: [NSImage] = []
     @FocusState private var inputFocused: Bool
 
 
@@ -205,39 +206,54 @@ struct ChatDetailView: View {
 
             Divider()
 
+            // Context usage monitor
+            if let usage = contextUsage, usage.promptTokens > 0 {
+                ContextMonitor(promptTokens: usage.promptTokens, contextLength: usage.contextLength, maxTokens: appState.maxTokens)
+            }
+
             // Input area — iMessage style
             VStack(spacing: 4) {
-                if isAgentMode {
-                    HStack(spacing: 4) {
-                        Circle().fill(.orange).frame(width: 6, height: 6)
-                        Text("Agent Mode")
-                            .font(.caption2.weight(.medium))
-                            .foregroundStyle(.orange)
+                // Pending image thumbnails
+                if !pendingImages.isEmpty {
+                    ScrollView(.horizontal, showsIndicators: false) {
+                        HStack(spacing: 6) {
+                            ForEach(Array(pendingImages.enumerated()), id: \.offset) { idx, img in
+                                ZStack(alignment: .topTrailing) {
+                                    Image(nsImage: img)
+                                        .resizable()
+                                        .aspectRatio(contentMode: .fill)
+                                        .frame(width: 56, height: 56)
+                                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                                    Button {
+                                        pendingImages.remove(at: idx)
+                                    } label: {
+                                        Image(systemName: "xmark.circle.fill")
+                                            .font(.system(size: 14))
+                                            .foregroundStyle(.white)
+                                            .background(Circle().fill(.black.opacity(0.5)))
+                                    }
+                                    .buttonStyle(.plain)
+                                    .offset(x: 4, y: -4)
+                                }
+                            }
+                        }
+                        .padding(.horizontal, 4)
                     }
+                    .frame(height: 64)
                 }
 
                 HStack(alignment: .bottom, spacing: 8) {
-                    Button { enableThinking.toggle() } label: {
-                        Image(systemName: "brain")
+                    // Image attachment button
+                    Button { pickImage() } label: {
+                        Image(systemName: "paperclip")
                             .font(.system(size: 13, weight: .medium))
-                            .foregroundStyle(enableThinking ? .white : .secondary)
+                            .foregroundStyle(.secondary)
                             .frame(width: 28, height: 28)
-                            .background(enableThinking ? .blue : Color.secondary.opacity(0.15))
+                            .background(Color.secondary.opacity(0.15))
                             .clipShape(Circle())
                     }
                     .buttonStyle(.plain)
-                    .help("Thinking Mode — model reasons step-by-step before answering (\(enableThinking ? "ON" : "OFF"))")
-
-                    Button { isAgentMode.toggle() } label: {
-                        Image(systemName: "wrench")
-                            .font(.system(size: 13, weight: .medium))
-                            .foregroundStyle(isAgentMode ? .white : .secondary)
-                            .frame(width: 28, height: 28)
-                            .background(isAgentMode ? .orange : Color.secondary.opacity(0.15))
-                            .clipShape(Circle())
-                    }
-                    .buttonStyle(.plain)
-                    .help("Agent Mode — plan & execute shell, files, web, AppleScript (\(isAgentMode ? "ON" : "OFF"))")
+                    .help("Attach image")
 
                     // Dark pill input
                     TextField("Message", text: $inputText, axis: .vertical)
@@ -280,11 +296,21 @@ struct ChatDetailView: View {
                             .foregroundStyle(isGenerating ? .red : .accentColor)
                     }
                     .buttonStyle(.plain)
-                    .disabled(server.status != .running || (inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && !isGenerating))
+                    .disabled(server.status != .running || (inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && pendingImages.isEmpty && !isGenerating))
                 }
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
+        }
+        .onDrop(of: [.image], isTargeted: nil) { providers in
+            for provider in providers {
+                provider.loadObject(ofClass: NSImage.self) { image, _ in
+                    if let image = image as? NSImage {
+                        DispatchQueue.main.async { pendingImages.append(image) }
+                    }
+                }
+            }
+            return true
         }
         .toolbar {
             ToolbarItem(placement: .automatic) {
@@ -305,10 +331,46 @@ struct ChatDetailView: View {
                 }
             }
             ToolbarItem(placement: .automatic) {
+                Button { enableThinking.toggle() } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "brain")
+                            .font(.system(size: 11, weight: .medium))
+                        Text("Think")
+                            .font(.caption.weight(.medium))
+                    }
+                    .foregroundStyle(enableThinking ? .white : .secondary)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(enableThinking ? .blue : Color.secondary.opacity(0.12))
+                    .clipShape(Capsule())
+                }
+                .buttonStyle(.plain)
+                .help("Thinking Mode (\(enableThinking ? "ON" : "OFF"))")
+                .padding(.leading, 8)
+                .padding(.trailing, 4)
+            }
+            ToolbarItem(placement: .automatic) {
+                Button { isAgentMode.toggle() } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "wrench")
+                            .font(.system(size: 11, weight: .medium))
+                        Text("Agent")
+                            .font(.caption.weight(.medium))
+                    }
+                    .foregroundStyle(isAgentMode ? .white : .secondary)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(isAgentMode ? .orange : Color.secondary.opacity(0.12))
+                    .clipShape(Capsule())
+                }
+                .buttonStyle(.plain)
+                .help("Agent Mode (\(isAgentMode ? "ON" : "OFF"))")
+            }
+            ToolbarItem(placement: .automatic) {
                 Circle()
                     .fill(server.status == .running ? .green : .red)
                     .frame(width: 8, height: 8)
-                    .padding(.horizontal, 6)
+                    .padding(.horizontal, 8)
                     .help(server.status == .running ? "Server running" : "Server stopped")
             }
         }
@@ -342,6 +404,69 @@ struct ChatDetailView: View {
         }
     }
 
+    // MARK: - Image Helpers
+
+    private func pickImage() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.image]
+        panel.allowsMultipleSelection = true
+        panel.canChooseDirectories = false
+        panel.begin { response in
+            guard response == .OK else { return }
+            for url in panel.urls {
+                if let image = NSImage(contentsOf: url) {
+                    pendingImages.append(image)
+                }
+            }
+        }
+    }
+
+    /// Convert NSImage to JPEG data suitable for API transport.
+    private static func nsImageToJPEG(_ image: NSImage) -> Data? {
+        guard let tiff = image.tiffRepresentation,
+              let bitmap = NSBitmapImageRep(data: tiff),
+              let jpeg = bitmap.representation(using: .jpeg, properties: [.compressionFactor: 0.85]) else {
+            return nil
+        }
+        return jpeg
+    }
+
+    /// Convert pending NSImages to ChatImage array, clearing the pending list.
+    private func consumePendingImages() -> [ChatImage]? {
+        guard !pendingImages.isEmpty else { return nil }
+        let chatImages = pendingImages.compactMap { img -> ChatImage? in
+            guard let data = Self.nsImageToJPEG(img) else { return nil }
+            return ChatImage(data: data)
+        }
+        pendingImages = []
+        return chatImages.isEmpty ? nil : chatImages
+    }
+
+    /// Build OpenAI-style content blocks for a message with images.
+    /// Images are preprocessed to raw float32 pixel data for the vision encoder.
+    private static func buildMultimodalContent(text: String, images: [ChatImage]) -> Any {
+        var blocks: [[String: Any]] = images.compactMap { img in
+            // Preprocess image for vision encoder (768x768 float32 CHW)
+            if let pixelData = ImagePreprocessor.preprocess(img.data) {
+                return [
+                    "type": "image_url",
+                    "image_url": [
+                        "url": "data:image/x-mlx-pixels;base64,\(pixelData.base64EncodedString())"
+                    ] as [String: Any]
+                ]
+            }
+            // Fallback: send JPEG if preprocessing fails
+            return [
+                "type": "image_url",
+                "image_url": ["url": img.base64URL] as [String: Any]
+            ]
+        }
+        if !text.isEmpty {
+            blocks.append(["type": "text", "text": text])
+        }
+        return blocks
+    }
+
     // MARK: - Helpers
 
     private func scrollToBottom(_ proxy: ScrollViewProxy) {
@@ -350,6 +475,24 @@ struct ChatDetailView: View {
         }
     }
 
+
+    /// Latest context usage from the most recent assistant message with token data.
+    private var contextUsage: (promptTokens: Int, contextLength: Int)? {
+        guard let messages = session?.messages else { return nil }
+        // Find last message with prompt token data
+        if let last = messages.last(where: { $0.promptTokens != nil && $0.promptTokens! > 0 }) {
+            let ctxLen: Int
+            if appState.contextSize > 0 {
+                ctxLen = appState.contextSize
+            } else if let modelCtx = server.modelInfo?.contextLength, modelCtx > 0 {
+                ctxLen = modelCtx
+            } else {
+                ctxLen = 32768
+            }
+            return (promptTokens: last.promptTokens!, contextLength: ctxLen)
+        }
+        return nil
+    }
 
     private var workingDirectoryBinding: Binding<String?> {
         Binding(
@@ -385,10 +528,12 @@ struct ChatDetailView: View {
         }
 
         let text = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty, !isGenerating, server.status == .running else { return }
+        let attachedImages = consumePendingImages()
+        guard !text.isEmpty || attachedImages != nil, !isGenerating, server.status == .running else { return }
         inputText = ""
 
-        let userMsg = ChatMessage(role: .user, content: text)
+        var userMsg = ChatMessage(role: .user, content: text)
+        userMsg.images = attachedImages
         appState.appendMessage(to: sessionId, message: userMsg)
 
         var assistantMsg = ChatMessage(role: .assistant, content: "")
@@ -398,12 +543,21 @@ struct ChatDetailView: View {
         isGenerating = true
         let api = APIClient()
 
+        // Strip images from old messages — server only processes the last user message's images.
+        // Re-sending old images wastes bandwidth and memory.
         let messages = (session?.messages ?? []).map { msg -> [String: Any] in
             var dict: [String: Any] = ["role": msg.role.rawValue, "content": msg.content]
             if msg.role == .assistant && msg.content.isEmpty { dict.removeValue(forKey: "content") }
             return dict
         }.dropLast() // Drop the empty assistant message we just added
-        let messagesArray = Array(messages) + [["role": "user", "content": text] as [String: Any]]
+        // Build last user message with potential images
+        var lastUserDict: [String: Any] = ["role": "user"]
+        if let imgs = attachedImages, !imgs.isEmpty {
+            lastUserDict["content"] = Self.buildMultimodalContent(text: text, images: imgs)
+        } else {
+            lastUserDict["content"] = text
+        }
+        let messagesArray = Array(messages) + [lastUserDict]
 
         generationTask = Task {
             do {
@@ -448,10 +602,12 @@ struct ChatDetailView: View {
 
     private func sendAgentMessage() {
         let text = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !text.isEmpty, !isGenerating, server.status == .running else { return }
+        let attachedImages = consumePendingImages()
+        guard !text.isEmpty || attachedImages != nil, !isGenerating, server.status == .running else { return }
         inputText = ""
 
-        let userMsg = ChatMessage(role: .user, content: text)
+        var userMsg = ChatMessage(role: .user, content: text)
+        userMsg.images = attachedImages
         appState.appendMessage(to: sessionId, message: userMsg)
 
         isGenerating = true
@@ -479,12 +635,14 @@ struct ChatDetailView: View {
 
     /// Agent loop: call model with tools (streaming), execute tool calls, feed results back, repeat.
     /// Stops when the model responds with content (no tool calls) or after 150 iterations.
-    private func runAgentLoop(api: APIClient, workingDirectory: String?) async throws {
+    private func runAgentLoop(api: APIClient, workingDirectory initialWorkDir: String?) async throws {
+        var workingDirectory = initialWorkDir
         let maxIterations = 150
         var padRetries = 0
         let padRetryPolicy = RetryPolicy.aggressive
         var recentToolNames: [String] = [] // sliding window for repetition detection
         var permanentlyBlocked: Set<String> = [] // tools blocked for the rest of this loop
+        var truncationRetries = 0
 
         for _ in 0..<maxIterations {
             try Task.checkCancellation()
@@ -522,6 +680,7 @@ struct ChatDetailView: View {
 
             // Stream model response with tools
             var receivedToolCalls: [APIClient.ToolCall] = []
+            var maxTokensHit = false
             let stream = api.streamChat(
                 port: server.port,
                 messages: messages,
@@ -542,12 +701,29 @@ struct ChatDetailView: View {
                 case .toolCalls(let calls):
                     receivedToolCalls = calls
                 case .maxTokensReached:
+                    maxTokensHit = true
                     appState.updateLastMessage(in: sessionId, content: "\n\n⚠️ *Output truncated — max tokens (\(appState.maxTokens)) reached. Try breaking the task into smaller steps.*")
                 case .done:
                     break
                 }
             }
             appState.updateLastMessage(in: sessionId, streaming: false)
+
+            // Truncation recovery: if max_tokens was hit AND tool calls were received,
+            // the tool call args are likely truncated (incomplete JSON). Don't execute them —
+            // drop the broken message, tell the model what happened, and retry.
+            if maxTokensHit && !receivedToolCalls.isEmpty && truncationRetries < 2 {
+                truncationRetries += 1
+                // Remove the broken assistant message
+                if let sIdx = appState.chatSessions.firstIndex(where: { $0.id == sessionId }),
+                   !appState.chatSessions[sIdx].messages.isEmpty {
+                    appState.chatSessions[sIdx].messages.removeLast()
+                }
+                // Add a user nudge so the model adapts its approach
+                let nudge = ChatMessage(role: .user, content: "[System: Your last response was cut off because the output was too long. The tool call was NOT executed. To avoid this, write shorter responses: use shell with heredoc (cat << 'EOF' > file) for file content instead of writeFile, or break large files into smaller pieces.]")
+                appState.appendMessage(to: sessionId, message: nudge)
+                continue
+            }
 
             // Check for pad-only or empty responses — retry limited times
             if receivedToolCalls.isEmpty {
@@ -579,14 +755,20 @@ struct ChatDetailView: View {
             guard !receivedToolCalls.isEmpty else { return }
 
             // Repetition detection: track tool names per round (deduplicated).
-            // If same read-only tool appears 4+ times in last 6 rounds, permanently block it.
-            // Write tools (writeFile, editFile, shell) are never permanently blocked since the model needs them to make progress.
+            // If same read-only tool appears too often in the sliding window, permanently block it.
+            // Write tools (writeFile, editFile, shell) are never blocked — they make progress.
+            // Browse/webSearch get a higher threshold (8 in 12) since they're inherently multi-step.
+            // Other read-only tools use a tight threshold (4 in 6).
             let writeTools: Set<String> = ["writeFile", "editFile", "shell"]
+            let browseTools: Set<String> = ["browse", "webSearch"]
             let uniqueNames = Set(receivedToolCalls.map { $0.name })
             recentToolNames.append(contentsOf: uniqueNames)
-            if recentToolNames.count > 6 { recentToolNames = Array(recentToolNames.suffix(6)) }
+            if recentToolNames.count > 12 { recentToolNames = Array(recentToolNames.suffix(12)) }
             for name in uniqueNames {
-                if recentToolNames.filter({ $0 == name }).count >= 4 && !writeTools.contains(name) {
+                if writeTools.contains(name) { continue }
+                let count = recentToolNames.filter({ $0 == name }).count
+                let threshold = browseTools.contains(name) ? 8 : 4
+                if count >= threshold {
                     permanentlyBlocked.insert(name)
                 }
             }
@@ -627,16 +809,41 @@ struct ChatDetailView: View {
                     effectiveTool = tool
                 }
 
-                // Block tools that have been called too many times in a row
+                // Handle cwd tool: change working directory for subsequent calls
                 let output: String
-                if blockedTools.contains(tc.name) {
+                if effectiveTool == .cwd {
+                    if let path = tc.arguments["path"] {
+                        let resolved: String
+                        if path.hasPrefix("/") || path.hasPrefix("~") {
+                            resolved = NSString(string: path).expandingTildeInPath
+                        } else if let wd = workingDirectory {
+                            resolved = (wd as NSString).appendingPathComponent(path)
+                        } else {
+                            resolved = path
+                        }
+                        let normalized = (resolved as NSString).standardizingPath
+                        var isDir: ObjCBool = false
+                        if FileManager.default.fileExists(atPath: normalized, isDirectory: &isDir), isDir.boolValue {
+                            workingDirectory = normalized
+                            output = "Changed working directory to \(normalized)"
+                        } else {
+                            output = "Error: '\(normalized)' is not a directory"
+                        }
+                    } else {
+                        output = "Error: cwd requires a path parameter. Example: {\"path\": \"myproject\"}"
+                    }
+                } else if blockedTools.contains(tc.name) {
                     output = "BLOCKED: \(tc.name) has been called too many times in a row. This tool is now disabled for this task. Use writeFile to create files, readFile to read them, editFile to modify them, and shell for commands."
                 } else {
                     // Pre-validate required params
                     let missing = Self.missingRequiredParams(for: tc.name, arguments: tc.arguments)
                     if !missing.isEmpty {
-                        let example = Self.toolExample(for: tc.name)
-                        output = "Error: \(tc.name) missing required params: \(missing.joined(separator: ", ")). Example: \(example)"
+                        if (tc.name == "writeFile" || tc.name == "editFile") && missing.contains("content") && tc.arguments["path"] != nil {
+                            output = "Error: \(tc.name) content was truncated — your output was too long and got cut off before the content was complete. The file was NOT written. To fix this, use shell with a heredoc instead: {\"command\": \"cat << 'FILEEOF' > \(tc.arguments["path"] ?? "path")\\nfile content here\\nFILEEOF\"}"
+                        } else {
+                            let example = Self.toolExample(for: tc.name)
+                            output = "Error: \(tc.name) missing required params: \(missing.joined(separator: ", ")). Example: \(example)"
+                        }
                     } else if let effectiveTool, let handler = toolHandlers[effectiveTool] {
                         do {
                             output = try await handler.execute(parameters: tc.arguments, workingDirectory: workingDirectory)
@@ -664,7 +871,27 @@ struct ChatDetailView: View {
                 var toolMsg = ChatMessage(role: .system, content: "")
                 toolMsg.toolCallId = tr.id
                 toolMsg.toolName = tr.name
-                toolMsg.content = Self.truncateWithOverflow(tr.output, toolCallId: tr.id, toolName: tr.name)
+
+                // Extract screenshot image data and attach as vision input
+                if tr.name == "browse" && tr.output.contains("data:image/jpeg;base64,") {
+                    if let range = tr.output.range(of: "data:image/jpeg;base64,") {
+                        // Take only the base64 portion — stop at newline or end of string
+                        let remainder = tr.output[range.upperBound...]
+                        let b64End = remainder.firstIndex(of: "\n") ?? remainder.endIndex
+                        let b64 = String(remainder[..<b64End])
+                        if let jpegData = Data(base64Encoded: b64),
+                           let chatImage = ChatImage(data: jpegData) as ChatImage? {
+                            toolMsg.images = [chatImage]
+                            toolMsg.content = "[screenshot captured]"
+                        } else {
+                            toolMsg.content = Self.truncateWithOverflow(tr.output, toolCallId: tr.id, toolName: tr.name)
+                        }
+                    } else {
+                        toolMsg.content = Self.truncateWithOverflow(tr.output, toolCallId: tr.id, toolName: tr.name)
+                    }
+                } else {
+                    toolMsg.content = Self.truncateWithOverflow(tr.output, toolCallId: tr.id, toolName: tr.name)
+                }
                 appState.appendMessage(to: sessionId, message: toolMsg)
             }
         }
@@ -758,11 +985,32 @@ struct ChatDetailView: View {
         let systemPromptCost = roughTokenCount(AgentPrompt.systemPrompt + AgentPrompt.memory)
         let budget = max(1024, contextLength - appState.maxTokens - safetyBuffer - systemPromptCost)
 
-        // Always pin the first user message (the original task)
+        // Always pin the first user message (the original task) AND the first
+        // assistant response (the plan). Without pinning the plan, context pressure
+        // drops the assistant's intent and the model re-interprets the original
+        // message literally (e.g. "say hi" → just replies "hi" mid-task).
         let firstUserIdx = allMessages.firstIndex { $0.role == .user && $0.toolCallId == nil }
+        let firstAssistantIdx: Int? = {
+            guard let uIdx = firstUserIdx else { return nil }
+            let afterUser = allMessages.index(after: uIdx)
+            guard afterUser < allMessages.count else { return nil }
+            return allMessages[afterUser...].firstIndex {
+                $0.role == .assistant && !$0.isAgentSummary && !$0.content.isEmpty
+            }
+        }()
         var pinnedCost = 0
         if let idx = firstUserIdx {
-            pinnedCost = roughTokenCount(allMessages[idx].content) + 4
+            pinnedCost += roughTokenCount(allMessages[idx].content) + 4
+        }
+        if let idx = firstAssistantIdx {
+            let content = allMessages[idx].content
+            // Truncate the plan to 500 chars to avoid blowing the budget on a long first response
+            pinnedCost += roughTokenCount(String(content.prefix(500))) + 4
+            if let tcs = allMessages[idx].toolCalls {
+                for tc in tcs {
+                    pinnedCost += roughTokenCount(tc.name) + roughTokenCount(tc.arguments) + 8
+                }
+            }
         }
 
         // Walk backward from newest message, accumulating token costs
@@ -782,8 +1030,16 @@ struct ChatDetailView: View {
             includeStartIdx = i
         }
 
-        // Determine if first user message needs pinning (fell outside included range)
+        // Determine if first user/assistant messages need pinning (fell outside included range)
         let needsPin = firstUserIdx != nil && firstUserIdx! < includeStartIdx
+        let needsPinAssistant = firstAssistantIdx != nil && firstAssistantIdx! < includeStartIdx
+
+        // Auto-compact: when context is squeezed, truncate tool results harder.
+        // Normal: recent=2000, older=500. Squeezed (<25% free): recent=500, older=100.
+        let freeRatio = Double(remainingBudget + pinnedCost) / Double(budget + pinnedCost)
+        let squeezed = freeRatio < 0.25
+        let recentLimit = squeezed ? 500 : 2000
+        let olderLimit = squeezed ? 100 : 500
 
         // Count tool results in included range for progressive truncation
         let window = Array(allMessages[includeStartIdx..<allMessages.count])
@@ -792,21 +1048,52 @@ struct ChatDetailView: View {
 
         var history: [[String: Any]] = []
 
-        // Pin the first user message if it fell outside the window
+        // Pin the first user message + assistant plan if they fell outside the window.
+        // Strip images from pinned messages — server only processes last user message's images.
         if needsPin, let idx = firstUserIdx {
             history.append(["role": "user", "content": allMessages[idx].content])
         }
+        if needsPinAssistant, let idx = firstAssistantIdx {
+            let msg = allMessages[idx]
+            var content = msg.content
+                .replacingOccurrences(of: "<pad>", with: "")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if content.count > 500 {
+                content = String(content.prefix(500)) + "..."
+            }
+            var dict: [String: Any] = ["role": "assistant"]
+            if !content.isEmpty { dict["content"] = content }
+            // Include tool_calls if present so the model remembers its initial actions
+            if let tcs = msg.toolCalls, !tcs.isEmpty {
+                dict["tool_calls"] = tcs.map { tc -> [String: Any] in
+                    [
+                        "id": tc.id,
+                        "type": "function",
+                        "function": [
+                            "name": tc.name,
+                            "arguments": tc.arguments
+                        ] as [String: Any]
+                    ]
+                }
+            }
+            history.append(dict)
+        }
+
+        // Find the last user message in the window — only IT gets image content blocks.
+        // Server only processes images from the last user message; re-sending old images
+        // wastes bandwidth and confuses the vision encoder with stale features.
+        let lastUserMsgId = window.last(where: { $0.role == .user && $0.toolCallId == nil })?.id
 
         for msg in window {
             // Tool response messages — truncate older results more aggressively
             if let callId = msg.toolCallId {
                 let isRecent = toolResultsSeen >= totalToolResults - 2
-                let limit = isRecent ? 2000 : 500
+                let limit = isRecent ? recentLimit : olderLimit
                 toolResultsSeen += 1
                 history.append([
                     "role": "tool",
                     "tool_call_id": callId,
-                    "content": String(msg.content.prefix(limit))
+                    "content": String(msg.content.prefix(limit)),
                 ])
                 continue
             }
@@ -843,7 +1130,14 @@ struct ChatDetailView: View {
                 content = String(content.prefix(500)) + "..."
             }
             if content.isEmpty { continue }
-            history.append(["role": msg.role.rawValue, "content": content])
+            var dict: [String: Any] = ["role": msg.role.rawValue]
+            // Only include images for the last user message
+            if msg.id == lastUserMsgId, let imgs = msg.images, !imgs.isEmpty {
+                dict["content"] = Self.buildMultimodalContent(text: content, images: imgs)
+            } else {
+                dict["content"] = content
+            }
+            history.append(dict)
         }
 
         return history
@@ -891,6 +1185,57 @@ struct ChatDetailView: View {
     }
 }
 
+// MARK: - Context Monitor
+
+struct ContextMonitor: View {
+    let promptTokens: Int
+    let contextLength: Int
+    let maxTokens: Int
+
+    private var usageRatio: Double {
+        guard contextLength > 0 else { return 0 }
+        return Double(promptTokens) / Double(contextLength)
+    }
+
+    private var generationBudget: Int {
+        let remaining = max(0, contextLength - promptTokens)
+        return min(remaining, maxTokens)
+    }
+
+    private var barColor: Color {
+        if usageRatio > 0.80 { return .red }
+        if usageRatio > 0.60 { return .orange }
+        return .green
+    }
+
+    var body: some View {
+        VStack(spacing: 2) {
+            GeometryReader { geo in
+                ZStack(alignment: .leading) {
+                    RoundedRectangle(cornerRadius: 2)
+                        .fill(Color.secondary.opacity(0.15))
+                    RoundedRectangle(cornerRadius: 2)
+                        .fill(barColor.opacity(0.7))
+                        .frame(width: geo.size.width * min(1.0, usageRatio))
+                }
+            }
+            .frame(height: 4)
+
+            HStack {
+                Text("\(promptTokens)/\(contextLength) tokens (\(Int(usageRatio * 100))%)")
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Text("gen: \(generationBudget)")
+                    .font(.system(size: 9, design: .monospaced))
+                    .foregroundStyle(generationBudget < 2048 ? .red : generationBudget < 4096 ? .orange : .secondary)
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.top, 4)
+    }
+}
+
 // MARK: - Message Bubble
 
 struct MessageBubble: View {
@@ -917,6 +1262,21 @@ struct MessageBubble: View {
                     .padding(8)
                     .background(.quaternary.opacity(0.5))
                     .clipShape(RoundedRectangle(cornerRadius: 8))
+                }
+
+                // Attached images
+                if let images = message.images, !images.isEmpty {
+                    HStack(spacing: 4) {
+                        ForEach(images) { img in
+                            if let nsImage = NSImage(data: img.data) {
+                                Image(nsImage: nsImage)
+                                    .resizable()
+                                    .aspectRatio(contentMode: .fit)
+                                    .frame(maxWidth: 200, maxHeight: 150)
+                                    .clipShape(RoundedRectangle(cornerRadius: 10))
+                            }
+                        }
+                    }
                 }
 
                 // Content
@@ -962,6 +1322,12 @@ struct MessageBubble: View {
 
             if message.role == .assistant { Spacer(minLength: 60) }
         }
+        .contextMenu {
+            Button("Copy Message") {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(message.content, forType: .string)
+            }
+        }
     }
 }
 
@@ -978,6 +1344,12 @@ struct MarkdownText: View {
         VStack(alignment: .leading, spacing: 6) {
             ForEach(Array(parseBlocks().enumerated()), id: \.offset) { _, block in
                 blockView(block)
+            }
+        }
+        .contextMenu {
+            Button("Copy All") {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(source, forType: .string)
             }
         }
     }

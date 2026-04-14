@@ -13,11 +13,19 @@ pub const ToolCall = struct {
     arguments: []const u8, // JSON string
 };
 
+/// Raw image pixel data for vision encoder (float32, CHW format).
+pub const ImageData = struct {
+    pixels: []const u8, // Raw float32 bytes [3 * H * W * 4]
+    width: u32,
+    height: u32,
+};
+
 pub const Message = struct {
     role: []const u8,
     content: []const u8,
     tool_calls: ?[]const ToolCall = null,
     tool_call_id: ?[]const u8 = null,
+    images: ?[]const ImageData = null, // Preprocessed image data for vision
 };
 
 /// Chat template configuration loaded from tokenizer_config.json.

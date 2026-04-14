@@ -256,16 +256,20 @@ struct StatusMenuView: View {
             // Downloads
             VStack(alignment: .leading, spacing: 6) {
                 Button {
-                    showDownloads.toggle()
-                } label: {
-                    HStack {
-                        Image(systemName: "arrow.down.circle")
-                        Text("Download Models")
-                            .font(.subheadline)
-                        Spacer()
-                        Image(systemName: showDownloads ? "chevron.up" : "chevron.down")
-                            .font(.caption)
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        showDownloads.toggle()
                     }
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "chevron.right")
+                            .font(.caption2)
+                            .rotationEffect(.degrees(showDownloads ? 90 : 0))
+                        Text("Download Models")
+                            .font(.subheadline.weight(.medium))
+                        Spacer()
+                    }
+                    .foregroundStyle(.secondary)
+                    .contentShape(Rectangle())
                 }
                 .buttonStyle(.plain)
 
@@ -367,6 +371,7 @@ struct StatusDot: View {
 struct EndpointsSection: View {
     let baseURL: String
     @State private var copiedEndpoint: String?
+    @State private var isExpanded = false
 
     private let endpoints: [(method: String, path: String)] = [
         ("GET", "/health"),
@@ -379,36 +384,52 @@ struct EndpointsSection: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Text("Endpoints")
-                .font(.subheadline.weight(.medium))
-                .foregroundStyle(.secondary)
-
-            ForEach(endpoints, id: \.path) { ep in
-                HStack(spacing: 4) {
-                    Text(ep.method)
-                        .font(.system(size: 9, weight: .bold, design: .monospaced))
-                        .foregroundStyle(ep.method == "GET" ? .green : .blue)
-                        .frame(width: 30, alignment: .leading)
-                    Text(baseURL + ep.path)
-                        .font(.system(size: 10, design: .monospaced))
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                    Spacer()
-                    Button {
-                        NSPasteboard.general.clearContents()
-                        NSPasteboard.general.setString(baseURL + ep.path, forType: .string)
-                        copiedEndpoint = ep.path
-                        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
-                            if copiedEndpoint == ep.path { copiedEndpoint = nil }
-                        }
-                    } label: {
-                        Image(systemName: copiedEndpoint == ep.path ? "checkmark" : "doc.on.doc")
-                            .font(.caption2)
-                    }
-                    .buttonStyle(.plain)
-                    .foregroundStyle(copiedEndpoint == ep.path ? .green : .secondary)
+            Button {
+                withAnimation(.easeInOut(duration: 0.2)) {
+                    isExpanded.toggle()
                 }
-                .padding(.vertical, 1)
+            } label: {
+                HStack(spacing: 4) {
+                    Image(systemName: "chevron.right")
+                        .font(.caption2)
+                        .rotationEffect(.degrees(isExpanded ? 90 : 0))
+                    Text("Endpoints")
+                        .font(.subheadline.weight(.medium))
+                    Spacer()
+                }
+                .foregroundStyle(.secondary)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+
+            if isExpanded {
+                ForEach(endpoints, id: \.path) { ep in
+                    HStack(spacing: 4) {
+                        Text(ep.method)
+                            .font(.system(size: 9, weight: .bold, design: .monospaced))
+                            .foregroundStyle(ep.method == "GET" ? .green : .blue)
+                            .frame(width: 30, alignment: .leading)
+                        Text(baseURL + ep.path)
+                            .font(.system(size: 10, design: .monospaced))
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                        Spacer()
+                        Button {
+                            NSPasteboard.general.clearContents()
+                            NSPasteboard.general.setString(baseURL + ep.path, forType: .string)
+                            copiedEndpoint = ep.path
+                            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                                if copiedEndpoint == ep.path { copiedEndpoint = nil }
+                            }
+                        } label: {
+                            Image(systemName: copiedEndpoint == ep.path ? "checkmark" : "doc.on.doc")
+                                .font(.caption2)
+                        }
+                        .buttonStyle(.plain)
+                        .foregroundStyle(copiedEndpoint == ep.path ? .green : .secondary)
+                    }
+                    .padding(.vertical, 1)
+                }
             }
         }
     }

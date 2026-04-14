@@ -109,6 +109,12 @@ if [ -f "$MLX_LIB/mlx.metallib" ]; then
     cp "$MLX_LIB/mlx.metallib" "$CONTENTS/Frameworks/"
 fi
 
+# libwebp + libsharpyuv for WebP image decoding in vision pipeline
+WEBP_LIB="$(brew --prefix webp 2>/dev/null || echo "/opt/homebrew/opt/webp")/lib"
+for wlib in libwebp.dylib libsharpyuv.dylib; do
+    [ -f "$WEBP_LIB/$wlib" ] && cp "$WEBP_LIB/$wlib" "$CONTENTS/Frameworks/"
+done
+
 # Fix rpaths on mlx-serve binary
 echo "→ Fixing rpaths..."
 install_name_tool -change \
@@ -121,6 +127,19 @@ install_name_tool -change \
     "$(otool -L "$CONTENTS/Frameworks/libmlxc.dylib" | grep libmlx.dylib | head -1 | awk '{print $1}')" \
     "@loader_path/libmlx.dylib" \
     "$CONTENTS/Frameworks/libmlxc.dylib" 2>/dev/null || true
+
+# Fix mlx-serve -> libwebp dependency
+if [ -f "$CONTENTS/Frameworks/libwebp.dylib" ]; then
+    install_name_tool -change \
+        "$(otool -L "$CONTENTS/MacOS/mlx-serve" | grep libwebp | awk '{print $1}')" \
+        "@executable_path/../Frameworks/libwebp.dylib" \
+        "$CONTENTS/MacOS/mlx-serve" 2>/dev/null || true
+    # Fix libwebp -> libsharpyuv dependency
+    install_name_tool -change \
+        "$(otool -L "$CONTENTS/Frameworks/libwebp.dylib" | grep libsharpyuv | awk '{print $1}')" \
+        "@loader_path/libsharpyuv.dylib" \
+        "$CONTENTS/Frameworks/libwebp.dylib" 2>/dev/null || true
+fi
 
 rm -rf "$ICON_DIR"
 

@@ -26,10 +26,15 @@ pub fn build(b: *std.Build) void {
     mod.addObjectFile(b.path("lib/jinja_cpp/libjinja.a"));
     mod.addIncludePath(b.path("lib/jinja_cpp"));
 
+    // stb_image for JPEG/PNG decoding in the vision pipeline
+    mod.addCSourceFile(.{ .file = b.path("lib/stb_image_impl.c"), .flags = &.{"-O2"} });
+    mod.addIncludePath(b.path("lib"));
+
     // mlx-c include/lib paths (homebrew)
     mod.addIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
     mod.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
     mod.linkSystemLibrary("mlxc", .{});
+    mod.linkSystemLibrary("webp", .{});
 
     const exe = b.addExecutable(.{
         .name = "mlx-serve",
@@ -66,10 +71,13 @@ pub fn build(b: *std.Build) void {
 
     test_mod.addObjectFile(b.path("lib/jinja_cpp/libjinja.a"));
     test_mod.addIncludePath(b.path("lib/jinja_cpp"));
+    test_mod.addCSourceFile(.{ .file = b.path("lib/stb_image_impl.c"), .flags = &.{"-O2"} });
+    test_mod.addIncludePath(b.path("lib"));
     test_mod.linkSystemLibrary("c++", .{});
     test_mod.addIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
     test_mod.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
     test_mod.linkSystemLibrary("mlxc", .{});
+    test_mod.linkSystemLibrary("webp", .{});
 
     const unit_tests = b.addTest(.{
         .root_module = test_mod,

@@ -109,6 +109,7 @@ pub extern "c" fn mlx_array_item_float32(res: *f32, arr: mlx_array) c_int;
 pub extern "c" fn mlx_array_item_int32(res: *i32, arr: mlx_array) c_int;
 
 // Data access
+pub extern "c" fn mlx_array_data_bool(arr: mlx_array) ?[*]const bool;
 pub extern "c" fn mlx_array_data_float32(arr: mlx_array) ?[*]const f32;
 pub extern "c" fn mlx_array_data_int32(arr: mlx_array) ?[*]const i32;
 pub extern "c" fn mlx_array_data_uint32(arr: mlx_array) ?[*]const u32;
@@ -158,6 +159,7 @@ pub extern "c" fn mlx_multiply(res: *mlx_array, a: mlx_array, b: mlx_array, s: m
 pub extern "c" fn mlx_divide(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
 pub extern "c" fn mlx_negative(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
 pub extern "c" fn mlx_maximum(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_minimum(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
 pub extern "c" fn mlx_matmul(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
 pub extern "c" fn mlx_square(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
 pub extern "c" fn mlx_sqrt(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
@@ -166,6 +168,8 @@ pub extern "c" fn mlx_exp(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
 pub extern "c" fn mlx_log(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
 pub extern "c" fn mlx_abs(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
 pub extern "c" fn mlx_tanh(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_cos(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_sin(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
 pub extern "c" fn mlx_erf(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
 
 pub extern "c" fn mlx_reshape(res: *mlx_array, a: mlx_array, shape: [*]const c_int, shape_num: usize, s: mlx_stream) c_int;
@@ -193,11 +197,14 @@ pub extern "c" fn mlx_min_axis(res: *mlx_array, a: mlx_array, axis: c_int, keepd
 
 pub extern "c" fn mlx_astype(res: *mlx_array, a: mlx_array, dtype: mlx_dtype, s: mlx_stream) c_int;
 
+pub extern "c" fn mlx_equal(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_remainder(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
 pub extern "c" fn mlx_where(res: *mlx_array, condition: mlx_array, x: mlx_array, y: mlx_array, s: mlx_stream) c_int;
 
 pub extern "c" fn mlx_arange(res: *mlx_array, start: f64, stop: f64, step: f64, dtype: mlx_dtype, s: mlx_stream) c_int;
 pub extern "c" fn mlx_full(res: *mlx_array, shape: [*]const c_int, shape_num: usize, val: mlx_array, dtype: mlx_dtype, s: mlx_stream) c_int;
 pub extern "c" fn mlx_zeros(res: *mlx_array, shape: [*]const c_int, shape_num: usize, dtype: mlx_dtype, s: mlx_stream) c_int;
+pub extern "c" fn mlx_ones(res: *mlx_array, shape: [*]const c_int, shape_num: usize, dtype: mlx_dtype, s: mlx_stream) c_int;
 
 pub extern "c" fn mlx_slice(res: *mlx_array, a: mlx_array, start: [*]const c_int, start_num: usize, stop: [*]const c_int, stop_num: usize, strides: [*]const c_int, strides_num: usize, s: mlx_stream) c_int;
 pub extern "c" fn mlx_slice_update(res: *mlx_array, src: mlx_array, update: mlx_array, start: [*]const c_int, start_num: usize, stop: [*]const c_int, stop_num: usize, strides: [*]const c_int, strides_num: usize, s: mlx_stream) c_int;

@@ -7,23 +7,26 @@ Native Zig server that runs MLX-format LMs on Apple Silicon and exposes OpenAI-c
 - **Zig** 0.15+
 - **mlx-c** (Apple) via Homebrew; FFI in `src/mlx.zig`.
 - **Jinja engine** (lib/jinja_cpp): llama.cpp's C++17 Jinja2 implementation with nlohmann/json. Pre-compiled as `libjinja.a` (rebuild: see comment in `build.zig`).
+- **stb_image** (lib/stb_image.h): JPEG/PNG decoding for vision pipeline
+- **libwebp** via Homebrew: WebP image decoding for vision pipeline
 - **safetensors** for weights; BPE tokenizers (SentencePiece / byte-level)
 
 ## Layout
 
 | Path | Role |
 |------|------|
-| `src/main.zig` | Entry, CLI (`--model`, `--serve`, `--host`, `--port`, `--prompt`, `--max-tokens`, `--temp`, `--ctx-size`, `--timeout`, `--reasoning-budget`, `--log-level`, `--version`, `--help`) |
+| `src/main.zig` | Entry, CLI (`--model`, `--serve`, `--host`, `--port`, `--prompt`, `--max-tokens`, `--temp`, `--ctx-size`, `--timeout`, `--reasoning-budget`, `--no-vision`, `--log-level`, `--version`, `--help`) |
 | `src/mlx.zig` | mlx-c FFI |
 | `src/model.zig` | Config + safetensors loading; supports Gemma-3, Gemma-4, Qwen3, Qwen3.5 MoE, Qwen3-next, Llama, Mistral |
 | `src/tokenizer.zig` | BPE tokenizer |
 | `src/transformer.zig` | Forward pass (embedding, attention, MLP, MoE, GatedDeltaNet); architecture dispatch |
 | `src/generate.zig` | Autoregressive generation, sampling (temperature, top-k, top-p, repeat penalty, presence penalty, logprobs) |
 | `src/chat.zig` | Chat template formatting (ChatML, Gemma turns, Llama-3, Jinja2 via llama.cpp engine); thinking/reasoning tags; tool call parsing |
-| `src/server.zig` | HTTP server: `/health`, `/v1/models`, `/v1/chat/completions`, `/v1/completions`, `/v1/messages` (OpenAI + Anthropic compat, stream + non-stream, tool calling, KV cache) |
+| `src/vision.zig` | Vision encoder (Gemma 4 SigLIP): patch embedding, 2D RoPE, clipped linears, position pooling, embedding projection |
+| `src/server.zig` | HTTP server: `/health`, `/v1/models`, `/v1/chat/completions`, `/v1/completions`, `/v1/messages` (OpenAI + Anthropic compat, stream + non-stream, tool calling, KV cache, vision) |
 | `src/status.zig` | TUI status bar (CPU, memory, GPU metrics) |
 | `src/log.zig` | Leveled logging (error, warn, info, debug) |
-| `build.zig` | Zig build; links mlx-c and pre-compiled libjinja.a |
+| `build.zig` | Zig build; links mlx-c, libjinja.a, libwebp, stb_image |
 
 ### MLX Core (Swift macOS app)
 
@@ -32,16 +35,17 @@ Native Zig server that runs MLX-format LMs on Apple Silicon and exposes OpenAI-c
 | `app/Package.swift` | Swift package; `MLXCore` executable + `MLXCoreTests` test target |
 | `app/Sources/MLXServe/MLXServeApp.swift` | App entry, menu bar + Chat/Browser windows |
 | `app/Sources/MLXServe/AppState.swift` | Global state, chat session management, persistence |
-| `app/Sources/MLXServe/Models/ChatModels.swift` | `ChatMessage`, `SerializedToolCall`, `ChatSession` |
+| `app/Sources/MLXServe/Models/ChatModels.swift` | `ChatMessage`, `ChatImage`, `SerializedToolCall`, `ChatSession` |
 | `app/Sources/MLXServe/Models/AgentModels.swift` | `AgentToolKind`, `AgentPlan`, `StepResult` |
 | `app/Sources/MLXServe/Services/APIClient.swift` | HTTP + SSE streaming client for mlx-serve |
-| `app/Sources/MLXServe/Services/AgentPrompt.swift` | System prompt, tool definitions (7 tools), `SkillManager` (prompt-based skills from `~/.mlx-serve/skills/`) |
-| `app/Sources/MLXServe/Services/ToolExecutor.swift` | Tool handlers: shell, readFile, writeFile, editFile, searchFiles, browse, webSearch |
+| `app/Sources/MLXServe/Services/AgentPrompt.swift` | System prompt, tool definitions (10 tools), `SkillManager` (prompt-based skills from `~/.mlx-serve/skills/`) |
+| `app/Sources/MLXServe/Services/ToolExecutor.swift` | Tool handlers: shell, cwd, readFile, writeFile, editFile, searchFiles, listFiles, browse, webSearch, saveMemory |
+| `app/Sources/MLXServe/Services/ImagePreprocessor.swift` | Image preprocessing for vision encoder (resize, float32 CHW conversion) |
 | `app/Sources/MLXServe/Services/BrowserManager.swift` | WKWebView (headless, created eagerly for background browsing) |
 | `app/Sources/MLXServe/Services/ServerManager.swift` | mlx-serve process lifecycle, stderr capture (`serverLog`), auto-start |
 | `app/Sources/MLXServe/Services/TestServer.swift` | Embedded HTTP server (port 8090) for test automation — same code path as UI |
 | `app/Sources/MLXServe/Services/AgentMemory.swift` | Agent context memory (recent dirs, commands) |
-| `app/Sources/MLXServe/Views/ChatView.swift` | Chat UI + `runAgentLoop()` + `buildAgentHistory()` |
+| `app/Sources/MLXServe/Views/ChatView.swift` | Chat UI + `runAgentLoop()` + `buildAgentHistory()` + image attachment + context monitor |
 | `app/Sources/MLXServe/Views/StatusMenuView.swift` | Menu bar UI, server log viewer, Claude Code launcher |
 | `app/Sources/MLXServe/Views/BrowserView.swift` | Browser window (uses shared WKWebView) |
 
@@ -59,8 +63,8 @@ Native Zig server that runs MLX-format LMs on Apple Silicon and exposes OpenAI-c
 
 ## Building
 
-- **Full app bundle**: `cd app && SKIP_NOTARIZE=1 bash build.sh` — builds Zig + Swift, assembles `.app`, signs (requires `APPLE_DEVELOPER_ID` and `APPLE_TEAM_ID` env vars)
-- Zig server only: `zig build -Doptimize=ReleaseFast`
+- **Full app bundle**: `cd app && SKIP_NOTARIZE=1 bash build.sh` — builds Zig + Swift, assembles `.app`, signs (requires `APPLE_DEVELOPER_ID` and `APPLE_TEAM_ID` env vars). Bundles libwebp + libsharpyuv for vision support.
+- Zig server only: `zig build -Doptimize=ReleaseFast` (requires `brew install webp` for vision pipeline)
 - Swift app only: `cd app && swift build -c release`
 - For tests: `zig build test` (Zig) and `cd app && swift test` (Swift)
 - **Rebuild Jinja library** (after changing `lib/jinja_cpp/*.cpp`): `cd lib/jinja_cpp && for f in jinja_wrapper caps lexer parser runtime jinja_string value; do clang++ -std=c++17 -O2 -DNDEBUG -I . -c $f.cpp -o obj/$f.o; done && ar rcs libjinja.a obj/*.o`
@@ -107,7 +111,7 @@ The MLX Core app has a "Launch Claude Code" button (visible when server is runni
 
 ### Client side (Swift)
 - **Agent loop** (`ChatView.runAgentLoop`): Up to 150 iterations. Calls model with tools → parses tool calls → executes locally → feeds results back → repeats until model responds without tool calls. Adds synthetic user nudge after tool results for models that need it.
-- **History builder** (`ChatView.buildAgentHistory`): Converts `ChatMessage` array to OpenAI API format. Filters out error messages, pad-only content, and agent summaries. Truncates assistant messages at 500 chars. Last 30 messages max.
+- **History builder** (`ChatView.buildAgentHistory`): Converts `ChatMessage` array to OpenAI API format. Filters out error messages, pad-only content, and agent summaries. Truncates assistant messages at 500 chars. Budget-aware: walks backward from newest message, fitting history within available context tokens (context_length - max_tokens - system_prompt). Pins first user message + first assistant response. Auto-compacts tool results when context is tight.
 - **SSE parsing** (`APIClient.performStream`): Accumulates streamed tool call deltas. Server sends full arguments in one delta. Emits `.toolCalls` event on `finish_reason: "tool_calls"`. Fallback emission if stream drops without finish_reason.
 - **Tool call storage**: `SerializedToolCall` (id, name, arguments as JSON string) stored on `ChatMessage.toolCalls`. Persisted via Codable for history replay. Backwards-compatible with old history files (field is optional).
 - **Error recovery**: Tool execution errors include what args were sent and ask the model to retry, enabling self-correction in the agent loop.

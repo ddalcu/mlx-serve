@@ -80,6 +80,22 @@ pub const ModelConfig = struct {
     has_explicit_layer_types: bool = false,
     layer_is_global: [128]bool = .{false} ** 128,
 
+    // Vision encoder (Gemma 4 SigLIP)
+    has_vision: bool = false,
+    vision_hidden_size: u32 = 768,
+    vision_num_layers: u32 = 16,
+    vision_num_heads: u32 = 12,
+    vision_head_dim: u32 = 64,
+    vision_intermediate_size: u32 = 3072,
+    vision_patch_size: u32 = 16,
+    vision_pooling_kernel: u32 = 3,
+    vision_soft_tokens: u32 = 280,
+    vision_position_embedding_size: u32 = 10240,
+    vision_rope_theta: f32 = 100.0,
+    image_token_id: u32 = 0, // 0 = no image token
+    boi_token_id: u32 = 0, // beginning of image
+    eoi_token_id: u32 = 0, // end of image
+
     // Gemma 4: dual head dimensions and KV sharing
     global_head_dim: u32 = 0, // 0 = same as head_dim
     num_global_key_value_heads: u32 = 0, // 0 = same as num_key_value_heads
@@ -331,6 +347,42 @@ pub fn parseConfig(allocator: std.mem.Allocator, model_dir: []const u8) !ModelCo
         }
     }
 
+    // Vision config (Gemma 4 SigLIP)
+    if (root.get("vision_config")) |vc_val| {
+        if (vc_val == .object) {
+            config.has_vision = true;
+            const vc = vc_val.object;
+            if (vc.get("hidden_size")) |v| { if (v == .integer) config.vision_hidden_size = @intCast(v.integer); }
+            if (vc.get("num_hidden_layers")) |v| { if (v == .integer) config.vision_num_layers = @intCast(v.integer); }
+            if (vc.get("num_attention_heads")) |v| { if (v == .integer) config.vision_num_heads = @intCast(v.integer); }
+            if (vc.get("head_dim")) |v| { if (v == .integer) config.vision_head_dim = @intCast(v.integer); }
+            if (vc.get("global_head_dim")) |v| { if (v == .integer) config.vision_head_dim = @intCast(v.integer); }
+            if (vc.get("intermediate_size")) |v| { if (v == .integer) config.vision_intermediate_size = @intCast(v.integer); }
+            if (vc.get("patch_size")) |v| { if (v == .integer) config.vision_patch_size = @intCast(v.integer); }
+            if (vc.get("pooling_kernel_size")) |v| { if (v == .integer) config.vision_pooling_kernel = @intCast(v.integer); }
+            if (vc.get("default_output_length")) |v| { if (v == .integer) config.vision_soft_tokens = @intCast(v.integer); }
+            if (vc.get("position_embedding_size")) |v| { if (v == .integer) config.vision_position_embedding_size = @intCast(v.integer); }
+            if (vc.get("rope_parameters")) |rp| {
+                if (rp == .object) {
+                    if (rp.object.get("rope_theta")) |v| config.vision_rope_theta = jsonFloat(v);
+                }
+            }
+        }
+    }
+    // Image token ID (top-level or in mm_tokens_per_image config)
+    if (root.get("image_token_id")) |v| {
+        if (v == .integer) config.image_token_id = @intCast(v.integer);
+    }
+    if (root.get("image_token_index")) |v| {
+        if (v == .integer and config.image_token_id == 0) config.image_token_id = @intCast(v.integer);
+    }
+    if (root.get("boi_token_id")) |v| {
+        if (v == .integer) config.boi_token_id = @intCast(v.integer);
+    }
+    if (root.get("eoi_token_id")) |v| {
+        if (v == .integer) config.eoi_token_id = @intCast(v.integer);
+    }
+
     // Set model-family defaults based on model_type
     if (std.mem.eql(u8, model_type, "gemma3")) {
         config.model_type = "gemma3";
@@ -503,7 +555,16 @@ pub const Weights = struct {
 };
 
 /// Load all safetensors files from model_dir.
+/// When `load_vision` is true, vision_tower and multi_modal_projector weights are included.
 pub fn loadWeights(allocator: std.mem.Allocator, model_dir: []const u8) !Weights {
+    return loadWeightsOpt(allocator, model_dir, false);
+}
+
+pub fn loadWeightsWithVision(allocator: std.mem.Allocator, model_dir: []const u8) !Weights {
+    return loadWeightsOpt(allocator, model_dir, true);
+}
+
+fn loadWeightsOpt(allocator: std.mem.Allocator, model_dir: []const u8, load_vision: bool) !Weights {
     var weights = Weights.init(allocator);
     errdefer weights.deinit();
 
@@ -525,7 +586,7 @@ pub fn loadWeights(allocator: std.mem.Allocator, model_dir: []const u8) !Weights
         defer allocator.free(path);
 
         log.info("Loading {s}...\n", .{entry.name});
-        try loadSafetensorsFile(allocator, &weights, path, s);
+        try loadSafetensorsFile(allocator, &weights, path, s, load_vision);
         file_count += 1;
     }
 
@@ -538,6 +599,7 @@ fn loadSafetensorsFile(
     weights: *Weights,
     path: [*:0]const u8,
     s: mlx.mlx_stream,
+    load_vision: bool,
 ) !void {
     var tensor_map = mlx.mlx_map_string_to_array_new();
     defer _ = mlx.mlx_map_string_to_array_free(tensor_map);
@@ -563,12 +625,14 @@ fn loadSafetensorsFile(
         const key_str = std.mem.span(key.?);
 
         // Skip non-text-model weights (vision, audio, multi-modal projector, etc.)
-        if (std.mem.startsWith(u8, key_str, "vision_tower.") or
+        // When load_vision is true, keep vision_tower and multi_modal_projector weights.
+        const is_vision = std.mem.startsWith(u8, key_str, "vision_tower.") or
+            std.mem.startsWith(u8, key_str, "embed_vision.") or
             std.mem.startsWith(u8, key_str, "multi_modal_projector.") or
-            std.mem.startsWith(u8, key_str, "audio_tower.") or
-            std.mem.startsWith(u8, key_str, "language_model.multi_modal_projector.") or
-            std.mem.startsWith(u8, key_str, "language_model.audio_multi_modal_projector."))
-        {
+            std.mem.startsWith(u8, key_str, "language_model.multi_modal_projector.");
+        const is_audio = std.mem.startsWith(u8, key_str, "audio_tower.") or
+            std.mem.startsWith(u8, key_str, "language_model.audio_multi_modal_projector.");
+        if (is_audio or (is_vision and !load_vision)) {
             _ = mlx.mlx_array_free(value);
             continue;
         }

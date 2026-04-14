@@ -15,6 +15,7 @@ enum AgentToolKind: String, Codable, CaseIterable {
     case browse
     case webSearch
     case saveMemory
+    case cwd
 
     var icon: String {
         switch self {
@@ -27,6 +28,7 @@ enum AgentToolKind: String, Codable, CaseIterable {
         case .browse: "globe"
         case .webSearch: "magnifyingglass"
         case .saveMemory: "brain"
+        case .cwd: "folder.badge.gearshape"
         }
     }
 
@@ -41,6 +43,7 @@ enum AgentToolKind: String, Codable, CaseIterable {
         case .browse: "Browse"
         case .webSearch: "Web Search"
         case .saveMemory: "Save Memory"
+        case .cwd: "Change Directory"
         }
     }
 }
