@@ -92,6 +92,8 @@ pub const ModelConfig = struct {
     vision_soft_tokens: u32 = 280,
     vision_position_embedding_size: u32 = 10240,
     vision_rope_theta: f32 = 100.0,
+    vision_use_clipped_linears: bool = true,
+    vision_standardize: bool = false,
     image_token_id: u32 = 0, // 0 = no image token
     boi_token_id: u32 = 0, // beginning of image
     eoi_token_id: u32 = 0, // end of image
@@ -367,6 +369,8 @@ pub fn parseConfig(allocator: std.mem.Allocator, model_dir: []const u8) !ModelCo
                     if (rp.object.get("rope_theta")) |v| config.vision_rope_theta = jsonFloat(v);
                 }
             }
+            if (vc.get("use_clipped_linears")) |v| { if (v == .bool) config.vision_use_clipped_linears = v.bool; }
+            if (vc.get("standardize")) |v| { if (v == .bool) config.vision_standardize = v.bool; }
         }
     }
     // Image token ID (top-level or in mm_tokens_per_image config)
