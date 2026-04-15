@@ -1,6 +1,6 @@
 # Changelog
 
-## v26.4.21 — Vision Pipeline, Prefill/Decode Metrics, Async Eval
+## v26.4.21 — Vision Pipeline, Prefill/Decode Metrics, 3x Prefill Speedup
 
 ### Vision Encoder (Gemma 4 SigLIP)
 - **Full vision pipeline**: Gemma 4 models can now process images end-to-end — SigLIP vision encoder with patch embedding, 2D RoPE, clipped linears, position pooling, and embedding projection
@@ -16,9 +16,47 @@
 - **Old**: `<- 1133+256 tokens (5906ms, ~43 tok/s) [length]`
 - **New**: `<- 1133+256 tokens (5906ms) [prefill: 606 tok/s, decode: 63 tok/s] [length]`
 
-### Async Eval Optimization
-- **Removed synchronous `evalState()` bottleneck**: `Generator.init()` now bundles KV cache state + sampled token + next forward pass into a single `async_eval` call, avoiding a synchronous GPU stall that blocked the async pipeline
-- **KV cache buffer allocation cleanup**: Separated fresh-buffer and grow-existing-buffer paths in `KVCache.update()` for clarity
+### 3x Prefill Speedup — Split Prefill (matches mlx-lm)
+- **Root cause**: The full forward pass applied `lm_head` projection (`[seq_len, 1536] @ [1536, 262144]`) over the entire prompt — for 870 tokens that's a ~912MB output tensor computed and immediately discarded (only the last position's logits are needed for sampling)
+- **Fix**: `Generator.init()` now splits prefill into two phases, mirroring mlx-lm's `generate_step`:
+  1. **Prefix pass** (N-1 tokens): Forward pass builds the lazy graph including `lm_head`, but only KV cache entries are evaluated — MLX's lazy evaluation skips the `lm_head` matmul entirely since nothing depends on it
+  2. **Last token pass** (1 token): Forward + `lm_head` on a single token produces the logits needed for sampling, then chains into the decode pipeline via `async_eval`
+- **`mlx_clear_cache()`** between phases frees intermediate Metal buffers from the prefix pass
+- **Conditional KV array allocation**: Moved 9 temp array declarations inside the non-shared KV block in `forwardStandard()` — eliminates 180 unnecessary `mlx_array_new()`/`free()` calls per forward pass for Gemma 4 E2B (20 of 35 layers share KV)
+
+#### Benchmark: Gemma 4 E2B-it 4-bit, Apple Silicon (mlx 0.31.1, mlx-c 0.6.0, llama.cpp b8680)
+
+**Prefill (tok/s)**
+
+| Prompt length | mlx-serve | mlx-lm | llama.cpp |
+|---------------|-----------|--------|-----------|
+| Short (~20 tok) | 22 | — | 189 |
+| Medium (~100 tok) | 252 | — | 397 |
+| Long (~900 tok) | **1,266** | ~equal wall | 554 |
+
+**Decode (tok/s)**
+
+| Test | mlx-serve | mlx-lm | llama.cpp |
+|------|-----------|--------|-----------|
+| 300-token generation | **63.7** | 61.7 | 48.0 |
+| Reasoning Q&A | **64.3** | 60.8 | 47.9 |
+| Code generation | **63.4** | 59.9 | 46.7 |
+| Tool calling | **62.4** | N/A | 47.1 |
+
+**Wall time (ms) — agentic workloads**
+
+| Test | mlx-serve | mlx-lm | llama.cpp |
+|------|-----------|--------|-----------|
+| Tool call selection | **798** | N/A | 6,767 |
+| Multi-turn tool fix | **8,278** | 8,567* | 11,293 |
+| Code gen (600 tok) | **9,657** | 9,960 | 13,003 |
+
+*mlx-lm has no tool calling support — tool tests adapted to plain prompts
+
+- **2.3x faster prefill** than llama.cpp on long prompts
+- **35% faster decode** than llama.cpp, 5% faster than mlx-lm
+- **8.5x faster tool calling** than llama.cpp (only engine producing valid structured tool calls)
+- **25–35% faster wall time** than llama.cpp on generation-heavy tasks
 
 ### MLX Core App — Image Support
 - **Image attachment UI**: Drag-and-drop or paste images into the chat input; thumbnails with remove buttons shown before sending

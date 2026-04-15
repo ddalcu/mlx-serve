@@ -83,47 +83,67 @@ pub const Generator = struct {
     ) !Generator {
         const s = xfm.s;
 
-        // Create input tensor for prefill: [1, seq_len]
-        const prompt_len: c_int = @intCast(prompt_ids.len);
-        const shape = [_]c_int{ 1, prompt_len };
-
         const ids_i32 = try allocator.alloc(i32, prompt_ids.len);
         defer allocator.free(ids_i32);
         for (prompt_ids, 0..) |id, i| {
             ids_i32[i] = @intCast(id);
         }
 
-        const input = mlx.mlx_array_new_data(ids_i32.ptr, &shape, 2, .int32);
-        defer _ = mlx.mlx_array_free(input);
+        // Split prefill: process first N-1 tokens (cache-only, skip lm_head eval),
+        // then the last token (produces logits for sampling). This mirrors mlx-lm's
+        // generate_step which avoids the expensive lm_head projection over the full
+        // sequence length. For vocab_size=262144, skipping lm_head on N-1 tokens
+        // avoids a [N-1, hidden] @ [hidden, 262144] matmul.
+        if (prompt_ids.len > 1) {
+            const prefix_len: c_int = @intCast(prompt_ids.len - 1);
+            const prefix_shape = [_]c_int{ 1, prefix_len };
+            const prefix_input = mlx.mlx_array_new_data(ids_i32.ptr, &prefix_shape, 2, .int32);
+            defer _ = mlx.mlx_array_free(prefix_input);
 
-        const logits = try xfm.forward(input);
+            // Forward pass on prefix — returns logits lazily (lm_head is in the
+            // graph but we never eval it, so MLX skips the computation).
+            const prefix_logits = try xfm.forward(prefix_input);
+            _ = mlx.mlx_array_free(prefix_logits); // drop logits ref
 
-        // Sample first token lazily, then build the next forward pass as part
-        // of the same lazy graph so async_eval kicks off the whole chain.
+            // Eval only cache state — materializes attention K/V without lm_head
+            {
+                const eval_vec = mlx.mlx_vector_array_new();
+                defer _ = mlx.mlx_vector_array_free(eval_vec);
+                for (xfm.cache.entries) |*entry| {
+                    if (!entry.initialized) continue;
+                    _ = mlx.mlx_vector_array_append_value(eval_vec, entry.keys);
+                    _ = mlx.mlx_vector_array_append_value(eval_vec, entry.values);
+                }
+                _ = mlx.mlx_eval(eval_vec);
+            }
+            _ = mlx.mlx_clear_cache();
+        }
+
+        // Process last token (or single token for len=1) — this applies lm_head
+        // on just 1 token, producing the logits we need for sampling.
+        const last_shape = [_]c_int{ 1, 1 };
+        const last_idx = prompt_ids.len - 1;
+        const last_input = mlx.mlx_array_new_data(&ids_i32[last_idx], &last_shape, 2, .int32);
+        defer _ = mlx.mlx_array_free(last_input);
+
+        const logits = try xfm.forward(last_input);
+
+        // Sample first token lazily, then build the next forward pass
         const lazy_token = sampleTokenLazy(logits, sampling, s);
         _ = mlx.mlx_array_free(logits);
 
-        // Reshape lazy token [1] -> [1, 1] and feed into next forward pass
         const next_logits = try lazyForward(xfm, lazy_token);
 
-        // Eval the cache state + token + next logits together via async_eval.
-        // Bundling everything into one async_eval lets MLX schedule the full
-        // graph (prefill -> sample -> decode-step-0) on the GPU at once,
-        // avoiding a synchronous stall from separate evalState() + async_eval.
+        // Async-eval the decode pipeline (single-token graphs, much smaller)
         {
             const eval_vec = mlx.mlx_vector_array_new();
             defer _ = mlx.mlx_vector_array_free(eval_vec);
-            for (xfm.cache.entries) |*entry| {
-                if (!entry.initialized) continue;
-                _ = mlx.mlx_vector_array_append_value(eval_vec, entry.keys);
-                _ = mlx.mlx_vector_array_append_value(eval_vec, entry.values);
-            }
             _ = mlx.mlx_vector_array_append_value(eval_vec, lazy_token);
             _ = mlx.mlx_vector_array_append_value(eval_vec, next_logits);
             _ = mlx.mlx_async_eval(eval_vec);
         }
 
-        // Now sync to get the first token value (GPU is already computing next_logits)
+        // Sync to get the first token value
         try mlx.check(mlx.mlx_array_eval(lazy_token));
         var val: i32 = 0;
         try mlx.check(mlx.mlx_array_item_int32(&val, lazy_token));

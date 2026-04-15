@@ -1959,25 +1959,6 @@ pub const Transformer = struct {
             // K, V and cache — either compute or read from shared source
             var full_k: mlx.mlx_array = undefined;
             var full_v: mlx.mlx_array = undefined;
-            // Temp arrays that need cleanup (only if we computed K,V ourselves)
-            var own_k = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(own_k);
-            var own_v = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(own_v);
-            var own_k_r = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(own_k_r);
-            var own_v_r = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(own_v_r);
-            var own_k_normed_arr = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(own_k_normed_arr);
-            var own_v_normed_arr = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(own_v_normed_arr);
-            var own_k_t = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(own_k_t);
-            var own_v_t = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(own_v_t);
-            var own_k_rope = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(own_k_rope);
 
             if (is_kv_shared) {
                 // KV sharing: read from source layer's cache
@@ -1986,20 +1967,30 @@ pub const Transformer = struct {
                 full_k = entry.key_view;
                 full_v = entry.value_view;
             } else {
-                // Compute K, V
-                own_k = try self.qmatmul(normed, lw.k_w, lw.k_s, lw.k_b);
-                own_v = try self.qmatmul(normed, lw.v_w, lw.v_s, lw.v_b);
+                // Compute K, V (temp arrays scoped to this block)
+                const own_k = try self.qmatmul(normed, lw.k_w, lw.k_s, lw.k_b);
+                defer _ = mlx.mlx_array_free(own_k);
+                const own_v = try self.qmatmul(normed, lw.v_w, lw.v_s, lw.v_b);
+                defer _ = mlx.mlx_array_free(own_v);
 
+                var own_k_r = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(own_k_r);
+                var own_v_r = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(own_v_r);
                 try mlx.check(mlx.mlx_reshape(&own_k_r, own_k, cur_kv_shape, 4, self.s));
                 try mlx.check(mlx.mlx_reshape(&own_v_r, own_v, cur_kv_shape, 4, self.s));
 
                 // K norm
+                var own_k_normed_arr = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(own_k_normed_arr);
                 if (lw.k_norm) |kn| {
                     own_k_normed_arr = try self.rmsNorm(own_k_r, kn);
                 }
                 const k_for_rope = if (lw.k_norm != null) own_k_normed_arr else own_k_r;
 
                 // V norm (Gemma 4: parameter-free RMS norm on values)
+                var own_v_normed_arr = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(own_v_normed_arr);
                 if (cfg.has_v_norm) {
                     const vnw = if (has_dual_hd and is_global)
                         (self.v_norm_weight_global orelse self.v_norm_weight.?)
@@ -2009,10 +2000,16 @@ pub const Transformer = struct {
                 }
                 const v_after_norm = if (cfg.has_v_norm) own_v_normed_arr else own_v_r;
 
+                var own_k_t = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(own_k_t);
+                var own_v_t = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(own_v_t);
                 try mlx.check(mlx.mlx_transpose_axes(&own_k_t, k_for_rope, &perm, 4, self.s));
                 try mlx.check(mlx.mlx_transpose_axes(&own_v_t, v_after_norm, &perm, 4, self.s));
 
                 // RoPE on K
+                var own_k_rope = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(own_k_rope);
                 try mlx.check(mlx.mlx_fast_rope(&own_k_rope, own_k_t, effective_rope_dims, false, rope_base_opt, rope_scale, @intCast(offset), rope_freqs, self.s));
 
                 // Update KV cache
