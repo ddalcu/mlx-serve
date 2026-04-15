@@ -93,7 +93,6 @@ pub const ModelConfig = struct {
     vision_position_embedding_size: u32 = 10240,
     vision_rope_theta: f32 = 100.0,
     vision_use_clipped_linears: bool = true,
-    vision_standardize: bool = false,
     image_token_id: u32 = 0, // 0 = no image token
     boi_token_id: u32 = 0, // beginning of image
     eoi_token_id: u32 = 0, // end of image
@@ -106,6 +105,8 @@ pub const ModelConfig = struct {
     hidden_size_per_layer_input: u32 = 0, // >0 enables PLE
     partial_rotary_factor_global: f32 = 1.0, // for global/full attention layers
     has_v_norm: bool = false, // parameter-free RMS norm on values
+    // Gemma 4 (31B): full_attention layers share V with K (no v_proj stored)
+    attention_k_eq_v: bool = false,
 
     pub fn isGlobalLayer(self: ModelConfig, layer_idx: u32) bool {
         if (!self.has_sliding_window) return true;
@@ -280,6 +281,9 @@ pub fn parseConfig(allocator: std.mem.Allocator, model_dir: []const u8) !ModelCo
     if (cfg_obj.get("num_kv_shared_layers")) |v| {
         if (v == .integer) config.num_kv_shared_layers = @intCast(v.integer);
     }
+    if (cfg_obj.get("attention_k_eq_v")) |v| {
+        if (v == .bool) config.attention_k_eq_v = v.bool;
+    }
     if (cfg_obj.get("final_logit_softcapping")) |v| {
         config.final_logit_softcapping = jsonFloat(v);
     }
@@ -370,7 +374,9 @@ pub fn parseConfig(allocator: std.mem.Allocator, model_dir: []const u8) !ModelCo
                 }
             }
             if (vc.get("use_clipped_linears")) |v| { if (v == .bool) config.vision_use_clipped_linears = v.bool; }
-            if (vc.get("standardize")) |v| { if (v == .bool) config.vision_standardize = v.bool; }
+            // vision_config.standardize is presence-only — the actual `std_scale`/`std_bias`
+            // safetensors presence drives behavior in `VisionEncoder.init`, so the config
+            // flag needs no field.
         }
     }
     // Image token ID (top-level or in mm_tokens_per_image config)

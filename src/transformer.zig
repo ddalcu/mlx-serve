@@ -357,6 +357,8 @@ const LayerWeights = struct {
     ple_norm: ?mlx.mlx_array = null,
     // KV sharing: source layer index (null = compute own KV)
     kv_source: ?u32 = null,
+    // Gemma 4 (31B): V aliases K projection within this layer (no v_proj weight loaded)
+    k_eq_v: bool = false,
 };
 
 // ── MoE model per-layer weights ──
@@ -468,6 +470,25 @@ const MoeLayerWeights = struct {
     layer_scalar: ?mlx.mlx_array = null,
 };
 
+// ── Quantization bit cache ──
+// A tiny lock-free pointer→bits cache. Quantized weights are loaded once at init and
+// reused for every forward pass; we detect bits on first touch and serve hits thereafter.
+// Uses open addressing with linear probing on a fixed-size array — this fits in L1
+// and keeps the cost of a lookup to ~5ns, matching the perf commit's intent of
+// "eliminate per-call detectQuantBits overhead" while still supporting mixed-precision
+// quantization (Gemma-4 MoE, etc.).
+const BITS_CACHE_CAP: usize = 1024; // plenty for 60 layers × ~10 quant weights × factor
+const BitsCache = struct {
+    keys: [BITS_CACHE_CAP]?*anyopaque = [_]?*anyopaque{null} ** BITS_CACHE_CAP,
+    vals: [BITS_CACHE_CAP]u8 = [_]u8{0} ** BITS_CACHE_CAP,
+
+    inline fn slot(key: *anyopaque) usize {
+        const h: usize = @intFromPtr(key);
+        // Golden-ratio multiplier for quick hash on pointer values (high bits).
+        return (h *% 0x9E3779B97F4A7C15) >> @as(u6, @intCast(@bitSizeOf(usize) - 10));
+    }
+};
+
 // ── Transformer ──
 
 pub const Transformer = struct {
@@ -544,6 +565,13 @@ pub const Transformer = struct {
     compiled_gelu: ?mlx.mlx_closure = null,
     compiled_geglu: ?mlx.mlx_closure = null, // gelu(gate) * up → 1 kernel
     compiled_softcap: ?mlx.mlx_closure = null, // tanh(x/cap) * cap → 1 kernel
+
+    // Per-weight quantization bit cache (see bitsFor). Populated lazily on first use.
+    // Keyed by the scales array's ctx pointer (stable for the lifetime of a weight).
+    // Used instead of config.quant_bits so mixed-precision models (Gemma-4 MoE, etc.)
+    // with per-layer overrides work correctly while keeping zero per-call FFI overhead
+    // after the first touch.
+    bits_cache: BitsCache = .{},
 
     pub fn init(allocator: std.mem.Allocator, config: ModelConfig, weights: *const Weights) !Transformer {
         // Create a dedicated GPU stream for generation (matches mlx-lm pattern).
@@ -1185,7 +1213,36 @@ pub const Transformer = struct {
     // ── Core ops ──
 
     inline fn qmatmul(self: *const Transformer, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array) !mlx.mlx_array {
-        return qmatmulBits(x, w, sc, bi, self.config.quant_bits, self.config.quant_group_size, self.s);
+        // Detect bits per weight to support mixed-precision models (e.g. Gemma-4 MoE
+        // where MLP/router are 8-bit while default is 4-bit). Cost is ~4 shape reads;
+        // the cache on Transformer avoids even that after the first call per weight.
+        const gs = self.config.quant_group_size;
+        const bits = self.bitsFor(w, sc, gs);
+        return qmatmulBits(x, w, sc, bi, bits, gs, self.s);
+    }
+
+    /// Resolve per-weight quant bits with a lazy cache keyed by the scales array pointer.
+    /// First touch computes from shapes (~4 FFI calls); subsequent calls are a single
+    /// pointer compare. Thread-safety: generation is single-threaded so no locks needed.
+    inline fn bitsFor(self: *const Transformer, w: mlx.mlx_array, sc: mlx.mlx_array, group_size: u32) u32 {
+        const key_raw = sc.ctx orelse return self.config.quant_bits;
+        const cache = @constCast(&self.bits_cache);
+        const start = BitsCache.slot(key_raw);
+        // Linear probe, 4 slots max — cache is sized generously so miss probing is rare.
+        var i: usize = 0;
+        while (i < 4) : (i += 1) {
+            const slot = (start + i) & (BITS_CACHE_CAP - 1);
+            const entry = cache.keys[slot];
+            if (entry == key_raw) return cache.vals[slot];
+            if (entry == null) {
+                const detected = detectQuantBits(w, sc, group_size);
+                cache.keys[slot] = key_raw;
+                cache.vals[slot] = @intCast(detected);
+                return detected;
+            }
+        }
+        // Probe window saturated (should essentially never happen) — fall through to direct detect.
+        return detectQuantBits(w, sc, group_size);
     }
 
     inline fn rmsNorm(self: *const Transformer, x: mlx.mlx_array, w: mlx.mlx_array) !mlx.mlx_array {
@@ -1230,13 +1287,14 @@ pub const Transformer = struct {
 
         var emb = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(emb);
+        const emb_bits = self.bitsFor(self.emb_w, self.emb_s, self.config.quant_group_size);
         try mlx.check(mlx.mlx_dequantize(
             &emb,
             taken_w,
             taken_s,
             taken_b,
             mlx.mlx_optional_int.some(@intCast(self.config.quant_group_size)),
-            mlx.mlx_optional_int.some(@intCast(self.config.quant_bits)),
+            mlx.mlx_optional_int.some(@intCast(emb_bits)),
             "affine",
             .{}, // global_scale (null)
             .{ .value = .bfloat16, .has_value = true },
@@ -1367,14 +1425,11 @@ pub const Transformer = struct {
         const ve = self.vision_embeddings orelse return h;
         if (cfg.image_token_id == 0) return h;
 
-        if (self.emb_scale) |scale| {
-            var ve_scaled = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(ve_scaled);
-            try mlx.check(mlx.mlx_multiply(&ve_scaled, ve, scale, self.s));
-            return self.spliceVisionEmbeddings(h, token_ids, ve_scaled, cfg.image_token_id);
-        } else {
-            return self.spliceVisionEmbeddings(h, token_ids, ve, cfg.image_token_id);
-        }
+        // Vision embeddings come out of the MultimodalEmbedder already in text-hidden space;
+        // mlx-vlm does NOT re-scale them by sqrt(hidden) the way text embeddings are scaled
+        // at LM embedding time. Splice directly — scaling here corrupts the MoE router's
+        // magnitude assumptions (visible as "please provide an image" responses on 26B MoE).
+        return self.spliceVisionEmbeddings(h, token_ids, ve, cfg.image_token_id);
     }
 
     // ── Activation functions ──
@@ -1569,13 +1624,14 @@ pub const Transformer = struct {
         defer _ = mlx.mlx_array_free(tb);
         try mlx.check(mlx.mlx_take_axis(&tb, bi, ids, 0, self.s));
         var result = mlx.mlx_array_new();
+        const bits = self.bitsFor(w, sc, self.config.quant_group_size);
         try mlx.check(mlx.mlx_dequantize(
             &result,
             tw,
             ts,
             tb,
             mlx.mlx_optional_int.some(@intCast(self.config.quant_group_size)),
-            mlx.mlx_optional_int.some(@intCast(self.config.quant_bits)),
+            mlx.mlx_optional_int.some(@intCast(bits)),
             "affine",
             .{}, // global_scale (null)
             .{ .value = .bfloat16, .has_value = true },
@@ -1967,11 +2023,17 @@ pub const Transformer = struct {
                 full_k = entry.key_view;
                 full_v = entry.value_view;
             } else {
-                // Compute K, V (temp arrays scoped to this block)
+                // Compute K, V (temp arrays scoped to this block).
+                // When k_eq_v, V shares the K projection — compute once, alias into V.
                 const own_k = try self.qmatmul(normed, lw.k_w, lw.k_s, lw.k_b);
                 defer _ = mlx.mlx_array_free(own_k);
-                const own_v = try self.qmatmul(normed, lw.v_w, lw.v_s, lw.v_b);
-                defer _ = mlx.mlx_array_free(own_v);
+                const own_v = if (lw.k_eq_v)
+                    own_k
+                else
+                    try self.qmatmul(normed, lw.v_w, lw.v_s, lw.v_b);
+                defer if (!lw.k_eq_v) {
+                    _ = mlx.mlx_array_free(own_v);
+                };
 
                 var own_k_r = mlx.mlx_array_new();
                 defer _ = mlx.mlx_array_free(own_k_r);
@@ -3029,8 +3091,12 @@ pub const Transformer = struct {
     fn moeMLP2(self: *Transformer, router_x: mlx.mlx_array, expert_x: mlx.mlx_array, mw: *const MoeMlpWeights) !mlx.mlx_array {
         const cfg = &self.config;
         const k: c_int = @intCast(cfg.num_experts_per_tok);
-        const bits = cfg.quant_bits;
         const gs = cfg.quant_group_size;
+        // Per-expert-weight bits: Gemma-4 MoE has 4-bit experts but 8-bit router/shared,
+        // so we can't use a single layer-wide bits value — resolve per weight.
+        const gate_bits = self.bitsFor(mw.switch_gate_w, mw.switch_gate_s, gs);
+        const up_bits = self.bitsFor(mw.switch_up_w, mw.switch_up_s, gs);
+        const down_bits = self.bitsFor(mw.switch_down_w, mw.switch_down_s, gs);
 
         // Router: compute logits and top-K selection
         var router_logits: mlx.mlx_array = undefined;
@@ -3049,11 +3115,11 @@ pub const Transformer = struct {
             defer _ = mlx.mlx_array_free(normed_input);
             try mlx.check(mlx.mlx_fast_rms_norm(&normed_input, router_x, norm_weight, cfg.rms_norm_eps, self.s));
 
-            const router_bits = detectQuantBits(mw.router_w, mw.router_s, gs);
+            const router_bits = self.bitsFor(mw.router_w, mw.router_s, gs);
             router_logits = try qmatmulBits(normed_input, mw.router_w, mw.router_s, mw.router_b, router_bits, gs, self.s);
         } else {
             // Qwen3.5: direct projection
-            const router_bits = detectQuantBits(mw.router_w, mw.router_s, gs);
+            const router_bits = self.bitsFor(mw.router_w, mw.router_s, gs);
             router_logits = try qmatmulBits(router_x, mw.router_w, mw.router_s, mw.router_b, router_bits, gs, self.s);
         }
 
@@ -3140,7 +3206,7 @@ pub const Transformer = struct {
         // gate_out: [B, S, K, 1, intermediate] → squeeze M → [B, S, K, intermediate]
         var gate_out_5d = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(gate_out_5d);
-        try mlx.check(mlx.mlx_gather_qmm(&gate_out_5d, x_exp, mw.switch_gate_w, mw.switch_gate_s, mw.switch_gate_b, no_idx, inds, true, mlx.mlx_optional_int.some(@intCast(gs)), mlx.mlx_optional_int.some(@intCast(bits)), "affine", false, self.s));
+        try mlx.check(mlx.mlx_gather_qmm(&gate_out_5d, x_exp, mw.switch_gate_w, mw.switch_gate_s, mw.switch_gate_b, no_idx, inds, true, mlx.mlx_optional_int.some(@intCast(gs)), mlx.mlx_optional_int.some(@intCast(gate_bits)), "affine", false, self.s));
         var gate_out = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(gate_out);
         try mlx.check(mlx.mlx_squeeze(&gate_out, gate_out_5d, self.s));
@@ -3148,7 +3214,7 @@ pub const Transformer = struct {
         // up_out: [B, S, K, intermediate]
         var up_out_5d = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(up_out_5d);
-        try mlx.check(mlx.mlx_gather_qmm(&up_out_5d, x_exp, mw.switch_up_w, mw.switch_up_s, mw.switch_up_b, no_idx, inds, true, mlx.mlx_optional_int.some(@intCast(gs)), mlx.mlx_optional_int.some(@intCast(bits)), "affine", false, self.s));
+        try mlx.check(mlx.mlx_gather_qmm(&up_out_5d, x_exp, mw.switch_up_w, mw.switch_up_s, mw.switch_up_b, no_idx, inds, true, mlx.mlx_optional_int.some(@intCast(gs)), mlx.mlx_optional_int.some(@intCast(up_bits)), "affine", false, self.s));
         var up_out = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(up_out);
         try mlx.check(mlx.mlx_squeeze(&up_out, up_out_5d, self.s));
@@ -3164,7 +3230,7 @@ pub const Transformer = struct {
 
         var down_out_5d = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(down_out_5d);
-        try mlx.check(mlx.mlx_gather_qmm(&down_out_5d, act_exp, mw.switch_down_w, mw.switch_down_s, mw.switch_down_b, no_idx, inds, true, mlx.mlx_optional_int.some(@intCast(gs)), mlx.mlx_optional_int.some(@intCast(bits)), "affine", false, self.s));
+        try mlx.check(mlx.mlx_gather_qmm(&down_out_5d, act_exp, mw.switch_down_w, mw.switch_down_s, mw.switch_down_b, no_idx, inds, true, mlx.mlx_optional_int.some(@intCast(gs)), mlx.mlx_optional_int.some(@intCast(down_bits)), "affine", false, self.s));
         var down_out = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(down_out);
         try mlx.check(mlx.mlx_squeeze(&down_out, down_out_5d, self.s));
@@ -3194,7 +3260,7 @@ pub const Transformer = struct {
         defer _ = mlx.mlx_array_free(sh_down);
 
         const seg_w = mw.shared_expert_gate_w.?;
-        const seg_bits = detectQuantBits(seg_w, mw.shared_expert_gate_s.?, gs);
+        const seg_bits = self.bitsFor(seg_w, mw.shared_expert_gate_s.?, gs);
         const sh_gate_logit = try qmatmulBits(expert_x, seg_w, mw.shared_expert_gate_s.?, mw.shared_expert_gate_b.?, seg_bits, gs, self.s);
         defer _ = mlx.mlx_array_free(sh_gate_logit);
         var sh_gate_sig = mlx.mlx_array_new();
@@ -3342,9 +3408,18 @@ fn initStandardLayers(allocator: std.mem.Allocator, config: ModelConfig, weights
         lw.k_w = getLayerWeight(weights, name_buf, prefix, li, "self_attn.k_proj.weight");
         lw.k_s = getLayerWeight(weights, name_buf, prefix, li, "self_attn.k_proj.scales");
         lw.k_b = getLayerWeight(weights, name_buf, prefix, li, "self_attn.k_proj.biases");
-        lw.v_w = getLayerWeight(weights, name_buf, prefix, li, "self_attn.v_proj.weight");
-        lw.v_s = getLayerWeight(weights, name_buf, prefix, li, "self_attn.v_proj.scales");
-        lw.v_b = getLayerWeight(weights, name_buf, prefix, li, "self_attn.v_proj.biases");
+        // Gemma 4 (31B): full_attention layers share V with K (no v_proj weight stored).
+        // Sliding_attention layers still have separate V.
+        lw.k_eq_v = config.attention_k_eq_v and config.isGlobalLayer(li);
+        if (lw.k_eq_v) {
+            lw.v_w = lw.k_w;
+            lw.v_s = lw.k_s;
+            lw.v_b = lw.k_b;
+        } else {
+            lw.v_w = getLayerWeight(weights, name_buf, prefix, li, "self_attn.v_proj.weight");
+            lw.v_s = getLayerWeight(weights, name_buf, prefix, li, "self_attn.v_proj.scales");
+            lw.v_b = getLayerWeight(weights, name_buf, prefix, li, "self_attn.v_proj.biases");
+        }
         lw.o_w = getLayerWeight(weights, name_buf, prefix, li, "self_attn.o_proj.weight");
         lw.o_s = getLayerWeight(weights, name_buf, prefix, li, "self_attn.o_proj.scales");
         lw.o_b = getLayerWeight(weights, name_buf, prefix, li, "self_attn.o_proj.biases");
@@ -3362,7 +3437,16 @@ fn initStandardLayers(allocator: std.mem.Allocator, config: ModelConfig, weights
         // Gemma 4: per-layer scalar
         lw.layer_scalar = getLayerWeightOpt(weights, name_buf, prefix, li, "layer_scalar");
 
-        // Gemma 4: PLE per-layer weights
+        // Gemma 4: PLE per-layer weights. Must initialize even in the no-PLE case so the
+        // optional tags are not read as uninitialized memory later in the eval loop
+        // (the layers slice comes from `allocator.alloc` which skips struct defaults).
+        lw.ple_gate_w = null;
+        lw.ple_gate_s = null;
+        lw.ple_gate_b = null;
+        lw.ple_proj_w = null;
+        lw.ple_proj_s = null;
+        lw.ple_proj_b = null;
+        lw.ple_norm = null;
         if (config.hidden_size_per_layer_input > 0) {
             lw.ple_gate_w = getLayerWeightOpt(weights, name_buf, prefix, li, "per_layer_input_gate.weight");
             lw.ple_gate_s = getLayerWeightOpt(weights, name_buf, prefix, li, "per_layer_input_gate.scales");
@@ -3394,6 +3478,18 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
         lw.input_norm = getLayerWeight(weights, name_buf, prefix, li, "input_layernorm.weight");
         lw.post_attn_norm = getLayerWeight(weights, name_buf, prefix, li, "post_attention_layernorm.weight");
         lw.is_linear = is_linear;
+
+        // `moe_layers` comes from `allocator.alloc` which skips struct defaults, so every
+        // optional must be initialized before the conditional Gemma-4-only assignments;
+        // otherwise the eval loop reads uninitialized memory as valid handles (segfaults
+        // with 0xaa...aa on Qwen3-Next and similar non-Gemma MoE models).
+        lw.pre_ff_norm = null;
+        lw.post_ff_norm = null;
+        lw.pre_ff_norm_2 = null;
+        lw.post_ff_norm_1 = null;
+        lw.post_ff_norm_2 = null;
+        lw.layer_scalar = null;
+        lw.shared_mlp = null;
 
         // Gemma 4 MoE: extra feedforward norms, layer scalar, shared expert MLP
         if (is_gemma4) {
