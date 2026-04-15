@@ -21,7 +21,7 @@ jobs:
           version: 0.15.2
 
       - name: Install dependencies
-        run: brew install mlx-c create-dmg
+        run: brew install mlx-c webp create-dmg
 
       - name: Import signing certificate
         env:
@@ -87,6 +87,11 @@ jobs:
           cp /opt/homebrew/opt/mlx/lib/libmlx.dylib "$STAGING/lib/"
           cp /opt/homebrew/opt/mlx/lib/mlx.metallib "$STAGING/lib/"
 
+          # WebP libraries for vision pipeline
+          WEBP_LIB="$(brew --prefix webp)/lib"
+          [ -f "$WEBP_LIB/libwebp.dylib" ] && cp "$WEBP_LIB/libwebp.dylib" "$STAGING/lib/"
+          [ -f "$WEBP_LIB/libsharpyuv.dylib" ] && cp "$WEBP_LIB/libsharpyuv.dylib" "$STAGING/lib/"
+
           install_name_tool -change \
             /opt/homebrew/opt/mlx-c/lib/libmlxc.dylib \
             @executable_path/lib/libmlxc.dylib \
@@ -97,8 +102,21 @@ jobs:
             @loader_path/libmlx.dylib \
             "$STAGING/lib/libmlxc.dylib"
 
-          codesign --force --options runtime --sign "$SIGNING_IDENTITY" "$STAGING/lib/libmlx.dylib"
-          codesign --force --options runtime --sign "$SIGNING_IDENTITY" "$STAGING/lib/libmlxc.dylib"
+          # Fix webp rpaths
+          if [ -f "$STAGING/lib/libwebp.dylib" ]; then
+            install_name_tool -change \
+              "$(otool -L "$STAGING/mlx-serve" | grep libwebp | awk '{print $1}')" \
+              @executable_path/lib/libwebp.dylib \
+              "$STAGING/mlx-serve" 2>/dev/null || true
+            install_name_tool -change \
+              "$(otool -L "$STAGING/lib/libwebp.dylib" | grep libsharpyuv | awk '{print $1}')" \
+              @loader_path/libsharpyuv.dylib \
+              "$STAGING/lib/libwebp.dylib" 2>/dev/null || true
+          fi
+
+          for lib in "$STAGING/lib/"*.dylib "$STAGING/lib/"*.metallib; do
+            [ -f "$lib" ] && codesign --force --options runtime --sign "$SIGNING_IDENTITY" "$lib"
+          done
           codesign --force --options runtime --sign "$SIGNING_IDENTITY" "$STAGING/mlx-serve"
 
           codesign --verify --deep --strict --verbose=2 "$STAGING/mlx-serve"
@@ -142,6 +160,11 @@ jobs:
           cp /opt/homebrew/opt/mlx/lib/libmlx.dylib "$CONTENTS/Frameworks/"
           cp /opt/homebrew/opt/mlx/lib/mlx.metallib "$CONTENTS/Frameworks/"
 
+          # WebP libraries for vision pipeline
+          WEBP_LIB="$(brew --prefix webp)/lib"
+          [ -f "$WEBP_LIB/libwebp.dylib" ] && cp "$WEBP_LIB/libwebp.dylib" "$CONTENTS/Frameworks/"
+          [ -f "$WEBP_LIB/libsharpyuv.dylib" ] && cp "$WEBP_LIB/libsharpyuv.dylib" "$CONTENTS/Frameworks/"
+
           # Fix rpaths
           install_name_tool -change \
             "$(otool -L "$CONTENTS/MacOS/mlx-serve" | grep libmlxc | awk '{print $1}')" \
@@ -152,6 +175,18 @@ jobs:
             "$(otool -L "$CONTENTS/Frameworks/libmlxc.dylib" | grep libmlx.dylib | head -1 | awk '{print $1}')" \
             "@loader_path/libmlx.dylib" \
             "$CONTENTS/Frameworks/libmlxc.dylib" 2>/dev/null || true
+
+          # Fix webp rpaths
+          if [ -f "$CONTENTS/Frameworks/libwebp.dylib" ]; then
+            install_name_tool -change \
+              "$(otool -L "$CONTENTS/MacOS/mlx-serve" | grep libwebp | awk '{print $1}')" \
+              "@executable_path/../Frameworks/libwebp.dylib" \
+              "$CONTENTS/MacOS/mlx-serve" 2>/dev/null || true
+            install_name_tool -change \
+              "$(otool -L "$CONTENTS/Frameworks/libwebp.dylib" | grep libsharpyuv | awk '{print $1}')" \
+              "@loader_path/libsharpyuv.dylib" \
+              "$CONTENTS/Frameworks/libwebp.dylib" 2>/dev/null || true
+          fi
 
           # Sign inside-out
           chmod -R u+w "$APP"
