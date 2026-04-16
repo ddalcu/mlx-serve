@@ -94,29 +94,46 @@ pub const Generator = struct {
         // generate_step which avoids the expensive lm_head projection over the full
         // sequence length. For vocab_size=262144, skipping lm_head on N-1 tokens
         // avoids a [N-1, hidden] @ [hidden, 262144] matmul.
+        //
+        // Chunked prefill: large prompts are processed in PREFILL_CHUNK-sized pieces
+        // to bound peak activation memory. Each chunk fills KV cache entries for its
+        // positions, gets eval'd, and intermediates are freed before the next chunk.
+        // Without chunking, Gemma-4 MoE's 2 MLPs × 4 stacked layers can spike to
+        // ~20 GB of activations alone on a 50k-token prompt, causing Metal OOM.
+        // Vision requests skip chunking since image token positions must be visible
+        // in a single forward pass for spliceVisionEmbeddings to work correctly.
+        const PREFILL_CHUNK: usize = 8192;
         if (prompt_ids.len > 1) {
-            const prefix_len: c_int = @intCast(prompt_ids.len - 1);
-            const prefix_shape = [_]c_int{ 1, prefix_len };
-            const prefix_input = mlx.mlx_array_new_data(ids_i32.ptr, &prefix_shape, 2, .int32);
-            defer _ = mlx.mlx_array_free(prefix_input);
+            const prefix_len = prompt_ids.len - 1;
+            const has_vision = xfm.vision_embeddings != null;
+            const chunk_size = if (has_vision) prefix_len else PREFILL_CHUNK;
 
-            // Forward pass on prefix — returns logits lazily (lm_head is in the
-            // graph but we never eval it, so MLX skips the computation).
-            const prefix_logits = try xfm.forward(prefix_input);
-            _ = mlx.mlx_array_free(prefix_logits); // drop logits ref
+            var pos: usize = 0;
+            while (pos < prefix_len) {
+                const end = @min(pos + chunk_size, prefix_len);
+                const chunk_len: c_int = @intCast(end - pos);
+                const chunk_shape = [_]c_int{ 1, chunk_len };
+                const chunk_input = mlx.mlx_array_new_data(@ptrCast(&ids_i32[pos]), &chunk_shape, 2, .int32);
+                defer _ = mlx.mlx_array_free(chunk_input);
 
-            // Eval only cache state — materializes attention K/V without lm_head
-            {
-                const eval_vec = mlx.mlx_vector_array_new();
-                defer _ = mlx.mlx_vector_array_free(eval_vec);
-                for (xfm.cache.entries) |*entry| {
-                    if (!entry.initialized) continue;
-                    _ = mlx.mlx_vector_array_append_value(eval_vec, entry.keys);
-                    _ = mlx.mlx_vector_array_append_value(eval_vec, entry.values);
+                const chunk_logits = try xfm.forward(chunk_input);
+                _ = mlx.mlx_array_free(chunk_logits);
+
+                // Eval KV cache — materializes this chunk's K/V, frees activation graph
+                {
+                    const eval_vec = mlx.mlx_vector_array_new();
+                    defer _ = mlx.mlx_vector_array_free(eval_vec);
+                    for (xfm.cache.entries) |*entry| {
+                        if (!entry.initialized) continue;
+                        _ = mlx.mlx_vector_array_append_value(eval_vec, entry.keys);
+                        _ = mlx.mlx_vector_array_append_value(eval_vec, entry.values);
+                    }
+                    _ = mlx.mlx_eval(eval_vec);
                 }
-                _ = mlx.mlx_eval(eval_vec);
+                _ = mlx.mlx_clear_cache();
+
+                pos = end;
             }
-            _ = mlx.mlx_clear_cache();
         }
 
         // Process last token (or single token for len=1) — this applies lm_head

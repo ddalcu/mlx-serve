@@ -398,23 +398,30 @@ fn computeMaxSafeContext(config: *const model_mod.ModelConfig) u32 {
     const layers: u64 = config.num_hidden_layers;
     const kv_heads: u64 = config.num_key_value_heads;
     const hdim: u64 = config.head_dim;
+    const hidden: u64 = config.hidden_size;
+    const ffn: u64 = @max(config.intermediate_size, config.moe_intermediate_size + config.shared_expert_intermediate_size);
 
     const total_limit = getMetalBufferLimit();
     var active_mem: usize = 0;
     _ = mlx.mlx_get_active_memory(&active_mem);
     const available: u64 = if (total_limit > active_mem) total_limit - active_mem else 0;
 
-    // Quadratic: a × seq² + b × seq ≤ budget, where budget = available × 4/5
-    const a: f64 = @floatFromInt(heads * 4);
-    const b: f64 = @floatFromInt(layers * 2 * kv_heads * hdim * 2);
-    const budget: f64 = @floatFromInt(available * 4 / 5);
+    // Linear in seq: per_tok × seq ≤ budget. Mirrors checkAttentionMemory's model.
+    // No seq² term — MLX's fused SDPA tiles over seq and never materializes [heads, seq, seq].
+    //   KV cache (fp16):   layers × 2 × kv_heads × head_dim × 2 bytes per token
+    //   Working (fp16):    ~8 × max(hidden, ffn) × 2 bytes per token (per-layer tensors,
+    //                      bounded by EVAL_EVERY_N_LAYERS in transformer.zig)
+    const kv_per_tok: u64 = layers * 2 * kv_heads * hdim * 2;
+    const work_per_tok: u64 = 8 * @max(hidden, ffn) * 2;
+    const per_tok: u64 = kv_per_tok + work_per_tok;
+    if (per_tok == 0) return 1024;
 
-    const disc = b * b + 4.0 * a * budget;
-    if (disc <= 0) return 1024;
-    const max_seq: f64 = (-b + @sqrt(disc)) / (2.0 * a);
-    if (max_seq <= 0) return 1024;
+    // 80% of available, then divide by 1.25 margin (matches checkAttentionMemory's 5/4)
+    const budget: u64 = available * 4 / 5;
+    const max_seq: u64 = (budget * 4 / 5) / per_tok;
+    if (max_seq == 0) return 1024;
 
-    var result: u32 = @intFromFloat(max_seq);
+    var result: u32 = if (max_seq > std.math.maxInt(u32)) std.math.maxInt(u32) else @intCast(max_seq);
     // Cap at model's max position embeddings
     if (config.max_position_embeddings > 0) {
         result = @min(result, config.max_position_embeddings);
@@ -422,10 +429,14 @@ fn computeMaxSafeContext(config: *const model_mod.ModelConfig) u32 {
     return result;
 }
 
-/// Estimate peak GPU memory for attention and reject if it would exceed Metal buffer limit.
-/// The attention matrix for one layer is: num_heads × seq_len² × sizeof(float32).
+/// Estimate peak GPU memory for prefill and reject if it would exceed Metal buffer limit.
 /// Metal has a max buffer size (~75% of unified memory). If this is exceeded, the Metal
 /// runtime throws an uncatchable C++ exception that crashes the process.
+///
+/// MLX uses `mlx_fast_scaled_dot_product_attention` — a fused flash-attention-style kernel
+/// that tiles over seq and never materializes the full [heads, seq, seq] attention matrix.
+/// So peak memory is dominated by (a) the persistent KV cache and (b) per-layer working
+/// tensors (QKV projections, MLP intermediates). There is no seq² term.
 fn checkAttentionMemory(allocator: std.mem.Allocator, stream: std.net.Stream, prompt_len: usize, config: *const model_mod.ModelConfig, is_anthropic: bool) !bool {
     const heads = config.num_attention_heads;
     if (heads == 0) return true; // unknown architecture, skip check
@@ -434,13 +445,19 @@ fn checkAttentionMemory(allocator: std.mem.Allocator, stream: std.net.Stream, pr
     const layers: u64 = config.num_hidden_layers;
     const kv_heads: u64 = config.num_key_value_heads;
     const hdim: u64 = config.head_dim;
+    const hidden: u64 = config.hidden_size;
+    const ffn: u64 = @max(config.intermediate_size, config.moe_intermediate_size + config.shared_expert_intermediate_size);
 
-    // Attention matrix (one layer, reused): num_heads × seq² × 4 bytes (float32)
-    const attn_bytes: u64 = @as(u64, heads) * seq * seq * 4;
-    // KV cache (all layers): layers × 2(K+V) × seq × kv_heads × head_dim × 2 bytes (float16)
+    // KV cache (all layers, fp16): layers × 2(K+V) × seq × kv_heads × head_dim × 2 bytes.
+    // This is persistent for the rest of the request, so it's a real hard cost.
     const kv_bytes: u64 = layers * 2 * seq * kv_heads * hdim * 2;
-    // Total estimate with 20% safety margin for intermediate buffers
-    const needed: u64 = (attn_bytes + kv_bytes) * 5 / 4;
+    // Per-layer working memory during prefill (fp16). The transformer eval()s every N layers,
+    // so transient tensors from earlier layers are released. Peak is bounded by a single layer:
+    //   QKV projections (~3× seq × hidden) + MLP intermediates (~3× seq × ffn) + residuals.
+    // A ~8× seq × max(hidden, ffn) × 2-byte envelope captures this with headroom.
+    const working_bytes: u64 = 8 * seq * @max(hidden, ffn) * 2;
+    // Total estimate with 25% safety margin
+    const needed: u64 = (kv_bytes + working_bytes) * 5 / 4;
 
     // Available = Metal limit minus current GPU usage (model weights etc.)
     const total_limit: u64 = getMetalBufferLimit();
@@ -451,7 +468,7 @@ fn checkAttentionMemory(allocator: std.mem.Allocator, stream: std.net.Stream, pr
     if (needed > available) {
         const needed_mb = needed / (1024 * 1024);
         const avail_mb = available / (1024 * 1024);
-        log.warn("  prompt {d} tokens needs ~{d}MB (attn+KV+margin), ~{d}MB available — rejecting\n", .{ prompt_len, needed_mb, avail_mb });
+        log.warn("  prompt {d} tokens needs ~{d}MB (KV+working+margin), ~{d}MB available — rejecting\n", .{ prompt_len, needed_mb, avail_mb });
         const msg = try std.fmt.allocPrint(allocator,
             "Prompt ({d} tokens) requires ~{d}MB GPU memory but only ~{d}MB available. Reduce prompt size or use a smaller model.", .{ prompt_len, needed_mb, avail_mb });
         defer allocator.free(msg);

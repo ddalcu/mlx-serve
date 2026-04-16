@@ -151,15 +151,23 @@ echo "→ Code signing..."
 # Fix permissions for signing
 chmod -R u+w "$APP"
 
+# Hardened runtime requires a real Team ID — skip it for ad-hoc ("-") signing,
+# otherwise dyld rejects framework loads with "different Team IDs".
+if [ "$IDENTITY" = "-" ]; then
+    SIGN_OPTS=(--force --sign -)
+else
+    SIGN_OPTS=(--force --options runtime --sign "$IDENTITY")
+fi
+
 # Sign frameworks first (inside-out)
 for fw in "$CONTENTS/Frameworks/"*.metallib "$CONTENTS/Frameworks/"*.dylib; do
-    [ -f "$fw" ] && codesign --force --options runtime --sign "$IDENTITY" "$fw" && echo "  Signed: $(basename "$fw")"
+    [ -f "$fw" ] && codesign "${SIGN_OPTS[@]}" "$fw" && echo "  Signed: $(basename "$fw")"
 done
 
 # Sign executables
-codesign --force --options runtime --sign "$IDENTITY" "$CONTENTS/MacOS/mlx-serve" && echo "  Signed: mlx-serve"
-codesign --force --options runtime --sign "$IDENTITY" "$CONTENTS/MacOS/MLXCore" && echo "  Signed: MLXCore"
-codesign --force --options runtime --sign "$IDENTITY" "$APP" && echo "  Signed: $APP_NAME.app"
+codesign "${SIGN_OPTS[@]}" "$CONTENTS/MacOS/mlx-serve" && echo "  Signed: mlx-serve"
+codesign "${SIGN_OPTS[@]}" "$CONTENTS/MacOS/MLXCore" && echo "  Signed: MLXCore"
+codesign "${SIGN_OPTS[@]}" "$APP" && echo "  Signed: $APP_NAME.app"
 
 # Verify
 codesign -vv "$APP" 2>&1 | head -3
