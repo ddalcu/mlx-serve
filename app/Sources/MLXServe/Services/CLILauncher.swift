@@ -93,8 +93,9 @@ final class CLILauncher: ObservableObject {
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
         panel.allowsMultipleSelection = false
+        panel.canCreateDirectories = true // show the "New Folder" button
         panel.prompt = "Open"
-        panel.message = "Select working directory for \(cli.displayName)"
+        panel.message = "Select or create a working directory"
         let defaultWS = NSString(string: "~/.mlx-serve/workspace").expandingTildeInPath
         try? FileManager.default.createDirectory(atPath: defaultWS, withIntermediateDirectories: true)
         panel.directoryURL = URL(fileURLWithPath: defaultWS)
