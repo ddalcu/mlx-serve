@@ -20,7 +20,8 @@ RESULTS="$REPO/tests/pi-results"
 SUMMARY="$REPO/tests/pi_integration_run.summary.tsv"
 MLX_BIN="$REPO/app/MLX Core.app/Contents/MacOS/mlx-serve"
 PI_MODELS_JSON="$HOME/.pi/agent/models.json"
-PORT=8080
+PORT="${PORT:-8080}"
+SERVED_MODEL="${SERVED_MODEL:-}"
 WORKSPACE_ROOT="/tmp/pi_mlx_workspaces"
 
 MATRIX="${1:-all}"
@@ -212,16 +213,25 @@ run_one_case() {
 
     local pid load_start load_end
     load_start=$(date +%s)
-    pid=$(start_mlx_serve "$path" "$server_log" 2> >(tee -a "$agent_log"))
-    if [ -z "$pid" ]; then
-        echo "FAIL: server failed" | tee -a "$agent_log"
-        printf "%s\t%s\t%s\t%s\t%s\n" "$(date +%Y-%m-%dT%H:%M:%S)" "$label" "server-start-fail" "0" "" >> "$SUMMARY"
-        return 1
+    if [ -z "${SKIP_SERVER_START:-}" ]; then
+        pid=$(start_mlx_serve "$path" "$server_log" 2> >(tee -a "$agent_log"))
+        if [ -z "$pid" ]; then
+            echo "FAIL: server failed" | tee -a "$agent_log"
+            printf "%s\t%s\t%s\t%s\t%s\n" "$(date +%Y-%m-%dT%H:%M:%S)" "$label" "server-start-fail" "0" "" >> "$SUMMARY"
+            return 1
+        fi
+        load_end=$(date +%s)
+        echo "mlx-serve PID=$pid (loaded in $((load_end-load_start))s)" | tee -a "$agent_log"
+    else
+        pid="external"
+        load_end=$load_start
+        echo "[using already-running server at :$PORT]" | tee -a "$agent_log"
     fi
-    load_end=$(date +%s)
-    echo "mlx-serve PID=$pid (loaded in $((load_end-load_start))s)" | tee -a "$agent_log"
 
-    write_pi_models_config "$served_name" "$thinking_format" "$reasoning"
+    # Allow env override of the model id used in pi's models.json.
+    local effective_name="${SERVED_MODEL:-$served_name}"
+    write_pi_models_config "$effective_name" "$thinking_format" "$reasoning"
+    served_name="$effective_name"
 
     # Turn 1
     local turn1_prompt="Create a minimal Express.js todo app in this directory. Requirements: package.json with express as dep, a file app.js exporting the Express app, in-memory todo storage, REST endpoints GET /todos, POST /todos (json body {text}), DELETE /todos/:id. Keep it in one file. Do NOT start the server yourself. When done, say 'app ready'."
@@ -255,7 +265,9 @@ run_one_case() {
     echo "SCORE: $score/5 $notes [total=${total_elapsed}s]" | tee -a "$agent_log"
     printf "%s\t%s\t%s\t%s\t%s\n" "$(date +%Y-%m-%dT%H:%M:%S)" "$label" "$score/5" "$total_elapsed" "$notes" >> "$SUMMARY"
 
-    kill_mlx_serve
+    if [ -z "${SKIP_SERVER_START:-}" ]; then
+        kill_mlx_serve
+    fi
     return 0
 }
 

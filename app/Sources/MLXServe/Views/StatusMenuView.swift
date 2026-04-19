@@ -553,8 +553,9 @@ func launchClaudeCodeWithPicker(baseURL: String) {
     panel.canChooseDirectories = true
     panel.canChooseFiles = false
     panel.allowsMultipleSelection = false
+    panel.canCreateDirectories = true
     panel.prompt = "Open"
-    panel.message = "Select working directory for Claude Code"
+    panel.message = "Select or create a working directory"
     let defaultWS = NSString(string: "~/.mlx-serve/workspace").expandingTildeInPath
     try? FileManager.default.createDirectory(atPath: defaultWS, withIntermediateDirectories: true)
     panel.directoryURL = URL(fileURLWithPath: defaultWS)
