@@ -31,20 +31,27 @@ final class CLILauncher: ObservableObject {
         self.hasScanned = true
     }
 
-    /// Resolve installed binaries by running a single `command -v` sweep inside a
-    /// login zsh so user-specific PATH additions (nvm, Homebrew, ~/.local/bin)
-    /// are honored. `command -v` is POSIX and prints just the path on success
-    /// (zsh's `type -p` prints `name is /path` which is harder to parse).
+    /// Resolve installed binaries by running a single `command -v` sweep inside
+    /// an **interactive** login zsh so user-specific PATH additions (nvm,
+    /// Homebrew, ~/.local/bin, ~/.opencode/bin) are honored.
+    ///
+    /// Both `-i` and `-l` matter: a login shell only sources `.zprofile`/
+    /// `.zlogin`, while most users put PATH mutations in `.zshrc` — which is
+    /// sourced only by interactive shells. When the app is launched from
+    /// Finder/LaunchServices the child process starts with a near-empty
+    /// environment, so without `-i` we'd see none of the user's tools.
+    ///
+    /// Output is keyed (`name=path`) instead of positional so any stray
+    /// stdout from `.zshrc` (e.g. `pyenv init`, version managers) can't
+    /// misalign parsing.
     private static func detectInstalled() async -> [LauncherCLI] {
         let names = candidates.map { $0.binaryName }
-        // Each command echoes "" on its own line if not found — so we get one
-        // line per candidate either way and can zip by index.
-        let script = names.map { "command -v \($0) 2>/dev/null || echo ''" }.joined(separator: "; ")
+        let script = names.map { "printf '%s=%s\\n' \($0) \"$(command -v \($0) 2>/dev/null)\"" }.joined(separator: "; ")
 
         let output = await Task.detached { () -> String in
             let proc = Process()
             proc.executableURL = URL(fileURLWithPath: "/bin/zsh")
-            proc.arguments = ["-l", "-c", script]
+            proc.arguments = ["-i", "-l", "-c", script]
             let pipe = Pipe()
             proc.standardOutput = pipe
             proc.standardError = Pipe()
@@ -58,16 +65,24 @@ final class CLILauncher: ObservableObject {
             }
         }.value
 
-        let lines = output.split(separator: "\n", omittingEmptySubsequences: false).map(String.init)
+        var resolvedByName: [String: String] = [:]
+        for line in output.split(separator: "\n", omittingEmptySubsequences: true) {
+            guard let eq = line.firstIndex(of: "=") else { continue }
+            let key = String(line[..<eq])
+            let value = String(line[line.index(after: eq)...]).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !value.isEmpty else { continue }
+            // Only keep keys we actually asked about — guards against any
+            // stray `foo=bar` lines printed from user rc files.
+            if names.contains(key) { resolvedByName[key] = value }
+        }
+
         var result: [LauncherCLI] = []
-        for (i, cli) in candidates.enumerated() {
-            guard i < lines.count else { break }
-            let resolved = lines[i].trimmingCharacters(in: .whitespacesAndNewlines)
-            if !resolved.isEmpty, FileManager.default.isExecutableFile(atPath: resolved) {
-                var updated = cli
-                updated.resolvedPath = resolved
-                result.append(updated)
-            }
+        for cli in candidates {
+            guard let path = resolvedByName[cli.binaryName],
+                  FileManager.default.isExecutableFile(atPath: path) else { continue }
+            var updated = cli
+            updated.resolvedPath = path
+            result.append(updated)
         }
         return result
     }
