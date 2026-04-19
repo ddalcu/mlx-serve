@@ -16,6 +16,9 @@ class AppState: ObservableObject {
     @Published var agentMemory = AgentMemory()
     @Published var toolExecutor = ToolExecutor()
     let testServer = TestServer()
+    @Published var python = PythonManager()
+    lazy var imageGen = ImageGenService(python: python)
+    lazy var videoGen = VideoGenService(python: python)
     @Published var hasSeenWelcome: Bool {
         didSet { UserDefaults.standard.set(hasSeenWelcome, forKey: "hasSeenWelcome") }
     }

@@ -51,6 +51,8 @@ struct MLXCoreApp: App {
             switch id {
             case "chat": title = "MLX Core"
             case "modelBrowser": title = "Model Browser"
+            case "imageGen": title = "Image Generation"
+            case "videoGen": title = "Video Generation"
             default: title = "Browser"
             }
             NSApplication.shared.windows
@@ -61,10 +63,17 @@ struct MLXCoreApp: App {
 
     var body: some Scene {
         MenuBarExtra {
-            StatusMenuView(openChat: { openAndFocus("chat") }, openBrowser: { openAndFocus("browser") }, openModelBrowser: { openAndFocus("modelBrowser") })
+            StatusMenuView(
+                openChat: { openAndFocus("chat") },
+                openBrowser: { openAndFocus("browser") },
+                openModelBrowser: { openAndFocus("modelBrowser") },
+                openImageGen: { openAndFocus("imageGen") },
+                openVideoGen: { openAndFocus("videoGen") }
+            )
                 .environmentObject(appState)
                 .environmentObject(appState.server)
                 .environmentObject(appState.downloads)
+                .environmentObject(appState.python)
         } label: {
             Image(nsImage: menuBarIcon(for: appState.server.status))
         }
@@ -93,6 +102,22 @@ struct MLXCoreApp: App {
                 .frame(minWidth: 700, minHeight: 400)
         }
         .defaultSize(width: 900, height: 600)
+
+        Window("Image Generation", id: "imageGen") {
+            ImageGenView()
+                .environmentObject(appState.python)
+                .environmentObject(appState.imageGen)
+                .environmentObject(appState.server)
+        }
+        .defaultSize(width: 960, height: 700)
+
+        Window("Video Generation", id: "videoGen") {
+            VideoGenView()
+                .environmentObject(appState.python)
+                .environmentObject(appState.videoGen)
+                .environmentObject(appState.server)
+        }
+        .defaultSize(width: 960, height: 700)
         .commands {
             CommandMenu("Agent") {
                 Button("Edit System Prompt") {

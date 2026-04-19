@@ -45,6 +45,39 @@ Menu bar app that wraps the server with a full UI:
 - **Persistent memory** -- agent can save memories across sessions to `~/.mlx-serve/memory.md`
 - **Prompt-based skills** -- drop `.md` files in `~/.mlx-serve/skills/` to teach the agent custom capabilities
 - **Server management** -- start/stop server, view logs, configure max tokens
+- **Image Generation (FLUX.2)** -- optional, tray button; requires Python (see below)
+- **Video Generation (LTX-Video 2.3, MLX-native, with audio)** -- optional, tray button; requires Python + ffmpeg (see below)
+
+### Image / Video Generation (optional)
+
+The tray has **ImageGen** and **VideoGen** buttons that run [FLUX.2](https://huggingface.co/black-forest-labs) and [LTX-Video 2.3](https://github.com/dgrauet/ltx-2-mlx) through a Python subprocess. Both run natively on MLX — no MPS/diffusers path. This is completely optional — the Zig server itself remains Python-free.
+
+**Prerequisite:** Python 3 and ffmpeg must be installed on your Mac.
+
+```bash
+brew install python ffmpeg
+```
+
+Then launch MLX Core, click the ImageGen (or VideoGen) tray icon, and hit **Install** in the window. The app will:
+
+1. Create a dedicated venv at `~/.mlx-serve/venv` (does not touch your system Python)
+2. Install mflux (FLUX), ltx-pipelines-mlx (LTX-2.3), and shared utilities. ~3 GB pip install.
+3. Download the model weights on first generation (HuggingFace cache, resumable)
+
+**Models:**
+
+| Feature | Default | Other options | Approx. RAM |
+|---|---|---|---|
+| Image | FLUX.2-klein 4B 4-bit (mflux, ~5 GB pre-quantized) | FLUX.1-schnell / dev 4-bit and 8-bit | 8 / 12 / 16 GB |
+| Video | LTX-Video 2.3 Q4 | — | 24 GB RAM, ~50 GB first-run download (LTX 41 GB + Gemma 8 GB) |
+
+> The 41 GB LTX snapshot ships **both** transformer variants (1-stage distilled + 2-stage dev, ~11 GB each) plus a 7.6 GB distillation LoRA, so you can switch between Fast/Good/Quality/Super offline without re-downloading.
+
+The image path uses [`mflux`](https://github.com/filipstrand/mflux) for native MLX inference with built-in 4/8-bit quantization — the only way FLUX fits on Apple Silicon under 32 GB. The video path uses [`ltx-2-mlx`](https://github.com/dgrauet/ltx-2-mlx), a native MLX pipeline for LTX-Video 2.3 with audio generation (muxed via system `ffmpeg`).
+
+Outputs go to `~/.mlx-serve/generations/images/YYYY-MM-DD/` and `.../videos/YYYY-MM-DD/`.
+
+> The app won't let you start a generation if there isn't enough free RAM. If the mlx-serve server is running and competing for memory, you'll be prompted to stop it first.
 
 ## Supported Models
 

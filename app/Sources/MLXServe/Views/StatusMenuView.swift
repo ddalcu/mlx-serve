@@ -93,11 +93,14 @@ struct StatusMenuView: View {
     @EnvironmentObject var appState: AppState
     @EnvironmentObject var server: ServerManager
     @EnvironmentObject var downloads: DownloadManager
+    @EnvironmentObject var python: PythonManager
     @State private var showDownloads = false
     @State private var showLog = false
     let openChat: () -> Void
     let openBrowser: () -> Void
     let openModelBrowser: () -> Void
+    let openImageGen: () -> Void
+    let openVideoGen: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -342,6 +345,38 @@ struct StatusMenuView: View {
                     Image(systemName: "power")
                 }
                 .buttonStyle(.bordered)
+            }
+            .padding(.horizontal, 16)
+            .padding(.top, 6)
+
+            // Secondary row: optional Python-backed features. Split out so the
+            // primary row above stays at its original width, and users can
+            // tell at a glance these are additional tools (not server
+            // controls).
+            HStack(spacing: 8) {
+                Button {
+                    openImageGen()
+                } label: {
+                    HStack {
+                        Image(systemName: "photo.on.rectangle.angled")
+                        Text("ImageGen")
+                    }
+                    .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                .help(python.status.imagesReady ? "Image Generation (FLUX.2)" : "Image Generation — click to install dependencies")
+
+                Button {
+                    openVideoGen()
+                } label: {
+                    HStack {
+                        Image(systemName: "film.stack")
+                        Text("VideoGen")
+                    }
+                    .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                .help(python.status.isReady ? "Video Generation (LTX-Video 2.3)" : "Video Generation — click to install dependencies")
             }
             .padding(.horizontal, 16)
             .padding(.top, 6)
