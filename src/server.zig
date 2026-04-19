@@ -2344,22 +2344,30 @@ fn reuseKVCache(allocator: std.mem.Allocator, xfm: *Transformer, prompt_ids: []c
             shared += 1;
         }
 
-        // Identical prompt seen before — the underlying KV buffer still holds
-        // tokens from the previous generation past the prompt boundary, and
-        // truncate() can't always fully scrub them on every architecture
-        // (observed on Qwen 3.5/3.6 MoE). Force a full reset so the new
-        // generation starts from clean state.
-        if (shared == prompt_ids.len and shared == cached.len) {
-            log.info("  [cache] reset — identical prompt re-issued (stale generation residue)\n", .{});
+        // Only reuse when the new prompt is a strict extension of the cached one.
+        // For hybrid architectures (Qwen 3.5/3.6 GatedDeltaNet, Nemotron-H, LFM2),
+        // the SSM/conv recurrent state cannot be rolled back — it has processed
+        // the cached prompt AND any tokens generated afterwards. Partial truncation
+        // of the KV cache leaves the SSM state stale, producing immediate EOS or
+        // garbage on the next generation. Any divergence (shorter, diverged, or
+        // identical-re-issue) forces a clean reset.
+        if (shared < cached.len) {
+            log.info("  [cache] reset — new prompt diverges from cached (shared={d} cached={d})\n", .{ shared, cached.len });
             allocator.free(cached);
             cached_prompt_ids = null;
             try xfm.resetCache();
             return .{ .new_tokens = prompt_ids, .cached_tokens = 0 };
         }
 
-        // Always keep at least 1 token to process (generator needs at least 1 for prefill)
-        if (shared >= prompt_ids.len) {
-            shared = prompt_ids.len - 1;
+        // shared == cached.len at this point. Identical re-issue (shared == prompt_ids.len)
+        // still resets: KV buffer holds stale post-gen tokens that truncate() can't scrub
+        // on every architecture.
+        if (shared == prompt_ids.len) {
+            log.info("  [cache] reset — identical prompt re-issued (stale generation residue)\n", .{});
+            allocator.free(cached);
+            cached_prompt_ids = null;
+            try xfm.resetCache();
+            return .{ .new_tokens = prompt_ids, .cached_tokens = 0 };
         }
 
         // Sliding window models (e.g. Gemma 4) interleave global and local attention layers.

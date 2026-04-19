@@ -1,5 +1,98 @@
 const std = @import("std");
 const mlx = @import("mlx.zig");
+
+// ── GatedDeltaNet fused Metal kernel ──
+// Ported from mlx-lm/models/gated_delta.py: `_make_gated_delta_kernel(has_mask=False, vectorized=False)`.
+// Processes the entire T-step delta recurrence in a single kernel dispatch, eliminating
+// the per-token kernel-launch overhead that otherwise caps prefill at ~330 tok/s on
+// Qwen 3.5/3.6 MoE. Template args (Dk, Dv, Hk, Hv) specialize the kernel; inputs carry
+// the runtime shapes. State math runs in float32 for numerical stability regardless
+// of the input/state storage dtype.
+const GDN_KERNEL_SOURCE =
+    \\auto n = thread_position_in_grid.z;
+    \\auto b_idx = n / Hv;
+    \\auto hv_idx = n % Hv;
+    \\auto hk_idx = hv_idx / (Hv / Hk);
+    \\constexpr int n_per_t = Dk / 32;
+    \\
+    \\auto q_ = q + b_idx * T * Hk * Dk + hk_idx * Dk;
+    \\auto k_ = k + b_idx * T * Hk * Dk + hk_idx * Dk;
+    \\
+    \\auto v_ = v + b_idx * T * Hv * Dv + hv_idx * Dv;
+    \\y += b_idx * T * Hv * Dv + hv_idx * Dv;
+    \\
+    \\auto dk_idx = thread_position_in_threadgroup.x;
+    \\auto dv_idx = thread_position_in_grid.y;
+    \\
+    \\auto i_state = state_in + (n * Dv + dv_idx) * Dk;
+    \\auto o_state = state_out + (n * Dv + dv_idx) * Dk;
+    \\
+    \\float state[n_per_t];
+    \\for (int i = 0; i < n_per_t; ++i) {
+    \\  auto s_idx = n_per_t * dk_idx + i;
+    \\  state[i] = static_cast<float>(i_state[s_idx]);
+    \\}
+    \\
+    \\auto g_ = g + b_idx * T * Hv;
+    \\auto beta_ = beta + b_idx * T * Hv;
+    \\
+    \\for (int t = 0; t < T; ++t) {
+    \\  float kv_mem = 0.0f;
+    \\  for (int i = 0; i < n_per_t; ++i) {
+    \\    auto s_idx = n_per_t * dk_idx + i;
+    \\    state[i] = state[i] * g_[hv_idx];
+    \\    kv_mem += state[i] * k_[s_idx];
+    \\  }
+    \\  kv_mem = simd_sum(kv_mem);
+    \\
+    \\  auto delta = (v_[dv_idx] - kv_mem) * beta_[hv_idx];
+    \\
+    \\  float out = 0.0f;
+    \\  for (int i = 0; i < n_per_t; ++i) {
+    \\    auto s_idx = n_per_t * dk_idx + i;
+    \\    state[i] = state[i] + k_[s_idx] * delta;
+    \\    out += state[i] * q_[s_idx];
+    \\  }
+    \\  out = simd_sum(out);
+    \\  if (thread_index_in_simdgroup == 0) {
+    \\    y[dv_idx] = static_cast<InT>(out);
+    \\  }
+    \\  q_ += Hk * Dk;
+    \\  k_ += Hk * Dk;
+    \\  v_ += Hv * Dv;
+    \\  y += Hv * Dv;
+    \\  g_ += Hv;
+    \\  beta_ += Hv;
+    \\}
+    \\for (int i = 0; i < n_per_t; ++i) {
+    \\  auto s_idx = n_per_t * dk_idx + i;
+    \\  o_state[s_idx] = static_cast<StT>(state[i]);
+    \\}
+;
+
+var gdn_kernel_cached: ?mlx.mlx_fast_metal_kernel = null;
+
+fn getGdnKernel() !mlx.mlx_fast_metal_kernel {
+    if (gdn_kernel_cached) |k| return k;
+    const input_names = [_][*:0]const u8{ "q", "k", "v", "g", "beta", "state_in", "T" };
+    const output_names = [_][*:0]const u8{ "y", "state_out" };
+    const in_vec = mlx.mlx_vector_string_new_data(&input_names, input_names.len);
+    defer _ = mlx.mlx_vector_string_free(in_vec);
+    const out_vec = mlx.mlx_vector_string_new_data(&output_names, output_names.len);
+    defer _ = mlx.mlx_vector_string_free(out_vec);
+    const kernel = mlx.mlx_fast_metal_kernel_new(
+        "gated_delta_step",
+        in_vec,
+        out_vec,
+        GDN_KERNEL_SOURCE,
+        "",
+        true,
+        false,
+    );
+    if (kernel.ctx == null) return error.MetalKernelCompileFailed;
+    gdn_kernel_cached = kernel;
+    return kernel;
+}
 const model_mod = @import("model.zig");
 const log = @import("log.zig");
 
@@ -3630,27 +3723,6 @@ pub const Transformer = struct {
         defer _ = mlx.mlx_array_free(beta);
         try mlx.check(mlx.mlx_sigmoid(&beta, b_proj, self.s)); // [B, S, Hv]
 
-        // Repeat Q, K heads from num_k_heads to num_v_heads for the recurrence
-        const repeat_factor = @divExact(cfg.linear_num_value_heads, cfg.linear_num_key_heads);
-        var q_rep = q_scaled;
-        var k_rep = k_scaled;
-        var q_rep_owned = false;
-        var k_rep_owned = false;
-        if (repeat_factor > 1) {
-            var q_tmp = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_repeat_axis(&q_tmp, q_scaled, @intCast(repeat_factor), 2, self.s));
-            q_rep = q_tmp;
-            q_rep_owned = true;
-            var k_tmp = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_repeat_axis(&k_tmp, k_scaled, @intCast(repeat_factor), 2, self.s));
-            k_rep = k_tmp;
-            k_rep_owned = true;
-        }
-        defer {
-            if (q_rep_owned) _ = mlx.mlx_array_free(q_rep);
-            if (k_rep_owned) _ = mlx.mlx_array_free(k_rep);
-        }
-
         // Initialize SSM state if needed.
         // Can't use ssm.initialized — conv1dWithCache already set it to true.
         // Check if ssm_state is empty (ctx == null) as the actual init indicator.
@@ -3660,100 +3732,49 @@ pub const Transformer = struct {
             try mlx.check(mlx.mlx_zeros(&ssm.ssm_state, &state_shape, 4, .bfloat16, self.s));
         }
 
-        // Delta recurrence: loop over timesteps
-        const T: usize = @intCast(seq_len);
-        const out_vec = mlx.mlx_vector_array_new();
-        defer _ = mlx.mlx_vector_array_free(out_vec);
+        // Fused Metal kernel: runs the full T-step delta recurrence in one dispatch.
+        // Inputs (shapes): q,k [B,T,Hk,Dk] (GQA handled in kernel), v [B,T,Hv,Dv],
+        //                  g,beta [B,T,Hv], state_in [B,Hv,Dv,Dk], T scalar.
+        // Outputs: y [B,T,Hv,Dv], state_out [B,Hv,Dv,Dk].
+        const T_scalar = mlx.mlx_array_new_int(seq_len);
+        defer _ = mlx.mlx_array_free(T_scalar);
 
-        for (0..T) |t| {
-            const ti: c_int = @intCast(t);
-            // Extract timestep slices: [B, 1, ...] → squeeze to [B, ...]
-            const qt = try sliceTimestep4(q_rep, batch, num_v_heads, dk, ti, self.s);
-            defer _ = mlx.mlx_array_free(qt);
-            const kt = try sliceTimestep4(k_rep, batch, num_v_heads, dk, ti, self.s);
-            defer _ = mlx.mlx_array_free(kt);
-            const vt = try sliceTimestep4(v_heads, batch, num_v_heads, dv, ti, self.s);
-            defer _ = mlx.mlx_array_free(vt);
-            const gt = try sliceTimestep3(g, batch, num_v_heads, ti, self.s);
-            defer _ = mlx.mlx_array_free(gt);
-            const bt = try sliceTimestep3(beta, batch, num_v_heads, ti, self.s);
-            defer _ = mlx.mlx_array_free(bt);
+        const inputs_arr = [_]mlx.mlx_array{ q_scaled, k_scaled, v_heads, g, beta, ssm.ssm_state, T_scalar };
+        const inputs_vec = mlx.mlx_vector_array_new_data(&inputs_arr, inputs_arr.len);
+        defer _ = mlx.mlx_vector_array_free(inputs_vec);
 
-            // state = state * g[..., None, None]
-            var g_exp = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(g_exp);
-            {
-                var g_e1 = mlx.mlx_array_new();
-                defer _ = mlx.mlx_array_free(g_e1);
-                try mlx.check(mlx.mlx_expand_dims(&g_e1, gt, 2, self.s));
-                try mlx.check(mlx.mlx_expand_dims(&g_exp, g_e1, 3, self.s));
-            }
-            var decayed = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(decayed);
-            try mlx.check(mlx.mlx_multiply(&decayed, ssm.ssm_state, g_exp, self.s));
+        const y_shape = [_]c_int{ batch, seq_len, num_v_heads, dv };
+        const state_shape_out = [_]c_int{ batch, num_v_heads, dv, dk };
 
-            // kv_mem = sum(state * k[..., None, :], axis=-1) → [B, Hv, Dv]
-            // k[..., None, :] expands k [B,H,Dk] to [B,H,1,Dk]
-            var k_exp = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(k_exp);
-            try mlx.check(mlx.mlx_expand_dims(&k_exp, kt, 2, self.s)); // [B,H,1,Dk]
-            var state_k = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(state_k);
-            try mlx.check(mlx.mlx_multiply(&state_k, decayed, k_exp, self.s)); // [B,H,Dv,Dk]
-            var kv_mem = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(kv_mem);
-            try mlx.check(mlx.mlx_sum_axis(&kv_mem, state_k, -1, false, self.s)); // [B,H,Dv]
+        const config = mlx.mlx_fast_metal_kernel_config_new();
+        defer _ = mlx.mlx_fast_metal_kernel_config_free(config);
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &y_shape, 4, .bfloat16));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &state_shape_out, 4, .bfloat16));
+        // Grid: (32, Dv, B*Hv) threads; threadgroup: (32, 4, 1). Matches mlx-lm.
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, 32, dv, batch * num_v_heads));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 32, 4, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "InT", .bfloat16));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "StT", .bfloat16));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "Dk", dk));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "Dv", dv));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "Hk", num_k_heads));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "Hv", num_v_heads));
 
-            // delta = (v - kv_mem) * beta[..., None]
-            var v_minus = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(v_minus);
-            try mlx.check(mlx.mlx_subtract(&v_minus, vt, kv_mem, self.s));
-            var b_exp = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(b_exp);
-            try mlx.check(mlx.mlx_expand_dims(&b_exp, bt, 2, self.s)); // [B,H,1]
-            var delta = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(delta);
-            try mlx.check(mlx.mlx_multiply(&delta, v_minus, b_exp, self.s)); // [B,H,Dv]
+        const gdn_kernel = try getGdnKernel();
+        var outputs_vec = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(outputs_vec);
+        try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, gdn_kernel, inputs_vec, config, self.s));
 
-            // state = decayed + k[..., None, :] * delta[..., None]
-            var d_exp = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(d_exp);
-            try mlx.check(mlx.mlx_expand_dims(&d_exp, delta, 3, self.s)); // [B,H,Dv,1]
-            var kd = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(kd);
-            try mlx.check(mlx.mlx_multiply(&kd, k_exp, d_exp, self.s)); // [B,H,Dv,Dk]
-            var new_state = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_add(&new_state, decayed, kd, self.s));
-            _ = mlx.mlx_array_free(ssm.ssm_state);
-            ssm.ssm_state = new_state;
+        if (mlx.mlx_vector_array_size(outputs_vec) != 2) return error.MetalKernelBadOutputCount;
 
-            // y = sum(state * q[..., None, :], axis=-1) → [B, Hv, Dv]
-            var q_exp = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(q_exp);
-            try mlx.check(mlx.mlx_expand_dims(&q_exp, qt, 2, self.s)); // [B,H,1,Dk]
-            var state_q = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(state_q);
-            try mlx.check(mlx.mlx_multiply(&state_q, ssm.ssm_state, q_exp, self.s));
-            var y_t = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_sum_axis(&y_t, state_q, -1, false, self.s)); // [B,Hv,Dv]
-            _ = mlx.mlx_vector_array_append_value(out_vec, y_t);
-            _ = mlx.mlx_array_free(y_t);
-
-            if ((t + 1) % RECURRENCE_EVAL_INTERVAL == 0) {
-                try mlx.check(mlx.mlx_array_eval(ssm.ssm_state));
-            }
-        }
-
-        // Stack outputs: [B, Hv, Dv] * T → [T, B, Hv, Dv] → transpose to [B, T, Hv, Dv]
-        var stacked = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(stacked);
-        try mlx.check(mlx.mlx_stack_axis(&stacked, out_vec, 0, self.s));
-
-        // Transpose [T, B, Hv, Dv] → [B, T, Hv, Dv]
-        const perm_tbhd = [_]c_int{ 1, 0, 2, 3 };
         var y_bthd = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(y_bthd);
-        try mlx.check(mlx.mlx_transpose_axes(&y_bthd, stacked, &perm_tbhd, 4, self.s));
+        try mlx.check(mlx.mlx_vector_array_get(&y_bthd, outputs_vec, 0));
+
+        var new_state = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_vector_array_get(&new_state, outputs_vec, 1));
+        _ = mlx.mlx_array_free(ssm.ssm_state);
+        ssm.ssm_state = new_state;
 
         // Reshape z to [B, S, Hv, Dv]
         const z_shape = [_]c_int{ batch, seq_len, num_v_heads, dv };
