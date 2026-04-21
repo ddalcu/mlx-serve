@@ -266,4 +266,16 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add Casks/mlx-core.rb Formula/mlx-serve.rb
           git commit -m "brew: update to v$VERSION"
-          git push origin HEAD:main
+
+          # Retry with rebase in case main advanced during the build
+          for i in 1 2 3 4 5; do
+            if git push origin HEAD:main; then
+              exit 0
+            fi
+            echo "push attempt $i rejected; rebasing on latest main and retrying..."
+            git fetch origin main
+            git rebase origin/main
+            sleep $((i * 2))
+          done
+          echo "failed to push Homebrew formula update after 5 attempts" >&2
+          exit 1
