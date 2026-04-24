@@ -218,6 +218,9 @@ struct VideoQualitySettings: Hashable {
     let steps: Int
     /// CFG scale, only used by two-stage modes.
     let cfgScale: Double
+    /// Spatial-temporal guidance. Only used by two-stage modes. Official
+    /// defaults: 1.0 for twoStage, 0.0 for twoStageHQ.
+    let stgScale: Double
     /// Suggested frame count — must satisfy (n-1) % 8 == 0.
     let numFrames: Int
 }
@@ -252,12 +255,14 @@ struct VideoModelPreset: Identifiable, Hashable {
         .init(width: 512,  height: 768, label: "512 × 768 (portrait 2:3)"),
     ]
 
-    /// LTX-2.3 documented frame ladder (8N+1, +16 stride starting at 9).
-    /// Capped at 193 — beyond that needs 64 GB+ Mac.
+    /// LTX-2.3 frame ladder — every valid `8N+1` count from 9 up to
+    /// `maxFrames`. 193 is the practical cap (≈8s at 24 fps); beyond that
+    /// needs a 64 GB+ Mac. The preset defaults (49, 97) must land on this
+    /// ladder or the Frames picker renders blank.
     private static func frameLadder(maxFrames: Int) -> [Int] {
         var values: [Int] = []
         var n = 9
-        while n <= maxFrames { values.append(n); n += 16 }
+        while n <= maxFrames { values.append(n); n += 8 }
         if !values.contains(maxFrames) { values.append(maxFrames) }
         return values
     }
@@ -275,10 +280,10 @@ struct VideoModelPreset: Identifiable, Hashable {
             defaultResolution: ltxResolutions[0],
             fps: 24,
             qualityProfiles: [
-                .fast:         .init(mode: .oneStage,   steps: 8,  cfgScale: 1.0, numFrames: 49),
-                .good:         .init(mode: .oneStage,   steps: 12, cfgScale: 1.0, numFrames: 97),
-                .quality:      .init(mode: .twoStage,   steps: 30, cfgScale: 3.0, numFrames: 97),
-                .superQuality: .init(mode: .twoStageHQ, steps: 15, cfgScale: 3.0, numFrames: 97),
+                .fast:         .init(mode: .oneStage,   steps: 8,  cfgScale: 1.0, stgScale: 0.0, numFrames: 49),
+                .good:         .init(mode: .oneStage,   steps: 12, cfgScale: 1.0, stgScale: 0.0, numFrames: 97),
+                .quality:      .init(mode: .twoStage,   steps: 30, cfgScale: 3.0, stgScale: 1.0, numFrames: 97),
+                .superQuality: .init(mode: .twoStageHQ, steps: 15, cfgScale: 3.0, stgScale: 0.0, numFrames: 97),
             ],
             defaultQuality: .good,
             maxFrames: cap,
@@ -313,6 +318,10 @@ struct VideoGenRequest {
     var mode: VideoPipelineMode
     var steps: Int
     var cfgScale: Double
+    var stgScale: Double = 0.0
+    /// Optional first-frame image for image-to-video conditioning (2-stage
+    /// pipelines only — the distilled 1-stage pipeline doesn't accept it).
+    var firstFrameImagePath: String? = nil
 }
 
 // MARK: - RAM checks

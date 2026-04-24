@@ -135,7 +135,7 @@ final class VideoGenService: ObservableObject {
     }
 
     private static func buildArgs(_ r: VideoGenRequest, outputPath: String) -> [String] {
-        [
+        var args = [
             "--repo", r.model.repo,
             "--mode", r.mode.rawValue,
             "--prompt", r.prompt,
@@ -144,9 +144,14 @@ final class VideoGenService: ObservableObject {
             "--frames", String(r.numFrames),
             "--steps", String(r.steps),
             "--cfg", String(r.cfgScale),
+            "--stg", String(r.stgScale),
             "--seed", String(r.seed),
             "--output", outputPath,
         ]
+        if let path = r.firstFrameImagePath {
+            args.append(contentsOf: ["--image", path])
+        }
+        return args
     }
 
     /// Python script for LTX-Video 2.3 generation via `ltx-2-mlx`. Single
@@ -173,6 +178,10 @@ def main():
                    help="num_steps for oneStage; stage1_steps for two-stage modes.")
     p.add_argument("--cfg", type=float, default=3.0,
                    help="CFG scale; ignored by oneStage.")
+    p.add_argument("--stg", type=float, default=0.0,
+                   help="Spatial-temporal guidance; ignored by oneStage.")
+    p.add_argument("--image", default=None,
+                   help="Optional first-frame image path (2-stage modes only).")
     p.add_argument("--output", required=True)
     args = p.parse_args()
 
@@ -221,6 +230,7 @@ def main():
           "message":f"Generating {args.frames} frames @ {args.width}x{args.height} ({args.mode})..."})
     try:
         if args.mode == "oneStage":
+            # Distilled 1-stage pipeline doesn't accept stg_scale or image.
             pipe.generate_and_save(
                 prompt=args.prompt,
                 output_path=args.output,
@@ -235,6 +245,8 @@ def main():
                 height=args.height, width=args.width,
                 num_frames=args.frames, seed=args.seed,
                 stage1_steps=args.steps, cfg_scale=args.cfg,
+                stg_scale=args.stg,
+                image=args.image,
             )
     except Exception as e:
         emit({"type":"error","message":str(e)})
