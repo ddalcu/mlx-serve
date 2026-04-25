@@ -60,7 +60,7 @@ struct VideoGenView: View {
                     qualitySection
                     resolutionSection
                     framesSection
-                    if supportsI2V { firstFrameSection }
+                    firstFrameSection
                     if showAdvanced { advancedSection } else { advancedToggle }
                     actionRow
                 }
@@ -256,10 +256,16 @@ struct VideoGenView: View {
     }
 
     /// Image-to-video is only supported by the 2-stage pipelines — the
-    /// distilled 1-stage pipeline doesn't accept an `image=` argument. We
-    /// hide the section entirely on 1-stage instead of dimming it.
+    /// distilled 1-stage pipeline was trained text-only and its
+    /// `generate_and_save()` signature doesn't accept `image=`. We keep the
+    /// First frame row visible but disabled on 1-stage so the feature is
+    /// discoverable, with a tooltip explaining what to do.
     private var supportsI2V: Bool {
         mode == .twoStage || mode == .twoStageHQ
+    }
+
+    private var i2vDisabledHelp: String {
+        "Image-to-video requires the Quality or Super Quality preset — the Fast / Good pipeline is text-only."
     }
 
     private var firstFrameSection: some View {
@@ -267,7 +273,9 @@ struct VideoGenView: View {
             HStack {
                 Text("First frame").font(.subheadline.weight(.semibold))
                 Spacer()
-                Text("optional — I2V").font(.caption).foregroundStyle(.secondary)
+                Text(supportsI2V ? "optional — I2V" : "needs Quality preset")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
             if let url = firstFrameImageURL {
                 HStack(spacing: 8) {
@@ -277,11 +285,13 @@ struct VideoGenView: View {
                             .aspectRatio(contentMode: .fill)
                             .frame(width: 64, height: 48)
                             .clipShape(RoundedRectangle(cornerRadius: 4))
+                            .opacity(supportsI2V ? 1.0 : 0.45)
                     }
                     Text(url.lastPathComponent)
                         .font(.caption)
                         .lineLimit(1)
                         .truncationMode(.middle)
+                        .foregroundStyle(supportsI2V ? .primary : .secondary)
                     Spacer()
                     Button {
                         firstFrameImageURL = nil
@@ -292,6 +302,7 @@ struct VideoGenView: View {
                     .foregroundStyle(.secondary)
                     .help("Clear first frame")
                 }
+                .help(supportsI2V ? "" : i2vDisabledHelp)
             } else {
                 Button {
                     chooseFirstFrameImage()
@@ -301,6 +312,10 @@ struct VideoGenView: View {
                         .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.bordered)
+                .disabled(!supportsI2V)
+                .help(supportsI2V
+                      ? "Select an image to use as the first frame of the video."
+                      : i2vDisabledHelp)
             }
         }
     }
@@ -495,9 +510,9 @@ struct VideoGenView: View {
         stgScale = s.stgScale
         numFrames = s.numFrames
         clampFramesToRAM()
-        // I2V is 2-stage only; drop the image if the user switched into
-        // 1-stage via a Quality preset change.
-        if !supportsI2V { firstFrameImageURL = nil }
+        // Keep firstFrameImageURL across preset changes so users can swap
+        // Quality tiers without losing their attached image. The First frame
+        // row dims itself on 1-stage and tryGenerate() nil's the path.
     }
 
     /// Resolution change still snaps frame count down to the model's hard

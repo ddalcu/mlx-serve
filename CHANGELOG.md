@@ -1,5 +1,23 @@
 # Changelog
 
+## v26.4.28 — Grammar-Constrained JSON Schema Decoding
+
+### Strict `response_format.json_schema` Enforcement
+- **Token-level mask**: When a request includes `response_format: {type: "json_schema", json_schema: {schema: …}}`, every sampled token is now filtered against a streaming JSON grammar derived from the schema. Tokens whose bytes would violate the grammar have their logits set to `-inf` before sampling, so non-conforming output is structurally unreachable. Previously the schema was injected into the system prompt as a "soft" instruction and quantized models routinely produced trailing prose, missing closing braces, or wrong types — which triggered backend `JSON.parse` retries on the consumer side.
+- **Supported subset (the common case)**: `type` (object, array, string, integer, number, boolean, null), `properties`, `required`, `additionalProperties` (defaults to `false`, OpenAI-strict), `items`, `enum`, `const`, `minLength` / `maxLength`, `minimum` / `maximum`, `exclusiveMinimum` / `exclusiveMaximum`, `pattern` (regex). `anyOf` / `oneOf` are relaxed to "any JSON value" at branch points; the prompt instruction still nudges the model toward the right shape.
+- **EOS gating**: The end-of-sequence token is masked off until the grammar reports the root value as fully parsed, eliminating premature truncation of partial JSON.
+- **Graceful fallback**: If the grammar enters a dead state (e.g. an unsupported schema feature surfaces mid-decode), the mask flips to "everything allowed" and a warning is logged — the request still completes instead of stalling.
+- **Token-byte cache**: The vocabulary's per-id byte sequences are computed once at first use (~50 ms for a 100k-vocab tokenizer) and reused across all subsequent requests, so per-token mask building is just a vocab-sized speculative replay (~1–5 ms on M-series silicon).
+
+### Implementation
+- New modules: `src/json_schema.zig` (schema IR + parser), `src/regex.zig` (Thompson-NFA engine for `pattern`), `src/json_grammar.zig` (streaming JSON FSM with snapshot/restore for speculative trial), `src/token_mask.zig` (mask builder using `acceptByteFast` over a single outer snapshot).
+- `generate.zig` gains a `Constraint` type and a `constraint` field on `SamplingParams`. When set, `Generator.init` skips the lazy first-sample fast path and `Generator.next` dispatches to a synchronous `nextConstrained` path: build mask → `mlx_where(mask, logits, -inf)` → categorical sample → eval → advance grammar by sampled token's bytes → async-launch next forward to overlap with the next mask build.
+- `server.zig` parses `response_format.json_schema`, lazily builds the global `TokenBytes` table, allocates a per-request mask buffer of `vocab_size` booleans, instantiates a `Grammar`, and threads a `Constraint` through `SamplingParams`. The existing prompt-side schema instruction is kept as a soft guide for the union/`anyOf` cases the grammar relaxes.
+
+### Testing
+- New unit-test modules covering schema IR (32 cases), regex NFA (counted quantifiers, character classes, alternation), streaming JSON grammar (snapshot/restore, depth tracking, cruise-app-style nested schemas), and token mask building (object/enum/dead-grammar fallback, multi-byte tokens straddling a key boundary).
+- New `tests/test_json_schema.sh` integration script: object schema, enum, nested array-of-string, and a streaming round-trip — all asserting that the assembled output round-trips through `json.loads` and matches the requested shape.
+
 ## v26.4.27 — Multi-CLI Launcher (Claude Code / pi / OpenCode)
 
 ### CLI Launcher

@@ -279,6 +279,15 @@ final class PythonManager: ObservableObject {
             // but this is more explicit for children Python may spawn.
             environment["PYTHONUNBUFFERED"] = "1"
             environment["PYTHONIOENCODING"] = "utf-8"
+            // Finder-launched apps inherit a minimal PATH (/usr/bin:/bin:...)
+            // and miss Homebrew, so shutil.which("ffmpeg") fails inside the
+            // Python script even when ffmpeg is installed. Prepend the usual
+            // Homebrew bin dirs so subprocess lookups match the user's shell.
+            let brewBins = ["/opt/homebrew/bin", "/usr/local/bin"]
+            let existing = environment["PATH"] ?? "/usr/bin:/bin:/usr/sbin:/sbin"
+            let parts = existing.split(separator: ":").map(String.init)
+            let prepend = brewBins.filter { !parts.contains($0) }
+            environment["PATH"] = (prepend + [existing]).joined(separator: ":")
             for (k, v) in env { environment[k] = v }
             proc.environment = environment
 

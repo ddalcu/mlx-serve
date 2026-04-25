@@ -21,6 +21,10 @@ pub fn setLevel(level: Level) void {
     current_level = level;
 }
 
+pub fn isDebug() bool {
+    return @intFromEnum(current_level) >= @intFromEnum(Level.debug);
+}
+
 pub fn info(comptime fmt: []const u8, args: anytype) void {
     if (@intFromEnum(current_level) >= @intFromEnum(Level.info)) {
         std.debug.print(fmt, args);
@@ -75,6 +79,8 @@ test "setLevel changes current level" {
 
     setLevel(.debug);
     try testing.expectEqual(Level.debug, current_level);
+    try testing.expect(isDebug());
     setLevel(.err);
     try testing.expectEqual(Level.err, current_level);
+    try testing.expect(!isDebug());
 }

@@ -9,4 +9,9 @@ test {
     _ = @import("generate.zig");
     _ = @import("transformer.zig");
     _ = @import("vision.zig");
+    _ = @import("regex.zig");
+    _ = @import("json_schema.zig");
+    _ = @import("json_grammar.zig");
+    _ = @import("token_mask.zig");
+    _ = @import("responses.zig");
 }

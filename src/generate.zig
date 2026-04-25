@@ -4,9 +4,67 @@ const transformer_mod = @import("transformer.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const model_mod = @import("model.zig");
 const log = @import("log.zig");
+const json_grammar = @import("json_grammar.zig");
+const json_schema = @import("json_schema.zig");
+const token_mask = @import("token_mask.zig");
 
 const Transformer = transformer_mod.Transformer;
 const Tokenizer = tokenizer_mod.Tokenizer;
+
+/// Grammar-constrained sampling state. The caller owns `grammar`, `token_bytes`,
+/// and `mask_buf`; the generator only reads them. `mask_buf.len` must equal
+/// `token_bytes.bytes.len` (the tokenizer's vocab size).
+pub const Constraint = struct {
+    grammar: *json_grammar.Grammar,
+    token_bytes: *const token_mask.TokenBytes,
+    mask_buf: []bool,
+};
+
+/// RAII bundle for grammar-constrained sampling. Owns the parsed schema,
+/// grammar state machine, and per-step mask buffer. The embedded `Constraint`
+/// holds pointers/slices into the surrounding struct, so this struct must NOT
+/// be moved after `initFromValue`. Construct via `var sc: SchemaConstraint =
+/// undefined; try sc.initFromValue(...);` and pass `&sc.constraint` to
+/// `SamplingParams`.
+pub const SchemaConstraint = struct {
+    schema: json_schema.Schema,
+    grammar: json_grammar.Grammar,
+    mask_buf: []bool,
+    constraint: Constraint,
+    allocator: std.mem.Allocator,
+
+    /// Initialize in-place from a JSON schema value. On failure, any partial
+    /// allocations made during this call are freed and the struct is left
+    /// undefined (do not call `deinit`).
+    pub fn initFromValue(
+        self: *SchemaConstraint,
+        allocator: std.mem.Allocator,
+        schema_value: std.json.Value,
+        token_bytes: *const token_mask.TokenBytes,
+    ) !void {
+        self.allocator = allocator;
+        self.schema = try json_schema.parse(allocator, schema_value);
+        errdefer self.schema.deinit();
+
+        self.grammar = try json_grammar.Grammar.init(allocator, &self.schema);
+        errdefer self.grammar.deinit();
+
+        self.mask_buf = try allocator.alloc(bool, token_bytes.bytes.len);
+        errdefer allocator.free(self.mask_buf);
+
+        self.constraint = .{
+            .grammar = &self.grammar,
+            .token_bytes = token_bytes,
+            .mask_buf = self.mask_buf,
+        };
+    }
+
+    pub fn deinit(self: *SchemaConstraint) void {
+        self.allocator.free(self.mask_buf);
+        self.grammar.deinit();
+        self.schema.deinit();
+    }
+};
 
 /// Per-token logprob info (OpenAI format).
 pub const TokenLogprob = struct {
@@ -28,6 +86,10 @@ pub const SamplingParams = struct {
     repeat_penalty: f32 = 1.0,
     presence_penalty: f32 = 0.0, // 0.0 = disabled
     seed: ?u64 = null,
+    /// When non-null, generation is constrained to outputs that satisfy the
+    /// grammar at byte level. Forces a synchronous sampling path (no lazy
+    /// pipeline) since grammar advancement requires the realized token id.
+    constraint: ?*Constraint = null,
 };
 
 /// Generation result (for non-streaming use).
@@ -145,6 +207,31 @@ pub const Generator = struct {
 
         const logits = try xfm.forward(last_input);
 
+        // Constrained generation skips the lazy first-sample fast path: we cannot
+        // sample the first token until we have applied the grammar mask, and we
+        // cannot pipeline because grammar advancement depends on the realized id.
+        if (sampling.constraint != null) {
+            var gen = Generator{
+                .xfm = xfm,
+                .tok = tok,
+                .next_token_id = 0,
+                .step = 0,
+                .max_tokens = max_tokens,
+                .sampling = sampling,
+                .prompt_tokens = @intCast(prompt_ids.len),
+                .completion_tokens = 0,
+                .finish_reason = "length",
+                .done = false,
+                .eos_token_ids = eos_token_ids,
+                .generated_ids = std.ArrayList(u32).empty,
+                .timeout_ns = 0,
+                .timer = try std.time.Timer.start(),
+            };
+            gen.pending_logits = logits;
+            gen.has_pending_logits = true;
+            return gen;
+        }
+
         // Sample first token lazily, then build the next forward pass
         const lazy_token = sampleTokenLazy(logits, sampling, s);
         _ = mlx.mlx_array_free(logits);
@@ -232,6 +319,7 @@ pub const Generator = struct {
     ///   where y.item() is instant because async_eval forced y's computation.
     pub fn next(self: *Generator, allocator: std.mem.Allocator) !?u32 {
         if (self.done) return null;
+        if (self.sampling.constraint != null) return self.nextConstrained(allocator);
 
         // ── Phase 1: Build and submit the NEXT step FIRST ──
         // This forces the GPU to compute the pending token as a dependency,
@@ -345,6 +433,120 @@ pub const Generator = struct {
             try mlx.check(mlx.mlx_array_item_int32(&val, lazy_token));
             _ = mlx.mlx_array_free(lazy_token);
             self.next_token_id = @intCast(val);
+        }
+
+        return token;
+    }
+
+    /// Synchronous, grammar-constrained sampling step. Used whenever
+    /// `sampling.constraint` is non-null. Builds a token mask from the grammar's
+    /// current state, applies it to the pending logits, samples, advances the
+    /// grammar by the sampled token's bytes, and pre-launches the next forward
+    /// pass to overlap with the next mask build.
+    fn nextConstrained(self: *Generator, allocator: std.mem.Allocator) !?u32 {
+        if (!self.has_pending_logits) {
+            self.done = true;
+            return null;
+        }
+        if (self.timeout_ns > 0 and self.timer.read() >= self.timeout_ns) {
+            self.done = true;
+            self.finish_reason = "length";
+            return null;
+        }
+        if (self.step >= self.max_tokens) {
+            self.done = true;
+            self.finish_reason = "length";
+            return null;
+        }
+
+        const constraint = self.sampling.constraint.?;
+        const s = self.xfm.s;
+
+        _ = try token_mask.buildMask(constraint.grammar, constraint.token_bytes, constraint.mask_buf);
+
+        // Also allow every stop-id the generator recognises once the grammar is
+        // complete. `token_mask.buildMask` only knows about `tokenizer.eos_id`,
+        // but models often have additional stop tokens (e.g. `<|im_end|>` for
+        // Qwen, `<end_of_turn>` for Gemma 4) registered via the config — without
+        // this, the model can never stop.
+        if (constraint.grammar.isComplete()) {
+            for (self.eos_token_ids) |eos_id| {
+                if (eos_id < constraint.mask_buf.len) constraint.mask_buf[eos_id] = true;
+            }
+        }
+
+        const step_logits = self.pending_logits;
+        self.has_pending_logits = false;
+        defer _ = mlx.mlx_array_free(step_logits);
+
+        var masked_logits = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(masked_logits);
+        try applyGrammarMask(allocator, &masked_logits, step_logits, constraint.mask_buf, s);
+
+        // Synchronous sample: we need the realized token id to advance the grammar.
+        const lazy = sampleTokenLazy(masked_logits, self.sampling, s);
+        try mlx.check(mlx.mlx_array_eval(lazy));
+        var val: i32 = 0;
+        try mlx.check(mlx.mlx_array_item_int32(&val, lazy));
+        _ = mlx.mlx_array_free(lazy);
+        const token: u32 = @intCast(val);
+        self.next_token_id = token;
+
+        // Stop on EOS — do not advance grammar or include in output.
+        for (self.eos_token_ids) |eos_id| {
+            if (token == eos_id) {
+                self.done = true;
+                self.finish_reason = "stop";
+                return null;
+            }
+        }
+        if (token == 0) {
+            self.consecutive_pad += 1;
+            if (self.consecutive_pad >= 3) {
+                self.done = true;
+                self.finish_reason = "stop";
+                return null;
+            }
+        } else {
+            self.consecutive_pad = 0;
+        }
+
+        // Advance the grammar by the sampled token's byte sequence. The mask
+        // guarantees every byte is accepted (or the token has no byte form, e.g. a
+        // special tag) — so a rejection here means a bug we want to surface.
+        if (token < constraint.token_bytes.bytes.len) {
+            if (constraint.token_bytes.bytes[token]) |bytes| {
+                for (bytes) |b| {
+                    const ok = try constraint.grammar.acceptByte(b);
+                    if (!ok) {
+                        log.warn("[grammar] sampled token {d} produced byte 0x{x} that was rejected — disabling further mask enforcement\n", .{ token, b });
+                        constraint.grammar.dead = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        self.completion_tokens += 1;
+        self.step += 1;
+        try self.generated_ids.append(allocator, token);
+        if (self.step % 256 == 0) _ = mlx.mlx_clear_cache();
+
+        if (self.step < self.max_tokens) {
+            const tok_i32: i32 = @intCast(token);
+            const tok_shape = [_]c_int{ 1, 1 };
+            const tok_input = mlx.mlx_array_new_data(&tok_i32, &tok_shape, 2, .int32);
+            defer _ = mlx.mlx_array_free(tok_input);
+            const next_logits = try self.xfm.forward(tok_input);
+            const arr = [_]mlx.mlx_array{next_logits};
+            const vec = mlx.mlx_vector_array_new_data(&arr, 1);
+            _ = mlx.mlx_async_eval(vec);
+            _ = mlx.mlx_vector_array_free(vec);
+            self.pending_logits = next_logits;
+            self.has_pending_logits = true;
+        } else {
+            self.done = true;
+            self.finish_reason = "length";
         }
 
         return token;
@@ -846,6 +1048,45 @@ fn computeLogprobs(allocator: std.mem.Allocator, logits: mlx.mlx_array, chosen_t
     };
 }
 
+/// Apply a grammar token mask to logits. `mask[i]==true` keeps `logits[i]`,
+/// `false` replaces it with `-inf`. The mask is broadcast over leading dims so
+/// `logits` can be either `[1, vocab]` or `[1, 1, vocab]`.
+fn applyGrammarMask(allocator: std.mem.Allocator, res: *mlx.mlx_array, logits: mlx.mlx_array, mask: []const bool, s: mlx.mlx_stream) !void {
+    const shape = mlx.getShape(logits);
+    const vocab_size: usize = @intCast(shape[shape.len - 1]);
+    const logit_mask = try maskForLogitVocab(allocator, mask, vocab_size);
+    defer logit_mask.deinit(allocator);
+
+    // Zig's `bool` is one byte and matches MLX's `.bool_` storage exactly.
+    const arr_shape = [_]c_int{@intCast(vocab_size)};
+    const mask_arr = mlx.mlx_array_new_data(@ptrCast(logit_mask.slice.ptr), &arr_shape, 1, .bool_);
+    defer _ = mlx.mlx_array_free(mask_arr);
+
+    const neg_inf = mlx.mlx_array_new_float(-std.math.inf(f32));
+    defer _ = mlx.mlx_array_free(neg_inf);
+
+    try mlx.check(mlx.mlx_where(res, mask_arr, logits, neg_inf, s));
+}
+
+const LogitMaskView = struct {
+    slice: []const bool,
+    owned: ?[]bool = null,
+
+    fn deinit(self: LogitMaskView, allocator: std.mem.Allocator) void {
+        if (self.owned) |buf| allocator.free(buf);
+    }
+};
+
+fn maskForLogitVocab(allocator: std.mem.Allocator, mask: []const bool, vocab_size: usize) !LogitMaskView {
+    if (mask.len == vocab_size) return .{ .slice = mask };
+
+    var adjusted = try allocator.alloc(bool, vocab_size);
+    @memset(adjusted, false);
+    const copy_len = @min(mask.len, vocab_size);
+    @memcpy(adjusted[0..copy_len], mask[0..copy_len]);
+    return .{ .slice = adjusted, .owned = adjusted };
+}
+
 /// Apply top-k filtering: keep only the top k logits, set the rest to -inf.
 fn applyTopK(res: *mlx.mlx_array, logits: mlx.mlx_array, k: u32, s: mlx.mlx_stream) !void {
     // Get the top-k values (returned in descending order)
@@ -1096,6 +1337,25 @@ test "GenerationResult fields" {
     try testing.expectEqual(@as(u32, 3), result.completion_tokens);
     try testing.expectEqualStrings("stop", result.finish_reason);
     try testing.expect(result.logprobs == null);
+}
+
+test "maskForLogitVocab pads and truncates to logits size" {
+    const short_mask = [_]bool{ true, false, true };
+    const padded = try maskForLogitVocab(testing.allocator, &short_mask, 5);
+    defer padded.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 5), padded.slice.len);
+    try testing.expect(padded.slice[0]);
+    try testing.expect(!padded.slice[1]);
+    try testing.expect(padded.slice[2]);
+    try testing.expect(!padded.slice[3]);
+    try testing.expect(!padded.slice[4]);
+
+    const long_mask = [_]bool{ false, true, true, true };
+    const truncated = try maskForLogitVocab(testing.allocator, &long_mask, 2);
+    defer truncated.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 2), truncated.slice.len);
+    try testing.expect(!truncated.slice[0]);
+    try testing.expect(truncated.slice[1]);
 }
 
 test "argmax selects highest value" {

@@ -7,6 +7,8 @@ const chat_mod = @import("chat.zig");
 const model_mod = @import("model.zig");
 const vision_mod = @import("vision.zig");
 const log = @import("log.zig");
+const token_mask_mod = @import("token_mask.zig");
+const responses_mod = @import("responses.zig");
 const stb = @cImport({ @cInclude("stb_image.h"); });
 const webp = @cImport({ @cInclude("webp/decode.h"); });
 const metrics = @import("status.zig");
@@ -89,6 +91,53 @@ var last_generation_was_pad: bool = false;
 /// Vision encoder (null if model has no vision support).
 var global_vision_encoder: ?*VisionEncoder = null;
 
+/// Tokenizer-vocabulary byte table for grammar-constrained sampling. Built
+/// lazily on the first JSON-schema request and reused for the lifetime of the
+/// server. Single-threaded inference path means no synchronization is needed.
+var global_token_bytes: ?token_mask_mod.TokenBytes = null;
+var global_token_bytes_gpa: ?std.mem.Allocator = null;
+
+fn getOrBuildTokenBytes(gpa: std.mem.Allocator, tok: *const Tokenizer) !*const token_mask_mod.TokenBytes {
+    if (global_token_bytes) |*tb| return tb;
+    log.info("[grammar] building token-byte table for vocab (one-time, ~50ms)\n", .{});
+    const built = try token_mask_mod.build(gpa, tok);
+    global_token_bytes = built;
+    global_token_bytes_gpa = gpa;
+    return &global_token_bytes.?;
+}
+
+fn deinitGlobalTokenBytes() void {
+    if (global_token_bytes) |*tb| {
+        tb.deinit();
+        global_token_bytes = null;
+        global_token_bytes_gpa = null;
+    }
+}
+
+/// In-memory store for OpenAI Responses API state (`store: true` requests).
+/// Bounded LRU; lost on restart.
+var global_response_store: ?responses_mod.ResponseStore = null;
+var global_response_store_gpa: ?std.mem.Allocator = null;
+const RESPONSE_STORE_CAP: usize = 256;
+const DEFAULT_API_MAX_TOKENS: u32 = 1024;
+const DEFAULT_STRUCTURED_OUTPUT_MAX_TOKENS: u32 = 2048;
+
+fn getOrInitResponseStore(gpa: std.mem.Allocator) *responses_mod.ResponseStore {
+    if (global_response_store == null) {
+        global_response_store = responses_mod.ResponseStore.init(gpa, RESPONSE_STORE_CAP);
+        global_response_store_gpa = gpa;
+    }
+    return &global_response_store.?;
+}
+
+fn deinitGlobalResponseStore() void {
+    if (global_response_store) |*store| {
+        store.deinit();
+        global_response_store = null;
+        global_response_store_gpa = null;
+    }
+}
+
 /// Start the HTTP server on the given host and port.
 pub fn serve(
     allocator: std.mem.Allocator,
@@ -161,6 +210,9 @@ pub fn serve(
     log.info("  POST /v1/completions\n", .{});
     log.info("  POST /v1/embeddings\n", .{});
     log.info("  POST /v1/messages (Anthropic)\n", .{});
+    log.info("  POST /v1/responses (OpenAI Responses)\n", .{});
+    log.info("  GET  /v1/responses/{{id}}\n", .{});
+    log.info("  DEL  /v1/responses/{{id}}\n", .{});
     log.info("  POST /tokenize\n", .{});
     log.info("  POST /detokenize\n\n", .{});
 
@@ -215,6 +267,8 @@ pub fn serve(
         allocator.free(old);
         cached_prompt_ids = null;
     }
+    deinitGlobalResponseStore();
+    deinitGlobalTokenBytes();
 
     log.info("\nShutting down gracefully...\n", .{});
 }
@@ -300,6 +354,8 @@ fn handleConnection(
     const raw_path = line_iter.next() orelse return;
     // Strip query string for route matching (e.g. /v1/messages?beta=true -> /v1/messages)
     const path = if (std.mem.indexOf(u8, raw_path, "?")) |qpos| raw_path[0..qpos] else raw_path;
+    const request_body = if (total_read > header_end_pos) request[header_end_pos..total_read] else "";
+    logHttpRequest(method, raw_path, request_body);
 
     if (std.mem.eql(u8, method, "HEAD") and std.mem.eql(u8, path, "/")) {
         // Connectivity check (Claude Code sends HEAD / before any API call)
@@ -366,6 +422,26 @@ fn handleConnection(
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
         const body = request[header_end + 4 .. total_read];
         try handleAnthropicMessages(allocator, stream, body, xfm, tok, chat_config, config);
+    } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/responses")) {
+        if (config.is_encoder_only) {
+            try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Encoder-only models do not support text generation. Use /v1/embeddings instead.", 400);
+            return;
+        }
+        if (!acquireInferenceSlot()) {
+            log.warn("POST /v1/responses -> 503 (queue full)\n", .{});
+            try sendErrorResponse(allocator, stream, "503 Service Unavailable", "server_error", "Server request queue is full. Try again shortly.", 503);
+            return;
+        }
+        defer releaseInferenceSlot();
+        const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
+        const body = request[header_end + 4 .. total_read];
+        try handleResponses(allocator, stream, body, xfm, tok, chat_config, config);
+    } else if (std.mem.eql(u8, method, "GET") and std.mem.startsWith(u8, path, "/v1/responses/")) {
+        const id = path["/v1/responses/".len..];
+        try handleResponsesGet(allocator, stream, id);
+    } else if (std.mem.eql(u8, method, "DELETE") and std.mem.startsWith(u8, path, "/v1/responses/")) {
+        const id = path["/v1/responses/".len..];
+        try handleResponsesDelete(allocator, stream, id);
     } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/tokenize")) {
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
         const body = request[header_end + 4 .. total_read];
@@ -819,49 +895,11 @@ fn handleChatCompletions(
                         if (img_obj != .object) continue;
                         const url_val = img_obj.object.get("url") orelse continue;
                         if (url_val != .string) continue;
-                        const url = url_val.string;
-                        // Decode image from data URL — supports:
-                        //   data:image/x-mlx-pixels;base64,... (preprocessed float32 CHW)
-                        //   data:image/jpeg;base64,...          (JPEG, decoded via stb_image)
-                        //   data:image/png;base64,...           (PNG, decoded via stb_image)
-                        if (std.mem.indexOf(u8, url, ";base64,")) |sep| {
-                            const b64_data = url[sep + 8 ..];
-                            const decoded_size = std.base64.standard.Decoder.calcSizeForSlice(b64_data) catch continue;
-                            const raw_buf = allocator.alloc(u8, decoded_size) catch continue;
-                            std.base64.standard.Decoder.decode(raw_buf, b64_data) catch {
-                                allocator.free(raw_buf);
+                        if (parseImageUrlContent(allocator, url_val.string)) |img| {
+                            image_list.append(allocator, img) catch {
+                                allocator.free(img.pixels);
                                 continue;
                             };
-
-                            const mime = url[0..sep];
-                            if (std.mem.eql(u8, mime, "data:image/x-mlx-pixels")) {
-                                // Already preprocessed float32 CHW pixels
-                                const n_pixels = raw_buf.len / 4;
-                                const per_channel = n_pixels / 3;
-                                const side = std.math.sqrt(per_channel);
-                                if (side * side == per_channel and n_pixels == 3 * side * side) {
-                                    image_list.append(allocator, .{
-                                        .pixels = raw_buf,
-                                        .width = @intCast(side),
-                                        .height = @intCast(side),
-                                    }) catch { allocator.free(raw_buf); continue; };
-                                } else {
-                                    allocator.free(raw_buf);
-                                }
-                            } else if (std.mem.startsWith(u8, mime, "data:image/")) {
-                                // JPEG/PNG/etc — decode with stb_image, resize, convert to float32 CHW
-                                if (decodeImageToPixels(allocator, raw_buf)) |img| {
-                                    allocator.free(raw_buf);
-                                    image_list.append(allocator, img) catch {
-                                        allocator.free(img.pixels);
-                                        continue;
-                                    };
-                                } else {
-                                    allocator.free(raw_buf);
-                                }
-                            } else {
-                                allocator.free(raw_buf);
-                            }
                         }
                     }
                 }
@@ -932,10 +970,10 @@ fn handleChatCompletions(
         break :blk if (v) |val|
             switch (val) {
                 .integer => |i| @intCast(i),
-                else => 256,
+                else => DEFAULT_API_MAX_TOKENS,
             }
         else
-            256;
+            DEFAULT_API_MAX_TOKENS;
     };
 
     const is_stream = if (root.get("stream")) |v| v == .bool and v.bool else false;
@@ -1046,7 +1084,9 @@ fn handleChatCompletions(
         rf_allocs.deinit(allocator);
     }
 
-    // Parse response_format — inject JSON schema constraint into system message
+    // Parse response_format — inject JSON schema constraint into system message,
+    // and capture the schema value for grammar-constrained sampling below.
+    var grammar_schema_val: ?std.json.Value = null;
     if (root.get("response_format")) |rf| {
         if (rf == .object) {
             const rf_type = if (rf.object.get("type")) |t| (if (t == .string) t.string else "") else "";
@@ -1059,6 +1099,7 @@ fn handleChatCompletions(
                 if (rf.object.get("json_schema")) |js| {
                     if (js == .object) {
                         if (js.object.get("schema")) |schema_val| {
+                            grammar_schema_val = schema_val;
                             var out: std.io.Writer.Allocating = .init(allocator);
                             defer out.deinit();
                             var jws: std.json.Stringify = .{ .writer = &out.writer, .options = .{} };
@@ -1190,7 +1231,7 @@ fn handleChatCompletions(
 
     const eos_slice = config.eosTokenSlice();
 
-    const sampling = generate_mod.SamplingParams{
+    var sampling = generate_mod.SamplingParams{
         .temperature = temperature,
         .top_p = top_p,
         .top_k = top_k,
@@ -1198,6 +1239,28 @@ fn handleChatCompletions(
         .presence_penalty = presence_penalty,
         .seed = seed,
     };
+
+    // Build grammar-constrained sampling state if a JSON schema was supplied.
+    // Lifetime is scoped to this request — the SchemaConstraint must NOT be
+    // moved (the embedded Constraint holds pointers into it).
+    var sc: generate_mod.SchemaConstraint = undefined;
+    var sc_init = false;
+    defer if (sc_init) sc.deinit();
+
+    if (grammar_schema_val) |sv| {
+        if (has_tools) {
+            log.info("[grammar] skipped JSON schema mask while tools are available (tool calls must remain reachable)\n", .{});
+        } else {
+            const tb = try getOrBuildTokenBytes(allocator, tok);
+            if (sc.initFromValue(allocator, sv, tb)) {
+                sc_init = true;
+                sampling.constraint = &sc.constraint;
+                log.info("[grammar] enforcing JSON schema (vocab={d}, mask={d}b)\n", .{ tb.bytes.len, sc.mask_buf.len });
+            } else |err| {
+                log.warn("[grammar] schema parse failed ({s}); falling back to prompt-only enforcement\n", .{@errorName(err)});
+            }
+        }
+    }
 
     if (is_stream) {
         handleStreamingGeneration(allocator, stream, xfm, tok, cache_result.new_tokens, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, include_usage, has_tools, cache_result.cached_tokens, logprobs_n, enable_thinking, reasoning_budget) catch |err| {
@@ -1266,8 +1329,8 @@ fn handleCompletions(
         const v = root.get("max_tokens") orelse root.get("max_completion_tokens");
         break :blk if (v) |val| switch (val) {
             .integer => |i| @intCast(i),
-            else => 256,
-        } else 256;
+            else => DEFAULT_API_MAX_TOKENS,
+        } else DEFAULT_API_MAX_TOKENS;
     };
 
     const is_stream = if (root.get("stream")) |v| v == .bool and v.bool else false;
@@ -1488,6 +1551,7 @@ fn handleStreamingCompletion(
         "Access-Control-Allow-Headers: Content-Type, Authorization\r\n" ++
         "\r\n";
     try stream.writeAll(header);
+    logHttpStreamStart("completions");
 
     var text_buf = std.ArrayList(u8).empty;
     defer text_buf.deinit(allocator);
@@ -1546,6 +1610,7 @@ fn handleStreamingCompletion(
         , .{ cmpl_id, created_ts, model_name, escaped });
         defer allocator.free(chunk);
 
+        logHttpSseData(chunk);
         try stream.writeAll("data: ");
         try stream.writeAll(chunk);
         try stream.writeAll("\n\n");
@@ -1566,9 +1631,11 @@ fn handleStreamingCompletion(
     , .{ cmpl_id, created_ts, model_name, finish_reason, usage_str });
     defer allocator.free(final_chunk);
 
+    logHttpSseData(final_chunk);
     try stream.writeAll("data: ");
     try stream.writeAll(final_chunk);
     try stream.writeAll("\n\n");
+    logHttpSseData("[DONE]");
     try stream.writeAll("data: [DONE]\n\n");
 
     const decode_ns = timer.read();
@@ -1826,6 +1893,7 @@ fn handleStreamingGeneration(
         "Access-Control-Allow-Headers: Content-Type, Authorization\r\n" ++
         "\r\n";
     try stream.writeAll(header);
+    logHttpStreamStart("chat.completions");
 
     // First chunk: role announcement
     try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = "assistant", .content = "" }, null, null);
@@ -2226,6 +2294,7 @@ fn handleStreamingGeneration(
     }
 
     // Done sentinel
+    logHttpSseData("[DONE]");
     try stream.writeAll("data: [DONE]\n\n");
 
     const decode_ns = timer.read();
@@ -2312,6 +2381,7 @@ fn sendSSEChunk(
     defer allocator.free(chunk);
 
     // Write as SSE event
+    logHttpSseData(chunk);
     try stream.writeAll("data: ");
     try stream.writeAll(chunk);
     try stream.writeAll("\n\n");
@@ -2405,6 +2475,8 @@ fn updateCachedPrompt(allocator: std.mem.Allocator, prompt_ids: []const u32, has
 }
 
 fn sendResponse(stream: std.net.Stream, status: []const u8, content_type: []const u8, body: []const u8) !void {
+    logHttpResponse(status, content_type, body);
+
     var hdr_buf: [512]u8 = undefined;
     const hdr = std.fmt.bufPrint(&hdr_buf, "HTTP/1.1 {s}\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: POST, GET, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Authorization\r\n\r\n", .{
         status,
@@ -2413,6 +2485,44 @@ fn sendResponse(stream: std.net.Stream, status: []const u8, content_type: []cons
     }) catch return error.Overflow;
     try stream.writeAll(hdr);
     if (body.len > 0) try stream.writeAll(body);
+}
+
+fn logHttpRequest(method: []const u8, path: []const u8, body: []const u8) void {
+    if (!log.isDebug()) return;
+    log.debug("[http] -> {s} {s} body={d}b\n", .{ method, path, body.len });
+    logHttpBody("[http] request body", body);
+}
+
+fn logHttpResponse(status: []const u8, content_type: []const u8, body: []const u8) void {
+    if (!log.isDebug()) return;
+    log.debug("[http] <- {s} {s} body={d}b\n", .{ status, content_type, body.len });
+    logHttpBody("[http] response body", body);
+}
+
+fn logHttpStreamStart(kind: []const u8) void {
+    if (!log.isDebug()) return;
+    log.debug("[http] <- 200 OK text/event-stream ({s})\n", .{kind});
+}
+
+fn logHttpSseEvent(event_name: []const u8, data: []const u8) void {
+    if (!log.isDebug()) return;
+    log.debug("[http] <- sse event={s} data={d}b\n", .{ event_name, data.len });
+    logHttpBody("[http] sse data", data);
+}
+
+fn logHttpSseData(data: []const u8) void {
+    if (!log.isDebug()) return;
+    log.debug("[http] <- sse data={d}b\n", .{data.len});
+    logHttpBody("[http] sse data", data);
+}
+
+fn logHttpBody(label: []const u8, body: []const u8) void {
+    if (body.len == 0) return;
+    log.debug("{s} ({d}b):\n{s}\n", .{
+        label,
+        body.len,
+        body,
+    });
 }
 
 fn findContentLength(headers: []const u8) ?usize {
@@ -2777,6 +2887,48 @@ fn insertImageTokens(allocator: std.mem.Allocator, prompt_ids: []const u32, imag
 
 /// Decode a JPEG/PNG image buffer to float32 CHW pixels, resized to target_size.
 /// Uses stb_image for decoding, then nearest-neighbor resize + CHW conversion.
+/// Decode an image content URL into preprocessed float32 CHW pixels. Supports:
+///   data:image/x-mlx-pixels;base64,... (already-preprocessed float32 CHW)
+///   data:image/jpeg|png|webp|...;base64,... (decoded + resized via stb_image / libwebp)
+/// Returns null on any decode failure (caller treats as missing image).
+fn parseImageUrlContent(allocator: std.mem.Allocator, url: []const u8) ?chat_mod.ImageData {
+    const sep = std.mem.indexOf(u8, url, ";base64,") orelse return null;
+    const b64_data = url[sep + 8 ..];
+    const decoded_size = std.base64.standard.Decoder.calcSizeForSlice(b64_data) catch return null;
+    const raw_buf = allocator.alloc(u8, decoded_size) catch return null;
+    std.base64.standard.Decoder.decode(raw_buf, b64_data) catch {
+        allocator.free(raw_buf);
+        return null;
+    };
+
+    const mime = url[0..sep];
+    if (std.mem.eql(u8, mime, "data:image/x-mlx-pixels")) {
+        // Already preprocessed float32 CHW pixels
+        const n_pixels = raw_buf.len / 4;
+        const per_channel = n_pixels / 3;
+        const side = std.math.sqrt(per_channel);
+        if (side * side == per_channel and n_pixels == 3 * side * side) {
+            return .{
+                .pixels = raw_buf,
+                .width = @intCast(side),
+                .height = @intCast(side),
+            };
+        }
+        allocator.free(raw_buf);
+        return null;
+    }
+
+    if (std.mem.startsWith(u8, mime, "data:image/")) {
+        // JPEG/PNG/WebP — decode + resize + convert to float32 CHW
+        const img = decodeImageToPixels(allocator, raw_buf);
+        allocator.free(raw_buf);
+        return img;
+    }
+
+    allocator.free(raw_buf);
+    return null;
+}
+
 fn decodeImageToPixels(allocator: std.mem.Allocator, encoded: []const u8) ?chat_mod.ImageData {
     const target: u32 = 768; // Gemma 4 default for square images
 
@@ -2877,6 +3029,7 @@ fn sendAnthropicError(allocator: std.mem.Allocator, stream: std.net.Stream, err_
 }
 
 fn sendAnthropicEvent(stream: std.net.Stream, event_name: []const u8, data: []const u8) !void {
+    logHttpSseEvent(event_name, data);
     try stream.writeAll("event: ");
     try stream.writeAll(event_name);
     try stream.writeAll("\ndata: ");
@@ -3515,6 +3668,7 @@ fn handleAnthropicStreaming(
         "Access-Control-Allow-Headers: Content-Type, Authorization, x-api-key, anthropic-version\r\n" ++
         "\r\n";
     try stream.writeAll(header);
+    logHttpStreamStart("anthropic.messages");
 
     // message_start
     {
@@ -3968,6 +4122,823 @@ fn closeAnthropicThinkingBlock(allocator: std.mem.Allocator, stream: std.net.Str
     try sendAnthropicEvent(stream, "content_block_stop", stop);
 }
 
+// ─── /v1/responses (OpenAI Responses API) ────────────────────────────────
+
+fn handleResponsesGet(allocator: std.mem.Allocator, stream: std.net.Stream, id: []const u8) !void {
+    const store = getOrInitResponseStore(allocator);
+    if (store.get(id)) |sr| {
+        try sendResponse(stream, "200 OK", "application/json", sr.body_json);
+    } else {
+        try sendErrorResponse(allocator, stream, "404 Not Found", "not_found", "Response not found", 404);
+    }
+}
+
+fn handleResponsesDelete(allocator: std.mem.Allocator, stream: std.net.Stream, id: []const u8) !void {
+    const store = getOrInitResponseStore(allocator);
+    if (store.delete(id)) {
+        const esc_id = try jsonEscape(allocator, id);
+        defer allocator.free(esc_id);
+        const body = try std.fmt.allocPrint(allocator,
+            \\{{"id":{s},"object":"response","deleted":true}}
+        , .{esc_id});
+        defer allocator.free(body);
+        try sendResponse(stream, "200 OK", "application/json", body);
+    } else {
+        try sendErrorResponse(allocator, stream, "404 Not Found", "not_found", "Response not found", 404);
+    }
+}
+
+
+fn responsesToolExists(tools_val: ?std.json.Value, name: []const u8) bool {
+    const v = tools_val orelse return false;
+    if (v != .array) return false;
+    for (v.array.items) |tool_val| {
+        if (tool_val != .object) continue;
+        const tool = tool_val.object;
+        const t = if (tool.get("type")) |tv| (if (tv == .string) tv.string else "") else "";
+        if (!std.mem.eql(u8, t, "function")) continue;
+        const tool_name = if (tool.get("name")) |nv| (if (nv == .string) nv.string else "") else "";
+        if (std.mem.eql(u8, tool_name, name)) return true;
+    }
+    return false;
+}
+
+fn buildResponsesJsonInstruction(allocator: std.mem.Allocator, schema_val: ?std.json.Value, tools_active: bool) ![]const u8 {
+    var instruction_buf = std.ArrayList(u8).empty;
+    defer instruction_buf.deinit(allocator);
+
+    if (tools_active) {
+        try instruction_buf.appendSlice(allocator, "If you answer without calling a function, respond with valid JSON only. Do not include markdown or explanation outside the JSON. If a function call is needed, call the function instead; this JSON format applies only to final assistant messages. ");
+    } else {
+        try instruction_buf.appendSlice(allocator, "Respond with valid JSON only. No other text, no markdown, no explanation. ");
+    }
+
+    if (schema_val) |sv| {
+        var out: std.io.Writer.Allocating = .init(allocator);
+        defer out.deinit();
+        var jws: std.json.Stringify = .{ .writer = &out.writer, .options = .{} };
+        sv.jsonStringify(&jws) catch {};
+        try instruction_buf.appendSlice(allocator, "Your response MUST conform to this JSON schema:\n");
+        try instruction_buf.appendSlice(allocator, out.written());
+    }
+
+    return try allocator.dupe(u8, instruction_buf.items);
+}
+
+fn shouldInjectResponsesJsonInstruction(wants_json: bool, tools_active: bool, tool_choice_instruction: ?[]const u8) bool {
+    if (!wants_json) return false;
+    if (!tools_active) return true;
+
+    // Required/forced tool calls must keep the prompt focused on tool syntax.
+    // Structured-output instructions apply after the tool result is supplied.
+    return tool_choice_instruction == null;
+}
+
+fn isJsonObjectString(allocator: std.mem.Allocator, text: []const u8) bool {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, text, .{}) catch return false;
+    defer parsed.deinit();
+    return parsed.value == .object;
+}
+
+fn handleResponses(
+    allocator: std.mem.Allocator,
+    stream: std.net.Stream,
+    body: []const u8,
+    xfm: *Transformer,
+    tok: *const Tokenizer,
+    chat_config: *const chat_mod.ChatConfig,
+    config: *const model_mod.ModelConfig,
+) !void {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, body, .{}) catch {
+        log.warn("POST /v1/responses -> 400 (invalid JSON)\n", .{});
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Invalid JSON in request body", 400);
+        return;
+    };
+    defer parsed.deinit();
+    const root = parsed.value.object;
+
+    // ── input (required) ──
+    const input_val = root.get("input") orelse {
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "'input' is a required field", 400);
+        return;
+    };
+
+    // ── instructions ──
+    const instructions: ?[]const u8 = if (root.get("instructions")) |v|
+        (if (v == .string) v.string else null)
+    else
+        null;
+
+    // ── previous_response_id ──
+    const prev_id: ?[]const u8 = if (root.get("previous_response_id")) |v|
+        (if (v == .string) v.string else null)
+    else
+        null;
+
+    // ── store (default true) ──
+    const should_store = if (root.get("store")) |v| (if (v == .bool) v.bool else true) else true;
+
+    // ── streaming ──
+    const is_stream = if (root.get("stream")) |v| (v == .bool and v.bool) else false;
+
+    // ── text.format ──
+    const text_format = responses_mod.parseTextFormat(root.get("text"));
+    const grammar_schema_val: ?std.json.Value = text_format.schema_value;
+    const wants_json = std.mem.eql(u8, text_format.kind, "json_schema") or std.mem.eql(u8, text_format.kind, "json_object");
+    const has_current_tool_output = responses_mod.inputContainsFunctionCallOutput(input_val);
+
+    // ── sampling params ──
+    const max_tokens: u32 = blk: {
+        const v = root.get("max_output_tokens") orelse root.get("max_tokens");
+        break :blk if (v) |val| switch (val) {
+            .integer => |i| @intCast(i),
+            else => if (wants_json) DEFAULT_STRUCTURED_OUTPUT_MAX_TOKENS else DEFAULT_API_MAX_TOKENS,
+        } else if (wants_json) DEFAULT_STRUCTURED_OUTPUT_MAX_TOKENS else DEFAULT_API_MAX_TOKENS;
+    };
+    const temperature = parseJsonFloat(root, "temperature", 1.0, 0.0, 2.0);
+    const top_p = parseJsonFloat(root, "top_p", 1.0, 0.0, 1.0);
+    const top_k: u32 = if (root.get("top_k")) |v| switch (v) {
+        .integer => |i| if (i > 0) @intCast(@min(i, 1000)) else 0,
+        else => 0,
+    } else 0;
+    const repeat_penalty: f32 = blk: {
+        const fp = parseJsonFloat(root, "frequency_penalty", 0.0, 0.0, 2.0);
+        break :blk if (fp > 0.0) 1.0 + fp else 1.0;
+    };
+    const presence_penalty = parseJsonFloat(root, "presence_penalty", 0.0, 0.0, 2.0);
+    const seed: ?u64 = if (root.get("seed")) |v| switch (v) {
+        .integer => |i| @intCast(i),
+        else => null,
+    } else null;
+
+    // ── stop sequences ──
+    var stop_sequences = std.ArrayList([]const u8).empty;
+    defer stop_sequences.deinit(allocator);
+    if (root.get("stop")) |sv| switch (sv) {
+        .string => |s| try stop_sequences.append(allocator, s),
+        .array => |arr| for (arr.items) |it| {
+            if (it == .string) try stop_sequences.append(allocator, it.string);
+        },
+        else => {},
+    };
+
+    // ── reasoning ──
+    // reasoning.budget is parsed but not enforced post-generation in this MVP
+    // pass; thinking truncation happens via finish_reason="length" if the model
+    // overruns max_output_tokens.
+    const reasoning_cfg = responses_mod.parseReasoning(root.get("reasoning"), default_reasoning_budget);
+    const enable_thinking = reasoning_cfg.enable;
+    _ = reasoning_cfg.budget;
+
+    // ── tools ──
+    var tools_json: ?[]const u8 = null;
+    var tools_json_owned = false;
+    defer if (tools_json_owned) {
+        if (tools_json) |tj| allocator.free(tj);
+    };
+    var has_tools = root.get("tools") != null;
+
+    const tool_choice = try responses_mod.parseToolChoice(allocator, root.get("tool_choice"));
+    defer if (tool_choice.instruction) |ins| allocator.free(ins);
+    if (!tool_choice.include_tools) has_tools = false;
+
+    if (has_tools) {
+        if (root.get("tools")) |tools_val| if (tools_val == .array) {
+            const reshaped = try responses_mod.buildToolsJson(allocator, tools_val.array);
+            tools_json = reshaped;
+            tools_json_owned = true;
+            if (reshaped.len <= 2) has_tools = false; // "[]" — no function tools
+        };
+    }
+
+    // Once tool outputs are supplied for a structured-output request, this turn
+    // must produce the final JSON answer. Keeping tools available lets local
+    // models reinterpret schema fields as fake tool calls and loop forever.
+    const final_answer_mode = wants_json and has_current_tool_output;
+    const active_has_tools = has_tools and !final_answer_mode;
+    const active_tools_json: ?[]const u8 = if (active_has_tools) tools_json else null;
+    const active_tool_choice_instruction: ?[]const u8 = if (active_has_tools) tool_choice.instruction else null;
+    if (final_answer_mode and has_tools) {
+        log.info("[responses] final-answer mode - tools disabled after function_call_output\n", .{});
+    }
+
+    // ── model name ──
+    const model_name = if (root.get("model")) |v|
+        (if (v == .string) v.string else config.model_type)
+    else
+        config.model_type;
+
+    // ── previous response — fetch stored history ──
+    var prev_messages: ?[]const chat_mod.Message = null;
+    if (prev_id) |pid| {
+        const store = getOrInitResponseStore(allocator);
+        if (store.get(pid)) |sr| {
+            prev_messages = sr.history;
+        } else {
+            try sendErrorResponse(allocator, stream, "404 Not Found", "not_found", "previous_response_id not found", 404);
+            return;
+        }
+    }
+
+    // ── parse input → messages ──
+    var pi = responses_mod.parseInput(allocator, input_val, instructions, prev_messages, parseImageUrlContent) catch |err| {
+        log.warn("POST /v1/responses -> 400 (input parse: {s})\n", .{@errorName(err)});
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Failed to parse input", 400);
+        return;
+    };
+    defer pi.deinit();
+
+    if (pi.messages.items.len == 0) {
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "No valid messages found in 'input'", 400);
+        return;
+    }
+
+    // ── inject json_schema instruction into system msg (prompt-side belt) ──
+    var rf_allocs = std.ArrayList([]const u8).empty;
+    defer {
+        for (rf_allocs.items) |a| allocator.free(a);
+        rf_allocs.deinit(allocator);
+    }
+    const inject_json_instruction = shouldInjectResponsesJsonInstruction(wants_json, active_has_tools, active_tool_choice_instruction);
+    if (inject_json_instruction) {
+        const owned = try buildResponsesJsonInstruction(allocator, grammar_schema_val, active_has_tools);
+        try rf_allocs.append(allocator, owned);
+        if (pi.messages.items.len > 0 and std.mem.eql(u8, pi.messages.items[0].role, "system")) {
+            const combined = try std.fmt.allocPrint(allocator, "{s}\n\n{s}", .{ pi.messages.items[0].content, owned });
+            try rf_allocs.append(allocator, combined);
+            pi.messages.items[0].content = combined;
+        } else {
+            try pi.messages.insert(allocator, 0, .{ .role = "system", .content = owned });
+        }
+        if (active_has_tools) {
+            log.info("[grammar] injected JSON schema prompt while tools are available (mask deferred for tool calls)\n", .{});
+        }
+    }
+
+    log.info("POST /v1/responses ({d} msgs, max_out={d}, temp={d:.2}, stream={}, thinking={}, prev={?s})\n", .{
+        pi.messages.items.len, max_tokens, temperature, is_stream, enable_thinking, prev_id,
+    });
+
+    // ── format chat template ──
+    var prompt_ids_raw = try chat_mod.formatChat(allocator, tok, pi.messages.items, chat_config, active_tools_json, active_tool_choice_instruction, enable_thinking);
+
+    // ── vision encoder ──
+    if (global_vision_encoder) |ve| {
+        processVisionImages(allocator, ve, xfm, pi.messages.items) catch |err| {
+            log.warn("Vision encoding failed: {}\n", .{err});
+        };
+        if (xfm.vision_embeddings != null) {
+            const ve_shape = mlx.getShape(xfm.vision_embeddings.?);
+            const n_img_tokens: usize = @intCast(ve_shape[1]);
+            const new_ids = try insertImageTokens(allocator, prompt_ids_raw, config.image_token_id, n_img_tokens, config);
+            allocator.free(prompt_ids_raw);
+            prompt_ids_raw = new_ids;
+        }
+    }
+    const prompt_ids = prompt_ids_raw;
+    defer allocator.free(prompt_ids);
+    defer {
+        if (xfm.vision_embeddings) |ve| _ = mlx.mlx_array_free(ve);
+        xfm.vision_embeddings = null;
+    }
+
+    // ── context limit ──
+    const effective_ctx = getEffectiveContextLength(config);
+    if (prompt_ids.len > effective_ctx) {
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Prompt exceeds maximum context length", 400);
+        return;
+    }
+    if (!try checkAttentionMemory(allocator, stream, prompt_ids.len, config, false)) return;
+    const effective_max_tokens = clampMaxTokens(max_tokens, prompt_ids.len);
+
+    // ── KV cache ──
+    const has_images = xfm.vision_embeddings != null;
+    if (has_images) {
+        if (cached_prompt_ids) |old| {
+            allocator.free(old);
+            cached_prompt_ids = null;
+        }
+        try xfm.resetCache();
+    }
+    const cache_result = try reuseKVCache(allocator, xfm, prompt_ids, active_has_tools);
+
+    // ── sampling ──
+    var sampling = generate_mod.SamplingParams{
+        .temperature = temperature,
+        .top_p = top_p,
+        .top_k = top_k,
+        .repeat_penalty = repeat_penalty,
+        .presence_penalty = presence_penalty,
+        .seed = seed,
+    };
+    var sc: generate_mod.SchemaConstraint = undefined;
+    var sc_init = false;
+    defer if (sc_init) sc.deinit();
+    if (grammar_schema_val) |sv| {
+        if (active_has_tools) {
+            log.info("[grammar] skipped JSON schema mask while tools are available (tool calls must remain reachable)\n", .{});
+        } else {
+            const tb = try getOrBuildTokenBytes(allocator, tok);
+            if (sc.initFromValue(allocator, sv, tb)) {
+                sc_init = true;
+                sampling.constraint = &sc.constraint;
+                log.info("[grammar] enforcing JSON schema (vocab={d}, mask={d}b)\n", .{ tb.bytes.len, sc.mask_buf.len });
+            } else |err| {
+                log.warn("[grammar] schema parse failed ({s})\n", .{@errorName(err)});
+            }
+        }
+    }
+
+    // ── pre-allocate response id (used in streaming envelopes too) ──
+    const resp_id = try responses_mod.makeId(allocator, "resp");
+    defer allocator.free(resp_id);
+    const esc_resp_id = try jsonEscape(allocator, resp_id);
+    defer allocator.free(esc_resp_id);
+    const esc_model = try jsonEscape(allocator, model_name);
+    defer allocator.free(esc_model);
+
+    // ── streaming: send SSE headers + response.created + response.in_progress ──
+    if (is_stream) {
+        const sse_headers =
+            "HTTP/1.1 200 OK\r\n" ++
+            "Content-Type: text/event-stream\r\n" ++
+            "Cache-Control: no-cache\r\n" ++
+            "Connection: close\r\n" ++
+            "Access-Control-Allow-Origin: *\r\n" ++
+            "Access-Control-Allow-Methods: POST, GET, OPTIONS\r\n" ++
+            "Access-Control-Allow-Headers: Content-Type, Authorization\r\n" ++
+            "\r\n";
+        try stream.writeAll(sse_headers);
+        logHttpStreamStart("responses");
+
+        // Skeleton envelope (status:in_progress, output:[])
+        const skel = try buildResponsesEnvelope(allocator, esc_resp_id, esc_model, "in_progress", "[]", 0, 0, should_store, prev_id, false);
+        defer allocator.free(skel);
+        const created_payload = try std.fmt.allocPrint(allocator, "{{\"type\":\"response.created\",\"response\":{s}}}", .{skel});
+        defer allocator.free(created_payload);
+        try sendAnthropicEvent(stream, "response.created", created_payload);
+        const ip_payload = try std.fmt.allocPrint(allocator, "{{\"type\":\"response.in_progress\",\"response\":{s}}}", .{skel});
+        defer allocator.free(ip_payload);
+        try sendAnthropicEvent(stream, "response.in_progress", ip_payload);
+    }
+
+    // ── generate ──
+    const eos_slice = config.eosTokenSlice();
+    var result = try generate_mod.generate(allocator, xfm, tok, cache_result.new_tokens, effective_max_tokens, sampling, eos_slice, getTimeoutNs(), 0);
+    result.prompt_tokens += cache_result.cached_tokens;
+    defer allocator.free(result.text);
+    defer allocator.free(result.token_ids);
+
+    // pad-only detection (KV cache hygiene)
+    if (result.token_ids.len > 0) {
+        var all_pad = true;
+        for (result.token_ids) |tid| {
+            if (tid != 0) { all_pad = false; break; }
+        }
+        last_generation_was_pad = all_pad;
+    }
+
+    // ── apply stop sequences ──
+    var final_text: []const u8 = result.text;
+    var finish_reason = result.finish_reason;
+    for (stop_sequences.items) |stop_seq| {
+        if (std.mem.indexOf(u8, final_text, stop_seq)) |idx| {
+            final_text = final_text[0..idx];
+            finish_reason = "stop";
+            break;
+        }
+    }
+
+    const status_str: []const u8 = if (std.mem.eql(u8, finish_reason, "length")) "incomplete" else "completed";
+
+    // ── split thinking & tool calls ──
+    const think_split = chat_mod.splitThinkBlock(final_text, enable_thinking);
+    const reasoning_text: ?[]const u8 = if (enable_thinking) think_split.reasoning_content else null;
+    const visible_text: []const u8 = if (enable_thinking) think_split.content else chat_mod.stripThinkBlock(final_text);
+
+    var tool_calls: ?[]chat_mod.ParsedToolCall = null;
+    if (active_has_tools) {
+        tool_calls = try chat_mod.parseToolCalls(allocator, final_text);
+    }
+    defer if (tool_calls) |tcs| {
+        for (tcs) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(tcs);
+    };
+
+    // ── build output[] array (shared between streaming + non-streaming) ──
+    var out_buf = std.ArrayList(u8).empty;
+    defer out_buf.deinit(allocator);
+    try out_buf.append(allocator, '[');
+    var emitted: usize = 0;
+    var output_index: u32 = 0;
+    var emitted_tool_calls = std.ArrayList(chat_mod.ToolCall).empty;
+    defer {
+        for (emitted_tool_calls.items) |tc| allocator.free(tc.id);
+        emitted_tool_calls.deinit(allocator);
+    }
+
+    if (reasoning_text) |rt| if (rt.len > 0) {
+        const rid = try responses_mod.makeId(allocator, "rs");
+        defer allocator.free(rid);
+        if (emitted > 0) try out_buf.append(allocator, ',');
+        try responses_mod.appendReasoningItem(allocator, &out_buf, rid, rt);
+        emitted += 1;
+        if (is_stream) {
+            try emitResponsesReasoningEvents(allocator, stream, output_index, rid, rt);
+        }
+        output_index += 1;
+    };
+
+    if (tool_calls) |tcs| if (tcs.len > 0) {
+        for (tcs) |tc| {
+            if (!responsesToolExists(root.get("tools"), tc.name)) {
+                log.warn("[responses] dropping undeclared tool call: {s}\n", .{tc.name});
+                continue;
+            }
+            if (!isJsonObjectString(allocator, tc.arguments)) {
+                log.warn("[responses] dropping tool call with non-object arguments: {s}\n", .{tc.name});
+                continue;
+            }
+            const fc_id = try responses_mod.makeId(allocator, "fc");
+            defer allocator.free(fc_id);
+            const call_id = try responses_mod.makeId(allocator, "call");
+            defer allocator.free(call_id);
+            const stored_call_id = try allocator.dupe(u8, call_id);
+            emitted_tool_calls.append(allocator, .{ .id = stored_call_id, .name = tc.name, .arguments = tc.arguments }) catch |err| {
+                allocator.free(stored_call_id);
+                return err;
+            };
+            if (emitted > 0) try out_buf.append(allocator, ',');
+            try responses_mod.appendFunctionCallItem(allocator, &out_buf, fc_id, call_id, tc.name, tc.arguments);
+            emitted += 1;
+            if (is_stream) {
+                try emitResponsesFunctionCallEvents(allocator, stream, output_index, fc_id, call_id, tc.name, tc.arguments);
+            }
+            output_index += 1;
+        }
+    };
+
+    const has_tool_calls = emitted_tool_calls.items.len > 0;
+    if (!has_tool_calls) {
+        const mid = try responses_mod.makeId(allocator, "msg");
+        defer allocator.free(mid);
+        if (emitted > 0) try out_buf.append(allocator, ',');
+        try responses_mod.appendOutputTextMessage(allocator, &out_buf, mid, visible_text);
+        emitted += 1;
+        if (is_stream) {
+            try emitResponsesMessageEvents(allocator, stream, output_index, mid, visible_text);
+        }
+        output_index += 1;
+    }
+
+    try out_buf.append(allocator, ']');
+
+    // ── envelope ──
+    const envelope = try buildResponsesEnvelope(
+        allocator,
+        esc_resp_id,
+        esc_model,
+        status_str,
+        out_buf.items,
+        result.prompt_tokens,
+        result.completion_tokens,
+        should_store,
+        prev_id,
+        std.mem.eql(u8, status_str, "incomplete"),
+    );
+    defer allocator.free(envelope);
+
+    // ── store response ──
+    if (should_store) {
+        const stored_tool_calls: ?[]const chat_mod.ToolCall = if (emitted_tool_calls.items.len > 0) emitted_tool_calls.items else null;
+        storeResponse(allocator, resp_id, model_name, status_str, envelope, pi.messages.items, visible_text, reasoning_text, stored_tool_calls) catch |err| {
+            log.warn("[responses] store failed: {s}\n", .{@errorName(err)});
+        };
+    }
+
+    if (is_stream) {
+        const completed_payload = try std.fmt.allocPrint(allocator, "{{\"type\":\"response.completed\",\"response\":{s}}}", .{envelope});
+        defer allocator.free(completed_payload);
+        try sendAnthropicEvent(stream, "response.completed", completed_payload);
+    } else {
+        try sendResponse(stream, "200 OK", "application/json", envelope);
+    }
+
+    // KV cache update (mirrors chat-completions)
+    if (last_generation_was_pad) {
+        try xfm.resetCache();
+        if (cached_prompt_ids) |old| {
+            allocator.free(old);
+            cached_prompt_ids = null;
+        }
+    } else {
+        updateCachedPrompt(allocator, prompt_ids, active_has_tools);
+    }
+}
+
+/// Build the Responses envelope JSON body. Used for both the response.created
+/// skeleton (in_progress, output:[]) and the final response.completed body.
+fn buildResponsesEnvelope(
+    allocator: std.mem.Allocator,
+    esc_resp_id: []const u8,
+    esc_model: []const u8,
+    status_str: []const u8,
+    output_json: []const u8,
+    input_tokens: u32,
+    output_tokens: u32,
+    should_store: bool,
+    prev_id: ?[]const u8,
+    incomplete: bool,
+) ![]const u8 {
+    const incomplete_json: []const u8 = if (incomplete)
+        ",\"incomplete_details\":{\"reason\":\"max_output_tokens\"}"
+    else
+        ",\"incomplete_details\":null";
+
+    var prev_field: []const u8 = ",\"previous_response_id\":null";
+    var prev_owned = false;
+    if (prev_id) |pid| {
+        const esc_pid = try jsonEscape(allocator, pid);
+        defer allocator.free(esc_pid);
+        prev_field = try std.fmt.allocPrint(allocator, ",\"previous_response_id\":{s}", .{esc_pid});
+        prev_owned = true;
+    }
+    defer if (prev_owned) allocator.free(prev_field);
+
+    return try std.fmt.allocPrint(allocator,
+        \\{{"id":{s},"object":"response","created_at":{d},"status":"{s}","model":{s},"output":{s},"usage":{{"input_tokens":{d},"output_tokens":{d},"total_tokens":{d}}},"store":{}{s}{s}}}
+    , .{
+        esc_resp_id,
+        std.time.timestamp(),
+        status_str,
+        esc_model,
+        output_json,
+        input_tokens,
+        output_tokens,
+        input_tokens + output_tokens,
+        should_store,
+        prev_field,
+        incomplete_json,
+    });
+}
+
+/// Emit the SSE event sequence for a reasoning output item: output_item.added,
+/// reasoning_summary_part.added, reasoning_summary_text.delta (single delta),
+/// .done, summary_part.done, output_item.done.
+fn emitResponsesReasoningEvents(
+    allocator: std.mem.Allocator,
+    stream: std.net.Stream,
+    output_index: u32,
+    item_id: []const u8,
+    reasoning_text: []const u8,
+) !void {
+    const esc_id = try jsonEscape(allocator, item_id);
+    defer allocator.free(esc_id);
+    const esc_text = try jsonEscape(allocator, reasoning_text);
+    defer allocator.free(esc_text);
+
+    {
+        const item_added = try std.fmt.allocPrint(allocator,
+            \\{{"type":"response.output_item.added","output_index":{d},"item":{{"type":"reasoning","id":{s},"summary":[]}}}}
+        , .{ output_index, esc_id });
+        defer allocator.free(item_added);
+        try sendAnthropicEvent(stream, "response.output_item.added", item_added);
+    }
+    {
+        const part_added = try std.fmt.allocPrint(allocator,
+            \\{{"type":"response.reasoning_summary_part.added","item_id":{s},"output_index":{d},"summary_index":0,"part":{{"type":"summary_text","text":""}}}}
+        , .{ esc_id, output_index });
+        defer allocator.free(part_added);
+        try sendAnthropicEvent(stream, "response.reasoning_summary_part.added", part_added);
+    }
+    {
+        const delta = try std.fmt.allocPrint(allocator,
+            \\{{"type":"response.reasoning_summary_text.delta","item_id":{s},"output_index":{d},"summary_index":0,"delta":{s}}}
+        , .{ esc_id, output_index, esc_text });
+        defer allocator.free(delta);
+        try sendAnthropicEvent(stream, "response.reasoning_summary_text.delta", delta);
+    }
+    {
+        const done = try std.fmt.allocPrint(allocator,
+            \\{{"type":"response.reasoning_summary_text.done","item_id":{s},"output_index":{d},"summary_index":0,"text":{s}}}
+        , .{ esc_id, output_index, esc_text });
+        defer allocator.free(done);
+        try sendAnthropicEvent(stream, "response.reasoning_summary_text.done", done);
+    }
+    {
+        const part_done = try std.fmt.allocPrint(allocator,
+            \\{{"type":"response.reasoning_summary_part.done","item_id":{s},"output_index":{d},"summary_index":0,"part":{{"type":"summary_text","text":{s}}}}}
+        , .{ esc_id, output_index, esc_text });
+        defer allocator.free(part_done);
+        try sendAnthropicEvent(stream, "response.reasoning_summary_part.done", part_done);
+    }
+    {
+        const item_done = try std.fmt.allocPrint(allocator,
+            \\{{"type":"response.output_item.done","output_index":{d},"item":{{"type":"reasoning","id":{s},"summary":[{{"type":"summary_text","text":{s}}}]}}}}
+        , .{ output_index, esc_id, esc_text });
+        defer allocator.free(item_done);
+        try sendAnthropicEvent(stream, "response.output_item.done", item_done);
+    }
+}
+
+/// Emit the SSE event sequence for a function_call output item: output_item.added,
+/// function_call_arguments.delta (single full-args delta), .done, output_item.done.
+fn emitResponsesFunctionCallEvents(
+    allocator: std.mem.Allocator,
+    stream: std.net.Stream,
+    output_index: u32,
+    fc_id: []const u8,
+    call_id: []const u8,
+    name: []const u8,
+    arguments_json: []const u8,
+) !void {
+    const esc_id = try jsonEscape(allocator, fc_id);
+    defer allocator.free(esc_id);
+    const esc_call = try jsonEscape(allocator, call_id);
+    defer allocator.free(esc_call);
+    const esc_name = try jsonEscape(allocator, name);
+    defer allocator.free(esc_name);
+    const esc_args = try jsonEscape(allocator, arguments_json);
+    defer allocator.free(esc_args);
+
+    {
+        const item_added = try std.fmt.allocPrint(allocator,
+            \\{{"type":"response.output_item.added","output_index":{d},"item":{{"type":"function_call","id":{s},"call_id":{s},"name":{s},"arguments":"","status":"in_progress"}}}}
+        , .{ output_index, esc_id, esc_call, esc_name });
+        defer allocator.free(item_added);
+        try sendAnthropicEvent(stream, "response.output_item.added", item_added);
+    }
+    {
+        const delta = try std.fmt.allocPrint(allocator,
+            \\{{"type":"response.function_call_arguments.delta","item_id":{s},"output_index":{d},"delta":{s}}}
+        , .{ esc_id, output_index, esc_args });
+        defer allocator.free(delta);
+        try sendAnthropicEvent(stream, "response.function_call_arguments.delta", delta);
+    }
+    {
+        const done = try std.fmt.allocPrint(allocator,
+            \\{{"type":"response.function_call_arguments.done","item_id":{s},"output_index":{d},"arguments":{s}}}
+        , .{ esc_id, output_index, esc_args });
+        defer allocator.free(done);
+        try sendAnthropicEvent(stream, "response.function_call_arguments.done", done);
+    }
+    {
+        const item_done = try std.fmt.allocPrint(allocator,
+            \\{{"type":"response.output_item.done","output_index":{d},"item":{{"type":"function_call","id":{s},"call_id":{s},"name":{s},"arguments":{s},"status":"completed"}}}}
+        , .{ output_index, esc_id, esc_call, esc_name, esc_args });
+        defer allocator.free(item_done);
+        try sendAnthropicEvent(stream, "response.output_item.done", item_done);
+    }
+}
+
+/// Emit the SSE event sequence for a message output item: output_item.added,
+/// content_part.added, output_text.delta (single full-text delta), .done,
+/// content_part.done, output_item.done.
+fn emitResponsesMessageEvents(
+    allocator: std.mem.Allocator,
+    stream: std.net.Stream,
+    output_index: u32,
+    item_id: []const u8,
+    text: []const u8,
+) !void {
+    const esc_id = try jsonEscape(allocator, item_id);
+    defer allocator.free(esc_id);
+    const esc_text = try jsonEscape(allocator, text);
+    defer allocator.free(esc_text);
+
+    {
+        const item_added = try std.fmt.allocPrint(allocator,
+            \\{{"type":"response.output_item.added","output_index":{d},"item":{{"type":"message","id":{s},"role":"assistant","status":"in_progress","content":[]}}}}
+        , .{ output_index, esc_id });
+        defer allocator.free(item_added);
+        try sendAnthropicEvent(stream, "response.output_item.added", item_added);
+    }
+    {
+        const part_added = try std.fmt.allocPrint(allocator,
+            \\{{"type":"response.content_part.added","item_id":{s},"output_index":{d},"content_index":0,"part":{{"type":"output_text","text":"","annotations":[]}}}}
+        , .{ esc_id, output_index });
+        defer allocator.free(part_added);
+        try sendAnthropicEvent(stream, "response.content_part.added", part_added);
+    }
+    {
+        const delta = try std.fmt.allocPrint(allocator,
+            \\{{"type":"response.output_text.delta","item_id":{s},"output_index":{d},"content_index":0,"delta":{s}}}
+        , .{ esc_id, output_index, esc_text });
+        defer allocator.free(delta);
+        try sendAnthropicEvent(stream, "response.output_text.delta", delta);
+    }
+    {
+        const done = try std.fmt.allocPrint(allocator,
+            \\{{"type":"response.output_text.done","item_id":{s},"output_index":{d},"content_index":0,"text":{s}}}
+        , .{ esc_id, output_index, esc_text });
+        defer allocator.free(done);
+        try sendAnthropicEvent(stream, "response.output_text.done", done);
+    }
+    {
+        const part_done = try std.fmt.allocPrint(allocator,
+            \\{{"type":"response.content_part.done","item_id":{s},"output_index":{d},"content_index":0,"part":{{"type":"output_text","text":{s},"annotations":[]}}}}
+        , .{ esc_id, output_index, esc_text });
+        defer allocator.free(part_done);
+        try sendAnthropicEvent(stream, "response.content_part.done", part_done);
+    }
+    {
+        const item_done = try std.fmt.allocPrint(allocator,
+            \\{{"type":"response.output_item.done","output_index":{d},"item":{{"type":"message","id":{s},"role":"assistant","status":"completed","content":[{{"type":"output_text","text":{s},"annotations":[]}}]}}}}
+        , .{ output_index, esc_id, esc_text });
+        defer allocator.free(item_done);
+        try sendAnthropicEvent(stream, "response.output_item.done", item_done);
+    }
+}
+
+/// Persist a finished response to the in-memory store. The stored history is
+/// the input messages plus the assistant turn, deep-copied into the entry's
+/// arena so it stays valid across the request that produced it.
+fn storeResponse(
+    gpa: std.mem.Allocator,
+    resp_id: []const u8,
+    model_name: []const u8,
+    status_str: []const u8,
+    body_json: []const u8,
+    input_messages: []const chat_mod.Message,
+    visible_text: []const u8,
+    reasoning_text: ?[]const u8,
+    tool_calls: ?[]const chat_mod.ToolCall,
+) !void {
+    const sr = try gpa.create(responses_mod.StoredResponse);
+    errdefer gpa.destroy(sr);
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    errdefer arena.deinit();
+    const a = arena.allocator();
+
+    // Build the assistant message that produced this response.
+    var assistant_text_parts = std.ArrayList(u8).empty;
+    defer assistant_text_parts.deinit(a);
+    if (reasoning_text) |rt| {
+        try assistant_text_parts.appendSlice(a, "<think>");
+        try assistant_text_parts.appendSlice(a, rt);
+        try assistant_text_parts.appendSlice(a, "</think>");
+    }
+    try assistant_text_parts.appendSlice(a, visible_text);
+    const assistant_content = try a.dupe(u8, assistant_text_parts.items);
+
+    var assistant_tool_calls: ?[]chat_mod.ToolCall = null;
+    if (tool_calls) |tcs| if (tcs.len > 0) {
+        const arr = try a.alloc(chat_mod.ToolCall, tcs.len);
+        for (tcs, 0..) |tc, i| {
+            arr[i] = .{
+                .id = try a.dupe(u8, tc.id),
+                .name = try a.dupe(u8, tc.name),
+                .arguments = try a.dupe(u8, tc.arguments),
+            };
+        }
+        assistant_tool_calls = arr;
+    };
+
+    // Deep-copy input messages.
+    const total_msgs = input_messages.len + 1; // +1 for assistant turn
+    const history = try a.alloc(chat_mod.Message, total_msgs);
+    for (input_messages, 0..) |m, i| {
+        history[i] = .{
+            .role = try a.dupe(u8, m.role),
+            .content = try a.dupe(u8, m.content),
+            .tool_call_id = if (m.tool_call_id) |tid| try a.dupe(u8, tid) else null,
+            .tool_calls = if (m.tool_calls) |tcs| blk: {
+                const copied = try a.alloc(chat_mod.ToolCall, tcs.len);
+                for (tcs, 0..) |tc, j| copied[j] = .{
+                    .id = try a.dupe(u8, tc.id),
+                    .name = try a.dupe(u8, tc.name),
+                    .arguments = try a.dupe(u8, tc.arguments),
+                };
+                break :blk copied;
+            } else null,
+            // images: not preserved across requests (would require deep-copying pixel buffers).
+            .images = null,
+        };
+    }
+    history[total_msgs - 1] = .{
+        .role = try a.dupe(u8, "assistant"),
+        .content = assistant_content,
+        .tool_calls = assistant_tool_calls,
+    };
+
+    sr.* = .{
+        .id = try a.dupe(u8, resp_id),
+        .created_at = std.time.timestamp(),
+        .model = try a.dupe(u8, model_name),
+        .status = try a.dupe(u8, status_str),
+        .body_json = try a.dupe(u8, body_json),
+        .history = history,
+        .arena = arena,
+    };
+    errdefer sr.deinit();
+
+    const store = getOrInitResponseStore(gpa);
+    try store.put(sr);
+}
+
 // ── Tests ──
 
 const testing = std.testing;
@@ -4184,4 +5155,63 @@ test "getTimeoutNs computes correctly" {
 
     request_timeout_sec = 0;
     try testing.expectEqual(@as(u64, 0), getTimeoutNs());
+}
+
+
+test "responsesToolExists validates Responses function tool names" {
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator,
+        \\[{"type":"function","name":"smartSearch","parameters":{}},{"type":"web_search"}]
+    , .{});
+    defer parsed.deinit();
+
+    try testing.expect(responsesToolExists(parsed.value, "smartSearch"));
+    try testing.expect(!responsesToolExists(parsed.value, "cruise_cards"));
+}
+
+test "buildResponsesJsonInstruction scopes schema prompt when tools are active" {
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator,
+        \\{"type":"object","properties":{"blocks":{"type":"array"}},"required":["blocks"]}
+    , .{});
+    defer parsed.deinit();
+
+    const with_tools = try buildResponsesJsonInstruction(testing.allocator, parsed.value, true);
+    defer testing.allocator.free(with_tools);
+    try testing.expect(std.mem.indexOf(u8, with_tools, "If you answer without calling a function") != null);
+    try testing.expect(std.mem.indexOf(u8, with_tools, "function call is needed") != null);
+    try testing.expect(std.mem.indexOf(u8, with_tools, "\"blocks\"") != null);
+
+    const without_tools = try buildResponsesJsonInstruction(testing.allocator, parsed.value, false);
+    defer testing.allocator.free(without_tools);
+    try testing.expect(std.mem.indexOf(u8, without_tools, "Respond with valid JSON only") != null);
+    try testing.expect(std.mem.indexOf(u8, without_tools, "without calling a function") == null);
+}
+
+test "shouldInjectResponsesJsonInstruction skips required tool turns" {
+    try testing.expect(!shouldInjectResponsesJsonInstruction(false, false, null));
+    try testing.expect(shouldInjectResponsesJsonInstruction(true, false, null));
+    try testing.expect(shouldInjectResponsesJsonInstruction(true, true, null));
+    try testing.expect(!shouldInjectResponsesJsonInstruction(true, true, "required"));
+}
+
+test "deinitGlobalResponseStore frees stored responses" {
+    deinitGlobalResponseStore();
+    defer deinitGlobalResponseStore();
+
+    const messages = [_]chat_mod.Message{.{ .role = "user", .content = "hi" }};
+    try storeResponse(testing.allocator, "resp_test", "mlx-serve", "completed", "{}", &messages, "hello", null, null);
+
+    if (global_response_store) |*store| {
+        try testing.expectEqual(@as(usize, 1), store.map.count());
+    } else {
+        return error.TestUnexpectedResult;
+    }
+
+    deinitGlobalResponseStore();
+    try testing.expect(global_response_store == null);
+}
+
+test "isJsonObjectString only accepts JSON objects" {
+    try testing.expect(isJsonObjectString(testing.allocator, "{\"destination\":\"CARIBBEAN\"}"));
+    try testing.expect(!isJsonObjectString(testing.allocator, "[]"));
+    try testing.expect(!isJsonObjectString(testing.allocator, "not-json"));
 }
