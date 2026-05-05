@@ -215,6 +215,18 @@ var request_timeout_sec: u32 = 300;
 /// Default reasoning budget in tokens (-1 = unlimited). Set by --reasoning-budget flag.
 var default_reasoning_budget: i32 = -1;
 
+/// Default MTP enabled state. Set by --mtp / --no-mtp flag at server startup.
+/// Per-request `enable_mtp` JSON field overrides this default.
+var default_enable_mtp: bool = false;
+
+/// Default PLD (Prompt Lookup Decoding) enabled state. Set by --pld /
+/// --no-pld at startup. Per-request `enable_pld` JSON field overrides.
+/// MTP, when active, takes priority over PLD on a per-request basis (a model
+/// with native MTP weights gets the higher-quality draft).
+var default_enable_pld: bool = false;
+var default_pld_draft_len: u32 = 5;
+var default_pld_key_len: u32 = 3;
+
 fn getTimeoutNs() u64 {
     if (request_timeout_sec == 0) return 0;
     return @as(u64, request_timeout_sec) * std.time.ns_per_s;
@@ -301,11 +313,19 @@ pub fn serve(
     ctx_size: u32,
     timeout: u32,
     reasoning_budget: i32,
+    enable_mtp: bool,
+    enable_pld: bool,
+    pld_draft_len: u32,
+    pld_key_len: u32,
 ) !void {
     global_vision_encoder = vision_encoder;
     max_context_size = ctx_size;
     request_timeout_sec = timeout;
     default_reasoning_budget = reasoning_budget;
+    default_enable_mtp = enable_mtp;
+    default_enable_pld = enable_pld;
+    default_pld_draft_len = pld_draft_len;
+    default_pld_key_len = pld_key_len;
     global_port = port;
     // Use the directory basename as the public model id (e.g. "gemma-4-e4b-it-8bit").
     // Trim any trailing slash, then take everything after the final slash. Falls
@@ -362,6 +382,12 @@ pub fn serve(
         log.info("Reasoning budget: {d} tokens\n", .{default_reasoning_budget});
     } else {
         log.info("Reasoning budget: unlimited\n", .{});
+    }
+    if (default_enable_mtp) {
+        log.info("MTP speculative decoding: ENABLED (default for new requests)\n", .{});
+    }
+    if (default_enable_pld) {
+        log.info("PLD speculative decoding: ENABLED (draft_len={d}, key_len={d}; default for new requests)\n", .{ default_pld_draft_len, default_pld_key_len });
     }
     log.info("\nServer listening on http://{s}:{d}\n", .{ host, port });
     log.info("  GET  /\n", .{});
@@ -1593,6 +1619,54 @@ fn handleChatCompletions(
         else => default_reasoning_budget,
     } else default_reasoning_budget;
 
+    // Parse enable_mtp: per-request override of the --mtp default. Auto-disabled
+    // when tools are present in the request — tool-call buffering is incompatible
+    // with the multi-token verify path in v1 (see Phase 6 plan).
+    var enable_mtp: bool = if (root.get("enable_mtp")) |v|
+        (v == .bool and v.bool)
+    else
+        default_enable_mtp;
+    if (enable_mtp and !xfm.config.has_mtp) {
+        enable_mtp = false; // model has no MTP head; quietly run without speculation
+    }
+    if (enable_mtp and has_tools) {
+        log.info("  mtp=disabled (tools present)\n", .{});
+        enable_mtp = false;
+    }
+    // TODO(Phase 5c): thread `enable_mtp` into handleStreaming/NonStreamingGeneration
+    // and on into the Generator. For now, log resolved value so /props observers
+    // can see it.
+    if (enable_mtp) log.info("  mtp=enabled\n", .{});
+
+    // Parse enable_pld: per-request override of the --pld default. Auto-disabled
+    // when MTP is winning the priority race (the model has native MTP weights
+    // AND MTP was selected for this request — MTP's drafts are higher-quality
+    // for that one model). Also disabled when tools/logprobs/streaming would
+    // be incompatible with multi-token verify (mirrors MTP's gates).
+    var enable_pld: bool = if (root.get("enable_pld")) |v|
+        (v == .bool and v.bool)
+    else
+        default_enable_pld;
+    if (enable_pld and enable_mtp) {
+        // Both eligible; prefer MTP for the one model that ships MTP weights.
+        log.info("  pld=disabled (mtp takes priority for this request)\n", .{});
+        enable_pld = false;
+    }
+    if (enable_pld and has_tools) {
+        log.info("  pld=disabled (tools present)\n", .{});
+        enable_pld = false;
+    }
+    if (enable_pld and xfm.config.has_hybrid_layers) {
+        // Hybrid SSM models (LFM2.5, Nemotron-H) hit an mlx_array error on
+        // the multi-token verify forward — the SSM update path has length-1
+        // assumptions that don't hold for length-(1+m) decode. Falling back
+        // to single-token decode preserves correctness; full hybrid PLD is
+        // a v2 task. Logged at info level so users see why.
+        log.info("  pld=disabled (hybrid SSM architecture not yet supported for multi-token verify)\n", .{});
+        enable_pld = false;
+    }
+    if (enable_pld) log.info("  pld=enabled (draft_len={d}, key_len={d})\n", .{ default_pld_draft_len, default_pld_key_len });
+
     // Log the request
     const last_msg = messages.items[messages.items.len - 1];
     const preview_len = @min(last_msg.content.len, 80);
@@ -1705,7 +1779,7 @@ fn handleChatCompletions(
     }
 
     if (is_stream) {
-        handleStreamingGeneration(allocator, stream, xfm, tok, cache_result.new_tokens, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, include_usage, has_tools, cache_result.cached_tokens, logprobs_n, enable_thinking, reasoning_budget) catch |err| {
+        handleStreamingGeneration(allocator, stream, xfm, tok, cache_result.new_tokens, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, include_usage, has_tools, cache_result.cached_tokens, logprobs_n, enable_thinking, reasoning_budget, enable_mtp, enable_pld) catch |err| {
             log.err("  -> streaming error: {}\n", .{err});
             // Send SSE error event so the client gets a proper error instead of a dropped connection
             const err_chunk = std.fmt.allocPrint(allocator,
@@ -1716,7 +1790,7 @@ fn handleChatCompletions(
             stream.writeAll("\n\ndata: [DONE]\n\n") catch {};
         };
     } else {
-        handleNonStreamingGeneration(allocator, stream, xfm, tok, cache_result.new_tokens, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, cache_result.cached_tokens, logprobs_n, enable_thinking, reasoning_budget) catch |err| {
+        handleNonStreamingGeneration(allocator, stream, xfm, tok, cache_result.new_tokens, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, cache_result.cached_tokens, logprobs_n, enable_thinking, reasoning_budget, enable_mtp, enable_pld) catch |err| {
             log.err("  -> 500 ({s})\n", .{@errorName(err)});
             sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", @errorName(err), 500) catch {};
         };
@@ -2107,10 +2181,26 @@ fn handleNonStreamingGeneration(
     logprobs_n: u32,
     enable_thinking: bool,
     reasoning_budget: i32,
+    enable_mtp: bool,
+    enable_pld: bool,
 ) !void {
     var timer = startStopwatch(stream.io);
 
-    var result = try generate_mod.generate(stream.io, allocator, xfm, tok, prompt_ids, max_tokens, sampling, eos_token_ids, getTimeoutNs(), logprobs_n);
+    // Speculative-decoding dispatch:
+    //   1. MTP wins if model has MTP weights AND was requested AND no
+    //      logprobs (logprobs path doesn't expose realized log-probs from
+    //      the draft side).
+    //   2. PLD next, if requested AND no logprobs AND no grammar constraint
+    //      (constrained decode requires per-token state advancement).
+    //   3. Otherwise the regular pipeline.
+    const use_mtp = enable_mtp and logprobs_n == 0 and xfm.mtp_layers != null;
+    const use_pld = !use_mtp and enable_pld and logprobs_n == 0 and sampling.constraint == null;
+    var result = if (use_mtp)
+        try generate_mod.generateMtp(stream.io, allocator, xfm, tok, prompt_ids, max_tokens, sampling, eos_token_ids, getTimeoutNs())
+    else if (use_pld)
+        try generate_mod.generatePld(stream.io, allocator, xfm, tok, prompt_ids, max_tokens, sampling, eos_token_ids, getTimeoutNs(), default_pld_draft_len, default_pld_key_len)
+    else
+        try generate_mod.generate(stream.io, allocator, xfm, tok, prompt_ids, max_tokens, sampling, eos_token_ids, getTimeoutNs(), logprobs_n);
     result.prompt_tokens += cached_tokens; // Include cached tokens in total prompt count
     defer allocator.free(result.text);
     defer allocator.free(result.token_ids);
@@ -2307,9 +2397,23 @@ fn handleStreamingGeneration(
     logprobs_n: u32,
     enable_thinking: bool,
     reasoning_budget: i32,
+    enable_mtp: bool,
+    enable_pld: bool,
 ) !void {
     const chat_id = nowMs(stream.io);
     var timer = startStopwatch(stream.io);
+
+    // Streaming MTP/PLD integration: defer to v2 — the streaming SSE state
+    // machine emits per-token deltas with intricate tool-call/think-block
+    // buffering that doesn't trivially compose with multi-token-per-step
+    // yields. For v1 we disable both on streaming requests and log it; users
+    // can opt in via `stream: false` requests for now.
+    if (enable_mtp) {
+        log.info("  mtp=disabled (streaming; non-stream supports it)\n", .{});
+    }
+    if (enable_pld) {
+        log.info("  pld=disabled (streaming; non-stream supports it)\n", .{});
+    }
 
     // Prefill + init generator
     var gen = try Generator.init(stream.io, allocator, xfm, tok, prompt_ids, max_tokens, sampling, eos_token_ids);

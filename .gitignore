@@ -25,3 +25,7 @@ test_zig
 app/MLXCore.dmg
 server_err.log
 .vscode
+
+# Speculative-decoding working notes (MTP + PLD planning/scratchpad)
+.mtp-progress.md
+.spec-progress.md

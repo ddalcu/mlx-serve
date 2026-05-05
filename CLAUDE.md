@@ -15,7 +15,7 @@ Native Zig server that runs MLX-format LMs on Apple Silicon and exposes OpenAI-c
 
 | Path | Role |
 |------|------|
-| `src/main.zig` | Entry, CLI (`--model`, `--serve`, `--host`, `--port`, `--prompt`, `--max-tokens`, `--temp`, `--ctx-size`, `--timeout`, `--reasoning-budget`, `--no-vision`, `--log-level`, `--version`, `--help`) |
+| `src/main.zig` | Entry, CLI (`--model`, `--serve`, `--host`, `--port`, `--prompt`, `--max-tokens`, `--temp`, `--ctx-size`, `--timeout`, `--reasoning-budget`, `--no-vision`, `--mtp`, `--pld`, `--pld-draft-len`, `--pld-key-len`, `--log-level`, `--version`, `--help`) |
 | `src/mlx.zig` | mlx-c FFI |
 | `src/model.zig` | Config + safetensors loading; see **Supported Architectures** below |
 | `src/tokenizer.zig` | BPE tokenizer |
@@ -26,6 +26,7 @@ Native Zig server that runs MLX-format LMs on Apple Silicon and exposes OpenAI-c
 | `src/server.zig` | HTTP server: `/health`, `/v1/models`, `/v1/chat/completions`, `/v1/completions`, `/v1/messages`, `/v1/responses`, `/v1/responses/compact`, plus a WebSocket transport on `/v1/responses` (OpenAI Chat + Responses + Anthropic Messages, stream + non-stream, tool calling, KV cache, vision) |
 | `src/responses.zig` | OpenAI Responses API: input-item parser (incl. `compaction` items), tool-shape translation, output-item builders, in-memory `ResponseStore`, `encodeCompactionBlob` (HTTP/streaming live in `server.zig`) |
 | `src/ws.zig` | RFC 6455 WebSocket framing + handshake (server-side only). Generic over a `Conn`-shaped type so it stays test-friendly without depending on `server.zig`. |
+| `src/pld_index.zig` | Prompt Lookup Decoding (PLD) n-gram index. Pure-data `PldLookup.findMatch` — given a key (last `key_len` tokens) and committed stream, returns up to `max_draft` tokens from the latest prior occurrence. Tests at the bottom of the file. |
 | `src/status.zig` | TUI status bar (CPU, memory, GPU metrics) |
 | `src/log.zig` | Leveled logging (error, warn, info, debug) |
 | `build.zig` | Zig build; links mlx-c, libjinja.a, libwebp, stb_image |
@@ -64,6 +65,8 @@ Native Zig server that runs MLX-format LMs on Apple Silicon and exposes OpenAI-c
 - `./tests/test_tool_response.sh [port]` — tool calling round-trip tests (needs running server)
 - `./tests/test_kv_cache_poison.sh [port]` — KV cache poisoning regression test (needs running server)
 - `./tests/test_anthropic_api.sh [port]` — Anthropic Messages API integration tests (needs running server)
+- `MTP_TEST_MODEL=<dir> ./tests/test_mtp_equivalence.sh [port]` — MTP byte-equivalence test (auto-skips when env var unset OR safetensors lack `*.mtp.*` weights — common for MLX-converted Qwen3.5)
+- `PLD_TEST_MODEL=<dir> ./tests/test_pld_equivalence.sh [port]` — PLD byte-equivalence test (defaults to `~/.mlx-serve/models/Qwen3.5-4B-MLX-4bit`; PLD is model-agnostic, any MLX checkpoint works)
 - Always run `zig build test` and `swift test` before submitting changes
 - Add tests for new pure logic functions in the same source file (Zig convention)
 - Shell integration tests go in `tests/` and need a running server with a loaded model
@@ -288,6 +291,28 @@ mlx-c requires a non-empty weight array for `mlx_fast_rms_norm`. Passing a null/
 
 ### Nemotron-H time_step_limit
 Python's `ModelArgs.__post_init__` defaults `time_step_limit` to `(0.0, inf)` — effectively no dt clipping. The config.json fields `time_step_min`/`time_step_max` exist but are NOT used for SSM clipping by Python. Our defaults match Python: `(0.0, inf)`. Only the `time_step_limit` JSON array (if present) overrides these.
+
+### MTP (Multi-Token Prediction) speculative decoding
+Qwen3.5/3.6/Qwen3-Next ship a native MTP head — a single transformer block trained to predict token N+2 from `(hidden_state_N, embed(token_N+1))`. Enabled per-server via `--mtp` and per-request via the `enable_mtp` JSON field. Only active when `config.has_mtp` is true (parsed from `mtp_num_hidden_layers` or `num_nextn_predict_layers`).
+
+The implementation is **non-streaming-only** in v1 (`stream: true` requests log `mtp=disabled (streaming; non-stream supports it)` and fall through to regular decode). Auto-disabled when `tools` are present (tool-call buffering is incompatible with multi-token verify) and when `logprobs` is requested.
+
+Algorithm (in `Generator.nextMtp`): draft via `mtpForward(last_hidden, last_token)` → sample → snapshot KV+SSM → verify via main `forwardCaptureHidden([last_token, draft_id])` length-2 → greedy compare argmax at position 1 → accept (advance step+=2, save new hidden) or reject (restore caches, re-forward `[last_token]` alone, sample fallback from position 0). Snapshot/restore via `KVCache.snapshot/restore` and `ssmSnapshot/Restore` ensures hybrid (GatedDeltaNet) models roll back correctly.
+
+**Critical**: most MLX-converted Qwen3.5/3.6 checkpoints declare `mtp_num_hidden_layers: 1` in their config but **strip the MTP weights** during conversion (no `*.mtp.*` tensors in safetensors). Without those weights, `--mtp` requests will fail at first `mtpForward` with `MISSING WEIGHT: ...mtp.0.eh_proj.weight`. Verify with `safe_open` before benchmarking. The `tests/test_mtp_equivalence.sh` script auto-detects this and skips.
+
+### PLD (Prompt Lookup Decoding) speculative decoding
+Model-agnostic speculative decoding via n-gram match in `prompt + generated_tokens`. No model weights required — works on every supported architecture. Enabled per-server via `--pld` (with `--pld-draft-len <n>` default 5 and `--pld-key-len <n>` default 3) and per-request via the `enable_pld` JSON field. The pure n-gram lookup lives in `src/pld_index.zig` (`PldLookup.findMatch`); the draft+verify orchestration is in `Generator.nextPld` / `generatePld` in `src/generate.zig`.
+
+**Auto-disable rules** (mirror MTP): off when `tools` are present, off when `logprobs > 0`, off when `stream: true` (streaming SSE state machine isn't compatible with multi-token-per-step yields), off when grammar-constrained sampling is active, **off on hybrid SSM architectures** (`config.has_hybrid_layers` — LFM2.5, Nemotron-H). The hybrid forward path's SSM/conv updates assume seq_len=1 during decode; multi-token verify hits an mlx_array error. v2 task. **MTP+PLD priority**: when both are enabled and the model has native MTP weights, MTP wins (its draft quality is better for that one model). PLD takes over otherwise.
+
+**`prompt_ids_owned`**: `Generator.initWithOptions` clones the input `prompt_ids` into `prompt_ids_owned` (freed in `deinit`) so PLD's lookup table sees the full context. The caller-supplied slice is freed before `nextPld` runs, so we cannot reference it. The owned copy is also visible to non-PLD generators but unused there.
+
+**Partial-accept re-forward**: when verify accepts `j < m` drafts, the cache is over-advanced by `m - j`. `nextPld` rolls back via `KVCache.snapshot/restore` + `ssmSnapshot/Restore`, then re-forwards `[t1, draft[0..j]]` (length `1+j`) to land the cache at `+1+j`. The pending correction is sampled from the *original* verify_logits[j] (not the re-forward) — that's the model's choice for the position the partial draft missed. This costs ~1 extra forward per partial-reject step, balanced against `1+j` accepted tokens for free.
+
+**Stochastic verify** treats the draft as a one-hot distribution (since it came from n-gram lookup, not a probabilistic model): `accept_prob = min(1, target_p[draft[i]])`. On reject, sample from residual `max(target_p − one_hot(draft[i]), 0)` renormalized — equivalent to "sample from target distribution conditional on not draft[i]" which preserves the marginal distribution per Leviathan et al. The one-hot is built via `pldOneHotRow` (arange + equal + cast) — no scatter required.
+
+**Equivalence test**: `./tests/test_pld_equivalence.sh [port]` (defaults to `~/.mlx-serve/models/Qwen3.5-4B-MLX-4bit`; override with `PLD_TEST_MODEL=<dir>`). Greedy temp=0 output must be byte-identical with vs without `--pld`. Skips cleanly when no model is available.
 
 ### mlx-c API changes
 mlx-c 0.6.0 added a `global_scale` parameter (may be null) to `mlx_dequantize` between `mode` and `dtype`. The FFI declaration in `mlx.zig` must match the installed header. When upgrading mlx-c, diff the headers in `/opt/homebrew/include/mlx/c/ops.h` against the `extern "c"` declarations in `src/mlx.zig`.

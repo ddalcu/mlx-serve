@@ -35,6 +35,15 @@ fn printUsage(io: std.Io) void {
         \\  --timeout <n>       Request timeout in seconds (default: 300, 0=none)
         \\  --reasoning-budget <n>  Max thinking tokens per request (default: unlimited)
         \\  --no-vision         Disable vision encoder (saves memory)
+        \\  --mtp               Enable MTP (Multi-Token Prediction) speculative decoding
+        \\                        Requires a model with `num_nextn_predict_layers > 0`
+        \\                        in config.json (Qwen3.5+, Qwen3-Next).
+        \\  --pld               Enable Prompt Lookup Decoding (model-agnostic
+        \\                        speculative decoding via n-gram matches in the
+        \\                        prompt + generated tokens). Big wins on echo-heavy
+        \\                        workloads (code editing, RAG, agentic loops).
+        \\  --pld-draft-len <n> Max draft tokens per PLD step (default: 5).
+        \\  --pld-key-len <n>   N-gram match key length for PLD (default: 3).
         \\  --log-level <lvl>   Log level: error, warn, info, debug (default: info)
         \\  --version           Print version and exit
         \\  --help              Show this help
@@ -77,6 +86,10 @@ pub fn main(init: std.process.Init) !void {
     var timeout: u32 = 300; // seconds, 0 = no timeout
     var reasoning_budget: i32 = -1; // -1 = unlimited
     var no_vision = false;
+    var enable_mtp = false; // MTP self-speculative decoding (off by default)
+    var enable_pld = false; // Prompt Lookup Decoding (off by default)
+    var pld_draft_len: u32 = 5;
+    var pld_key_len: u32 = 3;
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--version")) {
@@ -118,6 +131,20 @@ pub fn main(init: std.process.Init) !void {
             timeout = try std.fmt.parseInt(u32, args[i], 10);
         } else if (std.mem.eql(u8, args[i], "--no-vision")) {
             no_vision = true;
+        } else if (std.mem.eql(u8, args[i], "--mtp")) {
+            enable_mtp = true;
+        } else if (std.mem.eql(u8, args[i], "--no-mtp")) {
+            enable_mtp = false;
+        } else if (std.mem.eql(u8, args[i], "--pld")) {
+            enable_pld = true;
+        } else if (std.mem.eql(u8, args[i], "--no-pld")) {
+            enable_pld = false;
+        } else if (std.mem.eql(u8, args[i], "--pld-draft-len") and i + 1 < args.len) {
+            i += 1;
+            pld_draft_len = try std.fmt.parseInt(u32, args[i], 10);
+        } else if (std.mem.eql(u8, args[i], "--pld-key-len") and i + 1 < args.len) {
+            i += 1;
+            pld_key_len = try std.fmt.parseInt(u32, args[i], 10);
         } else if (std.mem.eql(u8, args[i], "--reasoning-budget") and i + 1 < args.len) {
             i += 1;
             reasoning_budget = try std.fmt.parseInt(i32, args[i], 10);
@@ -266,7 +293,12 @@ pub fn main(init: std.process.Init) !void {
 
     if (serve_mode) {
         // Start HTTP server
-        try server_mod.serve(io, allocator, &xfm, &tok, &chat_config, &config, if (vision_enc) |*ve| ve else null, model_dir, host, port, ctx_size, timeout, reasoning_budget);
+        // MTP guardrail: --mtp on a model without an MTP head silently downgrades.
+        const mtp_active = enable_mtp and config.has_mtp;
+        if (enable_mtp and !config.has_mtp) {
+            log.warn("--mtp requested but model has no MTP head (num_nextn_predict_layers=0); running without speculative decoding.\n", .{});
+        }
+        try server_mod.serve(io, allocator, &xfm, &tok, &chat_config, &config, if (vision_enc) |*ve| ve else null, model_dir, host, port, ctx_size, timeout, reasoning_budget, mtp_active, enable_pld, pld_draft_len, pld_key_len);
     } else {
         const user_prompt = prompt orelse "What is 2+2? Answer in one sentence.";
         const messages = [_]chat_mod.Message{

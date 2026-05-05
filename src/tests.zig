@@ -15,4 +15,5 @@ test {
     _ = @import("token_mask.zig");
     _ = @import("responses.zig");
     _ = @import("ws.zig");
+    _ = @import("pld_index.zig");
 }
