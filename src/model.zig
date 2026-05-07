@@ -1117,7 +1117,6 @@ test "ModelConfig BERT has no sliding window" {
 // checkpoints today). The head is a single transformer block trained to predict
 // token N+2 from `(hidden_state_N, embed(token_N+1))`. Used for self-speculative
 // decoding: draft with the MTP head, verify with a length-2 main forward.
-// See plan: /Users/david/.claude/plans/based-on-our-current-polished-hammock.md
 
 test "ModelConfig MTP defaults" {
     const config = ModelConfig{};

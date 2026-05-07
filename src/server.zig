@@ -591,7 +591,7 @@ fn handleConnection(
         try sendResponse(stream, "200 OK", "application/json", "{\"status\":\"ok\"}");
     } else if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/v1/models")) {
         log.debug("GET  /v1/models -> 200\n", .{});
-        try handleModels(allocator, stream, config, chat_config);
+        try handleModels(allocator, stream, xfm, config, chat_config);
     } else if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/props")) {
         log.debug("GET  /props -> 200\n", .{});
         try handleProps(allocator, stream, config, chat_config);
@@ -833,6 +833,7 @@ fn chatTemplateSupportsThinking(tmpl: []const u8) bool {
 fn handleModels(
     allocator: std.mem.Allocator,
     stream: *Conn,
+    xfm: *Transformer,
     config: *const model_mod.ModelConfig,
     chat_config: *const chat_mod.ChatConfig,
 ) !void {
@@ -886,8 +887,11 @@ fn handleModels(
     // — independent of the running server's chosen context size — so UI code
     // can show the true architectural cap without it shifting around when the
     // user picks a different ctx-size.
-    // `supports_mtp` lets the UI grey out the "Enable MTP" toggle for models
-    // whose config doesn't declare MTP layers (most checkpoints).
+    // `supports_mtp` reflects whether MTP weights are actually loaded — the
+    // config can declare MTP layers but most MLX-converted Qwen3.5/3.6
+    // checkpoints strip the `*.mtp.*` tensors at conversion time, so
+    // `--mtp` would fail at first draft. Reading the bound `xfm.mtp_layers`
+    // gives the truthful answer for UI gating.
     const body = try std.fmt.allocPrint(allocator,
         \\{{"object":"list","data":[{{"id":"{s}","object":"model","created":{d},"owned_by":"mlx-serve","capabilities":{s},"input_modalities":{s},"meta":{{"architecture":"{s}","vocab_size":{d},"hidden_size":{d},"num_layers":{d},"quantization":"{d}-bit","context_length":{s},"model_max_tokens":{d},"supports_mtp":{s}}}}}]}}
     , .{
@@ -902,7 +906,7 @@ fn handleModels(
         config.quant_bits,
         ctx_str,
         config.max_position_embeddings,
-        if (config.has_mtp) "true" else "false",
+        if (xfm.mtp_layers != null) "true" else "false",
     });
     defer allocator.free(body);
     try sendResponse(stream, "200 OK", "application/json", body);
@@ -2309,7 +2313,7 @@ fn handleNonStreamingGeneration(
     //      (constrained decode requires per-token state advancement).
     //   4. Otherwise the regular pipeline.
     const use_drafter = enable_drafter and logprobs_n == 0 and default_drafter != null and sampling.constraint == null;
-    const use_mtp = !use_drafter and enable_mtp and logprobs_n == 0 and xfm.mtp_layers != null;
+    const use_mtp = !use_drafter and enable_mtp and logprobs_n == 0 and sampling.constraint == null and xfm.mtp_layers != null;
     const use_pld = !use_drafter and !use_mtp and enable_pld and logprobs_n == 0 and sampling.constraint == null;
     var result = if (use_drafter)
         try generate_mod.generateDrafter(stream.io, allocator, xfm, default_drafter.?, tok, prompt_ids, max_tokens, sampling, eos_token_ids, getTimeoutNs(), default_draft_block_size)
@@ -2684,7 +2688,7 @@ fn pickStreamMode(
     logprobs_n: u32,
 ) StreamMode {
     if (enable_drafter and drafter_loaded and logprobs_n == 0 and !has_constraint and !has_hybrid_layers) return .drafter;
-    if (enable_mtp and logprobs_n == 0 and has_mtp_weights) return .mtp;
+    if (enable_mtp and logprobs_n == 0 and !has_constraint and has_mtp_weights) return .mtp;
     if (enable_pld and logprobs_n == 0 and !has_constraint and !has_hybrid_layers) return .pld;
     return .regular;
 }
@@ -4533,7 +4537,7 @@ fn handleAnthropicNonStreaming(
     var timer = startStopwatch(stream.io);
 
     // Speculative decoding dispatch — same priority as chat-completions.
-    const use_mtp = enable_mtp and xfm.mtp_layers != null;
+    const use_mtp = enable_mtp and sampling.constraint == null and xfm.mtp_layers != null;
     const use_pld = !use_mtp and enable_pld and sampling.constraint == null and !xfm.config.has_hybrid_layers;
     var result = if (use_mtp)
         try generate_mod.generateMtp(stream.io, allocator, xfm, tok, prompt_ids, max_tokens, sampling, eos_token_ids, getTimeoutNs())
@@ -6021,7 +6025,7 @@ fn handleResponses(
     } else {
         // Non-streaming Responses: dispatch to MTP / PLD when applicable so
         // /v1/responses gets the same speedup as /v1/chat/completions.
-        const use_mtp = enable_mtp_resp and xfm.mtp_layers != null;
+        const use_mtp = enable_mtp_resp and sampling.constraint == null and xfm.mtp_layers != null;
         const use_pld = !use_mtp and enable_pld_resp and sampling.constraint == null and !xfm.config.has_hybrid_layers;
         result = if (use_mtp)
             try generate_mod.generateMtp(stream.io, allocator, xfm, tok, cache_result.new_tokens, effective_max_tokens, sampling, eos_slice, getTimeoutNs())

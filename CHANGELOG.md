@@ -1,5 +1,21 @@
 # Changelog
 
+## v26.5.4 — Speculative decoding (MTP / PLD / Gemma 4 drafter), Settings window, tokenizer fix
+
+- **MTP (Multi-Token Prediction)**: native self-speculative decoding for Qwen3.5/3.6/Qwen3-Next checkpoints that ship MTP weights. `--mtp` flag and per-request `enable_mtp`. Snapshot/restore handles hybrid GatedDeltaNet rollback; tools/logprobs/grammar auto-disable.
+- **PLD (Prompt Lookup Decoding) on by default**: model-agnostic n-gram speculative decoding works on every supported architecture (Gemma, Qwen, Llama, Mistral, Nemotron-H, LFM2.5). Up to 1.82× on heavy-echo Gemma-4-E4B, 1.16× on RAG-style retrieval. `--no-pld` to disable.
+- **Gemma 4 assistant drafter**: cross-attention drafter using Google's `gemma-4-{E2B,E4B,26B-A4B,31B}-it-assistant-bf16` checkpoints. `--drafter <dir>` activates it; 1.98× decode on echo-heavy E4B-4bit (3.0/3 max acceptance). Streaming supported across chat / Anthropic / Responses paths.
+- **Adaptive prompt-time gate**: per-request 3-gram repetition score on the prompt disables PLD/drafter on novel content (`spec_gate_threshold = 0.01`). Validated 9/9 on a tuning corpus. Bypass with explicit `enable_pld:true` / `enable_drafter:true` in the request body.
+- **Runtime acceptance gate**: mid-decode fallback when actual draft acceptance is below break-even — < 0.30 after 5 attempts for PLD/drafter, < 0.70 after 8 attempts for MTP (binary outcome → separate threshold). Sticky per-request; protects against workloads the prompt-time gate misjudged.
+- **Settings window** (MLX Core, Cmd+,): single source-of-truth for server-launch flags (port, ctx-size, log-level, vision, MTP/PLD/drafter, draft lengths) and per-request defaults (max-tokens, temperature, top-p/top-k, repeat/presence penalty, reasoning budget, thinking, per-request spec-decode overrides). Restart banner appears when launch flags change; per-request fields apply on the next chat.
+- **Tokenizer correctness fix**: GPT-2 pre-tokenizer rewritten as a priority-ordered state machine matching the reference regex. Four classes of splits now correct — leading-space + letters as one pre-token (` total`), leading-space + punct (` +=`), multi-space runs preceding identifiers (`    total`), and digits as single codepoints (`100` → 1, 0, 0). Old impl perturbed BPE merges on every subsequent word.
+- **Markdown rendering**: assistant messages render in a single NSTextView so drag-select spans paragraphs / lists / code blocks / tables. Adds GFM table parsing with column alignment; small in-prompt nudge steers smaller models toward GFM table syntax for plain-chat tabular output.
+- **`/v1/models` meta additions**: `model_max_tokens` (architectural cap, independent of `--ctx-size`) and `supports_mtp` (config declares MTP layers).
+- **Build**: Swift 5 language mode globally (`-Xswiftc -swift-version -Xswiftc 5`) — required under Swift 6.3 / Xcode 26+ because the pinned `swift-sdk` 0.10.x trips new `SendingRisksDataRace` diagnostics. No-op on the Swift 6.1 CI runner.
+- **Tests**: PLD / MTP / drafter byte-equivalence suites (greedy temp=0); streaming-vs-non-streaming byte-equivalence; long-greedy memorized-prompt test that asserts byte-identical first 30 tokens (INT4 float-noise tail documented in CLAUDE.md). New `bench_spec.sh` with `--corpus` and `--gated` modes.
+
+---
+
 ## v26.5.3 — Real Sonoma compatibility, CI test gate, dependency pinning
 
 - **Bundled dylibs are now actually Sonoma-compatible.** Switched the release runner from `macos-26` to `macos-14`; Homebrew bottles for `mlx`, `mlx-c`, `webp`, and `libsharpyuv` come out stamped `minos 14.0` instead of `minos 26.0`. v26.5.2 fixed the Zig binary's minOS but the bundled libs still required Tahoe — dyld would refuse them on Sonoma at first launch, surfacing as "Server failed to start" in MLX Core.

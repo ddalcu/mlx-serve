@@ -1245,8 +1245,8 @@ test "gpt2PreTokenize: trailing whitespace at end of input" {
 }
 
 test "gpt2PreTokenize: full Python snippet matches HF reference" {
-    // Reference output produced by HuggingFace `tokenizers` library on
-    // /Users/david/.mlx-serve/models/Qwen3.5-4B-MTPLX-Speed/tokenizer.json
+    // Reference output produced by the HuggingFace `tokenizers` library on a
+    // Qwen3.5 tokenizer.json (any Qwen3.5/3.6 checkpoint reproduces this):
     //   ['def', ' total', '(items', '):\n', '   ', ' total', ' =', ' ', '0']
     // Note: `):\n` joins because pattern 4 allows trailing `[\r\n]*` after
     // the punct run. The byte-level encode + BPE merge stage downstream
