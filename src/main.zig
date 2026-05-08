@@ -308,6 +308,12 @@ pub fn main(init: std.process.Init) !void {
     if (config.final_logit_softcapping > 0.0) {
         xfm.compileSoftcap(); // tanh(x/cap) * cap → 1 kernel
     }
+    // MoE routing fusion: top-K expert selection + softmax/renormalize → 1 kernel.
+    // Only worthwhile if any layer is actually MoE. The closure is shapeless so it
+    // compiles cleanly across batch/seq variations; disabled if no MoE layers exist.
+    if (xfm.moe_layers != null) {
+        xfm.compileMoeRouting();
+    }
 
     log.info("Model ready.\n", .{});
 

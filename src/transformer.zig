@@ -945,6 +945,7 @@ pub const Transformer = struct {
     compiled_gelu: ?mlx.mlx_closure = null,
     compiled_geglu: ?mlx.mlx_closure = null, // gelu(gate) * up → 1 kernel
     compiled_softcap: ?mlx.mlx_closure = null, // tanh(x/cap) * cap → 1 kernel
+    compiled_moe_routing: ?mlx.mlx_closure = null, // negate→argpartition→slice→softmax→take→sum→expand→divide → 1 kernel
 
     // Per-weight quantization bit cache (see bitsFor). Populated lazily on first use.
     // Keyed by the scales array's ctx pointer (stable for the lifetime of a weight).
@@ -1741,6 +1742,86 @@ pub const Transformer = struct {
         return 0;
     }
 
+    /// Compile MoE routing (negate→argpartition→slice→softmax→take_along_axis→sum→expand→divide)
+    /// into a single fused kernel. Input: router_logits. Outputs: inds, norm_scores.
+    /// shapeless=false: slice bounds derive from input ndim, so the closure must
+    /// re-trace per input shape. MoE inference only sees two shapes in practice
+    /// (decode seq_len=1, prefill seq_len=N), so the trace cost amortizes after
+    /// the first prefill + first decode.
+    pub fn compileMoeRouting(self: *Transformer) void {
+        const raw_closure = mlx.mlx_closure_new_func_payload(
+            &moeRoutingClosureCallback,
+            @ptrCast(self),
+            null,
+        );
+        var compiled = mlx.mlx_closure{ .ctx = null };
+        const rc = mlx.mlx_compile(&compiled, raw_closure, false);
+        _ = mlx.mlx_closure_free(raw_closure);
+        if (rc == 0 and compiled.ctx != null) {
+            self.compiled_moe_routing = compiled;
+            log.info("MoE routing compiled (kernel fusion enabled)\n", .{});
+        }
+    }
+
+    /// Result type for the MoE routing helpers. Both fields are owned arrays —
+    /// caller is responsible for freeing them.
+    const MoeRouting = struct { inds: mlx.mlx_array, norm_scores: mlx.mlx_array };
+
+    /// Pure subgraph for MoE routing. Inputs:
+    ///   [0] router_logits — shape [..., num_experts]
+    /// Outputs:
+    ///   [0] inds         — shape [..., K], int32 expert indices (top-K)
+    ///   [1] norm_scores  — shape [..., K], renormalized top-K softmax weights
+    ///
+    /// The sigma-MoE per-expert-scale path stays outside the closure because it
+    /// branches on per-layer weights at model-load time.
+    fn moeRoutingClosureCallback(res: *mlx.mlx_vector_array, input: mlx.mlx_vector_array, payload: ?*anyopaque) callconv(.c) c_int {
+        const self: *Transformer = @ptrCast(@alignCast(payload.?));
+        const k: c_int = @intCast(self.config.num_experts_per_tok);
+
+        var router_logits = mlx.mlx_array_new();
+        if (mlx.mlx_vector_array_get(&router_logits, input, 0) != 0) return -1;
+        defer _ = mlx.mlx_array_free(router_logits);
+
+        const inds_norm = self.moeRoutingUncompiled(router_logits, k) catch return -1;
+        defer _ = mlx.mlx_array_free(inds_norm.inds);
+        defer _ = mlx.mlx_array_free(inds_norm.norm_scores);
+
+        const out_arr = [_]mlx.mlx_array{ inds_norm.inds, inds_norm.norm_scores };
+        res.* = mlx.mlx_vector_array_new_data(&out_arr, 2);
+        return 0;
+    }
+
+    /// Reference implementation of the MoE routing chain (used both as fallback
+    /// and as the body the compiled closure traces). Returns owned `inds` +
+    /// `norm_scores` arrays — caller must free both.
+    fn moeRoutingUncompiled(self: *const Transformer, router_logits: mlx.mlx_array, k: c_int) !MoeRouting {
+        return moeRoutingChain(router_logits, k, self.s);
+    }
+
+    /// Apply the compiled MoE routing closure if available, else fall back.
+    /// Returns owned `inds` + `norm_scores` — caller must free both.
+    fn computeMoeRouting(self: *const Transformer, router_logits: mlx.mlx_array) !MoeRouting {
+        const k: c_int = @intCast(self.config.num_experts_per_tok);
+        if (self.compiled_moe_routing) |compiled| {
+            const in_arr = [_]mlx.mlx_array{router_logits};
+            const in_vec = mlx.mlx_vector_array_new_data(&in_arr, 1);
+            defer _ = mlx.mlx_vector_array_free(in_vec);
+            var out_vec = mlx.mlx_vector_array{ .ctx = null };
+            try mlx.check(mlx.mlx_closure_apply(&out_vec, compiled, in_vec));
+            defer _ = mlx.mlx_vector_array_free(out_vec);
+
+            var inds = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(inds);
+            try mlx.check(mlx.mlx_vector_array_get(&inds, out_vec, 0));
+            var norm_scores = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(norm_scores);
+            try mlx.check(mlx.mlx_vector_array_get(&norm_scores, out_vec, 1));
+            return .{ .inds = inds, .norm_scores = norm_scores };
+        }
+        return self.moeRoutingUncompiled(router_logits, k);
+    }
+
     fn forwardClosureCallback(res: *mlx.mlx_vector_array, input: mlx.mlx_vector_array, payload: ?*anyopaque) callconv(.c) c_int {
         const self: *Transformer = @ptrCast(@alignCast(payload.?));
         var token_ids = mlx.mlx_array_new();
@@ -1779,6 +1860,7 @@ pub const Transformer = struct {
         if (self.compiled_gelu) |cg| _ = mlx.mlx_closure_free(cg);
         if (self.compiled_geglu) |cg| _ = mlx.mlx_closure_free(cg);
         if (self.compiled_softcap) |cs| _ = mlx.mlx_closure_free(cs);
+        if (self.compiled_moe_routing) |cmr| _ = mlx.mlx_closure_free(cmr);
         if (self.prompt_cache) |*pc| pc.deinit();
         self.cache.deinit();
         if (self.emb_scale) |es| _ = mlx.mlx_array_free(es);
@@ -4331,18 +4413,9 @@ pub const Transformer = struct {
         defer _ = mlx.mlx_array_free(gate);
         const up = try self.qmatmul(x, dw.up_w, dw.up_s, dw.up_b);
         defer _ = mlx.mlx_array_free(up);
-        const activated = try self.gatedMlpAct(gate, up);
+        const activated = try self.computeGeglu(gate, up);
         defer _ = mlx.mlx_array_free(activated);
         return self.qmatmul(activated, dw.down_w, dw.down_s, dw.down_b);
-    }
-
-    /// Gated MLP activation: activation(gate) * up, using the model's configured activation.
-    fn gatedMlpAct(self: *const Transformer, gate: mlx.mlx_array, up: mlx.mlx_array) !mlx.mlx_array {
-        const activated = try self.mlpActivation(gate);
-        defer _ = mlx.mlx_array_free(activated);
-        var result = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_multiply(&result, activated, up, self.s));
-        return result;
     }
 
     // ── Sparse MoE MLP ──
@@ -4356,7 +4429,6 @@ pub const Transformer = struct {
     /// expert_x: input for expert computation (possibly normalized).
     fn moeMLP2(self: *Transformer, router_x: mlx.mlx_array, expert_x: mlx.mlx_array, mw: *const MoeMlpWeights) !mlx.mlx_array {
         const cfg = &self.config;
-        const k: c_int = @intCast(cfg.num_experts_per_tok);
         const gs = cfg.quant_group_size;
         // Per-expert-weight bits: Gemma-4 MoE has 4-bit experts but 8-bit router/shared,
         // so we can't use a single layer-wide bits value — resolve per weight.
@@ -4369,17 +4441,12 @@ pub const Transformer = struct {
         defer _ = mlx.mlx_array_free(router_logits);
 
         if (mw.router_scale) |rs| {
-            // Sigma-MoE: rms_norm(x, scale * hidden_size^-0.5, eps) then project
-            const root_size: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(cfg.hidden_size)));
-            var norm_weight = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(norm_weight);
-            const root_scalar = bf16Scalar(root_size, self.s);
-            defer _ = mlx.mlx_array_free(root_scalar);
-            try mlx.check(mlx.mlx_multiply(&norm_weight, rs, root_scalar, self.s));
-
+            // Sigma-MoE: rms_norm(x, router_scale, eps) then project.
+            // `router_scale` is pre-folded with hidden_size^-0.5 at model-load time
+            // (see initMoeLayers) — no per-layer multiply needed.
             var normed_input = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(normed_input);
-            try mlx.check(mlx.mlx_fast_rms_norm(&normed_input, router_x, norm_weight, cfg.rms_norm_eps, self.s));
+            try mlx.check(mlx.mlx_fast_rms_norm(&normed_input, router_x, rs, cfg.rms_norm_eps, self.s));
 
             const router_bits = self.bitsFor(mw.router_w, mw.router_s, gs);
             router_logits = try qmatmulBits(normed_input, mw.router_w, mw.router_s, mw.router_b, router_bits, gs, self.s);
@@ -4389,53 +4456,15 @@ pub const Transformer = struct {
             router_logits = try qmatmulBits(router_x, mw.router_w, mw.router_s, mw.router_b, router_bits, gs, self.s);
         }
 
-        // Top-K: select on raw logits (negate for argpartition which finds smallest)
-        var neg_logits = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(neg_logits);
-        try mlx.check(mlx.mlx_negative(&neg_logits, router_logits, self.s));
-
-        var partitioned = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(partitioned);
-        try mlx.check(mlx.mlx_argpartition_axis(&partitioned, neg_logits, k - 1, -1, self.s));
-
-        // Slice [..., :K] from partitioned (first K = top-K of original logits)
-        const p_shape = mlx.getShape(partitioned);
-        var inds: mlx.mlx_array = undefined;
+        // Top-K + softmax/renormalize as a single fused kernel (when compiled).
+        const routed = try self.computeMoeRouting(router_logits);
+        const inds = routed.inds;
         defer _ = mlx.mlx_array_free(inds);
-        {
-            var start_arr: [4]c_int = undefined;
-            var stop_arr: [4]c_int = undefined;
-            var strides_arr: [4]c_int = undefined;
-            for (0..p_shape.len) |d| {
-                start_arr[d] = 0;
-                stop_arr[d] = if (d == p_shape.len - 1) k else p_shape[d];
-                strides_arr[d] = 1;
-            }
-            inds = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_slice(&inds, partitioned, &start_arr, p_shape.len, &stop_arr, p_shape.len, &strides_arr, p_shape.len, self.s));
-        }
-
-        // Weights from softmax probabilities at selected indices
-        var probs = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(probs);
-        try mlx.check(mlx.mlx_softmax_axis(&probs, router_logits, -1, true, self.s));
-
-        var top_weights = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(top_weights);
-        try mlx.check(mlx.mlx_take_along_axis(&top_weights, probs, inds, -1, self.s));
-
-        // Renormalize top-K weights
-        var weight_sum_raw = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(weight_sum_raw);
-        try mlx.check(mlx.mlx_sum_axis(&weight_sum_raw, top_weights, -1, false, self.s));
-        var weight_sum = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(weight_sum);
-        try mlx.check(mlx.mlx_expand_dims(&weight_sum, weight_sum_raw, -1, self.s));
-        var norm_scores = mlx.mlx_array_new();
+        var norm_scores = routed.norm_scores;
         defer _ = mlx.mlx_array_free(norm_scores);
-        try mlx.check(mlx.mlx_divide(&norm_scores, top_weights, weight_sum, self.s));
 
-        // Sigma-MoE: per-expert scale on selected indices (pes[inds])
+        // Sigma-MoE: per-expert scale on selected indices (pes[inds]).
+        // Stays outside the closure: depends on per-layer weights.
         if (mw.per_expert_scale) |pes| {
             var selected_scales = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(selected_scales);
@@ -4451,55 +4480,147 @@ pub const Transformer = struct {
             norm_scores = scaled_scores;
         }
 
-        // Expert computation using gather_qmm
-        // expert_x: [B, S, D] → [B, S, 1, 1, D] for gather_qmm
-        var x_e1 = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(x_e1);
-        try mlx.check(mlx.mlx_expand_dims(&x_e1, expert_x, -1, self.s)); // [B, S, D, 1]
-        var x_e2 = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(x_e2);
-        try mlx.check(mlx.mlx_expand_dims(&x_e2, x_e1, -1, self.s)); // [B, S, D, 1, 1]
-
+        // Expert computation. Two paths:
+        //
+        //   Decode / small prefill (B*S*K < 64): per-expert gather_qmm with
+        //   `rhs_indices=inds` shape [B,S,K]. Output is [B,S,K,1,inter]; works
+        //   but each token's K experts can be any subset, so HBM reads of the
+        //   quantized expert blocks are scattered.
+        //
+        //   Large prefill (B*S*K >= 64): mlx-lm's `_gather_sort` flow. Flatten
+        //   inds → argsort globally → `lhs_indices = order // K` selects which
+        //   token row to feed each sorted slot; `rhs_indices = inds[order]`
+        //   selects the expert (now sorted, so consecutive slots hit the same
+        //   expert block → one HBM stream). After down_proj, an inverse
+        //   permutation restores the original [B,S,K] layout.
         const x_shape = mlx.getShape(expert_x);
+        const B = x_shape[0];
+        const S = x_shape[1];
         const D = x_shape[x_shape.len - 1];
-        const exp_shape = [_]c_int{ x_shape[0], x_shape[1], 1, 1, D };
-        var x_exp = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(x_exp);
-        try mlx.check(mlx.mlx_reshape(&x_exp, expert_x, &exp_shape, 5, self.s));
-
+        const inds_shape = mlx.getShape(inds);
+        const K = inds_shape[inds_shape.len - 1];
+        const total_inds: c_int = B * S * K;
+        const do_sort = total_inds >= 64;
         const no_idx = mlx.mlx_array{ .ctx = null };
 
-        // gate_out: [B, S, K, 1, intermediate] → squeeze M → [B, S, K, intermediate]
-        var gate_out_5d = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(gate_out_5d);
-        try mlx.check(mlx.mlx_gather_qmm(&gate_out_5d, x_exp, mw.switch_gate_w, mw.switch_gate_s, mw.switch_gate_b, no_idx, inds, true, mlx.mlx_optional_int.some(@intCast(gs)), mlx.mlx_optional_int.some(@intCast(gate_bits)), "affine", false, self.s));
-        var gate_out = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(gate_out);
-        try mlx.check(mlx.mlx_squeeze(&gate_out, gate_out_5d, self.s));
-
-        // up_out: [B, S, K, intermediate]
-        var up_out_5d = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(up_out_5d);
-        try mlx.check(mlx.mlx_gather_qmm(&up_out_5d, x_exp, mw.switch_up_w, mw.switch_up_s, mw.switch_up_b, no_idx, inds, true, mlx.mlx_optional_int.some(@intCast(gs)), mlx.mlx_optional_int.some(@intCast(up_bits)), "affine", false, self.s));
-        var up_out = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(up_out);
-        try mlx.check(mlx.mlx_squeeze(&up_out, up_out_5d, self.s));
-
-        // Gated activation: activation(gate) * up → [B, S, K, intermediate]
-        const expert_act = try self.gatedMlpAct(gate_out, up_out);
-        defer _ = mlx.mlx_array_free(expert_act);
-
-        // down_out: expert_act [B,S,K,intermediate] → expand M → [B,S,K,1,intermediate]
-        var act_exp = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(act_exp);
-        try mlx.check(mlx.mlx_expand_dims(&act_exp, expert_act, -2, self.s));
-
-        var down_out_5d = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(down_out_5d);
-        try mlx.check(mlx.mlx_gather_qmm(&down_out_5d, act_exp, mw.switch_down_w, mw.switch_down_s, mw.switch_down_b, no_idx, inds, true, mlx.mlx_optional_int.some(@intCast(gs)), mlx.mlx_optional_int.some(@intCast(down_bits)), "affine", false, self.s));
         var down_out = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(down_out);
-        try mlx.check(mlx.mlx_squeeze(&down_out, down_out_5d, self.s));
+
+        if (do_sort) {
+            // ── Global-sort prefill path ──
+
+            // Flatten inds → [N] where N = B*S*K
+            const flat_shape = [_]c_int{total_inds};
+            var flat_inds = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(flat_inds);
+            try mlx.check(mlx.mlx_reshape(&flat_inds, inds, &flat_shape, 1, self.s));
+
+            // order = argsort(flat_inds), inv_order = argsort(order)
+            var order = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(order);
+            try mlx.check(mlx.mlx_argsort_axis(&order, flat_inds, 0, self.s));
+            var inv_order = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(inv_order);
+            try mlx.check(mlx.mlx_argsort_axis(&inv_order, order, 0, self.s));
+
+            // sorted_inds = flat_inds[order], shape [N]
+            var sorted_inds = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(sorted_inds);
+            try mlx.check(mlx.mlx_take_axis(&sorted_inds, flat_inds, order, 0, self.s));
+
+            // lhs_idx = order // K, shape [N] — picks the source token row
+            const k_arr = mlx.mlx_array_new_int(K);
+            defer _ = mlx.mlx_array_free(k_arr);
+            var lhs_idx = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(lhs_idx);
+            try mlx.check(mlx.mlx_floor_divide(&lhs_idx, order, k_arr, self.s));
+
+            // x_flat: [B,S,D] → [B*S, D]
+            const bs_d_shape = [_]c_int{ B * S, D };
+            var x_flat = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(x_flat);
+            try mlx.check(mlx.mlx_reshape(&x_flat, expert_x, &bs_d_shape, 2, self.s));
+
+            // x_rep: gather rows by lhs_idx → [N, D], then expand to [N, 1, D]
+            // for gather_qmm (it expects an inner singleton dim before the
+            // contracted feature dim).
+            var x_gathered = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(x_gathered);
+            try mlx.check(mlx.mlx_take_axis(&x_gathered, x_flat, lhs_idx, 0, self.s));
+            const n1d_shape = [_]c_int{ total_inds, 1, D };
+            var x_rep = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(x_rep);
+            try mlx.check(mlx.mlx_reshape(&x_rep, x_gathered, &n1d_shape, 3, self.s));
+
+            // gate / up gather_qmm: x_rep [N,1,D], rhs_indices=sorted_inds [N],
+            // output [N,1,intermediate]. squeeze inner 1 → [N, intermediate].
+            var gate_out_3d = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(gate_out_3d);
+            try mlx.check(mlx.mlx_gather_qmm(&gate_out_3d, x_rep, mw.switch_gate_w, mw.switch_gate_s, mw.switch_gate_b, no_idx, sorted_inds, true, mlx.mlx_optional_int.some(@intCast(gs)), mlx.mlx_optional_int.some(@intCast(gate_bits)), "affine", true, self.s));
+            var gate_out = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(gate_out);
+            try mlx.check(mlx.mlx_squeeze(&gate_out, gate_out_3d, self.s));
+
+            var up_out_3d = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(up_out_3d);
+            try mlx.check(mlx.mlx_gather_qmm(&up_out_3d, x_rep, mw.switch_up_w, mw.switch_up_s, mw.switch_up_b, no_idx, sorted_inds, true, mlx.mlx_optional_int.some(@intCast(gs)), mlx.mlx_optional_int.some(@intCast(up_bits)), "affine", true, self.s));
+            var up_out = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(up_out);
+            try mlx.check(mlx.mlx_squeeze(&up_out, up_out_3d, self.s));
+
+            const expert_act = try self.computeGeglu(gate_out, up_out);
+            defer _ = mlx.mlx_array_free(expert_act);
+
+            // down: expand inner singleton → [N,1,intermediate] → gather_qmm → [N,1,hidden]
+            var act_exp = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(act_exp);
+            try mlx.check(mlx.mlx_expand_dims(&act_exp, expert_act, -2, self.s));
+            var down_3d = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(down_3d);
+            try mlx.check(mlx.mlx_gather_qmm(&down_3d, act_exp, mw.switch_down_w, mw.switch_down_s, mw.switch_down_b, no_idx, sorted_inds, true, mlx.mlx_optional_int.some(@intCast(gs)), mlx.mlx_optional_int.some(@intCast(down_bits)), "affine", true, self.s));
+            var down_squeezed = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(down_squeezed);
+            try mlx.check(mlx.mlx_squeeze(&down_squeezed, down_3d, self.s)); // [N, hidden]
+
+            // Inverse permute → original order, then reshape back to [B,S,K,hidden].
+            var down_unsorted = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(down_unsorted);
+            try mlx.check(mlx.mlx_take_axis(&down_unsorted, down_squeezed, inv_order, 0, self.s));
+            const hidden = mlx.getShape(down_unsorted)[1];
+            const bskh_shape = [_]c_int{ B, S, K, hidden };
+            try mlx.check(mlx.mlx_reshape(&down_out, down_unsorted, &bskh_shape, 4, self.s));
+        } else {
+            // ── Decode / small-prefill path ──
+            const exp_shape = [_]c_int{ B, S, 1, 1, D };
+            var x_exp = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(x_exp);
+            try mlx.check(mlx.mlx_reshape(&x_exp, expert_x, &exp_shape, 5, self.s));
+
+            var gate_out_5d = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(gate_out_5d);
+            try mlx.check(mlx.mlx_gather_qmm(&gate_out_5d, x_exp, mw.switch_gate_w, mw.switch_gate_s, mw.switch_gate_b, no_idx, inds, true, mlx.mlx_optional_int.some(@intCast(gs)), mlx.mlx_optional_int.some(@intCast(gate_bits)), "affine", false, self.s));
+            var gate_out = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(gate_out);
+            try mlx.check(mlx.mlx_squeeze(&gate_out, gate_out_5d, self.s));
+
+            var up_out_5d = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(up_out_5d);
+            try mlx.check(mlx.mlx_gather_qmm(&up_out_5d, x_exp, mw.switch_up_w, mw.switch_up_s, mw.switch_up_b, no_idx, inds, true, mlx.mlx_optional_int.some(@intCast(gs)), mlx.mlx_optional_int.some(@intCast(up_bits)), "affine", false, self.s));
+            var up_out = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(up_out);
+            try mlx.check(mlx.mlx_squeeze(&up_out, up_out_5d, self.s));
+
+            const expert_act = try self.computeGeglu(gate_out, up_out);
+            defer _ = mlx.mlx_array_free(expert_act);
+
+            var act_exp = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(act_exp);
+            try mlx.check(mlx.mlx_expand_dims(&act_exp, expert_act, -2, self.s));
+            var down_5d = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(down_5d);
+            try mlx.check(mlx.mlx_gather_qmm(&down_5d, act_exp, mw.switch_down_w, mw.switch_down_s, mw.switch_down_b, no_idx, inds, true, mlx.mlx_optional_int.some(@intCast(gs)), mlx.mlx_optional_int.some(@intCast(down_bits)), "affine", false, self.s));
+            try mlx.check(mlx.mlx_squeeze(&down_out, down_5d, self.s)); // [B, S, K, hidden]
+        }
 
         // Weight by scores: down_out * norm_scores[..., None] → sum over K
         var scores_exp = mlx.mlx_array_new();
@@ -4520,7 +4641,7 @@ pub const Transformer = struct {
         defer _ = mlx.mlx_array_free(sh_gate);
         const sh_up = try self.qmatmul(expert_x, mw.shared_up_w, mw.shared_up_s, mw.shared_up_b);
         defer _ = mlx.mlx_array_free(sh_up);
-        const sh_act = try self.gatedMlpAct(sh_gate, sh_up);
+        const sh_act = try self.computeGeglu(sh_gate, sh_up);
         defer _ = mlx.mlx_array_free(sh_act);
         const sh_down = try self.qmatmul(sh_act, mw.shared_down_w, mw.shared_down_s, mw.shared_down_b);
         defer _ = mlx.mlx_array_free(sh_down);
@@ -4928,6 +5049,18 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
                 .shared_down_s = getLayerWeight(weights, name_buf, prefix, li, "mlp.down_proj.scales"),
                 .shared_down_b = getLayerWeight(weights, name_buf, prefix, li, "mlp.down_proj.biases"),
             } };
+            // Pre-fold the sigma-MoE router norm scale: at runtime the router does
+            // `rms_norm(x, router_scale * hidden_size^-0.5, eps)`. Multiplying once
+            // at load time saves the per-layer multiply (3 ops × num_layers).
+            if (lw.mlp.moe.router_scale) |rs| {
+                const root_size: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(config.hidden_size)));
+                const root_scalar = bf16Scalar(root_size, s);
+                defer _ = mlx.mlx_array_free(root_scalar);
+                var folded = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_multiply(&folded, rs, root_scalar, s));
+                try owned_bf16.append(allocator, folded);
+                lw.mlp.moe.router_scale = folded;
+            }
         } else if (config.isMoe()) {
             // Qwen3.5 MoE
             lw.mlp = .{ .moe = .{
@@ -5788,6 +5921,56 @@ fn detectQuantBits(w: mlx.mlx_array, sc: mlx.mlx_array, group_size: u32) u32 {
     const s_cols: u32 = @intCast(s_shape[s_shape.len - 1]);
     if (s_cols == 0) return 4;
     return (w_cols * 32) / (s_cols * group_size);
+}
+
+/// MoE routing chain (negate→argpartition→slice→softmax→take→sum→expand→divide).
+/// Free-function variant of `Transformer.moeRoutingUncompiled` so unit tests can
+/// exercise the pure subgraph without constructing a full Transformer. Returns
+/// owned `inds` (int32, [..., k]) and `norm_scores` (bf16, [..., k]) — caller
+/// must free both.
+fn moeRoutingChain(router_logits: mlx.mlx_array, k: c_int, s: mlx.mlx_stream) !Transformer.MoeRouting {
+    var neg_logits = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(neg_logits);
+    try mlx.check(mlx.mlx_negative(&neg_logits, router_logits, s));
+
+    var partitioned = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(partitioned);
+    try mlx.check(mlx.mlx_argpartition_axis(&partitioned, neg_logits, k - 1, -1, s));
+
+    const p_shape = mlx.getShape(partitioned);
+    var inds = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(inds);
+    {
+        var start_arr: [4]c_int = undefined;
+        var stop_arr: [4]c_int = undefined;
+        var strides_arr: [4]c_int = undefined;
+        for (0..p_shape.len) |d| {
+            start_arr[d] = 0;
+            stop_arr[d] = if (d == p_shape.len - 1) k else p_shape[d];
+            strides_arr[d] = 1;
+        }
+        try mlx.check(mlx.mlx_slice(&inds, partitioned, &start_arr, p_shape.len, &stop_arr, p_shape.len, &strides_arr, p_shape.len, s));
+    }
+
+    var probs = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(probs);
+    try mlx.check(mlx.mlx_softmax_axis(&probs, router_logits, -1, true, s));
+
+    var top_weights = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(top_weights);
+    try mlx.check(mlx.mlx_take_along_axis(&top_weights, probs, inds, -1, s));
+
+    var weight_sum_raw = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(weight_sum_raw);
+    try mlx.check(mlx.mlx_sum_axis(&weight_sum_raw, top_weights, -1, false, s));
+    var weight_sum = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(weight_sum);
+    try mlx.check(mlx.mlx_expand_dims(&weight_sum, weight_sum_raw, -1, s));
+    var norm_scores = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(norm_scores);
+    try mlx.check(mlx.mlx_divide(&norm_scores, top_weights, weight_sum, s));
+
+    return .{ .inds = inds, .norm_scores = norm_scores };
 }
 
 fn qmatmulBits(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, bits: u32, group_size: u32, s: mlx.mlx_stream) !mlx.mlx_array {
@@ -7220,4 +7403,71 @@ test "appendLinearAttnWeights skips fields with null ctx (plain bf16 layers)" {
     // (conv1d/A_log/dt_bias/norm_w) = 9 expected. The 10 null-ctx scales/biases
     // are skipped — confirms the optional-bf16 path doesn't poison the eval batch.
     try testing.expectEqual(@as(usize, 9), mlx.mlx_vector_array_size(vec));
+}
+
+test "moeRoutingChain produces top-K indices and renormalized softmax weights" {
+    const s = mlx.gpuStream();
+
+    // Two rows of router logits over 6 experts. Top-2 of each row is unambiguous:
+    //   row 0: experts {0, 3} (logits 10 and 5)
+    //   row 1: experts {1, 4} (logits 10 and 5)
+    const n_rows: c_int = 2;
+    const n_exp: c_int = 6;
+    const k: c_int = 2;
+    const data = [_]f32{
+        10.0, 0.0, 0.0, 5.0, 0.0, 0.0,
+        0.0,  10.0, 0.0, 0.0, 5.0, 0.0,
+    };
+    const shape = [_]c_int{ n_rows, n_exp };
+    const logits = mlx.mlx_array_new_data(&data, &shape, 2, .float32);
+    defer _ = mlx.mlx_array_free(logits);
+
+    const routed = try moeRoutingChain(logits, k, s);
+    defer _ = mlx.mlx_array_free(routed.inds);
+    defer _ = mlx.mlx_array_free(routed.norm_scores);
+
+    // Shape check (cheap, no data read needed).
+    {
+        const inds_shape = mlx.getShape(routed.inds);
+        try testing.expectEqual(@as(usize, 2), inds_shape.len);
+        try testing.expectEqual(n_rows, inds_shape[0]);
+        try testing.expectEqual(k, inds_shape[1]);
+        const sc_shape = mlx.getShape(routed.norm_scores);
+        try testing.expectEqual(@as(usize, 2), sc_shape.len);
+        try testing.expectEqual(n_rows, sc_shape[0]);
+        try testing.expectEqual(k, sc_shape[1]);
+    }
+
+    // To verify top-K correctness without reading non-contiguous slice memory
+    // directly, gather the original logits at the selected indices: gathered[i,j]
+    // == logits[i, inds[i,j]]. Then sum across K — for our fixture, the top-2
+    // logits in each row are {10, 5}, so the per-row sum must be 15.
+    var gathered = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(gathered);
+    try mlx.check(mlx.mlx_take_along_axis(&gathered, logits, routed.inds, -1, s));
+    var gathered_sum = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(gathered_sum);
+    try mlx.check(mlx.mlx_sum_axis(&gathered_sum, gathered, -1, false, s));
+
+    // norm_scores must sum to 1 along K (verifies the renormalize step).
+    var scores_sum = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(scores_sum);
+    try mlx.check(mlx.mlx_sum_axis(&scores_sum, routed.norm_scores, -1, false, s));
+
+    {
+        const ev = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(ev);
+        _ = mlx.mlx_vector_array_append_value(ev, gathered_sum);
+        _ = mlx.mlx_vector_array_append_value(ev, scores_sum);
+        try mlx.check(mlx.mlx_eval(ev));
+    }
+
+    // gathered_sum and scores_sum are 1D outputs of sum_axis (contiguous).
+    const gs = mlx.mlx_array_data_float32(gathered_sum) orelse return error.InvalidDtype;
+    const ss = mlx.mlx_array_data_float32(scores_sum) orelse return error.InvalidDtype;
+    const tol: f32 = 1e-3;
+    try testing.expect(@abs(gs[0] - 15.0) < tol);
+    try testing.expect(@abs(gs[1] - 15.0) < tol);
+    try testing.expect(@abs(ss[0] - 1.0) < tol);
+    try testing.expect(@abs(ss[1] - 1.0) < tol);
 }
