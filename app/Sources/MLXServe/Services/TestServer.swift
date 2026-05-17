@@ -350,19 +350,22 @@ class TestServer {
         let userMsg = ChatMessage(role: .user, content: message)
         appState.appendMessage(to: sessionId, message: userMsg)
 
-        // Stream response (non-agent, no tools)
+        let api = APIClient()
+        // Build the request body BEFORE appending the streaming placeholder
+        // so the placeholder never lands in the prompt. Session is the source
+        // of truth — no re-adding the user message (that double-add caused
+        // DSV4-Flash to degenerate into a repeating-token loop at temp > 0).
+        let messagesArray = appState.chatSessions
+            .first(where: { $0.id == sessionId })?.messages
+            .filter { !$0.isAgentSummary }
+            .map { ["role": $0.role.rawValue, "content": $0.content] as [String: Any] }
+            ?? []
+
+        // Streaming placeholder for the UI / history endpoint, appended after
+        // the request body so it's not part of the prompt.
         var assistantMsg = ChatMessage(role: .assistant, content: "")
         assistantMsg.isStreaming = true
         appState.appendMessage(to: sessionId, message: assistantMsg)
-
-        let api = APIClient()
-        let messages = appState.chatSessions
-            .first(where: { $0.id == sessionId })?.messages
-            .filter { !$0.isAgentSummary }
-            .dropLast()
-            .map { ["role": $0.role.rawValue, "content": $0.content] as [String: Any] }
-            ?? []
-        let messagesArray = Array(messages) + [["role": "user", "content": message] as [String: Any]]
 
         do {
             let stream = api.streamChat(

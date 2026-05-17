@@ -57,19 +57,13 @@ struct ModelDownloadRow: View {
                         .font(.caption)
                 } else if let state, state.status == .failed {
                     Button(downloads.hasPartialDownload(option.repoId) ? "Resume" : "Retry") {
-                        Task {
-                            await downloads.download(repoId: option.repoId)
-                            appState.refreshModels()
-                        }
+                        startDownload()
                     }
                     .font(.caption)
                     .controlSize(.mini)
                 } else {
                     Button(downloads.hasPartialDownload(option.repoId) ? "Resume" : "Download") {
-                        Task {
-                            await downloads.download(repoId: option.repoId)
-                            appState.refreshModels()
-                        }
+                        startDownload()
                     }
                     .font(.caption)
                     .controlSize(.mini)
@@ -92,5 +86,18 @@ struct ModelDownloadRow: View {
             }
         }
         .padding(.vertical, 3)
+    }
+
+    /// Kick off a download, picking the GGUF single-file path for ds4-backed
+    /// entries and the standard safetensors-tree path for everything else.
+    private func startDownload() {
+        Task {
+            if let gguf = option.ggufFilename {
+                await downloads.downloadGguf(repoId: option.repoId, ggufFilename: gguf)
+            } else {
+                await downloads.download(repoId: option.repoId)
+            }
+            appState.refreshModels()
+        }
     }
 }

@@ -16,6 +16,13 @@ test {
     _ = @import("responses.zig");
     _ = @import("ws.zig");
     _ = @import("pld_index.zig");
+    _ = @import("kv_quant.zig");
     _ = @import("drafter.zig");
     _ = @import("tokenizer.zig");
+    _ = @import("prefix_cache.zig");
+    _ = @import("model_discovery.zig");
+    _ = @import("model_registry.zig");
+    _ = @import("scheduler.zig");
+    _ = @import("ds4_ffi.zig");
+    _ = @import("arch/ds4.zig");
 }

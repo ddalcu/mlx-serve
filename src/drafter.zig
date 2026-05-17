@@ -1014,8 +1014,10 @@ fn layerForward(
     layer: *const DrafterLayer,
     h: mlx.mlx_array,
     target: *Transformer,
+    cache: *const KVCache,
     rope_offset: c_int,
 ) !mlx.mlx_array {
+    _ = target; // KV reads moved to `cache`; target retained for future per-target tweaks
     const eps = self.config.rms_norm_eps;
     const s = self.s;
     const n_heads: c_int = @intCast(layer.n_heads);
@@ -1058,11 +1060,18 @@ fn layerForward(
     // ── Read shared K/V from target ──
     const kv_layer_idx = self.target_kv_layer_for_type[@intFromEnum(layer.layer_type)] orelse
         return error.DrafterTargetMismatch;
-    const tgt_entry = &target.cache.entries[kv_layer_idx];
+    const tgt_entry = &cache.entries[kv_layer_idx];
     if (!tgt_entry.initialized) return error.TargetCacheUninitialized;
 
-    const full_k = tgt_entry.key_view;
-    const full_v = tgt_entry.value_view;
+    // `denseView` is a const-method-like read — but cache is a `*const KVCache`
+    // here. The `denseView` impl does not mutate `self` in dense mode (just
+    // returns aliased handles). For the quant variant, dequantization
+    // allocates fresh arrays without touching cache state. Cast away const
+    // for the call; SDPA below consumes the returned dense pair.
+    var tgt_dense = try @constCast(cache).denseView(kv_layer_idx, s);
+    defer tgt_dense.deinit();
+    const full_k = tgt_dense.k;
+    const full_v = tgt_dense.v;
 
     // Build mask
     const k_shape = mlx.getShape(full_k);
@@ -1265,15 +1274,19 @@ fn maskedLmHead(
 ///   `prev_token_id` — token we're drafting from (initial t1, then last sampled draft).
 ///   `target_hidden` — `[1, 1, backbone_hidden]` from target (post-final-norm
 ///       captured via `forwardCaptureHidden`).
-///   `target` — pointer to target Transformer (we cross-attend its KV cache).
-///   `rope_offset` — Q rotation position. Caller passes `target.cache.step`
-///       on the first draft of a round; subsequent drafts in the same round
-///       use the SAME offset (per upstream `set_shared_kv`).
+///   `target` — pointer to target Transformer (we read embed weights and
+///       config). The KV cache to read from is supplied separately as `cache`.
+///   `cache` — KV cache to cross-attend into. Phase 2 makes this per-slot;
+///       legacy single-slot callers pass `&target.cache`.
+///   `rope_offset` — Q rotation position. Caller passes `cache.step` on the
+///       first draft of a round; subsequent drafts in the same round use the
+///       SAME offset (per upstream `set_shared_kv`).
 ///
 /// Output: `DrafterStepOut` — caller frees both arrays.
 pub fn step(
     self: *DrafterModel,
     target: *Transformer,
+    cache: *const KVCache,
     prev_token_id: u32,
     target_hidden: mlx.mlx_array,
     rope_offset: c_int,
@@ -1282,7 +1295,7 @@ pub fn step(
     const id_shape = [_]c_int{1};
     const id_arr = mlx.mlx_array_new_data(&id_i32, &id_shape, 1, .int32);
     defer _ = mlx.mlx_array_free(id_arr);
-    return stepArr(self, target, id_arr, target_hidden, rope_offset);
+    return stepArr(self, target, cache, id_arr, target_hidden, rope_offset);
 }
 
 /// Like `step` but accepts `prev_token_arr` as a caller-owned 1-element int32
@@ -1295,6 +1308,7 @@ pub fn step(
 pub fn stepArr(
     self: *DrafterModel,
     target: *Transformer,
+    cache: *const KVCache,
     prev_token_arr: mlx.mlx_array,
     target_hidden: mlx.mlx_array,
     rope_offset: c_int,
@@ -1321,7 +1335,7 @@ pub fn stepArr(
 
     // ── Forward through drafter layers (cross-attn into target's KV) ──
     for (self.layers) |*lw| {
-        const new_h = try layerForward(self, lw, h, target, rope_offset);
+        const new_h = try layerForward(self, lw, h, target, cache, rope_offset);
         _ = mlx.mlx_array_free(h);
         h = new_h;
     }

@@ -292,7 +292,42 @@ Reproduce with **`./tests/bench_spec_matrix.sh`** (release-comparison matrix vs.
 ![Gemma 4](docs/perf-vs-lmstudio-gemma-26.5.5.png)
 ![Qwen 3.6](docs/perf-vs-lmstudio-qwen36-26.5.5.png)
 
-Reproduce: `./tests/bench_vs_lmstudio.sh --family gemma` (or `qwen36`). Requires `lms`, `jq`, `python3`, `matplotlib`.
+Reproduce: `./tests/bench_vs_lmstudio_omlx.sh --family gemma` (or `qwen36`). Requires `lms`, `jq`, `python3`, `matplotlib`; install `omlx` to include it in the comparison (it auto-skips otherwise).
+
+## Acknowledgements
+
+mlx-serve stands on a lot of open-source shoulders. Huge thanks to all of these projects.
+
+### Inference + math
+
+- [**MLX**](https://github.com/ml-explore/mlx) (Apple) — the C++/Metal tensor framework that does the actual GPU work. We link against it via [`mlx-c`](https://github.com/ml-explore/mlx-c), Apple's stable C API, so a Zig binary can drive it without a Python runtime.
+- [**mlx-lm**](https://github.com/ml-explore/mlx-lm) (Apple) — the reference Python implementation we cross-check against on every release. Many architecture quirks were nailed down by reading mlx-lm side-by-side.
+- [**antirez/ds4**](https://github.com/antirez/ds4) — the embedded engine that serves DeepSeek-V4-Flash via GGUF. Vendored under `lib/ds4/` pinned at commit `613e9b2`; native Metal kernels, official-logits-validated. Salvatore did the hard part.
+
+### Model architectures + tokenizers
+
+- [**llama.cpp**](https://github.com/ggerganov/llama.cpp) — vendored under `lib/jinja_cpp/` for the C++17 Jinja2 chat-template engine plus the bundled [**nlohmann/json**](https://github.com/nlohmann/json) header.
+- [**Google Gemma**](https://ai.google.dev/gemma), [**Qwen team**](https://huggingface.co/Qwen), [**Meta Llama**](https://www.llama.com/), [**Mistral AI**](https://mistral.ai/), [**NVIDIA Nemotron-H**](https://huggingface.co/nvidia), [**Liquid LFM2.5**](https://www.liquid.ai/), [**DeepSeek**](https://www.deepseek.com/) — the model families this server runs. The Zig forward paths were written against each project's official reference implementations.
+- The [**HuggingFace `tokenizers`**](https://github.com/huggingface/tokenizers) library — the byte-level BPE reference our Zig tokenizer matches against.
+
+### Image + video
+
+- [**stb_image**](https://github.com/nothings/stb) — single-header JPEG/PNG decode for vision input.
+- [**libwebp**](https://chromium.googlesource.com/webm/libwebp) — WebP decode.
+- [**Black Forest Labs FLUX.2**](https://huggingface.co/black-forest-labs) and [**LTX-Video 2.3 (dgrauet/ltx-2-mlx)**](https://github.com/dgrauet/ltx-2-mlx) — the optional MLX-native image / video generators MLX Core can drive.
+
+### MLX Core (Swift app) integrations
+
+- [**Anthropic swift-sdk**](https://github.com/anthropics/swift-sdk) — the Claude API client the agent loop uses.
+- [**Model Context Protocol (Swift SDK)**](https://github.com/modelcontextprotocol/swift-sdk) — powers the MCP marketplace + tool routing.
+- Apple frameworks (PDFKit, WKWebView, AVFoundation, AppKit, SwiftUI) — the menu-bar app, browser tool, video player, and PDF attachment pipeline all ride on these.
+
+### Build + ship
+
+- [**Zig**](https://ziglang.org) — the systems language the server is written in. The 0.16 migration was painless thanks to the team's documentation.
+- [**Homebrew**](https://brew.sh/) — distribution channel for both the server (`brew install mlx-serve`) and the GUI (`brew install --cask mlx-core`).
+
+If we missed you, please open a PR — happy to add anyone who landed code, fixtures, or a fix here.
 
 ## License
 

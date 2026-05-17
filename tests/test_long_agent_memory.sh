@@ -73,7 +73,7 @@ if ! curl -sf "$BASE/health" > /dev/null 2>&1; then
     fi
     echo "Starting mlx-serve on port $PORT (log: $LOG)..."
     ./zig-out/bin/mlx-serve --model "$MODEL" --serve --port "$PORT" --log-level info \
-        "${DRAFTER_ARGS[@]}" > "$LOG" 2>&1 &
+        "${DRAFTER_ARGS[@]}" ${MLX_SERVE_TEST_EXTRA_ARGS:-} > "$LOG" 2>&1 &
     SERVER_PID=$!
     OWN_SERVER=1
     trap 'if [ "$OWN_SERVER" = "1" ]; then kill $SERVER_PID 2>/dev/null; wait $SERVER_PID 2>/dev/null; fi' EXIT

@@ -28,6 +28,22 @@ struct ServerOptions: Codable, Equatable {
     var drafterPath: String = ""        // empty = no drafter
     var draftBlockSize: Int = 4
 
+    // Performance (server-launch flags)
+    /// Continuous batching: max in-flight chat requests batched through one
+    /// forward pass. 1 = serial (default). Hybrid SSM / MoE models clamp to 1
+    /// regardless. Pure-attention dense models pick up ~1.6× at 4-way.
+    var maxConcurrent: Int = 1
+    /// KV-cache quantization scheme. `off` = dense bf16. `int4` / `int8` apply
+    /// affine quant; `turbo2` / `turbo4` add a per-layer Hadamard rotation for
+    /// heavy-tailed activations.
+    var kvQuant: KVQuant = .off
+    /// Hot prefix cache entry count. >0 enables cross-request KV reuse for
+    /// shared system prompts. 0 disables.
+    var prefixCacheEntries: Int = 1
+    /// Hot prefix cache memory budget. `2GB`, `512MB`, etc. `0` or `off`
+    /// disables the byte cap (count cap still applies). Empty = server default.
+    var prefixCacheMem: String = "2GB"
+
     // MARK: Per-request defaults (apply immediately, no restart)
     var defaultMaxTokens: Int = 4096
     var defaultTemperature: Double = 0.8
@@ -45,6 +61,26 @@ struct ServerOptions: Codable, Equatable {
     enum LogLevel: String, Codable, CaseIterable, Identifiable {
         case error, warn, info, debug
         var id: String { rawValue }
+    }
+
+    enum KVQuant: String, Codable, CaseIterable, Identifiable {
+        case off
+        case int4 = "4"
+        case int8 = "8"
+        case turbo2
+        case turbo4
+        var id: String { rawValue }
+        /// CLI flag value (`--kv-quant <x>`); same string the server parses.
+        var cliValue: String { rawValue }
+        var label: String {
+            switch self {
+            case .off:    return "Off (dense bf16)"
+            case .int4:   return "4-bit (≈4× smaller KV)"
+            case .int8:   return "8-bit (≈2× smaller KV)"
+            case .turbo2: return "TurboQuant 2-bit"
+            case .turbo4: return "TurboQuant 4-bit"
+            }
+        }
     }
 
     enum TriState: String, Codable, CaseIterable, Identifiable {
@@ -83,20 +119,32 @@ struct ServerOptions: Codable, Equatable {
         pldDraftLen == other.pldDraftLen &&
         pldKeyLen == other.pldKeyLen &&
         drafterPath == other.drafterPath &&
-        draftBlockSize == other.draftBlockSize
+        draftBlockSize == other.draftBlockSize &&
+        maxConcurrent == other.maxConcurrent &&
+        kvQuant == other.kvQuant &&
+        prefixCacheEntries == other.prefixCacheEntries &&
+        prefixCacheMem == other.prefixCacheMem
     }
 
     // MARK: CLI args builder
 
     /// Translate to the `mlx-serve` CLI flags. The leading `--model <path>` is
     /// passed by ServerManager (since the model path comes from AppState).
-    func toCLIArgs() -> [String] {
+    ///
+    /// Plan 05 Phase G — `modelDirOverride` lets the caller inject
+    /// `--model-dir <path>` so the registry sees siblings (enables
+    /// hot-switch). ServerManager passes the parent directory of the
+    /// selected model.
+    func toCLIArgs(modelDirOverride: String? = nil) -> [String] {
         var args: [String] = [
             "--serve",
             "--port", "\(port)",
             "--host", host,
             "--log-level", logLevel.rawValue,
         ]
+        if let dir = modelDirOverride, !dir.isEmpty {
+            args += ["--model-dir", dir]
+        }
         if ctxSize > 0 {
             args += ["--ctx-size", "\(ctxSize)"]
         }
@@ -114,6 +162,21 @@ struct ServerOptions: Codable, Equatable {
         if !drafterPath.isEmpty {
             args += ["--drafter", drafterPath,
                      "--draft-block-size", "\(draftBlockSize)"]
+        }
+        // Performance: only emit non-default flags so the CLI tail stays
+        // readable in log lines and `ps`. Server defaults are 1 / off / 1 / 2GB.
+        if maxConcurrent > 1 {
+            args += ["--max-concurrent", "\(maxConcurrent)"]
+        }
+        if kvQuant != .off {
+            args += ["--kv-quant", kvQuant.cliValue]
+        }
+        if prefixCacheEntries != 1 {
+            args += ["--prefix-cache-entries", "\(prefixCacheEntries)"]
+        }
+        let trimmedPrefixMem = prefixCacheMem.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmedPrefixMem.isEmpty && trimmedPrefixMem != "2GB" {
+            args += ["--prefix-cache-mem", trimmedPrefixMem]
         }
         return args
     }
@@ -193,6 +256,22 @@ extension ServerOptions {
         "draftBlockSize": .init(
             title: "Drafter block size",
             explainer: "Tokens per drafter round (default 4 = 3 drafter steps + 1 verify token).",
+            needsRestart: true),
+        "maxConcurrent": .init(
+            title: "Concurrent requests",
+            explainer: "Continuous batching: how many chat requests share one forward pass. 1 = serial. 2 is a good default for dense models (~1.5× throughput, ~33% per-request latency cost). MoE and hybrid SSM models stay serial regardless.",
+            needsRestart: true),
+        "kvQuant": .init(
+            title: "KV cache quantization",
+            explainer: "Shrinks the KV cache: 4-bit ≈ 4× smaller, 8-bit ≈ 2×. Lets a 16K context fit on hardware that couldn't hold it dense, or doubles the parallel-request budget. TurboQuant variants add a per-layer Hadamard rotation for heavy-tailed activations.",
+            needsRestart: true),
+        "prefixCacheEntries": .init(
+            title: "Prefix cache entries",
+            explainer: "Hot prefix cache size: how many separate KV snapshots to keep across requests. Lets multi-turn chats skip re-prefilling shared system prompts. 0 disables.",
+            needsRestart: true),
+        "prefixCacheMem": .init(
+            title: "Prefix cache memory cap",
+            explainer: "Maximum RAM for the prefix cache. Accepts '2GB', '512MB', '0' (disable byte cap). Default 2GB.",
             needsRestart: true),
     ]
 

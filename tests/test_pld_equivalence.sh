@@ -113,7 +113,7 @@ run_request() {
     echo "  starting server ($label)..." >&2
     local logfile
     logfile=$(mktemp)
-    "$BINARY" --model "$MODEL" --serve --port "$PORT" $pld_flag > "$logfile" 2>&1 &
+    "$BINARY" --model "$MODEL" --serve --port "$PORT" $pld_flag ${MLX_SERVE_TEST_EXTRA_ARGS:-} > "$logfile" 2>&1 &
     local pid=$!
     local up=0
     for i in $(seq 1 60); do
@@ -146,7 +146,7 @@ run_and_tokenize() {
     echo "  starting server ($label)..." >&2
     local logfile
     logfile=$(mktemp)
-    "$BINARY" --model "$MODEL" --serve --port "$PORT" $pld_flag > "$logfile" 2>&1 &
+    "$BINARY" --model "$MODEL" --serve --port "$PORT" $pld_flag ${MLX_SERVE_TEST_EXTRA_ARGS:-} > "$logfile" 2>&1 &
     local pid=$!
     local up=0
     for i in $(seq 1 60); do

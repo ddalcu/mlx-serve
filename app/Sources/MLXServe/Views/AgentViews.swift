@@ -220,7 +220,7 @@ struct WorkingDirectoryIndicator: View {
             .padding(.horizontal, 8)
         }
         .buttonStyle(.borderless)
-        .help("Working directory for agent commands")
+        .help("Workspace — the working directory for every Agent tool call.\nshell, readFile, writeFile, editFile, searchFiles, listFiles, browse all resolve relative paths from here. Click to pick a new directory.")
     }
 
     private func pickDirectory() {

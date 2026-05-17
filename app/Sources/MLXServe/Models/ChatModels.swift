@@ -161,6 +161,18 @@ struct ModelInfo {
     /// Absolute path passed to `--drafter` at startup. nil when the server
     /// has no drafter loaded.
     var drafterPath: String? = nil
+    /// Plan 05 Phase G — multi-model fields. All optional so older
+    /// servers (single-model) still decode without these.
+    /// Whether this entry currently holds resident weights.
+    var loaded: Bool = true
+    /// Entry state from the registry: "ready" | "unloaded" | "loading" |
+    /// "error" | "evicting". nil on pre-Phase-D servers.
+    var state: String? = nil
+    /// Approximate bytes resident in GPU memory; 0 for unloaded entries.
+    var bytesResident: UInt64 = 0
+    /// Sum of *.safetensors sizes on disk; nil when scan failed or
+    /// pre-Phase-E server.
+    var bytesOnDisk: UInt64? = nil
 }
 
 struct MemoryInfo {
@@ -207,6 +219,7 @@ enum ServerStatus: Equatable {
 enum LocalModelSource: String, Codable, Hashable {
     case mlxServe
     case lmStudio
+    case custom
 }
 
 /// Distinguishes a base model from a paired drafter checkpoint. Drafters are
@@ -260,6 +273,21 @@ struct GemmaModelOption: Identifiable {
     let displayName: String
     let repoId: String
     let sizeEstimate: String
+    /// Optional explicit GGUF filename within `repoId`. When non-nil the
+    /// downloader resolves a single `.gguf` artifact and the server loads it
+    /// through the embedded ds4 engine instead of the MLX/safetensors path.
+    let ggufFilename: String?
+    /// Minimum host RAM (bytes) before this entry is surfaced in the UI. 0 = no gate.
+    let minHostRamBytes: UInt64
+
+    init(id: String, displayName: String, repoId: String, sizeEstimate: String, ggufFilename: String? = nil, minHostRamBytes: UInt64 = 0) {
+        self.id = id
+        self.displayName = displayName
+        self.repoId = repoId
+        self.sizeEstimate = sizeEstimate
+        self.ggufFilename = ggufFilename
+        self.minHostRamBytes = minHostRamBytes
+    }
 }
 
 let gemmaModelOptions: [GemmaModelOption] = [
@@ -275,6 +303,23 @@ let gemmaModelOptions: [GemmaModelOption] = [
     // 31B: 31B dense — fits 36 GB+ Macs (4-bit) or 48 GB+ (8-bit)
     GemmaModelOption(id: "31b-4bit", displayName: "Gemma 4 31B (4-bit)", repoId: "mlx-community/gemma-4-31b-it-4bit", sizeEstimate: "~18.4 GB, needs 36 GB+ RAM"),
     GemmaModelOption(id: "31b-8bit", displayName: "Gemma 4 31B (8-bit)", repoId: "mlx-community/gemma-4-31b-it-8bit", sizeEstimate: "~33.8 GB, needs 48 GB+ RAM"),
+    // DeepSeek-V4-Flash via ds4 GGUF — 96 GB+ Macs only. Served by the embedded
+    // ds4 engine (antirez/ds4) rather than the MLX/safetensors path.
+    GemmaModelOption(
+        id: "dsv4-flash-gguf",
+        displayName: "DeepSeek-V4-Flash (ds4)",
+        repoId: "antirez/deepseek-v4-gguf",
+        sizeEstimate: "~85 GB, needs 96 GB+ RAM",
+        ggufFilename: "DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2.gguf",
+        minHostRamBytes: 96 * (UInt64(1) << 30)
+    ),
 ]
 
-let gemmaModelOptions8BitOnly = gemmaModelOptions.filter { $0.id.contains("8bit") }
+let gemmaModelOptions8BitOnly = gemmaModelOptions.filter { $0.id.contains("8bit") || $0.id.contains("dsv4") }
+
+/// Subset of `gemmaModelOptions` visible on the current host. Hides entries
+/// whose `minHostRamBytes` exceeds the system RAM.
+var availableGemmaModelOptions: [GemmaModelOption] {
+    let ram = ProcessInfo.processInfo.physicalMemory
+    return gemmaModelOptions.filter { $0.minHostRamBytes <= ram }
+}

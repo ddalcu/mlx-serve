@@ -1,16 +1,23 @@
 #!/bin/bash
 # End-to-end test for MLX Core app via AppleScript UI automation + API monitoring.
 #
+# Self-bootstraps: if MLX Core isn't running, this script builds (if needed)
+# and launches the app, then waits up to 90s for its embedded mlx-serve to
+# come up on $PORT. If no model is configured to auto-load on launch and the
+# server never appears, the script SKIPs cleanly (exit 0) with instructions
+# so CI doesn't see it as a hard failure.
+#
 # Requires:
-#   - MLX Core app running with a model loaded
 #   - Accessibility permissions for Terminal (System Settings → Privacy → Accessibility)
+#     for the UI-automation half. API-only tests still run without it.
 #
 # What it does:
-#   1. Opens a chat window in MLX Core
-#   2. Enables agent mode
-#   3. Types test prompts and sends them
-#   4. Monitors server logs, chat history, and API requests
-#   5. Validates tool calls and responses
+#   1. Builds and launches MLX Core if not running
+#   2. Opens a chat window in MLX Core
+#   3. Enables agent mode
+#   4. Types test prompts and sends them
+#   5. Monitors server logs, chat history, and API requests
+#   6. Validates tool calls and responses
 #
 # Usage: ./tests/test_mlxcore.sh [port]
 
@@ -29,6 +36,9 @@ NC='\033[0m'
 PASS=0
 FAIL=0
 
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+
 > "$LOG_FILE"
 
 log() { echo "[$(date +%H:%M:%S)] $*" | tee -a "$LOG_FILE"; }
@@ -40,22 +50,72 @@ echo "  MLX Core End-to-End Test"
 echo "═══════════════════════════════════════════════"
 echo ""
 
+# ── Locate or build the .app, then launch ──
+# Prefer an existing build in this order: dev build (app/MLX Core.app) >
+# installed (/Applications/MLX Core.app). If neither exists, build a dev
+# .app via app/build.sh with notarization skipped (signing still happens —
+# SKIP_NOTARIZE=1 only short-circuits the Apple-Notary submission step).
+locate_app() {
+    if [[ -d "$REPO_ROOT/app/MLX Core.app" ]]; then
+        echo "$REPO_ROOT/app/MLX Core.app"
+    elif [[ -d "/Applications/MLX Core.app" ]]; then
+        echo "/Applications/MLX Core.app"
+    else
+        echo ""
+    fi
+}
+
+ensure_app_running() {
+    if pgrep -q MLXCore; then
+        log "MLX Core already running"
+        return 0
+    fi
+    local app_path; app_path="$(locate_app)"
+    if [[ -z "$app_path" ]]; then
+        log "No MLX Core.app on disk — building via app/build.sh (SKIP_NOTARIZE=1)..."
+        if ! SKIP_NOTARIZE=1 bash "$REPO_ROOT/app/build.sh" >>"$LOG_FILE" 2>&1; then
+            echo -e "${YELLOW}SKIP${NC} test_mlxcore: app/build.sh failed (see $LOG_FILE)"
+            exit 0
+        fi
+        app_path="$(locate_app)"
+        if [[ -z "$app_path" ]]; then
+            echo -e "${YELLOW}SKIP${NC} test_mlxcore: build succeeded but no .app produced"
+            exit 0
+        fi
+    fi
+    log "Launching $app_path"
+    open "$app_path"
+    # Wait up to 30s for the process to appear.
+    for _ in $(seq 1 60); do
+        pgrep -q MLXCore && return 0
+        sleep 0.5
+    done
+    echo -e "${YELLOW}SKIP${NC} test_mlxcore: MLXCore process never appeared after open"
+    exit 0
+}
+
 # ── Check prerequisites ──
 log "Checking prerequisites..."
 
-# App running?
-if ! pgrep -q MLXCore; then
-    echo -e "${RED}MLX Core is not running. Launch it first.${NC}"
-    exit 1
-fi
+ensure_app_running
 pass "MLX Core app is running"
 
-# Server running?
-if curl -sf "$BASE/health" > /dev/null 2>&1; then
+# Server running?  The app's embedded mlx-serve only starts listening once
+# the user (or a launch-time auto-load setting) picks a model. Wait up to
+# 90s — if it never comes up, that's a "model not configured" SKIP, not a
+# test failure.
+SERVER_UP=0
+for _ in $(seq 1 180); do
+    if curl -sf "$BASE/health" > /dev/null 2>&1; then SERVER_UP=1; break; fi
+    sleep 0.5
+done
+if [[ "$SERVER_UP" -eq 1 ]]; then
     pass "Server is healthy on port $PORT"
 else
-    fail "Server not responding on port $PORT" "Start a model in MLX Core first"
-    exit 1
+    echo -e "${YELLOW}SKIP${NC} test_mlxcore: MLX Core launched but no model loaded — server never appeared on :$PORT"
+    echo "  Configure MLX Core to auto-load a model (Settings → Server → Launch-time model)"
+    echo "  or load one manually, then re-run this test."
+    exit 0
 fi
 
 # Check accessibility

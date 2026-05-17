@@ -1,5 +1,9 @@
 const std = @import("std");
 const mlx = @import("mlx.zig");
+const kv_quant = @import("kv_quant.zig");
+
+pub const KVQuantConfig = kv_quant.KVQuantConfig;
+pub const KVQuantScheme = kv_quant.Scheme;
 
 // ── GatedDeltaNet fused Metal kernel ──
 // Ported from mlx-lm/models/gated_delta.py: `_make_gated_delta_kernel(has_mask=False, vectorized=False)`.
@@ -101,90 +105,220 @@ const Weights = model_mod.Weights;
 
 // ── KV Cache (standard attention) ──
 
-const KVCacheEntry = struct {
-    keys: mlx.mlx_array, // pre-allocated buffer [B, heads, capacity, head_dim]
+pub const KVCacheEntry = struct {
+    // Storage. In `off` (dense bf16) mode `keys`/`values` are the full
+    // [B,H,T,D] buffers and the `*_scales`/`*_biases` fields stay null. In
+    // `affine` mode `keys`/`values` hold packed uint32 codes
+    // ([B,H,T, D*bits/32]) and the matching scales/biases hold
+    // [B,H,T, D/group_size] bf16. Switched on `KVCache.config.scheme`.
+    keys: mlx.mlx_array,
     values: mlx.mlx_array,
-    key_view: mlx.mlx_array, // sliced view [B, heads, offset, head_dim]
+    keys_scales: mlx.mlx_array,
+    keys_biases: mlx.mlx_array,
+    values_scales: mlx.mlx_array,
+    values_biases: mlx.mlx_array,
+
+    // Views: same layout as the storage fields above but trimmed to
+    // [..., offset, ...] (or last `sw` entries during sliding-window decode).
+    // SDPA reads dense arrays via `KVCache.denseView`; in `off` mode the
+    // dense pair aliases `key_view`/`value_view`, in `affine` mode the
+    // dense pair is freshly dequantized from these triples on read.
+    key_view: mlx.mlx_array,
     value_view: mlx.mlx_array,
+    key_scales_view: mlx.mlx_array,
+    key_biases_view: mlx.mlx_array,
+    value_scales_view: mlx.mlx_array,
+    value_biases_view: mlx.mlx_array,
+
     offset: usize, // logical token count (may be < buffer capacity)
     initialized: bool,
 };
+
+/// Materialized dense `[B,H,T,D]` K/V pair handed to SDPA. Owns its arrays
+/// only when `owned == true` (i.e. when the cache stores quantized data and
+/// `KVCache.denseView` had to dequantize on read). In dense mode `k`/`v`
+/// alias the cache's `key_view`/`value_view` and `deinit` is a no-op.
+///
+/// Phase 2 (fused-attn): in `.affine` mode the view ALSO carries borrowed
+/// references to the cache's quantized K/V triples (`k_triple_q`, etc.).
+/// SDPA call sites that opt into the fused path (`ctx.kv_attn_fused`) read
+/// the triple via `quantTriple()`; everyone else uses `k`/`v` as before
+/// and pays for the dense materialization. The arrays are non-owning
+/// borrows of the cache's `key_view` / `key_scales_view` / `key_biases_view`
+/// (and the V trio) — the cache keeps them alive for the request's lifetime.
+pub const DenseKVView = struct {
+    k: mlx.mlx_array,
+    v: mlx.mlx_array,
+    owned: bool,
+
+    /// Borrowed quant triples. Set to `.ctx = null` when not applicable
+    /// (scheme == .off, or scheme is a TurboQuant variant — those need
+    /// the rotation undo step which the v1 fused path doesn't implement).
+    /// Read-only; the cache owns these handles.
+    k_triple_q: mlx.mlx_array = .{ .ctx = null },
+    k_triple_scales: mlx.mlx_array = .{ .ctx = null },
+    k_triple_biases: mlx.mlx_array = .{ .ctx = null },
+    v_triple_q: mlx.mlx_array = .{ .ctx = null },
+    v_triple_scales: mlx.mlx_array = .{ .ctx = null },
+    v_triple_biases: mlx.mlx_array = .{ .ctx = null },
+    /// True iff the triple fields above are populated. Lets call sites
+    /// avoid checking `.ctx == null` on every field.
+    has_quant_triple: bool = false,
+    /// Quant params copied off the cache config so call sites don't need
+    /// a pointer to it.
+    bits: u8 = 0,
+    group_size: u32 = 0,
+
+    pub fn deinit(self: *DenseKVView) void {
+        if (self.owned) {
+            _ = mlx.mlx_array_free(self.k);
+            _ = mlx.mlx_array_free(self.v);
+            self.k = mlx.mlx_array_new();
+            self.v = mlx.mlx_array_new();
+            self.owned = false;
+        }
+        // Triple fields are non-owning borrows — never free.
+    }
+
+    pub fn kTriple(self: DenseKVView) kv_quant.BorrowedTriple {
+        return .{ .q = self.k_triple_q, .scales = self.k_triple_scales, .biases = self.k_triple_biases };
+    }
+    pub fn vTriple(self: DenseKVView) kv_quant.BorrowedTriple {
+        return .{ .q = self.v_triple_q, .scales = self.v_triple_scales, .biases = self.v_triple_biases };
+    }
+};
+
+fn newEmptyKVEntry() KVCacheEntry {
+    return .{
+        .keys = mlx.mlx_array_new(),
+        .values = mlx.mlx_array_new(),
+        .keys_scales = mlx.mlx_array_new(),
+        .keys_biases = mlx.mlx_array_new(),
+        .values_scales = mlx.mlx_array_new(),
+        .values_biases = mlx.mlx_array_new(),
+        .key_view = mlx.mlx_array_new(),
+        .value_view = mlx.mlx_array_new(),
+        .key_scales_view = mlx.mlx_array_new(),
+        .key_biases_view = mlx.mlx_array_new(),
+        .value_scales_view = mlx.mlx_array_new(),
+        .value_biases_view = mlx.mlx_array_new(),
+        .offset = 0,
+        .initialized = false,
+    };
+}
+
+fn freeKVEntry(e: *KVCacheEntry) void {
+    _ = mlx.mlx_array_free(e.keys);
+    _ = mlx.mlx_array_free(e.values);
+    _ = mlx.mlx_array_free(e.keys_scales);
+    _ = mlx.mlx_array_free(e.keys_biases);
+    _ = mlx.mlx_array_free(e.values_scales);
+    _ = mlx.mlx_array_free(e.values_biases);
+    _ = mlx.mlx_array_free(e.key_view);
+    _ = mlx.mlx_array_free(e.value_view);
+    _ = mlx.mlx_array_free(e.key_scales_view);
+    _ = mlx.mlx_array_free(e.key_biases_view);
+    _ = mlx.mlx_array_free(e.value_scales_view);
+    _ = mlx.mlx_array_free(e.value_biases_view);
+}
 
 pub const KVCache = struct {
     entries: []KVCacheEntry,
     step: usize, // absolute sequence position (not affected by sliding window trimming)
     allocator: std.mem.Allocator,
+    config: KVQuantConfig,
+    /// Wave 2 — per-cache rotation matrices for the TurboQuant schemes.
+    /// `null` for `off` and `affine`. Built once at `initWithConfig` time
+    /// when the scheme is `turboquant_*`; reused across all updates. Lives
+    /// on the cache so `snapshot`/`restore` can refcount-share through it
+    /// (immutable post-init, safe to alias across snapshots).
+    quant_state: ?kv_quant.TurboState,
 
     pub fn init(allocator: std.mem.Allocator, num_layers: u32) !KVCache {
+        return initWithConfig(allocator, num_layers, KVQuantConfig.dense);
+    }
+
+    pub fn initWithConfig(allocator: std.mem.Allocator, num_layers: u32, config: KVQuantConfig) !KVCache {
+        return initWithConfigAndHeadDim(allocator, num_layers, config, 0);
+    }
+
+    /// TurboQuant schemes need a per-layer rotation-matrix slot. The actual
+    /// matrix dimension isn't known yet — Gemma 4's cached K is at
+    /// `2 * head_dim`, some archs differ per layer or between K/V — so we
+    /// allocate empty slots here and `updateTurboQuant` lazy-builds the real
+    /// matrix from the observed K/V last-dim on first write. `head_dim` is
+    /// accepted but only used to fail-fast on obviously-bad configs.
+    pub fn initWithConfigAndHeadDim(allocator: std.mem.Allocator, num_layers: u32, config: KVQuantConfig, head_dim: u32) !KVCache {
         const entries = try allocator.alloc(KVCacheEntry, num_layers);
+        errdefer allocator.free(entries);
         for (entries) |*e| {
-            e.* = .{
-                .keys = mlx.mlx_array_new(),
-                .values = mlx.mlx_array_new(),
-                .key_view = mlx.mlx_array_new(),
-                .value_view = mlx.mlx_array_new(),
-                .offset = 0,
-                .initialized = false,
-            };
+            e.* = newEmptyKVEntry();
         }
-        return .{ .entries = entries, .step = 0, .allocator = allocator };
+        var qs: ?kv_quant.TurboState = null;
+        switch (config.scheme) {
+            .turboquant_2, .turboquant_4 => {
+                _ = head_dim; // observed at first write
+                qs = try kv_quant.TurboState.initLazy(allocator, num_layers);
+            },
+            else => {},
+        }
+        return .{ .entries = entries, .step = 0, .allocator = allocator, .config = config, .quant_state = qs };
     }
 
     pub fn deinit(self: *KVCache) void {
         for (self.entries) |*e| {
-            _ = mlx.mlx_array_free(e.keys);
-            _ = mlx.mlx_array_free(e.values);
-            _ = mlx.mlx_array_free(e.key_view);
-            _ = mlx.mlx_array_free(e.value_view);
+            freeKVEntry(e);
         }
         self.allocator.free(self.entries);
+        if (self.quant_state) |*qs| qs.deinit();
+        self.quant_state = null;
     }
 
     /// Capture cache state for speculative-decoding rollback (PLD/drafter).
     /// Snapshots own array handles that share the underlying buffer with the
     /// source via refcount — cheap (no data copy) and immune to subsequent
     /// `update()` calls (which create new buffer handles when growing).
-    /// `key_view`/`value_view` are excluded because `update()` recreates them
-    /// every call.
+    /// `*_view` fields are excluded because `update()` recreates them every
+    /// call.
     pub fn snapshot(self: *const KVCache) !KVCacheSnapshot {
         const out = try self.allocator.alloc(KVCacheEntry, self.entries.len);
         for (self.entries, 0..) |src, i| {
-            out[i] = .{
-                .keys = mlx.mlx_array_new(),
-                .values = mlx.mlx_array_new(),
-                .key_view = mlx.mlx_array_new(),
-                .value_view = mlx.mlx_array_new(),
-                .offset = src.offset,
-                .initialized = src.initialized,
-            };
+            out[i] = newEmptyKVEntry();
+            out[i].offset = src.offset;
+            out[i].initialized = src.initialized;
             if (src.initialized) {
                 try mlx.check(mlx.mlx_array_set(&out[i].keys, src.keys));
                 try mlx.check(mlx.mlx_array_set(&out[i].values, src.values));
+                if (self.config.scheme != .off) {
+                    try mlx.check(mlx.mlx_array_set(&out[i].keys_scales, src.keys_scales));
+                    try mlx.check(mlx.mlx_array_set(&out[i].keys_biases, src.keys_biases));
+                    try mlx.check(mlx.mlx_array_set(&out[i].values_scales, src.values_scales));
+                    try mlx.check(mlx.mlx_array_set(&out[i].values_biases, src.values_biases));
+                }
             }
         }
-        return .{ .entries = out, .step = self.step, .allocator = self.allocator };
+        return .{ .entries = out, .step = self.step, .allocator = self.allocator, .config = self.config };
     }
 
     /// Replace cache state with `snap`. Frees current entries' arrays first;
     /// re-binds via refcount-share from snapshot. After restore, the next
-    /// `update()` will recreate `key_view`/`value_view` from the restored
-    /// buffers as usual.
+    /// `update()` will recreate `*_view` fields from the restored buffers.
     pub fn restore(self: *KVCache, snap: *const KVCacheSnapshot) !void {
         std.debug.assert(self.entries.len == snap.entries.len);
         for (self.entries, snap.entries) |*dst, src| {
-            _ = mlx.mlx_array_free(dst.keys);
-            _ = mlx.mlx_array_free(dst.values);
-            _ = mlx.mlx_array_free(dst.key_view);
-            _ = mlx.mlx_array_free(dst.value_view);
-            dst.keys = mlx.mlx_array_new();
-            dst.values = mlx.mlx_array_new();
-            dst.key_view = mlx.mlx_array_new();
-            dst.value_view = mlx.mlx_array_new();
+            freeKVEntry(dst);
+            dst.* = newEmptyKVEntry();
             dst.offset = src.offset;
             dst.initialized = src.initialized;
             if (src.initialized) {
                 try mlx.check(mlx.mlx_array_set(&dst.keys, src.keys));
                 try mlx.check(mlx.mlx_array_set(&dst.values, src.values));
+                if (self.config.scheme != .off) {
+                    try mlx.check(mlx.mlx_array_set(&dst.keys_scales, src.keys_scales));
+                    try mlx.check(mlx.mlx_array_set(&dst.keys_biases, src.keys_biases));
+                    try mlx.check(mlx.mlx_array_set(&dst.values_scales, src.values_scales));
+                    try mlx.check(mlx.mlx_array_set(&dst.values_biases, src.values_biases));
+                }
             }
         }
         self.step = snap.step;
@@ -192,7 +326,150 @@ pub const KVCache = struct {
 
     const chunk_step = 256;
 
-    pub fn update(self: *KVCache, layer: u32, new_k: mlx.mlx_array, new_v: mlx.mlx_array, s: mlx.mlx_stream, max_seq: u32) !struct { mlx.mlx_array, mlx.mlx_array } {
+    pub fn update(self: *KVCache, layer: u32, new_k: mlx.mlx_array, new_v: mlx.mlx_array, s: mlx.mlx_stream, max_seq: u32) !DenseKVView {
+        switch (self.config.scheme) {
+            .off => return self.updateDense(layer, new_k, new_v, s, max_seq),
+            .affine => return self.updateAffine(layer, new_k, new_v, s, max_seq),
+            .turboquant_2, .turboquant_4 => return self.updateTurboQuant(layer, new_k, new_v, s, max_seq),
+        }
+    }
+
+    /// Wave 2 — TurboQuant write path. Rotate K and V by the per-layer
+    /// Hadamard matrices, then re-use the affine grow/write/view machinery.
+    /// Read-back at SDPA time dequantizes + rotates back via `denseView`.
+    fn updateTurboQuant(self: *KVCache, layer: u32, new_k: mlx.mlx_array, new_v: mlx.mlx_array, s: mlx.mlx_stream, max_seq: u32) !DenseKVView {
+        const qs = if (self.quant_state) |*q| q else return error.MissingTurboState;
+        // Lazy-init: observe the actual K and V last-dims from the incoming
+        // tensors. Gemma 4 stores K at 2x head_dim; some archs split K/V
+        // dims; lazy construction sidesteps all of that.
+        const k_shape = mlx.getShape(new_k);
+        const v_shape = mlx.getShape(new_v);
+        const k_n: u32 = @intCast(k_shape[k_shape.len - 1]);
+        const v_n: u32 = @intCast(v_shape[v_shape.len - 1]);
+        const rk = try qs.ensureKLayer(s, layer, k_n);
+        const rv = try qs.ensureVLayer(s, layer, v_n);
+
+        // Rotate inputs along the last axis. Free as soon as the quantize
+        // call produces the affine triples — those become the stored cache
+        // contents.
+        const rotated_k = try kv_quant.rotateLastDim(s, new_k, rk);
+        defer _ = mlx.mlx_array_free(rotated_k);
+        const rotated_v = try kv_quant.rotateLastDim(s, new_v, rv);
+        defer _ = mlx.mlx_array_free(rotated_v);
+
+        // Hand off to the affine writer for the grow/slice_update/view work.
+        // The dense view it returns is rotated K/V — undo the rotation
+        // before handing back to SDPA. We can't call updateAffine directly
+        // because it dequantizes-without-rotate at the end; emit a thin
+        // helper that returns the rotated views and we rotate-back here.
+        const rotated_view = try self.updateAffineRotated(layer, rotated_k, rotated_v, s, max_seq);
+
+        // Now rotate the dense view back to the original basis for SDPA.
+        var dense_k = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(dense_k);
+        try mlx.check(mlx.mlx_matmul(&dense_k, rotated_view.k, rk, s));
+        var dense_v = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(dense_v);
+        try mlx.check(mlx.mlx_matmul(&dense_v, rotated_view.v, rv, s));
+
+        // Free the temporary rotated-basis dense view; we own a fresh one.
+        var rv_mut = rotated_view;
+        rv_mut.deinit();
+        return .{ .k = dense_k, .v = dense_v, .owned = true };
+    }
+
+    /// Variant of `updateAffine` that returns the rotated-basis dense view
+    /// instead of an unrotated one. Only called from `updateTurboQuant`,
+    /// which rotates the result back before handing to SDPA.
+    fn updateAffineRotated(self: *KVCache, layer: u32, rk_in: mlx.mlx_array, rv_in: mlx.mlx_array, s: mlx.mlx_stream, max_seq: u32) !DenseKVView {
+        return self.updateAffine(layer, rk_in, rv_in, s, max_seq);
+    }
+
+    fn updateAffine(self: *KVCache, layer: u32, new_k: mlx.mlx_array, new_v: mlx.mlx_array, s: mlx.mlx_stream, max_seq: u32) !DenseKVView {
+        const entry = &self.entries[layer];
+        const cfg = self.config;
+        const group_size: u32 = cfg.group_size;
+        const bits: u8 = cfg.bits;
+
+        // 1. Free stale views (6 of them — dense + 4 quant scale/bias views).
+        _ = mlx.mlx_array_free(entry.key_view);
+        _ = mlx.mlx_array_free(entry.value_view);
+        _ = mlx.mlx_array_free(entry.key_scales_view);
+        _ = mlx.mlx_array_free(entry.key_biases_view);
+        _ = mlx.mlx_array_free(entry.value_scales_view);
+        _ = mlx.mlx_array_free(entry.value_biases_view);
+        entry.key_view = mlx.mlx_array_new();
+        entry.value_view = mlx.mlx_array_new();
+        entry.key_scales_view = mlx.mlx_array_new();
+        entry.key_biases_view = mlx.mlx_array_new();
+        entry.value_scales_view = mlx.mlx_array_new();
+        entry.value_biases_view = mlx.mlx_array_new();
+
+        // 2. Quantize incoming K/V.
+        var new_kq = try kv_quant.quantizeAffine(s, new_k, group_size, bits);
+        defer new_kq.deinit();
+        var new_vq = try kv_quant.quantizeAffine(s, new_v, group_size, bits);
+        defer new_vq.deinit();
+
+        // 3. Shape info: new_k is [B, heads, new_len, head_dim].
+        const new_shape = mlx.getShape(new_k);
+        const new_len: usize = @intCast(new_shape[2]);
+        const B = new_shape[0];
+        const heads = new_shape[1];
+        const head_dim_u32: u32 = @intCast(new_shape[3]);
+        const q_last: c_int = @intCast(head_dim_u32 * @as(u32, bits) / 32);
+        const sc_last: c_int = @intCast(head_dim_u32 / group_size);
+
+        // 4. Grow buffers if needed (6 of them, in lockstep on the seq axis).
+        if (!entry.initialized or entry.offset + new_len > bufferCapacity(entry.keys)) {
+            const needed = entry.offset + new_len;
+            const n_chunks = (needed + chunk_step - 1) / chunk_step;
+            const new_cap: c_int = @intCast(n_chunks * chunk_step);
+
+            try growQuantBuf(s, &entry.keys, entry.initialized, entry.offset, new_cap, B, heads, q_last, .uint32);
+            try growQuantBuf(s, &entry.values, entry.initialized, entry.offset, new_cap, B, heads, q_last, .uint32);
+            try growQuantBuf(s, &entry.keys_scales, entry.initialized, entry.offset, new_cap, B, heads, sc_last, .bfloat16);
+            try growQuantBuf(s, &entry.keys_biases, entry.initialized, entry.offset, new_cap, B, heads, sc_last, .bfloat16);
+            try growQuantBuf(s, &entry.values_scales, entry.initialized, entry.offset, new_cap, B, heads, sc_last, .bfloat16);
+            try growQuantBuf(s, &entry.values_biases, entry.initialized, entry.offset, new_cap, B, heads, sc_last, .bfloat16);
+            entry.initialized = true;
+        }
+
+        // 5. slice_update each buffer at offset.
+        try writeAtOffset(s, &entry.keys, entry.offset, new_kq.q);
+        try writeAtOffset(s, &entry.values, entry.offset, new_vq.q);
+        try writeAtOffset(s, &entry.keys_scales, entry.offset, new_kq.scales);
+        try writeAtOffset(s, &entry.keys_biases, entry.offset, new_kq.biases);
+        try writeAtOffset(s, &entry.values_scales, entry.offset, new_vq.scales);
+        try writeAtOffset(s, &entry.values_biases, entry.offset, new_vq.biases);
+
+        // 6. Update offset / step.
+        entry.offset += new_len;
+        if (layer == 0) self.step += new_len;
+
+        // 7. Build views for all 6 buffers.
+        const total: c_int = @intCast(entry.offset);
+        const is_decode = new_len == 1;
+        const view_start: c_int = if (is_decode and max_seq > 0 and entry.offset > max_seq)
+            total - @as(c_int, @intCast(max_seq))
+        else
+            0;
+        try buildSliceView(s, &entry.key_view, entry.keys, total, view_start);
+        try buildSliceView(s, &entry.value_view, entry.values, total, view_start);
+        try buildSliceView(s, &entry.key_scales_view, entry.keys_scales, total, view_start);
+        try buildSliceView(s, &entry.key_biases_view, entry.keys_biases, total, view_start);
+        try buildSliceView(s, &entry.value_scales_view, entry.values_scales, total, view_start);
+        try buildSliceView(s, &entry.value_biases_view, entry.values_biases, total, view_start);
+
+        // 8. Dequantize K/V for SDPA. Owner of these dense arrays is the
+        //    DenseKVView returned to the caller.
+        const dense_k = try kv_quant.dequantizeAffine(s, entry.key_view, entry.key_scales_view, entry.key_biases_view, group_size, bits);
+        errdefer _ = mlx.mlx_array_free(dense_k);
+        const dense_v = try kv_quant.dequantizeAffine(s, entry.value_view, entry.value_scales_view, entry.value_biases_view, group_size, bits);
+        return .{ .k = dense_k, .v = dense_v, .owned = true };
+    }
+
+    fn updateDense(self: *KVCache, layer: u32, new_k: mlx.mlx_array, new_v: mlx.mlx_array, s: mlx.mlx_stream, max_seq: u32) !DenseKVView {
         const entry = &self.entries[layer];
 
         // 1. Free stale views — drops refcount on buffer → enables buffer donation
@@ -309,13 +586,126 @@ pub const KVCache = struct {
             try mlx.check(mlx.mlx_slice(&entry.value_view, entry.values, &v_start, 4, &v_stop, 4, &v_strides, 4, s));
         }
 
-        return .{ entry.key_view, entry.value_view };
+        return .{ .k = entry.key_view, .v = entry.value_view, .owned = false };
+    }
+
+    /// Read-side accessor: return a dense `[B,H,T,D]` K/V pair for the layer.
+    /// In dense mode this aliases `key_view`/`value_view` (no-op deinit).
+    /// In quant mode this dequantizes on the fly from the cache's stored
+    /// triples (the returned arrays are owned and freed by `deinit`).
+    /// SDPA call sites use this so they don't have to know the scheme.
+    pub fn denseView(self: *KVCache, layer: u32, s: mlx.mlx_stream) !DenseKVView {
+        const entry = &self.entries[layer];
+        switch (self.config.scheme) {
+            .off => return .{ .k = entry.key_view, .v = entry.value_view, .owned = false },
+            .affine => {
+                if (!entry.initialized) {
+                    return .{ .k = entry.key_view, .v = entry.value_view, .owned = false };
+                }
+                const dense_k = try kv_quant.dequantizeAffine(s, entry.key_view, entry.key_scales_view, entry.key_biases_view, self.config.group_size, self.config.bits);
+                errdefer _ = mlx.mlx_array_free(dense_k);
+                const dense_v = try kv_quant.dequantizeAffine(s, entry.value_view, entry.value_scales_view, entry.value_biases_view, self.config.group_size, self.config.bits);
+                return .{
+                    .k = dense_k,
+                    .v = dense_v,
+                    .owned = true,
+                    // Borrow the cache's quant triples so fused-attn call
+                    // sites can skip the dense materialization above (the
+                    // dequant arrays still get computed — mlx is lazy, so
+                    // the cost is only paid if SDPA actually reads them).
+                    .k_triple_q = entry.key_view,
+                    .k_triple_scales = entry.key_scales_view,
+                    .k_triple_biases = entry.key_biases_view,
+                    .v_triple_q = entry.value_view,
+                    .v_triple_scales = entry.value_scales_view,
+                    .v_triple_biases = entry.value_biases_view,
+                    .has_quant_triple = true,
+                    .bits = self.config.bits,
+                    .group_size = self.config.group_size,
+                };
+            },
+            .turboquant_2, .turboquant_4 => {
+                if (!entry.initialized) {
+                    return .{ .k = entry.key_view, .v = entry.value_view, .owned = false };
+                }
+                const qs = if (self.quant_state) |*q| q else return error.MissingTurboState;
+                // If we're reading before any write, the rotation matrices
+                // aren't built yet — fall back to the raw view (which is
+                // empty anyway when `initialized=false`, handled above).
+                const li: usize = @intCast(layer);
+                if (qs.rk_dim[li] == 0 or qs.rv_dim[li] == 0) {
+                    return .{ .k = entry.key_view, .v = entry.value_view, .owned = false };
+                }
+                const rk = qs.rk[li];
+                const rv = qs.rv[li];
+                const dense_k = try kv_quant.dequantizeTurbo(s, entry.key_view, entry.key_scales_view, entry.key_biases_view, rk, self.config.group_size, self.config.bits);
+                errdefer _ = mlx.mlx_array_free(dense_k);
+                const dense_v = try kv_quant.dequantizeTurbo(s, entry.value_view, entry.value_scales_view, entry.value_biases_view, rv, self.config.group_size, self.config.bits);
+                return .{ .k = dense_k, .v = dense_v, .owned = true };
+            },
+        }
     }
 
     fn bufferCapacity(arr: mlx.mlx_array) usize {
         const shape = mlx.getShape(arr);
         if (shape.len < 3) return 0;
         return @intCast(shape[2]);
+    }
+
+    /// Affine-mode helpers: same buffer-grow / slice-update / view-build
+    /// pattern as the dense path, parameterized over the buffer's last dim
+    /// and dtype. Used six times per `updateAffine` (3 buffers × K and V).
+    fn growQuantBuf(s: mlx.mlx_stream, buf: *mlx.mlx_array, initialized: bool, offset: usize, new_cap: c_int, B: c_int, heads: c_int, last_dim: c_int, dtype: mlx.mlx_dtype) !void {
+        const buf_shape = [_]c_int{ B, heads, new_cap, last_dim };
+        if (initialized and offset > 0) {
+            var new_buf = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_zeros(&new_buf, &buf_shape, 4, dtype, s));
+            const off_c: c_int = @intCast(offset);
+            const su_start = [_]c_int{ 0, 0, 0, 0 };
+            const su_stop = [_]c_int{ B, heads, off_c, last_dim };
+            const su_strides = [_]c_int{ 1, 1, 1, 1 };
+            var old_data = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_slice(&old_data, buf.*, &su_start, 4, &su_stop, 4, &su_strides, 4, s));
+            var updated = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_slice_update(&updated, new_buf, old_data, &su_start, 4, &su_stop, 4, &su_strides, 4, s));
+            _ = mlx.mlx_array_free(old_data);
+            _ = mlx.mlx_array_free(new_buf);
+            _ = mlx.mlx_array_free(buf.*);
+            buf.* = updated;
+        } else {
+            _ = mlx.mlx_array_free(buf.*);
+            var new_buf = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_zeros(&new_buf, &buf_shape, 4, dtype, s));
+            buf.* = new_buf;
+        }
+    }
+
+    fn writeAtOffset(s: mlx.mlx_stream, buf: *mlx.mlx_array, offset: usize, new_chunk: mlx.mlx_array) !void {
+        const new_shape = mlx.getShape(new_chunk);
+        const new_len: c_int = new_shape[2];
+        const buf_shape = mlx.getShape(buf.*);
+        const off: c_int = @intCast(offset);
+        const off_end: c_int = off + new_len;
+        const su_start = [_]c_int{ 0, 0, off, 0 };
+        const su_stop = [_]c_int{ buf_shape[0], buf_shape[1], off_end, buf_shape[3] };
+        const su_strides = [_]c_int{ 1, 1, 1, 1 };
+        var updated = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_slice_update(&updated, buf.*, new_chunk, &su_start, 4, &su_stop, 4, &su_strides, 4, s));
+        _ = mlx.mlx_array_free(buf.*);
+        buf.* = updated;
+    }
+
+    fn buildSliceView(s: mlx.mlx_stream, view: *mlx.mlx_array, buf: mlx.mlx_array, total: c_int, view_start: c_int) !void {
+        const buf_cap = bufferCapacity(buf);
+        if (view_start == 0 and @as(usize, @intCast(total)) == buf_cap) {
+            try mlx.check(mlx.mlx_array_set(view, buf));
+        } else {
+            const cur_shape = mlx.getShape(buf);
+            const v_start = [_]c_int{ 0, 0, view_start, 0 };
+            const v_stop = [_]c_int{ cur_shape[0], cur_shape[1], total, cur_shape[3] };
+            const v_strides = [_]c_int{ 1, 1, 1, 1 };
+            try mlx.check(mlx.mlx_slice(view, buf, &v_start, 4, &v_stop, 4, &v_strides, 4, s));
+        }
     }
 
     pub fn seqLen(self: *const KVCache, layer: u32) usize {
@@ -350,17 +740,37 @@ pub const KVCache = struct {
             if (!entry.initialized) continue;
             if (len >= entry.offset) continue;
 
-            // Free stale views
+            // Free stale views (all 6: dense + 4 quant scale/bias views)
             _ = mlx.mlx_array_free(entry.key_view);
             _ = mlx.mlx_array_free(entry.value_view);
             entry.key_view = mlx.mlx_array_new();
             entry.value_view = mlx.mlx_array_new();
+            if (self.config.scheme == .affine) {
+                _ = mlx.mlx_array_free(entry.key_scales_view);
+                _ = mlx.mlx_array_free(entry.key_biases_view);
+                _ = mlx.mlx_array_free(entry.value_scales_view);
+                _ = mlx.mlx_array_free(entry.value_biases_view);
+                entry.key_scales_view = mlx.mlx_array_new();
+                entry.key_biases_view = mlx.mlx_array_new();
+                entry.value_scales_view = mlx.mlx_array_new();
+                entry.value_biases_view = mlx.mlx_array_new();
+            }
 
             if (len == 0) {
                 _ = mlx.mlx_array_free(entry.keys);
                 _ = mlx.mlx_array_free(entry.values);
                 entry.keys = mlx.mlx_array_new();
                 entry.values = mlx.mlx_array_new();
+                if (self.config.scheme == .affine) {
+                    _ = mlx.mlx_array_free(entry.keys_scales);
+                    _ = mlx.mlx_array_free(entry.keys_biases);
+                    _ = mlx.mlx_array_free(entry.values_scales);
+                    _ = mlx.mlx_array_free(entry.values_biases);
+                    entry.keys_scales = mlx.mlx_array_new();
+                    entry.keys_biases = mlx.mlx_array_new();
+                    entry.values_scales = mlx.mlx_array_new();
+                    entry.values_biases = mlx.mlx_array_new();
+                }
                 entry.initialized = false;
                 entry.offset = 0;
                 continue;
@@ -379,6 +789,14 @@ pub const KVCache = struct {
             const v_strides = [_]c_int{ 1, 1, 1, 1 };
             try mlx.check(mlx.mlx_slice(&entry.key_view, entry.keys, &v_start, 4, &v_stop, 4, &v_strides, 4, s));
             try mlx.check(mlx.mlx_slice(&entry.value_view, entry.values, &v_start, 4, &v_stop, 4, &v_strides, 4, s));
+            if (self.config.scheme == .affine) {
+                const sc_shape = mlx.getShape(entry.keys_scales);
+                const sv_stop = [_]c_int{ sc_shape[0], sc_shape[1], seq_end, sc_shape[3] };
+                try mlx.check(mlx.mlx_slice(&entry.key_scales_view, entry.keys_scales, &v_start, 4, &sv_stop, 4, &v_strides, 4, s));
+                try mlx.check(mlx.mlx_slice(&entry.key_biases_view, entry.keys_biases, &v_start, 4, &sv_stop, 4, &v_strides, 4, s));
+                try mlx.check(mlx.mlx_slice(&entry.value_scales_view, entry.values_scales, &v_start, 4, &sv_stop, 4, &v_strides, 4, s));
+                try mlx.check(mlx.mlx_slice(&entry.value_biases_view, entry.values_biases, &v_start, 4, &sv_stop, 4, &v_strides, 4, s));
+            }
         }
     }
 };
@@ -390,13 +808,11 @@ pub const KVCacheSnapshot = struct {
     entries: []KVCacheEntry,
     step: usize,
     allocator: std.mem.Allocator,
+    config: KVQuantConfig,
 
     pub fn deinit(self: *KVCacheSnapshot) void {
         for (self.entries) |*e| {
-            _ = mlx.mlx_array_free(e.keys);
-            _ = mlx.mlx_array_free(e.values);
-            _ = mlx.mlx_array_free(e.key_view);
-            _ = mlx.mlx_array_free(e.value_view);
+            freeKVEntry(e);
         }
         self.allocator.free(self.entries);
     }
@@ -489,10 +905,7 @@ pub const PrefillCache = struct {
     pub fn deinit(self: *PrefillCache) void {
         self.allocator.free(self.tokens);
         for (self.kv_entries) |*e| {
-            _ = mlx.mlx_array_free(e.keys);
-            _ = mlx.mlx_array_free(e.values);
-            _ = mlx.mlx_array_free(e.key_view);
-            _ = mlx.mlx_array_free(e.value_view);
+            freeKVEntry(e);
         }
         self.allocator.free(self.kv_entries);
         self.allocator.free(self.offsets);
@@ -793,6 +1206,31 @@ const QuantParamsCache = struct {
 // Backwards-compatibility alias — keeps existing field names readable.
 const BitsCache = QuantParamsCache;
 
+// ── Forward context ──
+//
+// Routes per-request mutable state (KV cache, MoE seq offset, SSM entries,
+// hidden-state capture target, vision embeddings) into the forward pass via
+// a single struct. The legacy single-slot path uses `Transformer.defaultCtx()`
+// which points at the Transformer's own fields — semantically identical to the
+// pre-refactor code. Concurrent batching (Phase 1+) constructs one ctx per
+// in-flight request so multiple slots can share a Transformer's weights while
+// owning their own caches.
+pub const ForwardCtx = struct {
+    cache: *KVCache,
+    moe_seq_offset: *usize,
+    ssm_entries: ?[]SSMCacheEntry,
+    capture_hidden: ?*mlx.mlx_array,
+    vision_embeddings: ?mlx.mlx_array,
+    /// Phase 2 (Plan ricky): when true, attention call sites consume the
+    /// cache's quantized K/V triples directly via `kv_quant.quantAttention`
+    /// instead of dequantizing through `DenseKVView`. Only effective when
+    /// the cache scheme is .affine — TurboQuant + .off ignore this flag
+    /// (TurboQuant needs the rotation undo step, which the fused path
+    /// doesn't yet implement; .off has no quant triple to consume).
+    /// Default false → unchanged dense SDPA path.
+    kv_attn_fused: bool = false,
+};
+
 // ── Transformer ──
 
 pub const Transformer = struct {
@@ -906,6 +1344,10 @@ pub const Transformer = struct {
         var name_buf: [256]u8 = undefined;
 
         if (config.is_encoder_only) return initBert(io, allocator, config, weights, &name_buf, s);
+        if (std.mem.eql(u8, config.model_type, "deepseek_v4")) {
+            log.err("MLX-format deepseek_v4 is not supported — load the GGUF checkpoint via the ds4 engine instead\n", .{});
+            return error.UnsupportedModelType;
+        }
 
         // Embeddings: Nemotron-H uses "backbone.embeddings", others use "{prefix}.embed_tokens"
         const is_nemotron = std.mem.eql(u8, config.model_type, "nemotron_h");
@@ -1245,8 +1687,9 @@ pub const Transformer = struct {
 
     /// Reset all caches for a new request (KV cache + SSM state for MoE).
     pub fn resetCache(self: *Transformer) !void {
+        const prev_config = self.cache.config;
         self.cache.deinit();
-        self.cache = try KVCache.init(self.allocator, self.config.num_hidden_layers);
+        self.cache = try KVCache.initWithConfigAndHeadDim(self.allocator, self.config.num_hidden_layers, prev_config, self.config.head_dim);
         if (self.ssm_entries) |entries| {
             for (entries) |*e| {
                 _ = mlx.mlx_array_free(e.conv_state);
@@ -1280,16 +1723,23 @@ pub const Transformer = struct {
         }
 
         // Full prefix match with tokens remaining — restore cached state.
+        const prev_config = self.cache.config;
         self.cache.deinit();
-        self.cache = try KVCache.init(self.allocator, self.config.num_hidden_layers);
+        self.cache = try KVCache.initWithConfigAndHeadDim(self.allocator, self.config.num_hidden_layers, prev_config, self.config.head_dim);
         self.cache.step = pc.kv_step;
         for (pc.kv_entries, 0..) |src, i| {
             if (src.initialized) {
                 try mlx.check(mlx.mlx_array_set(&self.cache.entries[i].keys, src.keys));
                 try mlx.check(mlx.mlx_array_set(&self.cache.entries[i].values, src.values));
+                if (prev_config.scheme == .affine) {
+                    try mlx.check(mlx.mlx_array_set(&self.cache.entries[i].keys_scales, src.keys_scales));
+                    try mlx.check(mlx.mlx_array_set(&self.cache.entries[i].keys_biases, src.keys_biases));
+                    try mlx.check(mlx.mlx_array_set(&self.cache.entries[i].values_scales, src.values_scales));
+                    try mlx.check(mlx.mlx_array_set(&self.cache.entries[i].values_biases, src.values_biases));
+                }
                 self.cache.entries[i].initialized = true;
                 self.cache.entries[i].offset = pc.offsets[i];
-                // key_view/value_view left as mlx_array_new() — will be created on next update()
+                // *_view fields left as mlx_array_new() — recreated on next update()
             }
         }
 
@@ -1334,15 +1784,19 @@ pub const Transformer = struct {
             self.allocator.free(kv);
             return;
         };
+        const scheme = self.cache.config.scheme;
         for (self.cache.entries, kv, 0..) |src, *dst, i| {
-            dst.keys = mlx.mlx_array_new();
-            dst.values = mlx.mlx_array_new();
-            dst.key_view = mlx.mlx_array_new();
-            dst.value_view = mlx.mlx_array_new();
+            dst.* = newEmptyKVEntry();
             dst.offset = src.offset;
             if (src.initialized) {
                 _ = mlx.mlx_array_set(&dst.keys, src.keys);
                 _ = mlx.mlx_array_set(&dst.values, src.values);
+                if (scheme == .affine) {
+                    _ = mlx.mlx_array_set(&dst.keys_scales, src.keys_scales);
+                    _ = mlx.mlx_array_set(&dst.keys_biases, src.keys_biases);
+                    _ = mlx.mlx_array_set(&dst.values_scales, src.values_scales);
+                    _ = mlx.mlx_array_set(&dst.values_biases, src.values_biases);
+                }
             }
             dst.initialized = src.initialized;
             offsets[i] = src.offset;
@@ -1896,12 +2350,12 @@ pub const Transformer = struct {
     /// Apply vision embeddings to text embeddings during prefill.
     /// Handles scaling and splicing at image_token_id positions.
     /// Returns the (potentially modified) h; caller should replace their h with the result.
-    fn applyVisionEmbeddings(self: *Transformer, h: mlx.mlx_array, token_ids: mlx.mlx_array) !mlx.mlx_array {
+    fn applyVisionEmbeddingsWith(self: *Transformer, ctx: *ForwardCtx, h: mlx.mlx_array, token_ids: mlx.mlx_array) !mlx.mlx_array {
         const cfg = &self.config;
         const h_shape = mlx.getShape(h);
         // Only during prefill (seq_len > 1)
         if (h_shape[1] <= 1) return h;
-        const ve = self.vision_embeddings orelse return h;
+        const ve = ctx.vision_embeddings orelse return h;
         if (cfg.image_token_id == 0) return h;
 
         // Vision embeddings come out of the MultimodalEmbedder already in text-hidden space;
@@ -2121,11 +2575,111 @@ pub const Transformer = struct {
     const MOE_EVAL_EVERY_N_LAYERS: u32 = 4;
     const RECURRENCE_EVAL_INTERVAL: usize = 32;
 
+    /// Default forward context, routing through the Transformer's own state.
+    /// Used by the single-slot legacy path and by Phase-2 prefill on a slot
+    /// that has had its KVCache temporarily swapped onto the Transformer.
+    pub fn defaultCtx(self: *Transformer) ForwardCtx {
+        return .{
+            .cache = &self.cache,
+            .moe_seq_offset = &self.moe_seq_offset,
+            .ssm_entries = self.ssm_entries,
+            .capture_hidden = self.capture_hidden,
+            .vision_embeddings = self.vision_embeddings,
+        };
+    }
+
     pub fn forward(self: *Transformer, token_ids: mlx.mlx_array) !mlx.mlx_array {
-        if (self.bert_layers != null) return self.forwardBert(token_ids);
-        if (self.hybrid_layers != null) return self.forwardHybrid(token_ids);
-        if (self.moe_layers != null) return self.forwardMoe(token_ids);
-        return self.forwardStandard(token_ids);
+        var ctx = self.defaultCtx();
+        return self.forwardWith(&ctx, token_ids);
+    }
+
+    pub fn forwardWith(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_array) !mlx.mlx_array {
+        if (self.bert_layers != null) return self.forwardBertWith(ctx, token_ids);
+        if (self.hybrid_layers != null) return self.forwardHybridWith(ctx, token_ids);
+        if (self.moe_layers != null) return self.forwardMoeWith(ctx, token_ids);
+        return self.forwardStandardWith(ctx, token_ids);
+    }
+
+    /// Free compiled JIT closures (compiled_forward / compiled_gelu /
+    /// compiled_geglu / compiled_softcap / compiled_moe_routing). They get
+    /// bound to the calling thread's mlx GPU stream at compile time; once
+    /// inference moves to a different thread (Phase 2 scheduler) calls
+    /// against them fail with "no Stream(gpu, N) in current thread". Clear
+    /// them here so subsequent forward calls take the unfused fallback path,
+    /// then optionally re-warm on the new thread to recompile against its
+    /// own stream.
+    pub fn clearCompiledClosures(self: *Transformer) void {
+        if (self.compiled_forward) |c| {
+            _ = mlx.mlx_closure_free(c);
+            self.compiled_forward = null;
+        }
+        if (self.compiled_gelu) |c| {
+            _ = mlx.mlx_closure_free(c);
+            self.compiled_gelu = null;
+        }
+        if (self.compiled_geglu) |c| {
+            _ = mlx.mlx_closure_free(c);
+            self.compiled_geglu = null;
+        }
+        if (self.compiled_softcap) |c| {
+            _ = mlx.mlx_closure_free(c);
+            self.compiled_softcap = null;
+        }
+        if (self.compiled_moe_routing) |c| {
+            _ = mlx.mlx_closure_free(c);
+            self.compiled_moe_routing = null;
+        }
+    }
+
+    /// Pre-fault weight pages and trigger first-touch kernel compiles before
+    /// the first real request so cold prefill doesn't pay 800+ms of GPU page
+    /// faulting (measured on Gemma 4 E4B 4-bit). Runs three forward passes:
+    ///   1. [1, 1] decode-shape: faults embed matrix + compiles decode kernel
+    ///   2. [1, 8] prefill-shape: compiles short-prefill kernel
+    /// then resets the cache so the first real request starts from clean state.
+    /// Idempotent — calling twice is wasted work but not incorrect.
+    pub fn warmup(self: *Transformer) !void {
+        const dummy_id: i32 = 0; // BOS-ish placeholder; the actual id doesn't matter for warmup
+        const decode_shape = [_]c_int{ 1, 1 };
+        const decode_input = mlx.mlx_array_new_data(&dummy_id, &decode_shape, 2, .int32);
+        defer _ = mlx.mlx_array_free(decode_input);
+        const decode_logits = try self.forward(decode_input);
+        _ = mlx.mlx_array_free(decode_logits);
+        // Materialize the cache update so subsequent forwards see initialized entries.
+        {
+            const eval_vec = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(eval_vec);
+            for (self.cache.entries) |*entry| {
+                if (!entry.initialized) continue;
+                _ = mlx.mlx_vector_array_append_value(eval_vec, entry.keys);
+                _ = mlx.mlx_vector_array_append_value(eval_vec, entry.values);
+            }
+            _ = mlx.mlx_eval(eval_vec);
+        }
+        _ = mlx.mlx_clear_cache();
+
+        // Reset before the prefill-shape pass so we exercise the cold-init path,
+        // not the partial-cache path.
+        try self.resetCache();
+
+        const ids_8 = [_]i32{ 0, 0, 0, 0, 0, 0, 0, 0 };
+        const prefill_shape = [_]c_int{ 1, 8 };
+        const prefill_input = mlx.mlx_array_new_data(&ids_8, &prefill_shape, 2, .int32);
+        defer _ = mlx.mlx_array_free(prefill_input);
+        const prefill_logits = try self.forward(prefill_input);
+        _ = mlx.mlx_array_free(prefill_logits);
+        {
+            const eval_vec = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(eval_vec);
+            for (self.cache.entries) |*entry| {
+                if (!entry.initialized) continue;
+                _ = mlx.mlx_vector_array_append_value(eval_vec, entry.keys);
+                _ = mlx.mlx_vector_array_append_value(eval_vec, entry.values);
+            }
+            _ = mlx.mlx_eval(eval_vec);
+        }
+        _ = mlx.mlx_clear_cache();
+        try self.resetCache();
     }
 
     /// Run a forward pass and ALSO capture the post-final-norm hidden state
@@ -2142,9 +2696,25 @@ pub const Transformer = struct {
         out_hidden: *mlx.mlx_array,
     ) !mlx.mlx_array {
         std.debug.assert(self.capture_hidden == null); // re-entrant call
-        self.capture_hidden = out_hidden;
-        defer self.capture_hidden = null;
-        return self.forward(token_ids);
+        var ctx = self.defaultCtx();
+        ctx.capture_hidden = out_hidden;
+        return self.forwardWith(&ctx, token_ids);
+    }
+
+    /// Variant of `forwardWith` that overrides `ctx.capture_hidden` for this
+    /// call only (saved and restored on exit). Used by per-slot generators
+    /// (Phase 2) so the capture target is request-local without mutating
+    /// shared state on the ctx.
+    pub fn forwardWithCapture(
+        self: *Transformer,
+        ctx: *ForwardCtx,
+        token_ids: mlx.mlx_array,
+        out_hidden: *mlx.mlx_array,
+    ) !mlx.mlx_array {
+        const saved = ctx.capture_hidden;
+        ctx.capture_hidden = out_hidden;
+        defer ctx.capture_hidden = saved;
+        return self.forwardWith(ctx, token_ids);
     }
 
     // ── BERT encoder-only forward pass ──
@@ -2224,7 +2794,8 @@ pub const Transformer = struct {
         return result;
     }
 
-    fn forwardBert(self: *Transformer, token_ids: mlx.mlx_array) !mlx.mlx_array {
+    fn forwardBertWith(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_array) !mlx.mlx_array {
+        _ = ctx; // BERT is encoder-only, no per-request KV state
         const bert_layers = self.bert_layers.?;
         const h_count = self.config.num_attention_heads;
         const head_dim = self.config.head_dim;
@@ -2449,8 +3020,8 @@ pub const Transformer = struct {
 
     // ── Standard forward pass (Gemma / Llama / Qwen3 / Gemma4) ──
 
-    fn forwardStandard(self: *Transformer, token_ids: mlx.mlx_array) !mlx.mlx_array {
-        const offset = self.cache.step;
+    fn forwardStandardWith(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_array) !mlx.mlx_array {
+        const offset = ctx.cache.step;
         const cfg = &self.config;
         const h_count = cfg.num_attention_heads;
         const kv_h = cfg.num_key_value_heads;
@@ -2466,7 +3037,7 @@ pub const Transformer = struct {
         var h = try self.embedding(token_ids);
 
         // Splice vision embeddings at image_token_id positions (prefill only)
-        h = try self.applyVisionEmbeddings(h, token_ids);
+        h = try self.applyVisionEmbeddingsWith(ctx, h, token_ids);
 
         const x_shape = mlx.getShape(h);
         const batch: c_int = x_shape[0];
@@ -2517,7 +3088,7 @@ pub const Transformer = struct {
             if (ple_input) |p| _ = mlx.mlx_array_free(p);
         }
         if (cfg.hidden_size_per_layer_input > 0) {
-            if (self.vision_embeddings != null and cfg.image_token_id > 0) {
+            if (ctx.vision_embeddings != null and cfg.image_token_id > 0) {
                 // Zero out image tokens: per_layer_inputs_tokens = where(text_mask, ids, zeros)
                 const img_id = mlx.mlx_array_new_int(@intCast(cfg.image_token_id));
                 defer _ = mlx.mlx_array_free(img_id);
@@ -2596,16 +3167,21 @@ pub const Transformer = struct {
             defer _ = mlx.mlx_array_free(q_rope);
             try mlx.check(mlx.mlx_fast_rope(&q_rope, q_t, effective_rope_dims, false, rope_base_opt, rope_scale, @intCast(offset), rope_freqs, self.s));
 
-            // K, V and cache — either compute or read from shared source
+            // K, V and cache — either compute or read from shared source.
+            // `kv_view` is the lifetime owner: in dense mode it aliases the
+            // cache's view (no-op deinit); in quant mode it owns dequantized
+            // dense arrays freed at scope exit, after SDPA has consumed them.
+            var kv_view: DenseKVView = .{ .k = .{}, .v = .{}, .owned = false };
+            defer kv_view.deinit();
             var full_k: mlx.mlx_array = undefined;
             var full_v: mlx.mlx_array = undefined;
 
             if (is_kv_shared) {
                 // KV sharing: read from source layer's cache
                 const src = lw.kv_source.?;
-                const entry = &self.cache.entries[src];
-                full_k = entry.key_view;
-                full_v = entry.value_view;
+                kv_view = try ctx.cache.denseView(src, self.s);
+                full_k = kv_view.k;
+                full_v = kv_view.v;
             } else {
                 // Compute K, V (temp arrays scoped to this block).
                 // When k_eq_v, V shares the K projection — compute once, alias into V.
@@ -2660,40 +3236,65 @@ pub const Transformer = struct {
 
                 // Update KV cache
                 const max_kv: u32 = if (is_global) 0 else if (cfg.has_sliding_window) cfg.sliding_window else 0;
-                const kv = try self.cache.update(li, own_k_rope, own_v_t, self.s, max_kv);
-                full_k = kv[0];
-                full_v = kv[1];
+                kv_view = try ctx.cache.update(li, own_k_rope, own_v_t, self.s, max_kv);
+                full_k = kv_view.k;
+                full_v = kv_view.v;
             }
 
             // Scaled dot-product attention
             var attn_out = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(attn_out);
 
+            // Resolve mask first so dense + fused paths share the selection.
+            var sel_mode: []const u8 = "";
+            var sel_mask: mlx.mlx_array = none_mask;
             if (!cfg.has_sliding_window) {
-                if (is_prefill) {
-                    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "causal", none_mask, .{ .ctx = null }, self.s));
-                } else {
-                    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "", none_mask, .{ .ctx = null }, self.s));
-                }
+                if (is_prefill) sel_mode = "causal";
             } else {
                 const sw: c_int = @intCast(cfg.sliding_window);
                 if (is_prefill and is_global) {
-                    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "causal", none_mask, .{ .ctx = null }, self.s));
+                    sel_mode = "causal";
                 } else if (is_prefill) {
-                    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "array", local_prefill_mask, .{ .ctx = null }, self.s));
+                    sel_mode = "array";
+                    sel_mask = local_prefill_mask;
                 } else if (is_global) {
-                    // Global layers: full attention, no mask
-                    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "", none_mask, .{ .ctx = null }, self.s));
+                    // Global layers: full attention, no mask (defaults).
                 } else if (blk: {
-                    // Check if within sliding window (use source layer's cache for shared layers)
                     const check_layer = if (is_kv_shared) lw.kv_source.? else li;
-                    break :blk @as(c_int, @intCast(self.cache.seqLen(check_layer))) <= sw;
+                    break :blk @as(c_int, @intCast(ctx.cache.seqLen(check_layer))) <= sw;
                 }) {
-                    // Within window: no mask needed
-                    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "", none_mask, .{ .ctx = null }, self.s));
+                    // Within window: no mask needed (defaults).
                 } else {
-                    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "array", local_decode_mask, .{ .ctx = null }, self.s));
+                    sel_mode = "array";
+                    sel_mask = local_decode_mask;
                 }
+            }
+
+            // Fused-attn opt-in: consume the cache's quant triples directly
+            // via mlx_quantized_matmul. Only when the request opts in AND
+            // the cache scheme is .affine (TurboQuant variants need their
+            // rotation undo step, deferred). Falls back to dense SDPA on
+            // any precondition miss.
+            if (ctx.kv_attn_fused and kv_view.has_quant_triple) {
+                const fused = try kv_quant.quantAttention(
+                    q_rope,
+                    kv_view.kTriple(),
+                    kv_view.vTriple(),
+                    kv_view.bits,
+                    kv_view.group_size,
+                    attn_scale,
+                    sel_mode,
+                    sel_mask,
+                    self.s,
+                );
+                _ = mlx.mlx_array_free(attn_out);
+                attn_out = fused;
+            } else if (std.mem.eql(u8, sel_mode, "causal")) {
+                try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "causal", none_mask, .{ .ctx = null }, self.s));
+            } else if (std.mem.eql(u8, sel_mode, "array")) {
+                try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "array", sel_mask, .{ .ctx = null }, self.s));
+            } else {
+                try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "", none_mask, .{ .ctx = null }, self.s));
             }
 
             // Reshape attention output
@@ -2784,7 +3385,7 @@ pub const Transformer = struct {
         // Used by PLD verify-fusion and the Gemma 4 assistant drafter
         // (which needs the post-final-norm hidden as h_prev seed). Mirrors
         // the identical block in forwardMoe.
-        if (self.capture_hidden) |target| {
+        if (ctx.capture_hidden) |target| {
             const fn_shape = mlx.getShape(final_normed);
             const last = fn_shape[1] - 1;
             const start = [_]c_int{ 0, last, 0 };
@@ -2810,18 +3411,439 @@ pub const Transformer = struct {
         return logits;
     }
 
+    // ── Batched-decode forward pass ──
+    //
+    // One forward call computes next-token logits for N concurrent requests at
+    // decode step (q_len=1 each). Each request owns its own KVCache via its
+    // ForwardCtx; weights are shared. Returns N logits arrays of shape [1,1,V],
+    // one per slot in the input order. Caller owns the returned slice and the
+    // inner arrays (free each via mlx_array_free, then allocator.free the slice).
+    //
+    // Restrictions (enforced upstream by `Scheduler.batchable`):
+    //   - Standard arch only (no MoE, hybrid SSM, encoder-only).
+    //   - Decode only (each slot contributes exactly one new token).
+    //   - No grammar-constrained sampling, no in-flight speculative round.
+    //
+    // Per-layer flow:
+    //   embed → input_norm → Q/K/V proj (B=N, batch-invariant)
+    //   → Q/K-norm → transpose → mlx_fast_rope_dynamic (per-slot offset)
+    //   → per-slot cache.update at B=1 (each ctx's cache owns its own state)
+    //   → gather views, pad to common kv_max, concat axis=0
+    //   → build [N,1,1,kv_max] additive mask via positions < kv_lens
+    //   → SDPA → o_proj → MLP → final_norm → lm_head → softcap → demux.
+    pub fn forwardBatchedDecode(
+        self: *Transformer,
+        next_tokens: []const u32,
+        ctxs: []const *ForwardCtx,
+        rope_offsets: []const u32,
+    ) ![]mlx.mlx_array {
+        const N: c_int = @intCast(next_tokens.len);
+        std.debug.assert(next_tokens.len == ctxs.len);
+        std.debug.assert(next_tokens.len == rope_offsets.len);
+        std.debug.assert(N >= 1);
+
+        const cfg = &self.config;
+        const h_count = cfg.num_attention_heads;
+        const kv_h = cfg.num_key_value_heads;
+        const hd = cfg.head_dim;
+        const has_dual_hd = cfg.global_head_dim > 0 and cfg.global_head_dim != hd;
+        const ghd: u32 = if (has_dual_hd) cfg.global_head_dim else hd;
+        const gkv_h: u32 = if (cfg.num_global_key_value_heads > 0) cfg.num_global_key_value_heads else kv_h;
+        const attn_scale: f32 = if (std.mem.eql(u8, cfg.model_type, "gemma4"))
+            1.0
+        else
+            1.0 / @sqrt(@as(f32, @floatFromInt(cfg.query_pre_attn_scalar)));
+
+        // 1. Build [N, 1] int32 token tensor from u32 input.
+        var token_buf = try self.allocator.alloc(i32, next_tokens.len);
+        defer self.allocator.free(token_buf);
+        for (next_tokens, 0..) |t, i| token_buf[i] = @intCast(t);
+        const tok_shape = [_]c_int{ N, 1 };
+        const token_arr = mlx.mlx_array_new_data(token_buf.ptr, &tok_shape, 2, .int32);
+        defer _ = mlx.mlx_array_free(token_arr);
+
+        // 2. Embed → [N, 1, hidden].
+        var h = try self.embedding(token_arr);
+
+        // 3. Build per-slot int32 rope-offset array for mlx_fast_rope_dynamic.
+        var rope_off_buf = try self.allocator.alloc(i32, rope_offsets.len);
+        defer self.allocator.free(rope_off_buf);
+        for (rope_offsets, 0..) |o, i| rope_off_buf[i] = @intCast(o);
+        const rope_off_shape = [_]c_int{N};
+        const rope_offset_arr = mlx.mlx_array_new_data(rope_off_buf.ptr, &rope_off_shape, 1, .int32);
+        defer _ = mlx.mlx_array_free(rope_offset_arr);
+
+        // 4. Gemma 4 PLE input — computed once across the batch (token_arr is [N,1]).
+        var ple_input: ?mlx.mlx_array = null;
+        defer if (ple_input) |p| {
+            _ = mlx.mlx_array_free(p);
+        };
+        if (cfg.hidden_size_per_layer_input > 0) {
+            ple_input = try self.computePLEInput(token_arr, h, N, 1);
+        }
+
+        const perm = [_]c_int{ 0, 2, 1, 3 };
+        const perm_back = [_]c_int{ 0, 2, 1, 3 };
+        const none_mask = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(none_mask);
+
+        // Per-slot int32 kv-len buffer reused for the mask each layer.
+        var kv_len_buf = try self.allocator.alloc(i32, next_tokens.len);
+        defer self.allocator.free(kv_len_buf);
+
+        for (0..cfg.num_hidden_layers) |layer_idx| {
+            const li: u32 = @intCast(layer_idx);
+            const lw = &self.layers[layer_idx];
+            const is_global = cfg.isGlobalLayer(li);
+            const is_kv_shared = lw.kv_source != null;
+
+            const cur_hd: u32 = if (has_dual_hd and is_global) ghd else hd;
+            const cur_kv_h: u32 = if (has_dual_hd and is_global) gkv_h else kv_h;
+            const cur_q_shape = [_]c_int{ N, 1, @intCast(h_count), @intCast(cur_hd) };
+            const cur_kv_shape = [_]c_int{ N, 1, @intCast(cur_kv_h), @intCast(cur_hd) };
+            const cur_out_shape = [_]c_int{ N, 1, @intCast(h_count * cur_hd) };
+            // RoPE dims — same logic as forwardStandard's decode path.
+            const use_prop_rope = is_global and self.rope_freqs_global != null;
+            const rope_dims_partial: c_int = if (is_global and cfg.partial_rotary_factor_global < 1.0)
+                @intCast(@as(u32, @intFromFloat(@as(f32, @floatFromInt(cur_hd)) * cfg.partial_rotary_factor_global)))
+            else
+                @intCast(cur_hd);
+            const rope_base_opt = mlx.mlx_optional_float{
+                .value = if (is_global) cfg.rope_theta else cfg.rope_local_base_freq,
+                .has_value = !use_prop_rope,
+            };
+            const rope_scale: f32 = if (use_prop_rope) 1.0 else if (is_global) (1.0 / cfg.rope_scaling_factor) else 1.0;
+            const rope_freqs: mlx.mlx_array = if (use_prop_rope) self.rope_freqs_global.? else .{ .ctx = null };
+            const effective_rope_dims: c_int = if (use_prop_rope) @intCast(cur_hd) else rope_dims_partial;
+
+            const normed = try self.rmsNorm(h, lw.input_norm);
+            defer _ = mlx.mlx_array_free(normed);
+
+            // Q projection + reshape + Q-norm + transpose + dynamic RoPE.
+            const q = try self.qmatmul(normed, lw.q_w, lw.q_s, lw.q_b);
+            defer _ = mlx.mlx_array_free(q);
+
+            var q_r = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(q_r);
+            try mlx.check(mlx.mlx_reshape(&q_r, q, &cur_q_shape, 4, self.s));
+
+            const q_normed: ?mlx.mlx_array = if (lw.q_norm) |qn| try self.rmsNorm(q_r, qn) else null;
+            defer if (q_normed) |qn| {
+                _ = mlx.mlx_array_free(qn);
+            };
+            var q_t = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(q_t);
+            try mlx.check(mlx.mlx_transpose_axes(&q_t, q_normed orelse q_r, &perm, 4, self.s));
+
+            var q_rope = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(q_rope);
+            try mlx.check(mlx.mlx_fast_rope_dynamic(&q_rope, q_t, effective_rope_dims, false, rope_base_opt, rope_scale, rope_offset_arr, rope_freqs, self.s));
+
+            const max_kv_per_layer: u32 = if (is_global) 0 else if (cfg.has_sliding_window) cfg.sliding_window else 0;
+
+            // Per-slot KV update (or KV-share lookup), then gather views.
+            // own_views holds per-slot [1, kv_h, kv_len_i, cur_hd] mlx_arrays.
+            // We pad each to the common kv_max and concat axis=0 → [N, kv_h, kv_max, cur_hd].
+            if (!is_kv_shared) {
+                // Project K, V at full batch (B=N), reshape, normalize, transpose, RoPE.
+                const own_k = try self.qmatmul(normed, lw.k_w, lw.k_s, lw.k_b);
+                defer _ = mlx.mlx_array_free(own_k);
+                const own_v = if (lw.k_eq_v)
+                    own_k
+                else
+                    try self.qmatmul(normed, lw.v_w, lw.v_s, lw.v_b);
+                defer if (!lw.k_eq_v) {
+                    _ = mlx.mlx_array_free(own_v);
+                };
+
+                var own_k_r = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(own_k_r);
+                var own_v_r = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(own_v_r);
+                try mlx.check(mlx.mlx_reshape(&own_k_r, own_k, &cur_kv_shape, 4, self.s));
+                try mlx.check(mlx.mlx_reshape(&own_v_r, own_v, &cur_kv_shape, 4, self.s));
+
+                var own_k_normed_arr = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(own_k_normed_arr);
+                if (lw.k_norm) |kn| {
+                    own_k_normed_arr = try self.rmsNorm(own_k_r, kn);
+                }
+                const k_for_rope = if (lw.k_norm != null) own_k_normed_arr else own_k_r;
+
+                var own_v_normed_arr = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(own_v_normed_arr);
+                if (cfg.has_v_norm) {
+                    const vnw = if (has_dual_hd and is_global)
+                        (self.v_norm_weight_global orelse self.v_norm_weight.?)
+                    else
+                        self.v_norm_weight.?;
+                    own_v_normed_arr = try self.rmsNorm(own_v_r, vnw);
+                }
+                const v_after_norm = if (cfg.has_v_norm) own_v_normed_arr else own_v_r;
+
+                var own_k_t = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(own_k_t);
+                var own_v_t = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(own_v_t);
+                try mlx.check(mlx.mlx_transpose_axes(&own_k_t, k_for_rope, &perm, 4, self.s));
+                try mlx.check(mlx.mlx_transpose_axes(&own_v_t, v_after_norm, &perm, 4, self.s));
+
+                var own_k_rope = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(own_k_rope);
+                try mlx.check(mlx.mlx_fast_rope_dynamic(&own_k_rope, own_k_t, effective_rope_dims, false, rope_base_opt, rope_scale, rope_offset_arr, rope_freqs, self.s));
+
+                // Per-slot cache update at B=1 — slice axis 0 of stacked tensors.
+                const k_shape_full = mlx.getShape(own_k_rope);
+                const k_h_dim = k_shape_full[1];
+                const k_hd_dim = k_shape_full[3];
+                for (ctxs, 0..) |slot_ctx, i| {
+                    const i_c: c_int = @intCast(i);
+                    const slc_start = [_]c_int{ i_c, 0, 0, 0 };
+                    const slc_stop = [_]c_int{ i_c + 1, k_h_dim, 1, k_hd_dim };
+                    const slc_strides = [_]c_int{ 1, 1, 1, 1 };
+                    var k_slot = mlx.mlx_array_new();
+                    defer _ = mlx.mlx_array_free(k_slot);
+                    var v_slot = mlx.mlx_array_new();
+                    defer _ = mlx.mlx_array_free(v_slot);
+                    try mlx.check(mlx.mlx_slice(&k_slot, own_k_rope, &slc_start, 4, &slc_stop, 4, &slc_strides, 4, self.s));
+                    try mlx.check(mlx.mlx_slice(&v_slot, own_v_t, &slc_start, 4, &slc_stop, 4, &slc_strides, 4, self.s));
+                    var slot_view = try slot_ctx.cache.update(li, k_slot, v_slot, self.s, max_kv_per_layer);
+                    slot_view.deinit();
+                }
+            }
+
+            // Gather per-slot views and find kv_max. For KV-shared layers the
+            // source layer's view is what we read.
+            const view_layer: u32 = if (is_kv_shared) lw.kv_source.? else li;
+            var kv_max: c_int = 0;
+            for (ctxs, 0..) |slot_ctx, i| {
+                const view = slot_ctx.cache.entries[view_layer].key_view;
+                const vshape = mlx.getShape(view);
+                const klen: c_int = vshape[2];
+                kv_len_buf[i] = klen;
+                if (klen > kv_max) kv_max = klen;
+            }
+
+            // Pad every slot view to [1, cur_kv_h, kv_max, cur_hd] and concat axis=0.
+            const stacked_k = try self.padAndStackBatchedKV(ctxs, view_layer, true, kv_max);
+            defer _ = mlx.mlx_array_free(stacked_k);
+            const stacked_v = try self.padAndStackBatchedKV(ctxs, view_layer, false, kv_max);
+            defer _ = mlx.mlx_array_free(stacked_v);
+
+            // Mask: positions [1,1,1,kv_max] vs kv_lens [N,1,1,1] → broadcast to [N,1,1,kv_max].
+            const stacked_mask = try self.buildBatchedDecodeMask(kv_len_buf, kv_max);
+            defer _ = mlx.mlx_array_free(stacked_mask);
+
+            // SDPA → [N, h_count, 1, cur_hd].
+            var attn_out = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(attn_out);
+            try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, stacked_k, stacked_v, attn_scale, "array", stacked_mask, .{ .ctx = null }, self.s));
+
+            // Output projection.
+            var attn_t = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(attn_t);
+            try mlx.check(mlx.mlx_transpose_axes(&attn_t, attn_out, &perm_back, 4, self.s));
+            var attn_flat = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(attn_flat);
+            try mlx.check(mlx.mlx_reshape(&attn_flat, attn_t, &cur_out_shape, 3, self.s));
+
+            const o_out = try self.qmatmul(attn_flat, lw.o_w, lw.o_s, lw.o_b);
+            defer _ = mlx.mlx_array_free(o_out);
+
+            // MLP path — mirrors forwardStandard exactly.
+            if (cfg.has_pre_ff_norm) {
+                const attn_normed = try self.rmsNorm(o_out, lw.post_attn_norm);
+                defer _ = mlx.mlx_array_free(attn_normed);
+                var h_new = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_add(&h_new, h, attn_normed, self.s));
+                _ = mlx.mlx_array_free(h);
+                h = h_new;
+
+                const ff_normed = try self.rmsNorm(h, lw.pre_ff_norm.?);
+                defer _ = mlx.mlx_array_free(ff_normed);
+                const gate_raw = try self.qmatmul(ff_normed, lw.gate_w, lw.gate_s, lw.gate_b);
+                defer _ = mlx.mlx_array_free(gate_raw);
+                const up = try self.qmatmul(ff_normed, lw.up_w, lw.up_s, lw.up_b);
+                defer _ = mlx.mlx_array_free(up);
+                const gate_up = try self.computeGeglu(gate_raw, up);
+                defer _ = mlx.mlx_array_free(gate_up);
+                const down = try self.qmatmul(gate_up, lw.down_w, lw.down_s, lw.down_b);
+                defer _ = mlx.mlx_array_free(down);
+
+                const mlp_normed = try self.rmsNorm(down, lw.post_ff_norm.?);
+                defer _ = mlx.mlx_array_free(mlp_normed);
+                var h_next = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_add(&h_next, h, mlp_normed, self.s));
+                _ = mlx.mlx_array_free(h);
+                h = h_next;
+            } else {
+                var h_new = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_add(&h_new, h, o_out, self.s));
+                _ = mlx.mlx_array_free(h);
+                h = h_new;
+
+                const ff_normed = try self.rmsNorm(h, lw.post_attn_norm);
+                defer _ = mlx.mlx_array_free(ff_normed);
+                const gate_raw = try self.qmatmul(ff_normed, lw.gate_w, lw.gate_s, lw.gate_b);
+                defer _ = mlx.mlx_array_free(gate_raw);
+                const up = try self.qmatmul(ff_normed, lw.up_w, lw.up_s, lw.up_b);
+                defer _ = mlx.mlx_array_free(up);
+                const gate_up = try self.computeGeglu(gate_raw, up);
+                defer _ = mlx.mlx_array_free(gate_up);
+                const down = try self.qmatmul(gate_up, lw.down_w, lw.down_s, lw.down_b);
+                defer _ = mlx.mlx_array_free(down);
+
+                var h_next = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_add(&h_next, h, down, self.s));
+                _ = mlx.mlx_array_free(h);
+                h = h_next;
+            }
+
+            // Gemma 4 PLE: per-layer projection gate.
+            if (ple_input != null and lw.ple_gate_w != null) {
+                h = try self.applyPLE(h, lw, ple_input.?, li, N, 1);
+            }
+
+            // Gemma 4: layer scalar.
+            if (lw.layer_scalar) |ls| {
+                var h_scaled = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_multiply(&h_scaled, h, ls, self.s));
+                _ = mlx.mlx_array_free(h);
+                h = h_scaled;
+            }
+        }
+
+        const final_normed = try self.rmsNorm(h, self.final_norm);
+        _ = mlx.mlx_array_free(h);
+
+        var logits = try self.qmatmul(final_normed, self.lm_head_w, self.lm_head_s, self.lm_head_b);
+        _ = mlx.mlx_array_free(final_normed);
+
+        if (self.softcap_scalar != null) {
+            const capped = try self.applySoftcap(logits);
+            _ = mlx.mlx_array_free(logits);
+            logits = capped;
+        }
+        defer _ = mlx.mlx_array_free(logits);
+
+        // Demux: slice axis 0 into N tensors of shape [1, 1, V].
+        const lshape = mlx.getShape(logits);
+        const vocab: c_int = lshape[2];
+        const out = try self.allocator.alloc(mlx.mlx_array, next_tokens.len);
+        errdefer self.allocator.free(out);
+        for (out, 0..) |*slot, i| {
+            const i_c: c_int = @intCast(i);
+            const start = [_]c_int{ i_c, 0, 0 };
+            const stop = [_]c_int{ i_c + 1, 1, vocab };
+            const strides = [_]c_int{ 1, 1, 1 };
+            slot.* = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_slice(slot, logits, &start, 3, &stop, 3, &strides, 3, self.s));
+        }
+        return out;
+    }
+
+    // Pads each slot's KV view (shape [1, kv_h, kv_len_i, head_dim]) to a common
+    // kv_max along axis 2 with bf16 zeros and concatenates axis 0 → [N, kv_h, kv_max, head_dim].
+    // `key_not_value`: true selects key_view, false selects value_view.
+    fn padAndStackBatchedKV(
+        self: *const Transformer,
+        ctxs: []const *ForwardCtx,
+        layer: u32,
+        key_not_value: bool,
+        kv_max: c_int,
+    ) !mlx.mlx_array {
+        const pad_axes = [_]c_int{2};
+        const pad_value = bf16Scalar(0.0, self.s);
+        defer _ = mlx.mlx_array_free(pad_value);
+
+        const padded_vec = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(padded_vec);
+        // Track padded arrays so we can free them after the concat.
+        var padded_arrs = try self.allocator.alloc(mlx.mlx_array, ctxs.len);
+        defer {
+            for (padded_arrs) |a| _ = mlx.mlx_array_free(a);
+            self.allocator.free(padded_arrs);
+        }
+
+        for (ctxs, 0..) |slot_ctx, i| {
+            const view = if (key_not_value) slot_ctx.cache.entries[layer].key_view else slot_ctx.cache.entries[layer].value_view;
+            const vshape = mlx.getShape(view);
+            const klen: c_int = vshape[2];
+            const high_pad: c_int = kv_max - klen;
+            const low_pad_arr = [_]c_int{0};
+            const high_pad_arr = [_]c_int{high_pad};
+            padded_arrs[i] = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_pad(
+                &padded_arrs[i],
+                view,
+                &pad_axes,
+                1,
+                &low_pad_arr,
+                1,
+                &high_pad_arr,
+                1,
+                pad_value,
+                "constant",
+                self.s,
+            ));
+            _ = mlx.mlx_vector_array_append_value(padded_vec, padded_arrs[i]);
+        }
+
+        var stacked = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_concatenate_axis(&stacked, padded_vec, 0, self.s));
+        return stacked;
+    }
+
+    // Builds the additive per-slot decode mask [N,1,1,kv_max] in bf16 where
+    // valid columns are 0 and out-of-range columns are -inf. Computed via
+    // broadcasting: positions[1,1,1,kv_max] < kv_lens[N,1,1,1].
+    fn buildBatchedDecodeMask(
+        self: *const Transformer,
+        kv_lens: []const i32,
+        kv_max: c_int,
+    ) !mlx.mlx_array {
+        const N: c_int = @intCast(kv_lens.len);
+        var positions = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(positions);
+        try mlx.check(mlx.mlx_arange(&positions, 0, @floatFromInt(kv_max), 1, .int32, self.s));
+        const pos_shape = [_]c_int{ 1, 1, 1, kv_max };
+        var pos_4d = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(pos_4d);
+        try mlx.check(mlx.mlx_reshape(&pos_4d, positions, &pos_shape, 4, self.s));
+
+        const lens_shape = [_]c_int{N};
+        const lens_arr = mlx.mlx_array_new_data(kv_lens.ptr, &lens_shape, 1, .int32);
+        defer _ = mlx.mlx_array_free(lens_arr);
+        const lens_4shape = [_]c_int{ N, 1, 1, 1 };
+        var lens_4d = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(lens_4d);
+        try mlx.check(mlx.mlx_reshape(&lens_4d, lens_arr, &lens_4shape, 4, self.s));
+
+        var valid = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(valid);
+        try mlx.check(mlx.mlx_less(&valid, pos_4d, lens_4d, self.s));
+
+        const zero = bf16Scalar(0.0, self.s);
+        defer _ = mlx.mlx_array_free(zero);
+        const neg_inf = bf16Scalar(-std.math.inf(f32), self.s);
+        defer _ = mlx.mlx_array_free(neg_inf);
+        var mask = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_where(&mask, valid, zero, neg_inf, self.s));
+        return mask;
+    }
+
     // ── MoE forward pass (Qwen3.5 + Gemma 4) ──
 
-    fn forwardMoe(self: *Transformer, token_ids: mlx.mlx_array) !mlx.mlx_array {
+    fn forwardMoeWith(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_array) !mlx.mlx_array {
         const ml = self.moe_layers.?;
-        const offset = self.moe_seq_offset;
+        const offset = ctx.moe_seq_offset.*;
         const cfg = &self.config;
         const is_gemma4 = std.mem.eql(u8, cfg.model_type, "gemma4");
 
         var h = try self.embedding(token_ids);
 
         // Splice vision embeddings at image_token_id positions (prefill only)
-        h = try self.applyVisionEmbeddings(h, token_ids);
+        h = try self.applyVisionEmbeddingsWith(ctx, h, token_ids);
 
         const x_shape = mlx.getShape(h);
         const batch: c_int = x_shape[0];
@@ -2855,11 +3877,11 @@ pub const Transformer = struct {
 
             // Attention: linear (GatedDeltaNet) or full
             const attn_out = switch (lw.attn) {
-                .linear => |la| try self.gatedDeltaNet(normed, &la, &self.ssm_entries.?[layer_idx], batch, seq_len),
+                .linear => |la| try self.gatedDeltaNet(normed, &la, &ctx.ssm_entries.?[layer_idx], batch, seq_len),
                 .full => |fa| if (is_gemma4)
-                    try self.gemma4MoeAttn(normed, &fa, li, @intCast(offset), batch, seq_len, is_prefill, local_prefill_mask, local_decode_mask)
+                    try self.gemma4MoeAttnWith(ctx, normed, &fa, li, @intCast(offset), batch, seq_len, is_prefill, local_prefill_mask, local_decode_mask)
                 else
-                    try self.gatedFullAttn(normed, &fa, li, @intCast(offset), batch, seq_len, is_prefill),
+                    try self.gatedFullAttnWith(ctx, normed, &fa, li, @intCast(offset), batch, seq_len, is_prefill),
             };
             defer _ = mlx.mlx_array_free(attn_out);
 
@@ -2950,7 +3972,7 @@ pub const Transformer = struct {
             }
         }
 
-        self.moe_seq_offset += @intCast(seq_len);
+        ctx.moe_seq_offset.* += @intCast(seq_len);
 
         const final_normed = try self.rmsNorm(h, self.final_norm);
         _ = mlx.mlx_array_free(h);
@@ -2959,7 +3981,7 @@ pub const Transformer = struct {
         // at the LAST position only. Used by PLD verify-fusion and the
         // Gemma 4 assistant drafter as `h_prev`. Caller frees the captured
         // array.
-        if (self.capture_hidden) |target| {
+        if (ctx.capture_hidden) |target| {
             const fn_shape = mlx.getShape(final_normed);
             const last = fn_shape[1] - 1;
             const start = [_]c_int{ 0, last, 0 };
@@ -2987,9 +4009,9 @@ pub const Transformer = struct {
 
     // ── Hybrid forward pass (LFM2, Nemotron-H) ──
 
-    fn forwardHybrid(self: *Transformer, token_ids: mlx.mlx_array) !mlx.mlx_array {
+    fn forwardHybridWith(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_array) !mlx.mlx_array {
         const hl = self.hybrid_layers.?;
-        const offset = self.moe_seq_offset;
+        const offset = ctx.moe_seq_offset.*;
         const cfg = &self.config;
 
         var h = try self.embedding(token_ids);
@@ -3007,9 +4029,9 @@ pub const Transformer = struct {
 
             // Primary operation
             const op_out = switch (lw.op) {
-                .gated_conv => |cw| try self.gatedConv(normed, &cw, &self.ssm_entries.?[layer_idx], batch, seq_len),
-                .full_attn => |fa| try self.hybridAttn(normed, &fa, li, @intCast(offset), batch, seq_len, seq_len > 1),
-                .mamba2 => |mw| try self.mamba2Mixer(normed, &mw, &self.ssm_entries.?[layer_idx], batch, seq_len),
+                .gated_conv => |cw| try self.gatedConv(normed, &cw, &ctx.ssm_entries.?[layer_idx], batch, seq_len),
+                .full_attn => |fa| try self.hybridAttnWith(ctx, normed, &fa, li, @intCast(offset), batch, seq_len, seq_len > 1),
+                .mamba2 => |mw| try self.mamba2Mixer(normed, &mw, &ctx.ssm_entries.?[layer_idx], batch, seq_len),
                 .dense_mlp => |dw| try self.denseMLP(normed, &dw),
                 .simple_mlp => |sw| try self.simpleMLP(normed, &sw),
             };
@@ -3040,7 +4062,7 @@ pub const Transformer = struct {
 
         }
 
-        self.moe_seq_offset += @intCast(seq_len);
+        ctx.moe_seq_offset.* += @intCast(seq_len);
 
         // Final norm (absent for LFM2)
         if (cfg.has_final_norm) {
@@ -3455,8 +4477,9 @@ pub const Transformer = struct {
 
     // ── Hybrid attention (LFM2, Nemotron-H) ──
 
-    fn hybridAttn(
+    fn hybridAttnWith(
         self: *Transformer,
+        ctx: *ForwardCtx,
         x: mlx.mlx_array,
         fa: *const FullAttnWeights,
         layer_idx: u32,
@@ -3520,12 +4543,15 @@ pub const Transformer = struct {
         try mlx.check(mlx.mlx_fast_rope(&q_t, q_t, hd, false, rope_base, cfg.rope_scaling_factor, offset, no_freqs, self.s));
         try mlx.check(mlx.mlx_fast_rope(&k_t, k_t, hd, false, rope_base, cfg.rope_scaling_factor, offset, no_freqs, self.s));
 
-        // KV cache: update and get full K/V
-        const kv = try self.cache.update(layer_idx, k_t, v_t, self.s, cfg.max_position_embeddings);
+        // KV cache: update and get full K/V (DenseKVView owns its arrays only
+        // in quant mode; in dense mode it aliases the cache view, so the defer
+        // below is a no-op there).
+        var kv_view = try ctx.cache.update(layer_idx, k_t, v_t, self.s, cfg.max_position_embeddings);
+        defer kv_view.deinit();
         _ = mlx.mlx_array_free(k_t);
         _ = mlx.mlx_array_free(v_t);
-        k_t = kv.@"0";
-        v_t = kv.@"1";
+        k_t = kv_view.k;
+        v_t = kv_view.v;
 
         // Scaled dot-product attention (causal)
         const none_mask = mlx.mlx_array_new();
@@ -3571,8 +4597,9 @@ pub const Transformer = struct {
 
     // ── Full Attention for MoE models (with optional output gate) ──
 
-    fn gatedFullAttn(
+    fn gatedFullAttnWith(
         self: *Transformer,
+        ctx: *ForwardCtx,
         x: mlx.mlx_array,
         fa: *const FullAttnWeights,
         layer: u32,
@@ -3581,7 +4608,7 @@ pub const Transformer = struct {
         seq_len: c_int,
         is_prefill: bool,
     ) !mlx.mlx_array {
-        const cache = &self.cache;
+        const cache = ctx.cache;
         const cfg = &self.config;
         const h_count: c_int = @intCast(cfg.num_attention_heads);
         const kv_h: c_int = @intCast(cfg.num_key_value_heads);
@@ -3602,22 +4629,27 @@ pub const Transformer = struct {
         defer _ = mlx.mlx_array_free(gate);
 
         if (cfg.attn_output_gate) {
+            // Mirror mlx-lm qwen3_next.py:130-134: reshape Q-proj output to [B, S, H, D*2]
+            // then `mx.split(_, 2, axis=-1)` into (queries, gate). The single split op
+            // replaces our prior two-slice pattern (2 dispatches → 1 dispatch). Adds up
+            // across all `full_attention_interval` layers — was the dominant Qwen 3.5/3.6
+            // hybrid decode gap vs mlx-lm (5.7% → ~tied).
             const q_gate_shape = [_]c_int{ batch, seq_len, h_count, hd * 2 };
             var q_gate_r = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(q_gate_r);
             try mlx.check(mlx.mlx_reshape(&q_gate_r, q_proj, &q_gate_shape, 4, self.s));
 
-            const strides4 = [_]c_int{ 1, 1, 1, 1 };
-            const q_start = [_]c_int{ 0, 0, 0, 0 };
-            const q_stop = [_]c_int{ batch, seq_len, h_count, hd };
-            queries = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_slice(&queries, q_gate_r, &q_start, 4, &q_stop, 4, &strides4, 4, self.s));
+            var split_vec = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(split_vec);
+            try mlx.check(mlx.mlx_split(&split_vec, q_gate_r, 2, -1, self.s));
+            if (mlx.mlx_vector_array_size(split_vec) != 2) return error.UnexpectedSplitCount;
 
-            const g_start = [_]c_int{ 0, 0, 0, hd };
-            const g_stop = [_]c_int{ batch, seq_len, h_count, hd * 2 };
+            queries = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_vector_array_get(&queries, split_vec, 0));
+
             var gate_4d = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(gate_4d);
-            try mlx.check(mlx.mlx_slice(&gate_4d, q_gate_r, &g_start, 4, &g_stop, 4, &strides4, 4, self.s));
+            try mlx.check(mlx.mlx_vector_array_get(&gate_4d, split_vec, 1));
 
             try mlx.check(mlx.mlx_reshape(&gate, gate_4d, &flat_shape, 3, self.s));
         } else {
@@ -3666,9 +4698,10 @@ pub const Transformer = struct {
         try mlx.check(mlx.mlx_fast_rope(&q_rope, q_t, rope_dims, false, mlx.mlx_optional_float.some(self.config.rope_theta), 1.0, offset, .{ .ctx = null }, self.s));
         try mlx.check(mlx.mlx_fast_rope(&k_rope, k_t, rope_dims, false, mlx.mlx_optional_float.some(self.config.rope_theta), 1.0, offset, .{ .ctx = null }, self.s));
 
-        const kv = try cache.update(layer, k_rope, v_t, self.s, 0);
-        const full_k = kv[0];
-        const full_v = kv[1];
+        var kv_view = try cache.update(layer, k_rope, v_t, self.s, 0);
+        defer kv_view.deinit();
+        const full_k = kv_view.k;
+        const full_v = kv_view.v;
 
         // Attention
         var attn_out = mlx.mlx_array_new();
@@ -3676,7 +4709,23 @@ pub const Transformer = struct {
         const none_mask = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(none_mask);
 
-        if (is_prefill) {
+        // Fused-attn opt-in: see standard attention site for design notes.
+        const sel_mode_moe: []const u8 = if (is_prefill) "causal" else "";
+        if (ctx.kv_attn_fused and kv_view.has_quant_triple) {
+            const fused = try kv_quant.quantAttention(
+                q_rope,
+                kv_view.kTriple(),
+                kv_view.vTriple(),
+                kv_view.bits,
+                kv_view.group_size,
+                attn_scale,
+                sel_mode_moe,
+                none_mask,
+                self.s,
+            );
+            _ = mlx.mlx_array_free(attn_out);
+            attn_out = fused;
+        } else if (is_prefill) {
             try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "causal", none_mask, .{ .ctx = null }, self.s));
         } else {
             try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "", none_mask, .{ .ctx = null }, self.s));
@@ -3708,8 +4757,9 @@ pub const Transformer = struct {
     // ── Gemma 4 Full Attention for MoE layers ──
     // Handles dual head dims, v_norm, sliding window, per-layer RoPE.
 
-    fn gemma4MoeAttn(
+    fn gemma4MoeAttnWith(
         self: *Transformer,
+        ctx: *ForwardCtx,
         x: mlx.mlx_array,
         fa: *const FullAttnWeights,
         layer: u32,
@@ -3806,9 +4856,10 @@ pub const Transformer = struct {
 
         // Update KV cache (trim to sliding window for local layers)
         const max_kv: u32 = if (is_global) 0 else if (cfg.has_sliding_window) cfg.sliding_window else 0;
-        const kv = try self.cache.update(layer, k_rope, v_t, self.s, max_kv);
-        const full_k = kv[0];
-        const full_v = kv[1];
+        var kv_view = try ctx.cache.update(layer, k_rope, v_t, self.s, max_kv);
+        defer kv_view.deinit();
+        const full_k = kv_view.k;
+        const full_v = kv_view.v;
 
         // Scaled dot-product attention with sliding window masking
         var attn_out = mlx.mlx_array_new();
@@ -3829,7 +4880,7 @@ pub const Transformer = struct {
                 try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "array", local_prefill_mask, .{ .ctx = null }, self.s));
             } else if (is_global) {
                 try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "", none_mask, .{ .ctx = null }, self.s));
-            } else if (@as(c_int, @intCast(self.cache.seqLen(layer))) <= sw) {
+            } else if (@as(c_int, @intCast(ctx.cache.seqLen(layer))) <= sw) {
                 try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "", none_mask, .{ .ctx = null }, self.s));
             } else {
                 _ = total_kv;
@@ -5464,7 +6515,8 @@ test "KVCache sliding window views return last max_seq entries" {
         defer _ = mlx.mlx_array_free(k);
         const v = testKV(3, s);
         defer _ = mlx.mlx_array_free(v);
-        _ = try cache.update(0, k, v, s, 4);
+        var dv = try cache.update(0, k, v, s, 4);
+        dv.deinit();
     }
     // After prefill: offset=3, step=3
     try testing.expectEqual(@as(usize, 3), cache.entries[0].offset);
@@ -5476,7 +6528,8 @@ test "KVCache sliding window views return last max_seq entries" {
         defer _ = mlx.mlx_array_free(k);
         const v = testKV(1, s);
         defer _ = mlx.mlx_array_free(v);
-        _ = try cache.update(0, k, v, s, 4);
+        var dv = try cache.update(0, k, v, s, 4);
+        dv.deinit();
     }
     try testing.expectEqual(@as(usize, 4), cache.entries[0].offset);
     try testing.expectEqual(@as(usize, 4), cache.step);
@@ -5488,9 +6541,10 @@ test "KVCache sliding window views return last max_seq entries" {
         defer _ = mlx.mlx_array_free(k);
         const v = testKV(1, s);
         defer _ = mlx.mlx_array_free(v);
-        const kv = try cache.update(0, k, v, s, 4);
+        var dv = try cache.update(0, k, v, s, 4);
+        defer dv.deinit();
         // View should be 4 entries (max_seq), not 5
-        const view_shape = mlx.getShape(kv[0]);
+        const view_shape = mlx.getShape(dv.k);
         try testing.expectEqual(@as(c_int, 4), view_shape[2]);
     }
     // Buffer has 5 entries, but view shows 4. step=5 (absolute).
@@ -5503,8 +6557,9 @@ test "KVCache sliding window views return last max_seq entries" {
         defer _ = mlx.mlx_array_free(k);
         const v = testKV(1, s);
         defer _ = mlx.mlx_array_free(v);
-        const kv = try cache.update(0, k, v, s, 4);
-        const view_shape = mlx.getShape(kv[0]);
+        var dv = try cache.update(0, k, v, s, 4);
+        defer dv.deinit();
+        const view_shape = mlx.getShape(dv.k);
         try testing.expectEqual(@as(c_int, 4), view_shape[2]);
     }
     try testing.expectEqual(@as(usize, 8), cache.entries[0].offset);

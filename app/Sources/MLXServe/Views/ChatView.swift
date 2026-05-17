@@ -13,6 +13,149 @@ private struct ScrollViewHeightKey: PreferenceKey {
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = nextValue() }
 }
 
+/// A tool-call awaiting user approval. The agent loop suspends on
+/// `continuation` while the SwiftUI sheet shows the request; the sheet's
+/// buttons resume it with the user's choice.
+struct ToolApprovalRequest: Identifiable {
+    let id = UUID()
+    let toolName: String
+    let arguments: [String: String]
+    /// Raw JSON arguments — used when `arguments` is the post-parse dict but
+    /// we want to display the verbatim JSON (handy for nested objects /
+    /// arrays the dict-flattening loses).
+    let rawArguments: String
+    let continuation: CheckedContinuation<ToolApprovalChoice, Never>
+}
+
+enum ToolApprovalChoice {
+    case allow
+    case deny
+}
+
+/// Sheet body. Renders the tool name, a pretty-printed argument block, and
+/// three buttons. Allow / Deny resume the continuation with that choice;
+/// Always Allow flips a per-session flag (in the parent view) and resumes
+/// with `.allow`.
+private struct ToolApprovalSheet: View {
+    let request: ToolApprovalRequest
+    let onAllow: () -> Void
+    let onDeny: () -> Void
+    let onAllowAll: () -> Void
+
+    /// Short, human-readable summary for the most common tools. Falls back to
+    /// "Run <tool>" so unknown tools (e.g. MCP server tools) still render.
+    private var headline: String {
+        switch request.toolName {
+        case "shell":      return "Run a shell command"
+        case "cwd":        return "Change working directory"
+        case "writeFile":  return "Write a file"
+        case "editFile":   return "Edit a file"
+        case "readFile":   return "Read a file"
+        case "searchFiles":return "Search the workspace"
+        case "listFiles":  return "List files"
+        case "browse":     return "Browse the web"
+        case "webSearch":  return "Search the web"
+        case "saveMemory": return "Save a memory"
+        default:           return "Run \(request.toolName)"
+        }
+    }
+
+    /// Sorted arg pairs. Prefer the parsed dict; if it's empty (raw is the
+    /// only source of truth for arrays/objects), show the raw JSON inline.
+    private var argPairs: [(String, String)] {
+        request.arguments.sorted { $0.key < $1.key }.map { ($0.key, $0.value) }
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(spacing: 10) {
+                Image(systemName: "shield.lefthalf.filled")
+                    .font(.title2)
+                    .foregroundStyle(.orange)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Allow this tool call?")
+                        .font(.headline)
+                    Text(headline)
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer()
+            }
+
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Tool: \(request.toolName)")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.secondary)
+                if argPairs.isEmpty && !request.rawArguments.isEmpty {
+                    ScrollView {
+                        Text(request.rawArguments)
+                            .font(.system(size: 11, design: .monospaced))
+                            .textSelection(.enabled)
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(8)
+                    }
+                    .frame(maxHeight: 200)
+                    .background(Color(NSColor.textBackgroundColor))
+                    .clipShape(RoundedRectangle(cornerRadius: 6))
+                } else if argPairs.isEmpty {
+                    Text("(no arguments)")
+                        .font(.caption.italic())
+                        .foregroundStyle(.tertiary)
+                } else {
+                    ScrollView {
+                        VStack(alignment: .leading, spacing: 4) {
+                            ForEach(argPairs, id: \.0) { (k, v) in
+                                HStack(alignment: .firstTextBaseline, spacing: 6) {
+                                    Text(k)
+                                        .font(.system(size: 11, design: .monospaced).weight(.semibold))
+                                        .foregroundStyle(.secondary)
+                                    Text(v)
+                                        .font(.system(size: 11, design: .monospaced))
+                                        .textSelection(.enabled)
+                                        .lineLimit(8)
+                                        .fixedSize(horizontal: false, vertical: true)
+                                }
+                            }
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .padding(8)
+                    }
+                    .frame(maxHeight: 240)
+                    .background(Color(NSColor.textBackgroundColor))
+                    .clipShape(RoundedRectangle(cornerRadius: 6))
+                }
+            }
+
+            HStack(spacing: 8) {
+                Button(role: .destructive) {
+                    onDeny()
+                } label: {
+                    Text("Deny").frame(minWidth: 70)
+                }
+                .keyboardShortcut(.cancelAction)
+
+                Spacer()
+
+                Button {
+                    onAllowAll()
+                } label: {
+                    Text("Allow all tools this session").frame(minWidth: 180)
+                }
+
+                Button {
+                    onAllow()
+                } label: {
+                    Text("Allow").frame(minWidth: 70)
+                }
+                .keyboardShortcut(.defaultAction)
+                .buttonStyle(.borderedProminent)
+            }
+        }
+        .padding(20)
+        .frame(width: 520)
+    }
+}
+
 struct ChatView: View {
     @EnvironmentObject var appState: AppState
     @EnvironmentObject var server: ServerManager
@@ -148,6 +291,7 @@ struct ChatDetailView: View {
     @State private var enableThinking = false
     @State private var isAgentMode = false
     @State private var showMCPMarketplace = false
+    @State private var showThinkingInAgentConfirm = false
     @State private var executingPlanMessageId: UUID?
     @State private var generationTask: Task<Void, Never>?
     @State private var isNearBottom = true
@@ -156,6 +300,15 @@ struct ChatDetailView: View {
     @State private var scrollMonitor: Any?
     @State private var pendingImages: [NSImage] = []
     @State private var pendingPDFs: [(name: String, text: String)] = []
+    // Tool-approval gate state. `pendingApproval` is set right before each
+    // tool call when Agent mode is on; the sheet at the bottom of `body`
+    // observes it and resumes `approvalContinuation` with the user's choice.
+    // `sessionAllowAll` is a soft "Allow all tools this session" — scoped to
+    // *this chat session*: cleared when the user toggles Agent off, and also
+    // cleared by the `.onChange(of: sessionId)` below so switching to (or
+    // opening) a different chat re-arms the approval prompt.
+    @State private var pendingApproval: ToolApprovalRequest?
+    @State private var sessionAllowAll = false
     @FocusState private var inputFocused: Bool
 
 
@@ -398,7 +551,7 @@ struct ChatDetailView: View {
                         Image(systemName: "folder.badge.gearshape")
                             .font(.system(size: 12))
                     }
-                    .help("Agent Skills Folder")
+                    .help("Open ~/.mlx-serve in Finder — your skills/, system-prompt.md, memory.md, chat-history.json, and downloaded models live here.")
                 }
             }
             ToolbarItem(placement: .automatic) {
@@ -408,10 +561,16 @@ struct ChatDetailView: View {
                     Image(systemName: "gear")
                         .font(.system(size: 12))
                 }
-                .help("Settings")
+                .help("Open Settings (⌘,) — server flags, speculative decoding, performance (continuous batching, KV-quant, prefix cache), and per-request defaults.")
             }
             ToolbarItem(placement: .automatic) {
-                Button { enableThinking.toggle() } label: {
+                Button {
+                    if !enableThinking && isAgentMode {
+                        showThinkingInAgentConfirm = true
+                    } else {
+                        enableThinking.toggle()
+                    }
+                } label: {
                     HStack(spacing: 4) {
                         Image(systemName: "brain")
                             .font(.system(size: 11, weight: .medium))
@@ -425,12 +584,20 @@ struct ChatDetailView: View {
                     .clipShape(Capsule())
                 }
                 .buttonStyle(.plain)
-                .help("Thinking Mode (\(enableThinking ? "ON" : "OFF"))")
+                .help("Thinking Mode (\(enableThinking ? "ON" : "OFF")) — when the model supports it, it'll emit a private reasoning trace before the visible answer. Slower but better on reasoning-heavy prompts.")
                 .padding(.leading, 8)
                 .padding(.trailing, 4)
             }
             ToolbarItem(placement: .automatic) {
-                Button { isAgentMode.toggle() } label: {
+                Button {
+                    isAgentMode.toggle()
+                    // Re-arm the approval gate every time the user re-enters
+                    // Agent mode. "Always allow this session" decays here.
+                    if !isAgentMode { sessionAllowAll = false }
+                    // Thinking + tool-calling loops degrade quality on most
+                    // local models — auto-off when entering Agent mode.
+                    if isAgentMode { enableThinking = false }
+                } label: {
                     HStack(spacing: 4) {
                         Image(systemName: "wrench")
                             .font(.system(size: 11, weight: .medium))
@@ -444,7 +611,20 @@ struct ChatDetailView: View {
                     .clipShape(Capsule())
                 }
                 .buttonStyle(.plain)
-                .help("Agent Mode (\(isAgentMode ? "ON" : "OFF"))")
+                .help("""
+                Agent Mode (\(isAgentMode ? "ON" : "OFF")) — the model runs a tool-calling loop with these 10 built-in tools:
+                  • shell — run a shell command in the workspace
+                  • cwd — change the workspace working directory
+                  • readFile — read a file (with line range)
+                  • writeFile — create or overwrite a small file
+                  • editFile — line- or text-based edit of an existing file
+                  • searchFiles — ripgrep-style content search across the workspace
+                  • listFiles — list paths with glob + recursive options
+                  • browse — navigate + extract text/HTML via WKWebView
+                  • webSearch — DuckDuckGo search
+                  • saveMemory — persist a fact to ~/.mlx-serve/memory.md
+                Off: a regular chat with no tools.
+                """)
             }
             ToolbarItem(placement: .automatic) {
                 HStack(spacing: 0) {
@@ -469,11 +649,11 @@ struct ChatDetailView: View {
                             .padding(.vertical, 4)
                     }
                     .buttonStyle(.plain)
-                    .help("Open MCP Marketplace")
+                    .help("Open MCP Marketplace — browse and enable Model Context Protocol servers (GitHub, Filesystem, Slack, Notion, Playwright, Docker, etc.). Each enabled server's tools become callable in Agent Mode.")
                 }
                 .background(appState.mcpMode ? .purple : Color.secondary.opacity(0.12))
                 .clipShape(Capsule())
-                .help("MCP Mode (\(appState.mcpMode ? "ON" : "OFF")) — gear opens marketplace")
+                .help("MCP Mode (\(appState.mcpMode ? "ON" : "OFF")) — when on, tools from every enabled Model Context Protocol server are added to the Agent's toolset (alongside the 10 built-ins). Tap the gear to open the Marketplace and toggle servers on/off.")
             }
             ToolbarItem(placement: .automatic) {
                 Circle()
@@ -486,6 +666,19 @@ struct ChatDetailView: View {
         .sheet(isPresented: $showMCPMarketplace) {
             MCPMarketplaceView()
                 .environmentObject(mcpManager)
+        }
+        .alert("Enable thinking in Agent mode?", isPresented: $showThinkingInAgentConfirm) {
+            Button("Cancel", role: .cancel) { }
+            Button("Enable anyway") { enableThinking = true }
+        } message: {
+            Text("Thinking is not recommended with Agent mode — most local models tool-call more reliably without it. Do you still want to enable it?")
+        }
+        .sheet(item: $pendingApproval) { req in
+            ToolApprovalSheet(request: req,
+                              onAllow: { req.continuation.resume(returning: .allow) ; pendingApproval = nil },
+                              onDeny: { req.continuation.resume(returning: .deny) ; pendingApproval = nil },
+                              onAllowAll: { sessionAllowAll = true
+                                            req.continuation.resume(returning: .allow) ; pendingApproval = nil })
         }
         .onAppear {
             inputFocused = true
@@ -520,6 +713,13 @@ struct ChatDetailView: View {
         }
         .onChange(of: isGenerating) { _, generating in
             if !generating { inputFocused = true }
+        }
+        .onChange(of: sessionId) { _, _ in
+            // "Allow all tools this session" is scoped to a chat session —
+            // switching to a different chat (or opening a new one) must
+            // re-prompt on the next tool call. SwiftUI reuses this view
+            // across sessionId changes, so reset the flag explicitly.
+            sessionAllowAll = false
         }
     }
 
@@ -688,46 +888,63 @@ struct ChatDetailView: View {
         userMsg.images = attachedImages
         appState.appendMessage(to: sessionId, message: userMsg)
 
+        isGenerating = true
+        let api = APIClient()
+
+        // Build the request from the session (its source of truth). We append
+        // the streaming placeholder AFTER this so it never lands in the
+        // request — same pattern the agent loop uses. Image handling: only
+        // the latest user message's images are sent (older turns' images are
+        // stripped for bandwidth).
+        let sessionMsgs = session?.messages ?? []
+        let lastUserIdx = sessionMsgs.lastIndex { $0.role == .user }
+        let history: [[String: Any]] = sessionMsgs.enumerated().map { i, msg in
+            if i == lastUserIdx, msg.role == .user, let imgs = msg.images, !imgs.isEmpty {
+                return ["role": "user", "content": Self.buildMultimodalContent(text: msg.content, images: imgs)]
+            }
+            var d: [String: Any] = ["role": msg.role.rawValue, "content": msg.content]
+            if msg.role == .assistant && msg.content.isEmpty { d.removeValue(forKey: "content") }
+            return d
+        }
+        // Plain chat: no synthesized system message. Earlier versions
+        // prepended a "formatNudge" system message asking the model to use
+        // Markdown tables / fenced code / bold. That nudge had no persona
+        // and was routinely interpreted by the model AS the user's input —
+        // first-turn replies came back as meta-commentary like "It seems
+        // like you're providing a formatting reminder, but it looks like
+        // you may have intended to ask a question". Removing the nudge
+        // entirely; smaller models will occasionally emit whitespace-
+        // aligned tables instead of Markdown grids, which is a far better
+        // failure mode than the model addressing the system instruction
+        // instead of the user. Agent mode still has its own system prompt
+        // (AgentPrompt.swift) which DOES carry a full persona.
+        let messagesArray = history
+
+        // Streaming placeholder for the UI — appended AFTER the request body
+        // is built so it doesn't show up in the prompt. If we added it
+        // before building, the session would have a trailing empty assistant
+        // turn that we'd have to drop back out (and the user message we just
+        // appended would be on the line above it — easy to double-add by
+        // mistake, which on small / 2-bit-quant models like DSV4-Flash
+        // produces a repeating-token collapse at temp > 0).
         var assistantMsg = ChatMessage(role: .assistant, content: "")
         assistantMsg.isStreaming = true
         appState.appendMessage(to: sessionId, message: assistantMsg)
 
-        isGenerating = true
-        let api = APIClient()
-
-        // Strip images from old messages — server only processes the last user message's images.
-        // Re-sending old images wastes bandwidth and memory.
-        let messages = (session?.messages ?? []).map { msg -> [String: Any] in
-            var dict: [String: Any] = ["role": msg.role.rawValue, "content": msg.content]
-            if msg.role == .assistant && msg.content.isEmpty { dict.removeValue(forKey: "content") }
-            return dict
-        }.dropLast() // Drop the empty assistant message we just added
-        // Build last user message with potential images
-        var lastUserDict: [String: Any] = ["role": "user"]
-        if let imgs = attachedImages, !imgs.isEmpty {
-            lastUserDict["content"] = Self.buildMultimodalContent(text: text, images: imgs)
-        } else {
-            lastUserDict["content"] = text
-        }
-        // Tiny formatting nudge for plain chat (agent mode has its own system
-        // prompt). Without this, smaller models emit "tables" as whitespace-
-        // aligned plain text which the markdown renderer can't structure into
-        // a real grid. Phrased gently so it doesn't override user intent.
-        let formatNudge: [String: Any] = [
-            "role": "system",
-            "content": "When you display tabular data, use GitHub-flavored markdown table syntax (e.g. `| col1 | col2 |` with a `|---|---|` separator row). Use fenced ```code``` blocks for code, and `**bold**`/`*italic*` for emphasis."
-        ]
-        let messagesArray = [formatNudge] + Array(messages) + [lastUserDict]
-
         generationTask = Task {
             do {
+                // Plan 05 Phase G — pin the request to the active model
+                // (server-resolved default if nil) so hot-switch can finish
+                // in-flight requests on the old model before the new one
+                // takes over.
                 let stream = api.streamChat(
                     port: server.port,
                     messages: messagesArray,
                     maxTokens: appState.maxTokens,
                     temperature: appState.serverOptions.defaultTemperature,
                     enableThinking: enableThinking || appState.serverOptions.defaultEnableThinking,
-                    defaults: APIClient.RequestDefaults.from(appState.serverOptions)
+                    defaults: APIClient.RequestDefaults.from(appState.serverOptions),
+                    modelId: appState.server.modelInfo?.name
                 )
                 for try await event in stream {
                     try Task.checkCancellation()
@@ -825,6 +1042,24 @@ struct ChatDetailView: View {
     }
 
 
+    /// Ask the user to approve a single tool call. Returns true on Allow /
+    /// Always Allow, false on Deny. Bypassed entirely when `sessionAllowAll`
+    /// is on. Bounces to the main actor (state mutations + sheet presentation)
+    /// and suspends on a checked continuation until the sheet resumes it.
+    @MainActor
+    private func requestToolApproval(_ tc: APIClient.ToolCall) async -> Bool {
+        if sessionAllowAll { return true }
+        let choice: ToolApprovalChoice = await withCheckedContinuation { (cont: CheckedContinuation<ToolApprovalChoice, Never>) in
+            pendingApproval = ToolApprovalRequest(
+                toolName: tc.name,
+                arguments: tc.arguments,
+                rawArguments: tc.rawArguments,
+                continuation: cont
+            )
+        }
+        return choice == .allow
+    }
+
     /// Agent loop: call model with tools (streaming), execute tool calls, feed results back, repeat.
     /// Stops when the model responds with content (no tool calls) or after 150 iterations.
     private func runAgentLoop(api: APIClient, workingDirectory initialWorkDir: String?) async throws {
@@ -901,7 +1136,8 @@ struct ChatDetailView: View {
                 temperature: 0.7,
                 enableThinking: enableThinking,
                 toolsJSON: combinedToolsJSON,
-                defaults: APIClient.RequestDefaults.from(appState.serverOptions)
+                defaults: APIClient.RequestDefaults.from(appState.serverOptions),
+                modelId: appState.server.modelInfo?.name
             )
 
             // No client-side stream watchdog: long generations (large
@@ -1000,9 +1236,21 @@ struct ChatDetailView: View {
             if receivedToolCalls.isEmpty {
                 let lastContent = appState.chatSessions
                     .first(where: { $0.id == sessionId })?.messages.last?.content ?? ""
+                // Match the full `<tool…` family — `<tool_call>`, `<tool_call name=…>`,
+                // `<tool_calls>` wrapper, `<tool name=… arguments=…/>` self-closing,
+                // Gemma 4 `<|tool_call>`/`<tool_call|>`, and `<function=` legacy. The
+                // server-side `parseToolCalls` already handles all of these; this
+                // check is the defense-in-depth that fires the retry nudge when
+                // a new model variant slips through the parser before we recognize
+                // it (the symptom: hundreds of completion_tokens but the assistant
+                // turn ends with markup-as-content and no parsed tool_calls).
                 let looksLikeGhostToolCall = lastContent.contains("<|tool_call>") ||
                     lastContent.contains("<tool_call>") ||
+                    lastContent.contains("<tool_call ") ||
+                    lastContent.contains("<tool_calls>") ||
+                    lastContent.contains("<tool_calls ") ||
                     lastContent.contains("<tool_call|>") ||
+                    lastContent.contains("<tool name=") ||
                     lastContent.contains("<function=")
                 if looksLikeGhostToolCall && completionRetries < 1 {
                     completionRetries += 1
@@ -1055,8 +1303,30 @@ struct ChatDetailView: View {
 
             // Execute each tool call. MCP-namespaced names (`<server>__<tool>`) route to MCPManager;
             // everything else flows through the existing AgentEngine dispatch.
+            // Tool-approval gate: before every dispatch, ask the user unless
+            // they've flipped "Always allow this session". Deny short-circuits
+            // to a fabricated error result so the agent loop can react and
+            // the user's intent is visible in the transcript.
             for tc in receivedToolCalls {
                 try Task.checkCancellation()
+
+                let approved = await requestToolApproval(tc)
+                guard approved else {
+                    let denied = AgentEngine.ToolResult(
+                        id: tc.id,
+                        name: tc.name,
+                        output: "Error: user denied this tool call. Do not retry this command; ask the user how to proceed or try a different approach."
+                    )
+                    var deniedMsg = ChatMessage(role: .assistant, content: "**\(tc.name)** → denied by user")
+                    deniedMsg.isAgentSummary = true
+                    appState.appendMessage(to: sessionId, message: deniedMsg)
+                    var toolMsg = ChatMessage(role: .system, content: denied.output)
+                    toolMsg.toolCallId = denied.id
+                    toolMsg.toolName = denied.name
+                    appState.appendMessage(to: sessionId, message: toolMsg)
+                    continue
+                }
+
                 let result: AgentEngine.ToolResult
                 if mcpManager.owns(toolName: tc.name) {
                     let output = await mcpManager.executeToolCall(

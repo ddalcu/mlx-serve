@@ -1,0 +1,3 @@
+[submodule "lib/ds4"]
+	path = lib/ds4
+	url = https://github.com/antirez/ds4

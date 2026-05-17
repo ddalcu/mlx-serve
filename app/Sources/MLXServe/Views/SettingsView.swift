@@ -23,6 +23,12 @@ struct SettingsView: View {
             ScrollView {
                 VStack(alignment: .leading, spacing: 24) {
                     SettingsSection(
+                        title: "Model Folders",
+                        subtitle: "Always scans ~/.mlx-serve/models and ~/.lmstudio/models. Add one more folder here if your models live elsewhere — no restart needed."
+                    ) {
+                        ModelFoldersSectionContent()
+                    }
+                    SettingsSection(
                         title: "Server",
                         subtitle: "Server-launch flags. Restart the server to apply changes."
                     ) {
@@ -35,11 +41,19 @@ struct SettingsView: View {
                         SpecDecodeSectionContent()
                     }
                     SettingsSection(
+                        title: "Performance",
+                        subtitle: "Continuous batching, KV-cache quantization, and the cross-request prefix cache. Server-launch flags — restart to apply."
+                    ) {
+                        PerformanceSectionContent()
+                    }
+                    SettingsSection(
                         title: "Per-Request Defaults",
                         subtitle: "Apply on the next chat request — no restart needed."
                     ) {
                         RequestDefaultsSectionContent()
                     }
+
+                    ResetDefaultsFooter()
                 }
                 .padding(.horizontal, 24)
                 .padding(.vertical, 20)
@@ -47,6 +61,44 @@ struct SettingsView: View {
             }
         }
         .navigationTitle("Settings")
+    }
+}
+
+// MARK: - Reset to Defaults footer
+
+/// Single button that restores every field on the Settings screen to the
+/// values in `ServerOptions()` (the struct's default initializer). Confirms
+/// before discarding the user's tuning because some fields (drafter path,
+/// custom temperature, etc.) take meaningful effort to set up.
+private struct ResetDefaultsFooter: View {
+    @EnvironmentObject var appState: AppState
+    @State private var showConfirm = false
+
+    var body: some View {
+        HStack {
+            Spacer()
+            Button(role: .destructive) {
+                showConfirm = true
+            } label: {
+                Label("Reset to Defaults", systemImage: "arrow.uturn.backward.circle")
+            }
+            .buttonStyle(.bordered)
+            .controlSize(.small)
+            .help("Restores every Server / Speculative Decoding / Performance / Per-Request field to its built-in default. Server-launch fields still need a restart to take effect.")
+        }
+        .padding(.top, 4)
+        .confirmationDialog(
+            "Reset all settings to defaults?",
+            isPresented: $showConfirm,
+            titleVisibility: .visible
+        ) {
+            Button("Reset", role: .destructive) {
+                appState.serverOptions = ServerOptions()
+            }
+            Button("Cancel", role: .cancel) { }
+        } message: {
+            Text("This restores every field on this screen — server flags, speculative decoding, performance (continuous batching / KV-quant / prefix cache), and per-request defaults — to the values that ship with the app. The change is local; the running server keeps its current flags until you hit Restart Now.")
+        }
     }
 }
 
@@ -184,6 +236,70 @@ fileprivate struct ServerLaunchDirty {
     func dirty<V: Equatable>(_ keyPath: KeyPath<ServerOptions, V>) -> Bool {
         guard let last else { return false }
         return current[keyPath: keyPath] != last[keyPath: keyPath]
+    }
+}
+
+// MARK: - Model folders section
+
+/// One row showing the user-configured extra discovery root. The path is
+/// rendered verbatim (raw, not standardized) so the user sees exactly what
+/// they picked; discovery silently skips it when it doesn't resolve to an
+/// existing directory. Picking a folder triggers an immediate refresh so the
+/// menu-bar picker updates without a server restart.
+private struct ModelFoldersSectionContent: View {
+    @EnvironmentObject var appState: AppState
+    @EnvironmentObject var downloads: DownloadManager
+
+    var body: some View {
+        let pathText: String = {
+            let raw = downloads.customRoot?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+            return raw.isEmpty ? "(none)" : raw
+        }()
+        let hasPath = !(downloads.customRoot?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
+
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(alignment: .firstTextBaseline) {
+                Text("Custom folder")
+                    .font(.body)
+                Spacer(minLength: 12)
+                HStack(spacing: 8) {
+                    Text(pathText)
+                        .font(.caption.monospaced())
+                        .foregroundStyle(hasPath ? .primary : .secondary)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .frame(maxWidth: 220, alignment: .trailing)
+                    Button("Choose…") { choose() }
+                        .buttonStyle(.bordered)
+                    Button("Clear") {
+                        downloads.customRoot = nil
+                        appState.refreshModels()
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(!hasPath)
+                }
+            }
+            Text("Accepts both flat layout (<name>/config.json) and 2-level layout (<author>/<name>/config.json).")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+    }
+
+    private func choose() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Choose"
+        if let existing = downloads.customRoot,
+           !existing.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            panel.directoryURL = URL(fileURLWithPath: (existing as NSString).expandingTildeInPath)
+        }
+        if panel.runModal() == .OK, let url = panel.url {
+            downloads.customRoot = url.path
+            appState.refreshModels()
+        }
     }
 }
 
@@ -408,6 +524,74 @@ private struct SpecDecodeSectionContent: View {
                         .font(.body.monospacedDigit())
                 }
                 .disabled(!pldUsable)
+            }
+        }
+    }
+}
+
+// MARK: - Performance section
+
+private struct PerformanceSectionContent: View {
+    @EnvironmentObject var appState: AppState
+    @EnvironmentObject var server: ServerManager
+
+    private var meta: [String: ServerOptionField] { ServerOptions.serverFlagFields }
+    private var dirty: ServerLaunchDirty {
+        ServerLaunchDirty(current: appState.serverOptions, last: server.lastLaunchedOptions)
+    }
+
+    var body: some View {
+        let opts = $appState.serverOptions
+
+        if let m = meta["maxConcurrent"] {
+            SettingsRow(
+                title: m.title,
+                explainer: m.explainer,
+                isDirty: dirty.dirty(\.maxConcurrent)
+            ) {
+                Stepper(value: opts.maxConcurrent, in: 1...8) {
+                    Text("\(appState.serverOptions.maxConcurrent)")
+                        .font(.body.monospacedDigit())
+                }
+            }
+        }
+        if let m = meta["kvQuant"] {
+            SettingsRow(
+                title: m.title,
+                explainer: m.explainer,
+                isDirty: dirty.dirty(\.kvQuant)
+            ) {
+                Picker("", selection: opts.kvQuant) {
+                    ForEach(ServerOptions.KVQuant.allCases) { q in
+                        Text(q.label).tag(q)
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.menu)
+                .frame(minWidth: 220)
+            }
+        }
+        if let m = meta["prefixCacheEntries"] {
+            SettingsRow(
+                title: m.title,
+                explainer: m.explainer,
+                isDirty: dirty.dirty(\.prefixCacheEntries)
+            ) {
+                Stepper(value: opts.prefixCacheEntries, in: 0...16) {
+                    Text("\(appState.serverOptions.prefixCacheEntries)")
+                        .font(.body.monospacedDigit())
+                }
+            }
+        }
+        if let m = meta["prefixCacheMem"] {
+            SettingsRow(
+                title: m.title,
+                explainer: m.explainer,
+                isDirty: dirty.dirty(\.prefixCacheMem)
+            ) {
+                TextField("", text: opts.prefixCacheMem, prompt: Text("2GB"))
+                    .textFieldStyle(.roundedBorder)
+                    .frame(width: 110)
             }
         }
     }

@@ -70,6 +70,13 @@ class HFSearchService: ObservableObject {
         return .wontFit
     }
 
+    /// True when the host has at least 96 GB of physical RAM — gate for surfacing
+    /// the DeepSeek-V4-Flash ds4 download entry (model card claims 96 GB+ minimum
+    /// for the IQ2XXS checkpoint).
+    static func isSystemRAM96Plus() -> Bool {
+        return ProcessInfo.processInfo.physicalMemory >= (96 * (UInt64(1) << 30))
+    }
+
     private func fetchPage() async {
         isLoading = true
         defer { isLoading = false }
@@ -105,7 +112,12 @@ class HFSearchService: ObservableObject {
                 return
             }
             let decoded = try JSONDecoder().decode([HFModel].self, from: data)
-            fetchedModels.append(contentsOf: decoded)
+            // Filter out MLX-format DeepSeek-V4 checkpoints — the Zig MLX
+            // path rejects them; users should grab the GGUF + ds4 entry from
+            // the built-in catalog instead. Show every other result the API
+            // returns.
+            let filtered = decoded.filter { !$0.id.lowercased().contains("deepseek-v4-flash") }
+            fetchedModels.append(contentsOf: filtered)
             models = sortedModels
             currentSkip += decoded.count
             hasMore = decoded.count >= pageSize

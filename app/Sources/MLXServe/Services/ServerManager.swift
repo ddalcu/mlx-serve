@@ -6,6 +6,10 @@ import Darwin
 class ServerManager: ObservableObject {
     @Published var status: ServerStatus = .stopped
     @Published var modelInfo: ModelInfo?
+    /// Plan 05 Phase G — full registry snapshot, refreshed on the slow-poll
+    /// loop. UI uses this for the "Loaded Models" section and the model
+    /// picker. First entry mirrors `modelInfo` (server sorts default first).
+    @Published var allModels: [ModelInfo] = []
     @Published var memoryInfo: MemoryInfo?
     @Published var port: UInt16 = 11234
     @Published var currentModelPath: String = ""
@@ -59,7 +63,11 @@ class ServerManager: ObservableObject {
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: binaryPath)
         var args = ["--model", resolvedModel]
-        args += options.toCLIArgs()
+        // Plan 05 Phase G — pass the parent directory as --model-dir so the
+        // registry discovers all siblings at startup. Lets the user hot-load
+        // any sibling later via the model picker (when hot-switch is on).
+        let modelDir = (resolvedModel as NSString).deletingLastPathComponent
+        args += options.toCLIArgs(modelDirOverride: modelDir.isEmpty ? nil : modelDir)
         proc.arguments = args
         lastLaunchedOptions = options
 
@@ -256,11 +264,7 @@ class ServerManager: ObservableObject {
     private func transitionToRunning() {
         guard status != .running else { return }
         status = .running
-        Task {
-            if let info = try? await api.fetchModels(port: port) {
-                modelInfo = info
-            }
-        }
+        Task { await self.refreshModels() }
     }
 
     /// Called by TestServer when it detects health is ok but status is still starting
@@ -272,6 +276,26 @@ class ServerManager: ObservableObject {
         if let mem = try? await api.fetchProps(port: port) {
             memoryInfo = mem
         }
+        // Plan 05 Phase G — refresh registry snapshot too. Cheap (a few KB
+        // per call) and keeps the UI's loaded/unloaded badges in sync with
+        // server-side hot-load / eviction events.
+        await refreshModels()
+    }
+
+    private func refreshModels() async {
+        if let all = try? await api.fetchAllModels(port: port) {
+            allModels = all
+            if let first = all.first { modelInfo = first }
+        }
+    }
+
+    /// Plan 05 Phase G — explicit hot-load. Posts /v1/load-model and
+    /// refreshes the model list on success. Throws on 404/500/timeout so
+    /// callers can fall back to a server restart if hot-switch fails.
+    func loadModel(id: String, drafterPath: String? = nil) async throws -> ModelInfo {
+        let info = try await api.loadModel(port: port, id: id, drafterPath: drafterPath)
+        await refreshModels()
+        return info
     }
 
     private func killOrphanedServers(on port: UInt16) {

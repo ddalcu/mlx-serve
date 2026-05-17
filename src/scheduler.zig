@@ -1,0 +1,2472 @@
+//! Plan 01 Phase 2 — continuous-batching scheduler.
+//!
+//! Owns the single inference thread (the only thread that calls into mlx
+//! ops; mlx 0.31.2 made GPU streams thread-local so the model weights are
+//! bound to whichever thread first calls `useCurrentThreadStream` after
+//! load). Connection threads parse HTTP, build prompt token ids, call
+//! `submit()` and then loop on `Slot.waitNext()` to read generated tokens
+//! one at a time. The state machines for tool-call detection, thinking
+//! blocks, SSE streaming, etc. live on the connection thread, unchanged.
+//!
+//! Per-slot state (KVCache, moe_seq_offset, ssm_entries, vision_embeddings)
+//! lives on `Slot` itself; each slot's `ForwardCtx` points at those fields,
+//! and the `Generator` constructed for the slot stores the ctx so
+//! `xfm.forwardWith(&self.ctx, ...)` routes through slot-local state. The
+//! shared Transformer holds the weights only — single-writer-per-tick on
+//! the inference thread guards correctness while many slots can be in
+//! flight at once.
+//!
+//! Decode tick logic (the Phase 3 gate):
+//!   * `active.len == 1` (the common single-stream case) → legacy path:
+//!     `Generator.next` / `nextPld` / `nextDrafter` with the same lazy
+//!     pipeline that today's serial path uses. Bit-identical to pre-Phase-2.
+//!   * `active.len >= 2` → batched: `forwardBatchedDecode` produces N logits
+//!     in one kernel pass, sampled per-slot. PLD / drafter are forced off in
+//!     this path (the speculative paths assume a single in-flight slot's
+//!     KV cache; expensive to interleave).
+//!   * `cancelled` slots are skipped and culled from `decoding`.
+//!
+//! Output channel: each slot owns a bounded ring (`std.ArrayList(u32)` +
+//! cursor + cv) the inference thread pushes into and the connection thread
+//! drains. Generation end is signaled by `state == .finished` (or `.errored`)
+//! plus a cv broadcast.
+
+const std = @import("std");
+const mlx = @import("mlx.zig");
+const transformer_mod = @import("transformer.zig");
+const tokenizer_mod = @import("tokenizer.zig");
+const generate_mod = @import("generate.zig");
+const drafter_mod = @import("drafter.zig");
+const model_mod = @import("model.zig");
+const vision_mod = @import("vision.zig");
+const chat_mod = @import("chat.zig");
+const prefix_cache_mod = @import("prefix_cache.zig");
+const model_registry_mod = @import("model_registry.zig");
+const arch_ds4 = @import("arch/ds4.zig");
+const log = @import("log.zig");
+const io_util = @import("io_util.zig");
+
+const Transformer = transformer_mod.Transformer;
+const KVCache = transformer_mod.KVCache;
+const SSMCacheEntry = transformer_mod.SSMCacheEntry;
+const ForwardCtx = transformer_mod.ForwardCtx;
+const ModelConfig = model_mod.ModelConfig;
+const Tokenizer = tokenizer_mod.Tokenizer;
+const Generator = generate_mod.Generator;
+const SamplingParams = generate_mod.SamplingParams;
+const DrafterModel = drafter_mod.DrafterModel;
+const VisionEncoder = vision_mod.VisionEncoder;
+const Weights = model_mod.Weights;
+const ChatConfig = chat_mod.ChatConfig;
+const ModelRegistry = model_registry_mod.ModelRegistry;
+const LoadedModel = model_registry_mod.LoadedModel;
+
+/// Phase A1: model-load plan executed on the scheduler's inference thread.
+///
+/// mlx 0.31.2 uses thread-local GPU streams: every `mlx_*` op binds to the
+/// stream of the calling thread, and JIT-compiled closures are tied to that
+/// stream too. If main loads the model and the scheduler later calls forward,
+/// mlx aborts with "no Stream(gpu, N) in current thread". Solution: the
+/// scheduler's inference thread does the load itself so the stream is bound
+/// on the right thread from t0.
+///
+/// CPU-only state (parsed config, tokenizer, chat config) is loaded by main
+/// and passed in by reference. The mlx-allocating pieces (weights tensors,
+/// Transformer, vision encoder, drafter, JIT compile, warmup) all run on the
+/// inference thread before `init()` returns.
+pub const LoadParams = struct {
+    /// Registry that owns the entry to populate + provides snapshot/eviction
+    /// bookkeeping. Outlives the scheduler.
+    registry: *ModelRegistry,
+    /// The (pre-registered) LoadedModel stub that will be promoted to
+    /// `.ready` by the inference-thread load. Holds id/path on entry;
+    /// `loadModelOnInferenceThread` installs weights/transformer/vision/
+    /// drafter/tokenizer/chat_config/config into this slot. Lifetime
+    /// matches the registry.
+    entry: *LoadedModel,
+    /// Heap-allocated parsed config. Ownership transfers to `entry` on
+    /// successful load; caller must NOT deinit/free externally after
+    /// `Scheduler.init` returns.
+    config: *ModelConfig,
+    /// Heap-allocated tokenizer. Ownership transfers to `entry`.
+    tok: *Tokenizer,
+    /// Heap-allocated chat config. Ownership transfers to `entry`.
+    chat_config: *ChatConfig,
+    /// Path to the model directory. Borrowed; outlive scheduler.
+    model_dir: []const u8,
+    /// Path to the assistant drafter checkpoint. Empty disables the drafter.
+    /// Borrowed; outlive scheduler.
+    drafter_dir: []const u8 = "",
+    /// Whether to also load vision-tower weights. Combined with
+    /// `config.has_vision` — false here disables vision regardless of config.
+    load_vision: bool = false,
+    /// Eager warmup: fault weight pages + run a tiny forward to JIT-compile
+    /// the decode path on the inference thread. Adds ~600-900 ms at boot but
+    /// keeps the first user request fast.
+    warmup_eager: bool = true,
+    /// Drafter block size (caller computed via `drafter.recommendedBlockSize`).
+    /// Ignored when `drafter_dir` is empty.
+    draft_block_size: u32 = 4,
+    /// Whether the user passed --draft-block-size explicitly (used for
+    /// human-readable startup logging). Ignored when `drafter_dir` is empty.
+    draft_block_size_explicit: bool = false,
+    /// KV-cache storage backend. Defaults to dense bf16; user opts into
+    /// 4/8-bit affine quantization via `--kv-quant {4,8}`. Stored on every
+    /// per-slot KVCache and consulted at every read/write boundary.
+    kv_quant_config: transformer_mod.KVQuantConfig = transformer_mod.KVQuantConfig.dense,
+    /// Per-model hot prefix cache capacity (count). 0 disables.
+    prefix_cache_capacity: u32 = 1,
+    /// Per-model hot prefix cache KV-bytes budget. 0 disables the byte cap.
+    prefix_cache_mem_bytes: u64 = 0,
+    /// When non-empty, the load routes through the embedded ds4 engine
+    /// instead of the MLX safetensors path. `model_dir` is expected to point
+    /// at a `.gguf` file (or a directory containing one); the inference
+    /// thread opens a `Ds4Engine` and installs it on the entry's
+    /// `ds4_engine` field. `config`/`tok`/`chat_config` are stubs (the
+    /// embedded engine owns the real tokenizer + chat template); they're
+    /// still moved onto the entry so server-side reads of `lm.config.?`
+    /// (e.g. `eosTokenSlice`, `getEffectiveContextLength`) keep working.
+    ds4_path: []const u8 = "",
+};
+
+/// Submit-time parameters. `prompt_ids` and `eos_token_ids` are duped into the
+/// slot so callers can free their copies immediately. `vision_embeddings`
+/// ownership transfers into the slot when non-null (the slot will free on
+/// deinit).
+pub const SubmitParams = struct {
+    prompt_ids: []const u32,
+    /// Full original prompt for PLD lookup. When null, defaults to
+    /// `prompt_ids` (PLD's lookup table = full_prompt + generated).
+    full_prompt: ?[]const u32 = null,
+    cached_tokens: u32 = 0,
+    has_tools: bool = false,
+    sampling: SamplingParams,
+    eos_token_ids: []const u32,
+    max_tokens: u32,
+    timeout_ns: u64 = 0,
+    enable_pld: bool = false,
+    enable_drafter: bool = false,
+    drafter: ?*DrafterModel = null,
+    drafter_block_size: u32 = 4,
+    pld_draft_len: u32 = 5,
+    pld_key_len: u32 = 3,
+    /// Phase 2 (Plan ricky): route SDPA through `kv_quant.quantAttention`
+    /// instead of dequant + dense SDPA. No effect when the cache scheme
+    /// isn't `.affine`. Default false → unchanged behavior.
+    kv_attn_fused: bool = false,
+    /// Vision embeddings spliced at image-token positions during prefill.
+    /// Ownership transferred to the slot; freed on slot.deinit.
+    vision_embeddings: ?mlx.mlx_array = null,
+    logprobs_n: u32 = 0,
+    /// Wave 1.A: per-request override of the process-default KV-cache quant
+    /// scheme. When non-null, this slot's KVCache is constructed with this
+    /// config instead of `Scheduler.kv_quant_config`. Lets one server host a
+    /// single model and let clients trade accuracy for context length on a
+    /// per-call basis (`{"kv_quant": "off"|4|8}` body field).
+    kv_quant_config: ?transformer_mod.KVQuantConfig = null,
+    /// Plan 05 Phase D: the target model for this request. The conn thread
+    /// resolves this via `scheduler.ensureLoaded(id)` BEFORE submitting and
+    /// keeps a refcount on it for the slot's lifetime, so the model can't
+    /// be evicted mid-flight. The scheduler routes prefill/decode through
+    /// `slot.model.transformer.?` (and friends) instead of `sch.xfm`, so
+    /// per-tick model switching is just a pointer hop. Required field
+    /// post-Phase-D; tests using the legacy path pass the default model.
+    model: *model_registry_mod.LoadedModel,
+};
+
+pub const SlotState = enum { pending_prefill, decoding, finished, errored };
+
+/// Result of `Slot.waitNext`. Driven by the inference thread; consumed by
+/// the connection thread.
+pub const NextResult = union(enum) {
+    /// Next decoded token id.
+    token: u32,
+    /// Generation completed (EOS, max_tokens, timeout, etc.). `finish_reason`
+    /// is set on the slot at this point.
+    done: void,
+    /// Generation errored. `error_code` is set on the slot; the caller
+    /// should surface it to the client and call `complete(slot)`.
+    err: void,
+};
+
+/// Per-request state. Owned by the Scheduler from `submit` until `complete`.
+pub const Slot = struct {
+    allocator: std.mem.Allocator,
+    /// io reference for Stopwatch / async-eval (captured from Scheduler).
+    io: std.Io,
+
+    /// Plan 05 Phase D: target model for this request. Captured from
+    /// `SubmitParams.model` and borrowed for the slot's lifetime; the conn
+    /// thread holds a refcount (via `scheduler.ensureLoaded`) so the
+    /// pointer stays valid until `complete()`. Prefill/decode route forward
+    /// passes through `model.transformer.?` (and `model.vision_encoder`,
+    /// `model.drafter`, `model.prefix_cache`). Batched decode groups slots
+    /// by this field so kernels never cross model boundaries.
+    model: *model_registry_mod.LoadedModel,
+
+    // ── Per-slot model state. Owned by the slot. ──
+    cache: KVCache,
+    moe_seq_offset: usize,
+    ssm_entries: ?[]SSMCacheEntry,
+    vision_embeddings: ?mlx.mlx_array,
+
+    /// Forward context backed by the fields above. Initialized in `init`
+    /// and aliased by the Generator's own `ctx` field at prefill time.
+    ctx: ForwardCtx,
+
+    /// Generator (constructed on inference thread post-prefill).
+    legacy_gen: ?Generator,
+
+    /// Ds4 session for this slot. Created in `runPrefillDs4` when the slot's
+    /// model is `.ds4_engine`-backed; freed in `Slot.deinit`. Mutually
+    /// exclusive with `legacy_gen` (the MLX `Generator` path).
+    ds4_session: ?*arch_ds4.Ds4Session = null,
+    /// Per-request RNG state for ds4 sampling. ds4's sampler takes the seed
+    /// by pointer so we keep it on the slot.
+    ds4_rng: u64 = 0,
+
+    // ── Submission data. Owned by the slot, freed in deinit. ──
+    prompt_ids: []u32,
+    full_prompt: []u32,
+    sampling: SamplingParams,
+    eos_token_ids: []u32,
+    max_tokens: u32,
+    timeout_ns: u64,
+    has_tools: bool,
+    enable_pld: bool,
+    enable_drafter: bool,
+    drafter: ?*DrafterModel,
+    drafter_block_size: u32,
+    pld_draft_len: u32,
+    pld_key_len: u32,
+    /// Phase 2 (Plan ricky): see SubmitParams.kv_attn_fused.
+    kv_attn_fused: bool,
+    cached_tokens: u32,
+    logprobs_n: u32,
+
+    // ── State + output channel. ──
+    state: SlotState,
+
+    out_mu: std.Io.Mutex,
+    out_cond: std.Io.Condition,
+    out_buf: std.ArrayList(u32),
+    out_idx: usize,
+    finished: bool,
+    error_code: ?[]const u8,
+    finish_reason: []const u8,
+    cancelled: std.atomic.Value(bool),
+
+    // ── Stats (filled by inference thread, safe to read after finish). ──
+    prompt_tokens: u32,
+    completion_tokens: u32,
+    prefill_tps: f64,
+    decode_tps: f64,
+    /// Wall-clock nanoseconds spent in `runPrefill` for this slot. Includes
+    /// hot-prefix-cache lookup/restore and the model forward over the
+    /// uncached tail. Populated by the scheduler main loop.
+    prefill_ns: u64,
+    /// Wall-clock nanoseconds the slot spent in decode ticks. For batched
+    /// decode the full tick wall-clock is added to every participating slot,
+    /// so this matches the per-slot throughput a user actually observes
+    /// (`completion_tokens / decode_ns`).
+    decode_ns: u64,
+    /// Actual generated ids (from legacy_gen.generated_ids). Shallow copy at
+    /// completion so the connection thread can read them without locking.
+    generated_ids: ?[]u32,
+    /// pad-only flag: set by inference thread when the entire generation was
+    /// token id 0. Server-level cache invalidation reads this after complete.
+    was_pad_only: bool,
+    /// Phase A5: per-token logprobs accumulated by the inference thread when
+    /// `logprobs_n > 0`. The conn thread takes ownership via
+    /// `nonStreamingViaScheduler` (or equivalent) at completion; if the
+    /// caller doesn't consume, `Slot.deinit` frees the contents.
+    logprobs_buf: std.ArrayList(generate_mod.LogprobResult),
+
+    /// Initialize but do NOT take ownership of caches — those are allocated
+    /// inside `init` from the slot's allocator.
+    fn init(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        config: *const ModelConfig,
+        params: SubmitParams,
+        kv_quant_config: transformer_mod.KVQuantConfig,
+    ) !*Slot {
+        const slot = try allocator.create(Slot);
+        errdefer allocator.destroy(slot);
+
+        // ds4-backed model: skip all MLX per-slot allocations — the ds4
+        // engine owns its own KV cache, vision is not supported, and the
+        // forward path bypasses `ForwardCtx`. Build sentinel-empty fields so
+        // `Slot.deinit` is well-defined on both paths.
+        const is_ds4 = params.model.ds4_engine != null;
+
+        // Per-slot KVCache, honoring the process-level kv-quant setting.
+        // TurboQuant schemes need `head_dim` at construction time for the
+        // per-layer rotation matrices; other schemes ignore it. For ds4
+        // slots the engine owns its own cache — we initialize a zero-layer
+        // shell so `Slot.deinit` is symmetric with the MLX path.
+        const slot_kv_layers: u32 = if (is_ds4) 0 else config.num_hidden_layers;
+        var cache = try KVCache.initWithConfigAndHeadDim(allocator, slot_kv_layers, kv_quant_config, config.head_dim);
+        errdefer cache.deinit();
+
+        // Per-slot SSM cache. Mirror the same predicate `Transformer.init`
+        // uses to allocate `xfm.ssm_entries` (transformer.zig: `has_hybrid_layers`
+        // OR `isMoe() || full_attention_interval > 0`). Without this branch the
+        // slot's `ctx.ssm_entries` is null and `forwardMoeWith`'s
+        // linear-attention layers crash on `ctx.ssm_entries.?` for Qwen 3.5/3.6
+        // MoE (which carries GatedDeltaNet inside its MoE structure but does
+        // NOT set `has_hybrid_layers`).
+        var ssm_entries: ?[]SSMCacheEntry = null;
+        if (!is_ds4 and (config.has_hybrid_layers or config.isMoe() or config.full_attention_interval > 0)) {
+            const entries = try allocator.alloc(SSMCacheEntry, config.num_hidden_layers);
+            for (entries) |*e| {
+                e.* = .{
+                    .conv_state = mlx.mlx_array_new(),
+                    .ssm_state = mlx.mlx_array_new(),
+                    .initialized = false,
+                };
+            }
+            ssm_entries = entries;
+        }
+        errdefer if (ssm_entries) |entries| {
+            for (entries) |*e| {
+                _ = mlx.mlx_array_free(e.conv_state);
+                _ = mlx.mlx_array_free(e.ssm_state);
+            }
+            allocator.free(entries);
+        };
+
+        // Dup owned slices.
+        const prompt_owned = try allocator.dupe(u32, params.prompt_ids);
+        errdefer allocator.free(prompt_owned);
+        const full_prompt_src = params.full_prompt orelse params.prompt_ids;
+        const full_prompt_owned = try allocator.dupe(u32, full_prompt_src);
+        errdefer allocator.free(full_prompt_owned);
+        const eos_owned = try allocator.dupe(u32, params.eos_token_ids);
+        errdefer allocator.free(eos_owned);
+
+        slot.* = .{
+            .allocator = allocator,
+            .io = io,
+            .model = params.model,
+            .cache = cache,
+            .moe_seq_offset = 0,
+            .ssm_entries = ssm_entries,
+            .vision_embeddings = params.vision_embeddings,
+            .ctx = undefined, // set after slot is in stable storage so pointers are valid
+            .legacy_gen = null,
+            .ds4_session = null,
+            .ds4_rng = @intCast(std.Io.Timestamp.now(io, .real).toMilliseconds()),
+            .prompt_ids = prompt_owned,
+            .full_prompt = full_prompt_owned,
+            .sampling = params.sampling,
+            .eos_token_ids = eos_owned,
+            .max_tokens = params.max_tokens,
+            .timeout_ns = params.timeout_ns,
+            .has_tools = params.has_tools,
+            .enable_pld = params.enable_pld,
+            .enable_drafter = params.enable_drafter,
+            .drafter = params.drafter,
+            .drafter_block_size = params.drafter_block_size,
+            .pld_draft_len = params.pld_draft_len,
+            .pld_key_len = params.pld_key_len,
+            .kv_attn_fused = params.kv_attn_fused,
+            .cached_tokens = params.cached_tokens,
+            .logprobs_n = params.logprobs_n,
+            .state = .pending_prefill,
+            .out_mu = .init,
+            .out_cond = .init,
+            .out_buf = std.ArrayList(u32).empty,
+            .out_idx = 0,
+            .finished = false,
+            .error_code = null,
+            .finish_reason = "length",
+            .cancelled = std.atomic.Value(bool).init(false),
+            .prompt_tokens = 0,
+            .completion_tokens = 0,
+            .prefill_tps = 0.0,
+            .decode_tps = 0.0,
+            .prefill_ns = 0,
+            .decode_ns = 0,
+            .generated_ids = null,
+            .was_pad_only = true,
+            .logprobs_buf = .empty,
+        };
+
+        // ForwardCtx points at fields owned by `slot` — must outlive the
+        // Generator. The slot is heap-allocated so addresses are stable
+        // until `complete` frees it.
+        slot.ctx = .{
+            .cache = &slot.cache,
+            .moe_seq_offset = &slot.moe_seq_offset,
+            .ssm_entries = slot.ssm_entries,
+            .vision_embeddings = slot.vision_embeddings,
+            .capture_hidden = null,
+            .kv_attn_fused = params.kv_attn_fused,
+        };
+
+        return slot;
+    }
+
+    /// Free everything the slot owns. Only safe to call when no thread can
+    /// observe the slot anymore (i.e. after the inference thread has
+    /// finished/errored it AND the connection thread has consumed the final
+    /// `done`/`err` from `waitNext`).
+    pub fn deinit(self: *Slot) void {
+        if (self.ds4_session) |session| {
+            session.free();
+            self.ds4_session = null;
+        }
+        if (self.legacy_gen) |*gen| {
+            gen.deinit(self.allocator);
+        }
+        self.cache.deinit();
+        if (self.ssm_entries) |entries| {
+            for (entries) |*e| {
+                _ = mlx.mlx_array_free(e.conv_state);
+                _ = mlx.mlx_array_free(e.ssm_state);
+            }
+            self.allocator.free(entries);
+        }
+        if (self.vision_embeddings) |ve| _ = mlx.mlx_array_free(ve);
+        self.allocator.free(self.prompt_ids);
+        self.allocator.free(self.full_prompt);
+        self.allocator.free(self.eos_token_ids);
+        if (self.error_code) |code| self.allocator.free(code);
+        if (self.generated_ids) |g| self.allocator.free(g);
+        // Free any logprobs the conn thread didn't claim. After
+        // `nonStreamingViaScheduler` calls `toOwnedSlice`, items.len becomes
+        // 0 so this is a no-op on the success path.
+        for (self.logprobs_buf.items) |*lp| self.allocator.free(lp.top_logprobs);
+        self.logprobs_buf.deinit(self.allocator);
+        self.out_buf.deinit(self.allocator);
+        self.allocator.destroy(self);
+    }
+
+    /// Inference thread: enqueue a generated token for the consumer.
+    fn pushToken(self: *Slot, t: u32) void {
+        self.out_mu.lockUncancelable(self.io);
+        defer self.out_mu.unlock(self.io);
+        self.out_buf.append(self.allocator, t) catch |err| {
+            // Allocation failure: degrade to error.
+            self.error_code = self.allocator.dupe(u8, @errorName(err)) catch null;
+            self.state = .errored;
+        };
+        self.out_cond.broadcast(self.io);
+    }
+
+    /// Inference thread: signal normal completion. Safe to call multiple
+    /// times (idempotent on `finished`).
+    fn markFinished(self: *Slot, reason: []const u8) void {
+        self.out_mu.lockUncancelable(self.io);
+        defer self.out_mu.unlock(self.io);
+        if (self.finished) return;
+        self.finished = true;
+        self.state = .finished;
+        self.finish_reason = reason;
+        self.out_cond.broadcast(self.io);
+    }
+
+    /// Inference thread: signal error. `name` is borrowed; we dupe so the
+    /// connection thread can read it after the inference loop drops the slot.
+    fn markError(self: *Slot, name: []const u8) void {
+        self.out_mu.lockUncancelable(self.io);
+        defer self.out_mu.unlock(self.io);
+        if (self.error_code != null or self.finished) return;
+        self.error_code = self.allocator.dupe(u8, name) catch null;
+        self.state = .errored;
+        self.out_cond.broadcast(self.io);
+    }
+
+    /// Connection thread: block until the next token, completion, or error.
+    /// Returns `.token` for each generated id, then exactly one terminator
+    /// (`.done` or `.err`).
+    pub fn waitNext(self: *Slot) NextResult {
+        self.out_mu.lockUncancelable(self.io);
+        defer self.out_mu.unlock(self.io);
+        while (true) {
+            if (self.out_idx < self.out_buf.items.len) {
+                const t = self.out_buf.items[self.out_idx];
+                self.out_idx += 1;
+                return .{ .token = t };
+            }
+            if (self.error_code != null) return .{ .err = {} };
+            if (self.finished) return .{ .done = {} };
+            self.out_cond.waitUncancelable(self.io, &self.out_mu);
+        }
+    }
+
+    /// Connection thread: signal cancellation. The inference thread will
+    /// drop this slot at the next tick boundary.
+    pub fn cancel(self: *Slot) void {
+        self.cancelled.store(true, .release);
+        self.out_mu.lockUncancelable(self.io);
+        defer self.out_mu.unlock(self.io);
+        self.out_cond.broadcast(self.io);
+    }
+};
+
+/// Phase A4: pixel data for a single image, decoded by the connection
+/// thread (CPU only — stb_image / libwebp). The inference thread wraps this
+/// in an `mlx_array` via `mlx_array_new_data` and runs the vision encoder.
+pub const VisionImagePixels = struct {
+    /// Raw bytes holding float32 CHW pixel data — exactly what the existing
+    /// `chat_mod.ImageData.pixels` carries (3 × H × W × sizeof(f32)). Borrowed;
+    /// must outlive the encodeVision call (which blocks until completion).
+    pixels: []const u8,
+    width: u32,
+    height: u32,
+};
+
+/// Phase A4: vision-encode work item. Conn thread fills `images` (raw pixel
+/// data, CPU-only) and calls `Scheduler.encodeVision`, which posts the
+/// request and blocks until the inference thread fills `result` and signals
+/// `done`. Ownership of `result` transfers to the caller on success — pass
+/// to `scheduler.submit(.{ .vision_embeddings = arr, ... })` and the slot's
+/// `deinit` will free it.
+pub const VisionEncodeRequest = struct {
+    /// Plan 05 Phase D: target model whose `vision_encoder` services this
+    /// request. The conn thread holds a refcount (via `ensureLoaded`) for
+    /// the duration of the call.
+    model: *model_registry_mod.LoadedModel,
+    /// Per-image float32 CHW pixel buffers. Borrowed; must outlive the call.
+    images: []const VisionImagePixels,
+    /// Output: encoded embedding tensor on success. Ownership transfers to
+    /// the caller.
+    result: ?mlx.mlx_array = null,
+    /// Output: error name on failure. Owned by `allocator`; caller frees.
+    error_name: ?[]const u8 = null,
+    /// Done flag (under done_mu). Caller's wait-loop drains the cond when
+    /// this flips true.
+    done: bool = false,
+    allocator: std.mem.Allocator,
+    done_mu: std.Io.Mutex = .init,
+    done_cond: std.Io.Condition = .init,
+};
+
+/// Phase: embedding work item for encoder-only models. Conn thread fills
+/// `token_ids` and calls `Scheduler.computeEmbedding`; the inference thread
+/// services the request via `generate.computeEmbedding(xfm, ...)` and writes
+/// the float vector into `result` (caller frees). Mirrors the
+/// VisionEncodeRequest pattern.
+pub const EmbedRequest = struct {
+    /// Plan 05 Phase D: target model whose `transformer` services this
+    /// request. The conn thread holds a refcount for the duration.
+    model: *model_registry_mod.LoadedModel,
+    /// Tokenized input. Borrowed; must outlive the call.
+    token_ids: []const u32,
+    /// Output: pooled L2-normalized embedding on success. Owned by
+    /// `allocator`; caller frees.
+    result: ?[]f32 = null,
+    /// Output: error name on failure. Owned by `allocator`; caller frees.
+    error_name: ?[]const u8 = null,
+    done: bool = false,
+    allocator: std.mem.Allocator,
+    done_mu: std.Io.Mutex = .init,
+    done_cond: std.Io.Condition = .init,
+};
+
+/// Plan 05 Phase D: cold-load work item. Posted by `Scheduler.ensureLoaded`
+/// when a request targets an `.unloaded` (or freshly-evicted) entry; the
+/// inference thread drains the queue between ticks. The conn thread parses
+/// `config.json` / tokenizer / chat_config on its own thread (CPU only,
+/// no mlx ops) and hands the pre-parsed CPU state to the inference thread,
+/// which does the mlx-allocating work (weights + Transformer + vision +
+/// drafter + JIT + warmup) and installs everything on `entry`.
+///
+/// Eviction: when set, `evict_entry` is unloaded on the inference thread
+/// BEFORE the new load starts. The conn thread has already marked the
+/// victim `.evicting` and waited for refcount == 0, so freeing GPU memory
+/// is safe.
+pub const LoadRequest = struct {
+    /// Target entry to populate. Already transitioned to `.loading` by
+    /// the conn thread before posting; the inference thread completes the
+    /// load and calls `registry.markReadyLocked(entry, bytes)` or
+    /// `markErrorLocked` on failure.
+    entry: *LoadedModel,
+    /// Pre-parsed CPU state. Ownership transfers to `entry` on success;
+    /// on failure the conn thread takes them back via the `done` cond-var
+    /// and frees them.
+    config: *ModelConfig,
+    tok: *Tokenizer,
+    chat_config: *ChatConfig,
+
+    /// Borrowed paths. Conn thread keeps the buffers alive until `done`.
+    model_dir: []const u8,
+    drafter_dir: []const u8 = "",
+
+    load_vision: bool = false,
+    warmup_eager: bool = true,
+    draft_block_size: u32 = 4,
+    draft_block_size_explicit: bool = false,
+    kv_quant_config: transformer_mod.KVQuantConfig = transformer_mod.KVQuantConfig.dense,
+    prefix_cache_capacity: u32 = 1,
+    prefix_cache_mem_bytes: u64 = 0,
+
+    /// Optional victim to evict before the load. Already marked `.evicting`
+    /// with refcount == 0 by the conn thread under registry.mutex. The
+    /// inference thread calls `entry.unloadResident()` to free GPU memory
+    /// AND drops the resident-bytes accounting via `registry.accountEvictedLocked`,
+    /// then `registry.finalizeEvictionLocked`.
+    evict_entry: ?*LoadedModel = null,
+    /// Bytes accounted to the victim before eviction (so the inference
+    /// thread can subtract from `current_resident_bytes`).
+    evict_bytes: u64 = 0,
+
+    /// Output: error name on failure (owned by `allocator`; conn thread
+    /// frees). Null on success.
+    error_name: ?[]const u8 = null,
+
+    /// Conn-thread synchronization. Inference thread broadcasts when done.
+    done: bool = false,
+    allocator: std.mem.Allocator,
+    done_mu: std.Io.Mutex = .init,
+    done_cond: std.Io.Condition = .init,
+
+    /// Mirror `LoadParams.ds4_path`. The cold-load path (Phase D's
+    /// `ensureLoaded`) doesn't yet support ds4-on-demand loading; ds4 only
+    /// lands via the startup `LoadParams`, so this stays empty on the cold
+    /// path for now.
+    ds4_path: []const u8 = "",
+};
+
+/// Continuous-batching scheduler. One per server. Owns the inference
+/// thread, the queue of in-flight slots, AND (post-A1) the loaded model
+/// state — Transformer + weights + vision encoder + drafter all live here,
+/// allocated on the inference thread so mlx's thread-local GPU stream is
+/// bound on the right thread from the start.
+pub const Scheduler = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+
+    // ── Plan 05 — multi-model state. Source of truth for model fields is
+    //    `current_model` (a borrowed *LoadedModel owned by the registry).
+    //    The fields below (`xfm`, `weights`, …) are *borrowed views* into
+    //    `current_model` set at load time so existing scheduler-internal
+    //    code can keep reading them as fields. Phase D will refresh these
+    //    views on every model swap inside `pickNextTickWork`.
+    registry: *ModelRegistry,
+    current_model: ?*LoadedModel,
+
+    // ── Borrowed views (non-owning). Cleared on shutdown via
+    //    `clearCurrentModelViews`. Null only before load completes or after
+    //    an eviction in Phase D.
+    xfm: ?*Transformer,
+    weights: ?*Weights,
+    vision_encoder: ?*VisionEncoder,
+    drafter: ?*DrafterModel,
+    drafter_block_size: u32,
+    kv_quant_config: transformer_mod.KVQuantConfig,
+
+    // ── Borrowed refs (CPU-only state owned by the LoadedModel). ──
+    config: *const ModelConfig,
+    tok: *const Tokenizer,
+    chat_config: *const ChatConfig,
+    drafter_path: []const u8,
+
+    /// Phase A6 → Plan 05: per-model hot prefix cache. Pre-Plan-05 this was
+    /// a server-owned global; Plan 05 moves it onto `LoadedModel` so each
+    /// model gets isolation by construction. Borrowed view here is the
+    /// current model's cache (or null when the cache isn't applicable for
+    /// the model, e.g. hybrid SSM archs).
+    hot_prefix_cache: ?*prefix_cache_mod.HotPrefixCache,
+
+    max_concurrent: u32,
+    /// Phase A7 test hook: when true, `runDecodeTick` forces the batched
+    /// kernel even at `active.len == 1`. Set via the `MLX_SERVE_FORCE_BATCHED`
+    /// environment variable (`=1` to enable). Test-only — production uses
+    /// the auto-gate that drops to `runSingleDecodeTick` for single-slot
+    /// requests because that path is bit-identical to legacy and supports
+    /// speculative decoding (which the batched kernel doesn't).
+    force_batched: bool,
+
+    queue_mu: std.Io.Mutex,
+    queue_cond: std.Io.Condition,
+    pending: std.ArrayList(*Slot),
+    decoding: std.ArrayList(*Slot),
+    /// Phase A4: pending vision-encode requests. The inference thread drains
+    /// these in the gap before/after each prefill+decode tick. Posting
+    /// broadcasts on `queue_cond` to wake an idle inference thread.
+    vision_queue: std.ArrayList(*VisionEncodeRequest),
+    /// Pending embedding requests (encoder-only models). Same shape as
+    /// vision_queue; serviced inline between decode ticks.
+    embed_queue: std.ArrayList(*EmbedRequest),
+    /// Phase D: pending cold-load requests. Conn threads post here via
+    /// `scheduler.ensureLoaded`; the inference thread drains between ticks
+    /// (load runs after cleanup + vision/embed, before prefill). Multiple
+    /// concurrent requesters for the same id share one load via the
+    /// `.loading` state on the entry — `ensureLoaded` only posts when it
+    /// successfully flips the entry from `.unloaded` → `.loading`.
+    load_queue: std.ArrayList(*LoadRequest),
+    /// Slots awaiting cleanup. The conn thread queues a slot here in
+    /// `complete()` instead of calling `slot.deinit()` directly — `deinit`
+    /// frees mlx_arrays via refcount-decrement, and the underlying GPU
+    /// memory release races against the inference thread's stream. The
+    /// inference thread drains this queue between ticks where it owns the
+    /// stream binding, so all mlx ops stay on one thread.
+    cleanup_queue: std.ArrayList(*Slot),
+    /// Counts `pending.len + decoding.len` for back-pressure.
+    in_flight: u32,
+    /// Capacity for back-pressure. `submit` waits when in_flight >= cap.
+    /// `cap = max_concurrent + queue_depth`. queue_depth = 32 hardcoded
+    /// (matches the legacy `max_queue_size`).
+    queue_cap: u32,
+    submit_cond: std.Io.Condition,
+
+    inference_thread: ?std.Thread,
+    shutdown: std.atomic.Value(bool),
+    started: std.atomic.Value(bool),
+    started_mu: std.Io.Mutex,
+    started_cond: std.Io.Condition,
+
+    /// Set true by the inference thread if model load fails. Read by `init`
+    /// after `started` is signaled to decide whether to surface a load error.
+    load_failed: std.atomic.Value(bool),
+    /// Owned, dupe'd error name (e.g. "MissingVisionWeights"). null on
+    /// success. Freed in `deinit`.
+    load_error_name: ?[]const u8,
+
+    /// Construct a Scheduler whose inference thread loads the model. Returns
+    /// only after load + (optional) warmup completes. On load failure, returns
+    /// `error.LoadFailed`; the inference thread has already cleaned up any
+    /// partially-allocated mlx state by then.
+    pub fn init(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        params: LoadParams,
+        max_concurrent: u32,
+    ) !*Scheduler {
+        const self = try allocator.create(Scheduler);
+        errdefer allocator.destroy(self);
+
+        const cap = if (max_concurrent == 0) 1 else max_concurrent;
+        // Phase A7: force-batched test hook. The byte-equivalence test sets
+        // `MLX_SERVE_FORCE_BATCHED=1` to verify that the batched-kernel
+        // output matches the single-slot path token-for-token at temp=0,
+        // single client. Uses libc getenv to stay allocator-free.
+        const force_batched = blk: {
+            const raw = std.c.getenv("MLX_SERVE_FORCE_BATCHED");
+            if (raw == null) break :blk false;
+            const slice = std.mem.sliceTo(raw.?, 0);
+            break :blk std.mem.eql(u8, slice, "1");
+        };
+        if (force_batched) {
+            log.info("[scheduler] force_batched=on (MLX_SERVE_FORCE_BATCHED=1) — single-slot ticks will route through batched kernel\n", .{});
+        }
+        self.* = .{
+            .allocator = allocator,
+            .io = io,
+            .registry = params.registry,
+            .current_model = null,
+            .xfm = null,
+            .weights = null,
+            .vision_encoder = null,
+            .drafter = null,
+            .drafter_block_size = params.draft_block_size,
+            .kv_quant_config = params.kv_quant_config,
+            // Initial borrowed-view refs point at the (heap-allocated) CPU
+            // state carried on LoadParams; once the inference thread
+            // installs them on `entry`, the views still resolve to the
+            // same addresses (we store pointers, so the moves are no-ops).
+            .config = params.config,
+            .tok = params.tok,
+            .chat_config = params.chat_config,
+            .drafter_path = params.drafter_dir,
+            .hot_prefix_cache = null,
+            .max_concurrent = cap,
+            .force_batched = force_batched,
+            .queue_mu = .init,
+            .queue_cond = .init,
+            .pending = std.ArrayList(*Slot).empty,
+            .decoding = std.ArrayList(*Slot).empty,
+            .vision_queue = std.ArrayList(*VisionEncodeRequest).empty,
+            .embed_queue = std.ArrayList(*EmbedRequest).empty,
+            .load_queue = std.ArrayList(*LoadRequest).empty,
+            .cleanup_queue = std.ArrayList(*Slot).empty,
+            .in_flight = 0,
+            .queue_cap = cap + 32,
+            .submit_cond = .init,
+            .inference_thread = null,
+            .shutdown = std.atomic.Value(bool).init(false),
+            .started = std.atomic.Value(bool).init(false),
+            .started_mu = .init,
+            .started_cond = .init,
+            .load_failed = std.atomic.Value(bool).init(false),
+            .load_error_name = null,
+        };
+
+        const ctx = ThreadCtx{ .scheduler = self, .params = params };
+        self.inference_thread = try std.Thread.spawn(.{}, inferenceLoop, .{ctx});
+
+        // Wait until inference thread has loaded the model and (optionally)
+        // warmed up. submit() relies on xfm/weights being live.
+        self.started_mu.lockUncancelable(io);
+        defer self.started_mu.unlock(io);
+        while (!self.started.load(.acquire)) {
+            self.started_cond.waitUncancelable(io, &self.started_mu);
+        }
+
+        if (self.load_failed.load(.acquire)) {
+            // Inference thread already exited cleanly. Join + free + bubble up.
+            if (self.inference_thread) |t| t.join();
+            self.inference_thread = null;
+            const name = self.load_error_name orelse "unknown";
+            log.err("[scheduler] model load failed: {s}\n", .{name});
+            return error.LoadFailed;
+        }
+
+        return self;
+    }
+
+    pub fn deinit(self: *Scheduler) void {
+        self.shutdown.store(true, .release);
+        // Wake inference thread if it's waiting on queue_cond.
+        self.queue_mu.lockUncancelable(self.io);
+        self.queue_cond.broadcast(self.io);
+        self.submit_cond.broadcast(self.io);
+        self.queue_mu.unlock(self.io);
+
+        if (self.inference_thread) |t| t.join();
+
+        // Drain any leftover slots — should be empty if all conn threads
+        // called `complete` properly, but defensive. Inference thread has
+        // already exited by now (joined above), so freeing here is safe.
+        for (self.pending.items) |slot| slot.deinit();
+        self.pending.deinit(self.allocator);
+        for (self.decoding.items) |slot| slot.deinit();
+        self.decoding.deinit(self.allocator);
+        for (self.cleanup_queue.items) |slot| slot.deinit();
+        self.cleanup_queue.deinit(self.allocator);
+        // Vision/embed queues should be empty (encodeVision/computeEmbedding
+        // block until done) but guard against shutdown-mid-encode by signaling
+        // done with an error.
+        for (self.vision_queue.items) |req| {
+            req.done_mu.lockUncancelable(self.io);
+            req.error_name = self.allocator.dupe(u8, "Shutdown") catch null;
+            req.done = true;
+            req.done_cond.broadcast(self.io);
+            req.done_mu.unlock(self.io);
+        }
+        self.vision_queue.deinit(self.allocator);
+        for (self.embed_queue.items) |req| {
+            req.done_mu.lockUncancelable(self.io);
+            req.error_name = self.allocator.dupe(u8, "Shutdown") catch null;
+            req.done = true;
+            req.done_cond.broadcast(self.io);
+            req.done_mu.unlock(self.io);
+        }
+        self.embed_queue.deinit(self.allocator);
+        // Phase D: signal any pending cold-load requesters that the
+        // server is shutting down. They roll back their entry state and
+        // free pre-loaded CPU resources.
+        for (self.load_queue.items) |req| {
+            req.done_mu.lockUncancelable(self.io);
+            req.error_name = self.allocator.dupe(u8, "Shutdown") catch null;
+            req.done = true;
+            req.done_cond.broadcast(self.io);
+            req.done_mu.unlock(self.io);
+        }
+        self.load_queue.deinit(self.allocator);
+
+        // Plan 05: mlx-allocating state lives on the `LoadedModel` owned by
+        // the registry. We can't free the entries here (registry teardown
+        // happens later, after serve() returns), but we DO need to release
+        // their mlx pieces while we still have a thread bound to the mlx
+        // GPU stream — that's actually the calling thread, since the
+        // existing pattern frees mlx_array refcount-zeros from
+        // `Scheduler.deinit` directly. Walk EVERY .ready entry in the
+        // registry (multi-model: more than just `current_model`).
+        {
+            self.registry.mutex.lockUncancelable(self.io);
+            defer self.registry.mutex.unlock(self.io);
+            var it = self.registry.entries.valueIterator();
+            while (it.next()) |entry_ptr| {
+                const entry = entry_ptr.*;
+                if (entry.state == .ready or entry.state == .evicting) {
+                    entry.unloadResident();
+                }
+            }
+        }
+        self.current_model = null;
+        // Clear the borrowed views so post-shutdown reads (defensive) see
+        // null rather than dangling pointers.
+        self.xfm = null;
+        self.weights = null;
+        self.vision_encoder = null;
+        self.drafter = null;
+        self.hot_prefix_cache = null;
+        if (self.load_error_name) |n| self.allocator.free(n);
+
+        self.allocator.destroy(self);
+    }
+
+    /// Submit a new request. Builds a Slot, queues it, returns the handle.
+    /// Blocks if the queue is full (i.e. `in_flight >= queue_cap`). When
+    /// the scheduler is shutting down this returns `error.Shutdown`.
+    pub fn submit(self: *Scheduler, params: SubmitParams) !*Slot {
+        // Construct the slot up front so we don't hold the queue mutex
+        // through any allocation. Per-request `kv_quant_config` override (Wave
+        // 1.A) wins over the process-level default carried on the scheduler.
+        const eff_kv_quant = params.kv_quant_config orelse self.kv_quant_config;
+        // Phase D fix: use the slot's target-model config (not the
+        // scheduler's startup-model config) so per-slot state allocation
+        // (KVCache shape, SSM entries) matches the model that will
+        // actually run the request. Critical when two models with
+        // different architectures (e.g. pure-attention + hybrid SSM)
+        // share one scheduler.
+        const slot_config: *const ModelConfig = params.model.config orelse return error.ModelNotReady;
+        const slot = try Slot.init(self.allocator, self.io, slot_config, params, eff_kv_quant);
+        errdefer slot.deinit();
+
+        self.queue_mu.lockUncancelable(self.io);
+        defer self.queue_mu.unlock(self.io);
+
+        while (self.in_flight >= self.queue_cap and !self.shutdown.load(.acquire)) {
+            self.submit_cond.waitUncancelable(self.io, &self.queue_mu);
+        }
+        if (self.shutdown.load(.acquire)) return error.Shutdown;
+
+        try self.pending.append(self.allocator, slot);
+        self.in_flight += 1;
+        self.queue_cond.broadcast(self.io);
+        return slot;
+    }
+
+    /// Hand the slot off to the inference thread for cleanup, and notify any
+    /// submitter waiting for queue space. Must be called once per slot
+    /// returned by `submit`. Safe whether or not the slot finished normally.
+    ///
+    /// Why not free here: `slot.deinit()` walks the per-slot KVCache and
+    /// calls `mlx_array_free` on each entry. Refcount-shared GPU memory
+    /// release queues work against the array's owning stream, which is the
+    /// inference thread's. Freeing from a conn thread without that stream
+    /// binding crashes mlx 0.31.2 ("no Stream(gpu, N) in current thread").
+    /// So we remove the slot from any active list (so the inference thread
+    /// stops touching it) and queue it for cleanup on the inference thread.
+    pub fn complete(self: *Scheduler, slot: *Slot) void {
+        // Mark cancelled so any in-flight tick filters this slot out of its
+        // active list before we remove it from `decoding`. Idempotent.
+        slot.cancelled.store(true, .release);
+
+        self.queue_mu.lockUncancelable(self.io);
+
+        // Remove from pending (rare — only if conn thread cancels before
+        // prefill) and from decoding (the common case). After this, only the
+        // cleanup queue references the slot, so the next inference-thread
+        // cleanup drain can safely deinit it.
+        var i: usize = 0;
+        while (i < self.pending.items.len) : (i += 1) {
+            if (self.pending.items[i] == slot) {
+                _ = self.pending.orderedRemove(i);
+                break;
+            }
+        }
+        i = 0;
+        while (i < self.decoding.items.len) : (i += 1) {
+            if (self.decoding.items[i] == slot) {
+                _ = self.decoding.orderedRemove(i);
+                break;
+            }
+        }
+
+        self.cleanup_queue.append(self.allocator, slot) catch {
+            // OOM on the cleanup list — fall back to inline deinit. This
+            // races on mlx but is strictly better than the leak; the slot
+            // is no longer referenced from pending/decoding above.
+            self.queue_mu.unlock(self.io);
+            slot.deinit();
+            self.queue_mu.lockUncancelable(self.io);
+        };
+        if (self.in_flight > 0) self.in_flight -= 1;
+        self.queue_cond.broadcast(self.io); // wake inference thread to drain
+        self.submit_cond.broadcast(self.io); // wake any blocked submitter
+        self.queue_mu.unlock(self.io);
+    }
+
+    /// Plan 05 Phase D: resolve `id_or_empty` ("" / "mlx-serve" → default)
+    /// to a refcounted, ready `*LoadedModel`. Cold-loads on demand: if the
+    /// entry is `.unloaded`, parses CPU state, picks an LRU victim if
+    /// over caps, and posts a `LoadRequest` to the inference thread,
+    /// blocking until the load completes.
+    ///
+    /// Caller MUST call `release(lm)` once done.
+    ///
+    /// Errors:
+    ///   error.UnknownModelId    — id isn't in the registry.
+    ///   error.NoDefaultModel    — id empty AND no default set.
+    ///   error.NotEnoughMemory   — would exceed caps and no LRU victim.
+    ///   error.LoadFailed        — inference thread reported a load failure.
+    ///   error.Shutdown          — scheduler is shutting down.
+    pub fn ensureLoaded(self: *Scheduler, id_or_empty: []const u8) !*LoadedModel {
+        // Fast path: ready entries. registry.ensureLoaded handles waiting
+        // out .loading / .evicting transitions by other callers.
+        const fast_result = self.registry.ensureLoaded(id_or_empty);
+        if (fast_result) |lm| return lm else |err| switch (err) {
+            error.NotLoaded => {}, // fall through to slow path
+            else => return err,
+        }
+
+        // Slow path: cold load. Resolve the entry. Re-acquire mutex and
+        // re-check state — between the fast-path call and now another
+        // caller could have completed the load.
+        const entry = try self.registry.resolveEntry(id_or_empty);
+
+        // CPU-only pre-load: parse config / load tokenizer / load chat
+        // config. Cheap (~tens of ms); kept outside the mutex so other
+        // requests on other models stay unblocked. On failure, mark the
+        // entry `.error_state` so /v1/models surfaces the failure (and
+        // future ensureLoaded calls fail fast instead of re-tripping the
+        // same parse error). FileNotFound / parse errors land here.
+        const cpu_state = preloadCpuState(self.allocator, self.io, entry.path) catch |err| {
+            self.registry.mutex.lockUncancelable(self.io);
+            self.registry.markErrorLocked(entry, @errorName(err));
+            self.registry.mutex.unlock(self.io);
+            return error.LoadFailed;
+        };
+        // Ownership: on success transfers to the entry inside the
+        // inference thread's `doLoadOnInferenceThread`; on any error from
+        // here on, free them ourselves before returning.
+        var owned = cpu_state;
+        var owned_active: bool = true;
+        defer if (owned_active) freeCpuState(self.allocator, &owned);
+
+        var evict_entry: ?*LoadedModel = null;
+        var evict_bytes: u64 = 0;
+
+        // ── Stage 1 (registry mutex): claim .loading, plan eviction.
+        {
+            self.registry.mutex.lockUncancelable(self.io);
+            errdefer self.registry.mutex.unlock(self.io); // bail on early returns
+
+            // Wait out any concurrent .loading / .evicting state.
+            wait_loop: while (true) {
+                switch (entry.state) {
+                    .ready => {
+                        _ = entry.refcount.fetchAdd(1, .acq_rel);
+                        self.registry.mutex.unlock(self.io);
+                        return entry;
+                    },
+                    .loading, .evicting => {
+                        self.registry.state_cond.waitUncancelable(self.io, &self.registry.mutex);
+                        continue :wait_loop;
+                    },
+                    .error_state => {
+                        self.registry.mutex.unlock(self.io);
+                        return error.LoadFailed;
+                    },
+                    .unloaded => break :wait_loop,
+                }
+            }
+
+            // Claim the slot.
+            std.debug.assert(self.registry.tryBeginLoadLocked(entry));
+
+            // Estimate post-load bytes. We use the same estimator
+            // `doLoadOnInferenceThread` does (entry.bytes_on_disk; else a
+            // layers × hidden fallback). Adds 10% headroom for KV / vision
+            // / drafter overhead — close enough for the eviction gate.
+            const estimated: u64 = blk: {
+                const base: u64 = if (entry.bytes_on_disk) |b|
+                    b
+                else
+                    @as(u64, owned.config.num_hidden_layers) * @as(u64, owned.config.hidden_size) * 4 * 4;
+                break :blk base + base / 10;
+            };
+
+            // Eviction loop: drop LRU victims until under both caps.
+            // Plan 05 limits to ONE victim per load for now (matches the
+            // "block-until-loaded" UX); multi-victim is a future enhancement.
+            const loaded_count = self.registry.countLoadedLocked();
+            const need_count_evict = loaded_count + 1 > self.registry.max_resident_models;
+            const need_mem_evict =
+                self.registry.max_resident_mem > 0 and
+                self.registry.current_resident_bytes + estimated > self.registry.max_resident_mem;
+            if (need_count_evict or need_mem_evict) {
+                evict_entry = self.registry.pickLruEvictable(entry.id);
+                if (evict_entry == null) {
+                    // Roll back .loading and return — caller surfaces 503.
+                    self.registry.markUnloadedLocked(entry);
+                    self.registry.mutex.unlock(self.io);
+                    return error.NotEnoughMemory;
+                }
+                evict_bytes = evict_entry.?.bytes_resident;
+                self.registry.markEvictingLocked(evict_entry.?);
+                self.registry.waitForRefcountZeroLocked(evict_entry.?);
+            }
+            self.registry.mutex.unlock(self.io);
+        }
+
+        // ── Stage 2: build + post LoadRequest, wait for completion.
+        var req = LoadRequest{
+            .entry = entry,
+            .config = owned.config,
+            .tok = owned.tok,
+            .chat_config = owned.chat_config,
+            .model_dir = entry.path,
+            .drafter_dir = "", // Phase E will wire the load-model API to set this.
+            .load_vision = owned.config.has_vision,
+            .warmup_eager = true,
+            .draft_block_size = drafter_mod.DEFAULT_BLOCK_SIZE,
+            .draft_block_size_explicit = false,
+            .kv_quant_config = self.kv_quant_config,
+            .prefix_cache_capacity = 1,
+            .prefix_cache_mem_bytes = 0,
+            .evict_entry = evict_entry,
+            .evict_bytes = evict_bytes,
+            .allocator = self.allocator,
+        };
+
+        {
+            self.queue_mu.lockUncancelable(self.io);
+            defer self.queue_mu.unlock(self.io);
+            if (self.shutdown.load(.acquire)) return error.Shutdown;
+            try self.load_queue.append(self.allocator, &req);
+            self.queue_cond.broadcast(self.io);
+        }
+
+        // Block until the inference thread signals done.
+        req.done_mu.lockUncancelable(self.io);
+        while (!req.done) req.done_cond.waitUncancelable(self.io, &req.done_mu);
+        req.done_mu.unlock(self.io);
+
+        if (req.error_name) |name| {
+            self.allocator.free(name);
+            // On success the inference thread took ownership of cpu_state;
+            // on failure it didn't, so we still hold it.
+            return error.LoadFailed;
+        }
+
+        // Success — inference thread installed cpu_state onto the entry.
+        owned_active = false;
+
+        // Re-acquire under mutex and refcount the ready entry.
+        self.registry.mutex.lockUncancelable(self.io);
+        defer self.registry.mutex.unlock(self.io);
+        if (entry.state != .ready) return error.LoadFailed;
+        _ = entry.refcount.fetchAdd(1, .acq_rel);
+        return entry;
+    }
+
+    /// Release a borrowed pointer obtained from `ensureLoaded`. Forwards
+    /// to the registry so the refcount decrement + LRU clock bump happen
+    /// under registry.mutex.
+    pub fn release(self: *Scheduler, lm: *LoadedModel) void {
+        self.registry.release(lm);
+    }
+
+    /// Synchronously compute an embedding for `req.token_ids` using the
+    /// encoder forward pass on the inference thread. Same lifecycle as
+    /// `encodeVision`: post + block + return result. Caller frees the
+    /// returned `[]f32` (allocated with `req.allocator`).
+    pub fn computeEmbedding(self: *Scheduler, req: *EmbedRequest) ![]f32 {
+        self.queue_mu.lockUncancelable(self.io);
+        self.embed_queue.append(self.allocator, req) catch |err| {
+            self.queue_mu.unlock(self.io);
+            return err;
+        };
+        self.queue_cond.broadcast(self.io);
+        self.queue_mu.unlock(self.io);
+
+        req.done_mu.lockUncancelable(self.io);
+        defer req.done_mu.unlock(self.io);
+        while (!req.done) {
+            req.done_cond.waitUncancelable(self.io, &req.done_mu);
+        }
+        if (req.error_name) |_| return error.EmbedFailed;
+        return req.result orelse error.EmbedFailed;
+    }
+
+    /// Phase A4: synchronously encode one or more images and return the
+    /// embedding tensor. Conn thread fills `req.images` (CHW float32 pixel
+    /// buffers, decoded by stb_image / libwebp on the conn thread); this
+    /// method posts the request to the inference thread, blocks until done,
+    /// and returns the resulting `mlx_array` on success. Ownership of the
+    /// returned array transfers to the caller — typically passed straight
+    /// into `submit(.{ .vision_embeddings = arr, ... })` so the slot owns
+    /// it and frees on `deinit`.
+    ///
+    /// Returns `error.VisionEncodeFailed` if the inference thread fails.
+    /// The request struct must outlive this call, but since the call blocks,
+    /// a stack allocation in the caller works.
+    pub fn encodeVision(self: *Scheduler, req: *VisionEncodeRequest) !mlx.mlx_array {
+        // Post + wake.
+        self.queue_mu.lockUncancelable(self.io);
+        self.vision_queue.append(self.allocator, req) catch |err| {
+            self.queue_mu.unlock(self.io);
+            return err;
+        };
+        self.queue_cond.broadcast(self.io);
+        self.queue_mu.unlock(self.io);
+
+        // Wait for completion.
+        req.done_mu.lockUncancelable(self.io);
+        defer req.done_mu.unlock(self.io);
+        while (!req.done) {
+            req.done_cond.waitUncancelable(self.io, &req.done_mu);
+        }
+        if (req.error_name) |_| return error.VisionEncodeFailed;
+        return req.result orelse error.VisionEncodeFailed;
+    }
+
+    /// Active-tick gate. Decides whether a slot is eligible for the batched
+    /// decode kernel. Hybrid SSM / MoE / encoder / DSV4 models can't ride
+    /// the batched kernel (it doesn't model their state), so any slot
+    /// targeting such a model falls through to the single-slot path. Phase
+    /// D: the gate reads off the slot's own model config — multi-model
+    /// means the scheduler's startup config is no longer authoritative.
+    fn batchable(self: *const Scheduler, slot: *const Slot) bool {
+        _ = self;
+        if (slot.enable_pld or slot.enable_drafter) return false;
+        if (slot.sampling.constraint != null) return false;
+        if (slot.logprobs_n > 0) return false;
+        // ds4-backed slots have no `ForwardCtx` — they always fall through
+        // to the per-slot decode path (which dispatches into the engine).
+        if (slot.model.ds4_engine != null) return false;
+        const cfg = slot.model.config orelse return false;
+        return modelBatchable(cfg);
+    }
+};
+
+/// Pure-config predicate: is this model's architecture compatible with the
+/// batched-decode kernel? Used by `Scheduler.batchable` after slot-level
+/// flags are checked. MoE / hybrid / encoder have shape mismatches with
+/// `forwardBatchedDecode` and fall through to per-slot dispatch.
+pub fn modelBatchable(cfg: *const model_mod.ModelConfig) bool {
+    if (cfg.has_hybrid_layers) return false;
+    if (cfg.full_attention_interval > 0) return false;
+    if (cfg.is_encoder_only) return false;
+    if (cfg.isMoe()) return false;
+    return true;
+}
+
+const ThreadCtx = struct {
+    scheduler: *Scheduler,
+    params: LoadParams,
+};
+
+/// Signal to the parent waiting in `init()` that the inference thread is done
+/// with its load (or has failed). After `started` flips, the parent reads
+/// `load_failed` to decide whether to surface a startup error.
+fn signalStarted(sch: *Scheduler) void {
+    sch.started_mu.lockUncancelable(sch.io);
+    defer sch.started_mu.unlock(sch.io);
+    sch.started.store(true, .release);
+    sch.started_cond.broadcast(sch.io);
+}
+
+/// Set the load_error_name + flip load_failed. Best-effort dupe; on OOM the
+/// parent still sees `load_failed=true` and surfaces "unknown".
+fn recordLoadError(sch: *Scheduler, err_name: []const u8) void {
+    if (sch.load_error_name) |old| sch.allocator.free(old);
+    sch.load_error_name = sch.allocator.dupe(u8, err_name) catch null;
+    sch.load_failed.store(true, .release);
+}
+
+/// Heap-allocate `T`, run `init_fn`, return owning pointer. On `init_fn`
+/// failure, the heap slot is freed before the error propagates so the
+/// scheduler never holds a half-initialized struct.
+fn boxInit(
+    allocator: std.mem.Allocator,
+    comptime T: type,
+    init_fn: anytype,
+    args: anytype,
+) !*T {
+    const ptr = try allocator.create(T);
+    errdefer allocator.destroy(ptr);
+    ptr.* = try @call(.auto, init_fn, args);
+    return ptr;
+}
+
+/// Plan 05 Phase D: pre-loaded CPU state bundle. Built by the conn thread
+/// (CPU only — file I/O + parse, no mlx) ahead of posting a LoadRequest.
+/// Ownership transfers to the entry on successful load; on failure the
+/// conn thread frees via `freeCpuState`.
+const CpuState = struct {
+    config: *ModelConfig,
+    tok: *Tokenizer,
+    chat_config: *ChatConfig,
+};
+
+/// Phase D: parse config.json, tokenizer, and chat config from `model_dir`
+/// into heap pointers ready to hand off to `LoadRequest`. Mirrors the
+/// pre-load that main.zig does for the startup model in serve mode.
+///
+/// Errdefer pattern: for each `try ... else error`, the `deinit` errdefer
+/// is registered AFTER the successful init so a downstream failure doesn't
+/// call deinit on uninitialized memory. ModelConfig has no allocator-owned
+/// fields, so `allocator.destroy` is sufficient there.
+fn preloadCpuState(allocator: std.mem.Allocator, io: std.Io, model_dir: []const u8) !CpuState {
+    const config = try allocator.create(ModelConfig);
+    errdefer allocator.destroy(config);
+    config.* = try model_mod.parseConfig(io, allocator, model_dir);
+
+    const tok = try allocator.create(Tokenizer);
+    errdefer allocator.destroy(tok);
+    tok.* = try tokenizer_mod.loadTokenizer(io, allocator, model_dir);
+    errdefer tok.deinit();
+
+    const cc = try allocator.create(ChatConfig);
+    errdefer allocator.destroy(cc);
+    cc.* = try chat_mod.loadChatConfig(io, allocator, model_dir);
+    errdefer cc.deinit();
+
+    // Same EOS-resolution shenanigans main.zig does — without them the
+    // generated text won't stop on tokenizer-defined EOS strings.
+    if (config.num_eos_tokens == 0) {
+        if (cc.eos_token) |eos_str| {
+            if (tok.special_tokens.get(eos_str)) |eos_id| {
+                config.addEosToken(eos_id);
+            }
+        }
+        if (tok.special_tokens.get("<|endoftext|>")) |eot_id| {
+            if (!config.isEosToken(eot_id)) {
+                config.addEosToken(eot_id);
+            }
+        }
+    }
+    if (tok.special_tokens.get("<pad>")) |pad_id| {
+        if (pad_id > 0 and !config.isEosToken(pad_id)) {
+            config.addEosToken(pad_id);
+        }
+    }
+
+    return .{ .config = config, .tok = tok, .chat_config = cc };
+}
+
+fn freeCpuState(allocator: std.mem.Allocator, s: *CpuState) void {
+    allocator.destroy(s.config);
+    s.tok.deinit();
+    allocator.destroy(s.tok);
+    s.chat_config.deinit();
+    allocator.destroy(s.chat_config);
+}
+
+/// ds4 load on the inference thread. Mirrors the MLX path's "open weights
+/// → install on entry → markReady" shape but works exclusively through the
+/// embedded engine. The stub `config`/`tok`/`chat_config` come in via
+/// `params.config`/`params.tok`/`params.chat_config` (main.zig allocates
+/// them); the entry takes ownership.
+fn doLoadDs4OnInferenceThread(sch: *Scheduler, params: anytype) !void {
+    log.info("[ds4] opening engine: {s}\n", .{params.ds4_path});
+    const engine = try arch_ds4.Ds4Engine.open(sch.allocator, params.ds4_path, .{
+        .backend = .metal,
+        .warm_weights = true,
+    });
+    errdefer engine.close();
+    log.info("[ds4] engine ready (EOS={d}, has_mtp={})\n", .{ engine.eosToken(), engine.hasMtp() });
+
+    // Make sure the stub config knows about the engine's EOS token so the
+    // streaming/non-streaming paths' EOS check fires correctly. addEosToken
+    // is a no-op if the slot is already present.
+    const eos_id: u32 = @intCast(engine.eosToken());
+    params.config.addEosToken(eos_id);
+
+    // ── Install on entry. Everything below must be infallible (mirrors
+    //    the MLX path's invariant about the per-ptr errdefers above).
+    const entry = params.entry;
+    entry.ds4_engine = engine;
+    entry.config = params.config;
+    entry.tokenizer = params.tok;
+    entry.chat_config = params.chat_config;
+    entry.weights = null;
+    entry.transformer = null;
+    entry.vision_encoder = null;
+    entry.drafter = null;
+    entry.drafter_block_size = 0;
+    entry.drafter_path = "";
+    entry.prefix_cache = null;
+
+    // Bytes-resident is whatever main.zig handed us (typically the GGUF
+    // on-disk size). ds4's `ds4_context_memory_estimate` could give a
+    // tighter number; we leave that as a TODO since the registry's
+    // eviction gate doesn't currently support multi-engine residency.
+    const bytes_resident: u64 = if (entry.bytes_on_disk) |b| b else 0;
+
+    sch.registry.mutex.lockUncancelable(sch.io);
+    sch.registry.markReadyLocked(entry, bytes_resident);
+    sch.registry.mutex.unlock(sch.io);
+
+    // Scheduler's borrowed views: leave the MLX fields null. `runPrefill`
+    // / `runSingleDecodeTick` branch on `slot.ds4_session` and never touch
+    // `sch.xfm` for ds4 slots.
+    sch.current_model = entry;
+    sch.xfm = null;
+    sch.weights = null;
+    sch.vision_encoder = null;
+    sch.drafter = null;
+    sch.hot_prefix_cache = null;
+}
+
+/// Phase A1 → Plan 05: do the full model load on the inference thread.
+/// mlx ops here bind to this thread's GPU stream from t0; subsequent
+/// forwards stay on the same thread.
+///
+/// `params` is duck-typed (`anytype`): both `LoadParams` (startup) and
+/// `*LoadRequest` (on-demand) supply the same field set — `entry`,
+/// `config`/`tok`/`chat_config` (heap pointers), `model_dir`,
+/// `drafter_dir`, `load_vision`, `warmup_eager`, `draft_block_size`,
+/// `draft_block_size_explicit`, `kv_quant_config`, `prefix_cache_capacity`,
+/// `prefix_cache_mem_bytes`. The function reads them by name.
+///
+/// On any error the partial state has already been freed via errdefer; the
+/// caller decides how to surface (startup → recordLoadError + signal
+/// started; on-demand → req.error_name + done broadcast).
+fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
+    // ── ds4 fast path: when the caller passed `ds4_path`, the model is a
+    //    GGUF served by the embedded ds4 engine. The MLX scaffolding
+    //    (weights/Transformer/vision/drafter/JIT/warmup) is entirely
+    //    irrelevant — we open the engine on this thread (Metal kernels
+    //    bind to the local stream from t0), install it on the entry, and
+    //    mark ready. The stub config/tok/chat_config supplied by main.zig
+    //    is moved onto the entry so server-side reads of `lm.config.?`
+    //    (eos slices, context length, model name) keep working.
+    //
+    //    `params` is anytype — either `LoadParams` (startup) or `*LoadRequest`
+    //    (on-demand cold-load). The latter doesn't yet support ds4 (Phase D
+    //    cold-load is MLX-only), so we read `ds4_path` from the value type's
+    //    fields after a deref-when-pointer.
+    const Ty = @TypeOf(params);
+    const TyInfo = @typeInfo(Ty);
+    const Inner = if (TyInfo == .pointer) TyInfo.pointer.child else Ty;
+    if (@hasField(Inner, "ds4_path") and params.ds4_path.len > 0) {
+        try doLoadDs4OnInferenceThread(sch, params);
+        return;
+    }
+
+    // Allocate the drafter_path dupe up front so the post-publish step
+    // (lower down) has no fallible operations — once we start assigning
+    // pointers onto `params.entry`, an OOM during a dupe would leave the
+    // entry holding pointers that the per-ptr errdefers would double-free.
+    var drafter_path_owned: []u8 = &[_]u8{};
+    errdefer if (drafter_path_owned.len > 0) sch.allocator.free(drafter_path_owned);
+    if (params.drafter_dir.len > 0) {
+        drafter_path_owned = try sch.allocator.dupe(u8, params.drafter_dir);
+    }
+
+    // Weights — first mlx call. Binds the stream on this thread.
+    const weights_ptr = try sch.allocator.create(Weights);
+    errdefer sch.allocator.destroy(weights_ptr);
+    weights_ptr.* = if (params.load_vision)
+        try model_mod.loadWeightsWithVision(sch.io, sch.allocator, params.model_dir)
+    else
+        try model_mod.loadWeights(sch.io, sch.allocator, params.model_dir);
+    errdefer weights_ptr.deinit();
+
+    // Transformer — owns the bulk of the GPU memory.
+    const xfm_ptr = try sch.allocator.create(Transformer);
+    errdefer sch.allocator.destroy(xfm_ptr);
+    xfm_ptr.* = try Transformer.init(sch.io, sch.allocator, params.config.*, weights_ptr);
+    errdefer xfm_ptr.deinit();
+
+    // Propagate the kv-quant config to the Transformer's own cache. Slot
+    // caches in serve mode honor this independently in `Slot.init`; this
+    // call covers any path that still touches `xfm.cache` directly (legacy
+    // single-slot fallbacks, prompt-cache reuse).
+    if (params.kv_quant_config.scheme != .off) {
+        xfm_ptr.cache.deinit();
+        xfm_ptr.cache = try KVCache.initWithConfigAndHeadDim(sch.allocator, params.config.num_hidden_layers, params.kv_quant_config, params.config.head_dim);
+    }
+
+    // Wire model weights into GPU memory (prevents paging, matches mlx-lm).
+    {
+        var dev = mlx.mlx_device{ .ctx = null };
+        _ = mlx.mlx_get_default_device(&dev);
+        var info = mlx.mlx_device_info_new();
+        if (mlx.mlx_device_info_get(&info, dev) == 0) {
+            var max_rec: usize = 0;
+            if (mlx.mlx_device_info_get_size(&max_rec, info, "max_recommended_working_set_size") == 0 and max_rec > 0) {
+                var old_limit: usize = 0;
+                _ = mlx.mlx_set_wired_limit(&old_limit, max_rec);
+                log.debug("Wired limit set to {d} MB\n", .{max_rec / (1024 * 1024)});
+            }
+            _ = mlx.mlx_device_info_free(info);
+        }
+    }
+
+    // JIT-compile activation kernels. These are bound to THIS thread's mlx
+    // stream — that's exactly the point of doing them here.
+    if (params.config.hidden_act == .gelu_approx) {
+        xfm_ptr.compileGelu();
+        xfm_ptr.compileGeglu();
+    }
+    if (params.config.final_logit_softcapping > 0.0) {
+        xfm_ptr.compileSoftcap();
+    }
+    if (xfm_ptr.moe_layers != null) {
+        xfm_ptr.compileMoeRouting();
+    }
+
+    // Vision encoder if requested. `MissingVisionWeights` is a benign opt-out
+    // (model declares vision in config but the safetensors didn't ship the
+    // tower); other errors fail the whole load.
+    var vision_ptr: ?*VisionEncoder = null;
+    if (params.load_vision) {
+        const v = try sch.allocator.create(VisionEncoder);
+        if (VisionEncoder.init(sch.allocator, params.config.*, weights_ptr)) |encoder| {
+            v.* = encoder;
+            vision_ptr = v;
+        } else |err| {
+            sch.allocator.destroy(v);
+            if (err == error.MissingVisionWeights) {
+                log.warn("Vision weights missing — vision disabled (model may have been quantized without vision tower)\n", .{});
+            } else {
+                return err;
+            }
+        }
+    }
+    errdefer if (vision_ptr) |v| {
+        v.deinit();
+        sch.allocator.destroy(v);
+    };
+
+    // Drafter (optional). Loaded only when `drafter_dir` is non-empty.
+    var drafter_ptr: ?*DrafterModel = null;
+    if (params.drafter_dir.len > 0) {
+        const d = try sch.allocator.create(DrafterModel);
+        d.* = drafter_mod.loadDrafter(sch.io, sch.allocator, mlx.gpuStream(), params.drafter_dir) catch |err| {
+            sch.allocator.destroy(d);
+            log.err("Failed to load drafter at {s}: {s}\n", .{ params.drafter_dir, @errorName(err) });
+            return err;
+        };
+        d.bind(xfm_ptr) catch |err| {
+            d.deinit();
+            sch.allocator.destroy(d);
+            log.err(
+                "Drafter checkpoint at {s} is incompatible with target: {s}\n" ++
+                    "  (drafter+target must share backbone_hidden_size, vocab_size, and have\n" ++
+                    "  matching layer types in the target's non-shared K/V layers)\n",
+                .{ params.drafter_dir, @errorName(err) },
+            );
+            return err;
+        };
+        drafter_ptr = d;
+
+        // Auto-detect block_size unless the user pinned it explicitly.
+        if (!params.draft_block_size_explicit) {
+            const auto_bs = drafter_mod.recommendedBlockSize(params.config);
+            sch.drafter_block_size = auto_bs;
+            log.info(
+                "Drafter ready (block_size={d}, auto-detected for {s}/{d}-layer{s}).\n",
+                .{
+                    auto_bs,
+                    params.config.model_type,
+                    params.config.num_hidden_layers,
+                    if (params.config.isMoe()) ",moe" else "",
+                },
+            );
+        } else {
+            log.info("Drafter ready (block_size={d}, user override).\n", .{params.draft_block_size});
+        }
+
+        if (params.config.isMoe()) {
+            log.warn(
+                "Drafter loaded but target is MoE ({s}); per-request " ++
+                    "enable_drafter defaults to OFF — drafter+MoE regresses " ++
+                    "at single-stream batch=1 (verify forward expert-routing " ++
+                    "penalty). Pass enable_drafter:true per request to opt-in.\n",
+                .{params.config.model_type},
+            );
+        }
+    }
+    errdefer if (drafter_ptr) |d| {
+        d.deinit();
+        sch.allocator.destroy(d);
+    };
+
+    // Eager warmup: faults weight pages + compiles the decode-path kernels
+    // on this thread's stream. ~600-900 ms at boot but the first user request
+    // skips a cold path — observed savings on Gemma 4 E4B 4-bit.
+    if (params.warmup_eager) {
+        const warmup_start = std.Io.Timestamp.now(sch.io, .awake);
+        xfm_ptr.warmup() catch |err| {
+            log.warn("Warmup failed ({s}); continuing without it — first request may be slow.\n", .{@errorName(err)});
+        };
+        const warmup_ns: u64 = @intCast(warmup_start.untilNow(sch.io, .awake).nanoseconds);
+        log.info("Warmup complete ({d} ms).\n", .{warmup_ns / std.time.ns_per_ms});
+    }
+
+    // ── Phase 05: install everything onto the LoadedModel entry, mark
+    //    ready, and update the scheduler's borrowed views. The registry
+    //    mutex guards the state transition + `current_resident_bytes`
+    //    accounting; `state_cond.broadcast` (inside markReadyLocked) wakes
+    //    any waiter blocked in ensureLoaded.
+    //
+    //    Everything below this comment must be infallible — once we begin
+    //    assigning to `params.entry`, the per-ptr errdefers above would
+    //    double-free if we error-return. `drafter_path_owned` was alloc'd
+    //    up front for exactly this reason; the per-model prefix cache
+    //    init is a struct literal (no fallible alloc).
+    const entry = params.entry;
+    entry.weights = weights_ptr;
+    entry.transformer = xfm_ptr;
+    entry.vision_encoder = vision_ptr;
+    entry.drafter = drafter_ptr;
+    entry.drafter_block_size = sch.drafter_block_size;
+    entry.drafter_path = drafter_path_owned;
+    drafter_path_owned = &[_]u8{}; // disarm the errdefer
+    // Transfer ownership of the heap-allocated CPU state from `params` to
+    // the entry. The caller (main.zig) MUST NOT free these — `LoadedModel.deinit`
+    // walks them in the same `*X` pointer form they came in.
+    entry.config = params.config;
+    entry.tokenizer = params.tok;
+    entry.chat_config = params.chat_config;
+    // Per-model hot prefix cache (Plan 03 → Plan 05 move). Skip on hybrid
+    // recurrent archs — they reset on any divergence anyway.
+    if (params.prefix_cache_capacity > 0 and prefix_cache_mod.HotPrefixCache.shouldUse(params.config)) {
+        entry.prefix_cache = prefix_cache_mod.HotPrefixCache.initWithMem(
+            sch.allocator,
+            params.prefix_cache_capacity,
+            params.prefix_cache_mem_bytes,
+        );
+    }
+
+    // Best-effort bytes_resident estimate: prefer the disk size hint when
+    // available (it's close to actual GPU resident bytes after Metal page-
+    // ins), else fall back to a rough multiple of layers × hidden. The
+    // value drives LRU eviction's "will the new model fit?" gate in Phase
+    // D; precise accounting isn't required here.
+    const bytes_resident: u64 = if (entry.bytes_on_disk) |b|
+        b
+    else
+        @as(u64, params.config.num_hidden_layers) * @as(u64, params.config.hidden_size) * 4 * 4;
+
+    sch.registry.mutex.lockUncancelable(sch.io);
+    sch.registry.markReadyLocked(entry, bytes_resident);
+    sch.registry.mutex.unlock(sch.io);
+
+    // Set borrowed views for scheduler-internal code (and `current_model`
+    // for ensureLoaded → request handlers in Phase C).
+    sch.current_model = entry;
+    sch.weights = weights_ptr;
+    sch.xfm = xfm_ptr;
+    sch.vision_encoder = vision_ptr;
+    sch.drafter = drafter_ptr;
+    if (entry.prefix_cache) |*hc| sch.hot_prefix_cache = hc;
+}
+
+fn inferenceLoop(ctx: ThreadCtx) void {
+    const sch = ctx.scheduler;
+    const params = ctx.params;
+
+    // ── Phase A1 → Plan 05: load runs on this thread (mlx GPU stream
+    //    binding). On failure, mark the entry `.error_state` in the
+    //    registry AND set load_failed so `Scheduler.init`'s parent sees
+    //    the same shape it always has.
+    doLoadOnInferenceThread(sch, params) catch |err| {
+        recordLoadError(sch, @errorName(err));
+        sch.registry.mutex.lockUncancelable(sch.io);
+        sch.registry.markErrorLocked(params.entry, @errorName(err));
+        sch.registry.mutex.unlock(sch.io);
+        signalStarted(sch);
+        return;
+    };
+
+    log.info("Model ready (loaded on inference thread).\n", .{});
+    signalStarted(sch);
+
+    while (!sch.shutdown.load(.acquire)) {
+        // 0a. Drain slots queued for cleanup. Conn threads hand finished
+        //     slots here in `complete()` — we own the mlx stream binding,
+        //     so freeing per-slot KVCache + vision_embeddings + ssm_entries
+        //     is safe here even though those slots' arrays might trigger
+        //     real GPU memory release on refcount-zero.
+        var cleanup_batch: [16]*Slot = undefined;
+        var cleanup_n: usize = 0;
+        // 0b. Drain any pending vision/embed work. These run synchronously on
+        //     behalf of conn threads waiting in `encodeVision` /
+        //     `computeEmbedding`. Processed here (not concurrently with decode
+        //     ticks) so they share the inference thread's mlx stream cleanly.
+        var vision_batch: [4]*VisionEncodeRequest = undefined;
+        var vision_n: usize = 0;
+        var embed_batch: [4]*EmbedRequest = undefined;
+        var embed_n: usize = 0;
+        // Phase D: cold-load drain. Process ONE load per tick — loading a
+        // model is heavy (~seconds; weight read + JIT compile + warmup)
+        // and we want the rest of the inference loop to stay responsive.
+        // Other pending loads wait in queue and get picked up next tick.
+        var load_req: ?*LoadRequest = null;
+        {
+            sch.queue_mu.lockUncancelable(sch.io);
+            defer sch.queue_mu.unlock(sch.io);
+            while (cleanup_n < cleanup_batch.len and sch.cleanup_queue.items.len > 0) {
+                cleanup_batch[cleanup_n] = sch.cleanup_queue.orderedRemove(0);
+                cleanup_n += 1;
+            }
+            while (vision_n < vision_batch.len and sch.vision_queue.items.len > 0) {
+                vision_batch[vision_n] = sch.vision_queue.orderedRemove(0);
+                vision_n += 1;
+            }
+            while (embed_n < embed_batch.len and sch.embed_queue.items.len > 0) {
+                embed_batch[embed_n] = sch.embed_queue.orderedRemove(0);
+                embed_n += 1;
+            }
+            if (sch.load_queue.items.len > 0) {
+                load_req = sch.load_queue.orderedRemove(0);
+            }
+        }
+        for (cleanup_batch[0..cleanup_n]) |s| s.deinit();
+        if (vision_n > 0 or embed_n > 0) {
+            for (vision_batch[0..vision_n]) |req| runVisionEncode(sch, req);
+            for (embed_batch[0..embed_n]) |req| runEmbedRequest(sch, req);
+        }
+        if (load_req) |req| runLoadRequest(sch, req);
+
+        // 1. Wait for work. Drain pending slots into a local list under lock,
+        //    run prefills outside the lock.
+        var to_prefill: [16]*Slot = undefined;
+        var n_prefill: usize = 0;
+        {
+            sch.queue_mu.lockUncancelable(sch.io);
+            defer sch.queue_mu.unlock(sch.io);
+            while (sch.pending.items.len == 0 and sch.decoding.items.len == 0 and sch.vision_queue.items.len == 0 and sch.embed_queue.items.len == 0 and sch.cleanup_queue.items.len == 0 and sch.load_queue.items.len == 0 and !sch.shutdown.load(.acquire)) {
+                sch.queue_cond.waitUncancelable(sch.io, &sch.queue_mu);
+            }
+            if (sch.shutdown.load(.acquire)) break;
+
+            // If only vision/embed/cleanup/load work is pending, loop back to drain it.
+            if (sch.pending.items.len == 0 and sch.decoding.items.len == 0) continue;
+
+            while (n_prefill < to_prefill.len and sch.pending.items.len > 0) {
+                to_prefill[n_prefill] = sch.pending.orderedRemove(0);
+                n_prefill += 1;
+            }
+        }
+
+        // 2. Prefill each pending slot (heavy; mlx ops on this thread).
+        //    The inference thread is the sole mlx caller post-cleanup, so
+        //    no per-tick stream rebind / mutex coexistence is needed.
+        if (n_prefill > 0) {
+            for (to_prefill[0..n_prefill]) |slot| {
+                if (slot.cancelled.load(.acquire)) {
+                    slot.markFinished("cancelled");
+                    continue;
+                }
+                var prefill_sw = io_util.Stopwatch.init(sch.io);
+                runPrefill(sch, slot) catch |err| {
+                    log.err("[scheduler] prefill failed for slot: {s}\n", .{@errorName(err)});
+                    slot.markError(@errorName(err));
+                    continue;
+                };
+                slot.prefill_ns = prefill_sw.read();
+                sch.queue_mu.lockUncancelable(sch.io);
+                sch.decoding.append(sch.allocator, slot) catch |err| {
+                    sch.queue_mu.unlock(sch.io);
+                    slot.markError(@errorName(err));
+                    continue;
+                };
+                sch.queue_mu.unlock(sch.io);
+            }
+        }
+
+        // 3. Build active-list snapshot (skip cancelled / finished / errored).
+        var active: std.ArrayList(*Slot) = .empty;
+        defer active.deinit(sch.allocator);
+        {
+            sch.queue_mu.lockUncancelable(sch.io);
+            defer sch.queue_mu.unlock(sch.io);
+            for (sch.decoding.items) |s| {
+                if (s.cancelled.load(.acquire) or s.finished or s.error_code != null) continue;
+                active.append(sch.allocator, s) catch break;
+            }
+        }
+
+        // 4. Decode tick. Charge the full wall-clock tick time to each
+        //    participating slot — for batched ticks this matches the per-slot
+        //    throughput a user actually observes (their stream advances at
+        //    the tick cadence regardless of how many peers share it).
+        if (active.items.len > 0) {
+            var decode_sw = io_util.Stopwatch.init(sch.io);
+            runDecodeTick(sch, active.items) catch |err| {
+                log.err("[scheduler] decode tick failed: {s}\n", .{@errorName(err)});
+                for (active.items) |s| s.markError(@errorName(err));
+            };
+            const tick_ns = decode_sw.read();
+            for (active.items) |s| s.decode_ns +|= tick_ns;
+        }
+
+        // 5. Cull finished / errored / cancelled from `decoding`. The slot
+        //    still belongs to its connection thread until that thread calls
+        //    `complete`; we just stop touching it.
+        {
+            sch.queue_mu.lockUncancelable(sch.io);
+            defer sch.queue_mu.unlock(sch.io);
+            var i: usize = 0;
+            while (i < sch.decoding.items.len) {
+                const s = sch.decoding.items[i];
+                const drop = s.cancelled.load(.acquire) or s.finished or s.error_code != null;
+                if (drop) {
+                    _ = sch.decoding.orderedRemove(i);
+                } else i += 1;
+            }
+        }
+    }
+}
+
+/// Phase A4: encode one or more images on the inference thread. Mirrors the
+/// existing `processVisionImages` shape but writes the result into a request
+/// struct + signals done, so the conn thread (blocked in `encodeVision`)
+/// gets the output. On error, sets `req.error_name` and still signals done.
+/// Plan 05 Phase D: routes the encode through `req.model.vision_encoder`,
+/// not the scheduler's borrowed-view singleton — each LoadedModel has its
+/// own vision encoder when applicable.
+fn runVisionEncode(sch: *Scheduler, req: *VisionEncodeRequest) void {
+    const vision_enc = req.model.vision_encoder orelse {
+        finishVisionRequest(sch, req, "VisionEncoderNotLoaded");
+        return;
+    };
+    if (req.images.len == 0) {
+        finishVisionRequest(sch, req, "EmptyImages");
+        return;
+    }
+
+    // Encode each image, accumulate embeddings, free intermediate arrays.
+    var emb_parts = std.ArrayList(mlx.mlx_array).empty;
+    defer emb_parts.deinit(req.allocator);
+
+    for (req.images) |img| {
+        const h: c_int = @intCast(img.height);
+        const w: c_int = @intCast(img.width);
+        const shape = [_]c_int{ 1, 3, h, w };
+        const pixel_arr = mlx.mlx_array_new_data(img.pixels.ptr, &shape, 4, .float32);
+        defer _ = mlx.mlx_array_free(pixel_arr);
+        const emb = vision_enc.forward(pixel_arr) catch |err| {
+            // Free anything already encoded.
+            for (emb_parts.items) |e| _ = mlx.mlx_array_free(e);
+            finishVisionRequest(sch, req, @errorName(err));
+            return;
+        };
+        emb_parts.append(req.allocator, emb) catch |err| {
+            _ = mlx.mlx_array_free(emb);
+            for (emb_parts.items) |e| _ = mlx.mlx_array_free(e);
+            finishVisionRequest(sch, req, @errorName(err));
+            return;
+        };
+    }
+
+    // Single image: pass through. Multiple: concatenate along token dim.
+    var combined: mlx.mlx_array = undefined;
+    if (emb_parts.items.len == 1) {
+        combined = emb_parts.items[0];
+        emb_parts.items[0] = mlx.mlx_array_new(); // sentinel so the deferred-free path is a no-op
+    } else {
+        const cat_vec = mlx.mlx_vector_array_new_data(emb_parts.items.ptr, emb_parts.items.len);
+        defer _ = mlx.mlx_vector_array_free(cat_vec);
+        combined = mlx.mlx_array_new();
+        if (mlx.mlx_concatenate_axis(&combined, cat_vec, 1, vision_enc.s) != 0) {
+            _ = mlx.mlx_array_free(combined);
+            for (emb_parts.items) |e| _ = mlx.mlx_array_free(e);
+            finishVisionRequest(sch, req, "ConcatenateFailed");
+            return;
+        }
+    }
+    // emb_parts items are now either the sentinels (single-image case) or
+    // freeable copies (multi-image case post-concat). Free remaining.
+    for (emb_parts.items) |e| _ = mlx.mlx_array_free(e);
+
+    req.done_mu.lockUncancelable(sch.io);
+    defer req.done_mu.unlock(sch.io);
+    req.result = combined;
+    req.done = true;
+    req.done_cond.broadcast(sch.io);
+}
+
+fn finishVisionRequest(sch: *Scheduler, req: *VisionEncodeRequest, err_name: []const u8) void {
+    req.done_mu.lockUncancelable(sch.io);
+    defer req.done_mu.unlock(sch.io);
+    if (req.error_name) |old| req.allocator.free(old);
+    req.error_name = req.allocator.dupe(u8, err_name) catch null;
+    req.done = true;
+    req.done_cond.broadcast(sch.io);
+}
+
+/// Service one embedding request on the inference thread. Runs the
+/// encoder-only forward pass via `generate.computeEmbedding(xfm, ids)`,
+/// resets the global xfm.cache between requests (encoder-only does not
+/// share KV state across embeddings), and wakes the conn thread.
+fn runEmbedRequest(sch: *Scheduler, req: *EmbedRequest) void {
+    const xfm_ptr = req.model.transformer.?;
+    xfm_ptr.resetCache() catch |err| {
+        finishEmbedRequest(sch, req, @errorName(err));
+        return;
+    };
+    const result = generate_mod.computeEmbedding(req.allocator, xfm_ptr, req.token_ids) catch |err| {
+        finishEmbedRequest(sch, req, @errorName(err));
+        return;
+    };
+    req.done_mu.lockUncancelable(sch.io);
+    defer req.done_mu.unlock(sch.io);
+    req.result = result;
+    req.done = true;
+    req.done_cond.broadcast(sch.io);
+}
+
+fn finishEmbedRequest(sch: *Scheduler, req: *EmbedRequest, err_name: []const u8) void {
+    req.done_mu.lockUncancelable(sch.io);
+    defer req.done_mu.unlock(sch.io);
+    if (req.error_name) |old| req.allocator.free(old);
+    req.error_name = req.allocator.dupe(u8, err_name) catch null;
+    req.done = true;
+    req.done_cond.broadcast(sch.io);
+}
+
+/// Plan 05 Phase D: service a cold-load work item on the inference thread.
+/// Conn thread has already:
+///   * Marked `req.entry.state = .loading` (transitioned from .unloaded).
+///   * (Optionally) marked `req.evict_entry.state = .evicting` and drained
+///     its refcount to 0.
+///   * Parsed CPU-only state (config/tok/chat_config) and handed pointers
+///     in via the request.
+/// We unload the victim (if any), run the load body, install everything on
+/// `req.entry`, mark ready, and broadcast `req.done_cond` so the conn
+/// thread wakes. On failure, mark `.error_state` so future ensureLoaded
+/// calls fail fast; the conn thread surfaces a 500.
+fn runLoadRequest(sch: *Scheduler, req: *LoadRequest) void {
+    // Step 1: evict victim if requested. unloadResident() drops
+    // mlx_arrays — same thread-stream invariant as cleanup_queue drain.
+    if (req.evict_entry) |victim| {
+        log.info("[registry] evicting model id={s} ({d:.2} GB resident)\n", .{
+            victim.id,
+            @as(f64, @floatFromInt(victim.bytes_resident)) / 1_073_741_824.0,
+        });
+        victim.unloadResident();
+        sch.registry.mutex.lockUncancelable(sch.io);
+        sch.registry.accountEvictedLocked(req.evict_bytes);
+        sch.registry.finalizeEvictionLocked(victim);
+        sch.registry.mutex.unlock(sch.io);
+    }
+
+    // Step 2: the actual load. On error, mark .error_state and signal done
+    // (conn thread frees pre-parsed CPU state — ownership stays on req on
+    // the failure path).
+    doLoadOnInferenceThread(sch, req) catch |err| {
+        log.err("[registry] load failed for model id={s}: {s}\n", .{ req.entry.id, @errorName(err) });
+        sch.registry.mutex.lockUncancelable(sch.io);
+        // markErrorLocked dupes the error name onto the entry; the
+        // conn thread reads it back from the entry, not from req.
+        sch.registry.markErrorLocked(req.entry, @errorName(err));
+        sch.registry.mutex.unlock(sch.io);
+        finishLoadRequest(sch, req, @errorName(err));
+        return;
+    };
+
+    log.info("[registry] model id={s} ready ({d:.2} GB resident)\n", .{
+        req.entry.id,
+        @as(f64, @floatFromInt(req.entry.bytes_resident)) / 1_073_741_824.0,
+    });
+    finishLoadRequest(sch, req, null);
+}
+
+fn finishLoadRequest(sch: *Scheduler, req: *LoadRequest, err_name: ?[]const u8) void {
+    req.done_mu.lockUncancelable(sch.io);
+    defer req.done_mu.unlock(sch.io);
+    if (err_name) |name| {
+        if (req.error_name) |old| req.allocator.free(old);
+        req.error_name = req.allocator.dupe(u8, name) catch null;
+    }
+    req.done = true;
+    req.done_cond.broadcast(sch.io);
+}
+
+/// Phase A6: commit a successfully completed slot's KV cache to the hot
+/// prefix cache. Called from the inference thread BEFORE `markFinished`
+/// broadcasts, so the slot is still alive (the conn thread is blocked in
+/// `waitNext`). Skipped for pad-only generations, vision-bearing slots
+/// (stale embeddings would be reused), and slots with no generated tokens.
+fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
+    // Phase D: per-model prefix cache — read off the slot's LoadedModel.
+    const hc: *prefix_cache_mod.HotPrefixCache = if (slot.model.prefix_cache) |*p| p else return;
+    if (slot.was_pad_only) return;
+    if (slot.error_code != null) return;
+    if (slot.vision_embeddings != null) return;
+    const gen_ptr = if (slot.legacy_gen) |*g| g else return;
+    if (gen_ptr.generated_ids.items.len == 0) return;
+
+    // Construct the full token sequence: the original prompt + everything
+    // generated this turn. The cache reflects exactly this state — Generator
+    // forwarded each emitted token into slot.cache as it was sampled.
+    const total_len = slot.full_prompt.len + gen_ptr.generated_ids.items.len;
+    const total_tokens = sch.allocator.alloc(u32, total_len) catch return;
+    defer sch.allocator.free(total_tokens);
+    @memcpy(total_tokens[0..slot.full_prompt.len], slot.full_prompt);
+    @memcpy(total_tokens[slot.full_prompt.len..], gen_ptr.generated_ids.items);
+
+    hc.commit(&slot.cache, total_tokens, slot.has_tools) catch |err| {
+        log.warn("[hot-cache] commit failed: {s}\n", .{@errorName(err)});
+    };
+}
+
+/// Phase A6: finalize a slot. Commits to hot prefix cache (if applicable)
+/// before signaling completion. The order matters: commit first while the
+/// slot is alive, then markFinished — the conn thread's waitNext might
+/// return immediately after the broadcast and call complete()→deinit, so
+/// we cannot reach into the slot afterwards.
+fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
+    commitSlotIfApplicable(sch, slot);
+    slot.markFinished(reason);
+}
+
+/// ds4 prefill: create a session sized to the configured ctx and sync it to
+/// the full prompt. ds4 internally reuses the common prefix between its live
+/// session cache and the new prompt, so the mlx-serve hot prefix cache stays
+/// out of the picture. `slot.prompt_tokens` reports the full prompt length;
+/// `cached_tokens` is left at 0 (ds4 doesn't expose its per-session reuse
+/// count back through the FFI).
+fn runPrefillDs4(sch: *Scheduler, slot: *Slot, engine: *arch_ds4.Ds4Engine) !void {
+    _ = sch;
+    // Convert the slot's u32 prompt to ds4's i32 view. Sized once per
+    // prefill — ds4's session_sync owns the read of these IDs and the
+    // buffer can be freed before decode.
+    const i32_prompt = try slot.allocator.alloc(i32, slot.full_prompt.len);
+    defer slot.allocator.free(i32_prompt);
+    for (slot.full_prompt, 0..) |t, i| i32_prompt[i] = @intCast(t);
+
+    // Session sized to ds4's default ctx (matches the offline CLI path).
+    // Larger ctx → larger KV scratch up front; we leave tuning to future work.
+    const ctx_size: i32 = 32768;
+    var sess = try engine.createSession(ctx_size);
+    errdefer sess.free();
+
+    try sess.sync(i32_prompt);
+
+    slot.ds4_session = sess;
+    slot.prompt_tokens = @intCast(slot.full_prompt.len);
+    slot.cached_tokens = 0;
+    slot.state = .decoding;
+}
+
+/// ds4 decode tick: argmax (temp ≤ 0) or sample, check EOS, push token,
+/// `eval(token)` to extend the session, and stop on max_tokens. Each call
+/// emits exactly one token (unlike PLD/drafter which can emit several).
+fn runDs4DecodeTick(sch: *Scheduler, slot: *Slot, session: *arch_ds4.Ds4Session) !void {
+    const engine = slot.model.ds4_engine.?;
+    const next_id: i32 = if (slot.sampling.temperature <= 0.0)
+        session.argmax()
+    else
+        session.sample(
+            slot.sampling.temperature,
+            @intCast(slot.sampling.top_k),
+            slot.sampling.top_p,
+            0.05,
+            &slot.ds4_rng,
+        );
+
+    // ds4 returns an i32 token id; we treat any negative value as a sampler
+    // failure rather than push it through the unsigned ring buffer.
+    if (next_id < 0) {
+        slot.markError("ds4_sample_failed");
+        return;
+    }
+    const tok_u32: u32 = @intCast(next_id);
+
+    // EOS handling — match the MLX path: do NOT emit the stop token.
+    if (next_id == engine.eosToken() or generate_mod.isEosId(tok_u32, slot.eos_token_ids)) {
+        finishSlot(sch, slot, "stop");
+        return;
+    }
+
+    slot.pushToken(tok_u32);
+    if (tok_u32 != 0) slot.was_pad_only = false;
+    slot.completion_tokens += 1;
+
+    // Advance ds4's KV by feeding the freshly-sampled token. After this
+    // the session is in the state expected by the NEXT decode tick.
+    try session.eval(next_id);
+
+    if (slot.completion_tokens >= slot.max_tokens) {
+        finishSlot(sch, slot, "length");
+        return;
+    }
+}
+
+/// Allocate the slot's KVCache state (already done in Slot.init), construct
+/// the per-slot Generator via `Generator.initWithOptions(.{ .ctx = slot.ctx,
+/// .skip_lazy_preforward = true_for_regular, ... })`, and store it on the
+/// slot. After return, the slot is ready for decode ticks.
+fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
+    // ds4-backed model: bypass the MLX prefill path entirely. The ds4
+    // engine owns the chat/tokenizer/KV stack — we just create a session,
+    // sync it to the slot's full prompt (ds4 reuses common prefix against
+    // its live cache internally), and mark the slot decoding.
+    if (slot.model.ds4_engine) |engine| {
+        return runPrefillDs4(sch, slot, engine);
+    }
+    const sampling = slot.sampling;
+    // Refresh ctx in case slot was relocated (paranoia — slot is heap so no,
+    // but cheap).
+    slot.ctx.cache = &slot.cache;
+    slot.ctx.moe_seq_offset = &slot.moe_seq_offset;
+    slot.ctx.ssm_entries = slot.ssm_entries;
+    slot.ctx.vision_embeddings = slot.vision_embeddings;
+    slot.ctx.capture_hidden = null;
+    slot.ctx.kv_attn_fused = slot.kv_attn_fused;
+
+    const use_drafter = slot.enable_drafter and slot.drafter != null;
+    const use_pld = !use_drafter and slot.enable_pld;
+
+    // Phase A6: prefill source-of-truth is `slot.full_prompt` — the conn
+    // thread's `reuseKVCache` may have trimmed `slot.prompt_ids` based on
+    // `xfm.cache` (the legacy global cache), but the slot has its own cache
+    // which started empty. Using `slot.prompt_ids` would cause the model to
+    // attend to only the trailing portion with empty cache, producing
+    // garbage. Always start from the full prompt and let the hot prefix
+    // cache (if configured) trim it back via the slot's own cache state.
+    //
+    // Vision-bearing slots: skip the hot cache altogether. Image tokens
+    // have identical IDs but the underlying vision embeddings differ
+    // per-request, so prefix matching would reuse stale features.
+    var prefill_tokens: []const u32 = slot.full_prompt;
+    var hot_matched: u32 = 0;
+    // Phase D: per-slot model — pull transformer + prefix cache off the
+    // slot's LoadedModel. Both stay resident for the slot's lifetime
+    // because the conn thread holds a refcount on slot.model.
+    const xfm_ptr: *Transformer = slot.model.transformer.?;
+    if (slot.model.prefix_cache) |*hc| {
+        if (slot.vision_embeddings == null) {
+            const lookup = hc.lookupAndRestore(
+                &slot.cache,
+                &slot.moe_seq_offset,
+                slot.ssm_entries,
+                xfm_ptr.s,
+                slot.full_prompt,
+                slot.has_tools,
+            ) catch |err| blk: {
+                log.warn("[hot-cache] lookup failed: {s} — proceeding with cold prefill\n", .{@errorName(err)});
+                break :blk prefix_cache_mod.LookupResult{ .matched = 0, .full_match = false };
+            };
+            if (lookup.matched > 0 and lookup.matched <= slot.full_prompt.len) {
+                hot_matched = @intCast(lookup.matched);
+                prefill_tokens = slot.full_prompt[hot_matched..];
+            }
+        }
+    }
+
+    var gen = try Generator.initWithOptions(
+        sch.io,
+        slot.allocator,
+        xfm_ptr,
+        slot.model.tokenizer.?,
+        prefill_tokens,
+        slot.max_tokens,
+        sampling,
+        slot.eos_token_ids,
+        .{
+            .pld_enabled = use_pld,
+            .drafter_enabled = use_drafter,
+            .drafter = if (use_drafter) slot.drafter else null,
+            .drafter_block_size = slot.drafter_block_size,
+            .lookup_prompt = slot.full_prompt,
+            .ctx = slot.ctx,
+            // Regular path: skip the lazy preforward so cache.step lands at
+            // exactly prompt_len with t1 NOT in cache. Generator.next's
+            // transition shim sync-forwards [t1] on the first decode call.
+            // PLD/drafter init paths already skip preforward unconditionally.
+            .skip_lazy_preforward = !use_pld and !use_drafter,
+        },
+    );
+    gen.timeout_ns = slot.timeout_ns;
+    gen.logprobs_n = slot.logprobs_n;
+
+    slot.legacy_gen = gen;
+    // The conn thread's `cached_tokens` counted against `xfm.cache` (legacy
+    // global cache) which the slot doesn't use. The slot's `cached_tokens`
+    // is the hot-cache match (or 0 if the hot cache missed / isn't
+    // configured) — those are the only tokens actually present in slot.cache
+    // before this turn's prefill. With this override, slot.prompt_tokens
+    // reports the full prompt length: gen.prompt_tokens (= prefill_tokens.len)
+    // covers the un-cached tail, and `hot_matched` covers the restored prefix.
+    slot.cached_tokens = hot_matched;
+    slot.prompt_tokens = gen.prompt_tokens + slot.cached_tokens;
+    slot.state = .decoding;
+}
+
+fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
+    if (active.len == 0) return;
+
+    // Phase 3 gate: at len==1, route to legacy single-slot path. Bit-identical
+    // to pre-Phase-2 behavior including PLD/drafter speculative decoding.
+    // Phase A7 test hook: `MLX_SERVE_FORCE_BATCHED=1` bypasses the gate so the
+    // byte-equivalence test can run the batched kernel at active.len==1 and
+    // assert it matches the single-slot path token-for-token.
+    if (active.len == 1 and !sch.force_batched) {
+        try runSingleDecodeTick(sch, active[0]);
+        return;
+    }
+
+    // active.len >= 2 (or force_batched at len==1): split into batchable +
+    // non-batchable. Batchable slots share one `forwardBatchedDecode` call.
+    // Non-batchable (slots running PLD/drafter or grammar-constrained) fall
+    // back to legacy single-slot decode this tick.
+    //
+    // Plan 05 Phase D: batched decode requires all participating slots to
+    // share a transformer. We partition `batchable` by `slot.model` and
+    // emit one batched call per model. The non-batchable bucket doesn't
+    // care — each slot runs against its own `slot.model.transformer.?`.
+    var batchable_buf: [32]*Slot = undefined;
+    var batchable_n: usize = 0;
+    for (active) |s| {
+        if (sch.batchable(s) and batchable_n < batchable_buf.len) {
+            batchable_buf[batchable_n] = s;
+            batchable_n += 1;
+        } else {
+            // legacy single-slot for spec / grammar / overflow
+            try runSingleDecodeTick(sch, s);
+        }
+    }
+    if (batchable_n == 0) return;
+
+    // Group batchable slots by model pointer (in-place partition by sort).
+    // The order of slots within a model doesn't matter for batched decode;
+    // we only need contiguous runs per model.
+    std.sort.pdq(*Slot, batchable_buf[0..batchable_n], {}, struct {
+        fn lt(_: void, a: *Slot, b: *Slot) bool {
+            return @intFromPtr(a.model) < @intFromPtr(b.model);
+        }
+    }.lt);
+
+    var start: usize = 0;
+    while (start < batchable_n) {
+        var end = start + 1;
+        while (end < batchable_n and batchable_buf[end].model == batchable_buf[start].model) end += 1;
+        const group = batchable_buf[start..end];
+        // Honor force_batched even when only one slot is batchable so the
+        // test hook actually exercises forwardBatchedDecode at N=1.
+        if (group.len >= 2 or (sch.force_batched and group.len == 1)) {
+            try runBatchedDecodeTick(sch, group);
+        } else if (group.len == 1) {
+            try runSingleDecodeTick(sch, group[0]);
+        }
+        start = end;
+    }
+}
+
+/// Drive one Generator step (regular / PLD / drafter) and push emitted
+/// tokens into the slot's output ring. Mirrors the existing
+/// `StreamingTokenStream` adapter contract: 0..N tokens per call, with EOS
+/// stopping the slot but NOT being emitted.
+fn runSingleDecodeTick(sch: *Scheduler, slot: *Slot) !void {
+    // ds4-backed slot: drive the engine's session forward by one token. No
+    // PLD / drafter / batched paths apply — ds4 has its own internal MTP
+    // (see TODO: wire `evalSpeculative` when temp=0 and engine.hasMtp()).
+    if (slot.ds4_session) |session| {
+        return runDs4DecodeTick(sch, slot, session);
+    }
+    const gen = if (slot.legacy_gen) |*g| g else {
+        slot.markError("no_generator");
+        return;
+    };
+
+    if (slot.enable_drafter and gen.drafter != null and !gen.spec_disabled_runtime) {
+        const result = try gen.nextDrafter(slot.allocator);
+        if (result == null) {
+            finishSlot(sch, slot, gen.finish_reason);
+            return;
+        }
+        defer slot.allocator.free(result.?.tokens);
+        for (result.?.tokens) |t| {
+            if (slot.cancelled.load(.acquire)) return;
+            if (generate_mod.isEosId(t, slot.eos_token_ids)) {
+                finishSlot(sch, slot, "stop");
+                return;
+            }
+            slot.pushToken(t);
+            slot.completion_tokens = gen.completion_tokens;
+            if (t != 0) slot.was_pad_only = false;
+            if (slot.completion_tokens >= slot.max_tokens) {
+                finishSlot(sch, slot, "length");
+                return;
+            }
+        }
+        return;
+    }
+
+    if (slot.enable_pld and !gen.spec_disabled_runtime) {
+        const result = try gen.nextPld(slot.allocator, slot.pld_draft_len, slot.pld_key_len);
+        if (result == null) {
+            finishSlot(sch, slot, gen.finish_reason);
+            return;
+        }
+        defer slot.allocator.free(result.?.tokens);
+        for (result.?.tokens) |t| {
+            if (slot.cancelled.load(.acquire)) return;
+            if (generate_mod.isEosId(t, slot.eos_token_ids)) {
+                finishSlot(sch, slot, "stop");
+                return;
+            }
+            slot.pushToken(t);
+            slot.completion_tokens = gen.completion_tokens;
+            if (t != 0) slot.was_pad_only = false;
+            if (slot.completion_tokens >= slot.max_tokens) {
+                finishSlot(sch, slot, "length");
+                return;
+            }
+        }
+        return;
+    }
+
+    // Regular path.
+    const tok_opt = try gen.next(slot.allocator);
+    if (tok_opt == null) {
+        finishSlot(sch, slot, gen.finish_reason);
+        return;
+    }
+    const t = tok_opt.?;
+    slot.pushToken(t);
+    if (t != 0) slot.was_pad_only = false;
+    slot.completion_tokens = gen.completion_tokens;
+    // Phase A5: capture per-token logprob for the conn thread to consume at
+    // completion. `gen.last_logprob` ownership transfers into slot.logprobs_buf
+    // (gen sets the field, we null it after taking it).
+    if (slot.logprobs_n > 0) {
+        if (gen.last_logprob) |lp| {
+            slot.logprobs_buf.append(slot.allocator, lp) catch |err| {
+                slot.markError(@errorName(err));
+                return;
+            };
+            gen.last_logprob = null;
+        }
+    }
+}
+
+/// Batched decode kernel for >=2 active slots. All slots must have already
+/// done a non-spec prefill (`skip_lazy_preforward = true`) so cache.step is
+/// at prompt_len with `next_token_id` carrying t1. We forward those N tokens
+/// in one kernel pass, sample per-slot, push the OLD next_token_id (= the
+/// token we just committed to cache via the forward), and load the new
+/// sampled id back into next_token_id.
+fn runBatchedDecodeTick(sch: *Scheduler, active: []*Slot) !void {
+    const N = active.len;
+    if (N == 0) return;
+    const allocator = sch.allocator;
+
+    // Phase D: all batched slots must share the same model — the caller
+    // (`runDecodeTick`) partitions by `slot.model` before dispatching here.
+    // The first slot's transformer is authoritative; debug-assert the rest
+    // match to surface partitioning bugs early.
+    const xfm_ptr: *Transformer = active[0].model.transformer.?;
+    if (std.debug.runtime_safety) {
+        for (active) |s| std.debug.assert(s.model.transformer.? == xfm_ptr);
+    }
+
+    // Build inputs.
+    const next_tokens = try allocator.alloc(u32, N);
+    defer allocator.free(next_tokens);
+    const ctxs = try allocator.alloc(*ForwardCtx, N);
+    defer allocator.free(ctxs);
+    const rope_offsets = try allocator.alloc(u32, N);
+    defer allocator.free(rope_offsets);
+
+    for (active, 0..) |slot, i| {
+        const gen = if (slot.legacy_gen) |*g| g else {
+            slot.markError("no_generator");
+            return error.NoGenerator;
+        };
+        next_tokens[i] = gen.next_token_id;
+        ctxs[i] = &gen.ctx;
+        rope_offsets[i] = @intCast(slot.cache.step);
+        // If the slot still has lazy pipeline state from a previous legacy
+        // tick, drop it — batched path doesn't use it and re-entering legacy
+        // later will sync-forward via the transition shim.
+        if (gen.has_pending_logits) {
+            _ = mlx.mlx_array_free(gen.pending_logits);
+            gen.has_pending_logits = false;
+        }
+        if (gen.has_pending_token) {
+            _ = mlx.mlx_array_free(gen.pending_token);
+            gen.has_pending_token = false;
+        }
+    }
+
+    const logits_arr = try xfm_ptr.forwardBatchedDecode(next_tokens, ctxs, rope_offsets);
+    defer {
+        for (logits_arr) |a| _ = mlx.mlx_array_free(a);
+        allocator.free(logits_arr);
+    }
+
+    // Sample per slot, emit prev id, set new next_token_id.
+    for (active, 0..) |slot, i| {
+        if (slot.cancelled.load(.acquire)) continue;
+        const gen = &slot.legacy_gen.?;
+        const lazy = generate_mod.sampleTokenLazy(logits_arr[i], slot.sampling, xfm_ptr.s);
+        try mlx.check(mlx.mlx_array_eval(lazy));
+        var val: i32 = 0;
+        try mlx.check(mlx.mlx_array_item_int32(&val, lazy));
+        _ = mlx.mlx_array_free(lazy);
+
+        const emit = gen.next_token_id;
+        gen.generated_ids.append(slot.allocator, emit) catch |err| {
+            slot.markError(@errorName(err));
+            continue;
+        };
+        gen.completion_tokens += 1;
+        gen.step += 1;
+        gen.next_token_id = @intCast(val);
+
+        // Stop checks (mirrors Generator.checkStop).
+        if (generate_mod.isEosId(emit, slot.eos_token_ids)) {
+            // Per existing contract, emit IS NOT yielded when it's EOS — the
+            // STOP token comes BEFORE the yield. But here the cache has
+            // already moved past it. The legacy path's checkStop runs on the
+            // NEXT token (it's checked before emit). To preserve that
+            // behavior we emit and then mark finished if `next_token_id` is
+            // EOS (i.e. STOP is the next sampled token, ignored).
+            slot.pushToken(emit);
+            if (emit != 0) slot.was_pad_only = false;
+            slot.completion_tokens = gen.completion_tokens;
+            // not finished yet; next tick's checkStop on next_token_id ends it
+        } else {
+            slot.pushToken(emit);
+            if (emit != 0) slot.was_pad_only = false;
+            slot.completion_tokens = gen.completion_tokens;
+        }
+
+        if (generate_mod.isEosId(gen.next_token_id, slot.eos_token_ids)) {
+            finishSlot(sch, slot, "stop");
+            continue;
+        }
+        if (gen.next_token_id == 0) {
+            gen.consecutive_pad += 1;
+            if (gen.consecutive_pad >= 3) {
+                finishSlot(sch, slot, "stop");
+                continue;
+            }
+        } else {
+            gen.consecutive_pad = 0;
+        }
+        if (slot.completion_tokens >= slot.max_tokens) {
+            finishSlot(sch, slot, "length");
+            continue;
+        }
+    }
+}
+
+const testing = std.testing;
+
+test "modelBatchable rejects MoE / hybrid / encoder / sliding-window" {
+    {
+        var cfg = std.mem.zeroes(model_mod.ModelConfig);
+        cfg.has_hybrid_layers = true;
+        try testing.expect(!modelBatchable(&cfg));
+    }
+    {
+        var cfg = std.mem.zeroes(model_mod.ModelConfig);
+        cfg.full_attention_interval = 6;
+        try testing.expect(!modelBatchable(&cfg));
+    }
+    {
+        var cfg = std.mem.zeroes(model_mod.ModelConfig);
+        cfg.is_encoder_only = true;
+        try testing.expect(!modelBatchable(&cfg));
+    }
+    {
+        // MoE: isMoe() returns true when num_experts > 0.
+        var cfg = std.mem.zeroes(model_mod.ModelConfig);
+        cfg.num_experts = 8;
+        try testing.expect(!modelBatchable(&cfg));
+    }
+}
+
+test "modelBatchable permits pure-attention" {
+    // Defaults are all zero / null → vanilla pure-attention path.
+    var cfg = std.mem.zeroes(model_mod.ModelConfig);
+    try testing.expect(modelBatchable(&cfg));
+}

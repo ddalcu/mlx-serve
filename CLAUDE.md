@@ -31,7 +31,7 @@ Native Zig server that runs MLX-format LMs on Apple Silicon and exposes OpenAI-c
 | `log.zig` | Leveled logging |
 | `build.zig` | Links mlx-c, libjinja, libwebp, stb_image |
 
-CLI flags: `--model --serve --host --port --prompt --max-tokens --temp --ctx-size --timeout --reasoning-budget --no-vision --pld --pld-draft-len --pld-key-len --drafter --draft-block-size --log-level --version --help`
+CLI flags: `--model --serve --host --port --prompt --max-tokens --temp --ctx-size --timeout --reasoning-budget --no-vision --pld --pld-draft-len --pld-key-len --drafter --draft-block-size --kv-quant --prefix-cache-entries --prefix-cache-mem --max-concurrent --model-dir --log-level --version --help`
 
 ### Swift macOS app (`app/Sources/MLXServe/`)
 
@@ -49,8 +49,9 @@ CLI flags: `--model --serve --host --port --prompt --max-tokens --temp --ctx-siz
 
 ## Building
 
+- **ALWAYS build Zig with `-Doptimize=ReleaseFast`. Never use bare `zig build`.** The default optimize mode is Debug, which is 2-4× slower than ReleaseFast for the same workload (e.g. Gemma 4 E4B 4-bit prefill measured at 230 vs 558 tok/s on the same machine — pure build-flag difference, no code change). A Debug binary at `zig-out/bin/mlx-serve` will silently make every benchmark look like a regression. Zig caches incremental builds aggressively, so `-Doptimize=ReleaseFast` is essentially free on rebuild — there is no reason to ever skip it.
 - **Always use `./app/build.sh` for the Swift app, not direct `swift build`** — the script knows the right Swift-version flags, links Zig artifacts, signs the bundle, and keeps `MLXCore` + `mlx-serve` in lockstep. Skip notarization in dev with `SKIP_NOTARIZE=1 bash app/build.sh`.
-- Zig only: `zig build -Doptimize=ReleaseFast` (needs `brew install webp`)
+- Zig only: `zig build -Doptimize=ReleaseFast` (needs `brew install webp`). **No exceptions** — never bare `zig build` for performance work or for any artifact that ends up in `zig-out/bin/`. A quick way to spot a Debug binary that slipped through: it's ~7-8 MB vs the ~3.3 MB ReleaseFast binary, and `du -h zig-out/bin/mlx-serve` should match `/Applications/MLX Core.app/Contents/MacOS/mlx-serve` in size.
 - Direct `swift build` (escape hatch only — fast iteration on a Swift-only change): `cd app && swift build -c release -Xswiftc -swift-version -Xswiftc 5`. Don't ship a build that didn't go through `build.sh`.
 - **Rebuild Jinja** (after `lib/jinja_cpp/*.cpp` changes): `cd lib/jinja_cpp && for f in jinja_wrapper caps lexer parser runtime jinja_string value; do clang++ -std=c++17 -O2 -DNDEBUG -I . -c $f.cpp -o obj/$f.o; done && ar rcs libjinja.a obj/*.o`
 
@@ -58,11 +59,28 @@ The `-Xswiftc -swift-version -Xswiftc 5` flag forces Swift 5 mode under Swift 6.
 
 ## Testing
 
-- Always add tests for changes; unit tests OK but integration tests with real models are the real tests
-- Do things in a TDD style, write failing test first, then implement it.
-- Cover all supported architectures, not just one
-- After big features: build mlx-serve + app bundle, run `.app` with TestServer.swift enabled, test agentic harness
-- Always run `zig build test` and `swift test` before submitting
+**TDD is mandatory for every code change — features, bug fixes, refactors, build-script tweaks, all of it.** No exceptions, no "I'll add the test after the smoke test passes." A live curl against a running server is a useful sanity check but it is NOT a test — it doesn't survive in CI, it doesn't pin the behavior against future regressions, and it doesn't prove the fix is on the right code path.
+
+The order is fixed:
+
+1. **Write the failing test first.** It must fail for the right reason — i.e. the symptom you're fixing or the capability you're adding. If you can't articulate a failing test, you don't yet understand the change you're making.
+2. **Make it pass.** Minimum code to flip the test green; no opportunistic refactoring in the same step.
+3. **Run the full suite** (`zig build test` + `cd app && swift build` + the relevant integration script) — a green new test doesn't excuse a red regression elsewhere.
+4. **Then iterate** — refactor / clean up / extend, with the test as a tripwire.
+
+Concrete rules for each change class:
+
+- **Feature**: at least one unit test that fails without the feature and passes with it. Add an integration test (`tests/test_*.sh`) when the feature is observable over HTTP.
+- **Bug fix**: a regression test that reproduces the bug from the user's perspective. The diff order must be `test (red) → fix → test (green)` — verify locally that reverting the fix turns the test red again.
+- **Cross-arch work**: cover every architecture the change touches, not just the one you're holding (`gemma4`, `qwen3_5_moe`, `lfm2`, `nemotron_h`, `deepseek_v4` via ds4, etc.). One arch's pass is not the suite's pass.
+- **Refactor / no-behavior-change**: at least one existing test must exercise the refactored path before the change. If coverage isn't there, add a characterization test first, then refactor under it.
+- **Untestable surface (UI, build scripts, etc.)**: factor a pure helper out and test that. "I can't test SwiftUI" usually means "I didn't extract the testable piece yet."
+
+Existing tools:
+
+- Unit tests OK; integration tests with real models are the real tests.
+- After big features: build `mlx-serve` + the app bundle, run `.app` with `TestServer.swift` enabled, run the agentic harness.
+- Always run `zig build test` and `swift test` (or `swift build`) before submitting.
 
 | Command | Purpose |
 |---|---|
@@ -77,6 +95,11 @@ The `-Xswiftc -swift-version -Xswiftc 5` flag forces Swift 5 mode under Swift 6.
 | `./tests/test_drafter_equivalence.sh [port]` | Gemma 4 drafter byte-equivalence |
 | `UD_MOE_MODEL=<dir> ./tests/test_ud_moe.sh` | Unsloth UD MoE load + generate (default Qwen3.6-27B-UD-MLX-4bit) |
 | `./tests/test_long_agent_memory.sh [port]` | 10-turn Claude-Code-style agent: plants 3 facts in turn 1, recalls them across mode transitions (tools on/off, thinking on/off). Catches "model acts like first-time-seen" regressions. |
+| `./tests/test_kv_quant_equivalence.sh [model_dir] [port]` | Off-vs-4-bit-vs-8-bit KV cache equivalence (per-arch first-N-token thresholds, env-overridable). |
+| `./tests/test_kv_quant_per_request.sh [model_dir] [port]` | Per-request `kv_quant` body field plumbing — confirms parse + scheduler routing for each scheme. |
+| `./tests/test_prefix_cache_mem.sh [model_dir] [port]` | `--prefix-cache-mem` budget — long-prompt traffic must stay within the byte cap and produce eviction log lines. |
+| `./tests/test_turboquant_equivalence.sh [model_dir] [port]` | TurboQuant smoke (non-NaN, ≥5 tokens, first-N diff vs dense). |
+| `SOAK_DURATION_HOURS=N ./tests/test_soak_24h.sh [model_dir]` | Plan 01 A8 — 4-way concurrent soak (chat/agent/Anthropic/tool). RSS drift bounded; default 24h, set `SOAK_DURATION_HOURS=1` for CI smoke. |
 | `./tests/bench_spec.sh [runs]` / `--corpus` | Spec-decode benchmark + threshold-tuning corpus |
 
 ## Versioning & Releases
@@ -276,6 +299,31 @@ Two paths share a verify invariant: `cache.step = prompt_len + tokens_emitted`, 
 ### PLD/drafter long-greedy byte-divergence at INT4
 AR (`next`) forwards `[1,1,d]` qmv; verify forwards `[1,K+1,d]` qmm. INT4 float reductions in slightly different orders → near-tie argmax can flip → divergence cascades. First ~30–80 generated tokens at temp=0 are byte-identical (equivalence tests live here); beyond that, paths may diverge char-by-char while both being mathematically valid greedy outputs. At temp ≥ 0.01 the Leviathan sampler preserves the target distribution → exact past 30 tokens. **For byte-stable long-greedy at temp=0 on INT4: `--no-pld`, no `--drafter`.** For chat/agent (temp>0) spec-decode is exact and free.
 
+The same float-reduction issue compounds when **KV is also INT4** — see "KV cache quantization" below.
+
+### KV cache quantization (`--kv-quant {off, 4, 8, turbo2, turbo4}`)
+Group-wise affine quantization of K/V via `mlx_quantize`/`mlx_dequantize` (no new kernels). Storage swaps dense `[B,H,T,D]` bf16 buffers for a triple `(q, scales, biases)` where `q` is packed uint32 and `scales`/`biases` are per-group bf16; SDPA always reads dense data via `KVCache.denseView`, which dequantizes on the fly in quant mode. `--kv-quant` sets the **process default**; individual requests can override via the `kv_quant` body field on `/v1/chat/completions`, `/v1/messages`, `/v1/responses` (`"off"`, `4`, `8`, `"turbo2"`, `"turbo4"`). Memory: ~4× smaller at 4-bit (4.5 bits/elem including scale+bias overhead at group=64), ~2× at 8-bit. TurboQuant adds a Hadamard rotation before affine quant; `turbo2` halves bits-per-element again at the cost of an extra `[head_dim,head_dim]` matmul per K/V per token. Implemented in `src/kv_quant.zig` + `src/transformer.zig` (KVCache).
+
+- **Equivalence thresholds** (`tests/test_kv_quant_equivalence.sh`, default 30/30; raise via env vars for stricter testing):
+  - Gemma 4 E4B 4-bit weights: 30/30 passes; 8-bit KV stays identical past 60 in practice.
+  - Qwen 3.5/3.6 MoE 4-bit weights (GatedDeltaNet + MoE): 4-bit KV passes 30 tokens. 8-bit KV diverges around token 41 from MoE+GDN float-reduction noise — same class as the INT4-weight long-greedy tail.
+  - LFM2.5 8-bit weights (hybrid SSM): 4-bit KV diverges around token 12 — recommend `--kv-quant 8` for byte-stable long-greedy on this family.
+  - Override per-arch via `KV_QUANT_FIRST_N_4BIT` / `KV_QUANT_FIRST_N_8BIT` env vars.
+- **Compounding with INT4 weights**: Both the existing weight-quant divergence (PLD/drafter note above) and KV-quant divergence stack. For byte-stable long-greedy at temp=0 on INT4-weight models: prefer `--kv-quant 8` if you need a quant; `--kv-quant off` if you don't.
+- **Drafter**: target's KV may be quantized; drafter cross-attends through `cache.denseView` so it never sees the quantized representation directly. Drafter's own cache stays dense. No special handling needed.
+- **Snapshot / prefix cache**: snapshot/restore copy 6 array handles per entry instead of 2 (4 extra for scale/bias); hot prefix cache works unchanged because it operates on `KVCacheSnapshot` opaquely. Each `HotEntry` records its scheme; `findBestMatch` filters by `(prompt_ids, has_tools, scheme)` so per-request overrides never produce a cross-scheme hit.
+- **TurboQuant (`turbo2`, `turbo4`)**: same affine-write/read path with a per-layer Hadamard rotation applied before quantization and undone after dequantization. `TurboState` builds `2 × num_layers` symmetric `[head_dim, head_dim]` bf16 matrices via Sylvester construction with per-layer column-sign flips (deterministic, no RNG seed). `head_dim` MUST be a power of two — caller passes via `KVCache.initWithConfigAndHeadDim`. State lives on `KVCache.quant_state` and refcount-shares through `snapshot`/`restore`. The rotation matters when inputs have outliers that would inflate per-group ranges in straight affine; on smooth data it can be slightly *worse* than straight affine because the rotation spreads tight local ranges into a wider global range.
+- **1-bit TurboQuant**: not yet shipped. `mlx_quantize`/`mlx_dequantize` only support bits ∈ {2,4,8} natively, so 1-bit requires a custom pack/unpack. Land alongside the future fused-kernel work.
+- **Extending the scheme** (e.g. fused quant-SDPA Metal kernel): the contract between cache and attention is `KVCache.denseView`. To add a new scheme:
+  1. Add an enum variant to `kv_quant.Scheme`.
+  2. (Optional) Add per-cache state (e.g. `quant_state: ?TurboState` for rotation matrices).
+  3. Add `quantizeX` / `dequantizeX` functions in `src/kv_quant.zig`.
+  4. Extend the `switch (config.scheme)` arms in `KVCache.update` and `KVCache.denseView`.
+  SDPA call sites don't change. See top-of-file comment in `src/kv_quant.zig` for the worked TurboQuant example (now shipped).
+
+### Hot prefix cache memory budget (`--prefix-cache-mem`)
+Wave 1.B — the hot prefix cache used to cap on entry count alone; with 4 KB-ctx entries on Gemma 4 E4B that's an 8 GB worst case. `--prefix-cache-mem N{KB,MB,GB}` (default 2 GB) caps resident KV bytes; `commit` evicts LRU entries until `current_kv_bytes + new_bytes <= budget`. `0`/`off` disables the byte cap (count cap still applies). Each `HotEntry` records its bytes at commit time (sum of `mlx_array_size × mlx_array_itemsize` across keys/values plus the scales/biases triples in quant mode). Log line: `[hot-cache] resident=X.XX / Y.YY MB (E entries)` on every commit / eviction.
+
 ### PLD on hybrid SSM (snapshot null-state guard)
 `SSMCacheEntry` has two slots (`conv_state`, `ssm_state`) populated by different layer types: LFM2's `gated_conv` writes only `conv_state` (sets `initialized=true`) and never touches `ssm_state`. `mlx_array_set` with null source aborts via mlx-c's default handler (`exit(-1)`). `ssmSnapshot`/`ssmRestore` and `PrefillCache` save/restore must check each field's `.ctx != null` independently — `initialized` alone insufficient. This was the previous "off on hybrid SSM" auto-disable; lifted once per-field guard landed.
 
@@ -296,3 +344,13 @@ mlx-c 0.6.0 added a `global_scale` param (may be null) to `mlx_dequantize` betwe
 - `""` stays `""` in JSON (not `null`); server treats both as empty
 - `Double` like `0.7` → `0.69999999999999996` — fine
 - `arguments` in tool_calls must be a JSON String (e.g., `"{\"command\":\"ls\"}"`), not nested dict; server checks `if (v == .string)`
+
+### Embedded engines (`lib/<engine>/`)
+
+DSV4-Flash is served by the embedded **ds4** engine (antirez/ds4), pinned at `lib/ds4/@613e9b2`. The Zig MLX path no longer carries a DSV4 forward — `model_type=deepseek_v4` on a `.safetensors` checkpoint returns `error.UnsupportedDsv4MlxFormat`; users load the GGUF artifact through ds4 instead.
+
+- C library API: `lib/ds4/ds4.h` (~200 lines, engine + session model).
+- FFI: `src/ds4_ffi.zig` (mechanical mirror of the header).
+- Bridge: `src/arch/ds4.zig` (`Ds4Engine` + `Ds4Session` — owns Metal-kernel extraction, tokenizer lookups, and the speculative-decode API).
+- Build: `build.zig` compiles `lib/ds4/ds4.c` + `lib/ds4/ds4_metal.m` and links Foundation/Metal. Metal kernel sources are embedded via `@embedFile` (`lib/ds4_metal_sources.zig`); at first launch we stage them under `~/.mlx-serve/ds4-metal/<binary-hash>/` and point ds4 at them via its `DS4_METAL_<NAME>_SOURCE` env-var overrides — zero patches to the submodule.
+- Convention: each new model-specific engine lives at `lib/<engine>/`, exposes a single-header C API, and gets a thin Zig wrapper at `src/arch/<engine>.zig`. See `CONTRIBUTING.md` for the embedding checklist.

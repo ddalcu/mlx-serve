@@ -20,6 +20,8 @@ private let supportedArchitectureTagPrefixes: [String] = [
 ]
 
 /// model_type values from config.json that the Zig server can load.
+/// MLX-format DeepSeek-V4 is intentionally NOT in this set — DSV4 is served
+/// by the embedded ds4 engine, which loads the GGUF checkpoint directly.
 let supportedModelTypes: Set<String> = [
     "gemma3", "gemma4", "gemma4_text",
     "qwen3", "qwen3_5", "qwen3_5_moe", "qwen3_5_moe_text", "qwen3_next",

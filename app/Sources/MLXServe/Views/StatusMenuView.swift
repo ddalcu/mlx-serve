@@ -149,6 +149,7 @@ struct StatusMenuView: View {
                             let pickable = appState.localModels.filter { $0.kind == .base }
                             let mlxServe = pickable.filter { $0.source == .mlxServe }
                             let lmStudio = pickable.filter { $0.source == .lmStudio }
+                            let custom = pickable.filter { $0.source == .custom }
                             if !mlxServe.isEmpty {
                                 Section("MLX-Serve Models") {
                                     ForEach(mlxServe) { model in
@@ -159,6 +160,13 @@ struct StatusMenuView: View {
                             if !lmStudio.isEmpty {
                                 Section("Other Discovered Models") {
                                     ForEach(lmStudio) { model in
+                                        Text(modelPickerLabel(model)).tag(model.path)
+                                    }
+                                }
+                            }
+                            if !custom.isEmpty {
+                                Section("Custom Folder") {
+                                    ForEach(custom) { model in
                                         Text(modelPickerLabel(model)).tag(model.path)
                                     }
                                 }

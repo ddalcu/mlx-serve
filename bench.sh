@@ -78,7 +78,7 @@ Options:
   -h, --help        This message
 
 Output: pipe-separated rows on stdout.
-  label|engine|model|spec|prompt|prefill_tps|decode_tps|prompt_toks|completion_toks|notes
+  label|engine|model|spec|prompt|prefill_tps|decode_tps|prompt_toks|completion_toks|hardware|notes
 
 Examples:
   bench.sh moe --engine all
@@ -275,7 +275,7 @@ The 2026 Antarctic Treaty conference reaffirmed the moratorium on commercial min
 }
 
 # ── Dispatch ──
-echo "label|engine|model|spec|prompt|prefill_tps|decode_tps|prompt_toks|completion_toks|notes"
+echo "label|engine|model|spec|prompt|prefill_tps|decode_tps|prompt_toks|completion_toks|hardware|notes"
 
 if [[ "$CORPUS" == "1" ]]; then
     run_corpus

@@ -1,19 +1,20 @@
 #!/bin/bash
-# bench_vs_lmstudio.sh — apples-to-apples MLX-serve vs LM Studio benchmark
-# matrix that produced the charts in docs/perf-vs-lmstudio*.png.
+# bench_vs_lmstudio_omlx.sh — apples-to-apples MLX-serve vs LM Studio vs oMLX
+# benchmark matrix that produces the charts in docs/perf-vs-lmstudio-omlx*.png.
 #
 # Two model families are shipped:
 #   --family gemma   Gemma 4 E2B (8bit), E4B (8bit), 31B (8bit), 26B-A4B-MoE
 #                    (4bit). Compares LM Studio (MLX baseline + GGUF where
-#                    available) vs MLX-serve {none, pld, drafter} where drafter
-#                    uses the matching gemma-4-*-it-assistant-bf16 checkpoint.
-#   --family qwen36  Qwen 3.6 27B, 35B-A3B. Both engines load the same
+#                    available), oMLX, and MLX-serve {none, pld, drafter} where
+#                    drafter uses the matching gemma-4-*-it-assistant-bf16
+#                    checkpoint.
+#   --family qwen36  Qwen 3.6 27B, 35B-A3B. All engines load the same
 #                    standard mlx-community 4-bit MLX checkpoints (not the
 #                    unsloth UD variants — UD weights are bigger on disk and
 #                    less representative of what most users actually run).
-#                    Compares LM Studio MLX vs MLX-serve {none, pld}, plus a
-#                    GGUF baseline on the LMS side. Qwen has no Gemma-4-style
-#                    drafter.
+#                    Compares LM Studio MLX, oMLX, and MLX-serve {none, pld},
+#                    plus a GGUF baseline on the LMS side. Qwen has no
+#                    Gemma-4-style drafter.
 #
 # Apples-to-apples controls (the same for every cell in a row):
 #   - Context size: 4096 (--ctx-size on MLX-serve, --context-length on LMS).
@@ -30,13 +31,18 @@
 #     a default thinking mode, so the workaround is a no-op there.
 #
 # Output:
-#   - CSV at $OUT (default docs/perf-vs-lmstudio-<family>.csv) with rows:
-#     label|engine|model|spec|prompt|prefill_tps|decode_tps|prompt_toks|completion_toks|notes
-#   - To generate the chart: python3 tests/plot_vs_lmstudio.py <csv> <png> [--family <family>]
+#   - CSV at $OUT (default docs/perf-vs-lmstudio-omlx-<family>.csv) with rows:
+#     label|engine|model|spec|prompt|prefill_tps|decode_tps|prompt_toks|completion_toks|hardware|notes
+#   - To generate the chart: python3 tests/plot_vs_lmstudio_omlx.py <csv> <png> [--family <family>]
 #
 # Requirements:
 #   - LM Studio CLI (`lms`) installed; models pre-downloaded for the chosen family.
-#   - mlx-serve binary built (default ./zig-out/bin/mlx-serve).
+#   - oMLX CLI (`omlx`) on PATH. If missing, omlx cells skip and the rest of
+#     the matrix still runs. The script auto-flips
+#     `auth.skip_api_key_verification: true` in `~/.omlx/settings.json` so the
+#     bench can hit oMLX without an Authorization header.
+#   - mlx-serve binary built (default ./zig-out/bin/mlx-serve, MUST be
+#     -Doptimize=ReleaseFast — Debug build is 2-4× slower).
 #   - jq, python3, curl on PATH.
 
 set -uo pipefail
@@ -51,6 +57,17 @@ PNG_OUT=""
 KEEP_CSV=""
 SERVER_PORT=11250
 LMS_PORT=1234
+# Read OMLX_PORT from ~/.omlx/settings.json if present; fall back to 11251.
+if [[ -f "$HOME/.omlx/settings.json" ]]; then
+    OMLX_PORT="$(python3 -c "import json,sys
+try:
+    print(json.load(open(sys.argv[1])).get('server',{}).get('port',11251))
+except Exception:
+    print(11251)" "$HOME/.omlx/settings.json" 2>/dev/null)"
+    OMLX_PORT="${OMLX_PORT:-11251}"
+else
+    OMLX_PORT=11251
+fi
 
 usage() {
     cat <<EOF
@@ -59,17 +76,17 @@ Usage: $0 --family <gemma|qwen36> [options]
 Options:
   --family NAME        Model family: 'gemma' or 'qwen36' (required)
   --out PATH           Chart PNG output path. Default is timestamped:
-                       docs/perf-vs-lmstudio-<family>-YYYYMMDD-HHMMSS.png
+                       docs/perf-vs-lmstudio-omlx-<family>-YYYYMMDD-HHMMSS.png
   --keep-csv PATH      Also retain the raw CSV at this path. By default the
                        CSV is written to a temp file and deleted on exit.
   --runs N             Repeats per cell (run 1 dropped as warmup; default: 2)
   --max-tokens N       Decode budget (default: 128)
-  --ctx-size N         Context size for both engines (default: 4096)
+  --ctx-size N         Context size across all engines (default: 4096)
   --binary PATH        mlx-serve binary (default: ./zig-out/bin/mlx-serve)
   -h, --help           This message
 
 Examples:
-  $0 --family gemma                # writes docs/perf-vs-lmstudio-gemma.png
+  $0 --family gemma                # writes docs/perf-vs-lmstudio-omlx-gemma-<ts>.png
   $0 --family qwen36 --runs 3      # Qwen 3.6 matrix with one extra repeat
 EOF
 }
@@ -100,7 +117,7 @@ cd "$REPO_ROOT"
 # each other (handy when sweeping over runs / comparing tweaks). Override
 # with --out PATH to pick an exact filename (e.g. one referenced by README).
 TS="$(date +%Y%m%d-%H%M%S)"
-[[ -z "$PNG_OUT" ]] && PNG_OUT="docs/perf-vs-lmstudio-${FAMILY}-${TS}.png"
+[[ -z "$PNG_OUT" ]] && PNG_OUT="docs/perf-vs-lmstudio-omlx-${FAMILY}-${TS}.png"
 
 # Raw CSV is an internal artifact of the run. Use a temp file unless the
 # caller explicitly asked for it via --keep-csv.
@@ -126,27 +143,30 @@ case "$FAMILY" in
             "gemma4-31b-4bit|$LMS_DIR/mlx-community/gemma-4-31b-it-4bit|gemma-4-31b-it@4bit|google/gemma-4-31b|$DM/gemma-4-31B-it-assistant-bf16"
             "gemma4-26b-a4b-moe-4bit|$MD/gemma-4-26b-a4b-it-4bit|gemma-4-26b-a4b-it|google/gemma-4-26b-a4b|$DM/gemma-4-26B-A4B-it-assistant-bf16"
         )
-        # Specs measured (per row): mlx-serve {none,pld,drafter} + lms_baseline + lms_alt (GGUF).
-        # Order matters: mlx-serve runs first while the machine is coolest, LMS
-        # runs last so any thermal throttling that builds up during the row
-        # falls on the comparison engine, not on us. lms_alt rows skip silently
-        # when the row has no GGUF key configured (31B, 26B-A4B currently).
-        SPECS=("mlx-serve::none" "mlx-serve::pld" "mlx-serve::drafter" "lmstudio:lms_baseline:none" "lmstudio:lms_alt:none")
+        # Specs measured (per row): mlx-serve {none,pld,drafter} + omlx baseline
+        # + lms_baseline + lms_alt (GGUF). Order matters: mlx-serve runs first
+        # while the machine is coolest, omlx in the middle (same MLX backend so
+        # it'd benefit from a fresh start too), LMS runs last so any thermal
+        # throttling that builds up during the row falls on the comparison
+        # engines, not on us. lms_alt rows skip silently when the row has no
+        # GGUF key configured (31B, 26B-A4B currently).
+        SPECS=("mlx-serve::none" "mlx-serve::pld" "mlx-serve::drafter" "omlx:base:none" "lmstudio:lms_baseline:none" "lmstudio:lms_alt:none")
         # Workaround needed? (assistant <think></think> prefill on LMS)
         LMS_THINKING_WORKAROUND=0
         ;;
     qwen36)
         LMS_DIR="$HOME/.lmstudio/models"
-        # Both engines load the same standard mlx-community 4-bit MLX weights
+        # All engines load the same standard mlx-community 4-bit MLX weights
         # (not the unsloth UD variants — those are bigger on disk and we want
         # the more representative production checkpoint here).
         TARGETS=(
             "qwen36-27b|$LMS_DIR/mlx-community/Qwen3.6-27B-4bit|mlx-community/qwen3.6-27b|qwen/qwen3.6-27b|"
             "qwen36-35b-a3b|$LMS_DIR/mlx-community/Qwen3.6-35B-A3B-4bit|qwen3.6-35b-a3b@4bit|qwen/qwen3.6-35b-a3b|"
         )
-        # Same ordering rule as gemma: mlx-serve first (cool machine),
-        # LMS specs last so thermal throttling penalises the comparison.
-        SPECS=("mlx-serve::none" "mlx-serve::pld" "lmstudio:lms_baseline:none" "lmstudio:lms_alt:none")
+        # Same ordering rule as gemma: mlx-serve first (cool machine), omlx
+        # in the middle, LMS specs last so thermal throttling penalises the
+        # comparison.
+        SPECS=("mlx-serve::none" "mlx-serve::pld" "omlx:base:none" "lmstudio:lms_baseline:none" "lmstudio:lms_alt:none")
         LMS_THINKING_WORKAROUND=1
         ;;
     *)
@@ -203,37 +223,65 @@ build_body_lms() {
     fi
 }
 
+# oMLX accepts a bare OpenAI-style body. We skip the LMS thinking workaround
+# entirely — oMLX honors `chat_template_kwargs.enable_thinking` natively where
+# the chat template supports it, and ignores it where it doesn't.
+build_body_omlx() {
+    local prompt="$1" model="$2" mt="$3"
+    jq -nc --arg p "$prompt" --arg model "$model" --argjson mt "$mt" \
+        '{model:$model, messages:[{role:"user",content:$p}], max_tokens:$mt, temperature:0.0, top_p:1.0, stream:false, chat_template_kwargs:{enable_thinking:false}}'
+}
+
 # ── HTTP helpers ──
 salted() { echo "[run-$1-$RANDOM] $2"; }
 
 send_one() {
     local engine="$1" body="$2"
-    local port=$([[ "$engine" == "lmstudio" ]] && echo "$LMS_PORT" || echo "$SERVER_PORT")
+    local port
+    case "$engine" in
+        lmstudio)  port="$LMS_PORT" ;;
+        omlx)      port="$OMLX_PORT" ;;
+        *)         port="$SERVER_PORT" ;;
+    esac
     local t0 t1 resp
     t0=$(python3 -c 'import time;print(int(time.time()*1000))')
     resp=$(curl -sf -m 240 -X POST "http://127.0.0.1:$port/v1/chat/completions" \
         -H "Content-Type: application/json" -d "$body")
     t1=$(python3 -c 'import time;print(int(time.time()*1000))')
     if [[ -z "$resp" ]]; then echo "ERR|0|0|0"; return; fi
-    python3 -c "
+    # Garbage-response guard: when an engine dies mid-stream (oMLX has been
+    # seen to do this on later cells) curl can return a non-empty but
+    # truncated body, which then crashes json.loads with an unhelpful
+    # traceback. Catch it, log the raw response head, and treat as ERR
+    # (the caller — run_cell — then retries the cell once).
+    local parsed
+    parsed=$(python3 -c "
 import json,sys
-r=json.loads(sys.argv[1])
+try:
+    r=json.loads(sys.argv[1])
+except Exception as e:
+    sys.stderr.write(f'  send_one: non-JSON response ({type(e).__name__}: {e}); head={sys.argv[1][:120]!r}\\n')
+    sys.exit(0)
 u=r.get('usage',{}) or {}
 ctd=u.get('completion_tokens_details',{}) or {}
 print(f\"{int(sys.argv[2])-int(sys.argv[3])}|{u.get('prompt_tokens',0)}|{u.get('completion_tokens',0)}|{ctd.get('reasoning_tokens',0)}\")
-" "$resp" "$t1" "$t0"
+" "$resp" "$t1" "$t0")
+    if [[ -z "$parsed" ]]; then echo "ERR|0|0|0"; return; fi
+    echo "$parsed"
 }
 
 bench_decode() {
     local engine="$1" model="$2" spec="$3" prompt="$4" mt="$5"
+    # oMLX routes requests by the basename of the model dir, not the full path.
+    local omlx_model_id; omlx_model_id="$(basename "$model")"
     local elapsed_csv="" last_pt=0 last_ct=0 leaked=0
     for i in $(seq 1 "$RUNS"); do
         local body
-        if [[ "$engine" == "mlx-serve" ]]; then
-            body=$(build_body_mlx "$(salted "$i" "$prompt")" "$spec" "$mt")
-        else
-            body=$(build_body_lms "$(salted "$i" "$prompt")" "$model" "$mt")
-        fi
+        case "$engine" in
+            mlx-serve) body=$(build_body_mlx  "$(salted "$i" "$prompt")" "$spec"  "$mt") ;;
+            omlx)      body=$(build_body_omlx "$(salted "$i" "$prompt")" "$omlx_model_id" "$mt") ;;
+            *)         body=$(build_body_lms  "$(salted "$i" "$prompt")" "$model" "$mt") ;;
+        esac
         IFS='|' read -r elapsed pt ct rt < <(send_one "$engine" "$body")
         last_pt="$pt"; last_ct="$ct"
         [[ "$rt" -gt 0 ]] && leaked=$((leaked + rt))
@@ -253,14 +301,15 @@ print(f'{tps:.1f}|$last_pt|$last_ct|$leaked')"
 
 bench_prefill() {
     local engine="$1" model="$2" spec="$3"
+    local omlx_model_id; omlx_model_id="$(basename "$model")"
     local elapsed_csv="" last_pt=0
     for i in $(seq 1 "$RUNS"); do
         local body
-        if [[ "$engine" == "mlx-serve" ]]; then
-            body=$(build_body_mlx "$(salted "$i" "$PREFILL_PROMPT")" "$spec" 1)
-        else
-            body=$(build_body_lms "$(salted "$i" "$PREFILL_PROMPT")" "$model" 1)
-        fi
+        case "$engine" in
+            mlx-serve) body=$(build_body_mlx  "$(salted "$i" "$PREFILL_PROMPT")" "$spec"  1) ;;
+            omlx)      body=$(build_body_omlx "$(salted "$i" "$PREFILL_PROMPT")" "$omlx_model_id" 1) ;;
+            *)         body=$(build_body_lms  "$(salted "$i" "$PREFILL_PROMPT")" "$model" 1) ;;
+        esac
         IFS='|' read -r elapsed pt ct rt < <(send_one "$engine" "$body")
         last_pt="$pt"
         if [[ "$i" -gt 1 && "$pt" -gt 0 ]]; then
@@ -278,9 +327,55 @@ print(f'{tps:.1f}|$last_pt')"
 }
 
 # ── Engine lifecycle ──
+# Disable oMLX's API-key requirement once at script start so the warmup +
+# bench curls can hit it without an Authorization header. The setting persists
+# in `~/.omlx/settings.json`; idempotent.
+prepare_omlx_settings() {
+    [[ -f "$HOME/.omlx/settings.json" ]] || return 0  # first run will create it
+    python3 - "$HOME/.omlx/settings.json" <<'PY'
+import json, sys
+p = sys.argv[1]
+with open(p) as f:
+    c = json.load(f)
+auth = c.setdefault("auth", {})
+if not auth.get("skip_api_key_verification"):
+    auth["skip_api_key_verification"] = True
+    with open(p, "w") as f:
+        json.dump(c, f, indent=2)
+PY
+}
+
+stop_all_engines() {
+    pkill -9 -x mlx-serve 2>/dev/null
+    # oMLX launches as `python3 -m omlx.cli serve …` — match by `omlx.cli`.
+    pkill -9 -f "omlx.cli" 2>/dev/null
+    # Belt-and-suspenders: clear known ports if anything survived.
+    for p in "$SERVER_PORT" "$OMLX_PORT"; do
+        local pids; pids="$(lsof -ti:"$p" 2>/dev/null)"
+        [[ -n "$pids" ]] && echo "$pids" | xargs -r kill -9 2>/dev/null
+    done
+    # Wait for both ports to actually free up — pkill returns before the kernel
+    # reaps the process, and a quick relaunch can race the old socket holding
+    # the port (which then causes the new engine to die on bind). Plus give the
+    # kernel time to reclaim the prior model's MLX buffers (5-20 GB) before the
+    # next engine allocates — when this is too short, oMLX in particular has
+    # been observed to die mid-prefill on the next cell.
+    local waited=0
+    while (( waited < 30 )); do
+        local busy=0
+        for p in "$SERVER_PORT" "$OMLX_PORT" "$LMS_PORT"; do
+            if lsof -ti:"$p" >/dev/null 2>&1; then busy=1; break; fi
+        done
+        (( busy == 0 )) && break
+        sleep 1; waited=$((waited+1))
+    done
+    sleep 5
+}
+
 start_engine() {
     local engine="$1" model_or_path="$2" spec="$3" drafter="$4"
-    pkill -9 -x mlx-serve 2>/dev/null; sleep 2
+    ENGINE_PID=""   # global the caller polls to detect mid-cell death
+    stop_all_engines
     case "$engine" in
         mlx-serve)
             local extra=""
@@ -293,6 +388,7 @@ start_engine() {
             "$BINARY" --model "$model_or_path" --serve --port "$SERVER_PORT" \
                 --ctx-size "$CTX" --log-level info $extra >/tmp/bench_vs_lms_engine.log 2>&1 &
             local pid=$!
+            ENGINE_PID="$pid"
             for i in $(seq 1 240); do
                 curl -sf "http://127.0.0.1:$SERVER_PORT/health" >/dev/null 2>&1 && return 0
                 sleep 0.5
@@ -321,14 +417,55 @@ start_engine() {
                 return 1
             fi
             ;;
+        omlx)
+            # oMLX serves a `--model-dir` (parent) and routes requests by
+            # subdir name (= basename of the model path). Same MLX-format
+            # weights as mlx-serve, no conversion needed.
+            local model_dir model_id
+            model_dir="$(dirname "$model_or_path")"
+            model_id="$(basename "$model_or_path")"
+            # shellcheck disable=SC2086
+            omlx serve --model-dir "$model_dir" --port "$OMLX_PORT" \
+                >/tmp/bench_vs_lms_omlx.log 2>&1 &
+            local pid=$!
+            ENGINE_PID="$pid"
+            for i in $(seq 1 240); do
+                curl -sf "http://127.0.0.1:$OMLX_PORT/v1/models" >/dev/null 2>&1 && break
+                sleep 0.5
+                kill -0 "$pid" 2>/dev/null || { echo "  omlx died (tail of /tmp/bench_vs_lms_omlx.log:)" >&2; tail -n 15 /tmp/bench_vs_lms_omlx.log >&2; return 1; }
+                [[ "$i" -eq 240 ]] && { echo "  omlx /v1/models never came up" >&2; return 1; }
+            done
+            # JIT-load warmup so the first timed request doesn't pay the
+            # model-load cost.
+            local warmup_body
+            warmup_body=$(jq -nc --arg model "$model_id" '{model:$model,messages:[{role:"user",content:"hi"}],max_tokens:1,stream:false}')
+            if ! curl -sf -m 600 -X POST "http://127.0.0.1:$OMLX_PORT/v1/chat/completions" \
+                -H "Content-Type: application/json" -d "$warmup_body" >/dev/null 2>&1; then
+                echo "  omlx warmup failed for $model_id (check /tmp/bench_vs_lms_omlx.log)" >&2
+                return 1
+            fi
+            ;;
     esac
 }
 
+# ── Hardware tag (Phase B) ──
+# Tag every row with the host's chip + RAM so CSVs from different Macs can be
+# merged/diffed without losing provenance.
+HARDWARE_TAG="$(sysctl -n machdep.cpu.brand_string 2>/dev/null || echo unknown)"
+HARDWARE_TAG="${HARDWARE_TAG// /-}"
+if [[ "$(uname)" == "Darwin" ]]; then
+    _ram_gb=$(($(sysctl -n hw.memsize 2>/dev/null || echo 0) / 1024 / 1024 / 1024))
+else
+    _ram_gb=$(awk '/MemTotal/ {printf "%d", $2/1024/1024}' /proc/meminfo 2>/dev/null || echo 0)
+fi
+HARDWARE_TAG="${HARDWARE_TAG}-${_ram_gb}gb"
+unset _ram_gb
+
 # ── Output emission ──
-echo "label|engine|model|spec|prompt|prefill_tps|decode_tps|prompt_toks|completion_toks|notes" > "$OUT"
+echo "label|engine|model|spec|prompt|prefill_tps|decode_tps|prompt_toks|completion_toks|hardware|notes" > "$OUT"
 emit() {
     local label="$1" engine="$2" model="$3" spec="$4" prompt_kind="$5" pf="$6" dc="$7" pt="$8" ct="$9" notes="${10}"
-    echo "${label}|${engine}|${model}|${spec}|${prompt_kind}|${pf}|${dc}|${pt}|${ct}|${notes}" | tee -a "$OUT"
+    echo "${label}|${engine}|${model}|${spec}|${prompt_kind}|${pf}|${dc}|${pt}|${ct}|${HARDWARE_TAG}|${notes}" | tee -a "$OUT"
 }
 
 run_cell() {
@@ -340,33 +477,66 @@ run_cell() {
         return
     fi
 
-    local out tps pt ct rt cell_notes
+    local out tps pt ct rt cell_notes retry_out prompt kind
+
+    # engine_alive: true unless we have a tracked PID and it's dead. LM Studio
+    # doesn't expose a PID we can watch (`lms server start` daemonizes), so we
+    # treat ENGINE_PID="" as "always alive" and skip the mid-cell retry on
+    # that path.
+    engine_alive() {
+        [[ -z "$ENGINE_PID" ]] && return 0
+        kill -0 "$ENGINE_PID" 2>/dev/null
+    }
+
+    # retry_if_bad: when the prior call returned 0 tps, retry once. If the
+    # tracked engine PID is dead (oMLX has been seen to die mid-prefill on
+    # later cells) we restart it first; otherwise we just re-send the body
+    # (covers transient curl/JSON hiccups, the LMS-without-PID case, and any
+    # engine that's alive but returned garbage). The retry is bounded to one
+    # round so a permanently-broken engine costs at most one extra request.
+    retry_if_bad() {
+        local kind="$1" tps_in="$2"; shift 2  # remaining: bench fn args
+        if [[ "$tps_in" != "0" ]]; then echo ""; return; fi
+        if ! engine_alive; then
+            echo "  $engine died mid-cell ($kind) — restarting and retrying once" >&2
+            if ! start_engine "$engine" "$model_or_path" "$spec" "$drafter"; then
+                echo "  retry: start_engine failed; giving up on $label" >&2
+                return
+            fi
+        else
+            echo "  $engine returned 0 tps ($kind) — retrying once" >&2
+        fi
+        if [[ "$kind" == "prefill" ]]; then
+            bench_prefill "$engine" "$model_or_path" "$spec"
+        else
+            bench_decode  "$engine" "$model_or_path" "$spec" "$1" "$2"
+        fi
+    }
 
     out=$(bench_prefill "$engine" "$model_or_path" "$spec")
     IFS='|' read -r tps pt <<<"$out"
+    retry_out=$(retry_if_bad "prefill" "$tps")
+    [[ -n "$retry_out" ]] && { out="$retry_out"; IFS='|' read -r tps pt <<<"$out"; }
     emit "$label" "$engine" "$model_or_path" "$spec" "prefill" "$tps" "0" "$pt" "1" "$notes"
 
-    out=$(bench_decode "$engine" "$model_or_path" "$spec" "$DECODE_PROMPT" "$MAX_TOKENS")
-    IFS='|' read -r tps pt ct rt <<<"$out"
-    cell_notes="$notes"
-    [[ "$rt" -gt 0 ]] && cell_notes="${cell_notes:+$cell_notes,}thinking_leaked=$rt"
-    emit "$label" "$engine" "$model_or_path" "$spec" "decode" "0" "$tps" "$pt" "$ct" "$cell_notes"
-
-    out=$(bench_decode "$engine" "$model_or_path" "$spec" "$ECHO_PROMPT" "$MAX_TOKENS")
-    IFS='|' read -r tps pt ct rt <<<"$out"
-    cell_notes="$notes"
-    [[ "$rt" -gt 0 ]] && cell_notes="${cell_notes:+$cell_notes,}thinking_leaked=$rt"
-    emit "$label" "$engine" "$model_or_path" "$spec" "echo" "0" "$tps" "$pt" "$ct" "$cell_notes"
-
-    out=$(bench_decode "$engine" "$model_or_path" "$spec" "$CODE_PROMPT" "$MAX_TOKENS")
-    IFS='|' read -r tps pt ct rt <<<"$out"
-    cell_notes="$notes"
-    [[ "$rt" -gt 0 ]] && cell_notes="${cell_notes:+$cell_notes,}thinking_leaked=$rt"
-    emit "$label" "$engine" "$model_or_path" "$spec" "code" "0" "$tps" "$pt" "$ct" "$cell_notes"
+    for kind in decode echo code; do
+        case "$kind" in
+            decode) prompt="$DECODE_PROMPT" ;;
+            echo)   prompt="$ECHO_PROMPT" ;;
+            code)   prompt="$CODE_PROMPT" ;;
+        esac
+        out=$(bench_decode "$engine" "$model_or_path" "$spec" "$prompt" "$MAX_TOKENS")
+        IFS='|' read -r tps pt ct rt <<<"$out"
+        retry_out=$(retry_if_bad "$kind" "$tps" "$prompt" "$MAX_TOKENS")
+        [[ -n "$retry_out" ]] && { out="$retry_out"; IFS='|' read -r tps pt ct rt <<<"$out"; }
+        cell_notes="$notes"
+        [[ "$rt" -gt 0 ]] && cell_notes="${cell_notes:+$cell_notes,}thinking_leaked=$rt"
+        emit "$label" "$engine" "$model_or_path" "$spec" "$kind" "0" "$tps" "$pt" "$ct" "$cell_notes"
+    done
 }
 
 cleanup() {
-    pkill -9 -x mlx-serve 2>/dev/null
+    stop_all_engines
     lms unload --all >/dev/null 2>&1 || true
     # Remove the temp CSV unless the caller asked to keep it.
     if [[ -z "$KEEP_CSV" && -n "$OUT" && -f "$OUT" ]]; then
@@ -374,6 +544,16 @@ cleanup() {
     fi
 }
 trap cleanup EXIT INT TERM
+
+# Pre-flight: oMLX availability + auth-disable. Missing `omlx` doesn't abort
+# the run — the omlx cells just skip.
+HAS_OMLX=0
+if command -v omlx >/dev/null 2>&1; then
+    HAS_OMLX=1
+    prepare_omlx_settings
+else
+    echo "(omlx not on PATH — omlx cells will be skipped)" >&2
+fi
 
 for row in "${TARGETS[@]}"; do
     IFS='|' read -r logical mlxserve_path lms_baseline lms_alt drafter <<<"$row"
@@ -389,6 +569,10 @@ for row in "${TARGETS[@]}"; do
                 [[ -z "$lms_alt" ]] && continue
                 run_cell "${logical}/lmstudio-alt/${spec}"       "lmstudio"  "$lms_alt"       "$spec" "" ""
                 ;;
+            "omlx|base")
+                [[ "$HAS_OMLX" -eq 1 ]] || { echo "  SKIP ${logical}/omlx/${spec} (omlx not on PATH)" >&2; continue; }
+                run_cell "${logical}/omlx/${spec}"               "omlx"      "$mlxserve_path" "$spec" "" ""
+                ;;
             "mlx-serve|"|"mlx-serve|*")
                 # Skip drafter cell when no drafter dir is present (Qwen).
                 if [[ "$spec" == "drafter" && ( -z "$drafter" || ! -d "$drafter" ) ]]; then
@@ -400,12 +584,12 @@ for row in "${TARGETS[@]}"; do
     done
 done
 
-pkill -9 -x mlx-serve 2>/dev/null
+stop_all_engines
 lms unload --all >/dev/null 2>&1 || true
 
 # Render the chart (only artifact most users want).
 mkdir -p "$(dirname "$PNG_OUT")"
-python3 "$SCRIPT_DIR/plot_vs_lmstudio.py" "$OUT" "$PNG_OUT" --family "$FAMILY"
+python3 "$SCRIPT_DIR/plot_vs_lmstudio_omlx.py" "$OUT" "$PNG_OUT" --family "$FAMILY"
 
 # Optionally retain the raw CSV; otherwise it's a tempfile and gets cleaned
 # up by the EXIT trap below.

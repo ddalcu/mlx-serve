@@ -1,0 +1,898 @@
+//! Plan 05 — multi-model registry. Owns the discovery list and a set of
+//! `LoadedModel` entries (loaded + unloaded). Provides refcounted access via
+//! `ensureLoaded`/`release` so the per-request handler in `server.zig` can
+//! route to the right model without globals, and so the inference thread
+//! can swap which model's weights are "current" between scheduler ticks.
+//!
+//! Phase A scope: skeleton — types, bookkeeping (refcount, LRU clock,
+//! summed-bytes accounting), snapshot for `/v1/models`. `ensureLoaded`
+//! accepts already-`.ready` entries and waits on `.loading` ones; the
+//! cold-load posting path that promotes `.unloaded` → `.loading` → `.ready`
+//! lives in Phase D where the scheduler hook lands. Test helpers exercise
+//! the bookkeeping without touching mlx.
+//!
+//! Threading model: connection threads call `ensureLoaded`/`release`. The
+//! inference thread (Phase D) sees `.loading` work items via the same
+//! `vision_queue`/`embed_queue`-shaped channel; cold-load completion
+//! broadcasts on `state_cond` so blocked callers wake.
+
+const std = @import("std");
+const model_mod = @import("model.zig");
+const transformer_mod = @import("transformer.zig");
+const tokenizer_mod = @import("tokenizer.zig");
+const chat_mod = @import("chat.zig");
+const vision_mod = @import("vision.zig");
+const drafter_mod = @import("drafter.zig");
+const prefix_cache_mod = @import("prefix_cache.zig");
+const model_discovery = @import("model_discovery.zig");
+const arch_ds4 = @import("arch/ds4.zig");
+const log = @import("log.zig");
+
+const Transformer = transformer_mod.Transformer;
+const Weights = model_mod.Weights;
+const ModelConfig = model_mod.ModelConfig;
+const Tokenizer = tokenizer_mod.Tokenizer;
+const ChatConfig = chat_mod.ChatConfig;
+const VisionEncoder = vision_mod.VisionEncoder;
+const DrafterModel = drafter_mod.DrafterModel;
+const HotPrefixCache = prefix_cache_mod.HotPrefixCache;
+
+/// Lifecycle of an entry. State transitions are guarded by `ModelRegistry.mutex`;
+/// the inference thread writes, connection threads read under the same lock and
+/// wait on `state_cond` for transitions.
+pub const LoadState = enum {
+    /// Discovered but never loaded — no GPU memory committed. ensureLoaded
+    /// promotes to `.loading` (Phase D).
+    unloaded,
+    /// Inference thread is faulting weights / building the Transformer.
+    /// ensureLoaded callers block on `state_cond`.
+    loading,
+    /// Live in GPU memory. Refcounted; safe to use for inference.
+    ready,
+    /// Load failed. `error_name` is populated; ensureLoaded returns
+    /// `error.LoadFailed` until the entry resets.
+    error_state,
+    /// LRU eviction in progress. Refcount must be 0 before the inference
+    /// thread enters this state.
+    evicting,
+};
+
+/// One discovered + possibly-loaded model. The mlx-allocating fields
+/// (weights/transformer/vision_encoder/drafter) are optional so a stub
+/// entry can exist for `unloaded`/`error_state`/`loading` without faking
+/// half-built mlx state.
+pub const LoadedModel = struct {
+    allocator: std.mem.Allocator,
+
+    /// Identifier exposed via `/v1/models` and the request `model` field.
+    /// Allocator-owned dupe of the discovery id (path basename, e.g.
+    /// "gemma-4-e4b-it-4bit"). Also used as the StringHashMap key — the map
+    /// stores this slice directly, so it must outlive the entry's presence
+    /// in `ModelRegistry.entries`.
+    id: []const u8,
+    /// Full absolute path on disk. Allocator-owned dupe.
+    path: []const u8,
+    /// Approximate weight bytes on disk (sum of *.safetensors). Used for
+    /// pre-load eviction estimates so we don't oversubscribe wired memory.
+    bytes_on_disk: ?u64,
+
+    // ── Mlx-allocating state. Non-null iff state == .ready (or transitioning
+    //    out of .ready via eviction). Owned by this entry; freed in deinit.
+
+    /// Parsed `config.json`. Heap-allocated pointer so the address is stable
+    /// across LoadedModel relocations (the registry stores `*LoadedModel`
+    /// so the LoadedModel itself never moves, but downstream consumers
+    /// borrow `*const ModelConfig` and we want one consistent ownership
+    /// pattern across config/tokenizer/chat_config).
+    config: ?*ModelConfig,
+    weights: ?*Weights,
+    transformer: ?*Transformer,
+    /// Per-model tokenizer (different vocabularies across models). Phase 05
+    /// moves ownership here from main.zig so the tokenizer's lifetime
+    /// matches the model's residency.
+    tokenizer: ?*Tokenizer,
+    /// Per-model chat config — chat templates and EOS-token strings vary
+    /// across model families.
+    chat_config: ?*ChatConfig,
+    vision_encoder: ?*VisionEncoder,
+    drafter: ?*DrafterModel,
+    /// Echoed in `/v1/models` so the Swift app can show the drafter checkpoint
+    /// path; empty when no drafter is loaded. Allocator-owned dupe.
+    drafter_path: []const u8,
+    drafter_block_size: u32,
+    /// Per-model hot prefix cache — plan 05 drops the module-global hot
+    /// cache. `model_id`-keyed isolation falls out of "one cache per
+    /// LoadedModel" by construction.
+    prefix_cache: ?HotPrefixCache,
+
+    /// Embedded ds4 engine (DeepSeek-V4-Flash via GGUF). When non-null,
+    /// `transformer` / `weights` / `tokenizer` / `chat_config` stay null and
+    /// the request handlers route through `Ds4Engine` / `Ds4Session` instead
+    /// of the MLX path. Mutually exclusive with the safetensors fields.
+    ds4_engine: ?*arch_ds4.Ds4Engine = null,
+
+    // ── Bookkeeping. Updated under `ModelRegistry.mutex`. ──
+
+    /// Number of in-flight callers holding a borrowed pointer. Incremented
+    /// by `ensureLoaded`, decremented by `release`. Eviction is blocked
+    /// while refcount > 0. Atomic so the inference thread can observe it
+    /// without re-acquiring the registry mutex inside a tick.
+    refcount: std.atomic.Value(u32),
+    /// Monotonic clock — bumped on every `release`. Higher = more recent.
+    /// LRU eviction picks the lowest among `.ready` entries with
+    /// refcount == 0.
+    last_used_ns: i64,
+    /// Resident GPU bytes for this entry (weights + vision + drafter),
+    /// summed at load time. Zero for non-`.ready` entries.
+    bytes_resident: u64,
+    state: LoadState,
+    /// Allocator-owned error name when state == .error_state. Echoed in
+    /// the `/v1/models` snapshot so clients can see why a load failed
+    /// (e.g. "LoadFailed", "MissingVisionWeights"). Null otherwise.
+    error_name: ?[]const u8,
+
+    /// Free all owned state. Safe to call regardless of `state` — null
+    /// model fields are skipped. Mlx-allocating fields are freed in
+    /// drafter → vision → transformer → weights order to mirror the
+    /// dependency chain in `Scheduler.deinit`. Note: mlx-allocating frees
+    /// must run on the scheduler's inference thread (thread-local GPU
+    /// stream); the caller arranges this via `unloadResident` invoked
+    /// from the inference thread before registry teardown.
+    pub fn deinit(self: *LoadedModel) void {
+        if (self.ds4_engine) |engine| {
+            engine.close();
+            self.ds4_engine = null;
+        }
+        if (self.drafter) |d| {
+            d.deinit();
+            self.allocator.destroy(d);
+            self.drafter = null;
+        }
+        if (self.vision_encoder) |v| {
+            v.deinit();
+            self.allocator.destroy(v);
+            self.vision_encoder = null;
+        }
+        if (self.transformer) |x| {
+            x.deinit();
+            self.allocator.destroy(x);
+            self.transformer = null;
+        }
+        if (self.weights) |w| {
+            w.deinit();
+            self.allocator.destroy(w);
+            self.weights = null;
+        }
+        if (self.tokenizer) |tok| {
+            tok.deinit();
+            self.allocator.destroy(tok);
+            self.tokenizer = null;
+        }
+        if (self.chat_config) |cc| {
+            cc.deinit();
+            self.allocator.destroy(cc);
+            self.chat_config = null;
+        }
+        if (self.config) |c| {
+            // ModelConfig has no allocator-owned fields (all by-value, plus
+            // borrowed-static `model_type`/`weight_prefix`) so a plain
+            // destroy suffices.
+            self.allocator.destroy(c);
+            self.config = null;
+        }
+        if (self.prefix_cache) |*hc| {
+            hc.deinit();
+            self.prefix_cache = null;
+        }
+        if (self.error_name) |n| self.allocator.free(n);
+        if (self.drafter_path.len > 0) self.allocator.free(self.drafter_path);
+        self.allocator.free(self.id);
+        self.allocator.free(self.path);
+    }
+
+    /// Free only the mlx-allocating state (weights/transformer/vision/
+    /// drafter/prefix_cache), leaving CPU-only fields (config/tokenizer/
+    /// chat_config) AND the discovery stub (id/path/bytes_on_disk) intact.
+    /// Used by eviction so the registry keeps the entry around as
+    /// `.unloaded` for later listing/reload, AND by `Scheduler.deinit` so
+    /// mlx frees happen on the inference thread.
+    pub fn unloadResident(self: *LoadedModel) void {
+        if (self.ds4_engine) |engine| {
+            engine.close();
+            self.ds4_engine = null;
+        }
+        if (self.drafter) |d| {
+            d.deinit();
+            self.allocator.destroy(d);
+            self.drafter = null;
+        }
+        if (self.vision_encoder) |v| {
+            v.deinit();
+            self.allocator.destroy(v);
+            self.vision_encoder = null;
+        }
+        if (self.transformer) |x| {
+            x.deinit();
+            self.allocator.destroy(x);
+            self.transformer = null;
+        }
+        if (self.weights) |w| {
+            w.deinit();
+            self.allocator.destroy(w);
+            self.weights = null;
+        }
+        if (self.prefix_cache) |*hc| {
+            hc.deinit();
+            self.prefix_cache = null;
+        }
+        if (self.drafter_path.len > 0) {
+            self.allocator.free(self.drafter_path);
+            self.drafter_path = "";
+        }
+        self.drafter_block_size = 0;
+        self.bytes_resident = 0;
+        self.state = .unloaded;
+    }
+};
+
+/// Snapshot of a single entry, returned by `ModelRegistry.snapshot` for
+/// the `/v1/models` JSON listing. All slices are borrowed from the
+/// underlying entry — caller must finish reading before the snapshot slice
+/// is freed (registry mutex protects entry lifetime; snapshot is taken
+/// under the lock so the data won't disappear under the caller).
+pub const ModelStatus = struct {
+    id: []const u8,
+    loaded: bool,
+    bytes_resident: u64,
+    bytes_on_disk: ?u64,
+    last_used_ns: i64,
+    state: []const u8,
+    error_name: ?[]const u8,
+
+    pub fn stateName(s: LoadState) []const u8 {
+        return switch (s) {
+            .unloaded => "unloaded",
+            .loading => "loading",
+            .ready => "ready",
+            .error_state => "error",
+            .evicting => "evicting",
+        };
+    }
+};
+
+/// Registry of all discovered + loaded models. One instance per server.
+///
+/// Lifecycle:
+///   1. `init` is called from `serve()`, given an owned `DiscoveryResult`
+///      (or null for the legacy single-model case). Pre-populates `.unloaded`
+///      stubs for every discovered id so `/v1/models` and `ensureLoaded`
+///      can address them by name from t0.
+///   2. `serve()` chooses a default model (from `--model` or the first
+///      discovered) and (Phase B) hands its load spec to the scheduler.
+///      On success the entry transitions `.unloaded` → `.loading` → `.ready`.
+///   3. Per-request handlers (Phase C) call `ensureLoaded(scheduler, id)`
+///      and `release`. The borrowed `*LoadedModel` is valid until `release`.
+///   4. `deinit` tears down every entry; the discovery result is freed.
+pub const ModelRegistry = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+
+    /// Owned discovery (or null when `--model-dir` wasn't passed and the
+    /// server was started with just `--model`). When null, `entries` still
+    /// holds one synthetic entry for the loaded model so the rest of the
+    /// API works uniformly.
+    discovery: ?model_discovery.DiscoveryResult,
+
+    /// Map of id → entry. Keys are borrowed from `LoadedModel.id`; entries
+    /// are heap-allocated and owned by the registry. Iteration order isn't
+    /// guaranteed; snapshot sorts by `last_used_ns` desc for stable output.
+    entries: std.StringHashMap(*LoadedModel),
+
+    /// Default model id used when a request doesn't specify `model` (or
+    /// specifies the literal "mlx-serve"). Borrowed from the corresponding
+    /// entry's `id`; valid for the registry's lifetime.
+    default_id: []const u8,
+
+    /// Cap on `.ready` entries. ensureLoaded evicts before exceeding.
+    max_resident_models: u32,
+    /// Cap on summed bytes_resident across `.ready` entries.
+    /// 0 disables the byte cap (count cap still applies).
+    max_resident_mem: u64,
+    /// When non-null, the inference thread's idle tick (Phase D) evicts
+    /// `.ready` entries with refcount == 0 that haven't been touched
+    /// within this window.
+    idle_evict_secs: ?u32,
+
+    mutex: std.Io.Mutex,
+    /// Broadcast whenever an entry's `state` changes. Connection threads
+    /// blocked in `ensureLoaded` (on a `.loading`/`.evicting` entry) wake
+    /// here. The mutex is the predicate; the cond-var is the wake signal.
+    state_cond: std.Io.Condition,
+
+    /// Running sum of `bytes_resident` across `.ready` entries. Updated
+    /// under `mutex` on every state transition.
+    current_resident_bytes: u64,
+    /// Monotonic counter feeding `LoadedModel.last_used_ns`. We avoid
+    /// reading the wall clock under the mutex; ordering is all the LRU
+    /// pick needs.
+    lru_clock: i64,
+
+    /// Create the registry. Takes ownership of `discovery` (if non-null)
+    /// and pre-populates entries from it.
+    ///
+    /// Caller responsibilities:
+    ///   * Choose `default_id` so it matches either a discovered model id
+    ///     or a freshly-registered synthetic entry (`registerEntry`).
+    ///   * Call `registerEntry` for the loaded `--model` *before* using the
+    ///     registry if it wasn't already in `discovery`.
+    pub fn init(
+        allocator: std.mem.Allocator,
+        io: std.Io,
+        discovery: ?model_discovery.DiscoveryResult,
+        max_resident_models: u32,
+        max_resident_mem: u64,
+        idle_evict_secs: ?u32,
+    ) !*ModelRegistry {
+        const self = try allocator.create(ModelRegistry);
+        errdefer allocator.destroy(self);
+        self.* = .{
+            .allocator = allocator,
+            .io = io,
+            .discovery = discovery,
+            .entries = std.StringHashMap(*LoadedModel).init(allocator),
+            .default_id = "",
+            .max_resident_models = if (max_resident_models == 0) 1 else max_resident_models,
+            .max_resident_mem = max_resident_mem,
+            .idle_evict_secs = idle_evict_secs,
+            .mutex = .init,
+            .state_cond = .init,
+            .current_resident_bytes = 0,
+            .lru_clock = 0,
+        };
+
+        // Pre-populate `.unloaded` stubs for every discovered model. The
+        // scheduler's load path (Phase B/D) will promote one of these to
+        // `.ready` during startup, and `ensureLoaded` may promote others
+        // on-demand. Allocation failures here roll back any partial
+        // entries via errdefer so we don't leak strings on OOM.
+        if (discovery) |d| {
+            errdefer self.deinitInternal();
+            for (d.models) |m| {
+                _ = try self.registerStub(m.id, m.path, m.bytes_on_disk);
+            }
+        }
+
+        return self;
+    }
+
+    /// Frees everything the registry owns. Safe regardless of `state` on
+    /// each entry. Called once at server shutdown after the scheduler has
+    /// joined (so the inference thread isn't mid-load).
+    pub fn deinit(self: *ModelRegistry) void {
+        self.deinitInternal();
+        self.allocator.destroy(self);
+    }
+
+    fn deinitInternal(self: *ModelRegistry) void {
+        var it = self.entries.valueIterator();
+        while (it.next()) |entry_ptr| {
+            const entry = entry_ptr.*;
+            entry.deinit();
+            self.allocator.destroy(entry);
+        }
+        self.entries.deinit();
+        if (self.discovery) |*d| d.deinit();
+    }
+
+    /// Insert an `.unloaded` stub for a model. Returns the heap-allocated
+    /// entry; ownership stays with the registry. id and path are duped so
+    /// caller buffers can be transient.
+    ///
+    /// Used by `init` for discovery and by `serve()` to register the
+    /// loaded `--model` when it wasn't in `--model-dir`.
+    pub fn registerStub(self: *ModelRegistry, id: []const u8, path: []const u8, bytes_on_disk: ?u64) !*LoadedModel {
+        if (self.entries.get(id) != null) return error.DuplicateId;
+
+        const stub = try self.allocator.create(LoadedModel);
+        errdefer self.allocator.destroy(stub);
+        const id_owned = try self.allocator.dupe(u8, id);
+        errdefer self.allocator.free(id_owned);
+        const path_owned = try self.allocator.dupe(u8, path);
+        errdefer self.allocator.free(path_owned);
+
+        stub.* = .{
+            .allocator = self.allocator,
+            .id = id_owned,
+            .path = path_owned,
+            .bytes_on_disk = bytes_on_disk,
+            .config = null,
+            .weights = null,
+            .transformer = null,
+            .tokenizer = null,
+            .chat_config = null,
+            .vision_encoder = null,
+            .drafter = null,
+            .drafter_path = "",
+            .drafter_block_size = 0,
+            .prefix_cache = null,
+            .ds4_engine = null,
+            .refcount = std.atomic.Value(u32).init(0),
+            .last_used_ns = 0,
+            .bytes_resident = 0,
+            .state = .unloaded,
+            .error_name = null,
+        };
+
+        // putNoClobber so we surface a stronger error than overwrite — the
+        // earlier `entries.get` guard makes this defensive.
+        try self.entries.putNoClobber(stub.id, stub);
+        return stub;
+    }
+
+    /// Set the default model id used for requests that omit `model` or
+    /// pass the literal "mlx-serve". The id must already exist (via
+    /// `registerStub`); caller borrows the entry's own `id` slice so the
+    /// pointer is stable for the registry's lifetime.
+    pub fn setDefault(self: *ModelRegistry, id: []const u8) !void {
+        const entry = self.entries.get(id) orelse return error.UnknownModelId;
+        self.default_id = entry.id;
+    }
+
+    /// Look up an entry by id without taking a refcount. Returns null if
+    /// the id is unknown. Callers that intend to use the entry for
+    /// inference MUST go through `ensureLoaded` instead — this is for read-
+    /// only paths (e.g. `/v1/models` listing, log lines).
+    pub fn peek(self: *ModelRegistry, id: []const u8) ?*LoadedModel {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        return self.entries.get(id);
+    }
+
+    /// Resolve `id_or_empty` ("" or "mlx-serve" → default) to the entry.
+    /// Pure ID resolution; does not touch state or refcounts. Returns
+    /// `error.UnknownModelId` if the id isn't registered or
+    /// `error.NoDefaultModel` if `id_or_empty` is empty AND no default is
+    /// set. The returned pointer is borrowed; valid for the registry's
+    /// lifetime.
+    pub fn resolveEntry(self: *ModelRegistry, id_or_empty: []const u8) !*LoadedModel {
+        const id = if (id_or_empty.len == 0 or std.mem.eql(u8, id_or_empty, "mlx-serve"))
+            self.default_id
+        else
+            id_or_empty;
+        if (id.len == 0) return error.NoDefaultModel;
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        return self.entries.get(id) orelse error.UnknownModelId;
+    }
+
+    /// Resolve `id` (or the default when `id` is null/empty/"mlx-serve")
+    /// to a refcounted `*LoadedModel`. Phase A skeleton: succeeds only on
+    /// already-`.ready` entries and waits out `.loading`/`.evicting`
+    /// transitions; returns `error.NotLoaded` for `.unloaded` and
+    /// `error.LoadFailed` for `.error_state`. Phase D's cold-load path
+    /// lives on `Scheduler.ensureLoaded` (which calls into this fast-path
+    /// first; on `error.NotLoaded` it triggers a load on the inference
+    /// thread and re-enters here when the entry transitions to `.ready`).
+    ///
+    /// Caller MUST call `release(lm)` once done with the returned pointer.
+    pub fn ensureLoaded(self: *ModelRegistry, id_or_empty: []const u8) !*LoadedModel {
+        const id = if (id_or_empty.len == 0 or std.mem.eql(u8, id_or_empty, "mlx-serve"))
+            self.default_id
+        else
+            id_or_empty;
+
+        if (id.len == 0) return error.NoDefaultModel;
+
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+
+        const entry = self.entries.get(id) orelse return error.UnknownModelId;
+
+        while (true) {
+            switch (entry.state) {
+                .ready => {
+                    _ = entry.refcount.fetchAdd(1, .acq_rel);
+                    return entry;
+                },
+                .loading, .evicting => {
+                    self.state_cond.waitUncancelable(self.io, &self.mutex);
+                    continue;
+                },
+                .error_state => return error.LoadFailed,
+                .unloaded => return error.NotLoaded,
+            }
+        }
+    }
+
+    /// Phase D: claim the right to perform a cold load for `entry`. Caller
+    /// MUST already hold `mutex`. Transitions `.unloaded` → `.loading` and
+    /// broadcasts so any other ensureLoaded callers join the wait. Returns
+    /// false if the entry isn't in `.unloaded` state (someone else is
+    /// already loading it, or it's already ready/error). On false, the
+    /// caller should re-check state and wait or fast-path.
+    pub fn tryBeginLoadLocked(self: *ModelRegistry, entry: *LoadedModel) bool {
+        if (entry.state != .unloaded) return false;
+        entry.state = .loading;
+        self.state_cond.broadcast(self.io);
+        return true;
+    }
+
+    /// Phase D: roll back a failed load attempt back to `.unloaded` so a
+    /// later request can retry. Caller holds `mutex`. The entry's resident
+    /// fields should already be cleaned up (or never installed) before
+    /// calling.
+    pub fn markUnloadedLocked(self: *ModelRegistry, entry: *LoadedModel) void {
+        entry.state = .unloaded;
+        entry.bytes_resident = 0;
+        if (entry.error_name) |old| self.allocator.free(old);
+        entry.error_name = null;
+        self.state_cond.broadcast(self.io);
+    }
+
+    /// Phase D: begin evicting `entry`. Caller holds `mutex`. Subsequent
+    /// ensureLoaded callers wait on `.evicting`. Returns immediately;
+    /// caller MUST call `waitForRefcountZeroLocked` to drain readers
+    /// before freeing GPU memory.
+    pub fn markEvictingLocked(self: *ModelRegistry, entry: *LoadedModel) void {
+        std.debug.assert(entry.state == .ready);
+        entry.state = .evicting;
+        self.state_cond.broadcast(self.io);
+    }
+
+    /// Phase D: block until `entry.refcount == 0`. Caller holds `mutex`.
+    /// Wakes when any `release` lands on a zero refcount.
+    pub fn waitForRefcountZeroLocked(self: *ModelRegistry, entry: *LoadedModel) void {
+        while (entry.refcount.load(.acquire) != 0) {
+            self.state_cond.waitUncancelable(self.io, &self.mutex);
+        }
+    }
+
+    /// Phase D: finalize an eviction after `unloadResident()` has been
+    /// called on the inference thread. Caller holds `mutex`. Updates the
+    /// summed-bytes accounting and flips state to `.unloaded`.
+    pub fn finalizeEvictionLocked(self: *ModelRegistry, entry: *LoadedModel) void {
+        // bytes_resident was zeroed by unloadResident already; we still
+        // subtract its previous accounting here. Because we already
+        // synced `current_resident_bytes` at markReady time, just clear.
+        // Defensive: cap subtraction at zero in case of double-call.
+        // (unloadResident sets bytes_resident=0 itself, so we tracked the
+        // pre-eviction value externally — pass-through here is a no-op.)
+        entry.state = .unloaded;
+        entry.error_name = null;
+        self.state_cond.broadcast(self.io);
+    }
+
+    /// Phase D: count of currently-loaded (`.ready` or `.evicting`) entries.
+    /// Caller holds `mutex`. Used by the cap-check before starting a load.
+    pub fn countLoadedLocked(self: *const ModelRegistry) u32 {
+        var n: u32 = 0;
+        var it = self.entries.valueIterator();
+        while (@constCast(&it).next()) |entry_ptr| {
+            const entry = entry_ptr.*;
+            if (entry.state == .ready or entry.state == .evicting) n += 1;
+        }
+        return n;
+    }
+
+    /// Phase D: subtract `bytes` from the resident accounting. Caller holds
+    /// `mutex`. Used after `unloadResident()` to keep `current_resident_bytes`
+    /// in sync with the actual GPU footprint.
+    pub fn accountEvictedLocked(self: *ModelRegistry, bytes: u64) void {
+        if (self.current_resident_bytes >= bytes) {
+            self.current_resident_bytes -= bytes;
+        } else {
+            self.current_resident_bytes = 0;
+        }
+    }
+
+    /// Release a borrowed pointer obtained from `ensureLoaded`. Decrements
+    /// the refcount and bumps `last_used_ns` so LRU picks an older entry
+    /// over this one next. Wakes anyone waiting on eviction.
+    pub fn release(self: *ModelRegistry, lm: *LoadedModel) void {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        self.lru_clock += 1;
+        lm.last_used_ns = self.lru_clock;
+        const prev = lm.refcount.fetchSub(1, .acq_rel);
+        std.debug.assert(prev > 0);
+        // Broadcast so an evictor waiting for refcount == 0 wakes.
+        if (prev == 1) self.state_cond.broadcast(self.io);
+    }
+
+    /// Pick the least-recently-used `.ready` entry whose refcount is 0,
+    /// excluding `exclude_id` (typically the entry the caller is about to
+    /// load — never evict ourselves). Returns null if no evictable entry
+    /// exists. Caller holds `mutex`.
+    pub fn pickLruEvictable(self: *ModelRegistry, exclude_id: []const u8) ?*LoadedModel {
+        var best: ?*LoadedModel = null;
+        var best_used: i64 = std.math.maxInt(i64);
+        var it = self.entries.valueIterator();
+        while (it.next()) |entry_ptr| {
+            const entry = entry_ptr.*;
+            if (entry.state != .ready) continue;
+            if (entry.refcount.load(.acquire) != 0) continue;
+            if (std.mem.eql(u8, entry.id, exclude_id)) continue;
+            if (entry.last_used_ns < best_used) {
+                best_used = entry.last_used_ns;
+                best = entry;
+            }
+        }
+        return best;
+    }
+
+    /// Mark an entry as `.ready` after the inference thread finishes
+    /// loading. Must be called under `mutex`; broadcasts on the cond-var
+    /// so blocked `ensureLoaded` callers wake. Caller has already
+    /// populated weights/transformer/etc on `entry`; this just updates
+    /// the bookkeeping + state field.
+    pub fn markReadyLocked(self: *ModelRegistry, entry: *LoadedModel, bytes_resident: u64) void {
+        entry.bytes_resident = bytes_resident;
+        entry.state = .ready;
+        entry.error_name = null;
+        self.lru_clock += 1;
+        entry.last_used_ns = self.lru_clock;
+        self.current_resident_bytes += bytes_resident;
+        self.state_cond.broadcast(self.io);
+    }
+
+    /// Mark an entry as `.error_state` and store `error_name` (duped).
+    /// Future `ensureLoaded` calls fail with `error.LoadFailed` until the
+    /// entry is reset to `.unloaded` (Phase D may add a retry path).
+    pub fn markErrorLocked(self: *ModelRegistry, entry: *LoadedModel, error_name: []const u8) void {
+        if (entry.error_name) |old| self.allocator.free(old);
+        entry.error_name = self.allocator.dupe(u8, error_name) catch null;
+        entry.state = .error_state;
+        self.state_cond.broadcast(self.io);
+    }
+
+    /// Snapshot of every entry for `/v1/models`. Sort: default first
+    /// (so single-model clients reading `data[0]` keep working), then by
+    /// `last_used_ns` descending so the active model floats to the top of
+    /// the rest. Slice memory is owned by `result_alloc`; the embedded
+    /// string slices are borrowed from the registry (snapshot is taken
+    /// under the lock, so caller must finish reading before any
+    /// registry-mutating operation).
+    pub fn snapshot(self: *ModelRegistry, result_alloc: std.mem.Allocator) ![]ModelStatus {
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+
+        const out = try result_alloc.alloc(ModelStatus, self.entries.count());
+        var idx: usize = 0;
+        var it = self.entries.valueIterator();
+        while (it.next()) |entry_ptr| {
+            const entry = entry_ptr.*;
+            out[idx] = .{
+                .id = entry.id,
+                .loaded = entry.state == .ready,
+                .bytes_resident = entry.bytes_resident,
+                .bytes_on_disk = entry.bytes_on_disk,
+                .last_used_ns = entry.last_used_ns,
+                .state = ModelStatus.stateName(entry.state),
+                .error_name = entry.error_name,
+            };
+            idx += 1;
+        }
+
+        // Bring default to front; sort the rest by last_used_ns desc.
+        const default_id = self.default_id;
+        std.sort.pdq(ModelStatus, out, default_id, lessThanByDefaultThenRecent);
+        return out;
+    }
+
+    fn lessThanByDefaultThenRecent(default_id: []const u8, a: ModelStatus, b: ModelStatus) bool {
+        const a_def = std.mem.eql(u8, a.id, default_id);
+        const b_def = std.mem.eql(u8, b.id, default_id);
+        if (a_def != b_def) return a_def;
+        return a.last_used_ns > b.last_used_ns;
+    }
+};
+
+// ── Tests ─────────────────────────────────────────────────────────────────
+//
+// Phase A tests exercise the registry's bookkeeping (state transitions,
+// refcount math, LRU pick, snapshot output) without invoking the real
+// mlx-allocating load path. We synthesize `.ready` entries directly to
+// keep tests fast and free of GPU dependencies; the real load path is
+// covered by integration tests once Phase D lands.
+
+const testing = std.testing;
+
+fn makeReadyStub(reg: *ModelRegistry, id: []const u8, bytes: u64) !*LoadedModel {
+    const stub = try reg.registerStub(id, id, bytes);
+    reg.mutex.lockUncancelable(reg.io);
+    defer reg.mutex.unlock(reg.io);
+    reg.markReadyLocked(stub, bytes);
+    return stub;
+}
+
+test "ModelRegistry: init/deinit empty" {
+    var reg = try ModelRegistry.init(testing.allocator, std.Io.Threaded.global_single_threaded.io(), null, 3, 0, null);
+    defer reg.deinit();
+    try testing.expectEqual(@as(usize, 0), reg.entries.count());
+    try testing.expectEqual(@as(u64, 0), reg.current_resident_bytes);
+}
+
+test "ModelRegistry: registerStub + setDefault" {
+    var reg = try ModelRegistry.init(testing.allocator, std.Io.Threaded.global_single_threaded.io(), null, 3, 0, null);
+    defer reg.deinit();
+    _ = try reg.registerStub("foo", "/path/to/foo", 1024);
+    try reg.setDefault("foo");
+    try testing.expectEqualStrings("foo", reg.default_id);
+    try testing.expectError(error.DuplicateId, reg.registerStub("foo", "/path/to/foo", 1024));
+    try testing.expectError(error.UnknownModelId, reg.setDefault("bar"));
+}
+
+test "ModelRegistry: ensureLoaded fails on unloaded stub" {
+    var reg = try ModelRegistry.init(testing.allocator, std.Io.Threaded.global_single_threaded.io(), null, 3, 0, null);
+    defer reg.deinit();
+    _ = try reg.registerStub("foo", "/path/to/foo", 1024);
+    try reg.setDefault("foo");
+    try testing.expectError(error.NotLoaded, reg.ensureLoaded("foo"));
+    try testing.expectError(error.UnknownModelId, reg.ensureLoaded("bar"));
+}
+
+test "ModelRegistry: ensureLoaded + release refcount math" {
+    var reg = try ModelRegistry.init(testing.allocator, std.Io.Threaded.global_single_threaded.io(), null, 3, 0, null);
+    defer reg.deinit();
+    const lm = try makeReadyStub(reg, "foo", 1024);
+    try reg.setDefault("foo");
+
+    try testing.expectEqual(@as(u32, 0), lm.refcount.load(.acquire));
+    const a = try reg.ensureLoaded("foo");
+    try testing.expectEqual(lm, a);
+    try testing.expectEqual(@as(u32, 1), lm.refcount.load(.acquire));
+    const b = try reg.ensureLoaded("foo");
+    try testing.expectEqual(@as(u32, 2), lm.refcount.load(.acquire));
+
+    reg.release(a);
+    try testing.expectEqual(@as(u32, 1), lm.refcount.load(.acquire));
+    reg.release(b);
+    try testing.expectEqual(@as(u32, 0), lm.refcount.load(.acquire));
+}
+
+test "ModelRegistry: default routing on empty / mlx-serve" {
+    var reg = try ModelRegistry.init(testing.allocator, std.Io.Threaded.global_single_threaded.io(), null, 3, 0, null);
+    defer reg.deinit();
+    const lm = try makeReadyStub(reg, "foo", 1024);
+    try reg.setDefault("foo");
+
+    const a = try reg.ensureLoaded("");
+    try testing.expectEqual(lm, a);
+    reg.release(a);
+
+    const b = try reg.ensureLoaded("mlx-serve");
+    try testing.expectEqual(lm, b);
+    reg.release(b);
+}
+
+test "ModelRegistry: ensureLoaded fails when no default and id empty" {
+    var reg = try ModelRegistry.init(testing.allocator, std.Io.Threaded.global_single_threaded.io(), null, 3, 0, null);
+    defer reg.deinit();
+    _ = try makeReadyStub(reg, "foo", 1024);
+    // default_id never set
+    try testing.expectError(error.NoDefaultModel, reg.ensureLoaded(""));
+}
+
+test "ModelRegistry: ensureLoaded reports error_state" {
+    var reg = try ModelRegistry.init(testing.allocator, std.Io.Threaded.global_single_threaded.io(), null, 3, 0, null);
+    defer reg.deinit();
+    const stub = try reg.registerStub("broken", "/path/to/broken", 1024);
+    try reg.setDefault("broken");
+    reg.mutex.lockUncancelable(reg.io);
+    reg.markErrorLocked(stub, "MissingVisionWeights");
+    reg.mutex.unlock(reg.io);
+    try testing.expectError(error.LoadFailed, reg.ensureLoaded("broken"));
+    try testing.expect(stub.error_name != null);
+    try testing.expectEqualStrings("MissingVisionWeights", stub.error_name.?);
+}
+
+test "ModelRegistry: pickLruEvictable orders by last_used_ns, ignores refcounted" {
+    var reg = try ModelRegistry.init(testing.allocator, std.Io.Threaded.global_single_threaded.io(), null, 3, 0, null);
+    defer reg.deinit();
+
+    const a = try makeReadyStub(reg, "a", 100);
+    const b = try makeReadyStub(reg, "b", 200);
+    const c = try makeReadyStub(reg, "c", 300);
+
+    // Touch order: a (oldest via init), then b, then c (most recent).
+    // markReadyLocked already bumped lru_clock in registration order, but
+    // be explicit by re-releasing each so last_used_ns reflects test intent.
+    _ = a;
+    _ = b;
+    _ = c;
+    const aa = try reg.ensureLoaded("a");
+    reg.release(aa); // a now newest
+    const bb = try reg.ensureLoaded("b");
+    reg.release(bb); // b now newest, a oldest
+    const cc = try reg.ensureLoaded("c");
+    reg.release(cc); // c now newest, a oldest
+
+    {
+        reg.mutex.lockUncancelable(reg.io);
+        defer reg.mutex.unlock(reg.io);
+        const lru = reg.pickLruEvictable("").?;
+        try testing.expectEqualStrings("a", lru.id);
+    }
+
+    // Hold a refcount on `a` — eviction should now skip it and pick `b`.
+    const held = try reg.ensureLoaded("a");
+    {
+        reg.mutex.lockUncancelable(reg.io);
+        defer reg.mutex.unlock(reg.io);
+        const lru = reg.pickLruEvictable("").?;
+        try testing.expectEqualStrings("b", lru.id);
+    }
+    reg.release(held);
+
+    // Exclude `a` explicitly — pick `b` even with `a` released.
+    {
+        reg.mutex.lockUncancelable(reg.io);
+        defer reg.mutex.unlock(reg.io);
+        const lru = reg.pickLruEvictable("a").?;
+        try testing.expectEqualStrings("b", lru.id);
+    }
+}
+
+test "ModelRegistry: snapshot places default first then most-recent" {
+    var reg = try ModelRegistry.init(testing.allocator, std.Io.Threaded.global_single_threaded.io(), null, 3, 0, null);
+    defer reg.deinit();
+
+    _ = try makeReadyStub(reg, "a", 100);
+    _ = try makeReadyStub(reg, "b", 200);
+    const c = try makeReadyStub(reg, "c", 300);
+    try reg.setDefault("b");
+
+    // Touch c last so it floats to the top of non-default entries.
+    const cc = try reg.ensureLoaded("c");
+    reg.release(cc);
+    _ = c;
+
+    const snap = try reg.snapshot(testing.allocator);
+    defer testing.allocator.free(snap);
+
+    try testing.expectEqual(@as(usize, 3), snap.len);
+    try testing.expectEqualStrings("b", snap[0].id);     // default first
+    try testing.expectEqualStrings("c", snap[1].id);     // most-recent of rest
+    try testing.expectEqualStrings("a", snap[2].id);
+    try testing.expect(snap[0].loaded);
+    try testing.expectEqual(@as(u64, 200), snap[0].bytes_resident);
+    try testing.expectEqualStrings("ready", snap[0].state);
+}
+
+test "ModelRegistry: snapshot reports unloaded entries" {
+    var reg = try ModelRegistry.init(testing.allocator, std.Io.Threaded.global_single_threaded.io(), null, 3, 0, null);
+    defer reg.deinit();
+
+    _ = try reg.registerStub("ghost", "/path/ghost", 4096);
+    _ = try makeReadyStub(reg, "live", 1024);
+    try reg.setDefault("live");
+
+    const snap = try reg.snapshot(testing.allocator);
+    defer testing.allocator.free(snap);
+
+    try testing.expectEqual(@as(usize, 2), snap.len);
+    try testing.expectEqualStrings("live", snap[0].id);
+    try testing.expect(snap[0].loaded);
+    try testing.expectEqualStrings("ghost", snap[1].id);
+    try testing.expect(!snap[1].loaded);
+    try testing.expectEqualStrings("unloaded", snap[1].state);
+    try testing.expectEqual(@as(?u64, 4096), snap[1].bytes_on_disk);
+}
+
+test "ModelRegistry: markReadyLocked sums resident bytes" {
+    var reg = try ModelRegistry.init(testing.allocator, std.Io.Threaded.global_single_threaded.io(), null, 3, 0, null);
+    defer reg.deinit();
+    _ = try makeReadyStub(reg, "a", 100);
+    _ = try makeReadyStub(reg, "b", 250);
+    try testing.expectEqual(@as(u64, 350), reg.current_resident_bytes);
+}
+
+test "ModelRegistry: peek does not refcount" {
+    var reg = try ModelRegistry.init(testing.allocator, std.Io.Threaded.global_single_threaded.io(), null, 3, 0, null);
+    defer reg.deinit();
+    const lm = try makeReadyStub(reg, "foo", 1024);
+    const peeked = reg.peek("foo").?;
+    try testing.expectEqual(lm, peeked);
+    try testing.expectEqual(@as(u32, 0), lm.refcount.load(.acquire));
+    try testing.expectEqual(@as(?*LoadedModel, null), reg.peek("nope"));
+}

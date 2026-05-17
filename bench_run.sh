@@ -24,7 +24,11 @@
 #     [--quiet]                      # suppress stderr progress
 #
 # Output (stdout):
-#   label|engine|model|spec|prompt|prefill_tps|decode_tps|prompt_toks|completion_toks|notes
+#   label|engine|model|spec|prompt|prefill_tps|decode_tps|prompt_toks|completion_toks|hardware|notes
+#
+# `hardware` is auto-detected from the host (chip + RAM) so CSVs from different
+# Macs can be merged without losing provenance. Override via --hardware <tag> if
+# you know better (e.g. running on a remote rig that misreports sysctl values).
 #
 # Exit codes: 0 OK, 1 fatal error (engine failed to start, etc).
 
@@ -46,6 +50,22 @@ DO_PREFILL=1
 DO_DECODE=1
 DO_ECHO=0
 QUIET=0
+HARDWARE=""
+
+# ── Hardware detection ──
+# Tags rows so CSVs from different Macs can be merged. Format: "<chip>-<ram>gb",
+# e.g. "Apple-M1-Pro-32gb" or "Apple-M4-Max-128gb". Spaces in the chip name are
+# replaced with dashes so the tag is one shell-friendly token.
+detect_hardware() {
+    local chip ram_gb
+    chip=$(sysctl -n machdep.cpu.brand_string 2>/dev/null || echo "unknown")
+    if [[ "$(uname)" == "Darwin" ]]; then
+        ram_gb=$(($(sysctl -n hw.memsize 2>/dev/null || echo 0) / 1024 / 1024 / 1024))
+    else
+        ram_gb=$(awk '/MemTotal/ {printf "%d", $2/1024/1024}' /proc/meminfo 2>/dev/null || echo 0)
+    fi
+    echo "${chip// /-}-${ram_gb}gb"
+}
 
 # Fixed prompts so prefill/decode rates are reproducible.
 PREFILL_PROMPT="Explain the following topics in extreme detail: $(python3 -c "print(', '.join([f'topic {i} about science and technology and its impact on human civilization throughout history' for i in range(1,50)]))")"
@@ -76,6 +96,7 @@ while [[ $# -gt 0 ]]; do
         --no-decode)    DO_DECODE=0; shift ;;
         --echo)         DO_ECHO=1; shift ;;
         --quiet)        QUIET=1; shift ;;
+        --hardware)     HARDWARE="$2"; shift 2 ;;
         -h|--help)
             sed -n '2,30p' "$0"; exit 0 ;;
         *)              echo "Unknown arg: $1" >&2; exit 1 ;;
@@ -86,6 +107,7 @@ done
 [[ -z "$MODEL"  ]] && { echo "missing --model"  >&2; exit 1; }
 [[ -z "$LABEL"  ]] && LABEL="$ENGINE"
 [[ -z "$PORT"   ]] && PORT=$([[ "$ENGINE" == "lmstudio" ]] && echo 1234 || echo 11240)
+[[ -z "$HARDWARE" ]] && HARDWARE=$(detect_hardware)
 
 dbg() { [[ "$QUIET" == "1" ]] || echo "  $*" >&2; }
 fail() { echo "$*" >&2; exit 1; }
@@ -348,9 +370,9 @@ print(f'{sum(v)/len(v):.1f}|$last_pt|$last_ct')"
 # ── Main ──
 trap 'stop_engine' EXIT INT TERM
 
-dbg "=== $LABEL spec=$SPEC model=$MODEL port=$PORT ==="
+dbg "=== $LABEL spec=$SPEC model=$MODEL port=$PORT hardware=$HARDWARE ==="
 
-emit() { echo "$LABEL|$ENGINE|$MODEL|$SPEC|$1|$2|$3|$4|$5|$6"; }
+emit() { echo "$LABEL|$ENGINE|$MODEL|$SPEC|$1|$2|$3|$4|$5|$HARDWARE|$6"; }
 
 # mlx-lm bypasses HTTP entirely — its server is broken on this MLX version.
 if [[ "$ENGINE" == "mlx-lm" ]]; then

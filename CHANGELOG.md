@@ -1,5 +1,23 @@
 # Changelog
 
+## v26.5.6 — DeepSeek-V4 done right, faster than LM Studio, continuous batching
+
+- **DeepSeek-V4-Flash, the right way.** The 284B-parameter beast now runs through Salvatore Sanfilippo's [`antirez/ds4`](https://github.com/antirez/ds4) engine — native Metal kernels, byte-validated against the reference forward, single self-contained binary (kernel sources are embedded and staged at first launch). Available on 96 GB+ Macs straight from the MLX Core Model Browser: one-click download of the GGUF, served alongside MLX models from the same picker. Agent mode and MCP tool calling work on DSV4 too — the chat-template fallback inlines the tool catalog so the model sees the full toolset. We retired our previous 7,000-line in-house implementation in favor of the upstream engine; the result is faster, more memory-stable, and a lot less code to maintain.
+
+- **Faster than LM Studio (MLX) on every model we test.** Refreshed cross-engine charts across Gemma 4 (E2B / E4B / 31B / 26B-A4B-MoE) and Qwen 3.6 (27B / 35B-A3B) put MLX-serve ahead on echo, code completion, and free-form writing — every cell, every model. `--pld` takes the top bar on echo-heavy workloads (up to 1.5× on MoE); `--drafter` wins Gemma 4 code completion. Side-by-side charts and CSVs ship under `docs/`.
+
+- **Continuous batching.** A new `--max-concurrent N` flag batches up to N decode requests through a single forward pass — about 1.6× throughput at 4-way parallel on dense models (Gemma 4, Qwen 3, Llama, Mistral). Hybrid SSM and MoE models route through the same scheduler queue but stay single-stream. A 24-hour soak across four mixed workloads holds RSS drift under 5%.
+
+- **Smaller KV cache, bigger context.** `--kv-quant {4, 8, turbo2, turbo4}` (plus a per-request override on every chat endpoint) shrinks KV memory by ~4× at 4-bit and ~2× at 8-bit. 16K contexts now fit on hardware that couldn't hold them dense, or you double your parallel-request budget at the same context length. The TurboQuant variants add a per-layer Hadamard rotation that handles heavy-tailed activations more gracefully.
+
+- **One server, every model on disk.** `--model-dir <path>` discovers and serves every model in a folder; clients route by name in the request's `"model"` field. LRU eviction keeps the resident set within configurable byte/count caps. MLX Core's menu-bar picker now hot-switches models in place — no chat-session interruption.
+
+- **3.57× faster first request, smarter multi-turn.** Eager warmup at boot page-faults the weights and pre-compiles the decode kernels (1097 → 307 ms wall on Gemma 4 E4B 4-bit). A new shared-prefix cache (`--prefix-cache-entries`, `--prefix-cache-mem`) skips re-prefilling system prompts across turns; agent loops feel tighter. `/v1/embeddings` now runs on the same thread-local-stream-safe path as generation, so encoder-only models go parallel too. Verified by a new 11-turn agent memory harness (plant facts → tools → thinking → recall under mode transitions) that passes 15/15 on every supported arch including DSV4 via ds4.
+
+- **MLX Core, more in-app control.** A new Settings → Performance section exposes continuous batching, KV-cache quantization, and the prefix cache as menu-bar tunables instead of CLI-only flags. A "Reset to Defaults" footer restores every Settings field with one click + confirmation. The chat toolbar's Agent button hover now enumerates all 10 built-in tools so you can see exactly what Agent mode activates; every other toolbar button (Workspace, Folder, Settings, Think, MCP) gained a substantive tooltip too. New tool-approval dialog in Agent mode — **Allow** / **Deny** / **Always allow this session** — pops before each tool runs, so you can shape-check shell commands and file edits before the model touches your machine. The Model Browser gained a custom-folder picker so models that live outside `~/.mlx-serve/models` and `~/.lmstudio/models` show up in the picker without re-downloading. The GPU-memory indicator now reports correctly when the ds4 engine is loaded, and the picker only surfaces DeepSeek-V4-Flash GGUFs (not arbitrary LM Studio GGUFs the server can't load).
+
+---
+
 ## v26.5.5 — Multi-turn agent speed-ups, MoE forward, +39% vs LM Studio
 
 - **+39% faster than LM Studio overall** (geomean across 18 cells, identical 4-bit MLX weights, ctx=4096, temp=0). Echo +60–122%, code +47–53% on dense Gemma 4, free-form +20–35%. New apples-to-apples benchmark at `tests/bench_vs_lmstudio.sh`.

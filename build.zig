@@ -47,6 +47,15 @@ pub fn build(b: *std.Build) void {
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "version", version);
 
+    // ds4 Metal kernel sources embedded via @embedFile and exposed as a
+    // named module so src/arch/ds4.zig can import them with `@import("ds4_metal_sources")`
+    // without traversing the project root.
+    const ds4_metal_sources = b.createModule(.{
+        .root_source_file = b.path("lib/ds4_metal_sources.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+
     const mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
         .target = target,
@@ -54,6 +63,7 @@ pub fn build(b: *std.Build) void {
         .link_libcpp = true,
         .imports = &.{
             .{ .name = "build_options", .module = build_options.createModule() },
+            .{ .name = "ds4_metal_sources", .module = ds4_metal_sources },
         },
     });
 
@@ -67,6 +77,13 @@ pub fn build(b: *std.Build) void {
     mod.addCSourceFile(.{ .file = b.path("lib/stb_image_impl.c"), .flags = &.{"-O2"} });
     mod.addIncludePath(b.path("lib"));
 
+    // ds4 inference engine for DSV4-Flash (Metal backend, macOS only). See
+    // `lib/ds4/` submodule pinned at 613e9b2 and `src/arch/ds4.zig`. Kernel
+    // sources are embedded via `lib/ds4_metal_sources.zig` and extracted at
+    // runtime to ~/.mlx-serve/ds4-metal/<hash>/.
+    addDs4Sources(b, mod);
+    mod.addIncludePath(b.path("lib/ds4"));
+
     // mlx-c include/lib paths (homebrew)
     mod.addIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
     mod.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
@@ -78,6 +95,8 @@ pub fn build(b: *std.Build) void {
     }
     mod.linkFramework("IOKit", .{});
     mod.linkFramework("CoreFoundation", .{});
+    mod.linkFramework("Foundation", .{});
+    mod.linkFramework("Metal", .{});
 
     const exe = b.addExecutable(.{
         .name = "mlx-serve",
@@ -106,6 +125,7 @@ pub fn build(b: *std.Build) void {
         .link_libcpp = true,
         .imports = &.{
             .{ .name = "build_options", .module = build_options.createModule() },
+            .{ .name = "ds4_metal_sources", .module = ds4_metal_sources },
         },
     });
 
@@ -113,6 +133,8 @@ pub fn build(b: *std.Build) void {
     test_mod.addIncludePath(b.path("lib/jinja_cpp"));
     test_mod.addCSourceFile(.{ .file = b.path("lib/stb_image_impl.c"), .flags = &.{"-O2"} });
     test_mod.addIncludePath(b.path("lib"));
+    addDs4Sources(b, test_mod);
+    test_mod.addIncludePath(b.path("lib/ds4"));
     test_mod.linkSystemLibrary("c++", .{});
     test_mod.addIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
     test_mod.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
@@ -124,6 +146,8 @@ pub fn build(b: *std.Build) void {
     }
     test_mod.linkFramework("IOKit", .{});
     test_mod.linkFramework("CoreFoundation", .{});
+    test_mod.linkFramework("Foundation", .{});
+    test_mod.linkFramework("Metal", .{});
 
     const unit_tests = b.addTest(.{
         .root_module = test_mod,
@@ -132,6 +156,38 @@ pub fn build(b: *std.Build) void {
     const run_unit_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
+}
+
+fn addDs4Sources(b: *std.Build, module: *std.Build.Module) void {
+    // Match ds4's Makefile flags (lib/ds4/Makefile lines 10–11). We drop
+    // `-mcpu=native` so the produced binary stays portable across Apple
+    // Silicon generations — ds4 itself ships portable IR for its Metal
+    // kernels, and the C host code is not perf-critical compared to the GPU
+    // path. `-Wno-unused-parameter` + `-Wno-unused-variable` keep upstream's
+    // warnings from breaking our build without patching the submodule.
+    const c_flags = &[_][]const u8{
+        "-O3",
+        "-ffast-math",
+        "-std=c99",
+        "-Wno-unused-parameter",
+        "-Wno-unused-variable",
+        "-Wno-unused-but-set-variable",
+        "-Wno-unused-function",
+        "-Wno-deprecated-declarations",
+    };
+    module.addCSourceFile(.{ .file = b.path("lib/ds4/ds4.c"), .flags = c_flags });
+
+    const objc_flags = &[_][]const u8{
+        "-O3",
+        "-ffast-math",
+        "-fobjc-arc",
+        "-Wno-unused-parameter",
+        "-Wno-unused-variable",
+        "-Wno-unused-but-set-variable",
+        "-Wno-unused-function",
+        "-Wno-deprecated-declarations",
+    };
+    module.addCSourceFile(.{ .file = b.path("lib/ds4/ds4_metal.m"), .flags = objc_flags });
 }
 
 const BrewDep = struct { name: []const u8, min: std.SemanticVersion };

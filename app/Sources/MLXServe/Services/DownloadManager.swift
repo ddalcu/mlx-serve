@@ -47,6 +47,19 @@ class DownloadManager: ObservableObject {
     // through the discoverer's fallback scan and `existingModelDir(for:)` —
     // no automatic migration; users can move dirs manually if they want.
 
+    /// True iff a filename is a GGUF the embedded ds4 engine can load.
+    /// Today that's the DeepSeek-V4-Flash family only — match files whose
+    /// basename starts with `DeepSeek-V4-Flash-` and ends with `.gguf`.
+    /// Other GGUF families (Qwen, Gemma, Nemotron) are NOT loadable by
+    /// mlx-serve, so we deliberately hide them from the picker / readiness
+    /// check rather than surface them and fail at load time. The abliterated
+    /// `cyberneurova-DeepSeek-V4-Flash-…` community variants are also
+    /// excluded by the prefix check.
+    nonisolated static func isSupportedDsv4Gguf(_ filename: String) -> Bool {
+        guard filename.hasSuffix(".gguf") else { return false }
+        return filename.lowercased().hasPrefix("deepseek-v4-flash-")
+    }
+
     /// Where a fresh download of `repoId` should be written. New 2-level layout.
     /// `repoId` should be `author/name`; bare names land at the legacy top level.
     nonisolated static func newLayoutDir(rootDir: String, repoId: String) -> String {
@@ -84,6 +97,46 @@ class DownloadManager: ObservableObject {
         Self.existingModelDir(rootDir: modelsDir, repoId: repoId)
     }
 
+    /// User-configurable extra discovery root. Persisted in UserDefaults under
+    /// `customModelPath` so it survives app restarts. The raw stored value is
+    /// kept verbatim (we don't erase a broken path) so the user can see and
+    /// fix it in Settings; discovery, however, only uses it when it resolves
+    /// to an existing directory.
+    private static let customRootDefaultsKey = "customModelPath"
+
+    @Published var customRoot: String? = {
+        let raw = UserDefaults.standard.string(forKey: DownloadManager.customRootDefaultsKey) ?? ""
+        return raw.isEmpty ? nil : raw
+    }() {
+        didSet {
+            let trimmed = customRoot?.trimmingCharacters(in: .whitespacesAndNewlines)
+            if let t = trimmed, !t.isEmpty {
+                UserDefaults.standard.set(t, forKey: Self.customRootDefaultsKey)
+            } else {
+                UserDefaults.standard.removeObject(forKey: Self.customRootDefaultsKey)
+            }
+        }
+    }
+
+    /// Canonicalize a directory path for de-duplication against the default
+    /// roots. Returns nil when the path is empty or doesn't resolve to an
+    /// existing directory.
+    private func resolvedCustomRoot() -> String? {
+        guard let raw = customRoot?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else { return nil }
+        let expanded = (raw as NSString).expandingTildeInPath
+        let standardized = URL(fileURLWithPath: expanded).standardizedFileURL.path
+        var isDir: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: standardized, isDirectory: &isDir), isDir.boolValue else { return nil }
+        // Skip if it's the same folder we already scan as one of the defaults.
+        let standardizedMlx = URL(fileURLWithPath: modelsDir).standardizedFileURL.path
+        if standardized == standardizedMlx { return nil }
+        if let lm = lmStudioRoot,
+           URL(fileURLWithPath: lm).standardizedFileURL.path == standardized {
+            return nil
+        }
+        return standardized
+    }
+
     /// LM Studio's downloads root, resolved once at app launch.
     /// Reads `~/.lmstudio/settings.json`'s `downloadsFolder` field; falls back to
     /// `~/.lmstudio/models`. nil if LM Studio isn't installed or the folder is unreachable.
@@ -105,9 +158,24 @@ class DownloadManager: ObservableObject {
 
     /// Check if a model has all required files for loading.
     /// Verifies: config.json, tokenizer files, chat template, and ALL safetensors shards.
+    /// For GGUF-backed models (ds4 engine) the check is just "directory contains
+    /// at least one non-trivial .gguf" — they ship a single artifact, not the
+    /// MLX safetensors tree.
     func isReady(_ repoId: String) -> Bool {
         guard let modelDir = existingModelDir(for: repoId) else { return false }
         let fm = FileManager.default
+
+        // ds4 / GGUF fast-path. Check BEFORE the safetensors gate so a dir
+        // that legitimately has no config.json still resolves as ready.
+        // Gated to DeepSeek-V4-Flash variants — see `isSupportedDsv4Gguf` for
+        // why we don't surface arbitrary GGUFs.
+        if let entries = try? fm.contentsOfDirectory(atPath: modelDir) {
+            for entry in entries where Self.isSupportedDsv4Gguf(entry) {
+                let fullPath = (modelDir as NSString).appendingPathComponent(entry)
+                let size = (try? fm.attributesOfItem(atPath: fullPath)[.size] as? UInt64) ?? 0
+                if size >= 1_000_000 { return true }
+            }
+        }
 
         // Must have config.json
         guard fm.fileExists(atPath: (modelDir as NSString).appendingPathComponent("config.json")) else { return false }
@@ -300,6 +368,119 @@ class DownloadManager: ObservableObject {
         }
     }
 
+    /// Download a single GGUF artifact from a HuggingFace repo. Used by the
+    /// ds4-backed entries (e.g. DeepSeek-V4-Flash) which ship one big file
+    /// instead of the MLX safetensors tree. Mirrors `download(repoId:)`'s
+    /// resume/retry/disk-space shape, scoped to one file.
+    func downloadGguf(repoId: String, ggufFilename: String) async {
+        let destDir = newLayoutDir(for: repoId)
+        downloads[repoId] = DownloadState(status: .downloading, statusText: "Fetching \(ggufFilename)...")
+
+        do {
+            try FileManager.default.createDirectory(atPath: destDir, withIntermediateDirectories: true)
+
+            // HEAD to determine the GGUF's size up front for progress + disk-space check.
+            let fileURL = URL(string: "https://huggingface.co/\(repoId)/resolve/main/\(ggufFilename)")!
+            var headReq = URLRequest(url: fileURL)
+            headReq.httpMethod = "HEAD"
+            let (_, headResp) = try await URLSession.shared.data(for: headReq)
+            let fileSize: Int64 = {
+                guard let http = headResp as? HTTPURLResponse else { return 0 }
+                if let cl = http.value(forHTTPHeaderField: "Content-Length"), let n = Int64(cl) { return n }
+                return http.expectedContentLength
+            }()
+
+            let destURL = URL(fileURLWithPath: destDir)
+            if let values = try? destURL.resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey]),
+               let available = values.volumeAvailableCapacityForImportantUsage,
+               fileSize > 0, available < fileSize {
+                throw NSError(domain: NSCocoaErrorDomain, code: NSFileWriteOutOfSpaceError, userInfo: [
+                    NSLocalizedDescriptionKey: "Not enough disk space. Need \(formatBytes(fileSize)) but only \(formatBytes(Int64(available))) available."
+                ])
+            }
+
+            let destPath = (destDir as NSString).appendingPathComponent(ggufFilename)
+            let partialPath = destPath + ".partial"
+
+            // Skip if already exists at the expected size.
+            if fileSize > 0,
+               let attrs = try? FileManager.default.attributesOfItem(atPath: destPath),
+               let existingSize = attrs[.size] as? Int64,
+               existingSize == fileSize {
+                downloads[repoId] = DownloadState(progress: 1.0, status: .completed, statusText: "Complete", fileIndex: 1, fileCount: 1)
+                return
+            }
+
+            downloads[repoId]?.currentFile = ggufFilename
+            downloads[repoId]?.fileIndex = 1
+            downloads[repoId]?.fileCount = 1
+
+            let maxRetries = 20
+            for attempt in 0..<maxRetries {
+                try Task.checkCancellation()
+
+                let existingBytes: Int64
+                if let attrs = try? FileManager.default.attributesOfItem(atPath: partialPath),
+                   let size = attrs[.size] as? Int64, size > 0 {
+                    existingBytes = size
+                    downloads[repoId]?.statusText = "Resuming \(ggufFilename) from \(formatBytes(existingBytes))..."
+                    downloads[repoId]?.fileProgress = fileSize > 0 ? Double(existingBytes) / Double(fileSize) : 0
+                } else {
+                    existingBytes = 0
+                }
+
+                let fm = FileManager.default
+                if !fm.fileExists(atPath: partialPath) {
+                    fm.createFile(atPath: partialPath, contents: nil)
+                }
+                guard let fileHandle = FileHandle(forWritingAtPath: partialPath) else {
+                    throw URLError(.cannotCreateFile)
+                }
+                try fileHandle.seekToEnd()
+
+                var request = URLRequest(url: fileURL)
+                if existingBytes > 0 {
+                    request.setValue("bytes=\(existingBytes)-", forHTTPHeaderField: "Range")
+                }
+
+                do {
+                    try await downloadToFile(
+                        request: request,
+                        fileHandle: fileHandle,
+                        repoId: repoId,
+                        fileSize: fileSize,
+                        existingBytes: existingBytes,
+                        baseDownloaded: 0,
+                        totalSize: max(fileSize, 1)
+                    )
+                    try? fm.removeItem(atPath: destPath)
+                    try fm.moveItem(atPath: partialPath, toPath: destPath)
+                    break
+                } catch is CancellationError {
+                    throw CancellationError()
+                } catch {
+                    if attempt < maxRetries - 1 {
+                        let isStall = error is DownloadStallError
+                        let delay = isStall ? 2.0 : Double(attempt + 1) * 2.0
+                        let reason = isStall ? "Download stalled" : "Connection lost"
+                        downloads[repoId]?.statusText = "\(reason), retrying in \(Int(delay))s... (\(attempt + 2)/\(maxRetries))"
+                        try await Task.sleep(nanoseconds: UInt64(delay * 1_000_000_000))
+                    } else {
+                        throw error
+                    }
+                }
+            }
+
+            downloads[repoId] = DownloadState(progress: 1.0, status: .completed, statusText: "Complete", fileIndex: 1, fileCount: 1)
+        } catch {
+            let message = error.localizedDescription
+            downloads[repoId] = DownloadState(status: .failed, error: message)
+            if !(error is CancellationError) {
+                presentFailureAlert(repoId: repoId, message: message)
+            }
+        }
+    }
+
     private func presentFailureAlert(repoId: String, message: String) {
         let modelName = repoId.components(separatedBy: "/").last ?? repoId
         let alert = NSAlert()
@@ -369,10 +550,31 @@ class DownloadManager: ObservableObject {
 
     private func makeLocalModel(at dirPath: String, displayName: String, idKey: String, source: LocalModelSource) -> LocalModel? {
         let resolved = (dirPath as NSString).resolvingSymlinksInPath
+        let entries = (try? FileManager.default.contentsOfDirectory(atPath: resolved)) ?? []
+
+        // ds4 / GGUF fast-path: surface only DeepSeek-V4-Flash GGUFs from the
+        // canonical antirez/deepseek-v4-gguf release. Random GGUFs cached by
+        // LM Studio (Qwen, Gemma, Nemotron, abliterated DSV4 variants) are NOT
+        // supported by our ds4 bridge, so we deliberately don't surface them
+        // in the picker — otherwise users get cryptic load failures when
+        // selecting a model the server can't actually serve.
+        if let gguf = entries.first(where: { Self.isSupportedDsv4Gguf($0) }) {
+            let ggufPath = (resolved as NSString).appendingPathComponent(gguf)
+            let size = (try? FileManager.default.attributesOfItem(atPath: ggufPath)[.size] as? UInt64) ?? 0
+            return LocalModel(
+                id: "\(source.rawValue):\(idKey)",
+                name: displayName,
+                path: ggufPath,
+                sizeFormatted: MemoryInfo.format(Int64(size)),
+                modelType: "deepseek_v4",
+                source: source,
+                kind: .base
+            )
+        }
+
         let configPath = (resolved as NSString).appendingPathComponent("config.json")
         guard FileManager.default.fileExists(atPath: configPath) else { return nil }
 
-        let entries = (try? FileManager.default.contentsOfDirectory(atPath: resolved)) ?? []
         guard entries.contains(where: { $0.hasSuffix(".safetensors") && !$0.hasSuffix(".index.json") }) else { return nil }
 
         var modelType = "unknown"
@@ -440,6 +642,31 @@ class DownloadManager: ObservableObject {
                     let display = "\(pub)/\(repo)"
                     if let m = makeLocalModel(at: repoPath, displayName: display, idKey: display, source: .lmStudio) {
                         out.append(m)
+                    }
+                }
+            }
+        }
+
+        // User-configured custom root — same dual-layout scan as `~/.mlx-serve/models`.
+        // resolvedCustomRoot() handles tilde expansion, existence check, and
+        // dedup against the two default roots so a user pointing it at
+        // `~/.mlx-serve/models` doesn't produce duplicate picker entries.
+        if let root = resolvedCustomRoot(),
+           let entries = try? fm.contentsOfDirectory(atPath: root) {
+            for entry in entries where !entry.hasPrefix(".") {
+                let entryPath = (root as NSString).appendingPathComponent(entry)
+                let directConfig = (entryPath as NSString).appendingPathComponent("config.json")
+                if fm.fileExists(atPath: directConfig) {
+                    if let m = makeLocalModel(at: entryPath, displayName: entry, idKey: "custom:\(entry)", source: .custom) {
+                        out.append(m)
+                    }
+                } else if let children = try? fm.contentsOfDirectory(atPath: entryPath) {
+                    for child in children where !child.hasPrefix(".") {
+                        let childPath = (entryPath as NSString).appendingPathComponent(child)
+                        let display = "\(entry)/\(child)"
+                        if let m = makeLocalModel(at: childPath, displayName: display, idKey: "custom:\(display)", source: .custom) {
+                            out.append(m)
+                        }
                     }
                 }
             }

@@ -13,11 +13,39 @@ const drafter_mod = @import("drafter.zig");
 
 const Transformer = transformer_mod.Transformer;
 const Tokenizer = tokenizer_mod.Tokenizer;
+const ForwardCtx = transformer_mod.ForwardCtx;
 const SSMCacheEntrySnapshot = transformer_mod.SSMCacheEntrySnapshot;
 const ssmSnapshot = transformer_mod.ssmSnapshot;
 const ssmSnapshotDeinit = transformer_mod.ssmSnapshotDeinit;
 const ssmRestore = transformer_mod.ssmRestore;
 const DrafterModel = drafter_mod.DrafterModel;
+
+/// Module-level overrides for prefill behavior. Defaults match the original
+/// hardcoded values; main.zig may overwrite these from CLI flags before
+/// `serve()` runs. Per-request reads happen on the same thread that did the
+/// CLI parse, so no atomicity needed.
+pub var prefill_chunk_override: usize = 8192;
+pub var prefill_trace_force: bool = false;
+
+/// Read an unsigned integer from an environment variable, falling back to
+/// `default` when unset, empty, or unparseable. Uses libc getenv to stay
+/// allocator-free at call sites.
+fn readEnvUsize(name: [:0]const u8, default: usize) usize {
+    const raw = std.c.getenv(name.ptr);
+    if (raw == null) return default;
+    const slice = std.mem.sliceTo(raw.?, 0);
+    if (slice.len == 0) return default;
+    return std.fmt.parseInt(usize, slice, 10) catch default;
+}
+
+/// Truthy if the env var is exactly "1". Anything else (unset, "0", "true",
+/// "yes") is false — keep matching surface tight to avoid surprises.
+fn readEnvBool(name: [:0]const u8) bool {
+    const raw = std.c.getenv(name.ptr);
+    if (raw == null) return false;
+    const slice = std.mem.sliceTo(raw.?, 0);
+    return std.mem.eql(u8, slice, "1");
+}
 
 /// Grammar-constrained sampling state. The caller owns `grammar`, `token_bytes`,
 /// and `mask_buf`; the generator only reads them. `mask_buf.len` must equal
@@ -109,6 +137,10 @@ pub const GenerationResult = struct {
     finish_reason: []const u8,
     prefill_tps: f64,
     decode_tps: f64,
+    /// Wall-clock nanoseconds spent on prefill (prompt processing).
+    prefill_ns: u64 = 0,
+    /// Wall-clock nanoseconds spent on decode (token generation).
+    decode_ns: u64 = 0,
     logprobs: ?[]LogprobResult = null, // per-token logprobs (caller must free)
 };
 
@@ -118,6 +150,15 @@ pub const GenerationResult = struct {
 /// never idles between token generation steps.
 pub const Generator = struct {
     xfm: *Transformer,
+    /// Forward-pass context. Stores per-request KVCache pointer, moe_seq_offset
+    /// pointer, ssm_entries slice, vision_embeddings handle, and capture_hidden
+    /// override. The legacy single-slot path uses `xfm.defaultCtx()` (pointing at
+    /// the Transformer's own fields). Phase 2 concurrent batching constructs a
+    /// per-slot ForwardCtx pointing at the slot's own KVCache, etc., so multiple
+    /// generators can share one Transformer's weights without colliding on
+    /// per-request state. Stored by value; `&self.ctx` is what we pass to
+    /// `xfm.forwardWith` / `lazyForward` / drafter step.
+    ctx: ForwardCtx,
     tok: *const Tokenizer,
     next_token_id: u32,
     step: u32,
@@ -198,7 +239,20 @@ pub const Generator = struct {
     spec_disabled_runtime: bool = false,
     /// Number of attempts before the runtime gate considers disabling.
     /// Below this we trust the prompt-time gate.
+    ///
+    /// Override at runtime via `SPEC_GATE_WARMUP` env var (parsed in `runtimeGateWarmup()`
+    /// once per request). Lower values make the gate trip sooner,
+    /// reducing regression-tail damage at the cost of fewer chances for slow-warmup
+    /// workloads to amortize spec overhead.
     pub const RUNTIME_GATE_WARMUP: u64 = 5;
+
+    /// Read the warmup threshold for this call. Env-overridable so we can A/B
+    /// without rebuilding. Anything outside `[1, 64]` falls back to the default.
+    pub fn runtimeGateWarmup() u64 {
+        const n = readEnvUsize("SPEC_GATE_WARMUP", @intCast(RUNTIME_GATE_WARMUP));
+        if (n < 1 or n > 64) return RUNTIME_GATE_WARMUP;
+        return @intCast(n);
+    }
     /// Minimum per-draft acceptance probability. Below this after warmup,
     /// speculation is disabled for the rest of the request.
     ///
@@ -226,7 +280,7 @@ pub const Generator = struct {
     /// per round" → never trip (defensive — current callers always pass
     /// >= 1).
     pub fn runtimeGateShouldDisable(attempted: u64, accepted: u64, drafts_per_round: u32) bool {
-        if (attempted < RUNTIME_GATE_WARMUP) return false;
+        if (attempted < runtimeGateWarmup()) return false;
         if (drafts_per_round == 0) return false;
         const drafts_proposed = attempted * @as(u64, drafts_per_round);
         const rate = @as(f32, @floatFromInt(accepted)) /
@@ -334,6 +388,24 @@ pub const Generator = struct {
         /// server's KV-cache-reuse path to forward only the trailing tokens
         /// while still giving PLD the full prompt for matching.
         lookup_prompt: ?[]const u32 = null,
+        /// Per-slot forward context (Phase 2 concurrent batching). When null,
+        /// `initWithOptions` builds one from `xfm.defaultCtx()` so the legacy
+        /// single-slot path is unchanged. Phase 2 callers pass a ForwardCtx
+        /// whose `cache` / `moe_seq_offset` / `ssm_entries` / `vision_embeddings`
+        /// point at the slot's own state. Stored by value on the Generator.
+        ctx: ?ForwardCtx = null,
+        /// Skip the lazy first-token pre-forward (regular path only). When set,
+        /// init samples t1 synchronously and leaves `pending_logits` /
+        /// `pending_token` empty — cache.step lands at exactly prompt_len with
+        /// t1 NOT in cache. The first `next()` call's transition shim will
+        /// sync-forward `[t1]` to seed pending_logits before the lazy chain.
+        /// Used by the Phase 2 scheduler so a slot's cache state matches
+        /// `forwardBatchedDecode`'s expectation (cache.step == prompt_len at
+        /// the start of every decode tick). PLD / drafter paths already skip
+        /// the lazy pre-forward unconditionally; this flag generalizes that
+        /// behavior to the regular sampling path. Has no effect when
+        /// `pld_enabled` or `drafter_enabled` is true.
+        skip_lazy_preforward: bool = false,
     };
 
     /// Selects the source slice that `initWithOptions` will dupe into
@@ -356,6 +428,12 @@ pub const Generator = struct {
         options: InitOptions,
     ) !Generator {
         const s = xfm.s;
+        // Per-slot ForwardCtx (Phase 2). Stored by value on the Generator;
+        // callers either supply one (scheduler) or fall through to
+        // `xfm.defaultCtx()` for the legacy single-slot path. We pass
+        // `&ctx` to every forward call below; the cache/moe/ssm fields
+        // mutate in-place through their pointers.
+        var ctx: ForwardCtx = options.ctx orelse xfm.defaultCtx();
 
         const ids_i32 = try allocator.alloc(i32, prompt_ids.len);
         defer allocator.free(ids_i32);
@@ -388,10 +466,23 @@ pub const Generator = struct {
         // ~20 GB of activations alone on a 50k-token prompt, causing Metal OOM.
         // Vision requests skip chunking since image token positions must be visible
         // in a single forward pass for spliceVisionEmbeddings to work correctly.
-        const PREFILL_CHUNK: usize = 8192;
+        // PREFILL_CHUNK overridable via env MLX_SERVE_PREFILL_CHUNK for tuning,
+        // or via the module-level `prefill_chunk_override` (set by --prefill-chunk
+        // CLI flag in main.zig). Env var wins if both are set.
+        const PREFILL_CHUNK: usize = readEnvUsize("MLX_SERVE_PREFILL_CHUNK", prefill_chunk_override);
+        // Phase-level prefill instrumentation. Enabled at debug level OR via
+        // MLX_SERVE_PREFILL_TRACE=1 (which forces the trace line at info).
+        // Phase 0 of plan 04 — gives us a decomposed view of where cold prefill
+        // time goes (chunked-forward vs eval vs last-token-forward).
+        const trace_force: bool = prefill_trace_force or readEnvBool("MLX_SERVE_PREFILL_TRACE");
+        const trace_enabled = log.isDebug() or trace_force;
+        var prefill_sw = io_util.Stopwatch.init(io);
+        var chunked_ns: u64 = 0;
+        var eval_ns: u64 = 0;
+        var n_chunks: usize = 0;
         if (prompt_ids.len > 1) {
             const prefix_len = prompt_ids.len - 1;
-            const has_vision = xfm.vision_embeddings != null;
+            const has_vision = ctx.vision_embeddings != null;
             const chunk_size = if (has_vision) prefix_len else PREFILL_CHUNK;
 
             var pos: usize = 0;
@@ -402,14 +493,17 @@ pub const Generator = struct {
                 const chunk_input = mlx.mlx_array_new_data(@ptrCast(&ids_i32[pos]), &chunk_shape, 2, .int32);
                 defer _ = mlx.mlx_array_free(chunk_input);
 
-                const chunk_logits = try xfm.forward(chunk_input);
+                const chunk_start_ns = if (trace_enabled) prefill_sw.read() else 0;
+                const chunk_logits = try xfm.forwardWith(&ctx, chunk_input);
                 _ = mlx.mlx_array_free(chunk_logits);
+                if (trace_enabled) chunked_ns += prefill_sw.read() - chunk_start_ns;
 
                 // Eval KV cache — materializes this chunk's K/V, frees activation graph
+                const eval_start_ns = if (trace_enabled) prefill_sw.read() else 0;
                 {
                     const eval_vec = mlx.mlx_vector_array_new();
                     defer _ = mlx.mlx_vector_array_free(eval_vec);
-                    for (xfm.cache.entries) |*entry| {
+                    for (ctx.cache.entries) |*entry| {
                         if (!entry.initialized) continue;
                         _ = mlx.mlx_vector_array_append_value(eval_vec, entry.keys);
                         _ = mlx.mlx_vector_array_append_value(eval_vec, entry.values);
@@ -417,8 +511,10 @@ pub const Generator = struct {
                     _ = mlx.mlx_eval(eval_vec);
                 }
                 _ = mlx.mlx_clear_cache();
+                if (trace_enabled) eval_ns += prefill_sw.read() - eval_start_ns;
 
                 pos = end;
+                n_chunks += 1;
             }
         }
 
@@ -437,10 +533,30 @@ pub const Generator = struct {
         const need_capture = drafter_active;
         var captured_hidden: mlx.mlx_array = mlx.mlx_array_new();
         var has_captured_hidden = false;
+        const last_start_ns = if (trace_enabled) prefill_sw.read() else 0;
         const logits = if (need_capture) blk: {
             has_captured_hidden = true;
-            break :blk try xfm.forwardCaptureHidden(last_input, &captured_hidden);
-        } else try xfm.forward(last_input);
+            break :blk try xfm.forwardWithCapture(&ctx, last_input, &captured_hidden);
+        } else try xfm.forwardWith(&ctx, last_input);
+        if (trace_enabled) {
+            const last_ns = prefill_sw.read() - last_start_ns;
+            const total_ns = prefill_sw.read();
+            const ms = std.time.ns_per_ms;
+            std.debug.print(
+                "  [prefill-trace] tokens={d} chunks={d} chunk_size={d} chunked={d}ms eval={d}ms last_token={d}ms total={d}ms{s}{s}\n",
+                .{
+                    prompt_ids.len,
+                    n_chunks,
+                    PREFILL_CHUNK,
+                    chunked_ns / ms,
+                    eval_ns / ms,
+                    last_ns / ms,
+                    total_ns / ms,
+                    if (need_capture) " [capture-hidden]" else "",
+                    if (pld_active) " [pld]" else "",
+                },
+            );
+        }
         errdefer if (has_captured_hidden) {
             _ = mlx.mlx_array_free(captured_hidden);
         };
@@ -451,6 +567,7 @@ pub const Generator = struct {
         if (sampling.constraint != null) {
             var gen = Generator{
                 .xfm = xfm,
+                .ctx = ctx,
                 .tok = tok,
                 .next_token_id = 0,
                 .step = 0,
@@ -479,11 +596,6 @@ pub const Generator = struct {
         // cache at exactly prompt_len (last prompt token forwarded; first
         // sampled token deferred). The lazy pre-forward path below would
         // over-advance the cache and corrupt every verify forward.
-        //
-        // PLD-v2 mirrors nextDrafter's invariant: verify input includes t1
-        // (length 1+m) and full accept commits without a post-step forward.
-        // This eliminates one forward per accepted PLD step relative to v1,
-        // at the cost of losing the lazy-pipeline overlap on cold steps.
         if (drafter_active or pld_active) {
             const sample_lazy = sampleTokenLazy(logits, sampling, s);
             _ = mlx.mlx_array_free(logits);
@@ -494,6 +606,7 @@ pub const Generator = struct {
 
             const gen = Generator{
                 .xfm = xfm,
+                .ctx = ctx,
                 .tok = tok,
                 .next_token_id = @intCast(first_val),
                 .step = 0,
@@ -516,8 +629,46 @@ pub const Generator = struct {
                 .drafter_block_size = options.drafter_block_size,
             };
             // pending_logits/pending_token left empty — the lazy pipeline is
-            // skipped under PLD / drafter. The speculative `next*` paths
-            // drive every subsequent step with predictable cache offset.
+            // skipped under PLD / drafter. The speculative `next*` paths drive
+            // every subsequent step with predictable cache offset.
+            return gen;
+        }
+
+        // Phase 2: scheduler-managed slots ask init to sample t1 synchronously
+        // and skip the lazy pre-forward. Cache lands at prompt_len with t1 NOT
+        // in cache — matches `forwardBatchedDecode`'s expectation and the
+        // PLD / drafter init path's invariant. Generator.next's transition
+        // shim handles the bootstrap on the first decode tick.
+        if (options.skip_lazy_preforward) {
+            const sample_lazy = sampleTokenLazy(logits, sampling, s);
+            _ = mlx.mlx_array_free(logits);
+            try mlx.check(mlx.mlx_array_eval(sample_lazy));
+            var first_val: i32 = 0;
+            try mlx.check(mlx.mlx_array_item_int32(&first_val, sample_lazy));
+            _ = mlx.mlx_array_free(sample_lazy);
+
+            const gen = Generator{
+                .xfm = xfm,
+                .ctx = ctx,
+                .tok = tok,
+                .next_token_id = @intCast(first_val),
+                .step = 0,
+                .max_tokens = max_tokens,
+                .sampling = sampling,
+                .prompt_tokens = @intCast(prompt_ids.len),
+                .completion_tokens = 0,
+                .finish_reason = "length",
+                .done = false,
+                .eos_token_ids = eos_token_ids,
+                .generated_ids = std.ArrayList(u32).empty,
+                .timeout_ns = 0,
+                .timer = io_util.Stopwatch.init(io),
+                .last_hidden = if (has_captured_hidden) captured_hidden else mlx.mlx_array_new(),
+                .has_last_hidden = has_captured_hidden,
+                .prng = std.Random.DefaultPrng.init(sampling.seed orelse @intCast(std.Io.Timestamp.now(io, .real).toMilliseconds())),
+                .prompt_ids_owned = prompt_owned,
+                .prompt_ids_alloc = allocator,
+            };
             return gen;
         }
 
@@ -525,7 +676,7 @@ pub const Generator = struct {
         const lazy_token = sampleTokenLazy(logits, sampling, s);
         _ = mlx.mlx_array_free(logits);
 
-        const next_logits = try lazyForward(xfm, lazy_token);
+        const next_logits = try lazyForward(xfm, &ctx, lazy_token);
 
         // Async-eval the decode pipeline (single-token graphs, much smaller)
         {
@@ -544,6 +695,7 @@ pub const Generator = struct {
 
         var gen = Generator{
             .xfm = xfm,
+            .ctx = ctx,
             .tok = tok,
             .next_token_id = @intCast(val),
             .step = 0,
@@ -724,7 +876,7 @@ pub const Generator = struct {
             const t1_input = mlx.mlx_array_new_data(&t1_i32, &t1_shape, 2, .int32);
             defer _ = mlx.mlx_array_free(t1_input);
 
-            const cold_logits = try xfm.forward(t1_input); // cache.step += 1
+            const cold_logits = try xfm.forwardWith(&self.ctx, t1_input); // cache.step += 1
             defer _ = mlx.mlx_array_free(cold_logits);
 
             const lazy = sampleTokenLazy(cold_logits, self.sampling, s);
@@ -752,21 +904,21 @@ pub const Generator = struct {
         const draft = draft_slice.?;
         const m: u32 = @intCast(draft.len);
 
-        // ── Phase 3: Snapshot KV + per-layer SSM + moe_seq_offset ──
+        // ── Phase 3: Snapshot KV + per-layer SSM + moe_seq_offset + DSV4 ──
         // Cache enters at cache.step = prompt_len + TE.
-        var kv_snap = try xfm.cache.snapshot();
+        var kv_snap = try self.ctx.cache.snapshot();
         defer kv_snap.deinit();
         var ssm_snaps: ?[]SSMCacheEntrySnapshot = null;
         defer if (ssm_snaps) |snaps| {
             for (snaps) |*sn| ssmSnapshotDeinit(sn);
             xfm.allocator.free(snaps);
         };
-        if (xfm.ssm_entries) |entries| {
+        if (self.ctx.ssm_entries) |entries| {
             const out = try xfm.allocator.alloc(SSMCacheEntrySnapshot, entries.len);
             for (entries, 0..) |*entry, i| out[i] = ssmSnapshot(entry);
             ssm_snaps = out;
         }
-        const moe_seq_offset_snap = xfm.moe_seq_offset;
+        const moe_seq_offset_snap = self.ctx.moe_seq_offset.*;
 
         // ── Phase 4: Verify forward `[t1, draft[0..m-1]]` length 1+m ──
         // cache.step at start = prompt_len + TE; after = prompt_len + TE + 1 + m.
@@ -784,7 +936,7 @@ pub const Generator = struct {
         const verify_input = mlx.mlx_array_new_data(verify_input_buf.ptr, &verify_shape, 2, .int32);
         defer _ = mlx.mlx_array_free(verify_input);
 
-        const verify_logits = try xfm.forward(verify_input);
+        const verify_logits = try xfm.forwardWith(&self.ctx, verify_input);
         // verify_logits shape [1, 1+m, V]. Sliced and freed below.
         self.pld_attempted += 1;
 
@@ -888,11 +1040,11 @@ pub const Generator = struct {
         // both t1 AND the drafts. Skipping the re-forward here would leave
         // the cache at prompt_len + TE — one short of the post-emit invariant.
         if (!full_accept) {
-            try xfm.cache.restore(&kv_snap);
+            try self.ctx.cache.restore(&kv_snap);
             if (ssm_snaps) |snaps| {
-                for (xfm.ssm_entries.?, snaps) |*entry, *sn| try ssmRestore(entry, sn);
+                for (self.ctx.ssm_entries.?, snaps) |*entry, *sn| try ssmRestore(entry, sn);
             }
-            xfm.moe_seq_offset = moe_seq_offset_snap;
+            self.ctx.moe_seq_offset.* = moe_seq_offset_snap;
 
             const re_seq_len: c_int = @intCast(1 + accepted);
             const re_input_buf = try allocator.alloc(i32, 1 + accepted);
@@ -902,7 +1054,7 @@ pub const Generator = struct {
             const re_shape = [_]c_int{ 1, re_seq_len };
             const re_input = mlx.mlx_array_new_data(re_input_buf.ptr, &re_shape, 2, .int32);
             defer _ = mlx.mlx_array_free(re_input);
-            const re_logits = try xfm.forward(re_input);
+            const re_logits = try xfm.forwardWith(&self.ctx, re_input);
             _ = mlx.mlx_array_free(re_logits);
         }
 
@@ -1029,7 +1181,7 @@ pub const Generator = struct {
         // RoPE offset: position the drafter's queries rotate by. Per upstream
         // `set_shared_kv`, this is `target.cache.step` and stays constant
         // across all `m` drafter steps in this round.
-        const rope_offset: c_int = @intCast(xfm.cache.step);
+        const rope_offset: c_int = @intCast(self.ctx.cache.step);
 
         // ── Phase 1: draft `m` tokens lazily, no per-step CPU sync ──
         //
@@ -1074,7 +1226,7 @@ pub const Generator = struct {
             var i: u32 = 0;
             while (i < m) : (i += 1) {
                 const h_prev_arg: mlx.mlx_array = if (h_prev_owner) |h| h else self.last_hidden;
-                const step_out = try drafter_mod.stepArr(drafter, xfm, prev_tok_arr, h_prev_arg, rope_offset);
+                const step_out = try drafter_mod.stepArr(drafter, xfm, self.ctx.cache, prev_tok_arr, h_prev_arg, rope_offset);
                 // Sample lazily — `sampleTokenLazy` for greedy returns the
                 // argmax as a [1]-shaped lazy array. NO eval here.
                 draft_arrs[i] = sampleTokenLazy(step_out.logits, self.sampling, s);
@@ -1090,20 +1242,20 @@ pub const Generator = struct {
             }
         }
 
-        // ── Phase 2: snapshot KV + SSM ──
-        var kv_snap = try xfm.cache.snapshot();
+        // ── Phase 2: snapshot KV + SSM + DSV4 ──
+        var kv_snap = try self.ctx.cache.snapshot();
         defer kv_snap.deinit();
         var ssm_snaps: ?[]SSMCacheEntrySnapshot = null;
         defer if (ssm_snaps) |snaps| {
             for (snaps) |*sn| ssmSnapshotDeinit(sn);
             xfm.allocator.free(snaps);
         };
-        if (xfm.ssm_entries) |entries| {
+        if (self.ctx.ssm_entries) |entries| {
             const out = try xfm.allocator.alloc(SSMCacheEntrySnapshot, entries.len);
             for (entries, 0..) |*entry, idx| out[idx] = ssmSnapshot(entry);
             ssm_snaps = out;
         }
-        const moe_seq_offset_snap = xfm.moe_seq_offset;
+        const moe_seq_offset_snap = self.ctx.moe_seq_offset.*;
 
         // ── Phase 3: build verify input by concatenating [t1, drafts...] ──
         //
@@ -1141,7 +1293,7 @@ pub const Generator = struct {
         var new_hidden = mlx.mlx_array_new();
         // Captures the post-final-norm hidden at the LAST input position
         // (= position m, predicting the bonus token if all drafts accept).
-        const verify_logits = try xfm.forwardCaptureHidden(verify_input, &new_hidden);
+        const verify_logits = try xfm.forwardWithCapture(&self.ctx, verify_input, &new_hidden);
         // verify_logits shape: [1, 1+m, V]
         self.drafter_attempted += 1;
 
@@ -1334,11 +1486,11 @@ pub const Generator = struct {
         // accepted draft (where next_pending will live).
         _ = mlx.mlx_array_free(new_hidden);
 
-        try xfm.cache.restore(&kv_snap);
+        try self.ctx.cache.restore(&kv_snap);
         if (ssm_snaps) |snaps| {
-            for (xfm.ssm_entries.?, snaps) |*entry, *sn| try ssmRestore(entry, sn);
+            for (self.ctx.ssm_entries.?, snaps) |*entry, *sn| try ssmRestore(entry, sn);
         }
-        xfm.moe_seq_offset = moe_seq_offset_snap;
+        self.ctx.moe_seq_offset.* = moe_seq_offset_snap;
 
         const re_seq_len: c_int = @intCast(1 + accepted);
         const re_input_buf = try allocator.alloc(i32, 1 + accepted);
@@ -1350,7 +1502,7 @@ pub const Generator = struct {
         defer _ = mlx.mlx_array_free(re_input);
 
         var re_new_hidden = mlx.mlx_array_new();
-        const re_logits = try xfm.forwardCaptureHidden(re_input, &re_new_hidden);
+        const re_logits = try xfm.forwardWithCapture(&self.ctx, re_input, &re_new_hidden);
         _ = mlx.mlx_array_free(re_logits);
 
         const tokens = try allocator.alloc(u32, 1 + accepted);
@@ -1398,6 +1550,7 @@ pub const Generator = struct {
         self.spec_disabled_runtime = true;
     }
 
+
     /// Returns the next token ID, or null when generation is finished.
     ///
     /// Pipeline architecture (matches mlx-lm's generator pattern):
@@ -1431,7 +1584,7 @@ pub const Generator = struct {
             const tok_shape = [_]c_int{ 1, 1 };
             const tok_input = mlx.mlx_array_new_data(&tok_i32, &tok_shape, 2, .int32);
             defer _ = mlx.mlx_array_free(tok_input);
-            self.pending_logits = try self.xfm.forward(tok_input);
+            self.pending_logits = try self.xfm.forwardWith(&self.ctx, tok_input);
             self.has_pending_logits = true;
         }
 
@@ -1445,7 +1598,7 @@ pub const Generator = struct {
             const lazy_token = sampleTokenLazy(step_logits, self.sampling, self.xfm.s);
             _ = mlx.mlx_array_free(step_logits);
 
-            if (lazyForward(self.xfm, lazy_token)) |next_logits| {
+            if (lazyForward(self.xfm, &self.ctx, lazy_token)) |next_logits| {
                 const arr = [_]mlx.mlx_array{ lazy_token, next_logits };
                 const vec = mlx.mlx_vector_array_new_data(&arr, 2);
                 _ = mlx.mlx_async_eval(vec);
@@ -1504,7 +1657,7 @@ pub const Generator = struct {
             const tok_shape = [_]c_int{ 1, 1 };
             const tok_input = mlx.mlx_array_new_data(&tok_i32, &tok_shape, 2, .int32);
             defer _ = mlx.mlx_array_free(tok_input);
-            break :blk try self.xfm.forward(tok_input);
+            break :blk try self.xfm.forwardWith(&self.ctx, tok_input);
         };
 
         // Logprobs: fully synchronous
@@ -1523,7 +1676,7 @@ pub const Generator = struct {
         _ = mlx.mlx_array_free(step_logits);
 
         if (self.step < self.max_tokens) {
-            const next_logits = lazyForward(self.xfm, lazy_token) catch {
+            const next_logits = lazyForward(self.xfm, &self.ctx, lazy_token) catch {
                 try mlx.check(mlx.mlx_array_eval(lazy_token));
                 var val: i32 = 0;
                 try mlx.check(mlx.mlx_array_item_int32(&val, lazy_token));
@@ -1651,7 +1804,7 @@ pub const Generator = struct {
             const tok_shape = [_]c_int{ 1, 1 };
             const tok_input = mlx.mlx_array_new_data(&tok_i32, &tok_shape, 2, .int32);
             defer _ = mlx.mlx_array_free(tok_input);
-            const next_logits = try self.xfm.forward(tok_input);
+            const next_logits = try self.xfm.forwardWith(&self.ctx, tok_input);
             const arr = [_]mlx.mlx_array{next_logits};
             const vec = mlx.mlx_vector_array_new_data(&arr, 1);
             _ = mlx.mlx_async_eval(vec);
@@ -1705,7 +1858,7 @@ pub const Generator = struct {
         const tok_input = mlx.mlx_array_new_data(&tok_i32, &tok_shape, 2, .int32);
         defer _ = mlx.mlx_array_free(tok_input);
 
-        const logits = self.xfm.forward(tok_input) catch return;
+        const logits = self.xfm.forwardWith(&self.ctx, tok_input) catch return;
         const arr = [_]mlx.mlx_array{logits};
         const vec = mlx.mlx_vector_array_new_data(&arr, 1);
         _ = mlx.mlx_async_eval(vec);
@@ -1718,12 +1871,12 @@ pub const Generator = struct {
 
 /// Build forward pass from a lazy sampled token array.
 /// Reshapes [1] -> [1, 1] and calls transformer forward. All lazy (no eval).
-fn lazyForward(xfm: *Transformer, lazy_token: mlx.mlx_array) !mlx.mlx_array {
+fn lazyForward(xfm: *Transformer, ctx: *ForwardCtx, lazy_token: mlx.mlx_array) !mlx.mlx_array {
     const tok_shape = [_]c_int{ 1, 1 };
     var reshaped = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(reshaped);
     try mlx.check(mlx.mlx_reshape(&reshaped, lazy_token, &tok_shape, 2, xfm.s));
-    return try xfm.forward(reshaped);
+    return try xfm.forwardWith(ctx, reshaped);
 }
 
 /// Sample a token lazily from logits — returns a lazy MLX array (no eval).
@@ -1870,9 +2023,20 @@ fn sampleResidual(target_probs: mlx.mlx_array, draft_probs: mlx.mlx_array, s: ml
     return sampleFromProbs(residual, s);
 }
 
-fn sampleTokenLazy(logits: mlx.mlx_array, sampling: SamplingParams, s: mlx.mlx_stream) mlx.mlx_array {
+pub fn sampleTokenLazy(logits: mlx.mlx_array, sampling: SamplingParams, s: mlx.mlx_stream) mlx.mlx_array {
     const shape = mlx.getShape(logits);
     const seq_len = shape[1];
+
+    // Greedy + seq_len==1 (the decode hot path): one mlx op total. argmax_axis
+    // over the vocab dim of a `[1, 1, V]` tensor yields a `[1, 1]` int array,
+    // which downstream (resolvePendingToken / lazyForward / async_eval vector)
+    // treats identically to `[1]`. Skipping the otherwise-needed reshape +
+    // argmax-on-2D combo cuts ~one FFI call per decode step.
+    if (seq_len == 1 and sampling.temperature < 0.01) {
+        var result = mlx.mlx_array_new();
+        _ = mlx.mlx_argmax_axis(&result, logits, -1, false, s);
+        return result;
+    }
 
     // Extract last position: [1, seq_len, vocab] -> [1, vocab]
     // `current` is the single owned intermediate — freed before each reassignment.
@@ -3114,3 +3278,7 @@ test "InitOptions.lookup_prompt = null preserves existing behavior" {
     try testing.expectEqualSlices(u32, &prompt, src);
     try testing.expectEqual(@as([*]const u32, prompt[0..].ptr), src.ptr);
 }
+
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+

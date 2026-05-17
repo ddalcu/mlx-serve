@@ -5,10 +5,15 @@ const model_mod = @import("model.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const transformer_mod = @import("transformer.zig");
 const generate_mod = @import("generate.zig");
+const model_discovery = @import("model_discovery.zig");
+const model_registry_mod = @import("model_registry.zig");
 const drafter_mod = @import("drafter.zig");
 const chat_mod = @import("chat.zig");
 const server_mod = @import("server.zig");
+const scheduler_mod = @import("scheduler.zig");
 const vision_mod = @import("vision.zig");
+const ds4_arch = @import("arch/ds4.zig");
+const ds4_ffi = @import("ds4_ffi.zig");
 const log = @import("log.zig");
 
 pub const VERSION: []const u8 = build_options.version;
@@ -54,6 +59,36 @@ fn printUsage(io: std.Io) void {
         \\  --draft-block-size <n>  Tokens per drafter round. Default is
         \\                        auto-detected per Gemma 4 target (E2B=2,
         \\                        E4B=4, 26B-A4B=4, 31B=8); pass to override.
+        \\  --kv-quant <mode>   KV-cache quantization scheme:
+        \\                        off (default), 4, 8     — affine group quant.
+        \\                        turbo2, turbo4          — Hadamard-rotated
+        \\                          affine at 2/4 bits; lower distortion at
+        \\                          comparable storage. Per-request override
+        \\                          via the `kv_quant` body field.
+        \\  --kv-attn-mode {{dense|fused}}
+        \\                      Attention path for quantized KV. `dense`
+        \\                        (default) dequantizes K/V before SDPA;
+        \\                        `fused` consumes the quant triples directly
+        \\                        via mlx_quantized_matmul (opt-in; only
+        \\                        effective at --kv-quant 4 or 8).
+        \\  --prefix-cache-mem <n>{{KB,MB,GB}}
+        \\                      Hot prefix cache KV-bytes budget (default: 2GB).
+        \\                      Evicts LRU entries until the budget fits.
+        \\                      Pass 0/off to disable the byte budget.
+        \\  --model-dir <dir>   Directory of MLX models to discover at startup.
+        \\                        Discovered siblings appear in /v1/models and
+        \\                        can be loaded on-demand via /v1/load-model
+        \\                        (or by sending a request with model=<id>).
+        \\  --max-resident-models <n>
+        \\                      Maximum loaded models in memory (default: 3).
+        \\                        ensureLoaded evicts LRU before exceeding.
+        \\  --max-resident-mem <n>{{KB,MB,GB}}|auto
+        \\                      Summed resident-bytes cap across all loaded
+        \\                        models. Default 'auto' = 80% of MLX wired
+        \\                        limit at startup. Pass 0 to disable.
+        \\  --idle-evict-secs <n>
+        \\                      Evict .ready entries with refcount==0 if
+        \\                        idle for this many seconds. Default: off.
         \\  --log-level <lvl>   Log level: error, warn, info, debug (default: info)
         \\  --version           Print version and exit
         \\  --help              Show this help
@@ -85,6 +120,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     var model_dir: []const u8 = DEFAULT_MODEL_DIR;
+    var models_root: ?[]const u8 = null; // --model-dir for plan 05 discovery
     var port: u16 = 11234;
     var host: []const u8 = "0.0.0.0";
     var serve_mode = false;
@@ -102,6 +138,23 @@ pub fn main(init: std.process.Init) !void {
     var drafter_dir: ?[]const u8 = null; // Path to Gemma 4 assistant drafter checkpoint
     var draft_block_size: u32 = drafter_mod.DEFAULT_BLOCK_SIZE;
     var draft_block_size_explicit: bool = false; // user passed --draft-block-size?
+    // Plan 04 Phase 1: pre-fault weights and pre-compile kernels at boot.
+    // Default ON in serve mode — small boot-time cost, big cold-prefill win.
+    // --no-warmup-eager opts out for benchmarking / minimal-footprint deployments.
+    var warmup_eager: bool = true;
+    var kv_quant_config: transformer_mod.KVQuantConfig = transformer_mod.KVQuantConfig.dense;
+    // Phase 2 (Plan ricky): fused attention reads K/V triples directly via
+    // mlx_quantized_matmul instead of dequantizing through DenseKVView.
+    // Off by default — only `.affine` cache scheme is supported by the
+    // v1 fused path; TurboQuant + dense schemes ignore it.
+    var kv_attn_fused_default: bool = false;
+    // Plan 05 Phase D: multi-model caps. Defaults aim for "comfortable on
+    // 32–64 GB systems running Gemma 4 E4B-class models". Override via the
+    // CLI flags below; the Swift app exposes them under Advanced settings.
+    var max_resident_models: u32 = 3;
+    var max_resident_mem: u64 = 0; // 0 = auto (80% of wired limit at startup)
+    var max_resident_mem_explicit: bool = false;
+    var idle_evict_secs: ?u32 = null;
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--version")) {
@@ -168,9 +221,120 @@ pub fn main(init: std.process.Init) !void {
             if (log.Level.fromString(args[i])) |level| {
                 log.setLevel(level);
             }
+        } else if (std.mem.eql(u8, args[i], "--warmup-eager")) {
+            warmup_eager = true;
+        } else if (std.mem.eql(u8, args[i], "--no-warmup-eager")) {
+            warmup_eager = false;
+        } else if (std.mem.eql(u8, args[i], "--prefill-chunk") and i + 1 < args.len) {
+            i += 1;
+            const v = std.fmt.parseInt(usize, args[i], 10) catch 8192;
+            generate_mod.prefill_chunk_override = v;
+        } else if (std.mem.eql(u8, args[i], "--prefill-trace")) {
+            generate_mod.prefill_trace_force = true;
+        } else if (std.mem.eql(u8, args[i], "--prefix-cache-entries") and i + 1 < args.len) {
+            i += 1;
+            server_mod.prefix_cache_capacity = std.fmt.parseInt(u32, args[i], 10) catch 1;
+        } else if (std.mem.eql(u8, args[i], "--prefix-cache-mem") and i + 1 < args.len) {
+            // Wave 1.B — KV-bytes budget for the hot prefix cache. Accepts
+            // bare numbers (bytes), a suffix of `MB`/`GB`/`KB` (case-
+            // insensitive), or `0`/`off` to disable the byte budget entirely
+            // (count cap from --prefix-cache-entries still applies).
+            i += 1;
+            server_mod.prefix_cache_mem_bytes = parseSizeArg(args[i]) catch {
+                log.err("--prefix-cache-mem: expected '<n>{{MB,GB,KB}}' or '0'/'off'; got '{s}'\n", .{args[i]});
+                std.process.exit(1);
+            };
+        } else if (std.mem.eql(u8, args[i], "--max-concurrent") and i + 1 < args.len) {
+            i += 1;
+            server_mod.max_concurrent = std.fmt.parseInt(u32, args[i], 10) catch 1;
+        } else if (std.mem.eql(u8, args[i], "--model-dir") and i + 1 < args.len) {
+            i += 1;
+            models_root = args[i];
+        } else if (std.mem.eql(u8, args[i], "--max-resident-models") and i + 1 < args.len) {
+            // Plan 05 Phase D: cap on .ready entries in the registry.
+            // ensureLoaded evicts LRU before loading when this would be exceeded.
+            i += 1;
+            max_resident_models = std.fmt.parseInt(u32, args[i], 10) catch 3;
+            if (max_resident_models == 0) max_resident_models = 1;
+        } else if (std.mem.eql(u8, args[i], "--max-resident-mem") and i + 1 < args.len) {
+            // Plan 05 Phase D: cap on summed resident bytes. Accepts the
+            // same suffixes as --prefix-cache-mem. Special string "auto"
+            // (or default 0) → 80% of mlx_set_wired_limit at server start.
+            i += 1;
+            if (std.mem.eql(u8, args[i], "auto")) {
+                max_resident_mem = 0;
+            } else {
+                max_resident_mem = parseSizeArg(args[i]) catch {
+                    log.err("--max-resident-mem: expected '<n>{{MB,GB,KB}}' or 'auto'; got '{s}'\n", .{args[i]});
+                    std.process.exit(1);
+                };
+                max_resident_mem_explicit = true;
+            }
+        } else if (std.mem.eql(u8, args[i], "--idle-evict-secs") and i + 1 < args.len) {
+            // Plan 05 Phase D: idle-tick eviction window. When set, the
+            // inference loop's idle path evicts .ready entries (refcount==0)
+            // whose last_used_ns is older than this. Default off — eviction
+            // is on-demand only.
+            i += 1;
+            const n = std.fmt.parseInt(u32, args[i], 10) catch 0;
+            idle_evict_secs = if (n > 0) n else null;
+        } else if (std.mem.eql(u8, args[i], "--kv-quant") and i + 1 < args.len) {
+            i += 1;
+            if (std.mem.eql(u8, args[i], "off") or std.mem.eql(u8, args[i], "0")) {
+                kv_quant_config = transformer_mod.KVQuantConfig.dense;
+            } else if (std.mem.eql(u8, args[i], "4")) {
+                kv_quant_config = transformer_mod.KVQuantConfig.affine(4);
+            } else if (std.mem.eql(u8, args[i], "8")) {
+                kv_quant_config = transformer_mod.KVQuantConfig.affine(8);
+            } else if (std.mem.eql(u8, args[i], "turbo2")) {
+                kv_quant_config = transformer_mod.KVQuantConfig.turboquant(2);
+            } else if (std.mem.eql(u8, args[i], "turbo4")) {
+                kv_quant_config = transformer_mod.KVQuantConfig.turboquant(4);
+            } else {
+                log.err("--kv-quant: expected one of {{off, 4, 8, turbo2, turbo4}}; got '{s}'\n", .{args[i]});
+                std.process.exit(1);
+            }
+        } else if (std.mem.eql(u8, args[i], "--kv-attn-mode") and i + 1 < args.len) {
+            i += 1;
+            if (std.mem.eql(u8, args[i], "dense")) {
+                kv_attn_fused_default = false;
+            } else if (std.mem.eql(u8, args[i], "fused")) {
+                kv_attn_fused_default = true;
+            } else {
+                log.err("--kv-attn-mode: expected 'dense' or 'fused'; got '{s}'\n", .{args[i]});
+                std.process.exit(1);
+            }
         }
     }
 
+    // Plan 05 Phase 1: model discovery. When --model-dir is passed, scan
+    // the directory for subdirectories containing config.json. The
+    // discovered list is published via /v1/models. v1: routing still goes
+    // to a single loaded model — if --model isn't set, pick the first
+    // discovered. v2 (plan 05 phases 2-5) adds on-demand load and LRU.
+    var discovery_storage: ?model_discovery.DiscoveryResult = null;
+    defer if (discovery_storage) |*d| d.deinit();
+    if (models_root) |root| {
+        discovery_storage = model_discovery.discoverModels(io, allocator, root) catch |err| blk: {
+            log.warn("--model-dir scan failed ({s}): {s}\n", .{ root, @errorName(err) });
+            break :blk null;
+        };
+        if (discovery_storage) |*d| {
+            log.info("Discovered {d} model(s) under {s}:\n", .{ d.models.len, root });
+            for (d.models) |m| {
+                if (m.bytes_on_disk) |b| {
+                    log.info("  - {s} ({d:.1} GB)\n", .{ m.id, @as(f64, @floatFromInt(b)) / 1_073_741_824.0 });
+                } else {
+                    log.info("  - {s}\n", .{m.id});
+                }
+            }
+            // If --model wasn't passed, pick the first discovered as the loaded one.
+            if (model_dir.len == 0 and d.models.len > 0) {
+                model_dir = d.models[0].path;
+                log.info("Auto-selected --model {s} (first discovered)\n", .{d.models[0].id});
+            }
+        }
+    }
     // In serve mode, check if the port is already in use before loading the model
     // (model loading takes seconds — fail fast instead of wasting time)
     if (serve_mode) {
@@ -179,6 +343,40 @@ pub fn main(init: std.process.Init) !void {
             log.err("Stop it first (pkill -f mlx-serve) or use a different port (--port {d}).\n", .{port + 1});
             std.process.exit(1);
         }
+    }
+
+    // ── GGUF early-branch: route to the embedded ds4 engine ──
+    //
+    // mlx-serve serves DSV4-Flash through `lib/ds4/` (antirez/ds4). We pick the
+    // backend at load time by file extension. Any path ending in `.gguf` (or
+    // referring to a directory containing exactly one `.gguf`) bypasses the
+    // MLX safetensors path entirely. Both offline (`--prompt`) and serve
+    // (`--serve`) modes are wired; serve constructs a stub LoadedModel whose
+    // request handlers route through the engine instead of the MLX path.
+    if (isGgufPath(io, model_dir)) {
+        if (serve_mode) {
+            try runDs4Serve(
+                io,
+                allocator,
+                model_dir,
+                host,
+                port,
+                ctx_size,
+                timeout,
+                reasoning_budget,
+                max_resident_models,
+                max_resident_mem,
+                max_resident_mem_explicit,
+                idle_evict_secs,
+            );
+            return;
+        }
+        const prompt_text = prompt orelse {
+            log.err("ds4 offline mode requires --prompt <text>\n", .{});
+            std.process.exit(2);
+        };
+        try runDs4Offline(io, allocator, model_dir, prompt_text, max_tokens, temperature);
+        return;
     }
 
     // Print MLX version
@@ -209,6 +407,12 @@ pub fn main(init: std.process.Init) !void {
             no_vision,
         });
     }
+    switch (kv_quant_config.scheme) {
+        .off => log.info("[args] kv-quant: off\n", .{}),
+        .affine => log.info("[args] kv-quant: affine {d}-bit (group={d})\n", .{ kv_quant_config.bits, kv_quant_config.group_size }),
+        .turboquant_2, .turboquant_4 => log.info("[args] kv-quant: turboquant {d}-bit (group={d}, Hadamard rotation)\n", .{ kv_quant_config.bits, kv_quant_config.group_size }),
+    }
+    log.info("[args] kv-attn-mode: {s}\n", .{if (kv_attn_fused_default) "fused" else "dense"});
 
     // Set GPU as default
     var metal_avail: bool = false;
@@ -224,8 +428,15 @@ pub fn main(init: std.process.Init) !void {
     // Seed MLX RNG with current wall-clock time for non-deterministic sampling
     _ = mlx.mlx_random_seed(@intCast(std.Io.Timestamp.now(io, .real).toMilliseconds()));
 
-    // Parse config
-    var config = try model_mod.parseConfig(io, allocator, model_dir);
+    // Parse config — heap allocate so the LoadedModel can take ownership
+    // (Plan 05). Free path in serve_mode = registry.deinit; offline mode =
+    // explicit defer on `config_storage`.
+    const config_storage = try allocator.create(model_mod.ModelConfig);
+    var config_owned_by_registry = false;
+    errdefer if (!config_owned_by_registry) allocator.destroy(config_storage);
+    defer if (!config_owned_by_registry) allocator.destroy(config_storage);
+    config_storage.* = try model_mod.parseConfig(io, allocator, model_dir);
+    const config = config_storage;
     log.info("Model: {s} ({d} layers, {d}-dim, head_dim={d}, {d}h/{d}kv, {d}-bit quant)\n", .{
         config.model_type,
         config.num_hidden_layers,
@@ -236,14 +447,32 @@ pub fn main(init: std.process.Init) !void {
         config.quant_bits,
     });
 
-    // Load tokenizer
+    // Load tokenizer — heap-allocated, ownership transfers to registry on serve_mode.
     log.info("Loading tokenizer...\n", .{});
-    var tok = try tokenizer_mod.loadTokenizer(io, allocator, model_dir);
-    defer tok.deinit();
+    const tok = try allocator.create(tokenizer_mod.Tokenizer);
+    var tok_owned_by_registry = false;
+    errdefer if (!tok_owned_by_registry) {
+        tok.deinit();
+        allocator.destroy(tok);
+    };
+    defer if (!tok_owned_by_registry) {
+        tok.deinit();
+        allocator.destroy(tok);
+    };
+    tok.* = try tokenizer_mod.loadTokenizer(io, allocator, model_dir);
 
-    // Load chat config
-    var chat_config = try chat_mod.loadChatConfig(io, allocator, model_dir);
-    defer chat_config.deinit();
+    // Load chat config — heap-allocated, ownership transfers to registry on serve_mode.
+    const chat_config = try allocator.create(chat_mod.ChatConfig);
+    var chat_config_owned_by_registry = false;
+    errdefer if (!chat_config_owned_by_registry) {
+        chat_config.deinit();
+        allocator.destroy(chat_config);
+    };
+    defer if (!chat_config_owned_by_registry) {
+        chat_config.deinit();
+        allocator.destroy(chat_config);
+    };
+    chat_config.* = try chat_mod.loadChatConfig(io, allocator, model_dir);
 
     // Resolve EOS tokens from tokenizer if config.json didn't specify any
     if (config.num_eos_tokens == 0) {
@@ -272,152 +501,160 @@ pub fn main(init: std.process.Init) !void {
 
     // Pre-encode the user-turn marker so vision-image insertion can locate the
     // latest user turn at request time, regardless of architecture.
-    try config.populateUserTurnMarker(allocator, &tok, chat_config.chat_template);
+    try config.populateUserTurnMarker(allocator, tok, chat_config.chat_template);
 
-    // Load weights (include vision weights if model has vision config and not disabled)
     const load_vision = config.has_vision and !no_vision;
-    log.info("Loading weights...\n", .{});
-    var weights = if (load_vision)
-        try model_mod.loadWeightsWithVision(io, allocator, model_dir)
-    else
-        try model_mod.loadWeights(io, allocator, model_dir);
-    defer weights.deinit();
-
-    // Initialize transformer
-    var xfm = try transformer_mod.Transformer.init(io, allocator, config, &weights);
-    defer xfm.deinit();
-
-    // Initialize vision encoder if model supports it (and not disabled)
-    var vision_enc: ?vision_mod.VisionEncoder = if (load_vision) blk: {
-        log.info("Initializing vision encoder...\n", .{});
-        break :blk vision_mod.VisionEncoder.init(allocator, config, &weights) catch |err| {
-            if (err == error.MissingVisionWeights) {
-                log.warn("Vision weights missing — vision disabled (model may have been quantized without vision tower)\n", .{});
-                break :blk null;
-            }
-            return err;
-        };
-    } else null;
-    defer {
-        if (vision_enc) |*ve| ve.deinit();
-    }
-
-    // Wire model weights into GPU memory (prevents paging, matches mlx-lm behavior)
-    {
-        var dev = mlx.mlx_device{ .ctx = null };
-        _ = mlx.mlx_get_default_device(&dev);
-        var info = mlx.mlx_device_info_new();
-        if (mlx.mlx_device_info_get(&info, dev) == 0) {
-            var max_rec: usize = 0;
-            if (mlx.mlx_device_info_get_size(&max_rec, info, "max_recommended_working_set_size") == 0 and max_rec > 0) {
-                var old_limit: usize = 0;
-                _ = mlx.mlx_set_wired_limit(&old_limit, max_rec);
-                log.debug("Wired limit set to {d} MB\n", .{max_rec / (1024 * 1024)});
-            }
-            _ = mlx.mlx_device_info_free(info);
-        }
-    }
-
-    // JIT-compile activation functions (fuses ops → single kernels, matching mlx-lm)
-    if (config.hidden_act == .gelu_approx) {
-        xfm.compileGelu();
-        xfm.compileGeglu(); // gelu(gate) * up → 1 kernel
-    }
-    if (config.final_logit_softcapping > 0.0) {
-        xfm.compileSoftcap(); // tanh(x/cap) * cap → 1 kernel
-    }
-    // MoE routing fusion: top-K expert selection + softmax/renormalize → 1 kernel.
-    // Only worthwhile if any layer is actually MoE. The closure is shapeless so it
-    // compiles cleanly across batch/seq variations; disabled if no MoE layers exist.
-    if (xfm.moe_layers != null) {
-        xfm.compileMoeRouting();
-    }
-
-    log.info("Model ready.\n", .{});
 
     if (serve_mode) {
-        // Start HTTP server.
-        // Optional Gemma 4 assistant drafter. Loaded once at startup; held for
-        // the lifetime of the server. `bind` validates the drafter+target
-        // pair (backbone hidden size, layer-type compatibility); failure
-        // surfaces a clear error and we fall back to non-drafter mode.
-        var drafter_storage: ?drafter_mod.DrafterModel = null;
-        defer if (drafter_storage) |*d| d.deinit();
-        var drafter_ptr: ?*drafter_mod.DrafterModel = null;
-        if (drafter_dir) |dir| {
-            log.info("Loading drafter from {s}...\n", .{dir});
-            const dgpu_stream = mlx.gpuStream();
-            var d = drafter_mod.loadDrafter(io, allocator, dgpu_stream, dir) catch |err| {
-                log.err("Failed to load drafter at {s}: {s}\n", .{ dir, @errorName(err) });
-                std.process.exit(1);
-            };
-            d.bind(&xfm) catch |err| {
-                log.err(
-                    "Drafter checkpoint at {s} is incompatible with target: {s}\n" ++
-                        "  (drafter+target must share backbone_hidden_size, vocab_size, and have\n" ++
-                        "  matching layer types in the target's non-shared K/V layers — see\n" ++
-                        "  preceding [drafter] log lines for the specific mismatch)\n",
-                    .{ dir, @errorName(err) },
-                );
-                d.deinit();
-                std.process.exit(1);
-            };
-            drafter_storage = d;
-            drafter_ptr = &drafter_storage.?;
+        // ── Plan 05: build the ModelRegistry, register a stub for the
+        //    loaded model, and pass everything to serve(). The registry
+        //    takes ownership of `discovery_storage` (if any) and, once
+        //    the inference thread completes loading, ownership of
+        //    config/tok/chat_config too.
+        const model_id = blk: {
+            var p = model_dir;
+            while (p.len > 0 and p[p.len - 1] == '/') p = p[0 .. p.len - 1];
+            if (p.len == 0) break :blk config.model_type;
+            if (std.mem.lastIndexOfScalar(u8, p, '/')) |slash_idx| break :blk p[slash_idx + 1 ..];
+            break :blk p;
+        };
 
-            // Auto-detect block_size from the target's config when the user
-            // didn't pin it via --draft-block-size. The per-target table
-            // (vLLM PR #41745) gives 31B a bigger budget so its slower verify
-            // forwards are amortized, and keeps MoE / smaller models at safe
-            // defaults. Explicit --draft-block-size always wins.
-            if (!draft_block_size_explicit) {
-                const auto_bs = drafter_mod.recommendedBlockSize(&config);
-                if (auto_bs != draft_block_size) {
-                    log.info(
-                        "Drafter ready (block_size={d}, auto-detected for {s}/{d}-layer{s}).\n",
-                        .{
-                            auto_bs,
-                            config.model_type,
-                            config.num_hidden_layers,
-                            if (config.isMoe()) ",moe" else "",
-                        },
-                    );
-                    draft_block_size = auto_bs;
-                } else {
-                    log.info("Drafter ready (block_size={d}, default).\n", .{draft_block_size});
-                }
-            } else {
-                log.info("Drafter ready (block_size={d}, user override).\n", .{draft_block_size});
-            }
+        const discovery_for_registry = discovery_storage;
+        discovery_storage = null; // ownership moves to the registry
 
-            // MoE caveat: even at very high per-draft acceptance (97.8% on
-            // 26B-A4B echo, bench 2026-05-08), the verify forward's expert-
-            // routing penalty makes drafter a net regression at single-stream
-            // batch=1 — every block_size we tried (2, 4) shows worse decode
-            // tps than no speculation. Load the drafter so per-request
-            // `enable_drafter:true` still works, but flip the server default
-            // off. When the user passes `--no-pld --drafter <dir>` on MoE,
-            // PLD remains the recommended default-on path (1.43× echo on
-            // 26B-A4B per the prior bench).
-            if (config.isMoe()) {
-                log.warn(
-                    "Drafter loaded but target is MoE ({s}); per-request " ++
-                        "enable_drafter defaults to OFF — drafter+MoE regresses " ++
-                        "at single-stream batch=1 (verify forward expert-routing " ++
-                        "penalty). Pass enable_drafter:true per request to opt-in.\n",
-                    .{config.model_type},
-                );
-            }
+        // Plan 05 Phase D: compute the effective max_resident_mem. When the
+        // user didn't pass an explicit cap, derive 80% of mlx's wired limit
+        // (mlx_set_wired_limit returns a value the platform considers safe
+        // for sustained GPU work). The wired limit was already applied in
+        // the inference thread's load path; here we mirror that calculation
+        // so the registry's eviction gate stays in sync. 0 disables the cap.
+        const effective_max_resident_mem: u64 = if (max_resident_mem_explicit)
+            max_resident_mem
+        else blk: {
+            var dev = mlx.mlx_device{ .ctx = null };
+            _ = mlx.mlx_get_default_device(&dev);
+            var info = mlx.mlx_device_info_new();
+            defer _ = mlx.mlx_device_info_free(info);
+            if (mlx.mlx_device_info_get(&info, dev) != 0) break :blk 0;
+            var max_rec: usize = 0;
+            if (mlx.mlx_device_info_get_size(&max_rec, info, "max_recommended_working_set_size") != 0 or max_rec == 0) break :blk 0;
+            break :blk @as(u64, max_rec) * 4 / 5;
+        };
+        if (effective_max_resident_mem > 0) {
+            log.info("[registry] max_resident_models={d}, max_resident_mem={d:.1} GB\n", .{
+                max_resident_models,
+                @as(f64, @floatFromInt(effective_max_resident_mem)) / 1_073_741_824.0,
+            });
+        } else {
+            log.info("[registry] max_resident_models={d}, max_resident_mem=unlimited\n", .{max_resident_models});
         }
 
-        try server_mod.serve(io, allocator, &xfm, &tok, &chat_config, &config, if (vision_enc) |*ve| ve else null, model_dir, host, port, ctx_size, timeout, reasoning_budget, enable_pld, pld_draft_len, pld_key_len, drafter_ptr, draft_block_size, drafter_dir orelse "");
+        const registry = try model_registry_mod.ModelRegistry.init(
+            allocator,
+            io,
+            discovery_for_registry,
+            max_resident_models,
+            effective_max_resident_mem,
+            idle_evict_secs,
+        );
+        defer registry.deinit();
+
+        // Register the loaded model. Use the pre-registered discovery entry
+        // when available (so id/path/bytes_on_disk are consistent across
+        // /v1/models listings); otherwise create a fresh stub.
+        const entry = if (registry.peek(model_id)) |e| e else try registry.registerStub(model_id, model_dir, null);
+        try registry.setDefault(model_id);
+
+        // Ownership-transfer defer: registry takes ownership of
+        // config/tok/chat_config IF the inference-thread load installed
+        // them on `entry` (entry.config != null). Declared AFTER
+        // registry.deinit so it fires BEFORE it on scope exit — by the
+        // time registry.deinit walks the entry we've already decided who
+        // owns the heap pointers, so the early defers can no-op.
+        defer if (entry.config != null) {
+            config_owned_by_registry = true;
+            tok_owned_by_registry = true;
+            chat_config_owned_by_registry = true;
+        };
+
+        const params = scheduler_mod.LoadParams{
+            .registry = registry,
+            .entry = entry,
+            .config = config,
+            .tok = tok,
+            .chat_config = chat_config,
+            .model_dir = model_dir,
+            .drafter_dir = drafter_dir orelse "",
+            .load_vision = load_vision,
+            .warmup_eager = warmup_eager,
+            .draft_block_size = draft_block_size,
+            .draft_block_size_explicit = draft_block_size_explicit,
+            .kv_quant_config = kv_quant_config,
+            .prefix_cache_capacity = server_mod.prefix_cache_capacity,
+            .prefix_cache_mem_bytes = server_mod.prefix_cache_mem_bytes,
+        };
+        try server_mod.serve(io, allocator, params, config, host, port, .{
+            .max_context_size = ctx_size,
+            .request_timeout_sec = timeout,
+            .default_reasoning_budget = reasoning_budget,
+            .default_enable_pld = enable_pld,
+            .default_pld_draft_len = pld_draft_len,
+            .default_pld_key_len = pld_key_len,
+            .default_kv_attn_fused = kv_attn_fused_default,
+        });
     } else {
+        // ── Offline single-prompt mode. mlx ops run on this thread, no
+        //    scheduler. The same load path as pre-A1.
+        log.info("Loading weights...\n", .{});
+        var weights = if (load_vision)
+            try model_mod.loadWeightsWithVision(io, allocator, model_dir)
+        else
+            try model_mod.loadWeights(io, allocator, model_dir);
+        defer weights.deinit();
+
+        var xfm = try transformer_mod.Transformer.init(io, allocator, config.*, &weights);
+        defer xfm.deinit();
+
+        // Honor --kv-quant in offline mode too. The serve path threads this
+        // through Slot caches via the scheduler; here we swap the
+        // Transformer's own legacy cache to match.
+        if (kv_quant_config.scheme != .off) {
+            xfm.cache.deinit();
+            xfm.cache = try transformer_mod.KVCache.initWithConfigAndHeadDim(allocator, config.num_hidden_layers, kv_quant_config, config.head_dim);
+        }
+
+        // JIT-compile + wire memory limits.
+        {
+            var dev = mlx.mlx_device{ .ctx = null };
+            _ = mlx.mlx_get_default_device(&dev);
+            var info = mlx.mlx_device_info_new();
+            if (mlx.mlx_device_info_get(&info, dev) == 0) {
+                var max_rec: usize = 0;
+                if (mlx.mlx_device_info_get_size(&max_rec, info, "max_recommended_working_set_size") == 0 and max_rec > 0) {
+                    var old_limit: usize = 0;
+                    _ = mlx.mlx_set_wired_limit(&old_limit, max_rec);
+                    log.debug("Wired limit set to {d} MB\n", .{max_rec / (1024 * 1024)});
+                }
+                _ = mlx.mlx_device_info_free(info);
+            }
+        }
+        if (config.hidden_act == .gelu_approx) {
+            xfm.compileGelu();
+            xfm.compileGeglu();
+        }
+        if (config.final_logit_softcapping > 0.0) {
+            xfm.compileSoftcap();
+        }
+        if (xfm.moe_layers != null) {
+            xfm.compileMoeRouting();
+        }
+        log.info("Model ready.\n", .{});
         const user_prompt = prompt orelse "What is 2+2? Answer in one sentence.";
         const messages = [_]chat_mod.Message{
             .{ .role = "user", .content = user_prompt },
         };
 
-        const prompt_ids = try chat_mod.formatChat(allocator, &tok, &messages, &chat_config, null, null, false);
+        const prompt_ids = try chat_mod.formatChat(allocator, tok, &messages, chat_config, null, null, false);
         defer allocator.free(prompt_ids);
 
         // Reset peak memory before generation
@@ -434,7 +671,7 @@ pub fn main(init: std.process.Init) !void {
         if (stream_mode) {
             // Streaming: print tokens as they're generated
             const prefill_start = std.Io.Timestamp.now(io, .awake);
-            var gen = try generate_mod.Generator.init(io, allocator, &xfm, &tok, prompt_ids, max_tokens, sampling, eos_slice);
+            var gen = try generate_mod.Generator.init(io, allocator, &xfm, tok, prompt_ids, max_tokens, sampling, eos_slice);
             defer gen.deinit(allocator);
 
             const prefill_ns: u64 = @intCast(prefill_start.untilNow(io, .awake).nanoseconds);
@@ -467,7 +704,7 @@ pub fn main(init: std.process.Init) !void {
             try stdout_w.print("Generation: {d} tokens, {d:.3} tokens-per-sec\n", .{ completion_tokens, decode_tps });
         } else {
             // Non-streaming: generate all tokens then print
-            const result = try generate_mod.generate(io, allocator, &xfm, &tok, prompt_ids, max_tokens, sampling, eos_slice, 0, 0);
+            const result = try generate_mod.generate(io, allocator, &xfm, tok, prompt_ids, max_tokens, sampling, eos_slice, 0, 0);
             defer allocator.free(result.text);
             defer allocator.free(result.token_ids);
 
@@ -491,4 +728,321 @@ fn portInUse(io: std.Io, port: u16) bool {
     const stream = addr.connect(io, .{ .mode = .stream }) catch return false;
     stream.close(io);
     return true;
+}
+
+/// Parse a size-style CLI argument: bare integer = bytes, suffix `KB`/`MB`/
+/// `GB` (case-insensitive) multiplies by 1024^N, "0"/"off" = 0. Used by
+/// `--prefix-cache-mem`; returns `error.InvalidSize` on malformed input.
+/// True if `path` points at a .gguf file or a directory that contains one.
+/// We accept directories so users can pass the canonical
+/// `~/.mlx-serve/models/<owner>/<repo>/` shape Swift sets up.
+fn isGgufPath(io: std.Io, path: []const u8) bool {
+    if (std.mem.endsWith(u8, path, ".gguf")) return true;
+    var dir = std.Io.Dir.openDirAbsolute(io, path, .{ .iterate = true }) catch return false;
+    defer dir.close(io);
+    var it = dir.iterate();
+    while (it.next(io) catch return false) |entry| {
+        if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".gguf")) return true;
+    }
+    return false;
+}
+
+/// Resolve the actual .gguf file path. When `path` is a directory, return
+/// the first `.gguf` entry within it (caller frees). When `path` is already a
+/// file, return a dup. Errors if no .gguf is found.
+fn resolveGgufFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    if (std.mem.endsWith(u8, path, ".gguf")) return allocator.dupe(u8, path);
+    var dir = try std.Io.Dir.openDirAbsolute(io, path, .{ .iterate = true });
+    defer dir.close(io);
+    var it = dir.iterate();
+    while (try it.next(io)) |entry| {
+        if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".gguf")) {
+            return std.fmt.allocPrint(allocator, "{s}/{s}", .{ path, entry.name });
+        }
+    }
+    return error.NoGgufFile;
+}
+
+/// Offline single-prompt generation through the embedded ds4 engine.
+/// Skips the MLX/safetensors scaffolding entirely — there's no `Transformer`,
+/// no `Generator`, no scheduler. ds4 owns its own tokenizer, KV cache, and
+/// sampler; we just feed it the user prompt and stream the decoded tokens.
+fn runDs4Offline(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    model_dir: []const u8,
+    prompt: []const u8,
+    max_tokens: u32,
+    temp: f32,
+) !void {
+    const gguf_path = try resolveGgufFile(io, allocator, model_dir);
+    defer allocator.free(gguf_path);
+
+    log.info("[ds4] backend: Metal, model: {s}\n", .{gguf_path});
+
+    var engine = ds4_arch.Ds4Engine.open(allocator, gguf_path, .{
+        .backend = .metal,
+        .warm_weights = true,
+    }) catch |err| {
+        log.err("[ds4] engine open failed: {s}\n", .{@errorName(err)});
+        return err;
+    };
+    defer engine.close();
+
+    log.info("[ds4] engine ready (EOS={d}, has_mtp={})\n", .{ engine.eosToken(), engine.hasMtp() });
+
+    // Render the prompt through ds4's built-in chat template. `prompt` is the
+    // raw user text; the engine adds BOS, system markers, and the assistant
+    // prefix according to the GGUF's vocab.
+    const prompt_ids = try engine.encodeChatPrompt(allocator, null, prompt, .none);
+    defer allocator.free(prompt_ids);
+
+    log.info("[ds4] prompt: {d} tokens\n", .{prompt_ids.len});
+
+    // ds4's session API decouples cache lifetime from a single request — one
+    // session can be reused across multiple `sync` calls. ds4 sizes its
+    // prefill buffers against the requested ctx (`prefill_chunk = 2048` per
+    // the CLI default), and sessions smaller than the prefill chunk produce
+    // junk output. Mirror ds4's CLI default of 32768.
+    const ctx_size: i32 = 32768;
+    var sess = try engine.createSession(ctx_size);
+    defer sess.free();
+
+    try sess.sync(prompt_ids);
+
+    var rng: u64 = @intCast(std.Io.Timestamp.now(io, .real).toMilliseconds());
+
+    var stdout_buf: [4096]u8 = undefined;
+    var stdout = std.Io.File.stdout().writer(io, &stdout_buf);
+    const out_w = &stdout.interface;
+    try out_w.writeAll("\n");
+
+    const eos = engine.eosToken();
+    var generated: u32 = 0;
+    while (generated < max_tokens) : (generated += 1) {
+        const next_id: i32 = if (temp <= 0.0)
+            sess.argmax()
+        else
+            sess.sample(temp, 0, 1.0, 0.05, &rng);
+
+        if (next_id == eos) break;
+
+        const piece = try engine.detokenizeOne(allocator, next_id);
+        defer allocator.free(piece);
+        try out_w.writeAll(piece);
+        try out_w.flush();
+
+        try sess.eval(next_id);
+    }
+
+    try out_w.writeAll("\n");
+    try out_w.flush();
+    log.info("[ds4] generated {d} tokens (max={d})\n", .{ generated, max_tokens });
+}
+
+/// ds4 serve mode. Builds a stub LoadedModel + ModelConfig + ChatConfig
+/// (the engine owns the real tokenizer and chat template internally) and
+/// hands them to `Scheduler.init` via `LoadParams.ds4_path` — the scheduler's
+/// inference thread opens the engine on the right GPU-stream thread. All
+/// MLX-specific load steps (weights, Transformer, vision, drafter, JIT,
+/// warmup) are skipped.
+fn runDs4Serve(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    model_dir: []const u8,
+    host: []const u8,
+    port: u16,
+    ctx_size: u32,
+    timeout: u32,
+    reasoning_budget: i32,
+    max_resident_models: u32,
+    max_resident_mem: u64,
+    max_resident_mem_explicit: bool,
+    idle_evict_secs: ?u32,
+) !void {
+    // Resolve the GGUF file once on this thread so the engine's open() call
+    // (running on the inference thread) gets an absolute path.
+    const gguf_path_owned = try resolveGgufFile(io, allocator, model_dir);
+    defer allocator.free(gguf_path_owned);
+
+    log.info("mlx-serve {s} (ds4 engine, GGUF backend)\n", .{VERSION});
+    log.info("[args] model: {s}\n", .{gguf_path_owned});
+    log.info("[args] serve: {s}:{d}, ctx-size={d}\n", .{ host, port, ctx_size });
+
+    // Build a stub ModelConfig. The fields below are read by various parts
+    // of server.zig + scheduler.zig but the ds4 path bypasses anything that
+    // actually consumes the model architecture (Transformer, KV shapes,
+    // SSM cache, MoE routing). The values picked keep `modelBatchable`
+    // returning false (we're routed through `runSingleDecodeTick`), and
+    // `getEffectiveContextLength` returning the runtime ctx size.
+    const config_storage = try allocator.create(model_mod.ModelConfig);
+    var config_owned_by_registry = false;
+    errdefer if (!config_owned_by_registry) allocator.destroy(config_storage);
+    config_storage.* = model_mod.ModelConfig{
+        .model_type = "deepseek_v4",
+        .weight_prefix = "model",
+        .num_hidden_layers = 61,
+        .hidden_size = 7168,
+        .head_dim = 128,
+        .num_attention_heads = 56,
+        .num_key_value_heads = 56,
+        .max_position_embeddings = 32768,
+        .is_encoder_only = false,
+        // Carry the user-supplied --ctx-size hint via the standard field so
+        // `getEffectiveContextLength` honors it.
+    };
+
+    // Stub tokenizer. Most server.zig fast paths read `lm.tokenizer.?` —
+    // we build a minimal empty Tokenizer here. The chat handlers route
+    // through `chat_mod.decodeViaDs4` / `encodeChatViaDs4` when
+    // `lm.ds4_engine != null`, so the stub never actually services
+    // encode/decode on the happy path.
+    const tok_storage = try allocator.create(tokenizer_mod.Tokenizer);
+    var tok_owned_by_registry = false;
+    errdefer if (!tok_owned_by_registry) {
+        tok_storage.deinit();
+        allocator.destroy(tok_storage);
+    };
+    var byte_map: [256]u21 = undefined;
+    var b: usize = 0;
+    while (b < 256) : (b += 1) byte_map[b] = @intCast(b);
+    tok_storage.* = .{
+        .vocab = std.StringHashMap(u32).init(allocator),
+        .id_to_token = std.AutoHashMap(u32, []const u8).init(allocator),
+        .merge_ranks = @TypeOf(tok_storage.merge_ranks).init(allocator),
+        .allocator = allocator,
+        .special_tokens = std.StringHashMap(u32).init(allocator),
+        .tok_type = .byte_level_bpe,
+        .byte_to_unicode = byte_map,
+        .unicode_to_byte = std.AutoHashMap(u21, u8).init(allocator),
+        .bos_id = null,
+        .eos_id = null,
+        .parsed_json = null,
+    };
+
+    // Stub chat config — chat template stays empty. The ds4 path renders
+    // chat via the engine; the stub just keeps `lm.chat_config.?` reads
+    // from crashing.
+    const chat_config_storage = try allocator.create(chat_mod.ChatConfig);
+    var chat_config_owned_by_registry = false;
+    errdefer if (!chat_config_owned_by_registry) {
+        allocator.destroy(chat_config_storage);
+    };
+    chat_config_storage.* = .{
+        .chat_template = try allocator.dupe(u8, ""),
+        .bos_token = null,
+        .eos_token = null,
+        .add_bos_token = false,
+        .allocator = allocator,
+    };
+
+    // ── Registry + scheduler scaffolding. Mirror the MLX serve branch. ──
+    const model_id = blk: {
+        var p = gguf_path_owned;
+        while (p.len > 0 and p[p.len - 1] == '/') p = p[0 .. p.len - 1];
+        if (std.mem.lastIndexOfScalar(u8, p, '/')) |slash_idx| {
+            const name = p[slash_idx + 1 ..];
+            break :blk if (std.mem.endsWith(u8, name, ".gguf")) name[0 .. name.len - 5] else name;
+        }
+        break :blk p;
+    };
+
+    const effective_max_resident_mem: u64 = if (max_resident_mem_explicit) max_resident_mem else 0;
+    if (effective_max_resident_mem > 0) {
+        log.info("[registry] max_resident_models={d}, max_resident_mem={d:.1} GB\n", .{
+            max_resident_models,
+            @as(f64, @floatFromInt(effective_max_resident_mem)) / 1_073_741_824.0,
+        });
+    } else {
+        log.info("[registry] max_resident_models={d}, max_resident_mem=unlimited\n", .{max_resident_models});
+    }
+
+    const registry = try model_registry_mod.ModelRegistry.init(
+        allocator,
+        io,
+        null,
+        max_resident_models,
+        effective_max_resident_mem,
+        idle_evict_secs,
+    );
+    defer registry.deinit();
+
+    // Stat the GGUF so the registry knows its on-disk size — used by
+    // /v1/models, /props (memory indicator), and the LRU eviction gate.
+    // Without it the Swift GPU-memory bar stays at 0 for the whole session.
+    // Path is absolute; split into parent dir + basename so we can use the
+    // 0.16-era `Dir.statFile` API.
+    const gguf_bytes: ?u64 = blk: {
+        const slash = std.mem.lastIndexOfScalar(u8, gguf_path_owned, '/') orelse break :blk null;
+        const parent = gguf_path_owned[0..slash];
+        const name = gguf_path_owned[slash + 1 ..];
+        var dir = std.Io.Dir.openDirAbsolute(io, parent, .{}) catch break :blk null;
+        defer dir.close(io);
+        const st = dir.statFile(io, name, .{}) catch break :blk null;
+        break :blk @as(u64, @intCast(st.size));
+    };
+    const entry = try registry.registerStub(model_id, gguf_path_owned, gguf_bytes);
+    try registry.setDefault(model_id);
+
+    // Once the inference thread hands ownership of the stub
+    // config/tok/chat_config to the entry, the entry's deinit owns them —
+    // we mustn't double-free here.
+    defer if (entry.config != null) {
+        config_owned_by_registry = true;
+        tok_owned_by_registry = true;
+        chat_config_owned_by_registry = true;
+    };
+
+    // ds4's process-wide flock makes >1 in-flight session per process
+    // untested; clamp serial.
+    server_mod.max_concurrent = 1;
+
+    const params = scheduler_mod.LoadParams{
+        .registry = registry,
+        .entry = entry,
+        .config = config_storage,
+        .tok = tok_storage,
+        .chat_config = chat_config_storage,
+        .model_dir = gguf_path_owned, // unused on the ds4 branch but kept symmetric
+        .drafter_dir = "",
+        .load_vision = false,
+        .warmup_eager = false,
+        .draft_block_size = 0,
+        .draft_block_size_explicit = false,
+        .kv_quant_config = transformer_mod.KVQuantConfig.dense,
+        .prefix_cache_capacity = 0,
+        .prefix_cache_mem_bytes = 0,
+        .ds4_path = gguf_path_owned,
+    };
+
+    try server_mod.serve(io, allocator, params, config_storage, host, port, .{
+        .max_context_size = ctx_size,
+        .request_timeout_sec = timeout,
+        .default_reasoning_budget = reasoning_budget,
+        .default_enable_pld = false,
+        .default_pld_draft_len = 5,
+        .default_pld_key_len = 3,
+        .default_kv_attn_fused = false,
+    });
+}
+
+fn parseSizeArg(s: []const u8) !u64 {
+    if (std.mem.eql(u8, s, "off") or std.mem.eql(u8, s, "0")) return 0;
+    var end: usize = s.len;
+    var mult: u64 = 1;
+    if (std.mem.endsWith(u8, s, "GB") or std.mem.endsWith(u8, s, "gb")) {
+        end -= 2;
+        mult = 1024 * 1024 * 1024;
+    } else if (std.mem.endsWith(u8, s, "MB") or std.mem.endsWith(u8, s, "mb")) {
+        end -= 2;
+        mult = 1024 * 1024;
+    } else if (std.mem.endsWith(u8, s, "KB") or std.mem.endsWith(u8, s, "kb")) {
+        end -= 2;
+        mult = 1024;
+    } else if (std.mem.endsWith(u8, s, "B") or std.mem.endsWith(u8, s, "b")) {
+        end -= 1;
+    }
+    if (end == 0) return error.InvalidSize;
+    const n = std.fmt.parseInt(u64, s[0..end], 10) catch return error.InvalidSize;
+    return n * mult;
 }

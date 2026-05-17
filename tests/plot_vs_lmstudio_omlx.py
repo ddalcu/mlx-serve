@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""plot_vs_lmstudio.py — render the MLX-serve vs LM Studio comparison chart
-from a CSV produced by tests/bench_vs_lmstudio.sh.
+"""plot_vs_lmstudio_omlx.py — render the MLX-serve vs LM Studio vs oMLX
+comparison chart from a CSV produced by tests/bench_vs_lmstudio_omlx.sh.
 
 Three panels per chart:
   - "Echo (verbatim recitation)"       → echo prompt — PLD's home turf
@@ -8,11 +8,11 @@ Three panels per chart:
   - "Free-form writing (parity)"       → decode (creative essay) prompt
 
 Bar layout depends on --family:
-  gemma   → 5 bars: LM Studio MLX | LM Studio GGUF | MLX-serve --no-pld | --pld | --drafter
-  qwen36  → 4 bars: LM Studio MLX (baseline) | LM Studio GGUF | MLX-serve --no-pld | --pld
+  gemma   → 6 bars: LM Studio MLX | LM Studio GGUF | oMLX | MLX-serve {--no-pld, --pld, --drafter}
+  qwen36  → 5 bars: LM Studio MLX (baseline) | LM Studio GGUF | oMLX | MLX-serve {--no-pld, --pld}
 
 Usage:
-  python3 tests/plot_vs_lmstudio.py <csv> <png_out> --family <gemma|qwen36>
+  python3 tests/plot_vs_lmstudio_omlx.py <csv> <png_out> --family <gemma|qwen36>
 
 Requires matplotlib; install with `pip3 install --user matplotlib`
 (or `--break-system-packages` on PEP-668 systems).
@@ -29,11 +29,11 @@ import numpy as np
 # Family-specific layout. Each entry:
 #   (variant_filter, label, color)
 # variant_filter is matched against the second '/' segment in the CSV `label`
-# column (e.g. "lmstudio-baseline", "lmstudio-alt", "mlx-serve") AND the spec
-# (third segment: "none", "pld", "drafter").
+# column (e.g. "lmstudio-baseline", "lmstudio-alt", "omlx", "mlx-serve") AND
+# the spec (third segment: "none", "pld", "drafter").
 FAMILIES = {
     "gemma": {
-        "title": "MLX-serve vs LM Studio — Gemma 4 (Apple Silicon, decode tok/s)",
+        "title": "MLX-serve vs LM Studio vs oMLX — Gemma 4 (Apple Silicon, decode tok/s)",
         "x_label": lambda key: {
             "gemma4-e2b-4bit":          "E2B (4bit)",
             "gemma4-e4b-4bit":          "E4B (4bit)",
@@ -49,13 +49,14 @@ FAMILIES = {
         "variants": [
             ("lmstudio-baseline", "none",    "LM Studio (MLX, baseline)", "#888888", True),
             ("lmstudio-alt",      "none",    "LM Studio (GGUF)",          "#cccccc", False),
+            ("omlx",              "none",    "oMLX",                      "#2ca02c", False),
             ("mlx-serve",         "none",    "MLX-serve --no-pld",        "#3b82f6", False),
             ("mlx-serve",         "pld",     "MLX-serve --pld",           "#22c55e", False),
             ("mlx-serve",         "drafter", "MLX-serve --drafter",       "#f97316", False),
         ],
     },
     "qwen36": {
-        "title": "MLX-serve vs LM Studio — Qwen 3.6 (Apple Silicon, decode tok/s)",
+        "title": "MLX-serve vs LM Studio vs oMLX — Qwen 3.6 (Apple Silicon, decode tok/s)",
         "x_label": lambda key: {
             "qwen36-27b":      "27B (4bit)",
             "qwen36-35b-a3b":  "35B-A3B (4bit)",
@@ -67,6 +68,7 @@ FAMILIES = {
         "variants": [
             ("lmstudio-baseline", "none", "LM Studio (MLX, baseline)", "#888888", True),
             ("lmstudio-alt",      "none", "LM Studio (GGUF)",          "#cccccc", False),
+            ("omlx",              "none", "oMLX",                      "#2ca02c", False),
             ("mlx-serve",         "none", "MLX-serve --no-pld",        "#3b82f6", False),
             ("mlx-serve",         "pld",  "MLX-serve --pld",           "#22c55e", False),
         ],
@@ -74,15 +76,31 @@ FAMILIES = {
 }
 
 
-def load_csv(path: Path) -> dict:
-    """Returns {(model_logical, variant, spec): {prefill,decode,echo}}."""
+def load_csv(path: Path, hardware_filter: str | None = None) -> tuple[dict, set[str]]:
+    """Returns ({(model_logical, variant, spec): {prefill,decode,echo}}, hardware_seen).
+
+    Schema is `label|engine|model|spec|prompt|prefill|decode|pt|ct|hardware|notes`.
+    Older CSVs (pre-Phase-B, no hardware column) are accepted as-is and tagged
+    `unknown` for grouping. When `hardware_filter` is set, rows whose hardware
+    tag does not match are dropped before aggregation.
+    """
     data: dict = defaultdict(dict)
+    hardware_seen: set[str] = set()
     with open(path) as f:
         for line in f:
             parts = line.rstrip("\n").split("|")
             if len(parts) < 9 or parts[0] in ("label", ""):
                 continue
-            label, _engine, _model, _spec, prompt, pf, dc, _pt, _ct, *_ = parts
+            label, _engine, _model, _spec, prompt, pf, dc, _pt, _ct, *rest = parts
+            # Phase B added a hardware column before the trailing notes column.
+            # Old CSVs: rest = [notes]. New CSVs: rest = [hardware, notes].
+            if len(rest) >= 2:
+                hardware = rest[0] or "unknown"
+            else:
+                hardware = "unknown"
+            hardware_seen.add(hardware)
+            if hardware_filter and hardware != hardware_filter:
+                continue
             bits = label.split("/")
             if len(bits) < 3:
                 continue
@@ -101,17 +119,30 @@ def load_csv(path: Path) -> dict:
                 data[key]["echo"] = dc_v
             elif prompt == "code":
                 data[key]["code"] = dc_v
-    return data
+    return data, hardware_seen
 
 
-def render(csv_path: Path, png_out: Path, family: str) -> None:
+def render(csv_path: Path, png_out: Path, family: str,
+           hardware: str | None = None) -> None:
     if family not in FAMILIES:
         sys.exit(f"Unknown family '{family}'; pick one of: {', '.join(FAMILIES)}")
     cfg = FAMILIES[family]
-    data = load_csv(csv_path)
+    data, hardware_seen = load_csv(csv_path, hardware_filter=hardware)
+    # Reject mixed-hardware CSVs without explicit --hardware: combining M1 Pro
+    # and M4 Max numbers in one chart is exactly the bug Phase B fixed.
+    real_hardware = {h for h in hardware_seen if h != "unknown"}
+    if hardware is None and len(real_hardware) > 1:
+        sys.exit(
+            f"CSV contains {len(real_hardware)} hardware tags: "
+            f"{sorted(real_hardware)}. Pick one with --hardware <tag>."
+        )
+    title_hw = hardware or (next(iter(real_hardware)) if real_hardware else None)
+    title = cfg["title"]
+    if title_hw:
+        title = f"{title} [{title_hw}]"
 
     fig, axes = plt.subplots(1, 3, figsize=(22, 7))
-    fig.suptitle(cfg["title"], fontsize=14, fontweight="bold")
+    fig.suptitle(title, fontsize=14, fontweight="bold")
 
     x = np.arange(len(cfg["model_order"]))
     n_variants = len(cfg["variants"])
@@ -187,18 +218,21 @@ def render(csv_path: Path, png_out: Path, family: str) -> None:
 
 def main() -> None:
     p = argparse.ArgumentParser(
-        description="Render MLX-serve vs LM Studio comparison chart from a "
-                    "CSV produced by tests/bench_vs_lmstudio.sh.",
+        description="Render MLX-serve vs LM Studio vs oMLX comparison chart from a "
+                    "CSV produced by tests/bench_vs_lmstudio_omlx.sh.",
     )
     p.add_argument("csv", type=Path, help="input CSV path")
     p.add_argument("png", type=Path, help="output PNG path")
     p.add_argument("--family", required=True, choices=list(FAMILIES.keys()),
-                   help="model family (matches --family of bench_vs_lmstudio.sh)")
+                   help="model family (matches --family of bench_vs_lmstudio_omlx.sh)")
+    p.add_argument("--hardware", default=None,
+                   help="hardware tag to filter on (e.g. Apple-M1-Pro-32gb). "
+                        "Required when the CSV mixes multiple machines.")
     args = p.parse_args()
 
     if not args.csv.exists():
         sys.exit(f"CSV not found: {args.csv}")
-    render(args.csv, args.png, args.family)
+    render(args.csv, args.png, args.family, hardware=args.hardware)
 
 
 if __name__ == "__main__":

@@ -26,12 +26,43 @@ class AppState: ObservableObject {
                     serverOptions.drafterPath = ""
                 }
             }
-            // If the server is up with a different model, restart it with the new one.
-            if server.status == .running || server.status == .starting {
-                server.stop()
-                server.start(modelPath: selectedModelPath, options: serverOptions)
+            // Plan 05 Phase G — when hot-switch is enabled AND the server is
+            // already running, ask the server to load the new model in-place
+            // instead of restarting. Falls back to restart on failure (404
+            // because the new path isn't in --model-dir, 503 if out of
+            // memory, etc.). Restart path remains the default for clients
+            // that don't opt in.
+            if (server.status == .running || server.status == .starting) {
+                if hotSwitchEnabled, server.status == .running {
+                    let id = (selectedModelPath as NSString).lastPathComponent
+                    let drafterPath: String? = downloads.recommendedDrafterFromPath(selectedModelPath)?.url.path
+                    let mgr = server
+                    Task { @MainActor in
+                        do {
+                            _ = try await mgr.loadModel(id: id, drafterPath: drafterPath)
+                        } catch {
+                            // Hot-switch failed (likely 404 if the model isn't
+                            // under --model-dir on the running server). Fall
+                            // back to a full restart so the user's choice still
+                            // takes effect.
+                            print("[AppState] hot-switch failed (\(error)) — falling back to restart")
+                            mgr.stop()
+                            mgr.start(modelPath: self.selectedModelPath, options: self.serverOptions)
+                        }
+                    }
+                } else {
+                    server.stop()
+                    server.start(modelPath: selectedModelPath, options: serverOptions)
+                }
             }
         }
+    }
+    /// Plan 05 Phase G — when true, model picker changes call /v1/load-model
+    /// on the running server instead of restarting. Falls back to restart on
+    /// failure. Defaults off so existing behavior is unchanged for users who
+    /// haven't opted in.
+    @Published var hotSwitchEnabled: Bool {
+        didSet { UserDefaults.standard.set(hotSwitchEnabled, forKey: "hotSwitchEnabled") }
     }
     @Published var chatSessions: [ChatSession] = []
     @Published var activeChatId: UUID?
@@ -80,6 +111,7 @@ class AppState: ObservableObject {
     init() {
         self.hasSeenWelcome = UserDefaults.standard.bool(forKey: "hasSeenWelcome")
         self.autoStartServer = UserDefaults.standard.bool(forKey: "autoStartServer")
+        self.hotSwitchEnabled = UserDefaults.standard.bool(forKey: "hotSwitchEnabled")
         self.selectedModelPath = UserDefaults.standard.string(forKey: "selectedModelPath") ?? ""
         // Load ServerOptions, then migrate legacy single-key defaults
         // (`maxTokens`, `contextSize`) into it on first run if the dedicated

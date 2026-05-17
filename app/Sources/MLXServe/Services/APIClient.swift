@@ -89,18 +89,37 @@ class APIClient {
     }
 
     func fetchModels(port: UInt16) async throws -> ModelInfo? {
+        // Backwards-compat single-model accessor. Returns the first entry
+        // (the server sorts the default model to index 0).
+        let all = try await fetchAllModels(port: port)
+        return all.first
+    }
+
+    /// Plan 05 Phase G — fetch every entry the registry knows about. New
+    /// callers prefer this over `fetchModels(port:)` so the picker UI can
+    /// show loaded/unloaded badges per model.
+    func fetchAllModels(port: UInt16) async throws -> [ModelInfo] {
         let url = URL(string: "http://127.0.0.1:\(port)/v1/models")!
         let (data, _) = try await session.data(from: url)
         guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let dataArr = json["data"] as? [[String: Any]],
-              let first = dataArr.first else { return nil }
+              let dataArr = json["data"] as? [[String: Any]] else { return [] }
+        return dataArr.map { Self.parseModelInfo($0) }
+    }
 
+    private static func parseModelInfo(_ first: [String: Any]) -> ModelInfo {
         let name = first["id"] as? String ?? "unknown"
         let meta = first["meta"] as? [String: Any] ?? [:]
-        // `architecture` / `is_moe` / `drafter_loaded` / `drafter_path` are
-        // only emitted by mlx-serve binaries built after the drafter UX
-        // landed. Old binaries omit them; default to safe values so the app
-        // doesn't crash and the drafter row falls back to the disabled state.
+        // Pre-Phase-G servers omit `state`/`loaded`/`bytes_resident` at the
+        // top level. Default to `loaded=true` so existing single-model
+        // behavior continues unchanged when a new app talks to an old server.
+        let topLoaded = first["loaded"] as? Bool ?? true
+        let topState = first["state"] as? String
+        let topBytesResident = first["bytes_resident"] as? UInt64 ?? 0
+        let topBytesOnDisk: UInt64? = {
+            if let v = first["bytes_on_disk"] as? UInt64 { return v }
+            if let v = meta["bytes_on_disk"] as? UInt64 { return v }
+            return nil
+        }()
         return ModelInfo(
             name: name,
             quantBits: meta["quantization_bits"] as? Int ?? 0,
@@ -112,8 +131,38 @@ class APIClient {
             architecture: meta["architecture"] as? String ?? "",
             isMoE: meta["is_moe"] as? Bool ?? false,
             drafterLoaded: meta["drafter_loaded"] as? Bool ?? false,
-            drafterPath: meta["drafter_path"] as? String
+            drafterPath: meta["drafter_path"] as? String,
+            loaded: topLoaded,
+            state: topState,
+            bytesResident: topBytesResident,
+            bytesOnDisk: topBytesOnDisk
         )
+    }
+
+    /// Plan 05 Phase G — POST /v1/load-model. Returns the resulting
+    /// `ModelInfo` after the load completes (blocks for seconds on a cold
+    /// load). Throws if the id is unknown (404) or load fails (500).
+    func loadModel(port: UInt16, id: String, drafterPath: String? = nil) async throws -> ModelInfo {
+        let url = URL(string: "http://127.0.0.1:\(port)/v1/load-model")!
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        // Load can take 10–60 s on a fresh model; raise above the default.
+        request.timeoutInterval = 180
+        var body: [String: Any] = ["model": id]
+        if let drafterPath { body["drafter_path"] = drafterPath }
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+            let code = (response as? HTTPURLResponse)?.statusCode ?? -1
+            let snippet = String(data: data, encoding: .utf8)?.prefix(300) ?? ""
+            throw APIError.badStatus(code: code, detail: String(snippet))
+        }
+        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let modelObj = json["model"] as? [String: Any] else {
+            throw URLError(.cannotParseResponse)
+        }
+        return Self.parseModelInfo(modelObj)
     }
 
     func fetchProps(port: UInt16) async throws -> MemoryInfo? {
@@ -179,10 +228,24 @@ class APIClient {
         tools: [[String: Any]]? = nil,
         toolsJSON: String? = nil,
         defaults: RequestDefaults = .none,
-        retryPolicy: RetryPolicy = .default
+        retryPolicy: RetryPolicy = .default,
+        modelId: String? = nil
     ) -> AsyncThrowingStream<SSEEvent, Error> {
         AsyncThrowingStream { continuation in
-            Task {
+            // Cancellation plumbing: AsyncThrowingStream does NOT propagate
+            // consumer-side Task cancellation into the producer Task. Without
+            // this wiring, clicking Stop in the UI cancels the outer agent
+            // Task but the inner producer Task keeps pulling bytes from
+            // URLSession — the server sees a healthy reader, keeps generating
+            // tokens, GPU pegged for the rest of max_tokens.
+            //
+            // The fix: capture the producer Task and cancel it via
+            // `continuation.onTermination`. Cancelling propagates into the
+            // `for try await line in bytes.lines` loop inside performStream,
+            // which closes the URLSessionDataTask, which FINs the TCP
+            // connection, which surfaces to the server as `peerClosed → true`
+            // on its next ts.next() iteration.
+            let producerTask = Task {
                 var lastError: Error?
                 for attempt in 0...retryPolicy.maxRetries {
                     do {
@@ -192,6 +255,7 @@ class APIClient {
                             enableThinking: enableThinking, tools: tools,
                             toolsJSON: toolsJSON,
                             defaults: defaults,
+                            modelId: modelId,
                             continuation: continuation
                         )
                         return  // success
@@ -208,6 +272,9 @@ class APIClient {
                     }
                 }
                 continuation.finish(throwing: lastError ?? URLError(.unknown))
+            }
+            continuation.onTermination = { _ in
+                producerTask.cancel()
             }
         }
     }
@@ -231,6 +298,7 @@ class APIClient {
         tools: [[String: Any]]? = nil,
         toolsJSON: String? = nil,
         defaults: RequestDefaults = .none,
+        modelId: String? = nil,
         continuation: AsyncThrowingStream<SSEEvent, Error>.Continuation
     ) async throws {
         let url = URL(string: "http://127.0.0.1:\(port)/v1/chat/completions")!
@@ -245,6 +313,10 @@ class APIClient {
         // keep on every request.)
         let effectiveTopP = defaults.topP ?? 0.95
 
+        // Plan 05 Phase G — pin the request to the user's selected model
+        // when known. Defaults to "mlx-serve" which the server resolves
+        // to its default loaded model (matches pre-Phase-G behavior).
+        let effectiveModelId = modelId ?? "mlx-serve"
         if let toolsJSON {
             // Splice pre-serialized tools JSON to preserve property key order
             let messagesData = try JSONSerialization.data(withJSONObject: messages)
@@ -252,8 +324,11 @@ class APIClient {
                 continuation.finish(throwing: URLError(.cannotParseResponse))
                 return
             }
+            let escapedModelId = effectiveModelId
+                .replacingOccurrences(of: "\\", with: "\\\\")
+                .replacingOccurrences(of: "\"", with: "\\\"")
             var parts = [
-                "\"model\":\"mlx-serve\"",
+                "\"model\":\"\(escapedModelId)\"",
                 "\"messages\":\(messagesStr)",
                 "\"max_tokens\":\(maxTokens)",
                 "\"temperature\":\(temperature)",
@@ -272,7 +347,7 @@ class APIClient {
             request.httpBody = "{\(parts.joined(separator: ","))}".data(using: .utf8)
         } else {
             var body: [String: Any] = [
-                "model": "mlx-serve",
+                "model": effectiveModelId,
                 "messages": messages,
                 "max_tokens": maxTokens,
                 "temperature": temperature,
@@ -343,13 +418,26 @@ class APIClient {
                 return
             }
 
-            // Parse usage from final chunk
+            // Parse usage from final chunk. Prefer the server's authoritative
+            // decode throughput (`timings.predicted_per_second`, llama.cpp shape)
+            // when present — it measures actual GPU decode time, not
+            // wall-clock-plus-SSE-buffering. Falls back to client wall-clock for
+            // older mlx-serve builds and OpenAI-compat endpoints that don't
+            // emit the field.
             if let usage = chunk["usage"] as? [String: Any], usage["prompt_tokens"] != nil {
                 let prompt = usage["prompt_tokens"] as? Int ?? 0
                 let completion = usage["completion_tokens"] as? Int ?? 0
                 let total = usage["total_tokens"] as? Int ?? 0
-                let elapsed = Date().timeIntervalSince(firstTokenTime ?? streamStart)
-                let tps = elapsed > 0 ? Double(completion) / elapsed : 0
+                let tps: Double = {
+                    if let timings = chunk["timings"] as? [String: Any],
+                       let serverTps = (timings["predicted_per_second"] as? Double)
+                        ?? (timings["predicted_per_second"] as? Int).map(Double.init),
+                       serverTps > 0 {
+                        return serverTps
+                    }
+                    let elapsed = Date().timeIntervalSince(firstTokenTime ?? streamStart)
+                    return elapsed > 0 ? Double(completion) / elapsed : 0
+                }()
                 continuation.yield(.usage(TokenUsage(
                     promptTokens: prompt, completionTokens: completion,
                     totalTokens: total, tokensPerSecond: tps

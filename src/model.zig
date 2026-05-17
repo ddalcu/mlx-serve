@@ -665,6 +665,12 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
                 if (v == .integer) config.addEosToken(@intCast(v.integer));
             }
         }
+    } else if (std.mem.eql(u8, model_type, "deepseek_v4")) {
+        // MLX-format DSV4 is not supported in this build. Users should load
+        // the GGUF checkpoint via the ds4 engine (`*.gguf` early-branch in
+        // main.zig / Swift app). Fall through to the unknown-arch error
+        // path so the failure message points at the right thing.
+        return error.UnsupportedDsv4MlxFormat;
     } else if (std.mem.eql(u8, model_type, "bert")) {
         config.model_type = "bert";
         config.is_encoder_only = true;
