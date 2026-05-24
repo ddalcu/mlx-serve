@@ -3,25 +3,26 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>MLX Serve — Run LLMs natively on your Mac</title>
-  <meta name="description" content="Native Zig inference server for Apple Silicon. OpenAI + Anthropic API compatible. No Python. Includes MLX Core macOS app with chat, agent mode, and tool calling.">
+  <title>MLX Serve — Run LLMs (and DeepSeek V4 Flash) natively on your Mac</title>
+  <meta name="description" content="Native Zig inference server for Apple Silicon. Faster than LM Studio on every model we test. OpenAI + Anthropic (Claude Code) compatible. No Python. Run DeepSeek V4 Flash, Gemma 4, and Qwen 3.6 locally.">
   <link rel="canonical" href="https://ddalcu.github.io/mlx-serve/">
   <!-- Open Graph -->
   <meta property="og:type" content="website">
   <meta property="og:url" content="https://ddalcu.github.io/mlx-serve/">
-  <meta property="og:title" content="MLX Serve — Run LLMs natively on your Mac">
-  <meta property="og:description" content="Native Zig inference server for Apple Silicon. OpenAI + Anthropic API compatible. No Python. ~33 tok/s on Gemma 4. Includes MLX Core macOS app with chat, agent mode, and tool calling.">
+  <meta property="og:title" content="Run DeepSeek V4 Flash natively on your Mac — MLX Serve">
+  <meta property="og:description" content="Native Zig inference server for Apple Silicon. Faster than LM Studio on every model. Run the 284B DeepSeek V4 Flash on a 96 GB+ Mac. OpenAI + Anthropic API. No Python.">
   <meta property="og:image" content="https://ddalcu.github.io/mlx-serve/mlxcore-screenshot-1.png">
   <meta property="og:image:width" content="1200">
   <meta property="og:image:height" content="630">
   <!-- Twitter Card -->
   <meta name="twitter:card" content="summary_large_image">
-  <meta name="twitter:title" content="MLX Serve — Run LLMs natively on your Mac">
-  <meta name="twitter:description" content="Native Zig inference server for Apple Silicon. OpenAI + Anthropic API. No Python. ~33 tok/s. Includes MLX Core macOS app.">
+  <meta name="twitter:title" content="Run DeepSeek V4 Flash natively on your Mac — MLX Serve">
+  <meta name="twitter:description" content="Native Zig server for Apple Silicon. Faster than LM Studio on every model. 284B DeepSeek V4 Flash, Gemma 4, Qwen 3.6 — local. OpenAI + Anthropic API. No Python.">
   <meta name="twitter:image" content="https://ddalcu.github.io/mlx-serve/mlxcore-screenshot-1.png">
+  <link rel="icon" href="appiconb.png">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
   <style>
     :root {
       --white: #ffffff;
@@ -32,14 +33,19 @@
       --blue: #0071e3;
       --blue-hover: #0077ed;
       --blue-subtle: rgba(0, 113, 227, 0.08);
+      --teal: #00c6fb;
+      --green: #30d158;
+      --purple: #5e5ce6;
       --zig-orange: #f7a41d;
       --border: rgba(0, 0, 0, 0.08);
       --radius: 16px;
       --radius-sm: 10px;
       --code-bg: #1d1d1f;
       --code-text: #e5e5e7;
+      --ink: #08080c;
       --shadow-card: 0 2px 20px rgba(0, 0, 0, 0.04), 0 0 0 1px rgba(0, 0, 0, 0.04);
       --shadow-elevated: 0 8px 40px rgba(0, 0, 0, 0.08), 0 0 0 1px rgba(0, 0, 0, 0.04);
+      --mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
     }
 
     * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -69,7 +75,7 @@
       display: flex;
       align-items: center;
       justify-content: space-between;
-      padding: 0 max(24px, calc((100vw - 980px) / 2));
+      padding: 0 max(24px, calc((100vw - 1040px) / 2));
       background: rgba(255, 255, 255, 0.72);
       backdrop-filter: saturate(180%) blur(20px);
       -webkit-backdrop-filter: saturate(180%) blur(20px);
@@ -84,24 +90,22 @@
       color: var(--text-primary);
     }
 
-    .nav-logo-img {
-      width: 28px;
-      height: 28px;
-      border-radius: 7px;
+    .nav-logo-img { width: 28px; height: 28px; border-radius: 7px; }
+
+    .nav-logo span { font-size: 15px; font-weight: 600; letter-spacing: -0.01em; }
+
+    .nav-ver {
+      font-family: var(--mono);
+      font-size: 11px;
+      font-weight: 500;
+      color: var(--text-tertiary);
+      padding: 2px 7px;
+      border: 1px solid var(--border);
+      border-radius: 100px;
+      margin-left: 2px;
     }
 
-    .nav-logo span {
-      font-size: 15px;
-      font-weight: 600;
-      letter-spacing: -0.01em;
-    }
-
-    .nav-links {
-      display: flex;
-      align-items: center;
-      gap: 28px;
-      list-style: none;
-    }
+    .nav-links { display: flex; align-items: center; gap: 28px; list-style: none; }
 
     .nav-links a {
       font-size: 13px;
@@ -112,73 +116,104 @@
 
     .nav-links a:hover { color: var(--text-primary); }
 
-    .nav-github {
-      display: flex;
-      align-items: center;
-      gap: 6px;
-    }
-
-    .nav-github svg {
-      width: 18px;
-      height: 18px;
-      fill: var(--text-primary);
-      transition: fill 0.2s;
-    }
-
+    .nav-github { display: flex; align-items: center; gap: 6px; }
+    .nav-github svg { width: 18px; height: 18px; fill: var(--text-primary); transition: fill 0.2s; }
     .nav-github:hover svg { fill: var(--blue); }
 
     /* ─── HERO ─── */
     .hero {
-      padding: 140px 24px 80px;
+      padding: 144px 24px 72px;
       text-align: center;
       position: relative;
       overflow: hidden;
     }
 
-    .hero::before {
-      content: '';
+    .hero-glow {
       position: absolute;
-      top: -20%;
-      left: 50%;
-      transform: translateX(-50%);
-      width: 800px;
-      height: 600px;
-      background: radial-gradient(ellipse at center, rgba(0, 113, 227, 0.06) 0%, transparent 70%);
+      inset: 0;
       pointer-events: none;
+      overflow: hidden;
+      z-index: 0;
     }
+
+    .hero-glow span {
+      position: absolute;
+      border-radius: 50%;
+      filter: blur(80px);
+      opacity: 0.5;
+      animation: drift 18s ease-in-out infinite;
+    }
+
+    .hero-glow .g1 { width: 520px; height: 520px; top: -180px; left: 50%; margin-left: -360px; background: radial-gradient(circle, rgba(0,113,227,0.22), transparent 70%); }
+    .hero-glow .g2 { width: 440px; height: 440px; top: -120px; left: 50%; margin-left: 40px; background: radial-gradient(circle, rgba(0,198,251,0.18), transparent 70%); animation-delay: -6s; }
+    .hero-glow .g3 { width: 360px; height: 360px; top: 40px; left: 50%; margin-left: -120px; background: radial-gradient(circle, rgba(247,164,29,0.12), transparent 70%); animation-delay: -11s; }
+
+    @keyframes drift {
+      0%, 100% { transform: translate(0, 0) scale(1); }
+      33% { transform: translate(-30px, 24px) scale(1.08); }
+      66% { transform: translate(34px, -18px) scale(0.95); }
+    }
+
+    .hero > *:not(.hero-glow) { position: relative; z-index: 1; }
 
     .hero-badge {
       display: inline-flex;
       align-items: center;
-      gap: 6px;
-      padding: 5px 14px 5px 8px;
-      background: var(--blue-subtle);
+      gap: 8px;
+      padding: 5px 14px 5px 10px;
+      background: rgba(255,255,255,0.7);
+      border: 1px solid var(--border);
+      box-shadow: var(--shadow-card);
       border-radius: 100px;
       font-size: 13px;
       font-weight: 500;
-      color: var(--blue);
+      color: var(--text-primary);
+      text-decoration: none;
       margin-bottom: 28px;
       animation: fadeUp 0.6s ease both;
+      transition: transform 0.2s ease, box-shadow 0.2s ease;
     }
 
-    .hero-badge svg { width: 18px; height: 18px; }
+    .hero-badge:hover { transform: translateY(-1px); box-shadow: var(--shadow-elevated); }
+
+    .hero-badge .new-pill {
+      font-family: var(--mono);
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+      color: var(--white);
+      background: linear-gradient(135deg, var(--blue), var(--teal));
+      padding: 2px 7px;
+      border-radius: 100px;
+    }
+
+    .hero-badge .arrow { color: var(--text-tertiary); transition: transform 0.2s; }
+    .hero-badge:hover .arrow { transform: translateX(3px); }
 
     .hero h1 {
-      font-size: clamp(44px, 7vw, 72px);
+      font-size: clamp(46px, 7.4vw, 80px);
       font-weight: 700;
-      letter-spacing: -0.035em;
-      line-height: 1.05;
-      max-width: 700px;
-      margin: 0 auto 20px;
+      letter-spacing: -0.04em;
+      line-height: 1.02;
+      max-width: 820px;
+      margin: 0 auto 22px;
       animation: fadeUp 0.6s ease 0.1s both;
+    }
+
+    .hero h1 .grad {
+      background: linear-gradient(120deg, var(--blue) 10%, var(--teal) 90%);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
     }
 
     .hero-sub {
       font-size: clamp(17px, 2.2vw, 21px);
       color: var(--text-secondary);
-      max-width: 520px;
-      margin: 0 auto 40px;
-      line-height: 1.45;
+      max-width: 580px;
+      margin: 0 auto 38px;
+      line-height: 1.5;
       font-weight: 400;
       animation: fadeUp 0.6s ease 0.2s both;
     }
@@ -205,81 +240,80 @@
       border: none;
     }
 
-    .btn-primary {
-      background: var(--blue);
-      color: var(--white);
-    }
-
-    .btn-primary:hover {
-      background: var(--blue-hover);
-      transform: scale(1.02);
-    }
-
-    .btn-secondary {
-      background: transparent;
-      color: var(--blue);
-      border: 1.5px solid var(--border);
-    }
-
-    .btn-secondary:hover {
-      border-color: var(--blue);
-      background: var(--blue-subtle);
-    }
-
+    .btn-primary { background: var(--blue); color: var(--white); }
+    .btn-primary:hover { background: var(--blue-hover); transform: scale(1.02); }
+    .btn-secondary { background: transparent; color: var(--blue); border: 1.5px solid var(--border); }
+    .btn-secondary:hover { border-color: var(--blue); background: var(--blue-subtle); }
     .btn svg { width: 18px; height: 18px; }
 
     .hero-meta {
-      margin-top: 48px;
+      margin-top: 46px;
       display: flex;
       justify-content: center;
       gap: 32px;
       animation: fadeUp 0.6s ease 0.4s both;
     }
 
-    .hero-meta-item {
-      font-size: 13px;
-      color: var(--text-tertiary);
-      display: flex;
-      align-items: center;
-      gap: 6px;
-    }
-
-    .hero-meta-item strong {
-      color: var(--text-secondary);
-      font-weight: 600;
-    }
+    .hero-meta-item { font-size: 13px; color: var(--text-tertiary); display: flex; align-items: center; gap: 6px; }
+    .hero-meta-item strong { color: var(--text-secondary); font-weight: 600; }
 
     /* ─── SCREENSHOT ─── */
-    .screenshot-section {
-      padding: 20px 24px 100px;
-    }
+    .screenshot-section { padding: 16px 24px 64px; }
 
     .screenshot-wrap {
-      max-width: 920px;
+      max-width: 960px;
       margin: 0 auto;
-      border-radius: 12px;
+      border-radius: 14px;
       overflow: hidden;
-      box-shadow: var(--shadow-elevated), 0 20px 80px rgba(0, 0, 0, 0.12);
+      box-shadow: var(--shadow-elevated), 0 24px 90px rgba(0, 0, 0, 0.14);
       animation: fadeUp 0.8s ease 0.5s both;
     }
 
-    .screenshot-wrap img {
-      width: 100%;
-      display: block;
+    .screenshot-wrap img { width: 100%; display: block; }
+
+    /* ─── MARQUEE ─── */
+    .marquee {
+      border-top: 0.5px solid var(--border);
+      border-bottom: 0.5px solid var(--border);
+      padding: 18px 0;
+      overflow: hidden;
+      -webkit-mask-image: linear-gradient(90deg, transparent, #000 12%, #000 88%, transparent);
+      mask-image: linear-gradient(90deg, transparent, #000 12%, #000 88%, transparent);
+    }
+
+    .marquee-track {
+      display: inline-flex;
+      align-items: center;
+      gap: 0;
+      white-space: nowrap;
+      animation: scroll 34s linear infinite;
+    }
+
+    .marquee:hover .marquee-track { animation-play-state: paused; }
+
+    .marquee-item {
+      font-family: var(--mono);
+      font-size: 14px;
+      font-weight: 500;
+      color: var(--text-secondary);
+      padding: 0 26px;
+      display: inline-flex;
+      align-items: center;
+      gap: 26px;
+    }
+
+    .marquee-item::after { content: '·'; color: var(--text-tertiary); opacity: 0.5; }
+
+    @keyframes scroll {
+      from { transform: translateX(0); }
+      to { transform: translateX(-50%); }
     }
 
     /* ─── SECTION SHARED ─── */
-    .section {
-      padding: 100px 24px;
-    }
-
+    .section { padding: 100px 24px; }
     .section-alt { background: var(--bg-alt); }
 
-    .section-header {
-      text-align: center;
-      max-width: 600px;
-      margin: 0 auto 60px;
-    }
+    .section-header { text-align: center; max-width: 640px; margin: 0 auto 56px; }
 
     .section-label {
       font-size: 13px;
@@ -291,25 +325,307 @@
     }
 
     .section-title {
-      font-size: clamp(32px, 4.5vw, 44px);
+      font-size: clamp(32px, 4.5vw, 46px);
       font-weight: 700;
       letter-spacing: -0.03em;
-      line-height: 1.1;
+      line-height: 1.08;
       margin-bottom: 14px;
     }
 
-    .section-desc {
-      font-size: 17px;
-      color: var(--text-secondary);
-      line-height: 1.5;
+    .section-desc { font-size: 17px; color: var(--text-secondary); line-height: 1.5; }
+
+    /* ─── PERFORMANCE ─── */
+    .perf-stats {
+      display: flex;
+      justify-content: center;
+      gap: 56px;
+      flex-wrap: wrap;
+      max-width: 860px;
+      margin: 0 auto 64px;
     }
+
+    .perf-stat { display: flex; flex-direction: column; align-items: center; }
+
+    .perf-number {
+      font-family: var(--mono);
+      font-size: clamp(36px, 5.4vw, 52px);
+      font-weight: 700;
+      letter-spacing: -0.03em;
+      line-height: 1;
+      background: linear-gradient(135deg, var(--blue), var(--teal));
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .perf-label { font-size: 13.5px; color: var(--text-tertiary); margin-top: 10px; text-align: center; max-width: 160px; }
+
+    /* ─── CHART ─── */
+    .chart-card {
+      max-width: 980px;
+      margin: 0 auto;
+      background: var(--white);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow-elevated);
+      padding: 28px 28px 24px;
+    }
+
+    .chart-pills { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; margin-bottom: 22px; }
+
+    .chart-pill {
+      font-family: var(--mono);
+      font-size: 12.5px;
+      font-weight: 500;
+      padding: 7px 14px;
+      border-radius: 100px;
+      border: 1px solid var(--border);
+      background: var(--white);
+      color: var(--text-secondary);
+      cursor: pointer;
+      transition: all 0.18s ease;
+      white-space: nowrap;
+    }
+
+    .chart-pill:hover { border-color: var(--blue); color: var(--blue); }
+
+    .chart-pill.active {
+      background: var(--text-primary);
+      color: var(--white);
+      border-color: var(--text-primary);
+    }
+
+    .chart-canvas-wrap { position: relative; width: 100%; height: 380px; }
+    #perfChart { width: 100%; height: 100%; display: block; }
+
+    .chart-tooltip {
+      position: absolute;
+      pointer-events: none;
+      background: var(--ink);
+      color: var(--white);
+      border-radius: 9px;
+      padding: 9px 12px;
+      font-size: 12px;
+      line-height: 1.45;
+      opacity: 0;
+      transform: translate(-50%, -118%);
+      transition: opacity 0.12s ease;
+      white-space: nowrap;
+      box-shadow: 0 8px 30px rgba(0,0,0,0.25);
+      z-index: 5;
+    }
+
+    .chart-tooltip .tt-series { font-family: var(--mono); font-weight: 600; }
+    .chart-tooltip .tt-val { color: #9fe6ff; font-family: var(--mono); }
+    .chart-tooltip .tt-delta { color: var(--green); font-family: var(--mono); }
+
+    .chart-legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 18px;
+      justify-content: center;
+      margin-top: 18px;
+    }
+
+    .legend-item { display: flex; align-items: center; gap: 7px; font-size: 13px; color: var(--text-secondary); }
+    .legend-swatch { width: 13px; height: 13px; border-radius: 4px; flex-shrink: 0; }
+
+    .chart-caption {
+      max-width: 760px;
+      margin: 22px auto 0;
+      text-align: center;
+      font-size: 12.5px;
+      color: var(--text-tertiary);
+      line-height: 1.6;
+    }
+
+    .chart-caption b { color: var(--text-secondary); font-weight: 600; }
+
+    /* ─── DEEPSEEK ─── */
+    .deepseek {
+      position: relative;
+      background: var(--ink);
+      color: #f5f5f7;
+      padding: 120px 24px;
+      overflow: hidden;
+    }
+
+    .deepseek::before {
+      content: '';
+      position: absolute;
+      top: -30%;
+      left: 50%;
+      transform: translateX(-50%);
+      width: 1100px;
+      height: 800px;
+      background: radial-gradient(ellipse at center, rgba(0,113,227,0.32) 0%, rgba(94,92,230,0.12) 38%, transparent 68%);
+      pointer-events: none;
+    }
+
+    .deepseek::after {
+      content: '';
+      position: absolute;
+      inset: 0;
+      background-image: radial-gradient(rgba(255,255,255,0.045) 1px, transparent 1px);
+      background-size: 26px 26px;
+      pointer-events: none;
+      opacity: 0.6;
+    }
+
+    .deepseek-inner { position: relative; max-width: 1000px; margin: 0 auto; z-index: 1; }
+
+    .deepseek-grid {
+      display: grid;
+      grid-template-columns: 1fr 0.9fr;
+      gap: 56px;
+      align-items: center;
+    }
+
+    .deepseek-label {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      font-family: var(--mono);
+      font-size: 12px;
+      font-weight: 600;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+      color: var(--teal);
+      margin-bottom: 18px;
+    }
+
+    .deepseek h2 {
+      font-size: clamp(34px, 4.6vw, 50px);
+      font-weight: 700;
+      letter-spacing: -0.03em;
+      line-height: 1.06;
+      margin-bottom: 20px;
+    }
+
+    .deepseek h2 .grad {
+      background: linear-gradient(120deg, #6ea8ff, #9fe6ff);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+    }
+
+    .deepseek p { font-size: 16.5px; color: #c7c7cf; line-height: 1.6; margin-bottom: 18px; max-width: 480px; }
+
+    .deepseek-bullets { list-style: none; display: flex; flex-direction: column; gap: 12px; margin-bottom: 30px; }
+
+    .deepseek-bullets li { display: flex; align-items: flex-start; gap: 11px; font-size: 14.5px; color: #d6d6de; line-height: 1.5; }
+
+    .deepseek-bullets svg { width: 18px; height: 18px; flex-shrink: 0; margin-top: 1px; stroke: var(--teal); }
+
+    .deepseek-bullets b { color: #fff; font-weight: 600; }
+    .deepseek-bullets a { color: #9fe6ff; text-decoration: none; }
+    .deepseek-bullets a:hover { text-decoration: underline; }
+
+    .deepseek-cta {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 13px 26px;
+      border-radius: 100px;
+      font-size: 15px;
+      font-weight: 500;
+      text-decoration: none;
+      background: #fff;
+      color: var(--ink);
+      transition: transform 0.2s ease;
+    }
+
+    .deepseek-cta:hover { transform: scale(1.03); }
+
+    .deepseek-stat {
+      position: relative;
+      border: 1px solid rgba(255,255,255,0.1);
+      border-radius: 20px;
+      background: linear-gradient(160deg, rgba(255,255,255,0.06), rgba(255,255,255,0.01));
+      padding: 44px 36px;
+      text-align: center;
+      backdrop-filter: blur(6px);
+    }
+
+    .deepseek-stat .ds-big {
+      font-family: var(--mono);
+      font-size: clamp(64px, 10vw, 104px);
+      font-weight: 700;
+      letter-spacing: -0.04em;
+      line-height: 1;
+      background: linear-gradient(120deg, #6ea8ff, #9fe6ff 60%, #fff);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+    }
+
+    .deepseek-stat .ds-big-sub { font-size: 15px; color: #c7c7cf; margin-top: 6px; }
+
+    .deepseek-stat .ds-divider { height: 1px; background: rgba(255,255,255,0.1); margin: 28px 0; }
+
+    .deepseek-stat .ds-row { display: flex; justify-content: space-around; gap: 12px; }
+    .deepseek-stat .ds-row .ds-num { font-family: var(--mono); font-size: 24px; font-weight: 700; color: #fff; }
+    .deepseek-stat .ds-row .ds-cap { font-size: 12px; color: var(--text-tertiary); margin-top: 4px; }
+
+    /* ─── SPEC DECODE ─── */
+    .spec-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 20px;
+      max-width: 980px;
+      margin: 0 auto 28px;
+    }
+
+    .spec-card {
+      padding: 30px 26px;
+      background: var(--white);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow-card);
+      transition: transform 0.25s ease, box-shadow 0.25s ease;
+    }
+
+    .spec-card:hover { transform: translateY(-3px); box-shadow: var(--shadow-elevated); }
+
+    .spec-tag {
+      display: inline-block;
+      font-family: var(--mono);
+      font-size: 11px;
+      font-weight: 600;
+      padding: 4px 9px;
+      border-radius: 6px;
+      margin-bottom: 16px;
+    }
+
+    .spec-tag.pld { color: #1a8a3d; background: rgba(48,209,88,0.14); }
+    .spec-tag.drafter { color: #b4710b; background: rgba(247,164,29,0.16); }
+    .spec-tag.gate { color: var(--blue); background: var(--blue-subtle); }
+
+    .spec-card h3 { font-size: 18px; font-weight: 600; letter-spacing: -0.01em; margin-bottom: 9px; }
+    .spec-card p { font-size: 14px; color: var(--text-secondary); line-height: 1.55; }
+    .spec-card .spec-win { display: inline-block; margin-top: 14px; font-family: var(--mono); font-size: 13px; font-weight: 600; color: var(--text-primary); }
+    .spec-card .spec-win span { color: var(--green); }
+
+    .spec-note {
+      max-width: 720px;
+      margin: 0 auto;
+      text-align: center;
+      font-size: 13.5px;
+      color: var(--text-tertiary);
+      line-height: 1.6;
+      padding: 16px 22px;
+      background: var(--white);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+    }
+
+    .spec-note b { color: var(--text-secondary); }
 
     /* ─── FEATURES ─── */
     .features-grid {
       display: grid;
       grid-template-columns: repeat(3, 1fr);
       gap: 20px;
-      max-width: 980px;
+      max-width: 1040px;
       margin: 0 auto;
     }
 
@@ -321,10 +637,7 @@
       transition: transform 0.25s ease, box-shadow 0.25s ease;
     }
 
-    .feature-card:hover {
-      transform: translateY(-3px);
-      box-shadow: var(--shadow-elevated);
-    }
+    .feature-card:hover { transform: translateY(-3px); box-shadow: var(--shadow-elevated); }
 
     .feature-icon {
       width: 44px;
@@ -340,36 +653,26 @@
 
     .fi-perf { background: linear-gradient(135deg, #ff9500, #ff6723); }
     .fi-api { background: linear-gradient(135deg, var(--blue), #00c6fb); }
-    .fi-agent { background: linear-gradient(135deg, #af52de, #5e5ce6); }
-    .fi-app { background: linear-gradient(135deg, #30d158, #34c759); }
-    .fi-stream { background: linear-gradient(135deg, #ff375f, #ff6482); }
-    .fi-skills { background: linear-gradient(135deg, #ffd60a, #ff9f0a); }
+    .fi-batch { background: linear-gradient(135deg, #af52de, #5e5ce6); }
+    .fi-kv { background: linear-gradient(135deg, #30d158, #34c759); }
+    .fi-agent { background: linear-gradient(135deg, #ff375f, #ff6482); }
+    .fi-app { background: linear-gradient(135deg, #ffd60a, #ff9f0a); }
 
-    .feature-card h3 {
-      font-size: 17px;
-      font-weight: 600;
-      letter-spacing: -0.01em;
-      margin-bottom: 8px;
-    }
-
-    .feature-card p {
-      font-size: 14px;
-      color: var(--text-secondary);
-      line-height: 1.5;
+    .feature-card h3 { font-size: 17px; font-weight: 600; letter-spacing: -0.01em; margin-bottom: 8px; }
+    .feature-card p { font-size: 14px; color: var(--text-secondary); line-height: 1.5; }
+    .feature-card code {
+      font-family: var(--mono);
+      font-size: 12px;
+      background: var(--bg-alt);
+      color: var(--text-primary);
+      padding: 1px 5px;
+      border-radius: 5px;
     }
 
     /* ─── QUICK START ─── */
-    .quickstart-wrap {
-      max-width: 640px;
-      margin: 0 auto;
-    }
+    .quickstart-wrap { max-width: 680px; margin: 0 auto; }
 
-    .code-block {
-      background: var(--code-bg);
-      border-radius: var(--radius-sm);
-      overflow: hidden;
-      margin-bottom: 16px;
-    }
+    .code-block { background: var(--code-bg); border-radius: var(--radius-sm); overflow: hidden; margin-bottom: 16px; }
 
     .code-header {
       display: flex;
@@ -379,12 +682,7 @@
       border-bottom: 1px solid rgba(255, 255, 255, 0.06);
     }
 
-    .code-header span {
-      font-family: 'JetBrains Mono', monospace;
-      font-size: 12px;
-      color: var(--text-tertiary);
-      font-weight: 500;
-    }
+    .code-header span { font-family: var(--mono); font-size: 12px; color: var(--text-tertiary); font-weight: 500; }
 
     .copy-btn {
       background: none;
@@ -400,15 +698,12 @@
     .copy-btn:hover { color: var(--white); }
     .copy-btn svg { width: 16px; height: 16px; fill: currentColor; }
 
-    .code-body {
-      padding: 18px;
-      overflow-x: auto;
-    }
+    .code-body { padding: 18px; overflow-x: auto; }
 
     .code-body pre {
-      font-family: 'JetBrains Mono', monospace;
-      font-size: 13.5px;
-      line-height: 1.7;
+      font-family: var(--mono);
+      font-size: 13px;
+      line-height: 1.75;
       color: var(--code-text);
       white-space: pre;
     }
@@ -419,18 +714,8 @@
     .code-body .string { color: #ffd60a; }
     .code-body .url { color: #ff9f0a; }
 
-    .quickstart-note {
-      text-align: center;
-      font-size: 14px;
-      color: var(--text-tertiary);
-      margin-top: 24px;
-    }
-
-    .quickstart-note a {
-      color: var(--blue);
-      text-decoration: none;
-    }
-
+    .quickstart-note { text-align: center; font-size: 14px; color: var(--text-tertiary); margin-top: 24px; }
+    .quickstart-note a { color: var(--blue); text-decoration: none; }
     .quickstart-note a:hover { text-decoration: underline; }
 
     /* ─── APP DOWNLOAD CARD ─── */
@@ -438,7 +723,7 @@
       display: flex;
       align-items: center;
       gap: 14px;
-      max-width: 360px;
+      max-width: 380px;
       margin: 32px auto 0;
       padding: 14px 18px;
       background: var(--bg-alt);
@@ -449,34 +734,11 @@
       transition: transform 0.2s ease, box-shadow 0.2s ease;
     }
 
-    .app-download-card:hover {
-      transform: scale(1.02);
-      box-shadow: var(--shadow-elevated);
-    }
-
-    .app-download-icon {
-      width: 52px;
-      height: 52px;
-      border-radius: 12px;
-      flex-shrink: 0;
-    }
-
-    .app-download-info {
-      flex: 1;
-      min-width: 0;
-    }
-
-    .app-download-name {
-      font-size: 16px;
-      font-weight: 600;
-      letter-spacing: -0.01em;
-    }
-
-    .app-download-desc {
-      font-size: 13px;
-      color: var(--text-tertiary);
-      margin-top: 1px;
-    }
+    .app-download-card:hover { transform: scale(1.02); box-shadow: var(--shadow-elevated); }
+    .app-download-icon { width: 52px; height: 52px; border-radius: 12px; flex-shrink: 0; }
+    .app-download-info { flex: 1; min-width: 0; }
+    .app-download-name { font-size: 16px; font-weight: 600; letter-spacing: -0.01em; }
+    .app-download-desc { font-size: 13px; color: var(--text-tertiary); margin-top: 1px; }
 
     .app-download-btn {
       padding: 6px 18px;
@@ -489,16 +751,14 @@
       transition: background 0.2s;
     }
 
-    .app-download-card:hover .app-download-btn {
-      background: var(--blue-hover);
-    }
+    .app-download-card:hover .app-download-btn { background: var(--blue-hover); }
 
     /* ─── MODELS ─── */
     .models-grid {
       display: grid;
-      grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+      grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
       gap: 16px;
-      max-width: 860px;
+      max-width: 920px;
       margin: 0 auto;
     }
 
@@ -513,110 +773,51 @@
       transition: transform 0.2s ease;
     }
 
+    .model-card.featured { box-shadow: var(--shadow-elevated); border: 1px solid rgba(0,113,227,0.18); }
     .model-card:hover { transform: translateY(-2px); }
 
     .model-logo {
-      width: 36px;
-      height: 36px;
-      border-radius: 8px;
+      width: 38px;
+      height: 38px;
+      border-radius: 9px;
       display: flex;
       align-items: center;
       justify-content: center;
       font-size: 18px;
       font-weight: 700;
       flex-shrink: 0;
+      font-family: var(--mono);
     }
 
     .ml-gemma { background: linear-gradient(135deg, #4285f4, #34a853); color: white; }
     .ml-qwen { background: linear-gradient(135deg, #6366f1, #8b5cf6); color: white; }
+    .ml-deepseek { background: linear-gradient(135deg, #1f3a8a, #4f7cff); color: white; }
     .ml-llama { background: linear-gradient(135deg, #0668e1, #1877f2); color: white; }
     .ml-mistral { background: linear-gradient(135deg, #ff7000, #ff9a00); color: white; }
+    .ml-more { background: linear-gradient(135deg, #6e6e73, #1d1d1f); color: white; }
 
-    .model-info h3 {
-      font-size: 15px;
-      font-weight: 600;
-      letter-spacing: -0.01em;
-    }
+    .model-info h3 { font-size: 15px; font-weight: 600; letter-spacing: -0.01em; display: flex; align-items: center; gap: 7px; }
+    .model-info p { font-size: 12px; color: var(--text-tertiary); margin-top: 2px; }
 
-    .model-info p {
-      font-size: 12px;
-      color: var(--text-tertiary);
-      margin-top: 2px;
-    }
-
-    /* ─── PERFORMANCE BAR ─── */
-    .perf-section {
-      padding: 80px 24px;
-      text-align: center;
-    }
-
-    .perf-stats {
-      display: flex;
-      justify-content: center;
-      gap: 64px;
-      flex-wrap: wrap;
-      max-width: 800px;
-      margin: 0 auto;
-    }
-
-    .perf-stat {
-      display: flex;
-      flex-direction: column;
-      align-items: center;
-    }
-
-    .perf-number {
-      font-size: clamp(40px, 6vw, 56px);
+    .model-flag {
+      font-family: var(--mono);
+      font-size: 9.5px;
       font-weight: 700;
-      letter-spacing: -0.04em;
-      line-height: 1;
-      background: linear-gradient(135deg, var(--blue), #00c6fb);
-      -webkit-background-clip: text;
-      -webkit-text-fill-color: transparent;
-      background-clip: text;
-    }
-
-    .perf-label {
-      font-size: 14px;
-      color: var(--text-tertiary);
-      margin-top: 8px;
-    }
-
-    .perf-note {
-      font-size: 13px;
-      color: var(--text-tertiary);
-      margin-top: 16px;
-      text-align: center;
+      letter-spacing: 0.03em;
+      text-transform: uppercase;
+      color: var(--white);
+      background: linear-gradient(135deg, var(--blue), var(--teal));
+      padding: 2px 6px;
+      border-radius: 5px;
     }
 
     /* ─── FOOTER ─── */
-    footer {
-      padding: 40px 24px;
-      text-align: center;
-      border-top: 0.5px solid var(--border);
-    }
+    footer { padding: 44px 24px; text-align: center; border-top: 0.5px solid var(--border); }
 
-    .footer-links {
-      display: flex;
-      justify-content: center;
-      gap: 24px;
-      margin-bottom: 16px;
-      list-style: none;
-    }
-
-    .footer-links a {
-      font-size: 13px;
-      color: var(--text-secondary);
-      text-decoration: none;
-      transition: color 0.2s;
-    }
-
+    .footer-links { display: flex; justify-content: center; gap: 24px; margin-bottom: 16px; list-style: none; flex-wrap: wrap; }
+    .footer-links a { font-size: 13px; color: var(--text-secondary); text-decoration: none; transition: color 0.2s; }
     .footer-links a:hover { color: var(--blue); }
-
-    .footer-copy {
-      font-size: 12px;
-      color: var(--text-tertiary);
-    }
+    .footer-copy { font-size: 12px; color: var(--text-tertiary); }
 
     /* ─── ANIMATIONS ─── */
     @keyframes fadeUp {
@@ -624,40 +825,41 @@
       to { opacity: 1; transform: translateY(0); }
     }
 
-    .reveal {
-      opacity: 0;
-      transform: translateY(24px);
-      transition: opacity 0.6s ease, transform 0.6s ease;
-    }
+    .reveal { opacity: 0; transform: translateY(24px); transition: opacity 0.6s ease, transform 0.6s ease; }
+    .reveal.visible { opacity: 1; transform: translateY(0); }
 
-    .reveal.visible {
-      opacity: 1;
-      transform: translateY(0);
+    @media (prefers-reduced-motion: reduce) {
+      *, *::before, *::after { animation-duration: 0.001ms !important; animation-iteration-count: 1 !important; transition-duration: 0.001ms !important; scroll-behavior: auto !important; }
     }
 
     /* ─── RESPONSIVE ─── */
+    @media (max-width: 860px) {
+      .deepseek-grid { grid-template-columns: 1fr; gap: 40px; }
+      .spec-grid { grid-template-columns: 1fr; }
+    }
+
     @media (max-width: 768px) {
       nav { padding: 0 16px; }
-
-      .nav-links { gap: 18px; }
+      .nav-links { gap: 16px; }
       .nav-links .hide-mobile { display: none; }
-
-      .hero { padding: 120px 20px 60px; }
+      .hero { padding: 120px 20px 56px; }
       .hero-meta { gap: 16px; flex-wrap: wrap; }
-
       .section { padding: 72px 20px; }
-
+      .deepseek { padding: 88px 20px; }
       .features-grid { grid-template-columns: 1fr 1fr; gap: 14px; }
-
-      .perf-stats { gap: 36px; }
-
+      .perf-stats { gap: 30px 40px; }
       .models-grid { grid-template-columns: 1fr 1fr; }
+      .chart-canvas-wrap { height: 320px; }
+      .chart-card { padding: 20px 14px 18px; }
     }
 
     @media (max-width: 480px) {
       .features-grid { grid-template-columns: 1fr; }
       .models-grid { grid-template-columns: 1fr; }
       .hero-ctas { flex-direction: column; align-items: center; }
+      .hero h1 { font-size: 34px; letter-spacing: -0.03em; }
+      .perf-stats { gap: 26px 32px; }
+      .chart-canvas-wrap { height: 300px; }
     }
   </style>
 </head>
@@ -668,13 +870,15 @@
     <a href="#" class="nav-logo">
       <img src="appiconb.png" alt="MLX Core" class="nav-logo-img">
       <span>mlx-serve</span>
+      <span class="nav-ver">v26.5.6</span>
     </a>
     <ul class="nav-links">
+      <li><a href="#performance" class="hide-mobile">Performance</a></li>
+      <li><a href="#deepseek" class="hide-mobile">DeepSeek V4</a></li>
       <li><a href="#features" class="hide-mobile">Features</a></li>
-      <li><a href="#quickstart" class="hide-mobile">Quick Start</a></li>
       <li><a href="#models" class="hide-mobile">Models</a></li>
       <li>
-        <a href="https://github.com/ddalcu/mlx-serve" class="nav-github" target="_blank" rel="noopener">
+        <a href="https://github.com/ddalcu/mlx-serve" class="nav-github" target="_blank" rel="noopener" aria-label="GitHub">
           <svg viewBox="0 0 16 16"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
         </a>
       </li>
@@ -683,16 +887,18 @@
 
   <!-- HERO -->
   <section class="hero">
-    <div class="hero-badge">
-      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2L2 7l10 5 10-5-10-5z"/><path d="M2 17l10 5 10-5"/><path d="M2 12l10 5 10-5"/></svg>
-      Built for Apple Silicon
-    </div>
-    <h1>Run LLMs natively on your Mac</h1>
-    <p class="hero-sub">Native Zig inference server with a macOS menu bar app. OpenAI-compatible API. No Python. Just fast.</p>
+    <div class="hero-glow"><span class="g1"></span><span class="g2"></span><span class="g3"></span></div>
+    <a href="#deepseek" class="hero-badge">
+      <span class="new-pill">New</span>
+      DeepSeek&nbsp;V4&nbsp;Flash runs locally
+      <span class="arrow">→</span>
+    </a>
+    <h1>Run LLMs natively<br>on your <span class="grad">Mac</span></h1>
+    <p class="hero-sub">A native Zig inference server with a macOS menu-bar app. <strong>Faster than LM Studio on every model we test.</strong> OpenAI- and Anthropic-compatible. No Python.</p>
     <div class="hero-ctas">
       <a href="https://github.com/ddalcu/mlx-serve/releases" class="btn btn-primary">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
-        Download
+        Download for Mac
       </a>
       <a href="https://github.com/ddalcu/mlx-serve" class="btn btn-secondary" target="_blank" rel="noopener">
         View on GitHub
@@ -700,7 +906,7 @@
     </div>
     <div class="hero-meta">
       <div class="hero-meta-item"><strong>macOS 14+</strong></div>
-      <div class="hero-meta-item"><strong>M1 / M2 / M3 / M4</strong></div>
+      <div class="hero-meta-item"><strong>M1 – M4</strong></div>
       <div class="hero-meta-item"><strong>MIT License</strong></div>
     </div>
   </section>
@@ -712,80 +918,178 @@
     </div>
   </section>
 
+  <!-- MARQUEE -->
+  <div class="marquee" aria-hidden="true">
+    <div class="marquee-track">
+      <span class="marquee-item">DeepSeek V4 Flash</span><span class="marquee-item">Gemma 4</span><span class="marquee-item">Qwen 3.6</span><span class="marquee-item">Llama 3</span><span class="marquee-item">Mistral</span><span class="marquee-item">Nemotron-H</span><span class="marquee-item">LFM2.5</span><span class="marquee-item">Qwen 3-Next</span>
+      <span class="marquee-item">DeepSeek V4 Flash</span><span class="marquee-item">Gemma 4</span><span class="marquee-item">Qwen 3.6</span><span class="marquee-item">Llama 3</span><span class="marquee-item">Mistral</span><span class="marquee-item">Nemotron-H</span><span class="marquee-item">LFM2.5</span><span class="marquee-item">Qwen 3-Next</span>
+    </div>
+  </div>
+
   <!-- PERFORMANCE -->
-  <section class="perf-section reveal">
-    <div class="perf-stats">
+  <section class="section" id="performance">
+    <div class="section-header reveal">
+      <div class="section-label">Performance</div>
+      <h2 class="section-title">Faster than LM Studio.<br>Every model.</h2>
+      <p class="section-desc">Identical 4-bit MLX weights, same machine, same prompts. mlx-serve wins every cell — and speculative decoding pushes the lead further on the workloads where it counts.</p>
+    </div>
+
+    <div class="perf-stats reveal">
       <div class="perf-stat">
-        <div class="perf-number">33</div>
-        <div class="perf-label">tokens/sec decode</div>
+        <div class="perf-number" data-target="176">176</div>
+        <div class="perf-label">tok/s decode · Gemma 4 E2B 4-bit</div>
       </div>
       <div class="perf-stat">
-        <div class="perf-number">300</div>
-        <div class="perf-label">tokens/sec prefill</div>
+        <div class="perf-number" data-target="3749" data-comma="1">3,749</div>
+        <div class="perf-label">tok/s prefill</div>
       </div>
       <div class="perf-stat">
-        <div class="perf-number">0</div>
+        <div class="perf-number" data-target="284" data-suffix="B">284B</div>
+        <div class="perf-label">params, DeepSeek V4 Flash — local</div>
+      </div>
+      <div class="perf-stat">
+        <div class="perf-number" data-target="0">0</div>
         <div class="perf-label">Python dependencies</div>
       </div>
     </div>
-    <p class="perf-note">Gemma-4 E4B 4-bit — base model Mac Mini M4 (16 GB)</p>
+
+    <div class="chart-card reveal">
+      <div class="chart-pills" id="chartPills"></div>
+      <div class="chart-canvas-wrap">
+        <canvas id="perfChart"></canvas>
+        <div class="chart-tooltip" id="chartTooltip"></div>
+      </div>
+      <div class="chart-legend" id="chartLegend"></div>
+      <p class="chart-caption">
+        <b>Decode</b> = free-form generation · <b>Echo</b> = high-repetition (where PLD shines) · <b>Code</b> = code completion (where the drafter shines).
+        Tokens/sec, higher is better. Apple M4 Max (128 GB) · identical 4-bit MLX weights · ctx 4096 · temp 0 · LM Studio (MLX runtime) as baseline.
+      </p>
+    </div>
+  </section>
+
+  <!-- DEEPSEEK V4 FLASH -->
+  <section class="deepseek" id="deepseek">
+    <div class="deepseek-inner">
+      <div class="deepseek-grid">
+        <div class="reveal">
+          <div class="deepseek-label">
+            <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M13 2L3 14h9l-1 8 10-12h-9l1-8z"/></svg>
+            The marquee capability
+          </div>
+          <h2>Run <span class="grad">DeepSeek&nbsp;V4&nbsp;Flash</span> locally on your Mac</h2>
+          <p>The 284-billion-parameter flagship — running on your own machine, no cloud, no API key. If you have a 96&nbsp;GB+ Apple Silicon Mac, it's one click away in the Model Browser.</p>
+          <ul class="deepseek-bullets">
+            <li><svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg><span>Built on Salvatore Sanfilippo's <a href="https://github.com/antirez/ds4" target="_blank" rel="noopener"><b>antirez/ds4</b></a> engine — native Metal kernels, byte-validated against the reference forward.</span></li>
+            <li><svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg><span><b>One-click download</b> of the GGUF, served from the same picker as every MLX model.</span></li>
+            <li><svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg><span><b>Agent mode and MCP tool calling</b> work on DSV4 too — the full toolset is inlined into the prompt.</span></li>
+            <li><svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg><span>A <b>single self-contained binary</b> — kernel sources are embedded and staged at first launch.</span></li>
+          </ul>
+          <a href="https://github.com/ddalcu/mlx-serve/releases" class="deepseek-cta">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+            Get MLX Core
+          </a>
+        </div>
+        <div class="deepseek-stat reveal">
+          <div class="ds-big" data-target="284" data-suffix="B">284B</div>
+          <div class="ds-big-sub">parameters · running on your desk</div>
+          <div class="ds-divider"></div>
+          <div class="ds-row">
+            <div><div class="ds-num">96&nbsp;GB+</div><div class="ds-cap">unified memory</div></div>
+            <div><div class="ds-num">0</div><div class="ds-cap">cloud calls</div></div>
+            <div><div class="ds-num">1</div><div class="ds-cap">binary</div></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- SPECULATIVE DECODING -->
+  <section class="section section-alt" id="speculative">
+    <div class="section-header reveal">
+      <div class="section-label">Speculative Decoding</div>
+      <h2 class="section-title">Two ways to draft ahead</h2>
+      <p class="section-desc">Generate multiple tokens per forward pass, verified exactly — so output is identical, just faster. Smart gates keep it on where it pays and step aside where it doesn't.</p>
+    </div>
+    <div class="spec-grid">
+      <div class="spec-card reveal">
+        <span class="spec-tag pld">PLD</span>
+        <h3>Prompt Lookup Decoding</h3>
+        <p>Model-agnostic n-gram drafting from the prompt + generated text. Works on every architecture — Gemma, Qwen, Llama, Mistral, Nemotron-H, LFM2.5 — with nothing extra to download.</p>
+        <div class="spec-win">up to <span>1.5×</span> on echo / RAG workloads</div>
+      </div>
+      <div class="spec-card reveal">
+        <span class="spec-tag drafter">DRAFTER</span>
+        <h3>Gemma 4 assistant drafter</h3>
+        <p>A tiny cross-attention drafter reuses the target model's own K/V cache to propose blocks of tokens. Tuned block sizes per target (E2B → 31B).</p>
+        <div class="spec-win">up to <span>+30%</span> on Gemma 4 code completion</div>
+      </div>
+      <div class="spec-card reveal">
+        <span class="spec-tag gate">ADAPTIVE</span>
+        <h3>Gates that know when to quit</h3>
+        <p>A prompt-time repetition score disables drafting on novel content; a runtime acceptance gate backs off mid-decode when drafts stop landing. You never pay for speculation that won't pay back.</p>
+        <div class="spec-win">exact output, <span>zero</span> quality cost</div>
+      </div>
+    </div>
+    <p class="spec-note reveal">
+      <b>What about MTP?</b> Multi-Token Prediction shipped briefly, then we removed it — across our cross-model benchmarks it was at parity with or slower than PLD, which covers the same ground with bigger wins. Checkpoints that carry MTP heads (Qwen 3.5 / 3.6) still load and run as regular models.
+    </p>
   </section>
 
   <!-- FEATURES -->
-  <section class="section section-alt" id="features">
+  <section class="section" id="features">
     <div class="section-header reveal">
       <div class="section-label">Features</div>
-      <h2 class="section-title">Everything you need to run local AI</h2>
-      <p class="section-desc">A complete inference stack from server to UI, built from scratch in Zig and Swift.</p>
+      <h2 class="section-title">A complete local-AI stack</h2>
+      <p class="section-desc">From server to UI, built from scratch in Zig and Swift — with the production features you actually run into.</p>
     </div>
     <div class="features-grid">
       <div class="feature-card reveal">
         <div class="feature-icon fi-perf">
           <svg viewBox="0 0 24 24" fill="white" xmlns="http://www.w3.org/2000/svg"><path d="m23.53 1.02-7.686 3.45h-7.06l-2.98 3.452h7.173L.47 22.98l7.681-3.607h7.065v-.002l2.978-3.45-7.148-.001 12.482-14.9zM0 4.47v14.901h1.883l2.98-3.45H3.451v-8h.942l2.824-3.45H0zm22.117 0-2.98 3.608h1.412v7.844h-.942l-2.98 3.45H24V4.47h-1.883z"/></svg>
         </div>
-        <h3>Native Performance</h3>
-        <p>Written in Zig with direct MLX-C bindings. No Python runtime, no overhead. KV cache reuse across requests for instant multi-turn.</p>
+        <h3>Native, no Python</h3>
+        <p>Written in Zig with direct MLX-C bindings. Eager warmup makes the first request 3.5× faster; a shared-prefix cache skips re-prefilling system prompts across turns.</p>
       </div>
       <div class="feature-card reveal">
         <div class="feature-icon fi-api">
-          <svg viewBox="0 0 256 260" fill="white" xmlns="http://www.w3.org/2000/svg"><path d="M239.184 106.203c5.87-17.679 3.838-37.03-5.577-53.103-14.156-24.641-42.608-37.316-70.395-31.36C147.554 4.321 123.795-3.424 100.879 1.419 77.963 6.261 59.369 22.957 52.096 45.221c-18.252 3.743-34.006 15.172-43.229 31.361C-5.443 101.183-2.195 132.215 16.899 153.32c-5.893 17.671-3.874 37.024 5.525 53.103 14.174 24.649 42.644 37.324 70.445 31.36 12.366 13.925 30.131 21.848 48.754 21.744 28.481.025 53.714-18.361 62.414-41.481 18.249-3.749 34-15.176 43.229-31.36 13.838-24.641 10.862-55.218-8.083-76.483zm-97.56 136.338a48.393 48.393 0 01-31.105-11.255l1.535-.87 51.67-29.825a8.595 8.595 0 004.247-7.367V120.374l21.845 12.636c.218.111.37.32.409.563v59.367c-.057 26.818-21.783 48.545-48.6 48.601zM37.158 197.93a48.345 48.345 0 01-5.781-32.589l1.534.921 51.722 29.826a8.339 8.339 0 008.441 0l63.181-36.425v25.221a.87.87 0 01-.358.665l-52.335 30.184c-23.257 13.398-52.97 5.431-66.404-17.803zM23.549 85.381a48.35 48.35 0 0125.58-21.333v61.39a8.288 8.288 0 004.195 7.316l62.874 36.272-21.845 12.636a.819.819 0 01-.767 0L41.353 151.53C18.142 138.076 10.182 108.386 23.549 85.125zm179.466 41.695l-62.874-36.63 21.794-12.584a.82.82 0 01.767 0l52.233 30.184c16.302 9.407 25.707 27.382 24.141 46.138-1.566 18.757-13.82 34.923-31.457 41.497v-61.39a8.544 8.544 0 00-4.604-7.215zm21.742-32.69l-1.535-.921-51.627-30.082a8.58 8.58 0 00-8.441 0L99.981 99.808V74.587a.856.856 0 01.307-.665l52.233-30.133c16.342-9.414 36.653-8.536 52.122 2.255 15.468 10.79 23.306 29.549 20.114 48.137zM88.061 139.098l-21.845-12.585a.84.84 0 01-.409-.563V65.685c.025-18.857 10.943-36 28.02-43.997 17.077-7.996 37.237-5.404 51.736 6.651l-1.535.87-51.67 29.825a8.595 8.595 0 00-4.246 7.367l-.051 72.697zM99.93 113.519l28.136-16.217 28.188 16.218v32.434l-28.086 16.218-28.188-16.218-.05-32.435z"/></svg>
+          <svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>
         </div>
-        <h3>OpenAI-Compatible API</h3>
-        <p>Drop-in replacement. Chat completions, streaming, tool calling, embeddings, logprobs. Works with any OpenAI client library.</p>
+        <h3>OpenAI + Anthropic APIs</h3>
+        <p>Drop-in chat completions, streaming, tool calling, embeddings, the Responses API and WebSockets — plus a native Anthropic Messages endpoint, so you can point Claude Code at a local model.</p>
+      </div>
+      <div class="feature-card reveal">
+        <div class="feature-icon fi-batch">
+          <svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg>
+        </div>
+        <h3>Continuous batching</h3>
+        <p><code>--max-concurrent</code> batches multiple decode requests through one forward pass — about 1.6× throughput at 4-way parallel on dense models. A 24-hour soak holds memory drift under 5%.</p>
+      </div>
+      <div class="feature-card reveal">
+        <div class="feature-icon fi-kv">
+          <svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14a9 3 0 0 0 18 0V5"/><path d="M3 12a9 3 0 0 0 18 0"/></svg>
+        </div>
+        <h3>KV-cache quantization</h3>
+        <p><code>--kv-quant</code> shrinks KV memory ~4× at 4-bit and ~2× at 8-bit — fit 16K contexts that didn't fit dense, or double your parallel-request budget. TurboQuant variants handle heavy-tailed activations.</p>
       </div>
       <div class="feature-card reveal">
         <div class="feature-icon fi-agent">
           <svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 8V4H8"/><rect width="16" height="12" x="4" y="8" rx="2"/><path d="M2 14h2"/><path d="M20 14h2"/><path d="M15 13v2"/><path d="M9 13v2"/></svg>
         </div>
-        <h3>Built-in Agent</h3>
-        <p>7 built-in tools: shell, file read/write/edit, search, web browse, web search. Extend with prompt-based skills — just drop a markdown file.</p>
+        <h3>Built-in agent + MCP</h3>
+        <p>Ten built-in tools — shell, file read/write/edit, search, browse, web search, memory — with a per-tool approval dialog. Connect MCP servers from a curated marketplace, or extend with markdown skills.</p>
       </div>
       <div class="feature-card reveal">
         <div class="feature-icon fi-app">
           <svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="M10 4v4"/><path d="M2 8h20"/><path d="M6 4v4"/></svg>
         </div>
-        <h3>Menu Bar App</h3>
-        <p>Native macOS app lives in your menu bar. Download models from HuggingFace with resumable transfers. Chat, browse, and manage from one place.</p>
-      </div>
-      <div class="feature-card reveal">
-        <div class="feature-icon fi-stream">
-          <svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M4 14a1 1 0 0 1-.78-1.63l9.9-10.2a.5.5 0 0 1 .86.46l-1.92 6.02A1 1 0 0 0 13 10h7a1 1 0 0 1 .78 1.63l-9.9 10.2a.5.5 0 0 1-.86-.46l1.92-6.02A1 1 0 0 0 11 14z"/></svg>
-        </div>
-        <h3>Streaming &amp; Tool Calling</h3>
-        <p>Real-time SSE streaming with automatic tool call detection. The model can call functions, get results, and continue reasoning — all in one request.</p>
-      </div>
-      <div class="feature-card reveal">
-        <div class="feature-icon fi-skills">
-          <svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15.39 4.39a1 1 0 0 0 1.68-.474 2.5 2.5 0 1 1 3.014 3.015 1 1 0 0 0-.474 1.68l1.683 1.682a2.414 2.414 0 0 1 0 3.414L19.61 15.39a1 1 0 0 1-1.68-.474 2.5 2.5 0 1 0-3.014 3.015 1 1 0 0 1 .474 1.68l-1.683 1.682a2.414 2.414 0 0 1-3.414 0L8.61 19.61a1 1 0 0 0-1.68.474 2.5 2.5 0 1 1-3.014-3.015 1 1 0 0 0 .474-1.68l-1.683-1.682a2.414 2.414 0 0 1 0-3.414L4.39 8.61a1 1 0 0 1 1.68.474 2.5 2.5 0 1 0 3.014-3.015 1 1 0 0 1-.474-1.68l1.683-1.682a2.414 2.414 0 0 1 3.414 0z"/></svg>
-        </div>
-        <h3>Extensible Skills</h3>
-        <p>Teach the agent new capabilities by dropping markdown files in a folder. No code needed — just describe the workflow and the agent follows it.</p>
+        <h3>One server, every model</h3>
+        <p>The MLX Core menu-bar app downloads models from HuggingFace with resumable transfers and hot-switches between them in place. <code>--model-dir</code> serves a whole folder; clients route by name.</p>
       </div>
     </div>
   </section>
 
   <!-- QUICK START -->
-  <section class="section" id="quickstart">
+  <section class="section section-alt" id="quickstart">
     <div class="section-header reveal">
       <div class="section-label">Quick Start</div>
       <h2 class="section-title">Up and running in seconds</h2>
@@ -799,21 +1103,21 @@
           </button>
         </div>
         <div class="code-body">
-<pre><span class="comment"># Download a release or build from source</span>
+<pre><span class="comment"># Build from source (or grab a release)</span>
 <span class="cmd">git clone</span> https://github.com/ddalcu/mlx-serve
 <span class="cmd">cd</span> mlx-serve
 <span class="cmd">zig build</span> <span class="flag">-Doptimize=ReleaseFast</span>
 
-<span class="comment"># Start the server</span>
+<span class="comment"># Serve a model — add --pld for speculative decoding</span>
 <span class="cmd">./zig-out/bin/mlx-serve</span> \
-  <span class="flag">--model</span> <span class="string">~/models/gemma-4-4b-it-4bit</span> \
-  <span class="flag">--serve</span> <span class="flag">--port</span> <span class="string">8080</span></pre>
+  <span class="flag">--model</span> <span class="string">~/models/gemma-4-e4b-it-4bit</span> \
+  <span class="flag">--serve</span> <span class="flag">--port</span> <span class="string">8080</span> <span class="flag">--pld</span></pre>
         </div>
       </div>
 
       <div class="code-block">
         <div class="code-header">
-          <span>Use the API</span>
+          <span>Use the API — OpenAI or Anthropic</span>
           <button class="copy-btn" onclick="copyCode(this)" aria-label="Copy code">
             <svg viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>
           </button>
@@ -824,7 +1128,10 @@
   <span class="flag">-d</span> <span class="string">'{
     "messages": [{"role": "user", "content": "Hello!"}],
     "stream": true
-  }'</span></pre>
+  }'</span>
+
+<span class="comment"># Point Claude Code at your Mac</span>
+<span class="cmd">export</span> ANTHROPIC_BASE_URL=<span class="url">http://localhost:8080</span></pre>
         </div>
       </div>
 
@@ -832,7 +1139,7 @@
         <img src="appiconb.png" alt="MLX Core" class="app-download-icon">
         <div class="app-download-info">
           <div class="app-download-name">MLX Core</div>
-          <div class="app-download-desc">Desktop app for macOS</div>
+          <div class="app-download-desc">Desktop app for macOS — chat, agent &amp; model browser</div>
         </div>
         <div class="app-download-btn">Get</div>
       </a>
@@ -840,39 +1147,53 @@
   </section>
 
   <!-- MODELS -->
-  <section class="section section-alt" id="models">
+  <section class="section" id="models">
     <div class="section-header reveal">
       <div class="section-label">Models</div>
       <h2 class="section-title">Run the latest open models</h2>
-      <p class="section-desc">Supports quantized MLX-format models. Download directly from HuggingFace in the app.</p>
+      <p class="section-desc">Quantized MLX-format models plus DeepSeek V4 Flash via the embedded ds4 engine. Download directly from HuggingFace in the app.</p>
     </div>
     <div class="models-grid reveal">
+      <div class="model-card featured">
+        <div class="model-logo ml-deepseek">DS</div>
+        <div class="model-info">
+          <h3>DeepSeek V4 Flash <span class="model-flag">96GB+</span></h3>
+          <p>284B · via antirez/ds4 engine</p>
+        </div>
+      </div>
       <div class="model-card">
         <div class="model-logo ml-gemma">G</div>
         <div class="model-info">
           <h3>Gemma 4</h3>
-          <p>Google &middot; 4B, 12B, 27B</p>
+          <p>Google · E2B / E4B / 31B / 26B-A4B MoE · vision</p>
         </div>
       </div>
       <div class="model-card">
         <div class="model-logo ml-qwen">Q</div>
         <div class="model-info">
-          <h3>Qwen 3.5</h3>
-          <p>Alibaba &middot; MoE &middot; 4B, 14B, 32B</p>
+          <h3>Qwen 3.6</h3>
+          <p>Alibaba · 27B · 35B-A3B MoE · GatedDeltaNet</p>
         </div>
       </div>
       <div class="model-card">
         <div class="model-logo ml-llama">L</div>
         <div class="model-info">
           <h3>Llama 3</h3>
-          <p>Meta &middot; 8B, 70B</p>
+          <p>Meta · 8B · 70B</p>
         </div>
       </div>
       <div class="model-card">
         <div class="model-logo ml-mistral">M</div>
         <div class="model-info">
           <h3>Mistral</h3>
-          <p>Mistral AI &middot; 7B, 8x7B</p>
+          <p>Mistral AI · 7B · 8x7B</p>
+        </div>
+      </div>
+      <div class="model-card">
+        <div class="model-logo ml-more">+</div>
+        <div class="model-info">
+          <h3>And more</h3>
+          <p>Nemotron-H · LFM2.5 · Qwen 3-Next · Gemma 3</p>
         </div>
       </div>
     </div>
@@ -883,13 +1204,14 @@
     <ul class="footer-links">
       <li><a href="https://github.com/ddalcu/mlx-serve" target="_blank" rel="noopener">GitHub</a></li>
       <li><a href="https://github.com/ddalcu/mlx-serve/releases" target="_blank" rel="noopener">Releases</a></li>
+      <li><a href="https://github.com/ddalcu/mlx-serve/blob/main/CHANGELOG.md" target="_blank" rel="noopener">Changelog</a></li>
       <li><a href="https://github.com/ddalcu/mlx-serve/issues" target="_blank" rel="noopener">Issues</a></li>
     </ul>
-    <p class="footer-copy">MIT License &middot; mlx-serve</p>
+    <p class="footer-copy">MIT License · mlx-serve · built for Apple Silicon</p>
   </footer>
 
   <script>
-    // Scroll reveal
+    // ─── Scroll reveal ───
     const observer = new IntersectionObserver((entries) => {
       entries.forEach(entry => {
         if (entry.isIntersecting) {
@@ -898,10 +1220,35 @@
         }
       });
     }, { threshold: 0.15, rootMargin: '0px 0px -40px 0px' });
-
     document.querySelectorAll('.reveal').forEach(el => observer.observe(el));
 
-    // Copy code
+    // ─── Count-up stats ───
+    function animateCount(el) {
+      const target = parseFloat(el.dataset.target);
+      const suffix = el.dataset.suffix || '';
+      const comma = el.dataset.comma === '1';
+      const dur = 1400, start = performance.now();
+      function fmt(v) {
+        const n = Math.round(v);
+        return (comma ? n.toLocaleString('en-US') : String(n)) + suffix;
+      }
+      function tick(now) {
+        const p = Math.min(1, (now - start) / dur);
+        const e = 1 - Math.pow(1 - p, 3);
+        el.textContent = fmt(target * e);
+        if (p < 1) requestAnimationFrame(tick);
+        else el.textContent = fmt(target);
+      }
+      requestAnimationFrame(tick);
+    }
+    const countObserver = new IntersectionObserver((entries) => {
+      entries.forEach(entry => {
+        if (entry.isIntersecting) { animateCount(entry.target); countObserver.unobserve(entry.target); }
+      });
+    }, { threshold: 0.5 });
+    document.querySelectorAll('[data-target]').forEach(el => countObserver.observe(el));
+
+    // ─── Copy code ───
     function copyCode(btn) {
       const pre = btn.closest('.code-block').querySelector('pre');
       navigator.clipboard.writeText(pre.textContent).then(() => {
@@ -911,6 +1258,209 @@
         }, 2000);
       });
     }
+
+    // ─── Performance chart (real data, mlx-serve v26.5.6 vs LM Studio, M4 Max 128GB) ───
+    // Workloads: [Decode, Echo, Code] in tokens/sec.
+    const PERF = {
+      'gemma-e2b':   { name: 'Gemma 4 E2B', series: {
+        'LM Studio': [146.3, 125.0, 137.6], 'mlx-serve': [176.6, 164.0, 169.8],
+        '+ PLD': [155.0, 269.1, 166.4], '+ Drafter': [153.8, 192.0, 201.6] } },
+      'gemma-e4b':   { name: 'Gemma 4 E4B', series: {
+        'LM Studio': [94.8, 81.4, 89.2], 'mlx-serve': [110.7, 97.6, 101.0],
+        '+ PLD': [98.6, 158.8, 100.2], '+ Drafter': [101.7, 129.2, 131.4] } },
+      'gemma-31b':   { name: 'Gemma 4 31B', series: {
+        'LM Studio': [22.4, 19.3, 19.3], 'mlx-serve': [23.9, 19.7, 20.5],
+        '+ PLD': [23.3, 26.7, 18.6] } },
+      'gemma-26moe': { name: 'Gemma 4 26B-A4B MoE', series: {
+        'LM Studio': [80.5, 72.6, 76.1], 'mlx-serve': [106.6, 91.1, 96.5],
+        '+ PLD': [97.3, 125.2, 91.7] } },
+      'qwen-27b':    { name: 'Qwen 3.6 27B', series: {
+        'LM Studio': [26.2, 21.9, 23.0], 'mlx-serve': [27.5, 22.9, 24.0],
+        '+ PLD': [26.4, 33.6, 23.1] } },
+      'qwen-35moe':  { name: 'Qwen 3.6 35B-A3B MoE', series: {
+        'LM Studio': [97.6, 83.0, 88.9], 'mlx-serve': [118.2, 100.9, 105.5],
+        '+ PLD': [103.7, 140.3, 97.4] } },
+    };
+    const WORKLOADS = ['Decode', 'Echo', 'Code'];
+    const COLORS = {
+      'LM Studio': '#c2c2cc', 'mlx-serve': '#0071e3',
+      '+ PLD': '#30d158', '+ Drafter': '#f7a41d'
+    };
+
+    const canvas = document.getElementById('perfChart');
+    const ctx = canvas.getContext('2d');
+    const tooltip = document.getElementById('chartTooltip');
+    let activeKey = 'gemma-e2b';
+    let animProgress = 0, animRAF = null;
+    let hitRects = [];
+
+    function niceMax(v) {
+      const steps = [10, 20, 25, 40, 50, 80, 100, 120, 150, 200, 250, 300];
+      for (const s of steps) if (v <= s) return s;
+      return Math.ceil(v / 100) * 100;
+    }
+
+    function roundedTopRect(c, x, y, w, h, r) {
+      r = Math.min(r, w / 2, Math.abs(h));
+      c.beginPath();
+      c.moveTo(x, y + h);
+      c.lineTo(x, y + r);
+      c.arcTo(x, y, x + r, y, r);
+      c.lineTo(x + w - r, y);
+      c.arcTo(x + w, y, x + w, y + r, r);
+      c.lineTo(x + w, y + h);
+      c.closePath();
+    }
+
+    function drawChart() {
+      const dpr = window.devicePixelRatio || 1;
+      const wrap = canvas.parentElement;
+      const W = wrap.clientWidth, H = wrap.clientHeight;
+      canvas.width = W * dpr; canvas.height = H * dpr;
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.clearRect(0, 0, W, H);
+
+      const data = PERF[activeKey];
+      const seriesNames = Object.keys(data.series);
+      const padL = 46, padR = 14, padT = 16, padB = 40;
+      const plotW = W - padL - padR, plotH = H - padT - padB;
+      const baseY = padT + plotH;
+
+      let maxVal = 0;
+      seriesNames.forEach(s => data.series[s].forEach(v => { if (v > maxVal) maxVal = v; }));
+      const top = niceMax(maxVal);
+
+      // grid + y labels
+      ctx.font = '500 11px ' + getComputedStyle(document.body).getPropertyValue('--mono');
+      ctx.textBaseline = 'middle';
+      const lines = 4;
+      for (let i = 0; i <= lines; i++) {
+        const val = top * i / lines;
+        const y = baseY - plotH * i / lines;
+        ctx.strokeStyle = 'rgba(0,0,0,0.06)';
+        ctx.lineWidth = 1;
+        ctx.beginPath(); ctx.moveTo(padL, y + 0.5); ctx.lineTo(W - padR, y + 0.5); ctx.stroke();
+        ctx.fillStyle = '#86868b'; ctx.textAlign = 'right';
+        ctx.fillText(Math.round(val), padL - 10, y);
+      }
+
+      const groupW = plotW / WORKLOADS.length;
+      const innerPad = groupW * 0.16;
+      const usable = groupW - innerPad * 2;
+      const gap = 6;
+      const barW = (usable - gap * (seriesNames.length - 1)) / seriesNames.length;
+
+      hitRects = [];
+      ctx.textAlign = 'center';
+
+      WORKLOADS.forEach((wl, wi) => {
+        const gx = padL + groupW * wi + innerPad;
+        seriesNames.forEach((s, si) => {
+          const val = data.series[s][wi];
+          const fullH = plotH * (val / top);
+          const h = fullH * animProgress;
+          const x = gx + si * (barW + gap);
+          const y = baseY - h;
+          ctx.fillStyle = COLORS[s] || '#999';
+          roundedTopRect(ctx, x, y, barW, h, 4);
+          ctx.fill();
+          hitRects.push({ x, y: baseY - fullH, w: barW, h: fullH, series: s, workload: wl, value: val });
+        });
+        // workload label
+        ctx.fillStyle = '#1d1d1f';
+        ctx.font = '600 12px -apple-system, sans-serif';
+        ctx.textBaseline = 'top';
+        ctx.fillText(wl, padL + groupW * wi + groupW / 2, baseY + 12);
+        ctx.textBaseline = 'middle';
+      });
+    }
+
+    function runAnim() {
+      cancelAnimationFrame(animRAF);
+      animProgress = 0;
+      const start = performance.now(), dur = 750;
+      function step(now) {
+        const p = Math.min(1, (now - start) / dur);
+        animProgress = 1 - Math.pow(1 - p, 3);
+        drawChart();
+        if (p < 1) animRAF = requestAnimationFrame(step);
+        else { animProgress = 1; drawChart(); }
+      }
+      animRAF = requestAnimationFrame(step);
+    }
+
+    function buildPills() {
+      const wrap = document.getElementById('chartPills');
+      wrap.innerHTML = '';
+      Object.keys(PERF).forEach(key => {
+        const b = document.createElement('button');
+        b.className = 'chart-pill' + (key === activeKey ? ' active' : '');
+        b.textContent = PERF[key].name;
+        b.onclick = () => {
+          activeKey = key;
+          wrap.querySelectorAll('.chart-pill').forEach(p => p.classList.remove('active'));
+          b.classList.add('active');
+          buildLegend();
+          runAnim();
+        };
+        wrap.appendChild(b);
+      });
+    }
+
+    function buildLegend() {
+      const wrap = document.getElementById('chartLegend');
+      wrap.innerHTML = '';
+      Object.keys(PERF[activeKey].series).forEach(s => {
+        const item = document.createElement('div');
+        item.className = 'legend-item';
+        item.innerHTML = '<span class="legend-swatch" style="background:' + (COLORS[s] || '#999') + '"></span>' + s;
+        wrap.appendChild(item);
+      });
+    }
+
+    // hover tooltip
+    canvas.addEventListener('mousemove', (e) => {
+      const r = canvas.getBoundingClientRect();
+      const mx = e.clientX - r.left, my = e.clientY - r.top;
+      let hit = null;
+      for (const b of hitRects) {
+        if (mx >= b.x && mx <= b.x + b.w && my >= b.y && my <= b.y + b.h) { hit = b; break; }
+      }
+      if (hit) {
+        const base = PERF[activeKey].series['LM Studio'][WORKLOADS.indexOf(hit.workload)];
+        let delta = '';
+        if (hit.series !== 'LM Studio' && base) {
+          const pct = Math.round((hit.value / base - 1) * 100);
+          if (pct > 0) delta = '<div class="tt-delta">+' + pct + '% vs LM Studio</div>';
+        }
+        tooltip.innerHTML = '<div class="tt-series">' + hit.series + ' · ' + hit.workload + '</div>' +
+          '<div class="tt-val">' + hit.value.toFixed(1) + ' tok/s</div>' + delta;
+        tooltip.style.left = (hit.x + hit.w / 2) + 'px';
+        tooltip.style.top = hit.y + 'px';
+        tooltip.style.opacity = '1';
+      } else {
+        tooltip.style.opacity = '0';
+      }
+    });
+    canvas.addEventListener('mouseleave', () => { tooltip.style.opacity = '0'; });
+
+    // init + animate when scrolled into view
+    buildPills();
+    buildLegend();
+    drawChart();
+    let chartShown = false;
+    const chartObserver = new IntersectionObserver((entries) => {
+      entries.forEach(entry => {
+        if (entry.isIntersecting && !chartShown) { chartShown = true; runAnim(); }
+      });
+    }, { threshold: 0.25 });
+    chartObserver.observe(canvas.parentElement);
+
+    let resizeTO;
+    window.addEventListener('resize', () => {
+      clearTimeout(resizeTO);
+      resizeTO = setTimeout(drawChart, 120);
+    });
   </script>
 
 </body>
