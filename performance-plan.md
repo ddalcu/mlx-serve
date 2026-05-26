@@ -60,6 +60,93 @@ Key facts:
 6. **Always build `-Doptimize=ReleaseFast`.** Plain `swift build` (without
    `app/build.sh`) silently rebuilds zig-out in Debug.
 
+## Overnight perf push — 2026-05-26 (Iterations 0-5 of the autonomous loop)
+
+User-authorized 8-hour autonomous push focused on the highest-EV open
+items in this plan. Tripwires green across every commit; reproducible
+via the test scripts cited below.
+
+| Iter | Status | One-line | Test |
+|---|---|---|---|
+| 0 | ✅ | Committed Phase 2 forward-equivalence work + tripwire fixtures. | `tests/test_phase2_forward_equivalence.sh` 6/6 |
+| 1 | ✅ | `timings.tokenize_ms` on all 3 API surfaces (chat-completions, anthropic, responses). Measurement-first; finding triggered Iteration 2 immediately. | `tests/test_tokenize_ms_present.sh` 3/3 |
+| 1.b | ⛔️ skipped | Worker-thread tokenize. Measurement showed pure overhead — handler has nothing else to do before submit. | (n/a) |
+| 2 | ✅ | Per-LoadedModel chat-template tokenize LRU. Warm 7.7× on long-prompt repeats (236 ms → 0.002 ms tokenize). | `tests/test_tokenize_cache.sh` |
+| 3-5 | ✅ | llama.cpp multi-session LRU (`--llama-cache-entries N`, default 1). Alternating long-doc prompts stay warm in both slots instead of evicting each other. | `tests/test_llama_multi_session.sh` |
+| 6 | ⛔️ skipped | n_ubatch / n_threads_batch sweep — needs a long bench rig to find a >5% delta the plan's gate requires; deferred to a measurement-only follow-up. | (n/a) |
+| 7 | ⛔️ skipped | MLX micro-opts. Conditional, lower EV than the warm-tokenize/multi-session pair. | (n/a) |
+
+### Measured wins (Apple M4 / 16 GB, `tests/bench_iter2to5.sh`)
+
+**Iteration 2 — Gemma 4 E4B MLX, 1813-token repeat (warm tokenize cache):**
+
+| Run | cached_n | tokenize_ms | prompt_ms | Effective TTFT |
+|---:|---:|---:|---:|---:|
+| 1 (cold) | 0 | 233.27 | 2882.74 | 3116 ms |
+| 2 (warm) | 1812 | 0.003 | 35.36 | **35.4 ms** |
+| 3 (warm) | 1812 | 0.002 | 33.71 | **33.7 ms** |
+
+Warm-path tokenize dropped from 233 ms to 0.003 ms (the per-LoadedModel LRU
+hit returns a memcpy of the cached token IDs). Combined with the Phase 1
+SSM warm prefix reuse already shipped, total warm TTFT is **94×** faster
+than cold.
+
+**Iteration 3-5 — Qwen3.5-4B-IQ4_NL GGUF, alternating A/B/A/B/A:**
+
+| Mode | A1 | B1 | A2 | B2 | A3 |
+|---|---:|---:|---:|---:|---:|
+| `--llama-cache-entries 1` (legacy single-session) | cached_n=0 | 0 | **0** | **0** | **0** |
+| `--llama-cache-entries 2` (multi-session LRU) | cached_n=0 | 0 | **40/41** | **40/41** | **40/41** |
+| Decode tok/s (single-session) | 19.8 | 19.9 | 19.8 | 19.5 | 19.7 |
+| Decode tok/s (multi-session) | 19.5 | 20.0 | **29.4** | **29.7** | **29.7** |
+
+The single-session row is the pre-iteration baseline: every A/B flip
+evicts the other's KV and the second visit is a cold prefill. The
+multi-session row keeps both alive — second visits hit at 40/41 tokens
+cached (the trailing 1 is forced re-decode for fresh logits, per
+`LlamaSession.sync`). Decode tok/s also lifts ~1.5× on warm hits
+because llama.cpp's first-token-after-prefill path doesn't pay the
+sync overhead.
+
+### Files changed this session
+
+- **`src/server.zig`**: `formatTimingsObject` gains `tokenize_ns`; new
+  `cachedFormatChat` helper at the 3 handler entry points; envelope
+  emits `timings` on `/v1/responses`; new `tokenize_cache_entries` /
+  `llama_cache_entries` globals.
+- **`src/tokenize_cache.zig`** (new): `TokenizeCache` LRU keyed by
+  Wyhash digest of (messages, tools, flags). std.Io.Mutex guards
+  entries. Image-bearing messages skip caching.
+- **`src/model_registry.zig`**: new `LlamaSessionEntry`,
+  `llama_sessions` ArrayList replacing the single slot, `tokenize_cache`
+  field, deinit/unloadResident updated.
+- **`src/scheduler.zig`**: `runPrefillLlama` walks `llama_sessions`
+  picking the best-prefix-match entry; grows on miss until
+  `llama_cache_max_entries`; LRU-evicts when full. Tokenize-cache /
+  llama-cache wiring added to MLX, ds4, AND llama load paths
+  (previously the GGUF paths bypassed several shared assignments).
+- **`src/main.zig`**: `--tokenize-cache-entries`,
+  `--llama-cache-entries` flags; help text; threading to all 3
+  LoadParams construction sites (MLX, ds4, llama).
+- **`src/generate.zig`** + **`src/scheduler.zig`** (Phase 2 commit):
+  opt-in `MLX_SERVE_COMPILE_FORWARD=1` for the chunked-prefill loop.
+- **New tests**: `tests/test_phase2_forward_equivalence.sh` (6/6),
+  `tests/test_tokenize_ms_present.sh` (3/3),
+  `tests/test_tokenize_cache.sh`, `tests/test_llama_multi_session.sh`,
+  `tests/bench_iter2to5.sh`.
+- **Unit tests**: 362/364 passing (was 359/361, the +3 are new
+  TokenizeCache tests).
+
+### CLI flags shipped
+
+- `--tokenize-cache-entries N` (default **4**) — per-LoadedModel LRU
+  cache of chat-template render+tokenize results. 0 disables.
+- `--llama-cache-entries N` (default **1** = backwards-compat) — max
+  resident llama.cpp KV sessions. N > 1 enables best-prefix-match LRU
+  for alternating multi-doc workloads.
+
+---
+
 ## Where we are now (measured, post-Phase-1 + Phase 5 #2)
 
 **Headline numbers** (Apple M4 / 16 GB, same model files for both engines,
@@ -324,7 +411,24 @@ pre-change forward for every `model_type` touching the changed path:
 **Acceptance:** ≥ 30% cold prefill improvement on Qwen3.5-4B MLX *and*
 byte-equivalent across listed archs. Drop the change otherwise.
 
-### Phase 5 #1 — Multi-entry hot prefix cache for GGUF — OPEN
+### Phase 5 #1 — Multi-entry hot prefix cache for GGUF — ✅ SHIPPED (2026-05-26)
+
+See "Overnight perf push" section above. Iteration 3-5 landed
+`--llama-cache-entries N` (default 1) with best-prefix-match LRU.
+Alternating two long-doc prompts now keeps both KV slots warm; second
+visits hit at 40/41 tokens cached instead of 0/41. Test:
+`tests/test_llama_multi_session.sh`.
+
+**Not in scope tonight** (deferred to a follow-up):
+- Per-entry concurrency. `llama_session_busy` remains a model-wide gate
+  because `max_concurrent=1` still serializes the inference thread.
+  Per-entry concurrency wants an inference-thread refactor that's
+  unsafe to land unsupervised.
+- `--llama-cache-mem` byte-budget eviction. The count cap is in;
+  byte-cap is straight-forward to add when somebody quantifies the
+  per-session ctx_size × N footprint on real workloads.
+
+### Phase 5 #1 — Multi-entry hot prefix cache for GGUF — original spec preserved
 
 Today the llama.cpp path keeps **one** persistent `LlamaSession` per model
 (`LoadedModel.llama_session`). With one entry, switching between document A
@@ -350,7 +454,22 @@ second visit.
 **Acceptance:** zero regression on single-doc workflow, near-zero TTFT
 on alternation between N distinct doc roots.
 
-### Phase 4 #1 — Parallel tokenize on the connection thread — OPEN
+### Phase 4 #1 — Instrumentation + (skipped) parallel tokenize — ✅ INSTRUMENTED, ⛔️ WORKER-THREAD SKIPPED
+
+Iteration 1 added `timings.tokenize_ms` across all 3 API surfaces. The
+measurement-first finding (Gemma 4 E4B MLX 4-bit):
+
+- Short prompt (12 tok): tokenize 0.7 ms / prompt_ms 31 ms = **2.3%**
+- Long prompt cold (1813 tok): tokenize 236 ms / 2882 ms = **8.2%**
+- Long prompt warm hit: tokenize 236 ms / 35 ms = **672%** (!)
+
+The cold case crossed the plan's 5% threshold, but a worker thread is
+pure overhead — `Slot.submit` needs the result before it can dispatch,
+and there's nothing else for the handler to do in the meantime. The
+actual fix landed as Iteration 2 (Phase 4 #3 below) — a tokenize-cache
+that turns the 236 ms warm cost into 0.002 ms.
+
+### Phase 4 #1 — Original parallel-tokenize spec preserved
 
 Today `handleChatCompletions` renders the chat template + tokenizes inline
 **before** `sch.submit()`. For short prompts this is a few ms; for long
@@ -369,7 +488,23 @@ they're sequential and the user pays both.
 
 **Acceptance:** ≥ 20 ms off measured end-to-end TTFT on short prompts.
 
-### Phase 4 #3 — System-prompt prewarm — OPEN
+### Phase 4 #3 — Chat-template tokenize cache — ✅ SHIPPED (2026-05-26)
+
+Iteration 2 landed `--tokenize-cache-entries N` (default 4) — a
+per-LoadedModel LRU keyed on the chat-template inputs. On warm reuse
+of an identical prompt the second hit returns a memcpy of the cached
+token IDs (drop from 236 ms to 0.002 ms on a 1813-tok Gemma prompt).
+Test: `tests/test_tokenize_cache.sh`.
+
+This is a stronger, more general form of the original
+"system-prompt prewarm" idea — instead of pre-tokenizing only the
+system block at load time (which would require splitting the Jinja
+template at the system/user boundary), we memoize the full template
+output. Cache key includes messages, tools, tool-choice instructions,
+and `enable_thinking`; image-bearing messages skip the cache so the
+per-request vision-token injection always re-runs.
+
+### Phase 4 #3 — Original system-prompt prewarm spec preserved
 
 When the loaded model has a stable system prompt (e.g., agent flows where
 the same system + tools combination repeats every turn), we can:
