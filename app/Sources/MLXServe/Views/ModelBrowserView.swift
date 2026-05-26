@@ -224,16 +224,23 @@ private struct ColumnHeaderRow: View {
                 .frame(width: 54, alignment: .leading)
             SortableHeader("Size", field: nil, searchService: searchService)
                 .frame(width: 54, alignment: .trailing)
+            // Downloads column: 88 wide so "Downloads" + the sort chevron
+            // fit on one line. Was 72, which forced "Down-loads" wrapping
+            // (visible in the screenshot bug report).
             SortableHeader("Downloads", field: .downloads, searchService: searchService)
-                .frame(width: 72, alignment: .trailing)
+                .frame(width: 88, alignment: .trailing)
             SortableHeader("Likes", field: .likes, searchService: searchService)
                 .frame(width: 50, alignment: .trailing)
             SortableHeader("RAM Est.", field: .estimatedSize, searchService: searchService)
                 .frame(width: 80, alignment: .trailing)
             SortableHeader("Updated", field: .lastModified, searchService: searchService)
                 .frame(width: 64, alignment: .trailing)
+            // Action column: 92 wide so the Download button + menu chevron
+            // render without truncation (was 64). The cell content is
+            // either a "Download ▾" menu, a trash icon, a Resume/Retry
+            // button, or a progress bar — 92 fits the widest.
             Text("")
-                .frame(width: 64)
+                .frame(width: 92)
         }
         .font(.callout.weight(.semibold))
         .foregroundStyle(.secondary)
@@ -364,10 +371,11 @@ private struct ModelBrowserRow: View {
                 .font(.callout.monospacedDigit())
                 .frame(width: 54, alignment: .trailing)
 
-            // Downloads
+            // Downloads — width matched to ColumnHeaderRow (88) so the
+            // "Downloads" header doesn't have to wrap.
             Text(formatCount(model.downloads ?? 0))
                 .font(.callout.monospacedDigit())
-                .frame(width: 72, alignment: .trailing)
+                .frame(width: 88, alignment: .trailing)
 
             // Likes
             Text(formatCount(model.likes ?? 0))
@@ -390,9 +398,11 @@ private struct ModelBrowserRow: View {
                 .foregroundStyle(.secondary)
                 .frame(width: 64, alignment: .trailing)
 
-            // Download button
+            // Download button — width matched to ColumnHeaderRow (92) so
+            // the "Download ▾" GGUF menu, "Resume"/"Retry" buttons, and
+            // the trash icon all render without truncation.
             downloadButton
-                .frame(width: 64, alignment: .center)
+                .frame(width: 92, alignment: .center)
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
