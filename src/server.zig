@@ -2273,12 +2273,19 @@ fn handleChatCompletions(
     // `tools_json` + `tool_choice_instruction` through — the ds4 helper
     // synthesizes a system-message fallback when the GGUF chat template
     // doesn't model `tools` natively (which is the DSV4 case).
+    //
+    // Phase 4 instrumentation: time the render+tokenize step. This blocks the
+    // request thread today; if it grows past 5% of TTFT we move it to a
+    // worker thread (Phase 4 #1.b). The number is surfaced as
+    // `timings.tokenize_ms` so a bench can see it without a perf trace.
+    var tokenize_sw = Stopwatch.init(stream.io);
     var prompt_ids_raw = if (lm.ds4_engine) |engine|
         try chat_mod.encodeChatViaDs4(allocator, engine, messages.items, tools_json, tool_choice_instruction, enable_thinking)
     else if (lm.llama_engine) |engine|
         try chat_mod.encodeChatViaLlama(allocator, engine, chat_config, messages.items, tools_json, tool_choice_instruction, enable_thinking)
     else
         try chat_mod.formatChat(allocator, tok, messages.items, chat_config, tools_json, tool_choice_instruction, enable_thinking);
+    const tokenize_ns = tokenize_sw.read();
 
     // Run vision encoder if any messages contain images. Phase A8: each
     // request owns its embedding locally; we hand it off to the slot at
@@ -2386,7 +2393,7 @@ fn handleChatCompletions(
     const sub_ve = local_ve;
     local_ve = null;
     if (is_stream) {
-        handleStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, include_usage, has_tools, logprobs_n, enable_thinking, reasoning_budget, enable_pld, enable_drafter, sub_ve, kv_quant_override) catch |err| {
+        handleStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, include_usage, has_tools, logprobs_n, enable_thinking, reasoning_budget, enable_pld, enable_drafter, sub_ve, kv_quant_override, tokenize_ns) catch |err| {
             log.err("  -> streaming error: {}\n", .{err});
             // Send SSE error event so the client gets a proper error instead of a dropped connection
             const err_chunk = std.fmt.allocPrint(allocator,
@@ -2397,7 +2404,7 @@ fn handleChatCompletions(
             stream.writeAll("\n\ndata: [DONE]\n\n") catch {};
         };
     } else {
-        handleNonStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, logprobs_n, enable_thinking, reasoning_budget, enable_pld, enable_drafter, sub_ve, kv_quant_override) catch |err| {
+        handleNonStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, logprobs_n, enable_thinking, reasoning_budget, enable_pld, enable_drafter, sub_ve, kv_quant_override, tokenize_ns) catch |err| {
             log.err("  -> 500 ({s})\n", .{@errorName(err)});
             sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", @errorName(err), 500) catch {};
         };
@@ -2903,6 +2910,9 @@ fn handleNonStreamingGeneration(
     vision_embeddings: ?mlx.mlx_array,
     /// Wave 1.A: per-request KV-quant override; null = inherit scheduler default.
     kv_quant_override: ?transformer_mod.KVQuantConfig,
+    /// Iteration 1: tokenize_ns from the parent handleChatCompletions, so
+    /// the non-streaming chat response carries `timings.tokenize_ms`.
+    tokenize_ns: u64,
 ) !void {
     // Phase A8: this handler owns the vision array on entry; ownership
     // transfers to the slot on submit (the scheduler's `Slot.deinit` frees
@@ -3030,7 +3040,7 @@ fn handleNonStreamingGeneration(
             }
             defer if (tc_reasoning_allocated) allocator.free(tc_reasoning_json);
 
-            const tc_timings = try formatTimingsObject(allocator, result.prompt_tokens, result.cached_tokens, result.completion_tokens, result.prefill_ns, result.decode_ns);
+            const tc_timings = try formatTimingsObject(allocator, result.prompt_tokens, result.cached_tokens, result.completion_tokens, result.prefill_ns, result.decode_ns, tokenize_ns);
             defer allocator.free(tc_timings);
             const tc_timings_field = if (tc_timings.len > 0)
                 try std.fmt.allocPrint(allocator, ",\"timings\":{s}", .{tc_timings})
@@ -3094,7 +3104,7 @@ fn handleNonStreamingGeneration(
     }
     defer if (reasoning_allocated) allocator.free(reasoning_json);
 
-    const timings_obj = try formatTimingsObject(allocator, result.prompt_tokens, result.cached_tokens, result.completion_tokens, result.prefill_ns, result.decode_ns);
+    const timings_obj = try formatTimingsObject(allocator, result.prompt_tokens, result.cached_tokens, result.completion_tokens, result.prefill_ns, result.decode_ns, tokenize_ns);
     defer allocator.free(timings_obj);
     const timings_field = if (timings_obj.len > 0)
         try std.fmt.allocPrint(allocator, ",\"timings\":{s}", .{timings_obj})
@@ -3368,6 +3378,11 @@ fn handleStreamingGeneration(
     vision_embeddings: ?mlx.mlx_array,
     /// Wave 1.A: per-request KV-quant override; null = inherit scheduler default.
     kv_quant_override: ?transformer_mod.KVQuantConfig,
+    /// Iteration 1: tokenize_ns measured by the request handler before
+    /// dispatching here. Surfaced via `timings.tokenize_ms` on the final
+    /// usage SSE chunk so streaming clients see the same metric as
+    /// non-streaming.
+    tokenize_ns: u64,
 ) !void {
     // Vision array ownership: held by this handler on entry, transfers to
     // the slot on submit (slot.deinit frees). Nulled before transfer so
@@ -3831,7 +3846,7 @@ fn handleStreamingGeneration(
                 \\{{"prompt_tokens":{d},"completion_tokens":{d},"total_tokens":{d}}}
             , .{ total_prompt, ts.completion_tokens, total_prompt + ts.completion_tokens });
             defer allocator.free(usage_json);
-            const timings_obj = try formatTimingsObject(allocator, total_prompt, ts.cached_tokens, ts.completion_tokens, ts.prefill_ns, ts.decode_ns);
+            const timings_obj = try formatTimingsObject(allocator, total_prompt, ts.cached_tokens, ts.completion_tokens, ts.prefill_ns, ts.decode_ns, tokenize_ns);
             defer allocator.free(timings_obj);
             const timings_opt: ?[]const u8 = if (timings_obj.len > 0) timings_obj else null;
             try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null }, finish_reason, usage_json, timings_opt);
@@ -4112,8 +4127,16 @@ fn utf8TrailingIncomplete(s: []const u8) usize {
 
 /// Build a llama.cpp-style `timings` JSON object (no surrounding key) from
 /// raw nanosecond counts and token totals. Caller frees. Returns an empty
-/// string when both `prefill_ns` and `decode_ns` are zero (legacy paths that
-/// don't measure timing) so the field can be omitted from the response.
+/// string when `prefill_ns`, `decode_ns`, AND `tokenize_ns` are all zero
+/// (legacy paths that don't measure timing) so the field can be omitted.
+///
+/// `tokenize_ns` is the wall-clock cost of the synchronous
+/// `renderChatTemplate + tokenizer.encode` step on the request thread.
+/// Phase 4 #1 of `performance-plan.md` calls for instrumentation-first:
+/// before we move tokenize onto a worker thread, we need numbers per
+/// engine / prompt length. Pass 0 for legacy paths that don't measure it
+/// (the field is then omitted from the JSON; existing callers stay shape-
+/// compatible while the new ones surface the metric).
 fn formatTimingsObject(
     allocator: std.mem.Allocator,
     prompt_tokens: u32,
@@ -4121,21 +4144,25 @@ fn formatTimingsObject(
     completion_tokens: u32,
     prefill_ns: u64,
     decode_ns: u64,
+    tokenize_ns: u64,
 ) ![]u8 {
-    if (prefill_ns == 0 and decode_ns == 0) return try allocator.alloc(u8, 0);
+    if (prefill_ns == 0 and decode_ns == 0 and tokenize_ns == 0) return try allocator.alloc(u8, 0);
     const ns_per_ms_f: f64 = @as(f64, @floatFromInt(std.time.ns_per_ms));
     const p_ms = @as(f64, @floatFromInt(prefill_ns)) / ns_per_ms_f;
     const d_ms = @as(f64, @floatFromInt(decode_ns)) / ns_per_ms_f;
+    const t_ms = @as(f64, @floatFromInt(tokenize_ns)) / ns_per_ms_f;
     // prompt_per_second reflects compute: divide by the tokens actually run
     // (prompt minus the KV-cache prefix). `cached_n` exposes the reuse so a
     // bench / client can tell a warm hit from a cold prefill.
     const p_tps = generate_mod.prefillTokensPerSec(prompt_tokens, cached_tokens, prefill_ns);
     const d_tps = generate_mod.tokensPerSec(completion_tokens, decode_ns);
+    // Always emit `tokenize_ms` (even at 0.0) so clients can rely on the key
+    // being present — they can branch on the value, not on presence/absence.
     return try std.fmt.allocPrint(
         allocator,
-        \\{{"prompt_n":{d},"cached_n":{d},"prompt_ms":{d:.3},"prompt_per_second":{d:.3},"predicted_n":{d},"predicted_ms":{d:.3},"predicted_per_second":{d:.3}}}
+        \\{{"prompt_n":{d},"cached_n":{d},"prompt_ms":{d:.3},"prompt_per_second":{d:.3},"predicted_n":{d},"predicted_ms":{d:.3},"predicted_per_second":{d:.3},"tokenize_ms":{d:.3}}}
     ,
-        .{ prompt_tokens, cached_tokens, p_ms, p_tps, completion_tokens, d_ms, d_tps },
+        .{ prompt_tokens, cached_tokens, p_ms, p_tps, completion_tokens, d_ms, d_tps, t_ms },
     );
 }
 
@@ -5139,14 +5166,18 @@ fn handleAnthropicMessages(
     });
     log.info("  > \"{s}{s}\"\n", .{ last_msg.content[0..preview_len], if (last_msg.content.len > 80) "..." else "" });
 
-    // Format chat template
+    // Format chat template. Iteration 1 timing — see /v1/chat/completions for
+    // motivation; same number, same field on the Anthropic response so a
+    // bench targeting either endpoint sees the same instrumentation.
     const effective_tools_json: ?[]const u8 = if (has_tools) tools_json else null;
+    var tokenize_sw = Stopwatch.init(stream.io);
     var prompt_ids_raw = if (lm.ds4_engine) |engine|
         try chat_mod.encodeChatViaDs4(allocator, engine, messages.items, effective_tools_json, tool_choice_instruction, enable_thinking)
     else if (lm.llama_engine) |engine|
         try chat_mod.encodeChatViaLlama(allocator, engine, chat_config, messages.items, effective_tools_json, tool_choice_instruction, enable_thinking)
     else
         try chat_mod.formatChat(allocator, tok, messages.items, chat_config, effective_tools_json, tool_choice_instruction, enable_thinking);
+    const tokenize_ns = tokenize_sw.read();
 
     // Vision encoder: encode any images on the last user message and splice
     // image tokens into the prompt at the model's configured image_token_id.
@@ -5212,7 +5243,7 @@ fn handleAnthropicMessages(
     const sub_ve = local_ve;
     local_ve = null;
     if (is_stream) {
-        handleAnthropicStreaming(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, enable_thinking, reasoning_budget, @intCast(prompt_ids.len), enable_pld, enable_drafter, sub_ve, kv_quant_override) catch |err| {
+        handleAnthropicStreaming(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, enable_thinking, reasoning_budget, @intCast(prompt_ids.len), enable_pld, enable_drafter, sub_ve, kv_quant_override, tokenize_ns) catch |err| {
             log.err("  -> streaming error: {}\n", .{err});
             const err_data = std.fmt.allocPrint(allocator,
                 \\{{"type":"error","error":{{"type":"api_error","message":"Internal server error: {s}"}}}}
@@ -5221,7 +5252,7 @@ fn handleAnthropicMessages(
             sendAnthropicEvent(stream, "error", err_data) catch {};
         };
     } else {
-        handleAnthropicNonStreaming(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, enable_thinking, reasoning_budget, @intCast(prompt_ids.len), enable_pld, sub_ve, kv_quant_override) catch |err| {
+        handleAnthropicNonStreaming(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, enable_thinking, reasoning_budget, @intCast(prompt_ids.len), enable_pld, sub_ve, kv_quant_override, tokenize_ns) catch |err| {
             log.err("  -> 500 ({s})\n", .{@errorName(err)});
             sendAnthropicError(allocator, stream, "api_error", @errorName(err), 500) catch {};
         };
@@ -5247,6 +5278,10 @@ fn handleAnthropicNonStreaming(
     vision_embeddings: ?mlx.mlx_array,
     /// Wave 1.A: per-request KV-quant override.
     kv_quant_override: ?transformer_mod.KVQuantConfig,
+    /// Iteration 1 instrumentation: nanoseconds of render+tokenize measured
+    /// by the parent handleAnthropicMessages. Threaded through so the
+    /// non-streaming response carries `timings.tokenize_ms`.
+    tokenize_ns: u64,
 ) !void {
     // Vision-array ownership: nulled below before scheduler.submit so the
     // early-return defer doesn't double-free.
@@ -5391,8 +5426,20 @@ fn handleAnthropicNonStreaming(
         result.prompt_tokens, result.completion_tokens, elapsed_ms, perf, stop_reason,
     });
 
+    // Anthropic spec doesn't standardize a `timings` field; we attach one as
+    // an extension (mirrors what /v1/chat/completions already does) so bench
+    // tooling can read tokenize_ms / prompt_ms / predicted_ms from either
+    // surface without re-implementing the SSE accumulator.
+    const timings_obj = try formatTimingsObject(allocator, result.prompt_tokens, result.cached_tokens, result.completion_tokens, result.prefill_ns, result.decode_ns, tokenize_ns);
+    defer allocator.free(timings_obj);
+    const timings_field = if (timings_obj.len > 0)
+        try std.fmt.allocPrint(allocator, ",\"timings\":{s}", .{timings_obj})
+    else
+        try allocator.alloc(u8, 0);
+    defer allocator.free(timings_field);
+
     const response = try std.fmt.allocPrint(allocator,
-        \\{{"id":"msg_{d}","type":"message","role":"assistant","content":{s},"model":"{s}","stop_reason":"{s}","stop_sequence":null,"usage":{{"input_tokens":{d},"output_tokens":{d}}}}}
+        \\{{"id":"msg_{d}","type":"message","role":"assistant","content":{s},"model":"{s}","stop_reason":"{s}","stop_sequence":null,"usage":{{"input_tokens":{d},"output_tokens":{d}}}{s}}}
     , .{
         nowMs(stream.io),
         content.items,
@@ -5400,6 +5447,7 @@ fn handleAnthropicNonStreaming(
         stop_reason,
         prompt_token_count,
         result.completion_tokens,
+        timings_field,
     });
     defer allocator.free(response);
     try sendResponse(stream, "200 OK", "application/json", response);
@@ -5425,7 +5473,13 @@ fn handleAnthropicStreaming(
     vision_embeddings: ?mlx.mlx_array,
     /// Wave 1.A: per-request KV-quant override.
     kv_quant_override: ?transformer_mod.KVQuantConfig,
+    /// Iteration 1: tokenize_ns from parent handler. Anthropic streaming
+    /// doesn't currently emit `timings` over SSE (spec doesn't model it),
+    /// but plumbing the value through keeps the signature consistent with
+    /// non-streaming and unblocks a future message_delta extension.
+    tokenize_ns: u64,
 ) !void {
+    _ = tokenize_ns; // reserved; see doc comment
     // Vision-array ownership: held by this handler on entry, transfers to
     // the slot on submit (slot.deinit frees). Nulled before transfer.
     var ve_local = vision_embeddings;
@@ -6338,12 +6392,17 @@ fn handleResponses(
     });
 
     // ── format chat template ──
+    // Iteration 1: wrap with a Stopwatch so `usage.tokenize_ms` lands in the
+    // Responses envelope. Same instrumentation pattern as /v1/chat/completions
+    // and /v1/messages — single source of truth in formatTimingsObject.
+    var tokenize_sw = Stopwatch.init(stream.io);
     var prompt_ids_raw = if (lm.ds4_engine) |engine|
         try chat_mod.encodeChatViaDs4(allocator, engine, pi.messages.items, active_tools_json, active_tool_choice_instruction, enable_thinking)
     else if (lm.llama_engine) |engine|
         try chat_mod.encodeChatViaLlama(allocator, engine, chat_config, pi.messages.items, active_tools_json, active_tool_choice_instruction, enable_thinking)
     else
         try chat_mod.formatChat(allocator, tok, pi.messages.items, chat_config, active_tools_json, active_tool_choice_instruction, enable_thinking);
+    const tokenize_ns = tokenize_sw.read();
 
     // ── vision encoder ──
     // Phase A8: per-request ownership. Defer frees if we don't end up
@@ -6465,12 +6524,15 @@ fn handleResponses(
         }
 
         // Skeleton envelope (status:in_progress, output:[])
+        // Timings are all zero on the skeleton — the real numbers appear on
+        // the final `response.completed` envelope after generation.
         const skel = try buildResponsesEnvelope(
             stream.io, allocator, esc_resp_id, esc_model,
             "in_progress", "[]",
             0, 0, 0, 0,
             should_store, prev_id,
             false, false, response_echo,
+            0, 0, tokenize_ns, 0,
         );
         defer allocator.free(skel);
         const created_payload = try std.fmt.allocPrint(allocator, "{{\"type\":\"response.created\",\"response\":{s}}}", .{skel});
@@ -6919,13 +6981,17 @@ fn handleResponses(
         out_buf.items,
         result.prompt_tokens,
         result.completion_tokens,
-        0, // cached_tokens — surfaced via slot.cached_tokens at the scheduler layer; not threaded back here
+        result.cached_tokens,
         0, // reasoning_tokens — not tracked separately yet
         should_store,
         prev_id,
         is_incomplete,
         is_completed_status,
         response_echo,
+        result.prefill_ns,
+        result.decode_ns,
+        tokenize_ns,
+        result.completion_tokens,
     );
     defer allocator.free(envelope);
 
@@ -7511,6 +7577,14 @@ fn buildResponsesEnvelope(
     incomplete: bool,
     completed: bool,
     echo: ResponseEcho,
+    /// Iteration 1: timings extension. The Responses spec doesn't model
+    /// per-stage timings, so we attach a sibling `timings` block at the
+    /// envelope root with the same shape as /v1/chat/completions. Pass
+    /// zeroes to omit the field (legacy callers stay shape-compatible).
+    prefill_ns: u64,
+    decode_ns: u64,
+    tokenize_ns: u64,
+    completion_tokens_for_timings: u32,
 ) ![]const u8 {
     var buf = std.ArrayList(u8).empty;
     errdefer buf.deinit(allocator);
@@ -7651,6 +7725,16 @@ fn buildResponsesEnvelope(
         try buf.appendSlice(allocator, esc);
     } else {
         try buf.appendSlice(allocator, ",\"prompt_cache_key\":null");
+    }
+
+    // Iteration 1 timings extension. Reuses the chat-completions
+    // formatter so any future field added there appears on Responses too
+    // without a second touch point.
+    const timings_obj = try formatTimingsObject(allocator, input_tokens, cached_input_tokens, completion_tokens_for_timings, prefill_ns, decode_ns, tokenize_ns);
+    defer allocator.free(timings_obj);
+    if (timings_obj.len > 0) {
+        try buf.appendSlice(allocator, ",\"timings\":");
+        try buf.appendSlice(allocator, timings_obj);
     }
 
     try buf.append(allocator, '}');
