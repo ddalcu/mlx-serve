@@ -119,6 +119,95 @@ final class ServerOptionsTests: XCTestCase {
         XCTAssertEqual(opts, decoded)
     }
 
+    // MARK: - GGUF + common-engine flags
+
+    func testLlamaKvQuantOmittedAtDefault() {
+        let args = ServerOptions().toCLIArgs()
+        XCTAssertFalse(args.contains("--llama-kv-quant"),
+                      "default (.off) must NOT emit the flag so existing CLI invocations stay byte-identical")
+    }
+
+    func testLlamaKvQuantQ8EmitsFlag() {
+        var opts = ServerOptions()
+        opts.llamaKvQuant = .q8
+        let args = opts.toCLIArgs()
+        XCTAssertTrue(contains(args, flag: "--llama-kv-quant", value: "q8"))
+    }
+
+    func testLlamaKvQuantQ4EmitsFlag() {
+        var opts = ServerOptions()
+        opts.llamaKvQuant = .q4
+        let args = opts.toCLIArgs()
+        XCTAssertTrue(contains(args, flag: "--llama-kv-quant", value: "q4"))
+    }
+
+    func testLlamaCacheEntriesOmittedAtDefault() {
+        let args = ServerOptions().toCLIArgs()
+        XCTAssertFalse(args.contains("--llama-cache-entries"))
+    }
+
+    func testLlamaCacheEntriesEmitsWhenAboveOne() {
+        var opts = ServerOptions()
+        opts.llamaCacheEntries = 4
+        let args = opts.toCLIArgs()
+        XCTAssertTrue(contains(args, flag: "--llama-cache-entries", value: "4"))
+    }
+
+    func testTokenizeCacheEntriesOmittedAtDefault() {
+        let args = ServerOptions().toCLIArgs()
+        XCTAssertFalse(args.contains("--tokenize-cache-entries"),
+                      "default (4) must NOT emit — matches server-side default")
+    }
+
+    func testTokenizeCacheEntriesEmitsWhenChanged() {
+        var opts = ServerOptions()
+        opts.tokenizeCacheEntries = 0
+        var args = opts.toCLIArgs()
+        XCTAssertTrue(contains(args, flag: "--tokenize-cache-entries", value: "0"))
+        opts.tokenizeCacheEntries = 16
+        args = opts.toCLIArgs()
+        XCTAssertTrue(contains(args, flag: "--tokenize-cache-entries", value: "16"))
+    }
+
+    func testServerLaunchEqualsCoversNewFields() {
+        var a = ServerOptions()
+        var b = ServerOptions()
+        // Each new field flipping must trigger a restart.
+        b.llamaKvQuant = .q4
+        XCTAssertFalse(a.serverLaunchEquals(b))
+        b = ServerOptions()
+        b.llamaCacheEntries = 4
+        XCTAssertFalse(a.serverLaunchEquals(b))
+        b = ServerOptions()
+        b.tokenizeCacheEntries = 0
+        XCTAssertFalse(a.serverLaunchEquals(b))
+        // Sanity: untouched defaults are equal.
+        a = ServerOptions(); b = ServerOptions()
+        XCTAssertTrue(a.serverLaunchEquals(b))
+    }
+
+    // MARK: - Engine inference
+
+    func testEngineFromArchitecture() {
+        // The Settings UI hides MLX-only sections when engine != .mlx and
+        // surfaces the GGUF section when engine == .llama. The discriminator
+        // is the `architecture` string the server reports for the active
+        // model, derived from `model_type` in config.json (or the GGUF stub).
+        var info = ModelInfo(name: "x", quantBits: 4, layers: 0,
+                             hiddenSize: 0, vocabSize: 0,
+                             contextLength: 0, modelMaxTokens: 0,
+                             architecture: "gguf")
+        XCTAssertEqual(info.engine, .llama)
+        info.architecture = "deepseek_v4"
+        XCTAssertEqual(info.engine, .dsv4)
+        info.architecture = "gemma4"
+        XCTAssertEqual(info.engine, .mlx)
+        info.architecture = "qwen3_5_moe"
+        XCTAssertEqual(info.engine, .mlx)
+        info.architecture = ""  // older server build that omits the field
+        XCTAssertEqual(info.engine, .mlx, "empty arch must default to .mlx (the most common path)")
+    }
+
     // MARK: helpers
 
     private func contains(_ args: [String], flag: String, value: String? = nil) -> Bool {

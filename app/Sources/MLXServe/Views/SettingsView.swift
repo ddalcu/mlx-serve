@@ -34,18 +34,11 @@ struct SettingsView: View {
                     ) {
                         ServerSectionContent()
                     }
-                    SettingsSection(
-                        title: "Speculative Decoding",
-                        subtitle: "Server-launch flags. Big throughput wins on echo-heavy work; gates auto-disable on novel content."
-                    ) {
-                        SpecDecodeSectionContent()
-                    }
-                    SettingsSection(
-                        title: "Performance",
-                        subtitle: "Continuous batching, KV-cache quantization, and the cross-request prefix cache. Server-launch flags — restart to apply."
-                    ) {
-                        PerformanceSectionContent()
-                    }
+                    // Engine-aware sections. Each panel is hidden when its
+                    // controls don't apply to the active engine — flipping
+                    // `--kv-quant` on a GGUF model silently no-ops, so we'd
+                    // rather not show that picker at all than mislead.
+                    EngineAwareSections()
                     SettingsSection(
                         title: "Per-Request Defaults",
                         subtitle: "Apply on the next chat request — no restart needed."
@@ -134,21 +127,24 @@ private struct RestartBanner: View {
 
             Button("Discard") {
                 if let last = server.lastLaunchedOptions {
-                    var current = appState.serverOptions
                     // Revert every server-launch field to the last-launched
-                    // snapshot; per-request defaults are preserved.
-                    current.host = last.host
-                    current.port = last.port
-                    current.ctxSize = last.ctxSize
-                    current.noVision = last.noVision
-                    current.logLevel = last.logLevel
-                    current.requestTimeout = last.requestTimeout
-                    current.enablePLD = last.enablePLD
-                    current.pldDraftLen = last.pldDraftLen
-                    current.pldKeyLen = last.pldKeyLen
-                    current.drafterPath = last.drafterPath
-                    current.draftBlockSize = last.draftBlockSize
-                    appState.serverOptions = current
+                    // snapshot; per-request defaults are preserved. Start
+                    // from `last` (which has all server fields right) and
+                    // patch the per-request fields back from `current` so
+                    // the user's mid-session sampler tweaks survive.
+                    let current = appState.serverOptions
+                    var reverted = last
+                    reverted.defaultMaxTokens       = current.defaultMaxTokens
+                    reverted.defaultTemperature     = current.defaultTemperature
+                    reverted.defaultTopP            = current.defaultTopP
+                    reverted.defaultTopK            = current.defaultTopK
+                    reverted.defaultRepeatPenalty   = current.defaultRepeatPenalty
+                    reverted.defaultPresencePenalty = current.defaultPresencePenalty
+                    reverted.defaultReasoningBudget = current.defaultReasoningBudget
+                    reverted.defaultEnableThinking  = current.defaultEnableThinking
+                    reverted.perRequestEnablePLD    = current.perRequestEnablePLD
+                    reverted.perRequestEnableDrafter = current.perRequestEnableDrafter
+                    appState.serverOptions = reverted
                 }
             }
             .buttonStyle(.bordered)
@@ -158,6 +154,81 @@ private struct RestartBanner: View {
         .padding(.vertical, 12)
         .background(Color.orange.opacity(0.10))
         .overlay(Divider(), alignment: .bottom)
+    }
+}
+
+// MARK: - Engine-aware section composer
+
+/// Renders the engine-specific section set for the active model:
+///   - MLX target:   Common Performance + MLX Performance + MLX Spec Decode
+///   - GGUF target:  Common Performance + GGUF Performance
+///   - DSV4 target:  Common Performance only
+///   - No model yet: All sections shown (so users can pre-tune before
+///                   loading); a banner clarifies that some controls only
+///                   apply once a matching engine is loaded.
+///
+/// `ModelInfo.engine` is the source of truth — it's computed from the
+/// `architecture` string the server reports in `/v1/models`. Pre-load
+/// (`server.modelInfo == nil`) defaults to `.mlx` for display purposes
+/// since that's still the most common path, but a banner notes the
+/// fallback so power users know what's going on.
+private struct EngineAwareSections: View {
+    @EnvironmentObject var server: ServerManager
+
+    /// Resolved engine for routing UI decisions. Nil when no model has
+    /// loaded yet (server stopped or first start in progress) — that
+    /// case shows all sections so users can pre-tune.
+    private var engine: ServerEngine? { server.modelInfo?.engine }
+
+    var body: some View {
+        // Always-shown universal performance knob (applies to every engine).
+        SettingsSection(
+            title: "Performance (all engines)",
+            subtitle: "Tunables that apply regardless of engine. Server-launch flag — restart to apply."
+        ) {
+            CommonPerformanceSectionContent()
+        }
+
+        // Engine-specific sections. Show all when no model is loaded so
+        // the user can pre-tune; otherwise show only the matching set.
+        let showMLX = (engine == nil || engine == .mlx)
+        let showLlama = (engine == nil || engine == .llama)
+
+        if showMLX {
+            SettingsSection(
+                title: "Speculative Decoding (MLX only)",
+                subtitle: "Big throughput wins on echo-heavy work; gates auto-disable on novel content. PLD + drafter are MLX-only kernels — they no-op on GGUF / DSV4."
+            ) {
+                SpecDecodeSectionContent()
+            }
+            SettingsSection(
+                title: "MLX Performance",
+                subtitle: "Continuous batching, KV-cache quantization, and the cross-request hot prefix cache. MLX-only — distinct kernels from llama.cpp."
+            ) {
+                PerformanceSectionContent()
+            }
+        }
+
+        if showLlama {
+            SettingsSection(
+                title: "GGUF Performance (llama.cpp)",
+                subtitle: "Knobs that apply when an embedded llama.cpp engine is serving a `.gguf` model. Distinct from the MLX Performance section — different kernels, different KV layout."
+            ) {
+                LlamaPerformanceSectionContent()
+            }
+        }
+
+        if engine == nil {
+            HStack(spacing: 8) {
+                Image(systemName: "info.circle")
+                    .foregroundStyle(.secondary)
+                Text("No model loaded yet — every section is shown so you can pre-tune. Once a model is active, sections that don't apply will hide automatically.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .padding(.horizontal, 4)
+        }
     }
 }
 
@@ -592,6 +663,88 @@ private struct PerformanceSectionContent: View {
                 TextField("", text: opts.prefixCacheMem, prompt: Text("2GB"))
                     .textFieldStyle(.roundedBorder)
                     .frame(width: 110)
+            }
+        }
+    }
+}
+
+// MARK: - Common-engine performance section
+
+/// Knobs that apply to every backend (MLX / llama.cpp / ds4). Today this
+/// is just the chat-template tokenize cache — the warm-path tokenize
+/// stripper that brought a 1813-token Gemma 4 repeat from 240 ms to
+/// 0.002 ms. Reorg-friendly: anything we add later that crosses engines
+/// (e.g. shared HTTP timeout overrides) lands here.
+private struct CommonPerformanceSectionContent: View {
+    @EnvironmentObject var appState: AppState
+    @EnvironmentObject var server: ServerManager
+
+    private var meta: [String: ServerOptionField] { ServerOptions.serverFlagFields }
+    private var dirty: ServerLaunchDirty {
+        ServerLaunchDirty(current: appState.serverOptions, last: server.lastLaunchedOptions)
+    }
+
+    var body: some View {
+        let opts = $appState.serverOptions
+        if let m = meta["tokenizeCacheEntries"] {
+            SettingsRow(
+                title: m.title,
+                explainer: m.explainer,
+                isDirty: dirty.dirty(\.tokenizeCacheEntries)
+            ) {
+                Stepper(value: opts.tokenizeCacheEntries, in: 0...32) {
+                    Text("\(appState.serverOptions.tokenizeCacheEntries)")
+                        .font(.body.monospacedDigit())
+                }
+            }
+        }
+    }
+}
+
+// MARK: - GGUF (llama.cpp) performance section
+
+/// Knobs specific to the embedded llama.cpp engine — surfaced only when
+/// the active model loaded through that path (or pre-load, when no
+/// engine has been chosen yet). MLX's `--kv-quant` and `--prefix-cache-*`
+/// don't apply here; llama.cpp has its own KV scheme and its own
+/// multi-session LRU.
+private struct LlamaPerformanceSectionContent: View {
+    @EnvironmentObject var appState: AppState
+    @EnvironmentObject var server: ServerManager
+
+    private var meta: [String: ServerOptionField] { ServerOptions.serverFlagFields }
+    private var dirty: ServerLaunchDirty {
+        ServerLaunchDirty(current: appState.serverOptions, last: server.lastLaunchedOptions)
+    }
+
+    var body: some View {
+        let opts = $appState.serverOptions
+        if let m = meta["llamaKvQuant"] {
+            SettingsRow(
+                title: m.title,
+                explainer: m.explainer,
+                isDirty: dirty.dirty(\.llamaKvQuant)
+            ) {
+                Picker("", selection: opts.llamaKvQuant) {
+                    ForEach(ServerOptions.LlamaKVQuant.allCases) { q in
+                        Text(q.label).tag(q)
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.menu)
+                .frame(minWidth: 260)
+            }
+        }
+        if let m = meta["llamaCacheEntries"] {
+            SettingsRow(
+                title: m.title,
+                explainer: m.explainer,
+                isDirty: dirty.dirty(\.llamaCacheEntries)
+            ) {
+                Stepper(value: opts.llamaCacheEntries, in: 1...8) {
+                    Text("\(appState.serverOptions.llamaCacheEntries)")
+                        .font(.body.monospacedDigit())
+                }
             }
         }
     }

@@ -173,6 +173,43 @@ struct ModelInfo {
     /// Sum of *.safetensors sizes on disk; nil when scan failed or
     /// pre-Phase-E server.
     var bytesOnDisk: UInt64? = nil
+
+    /// Which backend serves this model — derived from `architecture`
+    /// (`model_type` in config.json / the GGUF stub). Drives the engine-
+    /// aware Settings UI so toggles that don't apply (e.g. MLX `--kv-quant`
+    /// on a GGUF target) are hidden instead of silently no-op'ing.
+    var engine: ServerEngine {
+        switch architecture {
+        case "gguf": return .llama
+        case "deepseek_v4": return .dsv4
+        default: return .mlx
+        }
+    }
+}
+
+/// Which embedded engine is serving the active model. The mlx-serve binary
+/// picks this at load time based on the model file/dir layout (`.gguf` →
+/// llama.cpp or ds4; `.safetensors` dir → MLX), so the Swift app reads
+/// `ModelInfo.engine` to decide which knobs are relevant. The Settings UI
+/// uses this to show MLX-only sections (PLD/drafter/KV-quant) only when
+/// they actually do something, and to surface a GGUF-specific section
+/// (--llama-kv-quant / --llama-cache-entries) when llama.cpp is active.
+enum ServerEngine: String, CaseIterable {
+    /// MLX safetensors path (default).
+    case mlx
+    /// Embedded llama.cpp engine (any `.gguf` except DSV4-Flash).
+    case llama
+    /// Embedded ds4 engine (DeepSeek-V4-Flash GGUF).
+    case dsv4
+
+    /// Short human label for the running-model badge / section headings.
+    var label: String {
+        switch self {
+        case .mlx:   return "MLX"
+        case .llama: return "llama.cpp (GGUF)"
+        case .dsv4:  return "ds4 (DSV4-Flash)"
+        }
+    }
 }
 
 struct MemoryInfo {
