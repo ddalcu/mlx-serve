@@ -29,6 +29,10 @@ let supportedModelTypes: Set<String> = [
     "llama", "mistral",
     "lfm2", "lfm2-vl",
     "nemotron_h",
+    // GGUF engines: "gguf" = any model via the embedded llama.cpp engine;
+    // "deepseek_v4" = DeepSeek-V4-Flash via the ds4 engine. Both are served, so
+    // neither should be flagged "unsupported architecture" in the model browser.
+    "gguf", "deepseek_v4",
 ]
 
 struct HFModel: Identifiable, Codable {
@@ -63,6 +67,15 @@ struct HFModel: Identifiable, Codable {
         return tags.contains { tag in
             supportedArchitectureTagPrefixes.contains { tag.hasPrefix($0) }
         }
+    }
+
+    /// True when this repo ships GGUF artifacts (HF tags it `gguf`). These download
+    /// via the single-file GGUF path — the user picks a quant from the repo's
+    /// `.gguf` list — and the server serves them through the embedded llama.cpp
+    /// engine (or ds4 for DeepSeek-V4-Flash). Distinct from MLX/safetensors repos,
+    /// which download the whole weight tree.
+    var isGgufRepo: Bool {
+        (tags ?? []).contains { $0.lowercased() == "gguf" }
     }
 
     /// Human-readable reason why this model isn't compatible.

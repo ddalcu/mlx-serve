@@ -24,6 +24,9 @@ const log = @import("log.zig");
 const KVCache = transformer_mod.KVCache;
 const KVCacheSnapshot = transformer_mod.KVCacheSnapshot;
 const SSMCacheEntry = transformer_mod.SSMCacheEntry;
+const SSMCheckpoint = transformer_mod.SSMCheckpoint;
+const restoreSsmCheckpoint = transformer_mod.restoreSsmCheckpoint;
+const ssmCheckpointBytes = transformer_mod.ssmCheckpointBytes;
 
 /// Result of a cache lookup. Tells the caller how many tokens of `prompt_ids`
 /// are already in the live cache after a successful restore — the caller
@@ -60,6 +63,16 @@ const Entry = struct {
     /// Used for `--prefix-cache-mem` memory-budget enforcement; sum across
     /// all entries == `current_kv_bytes`.
     kv_bytes: u64,
+    /// Phase 1 (perf-plan): SSM/conv state snapshots taken at stride-aligned
+    /// positions during prefill. Sorted by `pos` ascending; the highest `pos`
+    /// is at most `tokens.len`. Null for plain-attention archs. The hot
+    /// cache restore picks the largest `pos ≤ matched` and rewinds both KV
+    /// and SSM to it.
+    ssm_checkpoints: ?[]SSMCheckpoint = null,
+    /// Bytes resident in `ssm_checkpoints` (sum across all checkpoints and
+    /// layers). Folded into `kv_bytes` for the byte-budget accounting so the
+    /// memory cap covers both KV and SSM state.
+    ssm_bytes: u64 = 0,
 };
 
 pub const HotPrefixCache = struct {
@@ -96,19 +109,44 @@ pub const HotPrefixCache = struct {
 
     pub fn deinit(self: *HotPrefixCache) void {
         for (self.entries.items) |*e| {
-            self.allocator.free(e.tokens);
-            e.snapshot.deinit();
+            freeEntryOwnedState(self.allocator, e);
         }
         self.entries.deinit(self.allocator);
     }
 
-    /// Pure-attention + DSV4 are eligible. Hybrid recurrent-state archs reset
-    /// on any divergence so multi-entry caching gives no wins; keep them on
-    /// the legacy single-slot path. DSV4 supported via Phase D snapshot +
-    /// per-layer `truncate` (`state_kv` / `state_score` preserved on n > 0,
-    /// see Section A.2 fix 2026-05-13).
-    pub fn shouldUse(config: *const model_mod.ModelConfig) bool {
-        return !(config.has_hybrid_layers or config.full_attention_interval > 0);
+    /// Free everything an Entry owns: token buffer, KV snapshot, SSM
+    /// checkpoint array. Used by `deinit`, eviction, and replace paths so
+    /// they don't drift apart.
+    fn freeEntryOwnedState(allocator: std.mem.Allocator, e: *Entry) void {
+        allocator.free(e.tokens);
+        e.snapshot.deinit();
+        if (e.ssm_checkpoints) |cps| {
+            for (cps) |*cp| cp.deinit(allocator);
+            allocator.free(cps);
+            e.ssm_checkpoints = null;
+        }
+    }
+
+    /// Pure-attention + DSV4 are eligible by default. Hybrid recurrent-state
+    /// archs are gated by `enable_ssm_checkpoints` (set by the scheduler
+    /// when `--ssm-checkpoint-stride > 0`): with checkpoints we can rewind
+    /// both KV and SSM state to a stride-aligned position; without them
+    /// every divergence would force a full reset, so we keep the legacy
+    /// single-slot path.
+    ///
+    /// Both `has_hybrid_layers` and `full_attention_interval > 0` signal
+    /// the model has SSM/GatedDeltaNet layers somewhere — `has_hybrid_layers`
+    /// is set explicitly by the parsers for lfm2 / nemotron_h; the qwen3_5
+    /// family sets `full_attention_interval` to N to mark "every Nth layer
+    /// is full attention, the rest are GatedDeltaNet". Either way the same
+    /// SSM-checkpoint gate applies.
+    pub fn shouldUse(
+        config: *const model_mod.ModelConfig,
+        enable_ssm_checkpoints: bool,
+    ) bool {
+        const has_ssm_layers = config.has_hybrid_layers or config.full_attention_interval > 0;
+        if (has_ssm_layers and !enable_ssm_checkpoints) return false;
+        return true;
     }
 
     fn bumpCounter(self: *HotPrefixCache) u64 {
@@ -199,32 +237,74 @@ pub const HotPrefixCache = struct {
         e.last_used = self.bumpCounter();
 
         try target_cache.restore(&e.snapshot);
+
+        // Hybrid path: if the entry carries SSM checkpoints, restore the SSM
+        // state at the largest stride-aligned position ≤ m.shared and clamp
+        // the effective matched length to that position. KV is positionally
+        // trimmable; SSM is only restorable at the snapshotted positions.
+        // The two MUST stay in sync, so we rewind KV further too.
+        var effective_matched: usize = m.shared;
         if (target_ssm_entries) |entries| {
-            for (entries) |*ssm| {
-                _ = mlx.mlx_array_free(ssm.conv_state);
-                _ = mlx.mlx_array_free(ssm.ssm_state);
-                ssm.conv_state = mlx.mlx_array_new();
-                ssm.ssm_state = mlx.mlx_array_new();
-                ssm.initialized = false;
+            if (e.ssm_checkpoints) |cps| {
+                // findHighestCheckpoint: cps is sorted ascending by pos.
+                var picked: ?*SSMCheckpoint = null;
+                for (cps) |*cp| {
+                    if (cp.pos > m.shared) break;
+                    picked = cp;
+                }
+                if (picked) |cp| {
+                    try restoreSsmCheckpoint(entries, cp);
+                    effective_matched = cp.pos;
+                } else {
+                    // No checkpoint at or before this prefix length — reset
+                    // SSM and treat the match as zero-effective (we have to
+                    // cold-prefill anyway because SSM state would be wrong).
+                    for (entries) |*ssm| {
+                        _ = mlx.mlx_array_free(ssm.conv_state);
+                        _ = mlx.mlx_array_free(ssm.ssm_state);
+                        ssm.conv_state = mlx.mlx_array_new();
+                        ssm.ssm_state = mlx.mlx_array_new();
+                        ssm.initialized = false;
+                    }
+                    effective_matched = 0;
+                }
+            } else {
+                // Hybrid model without checkpoints (e.g., committed pre-Phase-1).
+                // Reset and treat as cold prefill — we can't safely reuse.
+                for (entries) |*ssm| {
+                    _ = mlx.mlx_array_free(ssm.conv_state);
+                    _ = mlx.mlx_array_free(ssm.ssm_state);
+                    ssm.conv_state = mlx.mlx_array_new();
+                    ssm.ssm_state = mlx.mlx_array_new();
+                    ssm.initialized = false;
+                }
+                effective_matched = 0;
             }
         }
-        target_moe_seq_offset.* = m.shared;
+        target_moe_seq_offset.* = effective_matched;
 
-        const full_match = m.shared == prompt_ids.len;
-        const final_len: usize = if (full_match and m.shared > 1) m.shared - 1 else m.shared;
+        // Miss path (hybrid without a usable checkpoint): also reset KV.
+        if (effective_matched == 0) {
+            try target_cache.truncate(0, s);
+            log.info("  [hot-cache] hybrid miss (no checkpoint ≤ {d} of {d}); cold prefill\n", .{ m.shared, prompt_ids.len });
+            return .{ .matched = 0, .full_match = false };
+        }
+
+        const full_match = effective_matched == prompt_ids.len;
+        const final_len: usize = if (full_match and effective_matched > 1) effective_matched - 1 else effective_matched;
 
         if (final_len < e.tokens.len) {
             try target_cache.truncate(final_len, s);
         }
 
-        if (full_match and m.shared > 1) {
-            target_moe_seq_offset.* = m.shared - 1;
-            log.info("  [hot-cache] full reuse {d}/{d}, re-forwarding last token\n", .{ m.shared - 1, prompt_ids.len });
-            return .{ .matched = m.shared - 1, .full_match = true };
+        if (full_match and effective_matched > 1) {
+            target_moe_seq_offset.* = effective_matched - 1;
+            log.info("  [hot-cache] full reuse {d}/{d}, re-forwarding last token\n", .{ effective_matched - 1, prompt_ids.len });
+            return .{ .matched = effective_matched - 1, .full_match = true };
         }
 
-        log.info("  [hot-cache] reused {d}/{d} tokens from entry {d} (of {d})\n", .{ m.shared, prompt_ids.len, m.idx + 1, self.entries.items.len });
-        return .{ .matched = m.shared, .full_match = full_match };
+        log.info("  [hot-cache] reused {d}/{d} tokens (matched {d}; entry {d}/{d})\n", .{ effective_matched, prompt_ids.len, m.shared, m.idx + 1, self.entries.items.len });
+        return .{ .matched = effective_matched, .full_match = full_match };
     }
 
     /// Commit the current `source_cache` state under the given key. Updates
@@ -237,6 +317,20 @@ pub const HotPrefixCache = struct {
         source_cache: *const KVCache,
         tokens: []const u32,
         has_tools: bool,
+    ) !void {
+        return self.commitWithSsm(source_cache, tokens, has_tools, null);
+    }
+
+    /// Commit with optional SSM checkpoint array (Phase 1). The caller
+    /// transfers ownership of the slice — the entry frees it on eviction via
+    /// the shared `freeEntryOwnedState`. Pass null on plain-attention archs;
+    /// the entry stays SSM-free.
+    pub fn commitWithSsm(
+        self: *HotPrefixCache,
+        source_cache: *const KVCache,
+        tokens: []const u32,
+        has_tools: bool,
+        ssm_cps: ?[]SSMCheckpoint,
     ) !void {
         const scheme = source_cache.config.scheme;
 
@@ -255,25 +349,108 @@ pub const HotPrefixCache = struct {
         }
 
         const new_snap = try source_cache.snapshot();
-        const new_bytes = snapshotBytes(&new_snap);
+        const new_kv_bytes = snapshotBytes(&new_snap);
+        var new_ssm_bytes: u64 = 0;
+        if (ssm_cps) |cps| {
+            for (cps) |*cp| new_ssm_bytes += ssmCheckpointBytes(cp);
+        }
+        const new_bytes = new_kv_bytes + new_ssm_bytes;
         const tokens_owned = self.allocator.dupe(u32, tokens) catch |err| {
-            var s = new_snap;
-            s.deinit();
+            var snap = new_snap;
+            snap.deinit();
+            if (ssm_cps) |cps| {
+                for (cps) |*cp| cp.deinit(self.allocator);
+                self.allocator.free(cps);
+            }
             return err;
         };
 
         if (replace_idx) |idx| {
             const e = &self.entries.items[idx];
+
+            // Phase 1: SSM checkpoint inheritance on prefix-extend. The
+            // replace path triggers when the new entry's tokens fully
+            // extend the old's (i.e., e.tokens is a prefix of `tokens`).
+            // The old SSM checkpoints were captured at positions inside
+            // e.tokens, so they're still valid for the new entry — those
+            // positions are a strict prefix of `tokens`. Inherit them and
+            // append any new checkpoints from this turn that don't overlap.
+            //
+            // Without this, multi-turn flows lose checkpoints fast: turn 2's
+            // prefill of the short tail captures few or no checkpoints, so
+            // turn 3 has nothing to restore from even though turn 2's match
+            // covered nearly the full prefix. (Reproducible by alternating
+            // identical-prompt requests at ssm_checkpoint_stride > prompt_len.)
+            const merged_cps: ?[]SSMCheckpoint = blk: {
+                const old = e.ssm_checkpoints orelse break :blk ssm_cps;
+                const new = ssm_cps orelse {
+                    // Detach old so the free-below doesn't touch it; it
+                    // becomes the new entry's checkpoint list as-is.
+                    e.ssm_checkpoints = null;
+                    break :blk old;
+                };
+                // Both old and new have data. Concat into a sorted-by-pos,
+                // dedup-by-pos list. Allocate fresh; transfer ownership.
+                var merged = std.ArrayList(SSMCheckpoint).empty;
+                errdefer {
+                    for (merged.items) |*c| c.deinit(self.allocator);
+                    merged.deinit(self.allocator);
+                }
+                // Detach old + new from their containers so we can move them.
+                e.ssm_checkpoints = null;
+                // Walk both, picking lower pos each step; on tie, prefer the
+                // new one and discard old (new is the more recently observed
+                // state at that position).
+                var i: usize = 0;
+                var j: usize = 0;
+                while (i < old.len or j < new.len) {
+                    if (i >= old.len) {
+                        try merged.append(self.allocator, new[j]);
+                        j += 1;
+                    } else if (j >= new.len) {
+                        try merged.append(self.allocator, old[i]);
+                        i += 1;
+                    } else if (old[i].pos < new[j].pos) {
+                        try merged.append(self.allocator, old[i]);
+                        i += 1;
+                    } else if (old[i].pos > new[j].pos) {
+                        try merged.append(self.allocator, new[j]);
+                        j += 1;
+                    } else {
+                        // Same pos: keep new, drop old.
+                        var dropped = old[i];
+                        dropped.deinit(self.allocator);
+                        i += 1;
+                        try merged.append(self.allocator, new[j]);
+                        j += 1;
+                    }
+                }
+                self.allocator.free(old);
+                self.allocator.free(new);
+                break :blk try merged.toOwnedSlice(self.allocator);
+            };
+
+            // Free everything the old entry owned EXCEPT the (now-detached)
+            // ssm_checkpoints, which were moved into `merged_cps` above.
             self.allocator.free(e.tokens);
             e.snapshot.deinit();
             self.current_kv_bytes -|= e.kv_bytes;
+
+            // Recompute ssm bytes from the merged list.
+            var merged_ssm_bytes: u64 = 0;
+            if (merged_cps) |cps| {
+                for (cps) |*cp| merged_ssm_bytes += ssmCheckpointBytes(cp);
+            }
+
             e.tokens = tokens_owned;
             e.snapshot = new_snap;
             e.has_tools = has_tools;
             e.scheme = scheme;
-            e.kv_bytes = new_bytes;
+            e.kv_bytes = new_kv_bytes + merged_ssm_bytes;
+            e.ssm_checkpoints = merged_cps;
+            e.ssm_bytes = merged_ssm_bytes;
             e.last_used = self.bumpCounter();
-            self.current_kv_bytes += new_bytes;
+            self.current_kv_bytes += e.kv_bytes;
             self.logResident();
             return;
         }
@@ -294,10 +471,16 @@ pub const HotPrefixCache = struct {
             .last_used = self.bumpCounter(),
             .scheme = scheme,
             .kv_bytes = new_bytes,
+            .ssm_checkpoints = ssm_cps,
+            .ssm_bytes = new_ssm_bytes,
         }) catch |err| {
             self.allocator.free(tokens_owned);
-            var s = new_snap;
-            s.deinit();
+            var snap = new_snap;
+            snap.deinit();
+            if (ssm_cps) |cps| {
+                for (cps) |*cp| cp.deinit(self.allocator);
+                self.allocator.free(cps);
+            }
             return err;
         };
         self.current_kv_bytes += new_bytes;
@@ -313,16 +496,22 @@ pub const HotPrefixCache = struct {
                 lru_idx = i;
             }
         }
-        const evicted = self.entries.swapRemove(lru_idx);
-        self.allocator.free(evicted.tokens);
-        var s = evicted.snapshot;
-        s.deinit();
+        var evicted = self.entries.swapRemove(lru_idx);
+        const tokens_len = evicted.tokens.len;
+        const kv_mb = @as(f64, @floatFromInt(evicted.kv_bytes)) / (1024.0 * 1024.0);
+        const had_ssm = evicted.ssm_checkpoints != null;
+        const ssm_mb = @as(f64, @floatFromInt(evicted.ssm_bytes)) / (1024.0 * 1024.0);
         self.current_kv_bytes -|= evicted.kv_bytes;
-        log.info("  [hot-cache] evicted LRU entry ({s}; was {d} tokens, {d:.2} MB)\n", .{
-            reason,
-            evicted.tokens.len,
-            @as(f64, @floatFromInt(evicted.kv_bytes)) / (1024.0 * 1024.0),
-        });
+        freeEntryOwnedState(self.allocator, &evicted);
+        if (had_ssm) {
+            log.info("  [hot-cache] evicted LRU entry ({s}; was {d} tokens, {d:.2} MB; ssm {d:.2} MB)\n", .{
+                reason, tokens_len, kv_mb, ssm_mb,
+            });
+        } else {
+            log.info("  [hot-cache] evicted LRU entry ({s}; was {d} tokens, {d:.2} MB)\n", .{
+                reason, tokens_len, kv_mb,
+            });
+        }
     }
 
     fn logResident(self: *const HotPrefixCache) void {
@@ -342,8 +531,7 @@ pub const HotPrefixCache = struct {
         if (self.entries.items.len == 0) return;
         log.info("  [hot-cache] invalidating all {d} entries: {s}\n", .{ self.entries.items.len, reason });
         for (self.entries.items) |*e| {
-            self.allocator.free(e.tokens);
-            e.snapshot.deinit();
+            freeEntryOwnedState(self.allocator, e);
         }
         self.entries.clearRetainingCapacity();
         self.current_kv_bytes = 0;
@@ -363,11 +551,9 @@ pub const HotPrefixCache = struct {
                 newest_idx = i;
             }
         }
-        const evicted = self.entries.swapRemove(newest_idx);
-        self.allocator.free(evicted.tokens);
-        var s = evicted.snapshot;
-        s.deinit();
+        var evicted = self.entries.swapRemove(newest_idx);
         self.current_kv_bytes -|= evicted.kv_bytes;
+        freeEntryOwnedState(self.allocator, &evicted);
         log.info("  [hot-cache] invalidated latest entry: {s}\n", .{reason});
     }
 
@@ -380,13 +566,20 @@ pub const HotPrefixCache = struct {
 
 const testing = std.testing;
 
-test "HotPrefixCache: shouldUse rejects hybrid arch" {
+test "HotPrefixCache: shouldUse gates hybrid by enable_ssm_checkpoints" {
     var cfg = model_mod.ModelConfig{};
+    // Plain attention: always allowed.
+    try testing.expect(HotPrefixCache.shouldUse(&cfg, false));
+    try testing.expect(HotPrefixCache.shouldUse(&cfg, true));
+    // Hybrid (lfm2/nemotron_h-style): only with checkpoints enabled.
     cfg.has_hybrid_layers = true;
-    try testing.expect(!HotPrefixCache.shouldUse(&cfg));
+    try testing.expect(!HotPrefixCache.shouldUse(&cfg, false));
+    try testing.expect(HotPrefixCache.shouldUse(&cfg, true));
+    // Qwen3.5-style full_attention_interval-marks-hybrid: same gate.
     cfg.has_hybrid_layers = false;
-    cfg.full_attention_interval = 0;
-    try testing.expect(HotPrefixCache.shouldUse(&cfg));
+    cfg.full_attention_interval = 4;
+    try testing.expect(!HotPrefixCache.shouldUse(&cfg, false));
+    try testing.expect(HotPrefixCache.shouldUse(&cfg, true));
 }
 
 test "HotPrefixCache: init zero capacity clamps to 1" {
@@ -411,6 +604,8 @@ test "HotPrefixCache: findBestMatch returns longest shared prefix" {
         .last_used = 1,
         .scheme = .off,
         .kv_bytes = 0,
+        .ssm_checkpoints = null,
+        .ssm_bytes = 0,
     });
     try cache.entries.append(testing.allocator, .{
         .tokens = ids_b,
@@ -419,6 +614,8 @@ test "HotPrefixCache: findBestMatch returns longest shared prefix" {
         .last_used = 2,
         .scheme = .off,
         .kv_bytes = 0,
+        .ssm_checkpoints = null,
+        .ssm_bytes = 0,
     });
 
     // Looking up [1,2,3,4,5,6] should match entry A (5 shared tokens).

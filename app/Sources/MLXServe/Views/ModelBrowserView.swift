@@ -33,7 +33,7 @@ struct ModelBrowserView: View {
                         TextField("Filter local models...", text: $localFilter)
                             .textFieldStyle(.plain)
                     } else {
-                        TextField("Search MLX models...", text: $searchService.searchQuery)
+                        TextField("Search models...", text: $searchService.searchQuery)
                             .textFieldStyle(.plain)
                             .onSubmit { Task { await searchService.search() } }
                     }
@@ -43,6 +43,20 @@ struct ModelBrowserView: View {
                 .cornerRadius(8)
 
                 if !showDownloadedOnly {
+                    // Weight-format filter: MLX (safetensors), GGUF (llama.cpp /
+                    // ds4), or Both. Re-runs the search on change.
+                    Picker("Format", selection: $searchService.format) {
+                        ForEach(ModelFormat.allCases) { f in
+                            Text(f.label).tag(f)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .fixedSize()
+                    .onChange(of: searchService.format) { _, _ in
+                        Task { await searchService.search() }
+                    }
+
                     Button("Search") {
                         Task { await searchService.search() }
                     }
@@ -448,23 +462,72 @@ private struct ModelBrowserRow: View {
                 Text("Delete \(model.modelName)? This will remove all downloaded files.")
             }
         } else if let state, state.status == .failed {
-            Button(downloads.hasPartialDownload(model.id) ? "Resume" : "Retry") {
-                Task {
-                    await downloads.download(repoId: model.id)
-                    appState.refreshModels()
+            if model.isGgufRepo {
+                GgufDownloadMenu(repoId: model.id, label: "Retry")
+            } else {
+                Button(downloads.hasPartialDownload(model.id) ? "Resume" : "Retry") {
+                    Task {
+                        await downloads.download(repoId: model.id)
+                        appState.refreshModels()
+                    }
                 }
+                .font(.callout)
+                .controlSize(.small)
             }
-            .font(.callout)
-            .controlSize(.small)
         } else {
-            Button(downloads.hasPartialDownload(model.id) ? "Resume" : "Download") {
-                Task {
-                    await downloads.download(repoId: model.id)
-                    appState.refreshModels()
+            if model.isGgufRepo {
+                // GGUF repos ship many quants — pick one from a menu.
+                GgufDownloadMenu(repoId: model.id, label: "Download")
+            } else {
+                Button(downloads.hasPartialDownload(model.id) ? "Resume" : "Download") {
+                    Task {
+                        await downloads.download(repoId: model.id)
+                        appState.refreshModels()
+                    }
+                }
+                .font(.callout)
+                .controlSize(.small)
+            }
+        }
+    }
+}
+
+/// Download button for a GGUF repo: a menu of the repo's quant files. The list
+/// is fetched lazily from the HF tree API the first time the menu is shown.
+private struct GgufDownloadMenu: View {
+    let repoId: String
+    let label: String
+    @EnvironmentObject var downloads: DownloadManager
+    @EnvironmentObject var appState: AppState
+    @State private var quants: [String] = []
+    @State private var loaded = false
+
+    var body: some View {
+        Menu {
+            if !loaded {
+                Text("Loading quants…")
+            } else if quants.isEmpty {
+                Text("No GGUF files found")
+            } else {
+                ForEach(quants, id: \.self) { file in
+                    Button(DownloadManager.quantLabel(forFilename: file)) {
+                        Task {
+                            await downloads.downloadGguf(repoId: repoId, ggufFilename: file)
+                            appState.refreshModels()
+                        }
+                    }
                 }
             }
-            .font(.callout)
-            .controlSize(.small)
+        } label: {
+            Text(label)
+        }
+        .font(.callout)
+        .controlSize(.small)
+        .fixedSize()
+        .task {
+            guard !loaded else { return }
+            quants = await downloads.listGgufFiles(repoId: repoId)
+            loaded = true
         }
     }
 }

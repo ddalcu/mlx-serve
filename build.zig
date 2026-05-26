@@ -84,6 +84,11 @@ pub fn build(b: *std.Build) void {
     addDs4Sources(b, mod);
     mod.addIncludePath(b.path("lib/ds4"));
 
+    // llama.cpp libllama for generic GGUF models (Metal backend, macOS only).
+    // Staged by `scripts/fetch-llama.sh` into lib/llama/ (a single self-contained
+    // dylib + headers extracted from the pinned XCFramework). See src/arch/llama.zig.
+    addLlamaLib(b, mod);
+
     // mlx-c include/lib paths (homebrew)
     mod.addIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
     mod.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
@@ -135,6 +140,7 @@ pub fn build(b: *std.Build) void {
     test_mod.addIncludePath(b.path("lib"));
     addDs4Sources(b, test_mod);
     test_mod.addIncludePath(b.path("lib/ds4"));
+    addLlamaLib(b, test_mod);
     test_mod.linkSystemLibrary("c++", .{});
     test_mod.addIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
     test_mod.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
@@ -188,6 +194,29 @@ fn addDs4Sources(b: *std.Build, module: *std.Build.Module) void {
         "-Wno-deprecated-declarations",
     };
     module.addCSourceFile(.{ .file = b.path("lib/ds4/ds4_metal.m"), .flags = objc_flags });
+}
+
+fn addLlamaLib(b: *std.Build, module: *std.Build.Module) void {
+    // Link the prebuilt libllama staged by scripts/fetch-llama.sh. The dylib's
+    // install-name is @rpath/libllama.dylib; we add an rpath to its build-tree
+    // location so `zig build run` / unit tests resolve it in dev. The app bundle
+    // and CLI tarball rewrite that reference to @executable_path/... and re-sign
+    // with the Developer ID (see release.yml / app/build.sh).
+    module.addIncludePath(b.path("lib/llama/include"));
+    module.addLibraryPath(b.path("lib/llama/lib"));
+    // use_pkg_config = .no: a Homebrew `llama.cpp` install ships a llama.pc that
+    // would otherwise hijack this link (pulling in /opt/homebrew's version + its
+    // separate libggml). We want exactly the pinned dylib staged in lib/llama/lib.
+    module.linkSystemLibrary("llama", .{ .use_pkg_config = .no });
+    module.addRPath(b.path("lib/llama/lib"));
+
+    // Our clean C shim over llama.h (src/llama_ffi.zig mirrors lib/llama_shim/llama_shim.h).
+    // C11 for pthread_once-based one-time backend init.
+    module.addIncludePath(b.path("lib/llama_shim"));
+    module.addCSourceFile(.{
+        .file = b.path("lib/llama_shim/llama_shim.c"),
+        .flags = &.{ "-O2", "-std=c11", "-Wno-unused-parameter" },
+    });
 }
 
 const BrewDep = struct { name: []const u8, min: std.SemanticVersion };

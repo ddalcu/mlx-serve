@@ -26,6 +26,7 @@ const drafter_mod = @import("drafter.zig");
 const prefix_cache_mod = @import("prefix_cache.zig");
 const model_discovery = @import("model_discovery.zig");
 const arch_ds4 = @import("arch/ds4.zig");
+const arch_llama = @import("arch/llama.zig");
 const log = @import("log.zig");
 
 const Transformer = transformer_mod.Transformer;
@@ -104,12 +105,44 @@ pub const LoadedModel = struct {
     /// cache. `model_id`-keyed isolation falls out of "one cache per
     /// LoadedModel" by construction.
     prefix_cache: ?HotPrefixCache,
+    /// Phase 1 (perf-plan): SSM/conv state snapshot stride during prefill,
+    /// in tokens. 0 = disabled (hybrid models bypass the hot prefix cache,
+    /// preserving legacy behavior). Non-zero enables multi-turn warm reuse
+    /// on hybrid SSM archs. Set by `doLoadOnInferenceThread` from
+    /// `LoadParams.ssm_checkpoint_stride`.
+    ssm_checkpoint_stride: u32 = 0,
+    /// Phase 1: per-request cap on snapshots retained.
+    ssm_checkpoint_max: u32 = 32,
 
     /// Embedded ds4 engine (DeepSeek-V4-Flash via GGUF). When non-null,
     /// `transformer` / `weights` / `tokenizer` / `chat_config` stay null and
     /// the request handlers route through `Ds4Engine` / `Ds4Session` instead
     /// of the MLX path. Mutually exclusive with the safetensors fields.
     ds4_engine: ?*arch_ds4.Ds4Engine = null,
+
+    /// Embedded llama.cpp engine (generic GGUF via libllama). Like `ds4_engine`,
+    /// when non-null the MLX fields stay null and request handlers route through
+    /// `LlamaEngine` / `LlamaSession`. Mutually exclusive with the safetensors
+    /// fields and `ds4_engine` (set for every `.gguf` except DeepSeek-V4-Flash).
+    llama_engine: ?*arch_llama.LlamaEngine = null,
+
+    /// Persistent llama.cpp session (one KV context reused across requests so a
+    /// shared prompt prefix is decoded once, matching LM Studio / llama-server
+    /// prompt caching). Created lazily on the first llama prefill and owned here
+    /// for the engine's lifetime — must be freed BEFORE `llama_engine` (it holds
+    /// a context bound to the engine's model). Borrowed (not owned) by the active
+    /// slot. `llama_session_busy` serializes the single context to one request at
+    /// a time (claimed in `Scheduler.submit`, released in `Scheduler.complete`).
+    llama_session: ?*arch_llama.LlamaSession = null,
+    llama_session_busy: bool = false,
+    /// Phase 5 #2: ggml types for the K and V halves of the llama.cpp KV
+    /// cache. 0 = libllama default (F16). Non-zero values are pulled from
+    /// `LoadParams.llama_kv_type_{k,v}` at load time and read by
+    /// `runPrefillLlama` when creating the persistent session. Mutating
+    /// these after a session has been created has no effect — the values
+    /// are baked into the libllama context at create-time.
+    llama_kv_type_k: i32 = 0,
+    llama_kv_type_v: i32 = 0,
 
     // ── Bookkeeping. Updated under `ModelRegistry.mutex`. ──
 
@@ -139,9 +172,18 @@ pub const LoadedModel = struct {
     /// stream); the caller arranges this via `unloadResident` invoked
     /// from the inference thread before registry teardown.
     pub fn deinit(self: *LoadedModel) void {
+        if (self.llama_session) |session| {
+            session.free();
+            self.llama_session = null;
+            self.llama_session_busy = false;
+        }
         if (self.ds4_engine) |engine| {
             engine.close();
             self.ds4_engine = null;
+        }
+        if (self.llama_engine) |engine| {
+            engine.close();
+            self.llama_engine = null;
         }
         if (self.drafter) |d| {
             d.deinit();
@@ -197,9 +239,18 @@ pub const LoadedModel = struct {
     /// `.unloaded` for later listing/reload, AND by `Scheduler.deinit` so
     /// mlx frees happen on the inference thread.
     pub fn unloadResident(self: *LoadedModel) void {
+        if (self.llama_session) |session| {
+            session.free();
+            self.llama_session = null;
+            self.llama_session_busy = false;
+        }
         if (self.ds4_engine) |engine| {
             engine.close();
             self.ds4_engine = null;
+        }
+        if (self.llama_engine) |engine| {
+            engine.close();
+            self.llama_engine = null;
         }
         if (self.drafter) |d| {
             d.deinit();

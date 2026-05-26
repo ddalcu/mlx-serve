@@ -1,11 +1,39 @@
 import Foundation
 
+/// Weight format filter for the Model Browser's HuggingFace search. MLX and GGUF
+/// are queried via distinct HF `filter` tags; `both` runs each and merges.
+enum ModelFormat: String, CaseIterable, Identifiable, Sendable {
+    case mlx
+    case gguf
+    case both
+
+    var id: String { rawValue }
+
+    var label: String {
+        switch self {
+        case .mlx: return "MLX"
+        case .gguf: return "GGUF"
+        case .both: return "Both"
+        }
+    }
+
+    /// HF API `filter` tags to query. `both` queries each tag and merges results.
+    var filterTags: [String] {
+        switch self {
+        case .mlx: return ["mlx"]
+        case .gguf: return ["gguf"]
+        case .both: return ["mlx", "gguf"]
+        }
+    }
+}
+
 @MainActor
 class HFSearchService: ObservableObject {
     @Published var models: [HFModel] = []
     @Published var isLoading = false
     @Published var error: String?
     @Published var searchQuery = ""
+    @Published var format: ModelFormat = .both
     @Published var sortField: HFSortField = .downloads
     @Published var sortDescending = true
     @Published var hasMore = true
@@ -81,55 +109,76 @@ class HFSearchService: ObservableObject {
         isLoading = true
         defer { isLoading = false }
 
-        var components = URLComponents(string: "https://huggingface.co/api/models")!
-        var items: [URLQueryItem] = [
-            URLQueryItem(name: "filter", value: "mlx"),
-            URLQueryItem(name: "sort", value: "downloads"),
-            URLQueryItem(name: "direction", value: "-1"),
-            URLQueryItem(name: "limit", value: "\(pageSize)"),
-            URLQueryItem(name: "skip", value: "\(currentSkip)"),
-        ]
-        let query = searchQuery.trimmingCharacters(in: .whitespaces)
-        if !query.isEmpty {
-            items.append(URLQueryItem(name: "search", value: query))
+        // Run one query per active filter tag (MLX / GGUF, or both), all at the
+        // same skip so they paginate in lockstep, then merge + dedup (a repo can
+        // carry both tags). hasMore stays true while any sub-query fills a page.
+        var rawAll: [HFModel] = []
+        var anyFull = false
+        for tag in format.filterTags {
+            guard let raw = await fetchFilterPage(tag: tag) else { continue }
+            if raw.count >= pageSize { anyFull = true }
+            rawAll.append(contentsOf: raw)
         }
-        // Request extra fields via expand[]
-        for field in ["safetensors", "lastModified", "likes", "downloads", "tags", "pipeline_tag"] {
-            items.append(URLQueryItem(name: "expand[]", value: field))
-        }
-        components.queryItems = items
 
-        guard let url = components.url else {
+        // Filter out MLX-format DeepSeek-V4 checkpoints — the Zig MLX path
+        // rejects them; users grab the GGUF + ds4 entry from the built-in catalog.
+        let filtered = rawAll.filter { !$0.id.lowercased().contains("deepseek-v4-flash") }
+
+        var seen = Set(fetchedModels.map { $0.id })
+        for m in filtered where !seen.contains(m.id) {
+            seen.insert(m.id)
+            fetchedModels.append(m)
+        }
+        models = sortedModels
+        currentSkip += pageSize
+        hasMore = anyFull
+
+        // Fetch safetensors sizes for MLX models missing metadata. GGUF repos
+        // report size per-quant (resolved at download time), so skip them here.
+        let missing = filtered.filter { $0.estimatedSizeBytes == 0 && $0.isCompatible && !$0.isGgufRepo }
+        if !missing.isEmpty {
+            Task { await fetchFallbackSizes(for: missing) }
+        }
+    }
+
+    /// Fetch one page for a single HF `filter` tag at the current skip. Returns
+    /// the raw decoded list (pre-dedup/DSV4-filter) or nil on error.
+    private func fetchFilterPage(tag: String) async -> [HFModel]? {
+        guard let url = Self.searchURL(query: searchQuery, filter: tag, skip: currentSkip, limit: pageSize) else {
             error = "Invalid search URL"
-            return
+            return nil
         }
-
         do {
             let (data, response) = try await URLSession.shared.data(from: url)
             guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
                 let code = (response as? HTTPURLResponse)?.statusCode ?? 0
                 error = "HuggingFace API error (HTTP \(code))"
-                return
+                return nil
             }
-            let decoded = try JSONDecoder().decode([HFModel].self, from: data)
-            // Filter out MLX-format DeepSeek-V4 checkpoints — the Zig MLX
-            // path rejects them; users should grab the GGUF + ds4 entry from
-            // the built-in catalog instead. Show every other result the API
-            // returns.
-            let filtered = decoded.filter { !$0.id.lowercased().contains("deepseek-v4-flash") }
-            fetchedModels.append(contentsOf: filtered)
-            models = sortedModels
-            currentSkip += decoded.count
-            hasMore = decoded.count >= pageSize
-
-            // Fetch file sizes for models missing safetensors metadata
-            let missing = decoded.filter { $0.estimatedSizeBytes == 0 && $0.isCompatible }
-            if !missing.isEmpty {
-                Task { await fetchFallbackSizes(for: missing) }
-            }
+            return try JSONDecoder().decode([HFModel].self, from: data)
         } catch {
             self.error = error.localizedDescription
+            return nil
         }
+    }
+
+    /// Build the HF API query URL for the given page parameters. Exposed for tests.
+    nonisolated static func searchURL(query: String, filter: String, skip: Int, limit: Int) -> URL? {
+        var components = URLComponents(string: "https://huggingface.co/api/models")!
+        var items: [URLQueryItem] = [
+            URLQueryItem(name: "filter", value: filter),
+            URLQueryItem(name: "sort", value: "downloads"),
+            URLQueryItem(name: "direction", value: "-1"),
+            URLQueryItem(name: "limit", value: "\(limit)"),
+            URLQueryItem(name: "skip", value: "\(skip)"),
+        ]
+        let q = query.trimmingCharacters(in: .whitespaces)
+        if !q.isEmpty { items.append(URLQueryItem(name: "search", value: q)) }
+        for field in ["safetensors", "lastModified", "likes", "downloads", "tags", "pipeline_tag"] {
+            items.append(URLQueryItem(name: "expand[]", value: field))
+        }
+        components.queryItems = items
+        return components.url
     }
 
     /// Fetch safetensors file sizes from the tree API for models missing metadata.

@@ -1,0 +1,10 @@
+label|kind|run|completion_tokens|decode_tok_s|wall_ms|hw
+qwen35-4b-mlx|mlx-serve|1|128|36.6|3660|Apple-M4-16gb
+qwen35-4b-mlx|mlx-serve|2|128|37.5|3490|Apple-M4-16gb
+qwen35-4b-mlx|mlx-serve|3|128|37.7|3465|Apple-M4-16gb
+gemma4-e4b|mlx-serve|1|128|18.4|7262|Apple-M4-16gb
+gemma4-e4b|mlx-serve|2|128|19.2|6761|Apple-M4-16gb
+gemma4-e4b|mlx-serve|3|128|19.0|6862|Apple-M4-16gb
+qwen35-4b-gguf|mlx-serve|1|128|29.2|4537|Apple-M4-16gb
+qwen35-4b-gguf|mlx-serve|2|128|29.2|4523|Apple-M4-16gb
+qwen35-4b-gguf|mlx-serve|3|128|29.3|4506|Apple-M4-16gb

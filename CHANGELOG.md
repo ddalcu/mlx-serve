@@ -1,5 +1,11 @@
 # Changelog
 
+## v26.5.7 — Run any GGUF model
+
+- **Any GGUF model, natively.** mlx-serve now embeds llama.cpp's inference library, so the whole GGUF world — Qwen, Llama, Mistral, Gemma, and thousands more — runs on Apple Silicon alongside MLX models. Pick a `.gguf` in the menu-bar app and it just works: the server auto-detects the format and routes to the right engine (DeepSeek-V4-Flash still uses the dedicated ds4 engine; everything else uses llama.cpp). No new app to trust — the engine ships inside the same signed, notarized bundle, so there's no "unidentified developer" dialog.
+
+---
+
 ## v26.5.6 — DeepSeek-V4 done right, faster than LM Studio, continuous batching
 
 - **DeepSeek-V4-Flash, the right way.** The 284B-parameter beast now runs through Salvatore Sanfilippo's [`antirez/ds4`](https://github.com/antirez/ds4) engine — native Metal kernels, byte-validated against the reference forward, single self-contained binary (kernel sources are embedded and staged at first launch). Available on 96 GB+ Macs straight from the MLX Core Model Browser: one-click download of the GGUF, served alongside MLX models from the same picker. Agent mode and MCP tool calling work on DSV4 too — the chat-template fallback inlines the tool catalog so the model sees the full toolset. We retired our previous 7,000-line in-house implementation in favor of the upstream engine; the result is faster, more memory-stable, and a lot less code to maintain.

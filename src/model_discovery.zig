@@ -123,6 +123,20 @@ pub const DiscoveryResult = struct {
     }
 };
 
+/// True if a `.gguf` basename is the DeepSeek-V4-Flash model served by the ds4
+/// engine (case-insensitive `deepseek-v4-flash` prefix). Every other GGUF routes
+/// to the generic llama.cpp engine — libllama can't load the DSV4-Flash
+/// architecture, which is why ds4 exists. Mirrors the Swift app's
+/// `isSupportedDsv4Gguf` so client and server agree on which GGUFs are ds4.
+pub fn isDs4GgufBasename(name: []const u8) bool {
+    const prefix = "deepseek-v4-flash";
+    if (name.len < prefix.len) return false;
+    for (prefix, 0..) |c, i| {
+        if (std.ascii.toLower(name[i]) != c) return false;
+    }
+    return true;
+}
+
 /// Scan `model_dir` for subdirectories containing `config.json`.
 /// Returns DiscoveryResult; caller owns memory via deinit().
 /// Symlinks followed; permission errors on individual subdirs skipped silently.
@@ -238,4 +252,15 @@ test "lessThanById sorts ascending" {
     try testing.expect(lessThanById({}, a, b));
     try testing.expect(!lessThanById({}, b, a));
     try testing.expect(!lessThanById({}, a, a));
+}
+
+test "isDs4GgufBasename routes DSV4 to ds4 and everything else to llama" {
+    // DeepSeek-V4-Flash → ds4 (case-insensitive).
+    try testing.expect(isDs4GgufBasename("DeepSeek-V4-Flash-Q4_K_M.gguf"));
+    try testing.expect(isDs4GgufBasename("deepseek-v4-flash-bf16.gguf"));
+    // Any other GGUF → llama.cpp engine.
+    try testing.expect(!isDs4GgufBasename("qwen2.5-0.5b-instruct-q4_k_m.gguf"));
+    try testing.expect(!isDs4GgufBasename("Meta-Llama-3.1-8B-Instruct.Q4_K_M.gguf"));
+    try testing.expect(!isDs4GgufBasename("deepseek-v3-chat.gguf")); // V3, not V4-Flash
+    try testing.expect(!isDs4GgufBasename("short.gguf"));
 }

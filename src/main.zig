@@ -13,6 +13,7 @@ const server_mod = @import("server.zig");
 const scheduler_mod = @import("scheduler.zig");
 const vision_mod = @import("vision.zig");
 const ds4_arch = @import("arch/ds4.zig");
+const llama_arch = @import("arch/llama.zig");
 const ds4_ffi = @import("ds4_ffi.zig");
 const log = @import("log.zig");
 
@@ -244,6 +245,30 @@ pub fn main(init: std.process.Init) !void {
                 log.err("--prefix-cache-mem: expected '<n>{{MB,GB,KB}}' or '0'/'off'; got '{s}'\n", .{args[i]});
                 std.process.exit(1);
             };
+        } else if (std.mem.eql(u8, args[i], "--ssm-checkpoint-stride") and i + 1 < args.len) {
+            // Phase 1 (perf-plan): per-position SSM/conv state snapshots during
+            // chunked prefill enable multi-turn warm reuse on hybrid SSM
+            // architectures. 0 disables (legacy behavior: hybrid bypasses the
+            // hot prefix cache); default 128.
+            i += 1;
+            server_mod.ssm_checkpoint_stride = std.fmt.parseInt(u32, args[i], 10) catch 128;
+        } else if (std.mem.eql(u8, args[i], "--ssm-checkpoint-max") and i + 1 < args.len) {
+            i += 1;
+            server_mod.ssm_checkpoint_max = std.fmt.parseInt(u32, args[i], 10) catch 32;
+        } else if (std.mem.eql(u8, args[i], "--llama-kv-quant") and i + 1 < args.len) {
+            // Phase 5 #2: KV-cache quantization for the embedded llama.cpp
+            // engine. Accepts `off`/`f16` (default; F16), `q8`/`8`/`Q8_0`
+            // (~2× compression, near-lossless), `q4`/`4`/`Q4_0` (~4×
+            // compression, some quality impact). Auto-enables flash-attn
+            // in the shim because llama's plain SDPA needs F16/F32 KV.
+            i += 1;
+            const arch_llama = @import("arch/llama.zig");
+            if (arch_llama.LlamaKvQuant.fromString(args[i])) |q| {
+                server_mod.llama_kv_quant = q;
+            } else {
+                log.err("--llama-kv-quant: expected off|q8|q4 (or 8/4), got '{s}'\n", .{args[i]});
+                std.process.exit(1);
+            }
         } else if (std.mem.eql(u8, args[i], "--max-concurrent") and i + 1 < args.len) {
             i += 1;
             server_mod.max_concurrent = std.fmt.parseInt(u32, args[i], 10) catch 1;
@@ -345,37 +370,35 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
-    // ── GGUF early-branch: route to the embedded ds4 engine ──
+    // ── GGUF early-branch: route to an embedded engine ──
     //
-    // mlx-serve serves DSV4-Flash through `lib/ds4/` (antirez/ds4). We pick the
-    // backend at load time by file extension. Any path ending in `.gguf` (or
-    // referring to a directory containing exactly one `.gguf`) bypasses the
-    // MLX safetensors path entirely. Both offline (`--prompt`) and serve
-    // (`--serve`) modes are wired; serve constructs a stub LoadedModel whose
-    // request handlers route through the engine instead of the MLX path.
+    // mlx-serve serves GGUF models through embedded engines (no MLX path). The
+    // backend is picked at load time by file extension + family: DeepSeek-V4-Flash
+    // goes to `lib/ds4/` (antirez/ds4, a bespoke engine for that architecture);
+    // every other `.gguf` goes to the embedded llama.cpp engine (`lib/llama_shim/`
+    // + `src/arch/llama.zig`). Any path ending in `.gguf` (or a directory
+    // containing one) bypasses the MLX safetensors path entirely. Both offline
+    // (`--prompt`) and serve (`--serve`) modes are wired; serve constructs a stub
+    // LoadedModel whose request handlers route through the engine.
     if (isGgufPath(io, model_dir)) {
+        const use_ds4 = isDs4Gguf(io, allocator, model_dir);
         if (serve_mode) {
-            try runDs4Serve(
-                io,
-                allocator,
-                model_dir,
-                host,
-                port,
-                ctx_size,
-                timeout,
-                reasoning_budget,
-                max_resident_models,
-                max_resident_mem,
-                max_resident_mem_explicit,
-                idle_evict_secs,
-            );
+            if (use_ds4) {
+                try runDs4Serve(io, allocator, model_dir, host, port, ctx_size, timeout, reasoning_budget, max_resident_models, max_resident_mem, max_resident_mem_explicit, idle_evict_secs);
+            } else {
+                try runLlamaServe(io, allocator, model_dir, host, port, ctx_size, timeout, reasoning_budget, max_resident_models, max_resident_mem, max_resident_mem_explicit, idle_evict_secs);
+            }
             return;
         }
         const prompt_text = prompt orelse {
-            log.err("ds4 offline mode requires --prompt <text>\n", .{});
+            log.err("GGUF offline mode requires --prompt <text>\n", .{});
             std.process.exit(2);
         };
-        try runDs4Offline(io, allocator, model_dir, prompt_text, max_tokens, temperature);
+        if (use_ds4) {
+            try runDs4Offline(io, allocator, model_dir, prompt_text, max_tokens, temperature);
+        } else {
+            try runLlamaOffline(io, allocator, model_dir, prompt_text, max_tokens, temperature);
+        }
         return;
     }
 
@@ -592,6 +615,10 @@ pub fn main(init: std.process.Init) !void {
             .kv_quant_config = kv_quant_config,
             .prefix_cache_capacity = server_mod.prefix_cache_capacity,
             .prefix_cache_mem_bytes = server_mod.prefix_cache_mem_bytes,
+            .ssm_checkpoint_stride = server_mod.ssm_checkpoint_stride,
+            .ssm_checkpoint_max = server_mod.ssm_checkpoint_max,
+            .llama_kv_type_k = server_mod.llama_kv_quant.ggmlType(),
+            .llama_kv_type_v = server_mod.llama_kv_quant.ggmlType(),
         };
         try server_mod.serve(io, allocator, params, config, host, port, .{
             .max_context_size = ctx_size,
@@ -761,6 +788,17 @@ fn resolveGgufFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !
         }
     }
     return error.NoGgufFile;
+}
+
+/// True if a `.gguf` path is the DeepSeek-V4-Flash model that the ds4 engine
+/// serves. Everything else routes to the generic llama.cpp engine. The check
+/// is a case-insensitive basename prefix, mirroring the Swift app's
+/// `isSupportedDsv4Gguf` so client and server agree on which GGUFs are ds4.
+/// libllama cannot load the DSV4-Flash architecture, which is why ds4 exists.
+fn isDs4Gguf(io: std.Io, allocator: std.mem.Allocator, path: []const u8) bool {
+    const gguf = resolveGgufFile(io, allocator, path) catch return false;
+    defer allocator.free(gguf);
+    return model_discovery.isDs4GgufBasename(std.fs.path.basename(gguf));
 }
 
 /// Offline single-prompt generation through the embedded ds4 engine.
@@ -1017,6 +1055,251 @@ fn runDs4Serve(
 
     try server_mod.serve(io, allocator, params, config_storage, host, port, .{
         .max_context_size = ctx_size,
+        .request_timeout_sec = timeout,
+        .default_reasoning_budget = reasoning_budget,
+        .default_enable_pld = false,
+        .default_pld_draft_len = 5,
+        .default_pld_key_len = 3,
+        .default_kv_attn_fused = false,
+    });
+}
+
+/// Offline single-prompt generation through the embedded llama.cpp engine.
+/// Renders the prompt via the GGUF's built-in chat template (falling back to a
+/// raw tokenize when the template isn't a recognized format) and streams
+/// decoded tokens to stdout. Mirrors `runDs4Offline`.
+fn runLlamaOffline(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    model_dir: []const u8,
+    prompt: []const u8,
+    max_tokens: u32,
+    temp: f32,
+) !void {
+    const gguf_path = try resolveGgufFile(io, allocator, model_dir);
+    defer allocator.free(gguf_path);
+
+    log.info("[llama] backend: Metal, model: {s}\n", .{gguf_path});
+
+    var engine = llama_arch.LlamaEngine.open(allocator, gguf_path, .{}) catch |err| {
+        log.err("[llama] engine open failed: {s}\n", .{@errorName(err)});
+        return err;
+    };
+    defer engine.close();
+
+    log.info("[llama] engine ready (EOS={d}, n_vocab={d})\n", .{ engine.eosToken(), engine.nVocab() });
+
+    // Render the single user turn through the model's chat template; tokenize the
+    // result with add_special=false (the template owns BOS). Fall back to a raw
+    // add-special tokenize if the GGUF's template isn't recognized.
+    const turns = [_]llama_arch.LlamaEngine.ChatTurn{.{ .role = "user", .content = prompt }};
+    const prompt_ids: []i32 = blk: {
+        if (engine.applyChatTemplate(allocator, &turns, true)) |rendered| {
+            defer allocator.free(rendered);
+            break :blk try engine.tokenizeText(allocator, rendered, false);
+        } else |_| {
+            break :blk try engine.tokenizeText(allocator, prompt, true);
+        }
+    };
+    defer allocator.free(prompt_ids);
+
+    log.info("[llama] prompt: {d} tokens\n", .{prompt_ids.len});
+
+    var sess = try engine.createSession(8192);
+    defer sess.free();
+
+    _ = try sess.sync(prompt_ids); // cold session: cached count is 0, unused here
+
+    var rng: u64 = @intCast(std.Io.Timestamp.now(io, .real).toMilliseconds());
+
+    var stdout_buf: [4096]u8 = undefined;
+    var stdout = std.Io.File.stdout().writer(io, &stdout_buf);
+    const out_w = &stdout.interface;
+    try out_w.writeAll("\n");
+
+    var generated: u32 = 0;
+    while (generated < max_tokens) : (generated += 1) {
+        const next_id: i32 = if (temp < 0.01)
+            sess.argmax()
+        else
+            sess.sample(temp, 0, 1.0, 0.0, &rng);
+
+        if (next_id < 0 or engine.isEog(next_id)) break;
+
+        const piece = try engine.detokenizeOne(allocator, next_id);
+        defer allocator.free(piece);
+        try out_w.writeAll(piece);
+        try out_w.flush();
+
+        try sess.eval(next_id);
+    }
+
+    try out_w.writeAll("\n");
+    try out_w.flush();
+    log.info("[llama] generated {d} tokens (max={d})\n", .{ generated, max_tokens });
+}
+
+/// llama.cpp serve mode. Builds a stub LoadedModel + ModelConfig + ChatConfig
+/// and hands them to `Scheduler.init` via `LoadParams.llama_path` — the
+/// scheduler's inference thread opens the engine on the GPU-stream thread and
+/// adopts the GGUF's embedded chat template into the stub ChatConfig. Mirrors
+/// `runDs4Serve`; all MLX-specific load steps are skipped.
+fn runLlamaServe(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    model_dir: []const u8,
+    host: []const u8,
+    port: u16,
+    ctx_size: u32,
+    timeout: u32,
+    reasoning_budget: i32,
+    max_resident_models: u32,
+    max_resident_mem: u64,
+    max_resident_mem_explicit: bool,
+    idle_evict_secs: ?u32,
+) !void {
+    const gguf_path_owned = try resolveGgufFile(io, allocator, model_dir);
+    defer allocator.free(gguf_path_owned);
+
+    // Effective context: the user's --ctx-size, else a safe 8192 default (we
+    // can't read the GGUF's trained context until the engine opens on the
+    // inference thread). Used for BOTH the llama session size (via the stub
+    // config's max_position_embeddings, read in runPrefillLlama) AND the
+    // server's context guard (server_config.max_context_size), so they agree.
+    const effective_ctx: u32 = if (ctx_size > 0) ctx_size else 8192;
+
+    log.info("mlx-serve {s} (llama.cpp engine, GGUF backend)\n", .{VERSION});
+    log.info("[args] model: {s}\n", .{gguf_path_owned});
+    log.info("[args] serve: {s}:{d}, ctx-size={d}\n", .{ host, port, effective_ctx });
+
+    // Stub ModelConfig. The llama path bypasses everything that consumes model
+    // architecture (Transformer, KV shapes, SSM, MoE); only model_type (echoed
+    // in /v1/models) and max_position_embeddings (session sizing) matter.
+    const config_storage = try allocator.create(model_mod.ModelConfig);
+    var config_owned_by_registry = false;
+    errdefer if (!config_owned_by_registry) allocator.destroy(config_storage);
+    config_storage.* = model_mod.ModelConfig{
+        .model_type = "gguf",
+        .weight_prefix = "model",
+        .head_dim = 128,
+        .max_position_embeddings = effective_ctx,
+        .is_encoder_only = false,
+    };
+
+    // Stub tokenizer — the llama engine owns the real GGUF vocab; chat handlers
+    // route through chat_mod.{encode,decode}ViaLlama when lm.llama_engine != null,
+    // so this never services encode/decode on the happy path.
+    const tok_storage = try allocator.create(tokenizer_mod.Tokenizer);
+    var tok_owned_by_registry = false;
+    errdefer if (!tok_owned_by_registry) {
+        tok_storage.deinit();
+        allocator.destroy(tok_storage);
+    };
+    var byte_map: [256]u21 = undefined;
+    var b: usize = 0;
+    while (b < 256) : (b += 1) byte_map[b] = @intCast(b);
+    tok_storage.* = .{
+        .vocab = std.StringHashMap(u32).init(allocator),
+        .id_to_token = std.AutoHashMap(u32, []const u8).init(allocator),
+        .merge_ranks = @TypeOf(tok_storage.merge_ranks).init(allocator),
+        .allocator = allocator,
+        .special_tokens = std.StringHashMap(u32).init(allocator),
+        .tok_type = .byte_level_bpe,
+        .byte_to_unicode = byte_map,
+        .unicode_to_byte = std.AutoHashMap(u21, u8).init(allocator),
+        .bos_id = null,
+        .eos_id = null,
+        .parsed_json = null,
+    };
+
+    // Stub chat config — template starts empty and is replaced with the GGUF's
+    // embedded template by doLoadLlamaOnInferenceThread once the engine opens.
+    const chat_config_storage = try allocator.create(chat_mod.ChatConfig);
+    var chat_config_owned_by_registry = false;
+    errdefer if (!chat_config_owned_by_registry) {
+        chat_config_storage.deinit();
+        allocator.destroy(chat_config_storage);
+    };
+    chat_config_storage.* = .{
+        .chat_template = try allocator.dupe(u8, ""),
+        .bos_token = null,
+        .eos_token = null,
+        .add_bos_token = false,
+        .allocator = allocator,
+    };
+
+    const model_id = blk: {
+        var p = gguf_path_owned;
+        while (p.len > 0 and p[p.len - 1] == '/') p = p[0 .. p.len - 1];
+        if (std.mem.lastIndexOfScalar(u8, p, '/')) |slash_idx| {
+            const name = p[slash_idx + 1 ..];
+            break :blk if (std.mem.endsWith(u8, name, ".gguf")) name[0 .. name.len - 5] else name;
+        }
+        break :blk p;
+    };
+
+    const effective_max_resident_mem: u64 = if (max_resident_mem_explicit) max_resident_mem else 0;
+    if (effective_max_resident_mem > 0) {
+        log.info("[registry] max_resident_models={d}, max_resident_mem={d:.1} GB\n", .{
+            max_resident_models,
+            @as(f64, @floatFromInt(effective_max_resident_mem)) / 1_073_741_824.0,
+        });
+    } else {
+        log.info("[registry] max_resident_models={d}, max_resident_mem=unlimited\n", .{max_resident_models});
+    }
+
+    const registry = try model_registry_mod.ModelRegistry.init(
+        allocator,
+        io,
+        null,
+        max_resident_models,
+        effective_max_resident_mem,
+        idle_evict_secs,
+    );
+    defer registry.deinit();
+
+    const gguf_bytes: ?u64 = blk: {
+        const slash = std.mem.lastIndexOfScalar(u8, gguf_path_owned, '/') orelse break :blk null;
+        const parent = gguf_path_owned[0..slash];
+        const name = gguf_path_owned[slash + 1 ..];
+        var dir = std.Io.Dir.openDirAbsolute(io, parent, .{}) catch break :blk null;
+        defer dir.close(io);
+        const st = dir.statFile(io, name, .{}) catch break :blk null;
+        break :blk @as(u64, @intCast(st.size));
+    };
+    const entry = try registry.registerStub(model_id, gguf_path_owned, gguf_bytes);
+    try registry.setDefault(model_id);
+
+    defer if (entry.config != null) {
+        config_owned_by_registry = true;
+        tok_owned_by_registry = true;
+        chat_config_owned_by_registry = true;
+    };
+
+    // Serial for v1 — each llama session owns an independent context (memory
+    // multiplies with concurrency); keep one in flight like the ds4 path.
+    server_mod.max_concurrent = 1;
+
+    const params = scheduler_mod.LoadParams{
+        .registry = registry,
+        .entry = entry,
+        .config = config_storage,
+        .tok = tok_storage,
+        .chat_config = chat_config_storage,
+        .model_dir = gguf_path_owned, // unused on the llama branch but kept symmetric
+        .drafter_dir = "",
+        .load_vision = false,
+        .warmup_eager = false,
+        .draft_block_size = 0,
+        .draft_block_size_explicit = false,
+        .kv_quant_config = transformer_mod.KVQuantConfig.dense,
+        .prefix_cache_capacity = 0,
+        .prefix_cache_mem_bytes = 0,
+        .llama_path = gguf_path_owned,
+    };
+
+    try server_mod.serve(io, allocator, params, config_storage, host, port, .{
+        .max_context_size = effective_ctx,
         .request_timeout_sec = timeout,
         .default_reasoning_budget = reasoning_budget,
         .default_enable_pld = false,

@@ -18,6 +18,8 @@ const SSMCacheEntrySnapshot = transformer_mod.SSMCacheEntrySnapshot;
 const ssmSnapshot = transformer_mod.ssmSnapshot;
 const ssmSnapshotDeinit = transformer_mod.ssmSnapshotDeinit;
 const ssmRestore = transformer_mod.ssmRestore;
+const SSMCheckpoint = transformer_mod.SSMCheckpoint;
+const captureSsmCheckpoint = transformer_mod.captureSsmCheckpoint;
 const DrafterModel = drafter_mod.DrafterModel;
 
 /// Module-level overrides for prefill behavior. Defaults match the original
@@ -141,8 +143,32 @@ pub const GenerationResult = struct {
     prefill_ns: u64 = 0,
     /// Wall-clock nanoseconds spent on decode (token generation).
     decode_ns: u64 = 0,
+    /// Prompt tokens served from a KV-cache prefix (hot prefix cache for MLX,
+    /// persistent-session prefix reuse for llama). `prompt_tokens - cached_tokens`
+    /// is what was actually run through the model this turn, so `prefill_tps`
+    /// reflects real compute rather than an inflated full-prompt rate.
+    cached_tokens: u32 = 0,
     logprobs: ?[]LogprobResult = null, // per-token logprobs (caller must free)
 };
+
+/// Throughput in tokens/sec. Returns 0 when no time elapsed so unmeasured paths
+/// report 0 rather than inf / NaN.
+pub fn tokensPerSec(tokens: u64, elapsed_ns: u64) f64 {
+    if (elapsed_ns == 0) return 0.0;
+    const tok_f: f64 = @floatFromInt(tokens);
+    const ns_f: f64 = @floatFromInt(elapsed_ns);
+    return tok_f * @as(f64, @floatFromInt(std.time.ns_per_s)) / ns_f;
+}
+
+/// True prefill compute throughput: divides by the tokens actually pushed through
+/// the model (prompt minus the prefix served from KV cache). A near-full cache
+/// hit therefore reports the small suffix's real rate, not an inflated
+/// full-prompt number. With `cached_tokens == 0` this is just the full-prompt
+/// rate, matching the pre-instrumentation behavior.
+pub fn prefillTokensPerSec(prompt_tokens: u32, cached_tokens: u32, prefill_ns: u64) f64 {
+    const uncached: u32 = if (prompt_tokens > cached_tokens) prompt_tokens - cached_tokens else 0;
+    return tokensPerSec(uncached, prefill_ns);
+}
 
 /// Step-based generator. Call `init` to prefill, then `next` per token.
 /// Uses a fully-lazy async pipeline matching mlx-lm: sample + next forward are
@@ -226,6 +252,22 @@ pub const Generator = struct {
     drafter_attempted: u64 = 0,
     /// Stats: cumulative draft tokens accepted (excluding always-accepted t1).
     drafter_accepted_tokens: u64 = 0,
+
+    // ── Phase 1: SSM checkpoints captured during prefill ──
+    /// Owned SSM-state snapshots taken at stride-aligned positions during
+    /// chunked prefill. Drained by the scheduler in `commitSlotIfApplicable`
+    /// via `takeSsmCheckpoints()`. Empty on non-hybrid models or when
+    /// `ssm_checkpoint_stride == 0`. Allocator: the Generator's `allocator`
+    /// (passed to `initWithOptions`); the same allocator must be passed to
+    /// `deinit` for any checkpoint that wasn't taken.
+    ssm_checkpoints: std.ArrayList(SSMCheckpoint) = std.ArrayList(SSMCheckpoint).empty,
+    /// Allocator used for `ssm_checkpoints` storage and each checkpoint's
+    /// per-layer slice. Set during `initWithOptions`. We track it separately
+    /// from the `allocator` argument to `deinit` because `takeSsmCheckpoints`
+    /// transfers ownership: the consumer (HotPrefixCache) must use the SAME
+    /// allocator to free, since the layer-slice backing memory was allocated
+    /// here.
+    ssm_checkpoint_alloc: ?std.mem.Allocator = null,
 
     // ── Runtime acceptance gate ──
     // Set to true mid-request when the per-request acceptance rate
@@ -406,6 +448,27 @@ pub const Generator = struct {
         /// behavior to the regular sampling path. Has no effect when
         /// `pld_enabled` or `drafter_enabled` is true.
         skip_lazy_preforward: bool = false,
+        /// Phase 1 (performance-plan): during prefill, capture an SSM
+        /// checkpoint every `ssm_checkpoint_stride` tokens. 0 = disabled.
+        /// Snapshots land in `Generator.ssm_checkpoints` for the caller to
+        /// drain into the hot prefix cache via `takeSsmCheckpoints()`. Only
+        /// effective when the model has hybrid layers (otherwise the
+        /// `ssm_entries` slice is empty and snapshots become no-op stubs).
+        /// Chunked prefill aligns chunk ends to stride positions so each
+        /// snapshot reflects a coherent state.
+        ssm_checkpoint_stride: u32 = 0,
+        /// Cap on the number of checkpoints retained. The first stride-aligned
+        /// position is always captured; if more would land than `ssm_checkpoint_max`,
+        /// the oldest checkpoints are dropped to keep the latest run of
+        /// positions. 0 = unlimited (rely on the hot-cache byte budget to bound).
+        ssm_checkpoint_max: u32 = 16,
+        /// Phase 1: absolute position of the FIRST token in `prompt_ids`.
+        /// On a cold prefill this is 0. On the warm path (where the
+        /// scheduler restored some prefix and now forwards only the tail),
+        /// callers pass `hot_matched` so the captured checkpoints stamp
+        /// absolute positions usable by future warm-path lookups against
+        /// the full prompt.
+        ssm_checkpoint_pos_offset: usize = 0,
     };
 
     /// Selects the source slice that `initWithOptions` will dupe into
@@ -480,14 +543,57 @@ pub const Generator = struct {
         var chunked_ns: u64 = 0;
         var eval_ns: u64 = 0;
         var n_chunks: usize = 0;
+
+        // Phase 1: SSM checkpointing during prefill. When enabled, the chunked
+        // prefill loop forces a chunk boundary at every multiple of
+        // `ssm_checkpoint_stride`, then snapshots `ctx.ssm_entries` after that
+        // chunk evaluates. Snapshots accumulate in `Generator.ssm_checkpoints`
+        // for the scheduler to drain in `commitSlotIfApplicable`. Plain-attn
+        // models have an empty `ssm_entries` slice, so this becomes a no-op
+        // even at stride > 0 — but we still bail early so we never allocate
+        // empty checkpoints.
+        var ssm_checkpoints: std.ArrayList(SSMCheckpoint) = std.ArrayList(SSMCheckpoint).empty;
+        errdefer {
+            for (ssm_checkpoints.items) |*cp| cp.deinit(allocator);
+            ssm_checkpoints.deinit(allocator);
+        }
+        const want_ssm_cp =
+            options.ssm_checkpoint_stride > 0 and
+            ctx.ssm_entries != null and
+            ctx.ssm_entries.?.len > 0;
+        const ssm_cp_stride: usize = if (want_ssm_cp) @intCast(options.ssm_checkpoint_stride) else 0;
+        // Absolute KV position of `prompt_ids[0]`. Warm-path callers (the
+        // scheduler after restoring a checkpoint) pass the matched prefix
+        // length so the snapshots stamp positions valid in the full original
+        // sequence, not relative offsets inside the tail-only prefill.
+        const ssm_cp_offset: usize = options.ssm_checkpoint_pos_offset;
+
         if (prompt_ids.len > 1) {
             const prefix_len = prompt_ids.len - 1;
             const has_vision = ctx.vision_embeddings != null;
-            const chunk_size = if (has_vision) prefix_len else PREFILL_CHUNK;
+            const default_chunk = if (has_vision) prefix_len else PREFILL_CHUNK;
 
             var pos: usize = 0;
             while (pos < prefix_len) {
-                const end = @min(pos + chunk_size, prefix_len);
+                // Pick this chunk's end. Normal path: hit the configured chunk
+                // size. Phase 1 path: if a checkpoint stride boundary lands
+                // inside the would-be chunk, shrink the chunk so it ends
+                // exactly on that boundary. That gives us an snapshot-point
+                // every `stride` tokens without changing the model's seen
+                // input — the forward result is identical to the unchunked
+                // version because attention is causal and SSM/conv update
+                // chunk-locally. Boundary alignment is in ABSOLUTE position
+                // (pos + offset), so the saved snapshot list is correct for
+                // the full prompt, not the truncated tail.
+                var end = @min(pos + default_chunk, prefix_len);
+                if (want_ssm_cp) {
+                    const abs_pos = pos + ssm_cp_offset;
+                    const abs_end = end + ssm_cp_offset;
+                    const next_boundary_abs = ((abs_pos / ssm_cp_stride) + 1) * ssm_cp_stride;
+                    if (next_boundary_abs > abs_pos and next_boundary_abs < abs_end) {
+                        end = next_boundary_abs - ssm_cp_offset;
+                    }
+                }
                 const chunk_len: c_int = @intCast(end - pos);
                 const chunk_shape = [_]c_int{ 1, chunk_len };
                 const chunk_input = mlx.mlx_array_new_data(@ptrCast(&ids_i32[pos]), &chunk_shape, 2, .int32);
@@ -508,13 +614,87 @@ pub const Generator = struct {
                         _ = mlx.mlx_vector_array_append_value(eval_vec, entry.keys);
                         _ = mlx.mlx_vector_array_append_value(eval_vec, entry.values);
                     }
+                    // Phase 1: also force SSM state to materialize so the
+                    // snapshot we take below holds a concrete tensor, not a
+                    // lazy node that would re-execute the prefill graph if
+                    // anyone reads from it later.
+                    const abs_end_for_cp = end + ssm_cp_offset;
+                    const should_capture = want_ssm_cp and ssm_cp_stride > 0 and abs_end_for_cp % ssm_cp_stride == 0;
+                    if (should_capture) {
+                        for (ctx.ssm_entries.?) |*ssm| {
+                            if (!ssm.initialized) continue;
+                            if (ssm.conv_state.ctx != null) {
+                                _ = mlx.mlx_vector_array_append_value(eval_vec, ssm.conv_state);
+                            }
+                            if (ssm.ssm_state.ctx != null) {
+                                _ = mlx.mlx_vector_array_append_value(eval_vec, ssm.ssm_state);
+                            }
+                        }
+                    }
                     _ = mlx.mlx_eval(eval_vec);
                 }
                 _ = mlx.mlx_clear_cache();
                 if (trace_enabled) eval_ns += prefill_sw.read() - eval_start_ns;
 
+                // Phase 1: snapshot SSM state at stride-aligned boundaries.
+                // We snapshot AFTER the eval above so the underlying buffers
+                // are realized; the snapshot is just a refcount-share of the
+                // already-resident state.
+                const abs_end_for_cp2 = end + ssm_cp_offset;
+                if (want_ssm_cp and ssm_cp_stride > 0 and abs_end_for_cp2 % ssm_cp_stride == 0) {
+                    const cp = try captureSsmCheckpoint(allocator, ctx.ssm_entries.?, abs_end_for_cp2);
+                    try ssm_checkpoints.append(allocator, cp);
+                    // Keep the buffer bounded — drop the oldest if we've
+                    // accumulated more than the configured max. Front-removal
+                    // is O(n) but `n` is tiny (≤ ssm_checkpoint_max). We keep
+                    // the latest positions because they're closer to the
+                    // end-of-prompt, which is where most multi-turn warm
+                    // requests match.
+                    if (options.ssm_checkpoint_max > 0 and
+                        ssm_checkpoints.items.len > options.ssm_checkpoint_max)
+                    {
+                        var oldest = ssm_checkpoints.orderedRemove(0);
+                        oldest.deinit(allocator);
+                    }
+                }
+
                 pos = end;
                 n_chunks += 1;
+            }
+
+            // Phase 1: always-on snapshot at the post-prefill position
+            // (= prefix_len, i.e., prompt_ids.len - 1). The stride loop
+            // captures snapshots at [stride, 2*stride, ...]; this final
+            // capture covers the most common warm-path case where the next
+            // turn's prompt fully matches turn-1's prompt and matched lands
+            // at prompt_ids.len. Without this, a stride=256 setup with a
+            // 750-token prompt could only restore at position 512 (losing
+            // ~234 tokens of potential reuse to the next stride boundary).
+            // With it, the cache restores to position 749 (~99% of the
+            // prompt) and only the last token + new tail re-forwards.
+            // Skipped on `prompt_ids.len == 1` (no prefill chunks ran).
+            if (want_ssm_cp and prefix_len > 0) {
+                const final_abs = prefix_len + ssm_cp_offset;
+                // Skip if we already captured at this exact position (the
+                // chunked loop would have done so when prefix_len happens
+                // to be a stride multiple).
+                const already_have = ssm_checkpoints.items.len > 0 and
+                    ssm_checkpoints.items[ssm_checkpoints.items.len - 1].pos == final_abs;
+                if (!already_have) {
+                    // SSM state is already materialized — the chunked loop
+                    // evaluated it at every chunk boundary. The final chunk
+                    // may have been a stride-aligned one (already evaluated)
+                    // or a partial tail (also evaluated). The snapshot is a
+                    // cheap refcount-share.
+                    const cp = try captureSsmCheckpoint(allocator, ctx.ssm_entries.?, final_abs);
+                    try ssm_checkpoints.append(allocator, cp);
+                    if (options.ssm_checkpoint_max > 0 and
+                        ssm_checkpoints.items.len > options.ssm_checkpoint_max)
+                    {
+                        var oldest = ssm_checkpoints.orderedRemove(0);
+                        oldest.deinit(allocator);
+                    }
+                }
             }
         }
 
@@ -561,6 +741,18 @@ pub const Generator = struct {
             _ = mlx.mlx_array_free(captured_hidden);
         };
 
+        // Attach the SSM-checkpoint buffer to whichever Generator variant
+        // we're about to return. Clears the local list so the errdefer above
+        // doesn't double-free. All four init paths below call this once
+        // before returning their Generator.
+        const attachCp = struct {
+            fn f(g: *Generator, list: *std.ArrayList(SSMCheckpoint), a: std.mem.Allocator) void {
+                g.ssm_checkpoints = list.*;
+                g.ssm_checkpoint_alloc = a;
+                list.* = std.ArrayList(SSMCheckpoint).empty;
+            }
+        }.f;
+
         // Constrained generation skips the lazy first-sample fast path: we cannot
         // sample the first token until we have applied the grammar mask, and we
         // cannot pipeline because grammar advancement depends on the realized id.
@@ -588,6 +780,7 @@ pub const Generator = struct {
             };
             gen.pending_logits = logits;
             gen.has_pending_logits = true;
+            attachCp(&gen, &ssm_checkpoints, allocator);
             return gen;
         }
 
@@ -604,7 +797,7 @@ pub const Generator = struct {
             try mlx.check(mlx.mlx_array_item_int32(&first_val, sample_lazy));
             _ = mlx.mlx_array_free(sample_lazy);
 
-            const gen = Generator{
+            var gen = Generator{
                 .xfm = xfm,
                 .ctx = ctx,
                 .tok = tok,
@@ -631,6 +824,7 @@ pub const Generator = struct {
             // pending_logits/pending_token left empty — the lazy pipeline is
             // skipped under PLD / drafter. The speculative `next*` paths drive
             // every subsequent step with predictable cache offset.
+            attachCp(&gen, &ssm_checkpoints, allocator);
             return gen;
         }
 
@@ -647,7 +841,7 @@ pub const Generator = struct {
             try mlx.check(mlx.mlx_array_item_int32(&first_val, sample_lazy));
             _ = mlx.mlx_array_free(sample_lazy);
 
-            const gen = Generator{
+            var gen = Generator{
                 .xfm = xfm,
                 .ctx = ctx,
                 .tok = tok,
@@ -669,6 +863,7 @@ pub const Generator = struct {
                 .prompt_ids_owned = prompt_owned,
                 .prompt_ids_alloc = allocator,
             };
+            attachCp(&gen, &ssm_checkpoints, allocator);
             return gen;
         }
 
@@ -719,6 +914,7 @@ pub const Generator = struct {
         gen.pending_logits = next_logits;
         gen.has_pending_logits = true;
 
+        attachCp(&gen, &ssm_checkpoints, allocator);
         return gen;
     }
 
@@ -743,7 +939,35 @@ pub const Generator = struct {
             self.prompt_ids_owned = &.{};
             self.prompt_ids_alloc = null;
         }
+        // Free any SSM checkpoints the caller didn't claim. Each layer-slice
+        // was allocated by `ssm_checkpoint_alloc` (= the allocator passed to
+        // `initWithOptions`), so we use that one. The ArrayList itself was
+        // also created with that allocator.
+        if (self.ssm_checkpoint_alloc) |a| {
+            for (self.ssm_checkpoints.items) |*cp| cp.deinit(a);
+            self.ssm_checkpoints.deinit(a);
+            self.ssm_checkpoints = std.ArrayList(SSMCheckpoint).empty;
+            self.ssm_checkpoint_alloc = null;
+        } else {
+            // Defensive: if init never set it, the list is empty — but the
+            // backing ArrayList state may still need a deinit call. Use the
+            // passed allocator as a fallback.
+            self.ssm_checkpoints.deinit(allocator);
+            self.ssm_checkpoints = std.ArrayList(SSMCheckpoint).empty;
+        }
         self.generated_ids.deinit(allocator);
+    }
+
+    /// Transfer ownership of accumulated SSM checkpoints to the caller.
+    /// Returns an owned slice; caller must free each `SSMCheckpoint` via
+    /// `cp.deinit(allocator)` and the slice itself via `allocator.free`,
+    /// where `allocator` is the same one passed to `initWithOptions`.
+    /// After return, `ssm_checkpoints` is empty and the Generator owns
+    /// nothing related to checkpoints.
+    pub fn takeSsmCheckpoints(self: *Generator) []SSMCheckpoint {
+        const a = self.ssm_checkpoint_alloc orelse return &[_]SSMCheckpoint{};
+        const out = self.ssm_checkpoints.toOwnedSlice(a) catch return &[_]SSMCheckpoint{};
+        return out;
     }
 
     /// Resolve the deferred pending token: eval the lazy array and extract the u32 value.
@@ -3007,6 +3231,35 @@ test "GenerationResult fields" {
     try testing.expectEqual(@as(u32, 3), result.completion_tokens);
     try testing.expectEqualStrings("stop", result.finish_reason);
     try testing.expect(result.logprobs == null);
+}
+
+test "tokensPerSec basic and zero-time" {
+    // 100 tokens in 1 second = 100 tok/s.
+    try testing.expectApproxEqAbs(@as(f64, 100.0), tokensPerSec(100, std.time.ns_per_s), 1e-6);
+    // 50 tokens in 0.5s = 100 tok/s.
+    try testing.expectApproxEqAbs(@as(f64, 100.0), tokensPerSec(50, std.time.ns_per_s / 2), 1e-6);
+    // Zero elapsed → 0, never inf/NaN.
+    try testing.expectEqual(@as(f64, 0.0), tokensPerSec(100, 0));
+}
+
+test "prefillTokensPerSec divides by uncached tokens" {
+    // Cold prefill: 754 tokens, none cached, 2s → 377 tok/s.
+    try testing.expectApproxEqAbs(
+        @as(f64, 377.0),
+        prefillTokensPerSec(754, 0, 2 * std.time.ns_per_s),
+        1e-6,
+    );
+    // Warm prefill: 754-token prompt, 700 cached, only 54 ran. A fast 54-token
+    // suffix in 0.1s is 540 tok/s — NOT 7540 (the inflated full-prompt rate).
+    try testing.expectApproxEqAbs(
+        @as(f64, 540.0),
+        prefillTokensPerSec(754, 700, std.time.ns_per_s / 10),
+        1e-6,
+    );
+    // Full cache hit: 0 uncached → 0 tok/s (no compute happened).
+    try testing.expectEqual(@as(f64, 0.0), prefillTokensPerSec(754, 754, std.time.ns_per_s));
+    // Defensive: cached > prompt (shouldn't happen) clamps to 0, no underflow.
+    try testing.expectEqual(@as(f64, 0.0), prefillTokensPerSec(10, 20, std.time.ns_per_s));
 }
 
 test "maskForLogitVocab pads and truncates to logits size" {

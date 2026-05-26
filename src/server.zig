@@ -15,6 +15,7 @@ const prefix_cache_mod = @import("prefix_cache.zig");
 const scheduler_mod = @import("scheduler.zig");
 const ds4_ffi = @import("ds4_ffi.zig");
 const model_registry_mod = @import("model_registry.zig");
+const arch_llama = @import("arch/llama.zig");
 const stb = @cImport({ @cInclude("stb_image.h"); });
 const webp = @cImport({ @cInclude("webp/decode.h"); });
 const metrics = @import("status.zig");
@@ -328,6 +329,33 @@ pub var prefix_cache_capacity: u32 = 1;
 /// from `--prefix-cache-entries` still applies).
 pub var prefix_cache_mem_bytes: u64 = 2 * 1024 * 1024 * 1024;
 
+/// Phase 1 (performance-plan): SSM/conv state snapshot stride during prefill,
+/// in tokens. Non-zero values enable multi-turn warm reuse on hybrid SSM
+/// architectures (Qwen3.5/3.6 GatedDeltaNet, Nemotron-H Mamba2, LFM2.5
+/// gated-conv). Set to 0 to disable (fall back to pre-Phase-1 behavior:
+/// hybrid models bypass the hot prefix cache entirely). Override via
+/// `--ssm-checkpoint-stride N`. Default 256: measured on M4 with Qwen3.5-4B,
+/// stride 256 keeps cold-prefill overhead under 3% (5 chunks vs 1 for 1k
+/// prompts) while still giving stride-aligned warm reuse to within ~256
+/// tokens of the matched prefix — typically saving 80-95% of multi-turn
+/// prefill compute. Stride 128 gives finer alignment at ~5% cold cost;
+/// stride 512 is essentially zero cold overhead but reuses less.
+pub var ssm_checkpoint_stride: u32 = 256;
+
+/// Phase 1: cap on the number of checkpoints retained per request. Snapshots
+/// past this drop the oldest (front of list) to keep memory bounded on very
+/// long prompts. 0 = unlimited (rely on the prefix-cache byte budget alone).
+pub var ssm_checkpoint_max: u32 = 32;
+
+/// Phase 5 (performance-plan) #2: KV-cache quantization for the embedded
+/// llama.cpp engine. `off` = F16 (libllama default); `q8` halves the KV
+/// bytes (Q8_0, near-lossless); `q4` quarters them (Q4_0, some quality
+/// impact). Non-default settings automatically enable flash attention in
+/// the shim because llama.cpp's plain SDPA only supports F16/F32 KV.
+/// Set via `--llama-kv-quant {off,q8,q4}`. Applies to every llama.cpp
+/// session created after this is set (i.e., from the next model load).
+pub var llama_kv_quant: arch_llama.LlamaKvQuant = .off;
+
 /// Plan 01 — continuous batching: maximum concurrent in-flight requests sharing
 /// the inference thread's batched-decode pass. Set via `--max-concurrent N`.
 /// Default 1 = legacy single-slot behavior (no scheduler engagement, every
@@ -381,6 +409,9 @@ fn decodeTokens(
 ) ![]u8 {
     if (lm.ds4_engine) |engine| {
         return chat_mod.decodeViaDs4(allocator, engine, ids);
+    }
+    if (lm.llama_engine) |engine| {
+        return chat_mod.decodeViaLlama(allocator, engine, ids);
     }
     return tok.decode(allocator, ids, strip_leading_space);
 }
@@ -450,14 +481,27 @@ pub fn serve(
     // using the per-LoadParams capacity + byte budget. Surface a friendly
     // log line so users see whether the cache engaged.
     if (scheduler.hot_prefix_cache != null) {
+        const ssm_note: []const u8 = if (config.has_hybrid_layers)
+            " [hybrid: SSM checkpoints]"
+        else
+            "";
         if (prefix_cache_mem_bytes > 0) {
             const cap_mb = @as(f64, @floatFromInt(prefix_cache_mem_bytes)) / (1024.0 * 1024.0);
-            log.info("Hot prefix cache: ENABLED (capacity={d}, mem-cap={d:.1} MB)\n", .{ prefix_cache_capacity, cap_mb });
+            log.info("Hot prefix cache: ENABLED (capacity={d}, mem-cap={d:.1} MB){s}\n", .{ prefix_cache_capacity, cap_mb, ssm_note });
         } else {
-            log.info("Hot prefix cache: ENABLED (capacity={d}, mem-cap=unlimited)\n", .{prefix_cache_capacity});
+            log.info("Hot prefix cache: ENABLED (capacity={d}, mem-cap=unlimited){s}\n", .{ prefix_cache_capacity, ssm_note });
+        }
+        if (config.has_hybrid_layers) {
+            log.info("  ssm-checkpoint-stride={d} tokens, max={d}/entry\n", .{ ssm_checkpoint_stride, ssm_checkpoint_max });
         }
     } else if (prefix_cache_capacity > 0) {
-        log.info("Hot prefix cache: requested capacity={d} but model is hybrid (recurrent state) — disabled\n", .{prefix_cache_capacity});
+        if (config.has_hybrid_layers and ssm_checkpoint_stride == 0) {
+            log.info("Hot prefix cache: requested capacity={d} but model is hybrid and --ssm-checkpoint-stride is 0 — disabled\n", .{prefix_cache_capacity});
+        } else if (config.full_attention_interval > 0) {
+            log.info("Hot prefix cache: requested capacity={d} but model uses full-attention-interval — disabled\n", .{prefix_cache_capacity});
+        } else {
+            log.info("Hot prefix cache: requested capacity={d} but disabled by scheduler\n", .{prefix_cache_capacity});
+        }
     }
 
     // `--max-concurrent N` is honored when the model can ride the batched
@@ -1325,6 +1369,13 @@ fn handleProps(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel) !v
         const total: u64 = gguf_bytes + ctx_mem.total_bytes;
         active_mem = @intCast(total);
         peak_mem = active_mem;
+    } else if (lm.llama_engine != null) {
+        // llama.cpp owns its own (Metal) allocations outside MLX's counters.
+        // Use the GGUF on-disk size as the headline figure so the app's GPU
+        // memory bar isn't stuck at 0/0; KV/scratch isn't separately exposed.
+        const gguf_bytes: u64 = lm.bytes_on_disk orelse 0;
+        active_mem = @intCast(gguf_bytes);
+        peak_mem = active_mem;
     } else {
         _ = mlx.mlx_get_active_memory(&active_mem);
         _ = mlx.mlx_get_peak_memory(&peak_mem);
@@ -1544,7 +1595,10 @@ fn handleEmbeddings(
     body: []const u8,
     lm: *LoadedModel,
 ) !void {
-    const xfm = lm.transformer.?;
+    // Optional: engine-backed (GGUF/ds4) models have no MLX transformer. The
+    // scheduler path doesn't need it; only the no-scheduler fallback does, and
+    // it guards on this being present.
+    const xfm_opt = lm.transformer;
     const tok = lm.tokenizer.?;
     const config = lm.config.?;
     const gen_mod = @import("generate.zig");
@@ -1625,6 +1679,10 @@ fn handleEmbeddings(
                 return;
             };
         } else fallback: {
+            const xfm = xfm_opt orelse {
+                try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Embeddings require an MLX (safetensors) model; this model has no encoder", null);
+                return;
+            };
             try xfm.resetCache();
             break :fallback gen_mod.computeEmbedding(allocator, xfm, ids) catch |err| {
                 log.err("  embedding error: {}\n", .{err});
@@ -1692,6 +1750,12 @@ fn handleTokenize(
 
     const ids = if (lm.ds4_engine) |engine| blk: {
         const i32_ids = try engine.tokenizeText(allocator, content.?);
+        defer allocator.free(i32_ids);
+        const out = try allocator.alloc(u32, i32_ids.len);
+        for (i32_ids, 0..) |t, i| out[i] = @intCast(t);
+        break :blk out;
+    } else if (lm.llama_engine) |engine| blk: {
+        const i32_ids = try engine.tokenizeText(allocator, content.?, true);
         defer allocator.free(i32_ids);
         const out = try allocator.alloc(u32, i32_ids.len);
         for (i32_ids, 0..) |t, i| out[i] = @intCast(t);
@@ -1772,7 +1836,10 @@ fn handleChatCompletions(
     body: []const u8,
     lm: *LoadedModel,
 ) !void {
-    const xfm = lm.transformer.?;
+    // NOTE: no `lm.transformer.?` here — this handler also serves engine-backed
+    // models (GGUF/llama, ds4) whose `transformer` is null. The only MLX-specific
+    // gate below reads `config.has_hybrid_layers` (valid for every model incl. the
+    // GGUF stub), so the transformer is never needed at this level.
     const tok = lm.tokenizer.?;
     const chat_config = lm.chat_config.?;
     const config = lm.config.?;
@@ -2166,7 +2233,7 @@ fn handleChatCompletions(
         log.info("  drafter=disabled (logprobs requested)\n", .{});
         enable_drafter = false;
     }
-    if (enable_drafter and xfm.config.has_hybrid_layers) {
+    if (enable_drafter and config.has_hybrid_layers) {
         log.info("  drafter=disabled (hybrid SSM architecture not yet supported for multi-token verify)\n", .{});
         enable_drafter = false;
     }
@@ -2208,6 +2275,8 @@ fn handleChatCompletions(
     // doesn't model `tools` natively (which is the DSV4 case).
     var prompt_ids_raw = if (lm.ds4_engine) |engine|
         try chat_mod.encodeChatViaDs4(allocator, engine, messages.items, tools_json, tool_choice_instruction, enable_thinking)
+    else if (lm.llama_engine) |engine|
+        try chat_mod.encodeChatViaLlama(allocator, engine, chat_config, messages.items, tools_json, tool_choice_instruction, enable_thinking)
     else
         try chat_mod.formatChat(allocator, tok, messages.items, chat_config, tools_json, tool_choice_instruction, enable_thinking);
 
@@ -2457,6 +2526,12 @@ fn handleCompletions(
         const out = try allocator.alloc(u32, i32_ids.len);
         for (i32_ids, 0..) |t, i| out[i] = @intCast(t);
         break :blk out;
+    } else if (lm.llama_engine) |engine| blk: {
+        const i32_ids = try engine.tokenizeText(allocator, prompt_text.?, true);
+        defer allocator.free(i32_ids);
+        const out = try allocator.alloc(u32, i32_ids.len);
+        for (i32_ids, 0..) |t, i| out[i] = @intCast(t);
+        break :blk out;
     } else try tok.encode(allocator, prompt_text.?);
     defer allocator.free(prompt_ids);
 
@@ -2529,8 +2604,10 @@ fn handleNonStreamingCompletion(
     }
 
     const elapsed_ms = timer.read() / std.time.ns_per_ms;
-    log.info("  <- {d}+{d} tokens ({d}ms) [prefill: {d:.1} tok/s, decode: {d:.1} tok/s] [{s}]\n", .{
-        result.prompt_tokens, result.completion_tokens, elapsed_ms, result.prefill_tps, result.decode_tps, finish_reason,
+    var perf_buf: [160]u8 = undefined;
+    const perf = formatPerfBracket(&perf_buf, result.prompt_tokens, result.cached_tokens, result.completion_tokens, result.prefill_ns, result.decode_ns);
+    log.info("  <- {d}+{d} tokens ({d}ms) [{s}] [{s}]\n", .{
+        result.prompt_tokens, result.completion_tokens, elapsed_ms, perf, finish_reason,
     });
 
     const escaped_text = jsonEscape(allocator, final_text) catch "\"\"";
@@ -2593,10 +2670,6 @@ fn handleStreamingCompletion(
     });
     var ts = StreamingTokenStream.initFromSlot(slot_handle.?, .regular, eos_token_ids);
     defer ts.deinit(allocator);
-
-    // Scheduler emits per-tick prefill log lines; we don't have a usable
-    // synchronous timing here, so report 0 tok/s for the streaming summary.
-    const prefill_tps: f64 = 0.0;
 
     // SSE headers
     const header =
@@ -2707,14 +2780,11 @@ fn handleStreamingCompletion(
         try stream.writeAll("data: [DONE]\n\n");
     }
 
-    const decode_ns = timer.read();
-    const decode_tps: f64 = if (decode_ns > 0)
-        @as(f64, @floatFromInt(ts.completion_tokens)) * @as(f64, @floatFromInt(std.time.ns_per_s)) / @as(f64, @floatFromInt(decode_ns))
-    else
-        0.0;
-    const elapsed_ms = decode_ns / std.time.ns_per_ms;
-    log.info("  <- {d}+{d} tokens streamed ({d}ms) [prefill: {d:.1} tok/s, decode: {d:.1} tok/s] [{s}]\n", .{
-        total_prompt, ts.completion_tokens, elapsed_ms, prefill_tps, decode_tps, finish_reason,
+    const elapsed_ms = timer.read() / std.time.ns_per_ms;
+    var perf_buf: [160]u8 = undefined;
+    const perf = formatPerfBracket(&perf_buf, ts.prompt_tokens, ts.cached_tokens, ts.completion_tokens, ts.prefill_ns, ts.decode_ns);
+    log.info("  <- {d}+{d} tokens streamed ({d}ms) [{s}] [{s}]\n", .{
+        total_prompt, ts.completion_tokens, elapsed_ms, perf, finish_reason,
     });
 }
 
@@ -2783,17 +2853,8 @@ fn nonStreamingViaScheduler(
     // The scheduler measures prefill_ns / decode_ns per-slot directly. Pull
     // those instead of the old single-wall-clock approximation, which
     // double-counted total time into both phases.
-    const ns_per_s_f: f64 = @as(f64, @floatFromInt(std.time.ns_per_s));
-    const prompt_len_f: f64 = @as(f64, @floatFromInt(slot.prompt_tokens));
-    const completion_len_f: f64 = @as(f64, @floatFromInt(slot.completion_tokens));
-    const prefill_tps: f64 = if (slot.prefill_ns > 0)
-        prompt_len_f * ns_per_s_f / @as(f64, @floatFromInt(slot.prefill_ns))
-    else
-        0.0;
-    const decode_tps: f64 = if (slot.decode_ns > 0)
-        completion_len_f * ns_per_s_f / @as(f64, @floatFromInt(slot.decode_ns))
-    else
-        0.0;
+    const prefill_tps = generate_mod.prefillTokensPerSec(slot.prompt_tokens, slot.cached_tokens, slot.prefill_ns);
+    const decode_tps = generate_mod.tokensPerSec(slot.completion_tokens, slot.decode_ns);
 
     const strip_leading = tok.tok_type == .sentencepiece_bpe;
     const text = try decodeTokens(allocator, lm, tok, output_ids.items, strip_leading);
@@ -2817,6 +2878,7 @@ fn nonStreamingViaScheduler(
         .decode_tps = decode_tps,
         .prefill_ns = slot.prefill_ns,
         .decode_ns = slot.decode_ns,
+        .cached_tokens = slot.cached_tokens,
         .logprobs = logprobs_slice,
     };
 }
@@ -2928,8 +2990,10 @@ fn handleNonStreamingGeneration(
                 allocator.free(tool_calls);
             }
 
-            log.info("  <- {d}+{d} tokens ({d}ms) [prefill: {d:.1} tok/s, decode: {d:.1} tok/s] [tool_calls: {d}]\n", .{
-                result.prompt_tokens, result.completion_tokens, elapsed_ms, result.prefill_tps, result.decode_tps, tool_calls.len,
+            var tc_perf_buf: [160]u8 = undefined;
+            const tc_perf = formatPerfBracket(&tc_perf_buf, result.prompt_tokens, result.cached_tokens, result.completion_tokens, result.prefill_ns, result.decode_ns);
+            log.info("  <- {d}+{d} tokens ({d}ms) [{s}] [tool_calls: {d}]\n", .{
+                result.prompt_tokens, result.completion_tokens, elapsed_ms, tc_perf, tool_calls.len,
             });
 
             // Build tool_calls JSON array
@@ -2966,7 +3030,7 @@ fn handleNonStreamingGeneration(
             }
             defer if (tc_reasoning_allocated) allocator.free(tc_reasoning_json);
 
-            const tc_timings = try formatTimingsObject(allocator, result.prompt_tokens, result.completion_tokens, result.prefill_ns, result.decode_ns);
+            const tc_timings = try formatTimingsObject(allocator, result.prompt_tokens, result.cached_tokens, result.completion_tokens, result.prefill_ns, result.decode_ns);
             defer allocator.free(tc_timings);
             const tc_timings_field = if (tc_timings.len > 0)
                 try std.fmt.allocPrint(allocator, ",\"timings\":{s}", .{tc_timings})
@@ -2993,8 +3057,10 @@ fn handleNonStreamingGeneration(
         }
     }
 
-    log.info("  <- {d}+{d} tokens ({d}ms) [prefill: {d:.1} tok/s, decode: {d:.1} tok/s] [{s}]\n", .{
-        result.prompt_tokens, result.completion_tokens, elapsed_ms, result.prefill_tps, result.decode_tps, finish_reason,
+    var perf_buf: [160]u8 = undefined;
+    const perf = formatPerfBracket(&perf_buf, result.prompt_tokens, result.cached_tokens, result.completion_tokens, result.prefill_ns, result.decode_ns);
+    log.info("  <- {d}+{d} tokens ({d}ms) [{s}] [{s}]\n", .{
+        result.prompt_tokens, result.completion_tokens, elapsed_ms, perf, finish_reason,
     });
 
     // Split thinking content from response
@@ -3028,7 +3094,7 @@ fn handleNonStreamingGeneration(
     }
     defer if (reasoning_allocated) allocator.free(reasoning_json);
 
-    const timings_obj = try formatTimingsObject(allocator, result.prompt_tokens, result.completion_tokens, result.prefill_ns, result.decode_ns);
+    const timings_obj = try formatTimingsObject(allocator, result.prompt_tokens, result.cached_tokens, result.completion_tokens, result.prefill_ns, result.decode_ns);
     defer allocator.free(timings_obj);
     const timings_field = if (timings_obj.len > 0)
         try std.fmt.allocPrint(allocator, ",\"timings\":{s}", .{timings_obj})
@@ -3096,6 +3162,7 @@ const StreamingTokenStream = struct {
     /// these instead of touching the underlying gen/slot directly so the same
     /// post-generation code works for both legacy and scheduler paths.
     prompt_tokens: u32 = 0,
+    cached_tokens: u32 = 0,
     completion_tokens: u32 = 0,
     finish_reason: []const u8 = "stop",
     /// Wall-clock ns for prefill / decode (scheduler path only; the legacy
@@ -3136,6 +3203,7 @@ const StreamingTokenStream = struct {
     fn finalize(self: *StreamingTokenStream) void {
         if (self.slot) |s| {
             self.prompt_tokens = s.prompt_tokens;
+            self.cached_tokens = s.cached_tokens;
             self.completion_tokens = s.completion_tokens;
             self.finish_reason = s.finish_reason;
             self.prefill_ns = s.prefill_ns;
@@ -3353,11 +3421,6 @@ fn handleStreamingGeneration(
     });
     var ts = StreamingTokenStream.initFromSlot(slot_handle.?, stream_mode, eos_token_ids);
     defer ts.deinit(allocator);
-
-    // Scheduler reports prefill_tps on slot completion via `ts.prefill_tps`
-    // (populated in `finalize`). Per-tick log lines emitted by runPrefill
-    // remain the authoritative source.
-    const prefill_tps: f64 = 0.0;
 
     // Send SSE headers (no Content-Length — we stream until done)
     const header =
@@ -3768,7 +3831,7 @@ fn handleStreamingGeneration(
                 \\{{"prompt_tokens":{d},"completion_tokens":{d},"total_tokens":{d}}}
             , .{ total_prompt, ts.completion_tokens, total_prompt + ts.completion_tokens });
             defer allocator.free(usage_json);
-            const timings_obj = try formatTimingsObject(allocator, total_prompt, ts.completion_tokens, ts.prefill_ns, ts.decode_ns);
+            const timings_obj = try formatTimingsObject(allocator, total_prompt, ts.cached_tokens, ts.completion_tokens, ts.prefill_ns, ts.decode_ns);
             defer allocator.free(timings_obj);
             const timings_opt: ?[]const u8 = if (timings_obj.len > 0) timings_obj else null;
             try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null }, finish_reason, usage_json, timings_opt);
@@ -3779,10 +3842,12 @@ fn handleStreamingGeneration(
         try stream.writeAll("data: [DONE]\n\n");
     }
 
-    // Decode TPS: scheduler emits its own per-tick prefill log line; here
-    // we just report the prompt+completion totals + finish reason.
-    log.info("  <- {d}+{d} tokens streamed [prefill: {d:.1} tok/s] [{s}]\n", .{
-        total_prompt, ts.completion_tokens, prefill_tps, finish_reason,
+    // Per-slot timings come from the scheduler (ts.prefill_ns / ts.decode_ns,
+    // populated in finalize); the bracket reports compute + any prefix reuse.
+    var perf_buf: [160]u8 = undefined;
+    const perf = formatPerfBracket(&perf_buf, ts.prompt_tokens, ts.cached_tokens, ts.completion_tokens, ts.prefill_ns, ts.decode_ns);
+    log.info("  <- {d}+{d} tokens streamed [{s}] [{s}]\n", .{
+        total_prompt, ts.completion_tokens, perf, finish_reason,
     });
 }
 
@@ -4052,29 +4117,48 @@ fn utf8TrailingIncomplete(s: []const u8) usize {
 fn formatTimingsObject(
     allocator: std.mem.Allocator,
     prompt_tokens: u32,
+    cached_tokens: u32,
     completion_tokens: u32,
     prefill_ns: u64,
     decode_ns: u64,
 ) ![]u8 {
     if (prefill_ns == 0 and decode_ns == 0) return try allocator.alloc(u8, 0);
     const ns_per_ms_f: f64 = @as(f64, @floatFromInt(std.time.ns_per_ms));
-    const ns_per_s_f: f64 = @as(f64, @floatFromInt(std.time.ns_per_s));
     const p_ms = @as(f64, @floatFromInt(prefill_ns)) / ns_per_ms_f;
     const d_ms = @as(f64, @floatFromInt(decode_ns)) / ns_per_ms_f;
-    const p_tps: f64 = if (prefill_ns > 0)
-        @as(f64, @floatFromInt(prompt_tokens)) * ns_per_s_f / @as(f64, @floatFromInt(prefill_ns))
-    else
-        0.0;
-    const d_tps: f64 = if (decode_ns > 0)
-        @as(f64, @floatFromInt(completion_tokens)) * ns_per_s_f / @as(f64, @floatFromInt(decode_ns))
-    else
-        0.0;
+    // prompt_per_second reflects compute: divide by the tokens actually run
+    // (prompt minus the KV-cache prefix). `cached_n` exposes the reuse so a
+    // bench / client can tell a warm hit from a cold prefill.
+    const p_tps = generate_mod.prefillTokensPerSec(prompt_tokens, cached_tokens, prefill_ns);
+    const d_tps = generate_mod.tokensPerSec(completion_tokens, decode_ns);
     return try std.fmt.allocPrint(
         allocator,
-        \\{{"prompt_n":{d},"prompt_ms":{d:.3},"prompt_per_second":{d:.3},"predicted_n":{d},"predicted_ms":{d:.3},"predicted_per_second":{d:.3}}}
+        \\{{"prompt_n":{d},"cached_n":{d},"prompt_ms":{d:.3},"prompt_per_second":{d:.3},"predicted_n":{d},"predicted_ms":{d:.3},"predicted_per_second":{d:.3}}}
     ,
-        .{ prompt_tokens, p_ms, p_tps, completion_tokens, d_ms, d_tps },
+        .{ prompt_tokens, cached_tokens, p_ms, p_tps, completion_tokens, d_ms, d_tps },
     );
+}
+
+/// Format the "prefill: X tok/s [(C cached / P total)], decode: Y tok/s" perf
+/// bracket into `buf` so every API path logs prefill compute (and any prefix
+/// reuse) identically. `cached > 0` adds the cached/total hint; otherwise the
+/// short form keeps the existing log shape for cold prefills. Single source of
+/// truth so the format never drifts across the chat/anthropic/streaming logs.
+fn formatPerfBracket(
+    buf: []u8,
+    prompt_tokens: u32,
+    cached_tokens: u32,
+    completion_tokens: u32,
+    prefill_ns: u64,
+    decode_ns: u64,
+) []const u8 {
+    const p_tps = generate_mod.prefillTokensPerSec(prompt_tokens, cached_tokens, prefill_ns);
+    const d_tps = generate_mod.tokensPerSec(completion_tokens, decode_ns);
+    const s = if (cached_tokens > 0)
+        std.fmt.bufPrint(buf, "prefill: {d:.1} tok/s ({d} cached / {d} total), decode: {d:.1} tok/s", .{ p_tps, cached_tokens, prompt_tokens, d_tps })
+    else
+        std.fmt.bufPrint(buf, "prefill: {d:.1} tok/s, decode: {d:.1} tok/s", .{ p_tps, d_tps });
+    return s catch buf[0..0];
 }
 
 fn jsonEscape(allocator: std.mem.Allocator, input: []const u8) ![]const u8 {
@@ -4689,7 +4773,8 @@ fn handleAnthropicMessages(
     body: []const u8,
     lm: *LoadedModel,
 ) !void {
-    const xfm = lm.transformer.?;
+    // No `lm.transformer.?` — engine-backed (GGUF/ds4) models have a null
+    // transformer; the only gate below uses `config.has_hybrid_layers`.
     const tok = lm.tokenizer.?;
     const chat_config = lm.chat_config.?;
     const config = lm.config.?;
@@ -5028,7 +5113,7 @@ fn handleAnthropicMessages(
     else
         server_config.default_enable_pld;
     if (enable_pld and has_tools) enable_pld = false;
-    if (enable_pld and xfm.config.has_hybrid_layers) enable_pld = false;
+    if (enable_pld and config.has_hybrid_layers) enable_pld = false;
 
     // Drafter: same disable rules as chat-completions parse site.
     const drafter_explicit_in_json: bool = root.get("enable_drafter") != null;
@@ -5039,7 +5124,7 @@ fn handleAnthropicMessages(
         lm_default_enable_drafter;
     if (enable_drafter and lm.drafter == null) enable_drafter = false;
     if (enable_drafter and has_tools) enable_drafter = false;
-    if (enable_drafter and xfm.config.has_hybrid_layers) enable_drafter = false;
+    if (enable_drafter and config.has_hybrid_layers) enable_drafter = false;
 
     // Log request
     const last_msg = messages.items[messages.items.len - 1];
@@ -5058,6 +5143,8 @@ fn handleAnthropicMessages(
     const effective_tools_json: ?[]const u8 = if (has_tools) tools_json else null;
     var prompt_ids_raw = if (lm.ds4_engine) |engine|
         try chat_mod.encodeChatViaDs4(allocator, engine, messages.items, effective_tools_json, tool_choice_instruction, enable_thinking)
+    else if (lm.llama_engine) |engine|
+        try chat_mod.encodeChatViaLlama(allocator, engine, chat_config, messages.items, effective_tools_json, tool_choice_instruction, enable_thinking)
     else
         try chat_mod.formatChat(allocator, tok, messages.items, chat_config, effective_tools_json, tool_choice_instruction, enable_thinking);
 
@@ -5251,8 +5338,10 @@ fn handleAnthropicNonStreaming(
                 allocator.free(tool_calls);
             }
 
-            log.info("  <- {d}+{d} tokens ({d}ms) [prefill: {d:.1} tok/s, decode: {d:.1} tok/s] [tool_use: {d}]\n", .{
-                result.prompt_tokens, result.completion_tokens, elapsed_ms, result.prefill_tps, result.decode_tps, tool_calls.len,
+            var tu_perf_buf: [160]u8 = undefined;
+            const tu_perf = formatPerfBracket(&tu_perf_buf, result.prompt_tokens, result.cached_tokens, result.completion_tokens, result.prefill_ns, result.decode_ns);
+            log.info("  <- {d}+{d} tokens ({d}ms) [{s}] [tool_use: {d}]\n", .{
+                result.prompt_tokens, result.completion_tokens, elapsed_ms, tu_perf, tool_calls.len,
             });
 
             // Emit tool_use content blocks
@@ -5296,8 +5385,10 @@ fn handleAnthropicNonStreaming(
     try content.append(allocator, ']');
 
     const stop_reason = mapFinishToStopReason(finish_reason);
-    log.info("  <- {d}+{d} tokens ({d}ms) [prefill: {d:.1} tok/s, decode: {d:.1} tok/s] [{s}]\n", .{
-        result.prompt_tokens, result.completion_tokens, elapsed_ms, result.prefill_tps, result.decode_tps, stop_reason,
+    var perf_buf: [160]u8 = undefined;
+    const perf = formatPerfBracket(&perf_buf, result.prompt_tokens, result.cached_tokens, result.completion_tokens, result.prefill_ns, result.decode_ns);
+    log.info("  <- {d}+{d} tokens ({d}ms) [{s}] [{s}]\n", .{
+        result.prompt_tokens, result.completion_tokens, elapsed_ms, perf, stop_reason,
     });
 
     const response = try std.fmt.allocPrint(allocator,
@@ -5378,10 +5469,6 @@ fn handleAnthropicStreaming(
     });
     var ts = StreamingTokenStream.initFromSlot(slot_handle.?, stream_mode, eos_token_ids);
     defer ts.deinit(allocator);
-
-    // Scheduler emits per-tick prefill log lines; we don't have a usable
-    // synchronous timing here, so report 0 tok/s for the streaming summary.
-    const prefill_tps: f64 = 0.0;
 
     // SSE headers
     const header =
@@ -5806,8 +5893,10 @@ fn handleAnthropicStreaming(
         try sendAnthropicEvent(stream, "message_stop", "{\"type\":\"message_stop\"}");
     }
 
-    log.info("  <- {d}+{d} tokens streamed [prefill: {d:.1} tok/s] [{s}]\n", .{
-        total_prompt, ts.completion_tokens, prefill_tps, stop_reason,
+    var perf_buf: [160]u8 = undefined;
+    const perf = formatPerfBracket(&perf_buf, ts.prompt_tokens, ts.cached_tokens, ts.completion_tokens, ts.prefill_ns, ts.decode_ns);
+    log.info("  <- {d}+{d} tokens streamed [{s}] [{s}]\n", .{
+        total_prompt, ts.completion_tokens, perf, stop_reason,
     });
 }
 
@@ -6027,7 +6116,8 @@ fn handleResponses(
     body: []const u8,
     lm: *LoadedModel,
 ) !void {
-    const xfm = lm.transformer.?;
+    // No `lm.transformer.?` — engine-backed (GGUF/ds4) models have a null
+    // transformer; the only gates below use `config.has_hybrid_layers`.
     const tok = lm.tokenizer.?;
     const chat_config = lm.chat_config.?;
     const config = lm.config.?;
@@ -6250,6 +6340,8 @@ fn handleResponses(
     // ── format chat template ──
     var prompt_ids_raw = if (lm.ds4_engine) |engine|
         try chat_mod.encodeChatViaDs4(allocator, engine, pi.messages.items, active_tools_json, active_tool_choice_instruction, enable_thinking)
+    else if (lm.llama_engine) |engine|
+        try chat_mod.encodeChatViaLlama(allocator, engine, chat_config, pi.messages.items, active_tools_json, active_tool_choice_instruction, enable_thinking)
     else
         try chat_mod.formatChat(allocator, tok, pi.messages.items, chat_config, active_tools_json, active_tool_choice_instruction, enable_thinking);
 
@@ -6416,7 +6508,7 @@ fn handleResponses(
     else
         server_config.default_enable_pld;
     if (enable_pld_resp and active_has_tools) enable_pld_resp = false;
-    if (enable_pld_resp and xfm.config.has_hybrid_layers) enable_pld_resp = false;
+    if (enable_pld_resp and config.has_hybrid_layers) enable_pld_resp = false;
 
     // Drafter (Responses-side parsing). Same disable rules as the chat
     // and Anthropic parse sites.
@@ -6428,7 +6520,7 @@ fn handleResponses(
         lm_default_enable_drafter_resp;
     if (enable_drafter_resp and lm.drafter == null) enable_drafter_resp = false;
     if (enable_drafter_resp and active_has_tools) enable_drafter_resp = false;
-    if (enable_drafter_resp and xfm.config.has_hybrid_layers) enable_drafter_resp = false;
+    if (enable_drafter_resp and config.has_hybrid_layers) enable_drafter_resp = false;
 
     // Adaptive spec-decode gate (Responses path; mirrors chat-completions and
     // Anthropic). Score the full prompt's 3-gram repetition; novel content
