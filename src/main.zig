@@ -788,32 +788,94 @@ fn portInUse(io: std.Io, port: u16) bool {
 /// `--prefix-cache-mem`; returns `error.InvalidSize` on malformed input.
 /// True if `path` points at a .gguf file or a directory that contains one.
 /// We accept directories so users can pass the canonical
-/// `~/.mlx-serve/models/<owner>/<repo>/` shape Swift sets up.
+/// `~/.mlx-serve/models/<owner>/<repo>/` shape Swift sets up. `mmproj-*.gguf`
+/// sidecars are NOT counted — a directory containing only an mmproj file
+/// is not a valid LLM path (`isMmprojGgufBasename` lives next to
+/// `isDs4GgufBasename` in `model_discovery.zig`).
 fn isGgufPath(io: std.Io, path: []const u8) bool {
+    // For a direct .gguf file path: always route to the llama branch so
+    // `resolveGgufFile` can emit a precise error if it's actually an
+    // mmproj sidecar. Falling through to the MLX path on a mmproj.gguf
+    // produces an opaque "no config.json" failure instead.
     if (std.mem.endsWith(u8, path, ".gguf")) return true;
     var dir = std.Io.Dir.openDirAbsolute(io, path, .{ .iterate = true }) catch return false;
     defer dir.close(io);
     var it = dir.iterate();
     while (it.next(io) catch return false) |entry| {
-        if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".gguf")) return true;
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".gguf")) continue;
+        // For directories we DO filter mmproj sidecars from "is this a GGUF
+        // dir?" — a folder with only mmproj.gguf shouldn't be classified as
+        // a llama LLM. `resolveGgufFile` then reports
+        // `error.OnlyMmprojGgufFile` if the user explicitly targets such a
+        // dir.
+        if (model_discovery.isMmprojGgufBasename(entry.name)) continue;
+        return true;
     }
     return false;
 }
 
 /// Resolve the actual .gguf file path. When `path` is a directory, return
-/// the first `.gguf` entry within it (caller frees). When `path` is already a
-/// file, return a dup. Errors if no .gguf is found.
+/// the first non-mmproj `.gguf` entry within it (caller frees). When `path`
+/// is already a file, return a dup. Errors:
+///   error.NoGgufFile         — no .gguf files at all
+///   error.OnlyMmprojGgufFile — directory (or path) had only mmproj sidecars
+///
+/// This function does NOT log on error — the caller decides whether the
+/// error is "fatal user load" (then call `logResolveGgufError` to surface
+/// the actionable message) or "silent probe" (e.g. `isDs4Gguf` checks the
+/// basename and would otherwise double-print on a mmproj path).
 fn resolveGgufFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8) ![]u8 {
-    if (std.mem.endsWith(u8, path, ".gguf")) return allocator.dupe(u8, path);
+    if (std.mem.endsWith(u8, path, ".gguf")) {
+        if (model_discovery.isMmprojGgufBasename(std.fs.path.basename(path))) {
+            return error.OnlyMmprojGgufFile;
+        }
+        return allocator.dupe(u8, path);
+    }
     var dir = try std.Io.Dir.openDirAbsolute(io, path, .{ .iterate = true });
     defer dir.close(io);
     var it = dir.iterate();
+    var saw_mmproj = false;
+    var pick: ?[]u8 = null;
+    errdefer if (pick) |p| allocator.free(p);
     while (try it.next(io)) |entry| {
-        if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".gguf")) {
-            return std.fmt.allocPrint(allocator, "{s}/{s}", .{ path, entry.name });
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".gguf")) continue;
+        if (model_discovery.isMmprojGgufBasename(entry.name)) { saw_mmproj = true; continue; }
+        // Deterministic pick when multiple LLM .ggufs are present: keep the
+        // alphabetically smallest. Avoids "load order depends on readdir(3)
+        // iteration order" (filesystem-dependent on macOS) and lets the
+        // user predict which quant gets loaded when they drop both
+        // `Q4_K_M.gguf` and `Q8_0.gguf` into one folder.
+        if (pick == null or std.mem.lessThan(u8, entry.name, std.fs.path.basename(pick.?))) {
+            if (pick) |p| allocator.free(p);
+            pick = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ path, entry.name });
         }
     }
+    if (pick) |p| return p;
+    if (saw_mmproj) return error.OnlyMmprojGgufFile;
     return error.NoGgufFile;
+}
+
+/// Emit a user-facing, actionable error message for the failures
+/// `resolveGgufFile` can return. Call from the fatal load path; probes
+/// (e.g. routing-decision helpers) should NOT log and let the eventual
+/// resolveGgufFile re-attempt surface the error once.
+fn logResolveGgufError(path: []const u8, err: anyerror) void {
+    switch (err) {
+        error.OnlyMmprojGgufFile => {
+            // Discriminate between "user pointed at the mmproj file
+            // directly" and "directory had only mmproj sidecars" via the
+            // suffix check we already did in resolveGgufFile.
+            if (std.mem.endsWith(u8, path, ".gguf")) {
+                log.err("'{s}' is an mmproj sidecar (CLIP vision/audio encoder), not an LLM. Point at the language-model .gguf (typically the same directory, e.g. `*-Q4_K_M.gguf`).\n", .{path});
+            } else {
+                log.err("'{s}' contains only mmproj sidecars (multimodal projection / CLIP encoders). Download or move the matching language-model .gguf (e.g. `*-Q4_K_M.gguf`) into this directory.\n", .{path});
+            }
+        },
+        error.NoGgufFile => log.err("'{s}' contains no .gguf files.\n", .{path}),
+        else => log.err("resolveGgufFile('{s}'): {s}\n", .{ path, @errorName(err) }),
+    }
 }
 
 /// True if a `.gguf` path is the DeepSeek-V4-Flash model that the ds4 engine
@@ -839,7 +901,10 @@ fn runDs4Offline(
     max_tokens: u32,
     temp: f32,
 ) !void {
-    const gguf_path = try resolveGgufFile(io, allocator, model_dir);
+    const gguf_path = resolveGgufFile(io, allocator, model_dir) catch |err| {
+        logResolveGgufError(model_dir, err);
+        return err;
+    };
     defer allocator.free(gguf_path);
 
     log.info("[ds4] backend: Metal, model: {s}\n", .{gguf_path});
@@ -926,7 +991,10 @@ fn runDs4Serve(
 ) !void {
     // Resolve the GGUF file once on this thread so the engine's open() call
     // (running on the inference thread) gets an absolute path.
-    const gguf_path_owned = try resolveGgufFile(io, allocator, model_dir);
+    const gguf_path_owned = resolveGgufFile(io, allocator, model_dir) catch |err| {
+        logResolveGgufError(model_dir, err);
+        return err;
+    };
     defer allocator.free(gguf_path_owned);
 
     log.info("mlx-serve {s} (ds4 engine, GGUF backend)\n", .{VERSION});
@@ -1104,7 +1172,10 @@ fn runLlamaOffline(
     max_tokens: u32,
     temp: f32,
 ) !void {
-    const gguf_path = try resolveGgufFile(io, allocator, model_dir);
+    const gguf_path = resolveGgufFile(io, allocator, model_dir) catch |err| {
+        logResolveGgufError(model_dir, err);
+        return err;
+    };
     defer allocator.free(gguf_path);
 
     log.info("[llama] backend: Metal, model: {s}\n", .{gguf_path});
@@ -1186,7 +1257,10 @@ fn runLlamaServe(
     max_resident_mem_explicit: bool,
     idle_evict_secs: ?u32,
 ) !void {
-    const gguf_path_owned = try resolveGgufFile(io, allocator, model_dir);
+    const gguf_path_owned = resolveGgufFile(io, allocator, model_dir) catch |err| {
+        logResolveGgufError(model_dir, err);
+        return err;
+    };
     defer allocator.free(gguf_path_owned);
 
     // Effective context: the user's --ctx-size, else a safe 8192 default (we
@@ -1367,3 +1441,11 @@ fn parseSizeArg(s: []const u8) !u64 {
     const n = std.fmt.parseInt(u64, s[0..end], 10) catch return error.InvalidSize;
     return n * mult;
 }
+
+// Pure-function tests for `isMmprojGgufBasename` live with the
+// implementation in `src/model_discovery.zig` (where they get picked up
+// by `zig build test`); main.zig itself is the executable root and is
+// not in the test pool. The directory-walk behavior of `resolveGgufFile`
+// is covered by integration: pointing the loader at a directory that
+// contains both `mmproj-*.gguf` and the real LLM .gguf now reliably
+// picks the LLM (manually verified after fixing the sidecar-skip).
