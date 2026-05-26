@@ -48,10 +48,26 @@ class DownloadManager: ObservableObject {
     // no automatic migration; users can move dirs manually if they want.
 
     /// True iff a filename is a GGUF mlx-serve can serve. As of the embedded
-    /// llama.cpp engine that's ANY `.gguf`: DeepSeek-V4-Flash routes to the ds4
-    /// engine, everything else to llama.cpp (server-side, by `ggufModelType`).
+    /// llama.cpp engine that's ANY `.gguf` EXCEPT mmproj sidecars (CLIP
+    /// vision / audio encoders shipped alongside vision-enabled LLMs —
+    /// `mmproj-*.gguf` files have `general.architecture=clip` and llama.cpp
+    /// refuses to load them as language models). DeepSeek-V4-Flash routes
+    /// to the ds4 engine, everything else to llama.cpp (server-side, by
+    /// `ggufModelType`).
     nonisolated static func isSupportedGguf(_ filename: String) -> Bool {
-        return filename.lowercased().hasSuffix(".gguf")
+        let lower = filename.lowercased()
+        guard lower.hasSuffix(".gguf") else { return false }
+        return !isMmprojGguf(filename)
+    }
+
+    /// True iff a basename is a multimodal-projection sidecar — the
+    /// `mmproj-*.gguf` convention used by llama.cpp tooling, ollama, and
+    /// LM Studio for the side-loaded CLIP vision / audio encoders. Mirrors
+    /// the Zig `model_discovery.isMmprojGgufBasename` so client and server
+    /// agree on which artifacts are LLMs.
+    nonisolated static func isMmprojGguf(_ filename: String) -> Bool {
+        let lower = filename.lowercased()
+        return lower.hasSuffix(".gguf") && lower.hasPrefix("mmproj")
     }
 
     /// Classify a GGUF filename into the `modelType` the server reports / routes
@@ -580,11 +596,19 @@ class DownloadManager: ObservableObject {
         let resolved = (dirPath as NSString).resolvingSymlinksInPath
         let entries = (try? FileManager.default.contentsOfDirectory(atPath: resolved)) ?? []
 
-        // GGUF fast-path: surface ANY `.gguf` as a selectable base model. The
-        // server auto-routes by family — DeepSeek-V4-Flash → ds4, everything else
-        // → the embedded llama.cpp engine — so we no longer hide non-DSV4 GGUFs.
-        // `ggufModelType` classifies the file into the modelType the server reports.
-        if let gguf = entries.first(where: { Self.isSupportedGguf($0) }),
+        // GGUF fast-path: surface ANY non-mmproj `.gguf` as a selectable base
+        // model. Sort first so the pick is deterministic across filesystems
+        // (FileManager.contentsOfDirectory order is APFS-specific). When a
+        // folder ships both `gemma-4-E4B-it-Q4_K_M.gguf` and `Q8_0.gguf`
+        // we deterministically pick the alphabetically-smallest basename
+        // (matches the Zig server's `resolveGgufFile` tiebreaker).
+        // `isSupportedGguf` already filters mmproj sidecars
+        // (`mmproj-*.gguf`, the CLIP vision/audio encoders) so they can't
+        // be picked here — the previous code grabbed them on Gemma 4 VL
+        // / Qwen 3.6 VL repos and the server then 404'd with
+        // 'unsupported model architecture: clip'.
+        let ggufCandidates = entries.filter { Self.isSupportedGguf($0) }.sorted()
+        if let gguf = ggufCandidates.first,
            let modelType = Self.ggufModelType(forBasename: gguf) {
             let ggufPath = (resolved as NSString).appendingPathComponent(gguf)
             let size = (try? FileManager.default.attributesOfItem(atPath: ggufPath)[.size] as? UInt64) ?? 0
