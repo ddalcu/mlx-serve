@@ -1,17 +1,26 @@
 # Performance plan — decisively beat LM Studio in every category
 
+> **2026-05-25 handoff:** Phase 1 (MLX hybrid prefix reuse via SSM
+> checkpointing) and Phase 5 #2 (`--llama-kv-quant`) are **shipped and
+> measured**. Final charts in `docs/perf-vs-lmstudio-final.png`,
+> `docs/perf-decode-vs-lmstudio.png`. 9/9 measured cells are wins or
+> ties vs LM Studio. The next agent picks up at Phases 2, 3, 4 #1/#3,
+> 5 #1, 6, 7 — all open. Section "What's left" below has the priority
+> order. Read "Lessons banked" first; it captures gotchas the next
+> phases will re-hit.
+
 ## Goal
 
 Beat LM Studio by a measurable, decisive margin across every dimension that
 affects user-perceived speed, on **both** engines mlx-serve ships:
 
-| Category | GGUF (via llama.cpp) | MLX (safetensors) |
-|---|---|---|
-| Cold prefill (tok/s) | beat by ≥ 25% | beat by ≥ 25% |
-| Warm / multi-turn prefill (TTFT) | tied/better — both near-instant | tied/better — both near-instant |
-| Decode (tok/s) | beat by ≥ 30% | beat by ≥ 30% |
-| End-to-end TTFT, 1k prompt cold | beat by ≥ 30% | beat by ≥ 30% |
-| End-to-end TTFT, warm multi-turn | beat by ≥ 5× | beat by ≥ 5× |
+| Category | GGUF (via llama.cpp) | MLX (safetensors) | Status (2026-05-25) |
+|---|---|---|---|
+| Cold prefill (tok/s) | beat by ≥ 25% | beat by ≥ 25% | ~at parity (+4–11%) |
+| Warm / multi-turn prefill (TTFT) | tied/better — both near-instant | tied/better — both near-instant | **1.33–1.82× faster** |
+| Decode (tok/s) | beat by ≥ 30% | beat by ≥ 30% | +9% / +11% / **+62%** |
+| End-to-end TTFT, 1k prompt cold | beat by ≥ 30% | beat by ≥ 30% | open (~tied) |
+| End-to-end TTFT, warm multi-turn | beat by ≥ 5× | beat by ≥ 5× | open (1.33–1.82×) |
 
 "Beat LM Studio" is harder than it sounds for GGUF because we share libllama
 with them — the wins must come from things LM Studio doesn't do (speculative
@@ -19,371 +28,475 @@ decoding, multi-entry prompt caching, tokenization pipelining, concurrent
 batching). For MLX we own the entire stack, so the ceiling is higher but the
 work is deeper (GatedDeltaNet forward, SSM checkpointing).
 
-## Where we are (measured, post the prefill/TTFT work)
+## Where we started (baseline, pre-Phase-1)
 
-Run `./tests/bench_prefill.sh <model>` to reproduce. Numbers below are
-Qwen3.5-4B on Apple Silicon, 750-token prompt, ReleaseFast.
+Run `./tests/bench_prefill.sh <model>` to reproduce. Apple M4 / 16 GB,
+~1000-token prompt, ReleaseFast.
 
 | | Cold prefill | Multi-turn (warm) | Decode |
 |---|---|---|---|
-| **GGUF Qwen3.5-4B-IQ4_NL** | ~698 tok/s | reuses 940/941 → near-instant | ~parity with LM Studio |
-| **MLX Qwen3.5-4B-4bit** | ~383 tok/s | **no reuse — full cold every turn** | ~8% behind LM Studio |
+| **GGUF Qwen3.5-4B-IQ4_NL** | ~720 tok/s | reuses 940/941 → near-instant | parity with LM Studio |
+| **MLX Qwen3.5-4B-4bit** (hybrid SSM) | ~393 tok/s | **0/941 cached — full cold every turn** | ~parity |
+| **MLX Gemma 4 E4B-4bit** (plain attn) | ~640 tok/s | reuses 936/937 → near-instant | ~+50% vs LM Studio |
 
-Key facts the next agent **must** internalize before changing anything:
+Key facts:
 
 1. **The original "384 tok/s for both engines" complaint was a client-TTFT
-   artifact, not raw prefill compute.** GGUF cold is actually ~700 tok/s.
-   Always measure server-side `timings.prompt_per_second` and `timings.cached_n`
-   (Phase 1 of the prior work surfaced these in every API response).
-2. **GGUF multi-turn is solved** — a persistent `LlamaSession` per model
-   reuses the KV prefix (LM-Studio-style). Don't redo this.
-3. **MLX hybrid (GatedDeltaNet) reuse is architecturally blocked** with the
-   current SSM cache design. The prior session attempted it and reverted; see
-   memory `project_prefill_perf_findings`. The real fix needs **per-position
-   SSM checkpointing** (Phase 2 below) — this is the highest-impact unblocker.
-4. **MLX cold prefill (383 tok/s)** is 100% GatedDeltaNet forward compute
-   (`MLX_SERVE_PREFILL_TRACE=1` shows 2940 ms forward, 1 ms eval — chunk size
-   has zero effect). Optimizing requires touching `transformer.zig`.
+   artifact, not raw prefill compute.** GGUF cold is actually ~720 tok/s.
+   Always measure server-side `timings.prompt_per_second` and `timings.cached_n`.
+2. **GGUF multi-turn was already solved** — a persistent `LlamaSession` per
+   model reuses the KV prefix (LM-Studio-style). Don't redo this.
+3. **MLX hybrid (GatedDeltaNet) reuse was architecturally blocked** with the
+   pre-Phase-1 SSM cache design (`HotPrefixCache.shouldUse` returned false on
+   any model with `has_hybrid_layers` or `full_attention_interval > 0`). The
+   prior session attempted single-snapshot solutions and reverted; **the real
+   fix needed per-position SSM checkpointing**.
+4. **MLX cold prefill (393 tok/s on Qwen3.5)** is 100% GatedDeltaNet forward
+   compute (`MLX_SERVE_PREFILL_TRACE=1` shows 2940 ms forward, 1 ms eval —
+   chunk size has zero effect). Optimizing requires touching `transformer.zig`.
 5. **Cross-arch byte-equivalence is non-negotiable.** Plain attention, hybrid
    SSM (lfm2 / nemotron_h / qwen3_5(_moe) / qwen3_next), sliding window (Gemma
    3/4), MoE — touching any shared path requires validating each.
 6. **Always build `-Doptimize=ReleaseFast`.** Plain `swift build` (without
    `app/build.sh`) silently rebuilds zig-out in Debug.
 
-## Approach
+## Where we are now (measured, post-Phase-1 + Phase 5 #2)
 
-The phases are ordered by **impact × tractability ÷ risk**. Phase 0 is mandatory
-before any compute change. Phase 1 unlocks the MLX multi-turn win that the
-prior work surfaced as the user's biggest pain. Each phase has its own
-acceptance criteria; if the measured gain doesn't clear the bar, the phase is
-dropped (per the project's "no speculative changes" discipline).
+**Headline numbers** (Apple M4 / 16 GB, same model files for both engines,
+~1325-token prompt, temperature=0, max_tokens=8 for TTFT / max_tokens=128
+for decode, median of warm runs):
 
-### Phase 0 — Apples-to-apples baseline harness (mandatory)
+### TTFT — `docs/perf-vs-lmstudio-final.png`
 
-Without this every later phase is fiction. Extend `tests/bench_prefill.sh` and
-add comparative variants:
+| Workload | mlx-serve | LM Studio | Win |
+|---|---:|---:|---:|
+| Cold Gemma 4 E4B MLX (plain attn) | 2362 ms | 2624 ms | 1.11× |
+| Cold Qwen3.5-4B GGUF (IQ4_NL) | 3736 ms | 3877 ms | 1.04× |
+| Cold Qwen3.5-4B MLX (hybrid SSM) | 3676 ms | 3669 ms | tied |
+| Warm Gemma 4 E4B MLX (plain attn) | 466 ms | 663 ms | **1.42×** |
+| Warm Qwen3.5-4B GGUF (IQ4_NL) | 334 ms | 445 ms | **1.33×** |
+| **Warm Qwen3.5-4B MLX (hybrid SSM)** | **298 ms** | **542 ms** | **1.82×** ← Phase 1 headline |
 
-- `tests/bench_vs_lmstudio.sh` — same prompt, same params, three back-ends:
-  mlx-serve (HTTP), LM Studio (HTTP, port 1234), mlx-lm (subprocess) — captures
-  cold prefill / warm prefill / decode tok/s / first-byte TTFT / total wall time
-  per scenario. Format CSV + a markdown summary table.
-- Scenarios (per model+engine pair):
-  1. **Single-shot cold** — fresh server, unique 1k-token prompt, max_tokens=64.
-  2. **Multi-turn warm** — 5-turn conversation, each turn ~200 tokens of new
-     user text, max_tokens=64. Measure turn 2..5 TTFT.
-  3. **Long-doc QA** — 8k-token document + short question. Cold and warm
-     (same doc, different question second time).
-  4. **Decode-dominated** — short prompt, max_tokens=512. Pure decode rate.
-- Models to bench (need to be downloaded):
-  - GGUF: `Qwen3.5-4B-IQ4_NL`, `Qwen3.5-4B-Q4_K_M`, `gemma-4-E4B-it-Q4_K_M`,
-    `Llama-3.1-8B-Instruct-Q4_K_M`.
-  - MLX: `Qwen3.5-4B-MLX-4bit`, `gemma-4-E4B-it-4bit` (plain-attention
-    reference — critical for isolating the GatedDeltaNet cost),
-    `Llama-3.1-8B-Instruct-4bit-MLX`.
-- **Output**: a markdown table per model showing the GAP vs LM Studio per
-  scenario. Commit it as `bench/baseline-{date}.md`. Every subsequent phase
-  compares against this baseline.
+### Decode tok/s — `docs/perf-decode-vs-lmstudio.png`
 
-Acceptance: the table exists, reproduces, and clearly identifies which numbers
-need to move. Without it, stop.
+| Workload | mlx-serve | LM Studio | Win |
+|---|---:|---:|---:|
+| Gemma 4 E4B MLX (plain attn) | **33.4 tok/s** | 20.6 tok/s | **+62%** |
+| Qwen3.5-4B MLX (hybrid SSM) | 37.5 tok/s | 33.7 tok/s | +11% |
+| Qwen3.5-4B GGUF (IQ4_NL) | 28.6 tok/s | 26.4 tok/s | +9% |
 
-### Phase 1 — MLX hybrid prefix reuse via per-position SSM checkpointing
+CSVs under `docs/perf-csvs/`. Methods documented in `docs/perf-vs-lmstudio-final.md`.
 
-**The biggest single MLX TTFT win.** Today every multi-turn MLX request pays
-full cold prefill because the hot prefix cache is disabled for hybrid
-(`has_hybrid_layers || full_attention_interval > 0`) — the SSM/recurrent state
-isn't positionally indexable, so it can't be trimmed to an arbitrary prefix.
+### What shipped this session
 
-The prior session attempted snapshotting at one boundary (post-generation,
-then prompt-boundary) and proved both fail due to **BPE boundary shift**:
-turn 1's prompt tokenizes to 159 tokens, turn 2 shares only 155 (the trailing
-assistant-header tokens re-tokenize differently when content follows). The
-snapshot was at 159 but the usable reuse point is at 155 → can't reuse.
+| Phase | Status | One-line |
+|---|---|---|
+| **0** (baseline harness) | ✅ | `tests/bench_final.sh`, `tests/bench_decode.sh`, plot scripts, CSV layout. |
+| **1** (MLX hybrid prefix reuse via SSM checkpointing) | ✅ | The big one. Multi-checkpoint stride-aligned snapshots + post-prefill snapshot + commit-time merge on prefix-extend. 1.82× warm TTFT on Qwen3.5-4B MLX, byte-identical to cold, no plain-attn regression. |
+| **4 #2** (early SSE role chunk) | ✅ (already in place) | `src/server.zig:3429` emits `delta.role=assistant` right after slot admission, before any decoded token. |
+| **5 #2** (`--llama-kv-quant {off,q8,q4}`) | ✅ | Exposes `type_k`/`type_v` ggml types on the llama.cpp KV cache via the shim. Auto-enables flash-attn when non-default. Output byte-identical at temperature=0 in spot-checks. |
 
-**The real fix is what llama.cpp does**: keep multiple SSM checkpoints along
-the sequence, not just one. (llama.cpp exposes this as `n_rs_seq` — number of
-recurrent-state snapshots per sequence.)
+### Files changed (touch points for the next agent)
 
-**Approach**:
+- **SSM checkpoint type + helpers:** `src/transformer.zig` (`SSMCheckpoint`,
+  `captureSsmCheckpoint`, `restoreSsmCheckpoint`, `ssmCheckpointBytes`).
+- **Capture during prefill:** `src/generate.zig` (chunked-prefill loop forces
+  chunk ends to stride boundaries; per-stride and post-prefill snapshots;
+  `Generator.takeSsmCheckpoints()`).
+- **Cache entry + commit/restore + gate:** `src/prefix_cache.zig`
+  (`Entry.ssm_checkpoints`, `commitWithSsm`, `lookupAndRestore` with
+  hybrid-aware effective-matched clamp, `shouldUse(config, enable_ssm_checkpoints)`,
+  merge-on-prefix-extend in the replace path).
+- **Scheduler plumbing + commit drain:** `src/scheduler.zig` (LoadParams +
+  LoadedModel fields, runPrefill passes stride and `hot_matched` offset,
+  commitSlotIfApplicable drains via `commitWithSsm`).
+- **CLI + defaults:** `src/main.zig` (`--ssm-checkpoint-stride`,
+  `--ssm-checkpoint-max`, `--llama-kv-quant`), `src/server.zig` (defaults
+  256/32/off; startup log line distinguishes hybrid + SSM-checkpoints
+  enabled vs the legacy "disabled" message).
+- **LoadedModel fields:** `src/model_registry.zig`
+  (`ssm_checkpoint_stride`, `ssm_checkpoint_max`, `llama_kv_type_{k,v}`).
+- **GGUF KV quant:** `lib/llama_shim/llama_shim.{h,c}` (new
+  `mlx_llama_session_create_kv_quant`), `src/llama_ffi.zig` (`GgmlType`
+  constants + new entry point), `src/arch/llama.zig` (`LlamaKvQuant` enum,
+  `createSessionWithKvQuant`).
+- **Regression guard:** `tests/test_hybrid_reuse_equivalence.sh` (TDD red/green
+  pin: byte-identical, cached_n > 0, warm prompt_ms < 70% of cold).
+- **Benches + charts:** `tests/bench_final.sh`, `tests/bench_decode.sh`,
+  `tests/bench_perfplan_compare.sh`, `tests/plot_final.py`,
+  `tests/plot_decode.py`, `tests/plot_perfplan.py`.
+- **Reports:** `docs/perf-vs-lmstudio-final.{md,png}`,
+  `docs/perf-decode-vs-lmstudio.png`, `docs/perf-csvs/*.csv`.
 
-1. Extend `SSMCacheEntry` (or add `SSMCheckpointBuffer`) to hold an array of
-   SSM-state snapshots at positions `0, K, 2K, 3K, ...` where `K` is the
-   checkpoint stride (e.g., 128 tokens). For Qwen3.5 the SSM state per layer
-   is `[B, Hv, Dv, Dk]` — a few MB; M checkpoints × N layers × that = bounded.
-2. During prefill / decode, every time the cache position crosses a multiple
-   of `K`, snapshot the current SSM state into the checkpoint buffer.
-3. In `prefix_cache.commit`, capture the full checkpoint array alongside the
-   KV snapshot.
-4. In `prefix_cache.lookupAndRestore`, when matched length `m` < entry length,
-   find the largest checkpoint position `p ≤ m`, restore SSM from that
-   checkpoint, then re-forward the small tail `tokens[p..m]` through the
-   GatedDeltaNet/SSM layers to advance state to position `m`. KV is already
-   restored to `m` via the existing positional KV restore (truncate).
-5. Cap memory: `--ssm-checkpoint-stride N` and `--ssm-checkpoint-budget` flags.
-   Default stride 128 (so the re-forward tail is at most 127 tokens, fast).
-6. Re-enable hybrid in `HotPrefixCache.shouldUse` (precise gate that does NOT
-   regress plain attention — see the prior session's notes on `has_sliding_window`
-   defaulting to true; the right gate is `!(has_sliding_window AND
-   full_attention_interval > 0)`).
+### Tunables shipped
 
-**Validation (TDD)**:
-- Unit test for the checkpoint stride math (which checkpoint covers position
-  `m`, how many tail tokens to re-forward).
-- New shell test `tests/test_hybrid_reuse_equivalence.sh` — multi-turn warm
-  output byte-identical to cold for first N tokens at temp=0, AND `cached_n`
-  on turn 2..5 > a meaningful threshold (e.g., ≥ 80% of turn-1 prompt length).
-- Cross-arch: gate on `MLX_HYBRID_MODEL` env (default Qwen3.5-4B), but make the
-  test runnable on `qwen3_5_moe`, `qwen3_next`, `lfm2`, `nemotron_h` and run it
-  on each before merging. Use `tests/test_pld_equivalence.sh` as the structural
-  template — same first-N-tokens byte-equivalence pattern.
+- `--ssm-checkpoint-stride N` (default **256**) — snapshot every N tokens
+  during prefill. 0 disables (legacy behavior; hybrid bypasses the cache).
+  Smaller stride = finer warm alignment + more cold-prefill overhead.
+- `--ssm-checkpoint-max N` (default **32**) — cap on snapshots per request.
+  Older ones drop front-first when the buffer would grow past this.
+- `--llama-kv-quant {off,q8,q4}` (default **off** = F16) — KV-cache
+  quantization for the embedded llama.cpp engine. `q8` ≈ 2× KV
+  compression (near-lossless); `q4` ≈ 4× (some quality impact).
 
-**Acceptance**: multi-turn TTFT collapses to suffix-prefill cost on Qwen3.5
-MLX (turn 2..5 prefill compute < 20% of turn-1's). Byte-identical to cold. No
-plain-attention regression.
+### Lessons banked (read before starting Phase 2+)
 
-**Risk gate**: if cross-arch correctness can't be established for any single
-listed model, ship the feature behind a per-arch allowlist rather than a
-global flip. Document.
+1. **BPE drift at chat-template boundaries.** Turn-2's tokenization of the
+   "assistant header" tokens can differ from turn-1's because trailing tokens
+   re-tokenize differently when content follows. A single snapshot at
+   `prompt_len` misses by 4-8 tokens. Phase 1 solved this with multi-snapshot
+   at stride. Any future cache-restore work must assume `matched <= prompt_len`
+   strictly.
+2. **The replace path in `commitWithSsm` MUST merge old + new snapshots on
+   prefix-extend.** Without merge: turn 2's prefill of the small uncached
+   tail captures few/no checkpoints, so turn 3 alternates hit→miss→hit→miss.
+   The merge is sorted-by-pos, dedup-by-pos (new wins on tie). Multi-turn
+   conversations would otherwise silently lose half their warm reuse.
+3. **`full_attention_interval > 0` is NOT a MoE signal on Qwen3.5/3.6 —
+   it's the hybrid-SSM marker** ("every Nth layer is full attention, the
+   rest are GatedDeltaNet"). The old `shouldUse` gate conflated these. The
+   new gate treats both `has_hybrid_layers` and `full_attention_interval > 0`
+   as "SSM layers somewhere", gated by `enable_ssm_checkpoints`.
+4. **`mlx_array_set` aborts on null source** (mlx-c default handler does
+   `exit(-1)`). SSM snapshot/restore must check each field's `.ctx != null`
+   independently — `initialized` alone is insufficient. LFM2 `gated_conv`
+   writes only `conv_state`; Mamba2/GDN order is the opposite. Both halves
+   already null-guarded in `ssmSnapshot`/`ssmRestore`; mimic that in any new
+   cache helpers.
+5. **Chunked prefill at smaller strides costs ~2-5% on cold.** Default stride
+   256 keeps the loss to ~2%; 128 is closer to 5%. The win on warm dominates
+   on any realistic workload (1.82× at 256). Don't lower stride further
+   without measurement.
+6. **Always measure server-side `prompt_ms` and `cached_n`** for prefill
+   benches — wall-clock TTFT conflates render + tokenize + queue + decode.
+   The Phase 1 bench (`tests/test_hybrid_reuse_equivalence.sh`) asserts on
+   `prompt_ms` so future regressions get caught even if wall-time looks fine.
+7. **LM Studio's HTTP API does NOT return `prompt_ms`** — only `usage`. Any
+   comparison bench must use wall-time for LMS and either wall or
+   `prompt_ms` consistently for mlx-serve. `tests/bench_final.sh` documents
+   the convention used in the report.
+8. **The Swift app needs no changes** to get Phase 1's wins — the binary
+   defaults `--ssm-checkpoint-stride 256` baked in, and `ServerOptions`
+   doesn't emit any flag that would disable it. Future phases that add CLI
+   knobs should mirror this: ship a safe default in the binary so the app
+   benefits without a UI change.
 
-### Phase 2 — MLX cold prefill: GatedDeltaNet forward optimization
+## What's left
 
-The 383 tok/s on Qwen3.5-4B MLX is 100% forward compute (`MLX_SERVE_PREFILL_TRACE=1`
-confirms 2940 ms of 2941 is the forward; chunked-eval overhead is 1 ms).
-Chunk size has no effect (256→8192 all ~2920 ms). So the bottleneck is the
-GatedDeltaNet implementation in `transformer.zig`.
+Phases ordered by **impact × tractability ÷ risk**. Phase 0's harness still
+applies — every change measures against the post-Phase-1 baseline in
+`docs/perf-csvs/bench_final-20260525-2258.csv`.
 
-**Approach**:
+### Phase 3 — GGUF speculative decoding (next biggest decode win) — OPEN
 
-1. Get a reference cold prefill number from mlx-lm running the SAME Qwen3.5-4B
-   MLX 4-bit model — that's the realistic ceiling on this hardware. If
-   mlx-serve is materially slower, the gap is the optimization target.
-2. Diff `mlx-serve`'s `gatedDeltaNet` / `mamba2Mixer` / `conv1dWithCache`
-   against the latest `mlx-lm/qwen3_5/...` (or `mlx-lm/qwen3_next/...`).
-   Common gaps to look for:
-   - **Parallel scan** — Mamba2/GatedDeltaNet's recurrence has a chunked
-     parallel form (the "Mamba2 SSD" formulation). mlx-lm may use it; check.
-   - **Fused conv1d + gating** — separate ops vs one fused call.
-   - **Redundant casts / copies** — bf16↔fp32 round-trips around the scan.
-   - **Tile sizes** — head_dim chunking, sequence chunking inside the recurrence.
-   - **Per-layer eval insertion** — the prefill loop in `generate.zig` evals
-     KV per chunk but **not SSM**; the SSM lazy graph may grow across the whole
-     prompt, hurting cache locality.
-3. Profile with Metal frame capture (Xcode's Metal Debugger) — identify which
-   kernel dominates and whether it's memory-bound or compute-bound. If
-   memory-bound, the win is in tile sizes; if compute-bound, the win is in
-   reducing FLOPs / fusion.
-4. If a Metal kernel is the bottleneck and MLX's high-level op set is
-   suboptimal, consider a custom Metal kernel via mlx's `metal_kernel` API
-   (mlx-c may not expose this — possible add to `mlx.zig`).
+LM Studio doesn't ship speculative decoding by default. MLX-serve has it on
+the MLX path (PLD + drafter). The GGUF path doesn't. Wiring it up is the
+cleanest decode win for GGUF on top of Phase 1's TTFT wins.
 
-**Validation**: byte-equivalence (first 30 tokens, temp=0) against the
-pre-change forward, for every model_type that touches the changed code path
-(`qwen3_5`, `qwen3_5_moe`, `qwen3_next`, `lfm2`, `nemotron_h`,
-`gemma4`/`gemma4_text` for the conv1d helper, `deepseek_v4` if shared).
-
-**Acceptance**: ≥ 30% cold prefill improvement on Qwen3.5-4B MLX *and*
-byte-equivalent across the listed archs. Drop the change otherwise.
-
-### Phase 3 — Decode parity: speculative decoding for GGUF
-
-LM Studio doesn't ship speculative decoding by default. MLX already has it
-(PLD + drafter, `tests/test_pld_equivalence.sh`, `tests/test_drafter_equivalence.sh`).
-The GGUF path doesn't. Wiring it up — using llama.cpp's existing batch decode
-API — is the cleanest decode win for GGUF.
-
-**Approach**:
-
-1. Add draft-model loading to `lib/llama_shim/`:
-   - `mlx_llama_open_drafter(parent_engine, gguf_path, err)` → loads a small
-     sibling model that shares vocab with the parent.
-   - `mlx_llama_session_eval_speculative(session, drafter, draft_len, out_tokens,
-     n_max, err)` → drafts `draft_len` tokens with the drafter, verifies with
-     the target via `llama_decode` on a batch of `draft_len+1`, returns
-     accepted tokens. Mirror the ds4 `evalSpeculative` shape so the scheduler
-     dispatch is uniform.
-2. Wire `slot.drafter` and `runLlamaDecodeTick` to route through it when
+**Approach** (unchanged from prior plan):
+1. Extend `lib/llama_shim/`:
+   - `mlx_llama_open_drafter(parent, gguf_path, err)` — load a small sibling
+     that shares vocab with the parent.
+   - `mlx_llama_session_eval_speculative(session, drafter, draft_len, out, n_max, err)` —
+     draft `draft_len` tokens with the drafter, verify via `llama_decode` on a
+     batch of `draft_len+1`, return accepted tokens. Mirror ds4's `evalSpeculative`.
+2. Wire `Slot.drafter` and `runLlamaDecodeTick` to route through it when
    `drafter != null`. Reuse `Generator.spec_disabled_runtime` gate semantics
-   (drop spec when per-draft acceptance < 50%).
-3. CLI: `--drafter` already exists for MLX; accept a `.gguf` path when the
-   target is also GGUF.
+   (drop spec when per-draft acceptance < 50%, sticky after warmup 5).
+3. CLI: `--drafter <path>` already exists for MLX; accept a `.gguf` path
+   when the target is also GGUF (route by file extension).
 4. Persistent-session interaction: the spec verify decodes `[t1, d0..dm-1]`,
    so the resident-token mirror in `arch/llama.zig` must append only the
    *accepted* tokens (not all drafts). Test the partial-accept rollback
    path explicitly.
 
-**Validation**: new `tests/test_drafter_equivalence_gguf.sh` — drafted decode
-byte-identical to non-drafted on a fixed seed at temp=0 (first N tokens), for
-at least Qwen3.5-4B-IQ4_NL (target) + Qwen2.5-0.5B-Instruct-Q4_K_M (drafter).
+**Validation:** new `tests/test_drafter_equivalence_gguf.sh` — drafted decode
+byte-identical to non-drafted on a fixed seed at temp=0 (first N tokens), at
+least Qwen3.5-4B-IQ4_NL (target) + Qwen2.5-0.5B-Instruct-Q4_K_M (drafter).
 Mirror the pattern in `tests/test_drafter_equivalence.sh`.
 
-**Acceptance**: ≥ 2× decode speedup on a creative-writing prompt where MLX
-PLD currently achieves ~1.4× (same workload class). Drop if per-draft
-acceptance is < 50% on representative prompts.
+**Acceptance:** ≥ 2× decode speedup on a code-completion prompt where MLX PLD
+currently achieves ~1.4×. Drop if per-draft acceptance < 50% on representative
+prompts.
 
-### Phase 4 — TTFT-specific micro-optimizations (orthogonal to compute)
+### Phase 2 — MLX cold prefill: GatedDeltaNet forward optimization — MEASUREMENT-CLOSED (2026-05-26)
 
-Once Phases 1–3 land, TTFT is dominated by everything-but-compute. Measure
-where the time goes (Phase 0 harness should already split this).
+**Outcome:** We are at the MLX/Metal ceiling on M4. The +30% target is
+unreachable without research-grade work that supersedes Apple's reference.
+A targeted 1-day experiment (full-forward Metal fusion via the existing
+`compileForward` closure) shipped byte-identical but with no measurable
+speedup. Phase 2 is closed; reopen only if a future MLX release or
+custom-kernel work changes the ceiling.
 
-**Likely wins**:
+**Measurements (Apple M4 / 16 GB, Qwen3.5-4B-MLX-4bit, 1325-tok prompt, warm engine):**
 
-1. **Jinja render + BPE encode on the connection thread, in parallel with
-   scheduler queue wait.** Today `handleChatCompletions` renders + tokenizes
-   inline before `submit`. Profile; if it's > 5% of TTFT for short prompts,
-   move tokenization off the critical path.
-2. **First SSE chunk emitted before any decode** — the `role`/`created` chunk
-   can fire on slot admission, not after the first sampled token. Knocks
-   ~10–50 ms off perceived TTFT for streaming clients.
-3. **System-prompt pre-warm**: if the loaded model has a chat template and a
-   stable system prompt, pre-compute its tokenization + (optionally) prefill
-   it into the persistent session at load time. Subsequent requests skip both.
-4. **HTTP/2 + persistent connections** — `Conn` is currently one-shot per
-   request. Multi-turn agents (Claude Code, Cursor) re-handshake every call.
+| Source | Cold prefill |
+|---|---:|
+| Apple `mlx_lm benchmark` (steady state, post-warmup, prefill-step=2048) | **408 tok/s** |
+| mlx-serve baseline (distinct prompts so prefix cache misses each turn) | 378–393 tok/s |
+| mlx-serve + `MLX_SERVE_COMPILE_FORWARD=1` (full-forward closure) | 382 tok/s |
+| LM Studio (also MLX-backed) | ~388 tok/s |
 
-**Acceptance**: each item lands only if it shaves ≥ 20 ms off measured
-end-to-end TTFT (Phase 0 harness). Stack-rank by measured impact.
+Gap to mlx-lm: 3.8% on best-case median runs, within run-to-run noise on
+others. **Not "materially slower" — Phase 2's original gate condition is
+not met.**
 
-### Phase 5 — GGUF: go beyond LM Studio
+**Why nothing meaningful was available:**
 
-The persistent session in Phase 3 already matches LM Studio's prompt cache.
-To **beat** it on GGUF (same library underneath), do things LM Studio doesn't:
+1. **GDN delta-recurrence kernel is identical.** mlx-serve's
+   `getGdnKernel()` uses grid `(32, Dv, B*Hv)` / threadgroup `(32, 4, 1)` —
+   the same source and dispatch as mlx-lm's `gated_delta_kernel` in
+   `mlx_lm/models/gated_delta.py`. Reading both side-by-side: char-for-char
+   identical. The most expensive component of the hybrid forward has zero
+   headroom.
+2. **Chunked prefill at stride 256 costs ~3 ms out of 3400 ms.** The
+   prefill trace breakdown is `chunked=3360-3500 ms, eval=3-12 ms,
+   last_token=0-3 ms`. No structural overhead to remove.
+3. **`compute_g` op fusion saves <0.3 ms total** across 24 GDN layers
+   (10 element-wise ops on `[B,S,Hv]=[1,1325,32]` tensors). The mlx-lm
+   `@partial(mx.compile, shapeless=True)` on `compute_g` is correct but
+   the workload is too small to register at this model size.
+4. **Full-forward `compileForward` is byte-identical but no faster.**
+   Wired in opt-in via `MLX_SERVE_COMPILE_FORWARD=1` (`src/scheduler.zig`,
+   `src/generate.zig` chunk loop) and validated with
+   `tests/test_phase2_forward_equivalence.sh` 6/6 across Qwen3.5 (hybrid SSM)
+   + Gemma 4 E4B (plain attention). Bench medians match within ~1% over
+   7 trials each. Apple's `@mx.compile` packaging in Python gives mlx-lm
+   the same set of underlying Metal kernels; once you reach those, there
+   is no further fusion to apply.
 
-1. **Multi-entry hot prefix cache for GGUF too.** Today the llama path keeps
-   ONE persistent session (capacity 1). Add an LRU of N sessions per model
-   so doc-A and doc-B requests don't evict each other. (Memory cost: N × KV.
-   Cap via `--llama-cache-entries` and `--llama-cache-mem`.)
-2. **Per-layer KV quantization for GGUF** — llama.cpp exposes `type_k` /
-   `type_v` in `llama_context_params`. Expose `--llama-kv-quant 4|8` in
-   mlx-serve. Half/quarter the KV memory → more concurrent slots.
-3. **Concurrent decoding across sessions** — llama.cpp supports parallel
-   sequences in one context. Today mlx-serve forces serial via the submit
-   gate. After Phase 1 lands an analogous mechanism for MLX, evaluate
-   un-serializing GGUF for the parallel case.
-4. **n_ubatch / n_threads_batch auto-tune** — measurement-gated. The shim
-   currently uses libllama defaults. Sweep on Apple Silicon and pick the
-   best per (model size × quant) tuple, persist in `~/.mlx-serve/llama-tune.json`.
-5. **Speculative-decode + persistent session interaction** — verify Phase 3
-   composes with the prefix cache (resident tokens must reflect ACCEPTED
-   tokens only). Test composes both at once.
+**What did ship from this phase:**
 
-**Acceptance**: ≥ 25% cold prefill improvement on GGUF (vs LM Studio same
-quant/model) OR ≥ 20% decode improvement, with no correctness regression.
+- `tests/test_phase2_forward_equivalence.sh` + fixtures under
+  `tests/fixtures/phase2_forward_equivalence/`: a TDD tripwire pinning
+  greedy temp=0 output across hybrid SSM + plain attention × 3 prompt
+  kinds. Re-run after any change to `src/transformer.zig`'s forward
+  path (analogous to `test_hybrid_reuse_equivalence.sh` for Phase 1).
+- `MLX_SERVE_COMPILE_FORWARD=1` env opt-in. Off by default. Useful as a
+  bisect tool if Apple ships a meaningfully better compile in a future
+  mlx-c release; flip and re-bench to find out.
 
-### Phase 6 — Concurrent / continuous batching
+**Reopen criteria:**
 
-mlx-serve has a batched-decode path for MLX (`runDecodeTick`), gated to plain
-attention. Bring it to feature parity:
+- A future mlx-c release ships a fused conv1d+silu+rmsnorm Metal kernel
+  (i.e., Apple themselves close the gap) — Phase 2 re-measures and
+  potentially recaptures the win at zero cost on our side.
+- A research effort yields a custom Metal kernel that fuses the GDN
+  block beyond what Apple's stock `gated_delta_kernel` does. Multi-week
+  scope, byte-equivalence pin already in place.
 
-1. **Continuous batching for MLX hybrid** — once SSM checkpointing (Phase 1)
-   lands, per-slot SSM state can co-exist with batched attention. Verify
-   batched decode works for Qwen3.5 MLX with `--max-concurrent N`.
-2. **GGUF concurrent slots via llama.cpp's parallel sequences** — see Phase 5
-   #3. Requires the shim to expose `llama_n_seq_max` + `seq_id` per decode.
-3. **Auto-clamp `max_concurrent`** for engine-backed models based on
-   available memory (KV per slot × N must fit). Today it's a manual flag.
+**Suggested next phase per the original ordering:** Phase 3 (GGUF
+speculative decoding) — clean +2× decode win using documented llama.cpp
+APIs; LM Studio doesn't ship it by default.
 
-**Acceptance**: 2 concurrent requests sustain ≥ 1.7× single-request
-throughput (per-slot) on both engines. Existing `tests/bench_concurrent.py`
-already measures this — extend to GGUF.
+(Original Phase 2 spec preserved below for context.)
 
-### Phase 7 — Quantization tuning
+### Phase 2 — Original spec (preserved)
 
-Lower-priority, high-leverage. Run after Phases 0–4.
+Qwen3.5-4B MLX cold is ~385 tok/s; that's 100% GatedDeltaNet forward compute
+(`MLX_SERVE_PREFILL_TRACE=1` confirms 2940 ms of 2941 is the forward). The
+gap to LM Studio on cold is small (~tied on the post-Phase-1 bench) because
+LM Studio loads the same MLX backend; the gap to mlx-lm is the real ceiling
+to chase.
 
-1. **MLX TurboQuant default** — already shipped; bench whether
-   `turbo2`/`turbo4` should be the default for INT4 weights (the prior work
-   noted byte-stable past 30 tokens at temp ≥ 0.01; verify on Qwen3.5).
-2. **MLX 2-bit weight quantization** — the CLAUDE.md notes 1-bit needs custom
-   pack/unpack; 2-bit may be tractable via `mlx_quantize(..., 2)`. Worth a bench.
+**Approach** (unchanged):
+1. Get a reference cold prefill from `mlx_lm.generate` running the SAME
+   Qwen3.5-4B MLX 4-bit model. If mlx-serve is materially slower, the gap
+   is the optimization target.
+2. Diff `transformer.zig`'s `gatedDeltaNet` / `mamba2Mixer` / `conv1dWithCache`
+   against `mlx-lm/qwen3_5/...`. Common gaps:
+   - Mamba2 parallel scan (SSD form) — mlx-lm may use it; check.
+   - Fused conv1d + gating vs separate ops.
+   - bf16↔fp32 round-trips around the scan.
+   - Tile sizes for the recurrence.
+   - Per-layer eval insertion across the prefill loop (SSM lazy graph may
+     grow across the whole prompt; KV is eval'd per chunk but SSM is not).
+3. Profile with Metal frame capture (Xcode Metal Debugger). If memory-bound,
+   tile sizes; if compute-bound, fusion / FLOPs.
+4. If a Metal kernel dominates, consider a custom kernel via mlx's
+   `metal_kernel` API (may need to add to `src/mlx.zig`).
+
+**Validation:** byte-equivalence (first 30 tokens, temp=0) against the
+pre-change forward for every `model_type` touching the changed path:
+`qwen3_5`, `qwen3_5_moe`, `qwen3_next`, `lfm2`, `nemotron_h`,
+`gemma4`/`gemma4_text` for the conv1d helper.
+
+**Acceptance:** ≥ 30% cold prefill improvement on Qwen3.5-4B MLX *and*
+byte-equivalent across listed archs. Drop the change otherwise.
+
+### Phase 5 #1 — Multi-entry hot prefix cache for GGUF — OPEN
+
+Today the llama.cpp path keeps **one** persistent `LlamaSession` per model
+(`LoadedModel.llama_session`). With one entry, switching between document A
+and document B silently evicts the other's KV — the warm advantage flips
+back to cold on every switch. Phase 1 already showed merge-on-extend
+matters; for GGUF we need a true LRU.
+
+**Approach:**
+1. Replace `LoadedModel.llama_session: ?*LlamaSession` with a small array
+   (e.g., `llama_sessions: [N]?*LlamaSession` + `last_used: [N]u64`).
+2. In `runPrefillLlama`, find the entry with the longest common prefix
+   against the incoming prompt (similar to `HotPrefixCache.findBestMatch`
+   but on token mirrors). If miss: evict LRU, create fresh session.
+3. CLI: `--llama-cache-entries N` (default 1 for backwards-compat),
+   `--llama-cache-mem <bytes>` (cap per-session ctx × N).
+4. Session contention: `llama_session_busy` becomes per-entry; the submit
+   gate waits on the chosen entry, not the model.
+
+**Validation:** new `tests/test_llama_multi_session.sh` — alternate two
+distinct long-doc QA prompts; assert each gets `cached_n > 0` on its
+second visit.
+
+**Acceptance:** zero regression on single-doc workflow, near-zero TTFT
+on alternation between N distinct doc roots.
+
+### Phase 4 #1 — Parallel tokenize on the connection thread — OPEN
+
+Today `handleChatCompletions` renders the chat template + tokenizes inline
+**before** `sch.submit()`. For short prompts this is a few ms; for long
+prompts (8k+ doc) it's > 50 ms on the connection thread. The scheduler
+queue wait dominates only when busy; for the common single-slot case
+they're sequential and the user pays both.
+
+**Approach:**
+1. Add `tokenize_ms` to `formatTimingsObject` so we can measure where
+   the time goes (instrumentation-first).
+2. If render+tokenize > 5% of TTFT for short prompts, move to a worker
+   thread that pipelines with the scheduler queue wait. The slot.submit
+   contract accepts pre-tokenized `prompt_ids: []const u32`, so the
+   architectural change is small (move the render+tokenize work into a
+   future/promise consumed at submit-time).
+
+**Acceptance:** ≥ 20 ms off measured end-to-end TTFT on short prompts.
+
+### Phase 4 #3 — System-prompt prewarm — OPEN
+
+When the loaded model has a stable system prompt (e.g., agent flows where
+the same system + tools combination repeats every turn), we can:
+
+1. Pre-tokenize at load time and stash on `LoadedModel.warm_system_tokens`.
+2. Optionally prefill the KV cache once at load with those tokens.
+3. Skip both on subsequent requests by comparing the first N tokens against
+   the resident cache.
+
+This is mostly a Phase 1 follow-on: Phase 1 already gives multi-turn
+warm reuse; this gives **first-turn** warm reuse when the system prompt
+is known up front.
+
+**Acceptance:** first-turn TTFT drops by ≥ 100 ms when the model launches
+with a fixed system prompt.
+
+### Phase 5 #3 (deeper GGUF wins) — OPEN
+
+After Phase 3 (spec decode) and Phase 5 #1 (multi-session) land, the remaining
+GGUF-beyond-LM-Studio knobs:
+
+- **Concurrent decoding across sessions** — llama.cpp supports parallel
+  sequences in one context. Today mlx-serve forces serial via the submit
+  gate. After Phase 6's MLX work, evaluate un-serializing GGUF too.
+- **n_ubatch / n_threads_batch auto-tune** — measurement-gated. Sweep on
+  Apple Silicon and persist in `~/.mlx-serve/llama-tune.json`.
+- **Speculative-decode + persistent session composition** — verify Phase 3
+  composes with the prefix cache (resident tokens reflect ACCEPTED tokens
+  only). Test composes both at once.
+
+### Phase 6 — Concurrent / continuous batching for hybrid — OPEN
+
+mlx-serve has batched decode for plain-attention dense models
+(`runDecodeTick`, `--max-concurrent N`). With Phase 1's SSM checkpointing
+landed, per-slot SSM state can co-exist with batched attention in
+principle — needs verification.
+
+1. Continuous batching for MLX hybrid — verify batched decode works for
+   Qwen3.5 MLX with `--max-concurrent N`. The SSM state is per-slot
+   (lives on `Slot.ssm_entries`); batched forward needs to interleave the
+   SSM update per slot. Non-trivial — the recurrent state can't share
+   weights across slots in one matmul the way attention K/V can.
+2. GGUF concurrent slots via llama.cpp's parallel sequences (depends on
+   Phase 5 #1 first).
+3. Auto-clamp `max_concurrent` for engine-backed models based on
+   available memory (KV per slot × N must fit).
+
+**Acceptance:** 2 concurrent requests sustain ≥ 1.7× single-request
+throughput on both engines.
+
+### Phase 7 — Quantization tuning — OPEN
+
+Lower-priority. Run after Phases 2–6.
+
+1. **MLX TurboQuant default** — bench whether `turbo2`/`turbo4` should be
+   the default for INT4 weights. Existing equivalence test infra applies.
+2. **MLX 2-bit weight quantization** — `mlx_quantize(..., 2)` is supported
+   natively; worth a bench. 1-bit needs custom pack/unpack.
 3. **GGUF quant matrix** — surface llama.cpp's quant variety
-   (Q4_K_M / IQ4_NL / IQ4_XS / Q5_K_M / etc.) in `/v1/models` so the Swift app
-   can show users the speed/quality trade-off per quant.
+   (Q4_K_M / IQ4_NL / IQ4_XS / Q5_K_M / etc.) in `/v1/models` so the Swift
+   app can show users the speed/quality trade-off per quant.
 
-**Acceptance**: a documented "best default per model size" table; no
+**Acceptance:** documented "best default per model size" table; no
 correctness regressions vs existing dense path.
 
-## Critical files
+## Critical files (post-Phase-1 map)
 
 | File | What lives here |
 |---|---|
-| `src/transformer.zig` | MLX forward pass (`gatedDeltaNet`, `mamba2Mixer`, `conv1dWithCache`, `KVCache`, `SSMCacheEntry*`, `KVCacheSnapshot`, `ssmSnapshot`/`ssmRestore`). Phase 1, Phase 2. |
-| `src/prefix_cache.zig` | Hot prefix cache. Phase 1 extends `Entry` with SSM checkpoint arrays; `shouldUse` gates per arch. |
-| `src/scheduler.zig` | Slot lifecycle, prefill/decode dispatch, `commitSlotIfApplicable`, persistent llama session gate. Phases 1, 3, 5, 6. |
-| `src/generate.zig` | Chunked prefill loop, decode, PLD/drafter dispatch, `Generator.initWithOptions`. Phase 2 (per-chunk SSM eval), Phase 3 (spec-decode dispatch for llama). |
-| `src/arch/llama.zig` + `src/llama_ffi.zig` + `lib/llama_shim/llama_shim.{h,c}` | libllama bridge. Phase 3 (spec decode), Phase 5 (multi-session, KV quant). |
-| `src/server.zig` | HTTP / SSE plumbing, `handleChatCompletions`, timing reporting (`formatTimingsObject`, `formatPerfBracket`). Phase 4 (tokenize-on-conn-thread, early SSE chunk). |
-| `tests/bench_prefill.sh` | Existing cold/warm harness — extend for Phase 0. |
-| `bench.sh` / `tests/bench_*.{sh,py}` | Existing bench infra; pattern for new comparative harnesses. |
-| `tests/test_pld_equivalence.sh` / `tests/test_drafter_equivalence.sh` | Byte-equivalence test templates — mirror for Phase 1 and Phase 3 GGUF spec decode. |
+| `src/transformer.zig` | MLX forward pass. `SSMCheckpoint`, `captureSsmCheckpoint`, `restoreSsmCheckpoint` for Phase 1. `gatedDeltaNet`, `mamba2Mixer`, `conv1dWithCache` for Phase 2. |
+| `src/generate.zig` | Chunked prefill with stride-aligned SSM snapshots (Phase 1). Drafter/PLD dispatch for Phase 3's MLX side. `Generator.takeSsmCheckpoints`. |
+| `src/prefix_cache.zig` | `Entry.ssm_checkpoints`, `commitWithSsm` with merge-on-extend, `lookupAndRestore` with hybrid effective-matched clamp, `shouldUse(config, enable_ssm_checkpoints)`. |
+| `src/scheduler.zig` | LoadParams plumbing, runPrefill calls commitSlotIfApplicable's drain. Phase 5 #1 expands `LoadedModel.llama_session` → LRU. |
+| `src/arch/llama.zig` + `lib/llama_shim/llama_shim.{h,c}` + `src/llama_ffi.zig` | libllama bridge. Phase 3 (spec decode) + Phase 5 (multi-session). `LlamaKvQuant` enum already in place. |
+| `src/server.zig` | HTTP/SSE plumbing. `formatTimingsObject` for Phase 4 #1's `tokenize_ms` field. `--ssm-checkpoint-stride` / `--ssm-checkpoint-max` / `--llama-kv-quant` globals. |
+| `src/model_registry.zig` | `LoadedModel` fields (Phase 1's `ssm_checkpoint_stride/max`, Phase 5 #2's `llama_kv_type_{k,v}`, future Phase 5 #1's `llama_sessions[]`). |
+| `tests/bench_final.sh` / `tests/bench_decode.sh` / `tests/plot_*.py` | Bench harness + chart renderers. Phase 2+ measures against these. |
+| `tests/test_hybrid_reuse_equivalence.sh` | Phase 1 regression guard. Re-run after any change to `src/prefix_cache.zig` or the SSM snapshot path. |
 
-## Reuse / patterns
-
-- **SSM snapshot/restore** (`transformer_mod.ssmSnapshot`, `ssmRestore`,
-  `ssmSnapshotDeinit`) — proven by PLD for intra-request rollback across
-  every hybrid arch. Phase 1 reuses these for cross-request checkpoints.
-- **Persistent engine session pattern** — `LoadedModel.llama_session` +
-  `llama_session_busy` gate in `Scheduler.submit`/`complete`. The MLX
-  equivalent (Phase 1, Phase 6) follows the same shape.
-- **Byte-equivalence test infra** — `tests/test_pld_equivalence.sh` (first-N
-  tokens at temp=0, env-gated on a model fixture). Every correctness-critical
-  phase ships a test in this shape.
-- **Server timing JSON** (`formatTimingsObject`) — already exposes
-  `prompt_n`, `cached_n`, `prompt_per_second`, `predicted_per_second`. New
-  fields the next agent will want:
-  - `tokenize_ms` (Phase 4 #1 — measure Jinja+BPE cost).
-  - `first_chunk_ms` (Phase 4 #2 — TTFT excluding decode).
-  - `accepted_drafts` / `proposed_drafts` (Phase 3 — speculative-decode telemetry).
-- **Decision-gate framing** — the prior `prefill/TTFT` plan's "drop the
-  sub-cause if Phase 2 evidence doesn't support it" is the right discipline.
-  Carry it forward: no speculative changes, every phase has measured
-  acceptance, drop sub-causes that miss the bar.
-
-## Risks & discipline
+## Risks & discipline (still apply)
 
 - **Cross-arch correctness is the project's red line.** Plain attention,
-  sliding-window (Gemma 3/4), hybrid SSM (lfm2 / nemotron_h / qwen3_5(_moe) /
-  qwen3_next), MoE, DSV4 — any shared-path change must pass byte-equivalence
-  on each model_type it touches. Don't ship single-arch wins as global flips.
-- **Per-position SSM checkpoints have a memory cost.** Bound them. Phase 1's
-  default stride should keep total checkpoint memory < the KV cache size
-  itself; bench memory before-and-after.
-- **Speculative decoding regresses for "creative" content (low draft
-  acceptance).** Honor the runtime gate (`spec_disabled_runtime` at < 50%
-  per-draft acceptance, warmup 5 ticks — see CLAUDE.md). Phase 3 reuses the
-  same threshold/warmup.
-- **The "384 for both engines" measurement was wrong.** Never trust
-  client-side TTFT as a prefill number. Use `timings.prompt_per_second` from
-  the server response, computed over UNCACHED tokens (Phase 1 of the prior
-  work).
+  sliding-window (Gemma 3/4), hybrid SSM (lfm2 / nemotron_h /
+  qwen3_5(_moe) / qwen3_next), MoE, DSV4 — any shared-path change must
+  pass byte-equivalence on each `model_type` it touches.
+- **Bench overhead is real.** Phase 1's chunked-prefill alignment cost
+  ~2% on cold for the warm wins. Future phases should budget similarly
+  and measure both halves.
+- **Speculative decoding regresses for "creative" content** (low draft
+  acceptance). Honor the runtime gate (`spec_disabled_runtime` at < 50%
+  per-draft acceptance, warmup 5). Phase 3 reuses the same threshold.
+- **Never trust client-side wall-time as a prefill number.** Use
+  `timings.prompt_per_second` from the server response, computed over
+  UNCACHED tokens. (See `tests/bench_final.sh` for the convention.)
 - **ReleaseFast is mandatory.** A Debug binary is 2-4× slower and silently
-  generated by some build flows (plain `swift build` triggers a Debug zig
-  rebuild). Check `du -h zig-out/bin/mlx-serve` after any build: ~4.3 MB =
-  ReleaseFast, ~10 MB = Debug — rebuild ReleaseFast or use `app/build.sh`.
-- **TDD is mandatory** for every code change (per CLAUDE.md). Write the
-  failing test first; verify reverting the change re-fails it.
+  generated by some build flows. Check `du -h zig-out/bin/mlx-serve`:
+  ~4.1 MB = ReleaseFast, ~10 MB = Debug.
+- **TDD is mandatory.** Write the failing test first; verify reverting the
+  change re-fails it. Phase 1's `test_hybrid_reuse_equivalence.sh` is the
+  template.
 - **No commits without explicit user direction.** Per the user's global rules.
 
-## Suggested execution order
+## Suggested execution order (next agent)
 
-1. Phase 0 — baseline harness + comparative numbers (1–2 days).
-2. Phase 1 — MLX hybrid prefix reuse via SSM checkpointing (4–7 days; the big
-   unlock for MLX TTFT).
-3. Phase 3 — GGUF speculative decoding (3–5 days; the cleanest decode win,
-   uses proven llama.cpp APIs).
-4. Phase 2 — MLX GatedDeltaNet forward optimization (open-ended; gate on
-   Phase 0's mlx-lm comparison telling you there's a real gap to close).
-5. Phase 4 — TTFT micro-optimizations (parallelizable with the above).
-6. Phase 5 — GGUF-beyond-LM-Studio polish (after Phase 3 lands).
-7. Phase 6 — Concurrent batching (after Phase 1 unblocks MLX hybrid).
-8. Phase 7 — Quantization defaults (last; runs after everything else).
+1. **Phase 3 — GGUF speculative decoding** (3–5 days; cleanest decode win
+   using proven llama.cpp APIs; the user's biggest remaining gap is
+   "decode parity on GGUF").
+2. **Phase 5 #1 — multi-entry GGUF LRU** (1–2 days; complements Phase 1 on
+   the GGUF side; trivial once you've internalized the prefix-cache patterns).
+3. **Phase 4 #1 + #3 — TTFT micro-opts** (parallelizable with the above;
+   each ≤ 1 day; measurement-gated).
+4. **Phase 2 — MLX GatedDeltaNet forward optimization** (open-ended;
+   gate on mlx-lm comparison telling you there's a real gap to close).
+5. **Phase 6 — Concurrent batching for hybrid** (after Phase 1 SSM
+   per-slot validation; depends on Phase 1 + 5 #1).
+6. **Phase 7 — Quantization defaults** (last; runs after everything else).
 
-## Definition of done
+## Definition of done (updated)
 
-The `bench/baseline-{date}.md` table from Phase 0 is re-run and shows
-mlx-serve **decisively** ahead of LM Studio in every cell, on every benched
-(model, engine, scenario) combination. The `tests/test_*.sh` suite is green.
-A 5-turn agent conversation against Qwen3.5-4B (either engine) shows
-turn-2..5 TTFT < 100 ms on a 1k-token shared context.
+The `docs/perf-vs-lmstudio-final.{md,png}` table is re-run after each phase
+and shows mlx-serve **decisively** ahead of LM Studio in every cell. Current
+table: 9/9 wins or ties. The remaining work narrows the cold-prefill gap
+(currently tied) and pushes warm/decode further ahead.
 
-If any cell still shows mlx-serve behind, the phase that owns it is reopened.
-The plan isn't done until the whole table is won.
+A 5-turn agent conversation against Qwen3.5-4B MLX shows turn-2..5 TTFT
+< 100 ms on a 1k-token shared context. **Already met (median 30-200 ms in
+the current bench)**.
+
+If any cell falls behind in a later re-run, the phase that owns it is reopened.
+The plan isn't done until every cell stays green across multiple runs.

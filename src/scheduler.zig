@@ -1653,6 +1653,25 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         xfm_ptr.compileMoeRouting();
     }
 
+    // Phase 2 experiment: opt-in full-forward Metal fusion via
+    // MLX_SERVE_COMPILE_FORWARD=1. This wraps the entire forward pass in
+    // mlx_compile so the chunked-prefill loop dispatches a fused graph
+    // instead of ~hundreds of separate ops per chunk. Gated because
+    // (a) the compiled closure captures `xfm.cache` / `xfm.ssm_entries`
+    // as state, and any path that swaps those (multi-slot scheduler,
+    // future re-entrant callers) must verify they're not racing the
+    // compiled call; (b) mlx_compile with shapeless=false recompiles
+    // per unique input shape, which thrashes if the prefill loop sees
+    // many different chunk sizes. Tied to byte-equivalence pin in
+    // tests/test_phase2_forward_equivalence.sh.
+    if (std.c.getenv("MLX_SERVE_COMPILE_FORWARD") != null) {
+        const raw = std.c.getenv("MLX_SERVE_COMPILE_FORWARD").?;
+        const slice = std.mem.sliceTo(raw, 0);
+        if (std.mem.eql(u8, slice, "1")) {
+            xfm_ptr.compileForward();
+        }
+    }
+
     // Vision encoder if requested. `MissingVisionWeights` is a benign opt-out
     // (model declares vision in config but the safetensors didn't ship the
     // tower); other errors fail the whole load.

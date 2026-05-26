@@ -600,7 +600,32 @@ pub const Generator = struct {
                 defer _ = mlx.mlx_array_free(chunk_input);
 
                 const chunk_start_ns = if (trace_enabled) prefill_sw.read() else 0;
-                const chunk_logits = try xfm.forwardWith(&ctx, chunk_input);
+                // Phase 2 experiment: when MLX_SERVE_COMPILE_FORWARD=1 wired a
+                // compiled closure at load time, route this chunk through it.
+                // The compiled closure uses xfm.defaultCtx (xfm.cache + xfm.ssm_entries),
+                // which matches the prefill `ctx` when the scheduler has swapped
+                // the slot's cache onto the Transformer (the single-slot legacy
+                // and Phase-2-swapped path both satisfy this). Hidden-capture
+                // and vision splice paths don't pass through this chunk loop
+                // (they take the last_input branch), so they're already safe.
+                // Optional-slice equality: same-ness here means both null or
+                // both point at the same backing memory. We accept ssm_entries
+                // null↔null too because plain-attn models legitimately have
+                // both ctx and xfm carry null.
+                const ssm_match = blk: {
+                    if (ctx.ssm_entries == null and xfm.ssm_entries == null) break :blk true;
+                    if (ctx.ssm_entries == null or xfm.ssm_entries == null) break :blk false;
+                    break :blk ctx.ssm_entries.?.ptr == xfm.ssm_entries.?.ptr and
+                        ctx.ssm_entries.?.len == xfm.ssm_entries.?.len;
+                };
+                const chunk_logits = if (xfm.compiled_forward != null and
+                    ctx.cache == &xfm.cache and
+                    ssm_match and
+                    ctx.capture_hidden == null and
+                    ctx.vision_embeddings == null)
+                    try xfm.forwardCompiled(chunk_input)
+                else
+                    try xfm.forwardWith(&ctx, chunk_input);
                 _ = mlx.mlx_array_free(chunk_logits);
                 if (trace_enabled) chunked_ns += prefill_sw.read() - chunk_start_ns;
 
