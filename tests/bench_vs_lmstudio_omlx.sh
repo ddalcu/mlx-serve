@@ -137,11 +137,17 @@ case "$FAMILY" in
         # 4-bit across the board (apples-to-apples MLX 4-bit vs GGUF Q4 vs
         # mlx-serve 4-bit). All four targets get both MLX baseline and GGUF alt.
         LMS_DIR="$HOME/.lmstudio/models"
+        # LM Studio 0.3+ dropped the `model@quant` ID syntax — model IDs are
+        # now the on-disk dirname (e.g. `gemma-4-e4b-it-mlx` for the MLX
+        # quant, `gemma-4-e4b-it` for the GGUF). The old `gemma-4-e4b-it@4bit`
+        # / `google/gemma-4-e4b` IDs return 404 against newer LM Studio.
+        # The script tolerates missing rows: any TARGETS entry whose
+        # `mlxserve_path` is absent skips silently.
         TARGETS=(
-            "gemma4-e2b-4bit|$LMS_DIR/mlx-community/gemma-4-e2b-it-4bit|gemma-4-e2b-it@4bit|google/gemma-4-e2b|$DM/gemma-4-E2B-it-assistant-bf16"
-            "gemma4-e4b-4bit|$LMS_DIR/mlx-community/gemma-4-e4b-it-4bit|gemma-4-e4b-it@4bit|google/gemma-4-e4b|$DM/gemma-4-E4B-it-assistant-bf16"
-            "gemma4-31b-4bit|$LMS_DIR/mlx-community/gemma-4-31b-it-4bit|gemma-4-31b-it@4bit|google/gemma-4-31b|$DM/gemma-4-31B-it-assistant-bf16"
-            "gemma4-26b-a4b-moe-4bit|$MD/gemma-4-26b-a4b-it-4bit|gemma-4-26b-a4b-it|google/gemma-4-26b-a4b|$DM/gemma-4-26B-A4B-it-assistant-bf16"
+            "gemma4-e2b-4bit|$LMS_DIR/mlx-community/gemma-4-e2b-it-4bit|gemma-4-e2b-it-mlx|gemma-4-e2b-it|$DM/gemma-4-E2B-it-assistant-bf16"
+            "gemma4-e4b-4bit|$LMS_DIR/mlx-community/gemma-4-e4b-it-4bit|gemma-4-e4b-it-mlx|gemma-4-e4b-it|$DM/gemma-4-E4B-it-assistant-bf16"
+            "gemma4-31b-4bit|$LMS_DIR/mlx-community/gemma-4-31b-it-4bit|gemma-4-31b-it-mlx|gemma-4-31b-it|$DM/gemma-4-31B-it-assistant-bf16"
+            "gemma4-26b-a4b-moe-4bit|$MD/gemma-4-26b-a4b-it-4bit|gemma-4-26b-a4b-it-mlx|gemma-4-26b-a4b-it|$DM/gemma-4-26B-A4B-it-assistant-bf16"
         )
         # Specs measured (per row): mlx-serve {none,pld,drafter} + omlx baseline
         # + lms_baseline + lms_alt (GGUF). Order matters: mlx-serve runs first
