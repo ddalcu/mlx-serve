@@ -46,9 +46,13 @@ FAMILIES = {
             "gemma4-31b-4bit",
             "gemma4-26b-a4b-moe-4bit",
         ],
+        # Order: LM Studio MLX baseline | LM Studio GGUF | mlx-serve GGUF
+        # (head-to-head with the LMS GGUF row) | oMLX | mlx-serve MLX
+        # {--no-pld, --pld, --drafter}.
         "variants": [
             ("lmstudio-baseline", "none",    "LM Studio (MLX, baseline)", "#888888", True),
             ("lmstudio-alt",      "none",    "LM Studio (GGUF)",          "#cccccc", False),
+            ("mlx-serve-gguf",    "none",    "MLX-serve (GGUF, llama.cpp)", "#a855f7", False),
             ("omlx",              "none",    "oMLX",                      "#2ca02c", False),
             ("mlx-serve",         "none",    "MLX-serve --no-pld",        "#3b82f6", False),
             ("mlx-serve",         "pld",     "MLX-serve --pld",           "#22c55e", False),

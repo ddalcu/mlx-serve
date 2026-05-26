@@ -125,10 +125,15 @@ OUT="$(mktemp -t bench_vs_lms.XXXXXX).csv"
 
 # ── Family-specific cell definitions ──
 #
-# Each row: label_prefix|mlxserve_path|lms_baseline_key|lms_alt_key|drafter_dir
-# - lms_baseline_key  → primary LMS baseline (UD MLX where applicable)
-# - lms_alt_key       → secondary LMS variant (GGUF for Qwen, empty for Gemma)
-# - drafter_dir       → Gemma 4 assistant drafter checkpoint, empty otherwise
+# Each row: label_prefix|mlxserve_mlx_path|lms_baseline|lms_alt|drafter_dir|mlxserve_gguf_path
+# - mlxserve_mlx_path   → MLX safetensors dir for the mlx-serve cells
+# - lms_baseline        → primary LMS model id (MLX baseline where applicable)
+# - lms_alt             → secondary LMS variant (GGUF id)
+# - drafter_dir         → Gemma 4 assistant drafter checkpoint, empty otherwise
+# - mlxserve_gguf_path  → .gguf file (or dir containing one) for the mlx-serve
+#                         GGUF cell. Same artifact LMS loads for `lms_alt` so
+#                         the head-to-head is apples-to-apples. Empty/missing
+#                         skips the mlx-serve-gguf cell for this row.
 declare -a TARGETS
 case "$FAMILY" in
     gemma)
@@ -137,6 +142,8 @@ case "$FAMILY" in
         # 4-bit across the board (apples-to-apples MLX 4-bit vs GGUF Q4 vs
         # mlx-serve 4-bit). All four targets get both MLX baseline and GGUF alt.
         LMS_DIR="$HOME/.lmstudio/models"
+        # Vendored GGUFs (LM Studio loads the same artifact under the hood).
+        SANDISK_GGUF="/Volumes/Sandisk_1TB/Models/lmstudio-community"
         # LM Studio 0.3+ dropped the `model@quant` ID syntax — model IDs are
         # now the on-disk dirname (e.g. `gemma-4-e4b-it-mlx` for the MLX
         # quant, `gemma-4-e4b-it` for the GGUF). The old `gemma-4-e4b-it@4bit`
@@ -144,19 +151,20 @@ case "$FAMILY" in
         # The script tolerates missing rows: any TARGETS entry whose
         # `mlxserve_path` is absent skips silently.
         TARGETS=(
-            "gemma4-e2b-4bit|$LMS_DIR/mlx-community/gemma-4-e2b-it-4bit|gemma-4-e2b-it-mlx|gemma-4-e2b-it|$DM/gemma-4-E2B-it-assistant-bf16"
-            "gemma4-e4b-4bit|$LMS_DIR/mlx-community/gemma-4-e4b-it-4bit|gemma-4-e4b-it-mlx|gemma-4-e4b-it|$DM/gemma-4-E4B-it-assistant-bf16"
-            "gemma4-31b-4bit|$LMS_DIR/mlx-community/gemma-4-31b-it-4bit|gemma-4-31b-it-mlx|gemma-4-31b-it|$DM/gemma-4-31B-it-assistant-bf16"
-            "gemma4-26b-a4b-moe-4bit|$MD/gemma-4-26b-a4b-it-4bit|gemma-4-26b-a4b-it-mlx|gemma-4-26b-a4b-it|$DM/gemma-4-26B-A4B-it-assistant-bf16"
+            "gemma4-e2b-4bit|$LMS_DIR/mlx-community/gemma-4-e2b-it-4bit|gemma-4-e2b-it-mlx|gemma-4-e2b-it|$DM/gemma-4-E2B-it-assistant-bf16|$SANDISK_GGUF/gemma-4-E2B-it-GGUF/gemma-4-E2B-it-Q4_K_M.gguf"
+            "gemma4-e4b-4bit|$LMS_DIR/mlx-community/gemma-4-e4b-it-4bit|gemma-4-e4b-it-mlx|gemma-4-e4b-it|$DM/gemma-4-E4B-it-assistant-bf16|$SANDISK_GGUF/gemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q4_K_M.gguf"
+            "gemma4-31b-4bit|$LMS_DIR/mlx-community/gemma-4-31b-it-4bit|gemma-4-31b-it-mlx|gemma-4-31b-it|$DM/gemma-4-31B-it-assistant-bf16|"
+            "gemma4-26b-a4b-moe-4bit|$MD/gemma-4-26b-a4b-it-4bit|gemma-4-26b-a4b-it-mlx|gemma-4-26b-a4b-it|$DM/gemma-4-26B-A4B-it-assistant-bf16|"
         )
-        # Specs measured (per row): mlx-serve {none,pld,drafter} + omlx baseline
-        # + lms_baseline + lms_alt (GGUF). Order matters: mlx-serve runs first
-        # while the machine is coolest, omlx in the middle (same MLX backend so
-        # it'd benefit from a fresh start too), LMS runs last so any thermal
-        # throttling that builds up during the row falls on the comparison
-        # engines, not on us. lms_alt rows skip silently when the row has no
-        # GGUF key configured (31B, 26B-A4B currently).
-        SPECS=("mlx-serve::none" "mlx-serve::pld" "mlx-serve::drafter" "omlx:base:none" "lmstudio:lms_baseline:none" "lmstudio:lms_alt:none")
+        # Specs measured (per row): mlx-serve {none,pld,drafter} + mlx-serve
+        # GGUF (none — PLD/drafter are MLX-only and silently no-op on the
+        # llama.cpp path) + omlx baseline + lms_baseline + lms_alt (GGUF).
+        # Order matters: mlx-serve MLX first (cool machine), mlx-serve GGUF
+        # next, omlx in the middle, LMS specs last so any thermal throttling
+        # that builds up during the row falls on the comparison engines, not
+        # on us. lms_alt rows skip silently when the row has no GGUF key
+        # configured (31B, 26B-A4B currently).
+        SPECS=("mlx-serve::none" "mlx-serve::pld" "mlx-serve::drafter" "mlx-serve:alt:none" "omlx:base:none" "lmstudio:lms_baseline:none" "lmstudio:lms_alt:none")
         # Workaround needed? (assistant <think></think> prefill on LMS)
         LMS_THINKING_WORKAROUND=0
         ;;
@@ -166,12 +174,13 @@ case "$FAMILY" in
         # (not the unsloth UD variants — those are bigger on disk and we want
         # the more representative production checkpoint here).
         TARGETS=(
-            "qwen36-27b|$LMS_DIR/mlx-community/Qwen3.6-27B-4bit|mlx-community/qwen3.6-27b|qwen/qwen3.6-27b|"
-            "qwen36-35b-a3b|$LMS_DIR/mlx-community/Qwen3.6-35B-A3B-4bit|qwen3.6-35b-a3b@4bit|qwen/qwen3.6-35b-a3b|"
+            "qwen36-27b|$LMS_DIR/mlx-community/Qwen3.6-27B-4bit|mlx-community/qwen3.6-27b|qwen/qwen3.6-27b||"
+            "qwen36-35b-a3b|$LMS_DIR/mlx-community/Qwen3.6-35B-A3B-4bit|qwen3.6-35b-a3b@4bit|qwen/qwen3.6-35b-a3b||"
         )
         # Same ordering rule as gemma: mlx-serve first (cool machine), omlx
         # in the middle, LMS specs last so thermal throttling penalises the
-        # comparison.
+        # comparison. No mlx-serve GGUF cell on qwen36 yet (vendored GGUFs
+        # not on this machine; add a mlxserve_gguf_path to TARGETS to enable).
         SPECS=("mlx-serve::none" "mlx-serve::pld" "omlx:base:none" "lmstudio:lms_baseline:none" "lmstudio:lms_alt:none")
         LMS_THINKING_WORKAROUND=1
         ;;
@@ -562,7 +571,7 @@ else
 fi
 
 for row in "${TARGETS[@]}"; do
-    IFS='|' read -r logical mlxserve_path lms_baseline lms_alt drafter <<<"$row"
+    IFS='|' read -r logical mlxserve_path lms_baseline lms_alt drafter mlxserve_gguf_path <<<"$row"
     [[ -d "$mlxserve_path" ]] || { echo "SKIP missing $mlxserve_path" >&2; continue; }
 
     for spec_entry in "${SPECS[@]}"; do
@@ -579,8 +588,19 @@ for row in "${TARGETS[@]}"; do
                 [[ "$HAS_OMLX" -eq 1 ]] || { echo "  SKIP ${logical}/omlx/${spec} (omlx not on PATH)" >&2; continue; }
                 run_cell "${logical}/omlx/${spec}"               "omlx"      "$mlxserve_path" "$spec" "" ""
                 ;;
-            "mlx-serve|"|"mlx-serve|*")
-                # Skip drafter cell when no drafter dir is present (Qwen).
+            "mlx-serve|alt")
+                # mlx-serve loading the same .gguf LM Studio uses. PLD /
+                # drafter silently no-op on the llama.cpp path (those are
+                # MLX-only kernels), so the only meaningful spec here is
+                # `none` — the SPECS list reflects that.
+                if [[ -z "$mlxserve_gguf_path" || ! -e "$mlxserve_gguf_path" ]]; then
+                    echo "  SKIP ${logical}/mlx-serve-gguf/${spec} (no mlxserve_gguf_path or file missing)" >&2
+                    continue
+                fi
+                run_cell "${logical}/mlx-serve-gguf/${spec}"     "mlx-serve" "$mlxserve_gguf_path" "$spec" "" ""
+                ;;
+            "mlx-serve|")
+                # Empty variant = MLX safetensors path (default).
                 if [[ "$spec" == "drafter" && ( -z "$drafter" || ! -d "$drafter" ) ]]; then
                     continue
                 fi
