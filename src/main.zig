@@ -81,6 +81,12 @@ fn printUsage(io: std.Io) void {
         \\                        tokenize results (default: 4). Skips re-
         \\                        rendering identical messages on warm reuse.
         \\                        0 disables.
+        \\  --llama-cache-entries <n>
+        \\                      For GGUF models served via llama.cpp, the max
+        \\                        number of resident KV sessions (default: 1).
+        \\                        N > 1 keeps the N most-recently-used prompts
+        \\                        hot so alternating multi-doc workloads don't
+        \\                        cold-prefill on every flip.
         \\  --model-dir <dir>   Directory of MLX models to discover at startup.
         \\                        Discovered siblings appear in /v1/models and
         \\                        can be loaded on-demand via /v1/load-model
@@ -256,6 +262,13 @@ pub fn main(init: std.process.Init) !void {
             // renders+re-tokenizes, mirrors pre-Iteration-2 behavior).
             i += 1;
             server_mod.tokenize_cache_entries = std.fmt.parseInt(u32, args[i], 10) catch 4;
+        } else if (std.mem.eql(u8, args[i], "--llama-cache-entries") and i + 1 < args.len) {
+            // Iteration 3-5 (perf-plan Phase 5 #1): max concurrent
+            // llama.cpp KV sessions per model. 1 = legacy single-session
+            // (every prefill fights for the one slot). > 1 enables the
+            // best-prefix-match LRU.
+            i += 1;
+            server_mod.llama_cache_entries = std.fmt.parseInt(u32, args[i], 10) catch 1;
         } else if (std.mem.eql(u8, args[i], "--ssm-checkpoint-stride") and i + 1 < args.len) {
             // Phase 1 (perf-plan): per-position SSM/conv state snapshots during
             // chunked prefill enable multi-turn warm reuse on hybrid SSM
@@ -629,6 +642,7 @@ pub fn main(init: std.process.Init) !void {
             .ssm_checkpoint_stride = server_mod.ssm_checkpoint_stride,
             .ssm_checkpoint_max = server_mod.ssm_checkpoint_max,
             .tokenize_cache_entries = server_mod.tokenize_cache_entries,
+            .llama_cache_entries = server_mod.llama_cache_entries,
             .llama_kv_type_k = server_mod.llama_kv_quant.ggmlType(),
             .llama_kv_type_v = server_mod.llama_kv_quant.ggmlType(),
         };
@@ -1062,6 +1076,8 @@ fn runDs4Serve(
         .kv_quant_config = transformer_mod.KVQuantConfig.dense,
         .prefix_cache_capacity = 0,
         .prefix_cache_mem_bytes = 0,
+        // Iteration 2: tokenize cache for ds4 too.
+        .tokenize_cache_entries = server_mod.tokenize_cache_entries,
         .ds4_path = gguf_path_owned,
     };
 
@@ -1307,6 +1323,16 @@ fn runLlamaServe(
         .kv_quant_config = transformer_mod.KVQuantConfig.dense,
         .prefix_cache_capacity = 0,
         .prefix_cache_mem_bytes = 0,
+        // Iteration 2 + 3-5: thread the tokenize cache + multi-session
+        // LRU through the llama-specific LoadParams. doLoadLlamaOnInferenceThread
+        // reads both fields.
+        .tokenize_cache_entries = server_mod.tokenize_cache_entries,
+        .llama_cache_entries = server_mod.llama_cache_entries,
+        // Phase 5 #2: also thread the llama KV-quant types on this path
+        // (the MLX branch sets them via the shared assignment, which we
+        // don't reach for GGUF models).
+        .llama_kv_type_k = server_mod.llama_kv_quant.ggmlType(),
+        .llama_kv_type_v = server_mod.llama_kv_quant.ggmlType(),
         .llama_path = gguf_path_owned,
     };
 

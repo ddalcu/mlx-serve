@@ -136,6 +136,12 @@ pub const LoadParams = struct {
     /// handful of repeated prompts, and full chat conversations bump
     /// this counter anyway via LRU as new turns arrive.
     tokenize_cache_entries: u32 = 4,
+    /// Iteration 3-5 (perf-plan Phase 5 #1): maximum resident llama.cpp
+    /// sessions per model. 1 = legacy single-session behavior (every
+    /// llama prefill fights one KV slot). > 1 keeps the N
+    /// most-recently-used prompts hot in independent contexts so
+    /// alternating multi-doc agent loads don't cold-prefill every flip.
+    llama_cache_entries: u32 = 1,
     /// Phase 5 #2: ggml types for the embedded llama.cpp KV cache.
     /// 0 = libllama default (F16); other values match `ggml_type` enum
     /// (Q8_0=8, Q4_0=2). Wired through `Scheduler.doLoadOnInferenceThread`
@@ -665,6 +671,9 @@ pub const LoadRequest = struct {
     /// `LoadParams.tokenize_cache_entries`; both paths feed
     /// `doLoadOnInferenceThread`.
     tokenize_cache_entries: u32 = 4,
+    /// Iteration 3-5: llama.cpp multi-session cap. Mirrors
+    /// `LoadParams.llama_cache_entries`.
+    llama_cache_entries: u32 = 1,
     /// Phase 5 #2: ggml types for the embedded llama.cpp KV cache. 0 keeps
     /// libllama default (F16); Q8_0=8, Q4_0=2. Threaded onto the LoadedModel
     /// at load time.
@@ -1483,6 +1492,14 @@ fn doLoadDs4OnInferenceThread(sch: *Scheduler, params: anytype) !void {
     entry.drafter_block_size = 0;
     entry.drafter_path = "";
     entry.prefix_cache = null;
+    // Iteration 2: tokenize cache also applies on the ds4 path. The
+    // MLX-branch assignment isn't reached here because we early-return.
+    if (params.tokenize_cache_entries > 0) {
+        entry.tokenize_cache = tokenize_cache_mod.TokenizeCache.init(
+            sch.allocator,
+            params.tokenize_cache_entries,
+        );
+    }
 
     // Bytes-resident is whatever main.zig handed us (typically the GGUF
     // on-disk size). ds4's `ds4_context_memory_estimate` could give a
@@ -1544,6 +1561,26 @@ fn doLoadLlamaOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     entry.drafter_block_size = 0;
     entry.drafter_path = "";
     entry.prefix_cache = null;
+    // Iteration 2: tokenize cache also applies on the llama path — same
+    // chat-template render + tokenize round-trip per request. Wire it
+    // here too so `--tokenize-cache-entries N` works for GGUFs.
+    if (params.tokenize_cache_entries > 0) {
+        entry.tokenize_cache = tokenize_cache_mod.TokenizeCache.init(
+            sch.allocator,
+            params.tokenize_cache_entries,
+        );
+    }
+    // Iteration 3-5: cap for the llama.cpp multi-session LRU. The MLX
+    // load path sets this further down; for llama we exit early at the
+    // top of doLoadOnInferenceThread, so it has to land here.
+    entry.llama_cache_max_entries = if (params.llama_cache_entries > 0)
+        params.llama_cache_entries
+    else
+        1;
+    // Phase 5 #2: ggml KV-quant types — same reason as above; the
+    // MLX path's assignment is never reached on the llama branch.
+    entry.llama_kv_type_k = params.llama_kv_type_k;
+    entry.llama_kv_type_v = params.llama_kv_type_v;
 
     const bytes_resident: u64 = if (entry.bytes_on_disk) |b| b else 0;
 
@@ -1829,6 +1866,13 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             params.tokenize_cache_entries,
         );
     }
+    // Iteration 3-5: cap for the llama.cpp multi-session LRU. Always
+    // clamp to ≥1 so `runPrefillLlama` can grow the cache even if a
+    // bug or a 0-default leaks through.
+    entry.llama_cache_max_entries = if (params.llama_cache_entries > 0)
+        params.llama_cache_entries
+    else
+        1;
     // Phase 5 #2: thread KV-quant types onto the LoadedModel so
     // runPrefillLlama uses them when creating the persistent session.
     entry.llama_kv_type_k = params.llama_kv_type_k;
@@ -2275,28 +2319,87 @@ fn runPrefillDs4(sch: *Scheduler, slot: *Slot, engine: *arch_ds4.Ds4Engine) !voi
 /// `cached_tokens` reports the reused prefix length; `prompt_tokens` stays the
 /// full prompt so prefill tok/s reflects only the uncached suffix.
 fn runPrefillLlama(sch: *Scheduler, slot: *Slot, engine: *arch_llama.LlamaEngine) !void {
-    _ = sch;
     const i32_prompt = try slot.allocator.alloc(i32, slot.full_prompt.len);
     defer slot.allocator.free(i32_prompt);
     for (slot.full_prompt, 0..) |t, i| i32_prompt[i] = @intCast(t);
 
     // Size to the stub config's context length (main.zig sets it from the user's
     // --ctx-size or the GGUF's trained context). 0 → libllama uses the model
-    // default (its trained context). The session is created once and reused.
+    // default (its trained context).
     const ctx_size: i32 = if (slot.model.config) |c| @intCast(c.max_position_embeddings) else 0;
-    const sess = if (slot.model.llama_session) |s| s else blk: {
-        // Phase 5 #2: honor the configured llama KV-quant scheme. Read off
-        // the LoadedModel (set by the scheduler at load time from
-        // LoadParams.llama_kv_quant), default 0/0 = F16.
+
+    // Phase 5 #1 (Iteration 3-5): pick the best matching entry out of the
+    // LRU. The "best" = longest common prefix between the incoming prompt
+    // and the entry's resident KV mirror; ties (including the all-zero
+    // case) go to the least-recently-used entry so a brand-new prompt
+    // doesn't keep clobbering the same slot.
+    const max_entries = if (slot.model.llama_cache_max_entries > 0)
+        slot.model.llama_cache_max_entries
+    else
+        1;
+
+    // Chat templates produce a fixed leading prefix (system header, BOS,
+    // role markers) that's identical across requests — for Qwen3-style
+    // it's ~3-10 tokens. Treating that as a "hit" would let request B
+    // claim request A's slot just to save a handful of tokens, evicting
+    // A's content-bearing KV. Require a higher floor before we count a
+    // resident entry as a meaningful match. The value 16 sits above
+    // every chat template's pure prologue in this codebase (Gemma=12,
+    // Qwen=8, Llama=4) and below any real user-message overlap.
+    const min_prefix_to_claim: usize = 16;
+
+    var best_idx: ?usize = null;
+    var best_shared: usize = 0;
+    var lru_idx: ?usize = null;
+    var lru_used: i64 = std.math.maxInt(i64);
+    for (slot.model.llama_sessions.items, 0..) |entry, i| {
+        const shared = arch_llama.commonPrefixLen(entry.session.resident.items, i32_prompt);
+        // Strict >: ties leave the lower-indexed entry in `best_idx`, which
+        // is fine — we still need the prefix-match candidate. The
+        // separately tracked `lru_idx` handles the cold-miss path.
+        if (shared > best_shared) {
+            best_shared = shared;
+            best_idx = i;
+        }
+        if (entry.last_used_ns < lru_used) {
+            lru_used = entry.last_used_ns;
+            lru_idx = i;
+        }
+    }
+
+    // Promote the best match only when it crosses the chat-template floor;
+    // otherwise fall through to growth / LRU eviction.
+    if (best_shared < min_prefix_to_claim) best_idx = null;
+
+    var pick_idx: usize = undefined;
+    if (best_idx) |i| {
+        pick_idx = i;
+    } else if (slot.model.llama_sessions.items.len < max_entries) {
+        // Grow the cache — every prefill so far missed; allocate a new
+        // session and append it.
         const type_k = slot.model.llama_kv_type_k;
         const type_v = slot.model.llama_kv_type_v;
         const created = if (type_k != 0 or type_v != 0)
             try engine.createSessionWithKvQuant(ctx_size, type_k, type_v)
         else
             try engine.createSession(ctx_size);
-        slot.model.llama_session = created;
-        break :blk created;
-    };
+        errdefer created.free();
+        try slot.model.llama_sessions.append(slot.allocator, .{ .session = created, .last_used_ns = 0 });
+        pick_idx = slot.model.llama_sessions.items.len - 1;
+        log.info("[llama-cache] created session #{d} (cap={d})\n", .{ pick_idx, max_entries });
+    } else {
+        // Full + no prefix match — evict the LRU entry by resetting its KV
+        // in place. Keeps the libllama context alive (re-allocating per
+        // miss would be expensive) but drops the resident-token mirror so
+        // the next sync starts from zero.
+        pick_idx = lru_idx.?;
+        slot.model.llama_sessions.items[pick_idx].session.reset();
+        log.info("[llama-cache] evicted LRU session #{d}\n", .{pick_idx});
+    }
+
+    const entry_ptr = &slot.model.llama_sessions.items[pick_idx];
+    entry_ptr.last_used_ns = @intCast(std.Io.Timestamp.now(sch.io, .boot).nanoseconds);
+    const sess = entry_ptr.session;
 
     const cached = sess.sync(i32_prompt) catch |err| {
         // A partial decode (e.g. prompt exceeds context) can leave KV and the

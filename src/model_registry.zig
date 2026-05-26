@@ -40,6 +40,18 @@ const DrafterModel = drafter_mod.DrafterModel;
 const HotPrefixCache = prefix_cache_mod.HotPrefixCache;
 const TokenizeCache = tokenize_cache_mod.TokenizeCache;
 
+/// One slot in `LoadedModel.llama_sessions` (Iteration 3-5 of the perf
+/// plan / Phase 5 #1). Each entry wraps a libllama context. The KV
+/// state and the resident-token mirror live inside the session; we add
+/// `last_used_ns` for LRU eviction.
+pub const LlamaSessionEntry = struct {
+    session: *arch_llama.LlamaSession,
+    /// Bumped on every successful pick. Lowest = LRU. Monotonic — the
+    /// scheduler bumps it under the same lock that guards
+    /// `llama_sessions`, so reads/writes never race.
+    last_used_ns: i64 = 0,
+};
+
 /// Lifecycle of an entry. State transitions are guarded by `ModelRegistry.mutex`;
 /// the inference thread writes, connection threads read under the same lock and
 /// wait on `state_cond` for transitions.
@@ -136,14 +148,27 @@ pub const LoadedModel = struct {
     /// fields and `ds4_engine` (set for every `.gguf` except DeepSeek-V4-Flash).
     llama_engine: ?*arch_llama.LlamaEngine = null,
 
-    /// Persistent llama.cpp session (one KV context reused across requests so a
-    /// shared prompt prefix is decoded once, matching LM Studio / llama-server
-    /// prompt caching). Created lazily on the first llama prefill and owned here
-    /// for the engine's lifetime — must be freed BEFORE `llama_engine` (it holds
-    /// a context bound to the engine's model). Borrowed (not owned) by the active
-    /// slot. `llama_session_busy` serializes the single context to one request at
-    /// a time (claimed in `Scheduler.submit`, released in `Scheduler.complete`).
-    llama_session: ?*arch_llama.LlamaSession = null,
+    /// Persistent llama.cpp sessions (Iteration 3-5 / Phase 5 #1): one or
+    /// more KV contexts, picked by best prompt-prefix match in
+    /// `runPrefillLlama`. With `--llama-cache-entries 1` (default for
+    /// backwards compat) this degenerates to the old single-session
+    /// behavior — one entry, every request fights for it. With N > 1 the
+    /// scheduler keeps the N most-recently-used sessions alive and
+    /// dispatches each incoming prompt to the entry whose resident KV
+    /// shares the longest prefix.
+    ///
+    /// `llama_session_busy` remains a model-wide gate — `max_concurrent=1`
+    /// today means only one llama request runs at a time anyway, and
+    /// adding per-entry concurrency would require an inference-thread
+    /// refactor we intentionally don't ship tonight.
+    ///
+    /// Sessions are freed BEFORE `llama_engine` in `deinit` because each
+    /// holds a context bound to the engine's model.
+    llama_sessions: std.ArrayListUnmanaged(LlamaSessionEntry) = .empty,
+    /// Cap on resident llama sessions. Mirrored from
+    /// `LoadParams.llama_cache_entries` at load time. 0 falls back to 1
+    /// for safety — every llama prefill needs at least one session.
+    llama_cache_max_entries: u32 = 1,
     llama_session_busy: bool = false,
     /// Phase 5 #2: ggml types for the K and V halves of the llama.cpp KV
     /// cache. 0 = libllama default (F16). Non-zero values are pulled from
@@ -182,11 +207,9 @@ pub const LoadedModel = struct {
     /// stream); the caller arranges this via `unloadResident` invoked
     /// from the inference thread before registry teardown.
     pub fn deinit(self: *LoadedModel) void {
-        if (self.llama_session) |session| {
-            session.free();
-            self.llama_session = null;
-            self.llama_session_busy = false;
-        }
+        for (self.llama_sessions.items) |entry| entry.session.free();
+        self.llama_sessions.deinit(self.allocator);
+        self.llama_session_busy = false;
         if (self.ds4_engine) |engine| {
             engine.close();
             self.ds4_engine = null;
@@ -253,11 +276,9 @@ pub const LoadedModel = struct {
     /// `.unloaded` for later listing/reload, AND by `Scheduler.deinit` so
     /// mlx frees happen on the inference thread.
     pub fn unloadResident(self: *LoadedModel) void {
-        if (self.llama_session) |session| {
-            session.free();
-            self.llama_session = null;
-            self.llama_session_busy = false;
-        }
+        for (self.llama_sessions.items) |entry| entry.session.free();
+        self.llama_sessions.clearRetainingCapacity();
+        self.llama_session_busy = false;
         if (self.ds4_engine) |engine| {
             engine.close();
             self.ds4_engine = null;

@@ -356,6 +356,14 @@ pub var ssm_checkpoint_max: u32 = 32;
 /// hoarding token buffers across a long session.
 pub var tokenize_cache_entries: u32 = 4;
 
+/// Iteration 3-5 (perf-plan Phase 5 #1): cap on resident llama.cpp KV
+/// sessions per loaded GGUF model. 1 keeps the legacy single-session
+/// behavior (a flip between two long-doc prompts evicts the other on
+/// every turn). N > 1 enables the best-prefix-match LRU so alternating
+/// multi-doc workloads stay warm. Default 1 = backwards-compat; tests
+/// and bench harnesses pass --llama-cache-entries N to exercise it.
+pub var llama_cache_entries: u32 = 1;
+
 /// Phase 5 (performance-plan) #2: KV-cache quantization for the embedded
 /// llama.cpp engine. `off` = F16 (libllama default); `q8` halves the KV
 /// bytes (Q8_0, near-lossless); `q4` quarters them (Q4_0, some quality
