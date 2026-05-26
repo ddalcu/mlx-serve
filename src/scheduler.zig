@@ -41,6 +41,7 @@ const model_mod = @import("model.zig");
 const vision_mod = @import("vision.zig");
 const chat_mod = @import("chat.zig");
 const prefix_cache_mod = @import("prefix_cache.zig");
+const tokenize_cache_mod = @import("tokenize_cache.zig");
 const model_registry_mod = @import("model_registry.zig");
 const arch_ds4 = @import("arch/ds4.zig");
 const arch_llama = @import("arch/llama.zig");
@@ -128,6 +129,13 @@ pub const LoadParams = struct {
     ssm_checkpoint_stride: u32 = 0,
     /// Phase 1: cap on snapshots retained per request.
     ssm_checkpoint_max: u32 = 32,
+    /// Iteration 2 (perf-plan Phase 4 #3): per-LoadedModel LRU cache
+    /// of chat-template render+tokenize results. 0 disables the cache
+    /// (useful for ablation benches / debugging). Default 4 matches
+    /// `prefix_cache_capacity` — most warm-reuse benches exercise a
+    /// handful of repeated prompts, and full chat conversations bump
+    /// this counter anyway via LRU as new turns arrive.
+    tokenize_cache_entries: u32 = 4,
     /// Phase 5 #2: ggml types for the embedded llama.cpp KV cache.
     /// 0 = libllama default (F16); other values match `ggml_type` enum
     /// (Q8_0=8, Q4_0=2). Wired through `Scheduler.doLoadOnInferenceThread`
@@ -653,6 +661,10 @@ pub const LoadRequest = struct {
     /// dropped front-first when the buffer would grow past this. 0 = no cap
     /// beyond the prefix-cache byte budget.
     ssm_checkpoint_max: u32 = 32,
+    /// Iteration 2: tokenize cache LRU capacity. Mirrored on
+    /// `LoadParams.tokenize_cache_entries`; both paths feed
+    /// `doLoadOnInferenceThread`.
+    tokenize_cache_entries: u32 = 4,
     /// Phase 5 #2: ggml types for the embedded llama.cpp KV cache. 0 keeps
     /// libllama default (F16); Q8_0=8, Q4_0=2. Threaded onto the LoadedModel
     /// at load time.
@@ -1802,6 +1814,20 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         );
         entry.ssm_checkpoint_stride = params.ssm_checkpoint_stride;
         entry.ssm_checkpoint_max = params.ssm_checkpoint_max;
+    }
+    // Iteration 2 (perf-plan Phase 4 #3): tokenize cache for warm-path
+    // chat-template renders. Applies to MLX, ds4, and llama engines —
+    // they all funnel through `chat_mod.formatChat` /
+    // `encodeChatViaDs4` / `encodeChatViaLlama` at the handler boundary.
+    // Default capacity is small (4 entries) because chat conversations
+    // mutate the messages list every turn; the goal is to catch warm
+    // reuse benches and repeated agent-loop probes, not to memoize a
+    // full session.
+    if (params.tokenize_cache_entries > 0) {
+        entry.tokenize_cache = tokenize_cache_mod.TokenizeCache.init(
+            sch.allocator,
+            params.tokenize_cache_entries,
+        );
     }
     // Phase 5 #2: thread KV-quant types onto the LoadedModel so
     // runPrefillLlama uses them when creating the persistent session.

@@ -76,6 +76,11 @@ fn printUsage(io: std.Io) void {
         \\                      Hot prefix cache KV-bytes budget (default: 2GB).
         \\                      Evicts LRU entries until the budget fits.
         \\                      Pass 0/off to disable the byte budget.
+        \\  --tokenize-cache-entries <n>
+        \\                      Per-model LRU cache of chat-template render +
+        \\                        tokenize results (default: 4). Skips re-
+        \\                        rendering identical messages on warm reuse.
+        \\                        0 disables.
         \\  --model-dir <dir>   Directory of MLX models to discover at startup.
         \\                        Discovered siblings appear in /v1/models and
         \\                        can be loaded on-demand via /v1/load-model
@@ -245,6 +250,12 @@ pub fn main(init: std.process.Init) !void {
                 log.err("--prefix-cache-mem: expected '<n>{{MB,GB,KB}}' or '0'/'off'; got '{s}'\n", .{args[i]});
                 std.process.exit(1);
             };
+        } else if (std.mem.eql(u8, args[i], "--tokenize-cache-entries") and i + 1 < args.len) {
+            // Iteration 2 (perf-plan Phase 4 #3): caps the per-LoadedModel
+            // chat-template tokenize cache. 0 = off (every request re-
+            // renders+re-tokenizes, mirrors pre-Iteration-2 behavior).
+            i += 1;
+            server_mod.tokenize_cache_entries = std.fmt.parseInt(u32, args[i], 10) catch 4;
         } else if (std.mem.eql(u8, args[i], "--ssm-checkpoint-stride") and i + 1 < args.len) {
             // Phase 1 (perf-plan): per-position SSM/conv state snapshots during
             // chunked prefill enable multi-turn warm reuse on hybrid SSM
@@ -617,6 +628,7 @@ pub fn main(init: std.process.Init) !void {
             .prefix_cache_mem_bytes = server_mod.prefix_cache_mem_bytes,
             .ssm_checkpoint_stride = server_mod.ssm_checkpoint_stride,
             .ssm_checkpoint_max = server_mod.ssm_checkpoint_max,
+            .tokenize_cache_entries = server_mod.tokenize_cache_entries,
             .llama_kv_type_k = server_mod.llama_kv_quant.ggmlType(),
             .llama_kv_type_v = server_mod.llama_kv_quant.ggmlType(),
         };

@@ -24,6 +24,7 @@ const chat_mod = @import("chat.zig");
 const vision_mod = @import("vision.zig");
 const drafter_mod = @import("drafter.zig");
 const prefix_cache_mod = @import("prefix_cache.zig");
+const tokenize_cache_mod = @import("tokenize_cache.zig");
 const model_discovery = @import("model_discovery.zig");
 const arch_ds4 = @import("arch/ds4.zig");
 const arch_llama = @import("arch/llama.zig");
@@ -37,6 +38,7 @@ const ChatConfig = chat_mod.ChatConfig;
 const VisionEncoder = vision_mod.VisionEncoder;
 const DrafterModel = drafter_mod.DrafterModel;
 const HotPrefixCache = prefix_cache_mod.HotPrefixCache;
+const TokenizeCache = tokenize_cache_mod.TokenizeCache;
 
 /// Lifecycle of an entry. State transitions are guarded by `ModelRegistry.mutex`;
 /// the inference thread writes, connection threads read under the same lock and
@@ -113,6 +115,14 @@ pub const LoadedModel = struct {
     ssm_checkpoint_stride: u32 = 0,
     /// Phase 1: per-request cap on snapshots retained.
     ssm_checkpoint_max: u32 = 32,
+
+    /// Iteration 2 (perf-plan Phase 4 #3): LRU cache of chat-template
+    /// render+tokenize results, keyed by a digest of (messages, tools,
+    /// flags). Targets the warm-reuse path where Jinja+BPE was
+    /// observed at 240 ms on a 1813-tok Gemma prompt — 7× the actual
+    /// Metal prefill on a KV-cache hit. Null when --tokenize-cache-entries
+    /// is 0 (caller disables for tests / debugging).
+    tokenize_cache: ?TokenizeCache = null,
 
     /// Embedded ds4 engine (DeepSeek-V4-Flash via GGUF). When non-null,
     /// `transformer` / `weights` / `tokenizer` / `chat_config` stay null and
@@ -225,6 +235,10 @@ pub const LoadedModel = struct {
         if (self.prefix_cache) |*hc| {
             hc.deinit();
             self.prefix_cache = null;
+        }
+        if (self.tokenize_cache) |*tc| {
+            tc.deinit();
+            self.tokenize_cache = null;
         }
         if (self.error_name) |n| self.allocator.free(n);
         if (self.drafter_path.len > 0) self.allocator.free(self.drafter_path);

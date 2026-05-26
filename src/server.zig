@@ -12,6 +12,7 @@ const token_mask_mod = @import("token_mask.zig");
 const responses_mod = @import("responses.zig");
 const pld_index = @import("pld_index.zig");
 const prefix_cache_mod = @import("prefix_cache.zig");
+const tokenize_cache_mod = @import("tokenize_cache.zig");
 const scheduler_mod = @import("scheduler.zig");
 const ds4_ffi = @import("ds4_ffi.zig");
 const model_registry_mod = @import("model_registry.zig");
@@ -346,6 +347,14 @@ pub var ssm_checkpoint_stride: u32 = 256;
 /// past this drop the oldest (front of list) to keep memory bounded on very
 /// long prompts. 0 = unlimited (rely on the prefix-cache byte budget alone).
 pub var ssm_checkpoint_max: u32 = 32;
+
+/// Iteration 2 (perf-plan Phase 4 #3): LRU capacity of the per-LoadedModel
+/// chat-template tokenize cache. 0 disables (every request re-renders +
+/// re-tokenizes, restoring pre-Iteration-2 behavior). Default 4 is small
+/// because real chat conversations mutate the messages list every turn;
+/// the cache catches warm-reuse benches + repeated agent probes without
+/// hoarding token buffers across a long session.
+pub var tokenize_cache_entries: u32 = 4;
 
 /// Phase 5 (performance-plan) #2: KV-cache quantization for the embedded
 /// llama.cpp engine. `off` = F16 (libllama default); `q8` halves the KV
@@ -2274,17 +2283,11 @@ fn handleChatCompletions(
     // synthesizes a system-message fallback when the GGUF chat template
     // doesn't model `tools` natively (which is the DSV4 case).
     //
-    // Phase 4 instrumentation: time the render+tokenize step. This blocks the
-    // request thread today; if it grows past 5% of TTFT we move it to a
-    // worker thread (Phase 4 #1.b). The number is surfaced as
-    // `timings.tokenize_ms` so a bench can see it without a perf trace.
+    // Phase 4 instrumentation + Iteration 2 cache: time the render+tokenize
+    // step. The cache is engine-agnostic — same hit even when the
+    // underlying call is ds4 / llama / MLX formatChat.
     var tokenize_sw = Stopwatch.init(stream.io);
-    var prompt_ids_raw = if (lm.ds4_engine) |engine|
-        try chat_mod.encodeChatViaDs4(allocator, engine, messages.items, tools_json, tool_choice_instruction, enable_thinking)
-    else if (lm.llama_engine) |engine|
-        try chat_mod.encodeChatViaLlama(allocator, engine, chat_config, messages.items, tools_json, tool_choice_instruction, enable_thinking)
-    else
-        try chat_mod.formatChat(allocator, tok, messages.items, chat_config, tools_json, tool_choice_instruction, enable_thinking);
+    var prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, chat_config, messages.items, tools_json, tool_choice_instruction, enable_thinking);
     const tokenize_ns = tokenize_sw.read();
 
     // Run vision encoder if any messages contain images. Phase A8: each
@@ -4137,6 +4140,47 @@ fn utf8TrailingIncomplete(s: []const u8) usize {
 /// engine / prompt length. Pass 0 for legacy paths that don't measure it
 /// (the field is then omitted from the JSON; existing callers stay shape-
 /// compatible while the new ones surface the metric).
+///
+/// Iteration 2: chat-template render+tokenize wrapper that consults a
+/// per-LoadedModel LRU cache before calling the underlying engine's
+/// encoder. On hit the returned slice is a fresh allocation owned by the
+/// caller (drop-in replacement for the engine encoders). On miss it
+/// stores a copy of the result in the cache.
+fn cachedFormatChat(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    lm: *LoadedModel,
+    tok: *const Tokenizer,
+    chat_config: *const chat_mod.ChatConfig,
+    messages: []const chat_mod.Message,
+    tools_json: ?[]const u8,
+    tool_choice_instruction: ?[]const u8,
+    enable_thinking: bool,
+) ![]u32 {
+    const cache_ptr: ?*tokenize_cache_mod.TokenizeCache = if (lm.tokenize_cache) |*tc| tc else null;
+    const key_opt: ?u64 = if (cache_ptr != null)
+        tokenize_cache_mod.TokenizeCache.keyFor(messages, tools_json, tool_choice_instruction, enable_thinking)
+    else
+        null;
+    if (cache_ptr) |cache| if (key_opt) |key| {
+        if (try cache.get(io, key, allocator)) |cached| return cached;
+    };
+    const ids = if (lm.ds4_engine) |engine|
+        try chat_mod.encodeChatViaDs4(allocator, engine, messages, tools_json, tool_choice_instruction, enable_thinking)
+    else if (lm.llama_engine) |engine|
+        try chat_mod.encodeChatViaLlama(allocator, engine, chat_config, messages, tools_json, tool_choice_instruction, enable_thinking)
+    else
+        try chat_mod.formatChat(allocator, tok, messages, chat_config, tools_json, tool_choice_instruction, enable_thinking);
+    if (cache_ptr) |cache| if (key_opt) |key| {
+        // Insert is best-effort; an OOM in the cache shouldn't fail the
+        // request — the user already has their tokenized prompt.
+        cache.put(io, key, ids) catch |err| {
+            log.warn("[tokenize-cache] put failed: {s}\n", .{@errorName(err)});
+        };
+    };
+    return ids;
+}
+
 fn formatTimingsObject(
     allocator: std.mem.Allocator,
     prompt_tokens: u32,
@@ -5166,17 +5210,12 @@ fn handleAnthropicMessages(
     });
     log.info("  > \"{s}{s}\"\n", .{ last_msg.content[0..preview_len], if (last_msg.content.len > 80) "..." else "" });
 
-    // Format chat template. Iteration 1 timing — see /v1/chat/completions for
-    // motivation; same number, same field on the Anthropic response so a
-    // bench targeting either endpoint sees the same instrumentation.
+    // Format chat template. Iteration 1 timing + Iteration 2 cache. The
+    // `effective_tools_json` swap (`null` when has_tools is false) keeps
+    // the cache key consistent with what the encoder actually sees.
     const effective_tools_json: ?[]const u8 = if (has_tools) tools_json else null;
     var tokenize_sw = Stopwatch.init(stream.io);
-    var prompt_ids_raw = if (lm.ds4_engine) |engine|
-        try chat_mod.encodeChatViaDs4(allocator, engine, messages.items, effective_tools_json, tool_choice_instruction, enable_thinking)
-    else if (lm.llama_engine) |engine|
-        try chat_mod.encodeChatViaLlama(allocator, engine, chat_config, messages.items, effective_tools_json, tool_choice_instruction, enable_thinking)
-    else
-        try chat_mod.formatChat(allocator, tok, messages.items, chat_config, effective_tools_json, tool_choice_instruction, enable_thinking);
+    var prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, chat_config, messages.items, effective_tools_json, tool_choice_instruction, enable_thinking);
     const tokenize_ns = tokenize_sw.read();
 
     // Vision encoder: encode any images on the last user message and splice
@@ -6392,16 +6431,11 @@ fn handleResponses(
     });
 
     // ── format chat template ──
-    // Iteration 1: wrap with a Stopwatch so `usage.tokenize_ms` lands in the
-    // Responses envelope. Same instrumentation pattern as /v1/chat/completions
-    // and /v1/messages — single source of truth in formatTimingsObject.
+    // Iteration 1 timing + Iteration 2 cache. Responses sees the same
+    // cache as chat-completions / messages because they all hash the
+    // same canonical (messages, tools, flags) tuple.
     var tokenize_sw = Stopwatch.init(stream.io);
-    var prompt_ids_raw = if (lm.ds4_engine) |engine|
-        try chat_mod.encodeChatViaDs4(allocator, engine, pi.messages.items, active_tools_json, active_tool_choice_instruction, enable_thinking)
-    else if (lm.llama_engine) |engine|
-        try chat_mod.encodeChatViaLlama(allocator, engine, chat_config, pi.messages.items, active_tools_json, active_tool_choice_instruction, enable_thinking)
-    else
-        try chat_mod.formatChat(allocator, tok, pi.messages.items, chat_config, active_tools_json, active_tool_choice_instruction, enable_thinking);
+    var prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, chat_config, pi.messages.items, active_tools_json, active_tool_choice_instruction, enable_thinking);
     const tokenize_ns = tokenize_sw.read();
 
     // ── vision encoder ──
