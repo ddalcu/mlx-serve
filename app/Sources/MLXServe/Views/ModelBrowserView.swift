@@ -292,14 +292,15 @@ private struct ModelBrowserRow: View {
 
     /// For Gemma 4 dense/MoE base rows, the variant whose drafter pairs with
     /// this checkpoint — drives the inline "+drafter" / "✓ paired" chip. nil
-    /// for non-Gemma-4 rows (most everything).
+    /// for non-Gemma-4 rows (most everything) and for GGUF repos (the
+    /// drafter is an MLX-only kernel). The rule lives in
+    /// `DownloadManager.drafterPairingVariant` so it's unit-testable.
     private var pairableVariant: GemmaVariant? {
-        guard !model.isDrafter else { return nil }
-        let lower = model.id.lowercased()
-        guard lower.contains("gemma-4") else { return nil }
-        // Note: HFModel doesn't tell us isMoE directly, but the size token
-        // does — 26b-a4b is the only MoE today.
-        return DownloadManager.gemmaVariantFor(modelPath: lower, isMoE: lower.contains("26b-a4b"))
+        DownloadManager.drafterPairingVariant(
+            repoId: model.id,
+            isDrafter: model.isDrafter,
+            isGgufRepo: model.isGgufRepo
+        )
     }
 
     var body: some View {

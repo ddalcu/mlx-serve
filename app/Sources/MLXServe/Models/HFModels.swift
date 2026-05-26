@@ -62,7 +62,16 @@ struct HFModel: Identifiable, Codable {
     /// Whether this model's architecture is known to work with mlx-serve.
     /// Checks HF tags for supported family prefixes (gemma, qwen, llama, mistral).
     /// Models with no tags get benefit of the doubt.
+    ///
+    /// GGUF repos get a permissive pass: many LM Studio community quant
+    /// repacks tag themselves only with `gguf` / `llama-cpp` / `base_model:...`
+    /// and never inherit the upstream family tag (e.g. `lmstudio-community/
+    /// gemma-4-E4B-it-GGUF` carries no `gemma*` tag of its own). The embedded
+    /// llama.cpp engine handles whatever architecture the .gguf declares
+    /// internally, so flagging these "Unsupported architecture" was a false
+    /// negative that hid legit downloads.
     var isSupportedArchitecture: Bool {
+        if isGgufRepo { return true }
         guard let tags, !tags.isEmpty else { return true }
         return tags.contains { tag in
             supportedArchitectureTagPrefixes.contains { tag.hasPrefix($0) }
