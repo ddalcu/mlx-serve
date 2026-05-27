@@ -1,8 +1,19 @@
 # Changelog
 
-## v26.5.7 — Run any GGUF model
+## v26.5.7 — Run any GGUF model, faster than LM Studio on the same file
 
 - **Any GGUF model, natively.** mlx-serve now embeds llama.cpp's inference library, so the whole GGUF world — Qwen, Llama, Mistral, Gemma, and thousands more — runs on Apple Silicon alongside MLX models. Pick a `.gguf` in the menu-bar app and it just works: the server auto-detects the format and routes to the right engine (DeepSeek-V4-Flash still uses the dedicated ds4 engine; everything else uses llama.cpp). No new app to trust — the engine ships inside the same signed, notarized bundle, so there's no "unidentified developer" dialog.
+
+- **Faster than LM Studio on the same `.gguf`.** Head-to-head on Gemma 4 E4B Q4_K_M (identical file, Apple M4 16GB): free-form decode +15%, echo +13%, code +12%, prefill +5%. Warm TTFT 15–26% better than LM Studio across both MLX and GGUF backends. Side-by-side chart and CSV ship under `docs/`.
+
+- **Warm chats 7.7× faster.** A new chat-template + tokenize cache turns the second hit on a long conversation into a memcpy: on a 1813-token prompt, the wall between "send" and "first token" drops from 271 ms to 35 ms. Applies to every engine — MLX, llama.cpp, and ds4 — and pairs with the existing prefix cache so multi-turn agent loops feel near-instant.
+
+- **Multi-doc agents stay warm.** llama.cpp now keeps an LRU of KV sessions, so alternating between two long prompts no longer pays the cold prefill twice. On a Qwen3.5-4B Q4_NL workload with two long-doc QA prompts, second-time A reuses 71/72 tokens (was 3/72). New `--llama-cache-entries N` knob; defaults to 1 for backwards compatibility, the menu-bar Settings panel exposes it.
+
+- **Engine-aware Settings.** The Settings window now shows the right knobs for the model you've loaded: MLX targets see the MLX KV-quant + speculative-decode controls; GGUF targets see llama.cpp's own quant and session-cache controls instead of MLX toggles that silently no-op. New rows for `--llama-kv-quant`, `--llama-cache-entries`, and `--tokenize-cache-entries`; restart banner fires when launch flags change.
+
+- **Smarter Model Browser for GGUF.** GGUF repos now show a "X–Y GB" RAM-estimate range covering the smallest and largest quants in the repo, the previous "Unsupported architecture" false-flag on LM Studio's community GGUF repacks (`lmstudio-community/gemma-4-E4B-it-GGUF` and friends) is fixed, mmproj sidecars are auto-skipped when picking a `.gguf` from a folder, and the MLX-only drafter pairing chip no longer appears on rows where it can't apply. Downloads + Download action columns widened so headers and the GGUF "Download ▾" menu render on one line.
+
 
 ---
 

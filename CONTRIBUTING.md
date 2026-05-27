@@ -6,7 +6,7 @@ Thanks for your interest in contributing! Here's how to get started.
 
 **Prerequisites:**
 - macOS with Apple Silicon (M1+)
-- [Zig 0.15+](https://ziglang.org/download/)
+- [Zig 0.16+](https://ziglang.org/download/)
 - mlx-c: `brew install mlx-c`
 
 **Build:**

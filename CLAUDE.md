@@ -4,7 +4,7 @@ Native Zig server that runs MLX-format LMs on Apple Silicon and exposes OpenAI-c
 
 ## Stack
 
-- **Zig** 0.15+; **mlx-c** (Apple) via Homebrew, FFI in `src/mlx.zig`
+- **Zig** 0.16+; **mlx-c** (Apple) via Homebrew, FFI in `src/mlx.zig`
 - **Jinja engine** (`lib/jinja_cpp`): llama.cpp's C++17 Jinja2 + nlohmann/json, pre-compiled as `libjinja.a`
 - **stb_image** (JPEG/PNG) + **libwebp** (WebP) for vision; **safetensors** weights; BPE tokenizers
 
