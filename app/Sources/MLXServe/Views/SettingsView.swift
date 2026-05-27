@@ -7,10 +7,9 @@ import UniformTypeIdentifiers
 /// UserDefaults.
 ///
 /// Intentionally narrow surface: only the things end-users actually want to
-/// tune. Host / port / request-timeout / log-level live in the CLI for
-/// power users; per-request spec-decode overrides duplicate what the
-/// Speculative Decoding toggles already express; "Enable thinking" lives on
-/// the chat toolbar.
+/// tune. Host / port / request-timeout live in the CLI for power users;
+/// per-request spec-decode overrides duplicate what the Speculative Decoding
+/// toggles already express; "Enable thinking" lives on the chat toolbar.
 struct SettingsView: View {
     @EnvironmentObject var appState: AppState
     @EnvironmentObject var server: ServerManager
@@ -396,6 +395,22 @@ private struct ServerSectionContent: View {
                 Toggle("", isOn: $appState.serverOptions.noVision)
                     .labelsHidden()
                     .toggleStyle(.switch)
+            }
+        }
+        if let m = meta["logLevel"] {
+            SettingsRow(
+                title: m.title,
+                explainer: m.explainer,
+                isDirty: dirty.dirty(\.logLevel)
+            ) {
+                Picker("", selection: $appState.serverOptions.logLevel) {
+                    ForEach(ServerOptions.LogLevel.allCases) { lvl in
+                        Text(lvl.label).tag(lvl)
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.menu)
+                .frame(minWidth: 180)
             }
         }
     }

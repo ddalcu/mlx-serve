@@ -124,6 +124,18 @@ mlx_llama_session *mlx_llama_session_create_kv_quant(mlx_llama_engine *e,
                                                     char *err, size_t errlen) {
     struct llama_context_params cp = llama_context_default_params();
     if (n_ctx > 0) cp.n_ctx = (uint32_t)n_ctx;
+    // Force the full-size SWA cache. With swa_full=false (the libllama default
+    // since b73xx) sliding-window-attention layers only expose `window`-many KV
+    // slots per sequence; after `llama_memory_seq_rm` trims a divergent tail in
+    // a persistent prompt-prefix-reuse session, the next `llama_decode` can
+    // fail to find a contiguous block of free slots and abort the prefill with
+    //   init_batch: failed to prepare attention ubatches
+    //   decode: failed to find a memory slot for batch of size 512
+    // mlx-serve owns its own ctx-size cap up the stack, so the extra KV that
+    // swa_full=true costs (window→full per SWA layer) is exactly what we
+    // already accounted for. Matches `llama-server --swa-full` and addresses
+    // llama.cpp issues #19794 / #21831 / #17196 for hybrid/SWA GGUFs.
+    cp.swa_full = true;
     // Flash-attention is required when K/V are quantized — llama.cpp's plain
     // SDPA path only supports F16/F32 KV. flash_attn defaults vary by version;
     // turn it on whenever the caller asks for a non-default KV type so we

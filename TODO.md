@@ -43,6 +43,8 @@ Multi-slot batching shipped: Gemma 4 E4B `--max-concurrent 2` → **1.50× throu
 
 11. **Multi-slot 24h soak test** with `--max-concurrent 4`. Bench harness `tests/bench_concurrent.py` shipped 2026-05-16; soak validation still pending.
 
+12. **Recurrent-state snapshots for hybrid-GGUF prefix reuse.** Today `LlamaSession.sync` trims attention KV via `seq_rm` but the recurrent state (GatedDeltaNet on Qwen3.5 / Qwen3-Next, Mamba on Nemotron-H GGUFs, etc.) can't be rolled back the same way — warm-decode after a trim is *not* byte-identical to cold-decode, and the `prefix reuse is byte-identical to cold decode` Zig test fails on hybrid `LLAMA_TEST_MODEL`s. Fix: thread `llama_state_seq_{get,set}_data` through the shim, hold one snapshot buffer per LRU entry on `LlamaSession`, save at the current resident-end after each successful sync, restore at the next sync's common-prefix point (fall through to `reset()` when `common < snapshot_pos`). Detect once via `llama_model_is_recurrent`. Preserves the multi-turn prefix-reuse speedup on hybrids that phase 5 #1 set up. Mid-term mitigation if not done: force cold-prefill on `llama_model_is_recurrent == true` so we don't ship wrong-output prefix reuse. **~1 day incl. a Mamba/GDN round-trip test.**
+
 ## Deviations kept (no work)
 
 - **`Conn.writeAllNoFlush`** — kept (ws.zig uses the explicit-flush pattern). Removing requires a deeper `writeAll` semantics refactor.

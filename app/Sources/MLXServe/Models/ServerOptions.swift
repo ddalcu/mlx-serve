@@ -81,6 +81,16 @@ struct ServerOptions: Codable, Equatable {
     enum LogLevel: String, Codable, CaseIterable, Identifiable {
         case error, warn, info, debug
         var id: String { rawValue }
+        /// Human-readable label for the Settings picker. The raw value is what
+        /// the server's `--log-level` flag accepts — keep these in sync.
+        var label: String {
+            switch self {
+            case .error: return "Error (quietest)"
+            case .warn:  return "Warn"
+            case .info:  return "Info (default)"
+            case .debug: return "Debug (verbose)"
+            }
+        }
     }
 
     enum KVQuant: String, Codable, CaseIterable, Identifiable {

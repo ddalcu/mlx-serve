@@ -338,6 +338,30 @@ pub const LlamaSession = struct {
         self.resident.clearRetainingCapacity();
     }
 
+    /// `sync` with a one-shot defense against libllama transients (the
+    /// `init_batch: failed to prepare attention ubatches` / `decode: failed to
+    /// find a memory slot for batch of size N` class). On any failure we drop
+    /// the resident state and retry once with a cold prefill — we lose this
+    /// single request's prefix-reuse savings but the client gets a normal
+    /// response instead of a 500. If the retry also fails the session is left
+    /// clean so the *next* request can cold-prefill into a known-good state.
+    ///
+    /// Behaves identically to `sync` on the happy path, including the returned
+    /// cached-prefix length.
+    pub fn syncWithFallback(self: *LlamaSession, prompt_ids: []const i32) Error!i32 {
+        return self.sync(prompt_ids) catch |err| blk: {
+            log.warn(
+                "[llama] sync failed ({s}); resetting session and retrying cold\n",
+                .{@errorName(err)},
+            );
+            self.reset();
+            break :blk self.sync(prompt_ids) catch |err2| {
+                self.reset();
+                return err2;
+            };
+        };
+    }
+
     /// Advance the KV cache by one already-sampled token.
     pub fn eval(self: *LlamaSession, token: i32) Error!void {
         var err_buf: [256]u8 = undefined;
@@ -406,6 +430,48 @@ test "llama: tokenize round-trip and short greedy decode" {
         try std.testing.expect(tok >= 0 and tok < engine.nVocab());
     }
     try std.testing.expect(sess.pos() >= @as(i32, @intCast(ids.len)));
+}
+
+// Model-gated: `syncWithFallback` is the public entry used by the scheduler.
+// Happy path — it must return the same cached-prefix length and leave the
+// session in the same state as plain `sync`. The retry-on-error branch is
+// covered by the integration test `tests/test_llama_persistent_session.sh`,
+// which exercises the full HTTP path through the scheduler.
+test "llama: syncWithFallback matches sync on the happy path" {
+    const allocator = std.testing.allocator;
+    const path = testModelPath() orelse return error.SkipZigTest;
+
+    var engine = try LlamaEngine.open(allocator, path, .{});
+    defer engine.close();
+
+    const a = try engine.tokenizeText(allocator, "Once upon a time, in a", true);
+    defer allocator.free(a);
+    const b = try engine.tokenizeText(allocator, "Once upon a time, in a galaxy far away", true);
+    defer allocator.free(b);
+
+    var sess_plain = try engine.createSession(2048);
+    defer sess_plain.free();
+    var sess_fb = try engine.createSession(2048);
+    defer sess_fb.free();
+
+    // Cold: both return 0, leave the resident mirror == the prompt.
+    try std.testing.expectEqual(
+        try sess_plain.sync(a),
+        try sess_fb.syncWithFallback(a),
+    );
+    try std.testing.expectEqualSlices(i32, sess_plain.resident.items, sess_fb.resident.items);
+
+    // Warm: prefix reuse, same cached-prefix count and same final resident.
+    const c1 = try sess_plain.sync(b);
+    const c2 = try sess_fb.syncWithFallback(b);
+    try std.testing.expectEqual(c1, c2);
+    try std.testing.expectEqualSlices(i32, sess_plain.resident.items, sess_fb.resident.items);
+
+    // After reset both go back to cold, and syncWithFallback still works.
+    sess_fb.reset();
+    try std.testing.expectEqual(@as(usize, 0), sess_fb.resident.items.len);
+    const c3 = try sess_fb.syncWithFallback(a);
+    try std.testing.expectEqual(@as(i32, 0), c3);
 }
 
 test "commonPrefixLen: shared prefix, divergence, and bounds" {

@@ -1357,9 +1357,41 @@ fn handleLoadModelStrict(allocator: std.mem.Allocator, stream: *Conn, request_bo
     try sendResponse(stream, "200 OK", "application/json", body);
 }
 
+/// Pure body-builder for `GET /props`. Split out from `handleProps` so it
+/// can be unit-tested without standing up a real `LoadedModel`. Caller owns
+/// the returned slice.
+///
+/// Note: the `chat_template` field that upstream llama-server exposes here
+/// is intentionally omitted. Our Swift app never read it, and stock chat
+/// templates are 10–100 KB of Jinja — that turned every /props poll into
+/// wasted bandwidth. Capabilities still come from `/v1/models` per entry;
+/// clients that genuinely need the template can still get it from the
+/// model's `config.json` / `chat_template.jinja` on disk, or by rendering
+/// through `/v1/chat/completions` server-side.
+fn renderPropsBody(
+    allocator: std.mem.Allocator,
+    config: *const model_mod.ModelConfig,
+    ctx_str: []const u8,
+    active_mem: usize,
+    peak_mem: usize,
+    safe_ctx: u32,
+) ![]u8 {
+    return std.fmt.allocPrint(allocator,
+        \\{{"default_generation_settings":{{"model":"{s}","n_ctx":{s}}},"total_slots":1,"model_info":{{"vocab_size":{d},"hidden_size":{d},"num_hidden_layers":{d},"num_attention_heads":{d},"num_key_value_heads":{d},"head_dim":{d},"quantization_bits":{d},"quantization_group_size":{d},"max_position_embeddings":{d}}},"memory":{{"active_bytes":{d},"peak_bytes":{d},"max_safe_context":{d}}}}}
+    , .{
+        config.model_type,        ctx_str,
+        config.vocab_size,        config.hidden_size,
+        config.num_hidden_layers, config.num_attention_heads,
+        config.num_key_value_heads, config.head_dim,
+        config.quant_bits,        config.quant_group_size,
+        config.max_position_embeddings,
+        active_mem,               peak_mem,
+        safe_ctx,
+    });
+}
+
 fn handleProps(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel) !void {
     const config = lm.config.?;
-    const chat_config = lm.chat_config.?;
     const ctx_len = getEffectiveContextLength(config);
     const ctx_str = if (ctx_len > 0) blk: {
         break :blk try std.fmt.allocPrint(allocator, "{d}", .{ctx_len});
@@ -1398,23 +1430,7 @@ fn handleProps(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel) !v
         _ = mlx.mlx_get_peak_memory(&peak_mem);
     }
 
-    // JSON-escape the chat template
-    const escaped_template = try jsonEscape(allocator, chat_config.chat_template);
-    defer allocator.free(escaped_template);
-
-    const body = try std.fmt.allocPrint(allocator,
-        \\{{"default_generation_settings":{{"model":"{s}","n_ctx":{s}}},"total_slots":1,"chat_template":{s},"model_info":{{"vocab_size":{d},"hidden_size":{d},"num_hidden_layers":{d},"num_attention_heads":{d},"num_key_value_heads":{d},"head_dim":{d},"quantization_bits":{d},"quantization_group_size":{d},"max_position_embeddings":{d}}},"memory":{{"active_bytes":{d},"peak_bytes":{d},"max_safe_context":{d}}}}}
-    , .{
-        config.model_type,        ctx_str,
-        escaped_template,
-        config.vocab_size,        config.hidden_size,
-        config.num_hidden_layers, config.num_attention_heads,
-        config.num_key_value_heads, config.head_dim,
-        config.quant_bits,        config.quant_group_size,
-        config.max_position_embeddings,
-        active_mem,               peak_mem,
-        safe_ctx,
-    });
+    const body = try renderPropsBody(allocator, config, ctx_str, active_mem, peak_mem, safe_ctx);
     defer allocator.free(body);
     try sendResponse(stream, "200 OK", "application/json", body);
 }
@@ -8525,5 +8541,59 @@ test "insertImageTokens is a no-op when image_token_id or n_tokens is zero" {
     const out_zero_n = try insertImageTokens(testing.allocator, &prompt, 999, 0, &config);
     defer testing.allocator.free(out_zero_n);
     try testing.expectEqualSlices(u32, &prompt, out_zero_n);
+}
+
+// --- /props payload regression ------------------------------------------------
+//
+// The `chat_template` field used to be emitted by /props for llama.cpp
+// server-compat clients. Our own Swift app never read it, and stock chat
+// templates are 10–100 KB of Jinja — that's wasted bandwidth on every poll.
+// `renderPropsBody` is the pure body-builder behind `handleProps`; these
+// tests pin the schema so a future "let's add it back" can't slip through
+// without flipping these assertions intentionally.
+
+test "renderPropsBody omits chat_template" {
+    var config = model_mod.ModelConfig{};
+    config.vocab_size = 32000;
+    config.hidden_size = 4096;
+    config.num_hidden_layers = 32;
+    config.num_attention_heads = 32;
+    config.num_key_value_heads = 8;
+    config.head_dim = 128;
+    config.quant_bits = 4;
+    config.quant_group_size = 64;
+    config.max_position_embeddings = 8192;
+    config.model_type = "gemma4";
+
+    const body = try renderPropsBody(testing.allocator, &config, "4096", 1234, 5678, 16384);
+    defer testing.allocator.free(body);
+
+    try testing.expect(std.mem.indexOf(u8, body, "\"chat_template\"") == null);
+}
+
+test "renderPropsBody keeps fields the Swift app + integration tests rely on" {
+    var config = model_mod.ModelConfig{};
+    config.model_type = "gemma4";
+    config.vocab_size = 32000;
+    config.hidden_size = 4096;
+    config.num_hidden_layers = 32;
+    config.num_attention_heads = 32;
+    config.num_key_value_heads = 8;
+    config.head_dim = 128;
+    config.quant_bits = 4;
+    config.quant_group_size = 64;
+    config.max_position_embeddings = 8192;
+
+    const body = try renderPropsBody(testing.allocator, &config, "4096", 1234, 5678, 16384);
+    defer testing.allocator.free(body);
+
+    // Hit every field a known consumer reads.
+    try testing.expect(std.mem.indexOf(u8, body, "\"n_ctx\":4096") != null);          // integration_test.sh
+    try testing.expect(std.mem.indexOf(u8, body, "\"total_slots\":1") != null);       // integration_test.sh
+    try testing.expect(std.mem.indexOf(u8, body, "\"model_info\"") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"memory\"") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"active_bytes\":1234") != null);   // Swift fetchProps
+    try testing.expect(std.mem.indexOf(u8, body, "\"peak_bytes\":5678") != null);     // Swift fetchProps
+    try testing.expect(std.mem.indexOf(u8, body, "\"max_safe_context\":16384") != null); // Swift fetchProps
 }
 

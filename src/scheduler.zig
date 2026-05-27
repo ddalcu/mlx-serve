@@ -2401,10 +2401,12 @@ fn runPrefillLlama(sch: *Scheduler, slot: *Slot, engine: *arch_llama.LlamaEngine
     entry_ptr.last_used_ns = @intCast(std.Io.Timestamp.now(sch.io, .boot).nanoseconds);
     const sess = entry_ptr.session;
 
-    const cached = sess.sync(i32_prompt) catch |err| {
-        // A partial decode (e.g. prompt exceeds context) can leave KV and the
-        // resident mirror inconsistent — reset so the next request cold-prefills
-        // cleanly instead of reusing a corrupt prefix.
+    // `syncWithFallback` does the prefix-trim + suffix decode and, on any
+    // libllama transient (the "failed to find a memory slot" class — see
+    // `LlamaSession.syncWithFallback`), resets the session and retries once
+    // cold. Either we serve the request with a clean response or we surface
+    // the error after leaving the session in a known-good state.
+    const cached = sess.syncWithFallback(i32_prompt) catch |err| {
         sess.reset();
         return err;
     };

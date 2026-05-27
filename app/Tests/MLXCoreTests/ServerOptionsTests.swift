@@ -186,6 +186,42 @@ final class ServerOptionsTests: XCTestCase {
         XCTAssertTrue(a.serverLaunchEquals(b))
     }
 
+    // MARK: - Log level
+
+    func testLogLevelDefaultIsInfo() {
+        let args = ServerOptions().toCLIArgs()
+        XCTAssertTrue(contains(args, flag: "--log-level", value: "info"))
+    }
+
+    func testCustomLogLevelEmitsCLIFlag() {
+        for lvl in ServerOptions.LogLevel.allCases {
+            var opts = ServerOptions()
+            opts.logLevel = lvl
+            XCTAssertTrue(
+                contains(opts.toCLIArgs(), flag: "--log-level", value: lvl.rawValue),
+                "logLevel=\(lvl.rawValue) must emit --log-level \(lvl.rawValue)"
+            )
+        }
+    }
+
+    func testLogLevelChangeTriggersRestart() {
+        var a = ServerOptions()
+        var b = ServerOptions()
+        b.logLevel = .debug
+        XCTAssertFalse(a.serverLaunchEquals(b),
+                       "Switching log level must require a server restart")
+        a.logLevel = .debug
+        XCTAssertTrue(a.serverLaunchEquals(b))
+    }
+
+    func testLogLevelHasHumanReadableLabel() {
+        // The Settings picker shows these — empty labels would render blank rows.
+        for lvl in ServerOptions.LogLevel.allCases {
+            XCTAssertFalse(lvl.label.isEmpty,
+                           "\(lvl.rawValue) needs a label for the Settings picker")
+        }
+    }
+
     // MARK: - Engine inference
 
     func testEngineFromArchitecture() {

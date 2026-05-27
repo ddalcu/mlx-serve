@@ -20,7 +20,32 @@ class ServerManager: ObservableObject {
     private var healthTask: Task<Void, Never>?
     private var pollSource: DispatchSourceTimer?
     private let api = APIClient()
-    @Published var serverLog = ""
+    /// True while the tray popover is on screen. Drives the live /props
+    /// ticker — when the popover is closed there's nothing to render, so we
+    /// stop polling entirely instead of burning 3 s ticks in the background.
+    /// Toggled via `setMenuVisible(_:)` from `StatusMenuView`'s
+    /// `onAppear`/`onDisappear`.
+    private var menuIsVisible = false
+
+    /// Off-main raw stderr buffer. **There is no `@Published` mirror.**
+    ///
+    /// Why: SwiftUI's `@EnvironmentObject` re-evaluates a view's `body` on
+    /// any `@Published` change of the observed object, regardless of which
+    /// properties the body actually reads. `ChatView` observes
+    /// `ServerManager` (for status / model info), so a `@Published` log
+    /// would force a ChatView body recompute on every flush — competing
+    /// with the SSE token loop on the main thread. Even throttled to
+    /// ~10 Hz that was enough to make generation visibly choppy when the
+    /// log window was open.
+    ///
+    /// Instead, the log views own a small `LogPoller` (`@StateObject`)
+    /// that ticks at its own rate and reads `currentServerLogSnapshot()`.
+    /// Only those views re-render on log activity; everything else
+    /// (ChatView, Settings, the menu popover header) is fully insulated
+    /// from stderr volume.
+    let logBuffer = ThrottledLogBuffer(maxBytes: serverLogMaxBytes)
+    nonisolated static let serverLogMaxBytes = 65_536              // hard cap on retained tail
+
     /// Snapshot of the ServerOptions used the last time `start()` was called.
     /// Settings UI compares this against the current options to decide whether
     /// the restart banner should appear.
@@ -45,7 +70,7 @@ class ServerManager: ObservableObject {
         port = options.port
         status = .starting
         lastError = ""
-        serverLog = ""
+        clearServerLog()
 
         // Reap orphaned mlx-serve processes still bound to our port (e.g. left
         // behind after a crash). We only target processes whose command name is
@@ -88,13 +113,11 @@ class ServerManager: ObservableObject {
         errPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
             let data = handle.availableData
             guard !data.isEmpty, let str = String(data: data, encoding: .utf8) else { return }
-            Task { @MainActor in
-                self?.serverLog += str
-                // Keep only last 2KB
-                if let s = self, s.serverLog.count > 65536 {
-                    s.serverLog = String(s.serverLog.suffix(65536))
-                }
-            }
+            // Pure off-main append. No `Task @MainActor`, no `DispatchQueue.main`,
+            // no `@Published` publish — none of which the inference path can
+            // afford. The log views poll `currentServerLogSnapshot()` on their
+            // own clock to pick this up.
+            self?.logBuffer.append(str)
         }
 
         proc.terminationHandler = { [weak self] proc in
@@ -158,7 +181,12 @@ class ServerManager: ObservableObject {
         healthTimer = nil
         process = nil
 
-        let errSnippet = serverLog.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Read straight from the locked buffer — the throttled `serverLog`
+        // can be up to one flush-interval (~100 ms) behind, which on a fast
+        // crash means we'd present the alert before the fatal stderr line
+        // made it to @Published.
+        let errSnippet = currentServerLogSnapshot()
+            .trimmingCharacters(in: .whitespacesAndNewlines)
         let shortErr = errSnippet.isEmpty ? "exit code \(exitCode)" : String(errSnippet.suffix(200))
         let fullLog = errSnippet.isEmpty ? "(no stderr captured — exit code \(exitCode))" : errSnippet
 
@@ -172,6 +200,40 @@ class ServerManager: ObservableObject {
             presentCrashAlert(title: "mlx-serve failed to start", log: fullLog, exitCode: exitCode)
         } else {
             status = .stopped
+        }
+    }
+
+    // MARK: - Server log (throttled)
+
+    /// Read the current raw buffer. Safe from any thread. Use this when you
+    /// need the *latest* stderr (e.g. crash reporting, Copy/Save in the log
+    /// window); the @Published `serverLog` view-mirror can be up to ~100 ms
+    /// behind.
+    nonisolated func currentServerLogSnapshot() -> String {
+        logBuffer.snapshot()
+    }
+
+    /// Wipe the raw buffer. Log views will see the empty result on their
+    /// next poll tick (typically within 500 ms). Called from `start()` and
+    /// the log window's Clear button.
+    nonisolated func clearServerLog() {
+        logBuffer.clear()
+    }
+
+    /// Pure helper: clamp `buf` to at most `maxBytes` characters by keeping
+    /// the tail. Mirrors `String(buf.suffix(maxBytes))` but avoids the
+    /// alloc when already in range, and well-defined at the degenerate
+    /// `maxBytes == 0` boundary. Lives on the type (not the instance) so
+    /// tests can drive it without standing up a real `ServerManager`, and
+    /// is `nonisolated` so the off-main `ThrottledLogBuffer` can call it
+    /// inside its lock.
+    nonisolated static func trimLogTail(_ buf: inout String, toAtMost maxBytes: Int) {
+        if maxBytes <= 0 {
+            buf = ""
+            return
+        }
+        if buf.count > maxBytes {
+            buf = String(buf.suffix(maxBytes))
         }
     }
 
@@ -240,9 +302,10 @@ class ServerManager: ObservableObject {
                     if self.status != .running {
                         self.transitionToRunning()
                     }
-                    // Switch to slow polling
+                    // Health handshake done — cancel the 1 Hz health source.
+                    // The /props slow-poll is started by transitionToRunning
+                    // (only when the menu is open) or by setMenuVisible(true).
                     source.cancel()
-                    self.startSlowPolling()
                 }
             }.resume()
         }
@@ -251,6 +314,10 @@ class ServerManager: ObservableObject {
     }
 
     private func startSlowPolling() {
+        // Idempotent — cancel any in-flight ticker before installing a new one,
+        // so back-to-back calls (e.g. popover-open + transition-to-running
+        // racing) can't leave two timers feeding /props at 2× the rate.
+        pollSource?.cancel()
         let source = DispatchSource.makeTimerSource(queue: .main)
         source.schedule(deadline: .now() + 3, repeating: 3.0)
         source.setEventHandler { [weak self] in
@@ -265,6 +332,13 @@ class ServerManager: ObservableObject {
         guard status != .running else { return }
         status = .running
         Task { await self.refreshModels() }
+        // If the user has the menu open at the exact moment the server comes
+        // up, start the live /props ticker now so the GPU-memory bar fills in
+        // immediately. Otherwise it'll start the next time they open the menu.
+        if menuIsVisible {
+            Task { await self.refreshStatus() }
+            startSlowPolling()
+        }
     }
 
     /// Called by TestServer when it detects health is ok but status is still starting
@@ -272,14 +346,43 @@ class ServerManager: ObservableObject {
         transitionToRunning()
     }
 
+    /// Wire the popover's open/close into the live-polling state. Called
+    /// from `StatusMenuView`'s `onAppear`/`onDisappear`. Drives the /props
+    /// ticker so it only runs when there's a UI on screen to consume it.
+    ///
+    /// - When the menu opens while the server is `.running`: immediate
+    ///   `refreshStatus()` + start the 3 s ticker.
+    /// - When the menu closes while the server is `.running`: cancel the
+    ///   ticker.
+    /// - During `.starting` / `.stopped`: no-op on close (we'd cancel the
+    ///   health-check poll by accident otherwise). On open during `.starting`,
+    ///   the health source is already ticking; we just record the visibility
+    ///   for when the server transitions.
+    func setMenuVisible(_ visible: Bool) {
+        guard menuIsVisible != visible else { return }
+        menuIsVisible = visible
+        guard status == .running else { return }
+        if visible {
+            Task { await self.refreshStatus() }
+            startSlowPolling()
+        } else {
+            pollSource?.cancel()
+            pollSource = nil
+        }
+    }
+
     private func refreshStatus() async {
         if let mem = try? await api.fetchProps(port: port) {
             memoryInfo = mem
         }
-        // Plan 05 Phase G — refresh registry snapshot too. Cheap (a few KB
-        // per call) and keeps the UI's loaded/unloaded badges in sync with
-        // server-side hot-load / eviction events.
-        await refreshModels()
+        // Intentionally do NOT poll /v1/models here. The registry snapshot is
+        // already populated once on `transitionToRunning` and again after every
+        // explicit `loadModel(id:)` the app makes — those are the only events
+        // that can change the loaded/unloaded badges from within this app.
+        // Hot-load / eviction triggered by a different client (curl, another
+        // app) won't be reflected until the next user-initiated load or a
+        // restart; that's an acceptable trade for not hitting /v1/models
+        // every 3 s for the lifetime of the session.
     }
 
     private func refreshModels() async {
@@ -374,5 +477,115 @@ class ServerManager: ObservableObject {
         if let proc = process, proc.isRunning {
             proc.terminate()
         }
+    }
+}
+
+/// Lock-guarded string buffer that holds the recent server stderr tail.
+/// Lives outside `ServerManager`'s `@MainActor` isolation so the stderr
+/// readability handler (running on a background `FileHandle` queue) can
+/// append without hopping to main on every chunk — that hop was the
+/// per-token bottleneck that starved ChatView's SSE loop when the log
+/// window was open.
+///
+/// `@unchecked Sendable` is honest here: the only shared state (`content`)
+/// is fully guarded by `lock`. There are no escaping references.
+final class ThrottledLogBuffer: @unchecked Sendable {
+    private let lock = NSLock()
+    private var content = ""
+    private let maxBytes: Int
+
+    init(maxBytes: Int) {
+        self.maxBytes = maxBytes
+    }
+
+    func append(_ str: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        content.append(str)
+        ServerManager.trimLogTail(&content, toAtMost: maxBytes)
+    }
+
+    func snapshot() -> String {
+        lock.lock()
+        defer { lock.unlock() }
+        return content
+    }
+
+    func clear() {
+        lock.lock()
+        defer { lock.unlock() }
+        content = ""
+    }
+}
+
+/// Pull-based bridge from `ThrottledLogBuffer` (off-main, lock-guarded
+/// source of truth) to a SwiftUI view that wants to render the log.
+///
+/// `ServerManager` deliberately does NOT publish the log — see the
+/// comment above `logBuffer` for why. Views that want live log content
+/// own a `LogPoller` as `@StateObject`, call `start()` on appear and
+/// `stop()` on disappear. The view re-renders on each `text` change at
+/// its own rate (default ~2 Hz); the rest of the app — ChatView,
+/// Settings, the menu popover — is fully insulated from log volume.
+@MainActor
+final class LogPoller: ObservableObject {
+    /// Latest snapshot fetched from the source. Only assigned when
+    /// changed, so no-op ticks don't trigger view re-renders.
+    @Published private(set) var text: String = ""
+
+    private var timer: DispatchSourceTimer?
+    private let interval: TimeInterval
+    private var snapshot: () -> String
+
+    /// - Parameters:
+    ///   - interval: poll interval in seconds. 0.5 (2 Hz) is the default —
+    ///     smooth-enough for human reading, cheap for the main thread.
+    ///   - snapshot: closure returning the latest content. Injected so
+    ///     tests can drive deterministically without spinning up a real
+    ///     `ServerManager`. In production this is
+    ///     `{ [weak server] in server?.currentServerLogSnapshot() ?? "" }`.
+    init(interval: TimeInterval = 0.5, snapshot: @escaping () -> String) {
+        self.interval = interval
+        self.snapshot = snapshot
+    }
+
+    /// Begin periodic polling. Safe to call repeatedly — cancels any
+    /// previous timer first. Fires one immediate `refresh()` so the view
+    /// shows content without waiting an interval.
+    func start() {
+        stop()
+        refresh()
+        let t = DispatchSource.makeTimerSource(queue: .main)
+        t.schedule(deadline: .now() + interval, repeating: interval)
+        t.setEventHandler { [weak self] in self?.refresh() }
+        t.resume()
+        timer = t
+    }
+
+    /// Cancel polling. Idempotent.
+    func stop() {
+        timer?.cancel()
+        timer = nil
+    }
+
+    /// Swap the snapshot source. Useful for `@StateObject` SwiftUI views
+    /// that can't pass an environment-injected dependency through the
+    /// `init` closure — they construct the poller with a placeholder, then
+    /// `bind` to the real source on `onAppear`.
+    func bind(_ snapshot: @escaping () -> String) {
+        self.snapshot = snapshot
+    }
+
+    /// Pull the current snapshot. Only assigns `text` when the value
+    /// actually changed, so unchanged ticks cost one closure call and a
+    /// string compare — no SwiftUI work.
+    func refresh() {
+        let new = snapshot()
+        if new != text { text = new }
+    }
+
+    deinit {
+        // Cancel without touching `self.timer` (deinit is nonisolated).
+        timer?.cancel()
     }
 }
