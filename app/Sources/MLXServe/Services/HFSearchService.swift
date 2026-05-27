@@ -133,9 +133,21 @@ class HFSearchService: ObservableObject {
         currentSkip += pageSize
         hasMore = anyFull
 
-        // Fetch safetensors sizes for MLX models missing metadata. GGUF repos
-        // report size per-quant (resolved at download time), so skip them here.
-        let missing = filtered.filter { $0.estimatedSizeBytes == 0 && $0.isCompatible && !$0.isGgufRepo }
+        // Fetch tree-API sizes for any row that came back without a size.
+        // Covers two distinct shapes inside `fetchFallbackSizes` →
+        // `parseFallbackSize`:
+        //   - MLX safetensors repos that didn't ship `safetensors.parameters`
+        //     in the search response (older HF metadata): sum the `.safetensors`
+        //     shards from the tree.
+        //   - GGUF repos: HF never reports a single size for these (each quant
+        //     is a separate file). We collect the non-mmproj `.gguf` sizes
+        //     and surface a min/max range so the RAM Est column shows
+        //     "1.7–8.5 GB" instead of "Unknown".
+        // Earlier this filter excluded `isGgufRepo` because the per-quant
+        // fetch was deferred to download time — that left the row useless
+        // for browsing. Don't add that gate back without first updating
+        // `parseFallbackSize` / `HFModel.ramEstimate`.
+        let missing = filtered.filter { Self.needsFallbackFetch($0) }
         if !missing.isEmpty {
             Task { await fetchFallbackSizes(for: missing) }
         }
@@ -181,29 +193,130 @@ class HFSearchService: ObservableObject {
         return components.url
     }
 
-    /// Fetch safetensors file sizes from the tree API for models missing metadata.
+    /// Fetch file sizes from the tree API for models missing metadata.
+    /// Branches inside `parseFallbackSize` on what the repo actually ships:
+    /// safetensors → sum across shards; single GGUF → that file; multi-quant
+    /// GGUF → min/max range so `HFModel.ramEstimate` can surface "1.7–8.5 GB"
+    /// instead of an opaque "Unknown".
     private func fetchFallbackSizes(for models: [HFModel]) async {
-        await withTaskGroup(of: (String, Int64)?.self) { group in
+        await withTaskGroup(of: (String, FallbackSize)?.self) { group in
             for model in models {
                 group.addTask {
                     guard let url = URL(string: "https://huggingface.co/api/models/\(model.id)/tree/main") else { return nil }
                     guard let (data, response) = try? await URLSession.shared.data(from: url),
                           let http = response as? HTTPURLResponse, http.statusCode == 200,
-                          let files = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else { return nil }
-                    let total = files
-                        .filter { ($0["path"] as? String)?.hasSuffix(".safetensors") == true && ($0["type"] as? String) == "file" }
-                        .compactMap { $0["size"] as? Int64 ?? ($0["size"] as? Int).map({ Int64($0) }) }
-                        .reduce(Int64(0), +)
-                    return total > 0 ? (model.id, total) : nil
+                          let raw = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else { return nil }
+                    let entries = Self.treeEntries(from: raw)
+                    guard let fb = Self.parseFallbackSize(files: entries) else { return nil }
+                    return (model.id, fb)
                 }
             }
             for await result in group {
-                guard let (id, size) = result else { continue }
+                guard let (id, fb) = result else { continue }
                 if let idx = fetchedModels.firstIndex(where: { $0.id == id }) {
-                    fetchedModels[idx].fallbackSizeBytes = size
+                    switch fb {
+                    case .safetensorsSum(let bytes), .ggufSingle(let bytes):
+                        fetchedModels[idx].fallbackSizeBytes = bytes
+                    case .ggufRange(let lo, let hi):
+                        fetchedModels[idx].ggufMinSizeBytes = lo
+                        fetchedModels[idx].ggufMaxSizeBytes = hi
+                        // Also seed fallbackSizeBytes with the max so sorting
+                        // and any code reading `estimatedSizeBytes` still has
+                        // a single number to work with (conservative-high).
+                        fetchedModels[idx].fallbackSizeBytes = hi
+                    }
                 }
             }
         }
         self.models = sortedModels
+    }
+
+    /// Whether a model row needs a tree-API fallback fetch to populate its
+    /// size. True when the search response didn't carry weight metadata
+    /// (`estimatedSizeBytes == 0`) AND the row is one mlx-serve can actually
+    /// load (`isCompatible`). Crucially: GGUF rows pass — they NEVER carry
+    /// safetensors metadata, so `estimatedSizeBytes == 0` is the norm for
+    /// them and they're exactly the case the GGUF range in
+    /// `parseFallbackSize` was added to serve. Pulled out for unit testing
+    /// — gating GGUF out here was the bug that re-surfaced "Unknown" in the
+    /// Model Browser even after `parseFallbackSize` learned about GGUF.
+    nonisolated static func needsFallbackFetch(_ model: HFModel) -> Bool {
+        model.estimatedSizeBytes == 0 && model.isCompatible
+    }
+
+    // MARK: - Pure tree-parsing helpers (testable without a network)
+
+    /// Typed view of a single HF tree-API entry — extracted so
+    /// `parseFallbackSize` is a pure function over plain values rather than
+    /// `[[String: Any]]` (which is awkward to construct in tests).
+    struct TreeFileEntry: Equatable, Sendable {
+        let path: String
+        let size: Int64
+    }
+
+    /// Result of inspecting a repo's tree for a fallback size. Distinguishes
+    /// the three shapes mlx-serve cares about so HFSearchService can route
+    /// to the right field on `HFModel`.
+    enum FallbackSize: Equatable, Sendable {
+        case safetensorsSum(Int64)                    // all .safetensors shards summed
+        case ggufSingle(Int64)                        // a single non-mmproj .gguf
+        case ggufRange(min: Int64, max: Int64)        // smallest + largest non-mmproj .gguf
+    }
+
+    /// Convert the raw `[[String: Any]]` HF tree response into typed entries.
+    /// Drops anything that isn't a `file`, has an unreadable size, or has no
+    /// path. `nonisolated` so tests can drive it without spinning up a
+    /// `@MainActor` instance.
+    nonisolated static func treeEntries(from raw: [[String: Any]]) -> [TreeFileEntry] {
+        raw.compactMap { entry -> TreeFileEntry? in
+            guard (entry["type"] as? String) == "file",
+                  let path = entry["path"] as? String else { return nil }
+            let size: Int64
+            if let i64 = entry["size"] as? Int64 { size = i64 }
+            else if let i = entry["size"] as? Int { size = Int64(i) }
+            else { return nil }
+            return TreeFileEntry(path: path, size: size)
+        }
+    }
+
+    /// Decide which fallback-size shape to record for a model given its
+    /// tree-API file list. Safetensors wins when present (matches existing
+    /// behavior). Otherwise consider non-mmproj top-level `.gguf` files
+    /// ≥ 1 MB — single → `ggufSingle`, two or more → `ggufRange` (min, max).
+    /// Returns nil when the repo has neither (the caller leaves the model
+    /// with `ramEstimate == "Unknown"`).
+    ///
+    /// Why exclude:
+    /// - mmproj sidecars (`mmproj-*.gguf`): CLIP vision/audio encoders, not
+    ///   loadable as LLMs by either engine — `DownloadManager.isMmprojGguf`
+    ///   filters them everywhere else; mirror that here so the row's size
+    ///   doesn't pull in a 200 MB sidecar that the user can't actually pick.
+    /// - subdir files (path contains `/`): split-shard GGUF layouts the
+    ///   single-file download path can't reassemble.
+    /// - files < 1 MB: README stubs / LFS pointer files that occasionally
+    ///   show up with non-zero sizes; would skew the min downward.
+    nonisolated static func parseFallbackSize(files: [TreeFileEntry]) -> FallbackSize? {
+        let safetensorsSum = files
+            .filter { $0.path.hasSuffix(".safetensors") }
+            .reduce(Int64(0)) { $0 + $1.size }
+        if safetensorsSum > 0 {
+            return .safetensorsSum(safetensorsSum)
+        }
+
+        let ggufSizes: [Int64] = files
+            .filter { entry in
+                let lower = entry.path.lowercased()
+                guard lower.hasSuffix(".gguf") else { return false }
+                if entry.path.contains("/") { return false }                  // subdir / split shard
+                if (entry.path as NSString).lastPathComponent
+                    .lowercased().hasPrefix("mmproj") { return false }        // CLIP sidecar
+                return entry.size >= 1_000_000
+            }
+            .map(\.size)
+            .sorted()
+
+        guard let lo = ggufSizes.first else { return nil }
+        let hi = ggufSizes.last ?? lo
+        return lo == hi ? .ggufSingle(lo) : .ggufRange(min: lo, max: hi)
     }
 }

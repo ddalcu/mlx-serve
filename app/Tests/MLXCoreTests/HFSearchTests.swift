@@ -1,5 +1,6 @@
 import XCTest
 import Foundation
+@testable import MLXCore
 
 // =============================================================================
 // MARK: - Type replicas for testing (matches HFModels.swift)
@@ -353,5 +354,245 @@ private extension TestHFModel {
         pipelineTag: String? = nil
     ) -> TestHFModel {
         TestHFModel(id: id, downloads: downloads, likes: likes, lastModified: lastModified, tags: nil, safetensors: safetensors, pipelineTag: pipelineTag)
+    }
+}
+
+// =============================================================================
+// MARK: - HF tree-API fallback-size parsing
+//
+// Reproduces the bug where GGUF repos showed "Unknown" in the Model Browser's
+// RAM Est column: the original `fetchFallbackSizes` only summed `.safetensors`
+// files, so any GGUF-only repo fell through with `fallbackSizeBytes = nil`
+// and `estimatedSizeBytes = 0`. These tests pin the new `parseFallbackSize`
+// path that picks up GGUF quants and returns a min/max range when the repo
+// ships more than one. Uses `@testable import MLXCore` so the real function
+// is under test rather than a replica.
+// =============================================================================
+
+final class HFFallbackSizeTests: XCTestCase {
+    private typealias Entry = HFSearchService.TreeFileEntry
+
+    func testSafetensorsSum_winsWhenPresent() {
+        let files: [Entry] = [
+            .init(path: "config.json", size: 1_000),
+            .init(path: "model-00001-of-00002.safetensors", size: 2_000_000_000),
+            .init(path: "model-00002-of-00002.safetensors", size: 3_000_000_000),
+            .init(path: "model.gguf", size: 4_000_000_000),  // also present — must lose
+        ]
+        XCTAssertEqual(HFSearchService.parseFallbackSize(files: files), .safetensorsSum(5_000_000_000))
+    }
+
+    func testGgufRange_acrossMultipleQuants() {
+        let files: [Entry] = [
+            .init(path: "README.md", size: 5_000),
+            .init(path: "gemma-4-E4B-Q2_K.gguf", size: 1_700_000_000),
+            .init(path: "gemma-4-E4B-Q4_K_M.gguf", size: 2_600_000_000),
+            .init(path: "gemma-4-E4B-Q5_K_M.gguf", size: 3_100_000_000),
+            .init(path: "gemma-4-E4B-Q8_0.gguf", size: 4_500_000_000),
+            .init(path: "gemma-4-E4B-BF16.gguf", size: 8_500_000_000),
+        ]
+        XCTAssertEqual(
+            HFSearchService.parseFallbackSize(files: files),
+            .ggufRange(min: 1_700_000_000, max: 8_500_000_000)
+        )
+    }
+
+    func testGgufSingle_collapsesToSingleVariant() {
+        let files: [Entry] = [
+            .init(path: "config.json", size: 1_000),
+            .init(path: "Qwen3.5-0.8B-Q4_K_M.gguf", size: 500_000_000),
+        ]
+        XCTAssertEqual(HFSearchService.parseFallbackSize(files: files), .ggufSingle(500_000_000))
+    }
+
+    func testMmprojSidecar_isExcluded() {
+        // Gemma 4 VL / Qwen 3.6 VL repos ship a `mmproj-*.gguf` next to the
+        // LLM quant. The sidecar is a CLIP vision encoder, not a loadable
+        // LLM — must NOT enter the range.
+        let files: [Entry] = [
+            .init(path: "gemma-4-E4B-Q4_K_M.gguf", size: 2_600_000_000),
+            .init(path: "gemma-4-E4B-BF16.gguf", size: 8_500_000_000),
+            .init(path: "mmproj-gemma-4-E4B-F16.gguf", size: 200_000_000),
+        ]
+        XCTAssertEqual(
+            HFSearchService.parseFallbackSize(files: files),
+            .ggufRange(min: 2_600_000_000, max: 8_500_000_000)
+        )
+    }
+
+    func testTinyFiles_areExcluded() {
+        // LFS pointer stubs occasionally show up with non-zero but absurdly-small
+        // sizes — those would skew the min downward if counted.
+        let files: [Entry] = [
+            .init(path: "tiny-pointer.gguf", size: 500),                    // < 1 MB
+            .init(path: "real-Q4_K_M.gguf", size: 2_600_000_000),
+            .init(path: "real-BF16.gguf", size: 8_500_000_000),
+        ]
+        XCTAssertEqual(
+            HFSearchService.parseFallbackSize(files: files),
+            .ggufRange(min: 2_600_000_000, max: 8_500_000_000)
+        )
+    }
+
+    func testSubdirGguf_isExcluded() {
+        // Split-shard layouts (`shard/part-001.gguf`) can't be reassembled by
+        // the single-file download path — don't include them in the row's
+        // displayed range, which advertises top-level pickable files.
+        let files: [Entry] = [
+            .init(path: "shard/part-001.gguf", size: 5_000_000_000),
+            .init(path: "shard/part-002.gguf", size: 5_000_000_000),
+            .init(path: "Q4_K_M.gguf", size: 2_600_000_000),
+        ]
+        XCTAssertEqual(HFSearchService.parseFallbackSize(files: files), .ggufSingle(2_600_000_000))
+    }
+
+    func testEmptyOrNoLLMArtifacts_returnsNil() {
+        XCTAssertNil(HFSearchService.parseFallbackSize(files: []))
+        let onlyDocs: [Entry] = [
+            .init(path: "README.md", size: 5_000),
+            .init(path: "LICENSE", size: 1_000),
+        ]
+        XCTAssertNil(HFSearchService.parseFallbackSize(files: onlyDocs))
+    }
+
+    func testTreeEntries_filtersNonFilesAndUnreadableSizes() {
+        let raw: [[String: Any]] = [
+            ["path": "Q4.gguf", "type": "file", "size": 2_600_000_000],
+            ["path": "subdir", "type": "directory", "size": 0],       // not a file
+            ["path": "Q8.gguf", "type": "file"],                       // no size
+            ["path": "Q5.gguf", "type": "file", "size": 3_100_000_000],
+        ]
+        let entries = HFSearchService.treeEntries(from: raw)
+        XCTAssertEqual(entries.count, 2)
+        XCTAssertEqual(Set(entries.map(\.path)), ["Q4.gguf", "Q5.gguf"])
+    }
+}
+
+// MARK: - HFSearchService.needsFallbackFetch — the gate that re-broke GGUF
+//
+// Regression for the bug that surfaced after the parseFallbackSize work:
+// fetchFallbackSizes' caller hard-coded `!$0.isGgufRepo`, so GGUF rows
+// never reached the new branch and the column kept rendering "Unknown".
+// Pin the gate's contract: GGUF rows with no estimated size MUST be
+// fetched. If anyone re-adds an `isGgufRepo` exclusion here, this test
+// goes red and points them at the right code path.
+
+final class HFFallbackFetchGateTests: XCTestCase {
+    private func gguf(id: String) -> HFModel {
+        // GGUF repo shape as the HF API returns it: `tags: ["gguf"]`, no
+        // `safetensors` block, no parameters → estimatedSizeBytes == 0.
+        HFModel(id: id, downloads: 100, likes: 10, lastModified: nil,
+                tags: ["gguf"], safetensors: nil, pipelineTag: "text-generation")
+    }
+
+    private func mlxNoSafetensors(id: String) -> HFModel {
+        HFModel(id: id, downloads: 100, likes: 10, lastModified: nil,
+                tags: ["mlx"], safetensors: nil, pipelineTag: "text-generation")
+    }
+
+    private func mlxWithParams(id: String) -> HFModel {
+        let st = HFSafetensors(parameters: ["BF16": 7_000_000_000], total: nil)
+        return HFModel(id: id, downloads: 100, likes: 10, lastModified: nil,
+                       tags: ["mlx"], safetensors: st, pipelineTag: "text-generation")
+    }
+
+    func testGgufRow_isFetched() {
+        // The original bug: this returned false because of `!$0.isGgufRepo`,
+        // leaving every GGUF row in the Model Browser stuck at "Unknown".
+        XCTAssertTrue(HFSearchService.needsFallbackFetch(gguf(id: "unsloth/gemma-4-E4B-it-GGUF")))
+    }
+
+    func testMlxRow_withoutMetadata_isFetched() {
+        XCTAssertTrue(HFSearchService.needsFallbackFetch(mlxNoSafetensors(id: "mlx-community/some-7B")))
+    }
+
+    func testMlxRow_withParameters_isNotRefetched() {
+        XCTAssertFalse(HFSearchService.needsFallbackFetch(mlxWithParams(id: "mlx-community/has-params")))
+    }
+
+    func testIncompatibleRow_isSkipped() {
+        // `text-to-image` and similar pipeline tags aren't loadable by
+        // mlx-serve — burning a tree-API request on them just wastes a
+        // round trip.
+        let m = HFModel(id: "x/diffusion", downloads: nil, likes: nil,
+                        lastModified: nil, tags: ["diffusers"], safetensors: nil,
+                        pipelineTag: "text-to-image")
+        XCTAssertFalse(HFSearchService.needsFallbackFetch(m))
+    }
+}
+
+// MARK: - HFModel.ramEstimate range surfacing
+
+final class HFModelRamEstimateTests: XCTestCase {
+    func testRamEstimate_rangeFromGgufFields() {
+        // Two quants populated → ramEstimate shows the formatted range with
+        // the same ×1.2 overhead as the single-value path.
+        var m = HFModel(id: "u/gemma-4-E4B-it-GGUF", downloads: nil, likes: nil,
+                        lastModified: nil, tags: ["gguf"], safetensors: nil, pipelineTag: nil)
+        m.ggufMinSizeBytes = 1_700_000_000   // ≈ 1.58 GB
+        m.ggufMaxSizeBytes = 8_500_000_000   // ≈ 7.91 GB
+        let s = m.ramEstimate
+        XCTAssertTrue(s.contains("GB"), "expected GB unit, got \(s)")
+        XCTAssertTrue(s.contains("\u{2013}"), "expected en-dash range separator, got \(s)")
+        XCTAssertNotEqual(s, "Unknown")
+    }
+
+    func testRamEstimate_singleGgufStillUsesFallbackPath() {
+        // Single-quant GGUF: parseFallbackSize records .ggufSingle, the
+        // service sets fallbackSizeBytes only, ramEstimate returns the
+        // single-value format.
+        var m = HFModel(id: "u/Q4-only-GGUF", downloads: nil, likes: nil,
+                        lastModified: nil, tags: ["gguf"], safetensors: nil, pipelineTag: nil)
+        m.fallbackSizeBytes = 2_600_000_000
+        XCTAssertFalse(m.ramEstimate.contains("\u{2013}"))
+        XCTAssertNotEqual(m.ramEstimate, "Unknown")
+    }
+
+    func testRamEstimateBytes_usesMaxForConservativeFitness() {
+        // Range repo with max ≈ 8 GB: fitness must compare against the
+        // conservative-high number so a 6 GB Mac doesn't see "fits".
+        var m = HFModel(id: "u/range", downloads: nil, likes: nil,
+                        lastModified: nil, tags: ["gguf"], safetensors: nil, pipelineTag: nil)
+        m.ggufMinSizeBytes = 1_700_000_000
+        m.ggufMaxSizeBytes = 8_500_000_000
+        // 8.5 GB × 1.2 ≈ 10.2 GB. Allow ±1% slack for the float math.
+        let expected: Int64 = Int64(Double(8_500_000_000) * 1.2)
+        XCTAssertEqual(m.ramEstimateBytes, expected)
+    }
+
+    func testRamEstimate_unknownWhenNothingPopulated() {
+        let m = HFModel(id: "u/empty", downloads: nil, likes: nil,
+                        lastModified: nil, tags: nil, safetensors: nil, pipelineTag: nil)
+        XCTAssertEqual(m.ramEstimate, "Unknown")
+        XCTAssertEqual(m.ramEstimateBytes, 0)
+    }
+}
+
+// MARK: - MemoryInfo.formatRange
+
+final class MemoryInfoFormatRangeTests: XCTestCase {
+    func testGbRange_sameUnit() {
+        // 1.58 GB to 7.91 GB → "1.6–7.9 GB" (rounded to 1 decimal place).
+        let s = MemoryInfo.formatRange(1_700_000_000, 8_500_000_000)
+        XCTAssertTrue(s.hasSuffix(" GB"), "got \(s)")
+        XCTAssertTrue(s.contains("\u{2013}"), "got \(s)")
+    }
+
+    func testMbRange_whenBothUnderGb() {
+        let s = MemoryInfo.formatRange(200_000_000, 800_000_000)
+        XCTAssertTrue(s.hasSuffix(" MB"), "got \(s)")
+        XCTAssertTrue(s.contains("\u{2013}"), "got \(s)")
+    }
+
+    func testSingleValue_whenMinEqualsMax() {
+        // Degenerate range collapses to the single-value formatter — no dash.
+        let s = MemoryInfo.formatRange(2_600_000_000, 2_600_000_000)
+        XCTAssertFalse(s.contains("\u{2013}"), "got \(s)")
+    }
+
+    func testReversedArgs_areNormalized() {
+        let a = MemoryInfo.formatRange(8_500_000_000, 1_700_000_000)
+        let b = MemoryInfo.formatRange(1_700_000_000, 8_500_000_000)
+        XCTAssertEqual(a, b)
     }
 }

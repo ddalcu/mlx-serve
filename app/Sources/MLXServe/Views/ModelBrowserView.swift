@@ -231,8 +231,15 @@ private struct ColumnHeaderRow: View {
                 .frame(width: 88, alignment: .trailing)
             SortableHeader("Likes", field: .likes, searchService: searchService)
                 .frame(width: 50, alignment: .trailing)
+            // RAM Est. column: 120 wide so GGUF range strings produced by
+            // `MemoryInfo.formatRange` ("11.1–30.9 GB", "21.2–55.4 GB",
+            // up to "999.9–999.9 GB") render on a single line. Single-value
+            // strings ("767 MB", "10.2 GB") were comfortable at 80; the
+            // wider budget is what GGUF's min–max range needs. Keep the
+            // ModelBrowserRow's RAM cell at the same width or alignment
+            // drifts across rows.
             SortableHeader("RAM Est.", field: .estimatedSize, searchService: searchService)
-                .frame(width: 80, alignment: .trailing)
+                .frame(width: 120, alignment: .trailing)
             SortableHeader("Updated", field: .lastModified, searchService: searchService)
                 .frame(width: 64, alignment: .trailing)
             // Action column: 92 wide so the Download button + menu chevron
@@ -382,15 +389,20 @@ private struct ModelBrowserRow: View {
                 .font(.callout.monospacedDigit())
                 .frame(width: 50, alignment: .trailing)
 
-            // RAM estimate with color indicator
+            // RAM estimate with color indicator — width matches
+            // ColumnHeaderRow (120) so GGUF range strings like
+            // "21.2–55.4 GB" stay on one line. `.lineLimit(1)` is the
+            // belt-and-suspenders guard against any future format that
+            // exceeds the budget — we'd rather truncate than wrap.
             HStack(spacing: 4) {
                 Circle()
                     .fill(fitnessColor)
                     .frame(width: 8, height: 8)
                 Text(model.ramEstimate)
                     .font(.callout.monospacedDigit())
+                    .lineLimit(1)
             }
-            .frame(width: 80, alignment: .trailing)
+            .frame(width: 120, alignment: .trailing)
 
             // Last updated
             Text(formatRelativeDate(model.lastModifiedDate))

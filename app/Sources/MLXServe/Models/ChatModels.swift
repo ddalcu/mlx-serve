@@ -226,6 +226,24 @@ struct MemoryInfo {
         let mb = Double(bytes) / (1024 * 1024)
         return String(format: "%.0f MB", mb)
     }
+
+    /// Format a `[min, max]` byte range as a single string with a shared unit
+    /// (GB if `max ≥ 1 GB`, else MB). Used by `HFModel.ramEstimate` to surface
+    /// a GGUF repo's smallest-to-largest quant size in one column slot
+    /// (e.g. "1.7–8.5 GB") without blowing past the column's ~80px budget.
+    /// The "–" is U+2013 (en dash) — same glyph as `MemoryInfo.format`'s
+    /// existing strings stay narrow with.
+    static func formatRange(_ minBytes: Int64, _ maxBytes: Int64) -> String {
+        let lo = min(minBytes, maxBytes)
+        let hi = max(minBytes, maxBytes)
+        if lo == hi { return format(lo) }
+        let gbDivisor = Double(1024 * 1024 * 1024)
+        let mbDivisor = Double(1024 * 1024)
+        if Double(hi) / gbDivisor >= 1.0 {
+            return String(format: "%.1f\u{2013}%.1f GB", Double(lo) / gbDivisor, Double(hi) / gbDivisor)
+        }
+        return String(format: "%.0f\u{2013}%.0f MB", Double(lo) / mbDivisor, Double(hi) / mbDivisor)
+    }
 }
 
 enum ServerStatus: Equatable {
