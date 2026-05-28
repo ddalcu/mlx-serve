@@ -1437,14 +1437,14 @@ pub const Transformer = struct {
             getWeightFmt(weights, &name_buf, "{s}.embeddings.weight", prefix)
         else
             getWeightFmt(weights, &name_buf, "{s}.embed_tokens.weight", prefix);
-        const emb_s_arr = if (is_nemotron)
-            getWeightFmt(weights, &name_buf, "{s}.embeddings.scales", prefix)
+        const emb_s_arr = (if (is_nemotron)
+            getWeightFmtOpt(weights, &name_buf, "{s}.embeddings.scales", prefix)
         else
-            getWeightFmt(weights, &name_buf, "{s}.embed_tokens.scales", prefix);
-        const emb_b_arr = if (is_nemotron)
-            getWeightFmt(weights, &name_buf, "{s}.embeddings.biases", prefix)
+            getWeightFmtOpt(weights, &name_buf, "{s}.embed_tokens.scales", prefix)) orelse mlx.mlx_array{ .ctx = null };
+        const emb_b_arr = (if (is_nemotron)
+            getWeightFmtOpt(weights, &name_buf, "{s}.embeddings.biases", prefix)
         else
-            getWeightFmt(weights, &name_buf, "{s}.embed_tokens.biases", prefix);
+            getWeightFmtOpt(weights, &name_buf, "{s}.embed_tokens.biases", prefix)) orelse mlx.mlx_array{ .ctx = null };
 
         const emb_scale: ?mlx.mlx_array = if (config.scale_embeddings)
             bf16Scalar(@sqrt(@as(f32, @floatFromInt(config.hidden_size))), s)
@@ -1477,8 +1477,8 @@ pub const Transformer = struct {
             const maybe_lm_w = getWeightFmtOpt(weights, &name_buf, "{s}.lm_head.weight", lm_prefix);
             if (maybe_lm_w) |w| {
                 lm_head_w = w;
-                lm_head_s = getWeightFmt(weights, &name_buf, "{s}.lm_head.scales", lm_prefix);
-                lm_head_b = getWeightFmt(weights, &name_buf, "{s}.lm_head.biases", lm_prefix);
+                lm_head_s = getWeightFmtOpt(weights, &name_buf, "{s}.lm_head.scales", lm_prefix) orelse mlx.mlx_array{ .ctx = null };
+                lm_head_b = getWeightFmtOpt(weights, &name_buf, "{s}.lm_head.biases", lm_prefix) orelse mlx.mlx_array{ .ctx = null };
                 owns_lm_head = !config.tie_word_embeddings;
             } else if (weights.get("lm_head.weight")) |w| {
                 lm_head_w = w;
@@ -1640,11 +1640,11 @@ pub const Transformer = struct {
             defer _ = mlx.mlx_vector_array_free(all_vec);
 
             _ = mlx.mlx_vector_array_append_value(all_vec, emb_w);
-            _ = mlx.mlx_vector_array_append_value(all_vec, emb_s_arr);
-            _ = mlx.mlx_vector_array_append_value(all_vec, emb_b_arr);
+            if (emb_s_arr.ctx != null) _ = mlx.mlx_vector_array_append_value(all_vec, emb_s_arr);
+            if (emb_b_arr.ctx != null) _ = mlx.mlx_vector_array_append_value(all_vec, emb_b_arr);
             _ = mlx.mlx_vector_array_append_value(all_vec, lm_head_w);
-            _ = mlx.mlx_vector_array_append_value(all_vec, lm_head_s);
-            _ = mlx.mlx_vector_array_append_value(all_vec, lm_head_b);
+            if (lm_head_s.ctx != null) _ = mlx.mlx_vector_array_append_value(all_vec, lm_head_s);
+            if (lm_head_b.ctx != null) _ = mlx.mlx_vector_array_append_value(all_vec, lm_head_b);
 
             if (moe_layers) |ml| {
                 for (ml) |lw| {
@@ -1677,26 +1677,26 @@ pub const Transformer = struct {
                     if (lw.q_norm) |n| _ = mlx.mlx_vector_array_append_value(all_vec, n);
                     if (lw.k_norm) |n| _ = mlx.mlx_vector_array_append_value(all_vec, n);
                     _ = mlx.mlx_vector_array_append_value(all_vec, lw.q_w);
-                    _ = mlx.mlx_vector_array_append_value(all_vec, lw.q_s);
-                    _ = mlx.mlx_vector_array_append_value(all_vec, lw.q_b);
+                    if (lw.q_s.ctx != null) _ = mlx.mlx_vector_array_append_value(all_vec, lw.q_s);
+                    if (lw.q_b.ctx != null) _ = mlx.mlx_vector_array_append_value(all_vec, lw.q_b);
                     _ = mlx.mlx_vector_array_append_value(all_vec, lw.k_w);
-                    _ = mlx.mlx_vector_array_append_value(all_vec, lw.k_s);
-                    _ = mlx.mlx_vector_array_append_value(all_vec, lw.k_b);
+                    if (lw.k_s.ctx != null) _ = mlx.mlx_vector_array_append_value(all_vec, lw.k_s);
+                    if (lw.k_b.ctx != null) _ = mlx.mlx_vector_array_append_value(all_vec, lw.k_b);
                     _ = mlx.mlx_vector_array_append_value(all_vec, lw.v_w);
-                    _ = mlx.mlx_vector_array_append_value(all_vec, lw.v_s);
-                    _ = mlx.mlx_vector_array_append_value(all_vec, lw.v_b);
+                    if (lw.v_s.ctx != null) _ = mlx.mlx_vector_array_append_value(all_vec, lw.v_s);
+                    if (lw.v_b.ctx != null) _ = mlx.mlx_vector_array_append_value(all_vec, lw.v_b);
                     _ = mlx.mlx_vector_array_append_value(all_vec, lw.o_w);
-                    _ = mlx.mlx_vector_array_append_value(all_vec, lw.o_s);
-                    _ = mlx.mlx_vector_array_append_value(all_vec, lw.o_b);
+                    if (lw.o_s.ctx != null) _ = mlx.mlx_vector_array_append_value(all_vec, lw.o_s);
+                    if (lw.o_b.ctx != null) _ = mlx.mlx_vector_array_append_value(all_vec, lw.o_b);
                     _ = mlx.mlx_vector_array_append_value(all_vec, lw.gate_w);
-                    _ = mlx.mlx_vector_array_append_value(all_vec, lw.gate_s);
-                    _ = mlx.mlx_vector_array_append_value(all_vec, lw.gate_b);
+                    if (lw.gate_s.ctx != null) _ = mlx.mlx_vector_array_append_value(all_vec, lw.gate_s);
+                    if (lw.gate_b.ctx != null) _ = mlx.mlx_vector_array_append_value(all_vec, lw.gate_b);
                     _ = mlx.mlx_vector_array_append_value(all_vec, lw.up_w);
-                    _ = mlx.mlx_vector_array_append_value(all_vec, lw.up_s);
-                    _ = mlx.mlx_vector_array_append_value(all_vec, lw.up_b);
+                    if (lw.up_s.ctx != null) _ = mlx.mlx_vector_array_append_value(all_vec, lw.up_s);
+                    if (lw.up_b.ctx != null) _ = mlx.mlx_vector_array_append_value(all_vec, lw.up_b);
                     _ = mlx.mlx_vector_array_append_value(all_vec, lw.down_w);
-                    _ = mlx.mlx_vector_array_append_value(all_vec, lw.down_s);
-                    _ = mlx.mlx_vector_array_append_value(all_vec, lw.down_b);
+                    if (lw.down_s.ctx != null) _ = mlx.mlx_vector_array_append_value(all_vec, lw.down_s);
+                    if (lw.down_b.ctx != null) _ = mlx.mlx_vector_array_append_value(all_vec, lw.down_b);
                     if (lw.layer_scalar) |ls| _ = mlx.mlx_vector_array_append_value(all_vec, ls);
                     if (lw.ple_gate_w) |w| _ = mlx.mlx_vector_array_append_value(all_vec, w);
                     if (lw.ple_gate_s) |sc| _ = mlx.mlx_vector_array_append_value(all_vec, sc);
@@ -2249,15 +2249,15 @@ pub const Transformer = struct {
                 };
             }
             if (entry == null) {
-                const detected = detectQuantBits(w, sc, default_gs);
+                const dp = detectQuantParams(w, sc, default_gs);
                 cache.keys[idx] = key_raw;
-                cache.vals_bits[idx] = @intCast(detected);
-                cache.vals_gs_div8[idx] = @intCast(default_gs / 8);
-                return .{ .bits = detected, .group_size = default_gs };
+                cache.vals_bits[idx] = @intCast(dp.bits);
+                cache.vals_gs_div8[idx] = @intCast(dp.group_size / 8);
+                return .{ .bits = dp.bits, .group_size = dp.group_size };
             }
         }
         // Probe window saturated — fall through to direct detect, no cache write.
-        return .{ .bits = detectQuantBits(w, sc, default_gs), .group_size = default_gs };
+        return detectQuantParams(w, sc, default_gs);
     }
 
     inline fn rmsNorm(self: *const Transformer, x: mlx.mlx_array, w: mlx.mlx_array) !mlx.mlx_array {
@@ -2293,28 +2293,42 @@ pub const Transformer = struct {
         var taken_w = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(taken_w);
         try mlx.check(mlx.mlx_take_axis(&taken_w, self.emb_w, flat_ids, 0, self.s));
-        var taken_s = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(taken_s);
-        try mlx.check(mlx.mlx_take_axis(&taken_s, self.emb_s, flat_ids, 0, self.s));
-        var taken_b = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(taken_b);
-        try mlx.check(mlx.mlx_take_axis(&taken_b, self.emb_b, flat_ids, 0, self.s));
 
         var emb = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(emb);
-        const emb_qp = self.quantParamsFor(self.emb_w, self.emb_s);
-        try mlx.check(mlx.mlx_dequantize(
-            &emb,
-            taken_w,
-            taken_s,
-            taken_b,
-            mlx.mlx_optional_int.some(@intCast(emb_qp.group_size)),
-            mlx.mlx_optional_int.some(@intCast(emb_qp.bits)),
-            "affine",
-            .{}, // global_scale (null)
-            .{ .value = .bfloat16, .has_value = true },
-            self.s,
-        ));
+        if (self.emb_s.ctx == null) {
+            // Plain bf16 embedding: no scales/biases, no dequant — the gathered
+            // rows are already the embedding vectors. Cast to bf16 for parity
+            // with the dequantized path's output dtype.
+            try mlx.check(mlx.mlx_astype(&emb, taken_w, .bfloat16, self.s));
+        } else {
+            var taken_s = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(taken_s);
+            try mlx.check(mlx.mlx_take_axis(&taken_s, self.emb_s, flat_ids, 0, self.s));
+            const emb_qp = self.quantParamsFor(self.emb_w, self.emb_s);
+            const emb_desc = quantDescFor(self.emb_w, self.emb_s, self.emb_b, emb_qp.bits, emb_qp.group_size);
+
+            var taken_b = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(taken_b);
+            // mxfp8 has no bias term: pass a null handle and skip the bias gather.
+            const dq_biases = if (isMxQuant(self.emb_b)) mlx.mlx_array{ .ctx = null } else blk: {
+                try mlx.check(mlx.mlx_take_axis(&taken_b, self.emb_b, flat_ids, 0, self.s));
+                break :blk taken_b;
+            };
+
+            try mlx.check(mlx.mlx_dequantize(
+                &emb,
+                taken_w,
+                taken_s,
+                dq_biases,
+                mlx.mlx_optional_int.some(@intCast(emb_desc.group_size)),
+                mlx.mlx_optional_int.some(@intCast(emb_desc.bits)),
+                emb_desc.mode,
+                .{}, // global_scale (null)
+                .{ .value = .bfloat16, .has_value = true },
+                self.s,
+            ));
+        }
 
         const out_shape = [_]c_int{ batch, seq_len, @intCast(self.config.hidden_size) };
         var reshaped = mlx.mlx_array_new();
@@ -5301,6 +5315,30 @@ pub const Transformer = struct {
     /// MoE MLP with separate router and expert inputs.
     /// router_x: input for routing (raw hidden states).
     /// expert_x: input for expert computation (possibly normalized).
+    /// One expert projection in the MoE dispatch. Quantized experts go through
+    /// `gather_qmm` (transpose_w=true, consuming stored [experts, out, in]);
+    /// plain-bf16 experts (null scales) go through dense `gather_mm`, which does
+    /// not transpose and therefore needs [experts, in, out] — the layout that
+    /// `maybeTransposeForBf16` produces at load. Gather/sort semantics are
+    /// identical across both ops.
+    fn expertGatherMatmul(
+        self: *const Transformer,
+        res: *mlx.mlx_array,
+        x: mlx.mlx_array,
+        w: mlx.mlx_array,
+        sc: mlx.mlx_array,
+        q: QuantDesc,
+        lhs_indices: mlx.mlx_array,
+        rhs_indices: mlx.mlx_array,
+        sorted_indices: bool,
+    ) !void {
+        if (sc.ctx == null) {
+            try mlx.check(mlx.mlx_gather_mm(res, x, w, lhs_indices, rhs_indices, sorted_indices, self.s));
+        } else {
+            try mlx.check(mlx.mlx_gather_qmm(res, x, w, sc, q.biases, lhs_indices, rhs_indices, true, mlx.mlx_optional_int.some(@intCast(q.group_size)), mlx.mlx_optional_int.some(@intCast(q.bits)), q.mode, sorted_indices, self.s));
+        }
+    }
+
     fn moeMLP2(self: *Transformer, router_x: mlx.mlx_array, expert_x: mlx.mlx_array, mw: *const MoeMlpWeights) !mlx.mlx_array {
         const cfg = &self.config;
         const gs = cfg.quant_group_size;
@@ -5309,6 +5347,12 @@ pub const Transformer = struct {
         const gate_bits = self.bitsFor(mw.switch_gate_w, mw.switch_gate_s, gs);
         const up_bits = self.bitsFor(mw.switch_up_w, mw.switch_up_s, gs);
         const down_bits = self.bitsFor(mw.switch_down_w, mw.switch_down_s, gs);
+
+        // Per-expert quant descriptors. mxfp8 experts have scales but no biases,
+        // and need mode="mxfp8"/bits=8 rather than the affine path.
+        const gate_q = quantDescFor(mw.switch_gate_w, mw.switch_gate_s, mw.switch_gate_b, gate_bits, gs);
+        const up_q = quantDescFor(mw.switch_up_w, mw.switch_up_s, mw.switch_up_b, up_bits, gs);
+        const down_q = quantDescFor(mw.switch_down_w, mw.switch_down_s, mw.switch_down_b, down_bits, gs);
 
         // Router: compute logits and top-K selection
         var router_logits: mlx.mlx_array = undefined;
@@ -5322,12 +5366,12 @@ pub const Transformer = struct {
             defer _ = mlx.mlx_array_free(normed_input);
             try mlx.check(mlx.mlx_fast_rms_norm(&normed_input, router_x, rs, cfg.rms_norm_eps, self.s));
 
-            const router_bits = self.bitsFor(mw.router_w, mw.router_s, gs);
-            router_logits = try qmatmulBits(normed_input, mw.router_w, mw.router_s, mw.router_b, router_bits, gs, self.s);
+            const rqp = self.quantParamsFor(mw.router_w, mw.router_s);
+            router_logits = try qmatmulBits(normed_input, mw.router_w, mw.router_s, mw.router_b, rqp.bits, rqp.group_size, self.s);
         } else {
             // Qwen3.5: direct projection
-            const router_bits = self.bitsFor(mw.router_w, mw.router_s, gs);
-            router_logits = try qmatmulBits(router_x, mw.router_w, mw.router_s, mw.router_b, router_bits, gs, self.s);
+            const rqp = self.quantParamsFor(mw.router_w, mw.router_s);
+            router_logits = try qmatmulBits(router_x, mw.router_w, mw.router_s, mw.router_b, rqp.bits, rqp.group_size, self.s);
         }
 
         // Top-K + softmax/renormalize as a single fused kernel (when compiled).
@@ -5377,7 +5421,12 @@ pub const Transformer = struct {
         const inds_shape = mlx.getShape(inds);
         const K = inds_shape[inds_shape.len - 1];
         const total_inds: c_int = B * S * K;
-        const do_sort = S > 1 or total_inds >= 64;
+        // bf16 experts (null scales) use dense `gather_mm`, whose decode-path
+        // index broadcasting against the 5-D [B,S,1,1,D] layout is unverified;
+        // the sorted path's flat [N,1,D] layout is unambiguous, so always take
+        // it for bf16. Quantized experts keep the original heuristic.
+        const experts_bf16 = mw.switch_gate_s.ctx == null;
+        const do_sort = experts_bf16 or S > 1 or total_inds >= 64;
         const no_idx = mlx.mlx_array{ .ctx = null };
 
         var down_out = mlx.mlx_array_new();
@@ -5433,14 +5482,14 @@ pub const Transformer = struct {
             // output [N,1,intermediate]. squeeze inner 1 → [N, intermediate].
             var gate_out_3d = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(gate_out_3d);
-            try mlx.check(mlx.mlx_gather_qmm(&gate_out_3d, x_rep, mw.switch_gate_w, mw.switch_gate_s, mw.switch_gate_b, no_idx, sorted_inds, true, mlx.mlx_optional_int.some(@intCast(gs)), mlx.mlx_optional_int.some(@intCast(gate_bits)), "affine", true, self.s));
+            try self.expertGatherMatmul(&gate_out_3d, x_rep, mw.switch_gate_w, mw.switch_gate_s, gate_q, no_idx, sorted_inds, true);
             var gate_out = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(gate_out);
             try mlx.check(mlx.mlx_squeeze(&gate_out, gate_out_3d, self.s));
 
             var up_out_3d = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(up_out_3d);
-            try mlx.check(mlx.mlx_gather_qmm(&up_out_3d, x_rep, mw.switch_up_w, mw.switch_up_s, mw.switch_up_b, no_idx, sorted_inds, true, mlx.mlx_optional_int.some(@intCast(gs)), mlx.mlx_optional_int.some(@intCast(up_bits)), "affine", true, self.s));
+            try self.expertGatherMatmul(&up_out_3d, x_rep, mw.switch_up_w, mw.switch_up_s, up_q, no_idx, sorted_inds, true);
             var up_out = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(up_out);
             try mlx.check(mlx.mlx_squeeze(&up_out, up_out_3d, self.s));
@@ -5454,7 +5503,7 @@ pub const Transformer = struct {
             try mlx.check(mlx.mlx_expand_dims(&act_exp, expert_act, -2, self.s));
             var down_3d = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(down_3d);
-            try mlx.check(mlx.mlx_gather_qmm(&down_3d, act_exp, mw.switch_down_w, mw.switch_down_s, mw.switch_down_b, no_idx, sorted_inds, true, mlx.mlx_optional_int.some(@intCast(gs)), mlx.mlx_optional_int.some(@intCast(down_bits)), "affine", true, self.s));
+            try self.expertGatherMatmul(&down_3d, act_exp, mw.switch_down_w, mw.switch_down_s, down_q, no_idx, sorted_inds, true);
             var down_squeezed = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(down_squeezed);
             try mlx.check(mlx.mlx_squeeze(&down_squeezed, down_3d, self.s)); // [N, hidden]
@@ -5475,14 +5524,14 @@ pub const Transformer = struct {
 
             var gate_out_5d = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(gate_out_5d);
-            try mlx.check(mlx.mlx_gather_qmm(&gate_out_5d, x_exp, mw.switch_gate_w, mw.switch_gate_s, mw.switch_gate_b, no_idx, inds, true, mlx.mlx_optional_int.some(@intCast(gs)), mlx.mlx_optional_int.some(@intCast(gate_bits)), "affine", false, self.s));
+            try self.expertGatherMatmul(&gate_out_5d, x_exp, mw.switch_gate_w, mw.switch_gate_s, gate_q, no_idx, inds, false);
             var gate_out = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(gate_out);
             try mlx.check(mlx.mlx_squeeze(&gate_out, gate_out_5d, self.s));
 
             var up_out_5d = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(up_out_5d);
-            try mlx.check(mlx.mlx_gather_qmm(&up_out_5d, x_exp, mw.switch_up_w, mw.switch_up_s, mw.switch_up_b, no_idx, inds, true, mlx.mlx_optional_int.some(@intCast(gs)), mlx.mlx_optional_int.some(@intCast(up_bits)), "affine", false, self.s));
+            try self.expertGatherMatmul(&up_out_5d, x_exp, mw.switch_up_w, mw.switch_up_s, up_q, no_idx, inds, false);
             var up_out = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(up_out);
             try mlx.check(mlx.mlx_squeeze(&up_out, up_out_5d, self.s));
@@ -5495,7 +5544,7 @@ pub const Transformer = struct {
             try mlx.check(mlx.mlx_expand_dims(&act_exp, expert_act, -2, self.s));
             var down_5d = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(down_5d);
-            try mlx.check(mlx.mlx_gather_qmm(&down_5d, act_exp, mw.switch_down_w, mw.switch_down_s, mw.switch_down_b, no_idx, inds, true, mlx.mlx_optional_int.some(@intCast(gs)), mlx.mlx_optional_int.some(@intCast(down_bits)), "affine", false, self.s));
+            try self.expertGatherMatmul(&down_5d, act_exp, mw.switch_down_w, mw.switch_down_s, down_q, no_idx, inds, false);
             try mlx.check(mlx.mlx_squeeze(&down_out, down_5d, self.s)); // [B, S, K, hidden]
         }
 
@@ -5524,8 +5573,8 @@ pub const Transformer = struct {
         defer _ = mlx.mlx_array_free(sh_down);
 
         const seg_w = mw.shared_expert_gate_w.?;
-        const seg_bits = self.bitsFor(seg_w, mw.shared_expert_gate_s.?, gs);
-        const sh_gate_logit = try qmatmulBits(expert_x, seg_w, mw.shared_expert_gate_s.?, mw.shared_expert_gate_b.?, seg_bits, gs, self.s);
+        const seg_qp = self.quantParamsFor(seg_w, mw.shared_expert_gate_s.?);
+        const sh_gate_logit = try qmatmulBits(expert_x, seg_w, mw.shared_expert_gate_s.?, mw.shared_expert_gate_b.?, seg_qp.bits, seg_qp.group_size, self.s);
         defer _ = mlx.mlx_array_free(sh_gate_logit);
         var sh_gate_sig = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(sh_gate_sig);
@@ -5667,11 +5716,11 @@ fn initStandardLayers(allocator: std.mem.Allocator, config: ModelConfig, weights
         }
 
         lw.q_w = getLayerWeight(weights, name_buf, prefix, li, "self_attn.q_proj.weight");
-        lw.q_s = getLayerWeight(weights, name_buf, prefix, li, "self_attn.q_proj.scales");
-        lw.q_b = getLayerWeight(weights, name_buf, prefix, li, "self_attn.q_proj.biases");
+        lw.q_s = getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.q_proj.scales") orelse mlx.mlx_array{ .ctx = null };
+        lw.q_b = getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.q_proj.biases") orelse mlx.mlx_array{ .ctx = null };
         lw.k_w = getLayerWeight(weights, name_buf, prefix, li, "self_attn.k_proj.weight");
-        lw.k_s = getLayerWeight(weights, name_buf, prefix, li, "self_attn.k_proj.scales");
-        lw.k_b = getLayerWeight(weights, name_buf, prefix, li, "self_attn.k_proj.biases");
+        lw.k_s = getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.k_proj.scales") orelse mlx.mlx_array{ .ctx = null };
+        lw.k_b = getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.k_proj.biases") orelse mlx.mlx_array{ .ctx = null };
         // Gemma 4 (31B): full_attention layers share V with K (no v_proj weight stored).
         // Sliding_attention layers still have separate V.
         lw.k_eq_v = config.attention_k_eq_v and config.isGlobalLayer(li);
@@ -5681,22 +5730,22 @@ fn initStandardLayers(allocator: std.mem.Allocator, config: ModelConfig, weights
             lw.v_b = lw.k_b;
         } else {
             lw.v_w = getLayerWeight(weights, name_buf, prefix, li, "self_attn.v_proj.weight");
-            lw.v_s = getLayerWeight(weights, name_buf, prefix, li, "self_attn.v_proj.scales");
-            lw.v_b = getLayerWeight(weights, name_buf, prefix, li, "self_attn.v_proj.biases");
+            lw.v_s = getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.v_proj.scales") orelse mlx.mlx_array{ .ctx = null };
+            lw.v_b = getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.v_proj.biases") orelse mlx.mlx_array{ .ctx = null };
         }
         lw.o_w = getLayerWeight(weights, name_buf, prefix, li, "self_attn.o_proj.weight");
-        lw.o_s = getLayerWeight(weights, name_buf, prefix, li, "self_attn.o_proj.scales");
-        lw.o_b = getLayerWeight(weights, name_buf, prefix, li, "self_attn.o_proj.biases");
+        lw.o_s = getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.o_proj.scales") orelse mlx.mlx_array{ .ctx = null };
+        lw.o_b = getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.o_proj.biases") orelse mlx.mlx_array{ .ctx = null };
 
         lw.gate_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.gate_proj.weight");
-        lw.gate_s = getLayerWeight(weights, name_buf, prefix, li, "mlp.gate_proj.scales");
-        lw.gate_b = getLayerWeight(weights, name_buf, prefix, li, "mlp.gate_proj.biases");
+        lw.gate_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.gate_proj.scales") orelse mlx.mlx_array{ .ctx = null };
+        lw.gate_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.gate_proj.biases") orelse mlx.mlx_array{ .ctx = null };
         lw.up_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.up_proj.weight");
-        lw.up_s = getLayerWeight(weights, name_buf, prefix, li, "mlp.up_proj.scales");
-        lw.up_b = getLayerWeight(weights, name_buf, prefix, li, "mlp.up_proj.biases");
+        lw.up_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.up_proj.scales") orelse mlx.mlx_array{ .ctx = null };
+        lw.up_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.up_proj.biases") orelse mlx.mlx_array{ .ctx = null };
         lw.down_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.down_proj.weight");
-        lw.down_s = getLayerWeight(weights, name_buf, prefix, li, "mlp.down_proj.scales");
-        lw.down_b = getLayerWeight(weights, name_buf, prefix, li, "mlp.down_proj.biases");
+        lw.down_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.down_proj.scales") orelse mlx.mlx_array{ .ctx = null };
+        lw.down_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.down_proj.biases") orelse mlx.mlx_array{ .ctx = null };
 
         // Gemma 4: per-layer scalar
         lw.layer_scalar = getLayerWeightOpt(weights, name_buf, prefix, li, "layer_scalar");
@@ -5733,8 +5782,17 @@ fn initStandardLayers(allocator: std.mem.Allocator, config: ModelConfig, weights
 /// unquantized while quantizing the rest. Caller owns the returned array.
 fn transposeBf16Weight(w: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
     var w_t = mlx.mlx_array_new();
-    const perm = [_]c_int{ 1, 0 };
-    try mlx.check(mlx.mlx_transpose_axes(&w_t, w, &perm, 2, s));
+    // Swap the last two axes. 2-D Linear weights become [in, out]; 3-D stacked
+    // MoE expert weights [experts, out, in] keep the expert axis and become
+    // [experts, in, out]. Higher ranks fall back to the 2-D case (unused today).
+    const ndim = mlx.getShape(w).len;
+    if (ndim == 3) {
+        const perm = [_]c_int{ 0, 2, 1 };
+        try mlx.check(mlx.mlx_transpose_axes(&w_t, w, &perm, 3, s));
+    } else {
+        const perm = [_]c_int{ 1, 0 };
+        try mlx.check(mlx.mlx_transpose_axes(&w_t, w, &perm, 2, s));
+    }
     return w_t;
 }
 
@@ -5878,16 +5936,16 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
             }
         } else {
             const k_w = getLayerWeight(weights, name_buf, prefix, li, "self_attn.k_proj.weight");
-            const k_s = getLayerWeight(weights, name_buf, prefix, li, "self_attn.k_proj.scales");
-            const k_b = getLayerWeight(weights, name_buf, prefix, li, "self_attn.k_proj.biases");
+            const k_s = getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.k_proj.scales") orelse mlx.mlx_array{ .ctx = null };
+            const k_b = getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.k_proj.biases") orelse mlx.mlx_array{ .ctx = null };
             // Gemma 4 MoE: global layers use K=V (no separate v_proj)
             const v_w = getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.v_proj.weight") orelse k_w;
             const v_s = getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.v_proj.scales") orelse k_s;
             const v_b = getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.v_proj.biases") orelse k_b;
             lw.attn = .{ .full = .{
                 .q_w = getLayerWeight(weights, name_buf, prefix, li, "self_attn.q_proj.weight"),
-                .q_s = getLayerWeight(weights, name_buf, prefix, li, "self_attn.q_proj.scales"),
-                .q_b = getLayerWeight(weights, name_buf, prefix, li, "self_attn.q_proj.biases"),
+                .q_s = getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.q_proj.scales") orelse mlx.mlx_array{ .ctx = null },
+                .q_b = getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.q_proj.biases") orelse mlx.mlx_array{ .ctx = null },
                 .k_w = k_w,
                 .k_s = k_s,
                 .k_b = k_b,
@@ -5895,8 +5953,8 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
                 .v_s = v_s,
                 .v_b = v_b,
                 .o_w = getLayerWeight(weights, name_buf, prefix, li, "self_attn.o_proj.weight"),
-                .o_s = getLayerWeight(weights, name_buf, prefix, li, "self_attn.o_proj.scales"),
-                .o_b = getLayerWeight(weights, name_buf, prefix, li, "self_attn.o_proj.biases"),
+                .o_s = getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.o_proj.scales") orelse mlx.mlx_array{ .ctx = null },
+                .o_b = getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.o_proj.biases") orelse mlx.mlx_array{ .ctx = null },
                 .q_norm = getLayerWeight(weights, name_buf, prefix, li, "self_attn.q_norm.weight"),
                 .k_norm = getLayerWeight(weights, name_buf, prefix, li, "self_attn.k_norm.weight"),
             } };
@@ -6178,7 +6236,10 @@ fn initHybridLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: 
 
 fn appendFullAttnWeights(vec: mlx.mlx_vector_array, fa: *const FullAttnWeights) void {
     inline for (std.meta.fields(FullAttnWeights)) |field| {
-        _ = mlx.mlx_vector_array_append_value(vec, @field(fa, field.name));
+        if (comptime field.type != mlx.mlx_array) continue;
+        // mxfp8 / plain-bf16 layers carry null-ctx scales/biases — skip those.
+        const arr = @field(fa, field.name);
+        if (arr.ctx != null) _ = mlx.mlx_vector_array_append_value(vec, arr);
     }
 }
 
@@ -6233,6 +6294,37 @@ fn detectQuantBits(w: mlx.mlx_array, sc: mlx.mlx_array, group_size: u32) u32 {
     const s_cols: u32 = @intCast(s_shape[s_shape.len - 1]);
     if (s_cols == 0) return 4;
     return (w_cols * 32) / (s_cols * group_size);
+}
+
+/// Jointly recover (bits, group_size) for an affine-quantized weight from its
+/// packed-weight and scales shapes, without trusting a globally-configured
+/// group_size. Mixed-precision checkpoints (e.g. mxfp8 experts with affine
+/// router) carry per-module group_size overrides that the loader does not
+/// thread through, so a single global value mis-detects bits for the modules
+/// that differ.
+///
+/// For affine packing the packed weight has `w_cols = in * bits / 32` and the
+/// scales have `s_cols = in / gs`, hence `w_cols * 32 / s_cols = bits * gs`.
+/// That product is fixed by the shapes; we pick the standard (bits, gs) pair
+/// that satisfies it, preferring higher bit widths. Falls back to the passed
+/// `group_size` with the legacy formula if no standard pair matches.
+fn detectQuantParams(w: mlx.mlx_array, sc: mlx.mlx_array, group_size: u32) QuantParams {
+    const w_shape = mlx.getShape(w);
+    const s_shape = mlx.getShape(sc);
+    if (w_shape.len < 2 or s_shape.len < 2) return .{ .bits = 4, .group_size = group_size };
+    const w_cols: u32 = @intCast(w_shape[w_shape.len - 1]);
+    const s_cols: u32 = @intCast(s_shape[s_shape.len - 1]);
+    if (s_cols == 0) return .{ .bits = 4, .group_size = group_size };
+    const product = (w_cols * 32) / s_cols; // == bits * gs
+    // Prefer wider bits; gs must be a standard group size.
+    const bit_candidates = [_]u32{ 8, 4, 2 };
+    for (bit_candidates) |b| {
+        if (product % b != 0) continue;
+        const gs = product / b;
+        if (gs == 32 or gs == 64 or gs == 128) return .{ .bits = b, .group_size = gs };
+    }
+    // No standard pair — keep the configured gs and derive bits from it.
+    return .{ .bits = detectQuantBits(w, sc, group_size), .group_size = group_size };
 }
 
 /// MoE routing chain (negate→argpartition→slice→softmax→take→sum→expand→divide).
@@ -6296,8 +6388,9 @@ fn qmatmulBits(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.ml
         return fp_result;
     }
 
-    // Detect mxfp8 mode: biases array has null ctx (created with mlx_array_new())
-    const is_mxfp = bi.ctx == null;
+    // Detect mxfp8 mode: weight has scales but no affine bias term (either a
+    // null handle or an empty placeholder array from an absent optional load).
+    const is_mxfp = isMxQuant(bi);
 
     if (is_mxfp) {
         // mxfp8: bits is always 8; infer group_size from scales/weight shape ratio
@@ -6342,6 +6435,45 @@ fn qmatmulBits(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.ml
         s,
     ));
     return result;
+}
+
+/// True when a quantized weight carries no affine bias term — i.e. it is stored
+/// in a microscaling format (mxfp8), which has `scales` but no `biases`. Both an
+/// explicit null handle and an empty placeholder array (produced by
+/// `mlx_array_new()` on an absent optional weight) count as "no biases".
+fn isMxQuant(bi: mlx.mlx_array) bool {
+    return bi.ctx == null or mlx.getShape(bi).len == 0;
+}
+
+const QuantDesc = struct {
+    mode: [*:0]const u8,
+    bits: u32,
+    group_size: u32,
+    biases: mlx.mlx_array,
+};
+
+/// Resolve (mode, bits, group_size, biases) for a quantized weight, mirroring
+/// the inference in `qmatmulBits`. Affine weights keep the caller-supplied
+/// `aff_bits`/`aff_gs` and their real biases. Microscaling (mxfp8) weights are
+/// 8-bit with group_size inferred from the scales/weight column ratio and a
+/// null bias handle (mxfp8 has no bias term).
+fn quantDescFor(w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, aff_bits: u32, aff_gs: u32) QuantDesc {
+    // Affine (real biases) or unquantized (no scales at all): keep the affine
+    // params and the caller-supplied biases array. Only a weight with scales but
+    // no biases is microscaling.
+    if (sc.ctx == null or !isMxQuant(bi))
+        return .{ .mode = "affine", .bits = aff_bits, .group_size = aff_gs, .biases = bi };
+
+    const mxfp_bits: u32 = 8;
+    const s_shape = mlx.getShape(sc);
+    const w_shape = mlx.getShape(w);
+    const mxfp_gs: u32 = if (s_shape.len >= 2 and w_shape.len >= 2) blk: {
+        const s_cols: u32 = @intCast(s_shape[s_shape.len - 1]);
+        const w_cols: u32 = @intCast(w_shape[w_shape.len - 1]);
+        if (s_cols > 0) break :blk (w_cols * 32) / (s_cols * mxfp_bits);
+        break :blk 32;
+    } else 32;
+    return .{ .mode = "mxfp8", .bits = mxfp_bits, .group_size = mxfp_gs, .biases = .{ .ctx = null } };
 }
 
 /// Extract timestep t from a [B, T, H, D] tensor → [B, H, D]
