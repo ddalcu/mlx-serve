@@ -12,9 +12,11 @@ const token_mask_mod = @import("token_mask.zig");
 const responses_mod = @import("responses.zig");
 const pld_index = @import("pld_index.zig");
 const prefix_cache_mod = @import("prefix_cache.zig");
+const tokenize_cache_mod = @import("tokenize_cache.zig");
 const scheduler_mod = @import("scheduler.zig");
 const ds4_ffi = @import("ds4_ffi.zig");
 const model_registry_mod = @import("model_registry.zig");
+const arch_llama = @import("arch/llama.zig");
 const stb = @cImport({ @cInclude("stb_image.h"); });
 const webp = @cImport({ @cInclude("webp/decode.h"); });
 const metrics = @import("status.zig");
@@ -208,7 +210,9 @@ fn signalHandler(_: std.posix.SIG) callconv(.c) void {
 /// The plan started from 0.15 but BPE tokenization fragments echo-heavy
 /// content enough that even strong echo cases land in the 0.01–0.10 range.
 /// 0.01 cleanly separates "any repetition at all" (PLD likely helps) from
-/// "pure novel" (PLD overhead-only). Tune via bench_spec.sh --gated.
+/// "pure novel" (PLD overhead-only). Re-tune by sweeping `enable_pld` on/off
+/// across an echo-heavy vs novel-content prompt set and picking the threshold
+/// that maximizes (echo_speedup / novel_overhead).
 const spec_gate_threshold: f32 = 0.01;
 
 // Plan 05: drafter state moved to `LoadedModel` (per-model `drafter`,
@@ -328,6 +332,49 @@ pub var prefix_cache_capacity: u32 = 1;
 /// from `--prefix-cache-entries` still applies).
 pub var prefix_cache_mem_bytes: u64 = 2 * 1024 * 1024 * 1024;
 
+/// Phase 1 (performance-plan): SSM/conv state snapshot stride during prefill,
+/// in tokens. Non-zero values enable multi-turn warm reuse on hybrid SSM
+/// architectures (Qwen3.5/3.6 GatedDeltaNet, Nemotron-H Mamba2, LFM2.5
+/// gated-conv). Set to 0 to disable (fall back to pre-Phase-1 behavior:
+/// hybrid models bypass the hot prefix cache entirely). Override via
+/// `--ssm-checkpoint-stride N`. Default 256: measured on M4 with Qwen3.5-4B,
+/// stride 256 keeps cold-prefill overhead under 3% (5 chunks vs 1 for 1k
+/// prompts) while still giving stride-aligned warm reuse to within ~256
+/// tokens of the matched prefix — typically saving 80-95% of multi-turn
+/// prefill compute. Stride 128 gives finer alignment at ~5% cold cost;
+/// stride 512 is essentially zero cold overhead but reuses less.
+pub var ssm_checkpoint_stride: u32 = 256;
+
+/// Phase 1: cap on the number of checkpoints retained per request. Snapshots
+/// past this drop the oldest (front of list) to keep memory bounded on very
+/// long prompts. 0 = unlimited (rely on the prefix-cache byte budget alone).
+pub var ssm_checkpoint_max: u32 = 32;
+
+/// Iteration 2 (perf-plan Phase 4 #3): LRU capacity of the per-LoadedModel
+/// chat-template tokenize cache. 0 disables (every request re-renders +
+/// re-tokenizes, restoring pre-Iteration-2 behavior). Default 4 is small
+/// because real chat conversations mutate the messages list every turn;
+/// the cache catches warm-reuse benches + repeated agent probes without
+/// hoarding token buffers across a long session.
+pub var tokenize_cache_entries: u32 = 4;
+
+/// Iteration 3-5 (perf-plan Phase 5 #1): cap on resident llama.cpp KV
+/// sessions per loaded GGUF model. 1 keeps the legacy single-session
+/// behavior (a flip between two long-doc prompts evicts the other on
+/// every turn). N > 1 enables the best-prefix-match LRU so alternating
+/// multi-doc workloads stay warm. Default 1 = backwards-compat; tests
+/// and bench harnesses pass --llama-cache-entries N to exercise it.
+pub var llama_cache_entries: u32 = 1;
+
+/// Phase 5 (performance-plan) #2: KV-cache quantization for the embedded
+/// llama.cpp engine. `off` = F16 (libllama default); `q8` halves the KV
+/// bytes (Q8_0, near-lossless); `q4` quarters them (Q4_0, some quality
+/// impact). Non-default settings automatically enable flash attention in
+/// the shim because llama.cpp's plain SDPA only supports F16/F32 KV.
+/// Set via `--llama-kv-quant {off,q8,q4}`. Applies to every llama.cpp
+/// session created after this is set (i.e., from the next model load).
+pub var llama_kv_quant: arch_llama.LlamaKvQuant = .off;
+
 /// Plan 01 — continuous batching: maximum concurrent in-flight requests sharing
 /// the inference thread's batched-decode pass. Set via `--max-concurrent N`.
 /// Default 1 = legacy single-slot behavior (no scheduler engagement, every
@@ -381,6 +428,9 @@ fn decodeTokens(
 ) ![]u8 {
     if (lm.ds4_engine) |engine| {
         return chat_mod.decodeViaDs4(allocator, engine, ids);
+    }
+    if (lm.llama_engine) |engine| {
+        return chat_mod.decodeViaLlama(allocator, engine, ids);
     }
     return tok.decode(allocator, ids, strip_leading_space);
 }
@@ -450,14 +500,27 @@ pub fn serve(
     // using the per-LoadParams capacity + byte budget. Surface a friendly
     // log line so users see whether the cache engaged.
     if (scheduler.hot_prefix_cache != null) {
+        const ssm_note: []const u8 = if (config.has_hybrid_layers)
+            " [hybrid: SSM checkpoints]"
+        else
+            "";
         if (prefix_cache_mem_bytes > 0) {
             const cap_mb = @as(f64, @floatFromInt(prefix_cache_mem_bytes)) / (1024.0 * 1024.0);
-            log.info("Hot prefix cache: ENABLED (capacity={d}, mem-cap={d:.1} MB)\n", .{ prefix_cache_capacity, cap_mb });
+            log.info("Hot prefix cache: ENABLED (capacity={d}, mem-cap={d:.1} MB){s}\n", .{ prefix_cache_capacity, cap_mb, ssm_note });
         } else {
-            log.info("Hot prefix cache: ENABLED (capacity={d}, mem-cap=unlimited)\n", .{prefix_cache_capacity});
+            log.info("Hot prefix cache: ENABLED (capacity={d}, mem-cap=unlimited){s}\n", .{ prefix_cache_capacity, ssm_note });
+        }
+        if (config.has_hybrid_layers) {
+            log.info("  ssm-checkpoint-stride={d} tokens, max={d}/entry\n", .{ ssm_checkpoint_stride, ssm_checkpoint_max });
         }
     } else if (prefix_cache_capacity > 0) {
-        log.info("Hot prefix cache: requested capacity={d} but model is hybrid (recurrent state) — disabled\n", .{prefix_cache_capacity});
+        if (config.has_hybrid_layers and ssm_checkpoint_stride == 0) {
+            log.info("Hot prefix cache: requested capacity={d} but model is hybrid and --ssm-checkpoint-stride is 0 — disabled\n", .{prefix_cache_capacity});
+        } else if (config.full_attention_interval > 0) {
+            log.info("Hot prefix cache: requested capacity={d} but model uses full-attention-interval — disabled\n", .{prefix_cache_capacity});
+        } else {
+            log.info("Hot prefix cache: requested capacity={d} but disabled by scheduler\n", .{prefix_cache_capacity});
+        }
     }
 
     // `--max-concurrent N` is honored when the model can ride the batched
@@ -1296,9 +1359,41 @@ fn handleLoadModelStrict(allocator: std.mem.Allocator, stream: *Conn, request_bo
     try sendResponse(stream, "200 OK", "application/json", body);
 }
 
+/// Pure body-builder for `GET /props`. Split out from `handleProps` so it
+/// can be unit-tested without standing up a real `LoadedModel`. Caller owns
+/// the returned slice.
+///
+/// Note: the `chat_template` field that upstream llama-server exposes here
+/// is intentionally omitted. Our Swift app never read it, and stock chat
+/// templates are 10–100 KB of Jinja — that turned every /props poll into
+/// wasted bandwidth. Capabilities still come from `/v1/models` per entry;
+/// clients that genuinely need the template can still get it from the
+/// model's `config.json` / `chat_template.jinja` on disk, or by rendering
+/// through `/v1/chat/completions` server-side.
+fn renderPropsBody(
+    allocator: std.mem.Allocator,
+    config: *const model_mod.ModelConfig,
+    ctx_str: []const u8,
+    active_mem: usize,
+    peak_mem: usize,
+    safe_ctx: u32,
+) ![]u8 {
+    return std.fmt.allocPrint(allocator,
+        \\{{"default_generation_settings":{{"model":"{s}","n_ctx":{s}}},"total_slots":1,"model_info":{{"vocab_size":{d},"hidden_size":{d},"num_hidden_layers":{d},"num_attention_heads":{d},"num_key_value_heads":{d},"head_dim":{d},"quantization_bits":{d},"quantization_group_size":{d},"max_position_embeddings":{d}}},"memory":{{"active_bytes":{d},"peak_bytes":{d},"max_safe_context":{d}}}}}
+    , .{
+        config.model_type,        ctx_str,
+        config.vocab_size,        config.hidden_size,
+        config.num_hidden_layers, config.num_attention_heads,
+        config.num_key_value_heads, config.head_dim,
+        config.quant_bits,        config.quant_group_size,
+        config.max_position_embeddings,
+        active_mem,               peak_mem,
+        safe_ctx,
+    });
+}
+
 fn handleProps(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel) !void {
     const config = lm.config.?;
-    const chat_config = lm.chat_config.?;
     const ctx_len = getEffectiveContextLength(config);
     const ctx_str = if (ctx_len > 0) blk: {
         break :blk try std.fmt.allocPrint(allocator, "{d}", .{ctx_len});
@@ -1325,28 +1420,19 @@ fn handleProps(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel) !v
         const total: u64 = gguf_bytes + ctx_mem.total_bytes;
         active_mem = @intCast(total);
         peak_mem = active_mem;
+    } else if (lm.llama_engine != null) {
+        // llama.cpp owns its own (Metal) allocations outside MLX's counters.
+        // Use the GGUF on-disk size as the headline figure so the app's GPU
+        // memory bar isn't stuck at 0/0; KV/scratch isn't separately exposed.
+        const gguf_bytes: u64 = lm.bytes_on_disk orelse 0;
+        active_mem = @intCast(gguf_bytes);
+        peak_mem = active_mem;
     } else {
         _ = mlx.mlx_get_active_memory(&active_mem);
         _ = mlx.mlx_get_peak_memory(&peak_mem);
     }
 
-    // JSON-escape the chat template
-    const escaped_template = try jsonEscape(allocator, chat_config.chat_template);
-    defer allocator.free(escaped_template);
-
-    const body = try std.fmt.allocPrint(allocator,
-        \\{{"default_generation_settings":{{"model":"{s}","n_ctx":{s}}},"total_slots":1,"chat_template":{s},"model_info":{{"vocab_size":{d},"hidden_size":{d},"num_hidden_layers":{d},"num_attention_heads":{d},"num_key_value_heads":{d},"head_dim":{d},"quantization_bits":{d},"quantization_group_size":{d},"max_position_embeddings":{d}}},"memory":{{"active_bytes":{d},"peak_bytes":{d},"max_safe_context":{d}}}}}
-    , .{
-        config.model_type,        ctx_str,
-        escaped_template,
-        config.vocab_size,        config.hidden_size,
-        config.num_hidden_layers, config.num_attention_heads,
-        config.num_key_value_heads, config.head_dim,
-        config.quant_bits,        config.quant_group_size,
-        config.max_position_embeddings,
-        active_mem,               peak_mem,
-        safe_ctx,
-    });
+    const body = try renderPropsBody(allocator, config, ctx_str, active_mem, peak_mem, safe_ctx);
     defer allocator.free(body);
     try sendResponse(stream, "200 OK", "application/json", body);
 }
@@ -1544,7 +1630,10 @@ fn handleEmbeddings(
     body: []const u8,
     lm: *LoadedModel,
 ) !void {
-    const xfm = lm.transformer.?;
+    // Optional: engine-backed (GGUF/ds4) models have no MLX transformer. The
+    // scheduler path doesn't need it; only the no-scheduler fallback does, and
+    // it guards on this being present.
+    const xfm_opt = lm.transformer;
     const tok = lm.tokenizer.?;
     const config = lm.config.?;
     const gen_mod = @import("generate.zig");
@@ -1625,6 +1714,10 @@ fn handleEmbeddings(
                 return;
             };
         } else fallback: {
+            const xfm = xfm_opt orelse {
+                try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Embeddings require an MLX (safetensors) model; this model has no encoder", null);
+                return;
+            };
             try xfm.resetCache();
             break :fallback gen_mod.computeEmbedding(allocator, xfm, ids) catch |err| {
                 log.err("  embedding error: {}\n", .{err});
@@ -1692,6 +1785,12 @@ fn handleTokenize(
 
     const ids = if (lm.ds4_engine) |engine| blk: {
         const i32_ids = try engine.tokenizeText(allocator, content.?);
+        defer allocator.free(i32_ids);
+        const out = try allocator.alloc(u32, i32_ids.len);
+        for (i32_ids, 0..) |t, i| out[i] = @intCast(t);
+        break :blk out;
+    } else if (lm.llama_engine) |engine| blk: {
+        const i32_ids = try engine.tokenizeText(allocator, content.?, true);
         defer allocator.free(i32_ids);
         const out = try allocator.alloc(u32, i32_ids.len);
         for (i32_ids, 0..) |t, i| out[i] = @intCast(t);
@@ -1772,7 +1871,10 @@ fn handleChatCompletions(
     body: []const u8,
     lm: *LoadedModel,
 ) !void {
-    const xfm = lm.transformer.?;
+    // NOTE: no `lm.transformer.?` here — this handler also serves engine-backed
+    // models (GGUF/llama, ds4) whose `transformer` is null. The only MLX-specific
+    // gate below reads `config.has_hybrid_layers` (valid for every model incl. the
+    // GGUF stub), so the transformer is never needed at this level.
     const tok = lm.tokenizer.?;
     const chat_config = lm.chat_config.?;
     const config = lm.config.?;
@@ -2166,7 +2268,7 @@ fn handleChatCompletions(
         log.info("  drafter=disabled (logprobs requested)\n", .{});
         enable_drafter = false;
     }
-    if (enable_drafter and xfm.config.has_hybrid_layers) {
+    if (enable_drafter and config.has_hybrid_layers) {
         log.info("  drafter=disabled (hybrid SSM architecture not yet supported for multi-token verify)\n", .{});
         enable_drafter = false;
     }
@@ -2206,10 +2308,13 @@ fn handleChatCompletions(
     // `tools_json` + `tool_choice_instruction` through — the ds4 helper
     // synthesizes a system-message fallback when the GGUF chat template
     // doesn't model `tools` natively (which is the DSV4 case).
-    var prompt_ids_raw = if (lm.ds4_engine) |engine|
-        try chat_mod.encodeChatViaDs4(allocator, engine, messages.items, tools_json, tool_choice_instruction, enable_thinking)
-    else
-        try chat_mod.formatChat(allocator, tok, messages.items, chat_config, tools_json, tool_choice_instruction, enable_thinking);
+    //
+    // Phase 4 instrumentation + Iteration 2 cache: time the render+tokenize
+    // step. The cache is engine-agnostic — same hit even when the
+    // underlying call is ds4 / llama / MLX formatChat.
+    var tokenize_sw = Stopwatch.init(stream.io);
+    var prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, chat_config, messages.items, tools_json, tool_choice_instruction, enable_thinking);
+    const tokenize_ns = tokenize_sw.read();
 
     // Run vision encoder if any messages contain images. Phase A8: each
     // request owns its embedding locally; we hand it off to the slot at
@@ -2317,7 +2422,7 @@ fn handleChatCompletions(
     const sub_ve = local_ve;
     local_ve = null;
     if (is_stream) {
-        handleStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, include_usage, has_tools, logprobs_n, enable_thinking, reasoning_budget, enable_pld, enable_drafter, sub_ve, kv_quant_override) catch |err| {
+        handleStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, include_usage, has_tools, logprobs_n, enable_thinking, reasoning_budget, enable_pld, enable_drafter, sub_ve, kv_quant_override, tokenize_ns) catch |err| {
             log.err("  -> streaming error: {}\n", .{err});
             // Send SSE error event so the client gets a proper error instead of a dropped connection
             const err_chunk = std.fmt.allocPrint(allocator,
@@ -2328,7 +2433,7 @@ fn handleChatCompletions(
             stream.writeAll("\n\ndata: [DONE]\n\n") catch {};
         };
     } else {
-        handleNonStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, logprobs_n, enable_thinking, reasoning_budget, enable_pld, enable_drafter, sub_ve, kv_quant_override) catch |err| {
+        handleNonStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, logprobs_n, enable_thinking, reasoning_budget, enable_pld, enable_drafter, sub_ve, kv_quant_override, tokenize_ns) catch |err| {
             log.err("  -> 500 ({s})\n", .{@errorName(err)});
             sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", @errorName(err), 500) catch {};
         };
@@ -2457,6 +2562,12 @@ fn handleCompletions(
         const out = try allocator.alloc(u32, i32_ids.len);
         for (i32_ids, 0..) |t, i| out[i] = @intCast(t);
         break :blk out;
+    } else if (lm.llama_engine) |engine| blk: {
+        const i32_ids = try engine.tokenizeText(allocator, prompt_text.?, true);
+        defer allocator.free(i32_ids);
+        const out = try allocator.alloc(u32, i32_ids.len);
+        for (i32_ids, 0..) |t, i| out[i] = @intCast(t);
+        break :blk out;
     } else try tok.encode(allocator, prompt_text.?);
     defer allocator.free(prompt_ids);
 
@@ -2529,8 +2640,10 @@ fn handleNonStreamingCompletion(
     }
 
     const elapsed_ms = timer.read() / std.time.ns_per_ms;
-    log.info("  <- {d}+{d} tokens ({d}ms) [prefill: {d:.1} tok/s, decode: {d:.1} tok/s] [{s}]\n", .{
-        result.prompt_tokens, result.completion_tokens, elapsed_ms, result.prefill_tps, result.decode_tps, finish_reason,
+    var perf_buf: [160]u8 = undefined;
+    const perf = formatPerfBracket(&perf_buf, result.prompt_tokens, result.cached_tokens, result.completion_tokens, result.prefill_ns, result.decode_ns);
+    log.info("  <- {d}+{d} tokens ({d}ms) [{s}] [{s}]\n", .{
+        result.prompt_tokens, result.completion_tokens, elapsed_ms, perf, finish_reason,
     });
 
     const escaped_text = jsonEscape(allocator, final_text) catch "\"\"";
@@ -2593,10 +2706,6 @@ fn handleStreamingCompletion(
     });
     var ts = StreamingTokenStream.initFromSlot(slot_handle.?, .regular, eos_token_ids);
     defer ts.deinit(allocator);
-
-    // Scheduler emits per-tick prefill log lines; we don't have a usable
-    // synchronous timing here, so report 0 tok/s for the streaming summary.
-    const prefill_tps: f64 = 0.0;
 
     // SSE headers
     const header =
@@ -2707,14 +2816,11 @@ fn handleStreamingCompletion(
         try stream.writeAll("data: [DONE]\n\n");
     }
 
-    const decode_ns = timer.read();
-    const decode_tps: f64 = if (decode_ns > 0)
-        @as(f64, @floatFromInt(ts.completion_tokens)) * @as(f64, @floatFromInt(std.time.ns_per_s)) / @as(f64, @floatFromInt(decode_ns))
-    else
-        0.0;
-    const elapsed_ms = decode_ns / std.time.ns_per_ms;
-    log.info("  <- {d}+{d} tokens streamed ({d}ms) [prefill: {d:.1} tok/s, decode: {d:.1} tok/s] [{s}]\n", .{
-        total_prompt, ts.completion_tokens, elapsed_ms, prefill_tps, decode_tps, finish_reason,
+    const elapsed_ms = timer.read() / std.time.ns_per_ms;
+    var perf_buf: [160]u8 = undefined;
+    const perf = formatPerfBracket(&perf_buf, ts.prompt_tokens, ts.cached_tokens, ts.completion_tokens, ts.prefill_ns, ts.decode_ns);
+    log.info("  <- {d}+{d} tokens streamed ({d}ms) [{s}] [{s}]\n", .{
+        total_prompt, ts.completion_tokens, elapsed_ms, perf, finish_reason,
     });
 }
 
@@ -2783,17 +2889,8 @@ fn nonStreamingViaScheduler(
     // The scheduler measures prefill_ns / decode_ns per-slot directly. Pull
     // those instead of the old single-wall-clock approximation, which
     // double-counted total time into both phases.
-    const ns_per_s_f: f64 = @as(f64, @floatFromInt(std.time.ns_per_s));
-    const prompt_len_f: f64 = @as(f64, @floatFromInt(slot.prompt_tokens));
-    const completion_len_f: f64 = @as(f64, @floatFromInt(slot.completion_tokens));
-    const prefill_tps: f64 = if (slot.prefill_ns > 0)
-        prompt_len_f * ns_per_s_f / @as(f64, @floatFromInt(slot.prefill_ns))
-    else
-        0.0;
-    const decode_tps: f64 = if (slot.decode_ns > 0)
-        completion_len_f * ns_per_s_f / @as(f64, @floatFromInt(slot.decode_ns))
-    else
-        0.0;
+    const prefill_tps = generate_mod.prefillTokensPerSec(slot.prompt_tokens, slot.cached_tokens, slot.prefill_ns);
+    const decode_tps = generate_mod.tokensPerSec(slot.completion_tokens, slot.decode_ns);
 
     const strip_leading = tok.tok_type == .sentencepiece_bpe;
     const text = try decodeTokens(allocator, lm, tok, output_ids.items, strip_leading);
@@ -2817,6 +2914,7 @@ fn nonStreamingViaScheduler(
         .decode_tps = decode_tps,
         .prefill_ns = slot.prefill_ns,
         .decode_ns = slot.decode_ns,
+        .cached_tokens = slot.cached_tokens,
         .logprobs = logprobs_slice,
     };
 }
@@ -2841,6 +2939,9 @@ fn handleNonStreamingGeneration(
     vision_embeddings: ?mlx.mlx_array,
     /// Wave 1.A: per-request KV-quant override; null = inherit scheduler default.
     kv_quant_override: ?transformer_mod.KVQuantConfig,
+    /// Iteration 1: tokenize_ns from the parent handleChatCompletions, so
+    /// the non-streaming chat response carries `timings.tokenize_ms`.
+    tokenize_ns: u64,
 ) !void {
     // Phase A8: this handler owns the vision array on entry; ownership
     // transfers to the slot on submit (the scheduler's `Slot.deinit` frees
@@ -2928,8 +3029,10 @@ fn handleNonStreamingGeneration(
                 allocator.free(tool_calls);
             }
 
-            log.info("  <- {d}+{d} tokens ({d}ms) [prefill: {d:.1} tok/s, decode: {d:.1} tok/s] [tool_calls: {d}]\n", .{
-                result.prompt_tokens, result.completion_tokens, elapsed_ms, result.prefill_tps, result.decode_tps, tool_calls.len,
+            var tc_perf_buf: [160]u8 = undefined;
+            const tc_perf = formatPerfBracket(&tc_perf_buf, result.prompt_tokens, result.cached_tokens, result.completion_tokens, result.prefill_ns, result.decode_ns);
+            log.info("  <- {d}+{d} tokens ({d}ms) [{s}] [tool_calls: {d}]\n", .{
+                result.prompt_tokens, result.completion_tokens, elapsed_ms, tc_perf, tool_calls.len,
             });
 
             // Build tool_calls JSON array
@@ -2966,7 +3069,7 @@ fn handleNonStreamingGeneration(
             }
             defer if (tc_reasoning_allocated) allocator.free(tc_reasoning_json);
 
-            const tc_timings = try formatTimingsObject(allocator, result.prompt_tokens, result.completion_tokens, result.prefill_ns, result.decode_ns);
+            const tc_timings = try formatTimingsObject(allocator, result.prompt_tokens, result.cached_tokens, result.completion_tokens, result.prefill_ns, result.decode_ns, tokenize_ns);
             defer allocator.free(tc_timings);
             const tc_timings_field = if (tc_timings.len > 0)
                 try std.fmt.allocPrint(allocator, ",\"timings\":{s}", .{tc_timings})
@@ -2993,8 +3096,10 @@ fn handleNonStreamingGeneration(
         }
     }
 
-    log.info("  <- {d}+{d} tokens ({d}ms) [prefill: {d:.1} tok/s, decode: {d:.1} tok/s] [{s}]\n", .{
-        result.prompt_tokens, result.completion_tokens, elapsed_ms, result.prefill_tps, result.decode_tps, finish_reason,
+    var perf_buf: [160]u8 = undefined;
+    const perf = formatPerfBracket(&perf_buf, result.prompt_tokens, result.cached_tokens, result.completion_tokens, result.prefill_ns, result.decode_ns);
+    log.info("  <- {d}+{d} tokens ({d}ms) [{s}] [{s}]\n", .{
+        result.prompt_tokens, result.completion_tokens, elapsed_ms, perf, finish_reason,
     });
 
     // Split thinking content from response
@@ -3028,7 +3133,7 @@ fn handleNonStreamingGeneration(
     }
     defer if (reasoning_allocated) allocator.free(reasoning_json);
 
-    const timings_obj = try formatTimingsObject(allocator, result.prompt_tokens, result.completion_tokens, result.prefill_ns, result.decode_ns);
+    const timings_obj = try formatTimingsObject(allocator, result.prompt_tokens, result.cached_tokens, result.completion_tokens, result.prefill_ns, result.decode_ns, tokenize_ns);
     defer allocator.free(timings_obj);
     const timings_field = if (timings_obj.len > 0)
         try std.fmt.allocPrint(allocator, ",\"timings\":{s}", .{timings_obj})
@@ -3096,6 +3201,7 @@ const StreamingTokenStream = struct {
     /// these instead of touching the underlying gen/slot directly so the same
     /// post-generation code works for both legacy and scheduler paths.
     prompt_tokens: u32 = 0,
+    cached_tokens: u32 = 0,
     completion_tokens: u32 = 0,
     finish_reason: []const u8 = "stop",
     /// Wall-clock ns for prefill / decode (scheduler path only; the legacy
@@ -3136,6 +3242,7 @@ const StreamingTokenStream = struct {
     fn finalize(self: *StreamingTokenStream) void {
         if (self.slot) |s| {
             self.prompt_tokens = s.prompt_tokens;
+            self.cached_tokens = s.cached_tokens;
             self.completion_tokens = s.completion_tokens;
             self.finish_reason = s.finish_reason;
             self.prefill_ns = s.prefill_ns;
@@ -3300,6 +3407,11 @@ fn handleStreamingGeneration(
     vision_embeddings: ?mlx.mlx_array,
     /// Wave 1.A: per-request KV-quant override; null = inherit scheduler default.
     kv_quant_override: ?transformer_mod.KVQuantConfig,
+    /// Iteration 1: tokenize_ns measured by the request handler before
+    /// dispatching here. Surfaced via `timings.tokenize_ms` on the final
+    /// usage SSE chunk so streaming clients see the same metric as
+    /// non-streaming.
+    tokenize_ns: u64,
 ) !void {
     // Vision array ownership: held by this handler on entry, transfers to
     // the slot on submit (slot.deinit frees). Nulled before transfer so
@@ -3353,11 +3465,6 @@ fn handleStreamingGeneration(
     });
     var ts = StreamingTokenStream.initFromSlot(slot_handle.?, stream_mode, eos_token_ids);
     defer ts.deinit(allocator);
-
-    // Scheduler reports prefill_tps on slot completion via `ts.prefill_tps`
-    // (populated in `finalize`). Per-tick log lines emitted by runPrefill
-    // remain the authoritative source.
-    const prefill_tps: f64 = 0.0;
 
     // Send SSE headers (no Content-Length — we stream until done)
     const header =
@@ -3768,7 +3875,7 @@ fn handleStreamingGeneration(
                 \\{{"prompt_tokens":{d},"completion_tokens":{d},"total_tokens":{d}}}
             , .{ total_prompt, ts.completion_tokens, total_prompt + ts.completion_tokens });
             defer allocator.free(usage_json);
-            const timings_obj = try formatTimingsObject(allocator, total_prompt, ts.completion_tokens, ts.prefill_ns, ts.decode_ns);
+            const timings_obj = try formatTimingsObject(allocator, total_prompt, ts.cached_tokens, ts.completion_tokens, ts.prefill_ns, ts.decode_ns, tokenize_ns);
             defer allocator.free(timings_obj);
             const timings_opt: ?[]const u8 = if (timings_obj.len > 0) timings_obj else null;
             try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null }, finish_reason, usage_json, timings_opt);
@@ -3779,10 +3886,12 @@ fn handleStreamingGeneration(
         try stream.writeAll("data: [DONE]\n\n");
     }
 
-    // Decode TPS: scheduler emits its own per-tick prefill log line; here
-    // we just report the prompt+completion totals + finish reason.
-    log.info("  <- {d}+{d} tokens streamed [prefill: {d:.1} tok/s] [{s}]\n", .{
-        total_prompt, ts.completion_tokens, prefill_tps, finish_reason,
+    // Per-slot timings come from the scheduler (ts.prefill_ns / ts.decode_ns,
+    // populated in finalize); the bracket reports compute + any prefix reuse.
+    var perf_buf: [160]u8 = undefined;
+    const perf = formatPerfBracket(&perf_buf, ts.prompt_tokens, ts.cached_tokens, ts.completion_tokens, ts.prefill_ns, ts.decode_ns);
+    log.info("  <- {d}+{d} tokens streamed [{s}] [{s}]\n", .{
+        total_prompt, ts.completion_tokens, perf, finish_reason,
     });
 }
 
@@ -4047,34 +4156,106 @@ fn utf8TrailingIncomplete(s: []const u8) usize {
 
 /// Build a llama.cpp-style `timings` JSON object (no surrounding key) from
 /// raw nanosecond counts and token totals. Caller frees. Returns an empty
-/// string when both `prefill_ns` and `decode_ns` are zero (legacy paths that
-/// don't measure timing) so the field can be omitted from the response.
+/// string when `prefill_ns`, `decode_ns`, AND `tokenize_ns` are all zero
+/// (legacy paths that don't measure timing) so the field can be omitted.
+///
+/// `tokenize_ns` is the wall-clock cost of the synchronous
+/// `renderChatTemplate + tokenizer.encode` step on the request thread.
+/// Phase 4 #1 of `performance-plan.md` calls for instrumentation-first:
+/// before we move tokenize onto a worker thread, we need numbers per
+/// engine / prompt length. Pass 0 for legacy paths that don't measure it
+/// (the field is then omitted from the JSON; existing callers stay shape-
+/// compatible while the new ones surface the metric).
+///
+/// Iteration 2: chat-template render+tokenize wrapper that consults a
+/// per-LoadedModel LRU cache before calling the underlying engine's
+/// encoder. On hit the returned slice is a fresh allocation owned by the
+/// caller (drop-in replacement for the engine encoders). On miss it
+/// stores a copy of the result in the cache.
+fn cachedFormatChat(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    lm: *LoadedModel,
+    tok: *const Tokenizer,
+    chat_config: *const chat_mod.ChatConfig,
+    messages: []const chat_mod.Message,
+    tools_json: ?[]const u8,
+    tool_choice_instruction: ?[]const u8,
+    enable_thinking: bool,
+) ![]u32 {
+    const cache_ptr: ?*tokenize_cache_mod.TokenizeCache = if (lm.tokenize_cache) |*tc| tc else null;
+    const key_opt: ?u64 = if (cache_ptr != null)
+        tokenize_cache_mod.TokenizeCache.keyFor(messages, tools_json, tool_choice_instruction, enable_thinking)
+    else
+        null;
+    if (cache_ptr) |cache| if (key_opt) |key| {
+        if (try cache.get(io, key, allocator)) |cached| return cached;
+    };
+    const ids = if (lm.ds4_engine) |engine|
+        try chat_mod.encodeChatViaDs4(allocator, engine, messages, tools_json, tool_choice_instruction, enable_thinking)
+    else if (lm.llama_engine) |engine|
+        try chat_mod.encodeChatViaLlama(allocator, engine, chat_config, messages, tools_json, tool_choice_instruction, enable_thinking)
+    else
+        try chat_mod.formatChat(allocator, tok, messages, chat_config, tools_json, tool_choice_instruction, enable_thinking);
+    if (cache_ptr) |cache| if (key_opt) |key| {
+        // Insert is best-effort; an OOM in the cache shouldn't fail the
+        // request — the user already has their tokenized prompt.
+        cache.put(io, key, ids) catch |err| {
+            log.warn("[tokenize-cache] put failed: {s}\n", .{@errorName(err)});
+        };
+    };
+    return ids;
+}
+
 fn formatTimingsObject(
     allocator: std.mem.Allocator,
     prompt_tokens: u32,
+    cached_tokens: u32,
     completion_tokens: u32,
     prefill_ns: u64,
     decode_ns: u64,
+    tokenize_ns: u64,
 ) ![]u8 {
-    if (prefill_ns == 0 and decode_ns == 0) return try allocator.alloc(u8, 0);
+    if (prefill_ns == 0 and decode_ns == 0 and tokenize_ns == 0) return try allocator.alloc(u8, 0);
     const ns_per_ms_f: f64 = @as(f64, @floatFromInt(std.time.ns_per_ms));
-    const ns_per_s_f: f64 = @as(f64, @floatFromInt(std.time.ns_per_s));
     const p_ms = @as(f64, @floatFromInt(prefill_ns)) / ns_per_ms_f;
     const d_ms = @as(f64, @floatFromInt(decode_ns)) / ns_per_ms_f;
-    const p_tps: f64 = if (prefill_ns > 0)
-        @as(f64, @floatFromInt(prompt_tokens)) * ns_per_s_f / @as(f64, @floatFromInt(prefill_ns))
-    else
-        0.0;
-    const d_tps: f64 = if (decode_ns > 0)
-        @as(f64, @floatFromInt(completion_tokens)) * ns_per_s_f / @as(f64, @floatFromInt(decode_ns))
-    else
-        0.0;
+    const t_ms = @as(f64, @floatFromInt(tokenize_ns)) / ns_per_ms_f;
+    // prompt_per_second reflects compute: divide by the tokens actually run
+    // (prompt minus the KV-cache prefix). `cached_n` exposes the reuse so a
+    // bench / client can tell a warm hit from a cold prefill.
+    const p_tps = generate_mod.prefillTokensPerSec(prompt_tokens, cached_tokens, prefill_ns);
+    const d_tps = generate_mod.tokensPerSec(completion_tokens, decode_ns);
+    // Always emit `tokenize_ms` (even at 0.0) so clients can rely on the key
+    // being present — they can branch on the value, not on presence/absence.
     return try std.fmt.allocPrint(
         allocator,
-        \\{{"prompt_n":{d},"prompt_ms":{d:.3},"prompt_per_second":{d:.3},"predicted_n":{d},"predicted_ms":{d:.3},"predicted_per_second":{d:.3}}}
+        \\{{"prompt_n":{d},"cached_n":{d},"prompt_ms":{d:.3},"prompt_per_second":{d:.3},"predicted_n":{d},"predicted_ms":{d:.3},"predicted_per_second":{d:.3},"tokenize_ms":{d:.3}}}
     ,
-        .{ prompt_tokens, p_ms, p_tps, completion_tokens, d_ms, d_tps },
+        .{ prompt_tokens, cached_tokens, p_ms, p_tps, completion_tokens, d_ms, d_tps, t_ms },
     );
+}
+
+/// Format the "prefill: X tok/s [(C cached / P total)], decode: Y tok/s" perf
+/// bracket into `buf` so every API path logs prefill compute (and any prefix
+/// reuse) identically. `cached > 0` adds the cached/total hint; otherwise the
+/// short form keeps the existing log shape for cold prefills. Single source of
+/// truth so the format never drifts across the chat/anthropic/streaming logs.
+fn formatPerfBracket(
+    buf: []u8,
+    prompt_tokens: u32,
+    cached_tokens: u32,
+    completion_tokens: u32,
+    prefill_ns: u64,
+    decode_ns: u64,
+) []const u8 {
+    const p_tps = generate_mod.prefillTokensPerSec(prompt_tokens, cached_tokens, prefill_ns);
+    const d_tps = generate_mod.tokensPerSec(completion_tokens, decode_ns);
+    const s = if (cached_tokens > 0)
+        std.fmt.bufPrint(buf, "prefill: {d:.1} tok/s ({d} cached / {d} total), decode: {d:.1} tok/s", .{ p_tps, cached_tokens, prompt_tokens, d_tps })
+    else
+        std.fmt.bufPrint(buf, "prefill: {d:.1} tok/s, decode: {d:.1} tok/s", .{ p_tps, d_tps });
+    return s catch buf[0..0];
 }
 
 fn jsonEscape(allocator: std.mem.Allocator, input: []const u8) ![]const u8 {
@@ -4689,7 +4870,8 @@ fn handleAnthropicMessages(
     body: []const u8,
     lm: *LoadedModel,
 ) !void {
-    const xfm = lm.transformer.?;
+    // No `lm.transformer.?` — engine-backed (GGUF/ds4) models have a null
+    // transformer; the only gate below uses `config.has_hybrid_layers`.
     const tok = lm.tokenizer.?;
     const chat_config = lm.chat_config.?;
     const config = lm.config.?;
@@ -5028,7 +5210,7 @@ fn handleAnthropicMessages(
     else
         server_config.default_enable_pld;
     if (enable_pld and has_tools) enable_pld = false;
-    if (enable_pld and xfm.config.has_hybrid_layers) enable_pld = false;
+    if (enable_pld and config.has_hybrid_layers) enable_pld = false;
 
     // Drafter: same disable rules as chat-completions parse site.
     const drafter_explicit_in_json: bool = root.get("enable_drafter") != null;
@@ -5039,7 +5221,7 @@ fn handleAnthropicMessages(
         lm_default_enable_drafter;
     if (enable_drafter and lm.drafter == null) enable_drafter = false;
     if (enable_drafter and has_tools) enable_drafter = false;
-    if (enable_drafter and xfm.config.has_hybrid_layers) enable_drafter = false;
+    if (enable_drafter and config.has_hybrid_layers) enable_drafter = false;
 
     // Log request
     const last_msg = messages.items[messages.items.len - 1];
@@ -5054,12 +5236,13 @@ fn handleAnthropicMessages(
     });
     log.info("  > \"{s}{s}\"\n", .{ last_msg.content[0..preview_len], if (last_msg.content.len > 80) "..." else "" });
 
-    // Format chat template
+    // Format chat template. Iteration 1 timing + Iteration 2 cache. The
+    // `effective_tools_json` swap (`null` when has_tools is false) keeps
+    // the cache key consistent with what the encoder actually sees.
     const effective_tools_json: ?[]const u8 = if (has_tools) tools_json else null;
-    var prompt_ids_raw = if (lm.ds4_engine) |engine|
-        try chat_mod.encodeChatViaDs4(allocator, engine, messages.items, effective_tools_json, tool_choice_instruction, enable_thinking)
-    else
-        try chat_mod.formatChat(allocator, tok, messages.items, chat_config, effective_tools_json, tool_choice_instruction, enable_thinking);
+    var tokenize_sw = Stopwatch.init(stream.io);
+    var prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, chat_config, messages.items, effective_tools_json, tool_choice_instruction, enable_thinking);
+    const tokenize_ns = tokenize_sw.read();
 
     // Vision encoder: encode any images on the last user message and splice
     // image tokens into the prompt at the model's configured image_token_id.
@@ -5125,7 +5308,7 @@ fn handleAnthropicMessages(
     const sub_ve = local_ve;
     local_ve = null;
     if (is_stream) {
-        handleAnthropicStreaming(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, enable_thinking, reasoning_budget, @intCast(prompt_ids.len), enable_pld, enable_drafter, sub_ve, kv_quant_override) catch |err| {
+        handleAnthropicStreaming(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, enable_thinking, reasoning_budget, @intCast(prompt_ids.len), enable_pld, enable_drafter, sub_ve, kv_quant_override, tokenize_ns) catch |err| {
             log.err("  -> streaming error: {}\n", .{err});
             const err_data = std.fmt.allocPrint(allocator,
                 \\{{"type":"error","error":{{"type":"api_error","message":"Internal server error: {s}"}}}}
@@ -5134,7 +5317,7 @@ fn handleAnthropicMessages(
             sendAnthropicEvent(stream, "error", err_data) catch {};
         };
     } else {
-        handleAnthropicNonStreaming(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, enable_thinking, reasoning_budget, @intCast(prompt_ids.len), enable_pld, sub_ve, kv_quant_override) catch |err| {
+        handleAnthropicNonStreaming(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, enable_thinking, reasoning_budget, @intCast(prompt_ids.len), enable_pld, sub_ve, kv_quant_override, tokenize_ns) catch |err| {
             log.err("  -> 500 ({s})\n", .{@errorName(err)});
             sendAnthropicError(allocator, stream, "api_error", @errorName(err), 500) catch {};
         };
@@ -5160,6 +5343,10 @@ fn handleAnthropicNonStreaming(
     vision_embeddings: ?mlx.mlx_array,
     /// Wave 1.A: per-request KV-quant override.
     kv_quant_override: ?transformer_mod.KVQuantConfig,
+    /// Iteration 1 instrumentation: nanoseconds of render+tokenize measured
+    /// by the parent handleAnthropicMessages. Threaded through so the
+    /// non-streaming response carries `timings.tokenize_ms`.
+    tokenize_ns: u64,
 ) !void {
     // Vision-array ownership: nulled below before scheduler.submit so the
     // early-return defer doesn't double-free.
@@ -5251,8 +5438,10 @@ fn handleAnthropicNonStreaming(
                 allocator.free(tool_calls);
             }
 
-            log.info("  <- {d}+{d} tokens ({d}ms) [prefill: {d:.1} tok/s, decode: {d:.1} tok/s] [tool_use: {d}]\n", .{
-                result.prompt_tokens, result.completion_tokens, elapsed_ms, result.prefill_tps, result.decode_tps, tool_calls.len,
+            var tu_perf_buf: [160]u8 = undefined;
+            const tu_perf = formatPerfBracket(&tu_perf_buf, result.prompt_tokens, result.cached_tokens, result.completion_tokens, result.prefill_ns, result.decode_ns);
+            log.info("  <- {d}+{d} tokens ({d}ms) [{s}] [tool_use: {d}]\n", .{
+                result.prompt_tokens, result.completion_tokens, elapsed_ms, tu_perf, tool_calls.len,
             });
 
             // Emit tool_use content blocks
@@ -5296,12 +5485,26 @@ fn handleAnthropicNonStreaming(
     try content.append(allocator, ']');
 
     const stop_reason = mapFinishToStopReason(finish_reason);
-    log.info("  <- {d}+{d} tokens ({d}ms) [prefill: {d:.1} tok/s, decode: {d:.1} tok/s] [{s}]\n", .{
-        result.prompt_tokens, result.completion_tokens, elapsed_ms, result.prefill_tps, result.decode_tps, stop_reason,
+    var perf_buf: [160]u8 = undefined;
+    const perf = formatPerfBracket(&perf_buf, result.prompt_tokens, result.cached_tokens, result.completion_tokens, result.prefill_ns, result.decode_ns);
+    log.info("  <- {d}+{d} tokens ({d}ms) [{s}] [{s}]\n", .{
+        result.prompt_tokens, result.completion_tokens, elapsed_ms, perf, stop_reason,
     });
 
+    // Anthropic spec doesn't standardize a `timings` field; we attach one as
+    // an extension (mirrors what /v1/chat/completions already does) so bench
+    // tooling can read tokenize_ms / prompt_ms / predicted_ms from either
+    // surface without re-implementing the SSE accumulator.
+    const timings_obj = try formatTimingsObject(allocator, result.prompt_tokens, result.cached_tokens, result.completion_tokens, result.prefill_ns, result.decode_ns, tokenize_ns);
+    defer allocator.free(timings_obj);
+    const timings_field = if (timings_obj.len > 0)
+        try std.fmt.allocPrint(allocator, ",\"timings\":{s}", .{timings_obj})
+    else
+        try allocator.alloc(u8, 0);
+    defer allocator.free(timings_field);
+
     const response = try std.fmt.allocPrint(allocator,
-        \\{{"id":"msg_{d}","type":"message","role":"assistant","content":{s},"model":"{s}","stop_reason":"{s}","stop_sequence":null,"usage":{{"input_tokens":{d},"output_tokens":{d}}}}}
+        \\{{"id":"msg_{d}","type":"message","role":"assistant","content":{s},"model":"{s}","stop_reason":"{s}","stop_sequence":null,"usage":{{"input_tokens":{d},"output_tokens":{d}}}{s}}}
     , .{
         nowMs(stream.io),
         content.items,
@@ -5309,6 +5512,7 @@ fn handleAnthropicNonStreaming(
         stop_reason,
         prompt_token_count,
         result.completion_tokens,
+        timings_field,
     });
     defer allocator.free(response);
     try sendResponse(stream, "200 OK", "application/json", response);
@@ -5334,7 +5538,13 @@ fn handleAnthropicStreaming(
     vision_embeddings: ?mlx.mlx_array,
     /// Wave 1.A: per-request KV-quant override.
     kv_quant_override: ?transformer_mod.KVQuantConfig,
+    /// Iteration 1: tokenize_ns from parent handler. Anthropic streaming
+    /// doesn't currently emit `timings` over SSE (spec doesn't model it),
+    /// but plumbing the value through keeps the signature consistent with
+    /// non-streaming and unblocks a future message_delta extension.
+    tokenize_ns: u64,
 ) !void {
+    _ = tokenize_ns; // reserved; see doc comment
     // Vision-array ownership: held by this handler on entry, transfers to
     // the slot on submit (slot.deinit frees). Nulled before transfer.
     var ve_local = vision_embeddings;
@@ -5378,10 +5588,6 @@ fn handleAnthropicStreaming(
     });
     var ts = StreamingTokenStream.initFromSlot(slot_handle.?, stream_mode, eos_token_ids);
     defer ts.deinit(allocator);
-
-    // Scheduler emits per-tick prefill log lines; we don't have a usable
-    // synchronous timing here, so report 0 tok/s for the streaming summary.
-    const prefill_tps: f64 = 0.0;
 
     // SSE headers
     const header =
@@ -5806,8 +6012,10 @@ fn handleAnthropicStreaming(
         try sendAnthropicEvent(stream, "message_stop", "{\"type\":\"message_stop\"}");
     }
 
-    log.info("  <- {d}+{d} tokens streamed [prefill: {d:.1} tok/s] [{s}]\n", .{
-        total_prompt, ts.completion_tokens, prefill_tps, stop_reason,
+    var perf_buf: [160]u8 = undefined;
+    const perf = formatPerfBracket(&perf_buf, ts.prompt_tokens, ts.cached_tokens, ts.completion_tokens, ts.prefill_ns, ts.decode_ns);
+    log.info("  <- {d}+{d} tokens streamed [{s}] [{s}]\n", .{
+        total_prompt, ts.completion_tokens, perf, stop_reason,
     });
 }
 
@@ -6027,7 +6235,8 @@ fn handleResponses(
     body: []const u8,
     lm: *LoadedModel,
 ) !void {
-    const xfm = lm.transformer.?;
+    // No `lm.transformer.?` — engine-backed (GGUF/ds4) models have a null
+    // transformer; the only gates below use `config.has_hybrid_layers`.
     const tok = lm.tokenizer.?;
     const chat_config = lm.chat_config.?;
     const config = lm.config.?;
@@ -6248,10 +6457,12 @@ fn handleResponses(
     });
 
     // ── format chat template ──
-    var prompt_ids_raw = if (lm.ds4_engine) |engine|
-        try chat_mod.encodeChatViaDs4(allocator, engine, pi.messages.items, active_tools_json, active_tool_choice_instruction, enable_thinking)
-    else
-        try chat_mod.formatChat(allocator, tok, pi.messages.items, chat_config, active_tools_json, active_tool_choice_instruction, enable_thinking);
+    // Iteration 1 timing + Iteration 2 cache. Responses sees the same
+    // cache as chat-completions / messages because they all hash the
+    // same canonical (messages, tools, flags) tuple.
+    var tokenize_sw = Stopwatch.init(stream.io);
+    var prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, chat_config, pi.messages.items, active_tools_json, active_tool_choice_instruction, enable_thinking);
+    const tokenize_ns = tokenize_sw.read();
 
     // ── vision encoder ──
     // Phase A8: per-request ownership. Defer frees if we don't end up
@@ -6373,12 +6584,15 @@ fn handleResponses(
         }
 
         // Skeleton envelope (status:in_progress, output:[])
+        // Timings are all zero on the skeleton — the real numbers appear on
+        // the final `response.completed` envelope after generation.
         const skel = try buildResponsesEnvelope(
             stream.io, allocator, esc_resp_id, esc_model,
             "in_progress", "[]",
             0, 0, 0, 0,
             should_store, prev_id,
             false, false, response_echo,
+            0, 0, tokenize_ns, 0,
         );
         defer allocator.free(skel);
         const created_payload = try std.fmt.allocPrint(allocator, "{{\"type\":\"response.created\",\"response\":{s}}}", .{skel});
@@ -6416,7 +6630,7 @@ fn handleResponses(
     else
         server_config.default_enable_pld;
     if (enable_pld_resp and active_has_tools) enable_pld_resp = false;
-    if (enable_pld_resp and xfm.config.has_hybrid_layers) enable_pld_resp = false;
+    if (enable_pld_resp and config.has_hybrid_layers) enable_pld_resp = false;
 
     // Drafter (Responses-side parsing). Same disable rules as the chat
     // and Anthropic parse sites.
@@ -6428,7 +6642,7 @@ fn handleResponses(
         lm_default_enable_drafter_resp;
     if (enable_drafter_resp and lm.drafter == null) enable_drafter_resp = false;
     if (enable_drafter_resp and active_has_tools) enable_drafter_resp = false;
-    if (enable_drafter_resp and xfm.config.has_hybrid_layers) enable_drafter_resp = false;
+    if (enable_drafter_resp and config.has_hybrid_layers) enable_drafter_resp = false;
 
     // Adaptive spec-decode gate (Responses path; mirrors chat-completions and
     // Anthropic). Score the full prompt's 3-gram repetition; novel content
@@ -6827,13 +7041,17 @@ fn handleResponses(
         out_buf.items,
         result.prompt_tokens,
         result.completion_tokens,
-        0, // cached_tokens — surfaced via slot.cached_tokens at the scheduler layer; not threaded back here
+        result.cached_tokens,
         0, // reasoning_tokens — not tracked separately yet
         should_store,
         prev_id,
         is_incomplete,
         is_completed_status,
         response_echo,
+        result.prefill_ns,
+        result.decode_ns,
+        tokenize_ns,
+        result.completion_tokens,
     );
     defer allocator.free(envelope);
 
@@ -7419,6 +7637,14 @@ fn buildResponsesEnvelope(
     incomplete: bool,
     completed: bool,
     echo: ResponseEcho,
+    /// Iteration 1: timings extension. The Responses spec doesn't model
+    /// per-stage timings, so we attach a sibling `timings` block at the
+    /// envelope root with the same shape as /v1/chat/completions. Pass
+    /// zeroes to omit the field (legacy callers stay shape-compatible).
+    prefill_ns: u64,
+    decode_ns: u64,
+    tokenize_ns: u64,
+    completion_tokens_for_timings: u32,
 ) ![]const u8 {
     var buf = std.ArrayList(u8).empty;
     errdefer buf.deinit(allocator);
@@ -7559,6 +7785,16 @@ fn buildResponsesEnvelope(
         try buf.appendSlice(allocator, esc);
     } else {
         try buf.appendSlice(allocator, ",\"prompt_cache_key\":null");
+    }
+
+    // Iteration 1 timings extension. Reuses the chat-completions
+    // formatter so any future field added there appears on Responses too
+    // without a second touch point.
+    const timings_obj = try formatTimingsObject(allocator, input_tokens, cached_input_tokens, completion_tokens_for_timings, prefill_ns, decode_ns, tokenize_ns);
+    defer allocator.free(timings_obj);
+    if (timings_obj.len > 0) {
+        try buf.appendSlice(allocator, ",\"timings\":");
+        try buf.appendSlice(allocator, timings_obj);
     }
 
     try buf.append(allocator, '}');
@@ -8307,5 +8543,59 @@ test "insertImageTokens is a no-op when image_token_id or n_tokens is zero" {
     const out_zero_n = try insertImageTokens(testing.allocator, &prompt, 999, 0, &config);
     defer testing.allocator.free(out_zero_n);
     try testing.expectEqualSlices(u32, &prompt, out_zero_n);
+}
+
+// --- /props payload regression ------------------------------------------------
+//
+// The `chat_template` field used to be emitted by /props for llama.cpp
+// server-compat clients. Our own Swift app never read it, and stock chat
+// templates are 10–100 KB of Jinja — that's wasted bandwidth on every poll.
+// `renderPropsBody` is the pure body-builder behind `handleProps`; these
+// tests pin the schema so a future "let's add it back" can't slip through
+// without flipping these assertions intentionally.
+
+test "renderPropsBody omits chat_template" {
+    var config = model_mod.ModelConfig{};
+    config.vocab_size = 32000;
+    config.hidden_size = 4096;
+    config.num_hidden_layers = 32;
+    config.num_attention_heads = 32;
+    config.num_key_value_heads = 8;
+    config.head_dim = 128;
+    config.quant_bits = 4;
+    config.quant_group_size = 64;
+    config.max_position_embeddings = 8192;
+    config.model_type = "gemma4";
+
+    const body = try renderPropsBody(testing.allocator, &config, "4096", 1234, 5678, 16384);
+    defer testing.allocator.free(body);
+
+    try testing.expect(std.mem.indexOf(u8, body, "\"chat_template\"") == null);
+}
+
+test "renderPropsBody keeps fields the Swift app + integration tests rely on" {
+    var config = model_mod.ModelConfig{};
+    config.model_type = "gemma4";
+    config.vocab_size = 32000;
+    config.hidden_size = 4096;
+    config.num_hidden_layers = 32;
+    config.num_attention_heads = 32;
+    config.num_key_value_heads = 8;
+    config.head_dim = 128;
+    config.quant_bits = 4;
+    config.quant_group_size = 64;
+    config.max_position_embeddings = 8192;
+
+    const body = try renderPropsBody(testing.allocator, &config, "4096", 1234, 5678, 16384);
+    defer testing.allocator.free(body);
+
+    // Hit every field a known consumer reads.
+    try testing.expect(std.mem.indexOf(u8, body, "\"n_ctx\":4096") != null);          // integration_test.sh
+    try testing.expect(std.mem.indexOf(u8, body, "\"total_slots\":1") != null);       // integration_test.sh
+    try testing.expect(std.mem.indexOf(u8, body, "\"model_info\"") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"memory\"") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"active_bytes\":1234") != null);   // Swift fetchProps
+    try testing.expect(std.mem.indexOf(u8, body, "\"peak_bytes\":5678") != null);     // Swift fetchProps
+    try testing.expect(std.mem.indexOf(u8, body, "\"max_safe_context\":16384") != null); // Swift fetchProps
 }
 

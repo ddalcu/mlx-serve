@@ -4,6 +4,9 @@ zig-out/
 /models/
 *.safetensors
 
+# llama.cpp libllama, staged at build time by scripts/fetch-llama.sh (not vendored)
+/lib/llama/
+
 # Swift / app build
 app/.build/
 app/.swiftpm/

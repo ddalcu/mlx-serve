@@ -41,8 +41,10 @@ const model_mod = @import("model.zig");
 const vision_mod = @import("vision.zig");
 const chat_mod = @import("chat.zig");
 const prefix_cache_mod = @import("prefix_cache.zig");
+const tokenize_cache_mod = @import("tokenize_cache.zig");
 const model_registry_mod = @import("model_registry.zig");
 const arch_ds4 = @import("arch/ds4.zig");
+const arch_llama = @import("arch/llama.zig");
 const log = @import("log.zig");
 const io_util = @import("io_util.zig");
 
@@ -118,6 +120,35 @@ pub const LoadParams = struct {
     prefix_cache_capacity: u32 = 1,
     /// Per-model hot prefix cache KV-bytes budget. 0 disables the byte cap.
     prefix_cache_mem_bytes: u64 = 0,
+    /// Phase 1 (perf-plan): SSM/conv state snapshot stride during prefill.
+    /// 0 = disabled (hybrid models bypass the hot prefix cache). Non-zero
+    /// enables hybrid in `HotPrefixCache.shouldUse` and triggers per-stride
+    /// snapshots in the Generator's prefill loop. Default 0 here so callers
+    /// that don't set it (legacy paths) preserve pre-Phase-1 behavior;
+    /// `main.zig` overrides via `--ssm-checkpoint-stride` for the serve path.
+    ssm_checkpoint_stride: u32 = 0,
+    /// Phase 1: cap on snapshots retained per request.
+    ssm_checkpoint_max: u32 = 32,
+    /// Iteration 2 (perf-plan Phase 4 #3): per-LoadedModel LRU cache
+    /// of chat-template render+tokenize results. 0 disables the cache
+    /// (useful for ablation benches / debugging). Default 4 matches
+    /// `prefix_cache_capacity` — most warm-reuse benches exercise a
+    /// handful of repeated prompts, and full chat conversations bump
+    /// this counter anyway via LRU as new turns arrive.
+    tokenize_cache_entries: u32 = 4,
+    /// Iteration 3-5 (perf-plan Phase 5 #1): maximum resident llama.cpp
+    /// sessions per model. 1 = legacy single-session behavior (every
+    /// llama prefill fights one KV slot). > 1 keeps the N
+    /// most-recently-used prompts hot in independent contexts so
+    /// alternating multi-doc agent loads don't cold-prefill every flip.
+    llama_cache_entries: u32 = 1,
+    /// Phase 5 #2: ggml types for the embedded llama.cpp KV cache.
+    /// 0 = libllama default (F16); other values match `ggml_type` enum
+    /// (Q8_0=8, Q4_0=2). Wired through `Scheduler.doLoadOnInferenceThread`
+    /// to the LoadedModel; consumed at first request when the session is
+    /// created in `runPrefillLlama`.
+    llama_kv_type_k: i32 = 0,
+    llama_kv_type_v: i32 = 0,
     /// When non-empty, the load routes through the embedded ds4 engine
     /// instead of the MLX safetensors path. `model_dir` is expected to point
     /// at a `.gguf` file (or a directory containing one); the inference
@@ -127,6 +158,11 @@ pub const LoadParams = struct {
     /// still moved onto the entry so server-side reads of `lm.config.?`
     /// (e.g. `eosTokenSlice`, `getEffectiveContextLength`) keep working.
     ds4_path: []const u8 = "",
+    /// Like `ds4_path` but for the generic llama.cpp engine (any GGUF except
+    /// DeepSeek-V4-Flash). The inference thread opens a `LlamaEngine` and
+    /// installs it on the entry's `llama_engine` field. Mutually exclusive with
+    /// `ds4_path` and the MLX safetensors path.
+    llama_path: []const u8 = "",
 };
 
 /// Submit-time parameters. `prompt_ids` and `eos_token_ids` are duped into the
@@ -225,6 +261,18 @@ pub const Slot = struct {
     /// by pointer so we keep it on the slot.
     ds4_rng: u64 = 0,
 
+    /// llama.cpp session for this slot. BORROWED from the slot's
+    /// `model.llama_session` (a persistent per-model context reused across
+    /// requests for prompt-prefix KV reuse) — NOT owned, so `Slot.deinit` must
+    /// not free it. Mutually exclusive with `legacy_gen` and `ds4_session`.
+    llama_session: ?*arch_llama.LlamaSession = null,
+    /// True when this slot claimed `model.llama_session_busy` in `submit`. The
+    /// single persistent context serves one request at a time; the claim is
+    /// released in `complete()`. Tracked per-slot so only the holder releases.
+    llama_holds_session: bool = false,
+    /// Per-request RNG state for llama.cpp sampling (passed by pointer, like ds4).
+    llama_rng: u64 = 0,
+
     // ── Submission data. Owned by the slot, freed in deinit. ──
     prompt_ids: []u32,
     full_prompt: []u32,
@@ -294,18 +342,18 @@ pub const Slot = struct {
         const slot = try allocator.create(Slot);
         errdefer allocator.destroy(slot);
 
-        // ds4-backed model: skip all MLX per-slot allocations — the ds4
-        // engine owns its own KV cache, vision is not supported, and the
-        // forward path bypasses `ForwardCtx`. Build sentinel-empty fields so
-        // `Slot.deinit` is well-defined on both paths.
-        const is_ds4 = params.model.ds4_engine != null;
+        // Embedded-GGUF model (ds4 or llama.cpp): skip all MLX per-slot
+        // allocations — the engine owns its own KV cache, vision is not
+        // supported, and the forward path bypasses `ForwardCtx`. Build
+        // sentinel-empty fields so `Slot.deinit` is well-defined on both paths.
+        const is_embedded = params.model.ds4_engine != null or params.model.llama_engine != null;
 
         // Per-slot KVCache, honoring the process-level kv-quant setting.
         // TurboQuant schemes need `head_dim` at construction time for the
-        // per-layer rotation matrices; other schemes ignore it. For ds4
+        // per-layer rotation matrices; other schemes ignore it. For embedded
         // slots the engine owns its own cache — we initialize a zero-layer
         // shell so `Slot.deinit` is symmetric with the MLX path.
-        const slot_kv_layers: u32 = if (is_ds4) 0 else config.num_hidden_layers;
+        const slot_kv_layers: u32 = if (is_embedded) 0 else config.num_hidden_layers;
         var cache = try KVCache.initWithConfigAndHeadDim(allocator, slot_kv_layers, kv_quant_config, config.head_dim);
         errdefer cache.deinit();
 
@@ -317,7 +365,7 @@ pub const Slot = struct {
         // MoE (which carries GatedDeltaNet inside its MoE structure but does
         // NOT set `has_hybrid_layers`).
         var ssm_entries: ?[]SSMCacheEntry = null;
-        if (!is_ds4 and (config.has_hybrid_layers or config.isMoe() or config.full_attention_interval > 0)) {
+        if (!is_embedded and (config.has_hybrid_layers or config.isMoe() or config.full_attention_interval > 0)) {
             const entries = try allocator.alloc(SSMCacheEntry, config.num_hidden_layers);
             for (entries) |*e| {
                 e.* = .{
@@ -357,6 +405,8 @@ pub const Slot = struct {
             .legacy_gen = null,
             .ds4_session = null,
             .ds4_rng = @intCast(std.Io.Timestamp.now(io, .real).toMilliseconds()),
+            .llama_session = null,
+            .llama_rng = @intCast(std.Io.Timestamp.now(io, .real).toMilliseconds()),
             .prompt_ids = prompt_owned,
             .full_prompt = full_prompt_owned,
             .sampling = params.sampling,
@@ -417,6 +467,10 @@ pub const Slot = struct {
             session.free();
             self.ds4_session = null;
         }
+        // llama_session is borrowed from model.llama_session (persistent across
+        // requests) — do NOT free it here. The claim on it is released in
+        // Scheduler.complete; the session itself is freed with the model.
+        self.llama_session = null;
         if (self.legacy_gen) |*gen| {
             gen.deinit(self.allocator);
         }
@@ -602,6 +656,29 @@ pub const LoadRequest = struct {
     kv_quant_config: transformer_mod.KVQuantConfig = transformer_mod.KVQuantConfig.dense,
     prefix_cache_capacity: u32 = 1,
     prefix_cache_mem_bytes: u64 = 0,
+    /// Phase 1 (perf-plan): SSM/conv state snapshot stride during prefill.
+    /// Zero disables (hybrid models bypass the hot prefix cache, as before).
+    /// Non-zero enables multi-turn warm reuse on hybrid SSM archs. Plumbed
+    /// to `HotPrefixCache.shouldUse(enable_ssm_checkpoints = stride > 0)`
+    /// and to every `Generator.initWithOptions` call so the prefill loop
+    /// captures snapshots.
+    ssm_checkpoint_stride: u32 = 0,
+    /// Phase 1: maximum checkpoints retained per request. Older ones are
+    /// dropped front-first when the buffer would grow past this. 0 = no cap
+    /// beyond the prefix-cache byte budget.
+    ssm_checkpoint_max: u32 = 32,
+    /// Iteration 2: tokenize cache LRU capacity. Mirrored on
+    /// `LoadParams.tokenize_cache_entries`; both paths feed
+    /// `doLoadOnInferenceThread`.
+    tokenize_cache_entries: u32 = 4,
+    /// Iteration 3-5: llama.cpp multi-session cap. Mirrors
+    /// `LoadParams.llama_cache_entries`.
+    llama_cache_entries: u32 = 1,
+    /// Phase 5 #2: ggml types for the embedded llama.cpp KV cache. 0 keeps
+    /// libllama default (F16); Q8_0=8, Q4_0=2. Threaded onto the LoadedModel
+    /// at load time.
+    llama_kv_type_k: i32 = 0,
+    llama_kv_type_v: i32 = 0,
 
     /// Optional victim to evict before the load. Already marked `.evicting`
     /// with refcount == 0 by the conn thread under registry.mutex. The
@@ -712,6 +789,10 @@ pub const Scheduler = struct {
     /// (matches the legacy `max_queue_size`).
     queue_cap: u32,
     submit_cond: std.Io.Condition,
+    /// Signaled when a persistent engine session (llama) is released in
+    /// `complete()`, waking a `submit()` blocked waiting to claim it. Guarded by
+    /// `queue_mu` together with `LoadedModel.llama_session_busy`.
+    session_cond: std.Io.Condition,
 
     inference_thread: ?std.Thread,
     shutdown: std.atomic.Value(bool),
@@ -786,6 +867,7 @@ pub const Scheduler = struct {
             .in_flight = 0,
             .queue_cap = cap + 32,
             .submit_cond = .init,
+            .session_cond = .init,
             .inference_thread = null,
             .shutdown = std.atomic.Value(bool).init(false),
             .started = std.atomic.Value(bool).init(false),
@@ -926,7 +1008,31 @@ pub const Scheduler = struct {
         }
         if (self.shutdown.load(.acquire)) return error.Shutdown;
 
-        try self.pending.append(self.allocator, slot);
+        // Persistent-session engines (llama) reuse one KV context across
+        // requests, so only one request may drive it at a time. Block here until
+        // the model's session is free, then claim it (released in `complete`).
+        // ds4 keeps a per-slot session, so it isn't gated. This serializes
+        // concurrent llama requests (v1 scope) without spinning the inference
+        // thread, and lets the next request reuse the previous one's prompt KV.
+        if (params.model.llama_engine != null) {
+            while (params.model.llama_session_busy and !self.shutdown.load(.acquire)) {
+                self.session_cond.waitUncancelable(self.io, &self.queue_mu);
+            }
+            if (self.shutdown.load(.acquire)) return error.Shutdown;
+            params.model.llama_session_busy = true;
+            slot.llama_holds_session = true;
+        }
+
+        self.pending.append(self.allocator, slot) catch |err| {
+            // Release the session claim before bubbling the error — the caller
+            // never gets the slot, so `complete` won't run for it.
+            if (slot.llama_holds_session) {
+                params.model.llama_session_busy = false;
+                slot.llama_holds_session = false;
+                self.session_cond.broadcast(self.io);
+            }
+            return err;
+        };
         self.in_flight += 1;
         self.queue_cond.broadcast(self.io);
         return slot;
@@ -967,6 +1073,16 @@ pub const Scheduler = struct {
                 _ = self.decoding.orderedRemove(i);
                 break;
             }
+        }
+
+        // Release the persistent llama session claim (if this slot held it) so
+        // the next queued llama request can claim it AND reuse the KV prefix the
+        // session now holds. Done before enqueueing cleanup so a waiting
+        // submitter can proceed immediately.
+        if (slot.llama_holds_session) {
+            slot.model.llama_session_busy = false;
+            slot.llama_holds_session = false;
+            self.session_cond.broadcast(self.io);
         }
 
         self.cleanup_queue.append(self.allocator, slot) catch {
@@ -1219,9 +1335,10 @@ pub const Scheduler = struct {
         if (slot.enable_pld or slot.enable_drafter) return false;
         if (slot.sampling.constraint != null) return false;
         if (slot.logprobs_n > 0) return false;
-        // ds4-backed slots have no `ForwardCtx` — they always fall through
-        // to the per-slot decode path (which dispatches into the engine).
-        if (slot.model.ds4_engine != null) return false;
+        // Embedded-GGUF slots (ds4 / llama.cpp) have no `ForwardCtx` — they
+        // always fall through to the per-slot decode path (which dispatches
+        // into the engine).
+        if (slot.model.ds4_engine != null or slot.model.llama_engine != null) return false;
         const cfg = slot.model.config orelse return false;
         return modelBatchable(cfg);
     }
@@ -1375,6 +1492,14 @@ fn doLoadDs4OnInferenceThread(sch: *Scheduler, params: anytype) !void {
     entry.drafter_block_size = 0;
     entry.drafter_path = "";
     entry.prefix_cache = null;
+    // Iteration 2: tokenize cache also applies on the ds4 path. The
+    // MLX-branch assignment isn't reached here because we early-return.
+    if (params.tokenize_cache_entries > 0) {
+        entry.tokenize_cache = tokenize_cache_mod.TokenizeCache.init(
+            sch.allocator,
+            params.tokenize_cache_entries,
+        );
+    }
 
     // Bytes-resident is whatever main.zig handed us (typically the GGUF
     // on-disk size). ds4's `ds4_context_memory_estimate` could give a
@@ -1389,6 +1514,80 @@ fn doLoadDs4OnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // Scheduler's borrowed views: leave the MLX fields null. `runPrefill`
     // / `runSingleDecodeTick` branch on `slot.ds4_session` and never touch
     // `sch.xfm` for ds4 slots.
+    sch.current_model = entry;
+    sch.xfm = null;
+    sch.weights = null;
+    sch.vision_encoder = null;
+    sch.drafter = null;
+    sch.hot_prefix_cache = null;
+}
+
+/// llama.cpp load on the inference thread. Mirrors `doLoadDs4OnInferenceThread`:
+/// open the embedded engine (its Metal kernels bind to this thread's GPU stream
+/// from t0), install it on the entry, move the stub config/tok/chat_config over,
+/// and mark ready. The stub config carries the effective context length so the
+/// server's memory estimate and `runPrefillLlama` size the session correctly.
+fn doLoadLlamaOnInferenceThread(sch: *Scheduler, params: anytype) !void {
+    log.info("[llama] opening engine: {s}\n", .{params.llama_path});
+    const engine = try arch_llama.LlamaEngine.open(sch.allocator, params.llama_path, .{});
+    errdefer engine.close();
+    log.info("[llama] engine ready (EOS={d}, n_vocab={d})\n", .{ engine.eosToken(), engine.nVocab() });
+
+    // Make sure the stub config's EOS set includes the engine's EOS so the
+    // streaming/non-streaming stop checks fire.
+    const eos_id: u32 = @intCast(engine.eosToken());
+    params.config.addEosToken(eos_id);
+
+    // Adopt the GGUF's embedded chat template into the stub ChatConfig so
+    // `chat.encodeChatViaLlama` can render it through mlx-serve's Jinja engine
+    // (which also supplies the tool-synthesis fallback). The stub starts with an
+    // empty allocator-owned template; swap it for the model's, freed by deinit.
+    if (engine.chatTemplate()) |tmpl| {
+        if (params.chat_config.allocator.dupe(u8, tmpl)) |dup| {
+            params.chat_config.allocator.free(params.chat_config.chat_template);
+            params.chat_config.chat_template = dup;
+        } else |_| {}
+    }
+
+    const entry = params.entry;
+    entry.llama_engine = engine;
+    entry.config = params.config;
+    entry.tokenizer = params.tok;
+    entry.chat_config = params.chat_config;
+    entry.weights = null;
+    entry.transformer = null;
+    entry.vision_encoder = null;
+    entry.drafter = null;
+    entry.drafter_block_size = 0;
+    entry.drafter_path = "";
+    entry.prefix_cache = null;
+    // Iteration 2: tokenize cache also applies on the llama path — same
+    // chat-template render + tokenize round-trip per request. Wire it
+    // here too so `--tokenize-cache-entries N` works for GGUFs.
+    if (params.tokenize_cache_entries > 0) {
+        entry.tokenize_cache = tokenize_cache_mod.TokenizeCache.init(
+            sch.allocator,
+            params.tokenize_cache_entries,
+        );
+    }
+    // Iteration 3-5: cap for the llama.cpp multi-session LRU. The MLX
+    // load path sets this further down; for llama we exit early at the
+    // top of doLoadOnInferenceThread, so it has to land here.
+    entry.llama_cache_max_entries = if (params.llama_cache_entries > 0)
+        params.llama_cache_entries
+    else
+        1;
+    // Phase 5 #2: ggml KV-quant types — same reason as above; the
+    // MLX path's assignment is never reached on the llama branch.
+    entry.llama_kv_type_k = params.llama_kv_type_k;
+    entry.llama_kv_type_v = params.llama_kv_type_v;
+
+    const bytes_resident: u64 = if (entry.bytes_on_disk) |b| b else 0;
+
+    sch.registry.mutex.lockUncancelable(sch.io);
+    sch.registry.markReadyLocked(entry, bytes_resident);
+    sch.registry.mutex.unlock(sch.io);
+
     sch.current_model = entry;
     sch.xfm = null;
     sch.weights = null;
@@ -1430,6 +1629,13 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     const Inner = if (TyInfo == .pointer) TyInfo.pointer.child else Ty;
     if (@hasField(Inner, "ds4_path") and params.ds4_path.len > 0) {
         try doLoadDs4OnInferenceThread(sch, params);
+        return;
+    }
+    // ── llama.cpp fast path: same shape as ds4, for any other GGUF. Cold-load
+    //    (LoadRequest) is MLX-only for now, so this only fires on startup
+    //    LoadParams that carry a non-empty `llama_path`.
+    if (@hasField(Inner, "llama_path") and params.llama_path.len > 0) {
+        try doLoadLlamaOnInferenceThread(sch, params);
         return;
     }
 
@@ -1494,6 +1700,25 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     }
     if (xfm_ptr.moe_layers != null) {
         xfm_ptr.compileMoeRouting();
+    }
+
+    // Phase 2 experiment: opt-in full-forward Metal fusion via
+    // MLX_SERVE_COMPILE_FORWARD=1. This wraps the entire forward pass in
+    // mlx_compile so the chunked-prefill loop dispatches a fused graph
+    // instead of ~hundreds of separate ops per chunk. Gated because
+    // (a) the compiled closure captures `xfm.cache` / `xfm.ssm_entries`
+    // as state, and any path that swaps those (multi-slot scheduler,
+    // future re-entrant callers) must verify they're not racing the
+    // compiled call; (b) mlx_compile with shapeless=false recompiles
+    // per unique input shape, which thrashes if the prefill loop sees
+    // many different chunk sizes. Tied to byte-equivalence pin in
+    // tests/test_phase2_forward_equivalence.sh.
+    if (std.c.getenv("MLX_SERVE_COMPILE_FORWARD") != null) {
+        const raw = std.c.getenv("MLX_SERVE_COMPILE_FORWARD").?;
+        const slice = std.mem.sliceTo(raw, 0);
+        if (std.mem.eql(u8, slice, "1")) {
+            xfm_ptr.compileForward();
+        }
     }
 
     // Vision encoder if requested. `MissingVisionWeights` is a benign opt-out
@@ -1610,15 +1835,48 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     entry.config = params.config;
     entry.tokenizer = params.tok;
     entry.chat_config = params.chat_config;
-    // Per-model hot prefix cache (Plan 03 → Plan 05 move). Skip on hybrid
-    // recurrent archs — they reset on any divergence anyway.
-    if (params.prefix_cache_capacity > 0 and prefix_cache_mod.HotPrefixCache.shouldUse(params.config)) {
+    // Per-model hot prefix cache (Plan 03 → Plan 05 move). Hybrid recurrent
+    // archs are accepted iff `ssm_checkpoint_stride > 0` (Phase 1 of the
+    // performance plan): with per-stride SSM checkpoints we can rewind both
+    // KV and SSM to a snapshotted prefix; without them, divergence forces a
+    // full reset, so we keep the legacy single-slot path for hybrid.
+    const enable_ssm_cps = params.ssm_checkpoint_stride > 0;
+    if (params.prefix_cache_capacity > 0 and
+        prefix_cache_mod.HotPrefixCache.shouldUse(params.config, enable_ssm_cps))
+    {
         entry.prefix_cache = prefix_cache_mod.HotPrefixCache.initWithMem(
             sch.allocator,
             params.prefix_cache_capacity,
             params.prefix_cache_mem_bytes,
         );
+        entry.ssm_checkpoint_stride = params.ssm_checkpoint_stride;
+        entry.ssm_checkpoint_max = params.ssm_checkpoint_max;
     }
+    // Iteration 2 (perf-plan Phase 4 #3): tokenize cache for warm-path
+    // chat-template renders. Applies to MLX, ds4, and llama engines —
+    // they all funnel through `chat_mod.formatChat` /
+    // `encodeChatViaDs4` / `encodeChatViaLlama` at the handler boundary.
+    // Default capacity is small (4 entries) because chat conversations
+    // mutate the messages list every turn; the goal is to catch warm
+    // reuse benches and repeated agent-loop probes, not to memoize a
+    // full session.
+    if (params.tokenize_cache_entries > 0) {
+        entry.tokenize_cache = tokenize_cache_mod.TokenizeCache.init(
+            sch.allocator,
+            params.tokenize_cache_entries,
+        );
+    }
+    // Iteration 3-5: cap for the llama.cpp multi-session LRU. Always
+    // clamp to ≥1 so `runPrefillLlama` can grow the cache even if a
+    // bug or a 0-default leaks through.
+    entry.llama_cache_max_entries = if (params.llama_cache_entries > 0)
+        params.llama_cache_entries
+    else
+        1;
+    // Phase 5 #2: thread KV-quant types onto the LoadedModel so
+    // runPrefillLlama uses them when creating the persistent session.
+    entry.llama_kv_type_k = params.llama_kv_type_k;
+    entry.llama_kv_type_v = params.llama_kv_type_v;
 
     // Best-effort bytes_resident estimate: prefer the disk size hint when
     // available (it's close to actual GPU resident bytes after Metal page-
@@ -1990,8 +2248,27 @@ fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
     @memcpy(total_tokens[0..slot.full_prompt.len], slot.full_prompt);
     @memcpy(total_tokens[slot.full_prompt.len..], gen_ptr.generated_ids.items);
 
-    hc.commit(&slot.cache, total_tokens, slot.has_tools) catch |err| {
+    // Phase 1: drain any SSM checkpoints captured by the Generator's prefill
+    // loop and hand them to the cache alongside the KV snapshot. For plain-
+    // attn models this returns an empty slice (no allocator hit). Ownership
+    // transfers to the cache via `commitWithSsm`; freeing happens on
+    // eviction.
+    const ssm_cps_slice = gen_ptr.takeSsmCheckpoints();
+    const ssm_cps_opt: ?[]transformer_mod.SSMCheckpoint = if (ssm_cps_slice.len > 0) ssm_cps_slice else null;
+    if (ssm_cps_slice.len == 0 and gen_ptr.ssm_checkpoint_alloc != null) {
+        // Empty list — free the (zero-length) slice we got back so the
+        // allocator's bookkeeping stays clean.
+        gen_ptr.ssm_checkpoint_alloc.?.free(ssm_cps_slice);
+    }
+    hc.commitWithSsm(&slot.cache, total_tokens, slot.has_tools, ssm_cps_opt) catch |err| {
         log.warn("[hot-cache] commit failed: {s}\n", .{@errorName(err)});
+        // Commit failed — we still own the checkpoints. Free them so they
+        // don't leak.
+        if (ssm_cps_opt) |cps| {
+            const a = gen_ptr.ssm_checkpoint_alloc orelse sch.allocator;
+            for (cps) |*cp| cp.deinit(a);
+            a.free(cps);
+        }
     };
 }
 
@@ -2031,6 +2308,112 @@ fn runPrefillDs4(sch: *Scheduler, slot: *Slot, engine: *arch_ds4.Ds4Engine) !voi
     slot.ds4_session = sess;
     slot.prompt_tokens = @intCast(slot.full_prompt.len);
     slot.cached_tokens = 0;
+    slot.state = .decoding;
+}
+
+/// llama.cpp prefill: drive a persistent per-model session, reusing the KV from
+/// the previous request's shared prompt prefix (LM-Studio-style prompt caching).
+/// `submit` guarantees a single slot owns the session at a time, so the resident
+/// KV is exactly the prior request's prompt+generation. `sync` diffs the new
+/// prompt against it, trims the divergent tail, and decodes only the suffix.
+/// `cached_tokens` reports the reused prefix length; `prompt_tokens` stays the
+/// full prompt so prefill tok/s reflects only the uncached suffix.
+fn runPrefillLlama(sch: *Scheduler, slot: *Slot, engine: *arch_llama.LlamaEngine) !void {
+    const i32_prompt = try slot.allocator.alloc(i32, slot.full_prompt.len);
+    defer slot.allocator.free(i32_prompt);
+    for (slot.full_prompt, 0..) |t, i| i32_prompt[i] = @intCast(t);
+
+    // Size to the stub config's context length (main.zig sets it from the user's
+    // --ctx-size or the GGUF's trained context). 0 → libllama uses the model
+    // default (its trained context).
+    const ctx_size: i32 = if (slot.model.config) |c| @intCast(c.max_position_embeddings) else 0;
+
+    // Phase 5 #1 (Iteration 3-5): pick the best matching entry out of the
+    // LRU. The "best" = longest common prefix between the incoming prompt
+    // and the entry's resident KV mirror; ties (including the all-zero
+    // case) go to the least-recently-used entry so a brand-new prompt
+    // doesn't keep clobbering the same slot.
+    const max_entries = if (slot.model.llama_cache_max_entries > 0)
+        slot.model.llama_cache_max_entries
+    else
+        1;
+
+    // Chat templates produce a fixed leading prefix (system header, BOS,
+    // role markers) that's identical across requests — for Qwen3-style
+    // it's ~3-10 tokens. Treating that as a "hit" would let request B
+    // claim request A's slot just to save a handful of tokens, evicting
+    // A's content-bearing KV. Require a higher floor before we count a
+    // resident entry as a meaningful match. The value 16 sits above
+    // every chat template's pure prologue in this codebase (Gemma=12,
+    // Qwen=8, Llama=4) and below any real user-message overlap.
+    const min_prefix_to_claim: usize = 16;
+
+    var best_idx: ?usize = null;
+    var best_shared: usize = 0;
+    var lru_idx: ?usize = null;
+    var lru_used: i64 = std.math.maxInt(i64);
+    for (slot.model.llama_sessions.items, 0..) |entry, i| {
+        const shared = arch_llama.commonPrefixLen(entry.session.resident.items, i32_prompt);
+        // Strict >: ties leave the lower-indexed entry in `best_idx`, which
+        // is fine — we still need the prefix-match candidate. The
+        // separately tracked `lru_idx` handles the cold-miss path.
+        if (shared > best_shared) {
+            best_shared = shared;
+            best_idx = i;
+        }
+        if (entry.last_used_ns < lru_used) {
+            lru_used = entry.last_used_ns;
+            lru_idx = i;
+        }
+    }
+
+    // Promote the best match only when it crosses the chat-template floor;
+    // otherwise fall through to growth / LRU eviction.
+    if (best_shared < min_prefix_to_claim) best_idx = null;
+
+    var pick_idx: usize = undefined;
+    if (best_idx) |i| {
+        pick_idx = i;
+    } else if (slot.model.llama_sessions.items.len < max_entries) {
+        // Grow the cache — every prefill so far missed; allocate a new
+        // session and append it.
+        const type_k = slot.model.llama_kv_type_k;
+        const type_v = slot.model.llama_kv_type_v;
+        const created = if (type_k != 0 or type_v != 0)
+            try engine.createSessionWithKvQuant(ctx_size, type_k, type_v)
+        else
+            try engine.createSession(ctx_size);
+        errdefer created.free();
+        try slot.model.llama_sessions.append(slot.allocator, .{ .session = created, .last_used_ns = 0 });
+        pick_idx = slot.model.llama_sessions.items.len - 1;
+        log.info("[llama-cache] created session #{d} (cap={d})\n", .{ pick_idx, max_entries });
+    } else {
+        // Full + no prefix match — evict the LRU entry by resetting its KV
+        // in place. Keeps the libllama context alive (re-allocating per
+        // miss would be expensive) but drops the resident-token mirror so
+        // the next sync starts from zero.
+        pick_idx = lru_idx.?;
+        slot.model.llama_sessions.items[pick_idx].session.reset();
+        log.info("[llama-cache] evicted LRU session #{d}\n", .{pick_idx});
+    }
+
+    const entry_ptr = &slot.model.llama_sessions.items[pick_idx];
+    entry_ptr.last_used_ns = @intCast(std.Io.Timestamp.now(sch.io, .boot).nanoseconds);
+    const sess = entry_ptr.session;
+
+    // `syncWithFallback` does the prefix-trim + suffix decode and, on any
+    // libllama transient (the "failed to find a memory slot" class — see
+    // `LlamaSession.syncWithFallback`), resets the session and retries once
+    // cold. Either we serve the request with a clean response or we surface
+    // the error after leaving the session in a known-good state.
+    const cached = sess.syncWithFallback(i32_prompt) catch |err| {
+        sess.reset();
+        return err;
+    };
+
+    slot.llama_session = sess;
+    slot.prompt_tokens = @intCast(slot.full_prompt.len);
+    slot.cached_tokens = @intCast(cached);
     slot.state = .decoding;
 }
 
@@ -2078,6 +2461,47 @@ fn runDs4DecodeTick(sch: *Scheduler, slot: *Slot, session: *arch_ds4.Ds4Session)
     }
 }
 
+/// llama.cpp decode tick: argmax (temp < 0.01, matching the MLX greedy
+/// threshold) or sample, check EOS, push token, `eval(token)` to extend the
+/// session, and stop on max_tokens. One token per call.
+fn runLlamaDecodeTick(sch: *Scheduler, slot: *Slot, session: *arch_llama.LlamaSession) !void {
+    const engine = slot.model.llama_engine.?;
+    const next_id: i32 = if (slot.sampling.temperature < 0.01)
+        session.argmax()
+    else
+        session.sample(
+            slot.sampling.temperature,
+            @intCast(slot.sampling.top_k),
+            slot.sampling.top_p,
+            0.0, // min_p disabled — matches the MLX sampler (top_k + top_p only)
+            &slot.llama_rng,
+        );
+
+    if (next_id < 0) {
+        slot.markError("llama_sample_failed");
+        return;
+    }
+    const tok_u32: u32 = @intCast(next_id);
+
+    // EOS / end-of-generation — like the MLX path, do NOT emit the stop token.
+    if (engine.isEog(next_id) or generate_mod.isEosId(tok_u32, slot.eos_token_ids)) {
+        finishSlot(sch, slot, "stop");
+        return;
+    }
+
+    slot.pushToken(tok_u32);
+    if (tok_u32 != 0) slot.was_pad_only = false;
+    slot.completion_tokens += 1;
+
+    // Advance the KV by feeding the freshly-sampled token.
+    try session.eval(next_id);
+
+    if (slot.completion_tokens >= slot.max_tokens) {
+        finishSlot(sch, slot, "length");
+        return;
+    }
+}
+
 /// Allocate the slot's KVCache state (already done in Slot.init), construct
 /// the per-slot Generator via `Generator.initWithOptions(.{ .ctx = slot.ctx,
 /// .skip_lazy_preforward = true_for_regular, ... })`, and store it on the
@@ -2089,6 +2513,9 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     // its live cache internally), and mark the slot decoding.
     if (slot.model.ds4_engine) |engine| {
         return runPrefillDs4(sch, slot, engine);
+    }
+    if (slot.model.llama_engine) |engine| {
+        return runPrefillLlama(sch, slot, engine);
     }
     const sampling = slot.sampling;
     // Refresh ctx in case slot was relocated (paranoia — slot is heap so no,
@@ -2140,6 +2567,15 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
         }
     }
 
+    // Phase 1 (perf-plan): forward the SSM-checkpoint stride from the
+    // LoadedModel so the prefill loop snapshots SSM state at stride-aligned
+    // positions for hybrid archs. Plain-attn models have empty ssm_entries
+    // and ignore the stride entirely (no-op even at stride > 0). When the
+    // hot prefix cache is disabled or off, set stride to 0 to skip
+    // snapshot work that would just be discarded.
+    const cp_stride: u32 = if (slot.model.prefix_cache != null) slot.model.ssm_checkpoint_stride else 0;
+    const cp_max: u32 = slot.model.ssm_checkpoint_max;
+
     var gen = try Generator.initWithOptions(
         sch.io,
         slot.allocator,
@@ -2161,6 +2597,9 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             // transition shim sync-forwards [t1] on the first decode call.
             // PLD/drafter init paths already skip preforward unconditionally.
             .skip_lazy_preforward = !use_pld and !use_drafter,
+            .ssm_checkpoint_stride = cp_stride,
+            .ssm_checkpoint_max = cp_max,
+            .ssm_checkpoint_pos_offset = hot_matched,
         },
     );
     gen.timeout_ns = slot.timeout_ns;
@@ -2249,6 +2688,9 @@ fn runSingleDecodeTick(sch: *Scheduler, slot: *Slot) !void {
     // (see TODO: wire `evalSpeculative` when temp=0 and engine.hasMtp()).
     if (slot.ds4_session) |session| {
         return runDs4DecodeTick(sch, slot, session);
+    }
+    if (slot.llama_session) |session| {
+        return runLlamaDecodeTick(sch, slot, session);
     }
     const gen = if (slot.legacy_gen) |*g| g else {
         slot.markError("no_generator");

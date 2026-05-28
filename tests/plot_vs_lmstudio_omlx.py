@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """plot_vs_lmstudio_omlx.py — render the MLX-serve vs LM Studio vs oMLX
-comparison chart from a CSV produced by tests/bench_vs_lmstudio_omlx.sh.
+comparison chart from a CSV produced by tests/bench.sh.
 
 Three panels per chart:
   - "Echo (verbatim recitation)"       → echo prompt — PLD's home turf
@@ -26,11 +26,16 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 
-# Family-specific layout. Each entry:
-#   (variant_filter, label, color)
-# variant_filter is matched against the second '/' segment in the CSV `label`
-# column (e.g. "lmstudio-baseline", "lmstudio-alt", "omlx", "mlx-serve") AND
-# the spec (third segment: "none", "pld", "drafter").
+# Family-specific layout. Each variant tuple is:
+#   (variant_filter, spec, label, color, is_baseline, show_delta, short)
+# - variant_filter matches the second '/' segment in the CSV `label` column
+#   ("lmstudio-baseline", "lmstudio-alt", "omlx", "mlx-serve-gguf", "mlx-serve")
+# - spec matches the third segment ("none", "pld", "drafter")
+# - is_baseline: this row is the reference for percentage deltas (one per family)
+# - show_delta: render a "+X%" label above the bar. False for comparison engines
+#   to halve label density; the bar height already shows the comparison visually.
+# - short: 3-9 char label rendered inside each bar under the tok/s value, so
+#   bars self-identify without the reader chasing the top-of-figure legend.
 FAMILIES = {
     "gemma": {
         "title": "MLX-serve vs LM Studio vs oMLX — Gemma 4 (Apple Silicon, decode tok/s)",
@@ -46,13 +51,17 @@ FAMILIES = {
             "gemma4-31b-4bit",
             "gemma4-26b-a4b-moe-4bit",
         ],
+        # Visual order: comparison engines (muted grays/cool) → mlx-serve
+        # variants (vivid). Percentage deltas only on the mlx-serve rows so
+        # the labels above tiny bars don't pile up.
         "variants": [
-            ("lmstudio-baseline", "none",    "LM Studio (MLX, baseline)", "#888888", True),
-            ("lmstudio-alt",      "none",    "LM Studio (GGUF)",          "#cccccc", False),
-            ("omlx",              "none",    "oMLX",                      "#2ca02c", False),
-            ("mlx-serve",         "none",    "MLX-serve --no-pld",        "#3b82f6", False),
-            ("mlx-serve",         "pld",     "MLX-serve --pld",           "#22c55e", False),
-            ("mlx-serve",         "drafter", "MLX-serve --drafter",       "#f97316", False),
+            ("lmstudio-baseline", "none",    "LM Studio (MLX, baseline)",   "#9ca3af", True,  False, "LM-MLX"),
+            ("lmstudio-alt",      "none",    "LM Studio (GGUF)",            "#d1d5db", False, False, "LM-GG"),
+            ("mlx-serve-gguf",    "none",    "MLX-serve (GGUF / llama.cpp)", "#a78bfa", False, False, "MLXS-GG"),
+            ("omlx",              "none",    "oMLX",                        "#10b981", False, False, "oMLX"),
+            ("mlx-serve",         "none",    "MLX-serve (MLX, --no-pld)",   "#2563eb", False, True,  "MLXS-NPLD"),
+            ("mlx-serve",         "pld",     "MLX-serve (MLX, --pld)",      "#16a34a", False, True,  "MLXS-PLD"),
+            ("mlx-serve",         "drafter", "MLX-serve (MLX, --drafter)",  "#ea580c", False, True,  "MLXS-DRFT"),
         ],
     },
     "qwen36": {
@@ -66,11 +75,12 @@ FAMILIES = {
             "qwen36-35b-a3b",
         ],
         "variants": [
-            ("lmstudio-baseline", "none", "LM Studio (MLX, baseline)", "#888888", True),
-            ("lmstudio-alt",      "none", "LM Studio (GGUF)",          "#cccccc", False),
-            ("omlx",              "none", "oMLX",                      "#2ca02c", False),
-            ("mlx-serve",         "none", "MLX-serve --no-pld",        "#3b82f6", False),
-            ("mlx-serve",         "pld",  "MLX-serve --pld",           "#22c55e", False),
+            ("lmstudio-baseline", "none", "LM Studio (MLX, baseline)",   "#9ca3af", True,  False, "LM-MLX"),
+            ("lmstudio-alt",      "none", "LM Studio (GGUF)",            "#d1d5db", False, False, "LM-GG"),
+            ("mlx-serve-gguf",    "none", "MLX-serve (GGUF / llama.cpp)", "#a78bfa", False, False, "MLXS-GG"),
+            ("omlx",              "none", "oMLX",                        "#10b981", False, False, "oMLX"),
+            ("mlx-serve",         "none", "MLX-serve (MLX, --no-pld)",   "#2563eb", False, True,  "MLXS-NPLD"),
+            ("mlx-serve",         "pld",  "MLX-serve (MLX, --pld)",      "#16a34a", False, True,  "MLXS-PLD"),
         ],
     },
 }
@@ -139,14 +149,32 @@ def render(csv_path: Path, png_out: Path, family: str,
     title_hw = hardware or (next(iter(real_hardware)) if real_hardware else None)
     title = cfg["title"]
     if title_hw:
-        title = f"{title} [{title_hw}]"
+        title = f"{title} · {title_hw}"
 
-    fig, axes = plt.subplots(1, 3, figsize=(22, 7))
-    fig.suptitle(title, fontsize=14, fontweight="bold")
+    # Style: clean grid, sans-serif, axis lines hidden except baseline.
+    plt.rcParams.update({
+        "font.family": "sans-serif",
+        "font.sans-serif": ["Helvetica Neue", "Helvetica", "Arial", "DejaVu Sans"],
+        "axes.spines.top": False,
+        "axes.spines.right": False,
+        "axes.edgecolor": "#9ca3af",
+        "axes.labelcolor": "#374151",
+        "xtick.color": "#374151",
+        "ytick.color": "#6b7280",
+        "axes.titlecolor": "#111827",
+    })
 
-    x = np.arange(len(cfg["model_order"]))
+    # Wider figure + extra room above for a top-of-figure legend.
+    fig, axes = plt.subplots(1, 3, figsize=(28, 9.2))
+    fig.suptitle(title, fontsize=16, fontweight="bold", color="#111827", y=0.985)
+
+    n_models = len(cfg["model_order"])
     n_variants = len(cfg["variants"])
-    width = 0.8 / n_variants
+    # Spread model groups further apart so 7 bars per group breathe.
+    group_step = 1.6
+    x = np.arange(n_models) * group_step
+    # Bar width: use ~85% of the per-group slot, divided evenly across variants.
+    width = (group_step * 0.85) / n_variants
 
     panels = [
         ("echo",   "Echo (verbatim recitation — PLD's home turf)"),
@@ -154,77 +182,119 @@ def render(csv_path: Path, png_out: Path, family: str,
         ("decode", "Free-form writing (creative essay, parity case)"),
     ]
 
+    # Resolve baseline (variant, spec) once.
+    base_variant_spec = next(
+        ((var, sp) for (var, sp, _l, _c, base, _d, _s) in cfg["variants"] if base),
+        None,
+    )
+
+    legend_handles = None
     for panel_idx, (workload_key, workload_label) in enumerate(panels):
         ax = axes[panel_idx]
-        for v_idx, (variant, spec, label, color, is_baseline) in enumerate(cfg["variants"]):
+        # Alternating very-faint background bands per model group make it
+        # easier to see which bars belong together.
+        for i in range(n_models):
+            if i % 2 == 0:
+                ax.axvspan(
+                    x[i] - group_step / 2, x[i] + group_step / 2,
+                    color="#f9fafb", zorder=0,
+                )
+        for v_idx, (variant, spec, label, color, is_baseline, show_delta, short) in enumerate(cfg["variants"]):
             values, baselines = [], []
             for logical in cfg["model_order"]:
                 cell = data.get((logical, variant, spec), {})
-                # Find the row marked as baseline within the family, look up
-                # its value for this prompt as the comparison point.
-                base_variant_spec = next(
-                    ((var, sp) for (var, sp, _l, _c, base) in cfg["variants"] if base),
-                    None,
-                )
-                if base_variant_spec:
-                    base_cell = data.get((logical,) + base_variant_spec, {})
-                else:
-                    base_cell = {}
+                base_cell = (data.get((logical,) + base_variant_spec, {})
+                             if base_variant_spec else {})
                 values.append(cell.get(workload_key, 0))
                 baselines.append(base_cell.get(workload_key, 0))
             offset = (v_idx - (n_variants - 1) / 2) * width
             bars = ax.bar(
                 x + offset, values, width,
-                label=label, color=color, edgecolor="black", linewidth=0.6,
+                label=label, color=color,
+                edgecolor="#1f2937" if not is_baseline else "#6b7280",
+                linewidth=0.5, zorder=2,
             )
             for bar, val, base in zip(bars, values, baselines):
                 if val <= 0:
                     continue
-                if is_baseline:
-                    txt = f"{val:.1f}"
-                    color_txt = "#222"
-                else:
-                    gain = (val / base - 1) * 100 if base > 0 else 0
-                    color_txt = (
-                        "#15803d" if gain >= 5 else
-                        "#b91c1c" if gain <= -5 else
-                        "#525252"
-                    )
-                    txt = f"{val:.1f}\n{gain:+.0f}%"
+                # Value (tok/s) and engine short-name stack INSIDE the bar
+                # near the bottom. White text reads cleanly on saturated
+                # colors; muted gray comparison bars get dark text.
+                light_bar = is_baseline or color in ("#d1d5db", "#9ca3af")
+                text_color = "#111827" if light_bar else "#ffffff"
+                # Stack with the tok/s value above the engine short name.
+                # Vertical offsets are picked to clear the bar baseline even
+                # on the 31B tiny-bar case (~20 tok/s with y-range 0-150).
+                value_str = f"{val:.0f}" if val >= 10 else f"{val:.1f}"
                 ax.text(
                     bar.get_x() + bar.get_width() / 2,
-                    bar.get_height() + 0.5,
-                    txt,
-                    ha="center", va="bottom", fontsize=8, color=color_txt,
+                    max(bar.get_height() * 0.18, 1.2),
+                    value_str,
+                    ha="center", va="bottom",
+                    fontsize=9, color=text_color, fontweight="bold",
                 )
+                ax.text(
+                    bar.get_x() + bar.get_width() / 2,
+                    max(bar.get_height() * 0.04, 0.3),
+                    short,
+                    ha="center", va="bottom",
+                    fontsize=6.5, color=text_color, alpha=0.85,
+                )
+                # Percent delta: horizontal, ABOVE the bar. Only on mlx-serve
+                # rows (`show_delta=True`) so the labels above don't collide.
+                # Suppress noise-grade deltas (<3%) — bar height shows it.
+                if show_delta and base > 0:
+                    gain = (val / base - 1) * 100
+                    if abs(gain) >= 3:
+                        gcolor = ("#15803d" if gain >= 5 else
+                                  "#b91c1c" if gain <= -5 else "#525252")
+                        ax.text(
+                            bar.get_x() + bar.get_width() / 2,
+                            bar.get_height() + (bar.get_height() * 0.015 + 0.4),
+                            f"{gain:+.0f}%",
+                            ha="center", va="bottom",
+                            fontsize=9, color=gcolor, fontweight="bold",
+                        )
+        if legend_handles is None:
+            legend_handles, legend_labels = ax.get_legend_handles_labels()
         ax.set_xticks(x)
-        ax.set_xticklabels([cfg["x_label"](m) for m in cfg["model_order"]], fontsize=9)
+        ax.set_xticklabels([cfg["x_label"](m) for m in cfg["model_order"]],
+                           fontsize=10, fontweight="medium")
         ax.set_ylabel("decode tok/s", fontsize=10)
-        ax.set_title(workload_label, fontsize=11)
-        ax.grid(True, axis="y", alpha=0.3, linestyle="--")
+        ax.set_title(workload_label, fontsize=12, fontweight="semibold", pad=8)
+        ax.grid(True, axis="y", alpha=0.35, linestyle="--", color="#d1d5db", zorder=1)
         ax.set_axisbelow(True)
-        if panel_idx == 0:
-            ax.legend(loc="upper left", fontsize=9, framealpha=0.9)
+        ax.tick_params(axis="x", length=0)
 
-    # Headroom for the +X% labels above tall bars.
+    # Single shared legend, positioned ~30px below the title (in 140-dpi
+    # output, ~0.03 figure-fraction). Title sits at y=0.985, legend at 0.92.
+    fig.legend(legend_handles, legend_labels,
+               loc="lower center", bbox_to_anchor=(0.5, 0.915),
+               ncol=len(cfg["variants"]), fontsize=10,
+               frameon=False, columnspacing=1.5, handlelength=1.6)
+
+    # Headroom for the percent labels above bars.
     for ax in axes:
         cur_ylim = ax.get_ylim()
         ax.set_ylim(0, cur_ylim[1] * 1.18)
+        ax.set_xlim(x[0] - group_step / 2, x[-1] + group_step / 2)
 
-    plt.tight_layout(rect=[0, 0, 1, 0.96])
-    plt.savefig(png_out, dpi=140, bbox_inches="tight")
+    # Leave room above for the title + legend stack (title at 0.985, legend
+    # band around 0.915 → reserve top 12% of the figure).
+    plt.tight_layout(rect=[0, 0, 1, 0.88])
+    plt.savefig(png_out, dpi=140, bbox_inches="tight", facecolor="white")
     print(f"Wrote {png_out}")
 
 
 def main() -> None:
     p = argparse.ArgumentParser(
         description="Render MLX-serve vs LM Studio vs oMLX comparison chart from a "
-                    "CSV produced by tests/bench_vs_lmstudio_omlx.sh.",
+                    "CSV produced by tests/bench.sh.",
     )
     p.add_argument("csv", type=Path, help="input CSV path")
     p.add_argument("png", type=Path, help="output PNG path")
     p.add_argument("--family", required=True, choices=list(FAMILIES.keys()),
-                   help="model family (matches --family of bench_vs_lmstudio_omlx.sh)")
+                   help="model family (matches --family of tests/bench.sh)")
     p.add_argument("--hardware", default=None,
                    help="hardware tag to filter on (e.g. Apple-M1-Pro-32gb). "
                         "Required when the CSV mixes multiple machines.")

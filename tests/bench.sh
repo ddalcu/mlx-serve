@@ -1,6 +1,11 @@
 #!/bin/bash
-# bench_vs_lmstudio_omlx.sh — apples-to-apples MLX-serve vs LM Studio vs oMLX
-# benchmark matrix that produces the charts in docs/perf-vs-lmstudio-omlx*.png.
+# bench.sh — unified mlx-serve performance bench.
+#
+# Default run is mlx-serve only across {none,pld,drafter} × prefill/decode/echo/code
+# prompts (fast dev-loop iteration). Pass --lmstudio and/or --omlx to add the
+# apples-to-apples comparison cells that produce charts in
+# docs/perf-vs-lmstudio-omlx*.png. Pass --concurrent N to also emit batched
+# throughput rows (folded from the old bench_concurrent.py).
 #
 # Two model families are shipped:
 #   --family gemma   Gemma 4 E2B (8bit), E4B (8bit), 31B (8bit), 26B-A4B-MoE
@@ -57,6 +62,17 @@ PNG_OUT=""
 KEEP_CSV=""
 SERVER_PORT=11250
 LMS_PORT=1234
+# Comparison engines are opt-in. Default is mlx-serve cells only — that's the
+# fast "did my change move perf" loop. Pass --lmstudio and/or --omlx to enable
+# the engine-comparison cells (slower; each adds boot+warmup time per row).
+INCLUDE_LMSTUDIO=0
+INCLUDE_OMLX=0
+# Concurrent throughput mode (folded from the old bench_concurrent.py). When >1,
+# starts mlx-serve with --max-concurrent N and emits an extra `decode_c<N>`
+# row per cell that fires N parallel requests; the row's tok/s is the aggregate
+# rate (sum of completion_tokens / wall). Compares cleanly against the single-
+# request decode row above it to see the batching speedup.
+CONCURRENT=0
 # Read OMLX_PORT from ~/.omlx/settings.json if present; fall back to 11251.
 if [[ -f "$HOME/.omlx/settings.json" ]]; then
     OMLX_PORT="$(python3 -c "import json,sys
@@ -73,10 +89,25 @@ usage() {
     cat <<EOF
 Usage: $0 --family <gemma|qwen36> [options]
 
+The default run measures mlx-serve only (MLX safetensors + GGUF where vendored)
+across {none, pld, drafter} and the prefill/decode/echo/code prompts. Add
+--lmstudio and/or --omlx to include the comparison engines.
+
 Options:
   --family NAME        Model family: 'gemma' or 'qwen36' (required)
+  --lmstudio           Include LM Studio cells (MLX baseline + GGUF alt where
+                       configured). Requires \`lms\` CLI; LM Studio handles JIT
+                       model load on the warmup curl.
+  --omlx               Include oMLX cells. Requires \`omlx\` on PATH; silently
+                       skipped if missing.
+  --concurrent N       Also emit a \`decode_c<N>\` row per mlx-serve cell. The
+                       server is started with --max-concurrent N and N parallel
+                       /v1/chat/completions are fired; the row's tok/s is the
+                       aggregate rate. Default 0 (off).
   --out PATH           Chart PNG output path. Default is timestamped:
                        docs/perf-vs-lmstudio-omlx-<family>-YYYYMMDD-HHMMSS.png
+                       The chart is skipped when no comparison engines are
+                       enabled (a single-engine bar chart isn't useful).
   --keep-csv PATH      Also retain the raw CSV at this path. By default the
                        CSV is written to a temp file and deleted on exit.
   --runs N             Repeats per cell (run 1 dropped as warmup; default: 2)
@@ -86,14 +117,19 @@ Options:
   -h, --help           This message
 
 Examples:
-  $0 --family gemma                # writes docs/perf-vs-lmstudio-omlx-gemma-<ts>.png
-  $0 --family qwen36 --runs 3      # Qwen 3.6 matrix with one extra repeat
+  $0 --family gemma                            # mlx-serve only (fast iteration)
+  $0 --family gemma --lmstudio --omlx          # full apples-to-apples chart
+  $0 --family qwen36 --concurrent 2            # add 2-way batched row
+  $0 --family gemma --lmstudio --keep-csv x.csv
 EOF
 }
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --family)     FAMILY="$2"; shift 2 ;;
+        --lmstudio)   INCLUDE_LMSTUDIO=1; shift ;;
+        --omlx)       INCLUDE_OMLX=1; shift ;;
+        --concurrent) CONCURRENT="$2"; shift 2 ;;
         --out)        PNG_OUT="$2"; shift 2 ;;
         --keep-csv)   KEEP_CSV="$2"; shift 2 ;;
         --runs)       RUNS="$2"; shift 2 ;;
@@ -125,10 +161,15 @@ OUT="$(mktemp -t bench_vs_lms.XXXXXX).csv"
 
 # ── Family-specific cell definitions ──
 #
-# Each row: label_prefix|mlxserve_path|lms_baseline_key|lms_alt_key|drafter_dir
-# - lms_baseline_key  → primary LMS baseline (UD MLX where applicable)
-# - lms_alt_key       → secondary LMS variant (GGUF for Qwen, empty for Gemma)
-# - drafter_dir       → Gemma 4 assistant drafter checkpoint, empty otherwise
+# Each row: label_prefix|mlxserve_mlx_path|lms_baseline|lms_alt|drafter_dir|mlxserve_gguf_path
+# - mlxserve_mlx_path   → MLX safetensors dir for the mlx-serve cells
+# - lms_baseline        → primary LMS model id (MLX baseline where applicable)
+# - lms_alt             → secondary LMS variant (GGUF id)
+# - drafter_dir         → Gemma 4 assistant drafter checkpoint, empty otherwise
+# - mlxserve_gguf_path  → .gguf file (or dir containing one) for the mlx-serve
+#                         GGUF cell. Same artifact LMS loads for `lms_alt` so
+#                         the head-to-head is apples-to-apples. Empty/missing
+#                         skips the mlx-serve-gguf cell for this row.
 declare -a TARGETS
 case "$FAMILY" in
     gemma)
@@ -137,36 +178,53 @@ case "$FAMILY" in
         # 4-bit across the board (apples-to-apples MLX 4-bit vs GGUF Q4 vs
         # mlx-serve 4-bit). All four targets get both MLX baseline and GGUF alt.
         LMS_DIR="$HOME/.lmstudio/models"
+        # Vendored GGUFs — same files LM Studio loads under the hood. Default
+        # to the LM Studio community dir under $LMS_DIR; override the per-row
+        # path in TARGETS if your GGUFs live elsewhere.
+        GGUF_DIR="$LMS_DIR/lmstudio-community"
+        # LM Studio 0.3+ model IDs are the upstream HF org/name. Verify with
+        # `curl -sf http://127.0.0.1:1234/v1/models` — the MLX baseline lives
+        # under `mlx-community/<name>`, the GGUF alt under `google/<name>` (or
+        # `<name>` without an org for some entries). Older `*-it-mlx` /
+        # `<name>` fuzzy IDs no longer JIT-load and timed out the bench
+        # silently. The script tolerates missing rows: any TARGETS entry
+        # whose `mlxserve_path` is absent skips silently.
         TARGETS=(
-            "gemma4-e2b-4bit|$LMS_DIR/mlx-community/gemma-4-e2b-it-4bit|gemma-4-e2b-it@4bit|google/gemma-4-e2b|$DM/gemma-4-E2B-it-assistant-bf16"
-            "gemma4-e4b-4bit|$LMS_DIR/mlx-community/gemma-4-e4b-it-4bit|gemma-4-e4b-it@4bit|google/gemma-4-e4b|$DM/gemma-4-E4B-it-assistant-bf16"
-            "gemma4-31b-4bit|$LMS_DIR/mlx-community/gemma-4-31b-it-4bit|gemma-4-31b-it@4bit|google/gemma-4-31b|$DM/gemma-4-31B-it-assistant-bf16"
-            "gemma4-26b-a4b-moe-4bit|$MD/gemma-4-26b-a4b-it-4bit|gemma-4-26b-a4b-it|google/gemma-4-26b-a4b|$DM/gemma-4-26B-A4B-it-assistant-bf16"
+            "gemma4-e2b-4bit|$LMS_DIR/mlx-community/gemma-4-e2b-it-4bit|mlx-community/gemma-4-e2b-it|google/gemma-4-e2b|$DM/gemma-4-E2B-it-assistant-bf16|$GGUF_DIR/gemma-4-E2B-it-GGUF/gemma-4-E2B-it-Q4_K_M.gguf"
+            "gemma4-e4b-4bit|$LMS_DIR/mlx-community/gemma-4-e4b-it-4bit|mlx-community/gemma-4-e4b-it|google/gemma-4-e4b|$DM/gemma-4-E4B-it-assistant-bf16|$GGUF_DIR/gemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q4_K_M.gguf"
+            "gemma4-31b-4bit|$LMS_DIR/mlx-community/gemma-4-31b-it-4bit|mlx-community/gemma-4-31b-it|google/gemma-4-31b|$DM/gemma-4-31B-it-assistant-bf16|$GGUF_DIR/gemma-4-31B-it-GGUF/gemma-4-31B-it-Q4_K_M.gguf"
+            "gemma4-26b-a4b-moe-4bit|$MD/gemma-4-26b-a4b-it-4bit|mlx-community/gemma-4-26b-a4b-it|google/gemma-4-26b-a4b|$DM/gemma-4-26B-A4B-it-assistant-bf16|$GGUF_DIR/gemma-4-26B-A4B-it-GGUF/gemma-4-26B-A4B-it-Q4_K_M.gguf"
         )
-        # Specs measured (per row): mlx-serve {none,pld,drafter} + omlx baseline
-        # + lms_baseline + lms_alt (GGUF). Order matters: mlx-serve runs first
-        # while the machine is coolest, omlx in the middle (same MLX backend so
-        # it'd benefit from a fresh start too), LMS runs last so any thermal
-        # throttling that builds up during the row falls on the comparison
-        # engines, not on us. lms_alt rows skip silently when the row has no
-        # GGUF key configured (31B, 26B-A4B currently).
-        SPECS=("mlx-serve::none" "mlx-serve::pld" "mlx-serve::drafter" "omlx:base:none" "lmstudio:lms_baseline:none" "lmstudio:lms_alt:none")
-        # Workaround needed? (assistant <think></think> prefill on LMS)
+        # Specs measured (per row): mlx-serve {none,pld,drafter} + mlx-serve
+        # GGUF (none — PLD/drafter are MLX-only and silently no-op on the
+        # llama.cpp path) + omlx baseline + lms_baseline + lms_alt (GGUF).
+        # Order matters: mlx-serve MLX first (cool machine), mlx-serve GGUF
+        # next, omlx in the middle, LMS specs last so any thermal throttling
+        # that builds up during the row falls on the comparison engines, not
+        # on us. lms_alt rows skip silently when the row has no GGUF key
+        # configured (31B, 26B-A4B currently).
+        SPECS=("mlx-serve::none" "mlx-serve::pld" "mlx-serve::drafter" "mlx-serve:alt:none" "omlx:base:none" "lmstudio:lms_baseline:none" "lmstudio:lms_alt:none")
+        # Gemma 4 has no thinking mode; the LMS workaround is a no-op.
         LMS_THINKING_WORKAROUND=0
         ;;
     qwen36)
         LMS_DIR="$HOME/.lmstudio/models"
+        GGUF_DIR="$LMS_DIR/lmstudio-community"
         # All engines load the same standard mlx-community 4-bit MLX weights
         # (not the unsloth UD variants — those are bigger on disk and we want
-        # the more representative production checkpoint here).
+        # the more representative production checkpoint here). GGUFs are the
+        # lmstudio-community Q4_K_M vendored builds.
         TARGETS=(
-            "qwen36-27b|$LMS_DIR/mlx-community/Qwen3.6-27B-4bit|mlx-community/qwen3.6-27b|qwen/qwen3.6-27b|"
-            "qwen36-35b-a3b|$LMS_DIR/mlx-community/Qwen3.6-35B-A3B-4bit|qwen3.6-35b-a3b@4bit|qwen/qwen3.6-35b-a3b|"
+            "qwen36-27b|$LMS_DIR/mlx-community/Qwen3.6-27B-4bit|mlx-community/qwen3.6-27b|qwen/qwen3.6-27b||$GGUF_DIR/Qwen3.6-27B-GGUF/Qwen3.6-27B-Q4_K_M.gguf"
+            "qwen36-35b-a3b|$LMS_DIR/mlx-community/Qwen3.6-35B-A3B-4bit|mlx-community/qwen3.6-35b-a3b|qwen/qwen3.6-35b-a3b||$GGUF_DIR/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-Q4_K_M.gguf"
         )
-        # Same ordering rule as gemma: mlx-serve first (cool machine), omlx
-        # in the middle, LMS specs last so thermal throttling penalises the
-        # comparison.
-        SPECS=("mlx-serve::none" "mlx-serve::pld" "omlx:base:none" "lmstudio:lms_baseline:none" "lmstudio:lms_alt:none")
+        # Same ordering rule as gemma: mlx-serve MLX first (cool machine),
+        # mlx-serve GGUF next, omlx in the middle, LMS specs last so any
+        # thermal throttling penalises the comparison engines, not us.
+        SPECS=("mlx-serve::none" "mlx-serve::pld" "mlx-serve:alt:none" "omlx:base:none" "lmstudio:lms_baseline:none" "lmstudio:lms_alt:none")
+        # Qwen 3.6's chat template auto-activates `<think>` mode; LM Studio
+        # ignores `chat_template_kwargs.enable_thinking:false`, so build_body_lms
+        # uses the stacked workaround when this flag is on.
         LMS_THINKING_WORKAROUND=1
         ;;
     *)
@@ -175,7 +233,7 @@ case "$FAMILY" in
         ;;
 esac
 
-# ── Test prompts (kept identical to bench_run.sh's so cross-bench numbers compare) ──
+# ── Test prompts (identical wording across engines so cross-bench numbers compare) ──
 PREFILL_PROMPT="Explain the following topics in extreme detail: $(python3 -c "print(', '.join([f'topic {i} about science and technology and its impact on human civilization throughout history' for i in range(1,50)]))")"
 DECODE_PROMPT="Write a detailed essay about quantum computing"
 ECHO_PROMPT='Repeat the following paragraph back to me word for word, exactly as written, with no additional commentary. Then add the single sentence "End of recitation." on a new line. PARAGRAPH: The quick brown fox jumps over the lazy dog. Pack my box with five dozen liquor jugs. How vexingly quick daft zebras jump. The five boxing wizards jump quickly. Jackdaws love my big sphinx of quartz. Bright vixens jump; dozy fowl quack. Sphinx of black quartz, judge my vow. Two driven jocks help fax my big quiz. Now repeat the paragraph above exactly:'
@@ -200,6 +258,13 @@ def is_palindrome(s: str) -> bool:
     """Return True if s is a palindrome ignoring case and non-alphanumerics."""'
 
 # ── Body builders ──
+# Thinking is suppressed across all engines so prefill/decode/echo/code cells
+# measure the same workload. Thinking-on produces measurement asymmetry: LMS
+# excludes reasoning tokens from max_tokens while mlx-serve doesn't, so the
+# two engines end up decoding very different amounts of tokens for the same
+# nominal max_tokens. Gemma 4 has no thinking mode (enable_thinking is a
+# no-op). Qwen 3.6 needs the stacked workaround in build_body_lms — LMS
+# silently ignores chat_template_kwargs.enable_thinking:false on this family.
 build_body_mlx() {
     local prompt="$1" spec="$2" mt="$3"
     local epld=false edrft=false
@@ -212,20 +277,30 @@ build_body_mlx() {
 build_body_lms() {
     local prompt="$1" model="$2" mt="$3"
     if [[ "$LMS_THINKING_WORKAROUND" == "1" ]]; then
-        # Assistant-prefill `<think>\n\n</think>\n\n` so model continues in
-        # content mode. Required for Qwen 3.6 since LM Studio ignores
-        # chat_template_kwargs.enable_thinking on this family.
-        jq -nc --arg p "$prompt" --arg model "$model" --argjson mt "$mt" \
-            '{model:$model, messages:[{role:"user",content:$p},{role:"assistant",content:"<think>\n\n</think>\n\n"}], max_tokens:$mt, temperature:0.0, top_p:1.0, stream:false, add_generation_prompt:false, continue_final_message:true}'
+        # Thinking-suppression for Qwen 3.6 on LM Studio. The old
+        # assistant-prefilled `<think></think>` + continue_final_message trick
+        # DID suppress thinking but made LMS ~5× slower (probably re-running
+        # the chat template on every decode step). Instead we use a lighter
+        # combo: a system message + Qwen's native `/no_think` suffix +
+        # chat_template_kwargs. Even when the model still thinks, LMS double-
+        # reports the work in `completion_tokens` (alongside reasoning_tokens),
+        # so dividing by wall gives the honest engine decode rate.
+        jq -nc --arg p "$prompt" --arg model "$model" --argjson mt "$mt" '{
+            model: $model,
+            messages: [
+                {role: "system", content: "Respond directly. Do not emit any <think> or </think> tokens. Provide the final answer immediately."},
+                {role: "user", content: ($p + "  /no_think")}
+            ],
+            max_tokens: $mt, temperature: 0.0, top_p: 1.0, stream: false,
+            chat_template_kwargs: {enable_thinking: false}
+        }'
     else
         jq -nc --arg p "$prompt" --arg model "$model" --argjson mt "$mt" \
             '{model:$model, messages:[{role:"user",content:$p}], max_tokens:$mt, temperature:0.0, top_p:1.0, stream:false, chat_template_kwargs:{enable_thinking:false}}'
     fi
 }
 
-# oMLX accepts a bare OpenAI-style body. We skip the LMS thinking workaround
-# entirely — oMLX honors `chat_template_kwargs.enable_thinking` natively where
-# the chat template supports it, and ignores it where it doesn't.
+# oMLX accepts a bare OpenAI-style body; it honors chat_template_kwargs natively.
 build_body_omlx() {
     local prompt="$1" model="$2" mt="$3"
     jq -nc --arg p "$prompt" --arg model "$model" --argjson mt "$mt" \
@@ -254,6 +329,11 @@ send_one() {
     # truncated body, which then crashes json.loads with an unhelpful
     # traceback. Catch it, log the raw response head, and treat as ERR
     # (the caller — run_cell — then retries the cell once).
+    # Returns: elapsed_ms|prompt_tokens|completion_tokens|reasoning_tokens
+    # Thinking is suppressed across all engines; reasoning_tokens > 0 means
+    # the suppression LEAKED on that cell, and the row should be treated as
+    # unreliable (tok/s based on completion_tokens alone undercounts what the
+    # engine actually decoded).
     local parsed
     parsed=$(python3 -c "
 import json,sys
@@ -264,7 +344,9 @@ except Exception as e:
     sys.exit(0)
 u=r.get('usage',{}) or {}
 ctd=u.get('completion_tokens_details',{}) or {}
-print(f\"{int(sys.argv[2])-int(sys.argv[3])}|{u.get('prompt_tokens',0)}|{u.get('completion_tokens',0)}|{ctd.get('reasoning_tokens',0)}\")
+ct=int(u.get('completion_tokens') or 0)
+rt=int(ctd.get('reasoning_tokens') or 0)
+print(f\"{int(sys.argv[2])-int(sys.argv[3])}|{u.get('prompt_tokens',0)}|{ct}|{rt}\")
 " "$resp" "$t1" "$t0")
     if [[ -z "$parsed" ]]; then echo "ERR|0|0|0"; return; fi
     echo "$parsed"
@@ -326,6 +408,63 @@ tps=pt/(avg/1000.0) if avg>0 and pt>0 else 0
 print(f'{tps:.1f}|$last_pt')"
 }
 
+# ── Concurrent decode (folded from bench_concurrent.py) ──
+# Fires $n parallel /v1/chat/completions and reports aggregate throughput
+# (sum of completion_tokens across all requests, divided by total wall time).
+# The single-request decode row above this in the CSV gives the per-request
+# baseline; the speedup = aggregate_tps / single_request_tps shows whether
+# the engine's batched scheduling actually helps for this workload.
+bench_decode_concurrent() {
+    local engine="$1" model="$2" spec="$3" prompt="$4" mt="$5" n="$6"
+    local omlx_model_id; omlx_model_id="$(basename "$model")"
+    local port
+    case "$engine" in
+        lmstudio) port="$LMS_PORT" ;;
+        omlx)     port="$OMLX_PORT" ;;
+        *)        port="$SERVER_PORT" ;;
+    esac
+    local outdir; outdir=$(mktemp -d -t bench_conc.XXXXXX)
+    local pids=() i
+    local t0; t0=$(python3 -c 'import time;print(int(time.time()*1000))')
+    for i in $(seq 1 "$n"); do
+        local body
+        case "$engine" in
+            mlx-serve) body=$(build_body_mlx  "$(salted "c$i" "$prompt")" "$spec"  "$mt") ;;
+            omlx)      body=$(build_body_omlx "$(salted "c$i" "$prompt")" "$omlx_model_id" "$mt") ;;
+            *)         body=$(build_body_lms  "$(salted "c$i" "$prompt")" "$model" "$mt") ;;
+        esac
+        (
+            curl -sf -m 240 -X POST "http://127.0.0.1:$port/v1/chat/completions" \
+                -H "Content-Type: application/json" -d "$body" > "$outdir/$i.json" 2>/dev/null
+        ) &
+        pids+=("$!")
+    done
+    for pid in "${pids[@]}"; do wait "$pid" 2>/dev/null || true; done
+    local t1; t1=$(python3 -c 'import time;print(int(time.time()*1000))')
+    local result
+    result=$(python3 -c "
+import json, glob, sys
+elapsed_ms = $t1 - $t0
+tot_ct = tot_pt = 0
+ok = 0
+for f in sorted(glob.glob('$outdir/*.json')):
+    try:
+        r = json.load(open(f))
+    except Exception:
+        continue
+    u = r.get('usage') or {}
+    ct = int(u.get('completion_tokens') or 0)
+    pt = int(u.get('prompt_tokens') or 0)
+    if ct > 0:
+        ok += 1
+    tot_ct += ct
+    tot_pt += pt
+tps = (tot_ct / (elapsed_ms / 1000.0)) if elapsed_ms > 0 and tot_ct > 0 else 0
+print(f'{tps:.1f}|{tot_pt}|{tot_ct}|0|{ok}')")
+    rm -rf "$outdir"
+    echo "$result"
+}
+
 # ── Engine lifecycle ──
 # Disable oMLX's API-key requirement once at script start so the warmup +
 # bench curls can hit it without an Authorization header. The setting persists
@@ -385,8 +524,12 @@ start_engine() {
                 drafter) [[ -z "$drafter" ]] && { echo "  drafter spec missing --drafter dir" >&2; return 1; }
                          extra="--no-pld --drafter $drafter" ;;
             esac
+            # --max-concurrent N enables N-way batched scheduling on dense archs.
+            # Always pass the flag — N=1 (default) matches single-slot behavior.
+            local mc_arg=""
+            [[ "$CONCURRENT" -gt 1 ]] && mc_arg="--max-concurrent $CONCURRENT"
             "$BINARY" --model "$model_or_path" --serve --port "$SERVER_PORT" \
-                --ctx-size "$CTX" --log-level info $extra >/tmp/bench_vs_lms_engine.log 2>&1 &
+                --ctx-size "$CTX" --log-level info $extra $mc_arg >/tmp/bench_vs_lms_engine.log 2>&1 &
             local pid=$!
             ENGINE_PID="$pid"
             for i in $(seq 1 240); do
@@ -533,6 +676,17 @@ run_cell() {
         [[ "$rt" -gt 0 ]] && cell_notes="${cell_notes:+$cell_notes,}thinking_leaked=$rt"
         emit "$label" "$engine" "$model_or_path" "$spec" "$kind" "0" "$tps" "$pt" "$ct" "$cell_notes"
     done
+
+    # Concurrent throughput pass: N parallel decode requests, aggregate tok/s.
+    # The single-request `decode` row above is the per-request baseline;
+    # `decode_c<N>` shows whether batched scheduling actually multiplies it.
+    if [[ "$CONCURRENT" -gt 1 ]]; then
+        out=$(bench_decode_concurrent "$engine" "$model_or_path" "$spec" "$DECODE_PROMPT" "$MAX_TOKENS" "$CONCURRENT")
+        IFS='|' read -r tps pt ct rt ok <<<"$out"
+        cell_notes="$notes"
+        cell_notes="${cell_notes:+$cell_notes,}concurrent=$CONCURRENT,ok=$ok"
+        emit "$label" "$engine" "$model_or_path" "$spec" "decode_c${CONCURRENT}" "0" "$tps" "$pt" "$ct" "$cell_notes"
+    fi
 }
 
 cleanup() {
@@ -545,36 +699,55 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
-# Pre-flight: oMLX availability + auth-disable. Missing `omlx` doesn't abort
-# the run — the omlx cells just skip.
+# Pre-flight: oMLX availability + auth-disable. Only checked when --omlx is
+# passed; without the flag, oMLX cells are skipped wholesale regardless of
+# whether the CLI is installed.
 HAS_OMLX=0
-if command -v omlx >/dev/null 2>&1; then
-    HAS_OMLX=1
-    prepare_omlx_settings
-else
-    echo "(omlx not on PATH — omlx cells will be skipped)" >&2
+if [[ "$INCLUDE_OMLX" -eq 1 ]]; then
+    if command -v omlx >/dev/null 2>&1; then
+        HAS_OMLX=1
+        prepare_omlx_settings
+    else
+        echo "--omlx passed but omlx not on PATH; cells will be skipped" >&2
+    fi
 fi
+[[ "$INCLUDE_LMSTUDIO" -eq 0 && "$INCLUDE_OMLX" -eq 0 ]] && \
+    echo "(mlx-serve only — pass --lmstudio and/or --omlx to add comparison engines)" >&2
 
 for row in "${TARGETS[@]}"; do
-    IFS='|' read -r logical mlxserve_path lms_baseline lms_alt drafter <<<"$row"
+    IFS='|' read -r logical mlxserve_path lms_baseline lms_alt drafter mlxserve_gguf_path <<<"$row"
     [[ -d "$mlxserve_path" ]] || { echo "SKIP missing $mlxserve_path" >&2; continue; }
 
     for spec_entry in "${SPECS[@]}"; do
         IFS=':' read -r engine variant spec <<<"$spec_entry"
         case "$engine|$variant" in
             "lmstudio|lms_baseline")
+                [[ "$INCLUDE_LMSTUDIO" -eq 1 ]] || continue
                 run_cell "${logical}/lmstudio-baseline/${spec}"  "lmstudio"  "$lms_baseline"  "$spec" "" ""
                 ;;
             "lmstudio|lms_alt")
+                [[ "$INCLUDE_LMSTUDIO" -eq 1 ]] || continue
                 [[ -z "$lms_alt" ]] && continue
                 run_cell "${logical}/lmstudio-alt/${spec}"       "lmstudio"  "$lms_alt"       "$spec" "" ""
                 ;;
             "omlx|base")
+                [[ "$INCLUDE_OMLX" -eq 1 ]] || continue
                 [[ "$HAS_OMLX" -eq 1 ]] || { echo "  SKIP ${logical}/omlx/${spec} (omlx not on PATH)" >&2; continue; }
                 run_cell "${logical}/omlx/${spec}"               "omlx"      "$mlxserve_path" "$spec" "" ""
                 ;;
-            "mlx-serve|"|"mlx-serve|*")
-                # Skip drafter cell when no drafter dir is present (Qwen).
+            "mlx-serve|alt")
+                # mlx-serve loading the same .gguf LM Studio uses. PLD /
+                # drafter silently no-op on the llama.cpp path (those are
+                # MLX-only kernels), so the only meaningful spec here is
+                # `none` — the SPECS list reflects that.
+                if [[ -z "$mlxserve_gguf_path" || ! -e "$mlxserve_gguf_path" ]]; then
+                    echo "  SKIP ${logical}/mlx-serve-gguf/${spec} (no mlxserve_gguf_path or file missing)" >&2
+                    continue
+                fi
+                run_cell "${logical}/mlx-serve-gguf/${spec}"     "mlx-serve" "$mlxserve_gguf_path" "$spec" "" ""
+                ;;
+            "mlx-serve|")
+                # Empty variant = MLX safetensors path (default).
                 if [[ "$spec" == "drafter" && ( -z "$drafter" || ! -d "$drafter" ) ]]; then
                     continue
                 fi
@@ -587,9 +760,16 @@ done
 stop_all_engines
 lms unload --all >/dev/null 2>&1 || true
 
-# Render the chart (only artifact most users want).
-mkdir -p "$(dirname "$PNG_OUT")"
-python3 "$SCRIPT_DIR/plot_vs_lmstudio_omlx.py" "$OUT" "$PNG_OUT" --family "$FAMILY"
+# Render the engine-comparison chart only when there's something to compare —
+# a bar chart of mlx-serve-only cells is just the CSV with extra steps.
+if [[ "$INCLUDE_LMSTUDIO" -eq 1 || "$INCLUDE_OMLX" -eq 1 ]]; then
+    mkdir -p "$(dirname "$PNG_OUT")"
+    python3 "$SCRIPT_DIR/plot_vs_lmstudio_omlx.py" "$OUT" "$PNG_OUT" --family "$FAMILY"
+    echo
+    echo "=== chart written to $PNG_OUT ==="
+else
+    echo "(chart skipped — no comparison engines; pass --lmstudio/--omlx to render)" >&2
+fi
 
 # Optionally retain the raw CSV; otherwise it's a tempfile and gets cleaned
 # up by the EXIT trap below.
@@ -598,6 +778,3 @@ if [[ -n "$KEEP_CSV" ]]; then
     cp "$OUT" "$KEEP_CSV"
     echo "CSV retained at $KEEP_CSV"
 fi
-
-echo
-echo "=== chart written to $PNG_OUT ==="

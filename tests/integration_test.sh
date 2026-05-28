@@ -134,6 +134,9 @@ echo -e "${YELLOW}Test: Props endpoint${NC}"
 RESP=$(curl -s "$BASE/props")
 assert_contains "GET /props has n_ctx" '"n_ctx"' "$RESP"
 assert_contains "GET /props has total_slots" '"total_slots"' "$RESP"
+# Regression: chat_template was dropped from /props (10-100 KB of Jinja that no
+# in-tree client read). renderPropsBody unit tests pin the same invariant.
+assert_not_contains "GET /props omits chat_template" '"chat_template"' "$RESP"
 echo ""
 
 # ── Test: Chat completions (non-streaming) ──

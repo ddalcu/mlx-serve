@@ -4,7 +4,7 @@ Native Zig server that runs MLX-format LMs on Apple Silicon and exposes OpenAI-c
 
 ## Stack
 
-- **Zig** 0.15+; **mlx-c** (Apple) via Homebrew, FFI in `src/mlx.zig`
+- **Zig** 0.16+; **mlx-c** (Apple) via Homebrew, FFI in `src/mlx.zig`
 - **Jinja engine** (`lib/jinja_cpp`): llama.cpp's C++17 Jinja2 + nlohmann/json, pre-compiled as `libjinja.a`
 - **stb_image** (JPEG/PNG) + **libwebp** (WebP) for vision; **safetensors** weights; BPE tokenizers
 
@@ -90,6 +90,7 @@ Existing tools:
 | `./tests/test_tool_response.sh [port]` | Tool calling round-trip |
 | `./tests/test_kv_cache_poison.sh [port]` | KV cache poisoning regression |
 | `./tests/test_anthropic_api.sh [port]` | Anthropic Messages API |
+| `LLAMA_GGUF_MODEL=<file.gguf> ./tests/test_llama_gguf.sh [port]` | Embedded llama.cpp GGUF engine end-to-end (auto-routing, chat, streaming, Anthropic) |
 | `PLD_TEST_MODEL=<dir> ./tests/test_pld_equivalence.sh` | PLD byte-equivalence (default gemma-4-e4b-it-8bit) |
 | `./tests/test_streaming_pld.sh [port]` | Streaming PLD byte-identical to non-streaming |
 | `./tests/test_drafter_equivalence.sh [port]` | Gemma 4 drafter byte-equivalence |
@@ -100,7 +101,7 @@ Existing tools:
 | `./tests/test_prefix_cache_mem.sh [model_dir] [port]` | `--prefix-cache-mem` budget — long-prompt traffic must stay within the byte cap and produce eviction log lines. |
 | `./tests/test_turboquant_equivalence.sh [model_dir] [port]` | TurboQuant smoke (non-NaN, ≥5 tokens, first-N diff vs dense). |
 | `SOAK_DURATION_HOURS=N ./tests/test_soak_24h.sh [model_dir]` | Plan 01 A8 — 4-way concurrent soak (chat/agent/Anthropic/tool). RSS drift bounded; default 24h, set `SOAK_DURATION_HOURS=1` for CI smoke. |
-| `./tests/bench_spec.sh [runs]` / `--corpus` | Spec-decode benchmark + threshold-tuning corpus |
+| `./tests/bench.sh --family <gemma\|qwen36> [--lmstudio --omlx --concurrent N]` | Unified bench: prefill/decode/echo/code prompts × {none,pld,drafter} cells. Default mlx-serve only; opt in to comparison engines and concurrent throughput. |
 
 ## Versioning & Releases
 
@@ -142,7 +143,7 @@ When in doubt, look at the existing entries (v26.5.4 and earlier) — keep the s
 
 ## Benchmarking
 
-Run `./bench.sh` after major features/optimizations; results go in `BenchmarkLog.md`. Flags: `--model gemma`, `--no-mlx-lm`, `--runs 5`.
+Run `./tests/bench.sh --family <gemma|qwen36>` after major features/optimizations; CSVs go in `docs/perf-csvs/`, narrative summary in `BenchmarkLog.md`. Pass `--lmstudio` and/or `--omlx` to add comparison engines (chart renders into `docs/`); `--concurrent N` adds a batched-throughput row per cell. Default run is mlx-serve only — fast enough for tight dev loops.
 
 ## Conventions
 
@@ -155,7 +156,7 @@ Run `./bench.sh` after major features/optimizations; results go in `BenchmarkLog
 
 ## Supported Architectures
 
-Dispatched on `model_type` in `config.json` via `model.zig` (config/weights) and `transformer.zig` (forward).
+Dispatched on `model_type` in `config.json` via `model.zig` (config/weights) and `transformer.zig` (forward). **GGUF files bypass this MLX dispatch entirely** and route to an embedded engine by file format — see "GGUF auto-routing" below.
 
 | `model_type` | Family | Weight prefix | Vision | MoE | Notes |
 |---|---|---|---|---|---|
@@ -167,8 +168,13 @@ Dispatched on `model_type` in `config.json` via `model.zig` (config/weights) and
 | `nemotron_h` | Nemotron-H | `backbone` | -- | -- | Hybrid transformer + Mamba2 SSM |
 | `lfm2` | Liquid LFM2.5 | `model` | -- | -- | Hybrid gated conv + full attention |
 | `llama`, `mistral` | Llama/Mistral | `model` | -- | -- | |
+| `*.gguf` (any) | via llama.cpp | -- | -- | -- | Embedded libllama engine; reported as `model_type=gguf`. See Embedded engines. |
 
 **TODO**: `lfm2-vl` (vision encoder), `phi`/`phi3` (different layout), `command-r` (different arch).
+
+### GGUF auto-routing
+
+A `.gguf` model path (or a directory containing one) bypasses the MLX safetensors path. `main.zig` picks the embedded engine by family: **DeepSeek-V4-Flash → ds4**, **every other GGUF → llama.cpp** (`model_discovery.isDs4GgufBasename` — case-insensitive `deepseek-v4-flash` prefix; mirrored client-side by `DownloadManager.ggufModelType`). The Swift app surfaces any `.gguf` as a selectable base model and the server auto-routes — no engine selector. Both engines share the same HTTP/chat-template/tool/SSE machinery via per-request dispatch on `LoadedModel.{ds4,llama}_engine`.
 
 Models with `vision_config` but no vision weights (e.g., text-only quantized Qwen 3.5) gracefully disable vision at init. Swift app flags unsupported archs via `supportedModelTypes` in `HFModels.swift`.
 
@@ -354,3 +360,13 @@ DSV4-Flash is served by the embedded **ds4** engine (antirez/ds4), pinned at `li
 - Bridge: `src/arch/ds4.zig` (`Ds4Engine` + `Ds4Session` — owns Metal-kernel extraction, tokenizer lookups, and the speculative-decode API).
 - Build: `build.zig` compiles `lib/ds4/ds4.c` + `lib/ds4/ds4_metal.m` and links Foundation/Metal. Metal kernel sources are embedded via `@embedFile` (`lib/ds4_metal_sources.zig`); at first launch we stage them under `~/.mlx-serve/ds4-metal/<binary-hash>/` and point ds4 at them via its `DS4_METAL_<NAME>_SOURCE` env-var overrides — zero patches to the submodule.
 - Convention: each new model-specific engine lives at `lib/<engine>/`, exposes a single-header C API, and gets a thin Zig wrapper at `src/arch/<engine>.zig`. See `CONTRIBUTING.md` for the embedding checklist.
+
+Generic GGUF models (everything except DSV4-Flash) are served by the embedded **llama.cpp** engine via `libllama`.
+
+- Staging: `scripts/fetch-llama.sh` downloads the pinned llama.cpp XCFramework (`LLAMA_TAG`, currently `b9318`), thins the macOS slice to a single self-contained arm64 `lib/llama/lib/libllama.dylib` (llama + ggml + ggml-metal merged, Metal shaders embedded), rewrites its install-name to `@rpath/libllama.dylib`, and copies headers to `lib/llama/include`. **Not vendored** — `lib/llama/` is git-ignored and re-fetched by CI / `app/build.sh`. Bump `LLAMA_TAG` to upgrade.
+- C shim: `lib/llama_shim/llama_shim.{h,c}` — a small, stable C API over the ABI-fragile `llama.h` structs (compiled by clang against the real header, so the ABI is always correct). Mirrors the ds4.h discipline.
+- FFI: `src/llama_ffi.zig` (mechanical mirror of the shim header).
+- Bridge: `src/arch/llama.zig` (`LlamaEngine` + `LlamaSession` — model load, tokenize/detokenize, chat-template string, prefill `sync`, `eval`, `argmax`/`sample`). Tests gate on `LLAMA_TEST_MODEL`.
+- Build: `build.zig` `addLlamaLib` adds `lib/llama/include`, links `libllama` (`use_pkg_config = .no` so a Homebrew `llama.cpp` install can't hijack the link), compiles the shim, and adds a dev rpath. Bundling: `release.yml` / `app/build.sh` copy `libllama.dylib` into the app `Frameworks/` (and the CLI tarball `lib/`), rewrite `@rpath/libllama.dylib` → `@executable_path/...`, and sign it through the existing dylib loop — no new executable, so notarization is unchanged.
+- Chat templating reuses mlx-serve's Jinja engine: the GGUF's embedded template is adopted into the stub `ChatConfig.chat_template` at load (`Scheduler.doLoadLlamaOnInferenceThread`), then `chat.encodeChatViaLlama` renders via `renderChatTemplate` (which supplies the tool-synthesis fallback) and tokenizes through libllama (`add_special=false`, the template owns BOS).
+- Scope (v1, like ds4): serial (`max_concurrent=1`), no PLD/drafter/kv-quant/hot-switch (those are MLX-specific). Tested by `tests/test_llama_gguf.sh` (gated on `LLAMA_GGUF_MODEL`).

@@ -3,22 +3,137 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>MLX Serve — Run LLMs (and DeepSeek V4 Flash) natively on your Mac</title>
-  <meta name="description" content="Native Zig inference server for Apple Silicon. Faster than LM Studio on every model we test. OpenAI + Anthropic (Claude Code) compatible. No Python. Run DeepSeek V4 Flash, Gemma 4, and Qwen 3.6 locally.">
+  <title>mlx-serve — Run any LLM on your Mac · MLX + GGUF · faster than LM Studio · OpenAI + Anthropic API</title>
+  <meta name="description" content="Native Zig inference server for Apple Silicon. Runs any LLM — MLX and GGUF — faster than LM Studio on the same file. OpenAI- and Anthropic-compatible (Claude Code) APIs. No Python. Drop-in alternative to LM Studio, Ollama, and llama.cpp on macOS. Gemma 4, Qwen 3.6, Llama 3, Mistral, DeepSeek V4 Flash — local, MIT-licensed.">
+  <meta name="keywords" content="MLX, MLX server, mlx-serve, Apple Silicon LLM, local LLM Mac, LM Studio alternative, Ollama alternative, llama.cpp Mac, GGUF Apple Silicon, OpenAI compatible local, Anthropic API local, Claude Code local, DeepSeek V4 Flash, Gemma 4, Qwen 3.6, M1 M2 M3 M4 LLM, native MLX inference">
+  <meta name="author" content="David Dalcu">
   <link rel="canonical" href="https://ddalcu.github.io/mlx-serve/">
   <!-- Open Graph -->
   <meta property="og:type" content="website">
   <meta property="og:url" content="https://ddalcu.github.io/mlx-serve/">
-  <meta property="og:title" content="Run DeepSeek V4 Flash natively on your Mac — MLX Serve">
-  <meta property="og:description" content="Native Zig inference server for Apple Silicon. Faster than LM Studio on every model. Run the 284B DeepSeek V4 Flash on a 96 GB+ Mac. OpenAI + Anthropic API. No Python.">
+  <meta property="og:title" content="Run any LLM on your Mac — faster than LM Studio on the same file">
+  <meta property="og:description" content="Native Zig inference server for Apple Silicon. MLX + GGUF. OpenAI- and Anthropic-compatible APIs. No Python. Drop-in alternative to LM Studio and Ollama on macOS.">
   <meta property="og:image" content="https://ddalcu.github.io/mlx-serve/mlxcore-screenshot-1.png">
   <meta property="og:image:width" content="1200">
   <meta property="og:image:height" content="630">
+  <meta property="og:site_name" content="mlx-serve">
   <!-- Twitter Card -->
   <meta name="twitter:card" content="summary_large_image">
-  <meta name="twitter:title" content="Run DeepSeek V4 Flash natively on your Mac — MLX Serve">
-  <meta name="twitter:description" content="Native Zig server for Apple Silicon. Faster than LM Studio on every model. 284B DeepSeek V4 Flash, Gemma 4, Qwen 3.6 — local. OpenAI + Anthropic API. No Python.">
+  <meta name="twitter:title" content="Run any LLM on your Mac — faster than LM Studio on the same file">
+  <meta name="twitter:description" content="Native Zig server for Apple Silicon. MLX + GGUF. OpenAI + Anthropic compatible. No Python. Drop-in alternative to LM Studio and Ollama.">
   <meta name="twitter:image" content="https://ddalcu.github.io/mlx-serve/mlxcore-screenshot-1.png">
+  <!-- JSON-LD structured data (AEO) -->
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "SoftwareApplication",
+    "name": "mlx-serve",
+    "alternateName": ["MLX Core", "mlx serve"],
+    "applicationCategory": "DeveloperApplication",
+    "applicationSubCategory": "AI Inference Server",
+    "operatingSystem": "macOS 14+ (Apple Silicon)",
+    "processorRequirements": "Apple Silicon (M1, M2, M3, M4)",
+    "url": "https://ddalcu.github.io/mlx-serve/",
+    "downloadUrl": "https://github.com/ddalcu/mlx-serve/releases/latest",
+    "codeRepository": "https://github.com/ddalcu/mlx-serve",
+    "license": "https://opensource.org/licenses/MIT",
+    "softwareVersion": "v26.5.7",
+    "author": { "@type": "Person", "name": "David Dalcu" },
+    "description": "Native Zig inference server for Apple Silicon that runs any LLM — MLX and GGUF — with OpenAI- and Anthropic-compatible APIs. Faster than LM Studio on the same file. No Python. MIT licensed.",
+    "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
+    "featureList": [
+      "Runs any MLX or GGUF model on Apple Silicon",
+      "OpenAI-compatible chat completions API",
+      "Anthropic Messages API (works with Claude Code)",
+      "OpenAI Responses API + WebSocket transport",
+      "Speculative decoding (PLD + Gemma 4 drafter)",
+      "KV-cache quantization (4-bit, 8-bit, TurboQuant)",
+      "Continuous batching",
+      "Built-in agent mode with MCP tool calling",
+      "DeepSeek V4 Flash via embedded ds4 engine"
+    ]
+  }
+  </script>
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "FAQPage",
+    "mainEntity": [
+      {
+        "@type": "Question",
+        "name": "Is mlx-serve faster than LM Studio?",
+        "acceptedAnswer": {
+          "@type": "Answer",
+          "text": "Yes — every cell, every model we've benchmarked. On identical 4-bit MLX weights mlx-serve wins by +39% geomean across 18 workloads (Gemma 4 and Qwen 3.6 families). On the same .gguf file as LM Studio, mlx-serve's embedded llama.cpp wrapper still wins +12-15% on decode and +5% on prefill. Speculative decoding pushes the lead further on echo-heavy and code-completion workloads — up to 2.65× on Gemma 4 E4B echo."
+        }
+      },
+      {
+        "@type": "Question",
+        "name": "Does mlx-serve replace LM Studio?",
+        "acceptedAnswer": {
+          "@type": "Answer",
+          "text": "For most use cases, yes. mlx-serve runs the same MLX and GGUF models, exposes an OpenAI-compatible API, and ships a native menu-bar app instead of an Electron one. It also adds things LM Studio doesn't have: a real Anthropic Messages API (works with Claude Code), the OpenAI Responses API + WebSockets, MCP tool calling, agent mode with 10 built-in tools, KV-cache quantization, continuous batching, and the antirez/ds4 engine for DeepSeek V4 Flash."
+        }
+      },
+      {
+        "@type": "Question",
+        "name": "Does mlx-serve replace Ollama on Mac?",
+        "acceptedAnswer": {
+          "@type": "Answer",
+          "text": "On Apple Silicon, yes. Ollama is cross-platform and uses llama.cpp; mlx-serve runs llama.cpp AND native MLX with the Mac-specific optimizations Ollama doesn't ship — Metal kernels through mlx-c, JIT-compiled activations, shared-prefix KV cache, and the Gemma 4 cross-attention drafter. The OpenAI-compatible wire is identical, so you can drop in http://localhost:11234 wherever you had http://localhost:11434."
+        }
+      },
+      {
+        "@type": "Question",
+        "name": "Can I run GGUF models on Mac without Python?",
+        "acceptedAnswer": {
+          "@type": "Answer",
+          "text": "Yes. mlx-serve embeds llama.cpp's inference library (libllama) inside the same signed, notarized binary. Point --model at any .gguf file and the server auto-detects the format and routes to the right engine — no pip, no venv, no llama-server to install separately. DeepSeek V4 Flash GGUFs go through the dedicated antirez/ds4 engine instead, also embedded."
+        }
+      },
+      {
+        "@type": "Question",
+        "name": "Does mlx-serve work with Claude Code?",
+        "acceptedAnswer": {
+          "@type": "Answer",
+          "text": "Yes — natively. mlx-serve implements Anthropic's /v1/messages endpoint including streaming, tool calling, and extended thinking. Point Claude Code at it with ANTHROPIC_BASE_URL=http://localhost:11234. The MLX Core app ships a one-click Launch Claude Code button that wires up the env vars for you."
+        }
+      },
+      {
+        "@type": "Question",
+        "name": "What models does mlx-serve support?",
+        "acceptedAnswer": {
+          "@type": "Answer",
+          "text": "Native MLX dispatch for Gemma 3/4, Qwen 3 / 3.5 / 3.6 / 3-Next, Llama 3.x, Mistral, Nemotron-H, LFM2.5, and DeepSeek V4 Flash. Anything else as GGUF via embedded llama.cpp — Qwen, Llama, Mistral, Gemma, DeepSeek, Phi, Yi, and thousands more available on HuggingFace."
+        }
+      },
+      {
+        "@type": "Question",
+        "name": "Can mlx-serve run DeepSeek V4 Flash locally on a Mac?",
+        "acceptedAnswer": {
+          "@type": "Answer",
+          "text": "Yes, on 96 GB+ Apple Silicon Macs. Open the MLX Core Model Browser, pick DeepSeek-V4-Flash, hit Download — the server routes the GGUF through the embedded antirez/ds4 engine with native Metal kernels, byte-validated against the reference forward. Agent mode and MCP tools work on DSV4 too."
+        }
+      },
+      {
+        "@type": "Question",
+        "name": "Where does my data go when using mlx-serve?",
+        "acceptedAnswer": {
+          "@type": "Answer",
+          "text": "Nowhere. Everything runs locally on your Mac — no analytics, no telemetry, no cloud calls. The HTTP server binds to 127.0.0.1 by default. Open source under the MIT license."
+        }
+      },
+      {
+        "@type": "Question",
+        "name": "How do I install mlx-serve?",
+        "acceptedAnswer": {
+          "@type": "Answer",
+          "text": "The easiest way is the MLX Core menu-bar app from the GitHub Releases page (signed and notarized DMG). Or via Homebrew: brew tap ddalcu/mlx-serve https://github.com/ddalcu/mlx-serve && brew install --cask mlx-core. The CLI server alone is brew install mlx-serve."
+        }
+      }
+    ]
+  }
+  </script>
   <link rel="icon" href="appiconb.png">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
@@ -811,6 +926,70 @@
       border-radius: 5px;
     }
 
+    /* ─── FAQ ─── */
+    .faq-wrap { max-width: 760px; margin: 0 auto; display: flex; flex-direction: column; gap: 10px; }
+
+    .faq-item {
+      background: var(--white);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      padding: 0;
+      transition: box-shadow 0.2s ease, border-color 0.2s ease;
+    }
+
+    .faq-item[open] { box-shadow: var(--shadow-card); border-color: rgba(0, 113, 227, 0.18); }
+
+    .faq-item summary {
+      cursor: pointer;
+      padding: 18px 22px;
+      font-size: 15.5px;
+      font-weight: 600;
+      letter-spacing: -0.005em;
+      color: var(--text-primary);
+      list-style: none;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      border-radius: var(--radius-sm);
+    }
+
+    .faq-item summary::-webkit-details-marker { display: none; }
+
+    .faq-item summary::after {
+      content: '+';
+      font-family: var(--mono);
+      font-size: 22px;
+      font-weight: 400;
+      color: var(--text-tertiary);
+      flex-shrink: 0;
+      transition: transform 0.2s ease, color 0.2s ease;
+      line-height: 1;
+    }
+
+    .faq-item[open] summary::after { transform: rotate(45deg); color: var(--blue); }
+    .faq-item summary:hover { color: var(--blue); }
+
+    .faq-item p {
+      padding: 0 22px 20px;
+      font-size: 14.5px;
+      color: var(--text-secondary);
+      line-height: 1.62;
+    }
+
+    .faq-item p code {
+      font-family: var(--mono);
+      font-size: 13px;
+      background: var(--bg-alt);
+      color: var(--text-primary);
+      padding: 1.5px 6px;
+      border-radius: 5px;
+    }
+
+    .faq-item p b { color: var(--text-primary); font-weight: 600; }
+    .faq-item p a { color: var(--blue); text-decoration: none; }
+    .faq-item p a:hover { text-decoration: underline; }
+
     /* ─── FOOTER ─── */
     footer { padding: 44px 24px; text-align: center; border-top: 0.5px solid var(--border); }
 
@@ -870,13 +1049,14 @@
     <a href="#" class="nav-logo">
       <img src="appiconb.png" alt="MLX Core" class="nav-logo-img">
       <span>mlx-serve</span>
-      <span class="nav-ver">v26.5.6</span>
+      <span class="nav-ver">v26.5.7</span>
     </a>
     <ul class="nav-links">
       <li><a href="#performance" class="hide-mobile">Performance</a></li>
       <li><a href="#deepseek" class="hide-mobile">DeepSeek V4</a></li>
       <li><a href="#features" class="hide-mobile">Features</a></li>
       <li><a href="#models" class="hide-mobile">Models</a></li>
+      <li><a href="#faq" class="hide-mobile">FAQ</a></li>
       <li>
         <a href="https://github.com/ddalcu/mlx-serve" class="nav-github" target="_blank" rel="noopener" aria-label="GitHub">
           <svg viewBox="0 0 16 16"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
@@ -888,13 +1068,13 @@
   <!-- HERO -->
   <section class="hero">
     <div class="hero-glow"><span class="g1"></span><span class="g2"></span><span class="g3"></span></div>
-    <a href="#deepseek" class="hero-badge">
-      <span class="new-pill">New</span>
-      DeepSeek&nbsp;V4&nbsp;Flash runs locally
+    <a href="https://github.com/ddalcu/mlx-serve/releases/tag/v26.5.7" class="hero-badge">
+      <span class="new-pill">v26.5.7</span>
+      Run any GGUF model — faster than LM Studio on the same file
       <span class="arrow">→</span>
     </a>
-    <h1>Run LLMs natively<br>on your <span class="grad">Mac</span></h1>
-    <p class="hero-sub">A native Zig inference server with a macOS menu-bar app. <strong>Faster than LM Studio on every model we test.</strong> OpenAI- and Anthropic-compatible. No Python.</p>
+    <h1>Run any LLM<br>on your <span class="grad">Mac</span></h1>
+    <p class="hero-sub">A native Zig inference server with a macOS menu-bar app. <strong>MLX + GGUF, faster than LM Studio on the same&nbsp;file.</strong> OpenAI- and Anthropic-compatible. No Python. No Electron.</p>
     <div class="hero-ctas">
       <a href="https://github.com/ddalcu/mlx-serve/releases" class="btn btn-primary">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
@@ -908,6 +1088,7 @@
       <div class="hero-meta-item"><strong>macOS 14+</strong></div>
       <div class="hero-meta-item"><strong>M1 – M4</strong></div>
       <div class="hero-meta-item"><strong>MIT License</strong></div>
+      <a href="https://github.com/ddalcu/mlx-serve/stargazers" class="hero-meta-item" style="text-decoration:none;color:var(--text-tertiary);" target="_blank" rel="noopener">★ <strong>Star on GitHub</strong></a>
     </div>
   </section>
 
@@ -921,8 +1102,8 @@
   <!-- MARQUEE -->
   <div class="marquee" aria-hidden="true">
     <div class="marquee-track">
-      <span class="marquee-item">DeepSeek V4 Flash</span><span class="marquee-item">Gemma 4</span><span class="marquee-item">Qwen 3.6</span><span class="marquee-item">Llama 3</span><span class="marquee-item">Mistral</span><span class="marquee-item">Nemotron-H</span><span class="marquee-item">LFM2.5</span><span class="marquee-item">Qwen 3-Next</span>
-      <span class="marquee-item">DeepSeek V4 Flash</span><span class="marquee-item">Gemma 4</span><span class="marquee-item">Qwen 3.6</span><span class="marquee-item">Llama 3</span><span class="marquee-item">Mistral</span><span class="marquee-item">Nemotron-H</span><span class="marquee-item">LFM2.5</span><span class="marquee-item">Qwen 3-Next</span>
+      <span class="marquee-item">MLX + GGUF</span><span class="marquee-item">DeepSeek V4 Flash</span><span class="marquee-item">Gemma 4</span><span class="marquee-item">Qwen 3.6</span><span class="marquee-item">Llama 3</span><span class="marquee-item">Mistral</span><span class="marquee-item">Nemotron-H</span><span class="marquee-item">LFM2.5</span><span class="marquee-item">OpenAI API</span><span class="marquee-item">Anthropic API</span><span class="marquee-item">Claude Code</span><span class="marquee-item">MCP</span>
+      <span class="marquee-item">MLX + GGUF</span><span class="marquee-item">DeepSeek V4 Flash</span><span class="marquee-item">Gemma 4</span><span class="marquee-item">Qwen 3.6</span><span class="marquee-item">Llama 3</span><span class="marquee-item">Mistral</span><span class="marquee-item">Nemotron-H</span><span class="marquee-item">LFM2.5</span><span class="marquee-item">OpenAI API</span><span class="marquee-item">Anthropic API</span><span class="marquee-item">Claude Code</span><span class="marquee-item">MCP</span>
     </div>
   </div>
 
@@ -1199,6 +1380,72 @@
     </div>
   </section>
 
+  <!-- FAQ (AEO + humans) -->
+  <section class="section section-alt" id="faq">
+    <div class="section-header reveal">
+      <div class="section-label">FAQ</div>
+      <h2 class="section-title">Questions, answered</h2>
+      <p class="section-desc">The things people actually ask in HN comments, Discord, and AI search.</p>
+    </div>
+    <div class="faq-wrap reveal">
+      <details class="faq-item">
+        <summary>Is mlx-serve faster than LM Studio?</summary>
+        <p>Yes — every cell, every model we've benchmarked. On identical 4-bit MLX weights mlx-serve wins by <b>+39% geomean across 18 workloads</b> (Gemma 4 E2B/E4B/31B/26B-A4B-MoE and Qwen 3.6 27B/35B-A3B-MoE). On the <b>same <code>.gguf</code> file</b> as LM Studio (<code>gemma-4-E4B-it-Q4_K_M.gguf</code>), mlx-serve's embedded llama.cpp wrapper still wins <b>+12-15% on decode</b> and <b>+5% on prefill</b>. Speculative decoding pushes the lead further on echo-heavy and code-completion workloads — up to 2.65× on Gemma 4 E4B echo.</p>
+      </details>
+      <details class="faq-item">
+        <summary>Does mlx-serve replace LM Studio?</summary>
+        <p>For most use cases, yes. mlx-serve runs the same MLX and GGUF models, exposes an OpenAI-compatible API on the same kind of port, and ships a native menu-bar app instead of an Electron one. It also adds things LM Studio doesn't have: a real <b>Anthropic Messages API</b> (works with Claude Code), the <b>OpenAI Responses API + WebSockets</b>, <b>MCP tool calling</b>, agent mode with 10 built-in tools, KV-cache quantization, continuous batching, and the <a href="https://github.com/antirez/ds4" target="_blank" rel="noopener">antirez/ds4</a> engine for DeepSeek V4 Flash.</p>
+      </details>
+      <details class="faq-item">
+        <summary>Does mlx-serve replace Ollama on Mac?</summary>
+        <p>On Apple Silicon, yes. Ollama is cross-platform and uses llama.cpp; mlx-serve runs llama.cpp <b>and</b> native MLX with the Mac-specific optimizations Ollama doesn't ship — Metal kernels through mlx-c, JIT-compiled activations, shared-prefix KV cache, and the Gemma 4 cross-attention drafter. The OpenAI-compatible wire is identical, so you can drop in <code>http://localhost:11234</code> wherever you had <code>http://localhost:11434</code>.</p>
+      </details>
+      <details class="faq-item">
+        <summary>Can I run GGUF models on Mac without Python?</summary>
+        <p>Yes. mlx-serve embeds llama.cpp's inference library (<code>libllama</code>) inside the same signed, notarized binary. Point <code>--model</code> at any <code>.gguf</code> file and the server auto-detects the format and routes to the right engine — no <code>pip</code>, no venv, no <code>llama-server</code> to install separately. DeepSeek V4 Flash GGUFs go through the dedicated antirez/ds4 engine instead, also embedded.</p>
+      </details>
+      <details class="faq-item">
+        <summary>Does mlx-serve work with Claude Code?</summary>
+        <p>Yes — natively. mlx-serve implements Anthropic's <code>/v1/messages</code> endpoint including streaming, tool calling, and extended thinking. Point Claude Code at it with <code>ANTHROPIC_BASE_URL=http://localhost:11234</code>. The MLX Core app ships a one-click <b>Launch Claude Code</b> button that wires up the env vars for you.</p>
+      </details>
+      <details class="faq-item">
+        <summary>What about the OpenAI SDK, Continue, Cursor, Open WebUI?</summary>
+        <p>All work — anything that talks the OpenAI chat-completions or Anthropic Messages wire protocol does. mlx-serve also implements the newer OpenAI Responses API (<code>/v1/responses</code>) for clients that want stateful chains via <code>previous_response_id</code>, plus a WebSocket transport on the same endpoint.</p>
+      </details>
+      <details class="faq-item">
+        <summary>Can mlx-serve run DeepSeek V4 Flash locally?</summary>
+        <p>Yes, on 96 GB+ Apple Silicon Macs. Open the MLX Core Model Browser, pick DeepSeek-V4-Flash, hit Download — the server routes the GGUF through the embedded ds4 engine (native Metal kernels, byte-validated against the reference forward). Agent mode and MCP tools work on DSV4 too.</p>
+      </details>
+      <details class="faq-item">
+        <summary>What models are supported?</summary>
+        <p>Native MLX dispatch for Gemma 3/4, Qwen 3 / 3.5 / 3.6 / 3-Next, Llama 3.x, Mistral, Nemotron-H, LFM2.5, and DeepSeek V4 Flash. Anything else as GGUF via embedded llama.cpp — Qwen, Llama, Mistral, Gemma, DeepSeek, Phi, Yi, and thousands more from HuggingFace.</p>
+      </details>
+      <details class="faq-item">
+        <summary>Does it support tools / function calling?</summary>
+        <p>Yes, on both API surfaces. The server detects tool-call patterns across architectures (Hermes XML, Gemma 4 <code>&lt;|tool_call&gt;</code>, raw JSON, ChatML), repairs common Qwen 3.5/3.6 escape quirks, and emits OpenAI-style <code>tool_calls</code> deltas in the SSE stream. The MLX Core app ships <b>10 built-in tools</b> (shell, file I/O, search, browse, web search, memory) and connects to MCP servers from a curated marketplace.</p>
+      </details>
+      <details class="faq-item">
+        <summary>How does it stay this small / fast?</summary>
+        <p>Zig with direct <code>mlx-c</code> FFI — no Python runtime, no Electron, no IPC bridge. The release binary is ~3.3 MB. Eager warmup at boot page-faults weights and pre-compiles decode kernels (first request 3.5× faster). Multi-turn agent loops reuse KV across turns and skip re-prefilling system prompts via a shared-prefix cache. Tokenize caching turns the second hit on a long conversation into a memcpy (7.7× warm TTFT on Gemma 4 E4B).</p>
+      </details>
+      <details class="faq-item">
+        <summary>Is the inference exact, or quantized output drift?</summary>
+        <p>For greedy decoding (temp=0), mlx-serve is byte-identical to the reference for the first ~30-80 generated tokens, with long-tail divergence inherent to INT4 float-reduction order. For temp &gt; 0, the Leviathan probability-ratio sampler keeps speculative decoding mathematically exact in distribution. Equivalence is pinned by automated tests on every release.</p>
+      </details>
+      <details class="faq-item">
+        <summary>Where does my data go?</summary>
+        <p>Nowhere. Everything runs locally on your Mac — no analytics, no telemetry, no cloud calls. The HTTP server binds to <code>127.0.0.1</code> by default. Open source under MIT.</p>
+      </details>
+      <details class="faq-item">
+        <summary>How do I install it?</summary>
+        <p>The easiest way is the <a href="https://github.com/ddalcu/mlx-serve/releases/latest">MLX Core app from GitHub Releases</a> (signed and notarized DMG). Or via Homebrew: <code>brew tap ddalcu/mlx-serve https://github.com/ddalcu/mlx-serve &amp;&amp; brew install --cask mlx-core</code>. CLI server alone: <code>brew install mlx-serve</code>.</p>
+      </details>
+    </div>
+    <p style="text-align:center; margin-top: 32px; font-size: 14px; color: var(--text-tertiary);">
+      Have another question? <a href="https://github.com/ddalcu/mlx-serve/issues/new" style="color: var(--blue); text-decoration: none;" target="_blank" rel="noopener">Open an issue</a> · ★ <a href="https://github.com/ddalcu/mlx-serve/stargazers" style="color: var(--blue); text-decoration: none;" target="_blank" rel="noopener">Star the repo</a> if mlx-serve saved you from spinning up another Electron app.
+    </p>
+  </section>
+
   <!-- FOOTER -->
   <footer>
     <ul class="footer-links">
@@ -1206,8 +1453,9 @@
       <li><a href="https://github.com/ddalcu/mlx-serve/releases" target="_blank" rel="noopener">Releases</a></li>
       <li><a href="https://github.com/ddalcu/mlx-serve/blob/main/CHANGELOG.md" target="_blank" rel="noopener">Changelog</a></li>
       <li><a href="https://github.com/ddalcu/mlx-serve/issues" target="_blank" rel="noopener">Issues</a></li>
+      <li><a href="https://github.com/ddalcu/mlx-serve/stargazers" target="_blank" rel="noopener">★ Star</a></li>
     </ul>
-    <p class="footer-copy">MIT License · mlx-serve · built for Apple Silicon</p>
+    <p class="footer-copy">MIT License · mlx-serve <span style="opacity:0.7;">v26.5.7</span> · built for Apple Silicon</p>
   </footer>
 
   <script>

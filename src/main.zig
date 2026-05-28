@@ -13,6 +13,7 @@ const server_mod = @import("server.zig");
 const scheduler_mod = @import("scheduler.zig");
 const vision_mod = @import("vision.zig");
 const ds4_arch = @import("arch/ds4.zig");
+const llama_arch = @import("arch/llama.zig");
 const ds4_ffi = @import("ds4_ffi.zig");
 const log = @import("log.zig");
 
@@ -75,6 +76,17 @@ fn printUsage(io: std.Io) void {
         \\                      Hot prefix cache KV-bytes budget (default: 2GB).
         \\                      Evicts LRU entries until the budget fits.
         \\                      Pass 0/off to disable the byte budget.
+        \\  --tokenize-cache-entries <n>
+        \\                      Per-model LRU cache of chat-template render +
+        \\                        tokenize results (default: 4). Skips re-
+        \\                        rendering identical messages on warm reuse.
+        \\                        0 disables.
+        \\  --llama-cache-entries <n>
+        \\                      For GGUF models served via llama.cpp, the max
+        \\                        number of resident KV sessions (default: 1).
+        \\                        N > 1 keeps the N most-recently-used prompts
+        \\                        hot so alternating multi-doc workloads don't
+        \\                        cold-prefill on every flip.
         \\  --model-dir <dir>   Directory of MLX models to discover at startup.
         \\                        Discovered siblings appear in /v1/models and
         \\                        can be loaded on-demand via /v1/load-model
@@ -244,6 +256,43 @@ pub fn main(init: std.process.Init) !void {
                 log.err("--prefix-cache-mem: expected '<n>{{MB,GB,KB}}' or '0'/'off'; got '{s}'\n", .{args[i]});
                 std.process.exit(1);
             };
+        } else if (std.mem.eql(u8, args[i], "--tokenize-cache-entries") and i + 1 < args.len) {
+            // Iteration 2 (perf-plan Phase 4 #3): caps the per-LoadedModel
+            // chat-template tokenize cache. 0 = off (every request re-
+            // renders+re-tokenizes, mirrors pre-Iteration-2 behavior).
+            i += 1;
+            server_mod.tokenize_cache_entries = std.fmt.parseInt(u32, args[i], 10) catch 4;
+        } else if (std.mem.eql(u8, args[i], "--llama-cache-entries") and i + 1 < args.len) {
+            // Iteration 3-5 (perf-plan Phase 5 #1): max concurrent
+            // llama.cpp KV sessions per model. 1 = legacy single-session
+            // (every prefill fights for the one slot). > 1 enables the
+            // best-prefix-match LRU.
+            i += 1;
+            server_mod.llama_cache_entries = std.fmt.parseInt(u32, args[i], 10) catch 1;
+        } else if (std.mem.eql(u8, args[i], "--ssm-checkpoint-stride") and i + 1 < args.len) {
+            // Phase 1 (perf-plan): per-position SSM/conv state snapshots during
+            // chunked prefill enable multi-turn warm reuse on hybrid SSM
+            // architectures. 0 disables (legacy behavior: hybrid bypasses the
+            // hot prefix cache); default 128.
+            i += 1;
+            server_mod.ssm_checkpoint_stride = std.fmt.parseInt(u32, args[i], 10) catch 128;
+        } else if (std.mem.eql(u8, args[i], "--ssm-checkpoint-max") and i + 1 < args.len) {
+            i += 1;
+            server_mod.ssm_checkpoint_max = std.fmt.parseInt(u32, args[i], 10) catch 32;
+        } else if (std.mem.eql(u8, args[i], "--llama-kv-quant") and i + 1 < args.len) {
+            // Phase 5 #2: KV-cache quantization for the embedded llama.cpp
+            // engine. Accepts `off`/`f16` (default; F16), `q8`/`8`/`Q8_0`
+            // (~2× compression, near-lossless), `q4`/`4`/`Q4_0` (~4×
+            // compression, some quality impact). Auto-enables flash-attn
+            // in the shim because llama's plain SDPA needs F16/F32 KV.
+            i += 1;
+            const arch_llama = @import("arch/llama.zig");
+            if (arch_llama.LlamaKvQuant.fromString(args[i])) |q| {
+                server_mod.llama_kv_quant = q;
+            } else {
+                log.err("--llama-kv-quant: expected off|q8|q4 (or 8/4), got '{s}'\n", .{args[i]});
+                std.process.exit(1);
+            }
         } else if (std.mem.eql(u8, args[i], "--max-concurrent") and i + 1 < args.len) {
             i += 1;
             server_mod.max_concurrent = std.fmt.parseInt(u32, args[i], 10) catch 1;
@@ -345,37 +394,35 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
-    // ── GGUF early-branch: route to the embedded ds4 engine ──
+    // ── GGUF early-branch: route to an embedded engine ──
     //
-    // mlx-serve serves DSV4-Flash through `lib/ds4/` (antirez/ds4). We pick the
-    // backend at load time by file extension. Any path ending in `.gguf` (or
-    // referring to a directory containing exactly one `.gguf`) bypasses the
-    // MLX safetensors path entirely. Both offline (`--prompt`) and serve
-    // (`--serve`) modes are wired; serve constructs a stub LoadedModel whose
-    // request handlers route through the engine instead of the MLX path.
+    // mlx-serve serves GGUF models through embedded engines (no MLX path). The
+    // backend is picked at load time by file extension + family: DeepSeek-V4-Flash
+    // goes to `lib/ds4/` (antirez/ds4, a bespoke engine for that architecture);
+    // every other `.gguf` goes to the embedded llama.cpp engine (`lib/llama_shim/`
+    // + `src/arch/llama.zig`). Any path ending in `.gguf` (or a directory
+    // containing one) bypasses the MLX safetensors path entirely. Both offline
+    // (`--prompt`) and serve (`--serve`) modes are wired; serve constructs a stub
+    // LoadedModel whose request handlers route through the engine.
     if (isGgufPath(io, model_dir)) {
+        const use_ds4 = isDs4Gguf(io, allocator, model_dir);
         if (serve_mode) {
-            try runDs4Serve(
-                io,
-                allocator,
-                model_dir,
-                host,
-                port,
-                ctx_size,
-                timeout,
-                reasoning_budget,
-                max_resident_models,
-                max_resident_mem,
-                max_resident_mem_explicit,
-                idle_evict_secs,
-            );
+            if (use_ds4) {
+                try runDs4Serve(io, allocator, model_dir, host, port, ctx_size, timeout, reasoning_budget, max_resident_models, max_resident_mem, max_resident_mem_explicit, idle_evict_secs);
+            } else {
+                try runLlamaServe(io, allocator, model_dir, host, port, ctx_size, timeout, reasoning_budget, max_resident_models, max_resident_mem, max_resident_mem_explicit, idle_evict_secs);
+            }
             return;
         }
         const prompt_text = prompt orelse {
-            log.err("ds4 offline mode requires --prompt <text>\n", .{});
+            log.err("GGUF offline mode requires --prompt <text>\n", .{});
             std.process.exit(2);
         };
-        try runDs4Offline(io, allocator, model_dir, prompt_text, max_tokens, temperature);
+        if (use_ds4) {
+            try runDs4Offline(io, allocator, model_dir, prompt_text, max_tokens, temperature);
+        } else {
+            try runLlamaOffline(io, allocator, model_dir, prompt_text, max_tokens, temperature);
+        }
         return;
     }
 
@@ -592,6 +639,12 @@ pub fn main(init: std.process.Init) !void {
             .kv_quant_config = kv_quant_config,
             .prefix_cache_capacity = server_mod.prefix_cache_capacity,
             .prefix_cache_mem_bytes = server_mod.prefix_cache_mem_bytes,
+            .ssm_checkpoint_stride = server_mod.ssm_checkpoint_stride,
+            .ssm_checkpoint_max = server_mod.ssm_checkpoint_max,
+            .tokenize_cache_entries = server_mod.tokenize_cache_entries,
+            .llama_cache_entries = server_mod.llama_cache_entries,
+            .llama_kv_type_k = server_mod.llama_kv_quant.ggmlType(),
+            .llama_kv_type_v = server_mod.llama_kv_quant.ggmlType(),
         };
         try server_mod.serve(io, allocator, params, config, host, port, .{
             .max_context_size = ctx_size,
@@ -735,32 +788,105 @@ fn portInUse(io: std.Io, port: u16) bool {
 /// `--prefix-cache-mem`; returns `error.InvalidSize` on malformed input.
 /// True if `path` points at a .gguf file or a directory that contains one.
 /// We accept directories so users can pass the canonical
-/// `~/.mlx-serve/models/<owner>/<repo>/` shape Swift sets up.
+/// `~/.mlx-serve/models/<owner>/<repo>/` shape Swift sets up. `mmproj-*.gguf`
+/// sidecars are NOT counted — a directory containing only an mmproj file
+/// is not a valid LLM path (`isMmprojGgufBasename` lives next to
+/// `isDs4GgufBasename` in `model_discovery.zig`).
 fn isGgufPath(io: std.Io, path: []const u8) bool {
+    // For a direct .gguf file path: always route to the llama branch so
+    // `resolveGgufFile` can emit a precise error if it's actually an
+    // mmproj sidecar. Falling through to the MLX path on a mmproj.gguf
+    // produces an opaque "no config.json" failure instead.
     if (std.mem.endsWith(u8, path, ".gguf")) return true;
     var dir = std.Io.Dir.openDirAbsolute(io, path, .{ .iterate = true }) catch return false;
     defer dir.close(io);
     var it = dir.iterate();
     while (it.next(io) catch return false) |entry| {
-        if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".gguf")) return true;
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".gguf")) continue;
+        // For directories we DO filter mmproj sidecars from "is this a GGUF
+        // dir?" — a folder with only mmproj.gguf shouldn't be classified as
+        // a llama LLM. `resolveGgufFile` then reports
+        // `error.OnlyMmprojGgufFile` if the user explicitly targets such a
+        // dir.
+        if (model_discovery.isMmprojGgufBasename(entry.name)) continue;
+        return true;
     }
     return false;
 }
 
 /// Resolve the actual .gguf file path. When `path` is a directory, return
-/// the first `.gguf` entry within it (caller frees). When `path` is already a
-/// file, return a dup. Errors if no .gguf is found.
+/// the first non-mmproj `.gguf` entry within it (caller frees). When `path`
+/// is already a file, return a dup. Errors:
+///   error.NoGgufFile         — no .gguf files at all
+///   error.OnlyMmprojGgufFile — directory (or path) had only mmproj sidecars
+///
+/// This function does NOT log on error — the caller decides whether the
+/// error is "fatal user load" (then call `logResolveGgufError` to surface
+/// the actionable message) or "silent probe" (e.g. `isDs4Gguf` checks the
+/// basename and would otherwise double-print on a mmproj path).
 fn resolveGgufFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8) ![]u8 {
-    if (std.mem.endsWith(u8, path, ".gguf")) return allocator.dupe(u8, path);
+    if (std.mem.endsWith(u8, path, ".gguf")) {
+        if (model_discovery.isMmprojGgufBasename(std.fs.path.basename(path))) {
+            return error.OnlyMmprojGgufFile;
+        }
+        return allocator.dupe(u8, path);
+    }
     var dir = try std.Io.Dir.openDirAbsolute(io, path, .{ .iterate = true });
     defer dir.close(io);
     var it = dir.iterate();
+    var saw_mmproj = false;
+    var pick: ?[]u8 = null;
+    errdefer if (pick) |p| allocator.free(p);
     while (try it.next(io)) |entry| {
-        if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".gguf")) {
-            return std.fmt.allocPrint(allocator, "{s}/{s}", .{ path, entry.name });
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".gguf")) continue;
+        if (model_discovery.isMmprojGgufBasename(entry.name)) { saw_mmproj = true; continue; }
+        // Deterministic pick when multiple LLM .ggufs are present: keep the
+        // alphabetically smallest. Avoids "load order depends on readdir(3)
+        // iteration order" (filesystem-dependent on macOS) and lets the
+        // user predict which quant gets loaded when they drop both
+        // `Q4_K_M.gguf` and `Q8_0.gguf` into one folder.
+        if (pick == null or std.mem.lessThan(u8, entry.name, std.fs.path.basename(pick.?))) {
+            if (pick) |p| allocator.free(p);
+            pick = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ path, entry.name });
         }
     }
+    if (pick) |p| return p;
+    if (saw_mmproj) return error.OnlyMmprojGgufFile;
     return error.NoGgufFile;
+}
+
+/// Emit a user-facing, actionable error message for the failures
+/// `resolveGgufFile` can return. Call from the fatal load path; probes
+/// (e.g. routing-decision helpers) should NOT log and let the eventual
+/// resolveGgufFile re-attempt surface the error once.
+fn logResolveGgufError(path: []const u8, err: anyerror) void {
+    switch (err) {
+        error.OnlyMmprojGgufFile => {
+            // Discriminate between "user pointed at the mmproj file
+            // directly" and "directory had only mmproj sidecars" via the
+            // suffix check we already did in resolveGgufFile.
+            if (std.mem.endsWith(u8, path, ".gguf")) {
+                log.err("'{s}' is an mmproj sidecar (CLIP vision/audio encoder), not an LLM. Point at the language-model .gguf (typically the same directory, e.g. `*-Q4_K_M.gguf`).\n", .{path});
+            } else {
+                log.err("'{s}' contains only mmproj sidecars (multimodal projection / CLIP encoders). Download or move the matching language-model .gguf (e.g. `*-Q4_K_M.gguf`) into this directory.\n", .{path});
+            }
+        },
+        error.NoGgufFile => log.err("'{s}' contains no .gguf files.\n", .{path}),
+        else => log.err("resolveGgufFile('{s}'): {s}\n", .{ path, @errorName(err) }),
+    }
+}
+
+/// True if a `.gguf` path is the DeepSeek-V4-Flash model that the ds4 engine
+/// serves. Everything else routes to the generic llama.cpp engine. The check
+/// is a case-insensitive basename prefix, mirroring the Swift app's
+/// `isSupportedDsv4Gguf` so client and server agree on which GGUFs are ds4.
+/// libllama cannot load the DSV4-Flash architecture, which is why ds4 exists.
+fn isDs4Gguf(io: std.Io, allocator: std.mem.Allocator, path: []const u8) bool {
+    const gguf = resolveGgufFile(io, allocator, path) catch return false;
+    defer allocator.free(gguf);
+    return model_discovery.isDs4GgufBasename(std.fs.path.basename(gguf));
 }
 
 /// Offline single-prompt generation through the embedded ds4 engine.
@@ -775,7 +901,10 @@ fn runDs4Offline(
     max_tokens: u32,
     temp: f32,
 ) !void {
-    const gguf_path = try resolveGgufFile(io, allocator, model_dir);
+    const gguf_path = resolveGgufFile(io, allocator, model_dir) catch |err| {
+        logResolveGgufError(model_dir, err);
+        return err;
+    };
     defer allocator.free(gguf_path);
 
     log.info("[ds4] backend: Metal, model: {s}\n", .{gguf_path});
@@ -862,7 +991,10 @@ fn runDs4Serve(
 ) !void {
     // Resolve the GGUF file once on this thread so the engine's open() call
     // (running on the inference thread) gets an absolute path.
-    const gguf_path_owned = try resolveGgufFile(io, allocator, model_dir);
+    const gguf_path_owned = resolveGgufFile(io, allocator, model_dir) catch |err| {
+        logResolveGgufError(model_dir, err);
+        return err;
+    };
     defer allocator.free(gguf_path_owned);
 
     log.info("mlx-serve {s} (ds4 engine, GGUF backend)\n", .{VERSION});
@@ -1012,11 +1144,274 @@ fn runDs4Serve(
         .kv_quant_config = transformer_mod.KVQuantConfig.dense,
         .prefix_cache_capacity = 0,
         .prefix_cache_mem_bytes = 0,
+        // Iteration 2: tokenize cache for ds4 too.
+        .tokenize_cache_entries = server_mod.tokenize_cache_entries,
         .ds4_path = gguf_path_owned,
     };
 
     try server_mod.serve(io, allocator, params, config_storage, host, port, .{
         .max_context_size = ctx_size,
+        .request_timeout_sec = timeout,
+        .default_reasoning_budget = reasoning_budget,
+        .default_enable_pld = false,
+        .default_pld_draft_len = 5,
+        .default_pld_key_len = 3,
+        .default_kv_attn_fused = false,
+    });
+}
+
+/// Offline single-prompt generation through the embedded llama.cpp engine.
+/// Renders the prompt via the GGUF's built-in chat template (falling back to a
+/// raw tokenize when the template isn't a recognized format) and streams
+/// decoded tokens to stdout. Mirrors `runDs4Offline`.
+fn runLlamaOffline(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    model_dir: []const u8,
+    prompt: []const u8,
+    max_tokens: u32,
+    temp: f32,
+) !void {
+    const gguf_path = resolveGgufFile(io, allocator, model_dir) catch |err| {
+        logResolveGgufError(model_dir, err);
+        return err;
+    };
+    defer allocator.free(gguf_path);
+
+    log.info("[llama] backend: Metal, model: {s}\n", .{gguf_path});
+
+    var engine = llama_arch.LlamaEngine.open(allocator, gguf_path, .{}) catch |err| {
+        log.err("[llama] engine open failed: {s}\n", .{@errorName(err)});
+        return err;
+    };
+    defer engine.close();
+
+    log.info("[llama] engine ready (EOS={d}, n_vocab={d})\n", .{ engine.eosToken(), engine.nVocab() });
+
+    // Render the single user turn through the model's chat template; tokenize the
+    // result with add_special=false (the template owns BOS). Fall back to a raw
+    // add-special tokenize if the GGUF's template isn't recognized.
+    const turns = [_]llama_arch.LlamaEngine.ChatTurn{.{ .role = "user", .content = prompt }};
+    const prompt_ids: []i32 = blk: {
+        if (engine.applyChatTemplate(allocator, &turns, true)) |rendered| {
+            defer allocator.free(rendered);
+            break :blk try engine.tokenizeText(allocator, rendered, false);
+        } else |_| {
+            break :blk try engine.tokenizeText(allocator, prompt, true);
+        }
+    };
+    defer allocator.free(prompt_ids);
+
+    log.info("[llama] prompt: {d} tokens\n", .{prompt_ids.len});
+
+    var sess = try engine.createSession(8192);
+    defer sess.free();
+
+    _ = try sess.sync(prompt_ids); // cold session: cached count is 0, unused here
+
+    var rng: u64 = @intCast(std.Io.Timestamp.now(io, .real).toMilliseconds());
+
+    var stdout_buf: [4096]u8 = undefined;
+    var stdout = std.Io.File.stdout().writer(io, &stdout_buf);
+    const out_w = &stdout.interface;
+    try out_w.writeAll("\n");
+
+    var generated: u32 = 0;
+    while (generated < max_tokens) : (generated += 1) {
+        const next_id: i32 = if (temp < 0.01)
+            sess.argmax()
+        else
+            sess.sample(temp, 0, 1.0, 0.0, &rng);
+
+        if (next_id < 0 or engine.isEog(next_id)) break;
+
+        const piece = try engine.detokenizeOne(allocator, next_id);
+        defer allocator.free(piece);
+        try out_w.writeAll(piece);
+        try out_w.flush();
+
+        try sess.eval(next_id);
+    }
+
+    try out_w.writeAll("\n");
+    try out_w.flush();
+    log.info("[llama] generated {d} tokens (max={d})\n", .{ generated, max_tokens });
+}
+
+/// llama.cpp serve mode. Builds a stub LoadedModel + ModelConfig + ChatConfig
+/// and hands them to `Scheduler.init` via `LoadParams.llama_path` — the
+/// scheduler's inference thread opens the engine on the GPU-stream thread and
+/// adopts the GGUF's embedded chat template into the stub ChatConfig. Mirrors
+/// `runDs4Serve`; all MLX-specific load steps are skipped.
+fn runLlamaServe(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    model_dir: []const u8,
+    host: []const u8,
+    port: u16,
+    ctx_size: u32,
+    timeout: u32,
+    reasoning_budget: i32,
+    max_resident_models: u32,
+    max_resident_mem: u64,
+    max_resident_mem_explicit: bool,
+    idle_evict_secs: ?u32,
+) !void {
+    const gguf_path_owned = resolveGgufFile(io, allocator, model_dir) catch |err| {
+        logResolveGgufError(model_dir, err);
+        return err;
+    };
+    defer allocator.free(gguf_path_owned);
+
+    // Effective context: the user's --ctx-size, else a safe 8192 default (we
+    // can't read the GGUF's trained context until the engine opens on the
+    // inference thread). Used for BOTH the llama session size (via the stub
+    // config's max_position_embeddings, read in runPrefillLlama) AND the
+    // server's context guard (server_config.max_context_size), so they agree.
+    const effective_ctx: u32 = if (ctx_size > 0) ctx_size else 8192;
+
+    log.info("mlx-serve {s} (llama.cpp engine, GGUF backend)\n", .{VERSION});
+    log.info("[args] model: {s}\n", .{gguf_path_owned});
+    log.info("[args] serve: {s}:{d}, ctx-size={d}\n", .{ host, port, effective_ctx });
+
+    // Stub ModelConfig. The llama path bypasses everything that consumes model
+    // architecture (Transformer, KV shapes, SSM, MoE); only model_type (echoed
+    // in /v1/models) and max_position_embeddings (session sizing) matter.
+    const config_storage = try allocator.create(model_mod.ModelConfig);
+    var config_owned_by_registry = false;
+    errdefer if (!config_owned_by_registry) allocator.destroy(config_storage);
+    config_storage.* = model_mod.ModelConfig{
+        .model_type = "gguf",
+        .weight_prefix = "model",
+        .head_dim = 128,
+        .max_position_embeddings = effective_ctx,
+        .is_encoder_only = false,
+    };
+
+    // Stub tokenizer — the llama engine owns the real GGUF vocab; chat handlers
+    // route through chat_mod.{encode,decode}ViaLlama when lm.llama_engine != null,
+    // so this never services encode/decode on the happy path.
+    const tok_storage = try allocator.create(tokenizer_mod.Tokenizer);
+    var tok_owned_by_registry = false;
+    errdefer if (!tok_owned_by_registry) {
+        tok_storage.deinit();
+        allocator.destroy(tok_storage);
+    };
+    var byte_map: [256]u21 = undefined;
+    var b: usize = 0;
+    while (b < 256) : (b += 1) byte_map[b] = @intCast(b);
+    tok_storage.* = .{
+        .vocab = std.StringHashMap(u32).init(allocator),
+        .id_to_token = std.AutoHashMap(u32, []const u8).init(allocator),
+        .merge_ranks = @TypeOf(tok_storage.merge_ranks).init(allocator),
+        .allocator = allocator,
+        .special_tokens = std.StringHashMap(u32).init(allocator),
+        .tok_type = .byte_level_bpe,
+        .byte_to_unicode = byte_map,
+        .unicode_to_byte = std.AutoHashMap(u21, u8).init(allocator),
+        .bos_id = null,
+        .eos_id = null,
+        .parsed_json = null,
+    };
+
+    // Stub chat config — template starts empty and is replaced with the GGUF's
+    // embedded template by doLoadLlamaOnInferenceThread once the engine opens.
+    const chat_config_storage = try allocator.create(chat_mod.ChatConfig);
+    var chat_config_owned_by_registry = false;
+    errdefer if (!chat_config_owned_by_registry) {
+        chat_config_storage.deinit();
+        allocator.destroy(chat_config_storage);
+    };
+    chat_config_storage.* = .{
+        .chat_template = try allocator.dupe(u8, ""),
+        .bos_token = null,
+        .eos_token = null,
+        .add_bos_token = false,
+        .allocator = allocator,
+    };
+
+    const model_id = blk: {
+        var p = gguf_path_owned;
+        while (p.len > 0 and p[p.len - 1] == '/') p = p[0 .. p.len - 1];
+        if (std.mem.lastIndexOfScalar(u8, p, '/')) |slash_idx| {
+            const name = p[slash_idx + 1 ..];
+            break :blk if (std.mem.endsWith(u8, name, ".gguf")) name[0 .. name.len - 5] else name;
+        }
+        break :blk p;
+    };
+
+    const effective_max_resident_mem: u64 = if (max_resident_mem_explicit) max_resident_mem else 0;
+    if (effective_max_resident_mem > 0) {
+        log.info("[registry] max_resident_models={d}, max_resident_mem={d:.1} GB\n", .{
+            max_resident_models,
+            @as(f64, @floatFromInt(effective_max_resident_mem)) / 1_073_741_824.0,
+        });
+    } else {
+        log.info("[registry] max_resident_models={d}, max_resident_mem=unlimited\n", .{max_resident_models});
+    }
+
+    const registry = try model_registry_mod.ModelRegistry.init(
+        allocator,
+        io,
+        null,
+        max_resident_models,
+        effective_max_resident_mem,
+        idle_evict_secs,
+    );
+    defer registry.deinit();
+
+    const gguf_bytes: ?u64 = blk: {
+        const slash = std.mem.lastIndexOfScalar(u8, gguf_path_owned, '/') orelse break :blk null;
+        const parent = gguf_path_owned[0..slash];
+        const name = gguf_path_owned[slash + 1 ..];
+        var dir = std.Io.Dir.openDirAbsolute(io, parent, .{}) catch break :blk null;
+        defer dir.close(io);
+        const st = dir.statFile(io, name, .{}) catch break :blk null;
+        break :blk @as(u64, @intCast(st.size));
+    };
+    const entry = try registry.registerStub(model_id, gguf_path_owned, gguf_bytes);
+    try registry.setDefault(model_id);
+
+    defer if (entry.config != null) {
+        config_owned_by_registry = true;
+        tok_owned_by_registry = true;
+        chat_config_owned_by_registry = true;
+    };
+
+    // Serial for v1 — each llama session owns an independent context (memory
+    // multiplies with concurrency); keep one in flight like the ds4 path.
+    server_mod.max_concurrent = 1;
+
+    const params = scheduler_mod.LoadParams{
+        .registry = registry,
+        .entry = entry,
+        .config = config_storage,
+        .tok = tok_storage,
+        .chat_config = chat_config_storage,
+        .model_dir = gguf_path_owned, // unused on the llama branch but kept symmetric
+        .drafter_dir = "",
+        .load_vision = false,
+        .warmup_eager = false,
+        .draft_block_size = 0,
+        .draft_block_size_explicit = false,
+        .kv_quant_config = transformer_mod.KVQuantConfig.dense,
+        .prefix_cache_capacity = 0,
+        .prefix_cache_mem_bytes = 0,
+        // Iteration 2 + 3-5: thread the tokenize cache + multi-session
+        // LRU through the llama-specific LoadParams. doLoadLlamaOnInferenceThread
+        // reads both fields.
+        .tokenize_cache_entries = server_mod.tokenize_cache_entries,
+        .llama_cache_entries = server_mod.llama_cache_entries,
+        // Phase 5 #2: also thread the llama KV-quant types on this path
+        // (the MLX branch sets them via the shared assignment, which we
+        // don't reach for GGUF models).
+        .llama_kv_type_k = server_mod.llama_kv_quant.ggmlType(),
+        .llama_kv_type_v = server_mod.llama_kv_quant.ggmlType(),
+        .llama_path = gguf_path_owned,
+    };
+
+    try server_mod.serve(io, allocator, params, config_storage, host, port, .{
+        .max_context_size = effective_ctx,
         .request_timeout_sec = timeout,
         .default_reasoning_budget = reasoning_budget,
         .default_enable_pld = false,
@@ -1046,3 +1441,11 @@ fn parseSizeArg(s: []const u8) !u64 {
     const n = std.fmt.parseInt(u64, s[0..end], 10) catch return error.InvalidSize;
     return n * mult;
 }
+
+// Pure-function tests for `isMmprojGgufBasename` live with the
+// implementation in `src/model_discovery.zig` (where they get picked up
+// by `zig build test`); main.zig itself is the executable root and is
+// not in the test pool. The directory-walk behavior of `resolveGgufFile`
+// is covered by integration: pointing the loader at a directory that
+// contains both `mmproj-*.gguf` and the real LLM .gguf now reliably
+// picks the LLM (manually verified after fixing the sidecar-skip).

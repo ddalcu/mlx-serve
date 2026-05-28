@@ -54,6 +54,7 @@ struct MLXCoreApp: App {
             case "imageGen": title = "Image Generation"
             case "videoGen": title = "Video Generation"
             case "settings": title = "Settings"
+            case "serverLog": title = "Server Log"
             default: title = "Browser"
             }
             NSApplication.shared.windows
@@ -70,7 +71,8 @@ struct MLXCoreApp: App {
                 openModelBrowser: { openAndFocus("modelBrowser") },
                 openImageGen: { openAndFocus("imageGen") },
                 openVideoGen: { openAndFocus("videoGen") },
-                openSettings: { openAndFocus("settings") }
+                openSettings: { openAndFocus("settings") },
+                openServerLog: { openAndFocus("serverLog") }
             )
                 .environmentObject(appState)
                 .environmentObject(appState.server)
@@ -133,6 +135,16 @@ struct MLXCoreApp: App {
                 .frame(minWidth: 720, minHeight: 560)
         }
         .defaultSize(width: 820, height: 700)
+
+        // Dedicated terminal-style window for the server's live stderr.
+        // The inline log on the tray popover is still there for a glance;
+        // this is the one you keep open for long sessions where copy/paste
+        // and a roomy scroll-back matter.
+        Window("Server Log", id: "serverLog") {
+            ServerLogWindowView()
+                .environmentObject(appState.server)
+        }
+        .defaultSize(width: 900, height: 560)
         .commands {
             CommandMenu("Agent") {
                 Button("Settings…") { openAndFocus("settings") }

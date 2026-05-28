@@ -44,6 +44,9 @@ echo "  Swift binary: $(du -h "$SWIFT_BIN" | cut -f1)"
 # ── Phase 2: Build mlx-serve (Zig) ──
 echo "→ Building mlx-serve (Zig)..."
 cd "$PROJECT_ROOT"
+# Stage libllama (llama.cpp GGUF engine) before the Zig build links against it.
+echo "→ Fetching libllama..."
+bash "$PROJECT_ROOT/scripts/fetch-llama.sh"
 DEVELOPER_DIR=/Library/Developer/CommandLineTools zig build -Doptimize=ReleaseFast -Dversion="$MLX_SERVE_VERSION" 2>&1 | tail -3
 MLX_BIN="zig-out/bin/mlx-serve"
 if [ ! -f "$MLX_BIN" ]; then
@@ -131,6 +134,10 @@ for wlib in libwebp.dylib libsharpyuv.dylib; do
     [ -f "$WEBP_LIB/$wlib" ] && cp "$WEBP_LIB/$wlib" "$CONTENTS/Frameworks/"
 done
 
+# libllama (llama.cpp GGUF engine) — single self-contained dylib staged by
+# scripts/fetch-llama.sh. Bundled + signed exactly like the others.
+[ -f "$PROJECT_ROOT/lib/llama/lib/libllama.dylib" ] && cp "$PROJECT_ROOT/lib/llama/lib/libllama.dylib" "$CONTENTS/Frameworks/"
+
 # Fix rpaths on mlx-serve binary
 echo "→ Fixing rpaths..."
 install_name_tool -change \
@@ -159,6 +166,14 @@ if [ -f "$CONTENTS/Frameworks/libwebp.dylib" ]; then
         "$(otool -L "$CONTENTS/Frameworks/libwebp.dylib" | grep libsharpyuv | awk '{print $1}')" \
         "@loader_path/libsharpyuv.dylib" \
         "$CONTENTS/Frameworks/libwebp.dylib" 2>/dev/null || true
+fi
+
+# Fix mlx-serve -> libllama dependency (@rpath/libllama.dylib -> bundled Frameworks)
+if [ -f "$CONTENTS/Frameworks/libllama.dylib" ]; then
+    install_name_tool -change \
+        "@rpath/libllama.dylib" \
+        "@executable_path/../Frameworks/libllama.dylib" \
+        "$CONTENTS/MacOS/mlx-serve" 2>/dev/null || true
 fi
 
 rm -rf "$ICON_DIR"

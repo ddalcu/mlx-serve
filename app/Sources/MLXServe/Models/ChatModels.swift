@@ -173,6 +173,43 @@ struct ModelInfo {
     /// Sum of *.safetensors sizes on disk; nil when scan failed or
     /// pre-Phase-E server.
     var bytesOnDisk: UInt64? = nil
+
+    /// Which backend serves this model — derived from `architecture`
+    /// (`model_type` in config.json / the GGUF stub). Drives the engine-
+    /// aware Settings UI so toggles that don't apply (e.g. MLX `--kv-quant`
+    /// on a GGUF target) are hidden instead of silently no-op'ing.
+    var engine: ServerEngine {
+        switch architecture {
+        case "gguf": return .llama
+        case "deepseek_v4": return .dsv4
+        default: return .mlx
+        }
+    }
+}
+
+/// Which embedded engine is serving the active model. The mlx-serve binary
+/// picks this at load time based on the model file/dir layout (`.gguf` →
+/// llama.cpp or ds4; `.safetensors` dir → MLX), so the Swift app reads
+/// `ModelInfo.engine` to decide which knobs are relevant. The Settings UI
+/// uses this to show MLX-only sections (PLD/drafter/KV-quant) only when
+/// they actually do something, and to surface a GGUF-specific section
+/// (--llama-kv-quant / --llama-cache-entries) when llama.cpp is active.
+enum ServerEngine: String, CaseIterable {
+    /// MLX safetensors path (default).
+    case mlx
+    /// Embedded llama.cpp engine (any `.gguf` except DSV4-Flash).
+    case llama
+    /// Embedded ds4 engine (DeepSeek-V4-Flash GGUF).
+    case dsv4
+
+    /// Short human label for the running-model badge / section headings.
+    var label: String {
+        switch self {
+        case .mlx:   return "MLX"
+        case .llama: return "llama.cpp (GGUF)"
+        case .dsv4:  return "ds4 (DSV4-Flash)"
+        }
+    }
 }
 
 struct MemoryInfo {
@@ -188,6 +225,24 @@ struct MemoryInfo {
         if gb >= 1 { return String(format: "%.1f GB", gb) }
         let mb = Double(bytes) / (1024 * 1024)
         return String(format: "%.0f MB", mb)
+    }
+
+    /// Format a `[min, max]` byte range as a single string with a shared unit
+    /// (GB if `max ≥ 1 GB`, else MB). Used by `HFModel.ramEstimate` to surface
+    /// a GGUF repo's smallest-to-largest quant size in one column slot
+    /// (e.g. "1.7–8.5 GB") without blowing past the column's ~80px budget.
+    /// The "–" is U+2013 (en dash) — same glyph as `MemoryInfo.format`'s
+    /// existing strings stay narrow with.
+    static func formatRange(_ minBytes: Int64, _ maxBytes: Int64) -> String {
+        let lo = min(minBytes, maxBytes)
+        let hi = max(minBytes, maxBytes)
+        if lo == hi { return format(lo) }
+        let gbDivisor = Double(1024 * 1024 * 1024)
+        let mbDivisor = Double(1024 * 1024)
+        if Double(hi) / gbDivisor >= 1.0 {
+            return String(format: "%.1f\u{2013}%.1f GB", Double(lo) / gbDivisor, Double(hi) / gbDivisor)
+        }
+        return String(format: "%.0f\u{2013}%.0f MB", Double(lo) / mbDivisor, Double(hi) / mbDivisor)
     }
 }
 

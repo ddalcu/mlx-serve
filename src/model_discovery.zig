@@ -123,6 +123,42 @@ pub const DiscoveryResult = struct {
     }
 };
 
+/// True if a `.gguf` basename is the DeepSeek-V4-Flash model served by the ds4
+/// engine (case-insensitive `deepseek-v4-flash` prefix). Every other GGUF routes
+/// to the generic llama.cpp engine — libllama can't load the DSV4-Flash
+/// architecture, which is why ds4 exists. Mirrors the Swift app's
+/// `isSupportedDsv4Gguf` so client and server agree on which GGUFs are ds4.
+pub fn isDs4GgufBasename(name: []const u8) bool {
+    const prefix = "deepseek-v4-flash";
+    if (name.len < prefix.len) return false;
+    for (prefix, 0..) |c, i| {
+        if (std.ascii.toLower(name[i]) != c) return false;
+    }
+    return true;
+}
+
+/// True if a `.gguf` basename is a multimodal-projection sidecar (CLIP
+/// vision / audio encoder packaged separately so the language model can
+/// reference it at runtime). llama.cpp tooling, ollama, and LM Studio all
+/// use the `mmproj-*` prefix for this; `llama_model_load_from_file` refuses
+/// them with `unsupported model architecture: 'clip'`. Filtering them out
+/// at directory-pick time lets a user point at a model folder (which
+/// commonly ships both the LLM and the mmproj sidecar — Gemma 4 VL, Qwen
+/// 3.6 VL, etc.) and have the right file get loaded.
+///
+/// Match is a case-insensitive `mmproj` prefix + `.gguf` suffix. `mmproj.gguf`
+/// itself matches; `model-mmproj.gguf` (suffix, not prefix) does NOT —
+/// only basenames starting with the prefix are sidecars in the wild.
+pub fn isMmprojGgufBasename(basename: []const u8) bool {
+    if (basename.len < 7 or !std.mem.endsWith(u8, basename, ".gguf")) return false;
+    const prefix = "mmproj";
+    if (basename.len < prefix.len) return false;
+    for (basename[0..prefix.len], prefix) |c, p| {
+        if (std.ascii.toLower(c) != p) return false;
+    }
+    return true;
+}
+
 /// Scan `model_dir` for subdirectories containing `config.json`.
 /// Returns DiscoveryResult; caller owns memory via deinit().
 /// Symlinks followed; permission errors on individual subdirs skipped silently.
@@ -238,4 +274,40 @@ test "lessThanById sorts ascending" {
     try testing.expect(lessThanById({}, a, b));
     try testing.expect(!lessThanById({}, b, a));
     try testing.expect(!lessThanById({}, a, a));
+}
+
+test "isDs4GgufBasename routes DSV4 to ds4 and everything else to llama" {
+    // DeepSeek-V4-Flash → ds4 (case-insensitive).
+    try testing.expect(isDs4GgufBasename("DeepSeek-V4-Flash-Q4_K_M.gguf"));
+    try testing.expect(isDs4GgufBasename("deepseek-v4-flash-bf16.gguf"));
+    // Any other GGUF → llama.cpp engine.
+    try testing.expect(!isDs4GgufBasename("qwen2.5-0.5b-instruct-q4_k_m.gguf"));
+    try testing.expect(!isDs4GgufBasename("Meta-Llama-3.1-8B-Instruct.Q4_K_M.gguf"));
+    try testing.expect(!isDs4GgufBasename("deepseek-v3-chat.gguf")); // V3, not V4-Flash
+    try testing.expect(!isDs4GgufBasename("short.gguf"));
+}
+
+test "isMmprojGgufBasename catches the multimodal-projection sidecars" {
+    // Real mmproj files seen in the wild (Gemma 4 VL, Qwen 3.6 VL, ...).
+    try testing.expect(isMmprojGgufBasename("mmproj-gemma-4-E4B-it-BF16.gguf"));
+    try testing.expect(isMmprojGgufBasename("mmproj-gemma-4-E2B-it-BF16.gguf"));
+    try testing.expect(isMmprojGgufBasename("mmproj-F32.gguf"));
+    try testing.expect(isMmprojGgufBasename("mmproj-Qwen3.6-27B-VL-BF16.gguf"));
+    // Case-insensitive on the prefix only.
+    try testing.expect(isMmprojGgufBasename("MMPROJ-foo.gguf"));
+    try testing.expect(isMmprojGgufBasename("MmProj-bar.gguf"));
+    // Bare prefix.gguf — also a sidecar.
+    try testing.expect(isMmprojGgufBasename("mmproj.gguf"));
+
+    // Real LLM .gguf — must NOT match (this is the regression class:
+    // pre-fix, the directory-picker grabbed the alphabetically-first
+    // file and that file was the mmproj sidecar).
+    try testing.expect(!isMmprojGgufBasename("gemma-4-E4B-it-Q4_K_M.gguf"));
+    try testing.expect(!isMmprojGgufBasename("Qwen3.5-4B-IQ4_NL.gguf"));
+    try testing.expect(!isMmprojGgufBasename("DeepSeek-V4-Flash-Q4_K_M.gguf"));
+    // Not a .gguf → not a sidecar.
+    try testing.expect(!isMmprojGgufBasename("mmproj-readme.md"));
+    try testing.expect(!isMmprojGgufBasename("mmproj"));
+    // Suffix-only — model-mmproj.gguf is NOT the convention.
+    try testing.expect(!isMmprojGgufBasename("model-mmproj.gguf"));
 }

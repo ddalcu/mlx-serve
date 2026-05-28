@@ -116,6 +116,68 @@ final class DownloadManagerLayoutTests: XCTestCase {
         XCTAssertNil(DownloadManager.gemmaVariantFor(modelPath: "/m/qwen3-7b-4bit", isMoE: false))
     }
 
+    // MARK: - GGUF classification & discovery
+
+    func testGgufModelTypeRoutesDsv4ToDs4AndOthersToLlama() {
+        // DeepSeek-V4-Flash → ds4 engine (case-insensitive).
+        XCTAssertEqual(DownloadManager.ggufModelType(forBasename: "DeepSeek-V4-Flash-Q4_K_M.gguf"), "deepseek_v4")
+        XCTAssertEqual(DownloadManager.ggufModelType(forBasename: "deepseek-v4-flash-bf16.gguf"), "deepseek_v4")
+        // Any other GGUF → llama.cpp engine ("gguf").
+        XCTAssertEqual(DownloadManager.ggufModelType(forBasename: "qwen2.5-0.5b-instruct-q4_k_m.gguf"), "gguf")
+        XCTAssertEqual(DownloadManager.ggufModelType(forBasename: "Meta-Llama-3.1-8B-Instruct.Q4_K_M.gguf"), "gguf")
+        // Not a GGUF → nil (won't be surfaced via the GGUF fast-path).
+        XCTAssertNil(DownloadManager.ggufModelType(forBasename: "model.safetensors"))
+        XCTAssertNil(DownloadManager.ggufModelType(forBasename: "config.json"))
+    }
+
+    func testGgufModelTypesAreSupportedArchitectures() {
+        // Both engines' GGUF modelTypes must pass the architecture gate so the
+        // model browser doesn't flag them "Unsupported architecture".
+        for mt in ["gguf", "deepseek_v4"] {
+            let m = LocalModel(
+                id: "test:\(mt)", name: mt, path: "/tmp/x.gguf",
+                sizeFormatted: "1 GB", modelType: mt, source: .custom, kind: .base
+            )
+            XCTAssertTrue(m.isSupportedArchitecture, "\"\(mt)\" must be in supportedModelTypes")
+        }
+    }
+
+    // MARK: - mmproj sidecar filtering
+
+    /// `mmproj-*.gguf` files are CLIP / audio encoders, not language models —
+    /// llama.cpp refuses them with "unsupported model architecture: 'clip'".
+    /// The model-picker must skip them when scanning a vision-enabled folder
+    /// (Gemma 4 VL, Qwen 3.6 VL, etc. ship both files side-by-side).
+    func testIsMmprojGgufMatchesRealSidecars() {
+        // Real mmproj basenames seen across the model zoo.
+        XCTAssertTrue(DownloadManager.isMmprojGguf("mmproj-gemma-4-E4B-it-BF16.gguf"))
+        XCTAssertTrue(DownloadManager.isMmprojGguf("mmproj-gemma-4-E2B-it-BF16.gguf"))
+        XCTAssertTrue(DownloadManager.isMmprojGguf("mmproj-Qwen3.6-27B-VL-BF16.gguf"))
+        XCTAssertTrue(DownloadManager.isMmprojGguf("MMPROJ-foo.gguf"))   // case-insensitive
+        XCTAssertTrue(DownloadManager.isMmprojGguf("mmproj.gguf"))       // bare prefix
+        // Real LLM .gguf files MUST NOT match.
+        XCTAssertFalse(DownloadManager.isMmprojGguf("gemma-4-E4B-it-Q4_K_M.gguf"))
+        XCTAssertFalse(DownloadManager.isMmprojGguf("Qwen3.5-4B-IQ4_NL.gguf"))
+        XCTAssertFalse(DownloadManager.isMmprojGguf("DeepSeek-V4-Flash-Q4_K_M.gguf"))
+        // Suffix-only — "model-mmproj.gguf" is NOT the wild-type convention.
+        XCTAssertFalse(DownloadManager.isMmprojGguf("model-mmproj.gguf"))
+        // Non-.gguf — not a sidecar.
+        XCTAssertFalse(DownloadManager.isMmprojGguf("mmproj-readme.md"))
+        XCTAssertFalse(DownloadManager.isMmprojGguf("mmproj"))
+    }
+
+    func testIsSupportedGgufExcludesMmprojSidecars() {
+        // Real LLM .gguf is supported.
+        XCTAssertTrue(DownloadManager.isSupportedGguf("gemma-4-E4B-it-Q4_K_M.gguf"))
+        XCTAssertTrue(DownloadManager.isSupportedGguf("DeepSeek-V4-Flash-Q4_K_M.gguf"))
+        // mmproj sidecars are NOT — this is the regression that made the model
+        // picker hand the wrong .gguf to the server.
+        XCTAssertFalse(DownloadManager.isSupportedGguf("mmproj-gemma-4-E4B-it-BF16.gguf"))
+        XCTAssertFalse(DownloadManager.isSupportedGguf("mmproj-Qwen3.6-27B-VL-BF16.gguf"))
+        // Non-.gguf: not a GGUF at all.
+        XCTAssertFalse(DownloadManager.isSupportedGguf("config.json"))
+    }
+
     // MARK: - Helpers
 
     /// Minimal model dir layout: just `config.json`. The path-resolution and

@@ -13,7 +13,13 @@ on:
 
 jobs:
   build:
-    runs-on: macos-14
+    # macos-26 (Tahoe) so the Swift app links against the macOS 26 SDK. SwiftUI's
+    # MenuBarExtra(.window) popover only gets the correct Tahoe resize/height
+    # behavior when linked on-or-after the 26 SDK; building on macos-14 produced a
+    # menu-bar tray that wouldn't expand/collapse or retain height on Tahoe.
+    # Deployment target stays macOS 14 (Package.swift + Info.plist), so the app
+    # still runs on macOS 14+ — only the linked SDK changes.
+    runs-on: macos-26
     permissions:
       contents: write
 
@@ -83,6 +89,9 @@ jobs:
           git tag v${{ steps.version.outputs.version }}
           git push origin v${{ steps.version.outputs.version }}
 
+      - name: Fetch libllama (llama.cpp GGUF engine)
+        run: bash scripts/fetch-llama.sh
+
       - name: Build mlx-serve (Zig)
         run: zig build -Doptimize=ReleaseFast -Dversion=${{ steps.version.outputs.version }}
 
@@ -96,13 +105,16 @@ jobs:
 
       - name: Build Swift app
         working-directory: app
+        # Xcode 26 on the macos-26 runner is Swift 6.3; the swift-sdk 0.10.x pin
+        # needs Swift 5 language mode (matches app/build.sh) or its
+        # NetworkTransport.swift fails to compile with [#SendingRisksDataRace].
         run: |
-          swift build -c release
-          echo "SWIFT_BIN_PATH=$(swift build -c release --show-bin-path)" >> "$GITHUB_ENV"
+          swift build -c release -Xswiftc -swift-version -Xswiftc 5
+          echo "SWIFT_BIN_PATH=$(swift build -c release -Xswiftc -swift-version -Xswiftc 5 --show-bin-path)" >> "$GITHUB_ENV"
 
       - name: Run Swift tests
         working-directory: app
-        run: swift test
+        run: swift test -Xswiftc -swift-version -Xswiftc 5
 
       # ── CLI tarball (standalone binary + libs) ──
       - name: Package CLI binary
@@ -125,10 +137,19 @@ jobs:
           [ -f "$WEBP_LIB/libwebp.dylib" ] && cp "$WEBP_LIB/libwebp.dylib" "$STAGING/lib/"
           [ -f "$WEBP_LIB/libsharpyuv.dylib" ] && cp "$WEBP_LIB/libsharpyuv.dylib" "$STAGING/lib/"
 
+          # libllama (llama.cpp GGUF engine) — single self-contained dylib staged
+          # by scripts/fetch-llama.sh, install-name @rpath/libllama.dylib.
+          [ -f "lib/llama/lib/libllama.dylib" ] && cp "lib/llama/lib/libllama.dylib" "$STAGING/lib/"
+
           install_name_tool -change \
             /opt/homebrew/opt/mlx-c/lib/libmlxc.dylib \
             @executable_path/lib/libmlxc.dylib \
             "$STAGING/mlx-serve"
+
+          install_name_tool -change \
+            @rpath/libllama.dylib \
+            @executable_path/lib/libllama.dylib \
+            "$STAGING/mlx-serve" 2>/dev/null || true
 
           install_name_tool -change \
             /opt/homebrew/opt/mlx/lib/libmlx.dylib \
@@ -209,10 +230,19 @@ jobs:
           [ -f "$WEBP_LIB/libwebp.dylib" ] && cp "$WEBP_LIB/libwebp.dylib" "$CONTENTS/Frameworks/"
           [ -f "$WEBP_LIB/libsharpyuv.dylib" ] && cp "$WEBP_LIB/libsharpyuv.dylib" "$CONTENTS/Frameworks/"
 
+          # libllama (llama.cpp GGUF engine) — single self-contained dylib staged
+          # by scripts/fetch-llama.sh, install-name @rpath/libllama.dylib.
+          [ -f "lib/llama/lib/libllama.dylib" ] && cp "lib/llama/lib/libllama.dylib" "$CONTENTS/Frameworks/"
+
           # Fix rpaths
           install_name_tool -change \
             "$(otool -L "$CONTENTS/MacOS/mlx-serve" | grep libmlxc | awk '{print $1}')" \
             "@executable_path/../Frameworks/libmlxc.dylib" \
+            "$CONTENTS/MacOS/mlx-serve" 2>/dev/null || true
+
+          install_name_tool -change \
+            @rpath/libllama.dylib \
+            "@executable_path/../Frameworks/libllama.dylib" \
             "$CONTENTS/MacOS/mlx-serve" 2>/dev/null || true
 
           install_name_tool -change \

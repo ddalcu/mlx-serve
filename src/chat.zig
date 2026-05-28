@@ -5,6 +5,7 @@ const jinja_c = @cImport({
 const tokenizer_mod = @import("tokenizer.zig");
 const arch_ds4 = @import("arch/ds4.zig");
 const ds4_ffi = @import("ds4_ffi.zig");
+const arch_llama = @import("arch/llama.zig");
 const log = @import("log.zig");
 
 const Tokenizer = tokenizer_mod.Tokenizer;
@@ -242,6 +243,59 @@ pub fn encodeChatViaDs4(
 pub fn decodeViaDs4(
     allocator: std.mem.Allocator,
     engine: *arch_ds4.Ds4Engine,
+    ids: []const u32,
+) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    for (ids) |id| {
+        const piece = try engine.detokenizeOne(allocator, @intCast(id));
+        defer allocator.free(piece);
+        try out.appendSlice(allocator, piece);
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+/// Render + encode chat messages for a llama.cpp-backed (GGUF) model.
+///
+/// Unlike ds4 (which has its own template renderer), we reuse mlx-serve's Jinja
+/// engine via `renderChatTemplate` — `chat_config.chat_template` is populated
+/// from the GGUF's embedded template at load time (see
+/// `Scheduler.doLoadLlamaOnInferenceThread`). That path already handles the
+/// tool-synthesis fallback for templates that don't model `tools` natively, so
+/// tool calling works across the GGUF zoo. The rendered prompt is then tokenized
+/// through libllama's own vocab with `add_special = false` (the template owns
+/// any BOS) and `parse_special = true` (so `<|im_start|>` etc. become real
+/// special tokens).
+pub fn encodeChatViaLlama(
+    allocator: std.mem.Allocator,
+    engine: *arch_llama.LlamaEngine,
+    chat_config: *const ChatConfig,
+    messages: []const Message,
+    tools_json: ?[]const u8,
+    tool_choice_instruction: ?[]const u8,
+    enable_thinking: bool,
+) ![]u32 {
+    const rendered = try renderChatTemplate(allocator, messages, chat_config, tools_json, tool_choice_instruction, enable_thinking);
+    defer allocator.free(rendered);
+
+    const i32_ids = try engine.tokenizeText(allocator, rendered, false);
+    defer allocator.free(i32_ids);
+
+    const u32_ids = try allocator.alloc(u32, i32_ids.len);
+    for (i32_ids, 0..) |t, i| u32_ids[i] = @intCast(t);
+    log.debug("  prompt (llama): {d} messages -> {d} tokens (tools={s})\n", .{
+        messages.len,
+        u32_ids.len,
+        if (tools_json != null) "yes" else "no",
+    });
+    return u32_ids;
+}
+
+/// Detokenize a sequence of token IDs via the llama.cpp engine. Mirrors
+/// `decodeViaDs4` so server handlers switch on the LoadedModel uniformly.
+pub fn decodeViaLlama(
+    allocator: std.mem.Allocator,
+    engine: *arch_llama.LlamaEngine,
     ids: []const u32,
 ) ![]u8 {
     var out = std.ArrayList(u8).empty;
@@ -1081,7 +1135,12 @@ pub fn parseToolCalls(allocator: std.mem.Allocator, text: []const u8) !?[]Parsed
         //     proper JSON close. Find the first balanced JSON object via
         //     depth tracking and use just that.
         const unwrapped = stripParametersWrapper(content);
-        const balanced: []const u8 = balancedJsonObject(unwrapped) orelse unwrapped;
+        // Some models (often when echoing a Jinja `{{ }}` example) wrap the args
+        // object in an extra brace layer: `<tool_call>{{"name":…}}</tool_call>`.
+        // Strip one layer so the body parses as JSON. Only fires on the `{{…}}`
+        // shape (which otherwise fails to parse), so valid single-brace bodies are
+        // untouched. Mirrors the unwrap in `parseGemma4ToolCall`.
+        const balanced: []const u8 = unwrapDoubleBraces(balancedJsonObject(unwrapped) orelse unwrapped);
 
         // Try to extract a tool call from the body. Three shapes, tried in
         // priority order:
@@ -1477,6 +1536,17 @@ fn repairFlatBraceToolCallJson(allocator: std.mem.Allocator, text: []const u8) ?
     return std.fmt.allocPrint(allocator, "{s}\"arguments\":{s}", .{ trimmed[0..p], trimmed[p..] }) catch null;
 }
 
+/// Strip one layer of outer braces from a `{{…}}`-wrapped JSON object. Models
+/// sometimes emit args with a doubled brace layer (a literal-brace artifact from
+/// Jinja `{{ }}` templates). Only touches strings that start with `{{` and end
+/// with `}}`, so well-formed single-brace JSON passes through unchanged.
+fn unwrapDoubleBraces(s: []const u8) []const u8 {
+    if (s.len >= 4 and std.mem.startsWith(u8, s, "{{") and std.mem.endsWith(u8, s, "}}")) {
+        return s[1 .. s.len - 1];
+    }
+    return s;
+}
+
 /// Parse Gemma 4 tool call format: "call:function_name{json_args}"
 fn parseGemma4ToolCall(allocator: std.mem.Allocator, content: []const u8) ?ParsedToolCall {
     const prefix = "call:";
@@ -1492,9 +1562,7 @@ fn parseGemma4ToolCall(allocator: std.mem.Allocator, content: []const u8) ?Parse
 
     // Gemma 4 uses {{ }} (double braces) for literal braces in Jinja templates.
     // The model often generates {{"key":"value"}} — unwrap the outer braces.
-    if (args_str.len >= 4 and std.mem.startsWith(u8, args_str, "{{") and std.mem.endsWith(u8, args_str, "}}")) {
-        args_str = args_str[1 .. args_str.len - 1]; // strip one layer of braces
-    }
+    args_str = unwrapDoubleBraces(args_str);
 
     // Try JSON first (model sometimes outputs valid JSON arguments)
     if (std.json.parseFromSlice(std.json.Value, allocator, args_str, .{})) |parsed| {
@@ -2069,6 +2137,31 @@ test "parseToolCalls DSV4 attribute + mismatched close combined" {
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
     defer parsed.deinit();
     try testing.expectEqualStrings("ls /tmp", parsed.value.object.get("command").?.string);
+}
+
+test "parseToolCalls Hermes double-brace body: <tool_call>{{json}}</tool_call>" {
+    // Some models (seen on small GGUF instruct models echoing a Jinja `{{ }}`
+    // example) wrap the args object in an extra brace layer. The body must still
+    // parse into a tool call rather than leaking through as raw content.
+    const allocator = testing.allocator;
+    const text =
+        \\<tool_call>
+        \\{{"name": "get_weather", "arguments": {"city": "Paris"}}}
+        \\</tool_call>
+    ;
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("get_weather", calls[0].name);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("Paris", parsed.value.object.get("city").?.string);
 }
 
 test "parseToolCalls DSV4 attribute single-quoted: <tool_call name='X'>" {

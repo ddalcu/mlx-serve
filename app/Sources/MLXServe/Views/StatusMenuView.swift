@@ -1,4 +1,6 @@
 import SwiftUI
+import AppKit
+import UniformTypeIdentifiers
 
 /// Claude logo icon from the official Claude AI symbol SVG.
 struct ClaudeIcon: View {
@@ -102,6 +104,7 @@ struct StatusMenuView: View {
     let openImageGen: () -> Void
     let openVideoGen: () -> Void
     let openSettings: () -> Void
+    let openServerLog: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -183,19 +186,26 @@ struct StatusMenuView: View {
                     }
 
                     HStack(spacing: 6) {
+                        let control = ServerControlButtonPresentation(status: server.status)
                         Button {
                             server.toggle(modelPath: appState.selectedModelPath, options: appState.serverOptions)
                         } label: {
-                            HStack {
-                                Image(systemName: server.status == .running || server.status == .starting ? "stop.fill" : "play.fill")
-                                Text(server.status == .running || server.status == .starting ? "Stop Server" : "Start Server")
+                            HStack(spacing: 8) {
+                                if control.showsProgress {
+                                    ProgressView()
+                                        .controlSize(.small)
+                                } else if let systemImageName = control.systemImageName {
+                                    Image(systemName: systemImageName)
+                                }
+                                Text(control.title)
                             }
                             .frame(maxWidth: .infinity)
                         }
                         .buttonStyle(.borderedProminent)
-                        .tint(server.status == .running ? .red : .accentColor)
+                        .tint(control.tint.color)
                         .disabled(appState.selectedModelPath.isEmpty)
                         .controlSize(.regular)
+                        .help(control.help)
 
                         Button {
                             showLog.toggle()
@@ -204,7 +214,16 @@ struct StatusMenuView: View {
                         }
                         .buttonStyle(.bordered)
                         .controlSize(.regular)
-                        .help("Server Log")
+                        .help("Toggle inline Server Log")
+
+                        Button {
+                            openServerLog()
+                        } label: {
+                            Image(systemName: "macwindow.on.rectangle")
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.regular)
+                        .help("Open Server Log in a separate window (easier copy/paste)")
                     }
 
                     Toggle("Auto-start on launch", isOn: $appState.autoStartServer)
@@ -214,7 +233,12 @@ struct StatusMenuView: View {
                         .controlSize(.mini)
 
                     if showLog {
-                        ServerLogView(log: server.serverLog)
+                        // Each `ServerLogView` instance owns a tiny poller —
+                        // toggling the inline log on starts a 2 Hz pull;
+                        // toggling off stops it. No `@Published` on the
+                        // server means the menu popover header doesn't
+                        // re-render every time stderr ticks.
+                        ServerLogView(server: server)
                     }
 
                     // Show error details
@@ -316,7 +340,7 @@ struct StatusMenuView: View {
                     } label: {
                         HStack(spacing: 4) {
                             Image(systemName: "magnifyingglass")
-                            Text("Browse All MLX Models")
+                            Text("Browse More Models")
                         }
                         .frame(maxWidth: .infinity)
                     }
@@ -412,6 +436,13 @@ struct StatusMenuView: View {
             .padding(.bottom, 14)
         }
         .frame(width: 320)
+        // Drive ServerManager's /props live-polling from the popover's
+        // visibility: poll on open, idle on close. SwiftUI's MenuBarExtra
+        // (.window style) fires onAppear when the popover shows and
+        // onDisappear when it dismisses — perfect hook for "user is or isn't
+        // looking at the GPU-memory bar".
+        .onAppear { server.setMenuVisible(true) }
+        .onDisappear { server.setMenuVisible(false) }
     }
 
     /// Append a "+ assist" suffix to every model row that *could* use the
@@ -426,6 +457,51 @@ struct StatusMenuView: View {
             return model.name
         }
         return "\(model.name) + assist"
+    }
+}
+
+struct ServerControlButtonPresentation: Equatable {
+    enum Tint: Equatable {
+        case accent
+        case loading
+        case red
+
+        var color: Color {
+            switch self {
+            case .accent: .accentColor
+            case .loading: Color(red: 0.78, green: 0.32, blue: 0.0)
+            case .red: .red
+            }
+        }
+    }
+
+    let title: String
+    let systemImageName: String?
+    let showsProgress: Bool
+    let tint: Tint
+    let help: String
+
+    init(status: ServerStatus) {
+        switch status {
+        case .starting:
+            title = "Loading Model..."
+            systemImageName = nil
+            showsProgress = true
+            tint = .loading
+            help = "Loading model. Click to stop."
+        case .running:
+            title = "Stop Server"
+            systemImageName = "stop.fill"
+            showsProgress = false
+            tint = .red
+            help = "Stop the running server."
+        case .stopped, .error:
+            title = "Start Server"
+            systemImageName = "play.fill"
+            showsProgress = false
+            tint = .accent
+            help = "Start the selected model."
+        }
     }
 }
 
@@ -564,7 +640,17 @@ func launchClaudeCode(baseURL: String, workingDirectory: String? = nil) {
 }
 
 struct ServerLogView: View {
-    let log: String
+    let server: ServerManager
+    @StateObject private var poller: LogPoller
+
+    init(server: ServerManager) {
+        self.server = server
+        // 2 Hz is a good default for the inline peek: smooth-enough that
+        // it doesn't look frozen, cheap enough to not compete with chat.
+        _poller = StateObject(wrappedValue: LogPoller(interval: 0.5) {
+            [weak server] in server?.currentServerLogSnapshot() ?? ""
+        })
+    }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
@@ -574,8 +660,10 @@ struct ServerLogView: View {
                     .foregroundStyle(.secondary)
                 Spacer()
                 Button {
+                    // Always read the live buffer for copy — the poller
+                    // mirror can be up to one interval (~500 ms) stale.
                     NSPasteboard.general.clearContents()
-                    NSPasteboard.general.setString(log, forType: .string)
+                    NSPasteboard.general.setString(server.currentServerLogSnapshot(), forType: .string)
                 } label: {
                     Image(systemName: "doc.on.doc")
                         .font(.caption2)
@@ -586,9 +674,9 @@ struct ServerLogView: View {
             }
 
             ScrollView {
-                Text(log.isEmpty ? "(no output yet)" : log)
+                Text(poller.text.isEmpty ? "(no output yet)" : poller.text)
                     .font(.system(size: 10, design: .monospaced))
-                    .foregroundStyle(log.isEmpty ? .tertiary : .primary)
+                    .foregroundStyle(poller.text.isEmpty ? .tertiary : .primary)
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .textSelection(.enabled)
             }
@@ -596,6 +684,267 @@ struct ServerLogView: View {
             .background(.black.opacity(0.3))
             .clipShape(RoundedRectangle(cornerRadius: 6))
         }
+        .onAppear { poller.start() }
+        .onDisappear { poller.stop() }
+    }
+}
+
+/// Full-window terminal-style view of the live server stderr buffer.
+///
+/// Crucially, the view *pulls* — it owns a `LogPoller` that ticks at 2 Hz
+/// while the window is open and reads `server.currentServerLogSnapshot()`.
+/// `ServerManager` itself does NOT publish the log (see the `logBuffer`
+/// comment there). Result: stderr volume can't slow ChatView's SSE token
+/// loop — those views never re-render due to log activity, regardless of
+/// whether this window is open.
+///
+/// Auto-scroll defaults on; the toggle pins to the user's last interaction
+/// so selecting a region above doesn't get yanked away by new output.
+struct ServerLogWindowView: View {
+    @EnvironmentObject var server: ServerManager
+    @State private var autoScroll = true
+    @State private var copied = false
+    @StateObject private var poller: LogPoller
+
+    init() {
+        // Closure captures nothing at init — it'll be rebound to `server`
+        // on first appear via the environment-object lookup pattern below.
+        // We can't reach `@EnvironmentObject` in init(), so the poller
+        // starts with a placeholder snapshot that returns "" until
+        // `.onAppear` rebinds it through `start(server:)`.
+        _poller = StateObject(wrappedValue: LogPoller(interval: 0.5) { "" })
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            toolbar
+            Divider()
+            logBody
+        }
+        .frame(minWidth: 600, minHeight: 360)
+        .onAppear { startPolling() }
+        .onDisappear { poller.stop() }
+    }
+
+    /// Bind the poller's snapshot closure to the environment server, then
+    /// start ticking. Has to happen on appear because @StateObject's init
+    /// runs before SwiftUI injects the environment object.
+    private func startPolling() {
+        poller.bind { [weak server] in
+            server?.currentServerLogSnapshot() ?? ""
+        }
+        poller.start()
+    }
+
+    private var toolbar: some View {
+        HStack(spacing: 10) {
+            StatusDot(status: server.status)
+            Text(statusLabel)
+                .font(.caption.weight(.medium))
+                .foregroundStyle(.secondary)
+            Text("·")
+                .foregroundStyle(.tertiary)
+            // Byte counter from the poller mirror — same data the body
+            // shows, so the number matches what's on screen rather than
+            // racing with the live buffer.
+            Text("\(poller.text.count) bytes")
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.secondary)
+
+            Spacer()
+
+            Toggle(isOn: $autoScroll) {
+                Label("Auto-scroll", systemImage: "arrow.down.to.line")
+            }
+            .toggleStyle(.button)
+            .controlSize(.small)
+            .help(autoScroll
+                  ? "Auto-scroll is ON — new lines pin the view to the bottom"
+                  : "Auto-scroll is OFF — the view stays where you left it")
+
+            Button {
+                copyLog()
+            } label: {
+                Label(copied ? "Copied" : "Copy",
+                      systemImage: copied ? "checkmark" : "doc.on.doc")
+            }
+            .controlSize(.small)
+            .help("Copy the entire log to the clipboard")
+
+            Button {
+                saveLog()
+            } label: {
+                Label("Save…", systemImage: "square.and.arrow.down")
+            }
+            .controlSize(.small)
+            .help("Save the log to a .log file")
+
+            Button(role: .destructive) {
+                server.clearServerLog()
+            } label: {
+                Label("Clear", systemImage: "trash")
+            }
+            .controlSize(.small)
+            .help("Clear the in-memory log buffer (does not affect the running server)")
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(.bar)
+    }
+
+    private var logBody: some View {
+        ZStack {
+            // NSTextView, not SwiftUI Text — incremental textStorage.append
+            // for new bytes (a few ms regardless of buffer size), preserves
+            // user selection, native scroll. Driven by the poller's mirror;
+            // updates at the poller's rate (~2 Hz) not at stderr arrival
+            // rate.
+            TerminalLogTextView(text: poller.text, autoScroll: autoScroll)
+
+            // Empty-state placeholder. Pure poller.text check — re-renders
+            // only when the log transitions to/from empty.
+            if poller.text.isEmpty {
+                Text("(server has produced no output yet)")
+                    .font(.system(size: 12, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                    .padding(12)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity,
+                           alignment: .topLeading)
+                    .allowsHitTesting(false)
+            }
+        }
+        .background(Color.black)
+    }
+
+    private var statusLabel: String {
+        switch server.status {
+        case .running:  return "Running"
+        case .starting: return "Starting…"
+        case .stopped:  return "Stopped"
+        case .error:    return "Error"
+        }
+    }
+
+    private func copyLog() {
+        // Pull from the live raw buffer so a copy taken right after a fresh
+        // log line is never up-to-100-ms-stale relative to the displayed text.
+        NSPasteboard.general.clearContents()
+        NSPasteboard.general.setString(server.currentServerLogSnapshot(), forType: .string)
+        copied = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) {
+            copied = false
+        }
+    }
+
+    private func saveLog() {
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [.plainText]
+        panel.canCreateDirectories = true
+        // ISO timestamp with `:` replaced — POSIX-safe filename on macOS.
+        let stamp = ISO8601DateFormatter().string(from: Date())
+            .replacingOccurrences(of: ":", with: "-")
+        panel.nameFieldStringValue = "mlx-serve-\(stamp).log"
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        try? server.currentServerLogSnapshot()
+            .write(to: url, atomically: true, encoding: .utf8)
+    }
+}
+
+/// AppKit-backed terminal-style log view. Wraps `NSTextView` in an
+/// `NSScrollView` and exposes a SwiftUI-friendly `text` + `autoScroll`
+/// surface.
+///
+/// Why not SwiftUI `Text` in a `ScrollView`? Because SwiftUI `Text`
+/// re-lays-out its entire string on every `@Published` change. At 10 Hz
+/// with a 64 KB monospace block that's enough main-thread work to starve
+/// ChatView's SSE loop when this window is open. `NSTextView` does
+/// incremental `textStorage.append` for the common case (new bytes at the
+/// end of an existing prefix) — a few ms regardless of buffer size — and
+/// only falls back to a full replacement when the in-memory buffer is
+/// trimmed from the head (i.e. the 64 KB cap kicks in).
+struct TerminalLogTextView: NSViewRepresentable {
+    let text: String
+    let autoScroll: Bool
+
+    private static let textFont = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+    private static let textColor = NSColor(red: 0.86, green: 0.95, blue: 0.88, alpha: 1.0)
+    private static let bg = NSColor.black
+
+    func makeCoordinator() -> Coordinator { Coordinator() }
+
+    /// Carries cross-update state SwiftUI itself doesn't preserve — used
+    /// here to detect the autoScroll toggle so flipping it back on
+    /// scrolls to bottom even if `text` hasn't changed since.
+    final class Coordinator {
+        var lastAutoScroll: Bool = true
+    }
+
+    func makeNSView(context: Context) -> NSScrollView {
+        let scroll = NSTextView.scrollableTextView()
+        scroll.borderType = .noBorder
+        scroll.hasVerticalScroller = true
+        scroll.hasHorizontalScroller = false
+        scroll.drawsBackground = true
+        scroll.backgroundColor = Self.bg
+
+        guard let textView = scroll.documentView as? NSTextView else { return scroll }
+        textView.isEditable = false
+        textView.isSelectable = true
+        textView.isRichText = false
+        textView.allowsUndo = false
+        textView.usesFindBar = true
+        textView.font = Self.textFont
+        textView.textColor = Self.textColor
+        textView.backgroundColor = Self.bg
+        textView.drawsBackground = true
+        textView.textContainerInset = NSSize(width: 8, height: 8)
+        // Wrap lines to the visible width instead of horizontal-scrolling.
+        textView.isHorizontallyResizable = false
+        textView.autoresizingMask = [.width]
+        textView.textContainer?.widthTracksTextView = true
+        textView.textContainer?.containerSize = NSSize(
+            width: scroll.contentSize.width,
+            height: .greatestFiniteMagnitude
+        )
+        return scroll
+    }
+
+    func updateNSView(_ scroll: NSScrollView, context: Context) {
+        guard let textView = scroll.documentView as? NSTextView,
+              let storage = textView.textStorage else { return }
+
+        let attrs: [NSAttributedString.Key: Any] = [
+            .font: Self.textFont,
+            .foregroundColor: Self.textColor,
+        ]
+
+        let current = storage.string
+        let textChanged = (text != current)
+        if textChanged {
+            if !current.isEmpty && text.hasPrefix(current) {
+                // Cheap incremental append — preserves user selection and
+                // scroll position. This is the hot path while the server
+                // streams stderr below the 64 KB cap.
+                let suffix = String(text.dropFirst(current.count))
+                storage.append(NSAttributedString(string: suffix, attributes: attrs))
+            } else {
+                // Buffer was trimmed from the head (cap kicked in) or
+                // cleared via `clearServerLog()`. Full replacement is
+                // unavoidable; selection is lost but the user explicitly
+                // accepted that by streaming past the cap.
+                storage.beginEditing()
+                storage.setAttributedString(NSAttributedString(string: text, attributes: attrs))
+                storage.endEditing()
+            }
+        }
+
+        // Auto-scroll: every text change while on, plus the off→on toggle
+        // (so flipping the switch back to ON catches up immediately).
+        let toggledOn = autoScroll && !context.coordinator.lastAutoScroll
+        if autoScroll && (textChanged || toggledOn) {
+            textView.scrollToEndOfDocument(nil)
+        }
+        context.coordinator.lastAutoScroll = autoScroll
     }
 }
 

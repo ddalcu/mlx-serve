@@ -33,7 +33,7 @@ struct ModelBrowserView: View {
                         TextField("Filter local models...", text: $localFilter)
                             .textFieldStyle(.plain)
                     } else {
-                        TextField("Search MLX models...", text: $searchService.searchQuery)
+                        TextField("Search models...", text: $searchService.searchQuery)
                             .textFieldStyle(.plain)
                             .onSubmit { Task { await searchService.search() } }
                     }
@@ -43,6 +43,20 @@ struct ModelBrowserView: View {
                 .cornerRadius(8)
 
                 if !showDownloadedOnly {
+                    // Weight-format filter: MLX (safetensors), GGUF (llama.cpp /
+                    // ds4), or Both. Re-runs the search on change.
+                    Picker("Format", selection: $searchService.format) {
+                        ForEach(ModelFormat.allCases) { f in
+                            Text(f.label).tag(f)
+                        }
+                    }
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .fixedSize()
+                    .onChange(of: searchService.format) { _, _ in
+                        Task { await searchService.search() }
+                    }
+
                     Button("Search") {
                         Task { await searchService.search() }
                     }
@@ -210,16 +224,30 @@ private struct ColumnHeaderRow: View {
                 .frame(width: 54, alignment: .leading)
             SortableHeader("Size", field: nil, searchService: searchService)
                 .frame(width: 54, alignment: .trailing)
+            // Downloads column: 88 wide so "Downloads" + the sort chevron
+            // fit on one line. Was 72, which forced "Down-loads" wrapping
+            // (visible in the screenshot bug report).
             SortableHeader("Downloads", field: .downloads, searchService: searchService)
-                .frame(width: 72, alignment: .trailing)
+                .frame(width: 88, alignment: .trailing)
             SortableHeader("Likes", field: .likes, searchService: searchService)
                 .frame(width: 50, alignment: .trailing)
+            // RAM Est. column: 120 wide so GGUF range strings produced by
+            // `MemoryInfo.formatRange` ("11.1–30.9 GB", "21.2–55.4 GB",
+            // up to "999.9–999.9 GB") render on a single line. Single-value
+            // strings ("767 MB", "10.2 GB") were comfortable at 80; the
+            // wider budget is what GGUF's min–max range needs. Keep the
+            // ModelBrowserRow's RAM cell at the same width or alignment
+            // drifts across rows.
             SortableHeader("RAM Est.", field: .estimatedSize, searchService: searchService)
-                .frame(width: 80, alignment: .trailing)
+                .frame(width: 120, alignment: .trailing)
             SortableHeader("Updated", field: .lastModified, searchService: searchService)
                 .frame(width: 64, alignment: .trailing)
+            // Action column: 92 wide so the Download button + menu chevron
+            // render without truncation (was 64). The cell content is
+            // either a "Download ▾" menu, a trash icon, a Resume/Retry
+            // button, or a progress bar — 92 fits the widest.
             Text("")
-                .frame(width: 64)
+                .frame(width: 92)
         }
         .font(.callout.weight(.semibold))
         .foregroundStyle(.secondary)
@@ -278,14 +306,15 @@ private struct ModelBrowserRow: View {
 
     /// For Gemma 4 dense/MoE base rows, the variant whose drafter pairs with
     /// this checkpoint — drives the inline "+drafter" / "✓ paired" chip. nil
-    /// for non-Gemma-4 rows (most everything).
+    /// for non-Gemma-4 rows (most everything) and for GGUF repos (the
+    /// drafter is an MLX-only kernel). The rule lives in
+    /// `DownloadManager.drafterPairingVariant` so it's unit-testable.
     private var pairableVariant: GemmaVariant? {
-        guard !model.isDrafter else { return nil }
-        let lower = model.id.lowercased()
-        guard lower.contains("gemma-4") else { return nil }
-        // Note: HFModel doesn't tell us isMoE directly, but the size token
-        // does — 26b-a4b is the only MoE today.
-        return DownloadManager.gemmaVariantFor(modelPath: lower, isMoE: lower.contains("26b-a4b"))
+        DownloadManager.drafterPairingVariant(
+            repoId: model.id,
+            isDrafter: model.isDrafter,
+            isGgufRepo: model.isGgufRepo
+        )
     }
 
     var body: some View {
@@ -349,25 +378,31 @@ private struct ModelBrowserRow: View {
                 .font(.callout.monospacedDigit())
                 .frame(width: 54, alignment: .trailing)
 
-            // Downloads
+            // Downloads — width matched to ColumnHeaderRow (88) so the
+            // "Downloads" header doesn't have to wrap.
             Text(formatCount(model.downloads ?? 0))
                 .font(.callout.monospacedDigit())
-                .frame(width: 72, alignment: .trailing)
+                .frame(width: 88, alignment: .trailing)
 
             // Likes
             Text(formatCount(model.likes ?? 0))
                 .font(.callout.monospacedDigit())
                 .frame(width: 50, alignment: .trailing)
 
-            // RAM estimate with color indicator
+            // RAM estimate with color indicator — width matches
+            // ColumnHeaderRow (120) so GGUF range strings like
+            // "21.2–55.4 GB" stay on one line. `.lineLimit(1)` is the
+            // belt-and-suspenders guard against any future format that
+            // exceeds the budget — we'd rather truncate than wrap.
             HStack(spacing: 4) {
                 Circle()
                     .fill(fitnessColor)
                     .frame(width: 8, height: 8)
                 Text(model.ramEstimate)
                     .font(.callout.monospacedDigit())
+                    .lineLimit(1)
             }
-            .frame(width: 80, alignment: .trailing)
+            .frame(width: 120, alignment: .trailing)
 
             // Last updated
             Text(formatRelativeDate(model.lastModifiedDate))
@@ -375,9 +410,11 @@ private struct ModelBrowserRow: View {
                 .foregroundStyle(.secondary)
                 .frame(width: 64, alignment: .trailing)
 
-            // Download button
+            // Download button — width matched to ColumnHeaderRow (92) so
+            // the "Download ▾" GGUF menu, "Resume"/"Retry" buttons, and
+            // the trash icon all render without truncation.
             downloadButton
-                .frame(width: 64, alignment: .center)
+                .frame(width: 92, alignment: .center)
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
@@ -448,23 +485,72 @@ private struct ModelBrowserRow: View {
                 Text("Delete \(model.modelName)? This will remove all downloaded files.")
             }
         } else if let state, state.status == .failed {
-            Button(downloads.hasPartialDownload(model.id) ? "Resume" : "Retry") {
-                Task {
-                    await downloads.download(repoId: model.id)
-                    appState.refreshModels()
+            if model.isGgufRepo {
+                GgufDownloadMenu(repoId: model.id, label: "Retry")
+            } else {
+                Button(downloads.hasPartialDownload(model.id) ? "Resume" : "Retry") {
+                    Task {
+                        await downloads.download(repoId: model.id)
+                        appState.refreshModels()
+                    }
                 }
+                .font(.callout)
+                .controlSize(.small)
             }
-            .font(.callout)
-            .controlSize(.small)
         } else {
-            Button(downloads.hasPartialDownload(model.id) ? "Resume" : "Download") {
-                Task {
-                    await downloads.download(repoId: model.id)
-                    appState.refreshModels()
+            if model.isGgufRepo {
+                // GGUF repos ship many quants — pick one from a menu.
+                GgufDownloadMenu(repoId: model.id, label: "Download")
+            } else {
+                Button(downloads.hasPartialDownload(model.id) ? "Resume" : "Download") {
+                    Task {
+                        await downloads.download(repoId: model.id)
+                        appState.refreshModels()
+                    }
+                }
+                .font(.callout)
+                .controlSize(.small)
+            }
+        }
+    }
+}
+
+/// Download button for a GGUF repo: a menu of the repo's quant files. The list
+/// is fetched lazily from the HF tree API the first time the menu is shown.
+private struct GgufDownloadMenu: View {
+    let repoId: String
+    let label: String
+    @EnvironmentObject var downloads: DownloadManager
+    @EnvironmentObject var appState: AppState
+    @State private var quants: [String] = []
+    @State private var loaded = false
+
+    var body: some View {
+        Menu {
+            if !loaded {
+                Text("Loading quants…")
+            } else if quants.isEmpty {
+                Text("No GGUF files found")
+            } else {
+                ForEach(quants, id: \.self) { file in
+                    Button(DownloadManager.quantLabel(forFilename: file)) {
+                        Task {
+                            await downloads.downloadGguf(repoId: repoId, ggufFilename: file)
+                            appState.refreshModels()
+                        }
+                    }
                 }
             }
-            .font(.callout)
-            .controlSize(.small)
+        } label: {
+            Text(label)
+        }
+        .font(.callout)
+        .controlSize(.small)
+        .fixedSize()
+        .task {
+            guard !loaded else { return }
+            quants = await downloads.listGgufFiles(repoId: repoId)
+            loaded = true
         }
     }
 }

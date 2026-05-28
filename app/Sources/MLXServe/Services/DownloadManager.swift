@@ -47,17 +47,47 @@ class DownloadManager: ObservableObject {
     // through the discoverer's fallback scan and `existingModelDir(for:)` —
     // no automatic migration; users can move dirs manually if they want.
 
-    /// True iff a filename is a GGUF the embedded ds4 engine can load.
-    /// Today that's the DeepSeek-V4-Flash family only — match files whose
-    /// basename starts with `DeepSeek-V4-Flash-` and ends with `.gguf`.
-    /// Other GGUF families (Qwen, Gemma, Nemotron) are NOT loadable by
-    /// mlx-serve, so we deliberately hide them from the picker / readiness
-    /// check rather than surface them and fail at load time. The abliterated
-    /// `cyberneurova-DeepSeek-V4-Flash-…` community variants are also
-    /// excluded by the prefix check.
-    nonisolated static func isSupportedDsv4Gguf(_ filename: String) -> Bool {
-        guard filename.hasSuffix(".gguf") else { return false }
-        return filename.lowercased().hasPrefix("deepseek-v4-flash-")
+    /// True iff a filename is a GGUF mlx-serve can serve. As of the embedded
+    /// llama.cpp engine that's ANY `.gguf` EXCEPT mmproj sidecars (CLIP
+    /// vision / audio encoders shipped alongside vision-enabled LLMs —
+    /// `mmproj-*.gguf` files have `general.architecture=clip` and llama.cpp
+    /// refuses to load them as language models). DeepSeek-V4-Flash routes
+    /// to the ds4 engine, everything else to llama.cpp (server-side, by
+    /// `ggufModelType`).
+    nonisolated static func isSupportedGguf(_ filename: String) -> Bool {
+        let lower = filename.lowercased()
+        guard lower.hasSuffix(".gguf") else { return false }
+        return !isMmprojGguf(filename)
+    }
+
+    /// True iff a basename is a multimodal-projection sidecar — the
+    /// `mmproj-*.gguf` convention used by llama.cpp tooling, ollama, and
+    /// LM Studio for the side-loaded CLIP vision / audio encoders. Mirrors
+    /// the Zig `model_discovery.isMmprojGgufBasename` so client and server
+    /// agree on which artifacts are LLMs.
+    nonisolated static func isMmprojGguf(_ filename: String) -> Bool {
+        let lower = filename.lowercased()
+        return lower.hasSuffix(".gguf") && lower.hasPrefix("mmproj")
+    }
+
+    /// Classify a GGUF filename into the `modelType` the server reports / routes
+    /// on: `deepseek_v4` for DeepSeek-V4-Flash (ds4 engine), `gguf` for any other
+    /// `.gguf` (llama.cpp engine), or nil when it isn't a GGUF. Mirrors the Zig
+    /// `model_discovery.isDs4GgufBasename` split so client and server agree.
+    nonisolated static func ggufModelType(forBasename filename: String) -> String? {
+        guard filename.lowercased().hasSuffix(".gguf") else { return nil }
+        return filename.lowercased().hasPrefix("deepseek-v4-flash") ? "deepseek_v4" : "gguf"
+    }
+
+    /// Short, human-friendly label for a GGUF file in the quant picker: surfaces a
+    /// quant token like `Q4_K_M` / `IQ2_XXS` / `F16` when present, else the
+    /// extension-stripped basename. Pure + testable.
+    nonisolated static func quantLabel(forFilename filename: String) -> String {
+        let base = (filename as NSString).lastPathComponent
+        if let r = base.range(of: "(IQ|Q|BF|F)[0-9][A-Za-z0-9_]*", options: [.regularExpression, .caseInsensitive]) {
+            return String(base[r])
+        }
+        return (base as NSString).deletingPathExtension
     }
 
     /// Where a fresh download of `repoId` should be written. New 2-level layout.
@@ -165,12 +195,11 @@ class DownloadManager: ObservableObject {
         guard let modelDir = existingModelDir(for: repoId) else { return false }
         let fm = FileManager.default
 
-        // ds4 / GGUF fast-path. Check BEFORE the safetensors gate so a dir
-        // that legitimately has no config.json still resolves as ready.
-        // Gated to DeepSeek-V4-Flash variants — see `isSupportedDsv4Gguf` for
-        // why we don't surface arbitrary GGUFs.
+        // GGUF fast-path. Check BEFORE the safetensors gate so a dir that
+        // legitimately has no config.json still resolves as ready. Any non-trivial
+        // .gguf counts now (ds4 for DSV4-Flash, llama.cpp for the rest).
         if let entries = try? fm.contentsOfDirectory(atPath: modelDir) {
-            for entry in entries where Self.isSupportedDsv4Gguf(entry) {
+            for entry in entries where Self.isSupportedGguf(entry) {
                 let fullPath = (modelDir as NSString).appendingPathComponent(entry)
                 let size = (try? fm.attributesOfItem(atPath: fullPath)[.size] as? UInt64) ?? 0
                 if size >= 1_000_000 { return true }
@@ -368,10 +397,25 @@ class DownloadManager: ObservableObject {
         }
     }
 
+    /// List the top-level `.gguf` files in a HuggingFace repo (one per quant),
+    /// sorted by name. Skips files in subdirectories (split-shard layouts) since
+    /// the single-file download path can't reassemble them. Empty on error.
+    func listGgufFiles(repoId: String) async -> [String] {
+        guard let url = URL(string: "https://huggingface.co/api/models/\(repoId)/tree/main") else { return [] }
+        guard let (data, response) = try? await URLSession.shared.data(from: url),
+              let http = response as? HTTPURLResponse, http.statusCode == 200,
+              let files = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else { return [] }
+        return files
+            .compactMap { $0["path"] as? String }
+            .filter { $0.lowercased().hasSuffix(".gguf") && !$0.contains("/") }
+            .sorted()
+    }
+
     /// Download a single GGUF artifact from a HuggingFace repo. Used by the
     /// ds4-backed entries (e.g. DeepSeek-V4-Flash) which ship one big file
-    /// instead of the MLX safetensors tree. Mirrors `download(repoId:)`'s
-    /// resume/retry/disk-space shape, scoped to one file.
+    /// instead of the MLX safetensors tree, and by the Model Browser's GGUF quant
+    /// picker. Mirrors `download(repoId:)`'s resume/retry/disk-space shape, scoped
+    /// to one file.
     func downloadGguf(repoId: String, ggufFilename: String) async {
         let destDir = newLayoutDir(for: repoId)
         downloads[repoId] = DownloadState(status: .downloading, statusText: "Fetching \(ggufFilename)...")
@@ -552,13 +596,20 @@ class DownloadManager: ObservableObject {
         let resolved = (dirPath as NSString).resolvingSymlinksInPath
         let entries = (try? FileManager.default.contentsOfDirectory(atPath: resolved)) ?? []
 
-        // ds4 / GGUF fast-path: surface only DeepSeek-V4-Flash GGUFs from the
-        // canonical antirez/deepseek-v4-gguf release. Random GGUFs cached by
-        // LM Studio (Qwen, Gemma, Nemotron, abliterated DSV4 variants) are NOT
-        // supported by our ds4 bridge, so we deliberately don't surface them
-        // in the picker — otherwise users get cryptic load failures when
-        // selecting a model the server can't actually serve.
-        if let gguf = entries.first(where: { Self.isSupportedDsv4Gguf($0) }) {
+        // GGUF fast-path: surface ANY non-mmproj `.gguf` as a selectable base
+        // model. Sort first so the pick is deterministic across filesystems
+        // (FileManager.contentsOfDirectory order is APFS-specific). When a
+        // folder ships both `gemma-4-E4B-it-Q4_K_M.gguf` and `Q8_0.gguf`
+        // we deterministically pick the alphabetically-smallest basename
+        // (matches the Zig server's `resolveGgufFile` tiebreaker).
+        // `isSupportedGguf` already filters mmproj sidecars
+        // (`mmproj-*.gguf`, the CLIP vision/audio encoders) so they can't
+        // be picked here — the previous code grabbed them on Gemma 4 VL
+        // / Qwen 3.6 VL repos and the server then 404'd with
+        // 'unsupported model architecture: clip'.
+        let ggufCandidates = entries.filter { Self.isSupportedGguf($0) }.sorted()
+        if let gguf = ggufCandidates.first,
+           let modelType = Self.ggufModelType(forBasename: gguf) {
             let ggufPath = (resolved as NSString).appendingPathComponent(gguf)
             let size = (try? FileManager.default.attributesOfItem(atPath: ggufPath)[.size] as? UInt64) ?? 0
             return LocalModel(
@@ -566,7 +617,7 @@ class DownloadManager: ObservableObject {
                 name: displayName,
                 path: ggufPath,
                 sizeFormatted: MemoryInfo.format(Int64(size)),
-                modelType: "deepseek_v4",
+                modelType: modelType,
                 source: source,
                 kind: .base
             )
@@ -716,8 +767,7 @@ class DownloadManager: ObservableObject {
 
     /// Pick the drafter that pairs with the loaded base model. Returns nil
     /// when the loaded model isn't Gemma 4, or when no matching drafter is on
-    /// disk. Only the directory basename is parsed — the same convention used
-    /// in `tests/bench_vs_lmstudio.sh` (`gemma-4-e4b-it-4bit` → E4B).
+    /// disk. Only the directory basename is parsed (`gemma-4-e4b-it-4bit` → E4B).
     func recommendedDrafterFor(modelPath: String, architecture: String, isMoE: Bool) -> LocalDrafter? {
         guard architecture == "gemma4" || architecture == "gemma4_text" else { return nil }
         guard let variant = gemmaVariantFor(modelPath: modelPath, isMoE: isMoE) else { return nil }
@@ -744,6 +794,29 @@ class DownloadManager: ObservableObject {
         if basename.contains("e2b") { return .E2B }
         if basename.contains("31b") { return .gemma31B }
         return nil
+    }
+
+    /// Decide whether to surface the "Pair with drafter" chip on a Model
+    /// Browser row. Three rules, in order:
+    ///   1. Drafter checkpoints themselves never offer pairing.
+    ///   2. GGUF repos never offer pairing — the Gemma 4 assistant drafter
+    ///      is an MLX-only kernel (cross-attends into the target's MLX KV
+    ///      cache), so a GGUF base served by llama.cpp can't use it.
+    ///   3. Otherwise, if the path looks like a Gemma 4 size token, return
+    ///      the matching variant.
+    /// Pulled out of `ModelBrowserRow.pairableVariant` so it's directly
+    /// unit-testable — the row's `@EnvironmentObject` makes the view itself
+    /// awkward to construct in isolation.
+    nonisolated static func drafterPairingVariant(
+        repoId: String,
+        isDrafter: Bool,
+        isGgufRepo: Bool
+    ) -> GemmaVariant? {
+        if isDrafter { return nil }
+        if isGgufRepo { return nil }
+        let lower = repoId.lowercased()
+        guard lower.contains("gemma-4") else { return nil }
+        return gemmaVariantFor(modelPath: lower, isMoE: lower.contains("26b-a4b"))
     }
 
     func gemmaVariantFor(modelPath: String, isMoE: Bool) -> GemmaVariant? {

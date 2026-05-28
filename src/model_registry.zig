@@ -24,8 +24,10 @@ const chat_mod = @import("chat.zig");
 const vision_mod = @import("vision.zig");
 const drafter_mod = @import("drafter.zig");
 const prefix_cache_mod = @import("prefix_cache.zig");
+const tokenize_cache_mod = @import("tokenize_cache.zig");
 const model_discovery = @import("model_discovery.zig");
 const arch_ds4 = @import("arch/ds4.zig");
+const arch_llama = @import("arch/llama.zig");
 const log = @import("log.zig");
 
 const Transformer = transformer_mod.Transformer;
@@ -36,6 +38,19 @@ const ChatConfig = chat_mod.ChatConfig;
 const VisionEncoder = vision_mod.VisionEncoder;
 const DrafterModel = drafter_mod.DrafterModel;
 const HotPrefixCache = prefix_cache_mod.HotPrefixCache;
+const TokenizeCache = tokenize_cache_mod.TokenizeCache;
+
+/// One slot in `LoadedModel.llama_sessions` (Iteration 3-5 of the perf
+/// plan / Phase 5 #1). Each entry wraps a libllama context. The KV
+/// state and the resident-token mirror live inside the session; we add
+/// `last_used_ns` for LRU eviction.
+pub const LlamaSessionEntry = struct {
+    session: *arch_llama.LlamaSession,
+    /// Bumped on every successful pick. Lowest = LRU. Monotonic — the
+    /// scheduler bumps it under the same lock that guards
+    /// `llama_sessions`, so reads/writes never race.
+    last_used_ns: i64 = 0,
+};
 
 /// Lifecycle of an entry. State transitions are guarded by `ModelRegistry.mutex`;
 /// the inference thread writes, connection threads read under the same lock and
@@ -104,12 +119,65 @@ pub const LoadedModel = struct {
     /// cache. `model_id`-keyed isolation falls out of "one cache per
     /// LoadedModel" by construction.
     prefix_cache: ?HotPrefixCache,
+    /// Phase 1 (perf-plan): SSM/conv state snapshot stride during prefill,
+    /// in tokens. 0 = disabled (hybrid models bypass the hot prefix cache,
+    /// preserving legacy behavior). Non-zero enables multi-turn warm reuse
+    /// on hybrid SSM archs. Set by `doLoadOnInferenceThread` from
+    /// `LoadParams.ssm_checkpoint_stride`.
+    ssm_checkpoint_stride: u32 = 0,
+    /// Phase 1: per-request cap on snapshots retained.
+    ssm_checkpoint_max: u32 = 32,
+
+    /// Iteration 2 (perf-plan Phase 4 #3): LRU cache of chat-template
+    /// render+tokenize results, keyed by a digest of (messages, tools,
+    /// flags). Targets the warm-reuse path where Jinja+BPE was
+    /// observed at 240 ms on a 1813-tok Gemma prompt — 7× the actual
+    /// Metal prefill on a KV-cache hit. Null when --tokenize-cache-entries
+    /// is 0 (caller disables for tests / debugging).
+    tokenize_cache: ?TokenizeCache = null,
 
     /// Embedded ds4 engine (DeepSeek-V4-Flash via GGUF). When non-null,
     /// `transformer` / `weights` / `tokenizer` / `chat_config` stay null and
     /// the request handlers route through `Ds4Engine` / `Ds4Session` instead
     /// of the MLX path. Mutually exclusive with the safetensors fields.
     ds4_engine: ?*arch_ds4.Ds4Engine = null,
+
+    /// Embedded llama.cpp engine (generic GGUF via libllama). Like `ds4_engine`,
+    /// when non-null the MLX fields stay null and request handlers route through
+    /// `LlamaEngine` / `LlamaSession`. Mutually exclusive with the safetensors
+    /// fields and `ds4_engine` (set for every `.gguf` except DeepSeek-V4-Flash).
+    llama_engine: ?*arch_llama.LlamaEngine = null,
+
+    /// Persistent llama.cpp sessions (Iteration 3-5 / Phase 5 #1): one or
+    /// more KV contexts, picked by best prompt-prefix match in
+    /// `runPrefillLlama`. With `--llama-cache-entries 1` (default for
+    /// backwards compat) this degenerates to the old single-session
+    /// behavior — one entry, every request fights for it. With N > 1 the
+    /// scheduler keeps the N most-recently-used sessions alive and
+    /// dispatches each incoming prompt to the entry whose resident KV
+    /// shares the longest prefix.
+    ///
+    /// `llama_session_busy` remains a model-wide gate — `max_concurrent=1`
+    /// today means only one llama request runs at a time anyway, and
+    /// adding per-entry concurrency would require an inference-thread
+    /// refactor we intentionally don't ship tonight.
+    ///
+    /// Sessions are freed BEFORE `llama_engine` in `deinit` because each
+    /// holds a context bound to the engine's model.
+    llama_sessions: std.ArrayListUnmanaged(LlamaSessionEntry) = .empty,
+    /// Cap on resident llama sessions. Mirrored from
+    /// `LoadParams.llama_cache_entries` at load time. 0 falls back to 1
+    /// for safety — every llama prefill needs at least one session.
+    llama_cache_max_entries: u32 = 1,
+    llama_session_busy: bool = false,
+    /// Phase 5 #2: ggml types for the K and V halves of the llama.cpp KV
+    /// cache. 0 = libllama default (F16). Non-zero values are pulled from
+    /// `LoadParams.llama_kv_type_{k,v}` at load time and read by
+    /// `runPrefillLlama` when creating the persistent session. Mutating
+    /// these after a session has been created has no effect — the values
+    /// are baked into the libllama context at create-time.
+    llama_kv_type_k: i32 = 0,
+    llama_kv_type_v: i32 = 0,
 
     // ── Bookkeeping. Updated under `ModelRegistry.mutex`. ──
 
@@ -139,9 +207,16 @@ pub const LoadedModel = struct {
     /// stream); the caller arranges this via `unloadResident` invoked
     /// from the inference thread before registry teardown.
     pub fn deinit(self: *LoadedModel) void {
+        for (self.llama_sessions.items) |entry| entry.session.free();
+        self.llama_sessions.deinit(self.allocator);
+        self.llama_session_busy = false;
         if (self.ds4_engine) |engine| {
             engine.close();
             self.ds4_engine = null;
+        }
+        if (self.llama_engine) |engine| {
+            engine.close();
+            self.llama_engine = null;
         }
         if (self.drafter) |d| {
             d.deinit();
@@ -184,6 +259,10 @@ pub const LoadedModel = struct {
             hc.deinit();
             self.prefix_cache = null;
         }
+        if (self.tokenize_cache) |*tc| {
+            tc.deinit();
+            self.tokenize_cache = null;
+        }
         if (self.error_name) |n| self.allocator.free(n);
         if (self.drafter_path.len > 0) self.allocator.free(self.drafter_path);
         self.allocator.free(self.id);
@@ -197,9 +276,16 @@ pub const LoadedModel = struct {
     /// `.unloaded` for later listing/reload, AND by `Scheduler.deinit` so
     /// mlx frees happen on the inference thread.
     pub fn unloadResident(self: *LoadedModel) void {
+        for (self.llama_sessions.items) |entry| entry.session.free();
+        self.llama_sessions.clearRetainingCapacity();
+        self.llama_session_busy = false;
         if (self.ds4_engine) |engine| {
             engine.close();
             self.ds4_engine = null;
+        }
+        if (self.llama_engine) |engine| {
+            engine.close();
+            self.llama_engine = null;
         }
         if (self.drafter) |d| {
             d.deinit();

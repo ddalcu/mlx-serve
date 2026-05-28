@@ -44,6 +44,26 @@ struct ServerOptions: Codable, Equatable {
     /// disables the byte cap (count cap still applies). Empty = server default.
     var prefixCacheMem: String = "2GB"
 
+    // MARK: GGUF-only (llama.cpp engine)
+    /// KV-cache quantization for the embedded llama.cpp engine. MLX's
+    /// `--kv-quant` does NOT apply to the llama path (different kernels);
+    /// this is the GGUF-equivalent knob. `off` keeps F16 (libllama
+    /// default); `q8` ≈ 2× compression near-lossless; `q4` ≈ 4× with
+    /// some quality cost. Auto-enables flash-attn server-side when
+    /// non-default.
+    var llamaKvQuant: LlamaKVQuant = .off
+    /// Multi-session LRU size for the embedded llama.cpp engine. 1
+    /// keeps the legacy single-session behavior (every flip between
+    /// long-doc prompts evicts the other). N > 1 keeps the N most-
+    /// recently-used prompts hot in independent KV contexts.
+    var llamaCacheEntries: Int = 1
+
+    // MARK: All engines
+    /// Per-LoadedModel LRU cache of chat-template render + tokenize
+    /// results. Applies to MLX, llama.cpp, and ds4 — same handler
+    /// boundary on every path. 0 disables.
+    var tokenizeCacheEntries: Int = 4
+
     // MARK: Per-request defaults (apply immediately, no restart)
     var defaultMaxTokens: Int = 4096
     var defaultTemperature: Double = 0.8
@@ -61,6 +81,16 @@ struct ServerOptions: Codable, Equatable {
     enum LogLevel: String, Codable, CaseIterable, Identifiable {
         case error, warn, info, debug
         var id: String { rawValue }
+        /// Human-readable label for the Settings picker. The raw value is what
+        /// the server's `--log-level` flag accepts — keep these in sync.
+        var label: String {
+            switch self {
+            case .error: return "Error (quietest)"
+            case .warn:  return "Warn"
+            case .info:  return "Info (default)"
+            case .debug: return "Debug (verbose)"
+            }
+        }
     }
 
     enum KVQuant: String, Codable, CaseIterable, Identifiable {
@@ -79,6 +109,25 @@ struct ServerOptions: Codable, Equatable {
             case .int8:   return "8-bit (≈2× smaller KV)"
             case .turbo2: return "TurboQuant 2-bit"
             case .turbo4: return "TurboQuant 4-bit"
+            }
+        }
+    }
+
+    /// KV-cache quantization for the embedded llama.cpp engine.
+    /// Distinct from `KVQuant` because llama.cpp's quant scheme is
+    /// ggml's `Q8_0` / `Q4_0`, not the MLX affine kernels. The server
+    /// flag is `--llama-kv-quant` rather than `--kv-quant`.
+    enum LlamaKVQuant: String, Codable, CaseIterable, Identifiable {
+        case off
+        case q8
+        case q4
+        var id: String { rawValue }
+        var cliValue: String { rawValue }
+        var label: String {
+            switch self {
+            case .off: return "Off (F16, libllama default)"
+            case .q8:  return "Q8_0 (≈2× smaller, near-lossless)"
+            case .q4:  return "Q4_0 (≈4× smaller, some quality cost)"
             }
         }
     }
@@ -123,7 +172,10 @@ struct ServerOptions: Codable, Equatable {
         maxConcurrent == other.maxConcurrent &&
         kvQuant == other.kvQuant &&
         prefixCacheEntries == other.prefixCacheEntries &&
-        prefixCacheMem == other.prefixCacheMem
+        prefixCacheMem == other.prefixCacheMem &&
+        llamaKvQuant == other.llamaKvQuant &&
+        llamaCacheEntries == other.llamaCacheEntries &&
+        tokenizeCacheEntries == other.tokenizeCacheEntries
     }
 
     // MARK: CLI args builder
@@ -177,6 +229,21 @@ struct ServerOptions: Codable, Equatable {
         let trimmedPrefixMem = prefixCacheMem.trimmingCharacters(in: .whitespacesAndNewlines)
         if !trimmedPrefixMem.isEmpty && trimmedPrefixMem != "2GB" {
             args += ["--prefix-cache-mem", trimmedPrefixMem]
+        }
+        // GGUF-only performance knobs. Emitted unconditionally when not
+        // the default — the server silently ignores them on the MLX path
+        // (it never opens an llama session). Keeping them in argv for
+        // every launch means the user gets consistent behavior whether
+        // they're switching MLX↔GGUF via the menu picker or restarting.
+        if llamaKvQuant != .off {
+            args += ["--llama-kv-quant", llamaKvQuant.cliValue]
+        }
+        if llamaCacheEntries != 1 {
+            args += ["--llama-cache-entries", "\(llamaCacheEntries)"]
+        }
+        // All-engines knob — applies to MLX, llama, and ds4 alike.
+        if tokenizeCacheEntries != 4 {
+            args += ["--tokenize-cache-entries", "\(tokenizeCacheEntries)"]
         }
         return args
     }
@@ -272,6 +339,18 @@ extension ServerOptions {
         "prefixCacheMem": .init(
             title: "Prefix cache memory cap",
             explainer: "Maximum RAM for the prefix cache. Accepts '2GB', '512MB', '0' (disable byte cap). Default 2GB.",
+            needsRestart: true),
+        "llamaKvQuant": .init(
+            title: "KV cache quantization",
+            explainer: "llama.cpp's KV-quant scheme (ggml Q8_0 / Q4_0). Distinct from the MLX KV-quant — uses different kernels. Auto-enables flash-attn on the server side when non-default.",
+            needsRestart: true),
+        "llamaCacheEntries": .init(
+            title: "Session cache entries",
+            explainer: "How many independent llama.cpp KV contexts to keep resident. 1 = legacy single-session (every flip between long prompts evicts the other). >1 keeps the N most-recently-used prompts hot — alternating multi-doc workloads stop cold-prefilling on every flip.",
+            needsRestart: true),
+        "tokenizeCacheEntries": .init(
+            title: "Tokenize cache entries",
+            explainer: "Per-LoadedModel LRU of chat-template render+tokenize results. Skips re-rendering identical message lists on warm reuse — drops warm tokenize_ms from ~240 ms to ~0 on long-prompt repeats. Applies to all engines. 0 disables.",
             needsRestart: true),
     ]
 

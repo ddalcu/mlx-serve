@@ -29,6 +29,10 @@ let supportedModelTypes: Set<String> = [
     "llama", "mistral",
     "lfm2", "lfm2-vl",
     "nemotron_h",
+    // GGUF engines: "gguf" = any model via the embedded llama.cpp engine;
+    // "deepseek_v4" = DeepSeek-V4-Flash via the ds4 engine. Both are served, so
+    // neither should be flagged "unsupported architecture" in the model browser.
+    "gguf", "deepseek_v4",
 ]
 
 struct HFModel: Identifiable, Codable {
@@ -41,7 +45,20 @@ struct HFModel: Identifiable, Codable {
     let pipelineTag: String?
 
     /// Fallback file size from tree API (not from JSON — set by HFSearchService).
+    /// For safetensors repos this is the sum across all `.safetensors` shards.
+    /// For single-file GGUF repos this is the size of that one `.gguf`. For
+    /// multi-quant GGUF repos this is the LARGEST quant's size — keeps the
+    /// `estimatedSizeBytes` sort + fitness-coloring conservative-high while
+    /// `ramEstimate` separately surfaces the min/max as a range string.
     var fallbackSizeBytes: Int64? = nil
+
+    /// Smallest non-mmproj GGUF in the repo (bytes). Only populated by
+    /// `HFSearchService` for GGUF repos that ship multiple quants (e.g.
+    /// `unsloth/gemma-4-E4B-it-GGUF` with Q2_K through BF16). Paired with
+    /// `ggufMaxSizeBytes` to drive the `ramEstimate` range string.
+    var ggufMinSizeBytes: Int64? = nil
+    /// Largest non-mmproj GGUF in the repo (bytes). See `ggufMinSizeBytes`.
+    var ggufMaxSizeBytes: Int64? = nil
 
     enum CodingKeys: String, CodingKey {
         case id, downloads, likes, lastModified, tags, safetensors
@@ -58,11 +75,29 @@ struct HFModel: Identifiable, Codable {
     /// Whether this model's architecture is known to work with mlx-serve.
     /// Checks HF tags for supported family prefixes (gemma, qwen, llama, mistral).
     /// Models with no tags get benefit of the doubt.
+    ///
+    /// GGUF repos get a permissive pass: many LM Studio community quant
+    /// repacks tag themselves only with `gguf` / `llama-cpp` / `base_model:...`
+    /// and never inherit the upstream family tag (e.g. `lmstudio-community/
+    /// gemma-4-E4B-it-GGUF` carries no `gemma*` tag of its own). The embedded
+    /// llama.cpp engine handles whatever architecture the .gguf declares
+    /// internally, so flagging these "Unsupported architecture" was a false
+    /// negative that hid legit downloads.
     var isSupportedArchitecture: Bool {
+        if isGgufRepo { return true }
         guard let tags, !tags.isEmpty else { return true }
         return tags.contains { tag in
             supportedArchitectureTagPrefixes.contains { tag.hasPrefix($0) }
         }
+    }
+
+    /// True when this repo ships GGUF artifacts (HF tags it `gguf`). These download
+    /// via the single-file GGUF path — the user picks a quant from the repo's
+    /// `.gguf` list — and the server serves them through the embedded llama.cpp
+    /// engine (or ds4 for DeepSeek-V4-Flash). Distinct from MLX/safetensors repos,
+    /// which download the whole weight tree.
+    var isGgufRepo: Bool {
+        (tags ?? []).contains { $0.lowercased() == "gguf" }
     }
 
     /// Human-readable reason why this model isn't compatible.
@@ -162,15 +197,32 @@ struct HFModel: Identifiable, Codable {
     }
 
     /// RAM estimate including ~20% overhead for KV cache and runtime buffers.
+    /// For multi-quant GGUF repos this returns a range string (e.g.
+    /// "1.7–8.5 GB") spanning the smallest and largest quants — the user
+    /// hasn't picked one yet at row-render time, so showing the range is
+    /// more honest than a single number. Single-file repos (safetensors or
+    /// single GGUF) get the existing single-value formatting.
     var ramEstimate: String {
+        if let minB = ggufMinSizeBytes, let maxB = ggufMaxSizeBytes, minB < maxB {
+            let lo = Int64(Double(minB) * 1.2)
+            let hi = Int64(Double(maxB) * 1.2)
+            return MemoryInfo.formatRange(lo, hi)
+        }
         let weights = estimatedSizeBytes
         if weights == 0 { return "Unknown" }
         let withOverhead = Int64(Double(weights) * 1.2)
         return MemoryInfo.format(withOverhead)
     }
 
-    /// Raw weight size in bytes (without KV cache overhead). Used for RAM fitness comparison.
+    /// Single-value RAM estimate in bytes — drives sort + fitness coloring,
+    /// both of which need one number per row. For GGUF ranges we use the
+    /// max (conservative-high) so a row showing "1.7–8.5 GB" on a 6 GB Mac
+    /// colors as won't-fit rather than misleading-green on its smallest
+    /// quant. Single-value paths are unchanged.
     var ramEstimateBytes: Int64 {
+        if let maxB = ggufMaxSizeBytes {
+            return Int64(Double(maxB) * 1.2)
+        }
         let weights = estimatedSizeBytes
         if weights == 0 { return 0 }
         return Int64(Double(weights) * 1.2)

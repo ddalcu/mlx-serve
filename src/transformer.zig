@@ -891,6 +891,88 @@ pub fn ssmRestore(dst: *SSMCacheEntry, snap: *const SSMCacheEntrySnapshot) !void
     }
 }
 
+/// Phase 1 (performance-plan): per-position SSM checkpoint covering ALL hybrid
+/// layers in the model. Captures the SSM/conv state after the model has been
+/// forwarded over the first `pos` tokens of some prompt. Used by the hot prefix
+/// cache to restore mid-sequence SSM state on a multi-turn warm request, so we
+/// don't have to cold-prefill the shared prefix every turn.
+///
+/// A single checkpoint = one `SSMCacheEntrySnapshot` per layer (matching the
+/// shape of `ctx.ssm_entries`). Layers whose ssm/conv state is uninitialized
+/// at snapshot time hold a null-handle snapshot — `ssmRestore` is null-safe.
+///
+/// Memory: BF16 GatedDeltaNet state is ~260 KB per layer at typical
+/// configurations. A 48-layer 1k-token snapshot stride 128 stores 8
+/// checkpoints × 48 layers × 260 KB ≈ 100 MB. Bounded via
+/// `HotPrefixCache.max_kv_bytes` (counts toward the same budget as KV).
+pub const SSMCheckpoint = struct {
+    /// 1-based KV position immediately AFTER forwarding `pos` tokens. The
+    /// caller restores the slot's KVCache to exactly this position alongside
+    /// the SSM state, so the model behaves as if it had only seen the first
+    /// `pos` tokens of the prompt.
+    pos: usize,
+    /// Per-layer SSM snapshots — same length as `ctx.ssm_entries`. Non-SSM
+    /// layers (plain attention) get a null-handle snapshot which is a no-op
+    /// in `ssmRestore`.
+    layers: []SSMCacheEntrySnapshot,
+
+    pub fn deinit(self: *SSMCheckpoint, allocator: std.mem.Allocator) void {
+        for (self.layers) |*l| ssmSnapshotDeinit(l);
+        allocator.free(self.layers);
+        self.layers = &[_]SSMCacheEntrySnapshot{};
+        self.pos = 0;
+    }
+};
+
+/// Snapshot of every entry in `ssm_entries` at the current point. Caller owns
+/// the resulting buffer (free via `SSMCheckpoint.deinit`). Cheap — each layer
+/// is a refcount-share, not a copy.
+pub fn captureSsmCheckpoint(
+    allocator: std.mem.Allocator,
+    ssm_entries: []const SSMCacheEntry,
+    pos: usize,
+) !SSMCheckpoint {
+    const layers = try allocator.alloc(SSMCacheEntrySnapshot, ssm_entries.len);
+    var built: usize = 0;
+    errdefer {
+        for (layers[0..built]) |*l| ssmSnapshotDeinit(l);
+        allocator.free(layers);
+    }
+    for (ssm_entries, 0..) |*src, i| {
+        layers[i] = ssmSnapshot(src);
+        built = i + 1;
+    }
+    return .{ .pos = pos, .layers = layers };
+}
+
+/// Restore every layer of `ssm_entries` from `cp`. Mirrors the per-layer
+/// `ssmRestore` pattern — null-safe on either side.
+pub fn restoreSsmCheckpoint(
+    ssm_entries: []SSMCacheEntry,
+    cp: *const SSMCheckpoint,
+) !void {
+    if (ssm_entries.len != cp.layers.len) return error.SsmCheckpointLayerMismatch;
+    for (ssm_entries, cp.layers) |*dst, *src| {
+        try ssmRestore(dst, src);
+    }
+}
+
+/// Total bytes held by an SSM checkpoint (sum of conv_state + ssm_state across
+/// all layers). Used for hot-cache memory budgeting alongside `KVCacheSnapshot`
+/// bytes.
+pub fn ssmCheckpointBytes(cp: *const SSMCheckpoint) u64 {
+    var total: u64 = 0;
+    for (cp.layers) |l| {
+        if (l.conv_state.ctx != null) {
+            total += @as(u64, mlx.mlx_array_size(l.conv_state)) * @as(u64, mlx.mlx_array_itemsize(l.conv_state));
+        }
+        if (l.ssm_state.ctx != null) {
+            total += @as(u64, mlx.mlx_array_size(l.ssm_state)) * @as(u64, mlx.mlx_array_itemsize(l.ssm_state));
+        }
+    }
+    return total;
+}
+
 // ── Prompt Cache (snapshot of KV + SSM state for prefix reuse) ──
 
 pub const PrefillCache = struct {
