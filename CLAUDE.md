@@ -101,7 +101,7 @@ Existing tools:
 | `./tests/test_prefix_cache_mem.sh [model_dir] [port]` | `--prefix-cache-mem` budget — long-prompt traffic must stay within the byte cap and produce eviction log lines. |
 | `./tests/test_turboquant_equivalence.sh [model_dir] [port]` | TurboQuant smoke (non-NaN, ≥5 tokens, first-N diff vs dense). |
 | `SOAK_DURATION_HOURS=N ./tests/test_soak_24h.sh [model_dir]` | Plan 01 A8 — 4-way concurrent soak (chat/agent/Anthropic/tool). RSS drift bounded; default 24h, set `SOAK_DURATION_HOURS=1` for CI smoke. |
-| `./tests/bench_spec.sh [runs]` / `--corpus` | Spec-decode benchmark + threshold-tuning corpus |
+| `./tests/bench.sh --family <gemma\|qwen36> [--lmstudio --omlx --concurrent N]` | Unified bench: prefill/decode/echo/code prompts × {none,pld,drafter} cells. Default mlx-serve only; opt in to comparison engines and concurrent throughput. |
 
 ## Versioning & Releases
 
@@ -143,7 +143,7 @@ When in doubt, look at the existing entries (v26.5.4 and earlier) — keep the s
 
 ## Benchmarking
 
-Run `./bench.sh` after major features/optimizations; results go in `BenchmarkLog.md`. Flags: `--model gemma`, `--no-mlx-lm`, `--runs 5`.
+Run `./tests/bench.sh --family <gemma|qwen36>` after major features/optimizations; CSVs go in `docs/perf-csvs/`, narrative summary in `BenchmarkLog.md`. Pass `--lmstudio` and/or `--omlx` to add comparison engines (chart renders into `docs/`); `--concurrent N` adds a batched-throughput row per cell. Default run is mlx-serve only — fast enough for tight dev loops.
 
 ## Conventions
 

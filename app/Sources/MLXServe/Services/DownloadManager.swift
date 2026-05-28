@@ -767,8 +767,7 @@ class DownloadManager: ObservableObject {
 
     /// Pick the drafter that pairs with the loaded base model. Returns nil
     /// when the loaded model isn't Gemma 4, or when no matching drafter is on
-    /// disk. Only the directory basename is parsed — the same convention used
-    /// in `tests/bench_vs_lmstudio.sh` (`gemma-4-e4b-it-4bit` → E4B).
+    /// disk. Only the directory basename is parsed (`gemma-4-e4b-it-4bit` → E4B).
     func recommendedDrafterFor(modelPath: String, architecture: String, isMoE: Bool) -> LocalDrafter? {
         guard architecture == "gemma4" || architecture == "gemma4_text" else { return nil }
         guard let variant = gemmaVariantFor(modelPath: modelPath, isMoE: isMoE) else { return nil }

@@ -40,13 +40,17 @@ If you're already on LM Studio, Ollama, or `mlx-lm` and wondering whether to swi
 | Anthropic Messages API | ✅ | ❌ | ❌ | ❌ |
 | OpenAI Responses API + WebSockets | ✅ | ❌ | ❌ | ❌ |
 | DeepSeek V4 Flash (284B) | ✅ via ds4 | ❌ | ❌ | ❌ |
-| Speculative decoding (PLD + drafter) | ✅ | ❌ | partial | ❌ |
+| Speculative decoding (PLD + drafter) | ✅ | ❌ | partial | drafter only |
+| Decode speed (geomean vs LM Studio, identical weights) | **+35%** (MLX) | baseline | ~−15% (GGUF, est.¹) | +11% (MLX) |
 | KV-cache quantization (4/8-bit + TurboQuant) | ✅ | ❌ | partial | ✅ |
 | Continuous batching | ✅ | ❌ | ✅ | ❌ |
-| MCP tool client built into the app | ✅ | ❌ | ❌ | ❌ |
+| Built-in agent loop + MCP client | ✅ 10 tools | ❌ | ❌ | ❌ |
+| One-click launchers (Claude Code, OpenCode, Pi) | ✅ | ❌ | ❌ | ❌ |
 | Python required at runtime | ❌ | ❌ | ❌ | ✅ |
-| Native menu-bar app | ✅ | ❌ (Electron) | ❌ | ❌ |
+| Native menu-bar app (no Electron) | ✅ | ❌ Electron | ❌ | ❌ |
 | License | MIT | proprietary | MIT | MIT |
+
+¹ Ollama can't run MLX, so the comparison is GGUF-vs-GGUF. 
 
 ### Benchmarks (Apple M4, 16 GB · identical weights · ctx=4096 · temp=0)
 
@@ -68,7 +72,7 @@ If you're already on LM Studio, Ollama, or `mlx-lm` and wondering whether to swi
 | Gemma 4 26B-A4B MoE | Echo | 72.6 | 91.1 (+25%) | **125 (+72%)** | — |
 | Qwen 3.6 35B-A3B MoE | Echo | 83.0 | 101 (+22%) | **140 (+69%)** | — |
 
-Across 18 cells (best mlx-serve vs best LM Studio, geomean): **+39%**. Reproduce with [`tests/bench_vs_lmstudio_omlx.sh`](tests/bench_vs_lmstudio_omlx.sh) and [`tests/bench_gemma_e4b_5way.sh`](tests/bench_gemma_e4b_5way.sh).
+Across 18 cells (best mlx-serve vs best LM Studio, geomean): **+35%**. Reproduce with [`tests/bench.sh --family gemma --lmstudio --omlx`](tests/bench.sh).
 
 ![mlx-serve vs LM Studio — Gemma 4 (M4 Max)](docs/perf-vs-lmstudio-gemma-26.5.6.png)
 ![mlx-serve GGUF vs LM Studio GGUF — same file, Apple M4](docs/perf-vs-lmstudio-omlx-gemma-20260526-121327.png)
@@ -173,6 +177,7 @@ huggingface-cli download mlx-community/gemma-4-e4b-it-4bit --local-dir ~/.mlx-se
 ### Build and run
 
 ```bash
+./scripts/fetch-llama.sh (only once)
 zig build -Doptimize=ReleaseFast
 ./zig-out/bin/mlx-serve --model ~/.mlx-serve/models/gemma-4-e4b-it-4bit --serve --port 8080
 ```
@@ -180,6 +185,7 @@ zig build -Doptimize=ReleaseFast
 ### Build the app
 
 ```bash
+./scripts/fetch-llama.sh (only once)
 cd app && SKIP_NOTARIZE=1 bash build.sh
 open "MLX Core.app"
 ```
@@ -342,11 +348,11 @@ Apple M-series, MLX 4-bit weights, temp=0, function in prompt + small modificati
 
 On creative / novel-content prompts both features stay at parity (≈1.0×) thanks to the gate — **no regression**. The 350M LFM2.5 is roughly neutral on spec-decode — its forward is small enough that the verify pass costs about the same as AR.
 
-Reproduce with **`./tests/bench_spec_matrix.sh`** (release-comparison matrix vs. the shipped binary) or **`./tests/bench_spec.sh --corpus`** (9-prompt threshold-tuning corpus across echo, code-rename, JSON, RAG, agent, plain Q&A, code-translate, summarize, creative).
+Reproduce with **`./tests/bench.sh --family gemma`** (mlx-serve only — emits per-spec `none`/`pld`/`drafter` rows across the prefill/decode/echo/code prompts).
 
 ### vs. LM Studio (HTTP-vs-HTTP)
 
-**+39% faster overall** (geomean across 18 cells, best mlx-serve vs best LMS, identical 4-bit weights, ctx=4096, temp=0).
+**+35% faster overall** (geomean across 18 cells, best mlx-serve vs best LMS, identical 4-bit weights, ctx=4096, temp=0).
 
 | Model | Echo | Code | Free-form |
 |---|---:|---:|---:|
@@ -360,12 +366,12 @@ Reproduce with **`./tests/bench_spec_matrix.sh`** (release-comparison matrix vs.
 ![Gemma 4](docs/perf-vs-lmstudio-gemma-26.5.6.png)
 ![Qwen 3.6](docs/perf-vs-lmstudio-qwen36-26.5.6.png)
 
-Reproduce: `./tests/bench_vs_lmstudio_omlx.sh --family gemma` (or `qwen36`). Requires `lms`, `jq`, `python3`, `matplotlib`; install `omlx` to include it in the comparison (it auto-skips otherwise).
+Reproduce: `./tests/bench.sh --family gemma --lmstudio --omlx` (or `qwen36`). Requires `lms`, `jq`, `python3`, `matplotlib`; `--omlx` requires `omlx` on PATH.
 
 ## FAQ
 
 ### Is mlx-serve faster than LM Studio?
-Yes — every cell, every model we've benchmarked. On identical 4-bit MLX weights mlx-serve wins by **+39% geomean across 18 workloads** (Gemma 4 E2B/E4B/31B/26B-A4B-MoE and Qwen 3.6 27B/35B-A3B-MoE). On the **same `.gguf` file** as LM Studio (`gemma-4-E4B-it-Q4_K_M.gguf`), mlx-serve's embedded llama.cpp wrapper still wins **+12-15% on decode** and **+5% on prefill**. Speculative decoding pushes the lead further on echo-heavy and code-completion workloads — up to 2.65× on Gemma 4 E4B echo.
+Yes — every cell, every model we've benchmarked. On identical 4-bit MLX weights mlx-serve wins by **+35% geomean across 18 workloads** (Gemma 4 E2B/E4B/31B/26B-A4B-MoE and Qwen 3.6 27B/35B-A3B-MoE). On the **same `.gguf` file** as LM Studio (`gemma-4-E4B-it-Q4_K_M.gguf`), mlx-serve's embedded llama.cpp wrapper still wins **+12-15% on decode** and **+5% on prefill**. Speculative decoding pushes the lead further on echo-heavy and code-completion workloads — up to 2.65× on Gemma 4 E4B echo.
 
 ### Does mlx-serve replace LM Studio?
 For most use cases, yes. mlx-serve runs the same MLX and GGUF models, exposes an OpenAI-compatible API on the same kind of port, and ships a native menu-bar app instead of an Electron one. It also adds things LM Studio doesn't have: a real Anthropic Messages API (works with Claude Code), the OpenAI Responses API + WebSockets, MCP tool calling, agent mode with 10 built-in tools, KV-cache quantization, continuous batching, and the [antirez/ds4](https://github.com/antirez/ds4) engine for DeepSeek V4 Flash.

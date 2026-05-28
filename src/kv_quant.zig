@@ -444,8 +444,8 @@ pub fn dequantizeAffine(
 //   * Hand-rolled qmm × 2 + softmax loses tile-level fusion but skips the
 //     dense K/V materialization. Wins at long context where K/V bandwidth
 //     dominates.
-// The crossover is data-driven (see `tests/bench_fused_attn.sh`); v1 ships
-// behind `--kv-attn-mode fused` so the default is unchanged.
+// The crossover is data-driven; v1 ships behind `--kv-attn-mode fused` so the
+// default is unchanged.
 //
 // Shape contract:
 //   q_dense      : [B, H,    T_q, D] bf16 (Q already scaled or not; we apply scale below)

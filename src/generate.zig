@@ -302,8 +302,8 @@ pub const Generator = struct {
     /// average) against 0.30 — but with `block_size=4` the max value of that
     /// ratio is 3.0, so the 0.30 threshold corresponded to ~10% per-draft
     /// probability, well below where verify+draft overhead actually breaks
-    /// even. The Phase 1 bench (`tests/bench_drafter_accept.sh`) showed
-    /// creative-content workloads regressing at 22-47% per-draft acceptance
+    /// even. Empirically creative-content workloads regress at 22-47% per-draft
+    /// acceptance
     /// while the gate stayed off (per-round avg 0.66-1.58, all above 0.30).
     /// Switching to a per-draft probability with threshold 0.50 cleanly cuts
     /// off the regressing tail while leaving heavy-echo workloads (84-97%
@@ -331,8 +331,8 @@ pub const Generator = struct {
     }
 
     /// Emit a stable, easy-to-grep one-line summary of spec-decode acceptance
-    /// for this request. Bench scripts (`tests/bench_drafter_accept.sh`)
-    /// parse the `[spec-stats]` prefix; keep the format stable.
+    /// for this request. External tooling parses the `[spec-stats]` prefix;
+    /// keep the format stable.
     ///
     /// No-op when this Generator never ran a speculative path. Drafter and
     /// PLD are mutually exclusive within a single request (drafter > PLD per

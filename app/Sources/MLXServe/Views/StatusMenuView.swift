@@ -186,19 +186,26 @@ struct StatusMenuView: View {
                     }
 
                     HStack(spacing: 6) {
+                        let control = ServerControlButtonPresentation(status: server.status)
                         Button {
                             server.toggle(modelPath: appState.selectedModelPath, options: appState.serverOptions)
                         } label: {
-                            HStack {
-                                Image(systemName: server.status == .running || server.status == .starting ? "stop.fill" : "play.fill")
-                                Text(server.status == .running || server.status == .starting ? "Stop Server" : "Start Server")
+                            HStack(spacing: 8) {
+                                if control.showsProgress {
+                                    ProgressView()
+                                        .controlSize(.small)
+                                } else if let systemImageName = control.systemImageName {
+                                    Image(systemName: systemImageName)
+                                }
+                                Text(control.title)
                             }
                             .frame(maxWidth: .infinity)
                         }
                         .buttonStyle(.borderedProminent)
-                        .tint(server.status == .running ? .red : .accentColor)
+                        .tint(control.tint.color)
                         .disabled(appState.selectedModelPath.isEmpty)
                         .controlSize(.regular)
+                        .help(control.help)
 
                         Button {
                             showLog.toggle()
@@ -450,6 +457,51 @@ struct StatusMenuView: View {
             return model.name
         }
         return "\(model.name) + assist"
+    }
+}
+
+struct ServerControlButtonPresentation: Equatable {
+    enum Tint: Equatable {
+        case accent
+        case loading
+        case red
+
+        var color: Color {
+            switch self {
+            case .accent: .accentColor
+            case .loading: Color(red: 0.78, green: 0.32, blue: 0.0)
+            case .red: .red
+            }
+        }
+    }
+
+    let title: String
+    let systemImageName: String?
+    let showsProgress: Bool
+    let tint: Tint
+    let help: String
+
+    init(status: ServerStatus) {
+        switch status {
+        case .starting:
+            title = "Loading Model..."
+            systemImageName = nil
+            showsProgress = true
+            tint = .loading
+            help = "Loading model. Click to stop."
+        case .running:
+            title = "Stop Server"
+            systemImageName = "stop.fill"
+            showsProgress = false
+            tint = .red
+            help = "Stop the running server."
+        case .stopped, .error:
+            title = "Start Server"
+            systemImageName = "play.fill"
+            showsProgress = false
+            tint = .accent
+            help = "Start the selected model."
+        }
     }
 }
 

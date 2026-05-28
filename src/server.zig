@@ -210,7 +210,9 @@ fn signalHandler(_: std.posix.SIG) callconv(.c) void {
 /// The plan started from 0.15 but BPE tokenization fragments echo-heavy
 /// content enough that even strong echo cases land in the 0.01–0.10 range.
 /// 0.01 cleanly separates "any repetition at all" (PLD likely helps) from
-/// "pure novel" (PLD overhead-only). Tune via bench_spec.sh --gated.
+/// "pure novel" (PLD overhead-only). Re-tune by sweeping `enable_pld` on/off
+/// across an echo-heavy vs novel-content prompt set and picking the threshold
+/// that maximizes (echo_speedup / novel_overhead).
 const spec_gate_threshold: f32 = 0.01;
 
 // Plan 05: drafter state moved to `LoadedModel` (per-model `drafter`,
