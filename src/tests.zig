@@ -21,6 +21,7 @@ test {
     _ = @import("tokenizer.zig");
     _ = @import("prefix_cache.zig");
     _ = @import("model_discovery.zig");
+    _ = @import("gguf_meta.zig");
     _ = @import("model_registry.zig");
     _ = @import("scheduler.zig");
     _ = @import("ds4_ffi.zig");

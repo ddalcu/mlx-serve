@@ -6,6 +6,7 @@ const tokenizer_mod = @import("tokenizer.zig");
 const transformer_mod = @import("transformer.zig");
 const generate_mod = @import("generate.zig");
 const model_discovery = @import("model_discovery.zig");
+const gguf_meta = @import("gguf_meta.zig");
 const model_registry_mod = @import("model_registry.zig");
 const drafter_mod = @import("drafter.zig");
 const chat_mod = @import("chat.zig");
@@ -87,6 +88,17 @@ fn printUsage(io: std.Io) void {
         \\                        N > 1 keeps the N most-recently-used prompts
         \\                        hot so alternating multi-doc workloads don't
         \\                        cold-prefill on every flip.
+        \\  --engine {{auto|ds4|llama}}
+        \\                      Engine selector for `.gguf` inputs ONLY.
+        \\                        Safetensors models always run on the native
+        \\                        MLX engine and ignore this flag. For
+        \\                        GGUF: `auto` (default) reads the file's
+        \\                        `general.architecture` metadata and routes
+        \\                        deepseek4 + ds4-MLA quants to the embedded
+        \\                        ds4 engine, everything else to llama.cpp.
+        \\                        Override when auto-detection is wrong
+        \\                        (e.g. an unusual ds4 quant whose metadata
+        \\                        layout differs).
         \\  --model-dir <dir>   Directory of MLX models to discover at startup.
         \\                        Discovered siblings appear in /v1/models and
         \\                        can be loaded on-demand via /v1/load-model
@@ -167,6 +179,9 @@ pub fn main(init: std.process.Init) !void {
     var max_resident_mem: u64 = 0; // 0 = auto (80% of wired limit at startup)
     var max_resident_mem_explicit: bool = false;
     var idle_evict_secs: ?u32 = null;
+    // GGUF engine routing override. null → auto (decided by gguf_meta on
+    // file inspection); set explicitly via --engine to force ds4 or llama.
+    var engine_override: ?gguf_meta.Engine = null;
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--version")) {
@@ -343,6 +358,18 @@ pub fn main(init: std.process.Init) !void {
                 log.err("--kv-quant: expected one of {{off, 4, 8, turbo2, turbo4}}; got '{s}'\n", .{args[i]});
                 std.process.exit(1);
             }
+        } else if (std.mem.eql(u8, args[i], "--engine") and i + 1 < args.len) {
+            i += 1;
+            if (std.mem.eql(u8, args[i], "auto")) {
+                engine_override = null;
+            } else if (std.mem.eql(u8, args[i], "ds4")) {
+                engine_override = .ds4;
+            } else if (std.mem.eql(u8, args[i], "llama")) {
+                engine_override = .llama;
+            } else {
+                log.err("--engine: expected one of {{auto, ds4, llama}}; got '{s}'\n", .{args[i]});
+                std.process.exit(1);
+            }
         } else if (std.mem.eql(u8, args[i], "--kv-attn-mode") and i + 1 < args.len) {
             i += 1;
             if (std.mem.eql(u8, args[i], "dense")) {
@@ -405,12 +432,11 @@ pub fn main(init: std.process.Init) !void {
     // (`--prompt`) and serve (`--serve`) modes are wired; serve constructs a stub
     // LoadedModel whose request handlers route through the engine.
     if (isGgufPath(io, model_dir)) {
-        const use_ds4 = isDs4Gguf(io, allocator, model_dir);
+        const chosen = chooseGgufEngine(io, allocator, model_dir, engine_override);
         if (serve_mode) {
-            if (use_ds4) {
-                try runDs4Serve(io, allocator, model_dir, host, port, ctx_size, timeout, reasoning_budget, max_resident_models, max_resident_mem, max_resident_mem_explicit, idle_evict_secs);
-            } else {
-                try runLlamaServe(io, allocator, model_dir, host, port, ctx_size, timeout, reasoning_budget, max_resident_models, max_resident_mem, max_resident_mem_explicit, idle_evict_secs);
+            switch (chosen) {
+                .ds4 => try runDs4Serve(io, allocator, model_dir, host, port, ctx_size, timeout, reasoning_budget, max_resident_models, max_resident_mem, max_resident_mem_explicit, idle_evict_secs),
+                .llama => try runLlamaServe(io, allocator, model_dir, host, port, ctx_size, timeout, reasoning_budget, max_resident_models, max_resident_mem, max_resident_mem_explicit, idle_evict_secs),
             }
             return;
         }
@@ -418,10 +444,9 @@ pub fn main(init: std.process.Init) !void {
             log.err("GGUF offline mode requires --prompt <text>\n", .{});
             std.process.exit(2);
         };
-        if (use_ds4) {
-            try runDs4Offline(io, allocator, model_dir, prompt_text, max_tokens, temperature);
-        } else {
-            try runLlamaOffline(io, allocator, model_dir, prompt_text, max_tokens, temperature);
+        switch (chosen) {
+            .ds4 => try runDs4Offline(io, allocator, model_dir, prompt_text, max_tokens, temperature),
+            .llama => try runLlamaOffline(io, allocator, model_dir, prompt_text, max_tokens, temperature),
         }
         return;
     }
@@ -841,7 +866,10 @@ fn resolveGgufFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8) !
     while (try it.next(io)) |entry| {
         if (entry.kind != .file) continue;
         if (!std.mem.endsWith(u8, entry.name, ".gguf")) continue;
-        if (model_discovery.isMmprojGgufBasename(entry.name)) { saw_mmproj = true; continue; }
+        if (model_discovery.isMmprojGgufBasename(entry.name)) {
+            saw_mmproj = true;
+            continue;
+        }
         // Deterministic pick when multiple LLM .ggufs are present: keep the
         // alphabetically smallest. Avoids "load order depends on readdir(3)
         // iteration order" (filesystem-dependent on macOS) and lets the
@@ -878,15 +906,46 @@ fn logResolveGgufError(path: []const u8, err: anyerror) void {
     }
 }
 
-/// True if a `.gguf` path is the DeepSeek-V4-Flash model that the ds4 engine
-/// serves. Everything else routes to the generic llama.cpp engine. The check
-/// is a case-insensitive basename prefix, mirroring the Swift app's
-/// `isSupportedDsv4Gguf` so client and server agree on which GGUFs are ds4.
-/// libllama cannot load the DSV4-Flash architecture, which is why ds4 exists.
-fn isDs4Gguf(io: std.Io, allocator: std.mem.Allocator, path: []const u8) bool {
-    const gguf = resolveGgufFile(io, allocator, path) catch return false;
-    defer allocator.free(gguf);
-    return model_discovery.isDs4GgufBasename(std.fs.path.basename(gguf));
+/// Decide which embedded engine serves a `.gguf` file (or dir containing one).
+///
+/// Priority: explicit `--engine` override wins. Otherwise we read the file's
+/// GGUF metadata (cheap, header-only) and route on `general.architecture`:
+/// `deepseek4` + the antirez-style MLA key → ds4; everything else → llama.cpp.
+/// Issue #15 — the previous basename heuristic mis-routed two real-world
+/// files; see `src/gguf_meta.zig` for the rule.
+///
+/// On any inspection failure (file unreadable, malformed header, etc.) we
+/// default to llama.cpp and log the reason. Caller still gets a sane attempt
+/// (libllama will produce its own actionable error if the file isn't loadable).
+fn chooseGgufEngine(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    path: []const u8,
+    override: ?gguf_meta.Engine,
+) gguf_meta.Engine {
+    if (override) |e| {
+        log.info("[gguf] engine: {s} (forced via --engine)\n", .{@tagName(e)});
+        return e;
+    }
+    const gguf_path = resolveGgufFile(io, allocator, path) catch |err| {
+        log.warn("[gguf] route: cannot resolve gguf file ({s}); defaulting to llama\n", .{@errorName(err)});
+        return .llama;
+    };
+    defer allocator.free(gguf_path);
+
+    var info = gguf_meta.readFromFile(io, allocator, gguf_path) catch |err| {
+        log.warn("[gguf] route: metadata read failed ({s}); defaulting to llama\n", .{@errorName(err)});
+        return .llama;
+    };
+    defer info.deinit(allocator);
+
+    const e = gguf_meta.preferredEngine(info);
+    log.info("[gguf] engine: {s} (arch={s}, ds4-lora={})\n", .{
+        @tagName(e),
+        info.architecture orelse "?",
+        info.has_ds4_lora_rank,
+    });
+    return e;
 }
 
 /// Offline single-prompt generation through the embedded ds4 engine.
