@@ -1437,11 +1437,11 @@ pub const Transformer = struct {
             getWeightFmt(weights, &name_buf, "{s}.embeddings.weight", prefix)
         else
             getWeightFmt(weights, &name_buf, "{s}.embed_tokens.weight", prefix);
-        const emb_s_arr = if (is_nemotron)
+        const emb_s_arr = if (config.quant_bits == 0) mlx.mlx_array_new() else if (is_nemotron)
             getWeightFmt(weights, &name_buf, "{s}.embeddings.scales", prefix)
         else
             getWeightFmt(weights, &name_buf, "{s}.embed_tokens.scales", prefix);
-        const emb_b_arr = if (is_nemotron)
+        const emb_b_arr = if (config.quant_bits == 0) mlx.mlx_array_new() else if (is_nemotron)
             getWeightFmt(weights, &name_buf, "{s}.embeddings.biases", prefix)
         else
             getWeightFmt(weights, &name_buf, "{s}.embed_tokens.biases", prefix);
@@ -1477,8 +1477,8 @@ pub const Transformer = struct {
             const maybe_lm_w = getWeightFmtOpt(weights, &name_buf, "{s}.lm_head.weight", lm_prefix);
             if (maybe_lm_w) |w| {
                 lm_head_w = w;
-                lm_head_s = getWeightFmt(weights, &name_buf, "{s}.lm_head.scales", lm_prefix);
-                lm_head_b = getWeightFmt(weights, &name_buf, "{s}.lm_head.biases", lm_prefix);
+                lm_head_s = if (config.quant_bits == 0) mlx.mlx_array_new() else getWeightFmt(weights, &name_buf, "{s}.lm_head.scales", lm_prefix);
+                lm_head_b = if (config.quant_bits == 0) mlx.mlx_array_new() else getWeightFmt(weights, &name_buf, "{s}.lm_head.biases", lm_prefix);
                 owns_lm_head = !config.tie_word_embeddings;
             } else if (weights.get("lm_head.weight")) |w| {
                 lm_head_w = w;
@@ -1640,11 +1640,11 @@ pub const Transformer = struct {
             defer _ = mlx.mlx_vector_array_free(all_vec);
 
             _ = mlx.mlx_vector_array_append_value(all_vec, emb_w);
-            _ = mlx.mlx_vector_array_append_value(all_vec, emb_s_arr);
-            _ = mlx.mlx_vector_array_append_value(all_vec, emb_b_arr);
+            if (emb_s_arr.ctx != null) _ = mlx.mlx_vector_array_append_value(all_vec, emb_s_arr);
+            if (emb_b_arr.ctx != null) _ = mlx.mlx_vector_array_append_value(all_vec, emb_b_arr);
             _ = mlx.mlx_vector_array_append_value(all_vec, lm_head_w);
-            _ = mlx.mlx_vector_array_append_value(all_vec, lm_head_s);
-            _ = mlx.mlx_vector_array_append_value(all_vec, lm_head_b);
+            if (lm_head_s.ctx != null) _ = mlx.mlx_vector_array_append_value(all_vec, lm_head_s);
+            if (lm_head_b.ctx != null) _ = mlx.mlx_vector_array_append_value(all_vec, lm_head_b);
 
             if (moe_layers) |ml| {
                 for (ml) |lw| {
@@ -1677,26 +1677,26 @@ pub const Transformer = struct {
                     if (lw.q_norm) |n| _ = mlx.mlx_vector_array_append_value(all_vec, n);
                     if (lw.k_norm) |n| _ = mlx.mlx_vector_array_append_value(all_vec, n);
                     _ = mlx.mlx_vector_array_append_value(all_vec, lw.q_w);
-                    _ = mlx.mlx_vector_array_append_value(all_vec, lw.q_s);
-                    _ = mlx.mlx_vector_array_append_value(all_vec, lw.q_b);
+                    if (lw.q_s.ctx != null) _ = mlx.mlx_vector_array_append_value(all_vec, lw.q_s);
+                    if (lw.q_b.ctx != null) _ = mlx.mlx_vector_array_append_value(all_vec, lw.q_b);
                     _ = mlx.mlx_vector_array_append_value(all_vec, lw.k_w);
-                    _ = mlx.mlx_vector_array_append_value(all_vec, lw.k_s);
-                    _ = mlx.mlx_vector_array_append_value(all_vec, lw.k_b);
+                    if (lw.k_s.ctx != null) _ = mlx.mlx_vector_array_append_value(all_vec, lw.k_s);
+                    if (lw.k_b.ctx != null) _ = mlx.mlx_vector_array_append_value(all_vec, lw.k_b);
                     _ = mlx.mlx_vector_array_append_value(all_vec, lw.v_w);
-                    _ = mlx.mlx_vector_array_append_value(all_vec, lw.v_s);
-                    _ = mlx.mlx_vector_array_append_value(all_vec, lw.v_b);
+                    if (lw.v_s.ctx != null) _ = mlx.mlx_vector_array_append_value(all_vec, lw.v_s);
+                    if (lw.v_b.ctx != null) _ = mlx.mlx_vector_array_append_value(all_vec, lw.v_b);
                     _ = mlx.mlx_vector_array_append_value(all_vec, lw.o_w);
-                    _ = mlx.mlx_vector_array_append_value(all_vec, lw.o_s);
-                    _ = mlx.mlx_vector_array_append_value(all_vec, lw.o_b);
+                    if (lw.o_s.ctx != null) _ = mlx.mlx_vector_array_append_value(all_vec, lw.o_s);
+                    if (lw.o_b.ctx != null) _ = mlx.mlx_vector_array_append_value(all_vec, lw.o_b);
                     _ = mlx.mlx_vector_array_append_value(all_vec, lw.gate_w);
-                    _ = mlx.mlx_vector_array_append_value(all_vec, lw.gate_s);
-                    _ = mlx.mlx_vector_array_append_value(all_vec, lw.gate_b);
+                    if (lw.gate_s.ctx != null) _ = mlx.mlx_vector_array_append_value(all_vec, lw.gate_s);
+                    if (lw.gate_b.ctx != null) _ = mlx.mlx_vector_array_append_value(all_vec, lw.gate_b);
                     _ = mlx.mlx_vector_array_append_value(all_vec, lw.up_w);
-                    _ = mlx.mlx_vector_array_append_value(all_vec, lw.up_s);
-                    _ = mlx.mlx_vector_array_append_value(all_vec, lw.up_b);
+                    if (lw.up_s.ctx != null) _ = mlx.mlx_vector_array_append_value(all_vec, lw.up_s);
+                    if (lw.up_b.ctx != null) _ = mlx.mlx_vector_array_append_value(all_vec, lw.up_b);
                     _ = mlx.mlx_vector_array_append_value(all_vec, lw.down_w);
-                    _ = mlx.mlx_vector_array_append_value(all_vec, lw.down_s);
-                    _ = mlx.mlx_vector_array_append_value(all_vec, lw.down_b);
+                    if (lw.down_s.ctx != null) _ = mlx.mlx_vector_array_append_value(all_vec, lw.down_s);
+                    if (lw.down_b.ctx != null) _ = mlx.mlx_vector_array_append_value(all_vec, lw.down_b);
                     if (lw.layer_scalar) |ls| _ = mlx.mlx_vector_array_append_value(all_vec, ls);
                     if (lw.ple_gate_w) |w| _ = mlx.mlx_vector_array_append_value(all_vec, w);
                     if (lw.ple_gate_s) |sc| _ = mlx.mlx_vector_array_append_value(all_vec, sc);
@@ -2293,28 +2293,33 @@ pub const Transformer = struct {
         var taken_w = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(taken_w);
         try mlx.check(mlx.mlx_take_axis(&taken_w, self.emb_w, flat_ids, 0, self.s));
-        var taken_s = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(taken_s);
-        try mlx.check(mlx.mlx_take_axis(&taken_s, self.emb_s, flat_ids, 0, self.s));
-        var taken_b = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(taken_b);
-        try mlx.check(mlx.mlx_take_axis(&taken_b, self.emb_b, flat_ids, 0, self.s));
 
         var emb = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(emb);
-        const emb_qp = self.quantParamsFor(self.emb_w, self.emb_s);
-        try mlx.check(mlx.mlx_dequantize(
-            &emb,
-            taken_w,
-            taken_s,
-            taken_b,
-            mlx.mlx_optional_int.some(@intCast(emb_qp.group_size)),
-            mlx.mlx_optional_int.some(@intCast(emb_qp.bits)),
-            "affine",
-            .{}, // global_scale (null)
-            .{ .value = .bfloat16, .has_value = true },
-            self.s,
-        ));
+        if (self.emb_s.ctx == null) {
+            // Dense (bf16) embedding: no scales, skip dequantize
+            try mlx.check(mlx.mlx_astype(&emb, taken_w, .bfloat16, self.s));
+        } else {
+            var taken_s = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(taken_s);
+            try mlx.check(mlx.mlx_take_axis(&taken_s, self.emb_s, flat_ids, 0, self.s));
+            var taken_b = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(taken_b);
+            try mlx.check(mlx.mlx_take_axis(&taken_b, self.emb_b, flat_ids, 0, self.s));
+            const emb_qp = self.quantParamsFor(self.emb_w, self.emb_s);
+            try mlx.check(mlx.mlx_dequantize(
+                &emb,
+                taken_w,
+                taken_s,
+                taken_b,
+                mlx.mlx_optional_int.some(@intCast(emb_qp.group_size)),
+                mlx.mlx_optional_int.some(@intCast(emb_qp.bits)),
+                "affine",
+                .{}, // global_scale (null)
+                .{ .value = .bfloat16, .has_value = true },
+                self.s,
+            ));
+        }
 
         const out_shape = [_]c_int{ batch, seq_len, @intCast(self.config.hidden_size) };
         var reshaped = mlx.mlx_array_new();
@@ -2853,6 +2858,12 @@ pub const Transformer = struct {
         var tw = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(tw);
         try mlx.check(mlx.mlx_take_axis(&tw, w, ids, 0, self.s));
+        // Dense (bf16): no scales, skip dequantize
+        if (sc.ctx == null) {
+            var result = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_astype(&result, tw, .bfloat16, self.s));
+            return result;
+        }
         var ts = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(ts);
         try mlx.check(mlx.mlx_take_axis(&ts, sc, ids, 0, self.s));
@@ -5433,14 +5444,14 @@ pub const Transformer = struct {
             // output [N,1,intermediate]. squeeze inner 1 → [N, intermediate].
             var gate_out_3d = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(gate_out_3d);
-            try mlx.check(mlx.mlx_gather_qmm(&gate_out_3d, x_rep, mw.switch_gate_w, mw.switch_gate_s, mw.switch_gate_b, no_idx, sorted_inds, true, mlx.mlx_optional_int.some(@intCast(gs)), mlx.mlx_optional_int.some(@intCast(gate_bits)), "affine", true, self.s));
+            try gatherExpertMm(&gate_out_3d, x_rep, mw.switch_gate_w, mw.switch_gate_s, mw.switch_gate_b, no_idx, sorted_inds, gate_bits, gs, true, self.s);
             var gate_out = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(gate_out);
             try mlx.check(mlx.mlx_squeeze(&gate_out, gate_out_3d, self.s));
 
             var up_out_3d = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(up_out_3d);
-            try mlx.check(mlx.mlx_gather_qmm(&up_out_3d, x_rep, mw.switch_up_w, mw.switch_up_s, mw.switch_up_b, no_idx, sorted_inds, true, mlx.mlx_optional_int.some(@intCast(gs)), mlx.mlx_optional_int.some(@intCast(up_bits)), "affine", true, self.s));
+            try gatherExpertMm(&up_out_3d, x_rep, mw.switch_up_w, mw.switch_up_s, mw.switch_up_b, no_idx, sorted_inds, up_bits, gs, true, self.s);
             var up_out = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(up_out);
             try mlx.check(mlx.mlx_squeeze(&up_out, up_out_3d, self.s));
@@ -5454,7 +5465,7 @@ pub const Transformer = struct {
             try mlx.check(mlx.mlx_expand_dims(&act_exp, expert_act, -2, self.s));
             var down_3d = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(down_3d);
-            try mlx.check(mlx.mlx_gather_qmm(&down_3d, act_exp, mw.switch_down_w, mw.switch_down_s, mw.switch_down_b, no_idx, sorted_inds, true, mlx.mlx_optional_int.some(@intCast(gs)), mlx.mlx_optional_int.some(@intCast(down_bits)), "affine", true, self.s));
+            try gatherExpertMm(&down_3d, act_exp, mw.switch_down_w, mw.switch_down_s, mw.switch_down_b, no_idx, sorted_inds, down_bits, gs, true, self.s);
             var down_squeezed = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(down_squeezed);
             try mlx.check(mlx.mlx_squeeze(&down_squeezed, down_3d, self.s)); // [N, hidden]
@@ -5475,14 +5486,14 @@ pub const Transformer = struct {
 
             var gate_out_5d = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(gate_out_5d);
-            try mlx.check(mlx.mlx_gather_qmm(&gate_out_5d, x_exp, mw.switch_gate_w, mw.switch_gate_s, mw.switch_gate_b, no_idx, inds, true, mlx.mlx_optional_int.some(@intCast(gs)), mlx.mlx_optional_int.some(@intCast(gate_bits)), "affine", false, self.s));
+            try gatherExpertMm(&gate_out_5d, x_exp, mw.switch_gate_w, mw.switch_gate_s, mw.switch_gate_b, no_idx, inds, gate_bits, gs, false, self.s);
             var gate_out = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(gate_out);
             try mlx.check(mlx.mlx_squeeze(&gate_out, gate_out_5d, self.s));
 
             var up_out_5d = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(up_out_5d);
-            try mlx.check(mlx.mlx_gather_qmm(&up_out_5d, x_exp, mw.switch_up_w, mw.switch_up_s, mw.switch_up_b, no_idx, inds, true, mlx.mlx_optional_int.some(@intCast(gs)), mlx.mlx_optional_int.some(@intCast(up_bits)), "affine", false, self.s));
+            try gatherExpertMm(&up_out_5d, x_exp, mw.switch_up_w, mw.switch_up_s, mw.switch_up_b, no_idx, inds, up_bits, gs, false, self.s);
             var up_out = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(up_out);
             try mlx.check(mlx.mlx_squeeze(&up_out, up_out_5d, self.s));
@@ -5495,7 +5506,7 @@ pub const Transformer = struct {
             try mlx.check(mlx.mlx_expand_dims(&act_exp, expert_act, -2, self.s));
             var down_5d = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(down_5d);
-            try mlx.check(mlx.mlx_gather_qmm(&down_5d, act_exp, mw.switch_down_w, mw.switch_down_s, mw.switch_down_b, no_idx, inds, true, mlx.mlx_optional_int.some(@intCast(gs)), mlx.mlx_optional_int.some(@intCast(down_bits)), "affine", false, self.s));
+            try gatherExpertMm(&down_5d, act_exp, mw.switch_down_w, mw.switch_down_s, mw.switch_down_b, no_idx, inds, down_bits, gs, false, self.s);
             try mlx.check(mlx.mlx_squeeze(&down_out, down_5d, self.s)); // [B, S, K, hidden]
         }
 
@@ -5667,11 +5678,11 @@ fn initStandardLayers(allocator: std.mem.Allocator, config: ModelConfig, weights
         }
 
         lw.q_w = getLayerWeight(weights, name_buf, prefix, li, "self_attn.q_proj.weight");
-        lw.q_s = getLayerWeight(weights, name_buf, prefix, li, "self_attn.q_proj.scales");
-        lw.q_b = getLayerWeight(weights, name_buf, prefix, li, "self_attn.q_proj.biases");
+        lw.q_s = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "self_attn.q_proj.scales", config.quant_bits);
+        lw.q_b = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "self_attn.q_proj.biases", config.quant_bits);
         lw.k_w = getLayerWeight(weights, name_buf, prefix, li, "self_attn.k_proj.weight");
-        lw.k_s = getLayerWeight(weights, name_buf, prefix, li, "self_attn.k_proj.scales");
-        lw.k_b = getLayerWeight(weights, name_buf, prefix, li, "self_attn.k_proj.biases");
+        lw.k_s = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "self_attn.k_proj.scales", config.quant_bits);
+        lw.k_b = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "self_attn.k_proj.biases", config.quant_bits);
         // Gemma 4 (31B): full_attention layers share V with K (no v_proj weight stored).
         // Sliding_attention layers still have separate V.
         lw.k_eq_v = config.attention_k_eq_v and config.isGlobalLayer(li);
@@ -5681,22 +5692,22 @@ fn initStandardLayers(allocator: std.mem.Allocator, config: ModelConfig, weights
             lw.v_b = lw.k_b;
         } else {
             lw.v_w = getLayerWeight(weights, name_buf, prefix, li, "self_attn.v_proj.weight");
-            lw.v_s = getLayerWeight(weights, name_buf, prefix, li, "self_attn.v_proj.scales");
-            lw.v_b = getLayerWeight(weights, name_buf, prefix, li, "self_attn.v_proj.biases");
+            lw.v_s = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "self_attn.v_proj.scales", config.quant_bits);
+            lw.v_b = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "self_attn.v_proj.biases", config.quant_bits);
         }
         lw.o_w = getLayerWeight(weights, name_buf, prefix, li, "self_attn.o_proj.weight");
-        lw.o_s = getLayerWeight(weights, name_buf, prefix, li, "self_attn.o_proj.scales");
-        lw.o_b = getLayerWeight(weights, name_buf, prefix, li, "self_attn.o_proj.biases");
+        lw.o_s = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "self_attn.o_proj.scales", config.quant_bits);
+        lw.o_b = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "self_attn.o_proj.biases", config.quant_bits);
 
         lw.gate_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.gate_proj.weight");
-        lw.gate_s = getLayerWeight(weights, name_buf, prefix, li, "mlp.gate_proj.scales");
-        lw.gate_b = getLayerWeight(weights, name_buf, prefix, li, "mlp.gate_proj.biases");
+        lw.gate_s = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "mlp.gate_proj.scales", config.quant_bits);
+        lw.gate_b = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "mlp.gate_proj.biases", config.quant_bits);
         lw.up_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.up_proj.weight");
-        lw.up_s = getLayerWeight(weights, name_buf, prefix, li, "mlp.up_proj.scales");
-        lw.up_b = getLayerWeight(weights, name_buf, prefix, li, "mlp.up_proj.biases");
+        lw.up_s = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "mlp.up_proj.scales", config.quant_bits);
+        lw.up_b = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "mlp.up_proj.biases", config.quant_bits);
         lw.down_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.down_proj.weight");
-        lw.down_s = getLayerWeight(weights, name_buf, prefix, li, "mlp.down_proj.scales");
-        lw.down_b = getLayerWeight(weights, name_buf, prefix, li, "mlp.down_proj.biases");
+        lw.down_s = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "mlp.down_proj.scales", config.quant_bits);
+        lw.down_b = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "mlp.down_proj.biases", config.quant_bits);
 
         // Gemma 4: per-layer scalar
         lw.layer_scalar = getLayerWeightOpt(weights, name_buf, prefix, li, "layer_scalar");
@@ -5732,9 +5743,16 @@ fn initStandardLayers(allocator: std.mem.Allocator, config: ModelConfig, weights
 /// Unsloth Dynamic checkpoints that leave linear-attention projections
 /// unquantized while quantizing the rest. Caller owns the returned array.
 fn transposeBf16Weight(w: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
+    // Swap the last two axes. 2D weights [out, in] → [in, out]; stacked MoE
+    // expert weights [experts, out, in] → [experts, in, out].
     var w_t = mlx.mlx_array_new();
-    const perm = [_]c_int{ 1, 0 };
-    try mlx.check(mlx.mlx_transpose_axes(&w_t, w, &perm, 2, s));
+    const shape = mlx.getShape(w);
+    const ndim = shape.len;
+    var perm: [8]c_int = undefined; // max 8 dims, more than enough
+    for (0..ndim) |i| perm[i] = @intCast(i);
+    perm[ndim - 2] = @intCast(ndim - 1);
+    perm[ndim - 1] = @intCast(ndim - 2);
+    try mlx.check(mlx.mlx_transpose_axes(&w_t, w, &perm, @intCast(ndim), s));
     return w_t;
 }
 
@@ -5878,16 +5896,16 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
             }
         } else {
             const k_w = getLayerWeight(weights, name_buf, prefix, li, "self_attn.k_proj.weight");
-            const k_s = getLayerWeight(weights, name_buf, prefix, li, "self_attn.k_proj.scales");
-            const k_b = getLayerWeight(weights, name_buf, prefix, li, "self_attn.k_proj.biases");
+            const k_s = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "self_attn.k_proj.scales", config.quant_bits);
+            const k_b = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "self_attn.k_proj.biases", config.quant_bits);
             // Gemma 4 MoE: global layers use K=V (no separate v_proj)
             const v_w = getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.v_proj.weight") orelse k_w;
             const v_s = getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.v_proj.scales") orelse k_s;
             const v_b = getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.v_proj.biases") orelse k_b;
             lw.attn = .{ .full = .{
                 .q_w = getLayerWeight(weights, name_buf, prefix, li, "self_attn.q_proj.weight"),
-                .q_s = getLayerWeight(weights, name_buf, prefix, li, "self_attn.q_proj.scales"),
-                .q_b = getLayerWeight(weights, name_buf, prefix, li, "self_attn.q_proj.biases"),
+                .q_s = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "self_attn.q_proj.scales", config.quant_bits),
+                .q_b = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "self_attn.q_proj.biases", config.quant_bits),
                 .k_w = k_w,
                 .k_s = k_s,
                 .k_b = k_b,
@@ -5895,8 +5913,8 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
                 .v_s = v_s,
                 .v_b = v_b,
                 .o_w = getLayerWeight(weights, name_buf, prefix, li, "self_attn.o_proj.weight"),
-                .o_s = getLayerWeight(weights, name_buf, prefix, li, "self_attn.o_proj.scales"),
-                .o_b = getLayerWeight(weights, name_buf, prefix, li, "self_attn.o_proj.biases"),
+                .o_s = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "self_attn.o_proj.scales", config.quant_bits),
+                .o_b = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "self_attn.o_proj.biases", config.quant_bits),
                 .q_norm = getLayerWeight(weights, name_buf, prefix, li, "self_attn.q_norm.weight"),
                 .k_norm = getLayerWeight(weights, name_buf, prefix, li, "self_attn.k_norm.weight"),
             } };
@@ -6073,12 +6091,12 @@ fn initHybridLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: 
             .gated_conv => {
                 lw.op = .{ .gated_conv = .{
                     .in_proj_w = getLayerWeight(weights, name_buf, prefix, li, "conv.in_proj.weight"),
-                    .in_proj_s = getLayerWeight(weights, name_buf, prefix, li, "conv.in_proj.scales"),
-                    .in_proj_b = getLayerWeight(weights, name_buf, prefix, li, "conv.in_proj.biases"),
+                    .in_proj_s = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "conv.in_proj.scales", config.quant_bits),
+                    .in_proj_b = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "conv.in_proj.biases", config.quant_bits),
                     .conv_w = getLayerWeight(weights, name_buf, prefix, li, "conv.conv.weight"),
                     .out_proj_w = getLayerWeight(weights, name_buf, prefix, li, "conv.out_proj.weight"),
-                    .out_proj_s = getLayerWeight(weights, name_buf, prefix, li, "conv.out_proj.scales"),
-                    .out_proj_b = getLayerWeight(weights, name_buf, prefix, li, "conv.out_proj.biases"),
+                    .out_proj_s = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "conv.out_proj.scales", config.quant_bits),
+                    .out_proj_b = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "conv.out_proj.biases", config.quant_bits),
                 } };
             },
             .attention => {
@@ -6087,16 +6105,16 @@ fn initHybridLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: 
                     // Use Opt for biases — mxfp8 quantized layers may lack them
                     lw.op = .{ .full_attn = .{
                         .q_w = getLayerWeight(weights, name_buf, prefix, li, "mixer.q_proj.weight"),
-                        .q_s = getLayerWeight(weights, name_buf, prefix, li, "mixer.q_proj.scales"),
+                        .q_s = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "mixer.q_proj.scales", config.quant_bits),
                         .q_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mixer.q_proj.biases") orelse mlx.mlx_array_new(),
                         .k_w = getLayerWeight(weights, name_buf, prefix, li, "mixer.k_proj.weight"),
-                        .k_s = getLayerWeight(weights, name_buf, prefix, li, "mixer.k_proj.scales"),
+                        .k_s = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "mixer.k_proj.scales", config.quant_bits),
                         .k_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mixer.k_proj.biases") orelse mlx.mlx_array_new(),
                         .v_w = getLayerWeight(weights, name_buf, prefix, li, "mixer.v_proj.weight"),
-                        .v_s = getLayerWeight(weights, name_buf, prefix, li, "mixer.v_proj.scales"),
+                        .v_s = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "mixer.v_proj.scales", config.quant_bits),
                         .v_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mixer.v_proj.biases") orelse mlx.mlx_array_new(),
                         .o_w = getLayerWeight(weights, name_buf, prefix, li, "mixer.o_proj.weight"),
-                        .o_s = getLayerWeight(weights, name_buf, prefix, li, "mixer.o_proj.scales"),
+                        .o_s = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "mixer.o_proj.scales", config.quant_bits),
                         .o_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mixer.o_proj.biases") orelse mlx.mlx_array_new(),
                         .q_norm = mlx.mlx_array_new(),
                         .k_norm = mlx.mlx_array_new(),
@@ -6105,17 +6123,17 @@ fn initHybridLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: 
                     // LFM2: self_attn.{q,k,v}_proj + out_proj, QK layernorms
                     lw.op = .{ .full_attn = .{
                         .q_w = getLayerWeight(weights, name_buf, prefix, li, "self_attn.q_proj.weight"),
-                        .q_s = getLayerWeight(weights, name_buf, prefix, li, "self_attn.q_proj.scales"),
-                        .q_b = getLayerWeight(weights, name_buf, prefix, li, "self_attn.q_proj.biases"),
+                        .q_s = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "self_attn.q_proj.scales", config.quant_bits),
+                        .q_b = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "self_attn.q_proj.biases", config.quant_bits),
                         .k_w = getLayerWeight(weights, name_buf, prefix, li, "self_attn.k_proj.weight"),
-                        .k_s = getLayerWeight(weights, name_buf, prefix, li, "self_attn.k_proj.scales"),
-                        .k_b = getLayerWeight(weights, name_buf, prefix, li, "self_attn.k_proj.biases"),
+                        .k_s = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "self_attn.k_proj.scales", config.quant_bits),
+                        .k_b = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "self_attn.k_proj.biases", config.quant_bits),
                         .v_w = getLayerWeight(weights, name_buf, prefix, li, "self_attn.v_proj.weight"),
-                        .v_s = getLayerWeight(weights, name_buf, prefix, li, "self_attn.v_proj.scales"),
-                        .v_b = getLayerWeight(weights, name_buf, prefix, li, "self_attn.v_proj.biases"),
+                        .v_s = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "self_attn.v_proj.scales", config.quant_bits),
+                        .v_b = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "self_attn.v_proj.biases", config.quant_bits),
                         .o_w = getLayerWeight(weights, name_buf, prefix, li, "self_attn.out_proj.weight"),
-                        .o_s = getLayerWeight(weights, name_buf, prefix, li, "self_attn.out_proj.scales"),
-                        .o_b = getLayerWeight(weights, name_buf, prefix, li, "self_attn.out_proj.biases"),
+                        .o_s = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "self_attn.out_proj.scales", config.quant_bits),
+                        .o_b = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "self_attn.out_proj.biases", config.quant_bits),
                         .q_norm = getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.q_layernorm.weight") orelse mlx.mlx_array_new(),
                         .k_norm = getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.k_layernorm.weight") orelse mlx.mlx_array_new(),
                     } };
@@ -6124,7 +6142,7 @@ fn initHybridLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: 
             .mamba2 => {
                 lw.op = .{ .mamba2 = .{
                     .in_proj_w = getLayerWeight(weights, name_buf, prefix, li, "mixer.in_proj.weight"),
-                    .in_proj_s = getLayerWeight(weights, name_buf, prefix, li, "mixer.in_proj.scales"),
+                    .in_proj_s = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "mixer.in_proj.scales", config.quant_bits),
                     .in_proj_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mixer.in_proj.biases") orelse mlx.mlx_array_new(),
                     .conv1d_w = getLayerWeight(weights, name_buf, prefix, li, "mixer.conv1d.weight"),
                     .conv1d_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mixer.conv1d.bias"),
@@ -6133,7 +6151,7 @@ fn initHybridLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: 
                     .dt_bias = getLayerWeight(weights, name_buf, prefix, li, "mixer.dt_bias"),
                     .norm_w = getLayerWeight(weights, name_buf, prefix, li, "mixer.norm.weight"),
                     .out_proj_w = getLayerWeight(weights, name_buf, prefix, li, "mixer.out_proj.weight"),
-                    .out_proj_s = getLayerWeight(weights, name_buf, prefix, li, "mixer.out_proj.scales"),
+                    .out_proj_s = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "mixer.out_proj.scales", config.quant_bits),
                     .out_proj_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mixer.out_proj.biases") orelse mlx.mlx_array_new(),
                 } };
             },
@@ -6141,10 +6159,10 @@ fn initHybridLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: 
                 // Nemotron-H standalone MLP (ReLU^2, ungated: up + down only)
                 lw.op = .{ .simple_mlp = .{
                     .up_w = getLayerWeight(weights, name_buf, prefix, li, "mixer.up_proj.weight"),
-                    .up_s = getLayerWeight(weights, name_buf, prefix, li, "mixer.up_proj.scales"),
+                    .up_s = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "mixer.up_proj.scales", config.quant_bits),
                     .up_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mixer.up_proj.biases") orelse mlx.mlx_array_new(),
                     .down_w = getLayerWeight(weights, name_buf, prefix, li, "mixer.down_proj.weight"),
-                    .down_s = getLayerWeight(weights, name_buf, prefix, li, "mixer.down_proj.scales"),
+                    .down_s = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "mixer.down_proj.scales", config.quant_bits),
                     .down_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mixer.down_proj.biases") orelse mlx.mlx_array_new(),
                 } };
             },
@@ -6159,14 +6177,14 @@ fn initHybridLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: 
             // LFM2 uses feed_forward.w1 (gate), w3 (up), w2 (down) — SwiGLU
             lw.mlp = .{
                 .gate_w = getLayerWeight(weights, name_buf, prefix, li, "feed_forward.w1.weight"),
-                .gate_s = getLayerWeight(weights, name_buf, prefix, li, "feed_forward.w1.scales"),
-                .gate_b = getLayerWeight(weights, name_buf, prefix, li, "feed_forward.w1.biases"),
+                .gate_s = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "feed_forward.w1.scales", config.quant_bits),
+                .gate_b = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "feed_forward.w1.biases", config.quant_bits),
                 .up_w = getLayerWeight(weights, name_buf, prefix, li, "feed_forward.w3.weight"),
-                .up_s = getLayerWeight(weights, name_buf, prefix, li, "feed_forward.w3.scales"),
-                .up_b = getLayerWeight(weights, name_buf, prefix, li, "feed_forward.w3.biases"),
+                .up_s = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "feed_forward.w3.scales", config.quant_bits),
+                .up_b = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "feed_forward.w3.biases", config.quant_bits),
                 .down_w = getLayerWeight(weights, name_buf, prefix, li, "feed_forward.w2.weight"),
-                .down_s = getLayerWeight(weights, name_buf, prefix, li, "feed_forward.w2.scales"),
-                .down_b = getLayerWeight(weights, name_buf, prefix, li, "feed_forward.w2.biases"),
+                .down_s = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "feed_forward.w2.scales", config.quant_bits),
+                .down_b = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "feed_forward.w2.biases", config.quant_bits),
             };
         } else {
             lw.mlp = null;
@@ -6177,8 +6195,10 @@ fn initHybridLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: 
 }
 
 fn appendFullAttnWeights(vec: mlx.mlx_vector_array, fa: *const FullAttnWeights) void {
+    // Plain-bf16 layers carry null-ctx scales/biases — skip those.
     inline for (std.meta.fields(FullAttnWeights)) |field| {
-        _ = mlx.mlx_vector_array_append_value(vec, @field(fa, field.name));
+        const arr = @field(fa, field.name);
+        if (arr.ctx != null) _ = mlx.mlx_vector_array_append_value(vec, arr);
     }
 }
 
@@ -6285,14 +6305,46 @@ fn moeRoutingChain(router_logits: mlx.mlx_array, k: c_int, s: mlx.mlx_stream) !T
     return .{ .inds = inds, .norm_scores = norm_scores };
 }
 
-fn qmatmulBits(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, bits: u32, group_size: u32, s: mlx.mlx_stream) !mlx.mlx_array {
-    // Plain BF16 weight: scales array is unset. Used by mixed-precision Unsloth
-    // Dynamic checkpoints that leave a subset of layers (e.g. linear_attn
-    // projections in Qwen3.6 UD) unquantized. The weight is pre-transposed at
-    // load to [in, out] so a single mlx_matmul does the contraction.
+/// Gathered matmul for MoE expert dispatch, handles both quantized and dense bf16.
+/// For bf16 models (sc.ctx==null), weights are pre-transposed by maybeTransposeForBf16
+/// to [..., in, out] so mlx_gather_mm(x, w) gives x @ w = correct output.
+/// For quantized models, delegates to mlx_gather_qmm with transpose=true as before.
+fn gatherExpertMm(res: *mlx.mlx_array, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, lhs_idx: mlx.mlx_array, rhs_idx: mlx.mlx_array, bits: u32, group_size: u32, sorted: bool, s: mlx.mlx_stream) !void {
     if (sc.ctx == null) {
+        try mlx.check(mlx.mlx_gather_mm(res, x, w, lhs_idx, rhs_idx, sorted, s));
+    } else {
+        try mlx.check(mlx.mlx_gather_qmm(res, x, w, sc, bi, lhs_idx, rhs_idx, true, mlx.mlx_optional_int.some(@intCast(group_size)), mlx.mlx_optional_int.some(@intCast(bits)), "affine", sorted, s));
+    }
+}
+
+fn qmatmulBits(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, bits: u32, group_size: u32, s: mlx.mlx_stream) !mlx.mlx_array {
+    // Plain BF16 weight: scales array is null. Two sources:
+    //   1. Unsloth Dynamic mixed-precision: individual layers left unquantized;
+    //      maybeTransposeForBf16 pre-transposes them to [in, out] at load time.
+    //   2. Fully-dense bf16 models (quant_bits == 0): MLP weights are also
+    //      pre-transposed by maybeTransposeForBf16; attention projections are not.
+    // Shape-based detection handles both: [out,in] → transpose, [in,out] → direct.
+    if (sc.ctx == null) {
+        // Dense bf16 weight. Two conventions in practice:
+        //   [out, in] — standard MLX/PyTorch storage (attention weights); requires x @ w^T.
+        //   [in, out] — pre-transposed by maybeTransposeForBf16 (MLP weights); x @ w is correct.
+        // Distinguish by comparing w's last dimension against x's last dimension.
+        const x_shape = mlx.getShape(x);
+        const w_shape = mlx.getShape(w);
+        const x_in: c_int = x_shape[x_shape.len - 1];
+        const w_last: c_int = w_shape[w_shape.len - 1];
         var fp_result = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_matmul(&fp_result, x, w, s));
+        if (w_last == x_in) {
+            // w last two dims are [out, in]: swap to [in, out] for matmul.
+            // transposeBf16Weight swaps the last two axes for any rank so
+            // stacked MoE experts [experts, out, in] work correctly too.
+            const wt = try transposeBf16Weight(w, s);
+            defer _ = mlx.mlx_array_free(wt);
+            try mlx.check(mlx.mlx_matmul(&fp_result, x, wt, s));
+        } else {
+            // w is already [in, out] (Unsloth Dynamic pre-transposed)
+            try mlx.check(mlx.mlx_matmul(&fp_result, x, w, s));
+        }
         return fp_result;
     }
 
@@ -6388,6 +6440,19 @@ fn getWeightFmtOpt(weights: *const Weights, buf: *[256]u8, comptime fmt: []const
 fn getLayerWeightOpt(weights: *const Weights, buf: *[256]u8, prefix: []const u8, layer: u32, suffix: []const u8) ?mlx.mlx_array {
     const name = std.fmt.bufPrint(buf, "{s}.layers.{d}.{s}", .{ prefix, layer, suffix }) catch unreachable;
     return weights.get(name);
+}
+
+/// Fetch a quantization scale or bias tensor.
+/// Dense bf16 models (quant_bits == 0) carry no scale tensors — returns an
+/// empty array whose ctx==null signals "no quantization" to qmatmulBits.
+/// Quantized models (quant_bits > 0) use the mandatory getter so a missing
+/// scale tensor still produces a clear MISSING WEIGHT error.
+/// Note: empty arrays are not in the Weights map and are not freed by
+/// Transformer.deinit (weight arrays never are). The per-model overhead is
+/// ~512 tiny C structs (~8 KB) — no GPU memory, acceptable for a 50+ GB model.
+fn getLayerScaleOrEmpty(weights: *const Weights, buf: *[256]u8, prefix: []const u8, layer: u32, suffix: []const u8, quant_bits: u32) mlx.mlx_array {
+    if (quant_bits == 0) return mlx.mlx_array_new();
+    return getLayerWeight(weights, buf, prefix, layer, suffix);
 }
 
 fn getLayerWeight(weights: *const Weights, buf: *[256]u8, prefix: []const u8, layer: u32, suffix: []const u8) mlx.mlx_array {
@@ -7230,4 +7295,92 @@ test "moeRoutingChain produces top-K indices and renormalized softmax weights" {
     try testing.expect(@abs(gs[1] - 15.0) < tol);
     try testing.expect(@abs(ss[0] - 1.0) < tol);
     try testing.expect(@abs(ss[1] - 1.0) < tol);
+}
+
+test "qmatmulBits transposes [out, in] bf16 weight when scales has null ctx" {
+    // Validates the shape-detection path added for dense bf16 models whose
+    // weights are stored in standard [out, in] / PyTorch convention and are
+    // NOT pre-transposed at load time (unlike Unsloth Dynamic checkpoints).
+    const s = mlx.gpuStream();
+
+    // x: [1, 1, in=4], w: [out=2, in=4] (standard [out, in] storage).
+    // Expected: x @ w^T = [1, 1, 2], same result as the Unsloth pre-transposed test.
+    var x_flat = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x_flat);
+    try mlx.check(mlx.mlx_arange(&x_flat, 0.0, 4.0, 1.0, .float32, s));
+    var x = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x);
+    {
+        const sh = [_]c_int{ 1, 1, 4 };
+        try mlx.check(mlx.mlx_reshape(&x, x_flat, &sh, 3, s));
+    }
+
+    // w is [out=2, in=4] — NOT pre-transposed.  qmatmulBits must detect this
+    // (w.last == x.last == 4) and transpose internally before the matmul.
+    var w_flat = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(w_flat);
+    try mlx.check(mlx.mlx_arange(&w_flat, 0.0, 8.0, 1.0, .float32, s));
+    var w = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(w);
+    {
+        const sh = [_]c_int{ 2, 4 };
+        try mlx.check(mlx.mlx_reshape(&w, w_flat, &sh, 2, s));
+    }
+
+    const null_sc = mlx.mlx_array{ .ctx = null };
+    const null_bi = mlx.mlx_array{ .ctx = null };
+    const got = try qmatmulBits(x, w, null_sc, null_bi, 4, 64, s);
+    defer _ = mlx.mlx_array_free(got);
+
+    var got_f32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(got_f32);
+    try mlx.check(mlx.mlx_astype(&got_f32, got, .float32, s));
+    var got_flat = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(got_flat);
+    {
+        const sh = [_]c_int{2};
+        try mlx.check(mlx.mlx_reshape(&got_flat, got_f32, &sh, 1, s));
+    }
+    {
+        const ev = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(ev);
+        _ = mlx.mlx_vector_array_append_value(ev, got_flat);
+        try mlx.check(mlx.mlx_eval(ev));
+    }
+    const data = mlx.mlx_array_data_float32(got_flat) orelse return error.TestUnexpectedNullData;
+    // [0,1,2,3] @ [[0,1,2,3],[4,5,6,7]]^T = [0+1+4+9, 0+5+12+21] = [14, 38]
+    try testing.expectApproxEqAbs(@as(f32, 14.0), data[0], 1e-3);
+    try testing.expectApproxEqAbs(@as(f32, 38.0), data[1], 1e-3);
+}
+
+test "appendFullAttnWeights skips fields with null ctx (plain bf16 layers)" {
+    // FullAttnWeights has 14 mlx_array fields: 4 weights (q/k/v/o _w),
+    // 2 norms (q_norm, k_norm), and 8 scale/bias fields (_s / _b).
+    // For a bf16 model the 8 scale/bias fields are empty (null ctx).
+    // appendFullAttnWeights must skip those and append only the 6 real arrays.
+    const s = mlx.gpuStream();
+    const vec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(vec);
+
+    const sh = [_]c_int{1};
+    var real: [6]mlx.mlx_array = undefined;
+    for (&real) |*a| {
+        a.* = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_zeros(a, &sh, 1, .bfloat16, s));
+    }
+    defer for (real) |a| { _ = mlx.mlx_array_free(a); };
+
+    const fa: FullAttnWeights = .{
+        .q_w = real[0], .q_s = .{ .ctx = null }, .q_b = .{ .ctx = null },
+        .k_w = real[1], .k_s = .{ .ctx = null }, .k_b = .{ .ctx = null },
+        .v_w = real[2], .v_s = .{ .ctx = null }, .v_b = .{ .ctx = null },
+        .o_w = real[3], .o_s = .{ .ctx = null }, .o_b = .{ .ctx = null },
+        .q_norm = real[4],
+        .k_norm = real[5],
+    };
+
+    appendFullAttnWeights(vec, &fa);
+
+    // 4 projection weights + 2 norms = 6 real arrays; 8 null-ctx scales/biases skipped.
+    try testing.expectEqual(@as(usize, 6), mlx.mlx_vector_array_size(vec));
 }

@@ -34,8 +34,8 @@ pub const ModelConfig = struct {
     sliding_window: u32 = 1024,
     sliding_window_pattern: u32 = 6,
 
-    // Quantization
-    quant_bits: u32 = 4,
+    // Quantization. 0 = dense bf16 (no "quantization" key in config.json).
+    quant_bits: u32 = 0,
     quant_group_size: u32 = 64,
 
     // Attention scale: 1/sqrt(query_pre_attn_scalar) for Gemma, 1/sqrt(head_dim) for others
@@ -899,7 +899,7 @@ test "ModelConfig defaults" {
     const config = ModelConfig{};
     try testing.expectEqual(@as(u32, 0), config.num_eos_tokens);
     try testing.expectEqual(@as(u32, 0), config.max_position_embeddings);
-    try testing.expectEqual(@as(u32, 4), config.quant_bits);
+    try testing.expectEqual(@as(u32, 0), config.quant_bits); // 0 = dense bf16 (no quantization key)
     try testing.expectEqual(@as(u32, 64), config.quant_group_size);
     try testing.expect(!config.tie_word_embeddings);
 }
@@ -1201,4 +1201,30 @@ test "ModelConfig parses gemma4_unified text_config" {
     try testing.expectApproxEqAbs(@as(f32, 30.0), config.final_logit_softcapping, 0.001);
     try testing.expectEqual(@as(u32, 3840), config.hidden_size);
     try testing.expectEqual(@as(u32, 48), config.num_hidden_layers);
+}
+
+test "parseConfigFromJson quant_bits is 0 for dense bf16 (no quantization key)" {
+    // A dense bf16 model config.json has no "quantization" key.
+    // quant_bits must stay at 0 so layer initializers skip scale/bias fetches.
+    const json =
+        \\{"model_type": "qwen3_5", "num_hidden_layers": 64, "hidden_size": 5120,
+        \\ "num_attention_heads": 24, "num_key_value_heads": 4,
+        \\ "max_position_embeddings": 262144}
+    ;
+    const config = try parseConfigFromJson(testing.allocator, json);
+    try testing.expectEqual(@as(u32, 0), config.quant_bits);
+}
+
+test "parseConfigFromJson quant_bits is set from quantization key" {
+    // A quantized model config.json carries a "quantization" block.
+    // quant_bits must reflect it so mandatory scale/bias fetches are enforced.
+    const json =
+        \\{"model_type": "qwen3_5", "num_hidden_layers": 64, "hidden_size": 5120,
+        \\ "num_attention_heads": 24, "num_key_value_heads": 4,
+        \\ "max_position_embeddings": 131072,
+        \\ "quantization": {"bits": 4, "group_size": 64}}
+    ;
+    const config = try parseConfigFromJson(testing.allocator, json);
+    try testing.expectEqual(@as(u32, 4), config.quant_bits);
+    try testing.expectEqual(@as(u32, 64), config.quant_group_size);
 }

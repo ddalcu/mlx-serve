@@ -505,7 +505,6 @@ pub fn main(init: std.process.Init) !void {
     // explicit defer on `config_storage`.
     const config_storage = try allocator.create(model_mod.ModelConfig);
     var config_owned_by_registry = false;
-    errdefer if (!config_owned_by_registry) allocator.destroy(config_storage);
     defer if (!config_owned_by_registry) allocator.destroy(config_storage);
     config_storage.* = try model_mod.parseConfig(io, allocator, model_dir);
     const config = config_storage;
