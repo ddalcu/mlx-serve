@@ -1,18 +1,18 @@
 import XCTest
 @testable import MLXCore
 
-/// Pins the time-driven pulse math that replaced the imperative
-/// `withAnimation(...).repeatForever(...)` breathe in the voice tray panel and
-/// the orb.
+/// Pins the time-driven pulse math for the in-window voice **orb**
+/// (`VoiceModeView`).
 ///
-/// Regression context: that repeating animation, kicked off in `.onAppear`
-/// inside the `MenuBarExtra(.window)` popover, never settled and wedged
-/// SwiftUI's event handling — the tray's `Button`s stopped responding to clicks
-/// while AppKit pop-up controls (the model `Picker`, the voice `Menu`) kept
-/// working from their own event-tracking loop ("the dropdown is still clickable
-/// but nothing else is"). Driving the same breathe from a `TimelineView` + these
-/// pure functions removes the long-lived animation; this test locks the curve so
-/// nobody reintroduces a constant (dead) or out-of-range pulse.
+/// Regression context: a repeating breathe hosted inside the
+/// `MenuBarExtra(.window)` popover (whether `repeatForever` or a running
+/// `TimelineView(.animation)`) wedges SwiftUI's event handling — the tray's
+/// `Button`s stop responding to clicks while AppKit pop-up controls (the model
+/// `Picker`, the voice `Menu`) keep working from their own event-tracking loop
+/// ("the dropdown is still clickable but nothing else is"). So the *tray* dot is
+/// static (`VoiceTrayDot`); the breathe lives only in the orb, which is in a
+/// normal `Window`. This test locks the orb's curve so nobody reintroduces a
+/// constant (dead) or out-of-range pulse.
 final class VoicePulseTests: XCTestCase {
 
     func testPhaseStaysInUnitRange() {
@@ -37,26 +37,6 @@ final class VoicePulseTests: XCTestCase {
         let a = VoicePulse.phase(at: 0, period: period)
         let b = VoicePulse.phase(at: period / 4, period: period)
         XCTAssertGreaterThan(abs(a - b), 0.3)
-    }
-
-    func testDotOpacitySteadyWhenNotAnimating() {
-        for i in 0..<50 {
-            XCTAssertEqual(VoicePulse.dotOpacity(animating: false, at: Double(i) * 0.1), 1.0)
-        }
-    }
-
-    func testDotOpacityBreathesBetweenFloorAndOne() {
-        let floor = 0.35
-        var sawLow = false, sawHigh = false
-        for i in 0..<400 {
-            let o = VoicePulse.dotOpacity(animating: true, at: Double(i) * 0.03, floor: floor)
-            XCTAssertGreaterThanOrEqual(o, floor - 1e-9)
-            XCTAssertLessThanOrEqual(o, 1 + 1e-9)
-            if o < floor + 0.05 { sawLow = true }
-            if o > 0.95 { sawHigh = true }
-        }
-        XCTAssertTrue(sawLow, "pulse should reach near the dim floor")
-        XCTAssertTrue(sawHigh, "pulse should reach near full brightness")
     }
 
     func testOrbBreatheZeroWhenNotAnimating() {

@@ -2753,6 +2753,21 @@ fn runSingleDecodeTick(sch: *Scheduler, slot: *Slot) !void {
         return;
     };
 
+    // Stop a runaway repetition loop before generating more. Some models (seen
+    // on Gemma 4 12B after a large/confusing tool result) collapse into spamming
+    // one short cycle — e.g. the thinking opener `<|channel>thought` — forever;
+    // with no repeat penalty by default and a generous max_tokens, nothing else
+    // halts it until the cap. Checked here, before this tick's step, so it
+    // covers the regular, PLD, and drafter paths uniformly.
+    if (generate_mod.isDegenerateTailLoop(
+        gen.generated_ids.items,
+        generate_mod.degenerate_loop_max_period,
+        generate_mod.degenerate_loop_reps,
+    )) {
+        finishSlot(sch, slot, "stop");
+        return;
+    }
+
     if (slot.enable_drafter and gen.drafter != null and !gen.spec_disabled_runtime) {
         const result = try gen.nextDrafter(slot.allocator);
         if (result == null) {

@@ -68,18 +68,16 @@ struct VoiceTrayPanel: View {
 
     private var statusLine: some View {
         HStack(spacing: 8) {
-            // Breathe via TimelineView (paused unless a turn is in flight) rather
-            // than a `repeatForever` animation: a never-settling animation hosted
-            // in the MenuBarExtra popover wedges its event handling and the tray's
-            // buttons stop responding to clicks. See `VoicePulse`.
-            TimelineView(.animation(paused: !animatesDot)) { tl in
-                Circle()
-                    .fill(dotColor)
-                    .frame(width: 8, height: 8)
-                    .opacity(VoicePulse.dotOpacity(
-                        animating: animatesDot,
-                        at: tl.date.timeIntervalSinceReferenceDate))
-            }
+            // STATIC dot — color alone encodes the state. Do NOT animate this in
+            // the tray: a continuously-redrawing view (a `repeatForever`
+            // animation *or* a running `TimelineView(.animation)`) inside this
+            // LSUIElement app's MenuBarExtra(.window) popover starves SwiftUI
+            // Button hit-testing and wedges every tray button, while the model
+            // Picker / voice Menu keep working from their own NSMenu tracking
+            // loop. The breathe lives only in the in-window orb. See `VoiceTrayDot`.
+            Circle()
+                .fill(dotColor)
+                .frame(width: 8, height: 8)
             Text(statusText)
                 .font(.caption.weight(.medium))
                 .foregroundStyle(isError ? .red : .secondary)
@@ -263,12 +261,6 @@ struct VoiceTrayPanel: View {
 
     private var isError: Bool { if case .error = voice.state { return true }; return false }
 
-    /// The dot pulses only while a turn is in flight; steady otherwise.
-    private var animatesDot: Bool {
-        voice.state == .listening || voice.state == .recognizing
-            || voice.state == .thinking || voice.state == .speaking
-    }
-
     private var statusText: String {
         switch voice.state {
         case .idle:        return "Starting…"
@@ -280,13 +272,15 @@ struct VoiceTrayPanel: View {
         }
     }
 
+    /// Static color for the status dot, mapped from the pure `VoiceTrayDot`
+    /// presentation (which is time-free by design — see the freeze regression).
     private var dotColor: Color {
-        switch voice.state {
-        case .listening, .recognizing: return .cyan
-        case .thinking:                return .purple
-        case .speaking:                return .green
-        case .error:                   return .red
-        case .idle:                    return .gray
+        switch VoiceTrayDot.tint(for: voice.state) {
+        case .active:   return .cyan
+        case .thinking: return .purple
+        case .speaking: return .green
+        case .error:    return .red
+        case .idle:     return .gray
         }
     }
 }

@@ -65,7 +65,12 @@ struct ServerOptions: Codable, Equatable {
     var tokenizeCacheEntries: Int = 4
 
     // MARK: Per-request defaults (apply immediately, no restart)
-    var defaultMaxTokens: Int = 4096
+    // 16384, not 4096: a thinking trace + agentic/code answer routinely blew
+    // past 4 K and tripped finish_reason "length" mid-reply. The server clamps
+    // this to the live context window, so a generous default can't overflow —
+    // it just stops cutting normal answers short. Users can still tune it in
+    // Settings (existing stored values are preserved on upgrade).
+    var defaultMaxTokens: Int = 16384
     var defaultTemperature: Double = 0.8
     var defaultTopP: Double = 0.95
     var defaultTopK: Int = 0            // 0 = disabled

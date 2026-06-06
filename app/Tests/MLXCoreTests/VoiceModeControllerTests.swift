@@ -21,9 +21,13 @@ final class VoiceModeControllerTests: XCTestCase {
         var authorized = true
         private(set) var startCount = 0
         private(set) var stopCount = 0
+        /// Ordered log of mic lifecycle calls, so tests can assert a *clean*
+        /// stop→start restart (a `start` while already started double-installs the
+        /// real `AVAudioEngine` tap and wedges the UI).
+        private(set) var events: [String] = []
         func requestAuthorization() async -> Bool { authorized }
-        func start() throws { startCount += 1 }
-        func stop() { stopCount += 1 }
+        func start() throws { startCount += 1; events.append("start") }
+        func stop() { stopCount += 1; events.append("stop") }
     }
 
     final class FakeSynth: SpeechSynthesizing {
@@ -240,6 +244,33 @@ final class VoiceModeControllerTests: XCTestCase {
         c.bargeIn()
         XCTAssertEqual(syn.stopCount, 1)
         XCTAssertEqual(c.state, .listening)
+    }
+
+    func testBargeInWhileRecognizingReleasesMicBeforeReopening() async {
+        // Repro for the tray freeze: toggle voice on → make a noise (VAD trips
+        // `.speechStarted`) → state `.recognizing` with the mic STILL live (no
+        // final transcript, so nothing stopped it) → click Stop. Barge-in must
+        // release the mic *before* reopening it; restarting a live recognizer
+        // re-installs the `AVAudioEngine` input tap and wedges the main thread
+        // (the "tray buttons dead, dropdown still works" freeze). No LLM involved.
+        let (c, rec, syn) = make()
+        _ = await c.begin()                 // → .listening, mic started
+        rec.onSpeechStarted?()              // a noise trips VAD
+        XCTAssertEqual(c.state, .recognizing)
+        XCTAssertTrue(c.canInterrupt)       // Stop is enabled
+
+        let startsBefore = rec.startCount
+        let stopsBefore = rec.stopCount
+        c.bargeIn()                         // user clicks Stop
+
+        XCTAssertEqual(c.state, .listening)
+        XCTAssertEqual(syn.stopCount, 1)
+        // The live mic must be torn down and reopened — a clean stop→start cycle,
+        // never a bare second start on the running engine.
+        XCTAssertEqual(rec.stopCount, stopsBefore + 1, "mic must be released on barge-in")
+        XCTAssertEqual(rec.startCount, startsBefore + 1, "mic must be reopened to keep listening")
+        XCTAssertEqual(Array(rec.events.suffix(2)), ["stop", "start"],
+                       "restart must stop the live mic first, then start")
     }
 
     func testStopWhileSpeakingHaltsGenerationAndSpeechThenListens() async {

@@ -10,7 +10,7 @@ import AppKit
 /// model-issued tool calls to the right server. Designed to live as an @EnvironmentObject so the
 /// chat view and the marketplace sheet share the same instance.
 @MainActor
-final class MCPManager: ObservableObject {
+final class MCPManager: ObservableObject, MCPToolRouting {
 
     /// One running server. Stdio sessions retain the Process and pipes; HTTP sessions only retain
     /// the MCP Client (no subprocess). All stdio fields are nil for HTTP sessions.

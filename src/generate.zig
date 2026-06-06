@@ -2681,6 +2681,46 @@ pub fn isEosId(id: u32, eos: []const u32) bool {
     return false;
 }
 
+/// Max cycle length (in tokens) scanned by `isDegenerateTailLoop`, and how many
+/// identical repetitions of that cycle count as "stuck". A real answer — prose,
+/// code, a markdown table — essentially never repeats an identical ≤8-token
+/// cycle 16 times in a row, so these won't fire on legitimate output, while a
+/// model that has collapsed into spamming one short phrase is caught within a
+/// few dozen tokens instead of running all the way to `max_tokens`.
+pub const degenerate_loop_max_period: usize = 8;
+pub const degenerate_loop_reps: usize = 16;
+
+/// Detect a degenerate tail loop: the model is stuck emitting the same short
+/// token cycle over and over. Returns true when the last `reps` repetitions of
+/// some period-`p` cycle (1 ≤ p ≤ `max_period`) are byte-identical.
+///
+/// Motivation: Gemma 4 12B sometimes collapses after a large/confusing tool
+/// result and spams the thinking opener `<|channel>thought` forever; with no
+/// repeat penalty (the default) and a now-generous `max_tokens`, nothing else
+/// stops it. The decode loop calls this each tick and cuts the slot short.
+///
+/// Pure and cheap: only the trailing `max_period * reps` ids are inspected, so
+/// cost is independent of total generated length.
+pub fn isDegenerateTailLoop(tokens: []const u32, max_period: usize, reps: usize) bool {
+    if (max_period == 0 or reps < 2) return false;
+    var p: usize = 1;
+    while (p <= max_period) : (p += 1) {
+        const span = p * reps;
+        if (tokens.len < span) continue;
+        const tail = tokens[tokens.len - span ..];
+        var periodic = true;
+        var i: usize = p;
+        while (i < tail.len) : (i += 1) {
+            if (tail[i] != tail[i - p]) {
+                periodic = false;
+                break;
+            }
+        }
+        if (periodic) return true;
+    }
+    return false;
+}
+
 /// Compute mean-pooled, L2-normalized embedding from token IDs.
 /// Returns a float32 array of shape [hidden_size]. Caller must free the returned slice.
 pub fn computeEmbedding(
@@ -3555,6 +3595,72 @@ test "InitOptions.lookup_prompt = null preserves existing behavior" {
     try testing.expectEqual(prompt.len, src.len);
     try testing.expectEqualSlices(u32, &prompt, src);
     try testing.expectEqual(@as([*]const u32, prompt[0..].ptr), src.ptr);
+}
+
+test "isDegenerateTailLoop catches a repeated channel-opener cycle" {
+    const P = degenerate_loop_max_period;
+    const R = degenerate_loop_reps;
+
+    // Gemma 4 12B failure mode: the model spams the thinking opener
+    // `<|channel>thought\n` — model that as a 3-token cycle. After enough
+    // identical repetitions the tail is a pure period-3 loop → fire.
+    {
+        var ids = std.ArrayList(u32).empty;
+        defer ids.deinit(testing.allocator);
+        try ids.appendSlice(testing.allocator, &[_]u32{ 7, 8, 9 }); // some real prefix
+        var k: usize = 0;
+        while (k < R + 4) : (k += 1) {
+            try ids.appendSlice(testing.allocator, &[_]u32{ 101, 102, 103 }); // <|channel>,thought,\n
+        }
+        try testing.expect(isDegenerateTailLoop(ids.items, P, R));
+    }
+
+    // A single token stuck on repeat (period 1) also counts once it passes R.
+    {
+        var ids = std.ArrayList(u32).empty;
+        defer ids.deinit(testing.allocator);
+        var k: usize = 0;
+        while (k < R + 2) : (k += 1) try ids.append(testing.allocator, 42);
+        try testing.expect(isDegenerateTailLoop(ids.items, P, R));
+    }
+}
+
+test "isDegenerateTailLoop does not fire on healthy or briefly-repeating output" {
+    const P = degenerate_loop_max_period;
+    const R = degenerate_loop_reps;
+
+    // Strictly increasing ids — no cycle at all.
+    {
+        var ids: [200]u32 = undefined;
+        for (&ids, 0..) |*v, i| v.* = @intCast(i);
+        try testing.expect(!isDegenerateTailLoop(&ids, P, R));
+    }
+    // A short burst of repetition (well under R reps) must be left alone — a
+    // model legitimately writing "ha ha ha" or a few identical list bullets.
+    {
+        var ids = std.ArrayList(u32).empty;
+        defer ids.deinit(testing.allocator);
+        try ids.appendSlice(testing.allocator, &[_]u32{ 1, 2, 3, 4, 5 });
+        var k: usize = 0;
+        while (k < R - 1) : (k += 1) try ids.appendSlice(testing.allocator, &[_]u32{ 50, 51 });
+        try testing.expect(!isDegenerateTailLoop(ids.items, P, R));
+    }
+    // Periodic tail but with a longer period than we scan for → ignored.
+    {
+        var ids = std.ArrayList(u32).empty;
+        defer ids.deinit(testing.allocator);
+        var k: usize = 0;
+        var base: u32 = 0;
+        while (k < R) : (k += 1) {
+            // period = P + 3 (> max_period); never a pure short cycle.
+            var j: u32 = 0;
+            while (j < P + 3) : (j += 1) try ids.append(testing.allocator, base + j);
+            base = 0; // same long block repeats, but its period exceeds the scan window
+        }
+        try testing.expect(!isDegenerateTailLoop(ids.items, P, R));
+    }
+    // Too few tokens to judge.
+    try testing.expect(!isDegenerateTailLoop(&[_]u32{ 1, 1 }, P, R));
 }
 
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;

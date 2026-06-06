@@ -1,5 +1,21 @@
 # Changelog
 
+## v26.6.5 — Voice Mode reliability, agents that finish
+
+- **Voice Mode can hear you again.** A code-signing fix grants the app the microphone entitlement it needs under macOS's hardened runtime, so the permission prompt actually appears the first time you say "Hey Loki" — previously mic access was silently denied and Voice Mode never picked up a word. Applied to both local and released/notarized builds.
+
+- **The menu-bar tray stays responsive during an answer.** While the model streamed a reply into the open tray popover, the **Stop** button — and the rest of the tray — could go dead even though the dropdown menus still worked. Streaming updates are now batched to a steady cadence, the tray status dot is a solid color instead of a constant animation, and the microphone is released cleanly before it reopens on barge-in. Together these keep the tray clickable from the first token to the last.
+
+- **The agent stops quitting mid-task.** A long, multi-step agent run could halt early after a single stray bad tool call — even after lots of successful work. Recoverable failures (malformed tool calls, truncated arguments, empty replies) are now counted consecutively and reset on every real tool round, so one isolated hiccup no longer ends a productive turn.
+
+- **No more infinite tool loops.** MCP tool calls now pass through the same repetition guard as the built-in tools, so a model can't get wedged firing the same database query — or any MCP call — over and over. Genuinely different calls stay independent and aren't over-blocked.
+
+- **Gemma 4 12B won't spin forever after a big tool result.** The 12B model occasionally collapsed into repeating its thinking opener endlessly until it burned the entire token budget; the server now detects a stuck repetition loop mid-generation and ends the turn cleanly. A companion fix keeps a raw control tag from leaking into a reply that was cut off mid-thought.
+
+- **Longer answers get cut off far less often.** The default max-tokens rises from 4,096 to 16,384, so a reasoning trace plus a real code or agent answer no longer trips the truncation cap in the middle of a reply (the server still clamps to your context window, so it can't overflow). When output is genuinely truncated, the "output truncated" notice now appears exactly once per turn instead of stacking on every step.
+
+---
+
 ## v26.6.2 — Hey Loki ! Voice Mode
 
 - **Hands-free Voice Mode.** Say "Hey Loki" and just talk to your local model — no typing, no buttons. Speech is transcribed **entirely on-device**, so your audio never leaves the Mac and it works with no internet and runs straight from the menu-bar tray with no window open — a chime confirms it heard you, a soft cue plays while it's thinking — or as a full-screen animated orb over the chat. Agent tools, thinking, and MCP all work in voice exactly as they do in text, because both now run through one shared engine.

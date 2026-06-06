@@ -1,5 +1,15 @@
 import Foundation
 
+/// The slice of MCP behavior the agent executor needs, so `AgentEngine` can run
+/// MCP tools through the *same* repetition guard as built-in tools without
+/// depending on the concrete `MCPManager`. Production passes the real manager;
+/// tests pass a fake. `MCPManager` already provides both methods.
+@MainActor
+protocol MCPToolRouting {
+    func owns(toolName: String) -> Bool
+    func executeToolCall(name: String, arguments: [String: String], rawArguments: String) async -> String
+}
+
 /// Shared agent engine — history building, tool execution, repetition tracking.
 /// Used by both ChatView (production UI) and TestServer (test automation).
 /// Eliminates duplication between the two, ensuring bug fixes apply everywhere.
@@ -358,7 +368,16 @@ enum AgentEngine {
         if let argKey = primaryArgKey[name], let val = arguments[argKey], !val.isEmpty {
             return "\(name):\(val)"
         }
-        return name
+        // No designated primary arg (MCP tools like `dbhub__execute_sql`,
+        // saveMemory, …): key on the FULL argument set so only *identical* calls
+        // count as repetition. Distinct calls (e.g. different SQL queries) stay
+        // independent and aren't over-blocked once they flow through the shared
+        // block guard. Keys are sorted for a stable, dict-order-independent key.
+        if arguments.isEmpty { return name }
+        let serialized = arguments.keys.sorted()
+            .map { "\($0)=\(arguments[$0] ?? "")" }
+            .joined(separator: "\u{1}")
+        return "\(name):\(serialized)"
     }
 
     /// Tool-specific block messages suggesting useful alternatives.
@@ -455,6 +474,47 @@ enum AgentEngine {
         }
     }
 
+    /// Per-turn budget for *recoverable* agent-loop failures: malformed/"ghost"
+    /// tool calls, truncated tool-call args, and empty/pad responses.
+    ///
+    /// Counts **consecutive** failures, not lifetime-of-turn ones — a round that
+    /// executes real tool calls calls `recordProgress()` to clear it. Without
+    /// this, one early bad tool call (e.g. an `editFile` with unescaped quotes)
+    /// permanently spent the budget, so the *next* bad call — even after lots of
+    /// successful work — ended the turn: the "agent just stops mid-task" bug.
+    struct AgentRetryBudget {
+        private(set) var ghost = 0
+        private(set) var truncation = 0
+        /// Empty/pad-response retries. The limit + backoff live with the caller's
+        /// `RetryPolicy`, so this stays a plain counter the loop reads and bumps.
+        var pad = 0
+
+        static let ghostLimit = 1
+        static let truncationLimit = 2
+
+        /// Consume one ghost-tool-call retry; false once the consecutive limit
+        /// is hit (the loop then gives up for this stretch).
+        mutating func allowGhostRetry() -> Bool {
+            guard ghost < Self.ghostLimit else { return false }
+            ghost += 1
+            return true
+        }
+
+        /// Consume one truncated-tool-call retry; false once the limit is hit.
+        mutating func allowTruncationRetry() -> Bool {
+            guard truncation < Self.truncationLimit else { return false }
+            truncation += 1
+            return true
+        }
+
+        /// A round executed real tool calls — clear the consecutive-failure budget.
+        mutating func recordProgress() {
+            ghost = 0
+            truncation = 0
+            pad = 0
+        }
+    }
+
     /// Shared tool handler instances. Handlers are stateless — safe to reuse.
     private static var toolHandlers: [AgentToolKind: any ToolHandler] {
         [
@@ -484,12 +544,45 @@ enum AgentEngine {
         workingDirectory: inout String?,
         repetition: RepetitionTracker,
         iteration: Int,
-        agentMemory: AgentMemory
+        agentMemory: AgentMemory,
+        mcpRouter: (any MCPToolRouting)? = nil
     ) async -> ToolResult {
         // Normalize the model-emitted name (strip a leaked trailing ':' etc.)
-        // before resolving the tool. Repetition tracking below stays on the raw
+        // before resolving the tool. Repetition tracking stays on the raw
         // `tc.name` to match the caller's `RepetitionTracker.track(toolCalls:)`.
         let name = canonicalToolName(tc.name)
+
+        // ── Single repetition guard for ALL tools — built-in and MCP alike ──
+        // MCP execution used to live in a separate branch that skipped this
+        // entirely, so the model could loop on the same MCP call forever (the
+        // 26B `dbhub__search_objects` ×31). Routing both kinds through here keeps
+        // the block/warning logic in one place. `cwd` is exempt (see exemptTools)
+        // so isBlocked short-circuits false for it.
+        let output: String
+        if repetition.isBlocked(name: tc.name, arguments: tc.arguments, iteration: iteration) {
+            output = toolBlockMessage(for: tc.name)
+        } else if let mcpRouter, mcpRouter.owns(toolName: tc.name) {
+            output = await mcpRouter.executeToolCall(
+                name: tc.name, arguments: tc.arguments, rawArguments: tc.rawArguments)
+        } else {
+            output = await executeBuiltinTool(tc, name: name, workingDirectory: &workingDirectory, agentMemory: agentMemory)
+        }
+
+        // Apply warning if near repetition threshold (raw name — see above).
+        // No-ops on a "BLOCKED:" output, so blocked calls pass through unchanged.
+        let warned = repetition.applyWarning(name: tc.name, arguments: tc.arguments, output: output)
+        return ToolResult(id: tc.id, name: name, output: warned)
+    }
+
+    /// Dispatch a built-in (non-MCP) tool: cwd, param validation, then the
+    /// registered handler. Returns the raw output; the shared repetition guard
+    /// and warning are applied by the caller (`executeToolCall`).
+    private static func executeBuiltinTool(
+        _ tc: APIClient.ToolCall,
+        name: String,
+        workingDirectory: inout String?,
+        agentMemory: AgentMemory
+    ) async -> String {
         let tool = AgentToolKind(rawValue: name)
 
         // Smart fallback: editFile with content but no find → writeFile
@@ -500,60 +593,50 @@ enum AgentEngine {
             effectiveTool = tool
         }
 
-        var output: String
-
         if effectiveTool == .cwd {
             // Change working directory for subsequent calls
-            if let path = tc.arguments["path"] {
-                let resolved: String
-                if path.hasPrefix("/") || path.hasPrefix("~") {
-                    resolved = NSString(string: path).expandingTildeInPath
-                } else if let wd = workingDirectory {
-                    resolved = (wd as NSString).appendingPathComponent(path)
-                } else {
-                    resolved = path
-                }
-                let normalized = (resolved as NSString).standardizingPath
-                var isDir: ObjCBool = false
-                if FileManager.default.fileExists(atPath: normalized, isDirectory: &isDir), isDir.boolValue {
-                    workingDirectory = normalized
-                    output = "Changed working directory to \(normalized)"
-                } else {
-                    output = "Error: '\(normalized)' is not a directory"
-                }
-            } else {
-                output = "Error: cwd requires a path parameter. Example: {\"path\": \"myproject\"}"
+            guard let path = tc.arguments["path"] else {
+                return "Error: cwd requires a path parameter. Example: {\"path\": \"myproject\"}"
             }
-        } else if repetition.isBlocked(name: tc.name, arguments: tc.arguments, iteration: iteration) {
-            output = toolBlockMessage(for: tc.name)
-        } else {
-            // Validate required parameters
-            let missing = missingRequiredParams(for: name, arguments: tc.arguments)
-            if !missing.isEmpty {
-                if (name == "writeFile" || name == "editFile") && missing.contains("content") && tc.arguments["path"] != nil {
-                    output = "Error: \(name) content was truncated — your output was too long and got cut off before the content was complete. The file was NOT written. To fix this, use shell with a heredoc instead: {\"command\": \"cat << 'FILEEOF' > \(tc.arguments["path"] ?? "path")\\nfile content here\\nFILEEOF\"}"
-                } else {
-                    output = "Error: \(name) missing required params: \(missing.joined(separator: ", ")). Example: \(toolExample(for: name))"
-                }
-            } else if let effectiveTool, let handler = toolHandlers[effectiveTool] {
-                do {
-                    output = try await handler.execute(parameters: tc.arguments, workingDirectory: workingDirectory)
-                    if effectiveTool == .shell, let cmd = tc.arguments["command"] {
-                        agentMemory.recordCommand(cmd)
-                    }
-                } catch {
-                    let argsDesc = tc.arguments.isEmpty ? "none" : tc.arguments.map { "\($0.key)=\($0.value.prefix(30))" }.joined(separator: ", ")
-                    output = "Error: \(error.localizedDescription). You sent args: [\(argsDesc)]. Example: \(toolExample(for: name))"
-                }
+            let resolved: String
+            if path.hasPrefix("/") || path.hasPrefix("~") {
+                resolved = NSString(string: path).expandingTildeInPath
+            } else if let wd = workingDirectory {
+                resolved = (wd as NSString).appendingPathComponent(path)
             } else {
-                output = "Error: Unknown tool '\(name)'"
+                resolved = path
             }
+            let normalized = (resolved as NSString).standardizingPath
+            var isDir: ObjCBool = false
+            if FileManager.default.fileExists(atPath: normalized, isDirectory: &isDir), isDir.boolValue {
+                workingDirectory = normalized
+                return "Changed working directory to \(normalized)"
+            }
+            return "Error: '\(normalized)' is not a directory"
         }
 
-        // Apply warning if near repetition threshold (raw name — see above).
-        output = repetition.applyWarning(name: tc.name, arguments: tc.arguments, output: output)
+        // Validate required parameters
+        let missing = missingRequiredParams(for: name, arguments: tc.arguments)
+        if !missing.isEmpty {
+            if (name == "writeFile" || name == "editFile") && missing.contains("content") && tc.arguments["path"] != nil {
+                return "Error: \(name) content was truncated — your output was too long and got cut off before the content was complete. The file was NOT written. To fix this, use shell with a heredoc instead: {\"command\": \"cat << 'FILEEOF' > \(tc.arguments["path"] ?? "path")\\nfile content here\\nFILEEOF\"}"
+            }
+            return "Error: \(name) missing required params: \(missing.joined(separator: ", ")). Example: \(toolExample(for: name))"
+        }
 
-        return ToolResult(id: tc.id, name: name, output: output)
+        guard let effectiveTool, let handler = toolHandlers[effectiveTool] else {
+            return "Error: Unknown tool '\(name)'"
+        }
+        do {
+            let output = try await handler.execute(parameters: tc.arguments, workingDirectory: workingDirectory)
+            if effectiveTool == .shell, let cmd = tc.arguments["command"] {
+                agentMemory.recordCommand(cmd)
+            }
+            return output
+        } catch {
+            let argsDesc = tc.arguments.isEmpty ? "none" : tc.arguments.map { "\($0.key)=\($0.value.prefix(30))" }.joined(separator: ", ")
+            return "Error: \(error.localizedDescription). You sent args: [\(argsDesc)]. Example: \(toolExample(for: name))"
+        }
     }
 
     // MARK: - Tool Result Overflow

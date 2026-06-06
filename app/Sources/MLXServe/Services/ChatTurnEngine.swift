@@ -65,6 +65,17 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
         appState.chatSessions.first { $0.id == id }
     }
 
+    /// Apply a coalesced streaming batch into the session. Streamed tokens are
+    /// batched (see `StreamCoalescer`) rather than written one at a time so the
+    /// per-token `AppState.objectWillChange` churn can't re-render — and wedge —
+    /// the open tray popover during the assistant's answer.
+    private func applyStreamBatch(_ batch: (content: String, reasoning: String)?,
+                                  to sessionId: UUID) {
+        guard let batch else { return }
+        if !batch.content.isEmpty { appState.updateLastMessage(in: sessionId, content: batch.content) }
+        if !batch.reasoning.isEmpty { appState.updateLastMessage(in: sessionId, reasoning: batch.reasoning) }
+    }
+
     // MARK: - Public API (TurnRunning)
 
     func stop() {
@@ -170,23 +181,32 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                 defaults: APIClient.RequestDefaults.from(appState.serverOptions),
                 modelId: server.modelInfo?.name
             )
+            var coalescer = StreamCoalescer()
             for try await event in stream {
                 try Task.checkCancellation()
                 switch event {
                 case .content(let text):
-                    appState.updateLastMessage(in: sessionId, content: text)
+                    applyStreamBatch(coalescer.add(content: text, now: Date().timeIntervalSinceReferenceDate),
+                                     to: sessionId)
                 case .reasoning(let text):
-                    appState.updateLastMessage(in: sessionId, reasoning: text)
+                    applyStreamBatch(coalescer.add(reasoning: text, now: Date().timeIntervalSinceReferenceDate),
+                                     to: sessionId)
                 case .usage(let usage):
+                    applyStreamBatch(coalescer.drain(), to: sessionId)
                     appState.updateLastMessage(in: sessionId, usage: usage)
                 case .toolCalls:
                     break
                 case .maxTokensReached:
-                    appState.updateLastMessage(in: sessionId, content: "\n\n⚠️ *Output truncated — max tokens (\(appState.maxTokens)) reached.*")
+                    // Plain chat is a single, always-terminal response — show the
+                    // notice immediately (no agent loop to stack it). Flush any
+                    // buffered text first so the notice lands after it, in order.
+                    applyStreamBatch(coalescer.drain(), to: sessionId)
+                    appState.updateLastMessage(in: sessionId, content: TruncationNotice.text(maxTokens: appState.maxTokens))
                 case .done:
                     break
                 }
             }
+            applyStreamBatch(coalescer.drain(), to: sessionId)   // flush the trailing batch
         } catch is CancellationError {
             // Stopped by user
         } catch {
@@ -268,18 +288,17 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                               approval: @escaping (APIClient.ToolCall) async -> Bool) async throws {
         var workingDirectory = initialWorkDir
         let maxIterations = 150
-        var padRetries = 0
         let padRetryPolicy = RetryPolicy.aggressive
         let repetition = AgentEngine.RepetitionTracker()
         // Bail out if the model spends several rounds where every tool call
         // fails/blocks (e.g. an unresolvable tool name) instead of grinding to
         // `maxIterations` achieving nothing.
         var stuck = AgentEngine.StuckDetector()
-        var truncationRetries = 0
-        // One retry when the model exits with a malformed/ghost tool-call tag
-        // in its content instead of a proper finish — re-prompt for a clean
-        // plain-text summary so the user isn't left staring at `<|tool_call>…`.
-        var completionRetries = 0
+        // Budget for recoverable failures: ghost/malformed tool calls, truncated
+        // tool-call args, empty/pad responses. CONSECUTIVE, not cumulative — a
+        // real tool round resets it (recordProgress below), so an isolated late
+        // failure doesn't end a long, productive turn.
+        var retry = AgentEngine.AgentRetryBudget()
 
         for iteration in 0..<maxIterations {
             try Task.checkCancellation()
@@ -362,24 +381,34 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
             let streamTask = Task<(tcs: [APIClient.ToolCall], maxHit: Bool), Error> {
                 var tcs: [APIClient.ToolCall] = []
                 var maxHit = false
+                var coalescer = StreamCoalescer()
                 for try await event in stream {
                     try Task.checkCancellation()
                     switch event {
                     case .content(let text):
-                        appState.updateLastMessage(in: sessionId, content: text)
+                        self.applyStreamBatch(coalescer.add(content: text, now: Date().timeIntervalSinceReferenceDate),
+                                              to: sessionId)
                     case .reasoning(let text):
-                        appState.updateLastMessage(in: sessionId, reasoning: text)
+                        self.applyStreamBatch(coalescer.add(reasoning: text, now: Date().timeIntervalSinceReferenceDate),
+                                              to: sessionId)
                     case .usage(let usage):
+                        self.applyStreamBatch(coalescer.drain(), to: sessionId)
                         appState.updateLastMessage(in: sessionId, usage: usage)
                     case .toolCalls(let calls):
                         tcs = calls
                     case .maxTokensReached:
+                        // Just record it. The notice is surfaced once at the
+                        // turn's terminal exit (see below) — appending here, per
+                        // iteration, is what stacked duplicate banners on a
+                        // multi-step agent turn.
                         maxHit = true
-                        appState.updateLastMessage(in: sessionId, content: "\n\n⚠️ *Output truncated — max tokens (\(appState.maxTokens)) reached. Try breaking the task into smaller steps.*")
                     case .done:
                         break
                     }
                 }
+                // Flush the trailing batch so the message content is complete
+                // before the post-stream truncation/pad checks read it back.
+                self.applyStreamBatch(coalescer.drain(), to: sessionId)
                 return (tcs, maxHit)
             }
             // Wire the user's Stop button through to the inner stream task.
@@ -400,8 +429,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
             // the tool call args are likely truncated (incomplete JSON). Don't execute them —
             // mark the broken message as non-replayable (preserves reasoning in the UI)
             // and nudge the model to try again more concisely.
-            if maxTokensHit && !receivedToolCalls.isEmpty && truncationRetries < 2 {
-                truncationRetries += 1
+            if maxTokensHit && !receivedToolCalls.isEmpty && retry.allowTruncationRetry() {
                 if let sIdx = appState.chatSessions.firstIndex(where: { $0.id == sessionId }),
                    !appState.chatSessions[sIdx].messages.isEmpty {
                     let mIdx = appState.chatSessions[sIdx].messages.count - 1
@@ -428,9 +456,9 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                         let mIdx = appState.chatSessions[sIdx].messages.count - 1
                         appState.chatSessions[sIdx].messages[mIdx].failedRetry = true
                     }
-                    padRetries += 1
-                    if padRetries <= padRetryPolicy.maxRetries {
-                        let delay = padRetryPolicy.delay(for: padRetries)
+                    retry.pad += 1
+                    if retry.pad <= padRetryPolicy.maxRetries {
+                        let delay = padRetryPolicy.delay(for: retry.pad)
                         try? await Task.sleep(nanoseconds: delay)
                         continue
                     }
@@ -466,8 +494,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                     lastContent.contains("<tool_call|>") ||
                     lastContent.contains("<tool name=") ||
                     lastContent.contains("<function=")
-                if looksLikeGhostToolCall && completionRetries < 1 {
-                    completionRetries += 1
+                if looksLikeGhostToolCall && retry.allowGhostRetry() {
                     if let sIdx = appState.chatSessions.firstIndex(where: { $0.id == sessionId }),
                        !appState.chatSessions[sIdx].messages.isEmpty {
                         let mIdx = appState.chatSessions[sIdx].messages.count - 1
@@ -477,8 +504,20 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                     appState.appendMessage(to: sessionId, message: nudge)
                     continue
                 }
+                // Terminal exit: a final answer with no more tool calls. If it
+                // was cut off by the cap, surface the truncation notice exactly
+                // once here — not per iteration in the stream loop above.
+                if TruncationNotice.shouldShow(maxTokensHit: maxTokensHit, turnEnding: true, willRetry: false) {
+                    appState.updateLastMessage(in: sessionId, content: TruncationNotice.text(maxTokens: appState.maxTokens))
+                }
                 return
             }
+
+            // A round with real, parseable tool calls = progress. Reset the
+            // recoverable-failure budget so an isolated *later* ghost/truncated
+            // tool call gets its own retry instead of ending the turn (the budget
+            // counts consecutive failures, not lifetime-of-turn ones).
+            retry.recordProgress()
 
             // Track repetition for this round
             repetition.track(toolCalls: receivedToolCalls)
@@ -545,19 +584,16 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                     continue
                 }
 
-                let result: AgentEngine.ToolResult
-                if mcpManager.owns(toolName: tc.name) {
-                    let output = await mcpManager.executeToolCall(
-                        name: tc.name, arguments: tc.arguments, rawArguments: tc.rawArguments
-                    )
-                    result = AgentEngine.ToolResult(id: tc.id, name: tc.name, output: output)
-                } else {
-                    result = await AgentEngine.executeToolCall(
-                        tc, workingDirectory: &workingDirectory,
-                        repetition: repetition, iteration: iteration,
-                        agentMemory: appState.agentMemory
-                    )
-                }
+                // One execution path for built-in *and* MCP tools — the shared
+                // repetition guard applies to both, so an MCP tool can no longer
+                // loop forever (it routes to `mcpManager` internally via
+                // `MCPToolRouting`).
+                let result = await AgentEngine.executeToolCall(
+                    tc, workingDirectory: &workingDirectory,
+                    repetition: repetition, iteration: iteration,
+                    agentMemory: appState.agentMemory,
+                    mcpRouter: mcpManager
+                )
                 roundOutputs.append(result.output)
 
                 // Show result in chat (display-only)

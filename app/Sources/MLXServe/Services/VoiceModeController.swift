@@ -270,6 +270,16 @@ final class VoiceModeController: ObservableObject {
         runner?.stop()
         synthesizer.stop()
         resetTurn()
+        // Release the mic before reopening it. When barge-in fires from
+        // `.recognizing` (the user made a noise that tripped VAD but never
+        // finalized — e.g. just tapping Stop), the recognizer is *still live*:
+        // `handleFinalTranscript`'s `recognizer.stop()` never ran. Calling
+        // `startListening()` → `recognizer.start()` on the running AVAudioEngine
+        // re-installs the input tap, which floods/wedges the main thread and
+        // freezes the tray ("buttons dead, dropdown still works"). Stopping first
+        // gives a clean stop→start cycle; it's a harmless no-op when the mic was
+        // already off (barge-in from `.speaking`/`.thinking`).
+        recognizer.stop()
         startListening()
     }
 

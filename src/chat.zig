@@ -906,7 +906,17 @@ pub fn splitThinkBlock(text: []const u8, thinking: bool) ThinkSplit {
             const reasoning = std.mem.trimStart(u8, text[start..], "\n ");
             return .{ .reasoning_content = if (reasoning.len > 0) reasoning else null, .content = "" };
         }
-        return .{ .reasoning_content = null, .content = std.mem.trimStart(u8, text, "\n ") };
+        // No thought block, but the model may have emitted (or been truncated
+        // right after) a dangling Gemma 4 *content* channel opener `<|channel>`
+        // / `<|channel>\n`. Strip it so a cut-off reply never leaks the raw
+        // control tag into visible content; whatever follows is the answer.
+        var content = std.mem.trimStart(u8, text, "\n ");
+        if (std.mem.startsWith(u8, content, "<|channel>\n")) {
+            content = content[11..];
+        } else if (std.mem.startsWith(u8, content, "<|channel>")) {
+            content = content[10..];
+        }
+        return .{ .reasoning_content = null, .content = std.mem.trimStart(u8, content, "\n ") };
     }
     return .{ .reasoning_content = null, .content = text };
 }
@@ -2528,6 +2538,33 @@ test "splitThinkBlock Gemma 4 thinking in progress" {
     const result = splitThinkBlock("<|channel>thought\npartial reasoning", true);
     try testing.expectEqualStrings("partial reasoning", result.reasoning_content.?);
     try testing.expectEqualStrings("", result.content);
+}
+
+test "splitThinkBlock truncated mid-thinking does not leak channel tag" {
+    // Truncation regression: the model emitted the Gemma 4 *content* channel
+    // opener (`<|channel>\n…`) directly — no thought block and no `<channel|>`
+    // close — then hit the output cap. The raw `<|channel>` control tag must
+    // never reach visible content (it used to leak straight through).
+    {
+        const r = splitThinkBlock("<|channel>\nThe answer is 42.", true);
+        try testing.expect(r.reasoning_content == null);
+        try testing.expectEqualStrings("The answer is 42.", r.content);
+    }
+    // Bare dangling opener (cut off right after the tag) → nothing visible.
+    {
+        const r = splitThinkBlock("<|channel>", true);
+        try testing.expectEqualStrings("", r.content);
+    }
+    {
+        const r = splitThinkBlock("<|channel>\n", true);
+        try testing.expectEqualStrings("", r.content);
+    }
+    // The template-injected-but-no-tags case must still pass through untouched.
+    {
+        const r = splitThinkBlock("It is currently 8:15 AM PDT.", true);
+        try testing.expect(r.reasoning_content == null);
+        try testing.expectEqualStrings("It is currently 8:15 AM PDT.", r.content);
+    }
 }
 
 test "parseToolCalls Gemma 4 format" {

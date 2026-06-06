@@ -32,6 +32,14 @@ final class ServerOptionsTests: XCTestCase {
         XCTAssertFalse(contains(args, flag: "--timeout"))   // 300 = default, not emitted
     }
 
+    /// 4096 was too low: a single thinking trace + agentic answer routinely
+    /// tripped `finish_reason: "length"` and surfaced the truncation notice.
+    /// The default per-turn output budget must be generous — the server still
+    /// clamps it to the live context window, so a high value can't overflow.
+    func testDefaultMaxTokensIsGenerous() {
+        XCTAssertGreaterThanOrEqual(ServerOptions().defaultMaxTokens, 16384)
+    }
+
     func testPLDOffUsesNoPldFlag() {
         var opts = ServerOptions()
         opts.enablePLD = false

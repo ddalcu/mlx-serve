@@ -91,6 +91,15 @@ class BaseSpeechRecognizer: NSObject, SpeechRecognizing {
     }
 
     func start() throws {
+        // Idempotent start: tear down any existing tap/engine/recognition first.
+        // `AVAudioEngine` raises (and aborts the app) if a second tap is installed
+        // on a bus that already has one, so a stray double-`start()` — e.g. a
+        // barge-in that reopens the mic while it's still live — must never reach
+        // `installTap` with the old tap in place. `stop()` is a safe no-op when
+        // nothing is running. Belt-and-suspenders with the controller's own
+        // stop-before-restart; this guarantees it engine-side for every caller.
+        stop()
+
         let input = engine.inputNode
         // (Voice-processing/echo-cancellation IO was here for talk-over barge-in;
         // the mic is off while the assistant speaks, so it isn't needed in v1 and
