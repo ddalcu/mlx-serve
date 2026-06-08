@@ -33,6 +33,7 @@ const supported_model_types = [_][]const u8{
     "gemma4_unified", "gemma4_unified_text",
     "qwen3",        "qwen3_5",        "qwen3_5_text",
     "qwen3_5_moe",  "qwen3_5_moe_text",
+    "qwen3_moe",    "qwen3_moe_text",
     "qwen3_next",
     "llama",        "mistral",
     "lfm2",         // also matches any "lfm2*" prefix (lfm2_vl etc. when added)
@@ -311,4 +312,17 @@ test "isMmprojGgufBasename catches the multimodal-projection sidecars" {
     try testing.expect(!isMmprojGgufBasename("mmproj"));
     // Suffix-only — model-mmproj.gguf is NOT the convention.
     try testing.expect(!isMmprojGgufBasename("model-mmproj.gguf"));
+}
+
+test "isSupportedModelType accepts qwen3_moe (Qwen3-30B-A3B)" {
+    // Regression for the "[discovery] skip ...: unsupported model_type
+    // 'qwen3_moe'" warning: Qwen3-30B-A3B / Qwen3-Coder-30B-A3B must be
+    // discoverable by the model manager, not silently skipped.
+    try testing.expect(isSupportedModelType("qwen3_moe"));
+    try testing.expect(isSupportedModelType("qwen3_moe_text"));
+    // Sibling arches still recognized.
+    try testing.expect(isSupportedModelType("qwen3_5_moe"));
+    try testing.expect(isSupportedModelType("qwen3"));
+    // A genuinely unknown arch is still rejected.
+    try testing.expect(!isSupportedModelType("totally_made_up_arch"));
 }

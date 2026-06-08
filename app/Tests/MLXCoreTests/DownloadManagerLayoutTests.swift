@@ -177,6 +177,19 @@ final class DownloadManagerLayoutTests: XCTestCase {
         }
     }
 
+    func testQwen3MoeIsSupportedArchitecture() {
+        // Qwen3-30B-A3B / Qwen3-Coder-30B-A3B ship model_type "qwen3_moe".
+        // A locally-discovered checkpoint must NOT be flagged "Unsupported
+        // architecture" in the model manager (issue #19).
+        for mt in ["qwen3_moe", "qwen3_moe_text"] {
+            let m = LocalModel(
+                id: "test:\(mt)", name: mt, path: "/tmp/Qwen3-Coder-30B-A3B-8bit",
+                sizeFormatted: "32 GB", modelType: mt, source: .custom, kind: .base
+            )
+            XCTAssertTrue(m.isSupportedArchitecture, "\"\(mt)\" must be in supportedModelTypes")
+        }
+    }
+
     // MARK: - mmproj sidecar filtering
 
     /// `mmproj-*.gguf` files are CLIP / audio encoders, not language models —

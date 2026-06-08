@@ -612,6 +612,35 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         if (cfg_obj.get("query_pre_attn_scalar") == null) {
             config.query_pre_attn_scalar = config.head_dim;
         }
+    } else if (std.mem.eql(u8, model_type, "qwen3_moe") or
+        std.mem.eql(u8, model_type, "qwen3_moe_text"))
+    {
+        // Qwen3-30B-A3B / Qwen3-Coder-30B-A3B. Shares qwen3_5_moe's weight
+        // layout (`mlp.gate` router + stacked `mlp.switch_mlp.*` experts) and
+        // its MoE forward, but differs in three ways that make it its OWN
+        // model_type rather than a remap onto qwen3_5_moe:
+        //   1. No GatedDeltaNet — every layer is full attention
+        //      (full_attention_interval stays 0 ⇒ isLinearLayer == false).
+        //   2. No attention output gate (attn_output_gate stays false; the
+        //      qwen3_5 split-Q path would mis-shape the projection here).
+        //   3. No shared expert (shared_expert_intermediate_size: 0, no
+        //      mlp.shared_expert.* weights). The MoE binding in
+        //      transformer.zig loads those optionally and the forward skips
+        //      the shared branch when shared_expert_gate_w is null.
+        // weight_prefix is plain "model" (no language_model nesting).
+        config.model_type = "qwen3_moe";
+        config.weight_prefix = "model";
+        config.norm_has_offset = false;
+        config.scale_embeddings = false;
+        config.has_pre_ff_norm = false;
+        config.has_qk_norm = true;
+        config.hidden_act = .silu;
+        config.has_sliding_window = false;
+        config.rope_scaling_factor = 1.0;
+        config.rope_local_base_freq = config.rope_theta;
+        if (cfg_obj.get("query_pre_attn_scalar") == null) {
+            config.query_pre_attn_scalar = config.head_dim;
+        }
     } else if (std.mem.eql(u8, model_type, "qwen3_next")) {
         config.model_type = "qwen3_next";
         config.weight_prefix = "model";
@@ -1367,4 +1396,47 @@ test "parseConfigFromJson quantized qwen3_5_moe → quant_bits from key" {
     const config = try parseConfigFromJson(testing.allocator, json);
     try testing.expectEqual(@as(u32, 4), config.quant_bits);
     try testing.expectEqual(@as(u32, 64), config.quant_group_size);
+}
+
+test "parseConfigFromJson qwen3_moe (Qwen3-30B-A3B) → MoE, no shared expert, no output gate" {
+    // Qwen3-Coder-30B-A3B / Qwen3-30B-A3B ship model_type "qwen3_moe": a pure
+    // full-attention MoE (no GatedDeltaNet) that DROPPED the shared expert that
+    // Qwen2-MoE / Qwen3.5-MoE carry (shared_expert_intermediate_size: 0, no
+    // mlp.shared_expert.* weights). It must NOT be remapped onto qwen3_5_moe
+    // (which assumes a shared expert and an attention output gate) — doing so
+    // crashed at load with "MISSING WEIGHT: ...mlp.shared_expert.gate_proj.weight".
+    const json =
+        \\{
+        \\  "model_type": "qwen3_moe",
+        \\  "hidden_size": 2048,
+        \\  "head_dim": 128,
+        \\  "num_hidden_layers": 48,
+        \\  "num_attention_heads": 32,
+        \\  "num_key_value_heads": 4,
+        \\  "num_experts": 128,
+        \\  "num_experts_per_tok": 8,
+        \\  "moe_intermediate_size": 768,
+        \\  "shared_expert_intermediate_size": 0,
+        \\  "use_qk_norm": true,
+        \\  "use_sliding_window": false,
+        \\  "rope_theta": 10000000,
+        \\  "tie_word_embeddings": false,
+        \\  "quantization": {"bits": 8, "group_size": 64}
+        \\}
+    ;
+    const config = try parseConfigFromJson(testing.allocator, json);
+    try testing.expectEqualStrings("qwen3_moe", config.model_type);
+    try testing.expectEqualStrings("model", config.weight_prefix);
+    try testing.expect(config.isMoe());
+    try testing.expectEqual(@as(u32, 128), config.num_experts);
+    try testing.expectEqual(@as(u32, 8), config.num_experts_per_tok);
+    // qwen3 attention: QK-norm on, NO output gate (that's a qwen3_5 thing).
+    try testing.expect(config.has_qk_norm);
+    try testing.expect(!config.attn_output_gate);
+    // Full attention everywhere — no GatedDeltaNet/linear layers.
+    try testing.expect(!config.isLinearLayer(0));
+    try testing.expect(!config.isLinearLayer(3));
+    try testing.expect(!config.has_hybrid_layers);
+    try testing.expect(!config.has_sliding_window);
+    try testing.expectEqual(@as(u32, 8), config.quant_bits);
 }

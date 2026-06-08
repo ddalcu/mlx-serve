@@ -26,6 +26,7 @@ let supportedModelTypes: Set<String> = [
     "gemma3", "gemma4", "gemma4_text",
     "gemma4_unified", "gemma4_unified_text",
     "qwen3", "qwen3_5", "qwen3_5_moe", "qwen3_5_moe_text", "qwen3_next",
+    "qwen3_moe", "qwen3_moe_text",
     "qwen2",
     "llama", "mistral",
     "lfm2", "lfm2-vl",

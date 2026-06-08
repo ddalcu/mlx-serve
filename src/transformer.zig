@@ -6090,12 +6090,20 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
                 lw.mlp.moe.router_scale = folded;
             }
         } else if (config.isMoe()) {
-            // Qwen3.5 MoE. Each `*_s`/`*_b` is loaded optionally — Unsloth Dynamic
-            // checkpoints (e.g. Qwen3.6-A3B UD) leave the router (`mlp.gate`) and the
-            // shared-expert gate (`mlp.shared_expert_gate`) as plain bf16, with no
-            // scales/biases. The `maybeTransposeForBf16` calls below pre-transpose
-            // bf16 weights from `[out, in]` → `[in, out]` so `qmatmulBits` can
-            // dispatch to plain `mlx_matmul`. They no-op on already-quantized weights.
+            // Qwen3.5 MoE — also serves Qwen3-30B-A3B (`qwen3_moe`), which shares
+            // this exact router/switch_mlp layout. Each `*_s`/`*_b` is loaded
+            // optionally — Unsloth Dynamic checkpoints (e.g. Qwen3.6-A3B UD) leave
+            // the router (`mlp.gate`) and the shared-expert gate
+            // (`mlp.shared_expert_gate`) as plain bf16, with no scales/biases.
+            // The shared-expert WEIGHTS themselves are also optional: qwen3_moe
+            // (Qwen3-30B-A3B / Coder) dropped the shared expert entirely
+            // (shared_expert_intermediate_size: 0, no mlp.shared_expert.*). When
+            // absent they bind to empty handles and `shared_expert_gate_w` stays
+            // null, which makes moeMLP early-return the routed-expert sum without
+            // ever reading them — so no MISSING WEIGHT crash. The
+            // `maybeTransposeForBf16` calls below pre-transpose bf16 weights from
+            // `[out, in]` → `[in, out]` so `qmatmulBits` can dispatch to plain
+            // `mlx_matmul`; they no-op on already-quantized AND on empty handles.
             lw.mlp = .{ .moe = .{
                 .router_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.gate.weight"),
                 .router_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.gate.scales") orelse mlx.mlx_array_new(),
@@ -6109,16 +6117,16 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
                 .switch_down_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.switch_mlp.down_proj.weight"),
                 .switch_down_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.switch_mlp.down_proj.scales") orelse mlx.mlx_array_new(),
                 .switch_down_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.switch_mlp.down_proj.biases") orelse mlx.mlx_array_new(),
-                .shared_gate_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.shared_expert.gate_proj.weight"),
+                .shared_gate_w = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_expert.gate_proj.weight") orelse mlx.mlx_array_new(),
                 .shared_gate_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_expert.gate_proj.scales") orelse mlx.mlx_array_new(),
                 .shared_gate_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_expert.gate_proj.biases") orelse mlx.mlx_array_new(),
-                .shared_up_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.shared_expert.up_proj.weight"),
+                .shared_up_w = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_expert.up_proj.weight") orelse mlx.mlx_array_new(),
                 .shared_up_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_expert.up_proj.scales") orelse mlx.mlx_array_new(),
                 .shared_up_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_expert.up_proj.biases") orelse mlx.mlx_array_new(),
-                .shared_down_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.shared_expert.down_proj.weight"),
+                .shared_down_w = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_expert.down_proj.weight") orelse mlx.mlx_array_new(),
                 .shared_down_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_expert.down_proj.scales") orelse mlx.mlx_array_new(),
                 .shared_down_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_expert.down_proj.biases") orelse mlx.mlx_array_new(),
-                .shared_expert_gate_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.shared_expert_gate.weight"),
+                .shared_expert_gate_w = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_expert_gate.weight"),
                 .shared_expert_gate_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_expert_gate.scales") orelse mlx.mlx_array_new(),
                 .shared_expert_gate_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_expert_gate.biases") orelse mlx.mlx_array_new(),
             } };
