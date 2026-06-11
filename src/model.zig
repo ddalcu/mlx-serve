@@ -5,6 +5,37 @@ const tokenizer_mod = @import("tokenizer.zig");
 
 pub const HiddenAct = enum { gelu_approx, silu, relu_sq };
 
+/// MLX quantization mode from config.json's `quantization.mode`. All
+/// non-affine modes store NO `.biases` tensors (per-group fp8-encoded uint8
+/// scales only) but share the packed-u32 weight layout, so supporting them is
+/// a matter of skipping the biases fetch and passing the right mode string to
+/// the mlx quantized ops. Tag names match the mlx-c mode strings exactly.
+pub const QuantMode = enum {
+    affine,
+    nvfp4,
+    mxfp4,
+    mxfp8,
+
+    pub fn fromString(name: []const u8) ?QuantMode {
+        return std.meta.stringToEnum(QuantMode, name);
+    }
+
+    /// Mode string for mlx_quantized_matmul / mlx_gather_qmm / mlx_dequantize.
+    pub fn cstr(self: QuantMode) [*:0]const u8 {
+        return switch (self) {
+            .affine => "affine",
+            .nvfp4 => "nvfp4",
+            .mxfp4 => "mxfp4",
+            .mxfp8 => "mxfp8",
+        };
+    }
+
+    /// Affine is the only mode whose checkpoints carry per-group biases.
+    pub fn hasBiases(self: QuantMode) bool {
+        return self == .affine;
+    }
+};
+
 pub const LayerBlockType = enum { attention, gated_conv, mamba2, mlp, moe };
 
 pub const ModelConfig = struct {
@@ -38,6 +69,7 @@ pub const ModelConfig = struct {
     // quantized checkpoints always set this from that key (see parseConfig).
     quant_bits: u32 = 0,
     quant_group_size: u32 = 64,
+    quant_mode: QuantMode = .affine,
 
     // Attention scale: 1/sqrt(query_pre_attn_scalar) for Gemma, 1/sqrt(head_dim) for others
     query_pre_attn_scalar: u32 = 256,
@@ -528,6 +560,14 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         const q = q_val.object;
         if (q.get("bits")) |v| config.quant_bits = @intCast(v.integer);
         if (q.get("group_size")) |v| config.quant_group_size = @intCast(v.integer);
+        if (q.get("mode")) |v| {
+            if (v == .string) {
+                config.quant_mode = QuantMode.fromString(v.string) orelse {
+                    log.err("unsupported quantization mode '{s}' (supported: affine, nvfp4, mxfp4, mxfp8)\n", .{v.string});
+                    return error.UnsupportedQuantMode;
+                };
+            }
+        }
     }
 
     // EOS tokens
@@ -1485,6 +1525,52 @@ test "parseConfigFromJson quantized qwen3_5_moe → quant_bits from key" {
     const config = try parseConfigFromJson(testing.allocator, json);
     try testing.expectEqual(@as(u32, 4), config.quant_bits);
     try testing.expectEqual(@as(u32, 64), config.quant_group_size);
+    try testing.expectEqual(QuantMode.affine, config.quant_mode);
+}
+
+test "parseConfigFromJson nvfp4 quantization mode" {
+    // NVFP4 checkpoints (issue #24): {"group_size": 16, "bits": 4, "mode": "nvfp4"}.
+    // The mode must land on config.quant_mode so the loader skips the .biases
+    // fetches (nvfp4 stores no biases tensors) and the matmul call sites pass
+    // "nvfp4" to mlx instead of "affine".
+    const json =
+        \\{
+        \\  "model_type": "qwen3",
+        \\  "hidden_size": 1024,
+        \\  "quantization": {"group_size": 16, "bits": 4, "mode": "nvfp4"}
+        \\}
+    ;
+    const config = try parseConfigFromJson(testing.allocator, json);
+    try testing.expectEqual(QuantMode.nvfp4, config.quant_mode);
+    try testing.expectEqual(@as(u32, 4), config.quant_bits);
+    try testing.expectEqual(@as(u32, 16), config.quant_group_size);
+    try testing.expect(!config.quant_mode.hasBiases());
+}
+
+test "parseConfigFromJson explicit affine mode keeps biases" {
+    const json =
+        \\{
+        \\  "model_type": "qwen3",
+        \\  "hidden_size": 1024,
+        \\  "quantization": {"group_size": 64, "bits": 4, "mode": "affine"}
+        \\}
+    ;
+    const config = try parseConfigFromJson(testing.allocator, json);
+    try testing.expectEqual(QuantMode.affine, config.quant_mode);
+    try testing.expect(config.quant_mode.hasBiases());
+}
+
+test "parseConfigFromJson unknown quantization mode → error" {
+    // An unrecognized mode must fail loudly at config parse — not crash later
+    // in the weight loader with a misleading MISSING WEIGHT error.
+    const json =
+        \\{
+        \\  "model_type": "qwen3",
+        \\  "hidden_size": 1024,
+        \\  "quantization": {"group_size": 32, "bits": 4, "mode": "fp99"}
+        \\}
+    ;
+    try testing.expectError(error.UnsupportedQuantMode, parseConfigFromJson(testing.allocator, json));
 }
 
 test "parseConfigFromJson qwen3_moe (Qwen3-30B-A3B) → MoE, no shared expert, no output gate" {

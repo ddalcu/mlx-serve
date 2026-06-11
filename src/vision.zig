@@ -334,7 +334,7 @@ pub const VisionEncoder = struct {
             try mlx.check(mlx.mlx_quantized_matmul(
                 &out, x, w, sc, qb, true,
                 mlx.mlx_optional_int.some(@intCast(self.proj_quant_group_size)),
-                mlx.mlx_optional_int.some(@intCast(bits)), "affine", self.s,
+                mlx.mlx_optional_int.some(@intCast(bits)), self.config.quant_mode.cstr(), self.s,
             ));
         } else {
             var wt = mlx.mlx_array_new();
@@ -660,7 +660,7 @@ pub const VisionEncoder = struct {
             try mlx.check(mlx.mlx_quantized_matmul(
                 &post_normed, pre_proj_normed, self.proj_w, self.proj_s, self.proj_b,
                 true, mlx.mlx_optional_int.some(@intCast(self.proj_quant_group_size)),
-                mlx.mlx_optional_int.some(@intCast(self.proj_quant_bits)), "affine", self.s,
+                mlx.mlx_optional_int.some(@intCast(self.proj_quant_bits)), self.config.quant_mode.cstr(), self.s,
             ));
         } else {
             var proj_wt = mlx.mlx_array_new();

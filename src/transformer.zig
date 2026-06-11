@@ -101,6 +101,7 @@ const model_mod = @import("model.zig");
 const log = @import("log.zig");
 
 const ModelConfig = model_mod.ModelConfig;
+const QuantMode = model_mod.QuantMode;
 const Weights = model_mod.Weights;
 
 // ── KV Cache (standard attention) ──
@@ -1251,13 +1252,14 @@ const HybridLayerWeights = struct {
 // matching the perf commit's intent of "eliminate per-call detect overhead" while
 // supporting mixed-precision quantization (Gemma-4 MoE per-layer bits, etc.).
 const BITS_CACHE_CAP: usize = 1024; // plenty for 60 layers × ~10 quant weights × factor
-const QuantParams = struct { bits: u32, group_size: u32 };
+const QuantParams = struct { bits: u32, group_size: u32, mode: QuantMode = .affine };
 const QuantParamsCache = struct {
     keys: [BITS_CACHE_CAP]?*anyopaque = [_]?*anyopaque{null} ** BITS_CACHE_CAP,
     vals_bits: [BITS_CACHE_CAP]u8 = [_]u8{0} ** BITS_CACHE_CAP,
-    // group_size is always a small power of two in MLX (32, 64, 128). Store as
-    // group_size/8 to fit u8 with headroom up to 2040.
+    // group_size is always a small power of two in MLX (16, 32, 64, 128).
+    // Store as group_size/8 to fit u8 with headroom up to 2040.
     vals_gs_div8: [BITS_CACHE_CAP]u8 = [_]u8{0} ** BITS_CACHE_CAP,
+    vals_mode: [BITS_CACHE_CAP]u8 = [_]u8{0} ** BITS_CACHE_CAP,
 
     inline fn slot(key: *anyopaque) usize {
         const h: usize = @intFromPtr(key);
@@ -1265,19 +1267,19 @@ const QuantParamsCache = struct {
         return (h *% 0x9E3779B97F4A7C15) >> @as(u6, @intCast(@bitSizeOf(usize) - 10));
     }
 
-    /// Insert (bits, group_size) for `key`. Returns false if the probe
-    /// window saturated (caller should treat as "fall through to detection"
-    /// — but realistically never fires given BITS_CACHE_CAP is 1024 vs ~2k
-    /// weights max).
-    fn put(self: *QuantParamsCache, key: *anyopaque, bits: u32, group_size: u32) bool {
+    /// Insert params for `key`. Returns false if the probe window saturated
+    /// (caller should treat as "fall through to detection" — but realistically
+    /// never fires given BITS_CACHE_CAP is 1024 vs ~2k weights max).
+    fn put(self: *QuantParamsCache, key: *anyopaque, qp: QuantParams) bool {
         const start = slot(key);
         var i: usize = 0;
         while (i < 4) : (i += 1) {
             const idx = (start + i) & (BITS_CACHE_CAP - 1);
             if (self.keys[idx] == null or self.keys[idx] == key) {
                 self.keys[idx] = key;
-                self.vals_bits[idx] = @intCast(bits);
-                self.vals_gs_div8[idx] = @intCast(group_size / 8);
+                self.vals_bits[idx] = @intCast(qp.bits);
+                self.vals_gs_div8[idx] = @intCast(qp.group_size / 8);
+                self.vals_mode[idx] = @intFromEnum(qp.mode);
                 return true;
             }
         }
@@ -1452,6 +1454,11 @@ pub const Transformer = struct {
             getWeightFmt(weights, &name_buf, "{s}.embed_tokens.weight", prefix);
         // Dense bf16 (quant_bits==0): no scales/biases exist → null-ctx arrays
         // signal "plain bf16" to embedding()/dequantTake().
+        // Bias-less quant modes (nvfp4/mxfp4/mxfp8): scales exist, biases are
+        // OPTIONAL — absent on fp8 tensors, present on affine-override tensors
+        // in mixed QAT checkpoints. A mandatory fetch would be a spurious
+        // MISSING WEIGHT crash (issue #24).
+        const bias_mandatory = config.quant_bits > 0 and config.quant_mode.hasBiases();
         const emb_s_arr = if (config.quant_bits == 0)
             mlx.mlx_array_new()
         else if (is_nemotron)
@@ -1461,9 +1468,9 @@ pub const Transformer = struct {
         const emb_b_arr = if (config.quant_bits == 0)
             mlx.mlx_array_new()
         else if (is_nemotron)
-            getWeightFmt(weights, &name_buf, "{s}.embeddings.biases", prefix)
+            (if (bias_mandatory) getWeightFmt(weights, &name_buf, "{s}.embeddings.biases", prefix) else getWeightFmtOpt(weights, &name_buf, "{s}.embeddings.biases", prefix) orelse mlx.mlx_array_new())
         else
-            getWeightFmt(weights, &name_buf, "{s}.embed_tokens.biases", prefix);
+            (if (bias_mandatory) getWeightFmt(weights, &name_buf, "{s}.embed_tokens.biases", prefix) else getWeightFmtOpt(weights, &name_buf, "{s}.embed_tokens.biases", prefix) orelse mlx.mlx_array_new());
 
         const emb_scale: ?mlx.mlx_array = if (config.scale_embeddings)
             bf16Scalar(@sqrt(@as(f32, @floatFromInt(config.hidden_size))), s)
@@ -1499,7 +1506,12 @@ pub const Transformer = struct {
                 // Dense bf16: no scales/biases → null-ctx; lmHeadProject() then
                 // projects via a transposed view of the [vocab, hidden] weight.
                 lm_head_s = if (config.quant_bits == 0) mlx.mlx_array_new() else getWeightFmt(weights, &name_buf, "{s}.lm_head.scales", lm_prefix);
-                lm_head_b = if (config.quant_bits == 0) mlx.mlx_array_new() else getWeightFmt(weights, &name_buf, "{s}.lm_head.biases", lm_prefix);
+                lm_head_b = if (config.quant_bits == 0)
+                    mlx.mlx_array_new()
+                else if (bias_mandatory)
+                    getWeightFmt(weights, &name_buf, "{s}.lm_head.biases", lm_prefix)
+                else
+                    getWeightFmtOpt(weights, &name_buf, "{s}.lm_head.biases", lm_prefix) orelse mlx.mlx_array_new();
                 owns_lm_head = !config.tie_word_embeddings;
             } else if (weights.get("lm_head.weight")) |w| {
                 lm_head_w = w;
@@ -1580,12 +1592,20 @@ pub const Transformer = struct {
             ple_emb_w = getWeightFmt(weights, &name_buf, "{s}.embed_tokens_per_layer.weight", prefix);
             // Dense bf16: no scales/biases → null-ctx; dequantTake takes its dense path.
             ple_emb_s = if (config.quant_bits == 0) mlx.mlx_array_new() else getWeightFmt(weights, &name_buf, "{s}.embed_tokens_per_layer.scales", prefix);
-            ple_emb_b = if (config.quant_bits == 0) mlx.mlx_array_new() else getWeightFmt(weights, &name_buf, "{s}.embed_tokens_per_layer.biases", prefix);
+            ple_emb_b = if (config.quant_bits == 0)
+                mlx.mlx_array_new()
+            else if (bias_mandatory)
+                getWeightFmt(weights, &name_buf, "{s}.embed_tokens_per_layer.biases", prefix)
+            else
+                getWeightFmtOpt(weights, &name_buf, "{s}.embed_tokens_per_layer.biases", prefix) orelse mlx.mlx_array_new();
             ple_proj_w_g = getWeightFmt(weights, &name_buf, "{s}.per_layer_model_projection.weight", prefix);
             // per_layer_model_projection may be unquantized (no scales/biases)
             if (getWeightFmtOpt(weights, &name_buf, "{s}.per_layer_model_projection.scales", prefix)) |sc| {
                 ple_proj_s_g = sc;
-                ple_proj_b_g = getWeightFmt(weights, &name_buf, "{s}.per_layer_model_projection.biases", prefix);
+                ple_proj_b_g = if (bias_mandatory)
+                    getWeightFmt(weights, &name_buf, "{s}.per_layer_model_projection.biases", prefix)
+                else
+                    getWeightFmtOpt(weights, &name_buf, "{s}.per_layer_model_projection.biases", prefix) orelse mlx.mlx_array_new();
                 ple_proj_quantized = true;
             }
             ple_proj_norm = getWeightFmt(weights, &name_buf, "{s}.per_layer_projection_norm.weight", prefix);
@@ -2325,11 +2345,12 @@ pub const Transformer = struct {
     // ── Core ops ──
 
     inline fn qmatmul(self: *const Transformer, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array) !mlx.mlx_array {
-        // Resolve (bits, group_size) per weight. Most weights inherit the global
-        // config; per-weight overrides land in the cache at bind time so qmatmul
-        // calls see the correct params without changing the call sites.
-        const qp = self.quantParamsFor(w, sc);
-        return qmatmulBits(x, w, sc, bi, qp.bits, qp.group_size, self.s);
+        // Resolve (bits, group_size, mode) per weight. Most weights inherit the
+        // global config; per-weight overrides (mixed-precision checkpoints, e.g.
+        // affine 8-bit shared MLP inside an nvfp4 QAT model) are detected on
+        // first touch — x's inner dim pins (bits, group_size) exactly.
+        const qp = self.quantParamsHinted(w, sc, lastDim(x));
+        return qmatmulBits(x, w, sc, bi, qp.bits, qp.group_size, qp.mode, self.s);
     }
 
     /// Final logits projection. For dense bf16 the lm_head weight is [vocab, hidden]
@@ -2347,21 +2368,25 @@ pub const Transformer = struct {
         return self.qmatmul(x, self.lm_head_w, self.lm_head_s, self.lm_head_b);
     }
 
-    /// Resolve per-weight quant bits — convenience for callers that only need
-    /// bits (e.g. embedding gather) and use `config.quant_group_size` directly.
-    inline fn bitsFor(self: *const Transformer, w: mlx.mlx_array, sc: mlx.mlx_array, group_size: u32) u32 {
-        _ = group_size; // accepted for API compatibility; we always use the cached value
-        return self.quantParamsFor(w, sc).bits;
+    /// Resolve per-weight quant params without an activation hint — for callers
+    /// like the embedding gather whose tensors follow the model-wide scheme.
+    inline fn quantParamsFor(self: *const Transformer, w: mlx.mlx_array, sc: mlx.mlx_array) QuantParams {
+        return self.quantParamsHinted(w, sc, null);
     }
 
-    /// Resolve per-weight (bits, group_size) with a lazy cache keyed by the
-    /// scales array pointer. First touch computes bits from shapes against the
-    /// global config's group_size (~4 FFI calls); subsequent calls are a single
-    /// pointer compare. Pre-populated entries take precedence over the global
-    /// default. Thread-safety: generation is single-threaded.
-    inline fn quantParamsFor(self: *const Transformer, w: mlx.mlx_array, sc: mlx.mlx_array) QuantParams {
-        const default_gs = self.config.quant_group_size;
-        const key_raw = sc.ctx orelse return .{ .bits = self.config.quant_bits, .group_size = default_gs };
+    /// Resolve per-weight (bits, group_size, mode) with a lazy cache keyed by
+    /// the scales array pointer. First touch computes params from the scales
+    /// dtype + shapes (~4 FFI calls); subsequent calls are a single pointer
+    /// compare. `in_dim` is the weight's input dimension when the caller knows
+    /// it (activation inner dim) — required to disambiguate (bits, group_size)
+    /// for affine-override tensors inside a non-affine model.
+    /// Thread-safety: generation is single-threaded.
+    inline fn quantParamsHinted(self: *const Transformer, w: mlx.mlx_array, sc: mlx.mlx_array, in_dim: ?u32) QuantParams {
+        const key_raw = sc.ctx orelse return .{
+            .bits = self.config.quant_bits,
+            .group_size = self.config.quant_group_size,
+            .mode = self.config.quant_mode,
+        };
         const cache = @constCast(&self.bits_cache);
         const start = BitsCache.slot(key_raw);
         var i: usize = 0;
@@ -2372,18 +2397,17 @@ pub const Transformer = struct {
                 return .{
                     .bits = cache.vals_bits[idx],
                     .group_size = @as(u32, cache.vals_gs_div8[idx]) * 8,
+                    .mode = @enumFromInt(cache.vals_mode[idx]),
                 };
             }
             if (entry == null) {
-                const detected = detectQuantBits(w, sc, default_gs);
-                cache.keys[idx] = key_raw;
-                cache.vals_bits[idx] = @intCast(detected);
-                cache.vals_gs_div8[idx] = @intCast(default_gs / 8);
-                return .{ .bits = detected, .group_size = default_gs };
+                const detected = computeQuantParams(&self.config, w, sc, in_dim);
+                _ = cache.put(key_raw, detected);
+                return detected;
             }
         }
         // Probe window saturated — fall through to direct detect, no cache write.
-        return .{ .bits = detectQuantBits(w, sc, default_gs), .group_size = default_gs };
+        return computeQuantParams(&self.config, w, sc, in_dim);
     }
 
     inline fn rmsNorm(self: *const Transformer, x: mlx.mlx_array, w: mlx.mlx_array) !mlx.mlx_array {
@@ -2429,10 +2453,14 @@ pub const Transformer = struct {
             var taken_s = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(taken_s);
             try mlx.check(mlx.mlx_take_axis(&taken_s, self.emb_s, flat_ids, 0, self.s));
+            // Bias-less modes (nvfp4/mxfp4/mxfp8) have a null-ctx emb_b —
+            // mlx_take_axis on a null handle aborts, so gather only when present.
             var taken_b = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(taken_b);
-            try mlx.check(mlx.mlx_take_axis(&taken_b, self.emb_b, flat_ids, 0, self.s));
-            const emb_qp = self.quantParamsFor(self.emb_w, self.emb_s);
+            if (self.emb_b.ctx != null) {
+                try mlx.check(mlx.mlx_take_axis(&taken_b, self.emb_b, flat_ids, 0, self.s));
+            }
+            const emb_qp = self.quantParamsHinted(self.emb_w, self.emb_s, self.config.hidden_size);
             try mlx.check(mlx.mlx_dequantize(
                 &emb,
                 taken_w,
@@ -2440,7 +2468,7 @@ pub const Transformer = struct {
                 taken_b,
                 mlx.mlx_optional_int.some(@intCast(emb_qp.group_size)),
                 mlx.mlx_optional_int.some(@intCast(emb_qp.bits)),
-                "affine",
+                emb_qp.mode.cstr(),
                 .{}, // global_scale (null)
                 .{ .value = .bfloat16, .has_value = true },
                 self.s,
@@ -3034,9 +3062,12 @@ pub const Transformer = struct {
         var ts = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(ts);
         try mlx.check(mlx.mlx_take_axis(&ts, sc, ids, 0, self.s));
+        // Bias-less modes ship a null-ctx bi — gather only when present.
         var tb = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(tb);
-        try mlx.check(mlx.mlx_take_axis(&tb, bi, ids, 0, self.s));
+        if (bi.ctx != null) {
+            try mlx.check(mlx.mlx_take_axis(&tb, bi, ids, 0, self.s));
+        }
         var result = mlx.mlx_array_new();
         const qp = self.quantParamsFor(w, sc);
         try mlx.check(mlx.mlx_dequantize(
@@ -3046,7 +3077,7 @@ pub const Transformer = struct {
             tb,
             mlx.mlx_optional_int.some(@intCast(qp.group_size)),
             mlx.mlx_optional_int.some(@intCast(qp.bits)),
-            "affine",
+            qp.mode.cstr(),
             .{}, // global_scale (null)
             .{ .value = .bfloat16, .has_value = true },
             self.s,
@@ -5461,12 +5492,13 @@ pub const Transformer = struct {
     /// expert_x: input for expert computation (possibly normalized).
     fn moeMLP2(self: *Transformer, router_x: mlx.mlx_array, expert_x: mlx.mlx_array, mw: *const MoeMlpWeights) !mlx.mlx_array {
         const cfg = &self.config;
-        const gs = cfg.quant_group_size;
-        // Per-expert-weight bits: Gemma-4 MoE has 4-bit experts but 8-bit router/shared,
-        // so we can't use a single layer-wide bits value — resolve per weight.
-        const gate_bits = self.bitsFor(mw.switch_gate_w, mw.switch_gate_s, gs);
-        const up_bits = self.bitsFor(mw.switch_up_w, mw.switch_up_s, gs);
-        const down_bits = self.bitsFor(mw.switch_down_w, mw.switch_down_s, gs);
+        // Per-expert-weight params: mixed-precision MoE checkpoints vary bits
+        // (and, with non-affine modes, group size + mode) per weight — resolve
+        // each individually. gate/up consume the hidden dim; down consumes the
+        // expert intermediate dim.
+        const gate_qp = self.quantParamsHinted(mw.switch_gate_w, mw.switch_gate_s, lastDim(expert_x));
+        const up_qp = self.quantParamsHinted(mw.switch_up_w, mw.switch_up_s, lastDim(expert_x));
+        const down_qp = self.quantParamsHinted(mw.switch_down_w, mw.switch_down_s, if (cfg.moe_intermediate_size > 0) cfg.moe_intermediate_size else null);
 
         // Router: compute logits and top-K selection
         var router_logits: mlx.mlx_array = undefined;
@@ -5480,12 +5512,12 @@ pub const Transformer = struct {
             defer _ = mlx.mlx_array_free(normed_input);
             try mlx.check(mlx.mlx_fast_rms_norm(&normed_input, router_x, rs, cfg.rms_norm_eps, self.s));
 
-            const router_bits = self.bitsFor(mw.router_w, mw.router_s, gs);
-            router_logits = try qmatmulBits(normed_input, mw.router_w, mw.router_s, mw.router_b, router_bits, gs, self.s);
+            const router_qp = self.quantParamsHinted(mw.router_w, mw.router_s, lastDim(normed_input));
+            router_logits = try qmatmulBits(normed_input, mw.router_w, mw.router_s, mw.router_b, router_qp.bits, router_qp.group_size, router_qp.mode, self.s);
         } else {
             // Qwen3.5: direct projection
-            const router_bits = self.bitsFor(mw.router_w, mw.router_s, gs);
-            router_logits = try qmatmulBits(router_x, mw.router_w, mw.router_s, mw.router_b, router_bits, gs, self.s);
+            const router_qp = self.quantParamsHinted(mw.router_w, mw.router_s, lastDim(router_x));
+            router_logits = try qmatmulBits(router_x, mw.router_w, mw.router_s, mw.router_b, router_qp.bits, router_qp.group_size, router_qp.mode, self.s);
         }
 
         // Top-K + softmax/renormalize as a single fused kernel (when compiled).
@@ -5591,14 +5623,14 @@ pub const Transformer = struct {
             // output [N,1,intermediate]. squeeze inner 1 → [N, intermediate].
             var gate_out_3d = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(gate_out_3d);
-            try gatherExpertMm(&gate_out_3d, x_rep, mw.switch_gate_w, mw.switch_gate_s, mw.switch_gate_b, no_idx, sorted_inds, gate_bits, gs, true, self.s);
+            try gatherExpertMm(&gate_out_3d, x_rep, mw.switch_gate_w, mw.switch_gate_s, mw.switch_gate_b, no_idx, sorted_inds, gate_qp.bits, gate_qp.group_size, gate_qp.mode, true, self.s);
             var gate_out = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(gate_out);
             try mlx.check(mlx.mlx_squeeze(&gate_out, gate_out_3d, self.s));
 
             var up_out_3d = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(up_out_3d);
-            try gatherExpertMm(&up_out_3d, x_rep, mw.switch_up_w, mw.switch_up_s, mw.switch_up_b, no_idx, sorted_inds, up_bits, gs, true, self.s);
+            try gatherExpertMm(&up_out_3d, x_rep, mw.switch_up_w, mw.switch_up_s, mw.switch_up_b, no_idx, sorted_inds, up_qp.bits, up_qp.group_size, up_qp.mode, true, self.s);
             var up_out = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(up_out);
             try mlx.check(mlx.mlx_squeeze(&up_out, up_out_3d, self.s));
@@ -5612,7 +5644,7 @@ pub const Transformer = struct {
             try mlx.check(mlx.mlx_expand_dims(&act_exp, expert_act, -2, self.s));
             var down_3d = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(down_3d);
-            try gatherExpertMm(&down_3d, act_exp, mw.switch_down_w, mw.switch_down_s, mw.switch_down_b, no_idx, sorted_inds, down_bits, gs, true, self.s);
+            try gatherExpertMm(&down_3d, act_exp, mw.switch_down_w, mw.switch_down_s, mw.switch_down_b, no_idx, sorted_inds, down_qp.bits, down_qp.group_size, down_qp.mode, true, self.s);
             var down_squeezed = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(down_squeezed);
             try mlx.check(mlx.mlx_squeeze(&down_squeezed, down_3d, self.s)); // [N, hidden]
@@ -5633,14 +5665,14 @@ pub const Transformer = struct {
 
             var gate_out_5d = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(gate_out_5d);
-            try gatherExpertMm(&gate_out_5d, x_exp, mw.switch_gate_w, mw.switch_gate_s, mw.switch_gate_b, no_idx, inds, gate_bits, gs, false, self.s);
+            try gatherExpertMm(&gate_out_5d, x_exp, mw.switch_gate_w, mw.switch_gate_s, mw.switch_gate_b, no_idx, inds, gate_qp.bits, gate_qp.group_size, gate_qp.mode, false, self.s);
             var gate_out = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(gate_out);
             try mlx.check(mlx.mlx_squeeze(&gate_out, gate_out_5d, self.s));
 
             var up_out_5d = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(up_out_5d);
-            try gatherExpertMm(&up_out_5d, x_exp, mw.switch_up_w, mw.switch_up_s, mw.switch_up_b, no_idx, inds, up_bits, gs, false, self.s);
+            try gatherExpertMm(&up_out_5d, x_exp, mw.switch_up_w, mw.switch_up_s, mw.switch_up_b, no_idx, inds, up_qp.bits, up_qp.group_size, up_qp.mode, false, self.s);
             var up_out = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(up_out);
             try mlx.check(mlx.mlx_squeeze(&up_out, up_out_5d, self.s));
@@ -5653,7 +5685,7 @@ pub const Transformer = struct {
             try mlx.check(mlx.mlx_expand_dims(&act_exp, expert_act, -2, self.s));
             var down_5d = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(down_5d);
-            try gatherExpertMm(&down_5d, act_exp, mw.switch_down_w, mw.switch_down_s, mw.switch_down_b, no_idx, inds, down_bits, gs, false, self.s);
+            try gatherExpertMm(&down_5d, act_exp, mw.switch_down_w, mw.switch_down_s, mw.switch_down_b, no_idx, inds, down_qp.bits, down_qp.group_size, down_qp.mode, false, self.s);
             try mlx.check(mlx.mlx_squeeze(&down_out, down_5d, self.s)); // [B, S, K, hidden]
         }
 
@@ -5682,8 +5714,8 @@ pub const Transformer = struct {
         defer _ = mlx.mlx_array_free(sh_down);
 
         const seg_w = mw.shared_expert_gate_w.?;
-        const seg_bits = self.bitsFor(seg_w, mw.shared_expert_gate_s.?, gs);
-        const sh_gate_logit = try qmatmulBits(expert_x, seg_w, mw.shared_expert_gate_s.?, mw.shared_expert_gate_b.?, seg_bits, gs, self.s);
+        const seg_qp = self.quantParamsHinted(seg_w, mw.shared_expert_gate_s.?, lastDim(expert_x));
+        const sh_gate_logit = try qmatmulBits(expert_x, seg_w, mw.shared_expert_gate_s.?, mw.shared_expert_gate_b.?, seg_qp.bits, seg_qp.group_size, seg_qp.mode, self.s);
         defer _ = mlx.mlx_array_free(sh_gate_logit);
         var sh_gate_sig = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(sh_gate_sig);
@@ -5845,7 +5877,7 @@ fn initStandardLayers(allocator: std.mem.Allocator, config: ModelConfig, weights
 
         lw.q_w = getLayerWeight(weights, name_buf, prefix, li, "self_attn.q_proj.weight");
         lw.q_s = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "self_attn.q_proj.scales", config.quant_bits);
-        lw.q_b = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "self_attn.q_proj.biases", config.quant_bits);
+        lw.q_b = getLayerBias(weights, name_buf, prefix, li, "self_attn.q_proj.biases", &config);
         if (kv_shared) {
             // No own K/V — the forward reads kv_source's cache. Leave empty.
             lw.k_eq_v = false;
@@ -5858,7 +5890,7 @@ fn initStandardLayers(allocator: std.mem.Allocator, config: ModelConfig, weights
         } else {
             lw.k_w = getLayerWeight(weights, name_buf, prefix, li, "self_attn.k_proj.weight");
             lw.k_s = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "self_attn.k_proj.scales", config.quant_bits);
-            lw.k_b = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "self_attn.k_proj.biases", config.quant_bits);
+            lw.k_b = getLayerBias(weights, name_buf, prefix, li, "self_attn.k_proj.biases", &config);
             // Gemma 4 (31B): full_attention layers share V with K (no v_proj weight stored).
             // Sliding_attention layers still have separate V.
             lw.k_eq_v = config.attention_k_eq_v and config.isGlobalLayer(li);
@@ -5869,22 +5901,22 @@ fn initStandardLayers(allocator: std.mem.Allocator, config: ModelConfig, weights
             } else {
                 lw.v_w = getLayerWeight(weights, name_buf, prefix, li, "self_attn.v_proj.weight");
                 lw.v_s = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "self_attn.v_proj.scales", config.quant_bits);
-                lw.v_b = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "self_attn.v_proj.biases", config.quant_bits);
+                lw.v_b = getLayerBias(weights, name_buf, prefix, li, "self_attn.v_proj.biases", &config);
             }
         }
         lw.o_w = getLayerWeight(weights, name_buf, prefix, li, "self_attn.o_proj.weight");
         lw.o_s = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "self_attn.o_proj.scales", config.quant_bits);
-        lw.o_b = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "self_attn.o_proj.biases", config.quant_bits);
+        lw.o_b = getLayerBias(weights, name_buf, prefix, li, "self_attn.o_proj.biases", &config);
 
         lw.gate_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.gate_proj.weight");
         lw.gate_s = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "mlp.gate_proj.scales", config.quant_bits);
-        lw.gate_b = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "mlp.gate_proj.biases", config.quant_bits);
+        lw.gate_b = getLayerBias(weights, name_buf, prefix, li, "mlp.gate_proj.biases", &config);
         lw.up_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.up_proj.weight");
         lw.up_s = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "mlp.up_proj.scales", config.quant_bits);
-        lw.up_b = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "mlp.up_proj.biases", config.quant_bits);
+        lw.up_b = getLayerBias(weights, name_buf, prefix, li, "mlp.up_proj.biases", &config);
         lw.down_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.down_proj.weight");
         lw.down_s = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "mlp.down_proj.scales", config.quant_bits);
-        lw.down_b = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "mlp.down_proj.biases", config.quant_bits);
+        lw.down_b = getLayerBias(weights, name_buf, prefix, li, "mlp.down_proj.biases", &config);
 
         // Dense bf16: pre-transpose [out,in]→[in,out] so qmatmulBits dispatches to
         // a plain matmul. No-ops on quantized weights (scales non-null).
@@ -5919,10 +5951,10 @@ fn initStandardLayers(allocator: std.mem.Allocator, config: ModelConfig, weights
             // `.?` then feeds qmatmul, so supply a null-ctx array (not Zig-null) →
             // qmatmulBits sees the bf16 path.
             lw.ple_gate_s = getLayerScaleOrEmptyOpt(weights, name_buf, prefix, li, "per_layer_input_gate.scales", config.quant_bits);
-            lw.ple_gate_b = getLayerScaleOrEmptyOpt(weights, name_buf, prefix, li, "per_layer_input_gate.biases", config.quant_bits);
+            lw.ple_gate_b = getLayerBias(weights, name_buf, prefix, li, "per_layer_input_gate.biases", &config);
             lw.ple_proj_w = getLayerWeightOpt(weights, name_buf, prefix, li, "per_layer_projection.weight");
             lw.ple_proj_s = getLayerScaleOrEmptyOpt(weights, name_buf, prefix, li, "per_layer_projection.scales", config.quant_bits);
-            lw.ple_proj_b = getLayerScaleOrEmptyOpt(weights, name_buf, prefix, li, "per_layer_projection.biases", config.quant_bits);
+            lw.ple_proj_b = getLayerBias(weights, name_buf, prefix, li, "per_layer_projection.biases", &config);
             lw.ple_norm = getLayerWeightOpt(weights, name_buf, prefix, li, "post_per_layer_input_norm.weight");
             // bf16: pre-transpose the two PLE projections (used via qmatmul).
             if (lw.ple_gate_w) |*w| try maybeTransposeForBf16(w, lw.ple_gate_s.?, &owned_bf16, allocator, s);
@@ -6091,7 +6123,7 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
         } else {
             const k_w = getLayerWeight(weights, name_buf, prefix, li, "self_attn.k_proj.weight");
             const k_s = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "self_attn.k_proj.scales", config.quant_bits);
-            const k_b = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "self_attn.k_proj.biases", config.quant_bits);
+            const k_b = getLayerBias(weights, name_buf, prefix, li, "self_attn.k_proj.biases", &config);
             // Gemma 4 MoE: global layers use K=V (no separate v_proj)
             const v_w = getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.v_proj.weight") orelse k_w;
             const v_s = getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.v_proj.scales") orelse k_s;
@@ -6100,7 +6132,7 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
             lw.attn = .{ .full = .{
                 .q_w = getLayerWeight(weights, name_buf, prefix, li, "self_attn.q_proj.weight"),
                 .q_s = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "self_attn.q_proj.scales", config.quant_bits),
-                .q_b = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "self_attn.q_proj.biases", config.quant_bits),
+                .q_b = getLayerBias(weights, name_buf, prefix, li, "self_attn.q_proj.biases", &config),
                 .k_w = k_w,
                 .k_s = k_s,
                 .k_b = k_b,
@@ -6109,7 +6141,7 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
                 .v_b = v_b,
                 .o_w = getLayerWeight(weights, name_buf, prefix, li, "self_attn.o_proj.weight"),
                 .o_s = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "self_attn.o_proj.scales", config.quant_bits),
-                .o_b = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "self_attn.o_proj.biases", config.quant_bits),
+                .o_b = getLayerBias(weights, name_buf, prefix, li, "self_attn.o_proj.biases", &config),
                 .q_norm = getLayerWeight(weights, name_buf, prefix, li, "self_attn.q_norm.weight"),
                 .k_norm = getLayerWeight(weights, name_buf, prefix, li, "self_attn.k_norm.weight"),
             } };
@@ -6310,11 +6342,11 @@ fn initHybridLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: 
                 lw.op = .{ .gated_conv = .{
                     .in_proj_w = getLayerWeight(weights, name_buf, prefix, li, "conv.in_proj.weight"),
                     .in_proj_s = getLayerWeight(weights, name_buf, prefix, li, "conv.in_proj.scales"),
-                    .in_proj_b = getLayerWeight(weights, name_buf, prefix, li, "conv.in_proj.biases"),
+                    .in_proj_b = getLayerBias(weights, name_buf, prefix, li, "conv.in_proj.biases", &config),
                     .conv_w = getLayerWeight(weights, name_buf, prefix, li, "conv.conv.weight"),
                     .out_proj_w = getLayerWeight(weights, name_buf, prefix, li, "conv.out_proj.weight"),
                     .out_proj_s = getLayerWeight(weights, name_buf, prefix, li, "conv.out_proj.scales"),
-                    .out_proj_b = getLayerWeight(weights, name_buf, prefix, li, "conv.out_proj.biases"),
+                    .out_proj_b = getLayerBias(weights, name_buf, prefix, li, "conv.out_proj.biases", &config),
                 } };
             },
             .attention => {
@@ -6342,16 +6374,16 @@ fn initHybridLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: 
                     lw.op = .{ .full_attn = .{
                         .q_w = getLayerWeight(weights, name_buf, prefix, li, "self_attn.q_proj.weight"),
                         .q_s = getLayerWeight(weights, name_buf, prefix, li, "self_attn.q_proj.scales"),
-                        .q_b = getLayerWeight(weights, name_buf, prefix, li, "self_attn.q_proj.biases"),
+                        .q_b = getLayerBias(weights, name_buf, prefix, li, "self_attn.q_proj.biases", &config),
                         .k_w = getLayerWeight(weights, name_buf, prefix, li, "self_attn.k_proj.weight"),
                         .k_s = getLayerWeight(weights, name_buf, prefix, li, "self_attn.k_proj.scales"),
-                        .k_b = getLayerWeight(weights, name_buf, prefix, li, "self_attn.k_proj.biases"),
+                        .k_b = getLayerBias(weights, name_buf, prefix, li, "self_attn.k_proj.biases", &config),
                         .v_w = getLayerWeight(weights, name_buf, prefix, li, "self_attn.v_proj.weight"),
                         .v_s = getLayerWeight(weights, name_buf, prefix, li, "self_attn.v_proj.scales"),
-                        .v_b = getLayerWeight(weights, name_buf, prefix, li, "self_attn.v_proj.biases"),
+                        .v_b = getLayerBias(weights, name_buf, prefix, li, "self_attn.v_proj.biases", &config),
                         .o_w = getLayerWeight(weights, name_buf, prefix, li, "self_attn.out_proj.weight"),
                         .o_s = getLayerWeight(weights, name_buf, prefix, li, "self_attn.out_proj.scales"),
-                        .o_b = getLayerWeight(weights, name_buf, prefix, li, "self_attn.out_proj.biases"),
+                        .o_b = getLayerBias(weights, name_buf, prefix, li, "self_attn.out_proj.biases", &config),
                         .q_norm = getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.q_layernorm.weight") orelse mlx.mlx_array_new(),
                         .k_norm = getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.k_layernorm.weight") orelse mlx.mlx_array_new(),
                     } };
@@ -6396,13 +6428,13 @@ fn initHybridLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: 
             lw.mlp = .{
                 .gate_w = getLayerWeight(weights, name_buf, prefix, li, "feed_forward.w1.weight"),
                 .gate_s = getLayerWeight(weights, name_buf, prefix, li, "feed_forward.w1.scales"),
-                .gate_b = getLayerWeight(weights, name_buf, prefix, li, "feed_forward.w1.biases"),
+                .gate_b = getLayerBias(weights, name_buf, prefix, li, "feed_forward.w1.biases", &config),
                 .up_w = getLayerWeight(weights, name_buf, prefix, li, "feed_forward.w3.weight"),
                 .up_s = getLayerWeight(weights, name_buf, prefix, li, "feed_forward.w3.scales"),
-                .up_b = getLayerWeight(weights, name_buf, prefix, li, "feed_forward.w3.biases"),
+                .up_b = getLayerBias(weights, name_buf, prefix, li, "feed_forward.w3.biases", &config),
                 .down_w = getLayerWeight(weights, name_buf, prefix, li, "feed_forward.w2.weight"),
                 .down_s = getLayerWeight(weights, name_buf, prefix, li, "feed_forward.w2.scales"),
-                .down_b = getLayerWeight(weights, name_buf, prefix, li, "feed_forward.w2.biases"),
+                .down_b = getLayerBias(weights, name_buf, prefix, li, "feed_forward.w2.biases", &config),
             };
         } else {
             lw.mlp = null;
@@ -6472,6 +6504,63 @@ fn detectQuantBits(w: mlx.mlx_array, sc: mlx.mlx_array, group_size: u32) u32 {
     const s_cols: u32 = @intCast(s_shape[s_shape.len - 1]);
     if (s_cols == 0) return 4;
     return (w_cols * 32) / (s_cols * group_size);
+}
+
+/// Last-axis size of an array, as the input-dimension hint for
+/// `quantParamsHinted`. Null for null-ctx handles or degenerate shapes.
+inline fn lastDim(x: mlx.mlx_array) ?u32 {
+    if (x.ctx == null) return null;
+    const shape = mlx.getShape(x);
+    if (shape.len == 0) return null;
+    const d = shape[shape.len - 1];
+    return if (d > 0) @as(u32, @intCast(d)) else null;
+}
+
+/// Detect a quantized weight's (bits, group_size, mode) from its scales tensor
+/// plus the model config:
+/// - uint8 scales → fp8-family. In an nvfp4/mxfp4/mxfp8 model the config's
+///   mode/bits/group_size apply (the fp8 scheme is uniform within a model).
+///   Under an affine config this is the legacy "mxfp8 tensor inside an affine
+///   checkpoint" case: bits is always 8, group size from the shape ratio.
+/// - float scales → affine. In an affine model, bits via detectQuantBits
+///   against the config group_size (mixed-precision models share one gs). For
+///   affine OVERRIDES inside a non-affine model (e.g. nvfp4 QAT checkpoints
+///   keep the shared MLP at affine 8-bit/gs64) the config group_size doesn't
+///   apply: w_cols*32/s_cols only pins bits×gs, so solve exactly with the
+///   caller's `in_dim` (activation inner dim); without a hint, assume mlx-lm's
+///   override default group size 64.
+fn computeQuantParams(config: *const ModelConfig, w: mlx.mlx_array, sc: mlx.mlx_array, in_dim: ?u32) QuantParams {
+    const w_shape = mlx.getShape(w);
+    const s_shape = mlx.getShape(sc);
+    const w_cols: u32 = if (w_shape.len >= 2) @intCast(w_shape[w_shape.len - 1]) else 0;
+    const s_cols: u32 = if (s_shape.len >= 2) @intCast(s_shape[s_shape.len - 1]) else 0;
+
+    if (mlx.mlx_array_dtype(sc) == .uint8) {
+        if (config.quant_mode != .affine) {
+            return .{ .bits = config.quant_bits, .group_size = config.quant_group_size, .mode = config.quant_mode };
+        }
+        const gs: u32 = if (w_cols > 0 and s_cols > 0) (w_cols * 32) / (s_cols * 8) else 32;
+        return .{ .bits = 8, .group_size = gs, .mode = .mxfp8 };
+    }
+
+    if (config.quant_mode == .affine) {
+        return .{
+            .bits = detectQuantBits(w, sc, config.quant_group_size),
+            .group_size = config.quant_group_size,
+            .mode = .affine,
+        };
+    }
+
+    if (in_dim) |in| {
+        if (in > 0 and s_cols > 0 and w_cols > 0) {
+            return .{ .bits = (w_cols * 32) / in, .group_size = in / s_cols, .mode = .affine };
+        }
+    }
+    if (w_cols > 0 and s_cols > 0) {
+        const ratio = (w_cols * 32) / s_cols; // = bits × group_size
+        return .{ .bits = @max(ratio / 64, 1), .group_size = 64, .mode = .affine };
+    }
+    return .{ .bits = 8, .group_size = 64, .mode = .affine };
 }
 
 /// MoE routing chain (negate→argpartition→slice→softmax→take→sum→expand→divide).
@@ -6570,7 +6659,7 @@ fn moeRoutingChain(router_logits: mlx.mlx_array, k: c_int, s: mlx.mlx_stream) !T
 /// Dense bf16 (sc.ctx == null): mlx_gather_mm; w was pre-transposed to [E,in,out] at load
 /// (maybeTransposeForBf16 + generalized transposeBf16Weight), so x @ w is correct with no
 /// transpose flag — mirrors mlx-lm's `gather_mm(x, weight.swapaxes(-1,-2))`.
-fn gatherExpertMm(res: *mlx.mlx_array, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, lhs_idx: mlx.mlx_array, rhs_idx: mlx.mlx_array, bits: u32, group_size: u32, sorted: bool, s: mlx.mlx_stream) !void {
+fn gatherExpertMm(res: *mlx.mlx_array, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, lhs_idx: mlx.mlx_array, rhs_idx: mlx.mlx_array, bits: u32, group_size: u32, mode: QuantMode, sorted: bool, s: mlx.mlx_stream) !void {
     if (sc.ctx == null) {
         // mlx 0.31.2's `mlx_gather_mm` returns WRONG results with sorted_indices=true
         // for the dense (non-quantized) path — the quantized `mlx_gather_qmm` honors
@@ -6584,11 +6673,11 @@ fn gatherExpertMm(res: *mlx.mlx_array, x: mlx.mlx_array, w: mlx.mlx_array, sc: m
         // correctly.
         try mlx.check(mlx.mlx_gather_mm(res, x, w, lhs_idx, rhs_idx, false, s));
     } else {
-        try mlx.check(mlx.mlx_gather_qmm(res, x, w, sc, bi, lhs_idx, rhs_idx, true, mlx.mlx_optional_int.some(@intCast(group_size)), mlx.mlx_optional_int.some(@intCast(bits)), "affine", sorted, s));
+        try mlx.check(mlx.mlx_gather_qmm(res, x, w, sc, bi, lhs_idx, rhs_idx, true, mlx.mlx_optional_int.some(@intCast(group_size)), mlx.mlx_optional_int.some(@intCast(bits)), mode.cstr(), sorted, s));
     }
 }
 
-fn qmatmulBits(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, bits: u32, group_size: u32, s: mlx.mlx_stream) !mlx.mlx_array {
+fn qmatmulBits(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, bits: u32, group_size: u32, mode: QuantMode, s: mlx.mlx_stream) !mlx.mlx_array {
     // Plain BF16 weight: scales array is unset. Used by mixed-precision Unsloth
     // Dynamic checkpoints that leave a subset of layers (e.g. linear_attn
     // projections in Qwen3.6 UD) unquantized. The weight is pre-transposed at
@@ -6599,7 +6688,30 @@ fn qmatmulBits(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.ml
         return fp_result;
     }
 
-    // Detect mxfp8 mode: biases array has null ctx (created with mlx_array_new())
+    // Non-affine model-wide mode (nvfp4 / mxfp4 / mxfp8 from config.json):
+    // bias-less by construction; bits/group_size come from the config like
+    // affine. Checked BEFORE the legacy null-bias heuristic below, which
+    // would misroute e.g. an nvfp4 weight to mxfp8.
+    if (mode != .affine) {
+        var result = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_quantized_matmul(
+            &result,
+            x,
+            w,
+            sc,
+            mlx.mlx_array{ .ctx = null },
+            true,
+            mlx.mlx_optional_int.some(@intCast(group_size)),
+            mlx.mlx_optional_int.some(@intCast(bits)),
+            mode.cstr(),
+            s,
+        ));
+        return result;
+    }
+
+    // Legacy heuristic for mixed checkpoints whose config declares affine but
+    // whose individual tensors lack biases (NVIDIA mxfp8 layers): biases array
+    // has null ctx (created with mlx_array_new()).
     const is_mxfp = bi.ctx == null;
 
     if (is_mxfp) {
@@ -6710,6 +6822,19 @@ fn getLayerWeight(weights: *const Weights, buf: *[256]u8, prefix: []const u8, la
 fn getLayerScaleOrEmpty(weights: *const Weights, buf: *[256]u8, prefix: []const u8, layer: u32, suffix: []const u8, quant_bits: u32) mlx.mlx_array {
     if (quant_bits == 0) return mlx.mlx_array_new();
     return getLayerWeight(weights, buf, prefix, layer, suffix);
+}
+
+/// Fetch a `.biases` tensor with mode-aware mandatoriness:
+/// - dense bf16 (quant_bits == 0): null-ctx placeholder, like the scales.
+/// - affine mode: mandatory — a missing bias is a clear MISSING WEIGHT error.
+/// - bias-less modes (nvfp4/mxfp4/mxfp8, issue #24): OPTIONAL. The fp8
+///   tensors ship no biases, but mixed QAT checkpoints override some layers
+///   to affine (e.g. shared MLP at 8-bit/gs64) and those overrides DO carry
+///   biases that the affine matmul needs.
+fn getLayerBias(weights: *const Weights, buf: *[256]u8, prefix: []const u8, layer: u32, suffix: []const u8, config: *const ModelConfig) mlx.mlx_array {
+    if (config.quant_bits == 0) return mlx.mlx_array_new();
+    if (config.quant_mode.hasBiases()) return getLayerWeight(weights, buf, prefix, layer, suffix);
+    return getLayerWeightOpt(weights, buf, prefix, layer, suffix) orelse mlx.mlx_array_new();
 }
 
 /// Optional-typed variant for fields stored as `?mlx_array` (e.g. PLE projections).
@@ -7232,6 +7357,68 @@ test "SSMCacheEntry snapshot/restore handles null ssm_state (LFM2 gated_conv)" {
     try testing.expectEqual(@as(c_int, 4), restored[2]);
 }
 
+test "computeQuantParams resolves mixed nvfp4 + affine-override weights" {
+    // Real-world shape: gemma-4 QAT nvfp4 checkpoints quantize most tensors
+    // nvfp4 (uint8 fp8 scales, gs 16) but override the shared MLP to affine
+    // 8-bit/gs64 (bf16 scales + biases). Detection key: scales dtype, then
+    // the activation inner dim to pin (bits, group_size) for the override.
+    const s = mlx.gpuStream();
+    const IN = 2560;
+    const OUT = 8;
+
+    var cfg = ModelConfig{};
+    cfg.quant_bits = 4;
+    cfg.quant_group_size = 16;
+    cfg.quant_mode = .nvfp4;
+
+    // nvfp4 tensor: w [OUT, IN*4/32] u32, scales [OUT, IN/16] u8.
+    var w_nv = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(w_nv);
+    var sc_nv = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sc_nv);
+    const w_nv_sh = [_]c_int{ OUT, IN * 4 / 32 };
+    const sc_nv_sh = [_]c_int{ OUT, IN / 16 };
+    try mlx.check(mlx.mlx_zeros(&w_nv, &w_nv_sh, 2, .uint32, s));
+    try mlx.check(mlx.mlx_zeros(&sc_nv, &sc_nv_sh, 2, .uint8, s));
+    const qp_nv = computeQuantParams(&cfg, w_nv, sc_nv, null);
+    try testing.expectEqual(QuantMode.nvfp4, qp_nv.mode);
+    try testing.expectEqual(@as(u32, 4), qp_nv.bits);
+    try testing.expectEqual(@as(u32, 16), qp_nv.group_size);
+
+    // Affine 8-bit/gs64 override: w [OUT, IN*8/32] u32, scales [OUT, IN/64] bf16.
+    var w_af = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(w_af);
+    var sc_af = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sc_af);
+    const w_af_sh = [_]c_int{ OUT, IN * 8 / 32 };
+    const sc_af_sh = [_]c_int{ OUT, IN / 64 };
+    try mlx.check(mlx.mlx_zeros(&w_af, &w_af_sh, 2, .uint32, s));
+    try mlx.check(mlx.mlx_zeros(&sc_af, &sc_af_sh, 2, .bfloat16, s));
+
+    // With the activation inner-dim hint: exact.
+    const qp_af = computeQuantParams(&cfg, w_af, sc_af, IN);
+    try testing.expectEqual(QuantMode.affine, qp_af.mode);
+    try testing.expectEqual(@as(u32, 8), qp_af.bits);
+    try testing.expectEqual(@as(u32, 64), qp_af.group_size);
+
+    // Without a hint: falls back to mlx-lm's override default gs=64.
+    const qp_af_nohint = computeQuantParams(&cfg, w_af, sc_af, null);
+    try testing.expectEqual(QuantMode.affine, qp_af_nohint.mode);
+    try testing.expectEqual(@as(u32, 8), qp_af_nohint.bits);
+    try testing.expectEqual(@as(u32, 64), qp_af_nohint.group_size);
+
+    // Plain affine model (config mode affine, bf16 scales): unchanged
+    // detect-against-config-gs behavior.
+    var cfg_affine = ModelConfig{};
+    cfg_affine.quant_bits = 4;
+    cfg_affine.quant_group_size = 64;
+    cfg_affine.quant_mode = .affine;
+    const qp_plain = computeQuantParams(&cfg_affine, w_af, sc_af, null);
+    try testing.expectEqual(QuantMode.affine, qp_plain.mode);
+    try testing.expectEqual(@as(u32, 8), qp_plain.bits);
+    try testing.expectEqual(@as(u32, 64), qp_plain.group_size);
+}
+
 test "QuantParamsCache put/lookup round-trip" {
     var cache: BitsCache = .{};
     const s = mlx.gpuStream();
@@ -7248,9 +7435,9 @@ test "QuantParamsCache put/lookup round-trip" {
     try mlx.check(mlx.mlx_zeros(&b, &shape, 1, .bfloat16, s));
     try mlx.check(mlx.mlx_zeros(&c, &shape, 1, .bfloat16, s));
 
-    try testing.expect(cache.put(a.ctx.?, 4, 32));
-    try testing.expect(cache.put(b.ctx.?, 4, 64));
-    try testing.expect(cache.put(c.ctx.?, 8, 128));
+    try testing.expect(cache.put(a.ctx.?, .{ .bits = 4, .group_size = 32, .mode = .affine }));
+    try testing.expect(cache.put(b.ctx.?, .{ .bits = 4, .group_size = 64, .mode = .nvfp4 }));
+    try testing.expect(cache.put(c.ctx.?, .{ .bits = 8, .group_size = 128, .mode = .affine }));
 
     // Build a Transformer-like view over the cache via quantParamsFor — we
     // need a real Transformer to call the method, so verify by direct slot
@@ -7264,6 +7451,7 @@ test "QuantParamsCache put/lookup round-trip" {
             if (cache.keys[j] == a.ctx) {
                 try testing.expectEqual(@as(u8, 4), cache.vals_bits[j]);
                 try testing.expectEqual(@as(u8, 32 / 8), cache.vals_gs_div8[j]);
+                try testing.expectEqual(@intFromEnum(QuantMode.affine), cache.vals_mode[j]);
                 found = true;
                 break;
             }
@@ -7278,6 +7466,7 @@ test "QuantParamsCache put/lookup round-trip" {
             if (cache.keys[j] == c.ctx) {
                 try testing.expectEqual(@as(u8, 8), cache.vals_bits[j]);
                 try testing.expectEqual(@as(u8, 128 / 8), cache.vals_gs_div8[j]);
+                try testing.expectEqual(@intFromEnum(QuantMode.affine), cache.vals_mode[j]);
                 found = true;
                 break;
             }
@@ -7318,7 +7507,7 @@ test "qmatmulBits dispatches to plain matmul when scales has null ctx (Unsloth D
     // qmatmulBits with null sc/bi must plain-matmul x @ w_t.
     const null_sc = mlx.mlx_array{ .ctx = null };
     const null_bi = mlx.mlx_array{ .ctx = null };
-    const got = try qmatmulBits(x, w_t, null_sc, null_bi, 4, 64, s);
+    const got = try qmatmulBits(x, w_t, null_sc, null_bi, 4, 64, .affine, s);
     defer _ = mlx.mlx_array_free(got);
 
     // Reduce to host floats for comparison.
@@ -7467,7 +7656,7 @@ test "gatherExpertMm dense bf16 matches per-expert ground truth (decode + prefil
         // Dense path.
         var dense5 = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(dense5);
-        try gatherExpertMm(&dense5, x_exp, w_deq_t, null_sc, null_bi, no_idx, inds, bits, gs, false, s);
+        try gatherExpertMm(&dense5, x_exp, w_deq_t, null_sc, null_bi, no_idx, inds, bits, gs, .affine, false, s);
         var dense = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(dense);
         try mlx.check(mlx.mlx_squeeze(&dense, dense5, s)); // [K, OUT]
@@ -7478,7 +7667,7 @@ test "gatherExpertMm dense bf16 matches per-expert ground truth (decode + prefil
         // Quantized path (cross-check).
         var quant5 = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(quant5);
-        try gatherExpertMm(&quant5, x_exp, q_w, q_sc, q_bi, no_idx, inds, bits, gs, false, s);
+        try gatherExpertMm(&quant5, x_exp, q_w, q_sc, q_bi, no_idx, inds, bits, gs, .affine, false, s);
         var quant = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(quant);
         try mlx.check(mlx.mlx_squeeze(&quant, quant5, s));
@@ -7530,7 +7719,7 @@ test "gatherExpertMm dense bf16 matches per-expert ground truth (decode + prefil
 
         var dense3 = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(dense3);
-        try gatherExpertMm(&dense3, x_rep, w_deq_t, null_sc, null_bi, no_idx, sorted_inds, bits, gs, true, s);
+        try gatherExpertMm(&dense3, x_rep, w_deq_t, null_sc, null_bi, no_idx, sorted_inds, bits, gs, .affine, true, s);
         var dense = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(dense);
         try mlx.check(mlx.mlx_squeeze(&dense, dense3, s)); // [N, OUT]
@@ -7540,7 +7729,7 @@ test "gatherExpertMm dense bf16 matches per-expert ground truth (decode + prefil
 
         var quant3 = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(quant3);
-        try gatherExpertMm(&quant3, x_rep, q_w, q_sc, q_bi, no_idx, sorted_inds, bits, gs, true, s);
+        try gatherExpertMm(&quant3, x_rep, q_w, q_sc, q_bi, no_idx, sorted_inds, bits, gs, .affine, true, s);
         var quant = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(quant);
         try mlx.check(mlx.mlx_squeeze(&quant, quant3, s));
@@ -7552,6 +7741,219 @@ test "gatherExpertMm dense bf16 matches per-expert ground truth (decode + prefil
             try testing.expectApproxEqAbs(gt[i], dense_host[i], 2e-2);
             try testing.expectApproxEqAbs(gt[i], quant_host[i], 2e-2);
         }
+    }
+}
+
+test "qmatmulBits nvfp4 matches dequantize+matmul reference" {
+    // NVFP4 (issue #24): packed-u32 weight + fp8-e4m3 uint8 scales, NO biases,
+    // group_size 16. qmatmulBits must route the bias-less weight to mode
+    // "nvfp4" — the legacy null-bias heuristic would misroute it to "mxfp8"
+    // (bits=8) and produce garbage.
+    const s = mlx.gpuStream();
+
+    const OUT = 8;
+    const IN = 64; // multiple of the nvfp4 group size (16)
+    var w_host: [OUT * IN]f32 = undefined;
+    for (&w_host, 0..) |*v, i| v.* = (@as(f32, @floatFromInt(@as(i32, @intCast(i % 11)) - 5))) * 0.07;
+    var w_f32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(w_f32);
+    {
+        const sh = [_]c_int{ OUT, IN };
+        w_f32 = mlx.mlx_array_new_data(&w_host, &sh, 2, .float32);
+    }
+    var w_bf16 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(w_bf16);
+    try mlx.check(mlx.mlx_astype(&w_bf16, w_f32, .bfloat16, s));
+
+    // Quantize with mode=nvfp4 → vector [q, scales] (no biases element).
+    var qvec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(qvec);
+    try mlx.check(mlx.mlx_quantize(&qvec, w_bf16, mlx.mlx_optional_int.some(16), mlx.mlx_optional_int.some(4), "nvfp4", .{}, s));
+    var q_w = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(q_w);
+    var q_sc = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(q_sc);
+    try mlx.check(mlx.mlx_vector_array_get(&q_w, qvec, 0));
+    try mlx.check(mlx.mlx_vector_array_get(&q_sc, qvec, 1));
+
+    const null_bi = mlx.mlx_array{ .ctx = null };
+
+    // Reference: dequantize(mode=nvfp4) → x @ wᵀ in plain matmul.
+    var w_deq = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(w_deq);
+    try mlx.check(mlx.mlx_dequantize(&w_deq, q_w, q_sc, null_bi, mlx.mlx_optional_int.some(16), mlx.mlx_optional_int.some(4), "nvfp4", .{ .ctx = null }, .{ .value = .bfloat16, .has_value = true }, s));
+    var w_deq_host: [OUT * IN]f32 = undefined;
+    try testReadF32(w_deq, &w_deq_host, s);
+
+    var x_host: [IN]f32 = undefined;
+    for (&x_host, 0..) |*v, i| v.* = (@as(f32, @floatFromInt(@as(i32, @intCast(i % 5)) - 2))) * 0.1;
+    var x_f32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x_f32);
+    {
+        const sh = [_]c_int{ 1, IN };
+        x_f32 = mlx.mlx_array_new_data(&x_host, &sh, 2, .float32);
+    }
+    var x_bf = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x_bf);
+    try mlx.check(mlx.mlx_astype(&x_bf, x_f32, .bfloat16, s));
+    var x_bf_host: [IN]f32 = undefined;
+    try testReadF32(x_bf, &x_bf_host, s);
+
+    // Ground truth from the dequantized weights.
+    var gt: [OUT]f32 = undefined;
+    for (0..OUT) |o| {
+        var acc: f32 = 0;
+        for (0..IN) |in| acc += x_bf_host[in] * w_deq_host[o * IN + in];
+        gt[o] = acc;
+    }
+
+    const got = try qmatmulBits(x_bf, q_w, q_sc, null_bi, 4, 16, .nvfp4, s);
+    defer _ = mlx.mlx_array_free(got);
+    var got_host: [OUT]f32 = undefined;
+    try testReadF32(got, &got_host, s);
+
+    for (0..OUT) |o| try testing.expectApproxEqAbs(gt[o], got_host[o], 5e-2);
+}
+
+test "gatherExpertMm nvfp4 matches per-expert dequantized reference" {
+    // MoE expert dispatch on an nvfp4 checkpoint: gather_qmm must receive
+    // mode="nvfp4" + null biases (decode AND prefill shapes, same calling
+    // convention as moeMLP2).
+    const s = mlx.gpuStream();
+
+    const E = 4;
+    const IN = 32;
+    const OUT = 8;
+
+    var w_host: [E * OUT * IN]f32 = undefined;
+    for (&w_host, 0..) |*v, i| v.* = (@as(f32, @floatFromInt(@as(i32, @intCast(i % 13)) - 6))) * 0.05;
+    var w_f32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(w_f32);
+    {
+        const sh = [_]c_int{ E, OUT, IN };
+        w_f32 = mlx.mlx_array_new_data(&w_host, &sh, 3, .float32);
+    }
+    var w_bf16 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(w_bf16);
+    try mlx.check(mlx.mlx_astype(&w_bf16, w_f32, .bfloat16, s));
+
+    var qvec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(qvec);
+    try mlx.check(mlx.mlx_quantize(&qvec, w_bf16, mlx.mlx_optional_int.some(16), mlx.mlx_optional_int.some(4), "nvfp4", .{}, s));
+    var q_w = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(q_w);
+    var q_sc = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(q_sc);
+    try mlx.check(mlx.mlx_vector_array_get(&q_w, qvec, 0));
+    try mlx.check(mlx.mlx_vector_array_get(&q_sc, qvec, 1));
+
+    const null_bi = mlx.mlx_array{ .ctx = null };
+    const no_idx = mlx.mlx_array{ .ctx = null };
+
+    var w_deq = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(w_deq);
+    try mlx.check(mlx.mlx_dequantize(&w_deq, q_w, q_sc, null_bi, mlx.mlx_optional_int.some(16), mlx.mlx_optional_int.some(4), "nvfp4", .{ .ctx = null }, .{ .value = .bfloat16, .has_value = true }, s));
+    var w_deq_host: [E * OUT * IN]f32 = undefined;
+    try testReadF32(w_deq, &w_deq_host, s);
+
+    // ── Decode shape: x_exp [1,1,1,1,IN], inds [1,1,K], sorted=false ──
+    {
+        const K = 2;
+        var x_host: [IN]f32 = undefined;
+        for (&x_host, 0..) |*v, i| v.* = (@as(f32, @floatFromInt(@as(i32, @intCast(i % 5)) - 2))) * 0.1;
+        var x_f32 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(x_f32);
+        {
+            const sh = [_]c_int{IN};
+            x_f32 = mlx.mlx_array_new_data(&x_host, &sh, 1, .float32);
+        }
+        var x_bf = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(x_bf);
+        try mlx.check(mlx.mlx_astype(&x_bf, x_f32, .bfloat16, s));
+        var x_exp = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(x_exp);
+        {
+            const sh = [_]c_int{ 1, 1, 1, 1, IN };
+            try mlx.check(mlx.mlx_reshape(&x_exp, x_bf, &sh, 5, s));
+        }
+        var x_bf_host: [IN]f32 = undefined;
+        try testReadF32(x_bf, &x_bf_host, s);
+
+        const inds_host = [_]u32{ 1, 3 };
+        var inds = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(inds);
+        {
+            const sh = [_]c_int{ 1, 1, K };
+            inds = mlx.mlx_array_new_data(&inds_host, &sh, 3, .uint32);
+        }
+
+        var gt: [K * OUT]f32 = undefined;
+        for (0..K) |k| {
+            const e = inds_host[k];
+            for (0..OUT) |o| {
+                var acc: f32 = 0;
+                for (0..IN) |in| acc += x_bf_host[in] * w_deq_host[e * OUT * IN + o * IN + in];
+                gt[k * OUT + o] = acc;
+            }
+        }
+
+        var quant5 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(quant5);
+        try gatherExpertMm(&quant5, x_exp, q_w, q_sc, null_bi, no_idx, inds, 4, 16, .nvfp4, false, s);
+        var quant = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(quant);
+        try mlx.check(mlx.mlx_squeeze(&quant, quant5, s)); // [K, OUT]
+        var quant_host: [K * OUT]f32 = undefined;
+        try testReadF32(quant, &quant_host, s);
+
+        for (0..K * OUT) |i| try testing.expectApproxEqAbs(gt[i], quant_host[i], 5e-2);
+    }
+
+    // ── Prefill/sorted shape: x_rep [N,1,IN], sorted_inds [N], sorted=true ──
+    {
+        const N = 5;
+        var x_host: [N * IN]f32 = undefined;
+        for (&x_host, 0..) |*v, i| v.* = (@as(f32, @floatFromInt(@as(i32, @intCast(i % 7)) - 3))) * 0.07;
+        var x_f32 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(x_f32);
+        {
+            const sh = [_]c_int{ N, 1, IN };
+            x_f32 = mlx.mlx_array_new_data(&x_host, &sh, 3, .float32);
+        }
+        var x_rep = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(x_rep);
+        try mlx.check(mlx.mlx_astype(&x_rep, x_f32, .bfloat16, s));
+        var x_bf_host: [N * IN]f32 = undefined;
+        try testReadF32(x_rep, &x_bf_host, s);
+
+        const sorted_host = [_]u32{ 0, 0, 1, 2, 3 };
+        var sorted_inds = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(sorted_inds);
+        {
+            const sh = [_]c_int{N};
+            sorted_inds = mlx.mlx_array_new_data(&sorted_host, &sh, 1, .uint32);
+        }
+
+        var gt: [N * OUT]f32 = undefined;
+        for (0..N) |i| {
+            const e = sorted_host[i];
+            for (0..OUT) |o| {
+                var acc: f32 = 0;
+                for (0..IN) |in| acc += x_bf_host[i * IN + in] * w_deq_host[e * OUT * IN + o * IN + in];
+                gt[i * OUT + o] = acc;
+            }
+        }
+
+        var quant3 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(quant3);
+        try gatherExpertMm(&quant3, x_rep, q_w, q_sc, null_bi, no_idx, sorted_inds, 4, 16, .nvfp4, true, s);
+        var quant = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(quant);
+        try mlx.check(mlx.mlx_squeeze(&quant, quant3, s));
+        var quant_host: [N * OUT]f32 = undefined;
+        try testReadF32(quant, &quant_host, s);
+
+        for (0..N * OUT) |i| try testing.expectApproxEqAbs(gt[i], quant_host[i], 5e-2);
     }
 }
 

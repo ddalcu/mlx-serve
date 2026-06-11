@@ -50,6 +50,18 @@ fn isSupportedModelType(model_type: []const u8) bool {
     return false;
 }
 
+/// Quantization modes the MLX loader supports. Must stay in sync with
+/// `model.zig:QuantMode` (discovery deliberately avoids importing model.zig,
+/// which would drag the mlx FFI into this filesystem-only module).
+const supported_quant_modes = [_][]const u8{ "affine", "nvfp4", "mxfp4", "mxfp8" };
+
+fn isSupportedQuantMode(mode: []const u8) bool {
+    for (supported_quant_modes) |m| {
+        if (std.mem.eql(u8, mode, m)) return true;
+    }
+    return false;
+}
+
 /// Outcome of reading a candidate's config.json. Discovery treats any
 /// non-`.supported` result as "skip this directory."
 const ConfigPeek = union(enum) {
@@ -62,9 +74,8 @@ const ConfigPeek = union(enum) {
 /// Peek at a candidate's `config.json`: classify by `model_type` and
 /// `quantization.mode`. Discovery uses this to filter out:
 ///   - unsupported archs (e.g. deepseek_v4, which crashes the tokenizer)
-///   - non-affine quantizations (e.g. nvfp4 / NVIDIA FP4 — same
-///     `model_type` as a normal MLX qwen, but a weight layout our
-///     safetensors loader can't decode and which aborts on tensor read).
+///   - unsupported quantization modes (anything outside
+///     `supported_quant_modes` — affine, nvfp4, mxfp4, mxfp8).
 ///
 /// Returned strings are owned by `allocator`; the caller frees them via
 /// the helpers in `freeConfigPeek`.
@@ -87,12 +98,12 @@ fn peekConfig(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir, entry_n
         return .{ .unsupported_arch = dup };
     }
     // Quantization gate: if a model declares a `quantization.mode`, accept
-    // only the standard MLX `affine` scheme. Models without a quantization
+    // only the schemes the loader supports. Models without a quantization
     // block (bf16 / unquantized) pass through.
     if (root.get("quantization")) |q_val| {
         if (q_val == .object) {
             if (q_val.object.get("mode")) |mode_val| {
-                if (mode_val == .string and !std.mem.eql(u8, mode_val.string, "affine")) {
+                if (mode_val == .string and !isSupportedQuantMode(mode_val.string)) {
                     const dup = allocator.dupe(u8, mode_val.string) catch return .missing_or_unparseable;
                     return .{ .unsupported_quant = dup };
                 }
@@ -194,8 +205,7 @@ pub fn discoverModels(io: std.Io, allocator: std.mem.Allocator, model_dir: []con
         // Filter by supported model_type AND quantization scheme. Catches:
         //   - partially-downloaded checkpoints (missing/garbage config)
         //   - unsupported arches (e.g. deepseek_v4, MLA + indexer)
-        //   - unsupported quants (e.g. nvfp4, which shares model_type with
-        //     standard MLX qwens but uses a different weight layout)
+        //   - unsupported quants (modes outside supported_quant_modes)
         // before they reach the tokenizer/weight loaders.
         switch (peekConfig(io, allocator, dir, entry.name)) {
             .missing_or_unparseable => {
@@ -209,7 +219,7 @@ pub fn discoverModels(io: std.Io, allocator: std.mem.Allocator, model_dir: []con
             },
             .unsupported_quant => |mode| {
                 defer allocator.free(mode);
-                log.info("[discovery] skip {s}: unsupported quantization mode '{s}' (only 'affine' supported)", .{ entry.name, mode });
+                log.info("[discovery] skip {s}: unsupported quantization mode '{s}' (supported: affine, nvfp4, mxfp4, mxfp8)", .{ entry.name, mode });
                 continue;
             },
             .supported => |mt| allocator.free(mt),
@@ -325,4 +335,15 @@ test "isSupportedModelType accepts qwen3_moe (Qwen3-30B-A3B)" {
     try testing.expect(isSupportedModelType("qwen3"));
     // A genuinely unknown arch is still rejected.
     try testing.expect(!isSupportedModelType("totally_made_up_arch"));
+}
+
+test "isSupportedQuantMode accepts nvfp4 (issue #24), rejects unknown" {
+    // Regression for "[discovery] skip ...: unsupported quantization mode
+    // 'nvfp4'": nvfp4 / mxfp4 / mxfp8 checkpoints are loadable and must be
+    // discoverable.
+    try testing.expect(isSupportedQuantMode("affine"));
+    try testing.expect(isSupportedQuantMode("nvfp4"));
+    try testing.expect(isSupportedQuantMode("mxfp4"));
+    try testing.expect(isSupportedQuantMode("mxfp8"));
+    try testing.expect(!isSupportedQuantMode("fp99"));
 }

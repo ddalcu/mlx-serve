@@ -335,9 +335,12 @@ fn embedTargetTokens(
     var ts = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(ts);
     try mlx.check(mlx.mlx_take_axis(&ts, target.emb_s, id_arr, 0, s));
+    // Bias-less trunk quant modes (nvfp4 etc.) have a null-ctx emb_b.
     var tb = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(tb);
-    try mlx.check(mlx.mlx_take_axis(&tb, target.emb_b, id_arr, 0, s));
+    if (target.emb_b.ctx != null) {
+        try mlx.check(mlx.mlx_take_axis(&tb, target.emb_b, id_arr, 0, s));
+    }
 
     var dequant = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(dequant);
@@ -348,7 +351,7 @@ fn embedTargetTokens(
         tb,
         mlx.mlx_optional_int.some(@intCast(target.config.quant_group_size)),
         mlx.mlx_optional_int.some(@intCast(target.config.quant_bits)),
-        "affine",
+        target.config.quant_mode.cstr(),
         .{}, // global_scale
         .{ .value = .bfloat16, .has_value = true },
         s,
@@ -379,7 +382,7 @@ fn targetLmHead(target: *Transformer, x: mlx.mlx_array, s: mlx.mlx_stream) !mlx.
         true,
         mlx.mlx_optional_int.some(@intCast(target.config.quant_group_size)),
         mlx.mlx_optional_int.some(@intCast(target.config.quant_bits)),
-        "affine",
+        target.config.quant_mode.cstr(),
         s,
     ));
     return out;

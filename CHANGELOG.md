@@ -1,5 +1,13 @@
 # Changelog
 
+## v26.6.10 — NVFP4 models just work
+
+- **NVFP4 quantized models load and serve.** Checkpoints converted with MLX's NVIDIA-FP4 mode (`gemma-4-31b-it-nvfp4`, `Qwen3.6-27B-nvfp4`, `Qwen3-Next-80B-A3B-Thinking-mlx-nvfp4`, and the rest of the growing nvfp4 catalog) now run out of the box instead of crashing at load — output verified token-identical to the reference implementation at temperature 0. mxfp4 and mxfp8 checkpoints ride the same path.
+- **Mixed-precision QAT checkpoints resolve per weight.** NVFP4 QAT conversions that keep sensitive layers at affine 8-bit (the gemma-4 QAT series overrides the shared MLP and MoE router) dispatch each tensor to its own scheme automatically — dense, MoE expert gather, embeddings, and vision projections included.
+- **Discovery picks them up.** `--model-dir` folders now list nvfp4/mxfp4/mxfp8 models in `/v1/models` and the app's model picker instead of skipping them, and the startup banner reports the quantization mode.
+
+---
+
 ## v26.6.9 — Qwen 3.6 predicts its own future
 
 - **Native multi-token prediction for Qwen 3.6.** Models that ship Qwen's trained MTP head as an `mtp/` sidecar (like [ddalcu/Qwen3.6-27B-4bit-MTP-MLX-Serve](https://huggingface.co/ddalcu/Qwen3.6-27B-4bit-MTP-MLX-Serve)) now use it automatically: the model drafts its own next tokens and verifies them in one pass, with exact rejection sampling — same output distribution, measurably faster. Agent-style edit and echo workloads decode **up to 1.8× faster** (29 → 51.6 tok/s on Qwen3.6-27B 4-bit, M4 Max), code generation 1.43×, creative writing ~1.1× — beating the reference MTP runtime on every workload measured, at identical output quality.

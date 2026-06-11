@@ -549,7 +549,7 @@ pub fn main(init: std.process.Init) !void {
     defer if (!config_owned_by_registry) allocator.destroy(config_storage);
     config_storage.* = try model_mod.parseConfig(io, allocator, model_dir);
     const config = config_storage;
-    log.info("Model: {s} ({d} layers, {d}-dim, head_dim={d}, {d}h/{d}kv, {d}-bit quant)\n", .{
+    log.info("Model: {s} ({d} layers, {d}-dim, head_dim={d}, {d}h/{d}kv, {d}-bit {s} quant)\n", .{
         config.model_type,
         config.num_hidden_layers,
         config.hidden_size,
@@ -557,6 +557,7 @@ pub fn main(init: std.process.Init) !void {
         config.num_attention_heads,
         config.num_key_value_heads,
         config.quant_bits,
+        @tagName(config.quant_mode),
     });
 
     // Load tokenizer — heap-allocated, ownership transfers to registry on serve_mode.

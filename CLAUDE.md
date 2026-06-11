@@ -106,6 +106,7 @@ Existing tools:
 | `./tests/test_batched_transition.sh [port]` | Concurrent-stream consistency: legacy→batched decode transition must not duplicate/drop tokens (starts its own server) |
 | `./tests/test_drafter_equivalence.sh [port]` | Gemma 4 drafter byte-equivalence |
 | `UD_MOE_MODEL=<dir> ./tests/test_ud_moe.sh` | Unsloth UD MoE load + generate (default Qwen3.6-27B-UD-MLX-4bit) |
+| `NVFP4_TEST_MODEL=<dir> ./tests/test_nvfp4.sh` | NVFP4 checkpoint (issue #24): load, banner reports nvfp4 mode, temp-0 coherence canary. Default Qwen3-0.6B-nvfp4; pass a gemma-4 QAT nvfp4 dir to exercise mixed affine-override resolution. Hermetic counterparts: `computeQuantParams` + nvfp4 qmatmul/gather tests in transformer.zig. |
 | `./tests/test_long_agent_memory.sh [port]` | 10-turn Claude-Code-style agent: plants 3 facts in turn 1, recalls them across mode transitions (tools on/off, thinking on/off). Catches "model acts like first-time-seen" regressions. |
 | `./tests/test_disconnect_cancel.sh [model_dir] [port]` | Client-disconnect handling during long prefills: SSE keepalives flow every 5s while a request waits on first tokens (Anthropic `ping` events / OpenAI `: keepalive` comments), and a vanished client cancels its slot within one probe interval — the chunk loop aborts the ghost prefill (`error.Cancelled`) instead of grinding minutes of abandoned work that piles up behind Claude Code retries. Starts its own server. |
 | `./tests/test_messages_stream_thinking_tools.sh [model_dir] [port]` | /v1/messages STREAMING with thinking + tools together (Claude Code's exact shape) on a template-opened-think model: no think-tag leak in text deltas, SSE content-block lifecycle validity (every delta/stop references an open block), thinking_delta + tool_use emission. Starts its own server. Hermetic counterpart: `chat.streamThinkGate` unit tests + the corpus streaming-gate replay. |
@@ -283,6 +284,9 @@ Templates render `role: "tool"` natively as `<|turn>tool` — no transformation.
 
 ### Streaming with tools + thinking
 Server buffers tokens to detect tool patterns. With thinking enabled, `<|channel>thought` is buffered (not flushed) until closing `<channel|>`. After generation, thinking is split into `reasoning_content`; channel tags stripped from visible content.
+
+### Quantization modes (nvfp4 / mxfp4 / mxfp8)
+`config.json`'s `quantization.mode` lands on `ModelConfig.quant_mode` (default `affine`; unknown → `error.UnsupportedQuantMode` at parse). Non-affine modes store NO `.biases` tensors and use uint8 fp8-encoded scales — but mixed QAT checkpoints (gemma-4 `*-qat-nvfp4`) override some layers to affine 8-bit/gs64 WITH bf16 scales + biases, so resolution is PER WEIGHT (`transformer.computeQuantParams`, cached by scales ctx): uint8 scales → config's fp8 mode; float scales → affine, with (bits, group_size) solved from the activation inner dim (`w_cols*32/s_cols` alone only pins bits×gs). Two loader rules: `.biases` fetches are mandatory under affine, OPTIONAL under non-affine modes (`getLayerBias`) — never skipped, or the affine-override matmuls break; and never gate fp8-vs-affine on `biases.ctx == null` alone (that's the legacy mxfp8-inside-affine heuristic in `qmatmulBits`, kept for NVIDIA Nemotron mxfp8 layers).
 
 ### SSM/GatedDeltaNet state init
 `conv1dWithCache` sets `ssm.initialized = true` after conv update but BEFORE SSM recurrence state exists. Init code must check `ssm.ssm_state.ctx == null`, NOT `!ssm.initialized`. Used by both `mamba2Mixer` and `gatedDeltaNet`.
