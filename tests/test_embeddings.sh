@@ -176,6 +176,59 @@ except Exception:
     check "encoder hot-loads by id next to chat default" "$HOT_OK" \
         "$(tail -3 /tmp/test_embeddings_hotload.log)"
     stop_server
+
+    # --- 6. load-by-path: encoder OUTSIDE the server's --model-dir scope ---
+    # The app auto-downloads the encoder and registers it via
+    # POST /v1/load-model {"model": "<abs path>"} — this must work even when
+    # discovery never saw the directory.
+    echo "=== /v1/load-model: register encoder by absolute path ==="
+    start_server /tmp/test_embeddings_bypath.log \
+        --model "$CHAT_MODEL" --model-dir "$(dirname "$CHAT_MODEL")" --log-level info
+    NOT_LISTED=$(curl -s -m 30 "$BASE/v1/models" | python3 -c "
+import sys, json
+r = json.load(sys.stdin)
+print(0 if any(m['id'] == '$ENCODER_ID' for m in r['data']) else 1)")
+    if [ "$NOT_LISTED" != "1" ]; then
+        echo -e "  ${YELLOW}SKIP${NC} encoder unexpectedly inside --model-dir scope; can't exercise load-by-path"
+    else
+        # JSON-escaped slashes (\/) — the exact bytes Swift's JSONSerialization
+        # emits. A scanner that doesn't unescape sees "\/Users\/…" and misses
+        # the absolute-path branch (live failure 2026-06-12).
+        ESCAPED_MODEL=$(printf '%s' "$EMBED_MODEL" | sed 's|/|\\/|g')
+        LOAD_CODE=$(curl -s -o /tmp/test_embeddings_load.out -w "%{http_code}" -m 180 \
+            "$BASE/v1/load-model" -H 'Content-Type: application/json' \
+            -d "{\"model\":\"$ESCAPED_MODEL\"}")
+        check "load-model accepts an absolute encoder path (JSON-escaped slashes)" \
+            "$([ "$LOAD_CODE" = "200" ] && echo 1 || echo 0)" \
+            "HTTP $LOAD_CODE: $(cat /tmp/test_embeddings_load.out)"
+        LOAD_CODE2=$(curl -s -o /dev/null -w "%{http_code}" -m 180 \
+            "$BASE/v1/load-model" -H 'Content-Type: application/json' \
+            -d "{\"model\":\"$EMBED_MODEL\"}")
+        check "load-model accepts an absolute encoder path (plain)" \
+            "$([ "$LOAD_CODE2" = "200" ] && echo 1 || echo 0)" "HTTP $LOAD_CODE2"
+        # The id must be REGISTERED now (embeddings alone can pass spuriously
+        # via unknown-id fallback to the default chat model).
+        LISTED_NOW=$(curl -s -m 30 "$BASE/v1/models" | python3 -c "
+import sys, json
+r = json.load(sys.stdin)
+print(1 if any(m['id'] == '$ENCODER_ID' for m in r['data']) else 0)")
+        check "path-registered encoder appears in /v1/models" "$LISTED_NOW"
+        BYPATH_OK=$(embed '"hello world"' "$ENCODER_ID" | python3 -c "
+import sys, json
+try:
+    r = json.load(sys.stdin)
+    print(1 if len(r['data'][0]['embedding']) > 0 else 0)
+except Exception:
+    print(0)")
+        check "path-registered encoder serves embeddings by id" "$BYPATH_OK" \
+            "$(tail -3 /tmp/test_embeddings_bypath.log)"
+        # Garbage paths must not register anything.
+        BAD_CODE=$(curl -s -o /dev/null -w "%{http_code}" -m 30 "$BASE/v1/load-model" \
+            -H 'Content-Type: application/json' -d '{"model":"/nonexistent/model-dir"}')
+        check "bogus absolute path is rejected with 404" \
+            "$([ "$BAD_CODE" = "404" ] && echo 1 || echo 0)" "got HTTP $BAD_CODE"
+    fi
+    stop_server
 fi
 
 echo

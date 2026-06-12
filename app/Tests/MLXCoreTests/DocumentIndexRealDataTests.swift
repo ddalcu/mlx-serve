@@ -2,8 +2,8 @@ import XCTest
 @testable import MLXCore
 
 /// Retrieval-quality diagnostics against a real local document folder, gated on
-/// `DOCS_RAG_FOLDER` (skipped in CI). Uses the production Apple sentence
-/// embeddings — run it to eyeball what the searchDocuments tool would return:
+/// `DOCS_RAG_FOLDER` (skipped in CI). Uses the local server's encoder via DOCS_RAG_PORT
+/// (probe-only), else lexical-only retrieval — run it to eyeball what the searchDocuments tool would return:
 ///
 ///   DOCS_RAG_FOLDER=~/path/to/folder swift test -Xswiftc -swift-version \
 ///     -Xswiftc 5 --filter DocumentIndexRealDataTests
@@ -32,7 +32,15 @@ final class DocumentIndexRealDataTests: XCTestCase {
         if let cached = Self.cachedIndex, case .ready = cached.state {
             return cached
         }
-        let index = DocumentIndex(folderURL: folder)
+        // Embeds via a local server when DOCS_RAG_PORT points at one with an
+        // encoder model (probe-only — a test run never downloads weights);
+        // otherwise retrieval is lexical-only, which the structural
+        // assertions below are designed to survive.
+        let port = ProcessInfo.processInfo.environment["DOCS_RAG_PORT"].flatMap { UInt16($0) }
+        let index = DocumentIndex(folderURL: folder, embedderProvider: {
+            guard let port else { return nil }
+            return await ServerEmbedding.probe(port: port)()
+        })
         Self.cachedIndex = index
         index.startIndexing()
         let start = Date()

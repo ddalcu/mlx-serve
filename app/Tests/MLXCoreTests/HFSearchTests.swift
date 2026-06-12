@@ -556,6 +556,14 @@ final class HFModelQuantGateTests: XCTestCase {
                       "local encoder checkpoints (config.json model_type=bert) must not be flagged unsupported")
     }
 
+    func testDiffusionGemmaIsSupportedModelType() {
+        // DiffusionGemma (block diffusion, config.json model_type=diffusion_gemma)
+        // is served by the canvas-denoising loop since v26.6.10 — the browser
+        // must not flag mlx-community/diffusiongemma-* as unsupported.
+        XCTAssertTrue(supportedModelTypes.contains("diffusion_gemma"),
+                      "diffusion_gemma checkpoints are served (src/diffusion.zig) and must not be flagged unsupported")
+    }
+
     func testNvfp4_servedSinceV26_6_10_notFlagged() {
         let m = mlx(id: "mlx-community/Qwen3-30B-A3B-nvfp4", tags: ["mlx", "qwen3"])
         XCTAssertNil(m.unsupportedQuantization)

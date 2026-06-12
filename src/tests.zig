@@ -20,6 +20,7 @@ test {
     _ = @import("kv_quant.zig");
     _ = @import("drafter.zig");
     _ = @import("mtp.zig");
+    _ = @import("diffusion.zig");
     _ = @import("tokenizer.zig");
     _ = @import("prefix_cache.zig");
     _ = @import("model_discovery.zig");

@@ -273,6 +273,59 @@ fn trimTrailingSlash(s: []const u8) []const u8 {
     return p;
 }
 
+pub const ProbeResult = struct {
+    /// Owned dupe of the supported model_type.
+    model_type: []const u8,
+    /// Sum of *.safetensors bytes; null if the scan failed.
+    bytes_on_disk: ?u64,
+};
+
+/// Validate an arbitrary absolute model directory the way discovery would
+/// (config.json present, supported model_type and quant mode) and report its
+/// weight bytes. Used by /v1/load-model's register-by-path branch for models
+/// OUTSIDE the --model-dir scan — e.g. the app's auto-downloaded embedding
+/// encoder, which lands wherever the download root is regardless of which
+/// org dir the chat model came from.
+pub fn probeModelDir(io: std.Io, allocator: std.mem.Allocator, abs_path: []const u8) !ProbeResult {
+    const trimmed = trimTrailingSlash(abs_path);
+    const base = std.fs.path.basename(trimmed);
+    const parent = std.fs.path.dirname(trimmed) orelse return error.InvalidModelPath;
+    if (base.len == 0 or parent.len == 0) return error.InvalidModelPath;
+
+    var dir = std.Io.Dir.openDirAbsolute(io, parent, .{}) catch return error.ModelDirNotFound;
+    defer dir.close(io);
+
+    const model_type: []const u8 = switch (peekConfig(io, allocator, dir, base)) {
+        .missing_or_unparseable => return error.ModelDirNotFound,
+        .unsupported_arch => |mt| {
+            allocator.free(mt);
+            return error.UnsupportedArch;
+        },
+        .unsupported_quant => |mode| {
+            allocator.free(mode);
+            return error.UnsupportedQuantMode;
+        },
+        .supported => |mt| mt,
+    };
+    errdefer allocator.free(model_type);
+
+    var bytes: u64 = 0;
+    var bytes_ok = false;
+    var sub = dir.openDir(io, base, .{ .iterate = true }) catch null;
+    if (sub) |*sd| {
+        defer sd.close(io);
+        var it = sd.iterate();
+        while (it.next(io) catch null) |entry| {
+            if (entry.kind != .file) continue;
+            if (!std.mem.endsWith(u8, entry.name, ".safetensors")) continue;
+            const st = sd.statFile(io, entry.name, .{}) catch continue;
+            bytes += @intCast(st.size);
+            bytes_ok = true;
+        }
+    }
+    return .{ .model_type = model_type, .bytes_on_disk = if (bytes_ok) bytes else null };
+}
+
 fn lessThanById(_: void, a: DiscoveredModel, b: DiscoveredModel) bool {
     return std.mem.lessThan(u8, a.id, b.id);
 }

@@ -178,6 +178,20 @@ pub const ModelConfig = struct {
     // Gemma 4 (31B): full_attention layers share V with K (no v_proj stored)
     attention_k_eq_v: bool = false,
 
+    // Block diffusion (DiffusionGemma). canvas_length > 0 marks a diffusion
+    // checkpoint: generation runs the canvas-denoising loop in
+    // src/diffusion.zig instead of autoregressive decode. The knobs mirror
+    // the checkpoint's embedded `generation_config` object; defaults match
+    // google/diffusiongemma-26B-A4B-it.
+    canvas_length: u32 = 0,
+    diffusion_max_steps: u32 = 48,
+    diffusion_t_min: f32 = 0.4,
+    diffusion_t_max: f32 = 0.8,
+    diffusion_entropy_bound: f32 = 0.1,
+    diffusion_confidence_threshold: f32 = 0.005,
+    diffusion_stability_threshold: u32 = 1,
+    diffusion_pad_token: u32 = 0,
+
     // Hybrid layers (LFM2, Nemotron-H): per-layer type dispatch
     has_hybrid_layers: bool = false,
     layer_block_types: [128]LayerBlockType = .{.attention} ** 128,
@@ -249,6 +263,22 @@ pub const ModelConfig = struct {
 
     pub fn isMoe(self: *const ModelConfig) bool {
         return self.num_experts > 0;
+    }
+
+    /// Block-diffusion checkpoint (DiffusionGemma): generation is the canvas
+    /// denoising loop, not autoregressive decode.
+    pub fn isDiffusion(self: *const ModelConfig) bool {
+        return self.canvas_length > 0;
+    }
+
+    /// True when the trunk uses the Gemma 4 layer structure (dual FFN with
+    /// shared-expert branch, sigma-MoE router, 7 norms, layer_scalar, v_norm,
+    /// proportional RoPE on full layers). DiffusionGemma reuses the Gemma 4
+    /// 26B-A4B decoder verbatim, so transformer.zig's gemma4 forward/binding
+    /// paths key on this rather than on the model_type string.
+    pub fn isGemma4Layers(self: *const ModelConfig) bool {
+        return std.mem.eql(u8, self.model_type, "gemma4") or
+            std.mem.eql(u8, self.model_type, "diffusion_gemma");
     }
 
     pub fn addEosToken(self: *ModelConfig, id: u32) void {
@@ -716,6 +746,67 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         // (transformer.zig:5677) already encodes that:
         //   `k_eq_v = config.attention_k_eq_v and isGlobalLayer(li)`.
         // So we leave the parsed flag intact.
+    } else if (std.mem.eql(u8, model_type, "diffusion_gemma")) {
+        // DiffusionGemma (block diffusion, June 2026). The trunk is the
+        // Gemma 4 26B-A4B MoE decoder verbatim — same dual-FFN layer
+        // structure, sigma-MoE router, v_norm, dual head geometry,
+        // proportional RoPE — under weight prefix `model.decoder`. The
+        // model_type stays distinct because GENERATION is different: a
+        // bidirectional canvas-denoising loop (src/diffusion.zig), not
+        // autoregressive decode.
+        config.model_type = "diffusion_gemma";
+        config.weight_prefix = "model.decoder";
+        config.hidden_act = .gelu_approx;
+        config.norm_has_offset = false;
+        config.scale_embeddings = true;
+        config.has_pre_ff_norm = true;
+        config.has_qk_norm = true;
+        config.has_v_norm = true;
+        config.rope_scaling_factor = 1.0;
+        // Full-attention layers ship NO v_proj — V is the param-free-normed
+        // k_proj output. Same per-layer alias the Gemma 4 31B/12B binder uses.
+        config.attention_k_eq_v = true;
+        // canvas_length: top-level; presence is what flags diffusion.
+        if (root.get("canvas_length")) |v| {
+            if (v == .integer) config.canvas_length = @intCast(v.integer);
+        }
+        if (config.canvas_length == 0) config.canvas_length = 256;
+        // Diffusion knobs from the embedded generation_config object.
+        if (root.get("generation_config")) |gc_val| {
+            if (gc_val == .object) {
+                const gc = gc_val.object;
+                if (gc.get("max_denoising_steps")) |v| { if (v == .integer) config.diffusion_max_steps = @intCast(v.integer); }
+                if (gc.get("t_min")) |v| config.diffusion_t_min = jsonFloat(v);
+                if (gc.get("t_max")) |v| config.diffusion_t_max = jsonFloat(v);
+                if (gc.get("confidence_threshold")) |v| config.diffusion_confidence_threshold = jsonFloat(v);
+                if (gc.get("stability_threshold")) |v| { if (v == .integer) config.diffusion_stability_threshold = @intCast(v.integer); }
+                if (gc.get("pad_token_id")) |v| { if (v == .integer) config.diffusion_pad_token = @intCast(v.integer); }
+                if (gc.get("sampler_config")) |sc_val| {
+                    if (sc_val == .object) {
+                        if (sc_val.object.get("entropy_bound")) |v| config.diffusion_entropy_bound = jsonFloat(v);
+                    }
+                }
+                // EOS may also live here (mirrors the top-level list).
+                if (config.num_eos_tokens == 0) {
+                    if (gc.get("eos_token_id")) |v| {
+                        switch (v) {
+                            .integer => |i| config.addEosToken(@intCast(i)),
+                            .array => |arr| for (arr.items) |item| {
+                                if (item == .integer) config.addEosToken(@intCast(item.integer));
+                            },
+                            else => {},
+                        }
+                    }
+                }
+            }
+        }
+        // The model.encoder.vision_tower is not wired yet (dropped at load by
+        // shouldKeepWeightKey) — never advertise vision for this arch.
+        config.has_vision = false;
+        if (config.num_eos_tokens == 0) {
+            config.addEosToken(1);
+            config.addEosToken(106);
+        }
     } else if (std.mem.eql(u8, model_type, "qwen3_5_moe") or
         std.mem.eql(u8, model_type, "qwen3_5") or
         std.mem.eql(u8, model_type, "qwen3_5_moe_text") or
@@ -1094,6 +1185,14 @@ pub fn shouldKeepWeightKey(key: []const u8, load_vision: bool) bool {
     const is_audio_tower = std.mem.startsWith(u8, key, "audio_tower.") or
         std.mem.startsWith(u8, key, "language_model.audio_multi_modal_projector.");
     if (is_audio_tower) return false;
+    // DiffusionGemma nests its (not-yet-wired) vision tower under
+    // model.encoder.* — always drop it so a 26B text load doesn't carry
+    // ~1 GB of dead tower weights. The encoder LAYER SCALARS
+    // (model.encoder.language_model.layers.N.layer_scalar) must survive:
+    // they're the only untied encoder text params and the causal encoder
+    // pass multiplies by them instead of the decoder's layer_scalar.
+    if (std.mem.startsWith(u8, key, "model.encoder.vision_tower.") or
+        std.mem.startsWith(u8, key, "model.encoder.embed_vision.")) return false;
     if (is_vision and !load_vision) return false;
     return true;
 }
@@ -1614,6 +1713,123 @@ test "parseConfigFromJson qwen3_moe (Qwen3-30B-A3B) → MoE, no shared expert, n
     try testing.expect(!config.has_hybrid_layers);
     try testing.expect(!config.has_sliding_window);
     try testing.expectEqual(@as(u32, 8), config.quant_bits);
+}
+
+test "ModelConfig parses diffusion_gemma (DiffusionGemma 26B-A4B block diffusion)" {
+    // Faithful subset of mlx-community/diffusiongemma-26B-A4B-it-4bit's
+    // config.json. The trunk is the Gemma 4 26B-A4B MoE decoder (dual FFN,
+    // sigma-MoE router, v_norm, K=V alias on full layers, proportional RoPE)
+    // under weight prefix `model.decoder`; the diffusion-specific knobs ride
+    // in the embedded `generation_config` object plus top-level canvas_length.
+    const json =
+        \\{
+        \\  "model_type": "diffusion_gemma",
+        \\  "canvas_length": 256,
+        \\  "eos_token_id": [1, 106, 50],
+        \\  "tie_word_embeddings": true,
+        \\  "generation_config": {
+        \\    "confidence_threshold": 0.005,
+        \\    "max_denoising_steps": 48,
+        \\    "pad_token_id": 0,
+        \\    "sampler_config": {"_cls_name": "EntropyBoundSamplerConfig", "entropy_bound": 0.1},
+        \\    "stability_threshold": 1,
+        \\    "t_max": 0.8,
+        \\    "t_min": 0.4
+        \\  },
+        \\  "text_config": {
+        \\    "model_type": "diffusion_gemma_text",
+        \\    "vocab_size": 262144,
+        \\    "hidden_size": 2816,
+        \\    "intermediate_size": 2112,
+        \\    "moe_intermediate_size": 704,
+        \\    "num_experts": 128,
+        \\    "top_k_experts": 8,
+        \\    "num_hidden_layers": 30,
+        \\    "num_attention_heads": 16,
+        \\    "num_key_value_heads": 8,
+        \\    "num_global_key_value_heads": 2,
+        \\    "head_dim": 256,
+        \\    "global_head_dim": 512,
+        \\    "final_logit_softcapping": 30.0,
+        \\    "hidden_activation": "gelu_pytorch_tanh",
+        \\    "rms_norm_eps": 1e-06,
+        \\    "max_position_embeddings": 262144,
+        \\    "sliding_window": 1024,
+        \\    "tie_word_embeddings": true,
+        \\    "layer_types": ["sliding_attention", "sliding_attention", "sliding_attention", "sliding_attention", "sliding_attention", "full_attention"],
+        \\    "rope_parameters": {
+        \\      "full_attention": {"partial_rotary_factor": 0.25, "rope_theta": 1000000.0, "rope_type": "proportional"},
+        \\      "sliding_attention": {"rope_theta": 10000.0, "rope_type": "default"}
+        \\    },
+        \\    "use_bidirectional_attention": "vision"
+        \\  },
+        \\  "vision_config": {"model_type": "gemma4_vision", "hidden_size": 1152, "num_hidden_layers": 27},
+        \\  "quantization": {"group_size": 64, "bits": 4, "mode": "affine"}
+        \\}
+    ;
+    const config = try parseConfigFromJson(testing.allocator, json);
+    // model_type stays distinct — it drives diffusion generation dispatch —
+    // but the trunk inherits every gemma4 layer-structure flag.
+    try testing.expectEqualStrings("diffusion_gemma", config.model_type);
+    try testing.expectEqualStrings("model.decoder", config.weight_prefix);
+    try testing.expect(config.isDiffusion());
+    try testing.expect(config.has_v_norm);
+    try testing.expect(config.has_pre_ff_norm);
+    try testing.expect(config.has_qk_norm);
+    try testing.expect(!config.norm_has_offset);
+    try testing.expect(config.scale_embeddings);
+    try testing.expect(config.tie_word_embeddings);
+    // Full-attention layers ship no v_proj: V = param-free-norm(k_proj out).
+    try testing.expect(config.attention_k_eq_v);
+    // MoE trunk
+    try testing.expect(config.isMoe());
+    try testing.expectEqual(@as(u32, 128), config.num_experts);
+    try testing.expectEqual(@as(u32, 8), config.num_experts_per_tok);
+    try testing.expectEqual(@as(u32, 704), config.moe_intermediate_size);
+    // Dual head geometry + per-type RoPE
+    try testing.expectEqual(@as(u32, 512), config.global_head_dim);
+    try testing.expectEqual(@as(u32, 2), config.num_global_key_value_heads);
+    try testing.expect(config.rope_proportional);
+    try testing.expectApproxEqAbs(@as(f32, 0.25), config.partial_rotary_factor_global, 0.0001);
+    try testing.expectApproxEqAbs(@as(f32, 1000000.0), config.rope_theta, 0.5);
+    try testing.expectApproxEqAbs(@as(f32, 10000.0), config.rope_local_base_freq, 0.5);
+    try testing.expect(config.has_explicit_layer_types);
+    try testing.expect(config.isGlobalLayer(5));
+    try testing.expect(!config.isGlobalLayer(4));
+    try testing.expectEqual(@as(u32, 1024), config.sliding_window);
+    try testing.expectApproxEqAbs(@as(f32, 30.0), config.final_logit_softcapping, 0.001);
+    // EOS set {eos, end_of_turn, +1}
+    try testing.expectEqual(@as(u32, 3), config.num_eos_tokens);
+    try testing.expect(config.isEosToken(1));
+    try testing.expect(config.isEosToken(106));
+    try testing.expect(config.isEosToken(50));
+    // Diffusion generation knobs from the embedded generation_config
+    try testing.expectEqual(@as(u32, 256), config.canvas_length);
+    try testing.expectEqual(@as(u32, 48), config.diffusion_max_steps);
+    try testing.expectApproxEqAbs(@as(f32, 0.4), config.diffusion_t_min, 0.0001);
+    try testing.expectApproxEqAbs(@as(f32, 0.8), config.diffusion_t_max, 0.0001);
+    try testing.expectApproxEqAbs(@as(f32, 0.1), config.diffusion_entropy_bound, 0.0001);
+    try testing.expectApproxEqAbs(@as(f32, 0.005), config.diffusion_confidence_threshold, 0.000001);
+    try testing.expectEqual(@as(u32, 1), config.diffusion_stability_threshold);
+    try testing.expectEqual(@as(u32, 0), config.diffusion_pad_token);
+    // Vision tower (model.encoder.vision_tower.*) is not wired yet — the
+    // diffusion arm must NOT advertise vision, or image requests would splice
+    // embeddings into a tower-less forward.
+    try testing.expect(!config.has_vision);
+    try testing.expectEqual(@as(u32, 4), config.quant_bits);
+}
+
+test "shouldKeepWeightKey drops DiffusionGemma encoder vision tower (text-only v1)" {
+    // DiffusionGemma nests its vision tower under model.encoder.* — distinct
+    // from the bare vision_tower.* prefixes of earlier checkpoints. Until the
+    // tower is wired, those tensors must be dropped even with load_vision on,
+    // and ALWAYS dropped when vision is off.
+    try testing.expect(!shouldKeepWeightKey("model.encoder.vision_tower.encoder.layers.0.self_attn.q_proj.linear.weight", false));
+    try testing.expect(!shouldKeepWeightKey("model.encoder.embed_vision.embedding_projection.weight", false));
+    // Trunk + diffusion weights always survive.
+    try testing.expect(shouldKeepWeightKey("model.decoder.layers.0.experts.gate_up_proj.weight", false));
+    try testing.expect(shouldKeepWeightKey("model.decoder.self_conditioning.gate_proj.weight", false));
+    try testing.expect(shouldKeepWeightKey("model.encoder.language_model.layers.0.layer_scalar", false));
 }
 
 test "parseGenerationDefaultsFromJson: reads model sampling recommendations" {

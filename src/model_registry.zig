@@ -547,6 +547,42 @@ pub const ModelRegistry = struct {
         return stub;
     }
 
+    /// Register-by-path (/v1/load-model with an absolute path): validate
+    /// `abs_path` exactly like discovery would (config.json, supported
+    /// model_type + quant mode) and insert an `.unloaded` stub keyed by the
+    /// directory basename, carrying the arch hint and weight bytes. An
+    /// existing entry with that id wins — same id means same model in the
+    /// registry's world, and we never re-point a live entry's path. Returns
+    /// the entry's stable id slice (owned by the registry).
+    ///
+    /// Exists for models OUTSIDE the --model-dir scan: the app auto-downloads
+    /// a small embedding encoder and registers it here no matter which org
+    /// dir the chat model (and thus --model-dir) points at.
+    pub fn registerByPath(self: *ModelRegistry, io: std.Io, abs_path: []const u8) ![]const u8 {
+        var trimmed = abs_path;
+        while (trimmed.len > 0 and trimmed[trimmed.len - 1] == '/') trimmed = trimmed[0 .. trimmed.len - 1];
+        const base = std.fs.path.basename(trimmed);
+        if (base.len == 0) return error.InvalidModelPath;
+
+        // Fast path: already registered (discovered, --model, or a previous
+        // register-by-path). No filesystem touch.
+        {
+            self.mutex.lockUncancelable(io);
+            defer self.mutex.unlock(io);
+            if (self.entries.get(base)) |existing| return existing.id;
+        }
+
+        const probe = try model_discovery.probeModelDir(io, self.allocator, trimmed);
+        defer self.allocator.free(probe.model_type);
+
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
+        // Re-check under the lock — another conn thread may have raced us.
+        if (self.entries.get(base)) |existing| return existing.id;
+        const stub = try self.registerStubWithArch(base, trimmed, probe.bytes_on_disk, probe.model_type);
+        return stub.id;
+    }
+
     /// Set the default model id used for requests that omit `model` or
     /// pass the literal "mlx-serve". The id must already exist (via
     /// `registerStub`); caller borrows the entry's own `id` slice so the
@@ -848,6 +884,26 @@ test "ModelRegistry: registerStubWithArch keeps the discovery arch hint" {
     // Plain registerStub keeps an empty hint (no arch known).
     const plain = try reg.registerStub("foo", "/path/to/foo", 1024);
     try testing.expectEqualStrings("", plain.arch_hint);
+}
+
+test "ModelRegistry: registerByPath reuses an existing id without touching the filesystem" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var reg = try ModelRegistry.init(testing.allocator, io, null, 3, 0, null);
+    defer reg.deinit();
+    const stub = try reg.registerStubWithArch("bge-x", "/models/bge-x", 64, "bert");
+    // The path's parent doesn't exist — proves the fast path resolves by
+    // basename before any probe.
+    const id = try reg.registerByPath(io, "/nonexistent/parent/bge-x/");
+    try testing.expectEqualStrings("bge-x", id);
+    try testing.expectEqual(stub.id.ptr, id.ptr);
+}
+
+test "ModelRegistry: registerByPath rejects a nonexistent directory" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var reg = try ModelRegistry.init(testing.allocator, io, null, 3, 0, null);
+    defer reg.deinit();
+    try testing.expectError(error.ModelDirNotFound, reg.registerByPath(io, "/nonexistent/parent/some-model"));
+    try testing.expectError(error.InvalidModelPath, reg.registerByPath(io, "/"));
 }
 
 test "ModelRegistry: ensureLoaded fails on unloaded stub" {

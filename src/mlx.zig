@@ -293,6 +293,17 @@ pub extern "c" fn mlx_fast_metal_kernel_apply(outputs: *mlx_vector_array, cls: m
 pub extern "c" fn mlx_random_categorical(res: *mlx_array, logits: mlx_array, axis: c_int, key: mlx_array, s: mlx_stream) c_int;
 pub extern "c" fn mlx_random_key(res: *mlx_array, seed: u64) c_int;
 pub extern "c" fn mlx_random_seed(seed: u64) c_int;
+// Uniform random integers in [low, high) — DiffusionGemma canvas init/renoise.
+pub extern "c" fn mlx_random_randint(res: *mlx_array, low: mlx_array, high: mlx_array, shape: [*]const c_int, shape_num: usize, dtype: mlx_dtype, key: mlx_array, s: mlx_stream) c_int;
+
+// ── Diffusion sampler ops ──
+pub extern "c" fn mlx_cummax(res: *mlx_array, a: mlx_array, axis: c_int, reverse: bool, inclusive: bool, s: mlx_stream) c_int;
+pub extern "c" fn mlx_logsumexp_axis(res: *mlx_array, a: mlx_array, axis: c_int, keepdims: bool, s: mlx_stream) c_int;
+pub extern "c" fn mlx_all(res: *mlx_array, a: mlx_array, keepdims: bool, s: mlx_stream) c_int;
+pub extern "c" fn mlx_contiguous(res: *mlx_array, a: mlx_array, allow_col_major: bool, s: mlx_stream) c_int;
+pub extern "c" fn mlx_mean(res: *mlx_array, a: mlx_array, keepdims: bool, s: mlx_stream) c_int;
+pub extern "c" fn mlx_max(res: *mlx_array, a: mlx_array, keepdims: bool, s: mlx_stream) c_int;
+pub extern "c" fn mlx_array_item_bool(res: *bool, arr: mlx_array) c_int;
 
 // ── Batch eval ──
 pub extern "c" fn mlx_eval(outputs: mlx_vector_array) c_int;

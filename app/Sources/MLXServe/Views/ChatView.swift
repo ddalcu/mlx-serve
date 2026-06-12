@@ -296,6 +296,8 @@ private struct DocumentFolderChip: View {
 
     private var statusText: String {
         switch index.state {
+        case .preparing:
+            return "Preparing embeddings…"
         case .indexing(let done, let total):
             return total > 0 ? "Indexing \(done)/\(total) files…" : "Scanning folder…"
         case .ready(let files, let chunks):
@@ -945,11 +947,11 @@ struct ChatDetailView: View {
             guard response == .OK, let url = panel.url else { return }
             DispatchQueue.main.async {
                 appState.documentIndexes[sessionId]?.cancel()
-                // Embed on the local server's GPU when it has an encoder
-                // model; the probe falls back to on-device NLEmbedding when
-                // the server is down or has no encoder model.
+                // Embeds on the local server's GPU; auto-downloads the
+                // default encoder model (35 MB, one-time) when none is
+                // available. Server down → lexical-only retrieval.
                 let index = DocumentIndex(folderURL: url,
-                                          gpuEmbedderProbe: ServerEmbedding.probe(port: server.port))
+                                          embedderProvider: ServerEmbedding.autoProvider(port: server.port))
                 appState.documentIndexes[sessionId] = index
                 index.startIndexing()
             }

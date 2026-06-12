@@ -171,7 +171,10 @@ class APIClient {
         request.timeoutInterval = 180
         var body: [String: Any] = ["model": id]
         if let drafterPath { body["drafter_path"] = drafterPath }
-        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+        // withoutEscapingSlashes: `id` may be an absolute path (the
+        // auto-downloaded encoder registers by path) — keep it readable in
+        // logs. The server unescapes either form.
+        request.httpBody = try JSONSerialization.data(withJSONObject: body, options: [.withoutEscapingSlashes])
         let (data, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
             let code = (response as? HTTPURLResponse)?.statusCode ?? -1

@@ -293,7 +293,7 @@ final class DocumentIndexTests: XCTestCase {
     @MainActor
     func testSearchDocumentsToolReturnsRankedExcerpts() async {
         let index = DocumentIndex(folderURL: URL(fileURLWithPath: "/tmp/docs"),
-                                  makeEmbedder: { FakeEmbedder() })
+                                  embedderProvider: { FakeEmbedder() })
         index.finishForTesting(chunks: [
             DocumentRetrieval.Chunk(text: "the cat sat on the mat", source: "cats.txt",
                                     vector: FakeEmbedder().vector(for: "the cat sat on the mat")),
@@ -318,7 +318,7 @@ final class DocumentIndexTests: XCTestCase {
     @MainActor
     func testSearchWhileIndexingTellsModelToWait() async {
         let index = DocumentIndex(folderURL: URL(fileURLWithPath: "/tmp/docs"),
-                                  makeEmbedder: { FakeEmbedder() })
+                                  embedderProvider: { FakeEmbedder() })
         // state stays .indexing — never finished
         let out = await index.search(query: "anything")
         XCTAssertTrue(out.lowercased().contains("index"), "should say indexing is in progress: \(out)")
@@ -338,7 +338,7 @@ final class DocumentIndexTests: XCTestCase {
             .write(to: dir.appendingPathComponent("notes.json"), atomically: true, encoding: .utf8)
         try Data([0xFF, 0xD8, 0xFF]).write(to: dir.appendingPathComponent("photo.jpg")) // skipped
 
-        let index = DocumentIndex(folderURL: dir, makeEmbedder: { FakeEmbedder() })
+        let index = DocumentIndex(folderURL: dir, embedderProvider: { FakeEmbedder() })
         index.startIndexing()
         // Poll until ready (file IO + fake embedding is fast).
         for _ in 0..<200 {
@@ -356,9 +356,9 @@ final class DocumentIndexTests: XCTestCase {
         XCTAssertTrue(out.contains("chat1.txt"), "search should surface the transcript: \(out)")
     }
 
-    /// Indexing must fan out across multiple workers, each with its own
-    /// embedder instance — single-threaded NLEmbedding measured 48ms/chunk,
-    /// i.e. 7+ minutes for a 500-file folder. One embedder = one worker.
+    /// Indexing must fan out across multiple workers so file IO + chunking
+    /// overlap the embedder's (HTTP) round-trips — measured via the maximum
+    /// number of simultaneously in-flight embed calls on a shared embedder.
     @MainActor
     func testIndexingParallelizesAcrossWorkers() async throws {
         try XCTSkipIf(ProcessInfo.processInfo.activeProcessorCount < 4, "needs a multicore host")
@@ -371,11 +371,8 @@ final class DocumentIndexTests: XCTestCase {
                 .write(to: dir.appendingPathComponent("f\(i).txt"), atomically: true, encoding: .utf8)
         }
 
-        let counter = EmbedderFactoryCounter()
-        let index = DocumentIndex(folderURL: dir, makeEmbedder: {
-            counter.increment()
-            return FakeEmbedder()
-        })
+        let embedder = ConcurrencyProbeEmbedder()
+        let index = DocumentIndex(folderURL: dir, embedderProvider: { embedder })
         index.startIndexing()
         for _ in 0..<200 {
             if case .ready = index.state { break }
@@ -385,8 +382,8 @@ final class DocumentIndexTests: XCTestCase {
             return XCTFail("index never became ready: \(index.state)")
         }
         XCTAssertEqual(files, 12)
-        XCTAssertGreaterThan(counter.count, 1,
-                             "indexing must create one embedder per worker (parallel), got \(counter.count)")
+        XCTAssertGreaterThan(embedder.maxInFlight, 1,
+                             "file embedding must overlap across workers, got max in-flight \(embedder.maxInFlight)")
     }
 
     @MainActor
@@ -397,7 +394,7 @@ final class DocumentIndexTests: XCTestCase {
         defer { try? FileManager.default.removeItem(at: dir) }
         try Data([0x00]).write(to: dir.appendingPathComponent("blob.bin"))
 
-        let index = DocumentIndex(folderURL: dir, makeEmbedder: { FakeEmbedder() })
+        let index = DocumentIndex(folderURL: dir, embedderProvider: { FakeEmbedder() })
         index.startIndexing()
         for _ in 0..<200 {
             if case .failed = index.state { break }
@@ -502,8 +499,7 @@ final class DocumentIndexTests: XCTestCase {
         let rec = TransportRecorder()
         let index = DocumentIndex(
             folderURL: dir,
-            makeEmbedder: { XCTFail("CPU embedder must not be built when the GPU probe succeeds"); return nil },
-            gpuEmbedderProbe: { ServerEmbedding(model: "bge-test", transport: rec.transport) }
+            embedderProvider: { ServerEmbedding(model: "bge-test", transport: rec.transport) }
         )
         index.startIndexing()
         for _ in 0..<200 {
@@ -521,15 +517,129 @@ final class DocumentIndexTests: XCTestCase {
         XCTAssertEqual(rec.texts.count, before + 1, "the query must use the same (GPU) embedder as the index")
         XCTAssertTrue(rec.texts.last?.contains("deploy friday") ?? false)
     }
+
+    /// Full fresh-machine provisioning against a LIVE local server: probe
+    /// finds no encoder → download the default encoder from HF (~35 MB) →
+    /// register it by absolute path → embed. Gated (network + server):
+    ///
+    ///   DOCS_RAG_AUTODL_PORT=11321 swift test -Xswiftc -swift-version \
+    ///     -Xswiftc 5 --filter testAutoProviderProvisionsEncoderEndToEnd
+    @MainActor
+    func testAutoProviderProvisionsEncoderEndToEnd() async throws {
+        guard let portStr = ProcessInfo.processInfo.environment["DOCS_RAG_AUTODL_PORT"],
+              let port = UInt16(portStr) else {
+            throw XCTSkip("DOCS_RAG_AUTODL_PORT not set — live auto-provisioning test skipped")
+        }
+        let embedder = await ServerEmbedding.autoProvider(port: port)()
+        let e = try XCTUnwrap(embedder, "auto-provisioning must yield a server embedder")
+        let vecs = await e.vectors(for: ["hello world", "goodbye world"])
+        XCTAssertEqual(vecs.count, 2)
+        XCTAssertEqual(vecs.compactMap { $0 }.count, 2, "both texts must embed")
+        XCTAssertGreaterThan(vecs[0]?.count ?? 0, 0)
+    }
+
+    // MARK: - ServerEmbedding.resolve (seamless auto-provisioning)
+
+    private static func registryModel(_ name: String, embeddings: Bool, loaded: Bool = true) -> ModelInfo {
+        ModelInfo(name: name, quantBits: 0, layers: 0, hiddenSize: 0, vocabSize: 0,
+                  contextLength: 0, modelMaxTokens: 0,
+                  supportsEmbeddings: embeddings, loaded: loaded)
+    }
+
+    func testResolveReturnsNilWhenServerUnreachableWithoutDownloading() async {
+        let downloaded = Flag()
+        let e = await ServerEmbedding.resolve(
+            fetchModels: { throw URLError(.cannotConnectToHost) },
+            ensureEncoderOnDisk: { downloaded.set(); return "/x" },
+            loadByPath: { _ in "x" },
+            transport: { _, _ in [] })
+        XCTAssertNil(e, "server down → lexical-only retrieval")
+        XCTAssertFalse(downloaded.isSet, "must not download the encoder when the server is down")
+    }
+
+    func testResolveUsesKnownEncoderWithoutDownloading() async {
+        let downloaded = Flag()
+        let e = await ServerEmbedding.resolve(
+            fetchModels: { [Self.registryModel("gemma", embeddings: false),
+                           Self.registryModel("bge-known", embeddings: true, loaded: false)] },
+            ensureEncoderOnDisk: { downloaded.set(); return "/x" },
+            loadByPath: { _ in XCTFail("no load-by-path needed"); return "x" },
+            transport: { _, _ in [] })
+        XCTAssertEqual((e as? ServerEmbedding)?.model, "bge-known")
+        XCTAssertFalse(downloaded.isSet, "an encoder the server already knows wins over downloading")
+    }
+
+    func testResolveDownloadsAndRegistersByPathWhenNoEncoderKnown() async {
+        let loadedPath = LockedBox<String>()
+        let e = await ServerEmbedding.resolve(
+            fetchModels: { [Self.registryModel("gemma", embeddings: false)] },
+            ensureEncoderOnDisk: { "/models/mlx-community/bge-small-en-v1.5-8bit" },
+            loadByPath: { path in loadedPath.value = path; return "bge-small-en-v1.5-8bit" },
+            transport: { _, _ in [] })
+        XCTAssertEqual(loadedPath.value, "/models/mlx-community/bge-small-en-v1.5-8bit",
+                       "the downloaded dir must be registered with the server by absolute path")
+        XCTAssertEqual((e as? ServerEmbedding)?.model, "bge-small-en-v1.5-8bit",
+                       "the embedder must use the id the server assigned")
+    }
+
+    func testResolveFailsSoftWhenDownloadOrLoadFails() async {
+        let downloadFailed = await ServerEmbedding.resolve(
+            fetchModels: { [] },
+            ensureEncoderOnDisk: { throw URLError(.cannotLoadFromNetwork) },
+            loadByPath: { _ in "x" },
+            transport: { _, _ in [] })
+        XCTAssertNil(downloadFailed, "failed download → lexical-only, not an error")
+        let loadFailed = await ServerEmbedding.resolve(
+            fetchModels: { [] },
+            ensureEncoderOnDisk: { "/x" },
+            loadByPath: { _ in throw URLError(.badServerResponse) },
+            transport: { _, _ in [] })
+        XCTAssertNil(loadFailed, "failed server-side load → lexical-only, not an error")
+    }
 }
 
-/// Thread-safe call counter for the embedder factory (invoked off-main by
-/// the indexing workers).
-private final class EmbedderFactoryCounter: @unchecked Sendable {
+/// Thread-safe settable box for capturing values inside @Sendable closures.
+private final class LockedBox<T>: @unchecked Sendable {
     private let lock = NSLock()
-    private var _count = 0
-    var count: Int { lock.lock(); defer { lock.unlock() }; return _count }
-    func increment() { lock.lock(); _count += 1; lock.unlock() }
+    private var _value: T?
+    var value: T? {
+        get { lock.lock(); defer { lock.unlock() }; return _value }
+        set { lock.lock(); _value = newValue; lock.unlock() }
+    }
+}
+
+/// Embedder that records how many `vectors(for:)` calls are in flight at
+/// once — pins the worker fan-out (IO/chunking overlapping embed calls)
+/// now that one stateless embedder is shared by every worker.
+private final class ConcurrencyProbeEmbedder: TextEmbedding, @unchecked Sendable {
+    private let lock = NSLock()
+    private var inFlight = 0
+    private var _maxInFlight = 0
+    var maxInFlight: Int { lock.lock(); defer { lock.unlock() }; return _maxInFlight }
+
+    private func enter() {
+        lock.lock()
+        inFlight += 1
+        _maxInFlight = max(_maxInFlight, inFlight)
+        lock.unlock()
+    }
+
+    private func exit() { lock.lock(); inFlight -= 1; lock.unlock() }
+
+    func vectors(for texts: [String]) async -> [[Double]?] {
+        enter()
+        try? await Task.sleep(nanoseconds: 30_000_000) // hold the slot so calls overlap
+        exit()
+        return texts.map { _ in [1.0, 0.001] }
+    }
+}
+
+/// Thread-safe one-shot flag for asserting a step did / didn't run.
+private final class Flag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var _isSet = false
+    var isSet: Bool { lock.lock(); defer { lock.unlock() }; return _isSet }
+    func set() { lock.lock(); _isSet = true; lock.unlock() }
 }
 
 /// Deterministic bag-of-words embedder: a tiny fixed vocabulary mapped to

@@ -1128,6 +1128,23 @@ const LinearAttnWeights = struct {
     out_b: mlx.mlx_array,
 };
 
+/// DiffusionGemma self-conditioning module: a GeGLU FFN over the previous
+/// denoising step's soft embeddings, added to the canvas token embeddings
+/// and re-normalized (scale-free) before decoder layer 0.
+///   out = rms_norm_no_scale(embeds + down(geglu(gate(pre_norm(sig)), up(pre_norm(sig)))))
+const SelfCondWeights = struct {
+    pre_norm: mlx.mlx_array,
+    gate_w: mlx.mlx_array,
+    gate_s: mlx.mlx_array,
+    gate_b: mlx.mlx_array,
+    up_w: mlx.mlx_array,
+    up_s: mlx.mlx_array,
+    up_b: mlx.mlx_array,
+    down_w: mlx.mlx_array,
+    down_s: mlx.mlx_array,
+    down_b: mlx.mlx_array,
+};
+
 const DenseMlpWeights = struct {
     gate_w: mlx.mlx_array,
     gate_s: mlx.mlx_array,
@@ -1191,6 +1208,11 @@ const MoeLayerWeights = struct {
     post_ff_norm_1: ?mlx.mlx_array = null,
     post_ff_norm_2: ?mlx.mlx_array = null,
     layer_scalar: ?mlx.mlx_array = null,
+    // DiffusionGemma: the causal ENCODER pass multiplies the layer output by
+    // its own scalar (model.encoder.language_model.layers.N.layer_scalar) —
+    // the only untied encoder text params. The bidirectional decoder pass
+    // uses `layer_scalar` above. Null for every other arch.
+    encoder_layer_scalar: ?mlx.mlx_array = null,
 };
 
 // ── Hybrid layer weights (LFM2, Nemotron-H) ──
@@ -1322,6 +1344,14 @@ pub const ForwardCtx = struct {
     /// by the BERT encoder forward so padded positions never attend. Null
     /// (the default) keeps the unmasked single-sequence path.
     key_pad_mask: ?mlx.mlx_array = null,
+    /// DiffusionGemma encoder pass: multiply each layer's output by the
+    /// ENCODER layer scalar instead of the decoder's. Set by the diffusion
+    /// runner for prompt prefill and committed-canvas re-encode passes.
+    use_encoder_scalars: bool = false,
+    /// DiffusionGemma encoder pass: the encoder only exists to fill the KV
+    /// cache — skip the 262K-vocab lm_head projection and return the
+    /// post-final-norm hidden instead of logits (caller frees either way).
+    skip_lm_head: bool = false,
 };
 
 // ── Transformer ──
@@ -1366,6 +1396,12 @@ pub const Transformer = struct {
     softcap_scalar: ?mlx.mlx_array,
     v_norm_weight: ?mlx.mlx_array, // ones(head_dim) for param-free RMS norm
     v_norm_weight_global: ?mlx.mlx_array, // ones(global_head_dim)
+
+    // DiffusionGemma: self-conditioning module weights (decoder-only) and a
+    // ones(hidden_size) vector for its scale-free post_norm + the router-style
+    // param-free norms in the diffusion decoder path. Null for other archs.
+    self_cond: ?SelfCondWeights = null,
+    ones_hidden: ?mlx.mlx_array = null,
 
     // Proportional RoPE frequencies for global/full attention layers (Gemma 4)
     rope_freqs_global: ?mlx.mlx_array,
@@ -1637,6 +1673,32 @@ pub const Transformer = struct {
             }
         }
 
+        // DiffusionGemma: self-conditioning module (the only diffusion-specific
+        // decoder weights) + a hidden-sized ones vector for its scale-free
+        // post_norm (the canvas embeddings pass through it even with a zero
+        // conditioning signal — i.e. they are always RMS-normalized pre-layer-0).
+        var self_cond: ?SelfCondWeights = null;
+        var ones_hidden: ?mlx.mlx_array = null;
+        if (config.isDiffusion()) {
+            self_cond = .{
+                .pre_norm = getWeightFmt(weights, &name_buf, "{s}.self_conditioning.pre_norm.weight", prefix),
+                .gate_w = getWeightFmt(weights, &name_buf, "{s}.self_conditioning.gate_proj.weight", prefix),
+                .gate_s = getWeightFmtOpt(weights, &name_buf, "{s}.self_conditioning.gate_proj.scales", prefix) orelse mlx.mlx_array_new(),
+                .gate_b = getWeightFmtOpt(weights, &name_buf, "{s}.self_conditioning.gate_proj.biases", prefix) orelse mlx.mlx_array_new(),
+                .up_w = getWeightFmt(weights, &name_buf, "{s}.self_conditioning.up_proj.weight", prefix),
+                .up_s = getWeightFmtOpt(weights, &name_buf, "{s}.self_conditioning.up_proj.scales", prefix) orelse mlx.mlx_array_new(),
+                .up_b = getWeightFmtOpt(weights, &name_buf, "{s}.self_conditioning.up_proj.biases", prefix) orelse mlx.mlx_array_new(),
+                .down_w = getWeightFmt(weights, &name_buf, "{s}.self_conditioning.down_proj.weight", prefix),
+                .down_s = getWeightFmtOpt(weights, &name_buf, "{s}.self_conditioning.down_proj.scales", prefix) orelse mlx.mlx_array_new(),
+                .down_b = getWeightFmtOpt(weights, &name_buf, "{s}.self_conditioning.down_proj.biases", prefix) orelse mlx.mlx_array_new(),
+            };
+            const one_val = bf16Scalar(1.0, s);
+            defer _ = mlx.mlx_array_free(one_val);
+            const h_shape = [_]c_int{@intCast(config.hidden_size)};
+            ones_hidden = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_full(&ones_hidden.?, &h_shape, 1, one_val, .bfloat16, s));
+        }
+
         // Gemma 4: proportional RoPE frequencies for global/full attention layers
         // freqs = factor * base^(arange(0, rotated_dims, 2) / full_dims)
         // padded with inf for non-rotated dimensions
@@ -1821,6 +1883,8 @@ pub const Transformer = struct {
             .softcap_scalar = softcap_scalar,
             .v_norm_weight = v_norm_weight,
             .v_norm_weight_global = v_norm_weight_global,
+            .self_cond = self_cond,
+            .ones_hidden = ones_hidden,
             .rope_freqs_global = rope_freqs_global,
             .bert_layers = null,
             .bert_pos_w = mlx.mlx_array_new(),
@@ -2300,6 +2364,7 @@ pub const Transformer = struct {
         if (self.gdn_ones_w) |w| _ = mlx.mlx_array_free(w);
         if (self.gdn_q_scale) |q| _ = mlx.mlx_array_free(q);
         if (self.gdn_k_scale) |k| _ = mlx.mlx_array_free(k);
+        if (self.ones_hidden) |o| _ = mlx.mlx_array_free(o);
         if (self.prompt_cache) |*pc| pc.deinit();
         self.cache.deinit();
         if (self.emb_scale) |es| _ = mlx.mlx_array_free(es);
@@ -2492,6 +2557,37 @@ pub const Transformer = struct {
         var result = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_array_set(&result, reshaped));
         return result;
+    }
+
+    /// Dense [vocab, hidden] bf16 view of the embedding table. DiffusionGemma
+    /// self-conditioning computes `probs @ table` — a plain matmul over a
+    /// float table — so quantized checkpoints dequantize the WHOLE table once
+    /// per generation request (mlx-vlm does the same; quantized_matmul with
+    /// transpose=false is several times slower at this shape). ~1.5 GB
+    /// transient for the 262K×2816 table. Caller frees. Dense bf16
+    /// checkpoints return a refcount-share of the live table.
+    pub fn dequantizedEmbedding(self: *Transformer) !mlx.mlx_array {
+        if (self.emb_s.ctx == null) {
+            var out = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_array_set(&out, self.emb_w));
+            return out;
+        }
+        const emb_qp = self.quantParamsHinted(self.emb_w, self.emb_s, self.config.hidden_size);
+        var dense = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(dense);
+        try mlx.check(mlx.mlx_dequantize(
+            &dense,
+            self.emb_w,
+            self.emb_s,
+            self.emb_b,
+            mlx.mlx_optional_int.some(@intCast(emb_qp.group_size)),
+            mlx.mlx_optional_int.some(@intCast(emb_qp.bits)),
+            emb_qp.mode.cstr(),
+            .{}, // global_scale (null)
+            .{ .value = .bfloat16, .has_value = true },
+            self.s,
+        ));
+        return dense;
     }
 
     /// Splice vision embeddings into text embeddings at image_token_id positions.
@@ -4151,7 +4247,7 @@ pub const Transformer = struct {
         const ml = self.moe_layers.?;
         const offset = ctx.moe_seq_offset.*;
         const cfg = &self.config;
-        const is_gemma4 = std.mem.eql(u8, cfg.model_type, "gemma4");
+        const is_gemma4 = cfg.isGemma4Layers();
 
         var h = try self.embedding(token_ids);
 
@@ -4199,66 +4295,7 @@ pub const Transformer = struct {
             defer _ = mlx.mlx_array_free(attn_out);
 
             if (is_gemma4) {
-                // Gemma 4 layer structure (from HF reference):
-                //   h = residual + post_attn_norm(attn(input_norm(residual)))
-                //   residual = h
-                //   shared = post_ff_norm_1(mlp(pre_ff_norm(h)))
-                //   experts = post_ff_norm_2(moe(pre_ff_norm_2(residual)))
-                //   h = residual + post_ff_norm(shared + experts)
-                //   h *= layer_scalar
-
-                // Attention residual
-                const attn_normed = try self.rmsNorm(attn_out, lw.post_attn_norm);
-                defer _ = mlx.mlx_array_free(attn_normed);
-                var h_new = mlx.mlx_array_new();
-                try mlx.check(mlx.mlx_add(&h_new, h, attn_normed, self.s));
-                _ = mlx.mlx_array_free(h);
-                h = h_new;
-                // h is now the residual for the feedforward block
-
-                // Shared expert: pre_ff_norm → mlp → post_ff_norm_1
-                const shared_in = try self.rmsNorm(h, lw.pre_ff_norm.?);
-                defer _ = mlx.mlx_array_free(shared_in);
-                const shared_out = if (lw.shared_mlp) |smlp|
-                    try self.denseMLP(shared_in, &smlp)
-                else
-                    try self.denseMLP(shared_in, &(switch (lw.mlp) {
-                        .dense => |dw| dw,
-                        .moe => unreachable,
-                    }));
-                defer _ = mlx.mlx_array_free(shared_out);
-                const shared_normed = try self.rmsNorm(shared_out, lw.post_ff_norm_1.?);
-                defer _ = mlx.mlx_array_free(shared_normed);
-
-                // Routed experts: router gets raw residual, experts get pre_ff_norm_2(residual)
-                const expert_in = try self.rmsNorm(h, lw.pre_ff_norm_2.?);
-                defer _ = mlx.mlx_array_free(expert_in);
-                const expert_out = switch (lw.mlp) {
-                    .moe => |*mw| try self.moeMLP2(h, expert_in, mw),
-                    .dense => |*dw| try self.denseMLP(expert_in, dw),
-                };
-                defer _ = mlx.mlx_array_free(expert_out);
-                const expert_normed = try self.rmsNorm(expert_out, lw.post_ff_norm_2.?);
-                defer _ = mlx.mlx_array_free(expert_normed);
-
-                // Combine: shared + experts → post_ff_norm → residual add
-                var combined = mlx.mlx_array_new();
-                defer _ = mlx.mlx_array_free(combined);
-                try mlx.check(mlx.mlx_add(&combined, shared_normed, expert_normed, self.s));
-                const combined_normed = try self.rmsNorm(combined, lw.post_ff_norm.?);
-                defer _ = mlx.mlx_array_free(combined_normed);
-                var h_ff = mlx.mlx_array_new();
-                try mlx.check(mlx.mlx_add(&h_ff, h, combined_normed, self.s));
-                _ = mlx.mlx_array_free(h);
-                h = h_ff;
-
-                // Layer scalar
-                if (lw.layer_scalar) |ls| {
-                    var h_scaled = mlx.mlx_array_new();
-                    try mlx.check(mlx.mlx_multiply(&h_scaled, h, ls, self.s));
-                    _ = mlx.mlx_array_free(h);
-                    h = h_scaled;
-                }
+                h = try self.gemma4MoeLayerTail(h, attn_out, lw, ctx.use_encoder_scalars);
             } else {
                 // Qwen3.5: simple residual + post_attn_norm before MLP
                 var h_new = mlx.mlx_array_new();
@@ -4310,6 +4347,9 @@ pub const Transformer = struct {
         }
 
         if (self.embedding_mode) return final_normed;
+        // Diffusion encoder passes exist only to fill the KV cache — the
+        // 262K-vocab projection is pure waste there.
+        if (ctx.skip_lm_head) return final_normed;
         var logits = try self.lmHeadProject(final_normed);
         _ = mlx.mlx_array_free(final_normed);
 
@@ -4320,6 +4360,354 @@ pub const Transformer = struct {
             logits = capped;
         }
 
+        return logits;
+    }
+
+    /// Gemma 4 / DiffusionGemma layer tail (from the HF reference):
+    ///   h = residual + post_attn_norm(attn_out)          [attn_out borrowed]
+    ///   residual = h
+    ///   shared  = post_ff_norm_1(mlp(pre_ff_norm(h)))
+    ///   experts = post_ff_norm_2(moe(pre_ff_norm_2(residual)))  [router sees RAW residual]
+    ///   h = residual + post_ff_norm(shared + experts)
+    ///   h *= layer_scalar (encoder variant when requested and bound)
+    /// Consumes `h_in`; returns the new layer output (caller owns).
+    fn gemma4MoeLayerTail(self: *Transformer, h_in: mlx.mlx_array, attn_out: mlx.mlx_array, lw: *const MoeLayerWeights, use_encoder_scalar: bool) !mlx.mlx_array {
+        var h = h_in;
+
+        // Attention residual
+        const attn_normed = try self.rmsNorm(attn_out, lw.post_attn_norm);
+        defer _ = mlx.mlx_array_free(attn_normed);
+        var h_new = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_add(&h_new, h, attn_normed, self.s));
+        _ = mlx.mlx_array_free(h);
+        h = h_new;
+        // h is now the residual for the feedforward block
+
+        // Shared expert: pre_ff_norm → mlp → post_ff_norm_1
+        const shared_in = try self.rmsNorm(h, lw.pre_ff_norm.?);
+        defer _ = mlx.mlx_array_free(shared_in);
+        const shared_out = if (lw.shared_mlp) |smlp|
+            try self.denseMLP(shared_in, &smlp)
+        else
+            try self.denseMLP(shared_in, &(switch (lw.mlp) {
+                .dense => |dw| dw,
+                .moe => unreachable,
+            }));
+        defer _ = mlx.mlx_array_free(shared_out);
+        const shared_normed = try self.rmsNorm(shared_out, lw.post_ff_norm_1.?);
+        defer _ = mlx.mlx_array_free(shared_normed);
+
+        // Routed experts: router gets raw residual, experts get pre_ff_norm_2(residual)
+        const expert_in = try self.rmsNorm(h, lw.pre_ff_norm_2.?);
+        defer _ = mlx.mlx_array_free(expert_in);
+        const expert_out = switch (lw.mlp) {
+            .moe => |*mw| try self.moeMLP2(h, expert_in, mw),
+            .dense => |*dw| try self.denseMLP(expert_in, dw),
+        };
+        defer _ = mlx.mlx_array_free(expert_out);
+        const expert_normed = try self.rmsNorm(expert_out, lw.post_ff_norm_2.?);
+        defer _ = mlx.mlx_array_free(expert_normed);
+
+        if (std.c.getenv("MLX_SERVE_DIFFUSION_TRACE") != null and trace_tail_once) {
+            trace_tail_once = false;
+            debugTraceHead("tail residual", h, self.s);
+            debugTraceHead("tail shared_normed", shared_normed, self.s);
+            debugTraceHead("tail expert_normed", expert_normed, self.s);
+        }
+
+        // Combine: shared + experts → post_ff_norm → residual add
+        var combined = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(combined);
+        try mlx.check(mlx.mlx_add(&combined, shared_normed, expert_normed, self.s));
+        const combined_normed = try self.rmsNorm(combined, lw.post_ff_norm.?);
+        defer _ = mlx.mlx_array_free(combined_normed);
+        var h_ff = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_add(&h_ff, h, combined_normed, self.s));
+        _ = mlx.mlx_array_free(h);
+        h = h_ff;
+
+        // Layer scalar. DiffusionGemma's causal encoder pass uses its own
+        // per-layer scalar (the only untied encoder text params); every
+        // other caller uses the decoder/trunk scalar.
+        const scalar = if (use_encoder_scalar and lw.encoder_layer_scalar != null)
+            lw.encoder_layer_scalar
+        else
+            lw.layer_scalar;
+        if (scalar) |ls| {
+            var h_scaled = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_multiply(&h_scaled, h, ls, self.s));
+            _ = mlx.mlx_array_free(h);
+            h = h_scaled;
+        }
+        return h;
+    }
+
+    // ── DiffusionGemma bidirectional canvas decoder ──
+
+    /// MLX_SERVE_DIFFUSION_TRACE=1 debugging aid: print the first 8 values
+    /// of position 0 of a hidden state.
+    var trace_tail_once: bool = true;
+    fn debugTraceHead(label: []const u8, arr: mlx.mlx_array, s: mlx.mlx_stream) void {
+        var f = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(f);
+        mlx.check(mlx.mlx_astype(&f, arr, .float32, s)) catch return;
+        mlx.check(mlx.mlx_array_eval(f)) catch return;
+        const d = mlx.mlx_array_data_float32(f) orelse return;
+        std.debug.print("{s}: {any}\n", .{ label, d[0..8] });
+    }
+
+    /// Decoder attention over a noisy canvas: Q/K/V computed for the canvas
+    /// only, RoPEd at absolute positions [offset, offset+L); the committed
+    /// context K/V is READ from the cache (never written) and concatenated.
+    /// Attention is fully bidirectional — no mask at all (B=1, no padding):
+    /// full layers see the whole cache + canvas; sliding layers see the last
+    /// `sliding_window − 1` cached positions + the whole canvas (enforced by
+    /// slicing the cached K/V, mirroring mlx-vlm's O(window) trick — the HF
+    /// reference zeroes the same region with a mask).
+    fn diffusionDecoderAttn(
+        self: *Transformer,
+        ctx: *ForwardCtx,
+        x: mlx.mlx_array,
+        fa: *const FullAttnWeights,
+        layer: u32,
+        offset: c_int,
+        batch: c_int,
+        seq_len: c_int,
+    ) !mlx.mlx_array {
+        const cfg = &self.config;
+        const is_global = cfg.isGlobalLayer(layer);
+        const h_count: c_int = @intCast(cfg.num_attention_heads);
+
+        const cur_hd: u32 = cfg.layerHeadDim(layer);
+        const cur_kv_h: u32 = cfg.layerKVHeads(layer);
+        const q_shape = [_]c_int{ batch, seq_len, h_count, @intCast(cur_hd) };
+        const kv_shape = [_]c_int{ batch, seq_len, @intCast(cur_kv_h), @intCast(cur_hd) };
+        const flat_shape = [_]c_int{ batch, seq_len, @intCast(@as(u32, @intCast(h_count)) * cur_hd) };
+
+        const use_prop_rope = is_global and self.rope_freqs_global != null;
+        const rope_dims: c_int = @intCast(cur_hd);
+        const rope_base = mlx.mlx_optional_float{ .value = if (is_global) cfg.rope_theta else cfg.rope_local_base_freq, .has_value = !use_prop_rope };
+        const rope_scale: f32 = if (use_prop_rope) 1.0 else if (is_global) (1.0 / cfg.rope_scaling_factor) else 1.0;
+        const rope_freqs: mlx.mlx_array = if (use_prop_rope) self.rope_freqs_global.? else .{ .ctx = null };
+
+        const perm = [_]c_int{ 0, 2, 1, 3 };
+        const none_mask = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(none_mask);
+
+        // Q projection + norm + RoPE
+        const q_proj = try self.qmatmul(x, fa.q_w, fa.q_s, fa.q_b);
+        defer _ = mlx.mlx_array_free(q_proj);
+        var q_r = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(q_r);
+        try mlx.check(mlx.mlx_reshape(&q_r, q_proj, &q_shape, 4, self.s));
+        const q_normed = try self.rmsNorm(q_r, fa.q_norm);
+        defer _ = mlx.mlx_array_free(q_normed);
+        var q_t = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(q_t);
+        try mlx.check(mlx.mlx_transpose_axes(&q_t, q_normed, &perm, 4, self.s));
+        var q_rope = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(q_rope);
+        try mlx.check(mlx.mlx_fast_rope(&q_rope, q_t, rope_dims, false, rope_base, rope_scale, offset, rope_freqs, self.s));
+
+        // K, V projections. On full layers fa.v_w aliases fa.k_w (no v_proj
+        // in the checkpoint): V = param-free-norm(k_proj out) PRE-k_norm,
+        // PRE-RoPE — same recompute the gemma4 MoE attention does.
+        const k_proj = try self.qmatmul(x, fa.k_w, fa.k_s, fa.k_b);
+        defer _ = mlx.mlx_array_free(k_proj);
+        const v_proj = try self.qmatmul(x, fa.v_w, fa.v_s, fa.v_b);
+        defer _ = mlx.mlx_array_free(v_proj);
+        var k_r = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(k_r);
+        var v_r = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(v_r);
+        try mlx.check(mlx.mlx_reshape(&k_r, k_proj, &kv_shape, 4, self.s));
+        try mlx.check(mlx.mlx_reshape(&v_r, v_proj, &kv_shape, 4, self.s));
+
+        const k_normed = try self.rmsNorm(k_r, fa.k_norm);
+        defer _ = mlx.mlx_array_free(k_normed);
+
+        var v_after_norm = v_r;
+        var v_normed_arr = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(v_normed_arr);
+        if (cfg.has_v_norm) {
+            const has_dual_hd = cfg.global_head_dim > 0 and cfg.global_head_dim != cfg.head_dim;
+            const vnw = if (has_dual_hd and is_global)
+                (self.v_norm_weight_global orelse self.v_norm_weight.?)
+            else
+                self.v_norm_weight.?;
+            v_normed_arr = try self.rmsNorm(v_r, vnw);
+            v_after_norm = v_normed_arr;
+        }
+
+        var k_t = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(k_t);
+        var v_t = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(v_t);
+        try mlx.check(mlx.mlx_transpose_axes(&k_t, k_normed, &perm, 4, self.s));
+        try mlx.check(mlx.mlx_transpose_axes(&v_t, v_after_norm, &perm, 4, self.s));
+
+        var k_rope = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(k_rope);
+        try mlx.check(mlx.mlx_fast_rope(&k_rope, k_t, rope_dims, false, rope_base, rope_scale, offset, rope_freqs, self.s));
+
+        // Read the committed-context K/V from the cache WITHOUT writing.
+        var full_k = k_rope;
+        var full_v = v_t;
+        var concat_k = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(concat_k);
+        var concat_v = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(concat_v);
+        var kv_view: ?DenseKVView = null;
+        defer if (kv_view) |*kv| kv.deinit();
+        if (ctx.cache.seqLen(layer) > 0) {
+            kv_view = try ctx.cache.denseView(layer, self.s);
+            var cache_k = kv_view.?.k;
+            var cache_v = kv_view.?.v;
+            // Sliding layers: the canvas only attends to the last window−1
+            // committed positions.
+            var sliced_k = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(sliced_k);
+            var sliced_v = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(sliced_v);
+            if (!is_global and cfg.has_sliding_window) {
+                const window: c_int = @as(c_int, @intCast(cfg.sliding_window)) - 1;
+                const ck_shape = mlx.getShape(cache_k);
+                const cache_len = ck_shape[2];
+                if (window > 0 and cache_len > window) {
+                    const start = [_]c_int{ 0, 0, cache_len - window, 0 };
+                    const stop = [_]c_int{ ck_shape[0], ck_shape[1], cache_len, ck_shape[3] };
+                    const strides = [_]c_int{ 1, 1, 1, 1 };
+                    try mlx.check(mlx.mlx_slice(&sliced_k, cache_k, &start, 4, &stop, 4, &strides, 4, self.s));
+                    try mlx.check(mlx.mlx_slice(&sliced_v, cache_v, &start, 4, &stop, 4, &strides, 4, self.s));
+                    cache_k = sliced_k;
+                    cache_v = sliced_v;
+                }
+            }
+            const kvec = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(kvec);
+            _ = mlx.mlx_vector_array_append_value(kvec, cache_k);
+            _ = mlx.mlx_vector_array_append_value(kvec, k_rope);
+            try mlx.check(mlx.mlx_concatenate_axis(&concat_k, kvec, 2, self.s));
+            const vvec = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(vvec);
+            _ = mlx.mlx_vector_array_append_value(vvec, cache_v);
+            _ = mlx.mlx_vector_array_append_value(vvec, v_t);
+            try mlx.check(mlx.mlx_concatenate_axis(&concat_v, vvec, 2, self.s));
+            full_k = concat_k;
+            full_v = concat_v;
+        }
+
+        // Bidirectional SDPA — no mask (scale 1.0; q/k norms absorb it).
+        var attn_out = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(attn_out);
+        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, 1.0, "", none_mask, .{ .ctx = null }, self.s));
+
+        const perm_back = [_]c_int{ 0, 2, 1, 3 };
+        var attn_t = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(attn_t);
+        try mlx.check(mlx.mlx_transpose_axes(&attn_t, attn_out, &perm_back, 4, self.s));
+        var attn_flat = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(attn_flat);
+        try mlx.check(mlx.mlx_reshape(&attn_flat, attn_t, &flat_shape, 3, self.s));
+
+        return self.qmatmul(attn_flat, fa.o_w, fa.o_s, fa.o_b);
+    }
+
+    /// DiffusionGemma decoder forward: one denoising step over the canvas.
+    /// `canvas_ids` [1, L] are the current noisy token ids;
+    /// `self_cond_embeddings` [1, L, H] is the previous step's soft embedding
+    /// (probs @ embed_table × √H) or null on the first step. The KV cache is
+    /// read-only here and `ctx.moe_seq_offset` does NOT advance — the canvas
+    /// is re-forwarded every step until it commits, at which point the caller
+    /// runs a causal ENCODER pass (forwardMoeWith with use_encoder_scalars)
+    /// over the committed tokens to extend the cache.
+    /// Returns softcapped logits [1, L, vocab]; caller frees.
+    pub fn forwardDiffusionDecoder(
+        self: *Transformer,
+        ctx: *ForwardCtx,
+        canvas_ids: mlx.mlx_array,
+        self_cond_embeddings: ?mlx.mlx_array,
+    ) !mlx.mlx_array {
+        const ml = self.moe_layers orelse return error.DiffusionRequiresMoeLayers;
+        const sc = self.self_cond orelse return error.DiffusionWeightsMissing;
+        const cfg = &self.config;
+        const offset: c_int = @intCast(ctx.moe_seq_offset.*);
+
+        // Canvas embeddings (× √hidden) + self-conditioning. Even with a
+        // null signal the embeddings pass through the module's scale-free
+        // post_norm (FFN(pre_norm(0)) ≡ 0), so layer-0 input is always
+        // RMS-normalized.
+        var h = try self.embedding(canvas_ids);
+        if (self_cond_embeddings) |sig| {
+            const dbg_sc = std.c.getenv("MLX_SERVE_DIFFUSION_TRACE") != null;
+            if (dbg_sc) debugTraceHead("sc sig", sig, self.s);
+            const sig_normed = try self.rmsNorm(sig, sc.pre_norm);
+            defer _ = mlx.mlx_array_free(sig_normed);
+            if (dbg_sc) debugTraceHead("sc normed", sig_normed, self.s);
+            const gate = try self.qmatmul(sig_normed, sc.gate_w, sc.gate_s, sc.gate_b);
+            defer _ = mlx.mlx_array_free(gate);
+            const up = try self.qmatmul(sig_normed, sc.up_w, sc.up_s, sc.up_b);
+            defer _ = mlx.mlx_array_free(up);
+            const act = try self.computeGeglu(gate, up);
+            defer _ = mlx.mlx_array_free(act);
+            const ffn_out = try self.qmatmul(act, sc.down_w, sc.down_s, sc.down_b);
+            defer _ = mlx.mlx_array_free(ffn_out);
+            if (dbg_sc) debugTraceHead("sc signal", ffn_out, self.s);
+            var summed = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(summed);
+            try mlx.check(mlx.mlx_add(&summed, h, ffn_out, self.s));
+            const post = try self.rmsNorm(summed, self.ones_hidden.?);
+            _ = mlx.mlx_array_free(h);
+            h = post;
+            if (dbg_sc) debugTraceHead("sc out", h, self.s);
+        } else {
+            const post = try self.rmsNorm(h, self.ones_hidden.?);
+            _ = mlx.mlx_array_free(h);
+            h = post;
+        }
+
+        const x_shape = mlx.getShape(h);
+        const batch: c_int = x_shape[0];
+        const seq_len: c_int = x_shape[1];
+
+        const dbg = std.c.getenv("MLX_SERVE_DIFFUSION_TRACE") != null;
+        if (dbg) debugTraceHead("embed+sc", h, self.s);
+
+        for (0..cfg.num_hidden_layers) |layer_idx| {
+            const li: u32 = @intCast(layer_idx);
+            const lw = &ml[layer_idx];
+
+            const normed = try self.rmsNorm(h, lw.input_norm);
+            defer _ = mlx.mlx_array_free(normed);
+
+            const attn_out = switch (lw.attn) {
+                .full => |fa| try self.diffusionDecoderAttn(ctx, normed, &fa, li, offset, batch, seq_len),
+                .linear => return error.DiffusionUnsupportedLinearAttn,
+            };
+            defer _ = mlx.mlx_array_free(attn_out);
+            if (dbg and layer_idx == 0) {
+                debugTraceHead("layer0 normed", normed, self.s);
+                debugTraceHead("layer0 attn_out", attn_out, self.s);
+            }
+
+            h = try self.gemma4MoeLayerTail(h, attn_out, lw, false);
+            if (dbg and (layer_idx == 0 or layer_idx == 1 or layer_idx == 5 or layer_idx == 29)) {
+                var buf: [32]u8 = undefined;
+                const label = std.fmt.bufPrint(&buf, "after layer {d}", .{layer_idx}) catch "layer";
+                debugTraceHead(label, h, self.s);
+            }
+        }
+
+        const final_normed = try self.rmsNorm(h, self.final_norm);
+        _ = mlx.mlx_array_free(h);
+        var logits = try self.lmHeadProject(final_normed);
+        _ = mlx.mlx_array_free(final_normed);
+
+        if (self.softcap_scalar != null) {
+            const capped = try self.applySoftcap(logits);
+            _ = mlx.mlx_array_free(logits);
+            logits = capped;
+        }
         return logits;
     }
 
@@ -5201,6 +5589,13 @@ pub const Transformer = struct {
             const total_kv: c_int = offset + seq_len;
             if (is_prefill and is_global) {
                 try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "causal", none_mask, .{ .ctx = null }, self.s));
+            } else if (is_prefill and total_kv <= sw) {
+                // Everything fits in the window: the sliding mask degenerates
+                // to plain causal. Use the "causal" fast path — same kernel
+                // (and reduction order) the mlx-lm/mlx-vlm reference picks for
+                // short prompts, which keeps near-tie MoE router decisions
+                // from flipping vs the reference (DiffusionGemma parity).
+                try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "causal", none_mask, .{ .ctx = null }, self.s));
             } else if (is_prefill) {
                 try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "array", local_prefill_mask, .{ .ctx = null }, self.s));
             } else if (is_global) {
@@ -5208,7 +5603,6 @@ pub const Transformer = struct {
             } else if (@as(c_int, @intCast(ctx.cache.seqLen(layer))) <= sw) {
                 try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "", none_mask, .{ .ctx = null }, self.s));
             } else {
-                _ = total_kv;
                 try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "array", local_decode_mask, .{ .ctx = null }, self.s));
             }
         }
@@ -6036,7 +6430,9 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
         for (owned_bf16.items) |a| _ = mlx.mlx_array_free(a);
         owned_bf16.deinit(allocator);
     }
-    const is_gemma4 = std.mem.eql(u8, config.model_type, "gemma4");
+    // DiffusionGemma reuses the Gemma 4 26B-A4B layer structure verbatim —
+    // both take the gemma4 binding/forward arms here.
+    const is_gemma4 = config.isGemma4Layers();
 
     for (0..config.num_hidden_layers) |i| {
         const li: u32 = @intCast(i);
@@ -6057,7 +6453,16 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
         lw.post_ff_norm_1 = null;
         lw.post_ff_norm_2 = null;
         lw.layer_scalar = null;
+        lw.encoder_layer_scalar = null;
         lw.shared_mlp = null;
+
+        // DiffusionGemma: the encoder's per-layer scalars are the only
+        // untied encoder text params; absolute name, outside weight_prefix.
+        if (config.isDiffusion()) {
+            var enc_buf: [256]u8 = undefined;
+            const enc_name = std.fmt.bufPrint(&enc_buf, "model.encoder.language_model.layers.{d}.layer_scalar", .{li}) catch unreachable;
+            lw.encoder_layer_scalar = weights.get(enc_name);
+        }
 
         // Gemma 4 MoE: extra feedforward norms, layer scalar, shared expert MLP
         if (is_gemma4) {
@@ -6195,21 +6600,78 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
             // Each `*_s`/`*_b` is loaded optionally for Unsloth Dynamic compatibility —
             // bf16 layers carry only the weight, no scales/biases. The post-construction
             // `maybeTransposeForBf16` calls are no-ops for already-quantized weights.
+            //
+            // Expert naming variants:
+            //   Gemma 4 26B-A4B:  experts.switch_glu.{gate,up,down}_proj.*
+            //   DiffusionGemma:   experts.gate_up_proj.* (PACKED [E, 2M, X],
+            //                     gate rows first) + experts.down_proj.*
+            // The packed variant is sliced into gate/up halves at load
+            // (splitPackedGateUp) so both feed the same MoeMlpWeights fields.
+            const packed_gu_w = getLayerWeightOpt(weights, name_buf, prefix, li, "experts.gate_up_proj.weight");
+            var sw_gate_w: mlx.mlx_array = undefined;
+            var sw_gate_s: mlx.mlx_array = undefined;
+            var sw_gate_b: mlx.mlx_array = undefined;
+            var sw_up_w: mlx.mlx_array = undefined;
+            var sw_up_s: mlx.mlx_array = undefined;
+            var sw_up_b: mlx.mlx_array = undefined;
+            var sw_down_w: mlx.mlx_array = undefined;
+            var sw_down_s: mlx.mlx_array = undefined;
+            var sw_down_b: mlx.mlx_array = undefined;
+            if (packed_gu_w) |gu_w| {
+                const w_pair = try splitPackedGateUp(gu_w, s);
+                try owned_bf16.append(allocator, w_pair.gate);
+                try owned_bf16.append(allocator, w_pair.up);
+                sw_gate_w = w_pair.gate;
+                sw_up_w = w_pair.up;
+                if (getLayerWeightOpt(weights, name_buf, prefix, li, "experts.gate_up_proj.scales")) |gu_s| {
+                    const s_pair = try splitPackedGateUp(gu_s, s);
+                    try owned_bf16.append(allocator, s_pair.gate);
+                    try owned_bf16.append(allocator, s_pair.up);
+                    sw_gate_s = s_pair.gate;
+                    sw_up_s = s_pair.up;
+                } else {
+                    sw_gate_s = mlx.mlx_array_new();
+                    sw_up_s = mlx.mlx_array_new();
+                }
+                if (getLayerWeightOpt(weights, name_buf, prefix, li, "experts.gate_up_proj.biases")) |gu_b| {
+                    const b_pair = try splitPackedGateUp(gu_b, s);
+                    try owned_bf16.append(allocator, b_pair.gate);
+                    try owned_bf16.append(allocator, b_pair.up);
+                    sw_gate_b = b_pair.gate;
+                    sw_up_b = b_pair.up;
+                } else {
+                    sw_gate_b = mlx.mlx_array_new();
+                    sw_up_b = mlx.mlx_array_new();
+                }
+                sw_down_w = getLayerWeight(weights, name_buf, prefix, li, "experts.down_proj.weight");
+                sw_down_s = getLayerWeightOpt(weights, name_buf, prefix, li, "experts.down_proj.scales") orelse mlx.mlx_array_new();
+                sw_down_b = getLayerWeightOpt(weights, name_buf, prefix, li, "experts.down_proj.biases") orelse mlx.mlx_array_new();
+            } else {
+                sw_gate_w = getLayerWeight(weights, name_buf, prefix, li, "experts.switch_glu.gate_proj.weight");
+                sw_gate_s = getLayerWeightOpt(weights, name_buf, prefix, li, "experts.switch_glu.gate_proj.scales") orelse mlx.mlx_array_new();
+                sw_gate_b = getLayerWeightOpt(weights, name_buf, prefix, li, "experts.switch_glu.gate_proj.biases") orelse mlx.mlx_array_new();
+                sw_up_w = getLayerWeight(weights, name_buf, prefix, li, "experts.switch_glu.up_proj.weight");
+                sw_up_s = getLayerWeightOpt(weights, name_buf, prefix, li, "experts.switch_glu.up_proj.scales") orelse mlx.mlx_array_new();
+                sw_up_b = getLayerWeightOpt(weights, name_buf, prefix, li, "experts.switch_glu.up_proj.biases") orelse mlx.mlx_array_new();
+                sw_down_w = getLayerWeight(weights, name_buf, prefix, li, "experts.switch_glu.down_proj.weight");
+                sw_down_s = getLayerWeightOpt(weights, name_buf, prefix, li, "experts.switch_glu.down_proj.scales") orelse mlx.mlx_array_new();
+                sw_down_b = getLayerWeightOpt(weights, name_buf, prefix, li, "experts.switch_glu.down_proj.biases") orelse mlx.mlx_array_new();
+            }
             lw.mlp = .{ .moe = .{
                 .router_w = getLayerWeight(weights, name_buf, prefix, li, "router.proj.weight"),
                 .router_s = getLayerWeightOpt(weights, name_buf, prefix, li, "router.proj.scales") orelse mlx.mlx_array_new(),
                 .router_b = getLayerWeightOpt(weights, name_buf, prefix, li, "router.proj.biases") orelse mlx.mlx_array_new(),
                 .router_scale = getLayerWeightOpt(weights, name_buf, prefix, li, "router.scale"),
                 .per_expert_scale = getLayerWeightOpt(weights, name_buf, prefix, li, "router.per_expert_scale"),
-                .switch_gate_w = getLayerWeight(weights, name_buf, prefix, li, "experts.switch_glu.gate_proj.weight"),
-                .switch_gate_s = getLayerWeightOpt(weights, name_buf, prefix, li, "experts.switch_glu.gate_proj.scales") orelse mlx.mlx_array_new(),
-                .switch_gate_b = getLayerWeightOpt(weights, name_buf, prefix, li, "experts.switch_glu.gate_proj.biases") orelse mlx.mlx_array_new(),
-                .switch_up_w = getLayerWeight(weights, name_buf, prefix, li, "experts.switch_glu.up_proj.weight"),
-                .switch_up_s = getLayerWeightOpt(weights, name_buf, prefix, li, "experts.switch_glu.up_proj.scales") orelse mlx.mlx_array_new(),
-                .switch_up_b = getLayerWeightOpt(weights, name_buf, prefix, li, "experts.switch_glu.up_proj.biases") orelse mlx.mlx_array_new(),
-                .switch_down_w = getLayerWeight(weights, name_buf, prefix, li, "experts.switch_glu.down_proj.weight"),
-                .switch_down_s = getLayerWeightOpt(weights, name_buf, prefix, li, "experts.switch_glu.down_proj.scales") orelse mlx.mlx_array_new(),
-                .switch_down_b = getLayerWeightOpt(weights, name_buf, prefix, li, "experts.switch_glu.down_proj.biases") orelse mlx.mlx_array_new(),
+                .switch_gate_w = sw_gate_w,
+                .switch_gate_s = sw_gate_s,
+                .switch_gate_b = sw_gate_b,
+                .switch_up_w = sw_up_w,
+                .switch_up_s = sw_up_s,
+                .switch_up_b = sw_up_b,
+                .switch_down_w = sw_down_w,
+                .switch_down_s = sw_down_s,
+                .switch_down_b = sw_down_b,
                 // Shared expert handled via lw.shared_mlp for Gemma 4 (separate branch in forward)
                 .shared_gate_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.gate_proj.weight"),
                 .shared_gate_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.gate_proj.scales") orelse mlx.mlx_array_new(),
@@ -6703,6 +7165,46 @@ fn gatherExpertMm(res: *mlx.mlx_array, x: mlx.mlx_array, w: mlx.mlx_array, sc: m
     } else {
         try mlx.check(mlx.mlx_gather_qmm(res, x, w, sc, bi, lhs_idx, rhs_idx, true, mlx.mlx_optional_int.some(@intCast(group_size)), mlx.mlx_optional_int.some(@intCast(bits)), mode.cstr(), sorted, s));
     }
+}
+
+/// DiffusionGemma packs each expert's gate and up projections in one tensor
+/// `experts.gate_up_proj` of shape [E, 2*M, X], gate rows first (HF chunks
+/// the projected output in halves: gate = [..., :M], up = [..., M:]).
+/// Slicing axis 1 maps the packed layout onto MoeMlpWeights' separate
+/// switch_gate_*/switch_up_* fields with zero forward-pass changes; the same
+/// split serves the packed-u32 weight, its scales, and its biases (all share
+/// the [E, rows, X] expert-output layout — quant groups run along axis 2).
+/// Caller owns both returned arrays.
+fn splitPackedGateUp(arr: mlx.mlx_array, s: mlx.mlx_stream) !struct { gate: mlx.mlx_array, up: mlx.mlx_array } {
+    const shape = mlx.getShape(arr);
+    if (shape.len != 3) return error.BadPackedGateUpShape;
+    const two_m = shape[1];
+    const m = @divExact(two_m, 2);
+    const strides = [_]c_int{ 1, 1, 1 };
+
+    var gate_view = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(gate_view);
+    const g_start = [_]c_int{ 0, 0, 0 };
+    const g_stop = [_]c_int{ shape[0], m, shape[2] };
+    try mlx.check(mlx.mlx_slice(&gate_view, arr, &g_start, 3, &g_stop, 3, &strides, 3, s));
+
+    var up_view = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(up_view);
+    const u_start = [_]c_int{ 0, m, 0 };
+    const u_stop = [_]c_int{ shape[0], two_m, shape[2] };
+    try mlx.check(mlx.mlx_slice(&up_view, arr, &u_start, 3, &u_stop, 3, &strides, 3, s));
+
+    // gather_qmm reads the expert weight buffers as ROW-CONTIGUOUS — a lazy
+    // slice view has parent strides and silently produces zeros. Materialize
+    // both halves (one-time cost at load).
+    var gate = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(gate);
+    try mlx.check(mlx.mlx_contiguous(&gate, gate_view, false, s));
+    var up = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(up);
+    try mlx.check(mlx.mlx_contiguous(&up, up_view, false, s));
+
+    return .{ .gate = gate, .up = up };
 }
 
 fn qmatmulBits(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, bits: u32, group_size: u32, mode: QuantMode, s: mlx.mlx_stream) !mlx.mlx_array {
@@ -7576,6 +8078,218 @@ fn testReadF32(arr: mlx.mlx_array, out: []f32, s: mlx.mlx_stream) !void {
     try mlx.check(mlx.mlx_eval(ev));
     const data = mlx.mlx_array_data_float32(flat) orelse return error.TestUnexpectedNullData;
     @memcpy(out, data[0..out.len]);
+}
+
+test "splitPackedGateUp slices DiffusionGemma experts.gate_up_proj into gate/up halves" {
+    // DiffusionGemma packs each expert's gate and up projections in one
+    // tensor [E, 2*M, X] with gate rows first (HF chunks the gate_up output
+    // in halves: gate = [..., :M], up = [..., M:]). The split must slice
+    // axis 1 so the same code serves the packed quantized weight, its
+    // scales, and its biases (all share the [E, rows, X] layout).
+    const s = mlx.gpuStream();
+    const E = 2;
+    const M = 2; // moe_intermediate rows per half
+    const X = 3;
+
+    var host: [E * 2 * M * X]f32 = undefined;
+    for (&host, 0..) |*v, i| v.* = @floatFromInt(i);
+    const sh = [_]c_int{ E, 2 * M, X };
+    const packed_arr = mlx.mlx_array_new_data(&host, &sh, 3, .float32);
+    defer _ = mlx.mlx_array_free(packed_arr);
+
+    const pair = try splitPackedGateUp(packed_arr, s);
+    defer _ = mlx.mlx_array_free(pair.gate);
+    defer _ = mlx.mlx_array_free(pair.up);
+
+    const gshape = mlx.getShape(pair.gate);
+    const ushape = mlx.getShape(pair.up);
+    try testing.expectEqualSlices(c_int, &[_]c_int{ E, M, X }, gshape);
+    try testing.expectEqualSlices(c_int, &[_]c_int{ E, M, X }, ushape);
+
+    // Expert e's gate = rows [0, M) of its 2M block; up = rows [M, 2M).
+    var gate_host: [E * M * X]f32 = undefined;
+    var up_host: [E * M * X]f32 = undefined;
+    try testReadF32(pair.gate, &gate_host, s);
+    try testReadF32(pair.up, &up_host, s);
+    for (0..E) |e| {
+        for (0..M) |r| {
+            for (0..X) |c| {
+                const out_idx = (e * M + r) * X + c;
+                const gate_src: f32 = @floatFromInt((e * 2 * M + r) * X + c);
+                const up_src: f32 = @floatFromInt((e * 2 * M + M + r) * X + c);
+                try testing.expectApproxEqAbs(gate_src, gate_host[out_idx], 0.001);
+                try testing.expectApproxEqAbs(up_src, up_host[out_idx], 0.001);
+            }
+        }
+    }
+}
+
+test "splitPackedGateUp halves feed gather_qmm correctly (lazy-slice zeros regression)" {
+    // CLASS-BUG regression: mlx_slice produces a lazy VIEW with parent
+    // strides; feeding such a view to mlx_gather_qmm silently produced
+    // all-ZERO expert outputs (gather_qmm assumes row-contiguous weight
+    // buffers). Reading the slice via data pointers materializes it
+    // correctly, so a value-equality test on the split alone cannot catch
+    // this — the assertion must go THROUGH gather_qmm. splitPackedGateUp
+    // now materializes contiguous halves; this test pins that by comparing
+    // gather_qmm on the split gate half against gather_qmm on an
+    // independently-built contiguous copy of the same rows.
+    const s = mlx.gpuStream();
+    // Geometry matters: small/toy shapes take a strided-tolerant kernel path
+    // and do NOT reproduce the zeros — keep dims near the real checkpoint's
+    // 4-bit/gs64 layout (full scale is E=128, M=704, IN=2816).
+    const E = 16;
+    const M = 128; // rows per half
+    const IN = 512;
+    const gs = 64;
+    const bits = 4;
+
+    // Dense [E, 2M, IN] bf16 source, then quantize.
+    const w_host = try std.testing.allocator.alloc(f32, E * 2 * M * IN);
+    defer std.testing.allocator.free(w_host);
+    for (w_host, 0..) |*v, i| v.* = (@as(f32, @floatFromInt(@as(i32, @intCast(i % 17)) - 8))) * 0.07;
+    const wsh = [_]c_int{ E, 2 * M, IN };
+    const w_f32 = mlx.mlx_array_new_data(w_host.ptr, &wsh, 3, .float32);
+    defer _ = mlx.mlx_array_free(w_f32);
+    var w_bf16 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(w_bf16);
+    try mlx.check(mlx.mlx_astype(&w_bf16, w_f32, .bfloat16, s));
+
+    var qvec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(qvec);
+    try mlx.check(mlx.mlx_quantize(&qvec, w_bf16, mlx.mlx_optional_int.some(gs), mlx.mlx_optional_int.some(bits), "affine", .{}, s));
+    var q = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(q);
+    var sc = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sc);
+    var bi = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(bi);
+    try mlx.check(mlx.mlx_vector_array_get(&q, qvec, 0));
+    try mlx.check(mlx.mlx_vector_array_get(&sc, qvec, 1));
+    try mlx.check(mlx.mlx_vector_array_get(&bi, qvec, 2));
+
+    const q_pair = try splitPackedGateUp(q, s);
+    defer _ = mlx.mlx_array_free(q_pair.gate);
+    defer _ = mlx.mlx_array_free(q_pair.up);
+    const s_pair = try splitPackedGateUp(sc, s);
+    defer _ = mlx.mlx_array_free(s_pair.gate);
+    defer _ = mlx.mlx_array_free(s_pair.up);
+    const b_pair = try splitPackedGateUp(bi, s);
+    defer _ = mlx.mlx_array_free(b_pair.gate);
+    defer _ = mlx.mlx_array_free(b_pair.up);
+
+    // Independent contiguous ground truth: quantize the gate rows directly.
+    const g_host = try std.testing.allocator.alloc(f32, E * M * IN);
+    defer std.testing.allocator.free(g_host);
+    for (0..E) |e| {
+        for (0..M) |r| {
+            for (0..IN) |c| {
+                g_host[(e * M + r) * IN + c] = w_host[(e * 2 * M + r) * IN + c];
+            }
+        }
+    }
+    const gsh = [_]c_int{ E, M, IN };
+    const g_f32 = mlx.mlx_array_new_data(g_host.ptr, &gsh, 3, .float32);
+    defer _ = mlx.mlx_array_free(g_f32);
+    var g_bf16 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(g_bf16);
+    try mlx.check(mlx.mlx_astype(&g_bf16, g_f32, .bfloat16, s));
+    var gvec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(gvec);
+    try mlx.check(mlx.mlx_quantize(&gvec, g_bf16, mlx.mlx_optional_int.some(gs), mlx.mlx_optional_int.some(bits), "affine", .{}, s));
+    var gq = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(gq);
+    var gsc = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(gsc);
+    var gbi = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(gbi);
+    try mlx.check(mlx.mlx_vector_array_get(&gq, gvec, 0));
+    try mlx.check(mlx.mlx_vector_array_get(&gsc, gvec, 1));
+    try mlx.check(mlx.mlx_vector_array_get(&gbi, gvec, 2));
+
+    // gather_qmm through both, on BOTH dispatch shapes moeMLP2 uses:
+    //   decode:  x [1,1,1,1,IN], inds [1,1,1], sorted=false
+    //   prefill: x [N,1,IN], sorted rhs inds [N], sorted=true  ← the shape
+    //            the live zeros bug fired on
+    var x_host: [IN]f32 = undefined;
+    for (&x_host, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i % 7)) * 0.11 - 0.3;
+
+    // decode shape
+    {
+        const xsh = [_]c_int{ 1, 1, 1, 1, IN };
+        const x_f32 = mlx.mlx_array_new_data(&x_host, &xsh, 5, .float32);
+        defer _ = mlx.mlx_array_free(x_f32);
+        var x_bf16 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(x_bf16);
+        try mlx.check(mlx.mlx_astype(&x_bf16, x_f32, .bfloat16, s));
+
+        for (0..E) |e| {
+            var inds_host = [_]u32{@intCast(e)};
+            const ish = [_]c_int{ 1, 1, 1 };
+            const inds = mlx.mlx_array_new_data(&inds_host, &ish, 3, .uint32);
+            defer _ = mlx.mlx_array_free(inds);
+            const no_idx = mlx.mlx_array{ .ctx = null };
+
+            var out_split = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(out_split);
+            try gatherExpertMm(&out_split, x_bf16, q_pair.gate, s_pair.gate, b_pair.gate, no_idx, inds, bits, gs, .affine, false, s);
+            var out_ref = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(out_ref);
+            try gatherExpertMm(&out_ref, x_bf16, gq, gsc, gbi, no_idx, inds, bits, gs, .affine, false, s);
+
+            var split_host: [M]f32 = undefined;
+            var ref_host: [M]f32 = undefined;
+            try testReadF32(out_split, &split_host, s);
+            try testReadF32(out_ref, &ref_host, s);
+            var nonzero = false;
+            for (split_host, ref_host) |a, b| {
+                try testing.expectApproxEqAbs(b, a, 0.02);
+                if (@abs(a) > 0.001) nonzero = true;
+            }
+            // The original bug produced exact zeros — make that explicit.
+            try testing.expect(nonzero);
+        }
+    }
+
+    // sorted prefill shape: N=E rows, one per expert, sorted inds [0..E)
+    {
+        const xr_host = try std.testing.allocator.alloc(f32, E * IN);
+        defer std.testing.allocator.free(xr_host);
+        for (xr_host, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i % 11)) * 0.05 - 0.2;
+        const xsh = [_]c_int{ E, 1, IN };
+        const x_f32 = mlx.mlx_array_new_data(xr_host.ptr, &xsh, 3, .float32);
+        defer _ = mlx.mlx_array_free(x_f32);
+        var x_bf16 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(x_bf16);
+        try mlx.check(mlx.mlx_astype(&x_bf16, x_f32, .bfloat16, s));
+
+        var inds_host: [E]u32 = undefined;
+        for (&inds_host, 0..) |*v, i| v.* = @intCast(i);
+        const ish = [_]c_int{E};
+        const inds = mlx.mlx_array_new_data(&inds_host, &ish, 1, .uint32);
+        defer _ = mlx.mlx_array_free(inds);
+        const no_idx = mlx.mlx_array{ .ctx = null };
+
+        var out_split = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(out_split);
+        try gatherExpertMm(&out_split, x_bf16, q_pair.gate, s_pair.gate, b_pair.gate, no_idx, inds, bits, gs, .affine, true, s);
+        var out_ref = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(out_ref);
+        try gatherExpertMm(&out_ref, x_bf16, gq, gsc, gbi, no_idx, inds, bits, gs, .affine, true, s);
+
+        const split_host = try std.testing.allocator.alloc(f32, E * M);
+        defer std.testing.allocator.free(split_host);
+        const ref_host = try std.testing.allocator.alloc(f32, E * M);
+        defer std.testing.allocator.free(ref_host);
+        try testReadF32(out_split, split_host, s);
+        try testReadF32(out_ref, ref_host, s);
+        var nonzero = false;
+        for (split_host, ref_host) |a, b| {
+            try testing.expectApproxEqAbs(b, a, 0.02);
+            if (@abs(a) > 0.001) nonzero = true;
+        }
+        try testing.expect(nonzero);
+    }
 }
 
 test "gatherExpertMm dense bf16 matches per-expert ground truth (decode + prefill shapes)" {

@@ -1428,7 +1428,49 @@ fn handleLoadModelStrict(allocator: std.mem.Allocator, stream: *Conn, request_bo
         try sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", "Scheduler not ready", 503);
         return;
     };
-    const requested_id = parseModelFromBody(request_body) orelse "";
+    // Parse the model field with std.json (NOT the quick scanner): clients
+    // like Swift's JSONSerialization legally escape '/' as '\/', and the raw
+    // scanner slice would read "\/Users\/…" — missing the absolute-path
+    // branch below and 404ing on the mangled id (live failure 2026-06-12).
+    var requested_id: []const u8 = "";
+    var parsed_body: ?std.json.Parsed(std.json.Value) = null;
+    defer if (parsed_body) |*p| p.deinit();
+    if (std.json.parseFromSlice(std.json.Value, allocator, request_body, .{})) |parsed| {
+        parsed_body = parsed;
+        if (parsed.value == .object) {
+            if (parsed.value.object.get("model")) |m| {
+                if (m == .string) requested_id = m.string;
+            }
+        }
+    } else |_| {
+        requested_id = parseModelFromBody(request_body) orelse "";
+    }
+    // Register-by-path: an absolute path to a model directory OUTSIDE the
+    // --model-dir scan (e.g. the app's auto-downloaded embedding encoder).
+    // The dir is validated exactly like discovery (config.json, supported
+    // model_type + quant mode) before anything is registered; the load then
+    // proceeds under the directory-basename id.
+    if (std.mem.startsWith(u8, requested_id, "/")) {
+        const registry = global_registry orelse {
+            try sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", "Registry not ready", 503);
+            return;
+        };
+        requested_id = registry.registerByPath(stream.io, requested_id) catch |err| switch (err) {
+            error.ModelDirNotFound, error.InvalidModelPath => {
+                try sendErrorResponse(allocator, stream, "404 Not Found", "model_not_found", "No loadable model directory at that path", 404);
+                return;
+            },
+            error.UnsupportedArch => {
+                try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Model at that path has an unsupported model_type", 400);
+                return;
+            },
+            error.UnsupportedQuantMode => {
+                try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Model at that path has an unsupported quantization mode", 400);
+                return;
+            },
+            else => return err,
+        };
+    }
     const lm = scheduler.ensureLoaded(requested_id) catch |err| switch (err) {
         error.UnknownModelId => {
             try sendErrorResponse(allocator, stream, "404 Not Found", "model_not_found", "Unknown model id", 404);

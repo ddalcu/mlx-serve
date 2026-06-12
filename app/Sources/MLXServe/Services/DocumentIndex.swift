@@ -1,5 +1,4 @@
 import Foundation
-import NaturalLanguage
 import PDFKit
 
 // Mini in-memory RAG pipeline for "attach a folder, ask questions about it".
@@ -32,34 +31,13 @@ extension TextEmbedding {
     }
 }
 
-/// Apple's on-device sentence embedding (NaturalLanguage framework). No
-/// network, no model download step. `init` returns nil on systems without
-/// the English sentence-embedding asset — callers then run lexical-only.
-/// CPU-bound: ~42 ms per 1200-char chunk single-threaded, so indexing fans
-/// out one instance per worker (NLEmbedding is not thread-safe).
-struct AppleSentenceEmbedding: TextEmbedding, @unchecked Sendable {
-    private let embedding: NLEmbedding
-
-    init?() {
-        guard let e = NLEmbedding.sentenceEmbedding(for: .english) else { return nil }
-        embedding = e
-    }
-
-    func vector(for text: String) -> [Double]? {
-        embedding.vector(for: text)
-    }
-
-    func vectors(for texts: [String]) async -> [[Double]?] {
-        texts.map { vector(for: $0) }
-    }
-}
-
 /// GPU embedder backed by the local mlx-serve `/v1/embeddings` endpoint
 /// (encoder-only BERT model, batched masked forward — measured ~1.4 ms per
-/// 1200-char chunk vs ~6.6 ms for the 8-worker NLEmbedding fan-out).
-/// Stateless and thread-safe: one instance is shared by every indexing
-/// worker. Transport errors degrade rows to nil (lexical-only) instead of
-/// failing the index build.
+/// 1200-char chunk on M4 Max). The ONLY embedder: when the server is down
+/// or the encoder can't be provisioned, chunks carry nil vectors and
+/// retrieval runs lexical-only. Stateless and thread-safe: one instance is
+/// shared by every indexing worker. Transport errors degrade rows to nil
+/// instead of failing the index build.
 struct ServerEmbedding: TextEmbedding {
     /// Registry id of the encoder model (e.g. "bge-small-en-v1.5-8bit").
     let model: String
@@ -104,9 +82,10 @@ struct ServerEmbedding: TextEmbedding {
         return (encoders.first { $0.loaded } ?? encoders.first)?.name
     }
 
-    /// Probe factory for `DocumentIndex`: asks the local server for an
-    /// embeddings-capable model and binds the transport to it. Returns nil
-    /// (→ CPU fallback) when the server is down or has no encoder model.
+    /// Probe-only factory: asks the local server for an embeddings-capable
+    /// model and binds the transport to it. Returns nil when the server is
+    /// down or has no encoder model. Never downloads — tests and diagnostics
+    /// use this; the app uses `autoProvider`.
     static func probe(port: UInt16) -> @Sendable () async -> TextEmbedding? {
         return {
             let api = APIClient()
@@ -116,6 +95,76 @@ struct ServerEmbedding: TextEmbedding {
                 try await api.embeddings(port: port, model: model, input: texts)
             })
         }
+    }
+
+    /// The encoder the app provisions automatically: 35 MB, 384-dim, strong
+    /// retrieval quality for its size. Any embeddings-capable model already
+    /// known to the server takes precedence over downloading this one.
+    static let defaultEncoderRepo = "mlx-community/bge-small-en-v1.5-8bit"
+
+    /// Seamless resolution, steps injected for unit tests:
+    ///   1. Server unreachable → nil (no point downloading; lexical-only).
+    ///   2. Server already knows an embeddings-capable model → use it.
+    ///   3. Otherwise download the default encoder (one-time, resumable) and
+    ///      register it with the server by absolute path — works regardless
+    ///      of which directory the server's --model-dir scan covers.
+    /// Any failure → nil → lexical-only retrieval. Never throws.
+    static func resolve(
+        fetchModels: @Sendable () async throws -> [ModelInfo],
+        ensureEncoderOnDisk: @Sendable () async throws -> String,
+        loadByPath: @Sendable (String) async throws -> String,
+        transport: @escaping @Sendable ([String], String) async throws -> [[Double]]
+    ) async -> TextEmbedding? {
+        guard let models = try? await fetchModels() else { return nil }
+        if let id = pickEmbeddingModel(models) {
+            return ServerEmbedding(model: id, transport: transport)
+        }
+        guard let path = try? await ensureEncoderOnDisk(),
+              let id = try? await loadByPath(path) else { return nil }
+        return ServerEmbedding(model: id, transport: transport)
+    }
+
+    /// Production provider for `DocumentIndex`: full auto-provisioning
+    /// against the local server (probe → download if absent → load by path).
+    static func autoProvider(port: UInt16) -> @Sendable () async -> TextEmbedding? {
+        return {
+            let api = APIClient()
+            return await resolve(
+                fetchModels: { try await api.fetchAllModels(port: port) },
+                ensureEncoderOnDisk: { try await EncoderDownloader.ensureOnDisk(repoId: defaultEncoderRepo) },
+                loadByPath: { try await api.loadModel(port: port, id: $0).name },
+                transport: { texts, model in
+                    try await api.embeddings(port: port, model: model, input: texts)
+                }
+            )
+        }
+    }
+}
+
+/// One-time provisioning of the default embedding encoder. Rides the
+/// existing `DownloadManager` (HF tree listing, resume, skip-existing,
+/// disk-space checks); a shared in-flight task deduplicates concurrent
+/// folder-attaches racing to download the same repo.
+@MainActor
+enum EncoderDownloader {
+    private static var inflight: Task<String, Error>?
+
+    static func ensureOnDisk(repoId: String) async throws -> String {
+        if let task = inflight { return try await task.value }
+        let task = Task<String, Error> {
+            let dm = DownloadManager()
+            if dm.isReady(repoId), let dir = dm.existingModelDir(for: repoId) { return dir }
+            await dm.download(repoId: repoId)
+            // download() reports failure via published state, not throws —
+            // gate on actual on-disk readiness.
+            guard dm.isReady(repoId), let dir = dm.existingModelDir(for: repoId) else {
+                throw URLError(.cannotLoadFromNetwork)
+            }
+            return dir
+        }
+        inflight = task
+        defer { inflight = nil }
+        return try await task.value
     }
 }
 
@@ -352,6 +401,9 @@ enum DocumentRetrieval {
 final class DocumentIndex: ObservableObject, Identifiable {
 
     enum State: Equatable {
+        /// Resolving the embedder — may include the one-time encoder-model
+        /// download (~35 MB) on a machine that doesn't have it yet.
+        case preparing
         case indexing(filesDone: Int, filesTotal: Int)
         case ready(files: Int, chunks: Int)
         case failed(String)
@@ -365,15 +417,15 @@ final class DocumentIndex: ObservableObject, Identifiable {
     private(set) var chunks: [DocumentRetrieval.Chunk] = []
 
     private var indexTask: Task<Void, Never>?
-    private let makeEmbedder: @Sendable () -> TextEmbedding?
-    /// Probe for a GPU embedder (the local server's /v1/embeddings with an
-    /// encoder model). Run once per startIndexing; nil result → CPU path.
-    private let gpuEmbedderProbe: (@Sendable () async -> TextEmbedding?)?
+    /// Resolves the embedder once per startIndexing. The production provider
+    /// (`ServerEmbedding.autoProvider`) probes the local server, downloads
+    /// the default encoder if needed, and registers it by path; nil →
+    /// lexical-only retrieval.
+    private let embedderProvider: @Sendable () async -> TextEmbedding?
     /// The embedder the index was BUILT with — queries must go through the
     /// same model or cosine compares vectors from different spaces (the
     /// dimension guard would silently drop to lexical-only).
     private var activeQueryEmbedder: TextEmbedding?
-    private lazy var cpuQueryEmbedder: TextEmbedding? = makeEmbedder()
 
     /// Skip pathological inputs: huge single files and unbounded folders.
     nonisolated static let maxFileBytes = 8 * 1024 * 1024
@@ -381,39 +433,35 @@ final class DocumentIndex: ObservableObject, Identifiable {
     nonisolated static let defaultTopK = 5
 
     init(folderURL: URL,
-         makeEmbedder: @escaping @Sendable () -> TextEmbedding? = { AppleSentenceEmbedding() },
-         gpuEmbedderProbe: (@Sendable () async -> TextEmbedding?)? = nil) {
+         embedderProvider: @escaping @Sendable () async -> TextEmbedding?) {
         self.folderURL = folderURL
-        self.makeEmbedder = makeEmbedder
-        self.gpuEmbedderProbe = gpuEmbedderProbe
+        self.embedderProvider = embedderProvider
     }
 
-    /// Workers for the CPU embedding fan-out. NLEmbedding measured ~42ms per
-    /// 1200-char chunk single-threaded; one embedding instance per worker
-    /// (thread safety) reaches ~6.6ms effective at 8 workers and ~4.9ms at
-    /// 14 on an M4 Max — sublinear but still improving, hence the cap at 16.
-    /// The GPU path shares ONE stateless ServerEmbedding across workers and
-    /// uses them only to overlap extraction/chunking with HTTP round-trips.
+    /// Worker fan-out: overlaps file IO + extraction + chunking with the
+    /// embedder's HTTP round-trips (the embedder itself is stateless and
+    /// shared). Cap well below the server's appetite — embed requests
+    /// serialize on its inference thread anyway.
     nonisolated static var indexingWorkers: Int {
         max(1, min(16, ProcessInfo.processInfo.activeProcessorCount - 2))
     }
 
     func startIndexing() {
         indexTask?.cancel()
-        state = .indexing(filesDone: 0, filesTotal: 0)
+        state = .preparing
         filesDone = 0
         let folder = folderURL
-        let makeEmbedder = makeEmbedder
-        let gpuProbe = gpuEmbedderProbe
+        let provider = embedderProvider
         indexTask = Task.detached(priority: .userInitiated) { [weak self] in
             let files = Self.collectFiles(in: folder)
             guard !files.isEmpty else {
                 await self?.finish(.failed("No readable documents found (txt, md, pdf, json, yaml, csv …)"))
                 return
             }
-            // Prefer the GPU embedder when the local server has an encoder
-            // model; otherwise every worker builds its own CPU embedder.
-            let gpuEmbedder = await gpuProbe?() ?? nil
+            // May download the encoder model on first ever use (~35 MB).
+            let embedder = await provider()
+            if Task.isCancelled { return }
+            await self?.beginIndexing(total: files.count)
             let workers = Self.indexingWorkers
             // Worker w takes files w, w+W, w+2W … — interleaving balances
             // uneven file sizes without a work queue. Results keyed by file
@@ -421,7 +469,6 @@ final class DocumentIndex: ObservableObject, Identifiable {
             let perFile = await withTaskGroup(of: [(Int, [DocumentRetrieval.Chunk])].self) { group in
                 for w in 0..<workers {
                     group.addTask {
-                        let embedder = gpuEmbedder ?? makeEmbedder()
                         var out: [(Int, [DocumentRetrieval.Chunk])] = []
                         var i = w
                         while i < files.count, !Task.isCancelled {
@@ -452,7 +499,7 @@ final class DocumentIndex: ObservableObject, Identifiable {
             if Task.isCancelled { return }
             let chunks = perFile.flatMap { $0 }
             await self?.finish(.ready(files: files.count, chunks: chunks.count),
-                               chunks: chunks, queryEmbedder: gpuEmbedder)
+                               chunks: chunks, queryEmbedder: embedder)
         }
     }
 
@@ -466,13 +513,14 @@ final class DocumentIndex: ObservableObject, Identifiable {
     /// The query rides the same embedder that built the index (GPU or CPU).
     func search(query: String, topK: Int = DocumentIndex.defaultTopK) async -> String {
         switch state {
+        case .preparing:
+            return "The document index is still being prepared (resolving the embedding model). Wait a moment and search again."
         case .indexing(let done, let total):
             return "The document index is still being built (\(done)/\(total) files). Wait a moment and search again."
         case .failed(let msg):
             return "Error: document indexing failed — \(msg)"
         case .ready:
-            let embedder = activeQueryEmbedder ?? cpuQueryEmbedder
-            let qv = await embedder?.queryVector(for: query)
+            let qv = await activeQueryEmbedder?.queryVector(for: query)
             let results = DocumentRetrieval.search(chunks: chunks, query: query,
                                                    queryVector: qv, topK: topK)
             return DocumentRetrieval.formatResults(results, query: query)
@@ -491,6 +539,11 @@ final class DocumentIndex: ObservableObject, Identifiable {
     /// Completed-file counter for the progress chip; bumped by every worker
     /// (serialized through the main actor).
     private var filesDone = 0
+
+    private func beginIndexing(total: Int) {
+        filesDone = 0
+        state = .indexing(filesDone: 0, filesTotal: total)
+    }
 
     private func bumpProgress(total: Int) {
         filesDone += 1

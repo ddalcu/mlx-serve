@@ -28,6 +28,7 @@ Native Zig server that runs MLX-format LMs on Apple Silicon and exposes OpenAI-c
 | `pld_index.zig` | PLD n-gram index (`PldLookup.findMatch`, `ngramRepeatScore`) |
 | `drafter.zig` | Gemma 4 assistant drafter (cross-attention spec-decode) |
 | `mtp.zig` | Qwen 3.5/3.6 native MTP head (sidecar spec-decode; self-contained — delete this + `Generator.nextMtp` to remove the feature) |
+| `diffusion.zig` | DiffusionGemma block-diffusion generation: canvas denoising loop, entropy-bound sampler, self-conditioning, per-slot `Runner` |
 | `status.zig` | TUI status bar |
 | `log.zig` | Leveled logging |
 | `build.zig` | Links mlx-c, libjinja, libwebp, stb_image |
@@ -47,7 +48,7 @@ Sampling defaults for request fields the client OMITS resolve as: request body >
 | `Services/AgentPrompt.swift` | System prompt, 10 tools, `SkillManager` |
 | `Services/AgentEngine.swift` | Shared agent logic: history, tool exec, repetition tracking, overflow |
 | `Services/ToolExecutor.swift` | Tool handlers (shell, file, search, browse, webSearch, saveMemory) |
-| `Services/DocumentIndex.swift` | Mini in-memory RAG for "attach a folder": chunker, hybrid retrieval (cosine + IDF lexical), `searchDocuments` tool. Embeds via `ServerEmbedding` (server `/v1/embeddings`, GPU, ~5× faster) when an encoder model is available, else per-worker `NLEmbedding` |
+| `Services/DocumentIndex.swift` | Mini in-memory RAG for "attach a folder": chunker, hybrid retrieval (cosine + IDF lexical), `searchDocuments` tool. Embeds via `ServerEmbedding` only (server `/v1/embeddings`, GPU): `autoProvider` probes `/v1/models`, auto-downloads `bge-small-en-v1.5-8bit` (35 MB) when no encoder is known, and registers it via `/v1/load-model` by absolute path. Server down / provisioning failure → lexical-only retrieval (no NLEmbedding fallback) |
 | `Services/{ImagePreprocessor,BrowserManager,ServerManager,TestServer,AgentMemory}.swift` | Image prep, WKWebView, server lifecycle, embedded test server (port 8090), agent context |
 | `Views/{ChatView,StatusMenuView,BrowserView}.swift` | Chat UI + `runAgentLoop()`, menu bar, browser |
 
@@ -109,8 +110,9 @@ Existing tools:
 | `./tests/test_drafter_equivalence.sh [port]` | Gemma 4 drafter byte-equivalence |
 | `UD_MOE_MODEL=<dir> ./tests/test_ud_moe.sh` | Unsloth UD MoE load + generate (default Qwen3.6-27B-UD-MLX-4bit) |
 | `NVFP4_TEST_MODEL=<dir> ./tests/test_nvfp4.sh` | NVFP4 checkpoint (issue #24): load, banner reports nvfp4 mode, temp-0 coherence canary. Default Qwen3-0.6B-nvfp4; pass a gemma-4 QAT nvfp4 dir to exercise mixed affine-override resolution. Hermetic counterparts: `computeQuantParams` + nvfp4 qmatmul/gather tests in transformer.zig. |
+| `./tests/test_diffusion_gemma.sh [port]` | DiffusionGemma block diffusion end-to-end: load, greedy chat coherence + EOS semantics, diffusion-loop engagement + early-stop convergence (steps < max), block-wise SSE streaming, /v1/messages, tool calls, thinking, multi-canvas long generation. Hermetic counterparts: sampler math tests in diffusion.zig. Live parity: `DIFFUSION_TEST_MODEL=<dir> zig build test` runs the converged-canvas self-consistency test (reference 63/64 no-sc, 64/64 with sc) — this is the test that catches the lazy-slice expert-zeros class (red on revert) where toy-scale synthetic gathers stay green. |
 | `./tests/test_long_agent_memory.sh [port]` | 10-turn Claude-Code-style agent: plants 3 facts in turn 1, recalls them across mode transitions (tools on/off, thinking on/off). Catches "model acts like first-time-seen" regressions. |
-| `EMBED_TEST_MODEL=<dir> ./tests/test_embeddings.sh [port]` | /v1/embeddings (encoder-only BERT): OpenAI shape, batched-vs-single cosine parity across mixed lengths (pins the padding mask + masked mean-pool), >EMBED_MAX_BATCH round-trip, 400 on generation, hot-load + stub `embeddings` capability beside a chat default. Default mlx-community/bge-small-en-v1.5-8bit. Hermetic counterparts: `buildPaddedBatch`/`buildKeyPadMask`/`maskedMeanPoolNormalize` tests in generate.zig. |
+| `EMBED_TEST_MODEL=<dir> ./tests/test_embeddings.sh [port]` | /v1/embeddings (encoder-only BERT): OpenAI shape, batched-vs-single cosine parity across mixed lengths (pins the padding mask + masked mean-pool), >EMBED_MAX_BATCH round-trip, 400 on generation, hot-load + stub `embeddings` capability beside a chat default, and `/v1/load-model` register-by-absolute-path (incl. the JSON `\/`-escaped form Swift clients send) for encoders outside --model-dir. Default mlx-community/bge-small-en-v1.5-8bit. Hermetic counterparts: `buildPaddedBatch`/`buildKeyPadMask`/`maskedMeanPoolNormalize` tests in generate.zig. Live app-side flow: `DOCS_RAG_AUTODL_PORT=<port> swift test --filter testAutoProviderProvisionsEncoderEndToEnd` (downloads from HF). |
 | `./tests/test_disconnect_cancel.sh [model_dir] [port]` | Client-disconnect handling during long prefills: SSE keepalives flow every 5s while a request waits on first tokens (Anthropic `ping` events / OpenAI `: keepalive` comments), and a vanished client cancels its slot within one probe interval — the chunk loop aborts the ghost prefill (`error.Cancelled`) instead of grinding minutes of abandoned work that piles up behind Claude Code retries. Starts its own server. |
 | `./tests/test_messages_stream_thinking_tools.sh [model_dir] [port]` | /v1/messages STREAMING with thinking + tools together (Claude Code's exact shape) on a template-opened-think model: no think-tag leak in text deltas, SSE content-block lifecycle validity (every delta/stop references an open block), thinking_delta + tool_use emission. Starts its own server. Hermetic counterpart: `chat.streamThinkGate` unit tests + the corpus streaming-gate replay. |
 | `./tests/test_kv_quant_equivalence.sh [model_dir] [port]` | Off-vs-4-bit-vs-8-bit KV cache equivalence (per-arch first-N-token thresholds, env-overridable). |
@@ -178,6 +180,7 @@ Dispatched on `model_type` in `config.json` via `model.zig` (config/weights) and
 | `model_type` | Family | Weight prefix | Vision | MoE | Notes |
 |---|---|---|---|---|---|
 | `gemma4`, `gemma4_text` | Gemma 4 | `language_model.model` | SigLIP | -- | Full vision, clipped linears, PLE |
+| `diffusion_gemma` | DiffusionGemma | `model.decoder` | -- (tower not wired) | 128/top-8 | Gemma 4 26B-A4B trunk; BLOCK-DIFFUSION generation (src/diffusion.zig), not AR decode. See "DiffusionGemma" below. |
 | `gemma3` | Gemma 3 | `language_model.model` | -- | -- | |
 | `qwen3` | Qwen 3 | `model` | -- | -- | QK norm |
 | `qwen3_5`, `qwen3_5_moe(_text)` | Qwen 3.5/3.6 | `language_model.model` | -- | Optional | GatedDeltaNet + MoE/dense, shared expert routing |
@@ -194,6 +197,16 @@ Dispatched on `model_type` in `config.json` via `model.zig` (config/weights) and
 A `.gguf` model path (or a directory containing one) bypasses the MLX safetensors path. `main.zig` picks the embedded engine by family: **DeepSeek-V4-Flash → ds4**, **every other GGUF → llama.cpp** (`model_discovery.isDs4GgufBasename` — case-insensitive `deepseek-v4-flash` prefix; mirrored client-side by `DownloadManager.ggufModelType`). The Swift app surfaces any `.gguf` as a selectable base model and the server auto-routes — no engine selector. Both engines share the same HTTP/chat-template/tool/SSE machinery via per-request dispatch on `LoadedModel.{ds4,llama}_engine`.
 
 Models with `vision_config` but no vision weights (e.g., text-only quantized Qwen 3.5) gracefully disable vision at init. Swift app flags unsupported archs via `supportedModelTypes` in `HFModels.swift`.
+
+### DiffusionGemma (block diffusion)
+
+`model_type: diffusion_gemma` (google/diffusiongemma-26B-A4B-it, June 2026) reuses the Gemma 4 26B-A4B MoE trunk verbatim — same `forwardMoeWith` gemma4 branch, sigma-MoE router, v_norm, K=V alias on full layers, proportional RoPE — but GENERATION is a canvas-denoising loop (`src/diffusion.zig`), not autoregressive decode. `config.isDiffusion()` (canvas_length > 0) gates everything; `config.isGemma4Layers()` collapses gemma4 + diffusion onto the shared binding/forward arms.
+
+- **Encoder/decoder split over one trunk.** The *encoder* runs the trunk causally (normal prefill, fills the slot's KV cache) using its own per-layer scalars (`model.encoder.language_model.layers.N.layer_scalar` — the only untied encoder weights; `ForwardCtx.use_encoder_scalars`). The *decoder* (`forwardDiffusionDecoder`) re-forwards a 64–256-token canvas of noise tokens BIDIRECTIONALLY each denoising step: q/k/v computed for the canvas only, cache K/V concat-READ (never written), sliding layers sliced to the last `sliding_window − 1` cached positions, no mask at all. `ctx.skip_lm_head` skips the 262K-vocab projection on encoder passes.
+- **The loop** (`diffusion.Runner.nextCanvas`, one canvas per scheduler tick): uniform-RANDOM canvas init (no mask token), ≤48 steps, linear temp schedule (t_max 0.8 → t_min 0.4 on countdown), entropy-bound acceptance (sort entropies asc, accept while `cumsum − cummax ≤ 0.1`, renoise the rest), self-conditioning via soft embeddings (`softmax(processed) @ dequantized_embed_table × √hidden` — table dequantized once per request, ~1.5 GB transient), early stop when argmax is stable across `stability_threshold` steps AND mean entropy < 0.005. COMMIT = the argmax canvas; committed tokens are causally re-encoded at the START of the next tick (so an EOS-terminated request never pays for it). User temp < 0.01 → greedy denoiser; ≥ → categorical (temp 1.0 ≡ HF reference). Measured: 256-token canvas in ~10 steps on prose (25.6 tokens/forward), ~30% faster than the mlx-vlm reference.
+- **Dispatch**: third engine-style branch (`runPrefillDiffusion` / `runDiffusionDecodeTick`, `Slot.diffusion`) — tokens flow through normal slot machinery, so all four HTTP surfaces + block-wise streaming work unchanged. PLD/drafter/MTP/batching never apply (MoE already non-batchable; `modelBatchable` also gates `isDiffusion`). Hot prefix cache is intentionally NOT consulted (restored snapshots leave cache VIEWS stale; the decoder reads views via denseView before any update would rebuild them) — wire it later by refreshing views post-restore.
+- **Weights**: prefix `model.decoder`; experts packed as `experts.gate_up_proj` [E, 2M, X] (gate rows first) → `splitPackedGateUp` slices + MATERIALIZES halves at load; self-conditioning module under `model.decoder.self_conditioning.*`; `model.encoder.vision_tower.*` dropped at load (tower not wired — `has_vision` forced false).
+- **Template/EOS**: standard Gemma 4 `<|turn>`/`<|channel>thought` template; EOS set {1, 106, 50}. Raw `/v1/completions` (no chat template) degenerates — reference behaves identically; instruct-only checkpoint trait, not a bug.
 
 ## OpenAI Responses API (`/v1/responses`)
 
@@ -287,6 +300,15 @@ Generated tool-call tokens are in the cache but not in `cached_prompt_ids` → r
 
 ### Sliding window KV cache
 Gemma 4 E4B (512-token window) keeps full buffer — no trimming. Prefill returns all entries (Q/K dim match); decode views return last `sw`. Mask handles attention scope. Matches mlx-lm `RotatingKVCache`.
+
+### Lazy mlx_slice views fed to gather_qmm (silent wrong/zero expert outputs)
+A weight produced by `mlx_slice` is a lazy VIEW with parent strides. Feeding such a view (weight, scales, or biases) to `mlx_gather_qmm` SILENTLY computes wrong expert outputs at real-checkpoint scale — observed as exactly-zero MoE branch output on DiffusionGemma's split `experts.gate_up_proj` (the model still "worked", just incoherently: the dense shared-MLP branch carried it). Three traps make this class nasty:
+- Reading the slice via data pointers materializes it correctly, so value-equality tests on the split pass while the gather is broken — the assertion must go THROUGH gather_qmm.
+- Toy/synthetic geometries stay green: a full-geometry random-weight repro (E=128, M=704, IN=2816, sorted path) showed ZERO diff between view and contiguous. Only the real checkpoint reproduces it. The guard is therefore the LIVE converged-canvas self-consistency test (`DIFFUSION_TEST_MODEL`), verified red-on-revert (49/64 vs 63/64).
+- Rule: any weight that goes through `mlx_gather_qmm`/`mlx_quantized_matmul` and was born from a slice must be materialized with `mlx_contiguous` at load (see `splitPackedGateUp`).
+
+### DiffusionGemma numerics: garbage canvases amplify chaos; parity-test on converged canvases
+Logit/argmax comparisons against the reference on RANDOM-token canvases are meaningless for correctness: garbage input puts the sigma-MoE router on knife-edge ties, and a single bf16 kernel-order difference flips expert sets, ballooning into multi-unit logit deltas while both outputs are "valid". The meaningful invariant is SELF-CONSISTENCY on a converged canvas (real prompt + the canvas the reference committed → one decoder forward must reproduce it as argmax; reference 63/64 no-sc / 64/64 with-sc). Related: sliding-layer prefill now takes the `"causal"` fast path whenever `total_kv <= sliding_window` (same kernel + reduction order the mlx-lm/mlx-vlm reference picks) — the `"array"`-mask kernel's different reduction order alone degraded diffusion convergence via router-tie flips. Debug aids: `MLX_SERVE_DIFFUSION_TRACE=1` prints per-step mean entropy + acceptance counts and decoder layer-0/self-conditioning tensor heads.
 
 ### Gemma 4 tool calling
 Templates render `role: "tool"` natively as `<|turn>tool` — no transformation. Don't add `tool_responses` field (causes duplicate content). Args serialized as JSON strings.

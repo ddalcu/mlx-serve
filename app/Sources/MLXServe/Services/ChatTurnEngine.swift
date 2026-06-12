@@ -688,7 +688,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
         switch index?.state {
         case .ready(let files, _): return files
         case .indexing(_, let total): return total
-        case .failed, nil: return 0
+        case .preparing, .failed, nil: return 0
         }
     }
 
