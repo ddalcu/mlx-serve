@@ -13,7 +13,7 @@
   <meta property="og:url" content="https://ddalcu.github.io/mlx-serve/">
   <meta property="og:title" content="Run any LLM on your Mac Locally — faster than LM Studio or Ollama">
   <meta property="og:description" content="Native Zig inference server for Apple Silicon. MLX + GGUF. OpenAI- and Anthropic-compatible APIs. No Python. Drop-in alternative to LM Studio and Ollama on macOS.">
-  <meta property="og:image" content="https://ddalcu.github.io/mlx-serve/mlxcore-screenshot-1.png">
+  <meta property="og:image" content="https://ddalcu.github.io/mlx-serve/demo-diffusion.gif">
   <meta property="og:image:width" content="1200">
   <meta property="og:image:height" content="630">
   <meta property="og:site_name" content="mlx-serve">
@@ -21,7 +21,7 @@
   <meta name="twitter:card" content="summary_large_image">
   <meta name="twitter:title" content="Run any LLM on your Mac Locally — faster than LM Studio or Ollama">
   <meta name="twitter:description" content="Native Zig server for Apple Silicon. MLX + GGUF. OpenAI + Anthropic compatible. No Python. Drop-in alternative to LM Studio and Ollama.">
-  <meta name="twitter:image" content="https://ddalcu.github.io/mlx-serve/mlxcore-screenshot-1.png">
+  <meta name="twitter:image" content="https://ddalcu.github.io/mlx-serve/demo-diffusion.gif">
   <!-- JSON-LD structured data (AEO) -->
   <script type="application/ld+json">
   {
@@ -37,7 +37,7 @@
     "downloadUrl": "https://github.com/ddalcu/mlx-serve/releases/latest",
     "codeRepository": "https://github.com/ddalcu/mlx-serve",
     "license": "https://opensource.org/licenses/MIT",
-    "softwareVersion": "v26.6.7",
+    "softwareVersion": "v26.6.10",
     "author": { "@type": "Person", "name": "David Dalcu" },
     "description": "Native Zig inference server for Apple Silicon that runs any LLM — MLX and GGUF — with OpenAI- and Anthropic-compatible APIs. Faster than LM Studio. No Python. MIT licensed.",
     "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
@@ -1049,7 +1049,7 @@
     <a href="#" class="nav-logo">
       <img src="appiconb.png" alt="MLX Core" class="nav-logo-img">
       <span>mlx-serve</span>
-      <span class="nav-ver">v26.6.7</span>
+      <span class="nav-ver">v26.6.10</span>
     </a>
     <ul class="nav-links">
       <li><a href="#performance" class="hide-mobile">Performance</a></li>
@@ -1068,9 +1068,9 @@
   <!-- HERO -->
   <section class="hero">
     <div class="hero-glow"><span class="g1"></span><span class="g2"></span><span class="g3"></span></div>
-    <a href="https://github.com/ddalcu/mlx-serve/releases/tag/v26.6.7" class="hero-badge">
-      <span class="new-pill">v26.6.7</span>
-      Run MLX or GGUF models — faster than LM Studio or Ollama
+    <a href="https://github.com/ddalcu/mlx-serve/releases/tag/v26.6.10" class="hero-badge">
+      <span class="new-pill">v26.6.10</span>
+      DiffusionGemma · Qwen MTP · NVFP4 · Document RAG — now shipping
       <span class="arrow">→</span>
     </a>
     <h1>Run any LLM<br>on your <span class="grad">Mac</span></h1>
@@ -1095,15 +1095,15 @@
   <!-- SCREENSHOT -->
   <section class="screenshot-section">
     <div class="screenshot-wrap">
-      <img src="mlxcore-screenshot-1.png" alt="MLX Core app — chat interface with model browser and server controls" loading="lazy">
+      <img src="demo-diffusion.gif" alt="MLX Core app — DiffusionGemma block diffusion running live in the chat interface" loading="lazy">
     </div>
   </section>
 
   <!-- MARQUEE -->
   <div class="marquee" aria-hidden="true">
     <div class="marquee-track">
-      <span class="marquee-item">MLX + GGUF</span><span class="marquee-item">DeepSeek V4 Flash</span><span class="marquee-item">Gemma 4</span><span class="marquee-item">Qwen 3.6</span><span class="marquee-item">Llama 3</span><span class="marquee-item">Mistral</span><span class="marquee-item">Nemotron-H</span><span class="marquee-item">LFM2.5</span><span class="marquee-item">OpenAI API</span><span class="marquee-item">Anthropic API</span><span class="marquee-item">Claude Code</span><span class="marquee-item">MCP</span>
-      <span class="marquee-item">MLX + GGUF</span><span class="marquee-item">DeepSeek V4 Flash</span><span class="marquee-item">Gemma 4</span><span class="marquee-item">Qwen 3.6</span><span class="marquee-item">Llama 3</span><span class="marquee-item">Mistral</span><span class="marquee-item">Nemotron-H</span><span class="marquee-item">LFM2.5</span><span class="marquee-item">OpenAI API</span><span class="marquee-item">Anthropic API</span><span class="marquee-item">Claude Code</span><span class="marquee-item">MCP</span>
+      <span class="marquee-item">MLX + GGUF</span><span class="marquee-item">DiffusionGemma</span><span class="marquee-item">DeepSeek V4 Flash</span><span class="marquee-item">Gemma 4</span><span class="marquee-item">Qwen 3.6 MTP</span><span class="marquee-item">Llama 3</span><span class="marquee-item">NVFP4 / MXFP4</span><span class="marquee-item">Mistral</span><span class="marquee-item">Nemotron-H</span><span class="marquee-item">LFM2.5</span><span class="marquee-item">Document RAG</span><span class="marquee-item">OpenAI API</span><span class="marquee-item">Anthropic API</span><span class="marquee-item">Claude Code</span><span class="marquee-item">MCP</span>
+      <span class="marquee-item">MLX + GGUF</span><span class="marquee-item">DiffusionGemma</span><span class="marquee-item">DeepSeek V4 Flash</span><span class="marquee-item">Gemma 4</span><span class="marquee-item">Qwen 3.6 MTP</span><span class="marquee-item">Llama 3</span><span class="marquee-item">NVFP4 / MXFP4</span><span class="marquee-item">Mistral</span><span class="marquee-item">Nemotron-H</span><span class="marquee-item">LFM2.5</span><span class="marquee-item">Document RAG</span><span class="marquee-item">OpenAI API</span><span class="marquee-item">Anthropic API</span><span class="marquee-item">Claude Code</span><span class="marquee-item">MCP</span>
     </div>
   </div>
 
@@ -1212,7 +1212,7 @@
       </div>
     </div>
     <p class="spec-note reveal">
-      <b>What about MTP?</b> Multi-Token Prediction shipped briefly, then we removed it — across our cross-model benchmarks it was at parity with or slower than PLD, which covers the same ground with bigger wins. Checkpoints that carry MTP heads (Qwen 3.5 / 3.6) still load and run as regular models.
+      <b>Qwen 3.6 native MTP.</b> Models with a trained MTP sidecar (like <a href="https://huggingface.co/ddalcu/Qwen3.6-27B-4bit-MTP-MLX-Serve" target="_blank" rel="noopener" style="color:var(--blue)">ddalcu/Qwen3.6-27B-4bit-MTP-MLX-Serve</a>) auto-load it and speculate from the model's own head — up to <b>1.8×</b> on agent-style edit loops (29 → 51.6 tok/s on Qwen3.6-27B 4-bit, M4 Max), 1.43× on code. The controller watches its own acceptance rate per request and adapts draft depth on the fly. Zero setup — drop in the model and it's on.
     </p>
   </section>
 
@@ -1264,7 +1264,21 @@
           <svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="M10 4v4"/><path d="M2 8h20"/><path d="M6 4v4"/></svg>
         </div>
         <h3>One server, every model</h3>
-        <p>The MLX Core menu-bar app downloads models from HuggingFace with resumable transfers and hot-switches between them in place. <code>--model-dir</code> serves a whole folder; clients route by name.</p>
+        <p>The MLX Core menu-bar app downloads models from HuggingFace with resumable transfers and hot-switches in place. <code>--model-dir</code> serves a whole folder. NVFP4, MXFP4, and MXFP8 quantized checkpoints load and serve out of the box.</p>
+      </div>
+      <div class="feature-card reveal">
+        <div class="feature-icon" style="background: linear-gradient(135deg, #5e5ce6, #9fe6ff);">
+          <svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18"/><path d="M9 21V9"/></svg>
+        </div>
+        <h3>Block diffusion</h3>
+        <p>DiffusionGemma runs natively — Google's block-diffusion model writes 256-token canvases in parallel instead of one token at a time. Up to 25 tokens per forward pass, ~30% faster than the mlx-vlm reference. Works on every API surface including streaming.</p>
+      </div>
+      <div class="feature-card reveal">
+        <div class="feature-icon" style="background: linear-gradient(135deg, #30d158, #0071e3);">
+          <svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>
+        </div>
+        <h3>Document folder RAG</h3>
+        <p>Attach a folder of mixed files — notes, PDFs, JSON exports — and ask questions in plain language. GPU-batched embedding (~5× faster indexing) via the server's <code>/v1/embeddings</code> API. Nothing leaves your Mac, nothing written to disk.</p>
       </div>
     </div>
   </section>
@@ -1340,6 +1354,13 @@
         <div class="model-info">
           <h3>DeepSeek V4 Flash <span class="model-flag">96GB+</span></h3>
           <p>284B · via antirez/ds4 engine</p>
+        </div>
+      </div>
+      <div class="model-card featured">
+        <div class="model-logo ml-gemma" style="font-size:13px;">DG</div>
+        <div class="model-info">
+          <h3>DiffusionGemma <span class="model-flag">NEW</span></h3>
+          <p>Google · 26B-A4B block diffusion · ~30% faster than mlx-vlm</p>
         </div>
       </div>
       <div class="model-card">
@@ -1455,7 +1476,7 @@
       <li><a href="https://github.com/ddalcu/mlx-serve/issues" target="_blank" rel="noopener">Issues</a></li>
       <li><a href="https://github.com/ddalcu/mlx-serve/stargazers" target="_blank" rel="noopener">★ Star</a></li>
     </ul>
-    <p class="footer-copy">MIT License · mlx-serve <span style="opacity:0.7;">v26.6.7</span> · built for Apple Silicon</p>
+    <p class="footer-copy">MIT License · mlx-serve <span style="opacity:0.7;">v26.6.10</span> · built for Apple Silicon</p>
   </footer>
 
   <script>
