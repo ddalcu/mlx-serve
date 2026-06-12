@@ -22,7 +22,7 @@ Native Zig server that runs MLX-format LMs on Apple Silicon and exposes OpenAI-c
 | `generate.zig` | Autoregressive generation, sampling, PLD/drafter/MTP orchestration |
 | `chat.zig` | Chat templates (ChatML, Gemma, Llama-3, Jinja2); thinking tags; tool call parsing |
 | `vision.zig` | Gemma 4 SigLIP vision encoder |
-| `server.zig` | HTTP: `/health`, `/v1/models`, `/v1/chat/completions`, `/v1/completions`, `/v1/messages`, `/v1/responses`, WebSocket on `/v1/responses` |
+| `server.zig` | HTTP: `/health`, `/v1/models`, `/v1/chat/completions`, `/v1/completions`, `/v1/messages`, `/v1/responses`, `/v1/embeddings` (encoder-only BERT; whole input array batched into padded masked GPU forwards), WebSocket on `/v1/responses` |
 | `responses.zig` | OpenAI Responses API: parser, envelope, in-memory `ResponseStore`, compaction blob |
 | `ws.zig` | RFC 6455 WebSocket framing (server-side, generic over `Conn`) |
 | `pld_index.zig` | PLD n-gram index (`PldLookup.findMatch`, `ngramRepeatScore`) |
@@ -47,6 +47,7 @@ Sampling defaults for request fields the client OMITS resolve as: request body >
 | `Services/AgentPrompt.swift` | System prompt, 10 tools, `SkillManager` |
 | `Services/AgentEngine.swift` | Shared agent logic: history, tool exec, repetition tracking, overflow |
 | `Services/ToolExecutor.swift` | Tool handlers (shell, file, search, browse, webSearch, saveMemory) |
+| `Services/DocumentIndex.swift` | Mini in-memory RAG for "attach a folder": chunker, hybrid retrieval (cosine + IDF lexical), `searchDocuments` tool. Embeds via `ServerEmbedding` (server `/v1/embeddings`, GPU, ~5× faster) when an encoder model is available, else per-worker `NLEmbedding` |
 | `Services/{ImagePreprocessor,BrowserManager,ServerManager,TestServer,AgentMemory}.swift` | Image prep, WKWebView, server lifecycle, embedded test server (port 8090), agent context |
 | `Views/{ChatView,StatusMenuView,BrowserView}.swift` | Chat UI + `runAgentLoop()`, menu bar, browser |
 
@@ -78,6 +79,7 @@ Concrete rules for each change class:
 - **Cross-arch work**: cover every architecture the change touches, not just the one you're holding (`gemma4`, `qwen3_5_moe`, `lfm2`, `nemotron_h`, `deepseek_v4` via ds4, etc.). One arch's pass is not the suite's pass.
 - **Refactor / no-behavior-change**: at least one existing test must exercise the refactored path before the change. If coverage isn't there, add a characterization test first, then refactor under it.
 - **Untestable surface (UI, build scripts, etc.)**: factor a pure helper out and test that. "I can't test SwiftUI" usually means "I didn't extract the testable piece yet."
+- **Class bugs get class guards — no whack-a-mole.** When a live failure reveals a CLASS of bug (an escaping gap, a format-family leak, a dispatch hole — anything where "fix one model" could break or miss another), the fix ships with THREE things: (1) the instance regression test; (2) a corpus entry or universal invariant in `src/format_corpus_test.zig` that exercises the whole class across every family/entry, so future additions are covered automatically; (3) a CLAUDE.md gotcha naming the class, its symptom signature, and the rule that prevents reintroduction. Precedents: the no-tag-leak + valid-JSON-args invariants, the history round-trip serialization invariant, the spec-decode dispatch engagement counts.
 
 Existing tools:
 
@@ -108,6 +110,7 @@ Existing tools:
 | `UD_MOE_MODEL=<dir> ./tests/test_ud_moe.sh` | Unsloth UD MoE load + generate (default Qwen3.6-27B-UD-MLX-4bit) |
 | `NVFP4_TEST_MODEL=<dir> ./tests/test_nvfp4.sh` | NVFP4 checkpoint (issue #24): load, banner reports nvfp4 mode, temp-0 coherence canary. Default Qwen3-0.6B-nvfp4; pass a gemma-4 QAT nvfp4 dir to exercise mixed affine-override resolution. Hermetic counterparts: `computeQuantParams` + nvfp4 qmatmul/gather tests in transformer.zig. |
 | `./tests/test_long_agent_memory.sh [port]` | 10-turn Claude-Code-style agent: plants 3 facts in turn 1, recalls them across mode transitions (tools on/off, thinking on/off). Catches "model acts like first-time-seen" regressions. |
+| `EMBED_TEST_MODEL=<dir> ./tests/test_embeddings.sh [port]` | /v1/embeddings (encoder-only BERT): OpenAI shape, batched-vs-single cosine parity across mixed lengths (pins the padding mask + masked mean-pool), >EMBED_MAX_BATCH round-trip, 400 on generation, hot-load + stub `embeddings` capability beside a chat default. Default mlx-community/bge-small-en-v1.5-8bit. Hermetic counterparts: `buildPaddedBatch`/`buildKeyPadMask`/`maskedMeanPoolNormalize` tests in generate.zig. |
 | `./tests/test_disconnect_cancel.sh [model_dir] [port]` | Client-disconnect handling during long prefills: SSE keepalives flow every 5s while a request waits on first tokens (Anthropic `ping` events / OpenAI `: keepalive` comments), and a vanished client cancels its slot within one probe interval — the chunk loop aborts the ghost prefill (`error.Cancelled`) instead of grinding minutes of abandoned work that piles up behind Claude Code retries. Starts its own server. |
 | `./tests/test_messages_stream_thinking_tools.sh [model_dir] [port]` | /v1/messages STREAMING with thinking + tools together (Claude Code's exact shape) on a template-opened-think model: no think-tag leak in text deltas, SSE content-block lifecycle validity (every delta/stop references an open block), thinking_delta + tool_use emission. Starts its own server. Hermetic counterpart: `chat.streamThinkGate` unit tests + the corpus streaming-gate replay. |
 | `./tests/test_kv_quant_equivalence.sh [model_dir] [port]` | Off-vs-4-bit-vs-8-bit KV cache equivalence (per-arch first-N-token thresholds, env-overridable). |
@@ -272,6 +275,12 @@ Steps...
 - KV cache: `pkill -f mlx-serve` between tests — one bad request can poison the cache
 
 ## Gotchas
+
+### Hand-rolled JSON and control bytes (silent prompt-format downgrade)
+Everything fed to the C++ Jinja engine is hand-serialized JSON (`chat.serializeMessagesJson` → `appendJsonString`), and nlohmann is strict: ONE raw control byte (< 0x20) anywhere in the history makes the whole render fail. `renderChatTemplate` then silently downgrades to `fallbackFormatChat`, whose generic tags are NOT the family's trained format — for Gemma 4 the fallback's `<start_of_turn>`/`<end_of_turn>` aren't even special tokens (its template uses `<|turn>`/`<turn|>`), so the model loses its stop token and degenerates into hallucinating both sides of the conversation. Live failure 2026-06-11: gemma-4-31b via pi went insane on turn 3 because turn 2's tool result captured an interactive npm CLI's ANSI codes (`\x1b[?25l`). Rules:
+- Any string that can carry arbitrary bytes (tool results, model output echoed into history) must be escaped by a helper that `\u`-escapes ALL control chars. `appendJsonString` does this now; never add a new field with ad-hoc escaping (compare `server.zig jsonEscape`, `responses.zig jsonEscape`, `json_schema.zig writeJsonString` — all already correct).
+- The corpus test "history round-trip serialization survives any byte content" (`src/format_corpus_test.zig`) pins the invariant for every corpus entry plus hostile ANSI/control-byte tool results — new corpus entries are covered automatically.
+- A Jinja render failure logs at **warn** (`jinja render failed`), not debug. If a model suddenly emits wrong-family tags (`<start_of_turn>` from a Gemma 4, raw role names like `assistant`), suspect a silent fallback render before suspecting the model or spec-decode.
 
 ### KV cache after tool calls
 Generated tool-call tokens are in the cache but not in `cached_prompt_ids` → reusing for the next request (with tool results) corrupts attention. Auto-invalidated. Pad-only generations also trigger invalidation.

@@ -121,6 +121,10 @@ pub const DiscoveredModel = struct {
     /// Approximate weight size on disk in bytes (sum of *.safetensors). Used
     /// later by eviction; null if scan failed.
     bytes_on_disk: ?u64,
+    /// `model_type` peeked from config.json (e.g. "bert"), so registry stubs
+    /// can advertise arch-derived capabilities before a cold load. Empty
+    /// when unknown.
+    model_type: []const u8 = "",
 };
 
 pub const DiscoveryResult = struct {
@@ -131,6 +135,7 @@ pub const DiscoveryResult = struct {
         for (self.models) |*m| {
             self.allocator.free(m.id);
             self.allocator.free(m.path);
+            if (m.model_type.len > 0) self.allocator.free(m.model_type);
         }
         self.allocator.free(self.models);
     }
@@ -186,6 +191,7 @@ pub fn discoverModels(io: std.Io, allocator: std.mem.Allocator, model_dir: []con
         for (found.items) |*m| {
             allocator.free(m.id);
             allocator.free(m.path);
+            if (m.model_type.len > 0) allocator.free(m.model_type);
         }
         found.deinit(allocator);
     }
@@ -207,7 +213,7 @@ pub fn discoverModels(io: std.Io, allocator: std.mem.Allocator, model_dir: []con
         //   - unsupported arches (e.g. deepseek_v4, MLA + indexer)
         //   - unsupported quants (modes outside supported_quant_modes)
         // before they reach the tokenizer/weight loaders.
-        switch (peekConfig(io, allocator, dir, entry.name)) {
+        const model_type: []const u8 = switch (peekConfig(io, allocator, dir, entry.name)) {
             .missing_or_unparseable => {
                 log.info("[discovery] skip {s}: config.json missing or unparseable", .{entry.name});
                 continue;
@@ -222,8 +228,9 @@ pub fn discoverModels(io: std.Io, allocator: std.mem.Allocator, model_dir: []con
                 log.info("[discovery] skip {s}: unsupported quantization mode '{s}' (supported: affine, nvfp4, mxfp4, mxfp8)", .{ entry.name, mode });
                 continue;
             },
-            .supported => |mt| allocator.free(mt),
-        }
+            .supported => |mt| mt, // ownership moves to the DiscoveredModel
+        };
+        errdefer if (model_type.len > 0) allocator.free(model_type);
 
         // Compute weight bytes (sum of *.safetensors sizes) — best-effort.
         var bytes: u64 = 0;
@@ -247,6 +254,7 @@ pub fn discoverModels(io: std.Io, allocator: std.mem.Allocator, model_dir: []con
             .id = id,
             .path = path,
             .bytes_on_disk = if (bytes_ok) bytes else null,
+            .model_type = model_type,
         });
     }
 

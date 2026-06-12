@@ -92,6 +92,11 @@ pub const LoadedModel = struct {
     /// Approximate weight bytes on disk (sum of *.safetensors). Used for
     /// pre-load eviction estimates so we don't oversubscribe wired memory.
     bytes_on_disk: ?u64,
+    /// `model_type` peeked from config.json at discovery time (allocator-
+    /// owned dupe; empty when unknown). Lets /v1/models advertise
+    /// arch-derived capabilities — e.g. "bert" → embeddings — while the
+    /// entry is still an `.unloaded` stub.
+    arch_hint: []const u8,
 
     // ── Mlx-allocating state. Non-null iff state == .ready (or transitioning
     //    out of .ready via eviction). Owned by this entry; freed in deinit.
@@ -277,6 +282,7 @@ pub const LoadedModel = struct {
         }
         if (self.error_name) |n| self.allocator.free(n);
         if (self.drafter_path.len > 0) self.allocator.free(self.drafter_path);
+        if (self.arch_hint.len > 0) self.allocator.free(self.arch_hint);
         self.allocator.free(self.id);
         self.allocator.free(self.path);
     }
@@ -461,7 +467,7 @@ pub const ModelRegistry = struct {
         if (discovery) |d| {
             errdefer self.deinitInternal();
             for (d.models) |m| {
-                _ = try self.registerStub(m.id, m.path, m.bytes_on_disk);
+                _ = try self.registerStubWithArch(m.id, m.path, m.bytes_on_disk, m.model_type);
             }
         }
 
@@ -494,6 +500,12 @@ pub const ModelRegistry = struct {
     /// Used by `init` for discovery and by `serve()` to register the
     /// loaded `--model` when it wasn't in `--model-dir`.
     pub fn registerStub(self: *ModelRegistry, id: []const u8, path: []const u8, bytes_on_disk: ?u64) !*LoadedModel {
+        return self.registerStubWithArch(id, path, bytes_on_disk, "");
+    }
+
+    /// `registerStub` variant carrying the discovery-peeked `model_type` so
+    /// the stub can advertise arch-derived capabilities before loading.
+    pub fn registerStubWithArch(self: *ModelRegistry, id: []const u8, path: []const u8, bytes_on_disk: ?u64, arch_hint: []const u8) !*LoadedModel {
         if (self.entries.get(id) != null) return error.DuplicateId;
 
         const stub = try self.allocator.create(LoadedModel);
@@ -502,12 +514,15 @@ pub const ModelRegistry = struct {
         errdefer self.allocator.free(id_owned);
         const path_owned = try self.allocator.dupe(u8, path);
         errdefer self.allocator.free(path_owned);
+        const arch_owned: []const u8 = if (arch_hint.len > 0) try self.allocator.dupe(u8, arch_hint) else "";
+        errdefer if (arch_owned.len > 0) self.allocator.free(arch_owned);
 
         stub.* = .{
             .allocator = self.allocator,
             .id = id_owned,
             .path = path_owned,
             .bytes_on_disk = bytes_on_disk,
+            .arch_hint = arch_owned,
             .config = null,
             .weights = null,
             .transformer = null,
@@ -823,6 +838,16 @@ test "ModelRegistry: registerStub + setDefault" {
     try testing.expectEqualStrings("foo", reg.default_id);
     try testing.expectError(error.DuplicateId, reg.registerStub("foo", "/path/to/foo", 1024));
     try testing.expectError(error.UnknownModelId, reg.setDefault("bar"));
+}
+
+test "ModelRegistry: registerStubWithArch keeps the discovery arch hint" {
+    var reg = try ModelRegistry.init(testing.allocator, std.Io.Threaded.global_single_threaded.io(), null, 3, 0, null);
+    defer reg.deinit();
+    const encoder = try reg.registerStubWithArch("bge", "/path/to/bge", 64, "bert");
+    try testing.expectEqualStrings("bert", encoder.arch_hint);
+    // Plain registerStub keeps an empty hint (no arch known).
+    const plain = try reg.registerStub("foo", "/path/to/foo", 1024);
+    try testing.expectEqualStrings("", plain.arch_hint);
 }
 
 test "ModelRegistry: ensureLoaded fails on unloaded stub" {

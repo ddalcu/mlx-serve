@@ -1343,9 +1343,21 @@ fn renderModelEntry(
         );
     } else &[_]u8{};
     defer if (err_part.len > 0) allocator.free(err_part);
+    // Arch-derived capabilities for stubs: encoder-only models advertise
+    // "embeddings" pre-load so clients (e.g. the app's document indexer)
+    // can pick a GPU embedder without forcing a cold load. Chat-derived
+    // caps stay load-gated (they need the chat template).
+    const is_encoder_stub = std.mem.eql(u8, entry.arch_hint, "bert");
+    const caps_part: []const u8 = if (is_encoder_stub) ",\"capabilities\":[\"embeddings\"]" else "";
+    const arch_part: []const u8 = if (entry.arch_hint.len > 0) blk: {
+        // arch_hint comes from config.json's model_type via discovery — the
+        // supported-type allowlist guarantees no JSON metacharacters.
+        break :blk try std.fmt.allocPrint(allocator, "\"architecture\":\"{s}\",", .{entry.arch_hint});
+    } else &[_]u8{};
+    defer if (arch_part.len > 0) allocator.free(arch_part);
     return std.fmt.allocPrint(allocator,
-        \\{{"id":"{s}","object":"model","created":0,"owned_by":"mlx-serve","loaded":false,"state":"{s}","bytes_resident":0,"bytes_on_disk":{s}{s},"meta":{{"bytes_on_disk":{s}}}}}
-    , .{ entry.id, state_str, bytes_on_disk_str, err_part, bytes_on_disk_str });
+        \\{{"id":"{s}","object":"model","created":0,"owned_by":"mlx-serve","loaded":false,"state":"{s}","bytes_resident":0,"bytes_on_disk":{s}{s}{s},"meta":{{{s}"bytes_on_disk":{s}}}}}
+    , .{ entry.id, state_str, bytes_on_disk_str, err_part, caps_part, arch_part, bytes_on_disk_str });
 }
 
 fn handleModels(
@@ -1802,49 +1814,62 @@ fn handleEmbeddings(
 
     try resp_buf.appendSlice(allocator, "{\"object\":\"list\",\"data\":[");
 
+    // Tokenize every input up front so the whole request rides ONE scheduler
+    // round-trip; the inference thread embeds the sequences in padded,
+    // key-masked GPU batches (generate.EMBED_MAX_BATCH per forward) instead
+    // of one forward per text.
     var total_tokens: usize = 0;
-    for (texts.items, 0..) |text, idx| {
-        // Tokenize
+    var seqs = std.ArrayList([]const u32).empty;
+    defer {
+        for (seqs.items) |ids| allocator.free(ids);
+        seqs.deinit(allocator);
+    }
+    for (texts.items) |text| {
         const ids = try tok.encode(allocator, text);
-        defer allocator.free(ids);
         total_tokens += ids.len;
+        try seqs.append(allocator, ids);
+    }
 
-        // Phase A: route through scheduler when available so the encoder
-        // forward pass runs on the inference thread (mlx 0.31.2 thread-local
-        // streams). Falls back to a direct call only in the offline path
-        // where no scheduler exists. Cache reset between embeddings is
-        // handled inside the scheduler's `runEmbedRequest` (or here for the
-        // fallback) — encoder-only embeddings carry no cross-request state.
-        const embedding = if (global_scheduler) |sch| blk: {
-            var req = scheduler_mod.EmbedRequest{
-                .model = lm,
-                .token_ids = ids,
-                .allocator = allocator,
-            };
-            break :blk sch.computeEmbedding(&req) catch |err| {
-                if (req.error_name) |e| {
-                    log.err("  embedding error: {s}\n", .{e});
-                    allocator.free(e);
-                } else {
-                    log.err("  embedding error: {}\n", .{err});
-                }
-                try sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", "Failed to compute embedding", null);
-                return;
-            };
-        } else fallback: {
-            const xfm = xfm_opt orelse {
-                try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Embeddings require an MLX (safetensors) model; this model has no encoder", null);
-                return;
-            };
-            try xfm.resetCache();
-            break :fallback gen_mod.computeEmbedding(allocator, xfm, ids) catch |err| {
-                log.err("  embedding error: {}\n", .{err});
-                try sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", "Failed to compute embedding", null);
-                return;
-            };
+    // Phase A: route through scheduler when available so the encoder
+    // forward pass runs on the inference thread (mlx 0.31.2 thread-local
+    // streams). Falls back to a direct call only in the offline path
+    // where no scheduler exists. Cache reset is handled inside the
+    // scheduler's `runEmbedRequest` (or here for the fallback) —
+    // encoder-only embeddings carry no cross-request state.
+    const embeddings = if (global_scheduler) |sch| blk: {
+        var req = scheduler_mod.EmbedRequest{
+            .model = lm,
+            .token_seqs = seqs.items,
+            .allocator = allocator,
         };
-        defer allocator.free(embedding);
+        break :blk sch.computeEmbeddings(&req) catch |err| {
+            if (req.error_name) |e| {
+                log.err("  embedding error: {s}\n", .{e});
+                allocator.free(e);
+            } else {
+                log.err("  embedding error: {}\n", .{err});
+            }
+            try sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", "Failed to compute embedding", null);
+            return;
+        };
+    } else fallback: {
+        const xfm = xfm_opt orelse {
+            try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Embeddings require an MLX (safetensors) model; this model has no encoder", null);
+            return;
+        };
+        try xfm.resetCache();
+        break :fallback gen_mod.computeEmbeddingsBatch(allocator, xfm, seqs.items) catch |err| {
+            log.err("  embedding error: {}\n", .{err});
+            try sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", "Failed to compute embedding", null);
+            return;
+        };
+    };
+    defer {
+        for (embeddings) |e| allocator.free(e);
+        allocator.free(embeddings);
+    }
 
+    for (embeddings, 0..) |embedding, idx| {
         if (idx > 0) try resp_buf.appendSlice(allocator, ",");
 
         // Format: {"object":"embedding","embedding":[...floats...],"index":N}

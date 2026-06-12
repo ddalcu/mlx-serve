@@ -238,6 +238,74 @@ private struct AttachmentPreviewRow: View {
     }
 }
 
+/// Chip for the attached document folder (mini RAG): shows live indexing
+/// progress, then the indexed file/chunk totals, with an ✕ to detach. Styled
+/// to match the `AttachmentPreviewRow` file chips.
+private struct DocumentFolderChip: View {
+    @ObservedObject var index: DocumentIndex
+    let onRemove: () -> Void
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: iconName)
+                .font(.system(size: 18))
+                .foregroundStyle(.white)
+                .frame(width: 32, height: 32)
+                .background(tint.opacity(0.85))
+                .clipShape(RoundedRectangle(cornerRadius: 6))
+            VStack(alignment: .leading, spacing: 1) {
+                Text(index.folderName)
+                    .font(.caption.weight(.medium))
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                Text(statusText)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+            if case .indexing(let done, let total) = index.state {
+                ProgressView(value: total > 0 ? Double(done) / Double(total) : 0)
+                    .progressViewStyle(.linear)
+                    .frame(width: 70)
+            }
+            Button(action: onRemove) {
+                Image(systemName: "xmark.circle.fill")
+                    .font(.system(size: 14))
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.plain)
+            .help("Detach folder")
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 4)
+        .frame(maxWidth: 320, minHeight: 44, alignment: .leading)
+        .background(Color.secondary.opacity(0.15))
+        .clipShape(RoundedRectangle(cornerRadius: 10))
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .padding(.horizontal, 4)
+    }
+
+    private var iconName: String {
+        if case .failed = index.state { return "exclamationmark.triangle.fill" }
+        return "folder.fill"
+    }
+
+    private var tint: Color {
+        if case .failed = index.state { return .orange }
+        return .blue
+    }
+
+    private var statusText: String {
+        switch index.state {
+        case .indexing(let done, let total):
+            return total > 0 ? "Indexing \(done)/\(total) files…" : "Scanning folder…"
+        case .ready(let files, let chunks):
+            return "\(files) files · \(chunks) excerpts — ask away"
+        case .failed(let msg):
+            return msg
+        }
+    }
+}
+
 /// Record-audio button shown next to the paperclip on audio-capable models.
 /// Tap to start (mic icon), tap again to stop (red pill with elapsed time).
 private struct MicButton: View {
@@ -515,9 +583,29 @@ struct ChatDetailView: View {
                     AttachmentPreviewRow(images: $pendingImages, pdfs: $pendingPDFs, audio: $pendingAudio)
                 }
 
+                // Attached document folder (mini RAG) — indexing progress / ready chip
+                if let docIndex = appState.documentIndexes[sessionId] {
+                    DocumentFolderChip(index: docIndex) {
+                        docIndex.cancel()
+                        appState.documentIndexes.removeValue(forKey: sessionId)
+                    }
+                }
+
                 HStack(alignment: .bottom, spacing: 8) {
-                    // Attachment button (images + PDFs)
-                    Button { pickAttachment() } label: {
+                    // Attachment menu (images/PDFs/audio + document folder)
+                    Menu {
+                        Button {
+                            pickAttachment()
+                        } label: {
+                            Label(audioSupported ? "Attach Image, PDF, or Audio…" : "Attach Image or PDF…",
+                                  systemImage: "photo.on.rectangle")
+                        }
+                        Button {
+                            pickDocumentFolder()
+                        } label: {
+                            Label("Attach Folder for Q&A…", systemImage: "folder.badge.questionmark")
+                        }
+                    } label: {
                         Image(systemName: "paperclip")
                             .font(.system(size: 13, weight: .medium))
                             .foregroundStyle(.secondary)
@@ -525,8 +613,18 @@ struct ChatDetailView: View {
                             .background(Color.secondary.opacity(0.15))
                             .clipShape(Circle())
                     }
+                    // .plain button style (not .borderlessButton menu style) —
+                    // the latter substitutes its own chrome on macOS, dropping
+                    // the circle background and mis-baselining the glyph next
+                    // to the input pill.
+                    .menuStyle(.button)
                     .buttonStyle(.plain)
-                    .help(audioSupported ? "Attach image, PDF, or audio" : "Attach image or PDF")
+                    .menuIndicator(.hidden)
+                    .frame(width: 28, height: 28)
+                    // Menu's bottom edge sits a hair lower than a plain Button's
+                    // did — lift it to line up with the input pill and send button.
+                    .padding(.bottom, 2)
+                    .help("Attach files, or a document folder to ask questions about")
 
                     // Mic — only on models that actually understand audio
                     // (Gemma 4 12B). Tap to record, tap again to attach.
@@ -833,6 +931,31 @@ struct ChatDetailView: View {
         }
     }
 
+    // MARK: - Document Folder (mini RAG)
+
+    /// Pick a folder of mixed documents to index in-memory for this session.
+    private func pickDocumentFolder() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.message = "Choose a folder of documents to ask questions about (txt, md, pdf, json, yaml, csv …)"
+        panel.prompt = "Attach"
+        panel.begin { response in
+            guard response == .OK, let url = panel.url else { return }
+            DispatchQueue.main.async {
+                appState.documentIndexes[sessionId]?.cancel()
+                // Embed on the local server's GPU when it has an encoder
+                // model; the probe falls back to on-device NLEmbedding when
+                // the server is down or has no encoder model.
+                let index = DocumentIndex(folderURL: url,
+                                          gpuEmbedderProbe: ServerEmbedding.probe(port: server.port))
+                appState.documentIndexes[sessionId] = index
+                index.startIndexing()
+            }
+        }
+    }
+
     // MARK: - Image Helpers
 
     private func pickAttachment() {
@@ -1069,7 +1192,8 @@ struct ChatDetailView: View {
             mcpMode: appState.mcpMode,
             enableThinking: enableThinking,
             voiceStyle: false,
-            workingDirectory: session?.workingDirectory
+            workingDirectory: session?.workingDirectory,
+            documentIndex: appState.documentIndexes[sessionId]
         )
         chatEngine.runTurn(sessionId: sessionId, userText: text,
                            images: attachedImages, audio: attachedAudio,
@@ -1083,6 +1207,9 @@ struct ChatDetailView: View {
     /// and suspends on a checked continuation until the sheet resumes it.
     @MainActor
     private func requestToolApproval(_ tc: APIClient.ToolCall) async -> Bool {
+        // Read-only search over a folder the user explicitly attached — never
+        // worth an approval interruption (docs-only mode has no other tools).
+        if tc.name == "searchDocuments" { return true }
         if sessionAllowAll { return true }
         let choice: ToolApprovalChoice = await withCheckedContinuation { (cont: CheckedContinuation<ToolApprovalChoice, Never>) in
             pendingApproval = ToolApprovalRequest(

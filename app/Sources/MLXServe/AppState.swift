@@ -74,6 +74,9 @@ class AppState: ObservableObject {
     @Published var pendingVoiceLaunch = false
     @Published var agentMemory = AgentMemory()
     @Published var toolExecutor = ToolExecutor()
+    /// Per-session attached document folders (mini RAG). In-memory only — an
+    /// index dies with the app and is rebuilt by re-attaching the folder.
+    @Published var documentIndexes: [UUID: DocumentIndex] = [:]
     let testServer = TestServer()
     @Published var python = PythonManager()
     lazy var imageGen = ImageGenService(python: python)
@@ -226,6 +229,8 @@ class AppState: ObservableObject {
     }
 
     func deleteSession(_ id: UUID) {
+        documentIndexes[id]?.cancel()
+        documentIndexes.removeValue(forKey: id)
         chatSessions.removeAll { $0.id == id }
         if activeChatId == id {
             activeChatId = chatSessions.first?.id

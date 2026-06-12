@@ -2,7 +2,9 @@
 //!
 //! A table of REAL captured model outputs (plus a few minimal synthetic
 //! variants of real failures) run through the pure post-processing layer:
-//! `chat.splitThinkBlock` / `chat.stripThinkBlock` / `chat.parseToolCalls`.
+//! `chat.splitThinkBlock` / `chat.stripThinkBlock` / `chat.parseToolCalls` —
+//! and back through the INPUT layer (`chat.serializeMessagesJson`), since
+//! every output re-enters the next request's history.
 //! No model weights, no server — runs in CI on every `zig build test`.
 //!
 //! Run just this corpus:
@@ -573,4 +575,67 @@ test "format corpus: streaming think-gate never leaks thinking mid-stream" {
 
     // Invariant 3, directly: once think_closed, prose streams.
     try testing.expectEqual(chat.StreamThinkGate.flush_text, chat.streamThinkGate("The visible answer.", true, true));
+}
+
+test "format corpus: history round-trip serialization survives any byte content" {
+    // Inverse direction of the corpus: everything a model emits (and every
+    // tool result an agent echoes back) re-enters the NEXT request's history
+    // and is serialized by chat.serializeMessagesJson into the JSON that the
+    // C++ Jinja engine (nlohmann, strict) parses. 2026-06-11 pi/gemma-4-31b
+    // failure: a tool result with a raw ESC byte (`\x1b[?25l`, ANSI
+    // hide-cursor from an interactive npm CLI) produced invalid JSON →
+    // jinja_render_chat returned NULL → silent fallback to the wrong prompt
+    // format → the model hallucinated whole conversations.
+    //
+    // Invariants, for every corpus entry's raw text AND hostile tool-result
+    // samples:
+    //   1. The serialized form contains NO raw control byte (< 0x20) — the
+    //      strictest parser downstream must accept it.
+    //   2. A strict JSON parse round-trips every content byte exactly.
+    const allocator = testing.allocator;
+
+    // Tool-result shapes that have to survive verbatim: ANSI codes from the
+    // live failure, plus every control byte 0x00–0x1F in one payload.
+    var all_ctrl: [0x20]u8 = undefined;
+    for (&all_ctrl, 0..) |*c, i| c.* = @intCast(i);
+    const hostile_tool_results = [_][]const u8{
+        "\x1b[?25l\u{2502}\n\u{25c6}  Which template would you like?\n\u{2502}  \u{25cf} SvelteKit minimal", // verbatim live failure
+        &all_ctrl,
+    };
+
+    for (corpus) |entry| {
+        for (hostile_tool_results) |tool_result| {
+            const tc = [_]chat.ToolCall{
+                .{ .id = "tc_0", .name = "bash", .arguments = "{\"command\": \"npx sv create .\"}" },
+            };
+            const messages = [_]chat.Message{
+                .{ .role = "user", .content = "make me a sveltekit app" },
+                // The model's own raw output goes back in as assistant content.
+                .{ .role = "assistant", .content = entry.raw, .tool_calls = &tc },
+                .{ .role = "tool", .content = tool_result, .tool_call_id = "tc_0" },
+            };
+
+            const serialized = try chat.serializeMessagesJson(allocator, &messages);
+            defer allocator.free(serialized);
+
+            for (serialized) |c| {
+                if (c < 0x20) {
+                    std.debug.print("\n[{s}] {s}: raw control byte 0x{x:0>2} in serialized history\n", .{ entry.family, entry.name, c });
+                    return error.FormatCorpusExpectFailed;
+                }
+            }
+
+            const parsed = std.json.parseFromSlice(std.json.Value, allocator, serialized, .{}) catch {
+                std.debug.print("\n[{s}] {s}: serialized history is not valid JSON\n  got: {s}\n", .{ entry.family, entry.name, serialized });
+                return error.FormatCorpusExpectFailed;
+            };
+            defer parsed.deinit();
+
+            const msgs = parsed.value.array.items;
+            const assistant_content = msgs[1].object.get("content").?.string;
+            const tool_content = msgs[2].object.get("content").?.string;
+            try testing.expectEqualStrings(entry.raw, assistant_content);
+            try testing.expectEqualStrings(tool_result, tool_content);
+        }
+    }
 }

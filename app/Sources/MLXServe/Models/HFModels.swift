@@ -1,10 +1,15 @@
 import Foundation
 
-/// Pipeline tags that mlx-serve can run (text LLMs and vision-language models).
+/// Pipeline tags that mlx-serve can run (text LLMs, vision-language models,
+/// and encoder-only embedding models).
 private let compatiblePipelineTags: Set<String> = [
     "text-generation",
     "image-text-to-text",
     "any-to-any",  // Gemma 4 uses this
+    // Encoder-only embedding repos (BERT family) — served via /v1/embeddings
+    // and used by the app's GPU folder indexing. HF tags them either way.
+    "feature-extraction",
+    "sentence-similarity",
 ]
 
 /// Architecture tag prefixes from HuggingFace that correspond to supported model families.
@@ -17,6 +22,7 @@ private let supportedArchitectureTagPrefixes: [String] = [
     "mistral",
     "nemotron",   // nemotron_h (Mamba2 SSM hybrid)
     "lfm",        // lfm2, lfm2-vl (Liquid state-space hybrid)
+    "bert",       // encoder-only embedding models (/v1/embeddings)
 ]
 
 /// model_type values from config.json that the Zig server can load.
@@ -31,6 +37,7 @@ let supportedModelTypes: Set<String> = [
     "llama", "mistral",
     "lfm2", "lfm2-vl",
     "nemotron_h",
+    "bert", // encoder-only; serves /v1/embeddings (GPU document indexing)
     // GGUF engines: "gguf" = any model via the embedded llama.cpp engine;
     // "deepseek_v4" = DeepSeek-V4-Flash via the ds4 engine. Both are served, so
     // neither should be flagged "unsupported architecture" in the model browser.
@@ -102,14 +109,15 @@ struct HFModel: Identifiable, Codable {
         (tags ?? []).contains { $0.lowercased() == "gguf" }
     }
 
-    /// The non-affine FP quantization this repo uses, if any — e.g. "NVFP4",
-    /// "MXFP8". MXFP (OCP microscaling) and NVFP (NVIDIA FP4) store weights in a
-    /// layout the MLX safetensors loader can't decode; the Zig server's
-    /// discovery gate already skips them (`model_discovery.peekConfig`:
-    /// `quantization.mode != "affine"`), so flag them here too rather than
-    /// offering a download that silently never loads. Name-based, matching the
-    /// `quantization` idiom. GGUF repos are exempt: llama.cpp loads mxfp4
-    /// (GPT-OSS) natively, and the server's quant gate is MLX/safetensors-only.
+    /// The FP quantization this repo uses that the server CANNOT load, if any.
+    /// Since v26.6.10 (issue #24) the server loads nvfp4/mxfp4/mxfp8
+    /// safetensors checkpoints natively (per-weight quant-mode resolution),
+    /// so those are no longer flagged — they surface as a `quantization`
+    /// badge instead. Only modes outside the server's set (`model.zig`
+    /// parse: affine/nvfp4/mxfp4/mxfp8 — e.g. mxfp6) keep the flag, so the
+    /// browser doesn't offer a download that errors at load. Name-based,
+    /// matching the `quantization` idiom. GGUF repos are exempt: llama.cpp
+    /// handles its own quant formats internally.
     var unsupportedQuantization: String? {
         if isGgufRepo { return nil }
         let lower = id.lowercased()
@@ -119,7 +127,7 @@ struct HFModel: Identifiable, Codable {
         return nil
     }
 
-    private static let unsupportedQuantizationTokens: [String] = ["nvfp4", "mxfp4", "mxfp6", "mxfp8"]
+    private static let unsupportedQuantizationTokens: [String] = ["mxfp6"]
 
     /// Human-readable reason why this model isn't compatible.
     var incompatibleReason: String? {
@@ -174,11 +182,12 @@ struct HFModel: Identifiable, Codable {
     /// Human label for the badge column, parsed from the repo id. Generalized
     /// over bit width (any N — 2/3/4/5/6/8/9/…, incl. fractional like "3.5bit")
     /// rather than a hardcoded set, covering both MLX "Nbit"/"N-bit" and GGUF
-    /// "qN_"/"iqN_" naming, plus the FP weight dtypes. Returns nil when the id
-    /// encodes no single quant (e.g. a multi-quant GGUF repo, where the user
-    /// picks the quant at download time). Non-affine FP formats (nvfp4/mxfp*)
-    /// deliberately don't match here — they surface via `incompatibleReason`,
-    /// not as a misleading bit badge.
+    /// "qN_"/"iqN_" naming, plus the FP weight dtypes and the server-loadable
+    /// FP quant modes (NVFP4/MXFP4/MXFP8, served since v26.6.10). Returns nil
+    /// when the id encodes no single quant (e.g. a multi-quant GGUF repo,
+    /// where the user picks the quant at download time). Still-unloadable
+    /// modes (mxfp6) deliberately don't match here — they surface via
+    /// `incompatibleReason`, not as a misleading badge.
     var quantization: String? {
         // GGUF repos host multiple quants in separate files; the repo ID alone
         // doesn't identify one, so surface "Multi" rather than "—".
@@ -188,6 +197,11 @@ struct HFModel: Identifiable, Codable {
 
     static func quantizationLabel(forId id: String) -> String? {
         let lower = id.lowercased()
+        // FP quant modes before the bit-width regexes so a hypothetical
+        // "…-nvfp4-4bit" id badges the format, not a bare width.
+        for mode in ["nvfp4", "mxfp4", "mxfp8"] where lower.contains(mode) {
+            return mode.uppercased()
+        }
         if lower.contains("fp16") { return "FP16" }
         if lower.contains("bf16") { return "BF16" }
         if let s = firstCapture(lower, quantBitRegex) { return "\(s)-bit" }

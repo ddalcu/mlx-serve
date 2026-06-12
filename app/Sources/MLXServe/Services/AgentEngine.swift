@@ -360,7 +360,7 @@ enum AgentEngine {
     /// Primary argument key per tool — used to distinguish different invocations.
     private static let primaryArgKey: [String: String] = [
         "listFiles": "path", "readFile": "path", "searchFiles": "pattern",
-        "browse": "url", "webSearch": "query",
+        "browse": "url", "webSearch": "query", "searchDocuments": "query",
     ]
 
     /// Build a repetition key like "listFiles:src/lib" or "saveMemory" (no primary arg).
@@ -545,7 +545,8 @@ enum AgentEngine {
         repetition: RepetitionTracker,
         iteration: Int,
         agentMemory: AgentMemory,
-        mcpRouter: (any MCPToolRouting)? = nil
+        mcpRouter: (any MCPToolRouting)? = nil,
+        documentIndex: DocumentIndex? = nil
     ) async -> ToolResult {
         // Normalize the model-emitted name (strip a leaked trailing ':' etc.)
         // before resolving the tool. Repetition tracking stays on the raw
@@ -565,7 +566,8 @@ enum AgentEngine {
             output = await mcpRouter.executeToolCall(
                 name: tc.name, arguments: tc.arguments, rawArguments: tc.rawArguments)
         } else {
-            output = await executeBuiltinTool(tc, name: name, workingDirectory: &workingDirectory, agentMemory: agentMemory)
+            output = await executeBuiltinTool(tc, name: name, workingDirectory: &workingDirectory,
+                                              agentMemory: agentMemory, documentIndex: documentIndex)
         }
 
         // Apply warning if near repetition threshold (raw name — see above).
@@ -581,7 +583,8 @@ enum AgentEngine {
         _ tc: APIClient.ToolCall,
         name: String,
         workingDirectory: inout String?,
-        agentMemory: AgentMemory
+        agentMemory: AgentMemory,
+        documentIndex: DocumentIndex? = nil
     ) async -> String {
         let tool = AgentToolKind(rawValue: name)
 
@@ -624,6 +627,15 @@ enum AgentEngine {
             return "Error: \(name) missing required params: \(missing.joined(separator: ", ")). Example: \(toolExample(for: name))"
         }
 
+        // Document search is stateful (the per-session index), so it dispatches
+        // here instead of through the stateless handler registry.
+        if effectiveTool == .searchDocuments {
+            guard let documentIndex else {
+                return "Error: no document folder is attached to this chat. Ask the user to attach one via the paperclip menu (Attach Folder for Q&A)."
+            }
+            return await documentIndex.search(query: tc.arguments["query"] ?? "")
+        }
+
         guard let effectiveTool, let handler = toolHandlers[effectiveTool] else {
             return "Error: Unknown tool '\(name)'"
         }
@@ -652,6 +664,9 @@ enum AgentEngine {
         "editFile": 2000,
         "writeFile": 2000,
         "saveMemory": 500,
+        // Top-5 excerpts at ~1200 chars each plus headers — don't truncate
+        // the retrieval the whole docs mode depends on.
+        "searchDocuments": 10000,
     ]
 
     /// Truncate tool output, saving full result to disk if oversized.

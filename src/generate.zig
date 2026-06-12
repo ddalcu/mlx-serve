@@ -3672,29 +3672,100 @@ pub fn computeEmbedding(
     xfm: *Transformer,
     token_ids: []const u32,
 ) ![]f32 {
-    const s = xfm.s;
-    const prompt_len: c_int = @intCast(token_ids.len);
-    const shape = [_]c_int{ 1, prompt_len };
+    const seqs = [_][]const u32{token_ids};
+    const rows = try computeEmbeddingsBatch(allocator, xfm, &seqs);
+    defer allocator.free(rows);
+    return rows[0];
+}
 
-    const ids_i32 = try allocator.alloc(i32, token_ids.len);
-    defer allocator.free(ids_i32);
-    for (token_ids, 0..) |id, i| {
-        ids_i32[i] = @intCast(id);
+/// GPU batch-size cap for encoder embedding forwards: bounds padded-batch
+/// memory while keeping the GPU saturated.
+pub const EMBED_MAX_BATCH: usize = 64;
+
+/// One padded batch of token sequences ready for an encoder forward.
+pub const PaddedBatch = struct {
+    ids: []i32, // [B * max_len] row-major, pad id 0
+    lengths: []usize, // [B]
+    max_len: usize,
+
+    pub fn deinit(self: *PaddedBatch, allocator: std.mem.Allocator) void {
+        allocator.free(self.ids);
+        allocator.free(self.lengths);
     }
+};
 
-    const input = mlx.mlx_array_new_data(ids_i32.ptr, &shape, 2, .int32);
-    defer _ = mlx.mlx_array_free(input);
+/// Pad `seqs` into one [B, max_len] i32 buffer (pad id 0). Padded positions
+/// are excluded from attention (`buildKeyPadMask`) and pooling
+/// (`maskedMeanPoolNormalize`), so the pad id value never leaks into results.
+pub fn buildPaddedBatch(allocator: std.mem.Allocator, seqs: []const []const u32) !PaddedBatch {
+    var max_len: usize = 0;
+    for (seqs) |seq| max_len = @max(max_len, seq.len);
+    if (max_len == 0) return error.EmptyInput;
 
-    // Get hidden states: [1, seq_len, hidden_size]
-    const hidden = try xfm.forwardEmbedding(input);
-    defer _ = mlx.mlx_array_free(hidden);
+    const ids = try allocator.alloc(i32, seqs.len * max_len);
+    errdefer allocator.free(ids);
+    const lengths = try allocator.alloc(usize, seqs.len);
+    errdefer allocator.free(lengths);
+    @memset(ids, 0);
+    for (seqs, 0..) |seq, b| {
+        lengths[b] = seq.len;
+        for (seq, 0..) |id, t| ids[b * max_len + t] = @intCast(id);
+    }
+    return .{ .ids = ids, .lengths = lengths, .max_len = max_len };
+}
 
-    // Mean pool over sequence dimension (axis=1): [1, hidden_size]
+/// Additive key-padding mask [B, 1, 1, max_len] (bf16): 0 over real keys,
+/// -inf over padding. Broadcasts across heads and query positions; padded
+/// QUERIES still produce garbage rows, but pooling drops them.
+pub fn buildKeyPadMask(allocator: std.mem.Allocator, lengths: []const usize, max_len: usize, s: mlx.mlx_stream) !mlx.mlx_array {
+    const buf = try allocator.alloc(f32, lengths.len * max_len);
+    defer allocator.free(buf);
+    for (lengths, 0..) |len, b| {
+        for (0..max_len) |t| {
+            buf[b * max_len + t] = if (t < len) 0 else -std.math.inf(f32);
+        }
+    }
+    const shape = [_]c_int{ @intCast(lengths.len), 1, 1, @intCast(max_len) };
+    const f32_mask = mlx.mlx_array_new_data(buf.ptr, &shape, 4, .float32);
+    defer _ = mlx.mlx_array_free(f32_mask);
+    var mask = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_astype(&mask, f32_mask, .bfloat16, s));
+    return mask;
+}
+
+/// Mean-pool `hidden` [B, T, H] over each row's first `lengths[b]` positions
+/// and L2-normalize. Returns B owned rows of H f32 each (plus the outer
+/// slice); caller frees all.
+pub fn maskedMeanPoolNormalize(allocator: std.mem.Allocator, hidden: mlx.mlx_array, lengths: []const usize, s: mlx.mlx_stream) ![][]f32 {
+    const shape = mlx.getShape(hidden);
+    const batch: usize = @intCast(shape[0]);
+    const seq_len: usize = @intCast(shape[1]);
+    const dim: usize = @intCast(shape[2]);
+
+    // Pool weights [B, T, 1]: 1/len over real positions, 0 over padding — a
+    // weighted sum along T is then exactly the masked mean. f32 weights also
+    // promote a bf16 hidden so the final data extraction is float32-safe.
+    const wbuf = try allocator.alloc(f32, batch * seq_len);
+    defer allocator.free(wbuf);
+    for (lengths, 0..) |len, b| {
+        const denom: f32 = @floatFromInt(@max(len, 1));
+        for (0..seq_len) |t| {
+            wbuf[b * seq_len + t] = if (t < len) 1.0 / denom else 0.0;
+        }
+    }
+    const wshape = [_]c_int{ shape[0], shape[1], 1 };
+    const weights = mlx.mlx_array_new_data(wbuf.ptr, &wshape, 3, .float32);
+    defer _ = mlx.mlx_array_free(weights);
+
+    var weighted = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(weighted);
+    try mlx.check(mlx.mlx_multiply(&weighted, hidden, weights, s));
+
     var pooled = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(pooled);
-    try mlx.check(mlx.mlx_mean_axis(&pooled, hidden, 1, false, s));
+    try mlx.check(mlx.mlx_sum_axis(&pooled, weighted, 1, false, s)); // [B, H]
 
-    // L2 normalize: pooled / sqrt(sum(pooled^2))
+    // L2 normalize rows: pooled / max(sqrt(sum(pooled^2)), eps).
     var squared = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(squared);
     try mlx.check(mlx.mlx_multiply(&squared, pooled, pooled, s));
@@ -3707,7 +3778,6 @@ pub fn computeEmbedding(
     defer _ = mlx.mlx_array_free(norm);
     try mlx.check(mlx.mlx_sqrt(&norm, sum_sq, s));
 
-    // Add epsilon to avoid division by zero
     const eps = mlx.mlx_array_new_float(1e-12);
     defer _ = mlx.mlx_array_free(eps);
     var norm_safe = mlx.mlx_array_new();
@@ -3718,15 +3788,68 @@ pub fn computeEmbedding(
     defer _ = mlx.mlx_array_free(normalized);
     try mlx.check(mlx.mlx_divide(&normalized, pooled, norm_safe, s));
 
-    // Eval and extract float data
     try mlx.check(mlx.mlx_array_eval(normalized));
-    const n_shape = mlx.getShape(normalized);
-    const dim: usize = @intCast(n_shape[n_shape.len - 1]);
     const data_ptr = mlx.mlx_array_data_float32(normalized) orelse return error.MlxError;
 
-    const result = try allocator.alloc(f32, dim);
-    @memcpy(result, data_ptr[0..dim]);
-    return result;
+    const rows = try allocator.alloc([]f32, batch);
+    var done: usize = 0;
+    errdefer {
+        for (rows[0..done]) |r| allocator.free(r);
+        allocator.free(rows);
+    }
+    for (rows, 0..) |*row, b| {
+        row.* = try allocator.alloc(f32, dim);
+        @memcpy(row.*, data_ptr[b * dim .. (b + 1) * dim]);
+        done += 1;
+    }
+    return rows;
+}
+
+/// Compute embeddings for many token sequences in GPU batches: each chunk of
+/// up to `EMBED_MAX_BATCH` sequences is padded to its own max length,
+/// forwarded ONCE through the encoder with a key-padding mask,
+/// masked-mean-pooled, and L2-normalized. Input order preserved. Caller
+/// frees every returned row and the outer slice.
+pub fn computeEmbeddingsBatch(
+    allocator: std.mem.Allocator,
+    xfm: *Transformer,
+    seqs: []const []const u32,
+) ![][]f32 {
+    const results = try allocator.alloc([]f32, seqs.len);
+    var filled: usize = 0;
+    errdefer {
+        for (results[0..filled]) |r| allocator.free(r);
+        allocator.free(results);
+    }
+    var start: usize = 0;
+    while (start < seqs.len) {
+        const sub = seqs[start..@min(start + EMBED_MAX_BATCH, seqs.len)];
+        var pb = try buildPaddedBatch(allocator, sub);
+        defer pb.deinit(allocator);
+
+        const shape = [_]c_int{ @intCast(sub.len), @intCast(pb.max_len) };
+        const input = mlx.mlx_array_new_data(pb.ids.ptr, &shape, 2, .int32);
+        defer _ = mlx.mlx_array_free(input);
+
+        // A single sequence has no padding, so it needs no mask.
+        var mask: ?mlx.mlx_array = null;
+        defer if (mask) |m| {
+            _ = mlx.mlx_array_free(m);
+        };
+        if (sub.len > 1) mask = try buildKeyPadMask(allocator, pb.lengths, pb.max_len, xfm.s);
+
+        const hidden = try xfm.forwardEmbeddingMasked(input, mask);
+        defer _ = mlx.mlx_array_free(hidden);
+
+        const rows = try maskedMeanPoolNormalize(allocator, hidden, pb.lengths, xfm.s);
+        defer allocator.free(rows);
+        for (rows, 0..) |r, i| {
+            results[start + i] = r;
+            filled += 1;
+        }
+        start += sub.len;
+    }
+    return results;
 }
 
 const SampleResult = struct {
@@ -4714,6 +4837,67 @@ test "mtpDepthDecision: confidence gates on disable, promote, cooldown" {
     try testing.expectEqual(@as(u32, 1), Generator.mtpDepthDecision(1, 3, 0.95, 8, true));
     // Demote reacts on a small sample, even during cooldown.
     try testing.expectEqual(@as(u32, 1), Generator.mtpDepthDecision(2, 3, 0.30, 5, true));
+}
+
+test "buildPaddedBatch pads to max length with zeros and records lengths" {
+    const seqs = [_][]const u32{
+        &[_]u32{ 101, 7592, 102 },
+        &[_]u32{ 101, 102 },
+    };
+    var pb = try buildPaddedBatch(testing.allocator, &seqs);
+    defer pb.deinit(testing.allocator);
+    try testing.expectEqual(@as(usize, 3), pb.max_len);
+    try testing.expectEqual(@as(usize, 2), pb.lengths.len);
+    try testing.expectEqual(@as(usize, 3), pb.lengths[0]);
+    try testing.expectEqual(@as(usize, 2), pb.lengths[1]);
+    const expected = [_]i32{ 101, 7592, 102, 101, 102, 0 };
+    try testing.expectEqualSlices(i32, &expected, pb.ids);
+}
+
+test "buildKeyPadMask is additive zero on real keys, -inf on padding" {
+    const s = mlx.gpuStream();
+    const lengths = [_]usize{ 3, 1 };
+    const mask = try buildKeyPadMask(testing.allocator, &lengths, 3, s);
+    defer _ = mlx.mlx_array_free(mask);
+    try testing.expectEqualSlices(c_int, &[_]c_int{ 2, 1, 1, 3 }, mlx.getShape(mask));
+    var f32_mask = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(f32_mask);
+    try mlx.check(mlx.mlx_astype(&f32_mask, mask, .float32, s));
+    try mlx.check(mlx.mlx_array_eval(f32_mask));
+    const data = mlx.mlx_array_data_float32(f32_mask).?;
+    // Batch row 0: all three keys real.
+    try testing.expectEqual(@as(f32, 0), data[0]);
+    try testing.expectEqual(@as(f32, 0), data[1]);
+    try testing.expectEqual(@as(f32, 0), data[2]);
+    // Batch row 1: one real key, two padded.
+    try testing.expectEqual(@as(f32, 0), data[3]);
+    try testing.expect(std.math.isInf(data[4]) and data[4] < 0);
+    try testing.expect(std.math.isInf(data[5]) and data[5] < 0);
+}
+
+test "maskedMeanPoolNormalize excludes padded positions and unit-normalizes" {
+    const s = mlx.gpuStream();
+    // hidden [2, 3, 2]; row 0 has 2 real positions (pad slot holds garbage
+    // that must not leak into the pool), row 1 has 3.
+    const data = [_]f32{
+        1, 0, 3, 4, 100, 100,
+        0, 2, 0, 4, 0,   6,
+    };
+    const shape = [_]c_int{ 2, 3, 2 };
+    const hidden = mlx.mlx_array_new_data(&data, &shape, 3, .float32);
+    defer _ = mlx.mlx_array_free(hidden);
+    const lengths = [_]usize{ 2, 3 };
+    const rows = try maskedMeanPoolNormalize(testing.allocator, hidden, &lengths, s);
+    defer {
+        for (rows) |r| testing.allocator.free(r);
+        testing.allocator.free(rows);
+    }
+    // Row 0: mean of (1,0),(3,4) = (2,2) → L2-normalized (1/√2, 1/√2).
+    try testing.expectApproxEqAbs(@as(f32, 0.70710678), rows[0][0], 1e-4);
+    try testing.expectApproxEqAbs(@as(f32, 0.70710678), rows[0][1], 1e-4);
+    // Row 1: mean of (0,2),(0,4),(0,6) = (0,4) → normalized (0, 1).
+    try testing.expectApproxEqAbs(@as(f32, 0.0), rows[1][0], 1e-4);
+    try testing.expectApproxEqAbs(@as(f32, 1.0), rows[1][1], 1e-4);
 }
 
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;

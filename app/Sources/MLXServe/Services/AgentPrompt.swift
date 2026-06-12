@@ -160,6 +160,42 @@ enum AgentPrompt {
     ]
     """#
 
+    /// Tool definition for the per-session document index (mini RAG). Kept out
+    /// of `toolDefinitionsJSON` because it is only advertised while a document
+    /// folder is attached to the chat — see `ChatTurnEngine.combinedToolsJSON`.
+    static let searchDocumentsToolJSON: String = #"""
+    [
+      {"type":"function","function":{"name":"searchDocuments","description":"Search the user's attached document folder for relevant excerpts. Returns the most relevant passages with their source filenames. Call this BEFORE answering any question about the attached documents. Use ONE short natural phrase per call (like a search box) — never a list of quoted keywords. Make several calls with different phrasings to cover different aspects. Example: {\"query\": \"customer frustrated about fees\"}","parameters":{"type":"object","properties":{"query":{"type":"string","description":"One short natural-language phrase describing what you are looking for. No boolean operators or quoted keyword lists."}},"required":["query"]}}}
+    ]
+    """#
+
+    /// Minimal system prompt for docs-only mode (plain chat + attached folder —
+    /// Agent and MCP toggles both off). Mirrors `mcpOnlySystemPrompt`: just
+    /// enough instruction to drive the one available tool well.
+    static func docsOnlySystemPrompt(folderName: String, fileCount: Int) -> String {
+        """
+        You are a helpful assistant. The user attached a folder of documents named "\(folderName)" (\(fileCount) files: chat transcripts, notes, PDFs, etc.). You cannot read whole files — your only access is the searchDocuments tool, which returns the passages most relevant to a query.
+
+        For any question about the documents:
+        1. Call searchDocuments with a focused query BEFORE answering. Never answer from memory alone.
+        2. If results look incomplete, search again with different wording (names, dates, synonyms) — up to a few attempts.
+        3. Answer from the retrieved excerpts and mention the source filenames you used.
+        4. If nothing relevant comes back, say the documents don't seem to cover it.
+
+        Questions unrelated to the documents can be answered normally without the tool.
+        """
+    }
+
+    /// Section appended to the agent/MCP system prompt while a folder is attached.
+    static func attachedDocumentsSection(folderName: String, fileCount: Int) -> String {
+        """
+
+
+        # Attached Documents
+        The user attached a document folder "\(folderName)" (\(fileCount) files) to this chat. Use the searchDocuments tool to retrieve relevant excerpts before answering questions about its contents — it searches by meaning and returns passages with source filenames. Try multiple phrasings if a search misses. Cite the source filenames in your answer.
+        """
+    }
+
     /// Lightweight system prompt for MCP-only mode (Agent toggle off, MCP toggle on).
     /// Tells the model what MCP servers are available without dragging in the heavy agent rules.
     static func mcpOnlySystemPrompt(toolListing: String) -> String {
@@ -179,13 +215,18 @@ enum AgentPrompt {
     }
 
     /// Parsed tool definitions for param validation and example extraction.
+    /// Includes the conditionally-advertised searchDocuments tool so its
+    /// required params validate the same way as the always-on agent tools.
     /// Key order is NOT preserved here (Swift dictionaries); use `toolDefinitionsJSON` for API requests.
     static let toolDefinitions: [[String: Any]] = {
-        guard let data = toolDefinitionsJSON.data(using: .utf8),
-              let arr = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
-            fatalError("Invalid toolDefinitionsJSON")
+        func parse(_ json: String) -> [[String: Any]] {
+            guard let data = json.data(using: .utf8),
+                  let arr = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else {
+                fatalError("Invalid tool definitions JSON")
+            }
+            return arr
         }
-        return arr
+        return parse(toolDefinitionsJSON) + parse(searchDocumentsToolJSON)
     }()
 }
 

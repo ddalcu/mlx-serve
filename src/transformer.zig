@@ -1318,6 +1318,10 @@ pub const ForwardCtx = struct {
     /// doesn't yet implement; .off has no quant triple to consume).
     /// Default false → unchanged dense SDPA path.
     kv_attn_fused: bool = false,
+    /// Batched-embeddings: additive key-padding mask [B, 1, 1, T] consumed
+    /// by the BERT encoder forward so padded positions never attend. Null
+    /// (the default) keeps the unmasked single-sequence path.
+    key_pad_mask: ?mlx.mlx_array = null,
 };
 
 // ── Transformer ──
@@ -3015,6 +3019,15 @@ pub const Transformer = struct {
         const word_emb = try self.dequantTake(self.emb_w, self.emb_s, self.emb_b, flat_ids);
         defer _ = mlx.mlx_array_free(word_emb);
 
+        // Reshape word embeddings to [B, S, H] up front: position / token-type
+        // embeddings are computed once per POSITION ([1, S, H]) and broadcast
+        // across the batch — adding them to the flat [B*S, H] form only
+        // happened to work at batch == 1.
+        const out_shape = [_]c_int{ batch, seq_len, @intCast(self.config.hidden_size) };
+        var word_3d = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(word_3d);
+        try mlx.check(mlx.mlx_reshape(&word_3d, word_emb, &out_shape, 3, self.s));
+
         // Position IDs: [0, 1, 2, ..., seq_len-1]
         var pos_ids = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(pos_ids);
@@ -3023,30 +3036,33 @@ pub const Transformer = struct {
         const pos_emb = try self.dequantTake(self.bert_pos_w, self.bert_pos_s, self.bert_pos_b, pos_ids);
         defer _ = mlx.mlx_array_free(pos_emb);
 
-        // Token type IDs: all zeros
+        // Token type IDs: all zeros (one row per position, broadcast over B)
+        const seq_shape = [_]c_int{seq_len};
         var toktype_ids = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(toktype_ids);
-        try mlx.check(mlx.mlx_zeros(&toktype_ids, &flat_shape, 1, .int32, self.s));
+        try mlx.check(mlx.mlx_zeros(&toktype_ids, &seq_shape, 1, .int32, self.s));
 
         const toktype_emb = try self.dequantTake(self.bert_toktype_w, self.bert_toktype_s, self.bert_toktype_b, toktype_ids);
         defer _ = mlx.mlx_array_free(toktype_emb);
 
-        // Sum: word + position + token_type
+        const bcast_shape = [_]c_int{ 1, seq_len, @intCast(self.config.hidden_size) };
+        var pos_3d = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(pos_3d);
+        try mlx.check(mlx.mlx_reshape(&pos_3d, pos_emb, &bcast_shape, 3, self.s));
+        var toktype_3d = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(toktype_3d);
+        try mlx.check(mlx.mlx_reshape(&toktype_3d, toktype_emb, &bcast_shape, 3, self.s));
+
+        // Sum: word + position + token_type → [B, S, H]
         var wp = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(wp);
-        try mlx.check(mlx.mlx_add(&wp, word_emb, pos_emb, self.s));
+        try mlx.check(mlx.mlx_add(&wp, word_3d, pos_3d, self.s));
         var sum = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(sum);
-        try mlx.check(mlx.mlx_add(&sum, wp, toktype_emb, self.s));
-
-        // Reshape to [B, S, H]
-        const out_shape = [_]c_int{ batch, seq_len, @intCast(self.config.hidden_size) };
-        var reshaped = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(reshaped);
-        try mlx.check(mlx.mlx_reshape(&reshaped, sum, &out_shape, 3, self.s));
+        try mlx.check(mlx.mlx_add(&sum, wp, toktype_3d, self.s));
 
         // LayerNorm
-        return self.layerNorm(reshaped, self.bert_emb_norm_w, self.bert_emb_norm_b);
+        return self.layerNorm(sum, self.bert_emb_norm_w, self.bert_emb_norm_b);
     }
 
     fn dequantTake(self: *const Transformer, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, ids: mlx.mlx_array) !mlx.mlx_array {
@@ -3086,7 +3102,9 @@ pub const Transformer = struct {
     }
 
     fn forwardBertWith(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_array) !mlx.mlx_array {
-        _ = ctx; // BERT is encoder-only, no per-request KV state
+        // BERT is encoder-only: no per-request KV state; ctx only carries the
+        // optional key-padding mask for padded [B, T] embedding batches.
+        const pad_mask = ctx.key_pad_mask;
         const bert_layers = self.bert_layers.?;
         const h_count = self.config.num_attention_heads;
         const head_dim = self.config.head_dim;
@@ -3129,7 +3147,8 @@ pub const Transformer = struct {
             defer _ = mlx.mlx_array_free(v_t);
             try mlx.check(mlx.mlx_transpose_axes(&v_t, v_r, &perm, 4, self.s));
 
-            // Bidirectional attention (no causal mask)
+            // Bidirectional attention (no causal mask); padded batches mask
+            // their pad KEYS so real positions never attend into padding.
             var attn = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(attn);
             try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(
@@ -3138,8 +3157,8 @@ pub const Transformer = struct {
                 k_t,
                 v_t,
                 scale,
-                "",
-                mlx.mlx_array_new(),
+                if (pad_mask != null) "array" else "",
+                if (pad_mask) |m| m else mlx.mlx_array_new(),
                 mlx.mlx_array_new(),
                 self.s,
             ));
@@ -4887,9 +4906,18 @@ pub const Transformer = struct {
     /// Forward pass that returns hidden states (after final_norm, before lm_head).
     /// Output shape: [1, seq_len, hidden_size]. Caller must free.
     pub fn forwardEmbedding(self: *Transformer, token_ids: mlx.mlx_array) !mlx.mlx_array {
+        return self.forwardEmbeddingMasked(token_ids, null);
+    }
+
+    /// Embedding forward for a padded [B, T] batch: `key_pad_mask` (additive,
+    /// [B, 1, 1, T]) keeps padded positions out of encoder attention. Null
+    /// mask == plain forwardEmbedding.
+    pub fn forwardEmbeddingMasked(self: *Transformer, token_ids: mlx.mlx_array, key_pad_mask: ?mlx.mlx_array) !mlx.mlx_array {
         self.embedding_mode = true;
         defer self.embedding_mode = false;
-        return self.forward(token_ids);
+        var ctx = self.defaultCtx();
+        ctx.key_pad_mask = key_pad_mask;
+        return self.forwardWith(&ctx, token_ids);
     }
 
     // ── Full Attention for MoE models (with optional output gate) ──

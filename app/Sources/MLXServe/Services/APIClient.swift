@@ -127,6 +127,11 @@ class APIClient {
         let caps = first["capabilities"] as? [String] ?? []
         let mods = first["input_modalities"] as? [String] ?? []
         let supportsAudio = caps.contains("audio") || mods.contains("audio")
+        // Encoder-only entries advertise "embeddings" even as unloaded stubs
+        // (the server peeks model_type at discovery); architecture is the
+        // belt-and-suspenders signal for loaded entries.
+        let supportsEmbeddings = caps.contains("embeddings")
+            || (meta["architecture"] as? String) == "bert"
         return ModelInfo(
             name: name,
             quantBits: meta["quantization_bits"] as? Int ?? 0,
@@ -138,6 +143,7 @@ class APIClient {
             architecture: meta["architecture"] as? String ?? "",
             isMoE: meta["is_moe"] as? Bool ?? false,
             supportsAudio: supportsAudio,
+            supportsEmbeddings: supportsEmbeddings,
             drafterLoaded: meta["drafter_loaded"] as? Bool ?? false,
             drafterPath: meta["drafter_path"] as? String,
             loaded: topLoaded,
@@ -177,6 +183,33 @@ class APIClient {
             throw URLError(.cannotParseResponse)
         }
         return Self.parseModelInfo(modelObj)
+    }
+
+    /// POST /v1/embeddings — batch-embed `input` with an encoder-only model
+    /// (the server runs one padded masked GPU forward per 64-text chunk).
+    /// Returns one vector per input, in input order.
+    func embeddings(port: UInt16, model: String, input: [String]) async throws -> [[Double]] {
+        let url = URL(string: "http://127.0.0.1:\(port)/v1/embeddings")!
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        // First call may cold-load the encoder model (seconds, not minutes).
+        request.timeoutInterval = 120
+        request.httpBody = try JSONSerialization.data(withJSONObject: ["model": model, "input": input])
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+            let code = (response as? HTTPURLResponse)?.statusCode ?? -1
+            let snippet = String(data: data, encoding: .utf8)?.prefix(300) ?? ""
+            throw APIError.badStatus(code: code, detail: String(snippet))
+        }
+        guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let rows = json["data"] as? [[String: Any]] else {
+            throw URLError(.cannotParseResponse)
+        }
+        let ordered = rows.sorted { ($0["index"] as? Int ?? 0) < ($1["index"] as? Int ?? 0) }
+        return ordered.compactMap { row in
+            (row["embedding"] as? [Any])?.compactMap { ($0 as? NSNumber)?.doubleValue }
+        }
     }
 
     func fetchProps(port: UInt16) async throws -> MemoryInfo? {

@@ -55,6 +55,10 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
         var enableThinking: Bool
         var voiceStyle: Bool
         var workingDirectory: String?
+        /// Per-session document index (mini RAG). Non-nil while the user has a
+        /// folder attached — advertises the searchDocuments tool and, with both
+        /// Agent and MCP off, routes the turn through the loop in docs-only mode.
+        var documentIndex: DocumentIndex? = nil
     }
 
     // MARK: - Convenience accessors
@@ -104,7 +108,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
 
         activeTurnSessionId = sessionId
 
-        if config.agentMode || config.mcpMode {
+        if config.agentMode || config.mcpMode || config.documentIndex != nil {
             runAgentTurn(sessionId: sessionId, text: text, images: images, audio: audio,
                          config: config, approval: approval)
         } else {
@@ -327,9 +331,21 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                 if !mcpListing.isEmpty {
                     systemPrompt += "\n\n# MCP Tools\nIn addition to the built-in tools above, the user has connected these MCP servers. Their tools are namespaced as `<server>__<tool>`:\n\n\(mcpListing)"
                 }
-            } else {
+            } else if config.mcpMode {
                 // MCP-only mode: minimal system prompt focused on MCP tool use, no shell/file rules.
                 systemPrompt = AgentPrompt.mcpOnlySystemPrompt(toolListing: mcpListing)
+            } else {
+                // Docs-only mode: plain chat with a document folder attached.
+                let index = config.documentIndex
+                systemPrompt = AgentPrompt.docsOnlySystemPrompt(
+                    folderName: index?.folderName ?? "documents",
+                    fileCount: indexedFileCount(index))
+            }
+            // Attached-docs section for the modes whose base prompt doesn't
+            // already explain the searchDocuments tool.
+            if let index = config.documentIndex, config.agentMode || config.mcpMode {
+                systemPrompt += AgentPrompt.attachedDocumentsSection(
+                    folderName: index.folderName, fileCount: indexedFileCount(index))
             }
             // Ground every agent turn in the wall clock so "what time/date is it"
             // is answered from reality, not a hallucinated guess (and so recency
@@ -360,7 +376,8 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
             var maxTokensHit = false
             let combinedToolsJSON = Self.combinedToolsJSON(
                 agentMode: config.agentMode,
-                mcpToolsJSON: mcpToolsJSON
+                mcpToolsJSON: mcpToolsJSON,
+                docsToolJSON: config.documentIndex != nil ? AgentPrompt.searchDocumentsToolJSON : nil
             )
             let stream = api.streamChat(
                 port: server.port,
@@ -592,7 +609,8 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                     tc, workingDirectory: &workingDirectory,
                     repetition: repetition, iteration: iteration,
                     agentMemory: appState.agentMemory,
-                    mcpRouter: mcpManager
+                    mcpRouter: mcpManager,
+                    documentIndex: config.documentIndex
                 )
                 roundOutputs.append(result.output)
 
@@ -645,26 +663,32 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
 
     // MARK: - Tool JSON + multimodal content (relocated from ChatDetailView)
 
-    /// Build the JSON tools array sent to the model. Concatenates agent tools (when agent mode is on) and
-    /// MCP tools (when MCP mode is on). Returns nil when no tools should be advertised.
+    /// Build the JSON tools array sent to the model. Concatenates agent tools (when agent mode is on),
+    /// MCP tools (when MCP mode is on), and the searchDocuments tool (when a folder is attached).
+    /// Returns nil when no tools should be advertised.
     /// `nonisolated` so it stays a pure helper callable off the main actor (unit tests).
-    nonisolated static func combinedToolsJSON(agentMode: Bool, mcpToolsJSON: String?) -> String? {
-        let agent = agentMode ? AgentPrompt.toolDefinitionsJSON : nil
-        switch (agent, mcpToolsJSON) {
-        case (nil, nil): return nil
-        case (let a?, nil): return a
-        case (nil, let m?): return m
-        case (let a?, let m?):
-            // Strip outer brackets and re-wrap. Both inputs are guaranteed to be JSON arrays.
-            let aInner = a.trimmingCharacters(in: .whitespacesAndNewlines)
-                .trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
-            let mInner = m.trimmingCharacters(in: .whitespacesAndNewlines)
-                .trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
-            let aTrimmed = aInner.trimmingCharacters(in: .whitespacesAndNewlines)
-            let mTrimmed = mInner.trimmingCharacters(in: .whitespacesAndNewlines)
-            if aTrimmed.isEmpty { return "[\(mTrimmed)]" }
-            if mTrimmed.isEmpty { return "[\(aTrimmed)]" }
-            return "[\(aTrimmed),\(mTrimmed)]"
+    nonisolated static func combinedToolsJSON(agentMode: Bool, mcpToolsJSON: String?,
+                                              docsToolJSON: String? = nil) -> String? {
+        // Strip each array's outer brackets, drop empties, re-wrap as one array.
+        let parts = [agentMode ? AgentPrompt.toolDefinitionsJSON : nil, mcpToolsJSON, docsToolJSON]
+            .compactMap { $0 }
+            .map {
+                $0.trimmingCharacters(in: .whitespacesAndNewlines)
+                    .trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+            .filter { !$0.isEmpty }
+        guard !parts.isEmpty else { return nil }
+        return "[\(parts.joined(separator: ","))]"
+    }
+
+    /// File count for prompt text — falls back to indexing-time totals so the
+    /// prompt is sensible even if a turn races the tail of indexing.
+    private func indexedFileCount(_ index: DocumentIndex?) -> Int {
+        switch index?.state {
+        case .ready(let files, _): return files
+        case .indexing(_, let total): return total
+        case .failed, nil: return 0
         }
     }
 

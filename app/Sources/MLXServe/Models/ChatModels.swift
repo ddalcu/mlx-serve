@@ -187,6 +187,10 @@ struct ModelInfo {
     /// unified). Gates the mic button + audio-file attachment in chat — other
     /// models silently ignore audio, so we only surface it where it works.
     var supportsAudio: Bool = false
+    /// True when the model advertises the `embeddings` capability (encoder-
+    /// only BERT entries, loaded or stub). DocumentIndex uses this to pick a
+    /// GPU embedder for folder indexing.
+    var supportsEmbeddings: Bool = false
     /// True when the running server was launched with `--drafter <dir>` and
     /// the drafter+target pair validated. Drives the green status pill.
     var drafterLoaded: Bool = false

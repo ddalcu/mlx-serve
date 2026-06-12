@@ -396,8 +396,13 @@ fn renderChatTemplate(
         return try collapseDoubledThinkTags(allocator, std.mem.span(ptr));
     }
 
+    // WARN, not debug: a failed render silently swaps the prompt into
+    // fallbackFormatChat's generic format — for families whose stop/turn
+    // tokens differ (Gemma 4's <|turn> vs the fallback's <start_of_turn>)
+    // that means degenerate generation, so the downgrade must be visible
+    // at the default log level.
     if (jinja_c.jinja_last_error()) |e| {
-        log.debug("  jinja error: {s}, using fallback\n", .{std.mem.span(e)});
+        log.warn("jinja render failed ({s}), falling back to generic chat format\n", .{std.mem.span(e)});
     }
     return fallbackFormatChat(allocator, messages, chat_config, tools_json, tool_choice_instruction, enable_thinking);
 }
@@ -546,7 +551,7 @@ fn synthesizeToolFallbackMessages(
     return out.toOwnedSlice(arena);
 }
 
-fn serializeMessagesJson(allocator: std.mem.Allocator, messages: []const Message) ![]const u8 {
+pub fn serializeMessagesJson(allocator: std.mem.Allocator, messages: []const Message) ![]const u8 {
     var buf = std.ArrayList(u8).empty;
     errdefer buf.deinit(allocator);
 
@@ -2603,6 +2608,15 @@ fn appendJsonString(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), s: []
             '\n' => try buf.appendSlice(allocator, "\\n"),
             '\r' => try buf.appendSlice(allocator, "\\r"),
             '\t' => try buf.appendSlice(allocator, "\\t"),
+            // Every other control char (e.g. ESC from ANSI codes in tool
+            // results) must be \u-escaped — nlohmann inside jinja_render_chat
+            // rejects raw control bytes, and the render failure silently
+            // downgrades the prompt to fallbackFormatChat.
+            0...8, 0x0B, 0x0C, 0x0E...0x1F => {
+                var esc: [6]u8 = undefined;
+                const n = std.fmt.bufPrint(&esc, "\\u{x:0>4}", .{c}) catch unreachable;
+                try buf.appendSlice(allocator, n);
+            },
             else => try buf.append(allocator, c),
         }
     }
@@ -3783,6 +3797,75 @@ test "appendJsonString empty string" {
 
     try appendJsonString(allocator, &buf, "");
     try testing.expectEqualStrings("\"\"", buf.items);
+}
+
+test "appendJsonString escapes ALL control characters (2026-06-11 ESC-byte regression)" {
+    // Live failure: a tool result carrying raw ANSI terminal codes (ESC = 0x1B
+    // from `\x1b[?25l`) passed through unescaped, nlohmann::json rejected the
+    // messages JSON inside jinja_render_chat, and the prompt silently fell
+    // back to the wrong-format fallbackFormatChat — gemma-4-31b then
+    // hallucinated entire conversations. JSON strings must escape EVERY
+    // control char < 0x20, not just \n \r \t.
+    const allocator = testing.allocator;
+
+    var input: [0x20]u8 = undefined;
+    for (&input, 0..) |*c, i| c.* = @intCast(i);
+
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(allocator);
+    try appendJsonString(allocator, &buf, &input);
+
+    // No raw control byte may survive in the serialized form.
+    for (buf.items) |c| {
+        try testing.expect(c >= 0x20);
+    }
+
+    // And the result must round-trip through a strict JSON parser byte-exact.
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, buf.items, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings(&input, parsed.value.string);
+}
+
+test "renderChatTemplate: tool result with raw ANSI escapes still renders via Jinja" {
+    // Regression for the 2026-06-11 pi/gemma-4-31b session: the third request
+    // was the first whose history held a tool result with a raw ESC byte (the
+    // interactive `npx sv create` output). The Jinja render failed on the
+    // unescaped messages JSON and silently downgraded to fallbackFormatChat's
+    // Gemma-2/3 `<start_of_turn>` text format — not special tokens for Gemma
+    // 4, so generation never stopped at turn end. The render must SUCCEED via
+    // the template (template marker present, fallback marker absent).
+    const allocator = testing.allocator;
+    const tpl =
+        \\{%- for message in messages -%}
+        \\{%- if message['role'] == 'tool' -%}<|tool_response>{{ message['content'] }}<turn|>
+        \\{%- else -%}<|turn>{{ message['role'] }}
+        \\{{ message['content'] }}{% if message.tool_calls %}{% for tc in message.tool_calls %}<|tool_call>{{ tc.function.name }}<tool_call|>{% endfor %}{% endif %}<turn|>
+        \\{%- endif -%}
+        \\{%- endfor -%}
+        \\{# tools referenced so no synthesis kicks in: {{ tools }} #}
+    ;
+    var config = ChatConfig{
+        .chat_template = tpl,
+        .bos_token = null,
+        .eos_token = null,
+        .add_bos_token = false,
+        .allocator = allocator,
+    };
+
+    const tc = [_]ToolCall{.{ .id = "tc_0", .name = "bash", .arguments = "{\"command\": \"npx sv create .\"}" }};
+    const messages = [_]Message{
+        .{ .role = "user", .content = "make me a sveltekit app" },
+        .{ .role = "assistant", .content = "", .tool_calls = &tc },
+        // Verbatim shape from the live failure: hide-cursor ANSI code + prompt UI.
+        .{ .role = "tool", .content = "\x1b[?25l\u{2502}\n\u{25c6}  Which template would you like?", .tool_call_id = "tc_0" },
+    };
+    const rendered = try renderChatTemplate(allocator, &messages, &config, "[]", null, false);
+    defer allocator.free(rendered);
+
+    try testing.expect(std.mem.indexOf(u8, rendered, "<|tool_response>") != null);
+    try testing.expect(std.mem.indexOf(u8, rendered, "Which template") != null);
+    // Fallback format must NOT have been used.
+    try testing.expect(std.mem.indexOf(u8, rendered, "<start_of_turn>") == null);
 }
 
 test "serializeExtraContext with thinking enabled" {

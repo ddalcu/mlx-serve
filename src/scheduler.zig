@@ -674,19 +674,20 @@ pub const VisionEncodeRequest = struct {
 };
 
 /// Phase: embedding work item for encoder-only models. Conn thread fills
-/// `token_ids` and calls `Scheduler.computeEmbedding`; the inference thread
-/// services the request via `generate.computeEmbedding(xfm, ...)` and writes
-/// the float vector into `result` (caller frees). Mirrors the
+/// `token_seqs` and calls `Scheduler.computeEmbeddings`; the inference
+/// thread services the request via `generate.computeEmbeddingsBatch` — one
+/// padded, key-masked GPU forward per EMBED_MAX_BATCH chunk — and writes
+/// the float vectors into `results` (caller frees). Mirrors the
 /// VisionEncodeRequest pattern.
 pub const EmbedRequest = struct {
     /// Plan 05 Phase D: target model whose `transformer` services this
     /// request. The conn thread holds a refcount for the duration.
     model: *model_registry_mod.LoadedModel,
-    /// Tokenized input. Borrowed; must outlive the call.
-    token_ids: []const u32,
-    /// Output: pooled L2-normalized embedding on success. Owned by
-    /// `allocator`; caller frees.
-    result: ?[]f32 = null,
+    /// Tokenized inputs, one slice per text. Borrowed; must outlive the call.
+    token_seqs: []const []const u32,
+    /// Output: one pooled L2-normalized embedding per input on success.
+    /// Rows + outer slice owned by `allocator`; caller frees.
+    results: ?[][]f32 = null,
     /// Output: error name on failure. Owned by `allocator`; caller frees.
     error_name: ?[]const u8 = null,
     done: bool = false,
@@ -1349,11 +1350,11 @@ pub const Scheduler = struct {
         self.registry.release(lm);
     }
 
-    /// Synchronously compute an embedding for `req.token_ids` using the
-    /// encoder forward pass on the inference thread. Same lifecycle as
-    /// `encodeVision`: post + block + return result. Caller frees the
-    /// returned `[]f32` (allocated with `req.allocator`).
-    pub fn computeEmbedding(self: *Scheduler, req: *EmbedRequest) ![]f32 {
+    /// Synchronously compute embeddings for `req.token_seqs` using the
+    /// batched encoder forward pass on the inference thread. Same lifecycle
+    /// as `encodeVision`: post + block + return results. Caller frees the
+    /// returned rows + outer slice (allocated with `req.allocator`).
+    pub fn computeEmbeddings(self: *Scheduler, req: *EmbedRequest) ![][]f32 {
         self.queue_mu.lockUncancelable(self.io);
         self.embed_queue.append(self.allocator, req) catch |err| {
             self.queue_mu.unlock(self.io);
@@ -1368,7 +1369,7 @@ pub const Scheduler = struct {
             req.done_cond.waitUncancelable(self.io, &req.done_mu);
         }
         if (req.error_name) |_| return error.EmbedFailed;
-        return req.result orelse error.EmbedFailed;
+        return req.results orelse error.EmbedFailed;
     }
 
     /// Phase A4: synchronously encode one or more images and return the
@@ -2303,8 +2304,8 @@ fn finishVisionRequest(sch: *Scheduler, req: *VisionEncodeRequest, err_name: []c
     req.done_cond.broadcast(sch.io);
 }
 
-/// Service one embedding request on the inference thread. Runs the
-/// encoder-only forward pass via `generate.computeEmbedding(xfm, ids)`,
+/// Service one embedding request on the inference thread. Runs the batched
+/// encoder-only forward pass via `generate.computeEmbeddingsBatch(xfm, ...)`,
 /// resets the global xfm.cache between requests (encoder-only does not
 /// share KV state across embeddings), and wakes the conn thread.
 fn runEmbedRequest(sch: *Scheduler, req: *EmbedRequest) void {
@@ -2313,13 +2314,13 @@ fn runEmbedRequest(sch: *Scheduler, req: *EmbedRequest) void {
         finishEmbedRequest(sch, req, @errorName(err));
         return;
     };
-    const result = generate_mod.computeEmbedding(req.allocator, xfm_ptr, req.token_ids) catch |err| {
+    const results = generate_mod.computeEmbeddingsBatch(req.allocator, xfm_ptr, req.token_seqs) catch |err| {
         finishEmbedRequest(sch, req, @errorName(err));
         return;
     };
     req.done_mu.lockUncancelable(sch.io);
     defer req.done_mu.unlock(sch.io);
-    req.result = result;
+    req.results = results;
     req.done = true;
     req.done_cond.broadcast(sch.io);
 }

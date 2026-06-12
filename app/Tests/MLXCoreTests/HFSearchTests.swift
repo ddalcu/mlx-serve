@@ -515,13 +515,13 @@ final class HFFallbackFetchGateTests: XCTestCase {
 
 // MARK: - HFModel non-affine quantization gate
 //
-// MXFP (OCP microscaling) and NVFP (NVIDIA FP4) are non-affine weight layouts
-// the MLX safetensors loader can't decode — the Zig server's discovery gate
-// already skips them (model_discovery.peekConfig: quantization.mode != "affine").
-// Without a client-side gate the browser offered a "Download" that silently
-// never loads. These pin the reason surfaced in the row. GGUF repos are exempt:
-// llama.cpp loads mxfp4 (GPT-OSS) natively, and the server's quant gate is
-// MLX-only.
+// Since v26.6.10 (issue #24) the server LOADS nvfp4/mxfp4/mxfp8 safetensors
+// checkpoints (per-weight quant-mode resolution in transformer.zig), so the
+// Model Browser must offer them — the old client-side "Unsupported
+// quantization" gate mirrored a server discovery gate that no longer exists.
+// Only formats the server still rejects (model.zig parse: anything outside
+// affine/nvfp4/mxfp4/mxfp8, e.g. mxfp6) stay flagged. GGUF repos were always
+// exempt: llama.cpp loads mxfp4 (GPT-OSS) natively.
 
 final class HFModelQuantGateTests: XCTestCase {
     private func mlx(id: String, tags: [String]? = nil, pipeline: String? = "text-generation") -> HFModel {
@@ -529,15 +529,53 @@ final class HFModelQuantGateTests: XCTestCase {
                 tags: tags, safetensors: nil, pipelineTag: pipeline)
     }
 
-    func testNvfp4_flaggedUnsupportedQuant() {
-        let m = mlx(id: "mlx-community/Qwen3-30B-A3B-nvfp4", tags: ["mlx", "qwen3"])
-        XCTAssertEqual(m.unsupportedQuantization, "NVFP4")
-        XCTAssertEqual(m.incompatibleReason, "Unsupported quantization (NVFP4)")
+    func testEncoderEmbeddingRepoIsCompatibleAndSupported() {
+        // Encoder-only embedding repos (BERT family) are served via
+        // /v1/embeddings and power GPU folder indexing — the browser must
+        // offer them. Real shape of mlx-community/bge-small-en-v1.5-8bit:
+        // pipeline "feature-extraction", tags include "bert".
+        let m = HFModel(id: "mlx-community/bge-small-en-v1.5-8bit",
+                        downloads: 186, likes: 1, lastModified: nil,
+                        tags: ["sentence-transformers", "safetensors", "bert",
+                               "feature-extraction", "sentence-similarity", "mlx"],
+                        safetensors: nil, pipelineTag: "feature-extraction")
+        XCTAssertTrue(m.isCompatible, "feature-extraction pipeline must be browsable")
+        XCTAssertTrue(m.isSupportedArchitecture, "bert tag is a supported family")
+        XCTAssertNil(m.incompatibleReason)
+        // sentence-similarity is the other pipeline tag embedding repos use.
+        let m2 = HFModel(id: "mlx-community/all-MiniLM-L6-v2-8bit",
+                         downloads: 81, likes: 1, lastModified: nil,
+                         tags: ["bert", "mlx"], safetensors: nil,
+                         pipelineTag: "sentence-similarity")
+        XCTAssertTrue(m2.isCompatible)
+        XCTAssertTrue(m2.isSupportedArchitecture)
     }
 
-    func testMxfpVariants_flagged() {
-        XCTAssertEqual(mlx(id: "x/model-mxfp4").unsupportedQuantization, "MXFP4")
-        XCTAssertEqual(mlx(id: "x/model-MXFP8-it").unsupportedQuantization, "MXFP8")
+    func testLocalBertModelIsSupportedModelType() {
+        XCTAssertTrue(supportedModelTypes.contains("bert"),
+                      "local encoder checkpoints (config.json model_type=bert) must not be flagged unsupported")
+    }
+
+    func testNvfp4_servedSinceV26_6_10_notFlagged() {
+        let m = mlx(id: "mlx-community/Qwen3-30B-A3B-nvfp4", tags: ["mlx", "qwen3"])
+        XCTAssertNil(m.unsupportedQuantization)
+        XCTAssertNil(m.incompatibleReason)
+        XCTAssertEqual(m.quantization, "NVFP4")
+    }
+
+    func testMxfp4Mxfp8_servedSinceV26_6_10_notFlagged() {
+        XCTAssertNil(mlx(id: "x/model-mxfp4").unsupportedQuantization)
+        XCTAssertNil(mlx(id: "x/model-MXFP8-it").unsupportedQuantization)
+        XCTAssertEqual(mlx(id: "x/model-mxfp4").quantization, "MXFP4")
+        XCTAssertEqual(mlx(id: "x/model-MXFP8-it").quantization, "MXFP8")
+    }
+
+    func testMxfp6_stillUnsupported_flagged() {
+        // model.zig rejects quantization.mode outside {affine, nvfp4, mxfp4,
+        // mxfp8} — mxfp6 repos must keep the un-downloadable flag.
+        let m = mlx(id: "x/model-mxfp6")
+        XCTAssertEqual(m.unsupportedQuantization, "MXFP6")
+        XCTAssertEqual(m.incompatibleReason, "Unsupported quantization (MXFP6)")
     }
 
     func testAffineQuant_notFlagged() {
@@ -557,8 +595,8 @@ final class HFModelQuantGateTests: XCTestCase {
 
     func testArchitectureReasonTakesPrecedence() {
         // An unsupported architecture is the more fundamental blocker — it wins
-        // the surfaced reason even when the name also carries an nvfp4 marker.
-        let m = HFModel(id: "x/some-diffusion-nvfp4", downloads: 1, likes: 1, lastModified: nil,
+        // the surfaced reason even when the name also carries an mxfp6 marker.
+        let m = HFModel(id: "x/some-diffusion-mxfp6", downloads: 1, likes: 1, lastModified: nil,
                         tags: ["diffusers"], safetensors: nil, pipelineTag: nil)
         XCTAssertEqual(m.incompatibleReason, "Unsupported architecture")
     }
@@ -613,11 +651,18 @@ final class HFModelQuantizationLabelTests: XCTestCase {
         XCTAssertNil(m("mlx-community/Qwen3-30B-A3B").quantization)
     }
 
-    func testNonAffineFp_noBitBadge() {
-        // nvfp4 / mxfp4 surface via incompatibleReason, not as a misleading
-        // bit badge — the parser must leave them unlabeled.
-        XCTAssertNil(m("x/Qwen3-30B-nvfp4").quantization)
-        XCTAssertNil(m("x/model-mxfp4").quantization)
+    func testServedFpModes_badgeTheFormat() {
+        // nvfp4/mxfp4/mxfp8 are loadable since v26.6.10 — badge the format
+        // name, not a bare bit width (and not nothing, as pre-support).
+        XCTAssertEqual(m("x/Qwen3-30B-nvfp4").quantization, "NVFP4")
+        XCTAssertEqual(m("x/model-mxfp4").quantization, "MXFP4")
+        XCTAssertEqual(m("x/gemma-4-E4B-it-qat-nvfp4").quantization, "NVFP4")
+    }
+
+    func testUnloadableFpModes_noBadge() {
+        // mxfp6 stays outside the server's set — it surfaces via
+        // incompatibleReason, never as a quant badge.
+        XCTAssertNil(m("x/model-mxfp6").quantization)
     }
 
     func testGgufRepo_showsMulti() {
