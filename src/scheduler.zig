@@ -772,15 +772,13 @@ pub const LoadRequest = struct {
     llama_kv_type_k: i32 = 0,
     llama_kv_type_v: i32 = 0,
 
-    /// Optional victim to evict before the load. Already marked `.evicting`
-    /// with refcount == 0 by the conn thread under registry.mutex. The
-    /// inference thread calls `entry.unloadResident()` to free GPU memory
-    /// AND drops the resident-bytes accounting via `registry.accountEvictedLocked`,
-    /// then `registry.finalizeEvictionLocked`.
-    evict_entry: ?*LoadedModel = null,
-    /// Bytes accounted to the victim before eviction (so the inference
-    /// thread can subtract from `current_resident_bytes`).
-    evict_bytes: u64 = 0,
+    /// Victims to evict before the load (LRU-selected by the planner). Each is
+    /// already marked `.evicting` with refcount == 0 by the conn thread under
+    /// registry.mutex. The inference thread calls `unloadResident()` on each to
+    /// free GPU memory, drops its resident-bytes accounting via
+    /// `registry.accountEvictedLocked`, then `registry.finalizeEvictionLocked`.
+    /// Borrows the conn thread's stack buffer; valid until `done`.
+    evict_entries: []*LoadedModel = &.{},
 
     /// Output: error name on failure (owned by `allocator`; conn thread
     /// frees). Null on success.
@@ -1238,8 +1236,11 @@ pub const Scheduler = struct {
         var owned_active: bool = true;
         defer if (owned_active) freeCpuState(self.allocator, &owned);
 
-        var evict_entry: ?*LoadedModel = null;
-        var evict_bytes: u64 = 0;
+        // Victims selected by the eviction planner (multi-victim: one load may
+        // need to free several models to fit). Lives on this stack frame; the
+        // slice handed to the LoadRequest stays valid while we block on `done`.
+        var victims_buf: [16]*LoadedModel = undefined;
+        var n_victims: usize = 0;
 
         // ── Stage 1 (registry mutex): claim .loading, plan eviction.
         {
@@ -1281,26 +1282,25 @@ pub const Scheduler = struct {
                 break :blk base + base / 10;
             };
 
-            // Eviction loop: drop LRU victims until under both caps.
-            // Plan 05 limits to ONE victim per load for now (matches the
-            // "block-until-loaded" UX); multi-victim is a future enhancement.
-            const loaded_count = self.registry.countLoadedLocked();
-            const need_count_evict = loaded_count + 1 > self.registry.max_resident_models;
-            const need_mem_evict =
-                self.registry.max_resident_mem > 0 and
-                self.registry.current_resident_bytes + estimated > self.registry.max_resident_mem;
-            if (need_count_evict or need_mem_evict) {
-                evict_entry = self.registry.pickLruEvictable(entry.id);
-                if (evict_entry == null) {
-                    // Roll back .loading and return — caller surfaces 503.
-                    self.registry.markUnloadedLocked(entry);
-                    self.registry.mutex.unlock(self.io);
-                    return error.NotEnoughMemory;
-                }
-                evict_bytes = evict_entry.?.bytes_resident;
-                self.registry.markEvictingLocked(evict_entry.?);
-                self.registry.waitForRefcountZeroLocked(evict_entry.?);
-            }
+            // Reserve this load's estimate BEFORE planning eviction, so a
+            // concurrent loader sees the pending allocation in its own gate.
+            // Without this, two loads can both read a stale resident total
+            // (one's bytes not yet committed at markReady), both skip eviction,
+            // and oversubscribe GPU memory → Metal OOM → process crash.
+            self.registry.reserveLoadLocked(entry, estimated);
+
+            // Evict LRU victims until both caps hold for this reservation
+            // (multi-victim). On failure — every other resident model is pinned
+            // by an in-flight request — roll back and surface a 503 instead of
+            // loading anyway and crashing.
+            const n = self.registry.planEvictionsLocked(entry.id, &victims_buf) orelse {
+                self.registry.markUnloadedLocked(entry); // releases the reservation
+                self.registry.mutex.unlock(self.io);
+                return error.NotEnoughMemory;
+            };
+            n_victims = n;
+            // Drain readers on each victim before the inference thread frees it.
+            for (victims_buf[0..n_victims]) |v| self.registry.waitForRefcountZeroLocked(v);
             self.registry.mutex.unlock(self.io);
         }
 
@@ -1319,8 +1319,7 @@ pub const Scheduler = struct {
             .kv_quant_config = self.kv_quant_config,
             .prefix_cache_capacity = 1,
             .prefix_cache_mem_bytes = 0,
-            .evict_entry = evict_entry,
-            .evict_bytes = evict_bytes,
+            .evict_entries = victims_buf[0..n_victims],
             .allocator = self.allocator,
         };
 
@@ -2360,16 +2359,18 @@ fn finishEmbedRequest(sch: *Scheduler, req: *EmbedRequest, err_name: []const u8)
 /// thread wakes. On failure, mark `.error_state` so future ensureLoaded
 /// calls fail fast; the conn thread surfaces a 500.
 fn runLoadRequest(sch: *Scheduler, req: *LoadRequest) void {
-    // Step 1: evict victim if requested. unloadResident() drops
+    // Step 1: evict victims (if any) BEFORE the load, so peak GPU residency
+    // never holds the old + new model at once. unloadResident() drops
     // mlx_arrays — same thread-stream invariant as cleanup_queue drain.
-    if (req.evict_entry) |victim| {
+    for (req.evict_entries) |victim| {
+        const victim_bytes = victim.bytes_resident; // unloadResident zeroes it
         log.info("[registry] evicting model id={s} ({d:.2} GB resident)\n", .{
             victim.id,
-            @as(f64, @floatFromInt(victim.bytes_resident)) / 1_073_741_824.0,
+            @as(f64, @floatFromInt(victim_bytes)) / 1_073_741_824.0,
         });
         victim.unloadResident();
         sch.registry.mutex.lockUncancelable(sch.io);
-        sch.registry.accountEvictedLocked(req.evict_bytes);
+        sch.registry.accountEvictedLocked(victim_bytes);
         sch.registry.finalizeEvictionLocked(victim);
         sch.registry.mutex.unlock(sch.io);
     }
