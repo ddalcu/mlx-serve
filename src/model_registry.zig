@@ -205,6 +205,11 @@ pub const LoadedModel = struct {
     /// Resident GPU bytes for this entry (weights + vision + drafter),
     /// summed at load time. Zero for non-`.ready` entries.
     bytes_resident: u64,
+    /// Estimated bytes reserved against `ModelRegistry.reserved_bytes` while
+    /// this entry is mid-load (`.loading`). Lets concurrent loaders see this
+    /// pending allocation in the budget gate so two loads can't both pass and
+    /// oversubscribe GPU memory. Released (zeroed) at markReady/Error/Unloaded.
+    load_estimate: u64 = 0,
     state: LoadState,
     /// Allocator-owned error name when state == .error_state. Echoed in
     /// the `/v1/models` snapshot so clients can see why a load failed
@@ -421,6 +426,12 @@ pub const ModelRegistry = struct {
     /// Running sum of `bytes_resident` across `.ready` entries. Updated
     /// under `mutex` on every state transition.
     current_resident_bytes: u64,
+    /// Sum of `load_estimate` across entries that are mid-load (`.loading`).
+    /// Counted alongside `current_resident_bytes` in the eviction gate so an
+    /// in-flight load is visible to a concurrent loader — without this, two
+    /// loads can both read a stale (pre-commit) resident total, both skip
+    /// eviction, and oversubscribe GPU memory (→ Metal OOM crash).
+    reserved_bytes: u64,
     /// Monotonic counter feeding `LoadedModel.last_used_ns`. We avoid
     /// reading the wall clock under the mutex; ordering is all the LRU
     /// pick needs.
@@ -456,6 +467,7 @@ pub const ModelRegistry = struct {
             .mutex = .init,
             .state_cond = .init,
             .current_resident_bytes = 0,
+            .reserved_bytes = 0,
             .lru_clock = 0,
         };
 
@@ -676,6 +688,7 @@ pub const ModelRegistry = struct {
     /// fields should already be cleaned up (or never installed) before
     /// calling.
     pub fn markUnloadedLocked(self: *ModelRegistry, entry: *LoadedModel) void {
+        self.releaseReservationLocked(entry);
         entry.state = .unloaded;
         entry.bytes_resident = 0;
         if (entry.error_name) |old| self.allocator.free(old);
@@ -780,6 +793,7 @@ pub const ModelRegistry = struct {
     /// populated weights/transformer/etc on `entry`; this just updates
     /// the bookkeeping + state field.
     pub fn markReadyLocked(self: *ModelRegistry, entry: *LoadedModel, bytes_resident: u64) void {
+        self.releaseReservationLocked(entry); // pending estimate → actual residency
         entry.bytes_resident = bytes_resident;
         entry.state = .ready;
         entry.error_name = null;
@@ -789,10 +803,80 @@ pub const ModelRegistry = struct {
         self.state_cond.broadcast(self.io);
     }
 
+    /// Reserve `estimated` bytes against `reserved_bytes` for an entry that has
+    /// just claimed `.loading`. Counted in the eviction gate so concurrent
+    /// loads see this pending allocation. Released by markReady/Error/Unloaded.
+    /// Caller holds `mutex`.
+    pub fn reserveLoadLocked(self: *ModelRegistry, entry: *LoadedModel, estimated: u64) void {
+        // Release any stale prior reservation first (defensive; should be 0).
+        self.releaseReservationLocked(entry);
+        entry.load_estimate = estimated;
+        self.reserved_bytes += estimated;
+    }
+
+    /// Drop an entry's in-flight load reservation (no-op if it never reserved).
+    /// Caller holds `mutex`.
+    fn releaseReservationLocked(self: *ModelRegistry, entry: *LoadedModel) void {
+        if (entry.load_estimate == 0) return;
+        if (self.reserved_bytes >= entry.load_estimate) {
+            self.reserved_bytes -= entry.load_estimate;
+        } else {
+            self.reserved_bytes = 0;
+        }
+        entry.load_estimate = 0;
+    }
+
+    /// Undo a `markEvictingLocked` — return a victim that was selected for
+    /// eviction back to `.ready` (used when an eviction PLAN can't be fully
+    /// satisfied and must roll back). Caller holds `mutex`.
+    pub fn unmarkEvictingLocked(self: *ModelRegistry, entry: *LoadedModel) void {
+        std.debug.assert(entry.state == .evicting);
+        entry.state = .ready;
+        self.state_cond.broadcast(self.io);
+    }
+
+    /// Select LRU victims to evict so that, once `entry` (already `.loading`,
+    /// with its estimate reserved) becomes resident, both caps hold. Marks each
+    /// chosen victim `.evicting` and writes it into `out`; returns the count,
+    /// or null if the caps can't be met (no more evictable victims, or `out`
+    /// too small) — in which case any victims marked here are rolled back so
+    /// the registry is left untouched. Caller holds `mutex` and must drain each
+    /// returned victim's refcount, then hand them to the load request to free.
+    pub fn planEvictionsLocked(self: *ModelRegistry, exclude_id: []const u8, out: []*LoadedModel) ?usize {
+        var n: usize = 0;
+        var freed: u64 = 0;
+        while (true) {
+            // Resident-after-plan = current minus what these victims free, plus
+            // every in-flight reservation (including this load's own estimate).
+            const projected_mem = (self.current_resident_bytes -| freed) + self.reserved_bytes;
+            // Count: .ready+.evicting now, minus the victims we'll drop, plus
+            // this load (currently `.loading`, becomes resident).
+            const projected_count = self.countLoadedLocked() - @as(u32, @intCast(n)) + 1;
+            const mem_ok = self.max_resident_mem == 0 or projected_mem <= self.max_resident_mem;
+            const count_ok = projected_count <= self.max_resident_models;
+            if (mem_ok and count_ok) return n;
+
+            const victim = self.pickLruEvictable(exclude_id) orelse {
+                // Can't satisfy the caps — roll back every marking we made.
+                for (out[0..n]) |v| self.unmarkEvictingLocked(v);
+                return null;
+            };
+            if (n >= out.len) {
+                for (out[0..n]) |v| self.unmarkEvictingLocked(v);
+                return null;
+            }
+            self.markEvictingLocked(victim); // now `.evicting` → pickLru won't repick
+            freed += victim.bytes_resident;
+            out[n] = victim;
+            n += 1;
+        }
+    }
+
     /// Mark an entry as `.error_state` and store `error_name` (duped).
     /// Future `ensureLoaded` calls fail with `error.LoadFailed` until the
     /// entry is reset to `.unloaded` (Phase D may add a retry path).
     pub fn markErrorLocked(self: *ModelRegistry, entry: *LoadedModel, error_name: []const u8) void {
+        self.releaseReservationLocked(entry);
         if (entry.error_name) |old| self.allocator.free(old);
         entry.error_name = self.allocator.dupe(u8, error_name) catch null;
         entry.state = .error_state;
@@ -1079,4 +1163,111 @@ test "ModelRegistry: peek does not refcount" {
     try testing.expectEqual(lm, peeked);
     try testing.expectEqual(@as(u32, 0), lm.refcount.load(.acquire));
     try testing.expectEqual(@as(?*LoadedModel, null), reg.peek("nope"));
+}
+
+// ── Eviction planner + reservation accounting (oversubscription fix) ──
+//
+// These pin the invariant that prevented the Metal-OOM crash: a cold load
+// reserves its estimate so a concurrent load sees the pending allocation, and
+// the planner evicts enough LRU victims to fit (multi-victim) or fails cleanly
+// (→ 503) rather than loading anyway and oversubscribing GPU memory.
+
+/// Claim `.loading` + reserve `estimate` for a fresh stub, the way the
+/// scheduler's ensureLoaded slow path does. Returns the loading entry.
+fn beginLoad(reg: *ModelRegistry, id: []const u8, estimate: u64) !*LoadedModel {
+    const stub = try reg.registerStub(id, id, estimate);
+    reg.mutex.lockUncancelable(reg.io);
+    defer reg.mutex.unlock(reg.io);
+    try testing.expect(reg.tryBeginLoadLocked(stub));
+    reg.reserveLoadLocked(stub, estimate);
+    return stub;
+}
+
+test "planEvictions: evicts one LRU victim to fit the memory budget" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var reg = try ModelRegistry.init(testing.allocator, io, null, 10, 100, null);
+    defer reg.deinit();
+    _ = try makeReadyStub(reg, "a", 40); // oldest
+    _ = try makeReadyStub(reg, "b", 40);
+    try testing.expectEqual(@as(u64, 80), reg.current_resident_bytes);
+
+    const c = try beginLoad(reg, "c", 40); // 80 + 40 = 120 > 100 → must evict
+    try testing.expectEqual(@as(u64, 40), reg.reserved_bytes);
+
+    reg.mutex.lockUncancelable(io);
+    defer reg.mutex.unlock(io);
+    var buf: [16]*LoadedModel = undefined;
+    const n = reg.planEvictionsLocked(c.id, &buf).?;
+    try testing.expectEqual(@as(usize, 1), n);
+    try testing.expectEqualStrings("a", buf[0].id); // LRU victim
+    try testing.expectEqual(LoadState.evicting, buf[0].state);
+}
+
+test "planEvictions: multi-victim — evicts as many as needed to fit" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var reg = try ModelRegistry.init(testing.allocator, io, null, 10, 100, null);
+    defer reg.deinit();
+    _ = try makeReadyStub(reg, "a", 40);
+    _ = try makeReadyStub(reg, "b", 40);
+    _ = try makeReadyStub(reg, "c", 40); // current = 120 (budget shrank under us)
+
+    const d = try beginLoad(reg, "d", 40); // need to free 2×40 to fit 40 in 100
+    reg.mutex.lockUncancelable(io);
+    defer reg.mutex.unlock(io);
+    var buf: [16]*LoadedModel = undefined;
+    const n = reg.planEvictionsLocked(d.id, &buf).?;
+    try testing.expectEqual(@as(usize, 2), n); // a and b (the two oldest)
+}
+
+test "planEvictions: returns null and rolls back when every victim is pinned" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var reg = try ModelRegistry.init(testing.allocator, io, null, 10, 100, null);
+    defer reg.deinit();
+    const a = try makeReadyStub(reg, "a", 80);
+    _ = a.refcount.fetchAdd(1, .acq_rel); // pinned by an in-flight request
+
+    const b = try beginLoad(reg, "b", 80); // 80 + 80 = 160 > 100 → must evict a
+    reg.mutex.lockUncancelable(io);
+    var buf: [16]*LoadedModel = undefined;
+    const plan = reg.planEvictionsLocked(b.id, &buf);
+    try testing.expectEqual(@as(?usize, null), plan); // can't evict the pinned victim
+    try testing.expectEqual(LoadState.ready, a.state); // rolled back, not left .evicting
+    // Scheduler then rolls back the load → releases the reservation.
+    reg.markUnloadedLocked(b);
+    reg.mutex.unlock(io);
+    try testing.expectEqual(@as(u64, 0), reg.reserved_bytes);
+    a.refcount.store(0, .release);
+}
+
+test "reservation: concurrent in-flight load is visible in the budget gate" {
+    // The crash's core: load #2's gate must SEE load #1's pending bytes, even
+    // though #1 hasn't reached markReady. With both reserved, the gate trips.
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var reg = try ModelRegistry.init(testing.allocator, io, null, 10, 100, null);
+    defer reg.deinit();
+    _ = try beginLoad(reg, "a", 60); // in-flight, not yet ready: reserved=60
+    _ = try beginLoad(reg, "b", 60); // in-flight too: reserved=120
+    try testing.expectEqual(@as(u64, 120), reg.reserved_bytes);
+    try testing.expectEqual(@as(u64, 0), reg.current_resident_bytes);
+    // A third load sees reserved=120 (+its own) → over the 100 budget, and with
+    // no `.ready` victim to evict, the plan fails (→ 503) instead of loading.
+    const c = try beginLoad(reg, "c", 60);
+    reg.mutex.lockUncancelable(io);
+    defer reg.mutex.unlock(io);
+    var buf: [16]*LoadedModel = undefined;
+    try testing.expectEqual(@as(?usize, null), reg.planEvictionsLocked(c.id, &buf));
+}
+
+test "reservation: released back to zero on markReady / markUnloaded" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var reg = try ModelRegistry.init(testing.allocator, io, null, 10, 0, null);
+    defer reg.deinit();
+    const a = try beginLoad(reg, "a", 500);
+    try testing.expectEqual(@as(u64, 500), reg.reserved_bytes);
+    reg.mutex.lockUncancelable(io);
+    reg.markReadyLocked(a, 480); // actual differs from estimate
+    reg.mutex.unlock(io);
+    try testing.expectEqual(@as(u64, 0), reg.reserved_bytes); // reservation cleared
+    try testing.expectEqual(@as(u64, 480), reg.current_resident_bytes); // actual counted
+    try testing.expectEqual(@as(u64, 0), a.load_estimate);
 }
