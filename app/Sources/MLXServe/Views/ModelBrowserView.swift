@@ -206,6 +206,27 @@ struct ModelBrowserView: View {
         .onChange(of: showDownloadedOnly) { _, isLocal in
             if isLocal { appState.refreshModels() }
         }
+        // Live-refresh on-disk sizes while the Downloaded tab is open and a
+        // download is in flight, so completion + growing size show up without
+        // the user toggling the button. The task id flips when the tab closes
+        // or the active-download set changes, which cancels + re-evaluates the
+        // guard — so it self-terminates once everything finishes.
+        .task(id: "\(showDownloadedOnly)-\(activeDownloads.count)") {
+            guard Self.shouldLivePoll(downloadedTab: showDownloadedOnly,
+                                      hasActiveDownloads: !activeDownloads.isEmpty) else { return }
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                if Task.isCancelled { break }
+                appState.refreshModels()
+            }
+        }
+    }
+
+    /// Whether the Downloaded tab should live-refresh on-disk sizes: only when
+    /// the tab is showing AND a download is in flight. Pulled out so the polling
+    /// trigger is unit-testable without driving SwiftUI.
+    static func shouldLivePoll(downloadedTab: Bool, hasActiveDownloads: Bool) -> Bool {
+        downloadedTab && hasActiveDownloads
     }
 }
 
@@ -458,12 +479,23 @@ private struct ModelBrowserRow: View {
                 Text("Delete \(model.modelName)? This will remove all downloaded files.")
             }
         } else if let state, state.status == .downloading {
-            VStack(spacing: 1) {
-                ProgressView(value: state.fileProgress)
-                    .frame(width: 50)
-                Text(state.percentFormatted)
-                    .font(.system(size: 9).monospacedDigit())
-                    .foregroundStyle(.secondary)
+            HStack(spacing: 4) {
+                VStack(spacing: 1) {
+                    ProgressView(value: state.fileProgress)
+                        .frame(width: 50)
+                    Text(state.percentFormatted)
+                        .font(.system(size: 9).monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+                Button {
+                    downloads.cancel(model.id)
+                    appState.refreshModels()
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .help("Cancel download")
             }
         } else if let state, state.status == .completed {
             Button {
@@ -489,10 +521,7 @@ private struct ModelBrowserRow: View {
                 GgufDownloadMenu(repoId: model.id, label: "Retry")
             } else {
                 Button(downloads.hasPartialDownload(model.id) ? "Resume" : "Retry") {
-                    Task {
-                        await downloads.download(repoId: model.id)
-                        appState.refreshModels()
-                    }
+                    downloads.start(repoId: model.id) { appState.refreshModels() }
                 }
                 .font(.callout)
                 .controlSize(.small)
@@ -503,10 +532,7 @@ private struct ModelBrowserRow: View {
                 GgufDownloadMenu(repoId: model.id, label: "Download")
             } else {
                 Button(downloads.hasPartialDownload(model.id) ? "Resume" : "Download") {
-                    Task {
-                        await downloads.download(repoId: model.id)
-                        appState.refreshModels()
-                    }
+                    downloads.start(repoId: model.id) { appState.refreshModels() }
                 }
                 .font(.callout)
                 .controlSize(.small)
@@ -534,8 +560,7 @@ private struct GgufDownloadMenu: View {
             } else {
                 ForEach(quants, id: \.self) { file in
                     Button(DownloadManager.quantLabel(forFilename: file)) {
-                        Task {
-                            await downloads.downloadGguf(repoId: repoId, ggufFilename: file)
+                        downloads.startGguf(repoId: repoId, ggufFilename: file) {
                             appState.refreshModels()
                         }
                     }
@@ -583,15 +608,38 @@ private struct LocalModelRow: View {
                             .help("Speculative-decoding drafter — pairs with a Gemma 4 base model in Settings, not loadable on its own.")
                     }
                 }
-                // Only flag genuinely unsupported architectures. Drafters
-                // declare `gemma4_assistant` (not in supportedModelTypes) but
-                // are intentionally so — the badge above already tells the
-                // user what they're for.
-                if model.kind != .drafter, !model.isSupportedArchitecture {
-                    Text("Unsupported architecture (\(model.modelType))")
-                        .font(.system(size: 10))
-                        .foregroundStyle(.red.opacity(0.8))
+                // Metadata caption: params · quant · architecture · engine, so
+                // the row actually tells the user what the model is — previously
+                // it was just a name and a delete button.
+                HStack(spacing: 6) {
+                    Text(model.metadataSummary)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
                         .lineLimit(1)
+                        .truncationMode(.middle)
+                    // Capability icons mirror the search rows.
+                    if model.hasVision {
+                        Image(systemName: "eye")
+                            .font(.system(size: 9))
+                            .foregroundStyle(.secondary)
+                            .help("Vision (image input)")
+                    }
+                    if model.hasToolCalling {
+                        Image(systemName: "wrench")
+                            .font(.system(size: 9))
+                            .foregroundStyle(.secondary)
+                            .help("Tool calling")
+                    }
+                    // Only flag genuinely unsupported architectures. Drafters
+                    // declare `gemma4_assistant` (not in supportedModelTypes)
+                    // intentionally — the badge above already explains them.
+                    if model.kind != .drafter, !model.isSupportedArchitecture {
+                        Text("Unsupported")
+                            .font(.system(size: 10).weight(.medium))
+                            .foregroundStyle(.red.opacity(0.8))
+                            .padding(.horizontal, 5).padding(.vertical, 1)
+                            .background(Color.red.opacity(0.12), in: Capsule())
+                    }
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)
@@ -614,7 +662,7 @@ private struct LocalModelRow: View {
             .alert("Delete Model", isPresented: $confirmDelete) {
                 Button("Cancel", role: .cancel) {}
                 Button("Delete", role: .destructive) {
-                    downloads.deleteModel(repoId: model.id)
+                    downloads.deleteModel(model)
                     appState.refreshModels()
                 }
             } message: {
@@ -661,20 +709,28 @@ private struct ActiveDownloadRow: View {
             .frame(maxWidth: .infinity, alignment: .leading)
 
             if state.status == .downloading {
-                VStack(alignment: .trailing, spacing: 1) {
-                    ProgressView(value: state.fileProgress)
-                        .frame(width: 80)
-                    Text("\(state.percentFormatted) \(state.speedFormatted)")
-                        .font(.system(size: 9).monospacedDigit())
-                        .foregroundStyle(.secondary)
+                HStack(spacing: 4) {
+                    VStack(alignment: .trailing, spacing: 1) {
+                        ProgressView(value: state.fileProgress)
+                            .frame(width: 80)
+                        Text("\(state.percentFormatted) \(state.speedFormatted)")
+                            .font(.system(size: 9).monospacedDigit())
+                            .foregroundStyle(.secondary)
+                    }
+                    Button {
+                        downloads.cancel(repoId)
+                        appState.refreshModels()
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Cancel download")
                 }
-                .frame(width: 90, alignment: .trailing)
+                .frame(width: 116, alignment: .trailing)
             } else if state.status == .failed {
                 Button(downloads.hasPartialDownload(repoId) ? "Resume" : "Retry") {
-                    Task {
-                        await downloads.download(repoId: repoId)
-                        appState.refreshModels()
-                    }
+                    downloads.start(repoId: repoId) { appState.refreshModels() }
                 }
                 .font(.callout)
                 .controlSize(.small)

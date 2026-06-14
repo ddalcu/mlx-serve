@@ -152,8 +152,13 @@ struct HFModel: Identifiable, Codable {
 
     /// Whether this model likely supports tool/function calling.
     /// Heuristic: instruction-tuned models from known families that implement tool call formats.
-    var hasToolCalling: Bool {
-        let lower = id.lowercased()
+    var hasToolCalling: Bool { Self.likelyToolCalling(forName: id) }
+
+    /// Name-based tool-calling heuristic, shared with `LocalModel` so the
+    /// Downloaded tab and search rows agree. Instruction-tuned (`-it`/`-instruct`
+    /// /`-chat`) checkpoints from families that implement a tool-call format.
+    static func likelyToolCalling(forName name: String) -> Bool {
+        let lower = name.lowercased()
         let isInstructTuned = lower.contains("-it") || lower.contains("-instruct") || lower.contains("-chat")
         guard isInstructTuned else { return false }
         let toolFamilies = ["gemma-4", "gemma-3", "qwen3", "qwen2.5", "llama-3", "mistral"]
@@ -248,14 +253,20 @@ struct HFModel: Identifiable, Codable {
     /// More reliable than safetensors.total for quantized models, where total
     /// counts packed tensor values rather than actual parameters.
     var modelSize: String {
-        let name = modelName
+        Self.paramSizeLabel(forName: modelName) ?? "\u{2014}"
+    }
+
+    /// Parameter-count token parsed from a model name (e.g. "31B", "82M",
+    /// "0.6B"), or nil when the name encodes none. Shared by `HFModel.modelSize`
+    /// and `LocalModel` so the Downloaded tab labels match the search rows.
+    static func paramSizeLabel(forName name: String) -> String? {
         // Match patterns like "31b", "E2B", "82M", "1.2B", "0.6b" preceded by - or _
         // Negative lookahead excludes "bit" (4bit, 8bit)
         let pattern = #"(?:^|[-_])[Ee]?(\d+(?:\.\d+)?[BbMm])(?![Ii])"#
         guard let regex = try? NSRegularExpression(pattern: pattern),
               let match = regex.firstMatch(in: name, range: NSRange(name.startIndex..., in: name)),
               let range = Range(match.range(at: 1), in: name) else {
-            return "\u{2014}"
+            return nil
         }
         return String(name[range]).uppercased()
     }
