@@ -16,6 +16,7 @@ const tokenize_cache_mod = @import("tokenize_cache.zig");
 const scheduler_mod = @import("scheduler.zig");
 const ds4_ffi = @import("ds4_ffi.zig");
 const model_registry_mod = @import("model_registry.zig");
+const model_discovery = @import("model_discovery.zig");
 const arch_llama = @import("arch/llama.zig");
 const stb = @cImport({ @cInclude("stb_image.h"); });
 const webp = @cImport({ @cInclude("webp/decode.h"); });
@@ -1343,21 +1344,76 @@ fn renderModelEntry(
         );
     } else &[_]u8{};
     defer if (err_part.len > 0) allocator.free(err_part);
-    // Arch-derived capabilities for stubs: encoder-only models advertise
-    // "embeddings" pre-load so clients (e.g. the app's document indexer)
-    // can pick a GPU embedder without forcing a cold load. Chat-derived
-    // caps stay load-gated (they need the chat template).
+    // Stub metadata sourced from config.json (+ chat-template presence) WITHOUT
+    // faulting in weights: dims, context window, MoE-ness, and capabilities.
+    // `/v1/models` isn't hot, so reading a small JSON per unloaded entry is fine.
+    const sm = model_discovery.readStubMeta(io, allocator, entry.path);
+
+    // Capabilities. Encoder-only models advertise "embeddings"; chat models get
+    // chat/tool_use/streaming/json_schema (gated on chat-template presence, the
+    // same rule the loaded path uses) plus "vision" when a vision config is
+    // present. Reasoning/audio stay load-gated (they need the live template /
+    // encoder), so an unloaded stub may under-report those two.
     const is_encoder_stub = std.mem.eql(u8, entry.arch_hint, "bert");
-    const caps_part: []const u8 = if (is_encoder_stub) ",\"capabilities\":[\"embeddings\"]" else "";
+    const caps_part: []const u8 = blk: {
+        if (is_encoder_stub) break :blk try allocator.dupe(u8, ",\"capabilities\":[\"embeddings\"]");
+        if (!sm.found or !(sm.has_chat or sm.has_vision)) break :blk try allocator.dupe(u8, "");
+        var b = std.ArrayList(u8).empty;
+        errdefer b.deinit(allocator);
+        try b.appendSlice(allocator, ",\"capabilities\":[");
+        var n: usize = 0;
+        const add = struct {
+            fn call(a: std.mem.Allocator, list: *std.ArrayList(u8), cnt: *usize, name: []const u8) !void {
+                if (cnt.* > 0) try list.append(a, ',');
+                try list.append(a, '"');
+                try list.appendSlice(a, name);
+                try list.append(a, '"');
+                cnt.* += 1;
+            }
+        }.call;
+        if (sm.has_chat) {
+            try add(allocator, &b, &n, "chat");
+            try add(allocator, &b, &n, "tool_use");
+            try add(allocator, &b, &n, "streaming");
+            try add(allocator, &b, &n, "json_schema");
+        }
+        if (sm.has_vision) try add(allocator, &b, &n, "vision");
+        try b.append(allocator, ']');
+        break :blk try b.toOwnedSlice(allocator);
+    };
+    defer allocator.free(caps_part);
+
+    const mods_part: []const u8 = if (sm.found and sm.has_vision)
+        ",\"input_modalities\":[\"text\",\"image\"]"
+    else if (sm.found and sm.has_chat)
+        ",\"input_modalities\":[\"text\"]"
+    else
+        "";
+
     const arch_part: []const u8 = if (entry.arch_hint.len > 0) blk: {
         // arch_hint comes from config.json's model_type via discovery — the
         // supported-type allowlist guarantees no JSON metacharacters.
         break :blk try std.fmt.allocPrint(allocator, "\"architecture\":\"{s}\",", .{entry.arch_hint});
     } else &[_]u8{};
     defer if (arch_part.len > 0) allocator.free(arch_part);
+
+    // Dimensions/context/quant/MoE — emitted only when config.json was readable.
+    const dims_part: []const u8 = if (sm.found) blk: {
+        break :blk try std.fmt.allocPrint(allocator, "\"vocab_size\":{d},\"hidden_size\":{d},\"num_layers\":{d},\"quantization\":\"{d}-bit\",\"context_length\":{d},\"model_max_tokens\":{d},\"is_moe\":{s},", .{
+            sm.vocab_size,
+            sm.hidden_size,
+            sm.num_hidden_layers,
+            sm.quant_bits,
+            sm.max_position_embeddings,
+            sm.max_position_embeddings,
+            if (sm.is_moe) "true" else "false",
+        });
+    } else &[_]u8{};
+    defer if (dims_part.len > 0) allocator.free(dims_part);
+
     return std.fmt.allocPrint(allocator,
-        \\{{"id":"{s}","object":"model","created":0,"owned_by":"mlx-serve","loaded":false,"state":"{s}","bytes_resident":0,"bytes_on_disk":{s}{s}{s},"meta":{{{s}"bytes_on_disk":{s}}}}}
-    , .{ entry.id, state_str, bytes_on_disk_str, err_part, caps_part, arch_part, bytes_on_disk_str });
+        \\{{"id":"{s}","object":"model","created":0,"owned_by":"mlx-serve","loaded":false,"state":"{s}","bytes_resident":0,"bytes_on_disk":{s}{s}{s}{s},"meta":{{{s}{s}"bytes_on_disk":{s}}}}}
+    , .{ entry.id, state_str, bytes_on_disk_str, err_part, caps_part, mods_part, arch_part, dims_part, bytes_on_disk_str });
 }
 
 fn handleModels(

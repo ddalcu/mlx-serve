@@ -326,6 +326,105 @@ pub fn probeModelDir(io: std.Io, allocator: std.mem.Allocator, abs_path: []const
     return .{ .model_type = model_type, .bytes_on_disk = if (bytes_ok) bytes else null };
 }
 
+/// Metadata an `unloaded` stub can advertise via `/v1/models` without faulting
+/// in weights — all sourced from `config.json` (+ chat-template presence). Lets
+/// clients see context window, dims, MoE-ness, and capabilities (tools/vision)
+/// before a cold load. `found=false` means config.json couldn't be read/parsed.
+pub const StubMeta = struct {
+    found: bool = false,
+    vocab_size: u32 = 0,
+    hidden_size: u32 = 0,
+    num_hidden_layers: u32 = 0,
+    max_position_embeddings: u32 = 0,
+    quant_bits: u32 = 0,
+    is_moe: bool = false,
+    has_vision: bool = false,
+    has_chat: bool = false,
+};
+
+fn jsonU32(obj: std.json.ObjectMap, key: []const u8) u32 {
+    if (obj.get(key)) |v| {
+        if (v == .integer and v.integer > 0) return @intCast(v.integer);
+    }
+    return 0;
+}
+
+/// Pure: extract `StubMeta` from raw config.json bytes. `has_chat_template` is
+/// supplied by the caller (the template lives outside config.json), and
+/// determines chat/tool capabilities — gated off for encoder-only (`bert`)
+/// archs. Mirrors the loaded-path capability rules in `server.renderModelEntry`
+/// (chat-template presence ⇒ chat/tool_use/streaming/json_schema). Returns
+/// `.found=false` on any parse failure.
+pub fn parseStubMeta(allocator: std.mem.Allocator, config_json: []const u8, has_chat_template: bool) StubMeta {
+    var meta: StubMeta = .{};
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, config_json, .{}) catch return meta;
+    defer parsed.deinit();
+    if (parsed.value != .object) return meta;
+    const root = parsed.value.object;
+    meta.found = true;
+    meta.vocab_size = jsonU32(root, "vocab_size");
+    meta.hidden_size = jsonU32(root, "hidden_size");
+    meta.num_hidden_layers = jsonU32(root, "num_hidden_layers");
+    meta.max_position_embeddings = jsonU32(root, "max_position_embeddings");
+    if (root.get("quantization")) |q| {
+        if (q == .object) meta.quant_bits = jsonU32(q.object, "bits");
+    }
+    meta.is_moe = jsonU32(root, "num_experts") > 0 or
+        jsonU32(root, "num_local_experts") > 0 or
+        jsonU32(root, "n_routed_experts") > 0;
+    const mt: []const u8 = if (root.get("model_type")) |v|
+        (if (v == .string) v.string else "")
+    else
+        "";
+    // Vision: a `vision_config` block on a non-`_text` arch (the `_text` guard
+    // skips text-only quantized checkpoints with a vestigial block).
+    meta.has_vision = root.get("vision_config") != null and !std.mem.endsWith(u8, mt, "_text");
+    const is_encoder = std.mem.eql(u8, mt, "bert");
+    meta.has_chat = has_chat_template and !is_encoder;
+    return meta;
+}
+
+/// Read `StubMeta` for the model directory at `abs_path` (config.json + a
+/// chat-template-presence check). Best-effort: any I/O / parse failure yields
+/// `.found=false`. Called per unloaded entry from `/v1/models` — cheap (small
+/// JSON files) and that endpoint isn't hot.
+pub fn readStubMeta(io: std.Io, allocator: std.mem.Allocator, abs_path: []const u8) StubMeta {
+    const trimmed = trimTrailingSlash(abs_path);
+    const base = std.fs.path.basename(trimmed);
+    const parent = std.fs.path.dirname(trimmed) orelse return .{};
+    if (base.len == 0 or parent.len == 0) return .{};
+    var parent_dir = std.Io.Dir.openDirAbsolute(io, parent, .{}) catch return .{};
+    defer parent_dir.close(io);
+    var dir = parent_dir.openDir(io, base, .{}) catch return .{};
+    defer dir.close(io);
+
+    var file = dir.openFile(io, "config.json", .{}) catch return .{};
+    defer file.close(io);
+    var rbuf: [4096]u8 = undefined;
+    var rs = file.reader(io, &rbuf);
+    const bytes = rs.interface.allocRemaining(allocator, .limited(4 * 1024 * 1024)) catch return .{};
+    defer allocator.free(bytes);
+
+    return parseStubMeta(allocator, bytes, hasChatTemplate(io, allocator, dir));
+}
+
+/// True if the model dir ships a chat template — a `chat_template.jinja` file,
+/// or a `tokenizer_config.json` that carries a `chat_template` key. Cheap proxy
+/// for "this is an instruct/chat model" used to gate chat/tool capabilities on
+/// unloaded stubs.
+fn hasChatTemplate(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir) bool {
+    if (dir.statFile(io, "chat_template.jinja", .{})) |st| {
+        if (st.kind == .file) return true;
+    } else |_| {}
+    var f = dir.openFile(io, "tokenizer_config.json", .{}) catch return false;
+    defer f.close(io);
+    var rbuf: [4096]u8 = undefined;
+    var rs = f.reader(io, &rbuf);
+    const bytes = rs.interface.allocRemaining(allocator, .limited(8 * 1024 * 1024)) catch return false;
+    defer allocator.free(bytes);
+    return std.mem.indexOf(u8, bytes, "\"chat_template\"") != null;
+}
+
 fn lessThanById(_: void, a: DiscoveredModel, b: DiscoveredModel) bool {
     return std.mem.lessThan(u8, a.id, b.id);
 }
@@ -407,4 +506,59 @@ test "isSupportedQuantMode accepts nvfp4 (issue #24), rejects unknown" {
     try testing.expect(isSupportedQuantMode("mxfp4"));
     try testing.expect(isSupportedQuantMode("mxfp8"));
     try testing.expect(!isSupportedQuantMode("fp99"));
+}
+
+test "parseStubMeta extracts dims/ctx/quant/MoE + chat/vision capabilities" {
+    const a = testing.allocator;
+    // MoE chat model (Qwen3-Coder-30B-A3B shape), chat template present.
+    {
+        const json =
+            \\{"model_type":"qwen3_moe","vocab_size":151936,"hidden_size":2048,
+            \\"num_hidden_layers":48,"max_position_embeddings":262144,
+            \\"num_experts":128,"num_experts_per_tok":8,"quantization":{"bits":8,"group_size":64}}
+        ;
+        const m = parseStubMeta(a, json, true);
+        try testing.expect(m.found);
+        try testing.expectEqual(@as(u32, 151936), m.vocab_size);
+        try testing.expectEqual(@as(u32, 2048), m.hidden_size);
+        try testing.expectEqual(@as(u32, 48), m.num_hidden_layers);
+        try testing.expectEqual(@as(u32, 262144), m.max_position_embeddings);
+        try testing.expectEqual(@as(u32, 8), m.quant_bits);
+        try testing.expect(m.is_moe);
+        try testing.expect(m.has_chat); // template present, not encoder
+        try testing.expect(!m.has_vision);
+    }
+    // Dense model, no template → no chat caps; no quant block → 0 bits.
+    {
+        const json =
+            \\{"model_type":"qwen2","hidden_size":5120,"num_attention_heads":40,
+            \\"max_position_embeddings":32768}
+        ;
+        const m = parseStubMeta(a, json, false);
+        try testing.expect(m.found);
+        try testing.expect(!m.is_moe);
+        try testing.expect(!m.has_chat);
+        try testing.expectEqual(@as(u32, 0), m.quant_bits);
+        try testing.expectEqual(@as(u32, 32768), m.max_position_embeddings);
+    }
+    // Vision: vision_config on a non-_text arch → has_vision.
+    {
+        const m = parseStubMeta(a, "{\"model_type\":\"gemma4\",\"vision_config\":{\"hidden_size\":1152}}", true);
+        try testing.expect(m.has_vision);
+    }
+    // …but a `_text` arch with a vestigial vision_config must NOT report vision.
+    {
+        const m = parseStubMeta(a, "{\"model_type\":\"qwen3_5_moe_text\",\"vision_config\":{}}", true);
+        try testing.expect(!m.has_vision);
+    }
+    // Encoder (bert): chat/tool caps suppressed even with a template present.
+    {
+        const m = parseStubMeta(a, "{\"model_type\":\"bert\",\"hidden_size\":384}", true);
+        try testing.expect(!m.has_chat);
+    }
+    // Malformed → found=false.
+    {
+        const m = parseStubMeta(a, "not json", true);
+        try testing.expect(!m.found);
+    }
 }
