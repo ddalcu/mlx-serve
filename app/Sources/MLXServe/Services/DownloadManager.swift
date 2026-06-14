@@ -738,12 +738,8 @@ class DownloadManager: ObservableObject {
 
         guard entries.contains(where: { $0.hasSuffix(".safetensors") && !$0.hasSuffix(".index.json") }) else { return nil }
 
-        var modelType = "unknown"
-        if let data = FileManager.default.contents(atPath: configPath),
-           let cfg = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-           let mt = cfg["model_type"] as? String {
-            modelType = mt
-        }
+        let meta = Self.parseConfigMetadata(atPath: configPath)
+        let modelType = meta.modelType
 
         let size = directorySize(resolved)
         // Drafter config dirs aren't loadable as a target — they pair with a
@@ -760,8 +756,48 @@ class DownloadManager: ObservableObject {
             sizeFormatted: MemoryInfo.format(Int64(size)),
             modelType: modelType,
             source: source,
-            kind: kind
+            kind: kind,
+            hasVision: meta.hasVision,
+            quantBits: meta.quantBits,
+            contextLength: meta.contextLength,
+            numExperts: meta.numExperts,
+            activeExperts: meta.activeExperts
         )
+    }
+
+    /// Metadata read from a model's `config.json` — the authoritative source for
+    /// quant, context window, MoE expert routing, and vision (the model name only
+    /// reliably carries the headline param count, which isn't a config field).
+    struct ConfigMetadata: Equatable {
+        var modelType = "unknown"
+        var hasVision = false
+        var quantBits: Int? = nil
+        var contextLength: Int? = nil
+        var numExperts: Int? = nil
+        var activeExperts: Int? = nil
+    }
+
+    /// Parse the subset of `config.json` the Downloaded tab surfaces. `nonisolated`
+    /// + static so it's unit-testable against a temp config without a real model.
+    /// Tolerant of missing keys — every field is optional and defaults sensibly.
+    nonisolated static func parseConfigMetadata(atPath configPath: String) -> ConfigMetadata {
+        var meta = ConfigMetadata()
+        guard let data = FileManager.default.contents(atPath: configPath),
+              let cfg = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return meta }
+        if let mt = cfg["model_type"] as? String { meta.modelType = mt }
+        // Vision: a `vision_config` block on a non-`_text` arch (the `_text`
+        // guard skips text-only quantized checkpoints with a vestigial block).
+        meta.hasVision = cfg["vision_config"] != nil && !meta.modelType.hasSuffix("_text")
+        // Quant: MLX writes `quantization`/`quantization_config` with `bits`.
+        if let q = (cfg["quantization"] ?? cfg["quantization_config"]) as? [String: Any] {
+            meta.quantBits = q["bits"] as? Int
+        }
+        meta.contextLength = cfg["max_position_embeddings"] as? Int
+        // MoE: total experts under one of several arch-specific keys; active
+        // experts per token under `num_experts_per_tok`.
+        meta.numExperts = (cfg["num_experts"] ?? cfg["num_local_experts"] ?? cfg["n_routed_experts"]) as? Int
+        meta.activeExperts = cfg["num_experts_per_tok"] as? Int
+        return meta
     }
 
     func discoverLocalModels() -> [LocalModel] {

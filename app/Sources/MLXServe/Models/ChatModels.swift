@@ -353,6 +353,17 @@ enum ModelEngine: String, Hashable {
         }
     }
 
+    /// Weight-format tag for metadata captions — the useful MLX-vs-GGUF
+    /// distinction, without the "MLX-Serve" app-name noise (`shortLabel` keeps
+    /// that for picker disambiguation).
+    var formatLabel: String {
+        switch self {
+        case .mlx: "MLX"
+        case .llamaCpp: "GGUF"
+        case .ds4: "GGUF·DS4"
+        }
+    }
+
     /// Human-readable engine name for the status menu.
     var displayName: String {
         switch self {
@@ -371,9 +382,78 @@ struct LocalModel: Identifiable, Hashable {
     let modelType: String
     let source: LocalModelSource
     let kind: ModelKind
+    // The fields below are read from `config.json` at discovery (the
+    // authoritative source); they default to nil/false for GGUF and any model
+    // whose config we didn't parse, in which case the accessors fall back to
+    // name-derived hints where possible.
+    /// `vision_config` present on a non-`_text` architecture.
+    var hasVision: Bool = false
+    /// Quantization bit-width from `config.json`'s `quantization.bits`.
+    var quantBits: Int? = nil
+    /// `max_position_embeddings`.
+    var contextLength: Int? = nil
+    /// Total MoE experts (`num_experts` / `num_local_experts` / `n_routed_experts`).
+    var numExperts: Int? = nil
+    /// Active MoE experts per token (`num_experts_per_tok`).
+    var activeExperts: Int? = nil
 
     var isSupportedArchitecture: Bool {
         supportedModelTypes.contains(modelType)
+    }
+
+    /// Likely tool/function-calling support (name heuristic, shared with the
+    /// search rows via `HFModel.likelyToolCalling`).
+    var hasToolCalling: Bool {
+        HFModel.likelyToolCalling(forName: name)
+    }
+
+    /// Quantization label. Prefers `config.json`'s `bits` (authoritative);
+    /// falls back to the name parser for GGUF / configs without a quant block.
+    var quantization: String? {
+        if let b = quantBits { return "\(b)-bit" }
+        return HFModel.quantizationLabel(forId: name)
+    }
+
+    /// Headline parameter count parsed from the name (e.g. "32B", "30B"). This
+    /// is the one figure NOT in config.json — it's marketing-rounded in the name
+    /// and only exactly recoverable by summing tensor shapes. nil when absent.
+    var paramSize: String? {
+        HFModel.paramSizeLabel(forName: name)
+    }
+
+    /// "8/128 experts" (active/total) when this is an MoE config, else nil.
+    var expertSummary: String? {
+        guard let total = numExperts, let active = activeExperts else { return nil }
+        return "\(active)/\(total) experts"
+    }
+
+    /// Context window as a compact label, e.g. 262144 → "256K ctx", 1048576 →
+    /// "1M ctx". nil when unknown.
+    var contextSummary: String? {
+        guard let n = contextLength else { return nil }
+        return Self.formatContext(n)
+    }
+
+    static func formatContext(_ n: Int) -> String {
+        if n >= 1024 * 1024, n % (1024 * 1024) == 0 { return "\(n / (1024 * 1024))M ctx" }
+        if n >= 1024 { return "\(n / 1024)K ctx" }
+        return "\(n) ctx"
+    }
+
+    /// One-line metadata caption for the Downloaded tab, e.g.
+    /// "30B · 8-bit · 8/128 experts · 256K ctx · qwen3_moe · MLX". Everything
+    /// except the headline param count is config-sourced; tokens the model
+    /// doesn't have are omitted. Capabilities (vision / tools) render as icons
+    /// in the row, not here.
+    var metadataSummary: String {
+        var tokens: [String] = []
+        if let p = paramSize { tokens.append(p) }
+        if let q = quantization { tokens.append(q) }
+        if let e = expertSummary { tokens.append(e) }
+        if let c = contextSummary { tokens.append(c) }
+        tokens.append(modelType)
+        tokens.append(engine.formatLabel)
+        return tokens.joined(separator: " · ")
     }
 
     /// Defaults to `.mlx` (MLX-Serve) whenever the engine can't be

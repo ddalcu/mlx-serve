@@ -608,15 +608,38 @@ private struct LocalModelRow: View {
                             .help("Speculative-decoding drafter — pairs with a Gemma 4 base model in Settings, not loadable on its own.")
                     }
                 }
-                // Only flag genuinely unsupported architectures. Drafters
-                // declare `gemma4_assistant` (not in supportedModelTypes) but
-                // are intentionally so — the badge above already tells the
-                // user what they're for.
-                if model.kind != .drafter, !model.isSupportedArchitecture {
-                    Text("Unsupported architecture (\(model.modelType))")
-                        .font(.system(size: 10))
-                        .foregroundStyle(.red.opacity(0.8))
+                // Metadata caption: params · quant · architecture · engine, so
+                // the row actually tells the user what the model is — previously
+                // it was just a name and a delete button.
+                HStack(spacing: 6) {
+                    Text(model.metadataSummary)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
                         .lineLimit(1)
+                        .truncationMode(.middle)
+                    // Capability icons mirror the search rows.
+                    if model.hasVision {
+                        Image(systemName: "eye")
+                            .font(.system(size: 9))
+                            .foregroundStyle(.secondary)
+                            .help("Vision (image input)")
+                    }
+                    if model.hasToolCalling {
+                        Image(systemName: "wrench")
+                            .font(.system(size: 9))
+                            .foregroundStyle(.secondary)
+                            .help("Tool calling")
+                    }
+                    // Only flag genuinely unsupported architectures. Drafters
+                    // declare `gemma4_assistant` (not in supportedModelTypes)
+                    // intentionally — the badge above already explains them.
+                    if model.kind != .drafter, !model.isSupportedArchitecture {
+                        Text("Unsupported")
+                            .font(.system(size: 10).weight(.medium))
+                            .foregroundStyle(.red.opacity(0.8))
+                            .padding(.horizontal, 5).padding(.vertical, 1)
+                            .background(Color.red.opacity(0.12), in: Capsule())
+                    }
                 }
             }
             .frame(maxWidth: .infinity, alignment: .leading)

@@ -390,6 +390,127 @@ final class DownloadManagerLayoutTests: XCTestCase {
         XCTAssertFalse(ModelBrowserView.shouldLivePoll(downloadedTab: false, hasActiveDownloads: false))
     }
 
+    // MARK: - LocalModel metadata caption
+    //
+    // The Downloaded tab used to render only a name + delete button. These pin
+    // the parsed metadata (params / quant / architecture / engine) that now
+    // makes each row actually informative.
+
+    private func localModel(
+        name: String, type: String, path: String,
+        vision: Bool = false, quantBits: Int? = nil, ctx: Int? = nil,
+        numExperts: Int? = nil, activeExperts: Int? = nil
+    ) -> LocalModel {
+        LocalModel(id: "mlxServe:\(name)", name: name, path: path,
+                   sizeFormatted: "10 GB", modelType: type, source: .mlxServe, kind: .base,
+                   hasVision: vision, quantBits: quantBits, contextLength: ctx,
+                   numExperts: numExperts, activeExperts: activeExperts)
+    }
+
+    // Captions below use the real config values dumped from the user's models:
+    // Qwen2.5-Coder-32B (qwen2, bits 8, ctx 32768, dense),
+    // Qwen3-Coder-30B-A3B (qwen3_moe, bits 8, ctx 262144, 128/8 experts),
+    // Qwen3-Coder-Next (qwen3_next, bits 4, ctx 262144, 512/10 experts).
+
+    func testMetadataSummaryDenseFromConfig() {
+        let m = localModel(name: "Qwen2.5-Coder-32B-Instruct-8bit", type: "qwen2",
+                           path: "/m/Qwen2.5-Coder-32B-Instruct-8bit",
+                           quantBits: 8, ctx: 32768)
+        XCTAssertEqual(m.paramSize, "32B")
+        XCTAssertNil(m.expertSummary, "dense model → no expert token")
+        // Format reads "MLX" (the weight format), not the "MLX-Serve" app name.
+        XCTAssertEqual(m.metadataSummary, "32B · 8-bit · 32K ctx · qwen2 · MLX")
+        XCTAssertTrue(m.hasToolCalling)
+        XCTAssertFalse(m.hasVision)
+    }
+
+    func testMetadataSummaryMoEShowsConfigExperts() {
+        let m = localModel(name: "Qwen3-Coder-30B-A3B-Instruct-8bit", type: "qwen3_moe",
+                           path: "/m/Qwen3-Coder-30B-A3B-Instruct-8bit",
+                           quantBits: 8, ctx: 262144, numExperts: 128, activeExperts: 8)
+        XCTAssertEqual(m.expertSummary, "8/128 experts")
+        XCTAssertEqual(m.metadataSummary, "30B · 8-bit · 8/128 experts · 256K ctx · qwen3_moe · MLX")
+    }
+
+    func testMetadataSummaryConfigQuantOverridesNameAndNoParamToken() {
+        // Name says nothing about params; config says bits 4. Caption must use
+        // the config bits and skip the missing param token.
+        let n = localModel(name: "Qwen3-Coder-Next-4bit", type: "qwen3_next",
+                           path: "/m/Qwen3-Coder-Next-4bit",
+                           quantBits: 4, ctx: 262144, numExperts: 512, activeExperts: 10)
+        XCTAssertNil(n.paramSize)
+        XCTAssertEqual(n.quantization, "4-bit")
+        XCTAssertEqual(n.metadataSummary, "4-bit · 10/512 experts · 256K ctx · qwen3_next · MLX")
+    }
+
+    func testMetadataSummaryGgufFallsBackToNameQuant() {
+        // GGUF has no config.json here → quant comes from the name, format = GGUF.
+        let g = LocalModel(id: "mlxServe:team/m", name: "Meta-Llama-3.1-8B-Instruct-Q4_K_M",
+                           path: "/m/team/m/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
+                           sizeFormatted: "5 GB", modelType: "gguf", source: .mlxServe, kind: .base)
+        XCTAssertEqual(g.paramSize, "8B")
+        XCTAssertEqual(g.quantization, "4-bit")   // Q4_K_M → 4-bit, via name fallback
+        XCTAssertEqual(g.metadataSummary, "8B · 4-bit · gguf · GGUF")
+        XCTAssertTrue(g.hasToolCalling)
+    }
+
+    func testContextFormatting() {
+        XCTAssertEqual(LocalModel.formatContext(262144), "256K ctx")
+        XCTAssertEqual(LocalModel.formatContext(32768), "32K ctx")
+        XCTAssertEqual(LocalModel.formatContext(1048576), "1M ctx")
+        XCTAssertEqual(LocalModel.formatContext(512), "512 ctx")
+    }
+
+    // MARK: - config.json parsing (the authoritative metadata source)
+
+    func testParseConfigMetadataReadsQuantCtxExpertsVision() throws {
+        let dir = (tempRoot as NSString).appendingPathComponent("cfg-moe")
+        try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        let cfg = (dir as NSString).appendingPathComponent("config.json")
+        try """
+        {"model_type":"qwen3_moe","quantization":{"group_size":64,"bits":8},
+         "max_position_embeddings":262144,"num_experts":128,"num_experts_per_tok":8}
+        """.write(toFile: cfg, atomically: true, encoding: .utf8)
+
+        let meta = DownloadManager.parseConfigMetadata(atPath: cfg)
+        XCTAssertEqual(meta.modelType, "qwen3_moe")
+        XCTAssertEqual(meta.quantBits, 8)
+        XCTAssertEqual(meta.contextLength, 262144)
+        XCTAssertEqual(meta.numExperts, 128)
+        XCTAssertEqual(meta.activeExperts, 8)
+        XCTAssertFalse(meta.hasVision)
+    }
+
+    func testParseConfigMetadataQuantizationConfigAndVision() throws {
+        // Some checkpoints use `quantization_config`; vision via `vision_config`.
+        let dir = (tempRoot as NSString).appendingPathComponent("cfg-vision")
+        try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        let cfg = (dir as NSString).appendingPathComponent("config.json")
+        try """
+        {"model_type":"gemma4","quantization_config":{"bits":4},"vision_config":{"hidden_size":1152}}
+        """.write(toFile: cfg, atomically: true, encoding: .utf8)
+
+        let meta = DownloadManager.parseConfigMetadata(atPath: cfg)
+        XCTAssertEqual(meta.quantBits, 4)
+        XCTAssertTrue(meta.hasVision)
+    }
+
+    func testParseConfigMetadataTextOnlyArchSuppressesVision() throws {
+        // A `_text` arch with a vestigial vision_config must NOT report vision.
+        let dir = (tempRoot as NSString).appendingPathComponent("cfg-text")
+        try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        let cfg = (dir as NSString).appendingPathComponent("config.json")
+        try #"{"model_type":"qwen3_5_moe_text","vision_config":{"x":1}}"#
+            .write(toFile: cfg, atomically: true, encoding: .utf8)
+
+        XCTAssertFalse(DownloadManager.parseConfigMetadata(atPath: cfg).hasVision)
+    }
+
+    func testParseConfigMetadataMissingFileDefaults() {
+        let meta = DownloadManager.parseConfigMetadata(atPath: "/nope/config.json")
+        XCTAssertEqual(meta, DownloadManager.ConfigMetadata())
+    }
+
     // MARK: - Helpers
 
     /// Minimal model dir layout: just `config.json`. The path-resolution and
