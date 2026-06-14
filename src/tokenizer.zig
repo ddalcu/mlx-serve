@@ -865,11 +865,14 @@ pub fn loadTokenizer(io: std.Io, allocator: std.mem.Allocator, model_dir: []cons
         try merge_ranks.ensureTotalCapacity(@intCast(merges_arr.items.len));
         sw = io_util.Stopwatch.init(io);
         for (merges_arr.items, 0..) |merge_val, rank| {
-            const pair = merge_val.array;
-            try merge_ranks.put(
-                .{ .left = pair.items[0].string, .right = pair.items[1].string },
-                @intCast(rank),
-            );
+            // Two on-disk formats: newer HF tokenizers store each merge as a
+            // 2-element array `["a","b"]` (Qwen3, Gemma 4); older / GPT-2-style
+            // exports store it as a single space-joined string `"a b"` (Qwen2.5,
+            // many Llama/Mistral). `parseMergePair` handles both. Reading `.array`
+            // off a string Value in ReleaseFast spins the loop on garbage, which
+            // hung Qwen2.5 loads before this fix.
+            const pair = parseMergePair(merge_val) orelse continue;
+            try merge_ranks.put(pair, @intCast(rank));
         }
         log.info("  loaded {d} merges in {d}ms\n", .{ merge_ranks.count(), sw.read() / std.time.ns_per_ms });
     }
@@ -930,6 +933,28 @@ pub fn loadTokenizer(io: std.Io, allocator: std.mem.Allocator, model_dir: []cons
         .eos_id = eos_id,
         .parsed_json = parsed,
     };
+}
+
+/// Parse one BPE merge entry, accepting both on-disk formats:
+///   - 2-element array `["left","right"]` (newer HF: Qwen3, Gemma 4)
+///   - space-joined string `"left right"` (GPT-2-style: Qwen2.5, many Llama/Mistral)
+/// Returns null for malformed entries (skip). The returned slices borrow from
+/// `merge_val`'s backing arena, same lifetime as the array-format halves.
+fn parseMergePair(merge_val: std.json.Value) ?Tokenizer.MergePair {
+    switch (merge_val) {
+        .array => |pair| {
+            if (pair.items.len < 2) return null;
+            if (pair.items[0] != .string or pair.items[1] != .string) return null;
+            return .{ .left = pair.items[0].string, .right = pair.items[1].string };
+        },
+        .string => |s| {
+            // Split on the FIRST space: byte-level BPE encodes spaces as 'Ġ',
+            // so neither half contains a literal space separator.
+            const sp = std.mem.indexOfScalar(u8, s, ' ') orelse return null;
+            return .{ .left = s[0..sp], .right = s[sp + 1 ..] };
+        },
+        else => return null,
+    }
 }
 
 /// Check if a pre_tokenizer JSON value contains a ByteLevel type.
@@ -1467,4 +1492,35 @@ test "bpeMerge: symbols missing from vocab fall back to byte pieces" {
     const ids = try tok.bpeMerge(allocator, "az");
     defer allocator.free(ids);
     try testing.expectEqualSlices(u32, &[_]u32{ 1, 99 }, ids);
+}
+
+test "parseMergePair handles both array and space-joined-string formats" {
+    const alloc = testing.allocator;
+    // Array format (Qwen3 / Gemma 4): ["left","right"].
+    {
+        var p = try std.json.parseFromSlice(std.json.Value, alloc, "[\"AB\",\"cd\"]", .{});
+        defer p.deinit();
+        const mp = parseMergePair(p.value).?;
+        try testing.expectEqualStrings("AB", mp.left);
+        try testing.expectEqualStrings("cd", mp.right);
+    }
+    // String format (Qwen2.5 / GPT-2-style): "left right" split on first space.
+    {
+        var p = try std.json.parseFromSlice(std.json.Value, alloc, "\"AB cd\"", .{});
+        defer p.deinit();
+        const mp = parseMergePair(p.value).?;
+        try testing.expectEqualStrings("AB", mp.left);
+        try testing.expectEqualStrings("cd", mp.right);
+    }
+    // Malformed → null (no crash): string without a space, short array.
+    {
+        var p = try std.json.parseFromSlice(std.json.Value, alloc, "\"nospace\"", .{});
+        defer p.deinit();
+        try testing.expect(parseMergePair(p.value) == null);
+    }
+    {
+        var p = try std.json.parseFromSlice(std.json.Value, alloc, "[\"only\"]", .{});
+        defer p.deinit();
+        try testing.expect(parseMergePair(p.value) == null);
+    }
 }

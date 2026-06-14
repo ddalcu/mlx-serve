@@ -1051,6 +1051,12 @@ const LayerWeights = struct {
     q_w: mlx.mlx_array,
     q_s: mlx.mlx_array,
     q_b: mlx.mlx_array,
+    // Additive qkv-projection biases (Qwen2's `q/k/v_proj.bias`), distinct from
+    // the quant `*_b` biases above. Empty-ctx when the arch has none (qwen3,
+    // llama, mistral). Applied via `qmatmulMaybeBias` in the forward.
+    q_bias: mlx.mlx_array = .{},
+    k_bias: mlx.mlx_array = .{},
+    v_bias: mlx.mlx_array = .{},
     k_w: mlx.mlx_array,
     k_s: mlx.mlx_array,
     k_b: mlx.mlx_array,
@@ -1814,6 +1820,10 @@ pub const Transformer = struct {
                     if (lw.v_w.ctx != null) _ = mlx.mlx_vector_array_append_value(all_vec, lw.v_w);
                     if (lw.v_s.ctx != null) _ = mlx.mlx_vector_array_append_value(all_vec, lw.v_s);
                     if (lw.v_b.ctx != null) _ = mlx.mlx_vector_array_append_value(all_vec, lw.v_b);
+                    // Additive qkv biases (Qwen2) — empty-ctx for archs without them.
+                    if (lw.q_bias.ctx != null) _ = mlx.mlx_vector_array_append_value(all_vec, lw.q_bias);
+                    if (lw.k_bias.ctx != null) _ = mlx.mlx_vector_array_append_value(all_vec, lw.k_bias);
+                    if (lw.v_bias.ctx != null) _ = mlx.mlx_vector_array_append_value(all_vec, lw.v_bias);
                     _ = mlx.mlx_vector_array_append_value(all_vec, lw.o_w);
                     if (lw.o_s.ctx != null) _ = mlx.mlx_vector_array_append_value(all_vec, lw.o_s);
                     if (lw.o_b.ctx != null) _ = mlx.mlx_vector_array_append_value(all_vec, lw.o_b);
@@ -2497,6 +2507,15 @@ pub const Transformer = struct {
         var result = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_add(&result, mm, bias, self.s));
         return result;
+    }
+
+    /// `qmatmul`, plus an additive projection bias when `bias` is non-empty.
+    /// Lets the standard (Llama-family) attention path support archs that carry
+    /// additive qkv biases (Qwen2's `q/k/v_proj.bias`) without branching per
+    /// arch — empty `bias` (qwen3/llama/mistral) is a plain `qmatmul`.
+    inline fn qmatmulMaybeBias(self: *const Transformer, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, bias: mlx.mlx_array) !mlx.mlx_array {
+        if (bias.ctx != null) return self.qmatmulAddBias(x, w, sc, bi, bias);
+        return self.qmatmul(x, w, sc, bi);
     }
 
     fn embedding(self: *const Transformer, token_ids: mlx.mlx_array) !mlx.mlx_array {
@@ -3543,7 +3562,7 @@ pub const Transformer = struct {
                 @intCast(cur_hd);
 
             // Q projection
-            const q = try self.qmatmul(normed, lw.q_w, lw.q_s, lw.q_b);
+            const q = try self.qmatmulMaybeBias(normed, lw.q_w, lw.q_s, lw.q_b, lw.q_bias);
             defer _ = mlx.mlx_array_free(q);
 
             var q_r = mlx.mlx_array_new();
@@ -3591,12 +3610,12 @@ pub const Transformer = struct {
             } else {
                 // Compute K, V (temp arrays scoped to this block).
                 // When k_eq_v, V shares the K projection — compute once, alias into V.
-                const own_k = try self.qmatmul(normed, lw.k_w, lw.k_s, lw.k_b);
+                const own_k = try self.qmatmulMaybeBias(normed, lw.k_w, lw.k_s, lw.k_b, lw.k_bias);
                 defer _ = mlx.mlx_array_free(own_k);
                 const own_v = if (lw.k_eq_v)
                     own_k
                 else
-                    try self.qmatmul(normed, lw.v_w, lw.v_s, lw.v_b);
+                    try self.qmatmulMaybeBias(normed, lw.v_w, lw.v_s, lw.v_b, lw.v_bias);
                 defer if (!lw.k_eq_v) {
                     _ = mlx.mlx_array_free(own_v);
                 };
@@ -3929,7 +3948,7 @@ pub const Transformer = struct {
             defer _ = mlx.mlx_array_free(normed);
 
             // Q projection + reshape + Q-norm + transpose + dynamic RoPE.
-            const q = try self.qmatmul(normed, lw.q_w, lw.q_s, lw.q_b);
+            const q = try self.qmatmulMaybeBias(normed, lw.q_w, lw.q_s, lw.q_b, lw.q_bias);
             defer _ = mlx.mlx_array_free(q);
 
             var q_r = mlx.mlx_array_new();
@@ -3955,12 +3974,12 @@ pub const Transformer = struct {
             // We pad each to the common kv_max and concat axis=0 → [N, kv_h, kv_max, cur_hd].
             if (!is_kv_shared) {
                 // Project K, V at full batch (B=N), reshape, normalize, transpose, RoPE.
-                const own_k = try self.qmatmul(normed, lw.k_w, lw.k_s, lw.k_b);
+                const own_k = try self.qmatmulMaybeBias(normed, lw.k_w, lw.k_s, lw.k_b, lw.k_bias);
                 defer _ = mlx.mlx_array_free(own_k);
                 const own_v = if (lw.k_eq_v)
                     own_k
                 else
-                    try self.qmatmul(normed, lw.v_w, lw.v_s, lw.v_b);
+                    try self.qmatmulMaybeBias(normed, lw.v_w, lw.v_s, lw.v_b, lw.v_bias);
                 defer if (!lw.k_eq_v) {
                     _ = mlx.mlx_array_free(own_v);
                 };
@@ -6300,19 +6319,24 @@ fn initStandardLayers(allocator: std.mem.Allocator, config: ModelConfig, weights
         lw.q_w = getLayerWeight(weights, name_buf, prefix, li, "self_attn.q_proj.weight");
         lw.q_s = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "self_attn.q_proj.scales", config.quant_bits);
         lw.q_b = getLayerBias(weights, name_buf, prefix, li, "self_attn.q_proj.biases", &config);
+        // Additive q-proj bias (Qwen2). Optional — empty for archs without it.
+        lw.q_bias = getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.q_proj.bias") orelse mlx.mlx_array_new();
         if (kv_shared) {
             // No own K/V — the forward reads kv_source's cache. Leave empty.
             lw.k_eq_v = false;
             lw.k_w = mlx.mlx_array_new();
             lw.k_s = mlx.mlx_array_new();
             lw.k_b = mlx.mlx_array_new();
+            lw.k_bias = mlx.mlx_array_new();
             lw.v_w = mlx.mlx_array_new();
             lw.v_s = mlx.mlx_array_new();
             lw.v_b = mlx.mlx_array_new();
+            lw.v_bias = mlx.mlx_array_new();
         } else {
             lw.k_w = getLayerWeight(weights, name_buf, prefix, li, "self_attn.k_proj.weight");
             lw.k_s = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "self_attn.k_proj.scales", config.quant_bits);
             lw.k_b = getLayerBias(weights, name_buf, prefix, li, "self_attn.k_proj.biases", &config);
+            lw.k_bias = getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.k_proj.bias") orelse mlx.mlx_array_new();
             // Gemma 4 (31B): full_attention layers share V with K (no v_proj weight stored).
             // Sliding_attention layers still have separate V.
             lw.k_eq_v = config.attention_k_eq_v and config.isGlobalLayer(li);
@@ -6320,10 +6344,12 @@ fn initStandardLayers(allocator: std.mem.Allocator, config: ModelConfig, weights
                 lw.v_w = lw.k_w;
                 lw.v_s = lw.k_s;
                 lw.v_b = lw.k_b;
+                lw.v_bias = lw.k_bias;
             } else {
                 lw.v_w = getLayerWeight(weights, name_buf, prefix, li, "self_attn.v_proj.weight");
                 lw.v_s = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "self_attn.v_proj.scales", config.quant_bits);
                 lw.v_b = getLayerBias(weights, name_buf, prefix, li, "self_attn.v_proj.biases", &config);
+                lw.v_bias = getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.v_proj.bias") orelse mlx.mlx_array_new();
             }
         }
         lw.o_w = getLayerWeight(weights, name_buf, prefix, li, "self_attn.o_proj.weight");

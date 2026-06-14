@@ -1008,6 +1008,11 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         // Llama-family defaults (qwen3, llama, mistral, etc.)
         if (std.mem.eql(u8, model_type, "qwen3")) {
             config.model_type = "qwen3";
+        } else if (std.mem.eql(u8, model_type, "qwen2")) {
+            // Qwen2.5 family: dense Llama-style attention, NO QK-norm (left
+            // false below), additive qkv-projection biases applied in the
+            // forward when present.
+            config.model_type = "qwen2";
         } else if (std.mem.eql(u8, model_type, "llama")) {
             config.model_type = "llama";
         } else if (std.mem.eql(u8, model_type, "mistral")) {
@@ -1022,6 +1027,14 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         config.has_qk_norm = false;
         config.rope_scaling_factor = 1.0;
         config.rope_local_base_freq = config.rope_theta;
+        // Llama-family models (qwen2, llama, mistral) usually omit `head_dim`;
+        // the HF default is hidden_size / num_attention_heads. Without this the
+        // stale 256 sentinel (line 53) would corrupt attention for any such
+        // checkpoint that doesn't ship an explicit head_dim (e.g. Qwen2.5).
+        // qwen3 ships an explicit head_dim, so this leaves it untouched.
+        if (cfg_obj.get("head_dim") == null) {
+            config.head_dim = config.hidden_size / config.num_attention_heads;
+        }
 
         if (cfg_obj.get("hidden_act")) |v| {
             if (v == .string) {
@@ -1712,6 +1725,39 @@ test "parseConfigFromJson qwen3_moe (Qwen3-30B-A3B) → MoE, no shared expert, n
     try testing.expect(!config.isLinearLayer(3));
     try testing.expect(!config.has_hybrid_layers);
     try testing.expect(!config.has_sliding_window);
+    try testing.expectEqual(@as(u32, 8), config.quant_bits);
+}
+
+test "parseConfigFromJson qwen2 (Qwen2.5) → dense, no QK-norm, silu" {
+    // Qwen2.5-Coder / Qwen2.5-Instruct ship model_type "qwen2": a dense
+    // full-attention Llama-family arch that, unlike qwen3, has NO QK-norm and
+    // DOES carry additive qkv-projection biases (q/k/v_proj.bias). The forward
+    // applies those biases when present; here we pin the config classification.
+    const json =
+        \\{
+        \\  "model_type": "qwen2",
+        \\  "hidden_size": 5120,
+        \\  "num_hidden_layers": 64,
+        \\  "num_attention_heads": 40,
+        \\  "num_key_value_heads": 8,
+        \\  "intermediate_size": 27648,
+        \\  "rms_norm_eps": 1e-6,
+        \\  "rope_theta": 1000000.0,
+        \\  "hidden_act": "silu",
+        \\  "tie_word_embeddings": false,
+        \\  "quantization": {"bits": 8, "group_size": 64}
+        \\}
+    ;
+    const config = try parseConfigFromJson(testing.allocator, json);
+    try testing.expectEqualStrings("qwen2", config.model_type);
+    try testing.expectEqualStrings("model", config.weight_prefix);
+    try testing.expect(!config.isMoe());
+    // KEY difference from qwen3: no QK-norm.
+    try testing.expect(!config.has_qk_norm);
+    try testing.expect(!config.has_pre_ff_norm);
+    try testing.expect(!config.scale_embeddings);
+    try testing.expectEqual(HiddenAct.silu, config.hidden_act);
+    try testing.expectEqual(@as(u32, 128), config.head_dim); // 5120 / 40
     try testing.expectEqual(@as(u32, 8), config.quant_bits);
 }
 
