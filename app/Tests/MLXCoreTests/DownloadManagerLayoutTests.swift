@@ -374,6 +374,22 @@ final class DownloadManagerLayoutTests: XCTestCase {
         XCTAssertFalse(DownloadManager.isCancellation(URLError(.notConnectedToInternet)))
     }
 
+    // MARK: - Downloaded tab live-refresh trigger
+    //
+    // The Downloaded tab's "Size on Disk" comes from a disk re-scan
+    // (`refreshModels`), which previously only fired on tab entry — so sizes
+    // froze mid-download until the user toggled the button. The tab now
+    // live-polls, but only while it's showing AND a download is in flight.
+
+    func testShouldLivePollOnlyWhenTabOpenAndDownloading() {
+        XCTAssertTrue(ModelBrowserView.shouldLivePoll(downloadedTab: true, hasActiveDownloads: true))
+        // No active downloads → nothing to refresh, don't spin.
+        XCTAssertFalse(ModelBrowserView.shouldLivePoll(downloadedTab: true, hasActiveDownloads: false))
+        // Not in the Downloaded tab → the sizes aren't even visible.
+        XCTAssertFalse(ModelBrowserView.shouldLivePoll(downloadedTab: false, hasActiveDownloads: true))
+        XCTAssertFalse(ModelBrowserView.shouldLivePoll(downloadedTab: false, hasActiveDownloads: false))
+    }
+
     // MARK: - Helpers
 
     /// Minimal model dir layout: just `config.json`. The path-resolution and

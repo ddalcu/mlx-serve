@@ -206,6 +206,27 @@ struct ModelBrowserView: View {
         .onChange(of: showDownloadedOnly) { _, isLocal in
             if isLocal { appState.refreshModels() }
         }
+        // Live-refresh on-disk sizes while the Downloaded tab is open and a
+        // download is in flight, so completion + growing size show up without
+        // the user toggling the button. The task id flips when the tab closes
+        // or the active-download set changes, which cancels + re-evaluates the
+        // guard — so it self-terminates once everything finishes.
+        .task(id: "\(showDownloadedOnly)-\(activeDownloads.count)") {
+            guard Self.shouldLivePoll(downloadedTab: showDownloadedOnly,
+                                      hasActiveDownloads: !activeDownloads.isEmpty) else { return }
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                if Task.isCancelled { break }
+                appState.refreshModels()
+            }
+        }
+    }
+
+    /// Whether the Downloaded tab should live-refresh on-disk sizes: only when
+    /// the tab is showing AND a download is in flight. Pulled out so the polling
+    /// trigger is unit-testable without driving SwiftUI.
+    static func shouldLivePoll(downloadedTab: Bool, hasActiveDownloads: Bool) -> Bool {
+        downloadedTab && hasActiveDownloads
     }
 }
 
