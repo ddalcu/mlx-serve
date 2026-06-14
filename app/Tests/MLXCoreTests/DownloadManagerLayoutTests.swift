@@ -226,50 +226,152 @@ final class DownloadManagerLayoutTests: XCTestCase {
         XCTAssertFalse(DownloadManager.isSupportedGguf("config.json"))
     }
 
-    // MARK: - Cancellation cleanup
+    // MARK: - Cancellation cleanup (full wipe)
+    //
+    // User-cancel removes the ENTIRE download dir — completed shards, config,
+    // and `.partial` files alike — so a cancel leaves zero footprint: no remnant
+    // that masquerades as a complete model, no undeletable config-only orphan.
+    // (Network-error resume is a separate path that keeps `.partial`s; it does
+    // NOT go through this wipe.)
 
-    /// User-cancel must leave `.partial` files gone (no Resume path) and final
-    /// files untouched. Pinned because the cancel button promises this exact
-    /// behavior; a regression would silently leave half-files on disk and the
-    /// "Resume" button would reappear on the next launch.
-    func testCleanupPartialsRemovesPartialsKeepsFinalFiles() throws {
+    func testCancelWipeRemovesCompletedShardsNotJustPartials() throws {
+        // The late-cancel case: some shards finished before the user hit cancel.
         let repoId = "acme/demo"
+        let author = (tempRoot as NSString).appendingPathComponent("acme")
         let dir = DownloadManager.newLayoutDir(rootDir: tempRoot, repoId: repoId)
         try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
         let finalCfg = (dir as NSString).appendingPathComponent("config.json")
-        let topPartial = (dir as NSString).appendingPathComponent("model.safetensors.partial")
-        let subdir = (dir as NSString).appendingPathComponent("nested")
-        try FileManager.default.createDirectory(atPath: subdir, withIntermediateDirectories: true)
-        let nestedPartial = (subdir as NSString).appendingPathComponent("shard-1.safetensors.partial")
+        let doneShard = (dir as NSString).appendingPathComponent("model-00001.safetensors")
+        let inFlight = (dir as NSString).appendingPathComponent("model-00002.safetensors.partial")
         try "{}".write(toFile: finalCfg, atomically: true, encoding: .utf8)
-        FileManager.default.createFile(atPath: topPartial, contents: Data())
-        FileManager.default.createFile(atPath: nestedPartial, contents: Data())
+        FileManager.default.createFile(atPath: doneShard, contents: Data("w".utf8))
+        FileManager.default.createFile(atPath: inFlight, contents: Data())
 
-        DownloadManager.cleanupPartials(rootDir: tempRoot, repoId: repoId)
+        DownloadManager.removeModelFiles(at: dir, roots: [tempRoot])
 
         let fm = FileManager.default
-        XCTAssertTrue(fm.fileExists(atPath: finalCfg), "completed files must stay on disk")
-        XCTAssertFalse(fm.fileExists(atPath: topPartial), "top-level .partial must be removed")
-        XCTAssertFalse(fm.fileExists(atPath: nestedPartial), "nested .partial must be removed")
-        XCTAssertTrue(fm.fileExists(atPath: dir), "dest dir must remain when other files survive")
+        XCTAssertFalse(fm.fileExists(atPath: dir), "whole download dir must be gone, completed shards included")
+        XCTAssertFalse(fm.fileExists(atPath: author), "now-empty author dir must be pruned")
+        XCTAssertTrue(fm.fileExists(atPath: tempRoot), "scan root must survive")
     }
 
-    func testCleanupPartialsRemovesEmptyDestDir() throws {
-        let repoId = "acme/empty"
+    func testCancelWipeRemovesConfigOnlyOrphan() throws {
+        // The previously-invisible case: config downloaded, no shard yet. Must
+        // not be left behind (it wouldn't surface as a deletable LocalModel).
+        let repoId = "acme/justconfig"
         let dir = DownloadManager.newLayoutDir(rootDir: tempRoot, repoId: repoId)
-        try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
-        let onlyPartial = (dir as NSString).appendingPathComponent("only.partial")
-        FileManager.default.createFile(atPath: onlyPartial, contents: Data())
+        try makeFakeModel(at: dir)   // config.json only
 
-        DownloadManager.cleanupPartials(rootDir: tempRoot, repoId: repoId)
+        DownloadManager.removeModelFiles(at: dir, roots: [tempRoot])
 
-        XCTAssertFalse(FileManager.default.fileExists(atPath: dir),
-                       "dest dir should be removed when it's empty after partials are deleted")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: dir))
     }
 
-    func testCleanupPartialsNoOpWhenDirMissing() {
+    func testCancelWipeNoOpWhenDirMissing() {
         // Cancelling a fresh download that bailed before mkdir must not crash.
-        DownloadManager.cleanupPartials(rootDir: tempRoot, repoId: "ghost/never-created")
+        let dir = DownloadManager.newLayoutDir(rootDir: tempRoot, repoId: "ghost/never-created")
+        XCTAssertFalse(DownloadManager.removeModelFiles(at: dir, roots: [tempRoot]))
+    }
+
+    // MARK: - Delete by on-disk path
+    //
+    // `LocalModelRow` used to delete via `deleteModel(repoId: model.id)`, but a
+    // LocalModel's `id` is source-prefixed (`"mlxServe:author/name"`), so the
+    // repoId-based path resolver looked under `<root>/mlxServe:author/name` and
+    // deleted nothing — the trash button silently no-op'd and the user had to
+    // `rm -rf` from a terminal. Deletion now keys off the model's real resolved
+    // `path` instead. These pin that behavior.
+
+    func testRemoveModelFilesDeletesNestedDirAndPrunesAuthor() throws {
+        let author = (tempRoot as NSString).appendingPathComponent("acme")
+        let modelDir = (author as NSString).appendingPathComponent("demo")
+        try makeFakeModel(at: modelDir)
+        let partial = (modelDir as NSString).appendingPathComponent("model.safetensors.partial")
+        FileManager.default.createFile(atPath: partial, contents: Data())
+
+        let removed = DownloadManager.removeModelFiles(at: modelDir, roots: [tempRoot])
+
+        let fm = FileManager.default
+        XCTAssertTrue(removed)
+        XCTAssertFalse(fm.fileExists(atPath: modelDir), "model dir (incl. .partial) must be gone")
+        XCTAssertFalse(fm.fileExists(atPath: author), "now-empty author dir must be pruned")
+        XCTAssertTrue(fm.fileExists(atPath: tempRoot), "the scan root itself must never be removed")
+    }
+
+    func testRemoveModelFilesFromGgufFilePath() throws {
+        // A GGUF model's `path` is the .gguf file, not its containing dir.
+        let modelDir = ((tempRoot as NSString).appendingPathComponent("team") as NSString)
+            .appendingPathComponent("mygguf")
+        try FileManager.default.createDirectory(atPath: modelDir, withIntermediateDirectories: true)
+        let gguf = (modelDir as NSString).appendingPathComponent("model-Q4_K_M.gguf")
+        FileManager.default.createFile(atPath: gguf, contents: Data("x".utf8))
+
+        let removed = DownloadManager.removeModelFiles(at: gguf, roots: [tempRoot])
+
+        XCTAssertTrue(removed)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: modelDir),
+                       "deleting by a file path must remove its containing model dir")
+    }
+
+    func testRemoveModelFilesKeepsAuthorWithSurvivingSiblings() throws {
+        let author = (tempRoot as NSString).appendingPathComponent("acme")
+        let a = (author as NSString).appendingPathComponent("model-a")
+        let b = (author as NSString).appendingPathComponent("model-b")
+        try makeFakeModel(at: a)
+        try makeFakeModel(at: b)
+
+        DownloadManager.removeModelFiles(at: a, roots: [tempRoot])
+
+        let fm = FileManager.default
+        XCTAssertFalse(fm.fileExists(atPath: a))
+        XCTAssertTrue(fm.fileExists(atPath: author), "author dir must survive while a sibling model remains")
+        XCTAssertTrue(fm.fileExists(atPath: b))
+    }
+
+    func testRemoveModelFilesLegacyFlatDoesNotPruneRoot() throws {
+        // Legacy flat layout: the model dir sits directly under a root, so its
+        // "author" IS the root — pruning must stop there.
+        let modelDir = (tempRoot as NSString).appendingPathComponent("flatmodel")
+        try makeFakeModel(at: modelDir)
+
+        DownloadManager.removeModelFiles(at: modelDir, roots: [tempRoot])
+
+        let fm = FileManager.default
+        XCTAssertFalse(fm.fileExists(atPath: modelDir))
+        XCTAssertTrue(fm.fileExists(atPath: tempRoot), "a root must never be pruned even when emptied")
+    }
+
+    func testRemoveModelFilesRefusesToDeleteARoot() throws {
+        // Defensive: never remove a root directory itself.
+        let removed = DownloadManager.removeModelFiles(at: tempRoot, roots: [tempRoot])
+        XCTAssertFalse(removed)
+        XCTAssertTrue(FileManager.default.fileExists(atPath: tempRoot))
+    }
+
+    func testRemoveModelFilesMissingPathIsNoOp() {
+        let ghost = (tempRoot as NSString).appendingPathComponent("nope/missing")
+        XCTAssertFalse(DownloadManager.removeModelFiles(at: ghost, roots: [tempRoot]))
+    }
+
+    // MARK: - Cancellation detection
+    //
+    // Cancelling an in-flight download surfaces as URLSession's
+    // NSURLErrorCancelled, NOT Swift's CancellationError — so the retry loop
+    // must recognize both, or a cancelled transfer flashes "retrying…" before
+    // it finally unwinds.
+
+    func testIsCancellationMatchesCancellationErrorAndURLCancel() {
+        XCTAssertTrue(DownloadManager.isCancellation(CancellationError()))
+        XCTAssertTrue(DownloadManager.isCancellation(URLError(.cancelled)))
+        XCTAssertTrue(DownloadManager.isCancellation(
+            NSError(domain: NSURLErrorDomain, code: NSURLErrorCancelled)))
+    }
+
+    func testIsCancellationRejectsTransientFailures() {
+        // These are genuine transient errors the retry loop must keep retrying.
+        XCTAssertFalse(DownloadManager.isCancellation(URLError(.timedOut)))
+        XCTAssertFalse(DownloadManager.isCancellation(URLError(.networkConnectionLost)))
+        XCTAssertFalse(DownloadManager.isCancellation(URLError(.notConnectedToInternet)))
     }
 
     // MARK: - Helpers

@@ -368,10 +368,12 @@ class DownloadManager: ObservableObject {
                         try? fm.removeItem(atPath: destPath)
                         try fm.moveItem(atPath: partialPath, toPath: destPath)
                         break
-                    } catch is CancellationError {
-                        // Keep partial file for future resume
-                        throw CancellationError()
                     } catch {
+                        // User-cancelled? Stop immediately. URLSession surfaces
+                        // cancellation as NSURLErrorCancelled, not CancellationError,
+                        // so route both here instead of into the retry path. Partial
+                        // file stays on disk for a future resume.
+                        if Self.isCancellation(error) { throw CancellationError() }
                         // Partial file stays on disk — next attempt resumes from it
                         if attempt < maxRetries - 1 {
                             let isStall = error is DownloadStallError
@@ -445,44 +447,78 @@ class DownloadManager: ObservableObject {
     }
 
     /// Cancel an in-flight download. The state row disappears from the UI and
-    /// any `.partial` files are removed so no Resume path remains. No-op if
-    /// nothing is in flight for `repoId`.
+    /// the entire download directory is removed — completed shards, config, and
+    /// `.partial` files alike — so a cancel leaves ZERO footprint (no remnant
+    /// that masquerades as a complete model, no undeletable config-only orphan).
+    /// No-op if nothing is in flight for `repoId`. The actual wipe for a live
+    /// task happens in `finalizeIfCancelled` once the task has stopped writing;
+    /// the branch here covers the no-live-task case (already finished, or cancel
+    /// fired before start).
     func cancel(_ repoId: String) {
         activeTasks[repoId]?.cancel()
-        // Defensive: if there's no live task (already finished, or cancel
-        // fired before start), still clear the row and partials so the UI
-        // returns to a clean "Download" state.
         if activeTasks[repoId] == nil {
             downloads.removeValue(forKey: repoId)
-            Self.cleanupPartials(rootDir: modelsDir, repoId: repoId)
+            wipeDownloadDir(repoId)
         }
     }
 
-    /// Post-await cleanup for the start() wrappers. When the task was
-    /// cancelled mid-flight, drop the (possibly `.failed`) row and wipe
-    /// `.partial` files. On normal completion this is a no-op.
+    /// Post-await cleanup for the start() wrappers. When the task was cancelled
+    /// mid-flight, drop the (possibly `.failed`) row and wipe the whole download
+    /// dir. Runs after `download()` has fully returned, so the file handle is
+    /// closed and it's safe to delete. On normal completion this is a no-op.
     private func finalizeIfCancelled(repoId: String) {
         guard Task.isCancelled else { return }
         downloads.removeValue(forKey: repoId)
-        Self.cleanupPartials(rootDir: modelsDir, repoId: repoId)
+        wipeDownloadDir(repoId)
     }
 
-    /// Recursively remove every `.partial` file under the model's dest dir.
-    /// If the dir is empty afterward, remove it too — so the next click
-    /// starts from a truly clean slate (no orphan empty `<author>/<name>/`).
-    /// Nonisolated + static so tests can hit it without a `DownloadManager`
-    /// instance (which is tied to the real `~/.mlx-serve/models`).
-    nonisolated static func cleanupPartials(rootDir: String, repoId: String) {
-        let dir = newLayoutDir(rootDir: rootDir, repoId: repoId)
+    /// Remove the entire download directory for `repoId`. Used only on
+    /// user-cancel — distinct from the network-error resume path, which keeps
+    /// `.partial` files on disk so the "Resume" button can pick up where it
+    /// left off.
+    private func wipeDownloadDir(_ repoId: String) {
+        Self.removeModelFiles(at: newLayoutDir(for: repoId), roots: [modelsDir])
+    }
+
+    /// True if `error` represents a user/task cancellation rather than a
+    /// transient failure. URLSession surfaces `session.invalidateAndCancel()`
+    /// as `NSURLErrorCancelled` (NOT Swift's `CancellationError`), so the
+    /// download retry loop must recognize both — otherwise a cancelled
+    /// transfer falls into the generic `catch`, flashes "Connection lost,
+    /// retrying…", and only unwinds when the next `Task.sleep` throws.
+    nonisolated static func isCancellation(_ error: Error) -> Bool {
+        if error is CancellationError { return true }
+        let ns = error as NSError
+        return ns.domain == NSURLErrorDomain && ns.code == NSURLErrorCancelled
+    }
+
+    /// Delete a model's on-disk files given its resolved `path` (a model
+    /// directory, or a single `.gguf` file living inside one). Removes the
+    /// containing model directory and, when it sits in the 2-level
+    /// `<author>/<name>` layout, prunes the now-empty author dir. Never deletes
+    /// or climbs past a directory in `roots` (the scan roots), so emptying the
+    /// last model under `~/.mlx-serve/models` can't wipe the root itself.
+    /// Returns true if the model dir was removed. `nonisolated`/static so it's
+    /// unit-testable without the real models root.
+    @discardableResult
+    nonisolated static func removeModelFiles(at path: String, roots: [String]) -> Bool {
         let fm = FileManager.default
-        guard let enumerator = fm.enumerator(atPath: dir) else { return }
-        while let rel = enumerator.nextObject() as? String {
-            guard rel.hasSuffix(".partial") else { continue }
-            try? fm.removeItem(atPath: (dir as NSString).appendingPathComponent(rel))
+        var isDir: ObjCBool = false
+        guard fm.fileExists(atPath: path, isDirectory: &isDir) else { return false }
+        let modelDir = isDir.boolValue ? path : (path as NSString).deletingLastPathComponent
+        let normRoots = Set(roots.map { URL(fileURLWithPath: $0).standardizedFileURL.path })
+        // Never remove a root directory itself.
+        if normRoots.contains(URL(fileURLWithPath: modelDir).standardizedFileURL.path) { return false }
+        try? fm.removeItem(atPath: modelDir)
+        // Prune the parent (author) dir if it's now empty — unless it's a root.
+        let authorDir = (modelDir as NSString).deletingLastPathComponent
+        let authorNorm = URL(fileURLWithPath: authorDir).standardizedFileURL.path
+        if !normRoots.contains(authorNorm),
+           let kids = try? fm.contentsOfDirectory(atPath: authorDir),
+           kids.filter({ !$0.hasPrefix(".") }).isEmpty {
+            try? fm.removeItem(atPath: authorDir)
         }
-        if let entries = try? fm.contentsOfDirectory(atPath: dir), entries.isEmpty {
-            try? fm.removeItem(atPath: dir)
-        }
+        return !fm.fileExists(atPath: modelDir)
     }
 
     /// Download a single GGUF artifact from a HuggingFace repo. Used by the
@@ -574,9 +610,8 @@ class DownloadManager: ObservableObject {
                     try? fm.removeItem(atPath: destPath)
                     try fm.moveItem(atPath: partialPath, toPath: destPath)
                     break
-                } catch is CancellationError {
-                    throw CancellationError()
                 } catch {
+                    if Self.isCancellation(error) { throw CancellationError() }
                     if attempt < maxRetries - 1 {
                         let isStall = error is DownloadStallError
                         let delay = isStall ? 2.0 : Double(attempt + 1) * 2.0
@@ -919,6 +954,23 @@ class DownloadManager: ObservableObject {
 
     func deleteModel(repoId: String) {
         removeFromDisk(repoId: repoId)
+    }
+
+    /// Delete a discovered local model by its real on-disk `path`. Preferred
+    /// over `deleteModel(repoId:)` for `LocalModelRow`, whose `model.id` is
+    /// source-prefixed (`"mlxServe:author/name"`) and therefore can't be fed to
+    /// the repoId-based path resolver — and for LM Studio / custom-root models,
+    /// which live outside `modelsDir` entirely. Scopes pruning to the known
+    /// scan roots so it never climbs out of a model tree.
+    func deleteModel(_ model: LocalModel) {
+        var roots = [modelsDir]
+        if let lms = lmStudioRoot { roots.append(lms) }
+        if let custom = resolvedCustomRoot() { roots.append(custom) }
+        Self.removeModelFiles(at: model.path, roots: roots)
+        // Clear any lingering download-state row, keyed by the clean repoId
+        // (drop the `source:` prefix the LocalModel id carries).
+        let cleanId = model.id.split(separator: ":", maxSplits: 1).last.map(String.init) ?? model.id
+        downloads.removeValue(forKey: cleanId)
     }
 
     private func removeFromDisk(repoId: String) {

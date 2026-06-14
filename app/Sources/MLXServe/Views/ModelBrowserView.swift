@@ -458,12 +458,23 @@ private struct ModelBrowserRow: View {
                 Text("Delete \(model.modelName)? This will remove all downloaded files.")
             }
         } else if let state, state.status == .downloading {
-            VStack(spacing: 1) {
-                ProgressView(value: state.fileProgress)
-                    .frame(width: 50)
-                Text(state.percentFormatted)
-                    .font(.system(size: 9).monospacedDigit())
-                    .foregroundStyle(.secondary)
+            HStack(spacing: 4) {
+                VStack(spacing: 1) {
+                    ProgressView(value: state.fileProgress)
+                        .frame(width: 50)
+                    Text(state.percentFormatted)
+                        .font(.system(size: 9).monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+                Button {
+                    downloads.cancel(model.id)
+                    appState.refreshModels()
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .help("Cancel download")
             }
         } else if let state, state.status == .completed {
             Button {
@@ -489,10 +500,7 @@ private struct ModelBrowserRow: View {
                 GgufDownloadMenu(repoId: model.id, label: "Retry")
             } else {
                 Button(downloads.hasPartialDownload(model.id) ? "Resume" : "Retry") {
-                    Task {
-                        await downloads.download(repoId: model.id)
-                        appState.refreshModels()
-                    }
+                    downloads.start(repoId: model.id) { appState.refreshModels() }
                 }
                 .font(.callout)
                 .controlSize(.small)
@@ -503,10 +511,7 @@ private struct ModelBrowserRow: View {
                 GgufDownloadMenu(repoId: model.id, label: "Download")
             } else {
                 Button(downloads.hasPartialDownload(model.id) ? "Resume" : "Download") {
-                    Task {
-                        await downloads.download(repoId: model.id)
-                        appState.refreshModels()
-                    }
+                    downloads.start(repoId: model.id) { appState.refreshModels() }
                 }
                 .font(.callout)
                 .controlSize(.small)
@@ -534,8 +539,7 @@ private struct GgufDownloadMenu: View {
             } else {
                 ForEach(quants, id: \.self) { file in
                     Button(DownloadManager.quantLabel(forFilename: file)) {
-                        Task {
-                            await downloads.downloadGguf(repoId: repoId, ggufFilename: file)
+                        downloads.startGguf(repoId: repoId, ggufFilename: file) {
                             appState.refreshModels()
                         }
                     }
@@ -614,7 +618,7 @@ private struct LocalModelRow: View {
             .alert("Delete Model", isPresented: $confirmDelete) {
                 Button("Cancel", role: .cancel) {}
                 Button("Delete", role: .destructive) {
-                    downloads.deleteModel(repoId: model.id)
+                    downloads.deleteModel(model)
                     appState.refreshModels()
                 }
             } message: {
@@ -661,20 +665,28 @@ private struct ActiveDownloadRow: View {
             .frame(maxWidth: .infinity, alignment: .leading)
 
             if state.status == .downloading {
-                VStack(alignment: .trailing, spacing: 1) {
-                    ProgressView(value: state.fileProgress)
-                        .frame(width: 80)
-                    Text("\(state.percentFormatted) \(state.speedFormatted)")
-                        .font(.system(size: 9).monospacedDigit())
-                        .foregroundStyle(.secondary)
+                HStack(spacing: 4) {
+                    VStack(alignment: .trailing, spacing: 1) {
+                        ProgressView(value: state.fileProgress)
+                            .frame(width: 80)
+                        Text("\(state.percentFormatted) \(state.speedFormatted)")
+                            .font(.system(size: 9).monospacedDigit())
+                            .foregroundStyle(.secondary)
+                    }
+                    Button {
+                        downloads.cancel(repoId)
+                        appState.refreshModels()
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                            .foregroundStyle(.secondary)
+                    }
+                    .buttonStyle(.plain)
+                    .help("Cancel download")
                 }
-                .frame(width: 90, alignment: .trailing)
+                .frame(width: 116, alignment: .trailing)
             } else if state.status == .failed {
                 Button(downloads.hasPartialDownload(repoId) ? "Resume" : "Retry") {
-                    Task {
-                        await downloads.download(repoId: repoId)
-                        appState.refreshModels()
-                    }
+                    downloads.start(repoId: repoId) { appState.refreshModels() }
                 }
                 .font(.callout)
                 .controlSize(.small)
