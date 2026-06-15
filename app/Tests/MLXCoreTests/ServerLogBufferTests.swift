@@ -178,4 +178,44 @@ final class ServerLogBufferTests: XCTestCase {
         XCTAssertEqual(calls, callsAtStop,
                        "Stopped poller must not invoke its snapshot closure")
     }
+
+    // MARK: - Crash summary (menu-bar error text)
+    //
+    // The menu bar used to show `String(stderr.suffix(200))`, which on a crash
+    // lands mid-native-backtrace ("…wqthread + 8") and hides the real cause.
+    // `summarizeCrash` extracts the meaningful line instead.
+
+    func testSummarizeCrashSurfacesGpuOOM() {
+        let log = """
+        MoE routing compiled (kernel fusion enabled)
+        GDN gate compiled (kernel fusion enabled)
+        25  libsystem_pthread.dylib  0x0000  start_wqthread + 8
+        libc++abi: terminating due to uncaught exception of type std::runtime_error: [METAL] Command buffer execution failed: Insufficient Memory (00000008:kIOGPUCommandBufferCallbackErrorOutOfMemory)
+        """
+        let msg = ServerManager.summarizeCrash(log, exitCode: 134)
+        XCTAssertTrue(msg.localizedCaseInsensitiveContains("GPU memory"), "got: \(msg)")
+        XCTAssertFalse(msg.contains("wqthread"), "must not surface a backtrace frame: \(msg)")
+    }
+
+    func testSummarizeCrashSurfacesPreflightRefusal() {
+        let log = "Loading...\nInsufficient memory to load model: weights ~41.8 GB but only 12.0 GB free. Close other models/apps..."
+        let msg = ServerManager.summarizeCrash(log, exitCode: 1)
+        XCTAssertTrue(msg.hasPrefix("Insufficient memory to load model"), "got: \(msg)")
+    }
+
+    func testSummarizeCrashStripsCppPreambleForGenericFatal() {
+        let log = "boot\nlibc++abi: terminating due to uncaught exception of type std::runtime_error: something specific went wrong"
+        let msg = ServerManager.summarizeCrash(log, exitCode: 134)
+        XCTAssertEqual(msg, "something specific went wrong")
+    }
+
+    func testSummarizeCrashMissingWeight() {
+        let log = "Loading model.safetensors...\nMISSING WEIGHT: model.layers.0.foo.weight"
+        let msg = ServerManager.summarizeCrash(log, exitCode: 1)
+        XCTAssertTrue(msg.contains("MISSING WEIGHT"), "got: \(msg)")
+    }
+
+    func testSummarizeCrashEmptyFallsBackToExitCode() {
+        XCTAssertEqual(ServerManager.summarizeCrash("   \n  ", exitCode: 9), "exit code 9")
+    }
 }

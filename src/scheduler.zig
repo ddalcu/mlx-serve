@@ -49,6 +49,7 @@ const arch_ds4 = @import("arch/ds4.zig");
 const arch_llama = @import("arch/llama.zig");
 const log = @import("log.zig");
 const io_util = @import("io_util.zig");
+const status = @import("status.zig");
 
 const Transformer = transformer_mod.Transformer;
 const KVCache = transformer_mod.KVCache;
@@ -1690,6 +1691,46 @@ fn doLoadLlamaOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     sch.hot_prefix_cache = null;
 }
 
+/// Sum of `*.safetensors` bytes in `model_dir` — the MLX weight footprint used
+/// by the load pre-flight. Returns 0 if the dir can't be read (treated as
+/// "unknown" by the caller, which then skips the check).
+fn modelDiskBytes(io: std.Io, model_dir: []const u8) u64 {
+    var dir = std.Io.Dir.openDirAbsolute(io, model_dir, .{ .iterate = true }) catch return 0;
+    defer dir.close(io);
+    var it = dir.iterate();
+    var total: u64 = 0;
+    while (it.next(io) catch null) |entry| {
+        if (entry.kind != .file) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".safetensors")) continue;
+        const st = dir.statFile(io, entry.name, .{}) catch continue;
+        total += @intCast(st.size);
+    }
+    return total;
+}
+
+/// Pure: would loading `weights_bytes` of model with `avail_bytes` free RAM risk
+/// a Metal OOM? Requires the weights plus ~1/7 (≈15%) + 1 GB headroom for the
+/// warmup KV cache + compute buffers. Returns false (allow the load) when either
+/// figure is 0 — a failed memory query must never block a load.
+fn memInsufficientForLoad(weights_bytes: u64, avail_bytes: u64) bool {
+    if (weights_bytes == 0 or avail_bytes == 0) return false;
+    const headroom: u64 = weights_bytes / 7 + 1024 * 1024 * 1024;
+    return avail_bytes < weights_bytes + headroom;
+}
+
+test "memInsufficientForLoad: headroom + unknown-query guards" {
+    const GB: u64 = 1024 * 1024 * 1024;
+    // Restart-into-pressure: 42 GB weights, only 44 GB free → needs ~49, refuse.
+    try std.testing.expect(memInsufficientForLoad(42 * GB, 44 * GB));
+    // Plenty of headroom → allow.
+    try std.testing.expect(!memInsufficientForLoad(42 * GB, 86 * GB));
+    // Exactly weights, no headroom → refuse.
+    try std.testing.expect(memInsufficientForLoad(42 * GB, 42 * GB));
+    // Unknown figures (query failed / size unknown) → never block.
+    try std.testing.expect(!memInsufficientForLoad(0, 44 * GB));
+    try std.testing.expect(!memInsufficientForLoad(42 * GB, 0));
+}
+
 /// Phase A1 → Plan 05: do the full model load on the inference thread.
 /// mlx ops here bind to this thread's GPU stream from t0; subsequent
 /// forwards stay on the same thread.
@@ -1731,6 +1772,25 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     if (@hasField(Inner, "llama_path") and params.llama_path.len > 0) {
         try doLoadLlamaOnInferenceThread(sch, params);
         return;
+    }
+
+    // GPU-memory pre-flight (MLX path). A Metal OOM during weight load / warmup
+    // is thrown by MLX as a C++ exception that can't be caught across the C ABI,
+    // so it terminates the whole process. Refuse the load up front instead, with
+    // an actionable error, when free RAM clearly can't hold the weights + warmup
+    // headroom — catches the common "restarted before the prior server released
+    // its memory" case. Bypass with MLX_SERVE_SKIP_MEM_PREFLIGHT=1.
+    if (std.c.getenv("MLX_SERVE_SKIP_MEM_PREFLIGHT") == null) {
+        const weights_bytes = modelDiskBytes(sch.io, params.model_dir);
+        const avail_bytes = status.getAvailableMemBytes();
+        if (memInsufficientForLoad(weights_bytes, avail_bytes)) {
+            const gb = 1024.0 * 1024.0 * 1024.0;
+            log.err("Insufficient memory to load model: weights ~{d:.1} GB but only {d:.1} GB free. Close other models/apps (or wait for a prior mlx-serve to fully exit) and retry; set MLX_SERVE_SKIP_MEM_PREFLIGHT=1 to override.\n", .{
+                @as(f64, @floatFromInt(weights_bytes)) / gb,
+                @as(f64, @floatFromInt(avail_bytes)) / gb,
+            });
+            return error.InsufficientMemory;
+        }
     }
 
     // Allocate the drafter_path dupe up front so the post-publish step
