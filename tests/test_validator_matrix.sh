@@ -42,6 +42,7 @@ GREEN='\033[0;32m'; RED='\033[0;31m'; YELLOW='\033[1;33m'; NC='\033[0m'
 # logical|display|path|pi_case|probe_timeout_s
 # pi_case must exist in pi_integration_run.sh's html matrix.
 MODELS=(
+    "qwen2|Qwen2.5-Coder 32B 8-bit (qwen2)|$HOME/.mlx-serve/models/mlx-community/Qwen2.5-Coder-32B-Instruct-8bit|html-coder|150"
     "gemma4|Gemma 4 E4B 8-bit (gemma4)|$HOME/.mlx-serve/models/gemma-4-e4b-it-8bit|html-e4b|90"
     "gemma3|Gemma 3 12B QAT 4-bit (gemma3)|$HOME/.mlx-serve/models/mlx-community/gemma-3-12b-it-qat-4bit|html-gemma3|90"
     "qwen36|Qwen3.6 27B dense 4-bit (qwen3_5)|$HOME/.lmstudio/models/mlx-community/Qwen3.6-27B-4bit|html-qwen36|150"

@@ -1246,6 +1246,31 @@ test "ModelConfig addEosToken max capacity" {
     try testing.expect(!config.isEosToken(999));
 }
 
+test "EOS merge: chat-terminator added even when config already provided an eos" {
+    // Regression for the Qwen2.5-Coder-7B leak: its config.json sets
+    // eos_token_id=<|endoftext|> (151643), but its chat template ends turns
+    // with <|im_end|> (151645). The load path (main.zig / scheduler doLoad)
+    // must ALWAYS merge the tokenizer's chat-terminator EOS — additively and
+    // dedup-guarded — not only when config provided none; otherwise <|im_end|>
+    // is never a stop token and leaks into the output (broke structured JSON /
+    // tool calling). This pins the merge invariant those call sites implement.
+    var config = ModelConfig{};
+    config.addEosToken(151643); // from config.json eos_token_id
+    try testing.expectEqual(@as(u32, 1), config.num_eos_tokens);
+
+    // Merge step the fix performs: add the chat terminator if absent.
+    const chat_eos: u32 = 151645; // <|im_end|>, from tokenizer_config eos_token
+    if (!config.isEosToken(chat_eos)) config.addEosToken(chat_eos);
+
+    try testing.expect(config.isEosToken(151645)); // now stops on <|im_end|>
+    try testing.expect(config.isEosToken(151643)); // original preserved
+    try testing.expectEqual(@as(u32, 2), config.num_eos_tokens);
+
+    // Idempotent: re-running the merge must not duplicate.
+    if (!config.isEosToken(chat_eos)) config.addEosToken(chat_eos);
+    try testing.expectEqual(@as(u32, 2), config.num_eos_tokens);
+}
+
 test "ModelConfig eosTokenSlice" {
     var config = ModelConfig{};
     config.addEosToken(10);

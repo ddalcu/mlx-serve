@@ -587,19 +587,25 @@ pub fn main(init: std.process.Init) !void {
     };
     chat_config.* = try chat_mod.loadChatConfig(io, allocator, model_dir);
 
-    // Resolve EOS tokens from tokenizer if config.json didn't specify any
-    if (config.num_eos_tokens == 0) {
-        if (chat_config.eos_token) |eos_str| {
-            if (tok.special_tokens.get(eos_str)) |eos_id| {
+    // Merge the tokenizer's chat-terminator EOS into the stop set — ALWAYS,
+    // even when config.json already specified an eos_token_id. Some checkpoints
+    // (e.g. Qwen2.5-Coder-7B) set config.json eos_token_id to <|endoftext|>
+    // (151643) but their chat template ends turns with <|im_end|> (151645);
+    // stopping only on config's id leaks <|im_end|> into the output (breaks
+    // structured-JSON / tool-calling). Additive + dedup-guarded: this can only
+    // ADD a model-declared stop token, never remove one.
+    if (chat_config.eos_token) |eos_str| {
+        if (tok.special_tokens.get(eos_str)) |eos_id| {
+            if (!config.isEosToken(eos_id)) {
                 config.addEosToken(eos_id);
                 log.info("EOS token from tokenizer: {s} (id={d})\n", .{ eos_str, eos_id });
             }
         }
-        // Also add <|endoftext|> if it exists and wasn't already added
-        if (tok.special_tokens.get("<|endoftext|>")) |eot_id| {
-            if (!config.isEosToken(eot_id)) {
-                config.addEosToken(eot_id);
-            }
+    }
+    // Also add <|endoftext|> if it exists and wasn't already added.
+    if (tok.special_tokens.get("<|endoftext|>")) |eot_id| {
+        if (!config.isEosToken(eot_id)) {
+            config.addEosToken(eot_id);
         }
     }
 
