@@ -79,6 +79,27 @@ pub fn getAppRssMb() u32 {
     return @intCast(info.resident_size / (1024 * 1024));
 }
 
+/// Bytes of physical memory available for new allocation without heavy
+/// swapping: total minus the resident-and-non-reclaimable set (active + wired +
+/// compressed). Free/inactive/speculative/purgeable pages count as available.
+/// Returns 0 if the query fails (callers treat 0 as "unknown — don't block").
+pub fn getAvailableMemBytes() u64 {
+    var total_mem: u64 = 0;
+    var len: usize = @sizeOf(u64);
+    if (sysctlbyname("hw.memsize", @ptrCast(&total_mem), &len, null, 0) != 0) return 0;
+
+    var page: usize = 0;
+    if (host_page_size(mach_host_self(), &page) != 0) return 0;
+
+    var vm = std.mem.zeroes(VmStats64);
+    var count: u32 = @sizeOf(VmStats64) / @sizeOf(i32);
+    if (host_statistics64(mach_host_self(), 4, @ptrCast(&vm), &count) != 0) return 0;
+
+    const used: u64 = (@as(u64, vm.active_count) + vm.wire_count + vm.compressor_page_count) * page;
+    if (total_mem == 0 or used >= total_mem) return 0;
+    return total_mem - used;
+}
+
 pub fn getSysMemPct() u32 {
     var total_mem: u64 = 0;
     var len: usize = @sizeOf(u64);

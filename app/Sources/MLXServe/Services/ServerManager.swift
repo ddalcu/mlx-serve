@@ -172,6 +172,43 @@ class ServerManager: ObservableObject {
         }
     }
 
+    /// Distill a crashed server's stderr tail into one human-meaningful line for
+    /// the menu-bar error. A blind `suffix(N)` lands mid-native-backtrace (e.g.
+    /// "…wqthread + 8") and buries the real cause; this surfaces the actual fatal
+    /// line — GPU OOM, our own pre-flight refusal, or a recognized error
+    /// signature — falling back to the last non-empty line. Pure + testable.
+    nonisolated static func summarizeCrash(_ log: String, exitCode: Int32) -> String {
+        let trimmed = log.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty { return "exit code \(exitCode)" }
+        let lines = trimmed.split(whereSeparator: \.isNewline).map(String.init)
+
+        // Our own pre-flight already emits a clean, actionable line — prefer it.
+        if let l = lines.last(where: { $0.contains("Insufficient memory to load model") }) {
+            return l
+        }
+        // A Metal GPU out-of-memory crash → friendly, actionable message. Match
+        // the Metal/IOGPU marker specifically so we don't catch unrelated lines
+        // that merely contain "insufficient memory".
+        if lines.contains(where: {
+            $0.contains("kIOGPUCommandBufferCallbackErrorOutOfMemory")
+                || ($0.contains("[METAL]") && $0.localizedCaseInsensitiveContains("Insufficient Memory"))
+        }) {
+            return "Out of GPU memory while loading the model — free memory (close other models/apps) and try again."
+        }
+        // Otherwise surface the most meaningful fatal line, scanning from the end.
+        let needles = ["terminating due to", "MLX error", "MISSING WEIGHT", "[fatal]", "panic", "error:"]
+        for line in lines.reversed() {
+            if needles.contains(where: { line.localizedCaseInsensitiveContains($0) }) {
+                // Strip the C++ "...uncaught exception of type T: " preamble.
+                if let r = line.range(of: "std::runtime_error: ") {
+                    return String(line[r.upperBound...])
+                }
+                return line
+            }
+        }
+        return lines.last ?? "exit code \(exitCode)"
+    }
+
     private func handleTermination(exitCode: Int32) {
         pollSource?.cancel()
         pollSource = nil
@@ -187,7 +224,7 @@ class ServerManager: ObservableObject {
         // made it to @Published.
         let errSnippet = currentServerLogSnapshot()
             .trimmingCharacters(in: .whitespacesAndNewlines)
-        let shortErr = errSnippet.isEmpty ? "exit code \(exitCode)" : String(errSnippet.suffix(200))
+        let shortErr = Self.summarizeCrash(errSnippet, exitCode: exitCode)
         let fullLog = errSnippet.isEmpty ? "(no stderr captured — exit code \(exitCode))" : errSnippet
 
         if case .running = status {
