@@ -1520,19 +1520,19 @@ fn preloadCpuState(allocator: std.mem.Allocator, io: std.Io, model_dir: []const 
     cc.* = try chat_mod.loadChatConfig(io, allocator, model_dir);
     errdefer cc.deinit();
 
-    // Same EOS-resolution shenanigans main.zig does — without them the
-    // generated text won't stop on tokenizer-defined EOS strings.
-    if (config.num_eos_tokens == 0) {
-        if (cc.eos_token) |eos_str| {
-            if (tok.special_tokens.get(eos_str)) |eos_id| {
-                config.addEosToken(eos_id);
-            }
+    // Same EOS-resolution as main.zig — merge the tokenizer's chat-terminator
+    // EOS into the stop set ALWAYS, even when config.json already specified an
+    // eos_token_id. Some checkpoints (e.g. Qwen2.5-Coder-7B) set config.json
+    // eos_token_id to <|endoftext|> but end chat turns with <|im_end|>; gating
+    // on `num_eos_tokens == 0` left <|im_end|> out of the stop set and it leaked
+    // into output. Additive + dedup-guarded: only ever ADDS a declared stop.
+    if (cc.eos_token) |eos_str| {
+        if (tok.special_tokens.get(eos_str)) |eos_id| {
+            if (!config.isEosToken(eos_id)) config.addEosToken(eos_id);
         }
-        if (tok.special_tokens.get("<|endoftext|>")) |eot_id| {
-            if (!config.isEosToken(eot_id)) {
-                config.addEosToken(eot_id);
-            }
-        }
+    }
+    if (tok.special_tokens.get("<|endoftext|>")) |eot_id| {
+        if (!config.isEosToken(eot_id)) config.addEosToken(eot_id);
     }
     if (tok.special_tokens.get("<pad>")) |pad_id| {
         if (pad_id > 0 and !config.isEosToken(pad_id)) {
