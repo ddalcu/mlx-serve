@@ -688,6 +688,16 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
     // Set model-family defaults based on model_type
     if (std.mem.eql(u8, model_type, "gemma3")) {
         config.model_type = "gemma3";
+        // gemma-3-4b-it's text_config omits num_attention_heads / num_key_value_heads
+        // / head_dim and leans on the HF Gemma3TextConfig defaults (8 q-heads,
+        // 4 kv-heads, head_dim 256). Our struct defaults are the 12b/27b shape
+        // (16/8), so apply the HF defaults explicitly when the config is silent —
+        // otherwise the Q projection (8*256) reshapes against 16 heads and the
+        // model crashes at warmup (issue #43). The 12b ships these fields, so its
+        // values are read at lines 458-460 and these fills never fire.
+        if (cfg_obj.get("num_attention_heads") == null) config.num_attention_heads = 8;
+        if (cfg_obj.get("num_key_value_heads") == null) config.num_key_value_heads = 4;
+        if (cfg_obj.get("head_dim") == null) config.head_dim = 256;
         config.weight_prefix = "language_model.model";
         config.hidden_act = .gelu_approx;
         config.norm_has_offset = true;
@@ -1558,6 +1568,65 @@ test "ModelConfig parses gemma4_unified text_config" {
     try testing.expectEqual(@as(u32, 48), config.num_hidden_layers);
     // Unified flag drives the encoder-free vision/audio embedder path.
     try testing.expect(config.is_gemma4_unified);
+}
+
+test "ModelConfig fills HF gemma3 defaults when text_config omits head counts" {
+    // gemma-3-4b-it-4bit's text_config carries hidden_size/num_hidden_layers but
+    // OMITS num_attention_heads/num_key_value_heads/head_dim, relying on the HF
+    // Gemma3TextConfig defaults (8 q-heads / 4 kv-heads / head_dim 256). Our
+    // struct defaults are the 12b/27b shape (16 q / 8 kv), so without an explicit
+    // fill the Q projection (8*256=2048) gets reshaped against 16 heads and the
+    // model crashes at warmup with "Cannot reshape array of size 2048 into shape
+    // (1,1,16,256)" (issue #43). The 12b config ships these fields explicitly, so
+    // it was never affected.
+    const json =
+        \\{
+        \\  "model_type": "gemma3",
+        \\  "text_config": {
+        \\    "model_type": "gemma3_text",
+        \\    "hidden_size": 2560,
+        \\    "intermediate_size": 10240,
+        \\    "num_hidden_layers": 34,
+        \\    "sliding_window": 1024,
+        \\    "rms_norm_eps": 1e-06
+        \\  },
+        \\  "vision_config": {"hidden_size": 1152},
+        \\  "quantization": {"bits": 4, "group_size": 32}
+        \\}
+    ;
+    const config = try parseConfigFromJson(testing.allocator, json);
+    try testing.expectEqualStrings("gemma3", config.model_type);
+    // HF Gemma3TextConfig defaults — NOT our 12b-shaped struct defaults (16/8).
+    try testing.expectEqual(@as(u32, 8), config.num_attention_heads);
+    try testing.expectEqual(@as(u32, 4), config.num_key_value_heads);
+    try testing.expectEqual(@as(u32, 256), config.head_dim);
+    // Fields the 4b text_config DOES carry must still win.
+    try testing.expectEqual(@as(u32, 2560), config.hidden_size);
+    try testing.expectEqual(@as(u32, 34), config.num_hidden_layers);
+}
+
+test "ModelConfig keeps explicit gemma3 head counts (12b)" {
+    // Regression guard for the fix above: a gemma3 text_config that DOES ship
+    // head counts must keep them, never get clobbered by the HF-default fill.
+    const json =
+        \\{
+        \\  "model_type": "gemma3",
+        \\  "text_config": {
+        \\    "model_type": "gemma3_text",
+        \\    "hidden_size": 3840,
+        \\    "num_hidden_layers": 48,
+        \\    "num_attention_heads": 16,
+        \\    "num_key_value_heads": 8,
+        \\    "head_dim": 256,
+        \\    "sliding_window": 1024
+        \\  },
+        \\  "quantization": {"bits": 4, "group_size": 32}
+        \\}
+    ;
+    const config = try parseConfigFromJson(testing.allocator, json);
+    try testing.expectEqual(@as(u32, 16), config.num_attention_heads);
+    try testing.expectEqual(@as(u32, 8), config.num_key_value_heads);
+    try testing.expectEqual(@as(u32, 256), config.head_dim);
 }
 
 test "ModelConfig parses gemma4_unified vision + audio multimodal fields" {
