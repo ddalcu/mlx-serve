@@ -545,7 +545,10 @@ pub fn main(init: std.process.Init) !void {
     // explicit defer on `config_storage`.
     const config_storage = try allocator.create(model_mod.ModelConfig);
     var config_owned_by_registry = false;
-    errdefer if (!config_owned_by_registry) allocator.destroy(config_storage);
+    // defer-only, NOT errdefer + defer: a plain `defer` already runs on the
+    // error-return path, so pairing it with an errdefer that has the same body
+    // frees the resource twice on error (double-free / SIGSEGV). The runtime
+    // `owned_by_registry` guard makes the single defer correct on every exit.
     defer if (!config_owned_by_registry) allocator.destroy(config_storage);
     config_storage.* = try model_mod.parseConfig(io, allocator, model_dir);
     const config = config_storage;
@@ -564,10 +567,8 @@ pub fn main(init: std.process.Init) !void {
     log.info("Loading tokenizer...\n", .{});
     const tok = try allocator.create(tokenizer_mod.Tokenizer);
     var tok_owned_by_registry = false;
-    errdefer if (!tok_owned_by_registry) {
-        tok.deinit();
-        allocator.destroy(tok);
-    };
+    // defer-only (see config note above): errdefer + defer with the same body
+    // double-frees on the error-return path.
     defer if (!tok_owned_by_registry) {
         tok.deinit();
         allocator.destroy(tok);
@@ -577,10 +578,9 @@ pub fn main(init: std.process.Init) !void {
     // Load chat config — heap-allocated, ownership transfers to registry on serve_mode.
     const chat_config = try allocator.create(chat_mod.ChatConfig);
     var chat_config_owned_by_registry = false;
-    errdefer if (!chat_config_owned_by_registry) {
-        chat_config.deinit();
-        allocator.destroy(chat_config);
-    };
+    // defer-only (see config note above): errdefer + defer with the same body
+    // double-frees on the error-return path — this is the one that crashed in
+    // the #45 GPU-OOM pre-flight refusal (ChatConfig.deinit ran twice).
     defer if (!chat_config_owned_by_registry) {
         chat_config.deinit();
         allocator.destroy(chat_config);
