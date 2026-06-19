@@ -1,5 +1,16 @@
 # Changelog
 
+## v26.6.11 — Message your model from your phone
+
+- **Telegram bot — your model in your pocket.** Make a bot in Telegram, paste its token, flip a switch, and message your local model from anywhere — no public URL, port-forwarding, or cloud relay; it works behind home Wi-Fi over your normal connection. Turn on Agent mode and it can run tools, read and write files (confined to a workspace folder), and even schedule tasks for you, all from your phone. The bot locks to the first chat that messages it, so no one else can drive your Mac.
+- **Paste anything straight into chat.** Drop or paste an image, a PDF, or a whole folder into the message box — the same as the attach button. Folders get indexed for question-answering, PDFs have their text pulled in, and images go to vision models.
+- **Cleaner agent conversations.** Tool calls and their results now fold into a compact, expandable summary, so a long agent run reads like a clear narrative instead of screens of raw output.
+- **Memory you can see — and that stops surprising you.** A new memory readout in the menu-bar tray shows what your model and context are using, and a pre-flight check turns a "model too big for free RAM" crash into a clear, upfront message. On 16 GB Macs the context window and cross-request cache now size themselves to your RAM, so long agent sessions stay stable — and if a prompt genuinely won't fit, you get a plain "prompt too long" notice instead of an out-of-memory crash. The server log also shows the exact launch command at the top for easy troubleshooting.
+- **More Gemma 3 models supported.** Flat text-only Gemma 3 checkpoints — including the popular abliterated builds — now load and run out of the box.
+- **Smoother Voice Mode setup, cleaner Gemma replies.** Turning on Voice Mode now shows a friendly card naming exactly what's missing — the on-device dictation model, microphone access — instead of quietly failing. And a Gemma quirk that occasionally leaked a raw thinking tag into the end of a reply is fixed, so answers stay clean.
+
+---
+
 ## v26.6.10 — Text diffusion lands on Apple Silicon
 
 - **DiffusionGemma runs natively.** Google's block-diffusion model ([diffusiongemma-26B-A4B-it](https://huggingface.co/mlx-community/diffusiongemma-26B-A4B-it-4bit)) writes whole 256-token blocks in parallel instead of one token at a time: the full canvas-denoising loop — entropy-bound sampling, self-conditioning, adaptive early stopping — validated tensor-by-tensor against the reference implementation. Up to 25 tokens land per forward pass, and decode runs ~30% faster than the mlx-vlm reference on the same M-series hardware (31.8 vs 24.6 tok/s on a story prompt).

@@ -92,22 +92,34 @@ enum AgentPrompt {
         You are honest about limitations and errors rather than hiding them.
         """
 
-    private static let defaultUserPromptFile = """
-        # Custom Instructions
-        Add your project-specific rules, preferences, or personality tweaks here.
-        These are appended to the base system prompt.
-        """
-
-    /// Load system prompt: hardcoded base + additive user customizations from `~/.mlx-serve/system-prompt.md`.
+    /// The agent system prompt. `~/.mlx-serve/system-prompt.md` is the single
+    /// editable source of truth: seeded with `defaultPromptFile` on first use,
+    /// then the file IS the prompt — users edit it wholesale via the tray's
+    /// "Edit System Prompt" (`openSystemPromptInEditor` seeds the same default).
+    /// Falls back to `defaultPromptFile` for an empty/unreadable file, or one
+    /// still holding the pre-v26.6.11 additive "Custom Instructions" stub —
+    /// migrating that stub in place so the editor and the agent stay in sync.
     static var systemPrompt: String {
-        var prompt = defaultPromptFile
-        ensureFile(at: promptPath, defaultContent: defaultUserPromptFile)
-        let userPrompt = (try? String(contentsOfFile: promptPath, encoding: .utf8))?
-            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
-        if !userPrompt.isEmpty {
-            prompt += "\n\n# User Instructions\n" + userPrompt
+        ensureFile(at: promptPath, defaultContent: defaultPromptFile)
+        let raw = (try? String(contentsOfFile: promptPath, encoding: .utf8)) ?? ""
+        let resolved = resolvePrompt(fileContent: raw)
+        if resolved == defaultPromptFile,
+           raw.trimmingCharacters(in: .whitespacesAndNewlines) != defaultPromptFile {
+            try? defaultPromptFile.write(toFile: promptPath, atomically: true, encoding: .utf8)
         }
-        return prompt
+        return resolved
+    }
+
+    /// Pure resolution of the on-disk prompt file to the effective prompt: an
+    /// empty file — or one still holding the legacy additive stub from before
+    /// the prompt was unified into this file — yields the built-in default;
+    /// anything else is the user's own prompt, verbatim (trimmed).
+    static func resolvePrompt(fileContent: String) -> String {
+        let trimmed = fileContent.trimmingCharacters(in: .whitespacesAndNewlines)
+        if trimmed.isEmpty || trimmed.contains("These are appended to the base system prompt") {
+            return defaultPromptFile
+        }
+        return trimmed
     }
 
     /// Load persistent memory from `~/.mlx-serve/memory.md`, capped at last 30 entries / ~2000 chars.
