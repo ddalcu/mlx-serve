@@ -239,7 +239,10 @@ jobs:
           # Ogg/Opus voice notes. SwiftPM fetched them into app/.build/artifacts;
           # embed the macOS slice so the app resolves @rpath/Ybrid*.framework at
           # runtime (without this the .app fails to launch). Mirrors app/build.sh.
-          ARTIFACTS="$(dirname "$SWIFT_BIN_PATH")/artifacts"
+          # NOTE: SwiftPM extracts binary artifacts to .build/artifacts (NOT under
+          # the per-triple bin dir), so go up TWO levels from --show-bin-path
+          # (.build/<triple>/release -> .build) before appending /artifacts.
+          ARTIFACTS="$(dirname "$(dirname "$SWIFT_BIN_PATH")")/artifacts"
           for fwname in YbridOpus YbridOgg; do
             fwsrc=$(find "$ARTIFACTS" -path "*macos-arm64*/$fwname.framework" -type d 2>/dev/null | head -1)
             if [ -n "$fwsrc" ]; then

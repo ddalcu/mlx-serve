@@ -32,6 +32,13 @@ final class VoiceModeController: ObservableObject {
     /// nothing — the runtime signature of on-device dictation being off (the
     /// pre-flight can't see this; `supportsOnDeviceRecognition` stays true).
     private var unrecognizedSpeechStreak = 0
+    /// True once recognition has produced ANY text this session (partial or
+    /// final). That's positive proof on-device dictation is installed + on, so
+    /// the "dictation unavailable" notice is then categorically wrong — later
+    /// empty endpoints are just noise (a cough, the assistant's own TTS bleeding
+    /// into the mic) and must never surface it. The empty-speech streak only
+    /// diagnoses a genuinely-dead recognizer, i.e. before any text appears.
+    private var hasRecognizedSpeech = false
     /// Surface the notice after this many empty-speech turns in a row — one stray
     /// noise shouldn't nag; two in a row means recognition really isn't working.
     private static let unrecognizedSpeechLimit = 2
@@ -212,7 +219,16 @@ final class VoiceModeController: ObservableObject {
 
     private func wire() {
         recognizer.onSpeechStarted = { [weak self] in self?.handleSpeechStarted() }
-        recognizer.onPartialTranscript = { [weak self] t in self?.partialTranscript = t }
+        recognizer.onPartialTranscript = { [weak self] t in
+            guard let self else { return }
+            self.partialTranscript = t
+            // Any partial text is proof on-device dictation is working — clear
+            // the empty-speech streak and latch it so noise can't false-trigger.
+            if !t.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                self.hasRecognizedSpeech = true
+                self.unrecognizedSpeechStreak = 0
+            }
+        }
         recognizer.onFinalTranscript = { [weak self] t in self?.handleFinalTranscript(t) }
         recognizer.onUnrecognizedSpeech = { [weak self] in self?.handleUnrecognizedSpeech() }
         recognizer.onError = { [weak self] m in self?.send(.failed(m)) }
@@ -235,6 +251,7 @@ final class VoiceModeController: ObservableObject {
         }
         setupIssue = nil
         unrecognizedSpeechStreak = 0
+        hasRecognizedSpeech = false
         send(.start)
         isActive = true
         disarmFollowUp()              // a fresh session always starts behind the wake word
@@ -248,6 +265,10 @@ final class VoiceModeController: ObservableObject {
     /// "Open Keyboard Settings" affordance as the pre-flight).
     private func handleUnrecognizedSpeech() {
         guard isActive else { return }
+        // Recognition already produced text this session → dictation is provably
+        // installed + on. This empty endpoint is just noise; never claim
+        // "dictation unavailable" and never stop a working session over it.
+        if hasRecognizedSpeech { return }
         unrecognizedSpeechStreak += 1
         guard unrecognizedSpeechStreak >= Self.unrecognizedSpeechLimit else { return }
         end()
@@ -415,6 +436,7 @@ final class VoiceModeController: ObservableObject {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
         unrecognizedSpeechStreak = 0   // recognition is working — clear the streak
+        hasRecognizedSpeech = true     // …and latch it: never nag "unavailable" again
 
         guard let query = wakeWordGate(trimmed) else {
             // Ambient speech we weren't addressed in, or a bare wake phrase that

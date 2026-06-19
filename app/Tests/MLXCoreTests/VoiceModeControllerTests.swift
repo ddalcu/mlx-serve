@@ -230,6 +230,36 @@ final class VoiceModeControllerTests: XCTestCase {
         XCTAssertNil(c.setupIssue)
     }
 
+    /// The false-positive the user hit: dictation has been transcribing fine,
+    /// then a couple of empty endpoints land back-to-back — a cough, a door, or
+    /// the assistant's own TTS bleeding into the mic crossing the VAD threshold
+    /// with no words. Once recognition has produced text this session, on-device
+    /// dictation is provably installed + on, so "dictation unavailable" is wrong
+    /// and must NEVER surface — and a benign noise burst must not kill the
+    /// working session. (Old behavior: streak went 1→2 and false-tripped.)
+    func testUnrecognizedSpeechNeverNagsAfterSuccessfulTranscript() async {
+        let (c, rec, _, _, _) = makeRunnable()
+        _ = await c.begin()
+        rec.onFinalTranscript?("hello there")  // proves on-device dictation works
+        rec.onUnrecognizedSpeech?()            // noise burst 1
+        rec.onUnrecognizedSpeech?()            // noise burst 2 — old streak would trip here
+        XCTAssertNil(c.setupIssue, "recognition already worked — never claim dictation is unavailable")
+        XCTAssertTrue(c.isActive, "a benign noise burst must not stop a working session")
+    }
+
+    /// Even a partial transcript is proof dictation works — words were detected.
+    /// Words mid-utterance followed by empty endpoints must not surface the
+    /// notice either.
+    func testPartialTranscriptAloneSuppressesDictationNotice() async {
+        let (c, rec, _) = make()
+        _ = await c.begin()
+        rec.onPartialTranscript?("hey lo")     // words detected → dictation is working
+        rec.onUnrecognizedSpeech?()            // 1
+        rec.onUnrecognizedSpeech?()            // 2 — would have tripped the streak
+        XCTAssertNil(c.setupIssue)
+        XCTAssertTrue(c.isActive)
+    }
+
     func testEndClearsSetupIssue() async {
         let (c, rec, _) = make()
         rec.authorized = false
