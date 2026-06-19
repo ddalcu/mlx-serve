@@ -32,6 +32,46 @@ final class ServerOptionsTests: XCTestCase {
         XCTAssertFalse(contains(args, flag: "--timeout"))   // 300 = default, not emitted
     }
 
+    /// SYNC GUARD (2026-06): every "emit-only-when-non-default" launch flag
+    /// assumes a specific SERVER-side default. If the Swift default — or the
+    /// emit guard — drifts from it, the flag is omitted and the server silently
+    /// runs ITS default. That's exactly the prefix-cache-entries (1-vs-32, OOM)
+    /// and llama-cache-entries (1-vs-4) surprises. For a fresh ServerOptions(),
+    /// NONE of these flags may appear: the app default must equal the server
+    /// default. The comments name the Zig source of truth — change both together.
+    /// See CLAUDE.md "ServerOptions defaults must mirror the Zig server defaults".
+    func testDefaultsMatchDocumentedServerDefaults() {
+        let d = ServerOptions()
+        // Each Swift default MUST equal the server default it mirrors. The
+        // llama-cache-entries bug was a SILENT one: Swift defaulted to 1, the
+        // server to 4, and the flag was omitted (1 != 1 is false), so the
+        // server ran 4 while the UI showed 1 — an emit-check alone can't catch
+        // that. These value assertions can; update both sides together.
+        XCTAssertEqual(d.ctxSize, 0)                  // main.zig ctx_size
+        XCTAssertEqual(d.requestTimeout, 300)         // main.zig timeout
+        XCTAssertEqual(d.noVision, false)             // main.zig no_vision
+        XCTAssertEqual(d.maxConcurrent, 1)            // server.zig max_concurrent
+        XCTAssertEqual(d.kvQuant, .off)               // server.zig kv-quant
+        XCTAssertEqual(d.prefixCacheMem, "2GB")       // server.zig prefix_cache_mem_bytes
+        XCTAssertEqual(d.tokenizeCacheEntries, 4)     // server.zig tokenize_cache_entries
+        XCTAssertEqual(d.llamaKvQuant, .off)          // server.zig llama_kv_quant
+        XCTAssertEqual(d.llamaCacheEntries, 4)        // server.zig llama_cache_entries
+        XCTAssertEqual(d.skipMemPreflight, false)     // scheduler.zig skip_mem_preflight
+
+        // Corollary: with defaults matching the server, a fresh launch omits
+        // every match-default flag (each guard fires only on a real change).
+        let args = d.toCLIArgs(physicalMemoryBytes: 64 * Self.GiB)
+        for flag in ["--ctx-size", "--timeout", "--no-vision", "--max-concurrent",
+                     "--kv-quant", "--prefix-cache-mem", "--tokenize-cache-entries",
+                     "--llama-kv-quant", "--llama-cache-entries", "--skip-mem-preflight",
+                     "--top-k", "--drafter"] {
+            XCTAssertFalse(args.contains(flag),
+                "\(flag) appeared at default — its Swift default or emit-guard drifted from the server")
+        }
+        // ALWAYS-emitted flags (authoritative from the app) MUST be present.
+        XCTAssertTrue(args.contains("--prefix-cache-entries"))
+    }
+
     /// 4096 was too low: a single thinking trace + agentic answer routinely
     /// tripped `finish_reason: "length"` and surfaced the truncation notice.
     /// The default per-turn output budget must be generous — the server still
@@ -191,21 +231,77 @@ final class ServerOptionsTests: XCTestCase {
     }
 
     func testLlamaCacheEntriesOmittedAtDefault() {
+        // Default (4) MUST equal the server's `llama_cache_entries` default so
+        // omitting the flag runs the same value — the prior Swift default of 1
+        // silently ran the server's 4 (mismatch surprise).
         let args = ServerOptions().toCLIArgs()
         XCTAssertFalse(args.contains("--llama-cache-entries"))
+        XCTAssertEqual(ServerOptions().llamaCacheEntries, 4,
+                       "must mirror server.zig llama_cache_entries default")
     }
 
-    func testLlamaCacheEntriesEmitsWhenAboveOne() {
+    func testLlamaCacheEntriesEmitsWhenChanged() {
         var opts = ServerOptions()
-        opts.llamaCacheEntries = 4
-        let args = opts.toCLIArgs()
-        XCTAssertTrue(contains(args, flag: "--llama-cache-entries", value: "4"))
+        opts.llamaCacheEntries = 1   // off the (4) default → must be emitted
+        XCTAssertTrue(contains(opts.toCLIArgs(), flag: "--llama-cache-entries", value: "1"))
+        opts.llamaCacheEntries = 8
+        XCTAssertTrue(contains(opts.toCLIArgs(), flag: "--llama-cache-entries", value: "8"))
     }
 
     func testTokenizeCacheEntriesOmittedAtDefault() {
         let args = ServerOptions().toCLIArgs()
         XCTAssertFalse(args.contains("--tokenize-cache-entries"),
                       "default (4) must NOT emit — matches server-side default")
+    }
+
+    // MARK: - Prefix cache: RAM clamp + always-emit (16 GB OOM fix)
+
+    private static let GiB: UInt64 = 1_073_741_824
+
+    /// Regression: the app only emitted `--prefix-cache-entries` when the value
+    /// differed from 1, but the SERVER default is 32 — so the flag was never
+    /// sent and a 32-entry cache silently launched, filling 16 GB Macs. The
+    /// flag must now ALWAYS be emitted so the server's 32 can't leak.
+    func testPrefixCacheEntriesAlwaysEmitted() {
+        let args = ServerOptions().toCLIArgs(physicalMemoryBytes: 64 * Self.GiB)
+        XCTAssertTrue(args.contains("--prefix-cache-entries"),
+                      "must always emit so the server's default-32 never leaks through")
+    }
+
+    func testPrefixCacheEntriesClampedOnLowRAM() {
+        var opts = ServerOptions()
+        opts.prefixCacheEntries = 8
+        // 16 GB Mac → capped to 1.
+        XCTAssertTrue(contains(opts.toCLIArgs(physicalMemoryBytes: 16 * Self.GiB),
+                               flag: "--prefix-cache-entries", value: "1"))
+        // 32 GB → capped to 8 (== request here, so unchanged).
+        XCTAssertTrue(contains(opts.toCLIArgs(physicalMemoryBytes: 32 * Self.GiB),
+                               flag: "--prefix-cache-entries", value: "8"))
+        // 64 GB → uncapped.
+        opts.prefixCacheEntries = 16
+        XCTAssertTrue(contains(opts.toCLIArgs(physicalMemoryBytes: 64 * Self.GiB),
+                               flag: "--prefix-cache-entries", value: "16"))
+    }
+
+    func testRamCappedPrefixCacheEntriesTiers() {
+        // ≤18 GB → 1
+        XCTAssertEqual(ServerOptions.ramCappedPrefixCacheEntries(8, physicalMemoryBytes: 16 * Self.GiB), 1)
+        XCTAssertEqual(ServerOptions.ramCappedPrefixCacheEntries(32, physicalMemoryBytes: 18 * Self.GiB), 1)
+        // ≤36 GB → 8
+        XCTAssertEqual(ServerOptions.ramCappedPrefixCacheEntries(32, physicalMemoryBytes: 32 * Self.GiB), 8)
+        XCTAssertEqual(ServerOptions.ramCappedPrefixCacheEntries(4, physicalMemoryBytes: 32 * Self.GiB), 4,
+                       "clamp is a ceiling, never raises a smaller request")
+        // big RAM → uncapped
+        XCTAssertEqual(ServerOptions.ramCappedPrefixCacheEntries(16, physicalMemoryBytes: 128 * Self.GiB), 16)
+        // explicit disable is preserved on every machine
+        XCTAssertEqual(ServerOptions.ramCappedPrefixCacheEntries(0, physicalMemoryBytes: 16 * Self.GiB), 0)
+    }
+
+    func testPrefixCacheDisableSurvivesClamp() {
+        var opts = ServerOptions()
+        opts.prefixCacheEntries = 0
+        XCTAssertTrue(contains(opts.toCLIArgs(physicalMemoryBytes: 16 * Self.GiB),
+                               flag: "--prefix-cache-entries", value: "0"))
     }
 
     func testTokenizeCacheEntriesEmitsWhenChanged() {
@@ -225,7 +321,7 @@ final class ServerOptionsTests: XCTestCase {
         b.llamaKvQuant = .q4
         XCTAssertFalse(a.serverLaunchEquals(b))
         b = ServerOptions()
-        b.llamaCacheEntries = 4
+        b.llamaCacheEntries = 2   // off the default (4)
         XCTAssertFalse(a.serverLaunchEquals(b))
         b = ServerOptions()
         b.tokenizeCacheEntries = 0
@@ -355,11 +451,11 @@ extension ServerOptionsTests {
         o.draftBlockSize = 8
         o.maxConcurrent = 4
         o.kvQuant = .int8
-        o.prefixCacheEntries = 8
+        o.prefixCacheEntries = 3   // off the default (8) so the round-trip moves it
         o.prefixCacheMem = "4GB"
         o.skipMemPreflight = true
         o.llamaKvQuant = .q8
-        o.llamaCacheEntries = 4
+        o.llamaCacheEntries = 2   // off the default (4) so the round-trip moves it
         o.tokenizeCacheEntries = 16
         o.defaultMaxTokens = 8192
         o.defaultTemperature = 0.42
@@ -389,44 +485,43 @@ extension ServerOptionsTests {
 }
 
 extension ServerOptionsTests {
-    // MARK: - Skip-memory-preflight env override
+    // MARK: - Skip-memory-preflight CLI flag
     //
-    // The MLX loader's free-RAM pre-flight is toggled by the
-    // MLX_SERVE_SKIP_MEM_PREFLIGHT environment variable, NOT a CLI flag, so the
-    // Settings toggle plumbs through `applyLaunchEnv` rather than `toCLIArgs`.
+    // The MLX loader's free-RAM pre-flight is now toggled by the
+    // `--skip-mem-preflight` CLI flag (was the MLX_SERVE_SKIP_MEM_PREFLIGHT env
+    // var) — same shape as every other launch knob, so it shows in --help, in
+    // `ps`, and in the launch-command echo at the top of the server log.
 
     func testSkipMemPreflightDefaultsOff() {
         XCTAssertFalse(ServerOptions().skipMemPreflight,
                        "the safety check must stay on by default")
     }
 
-    func testSkipMemPreflightSetsEnvVarWhenOn() {
+    func testSkipMemPreflightOmittedByDefault() {
+        XCTAssertFalse(ServerOptions().toCLIArgs().contains("--skip-mem-preflight"),
+                       "default (off) must not emit the flag so the pre-flight runs")
+    }
+
+    func testSkipMemPreflightEmitsFlagWhenOn() {
         var opts = ServerOptions()
         opts.skipMemPreflight = true
-        var env: [String: String] = [:]
-        opts.applyLaunchEnv(&env)
-        XCTAssertEqual(env["MLX_SERVE_SKIP_MEM_PREFLIGHT"], "1")
+        XCTAssertTrue(opts.toCLIArgs().contains("--skip-mem-preflight"))
     }
 
-    /// Off must strip an inherited value — `env` starts as the app's own
-    /// environment, so a var the app was launched with can't leak the override
-    /// into the server when the toggle is off.
-    func testSkipMemPreflightStripsInheritedEnvVarWhenOff() {
-        let opts = ServerOptions()  // skipMemPreflight = false
-        var env = ["MLX_SERVE_SKIP_MEM_PREFLIGHT": "1", "PATH": "/usr/bin"]
-        opts.applyLaunchEnv(&env)
-        XCTAssertNil(env["MLX_SERVE_SKIP_MEM_PREFLIGHT"],
-                     "off must remove the var so the pre-flight runs")
-        XCTAssertEqual(env["PATH"], "/usr/bin", "must not disturb other env vars")
-    }
-
-    /// It's an env var, not argv — it must never appear among the CLI flags.
-    func testSkipMemPreflightIsNotACLIFlag() {
+    /// It used to be an env var; the clean break makes it a normal CLI flag.
+    func testSkipMemPreflightTakesNoValueArg() {
         var opts = ServerOptions()
         opts.skipMemPreflight = true
         let args = opts.toCLIArgs()
-        XCTAssertFalse(args.contains { $0.localizedCaseInsensitiveContains("preflight") },
-                       "the memory override is an env var, never a CLI flag")
+        guard let i = args.firstIndex(of: "--skip-mem-preflight") else {
+            return XCTFail("flag missing")
+        }
+        // It's a bare boolean flag — the next token must be another flag (or end),
+        // never a value the server would mis-parse as a model path etc.
+        if i + 1 < args.count {
+            XCTAssertTrue(args[i + 1].hasPrefix("--"),
+                          "boolean flag must not be followed by a value token")
+        }
     }
 
     func testSkipMemPreflightChangeTriggersRestart() {

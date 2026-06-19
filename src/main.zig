@@ -50,6 +50,13 @@ fn printUsage(io: std.Io) void {
         \\  --timeout <n>       Request timeout in seconds (default: 300, 0=none)
         \\  --reasoning-budget <n>  Max thinking tokens per request (default: unlimited)
         \\  --no-vision         Disable vision encoder (saves memory)
+        \\  --skip-mem-preflight  Bypass the model-load free-RAM pre-flight that
+        \\                        refuses a load whose weights + warmup headroom
+        \\                        look too big for current free memory. The check
+        \\                        is conservative (macOS reclaims file cache as
+        \\                        MLX allocates); use this if a load you know fits
+        \\                        is being refused. A genuine over-commit can
+        \\                        hard-crash the server.
         \\  --pld               Enable Prompt Lookup Decoding (default: ON).
         \\                        Model-agnostic speculative decoding via n-gram
         \\                        matches in the prompt + generated tokens. Big
@@ -252,6 +259,8 @@ pub fn main(init: std.process.Init) !void {
             timeout = try std.fmt.parseInt(u32, args[i], 10);
         } else if (std.mem.eql(u8, args[i], "--no-vision")) {
             no_vision = true;
+        } else if (std.mem.eql(u8, args[i], "--skip-mem-preflight")) {
+            scheduler_mod.skip_mem_preflight = true;
         } else if (std.mem.eql(u8, args[i], "--pld")) {
             enable_pld = true;
         } else if (std.mem.eql(u8, args[i], "--no-pld")) {

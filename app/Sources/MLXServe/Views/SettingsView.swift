@@ -741,9 +741,17 @@ private struct PerformanceSectionContent: View {
             }
         }
         if let m = meta["prefixCacheEntries"] {
+            // Surface the RAM clamp so a 16 GB Mac user who sets, say, 8 sees
+            // that the launcher will actually pass 1 (and why).
+            let ram = ProcessInfo.processInfo.physicalMemory
+            let set = appState.serverOptions.prefixCacheEntries
+            let effective = ServerOptions.ramCappedPrefixCacheEntries(set, physicalMemoryBytes: ram)
+            let capNote = effective < set
+                ? "  ·  This Mac (\(MemoryInfo.format(Int64(ram)))) launches with \(effective) to keep cache memory bounded."
+                : ""
             SettingsRow(
                 title: m.title,
-                explainer: m.explainer,
+                explainer: m.explainer + capNote,
                 isDirty: dirty.dirty(\.prefixCacheEntries)
             ) {
                 Stepper(value: opts.prefixCacheEntries, in: 0...16) {

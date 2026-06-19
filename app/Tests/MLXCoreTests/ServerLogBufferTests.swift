@@ -180,6 +180,41 @@ final class ServerLogBufferTests: XCTestCase {
                        "Stopped poller must not invoke its snapshot closure")
     }
 
+    // MARK: - Launch command echo (top of the server log)
+    //
+    // The log window now prints the exact invocation above the server's own
+    // first line so the user can see and reproduce how mlx-serve was launched.
+
+    func testLaunchCommandLineJoinsBinaryAndArgs() {
+        let cmd = ServerManager.launchCommandLine(
+            binaryPath: "/Applications/MLX Core.app/Contents/MacOS/mlx-serve",
+            args: ["--model", "/Volumes/Models/Qwen", "--serve", "--port", "11234"])
+        // Binary path has a space → quoted; the whole invocation is present.
+        XCTAssertTrue(cmd.contains("\"/Applications/MLX Core.app/Contents/MacOS/mlx-serve\""))
+        XCTAssertTrue(cmd.contains("--model"))
+        XCTAssertTrue(cmd.contains("--port 11234"))
+    }
+
+    func testLaunchCommandLineQuotesArgsWithSpaces() {
+        let cmd = ServerManager.launchCommandLine(
+            binaryPath: "/usr/bin/mlx-serve",
+            args: ["--model", "/Volumes/My Drive/model dir"])
+        XCTAssertTrue(cmd.contains("\"/Volumes/My Drive/model dir\""),
+                      "a path with spaces must be quoted so the line is copy-pasteable")
+        XCTAssertFalse(cmd.contains("/usr/bin/mlx-serve\""), "a space-free binary path stays unquoted")
+    }
+
+    /// Every launch knob — including --skip-mem-preflight — is a CLI flag now,
+    /// so it rides through `args` into the echoed command (no special-casing).
+    func testLaunchCommandLineEchoesSkipPreflightFlag() {
+        let cmd = ServerManager.launchCommandLine(
+            binaryPath: "/usr/bin/mlx-serve",
+            args: ["--serve", "--skip-mem-preflight"])
+        XCTAssertTrue(cmd.contains("--skip-mem-preflight"))
+        XCTAssertFalse(cmd.contains("MLX_SERVE_SKIP_MEM_PREFLIGHT"),
+                       "the env var is gone — it must not reappear in the echoed command")
+    }
+
     // MARK: - Crash summary (menu-bar error text)
     //
     // The menu bar used to show `String(stderr.suffix(200))`, which on a crash

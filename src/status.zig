@@ -94,7 +94,7 @@ pub fn getAppRssMb() u32 {
 /// so counting `internal` makes a second large load correctly fail the guard.
 /// Slightly conservative (wired-anonymous pages can appear in both `wired` and
 /// `internal`), which is the safe direction for an OOM guard
-/// (`MLX_SERVE_SKIP_MEM_PREFLIGHT=1` overrides). Returns 0 when total is 0 or
+/// (`--skip-mem-preflight` overrides). Returns 0 when total is 0 or
 /// used ≥ total (a failed query must never block).
 fn computeAvailableBytes(total_mem: u64, wire_pages: u64, compressor_pages: u64, internal_pages: u64, page: u64) u64 {
     const used: u64 = (wire_pages + compressor_pages + internal_pages) * page;

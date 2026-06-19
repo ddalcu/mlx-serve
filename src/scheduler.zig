@@ -1716,6 +1716,12 @@ fn modelDiskBytes(io: std.Io, model_dir: []const u8) u64 {
 /// free → hard process-killing OOM), which this still catches. Returns false
 /// (allow the load) when either figure is 0 — a failed memory query must never
 /// block a load.
+/// Set by `--skip-mem-preflight` (main.zig) to bypass the model-load memory
+/// pre-flight below. A module global, not a `LoadParams` field, so it applies
+/// uniformly to startup loads AND later hot-loads — matching the env var
+/// (`MLX_SERVE_SKIP_MEM_PREFLIGHT`) it replaced.
+pub var skip_mem_preflight: bool = false;
+
 fn memInsufficientForLoad(weights_bytes: u64, avail_bytes: u64) bool {
     if (weights_bytes == 0 or avail_bytes == 0) return false;
     // Headroom over the weights for warmup compute buffers + a baseline KV cache.
@@ -1724,7 +1730,7 @@ fn memInsufficientForLoad(weights_bytes: u64, avail_bytes: u64) bool {
     // — so this margin can be generous without wrongly refusing a fresh load.
     // CAVEAT: the KV cache scales with --ctx-size, which this guard doesn't see;
     // a very large context can still exceed this margin (follow-up: plumb ctx +
-    // kv_quant to size KV precisely). Bypass with MLX_SERVE_SKIP_MEM_PREFLIGHT=1.
+    // kv_quant to size KV precisely). Bypass with --skip-mem-preflight.
     const headroom: u64 = weights_bytes / 8 + 1024 * 1024 * 1024;
     return avail_bytes < weights_bytes + headroom;
 }
@@ -1796,13 +1802,13 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // so it terminates the whole process. Refuse the load up front instead, with
     // an actionable error, when free RAM clearly can't hold the weights + warmup
     // headroom — catches the common "restarted before the prior server released
-    // its memory" case. Bypass with MLX_SERVE_SKIP_MEM_PREFLIGHT=1.
-    if (std.c.getenv("MLX_SERVE_SKIP_MEM_PREFLIGHT") == null) {
+    // its memory" case. Bypass with --skip-mem-preflight.
+    if (!skip_mem_preflight) {
         const weights_bytes = modelDiskBytes(sch.io, params.model_dir);
         const avail_bytes = status.getAvailableMemBytes();
         if (memInsufficientForLoad(weights_bytes, avail_bytes)) {
             const gb = 1024.0 * 1024.0 * 1024.0;
-            log.err("Insufficient memory to load model: weights ~{d:.1} GB but only {d:.1} GB free. Close other models/apps (or wait for a prior mlx-serve to fully exit) and retry; set MLX_SERVE_SKIP_MEM_PREFLIGHT=1 to override.\n", .{
+            log.err("Insufficient memory to load model: weights ~{d:.1} GB but only {d:.1} GB free. Close other models/apps (or wait for a prior mlx-serve to fully exit) and retry; pass --skip-mem-preflight to override.\n", .{
                 @as(f64, @floatFromInt(weights_bytes)) / gb,
                 @as(f64, @floatFromInt(avail_bytes)) / gb,
             });

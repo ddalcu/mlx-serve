@@ -103,10 +103,12 @@ class ServerManager: ObservableObject {
             env["DYLD_LIBRARY_PATH"] = existing.isEmpty ? frameworksPath : "\(frameworksPath):\(existing)"
             env["MLX_METAL_PATH"] = frameworksPath
         }
-        // Env-var-driven launch overrides (memory pre-flight). Resolves the key
-        // in both directions, so an inherited value can't leak past the toggle.
-        options.applyLaunchEnv(&env)
         proc.environment = env
+
+        // Echo the launch command at the top of the log (the buffer was just
+        // cleared, so this lands above the server's own first line). Lets the
+        // user see and reproduce the exact invocation.
+        logBuffer.append(Self.launchCommandLine(binaryPath: binaryPath, args: args) + "\n\n")
 
         // Capture stderr to show errors in the UI
         let errPipe = Pipe()
@@ -275,6 +277,19 @@ class ServerManager: ObservableObject {
         if buf.count > maxBytes {
             buf = String(buf.suffix(maxBytes))
         }
+    }
+
+    /// A copy-pasteable launch command line, shown at the top of the server log
+    /// so the user can see (and reproduce) exactly how mlx-serve was invoked.
+    /// Every launch knob is a CLI flag (already in `args`); bundle-internal
+    /// dylib env (DYLD_LIBRARY_PATH / MLX_METAL_PATH) is intentionally omitted
+    /// as per-install noise that isn't reproducible outside the app. Args
+    /// containing whitespace (e.g. a model path with spaces) are quoted.
+    nonisolated static func launchCommandLine(binaryPath: String, args: [String]) -> String {
+        func q(_ s: String) -> String {
+            (s.isEmpty || s.contains(where: { $0 == " " || $0 == "\t" })) ? "\"\(s)\"" : s
+        }
+        return ([q(binaryPath)] + args.map(q)).joined(separator: " ")
     }
 
     /// Builds the scrollable, selectable, monospaced log view shown in the

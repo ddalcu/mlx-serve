@@ -38,18 +38,22 @@ struct ServerOptions: Codable, Equatable {
     /// heavy-tailed activations.
     var kvQuant: KVQuant = .off
     /// Hot prefix cache entry count. >0 enables cross-request KV reuse for
-    /// shared system prompts. 0 disables.
-    var prefixCacheEntries: Int = 1
+    /// shared system prompts. 0 disables. The launcher RAM-clamps the emitted
+    /// value via `ramCappedPrefixCacheEntries` — each entry on a hybrid SSM
+    /// model (Qwen 3.5/3.6, etc.) retains large per-position KV + conv/SSM
+    /// snapshots whose true footprint dwarfs the model, so an uncapped count
+    /// fills a 16 GB Mac and starves the context window. Default 8 suits
+    /// 32 GB+; a 16 GB Mac caps to 1.
+    var prefixCacheEntries: Int = 8
     /// Hot prefix cache memory budget. `2GB`, `512MB`, etc. `0` or `off`
     /// disables the byte cap (count cap still applies). Empty = server default.
     var prefixCacheMem: String = "2GB"
-    /// When true, launch the server with `MLX_SERVE_SKIP_MEM_PREFLIGHT=1` so the
-    /// MLX loader skips the free-RAM pre-flight that would otherwise refuse a
-    /// model whose weights + warmup headroom look too big for current free
-    /// memory. The check is deliberately conservative (macOS reclaims file cache
-    /// as MLX allocates), so a load it refuses often still fits — but a genuine
-    /// over-commit can hard-crash the server, so this is opt-in. Plumbed as an
-    /// environment variable (see `applyLaunchEnv`), not a CLI flag.
+    /// When true, launch with `--skip-mem-preflight` so the MLX loader skips the
+    /// free-RAM pre-flight that would otherwise refuse a model whose weights +
+    /// warmup headroom look too big for current free memory. The check is
+    /// deliberately conservative (macOS reclaims file cache as MLX allocates),
+    /// so a load it refuses often still fits — but a genuine over-commit can
+    /// hard-crash the server, so this is opt-in.
     var skipMemPreflight: Bool = false
 
     // MARK: GGUF-only (llama.cpp engine)
@@ -60,11 +64,14 @@ struct ServerOptions: Codable, Equatable {
     /// some quality cost. Auto-enables flash-attn server-side when
     /// non-default.
     var llamaKvQuant: LlamaKVQuant = .off
-    /// Multi-session LRU size for the embedded llama.cpp engine. 1
-    /// keeps the legacy single-session behavior (every flip between
-    /// long-doc prompts evicts the other). N > 1 keeps the N most-
-    /// recently-used prompts hot in independent KV contexts.
-    var llamaCacheEntries: Int = 1
+    /// Multi-session LRU size for the embedded llama.cpp engine. 1 keeps the
+    /// legacy single-session behavior (every flip between long-doc prompts
+    /// evicts the other). N > 1 keeps the N most-recently-used prompts hot in
+    /// independent KV contexts. Default 4 MUST match `server.zig`
+    /// `llama_cache_entries` — `toCLIArgs` omits the flag at this value, so a
+    /// mismatch would silently run the server's default instead (see the
+    /// "ServerOptions defaults must mirror the Zig server" gotcha in CLAUDE.md).
+    var llamaCacheEntries: Int = 4
 
     // MARK: All engines
     /// Per-LoadedModel LRU cache of chat-template render + tokenize
@@ -266,7 +273,26 @@ struct ServerOptions: Codable, Equatable {
     /// `--model-dir <path>` so the registry sees siblings (enables
     /// hot-switch). ServerManager passes the parent directory of the
     /// selected model.
-    func toCLIArgs(modelDirOverride: String? = nil) -> [String] {
+    /// RAM-derived ceiling for the hot prefix cache entry count. On a hybrid
+    /// SSM model each entry pins large per-position KV + conv/SSM state, so a
+    /// generous count (the server's own default is 32) fills a small Mac and,
+    /// as resident memory climbs, the auto-context ceiling shrinks until
+    /// prompts no longer fit ("Prompt exceeds maximum context length"). Capping
+    /// the entry count is the reliable lever — the byte cap under-counts the
+    /// true retained allocation. An explicit 0 (disable) is preserved.
+    ///   ≤18 GB (16 GB Macs): 1   ≤36 GB (24/32 GB): 8   else: uncapped.
+    static func ramCappedPrefixCacheEntries(_ requested: Int, physicalMemoryBytes: UInt64) -> Int {
+        if requested <= 0 { return requested }
+        let gib = physicalMemoryBytes / 1_073_741_824
+        let ceiling: Int
+        if gib <= 18 { ceiling = 1 }
+        else if gib <= 36 { ceiling = 8 }
+        else { return requested }
+        return min(requested, ceiling)
+    }
+
+    func toCLIArgs(modelDirOverride: String? = nil,
+                   physicalMemoryBytes: UInt64 = ProcessInfo.processInfo.physicalMemory) -> [String] {
         // The host field is free text in Settings — a cleared field must not
         // launch `--host ""` (the server would fail to bind).
         let trimmedHost = host.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -298,16 +324,18 @@ struct ServerOptions: Codable, Equatable {
                      "--draft-block-size", "\(draftBlockSize)"]
         }
         // Performance: only emit non-default flags so the CLI tail stays
-        // readable in log lines and `ps`. Server defaults are 1 / off / 1 / 2GB.
+        // readable in log lines and `ps`. Server defaults are 1 / off / 2GB.
         if maxConcurrent > 1 {
             args += ["--max-concurrent", "\(maxConcurrent)"]
         }
         if kvQuant != .off {
             args += ["--kv-quant", kvQuant.cliValue]
         }
-        if prefixCacheEntries != 1 {
-            args += ["--prefix-cache-entries", "\(prefixCacheEntries)"]
-        }
+        // ALWAYS emit — the server's prefix-cache default is 32, NOT 1, so
+        // omitting this silently launched a 32-entry cache that filled small
+        // Macs. Emit the RAM-clamped value so the entry count stays bounded.
+        let cappedEntries = Self.ramCappedPrefixCacheEntries(prefixCacheEntries, physicalMemoryBytes: physicalMemoryBytes)
+        args += ["--prefix-cache-entries", "\(cappedEntries)"]
         let trimmedPrefixMem = prefixCacheMem.trimmingCharacters(in: .whitespacesAndNewlines)
         if !trimmedPrefixMem.isEmpty && trimmedPrefixMem != "2GB" {
             args += ["--prefix-cache-mem", trimmedPrefixMem]
@@ -320,7 +348,7 @@ struct ServerOptions: Codable, Equatable {
         if llamaKvQuant != .off {
             args += ["--llama-kv-quant", llamaKvQuant.cliValue]
         }
-        if llamaCacheEntries != 1 {
+        if llamaCacheEntries != 4 {  // 4 = server default (server.zig llama_cache_entries)
             args += ["--llama-cache-entries", "\(llamaCacheEntries)"]
         }
         // All-engines knob — applies to MLX, llama, and ds4 alike.
@@ -340,27 +368,11 @@ struct ServerOptions: Codable, Equatable {
         if defaultTopK > 0 {
             args += ["--top-k", "\(defaultTopK)"]
         }
-        return args
-    }
-
-    // MARK: Launch environment
-
-    /// Name of the env var the server reads to skip the model-load memory
-    /// pre-flight. The server treats *any* value (even empty) as "skip", so
-    /// presence is what matters — we set it to "1" and remove it otherwise.
-    static let skipMemPreflightEnvKey = "MLX_SERVE_SKIP_MEM_PREFLIGHT"
-
-    /// Apply env-var overrides to the launched server's environment. Unlike the
-    /// CLI flags in `toCLIArgs`, the memory pre-flight is toggled by an
-    /// environment variable. `env` is seeded from the app's own environment, so
-    /// we resolve the key in BOTH directions — set it when on, strip it when off
-    /// — so an inherited value can never leak the override either way.
-    func applyLaunchEnv(_ env: inout [String: String]) {
+        // Opt-in escape hatch — omitted by default so the load pre-flight runs.
         if skipMemPreflight {
-            env[Self.skipMemPreflightEnvKey] = "1"
-        } else {
-            env.removeValue(forKey: Self.skipMemPreflightEnvKey)
+            args += ["--skip-mem-preflight"]
         }
+        return args
     }
 
     // MARK: Settings-field validation helpers
@@ -534,7 +546,7 @@ extension ServerOptions {
             needsRestart: true),
         "prefixCacheEntries": .init(
             title: "Prefix cache entries",
-            explainer: "Hot prefix cache size: how many separate KV snapshots to keep across requests. Lets multi-turn chats skip re-prefilling shared system prompts. 0 disables.",
+            explainer: "Hot prefix cache size: how many separate KV snapshots to keep across requests. Lets multi-turn chats skip re-prefilling shared system prompts. 0 disables. Auto-capped on RAM-limited Macs (a 16 GB Mac caps to 1) — on hybrid SSM models each entry pins large KV + state snapshots that can otherwise fill memory.",
             needsRestart: true),
         "prefixCacheMem": .init(
             title: "Prefix cache memory cap",
@@ -542,7 +554,7 @@ extension ServerOptions {
             needsRestart: true),
         "skipMemPreflight": .init(
             title: "Skip memory pre-flight check",
-            explainer: "Bypass the safety check that refuses to load an MLX model when free RAM looks too low for its weights plus warmup headroom. The check is conservative — macOS reclaims file cache as the model loads — so turn this on if a load you know fits is being refused. A genuine over-commit can hard-crash the server. Sets MLX_SERVE_SKIP_MEM_PREFLIGHT.",
+            explainer: "Bypass the safety check that refuses to load an MLX model when free RAM looks too low for its weights plus warmup headroom. The check is conservative — macOS reclaims file cache as the model loads — so turn this on if a load you know fits is being refused. A genuine over-commit can hard-crash the server. Passes --skip-mem-preflight.",
             needsRestart: true),
         "llamaKvQuant": .init(
             title: "KV cache quantization",
