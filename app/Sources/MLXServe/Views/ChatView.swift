@@ -1784,34 +1784,56 @@ private struct ToolCallRow: View {
     let call: ChatMessage
     let results: [ChatMessage]
     @State private var expanded = false
+    @EnvironmentObject var processRegistry: ProcessRegistry
+
+    /// Live background-process handles this card started — drives the kill X.
+    /// Independent of `call.isStreaming` so the X stays after the tool returns,
+    /// and it vanishes once the registry flips the process dead.
+    private var killableHandles: [String] {
+        ProcessCardControls.killable(handles: call.processHandles, isAlive: processRegistry.isAlive)
+    }
 
     var body: some View {
         HStack(alignment: .top, spacing: 0) {
             VStack(alignment: .leading, spacing: 6) {
-                Button {
-                    withAnimation(.easeInOut(duration: 0.15)) { expanded.toggle() }
-                } label: {
-                    HStack(alignment: .top, spacing: 6) {
-                        Image(systemName: "wrench.and.screwdriver")
-                            .font(.caption2)
-                            .foregroundStyle(.secondary)
-                        Text(Self.stripBold(call.content))
-                            .font(.caption.monospaced())
-                            .multilineTextAlignment(.leading)
-                            .foregroundStyle(.primary)
-                        Spacer(minLength: 6)
-                        if call.isStreaming {
-                            GeneratingIndicator()
-                        } else if !results.isEmpty {
-                            Image(systemName: expanded ? "chevron.down" : "chevron.right")
+                HStack(alignment: .top, spacing: 6) {
+                    Button {
+                        withAnimation(.easeInOut(duration: 0.15)) { expanded.toggle() }
+                    } label: {
+                        HStack(alignment: .top, spacing: 6) {
+                            Image(systemName: "wrench.and.screwdriver")
                                 .font(.caption2)
                                 .foregroundStyle(.secondary)
+                            Text(Self.stripBold(call.content))
+                                .font(.caption.monospaced())
+                                .multilineTextAlignment(.leading)
+                                .foregroundStyle(.primary)
+                            Spacer(minLength: 6)
+                            if call.isStreaming {
+                                GeneratingIndicator()
+                            } else if !results.isEmpty {
+                                Image(systemName: expanded ? "chevron.down" : "chevron.right")
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
                         }
+                        .contentShape(Rectangle())
                     }
-                    .contentShape(Rectangle())
+                    .buttonStyle(.plain)
+                    .disabled(results.isEmpty)
+
+                    ForEach(killableHandles, id: \.self) { handle in
+                        Button {
+                            processRegistry.kill(handle: handle)
+                        } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .font(.caption)
+                                .foregroundStyle(.red)
+                        }
+                        .buttonStyle(.plain)
+                        .help("Stop background process \(handle)")
+                    }
                 }
-                .buttonStyle(.plain)
-                .disabled(results.isEmpty)
 
                 if expanded {
                     ForEach(results) { r in

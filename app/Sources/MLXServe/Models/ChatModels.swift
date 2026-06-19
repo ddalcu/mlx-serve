@@ -122,6 +122,10 @@ struct ChatMessage: Identifiable, Codable {
     // from a cut-off or pad-only retry) but excluded from API history so it
     // can't confuse subsequent iterations of the agent loop.
     var failedRetry: Bool = false
+    // Background-process handles (bg1, bg2, …) started by this tool-call round.
+    // Drives the inline kill X on the tool-call card. Persisted, but resolves to
+    // no live process after a restart (the registry isn't persisted).
+    var processHandles: [String]? = nil
 
     enum Role: String, Codable {
         case system, user, assistant
@@ -143,7 +147,7 @@ struct ChatMessage: Identifiable, Codable {
         case id, role, content, reasoningContent, isStreaming, timestamp
         case agentPlan, toolResults, isAgentSummary
         case promptTokens, completionTokens, tokensPerSecond
-        case toolCallId, toolName, toolCalls, images, audio, failedRetry
+        case toolCallId, toolName, toolCalls, images, audio, failedRetry, processHandles
     }
 
     init(from decoder: Decoder) throws {
@@ -166,6 +170,7 @@ struct ChatMessage: Identifiable, Codable {
         images = try c.decodeIfPresent([ChatImage].self, forKey: .images)
         audio = try c.decodeIfPresent([ChatAudio].self, forKey: .audio)
         failedRetry = try c.decodeIfPresent(Bool.self, forKey: .failedRetry) ?? false
+        processHandles = try c.decodeIfPresent([String].self, forKey: .processHandles)
     }
 }
 

@@ -1,0 +1,323 @@
+import Foundation
+import AppKit
+import Darwin
+
+/// Lifecycle status of an agent-spawned background process. `.exited` carries
+/// the real termination code (from `Process.terminationHandler`); `.killed`
+/// marks a deliberate kill so a trailing termination callback can't overwrite it.
+enum ProcessStatus: Equatable {
+    case running
+    case exited(Int32)
+    case killed
+
+    var isAlive: Bool { self == .running }
+}
+
+/// One agent-spawned background process. Reference type so the registry can flip
+/// its `status` in place and republish `processes` without copying the retained
+/// `Process` + pipes. Output is captured off-`@Published` into a lock-guarded
+/// `ProcessOutputBuffer` — same rationale as `ServerManager`'s `logBuffer`: a
+/// per-chunk publish would re-render `ChatView` during the SSE token loop.
+@MainActor
+final class ManagedProcess: Identifiable {
+    let handle: String          // monotonic "bg1", "bg2", …
+    fileprivate(set) var pid: Int32
+    let label: String           // first token of the command (for compact UI)
+    let command: String
+    let sessionId: UUID?
+    let startedAt: Date
+    fileprivate(set) var status: ProcessStatus
+    /// Retained so status comes from `terminationHandler`, never `kill(pid,0)` —
+    /// avoids PID-reuse ambiguity and zombie/fd leaks.
+    fileprivate let process: Process
+    let output: ProcessOutputBuffer
+
+    nonisolated var id: String { handle }
+
+    init(handle: String, pid: Int32, label: String, command: String,
+         sessionId: UUID?, startedAt: Date, status: ProcessStatus,
+         process: Process, output: ProcessOutputBuffer) {
+        self.handle = handle
+        self.pid = pid
+        self.label = label
+        self.command = command
+        self.sessionId = sessionId
+        self.startedAt = startedAt
+        self.status = status
+        self.process = process
+        self.output = output
+    }
+
+    var statusLabel: String {
+        switch status {
+        case .running: return "running"
+        case .exited(let c): return "exited(\(c))"
+        case .killed: return "killed"
+        }
+    }
+}
+
+/// Lock-guarded, bounded ring of a process's combined stdout/stderr. Modeled on
+/// `ServerManager.ThrottledLogBuffer` — lives outside any actor so the
+/// `FileHandle` readability handler (a background queue) can append without
+/// hopping to the main actor on every chunk. `readNew()` adds cursor-based
+/// incremental reads (BashOutput semantics) on top, with a dropped-bytes note
+/// when the tail-trim discarded output the caller never saw.
+///
+/// `@unchecked Sendable` is honest: all shared state is guarded by `lock`.
+final class ProcessOutputBuffer: @unchecked Sendable {
+    private let lock = NSLock()
+    private var content = ""        // retained tail (≤ maxBytes)
+    private let maxBytes: Int
+    private var droppedPrefix = 0   // logical chars trimmed off the front
+    private var totalAppended = 0   // logical chars ever appended
+    private var readCursor = 0      // logical position consumed by readNew()
+
+    init(maxBytes: Int = 65_536) {
+        self.maxBytes = maxBytes
+    }
+
+    func append(_ str: String) {
+        guard !str.isEmpty else { return }
+        lock.lock()
+        defer { lock.unlock() }
+        content += str
+        totalAppended += str.count
+        if content.count > maxBytes {
+            let overflow = content.count - maxBytes
+            content = String(content.suffix(maxBytes))
+            droppedPrefix += overflow
+        }
+    }
+
+    /// Append raw bytes (lossy-decoded as UTF-8) — the readability-handler path.
+    func append(_ data: Data) {
+        guard !data.isEmpty else { return }
+        append(String(decoding: data, as: UTF8.self))
+    }
+
+    /// The full retained tail.
+    func snapshot() -> String {
+        lock.lock()
+        defer { lock.unlock() }
+        return content
+    }
+
+    /// Output appended since the previous `readNew()` (BashOutput semantics).
+    /// When the ring trimmed past the cursor, prepends a note for the gap.
+    func readNew() -> String {
+        lock.lock()
+        defer { lock.unlock() }
+        var note = ""
+        var effectiveCursor = readCursor
+        if effectiveCursor < droppedPrefix {
+            note = "[... \(droppedPrefix - effectiveCursor) bytes dropped]\n"
+            effectiveCursor = droppedPrefix
+        }
+        let startInContent = effectiveCursor - droppedPrefix
+        let new = startInContent >= content.count ? "" : String(content.dropFirst(startInContent))
+        readCursor = totalAppended
+        return note + new
+    }
+}
+
+/// Single-use, lock-guarded out-parameter for a freshly created/adopted handle.
+/// `ShellHandler` (a `Sendable` struct whose `execute` returns only a `String`)
+/// writes the handle here so `AgentEngine.executeToolCall` can surface it
+/// structurally on `ToolResult.backgroundHandle` — no string-parsing.
+final class ProcessHandleBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: String?
+    func set(_ h: String) { lock.lock(); value = h; lock.unlock() }
+    var handle: String? { lock.lock(); defer { lock.unlock() }; return value }
+}
+
+/// Owns every agent-spawned background process. Modeled on `ServerManager`:
+/// retained `Process`, streaming capture via `readabilityHandler` into a bounded
+/// buffer, graceful `terminate()` → grace → `SIGKILL`, exit via
+/// `terminationHandler`. Owned by `AppState`; reached by the agent loop (so
+/// Telegram-driven turns get it too) and by the chat tool-call card's kill X.
+@MainActor
+final class ProcessRegistry: ObservableObject {
+    /// Status-only snapshot for the UI. Output is intentionally NOT published —
+    /// see `ProcessOutputBuffer` / `ServerManager.logBuffer`.
+    @Published private(set) var processes: [ManagedProcess] = []
+
+    private var counter = 0
+    private var quitObserver: NSObjectProtocol?
+
+    init() {
+        // No AppDelegate / applicationWillTerminate exists in this app, and
+        // `deinit` isn't guaranteed at process exit — so reap on the quit
+        // notification. Delivered on the main thread (`queue: .main`).
+        quitObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.willTerminateNotification, object: nil, queue: .main
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.killAll() }
+        }
+    }
+
+    deinit {
+        if let quitObserver { NotificationCenter.default.removeObserver(quitObserver) }
+    }
+
+    // MARK: - Shared process construction
+
+    /// The exact spawn shape both `ShellHandler` and the registry use: a
+    /// `/bin/zsh -l -c` login shell, stdin from `/dev/null` (an interactive
+    /// prompt hits EOF instead of hanging), and a pipe each for stdout/stderr.
+    nonisolated static func makeProcess(command: String, workingDirectory: String?) -> Process {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: "/bin/zsh")
+        process.arguments = ["-l", "-c", command]
+        if let wd = workingDirectory {
+            process.currentDirectoryURL = URL(fileURLWithPath: wd)
+        }
+        process.standardOutput = Pipe()
+        process.standardError = Pipe()
+        process.standardInput = FileHandle.nullDevice
+        return process
+    }
+
+    /// First whitespace-delimited token of a command — the compact label/icon hint.
+    nonisolated static func commandLabel(_ command: String) -> String {
+        command.split(whereSeparator: { $0 == " " || $0 == "\t" || $0 == "\n" })
+            .first.map(String.init) ?? command
+    }
+
+    // MARK: - Start / adopt
+
+    /// Create, register, and launch a new background process. Returns immediately
+    /// (the caller's tool call continues, the assistant keeps talking).
+    func start(command: String, workingDirectory: String?, sessionId: UUID?) -> ManagedProcess {
+        counter += 1
+        let handle = "bg\(counter)"
+        let process = Self.makeProcess(command: command, workingDirectory: workingDirectory)
+        let buffer = ProcessOutputBuffer()
+        let managed = ManagedProcess(
+            handle: handle, pid: 0, label: Self.commandLabel(command), command: command,
+            sessionId: sessionId, startedAt: Date(), status: .running,
+            process: process, output: buffer)
+
+        attachCapture(process: process, buffer: buffer)
+        process.terminationHandler = { [weak self] proc in
+            let code = proc.terminationStatus
+            Task { @MainActor in self?.markExited(handle: handle, code: code) }
+        }
+
+        do {
+            try process.run()
+            managed.pid = process.processIdentifier
+        } catch {
+            buffer.append("failed to launch: \(error.localizedDescription)\n")
+            managed.status = .exited(-1)
+        }
+        processes.append(managed)
+        return managed
+    }
+
+    /// Adopt an already-running `Process` handed over by the foreground backstop
+    /// (`ShellHandler` at its timeout). The caller has detached its own readers
+    /// and snapshotted `priorOutput`; we seed the buffer, re-attach capture, and
+    /// take over the termination callback. The real `Process` is retained so PID
+    /// reuse can never confuse us.
+    func adopt(process: Process, command: String, workingDirectory: String?,
+               sessionId: UUID?, priorOutput: String) -> ManagedProcess {
+        counter += 1
+        let handle = "bg\(counter)"
+        let buffer = ProcessOutputBuffer()
+        buffer.append(priorOutput)
+        let managed = ManagedProcess(
+            handle: handle, pid: process.processIdentifier, label: Self.commandLabel(command),
+            command: command, sessionId: sessionId, startedAt: Date(), status: .running,
+            process: process, output: buffer)
+
+        attachCapture(process: process, buffer: buffer)
+        process.terminationHandler = { [weak self] proc in
+            let code = proc.terminationStatus
+            Task { @MainActor in self?.markExited(handle: handle, code: code) }
+        }
+        // It may have exited in the gap between the backstop's check and now.
+        if !process.isRunning {
+            managed.status = .exited(process.terminationStatus)
+        }
+        processes.append(managed)
+        return managed
+    }
+
+    // MARK: - Query
+
+    func list(sessionId: UUID?) -> [ManagedProcess] {
+        guard let sessionId else { return processes }
+        return processes.filter { $0.sessionId == sessionId }
+    }
+
+    func isAlive(handle: String) -> Bool {
+        processes.first { $0.handle == handle }?.status.isAlive ?? false
+    }
+
+    /// Incremental output since the last read, or nil for an unknown handle.
+    func readOutput(handle: String) -> String? {
+        processes.first { $0.handle == handle }?.output.readNew()
+    }
+
+    // MARK: - Kill
+
+    /// Graceful stop: detach readers + close handles first (so a SIGKILL never
+    /// blocks on `readToEnd` waiting for an orphaned grandchild), flip status to
+    /// `.killed`, then `terminate()` → bounded grace → `SIGKILL`.
+    func kill(handle: String) {
+        guard let p = processes.first(where: { $0.handle == handle }), p.status.isAlive else { return }
+        let proc = p.process
+        detachCapture(proc)
+        proc.terminationHandler = nil   // status is now ours; don't let the trailing callback flip it
+        objectWillChange.send()
+        p.status = .killed
+        if proc.isRunning {
+            proc.terminate()
+            DispatchQueue.global().asyncAfter(deadline: .now() + 3) {
+                if proc.isRunning { Darwin.kill(proc.processIdentifier, SIGKILL) }
+            }
+        }
+    }
+
+    func killSession(_ id: UUID) {
+        for p in processes where p.sessionId == id { kill(handle: p.handle) }
+    }
+
+    func killAll() {
+        for p in processes { kill(handle: p.handle) }
+    }
+
+    // MARK: - Private
+
+    private func attachCapture(process: Process, buffer: ProcessOutputBuffer) {
+        (process.standardOutput as? Pipe)?.fileHandleForReading.readabilityHandler = { h in
+            buffer.append(h.availableData)
+        }
+        (process.standardError as? Pipe)?.fileHandleForReading.readabilityHandler = { h in
+            buffer.append(h.availableData)
+        }
+    }
+
+    private func detachCapture(_ process: Process) {
+        (process.standardOutput as? Pipe)?.fileHandleForReading.readabilityHandler = nil
+        (process.standardError as? Pipe)?.fileHandleForReading.readabilityHandler = nil
+    }
+
+    private func markExited(handle: String, code: Int32) {
+        guard let p = processes.first(where: { $0.handle == handle }), p.status.isAlive else { return }
+        objectWillChange.send()
+        p.status = .exited(code)
+    }
+}
+
+/// Pure presentation seam for the chat tool-call card's kill controls: from the
+/// handles persisted on the message and the registry's live `isAlive`, return
+/// only the handles still worth showing an X for. Persisted handles from a prior
+/// run resolve to no live process (the registry isn't persisted) → no buttons.
+enum ProcessCardControls {
+    static func killable(handles: [String]?, isAlive: (String) -> Bool) -> [String] {
+        (handles ?? []).filter(isAlive)
+    }
+}

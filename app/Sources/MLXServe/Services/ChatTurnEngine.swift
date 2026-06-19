@@ -593,6 +593,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
             // fabricated error result so the agent loop can react and the
             // user's intent is visible in the transcript.
             var roundOutputs: [String] = []
+            var roundHandles: [String] = []
             for tc in receivedToolCalls {
                 try Task.checkCancellation()
 
@@ -630,9 +631,12 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                             goal: goal, schedule: schedule,
                             telegramChatId: config.telegramChatId
                         ) ?? "Error: task creation unavailable."
-                    }
+                    },
+                    processRegistry: appState.processRegistry,
+                    sessionId: sessionId
                 )
                 roundOutputs.append(result.output)
+                if let handle = result.backgroundHandle { roundHandles.append(handle) }
 
                 // Build the model-facing tool message FIRST, so the visible
                 // summary can mirror it 1:1 (same content the model receives —
@@ -667,6 +671,17 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                 resultMsg.isAgentSummary = true
                 appState.appendMessage(to: sessionId, message: resultMsg)
                 appState.appendMessage(to: sessionId, message: toolMsg)
+            }
+
+            // Attach any background-process handles this round started to the
+            // call-summary message (located by the captured summaryId) so the
+            // tool-call card can render a kill X for each live process.
+            if !roundHandles.isEmpty,
+               let sIdx = appState.chatSessions.firstIndex(where: { $0.id == sessionId }),
+               let mIdx = appState.chatSessions[sIdx].messages.firstIndex(where: { $0.id == summaryId }) {
+                var handles = appState.chatSessions[sIdx].messages[mIdx].processHandles ?? []
+                handles.append(contentsOf: roundHandles)
+                appState.chatSessions[sIdx].messages[mIdx].processHandles = handles
             }
 
             // Stop if the model made no progress for several consecutive rounds

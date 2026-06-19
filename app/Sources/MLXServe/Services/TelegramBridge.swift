@@ -236,6 +236,12 @@ final class TelegramBridge: ObservableObject {
                 await send(token: token, chatId: chatId, text: startHelp())
                 return
             case "/new", "/reset":
+                // Reap the old session's background processes before dropping the
+                // mapping — otherwise the orphaned ChatSession's processes survive
+                // untracked (no chat card, no /new can ever reach them again).
+                if let oldSessionId = sessions[chatId] {
+                    appState.processRegistry.killSession(oldSessionId)
+                }
                 sessions[chatId] = nil
                 await send(token: token, chatId: chatId, text: "🧹 Started a new conversation.")
                 return

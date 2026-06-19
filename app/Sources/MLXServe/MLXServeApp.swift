@@ -119,6 +119,7 @@ struct MLXCoreApp: App {
                 .environmentObject(appState.mcpManager)
                 .environmentObject(appState.chatEngine)
                 .environmentObject(appState.voice)
+                .environmentObject(appState.processRegistry)
                 .frame(minWidth: 700, minHeight: 500)
                 .onDisappear {
                     Task { await appState.mcpManager.stopAll() }

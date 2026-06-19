@@ -51,4 +51,46 @@ final class ShellHandlerTests: XCTestCase {
             // expected
         }
     }
+
+    // MARK: - Background execution (run_in_background) + adopt backstop
+
+    /// run_in_background returns immediately with a handle while the process
+    /// keeps running — the canonical "serve this folder" fix.
+    @MainActor
+    func testRunInBackgroundReturnsImmediatelyAndStaysAlive() async throws {
+        let reg = ProcessRegistry()
+        defer { reg.killAll() }
+        let start = Date()
+        let out = try await ShellHandler(registry: reg).execute(
+            parameters: ["command": "sleep 5", "run_in_background": "true"], workingDirectory: nil)
+        let elapsed = Date().timeIntervalSince(start)
+        XCTAssertLessThan(elapsed, 2, "background start must return promptly (elapsed \(elapsed)s)")
+        XCTAssertTrue(out.contains("bg1"), out)
+        XCTAssertTrue(reg.isAlive(handle: "bg1"), "background process must keep running")
+    }
+
+    /// Without a registry the flag degrades to a graceful error — no crash, no
+    /// orphaned process.
+    func testRunInBackgroundWithoutRegistryIsGraceful() async throws {
+        let out = try await ShellHandler().execute(
+            parameters: ["command": "sleep 1", "run_in_background": "true"], workingDirectory: nil)
+        XCTAssertTrue(out.lowercased().contains("background"), out)
+        XCTAssertFalse(out.contains("bg1"), out)
+    }
+
+    /// Backstop: a foreground command still alive at the timeout is ADOPTED as a
+    /// managed background process — reported as such, NOT killed.
+    @MainActor
+    func testForegroundTimeoutAdoptsInsteadOfKilling() async throws {
+        let reg = ProcessRegistry()
+        defer { reg.killAll() }
+        let out = try await ShellHandler(timeoutSeconds: 1, registry: reg).execute(
+            parameters: ["command": "sleep 30"], workingDirectory: nil)
+        XCTAssertTrue(out.contains("managed in the background"), out)
+        XCTAssertTrue(out.contains("NOT killed"), out)
+        XCTAssertFalse(out.contains("timed out"), out)
+        XCTAssertEqual(reg.list(sessionId: nil).count, 1, "the live process must be adopted")
+        let handle = reg.list(sessionId: nil)[0].handle
+        XCTAssertTrue(reg.isAlive(handle: handle), "adopted process must still be alive")
+    }
 }

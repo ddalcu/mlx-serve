@@ -42,4 +42,20 @@ final class AgentPromptTests: XCTestCase {
         XCTAssertEqual(AgentPrompt.resolvePrompt(fileContent: "\n\n\(custom)\n  "), custom,
                        "surrounding whitespace is trimmed, content preserved")
     }
+
+    // Backgrounding guidance moved from brittle `&`/`kill %1` shell tricks to the
+    // managed run_in_background flag + readProcessOutput/killProcess tools.
+    func testPromptDropsBrittleBackgroundingGuidance() {
+        let p = AgentPrompt.defaultPromptFile
+        XCTAssertFalse(p.contains("kill %1"), "brittle `kill %1` guidance must be gone")
+        XCTAssertFalse(p.contains("node server.js &"), "brittle `&` backgrounding example must be gone")
+        XCTAssertFalse(p.contains("npm run dev &"), "brittle `&` backgrounding example must be gone")
+    }
+
+    func testPromptHasRunInBackgroundGuidance() {
+        let p = AgentPrompt.defaultPromptFile
+        XCTAssertTrue(p.contains("run_in_background"), "prompt should steer toward run_in_background")
+        XCTAssertTrue(p.contains("killProcess"), "prompt should mention killProcess")
+        XCTAssertTrue(p.contains("readProcessOutput"), "prompt should mention readProcessOutput")
+    }
 }

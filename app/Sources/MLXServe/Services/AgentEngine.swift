@@ -418,6 +418,10 @@ enum AgentEngine {
         let id: String
         let name: String
         var output: String
+        /// Handle of a background process this call started/adopted (a `shell`
+        /// with `run_in_background:"true"`, or the foreground backstop). Flows up
+        /// to the chat tool-call card so it can show a kill X. nil otherwise.
+        var backgroundHandle: String? = nil
     }
 
     /// Resolve a model-emitted tool name to a known tool, tolerating the common
@@ -547,7 +551,9 @@ enum AgentEngine {
         agentMemory: AgentMemory,
         mcpRouter: (any MCPToolRouting)? = nil,
         documentIndex: DocumentIndex? = nil,
-        createTask: ((_ goal: String, _ schedule: String?) async -> String)? = nil
+        createTask: ((_ goal: String, _ schedule: String?) async -> String)? = nil,
+        processRegistry: ProcessRegistry? = nil,
+        sessionId: UUID? = nil
     ) async -> ToolResult {
         // Normalize the model-emitted name (strip a leaked trailing ':' etc.)
         // before resolving the tool. Repetition tracking stays on the raw
@@ -573,6 +579,9 @@ enum AgentEngine {
         // the block/warning logic in one place. `cwd` is exempt (see exemptTools)
         // so isBlocked short-circuits false for it.
         let output: String
+        // Captures the handle of any background process the shell tool starts or
+        // adopts this call, so it can ride back on ToolResult.backgroundHandle.
+        let handleBox = ProcessHandleBox()
         if repetition.isBlocked(name: tc.name, arguments: tc.arguments, iteration: iteration) {
             output = toolBlockMessage(for: tc.name)
         } else if let mcpRouter, mcpRouter.owns(toolName: tc.name) {
@@ -580,13 +589,15 @@ enum AgentEngine {
                 name: tc.name, arguments: tc.arguments, rawArguments: tc.rawArguments)
         } else {
             output = await executeBuiltinTool(tc, name: name, workingDirectory: &workingDirectory,
-                                              agentMemory: agentMemory, documentIndex: documentIndex)
+                                              agentMemory: agentMemory, documentIndex: documentIndex,
+                                              processRegistry: processRegistry, sessionId: sessionId,
+                                              handleBox: handleBox)
         }
 
         // Apply warning if near repetition threshold (raw name — see above).
         // No-ops on a "BLOCKED:" output, so blocked calls pass through unchanged.
         let warned = repetition.applyWarning(name: tc.name, arguments: tc.arguments, output: output)
-        return ToolResult(id: tc.id, name: name, output: warned)
+        return ToolResult(id: tc.id, name: name, output: warned, backgroundHandle: handleBox.handle)
     }
 
     /// Dispatch a built-in (non-MCP) tool: cwd, param validation, then the
@@ -597,7 +608,10 @@ enum AgentEngine {
         name: String,
         workingDirectory: inout String?,
         agentMemory: AgentMemory,
-        documentIndex: DocumentIndex? = nil
+        documentIndex: DocumentIndex? = nil,
+        processRegistry: ProcessRegistry? = nil,
+        sessionId: UUID? = nil,
+        handleBox: ProcessHandleBox? = nil
     ) async -> String {
         let tool = AgentToolKind(rawValue: name)
 
@@ -649,6 +663,28 @@ enum AgentEngine {
             return await documentIndex.search(query: tc.arguments["query"] ?? "")
         }
 
+        // Background-process management — registry-backed, so dispatched inline
+        // (like cwd/searchDocuments) rather than through the stateless handlers.
+        if effectiveTool == .listProcesses || effectiveTool == .readProcessOutput || effectiveTool == .killProcess {
+            return processToolOutput(effectiveTool!, arguments: tc.arguments,
+                                     registry: processRegistry, sessionId: sessionId)
+        }
+
+        // Shell gets a fresh handler with the registry injected (the static
+        // `toolHandlers` entry is stateless) so background-start and the
+        // timeout-adopt backstop can register processes and report handles.
+        if effectiveTool == .shell {
+            let handler = ShellHandler(registry: processRegistry, sessionId: sessionId, handleBox: handleBox)
+            do {
+                let output = try await handler.execute(parameters: tc.arguments, workingDirectory: workingDirectory)
+                if let cmd = tc.arguments["command"] { agentMemory.recordCommand(cmd) }
+                return output
+            } catch {
+                let argsDesc = tc.arguments.isEmpty ? "none" : tc.arguments.map { "\($0.key)=\($0.value.prefix(30))" }.joined(separator: ", ")
+                return "Error: \(error.localizedDescription). You sent args: [\(argsDesc)]. Example: \(toolExample(for: name))"
+            }
+        }
+
         guard let effectiveTool, let handler = toolHandlers[effectiveTool] else {
             return "Error: Unknown tool '\(name)'"
         }
@@ -662,6 +698,55 @@ enum AgentEngine {
             let argsDesc = tc.arguments.isEmpty ? "none" : tc.arguments.map { "\($0.key)=\($0.value.prefix(30))" }.joined(separator: ", ")
             return "Error: \(error.localizedDescription). You sent args: [\(argsDesc)]. Example: \(toolExample(for: name))"
         }
+    }
+
+    /// Dispatch a background-process tool (`listProcesses`/`readProcessOutput`/
+    /// `killProcess`) against the session-scoped registry. Returns a graceful,
+    /// model-readable string in every case — unknown handles list the valid ones.
+    /// `handle` is already validated present by `missingRequiredParams` for the
+    /// two tools that require it.
+    static func processToolOutput(_ tool: AgentToolKind, arguments: [String: String],
+                                  registry: ProcessRegistry?, sessionId: UUID?) -> String {
+        guard let registry else {
+            return "Error: background process management isn't available in this context."
+        }
+        switch tool {
+        case .listProcesses:
+            let procs = registry.list(sessionId: sessionId)
+            guard !procs.isEmpty else { return "No background processes have been started in this chat." }
+            return procs.map { "\($0.handle) [\($0.statusLabel)] pid \($0.pid) — \($0.command.prefix(120))" }
+                .joined(separator: "\n")
+        case .readProcessOutput:
+            let handle = arguments["handle"] ?? ""
+            guard let out = registry.readOutput(handle: handle) else {
+                return unknownHandleError(handle, registry: registry, sessionId: sessionId)
+            }
+            let status = registry.isAlive(handle: handle) ? "still running" : "exited"
+            return out.isEmpty
+                ? "(\(handle) \(status); no new output since the last read)"
+                : "[\(handle) \(status)]\n\(out)"
+        case .killProcess:
+            let handle = arguments["handle"] ?? ""
+            guard registry.list(sessionId: nil).contains(where: { $0.handle == handle }) else {
+                return unknownHandleError(handle, registry: registry, sessionId: sessionId)
+            }
+            guard registry.isAlive(handle: handle) else {
+                return "\(handle) is not running (it already exited or was killed)."
+            }
+            registry.kill(handle: handle)
+            return "Killed \(handle)."
+        default:
+            return "Error: \(tool.rawValue) is not a process tool."
+        }
+    }
+
+    /// Helpful error for a handle that doesn't resolve — lists the live handles.
+    private static func unknownHandleError(_ handle: String, registry: ProcessRegistry, sessionId: UUID?) -> String {
+        let live = registry.list(sessionId: sessionId).filter { $0.status.isAlive }.map { $0.handle }
+        if live.isEmpty {
+            return "Error: no process with handle '\(handle)'. There are no running background processes — start one with shell {\"command\": \"…\", \"run_in_background\": \"true\"}."
+        }
+        return "Error: no process with handle '\(handle)'. Running processes: \(live.joined(separator: ", "))."
     }
 
     // MARK: - Tool Result Overflow

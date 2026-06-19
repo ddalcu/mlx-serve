@@ -17,6 +17,9 @@ enum AgentToolKind: String, Codable, CaseIterable {
     case saveMemory
     case cwd
     case searchDocuments
+    case killProcess
+    case readProcessOutput
+    case listProcesses
 
     var icon: String {
         switch self {
@@ -31,6 +34,9 @@ enum AgentToolKind: String, Codable, CaseIterable {
         case .saveMemory: "brain"
         case .cwd: "folder.badge.gearshape"
         case .searchDocuments: "doc.text.magnifyingglass"
+        case .killProcess: "xmark.octagon"
+        case .readProcessOutput: "text.viewfinder"
+        case .listProcesses: "list.bullet.rectangle"
         }
     }
 
@@ -47,6 +53,9 @@ enum AgentToolKind: String, Codable, CaseIterable {
         case .saveMemory: "Save Memory"
         case .cwd: "Change Directory"
         case .searchDocuments: "Search Documents"
+        case .killProcess: "Kill Process"
+        case .readProcessOutput: "Read Process Output"
+        case .listProcesses: "List Processes"
         }
     }
 }
