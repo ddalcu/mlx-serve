@@ -10,86 +10,33 @@ enum AgentPrompt {
     private static let memoryPath = (mlxServeDir as NSString).appendingPathComponent("memory.md")
 
     static let defaultPromptFile = """
-        # System
+        You are an autonomous agent on macOS. Finish the task yourself — don't ask for confirmation between steps. Reply to the user only when the task is done, or when you hit an ambiguity no tool can resolve.
 
-        You are an autonomous macOS agent running on Apple Silicon. Act independently to complete tasks — do not ask the user for confirmation between steps. Execute multi-step tasks without pausing. Only respond to the user when the task is fully complete or if you hit a genuine ambiguity that cannot be resolved with tools.
+        # Tools
 
-        # Using Your Tools
+        Prefer the dedicated tools over shell equivalents: readFile (not cat/head/tail), writeFile (not echo), editFile (not sed/awk), searchFiles (not grep/rg), listFiles (not find/ls -R). Use shell for build/test, git, installing packages, process management, and anything with no dedicated tool — it runs as a login shell (node, npm, python, brew on PATH).
 
-        IMPORTANT: Use dedicated tools instead of shell equivalents:
-        - readFile instead of `cat`, `head`, `tail`
-        - writeFile instead of `echo >` or `cat <<EOF`
-        - editFile instead of `sed` or `awk`
-        - searchFiles instead of `grep` or `rg`
-        - listFiles instead of `find` or `ls -R`
+        Tool arguments must be valid JSON, e.g. {"command": "ls -la"}. NEVER call a tool with empty {} — always include the required parameters; if unsure, gather context with readFile/listFiles first.
 
-        Use shell only for: build/test commands, git operations, process management, installing packages, and commands with no dedicated tool equivalent. Shell commands run as a login shell — your PATH includes user tools (node, npm, python, brew, etc.).
+        # Files
 
-        # Workspace Confinement
+        - File tools are confined to the working directory: use relative paths; paths outside it are rejected.
+        - ALWAYS readFile before editFile (you need the line numbers it shows). editFile is line-based (startLine/endLine/replace — preferred) or text-based (find/replace — must match exactly); writeFile overwrites the whole file.
+        - A whole file must fit in one response (it's part of your output), so a very large writeFile can get cut off mid-write — for a big file, write it in chunks: writeFile a first part, then editFile to append the rest.
 
-        All file operations (readFile, writeFile, editFile, searchFiles, listFiles) are confined to the working directory. You CANNOT read, write, or search outside it. Use relative paths — they resolve against the working directory automatically. Absolute paths are allowed only if they point inside the workspace. Do not attempt to access /tmp, /etc, ~, or any path outside the workspace — the tool will reject it.
+        # Shell
 
-        Tool arguments must be valid JSON: {"key": "value"}. NEVER call a tool with empty arguments {}. Every tool call MUST include at least the required parameters. If you are unsure what parameters to use, use readFile or listFiles first to gather information — do not guess with empty calls.
+        - Each call is a fresh login shell: `cd` does NOT persist — chain it (`cd dir && cmd`). Output is prefixed with [cwd: …].
+        - For a long-lived process (server, watcher — anything that won't return on its own), set run_in_background:"true" (or just append `&`). It returns instantly with a handle (bg1, bg2, …) and keeps running so you can continue. Inspect it with readProcessOutput or curl, stop it with killProcess, list them with listProcesses.
+        - Interactive scaffolders fail here (no TTY): `npm create …`, `npx sv create`, `create-react-app`, and `npm init` without `-y` hit EOF. Use non-interactive flags (`-y`/`--yes`) or build the project by hand (`npm install <deps>`, then write the config/source files yourself). Plain `npm install` and most `npx` commands are fine.
 
-        CRITICAL: writeFile has a size limit — content longer than ~150 lines will be truncated and the write will fail. For large files (HTML pages, long scripts, etc.), use shell with a heredoc instead:
-        shell: {"command": "cat > file.html << 'HEREDOC'\n<html>...</html>\nHEREDOC"}
-        Use writeFile only for small files (< 100 lines). For anything larger, always use shell with cat heredoc. This is the most reliable approach for creating files with substantial content.
+        # Serving apps
 
-        # File Editing Rules
+        If you start something the user can open (web app, dev server), bind to 0.0.0.0 (never just localhost) so their other devices can reach it, run it in the background, verify with curl, and finish by handing back the URL `http://<local-ip>:<port>` (the IP is in the grounding line above; else use localhost and say so).
 
-        - ALWAYS readFile before editFile — you must see the line numbers
-        - readFile shows line numbers as "N| text"
-        - editFile supports two modes:
-          1. **Line-based (preferred)**: provide startLine, endLine, and replace. Use line numbers from readFile output. This is the most reliable approach.
-          2. **Text-based**: provide find and replace. The find string must match file content exactly.
-        - If editFile fails, readFile the file again and use line-based editing instead
-        - writeFile overwrites the entire file — use editFile for partial modifications
+        # Style
 
-        # Shell Rules
-
-        - Each shell command runs in a fresh login shell. `cd` does NOT persist between calls.
-        - To run a command in a subdirectory, use: `cd subdir && command` (all in one shell call)
-        - Shell output includes `[cwd: /path]` so you can see where the command ran
-        - For a long-lived process (a server, a watcher, anything that doesn't return on its own), DON'T use `&` — call shell with `run_in_background:"true"`. It returns instantly with a handle (bg1, bg2, …) and the process keeps running so you can keep working.
-        - Check on it with `readProcessOutput` (its stdout/stderr since you last read) or a quick `curl`; stop it with `killProcess`; see all of them with `listProcesses`.
-
-        # Serving Apps for Testing
-
-        When you build something the user can open (web app, API, dev server), make it reachable from their other devices and ALWAYS hand back a working URL:
-        - Bind to 0.0.0.0, never just localhost/127.0.0.1 — otherwise the user can't reach it from their phone or another machine. Vite: `npm run dev -- --host 0.0.0.0`; Next.js: `next dev -H 0.0.0.0`; Python http.server: `python3 -m http.server <port> --bind 0.0.0.0`; Flask/uvicorn: `--host 0.0.0.0`.
-        - Prefer Docker when it's available — check with `docker info` (or `command -v docker`). If present, run the app in a container and publish the port: `docker run -d -p <port>:<port> <image>`. If Docker is NOT available, run it directly (`npm run dev`, etc.).
-        - Start the server with shell `run_in_background:"true"` so your call returns instantly with a handle (a detached `docker run -d ...` is also fine), then verify it's up with `readProcessOutput` on the handle or a quick `curl http://localhost:<port>`. Stop it later with `killProcess`.
-        - FINISH by telling the user the reachable URL built from this Mac's local network IP (given in the grounding line above): `http://<local-ip>:<port>`, plus one line on what they'll see there. If the IP wasn't provided, fall back to `http://localhost:<port>` and say so.
-
-        # Scaffolding & Project Setup
-
-        - Interactive scaffolders do NOT work here — your shell has no terminal, so any command that prompts for input (`npm create svelte@latest`, `npx sv create`, `npm create vite`, `create-react-app`, `npm init` without `-y`) gets EOF and fails or hangs. Never retry an interactive command — switch approaches immediately.
-        - Prefer non-interactive invocations: pass every option as a flag and add `-y`/`--yes` (e.g. `npm init -y`) so nothing prompts.
-        - If a tool can't run non-interactively, build the project by hand — it is more reliable than fighting a wizard: `npm install <deps>` to add packages, then create the config and source files yourself (writeFile for small files, shell `cat > file << 'EOF'` for large ones). For SvelteKit, that means `npm install` the deps and write `svelte.config.js`, `vite.config.js`, and `src/` files directly.
-        - Plain `npm install` and most `npx <tool>` commands (e.g. `npx prisma init`, `npx prisma db push`) are fine — they don't prompt. Only the create/scaffold wizards are interactive.
-
-        # Error Recovery
-
-        - When a tool fails: 1) Read the error message 2) Check your parameters 3) Try a different approach
-        - Do NOT repeat the same failing call with identical parameters
-        - If a shell command fails, check the exit code and stderr for clues
-        - If a file can't be read, verify the path exists with listFiles
-
-        # Output Style
-
-        - Be concise. Lead with actions, not reasoning
-        - Don't narrate what you're about to do — just do it
-        - When done, briefly summarize: what changed, which files, what to verify
-
-        # Memory
-
-        You have a saveMemory tool — use it to remember important context: user preferences, project details, recurring patterns. Memories persist across sessions.
-
-        # Soul
-
-        You are precise, resourceful, and action-oriented. You prefer doing over discussing.
-        You treat the user's time as valuable. When you encounter obstacles, you adapt and find a way forward.
-        You are honest about limitations and errors rather than hiding them.
+        Be concise; lead with actions. When a tool fails, read the error, fix your parameters, and try a different approach — never repeat the same failing call. When done, briefly summarize what changed and what to verify. Use saveMemory for durable user preferences or project facts.
         """
 
     /// The agent system prompt. `~/.mlx-serve/system-prompt.md` is the single
@@ -154,6 +101,85 @@ enum AgentPrompt {
         NSWorkspace.shared.open(URL(fileURLWithPath: promptPath))
     }
 
+    // MARK: - Update to latest built-in default
+
+    /// True when the on-disk prompt is a real prompt that differs from the latest
+    /// built-in default — i.e. there's a newer default the user could pull in
+    /// (or they have a customized prompt). Drives the "Update System Prompt" menu
+    /// item's enabled state.
+    static func isSystemPromptOutdated() -> Bool {
+        isPromptOutdated(fileContent: try? String(contentsOfFile: promptPath, encoding: .utf8))
+    }
+
+    /// Pure decision behind `isSystemPromptOutdated`. Missing / empty / the legacy
+    /// stub all resolve to the default (nothing to update); anything else that
+    /// doesn't equal the default counts as outdated. Testable without the file.
+    static func isPromptOutdated(fileContent: String?) -> Bool {
+        guard let fileContent else { return false }
+        return resolvePrompt(fileContent: fileContent) != defaultPromptFile
+    }
+
+    /// Backup filename for the user's current prompt, stamped so repeated updates
+    /// never clobber an earlier backup. Pure + testable.
+    static func promptBackupFileName(stamp: String) -> String {
+        "system-prompt.backup-\(stamp).md"
+    }
+
+    /// Back up the current on-disk prompt, then overwrite it with the latest
+    /// built-in default. Returns the backup path (nil when there was nothing to
+    /// back up). The prompt is read live on every turn, so the next request picks
+    /// up the new content automatically — no reload plumbing needed.
+    @discardableResult
+    static func updateSystemPromptToDefault() -> String? {
+        let existing = (try? String(contentsOfFile: promptPath, encoding: .utf8)) ?? ""
+        var backupPath: String? = nil
+        if !existing.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            let f = DateFormatter()
+            f.dateFormat = "yyyyMMdd-HHmmss"
+            let path = (mlxServeDir as NSString).appendingPathComponent(promptBackupFileName(stamp: f.string(from: Date())))
+            try? existing.write(toFile: path, atomically: true, encoding: .utf8)
+            backupPath = path
+        }
+        try? FileManager.default.createDirectory(atPath: mlxServeDir, withIntermediateDirectories: true)
+        try? defaultPromptFile.write(toFile: promptPath, atomically: true, encoding: .utf8)
+        return backupPath
+    }
+
+    /// Menu action for "Update System Prompt": confirm (warn it's destructive),
+    /// back up, overwrite with the latest default, then report where the backup
+    /// went. No-ops with a friendly note when already up to date.
+    @MainActor
+    static func runSystemPromptUpdateFlow() {
+        guard isSystemPromptOutdated() else {
+            let a = NSAlert()
+            a.messageText = "System prompt is up to date"
+            a.informativeText = "Your system prompt already matches the latest built-in default."
+            a.runModal()
+            return
+        }
+        let confirm = NSAlert()
+        confirm.alertStyle = .warning
+        confirm.messageText = "Replace your system prompt with the latest default?"
+        confirm.informativeText = "This overwrites ~/.mlx-serve/system-prompt.md with the latest built-in prompt. Your current prompt is backed up first so you can restore it."
+        confirm.addButton(withTitle: "Update")
+        confirm.addButton(withTitle: "Cancel")
+        guard confirm.runModal() == .alertFirstButtonReturn else { return }
+
+        let backup = updateSystemPromptToDefault()
+        let done = NSAlert()
+        done.messageText = "System prompt updated"
+        done.informativeText = backup.map { "Updated to the latest default.\nYour previous prompt was saved to:\n\($0)" }
+            ?? "Updated to the latest default."
+        if backup != nil {
+            done.addButton(withTitle: "Reveal Backup")
+            done.addButton(withTitle: "OK")
+        }
+        let resp = done.runModal()
+        if let backup, resp == .alertFirstButtonReturn {
+            NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: backup)])
+        }
+    }
+
     private static func ensureFile(at path: String, defaultContent: String) {
         let fm = FileManager.default
         if !fm.fileExists(atPath: path) {
@@ -169,12 +195,12 @@ enum AgentPrompt {
     [
       {"type":"function","function":{"name":"shell","description":"Run a shell command. Commands run in the current working directory (use cwd tool to change it). For a long-lived process (a server, a watcher) set run_in_background to \"true\" — it returns instantly with a handle (bg1, bg2, …) and keeps running so you can keep working; poll it with readProcessOutput, stop it with killProcess. Example: {\"command\": \"ls -la /tmp\"}","parameters":{"type":"object","properties":{"command":{"type":"string","description":"The shell command to execute"},"run_in_background":{"type":"string","description":"Set to \"true\" to start a long-lived process in the background and return immediately with a handle (bg1, bg2, …). Default: foreground."}},"required":["command"]}}},
       {"type":"function","function":{"name":"cwd","description":"Change the working directory for all subsequent tool calls (shell, readFile, writeFile, etc.). Like cd but persistent. Example: {\"path\": \"myproject/src\"}","parameters":{"type":"object","properties":{"path":{"type":"string","description":"Directory path (relative to current working directory, or absolute)"}},"required":["path"]}}},
-      {"type":"function","function":{"name":"writeFile","description":"Write content to a file (overwrites). Only for SMALL files (under 100 lines). For large files use shell with cat heredoc instead. Example: {\"path\": \"src/main.swift\", \"content\": \"hello\"}","parameters":{"type":"object","properties":{"path":{"type":"string","description":"File path relative to working directory (must stay within workspace)"},"content":{"type":"string","description":"File content to write (keep under 100 lines — use shell cat heredoc for larger files)"}},"required":["path","content"]}}},
-      {"type":"function","function":{"name":"readFile","description":"Read a file's contents with optional line range. For large files, use startLine/endLine to read specific sections. Example: {\"path\": \"src/main.swift\", \"startLine\": \"10\", \"endLine\": \"50\"}","parameters":{"type":"object","properties":{"path":{"type":"string","description":"File path relative to working directory (must stay within workspace)"},"startLine":{"type":"string","description":"First line to read (1-based, default: 1)"},"endLine":{"type":"string","description":"Last line to read (default: end of file)"}},"required":["path"]}}},
-      {"type":"function","function":{"name":"editFile","description":"Edit a file. Two modes: (1) Line-based: provide path, startLine, endLine, replace — replaces those lines. (2) Text-based: provide path, find, replace — find must match exactly. Prefer line-based editing. Always readFile first to see line numbers. Example line-based: {\"path\": \"src/main.js\", \"startLine\": \"5\", \"endLine\": \"8\", \"replace\": \"new code here\"}. Example text-based: {\"path\": \"src/main.js\", \"find\": \"old text\", \"replace\": \"new text\"}","parameters":{"type":"object","properties":{"path":{"type":"string","description":"File path relative to working directory (must stay within workspace)"},"startLine":{"type":"string","description":"First line to replace (1-based, from readFile output)"},"endLine":{"type":"string","description":"Last line to replace (1-based, defaults to startLine)"},"find":{"type":"string","description":"Exact text to find (for text-based mode)"},"replace":{"type":"string","description":"Replacement text"}},"required":["path"]}}},
+      {"type":"function","function":{"name":"writeFile","description":"Write content to a file (overwrites the whole file). The content is part of your response, so for a very large file write it in chunks — this call for the first part, then editFile to append the rest — so it isn't cut off mid-write. Example: {\"path\": \"src/main.swift\", \"content\": \"hello\"}","parameters":{"type":"object","properties":{"path":{"type":"string","description":"File path, relative to the working directory"},"content":{"type":"string","description":"File content (small files only; use a shell heredoc for larger)"}},"required":["path","content"]}}},
+      {"type":"function","function":{"name":"readFile","description":"Read a file's contents with optional line range. For large files, use startLine/endLine to read specific sections. Example: {\"path\": \"src/main.swift\", \"startLine\": \"10\", \"endLine\": \"50\"}","parameters":{"type":"object","properties":{"path":{"type":"string","description":"File path, relative to the working directory"},"startLine":{"type":"string","description":"First line to read (1-based, default: 1)"},"endLine":{"type":"string","description":"Last line to read (default: end of file)"}},"required":["path"]}}},
+      {"type":"function","function":{"name":"editFile","description":"Edit a file. Two modes: (1) Line-based: provide path, startLine, endLine, replace — replaces those lines. (2) Text-based: provide path, find, replace — find must match exactly. Prefer line-based editing. Always readFile first to see line numbers. Example line-based: {\"path\": \"src/main.js\", \"startLine\": \"5\", \"endLine\": \"8\", \"replace\": \"new code here\"}. Example text-based: {\"path\": \"src/main.js\", \"find\": \"old text\", \"replace\": \"new text\"}","parameters":{"type":"object","properties":{"path":{"type":"string","description":"File path, relative to the working directory"},"startLine":{"type":"string","description":"First line to replace (1-based, from readFile output)"},"endLine":{"type":"string","description":"Last line to replace (1-based, defaults to startLine)"},"find":{"type":"string","description":"Exact text to find (for text-based mode)"},"replace":{"type":"string","description":"Replacement text"}},"required":["path"]}}},
       {"type":"function","function":{"name":"searchFiles","description":"Search file contents for a pattern (uses ripgrep if available). Returns matching lines with file paths and line numbers. Example: {\"pattern\": \"TODO\", \"include\": \"*.swift\"}","parameters":{"type":"object","properties":{"pattern":{"type":"string","description":"Text or regex pattern to search for"},"path":{"type":"string","description":"Directory to search in (default: working directory)"},"include":{"type":"string","description":"File glob filter (e.g. '*.swift', '*.ts')"},"context":{"type":"string","description":"Number of context lines around matches (0-10, default: 0)"},"maxResults":{"type":"string","description":"Max matches to return (default: 100)"}},"required":["pattern"]}}},
       {"type":"function","function":{"name":"listFiles","description":"List files and directories. The root working directory listing is already in the system prompt — only use this for subdirectories or with glob patterns. Returns paths matching the optional glob pattern. Example: {\"path\": \"src\", \"pattern\": \"*.swift\", \"recursive\": \"true\"}","parameters":{"type":"object","properties":{"path":{"type":"string","description":"Directory to list (default: working directory)"},"pattern":{"type":"string","description":"Glob pattern to filter (e.g. '*.swift', '**/*.ts')"},"recursive":{"type":"string","description":"If 'true', search recursively (default: false)"}},"required":[]}}},
-      {"type":"function","function":{"name":"browse","description":"Browse and interact with web pages. Actions: 'navigate' (load URL), 'readText' (visible text from <main>/<article>, strips nav and <details> pickers), 'extractText' (innerText of elements matching a CSS selector — best for lists like article.Box-row, tr.athing, .result), 'readHTML' (raw HTML, first 8000 chars — mostly <head>), 'click', 'executeJS' (use to discover selectors), 'screenshot'. For data-listing pages prefer extractText. Provide a 'selector' param for click/extractText; provide 'script' for executeJS.","parameters":{"type":"object","properties":{"action":{"type":"string","description":"navigate, readText, extractText, readHTML, click, executeJS, or screenshot"},"url":{"type":"string","description":"URL to browse (required for navigate, optional for others)"},"selector":{"type":"string","description":"CSS selector for click/extractText (e.g. 'article.Box-row', 'button.submit', '#send-btn')"},"script":{"type":"string","description":"JavaScript code for executeJS action"}},"required":["action"]}}},
+      {"type":"function","function":{"name":"browse","description":"Browse web pages. Actions: navigate (load a URL), readText (visible text), extractText (innerText of a CSS selector — best for lists), readHTML, click, executeJS (to discover selectors), screenshot. Give 'selector' for click/extractText, 'script' for executeJS. Example: {\"action\": \"navigate\", \"url\": \"https://example.com\"}","parameters":{"type":"object","properties":{"action":{"type":"string","description":"navigate, readText, extractText, readHTML, click, executeJS, or screenshot"},"url":{"type":"string","description":"URL to browse (required for navigate, optional for others)"},"selector":{"type":"string","description":"CSS selector for click/extractText (e.g. 'article.Box-row', 'button.submit', '#send-btn')"},"script":{"type":"string","description":"JavaScript code for executeJS action"}},"required":["action"]}}},
       {"type":"function","function":{"name":"webSearch","description":"Search the web using DuckDuckGo. Example: {\"query\": \"latest news\"}","parameters":{"type":"object","properties":{"query":{"type":"string","description":"Search query"}},"required":["query"]}}},
       {"type":"function","function":{"name":"saveMemory","description":"Save a memory for future sessions. Use for user preferences, project context, or important facts. Example: {\"memory\": \"User prefers dark mode themes\"}","parameters":{"type":"object","properties":{"memory":{"type":"string","description":"The memory to save"}},"required":["memory"]}}},
       {"type":"function","function":{"name":"createTask","description":"Create a background task that runs unattended as an autonomous agent and reports its result back to you when done — pushed to this chat if we're talking over Telegram, plus a desktop notification. Use it when asked to schedule something, do something later or periodically, or run a longer job and be notified. Omit 'schedule' (or set it to 'now') to run ONCE immediately in the background; provide a natural-language 'schedule' for a RECURRING task. The task has no memory of this conversation, so write 'goal' as a complete, self-contained instruction. Example: {\"goal\": \"Check Hacker News and summarize the top 3 stories with links\", \"schedule\": \"every day at 9am\"}","parameters":{"type":"object","properties":{"goal":{"type":"string","description":"The full, self-contained instruction the task should carry out"},"schedule":{"type":"string","description":"Optional. Natural-language recurring schedule like 'every day at 9am', 'every hour', 'Mon Wed Fri at 8am'. Omit or use 'now' to run once immediately."}},"required":["goal"]}}},

@@ -83,4 +83,43 @@ final class ProcessToolDispatchTests: XCTestCase {
         XCTAssertNotNil(AgentToolKind(rawValue: "killProcess"))
         XCTAssertNotNil(AgentToolKind(rawValue: "listProcesses"))
     }
+
+    // MARK: - Salvaging a process tool a weak model emitted as a shell command
+
+    func testFirstBgHandle() {
+        XCTAssertEqual(AgentEngine.firstBgHandle(in: "killProcess{handle: \"bg1\"}"), "bg1")
+        XCTAssertEqual(AgentEngine.firstBgHandle(in: "stop bg42 now"), "bg42")
+        XCTAssertNil(AgentEngine.firstBgHandle(in: "no handle here"))
+        XCTAssertNil(AgentEngine.firstBgHandle(in: "bg")) // no digits
+    }
+
+    func testProcessToolFromShellCommand() {
+        XCTAssertEqual(AgentEngine.processToolFromShellCommand("killProcess{handle: \"bg1\"}")?.tool, .killProcess)
+        XCTAssertEqual(AgentEngine.processToolFromShellCommand("killProcess{handle: \"bg1\"}")?.handle, "bg1")
+        XCTAssertEqual(AgentEngine.processToolFromShellCommand("killProcess bg2")?.handle, "bg2")
+        XCTAssertEqual(AgentEngine.processToolFromShellCommand("readProcessOutput {\"handle\":\"bg3\"}")?.tool, .readProcessOutput)
+        XCTAssertEqual(AgentEngine.processToolFromShellCommand("listProcesses")?.tool, .listProcesses)
+        XCTAssertNil(AgentEngine.processToolFromShellCommand("listProcesses")?.handle)
+        // Real shell commands pass straight through.
+        XCTAssertNil(AgentEngine.processToolFromShellCommand("ls -la /tmp"))
+        XCTAssertNil(AgentEngine.processToolFromShellCommand("echo killProcess"), "tool name must be the FIRST token")
+    }
+
+    /// End-to-end: a `shell` call whose command is really `killProcess{…}` must
+    /// re-route to the tool and actually kill the process.
+    func testShellMisroutedKillProcessIsSalvaged() async {
+        let reg = ProcessRegistry(); defer { reg.killAll() }
+        let p = reg.start(command: "sleep 60", workingDirectory: nil, sessionId: nil)
+        XCTAssertTrue(reg.isAlive(handle: p.handle))
+        let tc = APIClient.ToolCall(id: "1", name: "shell",
+                                    arguments: ["command": "killProcess{handle: \"\(p.handle)\"}"],
+                                    rawArguments: "")
+        var wd: String? = nil
+        let r = await AgentEngine.executeToolCall(
+            tc, workingDirectory: &wd, repetition: AgentEngine.RepetitionTracker(),
+            iteration: 0, agentMemory: AgentMemory(),
+            processRegistry: reg, sessionId: nil)
+        XCTAssertTrue(r.output.contains("Killed"), r.output)
+        XCTAssertFalse(reg.isAlive(handle: p.handle), "misrouted killProcess must still stop the process")
+    }
 }

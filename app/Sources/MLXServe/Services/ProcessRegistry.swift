@@ -263,22 +263,63 @@ final class ProcessRegistry: ObservableObject {
 
     // MARK: - Kill
 
-    /// Graceful stop: detach readers + close handles first (so a SIGKILL never
-    /// blocks on `readToEnd` waiting for an orphaned grandchild), flip status to
-    /// `.killed`, then `terminate()` → bounded grace → `SIGKILL`.
+    /// Graceful stop of the WHOLE process subtree. A tracked server often spawns
+    /// children (`npm run dev` → node + esbuild; a `cd x && server` shell that
+    /// stays the parent), and killing only the tracked pid orphans them. So we
+    /// snapshot the live descendant set FIRST (while the tree is intact — the
+    /// stripped-`&` start keeps the leader alive, so nothing has reparented yet),
+    /// detach readers, flip status to `.killed`, SIGTERM the leader + every
+    /// descendant, then SIGKILL any survivor after a bounded grace.
     func kill(handle: String) {
         guard let p = processes.first(where: { $0.handle == handle }), p.status.isAlive else { return }
         let proc = p.process
+        let leaderPid = proc.processIdentifier
+        // Snapshot the subtree before any signal perturbs it.
+        let tree = leaderPid > 0 ? [leaderPid] + Self.descendantPids(of: leaderPid) : []
+
         detachCapture(proc)
         proc.terminationHandler = nil   // status is now ours; don't let the trailing callback flip it
         objectWillChange.send()
         p.status = .killed
-        if proc.isRunning {
-            proc.terminate()
-            DispatchQueue.global().asyncAfter(deadline: .now() + 3) {
-                if proc.isRunning { Darwin.kill(proc.processIdentifier, SIGKILL) }
-            }
+
+        guard !tree.isEmpty else { return }
+        for pid in tree { Darwin.kill(pid, SIGTERM) }
+        DispatchQueue.global().asyncAfter(deadline: .now() + 3) {
+            for pid in tree where Darwin.kill(pid, 0) == 0 { Darwin.kill(pid, SIGKILL) }
         }
+    }
+
+    /// All transitive child pids of `pid` from one `ps` snapshot. Used to tear
+    /// down a server's whole subtree on kill. Best-effort: a process that has
+    /// double-forked / re-parented away (a true daemon) escapes this, same as it
+    /// would escape a process-group kill.
+    nonisolated static func descendantPids(of pid: Int32) -> [Int32] {
+        let task = Process()
+        task.executableURL = URL(fileURLWithPath: "/bin/ps")
+        task.arguments = ["-axo", "pid=,ppid="]
+        let pipe = Pipe()
+        task.standardOutput = pipe
+        task.standardError = FileHandle.nullDevice
+        do { try task.run() } catch { return [] }
+        let data = pipe.fileHandleForReading.readDataToEndOfFile()
+        task.waitUntilExit()
+        let out = String(data: data, encoding: .utf8) ?? ""
+
+        // Build parent → children adjacency, then BFS from `pid`.
+        var children: [Int32: [Int32]] = [:]
+        for line in out.split(whereSeparator: \.isNewline) {
+            let cols = line.split(whereSeparator: { $0 == " " || $0 == "\t" }).compactMap { Int32($0) }
+            guard cols.count == 2 else { continue }
+            children[cols[1], default: []].append(cols[0])
+        }
+        var result: [Int32] = []
+        var queue = children[pid] ?? []
+        while let next = queue.first {
+            queue.removeFirst()
+            result.append(next)
+            queue.append(contentsOf: children[next] ?? [])
+        }
+        return result
     }
 
     func killSession(_ id: UUID) {

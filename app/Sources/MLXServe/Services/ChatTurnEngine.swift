@@ -467,7 +467,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                     appState.chatSessions[sIdx].messages[mIdx].failedRetry = true
                     appState.chatSessions[sIdx].messages[mIdx].toolCalls = nil
                 }
-                let nudge = ChatMessage(role: .user, content: "[System: Your last response was cut off because the output was too long. The tool call was NOT executed. To avoid this, write shorter responses: use shell with heredoc (cat << 'EOF' > file) for file content instead of writeFile, or break large files into smaller pieces.]")
+                let nudge = ChatMessage(role: .user, content: "[System: Your last response was cut off because the output was too long, so the tool call was NOT executed. Write shorter responses: for a large file, write it in chunks — writeFile a first part, then editFile to append the rest. (A shell heredoc has the same length limit, so don't switch to that.)]")
                 appState.appendMessage(to: sessionId, message: nudge)
                 continue
             }

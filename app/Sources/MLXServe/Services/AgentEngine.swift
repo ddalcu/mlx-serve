@@ -649,7 +649,7 @@ enum AgentEngine {
         let missing = missingRequiredParams(for: name, arguments: tc.arguments)
         if !missing.isEmpty {
             if (name == "writeFile" || name == "editFile") && missing.contains("content") && tc.arguments["path"] != nil {
-                return "Error: \(name) content was truncated — your output was too long and got cut off before the content was complete. The file was NOT written. To fix this, use shell with a heredoc instead: {\"command\": \"cat << 'FILEEOF' > \(tc.arguments["path"] ?? "path")\\nfile content here\\nFILEEOF\"}"
+                return "Error: \(name) content was truncated — your output got cut off before the content was complete, so the file was NOT written. Write it in smaller chunks: writeFile the first part, then editFile to append the rest (each call must be short enough to finish in one response). A shell heredoc has the same limit, so don't switch to that."
             }
             return "Error: \(name) missing required params: \(missing.joined(separator: ", ")). Example: \(toolExample(for: name))"
         }
@@ -674,6 +674,16 @@ enum AgentEngine {
         // `toolHandlers` entry is stateless) so background-start and the
         // timeout-adopt backstop can register processes and report handles.
         if effectiveTool == .shell {
+            // Weak models routinely emit a process-management TOOL as a shell
+            // COMMAND (`shell {"command":"killProcess{handle:\"bg1\"}"}`), which
+            // would just die as "command not found". Re-route it to the real
+            // tool so process management works regardless of model capability.
+            if let cmd = tc.arguments["command"],
+               let reroute = processToolFromShellCommand(cmd) {
+                let args = reroute.handle.map { ["handle": $0] } ?? [:]
+                return processToolOutput(reroute.tool, arguments: args,
+                                         registry: processRegistry, sessionId: sessionId)
+            }
             let handler = ShellHandler(registry: processRegistry, sessionId: sessionId, handleBox: handleBox)
             do {
                 let output = try await handler.execute(parameters: tc.arguments, workingDirectory: workingDirectory)
@@ -738,6 +748,40 @@ enum AgentEngine {
         default:
             return "Error: \(tool.rawValue) is not a process tool."
         }
+    }
+
+    /// Recognize a process-management tool that a weak model emitted as a shell
+    /// command (first token is the tool name, in any casing). Returns the tool +
+    /// the `bgN` handle plucked from anywhere in the command (nil for
+    /// listProcesses / when absent). nil when it isn't a process-tool command, so
+    /// real shell commands pass straight through. Pure + testable.
+    static func processToolFromShellCommand(_ command: String) -> (tool: AgentToolKind, handle: String?)? {
+        let trimmed = command.trimmingCharacters(in: .whitespaces)
+        let firstToken = trimmed.split(whereSeparator: { " \t{(\"'".contains($0) }).first.map(String.init) ?? ""
+        let tool: AgentToolKind
+        switch firstToken.lowercased() {
+        case "killprocess": tool = .killProcess
+        case "readprocessoutput": tool = .readProcessOutput
+        case "listprocesses": tool = .listProcesses
+        default: return nil
+        }
+        return (tool, firstBgHandle(in: trimmed))
+    }
+
+    /// First `bg<digits>` token anywhere in a string (handles are `bg1`, `bg2`, …).
+    static func firstBgHandle(in s: String) -> String? {
+        let chars = Array(s)
+        var i = 0
+        while i + 1 < chars.count {
+            if chars[i] == "b", chars[i + 1] == "g" {
+                var j = i + 2
+                var digits = ""
+                while j < chars.count, chars[j].isNumber { digits.append(chars[j]); j += 1 }
+                if !digits.isEmpty { return "bg" + digits }
+            }
+            i += 1
+        }
+        return nil
     }
 
     /// Helpful error for a handle that doesn't resolve — lists the live handles.

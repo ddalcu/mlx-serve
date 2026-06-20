@@ -545,7 +545,7 @@ class TestServer {
                    !appState.chatSessions[sIdx].messages.isEmpty {
                     appState.chatSessions[sIdx].messages.removeLast()
                 }
-                let nudge = ChatMessage(role: .user, content: "[System: Your last response was cut off because the output was too long. The tool call was NOT executed. To avoid this, write shorter responses: use shell with heredoc (cat << 'EOF' > file) for file content instead of writeFile, or break large files into smaller pieces.]")
+                let nudge = ChatMessage(role: .user, content: "[System: Your last response was cut off because the output was too long, so the tool call was NOT executed. Write shorter responses: for a large file, write it in chunks — writeFile a first part, then editFile to append the rest. (A shell heredoc has the same length limit, so don't switch to that.)]")
                 appState.appendMessage(to: sessionId, message: nudge)
                 continue
             }
@@ -588,7 +588,9 @@ class TestServer {
                 let result = await AgentEngine.executeToolCall(
                     tc, workingDirectory: &workDir,
                     repetition: repetition, iteration: iteration,
-                    agentMemory: appState.agentMemory
+                    agentMemory: appState.agentMemory,
+                    processRegistry: appState.processRegistry,
+                    sessionId: sessionId
                 )
 
                 var resultMsg = ChatMessage(role: .assistant, content: "**\(result.name)** → \(String(result.output.prefix(500)))")

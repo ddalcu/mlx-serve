@@ -1,4 +1,5 @@
 import XCTest
+import Darwin
 @testable import MLXCore
 
 /// The @MainActor registry that owns agent-spawned background processes. These
@@ -84,6 +85,31 @@ final class ProcessRegistryTests: XCTestCase {
         XCTAssertNil(reg.readOutput(handle: "nope"))
         XCTAssertFalse(reg.isAlive(handle: "nope"))
         reg.kill(handle: "nope") // must not crash
+    }
+
+    /// Killing a tracked process must take down the children it spawned — the
+    /// `npm run dev → node/esbuild` / `cd x && server` case — not just the leader.
+    func testKillTakesDownChildProcesses() async {
+        let reg = ProcessRegistry()
+        defer { reg.killAll() }
+        let pidFile = NSTemporaryDirectory() + "mlxtest_child_\(UUID().uuidString).pid"
+        // Leader (zsh) backgrounds a child sleep, records its pid, then waits —
+        // so the leader stays alive and the child is a live descendant at kill time.
+        let p = reg.start(command: "sleep 300 & echo $! > \(pidFile); wait",
+                          workingDirectory: nil, sessionId: nil)
+        await waitUntil(5) {
+            guard let s = try? String(contentsOfFile: pidFile) else { return false }
+            return !s.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+        let childPid = Int32((try? String(contentsOfFile: pidFile))?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? "") ?? 0
+        XCTAssertGreaterThan(childPid, 0, "failed to capture the child pid")
+        XCTAssertEqual(Darwin.kill(childPid, 0), 0, "child should be alive before kill")
+
+        reg.kill(handle: p.handle)
+        await waitUntil(5) { Darwin.kill(childPid, 0) != 0 }
+        XCTAssertNotEqual(Darwin.kill(childPid, 0), 0, "child must be killed along with its parent")
+        try? FileManager.default.removeItem(atPath: pidFile)
     }
 
     func testAdoptedProcessIsManagedAndAlive() async {

@@ -1793,64 +1793,77 @@ private struct ToolCallRow: View {
         ProcessCardControls.killable(handles: call.processHandles, isAlive: processRegistry.isAlive)
     }
 
+    /// At least one background process from this card is still alive — drives the
+    /// green "running" border. Goes false the moment the registry flips the last
+    /// one dead (e.g. you click its X), so border + kill X disappear together.
+    private var isRunningBackground: Bool { !killableHandles.isEmpty }
+
     var body: some View {
         HStack(alignment: .top, spacing: 0) {
             VStack(alignment: .leading, spacing: 6) {
-                HStack(alignment: .top, spacing: 6) {
-                    Button {
-                        withAnimation(.easeInOut(duration: 0.15)) { expanded.toggle() }
-                    } label: {
-                        HStack(alignment: .top, spacing: 6) {
-                            Image(systemName: "wrench.and.screwdriver")
-                                .font(.caption2)
-                                .foregroundStyle(.secondary)
-                            Text(Self.stripBold(call.content))
-                                .font(.caption.monospaced())
-                                .multilineTextAlignment(.leading)
-                                .foregroundStyle(.primary)
-                            Spacer(minLength: 6)
-                            if call.isStreaming {
-                                GeneratingIndicator()
-                            } else if !results.isEmpty {
-                                Image(systemName: expanded ? "chevron.down" : "chevron.right")
-                                    .font(.caption2)
-                                    .foregroundStyle(.secondary)
-                            }
-                        }
-                        .contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-                    .disabled(results.isEmpty)
-
-                    ForEach(killableHandles, id: \.self) { handle in
-                        Button {
-                            processRegistry.kill(handle: handle)
-                        } label: {
-                            Image(systemName: "xmark.circle.fill")
-                                .font(.caption)
-                                .foregroundStyle(.red)
-                        }
-                        .buttonStyle(.plain)
-                        .help("Stop background process \(handle)")
-                    }
-                }
-
-                if expanded {
-                    ForEach(results) { r in
-                        Text(Self.stripBold(r.content))
-                            .font(.caption.monospaced())
-                            .foregroundStyle(.secondary)
-                            .textSelection(.enabled)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                    }
-                }
+                headerRow
+                if expanded { expandedResults }
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
             .background(Color(.controlBackgroundColor))
             .clipShape(RoundedRectangle(cornerRadius: 14))
+            .overlay(
+                RoundedRectangle(cornerRadius: 14)
+                    .strokeBorder(Color.green.opacity(isRunningBackground ? 0.7 : 0), lineWidth: 1.5)
+            )
+            .animation(.easeInOut(duration: 0.2), value: isRunningBackground)
 
             Spacer(minLength: 60)
+        }
+    }
+
+    // Broken out into separately type-checked pieces — a single deeply nested
+    // body (expander button + per-handle kill buttons + results) pushed the
+    // SwiftUI type-checker into pathological (effectively non-terminating)
+    // compile times.
+    @ViewBuilder private var headerRow: some View {
+        HStack(alignment: .top, spacing: 6) {
+            Button {
+                withAnimation(.easeInOut(duration: 0.15)) { expanded.toggle() }
+            } label: {
+                headerLabel
+            }
+            .buttonStyle(.plain)
+            .disabled(results.isEmpty)
+
+            ProcessKillButtons(handles: killableHandles) { processRegistry.kill(handle: $0) }
+        }
+    }
+
+    @ViewBuilder private var headerLabel: some View {
+        HStack(alignment: .top, spacing: 6) {
+            Image(systemName: "wrench.and.screwdriver")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+            Text(Self.stripBold(call.content))
+                .font(.caption.monospaced())
+                .multilineTextAlignment(.leading)
+                .foregroundStyle(.primary)
+            Spacer(minLength: 6)
+            if call.isStreaming {
+                GeneratingIndicator()
+            } else if !results.isEmpty {
+                Image(systemName: expanded ? "chevron.down" : "chevron.right")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+        }
+        .contentShape(Rectangle())
+    }
+
+    @ViewBuilder private var expandedResults: some View {
+        ForEach(results) { r in
+            Text(Self.stripBold(r.content))
+                .font(.caption.monospaced())
+                .foregroundStyle(.secondary)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
         }
     }
 
@@ -1858,6 +1871,30 @@ private struct ToolCallRow: View {
     /// and body render as plain text, so strip the `**` markers.
     static func stripBold(_ s: String) -> String {
         s.replacingOccurrences(of: "**", with: "")
+    }
+}
+
+/// Per-handle red kill X for a tool-call card's live background processes. Its
+/// own type (not an inline ForEach in ToolCallRow.body) so the SwiftUI
+/// type-checker handles it as an isolated, trivial unit.
+private struct ProcessKillButtons: View {
+    let handles: [String]
+    let onKill: (String) -> Void
+
+    var body: some View {
+        ForEach(handles, id: \.self) { handle in
+            Button {
+                onKill(handle)
+            } label: {
+                Image(systemName: "xmark.circle.fill")
+                    .font(.title2)
+                    .foregroundStyle(.red)
+                    .symbolRenderingMode(.hierarchical)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help("Stop background process \(handle)")
+        }
     }
 }
 

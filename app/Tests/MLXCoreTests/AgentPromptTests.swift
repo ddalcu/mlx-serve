@@ -7,7 +7,7 @@ final class AgentPromptTests: XCTestCase {
     // toward non-interactive flags or manual setup.
     func testSystemPromptHasScaffoldingGuidance() {
         let p = AgentPrompt.defaultPromptFile
-        XCTAssertTrue(p.contains("Scaffolding"), "base prompt is missing a scaffolding section")
+        XCTAssertTrue(p.lowercased().contains("scaffold"), "base prompt is missing scaffolding guidance")
         XCTAssertTrue(p.lowercased().contains("interactive"),
                       "base prompt should warn about interactive commands")
         XCTAssertTrue(p.contains("npm init -y") || p.lowercased().contains("non-interactive"),
@@ -57,5 +57,28 @@ final class AgentPromptTests: XCTestCase {
         XCTAssertTrue(p.contains("run_in_background"), "prompt should steer toward run_in_background")
         XCTAssertTrue(p.contains("killProcess"), "prompt should mention killProcess")
         XCTAssertTrue(p.contains("readProcessOutput"), "prompt should mention readProcessOutput")
+    }
+
+    // "Update System Prompt" menu item: enabled only when the on-disk prompt is a
+    // real prompt that differs from the latest default.
+    func testIsPromptOutdated() {
+        // Missing / empty / legacy stub all resolve to the default → not outdated.
+        XCTAssertFalse(AgentPrompt.isPromptOutdated(fileContent: nil))
+        XCTAssertFalse(AgentPrompt.isPromptOutdated(fileContent: ""))
+        XCTAssertFalse(AgentPrompt.isPromptOutdated(fileContent: "   \n  "))
+        let legacyStub = "# Custom Instructions\nThese are appended to the base system prompt."
+        XCTAssertFalse(AgentPrompt.isPromptOutdated(fileContent: legacyStub))
+        // The current default itself → not outdated.
+        XCTAssertFalse(AgentPrompt.isPromptOutdated(fileContent: AgentPrompt.defaultPromptFile))
+        // A real, differing prompt (old default or a user customization) → outdated.
+        XCTAssertTrue(AgentPrompt.isPromptOutdated(fileContent: "# My terse prompt\nNo preamble."))
+        XCTAssertTrue(AgentPrompt.isPromptOutdated(fileContent: "You are an old version of the agent prompt."))
+    }
+
+    func testPromptBackupFileNameIsStampedAndDistinct() {
+        let a = AgentPrompt.promptBackupFileName(stamp: "20260620-101500")
+        XCTAssertEqual(a, "system-prompt.backup-20260620-101500.md")
+        let b = AgentPrompt.promptBackupFileName(stamp: "20260620-101501")
+        XCTAssertNotEqual(a, b, "different stamps must not collide")
     }
 }

@@ -93,4 +93,76 @@ final class ShellHandlerTests: XCTestCase {
         let handle = reg.list(sessionId: nil)[0].handle
         XCTAssertTrue(reg.isAlive(handle: handle), "adopted process must still be alive")
     }
+
+    // MARK: - Model-agnostic flag + `&` handling (no prompt-following required)
+
+    func testIsTruthyFlag() {
+        for yes in ["true", "True", "TRUE", "1", "yes", "Y", "on", " true "] {
+            XCTAssertTrue(ShellHandler.isTruthyFlag(yes), "\(yes) should be truthy")
+        }
+        for no in ["false", "0", "no", "", "  ", "tru"] {
+            XCTAssertFalse(ShellHandler.isTruthyFlag(no), "\(no) should be falsy")
+        }
+        XCTAssertFalse(ShellHandler.isTruthyFlag(nil))
+    }
+
+    /// Models send `run_in_background: 1` (stringified to "1") as often as
+    /// `"true"`. It must still background — not fall into the foreground/timeout
+    /// path. Regression for the live "simmering 20s" stuck card.
+    @MainActor
+    func testNumericTruthyFlagBackgrounds() async throws {
+        let reg = ProcessRegistry()
+        defer { reg.killAll() }
+        let start = Date()
+        let out = try await ShellHandler(registry: reg).execute(
+            parameters: ["command": "sleep 30", "run_in_background": "1"], workingDirectory: nil)
+        XCTAssertLessThan(Date().timeIntervalSince(start), 3, "run_in_background:1 must background, not block")
+        XCTAssertTrue(out.contains("bg1"), out)
+        XCTAssertTrue(reg.isAlive(handle: "bg1"))
+    }
+
+    func testHasTrailingBackgroundOperator() {
+        XCTAssertTrue(ShellHandler.hasTrailingBackgroundOperator("cmd &"))
+        XCTAssertTrue(ShellHandler.hasTrailingBackgroundOperator("cmd &   "))
+        XCTAssertFalse(ShellHandler.hasTrailingBackgroundOperator("cmd"))
+        XCTAssertFalse(ShellHandler.hasTrailingBackgroundOperator("a && b"), "&& is logical-AND, not background")
+        XCTAssertFalse(ShellHandler.hasTrailingBackgroundOperator("a & b"), "inner & is not a trailing operator")
+    }
+
+    func testStripTrailingBackgroundOperator() {
+        XCTAssertEqual(ShellHandler.stripTrailingBackgroundOperator("python3 -m http.server 8080 &"),
+                       "python3 -m http.server 8080")
+        XCTAssertEqual(ShellHandler.stripTrailingBackgroundOperator("  cmd &  "), "cmd")
+        XCTAssertEqual(ShellHandler.stripTrailingBackgroundOperator("cmd"), "cmd")
+        XCTAssertEqual(ShellHandler.stripTrailingBackgroundOperator("a && b"), "a && b")
+        XCTAssertEqual(ShellHandler.stripTrailingBackgroundOperator("a & b"), "a & b")
+    }
+
+    /// A small model that writes `… &` with NO run_in_background flag must still
+    /// be auto-tracked — and the tracked pid must be the LIVE process (strip), not
+    /// an instantly-exited backgrounding shell.
+    @MainActor
+    func testTrailingAmpersandAutoRoutesToLiveBackgroundProcess() async throws {
+        let reg = ProcessRegistry()
+        defer { reg.killAll() }
+        let start = Date()
+        let out = try await ShellHandler(registry: reg).execute(
+            parameters: ["command": "sleep 30 &"], workingDirectory: nil)
+        XCTAssertLessThan(Date().timeIntervalSince(start), 3, "auto-background should return promptly")
+        XCTAssertTrue(out.contains("bg1"), out)
+        XCTAssertTrue(reg.isAlive(handle: "bg1"),
+                      "tracked pid must be the live process, not an exited backgrounding shell")
+    }
+
+    /// A capable model that sets the flag AND redundantly adds `&` must not orphan
+    /// the process either.
+    @MainActor
+    func testRedundantAmpersandWithFlagStaysTracked() async throws {
+        let reg = ProcessRegistry()
+        defer { reg.killAll() }
+        let out = try await ShellHandler(registry: reg).execute(
+            parameters: ["command": "sleep 30 &", "run_in_background": "true"], workingDirectory: nil)
+        XCTAssertTrue(out.contains("bg1"), out)
+        XCTAssertTrue(reg.isAlive(handle: "bg1"), "redundant & must not orphan the tracked process")
+    }
 }

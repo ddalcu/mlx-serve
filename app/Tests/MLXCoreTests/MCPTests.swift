@@ -424,7 +424,7 @@ final class MCPTests: XCTestCase {
         XCTAssertNotNil(merged)
         let mergedData = merged!.data(using: .utf8)!
         let arr = try? JSONSerialization.jsonObject(with: mergedData) as? [[String: Any]]
-        XCTAssertEqual(arr?.count, 12, "Expected 11 agent tools (incl. createTask) + 1 MCP tool, got \(arr?.count ?? 0)")
+        XCTAssertEqual(arr?.count, 15, "Expected 14 agent tools (incl. createTask + killProcess/readProcessOutput/listProcesses) + 1 MCP tool, got \(arr?.count ?? 0)")
         XCTAssertTrue(merged!.contains("github__list_repos"))
         XCTAssertTrue(merged!.contains("shell"))
 
