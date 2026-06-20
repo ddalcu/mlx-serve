@@ -506,7 +506,7 @@ pub fn main(init: std.process.Init) !void {
             std.process.exit(2);
         };
         switch (chosen) {
-            .ds4 => try runDs4Offline(io, allocator, model_dir, prompt_text, max_tokens, temperature),
+            .ds4 => try runDs4Offline(io, allocator, model_dir, prompt_text, max_tokens, temperature, ctx_size),
             .llama => try runLlamaOffline(io, allocator, model_dir, prompt_text, max_tokens, temperature),
         }
         return;
@@ -1051,6 +1051,7 @@ fn runDs4Offline(
     prompt: []const u8,
     max_tokens: u32,
     temp: f32,
+    ctx_size: u32,
 ) !void {
     const gguf_path = resolveGgufFile(io, allocator, model_dir) catch |err| {
         logResolveGgufError(model_dir, err);
@@ -1084,9 +1085,10 @@ fn runDs4Offline(
     // session can be reused across multiple `sync` calls. ds4 sizes its
     // prefill buffers against the requested ctx (`prefill_chunk = 2048` per
     // the CLI default), and sessions smaller than the prefill chunk produce
-    // junk output. Mirror ds4's CLI default of 32768.
-    const ctx_size: i32 = 32768;
-    var sess = try engine.createSession(ctx_size);
+    // junk output — so the user's --ctx-size is floored at the chunk; 0/unset
+    // → ds4's default of 32768.
+    const sess_ctx: i32 = @intCast(ds4_arch.clampSessionCtx(ctx_size));
+    var sess = try engine.createSession(sess_ctx);
     defer sess.free();
 
     try sess.sync(prompt_ids);
@@ -1173,10 +1175,12 @@ fn runDs4Serve(
         .head_dim = 128,
         .num_attention_heads = 56,
         .num_key_value_heads = 56,
-        .max_position_embeddings = 32768,
+        // Carry the user-supplied --ctx-size (floored at ds4's prefill chunk;
+        // 0/unset → ds4's default) on the standard field. `runPrefillDs4` reads
+        // it back to size the ds4 session, and `getEffectiveContextLength` /
+        // /v1/models report it.
+        .max_position_embeddings = ds4_arch.clampSessionCtx(ctx_size),
         .is_encoder_only = false,
-        // Carry the user-supplied --ctx-size hint via the standard field so
-        // `getEffectiveContextLength` honors it.
     };
 
     // Stub tokenizer. Most server.zig fast paths read `lm.tokenizer.?` —

@@ -352,6 +352,62 @@ const corpus = [_]Expect{
         .tool_arg_value = "Paris, France",
         .last_tool_arg_value = "Tokyo, Japan",
     },
+    // ── Small-model big-file escaping recovery (looseRepairToolCallJson) ────
+    // Class: a model writing a large file in one shot mangles the JSON `content`
+    // string — raw control bytes instead of `\n`/`\t`, and/or unescaped inner
+    // quotes — which strict std.json rejects, so PRE-FIX the whole writeFile
+    // call was dropped and the file leaked as visible text. The valid-JSON
+    // invariant + byte-exact content assertion below pin the recovery; reverting
+    // looseRepairToolCallJson turns each of these red (call → null → "expected a
+    // tool call, got none"). New entries are covered automatically.
+    .{
+        .family = "qwen",
+        .name = "writeFile content with RAW newlines (small-model big-file)",
+        .raw = "<tool_call>{\"name\":\"writeFile\",\"arguments\":{\"path\":\"app.js\",\"content\":\"const a = 1;\nconst b = 2;\nmodule.exports = { a, b };\n\"}}</tool_call>",
+        .tool_name = "writeFile",
+        .tool_arg_key = "content",
+        .tool_arg_value = "const a = 1;\nconst b = 2;\nmodule.exports = { a, b };\n",
+    },
+    .{
+        .family = "qwen",
+        .name = "writeFile HTML with UNESCAPED inner quotes + raw newlines",
+        .raw = "<tool_call>{\"name\":\"writeFile\",\"arguments\":{\"path\":\"brevard.html\",\"content\":\"<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"UTF-8\">\n<title>Brevard, NC</title>\n</head>\n</html>\"}}</tool_call>",
+        .tool_name = "writeFile",
+        .tool_arg_key = "content",
+        .tool_arg_value = "<!DOCTYPE html>\n<html lang=\"en\">\n<head>\n<meta charset=\"UTF-8\">\n<title>Brevard, NC</title>\n</head>\n</html>",
+    },
+    .{
+        .family = "gemma4",
+        .name = "Gemma 4 call:writeFile{json} with raw newlines + inner quotes",
+        .raw = "<|tool_call>call:writeFile{\"path\":\"page.html\",\"content\":\"<div class=\"box\">\nhello\n</div>\"}<tool_call|>",
+        .tool_name = "writeFile",
+        .tool_arg_key = "content",
+        .tool_arg_value = "<div class=\"box\">\nhello\n</div>",
+    },
+    .{
+        // Live gemma-4-e4b-it-4bit (test_tool_matrix_small.sh): on a big HTML
+        // page it DROPPED the opening <|"|> on `content` but kept the closing
+        // one. Pre-fix the bare-value scan cut content at the viewport meta's
+        // comma and shredded the rest into bogus keys → invalid args; the
+        // closing <|"|> (followed by `,path`) is the true boundary.
+        .family = "gemma4",
+        .name = "Gemma 4 dropped opening <|\"|> on big content keeps full file",
+        .raw = "<|tool_call>call:write_file{content:<!DOCTYPE html>\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\n<style>body{margin:0}</style>\n</html><|\"|>,path:<|\"|>mars.html<|\"|>}<tool_call|>",
+        .tool_name = "write_file",
+        .tool_arg_key = "content",
+        .tool_arg_value = "<!DOCTYPE html>\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\n<style>body{margin:0}</style>\n</html>",
+    },
+    .{
+        // Windows path / regex in content — `\U`, `\d` are invalid JSON escapes
+        // that strict parse rejects; looseRepair treats them as literal
+        // backslashes (the model meant a path, not an escape).
+        .family = "qwen",
+        .name = "writeFile content with invalid backslash escapes (path/regex)",
+        .raw = "<tool_call>{\"name\":\"writeFile\",\"arguments\":{\"path\":\"out.py\",\"content\":\"p = r\"C:\\Users\\dev\"\nm = re.match(\\d+)\"}}</tool_call>",
+        .tool_name = "writeFile",
+        .tool_arg_key = "path",
+        .tool_arg_value = "out.py",
+    },
     .{
         // Verbatim capture from DeepSeek-V4-Flash via the ds4 engine
         // (2026-06-10, MLX Core agent chat): tool name and each argument as
@@ -418,6 +474,34 @@ const corpus = [_]Expect{
         .raw = "Here's the page I created for you:\n\n<tool_output>Page ready: mlx.html</tool_output>",
         .content_contains = "Page ready",
         .no_tool_calls = true,
+    },
+    // ── Truncated tool-call OPENER recovery (close_rel==null branch) ────────
+    // Class: a model dumps a huge file into ONE Hermes/XML tool call and hits
+    // the token cap mid-content, so the call arrives with an OPENING tag but no
+    // close (`</parameter>`/`</function>`/`</tool_call>`). Pre-fix the
+    // close_rel==null branch only tried JSON shapes, so the whole writeFile was
+    // DROPPED and leaked as visible text (live JFK-novel capture, 2026-06-20),
+    // and the app misclassified it as a "malformed tag" ghost call. We recover
+    // the tool NAME (content is intentionally NOT salvaged — a half-written file
+    // is worse than a re-issued chunked write) so the client fires the right
+    // chunk/append nudge. The no-tag-leak invariant below auto-confirms the
+    // `<tool_call>`/`<function=` markup no longer leaks once the call parses;
+    // reverting the recovery turns these red ("expected a tool call, got none").
+    .{
+        .family = "hermes",
+        .name = "truncated <function=writeFile> mid-content recovers the tool name",
+        .raw = "<tool_call>\n<function=writeFile>\n<parameter=content>\n# THE LION OF MASSACHUSETTS\n\nChapter 1. The young senator rose before dawn, the Cape light still grey over the water, and thought of all the speeches yet unwritten",
+        .tool_name = "writeFile",
+    },
+    .{
+        // EOS-before-close-tag variant: the parameter+function CLOSED but the
+        // outer </tool_call> was cut — recovers WITH args (bonus of the fix).
+        .family = "hermes",
+        .name = "EOS before </tool_call> recovers <function=> call with args",
+        .raw = "<tool_call>\n<function=shell>\n<parameter=command>ls -la</parameter>\n</function>",
+        .tool_name = "shell",
+        .tool_arg_key = "command",
+        .tool_arg_value = "ls -la",
     },
     // ── Negatives ────────────────────────────────────────────────────────────
     .{

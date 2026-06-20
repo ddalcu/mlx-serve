@@ -595,7 +595,7 @@ extension ServerOptions {
     static let requestDefaultFields: [String: ServerOptionField] = [
         "defaultMaxTokens": .init(
             title: "Max tokens",
-            explainer: "Default max_tokens to request per chat turn. Per-message overrides win when set.",
+            explainer: "Max tokens to generate per chat turn. \"Auto\" pegs it to the remaining context window — the safe choice on a small-RAM / small-context machine. Per-message overrides win when set.",
             needsRestart: false),
         "defaultTemperature": .init(
             title: "Temperature",

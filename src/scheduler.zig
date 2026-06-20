@@ -206,6 +206,12 @@ pub const SubmitParams = struct {
     /// Vision embeddings spliced at image-token positions during prefill.
     /// Ownership transferred to the slot; freed on slot.deinit.
     vision_embeddings: ?mlx.mlx_array = null,
+    /// Qwen3-VL interleaved M-RoPE: server-computed flat [3 × mrope_total] i32
+    /// position-id table + decode delta. Ownership of `mrope_pos` transfers to
+    /// the slot; freed on slot.deinit. Null for non-image / non-Qwen requests.
+    mrope_pos: ?[]const i32 = null,
+    mrope_total: usize = 0,
+    mrope_delta: i32 = 0,
     logprobs_n: u32 = 0,
     /// Wave 1.A: per-request override of the process-default KV-cache quant
     /// scheme. When non-null, this slot's KVCache is constructed with this
@@ -258,6 +264,11 @@ pub const Slot = struct {
     moe_seq_offset: usize,
     ssm_entries: ?[]SSMCacheEntry,
     vision_embeddings: ?mlx.mlx_array,
+    /// Qwen3-VL M-RoPE position-id table (flat [3 × mrope_total]) + decode delta.
+    /// Owned by the slot; `mrope_pos` freed on deinit.
+    mrope_pos: ?[]const i32,
+    mrope_total: usize,
+    mrope_delta: i32,
 
     /// Forward context backed by the fields above. Initialized in `init`
     /// and aliased by the Generator's own `ctx` field at prefill time.
@@ -430,6 +441,9 @@ pub const Slot = struct {
             .moe_seq_offset = 0,
             .ssm_entries = ssm_entries,
             .vision_embeddings = params.vision_embeddings,
+            .mrope_pos = params.mrope_pos,
+            .mrope_total = params.mrope_total,
+            .mrope_delta = params.mrope_delta,
             .ctx = undefined, // set after slot is in stable storage so pointers are valid
             .legacy_gen = null,
             .ds4_session = null,
@@ -445,10 +459,14 @@ pub const Slot = struct {
             .timeout_ns = params.timeout_ns,
             .has_tools = params.has_tools,
             .enable_pld = params.enable_pld,
-            .enable_drafter = params.enable_drafter,
+            // MTP/drafter do extra speculative forwards that don't yet carry
+            // Qwen3-VL M-RoPE positions — disable them for image requests so the
+            // spec path can't desync image-token positions. PLD is fine (it only
+            // engages on text decode, which uses the scalar offset+delta path).
+            .enable_drafter = params.enable_drafter and params.vision_embeddings == null,
             .drafter = params.drafter,
             .drafter_block_size = params.drafter_block_size,
-            .enable_mtp = params.enable_mtp,
+            .enable_mtp = params.enable_mtp and params.vision_embeddings == null,
             .mtp = params.mtp,
             .mtp_depth = params.mtp_depth,
             .pld_draft_len = params.pld_draft_len,
@@ -485,6 +503,9 @@ pub const Slot = struct {
             .moe_seq_offset = &slot.moe_seq_offset,
             .ssm_entries = slot.ssm_entries,
             .vision_embeddings = slot.vision_embeddings,
+            .mrope_pos = slot.mrope_pos,
+            .mrope_total = slot.mrope_total,
+            .mrope_delta = slot.mrope_delta,
             .capture_hidden = null,
             .kv_attn_fused = params.kv_attn_fused,
         };
@@ -522,6 +543,7 @@ pub const Slot = struct {
             self.allocator.free(entries);
         }
         if (self.vision_embeddings) |ve| _ = mlx.mlx_array_free(ve);
+        if (self.mrope_pos) |mp| self.allocator.free(mp);
         self.allocator.free(self.prompt_ids);
         self.allocator.free(self.full_prompt);
         self.allocator.free(self.eos_token_ids);
@@ -588,6 +610,13 @@ pub const Slot = struct {
             }
             if (self.error_code != null) return .{ .err = {} };
             if (self.finished) return .{ .done = {} };
+            // Cancellation (client disconnect or server shutdown) must unblock a
+            // blocked reader — `cancel()` only broadcasts; without this the
+            // reader would sleep until the inference thread happened to finish
+            // the slot, so shutdown could never drain in-flight requests and
+            // raced `Scheduler.deinit` into a use-after-free (SIGSEGV in
+            // `complete`). Buffered tokens above still drain first.
+            if (self.cancelled.load(.acquire)) return .{ .done = {} };
             self.out_cond.waitUncancelable(self.io, &self.out_mu);
         }
     }
@@ -615,6 +644,14 @@ pub const Slot = struct {
                 return .{ .err = {} };
             }
             if (self.finished) {
+                self.out_mu.unlock(self.io);
+                return .{ .done = {} };
+            }
+            // Cancellation unblocks the reader promptly (see waitNext) so a
+            // disconnected/shutdown request stops instead of waiting out the
+            // generation — the precondition for draining conn threads before
+            // teardown.
+            if (self.cancelled.load(.acquire)) {
                 self.out_mu.unlock(self.io);
                 return .{ .done = {} };
             }
@@ -646,12 +683,15 @@ pub const Slot = struct {
 /// thread (CPU only — stb_image / libwebp). The inference thread wraps this
 /// in an `mlx_array` via `mlx_array_new_data` and runs the vision encoder.
 pub const VisionImagePixels = struct {
-    /// Raw bytes holding float32 CHW pixel data — exactly what the existing
-    /// `chat_mod.ImageData.pixels` carries (3 × H × W × sizeof(f32)). Borrowed;
-    /// must outlive the encodeVision call (which blocks until completion).
+    /// Raw bytes holding float32 pixel data. Gemma: CHW (3 × H × W × 4). Qwen3-VL:
+    /// merge-order pixel_values (N × C·tps·ps·ps × 4). Borrowed; must outlive the
+    /// encodeVision call (which blocks until completion).
     pixels: []const u8,
     width: u32,
     height: u32,
+    /// Qwen3-VL only: full patch grid (0 ⇒ Gemma CHW). Selects QwenVision.
+    grid_h: u32 = 0,
+    grid_w: u32 = 0,
 };
 
 /// Phase A4: vision-encode work item. Conn thread fills `images` (raw pixel
@@ -1194,6 +1234,21 @@ pub const Scheduler = struct {
         self.queue_cond.broadcast(self.io); // wake inference thread to drain
         self.submit_cond.broadcast(self.io); // wake any blocked submitter
         self.queue_mu.unlock(self.io);
+    }
+
+    /// Shutdown helper: signal every in-flight slot (pending + decoding) to
+    /// cancel so their owning connection threads unblock from `waitNext` and
+    /// run their `defer complete(...)` promptly. `server.serve` calls this when
+    /// the accept loop exits, THEN waits for the connection threads to drain
+    /// before returning (which triggers `deinit`) — otherwise a thread still in
+    /// `complete()` races `deinit`'s teardown of `pending`/`decoding`/
+    /// `cleanup_queue` into a use-after-free. Does NOT remove or free slots;
+    /// the conn threads own that via `complete()`.
+    pub fn cancelAllInFlight(self: *Scheduler) void {
+        self.queue_mu.lockUncancelable(self.io);
+        defer self.queue_mu.unlock(self.io);
+        for (self.pending.items) |slot| slot.cancel();
+        for (self.decoding.items) |slot| slot.cancel();
     }
 
     /// Plan 05 Phase D: resolve `id_or_empty` ("" / "mlx-serve" → default)
@@ -2315,15 +2370,30 @@ fn runVisionEncode(sch: *Scheduler, req: *VisionEncodeRequest) void {
 
     var n_vision: usize = 0;
     for (req.images) |img| {
-        const h: c_int = @intCast(img.height);
-        const w: c_int = @intCast(img.width);
-        const shape = [_]c_int{ 1, 3, h, w };
-        const pixel_arr = mlx.mlx_array_new_data(img.pixels.ptr, &shape, 4, .float32);
-        defer _ = mlx.mlx_array_free(pixel_arr);
-        const emb = vision_enc.forward(pixel_arr) catch |err| {
-            failParts(sch, req, emb_parts.items, @errorName(err));
-            return;
-        };
+        var emb: mlx.mlx_array = undefined;
+        if (img.grid_h > 0) {
+            // Qwen3-VL: pixels hold merge-order pixel_values [N, feat]; the ViT
+            // produces [1, N/merge², out_hidden].
+            const n: usize = @as(usize, img.grid_h) * img.grid_w;
+            const feat: usize = (img.pixels.len / 4) / n;
+            const shape = [_]c_int{ @intCast(n), @intCast(feat) };
+            const pixel_arr = mlx.mlx_array_new_data(img.pixels.ptr, &shape, 2, .float32);
+            defer _ = mlx.mlx_array_free(pixel_arr);
+            emb = vision_enc.forwardQwen(pixel_arr, img.grid_h, img.grid_w) catch |err| {
+                failParts(sch, req, emb_parts.items, @errorName(err));
+                return;
+            };
+        } else {
+            const h: c_int = @intCast(img.height);
+            const w: c_int = @intCast(img.width);
+            const shape = [_]c_int{ 1, 3, h, w };
+            const pixel_arr = mlx.mlx_array_new_data(img.pixels.ptr, &shape, 4, .float32);
+            defer _ = mlx.mlx_array_free(pixel_arr);
+            emb = vision_enc.forward(pixel_arr) catch |err| {
+                failParts(sch, req, emb_parts.items, @errorName(err));
+                return;
+            };
+        }
         const es = mlx.getShape(emb);
         n_vision += @intCast(es[1]);
         emb_parts.append(req.allocator, emb) catch |err| {
@@ -2574,9 +2644,12 @@ fn runPrefillDs4(sch: *Scheduler, slot: *Slot, engine: *arch_ds4.Ds4Engine) !voi
     defer slot.allocator.free(i32_prompt);
     for (slot.full_prompt, 0..) |t, i| i32_prompt[i] = @intCast(t);
 
-    // Session sized to ds4's default ctx (matches the offline CLI path).
-    // Larger ctx → larger KV scratch up front; we leave tuning to future work.
-    const ctx_size: i32 = 32768;
+    // Session ctx from the user's --ctx-size, which runDs4Serve carries on the
+    // stub config's max_position_embeddings. Floored at ds4's prefill chunk so
+    // an under-sized ctx can't drop into the junk-output regime; 0/unset →
+    // ds4's default. Larger ctx → larger KV scratch up front.
+    const req_ctx: u32 = if (slot.model.config) |c| c.max_position_embeddings else 0;
+    const ctx_size: i32 = @intCast(arch_ds4.clampSessionCtx(req_ctx));
     var sess = try engine.createSession(ctx_size);
     errdefer sess.free();
 
@@ -2875,6 +2948,9 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     slot.ctx.moe_seq_offset = &slot.moe_seq_offset;
     slot.ctx.ssm_entries = slot.ssm_entries;
     slot.ctx.vision_embeddings = slot.vision_embeddings;
+    slot.ctx.mrope_pos = slot.mrope_pos;
+    slot.ctx.mrope_total = slot.mrope_total;
+    slot.ctx.mrope_delta = slot.mrope_delta;
     slot.ctx.capture_hidden = null;
     slot.ctx.kv_attn_fused = slot.kv_attn_fused;
 

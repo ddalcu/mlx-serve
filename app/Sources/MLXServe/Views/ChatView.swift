@@ -507,8 +507,14 @@ struct ChatDetailView: View {
     @EnvironmentObject var chatEngine: ChatTurnEngine
     @Environment(\.openWindow) private var openWindow
     @State private var inputText = ""
+    // The three toolbar toggles mirror the visible session's persisted state
+    // (`ChatSession.enableThinking` / `.mode` / `.useMCP`). They're loaded from
+    // the session on appear AND on every `sessionId` change, and written back on
+    // toggle — so each chat tab remembers its own Think/Agent/MCP choice instead
+    // of leaking the active tab's value into the reused ChatDetailView.
     @State private var enableThinking = false
     @State private var isAgentMode = false
+    @State private var mcpMode = false
     @State private var showMCPMarketplace = false
     @State private var showVoiceMode = false
     @State private var showThinkingInAgentConfirm = false
@@ -525,17 +531,37 @@ struct ChatDetailView: View {
     // Tool-approval gate state. `pendingApproval` is set right before each
     // tool call when Agent mode is on; the sheet at the bottom of `body`
     // observes it and resumes `approvalContinuation` with the user's choice.
-    // `sessionAllowAll` is a soft "Allow all tools this session" — scoped to
-    // *this chat session*: cleared when the user toggles Agent off, and also
-    // cleared by the `.onChange(of: sessionId)` below so switching to (or
-    // opening) a different chat re-arms the approval prompt.
+    // `toolAllowList` is the soft "Allow all tools this session" decision, keyed
+    // by session id so it is remembered PER TAB: SwiftUI reuses this view across
+    // `sessionId` changes, so a per-session set survives switching tabs (a plain
+    // Bool was shared across tabs and got wiped on every switch). A session
+    // re-arms only when the user toggles Agent off in that tab.
     @State private var pendingApproval: ToolApprovalRequest?
-    @State private var sessionAllowAll = false
+    @State private var toolAllowList = SessionToolAllowList()
     @FocusState private var inputFocused: Bool
 
 
     private var session: ChatSession? {
         appState.chatSessions.first { $0.id == sessionId }
+    }
+
+    /// Generation state for THIS chat. The engine runs one turn at a time, so a
+    /// chat that doesn't own the active turn must show Send (idle), not the Stop
+    /// button — and its Send is disabled while another chat is mid-turn.
+    private var composerState: ChatTurnEngine.ComposerState {
+        chatEngine.composerState(for: sessionId)
+    }
+
+    /// Pull the toolbar toggles from the visible session into local @State.
+    /// Called on appear and on every `sessionId` change — the view is reused
+    /// across tabs, so without this the toggles would show the previous tab's
+    /// values. Telegram sessions read the shared config instead (see
+    /// `toolbarToggles`), so they don't sync here.
+    private func syncTogglesFromSession() {
+        guard !isExternalBridgeSession else { return }
+        isAgentMode = session?.mode == .agent
+        enableThinking = session?.enableThinking ?? false
+        mcpMode = session?.useMCP ?? false
     }
 
     /// True when the visible session mirrors a Telegram conversation. The
@@ -551,7 +577,7 @@ struct ChatDetailView: View {
         return ChatModeToggles.resolve(
             isExternalBridge: isExternalBridgeSession,
             telegramThinking: tg.enableThinking, telegramAgent: tg.agentMode, telegramMCP: tg.useMCP,
-            inAppThinking: enableThinking, inAppAgent: isAgentMode, inAppMCP: appState.mcpMode)
+            inAppThinking: enableThinking, inAppAgent: isAgentMode, inAppMCP: mcpMode)
     }
 
     var body: some View {
@@ -617,9 +643,16 @@ struct ChatDetailView: View {
 
             Divider()
 
-            // Context usage monitor
-            if let usage = contextUsage, usage.promptTokens > 0 {
-                ContextMonitor(promptTokens: usage.promptTokens, contextLength: usage.contextLength, maxTokens: appState.maxTokens)
+            // Context usage monitor — shows once a turn has reported usage, or
+            // live the moment this chat starts generating its first reply.
+            if contextUsage != nil || composerState == .generatingHere {
+                ContextMonitor(promptTokens: contextUsage?.promptTokens ?? 0,
+                               completionTokens: contextUsage?.completionTokens ?? 0,
+                               liveTokens: composerState == .generatingHere ? chatEngine.liveCompletionTokens : 0,
+                               isLive: composerState == .generatingHere,
+                               contextLength: contextUsage?.contextLength
+                                   ?? AgentEngine.effectiveContextLength(appContextSize: appState.contextSize,
+                                                                         modelContextLength: server.modelInfo?.contextLength))
             }
 
             // Input area — iMessage style
@@ -709,7 +742,7 @@ struct ChatDetailView: View {
                                 inputText += "\n"
                                 return .handled
                             }
-                            if !chatEngine.isGenerating {
+                            if composerState == .idle {
                                 sendMessage()
                             }
                             return .handled
@@ -727,18 +760,26 @@ struct ChatDetailView: View {
                         )
 
                     Button {
-                        if chatEngine.isGenerating {
+                        if composerState == .generatingHere {
                             chatEngine.stop()
                         } else {
                             sendMessage()
                         }
                     } label: {
-                        Image(systemName: chatEngine.isGenerating ? "stop.circle.fill" : "arrow.up.circle.fill")
+                        Image(systemName: composerState == .generatingHere ? "stop.circle.fill" : "arrow.up.circle.fill")
                             .font(.system(size: 28))
-                            .foregroundStyle(chatEngine.isGenerating ? .red : .accentColor)
+                            .foregroundStyle(composerState == .generatingHere ? .red : .accentColor)
                     }
                     .buttonStyle(.plain)
-                    .disabled(server.status != .running || (inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && pendingImages.isEmpty && pendingPDFs.isEmpty && pendingAudio.isEmpty && !chatEngine.isGenerating))
+                    // Stop is always tappable for the owning chat. Otherwise: Send,
+                    // disabled when the server is down, when this chat has nothing
+                    // to send, or while ANOTHER chat is mid-turn (the single-turn
+                    // engine can't start a concurrent run — so don't dead-click).
+                    .disabled(server.status != .running
+                              || composerState == .busyElsewhere
+                              || (composerState == .idle
+                                  && inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                                  && pendingImages.isEmpty && pendingPDFs.isEmpty && pendingAudio.isEmpty))
                 }
               }   // end else (non-Telegram composer)
             }
@@ -858,8 +899,9 @@ struct ChatDetailView: View {
                     } else {
                         isAgentMode.toggle()
                         // Re-arm the approval gate every time the user re-enters
-                        // Agent mode. "Always allow this session" decays here.
-                        if !isAgentMode { sessionAllowAll = false }
+                        // Agent mode. "Always allow this session" decays here —
+                        // for THIS tab only; other tabs keep their decision.
+                        if !isAgentMode { toolAllowList.rearm(sessionId) }
                         // Thinking + tool-calling loops degrade quality on most
                         // local models — auto-off when entering Agent mode.
                         if isAgentMode { enableThinking = false }
@@ -900,7 +942,7 @@ struct ChatDetailView: View {
                             // Telegram session: flip the shared config (synced with Settings).
                             appState.serverOptions.telegram.useMCP.toggle()
                         } else {
-                            appState.mcpMode.toggle()
+                            mcpMode.toggle()
                         }
                     } label: {
                         HStack(spacing: 4) {
@@ -946,8 +988,7 @@ struct ChatDetailView: View {
         // persists in the tray; the orb's red ✕ (onClose) explicitly ends it.
         .sheet(isPresented: $showVoiceMode) {
             VoiceModeView(controller: appState.voice,
-                          onClose: { showVoiceMode = false; appState.voice.end() },
-                          onNewSession: { newVoiceSession() })
+                          onClose: { showVoiceMode = false; appState.voice.end() })
                 .environmentObject(appState)
         }
         .alert("Enable thinking in Agent mode?", isPresented: $showThinkingInAgentConfirm) {
@@ -968,7 +1009,7 @@ struct ChatDetailView: View {
         }
         .onAppear {
             inputFocused = true
-            isAgentMode = session?.mode == .agent
+            syncTogglesFromSession()
             scrollMonitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { event in
                 if event.scrollingDeltaY > 0 {
                     // Scrolling up — disengage auto-scroll
@@ -1008,20 +1049,33 @@ struct ChatDetailView: View {
                 pasteMonitor = nil
             }
         }
+        // Persist the toolbar toggles back onto the visible session so each tab
+        // remembers its own Think/Agent/MCP choice. Telegram sessions write the
+        // shared config in their button handlers instead, so skip them here.
         .onChange(of: isAgentMode) { _, newValue in
-            if let idx = appState.chatSessions.firstIndex(where: { $0.id == sessionId }) {
-                appState.chatSessions[idx].mode = newValue ? .agent : .chat
-            }
+            guard !isExternalBridgeSession,
+                  let idx = appState.chatSessions.firstIndex(where: { $0.id == sessionId }) else { return }
+            appState.chatSessions[idx].mode = newValue ? .agent : .chat
+        }
+        .onChange(of: enableThinking) { _, newValue in
+            guard !isExternalBridgeSession,
+                  let idx = appState.chatSessions.firstIndex(where: { $0.id == sessionId }) else { return }
+            appState.chatSessions[idx].enableThinking = newValue
+        }
+        .onChange(of: mcpMode) { _, newValue in
+            guard !isExternalBridgeSession,
+                  let idx = appState.chatSessions.firstIndex(where: { $0.id == sessionId }) else { return }
+            appState.chatSessions[idx].useMCP = newValue
         }
         .onChange(of: chatEngine.isGenerating) { _, generating in
             if !generating { inputFocused = true }
         }
         .onChange(of: sessionId) { _, _ in
-            // "Allow all tools this session" is scoped to a chat session —
-            // switching to a different chat (or opening a new one) must
-            // re-prompt on the next tool call. SwiftUI reuses this view
-            // across sessionId changes, so reset the flag explicitly.
-            sessionAllowAll = false
+            // The view is reused across tabs, so reload the toolbar toggles from
+            // the newly-visible session. The allow-list is NOT reset here — it's
+            // keyed by session id, so each tab keeps its own decision across
+            // switches (a session re-arms only when its Agent toggle goes off).
+            syncTogglesFromSession()
         }
     }
 
@@ -1253,15 +1307,16 @@ struct ChatDetailView: View {
     }
 
 
-    /// Latest context usage from the most recent assistant message with token data.
-    private var contextUsage: (promptTokens: Int, contextLength: Int)? {
+    /// Latest context usage from the most recent assistant message with token
+    /// data — the prompt size + the reply's length of the last completed turn.
+    private var contextUsage: (promptTokens: Int, completionTokens: Int, contextLength: Int)? {
         guard let messages = session?.messages else { return nil }
         if let last = messages.last(where: { $0.promptTokens != nil && $0.promptTokens! > 0 }) {
             let ctxLen = AgentEngine.effectiveContextLength(
                 appContextSize: appState.contextSize,
                 modelContextLength: server.modelInfo?.contextLength
             )
-            return (promptTokens: last.promptTokens!, contextLength: ctxLen)
+            return (promptTokens: last.promptTokens!, completionTokens: last.completionTokens ?? 0, contextLength: ctxLen)
         }
         return nil
     }
@@ -1287,7 +1342,7 @@ struct ChatDetailView: View {
     /// resolve their own approvals through the controller).
     private func resolveApproval(_ choice: ToolApprovalChoice, allowAll: Bool = false) {
         guard let req = pendingApproval else { return }
-        if allowAll { sessionAllowAll = true }
+        if allowAll { toolAllowList.allowAll(sessionId) }
         req.continuation.resume(returning: choice)
         pendingApproval = nil
     }
@@ -1297,19 +1352,17 @@ struct ChatDetailView: View {
     /// isn't active yet, ensuring a chat session exists first.
     private func startVoiceMode() {
         guard !showVoiceMode else { return }
+        // Sync the voice toggles to the chat session being opened — talking should
+        // start in the same Think/Agent/MCP mode as the chat you launched it from.
+        if let s = session {
+            appState.voice.enableThinking = s.enableThinking
+            appState.voice.agentMode = s.mode == .agent
+            appState.voice.mcpMode = s.useMCP
+        }
         showVoiceMode = true
         guard !appState.voice.isActive else { return }
         if appState.activeChatId == nil { _ = appState.newChatSession() }
         Task { _ = await appState.voice.begin() }   // on permission failure the orb shows the error
-    }
-
-    /// "New session" from the voice screen: stop the current answer, cut off any
-    /// in-progress speech, and switch the active chat to a fresh session. The
-    /// app-level voice controller stays live across the sessionId change.
-    private func newVoiceSession() {
-        chatEngine.stop()
-        appState.voice.bargeIn()        // cut off any in-progress speech, return to listening
-        _ = appState.newChatSession()   // sets activeChatId → voice's turnContext picks it up
     }
 
     // MARK: - Send Message
@@ -1340,7 +1393,7 @@ struct ChatDetailView: View {
 
         let config = ChatTurnEngine.TurnConfig(
             agentMode: isAgentMode,
-            mcpMode: appState.mcpMode,
+            mcpMode: mcpMode,
             enableThinking: enableThinking,
             voiceStyle: false,
             workingDirectory: session?.workingDirectory,
@@ -1353,15 +1406,16 @@ struct ChatDetailView: View {
     }
 
     /// Ask the user to approve a single tool call. Returns true on Allow /
-    /// Always Allow, false on Deny. Bypassed entirely when `sessionAllowAll`
-    /// is on. Bounces to the main actor (state mutations + sheet presentation)
-    /// and suspends on a checked continuation until the sheet resumes it.
+    /// Always Allow, false on Deny. Bypassed entirely when this session is on
+    /// the allow-list. Bounces to the main actor (state mutations + sheet
+    /// presentation) and suspends on a checked continuation until the sheet
+    /// resumes it.
     @MainActor
     private func requestToolApproval(_ tc: APIClient.ToolCall) async -> Bool {
         // Read-only search over a folder the user explicitly attached — never
         // worth an approval interruption (docs-only mode has no other tools).
         if tc.name == "searchDocuments" { return true }
-        if sessionAllowAll { return true }
+        if toolAllowList.allowsAll(sessionId) { return true }
         let choice: ToolApprovalChoice = await withCheckedContinuation { (cont: CheckedContinuation<ToolApprovalChoice, Never>) in
             pendingApproval = ToolApprovalRequest(
                 toolName: tc.name,
@@ -1378,19 +1432,40 @@ struct ChatDetailView: View {
 // MARK: - Context Monitor
 
 struct ContextMonitor: View {
+    /// Prompt + reply tokens of the last COMPLETED turn (context occupied so far).
     let promptTokens: Int
+    let completionTokens: Int
+    /// Tokens the in-flight reply has produced so far (0 unless THIS chat is the
+    /// one generating). Counted client-side from the streaming loop, advanced at
+    /// the coalescer's ~20 Hz cadence — so the bar + "gen:" move live.
+    let liveTokens: Int
+    let isLive: Bool
     let contextLength: Int
-    let maxTokens: Int
 
-    private var usageRatio: Double {
+    /// Total context occupied right now: last turn (prompt + its reply) plus the
+    /// in-flight reply's running count. Pure → ContextMonitorTests.
+    static func usedTokens(promptTokens: Int, completionTokens: Int, liveTokens: Int) -> Int {
+        promptTokens + completionTokens + liveTokens
+    }
+
+    /// Bar fill / percentage, clamped to [0, 1] (a context overflow can't exceed
+    /// 100%, and there's no context length before the first response). Pure.
+    static func usageRatio(usedTokens: Int, contextLength: Int) -> Double {
         guard contextLength > 0 else { return 0 }
-        return Double(promptTokens) / Double(contextLength)
+        return min(1.0, Double(usedTokens) / Double(contextLength))
     }
 
-    private var generationBudget: Int {
-        let remaining = max(0, contextLength - promptTokens)
-        return min(remaining, maxTokens)
+    /// The "gen:" figure: the live running count while this chat streams, else
+    /// the last completed reply's length. Pure → ContextMonitorTests.
+    static func genTokens(isLive: Bool, liveTokens: Int, completionTokens: Int) -> Int {
+        isLive ? liveTokens : completionTokens
     }
+
+    private var usedTokens: Int {
+        Self.usedTokens(promptTokens: promptTokens, completionTokens: completionTokens, liveTokens: liveTokens)
+    }
+    private var usageRatio: Double { Self.usageRatio(usedTokens: usedTokens, contextLength: contextLength) }
+    private var genTokens: Int { Self.genTokens(isLive: isLive, liveTokens: liveTokens, completionTokens: completionTokens) }
 
     private var barColor: Color {
         if usageRatio > 0.80 { return .red }
@@ -1406,19 +1481,22 @@ struct ContextMonitor: View {
                         .fill(Color.secondary.opacity(0.15))
                     RoundedRectangle(cornerRadius: 2)
                         .fill(barColor.opacity(0.7))
-                        .frame(width: geo.size.width * min(1.0, usageRatio))
+                        .frame(width: geo.size.width * usageRatio)
+                        .animation(.linear(duration: 0.1), value: usageRatio)
                 }
             }
             .frame(height: 4)
 
             HStack {
-                Text("\(promptTokens)/\(contextLength) tokens (\(Int(usageRatio * 100))%)")
+                Text("\(usedTokens)/\(contextLength) tokens (\(Int(usageRatio * 100))%)")
                     .font(.system(size: 9, design: .monospaced))
                     .foregroundStyle(.secondary)
                 Spacer()
-                Text("gen: \(generationBudget)")
+                // Live count of the current reply's tokens (or the last reply's
+                // length when idle). The bar color, not this, signals context pressure.
+                Text("gen: \(genTokens)\(isLive ? "…" : "")")
                     .font(.system(size: 9, design: .monospaced))
-                    .foregroundStyle(generationBudget < 2048 ? .red : generationBudget < 4096 ? .orange : .secondary)
+                    .foregroundStyle(isLive ? Color.accentColor : .secondary)
             }
         }
         .padding(.horizontal, 12)
@@ -1784,6 +1862,7 @@ private struct ToolCallRow: View {
     let call: ChatMessage
     let results: [ChatMessage]
     @State private var expanded = false
+    @State private var hovering = false
     @EnvironmentObject var processRegistry: ProcessRegistry
 
     /// Live background-process handles this card started — drives the kill X.
@@ -1813,6 +1892,11 @@ private struct ToolCallRow: View {
                     .strokeBorder(Color.green.opacity(isRunningBackground ? 0.7 : 0), lineWidth: 1.5)
             )
             .animation(.easeInOut(duration: 0.2), value: isRunningBackground)
+            // Recede a settled tool call so the assistant's prose carries the
+            // conversation; full opacity while it's running, hovered, or expanded.
+            .opacity(call.isStreaming || hovering || expanded ? 1.0 : 0.35)
+            .animation(.easeInOut(duration: 0.15), value: hovering)
+            .onHover { hovering = $0 }
 
             Spacer(minLength: 60)
         }

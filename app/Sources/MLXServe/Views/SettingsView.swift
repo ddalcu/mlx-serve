@@ -1060,11 +1060,13 @@ private struct RequestDefaultsSectionContent: View {
 
     private var meta: [String: ServerOptionField] { ServerOptions.requestDefaultFields }
 
-    /// Snapping presets for Max Tokens. Powers of 2 from 256 up to 256K cover
-    /// every realistic per-turn budget — short replies, agent loops, big code
-    /// generations.
+    /// Snapping presets for Max Tokens. Position 0 is "Auto" (= 0 sentinel):
+    /// the request omits max_tokens and the server pegs generation to the
+    /// remaining context window — the right cap on a small-RAM / small-context
+    /// machine, where a fixed number would over- or under-shoot. The rest are
+    /// powers of 2 from 256 up to 256K.
     private static let maxTokensPresets: [Int] = [
-        256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144,
+        0, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144,
     ]
 
     /// Snapping presets for Reasoning Budget. Position 0 is the special
@@ -1089,7 +1091,9 @@ private struct RequestDefaultsSectionContent: View {
                     presets: Self.maxTokensPresets,
                     current: appState.serverOptions.defaultMaxTokens,
                     set: { appState.serverOptions.defaultMaxTokens = $0 },
-                    label: Self.formatTokens(appState.serverOptions.defaultMaxTokens)
+                    label: appState.serverOptions.defaultMaxTokens <= 0
+                        ? "Auto"
+                        : Self.formatTokens(appState.serverOptions.defaultMaxTokens)
                 )
             }
         }

@@ -5,6 +5,28 @@ enum AgentPrompt {
 
     static let skillManager = SkillManager()
 
+    /// A concrete per-response output-budget note appended to the agent system
+    /// prompt so the model self-limits BEFORE hitting the real ceiling. A vague
+    /// "~200 lines" gets ignored (a model wrote ~750 lines straight past it); a
+    /// real number is stronger — and it must be the EFFECTIVE budget, not a flat
+    /// 16384. The model can emit at most ~2/5 of context per response (the rest
+    /// holds prompt + history — mirrors AgentEngine's generation reservation),
+    /// and no more than the `max_tokens` cap when one is set. `maxTokens <= 0`
+    /// means "Auto" (no cap → bounded only by context). On a small-context /
+    /// low-RAM machine the context term wins, which is the whole point of doing
+    /// this dynamically: a flat 16384 would lie to the model about its real room.
+    /// Stable within a session, so it rides in the volatile tail without
+    /// disturbing the KV prefix.
+    static func outputBudgetGuidance(maxTokens: Int, contextLength: Int) -> String {
+        let contextBudget = contextLength > 0 ? max(256, contextLength * 2 / 5) : 8192
+        let cap = maxTokens > 0 ? maxTokens : Int.max
+        let effective = min(cap, contextBudget)
+        let safeTokens = max(256, effective / 2)
+        let safeLines = max(20, safeTokens / 10)
+        return "\n\n# Output budget\n"
+            + "This machine gives you about \(effective) tokens per response. Exceed it and the response is cut off mid-write: a tool call in progress is LOST (the file is NOT written) and the turn can end unfinished. Keep any single writeFile/editFile content under ~\(safeLines) lines (~\(safeTokens) tokens). For a larger file, write the first chunk, then call writeFile again with append:\"true\" for each remaining chunk — a shell heredoc has the same cap, so chunking is the only fix."
+    }
+
     private static let mlxServeDir = NSString(string: "~/.mlx-serve").expandingTildeInPath
     private static let promptPath = (mlxServeDir as NSString).appendingPathComponent("system-prompt.md")
     private static let memoryPath = (mlxServeDir as NSString).appendingPathComponent("memory.md")
@@ -22,7 +44,7 @@ enum AgentPrompt {
 
         - File tools are confined to the working directory: use relative paths; paths outside it are rejected.
         - ALWAYS readFile before editFile (you need the line numbers it shows). editFile is line-based (startLine/endLine/replace — preferred) or text-based (find/replace — must match exactly); writeFile overwrites the whole file.
-        - A whole file must fit in one response (it's part of your output), so a very large writeFile can get cut off mid-write — for a big file, write it in chunks: writeFile a first part, then editFile to append the rest.
+        - A whole file must fit in one response (it's part of your output), so a very large writeFile can get cut off mid-write — for a big file, write it in chunks: a first writeFile, then writeFile with append:"true" for each remaining chunk. Keep each call within your output budget (stated at the end of this prompt).
 
         # Shell
 
@@ -195,7 +217,7 @@ enum AgentPrompt {
     [
       {"type":"function","function":{"name":"shell","description":"Run a shell command. Commands run in the current working directory (use cwd tool to change it). For a long-lived process (a server, a watcher) set run_in_background to \"true\" — it returns instantly with a handle (bg1, bg2, …) and keeps running so you can keep working; poll it with readProcessOutput, stop it with killProcess. Example: {\"command\": \"ls -la /tmp\"}","parameters":{"type":"object","properties":{"command":{"type":"string","description":"The shell command to execute"},"run_in_background":{"type":"string","description":"Set to \"true\" to start a long-lived process in the background and return immediately with a handle (bg1, bg2, …). Default: foreground."}},"required":["command"]}}},
       {"type":"function","function":{"name":"cwd","description":"Change the working directory for all subsequent tool calls (shell, readFile, writeFile, etc.). Like cd but persistent. Example: {\"path\": \"myproject/src\"}","parameters":{"type":"object","properties":{"path":{"type":"string","description":"Directory path (relative to current working directory, or absolute)"}},"required":["path"]}}},
-      {"type":"function","function":{"name":"writeFile","description":"Write content to a file (overwrites the whole file). The content is part of your response, so for a very large file write it in chunks — this call for the first part, then editFile to append the rest — so it isn't cut off mid-write. Example: {\"path\": \"src/main.swift\", \"content\": \"hello\"}","parameters":{"type":"object","properties":{"path":{"type":"string","description":"File path, relative to the working directory"},"content":{"type":"string","description":"File content (small files only; use a shell heredoc for larger)"}},"required":["path","content"]}}},
+      {"type":"function","function":{"name":"writeFile","description":"Write content to a file. Overwrites by default; pass append:\"true\" to add to the end (creates the file if missing). The whole content rides in this one response, so keep each call modest (~200 lines) — for a larger file, write the first chunk, then call writeFile again with append:\"true\" for each remaining chunk so nothing is cut off mid-write. Example: {\"path\": \"src/main.swift\", \"content\": \"hello\"}","parameters":{"type":"object","properties":{"path":{"type":"string","description":"File path, relative to the working directory"},"content":{"type":"string","description":"File content for this call (keep it within your per-response output budget; split a large file across multiple append:\"true\" calls)"},"append":{"type":"boolean","description":"Append flag (a boolean, NOT text). true = add to the END of the file (creates it if missing); omit or false = overwrite. The file body ALWAYS goes in \"content\" — never here. Use append to write a large file across several calls."}},"required":["path","content"]}}},
       {"type":"function","function":{"name":"readFile","description":"Read a file's contents with optional line range. For large files, use startLine/endLine to read specific sections. Example: {\"path\": \"src/main.swift\", \"startLine\": \"10\", \"endLine\": \"50\"}","parameters":{"type":"object","properties":{"path":{"type":"string","description":"File path, relative to the working directory"},"startLine":{"type":"string","description":"First line to read (1-based, default: 1)"},"endLine":{"type":"string","description":"Last line to read (default: end of file)"}},"required":["path"]}}},
       {"type":"function","function":{"name":"editFile","description":"Edit a file. Two modes: (1) Line-based: provide path, startLine, endLine, replace — replaces those lines. (2) Text-based: provide path, find, replace — find must match exactly. Prefer line-based editing. Always readFile first to see line numbers. Example line-based: {\"path\": \"src/main.js\", \"startLine\": \"5\", \"endLine\": \"8\", \"replace\": \"new code here\"}. Example text-based: {\"path\": \"src/main.js\", \"find\": \"old text\", \"replace\": \"new text\"}","parameters":{"type":"object","properties":{"path":{"type":"string","description":"File path, relative to the working directory"},"startLine":{"type":"string","description":"First line to replace (1-based, from readFile output)"},"endLine":{"type":"string","description":"Last line to replace (1-based, defaults to startLine)"},"find":{"type":"string","description":"Exact text to find (for text-based mode)"},"replace":{"type":"string","description":"Replacement text"}},"required":["path"]}}},
       {"type":"function","function":{"name":"searchFiles","description":"Search file contents for a pattern (uses ripgrep if available). Returns matching lines with file paths and line numbers. Example: {\"pattern\": \"TODO\", \"include\": \"*.swift\"}","parameters":{"type":"object","properties":{"pattern":{"type":"string","description":"Text or regex pattern to search for"},"path":{"type":"string","description":"Directory to search in (default: working directory)"},"include":{"type":"string","description":"File glob filter (e.g. '*.swift', '*.ts')"},"context":{"type":"string","description":"Number of context lines around matches (0-10, default: 0)"},"maxResults":{"type":"string","description":"Max matches to return (default: 100)"}},"required":["pattern"]}}},
@@ -294,10 +316,61 @@ class SkillManager {
     private var skills: [Skill] = []
     private var lastModDate: Date?
 
-    init() {
-        skillsDir = NSString(string: "~/.mlx-serve/skills").expandingTildeInPath
+    init(skillsDir: String? = nil) {
+        self.skillsDir = skillsDir ?? NSString(string: "~/.mlx-serve/skills").expandingTildeInPath
+        seedDefaultSkillIfFirstRun()
         reload()
     }
+
+    /// Absolute path of the skills directory — used by the "Agent → Open Skills
+    /// Folder" menu item (accessing the shared manager also triggers seeding).
+    var skillsDirectory: String { skillsDir }
+
+    /// First-run seed: when the skills directory doesn't exist yet, create it
+    /// and drop a single example skill so the feature is discoverable and users
+    /// have a working template to copy. Keyed on directory existence — once the
+    /// dir is there we never re-seed, so editing or deleting the example sticks.
+    private func seedDefaultSkillIfFirstRun() {
+        let fm = FileManager.default
+        guard !fm.fileExists(atPath: skillsDir) else { return }
+        guard (try? fm.createDirectory(atPath: skillsDir, withIntermediateDirectories: true)) != nil else { return }
+        let path = (skillsDir as NSString).appendingPathComponent("review.md")
+        try? Self.defaultSkillFile.write(toFile: path, atomically: true, encoding: .utf8)
+    }
+
+    /// The example skill shipped on first run. Genuinely useful (a focused,
+    /// read-only code review), and doubles as a format reference for users
+    /// writing their own.
+    static let defaultSkillFile = """
+    ---
+    name: review
+    description: Review the current changes or a file for bugs and improvements
+    trigger: review, code review, review this
+    ---
+    When the user asks you to review code:
+
+    1. Decide what to review. Default to the working changes — run `git diff` and
+       `git diff --staged`. If they name a file or folder, read that instead. Read
+       enough surrounding code to judge the change in context; don't review a diff
+       in isolation.
+
+    2. Report findings grouped by severity, most important first:
+       - Bugs / correctness — logic errors, unhandled edge cases, nil/force-unwraps,
+         off-by-ones, races, resource leaks.
+       - Risks — security holes, data loss, performance cliffs.
+       - Cleanups — naming, duplication, dead code, simpler equivalents.
+       For each finding cite file:line and give a concrete fix.
+
+    3. Be specific and honest. Say "this looks good" only when it genuinely does.
+       This is a read-only review — don't change code unless the user explicitly
+       asks you to apply a fix.
+
+    (This is an example skill that ships with the app — edit it, or add your own
+    .md files in this folder. Each skill needs frontmatter with `name`,
+    `description`, and `trigger` (comma-separated phrases that activate it when they
+    appear in your message). Everything below the frontmatter is injected into the
+    system prompt when a trigger matches.)
+    """
 
     /// Returns skill index (always) + matching skill bodies (when triggered).
     func matchingSkills(for userMessage: String) -> String {

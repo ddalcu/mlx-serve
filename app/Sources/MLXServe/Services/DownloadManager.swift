@@ -107,6 +107,29 @@ class DownloadManager: ObservableObject {
             .appendingPathComponent(name)
     }
 
+    /// Filter a HuggingFace `/tree/main?recursive=true` listing down to the
+    /// files a model download actually needs: top-level config / tokenizer /
+    /// weight files, PLUS the `mtp/` multi-token-prediction sidecar — the only
+    /// nested artifact the server auto-loads (`mtp/weights.safetensors`).
+    /// Without it, an MTP model silently loses its speculative-decoding speedup
+    /// because a non-recursive listing returns `mtp` as a bare directory entry
+    /// that the `type == "file"` filter drops. Other subdirectories (e.g.
+    /// `original/` or alternate-precision shadow copies) are skipped so we don't
+    /// pull tens of GB of unused weights. Returns (path, size) pairs.
+    nonisolated static func selectNeededFiles(from entries: [[String: Any]]) -> [(String, Int64)] {
+        let neededExtensions: Set<String> = ["json", "safetensors", "jinja", "model", "txt"]
+        return entries.compactMap { file -> (String, Int64)? in
+            guard let path = file["path"] as? String,
+                  let ftype = file["type"] as? String, ftype == "file" else { return nil }
+            // Top-level files, or the mtp/ sidecar. Skip other nested dirs.
+            guard !path.contains("/") || path.hasPrefix("mtp/") else { return nil }
+            let ext = (path as NSString).pathExtension
+            guard neededExtensions.contains(ext) || path == "chat_template.jinja" else { return nil }
+            let size = file["size"] as? Int64 ?? (file["size"] as? Int).map { Int64($0) } ?? 0
+            return (path, size)
+        }
+    }
+
     /// Path of an existing model on disk. Prefers the new 2-level layout; falls
     /// back to the legacy flat layout. Returns nil when neither has a `config.json`.
     nonisolated static func existingModelDir(rootDir: String, repoId: String) -> String? {
@@ -262,23 +285,18 @@ class DownloadManager: ObservableObject {
         do {
             try FileManager.default.createDirectory(atPath: destDir, withIntermediateDirectories: true)
 
-            let listURL = URL(string: "https://huggingface.co/api/models/\(repoId)/tree/main")!
+            // `?recursive=true` so the listing includes nested sidecars — most
+            // importantly the `mtp/` multi-token-prediction head. Without it HF
+            // returns `mtp` as a bare directory entry and the file filter skips
+            // it, silently dropping the sidecar (and the model's spec-decode
+            // speedup). `selectNeededFiles` keeps top-level files + mtp/ only.
+            let listURL = URL(string: "https://huggingface.co/api/models/\(repoId)/tree/main?recursive=true")!
             let (listData, _) = try await URLSession.shared.data(from: listURL)
             guard let files = try JSONSerialization.jsonObject(with: listData) as? [[String: Any]] else {
                 throw URLError(.cannotParseResponse)
             }
 
-            let neededExtensions = Set(["json", "safetensors", "jinja", "model", "txt"])
-            let neededFiles = files.compactMap { file -> (String, Int64)? in
-                guard let path = file["path"] as? String,
-                      let ftype = file["type"] as? String, ftype == "file" else { return nil }
-                let ext = (path as NSString).pathExtension
-                if neededExtensions.contains(ext) || path == "chat_template.jinja" {
-                    let size = file["size"] as? Int64 ?? (file["size"] as? Int).map { Int64($0) } ?? 0
-                    return (path, size)
-                }
-                return nil
-            }
+            let neededFiles = Self.selectNeededFiles(from: files)
 
             let totalSize = neededFiles.reduce(Int64(0)) { $0 + $1.1 }
             var downloadedSize: Int64 = 0

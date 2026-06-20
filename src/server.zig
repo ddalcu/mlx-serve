@@ -6,6 +6,8 @@ const generate_mod = @import("generate.zig");
 const drafter_mod = @import("drafter.zig");
 const chat_mod = @import("chat.zig");
 const model_mod = @import("model.zig");
+const qwen_vision = @import("qwen_vision.zig");
+const mrope_mod = @import("mrope.zig");
 const vision_mod = @import("vision.zig");
 const log = @import("log.zig");
 const token_mask_mod = @import("token_mask.zig");
@@ -30,6 +32,12 @@ const ModelRegistry = model_registry_mod.ModelRegistry;
 const LoadedModel = model_registry_mod.LoadedModel;
 /// Global flag set by signal handler for graceful shutdown.
 var shutdown_requested = std.atomic.Value(bool).init(false);
+/// Number of live per-connection threads. Incremented before each spawn,
+/// decremented when the thread's handler returns. On shutdown, `serve` waits
+/// for this to reach 0 before returning (which runs `scheduler.deinit`) — a
+/// detached conn thread still in `Scheduler.complete` would otherwise race
+/// deinit's teardown of the slot queues into a use-after-free (SIGSEGV).
+var active_conn_threads = std.atomic.Value(u32).init(0);
 
 const io_util = @import("io_util.zig");
 const ws_mod = @import("ws.zig");
@@ -221,6 +229,22 @@ fn signalHandler(_: std.posix.SIG) callconv(.c) void {
 /// across an echo-heavy vs novel-content prompt set and picking the threshold
 /// that maximizes (echo_speedup / novel_overhead).
 const spec_gate_threshold: f32 = 0.01;
+
+/// MTP-vs-PLD coexistence routing. When a model has BOTH a trained MTP head and
+/// PLD available for a request, the DEFAULT is the MTP head — it holds ~93%+
+/// per-draft on novel AND echo content and never risks PLD's runtime acceptance
+/// gate degrading to plain decode. Only a DOMINANT-echo prompt (score >= this)
+/// is handed to PLD, whose long n-gram drafts then reliably emit more tokens per
+/// verify forward than the depth-1 head.
+///
+/// The bar is deliberately high. Measured Qwen3.6-27B 4-bit: at ngram-score
+/// 0.055 PLD is a coin flip — a long whole-file reproduction sustains ~4.3
+/// accepted/round (48 tok/s) but a shorter one collapses below the 50% runtime
+/// gate and falls back to plain decode (~29 tok/s, WORSE than the head's 40).
+/// The score is computed on the PROMPT and can't see which way the GENERATION
+/// will go, so anything below a clearly-dominant-echo score routes to the robust
+/// head (40-42 tok/s, reliable). User `enable_mtp` in the body overrides.
+const mtp_pld_echo_threshold: f32 = 0.13;
 
 // Plan 05: drafter state moved to `LoadedModel` (per-model `drafter`,
 // `drafter_block_size`, `drafter_path`). The previous module-level
@@ -535,6 +559,20 @@ fn omittedMaxTokensDefault() u32 {
     return if (server_config.max_context_size > 0) std.math.maxInt(u32) / 4 else 4096;
 }
 
+/// Resolve a request's `max_tokens` (or its aliases) to an effective cap.
+/// Absent OR `<= 0` means **auto**: peg generation to the remaining context
+/// window via `auto_default` (the `omittedMaxTokensDefault` sentinel, which
+/// `clampMaxTokens` then reduces to `context - prompt`). The app's "Auto"
+/// setting sends 0 (or omits the field); both land on the context-pegged budget
+/// instead of a fixed ceiling. A positive integer is an explicit cap.
+fn resolveRequestMaxTokens(v: ?std.json.Value, auto_default: u32) u32 {
+    const val = v orelse return auto_default;
+    return switch (val) {
+        .integer => |i| if (i > 0) @intCast(i) else auto_default,
+        else => auto_default,
+    };
+}
+
 fn getOrInitResponseStore(io: std.Io, gpa: std.mem.Allocator) *responses_mod.ResponseStore {
     if (global_response_store == null) {
         global_response_store = responses_mod.ResponseStore.init(io, gpa, RESPONSE_STORE_CAP);
@@ -754,12 +792,37 @@ pub fn serve(
             .accepted_stream = accepted_stream,
             .io = io,
         };
+        // Count the thread before spawning so the shutdown drain can't miss a
+        // thread that's about to start; the thread decrements on return.
+        _ = active_conn_threads.fetchAdd(1, .acq_rel);
         _ = std.Thread.spawn(.{}, handleConnectionThread, .{args}) catch |err| {
             log.err("spawn conn thread failed: {}\n", .{err});
+            _ = active_conn_threads.fetchSub(1, .acq_rel);
             accepted_stream.close(io);
             allocator.destroy(args);
             continue;
         };
+    }
+
+    // Shutdown ordering (prevents a SIGSEGV in Scheduler.complete): the accept
+    // loop has exited. Cancel every in-flight slot so its connection thread
+    // unblocks from waitNext and runs its `defer complete(...)`, then WAIT for
+    // all connection threads to finish before returning — `serve`'s caller runs
+    // `scheduler.deinit` on return, which frees the slot queues that an
+    // in-flight `complete()` is still touching. The inference thread is still
+    // alive here (deinit joins it only after we return), so cancelled slots
+    // settle promptly. Bounded so a wedged thread can't hang shutdown forever.
+    if (global_scheduler) |sch| sch.cancelAllInFlight();
+    {
+        var waited_ms: u64 = 0;
+        var idle_fds = [_]std.posix.pollfd{};
+        while (active_conn_threads.load(.acquire) > 0 and waited_ms < 30_000) {
+            _ = std.posix.poll(&idle_fds, 20) catch {}; // empty fd set → 20ms sleep
+            waited_ms += 20;
+        }
+        const remaining = active_conn_threads.load(.acquire);
+        if (remaining > 0)
+            log.warn("shutdown: {d} connection thread(s) still active after {d}ms — proceeding\n", .{ remaining, waited_ms });
     }
 
     deinitGlobalResponseStore();
@@ -779,6 +842,10 @@ const ConnThreadArgs = struct {
 };
 
 fn handleConnectionThread(args: *ConnThreadArgs) void {
+    // Decrement LAST (declared first → runs after every other defer), so the
+    // shutdown drain in `serve` only sees this thread leave once it has fully
+    // returned from `complete()` and closed its socket.
+    defer _ = active_conn_threads.fetchSub(1, .acq_rel);
     var conn: Conn = undefined;
     Conn.init(&conn, args.accepted_stream, args.io);
     defer conn.close();
@@ -1331,6 +1398,7 @@ fn renderModelEntry(
 
         const model_id: []const u8 = if (entry.id.len > 0) entry.id else config.model_type;
         const drafter_loaded = entry.drafter != null;
+        const mtp_loaded = entry.mtp != null;
         const drafter_path_json = if (drafter_loaded)
             try jsonEscape(allocator, entry.drafter_path)
         else
@@ -1354,7 +1422,7 @@ fn renderModelEntry(
         defer allocator.free(gen_top_k_str);
 
         return std.fmt.allocPrint(allocator,
-            \\{{"id":"{s}","object":"model","created":{d},"owned_by":"mlx-serve","loaded":true,"state":"ready","bytes_resident":{d},"bytes_on_disk":{s},"capabilities":{s},"input_modalities":{s},"meta":{{"architecture":"{s}","vocab_size":{d},"hidden_size":{d},"num_layers":{d},"quantization":"{d}-bit","context_length":{s},"model_max_tokens":{d},"is_moe":{s},"drafter_loaded":{s},"drafter_path":{s},"gen_temperature":{s},"gen_top_p":{s},"gen_top_k":{s}}}}}
+            \\{{"id":"{s}","object":"model","created":{d},"owned_by":"mlx-serve","loaded":true,"state":"ready","bytes_resident":{d},"bytes_on_disk":{s},"capabilities":{s},"input_modalities":{s},"meta":{{"architecture":"{s}","vocab_size":{d},"hidden_size":{d},"num_layers":{d},"quantization":"{d}-bit","context_length":{s},"model_max_tokens":{d},"is_moe":{s},"drafter_loaded":{s},"drafter_path":{s},"mtp_loaded":{s},"gen_temperature":{s},"gen_top_p":{s},"gen_top_k":{s}}}}}
         , .{
             model_id,
             nowSecs(io),
@@ -1372,6 +1440,7 @@ fn renderModelEntry(
             if (config.isMoe()) "true" else "false",
             if (drafter_loaded) "true" else "false",
             drafter_path_json,
+            if (mtp_loaded) "true" else "false",
             gen_temp_str,
             gen_top_p_str,
             gen_top_k_str,
@@ -2239,7 +2308,7 @@ fn handleChatCompletions(
                         if (img_obj != .object) continue;
                         const url_val = img_obj.object.get("url") orelse continue;
                         if (url_val != .string) continue;
-                        if (parseImageUrlContent(allocator, url_val.string)) |img| {
+                        if (parseImageUrlContent(allocator, url_val.string, visionPreprocFromConfig(config))) |img| {
                             image_list.append(allocator, img) catch {
                                 allocator.free(img.pixels);
                                 continue;
@@ -2328,17 +2397,12 @@ fn handleChatCompletions(
         return;
     }
 
-    const max_tokens: u32 = blk: {
-        // Support both max_tokens and max_completion_tokens (OpenAI alias)
-        const v = root.get("max_tokens") orelse root.get("max_completion_tokens");
-        break :blk if (v) |val|
-            switch (val) {
-                .integer => |i| @intCast(i),
-                else => omittedMaxTokensDefault(),
-            }
-        else
-            omittedMaxTokensDefault();
-    };
+    // Support both max_tokens and max_completion_tokens (OpenAI alias). Absent
+    // or <= 0 → auto (peg to remaining context).
+    const max_tokens: u32 = resolveRequestMaxTokens(
+        root.get("max_tokens") orelse root.get("max_completion_tokens"),
+        omittedMaxTokensDefault(),
+    );
 
     const is_stream = if (root.get("stream")) |v| v == .bool and v.bool else false;
 
@@ -2674,6 +2738,14 @@ fn handleChatCompletions(
     const prompt_ids = prompt_ids_raw;
     defer allocator.free(prompt_ids);
 
+    // Qwen3-VL interleaved M-RoPE: compute the position-id table from the final
+    // (image-pad-expanded) prompt + the image grids. Ownership transfers to the
+    // slot at submit (mirrors the vision-embeddings handoff below).
+    var local_mrope = computeQwenMrope(allocator, prompt_ids, messages.items, config) catch MropeData{};
+    defer {
+        if (local_mrope.pos) |p| allocator.free(p);
+    }
+
     // Enforce context size limit
     const effective_ctx = getEffectiveContextLength(config);
     if (prompt_ids.len > effective_ctx) {
@@ -2715,6 +2787,13 @@ fn handleChatCompletions(
                 log.info("  drafter=disabled (ngram-score={d:.3} < gate threshold {d:.3})\n", .{ score, spec_gate_threshold });
                 enable_drafter = false;
             }
+        }
+        // MTP/PLD coexistence: on heavy-echo prompts PLD's long n-gram drafts
+        // beat the depth-1 MTP head, so route this request to PLD; novel and
+        // light-echo content stays on the robust MTP head. User enable_mtp wins.
+        if (enable_mtp and enable_pld and score >= mtp_pld_echo_threshold and root.get("enable_mtp") == null) {
+            log.info("  mtp=disabled (heavy echo ngram-score={d:.3} >= {d:.3}; PLD wins)\n", .{ score, mtp_pld_echo_threshold });
+            enable_mtp = false;
         }
     }
 
@@ -2758,8 +2837,10 @@ fn handleChatCompletions(
     // the slot at submit time.
     const sub_ve = local_ve;
     local_ve = null;
+    const sub_mrope = local_mrope;
+    local_mrope = .{}; // ownership transferred to the sub-handler → slot
     if (is_stream) {
-        handleStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, include_usage, has_tools, tools_json, logprobs_n, enable_thinking, reasoning_budget, enable_pld, enable_drafter, enable_mtp, sub_ve, kv_quant_override, tokenize_ns) catch |err| {
+        handleStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, include_usage, has_tools, tools_json, logprobs_n, enable_thinking, reasoning_budget, enable_pld, enable_drafter, enable_mtp, sub_ve, sub_mrope, kv_quant_override, tokenize_ns) catch |err| {
             log.err("  -> streaming error: {}\n", .{err});
             // Send SSE error event so the client gets a proper error instead of a dropped connection
             const err_chunk = std.fmt.allocPrint(allocator,
@@ -2770,7 +2851,7 @@ fn handleChatCompletions(
             stream.writeAll("\n\ndata: [DONE]\n\n") catch {};
         };
     } else {
-        handleNonStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, logprobs_n, enable_thinking, reasoning_budget, enable_pld, enable_drafter, enable_mtp, sub_ve, kv_quant_override, tokenize_ns) catch |err| {
+        handleNonStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, logprobs_n, enable_thinking, reasoning_budget, enable_pld, enable_drafter, enable_mtp, sub_ve, sub_mrope, kv_quant_override, tokenize_ns) catch |err| {
             log.err("  -> 500 ({s})\n", .{@errorName(err)});
             sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", @errorName(err), 500) catch {};
         };
@@ -2806,13 +2887,10 @@ fn handleCompletions(
         return;
     }
 
-    const max_tokens: u32 = blk: {
-        const v = root.get("max_tokens") orelse root.get("max_completion_tokens");
-        break :blk if (v) |val| switch (val) {
-            .integer => |i| @intCast(i),
-            else => omittedMaxTokensDefault(),
-        } else omittedMaxTokensDefault();
-    };
+    const max_tokens: u32 = resolveRequestMaxTokens(
+        root.get("max_tokens") orelse root.get("max_completion_tokens"),
+        omittedMaxTokensDefault(),
+    );
 
     const is_stream = if (root.get("stream")) |v| v == .bool and v.bool else false;
 
@@ -2947,6 +3025,11 @@ fn handleCompletions(
                 enable_drafter = false;
             }
         }
+        // MTP/PLD coexistence: heavy-echo -> PLD, novel/light-echo -> MTP.
+        if (enable_mtp and enable_pld and score >= mtp_pld_echo_threshold and root.get("enable_mtp") == null) {
+            log.info("  mtp=disabled (heavy echo ngram-score={d:.3} >= {d:.3}; PLD wins)\n", .{ score, mtp_pld_echo_threshold });
+            enable_mtp = false;
+        }
     }
 
     const eos_slice = config.eosTokenSlice();
@@ -2993,7 +3076,7 @@ fn handleNonStreamingCompletion(
     const use_drafter = !use_mtp and enable_drafter and lm.drafter != null and sampling.constraint == null;
     const use_pld = !use_mtp and !use_drafter and enable_pld and sampling.constraint == null;
 
-    var result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, false, use_pld, use_drafter, use_mtp, getTimeoutNs(), null, 0, null, stream) catch |err| switch (err) {
+    var result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, false, use_pld, use_drafter, use_mtp, getTimeoutNs(), null, .{}, 0, null, stream) catch |err| switch (err) {
         error.GenerationFailed => return sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", "generation failed", null),
         else => return err,
     };
@@ -3266,6 +3349,7 @@ fn nonStreamingViaScheduler(
     enable_mtp: bool,
     timeout_ns: u64,
     vision_embeddings: ?mlx.mlx_array,
+    mrope: MropeData,
     logprobs_n: u32,
     /// Wave 1.A: per-request KV-quant override; null = inherit scheduler default.
     kv_quant_override: ?transformer_mod.KVQuantConfig,
@@ -3295,6 +3379,9 @@ fn nonStreamingViaScheduler(
         .pld_key_len = server_config.default_pld_key_len,
         .kv_attn_fused = server_config.default_kv_attn_fused,
         .vision_embeddings = vision_embeddings,
+        .mrope_pos = mrope.pos,
+        .mrope_total = mrope.total,
+        .mrope_delta = mrope.delta,
         .logprobs_n = logprobs_n,
         .kv_quant_config = kv_quant_override,
     });
@@ -3379,6 +3466,7 @@ fn handleNonStreamingGeneration(
     enable_drafter: bool,
     enable_mtp: bool,
     vision_embeddings: ?mlx.mlx_array,
+    mrope: MropeData,
     /// Wave 1.A: per-request KV-quant override; null = inherit scheduler default.
     kv_quant_override: ?transformer_mod.KVQuantConfig,
     /// Iteration 1: tokenize_ns from the parent handleChatCompletions, so
@@ -3409,7 +3497,7 @@ fn handleNonStreamingGeneration(
         ve_local = null;
         break :blk v;
     };
-    const result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, use_pld, use_drafter, use_mtp, getTimeoutNs(), slot_ve, logprobs_n, kv_quant_override, stream) catch |err| switch (err) {
+    const result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, use_pld, use_drafter, use_mtp, getTimeoutNs(), slot_ve, mrope, logprobs_n, kv_quant_override, stream) catch |err| switch (err) {
         error.GenerationFailed => {
             try sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", "generation failed", null);
             return;
@@ -3933,6 +4021,7 @@ fn handleStreamingGeneration(
     enable_drafter: bool,
     enable_mtp: bool,
     vision_embeddings: ?mlx.mlx_array,
+    mrope: MropeData,
     /// Wave 1.A: per-request KV-quant override; null = inherit scheduler default.
     kv_quant_override: ?transformer_mod.KVQuantConfig,
     /// Iteration 1: tokenize_ns measured by the request handler before
@@ -3997,6 +4086,9 @@ fn handleStreamingGeneration(
         .kv_attn_fused = server_config.default_kv_attn_fused,
         .logprobs_n = logprobs_n,
         .vision_embeddings = slot_ve_s,
+        .mrope_pos = mrope.pos,
+        .mrope_total = mrope.total,
+        .mrope_delta = mrope.delta,
         .kv_quant_config = kv_quant_override,
     });
     var ts = StreamingTokenStream.initFromSlot(slot_handle.?, stream_mode, eos_token_ids);
@@ -5038,6 +5130,8 @@ fn processVisionImages(
                 .pixels = img.pixels,
                 .width = @intCast(img.width),
                 .height = @intCast(img.height),
+                .grid_h = img.grid_h,
+                .grid_w = img.grid_w,
             });
         }
         var aud_list = std.ArrayList([]const u8).empty;
@@ -5076,12 +5170,22 @@ fn processVisionImages(
     }
 
     for (images) |img| {
-        const h: c_int = @intCast(img.height);
-        const w: c_int = @intCast(img.width);
-        const shape = [_]c_int{ 1, 3, h, w };
-        const pixel_arr = mlx.mlx_array_new_data(img.pixels.ptr, &shape, 4, .float32);
-        defer _ = mlx.mlx_array_free(pixel_arr);
-        const emb = try vision_enc.forward(pixel_arr);
+        var emb: mlx.mlx_array = undefined;
+        if (img.grid_h > 0) {
+            const n: usize = @as(usize, img.grid_h) * img.grid_w;
+            const feat: usize = (img.pixels.len / 4) / n;
+            const shape = [_]c_int{ @intCast(n), @intCast(feat) };
+            const pixel_arr = mlx.mlx_array_new_data(img.pixels.ptr, &shape, 2, .float32);
+            defer _ = mlx.mlx_array_free(pixel_arr);
+            emb = try vision_enc.forwardQwen(pixel_arr, img.grid_h, img.grid_w);
+        } else {
+            const h: c_int = @intCast(img.height);
+            const w: c_int = @intCast(img.width);
+            const shape = [_]c_int{ 1, 3, h, w };
+            const pixel_arr = mlx.mlx_array_new_data(img.pixels.ptr, &shape, 4, .float32);
+            defer _ = mlx.mlx_array_free(pixel_arr);
+            emb = try vision_enc.forward(pixel_arr);
+        }
         const es = mlx.getShape(emb);
         out_n_vision.* += @intCast(es[1]);
         try emb_parts.append(allocator, emb);
@@ -5150,9 +5254,11 @@ fn insertImageTokens(allocator: std.mem.Allocator, prompt_ids: []const u32, imag
         insert_pos = if (prompt_ids.len > 5) prompt_ids.len - 5 else 0;
     }
 
-    // Insert: BOI + n_tokens × image_token + EOI
-    const boi: u32 = config.boi_token_id;
-    const eoi: u32 = config.eoi_token_id;
+    // Insert: BOI + n_tokens × image_token + EOI. Qwen3-VL wraps the image-pad run
+    // with <|vision_start|> / <|vision_end|> instead (get_rope_index keys on a
+    // vision_start immediately followed by image tokens).
+    const boi: u32 = if (config.qwen_vision) config.vision_start_token_id else config.boi_token_id;
+    const eoi: u32 = if (config.qwen_vision) config.vision_end_token_id else config.eoi_token_id;
     const has_boi = boi > 0;
     const has_eoi = eoi > 0;
     const extra = n_tokens + (if (has_boi) @as(usize, 1) else 0) + (if (has_eoi) @as(usize, 1) else 0);
@@ -5199,6 +5305,49 @@ fn userTurnInsertPos(prompt_ids: []const u32, config: *const model_mod.ModelConf
 /// block order MUST match the [vision ; audio] concatenation order of the
 /// soft-token embedding so the splice scatters each row into its slot.
 /// Gemma 4 12B unified routes both modalities through one splice channel.
+/// Qwen3-VL interleaved M-RoPE position-id table for a request. `pos` (owned) is
+/// the flat [3 × total] i32 table threaded to the slot; null for non-Qwen / no
+/// images. Pass-through bundle so sub-handlers thread one value, not three.
+pub const MropeData = struct {
+    pos: ?[]const i32 = null,
+    total: usize = 0,
+    delta: i32 = 0,
+};
+
+/// Compute the interleaved-M-RoPE table from the FINAL prompt_ids (after image-pad
+/// expansion) + the last user turn's image grids. Returns an empty bundle when the
+/// model isn't Qwen-vision or there are no images. Caller owns `pos`.
+fn computeQwenMrope(allocator: std.mem.Allocator, prompt_ids: []const u32, msgs: []const chat_mod.Message, config: *const model_mod.ModelConfig) !MropeData {
+    if (!config.qwen_vision) return .{};
+    // Collect the last user message's image grids (full patch grid per image).
+    var grids = std.ArrayList(mrope_mod.ImageGrid).empty;
+    defer grids.deinit(allocator);
+    var i = msgs.len;
+    while (i > 0) {
+        i -= 1;
+        if (std.mem.eql(u8, msgs[i].role, "user")) {
+            if (msgs[i].images) |imgs| for (imgs) |im| {
+                if (im.grid_h > 0) try grids.append(allocator, .{ .t = 1, .h = im.grid_h, .w = im.grid_w });
+            };
+            break;
+        }
+    }
+    if (grids.items.len == 0) return .{};
+
+    var ri = mrope_mod.getRopeIndex(allocator, prompt_ids, grids.items, config.image_token_id, config.video_token_id, config.vision_start_token_id, config.qv_merge) catch |err| {
+        log.warn("M-RoPE get_rope_index failed ({s}); falling back to scalar RoPE\n", .{@errorName(err)});
+        return .{};
+    };
+    defer ri.deinit();
+    const total = prompt_ids.len;
+    const flat = try allocator.alloc(i32, 3 * total);
+    @memcpy(flat[0..total], ri.pos[0]);
+    @memcpy(flat[total .. 2 * total], ri.pos[1]);
+    @memcpy(flat[2 * total .. 3 * total], ri.pos[2]);
+    log.info("  M-RoPE: {d} images, position ids over {d} tokens, decode delta {d}\n", .{ grids.items.len, total, ri.delta });
+    return .{ .pos = flat, .total = total, .delta = ri.delta };
+}
+
 fn insertMultimodalTokens(
     allocator: std.mem.Allocator,
     prompt_ids: []const u32,
@@ -5214,8 +5363,11 @@ fn insertMultimodalTokens(
 
     const insert_pos = userTurnInsertPos(prompt_ids, config);
 
-    const boi = config.boi_token_id;
-    const eoi = config.eoi_token_id;
+    // Qwen3-VL wraps the image-pad run with <|vision_start|>/<|vision_end|>
+    // (get_rope_index keys on vision_start immediately followed by image tokens);
+    // Gemma uses BOI/EOI.
+    const boi = if (config.qwen_vision) config.vision_start_token_id else config.boi_token_id;
+    const eoi = if (config.qwen_vision) config.vision_end_token_id else config.eoi_token_id;
     const boa = config.boa_token_id;
     const eoa = config.eoa_token_id;
 
@@ -5265,7 +5417,13 @@ fn parseAudioContent(allocator: std.mem.Allocator, data: []const u8) ?chat_mod.A
 ///   data:image/x-mlx-pixels;base64,... (already-preprocessed float32 CHW)
 ///   data:image/jpeg|png|webp|...;base64,... (decoded + resized via stb_image / libwebp)
 /// Returns null on any decode failure (caller treats as missing image).
-fn parseImageUrlContent(allocator: std.mem.Allocator, url: []const u8) ?chat_mod.ImageData {
+/// Derive per-request image preprocessing params from the loaded model config.
+fn visionPreprocFromConfig(config: *const model_mod.ModelConfig) chat_mod.VisionPreproc {
+    if (!config.qwen_vision) return .{};
+    return .{ .qwen = true, .patch = config.qv_patch, .tps = config.qv_temporal_patch, .merge = config.qv_merge };
+}
+
+fn parseImageUrlContent(allocator: std.mem.Allocator, url: []const u8, vp: chat_mod.VisionPreproc) ?chat_mod.ImageData {
     const sep = std.mem.indexOf(u8, url, ";base64,") orelse return null;
     const b64_data = url[sep + 8 ..];
     const decoded_size = std.base64.standard.Decoder.calcSizeForSlice(b64_data) catch return null;
@@ -5293,8 +5451,9 @@ fn parseImageUrlContent(allocator: std.mem.Allocator, url: []const u8) ?chat_mod
     }
 
     if (std.mem.startsWith(u8, mime, "data:image/")) {
-        // JPEG/PNG/WebP — decode + resize + convert to float32 CHW
-        const img = decodeImageToPixels(allocator, raw_buf);
+        // JPEG/PNG/WebP — decode + resize + convert to float32 CHW (Gemma) or
+        // smart-resized merge-order pixel_values (Qwen3-VL).
+        const img = decodeImageToPixels(allocator, raw_buf, vp);
         allocator.free(raw_buf);
         return img;
     }
@@ -5303,7 +5462,7 @@ fn parseImageUrlContent(allocator: std.mem.Allocator, url: []const u8) ?chat_mod
     return null;
 }
 
-fn decodeImageToPixels(allocator: std.mem.Allocator, encoded: []const u8) ?chat_mod.ImageData {
+fn decodeImageToPixels(allocator: std.mem.Allocator, encoded: []const u8, vp: chat_mod.VisionPreproc) ?chat_mod.ImageData {
     const target: u32 = 768; // Gemma 4 default for square images
 
     // Try stb_image first (JPEG/PNG) — request 4 channels to handle transparency
@@ -5357,6 +5516,45 @@ fn decodeImageToPixels(allocator: std.mem.Allocator, encoded: []const u8) ?chat_
 
     const src_w: u32 = @intCast(w);
     const src_h: u32 = @intCast(h);
+
+    // Qwen3-VL: smart-resize to a multiple of patch·merge within [min,max] pixels,
+    // normalize (x/255−0.5)/0.5, then emit the processor's merge-order pixel_values
+    // [N, C·tps·ps·ps]. The encoder is QwenVision; `grid_h/grid_w` carry the full
+    // patch grid (token count = (gh/merge)·(gw/merge)).
+    if (vp.qwen) {
+        const rs = qwen_vision.smartResizeDefault(src_h, src_w);
+        const rh = rs.h;
+        const rw = rs.w;
+        const C: u32 = 3;
+        const gh = rh / vp.patch;
+        const gw = rw / vp.patch;
+        const n: usize = @as(usize, gh) * gw;
+        const feat: usize = @as(usize, C) * vp.tps * vp.patch * vp.patch;
+        const plane: usize = @as(usize, rh) * rw;
+
+        const chw = allocator.alloc(f32, @as(usize, C) * plane) catch return null;
+        defer allocator.free(chw);
+        for (0..rh) |ty| {
+            for (0..rw) |tx| {
+                const sx_f = @as(f32, @floatFromInt(tx)) * @as(f32, @floatFromInt(src_w)) / @as(f32, @floatFromInt(rw));
+                const sy_f = @as(f32, @floatFromInt(ty)) * @as(f32, @floatFromInt(src_h)) / @as(f32, @floatFromInt(rh));
+                const sx: usize = @min(@as(usize, @intFromFloat(sx_f)), src_w - 1);
+                const sy: usize = @min(@as(usize, @intFromFloat(sy_f)), src_h - 1);
+                const sidx = (sy * src_w + sx) * 3;
+                const didx = ty * rw + tx;
+                inline for (0..3) |c| {
+                    // (x/255 − 0.5)/0.5 == x/127.5 − 1.0
+                    chw[c * plane + didx] = @as(f32, @floatFromInt(px[sidx + c])) / 127.5 - 1.0;
+                }
+            }
+        }
+
+        const pv_bytes = allocator.alloc(u8, n * feat * 4) catch return null;
+        const pv_f32 = @as([*]f32, @alignCast(@ptrCast(pv_bytes.ptr)))[0 .. n * feat];
+        qwen_vision.buildPixelValues(pv_f32, chw, C, rh, rw, vp.patch, vp.tps, vp.merge);
+        log.info("  Decoded {d}x{d} image → Qwen grid {d}x{d} ({d} tokens, resized {d}x{d})\n", .{ src_w, src_h, gh, gw, n / (@as(usize, vp.merge) * vp.merge), rw, rh });
+        return .{ .pixels = pv_bytes, .width = rw, .height = rh, .grid_h = gh, .grid_w = gw };
+    }
 
     // Allocate float32 CHW output: [3, target, target]
     const out_size = 3 * target * target;
@@ -5711,7 +5909,7 @@ fn handleAnthropicMessages(
                             };
                             if (data_url) |du| {
                                 defer allocator.free(du);
-                                if (parseImageUrlContent(allocator, du)) |img| {
+                                if (parseImageUrlContent(allocator, du, visionPreprocFromConfig(config))) |img| {
                                     image_list.append(allocator, img) catch {
                                         allocator.free(img.pixels);
                                         continue;
@@ -5966,6 +6164,11 @@ fn handleAnthropicMessages(
                 enable_drafter = false;
             }
         }
+        // MTP/PLD coexistence: heavy-echo -> PLD, novel/light-echo -> MTP.
+        if (enable_mtp and enable_pld and score >= mtp_pld_echo_threshold and root.get("enable_mtp") == null) {
+            log.info("  mtp=disabled (heavy echo ngram-score={d:.3} >= {d:.3}; PLD wins)\n", .{ score, mtp_pld_echo_threshold });
+            enable_mtp = false;
+        }
     }
 
     // Context size enforcement
@@ -6063,7 +6266,10 @@ fn handleAnthropicNonStreaming(
         ve_local = null;
         break :blk v;
     };
-    const result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, use_pld, use_drafter, use_mtp, getTimeoutNs(), slot_ve, 0, kv_quant_override, stream) catch |err| switch (err) {
+    // M-RoPE: Anthropic path uses scalar-RoPE fallback for now (faithful M-RoPE
+    // wired for /v1/chat/completions; see computeQwenMrope). Qwen image requests
+    // still decode correctly — M-RoPE refines spatial grounding only.
+    const result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, use_pld, use_drafter, use_mtp, getTimeoutNs(), slot_ve, .{}, 0, kv_quant_override, stream) catch |err| switch (err) {
         error.GenerationFailed => return sendAnthropicError(allocator, stream, "api_error", "generation failed", 500),
         else => return err,
     };
@@ -7007,7 +7213,8 @@ fn handleResponsesCompact(
     }
 
     // ── parse → resolved message history ──
-    var pi = responses_mod.parseInput(allocator, input_val, instructions, prev_messages, parseImageUrlContent) catch |err| {
+    // Compaction drops images, so the preprocessing selector is irrelevant here.
+    var pi = responses_mod.parseInput(allocator, input_val, instructions, prev_messages, parseImageUrlContent, .{}) catch |err| {
         log.warn("POST /v1/responses/compact -> 400 (input parse: {s})\n", .{@errorName(err)});
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Failed to parse input", 400);
         return;
@@ -7118,8 +7325,9 @@ fn handleResponses(
     // echo `null` (vs. our internal default) in the response envelope.
     const req_max_output_tokens: ?u32 = blk: {
         const v = root.get("max_output_tokens") orelse root.get("max_tokens");
+        // <= 0 is treated as "auto" (null here → context-pegged default below).
         break :blk if (v) |val| switch (val) {
-            .integer => |i| @as(?u32, @intCast(i)),
+            .integer => |i| if (i > 0) @as(?u32, @intCast(i)) else null,
             else => null,
         } else null;
     };
@@ -7241,7 +7449,7 @@ fn handleResponses(
     }
 
     // ── parse input → messages ──
-    var pi = responses_mod.parseInput(allocator, input_val, instructions, prev_messages, parseImageUrlContent) catch |err| {
+    var pi = responses_mod.parseInput(allocator, input_val, instructions, prev_messages, parseImageUrlContent, visionPreprocFromConfig(config)) catch |err| {
         log.warn("POST /v1/responses -> 400 (input parse: {s})\n", .{@errorName(err)});
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Failed to parse input", 400);
         return;
@@ -7483,6 +7691,11 @@ fn handleResponses(
                 log.info("  drafter=disabled (ngram-score={d:.3} < gate threshold {d:.3})\n", .{ score, spec_gate_threshold });
                 enable_drafter_resp = false;
             }
+        }
+        // MTP/PLD coexistence: heavy-echo -> PLD, novel/light-echo -> MTP.
+        if (enable_mtp_resp and enable_pld_resp and score >= mtp_pld_echo_threshold and root.get("enable_mtp") == null) {
+            log.info("  mtp=disabled (heavy echo ngram-score={d:.3} >= {d:.3}; PLD wins)\n", .{ score, mtp_pld_echo_threshold });
+            enable_mtp_resp = false;
         }
     }
 
@@ -7764,7 +7977,7 @@ fn handleResponses(
             local_ve = null;
             break :blk v;
         };
-        result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, effective_max_tokens, sampling, eos_slice, 0, active_has_tools, use_pld, use_drafter, use_mtp, getTimeoutNs(), slot_ve_ns, 0, kv_quant_override, stream) catch |err| switch (err) {
+        result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, effective_max_tokens, sampling, eos_slice, 0, active_has_tools, use_pld, use_drafter, use_mtp, getTimeoutNs(), slot_ve_ns, .{}, 0, kv_quant_override, stream) catch |err| switch (err) {
             error.GenerationFailed => return sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", "generation failed", null),
             else => return err,
         };
@@ -9262,6 +9475,20 @@ test "omittedMaxTokensDefault: context-bound when ctx is known, finite fallback 
     // so the default itself must stay finite.
     server_config.max_context_size = 0;
     try testing.expectEqual(@as(u32, 4096), omittedMaxTokensDefault());
+}
+
+test "resolveRequestMaxTokens: absent / 0 / negative / non-int → auto; positive → value" {
+    const auto: u32 = 12345;
+    // Absent → auto (the omitted-default path the app's "Auto" setting rides).
+    try testing.expectEqual(auto, resolveRequestMaxTokens(null, auto));
+    // 0 and negatives are "auto" too — a client must not be able to request a
+    // 0-token (generate-nothing) response by selecting Auto.
+    try testing.expectEqual(auto, resolveRequestMaxTokens(.{ .integer = 0 }, auto));
+    try testing.expectEqual(auto, resolveRequestMaxTokens(.{ .integer = -5 }, auto));
+    // Wrong type (e.g. a string) → auto rather than crashing.
+    try testing.expectEqual(auto, resolveRequestMaxTokens(.{ .string = "999" }, auto));
+    // A real positive cap is honored verbatim.
+    try testing.expectEqual(@as(u32, 4096), resolveRequestMaxTokens(.{ .integer = 4096 }, auto));
 }
 
 test "clampMaxTokens no limit when ctx_size=0" {

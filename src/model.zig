@@ -159,6 +159,30 @@ pub const ModelConfig = struct {
     audio_embed_dim: u32 = 0, // unified: raw samples per token (640)
     audio_samples_per_token: u32 = 640, // 40ms @ 16kHz
 
+    // Qwen3.5/3.6 vision (Qwen3-VL ViT). Distinct from the Gemma SigLIP fields
+    // above: Qwen ships a fused-qkv ViT with a patch merger, and the text trunk
+    // uses INTERLEAVED M-RoPE (image tokens get 2D grid positions). Populated in
+    // the qwen3_5 arm below. Encoder: src/qwen_vision.zig; M-RoPE: src/mrope.zig.
+    qwen_vision: bool = false,
+    qv_depth: u32 = 0, // ViT transformer blocks
+    qv_hidden: u32 = 0, // ViT hidden size
+    qv_heads: u32 = 0, // ViT attention heads
+    qv_head_dim: u32 = 0, // = qv_hidden / qv_heads
+    qv_intermediate: u32 = 0, // ViT MLP intermediate
+    qv_patch: u32 = 16, // pixel patch size
+    qv_temporal_patch: u32 = 2, // frames folded per patch (still image duplicated)
+    qv_merge: u32 = 2, // spatial merge: merge×merge patches → one LLM token
+    qv_num_pos_emb: u32 = 0, // learned pos table entries (e.g. 2304 = 48×48)
+    qv_out_hidden: u32 = 0, // merger output dim (= text hidden_size)
+    // Interleaved M-RoPE sections [t, h, w]; sum = rotary_dim/2 (e.g. [11,11,10]).
+    mrope_section: [3]u32 = .{ 0, 0, 0 },
+    mrope_interleaved: bool = false,
+    // Qwen vision token ids (top-level config.json). image_token_id reuses the
+    // shared field above (parsed generically at the image_token_id block).
+    video_token_id: u32 = 0,
+    vision_start_token_id: u32 = 0,
+    vision_end_token_id: u32 = 0,
+
     // Token IDs that mark the start of a user turn in the rendered prompt.
     // Populated at startup by encoding a chat-template-specific prefix string
     // (e.g. "<|turn>user\n" for Gemma 4, "<|im_start|>user\n" for Qwen ChatML).
@@ -859,6 +883,45 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         if (cfg_obj.get("query_pre_attn_scalar") == null) {
             config.query_pre_attn_scalar = config.head_dim;
         }
+        // Qwen3-VL vision tower (separate fields from the Gemma SigLIP block;
+        // see src/qwen_vision.zig). The generic vision_config block above already
+        // set has_vision; here we read Qwen's distinct keys into qv_*.
+        if (root.get("vision_config")) |vc_val| {
+            if (vc_val == .object) {
+                const vc = vc_val.object;
+                config.qwen_vision = true;
+                if (vc.get("depth")) |v| { if (v == .integer) config.qv_depth = @intCast(v.integer); }
+                if (vc.get("hidden_size")) |v| { if (v == .integer) config.qv_hidden = @intCast(v.integer); }
+                if (vc.get("num_heads")) |v| { if (v == .integer) config.qv_heads = @intCast(v.integer); }
+                if (vc.get("intermediate_size")) |v| { if (v == .integer) config.qv_intermediate = @intCast(v.integer); }
+                if (vc.get("patch_size")) |v| { if (v == .integer) config.qv_patch = @intCast(v.integer); }
+                if (vc.get("temporal_patch_size")) |v| { if (v == .integer) config.qv_temporal_patch = @intCast(v.integer); }
+                if (vc.get("spatial_merge_size")) |v| { if (v == .integer) config.qv_merge = @intCast(v.integer); }
+                if (vc.get("num_position_embeddings")) |v| { if (v == .integer) config.qv_num_pos_emb = @intCast(v.integer); }
+                if (vc.get("out_hidden_size")) |v| { if (v == .integer) config.qv_out_hidden = @intCast(v.integer); }
+                if (config.qv_heads != 0) config.qv_head_dim = config.qv_hidden / config.qv_heads;
+                if (config.qv_out_hidden == 0) config.qv_out_hidden = config.hidden_size;
+            }
+        }
+        // Interleaved M-RoPE sections (text_config.rope_parameters). rope_theta /
+        // partial_rotary_factor already parsed in the generic rope block above.
+        if (cfg_obj.get("rope_parameters")) |rp| {
+            if (rp == .object) {
+                if (rp.object.get("mrope_interleaved")) |v| { if (v == .bool) config.mrope_interleaved = v.bool; }
+                if (rp.object.get("mrope_section")) |v| {
+                    if (v == .array) {
+                        for (v.array.items, 0..) |item, i| {
+                            if (i >= 3) break;
+                            if (item == .integer) config.mrope_section[i] = @intCast(item.integer);
+                        }
+                    }
+                }
+            }
+        }
+        // Qwen vision token ids (top-level).
+        if (root.get("video_token_id")) |v| { if (v == .integer) config.video_token_id = @intCast(v.integer); }
+        if (root.get("vision_start_token_id")) |v| { if (v == .integer) config.vision_start_token_id = @intCast(v.integer); }
+        if (root.get("vision_end_token_id")) |v| { if (v == .integer) config.vision_end_token_id = @intCast(v.integer); }
     } else if (std.mem.eql(u8, model_type, "qwen3_moe") or
         std.mem.eql(u8, model_type, "qwen3_moe_text"))
     {
@@ -1626,6 +1689,80 @@ test "ModelConfig fills HF gemma3 defaults when text_config omits head counts" {
     // Fields the 4b text_config DOES carry must still win.
     try testing.expectEqual(@as(u32, 2560), config.hidden_size);
     try testing.expectEqual(@as(u32, 34), config.num_hidden_layers);
+}
+
+test "ModelConfig parses Qwen3.5 vision tower + interleaved M-RoPE" {
+    // A minimal qwen3_5 VL config.json: distinct vision_config keys (depth/num_heads/
+    // spatial_merge_size/...) land in qv_*, the interleaved M-RoPE sections come from
+    // text_config.rope_parameters, and the three Qwen vision token ids are read from
+    // the top level. has_vision must be set (the model IS multimodal now).
+    const json =
+        \\{
+        \\  "model_type": "qwen3_5",
+        \\  "image_token_id": 248056,
+        \\  "video_token_id": 248057,
+        \\  "vision_start_token_id": 248053,
+        \\  "vision_end_token_id": 248054,
+        \\  "text_config": {
+        \\    "hidden_size": 1024,
+        \\    "head_dim": 256,
+        \\    "num_attention_heads": 8,
+        \\    "num_key_value_heads": 2,
+        \\    "full_attention_interval": 4,
+        \\    "rope_parameters": {
+        \\      "rope_theta": 10000000,
+        \\      "partial_rotary_factor": 0.25,
+        \\      "mrope_interleaved": true,
+        \\      "mrope_section": [11, 11, 10]
+        \\    }
+        \\  },
+        \\  "vision_config": {
+        \\    "model_type": "qwen3_5",
+        \\    "depth": 12,
+        \\    "hidden_size": 768,
+        \\    "num_heads": 12,
+        \\    "intermediate_size": 3072,
+        \\    "patch_size": 16,
+        \\    "temporal_patch_size": 2,
+        \\    "spatial_merge_size": 2,
+        \\    "num_position_embeddings": 2304,
+        \\    "out_hidden_size": 1024
+        \\  },
+        \\  "quantization": {"bits": 4, "group_size": 32}
+        \\}
+    ;
+    const config = try parseConfigFromJson(testing.allocator, json);
+    try testing.expect(config.has_vision);
+    try testing.expect(config.qwen_vision);
+    try testing.expectEqual(@as(u32, 12), config.qv_depth);
+    try testing.expectEqual(@as(u32, 768), config.qv_hidden);
+    try testing.expectEqual(@as(u32, 12), config.qv_heads);
+    try testing.expectEqual(@as(u32, 64), config.qv_head_dim); // 768 / 12
+    try testing.expectEqual(@as(u32, 2), config.qv_merge);
+    try testing.expectEqual(@as(u32, 2), config.qv_temporal_patch);
+    try testing.expectEqual(@as(u32, 2304), config.qv_num_pos_emb);
+    try testing.expectEqual(@as(u32, 1024), config.qv_out_hidden);
+    try testing.expect(config.mrope_interleaved);
+    try testing.expectEqual([3]u32{ 11, 11, 10 }, config.mrope_section);
+    try testing.expectEqual(@as(u32, 248056), config.image_token_id);
+    try testing.expectEqual(@as(u32, 248057), config.video_token_id);
+    try testing.expectEqual(@as(u32, 248053), config.vision_start_token_id);
+    try testing.expectEqual(@as(u32, 248054), config.vision_end_token_id);
+    // partial_rotary_factor → rotary_dim = 256*0.25 = 64.
+    try testing.expectApproxEqAbs(@as(f32, 0.25), config.partial_rotary_factor, 1e-6);
+}
+
+test "ModelConfig text-only qwen3_5 has no qwen_vision" {
+    const json =
+        \\{
+        \\  "model_type": "qwen3_5_text",
+        \\  "hidden_size": 1024,
+        \\  "rope_parameters": {"rope_theta": 10000000, "partial_rotary_factor": 0.25}
+        \\}
+    ;
+    const config = try parseConfigFromJson(testing.allocator, json);
+    try testing.expect(!config.qwen_vision);
+    try testing.expect(!config.has_vision);
 }
 
 test "ModelConfig keeps explicit gemma3 head counts (12b)" {

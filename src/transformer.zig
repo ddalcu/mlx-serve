@@ -1,5 +1,6 @@
 const std = @import("std");
 const mlx = @import("mlx.zig");
+const mrope = @import("mrope.zig");
 const kv_quant = @import("kv_quant.zig");
 
 pub const KVQuantConfig = kv_quant.KVQuantConfig;
@@ -95,6 +96,102 @@ fn getGdnKernel() !mlx.mlx_fast_metal_kernel {
     );
     if (kernel.ctx == null) return error.MetalKernelCompileFailed;
     gdn_kernel_cached = kernel;
+    return kernel;
+}
+
+// Per-position-state variant of the GDN recurrence kernel, used ONLY on the PLD
+// verify forward (small T). Identical math to GDN_KERNEL_SOURCE, but instead of
+// writing only the FINAL state it records the state after EVERY timestep into
+// `state_seq` ([T, B, Hv, Dv, Dk]). That lets partial-accept rollback restore
+// the accepted-position SSM state by slicing — no re-forward of the accepted
+// prefix (the costly part on a 48-layer GatedDeltaNet trunk). The decode and
+// prefill paths keep using the original single-state kernel, so this adds zero
+// cost outside speculative decoding. `seq_stride` = (B*Hv)*Dv*Dk = per-timestep
+// element stride into `state_seq` (passed as a scalar, mirroring `T`).
+const GDN_KERNEL_SEQ_SOURCE =
+    \\auto n = thread_position_in_grid.z;
+    \\auto b_idx = n / Hv;
+    \\auto hv_idx = n % Hv;
+    \\auto hk_idx = hv_idx / (Hv / Hk);
+    \\constexpr int n_per_t = Dk / 32;
+    \\
+    \\auto q_ = q + b_idx * T * Hk * Dk + hk_idx * Dk;
+    \\auto k_ = k + b_idx * T * Hk * Dk + hk_idx * Dk;
+    \\
+    \\auto v_ = v + b_idx * T * Hv * Dv + hv_idx * Dv;
+    \\y += b_idx * T * Hv * Dv + hv_idx * Dv;
+    \\
+    \\auto dk_idx = thread_position_in_threadgroup.x;
+    \\auto dv_idx = thread_position_in_grid.y;
+    \\
+    \\auto i_state = state_in + (n * Dv + dv_idx) * Dk;
+    \\auto seq_base = (n * Dv + dv_idx) * Dk;
+    \\
+    \\float state[n_per_t];
+    \\for (int i = 0; i < n_per_t; ++i) {
+    \\  auto s_idx = n_per_t * dk_idx + i;
+    \\  state[i] = static_cast<float>(i_state[s_idx]);
+    \\}
+    \\
+    \\auto g_ = g + b_idx * T * Hv;
+    \\auto beta_ = beta + b_idx * T * Hv;
+    \\
+    \\for (int t = 0; t < T; ++t) {
+    \\  float kv_mem = 0.0f;
+    \\  for (int i = 0; i < n_per_t; ++i) {
+    \\    auto s_idx = n_per_t * dk_idx + i;
+    \\    state[i] = state[i] * g_[hv_idx];
+    \\    kv_mem += state[i] * k_[s_idx];
+    \\  }
+    \\  kv_mem = simd_sum(kv_mem);
+    \\
+    \\  auto delta = (v_[dv_idx] - kv_mem) * beta_[hv_idx];
+    \\
+    \\  float out = 0.0f;
+    \\  for (int i = 0; i < n_per_t; ++i) {
+    \\    auto s_idx = n_per_t * dk_idx + i;
+    \\    state[i] = state[i] + k_[s_idx] * delta;
+    \\    out += state[i] * q_[s_idx];
+    \\  }
+    \\  out = simd_sum(out);
+    \\  if (thread_index_in_simdgroup == 0) {
+    \\    y[dv_idx] = static_cast<InT>(out);
+    \\  }
+    \\  auto t_state = state_seq + t * seq_stride + seq_base;
+    \\  for (int i = 0; i < n_per_t; ++i) {
+    \\    auto s_idx = n_per_t * dk_idx + i;
+    \\    t_state[s_idx] = static_cast<StT>(state[i]);
+    \\  }
+    \\  q_ += Hk * Dk;
+    \\  k_ += Hk * Dk;
+    \\  v_ += Hv * Dv;
+    \\  y += Hv * Dv;
+    \\  g_ += Hv;
+    \\  beta_ += Hv;
+    \\}
+;
+
+var gdn_kernel_seq_cached: ?mlx.mlx_fast_metal_kernel = null;
+
+fn getGdnKernelSeq() !mlx.mlx_fast_metal_kernel {
+    if (gdn_kernel_seq_cached) |k| return k;
+    const input_names = [_][*:0]const u8{ "q", "k", "v", "g", "beta", "state_in", "T", "seq_stride" };
+    const output_names = [_][*:0]const u8{ "y", "state_seq" };
+    const in_vec = mlx.mlx_vector_string_new_data(&input_names, input_names.len);
+    defer _ = mlx.mlx_vector_string_free(in_vec);
+    const out_vec = mlx.mlx_vector_string_new_data(&output_names, output_names.len);
+    defer _ = mlx.mlx_vector_string_free(out_vec);
+    const kernel = mlx.mlx_fast_metal_kernel_new(
+        "gated_delta_step_seq",
+        in_vec,
+        out_vec,
+        GDN_KERNEL_SEQ_SOURCE,
+        "",
+        true,
+        false,
+    );
+    if (kernel.ctx == null) return error.MetalKernelCompileFailed;
+    gdn_kernel_seq_cached = kernel;
     return kernel;
 }
 const model_mod = @import("model.zig");
@@ -825,6 +922,18 @@ pub const SSMCacheEntry = struct {
     conv_state: mlx.mlx_array, // [B, kernel-1, conv_dim]
     ssm_state: mlx.mlx_array, // [B, Hv, Dv, Dk]
     initialized: bool,
+    /// PLD spec-decode capture: per-position SSM states recorded by the GDN
+    /// verify forward (`Transformer.spec_capture_ssm`). Shape [T, B, Hv, Dv, Dk]
+    /// where T = verify length. Lets partial-accept rollback pick the
+    /// accepted-position state WITHOUT a re-forward — the verify already ran the
+    /// (sequential, expensive on a 48-layer GatedDeltaNet trunk) recurrence, so
+    /// re-running it for the accepted prefix is pure waste. Null outside a
+    /// capturing verify; freed at the end of every `nextPld` round.
+    spec_state_seq: mlx.mlx_array = .{ .ctx = null },
+    /// PLD spec-decode capture: the conv1d input `[B, (kernel-1)+T, conv_dim]`
+    /// of the verify forward, so the accepted-position `conv_state` is just a
+    /// slice (no re-forward). Null outside capture.
+    spec_conv_input: mlx.mlx_array = .{ .ctx = null },
 };
 
 /// SSM snapshot value. Holds clones of conv_state and ssm_state via refcount —
@@ -889,6 +998,73 @@ pub fn ssmRestore(dst: *SSMCacheEntry, snap: *const SSMCacheEntrySnapshot) !void
     }
     if (snap.ssm_state.ctx != null) {
         try mlx.check(mlx.mlx_array_set(&dst.ssm_state, snap.ssm_state));
+    }
+}
+
+/// Free the transient PLD spec-decode capture buffers on an SSM entry
+/// (`spec_state_seq` / `spec_conv_input`). Idempotent — safe to call on an
+/// entry that never captured. Called at the end of every `nextPld` round and
+/// in the cache teardown paths so the capture never outlives a round.
+pub fn ssmFreeSpecCapture(entry: *SSMCacheEntry) void {
+    if (entry.spec_state_seq.ctx != null) {
+        _ = mlx.mlx_array_free(entry.spec_state_seq);
+        entry.spec_state_seq = .{ .ctx = null };
+    }
+    if (entry.spec_conv_input.ctx != null) {
+        _ = mlx.mlx_array_free(entry.spec_conv_input);
+        entry.spec_conv_input = .{ .ctx = null };
+    }
+}
+
+/// PLD partial-accept rollback for a GatedDeltaNet layer, using the
+/// per-position capture from the verify forward instead of a re-forward.
+/// Sets `conv_state` + `ssm_state` to the state AFTER processing the first
+/// `1 + accepted` verify tokens (t1 + accepted accepted drafts).
+///
+/// Numerically identical to a fresh forward over `[t1, draft[0..accepted-1]]`:
+/// the GDN recurrence is sequential, so the state captured at position
+/// `accepted` of a length-(1+m) verify run is the exact same float32→bf16
+/// value a length-(1+accepted) run would store as its final state. Likewise
+/// `conv_state` is the same windowed slice of the same conv input. So this
+/// preserves PLD's byte-equivalence guarantee (pinned by
+/// `tests/test_pld_equivalence.sh`).
+///
+/// No-op when the entry holds no capture (non-GDN hybrid layer); the caller
+/// only takes the fast path when capture succeeded.
+pub fn ssmRollbackFromCapture(entry: *SSMCacheEntry, accepted: u32, s: mlx.mlx_stream) !void {
+    if (entry.spec_state_seq.ctx == null) return;
+
+    const seq_shape = mlx.getShape(entry.spec_state_seq); // [T, B, Hv, Dv, Dk]
+    const acc: c_int = @intCast(accepted);
+
+    // ssm_state = spec_state_seq[accepted]  →  [B, Hv, Dv, Dk]
+    {
+        const start = [_]c_int{ acc, 0, 0, 0, 0 };
+        const stop = [_]c_int{ acc + 1, seq_shape[1], seq_shape[2], seq_shape[3], seq_shape[4] };
+        const strides = [_]c_int{ 1, 1, 1, 1, 1 };
+        var sliced = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_slice(&sliced, entry.spec_state_seq, &start, 5, &stop, 5, &strides, 5, s));
+        defer _ = mlx.mlx_array_free(sliced);
+        const new_shape = [_]c_int{ seq_shape[1], seq_shape[2], seq_shape[3], seq_shape[4] };
+        var reshaped = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_reshape(&reshaped, sliced, &new_shape, 4, s));
+        _ = mlx.mlx_array_free(entry.ssm_state);
+        entry.ssm_state = reshaped;
+    }
+
+    // conv_state = spec_conv_input[:, (1+accepted) : (1+accepted)+(kernel-1), :]
+    if (entry.spec_conv_input.ctx != null) {
+        const ci_shape = mlx.getShape(entry.spec_conv_input); // [B, (k-1)+T, conv_dim]
+        const t_len = seq_shape[0]; // verify length T
+        const km1 = ci_shape[1] - t_len; // kernel - 1
+        const cstart: c_int = @intCast(1 + accepted);
+        const start = [_]c_int{ 0, cstart, 0 };
+        const stop = [_]c_int{ ci_shape[0], cstart + km1, ci_shape[2] };
+        const strides = [_]c_int{ 1, 1, 1 };
+        var new_conv = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_slice(&new_conv, entry.spec_conv_input, &start, 3, &stop, 3, &strides, 3, s));
+        _ = mlx.mlx_array_free(entry.conv_state);
+        entry.conv_state = new_conv;
     }
 }
 
@@ -1337,7 +1513,24 @@ pub const ForwardCtx = struct {
     /// position only. Used by the Qwen MTP head, whose committed-history
     /// cache needs the trunk hidden at every verify/prefill position.
     capture_hidden_all: ?*mlx.mlx_array = null,
+    /// PLD spec-decode: when true, the GatedDeltaNet trunk records per-position
+    /// SSM/conv state during the verify forward (see `SSMCacheEntry.spec_*`),
+    /// so partial-accept rollback needs no re-forward. Set only by `nextPld`
+    /// for the verify pass on a GDN model; the flag reaches the layers via
+    /// `Transformer.spec_capture_ssm`.
+    capture_ssm_seq: bool = false,
     vision_embeddings: ?mlx.mlx_array,
+    /// Qwen3-VL interleaved M-RoPE. `mrope_pos` is the server-computed flat
+    /// [3 × mrope_total] i32 position-id table (axis-major: t,h,w rows), borrowed
+    /// from the slot. `mrope_delta` shifts the scalar decode RoPE (decode tokens
+    /// are text → t=h=w). `mrope_cos/sin_cur` are the per-prefill-chunk cos/sin
+    /// tables, built once in forwardMoeWith and consumed by every full-attn layer
+    /// that chunk, then freed. All null/0 for non-Qwen / text-only requests.
+    mrope_pos: ?[]const i32 = null,
+    mrope_total: usize = 0,
+    mrope_delta: i32 = 0,
+    mrope_cos_cur: ?mlx.mlx_array = null,
+    mrope_sin_cur: ?mlx.mlx_array = null,
     /// Phase 2 (Plan ricky): when true, attention call sites consume the
     /// cache's quantized K/V triples directly via `kv_quant.quantAttention`
     /// instead of dequantizing through `DenseKVView`. Only effective when
@@ -1466,6 +1659,10 @@ pub const Transformer = struct {
     gdn_ones_w: ?mlx.mlx_array = null, // ones([dk]) for parameter-free rms_norm
     gdn_q_scale: ?mlx.mlx_array = null, // bf16 scalar 1/dk
     gdn_k_scale: ?mlx.mlx_array = null, // bf16 scalar 1/sqrt(dk)
+    /// PLD spec-decode: mirrors `ForwardCtx.capture_ssm_seq` for the current
+    /// forward so `gatedDeltaNet`/`conv1dWithCache` (which don't take the ctx)
+    /// can capture per-position state. Set+reset only inside `forwardMoeWith`.
+    spec_capture_ssm: bool = false,
 
     // Per-weight quantization bit cache (see bitsFor). Populated lazily on first use.
     // Keyed by the scales array's ctx pointer (stable for the lifetime of a weight).
@@ -1923,6 +2120,7 @@ pub const Transformer = struct {
         self.cache = try KVCache.initWithConfigAndHeadDim(self.allocator, self.config.num_hidden_layers, prev_config, self.config.head_dim);
         if (self.ssm_entries) |entries| {
             for (entries) |*e| {
+                ssmFreeSpecCapture(e);
                 _ = mlx.mlx_array_free(e.conv_state);
                 _ = mlx.mlx_array_free(e.ssm_state);
                 e.conv_state = mlx.mlx_array_new();
@@ -2398,6 +2596,7 @@ pub const Transformer = struct {
         self.allocator.free(self.layers);
         if (self.ssm_entries) |entries| {
             for (entries) |*e| {
+                ssmFreeSpecCapture(e);
                 _ = mlx.mlx_array_free(e.conv_state);
                 _ = mlx.mlx_array_free(e.ssm_state);
             }
@@ -2864,6 +3063,15 @@ pub const Transformer = struct {
             _ = mlx.mlx_array_free(ssm.conv_state);
             ssm.conv_state = new_conv_state;
             ssm.initialized = true;
+        }
+
+        // PLD capture: stash the full conv input ([B, (kernel-1)+T, conv_dim])
+        // so partial-accept rollback can slice the accepted-position conv_state
+        // without a re-forward. Refcount-shared; freed at the end of the round.
+        if (self.spec_capture_ssm) {
+            if (ssm.spec_conv_input.ctx != null) _ = mlx.mlx_array_free(ssm.spec_conv_input);
+            ssm.spec_conv_input = mlx.mlx_array_new();
+            _ = mlx.mlx_array_set(&ssm.spec_conv_input, conv_input);
         }
 
         // Depthwise conv1d (groups = cdim)
@@ -4268,6 +4476,12 @@ pub const Transformer = struct {
         const cfg = &self.config;
         const is_gemma4 = cfg.isGemma4Layers();
 
+        // PLD spec-decode: thread the per-position SSM capture flag down to the
+        // GatedDeltaNet layers (which don't take the ctx). Reset on exit so it
+        // never leaks into a non-capturing forward.
+        self.spec_capture_ssm = ctx.capture_ssm_seq;
+        defer self.spec_capture_ssm = false;
+
         var h = try self.embedding(token_ids);
 
         // Splice vision embeddings at image_token_id positions (prefill only)
@@ -4277,6 +4491,22 @@ pub const Transformer = struct {
         const batch: c_int = x_shape[0];
         const seq_len: c_int = x_shape[1];
         const is_prefill = seq_len > 1;
+
+        // Qwen3-VL interleaved M-RoPE: build the per-prefill-chunk cos/sin once
+        // (shared by every full-attn layer this forward), freed after the loop.
+        // Decode (seq_len==1) leaves these null → gatedFullAttnWith uses the
+        // scalar offset+delta path.
+        if (ctx.mrope_pos != null and is_prefill and @as(usize, @intCast(offset)) + @as(usize, @intCast(seq_len)) <= ctx.mrope_total) {
+            const cs = try self.buildMropeCosSin(ctx, @intCast(offset), @intCast(seq_len));
+            ctx.mrope_cos_cur = cs.cos;
+            ctx.mrope_sin_cur = cs.sin;
+        }
+        defer {
+            if (ctx.mrope_cos_cur) |c| _ = mlx.mlx_array_free(c);
+            if (ctx.mrope_sin_cur) |sn| _ = mlx.mlx_array_free(sn);
+            ctx.mrope_cos_cur = null;
+            ctx.mrope_sin_cur = null;
+        }
 
         // Precompute sliding window masks (Gemma 4)
         var local_prefill_mask = mlx.mlx_array_new();
@@ -5329,6 +5559,116 @@ pub const Transformer = struct {
 
     // ── Full Attention for MoE models (with optional output gate) ──
 
+    /// Build per-token interleaved-M-RoPE cos/sin [1,1,seq_len,rope_dims] (bf16)
+    /// for prompt positions [offset, offset+seq_len) from `ctx.mrope_pos`. The
+    /// 3D (t,h,w) divergence only matters at image tokens (prefill); text tokens
+    /// have t=h=w so this collapses to ordinary partial RoPE.
+    fn buildMropeCosSin(self: *Transformer, ctx: *ForwardCtx, offset: usize, seq_len: usize) !struct { cos: mlx.mlx_array, sin: mlx.mlx_array } {
+        const cfg = &self.config;
+        const rope_dims: usize = @intFromFloat(@as(f32, @floatFromInt(cfg.head_dim)) * cfg.partial_rotary_factor);
+        const half = rope_dims / 2;
+        const pos = ctx.mrope_pos.?;
+        const total = ctx.mrope_total;
+
+        const inv_freq = try self.allocator.alloc(f64, half);
+        defer self.allocator.free(inv_freq);
+        mrope.computeInvFreq(inv_freq, rope_dims, cfg.rope_theta);
+        const sel = try self.allocator.alloc(u8, half);
+        defer self.allocator.free(sel);
+        mrope.interleavedSelector(sel, cfg.mrope_section);
+
+        const cos_buf = try self.allocator.alloc(f32, seq_len * rope_dims);
+        defer self.allocator.free(cos_buf);
+        const sin_buf = try self.allocator.alloc(f32, seq_len * rope_dims);
+        defer self.allocator.free(sin_buf);
+        for (0..seq_len) |i| {
+            const p = offset + i;
+            const o = i * rope_dims;
+            for (0..half) |d| {
+                const axis: usize = sel[d];
+                const pid: f64 = @floatFromInt(pos[axis * total + p]);
+                const angle = pid * inv_freq[d];
+                const c: f32 = @floatCast(@cos(angle));
+                const s: f32 = @floatCast(@sin(angle));
+                // NeoX layout: cos/sin tiled across the two halves of rope_dims.
+                cos_buf[o + d] = c;
+                cos_buf[o + half + d] = c;
+                sin_buf[o + d] = s;
+                sin_buf[o + half + d] = s;
+            }
+        }
+        const shape = [_]c_int{ 1, 1, @intCast(seq_len), @intCast(rope_dims) };
+        const cf = mlx.mlx_array_new_data(cos_buf.ptr, &shape, 4, .float32);
+        defer _ = mlx.mlx_array_free(cf);
+        const sf = mlx.mlx_array_new_data(sin_buf.ptr, &shape, 4, .float32);
+        defer _ = mlx.mlx_array_free(sf);
+        var cos = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_astype(&cos, cf, .bfloat16, self.s));
+        var sin = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_astype(&sin, sf, .bfloat16, self.s));
+        return .{ .cos = cos, .sin = sin };
+    }
+
+    /// Apply NeoX RoPE to the first `rope_dims` dims of `arr` [B,H,S,hd] using
+    /// precomputed cos/sin [1,1,S,rope_dims] (broadcast over B,H); pass remaining
+    /// dims through. Equivalent to `mlx_fast_rope(traditional=false)` but with
+    /// per-token (M-RoPE) angles instead of a scalar offset.
+    fn applyMrope(self: *Transformer, arr: mlx.mlx_array, cos: mlx.mlx_array, sin: mlx.mlx_array, rope_dims: c_int) !mlx.mlx_array {
+        const sh = mlx.getShape(arr);
+        const b = sh[0];
+        const h = sh[1];
+        const s = sh[2];
+        const hd = sh[3];
+        const half = @divExact(rope_dims, 2);
+        const st = [_]c_int{ 1, 1, 1, 1 };
+
+        var rot = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(rot);
+        try mlx.check(mlx.mlx_slice(&rot, arr, &[_]c_int{ 0, 0, 0, 0 }, 4, &[_]c_int{ b, h, s, rope_dims }, 4, &st, 4, self.s));
+
+        // rotate_half(rot) = concat(-rot[..,half:], rot[..,:half])
+        var r2 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(r2);
+        try mlx.check(mlx.mlx_slice(&r2, rot, &[_]c_int{ 0, 0, 0, half }, 4, &[_]c_int{ b, h, s, rope_dims }, 4, &st, 4, self.s));
+        var r1 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(r1);
+        try mlx.check(mlx.mlx_slice(&r1, rot, &[_]c_int{ 0, 0, 0, 0 }, 4, &[_]c_int{ b, h, s, half }, 4, &st, 4, self.s));
+        var neg = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(neg);
+        try mlx.check(mlx.mlx_negative(&neg, r2, self.s));
+        const rh_arrs = [_]mlx.mlx_array{ neg, r1 };
+        const rh_vec = mlx.mlx_vector_array_new_data(&rh_arrs, 2);
+        defer _ = mlx.mlx_vector_array_free(rh_vec);
+        var rh = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(rh);
+        try mlx.check(mlx.mlx_concatenate_axis(&rh, rh_vec, -1, self.s));
+
+        var xcos = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(xcos);
+        try mlx.check(mlx.mlx_multiply(&xcos, rot, cos, self.s));
+        var rsin = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(rsin);
+        try mlx.check(mlx.mlx_multiply(&rsin, rh, sin, self.s));
+        var out_rot = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(out_rot);
+        try mlx.check(mlx.mlx_add(&out_rot, xcos, rsin, self.s));
+
+        if (hd == rope_dims) {
+            var out = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_astype(&out, out_rot, .bfloat16, self.s));
+            return out;
+        }
+        var pass = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(pass);
+        try mlx.check(mlx.mlx_slice(&pass, arr, &[_]c_int{ 0, 0, 0, rope_dims }, 4, &[_]c_int{ b, h, s, hd }, 4, &st, 4, self.s));
+        const cat_arrs = [_]mlx.mlx_array{ out_rot, pass };
+        const cat_vec = mlx.mlx_vector_array_new_data(&cat_arrs, 2);
+        defer _ = mlx.mlx_vector_array_free(cat_vec);
+        var out = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_concatenate_axis(&out, cat_vec, -1, self.s));
+        return out;
+    }
+
     fn gatedFullAttnWith(
         self: *Transformer,
         ctx: *ForwardCtx,
@@ -5422,13 +5762,24 @@ pub const Transformer = struct {
         try mlx.check(mlx.mlx_transpose_axes(&k_t, k_normed, &perm, 4, self.s));
         try mlx.check(mlx.mlx_transpose_axes(&v_t, v_r, &perm, 4, self.s));
 
-        // Partial RoPE
+        // Partial RoPE. Qwen3-VL image requests use interleaved M-RoPE: manual
+        // per-token cos/sin on the prefill chunk (3D t/h/w angles at image
+        // tokens), and scalar RoPE at offset+delta on decode (decode tokens are
+        // text → t=h=w). Plain scalar partial RoPE otherwise (zero-cost for
+        // text-only qwen3_5).
         var q_rope = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(q_rope);
         var k_rope = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(k_rope);
-        try mlx.check(mlx.mlx_fast_rope(&q_rope, q_t, rope_dims, false, mlx.mlx_optional_float.some(self.config.rope_theta), 1.0, offset, .{ .ctx = null }, self.s));
-        try mlx.check(mlx.mlx_fast_rope(&k_rope, k_t, rope_dims, false, mlx.mlx_optional_float.some(self.config.rope_theta), 1.0, offset, .{ .ctx = null }, self.s));
+        if (ctx.mrope_cos_cur) |cos| {
+            const sin = ctx.mrope_sin_cur.?;
+            q_rope = try self.applyMrope(q_t, cos, sin, rope_dims);
+            k_rope = try self.applyMrope(k_t, cos, sin, rope_dims);
+        } else {
+            const eff_offset: c_int = offset + (if (ctx.mrope_pos != null) ctx.mrope_delta else 0);
+            try mlx.check(mlx.mlx_fast_rope(&q_rope, q_t, rope_dims, false, mlx.mlx_optional_float.some(self.config.rope_theta), 1.0, eff_offset, .{ .ctx = null }, self.s));
+            try mlx.check(mlx.mlx_fast_rope(&k_rope, k_t, rope_dims, false, mlx.mlx_optional_float.some(self.config.rope_theta), 1.0, eff_offset, .{ .ctx = null }, self.s));
+        }
 
         var kv_view = try cache.update(layer, k_rope, v_t, self.s, 0);
         defer kv_view.deinit();
@@ -5852,42 +6203,91 @@ pub const Transformer = struct {
         const T_scalar = mlx.mlx_array_new_int(seq_len);
         defer _ = mlx.mlx_array_free(T_scalar);
 
-        const inputs_arr = [_]mlx.mlx_array{ q_scaled, k_scaled, v_heads, g, beta, ssm.ssm_state, T_scalar };
-        const inputs_vec = mlx.mlx_vector_array_new_data(&inputs_arr, inputs_arr.len);
-        defer _ = mlx.mlx_vector_array_free(inputs_vec);
-
         const y_shape = [_]c_int{ batch, seq_len, num_v_heads, dv };
-        const state_shape_out = [_]c_int{ batch, num_v_heads, dv, dk };
 
         const config = mlx.mlx_fast_metal_kernel_config_new();
         defer _ = mlx.mlx_fast_metal_kernel_config_free(config);
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &y_shape, 4, .bfloat16));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &state_shape_out, 4, .bfloat16));
-        // Grid: (32, Dv, B*Hv) threads; threadgroup: (32, 4, 1). Matches mlx-lm.
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, 32, dv, batch * num_v_heads));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 32, 4, 1));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "InT", .bfloat16));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "StT", .bfloat16));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "Dk", dk));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "Dv", dv));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "Hk", num_k_heads));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "Hv", num_v_heads));
-
-        const gdn_kernel = try getGdnKernel();
-        var outputs_vec = mlx.mlx_vector_array_new();
-        defer _ = mlx.mlx_vector_array_free(outputs_vec);
-        try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, gdn_kernel, inputs_vec, config, self.s));
-
-        if (mlx.mlx_vector_array_size(outputs_vec) != 2) return error.MetalKernelBadOutputCount;
 
         var y_bthd = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(y_bthd);
-        try mlx.check(mlx.mlx_vector_array_get(&y_bthd, outputs_vec, 0));
 
-        var new_state = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_vector_array_get(&new_state, outputs_vec, 1));
-        _ = mlx.mlx_array_free(ssm.ssm_state);
-        ssm.ssm_state = new_state;
+        if (self.spec_capture_ssm) {
+            // PLD verify pass: emit per-position states so partial-accept
+            // rollback needs no re-forward. state_seq: [T, B, Hv, Dv, Dk].
+            const state_seq_shape = [_]c_int{ seq_len, batch, num_v_heads, dv, dk };
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &state_seq_shape, 5, .bfloat16));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, 32, dv, batch * num_v_heads));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 32, 4, 1));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "InT", .bfloat16));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "StT", .bfloat16));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "Dk", dk));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "Dv", dv));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "Hk", num_k_heads));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "Hv", num_v_heads));
+
+            // seq_stride = per-timestep element stride into state_seq.
+            const seq_stride = mlx.mlx_array_new_int(batch * num_v_heads * dv * dk);
+            defer _ = mlx.mlx_array_free(seq_stride);
+            const inputs_arr = [_]mlx.mlx_array{ q_scaled, k_scaled, v_heads, g, beta, ssm.ssm_state, T_scalar, seq_stride };
+            const inputs_vec = mlx.mlx_vector_array_new_data(&inputs_arr, inputs_arr.len);
+            defer _ = mlx.mlx_vector_array_free(inputs_vec);
+
+            const gdn_kernel = try getGdnKernelSeq();
+            var outputs_vec = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(outputs_vec);
+            try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, gdn_kernel, inputs_vec, config, self.s));
+            if (mlx.mlx_vector_array_size(outputs_vec) != 2) return error.MetalKernelBadOutputCount;
+            try mlx.check(mlx.mlx_vector_array_get(&y_bthd, outputs_vec, 0));
+
+            // Stash the full per-position sequence for rollback (takes ownership).
+            var state_seq = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_vector_array_get(&state_seq, outputs_vec, 1));
+            if (ssm.spec_state_seq.ctx != null) _ = mlx.mlx_array_free(ssm.spec_state_seq);
+            ssm.spec_state_seq = state_seq;
+
+            // Continue normal flow with the FINAL state = state_seq[T-1].
+            const last: c_int = seq_len - 1;
+            const fs_start = [_]c_int{ last, 0, 0, 0, 0 };
+            const fs_stop = [_]c_int{ seq_len, batch, num_v_heads, dv, dk };
+            const fs_strides = [_]c_int{ 1, 1, 1, 1, 1 };
+            var final_sliced = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_slice(&final_sliced, state_seq, &fs_start, 5, &fs_stop, 5, &fs_strides, 5, self.s));
+            defer _ = mlx.mlx_array_free(final_sliced);
+            const fin_shape = [_]c_int{ batch, num_v_heads, dv, dk };
+            var final_state = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_reshape(&final_state, final_sliced, &fin_shape, 4, self.s));
+            _ = mlx.mlx_array_free(ssm.ssm_state);
+            ssm.ssm_state = final_state;
+        } else {
+            const state_shape_out = [_]c_int{ batch, num_v_heads, dv, dk };
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &state_shape_out, 4, .bfloat16));
+            // Grid: (32, Dv, B*Hv) threads; threadgroup: (32, 4, 1). Matches mlx-lm.
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, 32, dv, batch * num_v_heads));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 32, 4, 1));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "InT", .bfloat16));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "StT", .bfloat16));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "Dk", dk));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "Dv", dv));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "Hk", num_k_heads));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "Hv", num_v_heads));
+
+            const inputs_arr = [_]mlx.mlx_array{ q_scaled, k_scaled, v_heads, g, beta, ssm.ssm_state, T_scalar };
+            const inputs_vec = mlx.mlx_vector_array_new_data(&inputs_arr, inputs_arr.len);
+            defer _ = mlx.mlx_vector_array_free(inputs_vec);
+
+            const gdn_kernel = try getGdnKernel();
+            var outputs_vec = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(outputs_vec);
+            try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, gdn_kernel, inputs_vec, config, self.s));
+            if (mlx.mlx_vector_array_size(outputs_vec) != 2) return error.MetalKernelBadOutputCount;
+            try mlx.check(mlx.mlx_vector_array_get(&y_bthd, outputs_vec, 0));
+
+            var new_state = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_vector_array_get(&new_state, outputs_vec, 1));
+            _ = mlx.mlx_array_free(ssm.ssm_state);
+            ssm.ssm_state = new_state;
+        }
 
         // Reshape z to [B, S, Hv, Dv]
         const z_shape = [_]c_int{ batch, seq_len, num_v_heads, dv };
@@ -8968,4 +9368,247 @@ test "gdnGateChain matches g = exp(-exp(A_log) * softplus(a + dt_bias))" {
     const tol: f32 = 5e-3;
     try testing.expect(@abs(gd[0] - 0.5) < tol);
     try testing.expect(@abs(gd[1] - 0.25) < tol);
+}
+
+// Helper for the GDN seq-kernel parity test below: run the recurrence via the
+// requested kernel variant and return the FINAL state [B,Hv,Dv,Dk] as f32.
+fn gdnTestRun(comptime seq: bool, q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, g: mlx.mlx_array, beta: mlx.mlx_array, state_in: mlx.mlx_array, B: c_int, T: c_int, Hk: c_int, Hv: c_int, Dk: c_int, Dv: c_int, s: mlx.mlx_stream) !mlx.mlx_array {
+    const T_scalar = mlx.mlx_array_new_int(T);
+    defer _ = mlx.mlx_array_free(T_scalar);
+    const y_shape = [_]c_int{ B, T, Hv, Dv };
+    const config = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(config);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &y_shape, 4, .bfloat16));
+    if (seq) {
+        const ss_shape = [_]c_int{ T, B, Hv, Dv, Dk };
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &ss_shape, 5, .bfloat16));
+    } else {
+        const so_shape = [_]c_int{ B, Hv, Dv, Dk };
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &so_shape, 4, .bfloat16));
+    }
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, 32, Dv, B * Hv));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 32, 4, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "InT", .bfloat16));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "StT", .bfloat16));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "Dk", Dk));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "Dv", Dv));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "Hk", Hk));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "Hv", Hv));
+
+    var outputs_vec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(outputs_vec);
+    if (seq) {
+        const seq_stride = mlx.mlx_array_new_int(B * Hv * Dv * Dk);
+        defer _ = mlx.mlx_array_free(seq_stride);
+        const inputs_arr = [_]mlx.mlx_array{ q, k, v, g, beta, state_in, T_scalar, seq_stride };
+        const inputs_vec = mlx.mlx_vector_array_new_data(&inputs_arr, inputs_arr.len);
+        defer _ = mlx.mlx_vector_array_free(inputs_vec);
+        const kern = try getGdnKernelSeq();
+        try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kern, inputs_vec, config, s));
+        var ss = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(ss);
+        try mlx.check(mlx.mlx_vector_array_get(&ss, outputs_vec, 1));
+        // slice [T-1] -> [1,B,Hv,Dv,Dk] -> reshape [B,Hv,Dv,Dk]
+        const start = [_]c_int{ T - 1, 0, 0, 0, 0 };
+        const stop = [_]c_int{ T, B, Hv, Dv, Dk };
+        const strides = [_]c_int{ 1, 1, 1, 1, 1 };
+        var sliced = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(sliced);
+        try mlx.check(mlx.mlx_slice(&sliced, ss, &start, 5, &stop, 5, &strides, 5, s));
+        const fshape = [_]c_int{ B, Hv, Dv, Dk };
+        var out = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_reshape(&out, sliced, &fshape, 4, s));
+        return out;
+    } else {
+        const inputs_arr = [_]mlx.mlx_array{ q, k, v, g, beta, state_in, T_scalar };
+        const inputs_vec = mlx.mlx_vector_array_new_data(&inputs_arr, inputs_arr.len);
+        defer _ = mlx.mlx_vector_array_free(inputs_vec);
+        const kern = try getGdnKernel();
+        try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kern, inputs_vec, config, s));
+        var out = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_vector_array_get(&out, outputs_vec, 1));
+        return out;
+    }
+}
+
+test "GDN seq-kernel final state matches single-state kernel (PLD capture parity)" {
+    const s = mlx.gpuStream();
+    const B: c_int = 1;
+    const T: c_int = 4;
+    const Hk: c_int = 1;
+    const Hv: c_int = 2;
+    const Dk: c_int = 128; // n_per_t = Dk/32 = 4 (matches real GatedDeltaNet head dim)
+    const Dv: c_int = 4;
+
+    // Deterministic pseudo-random inputs in [-0.5, 0.5].
+    var prng = std.Random.DefaultPrng.init(0xC0FFEE);
+    const rnd = prng.random();
+    const qn: usize = @intCast(B * T * Hk * Dk);
+    const vn: usize = @intCast(B * T * Hv * Dv);
+    const gn: usize = @intCast(B * T * Hv);
+    const sn: usize = @intCast(B * Hv * Dv * Dk);
+    const qd = try testing.allocator.alloc(f32, qn);
+    defer testing.allocator.free(qd);
+    const kd = try testing.allocator.alloc(f32, qn);
+    defer testing.allocator.free(kd);
+    const vd = try testing.allocator.alloc(f32, vn);
+    defer testing.allocator.free(vd);
+    const gd = try testing.allocator.alloc(f32, gn);
+    defer testing.allocator.free(gd);
+    const bd = try testing.allocator.alloc(f32, gn);
+    defer testing.allocator.free(bd);
+    const sd = try testing.allocator.alloc(f32, sn);
+    defer testing.allocator.free(sd);
+    for (qd) |*x| x.* = rnd.float(f32) - 0.5;
+    for (kd) |*x| x.* = rnd.float(f32) - 0.5;
+    for (vd) |*x| x.* = rnd.float(f32) - 0.5;
+    for (gd) |*x| x.* = 0.5 + 0.4 * rnd.float(f32); // decay in (0.5,0.9)
+    for (bd) |*x| x.* = rnd.float(f32);
+    for (sd) |*x| x.* = rnd.float(f32) - 0.5;
+
+    const qsh = [_]c_int{ B, T, Hk, Dk };
+    const vsh = [_]c_int{ B, T, Hv, Dv };
+    const gsh = [_]c_int{ B, T, Hv };
+    const ssh = [_]c_int{ B, Hv, Dv, Dk };
+    const q32 = mlx.mlx_array_new_data(qd.ptr, &qsh, 4, .float32);
+    defer _ = mlx.mlx_array_free(q32);
+    const k32 = mlx.mlx_array_new_data(kd.ptr, &qsh, 4, .float32);
+    defer _ = mlx.mlx_array_free(k32);
+    const v32 = mlx.mlx_array_new_data(vd.ptr, &vsh, 4, .float32);
+    defer _ = mlx.mlx_array_free(v32);
+    const g32 = mlx.mlx_array_new_data(gd.ptr, &gsh, 3, .float32);
+    defer _ = mlx.mlx_array_free(g32);
+    const b32 = mlx.mlx_array_new_data(bd.ptr, &gsh, 3, .float32);
+    defer _ = mlx.mlx_array_free(b32);
+    const st32 = mlx.mlx_array_new_data(sd.ptr, &ssh, 4, .float32);
+    defer _ = mlx.mlx_array_free(st32);
+
+    // Cast inputs to bf16 (kernel expects InT/StT = bf16).
+    var q = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(q);
+    var kk = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(kk);
+    var v = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(v);
+    var g = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(g);
+    var beta = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(beta);
+    var st = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(st);
+    try mlx.check(mlx.mlx_astype(&q, q32, .bfloat16, s));
+    try mlx.check(mlx.mlx_astype(&kk, k32, .bfloat16, s));
+    try mlx.check(mlx.mlx_astype(&v, v32, .bfloat16, s));
+    try mlx.check(mlx.mlx_astype(&g, g32, .bfloat16, s));
+    try mlx.check(mlx.mlx_astype(&beta, b32, .bfloat16, s));
+    try mlx.check(mlx.mlx_astype(&st, st32, .bfloat16, s));
+
+    const state_a = try gdnTestRun(false, q, kk, v, g, beta, st, B, T, Hk, Hv, Dk, Dv, s);
+    defer _ = mlx.mlx_array_free(state_a);
+    const state_b = try gdnTestRun(true, q, kk, v, g, beta, st, B, T, Hk, Hv, Dk, Dv, s);
+    defer _ = mlx.mlx_array_free(state_b);
+
+    var a32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(a32);
+    var bb32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(bb32);
+    try mlx.check(mlx.mlx_astype(&a32, state_a, .float32, s));
+    try mlx.check(mlx.mlx_astype(&bb32, state_b, .float32, s));
+    try mlx.check(mlx.mlx_array_eval(a32));
+    try mlx.check(mlx.mlx_array_eval(bb32));
+    const ad = mlx.mlx_array_data_float32(a32) orelse return error.InvalidDtype;
+    const bd2 = mlx.mlx_array_data_float32(bb32) orelse return error.InvalidDtype;
+    var max_diff: f32 = 0;
+    for (0..sn) |i| max_diff = @max(max_diff, @abs(ad[i] - bd2[i]));
+    // Both write the same bf16-cast state — expect exact (allow tiny slack).
+    try testing.expect(max_diff < 1e-3);
+
+    // Intermediate-position parity: the state captured at position `accepted`
+    // of a length-T seq run must equal a fresh normal-kernel run over just the
+    // first (accepted+1) tokens — this is exactly what partial-accept rollback
+    // relies on. Check accepted = 1 (run length 2).
+    const acc_run: c_int = 2; // accepted+1 = 2 tokens
+    const q2_sh = [_]c_int{ B, acc_run, Hk, Dk };
+    const v2_sh = [_]c_int{ B, acc_run, Hv, Dv };
+    const g2_sh = [_]c_int{ B, acc_run, Hv };
+    const z3 = [_]c_int{ 1, 1, 1, 1 };
+    var q2 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(q2);
+    var k2 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(k2);
+    var v2 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(v2);
+    var g2 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(g2);
+    var b2 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(b2);
+    try mlx.check(mlx.mlx_slice(&q2, q, &[_]c_int{ 0, 0, 0, 0 }, 4, &q2_sh, 4, &z3, 4, s));
+    try mlx.check(mlx.mlx_slice(&k2, kk, &[_]c_int{ 0, 0, 0, 0 }, 4, &q2_sh, 4, &z3, 4, s));
+    try mlx.check(mlx.mlx_slice(&v2, v, &[_]c_int{ 0, 0, 0, 0 }, 4, &v2_sh, 4, &z3, 4, s));
+    try mlx.check(mlx.mlx_slice(&g2, g, &[_]c_int{ 0, 0, 0 }, 3, &g2_sh, 3, &[_]c_int{ 1, 1, 1 }, 3, s));
+    try mlx.check(mlx.mlx_slice(&b2, beta, &[_]c_int{ 0, 0, 0 }, 3, &g2_sh, 3, &[_]c_int{ 1, 1, 1 }, 3, s));
+
+    const ref2 = try gdnTestRun(false, q2, k2, v2, g2, b2, st, B, acc_run, Hk, Hv, Dk, Dv, s);
+    defer _ = mlx.mlx_array_free(ref2);
+
+    // Pull position 1 out of the length-T seq run.
+    const state_seq_full = try gdnTestRunSeqAt(q, kk, v, g, beta, st, B, T, Hk, Hv, Dk, Dv, 1, s);
+    defer _ = mlx.mlx_array_free(state_seq_full);
+
+    var r32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(r32);
+    var p32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(p32);
+    try mlx.check(mlx.mlx_astype(&r32, ref2, .float32, s));
+    try mlx.check(mlx.mlx_astype(&p32, state_seq_full, .float32, s));
+    try mlx.check(mlx.mlx_array_eval(r32));
+    try mlx.check(mlx.mlx_array_eval(p32));
+    const rd = mlx.mlx_array_data_float32(r32) orelse return error.InvalidDtype;
+    const pd = mlx.mlx_array_data_float32(p32) orelse return error.InvalidDtype;
+    var mid_diff: f32 = 0;
+    for (0..sn) |i| mid_diff = @max(mid_diff, @abs(rd[i] - pd[i]));
+    try testing.expect(mid_diff < 1e-3);
+}
+
+// Like gdnTestRun(seq=true) but returns the state at an arbitrary position `pos`
+// (not just the last) — mirrors what `ssmRollbackFromCapture` slices out.
+fn gdnTestRunSeqAt(q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, g: mlx.mlx_array, beta: mlx.mlx_array, state_in: mlx.mlx_array, B: c_int, T: c_int, Hk: c_int, Hv: c_int, Dk: c_int, Dv: c_int, pos: c_int, s: mlx.mlx_stream) !mlx.mlx_array {
+    const T_scalar = mlx.mlx_array_new_int(T);
+    defer _ = mlx.mlx_array_free(T_scalar);
+    const y_shape = [_]c_int{ B, T, Hv, Dv };
+    const config = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(config);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &y_shape, 4, .bfloat16));
+    const ss_shape = [_]c_int{ T, B, Hv, Dv, Dk };
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &ss_shape, 5, .bfloat16));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, 32, Dv, B * Hv));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 32, 4, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "InT", .bfloat16));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "StT", .bfloat16));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "Dk", Dk));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "Dv", Dv));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "Hk", Hk));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "Hv", Hv));
+    const seq_stride = mlx.mlx_array_new_int(B * Hv * Dv * Dk);
+    defer _ = mlx.mlx_array_free(seq_stride);
+    const inputs_arr = [_]mlx.mlx_array{ q, k, v, g, beta, state_in, T_scalar, seq_stride };
+    const inputs_vec = mlx.mlx_vector_array_new_data(&inputs_arr, inputs_arr.len);
+    defer _ = mlx.mlx_vector_array_free(inputs_vec);
+    const kern = try getGdnKernelSeq();
+    var outputs_vec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(outputs_vec);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kern, inputs_vec, config, s));
+    var ss = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ss);
+    try mlx.check(mlx.mlx_vector_array_get(&ss, outputs_vec, 1));
+    const start = [_]c_int{ pos, 0, 0, 0, 0 };
+    const stop = [_]c_int{ pos + 1, B, Hv, Dv, Dk };
+    const strides = [_]c_int{ 1, 1, 1, 1, 1 };
+    var sliced = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sliced);
+    try mlx.check(mlx.mlx_slice(&sliced, ss, &start, 5, &stop, 5, &strides, 5, s));
+    const fshape = [_]c_int{ B, Hv, Dv, Dk };
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_reshape(&out, sliced, &fshape, 4, s));
+    return out;
 }

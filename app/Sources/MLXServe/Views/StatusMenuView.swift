@@ -345,6 +345,19 @@ struct StatusMenuView: View {
                                     .background(.quaternary)
                                     .clipShape(Capsule())
                             }
+                            // Speculative-decoding speedup badge (MTP / drafter).
+                            if let badge = info.specDecodeBadge {
+                                Text(badge)
+                                    .font(.caption2.weight(.semibold))
+                                    .foregroundStyle(.green)
+                                    .padding(.horizontal, 5)
+                                    .padding(.vertical, 1)
+                                    .background(Color.green.opacity(0.15))
+                                    .clipShape(Capsule())
+                                    .help(info.mtpLoaded
+                                          ? "Native multi-token-prediction head loaded — faster decode via speculative decoding"
+                                          : "Assistant drafter loaded — faster decode via speculative decoding")
+                            }
                         }
                         Text("\(info.layers) layers, \(info.hiddenSize)-dim")
                             .font(.caption)

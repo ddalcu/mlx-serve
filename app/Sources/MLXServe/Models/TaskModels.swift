@@ -48,6 +48,16 @@ enum RunStatus: String, Codable {
     case failed         // errored (server down, exception, etc.)
     case needsApproval  // paused mid-run waiting on the user (Phase 3)
     case cancelled      // user-stopped
+
+    /// A finished state: the run is no longer (and never again) executing, so it's
+    /// safe to delete and shouldn't show a spinner. `running`/`scheduled` are live;
+    /// `needsApproval` is paused-but-resumable, so neither counts as terminal.
+    var isTerminal: Bool {
+        switch self {
+        case .completed, .failed, .cancelled: return true
+        case .scheduled, .running, .needsApproval: return false
+        }
+    }
 }
 
 /// A user-defined recurring/agentic task. Codable for the `tasks.json` catalog.

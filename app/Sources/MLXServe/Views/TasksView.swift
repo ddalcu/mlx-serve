@@ -179,7 +179,16 @@ private struct TaskDetailView: View {
                 Divider()
 
                 // Run history
-                Text("Runs").font(.headline)
+                HStack {
+                    Text("Runs").font(.headline)
+                    Spacer()
+                    if runs.contains(where: { $0.status.isTerminal && scheduler.activeRun?.id != $0.id }) {
+                        Button("Clear finished") { scheduler.clearFinishedRuns(taskId: task.id) }
+                            .buttonStyle(.link)
+                            .font(.caption)
+                            .help("Delete all completed, failed and cancelled runs")
+                    }
+                }
                 if runs.isEmpty {
                     Text("No runs yet. Tap Run now to try it.")
                         .font(.callout).foregroundStyle(.secondary)
@@ -211,6 +220,9 @@ private struct RunRow: View {
     @State private var expanded = false
     @State private var transcript: [ChatMessage] = []
 
+    /// The live, currently-executing run can't be deleted out from under the engine.
+    private var isLive: Bool { scheduler.activeRun?.id == run.id }
+
     var body: some View {
         DisclosureGroup(isExpanded: $expanded) {
             VStack(alignment: .leading, spacing: 8) {
@@ -220,12 +232,27 @@ private struct RunRow: View {
                 ForEach(transcript) { msg in
                     MessageBubble(message: msg)
                 }
-                Button {
-                    NSWorkspace.shared.open(URL(fileURLWithPath: TaskPaths.runDir(task.id, run.id)))
-                } label: {
-                    Label("Reveal artifacts in Finder", systemImage: "folder")
+                HStack {
+                    Button {
+                        NSWorkspace.shared.open(URL(fileURLWithPath: TaskPaths.runDir(task.id, run.id)))
+                    } label: {
+                        Label("Reveal artifacts in Finder", systemImage: "folder")
+                    }
+                    .buttonStyle(.link)
+                    Spacer()
+                    if !run.status.isTerminal {
+                        Button(role: .destructive) {
+                            scheduler.cancelRun(taskId: task.id, runId: run.id)
+                        } label: { Label("Stop", systemImage: "stop.circle") }
+                        .buttonStyle(.link)
+                    }
+                    Button(role: .destructive) {
+                        scheduler.deleteRun(taskId: task.id, runId: run.id)
+                    } label: { Label("Delete", systemImage: "trash") }
+                    .buttonStyle(.link)
+                    .disabled(isLive)
+                    .help(isLive ? "Stop the run before deleting it" : "Delete this run and its artifacts")
                 }
-                .buttonStyle(.link)
                 .font(.caption)
             }
             .padding(.top, 6)
@@ -244,6 +271,17 @@ private struct RunRow: View {
                 Spacer()
                 if run.status == .running { ProgressView().controlSize(.small) }
             }
+        }
+        .contextMenu {
+            if !run.status.isTerminal {
+                Button(role: .destructive) {
+                    scheduler.cancelRun(taskId: task.id, runId: run.id)
+                } label: { Label("Stop run", systemImage: "stop.circle") }
+            }
+            Button(role: .destructive) {
+                scheduler.deleteRun(taskId: task.id, runId: run.id)
+            } label: { Label("Delete run", systemImage: "trash") }
+            .disabled(isLive)
         }
         .onChange(of: expanded) { _, now in
             if now, transcript.isEmpty {

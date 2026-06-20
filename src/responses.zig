@@ -306,7 +306,7 @@ pub const ParsedInput = struct {
 /// Decode a single image_url string into preprocessed pixels. Provided as a
 /// callback because the actual decoder lives in `server.zig` (uses stb_image
 /// + libwebp). Returning null is fine — the input item will lack images.
-pub const ImageUrlDecoder = *const fn (allocator: std.mem.Allocator, url: []const u8) ?chat_mod.ImageData;
+pub const ImageUrlDecoder = *const fn (allocator: std.mem.Allocator, url: []const u8, vp: chat_mod.VisionPreproc) ?chat_mod.ImageData;
 
 /// Translate a Responses `input` value (string or array of input items) into
 /// `chat_mod.Message`s. Optionally prepends `instructions` as the single leading
@@ -321,6 +321,7 @@ pub fn parseInput(
     instructions: ?[]const u8,
     previous_messages: ?[]const chat_mod.Message,
     image_decoder: ?ImageUrlDecoder,
+    vp: chat_mod.VisionPreproc,
 ) !ParsedInput {
     var pi: ParsedInput = .{
         .messages = std.ArrayList(chat_mod.Message).empty,
@@ -358,13 +359,13 @@ pub fn parseInput(
                 const obj = item.object;
                 const t_val = obj.get("type") orelse {
                     // Bare {role, content} (some clients omit "type":"message")
-                    try appendMessageItem(allocator, &pi, obj, image_decoder);
+                    try appendMessageItem(allocator, &pi, obj, image_decoder, vp);
                     continue;
                 };
                 if (t_val != .string) continue;
                 const t = t_val.string;
                 if (std.mem.eql(u8, t, "message")) {
-                    try appendMessageItem(allocator, &pi, obj, image_decoder);
+                    try appendMessageItem(allocator, &pi, obj, image_decoder, vp);
                 } else if (std.mem.eql(u8, t, "function_call")) {
                     try appendFunctionCallInputItem(allocator, &pi, obj);
                 } else if (std.mem.eql(u8, t, "function_call_output")) {
@@ -391,6 +392,7 @@ fn appendMessageItem(
     pi: *ParsedInput,
     obj: std.json.ObjectMap,
     image_decoder: ?ImageUrlDecoder,
+    vp: chat_mod.VisionPreproc,
 ) !void {
     const role_val = obj.get("role") orelse return;
     if (role_val != .string) return;
@@ -429,7 +431,7 @@ fn appendMessageItem(
                         else => continue,
                     };
                     if (image_decoder) |dec| {
-                        if (dec(allocator, url)) |img| {
+                        if (dec(allocator, url, vp)) |img| {
                             try image_list.append(allocator, img);
                         }
                     }
@@ -829,7 +831,7 @@ test "buildToolsJson skips non-function tools" {
 
 test "parseInput string becomes single user message" {
     const v: std.json.Value = .{ .string = "hello" };
-    var pi = try parseInput(testing.allocator, v, null, null, null);
+    var pi = try parseInput(testing.allocator, v, null, null, null, .{});
     defer pi.deinit();
     try testing.expectEqual(@as(usize, 1), pi.messages.items.len);
     try testing.expectEqualStrings("user", pi.messages.items[0].role);
@@ -838,7 +840,7 @@ test "parseInput string becomes single user message" {
 
 test "parseInput with instructions prepends system" {
     const v: std.json.Value = .{ .string = "hi" };
-    var pi = try parseInput(testing.allocator, v, "You are a pirate", null, null);
+    var pi = try parseInput(testing.allocator, v, "You are a pirate", null, null, .{});
     defer pi.deinit();
     try testing.expectEqual(@as(usize, 2), pi.messages.items.len);
     try testing.expectEqualStrings("system", pi.messages.items[0].role);
@@ -852,7 +854,7 @@ test "parseInput replaces stored system when fresh instructions are provided" {
         .{ .role = "user", .content = "first" },
         .{ .role = "assistant", .content = "answer" },
     };
-    var pi = try parseInput(testing.allocator, v, "new instructions", &prev, null);
+    var pi = try parseInput(testing.allocator, v, "new instructions", &prev, null, .{});
     defer pi.deinit();
 
     try testing.expectEqual(@as(usize, 4), pi.messages.items.len);
@@ -876,7 +878,7 @@ test "parseInput function_call + function_call_output round-trip" {
     ;
     const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
     defer parsed.deinit();
-    var pi = try parseInput(testing.allocator, parsed.value, null, null, null);
+    var pi = try parseInput(testing.allocator, parsed.value, null, null, null, .{});
     defer pi.deinit();
     try testing.expectEqual(@as(usize, 3), pi.messages.items.len);
     try testing.expectEqualStrings("user", pi.messages.items[0].role);
@@ -904,7 +906,7 @@ test "compaction blob round-trips through encode + parseInput" {
     const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, input_json, .{});
     defer parsed.deinit();
 
-    var pi = try parseInput(testing.allocator, parsed.value, null, null, null);
+    var pi = try parseInput(testing.allocator, parsed.value, null, null, null, .{});
     defer pi.deinit();
 
     try testing.expectEqual(@as(usize, 2), pi.messages.items.len);
@@ -925,7 +927,7 @@ test "compaction with malformed envelope is silently skipped" {
     for (inputs) |body| {
         const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
         defer parsed.deinit();
-        var pi = try parseInput(testing.allocator, parsed.value, null, null, null);
+        var pi = try parseInput(testing.allocator, parsed.value, null, null, null, .{});
         defer pi.deinit();
         try testing.expectEqual(@as(usize, 0), pi.messages.items.len);
     }

@@ -16,6 +16,24 @@ enum SystemGrounding {
             "answer any date or time question from this."
     }
 
+    /// Date-only grounding (no clock time) for the AGENT system prompt.
+    ///
+    /// Caching matters here: the server reuses a KV prefix across requests only
+    /// while the prompt prefix is byte-identical. A per-minute timestamp changes
+    /// every request, so prepending `dateTimeLine` defeated the cache entirely —
+    /// every agent turn cold-re-prefilled the full multi-thousand-token system +
+    /// tools prompt (slow TTFB even on a fresh chat). Date-only changes at most
+    /// once a day; placed at the END of the prompt, even the daily rollover only
+    /// re-prefills the short tail. Voice (short, cache-insensitive turns) keeps
+    /// the full `dateTimeLine`.
+    static func dateLine(now: Date = Date()) -> String {
+        let f = DateFormatter()
+        f.locale = Locale(identifier: "en_US")
+        f.dateFormat = "EEEE, MMMM d, yyyy"
+        return "Today's date is \(f.string(from: now)). " +
+            "Treat this as the present day — answer any date question from this, not from memory."
+    }
+
     /// A grounding sentence giving this Mac's LAN IP so the agent reports
     /// reachable URLs (http://<ip>:<port>) for any server/app it starts. Returns
     /// "" when offline / no IP. Pure on the resolved string → testable.

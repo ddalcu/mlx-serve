@@ -8,9 +8,7 @@ import AppKit
 /// from `VoiceModeController` and forwards the agent/thinking/MCP toggles.
 struct VoiceModeView: View {
     @ObservedObject var controller: VoiceModeController
-    @EnvironmentObject var appState: AppState
     var onClose: () -> Void
-    var onNewSession: () -> Void
 
     var body: some View {
         ZStack {
@@ -166,9 +164,9 @@ struct VoiceModeView: View {
                     controller.agentMode.toggle()
                     if controller.agentMode { controller.enableThinking = false }
                 }
-                chip("MCP", system: "puzzlepiece.extension", on: appState.mcpMode) { appState.mcpMode.toggle() }
+                chip("MCP", system: "puzzlepiece.extension", on: controller.mcpMode) { controller.mcpMode.toggle() }
             }
-            if controller.agentMode || appState.mcpMode {
+            if controller.agentMode || controller.mcpMode {
                 Toggle("Auto-approve tools (hands-free)", isOn: $controller.autoApproveTools)
                     .toggleStyle(.switch)
                     .controlSize(.mini)
@@ -179,10 +177,9 @@ struct VoiceModeView: View {
     }
 
     private var controls: some View {
+        // No "new session" button — voice mode is bound to the chat session it was
+        // launched from (its toggles are seeded from that session on open).
         HStack(spacing: 36) {
-            circleButton(system: "plus.bubble", tint: .secondary, help: "Start a new chat session") {
-                onNewSession()
-            }
             circleButton(system: "stop.fill",
                          tint: controller.canInterrupt ? .red : .secondary,
                          help: "Stop the assistant and listen again") {

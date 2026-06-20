@@ -81,6 +81,34 @@ final class APIClientLoadModelTests: XCTestCase {
         XCTAssertNil(legacy.recTopK)
     }
 
+    func testParseModelInfoReadsMtpLoadedAndTrayBadge() {
+        // MTP head loaded → mtpLoaded true → "+MTP" tray badge.
+        let mtp = APIClient.parseModelInfo([
+            "id": "Qwen3.6-27B-4bit-MTP",
+            "meta": ["architecture": "qwen3_5_moe", "mtp_loaded": true, "drafter_loaded": false],
+        ])
+        XCTAssertTrue(mtp.mtpLoaded)
+        XCTAssertEqual(mtp.specDecodeBadge, "+MTP")
+
+        // Drafter loaded (no MTP) → "+Drafter".
+        let drafter = APIClient.parseModelInfo([
+            "id": "gemma-4-e4b",
+            "meta": ["architecture": "gemma4", "mtp_loaded": false, "drafter_loaded": true],
+        ])
+        XCTAssertEqual(drafter.specDecodeBadge, "+Drafter")
+
+        // MTP wins over the drafter when both report (mirrors server dispatch).
+        let both = APIClient.parseModelInfo([
+            "id": "x", "meta": ["mtp_loaded": true, "drafter_loaded": true],
+        ])
+        XCTAssertEqual(both.specDecodeBadge, "+MTP")
+
+        // Neither head, and a pre-feature server (key absent) → no badge, no crash.
+        let none = APIClient.parseModelInfo(["id": "y", "meta": ["architecture": "llama"]])
+        XCTAssertFalse(none.mtpLoaded)
+        XCTAssertNil(none.specDecodeBadge)
+    }
+
     func testParseModelInfoReadsAudioCapability() {
         // Gemma 4 12B advertises "audio" in capabilities + input_modalities.
         let audioModel: [String: Any] = [

@@ -419,4 +419,25 @@ final class TelegramTests: XCTestCase {
         XCTAssertEqual(chunks.joined(), emoji)
         for chunk in chunks { XCTAssertLessThanOrEqual(chunk.utf16.count, 10) }
     }
+
+    // MARK: - Task-result delivery
+
+    func testTaskResultTextFormatsHeaderAndBody() {
+        XCTAssertEqual(TelegramBridge.taskResultText(title: "Nightly digest", completed: true, body: "done"),
+                       "✅ Task “Nightly digest” finished\n\ndone")
+        XCTAssertEqual(TelegramBridge.taskResultText(title: "Nightly digest", completed: false, body: nil),
+                       "⚠️ Task “Nightly digest” failed")
+    }
+
+    /// The truncation fix: a long task result is delivered IN FULL, split across
+    /// however many Telegram messages it takes — nothing is dropped.
+    func testFullTaskResultSplitsIntoMultipleTelegramMessages() {
+        let body = String(repeating: "a", count: 9000)   // > 2× the 4096 cap
+        let text = TelegramBridge.taskResultText(title: "Big report", completed: true, body: body)
+        let chunks = TelegramAPI.splitForTelegram(text)
+        XCTAssertGreaterThan(chunks.count, 1, "a long result must span multiple messages, not truncate")
+        XCTAssertEqual(chunks.joined(), text, "no content lost across chunks")
+        XCTAssertTrue(chunks.allSatisfy { $0.utf16.count <= TelegramAPI.messageLimit },
+                      "every chunk must fit Telegram's per-message cap")
+    }
 }

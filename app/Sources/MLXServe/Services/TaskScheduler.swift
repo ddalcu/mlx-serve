@@ -29,6 +29,10 @@ final class TaskScheduler: ObservableObject {
     private var queue: [() async -> Void] = []
     /// Tool calls that paused a run waiting on the user, keyed by run id.
     private var pendingForRun: [UUID: PendingApproval] = [:]
+    /// Runs the user cancelled mid-generation. `driveRun` checks this when the
+    /// engine goes idle so a user-stopped run finalizes as `.cancelled` instead of
+    /// being clobbered with the `.completed`/`.failed` it would otherwise get.
+    private var cancelledRunIds: Set<UUID> = []
     /// Single coalescing timer armed to the soonest `nextFireAt` across enabled tasks.
     private var timer: DispatchSourceTimer?
     private var started = false
@@ -166,6 +170,15 @@ final class TaskScheduler: ObservableObject {
         let now = Date()
         let cal = Calendar.current
         for i in tasks.indices {
+            // Heal stale runs first: any run persisted as `.running` was interrupted
+            // by an app quit/crash (nothing is executing it now — activeRun is nil at
+            // launch), so flip it to `.failed` instead of leaving a forever-spinner.
+            let current = runs(for: tasks[i].id)
+            let swept = Self.reconcileStaleRuns(current, now: now)
+            if swept != current {
+                runsByTask[tasks[i].id] = swept
+                saveRuns(tasks[i].id, swept)
+            }
             let decision = Self.catchUpDecision(task: tasks[i], now: now, calendar: cal)
             tasks[i].nextFireAt = decision.nextFire
             if decision.runNow { enqueue(tasks[i], reason: "catch-up") }
@@ -216,6 +229,88 @@ final class TaskScheduler: ObservableObject {
         guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
               let msgs = try? decoder.decode([ChatMessage].self, from: data) else { return [] }
         return msgs
+    }
+
+    // MARK: - Run management (stop / delete)
+
+    /// Stop a run. For the live run this signals `driveRun` to finalize it as
+    /// `.cancelled` (so the engine's in-flight completion can't overwrite it); for
+    /// a non-terminal run that ISN'T currently executing — a `needsApproval` pause,
+    /// or a stale `.running` left by a crash — it flips the status directly. A
+    /// terminal run is left alone.
+    func cancelRun(taskId: UUID, runId: UUID) {
+        if activeRun?.id == runId {
+            cancelledRunIds.insert(runId)
+            runEngine.stop()   // wakes driveRun's await; it finalizes as .cancelled
+            return
+        }
+        pendingForRun[runId] = nil
+        guard var run = runs(for: taskId).first(where: { $0.id == runId }),
+              !run.status.isTerminal else { return }
+        run.status = .cancelled
+        run.finishedAt = Date()
+        run.pendingApproval = nil
+        persistRun(run, taskId: taskId)
+        if activeRun?.id == runId { activeRun = nil }
+    }
+
+    /// Delete one run: drop it from the timeline index and remove its on-disk
+    /// folder (transcript + artifacts). Refuses to delete the live run — cancel it
+    /// first (the UI gates this; the guard is defense in depth against a race).
+    func deleteRun(taskId: UUID, runId: UUID) {
+        guard activeRun?.id != runId else { return }
+        pendingForRun[runId] = nil
+        cancelledRunIds.remove(runId)
+        var list = runs(for: taskId)
+        let before = list.count
+        list.removeAll { $0.id == runId }
+        guard list.count != before else { return }
+        runsByTask[taskId] = list
+        saveRuns(taskId, list)
+        try? FileManager.default.removeItem(atPath: TaskPaths.runDir(taskId, runId))
+    }
+
+    /// Delete every terminal run for a task (keeping any live or awaiting-approval
+    /// run), removing each one's on-disk folder. Returns the count removed.
+    @discardableResult
+    func clearFinishedRuns(taskId: UUID) -> Int {
+        let (keep, removed) = Self.runsAfterClearingFinished(runs(for: taskId), activeRunId: activeRun?.id)
+        guard !removed.isEmpty else { return 0 }
+        runsByTask[taskId] = keep
+        saveRuns(taskId, keep)
+        for r in removed {
+            pendingForRun[r.id] = nil
+            try? FileManager.default.removeItem(atPath: TaskPaths.runDir(taskId, r.id))
+        }
+        return removed.count
+    }
+
+    /// Partition a run list into (kept, removed) for a "clear finished" sweep:
+    /// terminal runs that aren't the live one are removed; everything else is kept.
+    /// Pure/testable — the instance method just applies it + does the disk I/O.
+    nonisolated static func runsAfterClearingFinished(_ runs: [TaskRun], activeRunId: UUID?)
+        -> (keep: [TaskRun], removed: [TaskRun]) {
+        var keep: [TaskRun] = []
+        var removed: [TaskRun] = []
+        for r in runs {
+            if r.status.isTerminal && r.id != activeRunId { removed.append(r) } else { keep.append(r) }
+        }
+        return (keep, removed)
+    }
+
+    /// Heal stale runs at launch: a run persisted as `.running` was interrupted by
+    /// an app quit/crash (nothing is executing it now), so mark it `.failed`.
+    /// `.needsApproval` (durable, resumable) and already-terminal runs are left as
+    /// is. Pure/testable.
+    nonisolated static func reconcileStaleRuns(_ runs: [TaskRun], now: Date) -> [TaskRun] {
+        runs.map { run in
+            guard run.status == .running else { return run }
+            var r = run
+            r.status = .failed
+            r.finishedAt = r.finishedAt ?? now
+            if r.summary == nil { r.summary = "Interrupted — the app quit while this run was in progress." }
+            return r
+        }
     }
 
     // MARK: - Running
@@ -309,6 +404,20 @@ final class TaskScheduler: ObservableObject {
         }
 
         let messages = appState.chatSessions.first { $0.id == sessionId }?.messages ?? []
+
+        // Cancelled by the user mid-run? (cancelRun set the flag + stopped the
+        // engine, which is what woke the await above.) Cancel wins over a pending
+        // approval — finalize as `.cancelled` so it isn't overwritten as completed.
+        if cancelledRunIds.remove(run.id) != nil {
+            pendingForRun[run.id] = nil
+            saveTranscript(taskId: task.id, runId: run.id, messages: messages)
+            appState.chatSessions.removeAll { $0.id == sessionId }
+            run.status = .cancelled
+            run.finishedAt = Date()
+            run.summary = Self.lastAssistantText(messages) ?? "Cancelled by user."
+            finalize(run, taskId: task.id)
+            return
+        }
 
         // Paused for approval?
         if let pending = pendingForRun[run.id] {
@@ -453,13 +562,22 @@ final class TaskScheduler: ObservableObject {
         return nil
     }
 
-    /// Latest non-empty assistant message — the task's "result" line.
-    nonisolated static func lastAssistantText(_ messages: [ChatMessage]) -> String? {
+    /// Latest non-empty assistant message, in FULL — the task's actual result.
+    /// Used where the whole answer matters (e.g. relaying to Telegram, which
+    /// chunks long replies itself). The `prefix(280)` cap in `lastAssistantText`
+    /// is purely for the one-line timeline row, so never reuse it here.
+    nonisolated static func fullLastAssistantText(_ messages: [ChatMessage]) -> String? {
         for msg in messages.reversed() where msg.role == .assistant {
             let trimmed = msg.content.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !trimmed.isEmpty { return String(trimmed.prefix(280)) }
+            if !trimmed.isEmpty { return trimmed }
         }
         return nil
+    }
+
+    /// Latest non-empty assistant message, capped — the task's "result" line in the
+    /// timeline. For the full text (relaying, export) use `fullLastAssistantText`.
+    nonisolated static func lastAssistantText(_ messages: [ChatMessage]) -> String? {
+        fullLastAssistantText(messages).map { String($0.prefix(280)) }
     }
 
     /// Make sure the server is running with the right model before a run:

@@ -221,6 +221,14 @@ struct MLXCoreApp: App {
                     NSWorkspace.shared.open(URL(fileURLWithPath: path))
                 }
 
+                Button("Open Skills Folder") {
+                    // Accessing the shared manager seeds the example skill on
+                    // first run; the create is a no-op if it already exists.
+                    let path = AgentPrompt.skillManager.skillsDirectory
+                    try? FileManager.default.createDirectory(atPath: path, withIntermediateDirectories: true)
+                    NSWorkspace.shared.open(URL(fileURLWithPath: path))
+                }
+
                 Button("Open MLX Serve Folder") {
                     let path = NSString(string: "~/.mlx-serve").expandingTildeInPath
                     NSWorkspace.shared.open(URL(fileURLWithPath: path))

@@ -39,6 +39,20 @@ final class MultimodalContentTests: XCTestCase {
         XCTAssertTrue(url!.hasPrefix("data:image/jpeg;base64,"))
     }
 
+    func testServerPreprocessSendsRawJpegEvenWhenPreprocessorAvailable() {
+        // Qwen3-VL: the Gemma-square `x-mlx-pixels` format doesn't apply; the app
+        // must send the raw image so the server runs Qwen smart_resize + patchify,
+        // even though a (Gemma) preprocessor closure would have succeeded.
+        let img = ChatImage(data: Data([0xFF, 0xD8, 0xFF]))
+        let out = MultimodalContent.build(text: "what is this", images: [img], audio: [],
+                                          serverPreprocess: true,
+                                          preprocessImage: { _ in Data([1, 2, 3, 4]) })
+        XCTAssertEqual(out.count, 2)
+        let url = (out[0]["image_url"] as? [String: Any])?["url"] as? String
+        XCTAssertEqual(url, img.base64URL)
+        XCTAssertTrue(url!.hasPrefix("data:image/jpeg;base64,"))
+    }
+
     func testAudioEmitsInputAudioBlockWithRawPcm() {
         let pcm = Data([0, 0, 0, 0, 0, 0, 0, 0]) // 2 float32 samples
         let clip = ChatAudio(name: "voice.wav", pcm: pcm)

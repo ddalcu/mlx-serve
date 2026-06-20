@@ -18,9 +18,24 @@ pub const ToolCall = struct {
 
 /// Raw image pixel data for vision encoder (float32, CHW format).
 pub const ImageData = struct {
-    pixels: []const u8, // Raw float32 bytes [3 * H * W * 4]
+    pixels: []const u8, // Gemma: CHW float32 [3*H*W*4]. Qwen: merge-order patches [N*1536*4].
     width: u32,
     height: u32,
+    // Qwen3-VL only: full patch grid (h=resized_H/patch, w=resized_W/patch). 0 ⇒
+    // Gemma CHW layout. When >0, `pixels` holds the processor's merge-order
+    // pixel_values and the encoder is QwenVision (see src/qwen_vision.zig).
+    grid_h: u32 = 0,
+    grid_w: u32 = 0,
+};
+
+/// Per-request image preprocessing selector, derived from the loaded model's
+/// config. Threaded into `parseImageUrlContent`/`decodeImageToPixels` so decode
+/// stays race-safe (no global state) under `--max-concurrent ≥ 2`.
+pub const VisionPreproc = struct {
+    qwen: bool = false,
+    patch: u32 = 16,
+    tps: u32 = 2,
+    merge: u32 = 2,
 };
 
 /// Raw mono 16 kHz audio samples for the Gemma 4 12B unified audio embedder.
@@ -1456,6 +1471,31 @@ pub fn parseToolCalls(allocator: std.mem.Allocator, text: []const u8) !?[]Parsed
                     continue;
                 }
             }
+            // Truncated Hermes/XML tool call: the model emitted
+            // `<tool_call><function=NAME><parameter=KEY>…` (Hermes function-tag)
+            // or the XML-element `<tool_name>NAME</tool_name>…` shape and ran
+            // out of tokens before ANY closing tag — so there's no balanced
+            // JSON to snap. The OPENING tags still carry the tool NAME; recover
+            // that (parseHermesToolCall breaks out of its parameter loop on a
+            // missing `</parameter>`, yielding name + `{}` args) so the call is
+            // recognized as a truncated writeFile instead of being DROPPED and
+            // leaked into visible content (live JFK-novel capture, 2026-06-20:
+            // a 19k-char writeFile cut off mid-content was silently lost and
+            // the app fired the wrong "malformed tag" ghost nudge). Recovering
+            // the name is enough for the client to fire the right chunk/append
+            // nudge; we do NOT salvage the partial content (a half-written file
+            // is worse than a re-issued chunked write). The text is truncated
+            // to its end here, so advance past it to terminate the scan.
+            if (parseHermesToolCall(allocator, effective_text[content_start..])) |tc| {
+                try calls.append(allocator, tc);
+                search_pos = effective_text.len;
+                continue;
+            }
+            if (parseXmlElementToolCall(allocator, effective_text[content_start..])) |tc| {
+                try calls.append(allocator, tc);
+                search_pos = effective_text.len;
+                continue;
+            }
             break;
         }
         const content = std.mem.trim(u8, effective_text[content_start .. content_start + close_rel.?], " \t\n\r");
@@ -2144,6 +2184,248 @@ fn appendJsonToolCallArray(
     pending.clearRetainingCapacity();
 }
 
+/// Lenient recovery for tool-call argument JSON that small models mangle when
+/// emitting large string values (file contents). Two failure modes, both of
+/// which make strict std.json reject the WHOLE blob so the call would be dropped
+/// and leak as visible text:
+///   • raw control bytes (literal newlines/tabs) inside a string instead of
+///     `\n`/`\t` — the dominant big-file failure;
+///   • unescaped inner double-quotes (`<meta charset="UTF-8">`) and invalid
+///     backslash escapes (Windows paths, regex) inside a string.
+/// Re-serializes a CLEAN object by walking the input with a position-aware
+/// tolerant parser (key vs value context): control bytes are re-escaped, lone/
+/// invalid backslashes are escaped, and a `"` closes a string only at a
+/// structural delimiter (`:` after a key; `,`/`}`/`]`/end after a value) — any
+/// other `"` is an inner content quote and gets escaped. The CALLER strict-parses
+/// the result, so a mis-recovery that yields invalid JSON is discarded; the only
+/// residual risk is a value string closed early on pathological content (a
+/// literal `"}` / `",` byte-sequence inside the file), which still beats dropping
+/// the call. Does NOT tolerate truncation (no auto-close of open containers) —
+/// that stays with completeUnbalancedJsonObject. Returns an allocator-owned
+/// normalized JSON string, or null when no well-formed leading object recovers.
+fn looseRepairToolCallJson(allocator: std.mem.Allocator, text: []const u8) ?[]const u8 {
+    const trimmed = std.mem.trim(u8, text, " \t\r\n");
+    const obj_start = std.mem.indexOfScalar(u8, trimmed, '{') orelse return null;
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    _ = looseEmitObject(allocator, &out, trimmed, obj_start, 0) catch {
+        out.deinit(allocator);
+        return null;
+    };
+    return out.toOwnedSlice(allocator) catch null;
+}
+
+const LooseStringCtx = enum { key, object_value, array_value };
+const LooseError = error{ Malformed, OutOfMemory };
+const loose_max_depth = 32;
+
+fn looseSkipWs(body: []const u8, start: usize) usize {
+    var i = start;
+    while (i < body.len) : (i += 1) {
+        switch (body[i]) {
+            ' ', '\t', '\n', '\r' => {},
+            else => break,
+        }
+    }
+    return i;
+}
+
+fn looseSkipWsCommas(body: []const u8, start: usize) usize {
+    var i = start;
+    while (i < body.len) : (i += 1) {
+        switch (body[i]) {
+            ' ', '\t', '\n', '\r', ',' => {},
+            else => break,
+        }
+    }
+    return i;
+}
+
+fn looseIsHex4(s: []const u8) bool {
+    if (s.len != 4) return false;
+    for (s) |c| {
+        const ok = (c >= '0' and c <= '9') or (c >= 'a' and c <= 'f') or (c >= 'A' and c <= 'F');
+        if (!ok) return false;
+    }
+    return true;
+}
+
+fn looseEmitObject(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    body: []const u8,
+    start: usize,
+    depth: usize,
+) LooseError!usize {
+    if (depth > loose_max_depth) return error.Malformed;
+    var i = looseSkipWs(body, start);
+    if (i >= body.len or body[i] != '{') return error.Malformed;
+    i += 1;
+    try out.append(allocator, '{');
+    var first = true;
+    while (true) {
+        i = looseSkipWsCommas(body, i);
+        if (i >= body.len) return error.Malformed; // unterminated (not truncation-tolerant)
+        if (body[i] == '}') {
+            try out.append(allocator, '}');
+            return i + 1;
+        }
+        if (body[i] != '"') return error.Malformed; // key must be a string
+        if (!first) try out.append(allocator, ',');
+        first = false;
+        i = try looseEmitString(allocator, out, body, i, .key);
+        i = looseSkipWs(body, i);
+        if (i >= body.len or body[i] != ':') return error.Malformed;
+        i += 1;
+        try out.append(allocator, ':');
+        i = try looseEmitValue(allocator, out, body, i, depth, .object_value);
+    }
+}
+
+fn looseEmitArray(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    body: []const u8,
+    start: usize,
+    depth: usize,
+) LooseError!usize {
+    if (depth > loose_max_depth) return error.Malformed;
+    var i = looseSkipWs(body, start);
+    if (i >= body.len or body[i] != '[') return error.Malformed;
+    i += 1;
+    try out.append(allocator, '[');
+    var first = true;
+    while (true) {
+        i = looseSkipWsCommas(body, i);
+        if (i >= body.len) return error.Malformed;
+        if (body[i] == ']') {
+            try out.append(allocator, ']');
+            return i + 1;
+        }
+        if (!first) try out.append(allocator, ',');
+        first = false;
+        i = try looseEmitValue(allocator, out, body, i, depth, .array_value);
+    }
+}
+
+fn looseEmitValue(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    body: []const u8,
+    start: usize,
+    depth: usize,
+    str_ctx: LooseStringCtx,
+) LooseError!usize {
+    const i = looseSkipWs(body, start);
+    if (i >= body.len) return error.Malformed;
+    return switch (body[i]) {
+        '"' => try looseEmitString(allocator, out, body, i, str_ctx),
+        '{' => try looseEmitObject(allocator, out, body, i, depth + 1),
+        '[' => try looseEmitArray(allocator, out, body, i, depth + 1),
+        else => try looseEmitScalar(allocator, out, body, i),
+    };
+}
+
+fn looseEmitScalar(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    body: []const u8,
+    start: usize,
+) LooseError!usize {
+    var i = start;
+    while (i < body.len) : (i += 1) {
+        switch (body[i]) {
+            ',', '}', ']', ' ', '\t', '\n', '\r' => break,
+            else => try out.append(allocator, body[i]),
+        }
+    }
+    if (i == start) return error.Malformed;
+    return i; // strict re-parse validates the token was a real number/bool/null
+}
+
+fn looseEmitString(
+    allocator: std.mem.Allocator,
+    out: *std.ArrayList(u8),
+    body: []const u8,
+    start: usize,
+    ctx: LooseStringCtx,
+) LooseError!usize {
+    // body[start] == '"'
+    try out.append(allocator, '"');
+    var i = start + 1;
+    while (i < body.len) {
+        const c = body[i];
+        if (c == '\\') {
+            if (i + 1 >= body.len) {
+                try out.appendSlice(allocator, "\\\\"); // trailing backslash → literal
+                i += 1;
+                continue;
+            }
+            const n = body[i + 1];
+            switch (n) {
+                '"', '\\', '/', 'b', 'f', 'n', 'r', 't' => {
+                    try out.append(allocator, '\\');
+                    try out.append(allocator, n);
+                    i += 2;
+                },
+                'u' => {
+                    if (i + 6 <= body.len and looseIsHex4(body[i + 2 .. i + 6])) {
+                        try out.appendSlice(allocator, body[i .. i + 6]);
+                        i += 6;
+                    } else {
+                        try out.appendSlice(allocator, "\\\\"); // invalid \u → literal backslash
+                        i += 1;
+                    }
+                },
+                else => {
+                    try out.appendSlice(allocator, "\\\\"); // invalid escape → literal backslash
+                    i += 1;
+                },
+            }
+            continue;
+        }
+        if (c == '"') {
+            const j = looseSkipWs(body, i + 1);
+            const is_close = switch (ctx) {
+                .key => j < body.len and body[j] == ':',
+                .object_value => j >= body.len or body[j] == ',' or body[j] == '}',
+                .array_value => j >= body.len or body[j] == ',' or body[j] == ']',
+            };
+            if (is_close) {
+                try out.append(allocator, '"');
+                return i + 1;
+            }
+            try out.appendSlice(allocator, "\\\""); // inner content quote → escape
+            i += 1;
+            continue;
+        }
+        if (c < 0x20) {
+            switch (c) {
+                '\n' => try out.appendSlice(allocator, "\\n"),
+                '\t' => try out.appendSlice(allocator, "\\t"),
+                '\r' => try out.appendSlice(allocator, "\\r"),
+                0x08 => try out.appendSlice(allocator, "\\b"),
+                0x0c => try out.appendSlice(allocator, "\\f"),
+                else => {
+                    var buf: [6]u8 = undefined;
+                    const esc = std.fmt.bufPrint(&buf, "\\u{x:0>4}", .{c}) catch unreachable;
+                    try out.appendSlice(allocator, esc);
+                },
+            }
+            i += 1;
+            continue;
+        }
+        try out.append(allocator, c);
+        i += 1;
+    }
+    // Ran off the end with no structural close — unterminated. The enclosing
+    // container won't find its close either → looseEmitObject returns Malformed
+    // and the whole recovery is discarded (truncation handled elsewhere). Emit
+    // a closing quote so the discarded buffer stays well-formed.
+    try out.append(allocator, '"');
+    return i;
+}
+
 fn tryParseJsonToolCall(allocator: std.mem.Allocator, text: []const u8) ?ParsedToolCall {
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, text, .{}) catch blk: {
         // Strict parse failed. Try a chain of repairs for known shapes:
@@ -2155,6 +2437,18 @@ fn tryParseJsonToolCall(allocator: std.mem.Allocator, text: []const u8) ?ParsedT
         if (repairBrokenToolCallJson(allocator, text)) |repaired| {
             defer allocator.free(repaired);
             if (std.json.parseFromSlice(std.json.Value, allocator, repaired, .{})) |reparsed| {
+                break :blk reparsed;
+            } else |_| {}
+        }
+        //   4. Mangled big-file content: raw control bytes (literal newlines/
+        //      tabs) and unescaped inner quotes inside a string value — what
+        //      small models emit when writing a large file in one shot. The
+        //      re-escaped copy is re-validated by the strict parse below, so a
+        //      mis-recovery that yields invalid JSON is silently discarded.
+        if (looseRepairToolCallJson(allocator, text)) |repaired| {
+            defer allocator.free(repaired);
+            if (std.json.parseFromSlice(std.json.Value, allocator, repaired, .{})) |reparsed| {
+                log.info("  [tool-parse] loose-repair recovered mangled tool-call JSON (raw control bytes / unescaped quotes)\n", .{});
                 break :blk reparsed;
             } else |_| {}
         }
@@ -2338,6 +2632,25 @@ fn parseGemma4ToolCall(allocator: std.mem.Allocator, content: []const u8) ?Parse
             };
         }
     } else |_| {}
+
+    // Strict JSON failed — but the model may have emitted standard JSON with
+    // mangled escaping (raw newlines / unescaped quotes in big content) rather
+    // than the custom <|"|> format. Recover that BEFORE the custom-format
+    // converter, which would garble standard JSON. looseRepair returns null for
+    // the bare-key `{key:<|"|>v<|"|>}` form, so the custom path still runs.
+    if (looseRepairToolCallJson(allocator, args_str)) |repaired| {
+        var keep = false;
+        defer if (!keep) allocator.free(repaired);
+        if (std.json.parseFromSlice(std.json.Value, allocator, repaired, .{})) |reparsed| {
+            defer reparsed.deinit();
+            if (reparsed.value == .object) {
+                const name_owned = allocator.dupe(u8, name) catch return null;
+                keep = true;
+                log.info("  [tool-parse] loose-repair recovered mangled Gemma 4 tool-call JSON\n", .{});
+                return .{ .name = name_owned, .arguments = repaired };
+            }
+        } else |_| {}
+    }
 
     // Convert Gemma 4 custom format to JSON:
     // {key:<|"|>value<|"|>,key2:<|"|>value2<|"|>} → {"key":"value","key2":"value2"}
@@ -2533,16 +2846,56 @@ fn convertGemma4Value(
     if (body[pos] == '{') return convertGemma4Object(allocator, result, body, pos, depth + 1);
     if (body[pos] == '[') return convertGemma4Array(allocator, result, body, pos, depth + 1);
 
-    // Bare value (number, boolean, null, or unquoted string) — terminates at
-    // the enclosing separator/closer.
-    const val_end = std.mem.indexOfAny(u8, body[pos..], ",}]") orelse (body.len - pos);
-    const value = std.mem.trim(u8, body[pos .. pos + val_end], " \t\n\r");
-    if (isJsonLiteral(value)) {
-        result.appendSlice(allocator, value) catch return null;
-    } else {
-        appendJsonString(allocator, result, value) catch return null;
+    // Bare value — a JSON literal (number/bool/null) terminates at the
+    // enclosing separator and is emitted verbatim.
+    const first_sep = std.mem.indexOfAny(u8, body[pos..], ",}]") orelse (body.len - pos);
+    const head = std.mem.trim(u8, body[pos .. pos + first_sep], " \t\n\r");
+    if (isJsonLiteral(head)) {
+        result.appendSlice(allocator, head) catch return null;
+        return pos + first_sep;
     }
-    return pos + val_end;
+
+    // Unquoted STRING. The bare scan above stops at the first `,`/`}`/`]`, which
+    // truncates rich content (HTML/markdown) that legitimately contains those
+    // bytes. Observed live on gemma-4-e4b-it writing a full page: it dropped the
+    // OPENING <|"|> on `content` but kept the CLOSING one
+    // (`content:<!DOCTYPE…>…</html><|"|>,path:…`), so content got cut at the
+    // viewport meta's comma and the rest became bogus keys → invalid args. Only
+    // rich content (multi-line or markup) gets the wider scan; a plain short
+    // bare token keeps the first-separator behavior so it can't swallow a
+    // sibling field (e.g. `command:ls -la`).
+    const rich = std.mem.indexOfScalar(u8, head, '\n') != null or
+        std.mem.indexOfScalar(u8, head, '<') != null;
+    if (rich) {
+        // Prefer a CLOSING <|"|> as the boundary (dropped-opener case). Confirm
+        // it's a closer — the byte after it (past whitespace) must be a
+        // separator/closer — so a LATER field's OPENING delimiter isn't grabbed.
+        if (std.mem.indexOf(u8, body[pos..], gemma4_str_delim)) |close_rel| {
+            const after = gemma4SkipWs(body, pos + close_rel + gemma4_str_delim.len);
+            const is_closer = after >= body.len or body[after] == ',' or body[after] == '}' or body[after] == ']';
+            if (is_closer) {
+                const value = std.mem.trim(u8, body[pos .. pos + close_rel], " \t\n\r");
+                appendJsonString(allocator, result, value) catch return null;
+                return pos + close_rel + gemma4_str_delim.len;
+            }
+        }
+        // No usable closing delimiter (both dropped). At the TOP level the value
+        // runs to the object's closing `}` (the last one); nested values keep
+        // the narrow scan since the outer `}` isn't theirs.
+        if (depth == 0) {
+            if (std.mem.lastIndexOfScalar(u8, body, '}')) |last_brace| {
+                if (last_brace > pos) {
+                    const value = std.mem.trim(u8, body[pos..last_brace], " \t\n\r");
+                    appendJsonString(allocator, result, value) catch return null;
+                    return last_brace;
+                }
+            }
+        }
+    }
+
+    // Plain short bare string — terminate at the first separator (unchanged).
+    appendJsonString(allocator, result, head) catch return null;
+    return pos + first_sep;
 }
 
 fn parseHermesToolCall(allocator: std.mem.Allocator, block: []const u8) ?ParsedToolCall {
@@ -2920,6 +3273,200 @@ test "parseToolCalls repairs Qwen MoE missing-opening-quote on arguments key" {
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
     defer parsed.deinit();
     try testing.expectEqualStrings("mkdir -p src/app", parsed.value.object.get("command").?.string);
+}
+
+test "parseToolCalls recovers writeFile content with RAW newlines (small-model big-file escaping)" {
+    const allocator = testing.allocator;
+    // Small models writing a big file often emit literal newlines inside the
+    // JSON `content` string instead of `\n` — strict JSON rejects raw control
+    // bytes, so pre-fix the whole call was dropped and the file leaked as text.
+    const text = "<tool_call>{\"name\":\"writeFile\",\"arguments\":{\"path\":\"a.js\",\"content\":\"const x = 1;\nconst y = 2;\n\"}}</tool_call>";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("writeFile", calls[0].name);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("a.js", parsed.value.object.get("path").?.string);
+    try testing.expectEqualStrings("const x = 1;\nconst y = 2;\n", parsed.value.object.get("content").?.string);
+}
+
+test "parseToolCalls recovers writeFile content with RAW tab" {
+    const allocator = testing.allocator;
+    const text = "<tool_call>{\"name\":\"writeFile\",\"arguments\":{\"path\":\"m.py\",\"content\":\"def f():\n\treturn 1\"}}</tool_call>";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("def f():\n\treturn 1", parsed.value.object.get("content").?.string);
+}
+
+test "parseToolCalls recovers writeFile content with UNESCAPED inner quotes (HTML)" {
+    const allocator = testing.allocator;
+    // HTML/code with attribute quotes — `<meta charset="UTF-8">` — is the other
+    // half of the escaping class: the model forgets to backslash the inner `"`.
+    const text = "<tool_call>{\"name\":\"writeFile\",\"arguments\":{\"path\":\"i.html\",\"content\":\"<meta charset=\"UTF-8\"><a href=\"x\">go</a>\"}}</tool_call>";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("i.html", parsed.value.object.get("path").?.string);
+    try testing.expectEqualStrings("<meta charset=\"UTF-8\"><a href=\"x\">go</a>", parsed.value.object.get("content").?.string);
+}
+
+test "parseToolCalls recovers writeFile content with BOTH raw newlines and unescaped quotes" {
+    const allocator = testing.allocator;
+    const text = "<tool_call>{\"name\":\"writeFile\",\"arguments\":{\"path\":\"p.html\",\"content\":\"<!DOCTYPE html>\n<meta charset=\"UTF-8\">\n<title>Hi</title>\"}}</tool_call>";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("<!DOCTYPE html>\n<meta charset=\"UTF-8\">\n<title>Hi</title>", parsed.value.object.get("content").?.string);
+}
+
+test "parseToolCalls recovers content with lone backslash (Windows path / regex)" {
+    const allocator = testing.allocator;
+    // `\U` and `\d` are invalid JSON escapes — strict parse rejects them.
+    const text = "<tool_call>{\"name\":\"writeFile\",\"arguments\":{\"path\":\"C:\\Users\\app.js\",\"content\":\"re.match(\\d+)\"}}</tool_call>";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("C:\\Users\\app.js", parsed.value.object.get("path").?.string);
+    try testing.expectEqualStrings("re.match(\\d+)", parsed.value.object.get("content").?.string);
+}
+
+test "parseToolCalls recovers Gemma 4 call:NAME{json} with raw newline content" {
+    const allocator = testing.allocator;
+    // Gemma 4's JSON-first branch hits the same strict-parse wall on raw bytes.
+    const text = "<|tool_call>call:writeFile{\"path\":\"g.txt\",\"content\":\"line1\nline2\"}<tool_call|>";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("writeFile", calls[0].name);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("line1\nline2", parsed.value.object.get("content").?.string);
+}
+
+test "parseToolCalls leaves valid escaped content untouched (no regression)" {
+    const allocator = testing.allocator;
+    // Already-correct JSON must pass straight through — the recovery path only
+    // runs after strict parse fails, so this never touches looseRepair.
+    const text = "<tool_call>{\"name\":\"writeFile\",\"arguments\":{\"path\":\"ok.js\",\"content\":\"a\\nb\\t\\\"q\\\"\"}}</tool_call>";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("a\nb\t\"q\"", parsed.value.object.get("content").?.string);
+}
+
+test "parseToolCalls recovers truncated <function=writeFile> (max_tokens mid-content)" {
+    const allocator = testing.allocator;
+    // Live JFK-novel capture (2026-06-20): a Hermes-format writeFile dumped a
+    // 19k-char novel into one <parameter=content> and hit the token cap before
+    // any closing tag. Pre-fix the close_rel==null branch only tried JSON, so
+    // the whole call was DROPPED and leaked as visible text. We must recover at
+    // least the tool NAME (args may be empty — content is truncated, not
+    // salvaged) so the client fires the chunk/append nudge instead of "use JSON".
+    const text = "<tool_call>\n<function=writeFile>\n<parameter=content>\n# THE LION OF MASSACHUSETTS\n\nChapter 1. The young senator rose before dawn";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("writeFile", calls[0].name);
+    // Args are valid JSON (empty object) — the parameter never closed.
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expect(parsed.value == .object);
+}
+
+test "parseToolCalls recovers EOS-before-close-tag <function=> with full args" {
+    const allocator = testing.allocator;
+    // Bonus from the same fix: a Hermes call that closed </parameter></function>
+    // but hit EOS before </tool_call> now recovers WITH its args, not just the
+    // name (parseHermesToolCall reads the closed parameter).
+    const text = "<tool_call>\n<function=shell>\n<parameter=command>ls -la</parameter>\n</function>";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("shell", calls[0].name);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("ls -la", parsed.value.object.get("command").?.string);
+}
+
+test "looseRepair does not fabricate a tool call from non-JSON prose" {
+    const allocator = testing.allocator;
+    // A stray `{` in prose must not become a tool call via the recovery path.
+    const text = "Here is the plan {step one, step two} and we proceed.";
+    const calls = try parseToolCalls(allocator, text);
+    if (calls) |cs| {
+        for (cs) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(cs);
+    }
+    try testing.expect(calls == null);
 }
 
 test "endsWithPartialThinkOpen holds back partial opener tails (pi GGUF leak repro)" {
@@ -3642,6 +4189,53 @@ test "parseToolCalls Gemma 4 quoted keys with bare values" {
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
     defer parsed.deinit();
     try testing.expectEqualStrings("ls -la", parsed.value.object.get("command").?.string);
+}
+
+test "parseToolCalls Gemma 4 dropped OPENING delimiter on big content (E4B live)" {
+    const allocator = testing.allocator;
+    // Verbatim shape captured from gemma-4-e4b-it-4bit writing a full HTML page
+    // (test_tool_matrix_small.sh): the model dropped the OPENING <|"|> on
+    // `content` but kept the CLOSING one, so the bare-value scan cut content at
+    // the FIRST comma (inside `<meta ... content="width=device-width, ...">`)
+    // and shredded the rest of the markup into bogus keys → invalid args. The
+    // closing <|"|> (followed by `,path`) is the real boundary.
+    const text = "<|tool_call>call:write_file{content:<!DOCTYPE html>\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\n<style>body{margin:0}</style>\n</html><|\"|>,path:<|\"|>mars.html<|\"|>}<tool_call|>";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("write_file", calls[0].name);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("mars.html", parsed.value.object.get("path").?.string);
+    try testing.expectEqualStrings(
+        "<!DOCTYPE html>\n<meta name=\"viewport\" content=\"width=device-width, initial-scale=1.0\">\n<style>body{margin:0}</style>\n</html>",
+        parsed.value.object.get("content").?.string,
+    );
+}
+
+test "parseToolCalls Gemma 4 dropped BOTH delimiters on single content field" {
+    const allocator = testing.allocator;
+    // Both delimiters dropped, content is the only/last field → run to the
+    // object's closing brace.
+    const text = "<|tool_call>call:write_file{content:<h1>Hi</h1>\n<p>a, b, c</p>}<tool_call|>";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("<h1>Hi</h1>\n<p>a, b, c</p>", parsed.value.object.get("content").?.string);
 }
 
 test "convertGemma4ArgsToJson nested braces in value" {

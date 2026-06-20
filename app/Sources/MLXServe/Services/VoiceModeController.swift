@@ -48,11 +48,12 @@ final class VoiceModeController: ObservableObject {
     /// card in the panel/orb and the turn waits until the user allows or denies.
     @Published var autoApproveTools = true
 
-    /// Voice-scoped agent / thinking toggles — independent of the chat window's
-    /// toolbar so talking and typing can run in different modes. MCP reuses the
-    /// app-level `appState.mcpMode`.
+    /// Voice-scoped Think / Agent / MCP toggles. Seeded from the chat session the
+    /// user launches voice mode in (`ChatView.startVoiceMode`), then independent of
+    /// the chat window's toolbar so talking and typing can run in different modes.
     @Published var agentMode = false
     @Published var enableThinking = false
+    @Published var mcpMode = false
 
     /// Wake-word gate. When true (the default), the assistant ignores everything
     /// it hears until an utterance opens with the wake phrase ("Hey Loki"); the
@@ -100,7 +101,7 @@ final class VoiceModeController: ObservableObject {
     /// Resolves the chat session a new turn runs against (creating one if needed)
     /// plus the app-level MCP flag and working directory for the turn config.
     /// Wired by `bind(appState:)`; set directly in tests.
-    var turnContext: (() -> (sessionId: UUID, mcpMode: Bool, workingDirectory: String?))?
+    var turnContext: (() -> (sessionId: UUID, workingDirectory: String?))?
 
     private let recognizer: any SpeechRecognizing
     private let synthesizer: any SpeechSynthesizing
@@ -150,10 +151,10 @@ final class VoiceModeController: ObservableObject {
         isBound = true
         runner = appState.chatEngine
         turnContext = { [weak appState] in
-            guard let appState else { return (UUID(), false, nil) }
+            guard let appState else { return (UUID(), nil) }
             let sid = appState.activeChatId ?? appState.newChatSession()
             let wd = appState.chatSessions.first { $0.id == sid }?.workingDirectory
-            return (sid, appState.mcpMode, wd)
+            return (sid, wd)
         }
 
         // Feed the active session's trailing assistant message into the
@@ -350,12 +351,12 @@ final class VoiceModeController: ObservableObject {
 
     /// Submit the finalized user transcript to the shared engine. Always uses a
     /// `voiceStyle` config so spoken answers stay short and Markdown-free; agent
-    /// and thinking come from the voice-scoped toggles, MCP from the app.
+    /// Agent, thinking, and MCP all come from the voice-scoped toggles.
     private func submitTurn(_ text: String) {
         guard let runner, let ctx = turnContext?() else { return }
         let config = ChatTurnEngine.TurnConfig(
             agentMode: agentMode,
-            mcpMode: ctx.mcpMode,
+            mcpMode: mcpMode,
             enableThinking: enableThinking,
             voiceStyle: true,
             workingDirectory: ctx.workingDirectory

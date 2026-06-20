@@ -264,6 +264,40 @@ enum AgentEngine {
     // MARK: - Tool Validation
 
     /// Check which required params are missing for a tool call.
+    /// Recover a file body a model crammed into the `append` value. Gemma 4 12B
+    /// (live, 2026-06-20) emits `{"append":"true,\n<entire file body>","path":…}`
+    /// with NO `content` key — merging the flag and the body into one string —
+    /// which left `content` "missing" and looped the agent on a bogus error. When
+    /// `content` is absent/blank AND `append` is a boolean keyword (`true`/`false`)
+    /// FOLLOWED by a separator and more text, split it: the leading boolean is the
+    /// flag, the remainder (past a comma/whitespace/newline) becomes `content`. A
+    /// clean boolean (`"true"` with nothing after it) is left untouched so a
+    /// genuinely missing content still surfaces as an error rather than a fabricated
+    /// empty file. Pure → unit-tested.
+    nonisolated static func normalizeWriteFileArgs(_ arguments: [String: String]) -> [String: String] {
+        let contentBlank = (arguments["content"] ?? "").trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        guard contentBlank, let appendVal = arguments["append"] else { return arguments }
+        let lower = appendVal.lowercased()
+        let afterFlag: Substring
+        let flag: String
+        if lower.hasPrefix("true") {
+            flag = "true"; afterFlag = appendVal.dropFirst("true".count)
+        } else if lower.hasPrefix("false") {
+            flag = "false"; afterFlag = appendVal.dropFirst("false".count)
+        } else {
+            return arguments
+        }
+        // The char right after the boolean must be a separator (or end) — else
+        // this is a real word like "truely", not a flag-plus-body jam.
+        if let first = afterFlag.first, !",\n\r\t ".contains(first) { return arguments }
+        let body = String(afterFlag.drop(while: { ",\n\r\t ".contains($0) }))
+        guard !body.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else { return arguments }
+        var out = arguments
+        out["append"] = flag
+        out["content"] = body
+        return out
+    }
+
     static func missingRequiredParams(for toolName: String, arguments: [String: String]) -> [String] {
         for def in AgentPrompt.toolDefinitions {
             guard let fn = def["function"] as? [String: Any],
@@ -623,6 +657,11 @@ enum AgentEngine {
             effectiveTool = tool
         }
 
+        // For writeFile, recover a body the model crammed into `append` (Gemma 4
+        // 12B emits `{"append":"true,\n<body>",…}` with no content key). No-op
+        // when the call is already well-formed or it's not writeFile.
+        let args = (effectiveTool == .writeFile) ? normalizeWriteFileArgs(tc.arguments) : tc.arguments
+
         if effectiveTool == .cwd {
             // Change working directory for subsequent calls
             guard let path = tc.arguments["path"] else {
@@ -646,10 +685,15 @@ enum AgentEngine {
         }
 
         // Validate required parameters
-        let missing = missingRequiredParams(for: name, arguments: tc.arguments)
+        let missing = missingRequiredParams(for: name, arguments: args)
         if !missing.isEmpty {
-            if (name == "writeFile" || name == "editFile") && missing.contains("content") && tc.arguments["path"] != nil {
-                return "Error: \(name) content was truncated — your output got cut off before the content was complete, so the file was NOT written. Write it in smaller chunks: writeFile the first part, then editFile to append the rest (each call must be short enough to finish in one response). A shell heredoc has the same limit, so don't switch to that."
+            if (name == "writeFile" || name == "editFile") && missing.contains("content") {
+                // Honest diagnosis: content is absent, NOT necessarily truncated.
+                // Real max_tokens truncation is intercepted upstream (ChatTurnEngine)
+                // before execution, so reaching here means the body was misplaced or
+                // omitted — most often crammed into `append`. Steer the model to the
+                // right field instead of falsely claiming its output was cut off.
+                return "Error: \(name) was called with no text in the `content` parameter, so nothing was written. Put the full file body in `content` — `append` is only a \"true\"/\"false\" flag and must never hold the text. For a long file, write the first part, then call again with `append`:\"true\" for each remaining chunk. Example: {\"path\": \"jfk.txt\", \"content\": \"<the text>\", \"append\": \"true\"}"
             }
             return "Error: \(name) missing required params: \(missing.joined(separator: ", ")). Example: \(toolExample(for: name))"
         }
@@ -699,13 +743,13 @@ enum AgentEngine {
             return "Error: Unknown tool '\(name)'"
         }
         do {
-            let output = try await handler.execute(parameters: tc.arguments, workingDirectory: workingDirectory)
-            if effectiveTool == .shell, let cmd = tc.arguments["command"] {
+            let output = try await handler.execute(parameters: args, workingDirectory: workingDirectory)
+            if effectiveTool == .shell, let cmd = args["command"] {
                 agentMemory.recordCommand(cmd)
             }
             return output
         } catch {
-            let argsDesc = tc.arguments.isEmpty ? "none" : tc.arguments.map { "\($0.key)=\($0.value.prefix(30))" }.joined(separator: ", ")
+            let argsDesc = args.isEmpty ? "none" : args.map { "\($0.key)=\($0.value.prefix(30))" }.joined(separator: ", ")
             return "Error: \(error.localizedDescription). You sent args: [\(argsDesc)]. Example: \(toolExample(for: name))"
         }
     }

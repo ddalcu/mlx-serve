@@ -151,6 +151,7 @@ class APIClient {
             supportsEmbeddings: supportsEmbeddings,
             drafterLoaded: meta["drafter_loaded"] as? Bool ?? false,
             drafterPath: meta["drafter_path"] as? String,
+            mtpLoaded: meta["mtp_loaded"] as? Bool ?? false,
             loaded: topLoaded,
             state: topState,
             bytesResident: topBytesResident,
@@ -381,12 +382,14 @@ class APIClient {
             var parts = [
                 "\"model\":\"\(escapedModelId)\"",
                 "\"messages\":\(messagesStr)",
-                "\"max_tokens\":\(maxTokens)",
                 "\"temperature\":\(temperature)",
                 "\"top_p\":\(effectiveTopP)",
                 "\"stream\":true",
                 "\"stream_options\":{\"include_usage\":true}",
             ]
+            // maxTokens <= 0 means "Auto": omit the field so the server pegs
+            // generation to the remaining context window.
+            if maxTokens > 0 { parts.append("\"max_tokens\":\(maxTokens)") }
             if enableThinking { parts.append("\"enable_thinking\":true") }
             if let v = defaults.topK { parts.append("\"top_k\":\(v)") }
             if let v = defaults.repeatPenalty { parts.append("\"repeat_penalty\":\(v)") }
@@ -400,12 +403,13 @@ class APIClient {
             var body: [String: Any] = [
                 "model": effectiveModelId,
                 "messages": messages,
-                "max_tokens": maxTokens,
                 "temperature": temperature,
                 "top_p": effectiveTopP,
                 "stream": true,
                 "stream_options": ["include_usage": true],
             ]
+            // maxTokens <= 0 means "Auto": omit so the server pegs to context.
+            if maxTokens > 0 { body["max_tokens"] = maxTokens }
             if enableThinking { body["enable_thinking"] = true }
             if let v = defaults.topK { body["top_k"] = v }
             if let v = defaults.repeatPenalty { body["repeat_penalty"] = v }

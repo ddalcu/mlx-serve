@@ -325,16 +325,46 @@ struct ReadFileHandler: ToolHandler {
 // MARK: - Write File
 
 struct WriteFileHandler: ToolHandler {
+    /// Tolerant boolean for the `append` flag. Models emit it dirty — `"true"`,
+    /// `"true,"` (gemma-4-12b adds a trailing comma), `"True"`, even a leftover
+    /// `"true,\n…"` before normalization peels the body off. Treat any value
+    /// whose first token is `true` (or `1`/`yes`) as append; an exact `== "true"`
+    /// match silently OVERWROTE the file when the model sent `"true,"`.
+    static func appendFlagIsTrue(_ raw: String?) -> Bool {
+        guard let raw else { return false }
+        let v = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if v == "true" || v == "1" || v == "yes" { return true }
+        // "true" followed immediately by a non-letter (comma/space/newline) →
+        // still append; "truely"/"truthy" (next char a letter) → not append.
+        if v.hasPrefix("true"), let after = v.dropFirst(4).first, !after.isLetter { return true }
+        return false
+    }
+
     func execute(parameters: [String: String], workingDirectory: String?) async throws -> String {
         guard let path = parameters["path"], let content = parameters["content"] else {
             throw ToolError.missingParameter("path and content")
         }
+        // append:true grows a file incrementally — the safe way to write a large
+        // file across multiple tool calls without any one call overrunning the
+        // token budget and getting truncated mid-write (see the writeFile tool
+        // description). Default is overwrite, matching prior behavior. Parsed
+        // tolerantly (see appendFlagIsTrue) — models dirty the flag value.
+        let append = Self.appendFlagIsTrue(parameters["append"])
 
         let fullPath = try resolveAndConfine(path, workingDirectory: workingDirectory)
         let dir = (fullPath as NSString).deletingLastPathComponent
         try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+
+        if append, FileManager.default.fileExists(atPath: fullPath) {
+            let handle = try FileHandle(forWritingTo: URL(fileURLWithPath: fullPath))
+            defer { try? handle.close() }
+            try handle.seekToEnd()
+            try handle.write(contentsOf: Data(content.utf8))
+            return "Appended \(content.count) characters to \(path)"
+        }
+        // Overwrite, or create the file when appending to one that doesn't exist yet.
         try content.write(toFile: fullPath, atomically: true, encoding: .utf8)
-        return "Wrote \(content.count) characters to \(path)"
+        return "Wrote \(content.count) characters to \(path)\(append ? " (new file)" : "")"
     }
 }
 

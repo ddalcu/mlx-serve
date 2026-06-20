@@ -130,7 +130,7 @@ final class VoiceModeControllerTests: XCTestCase {
         c.requireWakeWord = false
         let sid = UUID()
         c.runner = runner
-        c.turnContext = { (sid, false, nil) }
+        c.turnContext = { (sid, nil) }
         return (c, rec, syn, runner, sid)
     }
 
@@ -142,7 +142,7 @@ final class VoiceModeControllerTests: XCTestCase {
                                     followUpTimer: timer, chime: FakeWakeChime())
         c.requireWakeWord = true
         c.runner = runner
-        c.turnContext = { (UUID(), false, nil) }
+        c.turnContext = { (UUID(), nil) }
         return (c, rec, syn, runner, timer)
     }
 
@@ -153,7 +153,7 @@ final class VoiceModeControllerTests: XCTestCase {
         let c = VoiceModeController(recognizer: rec, synthesizer: syn, voices: Self.testVoices, chime: chime)
         c.requireWakeWord = true
         c.runner = runner
-        c.turnContext = { (UUID(), false, nil) }
+        c.turnContext = { (UUID(), nil) }
         return (c, rec, runner, chime)
     }
 
@@ -297,11 +297,13 @@ final class VoiceModeControllerTests: XCTestCase {
         let (c, rec, _, runner, _) = makeRunnable()
         c.agentMode = true
         c.enableThinking = true
+        c.mcpMode = true   // voice-scoped now (seeded from the launching chat session)
         _ = await c.begin()
         rec.onFinalTranscript?("do a thing")
         let config = runner.calls.first?.config
         XCTAssertEqual(config?.agentMode, true)
         XCTAssertEqual(config?.enableThinking, true)
+        XCTAssertEqual(config?.mcpMode, true, "voice MCP comes from the controller, not the app-global")
         XCTAssertEqual(config?.voiceStyle, true)
     }
 

@@ -26,6 +26,20 @@ protocol TurnRunning: AnyObject {
     func stop()
 }
 
+/// Per-session memory for the "Allow all tools this session" decision. Keyed by
+/// chat-session id so each tab remembers its own choice: the text-chat window
+/// reuses one `ChatDetailView` across `sessionId` changes, so a single `Bool`
+/// here is shared by every tab and was wiped on every switch. A `Set` keyed by
+/// id has nothing to wipe on a switch — switching away and back preserves the
+/// grant — and re-arming (Agent toggled off) clears only that one session.
+struct SessionToolAllowList {
+    private var allowed: Set<UUID> = []
+    func allowsAll(_ id: UUID) -> Bool { allowed.contains(id) }
+    mutating func allowAll(_ id: UUID) { allowed.insert(id) }
+    /// Re-prompt this session on the next tool call (leaves other tabs alone).
+    mutating func rearm(_ id: UUID) { allowed.remove(id) }
+}
+
 @MainActor
 final class ChatTurnEngine: ObservableObject, TurnRunning {
     /// Owning app state. `unowned` because the engine lives exactly as long as
@@ -40,8 +54,47 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
     private var generationTask: Task<Void, Never>?
     /// The session the in-flight turn is writing into — used by `stop()` so it
     /// clears the streaming flag on the right message even if `activeChatId`
-    /// changed underneath it.
-    private var activeTurnSessionId: UUID?
+    /// changed underneath it, and by the composer so only the owning chat shows
+    /// the Stop button. Published so the per-chat composer re-renders when the
+    /// active turn moves between sessions. Always set before `isGenerating` flips
+    /// true (the engine runs one turn at a time, so it never changes mid-turn).
+    @Published private(set) var activeTurnSessionId: UUID?
+
+    /// Live count of tokens the in-flight reply has produced — for the chat
+    /// composer's live "gen:" readout and growing context bar. Counted by tallying
+    /// streamed `.content`/`.reasoning` deltas (one per token for this server) and
+    /// PUBLISHED only at the StreamCoalescer's ~20 Hz flush cadence, never per
+    /// token — per-token @Published churn is exactly what StreamCoalescer exists to
+    /// avoid. Reset at the start of each streamed round; reconciled to the
+    /// authoritative `usage.completion_tokens` when the stream reports usage.
+    @Published private(set) var liveCompletionTokens: Int = 0
+    /// Non-published per-delta tally; promoted into `liveCompletionTokens` on flush.
+    private var liveTokenAccum: Int = 0
+
+    /// What the composer's primary button should show for a given chat. The
+    /// engine runs one turn at a time app-wide, so a chat that doesn't own the
+    /// active turn shows Send (disabled while busy), never the global Stop.
+    enum ComposerState: Equatable {
+        case idle             // free to send (subject to having content)
+        case generatingHere   // this chat owns the in-flight turn → show Stop
+        case busyElsewhere    // another chat is mid-turn → Send disabled
+    }
+
+    /// Pure decision for `ComposerState`; the instance accessor below feeds it
+    /// the live engine state. `nonisolated` because it touches no actor state —
+    /// just its arguments — so views and tests can call it freely.
+    nonisolated static func composerState(isGenerating: Bool,
+                                          activeTurnSessionId: UUID?,
+                                          for sessionId: UUID) -> ComposerState {
+        guard isGenerating else { return .idle }
+        return activeTurnSessionId == sessionId ? .generatingHere : .busyElsewhere
+    }
+
+    func composerState(for sessionId: UUID) -> ComposerState {
+        Self.composerState(isGenerating: isGenerating,
+                           activeTurnSessionId: activeTurnSessionId,
+                           for: sessionId)
+    }
 
     init(appState: AppState) {
         self.appState = appState
@@ -82,6 +135,26 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
         guard let batch else { return }
         if !batch.content.isEmpty { appState.updateLastMessage(in: sessionId, content: batch.content) }
         if !batch.reasoning.isEmpty { appState.updateLastMessage(in: sessionId, reasoning: batch.reasoning) }
+    }
+
+    /// Begin counting a fresh streamed reply (one per round). Zeroes the live
+    /// token tally so the composer's "gen:" restarts from 0.
+    private func beginLiveTokenCount() {
+        liveTokenAccum = 0
+        liveCompletionTokens = 0
+    }
+
+    /// Stream one text/reasoning delta into the session and tally it toward the
+    /// live token count. `liveCompletionTokens` advances only when the coalescer
+    /// actually flushes (≤20 Hz), so the live readout never adds per-token churn.
+    private func streamDelta(content: String = "", reasoning: String = "",
+                             coalescer: inout StreamCoalescer, to sessionId: UUID) {
+        liveTokenAccum += 1
+        if let batch = coalescer.add(content: content, reasoning: reasoning,
+                                     now: Date().timeIntervalSinceReferenceDate) {
+            applyStreamBatch(batch, to: sessionId)
+            liveCompletionTokens = liveTokenAccum
+        }
     }
 
     // MARK: - Public API (TurnRunning)
@@ -141,12 +214,13 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
         // stripped for bandwidth).
         let sessionMsgs = session(sessionId)?.messages ?? []
         let lastUserIdx = sessionMsgs.lastIndex { $0.role == .user }
+        let useServerPreprocess = wantsServerImagePreprocess
         let history: [[String: Any]] = sessionMsgs.enumerated().map { i, msg in
             if i == lastUserIdx, msg.role == .user {
                 let imgs = msg.images ?? []
                 let clips = msg.audio ?? []
                 if !imgs.isEmpty || !clips.isEmpty {
-                    return ["role": "user", "content": Self.buildMultimodalContent(text: msg.content, images: imgs, audio: clips)]
+                    return ["role": "user", "content": Self.buildMultimodalContent(text: msg.content, images: imgs, audio: clips, serverPreprocess: useServerPreprocess)]
                 }
             }
             var d: [String: Any] = ["role": msg.role.rawValue, "content": msg.content]
@@ -190,18 +264,18 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                 modelId: server.modelInfo?.name
             )
             var coalescer = StreamCoalescer()
+            beginLiveTokenCount()
             for try await event in stream {
                 try Task.checkCancellation()
                 switch event {
                 case .content(let text):
-                    applyStreamBatch(coalescer.add(content: text, now: Date().timeIntervalSinceReferenceDate),
-                                     to: sessionId)
+                    streamDelta(content: text, coalescer: &coalescer, to: sessionId)
                 case .reasoning(let text):
-                    applyStreamBatch(coalescer.add(reasoning: text, now: Date().timeIntervalSinceReferenceDate),
-                                     to: sessionId)
+                    streamDelta(reasoning: text, coalescer: &coalescer, to: sessionId)
                 case .usage(let usage):
                     applyStreamBatch(coalescer.drain(), to: sessionId)
                     appState.updateLastMessage(in: sessionId, usage: usage)
+                    liveCompletionTokens = usage.completionTokens   // reconcile to the authoritative count
                 case .toolCalls:
                     break
                 case .maxTokensReached:
@@ -321,25 +395,44 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                 appContextSize: appState.contextSize,
                 modelContextLength: server.modelInfo?.contextLength
             )
+            let useServerPreprocess = wantsServerImagePreprocess
             var history = AgentEngine.buildAgentHistory(
                 messages: session(sessionId)?.messages ?? [],
                 contextLength: contextLength,
                 maxTokens: appState.maxTokens,
-                buildMultimodalContent: Self.buildMultimodalContent
+                buildMultimodalContent: { text, images in
+                    Self.buildMultimodalContent(text: text, images: images, serverPreprocess: useServerPreprocess)
+                }
             )
             let userMsg = history.last { ($0["role"] as? String) == "user" }?["content"] as? String ?? ""
             let mcpToolsJSON = config.mcpMode ? mcpManager.toolDefinitionsJSON() : nil
             let mcpListing = config.mcpMode ? mcpManager.toolListingForPrompt() : ""
             var systemPrompt: String
+            // Volatile context that changes mid-session — kept OUT of the
+            // stable prefix and appended at the very end (see composeSystemPrompt).
+            var agentVolatileTail = ""
             if config.agentMode {
                 let skills = AgentPrompt.skillManager.matchingSkills(for: userMsg)
-                systemPrompt = AgentPrompt.systemPrompt + skills + AgentPrompt.memory + appState.agentMemory.contextSnippet()
-                if let wd = workingDirectory {
-                    systemPrompt += AgentEngine.workingDirectoryContext(wd)
-                }
+                // Stable, cacheable core: base instructions + memory instructions
+                // + MCP listing. The model's tool block (rendered by the chat
+                // template) sits in front of all of this, so as long as this
+                // prefix stays byte-identical the server reuses the whole
+                // tool+instruction KV across requests.
+                systemPrompt = AgentPrompt.systemPrompt + AgentPrompt.memory
                 if !mcpListing.isEmpty {
                     systemPrompt += "\n\n# MCP Tools\nIn addition to the built-in tools above, the user has connected these MCP servers. Their tools are namespaced as `<server>__<tool>`:\n\n\(mcpListing)"
                 }
+                // Volatile context to the tail, ordered big-listing-then-tiny-
+                // snippet so a shell command (which rewrites the recent-commands
+                // snippet every turn) only re-prefills the snippet, not the
+                // working-dir listing: matched skills (per message), the
+                // working-dir listing (changes as files change), then the
+                // learned recent-dirs/commands snippet (changes per command).
+                agentVolatileTail += skills
+                if let wd = workingDirectory {
+                    agentVolatileTail += AgentEngine.workingDirectoryContext(wd)
+                }
+                agentVolatileTail += appState.agentMemory.contextSnippet()
             } else if config.mcpMode {
                 // MCP-only mode: minimal system prompt focused on MCP tool use, no shell/file rules.
                 systemPrompt = AgentPrompt.mcpOnlySystemPrompt(toolListing: mcpListing)
@@ -356,15 +449,25 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                 systemPrompt += AgentPrompt.attachedDocumentsSection(
                     folderName: index.folderName, fileCount: indexedFileCount(index))
             }
-            // Ground every agent turn in the wall clock so "what time/date is it"
-            // is answered from reality, not a hallucinated guess (and so recency
-            // reasoning is correct). Voice and text agents both benefit. Also
-            // surface the Mac's LAN IP so the agent reports reachable URLs for
-            // anything it serves.
-            var grounding = SystemGrounding.dateTimeLine()
+            // Ground the turn in the wall clock (so "what day is it" is answered
+            // from reality) and surface the Mac's LAN IP (so the agent hands out
+            // reachable URLs). Date-ONLY (no clock time) and at the very END:
+            // a per-minute timestamp at the front changed the first tokens every
+            // request, so the KV prefix cache missed at token 0 and every agent
+            // turn cold-re-prefilled the whole prompt — the cause of slow TTFB.
+            var grounding = SystemGrounding.dateLine()
             let ipLine = SystemGrounding.localIPLine(ip: lanIP)
             if !ipLine.isEmpty { grounding += " " + ipLine }
-            systemPrompt = grounding + "\n\n" + systemPrompt
+            // Stable prefix first, all volatile content (skills / working-dir /
+            // memory) + grounding last — so a mid-session change only re-prefills
+            // the short tail, not the cached tool+instruction block.
+            // Make the model aware of its actual per-response token cap so it
+            // chunks large writes BEFORE truncating (a static "~200 lines" hint
+            // gets ignored). Stable within the session → stays in the volatile
+            // tail, before the date grounding, so the KV prefix still hits.
+            systemPrompt = Self.composeSystemPrompt(stable: systemPrompt,
+                                                    volatileTail: agentVolatileTail + AgentPrompt.outputBudgetGuidance(maxTokens: appState.maxTokens, contextLength: contextLength),
+                                                    grounding: grounding)
             // Voice mode: tools/thinking run silently; only the final answer is
             // spoken, so steer it to a short, speakable reply (no URLs/Markdown).
             if config.voiceStyle { systemPrompt = VoicePrompt.decorate(systemPrompt) }
@@ -413,18 +516,18 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                 var tcs: [APIClient.ToolCall] = []
                 var maxHit = false
                 var coalescer = StreamCoalescer()
+                self.beginLiveTokenCount()
                 for try await event in stream {
                     try Task.checkCancellation()
                     switch event {
                     case .content(let text):
-                        self.applyStreamBatch(coalescer.add(content: text, now: Date().timeIntervalSinceReferenceDate),
-                                              to: sessionId)
+                        self.streamDelta(content: text, coalescer: &coalescer, to: sessionId)
                     case .reasoning(let text):
-                        self.applyStreamBatch(coalescer.add(reasoning: text, now: Date().timeIntervalSinceReferenceDate),
-                                              to: sessionId)
+                        self.streamDelta(reasoning: text, coalescer: &coalescer, to: sessionId)
                     case .usage(let usage):
                         self.applyStreamBatch(coalescer.drain(), to: sessionId)
                         appState.updateLastMessage(in: sessionId, usage: usage)
+                        self.liveCompletionTokens = usage.completionTokens   // reconcile to the authoritative count
                     case .toolCalls(let calls):
                         tcs = calls
                     case .maxTokensReached:
@@ -467,7 +570,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                     appState.chatSessions[sIdx].messages[mIdx].failedRetry = true
                     appState.chatSessions[sIdx].messages[mIdx].toolCalls = nil
                 }
-                let nudge = ChatMessage(role: .user, content: "[System: Your last response was cut off because the output was too long, so the tool call was NOT executed. Write shorter responses: for a large file, write it in chunks — writeFile a first part, then editFile to append the rest. (A shell heredoc has the same length limit, so don't switch to that.)]")
+                let nudge = ChatMessage(role: .user, content: Self.truncatedToolCallNudge)
                 appState.appendMessage(to: sessionId, message: nudge)
                 continue
             }
@@ -509,6 +612,26 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
             if receivedToolCalls.isEmpty {
                 let lastContent = appState.chatSessions
                     .first(where: { $0.id == sessionId })?.messages.last?.content ?? ""
+
+                // Truncation, NOT a ghost. When the cap was hit AND the content
+                // still carries a tool-call opener with no matching close, the
+                // call was cut off mid-emission and the server's parser couldn't
+                // recover it (Step 1 recovers Hermes/XML, but a future format
+                // could escape it). This is a *truncation* — route it to the
+                // chunk/append nudge (budget 2) instead of falling through to the
+                // ghost path's "call it with proper JSON" (useless: the JSON was
+                // fine, just too long). Must precede the ghost check, which also
+                // matches `<function=`/`<tool_call>`.
+                if maxTokensHit && Self.hasUnclosedToolCallOpener(lastContent) && retry.allowTruncationRetry() {
+                    if let sIdx = appState.chatSessions.firstIndex(where: { $0.id == sessionId }),
+                       !appState.chatSessions[sIdx].messages.isEmpty {
+                        let mIdx = appState.chatSessions[sIdx].messages.count - 1
+                        appState.chatSessions[sIdx].messages[mIdx].failedRetry = true
+                    }
+                    let nudge = ChatMessage(role: .user, content: Self.truncatedToolCallNudge)
+                    appState.appendMessage(to: sessionId, message: nudge)
+                    continue
+                }
                 // Match the full `<tool…` family — `<tool_call>`, `<tool_call name=…>`,
                 // `<tool_calls>` wrapper, `<tool name=… arguments=…/>` self-closing,
                 // Gemma 4 `<|tool_call>`/`<tool_call|>`, and `<function=` legacy. The
@@ -752,6 +875,45 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
     /// MCP tools (when MCP mode is on), and the searchDocuments tool (when a folder is attached).
     /// Returns nil when no tools should be advertised.
     /// `nonisolated` so it stays a pure helper callable off the main actor (unit tests).
+    /// Assemble the system prompt so cacheable content stays first and volatile
+    /// content lasts. `stable` (base instructions + memory instructions + MCP +
+    /// attached-docs, with the template's tool block rendered in front of all of
+    /// it) must be byte-identical across a session for the server's KV prefix
+    /// cache to reuse the tool+instruction block. `volatileTail` (matched skills,
+    /// working-dir listing, learned recent-dirs/commands) and `grounding` (date +
+    /// LAN IP) change mid-session, so they go LAST — a change there re-prefills
+    /// only the short tail, not the big cached prefix. Pure → unit-tested.
+    nonisolated static func composeSystemPrompt(stable: String, volatileTail: String, grounding: String) -> String {
+        var p = stable + volatileTail
+        if !grounding.isEmpty { p += "\n\n" + grounding }
+        return p
+    }
+
+    /// Nudge for a tool call cut off by the token cap (the call was NOT
+    /// executed). Shared by the two truncation paths: when the server still
+    /// parsed the (truncated) call (args incomplete) and when it dropped it
+    /// entirely (a format the parser couldn't recover, leaving only the opener
+    /// in content). Steers the model to chunk + append rather than retry the
+    /// same one-shot write or switch to an equally-capped heredoc.
+    nonisolated static let truncatedToolCallNudge = "[System: Your last response was cut off because the output was too long, so the tool call was NOT executed. Write shorter responses: for a large file, write it in chunks — writeFile a first part, then writeFile again with append:\"true\" for each remaining chunk. (A shell heredoc has the same length limit, so don't switch to that.)]"
+
+    /// True when `content` carries a tool-call OPENER with no matching close —
+    /// the signature of a call cut off by the token cap (a *truncation*, not a
+    /// malformed/"ghost" call). Routes maxTokensHit-with-empty-calls to the
+    /// chunk/append nudge instead of the useless "call it with proper JSON"
+    /// ghost nudge. Covers Hermes `<function=`→`</function>`, the
+    /// `<tool_call>`/`<tool_calls>` wrappers→`</…>`, and Gemma 4
+    /// `<|tool_call>`→`<tool_call|>`. Pure → unit-tested.
+    nonisolated static func hasUnclosedToolCallOpener(_ content: String) -> Bool {
+        func openNoClose(_ open: String, _ close: String) -> Bool {
+            content.contains(open) && !content.contains(close)
+        }
+        return openNoClose("<function=", "</function>")
+            || openNoClose("<tool_call>", "</tool_call>")
+            || openNoClose("<tool_calls>", "</tool_calls>")
+            || openNoClose("<|tool_call>", "<tool_call|>")
+    }
+
     nonisolated static func combinedToolsJSON(agentMode: Bool, mcpToolsJSON: String?,
                                               docsToolJSON: String? = nil) -> String? {
         // Strip each array's outer brackets, drop empties, re-wrap as one array.
@@ -781,11 +943,17 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
     /// optionally, audio). Delegates to the pure, unit-tested `MultimodalContent`
     /// builder. Two overloads so the `buildAgentHistory` closure (images only)
     /// and the plain-chat path (images + audio) can both reference it.
-    nonisolated static func buildMultimodalContent(text: String, images: [ChatImage]) -> Any {
-        MultimodalContent.build(text: text, images: images, audio: [])
+    nonisolated static func buildMultimodalContent(text: String, images: [ChatImage], serverPreprocess: Bool = false) -> Any {
+        MultimodalContent.build(text: text, images: images, audio: [], serverPreprocess: serverPreprocess)
     }
 
-    nonisolated static func buildMultimodalContent(text: String, images: [ChatImage], audio: [ChatAudio]) -> Any {
-        MultimodalContent.build(text: text, images: images, audio: audio)
+    nonisolated static func buildMultimodalContent(text: String, images: [ChatImage], audio: [ChatAudio], serverPreprocess: Bool = false) -> Any {
+        MultimodalContent.build(text: text, images: images, audio: audio, serverPreprocess: serverPreprocess)
+    }
+
+    /// Whether the loaded model wants server-side image preprocessing (Qwen3-VL):
+    /// its `x-mlx-pixels` square format is Gemma-only, so Qwen sends raw images.
+    var wantsServerImagePreprocess: Bool {
+        (server.modelInfo?.architecture ?? "").hasPrefix("qwen")
     }
 }

@@ -23,7 +23,7 @@ struct VoiceTrayPanel: View {
             if voice.isActive {
                 statusLine
                 chips
-                if voice.agentMode || appState.mcpMode {
+                if voice.agentMode || voice.mcpMode {
                     autoApproveRow
                 }
                 controls
@@ -139,8 +139,8 @@ struct VoiceTrayPanel: View {
                 voice.agentMode.toggle()
                 if voice.agentMode { voice.enableThinking = false }
             }
-            chip("MCP", system: "puzzlepiece.extension", on: appState.mcpMode) {
-                appState.mcpMode.toggle()
+            chip("MCP", system: "puzzlepiece.extension", on: voice.mcpMode) {
+                voice.mcpMode.toggle()
             }
             chip("Think", system: "brain", on: voice.enableThinking) {
                 voice.enableThinking.toggle()

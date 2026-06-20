@@ -32,6 +32,25 @@ pub const Error = error{
     OutOfMemory,
 };
 
+/// ds4's prefill scratch is sized against the requested session ctx (the
+/// engine's `prefill_chunk` is 2048 by default). A session SMALLER than the
+/// prefill chunk produces junk output, so this is the hard floor for any
+/// user-supplied `--ctx-size` — below it we raise rather than honor verbatim.
+pub const ds4_prefill_chunk: u32 = 2048;
+/// ds4's CLI default ctx, used when the user leaves `--ctx-size` unset (0).
+pub const ds4_default_ctx: u32 = 32768;
+
+/// Resolve a ds4 session context size from the user's `--ctx-size`.
+/// `requested == 0` (unset) → ds4's default; otherwise the value, floored at
+/// the prefill chunk so it can never drop into the junk-output regime. No
+/// upper cap — a deliberately large ctx just allocates more KV scratch up
+/// front, which is the caller's explicit choice. Idempotent for non-zero
+/// inputs (re-clamping a clamped value is a no-op).
+pub fn clampSessionCtx(requested: u32) u32 {
+    if (requested == 0) return ds4_default_ctx;
+    return @max(requested, ds4_prefill_chunk);
+}
+
 const KernelEntry = struct {
     env_var: [:0]const u8,
     file_name: []const u8,
@@ -548,6 +567,29 @@ const TokenHolder = struct {
         self.allocator.free(self.buf);
     }
 };
+
+test "clampSessionCtx: unset (0) → ds4 default" {
+    try std.testing.expectEqual(ds4_default_ctx, clampSessionCtx(0));
+}
+
+test "clampSessionCtx: below prefill-chunk floor is raised (no junk-output regime)" {
+    // ds4's prefill scratch is sized against the session ctx; a session smaller
+    // than prefill_chunk produces junk. A user --ctx-size under the floor must
+    // be raised, never honored verbatim.
+    try std.testing.expectEqual(ds4_prefill_chunk, clampSessionCtx(1));
+    try std.testing.expectEqual(ds4_prefill_chunk, clampSessionCtx(ds4_prefill_chunk - 1));
+}
+
+test "clampSessionCtx: at/above the floor is honored verbatim" {
+    try std.testing.expectEqual(ds4_prefill_chunk, clampSessionCtx(ds4_prefill_chunk));
+    try std.testing.expectEqual(@as(u32, 8192), clampSessionCtx(8192));
+    try std.testing.expectEqual(@as(u32, 131072), clampSessionCtx(131072));
+}
+
+test "clampSessionCtx: idempotent (re-clamping a clamped value is a no-op except 0)" {
+    try std.testing.expectEqual(clampSessionCtx(8192), clampSessionCtx(clampSessionCtx(8192)));
+    try std.testing.expectEqual(ds4_default_ctx, clampSessionCtx(clampSessionCtx(0)));
+}
 
 test "kernel hash is stable across calls" {
     const a = computeKernelHash();

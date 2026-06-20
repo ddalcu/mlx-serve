@@ -15,10 +15,15 @@ enum MultimodalContent {
         text: String,
         images: [ChatImage],
         audio: [ChatAudio] = [],
+        // When true (Qwen3-VL and other non-Gemma vision models), skip the
+        // Gemma-specific square `x-mlx-pixels` preprocessing and send the raw
+        // image so the server runs the model's own preprocessing (smart_resize +
+        // merge-order patchify). Gemma keeps Swift-side bicubic preprocessing.
+        serverPreprocess: Bool = false,
         preprocessImage: (Data) -> Data? = { ImagePreprocessor.preprocess($0) }
     ) -> [[String: Any]] {
         var blocks: [[String: Any]] = images.map { img in
-            if let pixelData = preprocessImage(img.data) {
+            if !serverPreprocess, let pixelData = preprocessImage(img.data) {
                 return [
                     "type": "image_url",
                     "image_url": [

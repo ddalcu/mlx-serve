@@ -2,6 +2,7 @@ const std = @import("std");
 const mlx = @import("mlx.zig");
 const model_mod = @import("model.zig");
 const log = @import("log.zig");
+const qwen_vision = @import("qwen_vision.zig");
 
 const ModelConfig = model_mod.ModelConfig;
 const Weights = model_mod.Weights;
@@ -114,8 +115,13 @@ pub const VisionEncoder = struct {
     // unified embedder and all SigLIP fields above are unused sentinels.
     unified: ?UnifiedWeights = null,
 
+    // Qwen3.5/3.6 (Qwen3-VL) path. When set, `forwardQwen` drives the ViT and all
+    // SigLIP fields above are unused sentinels. See src/qwen_vision.zig.
+    qwen: ?qwen_vision.QwenVision = null,
+
     pub fn init(allocator: std.mem.Allocator, config: ModelConfig, weights: *const Weights) !VisionEncoder {
         if (config.is_gemma4_unified) return initUnified(allocator, config, weights);
+        if (config.qwen_vision) return initQwen(allocator, config, weights);
         const s = mlx.mlx_default_gpu_stream_new();
 
         var name_buf: [256]u8 = undefined;
@@ -237,6 +243,7 @@ pub const VisionEncoder = struct {
     pub fn deinit(self: *VisionEncoder) void {
         _ = mlx.mlx_array_free(self.half);
         _ = mlx.mlx_array_free(self.one);
+        if (self.qwen) |*q| q.deinit();
         self.allocator.free(self.layers);
         _ = mlx.mlx_stream_free(self.s);
     }
@@ -321,6 +328,42 @@ pub const VisionEncoder = struct {
             .one = bf16Scalar(1.0, s),
             .unified = unified,
         };
+    }
+
+    /// Build a VisionEncoder wrapping the Qwen3-VL ViT. SigLIP fields are
+    /// sentinels; `qwen` drives `forwardQwen`. The ViT owns its own GPU stream.
+    fn initQwen(allocator: std.mem.Allocator, config: ModelConfig, weights: *const Weights) !VisionEncoder {
+        const s = mlx.mlx_default_gpu_stream_new();
+        const qv = try qwen_vision.QwenVision.init(allocator, config, weights);
+        log.info("Vision encoder: Qwen3-VL ViT (depth={d}, hidden={d}, heads={d}, merge={d}, out_hidden={d})\n", .{
+            config.qv_depth, config.qv_hidden, config.qv_heads, config.qv_merge, config.qv_out_hidden,
+        });
+        return .{
+            .config = config,
+            .s = s,
+            .allocator = allocator,
+            .patch_proj_w = mlx.mlx_array_new(),
+            .position_embedding = mlx.mlx_array_new(),
+            .layers = &.{},
+            .proj_w = mlx.mlx_array_new(),
+            .proj_s = mlx.mlx_array_new(),
+            .proj_b = mlx.mlx_array_new(),
+            .proj_quant_bits = 4,
+            .proj_quant_group_size = config.quant_group_size,
+            .std_scale = null,
+            .std_bias = null,
+            .rms_eps = 1e-6,
+            .half = bf16Scalar(0.5, s),
+            .one = bf16Scalar(1.0, s),
+            .qwen = qv,
+        };
+    }
+
+    /// Encode one Qwen image: `patches` is the processor's merge-order
+    /// pixel_values [N, C·tps·ps·ps]; `grid_h/grid_w` is the full patch grid.
+    /// Returns [1, N/merge², out_hidden].
+    pub fn forwardQwen(self: *VisionEncoder, patches: mlx.mlx_array, grid_h: u32, grid_w: u32) !mlx.mlx_array {
+        return self.qwen.?.forward(patches, grid_h, grid_w);
     }
 
     /// Apply a quantized (or dense) Linear y = x · Wᵀ (+ optional bias). `sc`

@@ -435,16 +435,26 @@ final class TelegramBridge: ObservableObject {
     func deliverTaskResult(chatId: Int64, task: ScheduledTask, run: TaskRun) {
         let token = appState.serverOptions.telegram.trimmedToken
         guard !token.isEmpty else { return }
-        let header = run.status == .completed
-            ? "✅ Task “\(task.title)” finished"
-            : "⚠️ Task “\(task.title)” failed"
-        let text = header + (run.summary.map { "\n\n\($0)" } ?? "")
+        // Send the FULL final answer, not `run.summary` — that field is capped at
+        // 280 chars for the in-app timeline row, so relaying it is exactly the
+        // truncation users see on the phone. `splitForTelegram` chunks the rest.
+        let full = TaskScheduler.fullLastAssistantText(
+            appState.taskScheduler.transcript(taskId: task.id, runId: run.id))
+        let text = Self.taskResultText(title: task.title, completed: run.status == .completed,
+                                       body: full ?? run.summary)
         Task { [weak self] in
             guard let self else { return }
             for chunk in TelegramAPI.splitForTelegram(text) {
                 await self.send(token: token, chatId: chatId, text: chunk)
             }
         }
+    }
+
+    /// Format a finished task's report: status header + the full result body
+    /// (when there is one). Pure/testable; the caller chunks it for Telegram.
+    nonisolated static func taskResultText(title: String, completed: Bool, body: String?) -> String {
+        let header = completed ? "✅ Task “\(title)” finished" : "⚠️ Task “\(title)” failed"
+        return header + (body.map { "\n\n\($0)" } ?? "")
     }
 
     // MARK: - Telegram I/O

@@ -18,6 +18,12 @@ struct ChatSession: Identifiable, Codable {
     /// chat sidebar and never persisted to chat-history.json — the conversation
     /// lives on the messaging platform, not in the app's chat list.
     var isExternalBridge: Bool
+    /// Per-session toolbar toggles. Persisted here (not as view `@State` or the
+    /// app-global `mcpMode`) so each chat tab remembers its own Think/MCP choice
+    /// across tab switches and relaunches — `mode` already does the same for the
+    /// Agent toggle. See PerSessionUIStateTests.
+    var enableThinking: Bool
+    var useMCP: Bool
 
     init(title: String = "New Chat") {
         self.id = UUID()
@@ -29,10 +35,12 @@ struct ChatSession: Identifiable, Codable {
         self.workingDirectory = ChatSession.defaultWorkingDirectory
         self.taskRunId = nil
         self.isExternalBridge = false
+        self.enableThinking = false
+        self.useMCP = false
     }
 
     enum CodingKeys: String, CodingKey {
-        case id, title, messages, createdAt, updatedAt, mode, workingDirectory, taskRunId, isExternalBridge
+        case id, title, messages, createdAt, updatedAt, mode, workingDirectory, taskRunId, isExternalBridge, enableThinking, useMCP
     }
 
     init(from decoder: Decoder) throws {
@@ -45,6 +53,10 @@ struct ChatSession: Identifiable, Codable {
         mode = try c.decodeIfPresent(ChatMode.self, forKey: .mode) ?? .chat
         taskRunId = try c.decodeIfPresent(UUID.self, forKey: .taskRunId)
         isExternalBridge = try c.decodeIfPresent(Bool.self, forKey: .isExternalBridge) ?? false
+        // Backfill: sessions saved before the per-session Think/MCP toggles
+        // existed come back with the keys absent → default both off.
+        enableThinking = try c.decodeIfPresent(Bool.self, forKey: .enableThinking) ?? false
+        useMCP = try c.decodeIfPresent(Bool.self, forKey: .useMCP) ?? false
         // Backfill: sessions saved before workingDirectory had a default come back as nil. Anchor them
         // at ~/.mlx-serve/workspace so the agent's tools and MCP servers both have a sane default.
         let decoded = try c.decodeIfPresent(String.self, forKey: .workingDirectory)
@@ -214,6 +226,10 @@ struct ModelInfo {
     /// Absolute path passed to `--drafter` at startup. nil when the server
     /// has no drafter loaded.
     var drafterPath: String? = nil
+    /// True when the model dir shipped an `mtp/weights.safetensors` sidecar and
+    /// the server loaded the native multi-token-prediction head. Drives the
+    /// "+MTP" speedup badge under the model name in the tray.
+    var mtpLoaded: Bool = false
     /// Plan 05 Phase G — multi-model fields. All optional so older
     /// servers (single-model) still decode without these.
     /// Whether this entry currently holds resident weights.
@@ -248,6 +264,17 @@ struct ModelInfo {
         case "deepseek_v4": return .dsv4
         default: return .mlx
         }
+    }
+
+    /// Short "speedup active" badge for the tray under the model name, or nil
+    /// when no speculative-decoding head is loaded. MTP takes priority over the
+    /// drafter (mirrors server dispatch: MTP > drafter > PLD), so at most one
+    /// shows. PLD is intentionally NOT badged — it's content-adaptive (gated off
+    /// on novel prompts) rather than a loaded asset.
+    var specDecodeBadge: String? {
+        if mtpLoaded { return "+MTP" }
+        if drafterLoaded { return "+Drafter" }
+        return nil
     }
 }
 

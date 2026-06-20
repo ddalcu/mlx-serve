@@ -243,7 +243,11 @@ class AppState: ObservableObject {
     var visibleChatSessions: [ChatSession] { Self.sidebarSessions(from: chatSessions) }
 
     func newChatSession() -> UUID {
-        let session = ChatSession()
+        var session = ChatSession()
+        // Seed the new tab's MCP toggle from the global default so a user who
+        // generally runs with MCP on keeps it; Think/Agent start off. Each tab
+        // then remembers its own choice (ChatSession.useMCP/enableThinking).
+        session.useMCP = mcpMode
         chatSessions.insert(session, at: 0)
         activeChatId = session.id
         saveChatHistory()

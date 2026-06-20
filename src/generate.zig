@@ -1368,7 +1368,6 @@ pub const Generator = struct {
         return .{ .drained = token };
     }
 
-
     /// Result of one `nextPld` step. Yields 1..=(1+max_draft_len) tokens.
     /// Caller owns `tokens` (must `allocator.free` it).
     pub const PldStepResult = struct {
@@ -1426,16 +1425,16 @@ pub const Generator = struct {
                 defer allocator.free(committed_check);
                 @memcpy(committed_check[0..prompt_toks.len], prompt_toks);
                 @memcpy(committed_check[prompt_toks.len..], gen);
-                if (log.isDebug()) {
-                    const dbg_frac = pld_index.tailMatchFraction(committed_check, @min(SPEC_REENABLE_WINDOW, gen.len), 3);
-                    log.debug("  pld re-enable check: disabled_steps={d} gen={d} tail_match={d:.2}\n", .{ self.disabled_steps, gen.len, dbg_frac });
-                }
+                //if (log.isDebug()) {
+                //    const dbg_frac = pld_index.tailMatchFraction(committed_check, @min(SPEC_REENABLE_WINDOW, gen.len), 3);
+                //    log.debug("  pld re-enable check: disabled_steps={d} gen={d} tail_match={d:.2}\n", .{ self.disabled_steps, gen.len, dbg_frac });
+                //}
                 if (!specShouldReenable(committed_check, gen.len)) break :reenable;
                 switch (try self.drainPipelineForSpec(allocator)) {
                     .stay_disabled => break :reenable,
                     .stopped => return null,
                     .already_clean => {
-                        log.info("  pld=re-enabled (generated tail turned repetitive after {d} disabled steps)\n", .{self.disabled_steps});
+                        //log.info("  pld=re-enabled (generated tail turned repetitive after {d} disabled steps)\n", .{self.disabled_steps});
                         self.spec_disabled_runtime = false;
                         self.disabled_steps = 0;
                         self.yield_steps = 0;
@@ -1444,7 +1443,7 @@ pub const Generator = struct {
                         // enabled flow below in this same call.
                     },
                     .drained => |drained_tok| {
-                        log.info("  pld=re-enabled (generated tail turned repetitive after {d} disabled steps)\n", .{self.disabled_steps});
+                        //log.info("  pld=re-enabled (generated tail turned repetitive after {d} disabled steps)\n", .{self.disabled_steps});
                         self.spec_disabled_runtime = false;
                         self.disabled_steps = 0;
                         self.yield_steps = 0;
@@ -1577,6 +1576,20 @@ pub const Generator = struct {
 
         // ── Phase 3: Snapshot KV + per-layer SSM + moe_seq_offset + DSV4 ──
         // Cache enters at cache.step = prompt_len + TE.
+        //
+        // The snapshots below are the FALLBACK rollback path (pure-attention,
+        // Mamba2, LFM2). On a GatedDeltaNet trunk the verify forward instead
+        // CAPTURES per-position SSM/conv state (capture_ssm_seq), and partial
+        // accept rolls back by slicing that capture + truncating the KV cache —
+        // no re-forward of the accepted prefix, which on this arch re-runs the
+        // expensive 48-layer sequential recurrence.
+        //
+        // The KV-cache truncate length is anchored on `moe_seq_offset`, NOT
+        // `cache.step`: on a GDN trunk layer 0 is a linear-attention layer that
+        // never calls `cache.update`, and `cache.step` only advances under
+        // `if (layer == 0)` — so it stays stale (~0) for this family. The
+        // full-attention KV entries instead track `moe_seq_offset` (both advance
+        // by seq_len per forward), so that is the real KV length to roll back to.
         var kv_snap = try self.ctx.cache.snapshot();
         defer kv_snap.deinit();
         var ssm_snaps: ?[]SSMCacheEntrySnapshot = null;
@@ -1607,7 +1620,18 @@ pub const Generator = struct {
         const verify_input = mlx.mlx_array_new_data(verify_input_buf.ptr, &verify_shape, 2, .int32);
         defer _ = mlx.mlx_array_free(verify_input);
 
+        // Enable per-position SSM capture for the verify pass on a GDN trunk so
+        // partial accept can roll back without a re-forward. Self-detecting:
+        // only GatedDeltaNet layers actually populate `spec_state_seq`, so
+        // pure-attention / Mamba2 / LFM2 fall through to the snapshot fallback.
+        self.ctx.capture_ssm_seq = self.ctx.ssm_entries != null;
         const verify_logits = try xfm.forwardWith(&self.ctx, verify_input);
+        self.ctx.capture_ssm_seq = false;
+        // Always free the transient capture buffers before returning, however
+        // we exit this round (full accept, partial accept, or error).
+        defer if (self.ctx.ssm_entries) |entries| {
+            for (entries) |*entry| transformer_mod.ssmFreeSpecCapture(entry);
+        };
         // verify_logits shape [1, 1+m, V]. Sliced and freed below.
         self.pld_attempted += 1;
 
@@ -1711,22 +1735,51 @@ pub const Generator = struct {
         // both t1 AND the drafts. Skipping the re-forward here would leave
         // the cache at prompt_len + TE — one short of the post-emit invariant.
         if (!full_accept) {
-            try self.ctx.cache.restore(&kv_snap);
-            if (ssm_snaps) |snaps| {
-                for (self.ctx.ssm_entries.?, snaps) |*entry, *sn| try ssmRestore(entry, sn);
-            }
-            self.ctx.moe_seq_offset.* = moe_seq_offset_snap;
+            // Fast GatedDeltaNet path: the verify forward captured per-position
+            // SSM/conv state, so roll back by truncating the KV cache to the
+            // accepted length (keeping verify's already-correct K/V for those
+            // positions) and slicing the captured state — NO re-forward of the
+            // accepted prefix. Detect via a populated capture on the first SSM
+            // entry; absent it (pure-attention / Mamba2 / LFM2) we take the
+            // proven restore + re-forward fallback below. Byte-identical either
+            // way (pinned by tests/test_pld_equivalence.sh).
+            const gdn_captured = if (self.ctx.ssm_entries) |entries|
+                entries.len > 0 and entries[0].spec_state_seq.ctx != null
+            else
+                false;
 
-            const re_seq_len: c_int = @intCast(1 + accepted);
-            const re_input_buf = try allocator.alloc(i32, 1 + accepted);
-            defer allocator.free(re_input_buf);
-            re_input_buf[0] = @intCast(t1);
-            for (draft[0..accepted], 0..) |d, i| re_input_buf[1 + i] = @intCast(d);
-            const re_shape = [_]c_int{ 1, re_seq_len };
-            const re_input = mlx.mlx_array_new_data(re_input_buf.ptr, &re_shape, 2, .int32);
-            defer _ = mlx.mlx_array_free(re_input);
-            const re_logits = try xfm.forwardWith(&self.ctx, re_input);
-            _ = mlx.mlx_array_free(re_logits);
+            if (gdn_captured) {
+                const accepted_len: usize = 1 + @as(usize, accepted);
+                // `truncate` overwrites cache.step with its length arg; on this
+                // family cache.step is a stale counter the model never reads
+                // (positioning is moe_seq_offset), so preserve the snapshot's
+                // value to keep the prefix cache's kv_step bookkeeping identical
+                // to the restore-based fallback.
+                const step_keep = kv_snap.step;
+                try self.ctx.cache.truncate(moe_seq_offset_snap + accepted_len, s);
+                self.ctx.cache.step = step_keep;
+                for (self.ctx.ssm_entries.?) |*entry| {
+                    try transformer_mod.ssmRollbackFromCapture(entry, accepted, s);
+                }
+                self.ctx.moe_seq_offset.* = moe_seq_offset_snap + accepted_len;
+            } else {
+                try self.ctx.cache.restore(&kv_snap);
+                if (ssm_snaps) |snaps| {
+                    for (self.ctx.ssm_entries.?, snaps) |*entry, *sn| try ssmRestore(entry, sn);
+                }
+                self.ctx.moe_seq_offset.* = moe_seq_offset_snap;
+
+                const re_seq_len: c_int = @intCast(1 + accepted);
+                const re_input_buf = try allocator.alloc(i32, 1 + accepted);
+                defer allocator.free(re_input_buf);
+                re_input_buf[0] = @intCast(t1);
+                for (draft[0..accepted], 0..) |d, i| re_input_buf[1 + i] = @intCast(d);
+                const re_shape = [_]c_int{ 1, re_seq_len };
+                const re_input = mlx.mlx_array_new_data(re_input_buf.ptr, &re_shape, 2, .int32);
+                defer _ = mlx.mlx_array_free(re_input);
+                const re_logits = try xfm.forwardWith(&self.ctx, re_input);
+                _ = mlx.mlx_array_free(re_logits);
+            }
         }
 
         // ── Phase 8: Commit emitted tokens ──
@@ -2637,7 +2690,6 @@ pub const Generator = struct {
         // Reset the window so the new depth is judged on its own rounds.
         self.mtp_window_idx = 0;
     }
-
 
     /// Returns the next token ID, or null when generation is finished.
     ///
@@ -4902,4 +4954,3 @@ test "maskedMeanPoolNormalize excludes padded positions and unit-normalizes" {
 
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 extern "c" fn unsetenv(name: [*:0]const u8) c_int;
-

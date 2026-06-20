@@ -60,6 +60,43 @@ final class DownloadManagerLayoutTests: XCTestCase {
         XCTAssertNil(DownloadManager.existingModelDir(rootDir: tempRoot, repoId: "nobody/missing"))
     }
 
+    // MARK: - File selection (recursive tree, incl. mtp/ sidecar)
+
+    /// Regression for the silent MTP-sidecar drop: a model download must pull
+    /// the nested `mtp/weights.safetensors` head (else the model loses its
+    /// speculative-decoding speedup), while NOT pulling unrelated nested
+    /// subdirectories (e.g. `original/` alternate-precision shadow weights).
+    func testSelectNeededFilesIncludesMtpSidecarSkipsOtherNestedDirs() {
+        let entries: [[String: Any]] = [
+            ["path": "config.json", "type": "file", "size": 100],
+            ["path": "model-00001-of-00003.safetensors", "type": "file", "size": 5_000_000_000],
+            ["path": "tokenizer.json", "type": "file", "size": 19_000_000],
+            ["path": "chat_template.jinja", "type": "file", "size": 7_000],
+            ["path": "README.md", "type": "file", "size": 5_000],
+            ["path": ".DS_Store", "type": "file", "size": 6_000],
+            ["path": "mtp", "type": "directory", "size": 0],
+            ["path": "mtp/weights.safetensors", "type": "file", "size": 524_000_000],
+            ["path": "original/model.safetensors", "type": "file", "size": 50_000_000_000],
+        ]
+        let paths = Set(DownloadManager.selectNeededFiles(from: entries).map { $0.0 })
+
+        XCTAssertTrue(paths.contains("mtp/weights.safetensors"), "MTP sidecar must be downloaded")
+        XCTAssertTrue(paths.contains("config.json"))
+        XCTAssertTrue(paths.contains("model-00001-of-00003.safetensors"))
+        XCTAssertTrue(paths.contains("tokenizer.json"))
+        XCTAssertTrue(paths.contains("chat_template.jinja"))
+
+        XCTAssertFalse(paths.contains("mtp"), "a directory entry is not a downloadable file")
+        XCTAssertFalse(paths.contains("README.md"), "non-weight markdown skipped")
+        XCTAssertFalse(paths.contains(".DS_Store"), "files without a needed extension skipped")
+        XCTAssertFalse(paths.contains("original/model.safetensors"),
+                       "nested non-mtp shadow weights must not be pulled")
+
+        // Sidecar size is threaded through for the progress/space pre-check.
+        let sidecar = DownloadManager.selectNeededFiles(from: entries).first { $0.0 == "mtp/weights.safetensors" }
+        XCTAssertEqual(sidecar?.1, 524_000_000)
+    }
+
     // MARK: - Drafter discovery
 
     func testDiscoverDraftersFindsAllPublishedVariants() throws {
