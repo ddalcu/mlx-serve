@@ -18,6 +18,7 @@ const ds4_arch = @import("arch/ds4.zig");
 const llama_arch = @import("arch/llama.zig");
 const ds4_ffi = @import("ds4_ffi.zig");
 const log = @import("log.zig");
+const metrics_mod = @import("metrics.zig");
 
 pub const VERSION: []const u8 = build_options.version;
 
@@ -143,6 +144,9 @@ fn printUsage(io: std.Io) void {
         \\  --idle-evict-secs <n>
         \\                      Evict .ready entries with refcount==0 if
         \\                        idle for this many seconds. Default: off.
+        \\  --metrics           Enable Prometheus metrics endpoint at GET /metrics
+        \\                        (served on the main --port; dashboard at GET /admin)
+        \\  --admin-key <token> Bearer token to protect admin POST endpoints (optional)
         \\  --log-level <lvl>   Log level: error, warn, info, debug (default: info)
         \\  --version           Print version and exit
         \\  --help              Show this help
@@ -218,6 +222,7 @@ pub fn main(init: std.process.Init) !void {
     var max_resident_mem: u64 = 0; // 0 = auto (80% of wired limit at startup)
     var max_resident_mem_explicit: bool = false;
     var idle_evict_secs: ?u32 = null;
+    var metrics_enabled = false;
     // GGUF engine routing override. null → auto (decided by gguf_meta on
     // file inspection); set explicitly via --engine to force ds4 or llama.
     var engine_override: ?gguf_meta.Engine = null;
@@ -288,6 +293,11 @@ pub fn main(init: std.process.Init) !void {
             i += 1;
             draft_block_size = try std.fmt.parseInt(u32, args[i], 10);
             draft_block_size_explicit = true;
+        } else if (std.mem.eql(u8, args[i], "--metrics")) {
+            metrics_enabled = true;
+        } else if (std.mem.eql(u8, args[i], "--admin-key") and i + 1 < args.len) {
+            server_mod.g_admin_key = args[i + 1];
+            i += 1;
         } else if (std.mem.eql(u8, args[i], "--no-mtp")) {
             enable_mtp = false;
         } else if (std.mem.eql(u8, args[i], "--mtp-depth") and i + 1 < args.len) {
@@ -717,6 +727,12 @@ pub fn main(init: std.process.Init) !void {
             chat_config_owned_by_registry = true;
         };
 
+        // Metrics: allocate and wire through when --metrics is on.
+        var metrics_instance: ?metrics_mod.Metrics = if (metrics_enabled) metrics_mod.Metrics.init() else null;
+        if (metrics_instance != null) {
+            server_mod.g_metrics = &metrics_instance.?;
+        }
+
         const params = scheduler_mod.LoadParams{
             .registry = registry,
             .entry = entry,
@@ -740,6 +756,7 @@ pub fn main(init: std.process.Init) !void {
             .llama_cache_entries = server_mod.llama_cache_entries,
             .llama_kv_type_k = server_mod.llama_kv_quant.ggmlType(),
             .llama_kv_type_v = server_mod.llama_kv_quant.ggmlType(),
+            .metrics = if (metrics_instance != null) &metrics_instance.? else null,
         };
         try server_mod.serve(io, allocator, params, config, host, port, .{
             .max_context_size = ctx_size,
