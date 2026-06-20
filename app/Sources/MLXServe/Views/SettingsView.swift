@@ -476,6 +476,37 @@ private struct ServerSectionContent: View {
                     .toggleStyle(.switch)
             }
         }
+        if let m = meta["enableMetrics"] {
+            SettingsRow(
+                title: m.title,
+                explainer: m.explainer,
+                isDirty: dirty.dirty(\.enableMetrics)
+            ) {
+                Toggle("", isOn: $appState.serverOptions.enableMetrics)
+                    .labelsHidden()
+                    .toggleStyle(.switch)
+            }
+        }
+        if let m = meta["adminKey"] {
+            SettingsRow(
+                title: m.title,
+                explainer: m.explainer,
+                isDirty: dirty.dirty(\.adminKey)
+            ) {
+                TextField(
+                    "",
+                    text: Binding(
+                        get: { appState.serverOptions.adminKey },
+                        set: { appState.serverOptions.adminKey = $0.trimmingCharacters(in: .whitespaces) }
+                    ),
+                    prompt: Text("optional")
+                )
+                .textFieldStyle(.roundedBorder)
+                .multilineTextAlignment(.trailing)
+                .frame(width: 160)
+                .disabled(!appState.serverOptions.enableMetrics)
+            }
+        }
     }
 }
 

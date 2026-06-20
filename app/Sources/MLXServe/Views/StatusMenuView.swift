@@ -379,6 +379,24 @@ struct StatusMenuView: View {
                     .padding(.horizontal, 16)
                     .padding(.vertical, 10)
 
+                // Metrics dashboard — only shown when the server was launched
+                // with --metrics (opt-in; see ServerOptions.enableMetrics).
+                if appState.serverOptions.enableMetrics {
+                    Divider().padding(.horizontal, 12)
+                    Button {
+                        if let root = EndpointsSection.rootURL(server.baseURL) {
+                            NSWorkspace.shared.open(root.appendingPathComponent("admin"))
+                        }
+                    } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: "chart.bar.xaxis")
+                            Text("Open Metrics Dashboard")
+                        }
+                    }
+                    .buttonStyle(.plain)
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 6)
+                }
             }
 
             Divider().padding(.horizontal, 12)

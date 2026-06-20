@@ -173,6 +173,51 @@ final class ServerOptionsTests: XCTestCase {
         XCTAssertTrue(opts.toCLIArgs().contains("--no-vision"))
     }
 
+    // MARK: - Metrics / admin dashboard
+
+    func testMetricsFlagEmittedWhenEnabled() {
+        var opts = ServerOptions()
+        opts.enableMetrics = true
+        XCTAssertTrue(opts.toCLIArgs().contains("--metrics"))
+    }
+
+    func testMetricsFlagOmittedByDefault() {
+        let opts = ServerOptions()
+        XCTAssertFalse(opts.toCLIArgs().contains("--metrics"))
+    }
+
+    func testAdminKeyEmittedWithMetrics() {
+        var opts = ServerOptions()
+        opts.enableMetrics = true
+        opts.adminKey = "s3cret"
+        XCTAssertTrue(contains(opts.toCLIArgs(), flag: "--admin-key", value: "s3cret"))
+    }
+
+    func testAdminKeyOmittedWhenMetricsOff() {
+        var opts = ServerOptions()
+        opts.enableMetrics = false
+        opts.adminKey = "s3cret"
+        let args = opts.toCLIArgs()
+        XCTAssertFalse(args.contains("--metrics"))
+        XCTAssertFalse(args.contains("--admin-key"))
+    }
+
+    func testAdminKeyOmittedWhenBlank() {
+        var opts = ServerOptions()
+        opts.enableMetrics = true
+        opts.adminKey = ""
+        let args = opts.toCLIArgs()
+        XCTAssertTrue(args.contains("--metrics"))
+        XCTAssertFalse(args.contains("--admin-key"))
+    }
+
+    func testEnableMetricsChangeTriggersRestart() {
+        let a = ServerOptions()
+        var b = ServerOptions()
+        b.enableMetrics = true
+        XCTAssertFalse(a.serverLaunchEquals(b))
+    }
+
     func testServerLaunchEqualsIgnoresPerRequestFields() {
         var a = ServerOptions()
         var b = ServerOptions()

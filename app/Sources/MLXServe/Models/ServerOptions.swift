@@ -21,6 +21,15 @@ struct ServerOptions: Codable, Equatable {
     var logLevel: LogLevel = .info
     var requestTimeout: Int = 300       // seconds; 0 = unlimited
 
+    // Observability (server-launch flags)
+    /// Opt-in Prometheus metrics + zero-dependency admin dashboard. When true,
+    /// launches with `--metrics`, exposing `/metrics` and `/admin`.
+    var enableMetrics: Bool = false
+    /// Optional bearer token protecting admin POST actions (cache eviction,
+    /// etc.). Only emitted (`--admin-key`) when `enableMetrics` is also true —
+    /// never sent standalone.
+    var adminKey: String = ""
+
     // Speculative decoding (server-launch flags)
     var enablePLD: Bool = true          // --pld is default-on now (CLI flips with --no-pld)
     var pldDraftLen: Int = 5
@@ -289,6 +298,8 @@ struct ServerOptions: Codable, Equatable {
         noVision == other.noVision &&
         logLevel == other.logLevel &&
         requestTimeout == other.requestTimeout &&
+        enableMetrics == other.enableMetrics &&
+        adminKey == other.adminKey &&
         enablePLD == other.enablePLD &&
         pldDraftLen == other.pldDraftLen &&
         pldKeyLen == other.pldKeyLen &&
@@ -361,6 +372,12 @@ struct ServerOptions: Codable, Equatable {
         }
         if requestTimeout != 300 {
             args += ["--timeout", "\(requestTimeout)"]
+        }
+        if enableMetrics {
+            args += ["--metrics"]
+            if !adminKey.trimmingCharacters(in: .whitespaces).isEmpty {
+                args += ["--admin-key", adminKey.trimmingCharacters(in: .whitespaces)]
+            }
         }
         // Spec-decode: explicit flags either way so the server's CLI defaults
         // can't drift out from under the UI.
@@ -488,6 +505,8 @@ extension ServerOptions {
         if let v = try c.decodeIfPresent(Bool.self, forKey: .noVision) { noVision = v }
         if let v = try c.decodeIfPresent(LogLevel.self, forKey: .logLevel) { logLevel = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .requestTimeout) { requestTimeout = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .enableMetrics) { enableMetrics = v }
+        if let v = try c.decodeIfPresent(String.self, forKey: .adminKey) { adminKey = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .enablePLD) { enablePLD = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .pldDraftLen) { pldDraftLen = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .pldKeyLen) { pldKeyLen = v }
@@ -584,6 +603,14 @@ extension ServerOptions {
         "requestTimeout": .init(
             title: "Request timeout (s)",
             explainer: "Max seconds a single HTTP request is allowed to take. 0 = unlimited. Long agent loops may need 600+.",
+            needsRestart: true),
+        "enableMetrics": .init(
+            title: "Metrics & Dashboard",
+            explainer: "Expose Prometheus metrics at /metrics and the admin dashboard at /admin (opt-in).",
+            needsRestart: true),
+        "adminKey": .init(
+            title: "Admin Key",
+            explainer: "Optional bearer token protecting admin POST actions (cache eviction, etc.). Leave blank to leave them open on localhost.",
             needsRestart: true),
         "enablePLD": .init(
             title: "Enable PLD (recommended)",

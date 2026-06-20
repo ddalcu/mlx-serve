@@ -36,6 +36,32 @@ const TaskBasicInfo = extern struct {
     suspend_count: i32,
 };
 
+/// task_vm_info truncated through phys_footprint (rev1). Field order matches
+/// <mach/task_info.h> exactly; @sizeOf/@sizeOf(i32) == 38 == TASK_VM_INFO_REV1_COUNT,
+/// so the kernel fills through phys_footprint without overrunning the buffer.
+const TaskVmInfo = extern struct {
+    virtual_size: u64,
+    region_count: i32,
+    page_size: i32,
+    resident_size: u64,
+    resident_size_peak: u64,
+    device: u64,
+    device_peak: u64,
+    internal: u64,
+    internal_peak: u64,
+    external: u64,
+    external_peak: u64,
+    reusable: u64,
+    reusable_peak: u64,
+    purgeable_volatile_pmap: u64,
+    purgeable_volatile_resident: u64,
+    purgeable_volatile_virtual: u64,
+    compressed: u64,
+    compressed_peak: u64,
+    compressed_lifetime: u64,
+    phys_footprint: u64,
+};
+
 const CpuLoadInfo = extern struct {
     ticks: [4]u32, // user, system, idle, nice
 };
@@ -77,6 +103,16 @@ pub fn getAppRssMb() u32 {
     var count: u32 = @sizeOf(TaskBasicInfo) / @sizeOf(i32);
     if (task_info(mach_task_self_, 20, @ptrCast(&info), &count) != 0) return 0;
     return @intCast(info.resident_size / (1024 * 1024));
+}
+
+/// Process physical memory footprint in MB (TASK_VM_INFO flavor 22). Unlike
+/// resident_size, this includes MLX's Metal/IOKit + compressed memory — the
+/// only figure that reflects a loaded model's true footprint on Apple Silicon.
+pub fn getAppMemFootprintMb() u32 {
+    var info = std.mem.zeroes(TaskVmInfo);
+    var count: u32 = @sizeOf(TaskVmInfo) / @sizeOf(i32); // 38 = TASK_VM_INFO_REV1_COUNT
+    if (task_info(mach_task_self_, 22, @ptrCast(&info), &count) != 0) return 0;
+    return @intCast(info.phys_footprint / (1024 * 1024));
 }
 
 /// Bytes of physical memory available for new allocation without heavy
@@ -200,4 +236,12 @@ fn cfDictGet(dict: ?*const anyopaque, key_name: [*:0]const u8) ?*const anyopaque
     const key = CFStringCreateWithCString(null, key_name, 0x08000100) orelse return null;
     defer CFRelease(key);
     return CFDictionaryGetValue(dict, key);
+}
+
+test "getAppMemFootprintMb returns a plausible nonzero footprint" {
+    const fp = getAppMemFootprintMb();
+    // The test process itself footprints several MB; a wrong flavor/offset
+    // would yield 0 or absurd garbage.
+    try std.testing.expect(fp > 0);
+    try std.testing.expect(fp < 1024 * 1024); // < 1 TB sanity bound
 }

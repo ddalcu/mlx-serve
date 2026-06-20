@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mlx-serve Admin</title>
+<style>
+:root{--bg:#111217;--panel:#1a1c23;--border:#2c2e3a;--text:#d0d1d7;--muted:#8a8d99;--accent:#3b82f6;--green:#22c55e;--yellow:#f59e0b;--red:#ef4444;--font:-apple-system,BlinkMacSystemFont,'Segoe UI',system-ui,sans-serif}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--bg);color:var(--text);font-family:var(--font);min-height:100vh}
+header{background:var(--panel);border-bottom:1px solid var(--border);padding:12px 24px;display:flex;align-items:center;justify-content:space-between}
+.logo{font-size:16px;font-weight:700;color:var(--accent)}.logo span{color:var(--text)}
+#hdr-status{font-size:12px;padding:3px 12px;border-radius:12px;background:var(--border);color:var(--muted)}
+#hdr-status.live{background:#0f2a0f;color:var(--green)}
+#hdr-status.err{background:#2a0f0f;color:var(--red)}
+main{max-width:1280px;margin:0 auto;padding:20px 24px}
+#disabled-msg{display:none;text-align:center;padding:80px 20px;color:var(--muted)}
+#disabled-msg h2{font-size:20px;margin-bottom:10px;color:var(--text)}
+#disabled-msg code{font-family:monospace;color:var(--accent)}
+#content{display:none}
+.sec{font-size:11px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);margin:20px 0 10px 2px}
+.row{display:grid;gap:16px;margin-bottom:0}
+.r4{grid-template-columns:repeat(4,1fr)}
+.r2{grid-template-columns:repeat(2,1fr)}
+.panel{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:16px}
+.lbl{font-size:11px;text-transform:uppercase;letter-spacing:.06em;color:var(--muted);margin-bottom:8px}
+.val{font-size:30px;font-weight:700;line-height:1;color:var(--text)}
+.unit{font-size:14px;font-weight:400;color:var(--muted);margin-left:3px}
+.sub{font-size:11px;color:var(--muted);margin-top:6px}
+.track{height:6px;background:var(--border);border-radius:3px;margin-top:12px;overflow:hidden}
+.fill{height:100%;border-radius:3px;background:var(--accent);transition:width .4s}
+.fill.warn{background:var(--yellow)}.fill.crit{background:var(--red)}
+.spark{width:100%;height:72px}
+.tot-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;text-align:center}
+.tot-v{font-size:22px;font-weight:700}.tot-l{font-size:11px;color:var(--muted);margin-top:4px}
+.code-box{background:var(--bg);border:1px solid var(--border);border-radius:6px;padding:14px 18px;font-family:'SF Mono','Fira Code',monospace;font-size:12px;color:#93c5fd;white-space:pre;overflow-x:auto;margin-top:10px}
+</style>
+</head>
+<body>
+<header>
+  <div class="logo">mlx<span>-serve</span> · Admin</div>
+  <div id="hdr-status">Loading…</div>
+</header>
+<main>
+  <div id="disabled-msg">
+    <h2>Metrics Not Enabled</h2>
+    <p>Start mlx-serve with <code>--metrics</code> to enable this dashboard.</p>
+  </div>
+  <div id="content">
+    <div class="sec">Loaded model</div>
+    <div class="panel" id="model-panel" style="margin-bottom:4px">
+      <span class="val" id="model-name" style="font-size:22px">—</span>
+      <div class="sub" id="model-meta" style="margin-top:8px">loading model info…</div>
+    </div>
+    <div class="sec">Throughput</div>
+    <div class="row r4">
+      <div class="panel"><div class="lbl">Request Rate</div><span class="val" id="req-rate">—</span><span class="unit">req/s</span><div class="sub" id="req-total">— total</div></div>
+      <div class="panel"><div class="lbl">Tokens / sec</div><span class="val" id="tok-rate">—</span><span class="unit">tok/s</span><div class="sub" id="tok-total">— total generated</div></div>
+      <div class="panel"><div class="lbl">Avg TTFT</div><span class="val" id="ttft-avg">—</span><span class="unit">ms</span><div class="sub" id="ttft-count">— requests measured</div></div>
+      <div class="panel"><div class="lbl">Cache Hit Rate</div><span class="val" id="cache-pct">—</span><span class="unit">%</span><div class="sub" id="cache-detail">— / — queries</div></div>
+    </div>
+    <div class="sec">System</div>
+    <div class="row r4">
+      <div class="panel"><div class="lbl">Running</div><span class="val" id="running">0</span><span class="unit">slots</span></div>
+      <div class="panel"><div class="lbl">Waiting</div><span class="val" id="waiting">0</span><span class="unit">slots</span></div>
+      <div class="panel"><div class="lbl">GPU Utilization</div><span class="val" id="gpu-pct">0</span><span class="unit">%</span><div class="track"><div class="fill" id="gpu-bar" style="width:0%"></div></div></div>
+      <div class="panel"><div class="lbl">Memory</div><span class="val" id="rss">0</span><span class="unit">MB</span></div>
+    </div>
+    <div class="sec">History (last 2 min)</div>
+    <div class="row r2">
+      <div class="panel"><div class="lbl" style="margin-bottom:6px">TTFT (ms)</div><svg class="spark" id="ttft-chart" viewBox="0 0 600 72" preserveAspectRatio="none"></svg></div>
+      <div class="panel"><div class="lbl" style="margin-bottom:6px">Tokens / sec</div><svg class="spark" id="tok-chart" viewBox="0 0 600 72" preserveAspectRatio="none"></svg></div>
+    </div>
+    <div class="sec">Totals</div>
+    <div class="panel">
+      <div class="tot-grid">
+        <div><div class="tot-v" id="tot-ok">0</div><div class="tot-l">Successful</div></div>
+        <div><div class="tot-v" id="tot-cancel">0</div><div class="tot-l">Cancelled</div></div>
+        <div><div class="tot-v" id="tot-prompt">0</div><div class="tot-l">Prompt Tokens</div></div>
+        <div><div class="tot-v" id="tot-gen">0</div><div class="tot-l">Generated Tokens</div></div>
+      </div>
+    </div>
+    <div class="sec">Grafana Integration</div>
+    <div class="panel">
+      <div class="sub">Point Prometheus at the <code>/metrics</code> endpoint on this host:</div>
+      <div class="code-box" id="prom-cfg">Loading…</div>
+    </div>
+  </div>
+</main>
+<script>
+'use strict';
+const H=60;
+const samples=[];  // (t, counters) ring buffer for smooth trailing-window rates
+const ttftH=[],tokH=[];
+const $=id=>document.getElementById(id);
+
+function spark(id,data,color){
+  const svg=$(id);
+  if(data.length<2){svg.innerHTML='';return;}
+  const max=Math.max(...data,0.001);
+  const n=data.length,W=600,HT=72,p=4;
+  const pts=data.map((v,i)=>{
+    const x=p+(i/(n-1))*(W-2*p);
+    const y=HT-p-(v/max)*(HT-2*p);
+    return x+','+y;
+  }).join(' ');
+  svg.innerHTML='<polyline points="'+pts+'" fill="none" stroke="'+color+'" stroke-width="1.5" stroke-linejoin="round"/><line x1="'+p+'" y1="'+(HT-1)+'" x2="'+(W-p)+'" y2="'+(HT-1)+'" stroke="#2c2e3a" stroke-width="1"/>';
+}
+
+function fmt(v,d){
+  if(v===null||isNaN(v))return '—';
+  if(v>=1e6)return(v/1e6).toFixed(1)+'M';
+  if(v>=1e3)return(v/1e3).toFixed(1)+'K';
+  return v.toFixed(d===undefined?1:d);
+}
+
+function status(cls,txt){const e=$('hdr-status');e.className=cls;e.textContent=txt;}
+
+async function tick(){
+  let d;
+  try{
+    const r=await fetch('/admin/metrics.json');
+    if(r.status===503){
+      $('disabled-msg').style.display='block';
+      $('content').style.display='none';
+      status('err','Metrics disabled');return;
+    }
+    if(!r.ok)throw new Error('HTTP '+r.status);
+    d=await r.json();
+  }catch(e){status('err','Error: '+e.message);return;}
+
+  $('disabled-msg').style.display='none';
+  // Must be an explicit value: style.display='' reverts to the stylesheet rule
+  // (#content{display:none}), leaving the panels hidden. Use 'block'.
+  $('content').style.display='block';
+  status('live','● Live · 2s');
+
+  const c=d.counters,g=d.gauges,h=d.histograms;
+  const now=Date.now();
+  const th=h.time_to_first_token_seconds;
+  // Two timescales:
+  //  • tok/s comes from the generation_tokens_live GAUGE (completed tokens plus
+  //    tokens generated so far by in-flight slots), sampled server-side every
+  //    2s. It moves continuously even mid-request, so a short ~4s window gives a
+  //    real-time tok/s with no 0-reads between long-request completions. Falls
+  //    back to the completion counter on older servers without the gauge.
+  //  • req/s and TTFT come from completion COUNTERS, which only move when a
+  //    request finishes — genuinely sparse. A ~12s window keeps them stable
+  //    without the old 30s lag.
+  const liveTok=(g.generation_tokens_live!=null)?g.generation_tokens_live:c.generation_tokens_total;
+  samples.push({t:now,req:c.requests_success_total,tok:liveTok,tc:th.count,ts:th.sum});
+  while(samples.length>2 && now-samples[0].t>12000) samples.shift();
+  // newest sample at least winMs old (tightest window ≥ winMs); oldest while warming up
+  const at=winMs=>{let s=samples[0];for(const x of samples){if(now-x.t>=winMs)s=x;else break;}return s;};
+  let rr=null,tr=null,tavg=null;
+  if(samples.length>1){
+    const wt=at(4000), dtt=(now-wt.t)/1000;
+    if(dtt>0) tr=Math.max(0,(liveTok-wt.tok)/dtt);
+    const wr=at(12000), dtr=(now-wr.t)/1000;
+    if(dtr>0) rr=Math.max(0,(c.requests_success_total-wr.req)/dtr);
+    const dc=th.count-wr.tc;
+    tavg=dc>0?((th.sum-wr.ts)/dc)*1000:(th.count>0?(th.sum/th.count)*1000:null);
+    ttftH.push(tavg!==null?tavg:0);
+    tokH.push(tr!==null?tr:0);
+    if(ttftH.length>H)ttftH.shift();
+    if(tokH.length>H)tokH.shift();
+  }else if(th.count>0){
+    tavg=(th.sum/th.count)*1000;
+  }
+
+  $('req-rate').textContent=rr!==null?fmt(rr,2):'—';
+  $('req-total').textContent=fmt(c.requests_success_total,0)+' total';
+  $('tok-rate').textContent=tr!==null?fmt(tr,0):'—';
+  $('tok-total').textContent=fmt(c.generation_tokens_total,0)+' total generated';
+
+  const tAll=h.time_to_first_token_seconds;
+  const tDisp=tavg!==null?tavg:(tAll.count>0?(tAll.sum/tAll.count)*1000:null);
+  $('ttft-avg').textContent=tDisp!==null?fmt(tDisp,0):'—';
+  $('ttft-count').textContent=tAll.count+' requests measured';
+
+  const cq=c.prefix_cache_queries_total,ch=c.prefix_cache_hits_total;
+  $('cache-pct').textContent=cq>0?Math.round(ch/cq*100):'—';
+  $('cache-detail').textContent=ch+' / '+cq+' queries';
+
+  $('running').textContent=g.requests_running;
+  $('waiting').textContent=g.requests_waiting;
+  const gp=g.gpu_utilization_pct;
+  $('gpu-pct').textContent=gp;
+  const bar=$('gpu-bar');
+  bar.style.width=gp+'%';
+  bar.className='fill'+(gp>=90?' crit':gp>=70?' warn':'');
+  $('rss').textContent=g.memory_mb;
+
+  $('tot-ok').textContent=fmt(c.requests_success_total,0);
+  $('tot-cancel').textContent=fmt(c.requests_cancelled_total,0);
+  $('tot-prompt').textContent=fmt(c.prompt_tokens_total,0);
+  $('tot-gen').textContent=fmt(c.generation_tokens_total,0);
+
+  spark('ttft-chart',ttftH,'#3b82f6');
+  spark('tok-chart',tokH,'#22c55e');
+}
+
+const port=window.location.port||'80';
+const host=window.location.hostname;
+$('prom-cfg').textContent='# prometheus.yml\nscrape_configs:\n  - job_name: mlx_serve\n    static_configs:\n      - targets: [\''+host+':'+port+'\']\n    metrics_path: /metrics\n    scrape_interval: 15s';
+
+async function loadModel(){
+  try{
+    const r=await fetch('/v1/models'); if(!r.ok)return;
+    const list=(await r.json()).data||[];
+    const m=list.find(x=>x.loaded)||list[0]; if(!m)return;
+    $('model-name').textContent=m.id;
+    const meta=m.meta||{},parts=[];
+    if(meta.architecture)parts.push(meta.architecture);
+    if(meta.quantization)parts.push(meta.quantization);
+    if(meta.is_moe)parts.push('MoE');
+    if(meta.context_length)parts.push(meta.context_length.toLocaleString()+' ctx');
+    if(Array.isArray(m.capabilities)&&m.capabilities.length)parts.push(m.capabilities.join(', '));
+    $('model-meta').textContent=parts.join('  ·  ');
+  }catch(e){}
+}
+loadModel();
+setInterval(loadModel,30000);
+tick();
+setInterval(tick,2000);
+</script>
+</body>
+</html>
