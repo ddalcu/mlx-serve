@@ -538,7 +538,18 @@ struct ChatDetailView: View {
     // re-arms only when the user toggles Agent off in that tab.
     @State private var pendingApproval: ToolApprovalRequest?
     @State private var toolAllowList = SessionToolAllowList()
-    @FocusState private var inputFocused: Bool
+    // Plain Bool (not @FocusState): the composer is an NSTextView wrapper, so
+    // AppKit first-responder is the source of truth and GrowingTextEditor mirrors
+    // it back into this flag. The Cmd+V attach monitor reads it; on-appear and
+    // post-generation code set it true to (re)focus the field.
+    @State private var inputFocused = false
+    @State private var composerHeight: CGFloat = 36
+    // Pre-send intent nudge: when a message looks agentic / MCP-bound but the
+    // matching mode is off, confirm before sending. `intentSuppress` remembers a
+    // per-session "Send anyway" so we stop nagging that chat (keyed by session
+    // id — the view is reused across tabs).
+    @State private var pendingIntentPrompt: IntentPrompt?
+    @State private var intentSuppress = SessionIntentSuppression()
 
 
     private var session: ChatSession? {
@@ -728,32 +739,28 @@ struct ChatDetailView: View {
                             .disabled(server.status != .running || chatEngine.isGenerating)
                     }
 
-                    // Dark pill input
-                    TextField("Message", text: $inputText, axis: .vertical)
-                        .font(.body)
-                        .textFieldStyle(.plain)
-                        .lineLimit(1...15)
-                        .padding(.horizontal, 12)
-                        .padding(.vertical, 8)
-                        .focused($inputFocused)
+                    // Dark pill input — NSTextView-backed so a big paste stays
+                    // smooth and the mouse wheel scrolls once it grows past the cap.
+                    GrowingTextEditor(text: $inputText,
+                                      isFocused: $inputFocused,
+                                      measuredHeight: $composerHeight,
+                                      isIdle: composerState == .idle,
+                                      onSend: { sendMessage() })
+                        .frame(height: max(36, composerHeight))
+                        .padding(.horizontal, 5)
                         .disabled(server.status != .running)
-                        .onKeyPress(keys: [.return, .init("\u{03}")], phases: .down) { press in
-                            if press.modifiers.contains(.shift) {
-                                inputText += "\n"
-                                return .handled
-                            }
-                            if composerState == .idle {
-                                sendMessage()
-                            }
-                            return .handled
-                        }
-                        .onAppear {
-                            DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) {
-                                inputFocused = true
-                            }
-                        }
                         .background(Color(nsColor: .textBackgroundColor))
                         .clipShape(RoundedRectangle(cornerRadius: 20))
+                        .overlay(alignment: .topLeading) {
+                            if inputText.isEmpty {
+                                Text("Message")
+                                    .font(.body)
+                                    .foregroundStyle(.secondary)
+                                    .padding(.leading, 14)
+                                    .padding(.top, 8)
+                                    .allowsHitTesting(false)
+                            }
+                        }
                         .overlay(
                             RoundedRectangle(cornerRadius: 20)
                                 .stroke(Color.secondary.opacity(0.25), lineWidth: 0.5)
@@ -1048,6 +1055,31 @@ struct ChatDetailView: View {
                 NSEvent.removeMonitor(monitor)
                 pasteMonitor = nil
             }
+        }
+        // Pre-send nudge to enable Agent / MCP mode when the message looks like
+        // it needs it. "Send Anyway" suppresses the suggestion for this chat.
+        .confirmationDialog(
+            pendingIntentPrompt == .mcp ? "Enable MCP first?" : "Enable Agent Mode first?",
+            isPresented: Binding(get: { pendingIntentPrompt != nil },
+                                 set: { if !$0 { pendingIntentPrompt = nil } }),
+            titleVisibility: .visible,
+            presenting: pendingIntentPrompt
+        ) { prompt in
+            Button(prompt == .mcp ? "Enable MCP & Send" : "Enable Agent Mode & Send") {
+                enableForPrompt(prompt)
+                pendingIntentPrompt = nil
+                proceedSend()
+            }
+            Button("Send Anyway") {
+                intentSuppress.suppress(prompt, for: sessionId)
+                pendingIntentPrompt = nil
+                proceedSend()
+            }
+            Button("Cancel", role: .cancel) { pendingIntentPrompt = nil }
+        } message: { prompt in
+            Text(prompt == .mcp
+                 ? "This looks like it needs one of your MCP servers, but MCP mode is off. Enable it so those tools are available?"
+                 : "This looks like a task for the agent (creating files, running commands, browsing the web…), but Agent mode is off. Enable it so the model can use its tools?")
         }
         // Persist the toolbar toggles back onto the visible session so each tab
         // remembers its own Think/Agent/MCP choice. Telegram sessions write the
@@ -1378,6 +1410,59 @@ struct ChatDetailView: View {
         // a Mac-typed turn (the composer is already replaced by a view-only bar;
         // this is belt-and-suspenders for any other trigger path).
         if session?.isExternalBridge == true { return }
+
+        // Pre-send nudge: if the message looks like it needs a mode that's off,
+        // confirm first (unless this chat already declined that suggestion). The
+        // dialog's buttons call proceedSend(); nothing is consumed until then.
+        let trimmed = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !chatEngine.isGenerating, server.status == .running, !trimmed.isEmpty,
+           let prompt = detectIntentPrompt(for: trimmed) {
+            pendingIntentPrompt = prompt
+            return
+        }
+        proceedSend()
+    }
+
+    /// Names of MCP servers the user currently has enabled (disabled != true).
+    private func enabledMCPServerNames() -> [String] {
+        var out: [String] = []
+        for (id, entry) in mcpManager.config.mcpServers where entry.disabled != true {
+            out.append(id)
+        }
+        return out
+    }
+
+    /// Decide whether to nudge before sending. MCP takes priority over Agent
+    /// because a named server is the more specific signal; both are gated on the
+    /// matching mode being off and the suggestion not already declined this chat.
+    private func detectIntentPrompt(for text: String) -> IntentPrompt? {
+        let servers = enabledMCPServerNames()
+        if !mcpMode, !servers.isEmpty,
+           !intentSuppress.isSuppressed(.mcp, for: sessionId),
+           ComposerIntent.wantsMCP(text, serverNames: servers) {
+            return .mcp
+        }
+        if !isAgentMode,
+           !intentSuppress.isSuppressed(.agent, for: sessionId),
+           ComposerIntent.wantsAgent(text) {
+            return .agent
+        }
+        return nil
+    }
+
+    /// Enable the mode the nudge suggested, mirroring the toolbar toggles'
+    /// side effects (turning Agent on clears Thinking).
+    private func enableForPrompt(_ prompt: IntentPrompt) {
+        switch prompt {
+        case .agent:
+            isAgentMode = true
+            enableThinking = false
+        case .mcp:
+            mcpMode = true
+        }
+    }
+
+    private func proceedSend() {
         isNearBottom = true // snap to bottom on send
 
         var text = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -2588,5 +2673,181 @@ fileprivate final class IntrinsicTextView: NSTextView {
         super.setFrameSize(newSize)
         // Width changes (parent re-flow) require a layout-driven height re-check.
         invalidateIntrinsicContentSize()
+    }
+}
+
+// MARK: - GrowingTextEditor (editable, auto-growing, scrollable composer)
+
+/// Pure layout math for the auto-growing composer. Factored out of the
+/// NSViewRepresentable so it is unit-testable (the view itself is not).
+enum ComposerLayout {
+    /// Clamp the editor height between `minLines` and `maxLines` worth of text.
+    /// Returns the height SwiftUI frames the editor at, plus whether the content
+    /// overflows the cap (so the inner scroll view scrolls — the behavior the
+    /// old `TextField(axis: .vertical)` never had).
+    static func resolve(contentHeight: CGFloat,
+                        lineHeight: CGFloat,
+                        minLines: Int,
+                        maxLines: Int,
+                        verticalInset: CGFloat) -> (height: CGFloat, scrolls: Bool) {
+        let lo = max(1, minLines)
+        let hi = max(lo, maxLines)
+        let minH = lineHeight * CGFloat(lo) + verticalInset
+        let maxH = lineHeight * CGFloat(hi) + verticalInset
+        let natural = contentHeight + verticalInset
+        let clamped = Swift.max(minH, Swift.min(natural, maxH))
+        return (clamped, natural > maxH + 0.5)
+    }
+}
+
+/// What a Return keypress does in the composer. Mirrors the prior `.onKeyPress`
+/// contract: Shift+Return is always a newline; a bare Return sends only when
+/// idle, and is otherwise swallowed (never a stray newline mid-generation).
+enum ComposerReturnAction: Equatable { case send, newline, ignore }
+
+enum ComposerKey {
+    static func onReturn(shift: Bool, isIdle: Bool) -> ComposerReturnAction {
+        if shift { return .newline }
+        return isIdle ? .send : .ignore
+    }
+}
+
+/// Editable, auto-growing, scrollable text input backed by NSTextView in an
+/// NSScrollView. SwiftUI's `TextField(axis: .vertical)` re-lays out the whole
+/// string on every edit (janky on a big paste) and exposes no scroller (the
+/// mouse wheel does nothing past the line limit). TextKit handles large text
+/// natively and the scroll view gives real mouse-wheel scrolling.
+fileprivate struct GrowingTextEditor: NSViewRepresentable {
+    @Binding var text: String
+    @Binding var isFocused: Bool
+    @Binding var measuredHeight: CGFloat
+    var font: NSFont = .preferredFont(forTextStyle: .body)
+    var minLines: Int = 1
+    var maxLines: Int = 15
+    var isIdle: Bool
+    var onSend: () -> Void
+
+    let inset = NSSize(width: 7, height: 8)
+
+    func makeCoordinator() -> Coordinator { Coordinator(self) }
+
+    func makeNSView(context: Context) -> NSScrollView {
+        let scroll = NSScrollView()
+        scroll.drawsBackground = false
+        scroll.hasVerticalScroller = true
+        scroll.hasHorizontalScroller = false
+        scroll.autohidesScrollers = true
+        scroll.borderType = .noBorder
+        scroll.verticalScrollElasticity = .allowed
+
+        let tv = ComposerTextView()
+        tv.delegate = context.coordinator
+        tv.isEditable = context.environment.isEnabled
+        tv.isSelectable = true
+        tv.isRichText = false
+        tv.allowsUndo = true
+        tv.drawsBackground = false
+        tv.font = font
+        tv.textColor = .labelColor
+        tv.insertionPointColor = .labelColor
+        tv.textContainerInset = inset
+        tv.isVerticallyResizable = true
+        tv.isHorizontallyResizable = false
+        tv.textContainer?.widthTracksTextView = true
+        tv.textContainer?.lineFragmentPadding = 2
+        tv.autoresizingMask = [.width]
+        tv.string = text
+        tv.onBecomeFocus = { [weak c = context.coordinator] in c?.setFocus(true) }
+        tv.onResignFocus = { [weak c = context.coordinator] in c?.setFocus(false) }
+
+        scroll.documentView = tv
+        context.coordinator.textView = tv
+        DispatchQueue.main.async { context.coordinator.recomputeHeight() }
+        return scroll
+    }
+
+    func updateNSView(_ scroll: NSScrollView, context: Context) {
+        guard let tv = scroll.documentView as? ComposerTextView else { return }
+        context.coordinator.parent = self
+        // External text changes (e.g. cleared on send) without clobbering an
+        // in-progress edit at the same value.
+        if tv.string != text {
+            tv.string = text
+            context.coordinator.recomputeHeight()
+        }
+        let enabled = context.environment.isEnabled
+        if tv.isEditable != enabled { tv.isEditable = enabled }
+        // Drive AppKit first-responder from the SwiftUI focus mirror.
+        if isFocused, tv.window != nil, tv.window?.firstResponder !== tv {
+            DispatchQueue.main.async { tv.window?.makeFirstResponder(tv) }
+        }
+    }
+
+    final class Coordinator: NSObject, NSTextViewDelegate {
+        var parent: GrowingTextEditor
+        weak var textView: ComposerTextView?
+        init(_ parent: GrowingTextEditor) { self.parent = parent }
+
+        func textDidChange(_ notification: Notification) {
+            guard let tv = textView else { return }
+            if parent.text != tv.string { parent.text = tv.string }
+            recomputeHeight()
+        }
+
+        func textView(_ textView: NSTextView, doCommandBy commandSelector: Selector) -> Bool {
+            guard commandSelector == #selector(NSResponder.insertNewline(_:)) else { return false }
+            let shift = NSApp.currentEvent?.modifierFlags.contains(.shift) ?? false
+            switch ComposerKey.onReturn(shift: shift, isIdle: parent.isIdle) {
+            case .newline:
+                textView.insertNewlineIgnoringFieldEditor(self)
+                return true
+            case .send:
+                parent.onSend()
+                return true
+            case .ignore:
+                return true
+            }
+        }
+
+        func setFocus(_ value: Bool) {
+            guard parent.isFocused != value else { return }
+            DispatchQueue.main.async { self.parent.isFocused = value }
+        }
+
+        func recomputeHeight() {
+            guard let tv = textView, let lm = tv.layoutManager, let tc = tv.textContainer else { return }
+            lm.ensureLayout(for: tc)
+            let content = lm.usedRect(for: tc).height
+            let line = tv.font.map { $0.ascender - $0.descender + $0.leading } ?? 16
+            let r = ComposerLayout.resolve(contentHeight: content,
+                                           lineHeight: max(line, 12),
+                                           minLines: parent.minLines,
+                                           maxLines: parent.maxLines,
+                                           verticalInset: parent.inset.height * 2)
+            // Past the cap the scroll view owns overflow; below it the frame grows.
+            if let scroll = tv.enclosingScrollView {
+                scroll.hasVerticalScroller = r.scrolls
+            }
+            if abs(parent.measuredHeight - r.height) > 0.5 {
+                DispatchQueue.main.async { self.parent.measuredHeight = r.height }
+            }
+        }
+    }
+}
+
+/// NSTextView that reports focus transitions so SwiftUI's `inputFocused` mirror
+/// stays accurate — the Cmd+V "attach from clipboard" monitor reads it.
+fileprivate final class ComposerTextView: NSTextView {
+    var onBecomeFocus: (() -> Void)?
+    var onResignFocus: (() -> Void)?
+    override func becomeFirstResponder() -> Bool {
+        let ok = super.becomeFirstResponder()
+        if ok { onBecomeFocus?() }
+        return ok
+    }
+    override func resignFirstResponder() -> Bool {
+        let ok = super.resignFirstResponder()
+        if ok { onResignFocus?() }
+        return ok
     }
 }

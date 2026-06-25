@@ -64,4 +64,27 @@ final class ProcessToolSchemaTests: XCTestCase {
         XCTAssertTrue(names.contains("readProcessOutput"))
         XCTAssertTrue(names.contains("listProcesses"))
     }
+
+    /// The path-omission class: weak models routinely emit a `writeFile` with a
+    /// huge `content` value and NO `path` (the big blob crowds out the small
+    /// required param). The cheap lever is the description — it must FOREGROUND
+    /// `path` (name it before `content`) so an autoregressive model commits the
+    /// path before the body, and the example a model copies must show `path`.
+    @MainActor
+    func testWriteFileDescriptionForegroundsPath() {
+        let writeFile = byName()["writeFile"]!
+        let params = writeFile["parameters"] as! [String: Any]
+        // Required contract is unchanged.
+        XCTAssertEqual(params["required"] as! [String], ["path", "content"])
+
+        let desc = writeFile["description"] as! String
+        let firstPath = desc.range(of: "path")!.lowerBound
+        let firstContent = desc.range(of: "content")!.lowerBound
+        XCTAssertLessThan(firstPath, firstContent,
+            "writeFile description must name `path` before `content` (path-omission steer)")
+
+        // The copy-paste example must carry an explicit path.
+        XCTAssertTrue(AgentEngine.toolExample(for: "writeFile").contains("\"path\""),
+            "writeFile Example: must show a path the model can copy")
+    }
 }
