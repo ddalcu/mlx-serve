@@ -43,6 +43,7 @@ const model_mod = @import("model.zig");
 const vision_mod = @import("vision.zig");
 const chat_mod = @import("chat.zig");
 const prefix_cache_mod = @import("prefix_cache.zig");
+const metrics_mod = @import("metrics.zig");
 const tokenize_cache_mod = @import("tokenize_cache.zig");
 const model_registry_mod = @import("model_registry.zig");
 const arch_ds4 = @import("arch/ds4.zig");
@@ -173,6 +174,9 @@ pub const LoadParams = struct {
     /// installs it on the entry's `llama_engine` field. Mutually exclusive with
     /// `ds4_path` and the MLX safetensors path.
     llama_path: []const u8 = "",
+    /// Optional metrics sink. Null when --metrics is off (the default).
+    /// Passed to `Scheduler.init` which stores it for the inference thread.
+    metrics: ?*metrics_mod.Metrics = null,
 };
 
 /// Submit-time parameters. `prompt_ids` and `eos_token_ids` are duped into the
@@ -346,6 +350,9 @@ pub const Slot = struct {
     completion_tokens: u32,
     prefill_tps: f64,
     decode_tps: f64,
+    /// Monotonic timestamp captured in Slot.init (before queue wait). Used
+    /// to compute real TTFT = (start→first-token) = total_elapsed − decode_ns.
+    request_start_ts: std.Io.Timestamp,
     /// Wall-clock nanoseconds spent in `runPrefill` for this slot. Includes
     /// hot-prefix-cache lookup/restore and the model forward over the
     /// uncached tail. Populated by the scheduler main loop.
@@ -488,6 +495,7 @@ pub const Slot = struct {
             .completion_tokens = 0,
             .prefill_tps = 0.0,
             .decode_tps = 0.0,
+            .request_start_ts = std.Io.Timestamp.now(io, .boot),
             .prefill_ns = 0,
             .decode_ns = 0,
             .generated_ids = null,
@@ -919,6 +927,8 @@ pub const Scheduler = struct {
     /// inference thread drains this queue between ticks where it owns the
     /// stream binding, so all mlx ops stay on one thread.
     cleanup_queue: std.ArrayList(*Slot),
+    /// Metrics sink. Null when --metrics is off. Populated from LoadParams.
+    metrics: ?*metrics_mod.Metrics,
     /// Counts `pending.len + decoding.len` for back-pressure.
     in_flight: u32,
     /// Capacity for back-pressure. `submit` waits when in_flight >= cap.
@@ -933,6 +943,10 @@ pub const Scheduler = struct {
 
     inference_thread: ?std.Thread,
     shutdown: std.atomic.Value(bool),
+    /// Set by the HTTP admin thread to request prefix-cache eviction on the
+    /// next scheduling cycle. Cleared by the inference thread after handling.
+    /// Safe: written from conn thread, read from inference thread via atomics.
+    evict_cache_requested: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     started: std.atomic.Value(bool),
     started_mu: std.Io.Mutex,
     started_cond: std.Io.Condition,
@@ -1001,6 +1015,7 @@ pub const Scheduler = struct {
             .embed_queue = std.ArrayList(*EmbedRequest).empty,
             .load_queue = std.ArrayList(*LoadRequest).empty,
             .cleanup_queue = std.ArrayList(*Slot).empty,
+            .metrics = params.metrics,
             .in_flight = 0,
             .queue_cap = cap + 32,
             .submit_cond = .init,
@@ -1494,6 +1509,16 @@ pub const Scheduler = struct {
         if (slot.model.ds4_engine != null or slot.model.llama_engine != null) return false;
         const cfg = slot.model.config orelse return false;
         return modelBatchable(cfg);
+    }
+
+    /// Called from the HTTP admin conn thread to request async prefix-cache eviction.
+    /// The inference thread processes it at the next scheduling cycle.
+    /// Thread-safe: the flag write is atomic; queue_cond wakes the sleeping thread.
+    pub fn requestCacheEviction(self: *Scheduler) void {
+        self.evict_cache_requested.store(true, .release);
+        self.queue_mu.lockUncancelable(self.io);
+        defer self.queue_mu.unlock(self.io);
+        self.queue_cond.broadcast(self.io);
     }
 };
 
@@ -2247,10 +2272,15 @@ fn inferenceLoop(ctx: ThreadCtx) void {
         {
             sch.queue_mu.lockUncancelable(sch.io);
             defer sch.queue_mu.unlock(sch.io);
-            while (sch.pending.items.len == 0 and sch.decoding.items.len == 0 and sch.vision_queue.items.len == 0 and sch.embed_queue.items.len == 0 and sch.cleanup_queue.items.len == 0 and sch.load_queue.items.len == 0 and !sch.shutdown.load(.acquire)) {
+            while (sch.pending.items.len == 0 and sch.decoding.items.len == 0 and sch.vision_queue.items.len == 0 and sch.embed_queue.items.len == 0 and sch.cleanup_queue.items.len == 0 and sch.load_queue.items.len == 0 and !sch.evict_cache_requested.load(.acquire) and !sch.shutdown.load(.acquire)) {
                 sch.queue_cond.waitUncancelable(sch.io, &sch.queue_mu);
             }
             if (sch.shutdown.load(.acquire)) break;
+
+            // Admin: prefix-cache eviction requested externally.
+            if (sch.evict_cache_requested.swap(false, .acq_rel)) {
+                if (sch.hot_prefix_cache) |hc| hc.invalidateAll("admin request");
+            }
 
             // If only vision/embed/cleanup/load work is pending, loop back to drain it.
             if (sch.pending.items.len == 0 and sch.decoding.items.len == 0) continue;
@@ -2267,7 +2297,7 @@ fn inferenceLoop(ctx: ThreadCtx) void {
         if (n_prefill > 0) {
             for (to_prefill[0..n_prefill]) |slot| {
                 if (slot.cancelled.load(.acquire)) {
-                    slot.markFinished("cancelled");
+                    finishSlot(sch, slot, "cancelled");
                     continue;
                 }
                 var prefill_sw = io_util.Stopwatch.init(sch.io);
@@ -2277,7 +2307,7 @@ fn inferenceLoop(ctx: ThreadCtx) void {
                         // an idle keepalive probe and set slot.cancelled);
                         // the chunk loop aborted. A clean finish, not an error.
                         log.info("[scheduler] prefill aborted: client disconnected\n", .{});
-                        slot.markFinished("cancelled");
+                        finishSlot(sch, slot, "cancelled");
                         continue;
                     }
                     log.err("[scheduler] prefill failed for slot: {s}\n", .{@errorName(err)});
@@ -2626,6 +2656,30 @@ fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
     // finalize here instead.
     if (slot.legacy_gen) |*g| g.logSpecStats();
     commitSlotIfApplicable(sch, slot);
+    // Record per-request metrics while slot fields are still live (before
+    // markFinished broadcasts — conn thread may call deinit immediately after).
+    if (sch.metrics) |m| {
+        // Real TTFT = time from request arrival (Slot.init, pre-queue-wait) to
+        // first token = total_elapsed − decode_ns.  For single-user servers
+        // queue wait is 0, so this equals prefill_ns; for concurrent traffic
+        // it correctly includes queue latency.
+        const total_elapsed_ns: u64 = @intCast(
+            slot.request_start_ts.untilNow(sch.io, .boot).nanoseconds,
+        );
+        const real_ttft_ns = if (total_elapsed_ns > slot.decode_ns)
+            total_elapsed_ns - slot.decode_ns
+        else
+            slot.prefill_ns; // fallback: shouldn't happen, but don't go negative
+        m.recordRequest(
+            reason,
+            real_ttft_ns,
+            slot.prefill_ns,
+            slot.decode_ns,
+            slot.prompt_tokens,
+            slot.completion_tokens,
+            slot.cached_tokens,
+        );
+    }
     slot.markFinished(reason);
 }
 

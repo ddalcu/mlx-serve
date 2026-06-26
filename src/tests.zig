@@ -25,6 +25,8 @@ test {
     _ = @import("diffusion.zig");
     _ = @import("tokenizer.zig");
     _ = @import("prefix_cache.zig");
+    _ = @import("metrics.zig");
+    _ = @import("status.zig");
     _ = @import("model_discovery.zig");
     _ = @import("gguf_meta.zig");
     _ = @import("model_registry.zig");

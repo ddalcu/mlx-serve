@@ -23,6 +23,7 @@ const arch_llama = @import("arch/llama.zig");
 const stb = @cImport({ @cInclude("stb_image.h"); });
 const webp = @cImport({ @cInclude("webp/decode.h"); });
 const metrics = @import("status.zig");
+const instr = @import("metrics.zig");
 
 const Transformer = transformer_mod.Transformer;
 const Tokenizer = tokenizer_mod.Tokenizer;
@@ -38,6 +39,11 @@ var shutdown_requested = std.atomic.Value(bool).init(false);
 /// detached conn thread still in `Scheduler.complete` would otherwise race
 /// deinit's teardown of the slot queues into a use-after-free (SIGSEGV).
 var active_conn_threads = std.atomic.Value(u32).init(0);
+/// Set from main.zig before serve() is called when --metrics is on.
+pub var g_metrics: ?*instr.Metrics = null;
+/// Optional admin API bearer token. If null, all admin POST endpoints are open.
+/// Set via --admin-key CLI flag.
+pub var g_admin_key: ?[]const u8 = null;
 
 const io_util = @import("io_util.zig");
 const ws_mod = @import("ws.zig");
@@ -622,6 +628,26 @@ pub fn serve(
     defer scheduler.deinit();
     global_scheduler = scheduler;
     defer global_scheduler = null;
+    // Gauge sampler: samples instantaneous system state every 2 s and
+    // writes to the metrics gauges. Only runs when --metrics is on.
+    // LIFO defer ordering: `stop` must be registered AFTER `join` so it runs
+    // FIRST (setting the flag), allowing the thread to exit before join() blocks.
+    // Do NOT check scheduler.shutdown here — deinit() (which sets that flag) is
+    // registered as the earliest defer and runs last, after the join.
+    var sampler_thread: ?std.Thread = null;
+    var sampler_stop = std.atomic.Value(bool).init(false);
+    if (g_metrics) |m| {
+        const ctx = GaugeSamplerCtx{
+            .metrics = m,
+            .scheduler = scheduler,
+            .stop = &sampler_stop,
+        };
+        sampler_thread = try std.Thread.spawn(.{}, gaugeSamplerLoop, .{ctx});
+        log.info("Prometheus metrics: ENABLED — GET http://{s}:{d}/metrics\n", .{ host, port });
+    }
+    // LIFO: join deferred first → runs second. stop deferred second → runs first.
+    defer if (sampler_thread) |t| t.join();
+    defer sampler_stop.store(true, .monotonic);
     global_registry = scheduler.registry;
     defer global_registry = null;
 
@@ -957,6 +983,54 @@ fn handleConnection(
     if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/health")) {
         log.debug("GET  /health -> 200\n", .{});
         try sendResponse(stream, "200 OK", "application/json", "{\"status\":\"ok\"}");
+        return;
+    }
+    if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/metrics")) {
+        if (g_metrics) |m| {
+            log.debug("GET  /metrics -> 200\n", .{});
+            var out: std.Io.Writer.Allocating = .init(allocator);
+            defer out.deinit();
+            try instr.renderPrometheus(m, &out.writer);
+            try sendResponse(stream, "200 OK", "text/plain; version=0.0.4; charset=utf-8", out.written());
+        } else {
+            try sendResponse(stream, "503 Service Unavailable", "text/plain", "metrics not enabled (start with --metrics)");
+        }
+        return;
+    }
+    // GET /admin — self-contained web dashboard (zero deps, polls /admin/metrics.json)
+    if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/admin")) {
+        const html = @embedFile("admin_dashboard.html");
+        try sendResponse(stream, "200 OK", "text/html; charset=utf-8", html);
+        return;
+    }
+    if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/admin/metrics.json")) {
+        if (g_metrics) |m| {
+            log.debug("GET  /admin/metrics.json -> 200\n", .{});
+            var out: std.Io.Writer.Allocating = .init(allocator);
+            defer out.deinit();
+            try instr.renderJson(m, &out.writer);
+            try sendResponse(stream, "200 OK", "application/json", out.written());
+        } else {
+            try sendResponse(stream, "503 Service Unavailable", "application/json",
+                "{\"error\":\"metrics not enabled — start with --metrics\"}");
+        }
+        return;
+    }
+    if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/admin/evict-prefix-cache")) {
+        const raw_headers = request[0..header_end_pos];
+        const auth_hdr = findHeader(raw_headers, "authorization");
+        if (!checkAdminAuth(auth_hdr)) {
+            try sendResponse(stream, "401 Unauthorized", "application/json",
+                "{\"error\":\"unauthorized — provide Authorization: Bearer <admin-key>\"}");
+            return;
+        }
+        const sch = global_scheduler orelse {
+            try sendResponse(stream, "503 Service Unavailable", "application/json",
+                "{\"error\":\"scheduler not ready\"}");
+            return;
+        };
+        sch.requestCacheEviction();
+        try sendResponse(stream, "200 OK", "application/json", "{\"ok\":true}");
         return;
     }
     if (std.mem.eql(u8, method, "OPTIONS")) {
@@ -1897,6 +1971,7 @@ fn handleStatusPage(
         \\<div class=row><span class=k>GPU memory</span><span class=v>{d} MB active · {d} MB peak</span></div>
         \\<div class=caps>{s}</div>
         \\</div>
+        \\<div style="margin:6px 0 28px"><a href=/admin style="display:inline-block;background:#1c2e57;color:#86b8ff;border:1px solid #1f3a5f;border-radius:8px;padding:10px 18px;font-weight:600;text-decoration:none">&#128202; Real-Time Model Metrics &rarr;</a></div>
         \\
         \\<h2>OpenAI Chat Completions</h2>
         \\<div class=card>
@@ -1930,6 +2005,8 @@ fn handleStatusPage(
         \\<div class=ep><span class="m get">GET</span><div><div class=p><a href=/v1/models>/v1/models</a></div><div class=d>OpenAI models list (id, capabilities, context length)</div></div></div>
         \\<div class=ep><span class="m get">GET</span><div><div class=p><a href=/props>/props</a></div><div class=d>llama.cpp-style server props (chat template, memory)</div></div></div>
         \\<div class=ep><span class="m get">GET</span><div><div class=p><a href=/health>/health</a></div><div class=d>Liveness probe</div></div></div>
+        \\<div class=ep><span class="m get">GET</span><div><div class=p><a href=/admin>/admin</a></div><div class=d>Real-time model metrics dashboard (throughput, latency, GPU, memory)</div></div></div>
+        \\<div class=ep><span class="m get">GET</span><div><div class=p><a href=/metrics>/metrics</a></div><div class=d>Prometheus metrics (text exposition format)</div></div></div>
         \\</div>
         \\
         \\<h2>Quick start</h2>
@@ -4702,6 +4779,48 @@ fn logHttpBody(label: []const u8, body: []const u8) void {
         body.len,
         body,
     });
+}
+
+/// Find the value of a named HTTP header in the raw header block.
+/// `name` must be lowercase (e.g. "authorization"). Case-insensitive compare.
+/// Returns null if the header is absent.
+fn findHeader(headers: []const u8, name: []const u8) ?[]const u8 {
+    var lines = std.mem.splitSequence(u8, headers, "\r\n");
+    while (lines.next()) |line| {
+        if (line.len <= name.len + 1) continue;
+        // Check prefix match case-insensitively up to the colon.
+        var match = true;
+        for (0..name.len) |j| {
+            if (std.ascii.toLower(line[j]) != name[j]) {
+                match = false;
+                break;
+            }
+        }
+        if (!match) continue;
+        if (line[name.len] != ':') continue;
+        const rest = line[name.len + 1 ..];
+        return std.mem.trim(u8, rest, " \t");
+    }
+    return null;
+}
+
+/// Constant-time string compare — prevents timing-oracle key guessing.
+fn timingSafeEql(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    var diff: u8 = 0;
+    for (a, b) |x, y| diff |= x ^ y;
+    return diff == 0;
+}
+
+/// Returns true if the request is authorized for admin mutating actions.
+/// If no admin key is configured (g_admin_key == null), all requests pass.
+/// `auth_header` is the value of the "Authorization" header (or null).
+fn checkAdminAuth(auth_header: ?[]const u8) bool {
+    const key = g_admin_key orelse return true; // open mode
+    const hdr = auth_header orelse return false;
+    const prefix = "Bearer ";
+    if (!std.mem.startsWith(u8, hdr, prefix)) return false;
+    return timingSafeEql(hdr[prefix.len..], key);
 }
 
 fn findContentLength(headers: []const u8) ?usize {
@@ -9356,6 +9475,70 @@ test "utf8TrailingIncomplete partial after complete" {
 
 test "utf8TrailingIncomplete empty" {
     try testing.expectEqual(@as(usize, 0), utf8TrailingIncomplete(""));
+}
+
+const GaugeSamplerCtx = struct {
+    metrics: *instr.Metrics,
+    scheduler: *scheduler_mod.Scheduler,
+    /// Dedicated stop flag — set before joining the thread (LIFO defers ensure
+    /// this is written before join() blocks). Using a separate flag rather than
+    /// scheduler.shutdown avoids a LIFO deadlock: scheduler.deinit() (which sets
+    /// shutdown) is registered as the FIRST defer and therefore runs LAST, but
+    /// the join defer runs BEFORE it, so the loop would never see shutdown=true.
+    stop: *std.atomic.Value(bool),
+};
+
+/// Background thread: samples system gauges every 2 s.
+/// Exits when ctx.stop is set to true (see GaugeSamplerCtx.stop comment).
+/// Sample instantaneous system/queue state into the gauges. Non-blocking
+/// syscalls plus a brief scheduler-counter lock. Called by the sampler thread.
+fn sampleGauges(ctx: GaugeSamplerCtx) void {
+    // System gauges (non-blocking syscalls).
+    ctx.metrics.gpu_utilization_pct.set(@as(u64, metrics.getGpuPct()));
+    ctx.metrics.memory_mb.set(@as(u64, metrics.getAppMemFootprintMb()));
+
+    // Request queue depth + in-flight token progress — brief lock to read
+    // scheduler counters. `decoding` is guarded by queue_mu (slots are inserted
+    // / removed under it), so the slot pointers stay valid for the read; each
+    // slot's `completion_tokens` is a monotonic aligned u32 the inference thread
+    // bumps live, so an off-thread read is at worst a tick stale — exactly right
+    // for an approximate gauge, and it keeps the per-token decode path lock-free.
+    ctx.scheduler.queue_mu.lockUncancelable(ctx.scheduler.io);
+    const running = @as(u64, ctx.scheduler.in_flight);
+    const waiting = @as(u64, ctx.scheduler.pending.items.len);
+    var in_progress: u64 = 0;
+    for (ctx.scheduler.decoding.items) |slot| in_progress += @as(u64, slot.completion_tokens);
+    ctx.scheduler.queue_mu.unlock(ctx.scheduler.io);
+    ctx.metrics.requests_running.set(running);
+    ctx.metrics.requests_waiting.set(waiting);
+    // Real-time throughput source: completed generation tokens plus tokens
+    // generated so far by still-decoding slots. The dashboard derives a live
+    // tok/s from this gauge over a short window — non-zero even mid-request,
+    // unlike the completion-only counter which only moves when a request ends.
+    ctx.metrics.generation_tokens_live.set(ctx.metrics.generation_tokens_total.load() + in_progress);
+}
+
+fn gaugeSamplerLoop(ctx: GaugeSamplerCtx) void {
+    // Wake every 500 ms to check the stop flag; sample system state
+    // once per 2-second interval. The faster cadence (was 15 s) is what makes
+    // generation_tokens_live a real-time tok/s source — the dashboard windows
+    // over a few of these samples. Cost is trivial: a few non-blocking syscalls
+    // and one brief scheduler-counter lock every 2 s, never on the decode path.
+    // Uses std.c.nanosleep (POSIX) because std.time.sleep was removed in Zig
+    // 0.16 — this thread has no Io handle.
+    const SAMPLE_INTERVAL_TICKS: u64 = 4; // 4 × 500 ms = 2 s
+    const poll_ts = std.c.timespec{ .sec = 0, .nsec = 500_000_000 };
+    // Sample once immediately so the dashboard / Grafana show real values from
+    // the first scrape instead of zeros for the first interval.
+    sampleGauges(ctx);
+    var tick: u64 = 0;
+    while (!ctx.stop.load(.monotonic)) {
+        _ = std.c.nanosleep(&poll_ts, null);
+        tick += 1;
+        if (tick < SAMPLE_INTERVAL_TICKS) continue;
+        tick = 0;
+        sampleGauges(ctx);
+    }
 }
 
 test "parseJsonFloat returns value when present" {
