@@ -35,4 +35,5 @@ test {
     _ = @import("arch/llama.zig");
     _ = @import("wav.zig");
     _ = @import("tts.zig");
+    _ = @import("flux.zig");
 }

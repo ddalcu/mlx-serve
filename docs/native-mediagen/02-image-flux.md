@@ -4,8 +4,26 @@
 implementation served from `mlx-serve`. No Python. Exposed as an OpenAI-compatible
 `/v1/images/generations` endpoint.
 
-**Status:** 🔴 Not started. **Modality 2 of 3** (after audio, before video). Branch `feature/Any2Any`.
-Commit locally when feature-complete + tested.
+**Status:** 🟢 **Engine done + validated** (FLUX.2-klein-4B, `src/flux.zig`). **Modality 2 of 3.**
+Branch `feature/Any2Any`. End-to-end vs the Python reference (seed 42, "a red apple on a wooden
+table, studio lighting", 4 steps, 1024×1024): text encoder **corr 0.99973**, DiT **corr 0.99990**,
+VAE **corr 0.99998**, **end-to-end corr 0.99950 / PSNR 37.9 dB** — a real PNG essentially identical
+to Python, seed-exact noise via `mlx_random_key`+`mlx_random_normal`.
+
+Gotchas surfaced (worth CLAUDE.md notes):
+1. `Flux2Modulation` applies `silu(temb)` **before** its linear — skipping it tanks the DiT to corr 0.29.
+2. Strided/lazy mlx arrays + conv/readback (same class as the lazy-slice→gather_qmm gotcha): `mlx_conv2d`
+   miscomputes on strided input, and `mlx_array_data_float32` on a lazy *transpose* returns source memory
+   order — `mlx_contiguous` before conv and before reading output.
+3. Qwen hidden states have massive-activation outliers (|x|≈15000) — validate the text encoder by
+   **correlation**, not absolute rmse.
+
+VAE convs are bf16 OHWI (direct `mlx_conv2d`, no transpose); transformer/text Linears are affine-4bit g64
+(existing quant path); seed-exact noise is free.
+
+*Remaining for full feature*: Qwen3 chat-template tokenization (shared with audio's tokenizer work),
+`/v1/images/generations` endpoint + dispatch, real PNG encoding (engine emits PPM today — vendor
+`stb_image_write.h`), `ImageGenService` app swap, FLUX.1-schnell fast-follow (T5+CLIP).
 
 ---
 
