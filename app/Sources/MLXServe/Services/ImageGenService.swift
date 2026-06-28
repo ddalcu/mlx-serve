@@ -36,58 +36,60 @@ final class ImageGenService: ObservableObject {
     }
 
     func generate(_ request: ImageGenRequest) {
-        guard python.status.imagesReady else {
-            phase = .failed("Python environment is not ready.")
-            return
-        }
         guard !request.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             phase = .failed("Prompt is empty.")
             return
         }
+        // Native path: serve the FLUX model with a dedicated mlx-serve instance and
+        // POST /v1/images/generations. No Python.
+        guard let modelDir = NativeGenServer.resolveModelDir(repo: request.model.repo) else {
+            phase = .failed("Model \(request.model.repo) is not downloaded. Download it first.")
+            return
+        }
 
         task?.cancel()
-        phase = .running(step: 0, total: request.steps, message: "Starting...")
+        phase = .running(step: 0, total: request.steps, message: "Loading model…")
         log = []
 
         let outputPath = Self.makeOutputPath(prompt: request.prompt)
-        let args = Self.buildArgs(request, outputPath: outputPath)
+        let repo = request.model.repo
+        let prompt = request.prompt
+        let size = "\(request.width)x\(request.height)"
+        let steps = request.steps
 
         task = Task {
             do {
-                let stream = python.runScript(source: Self.mfluxScript, args: args)
-                for try await event in stream {
-                    switch event {
-                    case .progress(let step, let total, let message):
-                        phase = .running(step: step, total: total, message: message)
-                    case .complete(let path):
-                        phase = .completed(path: path)
-                        insertRecent(path)
-                    case .log(let line):
-                        appendLog(line)
-                    }
+                _ = try await NativeGenServer.shared.ensure(modelDir: modelDir)
+                if Task.isCancelled { phase = .idle; return }
+                phase = .running(step: 1, total: steps, message: "Generating…")
+                let data = try await NativeGenServer.shared.post(
+                    path: "/v1/images/generations",
+                    json: ["model": repo, "prompt": prompt, "size": size]
+                )
+                guard let png = Self.decodePngB64(data) else {
+                    phase = .failed("Server returned no image data.")
+                    return
                 }
-                // Stream finished without a complete event — treat as success
-                // if the file materialized, otherwise as failure.
-                if FileManager.default.fileExists(atPath: outputPath) {
-                    if case .completed = phase { /* already set */ } else {
-                        phase = .completed(path: outputPath)
-                        insertRecent(outputPath)
-                    }
-                } else if case .running = phase {
-                    phase = .failed("Generation finished without output.")
-                }
-            } catch GenError.cancelled {
+                try png.write(to: URL(fileURLWithPath: outputPath))
+                phase = .completed(path: outputPath)
+                insertRecent(outputPath)
+            } catch is CancellationError {
                 phase = .idle
             } catch {
-                // Prefer the actual error message the Python script emitted
-                // (kept in `log` with an "ERROR: " prefix) over the generic
-                // "Python exited with code N". The Python message usually
-                // includes actionable context (e.g. HF gated-repo auth steps).
-                let actionable = log.last(where: { $0.hasPrefix("ERROR: ") })
-                    .map { String($0.dropFirst("ERROR: ".count)) }
-                phase = .failed(actionable ?? error.localizedDescription)
+                phase = .failed(error.localizedDescription)
             }
         }
+    }
+
+    /// Extract the base64 PNG from an OpenAI `{data:[{b64_json}]}` response body.
+    /// Pure + static so it's unit-testable without a running server.
+    static func decodePngB64(_ body: Data) -> Data? {
+        guard let obj = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
+              let arr = obj["data"] as? [[String: Any]],
+              let b64 = arr.first?["b64_json"] as? String,
+              let png = Data(base64Encoded: b64)
+        else { return nil }
+        return png
     }
 
     func cancel() {

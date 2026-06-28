@@ -38,59 +38,45 @@ final class AudioGenService: ObservableObject {
     }
 
     func generate(_ request: AudioGenRequest) {
-        // mlx-audio doesn't shell out to ffmpeg, so `.needsFFmpeg` is still a
-        // usable state — same gate image generation uses.
-        guard python.status.imagesReady else {
-            phase = .failed("Python environment is not ready.")
-            return
-        }
         guard !request.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             phase = .failed("Text is empty.")
             return
         }
+        // Native path: serve the TTS model with a dedicated mlx-serve instance and
+        // POST /v1/audio/speech. No Python.
+        guard let modelDir = NativeGenServer.resolveModelDir(repo: request.model.repo) else {
+            phase = .failed("Model \(request.model.repo) is not downloaded. Download it first.")
+            return
+        }
 
         task?.cancel()
-        // 3-phase progress: Load → Synthesize → Done.
-        phase = .running(step: 0, total: 3, message: "Starting...")
+        phase = .running(step: 0, total: 3, message: "Loading model…")
         log = []
 
         let outputPath = Self.makeOutputPath(text: request.text)
-        let args = Self.buildArgs(request, outputPath: outputPath)
+        let repo = request.model.repo
+        let text = request.text
 
         task = Task {
             do {
-                let stream = python.runScript(source: Self.script, args: args)
-                for try await event in stream {
-                    switch event {
-                    case .progress(let step, let total, let message):
-                        phase = .running(step: step, total: total, message: message)
-                    case .complete(let path):
-                        phase = .completed(path: path)
-                        insertRecent(path)
-                    case .log(let line):
-                        appendLog(line)
-                    }
+                _ = try await NativeGenServer.shared.ensure(modelDir: modelDir)
+                if Task.isCancelled { phase = .idle; return }
+                phase = .running(step: 1, total: 3, message: "Synthesizing…")
+                let data = try await NativeGenServer.shared.post(
+                    path: "/v1/audio/speech",
+                    json: ["model": repo, "input": text]
+                )
+                guard data.count > 44 else {
+                    phase = .failed("Server returned an empty audio response.")
+                    return
                 }
-                if FileManager.default.fileExists(atPath: outputPath) {
-                    if case .completed = phase { /* already set */ } else {
-                        phase = .completed(path: outputPath)
-                        insertRecent(outputPath)
-                    }
-                } else if case .running = phase {
-                    phase = .failed("Generation finished without output.")
-                }
-            } catch GenError.cancelled {
+                try data.write(to: URL(fileURLWithPath: outputPath))
+                phase = .completed(path: outputPath)
+                insertRecent(outputPath)
+            } catch is CancellationError {
                 phase = .idle
             } catch {
-                let actionable = log.last(where: { $0.hasPrefix("ERROR: ") })
-                    .map { String($0.dropFirst("ERROR: ".count)) }
-                phase = .failed(actionable ?? error.localizedDescription)
-                // A failed `import mlx_audio` means the venv drifted out from
-                // under a stale `.ready` status — re-detect so the pane flips
-                // back to the installer instead of just showing red text.
-                if let msg = actionable, VideoGenService.indicatesVenvNeedsReinstall(msg) {
-                    await python.refresh()
-                }
+                phase = .failed(error.localizedDescription)
             }
         }
     }
