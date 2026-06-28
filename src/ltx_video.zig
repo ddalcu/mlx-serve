@@ -1263,6 +1263,98 @@ fn ditAdaLNSingle(comp: *const Component, alloc: std.mem.Allocator, t_sin: mlx.m
     return .{ .params = params, .embedded = embedded };
 }
 
+// ════════════════════════════════════════════════════════════════════════
+// The 48-block DiT (BasicAVTransformerBlock) — the last big video piece.
+// Joint audio+video transformer: per block, 8 sublayers (video/audio self-attn,
+// video/audio text cross-attn, a2v/v2a cross-modal attn, video/audio FF), each
+// AdaLN-modulated. Weights q4 g64/b4 (to_q/k/v/out, ff, gate) + a bf16 linear
+// `.bias`; adaLN scale_shift tables F32. Reference: transformer.py / attention.py.
+// ════════════════════════════════════════════════════════════════════════
+
+/// q4 linear over a Component: y = x @ dequant(<base>.weight).T + <base>.bias.
+/// Mirrors `gQLin` (affine g64 b4) but reads from a Component and adds the
+/// quantized Linear's separate bf16 `.bias` (present on every DiT projection).
+fn dQLin(comp: *const Component, alloc: std.mem.Allocator, x: mlx.mlx_array, base: []const u8, s: S) !mlx.mlx_array {
+    const wk = try std.fmt.allocPrint(alloc, "{s}.weight", .{base});
+    defer alloc.free(wk);
+    const sk = try std.fmt.allocPrint(alloc, "{s}.scales", .{base});
+    defer alloc.free(sk);
+    const bk = try std.fmt.allocPrint(alloc, "{s}.biases", .{base});
+    defer alloc.free(bk);
+    const lbk = try std.fmt.allocPrint(alloc, "{s}.bias", .{base});
+    defer alloc.free(lbk);
+    const wq = comp.get(wk) orelse return error.MissingDitWeight;
+    const sc = comp.get(sk) orelse return error.MissingDitWeight;
+    const bi = comp.get(bk) orelse return error.MissingDitWeight;
+    var mm = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_quantized_matmul(&mm, x, wq, sc, bi, true, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(4), "affine", s));
+    if (comp.get(lbk)) |lb| {
+        var out = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_add(&out, mm, lb, s));
+        _ = mlx.mlx_array_free(mm);
+        return out;
+    }
+    return mm;
+}
+
+/// AdaLN scalar unpack: `reshape(params,[1,P,dim]) + table[None]`. `params` is
+/// (1, P*dim) bf16 from the global adaln_single; `table_key` is the per-block
+/// (P, dim) F32 scale_shift table. Returns the combined [1, P, dim] (f32).
+fn adalnCombine(comp: *const Component, alloc: std.mem.Allocator, params: mlx.mlx_array, table_key: []const u8, P: u32, dim: u32, s: S) !mlx.mlx_array {
+    _ = alloc;
+    const table = comp.get(table_key) orelse return error.MissingDitWeight; // [P,dim] f32
+    const Pi: c_int = @intCast(P);
+    const di: c_int = @intCast(dim);
+    var p3 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(p3);
+    try mlx.check(mlx.mlx_reshape(&p3, params, &[_]c_int{ 1, Pi, di }, 3, s));
+    var t3 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(t3);
+    try mlx.check(mlx.mlx_reshape(&t3, table, &[_]c_int{ 1, Pi, di }, 3, s));
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_add(&out, p3, t3, s)); // bf16 + f32 → f32 (broadcast over batch=1)
+    return out;
+}
+
+/// Slice row `i` of a combined adaLN array [1,P,dim] → [1,1,dim].
+fn adalnRow(combined: mlx.mlx_array, i: u32, dim: u32, s: S) !mlx.mlx_array {
+    const di: c_int = @intCast(dim);
+    const ii: c_int = @intCast(i);
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_slice(&out, combined, &[_]c_int{ 0, ii, 0 }, 3, &[_]c_int{ 1, ii + 1, di }, 3, &[_]c_int{ 1, 1, 1 }, 3, s));
+    return out;
+}
+
+/// `x * (1 + scale) + shift` (AdaLN modulation). scale/shift broadcast [1,1,dim].
+fn modulate(x: mlx.mlx_array, scale: mlx.mlx_array, shift: mlx.mlx_array, s: S) !mlx.mlx_array {
+    const one = mlx.mlx_array_new_float(1.0);
+    defer _ = mlx.mlx_array_free(one);
+    var sp1 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sp1);
+    try mlx.check(mlx.mlx_add(&sp1, scale, one, s));
+    var xs = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(xs);
+    try mlx.check(mlx.mlx_multiply(&xs, x, sp1, s));
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_add(&out, xs, shift, s));
+    return out;
+}
+
+/// compute_video_normed_sa: `rmsAF(video_hidden) * (1+scale_sa) + shift_sa`
+/// where (shift_sa, scale_sa) = unpack rows 0,1 of (params + scale_shift_table).
+/// `table_key` = e.g. "transformer.transformer_blocks.0.scale_shift_table".
+fn ditNormedSA(comp: *const Component, alloc: std.mem.Allocator, video_hidden: mlx.mlx_array, params: mlx.mlx_array, table_key: []const u8, dim: u32, eps: f32, s: S) !mlx.mlx_array {
+    const comb = try adalnCombine(comp, alloc, params, table_key, 9, dim, s);
+    defer _ = mlx.mlx_array_free(comb);
+    const shift = try adalnRow(comb, 0, dim, s);
+    defer _ = mlx.mlx_array_free(shift);
+    const scale = try adalnRow(comb, 1, dim, s);
+    defer _ = mlx.mlx_array_free(scale);
+    const normed = try rmsAF(video_hidden, dim, eps, s);
+    defer _ = mlx.mlx_array_free(normed);
+    return modulate(normed, scale, shift, s);
+}
+
 // ── Tests ──
 
 const testing = std.testing;
@@ -1721,4 +1813,59 @@ test "ltx DiT adaLN conditioning reproduces AdaLayerNormSingle" {
     std.debug.print("[ltx-ada] params corr={d:.6} embedded corr={d:.6}\n", .{ cp, ce });
     try testing.expect(cp > 0.999);
     try testing.expect(ce > 0.999);
+}
+
+// Stage 1: compute_video_normed_sa (the adaLN-table unpack + affine-free RMS
+// modulation) reproduces the reference block-0 SA input. Catches the
+// shift/scale row-order trap cheaply. Gated on:
+//   LTX_TEST_MODEL=<q4 snapshot>, LTX_NSA_VH=<video_hidden.raw [1,192,4096]>,
+//   LTX_NSA_PARAMS=<video_adaln_params.raw [1,36864]>, LTX_NSA_REF=<normed_sa.raw [1,192,4096]>
+test "ltx DiT ditNormedSA reproduces compute_video_normed_sa" {
+    const dir = std.mem.span(std.c.getenv("LTX_TEST_MODEL") orelse return error.SkipZigTest);
+    const vhp = std.mem.span(std.c.getenv("LTX_NSA_VH") orelse return error.SkipZigTest);
+    const pp = std.mem.span(std.c.getenv("LTX_NSA_PARAMS") orelse return error.SkipZigTest);
+    const rp = std.mem.span(std.c.getenv("LTX_NSA_REF") orelse return error.SkipZigTest);
+    const allocator = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const cpu_s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(cpu_s);
+
+    const vp = try std.fmt.allocPrintSentinel(allocator, "{s}/transformer-dev.safetensors", .{dir}, 0);
+    defer allocator.free(vp);
+    var comp = try loadComponent(allocator, vp, cpu_s);
+    defer comp.deinit();
+
+    const vhbuf = try readF32(io, allocator, vhp);
+    defer allocator.free(vhbuf);
+    const pbuf = try readF32(io, allocator, pp);
+    defer allocator.free(pbuf);
+    const ref = try readF32(io, allocator, rp);
+    defer allocator.free(ref);
+
+    const Nv: c_int = @intCast(vhbuf.len / 4096);
+    const vh_f32 = mlx.mlx_array_new_data(vhbuf.ptr, &[_]c_int{ 1, Nv, 4096 }, 3, .float32);
+    defer _ = mlx.mlx_array_free(vh_f32);
+    var vh = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(vh);
+    try mlx.check(mlx.mlx_astype(&vh, vh_f32, .bfloat16, s));
+    const p_f32 = mlx.mlx_array_new_data(pbuf.ptr, &[_]c_int{ 1, 36864 }, 2, .float32);
+    defer _ = mlx.mlx_array_free(p_f32);
+    var params = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(params);
+    try mlx.check(mlx.mlx_astype(&params, p_f32, .bfloat16, s));
+
+    const out = try ditNormedSA(&comp, allocator, vh, params, "transformer.transformer_blocks.0.scale_shift_table", 4096, 1e-6, s);
+    defer _ = mlx.mlx_array_free(out);
+    var of = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(of);
+    try mlx.check(mlx.mlx_astype(&of, out, .float32, s));
+    _ = mlx.mlx_array_eval(of);
+
+    const n: usize = @intCast(mlx.mlx_array_size(of));
+    try testing.expectEqual(ref.len, n);
+    const corr = corrF32(mlx.mlx_array_data_float32(of).?, ref, 0);
+    std.debug.print("[ltx-nsa] normed_sa corr={d:.6} (n={d})\n", .{ corr, n });
+    try testing.expect(corr > 0.99);
 }
