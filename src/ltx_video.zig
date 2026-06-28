@@ -2189,6 +2189,76 @@ pub fn ditSampleCfg(
     return .{ .v = vx, .a = ax };
 }
 
+// ════════════════════════════════════════════════════════════════════════
+// Latent → frames: unpatchify the sampled video latent, VAE-decode, convert
+// to RGB uint8 frames. Reference: VideoLatentPatchifier.unpatchify + VideoDecoder
+// pixel conversion (clip[-1,1], (x+1)*127.5, uint8, CHW→HWC).
+// ════════════════════════════════════════════════════════════════════════
+
+/// Unpatchify: [1, F*H*W, C] → [1, C, F, H, W] (contiguous, ready for vaeDecode).
+pub fn unpatchifyVideo(tokens: mlx.mlx_array, F: u32, H: u32, W: u32, s: S) !mlx.mlx_array {
+    const C: c_int = mlx.getShape(tokens)[2];
+    var r = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(r);
+    try mlx.check(mlx.mlx_reshape(&r, tokens, &[_]c_int{ 1, @intCast(F), @intCast(H), @intCast(W), C }, 5, s));
+    var t = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(t);
+    try mlx.check(mlx.mlx_transpose_axes(&t, r, &[_]c_int{ 0, 4, 1, 2, 3 }, 5, s)); // [1,C,F,H,W]
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_contiguous(&out, t, false, s));
+    return out;
+}
+
+/// Convert decoded pixels [1,3,F,H,W] (≈[-1,1]) to RGB uint8 frames laid out as
+/// [F, H, W, 3] (row-major). Matches the reference clip→(x+1)*127.5→uint8→HWC.
+/// Returns a freshly-allocated `[]u8` of length F*H*W*3 (caller frees).
+pub fn framesToU8(pixels: mlx.mlx_array, alloc: std.mem.Allocator, s: S) ![]u8 {
+    const sh = mlx.getShape(pixels); // [1,3,F,H,W]
+    const Fp: usize = @intCast(sh[2]);
+    const Hp: usize = @intCast(sh[3]);
+    const Wp: usize = @intCast(sh[4]);
+    const lo = mlx.mlx_array_new_float(-1.0);
+    defer _ = mlx.mlx_array_free(lo);
+    const hi = mlx.mlx_array_new_float(1.0);
+    defer _ = mlx.mlx_array_free(hi);
+    var mx0 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(mx0);
+    try mlx.check(mlx.mlx_maximum(&mx0, pixels, lo, s));
+    var cl = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(cl);
+    try mlx.check(mlx.mlx_minimum(&cl, mx0, hi, s));
+    const one = mlx.mlx_array_new_float(1.0);
+    defer _ = mlx.mlx_array_free(one);
+    var p1 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(p1);
+    try mlx.check(mlx.mlx_add(&p1, cl, one, s));
+    const c127 = mlx.mlx_array_new_float(127.5);
+    defer _ = mlx.mlx_array_free(c127);
+    var sc = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sc);
+    try mlx.check(mlx.mlx_multiply(&sc, p1, c127, s));
+    var u8a = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(u8a);
+    try mlx.check(mlx.mlx_astype(&u8a, sc, .uint8, s)); // truncate, matches reference
+    // CHW→HWC: [1,3,F,H,W] → [1,F,H,W,3]
+    var fhwc = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(fhwc);
+    try mlx.check(mlx.mlx_transpose_axes(&fhwc, u8a, &[_]c_int{ 0, 2, 3, 4, 1 }, 5, s));
+    var cont = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(cont);
+    try mlx.check(mlx.mlx_contiguous(&cont, fhwc, false, s));
+    // No uint8 readback binding → read via exact f32 (values are integers 0..255).
+    var f32v = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(f32v);
+    try mlx.check(mlx.mlx_astype(&f32v, cont, .float32, s));
+    _ = mlx.mlx_array_eval(f32v);
+    const n = Fp * Hp * Wp * 3;
+    const data = mlx.mlx_array_data_float32(f32v).?;
+    const out = try alloc.alloc(u8, n);
+    for (0..n) |idx| out[idx] = @intFromFloat(data[idx]);
+    return out;
+}
+
 // ── Tests ──
 
 const testing = std.testing;
@@ -2531,6 +2601,14 @@ fn readI32(io: std.Io, allocator: std.mem.Allocator, path: []const u8) ![]i32 {
     const out = try allocator.alloc(i32, cnt);
     @memcpy(std.mem.sliceAsBytes(out), bytes[0 .. cnt * 4]);
     return out;
+}
+
+fn readU8(io: std.Io, allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    const f = try std.Io.Dir.openFileAbsolute(io, path, .{});
+    defer f.close(io);
+    var rb: [4096]u8 = undefined;
+    var rs = f.reader(io, &rb);
+    return rs.interface.allocRemaining(allocator, .limited(64 * 1024 * 1024));
 }
 
 fn corrF32(data: [*]const f32, ref: []const f32, start: usize) f64 {
@@ -3075,4 +3153,61 @@ test "ltx DiT ditSampleCfg reproduces guided denoise loop" {
     std.debug.print("[ltx-samp] final_v corr={d:.6} final_a corr={d:.6}\n", .{ vc, ac });
     try testing.expect(vc > 0.99);
     try testing.expect(ac > 0.99);
+}
+
+// Stage 5: latent → frames chain (unpatchifyVideo + vaeDecode + framesToU8)
+// reproduces the reference decoded uint8 frames. Gated on LTX_TEST_MODEL +
+// LTX_FRAMES_LATENT=<samp_final_v.raw [1,192,128]>, LTX_FRAMES_REF=<frames_u8.raw>.
+test "ltx DiT latent-to-frames reproduces reference decode" {
+    const dir = std.mem.span(std.c.getenv("LTX_TEST_MODEL") orelse return error.SkipZigTest);
+    const lp = std.mem.span(std.c.getenv("LTX_FRAMES_LATENT") orelse return error.SkipZigTest);
+    const rp = std.mem.span(std.c.getenv("LTX_FRAMES_REF") orelse return error.SkipZigTest);
+    const allocator = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const cpu_s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(cpu_s);
+
+    const vpth = try std.fmt.allocPrintSentinel(allocator, "{s}/vae_decoder.safetensors", .{dir}, 0);
+    defer allocator.free(vpth);
+    var comp = try loadComponent(allocator, vpth, cpu_s);
+    defer comp.deinit();
+    var it = comp.map.iterator();
+    while (it.next()) |e| _ = mlx.mlx_array_eval(e.value_ptr.*);
+
+    const latbuf = try readF32(io, allocator, lp);
+    defer allocator.free(latbuf);
+    const lat_f32 = mlx.mlx_array_new_data(latbuf.ptr, &[_]c_int{ 1, 192, 128 }, 3, .float32);
+    defer _ = mlx.mlx_array_free(lat_f32);
+    var tokens = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(tokens);
+    try mlx.check(mlx.mlx_astype(&tokens, lat_f32, .bfloat16, s));
+
+    const latent = try unpatchifyVideo(tokens, 2, 8, 12, s);
+    defer _ = mlx.mlx_array_free(latent);
+    const pixels = try vaeDecode(&comp, latent, s);
+    defer _ = mlx.mlx_array_free(pixels);
+    const frames = try framesToU8(pixels, allocator, s);
+    defer allocator.free(frames);
+
+    const ref = try readU8(io, allocator, rp);
+    defer allocator.free(ref);
+    try testing.expectEqual(ref.len, frames.len);
+    var se: f64 = 0;
+    var maxd: u32 = 0;
+    var exact: usize = 0;
+    for (frames, ref) |a, b| {
+        const d: i32 = @as(i32, a) - @as(i32, b);
+        se += @as(f64, @floatFromInt(d * d));
+        const ad: u32 = @abs(d);
+        maxd = @max(maxd, ad);
+        if (d == 0) exact += 1;
+    }
+    const mse = se / @as(f64, @floatFromInt(frames.len));
+    const psnr = if (mse > 0) 10.0 * std.math.log10(255.0 * 255.0 / mse) else 99.0;
+    const exact_frac = @as(f64, @floatFromInt(exact)) / @as(f64, @floatFromInt(frames.len));
+    std.debug.print("[ltx-frames] n={d} psnr={d:.2}dB max_diff={d} exact={d:.3}\n", .{ frames.len, psnr, maxd, exact_frac });
+    try testing.expect(psnr > 45.0);
+    try testing.expect(maxd <= 2);
 }
