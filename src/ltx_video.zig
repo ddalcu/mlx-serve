@@ -557,6 +557,363 @@ pub fn connectorProject(comp: *const Component, allocator: std.mem.Allocator, st
     return .{ .video = video, .audio = audio };
 }
 
+// ════════════════════════════════════════════════════════════════════════
+// Connector transformer (Embeddings1DConnector): the back half of the connector.
+// Projected video/audio embeds [1,T,dim] + valid-token count → 128 learnable
+// registers (replace pads) → 8 transformer blocks (gated attention, split-RoPE,
+// GELU FF, affine-free RMSNorm) → DiT conditioning [1,T,dim].
+// ════════════════════════════════════════════════════════════════════════
+
+/// Linear with bias: matmul(x, Wᵀ)+b. W stored [out,in]; transposed+materialized
+/// (a lazy transpose into matmul is the strided-array trap).
+fn linBias(comp: *const Component, allocator: std.mem.Allocator, x: mlx.mlx_array, comptime fmt: []const u8, args: anytype, s: S) !mlx.mlx_array {
+    const wk = try std.fmt.allocPrint(allocator, fmt ++ ".weight", args);
+    defer allocator.free(wk);
+    const bk = try std.fmt.allocPrint(allocator, fmt ++ ".bias", args);
+    defer allocator.free(bk);
+    const w = comp.get(wk) orelse return error.MissingConnectorWeight;
+    const b = comp.get(bk) orelse return error.MissingConnectorWeight;
+    var wt_lazy = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(wt_lazy);
+    try mlx.check(mlx.mlx_transpose_axes(&wt_lazy, w, &[_]c_int{ 1, 0 }, 2, s));
+    var wt = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(wt);
+    try mlx.check(mlx.mlx_contiguous(&wt, wt_lazy, false, s));
+    var mm = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(mm);
+    try mlx.check(mlx.mlx_matmul(&mm, x, wt, s));
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_add(&out, mm, b, s));
+    return out;
+}
+
+/// Affine-free RMS norm over the last axis (mx.fast.rms_norm(x, weight=None));
+/// mlx_fast_rms_norm crashes on null weight, so pass ones([dim]).
+fn rmsAF(x: mlx.mlx_array, dim: u32, eps: f32, s: S) !mlx.mlx_array {
+    const ov = mlx.mlx_array_new_float(1.0);
+    defer _ = mlx.mlx_array_free(ov);
+    var ones_w = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ones_w);
+    try mlx.check(mlx.mlx_broadcast_to(&ones_w, ov, &[_]c_int{@intCast(dim)}, 1, s));
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_fast_rms_norm(&out, x, ones_w, eps, s));
+    return out;
+}
+
+/// Weighted RMS norm (nn.RMSNorm with a learnable weight).
+fn rmsW(x: mlx.mlx_array, w: mlx.mlx_array, eps: f32, s: S) !mlx.mlx_array {
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_fast_rms_norm(&out, x, w, eps, s));
+    return out;
+}
+
+/// gelu_approx (tanh): 0.5*x*(1+tanh(√(2/π)*(x+0.044715*x³))).
+fn geluApprox(x: mlx.mlx_array, s: S) !mlx.mlx_array {
+    const c0 = mlx.mlx_array_new_float(0.7978845608028654);
+    defer _ = mlx.mlx_array_free(c0);
+    const c1 = mlx.mlx_array_new_float(0.044715);
+    defer _ = mlx.mlx_array_free(c1);
+    const half = mlx.mlx_array_new_float(0.5);
+    defer _ = mlx.mlx_array_free(half);
+    const one = mlx.mlx_array_new_float(1.0);
+    defer _ = mlx.mlx_array_free(one);
+    var x2 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x2);
+    try mlx.check(mlx.mlx_multiply(&x2, x, x, s));
+    var x3 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x3);
+    try mlx.check(mlx.mlx_multiply(&x3, x2, x, s));
+    var t1 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(t1);
+    try mlx.check(mlx.mlx_multiply(&t1, x3, c1, s));
+    var inner = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(inner);
+    try mlx.check(mlx.mlx_add(&inner, x, t1, s));
+    var inner_s = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(inner_s);
+    try mlx.check(mlx.mlx_multiply(&inner_s, inner, c0, s));
+    var th = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(th);
+    try mlx.check(mlx.mlx_tanh(&th, inner_s, s));
+    var thp = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(thp);
+    try mlx.check(mlx.mlx_add(&thp, th, one, s));
+    var hx = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(hx);
+    try mlx.check(mlx.mlx_multiply(&hx, x, half, s));
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_multiply(&out, hx, thp, s));
+    return out;
+}
+
+/// apply_rope_split: x [1,H,N,hd], cos/sin [1,H,N,hd/2] →
+/// concat([x1*cos - x2*sin, x1*sin + x2*cos]).
+fn applyRopeSplit(x: mlx.mlx_array, cos_f: mlx.mlx_array, sin_f: mlx.mlx_array, s: S) !mlx.mlx_array {
+    const sh = mlx.getShape(x);
+    const hd: c_int = sh[3];
+    const half = @divExact(hd, 2);
+    const st = [_]c_int{ 0, 0, 0, 0 };
+    const sp1 = [_]c_int{ sh[0], sh[1], sh[2], half };
+    const sp2 = [_]c_int{ sh[0], sh[1], sh[2], hd };
+    const st2 = [_]c_int{ 0, 0, 0, half };
+    const str = [_]c_int{ 1, 1, 1, 1 };
+    var x1 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x1);
+    try mlx.check(mlx.mlx_slice(&x1, x, &st, 4, &sp1, 4, &str, 4, s));
+    var x2 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x2);
+    try mlx.check(mlx.mlx_slice(&x2, x, &st2, 4, &sp2, 4, &str, 4, s));
+    var x1c = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x1c);
+    try mlx.check(mlx.mlx_multiply(&x1c, x1, cos_f, s));
+    var x2s = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x2s);
+    try mlx.check(mlx.mlx_multiply(&x2s, x2, sin_f, s));
+    var lo = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(lo);
+    try mlx.check(mlx.mlx_subtract(&lo, x1c, x2s, s));
+    var x1s = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x1s);
+    try mlx.check(mlx.mlx_multiply(&x1s, x1, sin_f, s));
+    var x2c = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x2c);
+    try mlx.check(mlx.mlx_multiply(&x2c, x2, cos_f, s));
+    var hi = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(hi);
+    try mlx.check(mlx.mlx_add(&hi, x1s, x2c, s));
+    const vec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(vec);
+    _ = mlx.mlx_vector_array_append_value(vec, lo);
+    _ = mlx.mlx_vector_array_append_value(vec, hi);
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_concatenate_axis(&out, vec, 3, s));
+    return out;
+}
+
+const RopeCS = struct { cos: mlx.mlx_array, sin: mlx.mlx_array };
+
+/// Precompute split-RoPE cos/sin for the connector → [1, heads, T, head_dim/2].
+/// freq_indices[j] = theta^(j/(num_freqs-1)) * pi/2 (log-spaced, fractional pos).
+fn connectorRope(allocator: std.mem.Allocator, T: u32, dim: u32, head_dim: u32, s: S) !RopeCS {
+    const theta: f32 = 10000.0;
+    const max_pos: f32 = 4096.0;
+    const num_heads: u32 = dim / head_dim;
+    const num_freqs: u32 = dim / 2; // inner_dim//2 (inner_dim == dim)
+    const hd_half: u32 = head_dim / 2;
+
+    const fi = try allocator.alloc(f32, num_freqs);
+    defer allocator.free(fi);
+    const denom: f32 = @floatFromInt(num_freqs - 1);
+    for (0..num_freqs) |j| {
+        const e: f32 = @as(f32, @floatFromInt(j)) / denom; // linspace 0..1
+        fi[j] = std.math.pow(f32, theta, e) * (std.math.pi / 2.0);
+    }
+    const freqs_buf = try allocator.alloc(f32, T * num_freqs);
+    defer allocator.free(freqs_buf);
+    for (0..T) |t| {
+        const frac: f32 = @as(f32, @floatFromInt(t)) / max_pos;
+        const sc = frac * 2.0 - 1.0;
+        for (0..num_freqs) |j| freqs_buf[t * num_freqs + j] = fi[j] * sc;
+    }
+    const fshape = [_]c_int{ 1, @intCast(T), @intCast(num_freqs) };
+    const freqs = mlx.mlx_array_new_data(freqs_buf.ptr, &fshape, 3, .float32);
+    defer _ = mlx.mlx_array_free(freqs);
+
+    var cos_raw = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(cos_raw);
+    try mlx.check(mlx.mlx_cos(&cos_raw, freqs, s));
+    var sin_raw = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sin_raw);
+    try mlx.check(mlx.mlx_sin(&sin_raw, freqs, s));
+    const rshape = [_]c_int{ 1, @intCast(T), @intCast(num_heads), @intCast(hd_half) };
+    var cos_r = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(cos_r);
+    try mlx.check(mlx.mlx_reshape(&cos_r, cos_raw, &rshape, 4, s));
+    var sin_r = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sin_r);
+    try mlx.check(mlx.mlx_reshape(&sin_r, sin_raw, &rshape, 4, s));
+    const perm = [_]c_int{ 0, 2, 1, 3 };
+    var cos_t = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_transpose_axes(&cos_t, cos_r, &perm, 4, s));
+    var sin_t = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_transpose_axes(&sin_t, sin_r, &perm, 4, s));
+    return .{ .cos = cos_t, .sin = sin_t };
+}
+
+/// Run one Embeddings1DConnector (8 blocks) on `input` [1,T,dim]. `n_valid` =
+/// number of valid (non-pad) tokens (left-padded → the last n_valid). `prefix` is
+/// e.g. "connector.video_embeddings_connector". Returns [1,T,dim].
+pub fn connectorTransform(comp: *const Component, allocator: std.mem.Allocator, input: mlx.mlx_array, n_valid: u32, dim: u32, head_dim: u32, prefix: []const u8, s: S) !mlx.mlx_array {
+    const T: u32 = @intCast(mlx.getShape(input)[1]);
+    const Ti: c_int = @intCast(T);
+    const di: c_int = @intCast(dim);
+    const num_heads: u32 = dim / head_dim;
+    const nh: c_int = @intCast(num_heads);
+    const hdi: c_int = @intCast(head_dim);
+    const nv: c_int = @intCast(n_valid);
+
+    // ── Register replacement (left-padded → valid first, registers fill rest) ──
+    const reg_key = try std.fmt.allocPrint(allocator, "{s}.learnable_registers", .{prefix});
+    defer allocator.free(reg_key);
+    const registers = comp.get(reg_key) orelse return error.MissingConnectorWeight; // [128, dim]
+    const num_reg: u32 = @intCast(mlx.getShape(registers)[0]);
+    const num_tiles: u32 = T / num_reg;
+    var reg3 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(reg3);
+    try mlx.check(mlx.mlx_reshape(&reg3, registers, &[_]c_int{ 1, @intCast(num_reg), di }, 3, s));
+    var reg_b = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(reg_b);
+    try mlx.check(mlx.mlx_broadcast_to(&reg_b, reg3, &[_]c_int{ @intCast(num_tiles), @intCast(num_reg), di }, 3, s));
+    var tiled = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(tiled);
+    try mlx.check(mlx.mlx_reshape(&tiled, reg_b, &[_]c_int{ 1, Ti, di }, 3, s)); // bf16 (registers bf16)
+    // Cast input to bf16 so the slice matches the bf16 registers for concat.
+    var input_bf = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(input_bf);
+    try mlx.check(mlx.mlx_astype(&input_bf, input, .bfloat16, s));
+    const str3 = [_]c_int{ 1, 1, 1 };
+    var valid = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(valid);
+    try mlx.check(mlx.mlx_slice(&valid, input_bf, &[_]c_int{ 0, Ti - nv, 0 }, 3, &[_]c_int{ 1, Ti, di }, 3, &str3, 3, s));
+    var reg_part = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(reg_part);
+    try mlx.check(mlx.mlx_slice(&reg_part, tiled, &[_]c_int{ 0, nv, 0 }, 3, &[_]c_int{ 1, Ti, di }, 3, &str3, 3, s));
+    var x = mlx.mlx_array_new();
+    {
+        const vec = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(vec);
+        _ = mlx.mlx_vector_array_append_value(vec, valid);
+        _ = mlx.mlx_vector_array_append_value(vec, reg_part);
+        try mlx.check(mlx.mlx_concatenate_axis(&x, vec, 1, s)); // [1,T,dim] bf16
+    }
+
+    // ── RoPE (cast to bf16 to match x) ──
+    const rope = try connectorRope(allocator, T, dim, head_dim, s);
+    defer _ = mlx.mlx_array_free(rope.cos);
+    defer _ = mlx.mlx_array_free(rope.sin);
+    var cosb = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(cosb);
+    try mlx.check(mlx.mlx_astype(&cosb, rope.cos, .bfloat16, s));
+    var sinb = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sinb);
+    try mlx.check(mlx.mlx_astype(&sinb, rope.sin, .bfloat16, s));
+
+    const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
+    const null_arr = mlx.mlx_array{ .ctx = null };
+
+    var blk: u32 = 0;
+    while (blk < 8) : (blk += 1) {
+        // ── Attention ──
+        const normed = try rmsAF(x, dim, 1e-6, s);
+        defer _ = mlx.mlx_array_free(normed);
+        var q = try linBias(comp, allocator, normed, "{s}.transformer_1d_blocks.{d}.attn1.to_q", .{ prefix, blk }, s);
+        defer _ = mlx.mlx_array_free(q);
+        var k = try linBias(comp, allocator, normed, "{s}.transformer_1d_blocks.{d}.attn1.to_k", .{ prefix, blk }, s);
+        defer _ = mlx.mlx_array_free(k);
+        const v = try linBias(comp, allocator, normed, "{s}.transformer_1d_blocks.{d}.attn1.to_v", .{ prefix, blk }, s);
+        defer _ = mlx.mlx_array_free(v);
+        {
+            const qnk = try std.fmt.allocPrint(allocator, "{s}.transformer_1d_blocks.{d}.attn1.q_norm.weight", .{ prefix, blk });
+            defer allocator.free(qnk);
+            const knk = try std.fmt.allocPrint(allocator, "{s}.transformer_1d_blocks.{d}.attn1.k_norm.weight", .{ prefix, blk });
+            defer allocator.free(knk);
+            const qn = try rmsW(q, comp.get(qnk).?, 1e-5, s);
+            _ = mlx.mlx_array_free(q);
+            q = qn;
+            const kn = try rmsW(k, comp.get(knk).?, 1e-5, s);
+            _ = mlx.mlx_array_free(k);
+            k = kn;
+        }
+        const perm = [_]c_int{ 0, 2, 1, 3 };
+        var qh = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(qh);
+        {
+            var qr = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(qr);
+            try mlx.check(mlx.mlx_reshape(&qr, q, &[_]c_int{ 1, Ti, nh, hdi }, 4, s));
+            try mlx.check(mlx.mlx_transpose_axes(&qh, qr, &perm, 4, s));
+        }
+        var kh = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(kh);
+        {
+            var kr = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(kr);
+            try mlx.check(mlx.mlx_reshape(&kr, k, &[_]c_int{ 1, Ti, nh, hdi }, 4, s));
+            try mlx.check(mlx.mlx_transpose_axes(&kh, kr, &perm, 4, s));
+        }
+        var vh = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(vh);
+        {
+            var vr = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(vr);
+            try mlx.check(mlx.mlx_reshape(&vr, v, &[_]c_int{ 1, Ti, nh, hdi }, 4, s));
+            try mlx.check(mlx.mlx_transpose_axes(&vh, vr, &perm, 4, s));
+        }
+        const qrp = try applyRopeSplit(qh, cosb, sinb, s);
+        defer _ = mlx.mlx_array_free(qrp);
+        const krp = try applyRopeSplit(kh, cosb, sinb, s);
+        defer _ = mlx.mlx_array_free(krp);
+        var attn = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(attn);
+        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn, qrp, krp, vh, scale, "", null_arr, null_arr, s));
+        { // per-head gate: 2*sigmoid(to_gate_logits(normed)) [1,T,heads] → [1,heads,T,1]
+            const gl = try linBias(comp, allocator, normed, "{s}.transformer_1d_blocks.{d}.attn1.to_gate_logits", .{ prefix, blk }, s);
+            defer _ = mlx.mlx_array_free(gl);
+            var sg = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(sg);
+            try mlx.check(mlx.mlx_sigmoid(&sg, gl, s));
+            const two = mlx.mlx_array_new_float(2.0);
+            defer _ = mlx.mlx_array_free(two);
+            var gate = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(gate);
+            try mlx.check(mlx.mlx_multiply(&gate, sg, two, s));
+            var gate_t = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(gate_t);
+            try mlx.check(mlx.mlx_transpose_axes(&gate_t, gate, &[_]c_int{ 0, 2, 1 }, 3, s));
+            var gate_4 = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(gate_4);
+            try mlx.check(mlx.mlx_reshape(&gate_4, gate_t, &[_]c_int{ 1, nh, Ti, 1 }, 4, s));
+            var gated = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_multiply(&gated, attn, gate_4, s));
+            _ = mlx.mlx_array_free(attn);
+            attn = gated;
+        }
+        var ao = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(ao);
+        {
+            var at = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(at);
+            try mlx.check(mlx.mlx_transpose_axes(&at, attn, &[_]c_int{ 0, 2, 1, 3 }, 4, s));
+            try mlx.check(mlx.mlx_reshape(&ao, at, &[_]c_int{ 1, Ti, di }, 3, s));
+        }
+        const proj = try linBias(comp, allocator, ao, "{s}.transformer_1d_blocks.{d}.attn1.to_out.0", .{ prefix, blk }, s);
+        defer _ = mlx.mlx_array_free(proj);
+        var x1 = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_add(&x1, x, proj, s));
+        _ = mlx.mlx_array_free(x);
+        x = x1;
+
+        // ── Feed-forward ──
+        const normed2 = try rmsAF(x, dim, 1e-6, s);
+        defer _ = mlx.mlx_array_free(normed2);
+        const ff0 = try linBias(comp, allocator, normed2, "{s}.transformer_1d_blocks.{d}.ff.net.0.proj", .{ prefix, blk }, s);
+        defer _ = mlx.mlx_array_free(ff0);
+        const ffg = try geluApprox(ff0, s);
+        defer _ = mlx.mlx_array_free(ffg);
+        const ff2 = try linBias(comp, allocator, ffg, "{s}.transformer_1d_blocks.{d}.ff.net.2", .{ prefix, blk }, s);
+        defer _ = mlx.mlx_array_free(ff2);
+        var x2 = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_add(&x2, x, ff2, s));
+        _ = mlx.mlx_array_free(x);
+        x = x2;
+        _ = mlx.mlx_array_eval(x);
+    }
+
+    const outn = try rmsAF(x, dim, 1e-6, s);
+    _ = mlx.mlx_array_free(x);
+    return outn;
+}
+
 // ── Tests ──
 
 const testing = std.testing;
@@ -821,6 +1178,58 @@ test "ltx connectorProject reproduces TextEmbeddingProjection" {
     std.debug.print("[ltx-conn] video corr={d:.6} ({d}), audio corr={d:.6} ({d})\n", .{ vc, vn, ac, an });
     try testing.expect(vc > 0.999);
     try testing.expect(ac > 0.999);
+}
+
+// Stage A: the Embeddings1DConnector transformers reproduce the reference output
+// for a fixed projected input + mask (T=256, n_valid=40). Env:
+//   LTX_TEST_MODEL, LTX_CONNT_VIN/VOUT (video [1,256,4096]), LTX_CONNT_AIN/AOUT (audio [1,256,2048]).
+test "ltx connectorTransform reproduces Embeddings1DConnector" {
+    const dir = std.mem.span(std.c.getenv("LTX_TEST_MODEL") orelse return error.SkipZigTest);
+    const vin_p = std.mem.span(std.c.getenv("LTX_CONNT_VIN") orelse return error.SkipZigTest);
+    const vout_p = std.mem.span(std.c.getenv("LTX_CONNT_VOUT") orelse return error.SkipZigTest);
+    const ain_p = std.mem.span(std.c.getenv("LTX_CONNT_AIN") orelse return error.SkipZigTest);
+    const aout_p = std.mem.span(std.c.getenv("LTX_CONNT_AOUT") orelse return error.SkipZigTest);
+    const allocator = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+
+    const cpu_s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(cpu_s);
+    const cp = try std.fmt.allocPrintSentinel(allocator, "{s}/connector.safetensors", .{dir}, 0);
+    defer allocator.free(cp);
+    var comp = try loadComponent(allocator, cp, cpu_s);
+    defer comp.deinit();
+    var it = comp.map.iterator();
+    while (it.next()) |e| _ = mlx.mlx_array_eval(e.value_ptr.*);
+
+    const T: u32 = 256;
+    const nv: u32 = 40;
+    const Run = struct {
+        fn go(c: *Component, a: std.mem.Allocator, ii: std.Io, in_p: []const u8, out_p: []const u8, dim: u32, hd: u32, prefix: []const u8, st: S) !f64 {
+            const inbuf = try readF32(ii, a, in_p);
+            defer a.free(inbuf);
+            const ref = try readF32(ii, a, out_p);
+            defer a.free(ref);
+            const ish = [_]c_int{ 1, @intCast(T), @intCast(dim) };
+            const inarr = mlx.mlx_array_new_data(inbuf.ptr, &ish, 3, .float32);
+            defer _ = mlx.mlx_array_free(inarr);
+            const out = try connectorTransform(c, a, inarr, nv, dim, hd, prefix, st);
+            defer _ = mlx.mlx_array_free(out);
+            var outf = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(outf);
+            try mlx.check(mlx.mlx_astype(&outf, out, .float32, st));
+            _ = mlx.mlx_array_eval(outf);
+            const n: usize = @intCast(mlx.mlx_array_size(outf));
+            try testing.expectEqual(ref.len, n);
+            return corrOf(mlx.mlx_array_data_float32(outf).?[0..n], ref);
+        }
+    };
+    const vc = try Run.go(&comp, allocator, io, vin_p, vout_p, 4096, 128, "connector.video_embeddings_connector", s);
+    const ac = try Run.go(&comp, allocator, io, ain_p, aout_p, 2048, 64, "connector.audio_embeddings_connector", s);
+    std.debug.print("[ltx-connT] video corr={d:.6}, audio corr={d:.6}\n", .{ vc, ac });
+    try testing.expect(vc > 0.99);
+    try testing.expect(ac > 0.99);
 }
 
 fn readF32(io: std.Io, allocator: std.mem.Allocator, path: []const u8) ![]f32 {
