@@ -1302,15 +1302,20 @@ fn dQLin(comp: *const Component, alloc: std.mem.Allocator, x: mlx.mlx_array, bas
 /// (P, dim) F32 scale_shift table. Returns the combined [1, P, dim] (f32).
 fn adalnCombine(comp: *const Component, alloc: std.mem.Allocator, params: mlx.mlx_array, table_key: []const u8, P: u32, dim: u32, s: S) !mlx.mlx_array {
     _ = alloc;
-    const table = comp.get(table_key) orelse return error.MissingDitWeight; // [P,dim] f32
+    const table = comp.get(table_key) orelse return error.MissingDitWeight; // [P_table, dim] f32
     const Pi: c_int = @intCast(P);
     const di: c_int = @intCast(dim);
     var p3 = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(p3);
     try mlx.check(mlx.mlx_reshape(&p3, params, &[_]c_int{ 1, Pi, di }, 3, s));
+    // Slice the table to its first P rows (the a2v tables carry a 5th gate row
+    // unpacked separately): table[:P, :] → [1,P,dim] (reference table[None,:P,:]).
+    var trows = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(trows);
+    try mlx.check(mlx.mlx_slice(&trows, table, &[_]c_int{ 0, 0 }, 2, &[_]c_int{ Pi, di }, 2, &[_]c_int{ 1, 1 }, 2, s));
     var t3 = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(t3);
-    try mlx.check(mlx.mlx_reshape(&t3, table, &[_]c_int{ 1, Pi, di }, 3, s));
+    try mlx.check(mlx.mlx_reshape(&t3, trows, &[_]c_int{ 1, Pi, di }, 3, s));
     var out = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_add(&out, p3, t3, s)); // bf16 + f32 → f32 (broadcast over batch=1)
     return out;
@@ -1353,6 +1358,473 @@ fn ditNormedSA(comp: *const Component, alloc: std.mem.Allocator, video_hidden: m
     const normed = try rmsAF(video_hidden, dim, eps, s);
     defer _ = mlx.mlx_array_free(normed);
     return modulate(normed, scale, shift, s);
+}
+
+/// Port of `precompute_rope_freqs` (SPLIT): log-spaced fractional-position grid.
+/// `pos` is a flat [N*A] f32 buffer (A position axes per token), `max_pos` is
+/// [A]. Returns per-head cos/sin [1, num_heads, N, head_dim/2] in **f32** (the
+/// DiT runs attention in f32, so cos/sin stay f32 to match the reference cast).
+fn ditRope(alloc: std.mem.Allocator, pos: []const f32, N: u32, A: u32, num_heads: u32, head_dim: u32, max_pos: []const f32, s: S) !RopeCS {
+    const theta: f32 = 10000.0;
+    const inner_dim: u32 = num_heads * head_dim;
+    const num_freqs: u32 = inner_dim / (2 * A);
+    const expected: u32 = inner_dim / 2; // = num_heads * (head_dim/2)
+    const pad: u32 = expected - num_freqs * A;
+    const hd_half: u32 = head_dim / 2;
+
+    const fi = try alloc.alloc(f32, num_freqs);
+    defer alloc.free(fi);
+    const denom: f32 = @floatFromInt(num_freqs - 1);
+    for (0..num_freqs) |j| {
+        const e: f32 = @as(f32, @floatFromInt(j)) / denom; // linspace 0..1
+        fi[j] = std.math.pow(f32, theta, e) * (std.math.pi / 2.0);
+    }
+
+    const cos_buf = try alloc.alloc(f32, N * expected);
+    defer alloc.free(cos_buf);
+    const sin_buf = try alloc.alloc(f32, N * expected);
+    defer alloc.free(sin_buf);
+    for (0..N) |n| {
+        const base = n * expected;
+        for (0..pad) |c| {
+            cos_buf[base + c] = 1.0; // cos(0)=1
+            sin_buf[base + c] = 0.0; // sin(0)=0
+        }
+        for (0..num_freqs) |j| {
+            for (0..A) |i| {
+                const frac = pos[n * A + i] / max_pos[i];
+                const sc = frac * 2.0 - 1.0;
+                const ang = fi[j] * sc;
+                const idx = base + pad + j * A + i;
+                cos_buf[idx] = @cos(ang);
+                sin_buf[idx] = @sin(ang);
+            }
+        }
+    }
+    const rshape = [_]c_int{ 1, @intCast(N), @intCast(num_heads), @intCast(hd_half) };
+    const cos_d = mlx.mlx_array_new_data(cos_buf.ptr, &rshape, 4, .float32);
+    defer _ = mlx.mlx_array_free(cos_d);
+    const sin_d = mlx.mlx_array_new_data(sin_buf.ptr, &rshape, 4, .float32);
+    defer _ = mlx.mlx_array_free(sin_d);
+    const perm = [_]c_int{ 0, 2, 1, 3 };
+    var cos_t = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(cos_t);
+    try mlx.check(mlx.mlx_transpose_axes(&cos_t, cos_d, &perm, 4, s));
+    var sin_t = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sin_t);
+    try mlx.check(mlx.mlx_transpose_axes(&sin_t, sin_d, &perm, 4, s));
+    // Materialize contiguous — the transpose is a lazy strided view; downstream
+    // data-readback (and any non-stride-aware consumer) would otherwise see
+    // source memory order.
+    var cos_c = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_contiguous(&cos_c, cos_t, false, s));
+    var sin_c = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_contiguous(&sin_c, sin_t, false, s));
+    return .{ .cos = cos_c, .sin = sin_c };
+}
+
+/// DiT q4 Attention (attention.py). q/k/v via dQLin; affine QK-norm over the full
+/// inner_dim; optional split-RoPE (separate cos/sin for q vs k); SDPA(scale=hd^-.5,
+/// no mask); per-head gate 2*sigmoid(to_gate_logits(x)); to_out. `cq/sq` and
+/// `ck/sk` may be null (text cross-attn: use_rope=false). `x` is the query input,
+/// `kv` the key/value input (== x for self-attn).
+fn ditAttention(comp: *const Component, alloc: std.mem.Allocator, x: mlx.mlx_array, kv: mlx.mlx_array, prefix: []const u8, num_heads: u32, head_dim: u32, cq: ?mlx.mlx_array, sq: ?mlx.mlx_array, ck: ?mlx.mlx_array, sk: ?mlx.mlx_array, eps: f32, s: S) !mlx.mlx_array {
+    const nh: c_int = @intCast(num_heads);
+    const hdi: c_int = @intCast(head_dim);
+    const inner: c_int = @intCast(num_heads * head_dim);
+    const Nq: c_int = mlx.getShape(x)[1];
+    const Nk: c_int = mlx.getShape(kv)[1];
+    const perm = [_]c_int{ 0, 2, 1, 3 };
+
+    const qb = try std.fmt.allocPrint(alloc, "{s}.to_q", .{prefix});
+    defer alloc.free(qb);
+    const kb = try std.fmt.allocPrint(alloc, "{s}.to_k", .{prefix});
+    defer alloc.free(kb);
+    const vb = try std.fmt.allocPrint(alloc, "{s}.to_v", .{prefix});
+    defer alloc.free(vb);
+    const qnk = try std.fmt.allocPrint(alloc, "{s}.q_norm.weight", .{prefix});
+    defer alloc.free(qnk);
+    const knk = try std.fmt.allocPrint(alloc, "{s}.k_norm.weight", .{prefix});
+    defer alloc.free(knk);
+
+    var q = try dQLin(comp, alloc, x, qb, s);
+    defer _ = mlx.mlx_array_free(q);
+    var k = try dQLin(comp, alloc, kv, kb, s);
+    defer _ = mlx.mlx_array_free(k);
+    const v = try dQLin(comp, alloc, kv, vb, s);
+    defer _ = mlx.mlx_array_free(v);
+    { // QK RMSNorm over full inner_dim
+        const qn = try rmsW(q, comp.get(qnk) orelse return error.MissingDitWeight, eps, s);
+        _ = mlx.mlx_array_free(q);
+        q = qn;
+        const kn = try rmsW(k, comp.get(knk) orelse return error.MissingDitWeight, eps, s);
+        _ = mlx.mlx_array_free(k);
+        k = kn;
+    }
+    var qh = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(qh);
+    {
+        var r = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(r);
+        try mlx.check(mlx.mlx_reshape(&r, q, &[_]c_int{ 1, Nq, nh, hdi }, 4, s));
+        try mlx.check(mlx.mlx_transpose_axes(&qh, r, &perm, 4, s));
+    }
+    var kh = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(kh);
+    {
+        var r = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(r);
+        try mlx.check(mlx.mlx_reshape(&r, k, &[_]c_int{ 1, Nk, nh, hdi }, 4, s));
+        try mlx.check(mlx.mlx_transpose_axes(&kh, r, &perm, 4, s));
+    }
+    var vh = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(vh);
+    {
+        var r = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(r);
+        try mlx.check(mlx.mlx_reshape(&r, v, &[_]c_int{ 1, Nk, nh, hdi }, 4, s));
+        try mlx.check(mlx.mlx_transpose_axes(&vh, r, &perm, 4, s));
+    }
+    if (cq) |cqa| {
+        const qr = try applyRopeSplit(qh, cqa, sq.?, s);
+        _ = mlx.mlx_array_free(qh);
+        qh = qr;
+        const kr = try applyRopeSplit(kh, ck.?, sk.?, s);
+        _ = mlx.mlx_array_free(kh);
+        kh = kr;
+    }
+    const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
+    const null_arr = mlx.mlx_array{ .ctx = null };
+    var attn = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(attn);
+    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn, qh, kh, vh, scale, "", null_arr, null_arr, s));
+    { // per-head gate: 2*sigmoid(to_gate_logits(x)) [1,Nq,heads] → [1,heads,Nq,1]
+        const gb = try std.fmt.allocPrint(alloc, "{s}.to_gate_logits", .{prefix});
+        defer alloc.free(gb);
+        const gl = try dQLin(comp, alloc, x, gb, s);
+        defer _ = mlx.mlx_array_free(gl);
+        var sg = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(sg);
+        try mlx.check(mlx.mlx_sigmoid(&sg, gl, s));
+        const two = mlx.mlx_array_new_float(2.0);
+        defer _ = mlx.mlx_array_free(two);
+        var gate = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(gate);
+        try mlx.check(mlx.mlx_multiply(&gate, sg, two, s));
+        var gt = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(gt);
+        try mlx.check(mlx.mlx_transpose_axes(&gt, gate, &[_]c_int{ 0, 2, 1 }, 3, s));
+        var g4 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(g4);
+        try mlx.check(mlx.mlx_reshape(&g4, gt, &[_]c_int{ 1, nh, Nq, 1 }, 4, s));
+        var gated = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_multiply(&gated, attn, g4, s));
+        _ = mlx.mlx_array_free(attn);
+        attn = gated;
+    }
+    var ao = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ao);
+    {
+        var at = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(at);
+        try mlx.check(mlx.mlx_transpose_axes(&at, attn, &perm, 4, s));
+        try mlx.check(mlx.mlx_reshape(&ao, at, &[_]c_int{ 1, Nq, inner }, 3, s));
+    }
+    const ob = try std.fmt.allocPrint(alloc, "{s}.to_out", .{prefix});
+    defer alloc.free(ob);
+    return dQLin(comp, alloc, ao, ob, s);
+}
+
+/// DiT FeedForward: proj_out(gelu_approx(proj_in(x))). Both q4.
+fn ditFF(comp: *const Component, alloc: std.mem.Allocator, x: mlx.mlx_array, prefix: []const u8, s: S) !mlx.mlx_array {
+    const ib = try std.fmt.allocPrint(alloc, "{s}.proj_in", .{prefix});
+    defer alloc.free(ib);
+    const ob = try std.fmt.allocPrint(alloc, "{s}.proj_out", .{prefix});
+    defer alloc.free(ob);
+    const h = try dQLin(comp, alloc, x, ib, s);
+    defer _ = mlx.mlx_array_free(h);
+    const g = try geluApprox(h, s);
+    defer _ = mlx.mlx_array_free(g);
+    return dQLin(comp, alloc, g, ob, s);
+}
+
+/// AV-cross gate: `(gate_params + table[4,:])[:, None, :]` → [1,1,dim] (f32).
+fn avGate(comp: *const Component, gate_params: mlx.mlx_array, table_key: []const u8, dim: u32, s: S) !mlx.mlx_array {
+    const di: c_int = @intCast(dim);
+    const table = comp.get(table_key) orelse return error.MissingDitWeight; // [5,dim]
+    var row4 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(row4);
+    try mlx.check(mlx.mlx_slice(&row4, table, &[_]c_int{ 4, 0 }, 2, &[_]c_int{ 5, di }, 2, &[_]c_int{ 1, 1 }, 2, s)); // [1,dim]
+    var g = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(g);
+    try mlx.check(mlx.mlx_add(&g, gate_params, row4, s)); // [1,dim] f32
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_reshape(&out, g, &[_]c_int{ 1, 1, di }, 3, s));
+    return out;
+}
+
+/// `x + delta * gate` (residual with AdaLN gate). Frees `delta`; returns new array.
+fn residGate(x: mlx.mlx_array, delta: mlx.mlx_array, gate: mlx.mlx_array, s: S) !mlx.mlx_array {
+    defer _ = mlx.mlx_array_free(delta);
+    var dg = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(dg);
+    try mlx.check(mlx.mlx_multiply(&dg, delta, gate, s));
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_add(&out, x, dg, s));
+    return out;
+}
+
+/// One BasicAVTransformerBlock (transformer.py). `vh_in`/`ah_in` are borrowed
+/// (caller frees); returns freshly-owned (video_hidden, audio_hidden). All adaLN
+/// params are (1, P*dim) bf16; rope cos/sin are f32 [1,heads,N,hd/2].
+const BlockRope = struct { vcos: mlx.mlx_array, vsin: mlx.mlx_array, acos: mlx.mlx_array, asin: mlx.mlx_array, vxcos: mlx.mlx_array, vxsin: mlx.mlx_array, axcos: mlx.mlx_array, axsin: mlx.mlx_array };
+const BlockOut = struct { v: mlx.mlx_array, a: mlx.mlx_array };
+
+fn ditBlock(
+    comp: *const Component,
+    alloc: std.mem.Allocator,
+    cfg: LtxConfig,
+    blk: u32,
+    vh_in: mlx.mlx_array,
+    ah_in: mlx.mlx_array,
+    video_adaln_params: mlx.mlx_array,
+    audio_adaln_params: mlx.mlx_array,
+    video_prompt_params: mlx.mlx_array,
+    audio_prompt_params: mlx.mlx_array,
+    av_ca_video_params: mlx.mlx_array,
+    av_ca_audio_params: mlx.mlx_array,
+    av_a2v_gate_params: mlx.mlx_array,
+    av_v2a_gate_params: mlx.mlx_array,
+    video_text: mlx.mlx_array,
+    audio_text: mlx.mlx_array,
+    rope: BlockRope,
+    s: S,
+) !BlockOut {
+    const vdim = cfg.videoDim(); // 4096
+    const adim = cfg.audioDim(); // 2048
+    const eps = cfg.norm_eps;
+    const P = "transformer.transformer_blocks";
+
+    const pfx = struct {
+        fn k(a: std.mem.Allocator, b: u32, name: []const u8) ![]u8 {
+            return std.fmt.allocPrint(a, "{s}.{d}.{s}", .{ P, b, name });
+        }
+    };
+
+    // ── adaLN unpack (scalar mode) ──
+    const sst = try pfx.k(alloc, blk, "scale_shift_table");
+    defer alloc.free(sst);
+    const vcomb = try adalnCombine(comp, alloc, video_adaln_params, sst, 9, vdim, s);
+    defer _ = mlx.mlx_array_free(vcomb);
+    const asst = try pfx.k(alloc, blk, "audio_scale_shift_table");
+    defer alloc.free(asst);
+    const acomb = try adalnCombine(comp, alloc, audio_adaln_params, asst, 9, adim, s);
+    defer _ = mlx.mlx_array_free(acomb);
+    const avv_k = try pfx.k(alloc, blk, "scale_shift_table_a2v_ca_video");
+    defer alloc.free(avv_k);
+    const avv = try adalnCombine(comp, alloc, av_ca_video_params, avv_k, 4, vdim, s);
+    defer _ = mlx.mlx_array_free(avv);
+    const ava_k = try pfx.k(alloc, blk, "scale_shift_table_a2v_ca_audio");
+    defer alloc.free(ava_k);
+    const ava = try adalnCombine(comp, alloc, av_ca_audio_params, ava_k, 4, adim, s);
+    defer _ = mlx.mlx_array_free(ava);
+
+    // video 9 rows: shift_sa,scale_sa,gate_sa, shift_ff,scale_ff,gate_ff, shift_ca,scale_ca,gate_ca
+    const v_shift_sa = try adalnRow(vcomb, 0, vdim, s);
+    defer _ = mlx.mlx_array_free(v_shift_sa);
+    const v_scale_sa = try adalnRow(vcomb, 1, vdim, s);
+    defer _ = mlx.mlx_array_free(v_scale_sa);
+    const v_gate_sa = try adalnRow(vcomb, 2, vdim, s);
+    defer _ = mlx.mlx_array_free(v_gate_sa);
+    const v_shift_ff = try adalnRow(vcomb, 3, vdim, s);
+    defer _ = mlx.mlx_array_free(v_shift_ff);
+    const v_scale_ff = try adalnRow(vcomb, 4, vdim, s);
+    defer _ = mlx.mlx_array_free(v_scale_ff);
+    const v_gate_ff = try adalnRow(vcomb, 5, vdim, s);
+    defer _ = mlx.mlx_array_free(v_gate_ff);
+    const v_shift_ca = try adalnRow(vcomb, 6, vdim, s);
+    defer _ = mlx.mlx_array_free(v_shift_ca);
+    const v_scale_ca = try adalnRow(vcomb, 7, vdim, s);
+    defer _ = mlx.mlx_array_free(v_scale_ca);
+    const v_gate_ca = try adalnRow(vcomb, 8, vdim, s);
+    defer _ = mlx.mlx_array_free(v_gate_ca);
+    // audio 9 rows
+    const a_shift_sa = try adalnRow(acomb, 0, adim, s);
+    defer _ = mlx.mlx_array_free(a_shift_sa);
+    const a_scale_sa = try adalnRow(acomb, 1, adim, s);
+    defer _ = mlx.mlx_array_free(a_scale_sa);
+    const a_gate_sa = try adalnRow(acomb, 2, adim, s);
+    defer _ = mlx.mlx_array_free(a_gate_sa);
+    const a_shift_ff = try adalnRow(acomb, 3, adim, s);
+    defer _ = mlx.mlx_array_free(a_shift_ff);
+    const a_scale_ff = try adalnRow(acomb, 4, adim, s);
+    defer _ = mlx.mlx_array_free(a_scale_ff);
+    const a_gate_ff = try adalnRow(acomb, 5, adim, s);
+    defer _ = mlx.mlx_array_free(a_gate_ff);
+    const a_shift_ca = try adalnRow(acomb, 6, adim, s);
+    defer _ = mlx.mlx_array_free(a_shift_ca);
+    const a_scale_ca = try adalnRow(acomb, 7, adim, s);
+    defer _ = mlx.mlx_array_free(a_scale_ca);
+    const a_gate_ca = try adalnRow(acomb, 8, adim, s);
+    defer _ = mlx.mlx_array_free(a_gate_ca);
+    // av cross video 4 rows (SCALE-first): scale_a2v,shift_a2v,scale_v2a,shift_v2a
+    const av_v_scale_a2v = try adalnRow(avv, 0, vdim, s);
+    defer _ = mlx.mlx_array_free(av_v_scale_a2v);
+    const av_v_shift_a2v = try adalnRow(avv, 1, vdim, s);
+    defer _ = mlx.mlx_array_free(av_v_shift_a2v);
+    const av_v_scale_v2a = try adalnRow(avv, 2, vdim, s);
+    defer _ = mlx.mlx_array_free(av_v_scale_v2a);
+    const av_v_shift_v2a = try adalnRow(avv, 3, vdim, s);
+    defer _ = mlx.mlx_array_free(av_v_shift_v2a);
+    const av_a_scale_a2v = try adalnRow(ava, 0, adim, s);
+    defer _ = mlx.mlx_array_free(av_a_scale_a2v);
+    const av_a_shift_a2v = try adalnRow(ava, 1, adim, s);
+    defer _ = mlx.mlx_array_free(av_a_shift_a2v);
+    const av_a_scale_v2a = try adalnRow(ava, 2, adim, s);
+    defer _ = mlx.mlx_array_free(av_a_scale_v2a);
+    const av_a_shift_v2a = try adalnRow(ava, 3, adim, s);
+    defer _ = mlx.mlx_array_free(av_a_shift_v2a);
+    // av gates
+    const av_v_gate_a2v = try avGate(comp, av_a2v_gate_params, avv_k, vdim, s);
+    defer _ = mlx.mlx_array_free(av_v_gate_a2v);
+    const av_a_gate_v2a = try avGate(comp, av_v2a_gate_params, ava_k, adim, s);
+    defer _ = mlx.mlx_array_free(av_a_gate_v2a);
+
+    var vh = vh_in;
+    var vh_owned = false;
+    var ah = ah_in;
+    var ah_owned = false;
+
+    // ── 1. video self-attn ──
+    {
+        const pn = try rmsAF(vh, vdim, eps, s);
+        defer _ = mlx.mlx_array_free(pn);
+        const normed = try modulate(pn, v_scale_sa, v_shift_sa, s);
+        defer _ = mlx.mlx_array_free(normed);
+        const aprefix = try pfx.k(alloc, blk, "attn1");
+        defer alloc.free(aprefix);
+        const out = try ditAttention(comp, alloc, normed, normed, aprefix, cfg.num_heads, cfg.head_dim, rope.vcos, rope.vsin, rope.vcos, rope.vsin, eps, s);
+        const nv = try residGate(vh, out, v_gate_sa, s);
+        if (vh_owned) _ = mlx.mlx_array_free(vh);
+        vh = nv;
+        vh_owned = true;
+    }
+    // ── 2. audio self-attn ──
+    {
+        const pn = try rmsAF(ah, adim, eps, s);
+        defer _ = mlx.mlx_array_free(pn);
+        const normed = try modulate(pn, a_scale_sa, a_shift_sa, s);
+        defer _ = mlx.mlx_array_free(normed);
+        const aprefix = try pfx.k(alloc, blk, "audio_attn1");
+        defer alloc.free(aprefix);
+        const out = try ditAttention(comp, alloc, normed, normed, aprefix, cfg.audio_num_heads, cfg.audio_head_dim, rope.acos, rope.asin, rope.acos, rope.asin, eps, s);
+        const na = try residGate(ah, out, a_gate_sa, s);
+        if (ah_owned) _ = mlx.mlx_array_free(ah);
+        ah = na;
+        ah_owned = true;
+    }
+    // ── 3. video text cross-attn ──
+    {
+        const pn = try rmsAF(vh, vdim, eps, s);
+        defer _ = mlx.mlx_array_free(pn);
+        const normed = try modulate(pn, v_scale_ca, v_shift_ca, s);
+        defer _ = mlx.mlx_array_free(normed);
+        const pk = try pfx.k(alloc, blk, "prompt_scale_shift_table");
+        defer alloc.free(pk);
+        const vp = try adalnCombine(comp, alloc, video_prompt_params, pk, 2, vdim, s);
+        defer _ = mlx.mlx_array_free(vp);
+        const vp_shift = try adalnRow(vp, 0, vdim, s);
+        defer _ = mlx.mlx_array_free(vp_shift);
+        const vp_scale = try adalnRow(vp, 1, vdim, s);
+        defer _ = mlx.mlx_array_free(vp_scale);
+        const text = try modulate(video_text, vp_scale, vp_shift, s);
+        defer _ = mlx.mlx_array_free(text);
+        const aprefix = try pfx.k(alloc, blk, "attn2");
+        defer alloc.free(aprefix);
+        const out = try ditAttention(comp, alloc, normed, text, aprefix, cfg.num_heads, cfg.head_dim, null, null, null, null, eps, s);
+        const nv = try residGate(vh, out, v_gate_ca, s);
+        _ = mlx.mlx_array_free(vh);
+        vh = nv;
+    }
+    // ── 4. audio text cross-attn ──
+    {
+        const pn = try rmsAF(ah, adim, eps, s);
+        defer _ = mlx.mlx_array_free(pn);
+        const normed = try modulate(pn, a_scale_ca, a_shift_ca, s);
+        defer _ = mlx.mlx_array_free(normed);
+        const pk = try pfx.k(alloc, blk, "audio_prompt_scale_shift_table");
+        defer alloc.free(pk);
+        const ap = try adalnCombine(comp, alloc, audio_prompt_params, pk, 2, adim, s);
+        defer _ = mlx.mlx_array_free(ap);
+        const ap_shift = try adalnRow(ap, 0, adim, s);
+        defer _ = mlx.mlx_array_free(ap_shift);
+        const ap_scale = try adalnRow(ap, 1, adim, s);
+        defer _ = mlx.mlx_array_free(ap_scale);
+        const text = try modulate(audio_text, ap_scale, ap_shift, s);
+        defer _ = mlx.mlx_array_free(text);
+        const aprefix = try pfx.k(alloc, blk, "audio_attn2");
+        defer alloc.free(aprefix);
+        const out = try ditAttention(comp, alloc, normed, text, aprefix, cfg.audio_num_heads, cfg.audio_head_dim, null, null, null, null, eps, s);
+        const na = try residGate(ah, out, a_gate_ca, s);
+        _ = mlx.mlx_array_free(ah);
+        ah = na;
+    }
+    // ── 5-6. AV cross-modal (shared norms) ──
+    {
+        const vn3 = try rmsAF(vh, vdim, eps, s);
+        defer _ = mlx.mlx_array_free(vn3);
+        const an3 = try rmsAF(ah, adim, eps, s);
+        defer _ = mlx.mlx_array_free(an3);
+        // A2V: q from video, kv from audio
+        const vq = try modulate(vn3, av_v_scale_a2v, av_v_shift_a2v, s);
+        defer _ = mlx.mlx_array_free(vq);
+        const akv = try modulate(an3, av_a_scale_a2v, av_a_shift_a2v, s);
+        defer _ = mlx.mlx_array_free(akv);
+        const a2v_k = try pfx.k(alloc, blk, "audio_to_video_attn");
+        defer alloc.free(a2v_k);
+        const a2v = try ditAttention(comp, alloc, vq, akv, a2v_k, cfg.audio_num_heads, cfg.audio_head_dim, rope.vxcos, rope.vxsin, rope.axcos, rope.axsin, eps, s);
+        const nv = try residGate(vh, a2v, av_v_gate_a2v, s);
+        _ = mlx.mlx_array_free(vh);
+        vh = nv;
+        // V2A: q from audio, kv from video (pre-A2V norms)
+        const aq = try modulate(an3, av_a_scale_v2a, av_a_shift_v2a, s);
+        defer _ = mlx.mlx_array_free(aq);
+        const vkv = try modulate(vn3, av_v_scale_v2a, av_v_shift_v2a, s);
+        defer _ = mlx.mlx_array_free(vkv);
+        const v2a_k = try pfx.k(alloc, blk, "video_to_audio_attn");
+        defer alloc.free(v2a_k);
+        const v2a = try ditAttention(comp, alloc, aq, vkv, v2a_k, cfg.audio_num_heads, cfg.audio_head_dim, rope.axcos, rope.axsin, rope.vxcos, rope.vxsin, eps, s);
+        const na = try residGate(ah, v2a, av_a_gate_v2a, s);
+        _ = mlx.mlx_array_free(ah);
+        ah = na;
+    }
+    // ── 7. video FF ──
+    {
+        const pn = try rmsAF(vh, vdim, eps, s);
+        defer _ = mlx.mlx_array_free(pn);
+        const normed = try modulate(pn, v_scale_ff, v_shift_ff, s);
+        defer _ = mlx.mlx_array_free(normed);
+        const ffk = try pfx.k(alloc, blk, "ff");
+        defer alloc.free(ffk);
+        const out = try ditFF(comp, alloc, normed, ffk, s);
+        const nv = try residGate(vh, out, v_gate_ff, s);
+        _ = mlx.mlx_array_free(vh);
+        vh = nv;
+    }
+    // ── 8. audio FF ──
+    {
+        const pn = try rmsAF(ah, adim, eps, s);
+        defer _ = mlx.mlx_array_free(pn);
+        const normed = try modulate(pn, a_scale_ff, a_shift_ff, s);
+        defer _ = mlx.mlx_array_free(normed);
+        const ffk = try pfx.k(alloc, blk, "audio_ff");
+        defer alloc.free(ffk);
+        const out = try ditFF(comp, alloc, normed, ffk, s);
+        const na = try residGate(ah, out, a_gate_ff, s);
+        _ = mlx.mlx_array_free(ah);
+        ah = na;
+    }
+    return .{ .v = vh, .a = ah };
 }
 
 // ── Tests ──
@@ -1868,4 +2340,208 @@ test "ltx DiT ditNormedSA reproduces compute_video_normed_sa" {
     const corr = corrF32(mlx.mlx_array_data_float32(of).?, ref, 0);
     std.debug.print("[ltx-nsa] normed_sa corr={d:.6} (n={d})\n", .{ corr, n });
     try testing.expect(corr > 0.99);
+}
+
+// Stage 2a: ditRope (precompute_rope_freqs SPLIT) reproduces reference cos/sin.
+// Cheap, no model load. Gated on LTX_TEST_MODEL not needed; needs the position +
+// rope .raw dumps. Env: LTX_POS_V=[1,Nv,3], LTX_POS_A=[1,Na,1],
+// LTX_ROPE_V{COS,SIN}=[1,32,Nv,64], LTX_ROPE_A{COS,SIN}=[1,32,Na,32],
+// LTX_ROPE_VX{COS,SIN}=[1,32,Nv,32], LTX_ROPE_AX{COS,SIN}=[1,32,Na,32].
+test "ltx DiT ditRope matches reference precompute_rope_freqs" {
+    const pvp = std.c.getenv("LTX_POS_V") orelse return error.SkipZigTest;
+    const pap = std.c.getenv("LTX_POS_A") orelse return error.SkipZigTest;
+    const allocator = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+
+    const vpos = try readF32(io, allocator, std.mem.span(pvp));
+    defer allocator.free(vpos);
+    const apos = try readF32(io, allocator, std.mem.span(pap));
+    defer allocator.free(apos);
+    const Nv: u32 = @intCast(vpos.len / 3);
+    const Na: u32 = @intCast(apos.len);
+
+    // temporal-only axis for cross rope
+    const vtmp = try allocator.alloc(f32, Nv);
+    defer allocator.free(vtmp);
+    for (0..Nv) |n| vtmp[n] = vpos[n * 3 + 0];
+
+    const Check = struct {
+        fn cmp(a: std.mem.Allocator, ii: std.Io, rope: RopeCS, env_cos: []const u8, env_sin: []const u8, st: S) !struct { c: f64, sgn: f64 } {
+            const cp = std.c.getenv(@ptrCast(env_cos.ptr)) orelse return error.SkipZigTest;
+            const sp = std.c.getenv(@ptrCast(env_sin.ptr)) orelse return error.SkipZigTest;
+            const rc = try readF32(ii, a, std.mem.span(cp));
+            defer a.free(rc);
+            const rs = try readF32(ii, a, std.mem.span(sp));
+            defer a.free(rs);
+            var cf = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(cf);
+            try mlx.check(mlx.mlx_astype(&cf, rope.cos, .float32, st));
+            _ = mlx.mlx_array_eval(cf);
+            var sf = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(sf);
+            try mlx.check(mlx.mlx_astype(&sf, rope.sin, .float32, st));
+            _ = mlx.mlx_array_eval(sf);
+            const nc: usize = @intCast(mlx.mlx_array_size(cf));
+            try testing.expectEqual(rc.len, nc);
+            const cc = corrF32(mlx.mlx_array_data_float32(cf).?, rc, 0);
+            const sc = corrF32(mlx.mlx_array_data_float32(sf).?, rs, 0);
+            return .{ .c = cc, .sgn = sc };
+        }
+    };
+
+    const max_v = [_]f32{ 20.0, 2048.0, 2048.0 };
+    const max_1 = [_]f32{20.0};
+
+    const rv = try ditRope(allocator, vpos, Nv, 3, 32, 128, &max_v, s);
+    defer _ = mlx.mlx_array_free(rv.cos);
+    defer _ = mlx.mlx_array_free(rv.sin);
+    const rrv = try Check.cmp(allocator, io, rv, "LTX_ROPE_VCOS", "LTX_ROPE_VSIN", s);
+
+    const ra = try ditRope(allocator, apos, Na, 1, 32, 64, &max_1, s);
+    defer _ = mlx.mlx_array_free(ra.cos);
+    defer _ = mlx.mlx_array_free(ra.sin);
+    const rra = try Check.cmp(allocator, io, ra, "LTX_ROPE_ACOS", "LTX_ROPE_ASIN", s);
+
+    const rvx = try ditRope(allocator, vtmp, Nv, 1, 32, 64, &max_1, s);
+    defer _ = mlx.mlx_array_free(rvx.cos);
+    defer _ = mlx.mlx_array_free(rvx.sin);
+    const rrvx = try Check.cmp(allocator, io, rvx, "LTX_ROPE_VXCOS", "LTX_ROPE_VXSIN", s);
+
+    const rax = try ditRope(allocator, apos, Na, 1, 32, 64, &max_1, s);
+    defer _ = mlx.mlx_array_free(rax.cos);
+    defer _ = mlx.mlx_array_free(rax.sin);
+    const rrax = try Check.cmp(allocator, io, rax, "LTX_ROPE_AXCOS", "LTX_ROPE_AXSIN", s);
+
+    std.debug.print("[ltx-rope] video cos={d:.6}/sin={d:.6} audio={d:.6}/{d:.6} vcross={d:.6}/{d:.6} across={d:.6}/{d:.6}\n", .{ rrv.c, rrv.sgn, rra.c, rra.sgn, rrvx.c, rrvx.sgn, rrax.c, rrax.sgn });
+    try testing.expect(rrv.c > 0.9999 and rrv.sgn > 0.9999);
+    try testing.expect(rra.c > 0.9999 and rra.sgn > 0.9999);
+    try testing.expect(rrvx.c > 0.9999 and rrvx.sgn > 0.9999);
+    try testing.expect(rrax.c > 0.9999 and rrax.sgn > 0.9999);
+}
+
+// Stage 2b: full BasicAVTransformerBlock block-0 forward reproduces out_v/out_a.
+// Gated on LTX_TEST_MODEL + the block-0 IO .raw dumps (LTX_B0_*).
+test "ltx DiT block-0 forward reproduces BasicAVTransformerBlock" {
+    const dir = std.mem.span(std.c.getenv("LTX_TEST_MODEL") orelse return error.SkipZigTest);
+    const allocator = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const cpu_s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(cpu_s);
+
+    const vp = try std.fmt.allocPrintSentinel(allocator, "{s}/transformer-dev.safetensors", .{dir}, 0);
+    defer allocator.free(vp);
+    var comp = try loadComponent(allocator, vp, cpu_s);
+    defer comp.deinit();
+
+    // helper: load env .raw → bf16 mlx array of given shape (f32 if keep_f32)
+    const L = struct {
+        fn arr(a: std.mem.Allocator, ii: std.Io, env: []const u8, shape: []const c_int, keep_f32: bool, st: S) !struct { x: mlx.mlx_array, buf: []f32 } {
+            const p = std.c.getenv(@ptrCast(env.ptr)) orelse return error.SkipZigTest;
+            const buf = try readF32(ii, a, std.mem.span(p));
+            const d = mlx.mlx_array_new_data(buf.ptr, shape.ptr, @intCast(shape.len), .float32);
+            if (keep_f32) return .{ .x = d, .buf = buf };
+            defer _ = mlx.mlx_array_free(d);
+            var b = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_astype(&b, d, .bfloat16, st));
+            return .{ .x = b, .buf = buf };
+        }
+    };
+
+    const Nv: c_int = 192;
+    const Na: c_int = 9;
+    const Nt: c_int = 128;
+
+    const vh = try L.arr(allocator, io, "LTX_B0_VH", &[_]c_int{ 1, Nv, 4096 }, false, s);
+    defer allocator.free(vh.buf);
+    defer _ = mlx.mlx_array_free(vh.x);
+    const ah = try L.arr(allocator, io, "LTX_B0_AH", &[_]c_int{ 1, Na, 2048 }, false, s);
+    defer allocator.free(ah.buf);
+    defer _ = mlx.mlx_array_free(ah.x);
+    const vap = try L.arr(allocator, io, "LTX_B0_VAP", &[_]c_int{ 1, 9 * 4096 }, false, s);
+    defer allocator.free(vap.buf);
+    defer _ = mlx.mlx_array_free(vap.x);
+    const aap = try L.arr(allocator, io, "LTX_B0_AAP", &[_]c_int{ 1, 9 * 2048 }, false, s);
+    defer allocator.free(aap.buf);
+    defer _ = mlx.mlx_array_free(aap.x);
+    const vpp = try L.arr(allocator, io, "LTX_B0_VPP", &[_]c_int{ 1, 2 * 4096 }, false, s);
+    defer allocator.free(vpp.buf);
+    defer _ = mlx.mlx_array_free(vpp.x);
+    const app = try L.arr(allocator, io, "LTX_B0_APP", &[_]c_int{ 1, 2 * 2048 }, false, s);
+    defer allocator.free(app.buf);
+    defer _ = mlx.mlx_array_free(app.x);
+    const avv = try L.arr(allocator, io, "LTX_B0_AVV", &[_]c_int{ 1, 4 * 4096 }, false, s);
+    defer allocator.free(avv.buf);
+    defer _ = mlx.mlx_array_free(avv.x);
+    const ava = try L.arr(allocator, io, "LTX_B0_AVA", &[_]c_int{ 1, 4 * 2048 }, false, s);
+    defer allocator.free(ava.buf);
+    defer _ = mlx.mlx_array_free(ava.x);
+    const a2vg = try L.arr(allocator, io, "LTX_B0_A2VG", &[_]c_int{ 1, 4096 }, false, s);
+    defer allocator.free(a2vg.buf);
+    defer _ = mlx.mlx_array_free(a2vg.x);
+    const v2ag = try L.arr(allocator, io, "LTX_B0_V2AG", &[_]c_int{ 1, 2048 }, false, s);
+    defer allocator.free(v2ag.buf);
+    defer _ = mlx.mlx_array_free(v2ag.x);
+    const vtext = try L.arr(allocator, io, "LTX_B0_VTEXT", &[_]c_int{ 1, Nt, 4096 }, false, s);
+    defer allocator.free(vtext.buf);
+    defer _ = mlx.mlx_array_free(vtext.x);
+    const atext = try L.arr(allocator, io, "LTX_B0_ATEXT", &[_]c_int{ 1, Nt, 2048 }, false, s);
+    defer allocator.free(atext.buf);
+    defer _ = mlx.mlx_array_free(atext.x);
+
+    // positions → rope
+    const vpos = try readF32(io, allocator, std.mem.span(std.c.getenv("LTX_POS_V") orelse return error.SkipZigTest));
+    defer allocator.free(vpos);
+    const apos = try readF32(io, allocator, std.mem.span(std.c.getenv("LTX_POS_A") orelse return error.SkipZigTest));
+    defer allocator.free(apos);
+    const NvU: u32 = @intCast(vpos.len / 3);
+    const NaU: u32 = @intCast(apos.len);
+    const vtmp = try allocator.alloc(f32, NvU);
+    defer allocator.free(vtmp);
+    for (0..NvU) |n| vtmp[n] = vpos[n * 3 + 0];
+    const max_v = [_]f32{ 20.0, 2048.0, 2048.0 };
+    const max_1 = [_]f32{20.0};
+    const rv = try ditRope(allocator, vpos, NvU, 3, 32, 128, &max_v, s);
+    defer _ = mlx.mlx_array_free(rv.cos);
+    defer _ = mlx.mlx_array_free(rv.sin);
+    const ra = try ditRope(allocator, apos, NaU, 1, 32, 64, &max_1, s);
+    defer _ = mlx.mlx_array_free(ra.cos);
+    defer _ = mlx.mlx_array_free(ra.sin);
+    const rvx = try ditRope(allocator, vtmp, NvU, 1, 32, 64, &max_1, s);
+    defer _ = mlx.mlx_array_free(rvx.cos);
+    defer _ = mlx.mlx_array_free(rvx.sin);
+    const rax = try ditRope(allocator, apos, NaU, 1, 32, 64, &max_1, s);
+    defer _ = mlx.mlx_array_free(rax.cos);
+    defer _ = mlx.mlx_array_free(rax.sin);
+    const rope = BlockRope{ .vcos = rv.cos, .vsin = rv.sin, .acos = ra.cos, .asin = ra.sin, .vxcos = rvx.cos, .vxsin = rvx.sin, .axcos = rax.cos, .axsin = rax.sin };
+
+    const cfg = LtxConfig{};
+    const out = try ditBlock(&comp, allocator, cfg, 0, vh.x, ah.x, vap.x, aap.x, vpp.x, app.x, avv.x, ava.x, a2vg.x, v2ag.x, vtext.x, atext.x, rope, s);
+    defer _ = mlx.mlx_array_free(out.v);
+    defer _ = mlx.mlx_array_free(out.a);
+
+    const refv = try readF32(io, allocator, std.mem.span(std.c.getenv("LTX_B0_OUTV") orelse return error.SkipZigTest));
+    defer allocator.free(refv);
+    const refa = try readF32(io, allocator, std.mem.span(std.c.getenv("LTX_B0_OUTA") orelse return error.SkipZigTest));
+    defer allocator.free(refa);
+    var vf = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(vf);
+    try mlx.check(mlx.mlx_astype(&vf, out.v, .float32, s));
+    _ = mlx.mlx_array_eval(vf);
+    var af = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(af);
+    try mlx.check(mlx.mlx_astype(&af, out.a, .float32, s));
+    _ = mlx.mlx_array_eval(af);
+    const vn: usize = @intCast(mlx.mlx_array_size(vf));
+    const an: usize = @intCast(mlx.mlx_array_size(af));
+    try testing.expectEqual(refv.len, vn);
+    try testing.expectEqual(refa.len, an);
+    const vc = corrF32(mlx.mlx_array_data_float32(vf).?, refv, 0);
+    const ac = corrF32(mlx.mlx_array_data_float32(af).?, refa, 0);
+    std.debug.print("[ltx-b0] out_v corr={d:.6} ({d}) out_a corr={d:.6} ({d})\n", .{ vc, vn, ac, an });
+    try testing.expect(vc > 0.99);
+    try testing.expect(ac > 0.99);
 }
