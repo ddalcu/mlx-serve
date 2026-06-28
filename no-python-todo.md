@@ -10,15 +10,24 @@ All work is **local commits only — never push** (user rule).
 |---|---|---|---|---|
 | **Audio** (Qwen3-TTS) | ✅ bit-exact | ✅ `/v1/audio/speech` | ✅ native server | **DONE** |
 | **Image** (FLUX.2-klein-4B) | ✅ corr 0.9995 | ✅ `/v1/images/generations` | ✅ native server | **DONE** |
-| **Video** (LTX-Video 2.3) | 🟡 ~85% | — | (Python) | **IN PROGRESS** |
+| **Video** (LTX-Video 2.3) | ✅ corr ~1.0 | ✅ `/v1/video/generations` | 🟡 service TODO | **DONE (server)** |
 
-`zig build test` → ~539/559 pass (rest are env-gated live tests). 15 commits.
+`zig build test` → ~539/559 pass (rest are env-gated live tests). 23 commits.
 Plans + checklists: `docs/native-mediagen/{01-audio-tts,02-image-flux,03-video-ltx}.md`.
 
-The two hard, novel goals (native no-Python audio + image generation, as APIs, wired
-into the app) are **done and validated** (curl-proven; WAV + PNG produced). Video is
-one big component (the DiT attention forward) + sampler + wiring away from done — and
-every other video component is already validated bit-exact/near-exact.
+**ALL THREE modalities now generate natively, no Python.** Video text-to-video is
+live end-to-end: `POST /v1/video/generations` on a Zig+mlx-c server produced a
+coherent 9-frame 256×384 mp4 from "a red fox running through a snowy forest" (4 steps,
+cfg-only). Every stage is validated against the `ltx_core_mlx` reference by correlation:
+- Gemma 49-layer capture 0.99999 · connector project 0.999994 / transform 0.9999
+- **DiT** (the big piece): `ditNormedSA` 0.999995 · block-0 forward out_v 1.0 / out_a 0.999998
+  · full 48-block `ditForward` velocity 0.999998 · rope/schedule/positions exact
+- **Sampler** (CFG-only Euler): final latent 0.999939 · `encodeTextLtx` 0.9999/0.9966
+- **Frames** (unpatchify + VAE + uint8): 78.6 dB vs reference, 99.9% exact
+
+Remaining: the macOS app `VideoGenService.swift` (mirror `ImageGenService`/`AudioGenService`)
++ AVFoundation mp4 mux from the returned RGB frames. STG/modality guidance, the audio
+branch (audio VAE + vocoder + BWE), and multi-resolution are deliberate slice-1 omissions.
 
 ---
 

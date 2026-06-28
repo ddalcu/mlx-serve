@@ -19,6 +19,7 @@ const llama_arch = @import("arch/llama.zig");
 const ds4_ffi = @import("ds4_ffi.zig");
 const tts_server = @import("tts_server.zig");
 const flux_server = @import("flux_server.zig");
+const ltx_server = @import("ltx_server.zig");
 const log = @import("log.zig");
 
 pub const VERSION: []const u8 = build_options.version;
@@ -580,6 +581,14 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    // Native LTX-Video 2.3 text-to-video: same self-contained serve path. LTX
+    // checkpoints store model_type "AudioVideo" with transformer-dev/connector/
+    // vae_decoder safetensors. Peek before the transformer parseConfig and route.
+    if (serve_mode and isLtxModel(io, allocator, model_dir)) {
+        try ltx_server.runLtxServe(io, allocator, model_dir, host, port);
+        return;
+    }
+
     // Parse config — heap allocate so the LoadedModel can take ownership
     // (Plan 05). Free path in serve_mode = registry.deinit; offline mode =
     // explicit defer on `config_storage`.
@@ -962,6 +971,31 @@ fn isFluxModel(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) 
     const mt = parsed.value.object.get("model_type") orelse return false;
     // mflux FLUX.2 checkpoints: model_type "flux2-klein-4b" / "flux2-klein-9b" etc.
     return mt == .string and std.mem.startsWith(u8, mt.string, "flux2");
+}
+
+/// True if `model_dir/config.json` declares `model_type == "AudioVideo"` (the
+/// LTX-Video 2.3 native engine) AND the connector + dev transformer are present.
+fn isLtxModel(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) bool {
+    const path = std.fmt.allocPrint(allocator, "{s}/config.json", .{model_dir}) catch return false;
+    defer allocator.free(path);
+    const file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return false;
+    defer file.close(io);
+    var rb: [4096]u8 = undefined;
+    var rs = file.reader(io, &rb);
+    const content = rs.interface.allocRemaining(allocator, .limited(4 * 1024 * 1024)) catch return false;
+    defer allocator.free(content);
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    const mt = parsed.value.object.get("model_type") orelse return false;
+    if (!(mt == .string and std.mem.eql(u8, mt.string, "AudioVideo"))) return false;
+    // Require the connector — distinguishes the LTX bundle from any other
+    // "AudioVideo" config and ensures the text path can load.
+    const conn = std.fmt.allocPrint(allocator, "{s}/connector.safetensors", .{model_dir}) catch return false;
+    defer allocator.free(conn);
+    const cf = std.Io.Dir.openFileAbsolute(io, conn, .{}) catch return false;
+    cf.close(io);
+    return true;
 }
 
 fn isGgufPath(io: std.Io, path: []const u8) bool {

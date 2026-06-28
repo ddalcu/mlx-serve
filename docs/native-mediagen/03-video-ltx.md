@@ -4,9 +4,13 @@
 Zig + mlx-c implementation served from `mlx-serve`. No Python. Exposed as a custom
 `/v1/video/generations` endpoint.
 
-**Status:** 🟡 **Foundation laid + validated** (`src/ltx_video.zig`). **Modality 3 of 3** (hardest).
-Branch `feature/Any2Any`. The full pipeline is a large remaining effort (scoped at weeks); the
-foundation de-risks the load + the new primitives.
+**Status:** ✅ **DONE (server)** — native text-to-video live end-to-end (`src/ltx_video.zig` +
+`src/ltx_server.zig`). Branch `feature/Any2Any`. `POST /v1/video/generations` produces RGB
+frames from a prompt with no Python; every stage validated vs `ltx_core_mlx` by correlation
+(DiT velocity 0.999998, sampler final latent 0.999939, frames 78.6 dB). Routed from `main.zig`
+by `model_type == "AudioVideo"`. Remaining: macOS `VideoGenService.swift` + AVFoundation mux.
+Slice-1 omissions: STG/modality guidance, the audio branch (audio VAE/vocoder/BWE),
+multi-resolution. Integration test: `tests/test_video_gen.sh`.
 
 Done + validated vs the real `dgrauet/ltx-2.3-mlx-q4` checkpoint (loads 262 connector + 86 vae_decoder
 tensors, no GPU forward → no OOM):
