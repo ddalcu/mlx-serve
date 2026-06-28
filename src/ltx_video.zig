@@ -245,6 +245,231 @@ pub fn pixelNorm(x: mlx.mlx_array, eps: f32, s: S) !mlx.mlx_array {
     return out;
 }
 
+// ── 3D VAE decoder (atop decoderConv3d) ──
+
+/// PixelNorm matching the reference `mx.fast.rms_norm(x, weight=None, eps)`:
+/// the FUSED kernel upcasts to fp32 internally, which the explicit bf16
+/// `pixelNorm` does not — over the VAE's ~20 sequential norms that divergence
+/// compounds. mlx_fast_rms_norm crashes on a null weight, so pass ones([C]).
+fn pixelNormFast(x: mlx.mlx_array, eps: f32, s: S) !mlx.mlx_array {
+    const sh = mlx.getShape(x);
+    const c = sh[sh.len - 1];
+    const ones = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ones);
+    const one_val = mlx.mlx_array_new_float(1.0);
+    defer _ = mlx.mlx_array_free(one_val);
+    var ones_w = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ones_w);
+    try mlx.check(mlx.mlx_full(&ones_w, &[_]c_int{c}, 1, one_val, .bfloat16, s));
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_fast_rms_norm(&out, x, ones_w, eps, s));
+    return out;
+}
+
+fn silu(x: mlx.mlx_array, s: S) !mlx.mlx_array {
+    var sig = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sig);
+    try mlx.check(mlx.mlx_sigmoid(&sig, x, s));
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_multiply(&out, x, sig, s));
+    return out;
+}
+
+/// Look up `<base>.weight`/`.bias` in the component and run the decoder conv
+/// (k=3, spatial_pad=1). `base` e.g. "vae_decoder.conv_in.conv".
+fn convByKey(comp: *const Component, base: []const u8, x: mlx.mlx_array, s: S) !mlx.mlx_array {
+    var wbuf: [256]u8 = undefined;
+    var bbuf: [256]u8 = undefined;
+    const wk = try std.fmt.bufPrint(&wbuf, "{s}.weight", .{base});
+    const bk = try std.fmt.bufPrint(&bbuf, "{s}.bias", .{base});
+    const w = comp.get(wk) orelse return error.MissingVaeWeight;
+    const b = comp.get(bk);
+    return decoderConv3d(x, w, b, 3, 1, s);
+}
+
+/// Pre-activation residual block: x = conv2(silu(pn(conv1(silu(pn(x)))))) + x.
+fn resBlock3d(comp: *const Component, x: mlx.mlx_array, up_idx: u32, blk: u32, s: S) !mlx.mlx_array {
+    var b1: [256]u8 = undefined;
+    var b2: [256]u8 = undefined;
+    const k1 = try std.fmt.bufPrint(&b1, "vae_decoder.up_blocks.{d}.res_blocks.{d}.conv1.conv", .{ up_idx, blk });
+    const pn1 = try pixelNormFast(x, 1e-8, s);
+    defer _ = mlx.mlx_array_free(pn1);
+    const a1 = try silu(pn1, s);
+    defer _ = mlx.mlx_array_free(a1);
+    const c1 = try convByKey(comp, k1, a1, s);
+    defer _ = mlx.mlx_array_free(c1);
+    const k2 = try std.fmt.bufPrint(&b2, "vae_decoder.up_blocks.{d}.res_blocks.{d}.conv2.conv", .{ up_idx, blk });
+    const pn2 = try pixelNormFast(c1, 1e-8, s);
+    defer _ = mlx.mlx_array_free(pn2);
+    const a2 = try silu(pn2, s);
+    defer _ = mlx.mlx_array_free(a2);
+    const c2 = try convByKey(comp, k2, a2, s);
+    defer _ = mlx.mlx_array_free(c2);
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_add(&out, c2, x, s));
+    return out;
+}
+
+fn reshapeTo(x: mlx.mlx_array, shape: []const c_int, s: S) !mlx.mlx_array {
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_reshape(&out, x, shape.ptr, shape.len, s));
+    return out;
+}
+fn transposeTo(x: mlx.mlx_array, axes: []const c_int, s: S) !mlx.mlx_array {
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_transpose_axes(&out, x, axes.ptr, axes.len, s));
+    return out;
+}
+
+/// depth-to-space: (B,D,H,W, C·tf·sf·sf) → (B, D·tf, H·sf, W·sf, C).
+/// Channel split order (c, p1=temporal, p2=H, p3=W), c outermost.
+fn pixelShuffle3d(x: mlx.mlx_array, sf: u32, tf: u32, s: S) !mlx.mlx_array {
+    const sh = mlx.getShape(x);
+    const B = sh[0];
+    const D = sh[1];
+    const H = sh[2];
+    const W = sh[3];
+    const Ct = sh[4];
+    const sfc: c_int = @intCast(sf);
+    const tfc: c_int = @intCast(tf);
+    const C = @divExact(Ct, sfc * sfc * tfc);
+    const r1 = try reshapeTo(x, &[_]c_int{ B, D, H, W, C, tfc, sfc, sfc }, s);
+    defer _ = mlx.mlx_array_free(r1);
+    const t = try transposeTo(r1, &[_]c_int{ 0, 1, 5, 2, 6, 3, 7, 4 }, s);
+    defer _ = mlx.mlx_array_free(t);
+    return reshapeTo(t, &[_]c_int{ B, D * tfc, H * sfc, W * sfc, C }, s);
+}
+
+/// final spatial unpatchify (B,F,H,W, C·ps·ps) → (B,F, H·ps, W·ps, C).
+/// Channel split (c, p=1, r=W, q=H) — width before height.
+fn unpatchifySpatial(x: mlx.mlx_array, ps: u32, s: S) !mlx.mlx_array {
+    const sh = mlx.getShape(x);
+    const B = sh[0];
+    const F = sh[1];
+    const H = sh[2];
+    const W = sh[3];
+    const Ct = sh[4];
+    const psc: c_int = @intCast(ps);
+    const C = @divExact(Ct, psc * psc);
+    const r1 = try reshapeTo(x, &[_]c_int{ B, F, H, W, C, psc, psc }, s);
+    defer _ = mlx.mlx_array_free(r1);
+    const t = try transposeTo(r1, &[_]c_int{ 0, 1, 2, 6, 3, 5, 4 }, s);
+    defer _ = mlx.mlx_array_free(t);
+    return reshapeTo(t, &[_]c_int{ B, F, H * psc, W * psc, C }, s);
+}
+
+const ResStageSpec = struct { up_idx: u32, num_blocks: u32 };
+const UpSpec = struct { up_idx: u32, sf: u32, tf: u32 };
+
+/// Decode an LTX latent `[B,128,F,H,W]` (BCFHW) → pixels `[B,3,8F-7,32H,32W]`
+/// (BCFHW). Weights live in `comp` (the vae_decoder component). Runs on stream `s`.
+pub fn vaeDecode(comp: *const Component, latent_bcfhw: mlx.mlx_array, s: S) !mlx.mlx_array {
+    // BCFHW → BFHWC.
+    var x = try transposeTo(latent_bcfhw, &[_]c_int{ 0, 2, 3, 4, 1 }, s);
+
+    // denormalize: x*std + mean, stats [128] → [1,1,1,1,128].
+    {
+        const mean = comp.get("vae_decoder.per_channel_statistics.mean").?;
+        const std_ = comp.get("vae_decoder.per_channel_statistics.std").?;
+        const mr = try reshapeTo(mean, &[_]c_int{ 1, 1, 1, 1, 128 }, s);
+        defer _ = mlx.mlx_array_free(mr);
+        const sr = try reshapeTo(std_, &[_]c_int{ 1, 1, 1, 1, 128 }, s);
+        defer _ = mlx.mlx_array_free(sr);
+        var xs = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_multiply(&xs, x, sr, s));
+        _ = mlx.mlx_array_free(x);
+        var xm = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_add(&xm, xs, mr, s));
+        _ = mlx.mlx_array_free(xs);
+        x = xm;
+    }
+
+    // conv_in (128→1024).
+    {
+        const nx = try convByKey(comp, "vae_decoder.conv_in.conv", x, s);
+        _ = mlx.mlx_array_free(x);
+        x = nx;
+    }
+
+    // up_blocks: even = ResStage, odd = DepthToSpace conv + pixel_shuffle.
+    const res_stages = [_]ResStageSpec{
+        .{ .up_idx = 0, .num_blocks = 2 }, .{ .up_idx = 2, .num_blocks = 2 },
+        .{ .up_idx = 4, .num_blocks = 4 }, .{ .up_idx = 6, .num_blocks = 6 },
+        .{ .up_idx = 8, .num_blocks = 4 },
+    };
+    const ups = [_]UpSpec{
+        .{ .up_idx = 1, .sf = 2, .tf = 2 }, .{ .up_idx = 3, .sf = 2, .tf = 2 },
+        .{ .up_idx = 5, .sf = 1, .tf = 2 }, .{ .up_idx = 7, .sf = 2, .tf = 1 },
+    };
+    var i: u32 = 0;
+    while (i <= 8) : (i += 1) {
+        if (i % 2 == 0) {
+            // ResStage.
+            const spec = for (res_stages) |r| {
+                if (r.up_idx == i) break r;
+            } else unreachable;
+            var b: u32 = 0;
+            while (b < spec.num_blocks) : (b += 1) {
+                const nx = try resBlock3d(comp, x, i, b, s);
+                _ = mlx.mlx_array_free(x);
+                x = nx;
+            }
+        } else {
+            // DepthToSpace conv then pixel_shuffle.
+            const spec = for (ups) |u| {
+                if (u.up_idx == i) break u;
+            } else unreachable;
+            var kbuf: [256]u8 = undefined;
+            const key = try std.fmt.bufPrint(&kbuf, "vae_decoder.up_blocks.{d}.conv.conv", .{i});
+            const cv = try convByKey(comp, key, x, s);
+            _ = mlx.mlx_array_free(x);
+            const ps = try pixelShuffle3d(cv, spec.sf, spec.tf, s);
+            _ = mlx.mlx_array_free(cv);
+            var dts = ps;
+            if (spec.tf > 1) {
+                // drop first frame after temporal upsample.
+                const D: c_int = mlx.getShape(ps)[1];
+                dts = try sliceAxis1(ps, 1, D, s);
+                _ = mlx.mlx_array_free(ps);
+            }
+            // pixel_shuffle/slice produce STRIDED views; the next stage's norm/
+            // conv read them wrong unless materialized (strided-array gotcha).
+            x = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_contiguous(&x, dts, false, s));
+            _ = mlx.mlx_array_free(dts);
+        }
+        _ = mlx.mlx_array_eval(x); // keep the lazy graph bounded across stages
+    }
+
+    // conv_out(silu(pixel_norm(x))) (128→48).
+    {
+        const pn = try pixelNormFast(x, 1e-8, s);
+        _ = mlx.mlx_array_free(x);
+        const a = try silu(pn, s);
+        _ = mlx.mlx_array_free(pn);
+        const co = try convByKey(comp, "vae_decoder.conv_out.conv", a, s);
+        _ = mlx.mlx_array_free(a);
+        x = co;
+    }
+
+    // final spatial unpatchify 48→3, 4× spatial.
+    {
+        const up = try unpatchifySpatial(x, 4, s);
+        _ = mlx.mlx_array_free(x);
+        x = up;
+    }
+
+    // BFHWC → BCFHW. Materialize: a lazy transpose view reads back in SOURCE
+    // memory order via mlx_array_data_* (strided-array gotcha) — contiguize so
+    // callers get a real BCFHW array.
+    const t = try transposeTo(x, &[_]c_int{ 0, 4, 1, 2, 3 }, s);
+    _ = mlx.mlx_array_free(x);
+    defer _ = mlx.mlx_array_free(t);
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_contiguous(&out, t, false, s));
+    return out;
+}
+
 // ── Tests ──
 
 const testing = std.testing;
@@ -362,6 +587,71 @@ test "ltx decoderConv3d matches reference conv_in" {
     const corr = dot / (@sqrt(na) * @sqrt(nb));
     std.debug.print("[ltx-conv3d] n={d} corr={d:.6} max_abs_err={d:.5}\n", .{ n, corr, maxabs });
     try testing.expect(corr > 0.9999);
+}
+
+// Full 3D VAE decoder validated against the reference VideoDecoder on a fixed
+// latent (NO 41GB pipeline — just vae_decoder.safetensors). Gated on:
+//   LTX_TEST_MODEL  = ltx-2.3-mlx-q4 snapshot dir
+//   LTX_VAE_LATENT  = raw f32 [1,128,2,8,12] (BCFHW) reference latent
+//   LTX_VAE_DECODED = raw f32 [1,3,9,256,384] (BCFHW) reference decoded pixels
+test "ltx vaeDecode reproduces reference VideoDecoder" {
+    const dir = std.mem.span(std.c.getenv("LTX_TEST_MODEL") orelse return error.SkipZigTest);
+    const lp = std.mem.span(std.c.getenv("LTX_VAE_LATENT") orelse return error.SkipZigTest);
+    const dp = std.mem.span(std.c.getenv("LTX_VAE_DECODED") orelse return error.SkipZigTest);
+    const allocator = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+
+    const latbuf = try readF32(io, allocator, lp);
+    defer allocator.free(latbuf);
+    const ref = try readF32(io, allocator, dp);
+    defer allocator.free(ref);
+
+    // Weights on a CPU stream (Load has no GPU eval), evaled before the GPU graph.
+    const cpu_s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(cpu_s);
+    const vp = try std.fmt.allocPrintSentinel(allocator, "{s}/vae_decoder.safetensors", .{dir}, 0);
+    defer allocator.free(vp);
+    var comp = try loadComponent(allocator, vp, cpu_s);
+    defer comp.deinit();
+    var it = comp.map.iterator();
+    while (it.next()) |e| _ = mlx.mlx_array_eval(e.value_ptr.*);
+
+    const lshape = [_]c_int{ 1, 128, 2, 8, 12 };
+    const lat_f32 = mlx.mlx_array_new_data(latbuf.ptr, &lshape, 5, .float32);
+    defer _ = mlx.mlx_array_free(lat_f32);
+    var lat = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(lat);
+    try mlx.check(mlx.mlx_astype(&lat, lat_f32, .bfloat16, s));
+
+    const out = try vaeDecode(&comp, lat, s);
+    defer _ = mlx.mlx_array_free(out);
+    var outf = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(outf);
+    try mlx.check(mlx.mlx_astype(&outf, out, .float32, s));
+    _ = mlx.mlx_array_eval(outf);
+
+    const n: usize = @intCast(mlx.mlx_array_size(outf));
+    try testing.expectEqual(ref.len, n);
+    const data = mlx.mlx_array_data_float32(outf).?;
+    var dot: f64 = 0;
+    var na: f64 = 0;
+    var nb: f64 = 0;
+    var se: f64 = 0;
+    for (0..n) |idx| {
+        const a: f64 = data[idx];
+        const r: f64 = ref[idx];
+        dot += a * r;
+        na += a * a;
+        nb += r * r;
+        se += (a - r) * (a - r);
+    }
+    const corr = dot / (@sqrt(na) * @sqrt(nb));
+    const mse = se / @as(f64, @floatFromInt(n));
+    const psnr = 10.0 * std.math.log10(4.0 / mse); // signal range ~[-1,1] → peak 2, peak^2=4
+    std.debug.print("[ltx-vae] n={d} corr={d:.6} psnr={d:.2}dB mse={d:.6}\n", .{ n, corr, psnr, mse });
+    try testing.expect(corr > 0.99);
 }
 
 fn readF32(io: std.Io, allocator: std.mem.Allocator, path: []const u8) ![]f32 {
