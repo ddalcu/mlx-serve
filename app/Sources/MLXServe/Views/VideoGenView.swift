@@ -31,11 +31,30 @@ struct VideoGenView: View {
     @State private var player: AVPlayer?
     /// Keep the model resident after generating (default off → unload).
     @State private var keepResident: Bool = false
+    /// Hydration guard — see ImageGenView for the full rationale.
+    @State private var hydrating: Bool = false
+    @State private var didHydrate: Bool = false
 
     var body: some View {
         readyView
         .frame(minWidth: 880, minHeight: 660)
-        .onAppear { applyModelDefaults() }
+        .onAppear {
+            if !didHydrate {
+                hydrating = true
+                hydrate()
+                didHydrate = true
+                DispatchQueue.main.async { hydrating = false }
+            }
+        }
+        // Persist the fields not owned by the model/quality/resolution sections.
+        .onChange(of: numFrames) { _, _ in guard !hydrating else { return }; persist() }
+        .onChange(of: fps) { _, _ in guard !hydrating else { return }; persist() }
+        .onChange(of: mode) { _, _ in guard !hydrating else { return }; persist() }
+        .onChange(of: steps) { _, _ in guard !hydrating else { return }; persist() }
+        .onChange(of: cfgScale) { _, _ in guard !hydrating else { return }; persist() }
+        .onChange(of: stgScale) { _, _ in guard !hydrating else { return }; persist() }
+        .onChange(of: seed) { _, _ in guard !hydrating else { return }; persist() }
+        .onChange(of: keepResident) { _, _ in guard !hydrating else { return }; persist() }
         .onChange(of: service.phase) { _, phase in
             if case .completed(let path) = phase {
                 player = AVPlayer(url: URL(fileURLWithPath: path))
@@ -151,7 +170,7 @@ struct VideoGenView: View {
             }
             .labelsHidden()
             .pickerStyle(.menu)
-            .onChange(of: model) { _, _ in applyModelDefaults() }
+            .onChange(of: model) { _, _ in guard !hydrating else { return }; applyModelDefaults(); persist() }
             Text("~\(model.approxRAMGB) GB RAM • Includes audio")
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -168,7 +187,7 @@ struct VideoGenView: View {
             }
             .pickerStyle(.segmented)
             .labelsHidden()
-            .onChange(of: quality) { _, _ in applyQualityDefaults() }
+            .onChange(of: quality) { _, _ in guard !hydrating else { return }; applyQualityDefaults(); persist() }
             Text(qualityHint)
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -199,7 +218,7 @@ struct VideoGenView: View {
             }
             .labelsHidden()
             .pickerStyle(.menu)
-            .onChange(of: resolution) { _, _ in clampFramesToRAM() }
+            .onChange(of: resolution) { _, _ in guard !hydrating else { return }; clampFramesToRAM(); persist() }
         }
     }
 
@@ -482,6 +501,40 @@ struct VideoGenView: View {
         .help(MediaStorage.videosRoot)
     }
 
+    // MARK: - Sticky settings
+
+    private func hydrate() {
+        let s = VideoGenSettings.load()
+        model = s.resolvedModel
+        quality = s.quality
+        resolution = s.resolvedResolution(for: model)
+        numFrames = s.numFrames
+        fps = s.fps
+        mode = s.mode
+        steps = s.steps
+        cfgScale = s.cfgScale
+        stgScale = s.stgScale
+        seed = s.seed
+        keepResident = s.keepResident
+        clampFramesToRAM()
+    }
+
+    private func persist() {
+        var s = VideoGenSettings()
+        s.modelId = model.id
+        s.quality = quality
+        s.resolutionId = resolution.id
+        s.numFrames = numFrames
+        s.fps = fps
+        s.mode = mode
+        s.steps = steps
+        s.cfgScale = cfgScale
+        s.stgScale = stgScale
+        s.seed = seed
+        s.keepResident = keepResident
+        s.save()
+    }
+
     // MARK: - Actions
 
     private func applyModelDefaults() {
@@ -534,6 +587,7 @@ struct VideoGenView: View {
             firstFrameImagePath: supportsI2V ? firstFrameImageURL?.path : nil,
             keepResident: keepResident
         )
+        persist()
 
         let total = RAMChecker.totalGB
         let needed = model.approxRAMGB

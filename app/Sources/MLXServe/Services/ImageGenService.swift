@@ -115,6 +115,67 @@ final class ImageGenService: ObservableObject {
         }
     }
 
+    /// Errors surfaced by the awaitable agent path (`generateForAgent`).
+    enum GenError: LocalizedError {
+        case emptyPrompt
+        case notDownloaded(String)
+        case server(String)
+        var errorDescription: String? {
+            switch self {
+            case .emptyPrompt:           return "Prompt is empty."
+            case .notDownloaded(let n):  return "\(n) is not downloaded."
+            case .server(let m):         return m
+            }
+        }
+    }
+
+    /// Awaitable image generation for the agent's `generate_image` tool. Runs the
+    /// SAME load → stream → write → unload pipeline as `generate`, returning the
+    /// output PNG path (or throwing), but WITHOUT touching the menu-bar UI state
+    /// (`phase`/`task`/`recent`) — so an agent generation never hijacks the Image
+    /// window. Honors the request's `keepResident` like the interactive path.
+    func generateForAgent(_ request: ImageGenRequest, server: ServerManager) async throws -> String {
+        guard !request.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw GenError.emptyPrompt
+        }
+        guard let modelDir = ServerManager.resolveModelDir(repo: request.model.repo) else {
+            throw GenError.notDownloaded(request.model.name)
+        }
+
+        let outputPath = Self.makeOutputPath(prompt: request.prompt)
+        let size = "\(request.width)x\(request.height)"
+        let seedToSend = request.seed >= 0 ? request.seed : Int.random(in: 0...0xFFFF_FFFF)
+        let keep = request.keepResident
+
+        let port = try await server.ensureRunning(forGenModelDir: modelDir)
+        let info = try await server.loadModel(id: modelDir)  // registry id = dir basename
+        let loadedId = info.name
+        func releaseIfNeeded() async {
+            if !keep { try? await server.unloadModel(id: loadedId) }
+        }
+        do {
+            var png: Data? = nil
+            var genJson: [String: Any] = ["model": info.name, "prompt": request.prompt,
+                                          "size": size, "steps": request.steps, "seed": seedToSend]
+            if !request.safeMode { genJson["safety"] = false }
+            for try await ev in api.streamGeneration(
+                port: port, path: "/v1/images/generations", json: genJson) {
+                switch ev["type"] as? String {
+                case "complete": png = Self.decodePngB64(ev)
+                case "error":    throw GenError.server(ev["message"] as? String ?? "Generation failed.")
+                default:         break
+                }
+            }
+            guard let png else { throw GenError.server("Server returned no image data.") }
+            try png.write(to: URL(fileURLWithPath: outputPath))
+            await releaseIfNeeded()
+            return outputPath
+        } catch {
+            await releaseIfNeeded()
+            throw error
+        }
+    }
+
     /// Extract the base64 PNG from an OpenAI `{data:[{b64_json}]}` response body.
     /// Pure + static so it's unit-testable without a running server.
     static func decodePngB64(_ body: Data) -> Data? {

@@ -31,14 +31,37 @@ struct ImageGenView: View {
     /// Apply the NSFW content filter (on by default). Off → sends safety:false so
     /// the server skips it. (The license expects filtering in deployments.)
     @State private var safeMode: Bool = true
+    /// True while `hydrate()` seeds `@State` from saved settings. Hydrating
+    /// `model`/`quality` fires their `.onChange` (applyModelDefaults /
+    /// applyQualityDefaults) which would clobber the just-restored
+    /// steps/guidance/resolution — so every reset + persist is guarded on this.
+    @State private var hydrating: Bool = false
+    /// Hydrate exactly once per window lifetime (the first `.onAppear`).
+    @State private var didHydrate: Bool = false
 
     var body: some View {
         readyView
         .frame(minWidth: 880, minHeight: 640)
         .onAppear {
-            applyModelDefaults()
+            if !didHydrate {
+                hydrating = true
+                hydrate()
+                didHydrate = true
+                // Clear on the next runloop tick so the cascade of `.onChange`
+                // fired by hydration's state writes is ignored.
+                DispatchQueue.main.async { hydrating = false }
+            }
             downloads.ensureNsfwClassifier() // best-effort: provision the shared content filter
         }
+        // Persist every other sticky field on change (model/quality persist in
+        // their sections after applying preset defaults).
+        .onChange(of: resolution) { _, _ in guard !hydrating else { return }; persist() }
+        .onChange(of: steps) { _, _ in guard !hydrating else { return }; persist() }
+        .onChange(of: guidance) { _, _ in guard !hydrating else { return }; persist() }
+        .onChange(of: seed) { _, _ in guard !hydrating else { return }; persist() }
+        .onChange(of: negative) { _, _ in guard !hydrating else { return }; persist() }
+        .onChange(of: safeMode) { _, _ in guard !hydrating else { return }; persist() }
+        .onChange(of: keepResident) { _, _ in guard !hydrating else { return }; persist() }
     }
 
     private var readyView: some View {
@@ -97,7 +120,7 @@ struct ImageGenView: View {
             }
             .labelsHidden()
             .pickerStyle(.menu)
-            .onChange(of: model) { _, _ in applyModelDefaults() }
+            .onChange(of: model) { _, _ in guard !hydrating else { return }; applyModelDefaults(); persist() }
             Text("~\(model.approxRAMGB) GB RAM")
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -114,7 +137,7 @@ struct ImageGenView: View {
             }
             .pickerStyle(.segmented)
             .labelsHidden()
-            .onChange(of: quality) { _, _ in applyQualityDefaults() }
+            .onChange(of: quality) { _, _ in guard !hydrating else { return }; applyQualityDefaults(); persist() }
             Text(qualityHint)
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -302,6 +325,40 @@ struct ImageGenView: View {
         .help(MediaStorage.imagesRoot)
     }
 
+    // MARK: - Sticky settings
+
+    /// Seed `@State` from the last-used settings. Saved values win; resolution
+    /// and quality are revalidated against the restored model so they stay
+    /// in-range. Runs under `hydrating == true` so the `.onChange` cascade these
+    /// writes trigger doesn't reapply preset defaults over them.
+    private func hydrate() {
+        let s = ImageGenSettings.load()
+        model = s.resolvedModel
+        quality = s.quality
+        resolution = s.resolvedResolution(for: model)
+        steps = s.steps
+        guidance = s.guidance
+        seed = s.seed
+        negative = s.negativePrompt
+        safeMode = s.safeMode
+        keepResident = s.keepResident
+    }
+
+    /// Capture the current controls as the new last-used settings.
+    private func persist() {
+        var s = ImageGenSettings()
+        s.modelId = model.id
+        s.quality = quality
+        s.resolutionId = resolution.id
+        s.steps = steps
+        s.guidance = guidance
+        s.seed = seed
+        s.negativePrompt = negative
+        s.safeMode = safeMode
+        s.keepResident = keepResident
+        s.save()
+    }
+
     // MARK: - Actions
 
     private func applyModelDefaults() {
@@ -334,6 +391,7 @@ struct ImageGenView: View {
             keepResident: keepResident,
             safeMode: safeMode
         )
+        persist()  // final capture — the agent's generate_image reuses these
 
         let total = RAMChecker.totalGB
         let needed = model.approxRAMGB

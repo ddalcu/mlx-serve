@@ -29,10 +29,25 @@ struct AudioGenView: View {
     @State private var player: AVPlayer?
     /// Keep the model resident after generating (default off → unload).
     @State private var keepResident: Bool = false
+    /// Hydration guard — see ImageGenView for the full rationale.
+    @State private var hydrating: Bool = false
+    @State private var didHydrate: Bool = false
 
     var body: some View {
         readyView
         .frame(minWidth: 820, minHeight: 600)
+        .onAppear {
+            if !didHydrate {
+                hydrating = true
+                hydrate()
+                didHydrate = true
+                DispatchQueue.main.async { hydrating = false }
+            }
+        }
+        .onChange(of: model) { _, _ in guard !hydrating else { return }; persist() }
+        .onChange(of: speed) { _, _ in guard !hydrating else { return }; persist() }
+        .onChange(of: temperature) { _, _ in guard !hydrating else { return }; persist() }
+        .onChange(of: keepResident) { _, _ in guard !hydrating else { return }; persist() }
         .onChange(of: service.phase) { _, phase in
             if case .completed(let path) = phase {
                 player = AVPlayer(url: URL(fileURLWithPath: path))
@@ -353,6 +368,25 @@ struct AudioGenView: View {
         player = p
     }
 
+    // MARK: - Sticky settings
+
+    private func hydrate() {
+        let s = AudioGenSettings.load()
+        model = s.resolvedModel
+        speed = s.speed
+        temperature = s.temperature
+        keepResident = s.keepResident
+    }
+
+    private func persist() {
+        var s = AudioGenSettings()
+        s.modelId = model.id
+        s.speed = speed
+        s.temperature = temperature
+        s.keepResident = keepResident
+        s.save()
+    }
+
     // MARK: - Generate
 
     private func tryGenerate() {
@@ -365,6 +399,7 @@ struct AudioGenView: View {
             temperature: temperature,
             keepResident: keepResident
         )
+        persist()
         let total = RAMChecker.totalGB
         let needed = model.approxRAMGB
         if total < needed {

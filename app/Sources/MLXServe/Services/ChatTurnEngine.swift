@@ -755,6 +755,10 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                             telegramChatId: config.telegramChatId
                         ) ?? "Error: task creation unavailable."
                     },
+                    generateImage: { [weak self] prompt in
+                        await self?.generateImageFromAgent(prompt: prompt)
+                            ?? "Error: image generation unavailable."
+                    },
                     processRegistry: appState.processRegistry,
                     sessionId: sessionId
                 )
@@ -768,19 +772,24 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                 toolMsg.toolCallId = result.id
                 toolMsg.toolName = result.name
 
-                // Extract screenshot image data and attach as vision input
-                if result.name == "browse" && result.output.contains("data:image/jpeg;base64,") {
-                    if let range = result.output.range(of: "data:image/jpeg;base64,") {
-                        let remainder = result.output[range.upperBound...]
-                        let b64End = remainder.firstIndex(of: "\n") ?? remainder.endIndex
-                        let b64 = String(remainder[..<b64End])
-                        if let jpegData = Data(base64Encoded: b64),
-                           let chatImage = ChatImage(data: jpegData) as ChatImage? {
-                            toolMsg.images = [chatImage]
-                            toolMsg.content = "[screenshot captured]"
-                        } else {
-                            toolMsg.content = AgentEngine.truncateWithOverflow(result.output, toolCallId: result.id, toolName: result.name)
-                        }
+                // Inline images. `browse` screenshots attach to the (hidden) tool
+                // message as VISION INPUT for the next turn. `generate_image`
+                // instead surfaces the rendered image to the USER as a separate
+                // visible assistant message (the tool message is hidden, and only
+                // a `.message` bubble renders images — ChatView ~1793); its
+                // model-facing content keeps just the caption/path, never the
+                // multi-KB base64 (which would blow up the context).
+                var pendingInlineImage: ChatImage? = nil
+                if (result.name == "browse" || result.name == "generate_image")
+                    && result.output.contains(AgentMediaInline.jpegDataURIMarker) {
+                    let (caption, jpeg) = AgentMediaInline.splitInlineImage(result.output)
+                    let chatImage = jpeg.map { ChatImage(data: $0) }
+                    if result.name == "generate_image" {
+                        toolMsg.content = caption.isEmpty ? "[image generated]" : caption
+                        pendingInlineImage = chatImage
+                    } else if let chatImage {
+                        toolMsg.images = [chatImage]
+                        toolMsg.content = "[screenshot captured]"
                     } else {
                         toolMsg.content = AgentEngine.truncateWithOverflow(result.output, toolCallId: result.id, toolName: result.name)
                     }
@@ -794,6 +803,14 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                 resultMsg.isAgentSummary = true
                 appState.appendMessage(to: sessionId, message: resultMsg)
                 appState.appendMessage(to: sessionId, message: toolMsg)
+
+                // Render the generated image inline AFTER the tool-call card, via
+                // a visible assistant `.message` (the only row that displays it).
+                if let pendingInlineImage {
+                    var imgMsg = ChatMessage(role: .assistant, content: "")
+                    imgMsg.images = [pendingInlineImage]
+                    appState.appendMessage(to: sessionId, message: imgMsg)
+                }
             }
 
             // Attach any background-process handles this round started to the
@@ -866,6 +883,56 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                 originTelegramChatId: telegramChatId)
             scheduler.addTask(task)
             return "✅ Scheduled task “\(title)” to run \(ScheduleParser.describe(trigger)). I'll \(willNotify) with each result."
+        }
+    }
+
+    // MARK: - generate_image tool (agent-rendered images, inline in chat)
+
+    /// Backs the agent's `generate_image` tool. Renders an image from `prompt`
+    /// using the user's SAVED Image settings (`ImageGenSettings`) — never a
+    /// model/size the model chose — and returns a string carrying the caption +
+    /// a `data:image/jpeg;base64,…` payload that `runAgentLoop` splits into a
+    /// model-facing caption and an inline image message. If the saved model
+    /// isn't downloaded, returns a friendly "download it first" message instead
+    /// of silently pulling multiple GB mid-chat.
+    func generateImageFromAgent(prompt: String) async -> String {
+        let trimmed = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else {
+            return "Error: generate_image needs a non-empty \"prompt\" describing the image to draw."
+        }
+        let s = ImageGenSettings.load()
+        let model = s.resolvedModel
+        // Don't kick off a silent multi-GB download from a chat turn — if the
+        // saved image model isn't present, tell the user to grab it from the
+        // Image window once (the only place with a progress bar + RAM gate).
+        guard ServerManager.resolveModelDir(repo: model.repo) != nil else {
+            return "The image model “\(model.name)” isn't downloaded yet, so I can't generate an image. Open the Image generation window once (menu-bar tray ▸ Image) to download it (~\(model.approxDownloadGB) GB), then ask me again."
+        }
+        let resolution = s.resolvedResolution(for: model)
+        let req = ImageGenRequest(
+            model: model,
+            prompt: trimmed,
+            negativePrompt: s.negativePrompt,
+            seed: s.seed,
+            width: resolution.width,
+            height: resolution.height,
+            steps: s.steps,
+            guidance: s.guidance,
+            keepResident: s.keepResident,
+            safeMode: s.safeMode
+        )
+        do {
+            let path = try await appState.imageGen.generateForAgent(req, server: appState.server)
+            // Caption FIRST, base64 LAST: runAgentLoop keeps the caption as the
+            // model-facing tool content and strips the data URI before the model
+            // sees it (see AgentMediaInline.splitInlineImage).
+            let caption = "Generated a \(resolution.width)×\(resolution.height) image for: \(trimmed). Saved to \(path)."
+            guard let dataURI = AgentMediaInline.pngFileToJpegDataURI(path) else {
+                return caption
+            }
+            return "\(caption)\n\(dataURI)"
+        } catch {
+            return "Error generating image: \(error.localizedDescription)"
         }
     }
 

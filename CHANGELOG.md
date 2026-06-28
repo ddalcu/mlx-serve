@@ -9,6 +9,8 @@
 - **One app, one server, one memory budget.** Chat and every media type now share a single local server instead of separate background processes. A model loads on demand when you generate and unloads when it's done to free GPU memory — flip "Keep loaded" for instant repeat runs — and a chat model and a media model can stay resident together without stepping on each other.
 - **Download media models right where you use them.** When a model you pick isn't on disk, the generation pane offers a one-click download with progress and only enables Generate once it's ready. Downloads pull just the files the engine actually reads — LTX grabs ~26 GB (model + its text encoder) instead of the repo's ~70 GB of unused weights — and that LTX text encoder doubles as a selectable chat model.
 - **Live progress everywhere.** Image, audio, and video all stream per-step progress as they generate, so you watch the work happen instead of staring at a spinner.
+- **Generate images right in chat.** In Agent mode, just ask for an image — "draw a red fox in the snow" — and it renders inline in the conversation using your saved Image settings (model, quality, resolution, seed, safe mode), no need to leave chat or restate the model. Double-click any image in a chat to open it full-size in Preview. (Audio and video generation stay in their tray windows for this release.)
+- **Your generation settings stick.** The Image, Audio, and Video panels now remember your last-used model, quality, resolution, steps, seed, and toggles — between opening the window and across app restarts — so you stop re-picking the same setup every time.
 
 ---
 

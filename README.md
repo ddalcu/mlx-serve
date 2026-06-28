@@ -48,6 +48,9 @@ If you're already on LM Studio, Ollama, or `mlx-lm` and wondering whether to swi
 | One-click launchers (Claude Code, OpenCode, Pi) | ✅ | ❌ | ❌ | ❌ |
 | Python required at runtime | ❌ | ❌ | ❌ | ✅ |
 | Native menu-bar app (no Electron) | ✅ | ❌ Electron | ❌ | ❌ |
+| **Image Generation** | ✅ | ❌ | ❌ | ❌ |
+| **Video Generation** | ✅ | ❌ | ❌ | ❌ |
+| **Audio Generation** | ✅ | ❌ | ❌ | ❌ |
 | License | MIT | proprietary | MIT | MIT |
 
 ¹ Ollama can't run MLX, so the comparison is GGUF-vs-GGUF. 
@@ -104,34 +107,25 @@ Menu-bar app that wraps the server with a full UI:
 - **Prompt-based skills** — drop `.md` files into `~/.mlx-serve/skills/` with YAML frontmatter to teach the agent custom capabilities triggered by keywords.
 - **Engine-aware Settings window** (Cmd+,) — every server-launch flag and per-request default, with sections that show only the knobs relevant to the engine you've loaded (MLX vs GGUF vs ds4).
 - **Server management** — start/stop, live log buffer, restart-on-flag-change banner.
-- **Image / Video Generation (optional)** — FLUX.2 and LTX-Video 2.3 through a Python subprocess (the Zig server itself stays Python-free; see below).
+- **Image / Video Generation** — Krea-2, FLUX.2 and LTX-Video 2.3 native via mlx-serve zig server.
 
-### Image / Video Generation (optional)
+### Image / Video Generation 
 
-The tray has **ImageGen** and **VideoGen** buttons that run [FLUX.2](https://huggingface.co/black-forest-labs) and [LTX-Video 2.3](https://github.com/dgrauet/ltx-2-mlx) through a Python subprocess. Both run natively on MLX — no MPS/diffusers path. This is completely optional — the Zig server itself remains Python-free.
+The tray has **ImageGen**, **VideoGen** and **AudioGen** buttons that run [FLUX.2](https://huggingface.co/black-forest-labs), [LTX-Video 2.3](https://github.com/dgrauet/ltx-2-mlx) and [Qwen3-TTS](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-Base) through our zig server. All three run natively on MLX. 
 
-**Prerequisite:** Python 3 and ffmpeg must be installed on your Mac.
+Launch MLX Core, click the ImageGen, VideoGen or AudioGen tray icon, and hit **Download**. Each panel remembers your last-used model, quality, resolution, steps and seed between sessions, so you don't re-pick them every time.
 
-```bash
-brew install python ffmpeg
-```
-
-Then launch MLX Core, click the ImageGen (or VideoGen) tray icon, and hit **Install** in the window. The app will:
-
-1. Create a dedicated venv at `~/.mlx-serve/venv` (does not touch your system Python)
-2. Install mflux (FLUX), ltx-pipelines-mlx (LTX-2.3), and shared utilities. ~3 GB pip install.
-3. Download the model weights on first generation (HuggingFace cache, resumable)
+You can also **generate images straight from chat**: in Agent mode, ask for an image and it renders inline in the conversation using your saved Image settings — double-click any chat image to open it full-size in Preview. (Audio and video generation live in their tray windows for now.)
 
 **Models:**
 
 | Feature | Default | Other options | Approx. RAM |
 |---|---|---|---|
-| Image | FLUX.2-klein 4B 4-bit (mflux, ~5 GB pre-quantized) | FLUX.1-schnell / dev 4-bit and 8-bit | 8 / 12 / 16 GB |
+| Image | FLUX.2-klein 4B 4-bit (mflux, ~5 GB pre-quantized) | Krea-2-Turbo-MLX-Serve-mixed-4-8 | 8 / 12 / 16 GB |
 | Video | LTX-Video 2.3 Q4 | — | 24 GB RAM, ~50 GB first-run download (LTX 41 GB + Gemma 8 GB) |
+| Audio | Qwen3-TTS 1.7b | — | 8 GB RAM, ~3.5 GB first-run download |
 
 > The 41 GB LTX snapshot ships **both** transformer variants (1-stage distilled + 2-stage dev, ~11 GB each) plus a 7.6 GB distillation LoRA, so you can switch between Fast/Good/Quality/Super offline without re-downloading.
-
-The image path uses [`mflux`](https://github.com/filipstrand/mflux) for native MLX inference with built-in 4/8-bit quantization. The video path uses [`ltx-2-mlx`](https://github.com/dgrauet/ltx-2-mlx) with audio generation (muxed via system `ffmpeg`).
 
 Outputs go to `~/.mlx-serve/generations/images/YYYY-MM-DD/` and `.../videos/YYYY-MM-DD/`.
 
