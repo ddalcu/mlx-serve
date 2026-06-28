@@ -23,11 +23,9 @@ final class VideoGenService: ObservableObject {
     @Published private(set) var recent: [String] = []
     @Published private(set) var log: [String] = []
 
-    private let python: PythonManager
     private var task: Task<Void, Never>?
 
-    init(python: PythonManager) {
-        self.python = python
+    init() {
         loadRecent()
     }
 
@@ -195,7 +193,7 @@ final class VideoGenService: ObservableObject {
     }
 
     private func loadRecent() {
-        let root = PythonManager.videosRoot
+        let root = MediaStorage.videosRoot
         let fm = FileManager.default
         guard let days = try? fm.contentsOfDirectory(atPath: root) else { return }
         var paths: [(String, Date)] = []
@@ -215,7 +213,7 @@ final class VideoGenService: ObservableObject {
         let df = DateFormatter()
         df.dateFormat = "yyyy-MM-dd"
         let day = df.string(from: Date())
-        let dayDir = (PythonManager.videosRoot as NSString).appendingPathComponent(day)
+        let dayDir = (MediaStorage.videosRoot as NSString).appendingPathComponent(day)
         try? FileManager.default.createDirectory(atPath: dayDir, withIntermediateDirectories: true)
         let tf = DateFormatter()
         tf.dateFormat = "yyyy-MM-dd_HH-mm-ss"

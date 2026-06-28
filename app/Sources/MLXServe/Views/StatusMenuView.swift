@@ -142,7 +142,6 @@ struct StatusMenuView: View {
     @EnvironmentObject var appState: AppState
     @EnvironmentObject var server: ServerManager
     @EnvironmentObject var downloads: DownloadManager
-    @EnvironmentObject var python: PythonManager
     @State private var showDownloads = false
     @State private var showLog = false
     /// Persisted so the accordion stays where the user left it across popover
@@ -491,9 +490,7 @@ struct StatusMenuView: View {
                             genFeatureButton(
                                 icon: exp.icon,
                                 title: exp.title,
-                                help: exp.help(ready: exp.ready(
-                                    imagesReady: python.status.imagesReady,
-                                    fullyReady: python.status.isReady)),
+                                help: exp.help(ready: true), // native engine — always available
                                 action: { open(exp) })
                         }
                     }

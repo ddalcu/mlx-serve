@@ -7,7 +7,6 @@ import AppKit
 /// pins to model-trained buckets, and Advanced lets the user override
 /// individual fields if they really want to.
 struct ImageGenView: View {
-    @EnvironmentObject var python: PythonManager
     @EnvironmentObject var service: ImageGenService
     @EnvironmentObject var server: ServerManager
 
@@ -25,18 +24,7 @@ struct ImageGenView: View {
     @State private var pendingRequest: ImageGenRequest? = nil
 
     var body: some View {
-        Group {
-            switch python.status {
-            case .unknown:
-                ProgressView().frame(maxWidth: .infinity, maxHeight: .infinity)
-            case .missingPython, .needsGit, .needsVenv, .needsPackages:
-                GenInstallPane(feature: "Image Generation (FLUX.2)")
-            case .needsFFmpeg, .ready:
-                // mflux doesn't need ffmpeg — image gen works even when only
-                // the video pipeline's system deps are missing.
-                readyView
-            }
-        }
+        readyView
         .frame(minWidth: 880, minHeight: 640)
         .onAppear { applyModelDefaults() }
     }
@@ -280,7 +268,7 @@ struct ImageGenView: View {
     private var outputFolderLink: some View {
         Button {
             NSWorkspace.shared.activateFileViewerSelecting(
-                [URL(fileURLWithPath: PythonManager.imagesRoot)]
+                [URL(fileURLWithPath: MediaStorage.imagesRoot)]
             )
         } label: {
             Label("Open output folder in Finder", systemImage: "folder")
@@ -288,7 +276,7 @@ struct ImageGenView: View {
         }
         .buttonStyle(.borderless)
         .foregroundStyle(.secondary)
-        .help(PythonManager.imagesRoot)
+        .help(MediaStorage.imagesRoot)
     }
 
     // MARK: - Actions

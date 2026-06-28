@@ -22,11 +22,9 @@ final class ImageGenService: ObservableObject {
     @Published private(set) var recent: [String] = []  // recent output paths, newest first
     @Published private(set) var log: [String] = []
 
-    private let python: PythonManager
     private var task: Task<Void, Never>?
 
-    init(python: PythonManager) {
-        self.python = python
+    init() {
         loadRecent()
     }
 
@@ -113,7 +111,7 @@ final class ImageGenService: ObservableObject {
     /// Scan the generations/images/ tree for existing files so the history
     /// shelf shows something on first launch.
     private func loadRecent() {
-        let root = PythonManager.imagesRoot
+        let root = MediaStorage.imagesRoot
         let fm = FileManager.default
         guard let days = try? fm.contentsOfDirectory(atPath: root) else { return }
         var paths: [(String, Date)] = []
@@ -135,7 +133,7 @@ final class ImageGenService: ObservableObject {
         let df = DateFormatter()
         df.dateFormat = "yyyy-MM-dd"
         let day = df.string(from: Date())
-        let dayDir = (PythonManager.imagesRoot as NSString).appendingPathComponent(day)
+        let dayDir = (MediaStorage.imagesRoot as NSString).appendingPathComponent(day)
         try? FileManager.default.createDirectory(atPath: dayDir, withIntermediateDirectories: true)
         let tf = DateFormatter()
         tf.dateFormat = "yyyy-MM-dd_HH-mm-ss"
@@ -147,159 +145,4 @@ final class ImageGenService: ObservableObject {
         let filename = "\(tf.string(from: Date()))_\(slug).png"
         return (dayDir as NSString).appendingPathComponent(filename)
     }
-
-    private static func buildArgs(_ r: ImageGenRequest, outputPath: String) -> [String] {
-        var args = [
-            "--variant", r.model.variant.rawValue,
-            "--config", r.model.configName,
-            "--repo", r.model.repo,
-            "--prompt", r.prompt,
-            "--width", String(r.width),
-            "--height", String(r.height),
-            "--steps", String(r.steps),
-            "--guidance", String(r.guidance),
-            "--seed", String(r.seed),
-            "--output", outputPath,
-        ]
-        if !r.negativePrompt.isEmpty {
-            args.append(contentsOf: ["--negative", r.negativePrompt])
-        }
-        return args
-    }
-
-    // MARK: - Embedded Python
-
-    /// mflux-based generation script. Uses the actual mflux 0.x API
-    /// discovered by inspecting the installed package — the public top-
-    /// level exports (`from mflux import Flux1`) are NOT available in
-    /// current mflux releases despite older docs. The real API:
-    ///
-    ///   from mflux.models.flux.variants.txt2img.flux import Flux1
-    ///   from mflux.models.flux2.variants.txt2img.flux2_klein import Flux2Klein
-    ///   from mflux.models.common.config.model_config import ModelConfig
-    ///
-    ///   flux = Flux1(model_config=ModelConfig.schnell(), quantize=4)
-    ///   img  = flux.generate_image(seed=..., prompt=..., num_inference_steps=...,
-    ///                              height=..., width=..., guidance=...)
-    ///   img.save(...)  # GeneratedImage.save accepts a positional path
-    ///
-    /// Wire format (JSON-per-line on stdout):
-    ///   {"type":"progress","step":N,"total":M,"message":"..."}
-    ///   {"type":"complete","path":"/abs/path/to/output.png"}
-    ///   {"type":"error","message":"..."}
-    ///
-    /// Per-step progress comes via tqdm interception — mflux uses tqdm
-    /// internally for its denoise loop and doesn't expose a step callback.
-    static let mfluxScript: String = #"""
-import sys, json, argparse, traceback, random
-
-def emit(obj):
-    print(json.dumps(obj), flush=True)
-
-def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--variant", required=True, choices=["flux1","flux2Klein4B","flux2Klein9B"])
-    p.add_argument("--config", required=True, help="schnell|dev|flux2_klein_4b|flux2_klein_9b")
-    p.add_argument("--repo", required=True,
-                   help="Pre-quantized mflux-format HuggingFace repo to download.")
-    p.add_argument("--prompt", required=True)
-    p.add_argument("--negative", default="")
-    p.add_argument("--seed", type=int, default=-1)
-    p.add_argument("--width", type=int, default=1024)
-    p.add_argument("--height", type=int, default=1024)
-    p.add_argument("--steps", type=int, default=4)
-    p.add_argument("--guidance", type=float, default=0.0)
-    p.add_argument("--output", required=True)
-    args = p.parse_args()
-
-    # Hook tqdm before importing mflux so the patched class is what mflux
-    # picks up for its denoise loop. mflux doesn't expose a step callback.
-    #
-    # We only emit progress for tqdm bars whose total looks like an inference
-    # step counter (<= 200). HuggingFace downloads also use tqdm (file count,
-    # byte counter in the billions) and emitting those would spam the UI with
-    # nonsensical "Step 0/4619599996" events.
-    try:
-        import tqdm
-        _orig = tqdm.tqdm
-        class _ProgressTqdm(_orig):
-            def update(self, n=1):
-                super().update(n)
-                if self.total and 0 < self.total <= 200:
-                    emit({"type":"progress","step":int(self.n),
-                          "total":int(self.total),
-                          "message":f"Step {int(self.n)}/{int(self.total)}"})
-        tqdm.tqdm = _ProgressTqdm
-        try:
-            import tqdm.auto
-            tqdm.auto.tqdm = _ProgressTqdm
-        except Exception:
-            pass
-    except Exception:
-        pass  # progress will be coarse; generation still works
-
-    try:
-        from mflux.models.common.config.model_config import ModelConfig
-        if args.variant == "flux1":
-            from mflux.models.flux.variants.txt2img.flux import Flux1 as ModelClass
-        else:
-            from mflux.models.flux2.variants.txt2img.flux2_klein import Flux2Klein as ModelClass
-    except Exception as e:
-        emit({"type":"error","message":f"mflux import failed: {e}"})
-        traceback.print_exc()
-        sys.exit(1)
-
-    # Resolve ModelConfig factory by name (e.g. "schnell" -> ModelConfig.schnell()).
-    try:
-        if not hasattr(ModelConfig, args.config):
-            emit({"type":"error","message":f"Unknown ModelConfig factory: {args.config}"})
-            sys.exit(1)
-        model_config = getattr(ModelConfig, args.config)()
-    except Exception as e:
-        emit({"type":"error","message":f"ModelConfig failed: {e}"})
-        traceback.print_exc()
-        sys.exit(1)
-
-    emit({"type":"progress","step":0,"total":args.steps,
-          "message":f"Downloading {args.repo} (first run only)..."})
-    try:
-        from huggingface_hub import snapshot_download
-        local_path = snapshot_download(repo_id=args.repo)
-        flux = ModelClass(model_config=model_config,
-                          model_path=local_path, quantize=None)
-    except Exception as e:
-        emit({"type":"error","message":f"Load failed: {e}"})
-        traceback.print_exc()
-        sys.exit(1)
-
-    seed = args.seed if args.seed >= 0 else random.randint(0, 2**32 - 1)
-    emit({"type":"progress","step":0,"total":args.steps,"message":"Generating..."})
-
-    # generate_image() in current mflux takes individual kwargs (no Config arg).
-    # FLUX.1 supports negative_prompt; FLUX.2 doesn't expose it as a top-level
-    # arg, so only forward it for flux1.
-    gen_kwargs = dict(
-        seed=seed,
-        prompt=args.prompt,
-        num_inference_steps=args.steps,
-        height=args.height,
-        width=args.width,
-        guidance=args.guidance,
-    )
-    if args.variant == "flux1" and args.negative:
-        gen_kwargs["negative_prompt"] = args.negative
-
-    try:
-        result = flux.generate_image(**gen_kwargs)
-    except Exception as e:
-        emit({"type":"error","message":str(e)})
-        traceback.print_exc()
-        sys.exit(1)
-
-    result.save(args.output)
-    emit({"type":"complete","path":args.output})
-
-if __name__ == "__main__":
-    main()
-"""#
 }

@@ -8,7 +8,6 @@ import UniformTypeIdentifiers
 /// picker, the text to speak, a reference-voice section (record or pick a file)
 /// with an optional transcript, and a player for the result.
 struct AudioGenView: View {
-    @EnvironmentObject var python: PythonManager
     @EnvironmentObject var service: AudioGenService
     @EnvironmentObject var server: ServerManager
 
@@ -29,17 +28,7 @@ struct AudioGenView: View {
     @State private var player: AVPlayer?
 
     var body: some View {
-        Group {
-            switch python.status {
-            case .unknown:
-                ProgressView().frame(maxWidth: .infinity, maxHeight: .infinity)
-            case .missingPython, .needsGit, .needsVenv, .needsPackages:
-                GenInstallPane(feature: "Audio Generation (voice cloning)")
-            case .needsFFmpeg, .ready:
-                // mlx-audio doesn't shell out to ffmpeg — works without it.
-                readyView
-            }
-        }
+        readyView
         .frame(minWidth: 820, minHeight: 600)
         .onChange(of: service.phase) { _, phase in
             if case .completed(let path) = phase {
@@ -285,13 +274,13 @@ struct AudioGenView: View {
 
     private var outputFolderLink: some View {
         Button {
-            NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: PythonManager.audiosRoot)])
+            NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: MediaStorage.audiosRoot)])
         } label: {
             Label("Open output folder in Finder", systemImage: "folder").font(.caption)
         }
         .buttonStyle(.borderless)
         .foregroundStyle(.secondary)
-        .help(PythonManager.audiosRoot)
+        .help(MediaStorage.audiosRoot)
     }
 
     // MARK: - Reference actions

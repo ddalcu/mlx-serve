@@ -24,11 +24,9 @@ final class AudioGenService: ObservableObject {
     @Published private(set) var recent: [String] = []
     @Published private(set) var log: [String] = []
 
-    private let python: PythonManager
     private var task: Task<Void, Never>?
 
-    init(python: PythonManager) {
-        self.python = python
+    init() {
         loadRecent()
     }
 
@@ -100,7 +98,7 @@ final class AudioGenService: ObservableObject {
     }
 
     private func loadRecent() {
-        let root = PythonManager.audiosRoot
+        let root = MediaStorage.audiosRoot
         let fm = FileManager.default
         guard let days = try? fm.contentsOfDirectory(atPath: root) else { return }
         var paths: [(String, Date)] = []
@@ -123,7 +121,7 @@ final class AudioGenService: ObservableObject {
         let df = DateFormatter()
         df.dateFormat = "yyyy-MM-dd"
         let day = df.string(from: Date())
-        let dayDir = (PythonManager.audiosRoot as NSString).appendingPathComponent(day)
+        let dayDir = (MediaStorage.audiosRoot as NSString).appendingPathComponent(day)
         try? FileManager.default.createDirectory(atPath: dayDir, withIntermediateDirectories: true)
         let tf = DateFormatter()
         tf.dateFormat = "yyyy-MM-dd_HH-mm-ss"
@@ -135,103 +133,4 @@ final class AudioGenService: ObservableObject {
         let filename = "\(tf.string(from: Date()))_\(slug).wav"
         return (dayDir as NSString).appendingPathComponent(filename)
     }
-
-    static func buildArgs(_ r: AudioGenRequest, outputPath: String) -> [String] {
-        var args = [
-            "--repo", r.model.repo,
-            "--text", r.text,
-            "--speed", String(r.speed),
-            "--temperature", String(r.temperature),
-            "--output", outputPath,
-        ]
-        if let ref = r.refAudioPath, !ref.isEmpty {
-            args.append(contentsOf: ["--ref-audio", ref])
-            let t = r.refText.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !t.isEmpty {
-                args.append(contentsOf: ["--ref-text", t])
-            }
-        }
-        return args
-    }
-
-    /// Python script for neural TTS / voice cloning via `mlx-audio`. Passes the
-    /// HF repo straight to `generate_audio`, which downloads + loads it. When a
-    /// reference clip is given it clones that voice (auto-transcribing with
-    /// Whisper if no `--ref-text`). `join_audio=True` yields a single file; we
-    /// then move whatever it produced onto the exact `--output` path so the
-    /// Swift side can trust the `complete` event.
-    static let script: String = #"""
-import sys, json, argparse, traceback, os, glob
-
-def emit(obj):
-    print(json.dumps(obj), flush=True)
-
-def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--repo", required=True)
-    p.add_argument("--text", required=True)
-    p.add_argument("--ref-audio", dest="ref_audio", default=None)
-    p.add_argument("--ref-text", dest="ref_text", default=None)
-    p.add_argument("--speed", type=float, default=1.0)
-    p.add_argument("--temperature", type=float, default=0.7)
-    p.add_argument("--output", required=True)
-    args = p.parse_args()
-
-    try:
-        from mlx_audio.tts.generate import generate_audio
-    except Exception as e:
-        emit({"type":"error","message":f"mlx-audio import failed: {e}. Re-run the installer."})
-        traceback.print_exc()
-        sys.exit(1)
-
-    out_dir = os.path.dirname(args.output)
-    os.makedirs(out_dir, exist_ok=True)
-    base = os.path.splitext(os.path.basename(args.output))[0]
-    prefix = base + "__seg"
-
-    emit({"type":"progress","step":0,"total":3,
-          "message":f"Loading {args.repo} (first run downloads weights)..."})
-
-    kwargs = dict(
-        text=args.text, model=args.repo, speed=args.speed, temperature=args.temperature,
-        output_path=out_dir, file_prefix=prefix, audio_format="wav",
-        join_audio=True, save=True, verbose=False,
-    )
-    if args.ref_audio:
-        if not os.path.exists(args.ref_audio):
-            emit({"type":"error","message":f"Reference audio not found: {args.ref_audio}"})
-            sys.exit(1)
-        kwargs["ref_audio"] = args.ref_audio
-        if args.ref_text:
-            kwargs["ref_text"] = args.ref_text
-        emit({"type":"progress","step":1,"total":3,"message":"Cloning reference voice and synthesizing..."})
-    else:
-        emit({"type":"progress","step":1,"total":3,"message":"Synthesizing speech..."})
-
-    try:
-        generate_audio(**kwargs)
-    except Exception as e:
-        emit({"type":"error","message":str(e)})
-        traceback.print_exc()
-        sys.exit(1)
-
-    produced = sorted(glob.glob(os.path.join(out_dir, prefix + "*.wav")))
-    if not produced:
-        emit({"type":"error","message":"Generation finished but produced no audio file."})
-        sys.exit(1)
-    try:
-        os.replace(produced[0], args.output)
-        for extra in produced[1:]:
-            try: os.remove(extra)
-            except OSError: pass
-    except OSError as e:
-        emit({"type":"error","message":f"Could not finalize output: {e}"})
-        sys.exit(1)
-
-    emit({"type":"progress","step":2,"total":3,"message":"Done."})
-    emit({"type":"complete","path":args.output})
-
-if __name__ == "__main__":
-    main()
-"""#
 }

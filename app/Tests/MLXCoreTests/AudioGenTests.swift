@@ -215,34 +215,4 @@ final class AudioGenTests: XCTestCase {
         let blob = original.withUnsafeBufferPointer { Data(buffer: $0) }
         XCTAssertEqual(floatSamplesReplica(from: blob), original)
     }
-
-    // MARK: - Real venv API contract (skipped without a venv)
-
-    /// The embedded TTS script calls `generate_audio(...)` with a specific set
-    /// of keyword args. If the installed mlx-audio renames or drops any of
-    /// them, generation breaks at runtime — so pin the contract against the
-    /// actually-installed package. Mirrors MediaGenTests' real-venv probe.
-    func testInstalledMlxAudioExposesExpectedGenerateAudioParams() throws {
-        let venvPython = NSString(string: "~/.mlx-serve/venv/bin/python").expandingTildeInPath
-        guard FileManager.default.isExecutableFile(atPath: venvPython) else {
-            throw XCTSkip("no venv at ~/.mlx-serve/venv")
-        }
-        let probe = """
-        import inspect, sys
-        from mlx_audio.tts.generate import generate_audio
-        params = set(inspect.signature(generate_audio).parameters)
-        required = {"text","model","ref_audio","ref_text","output_path",
-                    "file_prefix","audio_format","join_audio","save","speed","temperature"}
-        sys.exit(0 if required.issubset(params) else 1)
-        """
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: venvPython)
-        proc.arguments = ["-c", probe]
-        proc.standardOutput = Pipe()
-        proc.standardError = Pipe()
-        try proc.run()
-        proc.waitUntilExit()
-        XCTAssertEqual(proc.terminationStatus, 0,
-            "Installed mlx-audio's generate_audio must expose every kwarg the embedded script passes")
-    }
 }

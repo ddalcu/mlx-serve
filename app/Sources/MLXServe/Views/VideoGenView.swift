@@ -8,7 +8,6 @@ import UniformTypeIdentifiers
 /// Frames dropdown clamped to LTX's `8N+1` ladder and the user's RAM
 /// budget.
 struct VideoGenView: View {
-    @EnvironmentObject var python: PythonManager
     @EnvironmentObject var service: VideoGenService
     @EnvironmentObject var server: ServerManager
 
@@ -31,16 +30,7 @@ struct VideoGenView: View {
     @State private var player: AVPlayer?
 
     var body: some View {
-        Group {
-            switch python.status {
-            case .unknown:
-                ProgressView().frame(maxWidth: .infinity, maxHeight: .infinity)
-            case .missingPython, .needsGit, .needsVenv, .needsPackages, .needsFFmpeg:
-                GenInstallPane(feature: "Video Generation (LTX-Video 2.3)")
-            case .ready:
-                readyView
-            }
-        }
+        readyView
         .frame(minWidth: 880, minHeight: 660)
         .onAppear { applyModelDefaults() }
         .onChange(of: service.phase) { _, phase in
@@ -470,7 +460,7 @@ struct VideoGenView: View {
     private var outputFolderLink: some View {
         Button {
             NSWorkspace.shared.activateFileViewerSelecting(
-                [URL(fileURLWithPath: PythonManager.videosRoot)]
+                [URL(fileURLWithPath: MediaStorage.videosRoot)]
             )
         } label: {
             Label("Open output folder in Finder", systemImage: "folder")
@@ -478,7 +468,7 @@ struct VideoGenView: View {
         }
         .buttonStyle(.borderless)
         .foregroundStyle(.secondary)
-        .help(PythonManager.videosRoot)
+        .help(MediaStorage.videosRoot)
     }
 
     // MARK: - Actions
@@ -574,196 +564,6 @@ private struct AVPlayerViewRepresentable: NSViewRepresentable {
     func updateNSView(_ nsView: AVPlayerView, context: Context) {
         if nsView.player !== player {
             nsView.player = player
-        }
-    }
-}
-
-// MARK: - Shared install pane
-
-/// Shown by both ImageGen and VideoGen when the shared venv / packages are
-/// missing. One-click install button kicks `PythonManager.install()` and
-/// tails the log below.
-struct GenInstallPane: View {
-    let feature: String
-    @EnvironmentObject var python: PythonManager
-
-    var body: some View {
-        VStack(spacing: 16) {
-            Image(systemName: "shippingbox")
-                .font(.system(size: 56))
-                .foregroundStyle(.secondary)
-            Text(feature).font(.title2.weight(.semibold))
-            Text(reasonText)
-                .multilineTextAlignment(.center)
-                .foregroundStyle(.secondary)
-                .frame(maxWidth: 560)
-
-            switch python.status {
-            case .missingPython:
-                DependencyInstructions(
-                    title: "Install Python 3",
-                    brewCommand: "brew install python",
-                    xcodeApplies: true,
-                    xcodeNote: "Apple's Command Line Tools include a usable python3, though the version is older than Homebrew's.",
-                    afterNote: "Then reopen this pane."
-                )
-            case .needsGit:
-                DependencyInstructions(
-                    title: "Install git",
-                    brewCommand: "brew install git",
-                    xcodeApplies: true,
-                    xcodeNote: "Xcode Command Line Tools ship git out of the box and is the lightest install if you don't already use Homebrew.",
-                    afterNote: "Then reopen this pane — pip uses git to fetch the ltx-2-mlx packages."
-                )
-            case .needsFFmpeg:
-                DependencyInstructions(
-                    title: "Install ffmpeg",
-                    brewCommand: "brew install ffmpeg",
-                    xcodeApplies: false,
-                    xcodeNote: nil,
-                    afterNote: "Then reopen this pane — ltx-2-mlx shells out to ffmpeg for audio/video muxing."
-                )
-            default:
-                Button {
-                    Task { await python.install() }
-                } label: {
-                    if python.isInstalling {
-                        ProgressView().controlSize(.small)
-                        Text("Installing...").padding(.leading, 8)
-                    } else {
-                        Label("Install (≈3 GB, ~3 minutes)", systemImage: "arrow.down.circle")
-                    }
-                }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.large)
-                .disabled(python.isInstalling)
-            }
-
-            if let err = python.lastError {
-                Text(err).font(.caption).foregroundStyle(.red).multilineTextAlignment(.center)
-            }
-
-            if !python.installLog.isEmpty {
-                logTail
-            }
-
-            Spacer()
-        }
-        .padding(32)
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-    }
-
-    private var reasonText: String {
-        switch python.status {
-        case .missingPython:
-            return "Python 3 isn't installed on this Mac. Image and video generation need Python to host the mflux / ltx-2-mlx pipelines."
-        case .needsGit:
-            return "git isn't on PATH. The video pipeline (ltx-2-mlx) is fetched from GitHub by pip, which shells out to git during install."
-        case .needsVenv:
-            return "A dedicated Python environment at ~/.mlx-serve/venv needs to be created. Click Install to set it up — no effect on your system Python."
-        case .needsPackages:
-            return "The Python environment exists but is missing required packages. Click Install to finish the setup. ~50 GB of model weights download on first generation."
-        case .needsFFmpeg:
-            return "Python packages are installed, but the system ffmpeg binary is missing. ltx-2-mlx muxes audio into the mp4 via system ffmpeg."
-        default:
-            return ""
-        }
-    }
-
-    /// Single dependency-install card shared by all `needs*` external states.
-    /// Always shows the Homebrew option (we treat it as the recommended
-    /// path). Optionally includes the Xcode Command Line Tools alternative
-    /// for deps that ship with the CLT (python3, git) — not for ffmpeg, which
-    /// CLT doesn't bundle.
-    private struct DependencyInstructions: View {
-        let title: String
-        let brewCommand: String
-        let xcodeApplies: Bool
-        let xcodeNote: String?
-        let afterNote: String
-
-        var body: some View {
-            VStack(alignment: .leading, spacing: 10) {
-                Text(title).font(.callout.weight(.semibold))
-
-                option(
-                    badge: "Homebrew",
-                    badgeColor: .orange,
-                    command: brewCommand,
-                    note: "If you don't have Homebrew, install it from brew.sh first."
-                )
-
-                if xcodeApplies {
-                    option(
-                        badge: "Xcode CLT",
-                        badgeColor: .blue,
-                        command: "xcode-select --install",
-                        note: xcodeNote ?? ""
-                    )
-                }
-
-                Text(afterNote)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .padding(.top, 2)
-            }
-            .frame(maxWidth: 480, alignment: .leading)
-        }
-
-        @ViewBuilder
-        private func option(badge: String, badgeColor: Color, command: String, note: String) -> some View {
-            VStack(alignment: .leading, spacing: 4) {
-                HStack(spacing: 6) {
-                    Text(badge)
-                        .font(.caption2.weight(.semibold))
-                        .foregroundStyle(badgeColor)
-                        .padding(.horizontal, 6).padding(.vertical, 2)
-                        .background(badgeColor.opacity(0.15), in: Capsule())
-                    Spacer()
-                    Button {
-                        let pb = NSPasteboard.general
-                        pb.clearContents()
-                        pb.setString(command, forType: .string)
-                    } label: {
-                        Image(systemName: "doc.on.doc")
-                    }
-                    .buttonStyle(.borderless)
-                    .help("Copy command")
-                }
-                Text(command)
-                    .font(.system(.callout, design: .monospaced))
-                    .textSelection(.enabled)
-                    .padding(.horizontal, 10).padding(.vertical, 4)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(Color.secondary.opacity(0.15), in: RoundedRectangle(cornerRadius: 4))
-                if !note.isEmpty {
-                    Text(note).font(.caption2).foregroundStyle(.secondary)
-                }
-            }
-        }
-    }
-
-    private var logTail: some View {
-        ScrollViewReader { proxy in
-            ScrollView {
-                VStack(alignment: .leading, spacing: 2) {
-                    ForEach(Array(python.installLog.enumerated()), id: \.offset) { idx, line in
-                        Text(line)
-                            .font(.system(.caption, design: .monospaced))
-                            .foregroundStyle(.secondary)
-                            .id(idx)
-                    }
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(8)
-            }
-            .frame(maxWidth: 640, maxHeight: 200)
-            .background(Color.black.opacity(0.15), in: RoundedRectangle(cornerRadius: 6))
-            .onChange(of: python.installLog.count) { _, n in
-                if n > 0 {
-                    withAnimation { proxy.scrollTo(n - 1, anchor: .bottom) }
-                }
-            }
         }
     }
 }
