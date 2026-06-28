@@ -15,6 +15,7 @@ const ltx = @import("ltx_video.zig");
 const tok_mod = @import("tokenizer.zig");
 const log = @import("log.zig");
 const server_mod = @import("server.zig");
+const io_util = @import("io_util.zig");
 
 const Conn = server_mod.Conn;
 
@@ -180,11 +181,13 @@ fn handleOne(io: std.Io, allocator: std.mem.Allocator, ctx: *ServeCtx, conn: *Co
         const neg_ids = try tokenizePadded(allocator, ctx.tok, NEGATIVE_PROMPT);
         defer allocator.free(neg_ids);
 
+        const t_start = io_util.nowMs(io);
         var frames = ltx.generateVideoFrames(io, allocator, .{}, ctx.transformer, ctx.connector, ctx.vae, ctx.gemma_dir, pos_ids, neg_ids, PAD_ID, num_frames, height, width, frame_rate, steps, seed, 3.0, 7.0, 0.7, ctx.s) catch |err| {
             log.err("[ltx] generation failed: {}\n", .{err});
             return sendError(conn, 500, "generation failed");
         };
         defer frames.deinit(allocator);
+        log.info("[ltx] generated in {d}ms\n", .{io_util.nowMs(io) - t_start});
 
         const b64_len = std.base64.standard.Encoder.calcSize(frames.rgb.len);
         const b64 = try allocator.alloc(u8, b64_len);
