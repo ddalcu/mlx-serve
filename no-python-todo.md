@@ -29,6 +29,19 @@ Remaining: the macOS app `VideoGenService.swift` (mirror `ImageGenService`/`Audi
 + AVFoundation mp4 mux from the returned RGB frames. STG/modality guidance, the audio
 branch (audio VAE + vocoder + BWE), and multi-resolution are deliberate slice-1 omissions.
 
+**Gotchas worth knowing (cost a debugging cycle):**
+- **Prompt tokenization MUST prepend Gemma `<bos>` (=2).** mlx-serve's gemma tokenizer
+  doesn't; without it the conditioning is corrupt and you get a coherent but
+  COMPLETELY off-prompt video (a building instead of a fox). The correlation tests
+  miss it because they feed the reference's pre-tokenized ids. Fixed in
+  `ltx_server.zig padWithBos`; guard = the `padWithBos` hermetic tests + LOOK at the
+  image. Always validate generation by EYE on the final frame, not just corr-vs-reference.
+- **Steps: the dev model needs ~20-30 Euler steps** for a clean image (4 = grainy but
+  recognizable; 30 = crisp). Endpoint default is now 30. cfg-only (no STG/modality) is
+  fine for coherence — quality, not correctness, comes from STG/modality.
+- Verified on-prompt output: 30-step "a red fox running through a snowy forest" →
+  photorealistic fox in snow with motion across frames (frames in /tmp/ltx-frames).
+
 ---
 
 ## DONE — Audio (don't touch unless extending)
