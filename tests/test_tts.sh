@@ -16,3 +16,24 @@ code=$(curl -s -X POST "http://127.0.0.1:$PORT/v1/audio/speech" -H 'Content-Type
 [ "$(head -c 4 /tmp/test_tts.wav)" = "RIFF" ] || { echo "FAIL: not a WAV"; exit 1; }
 sz=$(wc -c < /tmp/test_tts.wav); [ "$sz" -gt 40000 ] || { echo "FAIL: WAV too small ($sz)"; exit 1; }
 echo "PASS: /v1/audio/speech -> $sz byte WAV"
+
+# SSE streaming: indeterminate per-frame progress events, then a complete event
+# carrying the WAV (audio length is model-determined, so total=0).
+SSE=/tmp/test_tts_sse.txt
+curl -sN -X POST "http://127.0.0.1:$PORT/v1/audio/speech" -H 'Content-Type: application/json' \
+  -d '{"model":"tts","input":"This is a longer sentence so the streaming progress updates over several frames.","stream":true}' >"$SSE"
+python3 - "$SSE" <<'PY'
+import sys, json, base64
+prog = 0; complete = None
+for line in open(sys.argv[1]):
+    line = line.strip()
+    if not line.startswith("data: "): continue
+    ev = json.loads(line[6:])
+    if ev["type"] == "progress": prog += 1; assert {"stage","step","total"} <= set(ev)
+    elif ev["type"] == "complete": complete = ev
+assert prog >= 1, f"expected progress events, got {prog}"
+assert complete is not None and complete.get("format") == "wav", "no wav complete event"
+wav = base64.b64decode(complete["data"])
+assert wav[:4] == b"RIFF", "complete WAV bad"
+print(f"PASS: SSE stream -> {prog} progress events + complete WAV ({len(wav)} bytes)")
+PY

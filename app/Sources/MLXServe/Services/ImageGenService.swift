@@ -57,14 +57,30 @@ final class ImageGenService: ObservableObject {
 
         task = Task {
             do {
-                _ = try await NativeGenServer.shared.ensure(modelDir: modelDir)
+                let port = try await NativeGenServer.shared.ensure(modelDir: modelDir)
                 if Task.isCancelled { phase = .idle; return }
-                phase = .running(step: 1, total: steps, message: "Generating…")
-                let data = try await NativeGenServer.shared.post(
+                // SSE: per-step `progress` events drive a determinate bar, then a
+                // `complete` event carries the PNG.
+                var png: Data? = nil
+                for try await ev in NativeGenServer.shared.postStream(
                     path: "/v1/images/generations",
-                    json: ["model": repo, "prompt": prompt, "size": size]
-                )
-                guard let png = Self.decodePngB64(data) else {
+                    json: ["model": repo, "prompt": prompt, "size": size], port: port) {
+                    switch ev["type"] as? String {
+                    case "progress":
+                        let step = ev["step"] as? Int ?? 0
+                        let total = ev["total"] as? Int ?? steps
+                        let stage = ev["stage"] as? String ?? "Generating"
+                        phase = .running(step: step, total: max(total, 1), message: "\(stage)…")
+                    case "complete":
+                        png = Self.decodePngB64(ev)
+                    case "error":
+                        phase = .failed(ev["message"] as? String ?? "Generation failed.")
+                        return
+                    default:
+                        break
+                    }
+                }
+                guard let png else {
                     phase = .failed("Server returned no image data.")
                     return
                 }
@@ -82,8 +98,13 @@ final class ImageGenService: ObservableObject {
     /// Extract the base64 PNG from an OpenAI `{data:[{b64_json}]}` response body.
     /// Pure + static so it's unit-testable without a running server.
     static func decodePngB64(_ body: Data) -> Data? {
-        guard let obj = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
-              let arr = obj["data"] as? [[String: Any]],
+        guard let obj = try? JSONSerialization.jsonObject(with: body) as? [String: Any] else { return nil }
+        return decodePngB64(obj)
+    }
+
+    /// Same, from an already-parsed object (the SSE `complete` event).
+    static func decodePngB64(_ obj: [String: Any]) -> Data? {
+        guard let arr = obj["data"] as? [[String: Any]],
               let b64 = arr.first?["b64_json"] as? String,
               let png = Data(base64Encoded: b64)
         else { return nil }

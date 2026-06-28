@@ -25,6 +25,7 @@ const log = @import("log.zig");
 const model_mod = @import("model.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const wav_mod = @import("wav.zig");
+const sse = @import("gen_sse.zig");
 
 const Weights = model_mod.Weights;
 
@@ -619,7 +620,7 @@ pub const TtsModel = struct {
 
     /// Generate the `[T, 16]` codebook matrix from text token ids (greedy).
     /// Caller owns the returned slice.
-    pub fn generateCodes(self: *TtsModel, input_ids: []const i32, max_frames: u32) ![][16]u32 {
+    pub fn generateCodes(self: *TtsModel, input_ids: []const i32, max_frames: u32, progress: ?sse.Progress) ![][16]u32 {
         const s = self.s;
         const cfg = self.cfg;
         const H = cfg.t_hidden;
@@ -709,6 +710,9 @@ pub const TtsModel = struct {
         var trailing_idx: u32 = 0;
         var frame: u32 = 0;
         while (frame < max_frames) : (frame += 1) {
+            // Audio length is model-determined (until EOS), so total is unknown:
+            // emit step=frame with total=0 (indeterminate) every few frames.
+            if (progress) |p| if (frame % 8 == 0) p.emit("Generating audio", frame, 0);
             const hidden = try qwenStackCached(input, self.talker_layers, self.talker_norm, t_dims, &talker_cache, s);
             _ = mlx.mlx_array_free(input);
             input = .{ .ctx = null }; // mark freed; reassigned below on the non-break path
@@ -1105,18 +1109,19 @@ pub const Synthesizer = struct {
     }
 
     /// text → waveform samples (f32, owned). `max_frames` caps generation.
-    pub fn synthesize(self: *Synthesizer, text: []const u8, max_frames: u32) ![]f32 {
+    pub fn synthesize(self: *Synthesizer, text: []const u8, max_frames: u32, progress: ?sse.Progress) ![]f32 {
         const ids = try self.buildInputIds(text);
         defer self.allocator.free(ids);
-        const codes = try self.model.generateCodes(ids, max_frames);
+        const codes = try self.model.generateCodes(ids, max_frames, progress);
         defer self.allocator.free(codes);
         if (codes.len == 0) return self.allocator.alloc(f32, 0);
+        if (progress) |p| p.emit("Decoding audio", 0, 0);
         return self.codec.decode(codes);
     }
 
     /// text → 16-bit PCM mono WAV bytes (owned).
-    pub fn synthesizeWav(self: *Synthesizer, text: []const u8, max_frames: u32) ![]u8 {
-        const samples = try self.synthesize(text, max_frames);
+    pub fn synthesizeWav(self: *Synthesizer, text: []const u8, max_frames: u32, progress: ?sse.Progress) ![]u8 {
+        const samples = try self.synthesize(text, max_frames, progress);
         defer self.allocator.free(samples);
         return wav_mod.encodePcm16Mono(self.allocator, samples, self.model.cfg.sample_rate);
     }
@@ -1872,7 +1877,7 @@ test "talker+predictor reproduce greedy oracle codes" {
     m.cfg.rep_penalty = 1.0; // match the pure-greedy oracle (rep_pen=1.0)
     m.cfg.temperature = 0.0; // greedy (deterministic) for equivalence
 
-    const codes = try m.generateCodes(ids, @intCast(check_frames));
+    const codes = try m.generateCodes(ids, @intCast(check_frames), null);
     defer allocator.free(codes);
 
     try std.testing.expect(codes.len >= check_frames);
@@ -1982,7 +1987,7 @@ test "end-to-end native TTS produces non-silent audio" {
     var dec = try loadCodecDecoder(io, allocator, s, model_dir);
     defer dec.deinit();
 
-    const codes = try m.generateCodes(ids, 256);
+    const codes = try m.generateCodes(ids, 256, null);
     defer allocator.free(codes);
     try std.testing.expect(codes.len > 8);
 
@@ -2036,7 +2041,7 @@ test "Synthesizer: native text to WAV" {
     std.debug.print("[tts-synth] built {d} ids (expected {d})\n", .{ ids.len, expected.len });
     try std.testing.expectEqualSlices(i32, &expected, ids);
 
-    const wav = try synth.synthesizeWav(text, 256);
+    const wav = try synth.synthesizeWav(text, 256, null);
     defer allocator.free(wav);
     try std.testing.expect(wav.len > 44 + 1000); // real audio, not just a header
     try std.testing.expectEqualSlices(u8, "RIFF", wav[0..4]);

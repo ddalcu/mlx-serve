@@ -13,6 +13,7 @@ const png = @import("png.zig");
 const tok_mod = @import("tokenizer.zig");
 const log = @import("log.zig");
 const server_mod = @import("server.zig");
+const sse = @import("gen_sse.zig");
 
 const Conn = server_mod.Conn;
 
@@ -156,14 +157,23 @@ fn handleOne(io: std.Io, allocator: std.mem.Allocator, ctx: *ServeCtx, conn: *Co
         const seed: u64 = extractJsonInt(body, "seed") orelse 42;
         const steps: u32 = @intCast(extractJsonInt(body, "steps") orelse 4);
 
-        log.info("[flux] generating {d}x{d} steps={d}: {d} chars\n", .{ width, height, steps, prompt.len });
-        const png_bytes = generatePng(io, allocator, ctx, prompt, width, height, seed, steps) catch |err| {
+        const want_stream = sse.bodyWantsTrue(body, "stream");
+        log.info("[flux] generating {d}x{d} steps={d} stream={}: {d} chars\n", .{ width, height, steps, want_stream, prompt.len });
+        var sctx = sse.StreamCtx{ .conn = conn };
+        const prog: ?sse.Progress = if (want_stream) sctx.progress() else null;
+        if (want_stream) try conn.writeAll(sse.headers);
+
+        const png_bytes = generatePng(io, allocator, ctx, prompt, width, height, seed, steps, prog) catch |err| {
             log.err("[flux] generation failed: {}\n", .{err});
+            if (want_stream) {
+                sse.sendError(conn, "generation failed");
+                return;
+            }
             return sendError(conn, 500, "generation failed");
         };
         defer allocator.free(png_bytes);
 
-        // {"data":[{"b64_json":"..."}]}
+        // {"data":[{"b64_json":"..."}]} (SSE complete wraps the same payload).
         const b64_len = std.base64.standard.Encoder.calcSize(png_bytes.len);
         const b64 = try allocator.alloc(u8, b64_len);
         defer allocator.free(b64);
@@ -171,17 +181,21 @@ fn handleOne(io: std.Io, allocator: std.mem.Allocator, ctx: *ServeCtx, conn: *Co
 
         var out: std.ArrayList(u8) = .empty;
         defer out.deinit(allocator);
-        try out.appendSlice(allocator, "{\"created\":0,\"data\":[{\"b64_json\":\"");
+        try out.appendSlice(allocator, if (want_stream) "data: {\"type\":\"complete\",\"data\":[{\"b64_json\":\"" else "{\"created\":0,\"data\":[{\"b64_json\":\"");
         try out.appendSlice(allocator, b64);
-        try out.appendSlice(allocator, "\"}]}");
+        try out.appendSlice(allocator, if (want_stream) "\"}]}\n\n" else "\"}]}");
         log.info("[flux] -> {d} PNG bytes ({d} b64)\n", .{ png_bytes.len, b64.len });
+        if (want_stream) {
+            try conn.writeAll(out.items);
+            return;
+        }
         return sendBytesJson(conn, allocator, out.items);
     }
     return sendError(conn, 404, "not found");
 }
 
 /// Tokenize the prompt (Qwen3 chat template) and run the FLUX pipeline → PNG bytes.
-fn generatePng(io: std.Io, allocator: std.mem.Allocator, ctx: *ServeCtx, prompt: []const u8, width: u32, height: u32, seed: u64, steps: u32) ![]u8 {
+fn generatePng(io: std.Io, allocator: std.mem.Allocator, ctx: *ServeCtx, prompt: []const u8, width: u32, height: u32, seed: u64, steps: u32, progress: ?sse.Progress) ![]u8 {
     _ = io;
     // mflux Qwen3 chat template (enable_thinking=False adds an empty <think> block).
     const templated = try std.fmt.allocPrint(allocator, "<|im_start|>user\n{s}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n", .{prompt});
@@ -206,7 +220,7 @@ fn generatePng(io: std.Io, allocator: std.mem.Allocator, ctx: *ServeCtx, prompt:
         }
     }
 
-    const img = try flux.generate(ctx.te, ctx.dit, ctx.vae, ids, mask, seed, steps, height, width);
+    const img = try flux.generate(ctx.te, ctx.dit, ctx.vae, ids, mask, seed, steps, height, width, progress);
     defer _ = mlx.mlx_array_free(img);
 
     // Extract RGB8 from [1,3,H,W] in [0,1] (mirror writePpm).

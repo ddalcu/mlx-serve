@@ -16,6 +16,7 @@ const tok_mod = @import("tokenizer.zig");
 const log = @import("log.zig");
 const server_mod = @import("server.zig");
 const io_util = @import("io_util.zig");
+const sse = @import("gen_sse.zig");
 
 const Conn = server_mod.Conn;
 
@@ -176,7 +177,7 @@ fn handleOne(io: std.Io, allocator: std.mem.Allocator, ctx: *ServeCtx, conn: *Co
         const steps: u32 = @intCast(extractJsonInt(body, "steps") orelse 30);
         const frame_rate: f32 = 24.0;
 
-        const want_stream = bodyWantsTrue(body, "stream");
+        const want_stream = sse.bodyWantsTrue(body, "stream");
         log.info("[ltx] generating {d}f {d}x{d} steps={d} stream={}: {d} chars\n", .{ num_frames, height, width, steps, want_stream, prompt.len });
 
         const pos_ids = try tokenizePadded(allocator, ctx.tok, prompt);
@@ -186,11 +187,9 @@ fn handleOne(io: std.Io, allocator: std.mem.Allocator, ctx: *ServeCtx, conn: *Co
 
         // Stream mode: SSE — push `progress` events per denoise step, then a
         // `complete` event with the frames. The view animates a determinate bar.
-        var sctx = StreamCtx{ .conn = conn };
-        const prog: ?ltx.Progress = if (want_stream) .{ .ctx = &sctx, .cb = StreamCtx.cb } else null;
-        if (want_stream) {
-            try conn.writeAll("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n");
-        }
+        var sctx = sse.StreamCtx{ .conn = conn };
+        const prog: ?ltx.Progress = if (want_stream) sctx.progress() else null;
+        if (want_stream) try conn.writeAll(sse.headers);
 
         const t_start = io_util.nowMs(io);
         var frames = ltx.generateVideoFrames(io, allocator, .{}, ctx.transformer, ctx.connector, ctx.vae, ctx.gemma_dir, pos_ids, neg_ids, PAD_ID, num_frames, height, width, frame_rate, steps, seed, 3.0, 7.0, 0.7, prog, ctx.s) catch |err| {
@@ -225,27 +224,6 @@ fn handleOne(io: std.Io, allocator: std.mem.Allocator, ctx: *ServeCtx, conn: *Co
         return sendBytesJson(conn, allocator, out.items);
     }
     return sendError(conn, 404, "not found");
-}
-
-/// SSE progress sink: writes one `data: {...progress...}` event per call.
-const StreamCtx = struct {
-    conn: *Conn,
-    fn cb(ptr: *anyopaque, stage: []const u8, step: u32, total: u32) void {
-        const self: *StreamCtx = @ptrCast(@alignCast(ptr));
-        var buf: [256]u8 = undefined;
-        const ev = std.fmt.bufPrint(&buf, "data: {{\"type\":\"progress\",\"stage\":\"{s}\",\"step\":{d},\"total\":{d}}}\n\n", .{ stage, step, total }) catch return;
-        self.conn.writeAll(ev) catch {};
-    }
-};
-
-/// True if the JSON body has `"key": true`.
-fn bodyWantsTrue(body: []const u8, key: []const u8) bool {
-    var pat_buf: [64]u8 = undefined;
-    const pat = std.fmt.bufPrint(&pat_buf, "\"{s}\"", .{key}) catch return false;
-    const ki = std.mem.indexOf(u8, body, pat) orelse return false;
-    var i = ki + pat.len;
-    while (i < body.len and (body[i] == ' ' or body[i] == ':' or body[i] == '\t')) i += 1;
-    return std.mem.startsWith(u8, body[i..], "true");
 }
 
 const GEMMA_BOS: i32 = 2; // <bos> — the reference LTX gemma tokenizer always prepends it

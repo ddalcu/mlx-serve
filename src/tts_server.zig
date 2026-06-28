@@ -14,6 +14,7 @@ const mlx = @import("mlx.zig");
 const tts = @import("tts.zig");
 const log = @import("log.zig");
 const server_mod = @import("server.zig");
+const sse = @import("gen_sse.zig");
 
 const Conn = server_mod.Conn;
 
@@ -127,13 +128,36 @@ fn handleOne(allocator: std.mem.Allocator, synth: *tts.Synthesizer, conn: *Conn,
         defer allocator.free(text);
         if (text.len == 0) return sendError(conn, 400, "empty 'input'");
 
-        log.info("[tts] synthesizing {d} chars\n", .{text.len});
-        const wav = synth.synthesizeWav(text, 2048) catch |err| {
+        const want_stream = sse.bodyWantsTrue(body, "stream");
+        log.info("[tts] synthesizing {d} chars stream={}\n", .{ text.len, want_stream });
+        var sctx = sse.StreamCtx{ .conn = conn };
+        const prog: ?sse.Progress = if (want_stream) sctx.progress() else null;
+        if (want_stream) try conn.writeAll(sse.headers);
+
+        const wav = synth.synthesizeWav(text, 2048, prog) catch |err| {
             log.err("[tts] synthesis failed: {}\n", .{err});
+            if (want_stream) {
+                sse.sendError(conn, "synthesis failed");
+                return;
+            }
             return sendError(conn, 500, "synthesis failed");
         };
         defer allocator.free(wav);
         log.info("[tts] -> {d} WAV bytes\n", .{wav.len});
+        if (want_stream) {
+            // Complete event carries the WAV as base64.
+            const b64_len = std.base64.standard.Encoder.calcSize(wav.len);
+            const b64 = try allocator.alloc(u8, b64_len);
+            defer allocator.free(b64);
+            _ = std.base64.standard.Encoder.encode(b64, wav);
+            var out: std.ArrayList(u8) = .empty;
+            defer out.deinit(allocator);
+            try out.appendSlice(allocator, "data: {\"type\":\"complete\",\"format\":\"wav\",\"data\":\"");
+            try out.appendSlice(allocator, b64);
+            try out.appendSlice(allocator, "\"}\n\n");
+            try conn.writeAll(out.items);
+            return;
+        }
         return sendBytes(conn, allocator, "audio/wav", wav);
     }
     return sendError(conn, 404, "not found");

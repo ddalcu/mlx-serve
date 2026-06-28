@@ -33,3 +33,23 @@ w,h=struct.unpack(">II", b[16:24])
 print(f"PASS: /v1/images/generations -> {len(b)} byte PNG {w}x{h}")
 assert w==1024 and h==1024, f"bad dims {w}x{h}"
 PY
+
+# SSE streaming: per-step progress events, then a complete event with the PNG.
+SSE=/tmp/test_image_sse.txt
+curl -sN -X POST "http://127.0.0.1:$PORT/v1/images/generations" -H 'Content-Type: application/json' \
+  -d '{"prompt":"a red apple","size":"1024x1024","steps":4,"stream":true}' >"$SSE"
+python3 - "$SSE" <<'PY'
+import sys, json, base64
+prog = 0; complete = None
+for line in open(sys.argv[1]):
+    line = line.strip()
+    if not line.startswith("data: "): continue
+    ev = json.loads(line[6:])
+    if ev["type"] == "progress": prog += 1; assert {"stage","step","total"} <= set(ev)
+    elif ev["type"] == "complete": complete = ev
+assert prog >= 4, f"expected several progress events, got {prog}"
+assert complete is not None, "no complete event"
+png = base64.b64decode(complete["data"][0]["b64_json"])
+assert png[:8] == bytes([0x89,0x50,0x4E,0x47,0x0D,0x0A,0x1A,0x0A]), "complete PNG bad"
+print(f"PASS: SSE stream -> {prog} progress events + complete PNG ({len(png)} bytes)")
+PY

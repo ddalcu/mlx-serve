@@ -224,8 +224,14 @@ struct AudioGenView: View {
                                            description: Text("Enter text, add a reference voice, and press Generate."))
                 case .running(let step, let total, let message):
                     VStack(spacing: 12) {
-                        ProgressView(value: Double(step), total: max(1, Double(total)))
-                            .progressViewStyle(.linear).frame(width: 240)
+                        // Audio length is unknown until the model stops (total==0)
+                        // → indeterminate bar; encode/decode stages are determinate.
+                        if total == 0 {
+                            ProgressView().frame(width: 240)
+                        } else {
+                            ProgressView(value: Double(step), total: max(1, Double(total)))
+                                .progressViewStyle(.linear).frame(width: 240)
+                        }
                         Text(message).font(.footnote).foregroundStyle(.secondary)
                     }
                 case .completed(let path):

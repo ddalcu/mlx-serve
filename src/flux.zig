@@ -10,6 +10,7 @@ const std = @import("std");
 const mlx = @import("mlx.zig");
 const log = @import("log.zig");
 const model_mod = @import("model.zig");
+const sse = @import("gen_sse.zig");
 
 const Weights = model_mod.Weights;
 const S = mlx.mlx_stream;
@@ -1255,7 +1256,7 @@ fn buildTextIds(allocator: std.mem.Allocator, seq: u32) ![]i32 {
 }
 
 /// Generate an image. Returns [1,3,H,W] f32 in [0,1] (owned mlx array).
-pub fn generate(te: *TextEncoder, dit: *Dit, vae: *Vae, ids: []const i32, mask: []const i32, seed: u64, steps: u32, height: u32, width: u32) !mlx.mlx_array {
+pub fn generate(te: *TextEncoder, dit: *Dit, vae: *Vae, ids: []const i32, mask: []const i32, seed: u64, steps: u32, height: u32, width: u32, progress: ?sse.Progress) !mlx.mlx_array {
     const s = dit.s;
     const a = dit.allocator;
     const lh = height / 16;
@@ -1290,7 +1291,9 @@ pub fn generate(te: *TextEncoder, dit: *Dit, vae: *Vae, ids: []const i32, mask: 
         const nl = try addA(latents, step, s);
         _ = mlx.mlx_array_free(latents); latents = nl;
         _ = mlx.mlx_array_eval(latents);
+        if (progress) |p| p.emit("Generating", @intCast(t + 1), steps);
     }
+    if (progress) |p| p.emit("Decoding image", steps, steps);
 
     // 4. unpack → [1,128,lh,lw], decode
     const lr = try reshape(latents, &[_]c_int{ 1, @intCast(lh), @intCast(lw), 128 }, s); defer _ = mlx.mlx_array_free(lr);
@@ -1358,7 +1361,7 @@ test "flux end-to-end pipeline matches reference image" {
     var dit = try loadDit(io, a, s, model_dir); defer dit.deinit();
     var vae = try loadVae(io, a, s, model_dir); defer vae.deinit();
 
-    const img = try generate(&te, &dit, &vae, ids, mask, 42, 4, 1024, 1024); // [0,1]
+    const img = try generate(&te, &dit, &vae, ids, mask, 42, 4, 1024, 1024, null); // [0,1]
     defer _ = mlx.mlx_array_free(img);
     _ = mlx.mlx_array_eval(img);
     const n: usize = @intCast(mlx.mlx_array_size(img));

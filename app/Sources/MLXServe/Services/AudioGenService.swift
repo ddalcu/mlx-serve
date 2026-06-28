@@ -57,18 +57,39 @@ final class AudioGenService: ObservableObject {
 
         task = Task {
             do {
-                _ = try await NativeGenServer.shared.ensure(modelDir: modelDir)
+                let port = try await NativeGenServer.shared.ensure(modelDir: modelDir)
                 if Task.isCancelled { phase = .idle; return }
-                phase = .running(step: 1, total: 3, message: "Synthesizing…")
-                let data = try await NativeGenServer.shared.post(
+                // SSE: audio length is model-determined, so `progress` events carry
+                // a growing frame count (total=0 → indeterminate bar); the
+                // `complete` event carries the WAV as base64.
+                var wav: Data? = nil
+                for try await ev in NativeGenServer.shared.postStream(
                     path: "/v1/audio/speech",
-                    json: ["model": repo, "input": text]
-                )
-                guard data.count > 44 else {
+                    json: ["model": repo, "input": text], port: port) {
+                    switch ev["type"] as? String {
+                    case "progress":
+                        let step = ev["step"] as? Int ?? 0
+                        let total = ev["total"] as? Int ?? 0
+                        let stage = ev["stage"] as? String ?? "Generating audio"
+                        // ~0.08s of audio per talker frame (1920 samples @ 24 kHz).
+                        let secs = Double(step) * 1920.0 / 24000.0
+                        let msg = total == 0 && step > 0
+                            ? String(format: "%@ — ~%.1fs", stage, secs) : "\(stage)…"
+                        phase = .running(step: step, total: total, message: msg)
+                    case "complete":
+                        if let b64 = ev["data"] as? String { wav = Data(base64Encoded: b64) }
+                    case "error":
+                        phase = .failed(ev["message"] as? String ?? "Synthesis failed.")
+                        return
+                    default:
+                        break
+                    }
+                }
+                guard let wav, wav.count > 44 else {
                     phase = .failed("Server returned an empty audio response.")
                     return
                 }
-                try data.write(to: URL(fileURLWithPath: outputPath))
+                try wav.write(to: URL(fileURLWithPath: outputPath))
                 phase = .completed(path: outputPath)
                 insertRecent(outputPath)
             } catch is CancellationError {

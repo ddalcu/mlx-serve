@@ -2130,17 +2130,8 @@ fn ditX0(comp: *const Component, alloc: std.mem.Allocator, cfg: LtxConfig, vx: m
     return .{ .v = x0v, .a = x0a };
 }
 
-/// Optional progress sink for long generations. `emit(stage, step, total)` is
-/// called from inside the denoise loop (and the encode/decode stages) so a
-/// streaming HTTP handler can push SSE events. Erased context + fn pointer so
-/// ltx_video.zig stays free of any HTTP/server dependency.
-pub const Progress = struct {
-    ctx: *anyopaque,
-    cb: *const fn (ctx: *anyopaque, stage: []const u8, step: u32, total: u32) void,
-    pub fn emit(self: Progress, stage: []const u8, step: u32, total: u32) void {
-        self.cb(self.ctx, stage, step, total);
-    }
-};
+/// Optional progress sink for long generations (shared with flux/tts servers).
+pub const Progress = @import("gen_sse.zig").Progress;
 
 /// CFG-only guided Euler denoise loop. `noise_v`/`noise_a` are the bf16 initial
 /// latents; `sigmas` includes the terminal 0.0. Returns the final (bf16) latents.
