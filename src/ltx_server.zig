@@ -171,7 +171,9 @@ fn handleOne(io: std.Io, allocator: std.mem.Allocator, ctx: *ServeCtx, conn: *Co
         const height: u32 = @intCast(extractJsonInt(body, "height") orelse 256);
         const width: u32 = @intCast(extractJsonInt(body, "width") orelse 384);
         const seed: u64 = extractJsonInt(body, "seed") orelse 42;
-        const steps: u32 = @intCast(extractJsonInt(body, "steps") orelse 4);
+        // Dev model needs ~20-30 Euler steps for a clean image (4 is grainy);
+        // matches the reference one-stage default. Lower it for fast iteration.
+        const steps: u32 = @intCast(extractJsonInt(body, "steps") orelse 30);
         const frame_rate: f32 = 24.0;
 
         log.info("[ltx] generating {d}f {d}x{d} steps={d}: {d} chars\n", .{ num_frames, height, width, steps, prompt.len });
@@ -207,16 +209,37 @@ fn handleOne(io: std.Io, allocator: std.mem.Allocator, ctx: *ServeCtx, conn: *Co
     return sendError(conn, 404, "not found");
 }
 
-/// Tokenize (BOS + raw prompt) and LEFT-pad/truncate to PAD_LEN with PAD_ID.
+const GEMMA_BOS: i32 = 2; // <bos> — the reference LTX gemma tokenizer always prepends it
+
+/// Tokenize the prompt the way the reference does: `[<bos>] + encode(text)`, then
+/// LEFT-pad/truncate to PAD_LEN with PAD_ID. mlx-serve's gemma tokenizer does NOT
+/// add <bos>, and Gemma is trained with it always present — omitting it corrupts
+/// every hidden state → coherent but off-prompt video, so we prepend it here.
 fn tokenizePadded(allocator: std.mem.Allocator, tokenizer: *tok_mod.Tokenizer, text: []const u8) ![]i32 {
-    const enc = try tokenizer.encode(allocator, text); // []u32, prepends <bos>
+    const enc = try tokenizer.encode(allocator, text); // []u32, NO <bos>
     defer allocator.free(enc);
-    const ids = try allocator.alloc(i32, PAD_LEN);
-    const real = @min(enc.len, PAD_LEN);
-    const pad = PAD_LEN - real;
-    for (0..pad) |i| ids[i] = PAD_ID;
-    // keep the LAST `real` tokens (left-pad = truncate from the left)
-    for (0..real) |i| ids[pad + i] = @intCast(enc[enc.len - real + i]);
+    return padWithBos(allocator, enc, GEMMA_BOS, PAD_LEN, PAD_ID);
+}
+
+/// Build the left-padded id buffer from BPE tokens, ensuring `[<bos>] + enc` is
+/// the conceptual sequence (drops <bos> only if the prompt overflows `pad_len`,
+/// matching the reference left-truncation). Pure so the BOS contract is testable
+/// without a live tokenizer. Returns a `pad_len`-long buffer (caller frees).
+fn padWithBos(allocator: std.mem.Allocator, enc: []const u32, bos: i32, pad_len: usize, pad_id: i32) ![]i32 {
+    const has_bos = enc.len > 0 and enc[0] == @as(u32, @intCast(bos));
+    const total = if (has_bos) enc.len else enc.len + 1;
+    const ids = try allocator.alloc(i32, pad_len);
+    const real = @min(total, pad_len);
+    const pad = pad_len - real;
+    for (0..pad) |i| ids[i] = pad_id;
+    for (0..real) |i| {
+        const idx = total - real + i; // index into the conceptual [bos, enc...] list
+        if (has_bos) {
+            ids[pad + i] = @intCast(enc[idx]);
+        } else {
+            ids[pad + i] = if (idx == 0) bos else @intCast(enc[idx - 1]);
+        }
+    }
     return ids;
 }
 
@@ -346,7 +369,29 @@ fn basename(path: []const u8) []const u8 {
     return p;
 }
 
-test "ltx tokenizePadded left-pads and truncates" {
-    // pure-helper smoke without a real tokenizer is not possible (needs encode);
-    // covered by the live test_video_gen.sh integration test instead.
+test "ltx padWithBos prepends gemma <bos> (off-prompt regression)" {
+    const a = std.testing.allocator;
+    // mlx-serve's gemma tokenizer omits <bos>; the reference always has it.
+    // Dropping it corrupts every hidden state → coherent but off-prompt video.
+    const enc = [_]u32{ 236746, 2604, 37423 };
+    const ids = try padWithBos(a, &enc, 2, 8, 0);
+    defer a.free(ids);
+    // left-padded: [0,0,0,0, <bos>=2, 236746, 2604, 37423]
+    try std.testing.expectEqualSlices(i32, &[_]i32{ 0, 0, 0, 0, 2, 236746, 2604, 37423 }, ids);
+}
+
+test "ltx padWithBos does not double an existing <bos>" {
+    const a = std.testing.allocator;
+    const enc = [_]u32{ 2, 236746, 2604 };
+    const ids = try padWithBos(a, &enc, 2, 6, 0);
+    defer a.free(ids);
+    try std.testing.expectEqualSlices(i32, &[_]i32{ 0, 0, 0, 2, 236746, 2604 }, ids);
+}
+
+test "ltx padWithBos left-truncates an overflowing prompt (bos may drop)" {
+    const a = std.testing.allocator;
+    const enc = [_]u32{ 10, 11, 12, 13 }; // [bos,10,11,12,13] = 5 tokens into pad_len 3
+    const ids = try padWithBos(a, &enc, 2, 3, 0);
+    defer a.free(ids);
+    try std.testing.expectEqualSlices(i32, &[_]i32{ 11, 12, 13 }, ids); // keeps the last 3
 }

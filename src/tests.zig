@@ -40,4 +40,5 @@ test {
     _ = @import("tts_server.zig");
     _ = @import("png.zig");
     _ = @import("flux_server.zig");
+    _ = @import("ltx_server.zig");
 }
