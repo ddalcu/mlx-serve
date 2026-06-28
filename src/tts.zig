@@ -183,6 +183,12 @@ inline fn mulA(a: mlx.mlx_array, b: mlx.mlx_array, s: S) !mlx.mlx_array {
     return out;
 }
 
+inline fn subA(a: mlx.mlx_array, b: mlx.mlx_array, s: S) !mlx.mlx_array {
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_subtract(&out, a, b, s));
+    return out;
+}
+
 /// silu(x) = x * sigmoid(x). mlx-c has no silu; compose it.
 inline fn silu(x: mlx.mlx_array, s: S) !mlx.mlx_array {
     var sig = mlx.mlx_array_new();
@@ -230,15 +236,24 @@ fn sliceSeq(x: mlx.mlx_array, start: c_int, stop: c_int, hidden: c_int, s: S) !m
     return out;
 }
 
-/// Embedding lookup: table [vocab, H], ids (int32 slice) → [1, N, H].
+/// Embedding lookup: table [vocab, H], ids (int32 slice) → [1, N, H]. The
+/// output width is the table's NATIVE width, read from its shape — NOT the
+/// `hidden` argument. The gather (`take_axis`) is always native-width, so a
+/// caller passing a mismatched `hidden` (e.g. the talker `t_hidden`=1024 when
+/// the embedding table is 2048-wide, as on the Qwen3-TTS 0.6B-Base checkpoint
+/// whose `text_projection` then maps 2048→1024) used to crash the reshape.
+/// `hidden` is now advisory only.
 fn embed(table: mlx.mlx_array, ids: []const i32, hidden: u32, s: S) !mlx.mlx_array {
+    _ = hidden;
     const id_shape = [_]c_int{@intCast(ids.len)};
     const id_arr = mlx.mlx_array_new_data(ids.ptr, &id_shape, 1, .int32);
     defer _ = mlx.mlx_array_free(id_arr);
     var taken = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(taken);
     try mlx.check(mlx.mlx_take_axis(&taken, table, id_arr, 0, s));
-    const out_shape = [_]c_int{ 1, @intCast(ids.len), @intCast(hidden) };
+    const tsh = mlx.getShape(table);
+    const H: c_int = if (tsh.len > 0) tsh[tsh.len - 1] else 0;
+    const out_shape = [_]c_int{ 1, @intCast(ids.len), H };
     return reshape(taken, &out_shape, s);
 }
 
@@ -577,8 +592,13 @@ pub const TtsModel = struct {
     cp_small_to_mtp_t: ?mlx.mlx_array, // [t_hidden, cp_hidden] when present
     cp_small_to_mtp_b: ?mlx.mlx_array,
 
+    // ECAPA-TDNN speaker encoder (zero-shot voice cloning). Present on the
+    // `-Base` checkpoints (which ship `speaker_encoder.*`); null otherwise.
+    speaker: ?SpeakerEncoder = null,
+
     pub fn deinit(self: *TtsModel) void {
         const a = self.allocator;
+        if (self.speaker) |*sp| sp.deinit();
         _ = mlx.mlx_array_free(self.text_embedding);
         _ = mlx.mlx_array_free(self.codec_embedding);
         _ = mlx.mlx_array_free(self.text_proj_fc1_t);
@@ -619,8 +639,11 @@ pub const TtsModel = struct {
     }
 
     /// Generate the `[T, 16]` codebook matrix from text token ids (greedy).
-    /// Caller owns the returned slice.
-    pub fn generateCodes(self: *TtsModel, input_ids: []const i32, max_frames: u32, progress: ?sse.Progress) ![][16]u32 {
+    /// `speaker_embed` (optional, `[1, t_hidden]`) is the ECAPA-TDNN embedding
+    /// of a reference clip for zero-shot voice cloning — inserted as one extra
+    /// position in the codec prefix (mirrors the reference). Caller owns the
+    /// returned slice.
+    pub fn generateCodes(self: *TtsModel, input_ids: []const i32, max_frames: u32, progress: ?sse.Progress, speaker_embed: ?mlx.mlx_array) ![][16]u32 {
         const s = self.s;
         const cfg = self.cfg;
         const H = cfg.t_hidden;
@@ -649,9 +672,16 @@ pub const TtsModel = struct {
         const suffix = [_]i32{ cfg.codec_pad, cfg.codec_bos };
         const codec_suf = try embed(self.codec_embedding, &suffix, H, s);
         defer _ = mlx.mlx_array_free(codec_suf);
-        const codec_embed = try concat(&[_]mlx.mlx_array{ codec_pre, codec_suf }, 1, s); // [1,5,H]
+        // Voice cloning: splice the speaker embedding between the think-prefix
+        // and the pad/bos suffix → codec stream grows 5 → 6 positions. The
+        // downstream assembly is `codec_len`-relative, so it flows unchanged.
+        const codec_embed = if (speaker_embed) |spk| blk: {
+            const spk3 = try reshape(spk, &[_]c_int{ 1, 1, hc }, s); // [1,1,H]
+            defer _ = mlx.mlx_array_free(spk3);
+            break :blk try concat(&[_]mlx.mlx_array{ codec_pre, spk3, codec_suf }, 1, s); // [1,6,H]
+        } else try concat(&[_]mlx.mlx_array{ codec_pre, codec_suf }, 1, s); // [1,5,H]
         defer _ = mlx.mlx_array_free(codec_embed);
-        const codec_len: c_int = mlx.getShape(codec_embed)[1]; // 5
+        const codec_len: c_int = mlx.getShape(codec_embed)[1]; // 5 (plain) or 6 (cloned)
 
         // role_embed = text_embed[:, :3, :]
         const role = try sliceSeq(text_embed, 0, 3, hc, s);
@@ -1045,6 +1075,17 @@ pub fn loadModel(io: std.Io, allocator: std.mem.Allocator, s: S, model_dir: []co
         m.cp_small_to_mtp_b = null;
     }
 
+    // Speaker encoder for zero-shot voice cloning — present on `-Base`
+    // checkpoints. Absent → cloning unavailable (plain TTS still works).
+    if (w.get("speaker_encoder.fc.weight") != null) {
+        m.speaker = SpeakerEncoder.load(allocator, &w, s) catch |err| blk: {
+            log.warn("[tts] speaker encoder load failed ({s}) — voice cloning disabled\n", .{@errorName(err)});
+            break :blk null;
+        };
+    } else {
+        m.speaker = null;
+    }
+
     return m;
 }
 
@@ -1062,6 +1103,530 @@ fn loadQwenLayer(w: *const Weights, allocator: std.mem.Allocator, s: S, comptime
         .up_w_t = try ownTfmt(w, s, allocator, prefix, .{ idx, "mlp.up_proj.weight" }),
         .down_w_t = try ownTfmt(w, s, allocator, prefix, .{ idx, "mlp.down_proj.weight" }),
     };
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// Speaker encoder (ECAPA-TDNN) + mel-spectrogram — zero-shot VOICE CLONING.
+// Port of mlx_audio's `Qwen3TTSSpeakerEncoder` + `mel_spectrogram`. The
+// reference audio → mel [1,T,128] → ECAPA-TDNN → speaker embedding [1, enc_dim].
+// The embedding is inserted as one extra position in the talker's codec prefix
+// (see `_prepare_generation_inputs` in the reference). Conv weights in the
+// mlx-community checkpoint are already MLX layout `[out, k, in]` (unlike the
+// codec, which is stored PyTorch-layout) — load directly, no transpose.
+// ════════════════════════════════════════════════════════════════════════
+
+const SPK_N_FFT: usize = 1024;
+const SPK_HOP: usize = 256;
+const SPK_N_MELS: usize = 128;
+const SPK_N_FREQS: usize = SPK_N_FFT / 2 + 1; // 513
+const SPK_F_MAX: f64 = 12000.0;
+const SPK_SR: f64 = 24000.0;
+const SPK_ENC_DIM: usize = 1024;
+// enc_channels [512,512,512,512,1536]; kernels [5,3,3,3,1]; dilations [1,2,3,4,1].
+const SPK_RES2NET_SCALE: usize = 8;
+
+/// Slaney hz→mel.
+fn hzToMelSlaney(freq: f64) f64 {
+    const f_sp = 200.0 / 3.0;
+    const min_log_hz = 1000.0;
+    const min_log_mel = min_log_hz / f_sp;
+    const logstep = std.math.log(f64, std.math.e, 6.4) / 27.0;
+    if (freq >= min_log_hz) return min_log_mel + std.math.log(f64, std.math.e, freq / min_log_hz) / logstep;
+    return freq / f_sp;
+}
+/// Slaney mel→hz.
+fn melToHzSlaney(mel: f64) f64 {
+    const f_sp = 200.0 / 3.0;
+    const min_log_hz = 1000.0;
+    const min_log_mel = min_log_hz / f_sp;
+    const logstep = std.math.log(f64, std.math.e, 6.4) / 27.0;
+    if (mel >= min_log_mel) return min_log_hz * @exp(logstep * (mel - min_log_mel));
+    return f_sp * mel;
+}
+
+/// Build the slaney mel filterbank `[n_mels, n_freqs]` on the CPU, matching
+/// `mlx_audio.dsp.mel_filters(norm="slaney", mel_scale="slaney")`. Returns an
+/// owned mlx array (caller frees).
+fn buildMelFilterbank(allocator: std.mem.Allocator) !mlx.mlx_array {
+    const n_freqs = SPK_N_FREQS;
+    const n_mels = SPK_N_MELS;
+    // all_freqs = linspace(0, sr/2, n_freqs)
+    var all_freqs: [SPK_N_FREQS]f64 = undefined;
+    const nyq = SPK_SR / 2.0;
+    for (0..n_freqs) |i| all_freqs[i] = nyq * @as(f64, @floatFromInt(i)) / @as(f64, @floatFromInt(n_freqs - 1));
+    // mel points: linspace(hz_to_mel(0), hz_to_mel(f_max), n_mels+2) → mel_to_hz
+    const m_min = hzToMelSlaney(0.0);
+    const m_max = hzToMelSlaney(SPK_F_MAX);
+    var f_pts: [SPK_N_MELS + 2]f64 = undefined;
+    for (0..n_mels + 2) |i| {
+        const m = m_min + (m_max - m_min) * @as(f64, @floatFromInt(i)) / @as(f64, @floatFromInt(n_mels + 1));
+        f_pts[i] = melToHzSlaney(m);
+    }
+    // triangular filters [n_mels, n_freqs], slaney area-norm.
+    const fb = try allocator.alloc(f32, n_mels * n_freqs);
+    defer allocator.free(fb);
+    for (0..n_mels) |m| {
+        const lo = f_pts[m];
+        const ctr = f_pts[m + 1];
+        const hi = f_pts[m + 2];
+        const enorm = 2.0 / (hi - lo); // slaney norm
+        for (0..n_freqs) |f| {
+            const fr = all_freqs[f];
+            const down = (fr - lo) / (ctr - lo); // up-slope toward center
+            const up = (hi - fr) / (hi - ctr); // down-slope after center
+            var v = @min(down, up);
+            if (v < 0) v = 0;
+            fb[m * n_freqs + f] = @floatCast(v * enorm);
+        }
+    }
+    const shape = [_]c_int{ @intCast(n_mels), @intCast(n_freqs) };
+    return mlx.mlx_array_new_data(fb.ptr, &shape, 2, .float32);
+}
+
+/// Symmetric Hann window `[n]` (periodic=False; denom=n-1). Owned mlx array.
+fn buildHann(allocator: std.mem.Allocator, n: usize) !mlx.mlx_array {
+    const w = try allocator.alloc(f32, n);
+    defer allocator.free(w);
+    const denom: f64 = @floatFromInt(n - 1);
+    for (0..n) |i| {
+        const x = 2.0 * std.math.pi * @as(f64, @floatFromInt(i)) / denom;
+        w[i] = @floatCast(0.5 * (1.0 - @cos(x)));
+    }
+    const shape = [_]c_int{@intCast(n)};
+    return mlx.mlx_array_new_data(w.ptr, &shape, 1, .float32);
+}
+
+/// Reflect-pad a 1-D f32 slice by `pad` on each side (mirror, no boundary
+/// repeat) — matches the manual reflect pad in `mel_spectrogram`. Caller frees.
+fn reflectPadF32(allocator: std.mem.Allocator, x: []const f32, pad: usize) ![]f32 {
+    const out = try allocator.alloc(f32, x.len + 2 * pad);
+    for (0..pad) |i| out[i] = x[pad - i]; // [x[pad], x[pad-1], ..., x[1]]
+    @memcpy(out[pad .. pad + x.len], x);
+    for (0..pad) |i| out[pad + x.len + i] = x[x.len - 2 - i]; // [x[T-2], ..., x[T-1-pad]]
+    return out;
+}
+
+/// mel-spectrogram of `samples` (24 kHz mono) → `[1, frames, 128]` (log-mel).
+/// `mel_basis` is `[128, 513]`, `hann` is `[1024]`.
+fn melSpectrogram(allocator: std.mem.Allocator, samples: []const f32, mel_basis: mlx.mlx_array, hann: mlx.mlx_array, s: S) !mlx.mlx_array {
+    const pad = (SPK_N_FFT - SPK_HOP) / 2; // 384
+    const padded = try reflectPadF32(allocator, samples, pad);
+    defer allocator.free(padded);
+    if (padded.len < SPK_N_FFT) return error.RefAudioTooShort;
+    const frames = 1 + (padded.len - SPK_N_FFT) / SPK_HOP;
+
+    // Build the [frames, n_fft] framed matrix on CPU (as_strided equivalent).
+    const fbuf = try allocator.alloc(f32, frames * SPK_N_FFT);
+    defer allocator.free(fbuf);
+    for (0..frames) |i| {
+        const base = i * SPK_HOP;
+        @memcpy(fbuf[i * SPK_N_FFT .. (i + 1) * SPK_N_FFT], padded[base .. base + SPK_N_FFT]);
+    }
+    const fshape = [_]c_int{ @intCast(frames), @intCast(SPK_N_FFT) };
+    const fr = mlx.mlx_array_new_data(fbuf.ptr, &fshape, 2, .float32);
+    defer _ = mlx.mlx_array_free(fr);
+
+    // frames * hann (broadcast over the n_fft axis).
+    const wf = try mulA(fr, hann, s);
+    defer _ = mlx.mlx_array_free(wf);
+    // rfft along axis 1 → [frames, 513] complex.
+    var spec = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(spec);
+    try mlx.check(mlx.mlx_fft_rfft(&spec, wf, @intCast(SPK_N_FFT), 1, mlx.MLX_FFT_NORM_BACKWARD, s));
+    // magnitude = |spec|; spec_mag = sqrt(mag^2 + 1e-9).
+    var mag = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(mag);
+    try mlx.check(mlx.mlx_abs(&mag, spec, s));
+    var mag2 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(mag2);
+    try mlx.check(mlx.mlx_square(&mag2, mag, s));
+    const eps_a = mlx.mlx_array_new_float(1e-9);
+    defer _ = mlx.mlx_array_free(eps_a);
+    const mag2e = try addA(mag2, eps_a, s);
+    defer _ = mlx.mlx_array_free(mag2e);
+    var spec_mag = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(spec_mag);
+    try mlx.check(mlx.mlx_sqrt(&spec_mag, mag2e, s));
+    // mel = spec_mag @ mel_basis.T  → [frames, 128]
+    const basis_t = try transpose(mel_basis, &[_]c_int{ 1, 0 }, s);
+    defer _ = mlx.mlx_array_free(basis_t);
+    const mel = try matmul(spec_mag, basis_t, s);
+    defer _ = mlx.mlx_array_free(mel);
+    // log(clip(mel, 1e-5)) = log(maximum(mel, 1e-5))
+    const floor_a = mlx.mlx_array_new_float(1e-5);
+    defer _ = mlx.mlx_array_free(floor_a);
+    var clipped = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(clipped);
+    try mlx.check(mlx.mlx_maximum(&clipped, mel, floor_a, s));
+    var logmel = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(logmel);
+    try mlx.check(mlx.mlx_log(&logmel, clipped, s));
+    // → [1, frames, 128]
+    return reshape(logmel, &[_]c_int{ 1, @intCast(frames), @intCast(SPK_N_MELS) }, s);
+}
+
+// ── ECAPA-TDNN building blocks (NCL = [batch, channels, time]) ──
+
+/// Reflect-pad an mlx array along the time axis (axis 1 in NLC) by `pad`,
+/// matching `reflect_pad_1d`. Built via a gather (take_axis) over reflected
+/// indices so it works on any intermediate activation.
+fn reflectPadNLC(allocator: std.mem.Allocator, x_nlc: mlx.mlx_array, pad: usize, s: S) !mlx.mlx_array {
+    if (pad == 0) {
+        var o = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_array_set(&o, x_nlc));
+        return o;
+    }
+    const sh = mlx.getShape(x_nlc); // [B, T, C]
+    const t: usize = @intCast(sh[1]);
+    const total = t + 2 * pad;
+    const idx = try allocator.alloc(i32, total);
+    defer allocator.free(idx);
+    for (0..pad) |i| idx[i] = @intCast(pad - i); // T,T-1..1 → reflected left
+    for (0..t) |i| idx[pad + i] = @intCast(i);
+    for (0..pad) |i| idx[pad + t + i] = @intCast(t - 2 - i);
+    const ishape = [_]c_int{@intCast(total)};
+    const iarr = mlx.mlx_array_new_data(idx.ptr, &ishape, 1, .int32);
+    defer _ = mlx.mlx_array_free(iarr);
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_take_axis(&out, x_nlc, iarr, 1, s));
+    return out;
+}
+
+const SpkMap = std.StringHashMap(mlx.mlx_array);
+
+fn spkGet(map: *const SpkMap, key: []const u8) !mlx.mlx_array {
+    return map.get(key) orelse {
+        log.err("[tts-spk] MISSING WEIGHT: {s}\n", .{key});
+        return error.MissingSpkWeight;
+    };
+}
+
+/// One TDNN conv over an NCL input: NCL→NLC, reflect-pad `(k-1)*d/2`, conv1d,
+/// +bias, optional ReLU, NLC→NCL. `prefix` resolves `{prefix}.weight/.bias`.
+fn spkTdnnConv(map: *const SpkMap, allocator: std.mem.Allocator, x_ncl: mlx.mlx_array, prefix: []const u8, kernel: usize, dilation: usize, do_relu: bool, s: S) !mlx.mlx_array {
+    var wk: [128]u8 = undefined;
+    const w = try spkGet(map, try std.fmt.bufPrint(&wk, "{s}.weight", .{prefix}));
+    const b = try spkGet(map, try std.fmt.bufPrint(&wk, "{s}.bias", .{prefix}));
+    const pad = (kernel - 1) * dilation / 2;
+    // NCL → NLC
+    const nlc = try transpose(x_ncl, &[_]c_int{ 0, 2, 1 }, s);
+    defer _ = mlx.mlx_array_free(nlc);
+    const padded = try reflectPadNLC(allocator, nlc, pad, s);
+    defer _ = mlx.mlx_array_free(padded);
+    var conv = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(conv);
+    try mlx.check(mlx.mlx_conv1d(&conv, padded, w, 1, 0, @intCast(dilation), 1, s));
+    const biased = try addA(conv, b, s); // bias broadcasts over the channel (last) axis
+    defer _ = mlx.mlx_array_free(biased);
+    var act = biased;
+    var act_owned = false;
+    if (do_relu) {
+        const zero = mlx.mlx_array_new_float(0);
+        defer _ = mlx.mlx_array_free(zero);
+        var r = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_maximum(&r, biased, zero, s));
+        act = r;
+        act_owned = true;
+    }
+    defer if (act_owned) {
+        _ = mlx.mlx_array_free(act);
+    };
+    // NLC → NCL
+    return transpose(act, &[_]c_int{ 0, 2, 1 }, s);
+}
+
+/// 1×1 conv over NLC (no reflect pad). `x_nlc` is already NLC.
+fn spkConv1x1NLC(map: *const SpkMap, x_nlc: mlx.mlx_array, prefix: []const u8, s: S) !mlx.mlx_array {
+    var wk: [128]u8 = undefined;
+    const w = try spkGet(map, try std.fmt.bufPrint(&wk, "{s}.weight", .{prefix}));
+    const b = try spkGet(map, try std.fmt.bufPrint(&wk, "{s}.bias", .{prefix}));
+    var conv = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(conv);
+    try mlx.check(mlx.mlx_conv1d(&conv, x_nlc, w, 1, 0, 1, 1, s));
+    return addA(conv, b, s);
+}
+
+/// Res2Net block: split into `scale` chunks, hierarchical TDNN (k3, dilation d).
+fn spkRes2Net(map: *const SpkMap, allocator: std.mem.Allocator, x_ncl: mlx.mlx_array, prefix: []const u8, dilation: usize, s: S) !mlx.mlx_array {
+    var chunks = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(chunks);
+    try mlx.check(mlx.mlx_split(&chunks, x_ncl, @intCast(SPK_RES2NET_SCALE), 1, s)); // split channels
+    var outs = std.ArrayList(mlx.mlx_array).empty;
+    defer {
+        for (outs.items) |o| _ = mlx.mlx_array_free(o);
+        outs.deinit(allocator);
+    }
+    var prev: ?mlx.mlx_array = null;
+    for (0..SPK_RES2NET_SCALE) |i| {
+        var chunk = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_vector_array_get(&chunk, chunks, i));
+        defer _ = mlx.mlx_array_free(chunk);
+        var part: mlx.mlx_array = undefined;
+        if (i == 0) {
+            part = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_array_set(&part, chunk));
+        } else {
+            var inp = chunk;
+            var inp_owned = false;
+            if (i >= 2) {
+                inp = try addA(chunk, prev.?, s);
+                inp_owned = true;
+            }
+            defer if (inp_owned) {
+                _ = mlx.mlx_array_free(inp);
+            };
+            var bk: [128]u8 = undefined;
+            const bp = try std.fmt.bufPrint(&bk, "{s}.blocks.{d}.conv", .{ prefix, i - 1 });
+            part = try spkTdnnConv(map, allocator, inp, bp, 3, dilation, true, s);
+        }
+        try outs.append(allocator, part);
+        prev = part;
+    }
+    const vec = mlx.mlx_vector_array_new_data(outs.items.ptr, outs.items.len);
+    defer _ = mlx.mlx_vector_array_free(vec);
+    var cat = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_concatenate_axis(&cat, vec, 1, s)); // concat channels
+    return cat;
+}
+
+/// Squeeze-Excitation: global avg-pool → conv1(relu) → conv2(sigmoid) → scale.
+fn spkSE(map: *const SpkMap, x_ncl: mlx.mlx_array, prefix: []const u8, s: S) !mlx.mlx_array {
+    // mean over time (axis 2) → [B, C, 1]
+    var xmean = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(xmean);
+    try mlx.check(mlx.mlx_mean_axis(&xmean, x_ncl, 2, true, s));
+    // → NLC [B, 1, C]
+    const se_nlc = try transpose(xmean, &[_]c_int{ 0, 2, 1 }, s);
+    defer _ = mlx.mlx_array_free(se_nlc);
+    var c1k: [128]u8 = undefined;
+    const c1 = try spkConv1x1NLC(map, se_nlc, try std.fmt.bufPrint(&c1k, "{s}.conv1", .{prefix}), s);
+    defer _ = mlx.mlx_array_free(c1);
+    const zero = mlx.mlx_array_new_float(0);
+    defer _ = mlx.mlx_array_free(zero);
+    var c1r = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(c1r);
+    try mlx.check(mlx.mlx_maximum(&c1r, c1, zero, s));
+    var c2k: [128]u8 = undefined;
+    const c2 = try spkConv1x1NLC(map, c1r, try std.fmt.bufPrint(&c2k, "{s}.conv2", .{prefix}), s);
+    defer _ = mlx.mlx_array_free(c2);
+    var sig = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sig);
+    try mlx.check(mlx.mlx_sigmoid(&sig, c2, s));
+    // back to NCL [B, C, 1]
+    const se_ncl = try transpose(sig, &[_]c_int{ 0, 2, 1 }, s);
+    defer _ = mlx.mlx_array_free(se_ncl);
+    return mulA(x_ncl, se_ncl, s); // broadcast over time
+}
+
+/// SE-Res2Net block: tdnn1 → res2net → tdnn2 → se + residual.
+fn spkSeRes2Net(map: *const SpkMap, allocator: std.mem.Allocator, x_ncl: mlx.mlx_array, prefix: []const u8, dilation: usize, s: S) !mlx.mlx_array {
+    var k: [128]u8 = undefined;
+    const a1 = try spkTdnnConv(map, allocator, x_ncl, try std.fmt.bufPrint(&k, "{s}.tdnn1.conv", .{prefix}), 1, 1, true, s);
+    defer _ = mlx.mlx_array_free(a1);
+    var rk: [128]u8 = undefined;
+    const a2 = try spkRes2Net(map, allocator, a1, try std.fmt.bufPrint(&rk, "{s}.res2net_block", .{prefix}), dilation, s);
+    defer _ = mlx.mlx_array_free(a2);
+    const a3 = try spkTdnnConv(map, allocator, a2, try std.fmt.bufPrint(&k, "{s}.tdnn2.conv", .{prefix}), 1, 1, true, s);
+    defer _ = mlx.mlx_array_free(a3);
+    var sk: [128]u8 = undefined;
+    const a4 = try spkSE(map, a3, try std.fmt.bufPrint(&sk, "{s}.se_block", .{prefix}), s);
+    defer _ = mlx.mlx_array_free(a4);
+    return addA(a4, x_ncl, s); // residual
+}
+
+/// Attentive statistics pooling → [B, 2C, 1].
+fn spkASP(map: *const SpkMap, allocator: std.mem.Allocator, x_ncl: mlx.mlx_array, s: S) !mlx.mlx_array {
+    const eps = mlx.mlx_array_new_float(1e-12);
+    defer _ = mlx.mlx_array_free(eps);
+    // mean/std over time (axis 2)
+    var mean = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(mean);
+    try mlx.check(mlx.mlx_mean_axis(&mean, x_ncl, 2, true, s));
+    const dev = try subA(x_ncl, mean, s);
+    defer _ = mlx.mlx_array_free(dev);
+    var dev2 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(dev2);
+    try mlx.check(mlx.mlx_square(&dev2, dev, s));
+    var varr = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(varr);
+    try mlx.check(mlx.mlx_mean_axis(&varr, dev2, 2, true, s));
+    const vare = try addA(varr, eps, s);
+    defer _ = mlx.mlx_array_free(vare);
+    var std_a = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(std_a);
+    try mlx.check(mlx.mlx_sqrt(&std_a, vare, s));
+    // broadcast mean/std to time length, concat [x, mean, std] along channels.
+    const sh = mlx.getShape(x_ncl); // [B, C, T]
+    const tlen = sh[2];
+    const mean_b = try broadcastTime(mean, tlen, s);
+    defer _ = mlx.mlx_array_free(mean_b);
+    const std_b = try broadcastTime(std_a, tlen, s);
+    defer _ = mlx.mlx_array_free(std_b);
+    var triple = [_]mlx.mlx_array{ x_ncl, mean_b, std_b };
+    const tvec = mlx.mlx_vector_array_new_data(&triple, 3);
+    defer _ = mlx.mlx_vector_array_free(tvec);
+    var att = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(att);
+    try mlx.check(mlx.mlx_concatenate_axis(&att, tvec, 1, s)); // [B, 3C, T]
+    // tdnn(3C→128, k1) [TimeDelayNetBlock → conv + ReLU] → tanh → conv(128→C, k1) → softmax(time)
+    const a_tdnn = try spkTdnnConv(map, allocator, att, "asp.tdnn.conv", 1, 1, true, s);
+    defer _ = mlx.mlx_array_free(a_tdnn);
+    var a_tanh = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(a_tanh);
+    try mlx.check(mlx.mlx_tanh(&a_tanh, a_tdnn, s));
+    // conv expects NLC
+    const a_nlc = try transpose(a_tanh, &[_]c_int{ 0, 2, 1 }, s);
+    defer _ = mlx.mlx_array_free(a_nlc);
+    const a_conv = try spkConv1x1NLC(map, a_nlc, "asp.conv", s);
+    defer _ = mlx.mlx_array_free(a_conv);
+    const a_back = try transpose(a_conv, &[_]c_int{ 0, 2, 1 }, s); // [B, C, T]
+    defer _ = mlx.mlx_array_free(a_back);
+    var attw = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(attw);
+    try mlx.check(mlx.mlx_softmax_axis(&attw, a_back, 2, true, s)); // softmax over time
+    // weighted mean = Σ attw*x ; weighted var = Σ attw*(x-mean)^2
+    const wx = try mulA(attw, x_ncl, s);
+    defer _ = mlx.mlx_array_free(wx);
+    var wmean = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(wmean);
+    try mlx.check(mlx.mlx_sum_axis(&wmean, wx, 2, true, s));
+    const dev_w = try subA(x_ncl, wmean, s);
+    defer _ = mlx.mlx_array_free(dev_w);
+    var dev_w2 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(dev_w2);
+    try mlx.check(mlx.mlx_square(&dev_w2, dev_w, s));
+    const wv = try mulA(attw, dev_w2, s);
+    defer _ = mlx.mlx_array_free(wv);
+    var wvar = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(wvar);
+    try mlx.check(mlx.mlx_sum_axis(&wvar, wv, 2, true, s));
+    // std = sqrt(clip(var, eps, inf))
+    var wvar_c = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(wvar_c);
+    try mlx.check(mlx.mlx_maximum(&wvar_c, wvar, eps, s));
+    var wstd = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(wstd);
+    try mlx.check(mlx.mlx_sqrt(&wstd, wvar_c, s));
+    var pair = [_]mlx.mlx_array{ wmean, wstd };
+    const pvec = mlx.mlx_vector_array_new_data(&pair, 2);
+    defer _ = mlx.mlx_vector_array_free(pvec);
+    var pooled = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_concatenate_axis(&pooled, pvec, 1, s)); // [B, 2C, 1]
+    return pooled;
+}
+
+/// Broadcast `[B, C, 1]` to `[B, C, T]`.
+fn broadcastTime(x: mlx.mlx_array, t: c_int, s: S) !mlx.mlx_array {
+    const sh = mlx.getShape(x); // [B, C, 1]
+    const target = [_]c_int{ sh[0], sh[1], t };
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_broadcast_to(&out, x, &target, 3, s));
+    return out;
+}
+
+pub const SpeakerEncoder = struct {
+    allocator: std.mem.Allocator,
+    s: S,
+    map: SpkMap,
+    mel_basis: mlx.mlx_array,
+    hann: mlx.mlx_array,
+    /// Output embedding dim = the talker hidden size (1024 on 0.6B, 2048 on
+    /// 1.7B) so the embedding inserts cleanly into the codec stream. Read from
+    /// the `fc` weight at load rather than hardcoded.
+    enc_dim: usize,
+    // dilations for the 3 SE-Res2Net blocks (enc_dilations[1..3]).
+    const se_dilations = [_]usize{ 2, 3, 4 };
+
+    /// Load `speaker_encoder.*` weights (already MLX conv layout — no
+    /// transpose) into an owned map + precompute the mel filterbank + window.
+    pub fn load(allocator: std.mem.Allocator, w: *const Weights, s: S) !SpeakerEncoder {
+        var map = SpkMap.init(allocator);
+        errdefer freeSpkMap(&map);
+        const prefix = "speaker_encoder.";
+        var it = w.map.iterator();
+        while (it.next()) |entry| {
+            const key = entry.key_ptr.*;
+            if (!std.mem.startsWith(u8, key, prefix)) continue;
+            const stripped = key[prefix.len..];
+            var owned = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_array_set(&owned, entry.value_ptr.*));
+            const dup = try allocator.dupe(u8, stripped);
+            try map.put(dup, owned);
+        }
+        const fcw = map.get("fc.weight") orelse return error.MissingSpkWeight;
+        const enc_dim: usize = @intCast(mlx.getShape(fcw)[0]);
+        const mel_basis = try buildMelFilterbank(allocator);
+        errdefer _ = mlx.mlx_array_free(mel_basis);
+        const hann = try buildHann(allocator, SPK_N_FFT);
+        log.info("[tts] speaker encoder (ECAPA-TDNN) loaded ({d} tensors, enc_dim={d}) — voice cloning ready\n", .{ map.count(), enc_dim });
+        return .{ .allocator = allocator, .s = s, .map = map, .mel_basis = mel_basis, .hann = hann, .enc_dim = enc_dim };
+    }
+
+    pub fn deinit(self: *SpeakerEncoder) void {
+        freeSpkMap(&self.map);
+        _ = mlx.mlx_array_free(self.mel_basis);
+        _ = mlx.mlx_array_free(self.hann);
+    }
+
+    /// Reference audio (24 kHz mono f32) → speaker embedding `[1, enc_dim]`.
+    pub fn embed(self: *SpeakerEncoder, samples: []const f32) !mlx.mlx_array {
+        const s = self.s;
+        const map = &self.map;
+        const a = self.allocator;
+        const mel = try melSpectrogram(a, samples, self.mel_basis, self.hann, s); // [1, T, 128]
+        defer _ = mlx.mlx_array_free(mel);
+        // NLT? mel is [1, T, mel] → transpose to NCL [1, mel, T].
+        var x = try transpose(mel, &[_]c_int{ 0, 2, 1 }, s);
+        // Block 0: initial TDNN(128→512, k5, d1).
+        {
+            const b0 = try spkTdnnConv(map, a, x, "blocks.0.conv", 5, 1, true, s);
+            _ = mlx.mlx_array_free(x);
+            x = b0;
+        }
+        // Blocks 1..3: SE-Res2Net; collect their outputs for MFA.
+        var mfa_inputs = std.ArrayList(mlx.mlx_array).empty;
+        defer {
+            for (mfa_inputs.items) |o| _ = mlx.mlx_array_free(o);
+            mfa_inputs.deinit(a);
+        }
+        for (0..3) |i| {
+            var pk: [64]u8 = undefined;
+            const prefix = try std.fmt.bufPrint(&pk, "blocks.{d}", .{i + 1});
+            const out = try spkSeRes2Net(map, a, x, prefix, se_dilations[i], s);
+            _ = mlx.mlx_array_free(x);
+            x = out;
+            var keep = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_array_set(&keep, x));
+            try mfa_inputs.append(a, keep);
+        }
+        _ = mlx.mlx_array_free(x);
+        // MFA: concat the 3 SE-Res2Net outputs (3×512=1536) → TDNN(1536→1536, k1).
+        const mvec = mlx.mlx_vector_array_new_data(mfa_inputs.items.ptr, mfa_inputs.items.len);
+        defer _ = mlx.mlx_vector_array_free(mvec);
+        var mcat = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_concatenate_axis(&mcat, mvec, 1, s));
+        const mfa = try spkTdnnConv(map, a, mcat, "mfa.conv", 1, 1, true, s);
+        _ = mlx.mlx_array_free(mcat);
+        defer _ = mlx.mlx_array_free(mfa);
+        // ASP → [1, 3072, 1].
+        const pooled = try spkASP(map, a, mfa, s);
+        defer _ = mlx.mlx_array_free(pooled);
+        // fc: conv(3072→1024, k1) over NLC → [1, 1, 1024] → [1, 1024].
+        const pooled_nlc = try transpose(pooled, &[_]c_int{ 0, 2, 1 }, s);
+        defer _ = mlx.mlx_array_free(pooled_nlc);
+        const fc = try spkConv1x1NLC(map, pooled_nlc, "fc", s); // [1, 1, enc_dim]
+        defer _ = mlx.mlx_array_free(fc);
+        return reshape(fc, &[_]c_int{ 1, @intCast(self.enc_dim) }, s);
+    }
+};
+
+fn freeSpkMap(map: *SpkMap) void {
+    var it = map.iterator();
+    while (it.next()) |entry| {
+        map.allocator.free(entry.key_ptr.*);
+        _ = mlx.mlx_array_free(entry.value_ptr.*);
+    }
+    map.deinit();
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -1108,20 +1673,38 @@ pub const Synthesizer = struct {
         return ids;
     }
 
+    /// True when this checkpoint can do zero-shot voice cloning (ships a
+    /// speaker encoder). The `-Base` models do; others fall back to plain TTS.
+    pub fn supportsCloning(self: *const Synthesizer) bool {
+        return self.model.speaker != null;
+    }
+
     /// text → waveform samples (f32, owned). `max_frames` caps generation.
-    pub fn synthesize(self: *Synthesizer, text: []const u8, max_frames: u32, progress: ?sse.Progress) ![]f32 {
+    /// `ref_audio` (optional, 24 kHz mono f32) clones that voice via the
+    /// speaker encoder; ignored (plain voice) when the model has none.
+    pub fn synthesize(self: *Synthesizer, text: []const u8, max_frames: u32, progress: ?sse.Progress, ref_audio: ?[]const f32) ![]f32 {
         const ids = try self.buildInputIds(text);
         defer self.allocator.free(ids);
-        const codes = try self.model.generateCodes(ids, max_frames, progress);
+        var spk_emb: ?mlx.mlx_array = null;
+        defer {
+            if (spk_emb) |e| _ = mlx.mlx_array_free(e);
+        }
+        if (ref_audio) |ref| {
+            if (self.model.speaker) |*sp| {
+                if (progress) |p| p.emit("Encoding reference voice", 0, 0);
+                spk_emb = try sp.embed(ref);
+            }
+        }
+        const codes = try self.model.generateCodes(ids, max_frames, progress, spk_emb);
         defer self.allocator.free(codes);
         if (codes.len == 0) return self.allocator.alloc(f32, 0);
         if (progress) |p| p.emit("Decoding audio", 0, 0);
         return self.codec.decode(codes);
     }
 
-    /// text → 16-bit PCM mono WAV bytes (owned).
-    pub fn synthesizeWav(self: *Synthesizer, text: []const u8, max_frames: u32, progress: ?sse.Progress) ![]u8 {
-        const samples = try self.synthesize(text, max_frames, progress);
+    /// text → 16-bit PCM mono WAV bytes (owned). `ref_audio` clones a voice.
+    pub fn synthesizeWav(self: *Synthesizer, text: []const u8, max_frames: u32, progress: ?sse.Progress, ref_audio: ?[]const f32) ![]u8 {
+        const samples = try self.synthesize(text, max_frames, progress, ref_audio);
         defer self.allocator.free(samples);
         return wav_mod.encodePcm16Mono(self.allocator, samples, self.model.cfg.sample_rate);
     }
@@ -1827,6 +2410,27 @@ test "TtsConfig defaults match 1.7B" {
     try std.testing.expectEqual(@as(u32, 16), cfg.num_code_groups);
 }
 
+test "embed uses the table's native width, not a mismatched hidden (0.6B-Base crash)" {
+    // Qwen3-TTS 0.6B-Base: text_embedding is 4-wide but the talker t_hidden is
+    // 2 (the text_projection bridges them). Passing the WRONG hidden=2 must NOT
+    // crash — the gather is always the table's native width. Red before the fix
+    // (reshape 2x4=8 into 1x2x2=4 → mlx error).
+    const s = mlx.mlx_default_cpu_stream_new();
+    const data = [_]f32{ 0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11 }; // vocab=3, H=4
+    const shape = [_]c_int{ 3, 4 };
+    const table = mlx.mlx_array_new_data(&data, &shape, 2, .float32);
+    defer _ = mlx.mlx_array_free(table);
+    const ids = [_]i32{ 0, 2 };
+    const e = try embed(table, &ids, 2, s); // pass the WRONG (talker) hidden
+    defer _ = mlx.mlx_array_free(e);
+    _ = mlx.mlx_array_eval(e);
+    const sh = mlx.getShape(e);
+    try std.testing.expectEqual(@as(usize, 3), sh.len);
+    try std.testing.expectEqual(@as(c_int, 1), sh[0]);
+    try std.testing.expectEqual(@as(c_int, 2), sh[1]); // N
+    try std.testing.expectEqual(@as(c_int, 4), sh[2]); // native H — NOT the passed 2
+}
+
 test "parseConfig reads talker dims" {
     const json =
         \\{"tts_bos_token_id":151672,"tts_eos_token_id":151673,"tts_pad_token_id":151671,
@@ -1877,7 +2481,7 @@ test "talker+predictor reproduce greedy oracle codes" {
     m.cfg.rep_penalty = 1.0; // match the pure-greedy oracle (rep_pen=1.0)
     m.cfg.temperature = 0.0; // greedy (deterministic) for equivalence
 
-    const codes = try m.generateCodes(ids, @intCast(check_frames), null);
+    const codes = try m.generateCodes(ids, @intCast(check_frames), null, null);
     defer allocator.free(codes);
 
     try std.testing.expect(codes.len >= check_frames);
@@ -1967,6 +2571,82 @@ test "codec decoder reproduces reference audio" {
     try std.testing.expect(rms_err < 0.02);
 }
 
+// Speaker encoder (ECAPA-TDNN) parity vs the Python reference. Validates the
+// mel-spectrogram + the full ECAPA forward: the Zig speaker embedding must be
+// (near-)identical to mlx_audio's `extract_speaker_embedding(ref_audio)`. This
+// is the correctness gate for zero-shot voice cloning.
+//   TTS_TEST_MODEL = model dir; TTS_SPK_REF = ref audio f32; TTS_SPK_EMB = oracle [enc_dim] f32
+test "speaker encoder (ECAPA-TDNN) matches the Python oracle" {
+    const model_dir = std.mem.span(std.c.getenv("TTS_TEST_MODEL") orelse return error.SkipZigTest);
+    const ref_path = std.mem.span(std.c.getenv("TTS_SPK_REF") orelse return error.SkipZigTest);
+    const emb_path = std.mem.span(std.c.getenv("TTS_SPK_EMB") orelse return error.SkipZigTest);
+    const allocator = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    const ref = try readF32File(io, allocator, ref_path);
+    defer allocator.free(ref);
+    const oracle = try readF32File(io, allocator, emb_path);
+    defer allocator.free(oracle);
+
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var w = try model_mod.loadWeights(io, allocator, model_dir);
+    defer w.deinit();
+    var enc = try SpeakerEncoder.load(allocator, &w, s);
+    defer enc.deinit();
+
+    // Optional: validate the (deterministic, f32) mel-spectrogram in isolation,
+    // to separate a mel bug from bf16 ECAPA drift.
+    if (std.c.getenv("TTS_SPK_MEL")) |mp| {
+        const mel_oracle = try readF32File(io, allocator, std.mem.span(mp));
+        defer allocator.free(mel_oracle);
+        const mel = try melSpectrogram(allocator, ref, enc.mel_basis, enc.hann, s);
+        defer _ = mlx.mlx_array_free(mel);
+        _ = mlx.mlx_array_eval(mel);
+        const md = mlx.mlx_array_data_float32(mel) orelse return error.NoData;
+        const mn = mel_oracle.len;
+        var mdot: f64 = 0;
+        var mna: f64 = 0;
+        var mnb: f64 = 0;
+        var mmax: f64 = 0;
+        for (0..mn) |i| {
+            const a: f64 = md[i];
+            const b: f64 = mel_oracle[i];
+            mdot += a * b;
+            mna += a * a;
+            mnb += b * b;
+            mmax = @max(mmax, @abs(a - b));
+        }
+        std.debug.print("[tts-mel] cos={d:.6} maxabs={d:.6} n={d}\n", .{ mdot / (std.math.sqrt(mna) * std.math.sqrt(mnb)), mmax, mn });
+    }
+
+    const emb = try enc.embed(ref);
+    defer _ = mlx.mlx_array_free(emb);
+    _ = mlx.mlx_array_eval(emb);
+    const d = mlx.mlx_array_data_float32(emb) orelse return error.NoData;
+
+    const n = oracle.len; // enc_dim (1024)
+    var dot: f64 = 0;
+    var na: f64 = 0;
+    var nb: f64 = 0;
+    var maxabs: f64 = 0;
+    for (0..n) |i| {
+        const a: f64 = d[i];
+        const b: f64 = oracle[i];
+        dot += a * b;
+        na += a * a;
+        nb += b * b;
+        maxabs = @max(maxabs, @abs(a - b));
+    }
+    const cos = if (na > 0 and nb > 0) dot / (std.math.sqrt(na) * std.math.sqrt(nb)) else 0;
+    std.debug.print("[tts-spk] cos={d:.6} maxabs={d:.6} got_norm={d:.4} ref_norm={d:.4}\n", .{ cos, maxabs, std.math.sqrt(na), std.math.sqrt(nb) });
+    // cos > 0.998 is cloning-grade: speaker embeddings this aligned are the
+    // SAME voice (verification systems treat cos > ~0.7 as same speaker). The
+    // residual vs the reference is a deterministic ECAPA accumulation micro-
+    // difference (the mel input is f32-exact), not a structural error.
+    try std.testing.expect(cos > 0.998);
+}
+
 // End-to-end: text ids → talker+predictor → codec → WAV. Writes a real WAV for
 // audible verification and asserts it's non-silent with the right length.
 //   TTS_TEST_MODEL, TTS_INPUT_IDS, TTS_WAV_OUT (output path, optional)
@@ -1987,7 +2667,7 @@ test "end-to-end native TTS produces non-silent audio" {
     var dec = try loadCodecDecoder(io, allocator, s, model_dir);
     defer dec.deinit();
 
-    const codes = try m.generateCodes(ids, 256, null);
+    const codes = try m.generateCodes(ids, 256, null, null);
     defer allocator.free(codes);
     try std.testing.expect(codes.len > 8);
 
@@ -2041,7 +2721,7 @@ test "Synthesizer: native text to WAV" {
     std.debug.print("[tts-synth] built {d} ids (expected {d})\n", .{ ids.len, expected.len });
     try std.testing.expectEqualSlices(i32, &expected, ids);
 
-    const wav = try synth.synthesizeWav(text, 256, null);
+    const wav = try synth.synthesizeWav(text, 256, null, null);
     defer allocator.free(wav);
     try std.testing.expect(wav.len > 44 + 1000); // real audio, not just a header
     try std.testing.expectEqualSlices(u8, "RIFF", wav[0..4]);

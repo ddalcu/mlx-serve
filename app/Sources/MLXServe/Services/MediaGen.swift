@@ -271,10 +271,13 @@ struct VideoModelPreset: Identifiable, Hashable {
         let cap = 193
         return VideoModelPreset(
             id: "dgrauet/ltx-2.3-mlx-q4",
-            name: "LTX-Video 2.3 Q4 (with audio, ~41 GB)",
+            name: "LTX-Video 2.3 Q4 (with audio, ~26 GB)",
             repo: "dgrauet/ltx-2.3-mlx-q4",
-            approxDownloadGB: 41,
-            approxFirstRunDownloadGB: 49,    // + ~8 GB Gemma 3 12B 4-bit
+            // Bundle pulls ONLY the 3 safetensors the engine reads (~18 GB) —
+            // not the repo's ~50 GB of LoRAs/upscalers/alt transformers — plus
+            // the ~8 GB Gemma-3-12B text encoder.
+            approxDownloadGB: 18,
+            approxFirstRunDownloadGB: 26,
             approxRAMGB: 24,
             resolutions: ltxResolutions,
             defaultResolution: ltxResolutions[0],
@@ -296,19 +299,17 @@ struct VideoModelPreset: Identifiable, Hashable {
 
 // MARK: - Audio presets (TTS / voice cloning)
 
-/// A neural text-to-speech model served through the embedded `mlx-audio`
-/// library. Every preset here does **zero-shot voice cloning** — given a few
-/// seconds of reference audio (plus an optional transcript), it speaks the
-/// prompt text in that voice. The model is identified solely by its open
-/// `mlx-community` HuggingFace repo, which `mlx_audio.tts.generate_audio`
-/// downloads and loads on first use (no separate snapshot step).
+/// A neural text-to-speech model served by mlx-serve's NATIVE Qwen3-TTS engine
+/// (`src/tts.zig`). Only the `qwen3_tts` architecture is supported — the engine
+/// dispatches on `config.json`'s `model_type`, so non-Qwen3-TTS checkpoints
+/// (e.g. the old gpt2-based MOSS-TTS) can't load and aren't offered here.
 ///
 /// We deliberately don't surface the macOS system voices here — those live in
 /// Voice mode. This panel is neural-only.
 struct AudioModelPreset: Identifiable, Hashable {
     let id: String
     let name: String
-    /// Open `mlx-community` repo passed straight to `generate_audio(model:)`.
+    /// Open `mlx-community` Qwen3-TTS repo (downloaded via DownloadManager).
     let repo: String
     /// Rough on-disk weight size, GB (first-run download). Shown in the picker.
     let approxDownloadGB: Double
@@ -321,19 +322,7 @@ struct AudioModelPreset: Identifiable, Hashable {
     static func == (lhs: Self, rhs: Self) -> Bool { lhs.id == rhs.id }
     func hash(into hasher: inout Hasher) { hasher.combine(id) }
 
-    /// MOSS-TTS Nano — 100M params, the lightest cloning model in the catalog.
-    /// ~0.6 GB peak memory, real-time-plus on any Apple Silicon. Default.
-    static let mossNano = AudioModelPreset(
-        id: "mlx-audio/moss-tts-nano-100m",
-        name: "MOSS-TTS Nano 100M (fast, ~0.5 GB)",
-        repo: "mlx-community/MOSS-TTS-Nano-100M",
-        approxDownloadGB: 0.5,
-        approxRAMGB: 2,
-        recommendedRefSeconds: 6
-    )
-
-    /// Qwen3-TTS 0.6B (Base) — zero-shot cloning, a clear quality step up from
-    /// Nano while still light. Balanced default-plus.
+    /// Qwen3-TTS 0.6B (Base) — the lightest supported model. Default.
     static let qwen3TTS06B = AudioModelPreset(
         id: "mlx-audio/qwen3-tts-0.6b-base",
         name: "Qwen3-TTS 0.6B (balanced, ~1.5 GB)",
@@ -354,8 +343,9 @@ struct AudioModelPreset: Identifiable, Hashable {
         recommendedRefSeconds: 8
     )
 
-    /// Catalog ordered lightest → heaviest. Default (`first`) is MOSS-TTS Nano.
-    static let all: [AudioModelPreset] = [.mossNano, .qwen3TTS06B, .qwen3TTS17B]
+    /// Catalog ordered lightest → heaviest. Default (`first`) is Qwen3-TTS 0.6B.
+    /// Only `qwen3_tts` models — the native engine can't serve other TTS archs.
+    static let all: [AudioModelPreset] = [.qwen3TTS06B, .qwen3TTS17B]
 }
 
 // MARK: - Requests
@@ -369,6 +359,9 @@ struct ImageGenRequest {
     var height: Int
     var steps: Int
     var guidance: Double
+    /// Keep the model resident after this generation (default off → unload
+    /// when done, freeing GPU memory). On → instant reuse for the next gen.
+    var keepResident: Bool = false
 }
 
 struct VideoGenRequest {
@@ -386,6 +379,8 @@ struct VideoGenRequest {
     /// Optional first-frame image for image-to-video conditioning (2-stage
     /// pipelines only — the distilled 1-stage pipeline doesn't accept it).
     var firstFrameImagePath: String? = nil
+    /// Keep the model resident after this generation (default off → unload).
+    var keepResident: Bool = false
 }
 
 struct AudioGenRequest {
@@ -403,6 +398,8 @@ struct AudioGenRequest {
     var speed: Double = 1.0
     /// Sampling temperature — higher is more expressive/varied.
     var temperature: Double = 0.7
+    /// Keep the model resident after this generation (default off → unload).
+    var keepResident: Bool = false
 }
 
 // MARK: - RAM checks

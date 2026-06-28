@@ -10,6 +10,7 @@ import UniformTypeIdentifiers
 struct VideoGenView: View {
     @EnvironmentObject var service: VideoGenService
     @EnvironmentObject var server: ServerManager
+    @EnvironmentObject var downloads: DownloadManager
 
     @State private var prompt: String = ""
     @State private var showAdvanced: Bool = false
@@ -28,6 +29,8 @@ struct VideoGenView: View {
     @State private var ramWarningMessage: String = ""
     @State private var pendingRequest: VideoGenRequest? = nil
     @State private var player: AVPlayer?
+    /// Keep the model resident after generating (default off → unload).
+    @State private var keepResident: Bool = false
 
     var body: some View {
         readyView
@@ -68,7 +71,7 @@ struct VideoGenView: View {
         .alert("Model exceeds your Mac's RAM", isPresented: $showRAMWarning) {
             Button("Cancel", role: .cancel) { pendingRequest = nil }
             Button("Generate Anyway", role: .destructive) {
-                if let req = pendingRequest { service.generate(req) }
+                if let req = pendingRequest { service.generate(req, server: server) }
                 pendingRequest = nil
             }
         } message: {
@@ -356,6 +359,9 @@ struct VideoGenView: View {
                 numberField("Seed", value: $seed, step: 1)
                 Spacer()
             }
+            Toggle("Keep model loaded after generating", isOn: $keepResident)
+                .font(.caption)
+                .help("On: the model stays resident so the next generation is instant. Off (default): it's unloaded to free GPU memory.")
         }
     }
 
@@ -380,25 +386,30 @@ struct VideoGenView: View {
     }
 
     private var actionRow: some View {
-        HStack {
-            if service.isRunning {
-                Button(role: .destructive) {
-                    service.cancel()
-                } label: {
-                    Label("Cancel", systemImage: "stop.circle")
-                        .frame(maxWidth: .infinity)
+        VStack(spacing: 8) {
+            if !downloads.bundleReady(model.bundle) {
+                BundleDownloadBar(bundle: model.bundle)
+            }
+            HStack {
+                if service.isRunning {
+                    Button(role: .destructive) {
+                        service.cancel()
+                    } label: {
+                        Label("Cancel", systemImage: "stop.circle")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.bordered)
+                } else {
+                    Button {
+                        tryGenerate()
+                    } label: {
+                        Label("Generate", systemImage: "wand.and.stars")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .keyboardShortcut(.return, modifiers: [.command])
+                    .disabled(prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !downloads.bundleReady(model.bundle))
                 }
-                .buttonStyle(.bordered)
-            } else {
-                Button {
-                    tryGenerate()
-                } label: {
-                    Label("Generate", systemImage: "wand.and.stars")
-                        .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.borderedProminent)
-                .keyboardShortcut(.return, modifiers: [.command])
-                .disabled(prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
         }
     }
@@ -520,7 +531,8 @@ struct VideoGenView: View {
             steps: steps,
             cfgScale: cfgScale,
             stgScale: stgScale,
-            firstFrameImagePath: supportsI2V ? firstFrameImageURL?.path : nil
+            firstFrameImagePath: supportsI2V ? firstFrameImageURL?.path : nil,
+            keepResident: keepResident
         )
 
         let total = RAMChecker.totalGB
@@ -532,7 +544,7 @@ struct VideoGenView: View {
             return
         }
 
-        service.generate(req)
+        service.generate(req, server: server)
     }
 
     private func showLogWindow() {

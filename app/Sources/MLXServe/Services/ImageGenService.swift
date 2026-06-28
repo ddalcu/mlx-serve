@@ -23,6 +23,7 @@ final class ImageGenService: ObservableObject {
     @Published private(set) var log: [String] = []
 
     private var task: Task<Void, Never>?
+    private let api = APIClient()
 
     init() {
         loadRecent()
@@ -33,14 +34,16 @@ final class ImageGenService: ObservableObject {
         return false
     }
 
-    func generate(_ request: ImageGenRequest) {
+    /// Generate through the ONE main server: ensure it's running (headless if
+    /// needed), load the FLUX model on demand, stream `/v1/images/generations`,
+    /// then unload unless the user pinned "Keep loaded". Coexists with a chat
+    /// model on the same process.
+    func generate(_ request: ImageGenRequest, server: ServerManager) {
         guard !request.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             phase = .failed("Prompt is empty.")
             return
         }
-        // Native path: serve the FLUX model with a dedicated mlx-serve instance and
-        // POST /v1/images/generations. No Python.
-        guard let modelDir = NativeGenServer.resolveModelDir(repo: request.model.repo) else {
+        guard let modelDir = ServerManager.resolveModelDir(repo: request.model.repo) else {
             phase = .failed("Model \(request.model.repo) is not downloaded. Download it first.")
             return
         }
@@ -50,21 +53,28 @@ final class ImageGenService: ObservableObject {
         log = []
 
         let outputPath = Self.makeOutputPath(prompt: request.prompt)
-        let repo = request.model.repo
         let prompt = request.prompt
         let size = "\(request.width)x\(request.height)"
         let steps = request.steps
+        let keep = request.keepResident
 
         task = Task {
+            var loadedId: String? = nil
+            func releaseIfNeeded() async {
+                if !keep, let id = loadedId { try? await server.unloadModel(id: id) }
+            }
             do {
-                let port = try await NativeGenServer.shared.ensure(modelDir: modelDir)
+                let port = try await server.ensureRunning(forGenModelDir: modelDir)
                 if Task.isCancelled { phase = .idle; return }
+                let info = try await server.loadModel(id: modelDir)  // registry id = dir basename
+                loadedId = info.name
+                if Task.isCancelled { await releaseIfNeeded(); phase = .idle; return }
                 // SSE: per-step `progress` events drive a determinate bar, then a
                 // `complete` event carries the PNG.
                 var png: Data? = nil
-                for try await ev in NativeGenServer.shared.postStream(
-                    path: "/v1/images/generations",
-                    json: ["model": repo, "prompt": prompt, "size": size], port: port) {
+                for try await ev in api.streamGeneration(
+                    port: port, path: "/v1/images/generations",
+                    json: ["model": info.name, "prompt": prompt, "size": size]) {
                     switch ev["type"] as? String {
                     case "progress":
                         let step = ev["step"] as? Int ?? 0
@@ -74,12 +84,14 @@ final class ImageGenService: ObservableObject {
                     case "complete":
                         png = Self.decodePngB64(ev)
                     case "error":
+                        await releaseIfNeeded()
                         phase = .failed(ev["message"] as? String ?? "Generation failed.")
                         return
                     default:
                         break
                     }
                 }
+                await releaseIfNeeded()
                 guard let png else {
                     phase = .failed("Server returned no image data.")
                     return
@@ -88,8 +100,10 @@ final class ImageGenService: ObservableObject {
                 phase = .completed(path: outputPath)
                 insertRecent(outputPath)
             } catch is CancellationError {
+                await releaseIfNeeded()
                 phase = .idle
             } catch {
+                await releaseIfNeeded()
                 phase = .failed(error.localizedDescription)
             }
         }

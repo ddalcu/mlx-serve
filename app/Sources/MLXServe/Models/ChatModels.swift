@@ -630,6 +630,10 @@ let gemmaModelOptions: [GemmaModelOption] = [
     // 12B: dense — fits 16 GB+ Macs (4-bit) or 24 GB+ (8-bit).
     GemmaModelOption(id: "12b-4bit", displayName: "Gemma 4 12B (4-bit)", repoId: "mlx-community/gemma-4-12b-it-4bit", sizeEstimate: "~7.1 GB, needs 16 GB+ RAM"),
     GemmaModelOption(id: "12b-8bit", displayName: "Gemma 4 12B (8-bit)", repoId: "mlx-community/gemma-4-12b-it-8bit", sizeEstimate: "~12.8 GB, needs 24 GB+ RAM"),
+    // Gemma 3 12B (4-bit) — a capable chat model in its own right, AND the text
+    // encoder LTX-Video uses. Downloading the LTX bundle pulls this; it also
+    // shows here so it can be picked as a standalone chat model.
+    GemmaModelOption(id: "gemma3-12b-4bit", displayName: "Gemma 3 12B (4-bit)", repoId: "mlx-community/gemma-3-12b-it-4bit", sizeEstimate: "~7.1 GB, needs 16 GB+ RAM — also the LTX-Video text encoder"),
     // 26B-A4B: 25.2B MoE, only 3.8B active per token — fits 24 GB+ Macs (4-bit) or 36 GB+ (8-bit)
     GemmaModelOption(id: "26b-a4b-4bit", displayName: "Gemma 4 26B-A4B (4-bit)", repoId: "mlx-community/gemma-4-26b-a4b-it-4bit", sizeEstimate: "~15.6 GB, needs 24 GB+ RAM"),
     GemmaModelOption(id: "26b-a4b-8bit", displayName: "Gemma 4 26B-A4B (8-bit)", repoId: "mlx-community/gemma-4-26b-a4b-it-8bit", sizeEstimate: "~28 GB, needs 36 GB+ RAM"),

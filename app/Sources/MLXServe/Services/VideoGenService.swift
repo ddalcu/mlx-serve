@@ -24,6 +24,7 @@ final class VideoGenService: ObservableObject {
     @Published private(set) var log: [String] = []
 
     private var task: Task<Void, Never>?
+    private let api = APIClient()
 
     init() {
         loadRecent()
@@ -34,12 +35,15 @@ final class VideoGenService: ObservableObject {
         return false
     }
 
-    func generate(_ request: VideoGenRequest) {
+    /// Generate through the ONE main server: ensure running (headless if
+    /// needed), load the LTX model on demand, stream `/v1/video/generations`,
+    /// mux the returned frames to mp4, then unload unless "Keep loaded" is set.
+    func generate(_ request: VideoGenRequest, server: ServerManager) {
         guard !request.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             phase = .failed("Prompt is empty.")
             return
         }
-        guard let modelDir = NativeGenServer.resolveModelDir(repo: request.model.repo) else {
+        guard let modelDir = ServerManager.resolveModelDir(repo: request.model.repo) else {
             phase = .failed("Model \(request.model.repo) is not downloaded. Download it first.")
             return
         }
@@ -49,29 +53,35 @@ final class VideoGenService: ObservableObject {
         log = []
 
         let outputPath = Self.makeOutputPath(prompt: request.prompt)
-        let repo = request.model.repo
         let prompt = request.prompt
         let fps = request.fps
-        let body: [String: Any] = [
-            "model": repo,
-            "prompt": prompt,
-            "num_frames": request.numFrames,
-            "height": request.height,
-            "width": request.width,
-            "steps": request.steps,
-            "seed": request.seed,
-        ]
-
+        let numFrames = request.numFrames
+        let height = request.height
+        let width = request.width
+        let seed = request.seed
         let steps = request.steps
+        let keep = request.keepResident
+
         task = Task {
+            var loadedId: String? = nil
+            func releaseIfNeeded() async {
+                if !keep, let id = loadedId { try? await server.unloadModel(id: id) }
+            }
             do {
-                let port = try await NativeGenServer.shared.ensure(modelDir: modelDir)
+                let port = try await server.ensureRunning(forGenModelDir: modelDir)
                 if Task.isCancelled { phase = .idle; return }
+                let info = try await server.loadModel(id: modelDir)
+                loadedId = info.name
+                if Task.isCancelled { await releaseIfNeeded(); phase = .idle; return }
+                let body: [String: Any] = [
+                    "model": info.name, "prompt": prompt, "num_frames": numFrames,
+                    "height": height, "width": width, "steps": steps, "seed": seed,
+                ]
                 // SSE: the server pushes `progress` events per denoise step, then a
                 // `complete` event with the frames. Drive a determinate bar from them.
                 var decoded: DecodedFrames? = nil
-                for try await ev in NativeGenServer.shared.postStream(
-                    path: "/v1/video/generations", json: body, port: port) {
+                for try await ev in api.streamGeneration(
+                    port: port, path: "/v1/video/generations", json: body) {
                     switch ev["type"] as? String {
                     case "progress":
                         let step = ev["step"] as? Int ?? 0
@@ -81,12 +91,14 @@ final class VideoGenService: ObservableObject {
                     case "complete":
                         decoded = Self.decodeFrames(ev)
                     case "error":
+                        await releaseIfNeeded()
                         phase = .failed(ev["message"] as? String ?? "Generation failed.")
                         return
                     default:
                         break
                     }
                 }
+                await releaseIfNeeded()
                 guard let frames = decoded else {
                     phase = .failed("Server returned no video frames.")
                     return
@@ -103,8 +115,10 @@ final class VideoGenService: ObservableObject {
                 phase = .completed(path: outputPath)
                 insertRecent(outputPath)
             } catch is CancellationError {
+                await releaseIfNeeded()
                 phase = .idle
             } catch {
+                await releaseIfNeeded()
                 phase = .failed(error.localizedDescription)
             }
         }

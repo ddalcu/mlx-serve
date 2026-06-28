@@ -10,11 +10,12 @@ import UniformTypeIdentifiers
 struct AudioGenView: View {
     @EnvironmentObject var service: AudioGenService
     @EnvironmentObject var server: ServerManager
+    @EnvironmentObject var downloads: DownloadManager
 
     @StateObject private var recorder = AudioRecorder()
 
     @State private var text: String = ""
-    @State private var model: AudioModelPreset = .mossNano
+    @State private var model: AudioModelPreset = .qwen3TTS06B
     @State private var refAudioURL: URL? = nil
     @State private var refText: String = ""
     @State private var speed: Double = 1.0
@@ -26,6 +27,8 @@ struct AudioGenView: View {
     @State private var ramWarningMessage: String = ""
     @State private var pendingRequest: AudioGenRequest? = nil
     @State private var player: AVPlayer?
+    /// Keep the model resident after generating (default off → unload).
+    @State private var keepResident: Bool = false
 
     var body: some View {
         readyView
@@ -62,7 +65,7 @@ struct AudioGenView: View {
         .alert("Model exceeds your Mac's RAM", isPresented: $showRAMWarning) {
             Button("Cancel", role: .cancel) { pendingRequest = nil }
             Button("Generate Anyway", role: .destructive) {
-                if let req = pendingRequest { service.generate(req) }
+                if let req = pendingRequest { service.generate(req, server: server) }
                 pendingRequest = nil
             }
         } message: {
@@ -151,7 +154,7 @@ struct AudioGenView: View {
                 VStack(alignment: .leading, spacing: 4) {
                     Text("Transcript of reference (optional)").font(.caption)
                     TextField("", text: $refText,
-                              prompt: Text("Leave empty to auto-transcribe (slower, downloads Whisper)"))
+                              prompt: Text("Optional — the reference audio alone clones the voice"))
                         .textFieldStyle(.roundedBorder)
                         .font(.caption)
                 }
@@ -193,23 +196,31 @@ struct AudioGenView: View {
                 Slider(value: $temperature, in: 0.1...1.5, step: 0.05)
                 Text("Higher = more expressive and varied.").font(.caption2).foregroundStyle(.secondary)
             }
+            Toggle("Keep model loaded after generating", isOn: $keepResident)
+                .font(.caption)
+                .help("On: the model stays resident so the next generation is instant. Off (default): it's unloaded to free GPU memory.")
         }
     }
 
     private var actionRow: some View {
-        HStack {
-            if service.isRunning {
-                Button(role: .destructive) { service.cancel() } label: {
-                    Label("Cancel", systemImage: "stop.circle").frame(maxWidth: .infinity)
+        VStack(spacing: 8) {
+            if !downloads.bundleReady(model.bundle) {
+                BundleDownloadBar(bundle: model.bundle)
+            }
+            HStack {
+                if service.isRunning {
+                    Button(role: .destructive) { service.cancel() } label: {
+                        Label("Cancel", systemImage: "stop.circle").frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.bordered)
+                } else {
+                    Button { tryGenerate() } label: {
+                        Label("Generate", systemImage: "waveform").frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .keyboardShortcut(.return, modifiers: [.command])
+                    .disabled(text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !downloads.bundleReady(model.bundle))
                 }
-                .buttonStyle(.bordered)
-            } else {
-                Button { tryGenerate() } label: {
-                    Label("Generate", systemImage: "waveform").frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.borderedProminent)
-                .keyboardShortcut(.return, modifiers: [.command])
-                .disabled(text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
         }
     }
@@ -351,7 +362,8 @@ struct AudioGenView: View {
             refAudioPath: refAudioURL?.path,
             refText: refText,
             speed: speed,
-            temperature: temperature
+            temperature: temperature,
+            keepResident: keepResident
         )
         let total = RAMChecker.totalGB
         let needed = model.approxRAMGB
@@ -361,7 +373,7 @@ struct AudioGenView: View {
             showRAMWarning = true
             return
         }
-        service.generate(req)
+        service.generate(req, server: server)
     }
 
     private func showLogWindow() {

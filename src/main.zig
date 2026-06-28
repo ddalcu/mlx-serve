@@ -17,9 +17,7 @@ const vision_mod = @import("vision.zig");
 const ds4_arch = @import("arch/ds4.zig");
 const llama_arch = @import("arch/llama.zig");
 const ds4_ffi = @import("ds4_ffi.zig");
-const tts_server = @import("tts_server.zig");
-const flux_server = @import("flux_server.zig");
-const ltx_server = @import("ltx_server.zig");
+const gen_mod = @import("gen.zig");
 const log = @import("log.zig");
 
 pub const VERSION: []const u8 = build_options.version;
@@ -462,11 +460,11 @@ pub fn main(init: std.process.Init) !void {
                     log.info("  - {s}\n", .{m.id});
                 }
             }
-            // If --model wasn't passed, pick the first discovered as the loaded one.
-            if (model_dir.len == 0 and d.models.len > 0) {
-                model_dir = d.models[0].path;
-                log.info("Auto-selected --model {s} (first discovered)\n", .{d.models[0].id});
-            }
+            // No auto-select: when `--model` is omitted but `--model-dir` is
+            // present, the server starts HEADLESS (no primary model). All
+            // discovered models are registered as stubs and load on demand via
+            // `/v1/load-model` — chat OR media. The headless branch in the
+            // serve block below handles this.
         }
     }
     // In serve mode, check if the port is already in use before loading the model
@@ -564,29 +562,29 @@ pub fn main(init: std.process.Init) !void {
     // Seed MLX RNG with current wall-clock time for non-deterministic sampling
     _ = mlx.mlx_random_seed(@intCast(std.Io.Timestamp.now(io, .real).toMilliseconds()));
 
-    // Native Qwen3-TTS: a serial request→file engine (like the embedded GGUF
-    // engines) that bypasses the MLX transformer scheduler entirely. Peek
-    // model_type from config.json BEFORE the transformer-shaped parseConfig and
-    // route to the dedicated TTS serve loop.
-    if (serve_mode and isTtsModel(io, allocator, model_dir)) {
-        try tts_server.runTtsServe(io, allocator, model_dir, host, port);
-        return;
-    }
+    if (serve_mode) {
+        // Headless boot: `--model-dir` given, no `--model`. Start with no
+        // primary model; everything (chat + media) loads on demand through the
+        // registry. The app uses this so a single server hosts chat + image +
+        // audio + video, coexisting under one memory budget.
+        if (model_dir.len == 0) {
+            const discovery_for_registry = discovery_storage;
+            discovery_storage = null; // ownership moves to the registry
+            try runHeadlessServe(io, allocator, discovery_for_registry, host, port, ctx_size, timeout, reasoning_budget, max_resident_models, max_resident_mem, max_resident_mem_explicit, idle_evict_secs);
+            return;
+        }
 
-    // Native FLUX.2 image generation: same self-contained serve path (mflux
-    // checkpoints store model_type "flux2-..." with transformer/vae/text_encoder
-    // subdirs). Peek before the transformer parseConfig and route to the FLUX loop.
-    if (serve_mode and isFluxModel(io, allocator, model_dir)) {
-        try flux_server.runFluxServe(io, allocator, model_dir, host, port);
-        return;
-    }
-
-    // Native LTX-Video 2.3 text-to-video: same self-contained serve path. LTX
-    // checkpoints store model_type "AudioVideo" with transformer-dev/connector/
-    // vae_decoder safetensors. Peek before the transformer parseConfig and route.
-    if (serve_mode and isLtxModel(io, allocator, model_dir)) {
-        try ltx_server.runLtxServe(io, allocator, model_dir, host, port);
-        return;
+        // Native media generation (image FLUX / audio Qwen3-TTS / video LTX):
+        // these bypass the MLX transformer but are now hosted by the ONE main
+        // server via the registry (modality engine on the LoadedModel). Peek
+        // model_type from config.json BEFORE the transformer-shaped parseConfig
+        // and route the primary model through the media serve path.
+        if (gen_mod.detectModality(io, allocator, model_dir)) |modality| {
+            const discovery_for_registry = discovery_storage;
+            discovery_storage = null; // ownership moves to the registry
+            try runGenServe(io, allocator, model_dir, modality, discovery_for_registry, host, port, ctx_size, timeout, reasoning_budget, max_resident_models, max_resident_mem, max_resident_mem_explicit, idle_evict_secs);
+            return;
+        }
     }
 
     // Parse config — heap allocate so the LoadedModel can take ownership
@@ -937,68 +935,13 @@ fn portInUse(io: std.Io, port: u16) bool {
 /// sidecars are NOT counted — a directory containing only an mmproj file
 /// is not a valid LLM path (`isMmprojGgufBasename` lives next to
 /// `isDs4GgufBasename` in `model_discovery.zig`).
-/// True if `model_dir/config.json` declares `model_type == "qwen3_tts"` — the
-/// native TTS engine. Cheap peek (reads config.json, looks for the model_type
-/// string) so we can route before the transformer-shaped parseConfig.
-fn isTtsModel(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) bool {
-    const path = std.fmt.allocPrint(allocator, "{s}/config.json", .{model_dir}) catch return false;
-    defer allocator.free(path);
-    const file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return false;
-    defer file.close(io);
-    var rb: [4096]u8 = undefined;
-    var rs = file.reader(io, &rb);
-    const content = rs.interface.allocRemaining(allocator, .limited(4 * 1024 * 1024)) catch return false;
-    defer allocator.free(content);
-    var parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch return false;
-    defer parsed.deinit();
-    if (parsed.value != .object) return false;
-    const mt = parsed.value.object.get("model_type") orelse return false;
-    return mt == .string and std.mem.eql(u8, mt.string, "qwen3_tts");
-}
-
-fn isFluxModel(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) bool {
-    const path = std.fmt.allocPrint(allocator, "{s}/config.json", .{model_dir}) catch return false;
-    defer allocator.free(path);
-    const file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return false;
-    defer file.close(io);
-    var rb: [4096]u8 = undefined;
-    var rs = file.reader(io, &rb);
-    const content = rs.interface.allocRemaining(allocator, .limited(4 * 1024 * 1024)) catch return false;
-    defer allocator.free(content);
-    var parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch return false;
-    defer parsed.deinit();
-    if (parsed.value != .object) return false;
-    const mt = parsed.value.object.get("model_type") orelse return false;
-    // mflux FLUX.2 checkpoints: model_type "flux2-klein-4b" / "flux2-klein-9b" etc.
-    return mt == .string and std.mem.startsWith(u8, mt.string, "flux2");
-}
-
-/// True if `model_dir/config.json` declares `model_type == "AudioVideo"` (the
-/// LTX-Video 2.3 native engine) AND the connector + dev transformer are present.
-fn isLtxModel(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) bool {
-    const path = std.fmt.allocPrint(allocator, "{s}/config.json", .{model_dir}) catch return false;
-    defer allocator.free(path);
-    const file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return false;
-    defer file.close(io);
-    var rb: [4096]u8 = undefined;
-    var rs = file.reader(io, &rb);
-    const content = rs.interface.allocRemaining(allocator, .limited(4 * 1024 * 1024)) catch return false;
-    defer allocator.free(content);
-    var parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch return false;
-    defer parsed.deinit();
-    if (parsed.value != .object) return false;
-    const mt = parsed.value.object.get("model_type") orelse return false;
-    if (!(mt == .string and std.mem.eql(u8, mt.string, "AudioVideo"))) return false;
-    // Require the connector — distinguishes the LTX bundle from any other
-    // "AudioVideo" config and ensures the text path can load.
-    const conn = std.fmt.allocPrint(allocator, "{s}/connector.safetensors", .{model_dir}) catch return false;
-    defer allocator.free(conn);
-    const cf = std.Io.Dir.openFileAbsolute(io, conn, .{}) catch return false;
-    cf.close(io);
-    return true;
-}
 
 fn isGgufPath(io: std.Io, path: []const u8) bool {
+    // Empty / non-absolute path (e.g. headless boot with no --model): not a
+    // GGUF. Guard before `openDirAbsolute`, which ASSERTS the path is absolute
+    // (`unreachable` on "") — in ReleaseFast that's UB that miscompiles the
+    // caller (the headless branch below was silently eliminated until this).
+    if (path.len == 0 or !std.fs.path.isAbsolute(path)) return false;
     // For a direct .gguf file path: always route to the llama branch so
     // `resolveGgufFile` can emit a precise error if it's actually an
     // mmproj sidecar. Falling through to the MLX path on a mmproj.gguf
@@ -1210,6 +1153,212 @@ fn runDs4Offline(
     try out_w.writeAll("\n");
     try out_w.flush();
     log.info("[ds4] generated {d} tokens (max={d})\n", .{ generated, max_tokens });
+}
+
+/// Registry resident-memory cap: the user's explicit value, or 80% of mlx's
+/// wired limit at startup (mirrors the MLX serve block). 0 = query failed →
+/// unlimited (the count cap still applies).
+fn autoResidentMemBytes(explicit: bool, val: u64) u64 {
+    if (explicit) return val;
+    var dev = mlx.mlx_device{ .ctx = null };
+    _ = mlx.mlx_get_default_device(&dev);
+    var info = mlx.mlx_device_info_new();
+    defer _ = mlx.mlx_device_info_free(info);
+    if (mlx.mlx_device_info_get(&info, dev) != 0) return 0;
+    var max_rec: usize = 0;
+    if (mlx.mlx_device_info_get_size(&max_rec, info, "max_recommended_working_set_size") != 0 or max_rec == 0) return 0;
+    return @as(u64, max_rec) * 4 / 5;
+}
+
+fn dirBasename(path: []const u8) []const u8 {
+    var p = path;
+    while (p.len > 0 and p[p.len - 1] == '/') p = p[0 .. p.len - 1];
+    if (p.len == 0) return p;
+    if (std.mem.lastIndexOfScalar(u8, p, '/')) |i| return p[i + 1 ..];
+    return p;
+}
+
+/// Native media-generation serve mode (image / audio / video) with the media
+/// model as the PRIMARY (default) model. Builds a modality stub
+/// (config/tok/chat_config) and hands it to `Scheduler.init`; the gen load arm
+/// dispatches off the stub config's media `model_type` and opens the modality
+/// engine on the inference thread. Coexists with on-demand chat/media loads via
+/// the registry (`discovery`). Mirrors `runDs4Serve`.
+fn runGenServe(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    model_dir: []const u8,
+    modality: gen_mod.Modality,
+    discovery: ?model_discovery.DiscoveryResult,
+    host: []const u8,
+    port: u16,
+    ctx_size: u32,
+    timeout: u32,
+    reasoning_budget: i32,
+    max_resident_models: u32,
+    max_resident_mem: u64,
+    max_resident_mem_explicit: bool,
+    idle_evict_secs: ?u32,
+) !void {
+    log.info("mlx-serve {s} (native {s} engine)\n", .{ VERSION, @tagName(modality) });
+    log.info("[args] model: {s}\n", .{model_dir});
+    log.info("[args] serve: {s}:{d}\n", .{ host, port });
+
+    var stub = try gen_mod.buildStubCpuState(allocator, modality);
+    var config_owned_by_registry = false;
+    errdefer if (!config_owned_by_registry) gen_mod.freeStubCpuState(allocator, &stub);
+
+    const model_id = dirBasename(model_dir);
+
+    const effective_max_resident_mem = autoResidentMemBytes(max_resident_mem_explicit, max_resident_mem);
+    if (effective_max_resident_mem > 0) {
+        log.info("[registry] max_resident_models={d}, max_resident_mem={d:.1} GB\n", .{ max_resident_models, @as(f64, @floatFromInt(effective_max_resident_mem)) / 1_073_741_824.0 });
+    } else {
+        log.info("[registry] max_resident_models={d}, max_resident_mem=unlimited\n", .{max_resident_models});
+    }
+
+    const registry = try model_registry_mod.ModelRegistry.init(allocator, io, discovery, max_resident_models, effective_max_resident_mem, idle_evict_secs);
+    defer registry.deinit();
+
+    const entry = if (registry.peek(model_id)) |e| e else try registry.registerStubWithArch(model_id, model_dir, null, modality.modelType());
+    try registry.setDefault(model_id);
+
+    // Registry takes ownership of the stub if the inference thread installed it.
+    defer if (entry.config != null) {
+        config_owned_by_registry = true;
+    };
+
+    const params = scheduler_mod.LoadParams{
+        .registry = registry,
+        .entry = entry,
+        .config = stub.config,
+        .tok = stub.tok,
+        .chat_config = stub.chat_config,
+        .model_dir = model_dir,
+        .load_vision = false,
+        .warmup_eager = false,
+        .draft_block_size = 0,
+        .draft_block_size_explicit = false,
+        .kv_quant_config = transformer_mod.KVQuantConfig.dense,
+        .prefix_cache_capacity = 0,
+        .prefix_cache_mem_bytes = 0,
+        .tokenize_cache_entries = 0,
+    };
+
+    try server_mod.serve(io, allocator, params, stub.config, host, port, .{
+        .max_context_size = ctx_size,
+        .request_timeout_sec = timeout,
+        .default_reasoning_budget = reasoning_budget,
+        .default_temperature = null,
+        .default_top_p = null,
+        .default_top_k = null,
+        .default_enable_pld = false,
+        .default_pld_draft_len = 5,
+        .default_pld_key_len = 3,
+        .default_kv_attn_fused = false,
+    });
+}
+
+/// Headless serve mode: start with NO primary model. The registry holds all
+/// discovery stubs; chat AND media models load on demand via `/v1/load-model`
+/// (or a request targeting a discovered id), coexisting under one memory
+/// budget. The scheduler's borrowed-view fields are seeded from a throwaway
+/// stub that's never installed on an entry (`no_initial_load`).
+fn runHeadlessServe(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    discovery: ?model_discovery.DiscoveryResult,
+    host: []const u8,
+    port: u16,
+    ctx_size: u32,
+    timeout: u32,
+    reasoning_budget: i32,
+    max_resident_models: u32,
+    max_resident_mem: u64,
+    max_resident_mem_explicit: bool,
+    idle_evict_secs: ?u32,
+) !void {
+    log.info("mlx-serve {s} (headless — models load on demand)\n", .{VERSION});
+    log.info("[args] serve: {s}:{d}\n", .{ host, port });
+
+    var stub = try gen_mod.buildStubCpuState(allocator, .image);
+    defer gen_mod.freeStubCpuState(allocator, &stub);
+
+    const effective_max_resident_mem = autoResidentMemBytes(max_resident_mem_explicit, max_resident_mem);
+    if (effective_max_resident_mem > 0) {
+        log.info("[registry] max_resident_models={d}, max_resident_mem={d:.1} GB\n", .{ max_resident_models, @as(f64, @floatFromInt(effective_max_resident_mem)) / 1_073_741_824.0 });
+    } else {
+        log.info("[registry] max_resident_models={d}, max_resident_mem=unlimited\n", .{max_resident_models});
+    }
+
+    const registry = try model_registry_mod.ModelRegistry.init(allocator, io, discovery, max_resident_models, effective_max_resident_mem, idle_evict_secs);
+    defer registry.deinit();
+
+    // Carrier entry for LoadParams (required field), never loaded here
+    // (`no_initial_load`). Prefer a discovered stub (so it's listed in
+    // /v1/models); else a throwaway placeholder — headless is valid with empty
+    // discovery because the app loads media/chat models by ABSOLUTE PATH via
+    // /v1/load-model (registerByPath), regardless of what --model-dir scans.
+    // No default is set, so a request that omits `model` gets a clean 503
+    // until a model is loaded.
+    var placeholder = model_registry_mod.LoadedModel{
+        .allocator = allocator,
+        .id = "",
+        .path = "",
+        .bytes_on_disk = null,
+        .arch_hint = "",
+        .config = null,
+        .weights = null,
+        .transformer = null,
+        .tokenizer = null,
+        .chat_config = null,
+        .vision_encoder = null,
+        .drafter = null,
+        .drafter_path = "",
+        .drafter_block_size = 0,
+        .prefix_cache = null,
+        .refcount = std.atomic.Value(u32).init(0),
+        .last_used_ns = 0,
+        .bytes_resident = 0,
+        .state = .unloaded,
+        .error_name = null,
+    };
+    const carrier: *model_registry_mod.LoadedModel = blk: {
+        var it = registry.entries.valueIterator();
+        if (it.next()) |e| break :blk e.*;
+        log.info("Headless: no models under --model-dir; load by path via /v1/load-model.\n", .{});
+        break :blk &placeholder;
+    };
+
+    const params = scheduler_mod.LoadParams{
+        .registry = registry,
+        .entry = carrier,
+        .config = stub.config,
+        .tok = stub.tok,
+        .chat_config = stub.chat_config,
+        .model_dir = "",
+        .no_initial_load = true,
+        .load_vision = false,
+        .warmup_eager = false,
+        .draft_block_size = 0,
+        .kv_quant_config = transformer_mod.KVQuantConfig.dense,
+        .prefix_cache_capacity = 0,
+        .prefix_cache_mem_bytes = 0,
+        .tokenize_cache_entries = 0,
+    };
+
+    try server_mod.serve(io, allocator, params, stub.config, host, port, .{
+        .max_context_size = ctx_size,
+        .request_timeout_sec = timeout,
+        .default_reasoning_budget = reasoning_budget,
+        .default_temperature = null,
+        .default_top_p = null,
+        .default_top_k = null,
+        .default_enable_pld = false,
+        .default_pld_draft_len = 5,
+        .default_pld_key_len = 3,
+        .default_kv_attn_fused = false,
+    });
 }
 
 /// ds4 serve mode. Builds a stub LoadedModel + ModelConfig + ChatConfig

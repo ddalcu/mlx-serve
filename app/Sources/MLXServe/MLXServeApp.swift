@@ -144,6 +144,8 @@ struct MLXCoreApp: App {
             ImageGenView()
                 .environmentObject(appState.imageGen)
                 .environmentObject(appState.server)
+                .environmentObject(appState.downloads)
+                .environmentObject(appState)
         }
         .defaultSize(width: 960, height: 700)
 
@@ -151,6 +153,8 @@ struct MLXCoreApp: App {
             VideoGenView()
                 .environmentObject(appState.videoGen)
                 .environmentObject(appState.server)
+                .environmentObject(appState.downloads)
+                .environmentObject(appState)
         }
         .defaultSize(width: 960, height: 700)
 
@@ -158,6 +162,8 @@ struct MLXCoreApp: App {
             AudioGenView()
                 .environmentObject(appState.audioGen)
                 .environmentObject(appState.server)
+                .environmentObject(appState.downloads)
+                .environmentObject(appState)
         }
         .defaultSize(width: 900, height: 660)
 

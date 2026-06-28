@@ -28,6 +28,7 @@ const tokenize_cache_mod = @import("tokenize_cache.zig");
 const model_discovery = @import("model_discovery.zig");
 const arch_ds4 = @import("arch/ds4.zig");
 const arch_llama = @import("arch/llama.zig");
+const gen_mod = @import("gen.zig");
 const log = @import("log.zig");
 
 const Transformer = transformer_mod.Transformer;
@@ -160,6 +161,21 @@ pub const LoadedModel = struct {
     /// fields and `ds4_engine` (set for every `.gguf` except DeepSeek-V4-Flash).
     llama_engine: ?*arch_llama.LlamaEngine = null,
 
+    /// Native media-generation engines, named by MODALITY (not by the FLUX/
+    /// Qwen3-TTS/LTX implementations, which are swappable internals). When one
+    /// is non-null the entry is a media model: the MLX/ds4/llama fields stay
+    /// null and the server routes the matching gen endpoint through this slot.
+    /// Mutually exclusive with each other and with the LM engine fields. Freed
+    /// FIRST in deinit/unloadResident (they own the bulk of the GPU memory).
+    image_engine: ?*gen_mod.ImageEngine = null,
+    audio_engine: ?*gen_mod.AudioEngine = null,
+    video_engine: ?*gen_mod.VideoEngine = null,
+    /// Model-wide serialization gate for media generation — mirrors
+    /// `llama_session_busy`. A gen runs to completion on the inference thread
+    /// (the sole mlx caller), so gen-vs-gen is already serial; this flag makes
+    /// the in-flight state visible (set around the gen job).
+    gen_busy: bool = false,
+
     /// Persistent llama.cpp sessions (Iteration 3-5 / Phase 5 #1): one or
     /// more KV contexts, picked by best prompt-prefix match in
     /// `runPrefillLlama`. With `--llama-cache-entries 1` (default for
@@ -235,6 +251,19 @@ pub const LoadedModel = struct {
             engine.close();
             self.llama_engine = null;
         }
+        if (self.image_engine) |e| {
+            e.deinit();
+            self.image_engine = null;
+        }
+        if (self.audio_engine) |e| {
+            e.deinit();
+            self.audio_engine = null;
+        }
+        if (self.video_engine) |e| {
+            e.deinit();
+            self.video_engine = null;
+        }
+        self.gen_busy = false;
         if (self.mtp) |h| {
             h.deinit();
             self.allocator.destroy(h);
@@ -310,6 +339,19 @@ pub const LoadedModel = struct {
             engine.close();
             self.llama_engine = null;
         }
+        if (self.image_engine) |e| {
+            e.deinit();
+            self.image_engine = null;
+        }
+        if (self.audio_engine) |e| {
+            e.deinit();
+            self.audio_engine = null;
+        }
+        if (self.video_engine) |e| {
+            e.deinit();
+            self.video_engine = null;
+        }
+        self.gen_busy = false;
         if (self.mtp) |h| {
             h.deinit();
             self.allocator.destroy(h);

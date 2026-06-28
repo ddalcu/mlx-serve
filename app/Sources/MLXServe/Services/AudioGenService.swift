@@ -25,6 +25,7 @@ final class AudioGenService: ObservableObject {
     @Published private(set) var log: [String] = []
 
     private var task: Task<Void, Never>?
+    private let api = APIClient()
 
     init() {
         loadRecent()
@@ -35,14 +36,15 @@ final class AudioGenService: ObservableObject {
         return false
     }
 
-    func generate(_ request: AudioGenRequest) {
+    /// Synthesize through the ONE main server: ensure running (headless if
+    /// needed), load the TTS model on demand, stream `/v1/audio/speech`, then
+    /// unload unless "Keep loaded" is set.
+    func generate(_ request: AudioGenRequest, server: ServerManager) {
         guard !request.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             phase = .failed("Text is empty.")
             return
         }
-        // Native path: serve the TTS model with a dedicated mlx-serve instance and
-        // POST /v1/audio/speech. No Python.
-        guard let modelDir = NativeGenServer.resolveModelDir(repo: request.model.repo) else {
+        guard let modelDir = ServerManager.resolveModelDir(repo: request.model.repo) else {
             phase = .failed("Model \(request.model.repo) is not downloaded. Download it first.")
             return
         }
@@ -52,20 +54,36 @@ final class AudioGenService: ObservableObject {
         log = []
 
         let outputPath = Self.makeOutputPath(text: request.text)
-        let repo = request.model.repo
         let text = request.text
+        let keep = request.keepResident
+        // Reference voice for zero-shot cloning: the recorded/picked clip is
+        // already normalized to 24 kHz mono WAV by AudioReference. Send it
+        // base64 as `ref_audio`; the server runs it through the ECAPA-TDNN
+        // speaker encoder and conditions the talker on it.
+        let refB64: String? = request.refAudioPath.flatMap { path in
+            (try? Data(contentsOf: URL(fileURLWithPath: path)))?.base64EncodedString()
+        }
 
         task = Task {
+            var loadedId: String? = nil
+            func releaseIfNeeded() async {
+                if !keep, let id = loadedId { try? await server.unloadModel(id: id) }
+            }
             do {
-                let port = try await NativeGenServer.shared.ensure(modelDir: modelDir)
+                let port = try await server.ensureRunning(forGenModelDir: modelDir)
                 if Task.isCancelled { phase = .idle; return }
+                let info = try await server.loadModel(id: modelDir)
+                loadedId = info.name
+                if Task.isCancelled { await releaseIfNeeded(); phase = .idle; return }
                 // SSE: audio length is model-determined, so `progress` events carry
                 // a growing frame count (total=0 → indeterminate bar); the
                 // `complete` event carries the WAV as base64.
                 var wav: Data? = nil
-                for try await ev in NativeGenServer.shared.postStream(
-                    path: "/v1/audio/speech",
-                    json: ["model": repo, "input": text], port: port) {
+                var reqJson: [String: Any] = ["model": info.name, "input": text]
+                if let refB64 { reqJson["ref_audio"] = refB64 }
+                for try await ev in api.streamGeneration(
+                    port: port, path: "/v1/audio/speech",
+                    json: reqJson) {
                     switch ev["type"] as? String {
                     case "progress":
                         let step = ev["step"] as? Int ?? 0
@@ -79,12 +97,14 @@ final class AudioGenService: ObservableObject {
                     case "complete":
                         if let b64 = ev["data"] as? String { wav = Data(base64Encoded: b64) }
                     case "error":
+                        await releaseIfNeeded()
                         phase = .failed(ev["message"] as? String ?? "Synthesis failed.")
                         return
                     default:
                         break
                     }
                 }
+                await releaseIfNeeded()
                 guard let wav, wav.count > 44 else {
                     phase = .failed("Server returned an empty audio response.")
                     return
@@ -93,8 +113,10 @@ final class AudioGenService: ObservableObject {
                 phase = .completed(path: outputPath)
                 insertRecent(outputPath)
             } catch is CancellationError {
+                await releaseIfNeeded()
                 phase = .idle
             } catch {
+                await releaseIfNeeded()
                 phase = .failed(error.localizedDescription)
             }
         }
