@@ -33,6 +33,7 @@
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const log = @import("log.zig");
+const model_mod = @import("model.zig");
 
 const S = mlx.mlx_stream;
 
@@ -914,6 +915,292 @@ pub fn connectorTransform(comp: *const Component, allocator: std.mem.Allocator, 
     return outn;
 }
 
+// ════════════════════════════════════════════════════════════════════════
+// Gemma-3-12B 49-layer hidden-state capture — the text encoder for the DiT
+// conditioning (feeds connectorProject). Reproduces the reference
+// get_all_hidden_states: state 0 = embed(ids)*sqrt(3840); states 1..48 = each
+// decoder-layer residual output, with NO final model.norm. The reference passes
+// ONE combined causal+pad mask to every layer, so no sliding-window masking
+// applies — sliding vs full layers differ ONLY in the RoPE base (local 1e4 /
+// global 1e6, full when (i+1)%6==0). Weights q4 g64; key prefix
+// `language_model.model.*`.
+// ════════════════════════════════════════════════════════════════════════
+
+const GemmaCfg = struct {
+    hidden: u32 = 3840,
+    layers: u32 = 48,
+    n_heads: u32 = 16,
+    n_kv: u32 = 8,
+    head_dim: u32 = 256,
+    eps: f32 = 1e-6,
+    qk_scale: f32 = 0.0625, // query_pre_attn_scalar(256)^-0.5
+    theta_local: f32 = 10000.0,
+    theta_global: f32 = 1000000.0,
+};
+
+fn gGet(w: *const model_mod.Weights, key: []const u8) !mlx.mlx_array {
+    return w.get(key) orelse {
+        log.err("[ltx-gemma] MISSING WEIGHT: {s}\n", .{key});
+        return error.MissingGemmaWeight;
+    };
+}
+
+/// q4 linear: y = x @ dequant(<base>.weight).T  (affine g64 b4).
+fn gQLin(w: *const model_mod.Weights, a: std.mem.Allocator, x: mlx.mlx_array, base: []const u8, s: S) !mlx.mlx_array {
+    const wk = try std.fmt.allocPrint(a, "{s}.weight", .{base});
+    defer a.free(wk);
+    const sk = try std.fmt.allocPrint(a, "{s}.scales", .{base});
+    defer a.free(sk);
+    const bk = try std.fmt.allocPrint(a, "{s}.biases", .{base});
+    defer a.free(bk);
+    const wq = try gGet(w, wk);
+    const sc = try gGet(w, sk);
+    const bi = try gGet(w, bk);
+    var o = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_quantized_matmul(&o, x, wq, sc, bi, true, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(4), "affine", s));
+    return o;
+}
+
+/// Gemma RMSNorm: x_normed * (1 + w).
+fn gRms(x: mlx.mlx_array, w: mlx.mlx_array, eps: f32, s: S) !mlx.mlx_array {
+    const one = mlx.mlx_array_new_float(1.0);
+    defer _ = mlx.mlx_array_free(one);
+    var wp1 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(wp1);
+    try mlx.check(mlx.mlx_add(&wp1, w, one, s));
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_fast_rms_norm(&out, x, wp1, eps, s));
+    return out;
+}
+
+fn gReshape(x: mlx.mlx_array, shape: []const c_int, s: S) !mlx.mlx_array {
+    var o = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_reshape(&o, x, shape.ptr, shape.len, s));
+    return o;
+}
+fn gTranspose(x: mlx.mlx_array, axes: []const c_int, s: S) !mlx.mlx_array {
+    var o = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_transpose_axes(&o, x, axes.ptr, axes.len, s));
+    return o;
+}
+
+/// One Gemma-3 decoder layer over [1,T,3840] with a precomputed combined mask.
+fn gLayer(w: *const model_mod.Weights, a: std.mem.Allocator, idx: u32, h: mlx.mlx_array, mask: mlx.mlx_array, base: f32, cfg: GemmaCfg, s: S) !mlx.mlx_array {
+    const pfx = try std.fmt.allocPrint(a, "language_model.model.layers.{d}", .{idx});
+    defer a.free(pfx);
+    const T: c_int = mlx.getShape(h)[1];
+    const nh: c_int = @intCast(cfg.n_heads);
+    const nkv: c_int = @intCast(cfg.n_kv);
+    const hd: c_int = @intCast(cfg.head_dim);
+    const eps = cfg.eps;
+
+    // ── Attention ──
+    const in_ln = try gGet(w, try fmtKey(a, pfx, "input_layernorm.weight"));
+    const x = try gRms(h, in_ln, eps, s);
+    defer _ = mlx.mlx_array_free(x);
+
+    const q = try gQLin(w, a, x, try fmtKey(a, pfx, "self_attn.q_proj"), s);
+    defer _ = mlx.mlx_array_free(q);
+    const k = try gQLin(w, a, x, try fmtKey(a, pfx, "self_attn.k_proj"), s);
+    defer _ = mlx.mlx_array_free(k);
+    const v = try gQLin(w, a, x, try fmtKey(a, pfx, "self_attn.v_proj"), s);
+    defer _ = mlx.mlx_array_free(v);
+
+    const q4 = try gReshape(q, &[_]c_int{ 1, T, nh, hd }, s);
+    defer _ = mlx.mlx_array_free(q4);
+    const qt = try gTranspose(q4, &[_]c_int{ 0, 2, 1, 3 }, s);
+    defer _ = mlx.mlx_array_free(qt);
+    const k4 = try gReshape(k, &[_]c_int{ 1, T, nkv, hd }, s);
+    defer _ = mlx.mlx_array_free(k4);
+    const kt = try gTranspose(k4, &[_]c_int{ 0, 2, 1, 3 }, s);
+    defer _ = mlx.mlx_array_free(kt);
+    const v4 = try gReshape(v, &[_]c_int{ 1, T, nkv, hd }, s);
+    defer _ = mlx.mlx_array_free(v4);
+    const vt = try gTranspose(v4, &[_]c_int{ 0, 2, 1, 3 }, s);
+    defer _ = mlx.mlx_array_free(vt);
+
+    // q/k norm over head_dim (RMSNorm with 1+w), then RoPE.
+    const qn_w = try gGet(w, try fmtKey(a, pfx, "self_attn.q_norm.weight"));
+    const qn = try gRms(qt, qn_w, eps, s);
+    defer _ = mlx.mlx_array_free(qn);
+    const kn_w = try gGet(w, try fmtKey(a, pfx, "self_attn.k_norm.weight"));
+    const kn = try gRms(kt, kn_w, eps, s);
+    defer _ = mlx.mlx_array_free(kn);
+
+    const base_opt = mlx.mlx_optional_float.some(base);
+    var qr = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(qr);
+    try mlx.check(mlx.mlx_fast_rope(&qr, qn, hd, false, base_opt, 1.0, 0, .{ .ctx = null }, s));
+    var kr = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(kr);
+    try mlx.check(mlx.mlx_fast_rope(&kr, kn, hd, false, base_opt, 1.0, 0, .{ .ctx = null }, s));
+
+    var attn = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(attn);
+    const null_arr = mlx.mlx_array{ .ctx = null };
+    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn, qr, kr, vt, cfg.qk_scale, "array", mask, null_arr, s));
+
+    const at = try gTranspose(attn, &[_]c_int{ 0, 2, 1, 3 }, s);
+    defer _ = mlx.mlx_array_free(at);
+    const af = try gReshape(at, &[_]c_int{ 1, T, nh * hd }, s);
+    defer _ = mlx.mlx_array_free(af);
+    const o = try gQLin(w, a, af, try fmtKey(a, pfx, "self_attn.o_proj"), s);
+    defer _ = mlx.mlx_array_free(o);
+    const pa_ln = try gGet(w, try fmtKey(a, pfx, "post_attention_layernorm.weight"));
+    const on = try gRms(o, pa_ln, eps, s);
+    defer _ = mlx.mlx_array_free(on);
+    const h1 = try clipResidual(h, on, s);
+    defer _ = mlx.mlx_array_free(h1);
+
+    // ── MLP (gated GELU-approx) ──
+    const pf_ln = try gGet(w, try fmtKey(a, pfx, "pre_feedforward_layernorm.weight"));
+    const xm = try gRms(h1, pf_ln, eps, s);
+    defer _ = mlx.mlx_array_free(xm);
+    const gate = try gQLin(w, a, xm, try fmtKey(a, pfx, "mlp.gate_proj"), s);
+    defer _ = mlx.mlx_array_free(gate);
+    const up = try gQLin(w, a, xm, try fmtKey(a, pfx, "mlp.up_proj"), s);
+    defer _ = mlx.mlx_array_free(up);
+    const gact = try geluApprox(gate, s);
+    defer _ = mlx.mlx_array_free(gact);
+    const ga = try mulArr(gact, up, s);
+    defer _ = mlx.mlx_array_free(ga);
+    const down = try gQLin(w, a, ga, try fmtKey(a, pfx, "mlp.down_proj"), s);
+    defer _ = mlx.mlx_array_free(down);
+    const po_ln = try gGet(w, try fmtKey(a, pfx, "post_feedforward_layernorm.weight"));
+    const dn = try gRms(down, po_ln, eps, s);
+    defer _ = mlx.mlx_array_free(dn);
+    return clipResidual(h1, dn, s);
+}
+
+/// Format `<prefix>.<suffix>` into an arena-allocated key (caller's arena frees).
+fn fmtKey(a: std.mem.Allocator, prefix: []const u8, suffix: []const u8) ![]u8 {
+    return std.fmt.allocPrint(a, "{s}.{s}", .{ prefix, suffix });
+}
+
+fn addArr(x: mlx.mlx_array, y: mlx.mlx_array, s: S) !mlx.mlx_array {
+    var o = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_add(&o, x, y, s));
+    return o;
+}
+fn mulArr(x: mlx.mlx_array, y: mlx.mlx_array, s: S) !mlx.mlx_array {
+    var o = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_multiply(&o, x, y, s));
+    return o;
+}
+
+/// Gemma-3 clip_residual: add in float32 then cast back to bf16 (clip to the
+/// bf16 range is a no-op for normal activations but matches the reference's
+/// rounding — the f32 intermediate, NOT a plain bf16 add, is what compounds
+/// over 96 residual adds across 48 layers).
+fn clipResidual(x: mlx.mlx_array, y: mlx.mlx_array, s: S) !mlx.mlx_array {
+    var xf = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(xf);
+    try mlx.check(mlx.mlx_astype(&xf, x, .float32, s));
+    var yf = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(yf);
+    try mlx.check(mlx.mlx_astype(&yf, y, .float32, s));
+    var sum = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sum);
+    try mlx.check(mlx.mlx_add(&sum, xf, yf, s));
+    const bound = mlx.mlx_array_new_float(3.3895314e38); // bf16 max
+    defer _ = mlx.mlx_array_free(bound);
+    const nbound = mlx.mlx_array_new_float(-3.3895314e38);
+    defer _ = mlx.mlx_array_free(nbound);
+    var lo = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(lo);
+    try mlx.check(mlx.mlx_minimum(&lo, sum, bound, s));
+    var hi = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(hi);
+    try mlx.check(mlx.mlx_maximum(&hi, lo, nbound, s));
+    var o = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_astype(&o, hi, .bfloat16, s));
+    return o;
+}
+
+/// Capture the 49 Gemma-3 hidden states for `ids` (length T, left-padded with
+/// `pad_id`). Returns an owned slice of 49 arrays [1,T,3840]; caller frees each
+/// + the slice. Weights loaded from `gemma_dir` (multi-shard, CPU stream).
+pub fn gemmaCapture(io: std.Io, allocator: std.mem.Allocator, gemma_dir: []const u8, ids: []const i32, pad_id: i32, s: S) ![]mlx.mlx_array {
+    const cfg = GemmaCfg{};
+    const T: c_int = @intCast(ids.len);
+    var w = try model_mod.loadWeights(io, allocator, gemma_dir);
+    defer w.deinit();
+
+    // Arena for the per-call key strings.
+    var arena_inst = std.heap.ArenaAllocator.init(allocator);
+    defer arena_inst.deinit();
+    const a = arena_inst.allocator();
+
+    var states = try allocator.alloc(mlx.mlx_array, cfg.layers + 1);
+    var done: usize = 0;
+    errdefer {
+        var i: usize = 0;
+        while (i < done) : (i += 1) _ = mlx.mlx_array_free(states[i]);
+        allocator.free(states);
+    }
+
+    // ── Embedding (q4 table lookup → dequant → ×sqrt(3840)) ──
+    const id_shape = [_]c_int{T};
+    const ids_arr = mlx.mlx_array_new_data(ids.ptr, &id_shape, 1, .int32);
+    defer _ = mlx.mlx_array_free(ids_arr);
+    const emb_w = try gGet(&w, "language_model.model.embed_tokens.weight");
+    const emb_s = try gGet(&w, "language_model.model.embed_tokens.scales");
+    const emb_b = try gGet(&w, "language_model.model.embed_tokens.biases");
+    var rw = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(rw);
+    try mlx.check(mlx.mlx_take_axis(&rw, emb_w, ids_arr, 0, s));
+    var rs = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(rs);
+    try mlx.check(mlx.mlx_take_axis(&rs, emb_s, ids_arr, 0, s));
+    var rb = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(rb);
+    try mlx.check(mlx.mlx_take_axis(&rb, emb_b, ids_arr, 0, s));
+    var deq = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(deq);
+    const null_gs = mlx.mlx_array{ .ctx = null };
+    try mlx.check(mlx.mlx_dequantize(&deq, rw, rs, rb, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(4), "affine", null_gs, .{ .value = .bfloat16, .has_value = true }, s));
+    const hd: c_int = @intCast(cfg.hidden);
+    const emb3 = try gReshape(deq, &[_]c_int{ 1, T, hd }, s);
+    defer _ = mlx.mlx_array_free(emb3);
+    const scale = mlx.mlx_array_new_float(@sqrt(@as(f32, @floatFromInt(cfg.hidden))));
+    defer _ = mlx.mlx_array_free(scale);
+    var h = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_multiply(&h, emb3, scale, s));
+    states[0] = h;
+    done = 1;
+
+    // ── Combined causal + left-pad mask [1,1,T,T] bf16 ──
+    const tn: usize = ids.len;
+    const mbuf = try allocator.alloc(f32, tn * tn);
+    defer allocator.free(mbuf);
+    const neg: f32 = -1e9;
+    for (0..tn) |i| {
+        for (0..tn) |j| {
+            var m: f32 = if (j <= i) 0.0 else neg;
+            if (ids[j] == pad_id) m += neg;
+            mbuf[i * tn + j] = m;
+        }
+    }
+    const mshape = [_]c_int{ 1, 1, T, T };
+    const mask_f32 = mlx.mlx_array_new_data(mbuf.ptr, &mshape, 4, .float32);
+    defer _ = mlx.mlx_array_free(mask_f32);
+    var mask = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(mask);
+    try mlx.check(mlx.mlx_astype(&mask, mask_f32, .bfloat16, s));
+
+    // ── 48 decoder layers ──
+    var li: u32 = 0;
+    while (li < cfg.layers) : (li += 1) {
+        const base = if ((li + 1) % 6 == 0) cfg.theta_global else cfg.theta_local;
+        const nh = try gLayer(&w, a, li, states[li], mask, base, cfg, s);
+        states[li + 1] = nh;
+        done += 1;
+        _ = mlx.mlx_array_eval(nh); // bound the lazy graph (GPU watchdog)
+        _ = arena_inst.reset(.retain_capacity);
+    }
+    return states;
+}
+
 // ── Tests ──
 
 const testing = std.testing;
@@ -1243,4 +1530,86 @@ fn readF32(io: std.Io, allocator: std.mem.Allocator, path: []const u8) ![]f32 {
     const out = try allocator.alloc(f32, cnt);
     @memcpy(std.mem.sliceAsBytes(out), bytes[0 .. cnt * 4]);
     return out;
+}
+
+fn readI32(io: std.Io, allocator: std.mem.Allocator, path: []const u8) ![]i32 {
+    const f = try std.Io.Dir.openFileAbsolute(io, path, .{});
+    defer f.close(io);
+    var rb: [4096]u8 = undefined;
+    var rs = f.reader(io, &rb);
+    const bytes = try rs.interface.allocRemaining(allocator, .limited(64 * 1024 * 1024));
+    defer allocator.free(bytes);
+    const cnt = bytes.len / 4;
+    const out = try allocator.alloc(i32, cnt);
+    @memcpy(std.mem.sliceAsBytes(out), bytes[0 .. cnt * 4]);
+    return out;
+}
+
+fn corrF32(data: [*]const f32, ref: []const f32, start: usize) f64 {
+    var dot: f64 = 0;
+    var na: f64 = 0;
+    var nb: f64 = 0;
+    var i: usize = start;
+    while (i < ref.len) : (i += 1) {
+        const aa: f64 = data[i];
+        const bb: f64 = ref[i];
+        dot += aa * bb;
+        na += aa * aa;
+        nb += bb * bb;
+    }
+    return dot / (@sqrt(na) * @sqrt(nb));
+}
+
+// Gemma 49-layer capture vs the reference get_all_hidden_states. Gated on:
+//   LTX_GEMMA_MODEL = gemma-3-12b-it-4bit dir
+//   LTX_GEMMA_IDS   = int32 raw of the left-padded 1024 token ids
+//   LTX_GEMMA_S0/S1/S24/S48 = f32 raw of reference states 0/1/24/48
+test "ltx gemmaCapture reproduces reference hidden states" {
+    const dir = std.mem.span(std.c.getenv("LTX_GEMMA_MODEL") orelse return error.SkipZigTest);
+    const idp = std.mem.span(std.c.getenv("LTX_GEMMA_IDS") orelse return error.SkipZigTest);
+    const allocator = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+
+    const ids = try readI32(io, allocator, idp);
+    defer allocator.free(ids);
+
+    const states = try gemmaCapture(io, allocator, dir, ids, 0, s);
+    defer {
+        for (states) |st| _ = mlx.mlx_array_free(st);
+        allocator.free(states);
+    }
+    try testing.expectEqual(@as(usize, 49), states.len);
+
+    // Only the VALID (non-pad) token rows feed the LTX connector (it zeros
+    // padding positions). Left-padded query positions attend an all-masked row
+    // (softmax over all -1e9 → undefined garbage that diverges across layers in
+    // both implementations), so compare only the valid tail.
+    var first_valid: usize = 0;
+    while (first_valid < ids.len and ids[first_valid] == 0) : (first_valid += 1) {}
+    const valid_start = first_valid * 3840;
+
+    const checks = [_]struct { li: usize, env: []const u8 }{
+        .{ .li = 0, .env = "LTX_GEMMA_S0" },
+        .{ .li = 1, .env = "LTX_GEMMA_S1" },
+        .{ .li = 24, .env = "LTX_GEMMA_S24" },
+        .{ .li = 48, .env = "LTX_GEMMA_S48" },
+    };
+    for (checks) |c| {
+        const p = std.c.getenv(@ptrCast(c.env.ptr)) orelse continue;
+        const ref = try readF32(io, allocator, std.mem.span(p));
+        defer allocator.free(ref);
+        var f32a = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(f32a);
+        try mlx.check(mlx.mlx_astype(&f32a, states[c.li], .float32, s));
+        _ = mlx.mlx_array_eval(f32a);
+        const n: usize = @intCast(mlx.mlx_array_size(f32a));
+        try testing.expectEqual(ref.len, n);
+        const data = mlx.mlx_array_data_float32(f32a).?;
+        const corr_full = corrF32(data, ref, 0);
+        const corr_valid = corrF32(data, ref, valid_start);
+        std.debug.print("[ltx-gemma] layer {d} corr_valid={d:.6} (full={d:.4})\n", .{ c.li, corr_valid, corr_full });
+        try testing.expect(corr_valid > 0.999);
+    }
 }
