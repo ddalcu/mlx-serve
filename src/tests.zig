@@ -36,4 +36,5 @@ test {
     _ = @import("wav.zig");
     _ = @import("tts.zig");
     _ = @import("flux.zig");
+    _ = @import("ltx_video.zig");
 }

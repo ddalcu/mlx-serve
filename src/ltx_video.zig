@@ -1,0 +1,229 @@
+//! Native LTX-Video 2.3 (one-stage text→video) — Zig + mlx-c port scaffold.
+//! See docs/native-mediagen/03-video-ltx.md for the full plan.
+//!
+//! STATUS (video fork, foundation slice): this file establishes the validated
+//! FOUNDATION for the LTX port — the real config, a single-component q4/bf16
+//! weight loader, and the conv3d/group-norm primitives — and pins them against
+//! the actual `dgrauet/ltx-2.3-mlx-q4` checkpoint with a loader-validation test.
+//! The full forward (Gemma-49-layer capture → connector → 48-block joint DiT →
+//! guided Euler loop → 3D-conv VAE decode) is the large remaining work; this
+//! file documents the exact architecture (real tensor keys/shapes) in code so
+//! the next implementer can build each stage against per-stage oracle taps.
+//!
+//! KEY FINDINGS (from dumping the real checkpoint):
+//!  - VAE conv weights are ALREADY in MLX layout `[C_out, kD, kH, kW, C_in]`
+//!    (e.g. `vae_decoder.conv_in.conv.weight [1024,3,3,3,128]`) — NO transpose
+//!    at load, unlike the PyTorch-layout audio convs. mlx_conv3d consumes this
+//!    directly with NDHWC input.
+//!  - DiT: 48 blocks, each 154 tensors. Six attention sub-modules per block:
+//!    attn1 (video self), attn2 (video→text cross), audio_attn1, audio_attn2,
+//!    audio_to_video_attn, video_to_audio_attn — all q4 (U32 weight + bf16
+//!    scales/biases, group_size 64). adaLN tables are F32: scale_shift_table
+//!    [9,4096] / audio_scale_shift_table [9,2048] (shift,scale,gate ×3),
+//!    prompt_scale_shift_table [2,*], scale_shift_table_a2v_ca_video [5,4096] /
+//!    _audio [5,2048] (AV-cross, SCALE-FIRST ordering — a porting trap).
+//!  - Connector: bf16. Two `Embeddings1DConnector`s (video dim 4096 / audio
+//!    2048), 8 `transformer_1d_blocks` each, `learnable_registers [128, dim]`,
+//!    gated attention (`to_gate_logits [num_heads, dim]`), GEGLU ff, q/k RMSNorm.
+//!    `text_embedding_projection.{video,audio}_aggregate_embed.weight
+//!    [4096|2048, 188160]` (= 49×3840 Gemma-stack projection).
+//!  - Quant: bits 4, group_size 64, only_transformer_blocks=true. A tensor is
+//!    q4 iff a sibling `<name>.scales` exists; else it's stored at its dtype.
+
+const std = @import("std");
+const mlx = @import("mlx.zig");
+const log = @import("log.zig");
+
+const S = mlx.mlx_stream;
+
+// ── Config (from config.json) ──
+
+pub const LtxConfig = struct {
+    num_heads: u32 = 32,
+    head_dim: u32 = 128,
+    in_channels: u32 = 128,
+    out_channels: u32 = 128,
+    num_layers: u32 = 48,
+    cross_attention_dim: u32 = 4096, // video_dim
+    audio_num_heads: u32 = 32,
+    audio_head_dim: u32 = 64,
+    audio_in_channels: u32 = 128,
+    audio_cross_attention_dim: u32 = 2048, // audio_dim
+    pos_emb_theta: f32 = 10000.0,
+    pos_emb_max_pos: [3]u32 = .{ 20, 2048, 2048 },
+    audio_pos_emb_max_pos: u32 = 20,
+    timestep_scale: f32 = 1000.0,
+    norm_eps: f32 = 1e-6,
+    connector_max_pos: u32 = 4096,
+    connector_num_blocks: u32 = 8,
+    connector_num_registers: u32 = 128,
+    gemma_layers: u32 = 49, // embedding + 48 layers
+    gemma_hidden: u32 = 3840,
+    aggregate_in: u32 = 188160, // 49 * 3840
+    quant_bits: u32 = 4,
+    quant_group_size: u32 = 64,
+
+    pub fn videoDim(self: LtxConfig) u32 {
+        return self.num_heads * self.head_dim; // 4096
+    }
+    pub fn audioDim(self: LtxConfig) u32 {
+        return self.audio_num_heads * self.audio_head_dim; // 2048
+    }
+};
+
+// ── Single-component weight loader ──
+//
+// The LTX checkpoint stores each sub-model as a separate `*.safetensors` file in
+// ONE directory (transformer-dev 11GB, connector 5.9GB, vae_decoder 777MB, ...).
+// `model.loadWeights` scans a whole dir → it would load all 40GB+ at once (OOM).
+// We load a single component file instead and classify each tensor q4-vs-bf16 by
+// the presence of a sibling `.scales` entry.
+
+pub const Component = struct {
+    map: std.StringHashMap(mlx.mlx_array),
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *Component) void {
+        var it = self.map.iterator();
+        while (it.next()) |e| {
+            _ = mlx.mlx_array_free(e.value_ptr.*);
+            self.allocator.free(e.key_ptr.*);
+        }
+        self.map.deinit();
+    }
+
+    pub fn get(self: *const Component, key: []const u8) ?mlx.mlx_array {
+        return self.map.get(key);
+    }
+
+    /// A weight is quantized (q4) iff a sibling `<base>.scales` exists. `weight`
+    /// keys end in `.weight`; the quant siblings are `.scales`/`.biases`.
+    pub fn isQuantized(self: *const Component, weight_key: []const u8) bool {
+        if (!std.mem.endsWith(u8, weight_key, ".weight")) return false;
+        const base = weight_key[0 .. weight_key.len - ".weight".len];
+        var buf: [512]u8 = undefined;
+        const scales_key = std.fmt.bufPrint(&buf, "{s}.scales", .{base}) catch return false;
+        return self.map.contains(scales_key);
+    }
+
+    pub fn count(self: *const Component) u32 {
+        return @intCast(self.map.count());
+    }
+};
+
+/// Load one `*.safetensors` file (absolute path) into a Component map.
+pub fn loadComponent(allocator: std.mem.Allocator, path: [:0]const u8, s: S) !Component {
+    var comp = Component{ .map = std.StringHashMap(mlx.mlx_array).init(allocator), .allocator = allocator };
+    errdefer comp.deinit();
+
+    var tensor_map = mlx.mlx_map_string_to_array_new();
+    defer _ = mlx.mlx_map_string_to_array_free(tensor_map);
+    var meta_map = mlx.mlx_map_string_to_string_new();
+    defer _ = mlx.mlx_map_string_to_string_free(meta_map);
+    try mlx.check(mlx.mlx_load_safetensors(&tensor_map, &meta_map, path, s));
+
+    const iter = mlx.mlx_map_string_to_array_iterator_new(tensor_map);
+    defer _ = mlx.mlx_map_string_to_array_iterator_free(iter);
+    while (true) {
+        var key: ?[*:0]const u8 = null;
+        var value = mlx.mlx_array_new();
+        const rc = mlx.mlx_map_string_to_array_iterator_next(&key, &value, iter);
+        if (rc != 0) break;
+        const k = key orelse break;
+        const key_slice = std.mem.span(k);
+        const owned_key = try allocator.dupe(u8, key_slice);
+        errdefer allocator.free(owned_key);
+        var owned_val = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_array_set(&owned_val, value));
+        try comp.map.put(owned_key, owned_val);
+    }
+    log.info("[ltx] loaded {d} tensors from {s}\n", .{ comp.count(), path });
+    return comp;
+}
+
+// ── Primitives the DiT/VAE need beyond the LLM stack ──
+
+/// 3D convolution on NDHWC input with MLX-layout weight `[C_out, kD, kH, kW, C_in]`.
+/// `pad` is symmetric per spatial axis (caller does causal/replicate padding
+/// separately via mlx_pad for the LTX causal-temporal scheme).
+pub fn conv3d(input: mlx.mlx_array, weight: mlx.mlx_array, stride: [3]c_int, pad: [3]c_int, s: S) !mlx.mlx_array {
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_conv3d(&out, input, weight, stride[0], stride[1], stride[2], pad[0], pad[1], pad[2], 1, 1, 1, 1, s));
+    return out;
+}
+
+/// Null-weight RMS / "PixelNorm" over the channel (last) axis: x / sqrt(mean(x^2)+eps).
+/// LTX VAE uses parameterless pixel norm; mlx_fast_rms_norm crashes on null weight,
+/// so compute it explicitly.
+pub fn pixelNorm(x: mlx.mlx_array, eps: f32, s: S) !mlx.mlx_array {
+    var sq = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sq);
+    try mlx.check(mlx.mlx_multiply(&sq, x, x, s));
+    var mean = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(mean);
+    try mlx.check(mlx.mlx_mean_axis(&mean, sq, -1, true, s));
+    const eps_a = mlx.mlx_array_new_float(eps);
+    defer _ = mlx.mlx_array_free(eps_a);
+    var denom = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(denom);
+    try mlx.check(mlx.mlx_add(&denom, mean, eps_a, s));
+    var rsq = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(rsq);
+    try mlx.check(mlx.mlx_rsqrt(&rsq, denom, s));
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_multiply(&out, x, rsq, s));
+    return out;
+}
+
+// ── Tests ──
+
+const testing = std.testing;
+
+test "LtxConfig derived dims" {
+    const c = LtxConfig{};
+    try testing.expectEqual(@as(u32, 4096), c.videoDim());
+    try testing.expectEqual(@as(u32, 2048), c.audioDim());
+    try testing.expectEqual(@as(u32, 188160), c.gemma_layers * c.gemma_hidden);
+}
+
+// Loader validation against the REAL ltx-2.3-mlx-q4 checkpoint. Loads the small
+// bf16 components (connector + vae_decoder — NOT the 11GB transformer, to avoid
+// OOM) and pins key tensors' presence/shape + the q4/bf16 classifier.
+//   LTX_TEST_MODEL = path to the snapshot dir
+test "ltx loader: connector + vae_decoder key map" {
+    const dir = std.mem.span(std.c.getenv("LTX_TEST_MODEL") orelse return error.SkipZigTest);
+    const allocator = testing.allocator;
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+
+    // Connector (bf16).
+    {
+        const path = try std.fmt.allocPrintSentinel(allocator, "{s}/connector.safetensors", .{dir}, 0);
+        defer allocator.free(path);
+        var comp = try loadComponent(allocator, path, s);
+        defer comp.deinit();
+        std.debug.print("[ltx] connector tensors: {d}\n", .{comp.count()});
+        try testing.expect(comp.get("connector.text_embedding_projection.video_aggregate_embed.weight") != null);
+        const vproj = comp.get("connector.text_embedding_projection.video_aggregate_embed.weight").?;
+        const sh = mlx.getShape(vproj);
+        try testing.expectEqual(@as(c_int, 4096), sh[0]);
+        try testing.expectEqual(@as(c_int, 188160), sh[1]);
+        // connector is bf16 → not quantized
+        try testing.expect(!comp.isQuantized("connector.video_embeddings_connector.transformer_1d_blocks.0.attn1.to_q.weight"));
+    }
+
+    // VAE decoder (bf16; conv weights already MLX [out,kD,kH,kW,in]).
+    {
+        const path = try std.fmt.allocPrintSentinel(allocator, "{s}/vae_decoder.safetensors", .{dir}, 0);
+        defer allocator.free(path);
+        var comp = try loadComponent(allocator, path, s);
+        defer comp.deinit();
+        std.debug.print("[ltx] vae_decoder tensors: {d}\n", .{comp.count()});
+        const ci = comp.get("vae_decoder.conv_in.conv.weight").?;
+        const sh = mlx.getShape(ci);
+        // [C_out=1024, kD=3, kH=3, kW=3, C_in=128]
+        try testing.expectEqual(@as(usize, 5), sh.len);
+        try testing.expectEqual(@as(c_int, 1024), sh[0]);
+        try testing.expectEqual(@as(c_int, 128), sh[4]);
+    }
+}

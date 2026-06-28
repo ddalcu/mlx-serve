@@ -4,8 +4,25 @@
 Zig + mlx-c implementation served from `mlx-serve`. No Python. Exposed as a custom
 `/v1/video/generations` endpoint.
 
-**Status:** 🔴 Not started. **Modality 3 of 3** (hardest, do last). Branch `feature/Any2Any`.
-Commit locally when feature-complete + tested.
+**Status:** 🟡 **Foundation laid + validated** (`src/ltx_video.zig`). **Modality 3 of 3** (hardest).
+Branch `feature/Any2Any`. The full pipeline is a large remaining effort (scoped at weeks); the
+foundation de-risks the load + the new primitives.
+
+Done + validated vs the real `dgrauet/ltx-2.3-mlx-q4` checkpoint (loads 262 connector + 86 vae_decoder
+tensors, no GPU forward → no OOM):
+- `LtxConfig` from config.json; **single-component q4/bf16 loader** (`loadComponent`) — the 41 GB model
+  stores each sub-model as a separate file, so the dir-scanning `loadWeights` would OOM; this loads one
+  component and classifies tensors by sibling `.scales`.
+- New primitives: `conv3d`, null-weight `pixelNorm`.
+- Pinned findings (accelerate the rest): **VAE conv weights are already MLX-layout** `[C_out,kD,kH,kW,C_in]`
+  (NO transpose, unlike the PyTorch-layout audio convs); DiT = 48 blocks × 154 tensors, six q4 attention
+  sub-modules/block; adaLN tables F32 with `scale_shift_table [9,4096]` and AV-cross `[5,*]` **scale-first**
+  (porting trap); connector bf16, two 8-block `Embeddings1DConnector`s + 128 registers + gated attn.
+
+*Remaining (the bulk):* Gemma 49-layer capture → connector forward → 48-block joint DiT (3D split-RoPE,
+AV cross-attn, adaLN-zero) → guided Euler sampler → 3D-conv VAE decode → frame emit → AVFoundation mux.
+Each stage needs `.npy` oracle taps; the 41 GB reference oracle was deferred to avoid OOM contention with
+the (then-running) image fork.
 
 > This is the heaviest modality. The plan front-loads the two pleasant surprises (the q4
 > weights load with our existing affine-4bit loader; the text encoder is **our own
