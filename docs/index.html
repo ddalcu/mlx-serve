@@ -37,7 +37,7 @@
     "downloadUrl": "https://github.com/ddalcu/mlx-serve/releases/latest",
     "codeRepository": "https://github.com/ddalcu/mlx-serve",
     "license": "https://opensource.org/licenses/MIT",
-    "softwareVersion": "v26.6.11",
+    "softwareVersion": "v26.6.13",
     "author": { "@type": "Person", "name": "David Dalcu" },
     "description": "Native Zig inference server for Apple Silicon that runs any LLM — MLX and GGUF — with OpenAI- and Anthropic-compatible APIs. Faster than LM Studio. No Python. MIT licensed.",
     "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
@@ -51,7 +51,9 @@
       "Continuous batching",
       "Built-in agent mode with MCP tool calling",
       "DeepSeek V4 Flash via embedded ds4 engine",
-      "Local image generation (FLUX.2 / FLUX.1)",
+      "Vision: Gemma 4 SigLIP and Qwen 3.5 / 3.6 image understanding",
+      "Local image generation (Krea-2-Turbo and FLUX.2, native MLX)",
+      "Generate images inline from the agent chat",
       "Local video generation (LTX-Video, image-to-video)",
       "Zero-shot voice cloning and local text-to-speech",
       "Hands-free voice mode with on-device speech recognition",
@@ -119,6 +121,14 @@
         "acceptedAnswer": {
           "@type": "Answer",
           "text": "Yes, on 96 GB+ Apple Silicon Macs. Open the MLX Core Model Browser, pick DeepSeek-V4-Flash, hit Download — the server routes the GGUF through the embedded antirez/ds4 engine with native Metal kernels, byte-validated against the reference forward. Agent mode and MCP tools work on DSV4 too."
+        }
+      },
+      {
+        "@type": "Question",
+        "name": "Can mlx-serve generate images, video, and audio locally?",
+        "acceptedAnswer": {
+          "@type": "Answer",
+          "text": "Yes — all on-device, no Python. Image: Krea-2-Turbo (a 12.9B photorealistic model) and FLUX.2 run natively on MLX, validated pixel-faithful to the reference (end-to-end cosine 0.9996); generate from the menu-bar tray, or just ask the agent for an image in chat and it renders inline. Video: LTX-Video 2.3 turns a prompt or a first frame into a ~4-second clip with synced audio. Audio: Qwen3-TTS does zero-shot voice cloning from a few seconds of reference audio, no transcript needed. Chat and every media type share one local server and one memory budget — a model loads on demand and unloads when done."
         }
       },
       {
@@ -1055,7 +1065,7 @@
     <a href="#" class="nav-logo">
       <img src="appiconb.png" alt="MLX Core" class="nav-logo-img">
       <span>mlx-serve</span>
-      <span class="nav-ver">v26.6.11</span>
+      <span class="nav-ver">v26.6.13</span>
     </a>
     <ul class="nav-links">
       <li><a href="#performance" class="hide-mobile">Performance</a></li>
@@ -1074,9 +1084,9 @@
   <!-- HERO -->
   <section class="hero">
     <div class="hero-glow"><span class="g1"></span><span class="g2"></span><span class="g3"></span></div>
-    <a href="https://github.com/ddalcu/mlx-serve/releases/tag/v26.6.11" class="hero-badge">
-      <span class="new-pill">v26.6.11</span>
-      Voice cloning · Gemma 4 · Qwen 3.6 MTP · DeepSeek V4 — now shipping
+    <a href="https://github.com/ddalcu/mlx-serve/releases/latest" class="hero-badge">
+      <span class="new-pill">v26.6.13</span>
+      Image, video &amp; audio generation — Krea-2 &amp; FLUX.2 run locally, all native
       <span class="arrow">→</span>
     </a>
     <h1>Run any LLM<br>on your <span class="grad">Mac</span></h1>
@@ -1108,8 +1118,8 @@
   <!-- MARQUEE -->
   <div class="marquee" aria-hidden="true">
     <div class="marquee-track">
-      <span class="marquee-item">MLX + GGUF</span><span class="marquee-item">DiffusionGemma</span><span class="marquee-item">DeepSeek V4 Flash</span><span class="marquee-item">Gemma 4</span><span class="marquee-item">Qwen 3.6 MTP</span><span class="marquee-item">Llama 3</span><span class="marquee-item">NVFP4 / MXFP4</span><span class="marquee-item">Mistral</span><span class="marquee-item">Nemotron-H</span><span class="marquee-item">LFM2.5</span><span class="marquee-item">Document RAG</span><span class="marquee-item">OpenAI API</span><span class="marquee-item">Anthropic API</span><span class="marquee-item">Claude Code</span><span class="marquee-item">MCP</span>
-      <span class="marquee-item">MLX + GGUF</span><span class="marquee-item">DiffusionGemma</span><span class="marquee-item">DeepSeek V4 Flash</span><span class="marquee-item">Gemma 4</span><span class="marquee-item">Qwen 3.6 MTP</span><span class="marquee-item">Llama 3</span><span class="marquee-item">NVFP4 / MXFP4</span><span class="marquee-item">Mistral</span><span class="marquee-item">Nemotron-H</span><span class="marquee-item">LFM2.5</span><span class="marquee-item">Document RAG</span><span class="marquee-item">OpenAI API</span><span class="marquee-item">Anthropic API</span><span class="marquee-item">Claude Code</span><span class="marquee-item">MCP</span>
+      <span class="marquee-item">MLX + GGUF</span><span class="marquee-item">Krea-2 Image Gen</span><span class="marquee-item">Video + Audio Gen</span><span class="marquee-item">Voice Cloning</span><span class="marquee-item">DiffusionGemma</span><span class="marquee-item">DeepSeek V4 Flash</span><span class="marquee-item">Gemma 4</span><span class="marquee-item">Qwen 3.6 MTP</span><span class="marquee-item">Llama 3</span><span class="marquee-item">NVFP4 / MXFP4</span><span class="marquee-item">Mistral</span><span class="marquee-item">Nemotron-H</span><span class="marquee-item">LFM2.5</span><span class="marquee-item">Document RAG</span><span class="marquee-item">OpenAI API</span><span class="marquee-item">Anthropic API</span><span class="marquee-item">Claude Code</span><span class="marquee-item">MCP</span>
+      <span class="marquee-item">MLX + GGUF</span><span class="marquee-item">Krea-2 Image Gen</span><span class="marquee-item">Video + Audio Gen</span><span class="marquee-item">Voice Cloning</span><span class="marquee-item">DiffusionGemma</span><span class="marquee-item">DeepSeek V4 Flash</span><span class="marquee-item">Gemma 4</span><span class="marquee-item">Qwen 3.6 MTP</span><span class="marquee-item">Llama 3</span><span class="marquee-item">NVFP4 / MXFP4</span><span class="marquee-item">Mistral</span><span class="marquee-item">Nemotron-H</span><span class="marquee-item">LFM2.5</span><span class="marquee-item">Document RAG</span><span class="marquee-item">OpenAI API</span><span class="marquee-item">Anthropic API</span><span class="marquee-item">Claude Code</span><span class="marquee-item">MCP</span>
     </div>
   </div>
 
@@ -1305,14 +1315,14 @@
           <svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 10v4"/><path d="M6 6v12"/><path d="M10 3v18"/><path d="M14 8v8"/><path d="M18 5v14"/><path d="M22 10v4"/></svg>
         </div>
         <h3>Voice cloning &amp; TTS</h3>
-        <p>Give it 6–8 seconds of any voice and it speaks your text in that voice — zero-shot, no training. Runs fully local on MOSS-TTS or Qwen3-TTS with adjustable speed and expressiveness, and auto-transcribes the reference with Whisper if you skip it.</p>
+        <p>Give it 6–8 seconds of any voice and it speaks your text in that voice — zero-shot, no training. Runs fully local on Qwen3-TTS with adjustable speed and expressiveness; the reference audio alone clones the voice, no transcript needed — validated bit-for-bit against the reference.</p>
       </div>
       <div class="feature-card reveal">
         <div class="feature-icon" style="background: linear-gradient(135deg, #ff9f0a, #ff375f);">
           <svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.1-3.1a2 2 0 0 0-2.8 0L6 21"/></svg>
         </div>
-        <h3>Image generation</h3>
-        <p>FLUX.2 and FLUX.1 (schnell / dev) run locally through MLX — text-to-image across eight aspect ratios up to 1536 px, with negative prompts and Fast → Super-Quality presets. Outputs straight to PNG; nothing leaves your Mac.</p>
+        <h3>Image generation — Krea-2 &amp; FLUX.2</h3>
+        <p><b>Krea-2-Turbo</b>, a 12.9B photorealistic model, runs entirely on your Mac — validated pixel-faithful to the reference (end-to-end cosine 0.9996), any size from 256² to 2048². FLUX.2 too. Generate from the tray, or just ask the agent in chat and the image renders inline. An on-device NSFW filter screens results; nothing leaves your Mac.</p>
       </div>
       <div class="feature-card reveal">
         <div class="feature-icon" style="background: linear-gradient(135deg, #ff453a, #ff9f0a);">
@@ -1429,7 +1439,7 @@
         <div class="model-logo ml-qwen">Q</div>
         <div class="model-info">
           <h3>Qwen 3.6</h3>
-          <p>Alibaba · 27B · 35B-A3B MoE · GatedDeltaNet</p>
+          <p>Alibaba · 27B · 35B-A3B MoE · GatedDeltaNet · vision</p>
         </div>
       </div>
       <div class="model-card">
@@ -1509,6 +1519,10 @@
         <p>For greedy decoding (temp=0), mlx-serve is byte-identical to the reference for the first ~30-80 generated tokens, with long-tail divergence inherent to INT4 float-reduction order. For temp &gt; 0, the Leviathan probability-ratio sampler keeps speculative decoding mathematically exact in distribution. Equivalence is pinned by automated tests on every release.</p>
       </details>
       <details class="faq-item">
+        <summary>Can mlx-serve generate images, video, and audio locally?</summary>
+        <p>Yes — all on-device, no Python. <b>Image:</b> <b>Krea-2-Turbo</b> (a 12.9B photorealistic model) and FLUX.2 run natively on MLX, validated pixel-faithful to the reference; generate from the menu-bar tray, or just ask the agent for an image in chat and it renders inline. <b>Video:</b> LTX-Video 2.3 turns a prompt or a first frame into a ~4-second clip with synced audio. <b>Audio:</b> Qwen3-TTS does zero-shot voice cloning from a few seconds of reference audio — no transcript needed. Chat and every media type share one local server and one memory budget: a model loads on demand and unloads when done, so a chat model and a media model can coexist.</p>
+      </details>
+      <details class="faq-item">
         <summary>Where does my data go?</summary>
         <p>Nowhere. Everything runs locally on your Mac — no analytics, no telemetry, no cloud calls. The HTTP server binds to <code>127.0.0.1</code> by default. Open source under MIT.</p>
       </details>
@@ -1531,7 +1545,7 @@
       <li><a href="https://github.com/ddalcu/mlx-serve/issues" target="_blank" rel="noopener">Issues</a></li>
       <li><a href="https://github.com/ddalcu/mlx-serve/stargazers" target="_blank" rel="noopener">★ Star</a></li>
     </ul>
-    <p class="footer-copy">MIT License · mlx-serve <span style="opacity:0.7;">v26.6.11</span> · built for Apple Silicon</p>
+    <p class="footer-copy">MIT License · mlx-serve <span style="opacity:0.7;">v26.6.13</span> · built for Apple Silicon</p>
   </footer>
 
   <script>
