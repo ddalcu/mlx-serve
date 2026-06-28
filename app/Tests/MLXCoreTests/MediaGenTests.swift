@@ -113,7 +113,46 @@ private func indicatesVenvNeedsReinstallReplica(_ message: String) -> Bool {
     message.localizedCaseInsensitiveContains("import failed")
 }
 
+/// Replica of `VideoGenService.decodeFrames` — the native `/v1/video/generations`
+/// rgb8 wire format (frames/height/width/fps + base64 data, with a length check).
+/// MLXCore is an executable target so tests can't import the real method; this
+/// pins the contract the server (`src/ltx_server.zig`) emits.
+struct DecodedFramesReplica: Equatable {
+    var rgb: Data; var frames: Int; var height: Int; var width: Int; var fps: Int
+}
+func decodeFramesReplica(_ body: Data) -> DecodedFramesReplica? {
+    guard let obj = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
+          let format = obj["format"] as? String, format == "rgb8",
+          let frames = obj["frames"] as? Int,
+          let height = obj["height"] as? Int,
+          let width = obj["width"] as? Int,
+          let b64 = obj["data"] as? String,
+          let rgb = Data(base64Encoded: b64),
+          rgb.count == frames * height * width * 3
+    else { return nil }
+    let fps = (obj["fps"] as? Int) ?? 24
+    return DecodedFramesReplica(rgb: rgb, frames: frames, height: height, width: width, fps: fps)
+}
+
 final class MediaGenTests: XCTestCase {
+
+    // MARK: - Native video wire format
+
+    func testDecodeFramesParsesValidBody() {
+        let rgb = Data([10, 20, 30, 40, 50, 60]) // 1 frame, 1x2, 3ch
+        let b64 = rgb.base64EncodedString()
+        let body = "{\"frames\":1,\"height\":1,\"width\":2,\"fps\":24,\"format\":\"rgb8\",\"data\":\"\(b64)\"}".data(using: .utf8)!
+        let d = decodeFramesReplica(body)
+        XCTAssertEqual(d, DecodedFramesReplica(rgb: rgb, frames: 1, height: 1, width: 2, fps: 24))
+    }
+
+    func testDecodeFramesRejectsLengthMismatchAndWrongFormat() {
+        // declared 1x2x3=6 bytes but only 3 provided
+        let short = "{\"frames\":1,\"height\":1,\"width\":2,\"fps\":24,\"format\":\"rgb8\",\"data\":\"\(Data([1,2,3]).base64EncodedString())\"}".data(using: .utf8)!
+        XCTAssertNil(decodeFramesReplica(short))
+        let wrongFmt = "{\"frames\":1,\"height\":1,\"width\":2,\"fps\":24,\"format\":\"png\",\"data\":\"\(Data([1,2,3,4,5,6]).base64EncodedString())\"}".data(using: .utf8)!
+        XCTAssertNil(decodeFramesReplica(wrongFmt))
+    }
 
     // MARK: - Quality preset
 

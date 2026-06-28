@@ -1,10 +1,14 @@
 import Foundation
 import SwiftUI
 import AppKit
+import AVFoundation
+import CoreVideo
 
-/// Runs LTX-Video generation via the shared `PythonManager` venv. Mirrors
-/// `ImageGenService`, but writes an mp4 and preserves a lot more metadata
-/// (frames, fps) per request.
+/// Runs LTX-Video 2.3 text-to-video via the native `mlx-serve` engine (no Python).
+///
+/// Serves the LTX model with a dedicated `mlx-serve` instance, POSTs
+/// `/v1/video/generations` (which returns base64 RGB frames), then muxes the
+/// frames into an mp4 with AVFoundation under `~/.mlx-serve/generations/video`.
 @MainActor
 final class VideoGenService: ObservableObject {
 
@@ -33,58 +37,58 @@ final class VideoGenService: ObservableObject {
     }
 
     func generate(_ request: VideoGenRequest) {
-        guard python.status.isReady else {
-            phase = .failed("Python environment is not ready.")
-            return
-        }
         guard !request.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             phase = .failed("Prompt is empty.")
             return
         }
+        guard let modelDir = NativeGenServer.resolveModelDir(repo: request.model.repo) else {
+            phase = .failed("Model \(request.model.repo) is not downloaded. Download it first.")
+            return
+        }
 
         task?.cancel()
-        // 4-phase progress: Download → Load → Generate → Encode.
-        phase = .running(step: 0, total: 4, message: "Starting...")
+        phase = .running(step: 0, total: 3, message: "Loading model…")
         log = []
 
         let outputPath = Self.makeOutputPath(prompt: request.prompt)
-        let args = Self.buildArgs(request, outputPath: outputPath)
+        let repo = request.model.repo
+        let prompt = request.prompt
+        let fps = request.fps
+        let body: [String: Any] = [
+            "model": repo,
+            "prompt": prompt,
+            "num_frames": request.numFrames,
+            "height": request.height,
+            "width": request.width,
+            "steps": request.steps,
+            "seed": request.seed,
+        ]
 
         task = Task {
             do {
-                let stream = python.runScript(source: Self.script, args: args)
-                for try await event in stream {
-                    switch event {
-                    case .progress(let step, let total, let message):
-                        phase = .running(step: step, total: total, message: message)
-                    case .complete(let path):
-                        phase = .completed(path: path)
-                        insertRecent(path)
-                    case .log(let line):
-                        appendLog(line)
-                    }
+                _ = try await NativeGenServer.shared.ensure(modelDir: modelDir)
+                if Task.isCancelled { phase = .idle; return }
+                phase = .running(step: 1, total: 3, message: "Generating…")
+                let data = try await NativeGenServer.shared.post(path: "/v1/video/generations", json: body)
+                guard let frames = Self.decodeFrames(data) else {
+                    phase = .failed("Server returned no video frames.")
+                    return
                 }
-                if FileManager.default.fileExists(atPath: outputPath) {
-                    if case .completed = phase { /* already set */ } else {
-                        phase = .completed(path: outputPath)
-                        insertRecent(outputPath)
-                    }
-                } else if case .running = phase {
-                    phase = .failed("Generation finished without output.")
-                }
-            } catch GenError.cancelled {
+                if Task.isCancelled { phase = .idle; return }
+                phase = .running(step: 2, total: 3, message: "Encoding mp4…")
+                let outFps = frames.fps > 0 ? frames.fps : fps
+                try await Task.detached(priority: .userInitiated) {
+                    try VideoGenService.writeMP4(
+                        rgb: frames.rgb, frames: frames.frames,
+                        width: frames.width, height: frames.height,
+                        fps: outFps, to: URL(fileURLWithPath: outputPath))
+                }.value
+                phase = .completed(path: outputPath)
+                insertRecent(outputPath)
+            } catch is CancellationError {
                 phase = .idle
             } catch {
-                let actionable = log.last(where: { $0.hasPrefix("ERROR: ") })
-                    .map { String($0.dropFirst("ERROR: ".count)) }
-                phase = .failed(actionable ?? error.localizedDescription)
-                // If generation died because the ltx package drifted out from
-                // under a stale `.ready` status (module present, symbols gone),
-                // re-run dependency detection so the pane flips back to the
-                // installer instead of only showing red text.
-                if let msg = actionable, Self.indicatesVenvNeedsReinstall(msg) {
-                    await python.refresh()
-                }
+                phase = .failed(error.localizedDescription)
             }
         }
     }
@@ -94,21 +98,95 @@ final class VideoGenService: ObservableObject {
         task = nil
     }
 
-    /// True when a generation error indicates the venv itself is broken (a
-    /// required import failed) rather than a per-request problem — in which
-    /// case the caller should re-run detection so the UI re-offers the
-    /// installer. Matches the message the embedded scripts emit on a failed
-    /// `from ltx_pipelines_mlx import …` (or `import mflux`).
-    static func indicatesVenvNeedsReinstall(_ message: String) -> Bool {
-        message.localizedCaseInsensitiveContains("import failed")
+    // MARK: - Decode + mux (pure / nonisolated so they're testable + off-main)
+
+    struct DecodedFrames: Equatable {
+        var rgb: Data        // [frames * height * width * 3] row-major RGB
+        var frames: Int
+        var height: Int
+        var width: Int
+        var fps: Int
+    }
+
+    /// Parse the native server's `{frames,height,width,fps,format,data}` body.
+    nonisolated static func decodeFrames(_ body: Data) -> DecodedFrames? {
+        guard let obj = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
+              let format = obj["format"] as? String, format == "rgb8",
+              let frames = obj["frames"] as? Int,
+              let height = obj["height"] as? Int,
+              let width = obj["width"] as? Int,
+              let b64 = obj["data"] as? String,
+              let rgb = Data(base64Encoded: b64),
+              rgb.count == frames * height * width * 3
+        else { return nil }
+        let fps = (obj["fps"] as? Int) ?? 24
+        return DecodedFrames(rgb: rgb, frames: frames, height: height, width: width, fps: fps)
+    }
+
+    enum MuxError: Error { case writerInit, noPool, finishFailed(String) }
+
+    /// Mux raw RGB frames → h264 mp4 via AVAssetWriter.
+    nonisolated static func writeMP4(rgb: Data, frames: Int, width: Int, height: Int, fps: Int, to url: URL) throws {
+        try? FileManager.default.removeItem(at: url)
+        let writer = try AVAssetWriter(outputURL: url, fileType: .mp4)
+        let settings: [String: Any] = [
+            AVVideoCodecKey: AVVideoCodecType.h264,
+            AVVideoWidthKey: width,
+            AVVideoHeightKey: height,
+        ]
+        let input = AVAssetWriterInput(mediaType: .video, outputSettings: settings)
+        input.expectsMediaDataInRealTime = false
+        let attrs: [String: Any] = [
+            kCVPixelBufferPixelFormatTypeKey as String: kCVPixelFormatType_32BGRA,
+            kCVPixelBufferWidthKey as String: width,
+            kCVPixelBufferHeightKey as String: height,
+        ]
+        let adaptor = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput: input, sourcePixelBufferAttributes: attrs)
+        guard writer.canAdd(input) else { throw MuxError.writerInit }
+        writer.add(input)
+        guard writer.startWriting() else { throw writer.error ?? MuxError.writerInit }
+        writer.startSession(atSourceTime: .zero)
+        guard let pool = adaptor.pixelBufferPool else { throw MuxError.noPool }
+
+        let ts: Int32 = 600
+        rgb.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+            let src = raw.bindMemory(to: UInt8.self).baseAddress!
+            for f in 0..<frames {
+                while !input.isReadyForMoreMediaData { usleep(500) }
+                var pbOut: CVPixelBuffer?
+                CVPixelBufferPoolCreatePixelBuffer(nil, pool, &pbOut)
+                guard let pb = pbOut else { continue }
+                CVPixelBufferLockBaseAddress(pb, [])
+                if let base = CVPixelBufferGetBaseAddress(pb) {
+                    let dst = base.assumingMemoryBound(to: UInt8.self)
+                    let bpr = CVPixelBufferGetBytesPerRow(pb)
+                    for h in 0..<height {
+                        let rowBase = ((f * height + h) * width) * 3
+                        for w in 0..<width {
+                            let s = rowBase + w * 3
+                            let d = h * bpr + w * 4
+                            dst[d + 0] = src[s + 2] // B
+                            dst[d + 1] = src[s + 1] // G
+                            dst[d + 2] = src[s + 0] // R
+                            dst[d + 3] = 255        // A
+                        }
+                    }
+                }
+                CVPixelBufferUnlockBaseAddress(pb, [])
+                let pts = CMTime(value: Int64(f) * Int64(ts) / Int64(max(fps, 1)), timescale: ts)
+                adaptor.append(pb, withPresentationTime: pts)
+            }
+        }
+        input.markAsFinished()
+        let sem = DispatchSemaphore(value: 0)
+        writer.finishWriting { sem.signal() }
+        sem.wait()
+        if writer.status != .completed {
+            throw MuxError.finishFailed(writer.error?.localizedDescription ?? "unknown")
+        }
     }
 
     // MARK: - Private
-
-    private func appendLog(_ line: String) {
-        log.append(line)
-        if log.count > 400 { log.removeFirst(log.count - 400) }
-    }
 
     private func insertRecent(_ path: String) {
         recent.removeAll { $0 == path }
@@ -149,149 +227,4 @@ final class VideoGenService: ObservableObject {
         let filename = "\(tf.string(from: Date()))_\(slug).mp4"
         return (dayDir as NSString).appendingPathComponent(filename)
     }
-
-    private static func buildArgs(_ r: VideoGenRequest, outputPath: String) -> [String] {
-        var args = [
-            "--repo", r.model.repo,
-            "--mode", r.mode.rawValue,
-            "--prompt", r.prompt,
-            "--width", String(r.width),
-            "--height", String(r.height),
-            "--frames", String(r.numFrames),
-            "--fps", String(r.fps),
-            "--steps", String(r.steps),
-            "--cfg", String(r.cfgScale),
-            "--stg", String(r.stgScale),
-            "--seed", String(r.seed),
-            "--output", outputPath,
-        ]
-        if let path = r.firstFrameImagePath {
-            args.append(contentsOf: ["--image", path])
-        }
-        return args
-    }
-
-    /// Python script for LTX-Video 2.3 generation via `ltx-2-mlx`. Single
-    /// pipeline path — no fallbacks — mirrors the shape of the mflux image
-    /// script. Progress is coarse 4-phase (Download → Load → Generate →
-    /// Encode); the TI2Vid* pipelines don't expose a per-step callback, so
-    /// finer granularity would need monkey-patching `mlx_arsenal.scheduler`.
-    static let script: String = #"""
-import sys, json, argparse, traceback, os, shutil
-
-def emit(obj):
-    print(json.dumps(obj), flush=True)
-
-def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--repo", required=True)
-    p.add_argument("--mode", required=True, choices=["oneStage","twoStage","twoStageHQ"])
-    p.add_argument("--prompt", required=True)
-    p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--width", type=int, default=704)
-    p.add_argument("--height", type=int, default=480)
-    p.add_argument("--frames", type=int, default=97)
-    p.add_argument("--steps", type=int, default=8,
-                   help="num_steps for oneStage; stage1_steps for two-stage modes.")
-    p.add_argument("--cfg", type=float, default=3.0,
-                   help="CFG scale; ignored by oneStage.")
-    p.add_argument("--stg", type=float, default=0.0,
-                   help="Spatial-temporal guidance; ignored by oneStage.")
-    p.add_argument("--image", default=None,
-                   help="Optional first-frame image path (I2V via image=...).")
-    p.add_argument("--fps", type=int, default=24,
-                   help="Output frame rate. LTX-2.3 was trained at 24; far-off "
-                        "values drift out of distribution. Mandatory on every pipeline.")
-    p.add_argument("--output", required=True)
-    args = p.parse_args()
-
-    # Up-front ffmpeg check so the user sees an actionable error instead of
-    # the generic RuntimeError from inside ltx_core_mlx after Gemma loads.
-    if not shutil.which("ffmpeg"):
-        emit({"type":"error","message":"ffmpeg not found on PATH. Install it with: brew install ffmpeg"})
-        sys.exit(1)
-
-    try:
-        from ltx_pipelines_mlx import (
-            TI2VidOneStagePipeline,
-            TI2VidTwoStagesPipeline,
-            TI2VidTwoStagesHQPipeline,
-        )
-        from huggingface_hub import snapshot_download
-    except Exception as e:
-        emit({"type":"error","message":f"ltx-2-mlx import failed: {e}. Re-run the installer."})
-        traceback.print_exc()
-        sys.exit(1)
-
-    emit({"type":"progress","step":0,"total":4,
-          "message":f"Downloading {args.repo} (first run only, ~41 GB)..."})
-    try:
-        local = snapshot_download(repo_id=args.repo)
-    except Exception as e:
-        emit({"type":"error","message":f"Model download failed: {e}"})
-        traceback.print_exc()
-        sys.exit(1)
-
-    emit({"type":"progress","step":1,"total":4,
-          "message":"Loading Gemma text encoder + LTX transformer..."})
-    PIPELINES = {
-        "oneStage":   TI2VidOneStagePipeline,
-        "twoStage":   TI2VidTwoStagesPipeline,
-        "twoStageHQ": TI2VidTwoStagesHQPipeline,
-    }
-    try:
-        pipe = PIPELINES[args.mode](
-            model_dir=local,
-            gemma_model_id="mlx-community/gemma-3-12b-it-4bit",
-            low_memory=True,
-        )
-    except Exception as e:
-        emit({"type":"error","message":f"Pipeline load failed: {e}"})
-        traceback.print_exc()
-        sys.exit(1)
-
-    emit({"type":"progress","step":2,"total":4,
-          "message":f"Generating {args.frames} frames @ {args.width}x{args.height} ({args.mode})..."})
-    try:
-        if args.mode == "oneStage":
-            # Dev one-stage: num_steps drives the single denoise pass; CFG/STG
-            # apply (1.0/0.0 = guidance off for the fast presets). frame_rate is
-            # mandatory on every ltx-2-mlx pipeline.
-            pipe.generate_and_save(
-                prompt=args.prompt,
-                output_path=args.output,
-                height=args.height, width=args.width,
-                num_frames=args.frames, seed=args.seed,
-                frame_rate=args.fps,
-                num_steps=args.steps,
-                cfg_scale=args.cfg,
-                stg_scale=args.stg,
-                image=args.image,
-            )
-        else:
-            pipe.generate_and_save(
-                prompt=args.prompt,
-                output_path=args.output,
-                height=args.height, width=args.width,
-                num_frames=args.frames, seed=args.seed,
-                frame_rate=args.fps,
-                stage1_steps=args.steps, cfg_scale=args.cfg,
-                stg_scale=args.stg,
-                image=args.image,
-            )
-    except Exception as e:
-        emit({"type":"error","message":str(e)})
-        traceback.print_exc()
-        sys.exit(1)
-
-    emit({"type":"progress","step":3,"total":4,"message":"Encoding mp4 with audio (ffmpeg)..."})
-    if not os.path.exists(args.output):
-        emit({"type":"error","message":"Pipeline finished but output file is missing."})
-        sys.exit(1)
-    emit({"type":"progress","step":4,"total":4,"message":"Done."})
-    emit({"type":"complete","path":args.output})
-
-if __name__ == "__main__":
-    main()
-"""#
 }
