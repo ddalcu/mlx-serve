@@ -33,4 +33,6 @@ test {
     _ = @import("arch/ds4.zig");
     _ = @import("llama_ffi.zig");
     _ = @import("arch/llama.zig");
+    _ = @import("wav.zig");
+    _ = @import("tts.zig");
 }

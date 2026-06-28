@@ -1215,7 +1215,10 @@ fn loadWeightsOpt(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u
     var file_count: u32 = 0;
     var it = dir.iterate();
     while (try it.next(io)) |entry| {
-        if (entry.kind != .file) continue;
+        // Accept regular files AND symlinks: HuggingFace cache snapshots store
+        // every weight file as a symlink into ../../blobs/<hash>. mlx_load_safetensors
+        // resolves the link at the OS level, so a symlinked *.safetensors loads fine.
+        if (entry.kind != .file and entry.kind != .sym_link) continue;
         if (!std.mem.endsWith(u8, entry.name, ".safetensors")) continue;
 
         const path_slice = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ model_dir, entry.name });
