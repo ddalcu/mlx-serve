@@ -18,6 +18,7 @@ const ds4_arch = @import("arch/ds4.zig");
 const llama_arch = @import("arch/llama.zig");
 const ds4_ffi = @import("ds4_ffi.zig");
 const tts_server = @import("tts_server.zig");
+const flux_server = @import("flux_server.zig");
 const log = @import("log.zig");
 
 pub const VERSION: []const u8 = build_options.version;
@@ -571,6 +572,14 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    // Native FLUX.2 image generation: same self-contained serve path (mflux
+    // checkpoints store model_type "flux2-..." with transformer/vae/text_encoder
+    // subdirs). Peek before the transformer parseConfig and route to the FLUX loop.
+    if (serve_mode and isFluxModel(io, allocator, model_dir)) {
+        try flux_server.runFluxServe(io, allocator, model_dir, host, port);
+        return;
+    }
+
     // Parse config — heap allocate so the LoadedModel can take ownership
     // (Plan 05). Free path in serve_mode = registry.deinit; offline mode =
     // explicit defer on `config_storage`.
@@ -936,6 +945,23 @@ fn isTtsModel(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) b
     if (parsed.value != .object) return false;
     const mt = parsed.value.object.get("model_type") orelse return false;
     return mt == .string and std.mem.eql(u8, mt.string, "qwen3_tts");
+}
+
+fn isFluxModel(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) bool {
+    const path = std.fmt.allocPrint(allocator, "{s}/config.json", .{model_dir}) catch return false;
+    defer allocator.free(path);
+    const file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return false;
+    defer file.close(io);
+    var rb: [4096]u8 = undefined;
+    var rs = file.reader(io, &rb);
+    const content = rs.interface.allocRemaining(allocator, .limited(4 * 1024 * 1024)) catch return false;
+    defer allocator.free(content);
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    const mt = parsed.value.object.get("model_type") orelse return false;
+    // mflux FLUX.2 checkpoints: model_type "flux2-klein-4b" / "flux2-klein-9b" etc.
+    return mt == .string and std.mem.startsWith(u8, mt.string, "flux2");
 }
 
 fn isGgufPath(io: std.Io, path: []const u8) bool {

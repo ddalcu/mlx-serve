@@ -38,4 +38,6 @@ test {
     _ = @import("flux.zig");
     _ = @import("ltx_video.zig");
     _ = @import("tts_server.zig");
+    _ = @import("png.zig");
+    _ = @import("flux_server.zig");
 }
