@@ -152,6 +152,76 @@ pub fn conv3d(input: mlx.mlx_array, weight: mlx.mlx_array, stride: [3]c_int, pad
     return out;
 }
 
+/// Slice frames `[start, stop)` along the depth axis (axis 1) of an NDHWC array.
+fn sliceAxis1(x: mlx.mlx_array, start: c_int, stop: c_int, s: S) !mlx.mlx_array {
+    const sh = mlx.getShape(x);
+    const st = [_]c_int{ 0, start, 0, 0, 0 };
+    const sp = [_]c_int{ sh[0], stop, sh[2], sh[3], sh[4] };
+    const stride = [_]c_int{ 1, 1, 1, 1, 1 };
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_slice(&out, x, &st, 5, &sp, 5, &stride, 5, s));
+    return out;
+}
+
+/// Decoder-side (causal=False) Conv3dBlock forward: temporal SYMMETRIC replicate
+/// padding ((k-1)/2 frames front AND back), spatial zero-pad, then conv3d(pad=0),
+/// + bias. `x` is NDHWC `[B,D,H,W,C]`; `weight` is MLX `[O,kD,kH,kW,I]`; `bias` `[O]`.
+/// This is the reusable VAE-decoder conv (matches ltx_core_mlx Conv3dBlock, causal=False).
+pub fn decoderConv3d(x: mlx.mlx_array, weight: mlx.mlx_array, bias: ?mlx.mlx_array, k: u32, spatial_pad: u32, s: S) !mlx.mlx_array {
+    var t = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_array_set(&t, x));
+
+    const ps: c_int = @intCast((k - 1) / 2);
+    if (ps > 0) {
+        const D: c_int = mlx.getShape(x)[1];
+        const first = try sliceAxis1(x, 0, 1, s);
+        defer _ = mlx.mlx_array_free(first);
+        const last = try sliceAxis1(x, D - 1, D, s);
+        defer _ = mlx.mlx_array_free(last);
+        var fp = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(fp);
+        try mlx.check(mlx.mlx_repeat_axis(&fp, first, ps, 1, s));
+        var lp = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(lp);
+        try mlx.check(mlx.mlx_repeat_axis(&lp, last, ps, 1, s));
+        const vec = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(vec);
+        _ = mlx.mlx_vector_array_append_value(vec, fp);
+        _ = mlx.mlx_vector_array_append_value(vec, x);
+        _ = mlx.mlx_vector_array_append_value(vec, lp);
+        var nt = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_concatenate_axis(&nt, vec, 1, s));
+        _ = mlx.mlx_array_free(t);
+        t = nt;
+    }
+    if (spatial_pad > 0) {
+        const sp: c_int = @intCast(spatial_pad);
+        const axes = [_]c_int{ 2, 3 };
+        const lo = [_]c_int{ sp, sp };
+        const hi = [_]c_int{ sp, sp };
+        const zero = mlx.mlx_array_new_float(0);
+        defer _ = mlx.mlx_array_free(zero);
+        var nt = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_pad(&nt, t, &axes, 2, &lo, 2, &hi, 2, zero, "constant", s));
+        _ = mlx.mlx_array_free(t);
+        t = nt;
+    }
+    // mlx_conv miscomputes on strided/lazy input — materialize first (image-fork gotcha).
+    var tc = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(tc);
+    try mlx.check(mlx.mlx_contiguous(&tc, t, false, s));
+    _ = mlx.mlx_array_free(t);
+
+    const out = try conv3d(tc, weight, .{ 1, 1, 1 }, .{ 0, 0, 0 }, s);
+    if (bias) |b| {
+        var wb = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_add(&wb, out, b, s));
+        _ = mlx.mlx_array_free(out);
+        return wb;
+    }
+    return out;
+}
+
 /// Null-weight RMS / "PixelNorm" over the channel (last) axis: x / sqrt(mean(x^2)+eps).
 /// LTX VAE uses parameterless pixel norm; mlx_fast_rms_norm crashes on null weight,
 /// so compute it explicitly.
@@ -226,4 +296,83 @@ test "ltx loader: connector + vae_decoder key map" {
         try testing.expectEqual(@as(c_int, 1024), sh[0]);
         try testing.expectEqual(@as(c_int, 128), sh[4]);
     }
+}
+
+// Stage-5 keystone: validate decoderConv3d (the VAE's causal=False Conv3dBlock)
+// against the reference conv_in. Confirms the conv3d primitive + [O,kD,kH,kW,I]
+// weight layout + replicate/zero padding produce bit-faithful numerics — the
+// gate for the whole 3D VAE decoder. Gated on:
+//   LTX_TEST_MODEL = ltx-2.3-mlx-q4 snapshot dir
+//   LTX_CONVIN_X / LTX_CONVIN_Y = raw f32 dumps from the Python oracle
+//     ([1,3,8,8,128] input / [1,3,8,8,1024] output of conv_in).
+test "ltx decoderConv3d matches reference conv_in" {
+    const dir = std.mem.span(std.c.getenv("LTX_TEST_MODEL") orelse return error.SkipZigTest);
+    const xp = std.mem.span(std.c.getenv("LTX_CONVIN_X") orelse return error.SkipZigTest);
+    const yp = std.mem.span(std.c.getenv("LTX_CONVIN_Y") orelse return error.SkipZigTest);
+    const allocator = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+
+    const xbuf = try readF32(io, allocator, xp);
+    defer allocator.free(xbuf);
+    const yref = try readF32(io, allocator, yp);
+    defer allocator.free(yref);
+
+    const xshape = [_]c_int{ 1, 3, 8, 8, 128 };
+    const x = mlx.mlx_array_new_data(xbuf.ptr, &xshape, 5, .float32);
+    defer _ = mlx.mlx_array_free(x);
+
+    // Load weights on a CPU stream — the safetensors Load op only evals on CPU;
+    // loading on the GPU stream makes the downstream GPU conv graph fail with
+    // "[Load::eval_gpu] Not implemented".
+    const cpu_s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(cpu_s);
+    const vp = try std.fmt.allocPrintSentinel(allocator, "{s}/vae_decoder.safetensors", .{dir}, 0);
+    defer allocator.free(vp);
+    var comp = try loadComponent(allocator, vp, cpu_s);
+    defer comp.deinit();
+    const w = comp.get("vae_decoder.conv_in.conv.weight").?;
+    const b = comp.get("vae_decoder.conv_in.conv.bias").?;
+    _ = mlx.mlx_array_eval(w);
+    _ = mlx.mlx_array_eval(b);
+
+    const out = try decoderConv3d(x, w, b, 3, 1, s);
+    defer _ = mlx.mlx_array_free(out);
+    var outf = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(outf);
+    try mlx.check(mlx.mlx_astype(&outf, out, .float32, s));
+    _ = mlx.mlx_array_eval(outf);
+
+    const n: usize = @intCast(mlx.mlx_array_size(outf));
+    try testing.expectEqual(yref.len, n);
+    const data = mlx.mlx_array_data_float32(outf).?;
+    var dot: f64 = 0;
+    var na: f64 = 0;
+    var nb: f64 = 0;
+    var maxabs: f64 = 0;
+    for (0..n) |i| {
+        const a: f64 = data[i];
+        const r: f64 = yref[i];
+        dot += a * r;
+        na += a * a;
+        nb += r * r;
+        maxabs = @max(maxabs, @abs(a - r));
+    }
+    const corr = dot / (@sqrt(na) * @sqrt(nb));
+    std.debug.print("[ltx-conv3d] n={d} corr={d:.6} max_abs_err={d:.5}\n", .{ n, corr, maxabs });
+    try testing.expect(corr > 0.9999);
+}
+
+fn readF32(io: std.Io, allocator: std.mem.Allocator, path: []const u8) ![]f32 {
+    const f = try std.Io.Dir.openFileAbsolute(io, path, .{});
+    defer f.close(io);
+    var rb: [4096]u8 = undefined;
+    var rs = f.reader(io, &rb);
+    const bytes = try rs.interface.allocRemaining(allocator, .limited(256 * 1024 * 1024));
+    defer allocator.free(bytes);
+    const cnt = bytes.len / 4;
+    const out = try allocator.alloc(f32, cnt);
+    @memcpy(std.mem.sliceAsBytes(out), bytes[0 .. cnt * 4]);
+    return out;
 }
