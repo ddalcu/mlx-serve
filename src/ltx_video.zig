@@ -2259,6 +2259,184 @@ pub fn framesToU8(pixels: mlx.mlx_array, alloc: std.mem.Allocator, s: S) ![]u8 {
     return out;
 }
 
+// ════════════════════════════════════════════════════════════════════════
+// End-to-end orchestration: prompt → text embeds → noise → sampler → frames.
+// Composes the validated stages (gemmaCapture, connector, ditSampleCfg, VAE).
+// Reference: ltx_pipelines_mlx ti2vid_one_stage + utils/positions + patchifiers.
+// ════════════════════════════════════════════════════════════════════════
+
+/// VAE-latent spatial dims from pixel dims (temporal /8 ceil, spatial /32).
+pub fn computeVideoLatentShape(num_frames: u32, height: u32, width: u32) struct { F: u32, H: u32, W: u32 } {
+    return .{ .F = (num_frames + 7) / 8, .H = height / 32, .W = width / 32 };
+}
+
+/// Audio latent token count for a video length (≈25 latents/sec).
+pub fn computeAudioTokenCount(num_frames: u32, frame_rate: f32) u32 {
+    const dur = @as(f32, @floatFromInt(num_frames)) / frame_rate;
+    return @intFromFloat(@round(dur * 25.0));
+}
+
+/// 3D video positions [F*H*W*3] (time, height, width) in pixel-space, causal-fix
+/// temporal / frame_rate. Mirrors utils/positions.compute_video_positions.
+pub fn computeVideoPositions(alloc: std.mem.Allocator, F: u32, H: u32, W: u32, frame_rate: f32) ![]f32 {
+    const out = try alloc.alloc(f32, F * H * W * 3);
+    for (0..F) |f| {
+        const fi: f32 = @floatFromInt(f);
+        const fs = @max(fi * 8.0 + 1.0 - 8.0, 0.0);
+        const fe = @max((fi + 1.0) * 8.0 + 1.0 - 8.0, 0.0);
+        const fmid = (fs + fe) / 2.0 / frame_rate;
+        for (0..H) |h| {
+            const hmid = @as(f32, @floatFromInt(h)) * 32.0 + 16.0;
+            for (0..W) |w| {
+                const wmid = @as(f32, @floatFromInt(w)) * 32.0 + 16.0;
+                const n = (f * H + h) * W + w;
+                out[n * 3 + 0] = fmid;
+                out[n * 3 + 1] = hmid;
+                out[n * 3 + 2] = wmid;
+            }
+        }
+    }
+    return out;
+}
+
+/// 1D audio positions [num_tokens] in real-time seconds (causal midpoints).
+pub fn computeAudioPositions(alloc: std.mem.Allocator, num_tokens: u32) ![]f32 {
+    const out = try alloc.alloc(f32, num_tokens);
+    for (0..num_tokens) |i| {
+        const fi: f32 = @floatFromInt(i);
+        const start = @max(fi * 4.0 + 1.0 - 4.0, 0.0) * 160.0 / 16000.0;
+        const end = @max((fi + 1.0) * 4.0 + 1.0 - 4.0, 0.0) * 160.0 / 16000.0;
+        out[i] = (start + end) / 2.0;
+    }
+    return out;
+}
+
+/// Seed-based standard-normal noise (f32 → bf16), matching the reference dtype.
+fn mlxRandomNormal(shape: []const c_int, seed: u64, s: S) !mlx.mlx_array {
+    var key = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(key);
+    try mlx.check(mlx.mlx_random_key(&key, seed));
+    var f32n = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(f32n);
+    try mlx.check(mlx.mlx_random_normal(&f32n, shape.ptr, shape.len, .float32, 0.0, 1.0, key, s));
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_astype(&out, f32n, .bfloat16, s));
+    return out;
+}
+
+pub const TextEmbeds = struct {
+    video: mlx.mlx_array,
+    audio: mlx.mlx_array,
+    pub fn deinit(self: *TextEmbeds) void {
+        _ = mlx.mlx_array_free(self.video);
+        _ = mlx.mlx_array_free(self.audio);
+    }
+};
+
+/// Full text-conditioning path: gemmaCapture (49 states) → connectorProject →
+/// connectorTransform (per modality). `ids` is the left-padded token sequence;
+/// pads are replaced by learnable registers inside connectorTransform.
+pub fn encodeTextLtx(connector: *const Component, io: std.Io, alloc: std.mem.Allocator, gemma_dir: []const u8, ids: []const i32, pad_id: i32, s: S) !TextEmbeds {
+    const states = try gemmaCapture(io, alloc, gemma_dir, ids, pad_id, s);
+    defer {
+        for (states) |st| _ = mlx.mlx_array_free(st);
+        alloc.free(states);
+    }
+    var proj = try connectorProject(connector, alloc, states, s);
+    defer proj.deinit();
+    var n_valid: u32 = 0;
+    for (ids) |t| {
+        if (t != pad_id) n_valid += 1;
+    }
+    const video = try connectorTransform(connector, alloc, proj.video, n_valid, 4096, 128, "connector.video_embeddings_connector", s);
+    errdefer _ = mlx.mlx_array_free(video);
+    const audio = try connectorTransform(connector, alloc, proj.audio, n_valid, 2048, 64, "connector.audio_embeddings_connector", s);
+    return .{ .video = video, .audio = audio };
+}
+
+pub const VideoFrames = struct {
+    rgb: []u8, // [F_px, H_px, W_px, 3] row-major
+    frames: u32,
+    height: u32,
+    width: u32,
+    pub fn deinit(self: *VideoFrames, alloc: std.mem.Allocator) void {
+        alloc.free(self.rgb);
+    }
+};
+
+/// Full native text-to-video: prompt ids (+ negative) → text embeds → seed noise
+/// → CFG Euler sampler → VAE decode → RGB uint8 frames. `connector` and
+/// `transformer` are the connector.safetensors and transformer-dev.safetensors
+/// Components; `vae` is vae_decoder.safetensors. Caller frees the result.
+pub fn generateVideoFrames(
+    io: std.Io,
+    alloc: std.mem.Allocator,
+    cfg: LtxConfig,
+    transformer: *const Component,
+    connector: *const Component,
+    vae: *const Component,
+    gemma_dir: []const u8,
+    pos_ids: []const i32,
+    neg_ids: []const i32,
+    pad_id: i32,
+    num_frames: u32,
+    height: u32,
+    width: u32,
+    frame_rate: f32,
+    num_steps: u32,
+    seed: u64,
+    cfg_video: f32,
+    cfg_audio: f32,
+    rescale: f32,
+    s: S,
+) !VideoFrames {
+    const shape = computeVideoLatentShape(num_frames, height, width);
+    const F = shape.F;
+    const H = shape.H;
+    const W = shape.W;
+    const Nv = F * H * W;
+    const Na = computeAudioTokenCount(num_frames, frame_rate);
+    log.info("[ltx] latent F={d} H={d} W={d} (Nv={d}, Na={d}) steps={d}\n", .{ F, H, W, Nv, Na, num_steps });
+
+    // ── text embeds (positive + negative) ──
+    var pos = try encodeTextLtx(connector, io, alloc, gemma_dir, pos_ids, pad_id, s);
+    defer pos.deinit();
+    _ = mlx.mlx_array_eval(pos.video);
+    _ = mlx.mlx_array_eval(pos.audio);
+    var neg = try encodeTextLtx(connector, io, alloc, gemma_dir, neg_ids, pad_id, s);
+    defer neg.deinit();
+    _ = mlx.mlx_array_eval(neg.video);
+    _ = mlx.mlx_array_eval(neg.audio);
+
+    // ── positions + schedule ──
+    const vpos = try computeVideoPositions(alloc, F, H, W, frame_rate);
+    defer alloc.free(vpos);
+    const apos = try computeAudioPositions(alloc, Na);
+    defer alloc.free(apos);
+    const sigmas = try dynamicShiftSchedule(alloc, num_steps, Nv, 0.95, 2.05, 1024, 4096, true, 0.1);
+    defer alloc.free(sigmas);
+
+    // ── seed noise (video seed, audio seed+1 — matches the reference) ──
+    const noise_v = try mlxRandomNormal(&[_]c_int{ 1, @intCast(Nv), 128 }, seed, s);
+    defer _ = mlx.mlx_array_free(noise_v);
+    const noise_a = try mlxRandomNormal(&[_]c_int{ 1, @intCast(Na), 128 }, seed + 1, s);
+    defer _ = mlx.mlx_array_free(noise_a);
+
+    // ── denoise ──
+    const final = try ditSampleCfg(transformer, alloc, cfg, noise_v, noise_a, pos.video, pos.audio, neg.video, neg.audio, vpos, apos, sigmas, cfg_video, cfg_audio, rescale, s);
+    defer _ = mlx.mlx_array_free(final.v);
+    defer _ = mlx.mlx_array_free(final.a);
+
+    // ── decode video → frames ──
+    const latent = try unpatchifyVideo(final.v, F, H, W, s);
+    defer _ = mlx.mlx_array_free(latent);
+    const pixels = try vaeDecode(vae, latent, s);
+    defer _ = mlx.mlx_array_free(pixels);
+    const psh = mlx.getShape(pixels); // [1,3,F_px,H_px,W_px]
+    const rgb = try framesToU8(pixels, alloc, s);
+    return .{ .rgb = rgb, .frames = @intCast(psh[2]), .height = @intCast(psh[3]), .width = @intCast(psh[4]) };
+}
+
 // ── Tests ──
 
 const testing = std.testing;
@@ -3210,4 +3388,75 @@ test "ltx DiT latent-to-frames reproduces reference decode" {
     std.debug.print("[ltx-frames] n={d} psnr={d:.2}dB max_diff={d} exact={d:.3}\n", .{ frames.len, psnr, maxd, exact_frac });
     try testing.expect(psnr > 45.0);
     try testing.expect(maxd <= 2);
+}
+
+// Stage 6a: native positions match the reference compute_video/audio_positions.
+// Cheap, no model. Gated on LTX_POS_V / LTX_POS_A dumps.
+test "ltx DiT computeVideoPositions matches reference" {
+    const pvp = std.c.getenv("LTX_POS_V") orelse return error.SkipZigTest;
+    const pap = std.c.getenv("LTX_POS_A") orelse return error.SkipZigTest;
+    const allocator = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const refv = try readF32(io, allocator, std.mem.span(pvp));
+    defer allocator.free(refv);
+    const refa = try readF32(io, allocator, std.mem.span(pap));
+    defer allocator.free(refa);
+    const vpos = try computeVideoPositions(allocator, 2, 8, 12, 24.0);
+    defer allocator.free(vpos);
+    const apos = try computeAudioPositions(allocator, 9);
+    defer allocator.free(apos);
+    try testing.expectEqual(refv.len, vpos.len);
+    try testing.expectEqual(refa.len, apos.len);
+    var maxv: f64 = 0;
+    for (vpos, refv) |a, b| maxv = @max(maxv, @abs(@as(f64, a) - @as(f64, b)));
+    var maxa: f64 = 0;
+    for (apos, refa) |a, b| maxa = @max(maxa, @abs(@as(f64, a) - @as(f64, b)));
+    std.debug.print("[ltx-pos] video max_err={e} audio max_err={e}\n", .{ maxv, maxa });
+    try testing.expect(maxv < 1e-4 and maxa < 1e-6);
+}
+
+// Stage 6b: encodeTextLtx (gemmaCapture → connectorProject → connectorTransform)
+// reproduces the reference PromptEncoder embeds. Gated on LTX_TEST_MODEL (connector)
+// + LTX_GEMMA_MODEL + LTX_TEXT_IDS/VIDEO/AUDIO.
+test "ltx DiT encodeTextLtx reproduces PromptEncoder" {
+    const dir = std.mem.span(std.c.getenv("LTX_TEST_MODEL") orelse return error.SkipZigTest);
+    const gdir = std.mem.span(std.c.getenv("LTX_GEMMA_MODEL") orelse return error.SkipZigTest);
+    const idp = std.mem.span(std.c.getenv("LTX_TEXT_IDS") orelse return error.SkipZigTest);
+    const allocator = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const cpu_s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(cpu_s);
+
+    const cp = try std.fmt.allocPrintSentinel(allocator, "{s}/connector.safetensors", .{dir}, 0);
+    defer allocator.free(cp);
+    var comp = try loadComponent(allocator, cp, cpu_s);
+    defer comp.deinit();
+    var it = comp.map.iterator();
+    while (it.next()) |e| _ = mlx.mlx_array_eval(e.value_ptr.*);
+
+    const ids = try readI32(io, allocator, idp);
+    defer allocator.free(ids);
+
+    var emb = try encodeTextLtx(&comp, io, allocator, gdir, ids, 0, s);
+    defer emb.deinit();
+    var vf = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(vf);
+    try mlx.check(mlx.mlx_astype(&vf, emb.video, .float32, s));
+    _ = mlx.mlx_array_eval(vf);
+    var af = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(af);
+    try mlx.check(mlx.mlx_astype(&af, emb.audio, .float32, s));
+    _ = mlx.mlx_array_eval(af);
+
+    const refv = try readF32(io, allocator, std.mem.span(std.c.getenv("LTX_TEXT_VIDEO") orelse return error.SkipZigTest));
+    defer allocator.free(refv);
+    const refa = try readF32(io, allocator, std.mem.span(std.c.getenv("LTX_TEXT_AUDIO") orelse return error.SkipZigTest));
+    defer allocator.free(refa);
+    const vc = corrF32(mlx.mlx_array_data_float32(vf).?, refv, 0);
+    const ac = corrF32(mlx.mlx_array_data_float32(af).?, refa, 0);
+    std.debug.print("[ltx-text] video corr={d:.6} audio corr={d:.6}\n", .{ vc, ac });
+    try testing.expect(vc > 0.99);
+    try testing.expect(ac > 0.99);
 }
