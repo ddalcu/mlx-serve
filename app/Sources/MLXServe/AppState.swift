@@ -83,10 +83,9 @@ class AppState: ObservableObject {
     /// index dies with the app and is rebuilt by re-attaching the folder.
     @Published var documentIndexes: [UUID: DocumentIndex] = [:]
     let testServer = TestServer()
-    @Published var python = PythonManager()
-    lazy var imageGen = ImageGenService(python: python)
-    lazy var videoGen = VideoGenService(python: python)
-    lazy var audioGen = AudioGenService(python: python)
+    lazy var imageGen = ImageGenService()
+    lazy var videoGen = VideoGenService()
+    lazy var audioGen = AudioGenService()
     @Published var hasSeenWelcome: Bool {
         didSet { UserDefaults.standard.set(hasSeenWelcome, forKey: "hasSeenWelcome") }
     }

@@ -71,49 +71,47 @@ private func safeFrameCap(modelRAMGB: Int, modelMaxFrames: Int, width: Int, heig
     return min(modelMaxFrames, max(9, framesByRAM))
 }
 
-// =============================================================================
-// MARK: - Replica of PythonManager's venv import-probe
-//
-// `checkPackages()` builds one `python -c` program from `requiredImports` and
-// treats a nonzero exit as "venv not ready → show the install pane". The bug:
-// a bare `import ltx_pipelines_mlx` succeeds even after the git-pinned package
-// drifts and stops exporting `TextToVideoPipeline`, so the app reported
-// `.ready` and let the user click Generate — which then died at runtime with
-// "cannot import name 'TextToVideoPipeline'". The probe must verify the exact
-// symbols the generation script imports, not just that the module loads.
-// Kept verbatim-in-sync with PythonManager.requiredImports / importProbeScript().
-// =============================================================================
 
-/// Pipeline symbols `VideoGenService.script` imports from `ltx_pipelines_mlx`
-/// (ltx-2-mlx ≥0.14 names).
-private let ltxPipelineSymbolsReplica = ["TI2VidOneStagePipeline", "TI2VidTwoStagesPipeline", "TI2VidTwoStagesHQPipeline"]
-
-private let requiredImportsReplica: [String] = [
-    "import mflux",
-    "import ltx_core_mlx",
-    "from ltx_pipelines_mlx import " + ltxPipelineSymbolsReplica.joined(separator: ", "),
-    "from mlx_audio.tts.generate import generate_audio",
-    "import PIL",
-    "import safetensors",
-    "import huggingface_hub",
-]
-
-private func importProbeScriptReplica() -> String {
-    requiredImportsReplica.joined(separator: "\n")
+/// Replica of `VideoGenService.decodeFrames` — the native `/v1/video/generations`
+/// rgb8 wire format (frames/height/width/fps + base64 data, with a length check).
+/// MLXCore is an executable target so tests can't import the real method; this
+/// pins the contract the server (`src/ltx_server.zig`) emits.
+struct DecodedFramesReplica: Equatable {
+    var rgb: Data; var frames: Int; var height: Int; var width: Int; var fps: Int
 }
-
-/// The single import statement that probes `ltx_pipelines_mlx`, isolated so a
-/// test can run it against a throwaway package without needing mflux/PIL/etc.
-private func ltxProbeStatementReplica() -> String {
-    requiredImportsReplica.first { $0.contains("ltx_pipelines_mlx") }!
-}
-
-/// Replica of `VideoGenService.indicatesVenvNeedsReinstall`.
-private func indicatesVenvNeedsReinstallReplica(_ message: String) -> Bool {
-    message.localizedCaseInsensitiveContains("import failed")
+func decodeFramesReplica(_ body: Data) -> DecodedFramesReplica? {
+    guard let obj = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
+          let format = obj["format"] as? String, format == "rgb8",
+          let frames = obj["frames"] as? Int,
+          let height = obj["height"] as? Int,
+          let width = obj["width"] as? Int,
+          let b64 = obj["data"] as? String,
+          let rgb = Data(base64Encoded: b64),
+          rgb.count == frames * height * width * 3
+    else { return nil }
+    let fps = (obj["fps"] as? Int) ?? 24
+    return DecodedFramesReplica(rgb: rgb, frames: frames, height: height, width: width, fps: fps)
 }
 
 final class MediaGenTests: XCTestCase {
+
+    // MARK: - Native video wire format
+
+    func testDecodeFramesParsesValidBody() {
+        let rgb = Data([10, 20, 30, 40, 50, 60]) // 1 frame, 1x2, 3ch
+        let b64 = rgb.base64EncodedString()
+        let body = "{\"frames\":1,\"height\":1,\"width\":2,\"fps\":24,\"format\":\"rgb8\",\"data\":\"\(b64)\"}".data(using: .utf8)!
+        let d = decodeFramesReplica(body)
+        XCTAssertEqual(d, DecodedFramesReplica(rgb: rgb, frames: 1, height: 1, width: 2, fps: 24))
+    }
+
+    func testDecodeFramesRejectsLengthMismatchAndWrongFormat() {
+        // declared 1x2x3=6 bytes but only 3 provided
+        let short = "{\"frames\":1,\"height\":1,\"width\":2,\"fps\":24,\"format\":\"rgb8\",\"data\":\"\(Data([1,2,3]).base64EncodedString())\"}".data(using: .utf8)!
+        XCTAssertNil(decodeFramesReplica(short))
+        let wrongFmt = "{\"frames\":1,\"height\":1,\"width\":2,\"fps\":24,\"format\":\"png\",\"data\":\"\(Data([1,2,3,4,5,6]).base64EncodedString())\"}".data(using: .utf8)!
+        XCTAssertNil(decodeFramesReplica(wrongFmt))
+    }
 
     // MARK: - Quality preset
 
@@ -252,103 +250,4 @@ final class MediaGenTests: XCTestCase {
             "fps value must follow the --fps flag")
     }
 
-    // MARK: - venv import-probe (ltx symbol drift)
-
-    /// Regression for the bug report: a venv whose `ltx_pipelines_mlx` module
-    /// imports fine but no longer exports `TextToVideoPipeline` (upstream
-    /// drift) must be detected as NOT ready, so the UI re-offers the installer
-    /// instead of letting generation fail at runtime. Runs the real probe
-    /// statement against a throwaway package with the symbol missing.
-    func testProbeDetectsMissingPipelineSymbol() throws {
-        guard let py = Self.findPython3() else { throw XCTSkip("python3 not available") }
-        let dir = try Self.makeFakeLtxPackage(symbols: [])
-        defer { try? FileManager.default.removeItem(atPath: dir) }
-        let status = Self.runPythonProbe(py, script: ltxProbeStatementReplica(), pythonPath: dir)
-        XCTAssertNotEqual(status, 0,
-            "A venv whose ltx_pipelines_mlx lacks TextToVideoPipeline must probe as NOT ready")
-    }
-
-    /// The positive case: when every pipeline symbol is exported, the probe
-    /// passes and the venv counts as ready.
-    func testProbePassesWhenPipelineSymbolsPresent() throws {
-        guard let py = Self.findPython3() else { throw XCTSkip("python3 not available") }
-        let dir = try Self.makeFakeLtxPackage(symbols: ltxPipelineSymbolsReplica)
-        defer { try? FileManager.default.removeItem(atPath: dir) }
-        let status = Self.runPythonProbe(py, script: ltxProbeStatementReplica(), pythonPath: dir)
-        XCTAssertEqual(status, 0, "A venv exporting all pipeline symbols must probe as ready")
-    }
-
-    /// The full probe must check ltx at the symbol level, as a newline-joined
-    /// multi-statement program — not the old single comma `import` that masked
-    /// the drift.
-    func testImportProbeIsSymbolLevelForLtx() {
-        let script = importProbeScriptReplica()
-        XCTAssertTrue(script.contains("from ltx_pipelines_mlx import \(ltxPipelineSymbolsReplica.first!)"),
-            "Probe must verify the pipeline symbols, not just that the module loads:\n\(script)")
-        XCTAssertTrue(script.contains("\n"),
-            "Probe must be a newline-joined multi-statement program")
-        XCTAssertFalse(script.contains("import mflux, "),
-            "Probe should not collapse modules into a single comma import")
-    }
-
-    /// The runtime-recovery predicate: a failed required import (the bug's
-    /// "ltx-2-mlx import failed: … Re-run the installer." message) must trigger
-    /// re-detection; an ordinary per-request error must not.
-    func testReinstallPredicateMatchesImportFailures() {
-        XCTAssertTrue(indicatesVenvNeedsReinstallReplica(
-            "ltx-2-mlx import failed: cannot import name 'TextToVideoPipeline'. Re-run the installer."))
-        XCTAssertTrue(indicatesVenvNeedsReinstallReplica("mflux import failed: No module named 'mflux'"))
-        XCTAssertFalse(indicatesVenvNeedsReinstallReplica("Model download failed: 404"))
-        XCTAssertFalse(indicatesVenvNeedsReinstallReplica("ffmpeg not found on PATH."))
-    }
-
-    /// End-to-end against the real venv (skipped where none exists, e.g. CI):
-    /// the symbols the app probes must actually be exported by the installed
-    /// `ltx_pipelines_mlx`. This is what caught the 0.14.9 rename
-    /// (TextToVideoPipeline → TI2VidOneStagePipeline) that made a freshly
-    /// installed venv still fail the import check.
-    func testRealVenvPassesFullImportProbe() throws {
-        let venvPython = NSString(string: "~/.mlx-serve/venv/bin/python").expandingTildeInPath
-        guard FileManager.default.isExecutableFile(atPath: venvPython) else {
-            throw XCTSkip("no venv at ~/.mlx-serve/venv")
-        }
-        let status = Self.runPythonProbe(venvPython, script: importProbeScriptReplica(), pythonPath: "")
-        XCTAssertEqual(status, 0,
-            "The installed venv must pass the same import probe the app runs:\n\(importProbeScriptReplica())")
-    }
-
-    // MARK: - Probe test helpers
-
-    private static func findPython3() -> String? {
-        for p in ["/opt/homebrew/bin/python3", "/usr/local/bin/python3", "/usr/bin/python3"]
-        where FileManager.default.isExecutableFile(atPath: p) { return p }
-        return nil
-    }
-
-    /// Create a throwaway `ltx_pipelines_mlx` package exporting `symbols`;
-    /// returns the directory to place on PYTHONPATH.
-    private static func makeFakeLtxPackage(symbols: [String]) throws -> String {
-        let root = (NSTemporaryDirectory() as NSString)
-            .appendingPathComponent("ltxprobe-" + UUID().uuidString)
-        let pkg = (root as NSString).appendingPathComponent("ltx_pipelines_mlx")
-        try FileManager.default.createDirectory(atPath: pkg, withIntermediateDirectories: true)
-        let body = symbols.map { "\($0) = object" }.joined(separator: "\n") + "\n"
-        try body.write(toFile: (pkg as NSString).appendingPathComponent("__init__.py"),
-                       atomically: true, encoding: .utf8)
-        return root
-    }
-
-    private static func runPythonProbe(_ python: String, script: String, pythonPath: String) -> Int32 {
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: python)
-        proc.arguments = ["-c", script]
-        var env = ProcessInfo.processInfo.environment
-        env["PYTHONPATH"] = pythonPath
-        proc.environment = env
-        proc.standardOutput = Pipe()
-        proc.standardError = Pipe()
-        do { try proc.run() } catch { return -1 }
-        proc.waitUntilExit()
-        return proc.terminationStatus
-    }
 }

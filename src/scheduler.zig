@@ -36,6 +36,7 @@ const mlx = @import("mlx.zig");
 const transformer_mod = @import("transformer.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const generate_mod = @import("generate.zig");
+const gen_mod = @import("gen.zig");
 const drafter_mod = @import("drafter.zig");
 const mtp_mod = @import("mtp.zig");
 const diffusion_mod = @import("diffusion.zig");
@@ -173,6 +174,12 @@ pub const LoadParams = struct {
     /// installs it on the entry's `llama_engine` field. Mutually exclusive with
     /// `ds4_path` and the MLX safetensors path.
     llama_path: []const u8 = "",
+    /// Headless boot: skip the startup load entirely and run the inference
+    /// loop idle. The registry holds discovery stubs (or nothing); the first
+    /// model — chat or media — loads on demand via `/v1/load-model`. `entry`/
+    /// `config`/`tok`/`chat_config` are still required (they seed the
+    /// scheduler's borrowed-view fields) but are never installed on an entry.
+    no_initial_load: bool = false,
 };
 
 /// Submit-time parameters. `prompt_ids` and `eos_token_ids` are duped into the
@@ -844,6 +851,37 @@ pub const LoadRequest = struct {
     ds4_path: []const u8 = "",
 };
 
+/// Media-generation work item. Posted by `runGeneration` from a connection
+/// thread; the inference thread invokes `run(ctx)` between ticks so all mlx
+/// ops AND the SSE writes to the (parked) connection happen on the GPU-stream-
+/// owning thread. Decoupled via an opaque ctx + runner so this module needs
+/// no dependency on `server.zig`/`gen.zig` — `server.zig` owns the job body.
+pub const GenRequest = struct {
+    /// Opaque job payload (a `*GenJob` in server.zig).
+    ctx: *anyopaque,
+    /// Runs the job body on the inference thread. Must not return an error
+    /// (it writes any failure into its own response/SSE).
+    run: *const fn (ctx: *anyopaque) void,
+    /// The media model. `gen_busy` is set/cleared around the run for
+    /// visibility; the conn thread's refcount already pins it against eviction.
+    model: *model_registry_mod.LoadedModel,
+    done: bool = false,
+    done_mu: std.Io.Mutex = .init,
+    done_cond: std.Io.Condition = .init,
+};
+
+/// Model-unload work item. Posted by `unloadModel` after the conn thread
+/// marked the entry `.evicting` and drained its refcount. The inference thread
+/// frees the entry's resident mlx state (stream-bound) and finalizes the
+/// eviction accounting, then the entry returns to `.unloaded` (the stub stays
+/// in the registry so it can reload later).
+pub const UnloadRequest = struct {
+    entry: *model_registry_mod.LoadedModel,
+    done: bool = false,
+    done_mu: std.Io.Mutex = .init,
+    done_cond: std.Io.Condition = .init,
+};
+
 /// Continuous-batching scheduler. One per server. Owns the inference
 /// thread, the queue of in-flight slots, AND (post-A1) the loaded model
 /// state — Transformer + weights + vision encoder + drafter all live here,
@@ -912,6 +950,17 @@ pub const Scheduler = struct {
     /// `.loading` state on the entry — `ensureLoaded` only posts when it
     /// successfully flips the entry from `.unloaded` → `.loading`.
     load_queue: std.ArrayList(*LoadRequest),
+    /// Pending media-generation jobs (image/audio/video). Conn threads post
+    /// here via `runGeneration`; the inference thread runs each to completion
+    /// between ticks (it owns the GPU stream — the sole mlx caller — so gen
+    /// MLX ops + SSE writes to the parked connection are single-threaded).
+    /// A long gen stalls chat decode for its duration; accepted tradeoff
+    /// (single GPU, gen is the user's foreground action).
+    gen_queue: std.ArrayList(*GenRequest),
+    /// Pending model-unload jobs. Conn threads post here via `unloadModel`
+    /// after marking the entry `.evicting` + draining its refcount; the
+    /// inference thread frees the mlx state (stream-bound, like cleanup).
+    unload_queue: std.ArrayList(*UnloadRequest),
     /// Slots awaiting cleanup. The conn thread queues a slot here in
     /// `complete()` instead of calling `slot.deinit()` directly — `deinit`
     /// frees mlx_arrays via refcount-decrement, and the underlying GPU
@@ -1000,6 +1049,8 @@ pub const Scheduler = struct {
             .vision_queue = std.ArrayList(*VisionEncodeRequest).empty,
             .embed_queue = std.ArrayList(*EmbedRequest).empty,
             .load_queue = std.ArrayList(*LoadRequest).empty,
+            .gen_queue = std.ArrayList(*GenRequest).empty,
+            .unload_queue = std.ArrayList(*UnloadRequest).empty,
             .cleanup_queue = std.ArrayList(*Slot).empty,
             .in_flight = 0,
             .queue_cap = cap + 32,
@@ -1086,6 +1137,23 @@ pub const Scheduler = struct {
             req.done_mu.unlock(self.io);
         }
         self.load_queue.deinit(self.allocator);
+        // Wake any conn threads blocked in runGeneration / unloadModel. The
+        // jobs never ran (so the gen body wrote no response — the conn thread
+        // surfaces a 503), but we must release them so they don't hang.
+        for (self.gen_queue.items) |req| {
+            req.done_mu.lockUncancelable(self.io);
+            req.done = true;
+            req.done_cond.broadcast(self.io);
+            req.done_mu.unlock(self.io);
+        }
+        self.gen_queue.deinit(self.allocator);
+        for (self.unload_queue.items) |req| {
+            req.done_mu.lockUncancelable(self.io);
+            req.done = true;
+            req.done_cond.broadcast(self.io);
+            req.done_mu.unlock(self.io);
+        }
+        self.unload_queue.deinit(self.allocator);
 
         // Plan 05: mlx-allocating state lives on the `LoadedModel` owned by
         // the registry. We can't free the entries here (registry teardown
@@ -1423,6 +1491,68 @@ pub const Scheduler = struct {
         self.registry.release(lm);
     }
 
+    /// Run a media-generation job on the inference thread. Posts `req` to the
+    /// gen queue and blocks the calling (connection) thread until the
+    /// inference thread has run the job body to completion. The job writes its
+    /// own HTTP/SSE response to the connection; this just synchronizes.
+    pub fn runGeneration(self: *Scheduler, req: *GenRequest) !void {
+        {
+            self.queue_mu.lockUncancelable(self.io);
+            defer self.queue_mu.unlock(self.io);
+            if (self.shutdown.load(.acquire)) return error.Shutdown;
+            try self.gen_queue.append(self.allocator, req);
+            self.queue_cond.broadcast(self.io);
+        }
+        req.done_mu.lockUncancelable(self.io);
+        while (!req.done) req.done_cond.waitUncancelable(self.io, &req.done_mu);
+        req.done_mu.unlock(self.io);
+    }
+
+    /// Free a model's resident GPU state, returning its registry stub to
+    /// `.unloaded` so it can reload later. Idempotent — a non-resident model
+    /// returns immediately. Marks the entry `.evicting`, drains in-flight
+    /// requests (refcount → 0), then hands the mlx free to the inference
+    /// thread (stream-bound). Blocks until the free completes.
+    pub fn unloadModel(self: *Scheduler, id_or_empty: []const u8) !void {
+        const entry = try self.registry.resolveEntry(id_or_empty);
+        {
+            self.registry.mutex.lockUncancelable(self.io);
+            wait: while (true) {
+                switch (entry.state) {
+                    // Already free (or failed-load stub) → nothing to do.
+                    .unloaded, .error_state => {
+                        self.registry.mutex.unlock(self.io);
+                        return;
+                    },
+                    // Another caller is mid load/evict — wait it out, then
+                    // re-check (it may end up resident or unloaded).
+                    .loading, .evicting => {
+                        self.registry.state_cond.waitUncancelable(self.io, &self.registry.mutex);
+                        continue :wait;
+                    },
+                    .ready => break :wait,
+                }
+            }
+            self.registry.markEvictingLocked(entry);
+            self.registry.waitForRefcountZeroLocked(entry);
+            self.registry.mutex.unlock(self.io);
+        }
+
+        var req = UnloadRequest{ .entry = entry };
+        {
+            self.queue_mu.lockUncancelable(self.io);
+            defer self.queue_mu.unlock(self.io);
+            // On shutdown the entry stays `.evicting`; `Scheduler.deinit`
+            // unloads every `.ready`/`.evicting` entry, so it's still freed.
+            if (self.shutdown.load(.acquire)) return error.Shutdown;
+            try self.unload_queue.append(self.allocator, &req);
+            self.queue_cond.broadcast(self.io);
+        }
+        req.done_mu.lockUncancelable(self.io);
+        while (!req.done) req.done_cond.waitUncancelable(self.io, &req.done_mu);
+        req.done_mu.unlock(self.io);
+    }
+
     /// Synchronously compute embeddings for `req.token_seqs` using the
     /// batched encoder forward pass on the inference thread. Same lifecycle
     /// as `encodeVision`: post + block + return results. Caller frees the
@@ -1568,6 +1698,16 @@ const CpuState = struct {
 /// call deinit on uninitialized memory. ModelConfig has no allocator-owned
 /// fields, so `allocator.destroy` is sufficient there.
 fn preloadCpuState(allocator: std.mem.Allocator, io: std.Io, model_dir: []const u8) !CpuState {
+    // Media model (image/audio/video): the engine owns the real tokenizer +
+    // forward path, so we hand the inference thread a minimal stub instead of
+    // parsing a transformer-shaped config (which would fail on a flux2/
+    // qwen3_tts/AudioVideo config.json). The gen load arm dispatches off the
+    // stub's `model_type`.
+    if (gen_mod.detectModality(io, allocator, model_dir)) |modality| {
+        const stub = try gen_mod.buildStubCpuState(allocator, modality);
+        return .{ .config = stub.config, .tok = stub.tok, .chat_config = stub.chat_config };
+    }
+
     const config = try allocator.create(ModelConfig);
     errdefer allocator.destroy(config);
     config.* = try model_mod.parseConfig(io, allocator, model_dir);
@@ -1752,6 +1892,56 @@ fn doLoadLlamaOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     sch.hot_prefix_cache = null;
 }
 
+/// Media-gen load on the inference thread. Mirrors `doLoadDs4OnInferenceThread`:
+/// build the modality engine (its mlx ops bind to this thread's GPU stream from
+/// t0), install it on the entry, move the stub config/tok/chat_config over, and
+/// mark ready. The MLX/ds4/llama fields stay null; request handlers route
+/// through the matching `image_engine`/`audio_engine`/`video_engine` slot.
+fn doLoadGenOnInferenceThread(sch: *Scheduler, params: anytype, modality: gen_mod.Modality) !void {
+    log.info("[gen] loading {s} engine: {s}\n", .{ @tagName(modality), params.model_dir });
+    const entry = params.entry;
+
+    // Build the engine FIRST. On failure the engine's own errdefer cleans up
+    // its partial state, the slot stays null, and the stub config (still owned
+    // by the caller, not yet installed below) is freed by the caller's
+    // error path — so we must not touch `entry.config` before this succeeds.
+    switch (modality) {
+        .image => entry.image_engine = try gen_mod.ImageEngine.load(sch.io, sch.allocator, params.model_dir),
+        .audio => entry.audio_engine = try gen_mod.AudioEngine.load(sch.io, sch.allocator, params.model_dir),
+        .video => entry.video_engine = try gen_mod.VideoEngine.load(sch.io, sch.allocator, params.model_dir),
+    }
+
+    // Install stub CPU state (infallible from here, mirroring the ds4 path).
+    entry.config = params.config;
+    entry.tokenizer = params.tok;
+    entry.chat_config = params.chat_config;
+    entry.weights = null;
+    entry.transformer = null;
+    entry.vision_encoder = null;
+    entry.drafter = null;
+    entry.drafter_block_size = 0;
+    entry.drafter_path = "";
+    entry.prefix_cache = null;
+
+    const bytes_resident: u64 = blk: {
+        if (entry.bytes_on_disk) |b| {
+            if (b > 0) break :blk b;
+        }
+        break :blk gen_mod.estimateResidentBytes(sch.io, params.model_dir);
+    };
+
+    sch.registry.mutex.lockUncancelable(sch.io);
+    sch.registry.markReadyLocked(entry, bytes_resident);
+    sch.registry.mutex.unlock(sch.io);
+
+    sch.current_model = entry;
+    sch.xfm = null;
+    sch.weights = null;
+    sch.vision_encoder = null;
+    sch.drafter = null;
+    sch.hot_prefix_cache = null;
+}
+
 /// Sum of `*.safetensors` bytes in `model_dir` — the MLX weight footprint used
 /// by the load pre-flight. Returns 0 if the dir can't be read (treated as
 /// "unknown" by the caller, which then skips the check).
@@ -1856,6 +2046,15 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     //    LoadParams that carry a non-empty `llama_path`.
     if (@hasField(Inner, "llama_path") and params.llama_path.len > 0) {
         try doLoadLlamaOnInferenceThread(sch, params);
+        return;
+    }
+    // ── media-gen fast path: the (stub) config's model_type marks an image/
+    //    audio/video model (FLUX / Qwen3-TTS / LTX). Build the modality engine
+    //    instead of the MLX safetensors path. Works for BOTH the startup
+    //    gen-primary path (main builds the stub config) and the cold-load path
+    //    (preloadCpuState builds it), since both dispatch off model_type.
+    if (gen_mod.modalityFromType(params.config.model_type)) |modality| {
+        try doLoadGenOnInferenceThread(sch, params, modality);
         return;
     }
 
@@ -2181,17 +2380,27 @@ fn inferenceLoop(ctx: ThreadCtx) void {
     //    binding). On failure, mark the entry `.error_state` in the
     //    registry AND set load_failed so `Scheduler.init`'s parent sees
     //    the same shape it always has.
-    doLoadOnInferenceThread(sch, params) catch |err| {
-        recordLoadError(sch, @errorName(err));
-        sch.registry.mutex.lockUncancelable(sch.io);
-        sch.registry.markErrorLocked(params.entry, @errorName(err));
-        sch.registry.mutex.unlock(sch.io);
+    //
+    // Headless boot (`no_initial_load`): start with NO primary model. The
+    // server runs idle until a chat or media model is loaded on demand via
+    // `/v1/load-model` (or a request targeting a discovered id). Used by the
+    // app's "start headless, load gen on demand" flow.
+    if (params.no_initial_load) {
+        log.info("Headless: no primary model loaded; models load on demand.\n", .{});
         signalStarted(sch);
-        return;
-    };
-
-    log.info("Model ready (loaded on inference thread).\n", .{});
-    signalStarted(sch);
+    } else {
+        if (doLoadOnInferenceThread(sch, params)) |_| {
+            log.info("Model ready (loaded on inference thread).\n", .{});
+            signalStarted(sch);
+        } else |err| {
+            recordLoadError(sch, @errorName(err));
+            sch.registry.mutex.lockUncancelable(sch.io);
+            sch.registry.markErrorLocked(params.entry, @errorName(err));
+            sch.registry.mutex.unlock(sch.io);
+            signalStarted(sch);
+            return;
+        }
+    }
 
     while (!sch.shutdown.load(.acquire)) {
         // 0a. Drain slots queued for cleanup. Conn threads hand finished
@@ -2214,6 +2423,11 @@ fn inferenceLoop(ctx: ThreadCtx) void {
         // and we want the rest of the inference loop to stay responsive.
         // Other pending loads wait in queue and get picked up next tick.
         var load_req: ?*LoadRequest = null;
+        // Media-gen + unload work items (one per tick, like load — both are
+        // heavy and we re-check the loop between them). Gen runs to completion
+        // synchronously, blocking decode for its duration.
+        var gen_req: ?*GenRequest = null;
+        var unload_req: ?*UnloadRequest = null;
         {
             sch.queue_mu.lockUncancelable(sch.io);
             defer sch.queue_mu.unlock(sch.io);
@@ -2232,6 +2446,12 @@ fn inferenceLoop(ctx: ThreadCtx) void {
             if (sch.load_queue.items.len > 0) {
                 load_req = sch.load_queue.orderedRemove(0);
             }
+            if (sch.unload_queue.items.len > 0) {
+                unload_req = sch.unload_queue.orderedRemove(0);
+            }
+            if (sch.gen_queue.items.len > 0) {
+                gen_req = sch.gen_queue.orderedRemove(0);
+            }
         }
         for (cleanup_batch[0..cleanup_n]) |s| s.deinit();
         if (vision_n > 0 or embed_n > 0) {
@@ -2239,6 +2459,8 @@ fn inferenceLoop(ctx: ThreadCtx) void {
             for (embed_batch[0..embed_n]) |req| runEmbedRequest(sch, req);
         }
         if (load_req) |req| runLoadRequest(sch, req);
+        if (unload_req) |req| runUnloadRequest(sch, req);
+        if (gen_req) |req| runGenRequest(sch, req);
 
         // 1. Wait for work. Drain pending slots into a local list under lock,
         //    run prefills outside the lock.
@@ -2247,7 +2469,7 @@ fn inferenceLoop(ctx: ThreadCtx) void {
         {
             sch.queue_mu.lockUncancelable(sch.io);
             defer sch.queue_mu.unlock(sch.io);
-            while (sch.pending.items.len == 0 and sch.decoding.items.len == 0 and sch.vision_queue.items.len == 0 and sch.embed_queue.items.len == 0 and sch.cleanup_queue.items.len == 0 and sch.load_queue.items.len == 0 and !sch.shutdown.load(.acquire)) {
+            while (sch.pending.items.len == 0 and sch.decoding.items.len == 0 and sch.vision_queue.items.len == 0 and sch.embed_queue.items.len == 0 and sch.cleanup_queue.items.len == 0 and sch.load_queue.items.len == 0 and sch.gen_queue.items.len == 0 and sch.unload_queue.items.len == 0 and !sch.shutdown.load(.acquire)) {
                 sch.queue_cond.waitUncancelable(sch.io, &sch.queue_mu);
             }
             if (sch.shutdown.load(.acquire)) break;
@@ -2566,6 +2788,54 @@ fn finishLoadRequest(sch: *Scheduler, req: *LoadRequest, err_name: ?[]const u8) 
     }
     req.done = true;
     req.done_cond.broadcast(sch.io);
+}
+
+/// Run one media-generation job on the inference thread. The job body
+/// (`req.run`) does all mlx work + writes the HTTP/SSE response to the parked
+/// connection. We bracket it with the model's `gen_busy` flag for visibility
+/// and signal `done` so the conn thread in `runGeneration` wakes.
+fn runGenRequest(sch: *Scheduler, req: *GenRequest) void {
+    req.model.gen_busy = true;
+    req.run(req.ctx);
+    req.model.gen_busy = false;
+    req.done_mu.lockUncancelable(sch.io);
+    req.done = true;
+    req.done_cond.broadcast(sch.io);
+    req.done_mu.unlock(sch.io);
+}
+
+/// Free a model's resident mlx state on the inference thread (stream-bound,
+/// same invariant as the cleanup-queue drain) and finalize the eviction
+/// accounting. The conn thread already marked the entry `.evicting` and
+/// drained its refcount in `unloadModel`.
+fn runUnloadRequest(sch: *Scheduler, req: *UnloadRequest) void {
+    const entry = req.entry;
+    const bytes = entry.bytes_resident; // unloadResident zeroes it
+    log.info("[registry] unloading model id={s} ({d:.2} GB resident)\n", .{
+        entry.id,
+        @as(f64, @floatFromInt(bytes)) / 1_073_741_824.0,
+    });
+    entry.unloadResident();
+    // Drop any borrowed views that pointed at this entry so post-unload reads
+    // don't dangle (gen entries leave xfm null already, but an LLM unload
+    // must clear them).
+    if (sch.current_model == entry) {
+        sch.current_model = null;
+        sch.xfm = null;
+        sch.weights = null;
+        sch.vision_encoder = null;
+        sch.drafter = null;
+        sch.hot_prefix_cache = null;
+    }
+    sch.registry.mutex.lockUncancelable(sch.io);
+    sch.registry.accountEvictedLocked(bytes);
+    sch.registry.finalizeEvictionLocked(entry);
+    sch.registry.mutex.unlock(sch.io);
+
+    req.done_mu.lockUncancelable(sch.io);
+    req.done = true;
+    req.done_cond.broadcast(sch.io);
+    req.done_mu.unlock(sch.io);
 }
 
 /// Phase A6: commit a successfully completed slot's KV cache to the hot

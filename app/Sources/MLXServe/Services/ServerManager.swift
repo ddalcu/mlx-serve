@@ -67,6 +67,32 @@ class ServerManager: ObservableObject {
         // Resolve symlinks for the model path
         let resolvedModel = (modelPath as NSString).resolvingSymlinksInPath
         currentModelPath = resolvedModel
+
+        var args = ["--model", resolvedModel]
+        // Plan 05 Phase G — pass the parent directory as --model-dir so the
+        // registry discovers all siblings at startup. Lets the user hot-load
+        // any sibling later via the model picker (when hot-switch is on).
+        let modelDir = (resolvedModel as NSString).deletingLastPathComponent
+        args += options.toCLIArgs(modelDirOverride: modelDir.isEmpty ? nil : modelDir)
+        launch(args: args, options: options)
+    }
+
+    /// Start the server HEADLESS — no `--model`, just `--model-dir` so the
+    /// registry discovers chat models while media + chat load on demand via
+    /// `/v1/load-model`. Used by `ensureRunning(forGenModelDir:)` when the user
+    /// generates media before any chat server is up. One process hosts
+    /// chat + image + audio + video under one memory budget.
+    func startHeadless(modelsDir: String, options: ServerOptions) {
+        guard status != .running, status != .starting else { return }
+        currentModelPath = ""
+        let args = options.toCLIArgs(modelDirOverride: modelsDir.isEmpty ? nil : modelsDir)
+        launch(args: args, options: options)
+    }
+
+    /// Shared process launch for `start` / `startHeadless`. `args` already
+    /// carries `--model`/`--model-dir`; this wires the env, stderr capture,
+    /// termination handler, and health polling.
+    private func launch(args: [String], options: ServerOptions) {
         port = options.port
         status = .starting
         lastError = ""
@@ -87,12 +113,6 @@ class ServerManager: ObservableObject {
 
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: binaryPath)
-        var args = ["--model", resolvedModel]
-        // Plan 05 Phase G — pass the parent directory as --model-dir so the
-        // registry discovers all siblings at startup. Lets the user hot-load
-        // any sibling later via the model picker (when hot-switch is on).
-        let modelDir = (resolvedModel as NSString).deletingLastPathComponent
-        args += options.toCLIArgs(modelDirOverride: modelDir.isEmpty ? nil : modelDir)
         proc.arguments = args
         lastLaunchedOptions = options
 
@@ -469,6 +489,75 @@ class ServerManager: ObservableObject {
         let info = try await api.loadModel(port: port, id: id, drafterPath: drafterPath)
         await refreshModels()
         return info
+    }
+
+    /// Free a model's resident GPU state (registry keeps the stub). Used by the
+    /// media-gen load→generate→unload flow. Idempotent.
+    func unloadModel(id: String) async throws {
+        try await api.unloadModel(port: port, id: id)
+        await refreshModels()
+    }
+
+    /// Errors surfaced to the media-gen services.
+    enum GenServerError: LocalizedError {
+        case binaryMissing(String)
+        case modelMissing(String)
+        case startFailed(String)
+        var errorDescription: String? {
+            switch self {
+            case .binaryMissing(let p): return "mlx-serve binary not found at \(p)."
+            case .modelMissing(let r): return "Model \(r) is not downloaded. Download it first."
+            case .startFailed(let s): return "Server did not start: \(s)"
+            }
+        }
+    }
+
+    /// Ensure the main server is running so a media model can load on demand,
+    /// then return its port. Reuses an already-running server (so a chat model
+    /// and a gen model coexist on ONE process); otherwise starts the server
+    /// HEADLESS (no `--model`) against the models root. The caller then
+    /// `loadModel(id:)`s the media model by path. `dir` is accepted for symmetry
+    /// / future per-model routing; the headless `--model-dir` is the models root
+    /// so chat models stay discoverable.
+    func ensureRunning(forGenModelDir dir: String) async throws -> UInt16 {
+        _ = dir
+        if status == .running { return port }
+        if status != .starting {
+            let modelsRoot = NSString(string: "~/.mlx-serve/models").expandingTildeInPath
+            startHeadless(modelsDir: modelsRoot, options: lastLaunchedOptions ?? ServerOptions())
+        }
+        try await waitUntilRunning(timeout: 240)
+        return port
+    }
+
+    /// Poll `status` until the health loop flips it to `.running` (or `.error`).
+    private func waitUntilRunning(timeout: TimeInterval) async throws {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline {
+            switch status {
+            case .running: return
+            case .error(let m): throw GenServerError.startFailed(m)
+            default: break
+            }
+            try? await Task.sleep(nanoseconds: 300_000_000)
+        }
+        throw GenServerError.startFailed("server did not become ready in time")
+    }
+
+    /// Resolve a HuggingFace repo id to its local model directory under
+    /// `~/.mlx-serve/models` — the SINGLE source of truth for downloaded
+    /// models. No HF-cache fallback: the app owns downloads (chat + media), so
+    /// a model the user hasn't downloaded through us simply isn't available.
+    /// nil when the dir (with a `config.json`) doesn't exist. The media-gen
+    /// services call this before loading.
+    static func resolveModelDir(repo: String) -> String? {
+        let fm = FileManager.default
+        let modelsRoot = NSString(string: "~/.mlx-serve/models").expandingTildeInPath
+        if let dir = DownloadManager.existingModelDir(rootDir: modelsRoot, repoId: repo),
+           fm.fileExists(atPath: (dir as NSString).appendingPathComponent("config.json")) {
+            return dir
+        }
+        return nil
     }
 
     private func killOrphanedServers(on port: UInt16) {

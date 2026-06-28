@@ -1,15 +1,17 @@
 import SwiftUI
 import AppKit
 
-/// Image generation window — FLUX.2 via the shared Python venv.
+/// Image generation window — native FLUX.2 and Krea-2-Turbo (no Python).
+/// The model picker lists every `ImageModelPreset`; the server auto-routes to
+/// the right image backend by the model's `config.json` `model_type`.
 ///
 /// UI layering: a Quality picker drives steps + CFG, a Resolution picker
 /// pins to model-trained buckets, and Advanced lets the user override
 /// individual fields if they really want to.
 struct ImageGenView: View {
-    @EnvironmentObject var python: PythonManager
     @EnvironmentObject var service: ImageGenService
     @EnvironmentObject var server: ServerManager
+    @EnvironmentObject var downloads: DownloadManager
 
     @State private var prompt: String = ""
     @State private var negative: String = ""
@@ -23,22 +25,43 @@ struct ImageGenView: View {
     @State private var showRAMWarning: Bool = false
     @State private var ramWarningMessage: String = ""
     @State private var pendingRequest: ImageGenRequest? = nil
+    /// Keep the model resident after generating (default off → unload to free
+    /// GPU memory). On → the next generation reuses it instantly.
+    @State private var keepResident: Bool = false
+    /// Apply the NSFW content filter (on by default). Off → sends safety:false so
+    /// the server skips it. (The license expects filtering in deployments.)
+    @State private var safeMode: Bool = true
+    /// True while `hydrate()` seeds `@State` from saved settings. Hydrating
+    /// `model`/`quality` fires their `.onChange` (applyModelDefaults /
+    /// applyQualityDefaults) which would clobber the just-restored
+    /// steps/guidance/resolution — so every reset + persist is guarded on this.
+    @State private var hydrating: Bool = false
+    /// Hydrate exactly once per window lifetime (the first `.onAppear`).
+    @State private var didHydrate: Bool = false
 
     var body: some View {
-        Group {
-            switch python.status {
-            case .unknown:
-                ProgressView().frame(maxWidth: .infinity, maxHeight: .infinity)
-            case .missingPython, .needsGit, .needsVenv, .needsPackages:
-                GenInstallPane(feature: "Image Generation (FLUX.2)")
-            case .needsFFmpeg, .ready:
-                // mflux doesn't need ffmpeg — image gen works even when only
-                // the video pipeline's system deps are missing.
-                readyView
-            }
-        }
+        readyView
         .frame(minWidth: 880, minHeight: 640)
-        .onAppear { applyModelDefaults() }
+        .onAppear {
+            if !didHydrate {
+                hydrating = true
+                hydrate()
+                didHydrate = true
+                // Clear on the next runloop tick so the cascade of `.onChange`
+                // fired by hydration's state writes is ignored.
+                DispatchQueue.main.async { hydrating = false }
+            }
+            downloads.ensureNsfwClassifier() // best-effort: provision the shared content filter
+        }
+        // Persist every other sticky field on change (model/quality persist in
+        // their sections after applying preset defaults).
+        .onChange(of: resolution) { _, _ in guard !hydrating else { return }; persist() }
+        .onChange(of: steps) { _, _ in guard !hydrating else { return }; persist() }
+        .onChange(of: guidance) { _, _ in guard !hydrating else { return }; persist() }
+        .onChange(of: seed) { _, _ in guard !hydrating else { return }; persist() }
+        .onChange(of: negative) { _, _ in guard !hydrating else { return }; persist() }
+        .onChange(of: safeMode) { _, _ in guard !hydrating else { return }; persist() }
+        .onChange(of: keepResident) { _, _ in guard !hydrating else { return }; persist() }
     }
 
     private var readyView: some View {
@@ -65,7 +88,7 @@ struct ImageGenView: View {
         .alert("Model exceeds your Mac's RAM", isPresented: $showRAMWarning) {
             Button("Cancel", role: .cancel) { pendingRequest = nil }
             Button("Generate Anyway", role: .destructive) {
-                if let req = pendingRequest { service.generate(req) }
+                if let req = pendingRequest { service.generate(req, server: server) }
                 pendingRequest = nil
             }
         } message: {
@@ -97,7 +120,7 @@ struct ImageGenView: View {
             }
             .labelsHidden()
             .pickerStyle(.menu)
-            .onChange(of: model) { _, _ in applyModelDefaults() }
+            .onChange(of: model) { _, _ in guard !hydrating else { return }; applyModelDefaults(); persist() }
             Text("~\(model.approxRAMGB) GB RAM")
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -114,7 +137,7 @@ struct ImageGenView: View {
             }
             .pickerStyle(.segmented)
             .labelsHidden()
-            .onChange(of: quality) { _, _ in applyQualityDefaults() }
+            .onChange(of: quality) { _, _ in guard !hydrating else { return }; applyQualityDefaults(); persist() }
             Text(qualityHint)
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -177,6 +200,12 @@ struct ImageGenView: View {
                 TextField("", text: $negative, prompt: Text("(optional, ignored by Klein)"))
                     .textFieldStyle(.roundedBorder)
             }
+            Toggle("Keep model loaded after generating", isOn: $keepResident)
+                .font(.caption)
+                .help("On: the model stays resident so the next generation is instant. Off (default): it's unloaded to free GPU memory.")
+            Toggle("Safe mode (NSFW content filter)", isOn: $safeMode)
+                .font(.caption)
+                .help("On (default): generated images are screened by an on-device NSFW classifier and explicit results are blocked. Off: no filtering — you are responsible for the output.")
         }
     }
 
@@ -199,25 +228,30 @@ struct ImageGenView: View {
     }
 
     private var actionRow: some View {
-        HStack {
-            if service.isRunning {
-                Button(role: .destructive) {
-                    service.cancel()
-                } label: {
-                    Label("Cancel", systemImage: "stop.circle")
-                        .frame(maxWidth: .infinity)
+        VStack(spacing: 8) {
+            if !downloads.bundleReady(model.bundle) {
+                BundleDownloadBar(bundle: model.bundle)
+            }
+            HStack {
+                if service.isRunning {
+                    Button(role: .destructive) {
+                        service.cancel()
+                    } label: {
+                        Label("Cancel", systemImage: "stop.circle")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.bordered)
+                } else {
+                    Button {
+                        tryGenerate()
+                    } label: {
+                        Label("Generate", systemImage: "wand.and.stars")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .keyboardShortcut(.return, modifiers: [.command])
+                    .disabled(prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !downloads.bundleReady(model.bundle))
                 }
-                .buttonStyle(.bordered)
-            } else {
-                Button {
-                    tryGenerate()
-                } label: {
-                    Label("Generate", systemImage: "wand.and.stars")
-                        .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.borderedProminent)
-                .keyboardShortcut(.return, modifiers: [.command])
-                .disabled(prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
         }
     }
@@ -280,7 +314,7 @@ struct ImageGenView: View {
     private var outputFolderLink: some View {
         Button {
             NSWorkspace.shared.activateFileViewerSelecting(
-                [URL(fileURLWithPath: PythonManager.imagesRoot)]
+                [URL(fileURLWithPath: MediaStorage.imagesRoot)]
             )
         } label: {
             Label("Open output folder in Finder", systemImage: "folder")
@@ -288,7 +322,41 @@ struct ImageGenView: View {
         }
         .buttonStyle(.borderless)
         .foregroundStyle(.secondary)
-        .help(PythonManager.imagesRoot)
+        .help(MediaStorage.imagesRoot)
+    }
+
+    // MARK: - Sticky settings
+
+    /// Seed `@State` from the last-used settings. Saved values win; resolution
+    /// and quality are revalidated against the restored model so they stay
+    /// in-range. Runs under `hydrating == true` so the `.onChange` cascade these
+    /// writes trigger doesn't reapply preset defaults over them.
+    private func hydrate() {
+        let s = ImageGenSettings.load()
+        model = s.resolvedModel
+        quality = s.quality
+        resolution = s.resolvedResolution(for: model)
+        steps = s.steps
+        guidance = s.guidance
+        seed = s.seed
+        negative = s.negativePrompt
+        safeMode = s.safeMode
+        keepResident = s.keepResident
+    }
+
+    /// Capture the current controls as the new last-used settings.
+    private func persist() {
+        var s = ImageGenSettings()
+        s.modelId = model.id
+        s.quality = quality
+        s.resolutionId = resolution.id
+        s.steps = steps
+        s.guidance = guidance
+        s.seed = seed
+        s.negativePrompt = negative
+        s.safeMode = safeMode
+        s.keepResident = keepResident
+        s.save()
     }
 
     // MARK: - Actions
@@ -319,8 +387,11 @@ struct ImageGenView: View {
             width: resolution.width,
             height: resolution.height,
             steps: steps,
-            guidance: guidance
+            guidance: guidance,
+            keepResident: keepResident,
+            safeMode: safeMode
         )
+        persist()  // final capture — the agent's generate_image reuses these
 
         let total = RAMChecker.totalGB
         let needed = model.approxRAMGB
@@ -331,7 +402,7 @@ struct ImageGenView: View {
             return
         }
 
-        service.generate(req)
+        service.generate(req, server: server)
     }
 
     private func showLogWindow() {

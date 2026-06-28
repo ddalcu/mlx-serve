@@ -2,14 +2,13 @@ import Foundation
 import SwiftUI
 import AppKit
 
-/// Runs neural text-to-speech (with zero-shot voice cloning) via the shared
-/// `PythonManager` venv and the embedded `mlx-audio` library. Mirrors
-/// `ImageGenService` / `VideoGenService`: same `Phase` lifecycle, same
-/// JSON-event stream, writes a `.wav` under `~/.mlx-serve/generations/audio`.
+/// Drives neural text-to-speech (with zero-shot voice cloning) on the native
+/// mlx-serve server (Qwen3-TTS). Mirrors `ImageGenService` / `VideoGenService`:
+/// same `Phase` lifecycle, same JSON-event stream, writes a `.wav` under
+/// `~/.mlx-serve/generations/audio`.
 ///
-/// Unlike video, audio needs no ffmpeg — reference clips are normalized to
-/// 24 kHz mono WAV in Swift (`AudioReference`) before they reach Python, and
-/// mlx-audio writes the output wav itself.
+/// Reference clips are normalized to 24 kHz mono WAV in Swift (`AudioReference`)
+/// and sent to the server as base64; the engine writes the output WAV itself.
 @MainActor
 final class AudioGenService: ObservableObject {
 
@@ -24,11 +23,10 @@ final class AudioGenService: ObservableObject {
     @Published private(set) var recent: [String] = []
     @Published private(set) var log: [String] = []
 
-    private let python: PythonManager
     private var task: Task<Void, Never>?
+    private let api = APIClient()
 
-    init(python: PythonManager) {
-        self.python = python
+    init() {
         loadRecent()
     }
 
@@ -37,60 +35,88 @@ final class AudioGenService: ObservableObject {
         return false
     }
 
-    func generate(_ request: AudioGenRequest) {
-        // mlx-audio doesn't shell out to ffmpeg, so `.needsFFmpeg` is still a
-        // usable state — same gate image generation uses.
-        guard python.status.imagesReady else {
-            phase = .failed("Python environment is not ready.")
-            return
-        }
+    /// Synthesize through the ONE main server: ensure running (headless if
+    /// needed), load the TTS model on demand, stream `/v1/audio/speech`, then
+    /// unload unless "Keep loaded" is set.
+    func generate(_ request: AudioGenRequest, server: ServerManager) {
         guard !request.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             phase = .failed("Text is empty.")
             return
         }
+        guard let modelDir = ServerManager.resolveModelDir(repo: request.model.repo) else {
+            phase = .failed("Model \(request.model.repo) is not downloaded. Download it first.")
+            return
+        }
 
         task?.cancel()
-        // 3-phase progress: Load → Synthesize → Done.
-        phase = .running(step: 0, total: 3, message: "Starting...")
+        phase = .running(step: 0, total: 3, message: "Loading model…")
         log = []
 
         let outputPath = Self.makeOutputPath(text: request.text)
-        let args = Self.buildArgs(request, outputPath: outputPath)
+        let text = request.text
+        let keep = request.keepResident
+        // Reference voice for zero-shot cloning: the recorded/picked clip is
+        // already normalized to 24 kHz mono WAV by AudioReference. Send it
+        // base64 as `ref_audio`; the server runs it through the ECAPA-TDNN
+        // speaker encoder and conditions the talker on it.
+        let refB64: String? = request.refAudioPath.flatMap { path in
+            (try? Data(contentsOf: URL(fileURLWithPath: path)))?.base64EncodedString()
+        }
 
         task = Task {
+            var loadedId: String? = nil
+            func releaseIfNeeded() async {
+                if !keep, let id = loadedId { try? await server.unloadModel(id: id) }
+            }
             do {
-                let stream = python.runScript(source: Self.script, args: args)
-                for try await event in stream {
-                    switch event {
-                    case .progress(let step, let total, let message):
-                        phase = .running(step: step, total: total, message: message)
-                    case .complete(let path):
-                        phase = .completed(path: path)
-                        insertRecent(path)
-                    case .log(let line):
-                        appendLog(line)
+                let port = try await server.ensureRunning(forGenModelDir: modelDir)
+                if Task.isCancelled { phase = .idle; return }
+                let info = try await server.loadModel(id: modelDir)
+                loadedId = info.name
+                if Task.isCancelled { await releaseIfNeeded(); phase = .idle; return }
+                // SSE: audio length is model-determined, so `progress` events carry
+                // a growing frame count (total=0 → indeterminate bar); the
+                // `complete` event carries the WAV as base64.
+                var wav: Data? = nil
+                var reqJson: [String: Any] = ["model": info.name, "input": text]
+                if let refB64 { reqJson["ref_audio"] = refB64 }
+                for try await ev in api.streamGeneration(
+                    port: port, path: "/v1/audio/speech",
+                    json: reqJson) {
+                    switch ev["type"] as? String {
+                    case "progress":
+                        let step = ev["step"] as? Int ?? 0
+                        let total = ev["total"] as? Int ?? 0
+                        let stage = ev["stage"] as? String ?? "Generating audio"
+                        // ~0.08s of audio per talker frame (1920 samples @ 24 kHz).
+                        let secs = Double(step) * 1920.0 / 24000.0
+                        let msg = total == 0 && step > 0
+                            ? String(format: "%@ — ~%.1fs", stage, secs) : "\(stage)…"
+                        phase = .running(step: step, total: total, message: msg)
+                    case "complete":
+                        if let b64 = ev["data"] as? String { wav = Data(base64Encoded: b64) }
+                    case "error":
+                        await releaseIfNeeded()
+                        phase = .failed(ev["message"] as? String ?? "Synthesis failed.")
+                        return
+                    default:
+                        break
                     }
                 }
-                if FileManager.default.fileExists(atPath: outputPath) {
-                    if case .completed = phase { /* already set */ } else {
-                        phase = .completed(path: outputPath)
-                        insertRecent(outputPath)
-                    }
-                } else if case .running = phase {
-                    phase = .failed("Generation finished without output.")
+                await releaseIfNeeded()
+                guard let wav, wav.count > 44 else {
+                    phase = .failed("Server returned an empty audio response.")
+                    return
                 }
-            } catch GenError.cancelled {
+                try wav.write(to: URL(fileURLWithPath: outputPath))
+                phase = .completed(path: outputPath)
+                insertRecent(outputPath)
+            } catch is CancellationError {
+                await releaseIfNeeded()
                 phase = .idle
             } catch {
-                let actionable = log.last(where: { $0.hasPrefix("ERROR: ") })
-                    .map { String($0.dropFirst("ERROR: ".count)) }
-                phase = .failed(actionable ?? error.localizedDescription)
-                // A failed `import mlx_audio` means the venv drifted out from
-                // under a stale `.ready` status — re-detect so the pane flips
-                // back to the installer instead of just showing red text.
-                if let msg = actionable, VideoGenService.indicatesVenvNeedsReinstall(msg) {
-                    await python.refresh()
-                }
+                await releaseIfNeeded()
+                phase = .failed(error.localizedDescription)
             }
         }
     }
@@ -114,7 +140,7 @@ final class AudioGenService: ObservableObject {
     }
 
     private func loadRecent() {
-        let root = PythonManager.audiosRoot
+        let root = MediaStorage.audiosRoot
         let fm = FileManager.default
         guard let days = try? fm.contentsOfDirectory(atPath: root) else { return }
         var paths: [(String, Date)] = []
@@ -137,7 +163,7 @@ final class AudioGenService: ObservableObject {
         let df = DateFormatter()
         df.dateFormat = "yyyy-MM-dd"
         let day = df.string(from: Date())
-        let dayDir = (PythonManager.audiosRoot as NSString).appendingPathComponent(day)
+        let dayDir = (MediaStorage.audiosRoot as NSString).appendingPathComponent(day)
         try? FileManager.default.createDirectory(atPath: dayDir, withIntermediateDirectories: true)
         let tf = DateFormatter()
         tf.dateFormat = "yyyy-MM-dd_HH-mm-ss"
@@ -149,103 +175,4 @@ final class AudioGenService: ObservableObject {
         let filename = "\(tf.string(from: Date()))_\(slug).wav"
         return (dayDir as NSString).appendingPathComponent(filename)
     }
-
-    static func buildArgs(_ r: AudioGenRequest, outputPath: String) -> [String] {
-        var args = [
-            "--repo", r.model.repo,
-            "--text", r.text,
-            "--speed", String(r.speed),
-            "--temperature", String(r.temperature),
-            "--output", outputPath,
-        ]
-        if let ref = r.refAudioPath, !ref.isEmpty {
-            args.append(contentsOf: ["--ref-audio", ref])
-            let t = r.refText.trimmingCharacters(in: .whitespacesAndNewlines)
-            if !t.isEmpty {
-                args.append(contentsOf: ["--ref-text", t])
-            }
-        }
-        return args
-    }
-
-    /// Python script for neural TTS / voice cloning via `mlx-audio`. Passes the
-    /// HF repo straight to `generate_audio`, which downloads + loads it. When a
-    /// reference clip is given it clones that voice (auto-transcribing with
-    /// Whisper if no `--ref-text`). `join_audio=True` yields a single file; we
-    /// then move whatever it produced onto the exact `--output` path so the
-    /// Swift side can trust the `complete` event.
-    static let script: String = #"""
-import sys, json, argparse, traceback, os, glob
-
-def emit(obj):
-    print(json.dumps(obj), flush=True)
-
-def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--repo", required=True)
-    p.add_argument("--text", required=True)
-    p.add_argument("--ref-audio", dest="ref_audio", default=None)
-    p.add_argument("--ref-text", dest="ref_text", default=None)
-    p.add_argument("--speed", type=float, default=1.0)
-    p.add_argument("--temperature", type=float, default=0.7)
-    p.add_argument("--output", required=True)
-    args = p.parse_args()
-
-    try:
-        from mlx_audio.tts.generate import generate_audio
-    except Exception as e:
-        emit({"type":"error","message":f"mlx-audio import failed: {e}. Re-run the installer."})
-        traceback.print_exc()
-        sys.exit(1)
-
-    out_dir = os.path.dirname(args.output)
-    os.makedirs(out_dir, exist_ok=True)
-    base = os.path.splitext(os.path.basename(args.output))[0]
-    prefix = base + "__seg"
-
-    emit({"type":"progress","step":0,"total":3,
-          "message":f"Loading {args.repo} (first run downloads weights)..."})
-
-    kwargs = dict(
-        text=args.text, model=args.repo, speed=args.speed, temperature=args.temperature,
-        output_path=out_dir, file_prefix=prefix, audio_format="wav",
-        join_audio=True, save=True, verbose=False,
-    )
-    if args.ref_audio:
-        if not os.path.exists(args.ref_audio):
-            emit({"type":"error","message":f"Reference audio not found: {args.ref_audio}"})
-            sys.exit(1)
-        kwargs["ref_audio"] = args.ref_audio
-        if args.ref_text:
-            kwargs["ref_text"] = args.ref_text
-        emit({"type":"progress","step":1,"total":3,"message":"Cloning reference voice and synthesizing..."})
-    else:
-        emit({"type":"progress","step":1,"total":3,"message":"Synthesizing speech..."})
-
-    try:
-        generate_audio(**kwargs)
-    except Exception as e:
-        emit({"type":"error","message":str(e)})
-        traceback.print_exc()
-        sys.exit(1)
-
-    produced = sorted(glob.glob(os.path.join(out_dir, prefix + "*.wav")))
-    if not produced:
-        emit({"type":"error","message":"Generation finished but produced no audio file."})
-        sys.exit(1)
-    try:
-        os.replace(produced[0], args.output)
-        for extra in produced[1:]:
-            try: os.remove(extra)
-            except OSError: pass
-    except OSError as e:
-        emit({"type":"error","message":f"Could not finalize output: {e}"})
-        sys.exit(1)
-
-    emit({"type":"progress","step":2,"total":3,"message":"Done."})
-    emit({"type":"complete","path":args.output})
-
-if __name__ == "__main__":
-    main()
-"""#
 }

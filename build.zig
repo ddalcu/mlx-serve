@@ -75,6 +75,8 @@ pub fn build(b: *std.Build) void {
 
     // stb_image for JPEG/PNG decoding in the vision pipeline
     mod.addCSourceFile(.{ .file = b.path("lib/stb_image_impl.c"), .flags = &.{"-O2"} });
+    // stb_image_write for PNG encoding (native image-generation endpoint)
+    mod.addCSourceFile(.{ .file = b.path("lib/stb_image_write_impl.c"), .flags = &.{"-O2"} });
     mod.addIncludePath(b.path("lib"));
 
     // ds4 inference engine for DSV4-Flash (Metal backend, macOS only). See
@@ -137,6 +139,7 @@ pub fn build(b: *std.Build) void {
     test_mod.addObjectFile(b.path("lib/jinja_cpp/libjinja.a"));
     test_mod.addIncludePath(b.path("lib/jinja_cpp"));
     test_mod.addCSourceFile(.{ .file = b.path("lib/stb_image_impl.c"), .flags = &.{"-O2"} });
+    test_mod.addCSourceFile(.{ .file = b.path("lib/stb_image_write_impl.c"), .flags = &.{"-O2"} });
     test_mod.addIncludePath(b.path("lib"));
     addDs4Sources(b, test_mod);
     test_mod.addIncludePath(b.path("lib/ds4"));

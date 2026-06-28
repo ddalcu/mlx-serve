@@ -116,15 +116,25 @@ class DownloadManager: ObservableObject {
     /// that the `type == "file"` filter drops. Other subdirectories (e.g.
     /// `original/` or alternate-precision shadow copies) are skipped so we don't
     /// pull tens of GB of unused weights. Returns (path, size) pairs.
-    nonisolated static func selectNeededFiles(from entries: [[String: Any]]) -> [(String, Int64)] {
+    nonisolated static func selectNeededFiles(from entries: [[String: Any]], selection: FileSelection = .chatDefault) -> [(String, Int64)] {
         let neededExtensions: Set<String> = ["json", "safetensors", "jinja", "model", "txt"]
         return entries.compactMap { file -> (String, Int64)? in
             guard let path = file["path"] as? String,
                   let ftype = file["type"] as? String, ftype == "file" else { return nil }
-            // Top-level files, or the mtp/ sidecar. Skip other nested dirs.
-            guard !path.contains("/") || path.hasPrefix("mtp/") else { return nil }
-            let ext = (path as NSString).pathExtension
-            guard neededExtensions.contains(ext) || path == "chat_template.jinja" else { return nil }
+            // Depth gate. Chat default: top-level files + the `mtp/` sidecar.
+            // Media (recursive): keep nested weight subdirs (FLUX's
+            // transformer/vae/text_encoder, TTS's speech_tokenizer).
+            if !selection.recursive {
+                guard !path.contains("/") || path.hasPrefix("mtp/") else { return nil }
+            }
+            let ext = (path as NSString).pathExtension.lowercased()
+            guard neededExtensions.contains(ext) || (path as NSString).lastPathComponent == "chat_template.jinja" else { return nil }
+            // Per-bundle junk filter.
+            if selection.excludeSubstrings.contains(where: { path.contains($0) }) { return nil }
+            // Safetensors allowlist (LTX): keep only the engine's 3 files, skip
+            // the LoRAs / upscalers / alternate transformers (~50 GB unused).
+            if ext == "safetensors", let keep = selection.keepSafetensors,
+               !keep.contains((path as NSString).lastPathComponent) { return nil }
             let size = file["size"] as? Int64 ?? (file["size"] as? Int).map { Int64($0) } ?? 0
             return (path, size)
         }
@@ -152,6 +162,27 @@ class DownloadManager: ObservableObject {
 
     func existingModelDir(for repoId: String) -> String? {
         Self.existingModelDir(rootDir: modelsDir, repoId: repoId)
+    }
+
+    /// Shared NSFW content-filter classifier (Apache-2.0). The server applies it
+    /// to ALL image generation (Krea license §4.2); auto-downloaded once into
+    /// `~/.mlx-serve/models` and shared across every image model. Original
+    /// public repo — no conversion/hosting; the Zig engine reads it directly.
+    static let nsfwClassifierRepo = "Falconsai/nsfw_image_detection"
+
+    func nsfwClassifierReady() -> Bool {
+        guard let dir = existingModelDir(for: Self.nsfwClassifierRepo) else { return false }
+        return FileManager.default.fileExists(atPath: (dir as NSString).appendingPathComponent("model.safetensors"))
+    }
+
+    /// Best-effort: provision the NSFW classifier in the background if missing.
+    /// Idempotent + quiet (tracked under its own repoId, so it doesn't disturb a
+    /// model's bundle progress); the server fails OPEN until it's present. Safe to
+    /// call on every Image-tab appearance.
+    func ensureNsfwClassifier() {
+        if nsfwClassifierReady() { return }
+        if activeTasks[Self.nsfwClassifierRepo] != nil { return } // already downloading
+        start(repoId: Self.nsfwClassifierRepo) {}
     }
 
     /// User-configurable extra discovery root. Persisted in UserDefaults under
@@ -277,7 +308,7 @@ class DownloadManager: ObservableObject {
         existingModelDir(for: repoId) ?? newLayoutDir(for: repoId)
     }
 
-    func download(repoId: String) async {
+    func download(repoId: String, selection: FileSelection = .chatDefault) async {
         let destDir = newLayoutDir(for: repoId)
 
         downloads[repoId] = DownloadState(status: .downloading, statusText: "Fetching file list...")
@@ -296,7 +327,7 @@ class DownloadManager: ObservableObject {
                 throw URLError(.cannotParseResponse)
             }
 
-            let neededFiles = Self.selectNeededFiles(from: files)
+            let neededFiles = Self.selectNeededFiles(from: files, selection: selection)
 
             let totalSize = neededFiles.reduce(Int64(0)) { $0 + $1.1 }
             var downloadedSize: Int64 = 0
@@ -450,6 +481,86 @@ class DownloadManager: ObservableObject {
             onFinish()
         }
         activeTasks[repoId] = task
+    }
+
+    // MARK: - Media bundles
+    //
+    // A media model + its dependencies, downloaded as a unit (LTX → LTX +
+    // Gemma-3-12B; FLUX/TTS → just the primary). Each component pulls ONLY the
+    // files the engine reads (`FileSelection`). Tracked under the bundle id so
+    // the gen pane can show aggregate progress / cancel.
+
+    /// Download a bundle's components sequentially (skipping any already on
+    /// disk). `onFinish` runs once after the last component settles. Stops the
+    /// bundle if a component fails.
+    func startBundle(_ bundle: MediaBundle, onFinish: @escaping @MainActor () -> Void) {
+        activeTasks[bundle.id]?.cancel()
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            for comp in bundle.components {
+                if Task.isCancelled { break }
+                if self.componentReady(comp) { continue }
+                await self.download(repoId: comp.repo, selection: comp.selection)
+                if Task.isCancelled { break }
+                if self.downloads[comp.repo]?.status == .failed { break }
+            }
+            self.activeTasks.removeValue(forKey: bundle.id)
+            onFinish()
+        }
+        activeTasks[bundle.id] = task
+    }
+
+    /// Cancel a bundle download and every component's in-flight transfer.
+    func cancelBundle(_ bundle: MediaBundle) {
+        activeTasks[bundle.id]?.cancel()
+        activeTasks.removeValue(forKey: bundle.id)
+        for comp in bundle.components { cancel(comp.repo) }
+    }
+
+    /// True when every component of the bundle is present + complete on disk.
+    func bundleReady(_ bundle: MediaBundle) -> Bool {
+        bundle.components.allSatisfy { componentReady($0) }
+    }
+
+    func componentReady(_ comp: MediaComponent) -> Bool {
+        Self.componentReady(comp, modelsRoot: modelsDir)
+    }
+
+    /// A component is ready when its model dir resolves, ALL `readyMarkers`
+    /// exist (file or dir), AND at least one `.safetensors` is present — so a
+    /// config-only partial download isn't mistaken for ready. `nonisolated` +
+    /// static so it's unit-testable against a temp dir.
+    nonisolated static func componentReady(_ comp: MediaComponent, modelsRoot: String) -> Bool {
+        guard let dir = existingModelDir(rootDir: modelsRoot, repoId: comp.repo) else { return false }
+        let fm = FileManager.default
+        for marker in comp.readyMarkers {
+            guard fm.fileExists(atPath: (dir as NSString).appendingPathComponent(marker)) else { return false }
+        }
+        return hasSafetensorsRecursive(dir)
+    }
+
+    nonisolated static func hasSafetensorsRecursive(_ dir: String) -> Bool {
+        guard let en = FileManager.default.enumerator(atPath: dir) else { return false }
+        while let f = en.nextObject() as? String {
+            if (f as NSString).lastPathComponent.hasSuffix(".safetensors") { return true }
+        }
+        return false
+    }
+
+    /// Aggregate UI state for an in-flight (or failed) bundle download: the
+    /// component currently transferring + its 1-based position. nil when the
+    /// bundle is idle or fully ready.
+    func activeBundleComponent(_ bundle: MediaBundle) -> (repo: String, index: Int, count: Int, state: DownloadState)? {
+        for (i, comp) in bundle.components.enumerated() {
+            if let st = downloads[comp.repo], st.status == .downloading || st.status == .failed {
+                return (comp.repo, i + 1, bundle.components.count, st)
+            }
+        }
+        return nil
+    }
+
+    func isBundleDownloading(_ bundle: MediaBundle) -> Bool {
+        activeTasks[bundle.id] != nil
     }
 
     /// GGUF analogue of `start(repoId:onFinish:)`.

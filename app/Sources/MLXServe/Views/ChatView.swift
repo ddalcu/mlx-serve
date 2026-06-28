@@ -56,6 +56,9 @@ struct ToolApprovalSheet: View {
         case "browse":     return "Browse the web"
         case "webSearch":  return "Search the web"
         case "saveMemory": return "Save a memory"
+        case "generate_image": return "Generate an image"
+        case "generate_audio": return "Generate audio"
+        case "generate_video": return "Generate a video"
         default:           return "Run \(request.toolName)"
         }
     }
@@ -1790,7 +1793,7 @@ struct MessageBubble: View {
                     .clipShape(RoundedRectangle(cornerRadius: 8))
                 }
 
-                // Attached images
+                // Attached images. Double-click opens the full image in Preview.
                 if let images = message.images, !images.isEmpty {
                     HStack(spacing: 4) {
                         ForEach(images) { img in
@@ -1798,8 +1801,10 @@ struct MessageBubble: View {
                                 Image(nsImage: nsImage)
                                     .resizable()
                                     .aspectRatio(contentMode: .fit)
-                                    .frame(maxWidth: 200, maxHeight: 150)
+                                    .frame(maxWidth: 400, maxHeight: 300)
                                     .clipShape(RoundedRectangle(cornerRadius: 10))
+                                    .onTapGesture(count: 2) { ChatImagePreview.openInPreview(img) }
+                                    .help("Double-click to open in Preview")
                             }
                         }
                     }

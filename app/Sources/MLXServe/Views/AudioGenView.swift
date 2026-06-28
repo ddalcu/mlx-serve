@@ -3,19 +3,19 @@ import AppKit
 import AVKit
 import UniformTypeIdentifiers
 
-/// Audio generation window — neural TTS with zero-shot voice cloning via the
-/// shared Python venv (`mlx-audio`). Same shell as ImageGen/VideoGen: a model
+/// Audio generation window — neural TTS with zero-shot voice cloning, run
+/// natively by the embedded mlx-serve server. Same shell as ImageGen/VideoGen: a model
 /// picker, the text to speak, a reference-voice section (record or pick a file)
 /// with an optional transcript, and a player for the result.
 struct AudioGenView: View {
-    @EnvironmentObject var python: PythonManager
     @EnvironmentObject var service: AudioGenService
     @EnvironmentObject var server: ServerManager
+    @EnvironmentObject var downloads: DownloadManager
 
     @StateObject private var recorder = AudioRecorder()
 
     @State private var text: String = ""
-    @State private var model: AudioModelPreset = .mossNano
+    @State private var model: AudioModelPreset = .qwen3TTS06B
     @State private var refAudioURL: URL? = nil
     @State private var refText: String = ""
     @State private var speed: Double = 1.0
@@ -27,20 +27,27 @@ struct AudioGenView: View {
     @State private var ramWarningMessage: String = ""
     @State private var pendingRequest: AudioGenRequest? = nil
     @State private var player: AVPlayer?
+    /// Keep the model resident after generating (default off → unload).
+    @State private var keepResident: Bool = false
+    /// Hydration guard — see ImageGenView for the full rationale.
+    @State private var hydrating: Bool = false
+    @State private var didHydrate: Bool = false
 
     var body: some View {
-        Group {
-            switch python.status {
-            case .unknown:
-                ProgressView().frame(maxWidth: .infinity, maxHeight: .infinity)
-            case .missingPython, .needsGit, .needsVenv, .needsPackages:
-                GenInstallPane(feature: "Audio Generation (voice cloning)")
-            case .needsFFmpeg, .ready:
-                // mlx-audio doesn't shell out to ffmpeg — works without it.
-                readyView
+        readyView
+        .frame(minWidth: 820, minHeight: 600)
+        .onAppear {
+            if !didHydrate {
+                hydrating = true
+                hydrate()
+                didHydrate = true
+                DispatchQueue.main.async { hydrating = false }
             }
         }
-        .frame(minWidth: 820, minHeight: 600)
+        .onChange(of: model) { _, _ in guard !hydrating else { return }; persist() }
+        .onChange(of: speed) { _, _ in guard !hydrating else { return }; persist() }
+        .onChange(of: temperature) { _, _ in guard !hydrating else { return }; persist() }
+        .onChange(of: keepResident) { _, _ in guard !hydrating else { return }; persist() }
         .onChange(of: service.phase) { _, phase in
             if case .completed(let path) = phase {
                 player = AVPlayer(url: URL(fileURLWithPath: path))
@@ -73,7 +80,7 @@ struct AudioGenView: View {
         .alert("Model exceeds your Mac's RAM", isPresented: $showRAMWarning) {
             Button("Cancel", role: .cancel) { pendingRequest = nil }
             Button("Generate Anyway", role: .destructive) {
-                if let req = pendingRequest { service.generate(req) }
+                if let req = pendingRequest { service.generate(req, server: server) }
                 pendingRequest = nil
             }
         } message: {
@@ -162,7 +169,7 @@ struct AudioGenView: View {
                 VStack(alignment: .leading, spacing: 4) {
                     Text("Transcript of reference (optional)").font(.caption)
                     TextField("", text: $refText,
-                              prompt: Text("Leave empty to auto-transcribe (slower, downloads Whisper)"))
+                              prompt: Text("Optional — the reference audio alone clones the voice"))
                         .textFieldStyle(.roundedBorder)
                         .font(.caption)
                 }
@@ -204,23 +211,31 @@ struct AudioGenView: View {
                 Slider(value: $temperature, in: 0.1...1.5, step: 0.05)
                 Text("Higher = more expressive and varied.").font(.caption2).foregroundStyle(.secondary)
             }
+            Toggle("Keep model loaded after generating", isOn: $keepResident)
+                .font(.caption)
+                .help("On: the model stays resident so the next generation is instant. Off (default): it's unloaded to free GPU memory.")
         }
     }
 
     private var actionRow: some View {
-        HStack {
-            if service.isRunning {
-                Button(role: .destructive) { service.cancel() } label: {
-                    Label("Cancel", systemImage: "stop.circle").frame(maxWidth: .infinity)
+        VStack(spacing: 8) {
+            if !downloads.bundleReady(model.bundle) {
+                BundleDownloadBar(bundle: model.bundle)
+            }
+            HStack {
+                if service.isRunning {
+                    Button(role: .destructive) { service.cancel() } label: {
+                        Label("Cancel", systemImage: "stop.circle").frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.bordered)
+                } else {
+                    Button { tryGenerate() } label: {
+                        Label("Generate", systemImage: "waveform").frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .keyboardShortcut(.return, modifiers: [.command])
+                    .disabled(text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !downloads.bundleReady(model.bundle))
                 }
-                .buttonStyle(.bordered)
-            } else {
-                Button { tryGenerate() } label: {
-                    Label("Generate", systemImage: "waveform").frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.borderedProminent)
-                .keyboardShortcut(.return, modifiers: [.command])
-                .disabled(text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
         }
     }
@@ -235,8 +250,14 @@ struct AudioGenView: View {
                                            description: Text("Enter text, add a reference voice, and press Generate."))
                 case .running(let step, let total, let message):
                     VStack(spacing: 12) {
-                        ProgressView(value: Double(step), total: max(1, Double(total)))
-                            .progressViewStyle(.linear).frame(width: 240)
+                        // Audio length is unknown until the model stops (total==0)
+                        // → indeterminate bar; encode/decode stages are determinate.
+                        if total == 0 {
+                            ProgressView().frame(width: 240)
+                        } else {
+                            ProgressView(value: Double(step), total: max(1, Double(total)))
+                                .progressViewStyle(.linear).frame(width: 240)
+                        }
                         Text(message).font(.footnote).foregroundStyle(.secondary)
                     }
                 case .completed(let path):
@@ -285,13 +306,13 @@ struct AudioGenView: View {
 
     private var outputFolderLink: some View {
         Button {
-            NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: PythonManager.audiosRoot)])
+            NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: MediaStorage.audiosRoot)])
         } label: {
             Label("Open output folder in Finder", systemImage: "folder").font(.caption)
         }
         .buttonStyle(.borderless)
         .foregroundStyle(.secondary)
-        .help(PythonManager.audiosRoot)
+        .help(MediaStorage.audiosRoot)
     }
 
     // MARK: - Reference actions
@@ -347,6 +368,25 @@ struct AudioGenView: View {
         player = p
     }
 
+    // MARK: - Sticky settings
+
+    private func hydrate() {
+        let s = AudioGenSettings.load()
+        model = s.resolvedModel
+        speed = s.speed
+        temperature = s.temperature
+        keepResident = s.keepResident
+    }
+
+    private func persist() {
+        var s = AudioGenSettings()
+        s.modelId = model.id
+        s.speed = speed
+        s.temperature = temperature
+        s.keepResident = keepResident
+        s.save()
+    }
+
     // MARK: - Generate
 
     private func tryGenerate() {
@@ -356,8 +396,10 @@ struct AudioGenView: View {
             refAudioPath: refAudioURL?.path,
             refText: refText,
             speed: speed,
-            temperature: temperature
+            temperature: temperature,
+            keepResident: keepResident
         )
+        persist()
         let total = RAMChecker.totalGB
         let needed = model.approxRAMGB
         if total < needed {
@@ -366,7 +408,7 @@ struct AudioGenView: View {
             showRAMWarning = true
             return
         }
-        service.generate(req)
+        service.generate(req, server: server)
     }
 
     private func showLogWindow() {

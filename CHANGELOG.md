@@ -1,5 +1,19 @@
 # Changelog
 
+## v26.6.13 — Create images, voices, and video locally, all Zig Native
+
+- **Image generation.** Generate images from a text prompt right on your Mac — pick **FLUX.2** for fast results or **Krea-2-Turbo**, a 12.9B photorealistic model, then type a prompt and get a PNG with a live progress bar as it denoises. The whole pipeline (text encoder, diffusion transformer, VAE) runs natively on Apple Silicon: no venv, no setup step. Krea is a one-click ~15 GB download and was validated numerically faithful to the reference (end-to-end pixel cosine 0.9996); any size from 256² to 2048² works.
+- **On-device safety filter for images.** Every generated image is screened by an NSFW classifier that runs natively on your Mac — nothing is uploaded anywhere — and explicit results are blocked before they reach you. On by default, with a Safe-mode toggle in the Image tab (and a `--no-safety` server flag) to turn it off.
+- **Text-to-speech with zero-shot voice cloning.** Type text and hear it spoken by Qwen3-TTS — and record or pick a few seconds of any voice to have the model speak your text *in that voice*. Cloning runs entirely on device (validated bit-for-bit against the reference) and needs only the reference audio — no transcript.
+- **Text-to-video with audio.** Turn a prompt into a short LTX-Video 2.3 clip with synchronized audio, muxed straight to an mp4 — the full diffusion + 3D-VAE pipeline ported natively and validated tensor-by-tensor against the reference.
+- **One app, one server, one memory budget.** Chat and every media type now share a single local server instead of separate background processes. A model loads on demand when you generate and unloads when it's done to free GPU memory — flip "Keep loaded" for instant repeat runs — and a chat model and a media model can stay resident together without stepping on each other.
+- **Download media models right where you use them.** When a model you pick isn't on disk, the generation pane offers a one-click download with progress and only enables Generate once it's ready. Downloads pull just the files the engine actually reads — LTX grabs ~26 GB (model + its text encoder) instead of the repo's ~70 GB of unused weights — and that LTX text encoder doubles as a selectable chat model.
+- **Live progress everywhere.** Image, audio, and video all stream per-step progress as they generate, so you watch the work happen instead of staring at a spinner.
+- **Generate images right in chat.** In Agent mode, just ask for an image — "draw a red fox in the snow" — and it renders inline in the conversation using your saved Image settings (model, quality, resolution, seed, safe mode), no need to leave chat or restate the model. Double-click any image in a chat to open it full-size in Preview. (Audio and video generation stay in their tray windows for this release.)
+- **Your generation settings stick.** The Image, Audio, and Video panels now remember your last-used model, quality, resolution, steps, seed, and toggles — between opening the window and across app restarts — so you stop re-picking the same setup every time.
+
+---
+
 ## v26.6.12 — Big writes finish, agents run servers
 
 - **Your Qwen models can see now.** Qwen 3.5 and 3.6 vision checkpoints read images out of the box — attach a photo in chat, or send one through the OpenAI or Anthropic API, and the model describes the scene, reads text in the image, and answers questions about what's there. Validated from the tiny 0.8B up to the 27B; vision-capable models keep their multi-token-prediction speedup on text turns and switch it off automatically for image turns, so picture questions stay correct.

@@ -23,9 +23,23 @@ final class ProcessToolSchemaTests: XCTestCase {
     }
 
     func testToolCountIncludesNewProcessTools() {
-        // 11 existing (shell, cwd, writeFile, readFile, editFile, searchFiles,
-        // listFiles, browse, webSearch, saveMemory, createTask) + 3 new = 14.
-        XCTAssertEqual(defs().count, 14)
+        // 11 base (shell, cwd, writeFile, readFile, editFile, searchFiles,
+        // listFiles, browse, webSearch, saveMemory, createTask) + 3 process
+        // (killProcess, readProcessOutput, listProcesses) + 3 media
+        // (generate_image, generate_audio, generate_video) = 17.
+        XCTAssertEqual(defs().count, 17)
+    }
+
+    /// The media-generation tools: `generate_image` is the real, required-prompt
+    /// tool; `generate_audio`/`generate_video` are advertised "coming soon" stubs.
+    func testMediaGenerationToolsPresent() {
+        let tools = byName()
+        for n in ["generate_image", "generate_audio", "generate_video"] {
+            XCTAssertNotNil(tools[n], "\(n) missing from schema")
+        }
+        XCTAssertEqual((tools["generate_image"]!["parameters"] as! [String: Any])["required"] as! [String], ["prompt"])
+        XCTAssertEqual((tools["generate_audio"]!["parameters"] as! [String: Any])["required"] as! [String], ["text"])
+        XCTAssertEqual((tools["generate_video"]!["parameters"] as! [String: Any])["required"] as! [String], ["prompt"])
     }
 
     func testShellHasOptionalRunInBackgroundParam() {

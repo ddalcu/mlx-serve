@@ -94,7 +94,6 @@ struct MLXCoreApp: App {
                 .environmentObject(appState)
                 .environmentObject(appState.server)
                 .environmentObject(appState.downloads)
-                .environmentObject(appState.python)
                 .environmentObject(appState.voice)
         } label: {
             // Observe the voice controller so the tray icon picks up the accent
@@ -143,25 +142,28 @@ struct MLXCoreApp: App {
 
         Window("Image Generation", id: "imageGen") {
             ImageGenView()
-                .environmentObject(appState.python)
                 .environmentObject(appState.imageGen)
                 .environmentObject(appState.server)
+                .environmentObject(appState.downloads)
+                .environmentObject(appState)
         }
         .defaultSize(width: 960, height: 700)
 
         Window("Video Generation", id: "videoGen") {
             VideoGenView()
-                .environmentObject(appState.python)
                 .environmentObject(appState.videoGen)
                 .environmentObject(appState.server)
+                .environmentObject(appState.downloads)
+                .environmentObject(appState)
         }
         .defaultSize(width: 960, height: 700)
 
         Window("Audio Generation", id: "audioGen") {
             AudioGenView()
-                .environmentObject(appState.python)
                 .environmentObject(appState.audioGen)
                 .environmentObject(appState.server)
+                .environmentObject(appState.downloads)
+                .environmentObject(appState)
         }
         .defaultSize(width: 900, height: 660)
 

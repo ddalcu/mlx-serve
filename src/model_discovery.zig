@@ -43,8 +43,21 @@ const supported_model_types = [_][]const u8{
     "deepseek_v4",
 };
 
+/// Native media-generation archs (image / audio / video), served by the
+/// unified engines in `gen.zig`. Recognized here so `--model-dir` discovery
+/// and `/v1/load-model` by-path accept them; the modality engine (not the MLX
+/// transformer) handles the load. Kept as inline string checks so this module
+/// stays filesystem-only (no mlx/gen import). Mirrors `gen.modalityFromType`.
+fn isMediaModelType(model_type: []const u8) bool {
+    return std.mem.startsWith(u8, model_type, "flux2") or
+        std.mem.startsWith(u8, model_type, "krea") or
+        std.mem.eql(u8, model_type, "qwen3_tts") or
+        std.mem.eql(u8, model_type, "AudioVideo");
+}
+
 fn isSupportedModelType(model_type: []const u8) bool {
     if (std.mem.startsWith(u8, model_type, "lfm2")) return true;
+    if (isMediaModelType(model_type)) return true;
     for (supported_model_types) |t| {
         if (std.mem.eql(u8, model_type, t)) return true;
     }
@@ -97,6 +110,12 @@ fn peekConfig(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir, entry_n
     if (!isSupportedModelType(mt_val.string)) {
         const dup = allocator.dupe(u8, mt_val.string) catch return .missing_or_unparseable;
         return .{ .unsupported_arch = dup };
+    }
+    // Media models manage their own per-component quantization (the top-level
+    // config may declare a mode the MLX loader doesn't, e.g. a DiT scheme), so
+    // they bypass the LM quant gate below.
+    if (isMediaModelType(mt_val.string)) {
+        return .{ .supported = allocator.dupe(u8, mt_val.string) catch return .missing_or_unparseable };
     }
     // Quantization gate: if a model declares a `quantization.mode`, accept
     // only the schemes the loader supports. Models without a quantization
@@ -496,6 +515,19 @@ test "isSupportedModelType accepts qwen3_moe (Qwen3-30B-A3B)" {
     try testing.expect(isSupportedModelType("qwen3"));
     // A genuinely unknown arch is still rejected.
     try testing.expect(!isSupportedModelType("totally_made_up_arch"));
+}
+
+test "isSupportedModelType accepts native media archs (image/audio/video)" {
+    // Unified media-gen: FLUX (flux2*), Qwen3-TTS, LTX-Video (AudioVideo) load
+    // through the registry now, so discovery + by-path must accept them.
+    try testing.expect(isSupportedModelType("flux2-klein-4b"));
+    try testing.expect(isSupportedModelType("flux2"));
+    try testing.expect(isSupportedModelType("qwen3_tts"));
+    try testing.expect(isSupportedModelType("AudioVideo"));
+    try testing.expect(isMediaModelType("flux2-klein-9b"));
+    try testing.expect(isMediaModelType("krea2_turbo"));
+    try testing.expect(isSupportedModelType("krea2_turbo"));
+    try testing.expect(!isMediaModelType("gemma4"));
 }
 
 test "isSupportedModelType accepts gemma3_text (text-only Gemma3ForCausalLM)" {

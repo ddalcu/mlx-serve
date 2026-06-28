@@ -1,0 +1,173 @@
+import Foundation
+
+/// Which files of a HuggingFace repo a download should pull. Media models are
+/// NOT the flat single-dir shape chat models are: FLUX ships weight SUBDIRS
+/// (`transformer/`, `vae/`, …), TTS ships `speech_tokenizer/`, and LTX ships
+/// ~50 GB of files (LoRAs, upscalers, alternate transformers) the engine never
+/// reads. This lets each download pull EXACTLY what's needed — no more.
+struct FileSelection: Equatable {
+    /// Descend into subdirectories (FLUX/TTS). When false, only top-level files
+    /// + the `mtp/` sidecar are kept (the chat-model default).
+    var recursive: Bool = false
+    /// Skip any file whose path contains one of these (belt-and-suspenders for
+    /// junk a recursive scan would otherwise grab).
+    var excludeSubstrings: [String] = []
+    /// When non-nil, among `.safetensors` files keep ONLY these basenames. The
+    /// LTX allowlist (`transformer-dev`/`connector`/`vae_decoder`) — skips the
+    /// LoRAs, upscalers, and alternate transformers. Non-safetensors (json/txt)
+    /// follow the normal extension rule.
+    var keepSafetensors: Set<String>? = nil
+
+    /// Chat-model default: top-level files + `mtp/`, all needed extensions.
+    static let chatDefault = FileSelection()
+}
+
+/// One downloadable piece of a media bundle: a HF repo + how to pull it + how
+/// to tell it's fully present on disk.
+struct MediaComponent: Equatable {
+    let repo: String
+    let selection: FileSelection
+    /// Relative paths (file OR dir) that must exist for this component to be
+    /// "ready". Combined with a generic "has at least one .safetensors" check
+    /// so a config-only partial download never reads as ready.
+    let readyMarkers: [String]
+
+    static func == (l: MediaComponent, r: MediaComponent) -> Bool { l.repo == r.repo }
+}
+
+/// A media model + its dependencies, downloaded as a unit. Today: FLUX/TTS are
+/// single-component; LTX is `[ltx, gemma-3-12b]` (the text encoder, which is
+/// also selectable as a chat model). Designed to grow — new bundles just add
+/// components / a new factory.
+struct MediaBundle: Identifiable, Equatable {
+    let id: String
+    let displayName: String
+    /// Primary model first, then dependencies.
+    let components: [MediaComponent]
+    let sizeEstimateGB: Double
+
+    var primaryRepo: String { components.first!.repo }
+    var dependencyRepos: [String] { Array(components.dropFirst().map(\.repo)) }
+
+    static func == (l: MediaBundle, r: MediaBundle) -> Bool { l.id == r.id }
+}
+
+// MARK: - Bundle factories (per modality)
+
+extension MediaBundle {
+    /// FLUX (mflux): one repo with weight subdirs (`transformer/`, `vae/`,
+    /// `text_encoder/`, `tokenizer/`). Recursive download; ready when all four
+    /// subdirs + config are present.
+    static func flux(repo: String, displayName: String, sizeGB: Double) -> MediaBundle {
+        MediaBundle(
+            id: "flux:\(repo)",
+            displayName: displayName,
+            components: [
+                MediaComponent(
+                    repo: repo,
+                    selection: FileSelection(recursive: true),
+                    readyMarkers: ["config.json", "transformer", "vae", "text_encoder", "tokenizer"]
+                ),
+            ],
+            sizeEstimateGB: sizeGB
+        )
+    }
+
+    /// Qwen3-TTS: top-level model + `speech_tokenizer/` subdir (the codec
+    /// decoder reads `<dir>/speech_tokenizer/`). Recursive download.
+    static func tts(repo: String, displayName: String, sizeGB: Double) -> MediaBundle {
+        MediaBundle(
+            id: "tts:\(repo)",
+            displayName: displayName,
+            components: [
+                MediaComponent(
+                    repo: repo,
+                    selection: FileSelection(recursive: true),
+                    readyMarkers: ["config.json", "speech_tokenizer"]
+                ),
+            ],
+            sizeEstimateGB: sizeGB
+        )
+    }
+
+    /// LTX-Video: pull ONLY the 3 safetensors the engine reads (allowlist) plus
+    /// the small json configs — the repo also carries ~50 GB of LoRAs /
+    /// upscalers / alternate transformers we never touch. Depends on the
+    /// Gemma-3-12B text encoder (a normal chat model the app downloads).
+    static func ltx(repo: String, displayName: String) -> MediaBundle {
+        MediaBundle(
+            id: "ltx:\(repo)",
+            displayName: displayName,
+            components: [
+                MediaComponent(
+                    repo: repo,
+                    selection: FileSelection(keepSafetensors: [
+                        "transformer-dev.safetensors", "connector.safetensors", "vae_decoder.safetensors",
+                    ]),
+                    readyMarkers: [
+                        "config.json", "transformer-dev.safetensors",
+                        "connector.safetensors", "vae_decoder.safetensors",
+                    ]
+                ),
+                ltxGemmaComponent,
+            ],
+            // ~18 GB (3 LTX files) + ~8 GB (Gemma-3-12B 4-bit).
+            sizeEstimateGB: 26
+        )
+    }
+
+    /// Krea-2-Turbo (mlx-serve bundle): ONE public repo, assembled so the engine
+    /// loads it directly — a top-level transformer file + `vae/`/`text_encoder/`/
+    /// `tokenizer/` subdirs + `config.json`. Recursive download (no auth, no
+    /// gated base repo); ready when the transformer file + three subdirs + config
+    /// are present. Unlike FLUX the transformer is a top-level FILE, not a
+    /// `transformer/` subdir — hence its own readyMarkers.
+    static func krea(repo: String, displayName: String, sizeGB: Double) -> MediaBundle {
+        MediaBundle(
+            id: "krea:\(repo)",
+            displayName: displayName,
+            components: [
+                MediaComponent(
+                    repo: repo,
+                    selection: FileSelection(recursive: true),
+                    readyMarkers: ["config.json", "transformer_mixed_4_8.safetensors", "vae", "text_encoder", "tokenizer"]
+                ),
+            ],
+            sizeEstimateGB: sizeGB
+        )
+    }
+
+    /// The Gemma-3-12B text encoder LTX needs — also a standalone chat model.
+    /// Standard MLX layout (config + tokenizer + sharded safetensors).
+    static let ltxGemmaRepo = "mlx-community/gemma-3-12b-it-4bit"
+    static let ltxGemmaComponent = MediaComponent(
+        repo: ltxGemmaRepo,
+        selection: .chatDefault,
+        readyMarkers: ["config.json", "tokenizer.json"]
+    )
+}
+
+// MARK: - Preset → bundle
+
+extension ImageModelPreset {
+    var bundle: MediaBundle {
+        switch variant {
+        case .krea2Turbo:
+            return .krea(repo: repo, displayName: name, sizeGB: Double(approxDownloadGB))
+        default:
+            return .flux(repo: repo, displayName: name, sizeGB: Double(approxDownloadGB))
+        }
+    }
+}
+
+extension AudioModelPreset {
+    var bundle: MediaBundle {
+        .tts(repo: repo, displayName: name, sizeGB: approxDownloadGB)
+    }
+}
+
+extension VideoModelPreset {
+    var bundle: MediaBundle {
+        .ltx(repo: repo, displayName: name)
+    }
+}

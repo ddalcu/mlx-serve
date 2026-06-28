@@ -586,6 +586,7 @@ enum AgentEngine {
         mcpRouter: (any MCPToolRouting)? = nil,
         documentIndex: DocumentIndex? = nil,
         createTask: ((_ goal: String, _ schedule: String?) async -> String)? = nil,
+        generateImage: ((_ prompt: String) async -> String)? = nil,
         processRegistry: ProcessRegistry? = nil,
         sessionId: UUID? = nil
     ) async -> ToolResult {
@@ -604,6 +605,23 @@ enum AgentEngine {
                 ? await createTask!(tc.arguments["goal"] ?? "", tc.arguments["schedule"])
                 : "Error: createTask isn't available in this context."
             return ToolResult(id: tc.id, name: name, output: out)
+        }
+
+        // Media-generation meta-tools, handled before the repetition / built-in
+        // dispatch (a heavy one-shot, no workdir, not a ToolHandler). Like
+        // createTask the image generator is injected by the caller (ChatTurnEngine
+        // owns ImageGenService + AppState); audio/video are stubbed this release.
+        if name == "generate_image" {
+            let out = generateImage != nil
+                ? await generateImage!(tc.arguments["prompt"] ?? "")
+                : "Error: image generation isn't available in this context."
+            return ToolResult(id: tc.id, name: name, output: out)
+        }
+        if name == "generate_audio" {
+            return ToolResult(id: tc.id, name: name, output: AgentPrompt.comingSoonAudio)
+        }
+        if name == "generate_video" {
+            return ToolResult(id: tc.id, name: name, output: AgentPrompt.comingSoonVideo)
         }
 
         // ── Single repetition guard for ALL tools — built-in and MCP alike ──

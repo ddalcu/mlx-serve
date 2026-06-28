@@ -20,6 +20,7 @@ const ds4_ffi = @import("ds4_ffi.zig");
 const model_registry_mod = @import("model_registry.zig");
 const model_discovery = @import("model_discovery.zig");
 const arch_llama = @import("arch/llama.zig");
+const media_mod = @import("gen.zig");
 const stb = @cImport({ @cInclude("stb_image.h"); });
 const webp = @cImport({ @cInclude("webp/decode.h"); });
 const metrics = @import("status.zig");
@@ -442,6 +443,13 @@ pub var ssm_checkpoint_max: u32 = 32;
 /// the cache catches warm-reuse benches + repeated agent probes without
 /// hoarding token buffers across a long session.
 pub var tokenize_cache_entries: u32 = 4;
+
+/// Image-generation NSFW content filter (Krea 2 Community License §4.2). ON by
+/// default; `--no-safety` disables it process-wide, or a request can opt out with
+/// `"safety": false`. The classifier (Falconsai ViT, src/nsfw.zig) is lazy-loaded
+/// from `~/.mlx-serve/models`; if it's unavailable the server fails OPEN (warns +
+/// passes the image through).
+pub var image_safety_filter: bool = true;
 
 /// Iteration 3-5 (perf-plan Phase 5 #1): cap on resident llama.cpp KV
 /// sessions per loaded GGUF model. 1 is the legacy single-session
@@ -994,6 +1002,13 @@ fn handleConnection(
         try handleLoadModelStrict(allocator, stream, request_body);
         return;
     }
+    if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/unload-model")) {
+        // Free a model's resident GPU state (the app's load→generate→unload
+        // default). The stub stays registered so it can reload. Idempotent.
+        log.debug("POST /v1/unload-model -> 200\n", .{});
+        try handleUnloadModelStrict(allocator, stream, request_body);
+        return;
+    }
 
     // ── Plan 05 Phase D: resolve the request's target model via the
     //    scheduler (which delegates the fast path to registry.ensureLoaded
@@ -1133,6 +1148,18 @@ fn handleConnection(
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
         const body = request[header_end + 4 .. total_read];
         try handleDetokenize(allocator, stream, body, lm);
+    } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/images/generations")) {
+        const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
+        const body = request[header_end + 4 .. total_read];
+        try handleGen(allocator, stream, body, lm, .image);
+    } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/audio/speech")) {
+        const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
+        const body = request[header_end + 4 .. total_read];
+        try handleGen(allocator, stream, body, lm, .audio);
+    } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/video/generations")) {
+        const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
+        const body = request[header_end + 4 .. total_read];
+        try handleGen(allocator, stream, body, lm, .video);
     } else {
         log.warn("{s} {s} -> 404\n", .{ method, path });
         try sendErrorResponse(allocator, stream, "404 Not Found", "not_found", "The requested endpoint does not exist", null);
@@ -1387,6 +1414,10 @@ fn renderModelEntry(
         if (has_reasoning) try append_cap(allocator, &caps, &n_caps, "reasoning");
         if (has_chat) try append_cap(allocator, &caps, &n_caps, "json_schema");
         if (config.is_encoder_only) try append_cap(allocator, &caps, &n_caps, "embeddings");
+        // Native media-generation engines (resident).
+        if (entry.image_engine != null) try append_cap(allocator, &caps, &n_caps, "image");
+        if (entry.audio_engine != null and !has_audio) try append_cap(allocator, &caps, &n_caps, "audio");
+        if (entry.video_engine != null) try append_cap(allocator, &caps, &n_caps, "video");
         try caps.append(allocator, ']');
 
         var mods = std.ArrayList(u8).empty;
@@ -1480,7 +1511,11 @@ fn renderModelEntry(
     // present. Reasoning/audio stay load-gated (they need the live template /
     // encoder), so an unloaded stub may under-report those two.
     const is_encoder_stub = std.mem.eql(u8, entry.arch_hint, "bert");
+    // Native media-gen stub (image/audio/video) — advertise the modality from
+    // the discovery-peeked arch_hint so the app can find it before loading.
+    const media_modality = media_mod.modalityFromType(entry.arch_hint);
     const caps_part: []const u8 = blk: {
+        if (media_modality) |m| break :blk try std.fmt.allocPrint(allocator, ",\"capabilities\":[\"{s}\"]", .{m.capability()});
         if (is_encoder_stub) break :blk try allocator.dupe(u8, ",\"capabilities\":[\"embeddings\"]");
         if (!sm.found or !(sm.has_chat or sm.has_vision)) break :blk try allocator.dupe(u8, "");
         var b = std.ArrayList(u8).empty;
@@ -1708,6 +1743,118 @@ fn handleLoadModelStrict(allocator: std.mem.Allocator, stream: *Conn, request_bo
         if (drafter_loaded) "true" else "false",
         drafter_path_json,
     });
+    defer allocator.free(body);
+    try sendResponse(stream, "200 OK", "application/json", body);
+}
+
+/// Media-generation job payload. Carries the connection + body + resolved
+/// model into the inference thread, where `genJobRun` runs the actual
+/// generation (mlx + SSE writes) on the GPU-stream-owning thread.
+const GenJob = struct {
+    allocator: std.mem.Allocator,
+    conn: *Conn,
+    body: []const u8,
+    lm: *model_registry_mod.LoadedModel,
+    modality: media_mod.Modality,
+};
+
+/// Inference-thread entry point for a gen job. Dispatches on the engine slot
+/// and writes the full HTTP/SSE response to the (parked) connection.
+fn genJobRun(ctx: *anyopaque) void {
+    const job: *GenJob = @ptrCast(@alignCast(ctx));
+    const result = switch (job.modality) {
+        .image => if (job.lm.image_engine) |e| media_mod.handleImage(job.conn.io, job.allocator, job.conn, job.body, e) else error.WrongModality,
+        .audio => if (job.lm.audio_engine) |e| media_mod.handleAudio(job.allocator, job.conn, job.body, e) else error.WrongModality,
+        .video => if (job.lm.video_engine) |e| media_mod.handleVideo(job.conn.io, job.allocator, job.conn, job.body, e) else error.WrongModality,
+    };
+    result catch |err| {
+        log.warn("[gen] {s} job failed: {s}\n", .{ @tagName(job.modality), @errorName(err) });
+    };
+}
+
+/// Dispatch a media-generation request to the inference thread. `lm` is the
+/// already-resolved + refcounted model (so it can't be evicted mid-gen). The
+/// generation runs on the scheduler's inference thread (the sole mlx caller);
+/// the body writes its own response. A wrong-modality target gets a clear 400.
+fn handleGen(allocator: std.mem.Allocator, stream: *Conn, body: []const u8, lm: *model_registry_mod.LoadedModel, modality: media_mod.Modality) !void {
+    const scheduler = global_scheduler orelse {
+        try sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", "Scheduler not ready", 503);
+        return;
+    };
+    const ok = switch (modality) {
+        .image => lm.image_engine != null,
+        .audio => lm.audio_engine != null,
+        .video => lm.video_engine != null,
+    };
+    if (!ok) {
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Target model does not support this media modality. Load the matching image/audio/video model and target it by id.", 400);
+        return;
+    }
+    var job = GenJob{ .allocator = allocator, .conn = stream, .body = body, .lm = lm, .modality = modality };
+    var req = scheduler_mod.GenRequest{ .ctx = &job, .run = genJobRun, .model = lm };
+    scheduler.runGeneration(&req) catch |err| switch (err) {
+        error.Shutdown => {
+            try sendErrorResponse(allocator, stream, "503 Service Unavailable", "shutting_down", "Server is shutting down", 503);
+            return;
+        },
+        else => return err,
+    };
+    // The job body wrote the full HTTP/SSE response on the inference thread.
+}
+
+/// `POST /v1/unload-model` `{"model": id}`. Frees the model's resident GPU
+/// state (the stub stays registered so it can reload). Idempotent. Returns a
+/// small status payload confirming the model is unloaded.
+fn handleUnloadModelStrict(allocator: std.mem.Allocator, stream: *Conn, request_body: []const u8) !void {
+    const scheduler = global_scheduler orelse {
+        try sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", "Scheduler not ready", 503);
+        return;
+    };
+    // Parse the model id with std.json (handles '\/'-escaped absolute paths
+    // the same way /v1/load-model does), then reduce an absolute path to its
+    // basename — the registry keys media + by-path models by dir basename.
+    var requested_id: []const u8 = "";
+    var parsed_body: ?std.json.Parsed(std.json.Value) = null;
+    defer if (parsed_body) |*p| p.deinit();
+    if (std.json.parseFromSlice(std.json.Value, allocator, request_body, .{})) |parsed| {
+        parsed_body = parsed;
+        if (parsed.value == .object) {
+            if (parsed.value.object.get("model")) |m| {
+                if (m == .string) requested_id = m.string;
+            }
+        }
+    } else |_| {
+        requested_id = parseModelFromBody(request_body) orelse "";
+    }
+    if (std.mem.startsWith(u8, requested_id, "/")) {
+        var trimmed = requested_id;
+        while (trimmed.len > 0 and trimmed[trimmed.len - 1] == '/') trimmed = trimmed[0 .. trimmed.len - 1];
+        requested_id = std.fs.path.basename(trimmed);
+    }
+
+    scheduler.unloadModel(requested_id) catch |err| switch (err) {
+        error.UnknownModelId => {
+            try sendErrorResponse(allocator, stream, "404 Not Found", "model_not_found", "Unknown model id", 404);
+            return;
+        },
+        error.NoDefaultModel => {
+            try sendErrorResponse(allocator, stream, "503 Service Unavailable", "no_model", "No default model configured", 503);
+            return;
+        },
+        error.Shutdown => {
+            try sendErrorResponse(allocator, stream, "503 Service Unavailable", "shutting_down", "Server is shutting down", 503);
+            return;
+        },
+        else => {
+            try sendErrorResponse(allocator, stream, "500 Internal Server Error", "model_unload_failed", "Model unload failed", 500);
+            return;
+        },
+    };
+
+    const id_for_body = if (requested_id.len > 0) requested_id else "mlx-serve";
+    const body = try std.fmt.allocPrint(allocator,
+        \\{{"model":{{"id":"{s}","object":"model","loaded":false,"state":"unloaded"}}}}
+    , .{id_for_body});
     defer allocator.free(body);
     try sendResponse(stream, "200 OK", "application/json", body);
 }

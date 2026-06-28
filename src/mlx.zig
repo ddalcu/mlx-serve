@@ -242,6 +242,20 @@ pub extern "c" fn mlx_quantize(res: *mlx_vector_array, w: mlx_array, group_size:
 pub extern "c" fn mlx_sigmoid(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
 pub extern "c" fn mlx_sum_axis(res: *mlx_array, a: mlx_array, axis: c_int, keepdims: bool, s: mlx_stream) c_int;
 pub extern "c" fn mlx_conv1d(res: *mlx_array, input: mlx_array, weight: mlx_array, stride: c_int, padding: c_int, dilation: c_int, groups: c_int, s: mlx_stream) c_int;
+// FFT — real-input forward transform for the TTS speaker-encoder mel/STFT.
+// `mlx_fft_norm`: BACKWARD=0 (no scaling on forward; matches mx.fft.rfft default).
+pub const mlx_fft_norm = c_int;
+pub const MLX_FFT_NORM_BACKWARD: mlx_fft_norm = 0;
+pub extern "c" fn mlx_fft_rfft(res: *mlx_array, a: mlx_array, n: c_int, axis: c_int, norm: mlx_fft_norm, s: mlx_stream) c_int;
+// 2D/3D conv + transposed conv for the media-generation decoders (VAE/vocoder).
+// MLX layout: input NHWC / NDHWC, weight OHWI / ODHWI (out-channels first, in-channels last).
+pub extern "c" fn mlx_conv2d(res: *mlx_array, input: mlx_array, weight: mlx_array, stride_0: c_int, stride_1: c_int, padding_0: c_int, padding_1: c_int, dilation_0: c_int, dilation_1: c_int, groups: c_int, s: mlx_stream) c_int;
+pub extern "c" fn mlx_conv3d(res: *mlx_array, input: mlx_array, weight: mlx_array, stride_0: c_int, stride_1: c_int, stride_2: c_int, padding_0: c_int, padding_1: c_int, padding_2: c_int, dilation_0: c_int, dilation_1: c_int, dilation_2: c_int, groups: c_int, s: mlx_stream) c_int;
+pub extern "c" fn mlx_conv_transpose1d(res: *mlx_array, input: mlx_array, weight: mlx_array, stride: c_int, padding: c_int, dilation: c_int, output_padding: c_int, groups: c_int, s: mlx_stream) c_int;
+pub extern "c" fn mlx_conv_transpose2d(res: *mlx_array, input: mlx_array, weight: mlx_array, stride_0: c_int, stride_1: c_int, padding_0: c_int, padding_1: c_int, dilation_0: c_int, dilation_1: c_int, output_padding_0: c_int, output_padding_1: c_int, groups: c_int, s: mlx_stream) c_int;
+pub extern "c" fn mlx_conv_transpose3d(res: *mlx_array, input: mlx_array, weight: mlx_array, stride_0: c_int, stride_1: c_int, stride_2: c_int, padding_0: c_int, padding_1: c_int, padding_2: c_int, dilation_0: c_int, dilation_1: c_int, dilation_2: c_int, output_padding_0: c_int, output_padding_1: c_int, output_padding_2: c_int, groups: c_int, s: mlx_stream) c_int;
+// Seed-exact noise for diffusion latents (FLUX): pair with mlx_random_key(seed).
+pub extern "c" fn mlx_random_normal(res: *mlx_array, shape: [*]const c_int, shape_num: usize, dtype: mlx_dtype, loc: f32, scale: f32, key: mlx_array, s: mlx_stream) c_int;
 pub extern "c" fn mlx_argpartition_axis(res: *mlx_array, a: mlx_array, kth: c_int, axis: c_int, s: mlx_stream) c_int;
 pub extern "c" fn mlx_take_along_axis(res: *mlx_array, a: mlx_array, indices: mlx_array, axis: c_int, s: mlx_stream) c_int;
 pub extern "c" fn mlx_put_along_axis(res: *mlx_array, a: mlx_array, indices: mlx_array, values: mlx_array, axis: c_int, s: mlx_stream) c_int;

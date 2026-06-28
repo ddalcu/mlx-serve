@@ -3,14 +3,14 @@ import AppKit
 import AVKit
 import UniformTypeIdentifiers
 
-/// Video generation window — LTX-Video 2 via the shared Python venv.
+/// Video generation window — LTX-Video 2.3, run natively by the mlx-serve server.
 /// Uses the same Quality / Resolution preset shape as ImageGen, plus a
 /// Frames dropdown clamped to LTX's `8N+1` ladder and the user's RAM
 /// budget.
 struct VideoGenView: View {
-    @EnvironmentObject var python: PythonManager
     @EnvironmentObject var service: VideoGenService
     @EnvironmentObject var server: ServerManager
+    @EnvironmentObject var downloads: DownloadManager
 
     @State private var prompt: String = ""
     @State private var showAdvanced: Bool = false
@@ -29,20 +29,32 @@ struct VideoGenView: View {
     @State private var ramWarningMessage: String = ""
     @State private var pendingRequest: VideoGenRequest? = nil
     @State private var player: AVPlayer?
+    /// Keep the model resident after generating (default off → unload).
+    @State private var keepResident: Bool = false
+    /// Hydration guard — see ImageGenView for the full rationale.
+    @State private var hydrating: Bool = false
+    @State private var didHydrate: Bool = false
 
     var body: some View {
-        Group {
-            switch python.status {
-            case .unknown:
-                ProgressView().frame(maxWidth: .infinity, maxHeight: .infinity)
-            case .missingPython, .needsGit, .needsVenv, .needsPackages, .needsFFmpeg:
-                GenInstallPane(feature: "Video Generation (LTX-Video 2.3)")
-            case .ready:
-                readyView
+        readyView
+        .frame(minWidth: 880, minHeight: 660)
+        .onAppear {
+            if !didHydrate {
+                hydrating = true
+                hydrate()
+                didHydrate = true
+                DispatchQueue.main.async { hydrating = false }
             }
         }
-        .frame(minWidth: 880, minHeight: 660)
-        .onAppear { applyModelDefaults() }
+        // Persist the fields not owned by the model/quality/resolution sections.
+        .onChange(of: numFrames) { _, _ in guard !hydrating else { return }; persist() }
+        .onChange(of: fps) { _, _ in guard !hydrating else { return }; persist() }
+        .onChange(of: mode) { _, _ in guard !hydrating else { return }; persist() }
+        .onChange(of: steps) { _, _ in guard !hydrating else { return }; persist() }
+        .onChange(of: cfgScale) { _, _ in guard !hydrating else { return }; persist() }
+        .onChange(of: stgScale) { _, _ in guard !hydrating else { return }; persist() }
+        .onChange(of: seed) { _, _ in guard !hydrating else { return }; persist() }
+        .onChange(of: keepResident) { _, _ in guard !hydrating else { return }; persist() }
         .onChange(of: service.phase) { _, phase in
             if case .completed(let path) = phase {
                 player = AVPlayer(url: URL(fileURLWithPath: path))
@@ -78,7 +90,7 @@ struct VideoGenView: View {
         .alert("Model exceeds your Mac's RAM", isPresented: $showRAMWarning) {
             Button("Cancel", role: .cancel) { pendingRequest = nil }
             Button("Generate Anyway", role: .destructive) {
-                if let req = pendingRequest { service.generate(req) }
+                if let req = pendingRequest { service.generate(req, server: server) }
                 pendingRequest = nil
             }
         } message: {
@@ -158,7 +170,7 @@ struct VideoGenView: View {
             }
             .labelsHidden()
             .pickerStyle(.menu)
-            .onChange(of: model) { _, _ in applyModelDefaults() }
+            .onChange(of: model) { _, _ in guard !hydrating else { return }; applyModelDefaults(); persist() }
             Text("~\(model.approxRAMGB) GB RAM • Includes audio")
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -175,7 +187,7 @@ struct VideoGenView: View {
             }
             .pickerStyle(.segmented)
             .labelsHidden()
-            .onChange(of: quality) { _, _ in applyQualityDefaults() }
+            .onChange(of: quality) { _, _ in guard !hydrating else { return }; applyQualityDefaults(); persist() }
             Text(qualityHint)
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -206,7 +218,7 @@ struct VideoGenView: View {
             }
             .labelsHidden()
             .pickerStyle(.menu)
-            .onChange(of: resolution) { _, _ in clampFramesToRAM() }
+            .onChange(of: resolution) { _, _ in guard !hydrating else { return }; clampFramesToRAM(); persist() }
         }
     }
 
@@ -366,6 +378,9 @@ struct VideoGenView: View {
                 numberField("Seed", value: $seed, step: 1)
                 Spacer()
             }
+            Toggle("Keep model loaded after generating", isOn: $keepResident)
+                .font(.caption)
+                .help("On: the model stays resident so the next generation is instant. Off (default): it's unloaded to free GPU memory.")
         }
     }
 
@@ -390,25 +405,30 @@ struct VideoGenView: View {
     }
 
     private var actionRow: some View {
-        HStack {
-            if service.isRunning {
-                Button(role: .destructive) {
-                    service.cancel()
-                } label: {
-                    Label("Cancel", systemImage: "stop.circle")
-                        .frame(maxWidth: .infinity)
+        VStack(spacing: 8) {
+            if !downloads.bundleReady(model.bundle) {
+                BundleDownloadBar(bundle: model.bundle)
+            }
+            HStack {
+                if service.isRunning {
+                    Button(role: .destructive) {
+                        service.cancel()
+                    } label: {
+                        Label("Cancel", systemImage: "stop.circle")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.bordered)
+                } else {
+                    Button {
+                        tryGenerate()
+                    } label: {
+                        Label("Generate", systemImage: "wand.and.stars")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.borderedProminent)
+                    .keyboardShortcut(.return, modifiers: [.command])
+                    .disabled(prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !downloads.bundleReady(model.bundle))
                 }
-                .buttonStyle(.bordered)
-            } else {
-                Button {
-                    tryGenerate()
-                } label: {
-                    Label("Generate", systemImage: "wand.and.stars")
-                        .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.borderedProminent)
-                .keyboardShortcut(.return, modifiers: [.command])
-                .disabled(prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
             }
         }
     }
@@ -470,7 +490,7 @@ struct VideoGenView: View {
     private var outputFolderLink: some View {
         Button {
             NSWorkspace.shared.activateFileViewerSelecting(
-                [URL(fileURLWithPath: PythonManager.videosRoot)]
+                [URL(fileURLWithPath: MediaStorage.videosRoot)]
             )
         } label: {
             Label("Open output folder in Finder", systemImage: "folder")
@@ -478,7 +498,41 @@ struct VideoGenView: View {
         }
         .buttonStyle(.borderless)
         .foregroundStyle(.secondary)
-        .help(PythonManager.videosRoot)
+        .help(MediaStorage.videosRoot)
+    }
+
+    // MARK: - Sticky settings
+
+    private func hydrate() {
+        let s = VideoGenSettings.load()
+        model = s.resolvedModel
+        quality = s.quality
+        resolution = s.resolvedResolution(for: model)
+        numFrames = s.numFrames
+        fps = s.fps
+        mode = s.mode
+        steps = s.steps
+        cfgScale = s.cfgScale
+        stgScale = s.stgScale
+        seed = s.seed
+        keepResident = s.keepResident
+        clampFramesToRAM()
+    }
+
+    private func persist() {
+        var s = VideoGenSettings()
+        s.modelId = model.id
+        s.quality = quality
+        s.resolutionId = resolution.id
+        s.numFrames = numFrames
+        s.fps = fps
+        s.mode = mode
+        s.steps = steps
+        s.cfgScale = cfgScale
+        s.stgScale = stgScale
+        s.seed = seed
+        s.keepResident = keepResident
+        s.save()
     }
 
     // MARK: - Actions
@@ -530,8 +584,10 @@ struct VideoGenView: View {
             steps: steps,
             cfgScale: cfgScale,
             stgScale: stgScale,
-            firstFrameImagePath: supportsI2V ? firstFrameImageURL?.path : nil
+            firstFrameImagePath: supportsI2V ? firstFrameImageURL?.path : nil,
+            keepResident: keepResident
         )
+        persist()
 
         let total = RAMChecker.totalGB
         let needed = model.approxRAMGB
@@ -542,7 +598,7 @@ struct VideoGenView: View {
             return
         }
 
-        service.generate(req)
+        service.generate(req, server: server)
     }
 
     private func showLogWindow() {
@@ -574,196 +630,6 @@ private struct AVPlayerViewRepresentable: NSViewRepresentable {
     func updateNSView(_ nsView: AVPlayerView, context: Context) {
         if nsView.player !== player {
             nsView.player = player
-        }
-    }
-}
-
-// MARK: - Shared install pane
-
-/// Shown by both ImageGen and VideoGen when the shared venv / packages are
-/// missing. One-click install button kicks `PythonManager.install()` and
-/// tails the log below.
-struct GenInstallPane: View {
-    let feature: String
-    @EnvironmentObject var python: PythonManager
-
-    var body: some View {
-        VStack(spacing: 16) {
-            Image(systemName: "shippingbox")
-                .font(.system(size: 56))
-                .foregroundStyle(.secondary)
-            Text(feature).font(.title2.weight(.semibold))
-            Text(reasonText)
-                .multilineTextAlignment(.center)
-                .foregroundStyle(.secondary)
-                .frame(maxWidth: 560)
-
-            switch python.status {
-            case .missingPython:
-                DependencyInstructions(
-                    title: "Install Python 3",
-                    brewCommand: "brew install python",
-                    xcodeApplies: true,
-                    xcodeNote: "Apple's Command Line Tools include a usable python3, though the version is older than Homebrew's.",
-                    afterNote: "Then reopen this pane."
-                )
-            case .needsGit:
-                DependencyInstructions(
-                    title: "Install git",
-                    brewCommand: "brew install git",
-                    xcodeApplies: true,
-                    xcodeNote: "Xcode Command Line Tools ship git out of the box and is the lightest install if you don't already use Homebrew.",
-                    afterNote: "Then reopen this pane — pip uses git to fetch the ltx-2-mlx packages."
-                )
-            case .needsFFmpeg:
-                DependencyInstructions(
-                    title: "Install ffmpeg",
-                    brewCommand: "brew install ffmpeg",
-                    xcodeApplies: false,
-                    xcodeNote: nil,
-                    afterNote: "Then reopen this pane — ltx-2-mlx shells out to ffmpeg for audio/video muxing."
-                )
-            default:
-                Button {
-                    Task { await python.install() }
-                } label: {
-                    if python.isInstalling {
-                        ProgressView().controlSize(.small)
-                        Text("Installing...").padding(.leading, 8)
-                    } else {
-                        Label("Install (≈3 GB, ~3 minutes)", systemImage: "arrow.down.circle")
-                    }
-                }
-                .buttonStyle(.borderedProminent)
-                .controlSize(.large)
-                .disabled(python.isInstalling)
-            }
-
-            if let err = python.lastError {
-                Text(err).font(.caption).foregroundStyle(.red).multilineTextAlignment(.center)
-            }
-
-            if !python.installLog.isEmpty {
-                logTail
-            }
-
-            Spacer()
-        }
-        .padding(32)
-        .frame(maxWidth: .infinity, maxHeight: .infinity)
-    }
-
-    private var reasonText: String {
-        switch python.status {
-        case .missingPython:
-            return "Python 3 isn't installed on this Mac. Image and video generation need Python to host the mflux / ltx-2-mlx pipelines."
-        case .needsGit:
-            return "git isn't on PATH. The video pipeline (ltx-2-mlx) is fetched from GitHub by pip, which shells out to git during install."
-        case .needsVenv:
-            return "A dedicated Python environment at ~/.mlx-serve/venv needs to be created. Click Install to set it up — no effect on your system Python."
-        case .needsPackages:
-            return "The Python environment exists but is missing required packages. Click Install to finish the setup. ~50 GB of model weights download on first generation."
-        case .needsFFmpeg:
-            return "Python packages are installed, but the system ffmpeg binary is missing. ltx-2-mlx muxes audio into the mp4 via system ffmpeg."
-        default:
-            return ""
-        }
-    }
-
-    /// Single dependency-install card shared by all `needs*` external states.
-    /// Always shows the Homebrew option (we treat it as the recommended
-    /// path). Optionally includes the Xcode Command Line Tools alternative
-    /// for deps that ship with the CLT (python3, git) — not for ffmpeg, which
-    /// CLT doesn't bundle.
-    private struct DependencyInstructions: View {
-        let title: String
-        let brewCommand: String
-        let xcodeApplies: Bool
-        let xcodeNote: String?
-        let afterNote: String
-
-        var body: some View {
-            VStack(alignment: .leading, spacing: 10) {
-                Text(title).font(.callout.weight(.semibold))
-
-                option(
-                    badge: "Homebrew",
-                    badgeColor: .orange,
-                    command: brewCommand,
-                    note: "If you don't have Homebrew, install it from brew.sh first."
-                )
-
-                if xcodeApplies {
-                    option(
-                        badge: "Xcode CLT",
-                        badgeColor: .blue,
-                        command: "xcode-select --install",
-                        note: xcodeNote ?? ""
-                    )
-                }
-
-                Text(afterNote)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .padding(.top, 2)
-            }
-            .frame(maxWidth: 480, alignment: .leading)
-        }
-
-        @ViewBuilder
-        private func option(badge: String, badgeColor: Color, command: String, note: String) -> some View {
-            VStack(alignment: .leading, spacing: 4) {
-                HStack(spacing: 6) {
-                    Text(badge)
-                        .font(.caption2.weight(.semibold))
-                        .foregroundStyle(badgeColor)
-                        .padding(.horizontal, 6).padding(.vertical, 2)
-                        .background(badgeColor.opacity(0.15), in: Capsule())
-                    Spacer()
-                    Button {
-                        let pb = NSPasteboard.general
-                        pb.clearContents()
-                        pb.setString(command, forType: .string)
-                    } label: {
-                        Image(systemName: "doc.on.doc")
-                    }
-                    .buttonStyle(.borderless)
-                    .help("Copy command")
-                }
-                Text(command)
-                    .font(.system(.callout, design: .monospaced))
-                    .textSelection(.enabled)
-                    .padding(.horizontal, 10).padding(.vertical, 4)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .background(Color.secondary.opacity(0.15), in: RoundedRectangle(cornerRadius: 4))
-                if !note.isEmpty {
-                    Text(note).font(.caption2).foregroundStyle(.secondary)
-                }
-            }
-        }
-    }
-
-    private var logTail: some View {
-        ScrollViewReader { proxy in
-            ScrollView {
-                VStack(alignment: .leading, spacing: 2) {
-                    ForEach(Array(python.installLog.enumerated()), id: \.offset) { idx, line in
-                        Text(line)
-                            .font(.system(.caption, design: .monospaced))
-                            .foregroundStyle(.secondary)
-                            .id(idx)
-                    }
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .padding(8)
-            }
-            .frame(maxWidth: 640, maxHeight: 200)
-            .background(Color.black.opacity(0.15), in: RoundedRectangle(cornerRadius: 6))
-            .onChange(of: python.installLog.count) { _, n in
-                if n > 0 {
-                    withAnimation { proxy.scrollTo(n - 1, anchor: .bottom) }
-                }
-            }
         }
     }
 }

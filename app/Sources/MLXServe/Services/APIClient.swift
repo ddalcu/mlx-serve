@@ -194,6 +194,61 @@ class APIClient {
         return Self.parseModelInfo(modelObj)
     }
 
+    /// POST /v1/unload-model — free a model's resident GPU state (the registry
+    /// keeps the stub so it can reload). Used by the media-gen
+    /// load→generate→unload flow. Idempotent server-side; a non-resident model
+    /// returns 200.
+    func unloadModel(port: UInt16, id: String) async throws {
+        let url = URL(string: "http://127.0.0.1:\(port)/v1/unload-model")!
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.timeoutInterval = 120
+        request.httpBody = try JSONSerialization.data(withJSONObject: ["model": id], options: [.withoutEscapingSlashes])
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+            let code = (response as? HTTPURLResponse)?.statusCode ?? -1
+            let snippet = String(data: data, encoding: .utf8)?.prefix(300) ?? ""
+            throw APIError.badStatus(code: code, detail: String(snippet))
+        }
+    }
+
+    /// POST a media-generation endpoint with `stream:true` and yield each parsed
+    /// SSE `data:` event as a dictionary (`{type:"progress"|"complete"|"error", …}`)
+    /// against the MAIN server port. Replaces `NativeGenServer.postStream`. The
+    /// connection is torn down when the consuming task is cancelled.
+    nonisolated func streamGeneration(port: UInt16, path: String, json: [String: Any]) -> AsyncThrowingStream<[String: Any], Error> {
+        AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    var body = json
+                    body["stream"] = true
+                    var req = URLRequest(url: URL(string: "http://127.0.0.1:\(port)\(path)")!)
+                    req.httpMethod = "POST"
+                    req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                    req.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+                    req.httpBody = try JSONSerialization.data(withJSONObject: body, options: [.withoutEscapingSlashes])
+                    req.timeoutInterval = 900
+                    let (bytes, resp) = try await URLSession.shared.bytes(for: req)
+                    let code = (resp as? HTTPURLResponse)?.statusCode ?? -1
+                    guard code == 200 else { throw APIError.badStatus(code: code, detail: "stream start failed") }
+                    for try await line in bytes.lines {
+                        guard line.hasPrefix("data: ") else { continue }
+                        let payload = String(line.dropFirst(6))
+                        if let d = payload.data(using: .utf8),
+                           let obj = try? JSONSerialization.jsonObject(with: d) as? [String: Any] {
+                            continuation.yield(obj)
+                        }
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+
     /// POST /v1/embeddings — batch-embed `input` with an encoder-only model
     /// (the server runs one padded masked GPU forward per 64-text chunk).
     /// Returns one vector per input, in input order.

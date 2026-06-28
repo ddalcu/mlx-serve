@@ -2,7 +2,7 @@ import Foundation
 import SwiftUI
 import AppKit
 
-/// Runs FLUX.2 image generation via the shared `PythonManager` venv.
+/// Drives image generation (FLUX.2 / Krea-2-Turbo) on the native mlx-serve server.
 ///
 /// Keeps UI-facing state (progress, current output, history) so the view can
 /// just bind to it. Cancellation is handled by dropping the running `Task`,
@@ -22,11 +22,10 @@ final class ImageGenService: ObservableObject {
     @Published private(set) var recent: [String] = []  // recent output paths, newest first
     @Published private(set) var log: [String] = []
 
-    private let python: PythonManager
     private var task: Task<Void, Never>?
+    private let api = APIClient()
 
-    init(python: PythonManager) {
-        self.python = python
+    init() {
         loadRecent()
     }
 
@@ -35,59 +34,162 @@ final class ImageGenService: ObservableObject {
         return false
     }
 
-    func generate(_ request: ImageGenRequest) {
-        guard python.status.imagesReady else {
-            phase = .failed("Python environment is not ready.")
-            return
-        }
+    /// Generate through the ONE main server: ensure it's running (headless if
+    /// needed), load the FLUX model on demand, stream `/v1/images/generations`,
+    /// then unload unless the user pinned "Keep loaded". Coexists with a chat
+    /// model on the same process.
+    func generate(_ request: ImageGenRequest, server: ServerManager) {
         guard !request.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             phase = .failed("Prompt is empty.")
             return
         }
+        guard let modelDir = ServerManager.resolveModelDir(repo: request.model.repo) else {
+            phase = .failed("Model \(request.model.repo) is not downloaded. Download it first.")
+            return
+        }
 
         task?.cancel()
-        phase = .running(step: 0, total: request.steps, message: "Starting...")
+        phase = .running(step: 0, total: request.steps, message: "Loading model…")
         log = []
 
         let outputPath = Self.makeOutputPath(prompt: request.prompt)
-        let args = Self.buildArgs(request, outputPath: outputPath)
+        let prompt = request.prompt
+        let size = "\(request.width)x\(request.height)"
+        let steps = request.steps
+        // Send a concrete seed so "random" (-1) actually varies; the server
+        // otherwise defaults to a fixed seed.
+        let seedToSend = request.seed >= 0 ? request.seed : Int.random(in: 0...0xFFFF_FFFF)
+        let keep = request.keepResident
+        let safeMode = request.safeMode
 
         task = Task {
+            var loadedId: String? = nil
+            func releaseIfNeeded() async {
+                if !keep, let id = loadedId { try? await server.unloadModel(id: id) }
+            }
             do {
-                let stream = python.runScript(source: Self.mfluxScript, args: args)
-                for try await event in stream {
-                    switch event {
-                    case .progress(let step, let total, let message):
-                        phase = .running(step: step, total: total, message: message)
-                    case .complete(let path):
-                        phase = .completed(path: path)
-                        insertRecent(path)
-                    case .log(let line):
-                        appendLog(line)
+                let port = try await server.ensureRunning(forGenModelDir: modelDir)
+                if Task.isCancelled { phase = .idle; return }
+                let info = try await server.loadModel(id: modelDir)  // registry id = dir basename
+                loadedId = info.name
+                if Task.isCancelled { await releaseIfNeeded(); phase = .idle; return }
+                // SSE: per-step `progress` events drive a determinate bar, then a
+                // `complete` event carries the PNG.
+                var png: Data? = nil
+                var genJson: [String: Any] = ["model": info.name, "prompt": prompt, "size": size, "steps": steps, "seed": seedToSend]
+                if !safeMode { genJson["safety"] = false }  // opt out of the server NSFW filter
+                for try await ev in api.streamGeneration(
+                    port: port, path: "/v1/images/generations",
+                    json: genJson) {
+                    switch ev["type"] as? String {
+                    case "progress":
+                        let step = ev["step"] as? Int ?? 0
+                        let total = ev["total"] as? Int ?? steps
+                        let stage = ev["stage"] as? String ?? "Generating"
+                        phase = .running(step: step, total: max(total, 1), message: "\(stage)…")
+                    case "complete":
+                        png = Self.decodePngB64(ev)
+                    case "error":
+                        await releaseIfNeeded()
+                        phase = .failed(ev["message"] as? String ?? "Generation failed.")
+                        return
+                    default:
+                        break
                     }
                 }
-                // Stream finished without a complete event — treat as success
-                // if the file materialized, otherwise as failure.
-                if FileManager.default.fileExists(atPath: outputPath) {
-                    if case .completed = phase { /* already set */ } else {
-                        phase = .completed(path: outputPath)
-                        insertRecent(outputPath)
-                    }
-                } else if case .running = phase {
-                    phase = .failed("Generation finished without output.")
+                await releaseIfNeeded()
+                guard let png else {
+                    phase = .failed("Server returned no image data.")
+                    return
                 }
-            } catch GenError.cancelled {
+                try png.write(to: URL(fileURLWithPath: outputPath))
+                phase = .completed(path: outputPath)
+                insertRecent(outputPath)
+            } catch is CancellationError {
+                await releaseIfNeeded()
                 phase = .idle
             } catch {
-                // Prefer the actual error message the Python script emitted
-                // (kept in `log` with an "ERROR: " prefix) over the generic
-                // "Python exited with code N". The Python message usually
-                // includes actionable context (e.g. HF gated-repo auth steps).
-                let actionable = log.last(where: { $0.hasPrefix("ERROR: ") })
-                    .map { String($0.dropFirst("ERROR: ".count)) }
-                phase = .failed(actionable ?? error.localizedDescription)
+                await releaseIfNeeded()
+                phase = .failed(error.localizedDescription)
             }
         }
+    }
+
+    /// Errors surfaced by the awaitable agent path (`generateForAgent`).
+    enum GenError: LocalizedError {
+        case emptyPrompt
+        case notDownloaded(String)
+        case server(String)
+        var errorDescription: String? {
+            switch self {
+            case .emptyPrompt:           return "Prompt is empty."
+            case .notDownloaded(let n):  return "\(n) is not downloaded."
+            case .server(let m):         return m
+            }
+        }
+    }
+
+    /// Awaitable image generation for the agent's `generate_image` tool. Runs the
+    /// SAME load → stream → write → unload pipeline as `generate`, returning the
+    /// output PNG path (or throwing), but WITHOUT touching the menu-bar UI state
+    /// (`phase`/`task`/`recent`) — so an agent generation never hijacks the Image
+    /// window. Honors the request's `keepResident` like the interactive path.
+    func generateForAgent(_ request: ImageGenRequest, server: ServerManager) async throws -> String {
+        guard !request.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw GenError.emptyPrompt
+        }
+        guard let modelDir = ServerManager.resolveModelDir(repo: request.model.repo) else {
+            throw GenError.notDownloaded(request.model.name)
+        }
+
+        let outputPath = Self.makeOutputPath(prompt: request.prompt)
+        let size = "\(request.width)x\(request.height)"
+        let seedToSend = request.seed >= 0 ? request.seed : Int.random(in: 0...0xFFFF_FFFF)
+        let keep = request.keepResident
+
+        let port = try await server.ensureRunning(forGenModelDir: modelDir)
+        let info = try await server.loadModel(id: modelDir)  // registry id = dir basename
+        let loadedId = info.name
+        func releaseIfNeeded() async {
+            if !keep { try? await server.unloadModel(id: loadedId) }
+        }
+        do {
+            var png: Data? = nil
+            var genJson: [String: Any] = ["model": info.name, "prompt": request.prompt,
+                                          "size": size, "steps": request.steps, "seed": seedToSend]
+            if !request.safeMode { genJson["safety"] = false }
+            for try await ev in api.streamGeneration(
+                port: port, path: "/v1/images/generations", json: genJson) {
+                switch ev["type"] as? String {
+                case "complete": png = Self.decodePngB64(ev)
+                case "error":    throw GenError.server(ev["message"] as? String ?? "Generation failed.")
+                default:         break
+                }
+            }
+            guard let png else { throw GenError.server("Server returned no image data.") }
+            try png.write(to: URL(fileURLWithPath: outputPath))
+            await releaseIfNeeded()
+            return outputPath
+        } catch {
+            await releaseIfNeeded()
+            throw error
+        }
+    }
+
+    /// Extract the base64 PNG from an OpenAI `{data:[{b64_json}]}` response body.
+    /// Pure + static so it's unit-testable without a running server.
+    static func decodePngB64(_ body: Data) -> Data? {
+        guard let obj = try? JSONSerialization.jsonObject(with: body) as? [String: Any] else { return nil }
+        return decodePngB64(obj)
+    }
+
+    /// Same, from an already-parsed object (the SSE `complete` event).
+    static func decodePngB64(_ obj: [String: Any]) -> Data? {
+        guard let arr = obj["data"] as? [[String: Any]],
+              let b64 = arr.first?["b64_json"] as? String,
+              let png = Data(base64Encoded: b64)
+        else { return nil }
+        return png
     }
 
     func cancel() {
@@ -111,7 +213,7 @@ final class ImageGenService: ObservableObject {
     /// Scan the generations/images/ tree for existing files so the history
     /// shelf shows something on first launch.
     private func loadRecent() {
-        let root = PythonManager.imagesRoot
+        let root = MediaStorage.imagesRoot
         let fm = FileManager.default
         guard let days = try? fm.contentsOfDirectory(atPath: root) else { return }
         var paths: [(String, Date)] = []
@@ -133,7 +235,7 @@ final class ImageGenService: ObservableObject {
         let df = DateFormatter()
         df.dateFormat = "yyyy-MM-dd"
         let day = df.string(from: Date())
-        let dayDir = (PythonManager.imagesRoot as NSString).appendingPathComponent(day)
+        let dayDir = (MediaStorage.imagesRoot as NSString).appendingPathComponent(day)
         try? FileManager.default.createDirectory(atPath: dayDir, withIntermediateDirectories: true)
         let tf = DateFormatter()
         tf.dateFormat = "yyyy-MM-dd_HH-mm-ss"
@@ -145,159 +247,4 @@ final class ImageGenService: ObservableObject {
         let filename = "\(tf.string(from: Date()))_\(slug).png"
         return (dayDir as NSString).appendingPathComponent(filename)
     }
-
-    private static func buildArgs(_ r: ImageGenRequest, outputPath: String) -> [String] {
-        var args = [
-            "--variant", r.model.variant.rawValue,
-            "--config", r.model.configName,
-            "--repo", r.model.repo,
-            "--prompt", r.prompt,
-            "--width", String(r.width),
-            "--height", String(r.height),
-            "--steps", String(r.steps),
-            "--guidance", String(r.guidance),
-            "--seed", String(r.seed),
-            "--output", outputPath,
-        ]
-        if !r.negativePrompt.isEmpty {
-            args.append(contentsOf: ["--negative", r.negativePrompt])
-        }
-        return args
-    }
-
-    // MARK: - Embedded Python
-
-    /// mflux-based generation script. Uses the actual mflux 0.x API
-    /// discovered by inspecting the installed package — the public top-
-    /// level exports (`from mflux import Flux1`) are NOT available in
-    /// current mflux releases despite older docs. The real API:
-    ///
-    ///   from mflux.models.flux.variants.txt2img.flux import Flux1
-    ///   from mflux.models.flux2.variants.txt2img.flux2_klein import Flux2Klein
-    ///   from mflux.models.common.config.model_config import ModelConfig
-    ///
-    ///   flux = Flux1(model_config=ModelConfig.schnell(), quantize=4)
-    ///   img  = flux.generate_image(seed=..., prompt=..., num_inference_steps=...,
-    ///                              height=..., width=..., guidance=...)
-    ///   img.save(...)  # GeneratedImage.save accepts a positional path
-    ///
-    /// Wire format (JSON-per-line on stdout):
-    ///   {"type":"progress","step":N,"total":M,"message":"..."}
-    ///   {"type":"complete","path":"/abs/path/to/output.png"}
-    ///   {"type":"error","message":"..."}
-    ///
-    /// Per-step progress comes via tqdm interception — mflux uses tqdm
-    /// internally for its denoise loop and doesn't expose a step callback.
-    static let mfluxScript: String = #"""
-import sys, json, argparse, traceback, random
-
-def emit(obj):
-    print(json.dumps(obj), flush=True)
-
-def main():
-    p = argparse.ArgumentParser()
-    p.add_argument("--variant", required=True, choices=["flux1","flux2Klein4B","flux2Klein9B"])
-    p.add_argument("--config", required=True, help="schnell|dev|flux2_klein_4b|flux2_klein_9b")
-    p.add_argument("--repo", required=True,
-                   help="Pre-quantized mflux-format HuggingFace repo to download.")
-    p.add_argument("--prompt", required=True)
-    p.add_argument("--negative", default="")
-    p.add_argument("--seed", type=int, default=-1)
-    p.add_argument("--width", type=int, default=1024)
-    p.add_argument("--height", type=int, default=1024)
-    p.add_argument("--steps", type=int, default=4)
-    p.add_argument("--guidance", type=float, default=0.0)
-    p.add_argument("--output", required=True)
-    args = p.parse_args()
-
-    # Hook tqdm before importing mflux so the patched class is what mflux
-    # picks up for its denoise loop. mflux doesn't expose a step callback.
-    #
-    # We only emit progress for tqdm bars whose total looks like an inference
-    # step counter (<= 200). HuggingFace downloads also use tqdm (file count,
-    # byte counter in the billions) and emitting those would spam the UI with
-    # nonsensical "Step 0/4619599996" events.
-    try:
-        import tqdm
-        _orig = tqdm.tqdm
-        class _ProgressTqdm(_orig):
-            def update(self, n=1):
-                super().update(n)
-                if self.total and 0 < self.total <= 200:
-                    emit({"type":"progress","step":int(self.n),
-                          "total":int(self.total),
-                          "message":f"Step {int(self.n)}/{int(self.total)}"})
-        tqdm.tqdm = _ProgressTqdm
-        try:
-            import tqdm.auto
-            tqdm.auto.tqdm = _ProgressTqdm
-        except Exception:
-            pass
-    except Exception:
-        pass  # progress will be coarse; generation still works
-
-    try:
-        from mflux.models.common.config.model_config import ModelConfig
-        if args.variant == "flux1":
-            from mflux.models.flux.variants.txt2img.flux import Flux1 as ModelClass
-        else:
-            from mflux.models.flux2.variants.txt2img.flux2_klein import Flux2Klein as ModelClass
-    except Exception as e:
-        emit({"type":"error","message":f"mflux import failed: {e}"})
-        traceback.print_exc()
-        sys.exit(1)
-
-    # Resolve ModelConfig factory by name (e.g. "schnell" -> ModelConfig.schnell()).
-    try:
-        if not hasattr(ModelConfig, args.config):
-            emit({"type":"error","message":f"Unknown ModelConfig factory: {args.config}"})
-            sys.exit(1)
-        model_config = getattr(ModelConfig, args.config)()
-    except Exception as e:
-        emit({"type":"error","message":f"ModelConfig failed: {e}"})
-        traceback.print_exc()
-        sys.exit(1)
-
-    emit({"type":"progress","step":0,"total":args.steps,
-          "message":f"Downloading {args.repo} (first run only)..."})
-    try:
-        from huggingface_hub import snapshot_download
-        local_path = snapshot_download(repo_id=args.repo)
-        flux = ModelClass(model_config=model_config,
-                          model_path=local_path, quantize=None)
-    except Exception as e:
-        emit({"type":"error","message":f"Load failed: {e}"})
-        traceback.print_exc()
-        sys.exit(1)
-
-    seed = args.seed if args.seed >= 0 else random.randint(0, 2**32 - 1)
-    emit({"type":"progress","step":0,"total":args.steps,"message":"Generating..."})
-
-    # generate_image() in current mflux takes individual kwargs (no Config arg).
-    # FLUX.1 supports negative_prompt; FLUX.2 doesn't expose it as a top-level
-    # arg, so only forward it for flux1.
-    gen_kwargs = dict(
-        seed=seed,
-        prompt=args.prompt,
-        num_inference_steps=args.steps,
-        height=args.height,
-        width=args.width,
-        guidance=args.guidance,
-    )
-    if args.variant == "flux1" and args.negative:
-        gen_kwargs["negative_prompt"] = args.negative
-
-    try:
-        result = flux.generate_image(**gen_kwargs)
-    except Exception as e:
-        emit({"type":"error","message":str(e)})
-        traceback.print_exc()
-        sys.exit(1)
-
-    result.save(args.output)
-    emit({"type":"complete","path":args.output})
-
-if __name__ == "__main__":
-    main()
-"""#
 }

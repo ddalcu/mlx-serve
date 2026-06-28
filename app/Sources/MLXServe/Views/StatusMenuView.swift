@@ -91,10 +91,10 @@ private struct ClaudeShape: Shape {
     }
 }
 
-/// The optional Python-backed media tools shown under the collapsible
-/// "Experiments" section of the menu popover. Pure data (no SwiftUI, no
-/// `PythonManager`) so the section's membership, ordering, readiness wiring,
-/// and help text stay unit-testable. Kept in sync with `GenExperimentTests`.
+/// The native media-generation tools (image / video / audio) shown in the
+/// "Experiments" section of the menu popover. Pure data (no SwiftUI) so the
+/// section's membership, ordering, and help text stay unit-testable. Kept in
+/// sync with `GenExperimentTests`.
 enum GenExperiment: String, CaseIterable, Identifiable {
     case image, video, audio
 
@@ -116,24 +116,12 @@ enum GenExperiment: String, CaseIterable, Identifiable {
         }
     }
 
-    /// Tooltip — depends on whether the backing venv is installed.
-    func help(ready: Bool) -> String {
+    /// Tooltip for the tile.
+    var help: String {
         switch self {
-        case .image: ready ? "Image Generation (FLUX.2)"
-                           : "Image Generation — click to install dependencies"
-        case .video: ready ? "Video Generation (LTX-Video 2.3)"
-                           : "Video Generation — click to install dependencies"
-        case .audio: ready ? "Audio Generation — neural TTS & voice cloning"
-                           : "Audio Generation — click to install dependencies"
-        }
-    }
-
-    /// Which `PythonManager.status` flag gates this feature: ImageGen/AudioGen
-    /// only need the image stack; VideoGen needs the full (LTX) install.
-    func ready(imagesReady: Bool, fullyReady: Bool) -> Bool {
-        switch self {
-        case .image, .audio: imagesReady
-        case .video: fullyReady
+        case .image: "Image Generation (FLUX.2 / Krea-2)"
+        case .video: "Video Generation (LTX-Video 2.3)"
+        case .audio: "Audio Generation — neural TTS & voice cloning"
         }
     }
 }
@@ -142,12 +130,8 @@ struct StatusMenuView: View {
     @EnvironmentObject var appState: AppState
     @EnvironmentObject var server: ServerManager
     @EnvironmentObject var downloads: DownloadManager
-    @EnvironmentObject var python: PythonManager
     @State private var showDownloads = false
     @State private var showLog = false
-    /// Persisted so the accordion stays where the user left it across popover
-    /// open/close and app restarts. Collapsed by default — these are extras.
-    @AppStorage("experimentsExpanded") private var experimentsExpanded = false
     let openChat: () -> Void
     let openModelBrowser: () -> Void
     let openImageGen: () -> Void
@@ -463,42 +447,27 @@ struct StatusMenuView: View {
 
             Divider().padding(.horizontal, 12)
 
-            // Experiments — optional Python-backed media tools. Same
-            // click-to-toggle accordion as Downloads above; collapsed by
-            // default so the popover stays compact, and the state persists.
+            // Experiments — native media-generation tools (image / audio /
+            // video). Shown inline now that they're built in (no Python, no
+            // accordion); the tiles open their windows directly.
             VStack(alignment: .leading, spacing: 6) {
-                Button {
-                    withAnimation(.easeInOut(duration: 0.2)) {
-                        experimentsExpanded.toggle()
-                    }
-                } label: {
-                    HStack(spacing: 4) {
-                        Image(systemName: "chevron.right")
-                            .font(.caption2)
-                            .rotationEffect(.degrees(experimentsExpanded ? 90 : 0))
-                        Text("Experiments")
-                            .font(.subheadline.weight(.medium))
-                        Spacer()
-                    }
-                    .foregroundStyle(.secondary)
-                    .contentShape(Rectangle())
+                HStack(spacing: 4) {
+                    Text("Media Generation")
+                        .font(.subheadline.weight(.medium))
+                    Spacer()
                 }
-                .buttonStyle(.plain)
+                .foregroundStyle(.secondary)
 
-                if experimentsExpanded {
-                    HStack(spacing: 6) {
-                        ForEach(GenExperiment.allCases) { exp in
-                            genFeatureButton(
-                                icon: exp.icon,
-                                title: exp.title,
-                                help: exp.help(ready: exp.ready(
-                                    imagesReady: python.status.imagesReady,
-                                    fullyReady: python.status.isReady)),
-                                action: { open(exp) })
-                        }
+                HStack(spacing: 6) {
+                    ForEach(GenExperiment.allCases) { exp in
+                        genFeatureButton(
+                            icon: exp.icon,
+                            title: exp.title,
+                            help: exp.help,
+                            action: { open(exp) })
                     }
-                    .padding(.top, 4)
                 }
+                .padding(.top, 4)
             }
             .padding(.horizontal, 16)
             .padding(.vertical, 8)
