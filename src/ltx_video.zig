@@ -1971,6 +1971,224 @@ pub fn ditForward(
     return .{ .v = vout, .a = aout };
 }
 
+// ════════════════════════════════════════════════════════════════════════
+// Guided Euler sampler (CFG-only slice). Reference: ltx_pipelines_mlx
+// ti2vid_one_stage + utils/samplers.guided_denoise_loop + scheduler +
+// guiders + mlx_arsenal.diffusion.{dynamic_shift_schedule, euler_step}.
+// ════════════════════════════════════════════════════════════════════════
+
+/// LTX-2 token-adaptive flow-matching sigma schedule (dynamic_shift_schedule).
+/// Returns num_steps+1 sigmas ending at 0.0. Caller frees the slice.
+pub fn dynamicShiftSchedule(alloc: std.mem.Allocator, num_steps: u32, num_tokens: u32, base_shift: f64, max_shift: f64, base_tokens: f64, max_tokens: f64, stretch: bool, terminal: f64) ![]f32 {
+    const n = num_steps + 1;
+    const out = try alloc.alloc(f32, n);
+    const slope = (max_shift - base_shift) / (max_tokens - base_tokens);
+    const intercept = base_shift - slope * base_tokens;
+    const sigma_shift = @as(f64, @floatFromInt(num_tokens)) * slope + intercept;
+    const es = @exp(sigma_shift);
+    var sig = try alloc.alloc(f64, n);
+    defer alloc.free(sig);
+    for (0..n) |i| {
+        const lin = 1.0 - @as(f64, @floatFromInt(i)) / @as(f64, @floatFromInt(num_steps)); // linspace(1,0)
+        if (lin == 0.0) {
+            sig[i] = 0.0;
+        } else {
+            sig[i] = es / (es + (1.0 / lin - 1.0));
+        }
+    }
+    if (stretch) {
+        // last non-zero sigma is index num_steps-1 (index num_steps is 0)
+        const last_nz = sig[num_steps - 1];
+        const scale_factor = (1.0 - last_nz) / (1.0 - terminal);
+        if (scale_factor != 0.0) {
+            for (0..n) |i| {
+                if (sig[i] != 0.0) sig[i] = 1.0 - (1.0 - sig[i]) / scale_factor;
+            }
+        }
+    }
+    for (0..n) |i| out[i] = @floatCast(sig[i]);
+    return out;
+}
+
+/// Single Euler step on an x0-prediction model:
+/// `x_{t-1} = x + (sigma_next - sigma)*(x - x0)/sigma` (sigma==0 → x0).
+fn eulerStep(x: mlx.mlx_array, x0: mlx.mlx_array, sigma: f32, sigma_next: f32, s: S) !mlx.mlx_array {
+    if (sigma == 0.0) {
+        var c = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_array_set(&c, x0));
+        return c;
+    }
+    var xm = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(xm);
+    try mlx.check(mlx.mlx_subtract(&xm, x, x0, s));
+    const inv = mlx.mlx_array_new_float(1.0 / sigma);
+    defer _ = mlx.mlx_array_free(inv);
+    var d = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(d);
+    try mlx.check(mlx.mlx_multiply(&d, xm, inv, s));
+    const coef = mlx.mlx_array_new_float(sigma_next - sigma);
+    defer _ = mlx.mlx_array_free(coef);
+    var step = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(step);
+    try mlx.check(mlx.mlx_multiply(&step, d, coef, s));
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_add(&out, x, step, s));
+    return out;
+}
+
+/// Global (population) variance over all elements — mean((x - mean(x))^2).
+fn varGlobal(x: mlx.mlx_array, s: S) !mlx.mlx_array {
+    var m = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(m);
+    try mlx.check(mlx.mlx_mean(&m, x, false, s));
+    var xm = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(xm);
+    try mlx.check(mlx.mlx_subtract(&xm, x, m, s));
+    var sq = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sq);
+    try mlx.check(mlx.mlx_square(&sq, xm, s));
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_mean(&out, sq, false, s));
+    return out;
+}
+
+/// CFG guider with optional norm-preserving rescale (STG/modality dropped):
+/// `pred = cond + (cfg-1)*(cond-uncond)`; if rescale≠0,
+/// `pred *= rescale*sqrt(var(cond))/(sqrt(var(pred))+1e-8) + (1-rescale)`.
+fn cfgGuide(cond: mlx.mlx_array, uncond: mlx.mlx_array, cfg_scale: f32, rescale: f32, s: S) !mlx.mlx_array {
+    var diff = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(diff);
+    try mlx.check(mlx.mlx_subtract(&diff, cond, uncond, s));
+    const w = mlx.mlx_array_new_float(cfg_scale - 1.0);
+    defer _ = mlx.mlx_array_free(w);
+    var sc = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sc);
+    try mlx.check(mlx.mlx_multiply(&sc, diff, w, s));
+    var pred = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_add(&pred, cond, sc, s));
+    if (rescale != 0.0) {
+        const vc = try varGlobal(cond, s);
+        defer _ = mlx.mlx_array_free(vc);
+        const vp = try varGlobal(pred, s);
+        defer _ = mlx.mlx_array_free(vp);
+        var scd = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(scd);
+        try mlx.check(mlx.mlx_sqrt(&scd, vc, s));
+        var spd = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(spd);
+        try mlx.check(mlx.mlx_sqrt(&spd, vp, s));
+        const eps_a = mlx.mlx_array_new_float(1e-8);
+        defer _ = mlx.mlx_array_free(eps_a);
+        var spe = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(spe);
+        try mlx.check(mlx.mlx_add(&spe, spd, eps_a, s));
+        var factor = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(factor);
+        try mlx.check(mlx.mlx_divide(&factor, scd, spe, s));
+        const rs = mlx.mlx_array_new_float(rescale);
+        defer _ = mlx.mlx_array_free(rs);
+        var f2 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(f2);
+        try mlx.check(mlx.mlx_multiply(&f2, factor, rs, s));
+        const one_minus = mlx.mlx_array_new_float(1.0 - rescale);
+        defer _ = mlx.mlx_array_free(one_minus);
+        var f3 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(f3);
+        try mlx.check(mlx.mlx_add(&f3, f2, one_minus, s));
+        var pr = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_multiply(&pr, pred, f3, s));
+        _ = mlx.mlx_array_free(pred);
+        pred = pr;
+    }
+    return pred;
+}
+
+/// x0 prediction (X0Model): x0 = x_t - sigma*v, where v = ditForward(...).
+/// Returns bf16 x0 (matches the reference cast back to latent dtype).
+fn ditX0(comp: *const Component, alloc: std.mem.Allocator, cfg: LtxConfig, vx: mlx.mlx_array, ax: mlx.mlx_array, sigma: f32, vtext: mlx.mlx_array, atext: mlx.mlx_array, vpos: []const f32, apos: []const f32, s: S) !BlockOut {
+    const vel = try ditForward(comp, alloc, cfg, vx, ax, sigma, vtext, atext, vpos, apos, s);
+    defer _ = mlx.mlx_array_free(vel.v);
+    defer _ = mlx.mlx_array_free(vel.a);
+    const sig = mlx.mlx_array_new_float(sigma);
+    defer _ = mlx.mlx_array_free(sig);
+    var sv = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sv);
+    try mlx.check(mlx.mlx_multiply(&sv, vel.v, sig, s)); // bf16*f32 → f32
+    var x0vf = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x0vf);
+    try mlx.check(mlx.mlx_subtract(&x0vf, vx, sv, s));
+    var x0v = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_astype(&x0v, x0vf, .bfloat16, s));
+    var sa = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sa);
+    try mlx.check(mlx.mlx_multiply(&sa, vel.a, sig, s));
+    var x0af = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x0af);
+    try mlx.check(mlx.mlx_subtract(&x0af, ax, sa, s));
+    var x0a = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_astype(&x0a, x0af, .bfloat16, s));
+    return .{ .v = x0v, .a = x0a };
+}
+
+/// CFG-only guided Euler denoise loop. `noise_v`/`noise_a` are the bf16 initial
+/// latents; `sigmas` includes the terminal 0.0. Returns the final (bf16) latents.
+pub fn ditSampleCfg(
+    comp: *const Component,
+    alloc: std.mem.Allocator,
+    cfg: LtxConfig,
+    noise_v: mlx.mlx_array,
+    noise_a: mlx.mlx_array,
+    cond_v: mlx.mlx_array,
+    cond_a: mlx.mlx_array,
+    neg_v: mlx.mlx_array,
+    neg_a: mlx.mlx_array,
+    video_pos: []const f32,
+    audio_pos: []const f32,
+    sigmas: []const f32,
+    cfg_video: f32,
+    cfg_audio: f32,
+    rescale: f32,
+    s: S,
+) !BlockOut {
+    var vx = noise_v;
+    var ax = noise_a;
+    var owned = false;
+    var i: usize = 0;
+    while (i + 1 < sigmas.len) : (i += 1) {
+        const sigma = sigmas[i];
+        const sigma_next = sigmas[i + 1];
+        const cond = try ditX0(comp, alloc, cfg, vx, ax, sigma, cond_v, cond_a, video_pos, audio_pos, s);
+        defer _ = mlx.mlx_array_free(cond.v);
+        defer _ = mlx.mlx_array_free(cond.a);
+        const neg = try ditX0(comp, alloc, cfg, vx, ax, sigma, neg_v, neg_a, video_pos, audio_pos, s);
+        defer _ = mlx.mlx_array_free(neg.v);
+        defer _ = mlx.mlx_array_free(neg.a);
+        const v_x0 = try cfgGuide(cond.v, neg.v, cfg_video, rescale, s);
+        defer _ = mlx.mlx_array_free(v_x0);
+        const a_x0 = try cfgGuide(cond.a, neg.a, cfg_audio, rescale, s);
+        defer _ = mlx.mlx_array_free(a_x0);
+        const nvx = try eulerStep(vx, v_x0, sigma, sigma_next, s);
+        const nax = try eulerStep(ax, a_x0, sigma, sigma_next, s);
+        if (owned) {
+            _ = mlx.mlx_array_free(vx);
+            _ = mlx.mlx_array_free(ax);
+        }
+        vx = nvx;
+        ax = nax;
+        owned = true;
+        _ = mlx.mlx_array_eval(vx);
+        _ = mlx.mlx_array_eval(ax);
+    }
+    if (!owned) { // no steps → copy inputs so caller owns the result
+        var cv = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_array_set(&cv, vx));
+        var ca = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_array_set(&ca, ax));
+        return .{ .v = cv, .a = ca };
+    }
+    return .{ .v = vx, .a = ax };
+}
+
 // ── Tests ──
 
 const testing = std.testing;
@@ -2760,6 +2978,101 @@ test "ltx DiT ditForward reproduces LTXModel velocity" {
     const vc = corrF32(mlx.mlx_array_data_float32(vf).?, refv, 0);
     const ac = corrF32(mlx.mlx_array_data_float32(af).?, refa, 0);
     std.debug.print("[ltx-fwd] velocity_v corr={d:.6} ({d}) velocity_a corr={d:.6} ({d})\n", .{ vc, vn, ac, an });
+    try testing.expect(vc > 0.99);
+    try testing.expect(ac > 0.99);
+}
+
+// Stage 4a: dynamicShiftSchedule matches the reference ltx2_schedule. Cheap,
+// no model load. Gated on LTX_SAMP_SIGMAS=<samp_sigmas.raw [num_steps+1]>.
+test "ltx DiT dynamicShiftSchedule matches reference" {
+    const sp = std.c.getenv("LTX_SAMP_SIGMAS") orelse return error.SkipZigTest;
+    const allocator = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const ref = try readF32(io, allocator, std.mem.span(sp));
+    defer allocator.free(ref);
+    const num_steps: u32 = @intCast(ref.len - 1);
+    const sig = try dynamicShiftSchedule(allocator, num_steps, 192, 0.95, 2.05, 1024, 4096, true, 0.1);
+    defer allocator.free(sig);
+    try testing.expectEqual(ref.len, sig.len);
+    var maxerr: f64 = 0;
+    for (sig, ref) |a, b| maxerr = @max(maxerr, @abs(@as(f64, a) - @as(f64, b)));
+    std.debug.print("[ltx-sched] num_steps={d} max_abs_err={e}\n", .{ num_steps, maxerr });
+    try testing.expect(maxerr < 1e-4);
+}
+
+// Stage 4b: ditSampleCfg (CFG-only Euler loop) reproduces the reference final
+// denoised latents. Gated on LTX_TEST_MODEL + the sampler .raw dumps (LTX_SAMP_*).
+test "ltx DiT ditSampleCfg reproduces guided denoise loop" {
+    const dir = std.mem.span(std.c.getenv("LTX_TEST_MODEL") orelse return error.SkipZigTest);
+    const allocator = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const cpu_s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(cpu_s);
+
+    const vp = try std.fmt.allocPrintSentinel(allocator, "{s}/transformer-dev.safetensors", .{dir}, 0);
+    defer allocator.free(vp);
+    var comp = try loadComponent(allocator, vp, cpu_s);
+    defer comp.deinit();
+
+    const Lf = struct {
+        fn bf(a: std.mem.Allocator, ii: std.Io, env: []const u8, shape: []const c_int, st: S) !struct { x: mlx.mlx_array, buf: []f32 } {
+            const p = std.c.getenv(@ptrCast(env.ptr)) orelse return error.SkipZigTest;
+            const buf = try readF32(ii, a, std.mem.span(p));
+            const d = mlx.mlx_array_new_data(buf.ptr, shape.ptr, @intCast(shape.len), .float32);
+            defer _ = mlx.mlx_array_free(d);
+            var b = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_astype(&b, d, .bfloat16, st));
+            return .{ .x = b, .buf = buf };
+        }
+    };
+    const nv = try Lf.bf(allocator, io, "LTX_SAMP_NOISE_V", &[_]c_int{ 1, 192, 128 }, s);
+    defer allocator.free(nv.buf);
+    defer _ = mlx.mlx_array_free(nv.x);
+    const na = try Lf.bf(allocator, io, "LTX_SAMP_NOISE_A", &[_]c_int{ 1, 9, 128 }, s);
+    defer allocator.free(na.buf);
+    defer _ = mlx.mlx_array_free(na.x);
+    const cv = try Lf.bf(allocator, io, "LTX_SAMP_COND_V", &[_]c_int{ 1, 128, 4096 }, s);
+    defer allocator.free(cv.buf);
+    defer _ = mlx.mlx_array_free(cv.x);
+    const ca = try Lf.bf(allocator, io, "LTX_SAMP_COND_A", &[_]c_int{ 1, 128, 2048 }, s);
+    defer allocator.free(ca.buf);
+    defer _ = mlx.mlx_array_free(ca.x);
+    const ngv = try Lf.bf(allocator, io, "LTX_SAMP_NEG_V", &[_]c_int{ 1, 128, 4096 }, s);
+    defer allocator.free(ngv.buf);
+    defer _ = mlx.mlx_array_free(ngv.x);
+    const nga = try Lf.bf(allocator, io, "LTX_SAMP_NEG_A", &[_]c_int{ 1, 128, 2048 }, s);
+    defer allocator.free(nga.buf);
+    defer _ = mlx.mlx_array_free(nga.x);
+
+    const vpos = try readF32(io, allocator, std.mem.span(std.c.getenv("LTX_POS_V") orelse return error.SkipZigTest));
+    defer allocator.free(vpos);
+    const apos = try readF32(io, allocator, std.mem.span(std.c.getenv("LTX_POS_A") orelse return error.SkipZigTest));
+    defer allocator.free(apos);
+    const sigmas = try readF32(io, allocator, std.mem.span(std.c.getenv("LTX_SAMP_SIGMAS") orelse return error.SkipZigTest));
+    defer allocator.free(sigmas);
+
+    const cfg = LtxConfig{};
+    const out = try ditSampleCfg(&comp, allocator, cfg, nv.x, na.x, cv.x, ca.x, ngv.x, nga.x, vpos, apos, sigmas, 3.0, 7.0, 0.7, s);
+    defer _ = mlx.mlx_array_free(out.v);
+    defer _ = mlx.mlx_array_free(out.a);
+
+    const refv = try readF32(io, allocator, std.mem.span(std.c.getenv("LTX_SAMP_FINAL_V") orelse return error.SkipZigTest));
+    defer allocator.free(refv);
+    const refa = try readF32(io, allocator, std.mem.span(std.c.getenv("LTX_SAMP_FINAL_A") orelse return error.SkipZigTest));
+    defer allocator.free(refa);
+    var vf = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(vf);
+    try mlx.check(mlx.mlx_astype(&vf, out.v, .float32, s));
+    _ = mlx.mlx_array_eval(vf);
+    var af = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(af);
+    try mlx.check(mlx.mlx_astype(&af, out.a, .float32, s));
+    _ = mlx.mlx_array_eval(af);
+    const vc = corrF32(mlx.mlx_array_data_float32(vf).?, refv, 0);
+    const ac = corrF32(mlx.mlx_array_data_float32(af).?, refa, 0);
+    std.debug.print("[ltx-samp] final_v corr={d:.6} final_a corr={d:.6}\n", .{ vc, ac });
     try testing.expect(vc > 0.99);
     try testing.expect(ac > 0.99);
 }
