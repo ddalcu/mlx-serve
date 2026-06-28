@@ -807,11 +807,82 @@ pub fn loadTokenizer(io: std.Io, allocator: std.mem.Allocator, model_dir: []cons
     var reader_state = file.reader(io, &read_buf);
     const content = try reader_state.interface.allocRemaining(allocator, .limited(256 * 1024 * 1024));
     defer allocator.free(content);
+    return parseTokenizerContent(io, allocator, content);
+}
 
+/// Load a byte-level BPE tokenizer from the SLOW HF format (`vocab.json` +
+/// `merges.txt`), for checkpoints that ship no `tokenizer.json` (e.g.
+/// Qwen3-TTS). Synthesizes the equivalent `tokenizer.json` content and reuses
+/// `parseTokenizerContent` so arena lifetime is handled identically.
+pub fn loadTokenizerSlow(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !Tokenizer {
+    const vocab_path = try std.fmt.allocPrint(allocator, "{s}/vocab.json", .{model_dir});
+    defer allocator.free(vocab_path);
+    const vocab_json = try readFileAllocTok(io, allocator, vocab_path);
+    defer allocator.free(vocab_json);
+
+    const merges_path = try std.fmt.allocPrint(allocator, "{s}/merges.txt", .{model_dir});
+    defer allocator.free(merges_path);
+    const merges_txt = try readFileAllocTok(io, allocator, merges_path);
+    defer allocator.free(merges_txt);
+
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(allocator);
+    try buf.appendSlice(allocator, "{\"pre_tokenizer\":{\"type\":\"ByteLevel\"},\"model\":{\"type\":\"BPE\",\"vocab\":");
+    try buf.appendSlice(allocator, std.mem.trim(u8, vocab_json, " \t\r\n"));
+    try buf.appendSlice(allocator, ",\"merges\":[");
+    var first = true;
+    var lines = std.mem.splitScalar(u8, merges_txt, '\n');
+    while (lines.next()) |raw| {
+        const line = std.mem.trim(u8, raw, " \t\r");
+        if (line.len == 0 or line[0] == '#') continue;
+        if (!first) try buf.append(allocator, ',');
+        first = false;
+        try buf.append(allocator, '"');
+        try appendJsonEscapedTok(allocator, &buf, line);
+        try buf.append(allocator, '"');
+    }
+    try buf.appendSlice(allocator, "]}}");
+    return parseTokenizerContent(io, allocator, buf.items);
+}
+
+fn readFileAllocTok(io: std.Io, allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    const file = try std.Io.Dir.openFileAbsolute(io, path, .{});
+    defer file.close(io);
+    var rb: [4096]u8 = undefined;
+    var rs = file.reader(io, &rb);
+    return rs.interface.allocRemaining(allocator, .limited(256 * 1024 * 1024));
+}
+
+fn appendJsonEscapedTok(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), s: []const u8) !void {
+    for (s) |c| switch (c) {
+        '"' => try buf.appendSlice(allocator, "\\\""),
+        '\\' => try buf.appendSlice(allocator, "\\\\"),
+        else => {
+            if (c < 0x20) {
+                var tmp: [8]u8 = undefined;
+                try buf.appendSlice(allocator, std.fmt.bufPrint(&tmp, "\\u{x:0>4}", .{c}) catch unreachable);
+            } else try buf.append(allocator, c);
+        },
+    };
+}
+
+/// Try the fast `tokenizer.json` format, falling back to slow vocab.json+merges.txt.
+pub fn loadTokenizerAny(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !Tokenizer {
+    return loadTokenizer(io, allocator, model_dir) catch |e| {
+        if (e == error.FileNotFound) return loadTokenizerSlow(io, allocator, model_dir);
+        return e;
+    };
+}
+
+/// Parse a `tokenizer.json`-shaped JSON document into a `Tokenizer`. Split out
+/// from `loadTokenizer` so the slow-format loader (`loadTokenizerSlow`) can feed
+/// synthesized content. `parsed` (and the string keys borrowed from it) is owned
+/// by the returned `Tokenizer.parsed_json`, so `content` may be freed after.
+fn parseTokenizerContent(io: std.Io, allocator: std.mem.Allocator, content: []const u8) !Tokenizer {
     var sw = io_util.Stopwatch.init(io);
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, content, .{});
     errdefer parsed.deinit();
-    log.info("  parsed tokenizer.json ({d} MB) in {d}ms\n", .{ content.len / (1024 * 1024), sw.read() / std.time.ns_per_ms });
+    log.info("  parsed tokenizer ({d} MB) in {d}ms\n", .{ content.len / (1024 * 1024), sw.read() / std.time.ns_per_ms });
 
     const root = parsed.value.object;
     const model_obj = root.get("model").?.object;

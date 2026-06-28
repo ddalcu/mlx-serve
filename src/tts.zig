@@ -1076,7 +1076,7 @@ pub const Synthesizer = struct {
         errdefer model.deinit();
         var codec = try loadCodecDecoder(io, allocator, s, model_dir);
         errdefer codec.deinit();
-        const tok = try tokenizer_mod.loadTokenizer(io, allocator, model_dir);
+        const tok = try tokenizer_mod.loadTokenizerAny(io, allocator, model_dir);
         return .{ .model = model, .codec = codec, .tokenizer = tok, .allocator = allocator };
     }
 
