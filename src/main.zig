@@ -17,6 +17,7 @@ const vision_mod = @import("vision.zig");
 const ds4_arch = @import("arch/ds4.zig");
 const llama_arch = @import("arch/llama.zig");
 const ds4_ffi = @import("ds4_ffi.zig");
+const tts_server = @import("tts_server.zig");
 const log = @import("log.zig");
 
 pub const VERSION: []const u8 = build_options.version;
@@ -561,6 +562,15 @@ pub fn main(init: std.process.Init) !void {
     // Seed MLX RNG with current wall-clock time for non-deterministic sampling
     _ = mlx.mlx_random_seed(@intCast(std.Io.Timestamp.now(io, .real).toMilliseconds()));
 
+    // Native Qwen3-TTS: a serial request→file engine (like the embedded GGUF
+    // engines) that bypasses the MLX transformer scheduler entirely. Peek
+    // model_type from config.json BEFORE the transformer-shaped parseConfig and
+    // route to the dedicated TTS serve loop.
+    if (serve_mode and isTtsModel(io, allocator, model_dir)) {
+        try tts_server.runTtsServe(io, allocator, model_dir, host, port);
+        return;
+    }
+
     // Parse config — heap allocate so the LoadedModel can take ownership
     // (Plan 05). Free path in serve_mode = registry.deinit; offline mode =
     // explicit defer on `config_storage`.
@@ -909,6 +919,25 @@ fn portInUse(io: std.Io, port: u16) bool {
 /// sidecars are NOT counted — a directory containing only an mmproj file
 /// is not a valid LLM path (`isMmprojGgufBasename` lives next to
 /// `isDs4GgufBasename` in `model_discovery.zig`).
+/// True if `model_dir/config.json` declares `model_type == "qwen3_tts"` — the
+/// native TTS engine. Cheap peek (reads config.json, looks for the model_type
+/// string) so we can route before the transformer-shaped parseConfig.
+fn isTtsModel(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) bool {
+    const path = std.fmt.allocPrint(allocator, "{s}/config.json", .{model_dir}) catch return false;
+    defer allocator.free(path);
+    const file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return false;
+    defer file.close(io);
+    var rb: [4096]u8 = undefined;
+    var rs = file.reader(io, &rb);
+    const content = rs.interface.allocRemaining(allocator, .limited(4 * 1024 * 1024)) catch return false;
+    defer allocator.free(content);
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    const mt = parsed.value.object.get("model_type") orelse return false;
+    return mt == .string and std.mem.eql(u8, mt.string, "qwen3_tts");
+}
+
 fn isGgufPath(io: std.Io, path: []const u8) bool {
     // For a direct .gguf file path: always route to the llama branch so
     // `resolveGgufFile` can emit a precise error if it's actually an
