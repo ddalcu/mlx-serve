@@ -176,20 +176,33 @@ fn handleOne(io: std.Io, allocator: std.mem.Allocator, ctx: *ServeCtx, conn: *Co
         const steps: u32 = @intCast(extractJsonInt(body, "steps") orelse 30);
         const frame_rate: f32 = 24.0;
 
-        log.info("[ltx] generating {d}f {d}x{d} steps={d}: {d} chars\n", .{ num_frames, height, width, steps, prompt.len });
+        const want_stream = bodyWantsTrue(body, "stream");
+        log.info("[ltx] generating {d}f {d}x{d} steps={d} stream={}: {d} chars\n", .{ num_frames, height, width, steps, want_stream, prompt.len });
 
         const pos_ids = try tokenizePadded(allocator, ctx.tok, prompt);
         defer allocator.free(pos_ids);
         const neg_ids = try tokenizePadded(allocator, ctx.tok, NEGATIVE_PROMPT);
         defer allocator.free(neg_ids);
 
+        // Stream mode: SSE — push `progress` events per denoise step, then a
+        // `complete` event with the frames. The view animates a determinate bar.
+        var sctx = StreamCtx{ .conn = conn };
+        const prog: ?ltx.Progress = if (want_stream) .{ .ctx = &sctx, .cb = StreamCtx.cb } else null;
+        if (want_stream) {
+            try conn.writeAll("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n");
+        }
+
         const t_start = io_util.nowMs(io);
-        var frames = ltx.generateVideoFrames(io, allocator, .{}, ctx.transformer, ctx.connector, ctx.vae, ctx.gemma_dir, pos_ids, neg_ids, PAD_ID, num_frames, height, width, frame_rate, steps, seed, 3.0, 7.0, 0.7, ctx.s) catch |err| {
+        var frames = ltx.generateVideoFrames(io, allocator, .{}, ctx.transformer, ctx.connector, ctx.vae, ctx.gemma_dir, pos_ids, neg_ids, PAD_ID, num_frames, height, width, frame_rate, steps, seed, 3.0, 7.0, 0.7, prog, ctx.s) catch |err| {
             log.err("[ltx] generation failed: {}\n", .{err});
+            if (want_stream) {
+                conn.writeAll("data: {\"type\":\"error\",\"message\":\"generation failed\"}\n\n") catch {};
+                return;
+            }
             return sendError(conn, 500, "generation failed");
         };
         defer frames.deinit(allocator);
-        log.info("[ltx] generated in {d}ms\n", .{io_util.nowMs(io) - t_start});
+        log.info("[ltx] generated in {d}ms -> {d}f {d}x{d} ({d} rgb bytes)\n", .{ io_util.nowMs(io) - t_start, frames.frames, frames.height, frames.width, frames.rgb.len });
 
         const b64_len = std.base64.standard.Encoder.calcSize(frames.rgb.len);
         const b64 = try allocator.alloc(u8, b64_len);
@@ -198,15 +211,41 @@ fn handleOne(io: std.Io, allocator: std.mem.Allocator, ctx: *ServeCtx, conn: *Co
 
         var out: std.ArrayList(u8) = .empty;
         defer out.deinit(allocator);
-        const head = try std.fmt.allocPrint(allocator, "{{\"created\":0,\"frames\":{d},\"height\":{d},\"width\":{d},\"fps\":{d},\"format\":\"rgb8\",\"data\":\"", .{ frames.frames, frames.height, frames.width, @as(u32, @intFromFloat(frame_rate)) });
+        // SSE `complete` event vs a plain JSON body share the same payload fields.
+        const prefix = if (want_stream) "data: {\"type\":\"complete\"," else "{\"created\":0,";
+        const head = try std.fmt.allocPrint(allocator, "{s}\"frames\":{d},\"height\":{d},\"width\":{d},\"fps\":{d},\"format\":\"rgb8\",\"data\":\"", .{ prefix, frames.frames, frames.height, frames.width, @as(u32, @intFromFloat(frame_rate)) });
         defer allocator.free(head);
         try out.appendSlice(allocator, head);
         try out.appendSlice(allocator, b64);
-        try out.appendSlice(allocator, "\"}");
-        log.info("[ltx] -> {d}f {d}x{d} ({d} rgb bytes)\n", .{ frames.frames, frames.height, frames.width, frames.rgb.len });
+        try out.appendSlice(allocator, if (want_stream) "\"}\n\n" else "\"}");
+        if (want_stream) {
+            try conn.writeAll(out.items);
+            return;
+        }
         return sendBytesJson(conn, allocator, out.items);
     }
     return sendError(conn, 404, "not found");
+}
+
+/// SSE progress sink: writes one `data: {...progress...}` event per call.
+const StreamCtx = struct {
+    conn: *Conn,
+    fn cb(ptr: *anyopaque, stage: []const u8, step: u32, total: u32) void {
+        const self: *StreamCtx = @ptrCast(@alignCast(ptr));
+        var buf: [256]u8 = undefined;
+        const ev = std.fmt.bufPrint(&buf, "data: {{\"type\":\"progress\",\"stage\":\"{s}\",\"step\":{d},\"total\":{d}}}\n\n", .{ stage, step, total }) catch return;
+        self.conn.writeAll(ev) catch {};
+    }
+};
+
+/// True if the JSON body has `"key": true`.
+fn bodyWantsTrue(body: []const u8, key: []const u8) bool {
+    var pat_buf: [64]u8 = undefined;
+    const pat = std.fmt.bufPrint(&pat_buf, "\"{s}\"", .{key}) catch return false;
+    const ki = std.mem.indexOf(u8, body, pat) orelse return false;
+    var i = ki + pat.len;
+    while (i < body.len and (body[i] == ' ' or body[i] == ':' or body[i] == '\t')) i += 1;
+    return std.mem.startsWith(u8, body[i..], "true");
 }
 
 const GEMMA_BOS: i32 = 2; // <bos> — the reference LTX gemma tokenizer always prepends it

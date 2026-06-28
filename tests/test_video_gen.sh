@@ -42,6 +42,30 @@ print(f"PASS: /v1/video/generations -> {F} frames {W}x{H}, {len(raw)} rgb bytes,
 PY
 rc=$?
 
+# SSE streaming: progress events must arrive, then a complete event with frames.
+SSE=/tmp/test_video_sse.txt
+curl -sN --max-time 600 -X POST "http://127.0.0.1:$PORT/v1/video/generations" -H 'Content-Type: application/json' \
+  -d '{"prompt":"a red fox","num_frames":9,"height":256,"width":384,"steps":2,"seed":1,"stream":true}' >"$SSE"
+python3 - "$SSE" <<'PY'
+import sys, json, base64
+prog = 0; complete = None
+for line in open(sys.argv[1]):
+    line = line.strip()
+    if not line.startswith("data: "): continue
+    ev = json.loads(line[6:])
+    if ev["type"] == "progress":
+        prog += 1
+        assert {"stage", "step", "total"} <= set(ev), ev
+    elif ev["type"] == "complete":
+        complete = ev
+assert prog >= 3, f"expected several progress events, got {prog}"
+assert complete is not None, "no complete event"
+raw = base64.b64decode(complete["data"])
+assert len(raw) == complete["frames"] * complete["height"] * complete["width"] * 3
+print(f"PASS: SSE stream -> {prog} progress events + complete ({complete['frames']} frames)")
+PY
+[ $? -eq 0 ] || rc=1
+
 # Optional: mux to mp4 if ffmpeg is present (proves a playable clip).
 if [ $rc -eq 0 ] && command -v ffmpeg >/dev/null 2>&1; then
   python3 -c "import json,base64;d=json.load(open('$OUT'));open('/tmp/tvg.rgb','wb').write(base64.b64decode(d['data']));print(d['width'],d['height'],d['frames'])" >/tmp/tvg.dims

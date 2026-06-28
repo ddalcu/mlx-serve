@@ -90,6 +90,41 @@ final class NativeGenServer {
         return data
     }
 
+    /// POST with `stream:true` and yield each parsed SSE `data:` event as a
+    /// dictionary (`{type:"progress"|"complete"|"error", …}`). The connection is
+    /// torn down when the consuming task is cancelled.
+    nonisolated func postStream(path: String, json: [String: Any], port: Int) -> AsyncThrowingStream<[String: Any], Error> {
+        AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    var body = json
+                    body["stream"] = true
+                    var req = URLRequest(url: URL(string: "http://127.0.0.1:\(port)\(path)")!)
+                    req.httpMethod = "POST"
+                    req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                    req.setValue("text/event-stream", forHTTPHeaderField: "Accept")
+                    req.httpBody = try JSONSerialization.data(withJSONObject: body)
+                    req.timeoutInterval = 900
+                    let (bytes, resp) = try await URLSession.shared.bytes(for: req)
+                    let code = (resp as? HTTPURLResponse)?.statusCode ?? -1
+                    guard code == 200 else { throw GenServerError.http(code, "stream start failed") }
+                    for try await line in bytes.lines {
+                        guard line.hasPrefix("data: ") else { continue }
+                        let payload = String(line.dropFirst(6))
+                        if let d = payload.data(using: .utf8),
+                           let obj = try? JSONSerialization.jsonObject(with: d) as? [String: Any] {
+                            continuation.yield(obj)
+                        }
+                    }
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+            continuation.onTermination = { _ in task.cancel() }
+        }
+    }
+
     func stop() {
         proc?.terminate()
         proc = nil

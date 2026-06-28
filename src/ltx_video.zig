@@ -2130,6 +2130,18 @@ fn ditX0(comp: *const Component, alloc: std.mem.Allocator, cfg: LtxConfig, vx: m
     return .{ .v = x0v, .a = x0a };
 }
 
+/// Optional progress sink for long generations. `emit(stage, step, total)` is
+/// called from inside the denoise loop (and the encode/decode stages) so a
+/// streaming HTTP handler can push SSE events. Erased context + fn pointer so
+/// ltx_video.zig stays free of any HTTP/server dependency.
+pub const Progress = struct {
+    ctx: *anyopaque,
+    cb: *const fn (ctx: *anyopaque, stage: []const u8, step: u32, total: u32) void,
+    pub fn emit(self: Progress, stage: []const u8, step: u32, total: u32) void {
+        self.cb(self.ctx, stage, step, total);
+    }
+};
+
 /// CFG-only guided Euler denoise loop. `noise_v`/`noise_a` are the bf16 initial
 /// latents; `sigmas` includes the terminal 0.0. Returns the final (bf16) latents.
 pub fn ditSampleCfg(
@@ -2148,6 +2160,7 @@ pub fn ditSampleCfg(
     cfg_video: f32,
     cfg_audio: f32,
     rescale: f32,
+    progress: ?Progress,
     s: S,
 ) !BlockOut {
     var vx = noise_v;
@@ -2178,6 +2191,7 @@ pub fn ditSampleCfg(
         owned = true;
         _ = mlx.mlx_array_eval(vx);
         _ = mlx.mlx_array_eval(ax);
+        if (progress) |p| p.emit("Generating", @intCast(i + 1), @intCast(sigmas.len - 1));
     }
     if (!owned) { // no steps → copy inputs so caller owns the result
         var cv = mlx.mlx_array_new();
@@ -2388,6 +2402,7 @@ pub fn generateVideoFrames(
     cfg_video: f32,
     cfg_audio: f32,
     rescale: f32,
+    progress: ?Progress,
     s: S,
 ) !VideoFrames {
     const shape = computeVideoLatentShape(num_frames, height, width);
@@ -2399,6 +2414,7 @@ pub fn generateVideoFrames(
     log.info("[ltx] latent F={d} H={d} W={d} (Nv={d}, Na={d}) steps={d}\n", .{ F, H, W, Nv, Na, num_steps });
 
     // ── text embeds (positive + negative) ──
+    if (progress) |p| p.emit("Encoding prompt", 0, num_steps);
     var pos = try encodeTextLtx(connector, io, alloc, gemma_dir, pos_ids, pad_id, s);
     defer pos.deinit();
     _ = mlx.mlx_array_eval(pos.video);
@@ -2423,11 +2439,12 @@ pub fn generateVideoFrames(
     defer _ = mlx.mlx_array_free(noise_a);
 
     // ── denoise ──
-    const final = try ditSampleCfg(transformer, alloc, cfg, noise_v, noise_a, pos.video, pos.audio, neg.video, neg.audio, vpos, apos, sigmas, cfg_video, cfg_audio, rescale, s);
+    const final = try ditSampleCfg(transformer, alloc, cfg, noise_v, noise_a, pos.video, pos.audio, neg.video, neg.audio, vpos, apos, sigmas, cfg_video, cfg_audio, rescale, progress, s);
     defer _ = mlx.mlx_array_free(final.v);
     defer _ = mlx.mlx_array_free(final.a);
 
     // ── decode video → frames ──
+    if (progress) |p| p.emit("Decoding video", num_steps, num_steps);
     const latent = try unpatchifyVideo(final.v, F, H, W, s);
     defer _ = mlx.mlx_array_free(latent);
     const pixels = try vaeDecode(vae, latent, s);
@@ -3310,7 +3327,7 @@ test "ltx DiT ditSampleCfg reproduces guided denoise loop" {
     defer allocator.free(sigmas);
 
     const cfg = LtxConfig{};
-    const out = try ditSampleCfg(&comp, allocator, cfg, nv.x, na.x, cv.x, ca.x, ngv.x, nga.x, vpos, apos, sigmas, 3.0, 7.0, 0.7, s);
+    const out = try ditSampleCfg(&comp, allocator, cfg, nv.x, na.x, cv.x, ca.x, ngv.x, nga.x, vpos, apos, sigmas, 3.0, 7.0, 0.7, null, s);
     defer _ = mlx.mlx_array_free(out.v);
     defer _ = mlx.mlx_array_free(out.a);
 

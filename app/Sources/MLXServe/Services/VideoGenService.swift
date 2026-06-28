@@ -62,18 +62,37 @@ final class VideoGenService: ObservableObject {
             "seed": request.seed,
         ]
 
+        let steps = request.steps
         task = Task {
             do {
-                _ = try await NativeGenServer.shared.ensure(modelDir: modelDir)
+                let port = try await NativeGenServer.shared.ensure(modelDir: modelDir)
                 if Task.isCancelled { phase = .idle; return }
-                phase = .running(step: 1, total: 3, message: "Generating…")
-                let data = try await NativeGenServer.shared.post(path: "/v1/video/generations", json: body)
-                guard let frames = Self.decodeFrames(data) else {
+                // SSE: the server pushes `progress` events per denoise step, then a
+                // `complete` event with the frames. Drive a determinate bar from them.
+                var decoded: DecodedFrames? = nil
+                for try await ev in NativeGenServer.shared.postStream(
+                    path: "/v1/video/generations", json: body, port: port) {
+                    switch ev["type"] as? String {
+                    case "progress":
+                        let step = ev["step"] as? Int ?? 0
+                        let total = ev["total"] as? Int ?? steps
+                        let stage = ev["stage"] as? String ?? "Generating"
+                        phase = .running(step: step, total: max(total, 1), message: "\(stage)…")
+                    case "complete":
+                        decoded = Self.decodeFrames(ev)
+                    case "error":
+                        phase = .failed(ev["message"] as? String ?? "Generation failed.")
+                        return
+                    default:
+                        break
+                    }
+                }
+                guard let frames = decoded else {
                     phase = .failed("Server returned no video frames.")
                     return
                 }
                 if Task.isCancelled { phase = .idle; return }
-                phase = .running(step: 2, total: 3, message: "Encoding mp4…")
+                phase = .running(step: steps, total: steps, message: "Encoding mp4…")
                 let outFps = frames.fps > 0 ? frames.fps : fps
                 try await Task.detached(priority: .userInitiated) {
                     try VideoGenService.writeMP4(
@@ -108,8 +127,13 @@ final class VideoGenService: ObservableObject {
 
     /// Parse the native server's `{frames,height,width,fps,format,data}` body.
     nonisolated static func decodeFrames(_ body: Data) -> DecodedFrames? {
-        guard let obj = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
-              let format = obj["format"] as? String, format == "rgb8",
+        guard let obj = try? JSONSerialization.jsonObject(with: body) as? [String: Any] else { return nil }
+        return decodeFrames(obj)
+    }
+
+    /// Same, from an already-parsed object (the SSE `complete` event).
+    nonisolated static func decodeFrames(_ obj: [String: Any]) -> DecodedFrames? {
+        guard let format = obj["format"] as? String, format == "rgb8",
               let frames = obj["frames"] as? Int,
               let height = obj["height"] as? Int,
               let width = obj["width"] as? Int,
