@@ -19,10 +19,27 @@ tensors, no GPU forward → no OOM):
   sub-modules/block; adaLN tables F32 with `scale_shift_table [9,4096]` and AV-cross `[5,*]` **scale-first**
   (porting trap); connector bf16, two 8-block `Embeddings1DConnector`s + 128 registers + gated attn.
 
-*Remaining (the bulk):* Gemma 49-layer capture → connector forward → 48-block joint DiT (3D split-RoPE,
-AV cross-attn, adaLN-zero) → guided Euler sampler → 3D-conv VAE decode → frame emit → AVFoundation mux.
-Each stage needs `.npy` oracle taps; the 41 GB reference oracle was deferred to avoid OOM contention with
-the (then-running) image fork.
+### Progress (all validated against the reference, per-stage `.npy` oracle taps)
+
+| Stage | Status | Validation |
+|---|---|---|
+| Single-component q4/bf16 loader (`loadComponent`) | ✅ | loads 262 connector + 86 vae tensors |
+| `conv3d` + `decoderConv3d` (causal 3D conv) | ✅ | corr 1.0 vs reference conv_in |
+| **3D VAE decoder** (`vaeDecode`, full) | ✅ | corr 1.000000, mse 0.0 |
+| **Connector projection** (`connectorProject`) | ✅ | video/audio corr 0.999994 |
+| **Connector transformers** (`connectorTransform`, 8-block ×2) | ✅ | video 0.999910 / audio 0.999679 |
+| **Gemma 49-layer capture** (`gemmaCapture`) | ✅ | layers 0/1/24/48 corr 0.999999…0.999963 |
+| **DiT conditioning** (timestep + `AdaLayerNormSingle`) | ✅ | params + embedded corr 1.000000 |
+| **DiT 48-block attention forward** + output head | ⬜ **remaining (the last big piece)** | — |
+| Guided Euler sampler + dynamic_shift_schedule | ⬜ remaining | — |
+| End-to-end wiring (text→Gemma→connector→DiT-loop→VAE→frames) + AVFoundation mux + `/v1/video/generations` | ⬜ remaining | — |
+
+**The entire conditioning path (Gemma → connector) and the 3D VAE decode are done and validated.** The
+one remaining big component is the DiT's 48× `BasicAVTransformerBlock` attention forward — and it is fully
+scaffolded: the split-RoPE (`applyRopeSplit`), q4 matmul (`gQLin`), and all the modulation params
+(`ditAdaLNSingle`, corr 1.0) it consumes are done. Stage it block-0-first (catches the adaLN-table-ordering
+[per-block 9-param shift-first; AV-cross 5-param scale-first], per-head gating `2·sigmoid`, and affine-QK-norm
+traps cheaply), then the full 48 → x0 = x_t − sigma·v. Then the Euler sampler + wiring are comparatively small.
 
 > This is the heaviest modality. The plan front-loads the two pleasant surprises (the q4
 > weights load with our existing affine-4bit loader; the text encoder is **our own
