@@ -444,6 +444,13 @@ pub var ssm_checkpoint_max: u32 = 32;
 /// hoarding token buffers across a long session.
 pub var tokenize_cache_entries: u32 = 4;
 
+/// Image-generation NSFW content filter (Krea 2 Community License §4.2). ON by
+/// default; `--no-safety` disables it process-wide, or a request can opt out with
+/// `"safety": false`. The classifier (Falconsai ViT, src/nsfw.zig) is lazy-loaded
+/// from `~/.mlx-serve/models`; if it's unavailable the server fails OPEN (warns +
+/// passes the image through).
+pub var image_safety_filter: bool = true;
+
 /// Iteration 3-5 (perf-plan Phase 5 #1): cap on resident llama.cpp KV
 /// sessions per loaded GGUF model. 1 is the legacy single-session
 /// behavior (a flip between two long-doc prompts evicts the other on
@@ -1756,7 +1763,7 @@ const GenJob = struct {
 fn genJobRun(ctx: *anyopaque) void {
     const job: *GenJob = @ptrCast(@alignCast(ctx));
     const result = switch (job.modality) {
-        .image => if (job.lm.image_engine) |e| media_mod.handleImage(job.allocator, job.conn, job.body, e) else error.WrongModality,
+        .image => if (job.lm.image_engine) |e| media_mod.handleImage(job.conn.io, job.allocator, job.conn, job.body, e) else error.WrongModality,
         .audio => if (job.lm.audio_engine) |e| media_mod.handleAudio(job.allocator, job.conn, job.body, e) else error.WrongModality,
         .video => if (job.lm.video_engine) |e| media_mod.handleVideo(job.conn.io, job.allocator, job.conn, job.body, e) else error.WrongModality,
     };

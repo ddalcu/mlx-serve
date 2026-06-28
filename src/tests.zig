@@ -37,6 +37,7 @@ test {
     _ = @import("tts.zig");
     _ = @import("flux.zig");
     _ = @import("krea.zig");
+    _ = @import("nsfw.zig");
     _ = @import("ltx_video.zig");
     _ = @import("png.zig");
     _ = @import("gen.zig");

@@ -1,7 +1,9 @@
 import SwiftUI
 import AppKit
 
-/// Image generation window — FLUX.2 via the shared Python venv.
+/// Image generation window — native FLUX.2 and Krea-2-Turbo (no Python).
+/// The model picker lists every `ImageModelPreset`; the server auto-routes to
+/// the right image backend by the model's `config.json` `model_type`.
 ///
 /// UI layering: a Quality picker drives steps + CFG, a Resolution picker
 /// pins to model-trained buckets, and Advanced lets the user override
@@ -26,11 +28,17 @@ struct ImageGenView: View {
     /// Keep the model resident after generating (default off → unload to free
     /// GPU memory). On → the next generation reuses it instantly.
     @State private var keepResident: Bool = false
+    /// Apply the NSFW content filter (on by default). Off → sends safety:false so
+    /// the server skips it. (The license expects filtering in deployments.)
+    @State private var safeMode: Bool = true
 
     var body: some View {
         readyView
         .frame(minWidth: 880, minHeight: 640)
-        .onAppear { applyModelDefaults() }
+        .onAppear {
+            applyModelDefaults()
+            downloads.ensureNsfwClassifier() // best-effort: provision the shared content filter
+        }
     }
 
     private var readyView: some View {
@@ -172,6 +180,9 @@ struct ImageGenView: View {
             Toggle("Keep model loaded after generating", isOn: $keepResident)
                 .font(.caption)
                 .help("On: the model stays resident so the next generation is instant. Off (default): it's unloaded to free GPU memory.")
+            Toggle("Safe mode (NSFW content filter)", isOn: $safeMode)
+                .font(.caption)
+                .help("On (default): generated images are screened by an on-device NSFW classifier and explicit results are blocked. Off: no filtering — you are responsible for the output.")
         }
     }
 
@@ -320,7 +331,8 @@ struct ImageGenView: View {
             height: resolution.height,
             steps: steps,
             guidance: guidance,
-            keepResident: keepResident
+            keepResident: keepResident,
+            safeMode: safeMode
         )
 
         let total = RAMChecker.totalGB

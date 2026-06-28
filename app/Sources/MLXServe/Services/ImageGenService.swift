@@ -2,7 +2,7 @@ import Foundation
 import SwiftUI
 import AppKit
 
-/// Runs FLUX.2 image generation via the shared `PythonManager` venv.
+/// Drives image generation (FLUX.2 / Krea-2-Turbo) on the native mlx-serve server.
 ///
 /// Keeps UI-facing state (progress, current output, history) so the view can
 /// just bind to it. Cancellation is handled by dropping the running `Task`,
@@ -56,7 +56,11 @@ final class ImageGenService: ObservableObject {
         let prompt = request.prompt
         let size = "\(request.width)x\(request.height)"
         let steps = request.steps
+        // Send a concrete seed so "random" (-1) actually varies; the server
+        // otherwise defaults to a fixed seed.
+        let seedToSend = request.seed >= 0 ? request.seed : Int.random(in: 0...0xFFFF_FFFF)
         let keep = request.keepResident
+        let safeMode = request.safeMode
 
         task = Task {
             var loadedId: String? = nil
@@ -72,9 +76,11 @@ final class ImageGenService: ObservableObject {
                 // SSE: per-step `progress` events drive a determinate bar, then a
                 // `complete` event carries the PNG.
                 var png: Data? = nil
+                var genJson: [String: Any] = ["model": info.name, "prompt": prompt, "size": size, "steps": steps, "seed": seedToSend]
+                if !safeMode { genJson["safety"] = false }  // opt out of the server NSFW filter
                 for try await ev in api.streamGeneration(
                     port: port, path: "/v1/images/generations",
-                    json: ["model": info.name, "prompt": prompt, "size": size]) {
+                    json: genJson) {
                     switch ev["type"] as? String {
                     case "progress":
                         let step = ev["step"] as? Int ?? 0

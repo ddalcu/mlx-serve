@@ -17,6 +17,7 @@ const std = @import("std");
 const mlx = @import("mlx.zig");
 const flux = @import("flux.zig");
 const krea = @import("krea.zig");
+const nsfw = @import("nsfw.zig");
 const tts = @import("tts.zig");
 const ltx = @import("ltx_video.zig");
 const tok_mod = @import("tokenizer.zig");
@@ -151,8 +152,8 @@ const FluxImpl = struct {
     }
 
     /// Tokenize the prompt (Qwen3 chat template) and run the FLUX pipeline →
-    /// PNG bytes (caller frees).
-    fn generatePng(self: *FluxImpl, allocator: std.mem.Allocator, prompt: []const u8, width: u32, height: u32, seed: u64, steps: u32, progress: ?sse.Progress) ![]u8 {
+    /// image [1,3,H,W] f32 in [0,1] (owned mlx array; caller frees).
+    fn generateImage(self: *FluxImpl, allocator: std.mem.Allocator, prompt: []const u8, width: u32, height: u32, seed: u64, steps: u32, progress: ?sse.Progress) !mlx.mlx_array {
         // mflux Qwen3 chat template (enable_thinking=False adds an empty <think> block).
         const templated = try std.fmt.allocPrint(allocator, "<|im_start|>user\n{s}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n", .{prompt});
         defer allocator.free(templated);
@@ -174,8 +175,11 @@ const FluxImpl = struct {
                 mask[i] = 0;
             }
         }
+        return flux.generate(&self.te, &self.dit, &self.vae, ids, mask, seed, steps, height, width, progress);
+    }
 
-        const img = try flux.generate(&self.te, &self.dit, &self.vae, ids, mask, seed, steps, height, width, progress);
+    fn generatePng(self: *FluxImpl, allocator: std.mem.Allocator, prompt: []const u8, width: u32, height: u32, seed: u64, steps: u32, progress: ?sse.Progress) ![]u8 {
+        const img = try self.generateImage(allocator, prompt, width, height, seed, steps, progress);
         defer _ = mlx.mlx_array_free(img);
         return krea.imageToPng(allocator, img, self.s);
     }
@@ -230,6 +234,24 @@ pub const ImageEngine = struct {
         };
     }
 
+    /// Generate the raw image [1,3,H,W] f32 [0,1] (owned mlx array). Lets the
+    /// caller run the content filter on the pixels before PNG-encoding.
+    pub fn generateImage(self: *ImageEngine, allocator: std.mem.Allocator, prompt: []const u8, width: u32, height: u32, seed: u64, steps: u32, progress: ?sse.Progress) !mlx.mlx_array {
+        return switch (self.backend) {
+            .flux => |*f| f.generateImage(allocator, prompt, width, height, seed, steps, progress),
+            .krea => |k| k.generateImage(allocator, prompt, width, height, seed, steps, progress),
+        };
+    }
+
+    /// Encode an image [1,3,H,W] f32 [0,1] → PNG bytes (caller frees).
+    pub fn toPng(self: *ImageEngine, allocator: std.mem.Allocator, img: mlx.mlx_array) ![]u8 {
+        const s = switch (self.backend) {
+            .flux => |*f| f.s,
+            .krea => |k| k.s,
+        };
+        return krea.imageToPng(allocator, img, s);
+    }
+
     /// Resolve a requested WxH per backend. FLUX has a fixed 1024² latent grid;
     /// Krea accepts any multiple of 16 in [256, 2048].
     pub fn normalizeSize(self: *const ImageEngine, req_w: u32, req_h: u32) struct { w: u32, h: u32 } {
@@ -245,6 +267,77 @@ pub const ImageEngine = struct {
 fn clampKreaDim(v: u32) u32 {
     const rounded = ((v + 15) / 16) * 16;
     return std.math.clamp(rounded, 256, 2048);
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// NSFW content filter (Krea 2 Community License §4.2). A single shared classifier
+// (Falconsai ViT, src/nsfw.zig) is lazy-loaded once from ~/.mlx-serve/models and
+// applied to EVERY generated image (FLUX + Krea). On by default; `--no-safety`
+// or per-request `"safety": false` disables it. FAILS OPEN: if the classifier
+// isn't downloaded/loadable, image gen proceeds unfiltered (with a warning).
+// Loaded + run on the inference thread (the sole mlx caller) — gen is serial
+// there, so the lazy-init singleton needs no lock.
+// ════════════════════════════════════════════════════════════════════════
+
+const NSFW_REPO_DIR = "Falconsai/nsfw_image_detection";
+var g_nsfw: ?nsfw.Classifier = null;
+var g_nsfw_tried: bool = false;
+
+/// Locate the auto-downloaded classifier dir under ~/.mlx-serve/models (must
+/// contain model.safetensors), or null (→ fail open).
+fn resolveNsfwDir(allocator: std.mem.Allocator, io: std.Io) ?[]u8 {
+    const home = std.mem.span(std.c.getenv("HOME") orelse return null);
+    const dir = std.fmt.allocPrint(allocator, "{s}/.mlx-serve/models/{s}", .{ home, NSFW_REPO_DIR }) catch return null;
+    const marker = std.fmt.allocPrint(allocator, "{s}/model.safetensors", .{dir}) catch {
+        allocator.free(dir);
+        return null;
+    };
+    defer allocator.free(marker);
+    if (std.Io.Dir.openFileAbsolute(io, marker, .{})) |f| {
+        f.close(io);
+        return dir; // caller owns
+    } else |_| {
+        allocator.free(dir);
+        return null;
+    }
+}
+
+/// Lazy-load the shared classifier (once). Returns null on the fail-open path
+/// (model missing or load error) — logged once.
+fn ensureNsfwClassifier(io: std.Io, allocator: std.mem.Allocator) ?*nsfw.Classifier {
+    if (g_nsfw_tried) return if (g_nsfw) |*c| c else null;
+    g_nsfw_tried = true;
+    const dir = resolveNsfwDir(allocator, io) orelse {
+        log.warn("[image] content filter ON but classifier not found at ~/.mlx-serve/models/{s} — failing OPEN (images NOT filtered). Download it to enable.\n", .{NSFW_REPO_DIR});
+        return null;
+    };
+    defer allocator.free(dir);
+    g_nsfw = nsfw.load(io, allocator, dir) catch |err| {
+        log.warn("[image] NSFW classifier load failed ({s}) — failing OPEN (images NOT filtered)\n", .{@errorName(err)});
+        g_nsfw = null;
+        return null;
+    };
+    log.info("[image] NSFW content filter ready (Falconsai ViT)\n", .{});
+    return if (g_nsfw) |*c| c else null;
+}
+
+/// P(nsfw) threshold above which a generated image is blocked. Default 0.5;
+/// operators can tune via `MLX_SERVE_NSFW_THRESHOLD` (stricter = lower).
+fn nsfwThreshold() f32 {
+    if (std.c.getenv("MLX_SERVE_NSFW_THRESHOLD")) |v| {
+        return std.fmt.parseFloat(f32, std.mem.span(v)) catch nsfw.NSFW_THRESHOLD;
+    }
+    return nsfw.NSFW_THRESHOLD;
+}
+
+/// True if the request explicitly opts out of the content filter via
+/// `"safety": false`.
+fn bodyDisablesSafety(body: []const u8) bool {
+    const pat = "\"safety\"";
+    const ki = std.mem.indexOf(u8, body, pat) orelse return false;
+    var i = ki + pat.len;
+    while (i < body.len and (body[i] == ' ' or body[i] == ':' or body[i] == '\t')) i += 1;
+    return std.mem.startsWith(u8, body[i..], "false");
 }
 
 /// Audio backend (currently Qwen3-TTS). The `tts.Synthesizer` already bundles
@@ -408,7 +501,7 @@ fn ltxPadWithBos(allocator: std.mem.Allocator, enc: []const u32, bos: i32, pad_l
 // ════════════════════════════════════════════════════════════════════════
 
 /// POST /v1/images/generations — base64 PNG (or SSE progress + complete).
-pub fn handleImage(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, engine: *ImageEngine) !void {
+pub fn handleImage(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []const u8, engine: *ImageEngine) !void {
     const prompt_raw = extractJsonString(body, "prompt") orelse return sendError(conn, 400, "missing 'prompt'");
     const prompt = try jsonUnescape(allocator, prompt_raw);
     defer allocator.free(prompt);
@@ -439,7 +532,7 @@ pub fn handleImage(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
     const prog: ?sse.Progress = if (want_stream) sctx.progress() else null;
     if (want_stream) try conn.writeAll(sse.headers);
 
-    const png_bytes = engine.generatePng(allocator, prompt, width, height, seed, steps, prog) catch |err| {
+    const img = engine.generateImage(allocator, prompt, width, height, seed, steps, prog) catch |err| {
         log.err("[image] generation failed: {}\n", .{err});
         if (want_stream) {
             sse.sendError(conn, "generation failed");
@@ -447,6 +540,29 @@ pub fn handleImage(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
         }
         return sendError(conn, 500, "generation failed");
     };
+    defer _ = mlx.mlx_array_free(img);
+
+    // Content filter (Krea license §4.2; on by default, `--no-safety` /
+    // `"safety":false` to disable). Run the NSFW classifier on the generated
+    // pixels; if flagged, refuse. Fail OPEN if the classifier is unavailable.
+    if (server_mod.image_safety_filter and !bodyDisablesSafety(body)) {
+        if (ensureNsfwClassifier(io, allocator)) |clf| {
+            const p_nsfw = clf.classify(img) catch |err| blk: {
+                log.warn("[image] classifier error ({s}) — failing OPEN\n", .{@errorName(err)});
+                break :blk @as(f32, 0);
+            };
+            if (p_nsfw > nsfwThreshold()) {
+                log.warn("[image] output blocked by content filter (P(nsfw)={d:.3})\n", .{p_nsfw});
+                if (want_stream) {
+                    sse.sendError(conn, "generated image blocked by the content filter");
+                    return;
+                }
+                return sendError(conn, 400, "generated image blocked by the content filter (set \"safety\":false or run with --no-safety to override)");
+            }
+        }
+    }
+
+    const png_bytes = try engine.toPng(allocator, img);
     defer allocator.free(png_bytes);
 
     const b64_len = std.base64.standard.Encoder.calcSize(png_bytes.len);
@@ -847,6 +963,13 @@ test "modalityFromType classifies the media archs + markers (incl. krea)" {
     try testing.expectEqual(Modality.video, modalityFromType("AudioVideo").?);
     try testing.expectEqual(@as(?Modality, null), modalityFromType("gemma4"));
     try testing.expectEqual(@as(?Modality, null), modalityFromType("qwen3_5_moe"));
+}
+
+test "bodyDisablesSafety detects per-request opt-out" {
+    try testing.expect(bodyDisablesSafety("{\"prompt\":\"x\",\"safety\":false}"));
+    try testing.expect(bodyDisablesSafety("{\"safety\": false }"));
+    try testing.expect(!bodyDisablesSafety("{\"prompt\":\"x\",\"safety\":true}"));
+    try testing.expect(!bodyDisablesSafety("{\"prompt\":\"x\"}"));
 }
 
 test "parseSize parses WxH and rejects garbage" {

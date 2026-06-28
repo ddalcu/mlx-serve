@@ -2,14 +2,13 @@ import Foundation
 import SwiftUI
 import AppKit
 
-/// Runs neural text-to-speech (with zero-shot voice cloning) via the shared
-/// `PythonManager` venv and the embedded `mlx-audio` library. Mirrors
-/// `ImageGenService` / `VideoGenService`: same `Phase` lifecycle, same
-/// JSON-event stream, writes a `.wav` under `~/.mlx-serve/generations/audio`.
+/// Drives neural text-to-speech (with zero-shot voice cloning) on the native
+/// mlx-serve server (Qwen3-TTS). Mirrors `ImageGenService` / `VideoGenService`:
+/// same `Phase` lifecycle, same JSON-event stream, writes a `.wav` under
+/// `~/.mlx-serve/generations/audio`.
 ///
-/// Unlike video, audio needs no ffmpeg — reference clips are normalized to
-/// 24 kHz mono WAV in Swift (`AudioReference`) before they reach Python, and
-/// mlx-audio writes the output wav itself.
+/// Reference clips are normalized to 24 kHz mono WAV in Swift (`AudioReference`)
+/// and sent to the server as base64; the engine writes the output WAV itself.
 @MainActor
 final class AudioGenService: ObservableObject {
 

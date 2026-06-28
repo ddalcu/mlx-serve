@@ -164,6 +164,27 @@ class DownloadManager: ObservableObject {
         Self.existingModelDir(rootDir: modelsDir, repoId: repoId)
     }
 
+    /// Shared NSFW content-filter classifier (Apache-2.0). The server applies it
+    /// to ALL image generation (Krea license §4.2); auto-downloaded once into
+    /// `~/.mlx-serve/models` and shared across every image model. Original
+    /// public repo — no conversion/hosting; the Zig engine reads it directly.
+    static let nsfwClassifierRepo = "Falconsai/nsfw_image_detection"
+
+    func nsfwClassifierReady() -> Bool {
+        guard let dir = existingModelDir(for: Self.nsfwClassifierRepo) else { return false }
+        return FileManager.default.fileExists(atPath: (dir as NSString).appendingPathComponent("model.safetensors"))
+    }
+
+    /// Best-effort: provision the NSFW classifier in the background if missing.
+    /// Idempotent + quiet (tracked under its own repoId, so it doesn't disturb a
+    /// model's bundle progress); the server fails OPEN until it's present. Safe to
+    /// call on every Image-tab appearance.
+    func ensureNsfwClassifier() {
+        if nsfwClassifierReady() { return }
+        if activeTasks[Self.nsfwClassifierRepo] != nil { return } // already downloading
+        start(repoId: Self.nsfwClassifierRepo) {}
+    }
+
     /// User-configurable extra discovery root. Persisted in UserDefaults under
     /// `customModelPath` so it survives app restarts. The raw stored value is
     /// kept verbatim (we don't erase a broken path) so the user can see and

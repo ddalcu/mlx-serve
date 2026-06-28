@@ -3,8 +3,8 @@ import AppKit
 import AVKit
 import UniformTypeIdentifiers
 
-/// Audio generation window — neural TTS with zero-shot voice cloning via the
-/// shared Python venv (`mlx-audio`). Same shell as ImageGen/VideoGen: a model
+/// Audio generation window — neural TTS with zero-shot voice cloning, run
+/// natively by the embedded mlx-serve server. Same shell as ImageGen/VideoGen: a model
 /// picker, the text to speak, a reference-voice section (record or pick a file)
 /// with an optional transcript, and a player for the result.
 struct AudioGenView: View {

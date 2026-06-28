@@ -116,6 +116,27 @@ extension MediaBundle {
         )
     }
 
+    /// Krea-2-Turbo (mlx-serve bundle): ONE public repo, assembled so the engine
+    /// loads it directly — a top-level transformer file + `vae/`/`text_encoder/`/
+    /// `tokenizer/` subdirs + `config.json`. Recursive download (no auth, no
+    /// gated base repo); ready when the transformer file + three subdirs + config
+    /// are present. Unlike FLUX the transformer is a top-level FILE, not a
+    /// `transformer/` subdir — hence its own readyMarkers.
+    static func krea(repo: String, displayName: String, sizeGB: Double) -> MediaBundle {
+        MediaBundle(
+            id: "krea:\(repo)",
+            displayName: displayName,
+            components: [
+                MediaComponent(
+                    repo: repo,
+                    selection: FileSelection(recursive: true),
+                    readyMarkers: ["config.json", "transformer_mixed_4_8.safetensors", "vae", "text_encoder", "tokenizer"]
+                ),
+            ],
+            sizeEstimateGB: sizeGB
+        )
+    }
+
     /// The Gemma-3-12B text encoder LTX needs — also a standalone chat model.
     /// Standard MLX layout (config + tokenizer + sharded safetensors).
     static let ltxGemmaRepo = "mlx-community/gemma-3-12b-it-4bit"
@@ -130,7 +151,12 @@ extension MediaBundle {
 
 extension ImageModelPreset {
     var bundle: MediaBundle {
-        .flux(repo: repo, displayName: name, sizeGB: Double(approxDownloadGB))
+        switch variant {
+        case .krea2Turbo:
+            return .krea(repo: repo, displayName: name, sizeGB: Double(approxDownloadGB))
+        default:
+            return .flux(repo: repo, displayName: name, sizeGB: Double(approxDownloadGB))
+        }
     }
 }
 

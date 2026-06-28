@@ -3,7 +3,7 @@ import AppKit
 import AVKit
 import UniformTypeIdentifiers
 
-/// Video generation window — LTX-Video 2 via the shared Python venv.
+/// Video generation window — LTX-Video 2.3, run natively by the mlx-serve server.
 /// Uses the same Quality / Resolution preset shape as ImageGen, plus a
 /// Frames dropdown clamped to LTX's `8N+1` ladder and the user's RAM
 /// budget.

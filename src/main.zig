@@ -56,6 +56,8 @@ fn printUsage(io: std.Io) void {
         \\  --timeout <n>       Request timeout in seconds (default: 300, 0=none)
         \\  --reasoning-budget <n>  Max thinking tokens per request (default: unlimited)
         \\  --no-vision         Disable vision encoder (saves memory)
+        \\  --no-safety         Disable the image-gen NSFW content filter (on by
+        \\                      default; or set "safety":false per request)
         \\  --skip-mem-preflight  Bypass the model-load free-RAM pre-flight that
         \\                        refuses a load whose weights + warmup headroom
         \\                        look too big for current free memory. The check
@@ -272,6 +274,8 @@ pub fn main(init: std.process.Init) !void {
             no_vision = true;
         } else if (std.mem.eql(u8, args[i], "--skip-mem-preflight")) {
             scheduler_mod.skip_mem_preflight = true;
+        } else if (std.mem.eql(u8, args[i], "--no-safety")) {
+            server_mod.image_safety_filter = false;
         } else if (std.mem.eql(u8, args[i], "--pld")) {
             enable_pld = true;
         } else if (std.mem.eql(u8, args[i], "--no-pld")) {

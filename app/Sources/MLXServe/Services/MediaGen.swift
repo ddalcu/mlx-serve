@@ -47,6 +47,7 @@ enum FluxVariant: String, Hashable, Codable {
     case flux1            // FLUX.1 schnell / dev — uses Flux1 class
     case flux2Klein4B     // FLUX.2-klein 4B params — uses Flux2Klein, ModelConfig.flux2_klein_4b()
     case flux2Klein9B     // FLUX.2-klein 9B params — uses Flux2Klein, ModelConfig.flux2_klein_9b()
+    case krea2Turbo       // Krea-2-Turbo single-stream MMDiT — served by the krea image backend
 }
 
 struct ImageQualitySettings: Hashable {
@@ -194,10 +195,49 @@ struct ImageModelPreset: Identifiable, Hashable {
         defaultQuality: .quality
     )
 
+    // Krea-2-Turbo accepts any multiple of 16 in [256, 2048]; offer a few
+    // common buckets (the server resolves/clamps anything off-grid).
+    private static let kreaResolutions: [ResolutionOption] = [
+        .init(width: 1024, height: 1024, label: "1024 × 1024 (square)"),
+        .init(width: 768,  height: 768,  label: "768 × 768 (square, fast)"),
+        .init(width: 512,  height: 512,  label: "512 × 512 (fast, low RAM)"),
+        .init(width: 1024, height: 1536, label: "1024 × 1536 (portrait 2:3)"),
+        .init(width: 1536, height: 1024, label: "1536 × 1024 (landscape 3:2)"),
+        .init(width: 1344, height: 768,  label: "1344 × 768 (landscape 16:9)"),
+        .init(width: 768,  height: 1344, label: "768 × 1344 (portrait 9:16)"),
+    ]
+
+    /// Krea-2-Turbo — single-download mlx-serve bundle (transformer mixed-4/8 +
+    /// 8-bit Qwen3-VL encoder + Qwen-Image VAE + tokenizer). Distilled Turbo:
+    /// 8-step flow-matching, no CFG. Served by the native `krea` image backend
+    /// (auto-detected from `config.json` `model_type`).
+    ///
+    /// NOTE: `repo` must point at the PUBLIC bundle you upload. Defaulted to the
+    /// `ddalcu` namespace — change it to wherever you publish.
+    static let krea2Turbo = ImageModelPreset(
+        id: "krea/krea-2-turbo-mlx-serve",
+        name: "Krea 2 Turbo mixed-4/8 (~15 GB)",
+        variant: .krea2Turbo,
+        configName: "krea2_turbo",
+        repo: "ddalcu/Krea-2-Turbo-MLX-Serve-mixed-4-8",
+        approxDownloadGB: 15,
+        approxRAMGB: 24,
+        resolutions: kreaResolutions,
+        defaultResolution: kreaResolutions[0],
+        qualityProfiles: [
+            // Distilled Turbo: guidance 0 always; steps beyond ~8 add little.
+            .fast:         .init(steps: 6,  guidance: 0.0),
+            .good:         .init(steps: 8,  guidance: 0.0),
+            .quality:      .init(steps: 12, guidance: 0.0),
+            .superQuality: .init(steps: 16, guidance: 0.0),
+        ],
+        defaultQuality: .good
+    )
+
     /// Catalog ordered cheapest → heaviest. Default (`first`) is FLUX.2-klein
     /// 4B Q4 — smallest download.
     static let all: [ImageModelPreset] = [
-        .flux2Klein4B_Q4, .schnellQ4, .devQ4, .schnellQ8, .devQ8,
+        .flux2Klein4B_Q4, .schnellQ4, .devQ4, .schnellQ8, .devQ8, .krea2Turbo,
     ]
 }
 
@@ -362,6 +402,9 @@ struct ImageGenRequest {
     /// Keep the model resident after this generation (default off → unload
     /// when done, freeing GPU memory). On → instant reuse for the next gen.
     var keepResident: Bool = false
+    /// Apply the server's NSFW content filter (on by default). Off → sends
+    /// `"safety": false` so the server skips it for this request.
+    var safeMode: Bool = true
 }
 
 struct VideoGenRequest {
@@ -390,9 +433,8 @@ struct AudioGenRequest {
     /// Path to a normalized 24 kHz mono WAV of the voice to clone. `nil` falls
     /// back to the model's default voice (no cloning).
     var refAudioPath: String? = nil
-    /// Transcript of the reference clip. Optional — when empty, mlx-audio
-    /// auto-transcribes the reference with Whisper (an extra one-time download).
-    /// Supplying it makes cloning more stable and skips the STT model.
+    /// Transcript of the reference clip. Optional — supplying it can make voice
+    /// cloning more stable.
     var refText: String = ""
     /// Playback speed multiplier.
     var speed: Double = 1.0

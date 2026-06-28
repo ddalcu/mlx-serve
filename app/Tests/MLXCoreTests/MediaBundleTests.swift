@@ -119,4 +119,46 @@ final class MediaBundleTests: XCTestCase {
         XCTAssertTrue(t.components[0].selection.recursive)
         XCTAssertTrue(t.components[0].readyMarkers.contains("speech_tokenizer"))
     }
+
+    func testKreaBundleIsSinglePublicRecursiveComponent() {
+        let k = ImageModelPreset.krea2Turbo.bundle
+        // One public component, no gated dependency, recursive (pulls the weight subdirs).
+        XCTAssertEqual(k.components.count, 1)
+        XCTAssertTrue(k.dependencyRepos.isEmpty)
+        XCTAssertTrue(k.components[0].selection.recursive)
+        XCTAssertNil(k.components[0].selection.keepSafetensors)
+        // Transformer is a TOP-LEVEL FILE (not a `transformer/` subdir like FLUX),
+        // plus the three Qwen subdirs + config.
+        let m = k.components[0].readyMarkers
+        XCTAssertTrue(m.contains("transformer_mixed_4_8.safetensors"))
+        XCTAssertFalse(m.contains("transformer"))
+        for marker in ["config.json", "vae", "text_encoder", "tokenizer"] {
+            XCTAssertTrue(m.contains(marker), "missing readyMarker \(marker)")
+        }
+    }
+
+    func testNsfwClassifierProvisioningDefaults() {
+        // Shared content-filter classifier: the original public Apache-2.0 repo.
+        XCTAssertEqual(DownloadManager.nsfwClassifierRepo, "Falconsai/nsfw_image_detection")
+        // Safe mode is ON by default on a generation request.
+        let r = ImageGenRequest(model: .krea2Turbo, prompt: "x", width: 512, height: 512, steps: 8, guidance: 0)
+        XCTAssertTrue(r.safeMode)
+    }
+
+    func testKreaPresetIsDistilledTurboDefaults() {
+        let p = ImageModelPreset.krea2Turbo
+        XCTAssertEqual(p.variant, .krea2Turbo)
+        XCTAssertEqual(p.defaultQuality, .good)
+        // Distilled Turbo: 8 steps, no CFG.
+        XCTAssertEqual(p.settings(.good).steps, 8)
+        XCTAssertEqual(p.settings(.good).guidance, 0.0)
+        // Surfaced in the catalog so the picker shows it.
+        XCTAssertTrue(ImageModelPreset.all.contains(p))
+        // Resolutions are all multiples of 16 in [256, 2048] (the Krea size gate).
+        for r in p.resolutions {
+            XCTAssertEqual(r.width % 16, 0)
+            XCTAssertEqual(r.height % 16, 0)
+            XCTAssertTrue(r.width >= 256 && r.width <= 2048 && r.height >= 256 && r.height <= 2048)
+        }
+    }
 }

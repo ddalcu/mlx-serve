@@ -1,8 +1,9 @@
 # Changelog
 
-## v26.6.13 — Create images, voices, and video locally
+## v26.6.13 — Create images, voices, and video locally, all Zig Native
 
-- **Image generation, no Python.** Generate images from a text prompt right on your Mac with FLUX.2 — pick a model, type a prompt, and get a PNG with a live progress bar as it denoises. The whole pipeline (text encoder, diffusion transformer, VAE) runs natively on Apple Silicon: no venv, no setup step.
+- **Image generation.** Generate images from a text prompt right on your Mac — pick **FLUX.2** for fast results or **Krea-2-Turbo**, a 12.9B photorealistic model, then type a prompt and get a PNG with a live progress bar as it denoises. The whole pipeline (text encoder, diffusion transformer, VAE) runs natively on Apple Silicon: no venv, no setup step. Krea is a one-click ~15 GB download and was validated numerically faithful to the reference (end-to-end pixel cosine 0.9996); any size from 256² to 2048² works.
+- **On-device safety filter for images.** Every generated image is screened by an NSFW classifier that runs natively on your Mac — nothing is uploaded anywhere — and explicit results are blocked before they reach you. On by default, with a Safe-mode toggle in the Image tab (and a `--no-safety` server flag) to turn it off.
 - **Text-to-speech with zero-shot voice cloning.** Type text and hear it spoken by Qwen3-TTS — and record or pick a few seconds of any voice to have the model speak your text *in that voice*. Cloning runs entirely on device (validated bit-for-bit against the reference) and needs only the reference audio — no transcript.
 - **Text-to-video with audio.** Turn a prompt into a short LTX-Video 2.3 clip with synchronized audio, muxed straight to an mp4 — the full diffusion + 3D-VAE pipeline ported natively and validated tensor-by-tensor against the reference.
 - **One app, one server, one memory budget.** Chat and every media type now share a single local server instead of separate background processes. A model loads on demand when you generate and unloads when it's done to free GPU memory — flip "Keep loaded" for instant repeat runs — and a chat model and a media model can stay resident together without stepping on each other.
