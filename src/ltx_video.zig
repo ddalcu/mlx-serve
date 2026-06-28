@@ -1201,6 +1201,68 @@ pub fn gemmaCapture(io: std.Io, allocator: std.mem.Allocator, gemma_dir: []const
     return states;
 }
 
+// ════════════════════════════════════════════════════════════════════════
+// DiT conditioning: timestep sinusoidal embedding + AdaLayerNormSingle.
+// Every transformer block + the output head consume these modulation params.
+// (The 48-block joint DiT forward that uses them is the remaining work.)
+// ════════════════════════════════════════════════════════════════════════
+
+/// get_timestep_embedding(t_scaled, dim): sinusoidal, flip_sin_to_cos=True
+/// (cos first), downscale_freq_shift=0, max_period=10000. Returns [1, dim].
+fn ditTimestepSinusoid(t_scaled: f32, dim: u32, s: S) !mlx.mlx_array {
+    const half: c_int = @intCast(dim / 2);
+    var ar = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ar);
+    try mlx.check(mlx.mlx_arange(&ar, 0.0, @floatFromInt(dim / 2), 1.0, .float32, s));
+    const coef: f32 = -@log(@as(f32, 10000.0)) / @as(f32, @floatFromInt(dim / 2));
+    const cscal = mlx.mlx_array_new_float(coef);
+    defer _ = mlx.mlx_array_free(cscal);
+    var expo = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(expo);
+    try mlx.check(mlx.mlx_multiply(&expo, ar, cscal, s));
+    var freqs = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(freqs);
+    try mlx.check(mlx.mlx_exp(&freqs, expo, s));
+    const tscal = mlx.mlx_array_new_float(t_scaled);
+    defer _ = mlx.mlx_array_free(tscal);
+    var args = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(args);
+    try mlx.check(mlx.mlx_multiply(&args, freqs, tscal, s));
+    var args2 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(args2);
+    try mlx.check(mlx.mlx_reshape(&args2, args, &[_]c_int{ 1, half }, 2, s));
+    var cs = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(cs);
+    try mlx.check(mlx.mlx_cos(&cs, args2, s));
+    var sn = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sn);
+    try mlx.check(mlx.mlx_sin(&sn, args2, s));
+    const vec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(vec);
+    _ = mlx.mlx_vector_array_append_value(vec, cs);
+    _ = mlx.mlx_vector_array_append_value(vec, sn);
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_concatenate_axis(&out, vec, 1, s));
+    return out;
+}
+
+const AdaLNOut = struct { params: mlx.mlx_array, embedded: mlx.mlx_array };
+
+/// AdaLayerNormSingle: embedded = linear2(silu(linear1(t_sin))) [the timestep
+/// MLP]; params = linear(silu(embedded)) → (B, num_params*dim). `prefix` is the
+/// full key prefix, e.g. "transformer.adaln_single".
+fn ditAdaLNSingle(comp: *const Component, alloc: std.mem.Allocator, t_sin: mlx.mlx_array, prefix: []const u8, s: S) !AdaLNOut {
+    const e1 = try linBias(comp, alloc, t_sin, "{s}.emb.timestep_embedder.linear1", .{prefix}, s);
+    defer _ = mlx.mlx_array_free(e1);
+    const e1s = try silu(e1, s);
+    defer _ = mlx.mlx_array_free(e1s);
+    const embedded = try linBias(comp, alloc, e1s, "{s}.emb.timestep_embedder.linear2", .{prefix}, s);
+    const es = try silu(embedded, s);
+    defer _ = mlx.mlx_array_free(es);
+    const params = try linBias(comp, alloc, es, "{s}.linear", .{prefix}, s);
+    return .{ .params = params, .embedded = embedded };
+}
+
 // ── Tests ──
 
 const testing = std.testing;
@@ -1612,4 +1674,51 @@ test "ltx gemmaCapture reproduces reference hidden states" {
         std.debug.print("[ltx-gemma] layer {d} corr_valid={d:.6} (full={d:.4})\n", .{ c.li, corr_valid, corr_full });
         try testing.expect(corr_valid > 0.999);
     }
+}
+
+// DiT conditioning oracle: video adaln_single (9-param) for a fixed timestep.
+//   LTX_TEST_MODEL=<ltx-2.3-mlx-q4 snapshot>, LTX_ADA_PARAMS=<params.raw>, LTX_ADA_EMB=<emb.raw>
+test "ltx DiT adaLN conditioning reproduces AdaLayerNormSingle" {
+    const dir = std.mem.span(std.c.getenv("LTX_TEST_MODEL") orelse return error.SkipZigTest);
+    const pp = std.mem.span(std.c.getenv("LTX_ADA_PARAMS") orelse return error.SkipZigTest);
+    const ep = std.mem.span(std.c.getenv("LTX_ADA_EMB") orelse return error.SkipZigTest);
+    const allocator = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const cpu_s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(cpu_s);
+
+    const vp = try std.fmt.allocPrintSentinel(allocator, "{s}/transformer-dev.safetensors", .{dir}, 0);
+    defer allocator.free(vp);
+    var comp = try loadComponent(allocator, vp, cpu_s);
+    defer comp.deinit();
+
+    const refp = try readF32(io, allocator, pp);
+    defer allocator.free(refp);
+    const refe = try readF32(io, allocator, ep);
+    defer allocator.free(refe);
+
+    const t_sin = try ditTimestepSinusoid(700.0, 256, s);
+    defer _ = mlx.mlx_array_free(t_sin);
+    const out = try ditAdaLNSingle(&comp, allocator, t_sin, "transformer.adaln_single", s);
+    defer _ = mlx.mlx_array_free(out.params);
+    defer _ = mlx.mlx_array_free(out.embedded);
+
+    var pf = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(pf);
+    try mlx.check(mlx.mlx_astype(&pf, out.params, .float32, s));
+    _ = mlx.mlx_array_eval(pf);
+    var ef = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ef);
+    try mlx.check(mlx.mlx_astype(&ef, out.embedded, .float32, s));
+    _ = mlx.mlx_array_eval(ef);
+
+    const np: usize = @intCast(mlx.mlx_array_size(pf));
+    try testing.expectEqual(refp.len, np);
+    const cp = corrF32(mlx.mlx_array_data_float32(pf).?, refp, 0);
+    const ce = corrF32(mlx.mlx_array_data_float32(ef).?, refe, 0);
+    std.debug.print("[ltx-ada] params corr={d:.6} embedded corr={d:.6}\n", .{ cp, ce });
+    try testing.expect(cp > 0.999);
+    try testing.expect(ce > 0.999);
 }
