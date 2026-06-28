@@ -470,6 +470,93 @@ pub fn vaeDecode(comp: *const Component, latent_bcfhw: mlx.mlx_array, s: S) !mlx
     return out;
 }
 
+// ── Connector: TextEmbeddingProjection (stage 2, front half) ──
+// 49 Gemma hidden states [1,T,3840] → video[1,T,4096] + audio[1,T,2048].
+// Per-token RMS over the 49-layer stack (axis 3840), reshape to [1,T,188160],
+// then two √(target/3840)-rescaled biased Linears. Matches the reference
+// connector.text_embedding_projection.* (the Embeddings1DConnector transformers
+// that follow are the remaining back half).
+
+pub const ProjOut = struct {
+    video: mlx.mlx_array,
+    audio: mlx.mlx_array,
+    pub fn deinit(self: *ProjOut) void {
+        _ = mlx.mlx_array_free(self.video);
+        _ = mlx.mlx_array_free(self.audio);
+    }
+};
+
+fn projOne(comp: *const Component, allocator: std.mem.Allocator, stacked: mlx.mlx_array, name: []const u8, dim: u32, s: S) !mlx.mlx_array {
+    const scale: f32 = @sqrt(@as(f32, @floatFromInt(dim)) / 3840.0);
+    const sa = mlx.mlx_array_new_float(scale);
+    defer _ = mlx.mlx_array_free(sa);
+    var scaled = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(scaled);
+    try mlx.check(mlx.mlx_multiply(&scaled, stacked, sa, s));
+
+    const wk = try std.fmt.allocPrint(allocator, "connector.text_embedding_projection.{s}_aggregate_embed.weight", .{name});
+    defer allocator.free(wk);
+    const bk = try std.fmt.allocPrint(allocator, "connector.text_embedding_projection.{s}_aggregate_embed.bias", .{name});
+    defer allocator.free(bk);
+    const w = comp.get(wk) orelse return error.MissingConnectorWeight; // [dim, 188160]
+    const b = comp.get(bk) orelse return error.MissingConnectorWeight; // [dim]
+
+    // Transpose W → [188160, dim] and materialize (lazy transpose into matmul is
+    // the pinned strided-array trap).
+    var wt_lazy = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(wt_lazy);
+    try mlx.check(mlx.mlx_transpose_axes(&wt_lazy, w, &[_]c_int{ 1, 0 }, 2, s));
+    var wt = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(wt);
+    try mlx.check(mlx.mlx_contiguous(&wt, wt_lazy, false, s));
+
+    var mm = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(mm);
+    try mlx.check(mlx.mlx_matmul(&mm, scaled, wt, s)); // [1,T,dim]
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_add(&out, mm, b, s));
+    return out;
+}
+
+/// Run the projection front-half of the connector. `stack` is 49 arrays [1,T,3840].
+pub fn connectorProject(comp: *const Component, allocator: std.mem.Allocator, stack: []const mlx.mlx_array, s: S) !ProjOut {
+    const eps: f32 = 1e-6;
+    const vec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(vec);
+    for (stack) |a| _ = mlx.mlx_vector_array_append_value(vec, a);
+    var enc = mlx.mlx_array_new(); // [1,T,3840,49]
+    defer _ = mlx.mlx_array_free(enc);
+    try mlx.check(mlx.mlx_stack_axis(&enc, vec, 3, s));
+
+    var sq = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sq);
+    try mlx.check(mlx.mlx_multiply(&sq, enc, enc, s));
+    var meanv = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(meanv);
+    try mlx.check(mlx.mlx_mean_axis(&meanv, sq, 2, true, s)); // [1,T,1,49]
+    const epsa = mlx.mlx_array_new_float(eps);
+    defer _ = mlx.mlx_array_free(epsa);
+    var vplus = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(vplus);
+    try mlx.check(mlx.mlx_add(&vplus, meanv, epsa, s));
+    var rs = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(rs);
+    try mlx.check(mlx.mlx_rsqrt(&rs, vplus, s));
+    var normed = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(normed);
+    try mlx.check(mlx.mlx_multiply(&normed, enc, rs, s)); // [1,T,3840,49]
+
+    const T: c_int = mlx.getShape(enc)[1];
+    var stacked = mlx.mlx_array_new(); // [1,T,188160]
+    defer _ = mlx.mlx_array_free(stacked);
+    try mlx.check(mlx.mlx_reshape(&stacked, normed, &[_]c_int{ 1, T, 188160 }, 3, s));
+
+    const video = try projOne(comp, allocator, stacked, "video", 4096, s);
+    errdefer _ = mlx.mlx_array_free(video);
+    const audio = try projOne(comp, allocator, stacked, "audio", 2048, s);
+    return .{ .video = video, .audio = audio };
+}
+
 // ── Tests ──
 
 const testing = std.testing;
@@ -652,6 +739,88 @@ test "ltx vaeDecode reproduces reference VideoDecoder" {
     const psnr = 10.0 * std.math.log10(4.0 / mse); // signal range ~[-1,1] → peak 2, peak^2=4
     std.debug.print("[ltx-vae] n={d} corr={d:.6} psnr={d:.2}dB mse={d:.6}\n", .{ n, corr, psnr, mse });
     try testing.expect(corr > 0.99);
+}
+
+fn corrOf(a: []const f32, b: []const f32) f64 {
+    var dot: f64 = 0;
+    var na: f64 = 0;
+    var nb: f64 = 0;
+    for (a, b) |x, y| {
+        dot += @as(f64, x) * @as(f64, y);
+        na += @as(f64, x) * @as(f64, x);
+        nb += @as(f64, y) * @as(f64, y);
+    }
+    return dot / (@sqrt(na) * @sqrt(nb));
+}
+
+// Connector projection (stage 2 front-half): 49-stack → video/audio embeds.
+//   LTX_TEST_MODEL = q4 model dir (for connector.safetensors)
+//   LTX_CONN_STACK = [49,1,T,3840] f32; LTX_CONN_VIDEO/AUDIO = reference outputs
+test "ltx connectorProject reproduces TextEmbeddingProjection" {
+    const dir = std.mem.span(std.c.getenv("LTX_TEST_MODEL") orelse return error.SkipZigTest);
+    const sp = std.mem.span(std.c.getenv("LTX_CONN_STACK") orelse return error.SkipZigTest);
+    const vp = std.mem.span(std.c.getenv("LTX_CONN_VIDEO") orelse return error.SkipZigTest);
+    const ap = std.mem.span(std.c.getenv("LTX_CONN_AUDIO") orelse return error.SkipZigTest);
+    const allocator = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+
+    const stackbuf = try readF32(io, allocator, sp);
+    defer allocator.free(stackbuf);
+    const refv = try readF32(io, allocator, vp);
+    defer allocator.free(refv);
+    const refa = try readF32(io, allocator, ap);
+    defer allocator.free(refa);
+
+    const T: usize = stackbuf.len / (49 * 3840); // [49,1,T,3840]
+    const per: usize = T * 3840;
+
+    // Build 49 bf16 arrays [1,T,3840] from the f32 dump.
+    var arrs = try allocator.alloc(mlx.mlx_array, 49);
+    defer {
+        for (arrs) |a| _ = mlx.mlx_array_free(a);
+        allocator.free(arrs);
+    }
+    const shp = [_]c_int{ 1, @intCast(T), 3840 };
+    for (0..49) |i| {
+        const f32a = mlx.mlx_array_new_data(stackbuf.ptr + i * per, &shp, 3, .float32);
+        defer _ = mlx.mlx_array_free(f32a);
+        var bf = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_astype(&bf, f32a, .bfloat16, s));
+        arrs[i] = bf;
+    }
+
+    const cpu_s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(cpu_s);
+    const cp = try std.fmt.allocPrintSentinel(allocator, "{s}/connector.safetensors", .{dir}, 0);
+    defer allocator.free(cp);
+    var comp = try loadComponent(allocator, cp, cpu_s);
+    defer comp.deinit();
+    var it = comp.map.iterator();
+    while (it.next()) |e| _ = mlx.mlx_array_eval(e.value_ptr.*);
+
+    var out = try connectorProject(&comp, allocator, arrs, s);
+    defer out.deinit();
+
+    var vf = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(vf);
+    try mlx.check(mlx.mlx_astype(&vf, out.video, .float32, s));
+    var af = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(af);
+    try mlx.check(mlx.mlx_astype(&af, out.audio, .float32, s));
+    _ = mlx.mlx_array_eval(vf);
+    _ = mlx.mlx_array_eval(af);
+
+    const vn: usize = @intCast(mlx.mlx_array_size(vf));
+    const an: usize = @intCast(mlx.mlx_array_size(af));
+    try testing.expectEqual(refv.len, vn);
+    try testing.expectEqual(refa.len, an);
+    const vc = corrOf(mlx.mlx_array_data_float32(vf).?[0..vn], refv);
+    const ac = corrOf(mlx.mlx_array_data_float32(af).?[0..an], refa);
+    std.debug.print("[ltx-conn] video corr={d:.6} ({d}), audio corr={d:.6} ({d})\n", .{ vc, vn, ac, an });
+    try testing.expect(vc > 0.999);
+    try testing.expect(ac > 0.999);
 }
 
 fn readF32(io: std.Io, allocator: std.mem.Allocator, path: []const u8) ![]f32 {
