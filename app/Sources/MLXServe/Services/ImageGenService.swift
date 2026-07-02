@@ -186,7 +186,11 @@ final class ImageGenService: ObservableObject {
         if let src = request.initImagePath,
            let data = FileManager.default.contents(atPath: src) {
             json["image"] = data.base64EncodedString()
-            json["strength"] = request.strength
+            if request.editMode {
+                json["mode"] = "edit" // clean in-context reference; strength n/a
+            } else {
+                json["strength"] = request.strength
+            }
         }
         if request.condGain != 1.0 { json["cond_gain"] = request.condGain }
         if !request.condWeightsText.trimmingCharacters(in: .whitespaces).isEmpty,

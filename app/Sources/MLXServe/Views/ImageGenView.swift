@@ -36,6 +36,9 @@ struct ImageGenView: View {
     @State private var initImageURL: URL? = nil
     /// img2img renoise strength: low = stay close to the source, high = mostly prompt.
     @State private var strength: Double = 0.6
+    /// Source-image mode: true = instruction edit (FLUX.2 in-context reference,
+    /// keeps the subject), false = variation (renoise remix).
+    @State private var editMode: Bool = true
     /// Conditioning rebalance (Advanced): global gain on the prompt embeddings.
     @State private var condGain: Double = 1.0
     /// Conditioning rebalance (Advanced): per-tapped-layer weights as typed.
@@ -151,19 +154,34 @@ struct ImageGenView: View {
                 }
                 .padding(6)
                 .background(RoundedRectangle(cornerRadius: 6).fill(Color.secondary.opacity(0.08)))
-                VStack(alignment: .leading, spacing: 2) {
-                    HStack {
-                        Text("Variation strength").font(.caption)
-                        Spacer()
-                        Text(String(format: "%.0f%%", strength * 100))
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                if model.supportsReferenceEdit {
+                    Picker("", selection: $editMode) {
+                        Text("Edit").tag(true)
+                        Text("Variation").tag(false)
                     }
-                    Slider(value: $strength, in: 0.1...1.0, step: 0.05)
-                        .onChange(of: strength) { _, _ in guard !hydrating else { return }; persist() }
-                    Text("Low = stay close to the source; high = mostly the prompt.")
+                    .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .onChange(of: editMode) { _, _ in guard !hydrating else { return }; persist() }
+                }
+                if effectiveEditMode {
+                    Text("Describe the change in the prompt — “make the hair blue”, “remove the monitor”. The model sees the original and keeps the rest.")
                         .font(.caption2)
                         .foregroundStyle(.secondary)
+                } else {
+                    VStack(alignment: .leading, spacing: 2) {
+                        HStack {
+                            Text("Variation strength").font(.caption)
+                            Spacer()
+                            Text(String(format: "%.0f%%", strength * 100))
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        Slider(value: $strength, in: 0.1...1.0, step: 0.05)
+                            .onChange(of: strength) { _, _ in guard !hydrating else { return }; persist() }
+                        Text("Low = stay close to the source; high = mostly the prompt.")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
                 }
             } else {
                 Button {
@@ -341,6 +359,12 @@ struct ImageGenView: View {
         }
     }
 
+    /// Edit mode only applies where the model was trained for it (FLUX.2);
+    /// on other models the source image always means variation.
+    private var effectiveEditMode: Bool {
+        editMode && model.supportsReferenceEdit
+    }
+
     /// Placeholder showing the right count for the selected model's backend.
     private var defaultWeightsPlaceholder: String {
         Array(repeating: "1", count: model.condWeightCount).joined(separator: " ")
@@ -513,6 +537,7 @@ struct ImageGenView: View {
         safeMode = s.safeMode
         keepResident = s.keepResident
         strength = s.strength
+        editMode = s.editMode
         condGain = s.condGain
         condWeightsText = s.condWeightsText
         loraPath = s.loraPath
@@ -535,6 +560,7 @@ struct ImageGenView: View {
         s.safeMode = safeMode
         s.keepResident = keepResident
         s.strength = strength
+        s.editMode = editMode
         s.condGain = condGain
         s.condWeightsText = condWeightsText
         s.loraPath = loraPath
@@ -574,6 +600,7 @@ struct ImageGenView: View {
             safeMode: safeMode,
             initImagePath: initImageURL?.path,
             strength: strength,
+            editMode: effectiveEditMode,
             condGain: condGain,
             condWeightsText: condWeightsText,
             loraPath: loraPath.isEmpty ? nil : loraPath

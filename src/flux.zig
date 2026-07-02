@@ -1572,6 +1572,93 @@ test "flux VAE encoder round-trips through the decoder" {
     try testing.expect(mae < 0.05);
 }
 
+test "buildLatentIdsT stamps the reference time coordinate (FLUX.2 edit convention)" {
+    const a = testing.allocator;
+    // Generated tokens: t=0 (the existing convention).
+    const gen_ids = try buildLatentIdsT(a, 2, 3, 0);
+    defer a.free(gen_ids);
+    try testing.expectEqual(@as(usize, 2 * 3 * 4), gen_ids.len);
+    try testing.expectEqual(@as(i32, 0), gen_ids[0]); // t
+    try testing.expectEqual(@as(i32, 0), gen_ids[1]); // h
+    try testing.expectEqual(@as(i32, 0), gen_ids[2]); // w
+    try testing.expectEqual(@as(i32, 0), gen_ids[3]); // l
+    // Reference tokens: t=10 (official sampler: t_off = 10·(i+1)), own 0-based grid.
+    const ref_ids = try buildLatentIdsT(a, 2, 3, 10);
+    defer a.free(ref_ids);
+    const last = (2 * 3 - 1) * 4;
+    try testing.expectEqual(@as(i32, 10), ref_ids[0]);
+    try testing.expectEqual(@as(i32, 10), ref_ids[last + 0]);
+    try testing.expectEqual(@as(i32, 1), ref_ids[last + 1]); // h max
+    try testing.expectEqual(@as(i32, 2), ref_ids[last + 2]); // w max
+    // The legacy builder is the t=0 case.
+    const legacy = try buildLatentIds(a, 2, 3);
+    defer a.free(legacy);
+    try testing.expectEqualSlices(i32, gen_ids, legacy);
+}
+
+// Reference-image editing: conditioning the DiT on clean reference tokens must
+// change the output vs the same seed without a reference (and produce a valid
+// full-size image).  FLUX_TEST_MODEL (steps=2 keeps it quick)
+test "flux reference-image conditioning engages and changes the output" {
+    const model_dir = std.mem.span(std.c.getenv("FLUX_TEST_MODEL") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var te = try loadTextEncoder(io, a, s, model_dir);
+    defer te.deinit();
+    var dit = try loadDit(io, a, s, model_dir);
+    defer dit.deinit();
+    var vae = try loadVae(io, a, s, model_dir);
+    defer vae.deinit();
+    var venc = try loadVaeEncoder(io, a, s, model_dir);
+    defer venc.deinit();
+
+    // Trivial fixed prompt ids (pad token everywhere, short mask) — the test
+    // only needs determinism, not a meaningful prompt.
+    var ids: [512]i32 = @splat(151643);
+    var mask: [512]i32 = @splat(0);
+    for (0..8) |i| mask[i] = 1;
+
+    // Reference: smooth gradient encoded to clean latents.
+    const HW: usize = 1024;
+    const buf = try a.alloc(f32, 3 * HW * HW);
+    defer a.free(buf);
+    for (0..HW) |y| for (0..HW) |x| {
+        buf[0 * HW * HW + y * HW + x] = @as(f32, @floatFromInt(x)) / (HW - 1);
+        buf[1 * HW * HW + y * HW + x] = @as(f32, @floatFromInt(y)) / (HW - 1);
+        buf[2 * HW * HW + y * HW + x] = 0.5;
+    };
+    const ish = [_]c_int{ 1, 3, @intCast(HW), @intCast(HW) };
+    const img = mlx.mlx_array_new_data(buf.ptr, &ish, 4, .float32);
+    defer _ = mlx.mlx_array_free(img);
+    const ref_lat = try venc.encode(img);
+    defer _ = mlx.mlx_array_free(ref_lat);
+
+    const base = try generateWithOpts(&te, &dit, &vae, &ids, &mask, 42, 2, 1024, 1024, .{}, null);
+    defer _ = mlx.mlx_array_free(base);
+    const edited = try generateWithOpts(&te, &dit, &vae, &ids, &mask, 42, 2, 1024, 1024, .{ .ref_latents = ref_lat }, null);
+    defer _ = mlx.mlx_array_free(edited);
+    const esh = mlx.getShape(edited);
+    try testing.expectEqual(@as(c_int, 1024), esh[2]);
+    try testing.expectEqual(@as(c_int, 1024), esh[3]);
+    // Same seed, same prompt — the reference must be the thing that changed it.
+    const bf = try astype(base, .float32, s);
+    defer _ = mlx.mlx_array_free(bf);
+    const ef = try astype(edited, .float32, s);
+    defer _ = mlx.mlx_array_free(ef);
+    _ = mlx.mlx_array_eval(bf);
+    _ = mlx.mlx_array_eval(ef);
+    const bd = mlx.mlx_array_data_float32(bf) orelse return error.NoData;
+    const ed = mlx.mlx_array_data_float32(ef) orelse return error.NoData;
+    var diff: f64 = 0;
+    const n: usize = @intCast(mlx.mlx_array_size(bf));
+    for (0..n) |i| diff += @abs(@as(f64, bd[i]) - ed[i]);
+    diff /= @floatFromInt(n);
+    std.debug.print("[flux-edit] mean|base-edited|={d:.4}\n", .{diff});
+    try testing.expect(diff > 0.01);
+}
+
 test "flux applyCondRebalance scales tap thirds and global gain" {
     const s = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
@@ -1631,11 +1718,18 @@ fn computeSchedule(allocator: std.mem.Allocator, image_seq_len: u32, steps: u32)
 }
 
 fn buildLatentIds(allocator: std.mem.Allocator, lh: u32, lw: u32) ![]i32 {
+    return buildLatentIdsT(allocator, lh, lw, 0);
+}
+
+/// Latent position ids (t,h,w,l) with an explicit time coordinate. Generated
+/// tokens use t=0; reference-image tokens use the official FLUX.2 edit
+/// convention t=10·(ref_index+1) with their own 0-based h/w grid.
+fn buildLatentIdsT(allocator: std.mem.Allocator, lh: u32, lw: u32, t: i32) ![]i32 {
     const n = lh * lw;
     const out = try allocator.alloc(i32, n * 4);
     var idx: usize = 0;
     for (0..lh) |h| for (0..lw) |wv| {
-        out[idx * 4 + 0] = 0; // t
+        out[idx * 4 + 0] = t;
         out[idx * 4 + 1] = @intCast(h);
         out[idx * 4 + 2] = @intCast(wv);
         out[idx * 4 + 3] = 0; // layer
@@ -1662,6 +1756,11 @@ pub const GenOpts = struct {
     init_latents: ?mlx.mlx_array = null,
     /// First schedule index to run (img2img skip; 0 = full schedule).
     start_step: u32 = 0,
+    /// Reference-image editing (FLUX.2 in-context conditioning): CLEAN
+    /// bn-normalized packed latents [1,128,rh,rw] from `VaeEncoder.encode`,
+    /// concatenated on the token sequence with t=10 position ids. Never
+    /// noised; generation starts from pure noise and attends to them.
+    ref_latents: ?mlx.mlx_array = null,
     /// Conditioning rebalance: global gain + per-tap weights (len 3).
     cond_gain: f32 = 1.0,
     cond_weights: ?[]const f32 = null,
@@ -1702,6 +1801,35 @@ pub fn generateWithOpts(te: *TextEncoder, dit: *Dit, vae: *Vae, ids: []const i32
     const img_ids = try buildLatentIds(a, lh, lw); defer a.free(img_ids);
     const txt_ids = try buildTextIds(a, @intCast(ids.len)); defer a.free(txt_ids);
 
+    // Reference-image editing: pack the CLEAN reference latents into tokens
+    // with t=10 position ids (official FLUX.2 convention). They ride along in
+    // every forward; only the generated span is Euler-stepped.
+    var ref_tokens: mlx.mlx_array = .{ .ctx = null };
+    defer if (ref_tokens.ctx != null) {
+        _ = mlx.mlx_array_free(ref_tokens);
+    };
+    var all_ids: ?[]i32 = null;
+    defer if (all_ids) |ai| a.free(ai);
+    if (opts.ref_latents) |rl| {
+        const rsh = mlx.getShape(rl); // [1,128,rh,rw]
+        const rlh: u32 = @intCast(rsh[2]);
+        const rlw: u32 = @intCast(rsh[3]);
+        const rr = try reshape(rl, &[_]c_int{ 1, 128, @intCast(rlh * rlw) }, s);
+        defer _ = mlx.mlx_array_free(rr);
+        const rt = try transpose(rr, &[_]c_int{ 0, 2, 1 }, s);
+        defer _ = mlx.mlx_array_free(rt);
+        var rtc = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(rtc);
+        try mlx.check(mlx.mlx_contiguous(&rtc, rt, false, s));
+        ref_tokens = try astype(rtc, .bfloat16, s);
+        const rids = try buildLatentIdsT(a, rlh, rlw, 10);
+        defer a.free(rids);
+        const ai = try a.alloc(i32, img_ids.len + rids.len);
+        @memcpy(ai[0..img_ids.len], img_ids);
+        @memcpy(ai[img_ids.len..], rids);
+        all_ids = ai;
+    }
+
     // 3. denoise loop
     const sched = try computeSchedule(a, nlat, steps); defer { a.free(sched.ts); a.free(sched.sig); }
     const start_step: u32 = @min(opts.start_step, steps - 1);
@@ -1731,7 +1859,17 @@ pub fn generateWithOpts(te: *TextEncoder, dit: *Dit, vae: *Vae, ids: []const i32
 
     const run_steps = steps - start_step;
     for (start_step..steps) |t| {
-        const nz = try dit.forward(latents, enc, sched.ts[t], img_ids, txt_ids); defer _ = mlx.mlx_array_free(nz);
+        const nz = blk: {
+            if (ref_tokens.ctx != null) {
+                const input = try concat(&[_]mlx.mlx_array{ latents, ref_tokens }, 1, s);
+                defer _ = mlx.mlx_array_free(input);
+                const full = try dit.forward(input, enc, sched.ts[t], all_ids.?, txt_ids);
+                defer _ = mlx.mlx_array_free(full);
+                break :blk try slice3(full, 1, 0, @intCast(nlat), s);
+            }
+            break :blk try dit.forward(latents, enc, sched.ts[t], img_ids, txt_ids);
+        };
+        defer _ = mlx.mlx_array_free(nz);
         const dt = sched.sig[t + 1] - sched.sig[t];
         const dta = mlx.mlx_array_new_float(dt); defer _ = mlx.mlx_array_free(dta);
         const step = try mulA(nz, dta, s); defer _ = mlx.mlx_array_free(step);

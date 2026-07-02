@@ -138,6 +138,12 @@ code=$(api /v1/images/generations -X POST -H 'Content-Type: application/json' \
 [ "$code" = "400" ] || { echo "FAIL: 3 cond_weights on Krea returned $code (want 400)"; exit 1; }
 echo "PASS: 3 cond_weights on Krea -> 400 (needs 12)"
 
+# Instruction editing is FLUX.2-only (Krea has no edit training) → 400.
+code=$(api /v1/images/generations -X POST -H 'Content-Type: application/json' \
+  -d "{\"model\":\"$KREA_ID\",\"prompt\":\"x\",\"mode\":\"edit\",\"image\":\"aGk=\"}" -o /dev/null -w "%{http_code}")
+[ "$code" = "400" ] || { echo "FAIL: edit mode on Krea returned $code (want 400)"; exit 1; }
+echo "PASS: mode=edit on Krea -> 400 (FLUX.2-only)"
+
 # 5. Coexistence with a chat model.
 if [ -n "$CHAT" ]; then
   CHAT_ID="$(basename "$CHAT")"

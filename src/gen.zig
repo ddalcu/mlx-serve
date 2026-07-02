@@ -194,7 +194,12 @@ const FluxImpl = struct {
         defer if (init_lat) |l| {
             _ = mlx.mlx_array_free(l);
         };
-        if (opts.init_image) |pix| {
+        if (opts.edit_image) |pix| {
+            // Instruction edit: clean in-context reference, full noise start.
+            const ve = if (self.vae_enc) |*e| e else return error.NoVaeEncoder;
+            init_lat = try ve.encode(pix);
+            fopts.ref_latents = init_lat;
+        } else if (opts.init_image) |pix| {
             const ve = if (self.vae_enc) |*e| e else return error.NoVaeEncoder;
             init_lat = try ve.encode(pix);
             fopts.init_latents = init_lat;
@@ -227,6 +232,10 @@ pub const ImageGenOpts = struct {
     /// How far to renoise the source (diffusers convention: 1 = ignore it,
     /// low = small change). Only meaningful with `init_image`.
     strength: f32 = 0.6,
+    /// Instruction editing (FLUX.2 only): source pixels [1,3,H,W] f32 [0,1]
+    /// conditioned as CLEAN in-context reference tokens — generation starts
+    /// from pure noise and attends to them (`strength` does not apply).
+    edit_image: ?mlx.mlx_array = null,
     /// Conditioning rebalance: global gain × per-tapped-layer weights
     /// (FLUX: 3 taps, Krea: 12 taps).
     cond_gain: f32 = 1.0,
@@ -296,6 +305,15 @@ pub const ImageEngine = struct {
         };
     }
 
+    /// True when instruction editing (in-context reference conditioning) is
+    /// available — a trained FLUX.2 capability; Krea has no edit training.
+    pub fn supportsEdit(self: *const ImageEngine) bool {
+        return switch (self.backend) {
+            .flux => |*f| f.vae_enc != null,
+            .krea => false,
+        };
+    }
+
     /// Reconcile the engine's attached LoRA with the request: `path == null`
     /// detaches; a new path (or scale) loads + attaches; the same path+scale is
     /// a no-op reuse. Returns the number of matched DiT modules.
@@ -348,6 +366,7 @@ pub const ImageEngine = struct {
         return switch (self.backend) {
             .flux => |*f| f.generateImage(allocator, prompt, width, height, seed, steps, opts, progress),
             .krea => |k| blk: {
+                if (opts.edit_image != null) break :blk error.EditUnsupported;
                 const kopts = krea.GenOpts{
                     .init_image = opts.init_image,
                     .start_step = if (opts.init_image != null) img2imgStartStep(steps, opts.strength) else 0,
@@ -925,14 +944,26 @@ pub fn handleImage(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: 
     const seed: u64 = extractJsonInt(body, "seed") orelse 42;
     const steps: u32 = @intCast(extractJsonInt(body, "steps") orelse 4);
 
-    // img2img: `image` (base64 PNG/JPEG) + `strength` (0,1] — the source is
-    // resized to the resolved size, VAE-encoded, and partially renoised.
+    // Source image: `image` (base64 PNG/JPEG) + `mode` ("variation" default /
+    // "edit"). Variation = SDEdit renoise at `strength` (both backends);
+    // edit = FLUX.2 in-context reference conditioning (instruction edits —
+    // "make the hair blue" — with the source attended to clean; no strength).
     var init_img: ?mlx.mlx_array = null;
     defer if (init_img) |ii| {
         _ = mlx.mlx_array_free(ii);
     };
     var strength: f32 = 0.6;
+    var edit_mode = false;
+    if (extractJsonString(body, "mode")) |m| {
+        if (std.mem.eql(u8, m, "edit")) {
+            edit_mode = true;
+        } else if (!std.mem.eql(u8, m, "variation")) {
+            return sendError(conn, 400, "'mode' must be \"edit\" or \"variation\"");
+        }
+    }
     if (extractJsonString(body, "image")) |raw_img| {
+        if (edit_mode and !engine.supportsEdit())
+            return sendError(conn, 400, "instruction editing (mode:\"edit\") requires a FLUX.2 model — this model only supports mode:\"variation\"");
         if (!engine.supportsImg2Img())
             return sendError(conn, 400, "image-to-image needs the VAE encoder weights, which failed to load for this model");
         if (extractJsonFloat(body, "strength")) |sv| {
@@ -944,7 +975,13 @@ pub fn handleImage(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: 
         defer allocator.free(img_bytes);
         init_img = decodeImageToBCHW(allocator, img_bytes, height, width) orelse
             return sendError(conn, 400, "could not decode 'image' (PNG/JPEG supported)");
-        log.info("[image] img2img: source {d} bytes, strength={d:.2}\n", .{ img_bytes.len, strength });
+        if (edit_mode) {
+            log.info("[image] edit: reference {d} bytes (in-context conditioning)\n", .{img_bytes.len});
+        } else {
+            log.info("[image] img2img: source {d} bytes, strength={d:.2}\n", .{ img_bytes.len, strength });
+        }
+    } else if (edit_mode) {
+        return sendError(conn, 400, "mode:\"edit\" needs an 'image' to edit");
     }
 
     // Conditioning rebalance: global gain + per-tapped-layer weights.
@@ -991,8 +1028,9 @@ pub fn handleImage(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: 
     if (want_stream) try conn.writeAll(sse.headers);
 
     const gen_opts = ImageGenOpts{
-        .init_image = init_img,
+        .init_image = if (edit_mode) null else init_img,
         .strength = strength,
+        .edit_image = if (edit_mode) init_img else null,
         .cond_gain = cond_gain,
         .cond_weights = cond_weights,
     };

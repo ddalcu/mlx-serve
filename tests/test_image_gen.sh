@@ -91,12 +91,13 @@ code=$(curl -s -X POST "http://127.0.0.1:$PORT/v1/images/generations" -H 'Conten
   -d @"$REQ" -o "$OUT2" -w "%{http_code}")
 [ "$code" = "200" ] || { echo "FAIL: img2img http $code"; head -c 300 "$OUT2"; exit 1; }
 grep -q "\[image\] img2img:" /tmp/test_image_server.log || { echo "FAIL: no img2img engagement log line"; exit 1; }
-python3 - "$OUT2" <<'PY'
+# Shared checker: the output must keep the source's dark-left/bright-right split.
+cat > /tmp/check_split.py <<'PY'
 import sys, json, base64, zlib, struct
+label = sys.argv[2]
 d = json.load(open(sys.argv[1]))
 png = base64.b64decode(d["data"][0]["b64_json"])
 assert png[:8] == bytes([0x89,0x50,0x4E,0x47,0x0D,0x0A,0x1A,0x0A]), "not a PNG"
-# minimal PNG decode (8-bit RGB, filter types 0-4)
 pos, idat, w, h = 8, b"", 0, 0
 while pos < len(png):
     ln, typ = struct.unpack(">I4s", png[pos:pos+8]); data = png[pos+8:pos+8+ln]; pos += 12 + ln
@@ -126,10 +127,10 @@ for y in range(h):
         for x in range(0, w // 2, 16): left_sum += line[x * 3]; n += 1
         for x in range(w // 2, w, 16): right_sum += line[x * 3]
 left, right = left_sum / n, right_sum / n
-print(f"PASS: img2img strength=0.2 kept the split (left mean {left:.0f}, right mean {right:.0f})")
-assert right - left > 60, f"img2img lost the source structure (left {left:.0f}, right {right:.0f})"
+print(f"PASS: {label} kept the split (left mean {left:.0f}, right mean {right:.0f})")
+assert right - left > 60, f"{label} lost the source structure (left {left:.0f}, right {right:.0f})"
 PY
-[ $? -eq 0 ] || exit 1
+python3 /tmp/check_split.py "$OUT2" "img2img strength=0.2" || exit 1
 
 # ── strength out of range → 400
 code=$(curl -s -X POST "http://127.0.0.1:$PORT/v1/images/generations" -H 'Content-Type: application/json' \
@@ -200,3 +201,26 @@ code=$(curl -s -X POST "http://127.0.0.1:$PORT/v1/images/generations" -H 'Conten
   -d "{\"prompt\":\"x\",\"steps\":2,\"lora_path\":\"$LORA_BAD\"}" -o /dev/null -w "%{http_code}")
 [ "$code" = "400" ] || { echo "FAIL: foreign lora returned $code (want 400)"; exit 1; }
 echo "PASS: non-matching LoRA -> 400"
+
+# ── instruction edit (FLUX.2 in-context reference conditioning): generation
+# starts from PURE NOISE, so the split can only come from the model attending
+# to the clean reference tokens (probed live: diff ≈ 198).
+EREQ=/tmp/test_edit_req.json
+python3 - "$SRC" "$EREQ" <<'PY'
+import sys, json, base64
+b64 = base64.b64encode(open(sys.argv[1], "rb").read()).decode()
+json.dump({"prompt": "the same image, unchanged", "size": "1024x1024", "steps": 4,
+           "mode": "edit", "image": b64, "seed": 7}, open(sys.argv[2], "w"))
+PY
+EOUT=/tmp/test_edit_out.json
+code=$(curl -s -X POST "http://127.0.0.1:$PORT/v1/images/generations" -H 'Content-Type: application/json' \
+  -d @"$EREQ" -o "$EOUT" -w "%{http_code}")
+[ "$code" = "200" ] || { echo "FAIL: edit http $code"; head -c 300 "$EOUT"; exit 1; }
+grep -q "\[image\] edit:" /tmp/test_image_server.log || { echo "FAIL: no edit engagement log line"; exit 1; }
+python3 /tmp/check_split.py "$EOUT" "instruction edit (pure-noise start)" || exit 1
+
+# ── edit mode without an image → 400
+code=$(curl -s -X POST "http://127.0.0.1:$PORT/v1/images/generations" -H 'Content-Type: application/json' \
+  -d '{"prompt":"x","mode":"edit"}' -o /dev/null -w "%{http_code}")
+[ "$code" = "400" ] || { echo "FAIL: imageless edit returned $code (want 400)"; exit 1; }
+echo "PASS: mode=edit without image -> 400"

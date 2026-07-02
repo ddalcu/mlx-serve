@@ -427,4 +427,44 @@ final class MediaGenServiceTests: XCTestCase {
         XCTAssertEqual(ImageGenRequest(model: .flux2Klein4B_Q4, prompt: "x", width: 1024, height: 1024, steps: 4, guidance: 0.5).condWeightCount, 3)
         XCTAssertEqual(ImageGenRequest(model: .krea2Turbo, prompt: "x", width: 1024, height: 1024, steps: 8, guidance: 0.5).condWeightCount, 12)
     }
+
+    // MARK: - Instruction edit mode (FLUX.2 in-context reference conditioning)
+
+    func testImageRequestJsonEditModeSendsModeAndOmitsStrength() throws {
+        let tmp = FileManager.default.temporaryDirectory
+            .appendingPathComponent("edit-src-\(UUID().uuidString).png")
+        try Data([1, 2, 3]).write(to: tmp)
+        defer { try? FileManager.default.removeItem(at: tmp) }
+
+        var req = ImageGenRequest(model: .flux2Klein4B_Q4, prompt: "make the hair blue", width: 1024, height: 1024, steps: 8, guidance: 0.5)
+        req.initImagePath = tmp.path
+        req.editMode = true
+        req.strength = 0.4
+        let json = ImageGenService.requestJson(for: req, modelName: "m", seed: 1)
+        XCTAssertEqual(json["mode"] as? String, "edit")
+        XCTAssertNotNil(json["image"])
+        // Edit conditions on the clean reference — strength does not apply.
+        XCTAssertNil(json["strength"])
+    }
+
+    func testImageRequestJsonVariationModeOmitsModeField() throws {
+        let tmp = FileManager.default.temporaryDirectory
+            .appendingPathComponent("var-src-\(UUID().uuidString).png")
+        try Data([1, 2, 3]).write(to: tmp)
+        defer { try? FileManager.default.removeItem(at: tmp) }
+
+        var req = ImageGenRequest(model: .flux2Klein4B_Q4, prompt: "x", width: 1024, height: 1024, steps: 8, guidance: 0.5)
+        req.initImagePath = tmp.path
+        req.editMode = false
+        let json = ImageGenService.requestJson(for: req, modelName: "m", seed: 1)
+        XCTAssertNil(json["mode"]) // default server behavior = variation
+        XCTAssertNotNil(json["strength"])
+    }
+
+    func testSupportsReferenceEditFollowsVariant() {
+        // Editing is a trained FLUX.2 capability; FLUX.1 and Krea don't have it.
+        XCTAssertTrue(ImageModelPreset.flux2Klein4B_Q4.supportsReferenceEdit)
+        XCTAssertFalse(ImageModelPreset.krea2Turbo.supportsReferenceEdit)
+        XCTAssertFalse(ImageModelPreset.schnellQ4.supportsReferenceEdit)
+    }
 }

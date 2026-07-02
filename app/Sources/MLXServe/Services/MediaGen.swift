@@ -418,8 +418,12 @@ struct ImageGenRequest {
     /// requested resolution, VAE-encodes it, and partially renoises.
     var initImagePath: String? = nil
     /// How far to renoise the source (1 = ignore it, low = small change).
-    /// Only meaningful with `initImagePath`.
+    /// Only meaningful with `initImagePath` in variation mode.
     var strength: Double = 0.6
+    /// Instruction editing (FLUX.2 only): condition on the source as a clean
+    /// in-context reference — "make the hair blue" keeps the same person.
+    /// false = variation (renoise) mode.
+    var editMode: Bool = false
     /// Conditioning rebalance (Advanced): global multiplier on the prompt
     /// embeddings. 1.0 = off.
     var condGain: Double = 1.0
@@ -438,6 +442,10 @@ extension ImageModelPreset {
     /// Number of tapped text-encoder layers the backend fuses — the count
     /// `cond_weights` must supply (Krea stacks 12 layers; FLUX concatenates 3).
     var condWeightCount: Int { variant == .krea2Turbo ? 12 : 3 }
+
+    /// Instruction editing (in-context reference conditioning) is a trained
+    /// FLUX.2 capability; FLUX.1 and Krea can only do renoise variations.
+    var supportsReferenceEdit: Bool { variant == .flux2Klein4B || variant == .flux2Klein9B }
 }
 
 extension ImageGenRequest {
