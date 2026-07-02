@@ -146,6 +146,25 @@ final class AgentPromptTests: XCTestCase {
         XCTAssertFalse(s.contains("/workspace"))
     }
 
+    // The URL a served app is handed back on is ENVIRONMENT-specific: on the
+    // host a 0.0.0.0 bind is LAN-reachable at http://<local-ip>:<port>, but in
+    // the sandbox only the loopback port map answers — a LAN or guest IP URL
+    // is dead. Live 2026-07-02: the base prompt's <local-ip> directive made
+    // the agent hand the user the Mac's LAN IP for a sandboxed server. So the
+    // base prompt must not hardcode a URL form; each env section states its own.
+    func testServedUrlFormRidesTheEnvironmentSectionNotTheBasePrompt() {
+        XCTAssertFalse(AgentPrompt.defaultPromptFile.contains("<local-ip>"),
+                       "URL form is environment-specific — the base prompt must defer to the env section")
+        let sandbox = AgentPrompt.executionEnvironmentSection(sandboxed: true)
+        XCTAssertTrue(sandbox.contains("http://localhost:"),
+                      "sandbox section must state the mapped localhost URL form")
+        XCTAssertTrue(sandbox.contains("NEVER") || sandbox.contains("never"),
+                      "sandbox section must explicitly countermand LAN/local-ip URLs")
+        let host = AgentPrompt.executionEnvironmentSection(sandboxed: false)
+        XCTAssertTrue(host.contains("<local-ip>"),
+                      "host section carries the LAN-reachable URL directive (IP from the grounding line)")
+    }
+
     // MARK: - Skill seeding
 
     private func tempSkillsDir() -> String {

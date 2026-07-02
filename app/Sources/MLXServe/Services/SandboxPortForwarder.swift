@@ -95,14 +95,19 @@ enum GuestNetParser {
 /// Mac transparently reaches it (same port number, live — listeners open and
 /// close as the guest's `/proc/net/tcp` changes).
 ///
-/// Bind scope is deliberately 127.0.0.1 only: the mapping is for the user's
-/// browser/tools on this Mac, not for exposing the sandbox to the LAN.
+/// Bind scope is deliberately loopback only — BOTH 127.0.0.1 and ::1, since
+/// `localhost` resolves to ::1 first in modern clients and an IPv4-only
+/// listener leaves them refused — for the user's browser/tools on this Mac,
+/// not for exposing the sandbox to the LAN.
 /// A host port already in use (e.g. the mlx-serve server itself) fails to bind
 /// and is skipped with a log line — never an error surfaced to the agent.
 final class SandboxPortForwarder: @unchecked Sendable {
     private let queue = DispatchQueue(label: "mlxserve.sandbox.portfwd")
     private let lock = NSLock()
-    private var listeners: [UInt16: NWListener] = [:]
+    /// Per port: one listener per loopback family (v4 + v6). The port maps
+    /// only while BOTH bind — a partial bind would let `localhost` reach the
+    /// guest on one family and a different host service on the other.
+    private var listeners: [UInt16: [NWListener]] = [:]
     private var target: NWEndpoint.Host?
 
     /// Called (on the forwarder queue) whenever the set of mapped ports changes.
@@ -139,7 +144,7 @@ final class SandboxPortForwarder: @unchecked Sendable {
         let toOpen = ports.subtracting(current)
         var closed: [NWListener] = []
         for p in toClose {
-            if let l = listeners.removeValue(forKey: p) { closed.append(l) }
+            if let ls = listeners.removeValue(forKey: p) { closed.append(contentsOf: ls) }
         }
         lock.unlock()
         closed.forEach { $0.cancel() }
@@ -156,7 +161,7 @@ final class SandboxPortForwarder: @unchecked Sendable {
         let all = listeners
         listeners = [:]
         lock.unlock()
-        all.values.forEach { $0.cancel() }
+        all.values.forEach { $0.forEach { $0.cancel() } }
         if !all.isEmpty { onMappingsChanged?([]) }
     }
 
@@ -164,32 +169,40 @@ final class SandboxPortForwarder: @unchecked Sendable {
         guard let nwPort = NWEndpoint.Port(rawValue: port) else { return }
         let targetRaw = targetPortOverride?(port) ?? port
         guard let targetPort = NWEndpoint.Port(rawValue: targetRaw) else { return }
-        let params = NWParameters.tcp
-        params.allowLocalEndpointReuse = true
-        params.requiredLocalEndpoint = NWEndpoint.hostPort(host: "127.0.0.1", port: nwPort)
-        guard let listener = try? NWListener(using: params) else {
-            NSLog("[sandbox] port map: could not create listener for \(port)")
-            return
-        }
-        listener.newConnectionHandler = { [queue] client in
-            Self.relay(client: client, to: host, port: targetPort, on: queue)
-        }
-        listener.stateUpdateHandler = { [weak self, weak listener] state in
-            if case .failed(let err) = state {
-                // Typically addressInUse (something on the host already owns the
-                // port, e.g. mlx-serve itself) — drop the mapping, keep the rest.
-                NSLog("[sandbox] port map \(port) unavailable on host: \(err)")
-                listener?.cancel()
-                guard let self else { return }
-                self.lock.lock()
-                if self.listeners[port] === listener { self.listeners.removeValue(forKey: port) }
-                self.lock.unlock()
+        var opened: [NWListener] = []
+        for bindAddr in [NWEndpoint.Host("127.0.0.1"), NWEndpoint.Host("::1")] {
+            let params = NWParameters.tcp
+            params.allowLocalEndpointReuse = true
+            params.requiredLocalEndpoint = NWEndpoint.hostPort(host: bindAddr, port: nwPort)
+            guard let listener = try? NWListener(using: params) else {
+                NSLog("[sandbox] port map: could not create listener for \(port) on \(bindAddr)")
+                opened.forEach { $0.cancel() }
+                return
             }
+            listener.newConnectionHandler = { [queue] client in
+                Self.relay(client: client, to: host, port: targetPort, on: queue)
+            }
+            listener.stateUpdateHandler = { [weak self, weak listener] state in
+                if case .failed(let err) = state {
+                    // Typically addressInUse (something on the host already owns
+                    // the port, e.g. mlx-serve itself). Drop the WHOLE mapping —
+                    // sibling family included — keep the other ports.
+                    NSLog("[sandbox] port map \(port) unavailable on host: \(err)")
+                    listener?.cancel()
+                    guard let self, let listener else { return }
+                    self.lock.lock()
+                    let mine = self.listeners[port]?.contains(where: { $0 === listener }) ?? false
+                    let siblings = mine ? (self.listeners.removeValue(forKey: port) ?? []) : []
+                    self.lock.unlock()
+                    siblings.forEach { $0.cancel() }
+                }
+            }
+            opened.append(listener)
         }
         lock.lock()
-        listeners[port] = listener
+        listeners[port] = opened
         lock.unlock()
-        listener.start(queue: queue)
+        opened.forEach { $0.start(queue: queue) }
     }
 
     /// Bidirectional byte pump between an accepted host connection and a fresh

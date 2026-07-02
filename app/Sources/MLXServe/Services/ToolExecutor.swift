@@ -338,11 +338,19 @@ enum ShellMessages {
         "[cwd: \(cwd)]\nStarted in background as \(handle) (pid \(pid)). It keeps running — poll it with readProcessOutput {\"handle\": \"\(handle)\"}, stop it with killProcess {\"handle\": \"\(handle)\"}."
     }
 
+    /// The trailing URL steer is load-bearing: the model composes its "server
+    /// is up at <url>" reply straight from this result. Live 2026-07-02 an
+    /// agent handed the user the Mac's LAN IP (which the loopback-only port
+    /// map can never serve) — the base prompt's `http://<local-ip>:<port>`
+    /// directive won over the env section's localhost hint. That prompt
+    /// conflict is fixed in AgentPrompt; this steer is the belt-and-braces
+    /// layer closest to where the model writes the URL.
     static func sandboxBackgroundStarted(cwd: String, handle: String?, logPath: String, pid: Int32) -> String {
+        let urlSteer = "If this is a server, every TCP port it listens on inside the sandbox is auto-mapped to the host — the user reaches it at http://localhost:<port> in their browser. When sharing a URL, ALWAYS use http://localhost:<port>, never a LAN or guest IP address."
         if let handle {
-            return "[cwd: \(cwd)]\nStarted in the SANDBOX background (isolated Linux guest) as \(handle) (guest pid \(pid)). It keeps running — poll it with readProcessOutput {\"handle\": \"\(handle)\"}, stop it with killProcess {\"handle\": \"\(handle)\"}. Its output is also appended to \(logPath) inside the guest."
+            return "[cwd: \(cwd)]\nStarted in the SANDBOX background (isolated Linux guest) as \(handle) (guest pid \(pid)). It keeps running — poll it with readProcessOutput {\"handle\": \"\(handle)\"}, stop it with killProcess {\"handle\": \"\(handle)\"}. Its output is also appended to \(logPath) inside the guest. \(urlSteer)"
         }
-        return "[cwd: \(cwd)]\nStarted in the SANDBOX background (isolated Linux guest). Output is appended to \(logPath) inside the guest — check on it with the shell tool, e.g. {\"command\": \"tail -n 50 \(logPath)\"}."
+        return "[cwd: \(cwd)]\nStarted in the SANDBOX background (isolated Linux guest). Output is appended to \(logPath) inside the guest — check on it with the shell tool, e.g. {\"command\": \"tail -n 50 \(logPath)\"}. \(urlSteer)"
     }
 
     static func backgroundUnavailable(cwd: String, seconds: Int) -> String {

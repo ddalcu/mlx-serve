@@ -93,16 +93,9 @@ final class SandboxPortForwarderTests: XCTestCase {
 
     // MARK: end-to-end loopback forward
 
-    /// "Guest" echo service on [::1]:Q + forwarder mapping host 127.0.0.1:P →
-    /// ::1:Q via the test seam (NWListener internally probes BOTH address
-    /// families of its port, so P must differ from Q in-process; the real
-    /// same-port mapping is proven live by SandboxSmoke phase 4).
-    func testForwarderRelaysBytesToTarget() throws {
-        let port = UInt16.random(in: 20000...30000) // host side (P)
-        let servicePort = port + 10000 // fake guest side (Q)
-        let q = DispatchQueue(label: "test.guest.service")
-
-        // Echo-once service: BSD IPv6 socket, strictly ::1 (IPV6_V6ONLY).
+    /// Echo-once "guest" service: BSD IPv6 socket, strictly ::1 (IPV6_V6ONLY).
+    /// Returns the listening fd (caller closes).
+    private func startEchoService(port: UInt16) -> Int32 {
         let fd = socket(AF_INET6, SOCK_STREAM, 0)
         XCTAssertGreaterThanOrEqual(fd, 0)
         var on: Int32 = 1
@@ -110,7 +103,7 @@ final class SandboxPortForwarderTests: XCTestCase {
         setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &on, socklen_t(MemoryLayout<Int32>.size))
         var addr = sockaddr_in6()
         addr.sin6_family = sa_family_t(AF_INET6)
-        addr.sin6_port = servicePort.bigEndian
+        addr.sin6_port = port.bigEndian
         addr.sin6_addr = in6addr_loopback
         let bound = withUnsafePointer(to: &addr) {
             $0.withMemoryRebound(to: sockaddr.self, capacity: 1) {
@@ -119,7 +112,6 @@ final class SandboxPortForwarderTests: XCTestCase {
         }
         XCTAssertEqual(bound, 0, "could not bind the fake guest service")
         XCTAssertEqual(listen(fd, 4), 0)
-        defer { close(fd) }
         Thread.detachNewThread {
             let client = accept(fd, nil, nil)
             guard client >= 0 else { return }
@@ -130,18 +122,15 @@ final class SandboxPortForwarderTests: XCTestCase {
             _ = reply.withUnsafeBytes { write(client, $0.baseAddress, $0.count) }
             close(client)
         }
+        return fd
+    }
 
-        let fwd = SandboxPortForwarder()
-        defer { fwd.stop() }
-        fwd.targetPortOverride = { _ in servicePort }
-        fwd.setTarget(host: "::1")
-        fwd.update(ports: [port])
-
-        // Give the forwarder's listener a beat to bind, then connect to the
-        // HOST side (IPv4 loopback) and expect the guest service's reply.
-        let reply = expectation(description: "relayed reply")
+    /// Connect to the forwarder's HOST side at `hostSide`:P and expect the
+    /// guest echo service's reply through the relay.
+    private func expectRelayedEcho(hostSide: NWEndpoint.Host, port: UInt16, q: DispatchQueue) {
+        let reply = expectation(description: "relayed reply via \(hostSide)")
         let client = NWConnection(
-            host: "127.0.0.1", port: NWEndpoint.Port(rawValue: port)!, using: .tcp)
+            host: hostSide, port: NWEndpoint.Port(rawValue: port)!, using: .tcp)
         client.stateUpdateHandler = { state in
             if case .ready = state {
                 client.send(content: Data("ping".utf8), completion: .contentProcessed { _ in })
@@ -155,7 +144,68 @@ final class SandboxPortForwarderTests: XCTestCase {
         client.start(queue: q)
         defer { client.cancel() }
         wait(for: [reply], timeout: 10)
+    }
+
+    /// "Guest" echo service on [::1]:Q + forwarder mapping host loopback:P →
+    /// ::1:Q via the test seam (NWListener internally probes BOTH address
+    /// families of its port, so P must differ from Q in-process; the real
+    /// same-port mapping is proven live by SandboxSmoke phase 4).
+    func testForwarderRelaysBytesToTarget() throws {
+        let port = UInt16.random(in: 20000...30000) // host side (P)
+        let servicePort = port + 10000 // fake guest side (Q)
+        let q = DispatchQueue(label: "test.guest.service")
+        let fd = startEchoService(port: servicePort)
+        defer { close(fd) }
+
+        let fwd = SandboxPortForwarder()
+        defer { fwd.stop() }
+        fwd.targetPortOverride = { _ in servicePort }
+        fwd.setTarget(host: "::1")
+        fwd.update(ports: [port])
+
+        expectRelayedEcho(hostSide: "127.0.0.1", port: port, q: q)
         XCTAssertEqual(fwd.activePorts, [port])
+    }
+
+    /// `localhost` resolves to ::1 FIRST in modern browsers/clients; a
+    /// v4-only host listener leaves [::1]:P refused, so anything that doesn't
+    /// fall back to 127.0.0.1 sees a dead server. The forwarder must answer on
+    /// BOTH loopback families. (Live failure 2026-07-02: python http.server in
+    /// the guest, port map line shown, user's browser couldn't reach it.)
+    func testForwarderRelaysBytesViaIPv6LoopbackHostSide() throws {
+        let port = UInt16.random(in: 20000...30000) // host side (P)
+        let servicePort = port + 10000 // fake guest side (Q)
+        let q = DispatchQueue(label: "test.guest.service.v6")
+        let fd = startEchoService(port: servicePort)
+        defer { close(fd) }
+
+        let fwd = SandboxPortForwarder()
+        defer { fwd.stop() }
+        fwd.targetPortOverride = { _ in servicePort }
+        fwd.setTarget(host: "::1")
+        fwd.update(ports: [port])
+
+        expectRelayedEcho(hostSide: "::1", port: port, q: q)
+        XCTAssertEqual(fwd.activePorts, [port])
+    }
+
+    // MARK: tool-result URL steer
+
+    /// The model composes its "server is up at <url>" reply straight from this
+    /// tool result — live 2026-07-02 the agent told the user
+    /// http://192.168.2.61:8000, the Mac's LAN IP, which the loopback-only
+    /// forwarder can never serve (the base prompt's <local-ip> directive won
+    /// over the env section's localhost hint; both layers are fixed). The
+    /// result string itself must carry the localhost mapping + the
+    /// never-a-LAN/guest-IP rule.
+    func testSandboxBackgroundStartMessageSteersToLocalhostUrl() {
+        let withHandle = ShellMessages.sandboxBackgroundStarted(
+            cwd: "/workspace", handle: "bg1", logPath: "/tmp/x.log", pid: 101)
+        XCTAssertTrue(withHandle.contains("http://localhost:"), "must name the mapped URL shape")
+        XCTAssertTrue(withHandle.contains("never"), "must forbid LAN/guest-IP URLs")
+        let noHandle = ShellMessages.sandboxBackgroundStarted(
+            cwd: "/workspace", handle: nil, logPath: "/tmp/x.log", pid: 0)
+        XCTAssertTrue(noHandle.contains("http://localhost:"))
     }
 
     func testForwarderUpdateClosesRemovedPorts() {

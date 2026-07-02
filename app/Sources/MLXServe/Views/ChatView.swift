@@ -2446,7 +2446,9 @@ struct MarkdownText: View {
                     .foregroundColor: NSColor(white: 0.92, alpha: 1.0),
                     .paragraphStyle: p,
                 ]
-                result.append(NSAttributedString(string: content, attributes: attrs))
+                let code = NSMutableAttributedString(string: content, attributes: attrs)
+                linkifyBareUrls(code)
+                result.append(code)
 
             case .listItem(let text):
                 let bullet = NSAttributedString(string: "• ", attributes: [
@@ -2541,7 +2543,43 @@ struct MarkdownText: View {
             }
             result.addAttribute(.foregroundColor, value: NSColor.labelColor, range: range)
         }
+        linkifyBareUrls(result)
         return result
+    }
+
+    /// Shared detector — creating an NSDataDetector is not free and renderInline
+    /// runs many times per second while streaming.
+    private static let urlDetector = try? NSDataDetector(
+        types: NSTextCheckingResult.CheckingType.link.rawValue
+    )
+
+    /// Add `.link` attributes for http(s) URLs the markdown parser left
+    /// unlinked. CommonMark autolinks a bare `http://…` but NOT one inside a
+    /// code span — and models love `` `http://localhost:3000` `` — so a URL
+    /// would flicker clickable mid-stream (before the closing backtick
+    /// arrives) then go dead once the span completes. NSDataDetector handles
+    /// boundaries and trailing punctuation; only http/https matches are
+    /// linkified (no bare-domain or mailto surprises), and spans that already
+    /// carry a link (e.g. from `[text](url)`) are left untouched. Display
+    /// styling comes from the text view's `linkTextAttributes`.
+    private static func linkifyBareUrls(_ result: NSMutableAttributedString) {
+        guard let detector = urlDetector else { return }
+        let full = NSRange(location: 0, length: result.length)
+        for match in detector.matches(in: result.string, range: full) {
+            guard let url = match.url,
+                  let scheme = url.scheme?.lowercased(),
+                  scheme == "http" || scheme == "https" else { continue }
+            var alreadyLinked = false
+            result.enumerateAttribute(.link, in: match.range, options: []) { value, _, stop in
+                if value != nil {
+                    alreadyLinked = true
+                    stop.pointee = true
+                }
+            }
+            if !alreadyLinked {
+                result.addAttribute(.link, value: url, range: match.range)
+            }
+        }
     }
 
     /// Render a markdown table as monospaced columns padded to the widest cell

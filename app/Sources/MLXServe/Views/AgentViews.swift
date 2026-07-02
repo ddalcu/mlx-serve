@@ -234,6 +234,7 @@ struct WorkingDirectoryIndicator: View {
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
         panel.allowsMultipleSelection = false
+        panel.canCreateDirectories = true
         panel.prompt = "Select Working Directory"
         if panel.runModal() == .OK, let url = panel.url {
             path = url.path

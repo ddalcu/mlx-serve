@@ -54,7 +54,7 @@ enum AgentPrompt {
 
         # Serving apps
 
-        If you start something the user can open (web app, dev server), bind to 0.0.0.0 (never just localhost) so their other devices can reach it, run it in the background, verify with curl, and finish by handing back the URL `http://<local-ip>:<port>` (the IP is in the grounding line above; else use localhost and say so).
+        If you start something the user can open (web app, dev server), bind to 0.0.0.0 (never just localhost), run it in the background, verify with curl, and finish by handing back the URL — use the URL form stated in the Execution environment section below.
 
         # Style
 
@@ -73,13 +73,14 @@ enum AgentPrompt {
                 + "Shell commands run inside an isolated Linux VM (Debian, aarch64, GNU userland) — NOT on the host Mac. "
                 + "python3/pip, node/npm, git, and curl are available; macOS-only commands (brew, open, pbcopy, osascript, defaults) are NOT — use Linux equivalents (apt-get to add packages). "
                 + "The working folder is mounted at /workspace inside the VM; the file tools (readFile/writeFile/editFile/…) see the same files from the host side, so use them interchangeably with shell paths. "
-                + "The VM normally has outbound network access (unless disabled in Settings — if a download fails with a network error, say so instead of retrying), and any TCP port a server listens on inside the VM is automatically reachable on the host at localhost with the SAME port — e.g. an Express app on 8080 is live at http://localhost:8080 for the user; start the server and share that URL. "
+                + "The VM normally has outbound network access (unless disabled in Settings — if a download fails with a network error, say so instead of retrying), and any TCP port a server listens on inside the VM is automatically reachable on the host at localhost with the SAME port — e.g. an Express app on 8080 is live at http://localhost:8080 for the user. Hand back exactly http://localhost:<port> — NEVER a LAN IP, <local-ip>, or guest IP URL: the mapping answers only on the user's own Mac, and other devices cannot reach the sandbox. "
                 + "run_in_background starts the process inside the VM and returns a handle (bg1, bg2, …) you poll with readProcessOutput and stop with killProcess, exactly as on the host (its output is also appended to a log file inside the guest). "
                 + "Exported shell variables persist between calls."
         }
         return "\n\n# Execution environment\n"
             + "Shell commands run directly on this Mac (macOS, zsh login shell, BSD userland; node, npm, python, git, and brew are on PATH). "
-            + "Each call is a fresh login shell."
+            + "Each call is a fresh login shell. "
+            + "A server bound to 0.0.0.0 is reachable from the user's other devices too — hand back http://<local-ip>:<port> (the IP is in the grounding line above; if it's missing, use http://localhost:<port> and say so)."
     }
 
     /// The agent system prompt. `~/.mlx-serve/system-prompt.md` is the single

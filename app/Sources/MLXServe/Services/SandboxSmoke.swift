@@ -196,6 +196,19 @@ enum SandboxSmoke {
                     }
                     if mapped { log("[smoke]   ✓ guest :\(port) reachable at localhost:\(port)") }
                     else { log("[smoke]   ✗ port map: localhost:\(port) did not reach the guest server"); ok = false }
+
+                    // `localhost` resolves to ::1 first in modern clients — the
+                    // map must answer on BOTH loopback families, or IPv6-first
+                    // resolvers see a refused connection (live 2026-07-02).
+                    if mapped {
+                        let v6Body: String? = syncAwait {
+                            guard let url = URL(string: "http://[::1]:\(port)/"),
+                                  let (data, _) = try? await URLSession.shared.data(from: url) else { return nil }
+                            return String(decoding: data, as: UTF8.self)
+                        }
+                        if v6Body?.contains("PORTMAP_OK") == true { log("[smoke]   ✓ guest :\(port) reachable at [::1]:\(port)") }
+                        else { log("[smoke]   ✗ port map: [::1]:\(port) did not reach the guest server"); ok = false }
+                    }
                 }
 
                 // Phase 4b: ANSI sanitize — a real tty makes tools emit color +
