@@ -23,6 +23,7 @@ const tts = @import("tts.zig");
 const ltx = @import("ltx_video.zig");
 const ltx_audio = @import("ltx_audio.zig");
 const wav_mod = @import("wav.zig");
+const png_mod = @import("png.zig");
 const tok_mod = @import("tokenizer.zig");
 const model_mod = @import("model.zig");
 const chat_mod = @import("chat.zig");
@@ -748,9 +749,37 @@ fn decodeImageToBCFHW(allocator: std.mem.Allocator, encoded: []const u8, target_
     return bf;
 }
 
+/// Reference dims for edit mode: keep the source's aspect ratio, cap the area
+/// at ~1MP (klein's trained scale), round each side down to a multiple of 32
+/// (the official prep's crop granularity; also satisfies the VAE /8 + latent
+/// patchify /2). Never upscales; floors at 32.
+fn fitRefDims(w: u32, h: u32) struct { w: u32, h: u32 } {
+    const cap: f64 = 1024.0 * 1024.0;
+    const area: f64 = @as(f64, @floatFromInt(w)) * @as(f64, @floatFromInt(h));
+    const scale: f64 = @min(1.0, std.math.sqrt(cap / @max(area, 1.0)));
+    const sw: u32 = @intFromFloat(@as(f64, @floatFromInt(w)) * scale);
+    const sh: u32 = @intFromFloat(@as(f64, @floatFromInt(h)) * scale);
+    return .{
+        .w = @max(32, (sw / 32) * 32),
+        .h = @max(32, (sh / 32) * 32),
+    };
+}
+
+/// Native pixel dims of an encoded PNG/JPEG, without decoding the pixels.
+fn imageNativeSize(encoded: []const u8) ?struct { w: u32, h: u32 } {
+    var w: c_int = 0;
+    var h: c_int = 0;
+    var ch: c_int = 0;
+    if (stb.stbi_info_from_memory(encoded.ptr, @intCast(encoded.len), &w, &h, &ch) == 0) return null;
+    if (w <= 0 or h <= 0) return null;
+    return .{ .w = @intCast(w), .h = @intCast(h) };
+}
+
 /// Decode a PNG/JPEG image (raw file bytes) → `[1,3,target_h,target_w]` f32
-/// in [0,1], bilinear-resized (the img2img source; image engines convert to
-/// [-1,1] internally). Returns null on decode failure.
+/// in [0,1]. COVER semantics: bilinear-sampled from the largest centered
+/// source window matching the target's aspect ratio — the image is never
+/// stretched; mismatched aspects lose edges to a center crop instead of
+/// distorting the subject. Returns null on decode failure.
 fn decodeImageToBCHW(allocator: std.mem.Allocator, encoded: []const u8, target_h: u32, target_w: u32) ?mlx.mlx_array {
     var w: c_int = 0;
     var h: c_int = 0;
@@ -767,6 +796,19 @@ fn decodeImageToBCHW(allocator: std.mem.Allocator, encoded: []const u8, target_h
     const out = allocator.alloc(f32, 3 * th * tw) catch return null;
     defer allocator.free(out);
 
+    // Centered source window with the target's aspect ratio.
+    const src_ar = @as(f32, @floatFromInt(sw)) / @as(f32, @floatFromInt(sh));
+    const tgt_ar = @as(f32, @floatFromInt(tw)) / @as(f32, @floatFromInt(th));
+    var win_w: f32 = @floatFromInt(sw);
+    var win_h: f32 = @floatFromInt(sh);
+    if (src_ar > tgt_ar) {
+        win_w = win_h * tgt_ar; // too wide → crop the sides
+    } else {
+        win_h = win_w / tgt_ar; // too tall → crop top/bottom
+    }
+    const x_off = (@as(f32, @floatFromInt(sw)) - win_w) * 0.5;
+    const y_off = (@as(f32, @floatFromInt(sh)) - win_h) * 0.5;
+
     const clampIdx = struct {
         fn f(v: isize, n: usize) usize {
             if (v < 0) return 0;
@@ -777,14 +819,14 @@ fn decodeImageToBCHW(allocator: std.mem.Allocator, encoded: []const u8, target_h
 
     var oy: usize = 0;
     while (oy < th) : (oy += 1) {
-        const fy = (@as(f32, @floatFromInt(oy)) + 0.5) * @as(f32, @floatFromInt(sh)) / @as(f32, @floatFromInt(th)) - 0.5;
+        const fy = y_off + (@as(f32, @floatFromInt(oy)) + 0.5) * win_h / @as(f32, @floatFromInt(th)) - 0.5;
         const fy0 = @floor(fy);
         const wy = fy - fy0;
         const y0 = clampIdx(@intFromFloat(fy0), sh);
         const y1 = clampIdx(@as(isize, @intFromFloat(fy0)) + 1, sh);
         var ox: usize = 0;
         while (ox < tw) : (ox += 1) {
-            const fx = (@as(f32, @floatFromInt(ox)) + 0.5) * @as(f32, @floatFromInt(sw)) / @as(f32, @floatFromInt(tw)) - 0.5;
+            const fx = x_off + (@as(f32, @floatFromInt(ox)) + 0.5) * win_w / @as(f32, @floatFromInt(tw)) - 0.5;
             const fx0 = @floor(fx);
             const wx = fx - fx0;
             const x0 = clampIdx(@intFromFloat(fx0), sw);
@@ -973,11 +1015,21 @@ pub fn handleImage(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: 
         const img_bytes = base64DecodeAlloc(allocator, raw_img) catch
             return sendError(conn, 400, "invalid base64 in 'image'");
         defer allocator.free(img_bytes);
-        init_img = decodeImageToBCHW(allocator, img_bytes, height, width) orelse
-            return sendError(conn, 400, "could not decode 'image' (PNG/JPEG supported)");
         if (edit_mode) {
-            log.info("[image] edit: reference {d} bytes (in-context conditioning)\n", .{img_bytes.len});
+            // The reference keeps its OWN aspect ratio (fit to ~1MP, /32 dims —
+            // official prep behavior); its latent grid is independent of the
+            // output grid, so nothing gets squished or cropped away.
+            const nat = imageNativeSize(img_bytes) orelse
+                return sendError(conn, 400, "could not decode 'image' (PNG/JPEG supported)");
+            const rd = fitRefDims(nat.w, nat.h);
+            init_img = decodeImageToBCHW(allocator, img_bytes, rd.h, rd.w) orelse
+                return sendError(conn, 400, "could not decode 'image' (PNG/JPEG supported)");
+            log.info("[image] edit: reference {d}x{d} -> {d}x{d} (in-context conditioning)\n", .{ nat.w, nat.h, rd.w, rd.h });
         } else {
+            // Variation shares the output's latent grid — cover + center-crop
+            // to the output dims (never stretched).
+            init_img = decodeImageToBCHW(allocator, img_bytes, height, width) orelse
+                return sendError(conn, 400, "could not decode 'image' (PNG/JPEG supported)");
             log.info("[image] img2img: source {d} bytes, strength={d:.2}\n", .{ img_bytes.len, strength });
         }
     } else if (edit_mode) {
@@ -2065,6 +2117,57 @@ test "img2imgStartStep maps strength onto the schedule (diffusers convention)" {
     try testing.expectEqual(@as(u32, 7), img2imgStartStep(8, 0.01));
     try testing.expectEqual(@as(u32, 2), img2imgStartStep(4, 0.6));
     try testing.expectEqual(@as(u32, 0), img2imgStartStep(1, 0.3));
+}
+
+test "fitRefDims preserves aspect, caps at ~1MP, rounds to multiples of 32, never upscales" {
+    // 2:1 landscape above the cap → scaled down, aspect kept (±32-rounding).
+    const a = fitRefDims(2000, 1000);
+    try testing.expect(a.w * a.h <= 1024 * 1024);
+    try testing.expectEqual(@as(u32, 0), a.w % 32);
+    try testing.expectEqual(@as(u32, 0), a.h % 32);
+    const ar: f64 = @as(f64, @floatFromInt(a.w)) / @as(f64, @floatFromInt(a.h));
+    try testing.expect(ar > 1.85 and ar < 2.15);
+    // Small image: no upscale, just 32-rounding down.
+    const b = fitRefDims(300, 500);
+    try testing.expectEqual(@as(u32, 288), b.w);
+    try testing.expectEqual(@as(u32, 480), b.h);
+    // Already-conforming square passes through.
+    const c = fitRefDims(1024, 1024);
+    try testing.expectEqual(@as(u32, 1024), c.w);
+    try testing.expectEqual(@as(u32, 1024), c.h);
+    // Degenerate tiny inputs stay valid (≥32).
+    const d = fitRefDims(10, 3000);
+    try testing.expect(d.w >= 32 and d.h >= 32);
+}
+
+test "decodeImageToBCHW covers with a center crop instead of stretching" {
+    const a = testing.allocator;
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    // 100x50 source: black | white(center 50 cols) | black. Covering a 50x50
+    // target must sample ONLY the centered square window → all white.
+    // (The old stretch mapped the full width → black bands at the sides.)
+    const W = 100;
+    const H = 50;
+    var rgb: [W * H * 3]u8 = undefined;
+    for (0..H) |y| for (0..W) |x| {
+        const v: u8 = if (x >= 25 and x < 75) 255 else 0;
+        const o = (y * W + x) * 3;
+        rgb[o] = v;
+        rgb[o + 1] = v;
+        rgb[o + 2] = v;
+    };
+    const png_bytes = try png_mod.encodeRgb(a, &rgb, W, H);
+    defer a.free(png_bytes);
+    const arr = decodeImageToBCHW(a, png_bytes, 50, 50) orelse return error.DecodeFailed;
+    defer _ = mlx.mlx_array_free(arr);
+    _ = mlx.mlx_array_eval(arr);
+    const d = mlx.mlx_array_data_float32(arr) orelse return error.NoData;
+    const n: usize = @intCast(mlx.mlx_array_size(arr));
+    var mean: f64 = 0;
+    for (0..n) |i| mean += d[i];
+    mean /= @floatFromInt(n);
+    try testing.expect(mean > 0.9); // stretch gives ~0.5 here
 }
 
 test "extractCondWeights accepts a JSON array or a separated string" {

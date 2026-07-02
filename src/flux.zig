@@ -1157,10 +1157,14 @@ pub const Vae = struct {
 };
 
 /// [1,128,64,64] -> [1,32,128,128]  (reshape [1,32,2,2,64,64], transpose, reshape)
+/// packed [1,128,gh,gw] → [1,32,gh·2,gw·2] (channel = c·4 + ph·2 + pw).
 fn unpatchify(x: mlx.mlx_array, s: S) !mlx.mlx_array {
-    const r1 = try reshape(x, &[_]c_int{ 1, 32, 2, 2, 64, 64 }, s); defer _ = mlx.mlx_array_free(r1);
+    const sh = mlx.getShape(x);
+    const gh = sh[2];
+    const gw = sh[3];
+    const r1 = try reshape(x, &[_]c_int{ 1, 32, 2, 2, gh, gw }, s); defer _ = mlx.mlx_array_free(r1);
     const t1 = try transpose(r1, &[_]c_int{ 0, 1, 4, 2, 5, 3 }, s); defer _ = mlx.mlx_array_free(t1);
-    return reshape(t1, &[_]c_int{ 1, 32, 128, 128 }, s);
+    return reshape(t1, &[_]c_int{ 1, 32, gh * 2, gw * 2 }, s);
 }
 
 fn loadResnet(w: *const Weights, a: std.mem.Allocator, pfx: []const u8) !Resnet {
@@ -1249,12 +1253,17 @@ fn conv2dDown(x: mlx.mlx_array, w: mlx.mlx_array, bias: mlx.mlx_array, s: S) !ml
 
 /// Pixel-unshuffle NCHW [1,32,128,128] → packed [1,128,64,64]; exact inverse
 /// of `unpatchify` (packed channel = c*4 + ph*2 + pw).
+/// Pixel-unshuffle [1,32,H,W] → packed [1,128,H/2,W/2]; exact inverse of
+/// `unpatchify`.
 fn patchify(x: mlx.mlx_array, s: S) !mlx.mlx_array {
-    const r1 = try reshape(x, &[_]c_int{ 1, 32, 64, 2, 64, 2 }, s);
+    const sh = mlx.getShape(x);
+    const gh = @divExact(sh[2], 2);
+    const gw = @divExact(sh[3], 2);
+    const r1 = try reshape(x, &[_]c_int{ 1, 32, gh, 2, gw, 2 }, s);
     defer _ = mlx.mlx_array_free(r1);
     const t1 = try transpose(r1, &[_]c_int{ 0, 1, 3, 5, 2, 4 }, s);
     defer _ = mlx.mlx_array_free(t1);
-    return reshape(t1, &[_]c_int{ 1, 128, 64, 64 }, s);
+    return reshape(t1, &[_]c_int{ 1, 128, gh, gw }, s);
 }
 
 /// FLUX.2 VAE encoder — structural mirror of the decoder (down_blocks with
@@ -1570,6 +1579,62 @@ test "flux VAE encoder round-trips through the decoder" {
     std.debug.print("[flux-vae-enc] roundtrip corr={d:.6} mae={d:.5}\n", .{ corr, mae });
     try testing.expect(corr > 0.99);
     try testing.expect(mae < 0.05);
+}
+
+// Non-square sizes: the reference image in edit mode keeps its own aspect
+// ratio, so the VAE encode→decode pair must work off the 1024² grid.
+//   FLUX_TEST_MODEL
+test "flux VAE encoder round-trips at a non-square size" {
+    const model_dir = std.mem.span(std.c.getenv("FLUX_TEST_MODEL") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var enc = try loadVaeEncoder(io, a, s, model_dir);
+    defer enc.deinit();
+    var vae = try loadVae(io, a, s, model_dir);
+    defer vae.deinit();
+    const W: usize = 1152;
+    const H: usize = 896;
+    const img_buf = try a.alloc(f32, 3 * W * H);
+    defer a.free(img_buf);
+    for (0..H) |y| for (0..W) |x| {
+        const fy: f32 = @as(f32, @floatFromInt(y)) / (H - 1);
+        const fx: f32 = @as(f32, @floatFromInt(x)) / (W - 1);
+        img_buf[0 * W * H + y * W + x] = fx;
+        img_buf[1 * W * H + y * W + x] = fy;
+        img_buf[2 * W * H + y * W + x] = 0.5 * (fx + fy);
+    };
+    const ish = [_]c_int{ 1, 3, @intCast(H), @intCast(W) };
+    const img = mlx.mlx_array_new_data(img_buf.ptr, &ish, 4, .float32);
+    defer _ = mlx.mlx_array_free(img);
+    const lat = try enc.encode(img);
+    defer _ = mlx.mlx_array_free(lat);
+    const lsh = mlx.getShape(lat);
+    try testing.expectEqual(@as(c_int, 128), lsh[1]);
+    try testing.expectEqual(@as(c_int, @intCast(H / 16)), lsh[2]);
+    try testing.expectEqual(@as(c_int, @intCast(W / 16)), lsh[3]);
+    const dec = try vae.decode(lat); // [-1,1]
+    defer _ = mlx.mlx_array_free(dec);
+    const df = try astype(dec, .float32, s);
+    defer _ = mlx.mlx_array_free(df);
+    _ = mlx.mlx_array_eval(df);
+    const n: usize = @intCast(mlx.mlx_array_size(df));
+    try testing.expectEqual(img_buf.len, n);
+    const data = mlx.mlx_array_data_float32(df) orelse return error.NoData;
+    var dot: f64 = 0;
+    var na: f64 = 0;
+    var nb: f64 = 0;
+    for (0..n) |i| {
+        const x: f64 = data[i] * 0.5 + 0.5;
+        const y: f64 = img_buf[i];
+        dot += x * y;
+        na += x * x;
+        nb += y * y;
+    }
+    const corr = dot / (std.math.sqrt(na) * std.math.sqrt(nb));
+    std.debug.print("[flux-vae-enc] non-square roundtrip corr={d:.6}\n", .{corr});
+    try testing.expect(corr > 0.99);
 }
 
 test "buildLatentIdsT stamps the reference time coordinate (FLUX.2 edit convention)" {
