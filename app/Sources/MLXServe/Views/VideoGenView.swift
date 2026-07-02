@@ -126,7 +126,7 @@ struct VideoGenView: View {
                         RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.3), lineWidth: 0.5)
                     )
                 if prompt.isEmpty {
-                    Text("Describe your shot like a cinematographer — subject, action, camera movement, lighting, setting. 4–8 sentences. Click Examples above for a starting point.")
+                    Text("Describe your shot like a cinematographer — subject, action, camera movement, lighting, setting. 4–8 sentences. Put spoken dialogue in quotes to make characters talk. Click Examples above for a starting point.")
                         .font(.body)
                         .foregroundStyle(.secondary.opacity(0.6))
                         .padding(.horizontal, 5)
@@ -150,8 +150,14 @@ struct VideoGenView: View {
     }
 
     /// Canonical LTX-style example prompts seeded into the Examples menu.
-    /// Dense, cinematographer-style, covering three common shot types.
+    /// Dense, cinematographer-style, covering four common shot types. The
+    /// dialogue example matters most: LTX only generates speech when the
+    /// spoken words appear in quotes (short phrases, acting directions
+    /// between them, per the official prompting guide) — without it the
+    /// soundtrack is ambient noise only.
     private static let examplePrompts: [(title: String, body: String)] = [
+        ("Talking character (dialogue)",
+         "Medium close-up of a woman in her thirties with short auburn hair, seated at a kitchen table in warm morning light. She looks into the camera and says warmly, \"Good morning. I made coffee — it's still hot.\" She pauses, glancing toward the window, then adds with a small smile, \"Come sit with me for a minute.\" Her voice is clear and natural, speaking English. Soft room tone with a faint clink of a cup. The camera holds steady at eye level."),
         ("Cinematic character",
          "Medium shot of a young woman with dark curly hair and freckles, wearing a beige wool coat, walking slowly down a rain-slicked cobblestone street at dusk. She holds a folded paper map in one hand and glances up at the glowing shop windows. The camera tracks her from the side at eye level, then slowly dollies in as she stops. Warm amber light spills from the windows onto the wet stones, contrasting with the deep blue-grey sky. Light rain falls continuously, catching the light."),
         ("Nature aerial",

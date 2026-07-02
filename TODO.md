@@ -53,6 +53,10 @@ Multi-slot batching shipped: Gemma 4 E4B `--max-concurrent 2` → **1.50× throu
 
 14. **Qwen3-VL vision — faithful M-RoPE on Anthropic + /v1/responses.** Only `/v1/chat/completions` (stream + non-stream) threads the real M-RoPE position table today; `/v1/messages` and `/v1/responses` pass `MropeData{}` → scalar-RoPE fallback (images still decode correctly; only spatial grounding on large/counting tasks is softer). Those handlers (`handleAnthropicMessages`, `handleResponses`) compute `prompt_ids` + have the image grids but submit through sub-scopes where `computeQwenMrope`'s result isn't in scope. Thread it the same way the chat path does (compute after `insertMultimodalTokens`, hand off as `sub_mrope`, pass to the submit). Matters for Claude Code (Anthropic API) image use. **~half day.** Also: 35B (`mlx-community/Qwen3.6-35B-A3B-4bit`) untested — same arch as the validated 27B (head_dim 72), low risk; run `tests/test_qwen_vision.sh <35B>` to confirm. Multi-image per request also uses one `vision_start` block (single-image is the validated path).
 
+## Feature backlog
+
+15. **LTX audio-to-video (a2vid): make characters speak exact words.** Port the reference `a2vid_two_stage(_hq)` pipelines (`~/projects/agents/ltx-2-mlx/packages/ltx-pipelines-mlx/src/ltx_pipelines_mlx/a2vid_two_stage*.py`): the user supplies a speech/audio track and LTX generates video synced to it — voices, lip sync, and performance follow the audio, so the spoken words are guaranteed instead of hoping the joint DiT nails quoted dialogue. Pairs naturally with the native Qwen3-TTS engine (synthesize the line, then drive LTX with the WAV). API shape: an `audio` (base64 WAV) field on `/v1/video/generations`, mirroring the `first_frame_image` / TTS `ref_audio` precedents; the dev+distilled two-stage components it needs are already in the bundle. **Multi-day.**
+
 ## Deviations kept (no work)
 
 - **`Conn.writeAllNoFlush`** — kept (ws.zig uses the explicit-flush pattern). Removing requires a deeper `writeAll` semantics refactor.

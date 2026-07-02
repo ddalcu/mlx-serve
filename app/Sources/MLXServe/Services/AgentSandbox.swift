@@ -250,6 +250,55 @@ final class AgentSandbox: ObservableObject, @unchecked Sendable {
         var errorDescription: String? { message }
     }
 
+    // MARK: Sandbox background process control (guest-backed handles)
+
+    /// Guest-side command that stops process `pid`: SIGTERM, a brief grace, then
+    /// SIGKILL any survivor. The grace kill is backgrounded inside the guest (same
+    /// `(…) &` shape the background-launch wrapper uses) so the exec returns at
+    /// once. Pure + testable — the routing decision needs no live VM.
+    static func guestKillCommand(pid: Int32) -> String {
+        "kill -TERM \(pid) 2>/dev/null; (sleep 3; kill -KILL \(pid) 2>/dev/null) &"
+    }
+
+    /// Guest-side command that tails a background log (bounded to `maxBytes`). The
+    /// path is shell-quoted for the same reason `wrap` quotes the cwd.
+    static func guestReadLogCommand(logPath: String, maxBytes: Int = 65_536) -> String {
+        "tail -c \(maxBytes) \(VzGuest.shellQuote(logPath)) 2>/dev/null"
+    }
+
+    /// Stop a sandbox background process by its GUEST pid, inside the
+    /// ALREADY-BOOTED guest. NEVER boots one — if the guest is gone the process is
+    /// already dead, so there's nothing to kill. Called off the main thread by
+    /// `ProcessRegistry.kill` (the guest exec blocks).
+    func killGuestProcess(pid: Int32) {
+        guard pid > 0 else { return }
+        let g: VzGuest? = { bootLock.lock(); defer { bootLock.unlock() }; return guest }()
+        guard let g, !g.isFinished else { return }
+        let cmd = Self.guestKillCommand(pid: pid)
+        _ = try? g.exec(cmd, timeout: 10)
+        record(Entry(source: .system, command: cmd, output: "", exitCode: 0, at: Date()))
+    }
+
+    /// Read a sandbox background process's log from the ALREADY-BOOTED guest (never
+    /// boots one). Returns nil when no live guest exists — the caller then reports
+    /// the handle's status without log contents. Runs the blocking guest exec off
+    /// the main thread.
+    func tailGuestLog(logPath: String, timeout: Double = 15) async -> String? {
+        await withCheckedContinuation { (cont: CheckedContinuation<String?, Never>) in
+            DispatchQueue.global(qos: .userInitiated).async {
+                // Read the live guest INSIDE the hop (never boots one) so the
+                // non-Sendable VzGuest is never captured across the closure.
+                let g: VzGuest? = { self.bootLock.lock(); defer { self.bootLock.unlock() }; return self.guest }()
+                guard let g, !g.isFinished else { cont.resume(returning: nil); return }
+                if let r = try? g.exec(Self.guestReadLogCommand(logPath: logPath), timeout: timeout) {
+                    cont.resume(returning: TerminalOutput.sanitize(r.output))
+                } else {
+                    cont.resume(returning: nil)
+                }
+            }
+        }
+    }
+
     /// Run a foreground command in the sandbox. Boots + provisions lazily on first
     /// use. Returns output formatted like the host shell path (`ShellMessages`).
     /// Throws `SandboxError` when the guest can't be provisioned/booted — we do
@@ -266,10 +315,13 @@ final class AgentSandbox: ObservableObject, @unchecked Sendable {
                     let gp = Self.guestPath(hostPath: workingDirectory ?? hostCwd, sharedRoot: root)
                     let wrapped = Self.wrap(command: command, guestCwd: gp.path)
                     let r = try g.exec(wrapped, timeout: timeout)
-                    self.record(Entry(source: .agent, command: command, output: r.output,
+                    // hvc1 is a tty → tools emit ANSI color + progress animations;
+                    // strip them so the terminal AND the agent see clean text.
+                    let cleaned = TerminalOutput.sanitize(r.output)
+                    self.record(Entry(source: .agent, command: command, output: cleaned,
                                       exitCode: r.timedOut ? nil : r.exitCode,
                                       timedOut: r.timedOut, at: Date()))
-                    var body = r.output
+                    var body = cleaned
                     if !gp.mapped {
                         body = "[sandbox: cwd not under the shared folder; ran in /workspace]\n" + body
                     }
@@ -304,7 +356,7 @@ final class AgentSandbox: ObservableObject, @unchecked Sendable {
                 do {
                     let (g, _) = try self.ensureBooted(image: image, workingDirectory: root)
                     let r = try g.exec(trimmed, timeout: timeout)
-                    self.record(Entry(source: .user, command: trimmed, output: r.output,
+                    self.record(Entry(source: .user, command: trimmed, output: TerminalOutput.sanitize(r.output),
                                       exitCode: r.timedOut ? nil : r.exitCode,
                                       timedOut: r.timedOut, at: Date()))
                 } catch {

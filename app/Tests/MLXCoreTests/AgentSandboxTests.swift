@@ -29,6 +29,29 @@ final class AgentSandboxTests: XCTestCase {
         XCTAssertFalse(name.contains(".."))
     }
 
+    // MARK: guest background-process control (kill / log tail)
+
+    func testGuestKillCommandTargetsPidWithGraceKill() {
+        let cmd = AgentSandbox.guestKillCommand(pid: 4242)
+        XCTAssertTrue(cmd.contains("kill -TERM 4242"), cmd)
+        XCTAssertTrue(cmd.contains("kill -KILL 4242"), "must escalate to SIGKILL after a grace: \(cmd)")
+        XCTAssertTrue(cmd.contains("&"), "the grace kill must be backgrounded so the exec returns: \(cmd)")
+    }
+
+    func testGuestReadLogCommandTailsQuotedPath() {
+        let cmd = AgentSandbox.guestReadLogCommand(logPath: "/tmp/mlx-bg-1.log")
+        XCTAssertTrue(cmd.contains("tail -c"), cmd)
+        XCTAssertTrue(cmd.contains("'/tmp/mlx-bg-1.log'"), "path must be shell-quoted: \(cmd)")
+    }
+
+    /// With no live guest booted, the guest-kill / log-tail helpers are safe
+    /// no-ops (they must never boot a guest just to kill/read).
+    func testGuestControlHelpersAreNoopWithoutLiveGuest() async {
+        AgentSandbox.shared.killGuestProcess(pid: 12345) // must not crash / boot
+        let log = await AgentSandbox.shared.tailGuestLog(logPath: "/tmp/nope.log")
+        XCTAssertNil(log, "no live guest → nil log (never boots one)")
+    }
+
     // MARK: fallback shared root (no working directory supplied)
 
     func testFallbackSharedRootIsTheSessionWorkspaceNeverHomeOrCwd() {

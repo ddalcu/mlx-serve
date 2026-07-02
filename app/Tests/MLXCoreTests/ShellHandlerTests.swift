@@ -212,10 +212,11 @@ final class ShellHandlerTests: XCTestCase {
                        .hostForeground)
     }
 
-    func testSandboxBackgroundCommandWrapsDetachedWithLog() {
+    func testSandboxBackgroundCommandWrapsDetachedWithLogAndEchoesPid() {
         let wrapped = ShellHandler.sandboxBackgroundCommand("python3 -m http.server 8080",
                                                             logPath: "/tmp/mlx-bg-1.log")
-        XCTAssertEqual(wrapped, "(python3 -m http.server 8080) </dev/null >>/tmp/mlx-bg-1.log 2>&1 &")
+        XCTAssertEqual(wrapped,
+            "(python3 -m http.server 8080) </dev/null >>/tmp/mlx-bg-1.log 2>&1 & echo __CTN_BGPID=$!")
     }
 
     func testSandboxBackgroundLogPathIsUniquePerInvocation() {
@@ -224,5 +225,47 @@ final class ShellHandlerTests: XCTestCase {
         XCTAssertTrue(a.hasPrefix("/tmp/mlx-bg-"), a)
         XCTAssertTrue(a.hasSuffix(".log"), a)
         XCTAssertNotEqual(a, b, "each invocation needs its own guest log file")
+    }
+
+    func testParseSandboxBackgroundPID() {
+        // The marker line the wrapper echoes, wrapped in the completed-message shape.
+        XCTAssertEqual(ShellHandler.parseSandboxBackgroundPID("[cwd: /w]\n__CTN_BGPID=4242\n"), 4242)
+        XCTAssertEqual(ShellHandler.parseSandboxBackgroundPID("__CTN_BGPID=7"), 7)
+        XCTAssertNil(ShellHandler.parseSandboxBackgroundPID("no marker here"))
+        XCTAssertNil(ShellHandler.parseSandboxBackgroundPID("__CTN_BGPID=\n"), "empty pid → nil")
+    }
+
+    /// The guest-backed registration seam: given the parsed guest pid it registers
+    /// a SANDBOX process, surfaces its handle on the handleBox (drives the card's
+    /// running badge + kill X), and the message names the handle + log — no live
+    /// VM required.
+    @MainActor
+    func testRegisterSandboxBackgroundSetsHandleBoxAndRegisters() async {
+        let reg = ProcessRegistry(); defer { reg.killAll() }
+        let box = ProcessHandleBox()
+        let handler = ShellHandler(registry: reg, handleBox: box)
+        let msg = await handler.registerSandboxBackground(
+            command: "python3 -m http.server 8080", guestPID: 4242,
+            logPath: "/tmp/mlx-bg-1.log", cwd: "/work")
+        XCTAssertEqual(box.handle, "bg1", "the guest bg process must be surfaced on the handleBox")
+        XCTAssertTrue(msg.contains("bg1"), msg)
+        XCTAssertTrue(msg.contains("/tmp/mlx-bg-1.log"), msg)
+        XCTAssertTrue(msg.contains("readProcessOutput") && msg.contains("killProcess"), msg)
+        let entry = reg.list(sessionId: nil).first
+        XCTAssertEqual(entry?.pid, 4242, "the guest pid must be tracked")
+        XCTAssertTrue(entry?.isSandboxed ?? false, "the entry must be a sandbox (guest-backed) process")
+        XCTAssertTrue(reg.isAlive(handle: "bg1"))
+    }
+
+    /// With no registry (older call sites / unit tests) the sandbox background
+    /// path degrades to the log-only message — no handle, no crash.
+    func testRegisterSandboxBackgroundWithoutRegistryFallsBack() async {
+        let box = ProcessHandleBox()
+        let handler = ShellHandler(handleBox: box)
+        let msg = await handler.registerSandboxBackground(
+            command: "srv", guestPID: 5, logPath: "/tmp/x.log", cwd: "/work")
+        XCTAssertNil(box.handle)
+        XCTAssertTrue(msg.contains("/tmp/x.log"), msg)
+        XCTAssertFalse(msg.contains("readProcessOutput"), "no handle → no poll/kill guidance: \(msg)")
     }
 }

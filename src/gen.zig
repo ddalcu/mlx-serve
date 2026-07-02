@@ -371,13 +371,24 @@ const LTX_PAD_LEN: usize = 256; // gemma left-pad length
 const LTX_PAD_ID: i32 = 0; // gemma <pad>
 const LTX_GEMMA_BOS: i32 = 2; // <bos>
 
-// Trimmed DEFAULT_NEGATIVE_PROMPT — left-pad truncates from the left anyway.
+// Reference DEFAULT_NEGATIVE_PROMPT, verbatim. The audio tail (lip sync,
+// muted/distorted voice, background noise, dialogue terms) is load-bearing
+// for speech when audio CFG runs; if the whole thing ever exceeds
+// LTX_PAD_LEN, ltxPadWithBos left-truncates and keeps that tail.
 const LTX_NEGATIVE_PROMPT =
     "blurry, out of focus, overexposed, underexposed, low contrast, washed out colors, " ++
     "excessive noise, grainy texture, poor lighting, flickering, motion blur, distorted " ++
-    "proportions, unnatural skin tones, deformed facial features, extra limbs, disfigured " ++
-    "hands, inconsistent perspective, camera shake, color banding, cartoonish rendering, " ++
-    "3D CGI look, unrealistic materials, uncanny valley effect, exaggerated expressions";
+    "proportions, unnatural skin tones, deformed facial features, asymmetrical face, " ++
+    "missing facial features, extra limbs, disfigured hands, wrong hand count, artifacts " ++
+    "around text, inconsistent perspective, camera shake, incorrect depth of field, " ++
+    "background too sharp, background clutter, distracting reflections, harsh shadows, " ++
+    "inconsistent lighting direction, color banding, cartoonish rendering, 3D CGI look, " ++
+    "unrealistic materials, uncanny valley effect, incorrect ethnicity, wrong gender, " ++
+    "exaggerated expressions, wrong gaze direction, mismatched lip sync, silent or muted " ++
+    "audio, distorted voice, robotic voice, echo, background noise, off-sync audio, " ++
+    "incorrect dialogue, added dialogue, repetitive speech, jittery movement, awkward " ++
+    "pauses, incorrect timing, unnatural transitions, inconsistent framing, tilted camera, " ++
+    "flat lighting, inconsistent tone, cinematic oversaturation, stylized filters, or AI artifacts.";
 
 /// LTX transformer variants: DEV (non-distilled, needs CFG — two-stage stage 1)
 /// vs DISTILLED (guidance baked in — one-stage + two-stage stage 2).
@@ -1550,6 +1561,28 @@ test "videoGuiderDefaults mirrors the reference per-pipeline guidance" {
     try testing.expectEqual(@as(u32, 15), hq.stage1_steps_default);
     const hq_stg = videoGuiderDefaults(.two_stage_hq, null, null, 1.0);
     try testing.expect(!hq_stg.vp.needsPerturbed()); // no blocks → no perturbed forward
+}
+
+test "LTX negative prompt keeps the reference audio negatives (speech guidance)" {
+    // The audio tail of the reference DEFAULT_NEGATIVE_PROMPT does real work
+    // for dialogue: with audio CFG active (two-stage, ap.cfg=7.0) these terms
+    // push the soundtrack away from ambient noise toward clean speech. A
+    // trimmed copy that keeps only the visual head silently weakens speech.
+    // Overflow is safe: ltxPadWithBos left-truncates, keeping this tail.
+    const audio_negatives = [_][]const u8{
+        "mismatched lip sync",
+        "silent or muted audio",
+        "distorted voice",
+        "robotic voice",
+        "background noise",
+        "off-sync audio",
+        "incorrect dialogue",
+        "added dialogue",
+        "repetitive speech",
+    };
+    for (audio_negatives) |term| {
+        try testing.expect(std.mem.indexOf(u8, LTX_NEGATIVE_PROMPT, term) != null);
+    }
 }
 
 test "fileExists guards non-absolute paths (openFileAbsolute UB class)" {

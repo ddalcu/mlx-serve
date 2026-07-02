@@ -20,23 +20,32 @@ enum ProcessStatus: Equatable {
 /// per-chunk publish would re-render `ChatView` during the SSE token loop.
 @MainActor
 final class ManagedProcess: Identifiable {
+    /// A managed process is EITHER a real host `Process` (retained so status comes
+    /// from `terminationHandler`, never `kill(pid,0)` — avoids PID-reuse ambiguity
+    /// and zombie/fd leaks) OR a background command running INSIDE the Agent
+    /// Sandbox guest, which owns no host `Process` — only a guest pid + the log
+    /// file the guest appends its output to. The two share the same handle/status
+    /// machinery so the chat card renders the running badge + kill X identically.
+    enum Kind {
+        case host(Process)
+        case sandbox(logPath: String)
+    }
+
     let handle: String          // monotonic "bg1", "bg2", …
-    fileprivate(set) var pid: Int32
+    fileprivate(set) var pid: Int32   // host pid, or the GUEST pid for a sandbox entry
     let label: String           // first token of the command (for compact UI)
     let command: String
     let sessionId: UUID?
     let startedAt: Date
     fileprivate(set) var status: ProcessStatus
-    /// Retained so status comes from `terminationHandler`, never `kill(pid,0)` —
-    /// avoids PID-reuse ambiguity and zombie/fd leaks.
-    fileprivate let process: Process
+    fileprivate let kind: Kind
     let output: ProcessOutputBuffer
 
     nonisolated var id: String { handle }
 
     init(handle: String, pid: Int32, label: String, command: String,
          sessionId: UUID?, startedAt: Date, status: ProcessStatus,
-         process: Process, output: ProcessOutputBuffer) {
+         kind: Kind, output: ProcessOutputBuffer) {
         self.handle = handle
         self.pid = pid
         self.label = label
@@ -44,8 +53,30 @@ final class ManagedProcess: Identifiable {
         self.sessionId = sessionId
         self.startedAt = startedAt
         self.status = status
-        self.process = process
+        self.kind = kind
         self.output = output
+    }
+
+    /// The retained host `Process`, or nil for a sandbox (guest-backed) entry.
+    fileprivate var hostProcess: Process? {
+        if case .host(let p) = kind { return p }
+        return nil
+    }
+
+    /// True when this entry is a background command running inside the sandbox
+    /// guest (killed via a guest `kill`, output tailed from a guest log).
+    var isSandboxed: Bool {
+        if case .sandbox = kind { return true }
+        return false
+    }
+
+    /// The guest pid for a sandbox entry (nil for a host entry).
+    var guestPID: Int32? { isSandboxed ? pid : nil }
+
+    /// The guest log path a sandbox entry appends its output to (nil for host).
+    var logPath: String? {
+        if case .sandbox(let lp) = kind { return lp }
+        return nil
     }
 
     var statusLabel: String {
@@ -197,7 +228,7 @@ final class ProcessRegistry: ObservableObject {
         let managed = ManagedProcess(
             handle: handle, pid: 0, label: Self.commandLabel(command), command: command,
             sessionId: sessionId, startedAt: Date(), status: .running,
-            process: process, output: buffer)
+            kind: .host(process), output: buffer)
 
         attachCapture(process: process, buffer: buffer)
         process.terminationHandler = { [weak self] proc in
@@ -230,7 +261,7 @@ final class ProcessRegistry: ObservableObject {
         let managed = ManagedProcess(
             handle: handle, pid: process.processIdentifier, label: Self.commandLabel(command),
             command: command, sessionId: sessionId, startedAt: Date(), status: .running,
-            process: process, output: buffer)
+            kind: .host(process), output: buffer)
 
         attachCapture(process: process, buffer: buffer)
         process.terminationHandler = { [weak self] proc in
@@ -241,6 +272,23 @@ final class ProcessRegistry: ObservableObject {
         if !process.isRunning {
             managed.status = .exited(process.terminationStatus)
         }
+        processes.append(managed)
+        return managed
+    }
+
+    /// Register a background command running INSIDE the Agent Sandbox guest.
+    /// There's no host `Process` to retain — the guest owns the real process; we
+    /// track its guest pid (for a guest `kill`) and the log file it appends to
+    /// (for `readProcessOutput` to tail). Returns immediately with a `bgN` handle
+    /// so the chat card shows the SAME running badge + kill X as a host process.
+    func registerSandboxed(command: String, guestPID: Int32, logPath: String,
+                           sessionId: UUID?) -> ManagedProcess {
+        counter += 1
+        let handle = "bg\(counter)"
+        let managed = ManagedProcess(
+            handle: handle, pid: guestPID, label: Self.commandLabel(command), command: command,
+            sessionId: sessionId, startedAt: Date(), status: .running,
+            kind: .sandbox(logPath: logPath), output: ProcessOutputBuffer())
         processes.append(managed)
         return managed
     }
@@ -261,6 +309,13 @@ final class ProcessRegistry: ObservableObject {
         processes.first { $0.handle == handle }?.output.readNew()
     }
 
+    /// The guest log path for a sandbox-backed handle, or nil for a host handle /
+    /// unknown handle. `readProcessOutput` uses it to tail the guest log (a host
+    /// entry keeps its in-process capture buffer instead).
+    func sandboxLogPath(handle: String) -> String? {
+        processes.first { $0.handle == handle }?.logPath
+    }
+
     // MARK: - Kill
 
     /// Graceful stop of the WHOLE process subtree. A tracked server often spawns
@@ -272,7 +327,21 @@ final class ProcessRegistry: ObservableObject {
     /// descendant, then SIGKILL any survivor after a bounded grace.
     func kill(handle: String) {
         guard let p = processes.first(where: { $0.handle == handle }), p.status.isAlive else { return }
-        let proc = p.process
+
+        // Sandbox (guest-backed) entry: no host Process — route a `kill` INSIDE
+        // the guest (SIGTERM → grace → SIGKILL) off the main thread. Flip status
+        // synchronously so the card's badge + X clear at once (the guest kill is
+        // fire-and-forget; if the guest is already gone the process is too).
+        guard let proc = p.hostProcess else {
+            objectWillChange.send()
+            p.status = .killed
+            let guestPID = p.pid
+            DispatchQueue.global(qos: .utility).async {
+                AgentSandbox.shared.killGuestProcess(pid: guestPID)
+            }
+            return
+        }
+
         let leaderPid = proc.processIdentifier
         // Snapshot the subtree before any signal perturbs it.
         let tree = leaderPid > 0 ? [leaderPid] + Self.descendantPids(of: leaderPid) : []

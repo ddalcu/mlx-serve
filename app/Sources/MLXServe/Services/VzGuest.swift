@@ -80,6 +80,82 @@ enum ShellSentinel {
     }
 }
 
+// MARK: - Terminal output sanitizing (pure — unit tested)
+
+/// The sandbox shell runs on a real tty (hvc1), so CLI tools detect an
+/// interactive terminal and emit ANSI color codes + cursor-move progress
+/// animations (npm's braille spinner, `\e[1G\e[0K` line rewrites, curl's
+/// `\e[1m…\e[0m` bold headers). The host path uses a pipe, so tools stay
+/// quiet — this brings the guest to the same clean text for BOTH the Sandbox
+/// Terminal display and the text handed back to the agent.
+enum TerminalOutput {
+    /// Strip ANSI escape sequences and resolve carriage-return / cursor-to-
+    /// column-1 overwrites so only the final content of each line remains.
+    static func sanitize(_ raw: String) -> String {
+        let scalars = Array(raw.unicodeScalars)
+        var out: [Unicode.Scalar] = []
+        out.reserveCapacity(scalars.count)
+        let esc: Unicode.Scalar = "\u{1B}"
+        let bel: Unicode.Scalar = "\u{07}"
+        var i = 0
+        while i < scalars.count {
+            let c = scalars[i]
+            if c == esc {
+                i += 1
+                guard i < scalars.count else { break }
+                let kind = scalars[i]
+                if kind == "[" { // CSI: ESC [ params … final (0x40–0x7E)
+                    i += 1
+                    var params = ""
+                    while i < scalars.count, !(scalars[i].value >= 0x40 && scalars[i].value <= 0x7E) {
+                        params.unicodeScalars.append(scalars[i]); i += 1
+                    }
+                    let final: Unicode.Scalar? = i < scalars.count ? scalars[i] : nil
+                    i += 1
+                    // Cursor-horizontal-absolute (…G) means "return to column N";
+                    // treat it (and column-1 specifically) as a carriage return so
+                    // the line-collapse below discards the overwritten prefix.
+                    if final == "G" { out.append("\r") }
+                    // Every other CSI (color `m`, erase `K`/`J`, cursor moves) is
+                    // dropped — no textual content.
+                } else if kind == "]" { // OSC: ESC ] … (BEL | ESC \)
+                    i += 1
+                    while i < scalars.count {
+                        if scalars[i] == bel { i += 1; break }
+                        if scalars[i] == esc, i + 1 < scalars.count, scalars[i + 1] == "\\" { i += 2; break }
+                        i += 1
+                    }
+                } else {
+                    // Other escapes: optional intermediate bytes (0x20–0x2F, e.g.
+                    // the `(` in the charset-designator `ESC ( B`) then one final
+                    // byte. Drop the whole run.
+                    while i < scalars.count, scalars[i].value >= 0x20, scalars[i].value <= 0x2F { i += 1 }
+                    if i < scalars.count { i += 1 }
+                }
+                continue
+            }
+            out.append(c); i += 1
+        }
+        // Normalize CRLF → LF FIRST: the guest tty is ONLCR, so every real
+        // newline arrives as `\r\n`. Without this the per-line \r-collapse below
+        // treats that trailing `\r` as an overwrite and wipes the line content
+        // (live regression: `echo a; uname; pwd` came back as one run-on line).
+        let normalized = String(String.UnicodeScalarView(out)).replacingOccurrences(of: "\r\n", with: "\n")
+        // Resolve bare carriage-return overwrites per line: within each
+        // \n-delimited line, only the text after the LAST \r survives (a real
+        // terminal reprints from column 0). Also drop any other C0 control bytes.
+        var result = ""
+        for (idx, line) in normalized.split(separator: "\n", omittingEmptySubsequences: false).enumerated() {
+            if idx > 0 { result.append("\n") }
+            let collapsed = line.split(separator: "\r", omittingEmptySubsequences: false).last.map(String.init) ?? ""
+            for ch in collapsed.unicodeScalars where ch.value >= 0x20 || ch == "\t" {
+                result.unicodeScalars.append(ch)
+            }
+        }
+        return result
+    }
+}
+
 // MARK: - Thread-safe console buffer
 
 /// Accumulates guest console bytes delivered by pipe readability handlers (which

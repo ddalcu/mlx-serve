@@ -198,6 +198,21 @@ enum SandboxSmoke {
                     else { log("[smoke]   ✗ port map: localhost:\(port) did not reach the guest server"); ok = false }
                 }
 
+                // Phase 4b: ANSI sanitize — a real tty makes tools emit color +
+                // cursor escapes; the recorded transcript must be clean text.
+                log("[smoke] phase 4b: terminal control-sequence sanitize…")
+                syncAwait { await AgentSandbox.shared.runUserCommand("printf '\\033[31mRED\\033[0m \\033[1mBOLD\\033[0m done\\n'") }
+                var sane: Bool?
+                let saneDeadline = Date().addingTimeInterval(3)
+                while Date() < saneDeadline && sane == nil {
+                    RunLoop.main.run(until: Date().addingTimeInterval(0.1))
+                    if let e = AgentSandbox.shared.transcript.last(where: { $0.command.contains("printf") }) {
+                        sane = e.output.contains("RED BOLD done") && !e.output.contains("\u{1B}") && !e.output.contains("[31m")
+                    }
+                }
+                if sane == true { log("[smoke]   ✓ ANSI escapes stripped (clean transcript text)") }
+                else { log("[smoke]   ✗ ANSI sanitize failed (escapes leaked into the transcript)"); ok = false }
+
                 // Tray RAM readout: the guest's /proc/meminfo report must have
                 // produced a published display string by now (@Published lands
                 // on the main queue — pump it like the transcript check above).

@@ -107,4 +107,53 @@ final class ShellSentinelTests: XCTestCase {
         XCTAssertEqual(r?.output, "line1\n\nline3\n", "only the injected newline stripped; interior + own newlines preserved")
         XCTAssertEqual(r?.code, 0)
     }
+
+    // MARK: terminal control-sequence sanitizing
+
+    private let ESC = "\u{1B}"
+
+    func testSanitizeStripsColorAndKeepsText() {
+        // curl -I header line: `\e[1mX-Powered-By\e[0m: Express`
+        let raw = "\(ESC)[1mX-Powered-By\(ESC)[0m: Express"
+        XCTAssertEqual(TerminalOutput.sanitize(raw), "X-Powered-By: Express")
+    }
+
+    func testSanitizeCollapsesNpmSpinnerStorm() {
+        // npm's progress: repeated `\e[1G\e[0K<frame>` (cursor col 1 + clear
+        // line), with braille spinner frames, ending in the real message.
+        let ESC = self.ESC
+        var raw = ""
+        for f in ["⠙", "⠹", "⠸", "⠼"] { raw += "\(ESC)[1G\(ESC)[0K\(f)" }
+        raw += "\(ESC)[1G\(ESC)[0Kadded 67 packages in 3s\n"
+        let out = TerminalOutput.sanitize(raw)
+        // Only the final overwrite of the line survives — no braille, no escapes.
+        XCTAssertEqual(out, "added 67 packages in 3s\n")
+        XCTAssertFalse(out.contains("⠙"))
+        XCTAssertFalse(out.contains("\(ESC)"))
+        XCTAssertFalse(out.contains("[1G"))
+    }
+
+    func testSanitizeHandlesBareCarriageReturnProgress() {
+        // A `\r`-overwriting progress bar (no escapes): last write wins per line.
+        let raw = "downloading  10%\rdownloading  55%\rdownloading 100%\ndone\n"
+        XCTAssertEqual(TerminalOutput.sanitize(raw), "downloading 100%\ndone\n")
+    }
+
+    func testSanitizeStripsOscTitleAndLoneEscapes() {
+        let ESC = self.ESC
+        let raw = "\(ESC)]0;my title\u{07}hello\(ESC)(Bworld"
+        XCTAssertEqual(TerminalOutput.sanitize(raw), "helloworld")
+    }
+
+    func testSanitizeIsIdentityOnPlainText() {
+        let plain = "just plain output\nwith two lines\n"
+        XCTAssertEqual(TerminalOutput.sanitize(plain), plain)
+    }
+
+    func testSanitizeNormalizesCrlfWithoutEatingLines() {
+        // The guest tty is ONLCR: every \n arrives as \r\n. The trailing \r must
+        // NOT be treated as a line-overwrite (that ran multiple lines together).
+        let raw = "ROUTED_12\r\nLinux\r\n/workspace\r\n"
+        XCTAssertEqual(TerminalOutput.sanitize(raw), "ROUTED_12\nLinux\n/workspace\n")
+    }
 }

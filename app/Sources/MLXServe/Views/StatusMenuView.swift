@@ -505,7 +505,7 @@ struct StatusMenuView: View {
                             // guestMemoryText is quantized + published only on
                             // change, so this row doesn't re-render per second.
                             Text(sandbox.guestRunning
-                                 ? "Guest running" + (sandbox.guestMemoryText.map { " · \($0)" } ?? "") + " — open the terminal"
+                                 ? "Guest running" + (sandbox.guestMemoryText.map { " · \($0)" } ?? "")
                                  : "Idle — boots on the first command")
                                 .font(.caption2).foregroundStyle(.secondary)
                         }

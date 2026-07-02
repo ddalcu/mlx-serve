@@ -14,18 +14,18 @@ final class ProcessToolDispatchTests: XCTestCase {
         }
     }
 
-    func testListProcessesListsRunning() {
+    func testListProcessesListsRunning() async {
         let reg = ProcessRegistry(); defer { reg.killAll() }
         let sid = UUID()
         let p = reg.start(command: "sleep 5", workingDirectory: nil, sessionId: sid)
-        let out = AgentEngine.processToolOutput(.listProcesses, arguments: [:], registry: reg, sessionId: sid)
+        let out = await AgentEngine.processToolOutput(.listProcesses, arguments: [:], registry: reg, sessionId: sid)
         XCTAssertTrue(out.contains(p.handle), out)
         XCTAssertTrue(out.contains("running"), out)
     }
 
-    func testListProcessesEmpty() {
+    func testListProcessesEmpty() async {
         let reg = ProcessRegistry()
-        let out = AgentEngine.processToolOutput(.listProcesses, arguments: [:], registry: reg, sessionId: UUID())
+        let out = await AgentEngine.processToolOutput(.listProcesses, arguments: [:], registry: reg, sessionId: UUID())
         XCTAssertTrue(out.contains("No background processes"), out)
     }
 
@@ -33,38 +33,75 @@ final class ProcessToolDispatchTests: XCTestCase {
         let reg = ProcessRegistry(); defer { reg.killAll() }
         let p = reg.start(command: "echo hi-there; exec sleep 5", workingDirectory: nil, sessionId: nil)
         await waitUntil { p.output.snapshot().contains("hi-there") }
-        let out = AgentEngine.processToolOutput(.readProcessOutput, arguments: ["handle": p.handle],
-                                                registry: reg, sessionId: nil)
+        let out = await AgentEngine.processToolOutput(.readProcessOutput, arguments: ["handle": p.handle],
+                                                      registry: reg, sessionId: nil)
         XCTAssertTrue(out.contains("hi-there"), out)
     }
 
-    func testReadProcessOutputUnknownHandleErrors() {
+    func testReadProcessOutputUnknownHandleErrors() async {
         let reg = ProcessRegistry()
-        let out = AgentEngine.processToolOutput(.readProcessOutput, arguments: ["handle": "bgX"],
-                                                registry: reg, sessionId: nil)
+        let out = await AgentEngine.processToolOutput(.readProcessOutput, arguments: ["handle": "bgX"],
+                                                      registry: reg, sessionId: nil)
         XCTAssertTrue(out.hasPrefix("Error:"), out)
         XCTAssertTrue(out.contains("bgX"), out)
     }
 
-    func testKillProcessKills() {
+    func testKillProcessKills() async {
         let reg = ProcessRegistry(); defer { reg.killAll() }
         let p = reg.start(command: "sleep 30", workingDirectory: nil, sessionId: nil)
-        let out = AgentEngine.processToolOutput(.killProcess, arguments: ["handle": p.handle],
-                                                registry: reg, sessionId: nil)
+        let out = await AgentEngine.processToolOutput(.killProcess, arguments: ["handle": p.handle],
+                                                      registry: reg, sessionId: nil)
         XCTAssertTrue(out.contains("Killed"), out)
         XCTAssertFalse(reg.isAlive(handle: p.handle))
     }
 
-    func testKillProcessUnknownHandleErrors() {
+    func testKillProcessUnknownHandleErrors() async {
         let reg = ProcessRegistry()
-        let out = AgentEngine.processToolOutput(.killProcess, arguments: ["handle": "bgX"],
-                                                registry: reg, sessionId: nil)
+        let out = await AgentEngine.processToolOutput(.killProcess, arguments: ["handle": "bgX"],
+                                                      registry: reg, sessionId: nil)
         XCTAssertTrue(out.hasPrefix("Error:"), out)
     }
 
-    func testProcessToolsWithoutRegistryAreGraceful() {
-        let out = AgentEngine.processToolOutput(.listProcesses, arguments: [:], registry: nil, sessionId: nil)
+    func testProcessToolsWithoutRegistryAreGraceful() async {
+        let out = await AgentEngine.processToolOutput(.listProcesses, arguments: [:], registry: nil, sessionId: nil)
         XCTAssertTrue(out.hasPrefix("Error:"), out)
+    }
+
+    // MARK: - Sandbox (guest-backed) background handles
+
+    /// A sandbox-registered handle lists like any other running process.
+    func testListProcessesIncludesSandboxHandle() async {
+        let reg = ProcessRegistry(); defer { reg.killAll() }
+        let sid = UUID()
+        let p = reg.registerSandboxed(command: "python3 -m http.server 8080",
+                                      guestPID: 4242, logPath: "/tmp/mlx-bg-1.log", sessionId: sid)
+        let out = await AgentEngine.processToolOutput(.listProcesses, arguments: [:], registry: reg, sessionId: sid)
+        XCTAssertTrue(out.contains(p.handle), out)
+        XCTAssertTrue(out.contains("4242"), "guest pid should be listed: \(out)")
+    }
+
+    /// readProcessOutput on a sandbox handle resolves the handle (never "unknown")
+    /// and names the guest log even when no live guest is up to tail it.
+    func testReadProcessOutputSandboxHandleResolvesAndNamesLog() async {
+        let reg = ProcessRegistry(); defer { reg.killAll() }
+        let p = reg.registerSandboxed(command: "srv", guestPID: 99,
+                                      logPath: "/tmp/mlx-bg-x.log", sessionId: nil)
+        let out = await AgentEngine.processToolOutput(.readProcessOutput, arguments: ["handle": p.handle],
+                                                      registry: reg, sessionId: nil)
+        XCTAssertFalse(out.hasPrefix("Error:"), out)
+        XCTAssertTrue(out.contains("/tmp/mlx-bg-x.log") || out.contains(p.handle), out)
+    }
+
+    /// killProcess on a sandbox handle flips it dead (routes a guest kill).
+    func testKillProcessSandboxHandleFlipsKilled() async {
+        let reg = ProcessRegistry(); defer { reg.killAll() }
+        let p = reg.registerSandboxed(command: "srv", guestPID: 123,
+                                      logPath: "/tmp/mlx-bg-y.log", sessionId: nil)
+        XCTAssertTrue(reg.isAlive(handle: p.handle))
+        let out = await AgentEngine.processToolOutput(.killProcess, arguments: ["handle": p.handle],
+                                                      registry: reg, sessionId: nil)
+        XCTAssertTrue(out.contains("Killed"), out)
+        XCTAssertFalse(reg.isAlive(handle: p.handle))
     }
 
     // MARK: - Schema validation + name resolution

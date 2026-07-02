@@ -74,13 +74,17 @@ struct ShellHandler: ToolHandler {
             // the host ProcessRegistry (that executes on the host, defeating the
             // isolation the user opted into). Background it INSIDE the guest —
             // detached from the shell channel, output appended to a
-            // per-invocation log the model can tail with later shell calls.
+            // per-invocation log — then register it as a GUEST-backed managed
+            // process so the chat card shows the SAME running badge + kill X and
+            // readProcessOutput/killProcess work exactly like a host bg process.
             let logPath = Self.sandboxBackgroundLogPath()
-            let wrapped = Self.sandboxBackgroundCommand(
-                Self.stripTrailingBackgroundOperator(command), logPath: logPath)
-            _ = try await AgentSandbox.shared.runForeground(
+            let stripped = Self.stripTrailingBackgroundOperator(command)
+            let wrapped = Self.sandboxBackgroundCommand(stripped, logPath: logPath)
+            let execOut = try await AgentSandbox.shared.runForeground(
                 command: wrapped, workingDirectory: workingDirectory, timeout: timeoutSeconds)
-            return ShellMessages.sandboxBackgroundStarted(cwd: cwd, logPath: logPath)
+            let pid = Self.parseSandboxBackgroundPID(execOut) ?? 0
+            return await registerSandboxBackground(command: stripped, guestPID: pid,
+                                                    logPath: logPath, cwd: cwd)
         case .sandboxForeground:
             // Sandbox ON: run inside the isolated Linux guest. A trailing `&`
             // rides through unchanged — the guest shell backgrounds it itself.
@@ -119,9 +123,23 @@ struct ShellHandler: ToolHandler {
     /// Wrap a command so the GUEST shell backgrounds it: detached from stdin
     /// (the shell channel) with all output appended to `logPath` inside the
     /// guest, so the foreground exec returns immediately and the sentinel
-    /// framing stays clean.
+    /// framing stays clean. Echoes the backgrounded job's guest pid on a marker
+    /// line (`__CTN_BGPID=$!`) so the tool can track + kill it like a host bg
+    /// process (parsed back out by `parseSandboxBackgroundPID`).
     static func sandboxBackgroundCommand(_ command: String, logPath: String) -> String {
-        "(\(command)) </dev/null >>\(logPath) 2>&1 &"
+        "(\(command)) </dev/null >>\(logPath) 2>&1 & echo __CTN_BGPID=$!"
+    }
+
+    /// Marker prefix the background wrapper echoes the guest pid on.
+    static let sandboxBGPIDMarker = "__CTN_BGPID="
+
+    /// Pull the guest pid out of the background-launch exec output (the
+    /// `__CTN_BGPID=<pid>` marker line). nil when absent or unparsable — the
+    /// process is still tracked, just without a pid for a guest `kill`.
+    static func parseSandboxBackgroundPID(_ output: String) -> Int32? {
+        guard let range = output.range(of: sandboxBGPIDMarker) else { return nil }
+        let digits = output[range.upperBound...].prefix { $0.isNumber }
+        return Int32(digits)
     }
 
     /// Per-invocation guest log path (millisecond timestamp) so concurrent /
@@ -149,6 +167,27 @@ struct ShellHandler: ToolHandler {
         }
         handleBox?.set(info.handle)
         return ShellMessages.started(cwd: cwd, handle: info.handle, pid: info.pid)
+    }
+
+    /// Register a guest-backed background process with the registry, surface its
+    /// handle on `handleBox` (so the card renders the running badge + kill X), and
+    /// shape the start message. Split out of the `.sandboxBackground` branch so it
+    /// is testable without a live guest: given the parsed guest pid it does the
+    /// registration + messaging. No registry (older call sites / unit tests) →
+    /// today's log-only message, no handle.
+    func registerSandboxBackground(command: String, guestPID: Int32,
+                                   logPath: String, cwd: String) async -> String {
+        guard let registry else {
+            return ShellMessages.sandboxBackgroundStarted(cwd: cwd, handle: nil,
+                                                          logPath: logPath, pid: guestPID)
+        }
+        let handle = await MainActor.run {
+            registry.registerSandboxed(command: command, guestPID: guestPID,
+                                       logPath: logPath, sessionId: sessionId).handle
+        }
+        handleBox?.set(handle)
+        return ShellMessages.sandboxBackgroundStarted(cwd: cwd, handle: handle,
+                                                      logPath: logPath, pid: guestPID)
     }
 
     /// Lenient truthy read for a string-typed boolean tool flag. Tool arguments
@@ -299,8 +338,11 @@ enum ShellMessages {
         "[cwd: \(cwd)]\nStarted in background as \(handle) (pid \(pid)). It keeps running — poll it with readProcessOutput {\"handle\": \"\(handle)\"}, stop it with killProcess {\"handle\": \"\(handle)\"}."
     }
 
-    static func sandboxBackgroundStarted(cwd: String, logPath: String) -> String {
-        "[cwd: \(cwd)]\nStarted in the SANDBOX background (isolated Linux guest). Output is appended to \(logPath) inside the guest — check on it with the shell tool, e.g. {\"command\": \"tail -n 50 \(logPath)\"}. readProcessOutput/killProcess do not apply to sandboxed background commands; stop it with a shell kill inside the guest."
+    static func sandboxBackgroundStarted(cwd: String, handle: String?, logPath: String, pid: Int32) -> String {
+        if let handle {
+            return "[cwd: \(cwd)]\nStarted in the SANDBOX background (isolated Linux guest) as \(handle) (guest pid \(pid)). It keeps running — poll it with readProcessOutput {\"handle\": \"\(handle)\"}, stop it with killProcess {\"handle\": \"\(handle)\"}. Its output is also appended to \(logPath) inside the guest."
+        }
+        return "[cwd: \(cwd)]\nStarted in the SANDBOX background (isolated Linux guest). Output is appended to \(logPath) inside the guest — check on it with the shell tool, e.g. {\"command\": \"tail -n 50 \(logPath)\"}."
     }
 
     static func backgroundUnavailable(cwd: String, seconds: Int) -> String {

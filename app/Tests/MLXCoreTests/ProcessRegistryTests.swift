@@ -112,6 +112,64 @@ final class ProcessRegistryTests: XCTestCase {
         try? FileManager.default.removeItem(atPath: pidFile)
     }
 
+    // MARK: - Sandbox (guest-backed) entries — no host Process
+
+    func testRegisterSandboxedAppendsRunningHandle() async {
+        let reg = ProcessRegistry(); defer { reg.killAll() }
+        let p = reg.registerSandboxed(command: "python3 -m http.server 8080",
+                                      guestPID: 4242, logPath: "/tmp/mlx-bg-1.log", sessionId: nil)
+        XCTAssertEqual(p.handle, "bg1")
+        XCTAssertEqual(p.status, .running)
+        XCTAssertEqual(p.pid, 4242, "the tracked pid is the GUEST pid")
+        XCTAssertTrue(p.isSandboxed)
+        XCTAssertEqual(p.guestPID, 4242)
+        XCTAssertEqual(reg.sandboxLogPath(handle: "bg1"), "/tmp/mlx-bg-1.log")
+        XCTAssertTrue(reg.isAlive(handle: "bg1"))
+        XCTAssertEqual(reg.list(sessionId: nil).count, 1)
+    }
+
+    func testSandboxLogPathIsNilForHostEntry() async {
+        let reg = ProcessRegistry(); defer { reg.killAll() }
+        let p = reg.start(command: "sleep 5", workingDirectory: nil, sessionId: nil)
+        XCTAssertFalse(p.isSandboxed)
+        XCTAssertNil(p.guestPID)
+        XCTAssertNil(reg.sandboxLogPath(handle: p.handle), "a host entry has no guest log")
+    }
+
+    /// Killing a guest-backed entry flips it dead WITHOUT touching a (nonexistent)
+    /// host Process — the guest `kill` is fire-and-forget (no live guest in tests).
+    func testKillSandboxEntryFlipsKilledWithoutCrash() async {
+        let reg = ProcessRegistry(); defer { reg.killAll() }
+        let p = reg.registerSandboxed(command: "srv", guestPID: 123,
+                                      logPath: "/tmp/mlx-bg-2.log", sessionId: nil)
+        XCTAssertTrue(reg.isAlive(handle: p.handle))
+        reg.kill(handle: p.handle)
+        XCTAssertFalse(reg.isAlive(handle: p.handle))
+        XCTAssertEqual(p.status, .killed)
+    }
+
+    /// A registry holding BOTH a host and a sandbox entry must reap cleanly on
+    /// killAll — the sandbox arm must not force-unwrap a host Process.
+    func testKillAllWithMixedHostAndSandboxEntries() async {
+        let reg = ProcessRegistry()
+        let host = reg.start(command: "sleep 30", workingDirectory: nil, sessionId: nil)
+        let guest = reg.registerSandboxed(command: "srv", guestPID: 456,
+                                          logPath: "/tmp/mlx-bg-3.log", sessionId: nil)
+        reg.killAll()
+        XCTAssertFalse(reg.isAlive(handle: host.handle))
+        XCTAssertFalse(reg.isAlive(handle: guest.handle))
+    }
+
+    func testKillSessionScopesSandboxEntry() async {
+        let reg = ProcessRegistry(); defer { reg.killAll() }
+        let a = UUID(); let b = UUID()
+        let pa = reg.registerSandboxed(command: "srv", guestPID: 1, logPath: "/tmp/a.log", sessionId: a)
+        let pb = reg.registerSandboxed(command: "srv", guestPID: 2, logPath: "/tmp/b.log", sessionId: b)
+        reg.killSession(a)
+        XCTAssertFalse(reg.isAlive(handle: pa.handle))
+        XCTAssertTrue(reg.isAlive(handle: pb.handle), "other session's sandbox process must be untouched")
+    }
+
     func testAdoptedProcessIsManagedAndAlive() async {
         let reg = ProcessRegistry()
         defer { reg.killAll() }

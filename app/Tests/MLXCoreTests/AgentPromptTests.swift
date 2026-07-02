@@ -131,7 +131,9 @@ final class AgentPromptTests: XCTestCase {
         XCTAssertTrue(s.lowercased().contains("network"),
                       "must state the guest's network posture so failed downloads aren't retried forever")
         XCTAssertTrue(s.contains("run_in_background") && s.lowercased().contains("log"),
-                      "must explain sandboxed background commands write to a guest log (no bg handle / readProcessOutput)")
+                      "must explain sandboxed background commands: a bg handle (readProcessOutput/killProcess) plus a guest log")
+        XCTAssertTrue(s.contains("readProcessOutput") && s.contains("killProcess"),
+                      "sandboxed background handles now poll/kill exactly like the host")
         XCTAssertFalse(s.contains("zsh"))
     }
 
