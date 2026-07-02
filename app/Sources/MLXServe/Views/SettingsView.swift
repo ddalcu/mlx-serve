@@ -1275,6 +1275,15 @@ private struct SandboxSectionContent: View {
         }
 
         SettingsRow(
+            title: "Network + port mapping",
+            explainer: "ON = the sandbox has outbound internet (NAT), and any server the agent starts inside it is automatically reachable on this Mac at localhost with the same port — e.g. a dev server on 8080 appears at localhost:8080 (bound to localhost only, never your LAN). OFF = the sandbox gets no network device at all: fully isolated, but installs and downloads inside it will fail. Applies to the next sandbox session."
+        ) {
+            Toggle("", isOn: $appState.serverOptions.sandbox.network)
+                .labelsHidden()
+                .toggleStyle(.switch)
+        }
+
+        SettingsRow(
             title: "Base image",
             explainer: "The Docker/OCI image the sandbox boots from. Must have an arm64 build (Apple Silicon) — an amd64-only image won't boot. The default ddalcu/agent-shell is a purpose-built agentic shell (Node.js + Python3/pip + git/curl + apt). Pulled once on first use, then cached; a heavier image uses more disk and takes longer the first time."
         ) {

@@ -17,12 +17,24 @@ final class VzGuestTests: XCTestCase {
     // MARK: kernel command line
 
     func testKernelCommandLineBootsVirtiofsRootWithOurInit() {
-        let cl = VzGuest.kernelCommandLine
+        let cl = VzGuest.kernelCommandLine(network: false)
         XCTAssertTrue(cl.contains("console=hvc0"), "boot console must be the first hvc port")
         XCTAssertTrue(cl.contains("root=\(VzGuest.rootfsTag)"))
         XCTAssertTrue(cl.contains("rootfstype=virtiofs"), "rootfs is served over virtio-fs — no initramfs, no RAM-resident image")
         XCTAssertTrue(cl.contains("init=\(VzGuest.initScriptGuestPath)"))
         XCTAssertFalse(cl.contains("rootwait"), "rootwait is invalid for a non-block root and trips a kernel warning")
+    }
+
+    func testKernelCommandLineNetworkTogglesInKernelDhcp() {
+        // The prebuilt kernel has CONFIG_IP_PNP — `ip=dhcp` makes the KERNEL
+        // acquire address/route/DNS from VZ's NAT before init runs, so the guest
+        // gets networking with any image (no userspace DHCP client needed).
+        XCTAssertTrue(VzGuest.kernelCommandLine(network: true).contains(" ip=dhcp"))
+        XCTAssertFalse(VzGuest.kernelCommandLine(network: false).contains("ip=dhcp"),
+                       "network off must not DHCP — the isolated guest stays address-less")
+        // The base boot plumbing must be identical in both variants.
+        XCTAssertTrue(VzGuest.kernelCommandLine(network: true)
+            .hasPrefix(VzGuest.kernelCommandLine(network: false)))
     }
 
     // MARK: init script
@@ -86,6 +98,47 @@ final class VzGuestTests: XCTestCase {
         c.workdir = "/workspace/sub dir"
         let s = VzGuest.buildInitScript(config: c)
         XCTAssertTrue(s.contains("cd '/workspace/sub dir' 2>/dev/null"))
+    }
+
+    // MARK: networking in the init script
+
+    func testInitScriptNetworkOnWiresDnsAndPortMonitor() {
+        var c = baseConfig()
+        c.network = true
+        let s = VzGuest.buildInitScript(config: c)
+        // DNS: the kernel's DHCP answer lands in /proc/net/pnp — copy the
+        // resolver lines into /etc/resolv.conf so libc can resolve.
+        XCTAssertTrue(s.contains("/proc/net/pnp"))
+        XCTAssertTrue(s.contains("/etc/resolv.conf"))
+        // Live port map source: a background loop streams the guest IP +
+        // /proc/net/tcp(6) snapshots to the host over the third console port.
+        XCTAssertTrue(s.contains("/dev/hvc2"))
+        XCTAssertTrue(s.contains("/proc/net/tcp"))
+        XCTAssertTrue(s.contains("=EOS="), "snapshots must be framed so the host can split them")
+        XCTAssertTrue(s.contains("=IP="), "each snapshot must carry the guest address")
+    }
+
+    func testInitScriptNetworkOffStaysIsolated() {
+        var c = baseConfig()
+        c.network = false
+        let s = VzGuest.buildInitScript(config: c)
+        XCTAssertFalse(s.contains("dhclient"), "network off must not even try a DHCP client")
+        XCTAssertFalse(s.contains("/etc/resolv.conf"))
+        // The hvc2 monitor still runs (it carries the RAM readout for the tray)
+        // but must not report addresses when the guest is isolated.
+        XCTAssertTrue(s.contains("/dev/hvc2"))
+        XCTAssertTrue(s.contains("/proc/meminfo"))
+        XCTAssertFalse(s.contains("fib_trie"))
+    }
+
+    func testInitScriptMonitorReportsMemoryRegardlessOfNetwork() {
+        for network in [true, false] {
+            var c = baseConfig()
+            c.network = network
+            let s = VzGuest.buildInitScript(config: c)
+            XCTAssertTrue(s.contains("/proc/meminfo"), "network=\(network)")
+            XCTAssertTrue(s.contains("=EOS="), "network=\(network)")
+        }
     }
 
     // MARK: shell quoting

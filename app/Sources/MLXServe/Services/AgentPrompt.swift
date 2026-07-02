@@ -73,7 +73,7 @@ enum AgentPrompt {
                 + "Shell commands run inside an isolated Linux VM (Debian, aarch64, GNU userland) — NOT on the host Mac. "
                 + "python3/pip, node/npm, git, and curl are available; macOS-only commands (brew, open, pbcopy, osascript, defaults) are NOT — use Linux equivalents (apt-get to add packages). "
                 + "The working folder is mounted at /workspace inside the VM; the file tools (readFile/writeFile/editFile/…) see the same files from the host side, so use them interchangeably with shell paths. "
-                + "The VM may have no network access — if a download or install fails with a network error, say so instead of retrying. "
+                + "The VM normally has outbound network access (unless disabled in Settings — if a download fails with a network error, say so instead of retrying), and any TCP port a server listens on inside the VM is automatically reachable on the host at localhost with the SAME port — e.g. an Express app on 8080 is live at http://localhost:8080 for the user; start the server and share that URL. "
                 + "run_in_background starts the process inside the VM and appends its output to a log file the tool result names — check it with shell (e.g. tail that file); readProcessOutput/killProcess handles do not apply here. "
                 + "Exported shell variables persist between calls."
         }

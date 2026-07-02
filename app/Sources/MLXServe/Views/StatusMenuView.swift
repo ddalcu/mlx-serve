@@ -502,8 +502,11 @@ struct StatusMenuView: View {
                             .foregroundStyle(sandbox.guestRunning ? Color.green : Color.orange)
                         VStack(alignment: .leading, spacing: 1) {
                             Text("Agent Sandbox is on").font(.callout.weight(.medium))
-                            Text(sandbox.guestRunning ? "Guest running — open the terminal"
-                                                      : "Idle — boots on the first command")
+                            // guestMemoryText is quantized + published only on
+                            // change, so this row doesn't re-render per second.
+                            Text(sandbox.guestRunning
+                                 ? "Guest running" + (sandbox.guestMemoryText.map { " · \($0)" } ?? "") + " — open the terminal"
+                                 : "Idle — boots on the first command")
                                 .font(.caption2).foregroundStyle(.secondary)
                         }
                         Spacer()

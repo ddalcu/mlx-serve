@@ -265,6 +265,11 @@ struct ServerOptions: Codable, Equatable {
         /// shell (Debian glibc + Node.js + Python3/pip + git/curl + apt, ~129 MB).
         /// Any arm64 image works; e.g. `python:3.12-slim` or `debian:stable-slim`.
         var baseImage: String = "ddalcu/agent-shell"
+        /// Outbound network for the guest (NAT) + live guest→host port mapping:
+        /// a server the agent starts on guest port N becomes reachable at
+        /// `localhost:N` on this Mac. Off → the guest has NO network device at
+        /// all (fully isolated). Applies on the next guest boot.
+        var network: Bool = true
 
         /// The base image ref with surrounding whitespace stripped — what the
         /// image puller actually receives (users paste with trailing newlines).
@@ -538,6 +543,7 @@ extension ServerOptions.SandboxConfig {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         if let v = try c.decodeIfPresent(Bool.self, forKey: .enabled) { enabled = v }
         if let v = try c.decodeIfPresent(String.self, forKey: .baseImage) { baseImage = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .network) { network = v }
     }
 }
 

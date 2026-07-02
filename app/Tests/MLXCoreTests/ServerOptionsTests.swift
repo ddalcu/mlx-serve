@@ -639,6 +639,21 @@ extension ServerOptionsTests {
         XCTAssertEqual(decoded.sandbox.baseImage, "ddalcu/agent-shell")
     }
 
+    func testSandboxNetworkDefaultsOnAndDecodesLegacyBlobs() throws {
+        // Network + live port mapping is the useful default for an agent that
+        // builds and runs servers; the toggle exists to opt back into isolation.
+        XCTAssertTrue(ServerOptions.SandboxConfig().network)
+        // A blob written before the field existed must default it, not throw.
+        let legacy = #"{"sandbox":{"enabled":true,"baseImage":"alpine"}}"#.data(using: .utf8)!
+        let decoded = try JSONDecoder().decode(ServerOptions.self, from: legacy)
+        XCTAssertTrue(decoded.sandbox.network)
+        // And a stored `false` must round-trip.
+        var o = ServerOptions()
+        o.sandbox.network = false
+        let rt = try JSONDecoder().decode(ServerOptions.self, from: try JSONEncoder().encode(o))
+        XCTAssertFalse(rt.sandbox.network)
+    }
+
     func testSandboxRoundTripsThroughDecoder() throws {
         var o = ServerOptions()
         o.sandbox = .init(enabled: true, baseImage: "python:3.12")

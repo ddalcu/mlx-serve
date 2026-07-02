@@ -138,6 +138,9 @@ final class VzGuest {
         var workdir: String? = "/workspace"
         var ramBytes: UInt64 = 1 << 30 // rootfs is demand-paged over virtiofs — workload headroom only
         var cpuCount: Int = 4
+        /// NAT networking + the live port-report stream on hvc2. When false the
+        /// guest gets NO network device and never DHCPs — fully isolated.
+        var network: Bool = false
     }
 
     struct ExecResult {
@@ -164,8 +167,16 @@ final class VzGuest {
     static let rootfsTag = "rootfs"
     static let workspaceTag = "workspace"
     static let initScriptGuestPath = "/.vz-init"
-    static let kernelCommandLine =
+
+    /// Kernel command line. With `network`, `ip=dhcp` makes the KERNEL acquire
+    /// address/gateway/DNS from VZ's NAT (CONFIG_IP_PNP — verified present in
+    /// the prebuilt kernel) before init runs, so networking works with ANY
+    /// image: no userspace DHCP client required. VZ's vmnet answers the DHCP
+    /// immediately, so the boot-time cost is negligible.
+    static func kernelCommandLine(network: Bool) -> String {
         "console=hvc0 root=\(rootfsTag) rootfstype=virtiofs rw init=\(initScriptGuestPath) panic=-1"
+            + (network ? " ip=dhcp" : "")
+    }
 
     // MARK: Pure builders (unit tested)
 
@@ -199,16 +210,35 @@ final class VzGuest {
         if config.workspacePath != nil {
             s += "mount -t virtiofs \(workspaceTag) \(config.guestWorkspacePath) 2>/dev/null\n"
         }
-        // Best-effort networking: VZ's NAT device hands out addresses over DHCP,
-        // so this only works when the image ships a DHCP client (the default
-        // agent-shell image currently does not — the guest is network-isolated,
-        // which is the safe default for a sandbox anyway).
-        s += """
-        ip link set lo up 2>/dev/null
-        ip link set eth0 up 2>/dev/null
-        dhclient -1 eth0 2>/dev/null || udhcpc -i eth0 -n -q 2>/dev/null || dhcpcd -1 eth0 2>/dev/null || true
+        if config.network {
+            // The kernel already DHCPed eth0 (`ip=dhcp` on the cmdline) and wrote
+            // its answer to /proc/net/pnp. Userspace clients are only a fallback
+            // for a custom kernel without IP_PNP; DNS comes from the pnp file.
+            s += """
+            ip link set lo up 2>/dev/null
+            [ -s /proc/net/pnp ] || dhclient -1 eth0 2>/dev/null || udhcpc -i eth0 -n -q 2>/dev/null || dhcpcd -1 eth0 2>/dev/null || true
+            grep -E '^(nameserver|domain|search)' /proc/net/pnp > /etc/resolv.conf 2>/dev/null || true
 
-        """
+            """
+        }
+        // Guest monitor: stream a once-a-second report to the host over the
+        // THIRD console port — RAM (/proc/meminfo, feeds the tray readout)
+        // always, plus the guest IP + /proc/net/tcp(6) when networked (feeds
+        // the live port map, SandboxPortForwarder). Framed with =EOS= so the
+        // host can split complete snapshots. Runs detached so it never blocks
+        // the shell channel.
+        s += "i=0; while [ ! -e /dev/hvc2 ] && [ $i -lt 100 ]; do sleep 0.1; i=$((i+1)); done\n"
+        s += "( while true; do\n"
+        s += "    grep -E '^(MemTotal|MemAvailable)' /proc/meminfo 2>/dev/null\n"
+        if config.network {
+            s += "    ip4=$(grep -B1 -F '32 host LOCAL' /proc/net/fib_trie 2>/dev/null | grep -oE '([0-9]{1,3}\\.){3}[0-9]{1,3}' | grep -v '^127\\.' | head -1)\n"
+            s += "    printf '=IP=%s\\n' \"$ip4\"\n"
+            s += "    cat /proc/net/tcp 2>/dev/null\n"
+            s += "    cat /proc/net/tcp6 2>/dev/null\n"
+        }
+        s += "    printf '=EOS=\\n'\n"
+        s += "    sleep 1\n"
+        s += "  done ) >/dev/hvc2 2>/dev/null &\n\n"
         for entry in config.imageEnv {
             guard let eq = entry.firstIndex(of: "="), eq != entry.startIndex else { continue }
             let key = String(entry[..<eq])
@@ -247,6 +277,13 @@ final class VzGuest {
     // Pipes held for the guest's lifetime (the attachments borrow their fds).
     private var bootIn = Pipe(), bootOut = Pipe()
     private var shellIn = Pipe(), shellOut = Pipe()
+    private var netIn = Pipe(), netOut = Pipe()
+
+    /// Complete net-report snapshots from the guest's hvc2 monitor loop (raw
+    /// text between =EOS= sentinels; parse with `GuestNetParser`). Set BEFORE
+    /// `boot`; called on a dispatch-io thread.
+    var onNetSnapshot: ((String) -> Void)?
+    private let netSplitter = GuestNetSnapshotSplitter()
 
     init(nonce: String = String(UUID().uuidString.prefix(8))) {
         self.nonce = nonce
@@ -304,7 +341,7 @@ final class VzGuest {
         vmConfig.platform = VZGenericPlatformConfiguration()
 
         let bootLoader = VZLinuxBootLoader(kernelURL: URL(fileURLWithPath: cfg.kernelPath))
-        bootLoader.commandLine = Self.kernelCommandLine
+        bootLoader.commandLine = Self.kernelCommandLine(network: cfg.network)
         vmConfig.bootLoader = bootLoader
 
         func serialPort(_ inPipe: Pipe, _ outPipe: Pipe) -> VZVirtioConsoleDeviceSerialPortConfiguration {
@@ -314,8 +351,10 @@ final class VzGuest {
                 fileHandleForWriting: outPipe.fileHandleForWriting)
             return p
         }
-        // Index order is guest hvc order (spike-verified): 0 = boot console, 1 = shell.
-        vmConfig.serialPorts = [serialPort(bootIn, bootOut), serialPort(shellIn, shellOut)]
+        // Index order is guest hvc order (spike-verified): 0 = boot console,
+        // 1 = shell, 2 = net-report stream (present always so hvc numbering is
+        // stable; the monitor loop only writes to it when networking is on).
+        vmConfig.serialPorts = [serialPort(bootIn, bootOut), serialPort(shellIn, shellOut), serialPort(netIn, netOut)]
 
         let rootfsDev = VZVirtioFileSystemDeviceConfiguration(tag: Self.rootfsTag)
         rootfsDev.share = VZSingleDirectoryShare(
@@ -331,11 +370,13 @@ final class VzGuest {
 
         vmConfig.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]
         vmConfig.memoryBalloonDevices = [VZVirtioTraditionalMemoryBalloonDeviceConfiguration()]
-        // NAT network: only usable by images that ship a DHCP client (see init
-        // script). Harmless otherwise — the guest simply has no address.
-        let net = VZVirtioNetworkDeviceConfiguration()
-        net.attachment = VZNATNetworkDeviceAttachment()
-        vmConfig.networkDevices = [net]
+        // NAT network — only when the user left sandbox networking on. With it
+        // off there is NO network device at all: the guest is fully isolated.
+        if cfg.network {
+            let net = VZVirtioNetworkDeviceConfiguration()
+            net.attachment = VZNATNetworkDeviceAttachment()
+            vmConfig.networkDevices = [net]
+        }
 
         do { try vmConfig.validate() } catch {
             throw GuestError.bootFailed("invalid VM configuration: \(error.localizedDescription)")
@@ -344,6 +385,11 @@ final class VzGuest {
         // 3. Console capture + start.
         bootOut.fileHandleForReading.readabilityHandler = { [bootConsole] h in bootConsole.append(h.availableData) }
         shellOut.fileHandleForReading.readabilityHandler = { [shellConsole] h in shellConsole.append(h.availableData) }
+        netOut.fileHandleForReading.readabilityHandler = { [netSplitter, weak self] h in
+            for snapshot in netSplitter.feed(h.availableData) {
+                self?.onNetSnapshot?(snapshot)
+            }
+        }
 
         let machine = vmQueue.sync { VZVirtualMachine(configuration: vmConfig, queue: vmQueue) }
         let box = DelegateBox { [weak self] in
@@ -462,6 +508,8 @@ final class VzGuest {
         stopped.lock(); stoppedFlag = true; stopped.unlock()
         bootOut.fileHandleForReading.readabilityHandler = nil
         shellOut.fileHandleForReading.readabilityHandler = nil
+        netOut.fileHandleForReading.readabilityHandler = nil
+        onNetSnapshot = nil
         delegateBox = nil
     }
 

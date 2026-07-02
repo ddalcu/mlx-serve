@@ -161,6 +161,55 @@ enum SandboxSmoke {
                 if !userHit { log("[smoke]   ✗ user command not executed/recorded"); ok = false }
                 if !agentHit { log("[smoke]   ✗ agent command not recorded in transcript"); ok = false }
 
+                // Phase 4: networking + live port map (default-on; skip with
+                // SANDBOX_SMOKE_NO_NETWORK=1 for isolated-mode runs).
+                if env["SANDBOX_SMOKE_NO_NETWORK"] != "1" {
+                    log("[smoke] phase 4: guest networking + port map…")
+                    // Outbound: kernel-DHCP'd eth0 + resolv.conf → HTTPS works.
+                    let curl = syncAwait {
+                        (try? await handler.execute(
+                            parameters: ["command": "curl -sS -m 15 -o /dev/null -w NET_%{http_code} https://example.com || echo NET_FAIL"],
+                            workingDirectory: share)) ?? "<threw>"
+                    }
+                    if curl.contains("NET_200") { log("[smoke]   ✓ outbound HTTPS from the guest") }
+                    else { log("[smoke]   ✗ outbound network failed: \(curl.trimmingCharacters(in: .whitespacesAndNewlines).prefix(120))"); ok = false }
+
+                    // Port map: start a server on a guest port, then fetch it from
+                    // the HOST at localhost:<same port> (the forwarder mirrors it
+                    // from the guest's /proc/net/tcp within ~1s snapshots).
+                    let port = 8123
+                    _ = syncAwait {
+                        (try? await handler.execute(
+                            parameters: ["command": "mkdir -p /tmp/smokeweb && echo PORTMAP_OK > /tmp/smokeweb/index.html && (cd /tmp/smokeweb && (python3 -m http.server \(port) >/tmp/smokeweb.log 2>&1 &)) && echo started"],
+                            workingDirectory: share)) ?? "<threw>"
+                    }
+                    var mapped = false
+                    let mapDeadline = Date().addingTimeInterval(15)
+                    while Date() < mapDeadline && !mapped {
+                        Thread.sleep(forTimeInterval: 0.5)
+                        guard let url = URL(string: "http://127.0.0.1:\(port)/") else { break }
+                        let body: String? = syncAwait {
+                            guard let (data, _) = try? await URLSession.shared.data(from: url) else { return nil }
+                            return String(decoding: data, as: UTF8.self)
+                        }
+                        if body?.contains("PORTMAP_OK") == true { mapped = true }
+                    }
+                    if mapped { log("[smoke]   ✓ guest :\(port) reachable at localhost:\(port)") }
+                    else { log("[smoke]   ✗ port map: localhost:\(port) did not reach the guest server"); ok = false }
+                }
+
+                // Tray RAM readout: the guest's /proc/meminfo report must have
+                // produced a published display string by now (@Published lands
+                // on the main queue — pump it like the transcript check above).
+                var memText: String?
+                let memDeadline = Date().addingTimeInterval(5)
+                while Date() < memDeadline && memText == nil {
+                    RunLoop.main.run(until: Date().addingTimeInterval(0.1))
+                    memText = AgentSandbox.shared.guestMemoryText
+                }
+                if let memText { log("[smoke]   ✓ guest RAM readout: \(memText)") }
+                else { log("[smoke]   ✗ guest RAM readout never arrived"); ok = false }
+
                 AgentSandbox.shared.teardown()
             }
 

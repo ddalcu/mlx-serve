@@ -104,7 +104,8 @@ class AppState: ObservableObject {
             // Push the agent-sandbox setting to the shared manager so the next
             // shell command routes to the guest (or the host) accordingly.
             AgentSandbox.shared.configure(enabled: serverOptions.sandbox.enabled,
-                                          baseImage: serverOptions.sandbox.baseImage)
+                                          baseImage: serverOptions.sandbox.baseImage,
+                                          network: serverOptions.sandbox.network)
         }
     }
     /// Legacy bridge: `maxTokens` is now stored in `serverOptions.defaultMaxTokens`.
@@ -193,7 +194,8 @@ class AppState: ObservableObject {
 
         // Same for the agent sandbox: apply the persisted setting once at launch.
         AgentSandbox.shared.configure(enabled: serverOptions.sandbox.enabled,
-                                      baseImage: serverOptions.sandbox.baseImage)
+                                      baseImage: serverOptions.sandbox.baseImage,
+                                      network: serverOptions.sandbox.network)
 
         // Show welcome window on first launch
         if !hasSeenWelcome {

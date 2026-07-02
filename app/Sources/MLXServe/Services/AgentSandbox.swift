@@ -49,6 +49,12 @@ final class AgentSandbox: ObservableObject, @unchecked Sendable {
     var transcript: [Entry] { transcriptStore.entries }
     /// Whether a guest is currently booted (for the tray/terminal status).
     @Published private(set) var guestRunning = false
+    /// Coarse guest RAM readout for the tray ("384 MB / 987 MB RAM"), fed by
+    /// the guest's once-a-second /proc/meminfo report. QUANTIZED to 16 MB steps
+    /// and published only when the string changes, so the per-second snapshots
+    /// don't re-render the tray (the MenuBarExtra churn class). nil while no
+    /// guest is running.
+    @Published private(set) var guestMemoryText: String?
 
     private let lock = NSLock()
     private var enabled = false
@@ -56,6 +62,8 @@ final class AgentSandbox: ObservableObject, @unchecked Sendable {
     /// pinned by ServerOptionsTests); AppState overwrites it via `configure()`
     /// at launch and on every settings change.
     private var baseImage = ServerOptions.SandboxConfig().baseImage
+    /// Guest networking + live port mapping (see SandboxConfig.network).
+    private var networkEnabled = ServerOptions.SandboxConfig().network
 
     /// Append to the transcript on the main thread (@Published must mutate there).
     private func record(_ entry: Entry) {
@@ -64,13 +72,35 @@ final class AgentSandbox: ObservableObject, @unchecked Sendable {
         }
     }
     private func setGuestRunning(_ v: Bool) {
-        DispatchQueue.main.async { if self.guestRunning != v { self.guestRunning = v } }
+        DispatchQueue.main.async {
+            if self.guestRunning != v { self.guestRunning = v }
+            if !v, self.guestMemoryText != nil { self.guestMemoryText = nil }
+        }
+    }
+    private func setGuestMemoryText(_ v: String?) {
+        DispatchQueue.main.async { if self.guestMemoryText != v { self.guestMemoryText = v } }
+    }
+
+    /// Tray RAM readout: used (total − available) quantized to 16 MB so nearby
+    /// readings map to the SAME string (no per-second tray re-render); totals
+    /// ≥ 1000 MB read in GB with one decimal.
+    static func memoryDisplayText(availableKB: Int, totalKB: Int) -> String {
+        let usedMB = Double(max(0, totalKB - availableKB)) / 1024.0
+        let quantized = Int((usedMB / 16.0).rounded()) * 16
+        let totalMB = Double(totalKB) / 1024.0
+        let totalText = totalMB >= 1000
+            ? String(format: "%.1f GB", Double(totalKB) / (1024.0 * 1024.0))
+            : "\(Int(totalMB.rounded())) MB"
+        return "\(quantized) MB / \(totalText) RAM"
     }
 
     // Live guest + the host dir it shares at /workspace. Guarded by `bootLock`.
     private let bootLock = NSLock()
     private var guest: VzGuest?
     private var sharedRoot: String?
+    /// Host side of the live guest→host port map (created per boot when
+    /// networking is on; fed by the guest's hvc2 net-report stream).
+    private var forwarder: SandboxPortForwarder?
 
     private init() {}
 
@@ -79,16 +109,19 @@ final class AgentSandbox: ObservableObject, @unchecked Sendable {
     var isEnabled: Bool { lock.lock(); defer { lock.unlock() }; return enabled }
 
     /// Apply the Settings values. Turning the sandbox off, or changing the base
-    /// image, tears down any live guest so the next command re-provisions.
-    func configure(enabled: Bool, baseImage: String) {
+    /// image or the network mode, tears down any live guest so the next command
+    /// re-provisions with the new configuration.
+    func configure(enabled: Bool, baseImage: String, network: Bool = ServerOptions.SandboxConfig().network) {
         let trimmed = baseImage.trimmingCharacters(in: .whitespacesAndNewlines)
         lock.lock()
         let imageChanged = trimmed != self.baseImage && !trimmed.isEmpty
+        let networkChanged = network != self.networkEnabled
         let wasEnabled = self.enabled
         self.enabled = enabled
+        self.networkEnabled = network
         if !trimmed.isEmpty { self.baseImage = trimmed }
         lock.unlock()
-        if (!enabled && wasEnabled) || (enabled && imageChanged) {
+        if (!enabled && wasEnabled) || (enabled && (imageChanged || networkChanged)) {
             teardown()
         }
     }
@@ -112,9 +145,12 @@ final class AgentSandbox: ObservableObject, @unchecked Sendable {
     func teardown(shutdownBlocking: @escaping (VzGuest) -> Void) {
         bootLock.lock()
         let g = guest
+        let fwd = forwarder
         guest = nil
         sharedRoot = nil
+        forwarder = nil
         bootLock.unlock()
+        fwd?.stop()
         setGuestRunning(false)
         guard let g else { return }
         DispatchQueue.global(qos: .utility).async { shutdownBlocking(g) }
@@ -291,6 +327,7 @@ final class AgentSandbox: ObservableObject, @unchecked Sendable {
         // Stale/dead guest, or the working folder moved outside the shared
         // root (remount) — tear down and boot fresh with the right share.
         guest?.shutdown(); guest = nil; sharedRoot = nil
+        forwarder?.stop(); forwarder = nil
 
         #if !arch(arm64)
         throw SandboxError(message: "the Agent Sandbox requires Apple Silicon (the guest kernel is arm64)")
@@ -311,10 +348,46 @@ final class AgentSandbox: ObservableObject, @unchecked Sendable {
         cfg.guestWorkspacePath = "/workspace"
         cfg.imageEnv = imageConfig.env
         cfg.workdir = "/workspace"
+        let net = { lock.lock(); defer { lock.unlock() }; return networkEnabled }()
+        cfg.network = net
         // The rootfs is demand-paged over virtiofs (not RAM-resident like the old
         // initramfs boot), so guest RAM is pure workload headroom.
         let ramGB = ProcessInfo.processInfo.environment["SANDBOX_RAM_GB"].flatMap { UInt64($0) } ?? 1
         cfg.ramBytes = ramGB * 1024 * 1024 * 1024
+
+        // Guest monitor consumer: every snapshot carries /proc/meminfo (tray RAM
+        // readout — always), and when networked also the guest IP + listening
+        // ports, which reconcile the host-side forwarder: a server the agent
+        // starts on guest port N appears at localhost:N and disappears with it.
+        if net {
+            let fwd = SandboxPortForwarder()
+            fwd.onMappingsChanged = { [weak self] ports in
+                let list = ports.sorted().map { "localhost:\($0)" }.joined(separator: ", ")
+                self?.record(Entry(source: .system, command: "",
+                                   output: ports.isEmpty ? "port map: (none)" : "port map: \(list) → sandbox",
+                                   exitCode: 0, at: Date()))
+            }
+            forwarder = fwd
+        }
+        var announcedIP: String?
+        g.onNetSnapshot = { [weak self, weak fwd = forwarder] text in
+            guard let self else { return }
+            let snap = GuestNetParser.parse(text)
+            if let total = snap.memTotalKB, let avail = snap.memAvailableKB {
+                self.setGuestMemoryText(Self.memoryDisplayText(availableKB: avail, totalKB: total))
+            }
+            guard let fwd else { return }
+            if let ip = snap.ip {
+                fwd.setTarget(host: ip)
+                if announcedIP != ip {
+                    announcedIP = ip
+                    self.record(Entry(source: .system, command: "",
+                                      output: "network up — guest \(ip); guest ports auto-map to localhost",
+                                      exitCode: 0, at: Date()))
+                }
+            }
+            fwd.update(ports: snap.ports)
+        }
         do {
             try g.boot(cfg, readyTimeout: 60)
         } catch {
@@ -322,6 +395,7 @@ final class AgentSandbox: ObservableObject, @unchecked Sendable {
             // panic, ENOEXEC, etc.) instead of an opaque "guest exited".
             let tail = String(g.consoleSnapshot().suffix(1500))
             g.shutdown()
+            forwarder?.stop(); forwarder = nil
             NSLog("[sandbox] boot failed: \(error)\n--- guest console tail ---\n\(tail)\n--- end ---")
             throw SandboxError(message: "sandbox failed to start: \(error). Turn off the Agent Sandbox in Settings to run on the host, or check the base image. (guest console tail written to the server log)")
         }
