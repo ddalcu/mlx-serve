@@ -101,6 +101,10 @@ class AppState: ObservableObject {
             // Reconcile the Telegram bridge whenever options change (cheap no-op
             // unless the bot token / enabled flag actually moved).
             telegramBridge.reconcile()
+            // Push the agent-sandbox setting to the shared manager so the next
+            // shell command routes to the guest (or the host) accordingly.
+            AgentSandbox.shared.configure(enabled: serverOptions.sandbox.enabled,
+                                          baseImage: serverOptions.sandbox.baseImage)
         }
     }
     /// Legacy bridge: `maxTokens` is now stored in `serverOptions.defaultMaxTokens`.
@@ -186,6 +190,10 @@ class AppState: ObservableObject {
         // Start the Telegram bridge if the user left it enabled (didSet doesn't
         // fire for the initial serverOptions assignment in init).
         telegramBridge.reconcile()
+
+        // Same for the agent sandbox: apply the persisted setting once at launch.
+        AgentSandbox.shared.configure(enabled: serverOptions.sandbox.enabled,
+                                      baseImage: serverOptions.sandbox.baseImage)
 
         // Show welcome window on first launch
         if !hasSeenWelcome {

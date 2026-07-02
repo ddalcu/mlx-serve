@@ -114,6 +114,16 @@ struct ServerOptions: Codable, Equatable {
     /// prompt a server restart.
     var telegram: TelegramConfig = TelegramConfig()
 
+    // MARK: Agent sandbox (app-level — NOT a server-launch flag, NOT per-request)
+    /// Run the agent's shell/tool commands inside an isolated Linux sandbox
+    /// instead of directly on host macOS. The sandbox is a lightweight Linux
+    /// guest booted on Apple's Virtualization.framework (see `VzGuest`); only
+    /// the working directory is shared in, so a destructive command can't reach
+    /// the rest of the Mac. It's consumed by the app-side tool executor, so —
+    /// like `telegram` — it's deliberately excluded from `serverLaunchEquals`:
+    /// toggling it must never prompt a server restart.
+    var sandbox: SandboxConfig = SandboxConfig()
+
     enum LogLevel: String, Codable, CaseIterable, Identifiable {
         case error, warn, info, debug
         var id: String { rawValue }
@@ -238,6 +248,29 @@ struct ServerOptions: Codable, Equatable {
         case adopt
         /// An allow-list exists and this chat isn't on it — refuse.
         case rejected
+    }
+
+    /// Agent execution sandbox. When `enabled`, the agent's shell commands run
+    /// inside a throwaway Linux guest (booted on Apple's Virtualization
+    /// framework) with only the working directory shared in — so a destructive
+    /// command can't touch the rest of the Mac. It costs extra RAM while active
+    /// because a live VM is held for the session. Off by default.
+    struct SandboxConfig: Codable, Equatable {
+        /// false = tools run directly on host macOS (default, no extra RAM).
+        /// true = shell commands run inside the isolated Linux sandbox.
+        var enabled: Bool = false
+        /// OCI/Docker base image pulled once for the sandbox rootfs. MUST have an
+        /// arm64 build (the HVF guest is arm64) — an amd64-only image fails to
+        /// boot. Defaults to `ddalcu/agent-shell`: a purpose-built arm64 agentic
+        /// shell (Debian glibc + Node.js + Python3/pip + git/curl + apt, ~129 MB).
+        /// Any arm64 image works; e.g. `python:3.12-slim` or `debian:stable-slim`.
+        var baseImage: String = "ddalcu/agent-shell"
+
+        /// The base image ref with surrounding whitespace stripped — what the
+        /// image puller actually receives (users paste with trailing newlines).
+        var trimmedBaseImage: String {
+            baseImage.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
     }
 
     // MARK: Restart-detection helpers
@@ -475,6 +508,7 @@ extension ServerOptions {
         if let v = try c.decodeIfPresent(TriState.self, forKey: .perRequestEnablePLD) { perRequestEnablePLD = v }
         if let v = try c.decodeIfPresent(TriState.self, forKey: .perRequestEnableDrafter) { perRequestEnableDrafter = v }
         if let v = try c.decodeIfPresent(TelegramConfig.self, forKey: .telegram) { telegram = v }
+        if let v = try c.decodeIfPresent(SandboxConfig.self, forKey: .sandbox) { sandbox = v }
     }
 }
 
@@ -492,6 +526,18 @@ extension ServerOptions.TelegramConfig {
         if let v = try c.decodeIfPresent(Bool.self, forKey: .useMCP) { useMCP = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .enableThinking) { enableThinking = v }
         if let v = try c.decodeIfPresent([Int64].self, forKey: .allowedChatIds) { allowedChatIds = v }
+    }
+}
+
+extension ServerOptions.SandboxConfig {
+    /// Tolerant decode (same rationale as `ServerOptions.init(from:)`): a stored
+    /// blob written before a field existed must decode with that field defaulted,
+    /// not throw — a throw here propagates up and silently resets the whole config.
+    init(from decoder: Decoder) throws {
+        self.init()
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .enabled) { enabled = v }
+        if let v = try c.decodeIfPresent(String.self, forKey: .baseImage) { baseImage = v }
     }
 }
 

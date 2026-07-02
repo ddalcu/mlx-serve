@@ -227,21 +227,40 @@ struct VideoGenView: View {
             HStack {
                 Text("Frames").font(.subheadline.weight(.semibold))
                 Spacer()
-                Text("~\(String(format: "%.1f", Double(numFrames) / Double(fps)))s")
-                    .font(.caption)
+                Text("\(numFrames) frames · ~\(String(format: "%.1f", Double(numFrames) / Double(fps)))s")
+                    .font(.caption.monospacedDigit())
                     .foregroundStyle(.secondary)
             }
-            Picker("", selection: $numFrames) {
-                ForEach(availableFrameOptions, id: \.self) { n in
-                    Text("\(n) frames").tag(n)
-                }
-            }
-            .labelsHidden()
-            .pickerStyle(.menu)
+            // Snap through LTX's valid `8N+1` frame ladder by index, so the
+            // slider can only land on generatable lengths (9, 17, 25, … maxFrames).
+            frameSlider
             if let warn = frameRAMWarning {
                 Text(warn).font(.caption2).foregroundStyle(.orange)
             }
         }
+    }
+
+    private var frameSlider: some View {
+        let opts = availableFrameOptions
+        let maxIdx = max(1, opts.count - 1)
+        return Slider(
+            value: Binding(
+                get: {
+                    // Live index of the current frame count on the ladder.
+                    let i = opts.firstIndex(of: numFrames)
+                        ?? opts.lastIndex(where: { $0 <= numFrames })
+                        ?? 0
+                    return Double(i)
+                },
+                set: { newVal in
+                    let idx = min(opts.count - 1, max(0, Int(newVal.rounded())))
+                    numFrames = opts[idx]
+                }
+            ),
+            in: 0...Double(maxIdx),
+            step: 1
+        )
+        .help("Clip length. LTX only generates \(opts.first ?? 9)–\(opts.last ?? 193) frames on its 8N+1 ladder; the slider snaps to valid counts.")
     }
 
     /// Always show every option up to the model's hard cap. The user can
@@ -267,25 +286,17 @@ struct VideoGenView: View {
         return nil
     }
 
-    /// Image-to-video is only supported by the 2-stage pipelines — the
-    /// distilled 1-stage pipeline was trained text-only and its
-    /// `generate_and_save()` signature doesn't accept `image=`. We keep the
-    /// First frame row visible but disabled on 1-stage so the feature is
-    /// discoverable, with a tooltip explaining what to do.
-    private var supportsI2V: Bool {
-        mode == .twoStage || mode == .twoStageHQ
-    }
-
-    private var i2vDisabledHelp: String {
-        "Image-to-video requires the Quality or Super Quality preset — the Fast / Good pipeline is text-only."
-    }
-
+    // Image-to-video is always available: the native mlx-serve engine supports
+    // first-frame conditioning in every pipeline mode (the server VAE-encodes
+    // the image and pins it as the clean first latent frame), and gracefully
+    // falls back to text-to-video if the VAE encoder isn't downloaded — so the
+    // picker is never disabled.
     private var firstFrameSection: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack {
                 Text("First frame").font(.subheadline.weight(.semibold))
                 Spacer()
-                Text(supportsI2V ? "optional — I2V" : "needs Quality preset")
+                Text("optional — I2V")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -297,13 +308,11 @@ struct VideoGenView: View {
                             .aspectRatio(contentMode: .fill)
                             .frame(width: 64, height: 48)
                             .clipShape(RoundedRectangle(cornerRadius: 4))
-                            .opacity(supportsI2V ? 1.0 : 0.45)
                     }
                     Text(url.lastPathComponent)
                         .font(.caption)
                         .lineLimit(1)
                         .truncationMode(.middle)
-                        .foregroundStyle(supportsI2V ? .primary : .secondary)
                     Spacer()
                     Button {
                         firstFrameImageURL = nil
@@ -314,7 +323,6 @@ struct VideoGenView: View {
                     .foregroundStyle(.secondary)
                     .help("Clear first frame")
                 }
-                .help(supportsI2V ? "" : i2vDisabledHelp)
             } else {
                 Button {
                     chooseFirstFrameImage()
@@ -324,10 +332,7 @@ struct VideoGenView: View {
                         .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.bordered)
-                .disabled(!supportsI2V)
-                .help(supportsI2V
-                      ? "Select an image to use as the first frame of the video."
-                      : i2vDisabledHelp)
+                .help("Select an image to use as the first frame of the video.")
             }
         }
     }
@@ -354,26 +359,19 @@ struct VideoGenView: View {
                 .buttonStyle(.plain)
                 .foregroundStyle(.secondary)
             }
-            HStack {
-                numberField("Steps", value: $steps, step: 1)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("CFG scale").font(.caption)
-                    Stepper(value: $cfgScale, in: 0...20, step: 0.5) {
-                        Text(String(format: "%.1f", cfgScale))
-                    }
-                    .disabled(mode == .oneStage)
-                    .help(mode == .oneStage ? "The distilled 1-stage pipeline ignores CFG." : "LTX-2 default: 3.0")
-                }
-            }
-            if mode != .oneStage {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("STG scale (spatial-temporal guidance)").font(.caption)
-                    Stepper(value: $stgScale, in: 0...5, step: 0.5) {
-                        Text(String(format: "%.1f", stgScale))
-                    }
-                    .help("LTX-2 default: 1.0 for two-stage, 0.0 for two-stage HQ.")
-                }
-            }
+            // Steps — more steps = more detail/smoother motion, but slower.
+            intSliderRow("Steps", value: $steps, range: 4...50,
+                         help: "Denoising steps. More = more detail and smoother motion, but slower. LTX runs well from ~8 (fast) to ~30 (reference quality).")
+            Text("More steps refine the video further at the cost of speed. ~8 is fast, ~30 is the reference default.")
+                .font(.caption2).foregroundStyle(.secondary)
+
+            // CFG scale — always adjustable; the native engine honors it in
+            // every pipeline mode (one-stage and both two-stage variants).
+            sliderRow("CFG scale", value: $cfgScale, range: 1...10, step: 0.5,
+                      help: "Classifier-free guidance strength. LTX-2 default: 3.0; 1.0 = off (fastest).")
+            Text("Guidance strength — how closely the video follows your prompt. 1.0 = off: fastest and most natural-looking. Higher sticks to the prompt more strictly but is slower and can look over-saturated. LTX default is 3.0.")
+                .font(.caption2).foregroundStyle(.secondary)
+
             HStack {
                 numberField("Seed", value: $seed, step: 1)
                 Spacer()
@@ -402,6 +400,44 @@ struct VideoGenView: View {
                 Text(String(value.wrappedValue))
             }
         }
+    }
+
+    /// Labeled slider for a `Double` setting, with a live value readout on the
+    /// right and an optional hover tooltip.
+    private func sliderRow(_ label: String, value: Binding<Double>, range: ClosedRange<Double>, step: Double, help: String? = nil) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack {
+                Text(label).font(.caption)
+                Spacer()
+                Text(String(format: "%.1f", value.wrappedValue))
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+            Slider(value: value, in: range, step: step)
+        }
+        .help(help ?? "")
+    }
+
+    /// Labeled slider for an `Int` setting (bridges to a `Double` slider).
+    private func intSliderRow(_ label: String, value: Binding<Int>, range: ClosedRange<Int>, help: String? = nil) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack {
+                Text(label).font(.caption)
+                Spacer()
+                Text("\(value.wrappedValue)")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+            Slider(
+                value: Binding(
+                    get: { Double(value.wrappedValue) },
+                    set: { value.wrappedValue = Int($0.rounded()) }
+                ),
+                in: Double(range.lowerBound)...Double(range.upperBound),
+                step: 1
+            )
+        }
+        .help(help ?? "")
     }
 
     private var actionRow: some View {
@@ -511,8 +547,10 @@ struct VideoGenView: View {
         numFrames = s.numFrames
         fps = s.fps
         mode = s.mode
-        steps = s.steps
-        cfgScale = s.cfgScale
+        // Clamp into the slider ranges — a value persisted by the old wider
+        // steppers (Steps unbounded, CFG 0…20) would otherwise sit off-scale.
+        steps = min(50, max(4, s.steps))
+        cfgScale = min(10, max(1, s.cfgScale))
         stgScale = s.stgScale
         seed = s.seed
         keepResident = s.keepResident
@@ -553,8 +591,8 @@ struct VideoGenView: View {
         numFrames = s.numFrames
         clampFramesToRAM()
         // Keep firstFrameImageURL across preset changes so users can swap
-        // Quality tiers without losing their attached image. The First frame
-        // row dims itself on 1-stage and tryGenerate() nil's the path.
+        // Quality tiers without losing their attached image — every pipeline
+        // mode supports first-frame conditioning.
     }
 
     /// Resolution change still snaps frame count down to the model's hard
@@ -584,7 +622,7 @@ struct VideoGenView: View {
             steps: steps,
             cfgScale: cfgScale,
             stgScale: stgScale,
-            firstFrameImagePath: supportsI2V ? firstFrameImageURL?.path : nil,
+            firstFrameImagePath: firstFrameImageURL?.path,
             keepResident: keepResident
         )
         persist()

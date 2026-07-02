@@ -57,16 +57,77 @@ struct ShellHandler: ToolHandler {
         // foreground/adopt path. No prompt-following required; handled in code.
         let wantsBackground = Self.isTruthyFlag(parameters["run_in_background"])
         let hasTrailingAmp = Self.hasTrailingBackgroundOperator(command)
-        if registry != nil, wantsBackground || hasTrailingAmp {
+
+        switch Self.route(sandboxEnabled: AgentSandbox.shared.isEnabled,
+                          wantsBackground: wantsBackground,
+                          hasTrailingAmp: hasTrailingAmp,
+                          hasRegistry: registry != nil) {
+        case .hostBackground:
             return await startInBackground(command: command, cwd: cwd, workingDirectory: workingDirectory)
-        }
-        // Explicit flag but no registry wired → graceful error (preserves the
-        // old contract). A bare `&` with no registry just runs foreground as
-        // before — nothing to manage it, but no worse than today.
-        if wantsBackground {
+        case .hostBackgroundUnavailable:
+            // Explicit flag but no registry wired → graceful error (preserves
+            // the old contract). A bare `&` with no registry just runs
+            // foreground as before — nothing to manage it, but no worse than today.
             return ShellMessages.backgroundUnavailable(cwd: cwd, seconds: Int(timeoutSeconds))
+        case .sandboxBackground:
+            // Sandbox ON + explicit background flag: the command must NOT reach
+            // the host ProcessRegistry (that executes on the host, defeating the
+            // isolation the user opted into). Background it INSIDE the guest —
+            // detached from the shell channel, output appended to a
+            // per-invocation log the model can tail with later shell calls.
+            let logPath = Self.sandboxBackgroundLogPath()
+            let wrapped = Self.sandboxBackgroundCommand(
+                Self.stripTrailingBackgroundOperator(command), logPath: logPath)
+            _ = try await AgentSandbox.shared.runForeground(
+                command: wrapped, workingDirectory: workingDirectory, timeout: timeoutSeconds)
+            return ShellMessages.sandboxBackgroundStarted(cwd: cwd, logPath: logPath)
+        case .sandboxForeground:
+            // Sandbox ON: run inside the isolated Linux guest. A trailing `&`
+            // rides through unchanged — the guest shell backgrounds it itself.
+            // We do NOT fall back to the host on a sandbox error — the user
+            // opted into isolation.
+            return try await AgentSandbox.shared.runForeground(
+                command: command, workingDirectory: workingDirectory, timeout: timeoutSeconds)
+        case .hostForeground:
+            return try await runForeground(command: command, cwd: cwd, workingDirectory: workingDirectory)
         }
-        return try await runForeground(command: command, cwd: cwd, workingDirectory: workingDirectory)
+    }
+
+    /// Where a shell command executes. Pure decision (unit-tested) so the
+    /// sandbox-vs-host-vs-background routing can't silently regress — the live
+    /// bug was the host-background branch running BEFORE the sandbox check, so
+    /// `run_in_background:"true"` escaped the guest onto the host.
+    enum ShellRoute: Equatable {
+        case hostBackground            // ProcessRegistry-managed host process
+        case hostBackgroundUnavailable // explicit flag, no registry → graceful error
+        case sandboxBackground         // backgrounded INSIDE the guest, log file
+        case sandboxForeground         // normal guest path (guest shell owns any `&`)
+        case hostForeground
+    }
+
+    static func route(sandboxEnabled: Bool, wantsBackground: Bool,
+                      hasTrailingAmp: Bool, hasRegistry: Bool) -> ShellRoute {
+        if sandboxEnabled {
+            // NEVER the host registry while sandboxed — regardless of registry.
+            return wantsBackground ? .sandboxBackground : .sandboxForeground
+        }
+        if hasRegistry, wantsBackground || hasTrailingAmp { return .hostBackground }
+        if wantsBackground { return .hostBackgroundUnavailable }
+        return .hostForeground
+    }
+
+    /// Wrap a command so the GUEST shell backgrounds it: detached from stdin
+    /// (the shell channel) with all output appended to `logPath` inside the
+    /// guest, so the foreground exec returns immediately and the sentinel
+    /// framing stays clean.
+    static func sandboxBackgroundCommand(_ command: String, logPath: String) -> String {
+        "(\(command)) </dev/null >>\(logPath) 2>&1 &"
+    }
+
+    /// Per-invocation guest log path (millisecond timestamp) so concurrent /
+    /// repeated background commands never interleave into one file.
+    static func sandboxBackgroundLogPath(now: Date = Date()) -> String {
+        "/tmp/mlx-bg-\(UInt64(now.timeIntervalSince1970 * 1000)).log"
     }
 
     /// Register a long-lived command with the process registry and return at once
@@ -236,6 +297,10 @@ final class ShellCapture: @unchecked Sendable {
 enum ShellMessages {
     static func started(cwd: String, handle: String, pid: Int32) -> String {
         "[cwd: \(cwd)]\nStarted in background as \(handle) (pid \(pid)). It keeps running — poll it with readProcessOutput {\"handle\": \"\(handle)\"}, stop it with killProcess {\"handle\": \"\(handle)\"}."
+    }
+
+    static func sandboxBackgroundStarted(cwd: String, logPath: String) -> String {
+        "[cwd: \(cwd)]\nStarted in the SANDBOX background (isolated Linux guest). Output is appended to \(logPath) inside the guest — check on it with the shell tool, e.g. {\"command\": \"tail -n 50 \(logPath)\"}. readProcessOutput/killProcess do not apply to sandboxed background commands; stop it with a shell kill inside the guest."
     }
 
     static func backgroundUnavailable(cwd: String, seconds: Int) -> String {

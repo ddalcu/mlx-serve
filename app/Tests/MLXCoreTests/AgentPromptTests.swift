@@ -106,6 +106,44 @@ final class AgentPromptTests: XCTestCase {
         XCTAssertNotEqual(a, b, "different stamps must not collide")
     }
 
+    // MARK: - Execution environment (sandbox-aware)
+
+    // The BASE prompt file is user-editable and serves both environments, so it
+    // must be OS-neutral; the per-request Execution environment section is what
+    // tells the model where shell commands actually run. Without this split, a
+    // macOS-flavored prompt sends `brew`/`open` into the Linux guest (and a
+    // Linux-flavored one sends `apt-get` at the host).
+    func testDefaultPromptIsEnvironmentNeutral() {
+        let p = AgentPrompt.defaultPromptFile
+        XCTAssertFalse(p.contains("macOS"),
+                       "base prompt must be OS-neutral — environment specifics ride the per-request section")
+        XCTAssertFalse(p.contains("brew"),
+                       "macOS-specific tooling must not be baked into the neutral base prompt")
+    }
+
+    func testExecutionEnvironmentSectionLinuxVariant() {
+        let s = AgentPrompt.executionEnvironmentSection(sandboxed: true)
+        XCTAssertTrue(s.contains("# Execution environment"))
+        XCTAssertTrue(s.contains("Linux"))
+        XCTAssertTrue(s.contains("/workspace"), "must explain the workspace mount point")
+        XCTAssertTrue(s.contains("brew") && s.contains("NOT"),
+                      "must warn off macOS-only tooling inside the guest")
+        XCTAssertTrue(s.lowercased().contains("network"),
+                      "must state the guest's network posture so failed downloads aren't retried forever")
+        XCTAssertTrue(s.contains("run_in_background") && s.lowercased().contains("log"),
+                      "must explain sandboxed background commands write to a guest log (no bg handle / readProcessOutput)")
+        XCTAssertFalse(s.contains("zsh"))
+    }
+
+    func testExecutionEnvironmentSectionMacVariant() {
+        let s = AgentPrompt.executionEnvironmentSection(sandboxed: false)
+        XCTAssertTrue(s.contains("# Execution environment"))
+        XCTAssertTrue(s.contains("Mac"))
+        XCTAssertTrue(s.contains("brew"), "host variant restores the macOS tooling hint")
+        XCTAssertFalse(s.contains("Linux"))
+        XCTAssertFalse(s.contains("/workspace"))
+    }
+
     // MARK: - Skill seeding
 
     private func tempSkillsDir() -> String {

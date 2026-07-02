@@ -15,28 +15,56 @@ final class MediaBundleTests: XCTestCase {
             ["path": "transformer-dev.safetensors", "type": "file", "size": 11_000_000_000],
             ["path": "connector.safetensors", "type": "file", "size": 5_900_000_000],
             ["path": "vae_decoder.safetensors", "type": "file", "size": 777_000_000],
-            // The ~50 GB we must NOT pull:
-            ["path": "ltx-2.3-22b-distilled-lora-384.safetensors", "type": "file", "size": 7_100_000_000],
-            ["path": "transformer-distilled.safetensors", "type": "file", "size": 11_000_000_000],
-            ["path": "spatial_upscaler_x1_5_v1_0.safetensors", "type": "file", "size": 1_000_000_000],
+            ["path": "audio_vae.safetensors", "type": "file", "size": 106_000_000],
+            ["path": "vocoder.safetensors", "type": "file", "size": 258_000_000],
+            // VAE encoder (~0.6 GB) → image-to-video first-frame conditioning.
             ["path": "vae_encoder.safetensors", "type": "file", "size": 608_000_000],
+            // Two-stage + proper one-stage pipelines (server-side):
+            ["path": "transformer-distilled.safetensors", "type": "file", "size": 11_000_000_000],
+            ["path": "spatial_upscaler_x2_v1_1.safetensors", "type": "file", "size": 1_000_000_000],
+            // The rest of the ~50 GB we must NOT pull:
+            ["path": "ltx-2.3-22b-distilled-lora-384.safetensors", "type": "file", "size": 7_100_000_000],
+            ["path": "spatial_upscaler_x1_5_v1_0.safetensors", "type": "file", "size": 1_000_000_000],
             ["path": "README.md", "type": "file", "size": 100],
         ]
-        let sel = FileSelection(keepSafetensors: [
-            "transformer-dev.safetensors", "connector.safetensors", "vae_decoder.safetensors",
-        ])
+        // Use the REAL bundle's selection so the test can't drift from production.
+        let sel = MediaBundle.ltx(repo: "owner/ltx", displayName: "LTX").components.first!.selection
         let picked = Set(DownloadManager.selectNeededFiles(from: entries, selection: sel).map(\.0))
-        // Keeps config jsons + exactly the 3 engine safetensors.
+        // Keeps config jsons + exactly the 8 engine safetensors (incl. audio VAE +
+        // encoder + the two-stage distilled transformer + x2 upscaler).
         XCTAssertTrue(picked.contains("config.json"))
         XCTAssertTrue(picked.contains("embedded_config.json"))
         XCTAssertTrue(picked.contains("transformer-dev.safetensors"))
         XCTAssertTrue(picked.contains("connector.safetensors"))
         XCTAssertTrue(picked.contains("vae_decoder.safetensors"))
-        XCTAssertEqual(picked.filter { $0.hasSuffix(".safetensors") }.count, 3)
+        XCTAssertTrue(picked.contains("audio_vae.safetensors"))  // sound: VAE
+        XCTAssertTrue(picked.contains("vocoder.safetensors"))    // sound: vocoder
+        XCTAssertTrue(picked.contains("vae_encoder.safetensors")) // image-to-video
+        XCTAssertTrue(picked.contains("transformer-distilled.safetensors"))    // two-stage stage 2 / one-stage
+        XCTAssertTrue(picked.contains("spatial_upscaler_x2_v1_1.safetensors")) // two-stage upscale
+        XCTAssertEqual(picked.filter { $0.hasSuffix(".safetensors") }.count, 8)
         XCTAssertFalse(picked.contains("ltx-2.3-22b-distilled-lora-384.safetensors"))
-        XCTAssertFalse(picked.contains("transformer-distilled.safetensors"))
         XCTAssertFalse(picked.contains("spatial_upscaler_x1_5_v1_0.safetensors"))
         XCTAssertFalse(picked.contains("README.md"))
+    }
+
+    func testLtxAudioFilesAreOptionalNotReadyMarkers() {
+        // The audio VAE + vocoder are allowlisted (pulled when the repo ships
+        // them) but must NOT gate readiness — a video-only checkpoint still
+        // downloads + plays.
+        let ltx = MediaBundle.ltx(repo: "owner/ltx", displayName: "LTX")
+        let primary = ltx.components.first!
+        // The audio VAE/vocoder, the VAE encoder (image-to-video), and the
+        // two-stage weights (distilled transformer + x2 upscaler) are
+        // allowlisted but optional — none gate readiness, so existing
+        // dev-only installs keep working.
+        for f in ["audio_vae.safetensors", "vocoder.safetensors", "vae_encoder.safetensors",
+                  "transformer-distilled.safetensors", "spatial_upscaler_x2_v1_1.safetensors"] {
+            XCTAssertTrue(primary.selection.keepSafetensors?.contains(f) ?? false,
+                          "\(f) must be in the download allowlist")
+            XCTAssertFalse(primary.readyMarkers.contains(f),
+                           "\(f) must NOT be a ready marker (optional feature)")
+        }
     }
 
     func testRecursiveKeepsWeightSubdirsThatChatDefaultDrops() {
@@ -105,7 +133,7 @@ final class MediaBundleTests: XCTestCase {
         XCTAssertEqual(b.components.count, 2)
         XCTAssertEqual(b.primaryRepo, "dgrauet/ltx-2.3-mlx-q4")
         XCTAssertEqual(b.dependencyRepos, ["mlx-community/gemma-3-12b-it-4bit"])
-        XCTAssertEqual(b.components[0].selection.keepSafetensors?.count, 3)   // allowlist
+        XCTAssertEqual(b.components[0].selection.keepSafetensors?.count, 8)   // allowlist (incl. audio VAE + vocoder + image encoder + two-stage weights)
     }
 
     func testFluxAndTtsBundlesAreRecursiveSingleComponent() {

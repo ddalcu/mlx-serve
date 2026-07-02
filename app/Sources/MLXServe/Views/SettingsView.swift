@@ -46,6 +46,13 @@ struct SettingsView: View {
                     }
 
                     SettingsSection(
+                        title: "Agent Sandbox",
+                        subtitle: "Run the agent's shell commands inside an isolated Linux sandbox instead of directly on this Mac. Off by default; applies to the next command — no restart needed."
+                    ) {
+                        SandboxSectionContent()
+                    }
+
+                    SettingsSection(
                         title: "Messaging — Telegram bot",
                         subtitle: "Message your local model from your phone via a Telegram bot. No public URL or port-forwarding needed — the app long-polls Telegram over your normal internet connection, so it works behind home Wi-Fi."
                     ) {
@@ -1245,6 +1252,38 @@ private struct RequestDefaultsSectionContent: View {
             best = i
         }
         return best
+    }
+}
+
+// MARK: - Agent sandbox section
+
+/// Toggle + base-image field for the agent execution sandbox. This is an
+/// app-side agent-behavior setting (the tool executor reads it), NOT a
+/// server-launch flag — so it binds straight through
+/// `appState.serverOptions.sandbox` with no restart banner and no CLI flag.
+private struct SandboxSectionContent: View {
+    @EnvironmentObject var appState: AppState
+
+    var body: some View {
+        SettingsRow(
+            title: "Sandbox agent commands",
+            explainer: "OFF = the agent runs shell commands directly on macOS (fast, full access to your files). ON = commands run inside an isolated Linux sandbox that can only touch the current working folder, so a bad command can't harm the rest of your Mac. Costs a bit more memory while active because it spins up a lightweight virtual machine for the session."
+        ) {
+            Toggle("", isOn: $appState.serverOptions.sandbox.enabled)
+                .labelsHidden()
+                .toggleStyle(.switch)
+        }
+
+        SettingsRow(
+            title: "Base image",
+            explainer: "The Docker/OCI image the sandbox boots from. Must have an arm64 build (Apple Silicon) — an amd64-only image won't boot. The default ddalcu/agent-shell is a purpose-built agentic shell (Node.js + Python3/pip + git/curl + apt). Pulled once on first use, then cached; a heavier image uses more disk and takes longer the first time."
+        ) {
+            TextField("", text: $appState.serverOptions.sandbox.baseImage,
+                      prompt: Text("ddalcu/agent-shell"))
+                .textFieldStyle(.roundedBorder)
+                .font(.body.monospaced())
+                .frame(width: 260)
+        }
     }
 }
 

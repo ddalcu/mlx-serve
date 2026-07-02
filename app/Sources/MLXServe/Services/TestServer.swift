@@ -487,7 +487,9 @@ class TestServer {
             )
             let userContent = history.last { ($0["role"] as? String) == "user" }?["content"] as? String ?? ""
             let skills = AgentPrompt.skillManager.matchingSkills(for: userContent)
-            var systemPrompt = AgentPrompt.systemPrompt + skills + AgentPrompt.memory + appState.agentMemory.contextSnippet()
+            var systemPrompt = AgentPrompt.systemPrompt
+                + AgentPrompt.executionEnvironmentSection(sandboxed: AgentSandbox.shared.isEnabled)
+                + skills + AgentPrompt.memory + appState.agentMemory.contextSnippet()
             if let wd = workDir {
                 systemPrompt += AgentEngine.workingDirectoryContext(wd)
             }

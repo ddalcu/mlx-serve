@@ -471,6 +471,7 @@ extension ServerOptionsTests {
         o.perRequestEnableDrafter = .off
         o.telegram = .init(enabled: true, botToken: "1:abc", agentMode: true,
                            useMCP: true, enableThinking: true, allowedChatIds: [7, 8])
+        o.sandbox = .init(enabled: true, baseImage: "alpine")
 
         XCTAssertNotEqual(o, ServerOptions(), "sanity: every field moved off its default")
         let decoded = try JSONDecoder().decode(ServerOptions.self, from: try JSONEncoder().encode(o))
@@ -600,5 +601,65 @@ extension ServerOptionsTests {
         XCTAssertFalse(field.title.isEmpty)
         XCTAssertFalse(field.explainer.isEmpty)
         XCTAssertTrue(field.needsRestart, "ssd-streaming is a launch flag — must flag a restart")
+    }
+}
+
+extension ServerOptionsTests {
+    // MARK: - Agent sandbox (contain) — app-side setting, NOT a server-launch flag
+    //
+    // The sandbox routes the agent's shell commands into an isolated Linux guest
+    // (the embedded `contain` library) instead of running them on host macOS. It
+    // lives on the app side (the tool executor reads it), so — like `telegram` —
+    // it must never reach the server CLI or trip the restart banner.
+
+    func testSandboxDefaultsOff() {
+        let s = ServerOptions().sandbox
+        XCTAssertFalse(s.enabled, "the sandbox must be opt-in (off by default)")
+        XCTAssertEqual(s.baseImage, "ddalcu/agent-shell",
+                       "default base image must be arm64 — the HVF guest can't run an amd64-only image")
+    }
+
+    func testSandboxIsNotAServerLaunchFlag() {
+        var opts = ServerOptions()
+        opts.sandbox.enabled = true
+        opts.sandbox.baseImage = "ubuntu:24.04"
+        XCTAssertTrue(ServerOptions().serverLaunchEquals(opts),
+                      "toggling the sandbox is app-side — it must not require a server restart")
+        let args = opts.toCLIArgs()
+        XCTAssertFalse(args.contains { $0.contains("sandbox") || $0.contains("contain") },
+                       "the sandbox setting must never reach the server CLI")
+    }
+
+    func testSandboxLegacyBlobDecodesToDefaults() throws {
+        // A config.json written before the sandbox field existed must decode with
+        // sandbox defaulted (off), never throw and reset the user's whole config.
+        let legacy = #"{"host":"0.0.0.0","port":11234}"#.data(using: .utf8)!
+        let decoded = try JSONDecoder().decode(ServerOptions.self, from: legacy)
+        XCTAssertFalse(decoded.sandbox.enabled)
+        XCTAssertEqual(decoded.sandbox.baseImage, "ddalcu/agent-shell")
+    }
+
+    func testSandboxRoundTripsThroughDecoder() throws {
+        var o = ServerOptions()
+        o.sandbox = .init(enabled: true, baseImage: "python:3.12")
+        let decoded = try JSONDecoder().decode(ServerOptions.self, from: try JSONEncoder().encode(o))
+        XCTAssertEqual(decoded.sandbox, o.sandbox,
+                       "a field missing from SandboxConfig.init(from:) would revert to its default here")
+    }
+
+    func testSandboxTrimmedBaseImageStripsWhitespace() {
+        var s = ServerOptions.SandboxConfig()
+        s.baseImage = "  nikolaik/python-nodejs\n"
+        XCTAssertEqual(s.trimmedBaseImage, "nikolaik/python-nodejs")
+    }
+
+    func testSandboxResetToDefaultsClearsIt() {
+        // Settings' "Reset to Defaults" assigns ServerOptions(); the sandbox must
+        // come back off with the default image.
+        var o = ServerOptions()
+        o.sandbox = .init(enabled: true, baseImage: "alpine")
+        o = ServerOptions()
+        XCTAssertFalse(o.sandbox.enabled)
+        XCTAssertEqual(o.sandbox.baseImage, "ddalcu/agent-shell")
     }
 }

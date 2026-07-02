@@ -471,6 +471,307 @@ pub fn vaeDecode(comp: *const Component, latent_bcfhw: mlx.mlx_array, s: S) !mlx
     return out;
 }
 
+// ── 3D VAE encoder (mirror of vaeDecode) — the I2V first-frame conditioning path ──
+//
+// Encodes a SINGLE image (F=1 → F'=1) to a 128-channel latent. Reference:
+// ltx_core_mlx VideoEncoder.encode + sampling.py (SpaceToDepthDownsample /
+// patchify_spatial / space_to_depth). The encoder is `causal=True`: temporal
+// padding replicates the first frame (k-1) times at the FRONT only (vs the
+// decoder's symmetric replicate). For the single-image case the temporal dim
+// is trivially 1 throughout (each temporal-stride-2 downsample collapses the
+// causal-prepended 2 frames back to 1).
+
+/// Encoder-side (causal=True) Conv3dBlock forward: replicate first frame (k-1)
+/// times at the FRONT for temporal padding, spatial zero-pad, conv3d(pad=0),
+/// + bias. `x` is NDHWC `[B,D,H,W,C]`; `weight` is MLX `[O,kD,kH,kW,I]`.
+pub fn encoderConv3d(x: mlx.mlx_array, weight: mlx.mlx_array, bias: ?mlx.mlx_array, k: u32, spatial_pad: u32, s: S) !mlx.mlx_array {
+    var t = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_array_set(&t, x));
+
+    if (k > 1) {
+        const front: c_int = @intCast(k - 1);
+        const first = try sliceAxis1(x, 0, 1, s);
+        defer _ = mlx.mlx_array_free(first);
+        var fp = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(fp);
+        try mlx.check(mlx.mlx_repeat_axis(&fp, first, front, 1, s));
+        const vec = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(vec);
+        _ = mlx.mlx_vector_array_append_value(vec, fp);
+        _ = mlx.mlx_vector_array_append_value(vec, x);
+        var nt = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_concatenate_axis(&nt, vec, 1, s));
+        _ = mlx.mlx_array_free(t);
+        t = nt;
+    }
+    if (spatial_pad > 0) {
+        const sp: c_int = @intCast(spatial_pad);
+        const axes = [_]c_int{ 2, 3 };
+        const lo = [_]c_int{ sp, sp };
+        const hi = [_]c_int{ sp, sp };
+        const zero = mlx.mlx_array_new_float(0);
+        defer _ = mlx.mlx_array_free(zero);
+        var nt = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_pad(&nt, t, &axes, 2, &lo, 2, &hi, 2, zero, "constant", s));
+        _ = mlx.mlx_array_free(t);
+        t = nt;
+    }
+    // mlx_conv miscomputes on strided/lazy input — materialize first.
+    var tc = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(tc);
+    try mlx.check(mlx.mlx_contiguous(&tc, t, false, s));
+    _ = mlx.mlx_array_free(t);
+
+    const out = try conv3d(tc, weight, .{ 1, 1, 1 }, .{ 0, 0, 0 }, s);
+    if (bias) |b| {
+        var wb = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_add(&wb, out, b, s));
+        _ = mlx.mlx_array_free(out);
+        return wb;
+    }
+    return out;
+}
+
+/// Look up `<base>.weight`/`.bias` and run the causal encoder conv (k=3, pad=1).
+fn encoderConvByKey(comp: *const Component, base: []const u8, x: mlx.mlx_array, s: S) !mlx.mlx_array {
+    var wbuf: [256]u8 = undefined;
+    var bbuf: [256]u8 = undefined;
+    const wk = try std.fmt.bufPrint(&wbuf, "{s}.weight", .{base});
+    const bk = try std.fmt.bufPrint(&bbuf, "{s}.bias", .{base});
+    const w = comp.get(wk) orelse return error.MissingVaeWeight;
+    const b = comp.get(bk);
+    return encoderConv3d(x, w, b, 3, 1, s);
+}
+
+/// Spatial patchify (space-to-depth): (B,F,H,W,C) → (B,F,H/ps,W/ps,C·ps·ps).
+/// Channel split order (c, r=W, q=H) — matches reference patchify_spatial
+/// (the inverse pattern of `unpatchifySpatial`).
+fn patchifySpatial4(x: mlx.mlx_array, ps: u32, s: S) !mlx.mlx_array {
+    const sh = mlx.getShape(x);
+    const B = sh[0];
+    const F = sh[1];
+    const H = sh[2];
+    const W = sh[3];
+    const C = sh[4];
+    const psc: c_int = @intCast(ps);
+    const r1 = try reshapeTo(x, &[_]c_int{ B, F, @divExact(H, psc), psc, @divExact(W, psc), psc, C }, s);
+    defer _ = mlx.mlx_array_free(r1);
+    // indices: 0=B,1=F,2=Hp,3=q_H,4=Wp,5=r_W,6=C → (B,F,Hp,Wp,C,r_W,q_H)
+    const t = try transposeTo(r1, &[_]c_int{ 0, 1, 2, 4, 6, 5, 3 }, s);
+    defer _ = mlx.mlx_array_free(t);
+    return reshapeTo(t, &[_]c_int{ B, F, @divExact(H, psc), @divExact(W, psc), C * psc * psc }, s);
+}
+
+/// Space-to-depth downsample rearrange: (B,D,H,W,C) → (B,D/st,H/sh,W/sw,C·st·sh·sw).
+/// Channel order (c, st, sh, sw) — c outermost (reference space_to_depth).
+fn spaceToDepth(x: mlx.mlx_array, st: u32, sh_: u32, sw: u32, s: S) !mlx.mlx_array {
+    const shp = mlx.getShape(x);
+    const B = shp[0];
+    const D = shp[1];
+    const H = shp[2];
+    const W = shp[3];
+    const C = shp[4];
+    const sti: c_int = @intCast(st);
+    const shi: c_int = @intCast(sh_);
+    const swi: c_int = @intCast(sw);
+    const r1 = try reshapeTo(x, &[_]c_int{ B, @divExact(D, sti), sti, @divExact(H, shi), shi, @divExact(W, swi), swi, C }, s);
+    defer _ = mlx.mlx_array_free(r1);
+    // (B, D/st, st, H/sh, sh, W/sw, sw, C) → (B, D/st, H/sh, W/sw, C, st, sh, sw)
+    const t = try transposeTo(r1, &[_]c_int{ 0, 1, 3, 5, 7, 2, 4, 6 }, s);
+    defer _ = mlx.mlx_array_free(t);
+    return reshapeTo(t, &[_]c_int{ B, @divExact(D, sti), @divExact(H, shi), @divExact(W, swi), C * sti * shi * swi }, s);
+}
+
+/// Encoder pre-activation residual block (causal): conv2(silu(pn(conv1(silu(pn(x)))))) + x.
+fn resBlock3dEnc(comp: *const Component, x: mlx.mlx_array, down_idx: u32, blk: u32, s: S) !mlx.mlx_array {
+    var b1: [256]u8 = undefined;
+    var b2: [256]u8 = undefined;
+    const k1 = try std.fmt.bufPrint(&b1, "vae_encoder.down_blocks.{d}.res_blocks.{d}.conv1.conv", .{ down_idx, blk });
+    const pn1 = try pixelNormFast(x, 1e-8, s);
+    defer _ = mlx.mlx_array_free(pn1);
+    const a1 = try silu(pn1, s);
+    defer _ = mlx.mlx_array_free(a1);
+    const c1 = try encoderConvByKey(comp, k1, a1, s);
+    defer _ = mlx.mlx_array_free(c1);
+    const k2 = try std.fmt.bufPrint(&b2, "vae_encoder.down_blocks.{d}.res_blocks.{d}.conv2.conv", .{ down_idx, blk });
+    const pn2 = try pixelNormFast(c1, 1e-8, s);
+    defer _ = mlx.mlx_array_free(pn2);
+    const a2 = try silu(pn2, s);
+    defer _ = mlx.mlx_array_free(a2);
+    const c2 = try encoderConvByKey(comp, k2, a2, s);
+    defer _ = mlx.mlx_array_free(c2);
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_add(&out, c2, x, s));
+    return out;
+}
+
+/// SpaceToDepthDownsample: two-branch (group-mean skip + conv) downsample.
+/// Reference sampling.py SpaceToDepthDownsample.
+fn s2dDownsample(comp: *const Component, x_in: mlx.mlx_array, down_idx: u32, in_ch: u32, out_ch: u32, st: u32, sh_: u32, sw: u32, s: S) !mlx.mlx_array {
+    const prod = st * sh_ * sw;
+    const group_size = in_ch * prod / out_ch;
+
+    // Causal temporal prepend when downsampling time (stride[0]==2).
+    var x = mlx.mlx_array_new();
+    if (st == 2) {
+        const first = try sliceAxis1(x_in, 0, 1, s);
+        defer _ = mlx.mlx_array_free(first);
+        const vec = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(vec);
+        _ = mlx.mlx_vector_array_append_value(vec, first);
+        _ = mlx.mlx_vector_array_append_value(vec, x_in);
+        try mlx.check(mlx.mlx_concatenate_axis(&x, vec, 1, s));
+    } else {
+        try mlx.check(mlx.mlx_array_set(&x, x_in));
+    }
+    defer _ = mlx.mlx_array_free(x);
+
+    // Skip branch: space-to-depth → optional group-mean.
+    var x_skip = try spaceToDepth(x, st, sh_, sw, s);
+    if (group_size > 1) {
+        const sh = mlx.getShape(x_skip);
+        const B = sh[0];
+        const D = sh[1];
+        const H = sh[2];
+        const W = sh[3];
+        const oc: c_int = @intCast(out_ch);
+        const gs: c_int = @intCast(group_size);
+        const rg = try reshapeTo(x_skip, &[_]c_int{ B, D, H, W, oc, gs }, s);
+        _ = mlx.mlx_array_free(x_skip);
+        defer _ = mlx.mlx_array_free(rg);
+        var m = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_mean_axis(&m, rg, -1, false, s));
+        x_skip = m;
+    }
+    defer _ = mlx.mlx_array_free(x_skip);
+
+    // Conv branch: causal conv → space-to-depth.
+    var kbuf: [256]u8 = undefined;
+    const key = try std.fmt.bufPrint(&kbuf, "vae_encoder.down_blocks.{d}.conv.conv", .{down_idx});
+    const cv = try encoderConvByKey(comp, key, x, s);
+    defer _ = mlx.mlx_array_free(cv);
+    const x_conv = try spaceToDepth(cv, st, sh_, sw, s);
+    defer _ = mlx.mlx_array_free(x_conv);
+
+    var sum = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_add(&sum, x_conv, x_skip, s));
+    // S2D produces strided views; materialize so the next stage's conv reads it right.
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_contiguous(&out, sum, false, s));
+    _ = mlx.mlx_array_free(sum);
+    return out;
+}
+
+const DownStageSpec = struct { down_idx: u32, num_blocks: u32 };
+const DownSpec = struct { down_idx: u32, in_ch: u32, out_ch: u32, st: u32, sh: u32, sw: u32 };
+
+/// Encode pixels `[B,3,F,H,W]` (BCFHW, [-1,1]) → latent `[B,128,F',H',W']` (BCFHW).
+/// Weights live in `comp` (the vae_encoder component). For I2V conditioning the
+/// caller always passes a single image (F=1 → F'=1).
+pub fn vaeEncode(comp: *const Component, pixels_bcfhw: mlx.mlx_array, s: S) !mlx.mlx_array {
+    // BCFHW → BFHWC.
+    var x = try transposeTo(pixels_bcfhw, &[_]c_int{ 0, 2, 3, 4, 1 }, s);
+
+    // Spatial patchify: (B,F,H,W,3) → (B,F,H/4,W/4,48).
+    {
+        const px = try patchifySpatial4(x, 4, s);
+        _ = mlx.mlx_array_free(x);
+        x = px;
+    }
+    // conv_in (48→128).
+    {
+        const nx = try encoderConvByKey(comp, "vae_encoder.conv_in.conv", x, s);
+        _ = mlx.mlx_array_free(x);
+        x = nx;
+    }
+
+    // down_blocks: even = ResStage, odd = SpaceToDepthDownsample.
+    const stages = [_]DownStageSpec{
+        .{ .down_idx = 0, .num_blocks = 4 }, .{ .down_idx = 2, .num_blocks = 6 },
+        .{ .down_idx = 4, .num_blocks = 4 }, .{ .down_idx = 6, .num_blocks = 2 },
+        .{ .down_idx = 8, .num_blocks = 2 },
+    };
+    const downs = [_]DownSpec{
+        .{ .down_idx = 1, .in_ch = 128, .out_ch = 256, .st = 1, .sh = 2, .sw = 2 },
+        .{ .down_idx = 3, .in_ch = 256, .out_ch = 512, .st = 2, .sh = 1, .sw = 1 },
+        .{ .down_idx = 5, .in_ch = 512, .out_ch = 1024, .st = 2, .sh = 2, .sw = 2 },
+        .{ .down_idx = 7, .in_ch = 1024, .out_ch = 1024, .st = 2, .sh = 2, .sw = 2 },
+    };
+    var i: u32 = 0;
+    while (i <= 8) : (i += 1) {
+        if (i % 2 == 0) {
+            const spec = for (stages) |r| {
+                if (r.down_idx == i) break r;
+            } else unreachable;
+            var b: u32 = 0;
+            while (b < spec.num_blocks) : (b += 1) {
+                const nx = try resBlock3dEnc(comp, x, i, b, s);
+                _ = mlx.mlx_array_free(x);
+                x = nx;
+            }
+        } else {
+            const spec = for (downs) |u| {
+                if (u.down_idx == i) break u;
+            } else unreachable;
+            const nx = try s2dDownsample(comp, x, i, spec.in_ch, spec.out_ch, spec.st, spec.sh, spec.sw, s);
+            _ = mlx.mlx_array_free(x);
+            x = nx;
+        }
+        _ = mlx.mlx_array_eval(x); // bound the lazy graph across stages
+    }
+
+    // conv_out(silu(pixel_norm(x))) (1024→129).
+    {
+        const pn = try pixelNormFast(x, 1e-8, s);
+        _ = mlx.mlx_array_free(x);
+        const a = try silu(pn, s);
+        _ = mlx.mlx_array_free(pn);
+        const co = try encoderConvByKey(comp, "vae_encoder.conv_out.conv", a, s);
+        _ = mlx.mlx_array_free(a);
+        x = co;
+    }
+
+    // Take the first 128 channels (the mean; the rest is dropped — deterministic).
+    {
+        const sh = mlx.getShape(x);
+        const st = [_]c_int{ 0, 0, 0, 0, 0 };
+        const sp = [_]c_int{ sh[0], sh[1], sh[2], sh[3], 128 };
+        const stride = [_]c_int{ 1, 1, 1, 1, 1 };
+        var sl = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_slice(&sl, x, &st, 5, &sp, 5, &stride, 5, s));
+        _ = mlx.mlx_array_free(x);
+        var cont = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_contiguous(&cont, sl, false, s));
+        _ = mlx.mlx_array_free(sl);
+        x = cont;
+    }
+
+    // normalize_latent: (x - mean) / std, stats [128] → [1,1,1,1,128].
+    {
+        const mean = comp.get("vae_encoder.per_channel_statistics._mean_of_means") orelse return error.MissingVaeWeight;
+        const std_ = comp.get("vae_encoder.per_channel_statistics._std_of_means") orelse return error.MissingVaeWeight;
+        const mr = try reshapeTo(mean, &[_]c_int{ 1, 1, 1, 1, 128 }, s);
+        defer _ = mlx.mlx_array_free(mr);
+        const sr = try reshapeTo(std_, &[_]c_int{ 1, 1, 1, 1, 128 }, s);
+        defer _ = mlx.mlx_array_free(sr);
+        var xm = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_subtract(&xm, x, mr, s));
+        _ = mlx.mlx_array_free(x);
+        var xd = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_divide(&xd, xm, sr, s));
+        _ = mlx.mlx_array_free(xm);
+        x = xd;
+    }
+
+    // BFHWC → BCFHW, materialized.
+    const t = try transposeTo(x, &[_]c_int{ 0, 4, 1, 2, 3 }, s);
+    _ = mlx.mlx_array_free(x);
+    defer _ = mlx.mlx_array_free(t);
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_contiguous(&out, t, false, s));
+    return out;
+}
+
 // ── Connector: TextEmbeddingProjection (stage 2, front half) ──
 // 49 Gemma hidden states [1,T,3840] → video[1,T,4096] + audio[1,T,2048].
 // Per-token RMS over the 49-layer stack (axis 3840), reshape to [1,T,188160],
@@ -1246,6 +1547,49 @@ fn ditTimestepSinusoid(t_scaled: f32, dim: u32, s: S) !mlx.mlx_array {
     return out;
 }
 
+/// Per-token sinusoidal timestep embedding `[N, dim]` — `ditTimestepSinusoid`
+/// applied row-wise to each `t_scaled[n]` (= the reference `get_timestep_embedding`
+/// on a flat `(N,)` vector). Used for I2V per-token AdaLN: clean tokens get
+/// t_scaled=0, generated tokens get t_scaled=sigma*1000.
+fn ditTimestepSinusoidPerToken(t_scaled: []const f32, dim: u32, s: S) !mlx.mlx_array {
+    const N: c_int = @intCast(t_scaled.len);
+    const half: c_int = @intCast(dim / 2);
+    var ar = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ar);
+    try mlx.check(mlx.mlx_arange(&ar, 0.0, @floatFromInt(dim / 2), 1.0, .float32, s));
+    const coef: f32 = -@log(@as(f32, 10000.0)) / @as(f32, @floatFromInt(dim / 2));
+    const cscal = mlx.mlx_array_new_float(coef);
+    defer _ = mlx.mlx_array_free(cscal);
+    var expo = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(expo);
+    try mlx.check(mlx.mlx_multiply(&expo, ar, cscal, s));
+    var freqs = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(freqs);
+    try mlx.check(mlx.mlx_exp(&freqs, expo, s));
+    var freqs2 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(freqs2);
+    try mlx.check(mlx.mlx_reshape(&freqs2, freqs, &[_]c_int{ 1, half }, 2, s)); // [1, half]
+    // Per-token scaled timesteps [N, 1] (mlx_array_new_data copies the buffer).
+    const td = mlx.mlx_array_new_data(t_scaled.ptr, &[_]c_int{ N, 1 }, 2, .float32);
+    defer _ = mlx.mlx_array_free(td);
+    var args = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(args);
+    try mlx.check(mlx.mlx_multiply(&args, td, freqs2, s)); // [N, half] (broadcast)
+    var cs = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(cs);
+    try mlx.check(mlx.mlx_cos(&cs, args, s));
+    var sn = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sn);
+    try mlx.check(mlx.mlx_sin(&sn, args, s));
+    const vec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(vec);
+    _ = mlx.mlx_vector_array_append_value(vec, cs);
+    _ = mlx.mlx_vector_array_append_value(vec, sn);
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_concatenate_axis(&out, vec, 1, s)); // [N, dim]
+    return out;
+}
+
 const AdaLNOut = struct { params: mlx.mlx_array, embedded: mlx.mlx_array };
 
 /// AdaLayerNormSingle: embedded = linear2(silu(linear1(t_sin))) [the timestep
@@ -1327,6 +1671,71 @@ fn adalnRow(combined: mlx.mlx_array, i: u32, dim: u32, s: S) !mlx.mlx_array {
     const ii: c_int = @intCast(i);
     var out = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_slice(&out, combined, &[_]c_int{ 0, ii, 0 }, 3, &[_]c_int{ 1, ii + 1, di }, 3, &[_]c_int{ 1, 1, 1 }, 3, s));
+    return out;
+}
+
+// ── Per-token AdaLN (I2V first-frame conditioning) ──────────────────────────
+// The reference `_unpack_adaln` branches on `params.ndim`: SCALAR `[1, P*dim]`
+// (broadcast over all tokens) vs PER-TOKEN `[N, P*dim]` (one param set per token,
+// so a clean token at timestep 0 gets unmodulated). `n_tokens == 0` selects the
+// scalar path (the EXACT, byte-unchanged t2v code); `n_tokens > 0` builds the
+// per-token form. `modulate` is already element-wise so `[1,1,dim]` (scalar) and
+// `[1,N,dim]` (per-token) scale/shift both broadcast against `[1,N,dim]` hidden.
+
+/// adaLN combine, scalar OR per-token. Scalar (`n_tokens==0`) → `[1,P,dim]` via
+/// the unchanged `adalnCombine`. Per-token → params `[N, P*dim]` reshaped to
+/// `[1,N,P,dim]` + `table[:P]` broadcast over N.
+fn adalnUnpack(comp: *const Component, alloc: std.mem.Allocator, params: mlx.mlx_array, table_key: []const u8, P: u32, dim: u32, n_tokens: u32, s: S) !mlx.mlx_array {
+    if (n_tokens == 0) return adalnCombine(comp, alloc, params, table_key, P, dim, s);
+    const N: c_int = @intCast(n_tokens);
+    const Pi: c_int = @intCast(P);
+    const di: c_int = @intCast(dim);
+    const table = comp.get(table_key) orelse return error.MissingDitWeight; // [P_table, dim] f32
+    var p4 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(p4);
+    try mlx.check(mlx.mlx_reshape(&p4, params, &[_]c_int{ 1, N, Pi, di }, 4, s));
+    var trows = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(trows);
+    try mlx.check(mlx.mlx_slice(&trows, table, &[_]c_int{ 0, 0 }, 2, &[_]c_int{ Pi, di }, 2, &[_]c_int{ 1, 1 }, 2, s));
+    var t4 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(t4);
+    try mlx.check(mlx.mlx_reshape(&t4, trows, &[_]c_int{ 1, 1, Pi, di }, 4, s));
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_add(&out, p4, t4, s)); // [1,N,P,dim] (bf16+f32 → f32)
+    return out;
+}
+
+/// Slice param row `i`: scalar `[1,P,dim]` → `[1,1,dim]` (via `adalnRow`),
+/// per-token `[1,N,P,dim]` → `[1,N,dim]`.
+fn adalnRowN(combined: mlx.mlx_array, i: u32, dim: u32, n_tokens: u32, s: S) !mlx.mlx_array {
+    if (n_tokens == 0) return adalnRow(combined, i, dim, s);
+    const N: c_int = mlx.getShape(combined)[1];
+    const di: c_int = @intCast(dim);
+    const ii: c_int = @intCast(i);
+    var sl = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sl);
+    try mlx.check(mlx.mlx_slice(&sl, combined, &[_]c_int{ 0, 0, ii, 0 }, 4, &[_]c_int{ 1, N, ii + 1, di }, 4, &[_]c_int{ 1, 1, 1, 1 }, 4, s));
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_reshape(&out, sl, &[_]c_int{ 1, N, di }, 3, s));
+    return out;
+}
+
+/// Blend predicted x0 with the clean latent: `x0*mask + clean*(1-mask)`
+/// (reference `apply_denoise_mask`). `mask` is `[1,N,1]` (1=generate, 0=preserve).
+fn applyDenoiseMask(x0: mlx.mlx_array, clean: mlx.mlx_array, mask: mlx.mlx_array, s: S) !mlx.mlx_array {
+    var xm = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(xm);
+    try mlx.check(mlx.mlx_multiply(&xm, x0, mask, s));
+    const one = mlx.mlx_array_new_float(1.0);
+    defer _ = mlx.mlx_array_free(one);
+    var inv = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(inv);
+    try mlx.check(mlx.mlx_subtract(&inv, one, mask, s));
+    var cm = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(cm);
+    try mlx.check(mlx.mlx_multiply(&cm, clean, inv, s));
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_add(&out, xm, cm, s));
     return out;
 }
 
@@ -1428,7 +1837,7 @@ fn ditRope(alloc: std.mem.Allocator, pos: []const f32, N: u32, A: u32, num_heads
 /// no mask); per-head gate 2*sigmoid(to_gate_logits(x)); to_out. `cq/sq` and
 /// `ck/sk` may be null (text cross-attn: use_rope=false). `x` is the query input,
 /// `kv` the key/value input (== x for self-attn).
-fn ditAttention(comp: *const Component, alloc: std.mem.Allocator, x: mlx.mlx_array, kv: mlx.mlx_array, prefix: []const u8, num_heads: u32, head_dim: u32, cq: ?mlx.mlx_array, sq: ?mlx.mlx_array, ck: ?mlx.mlx_array, sk: ?mlx.mlx_array, eps: f32, s: S) !mlx.mlx_array {
+fn ditAttention(comp: *const Component, alloc: std.mem.Allocator, x: mlx.mlx_array, kv: mlx.mlx_array, prefix: []const u8, num_heads: u32, head_dim: u32, cq: ?mlx.mlx_array, sq: ?mlx.mlx_array, ck: ?mlx.mlx_array, sk: ?mlx.mlx_array, eps: f32, skip_to_values: bool, s: S) !mlx.mlx_array {
     const nh: c_int = @intCast(num_heads);
     const hdi: c_int = @intCast(head_dim);
     const inner: c_int = @intCast(num_heads * head_dim);
@@ -1498,6 +1907,12 @@ fn ditAttention(comp: *const Component, alloc: std.mem.Allocator, x: mlx.mlx_arr
     var attn = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(attn);
     try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn, qh, kh, vh, scale, "", null_arr, null_arr, s));
+    if (skip_to_values) {
+        // STG perturbation (full skip at B=1): replace the attention output with
+        // the value projection — reference `out*mask + v*(1-mask)` with mask=0,
+        // applied BEFORE the per-head gate (attention.py).
+        try mlx.check(mlx.mlx_array_set(&attn, vh));
+    }
     { // per-head gate: 2*sigmoid(to_gate_logits(x)) [1,Nq,heads] → [1,heads,Nq,1]
         const gb = try std.fmt.allocPrint(alloc, "{s}.to_gate_logits", .{prefix});
         defer alloc.free(gb);
@@ -1574,6 +1989,25 @@ fn residGate(x: mlx.mlx_array, delta: mlx.mlx_array, gate: mlx.mlx_array, s: S) 
     return out;
 }
 
+/// Attention perturbations for guided sampling (STG + isolated-modality
+/// guidance, reference guidance/perturbations.py). Default = no perturbation
+/// (byte-identical forward for every existing caller).
+pub const DitPerturb = struct {
+    /// Isolated-modality forward: drop the A2V + V2A cross-attention residuals
+    /// in EVERY block (reference SKIP_A2V_CROSS_ATTN + SKIP_V2A_CROSS_ATTN with
+    /// blocks=None; at B=1 the mask zeroes the whole contribution).
+    skip_av_cross: bool = false,
+    /// STG: skip video/audio self-attention (attention output → values) in
+    /// these block indices (reference SKIP_VIDEO/AUDIO_SELF_ATTN).
+    stg_video_blocks: []const u32 = &.{},
+    stg_audio_blocks: []const u32 = &.{},
+
+    fn hits(blocks: []const u32, blk: u32) bool {
+        for (blocks) |b| if (b == blk) return true;
+        return false;
+    }
+};
+
 /// One BasicAVTransformerBlock (transformer.py). `vh_in`/`ah_in` are borrowed
 /// (caller frees); returns freshly-owned (video_hidden, audio_hidden). All adaLN
 /// params are (1, P*dim) bf16; rope cos/sin are f32 [1,heads,N,hd/2].
@@ -1598,6 +2032,11 @@ fn ditBlock(
     video_text: mlx.mlx_array,
     audio_text: mlx.mlx_array,
     rope: BlockRope,
+    // Per-token video AdaLN (I2V): 0 = scalar (t2v, byte-unchanged); else Nv,
+    // and `video_adaln_params`/`av_ca_video_params` are `[Nv, P*dim]` (one row
+    // per video token). Audio + prompt + AV gates stay scalar regardless.
+    nv_pt: u32,
+    ptb: DitPerturb,
     s: S,
 ) !BlockOut {
     const vdim = cfg.videoDim(); // 4096
@@ -1611,10 +2050,10 @@ fn ditBlock(
         }
     };
 
-    // ── adaLN unpack (scalar mode) ──
+    // ── adaLN unpack (video = scalar OR per-token via nv_pt; audio always scalar) ──
     const sst = try pfx.k(alloc, blk, "scale_shift_table");
     defer alloc.free(sst);
-    const vcomb = try adalnCombine(comp, alloc, video_adaln_params, sst, 9, vdim, s);
+    const vcomb = try adalnUnpack(comp, alloc, video_adaln_params, sst, 9, vdim, nv_pt, s);
     defer _ = mlx.mlx_array_free(vcomb);
     const asst = try pfx.k(alloc, blk, "audio_scale_shift_table");
     defer alloc.free(asst);
@@ -1622,7 +2061,7 @@ fn ditBlock(
     defer _ = mlx.mlx_array_free(acomb);
     const avv_k = try pfx.k(alloc, blk, "scale_shift_table_a2v_ca_video");
     defer alloc.free(avv_k);
-    const avv = try adalnCombine(comp, alloc, av_ca_video_params, avv_k, 4, vdim, s);
+    const avv = try adalnUnpack(comp, alloc, av_ca_video_params, avv_k, 4, vdim, nv_pt, s);
     defer _ = mlx.mlx_array_free(avv);
     const ava_k = try pfx.k(alloc, blk, "scale_shift_table_a2v_ca_audio");
     defer alloc.free(ava_k);
@@ -1630,23 +2069,23 @@ fn ditBlock(
     defer _ = mlx.mlx_array_free(ava);
 
     // video 9 rows: shift_sa,scale_sa,gate_sa, shift_ff,scale_ff,gate_ff, shift_ca,scale_ca,gate_ca
-    const v_shift_sa = try adalnRow(vcomb, 0, vdim, s);
+    const v_shift_sa = try adalnRowN(vcomb, 0, vdim, nv_pt, s);
     defer _ = mlx.mlx_array_free(v_shift_sa);
-    const v_scale_sa = try adalnRow(vcomb, 1, vdim, s);
+    const v_scale_sa = try adalnRowN(vcomb, 1, vdim, nv_pt, s);
     defer _ = mlx.mlx_array_free(v_scale_sa);
-    const v_gate_sa = try adalnRow(vcomb, 2, vdim, s);
+    const v_gate_sa = try adalnRowN(vcomb, 2, vdim, nv_pt, s);
     defer _ = mlx.mlx_array_free(v_gate_sa);
-    const v_shift_ff = try adalnRow(vcomb, 3, vdim, s);
+    const v_shift_ff = try adalnRowN(vcomb, 3, vdim, nv_pt, s);
     defer _ = mlx.mlx_array_free(v_shift_ff);
-    const v_scale_ff = try adalnRow(vcomb, 4, vdim, s);
+    const v_scale_ff = try adalnRowN(vcomb, 4, vdim, nv_pt, s);
     defer _ = mlx.mlx_array_free(v_scale_ff);
-    const v_gate_ff = try adalnRow(vcomb, 5, vdim, s);
+    const v_gate_ff = try adalnRowN(vcomb, 5, vdim, nv_pt, s);
     defer _ = mlx.mlx_array_free(v_gate_ff);
-    const v_shift_ca = try adalnRow(vcomb, 6, vdim, s);
+    const v_shift_ca = try adalnRowN(vcomb, 6, vdim, nv_pt, s);
     defer _ = mlx.mlx_array_free(v_shift_ca);
-    const v_scale_ca = try adalnRow(vcomb, 7, vdim, s);
+    const v_scale_ca = try adalnRowN(vcomb, 7, vdim, nv_pt, s);
     defer _ = mlx.mlx_array_free(v_scale_ca);
-    const v_gate_ca = try adalnRow(vcomb, 8, vdim, s);
+    const v_gate_ca = try adalnRowN(vcomb, 8, vdim, nv_pt, s);
     defer _ = mlx.mlx_array_free(v_gate_ca);
     // audio 9 rows
     const a_shift_sa = try adalnRow(acomb, 0, adim, s);
@@ -1668,13 +2107,13 @@ fn ditBlock(
     const a_gate_ca = try adalnRow(acomb, 8, adim, s);
     defer _ = mlx.mlx_array_free(a_gate_ca);
     // av cross video 4 rows (SCALE-first): scale_a2v,shift_a2v,scale_v2a,shift_v2a
-    const av_v_scale_a2v = try adalnRow(avv, 0, vdim, s);
+    const av_v_scale_a2v = try adalnRowN(avv, 0, vdim, nv_pt, s);
     defer _ = mlx.mlx_array_free(av_v_scale_a2v);
-    const av_v_shift_a2v = try adalnRow(avv, 1, vdim, s);
+    const av_v_shift_a2v = try adalnRowN(avv, 1, vdim, nv_pt, s);
     defer _ = mlx.mlx_array_free(av_v_shift_a2v);
-    const av_v_scale_v2a = try adalnRow(avv, 2, vdim, s);
+    const av_v_scale_v2a = try adalnRowN(avv, 2, vdim, nv_pt, s);
     defer _ = mlx.mlx_array_free(av_v_scale_v2a);
-    const av_v_shift_v2a = try adalnRow(avv, 3, vdim, s);
+    const av_v_shift_v2a = try adalnRowN(avv, 3, vdim, nv_pt, s);
     defer _ = mlx.mlx_array_free(av_v_shift_v2a);
     const av_a_scale_a2v = try adalnRow(ava, 0, adim, s);
     defer _ = mlx.mlx_array_free(av_a_scale_a2v);
@@ -1703,7 +2142,7 @@ fn ditBlock(
         defer _ = mlx.mlx_array_free(normed);
         const aprefix = try pfx.k(alloc, blk, "attn1");
         defer alloc.free(aprefix);
-        const out = try ditAttention(comp, alloc, normed, normed, aprefix, cfg.num_heads, cfg.head_dim, rope.vcos, rope.vsin, rope.vcos, rope.vsin, eps, s);
+        const out = try ditAttention(comp, alloc, normed, normed, aprefix, cfg.num_heads, cfg.head_dim, rope.vcos, rope.vsin, rope.vcos, rope.vsin, eps, DitPerturb.hits(ptb.stg_video_blocks, blk), s);
         const nv = try residGate(vh, out, v_gate_sa, s);
         if (vh_owned) _ = mlx.mlx_array_free(vh);
         vh = nv;
@@ -1717,7 +2156,7 @@ fn ditBlock(
         defer _ = mlx.mlx_array_free(normed);
         const aprefix = try pfx.k(alloc, blk, "audio_attn1");
         defer alloc.free(aprefix);
-        const out = try ditAttention(comp, alloc, normed, normed, aprefix, cfg.audio_num_heads, cfg.audio_head_dim, rope.acos, rope.asin, rope.acos, rope.asin, eps, s);
+        const out = try ditAttention(comp, alloc, normed, normed, aprefix, cfg.audio_num_heads, cfg.audio_head_dim, rope.acos, rope.asin, rope.acos, rope.asin, eps, DitPerturb.hits(ptb.stg_audio_blocks, blk), s);
         const na = try residGate(ah, out, a_gate_sa, s);
         if (ah_owned) _ = mlx.mlx_array_free(ah);
         ah = na;
@@ -1741,7 +2180,7 @@ fn ditBlock(
         defer _ = mlx.mlx_array_free(text);
         const aprefix = try pfx.k(alloc, blk, "attn2");
         defer alloc.free(aprefix);
-        const out = try ditAttention(comp, alloc, normed, text, aprefix, cfg.num_heads, cfg.head_dim, null, null, null, null, eps, s);
+        const out = try ditAttention(comp, alloc, normed, text, aprefix, cfg.num_heads, cfg.head_dim, null, null, null, null, eps, false, s);
         const nv = try residGate(vh, out, v_gate_ca, s);
         _ = mlx.mlx_array_free(vh);
         vh = nv;
@@ -1764,13 +2203,16 @@ fn ditBlock(
         defer _ = mlx.mlx_array_free(text);
         const aprefix = try pfx.k(alloc, blk, "audio_attn2");
         defer alloc.free(aprefix);
-        const out = try ditAttention(comp, alloc, normed, text, aprefix, cfg.audio_num_heads, cfg.audio_head_dim, null, null, null, null, eps, s);
+        const out = try ditAttention(comp, alloc, normed, text, aprefix, cfg.audio_num_heads, cfg.audio_head_dim, null, null, null, null, eps, false, s);
         const na = try residGate(ah, out, a_gate_ca, s);
         _ = mlx.mlx_array_free(ah);
         ah = na;
     }
     // ── 5-6. AV cross-modal (shared norms) ──
-    {
+    // Isolated-modality guidance drops BOTH cross-attention residuals: the
+    // reference multiplies the attn output by a zero mask before the residual
+    // add (transformer.py SKIP_A2V/V2A_CROSS_ATTN), which at B=1 is a skip.
+    if (!ptb.skip_av_cross) {
         const vn3 = try rmsAF(vh, vdim, eps, s);
         defer _ = mlx.mlx_array_free(vn3);
         const an3 = try rmsAF(ah, adim, eps, s);
@@ -1782,7 +2224,7 @@ fn ditBlock(
         defer _ = mlx.mlx_array_free(akv);
         const a2v_k = try pfx.k(alloc, blk, "audio_to_video_attn");
         defer alloc.free(a2v_k);
-        const a2v = try ditAttention(comp, alloc, vq, akv, a2v_k, cfg.audio_num_heads, cfg.audio_head_dim, rope.vxcos, rope.vxsin, rope.axcos, rope.axsin, eps, s);
+        const a2v = try ditAttention(comp, alloc, vq, akv, a2v_k, cfg.audio_num_heads, cfg.audio_head_dim, rope.vxcos, rope.vxsin, rope.axcos, rope.axsin, eps, false, s);
         const nv = try residGate(vh, a2v, av_v_gate_a2v, s);
         _ = mlx.mlx_array_free(vh);
         vh = nv;
@@ -1793,7 +2235,7 @@ fn ditBlock(
         defer _ = mlx.mlx_array_free(vkv);
         const v2a_k = try pfx.k(alloc, blk, "video_to_audio_attn");
         defer alloc.free(v2a_k);
-        const v2a = try ditAttention(comp, alloc, aq, vkv, v2a_k, cfg.audio_num_heads, cfg.audio_head_dim, rope.axcos, rope.axsin, rope.vxcos, rope.vxsin, eps, s);
+        const v2a = try ditAttention(comp, alloc, aq, vkv, v2a_k, cfg.audio_num_heads, cfg.audio_head_dim, rope.axcos, rope.axsin, rope.vxcos, rope.vxsin, eps, false, s);
         const na = try residGate(ah, v2a, av_a_gate_v2a, s);
         _ = mlx.mlx_array_free(ah);
         ah = na;
@@ -1847,12 +2289,14 @@ fn layerNormAF(x: mlx.mlx_array, dim: u32, eps: f32, s: S) !mlx.mlx_array {
 
 /// Output head (_output_block): affine-free LayerNorm modulated by
 /// `(scale_shift_table[2,dim] + embedded_timestep)`, then proj (bf16) → 128 ch.
-fn outputBlock(comp: *const Component, alloc: std.mem.Allocator, x: mlx.mlx_array, embedded_ts: mlx.mlx_array, ss_key: []const u8, proj_key: []const u8, dim: u32, eps: f32, s: S) !mlx.mlx_array {
+fn outputBlock(comp: *const Component, alloc: std.mem.Allocator, x: mlx.mlx_array, embedded_ts: mlx.mlx_array, ss_key: []const u8, proj_key: []const u8, dim: u32, eps: f32, nv_pt: u32, s: S) !mlx.mlx_array {
     const di: c_int = @intCast(dim);
     const table = comp.get(ss_key) orelse return error.MissingDitWeight; // [2,dim] f32
+    // Scalar embedded_ts `[1,dim]` → `[1,1,dim]`; per-token `[Nv,dim]` → `[1,Nv,dim]`.
+    const nrow: c_int = if (nv_pt == 0) 1 else @intCast(nv_pt);
     var emb3 = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(emb3);
-    try mlx.check(mlx.mlx_reshape(&emb3, embedded_ts, &[_]c_int{ 1, 1, di }, 3, s)); // [1,1,dim]
+    try mlx.check(mlx.mlx_reshape(&emb3, embedded_ts, &[_]c_int{ 1, nrow, di }, 3, s));
     var shift_row = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(shift_row);
     try mlx.check(mlx.mlx_slice(&shift_row, table, &[_]c_int{ 0, 0 }, 2, &[_]c_int{ 1, di }, 2, &[_]c_int{ 1, 1 }, 2, s));
@@ -1886,6 +2330,11 @@ pub fn ditForward(
     audio_text: mlx.mlx_array,
     video_pos: []const f32,
     audio_pos: []const f32,
+    // I2V first-frame conditioning: `cond_mask[n]` (1=generate, 0=clean) over the
+    // Nv video tokens. When non-null the VIDEO stream's AdaLN runs PER-TOKEN
+    // (clean tokens get timestep 0 → unmodulated); null → scalar t2v (unchanged).
+    cond_mask: ?[]const f32,
+    ptb: DitPerturb,
     s: S,
 ) !BlockOut {
     const vdim = cfg.videoDim();
@@ -1893,26 +2342,43 @@ pub fn ditForward(
     const eps = cfg.norm_eps;
     const Nv: u32 = @intCast(video_pos.len / 3);
     const Na: u32 = @intCast(audio_pos.len);
+    const nv_pt: u32 = if (cond_mask != null) Nv else 0;
 
     // ── patchify ──
     var vh = try linBias(comp, alloc, video_latent, "{s}", .{"transformer.patchify_proj"}, s);
     var ah = try linBias(comp, alloc, audio_latent, "{s}", .{"transformer.audio_patchify_proj"}, s);
 
     // ── timestep embeddings → adaLN param sets ──
+    // Audio / prompt / AV-gate AdaLN ALWAYS use the scalar sigma sinusoids.
     const t_sin = try ditTimestepSinusoid(sigma * cfg.timestep_scale, 256, s); // sigma*1000
     defer _ = mlx.mlx_array_free(t_sin);
     const t_sin_gate = try ditTimestepSinusoid(sigma * 1.0, 256, s); // av_ca gate scale (×1)
     defer _ = mlx.mlx_array_free(t_sin_gate);
 
-    const v_ada = try ditAdaLNSingle(comp, alloc, t_sin, "transformer.adaln_single", s);
+    // Video AdaLN (9-param self/ff/text-ca + 4-param AV-cross-video): scalar from
+    // `t_sin`, OR per-token from a `[Nv,256]` sinusoid where clean tokens (mask=0)
+    // get timestep 0. Mirrors LTXModel.__call__'s `video_timesteps` branch.
+    var v_ada: AdaLNOut = undefined;
+    var v_avca: AdaLNOut = undefined;
+    if (cond_mask) |mask| {
+        const vt_scaled = try alloc.alloc(f32, Nv);
+        defer alloc.free(vt_scaled);
+        for (0..Nv) |n| vt_scaled[n] = mask[n] * sigma * cfg.timestep_scale;
+        const t_sin_v = try ditTimestepSinusoidPerToken(vt_scaled, 256, s); // [Nv,256]
+        defer _ = mlx.mlx_array_free(t_sin_v);
+        v_ada = try ditAdaLNSingle(comp, alloc, t_sin_v, "transformer.adaln_single", s);
+        v_avca = try ditAdaLNSingle(comp, alloc, t_sin_v, "transformer.av_ca_video_scale_shift_adaln_single", s);
+    } else {
+        v_ada = try ditAdaLNSingle(comp, alloc, t_sin, "transformer.adaln_single", s);
+        v_avca = try ditAdaLNSingle(comp, alloc, t_sin, "transformer.av_ca_video_scale_shift_adaln_single", s);
+    }
     defer _ = mlx.mlx_array_free(v_ada.params);
     defer _ = mlx.mlx_array_free(v_ada.embedded);
+    defer _ = mlx.mlx_array_free(v_avca.params);
+    defer _ = mlx.mlx_array_free(v_avca.embedded);
     const a_ada = try ditAdaLNSingle(comp, alloc, t_sin, "transformer.audio_adaln_single", s);
     defer _ = mlx.mlx_array_free(a_ada.params);
     defer _ = mlx.mlx_array_free(a_ada.embedded);
-    const v_avca = try ditAdaLNSingle(comp, alloc, t_sin, "transformer.av_ca_video_scale_shift_adaln_single", s);
-    defer _ = mlx.mlx_array_free(v_avca.params);
-    defer _ = mlx.mlx_array_free(v_avca.embedded);
     const a_avca = try ditAdaLNSingle(comp, alloc, t_sin, "transformer.av_ca_audio_scale_shift_adaln_single", s);
     defer _ = mlx.mlx_array_free(a_avca.params);
     defer _ = mlx.mlx_array_free(a_avca.embedded);
@@ -1952,7 +2418,7 @@ pub fn ditForward(
     // ── 48 blocks (mx.eval every 8 to bound the Metal command buffer) ──
     var blk: u32 = 0;
     while (blk < cfg.num_layers) : (blk += 1) {
-        const out = try ditBlock(comp, alloc, cfg, blk, vh, ah, v_ada.params, a_ada.params, v_prompt.params, a_prompt.params, v_avca.params, a_avca.params, a2v_gate.params, v2a_gate.params, video_text, audio_text, rope, s);
+        const out = try ditBlock(comp, alloc, cfg, blk, vh, ah, v_ada.params, a_ada.params, v_prompt.params, a_prompt.params, v_avca.params, a_avca.params, a2v_gate.params, v2a_gate.params, video_text, audio_text, rope, nv_pt, ptb, s);
         _ = mlx.mlx_array_free(vh);
         _ = mlx.mlx_array_free(ah);
         vh = out.v;
@@ -1963,10 +2429,10 @@ pub fn ditForward(
         }
     }
 
-    // ── output head → velocity ──
-    const vout = try outputBlock(comp, alloc, vh, v_ada.embedded, "transformer.scale_shift_table", "transformer.proj_out", vdim, eps, s);
+    // ── output head → velocity (video per-token when conditioning; audio scalar) ──
+    const vout = try outputBlock(comp, alloc, vh, v_ada.embedded, "transformer.scale_shift_table", "transformer.proj_out", vdim, eps, nv_pt, s);
     _ = mlx.mlx_array_free(vh);
-    const aout = try outputBlock(comp, alloc, ah, a_ada.embedded, "transformer.audio_scale_shift_table", "transformer.audio_proj_out", adim, eps, s);
+    const aout = try outputBlock(comp, alloc, ah, a_ada.embedded, "transformer.audio_scale_shift_table", "transformer.audio_proj_out", adim, eps, 0, s);
     _ = mlx.mlx_array_free(ah);
     return .{ .v = vout, .a = aout };
 }
@@ -2052,20 +2518,66 @@ fn varGlobal(x: mlx.mlx_array, s: S) !mlx.mlx_array {
     return out;
 }
 
-/// CFG guider with optional norm-preserving rescale (STG/modality dropped):
-/// `pred = cond + (cfg-1)*(cond-uncond)`; if rescale≠0,
-/// `pred *= rescale*sqrt(var(cond))/(sqrt(var(pred))+1e-8) + (1-rescale)`.
-fn cfgGuide(cond: mlx.mlx_array, uncond: mlx.mlx_array, cfg_scale: f32, rescale: f32, s: S) !mlx.mlx_array {
+/// Multi-modal guidance parameters (reference components/guiders.py
+/// MultiModalGuiderParams). Defaults are the no-op guider (single forward).
+pub const GuiderParams = struct {
+    cfg: f32 = 1.0, // classifier-free guidance scale
+    stg: f32 = 0.0, // spatio-temporal guidance scale
+    rescale: f32 = 0.0, // norm-preserving rescale strength
+    modality: f32 = 1.0, // isolated-modality guidance scale
+    stg_blocks: []const u32 = &.{}, // blocks whose self-attn STG perturbs
+
+    pub fn needsUncond(self: GuiderParams) bool {
+        return @abs(self.cfg - 1.0) > 1e-4;
+    }
+    pub fn needsPerturbed(self: GuiderParams) bool {
+        // Empty blocks → the perturbed forward equals cond and the STG term
+        // cancels; skip the wasted forward.
+        return @abs(self.stg) > 1e-4 and self.stg_blocks.len > 0;
+    }
+    pub fn needsModality(self: GuiderParams) bool {
+        return @abs(self.modality - 1.0) > 1e-4;
+    }
+    /// Any extra forward at all → the negative prompt must be encoded.
+    pub fn needsGuidance(self: GuiderParams) bool {
+        return self.needsUncond() or self.needsPerturbed() or self.needsModality();
+    }
+};
+
+/// `acc += w * (cond - other)` (guidance accumulate). Returns the new acc,
+/// freeing the old one.
+fn addScaledDiff(acc: mlx.mlx_array, cond: mlx.mlx_array, other: mlx.mlx_array, w: f32, s: S) !mlx.mlx_array {
+    defer _ = mlx.mlx_array_free(acc);
     var diff = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(diff);
-    try mlx.check(mlx.mlx_subtract(&diff, cond, uncond, s));
-    const w = mlx.mlx_array_new_float(cfg_scale - 1.0);
-    defer _ = mlx.mlx_array_free(w);
+    try mlx.check(mlx.mlx_subtract(&diff, cond, other, s));
+    const wa = mlx.mlx_array_new_float(w);
+    defer _ = mlx.mlx_array_free(wa);
     var sc = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(sc);
-    try mlx.check(mlx.mlx_multiply(&sc, diff, w, s));
+    try mlx.check(mlx.mlx_multiply(&sc, diff, wa, s));
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_add(&out, acc, sc, s));
+    return out;
+}
+
+/// Full multi-modal guider (reference MultiModalGuider.calculate):
+/// `pred = cond + (cfg-1)*(cond-uncond) + stg*(cond-ptb) + (modality-1)*(cond-mod)`;
+/// if rescale≠0, `pred *= rescale*sqrt(var(cond))/(sqrt(var(pred))+1e-8) + (1-rescale)`.
+/// Null optional predictions skip their term (their forward wasn't run).
+fn guiderCalculate(cond: mlx.mlx_array, uncond: ?mlx.mlx_array, ptb: ?mlx.mlx_array, mod: ?mlx.mlx_array, p: GuiderParams, s: S) !mlx.mlx_array {
     var pred = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_add(&pred, cond, sc, s));
+    try mlx.check(mlx.mlx_array_set(&pred, cond));
+    if (uncond) |u| {
+        if (p.needsUncond()) pred = try addScaledDiff(pred, cond, u, p.cfg - 1.0, s);
+    }
+    if (ptb) |pt| {
+        if (@abs(p.stg) > 1e-4) pred = try addScaledDiff(pred, cond, pt, p.stg, s);
+    }
+    if (mod) |m| {
+        if (p.needsModality()) pred = try addScaledDiff(pred, cond, m, p.modality - 1.0, s);
+    }
+    const rescale = p.rescale;
     if (rescale != 0.0) {
         const vc = try varGlobal(cond, s);
         defer _ = mlx.mlx_array_free(vc);
@@ -2104,16 +2616,35 @@ fn cfgGuide(cond: mlx.mlx_array, uncond: mlx.mlx_array, cfg_scale: f32, rescale:
 }
 
 /// x0 prediction (X0Model): x0 = x_t - sigma*v, where v = ditForward(...).
-/// Returns bf16 x0 (matches the reference cast back to latent dtype).
-fn ditX0(comp: *const Component, alloc: std.mem.Allocator, cfg: LtxConfig, vx: mlx.mlx_array, ax: mlx.mlx_array, sigma: f32, vtext: mlx.mlx_array, atext: mlx.mlx_array, vpos: []const f32, apos: []const f32, s: S) !BlockOut {
-    const vel = try ditForward(comp, alloc, cfg, vx, ax, sigma, vtext, atext, vpos, apos, s);
+/// Returns bf16 x0 (matches the reference cast back to latent dtype). When
+/// `cond_mask` is present the VIDEO x0 uses PER-TOKEN sigma (`mask*sigma`) so
+/// clean tokens (mask=0) get x0 = x_t (unchanged), matching X0Model's per-token
+/// path. Audio always uses scalar sigma.
+fn ditX0(comp: *const Component, alloc: std.mem.Allocator, cfg: LtxConfig, vx: mlx.mlx_array, ax: mlx.mlx_array, sigma: f32, vtext: mlx.mlx_array, atext: mlx.mlx_array, vpos: []const f32, apos: []const f32, cond_mask: ?[]const f32, ptb: DitPerturb, s: S) !BlockOut {
+    const vel = try ditForward(comp, alloc, cfg, vx, ax, sigma, vtext, atext, vpos, apos, cond_mask, ptb, s);
     defer _ = mlx.mlx_array_free(vel.v);
     defer _ = mlx.mlx_array_free(vel.a);
     const sig = mlx.mlx_array_new_float(sigma);
     defer _ = mlx.mlx_array_free(sig);
+    // Video sigma: scalar `sig`, or per-token `[1,Nv,1]` = mask*sigma.
+    var vsig = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(vsig);
+    var vt_buf: ?[]f32 = null;
+    defer if (vt_buf) |b| alloc.free(b);
+    if (cond_mask) |mask| {
+        const Nv: c_int = @intCast(mask.len);
+        const buf = try alloc.alloc(f32, mask.len);
+        vt_buf = buf;
+        for (mask, 0..) |m, n| buf[n] = m * sigma;
+        const a = mlx.mlx_array_new_data(buf.ptr, &[_]c_int{ 1, Nv, 1 }, 3, .float32);
+        try mlx.check(mlx.mlx_array_set(&vsig, a));
+        _ = mlx.mlx_array_free(a);
+    } else {
+        try mlx.check(mlx.mlx_array_set(&vsig, sig));
+    }
     var sv = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(sv);
-    try mlx.check(mlx.mlx_multiply(&sv, vel.v, sig, s)); // bf16*f32 → f32
+    try mlx.check(mlx.mlx_multiply(&sv, vel.v, vsig, s)); // bf16*f32 → f32
     var x0vf = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(x0vf);
     try mlx.check(mlx.mlx_subtract(&x0vf, vx, sv, s));
@@ -2133,8 +2664,102 @@ fn ditX0(comp: *const Component, alloc: std.mem.Allocator, cfg: LtxConfig, vx: m
 /// Optional progress sink for long generations (shared with flux/tts servers).
 pub const Progress = @import("gen_sse.zig").Progress;
 
-/// CFG-only guided Euler denoise loop. `noise_v`/`noise_a` are the bf16 initial
-/// latents; `sigmas` includes the terminal 0.0. Returns the final (bf16) latents.
+/// Whether classifier-free guidance needs the second (negative) DiT forward.
+/// Both scales at 1.0 → guidance is a no-op, so the negative pass is skipped.
+pub fn ltxNeedsCfg(cfg_video: f32, cfg_audio: f32) bool {
+    return @abs(cfg_video - 1.0) > 1e-4 or @abs(cfg_audio - 1.0) > 1e-4;
+}
+
+/// Progress reporting window for a sampler run: `emit(label, base+i, total)`.
+pub const ProgressWindow = struct {
+    label: []const u8 = "Generating",
+    base: u32 = 0,
+    total: u32 = 0, // 0 → use the sampler's own step count
+};
+
+/// One guided x0 prediction for both modalities (reference guided_denoise_loop
+/// steps 1-5): conditional forward, plus the unconditional / STG-perturbed /
+/// isolated-modality forwards any active guider term needs (shared between the
+/// video and audio guiders — each extra forward yields both modalities'
+/// predictions). Applies the video denoise mask (I2V) before returning.
+fn ditX0Guided(
+    comp: *const Component,
+    alloc: std.mem.Allocator,
+    cfg: LtxConfig,
+    vx: mlx.mlx_array,
+    ax: mlx.mlx_array,
+    sigma: f32,
+    cond_v: mlx.mlx_array,
+    cond_a: mlx.mlx_array,
+    neg_v: ?mlx.mlx_array,
+    neg_a: ?mlx.mlx_array,
+    vp: GuiderParams,
+    ap: GuiderParams,
+    video_pos: []const f32,
+    audio_pos: []const f32,
+    cond_mask: ?[]const f32,
+    clean_v: ?mlx.mlx_array,
+    mask_dev: ?mlx.mlx_array,
+    s: S,
+) !BlockOut {
+    const cond = try ditX0(comp, alloc, cfg, vx, ax, sigma, cond_v, cond_a, video_pos, audio_pos, cond_mask, .{}, s);
+    defer _ = mlx.mlx_array_free(cond.v);
+    defer _ = mlx.mlx_array_free(cond.a);
+
+    // Unconditional (negative-prompt) forward for CFG. Reference falls back to
+    // the positive embeds when no negative context is supplied.
+    var neg: ?BlockOut = null;
+    defer if (neg) |n| {
+        _ = mlx.mlx_array_free(n.v);
+        _ = mlx.mlx_array_free(n.a);
+    };
+    if (vp.needsUncond() or ap.needsUncond()) {
+        neg = try ditX0(comp, alloc, cfg, vx, ax, sigma, neg_v orelse cond_v, neg_a orelse cond_a, video_pos, audio_pos, cond_mask, .{}, s);
+    }
+
+    // STG-perturbed forward (skip self-attn in the guiders' blocks; one forward
+    // carries both modalities' perturbations, mirroring the reference).
+    var ptb: ?BlockOut = null;
+    defer if (ptb) |p| {
+        _ = mlx.mlx_array_free(p.v);
+        _ = mlx.mlx_array_free(p.a);
+    };
+    if (vp.needsPerturbed() or ap.needsPerturbed()) {
+        const perturb = DitPerturb{
+            .stg_video_blocks = if (vp.needsPerturbed()) vp.stg_blocks else &.{},
+            .stg_audio_blocks = if (ap.needsPerturbed()) ap.stg_blocks else &.{},
+        };
+        ptb = try ditX0(comp, alloc, cfg, vx, ax, sigma, cond_v, cond_a, video_pos, audio_pos, cond_mask, perturb, s);
+    }
+
+    // Isolated-modality forward (drop A2V + V2A cross-attention everywhere).
+    var mod: ?BlockOut = null;
+    defer if (mod) |m| {
+        _ = mlx.mlx_array_free(m.v);
+        _ = mlx.mlx_array_free(m.a);
+    };
+    if (vp.needsModality() or ap.needsModality()) {
+        mod = try ditX0(comp, alloc, cfg, vx, ax, sigma, cond_v, cond_a, video_pos, audio_pos, cond_mask, .{ .skip_av_cross = true }, s);
+    }
+
+    var v_x0 = try guiderCalculate(cond.v, if (neg) |n| n.v else null, if (ptb) |p| p.v else null, if (mod) |m| m.v else null, vp, s);
+    errdefer _ = mlx.mlx_array_free(v_x0);
+    const a_x0 = try guiderCalculate(cond.a, if (neg) |n| n.a else null, if (ptb) |p| p.a else null, if (mod) |m| m.a else null, ap, s);
+
+    // Pin the conditioned (clean) video tokens to the reference latent (I2V);
+    // audio is never conditioned, so its mask is all-ones — a no-op we skip.
+    if (cond_mask != null) {
+        const blended = try applyDenoiseMask(v_x0, clean_v.?, mask_dev.?, s);
+        _ = mlx.mlx_array_free(v_x0);
+        v_x0 = blended;
+    }
+    return .{ .v = v_x0, .a = a_x0 };
+}
+
+/// Guided Euler denoise loop (reference utils/samplers.guided_denoise_loop and,
+/// with default no-op guiders, denoise_loop). `noise_v`/`noise_a` are the bf16
+/// initial latents; `sigmas` includes the terminal 0.0. Returns the final
+/// (bf16) latents.
 pub fn ditSampleCfg(
     comp: *const Component,
     alloc: std.mem.Allocator,
@@ -2143,36 +2768,47 @@ pub fn ditSampleCfg(
     noise_a: mlx.mlx_array,
     cond_v: mlx.mlx_array,
     cond_a: mlx.mlx_array,
-    neg_v: mlx.mlx_array,
-    neg_a: mlx.mlx_array,
+    neg_v: ?mlx.mlx_array,
+    neg_a: ?mlx.mlx_array,
     video_pos: []const f32,
     audio_pos: []const f32,
     sigmas: []const f32,
-    cfg_video: f32,
-    cfg_audio: f32,
-    rescale: f32,
+    vp: GuiderParams,
+    ap: GuiderParams,
+    // I2V first-frame conditioning (both null → pure t2v). `cond_mask` is the
+    // per-video-token denoise mask (1=generate, 0=clean); `clean_v` is the clean
+    // video latent `[1,Nv,128]` whose preserved tokens (the encoded first frame)
+    // are pinned each step via `applyDenoiseMask` before the Euler step.
+    cond_mask: ?[]const f32,
+    clean_v: ?mlx.mlx_array,
     progress: ?Progress,
+    win: ProgressWindow,
     s: S,
 ) !BlockOut {
     var vx = noise_v;
     var ax = noise_a;
     var owned = false;
+    const total: u32 = if (win.total != 0) win.total else @intCast(sigmas.len - 1);
+
+    // Device denoise mask [1,Nv,1] for applyDenoiseMask (built once).
+    var mask_dev = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(mask_dev);
+    if (cond_mask) |m| {
+        const Nv: c_int = @intCast(m.len);
+        const a = mlx.mlx_array_new_data(m.ptr, &[_]c_int{ 1, Nv, 1 }, 3, .float32);
+        try mlx.check(mlx.mlx_array_set(&mask_dev, a));
+        _ = mlx.mlx_array_free(a);
+    }
+
     var i: usize = 0;
     while (i + 1 < sigmas.len) : (i += 1) {
         const sigma = sigmas[i];
         const sigma_next = sigmas[i + 1];
-        const cond = try ditX0(comp, alloc, cfg, vx, ax, sigma, cond_v, cond_a, video_pos, audio_pos, s);
-        defer _ = mlx.mlx_array_free(cond.v);
-        defer _ = mlx.mlx_array_free(cond.a);
-        const neg = try ditX0(comp, alloc, cfg, vx, ax, sigma, neg_v, neg_a, video_pos, audio_pos, s);
-        defer _ = mlx.mlx_array_free(neg.v);
-        defer _ = mlx.mlx_array_free(neg.a);
-        const v_x0 = try cfgGuide(cond.v, neg.v, cfg_video, rescale, s);
-        defer _ = mlx.mlx_array_free(v_x0);
-        const a_x0 = try cfgGuide(cond.a, neg.a, cfg_audio, rescale, s);
-        defer _ = mlx.mlx_array_free(a_x0);
-        const nvx = try eulerStep(vx, v_x0, sigma, sigma_next, s);
-        const nax = try eulerStep(ax, a_x0, sigma, sigma_next, s);
+        const x0 = try ditX0Guided(comp, alloc, cfg, vx, ax, sigma, cond_v, cond_a, neg_v, neg_a, vp, ap, video_pos, audio_pos, cond_mask, clean_v, if (cond_mask != null) mask_dev else null, s);
+        defer _ = mlx.mlx_array_free(x0.v);
+        defer _ = mlx.mlx_array_free(x0.a);
+        const nvx = try eulerStep(vx, x0.v, sigma, sigma_next, s);
+        const nax = try eulerStep(ax, x0.a, sigma, sigma_next, s);
         if (owned) {
             _ = mlx.mlx_array_free(vx);
             _ = mlx.mlx_array_free(ax);
@@ -2182,7 +2818,7 @@ pub fn ditSampleCfg(
         owned = true;
         _ = mlx.mlx_array_eval(vx);
         _ = mlx.mlx_array_eval(ax);
-        if (progress) |p| p.emit("Generating", @intCast(i + 1), @intCast(sigmas.len - 1));
+        if (progress) |p| p.emit(win.label, win.base + @as(u32, @intCast(i + 1)), total);
     }
     if (!owned) { // no steps → copy inputs so caller owns the result
         var cv = mlx.mlx_array_new();
@@ -2195,10 +2831,648 @@ pub fn ditSampleCfg(
 }
 
 // ════════════════════════════════════════════════════════════════════════
+// Sigma schedules + res_2s second-order sampler (two-stage HQ).
+// Reference: ltx_pipelines_mlx/scheduler.py + utils/{samplers,res2s}.py.
+// ════════════════════════════════════════════════════════════════════════
+
+/// 8-step distilled schedule (9 values, terminal 0.0). The distilled
+/// transformer was trained against exactly these sigmas.
+pub const DISTILLED_SIGMAS = [_]f32{ 1.0, 0.99375, 0.9875, 0.98125, 0.975, 0.909375, 0.725, 0.421875, 0.0 };
+
+/// Stage-2 refinement schedule (3 steps): renoise the upscaled latent to
+/// sigma 0.909375 and denoise with the distilled model.
+pub const STAGE_2_SIGMAS = [_]f32{ 0.909375, 0.725, 0.421875, 0.0 };
+
+/// phi_j(z) for the res_2s exponential integrator (reference utils/res2s.py).
+pub fn res2sPhi(j: u32, neg_h: f64) f64 {
+    if (@abs(neg_h) < 1e-10) {
+        var fact: f64 = 1.0;
+        for (1..j + 1) |k| fact *= @floatFromInt(k);
+        return 1.0 / fact;
+    }
+    var remainder: f64 = 0.0;
+    var fact: f64 = 1.0;
+    var pow: f64 = 1.0;
+    for (0..j) |k| {
+        if (k > 0) {
+            fact *= @floatFromInt(k);
+            pow *= neg_h;
+        }
+        remainder += pow / fact;
+    }
+    var denom: f64 = 1.0;
+    for (0..j) |_| denom *= neg_h;
+    return (@exp(neg_h) - remainder) / denom;
+}
+
+pub const Res2sCoeffs = struct { a21: f64, b1: f64, b2: f64 };
+
+/// res_2s Runge-Kutta coefficients for log-space step `h` (c2 = 0.5 midpoint).
+pub fn res2sCoefficients(h: f64) Res2sCoeffs {
+    const c2: f64 = 0.5;
+    const a21 = c2 * res2sPhi(1, -h * c2);
+    const b2 = res2sPhi(2, -h) / c2;
+    const b1 = res2sPhi(1, -h) - b2;
+    return .{ .a21 = a21, .b1 = b1, .b2 = b2 };
+}
+
+/// Zero-mean/unit-std noise normalization: global first, then per-channel over
+/// the token axis (reference _channelwise_normalize + _get_new_noise). f32 in/out.
+fn channelwiseNormalize(x: mlx.mlx_array, s: S) !mlx.mlx_array {
+    // global: (x - mean) / (std + 1e-8)
+    var gm = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(gm);
+    try mlx.check(mlx.mlx_mean(&gm, x, false, s));
+    var xm = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(xm);
+    try mlx.check(mlx.mlx_subtract(&xm, x, gm, s));
+    var gv = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(gv);
+    try mlx.check(mlx.mlx_std(&gv, xm, false, 0, s));
+    const eps_a = mlx.mlx_array_new_float(1e-8);
+    defer _ = mlx.mlx_array_free(eps_a);
+    var gve = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(gve);
+    try mlx.check(mlx.mlx_add(&gve, gv, eps_a, s));
+    var g = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(g);
+    try mlx.check(mlx.mlx_divide(&g, xm, gve, s));
+    // per-channel over axis 1 (tokens), keepdims
+    const axes1 = [_]c_int{1};
+    var cm = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(cm);
+    try mlx.check(mlx.mlx_mean_axes(&cm, g, &axes1, 1, true, s));
+    var cxm = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(cxm);
+    try mlx.check(mlx.mlx_subtract(&cxm, g, cm, s));
+    var cs = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(cs);
+    try mlx.check(mlx.mlx_std_axes(&cs, g, &axes1, 1, true, 0, s));
+    var cse = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(cse);
+    try mlx.check(mlx.mlx_add(&cse, cs, eps_a, s));
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_divide(&out, cxm, cse, s));
+    return out;
+}
+
+/// Res2s SDE noise-injection step (reference _sde_step): variance-preserving
+/// re-noise from `sample`→`denoised` while stepping sigma→sigma_next. f32.
+fn sdeStep(sample: mlx.mlx_array, denoised: mlx.mlx_array, sigma: f32, sigma_next: f32, noise: mlx.mlx_array, s: S) !mlx.mlx_array {
+    if (sigma_next == 0.0) {
+        var c = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_array_set(&c, denoised));
+        return c;
+    }
+    const sigma_up = @min(sigma_next * 0.5, sigma_next * 0.9999);
+    const sigma_signal = 1.0 - sigma_next;
+    const sigma_residual = @sqrt(@max(0.0, sigma_next * sigma_next - sigma_up * sigma_up));
+    const alpha_ratio = sigma_signal + sigma_residual;
+    const sigma_down = if (alpha_ratio > 0) sigma_residual / alpha_ratio else sigma_next;
+    if (sigma_up == 0.0) {
+        var c = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_array_set(&c, denoised));
+        return c;
+    }
+    // eps_next = (sample - denoised) / (sigma - sigma_next); denoised_next =
+    // sample - sigma*eps_next; out = alpha*(denoised_next + sigma_down*eps) + up*noise
+    var eps = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(eps);
+    if (sigma != sigma_next) {
+        var d = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(d);
+        try mlx.check(mlx.mlx_subtract(&d, sample, denoised, s));
+        const inv = mlx.mlx_array_new_float(1.0 / (sigma - sigma_next));
+        defer _ = mlx.mlx_array_free(inv);
+        try mlx.check(mlx.mlx_multiply(&eps, d, inv, s));
+    } else {
+        const z = mlx.mlx_array_new_float(0.0);
+        defer _ = mlx.mlx_array_free(z);
+        var zs = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(zs);
+        try mlx.check(mlx.mlx_multiply(&zs, sample, z, s));
+        try mlx.check(mlx.mlx_array_set(&eps, zs));
+    }
+    const sig_a = mlx.mlx_array_new_float(sigma);
+    defer _ = mlx.mlx_array_free(sig_a);
+    var se = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(se);
+    try mlx.check(mlx.mlx_multiply(&se, eps, sig_a, s));
+    var dnext = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(dnext);
+    try mlx.check(mlx.mlx_subtract(&dnext, sample, se, s));
+    const down_a = mlx.mlx_array_new_float(sigma_down);
+    defer _ = mlx.mlx_array_free(down_a);
+    var de = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(de);
+    try mlx.check(mlx.mlx_multiply(&de, eps, down_a, s));
+    var inner = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(inner);
+    try mlx.check(mlx.mlx_add(&inner, dnext, de, s));
+    const alpha_a = mlx.mlx_array_new_float(alpha_ratio);
+    defer _ = mlx.mlx_array_free(alpha_a);
+    var ai = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ai);
+    try mlx.check(mlx.mlx_multiply(&ai, inner, alpha_a, s));
+    const up_a = mlx.mlx_array_new_float(sigma_up);
+    defer _ = mlx.mlx_array_free(up_a);
+    var un = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(un);
+    try mlx.check(mlx.mlx_multiply(&un, noise, up_a, s));
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_add(&out, ai, un, s));
+    return out;
+}
+
+/// `x + w*y` on f32 arrays; returns a new array.
+fn axpy(x: mlx.mlx_array, y: mlx.mlx_array, w: f32, s: S) !mlx.mlx_array {
+    const wa = mlx.mlx_array_new_float(w);
+    defer _ = mlx.mlx_array_free(wa);
+    var wy = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(wy);
+    try mlx.check(mlx.mlx_multiply(&wy, y, wa, s));
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_add(&out, x, wy, s));
+    return out;
+}
+
+fn asF32(x: mlx.mlx_array, s: S) !mlx.mlx_array {
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_astype(&out, x, .float32, s));
+    return out;
+}
+
+fn asBf16(x: mlx.mlx_array, s: S) !mlx.mlx_array {
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_astype(&out, x, .bfloat16, s));
+    return out;
+}
+
+/// Refined res2s anchor. The reference iterates
+///   `x_anchor = x_mid - r*(d1 - x_anchor)` (r = h*a21)
+/// 100× — an affine contraction (|r| < 1 on every reachable step since h < 0.5)
+/// whose fixed point is exactly `(x_mid - r*d1) / (1 - r)`; after 100 rounds the
+/// iterate equals the fixed point to float precision, so we evaluate the closed
+/// form (the equivalence is pinned by the `bong anchor closed form` unit test).
+fn bongAnchor(x_mid: mlx.mlx_array, d1: mlx.mlx_array, r: f32, s: S) !mlx.mlx_array {
+    const ra = mlx.mlx_array_new_float(r);
+    defer _ = mlx.mlx_array_free(ra);
+    var rd = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(rd);
+    try mlx.check(mlx.mlx_multiply(&rd, d1, ra, s));
+    var num = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(num);
+    try mlx.check(mlx.mlx_subtract(&num, x_mid, rd, s));
+    const inv = mlx.mlx_array_new_float(1.0 / (1.0 - r));
+    defer _ = mlx.mlx_array_free(inv);
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_multiply(&out, num, inv, s));
+    return out;
+}
+
+/// res_2s second-order guided denoise loop (reference res2s_denoise_loop):
+/// exponential integrator with SDE noise injection at substep + step level and
+/// anchor refinement ("bongmath"). Same conditioning/guidance contract as
+/// `ditSampleCfg`. `seed` feeds the deterministic per-step SDE noise draws.
+pub fn ditSampleRes2s(
+    comp: *const Component,
+    alloc: std.mem.Allocator,
+    cfg: LtxConfig,
+    noise_v: mlx.mlx_array,
+    noise_a: mlx.mlx_array,
+    cond_v: mlx.mlx_array,
+    cond_a: mlx.mlx_array,
+    neg_v: ?mlx.mlx_array,
+    neg_a: ?mlx.mlx_array,
+    video_pos: []const f32,
+    audio_pos: []const f32,
+    sigmas_in: []const f32,
+    vp: GuiderParams,
+    ap: GuiderParams,
+    cond_mask: ?[]const f32,
+    clean_v: ?mlx.mlx_array,
+    seed: u64,
+    progress: ?Progress,
+    win: ProgressWindow,
+    s: S,
+) !BlockOut {
+    // Terminal-0 schedules get a minimal sigma injected before the final step
+    // (reference: sigmas[:-1] + [0.0011, 0.0]) to avoid division by zero.
+    const n_full_steps = sigmas_in.len - 1;
+    const terminal_zero = sigmas_in[sigmas_in.len - 1] == 0.0;
+    var sigmas = try alloc.alloc(f32, if (terminal_zero) sigmas_in.len + 1 else sigmas_in.len);
+    defer alloc.free(sigmas);
+    @memcpy(sigmas[0..sigmas_in.len], sigmas_in);
+    if (terminal_zero) {
+        sigmas[sigmas_in.len - 1] = 0.0011;
+        sigmas[sigmas_in.len] = 0.0;
+    }
+    const total: u32 = if (win.total != 0) win.total else @intCast(n_full_steps);
+
+    var mask_dev = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(mask_dev);
+    if (cond_mask) |m| {
+        const Nv: c_int = @intCast(m.len);
+        const a = mlx.mlx_array_new_data(m.ptr, &[_]c_int{ 1, Nv, 1 }, 3, .float32);
+        try mlx.check(mlx.mlx_array_set(&mask_dev, a));
+        _ = mlx.mlx_array_free(a);
+    }
+    const mask_opt: ?mlx.mlx_array = if (cond_mask != null) mask_dev else null;
+
+    var vx = try asF32(noise_v, s);
+    errdefer _ = mlx.mlx_array_free(vx);
+    var ax = try asF32(noise_a, s);
+    errdefer _ = mlx.mlx_array_free(ax);
+
+    var step: usize = 0;
+    while (step < n_full_steps) : (step += 1) {
+        const sigma = sigmas[step];
+        const sigma_next = sigmas[step + 1];
+        const h: f64 = -@log(@as(f64, sigma_next) / @as(f64, sigma));
+        const co = res2sCoefficients(h);
+        const a21: f32 = @floatCast(co.a21);
+        const b1: f32 = @floatCast(co.b1);
+        const b2: f32 = @floatCast(co.b2);
+        const hf: f32 = @floatCast(h);
+        const sub_sigma: f32 = @floatCast(@sqrt(@as(f64, sigma) * @as(f64, sigma_next)));
+
+        // Stage 1: predict at the current point.
+        const d1 = try res2sPredict(comp, alloc, cfg, vx, ax, sigma, cond_v, cond_a, neg_v, neg_a, vp, ap, video_pos, audio_pos, cond_mask, clean_v, mask_opt, s);
+        defer _ = mlx.mlx_array_free(d1.v);
+        defer _ = mlx.mlx_array_free(d1.a);
+
+        var x_anchor_v = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(x_anchor_v);
+        try mlx.check(mlx.mlx_array_set(&x_anchor_v, vx));
+        var x_anchor_a = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(x_anchor_a);
+        try mlx.check(mlx.mlx_array_set(&x_anchor_a, ax));
+
+        // eps1 = d1 - anchor; x_mid = anchor + h*a21*eps1
+        var eps1_v = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(eps1_v);
+        try mlx.check(mlx.mlx_subtract(&eps1_v, d1.v, x_anchor_v, s));
+        var eps1_a = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(eps1_a);
+        try mlx.check(mlx.mlx_subtract(&eps1_a, d1.a, x_anchor_a, s));
+        var x_mid_v = try axpy(x_anchor_v, eps1_v, hf * a21, s);
+        defer _ = mlx.mlx_array_free(x_mid_v);
+        var x_mid_a = try axpy(x_anchor_a, eps1_a, hf * a21, s);
+        defer _ = mlx.mlx_array_free(x_mid_a);
+
+        // SDE noise at the substep (channel-normalized draws; deterministic
+        // per-step keys derived from the request seed).
+        {
+            const nv = try res2sNoise(mlx.getShape(vx), seed +% step *% 10000 +% 1, s);
+            defer _ = mlx.mlx_array_free(nv);
+            const na = try res2sNoise(mlx.getShape(ax), seed +% step *% 10000 +% 251, s);
+            defer _ = mlx.mlx_array_free(na);
+            const mv = try sdeStep(x_anchor_v, x_mid_v, sigma, sub_sigma, nv, s);
+            _ = mlx.mlx_array_free(x_mid_v);
+            x_mid_v = mv;
+            const ma = try sdeStep(x_anchor_a, x_mid_a, sigma, sub_sigma, na, s);
+            _ = mlx.mlx_array_free(x_mid_a);
+            x_mid_a = ma;
+        }
+
+        // Anchor refinement for small steps (reference bongmath loop; closed form).
+        if (hf < 0.5 and sigma > 0.03) {
+            const r = hf * a21;
+            const av = try bongAnchor(x_mid_v, d1.v, r, s);
+            _ = mlx.mlx_array_free(x_anchor_v);
+            x_anchor_v = av;
+            try mlx.check(mlx.mlx_subtract(&eps1_v, d1.v, x_anchor_v, s));
+            const aa = try bongAnchor(x_mid_a, d1.a, r, s);
+            _ = mlx.mlx_array_free(x_anchor_a);
+            x_anchor_a = aa;
+            try mlx.check(mlx.mlx_subtract(&eps1_a, d1.a, x_anchor_a, s));
+        }
+
+        // Stage 2: predict at the substep.
+        const d2 = try res2sPredict(comp, alloc, cfg, x_mid_v, x_mid_a, sub_sigma, cond_v, cond_a, neg_v, neg_a, vp, ap, video_pos, audio_pos, cond_mask, clean_v, mask_opt, s);
+        defer _ = mlx.mlx_array_free(d2.v);
+        defer _ = mlx.mlx_array_free(d2.a);
+        var eps2_v = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(eps2_v);
+        try mlx.check(mlx.mlx_subtract(&eps2_v, d2.v, x_anchor_v, s));
+        var eps2_a = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(eps2_a);
+        try mlx.check(mlx.mlx_subtract(&eps2_a, d2.a, x_anchor_a, s));
+
+        // x_next = anchor + h*(b1*eps1 + b2*eps2)
+        const t1v = try axpy(x_anchor_v, eps1_v, hf * b1, s);
+        defer _ = mlx.mlx_array_free(t1v);
+        const x_next_v = try axpy(t1v, eps2_v, hf * b2, s);
+        defer _ = mlx.mlx_array_free(x_next_v);
+        const t1a = try axpy(x_anchor_a, eps1_a, hf * b1, s);
+        defer _ = mlx.mlx_array_free(t1a);
+        const x_next_a = try axpy(t1a, eps2_a, hf * b2, s);
+        defer _ = mlx.mlx_array_free(x_next_a);
+
+        // SDE noise at the step level.
+        {
+            const nv = try res2sNoise(mlx.getShape(vx), seed +% step *% 10000 +% 2, s);
+            defer _ = mlx.mlx_array_free(nv);
+            const na = try res2sNoise(mlx.getShape(ax), seed +% step *% 10000 +% 252, s);
+            defer _ = mlx.mlx_array_free(na);
+            const sv = try sdeStep(x_anchor_v, x_next_v, sigma, sigma_next, nv, s);
+            _ = mlx.mlx_array_free(vx);
+            vx = sv;
+            const sa = try sdeStep(x_anchor_a, x_next_a, sigma, sigma_next, na, s);
+            _ = mlx.mlx_array_free(ax);
+            ax = sa;
+        }
+        _ = mlx.mlx_array_eval(vx);
+        _ = mlx.mlx_array_eval(ax);
+        if (progress) |p| p.emit(win.label, win.base + @as(u32, @intCast(step + 1)), total);
+    }
+
+    // Terminal cleanup: one last x0 prediction at the injected minimal sigma.
+    if (terminal_zero) {
+        const x0 = try res2sPredict(comp, alloc, cfg, vx, ax, sigmas[n_full_steps], cond_v, cond_a, neg_v, neg_a, vp, ap, video_pos, audio_pos, cond_mask, clean_v, mask_opt, s);
+        _ = mlx.mlx_array_free(vx);
+        _ = mlx.mlx_array_free(ax);
+        vx = x0.v;
+        ax = x0.a;
+    }
+    const out_v = try asBf16(vx, s);
+    _ = mlx.mlx_array_free(vx);
+    const out_a = try asBf16(ax, s);
+    _ = mlx.mlx_array_free(ax);
+    return .{ .v = out_v, .a = out_a };
+}
+
+/// Guided x0 prediction on f32 latents (res2s loop body): bf16 forward, f32 out.
+fn res2sPredict(comp: *const Component, alloc: std.mem.Allocator, cfg: LtxConfig, vx_f32: mlx.mlx_array, ax_f32: mlx.mlx_array, sigma: f32, cond_v: mlx.mlx_array, cond_a: mlx.mlx_array, neg_v: ?mlx.mlx_array, neg_a: ?mlx.mlx_array, vp: GuiderParams, ap: GuiderParams, video_pos: []const f32, audio_pos: []const f32, cond_mask: ?[]const f32, clean_v: ?mlx.mlx_array, mask_dev: ?mlx.mlx_array, s: S) !BlockOut {
+    const vb = try asBf16(vx_f32, s);
+    defer _ = mlx.mlx_array_free(vb);
+    const ab = try asBf16(ax_f32, s);
+    defer _ = mlx.mlx_array_free(ab);
+    const x0 = try ditX0Guided(comp, alloc, cfg, vb, ab, sigma, cond_v, cond_a, neg_v, neg_a, vp, ap, video_pos, audio_pos, cond_mask, clean_v, mask_dev, s);
+    defer _ = mlx.mlx_array_free(x0.v);
+    defer _ = mlx.mlx_array_free(x0.a);
+    return .{ .v = try asF32(x0.v, s), .a = try asF32(x0.a, s) };
+}
+
+/// Channel-normalized standard-normal noise for the res2s SDE injections.
+fn res2sNoise(shape: []const c_int, seed: u64, s: S) !mlx.mlx_array {
+    var key = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(key);
+    try mlx.check(mlx.mlx_random_key(&key, seed));
+    var raw = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(raw);
+    try mlx.check(mlx.mlx_random_normal(&raw, shape.ptr, shape.len, .float32, 0.0, 1.0, key, s));
+    return channelwiseNormalize(raw, s);
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// LatentUpsampler (spatial x2) — two-stage pipeline stage boundary.
+// Reference: ltx_core_mlx/model/upsampler/model.py, weights
+// spatial_upscaler_x2_v1_1.safetensors (bf16, prefix "spatial_upscaler_x2_v1_1.").
+// Architecture: initial conv3d+GN+SiLU → 4 ResBlocks → per-frame conv2d +
+// PixelShuffle2D(2) → 4 ResBlocks → final conv3d. All convs k3 pad1 (plain
+// symmetric padding — NOT the VAE's causal-temporal scheme).
+// ════════════════════════════════════════════════════════════════════════
+
+pub const UPSAMPLER_PREFIX = "spatial_upscaler_x2_v1_1";
+
+/// Plain conv3d k3 pad1 + bias on BDHWC input (weight [O,3,3,3,I] MLX layout).
+fn upConv3d(comp: *const Component, alloc: std.mem.Allocator, x: mlx.mlx_array, comptime name_fmt: []const u8, args: anytype, s: S) !mlx.mlx_array {
+    const wk = try std.fmt.allocPrint(alloc, UPSAMPLER_PREFIX ++ "." ++ name_fmt ++ ".weight", args);
+    defer alloc.free(wk);
+    const bk = try std.fmt.allocPrint(alloc, UPSAMPLER_PREFIX ++ "." ++ name_fmt ++ ".bias", args);
+    defer alloc.free(bk);
+    const w = comp.get(wk) orelse return error.MissingUpsamplerWeight;
+    const b = comp.get(bk) orelse return error.MissingUpsamplerWeight;
+    const conv = try conv3d(x, w, .{ 1, 1, 1 }, .{ 1, 1, 1 }, s);
+    defer _ = mlx.mlx_array_free(conv);
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_add(&out, conv, b, s)); // bias [O] broadcasts on last axis
+    return out;
+}
+
+/// GroupNorm(32, C, pytorch_compatible) on BDHWC: normalize each (batch, group)
+/// over (D,H,W,C/32), then per-channel affine. eps 1e-5 (nn.GroupNorm default).
+fn groupNorm32(x: mlx.mlx_array, weight: mlx.mlx_array, bias: mlx.mlx_array, s: S) !mlx.mlx_array {
+    const sh = mlx.getShape(x); // [B,D,H,W,C]
+    const B = sh[0];
+    const D = sh[1];
+    const H = sh[2];
+    const W = sh[3];
+    const C = sh[4];
+    const G: c_int = 32;
+    const Cg = @divExact(C, G);
+    var xr = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(xr);
+    try mlx.check(mlx.mlx_reshape(&xr, x, &[_]c_int{ B, D, H, W, G, Cg }, 6, s));
+    const axes = [_]c_int{ 1, 2, 3, 5 };
+    var mean = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(mean);
+    try mlx.check(mlx.mlx_mean_axes(&mean, xr, &axes, axes.len, true, s));
+    var xm = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(xm);
+    try mlx.check(mlx.mlx_subtract(&xm, xr, mean, s));
+    var sq = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sq);
+    try mlx.check(mlx.mlx_square(&sq, xm, s));
+    var vv = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(vv);
+    try mlx.check(mlx.mlx_mean_axes(&vv, sq, &axes, axes.len, true, s));
+    const eps_a = mlx.mlx_array_new_float(1e-5);
+    defer _ = mlx.mlx_array_free(eps_a);
+    var ve = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ve);
+    try mlx.check(mlx.mlx_add(&ve, vv, eps_a, s));
+    var rs = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(rs);
+    try mlx.check(mlx.mlx_rsqrt(&rs, ve, s));
+    var normed = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(normed);
+    try mlx.check(mlx.mlx_multiply(&normed, xm, rs, s));
+    var flat = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(flat);
+    try mlx.check(mlx.mlx_reshape(&flat, normed, &[_]c_int{ B, D, H, W, C }, 5, s));
+    var scaled = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(scaled);
+    try mlx.check(mlx.mlx_multiply(&scaled, flat, weight, s));
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_add(&out, scaled, bias, s));
+    return out;
+}
+
+fn upGroupNorm(comp: *const Component, alloc: std.mem.Allocator, x: mlx.mlx_array, comptime name_fmt: []const u8, args: anytype, s: S) !mlx.mlx_array {
+    const wk = try std.fmt.allocPrint(alloc, UPSAMPLER_PREFIX ++ "." ++ name_fmt ++ ".weight", args);
+    defer alloc.free(wk);
+    const bk = try std.fmt.allocPrint(alloc, UPSAMPLER_PREFIX ++ "." ++ name_fmt ++ ".bias", args);
+    defer alloc.free(bk);
+    const w = comp.get(wk) orelse return error.MissingUpsamplerWeight;
+    const b = comp.get(bk) orelse return error.MissingUpsamplerWeight;
+    return groupNorm32(x, w, b, s);
+}
+
+/// ResBlock: conv1 → norm1 → SiLU → conv2 → norm2 → SiLU(x + residual).
+fn upResBlock(comp: *const Component, alloc: std.mem.Allocator, x_in: mlx.mlx_array, comptime stage: []const u8, blk: u32, s: S) !mlx.mlx_array {
+    const c1 = try upConv3d(comp, alloc, x_in, stage ++ ".{d}.conv1", .{blk}, s);
+    defer _ = mlx.mlx_array_free(c1);
+    const n1 = try upGroupNorm(comp, alloc, c1, stage ++ ".{d}.norm1", .{blk}, s);
+    defer _ = mlx.mlx_array_free(n1);
+    const s1 = try silu(n1, s);
+    defer _ = mlx.mlx_array_free(s1);
+    const c2 = try upConv3d(comp, alloc, s1, stage ++ ".{d}.conv2", .{blk}, s);
+    defer _ = mlx.mlx_array_free(c2);
+    const n2 = try upGroupNorm(comp, alloc, c2, stage ++ ".{d}.norm2", .{blk}, s);
+    defer _ = mlx.mlx_array_free(n2);
+    var res = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(res);
+    try mlx.check(mlx.mlx_add(&res, n2, x_in, s));
+    return silu(res, s);
+}
+
+/// 2D pixel shuffle on [N,H,W,C*f*f] → [N,H*f,W*f,C] (PyTorch (c,p1,p2) order).
+fn pixelShuffle2d(x: mlx.mlx_array, factor: u32, s: S) !mlx.mlx_array {
+    const sh = mlx.getShape(x);
+    const N = sh[0];
+    const H = sh[1];
+    const W = sh[2];
+    const f: c_int = @intCast(factor);
+    const C = @divExact(sh[3], f * f);
+    var r = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(r);
+    try mlx.check(mlx.mlx_reshape(&r, x, &[_]c_int{ N, H, W, C, f, f }, 6, s));
+    var t = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(t);
+    try mlx.check(mlx.mlx_transpose_axes(&t, r, &[_]c_int{ 0, 1, 4, 2, 5, 3 }, 6, s));
+    var ct = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ct);
+    try mlx.check(mlx.mlx_contiguous(&ct, t, false, s));
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_reshape(&out, ct, &[_]c_int{ N, H * f, W * f, C }, 4, s));
+    return out;
+}
+
+/// Full spatial-x2 latent upsample: `[1,C,F,H,W]` → `[1,C,F,2H,2W]` (bf16).
+/// Operates in UN-normalized latent space — callers denormalize before and
+/// re-normalize after (reference TwoStagePipeline upscale block).
+pub fn upsampleLatentX2(comp: *const Component, alloc: std.mem.Allocator, latent_bcfhw: mlx.mlx_array, s: S) !mlx.mlx_array {
+    // BCFHW → BFHWC
+    const tr = try transposeTo(latent_bcfhw, &[_]c_int{ 0, 2, 3, 4, 1 }, s);
+    defer _ = mlx.mlx_array_free(tr);
+    var x = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_contiguous(&x, tr, false, s));
+
+    { // initial conv + norm + SiLU
+        const c = try upConv3d(comp, alloc, x, "initial_conv", .{}, s);
+        defer _ = mlx.mlx_array_free(c);
+        const n = try upGroupNorm(comp, alloc, c, "initial_norm", .{}, s);
+        _ = mlx.mlx_array_free(x);
+        x = try silu(n, s);
+        _ = mlx.mlx_array_free(n);
+    }
+    for (0..4) |blk| {
+        const nx = try upResBlock(comp, alloc, x, "res_blocks", @intCast(blk), s);
+        _ = mlx.mlx_array_free(x);
+        x = nx;
+        _ = mlx.mlx_array_eval(x);
+    }
+    { // per-frame conv2d (upsampler.0) + PixelShuffle2D(2)
+        const sh = mlx.getShape(x); // [1,F,H,W,C]
+        const F = sh[1];
+        const H = sh[2];
+        const W = sh[3];
+        const C = sh[4];
+        var frames = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(frames);
+        try mlx.check(mlx.mlx_reshape(&frames, x, &[_]c_int{ F, H, W, C }, 4, s));
+        const w = comp.get(UPSAMPLER_PREFIX ++ ".upsampler.0.weight") orelse return error.MissingUpsamplerWeight;
+        const b = comp.get(UPSAMPLER_PREFIX ++ ".upsampler.0.bias") orelse return error.MissingUpsamplerWeight;
+        var conv = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(conv);
+        try mlx.check(mlx.mlx_conv2d(&conv, frames, w, 1, 1, 1, 1, 1, 1, 1, s));
+        var cb = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(cb);
+        try mlx.check(mlx.mlx_add(&cb, conv, b, s));
+        const ps = try pixelShuffle2d(cb, 2, s);
+        defer _ = mlx.mlx_array_free(ps);
+        _ = mlx.mlx_array_free(x);
+        x = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_reshape(&x, ps, &[_]c_int{ 1, F, H * 2, W * 2, C }, 5, s));
+        _ = mlx.mlx_array_eval(x);
+    }
+    for (0..4) |blk| {
+        const nx = try upResBlock(comp, alloc, x, "post_upsample_res_blocks", @intCast(blk), s);
+        _ = mlx.mlx_array_free(x);
+        x = nx;
+        _ = mlx.mlx_array_eval(x);
+    }
+    { // final conv
+        const c = try upConv3d(comp, alloc, x, "final_conv", .{}, s);
+        _ = mlx.mlx_array_free(x);
+        x = c;
+    }
+    // BFHWC → BCFHW
+    const tb = try transposeTo(x, &[_]c_int{ 0, 4, 1, 2, 3 }, s);
+    _ = mlx.mlx_array_free(x);
+    defer _ = mlx.mlx_array_free(tb);
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_contiguous(&out, tb, false, s));
+    return out;
+}
+
+/// Per-channel latent (de)normalization using the VAE ENCODER's statistics
+/// (`_mean_of_means`/`_std_of_means` [128]). The DiT works in normalized
+/// space; the upsampler works in raw space. Input/output `[1,C,F,H,W]`.
+pub fn latentDenormalize(enc: *const Component, latent_bcfhw: mlx.mlx_array, s: S) !mlx.mlx_array {
+    return latentStatsApply(enc, latent_bcfhw, false, s);
+}
+pub fn latentNormalize(enc: *const Component, latent_bcfhw: mlx.mlx_array, s: S) !mlx.mlx_array {
+    return latentStatsApply(enc, latent_bcfhw, true, s);
+}
+
+fn latentStatsApply(enc: *const Component, x: mlx.mlx_array, normalize: bool, s: S) !mlx.mlx_array {
+    const mean_raw = enc.get("vae_encoder.per_channel_statistics._mean_of_means") orelse return error.MissingVaeWeight;
+    const std_raw = enc.get("vae_encoder.per_channel_statistics._std_of_means") orelse return error.MissingVaeWeight;
+    const C: c_int = mlx.getShape(x)[1];
+    var mean = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(mean);
+    try mlx.check(mlx.mlx_reshape(&mean, mean_raw, &[_]c_int{ 1, C, 1, 1, 1 }, 5, s));
+    var stdv = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(stdv);
+    try mlx.check(mlx.mlx_reshape(&stdv, std_raw, &[_]c_int{ 1, C, 1, 1, 1 }, 5, s));
+    var out = mlx.mlx_array_new();
+    if (normalize) { // (x - mean) / std
+        var xm = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(xm);
+        try mlx.check(mlx.mlx_subtract(&xm, x, mean, s));
+        try mlx.check(mlx.mlx_divide(&out, xm, stdv, s));
+    } else { // x * std + mean
+        var xs = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(xs);
+        try mlx.check(mlx.mlx_multiply(&xs, x, stdv, s));
+        try mlx.check(mlx.mlx_add(&out, xs, mean, s));
+    }
+    return out;
+}
+
+// ════════════════════════════════════════════════════════════════════════
 // Latent → frames: unpatchify the sampled video latent, VAE-decode, convert
 // to RGB uint8 frames. Reference: VideoLatentPatchifier.unpatchify + VideoDecoder
 // pixel conversion (clip[-1,1], (x+1)*127.5, uint8, CHW→HWC).
 // ════════════════════════════════════════════════════════════════════════
+
+/// Patchify (inverse of `unpatchifyVideo`): [1, C, F, H, W] → [1, F*H*W, C].
+pub fn patchifyVideo(latent: mlx.mlx_array, s: S) !mlx.mlx_array {
+    const sh = mlx.getShape(latent); // [1,C,F,H,W]
+    const C = sh[1];
+    const N = sh[2] * sh[3] * sh[4];
+    const tr = try transposeTo(latent, &[_]c_int{ 0, 2, 3, 4, 1 }, s);
+    defer _ = mlx.mlx_array_free(tr);
+    var trc = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(trc);
+    try mlx.check(mlx.mlx_contiguous(&trc, tr, false, s));
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_reshape(&out, trc, &[_]c_int{ 1, N, C }, 3, s));
+    return out;
+}
 
 /// Unpatchify: [1, F*H*W, C] → [1, C, F, H, W] (contiguous, ready for vaeDecode).
 pub fn unpatchifyVideo(tokens: mlx.mlx_array, F: u32, H: u32, W: u32, s: S) !mlx.mlx_array {
@@ -2364,15 +3638,57 @@ pub const VideoFrames = struct {
     frames: u32,
     height: u32,
     width: u32,
+    audio_latent: ?mlx.mlx_array = null, // DiT audio latent [1, Na, 128]; caller decodes + frees
     pub fn deinit(self: *VideoFrames, alloc: std.mem.Allocator) void {
         alloc.free(self.rgb);
+        if (self.audio_latent) |a| _ = mlx.mlx_array_free(a);
     }
 };
 
-/// Full native text-to-video: prompt ids (+ negative) → text embeds → seed noise
-/// → CFG Euler sampler → VAE decode → RGB uint8 frames. `connector` and
-/// `transformer` are the connector.safetensors and transformer-dev.safetensors
-/// Components; `vae` is vae_decoder.safetensors. Caller frees the result.
+/// Slice tokens `[start, stop)` along axis 1 of a `[1,N,C]` token array.
+fn sliceTokens(x: mlx.mlx_array, start: u32, stop: u32, s: S) !mlx.mlx_array {
+    const C: c_int = mlx.getShape(x)[2];
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_slice(&out, x, &[_]c_int{ 0, @intCast(start), 0 }, 3, &[_]c_int{ 1, @intCast(stop), C }, 3, &[_]c_int{ 1, 1, 1 }, 3, s));
+    return out;
+}
+
+/// Concatenate two `[1,N,C]` token arrays along axis 1.
+fn concatTokens(a: mlx.mlx_array, b: mlx.mlx_array, s: S) !mlx.mlx_array {
+    const vec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(vec);
+    _ = mlx.mlx_vector_array_append_value(vec, a);
+    _ = mlx.mlx_vector_array_append_value(vec, b);
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_concatenate_axis(&out, vec, 1, s));
+    return out;
+}
+
+/// Sigma schedule for a single-pass generation. The DISTILLED transformer was
+/// trained against the fixed 8-step DISTILLED_SIGMAS table (reference one-stage:
+/// truncate-only, never re-spaced); the dev transformer uses the token-adaptive
+/// dynamic-shift schedule. Caller frees the slice.
+pub fn oneStageSigmas(alloc: std.mem.Allocator, distilled: bool, num_steps: u32, num_tokens: u32) ![]f32 {
+    if (distilled) {
+        // Truncating the table mid-way ends at a non-zero sigma (reference quirk
+        // that leaves the latent noisy); clamp to the full 8 steps instead and
+        // let callers log when the request asked for something else.
+        const out = try alloc.alloc(f32, DISTILLED_SIGMAS.len);
+        @memcpy(out, &DISTILLED_SIGMAS);
+        return out;
+    }
+    return dynamicShiftSchedule(alloc, num_steps, num_tokens, 0.95, 2.05, 1024, 4096, true, 0.1);
+}
+
+/// Full native text-to-video (and image-to-video): prompt ids (+ negative) →
+/// text embeds → seed noise → guided Euler sampler → VAE decode → RGB uint8
+/// frames. `connector`/`transformer` are connector.safetensors / a transformer
+/// variant; `vae` is vae_decoder.safetensors. For I2V, pass `vae_encoder` (the
+/// encoder Component) and `cond_image` (`[1,3,1,height,width]` BCFHW, bf16,
+/// [-1,1]) — the image is VAE-encoded and pinned as the clean first latent
+/// frame; both null → pure t2v (byte-unchanged). The negative prompt is only
+/// encoded (a full Gemma-3-12B pass) when a guider actually needs the
+/// unconditional forward. Caller frees the result.
 pub fn generateVideoFrames(
     io: std.Io,
     alloc: std.mem.Allocator,
@@ -2380,6 +3696,8 @@ pub fn generateVideoFrames(
     transformer: *const Component,
     connector: *const Component,
     vae: *const Component,
+    vae_encoder: ?*const Component,
+    cond_image: ?mlx.mlx_array,
     gemma_dir: []const u8,
     pos_ids: []const i32,
     neg_ids: []const i32,
@@ -2389,10 +3707,10 @@ pub fn generateVideoFrames(
     width: u32,
     frame_rate: f32,
     num_steps: u32,
+    distilled_schedule: bool,
     seed: u64,
-    cfg_video: f32,
-    cfg_audio: f32,
-    rescale: f32,
+    vp: GuiderParams,
+    ap: GuiderParams,
     progress: ?Progress,
     s: S,
 ) !VideoFrames {
@@ -2402,26 +3720,31 @@ pub fn generateVideoFrames(
     const W = shape.W;
     const Nv = F * H * W;
     const Na = computeAudioTokenCount(num_frames, frame_rate);
-    log.info("[ltx] latent F={d} H={d} W={d} (Nv={d}, Na={d}) steps={d}\n", .{ F, H, W, Nv, Na, num_steps });
+    log.info("[ltx] latent F={d} H={d} W={d} (Nv={d}, Na={d}) steps={d} distilled={}\n", .{ F, H, W, Nv, Na, num_steps, distilled_schedule });
 
-    // ── text embeds (positive + negative) ──
+    // ── text embeds (positive; negative only when CFG needs it) ──
     if (progress) |p| p.emit("Encoding prompt", 0, num_steps);
     var pos = try encodeTextLtx(connector, io, alloc, gemma_dir, pos_ids, pad_id, s);
     defer pos.deinit();
     _ = mlx.mlx_array_eval(pos.video);
     _ = mlx.mlx_array_eval(pos.audio);
-    var neg = try encodeTextLtx(connector, io, alloc, gemma_dir, neg_ids, pad_id, s);
-    defer neg.deinit();
-    _ = mlx.mlx_array_eval(neg.video);
-    _ = mlx.mlx_array_eval(neg.audio);
+    var neg: ?TextEmbeds = null;
+    defer if (neg) |*n| n.deinit();
+    if (vp.needsUncond() or ap.needsUncond()) {
+        neg = try encodeTextLtx(connector, io, alloc, gemma_dir, neg_ids, pad_id, s);
+        _ = mlx.mlx_array_eval(neg.?.video);
+        _ = mlx.mlx_array_eval(neg.?.audio);
+    }
 
     // ── positions + schedule ──
     const vpos = try computeVideoPositions(alloc, F, H, W, frame_rate);
     defer alloc.free(vpos);
     const apos = try computeAudioPositions(alloc, Na);
     defer alloc.free(apos);
-    const sigmas = try dynamicShiftSchedule(alloc, num_steps, Nv, 0.95, 2.05, 1024, 4096, true, 0.1);
+    const sigmas = try oneStageSigmas(alloc, distilled_schedule, num_steps, Nv);
     defer alloc.free(sigmas);
+    if (distilled_schedule and num_steps != DISTILLED_SIGMAS.len - 1)
+        log.info("[ltx] distilled schedule is fixed at {d} steps (requested {d})\n", .{ DISTILLED_SIGMAS.len - 1, num_steps });
 
     // ── seed noise (video seed, audio seed+1 — matches the reference) ──
     const noise_v = try mlxRandomNormal(&[_]c_int{ 1, @intCast(Nv), 128 }, seed, s);
@@ -2429,20 +3752,315 @@ pub fn generateVideoFrames(
     const noise_a = try mlxRandomNormal(&[_]c_int{ 1, @intCast(Na), 128 }, seed + 1, s);
     defer _ = mlx.mlx_array_free(noise_a);
 
+    // ── I2V first-frame conditioning (optional) ──────────────────────────────
+    // Encode the reference image → clean tokens for latent frame 0. Replace the
+    // first H*W noise tokens with them, build the clean latent + denoise mask.
+    // Reference: combined_image_conditionings + VideoConditionByLatentIndex.
+    const HW = H * W;
+    var init_owned: ?mlx.mlx_array = null;
+    defer if (init_owned) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    var clean_v: ?mlx.mlx_array = null;
+    defer if (clean_v) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    var cond_mask: ?[]f32 = null;
+    defer if (cond_mask) |b| alloc.free(b);
+    if (vae_encoder) |venc| if (cond_image) |img| if (HW < Nv) {
+        if (progress) |p| p.emit("Encoding image", 0, num_steps);
+        const ref_lat = try vaeEncode(venc, img, s); // [1,128,1,H,W]
+        defer _ = mlx.mlx_array_free(ref_lat);
+        // patchify: [1,128,1,H,W] → [1,1,H,W,128] → [1,H*W,128].
+        const tr = try transposeTo(ref_lat, &[_]c_int{ 0, 2, 3, 4, 1 }, s);
+        defer _ = mlx.mlx_array_free(tr);
+        var trc = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(trc);
+        try mlx.check(mlx.mlx_contiguous(&trc, tr, false, s));
+        var ref_tokens = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(ref_tokens);
+        try mlx.check(mlx.mlx_reshape(&ref_tokens, trc, &[_]c_int{ 1, @intCast(HW), 128 }, 3, s));
+
+        // init latent = [ref_tokens, noise[HW:]].
+        const rest = try sliceTokens(noise_v, HW, Nv, s);
+        defer _ = mlx.mlx_array_free(rest);
+        init_owned = try concatTokens(ref_tokens, rest, s);
+
+        // clean latent = [ref_tokens, zeros] (the zero region is masked out anyway).
+        const zv = mlx.mlx_array_new_float(0.0);
+        defer _ = mlx.mlx_array_free(zv);
+        var zeros = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(zeros);
+        try mlx.check(mlx.mlx_full(&zeros, &[_]c_int{ 1, @intCast(Nv - HW), 128 }, 3, zv, .bfloat16, s));
+        clean_v = try concatTokens(ref_tokens, zeros, s);
+
+        // denoise mask: 0 for the conditioned first frame, 1 for generated tokens.
+        const m = try alloc.alloc(f32, Nv);
+        for (0..Nv) |n| m[n] = if (n < HW) 0.0 else 1.0;
+        cond_mask = m;
+        log.info("[ltx] I2V: conditioned first frame ({d} tokens of {d})\n", .{ HW, Nv });
+    };
+    const sampler_v = init_owned orelse noise_v;
+
     // ── denoise ──
-    const final = try ditSampleCfg(transformer, alloc, cfg, noise_v, noise_a, pos.video, pos.audio, neg.video, neg.audio, vpos, apos, sigmas, cfg_video, cfg_audio, rescale, progress, s);
+    const total_steps: u32 = @intCast(sigmas.len - 1);
+    const final = try ditSampleCfg(transformer, alloc, cfg, sampler_v, noise_a, pos.video, pos.audio, if (neg) |n| n.video else null, if (neg) |n| n.audio else null, vpos, apos, sigmas, vp, ap, cond_mask, clean_v, progress, .{ .label = "Generating", .base = 0, .total = total_steps }, s);
     defer _ = mlx.mlx_array_free(final.v);
-    defer _ = mlx.mlx_array_free(final.a);
+    // final.a (audio latent [1, Na, 128]) is transferred to the caller below for
+    // optional audio decode; if anything fails before then, free it.
+    var audio_latent: ?mlx.mlx_array = final.a;
+    errdefer if (audio_latent) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
 
     // ── decode video → frames ──
-    if (progress) |p| p.emit("Decoding video", num_steps, num_steps);
+    if (progress) |p| p.emit("Decoding video", total_steps, total_steps);
     const latent = try unpatchifyVideo(final.v, F, H, W, s);
     defer _ = mlx.mlx_array_free(latent);
     const pixels = try vaeDecode(vae, latent, s);
     defer _ = mlx.mlx_array_free(pixels);
     const psh = mlx.getShape(pixels); // [1,3,F_px,H_px,W_px]
     const rgb = try framesToU8(pixels, alloc, s);
-    return .{ .rgb = rgb, .frames = @intCast(psh[2]), .height = @intCast(psh[3]), .width = @intCast(psh[4]) };
+    const al = audio_latent;
+    audio_latent = null; // ownership transferred into the result
+    return .{ .rgb = rgb, .frames = @intCast(psh[2]), .height = @intCast(psh[3]), .width = @intCast(psh[4]), .audio_latent = al };
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// Two-stage pipeline (reference ti2vid_two_stages[_hq].py):
+//   Stage 1: dev transformer + CFG/modality guidance at HALF resolution
+//            (Euler, or res_2s for HQ).
+//   Boundary: latent denormalize → spatial x2 upsampler → renormalize.
+//   Stage 2: distilled transformer, 3-step STAGE_2_SIGMAS refine at full res
+//            (no guidance), video renoised to sigma 0.909375, audio carried
+//            from stage 1 and renoised likewise.
+// ════════════════════════════════════════════════════════════════════════
+
+/// First-frame conditioning state for one stage (built from an encoded image).
+const I2VCond = struct {
+    init_latent: mlx.mlx_array, // [1,Nv,C]: [ref tokens, rest of `base`]
+    clean: mlx.mlx_array, // [1,Nv,C]: [ref tokens, zeros]
+    mask: []f32, // 0 for the first HW tokens, 1 elsewhere
+
+    fn deinit(self: *I2VCond, alloc: std.mem.Allocator) void {
+        _ = mlx.mlx_array_free(self.init_latent);
+        _ = mlx.mlx_array_free(self.clean);
+        alloc.free(self.mask);
+    }
+};
+
+/// VAE-encode `img` and pin it as latent frame 0 over `base` (the noise / noisy
+/// tokens for the rest of the canvas). Mirrors VideoConditionByLatentIndex.
+fn buildI2VCond(alloc: std.mem.Allocator, venc: *const Component, img: mlx.mlx_array, base: mlx.mlx_array, HW: u32, Nv: u32, s: S) !I2VCond {
+    const ref_lat = try vaeEncode(venc, img, s); // [1,128,1,H,W]
+    defer _ = mlx.mlx_array_free(ref_lat);
+    const ref_tokens = try patchifyVideo(ref_lat, s); // [1,HW,128]
+    defer _ = mlx.mlx_array_free(ref_tokens);
+
+    const rest = try sliceTokens(base, HW, Nv, s);
+    defer _ = mlx.mlx_array_free(rest);
+    const init_latent = try concatTokens(ref_tokens, rest, s);
+    errdefer _ = mlx.mlx_array_free(init_latent);
+
+    const zv = mlx.mlx_array_new_float(0.0);
+    defer _ = mlx.mlx_array_free(zv);
+    var zeros = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(zeros);
+    try mlx.check(mlx.mlx_full(&zeros, &[_]c_int{ 1, @intCast(Nv - HW), 128 }, 3, zv, .bfloat16, s));
+    const clean = try concatTokens(ref_tokens, zeros, s);
+    errdefer _ = mlx.mlx_array_free(clean);
+
+    const mask = try alloc.alloc(f32, Nv);
+    for (0..Nv) |n| mask[n] = if (n < HW) 0.0 else 1.0;
+    return .{ .init_latent = init_latent, .clean = clean, .mask = mask };
+}
+
+/// `noise*sigma + clean*(1-sigma)` (flow-matching renoise), bf16 out.
+fn lerpToSigma(clean: mlx.mlx_array, noise: mlx.mlx_array, sigma: f32, s: S) !mlx.mlx_array {
+    const sa = mlx.mlx_array_new_float(sigma);
+    defer _ = mlx.mlx_array_free(sa);
+    var ns = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ns);
+    try mlx.check(mlx.mlx_multiply(&ns, noise, sa, s));
+    const ca = mlx.mlx_array_new_float(1.0 - sigma);
+    defer _ = mlx.mlx_array_free(ca);
+    var cs = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(cs);
+    try mlx.check(mlx.mlx_multiply(&cs, clean, ca, s));
+    var sum = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sum);
+    try mlx.check(mlx.mlx_add(&sum, ns, cs, s));
+    return asBf16(sum, s);
+}
+
+pub const TwoStageOpts = struct {
+    hq: bool = false, // res_2s sampler for stage 1
+    stage1_steps: u32 = 30, // reference default (HQ default is 15 — caller sets)
+    stage2_steps: u32 = 0, // 0 → the full 3-step STAGE_2_SIGMAS
+    upsampler: *const Component,
+    /// Stage-2 transformer provider: invalidates the stage-1 (dev) component
+    /// and returns the distilled one (owned by ctx; borrowed here).
+    swap_ctx: *anyopaque,
+    swap: *const fn (ctx: *anyopaque) anyerror!*const Component,
+};
+
+/// Two-stage text/image-to-video. `transformer` is the DEV variant (stage 1
+/// requires real CFG); `vae_encoder` is REQUIRED (latent statistics for the
+/// upsampler boundary, plus I2V). `cond_image_half`/`cond_image_full` are the
+/// first-frame pixels prepared at the stage-1 / stage-2 grids (both null → t2v).
+pub fn generateVideoFramesTwoStage(
+    io: std.Io,
+    alloc: std.mem.Allocator,
+    cfg: LtxConfig,
+    transformer: *const Component,
+    connector: *const Component,
+    vae: *const Component,
+    vae_encoder: *const Component,
+    cond_image_half: ?mlx.mlx_array,
+    cond_image_full: ?mlx.mlx_array,
+    gemma_dir: []const u8,
+    pos_ids: []const i32,
+    neg_ids: []const i32,
+    pad_id: i32,
+    num_frames: u32,
+    height: u32,
+    width: u32,
+    frame_rate: f32,
+    opts: TwoStageOpts,
+    seed: u64,
+    vp: GuiderParams,
+    ap: GuiderParams,
+    progress: ?Progress,
+    s: S,
+) !VideoFrames {
+    const shape1 = computeVideoLatentShape(num_frames, height / 2, width / 2);
+    const F = shape1.F;
+    const H1 = shape1.H;
+    const W1 = shape1.W;
+    const Nv1 = F * H1 * W1;
+    const H2 = H1 * 2;
+    const W2 = W1 * 2;
+    const Nv2 = F * H2 * W2;
+    const Na = computeAudioTokenCount(num_frames, frame_rate);
+    const n_stage2: u32 = if (opts.stage2_steps == 0) STAGE_2_SIGMAS.len - 1 else @min(opts.stage2_steps, STAGE_2_SIGMAS.len - 1);
+    const total: u32 = opts.stage1_steps + n_stage2;
+    log.info("[ltx] two-stage{s}: stage1 {d}x{d} (Nv={d}) {d} steps, stage2 {d}x{d} (Nv={d}) {d} steps\n", .{ if (opts.hq) " HQ" else "", H1 * 32, W1 * 32, Nv1, opts.stage1_steps, H2 * 32, W2 * 32, Nv2, n_stage2 });
+
+    // ── text embeds (positive + negative — stage 1 always runs CFG) ──
+    if (progress) |p| p.emit("Encoding prompt", 0, total);
+    var pos = try encodeTextLtx(connector, io, alloc, gemma_dir, pos_ids, pad_id, s);
+    defer pos.deinit();
+    _ = mlx.mlx_array_eval(pos.video);
+    _ = mlx.mlx_array_eval(pos.audio);
+    var neg: ?TextEmbeds = null;
+    defer if (neg) |*n| n.deinit();
+    if (vp.needsUncond() or ap.needsUncond()) {
+        neg = try encodeTextLtx(connector, io, alloc, gemma_dir, neg_ids, pad_id, s);
+        _ = mlx.mlx_array_eval(neg.?.video);
+        _ = mlx.mlx_array_eval(neg.?.audio);
+    }
+
+    // ── stage 1: half resolution, guided ──
+    const vpos1 = try computeVideoPositions(alloc, F, H1, W1, frame_rate);
+    defer alloc.free(vpos1);
+    const apos = try computeAudioPositions(alloc, Na);
+    defer alloc.free(apos);
+    const sigmas1 = try dynamicShiftSchedule(alloc, opts.stage1_steps, Nv1, 0.95, 2.05, 1024, 4096, true, 0.1);
+    defer alloc.free(sigmas1);
+
+    const noise_v1 = try mlxRandomNormal(&[_]c_int{ 1, @intCast(Nv1), 128 }, seed, s);
+    defer _ = mlx.mlx_array_free(noise_v1);
+    const noise_a = try mlxRandomNormal(&[_]c_int{ 1, @intCast(Na), 128 }, seed + 1, s);
+    defer _ = mlx.mlx_array_free(noise_a);
+
+    var cond1: ?I2VCond = null;
+    defer if (cond1) |*c| c.deinit(alloc);
+    if (cond_image_half) |img| if (H1 * W1 < Nv1) {
+        if (progress) |p| p.emit("Encoding image", 0, total);
+        cond1 = try buildI2VCond(alloc, vae_encoder, img, noise_v1, H1 * W1, Nv1, s);
+        log.info("[ltx] two-stage I2V: conditioned first frame ({d} of {d} tokens)\n", .{ H1 * W1, Nv1 });
+    };
+
+    const stage1_v = if (cond1) |c| c.init_latent else noise_v1;
+    const win1 = ProgressWindow{ .label = "Stage 1", .base = 0, .total = total };
+    const out1 = if (opts.hq)
+        try ditSampleRes2s(transformer, alloc, cfg, stage1_v, noise_a, pos.video, pos.audio, if (neg) |n| n.video else null, if (neg) |n| n.audio else null, vpos1, apos, sigmas1, vp, ap, if (cond1) |c| c.mask else null, if (cond1) |c| c.clean else null, seed, progress, win1, s)
+    else
+        try ditSampleCfg(transformer, alloc, cfg, stage1_v, noise_a, pos.video, pos.audio, if (neg) |n| n.video else null, if (neg) |n| n.audio else null, vpos1, apos, sigmas1, vp, ap, if (cond1) |c| c.mask else null, if (cond1) |c| c.clean else null, progress, win1, s);
+    var audio1: ?mlx.mlx_array = out1.a;
+    defer if (audio1) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+
+    // ── boundary: unpatchify → denormalize → x2 upsample → renormalize ──
+    if (progress) |p| p.emit("Upscaling", opts.stage1_steps, total);
+    const video_tokens2 = blk: {
+        const half = try unpatchifyVideo(out1.v, F, H1, W1, s);
+        _ = mlx.mlx_array_free(out1.v);
+        defer _ = mlx.mlx_array_free(half);
+        const denorm = try latentDenormalize(vae_encoder, half, s);
+        defer _ = mlx.mlx_array_free(denorm);
+        const up = try upsampleLatentX2(opts.upsampler, alloc, denorm, s);
+        defer _ = mlx.mlx_array_free(up);
+        const renorm = try latentNormalize(vae_encoder, up, s);
+        defer _ = mlx.mlx_array_free(renorm);
+        const toks = try patchifyVideo(renorm, s); // [1,Nv2,128]
+        _ = mlx.mlx_array_eval(toks);
+        break :blk toks;
+    };
+    defer _ = mlx.mlx_array_free(video_tokens2);
+
+    // ── swap to the distilled transformer for the refine pass ──
+    const dit2 = try opts.swap(opts.swap_ctx);
+
+    // ── stage 2: full resolution, no guidance ──
+    var sigmas2_buf: [STAGE_2_SIGMAS.len]f32 = undefined;
+    @memcpy(sigmas2_buf[0 .. n_stage2 + 1], STAGE_2_SIGMAS[0 .. n_stage2 + 1]);
+    const sigmas2 = sigmas2_buf[0 .. n_stage2 + 1];
+    const start_sigma = sigmas2[0];
+
+    const noise_v2 = try mlxRandomNormal(&[_]c_int{ 1, @intCast(Nv2), 128 }, seed + 2, s);
+    defer _ = mlx.mlx_array_free(noise_v2);
+    const noisy_v2 = try lerpToSigma(video_tokens2, noise_v2, start_sigma, s);
+    defer _ = mlx.mlx_array_free(noisy_v2);
+
+    var cond2: ?I2VCond = null;
+    defer if (cond2) |*c| c.deinit(alloc);
+    if (cond_image_full) |img| if (H2 * W2 < Nv2) {
+        cond2 = try buildI2VCond(alloc, vae_encoder, img, noisy_v2, H2 * W2, Nv2, s);
+    };
+
+    // audio: carry stage-1 latent, renoised to the stage-2 start sigma.
+    const noise_a2 = try mlxRandomNormal(&[_]c_int{ 1, @intCast(Na), 128 }, seed +% 2 +% 0x9E3779B97F4A7C15, s);
+    defer _ = mlx.mlx_array_free(noise_a2);
+    const noisy_a2 = try lerpToSigma(audio1.?, noise_a2, start_sigma, s);
+    defer _ = mlx.mlx_array_free(noisy_a2);
+
+    const vpos2 = try computeVideoPositions(alloc, F, H2, W2, frame_rate);
+    defer alloc.free(vpos2);
+
+    const stage2_v = if (cond2) |c| c.init_latent else noisy_v2;
+    const out2 = try ditSampleCfg(dit2, alloc, cfg, stage2_v, noisy_a2, pos.video, pos.audio, null, null, vpos2, apos, sigmas2, .{}, .{}, if (cond2) |c| c.mask else null, if (cond2) |c| c.clean else null, progress, .{ .label = "Stage 2", .base = opts.stage1_steps, .total = total }, s);
+    defer _ = mlx.mlx_array_free(out2.v);
+    // stage-2 audio replaces stage-1 as the decoded track.
+    _ = mlx.mlx_array_free(audio1.?);
+    audio1 = null;
+    var audio_latent: ?mlx.mlx_array = out2.a;
+    errdefer if (audio_latent) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+
+    // ── decode ──
+    if (progress) |p| p.emit("Decoding video", total, total);
+    const latent = try unpatchifyVideo(out2.v, F, H2, W2, s);
+    defer _ = mlx.mlx_array_free(latent);
+    const pixels = try vaeDecode(vae, latent, s);
+    defer _ = mlx.mlx_array_free(pixels);
+    const psh = mlx.getShape(pixels); // [1,3,F_px,H_px,W_px]
+    const rgb = try framesToU8(pixels, alloc, s);
+    const al = audio_latent;
+    audio_latent = null;
+    return .{ .rgb = rgb, .frames = @intCast(psh[2]), .height = @intCast(psh[3]), .width = @intCast(psh[4]), .audio_latent = al };
 }
 
 // ── Tests ──
@@ -2454,6 +4072,14 @@ test "LtxConfig derived dims" {
     try testing.expectEqual(@as(u32, 4096), c.videoDim());
     try testing.expectEqual(@as(u32, 2048), c.audioDim());
     try testing.expectEqual(@as(u32, 188160), c.gemma_layers * c.gemma_hidden);
+}
+
+test "ltxNeedsCfg: both scales 1.0 skips the negative forward" {
+    try testing.expect(!ltxNeedsCfg(1.0, 1.0)); // one-stage default → single forward
+    try testing.expect(ltxNeedsCfg(3.0, 1.0)); // video guided → need negative
+    try testing.expect(ltxNeedsCfg(1.0, 7.0)); // audio guided → need negative
+    try testing.expect(ltxNeedsCfg(3.0, 7.0)); // both guided
+    try testing.expect(!ltxNeedsCfg(1.00001, 0.99999)); // within epsilon of 1.0
 }
 
 // Loader validation against the REAL ltx-2.3-mlx-q4 checkpoint. Loads the small
@@ -2627,6 +4253,60 @@ test "ltx vaeDecode reproduces reference VideoDecoder" {
     const psnr = 10.0 * std.math.log10(4.0 / mse); // signal range ~[-1,1] → peak 2, peak^2=4
     std.debug.print("[ltx-vae] n={d} corr={d:.6} psnr={d:.2}dB mse={d:.6}\n", .{ n, corr, psnr, mse });
     try testing.expect(corr > 0.99);
+}
+
+// VAE ENCODER parity (I2V first-frame conditioning): feed the reference's exact
+// input pixels through vaeEncode and compare the latent (cosine). Decouples the
+// encoder math from image preprocessing — the fixture dumps both tensors.
+//   LTX_TEST_MODEL  = ltx-2.3-mlx-q4 snapshot dir (has vae_encoder.safetensors)
+//   LTX_ENC_PIXELS  = raw f32 [1,3,1,H,W] (BCFHW, [-1,1]) reference input
+//   LTX_ENC_LATENT  = raw f32 [1,128,1,H/32,W/32] reference VideoEncoder.encode
+//   LTX_ENC_H / LTX_ENC_W = pixel dims (default 256/256)
+// Build fixtures with tests/dump_ltx_vae_encoder_fixtures.py.
+test "ltx VAE encoder reproduces reference VideoEncoder" {
+    const dir = std.mem.span(std.c.getenv("LTX_TEST_MODEL") orelse return error.SkipZigTest);
+    const pp = std.mem.span(std.c.getenv("LTX_ENC_PIXELS") orelse return error.SkipZigTest);
+    const lp = std.mem.span(std.c.getenv("LTX_ENC_LATENT") orelse return error.SkipZigTest);
+    const H: c_int = if (std.c.getenv("LTX_ENC_H")) |e| (std.fmt.parseInt(c_int, std.mem.span(e), 10) catch 256) else 256;
+    const W: c_int = if (std.c.getenv("LTX_ENC_W")) |e| (std.fmt.parseInt(c_int, std.mem.span(e), 10) catch 256) else 256;
+    const allocator = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+
+    const pxbuf = try readF32(io, allocator, pp);
+    defer allocator.free(pxbuf);
+    const ref = try readF32(io, allocator, lp);
+    defer allocator.free(ref);
+
+    const cpu_s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(cpu_s);
+    const ep = try std.fmt.allocPrintSentinel(allocator, "{s}/vae_encoder.safetensors", .{dir}, 0);
+    defer allocator.free(ep);
+    var comp = try loadComponent(allocator, ep, cpu_s);
+    defer comp.deinit();
+    var it = comp.map.iterator();
+    while (it.next()) |e| _ = mlx.mlx_array_eval(e.value_ptr.*);
+
+    const pshape = [_]c_int{ 1, 3, 1, H, W };
+    const px_f32 = mlx.mlx_array_new_data(pxbuf.ptr, &pshape, 5, .float32);
+    defer _ = mlx.mlx_array_free(px_f32);
+    var px = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(px);
+    try mlx.check(mlx.mlx_astype(&px, px_f32, .bfloat16, s));
+
+    const out = try vaeEncode(&comp, px, s);
+    defer _ = mlx.mlx_array_free(out);
+    var outf = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(outf);
+    try mlx.check(mlx.mlx_astype(&outf, out, .float32, s));
+    _ = mlx.mlx_array_eval(outf);
+
+    const n: usize = @intCast(mlx.mlx_array_size(outf));
+    try testing.expectEqual(ref.len, n);
+    const corr = corrF32(mlx.mlx_array_data_float32(outf).?, ref, 0);
+    std.debug.print("[ltx-enc] n={d} corr={d:.6}\n", .{ n, corr });
+    try testing.expect(corr > 0.998);
 }
 
 fn corrOf(a: []const f32, b: []const f32) f64 {
@@ -3145,7 +4825,7 @@ test "ltx DiT block-0 forward reproduces BasicAVTransformerBlock" {
     const rope = BlockRope{ .vcos = rv.cos, .vsin = rv.sin, .acos = ra.cos, .asin = ra.sin, .vxcos = rvx.cos, .vxsin = rvx.sin, .axcos = rax.cos, .axsin = rax.sin };
 
     const cfg = LtxConfig{};
-    const out = try ditBlock(&comp, allocator, cfg, 0, vh.x, ah.x, vap.x, aap.x, vpp.x, app.x, avv.x, ava.x, a2vg.x, v2ag.x, vtext.x, atext.x, rope, s);
+    const out = try ditBlock(&comp, allocator, cfg, 0, vh.x, ah.x, vap.x, aap.x, vpp.x, app.x, avv.x, ava.x, a2vg.x, v2ag.x, vtext.x, atext.x, rope, 0, .{}, s);
     defer _ = mlx.mlx_array_free(out.v);
     defer _ = mlx.mlx_array_free(out.a);
 
@@ -3219,7 +4899,7 @@ test "ltx DiT ditForward reproduces LTXModel velocity" {
     defer allocator.free(apos);
 
     const cfg = LtxConfig{};
-    const out = try ditForward(&comp, allocator, cfg, vlat.x, alat.x, 0.7, vtext.x, atext.x, vpos, apos, s);
+    const out = try ditForward(&comp, allocator, cfg, vlat.x, alat.x, 0.7, vtext.x, atext.x, vpos, apos, null, .{}, s);
     defer _ = mlx.mlx_array_free(out.v);
     defer _ = mlx.mlx_array_free(out.a);
 
@@ -3244,6 +4924,109 @@ test "ltx DiT ditForward reproduces LTXModel velocity" {
     std.debug.print("[ltx-fwd] velocity_v corr={d:.6} ({d}) velocity_a corr={d:.6} ({d})\n", .{ vc, vn, ac, an });
     try testing.expect(vc > 0.99);
     try testing.expect(ac > 0.99);
+}
+
+// Per-token AdaLN regression tripwire: with an ALL-ONES denoise mask every token
+// is at the SAME timestep (sigma), so the per-token path MUST reproduce the
+// scalar t2v path — proving the I2V plumbing adds no t2v regression. Synthetic
+// inputs (no fixtures), so it runs whenever the transformer is present.
+//   LTX_TEST_MODEL = ltx-2.3-mlx-q4 snapshot dir (for transformer-dev.safetensors)
+test "ltx DiT per-token AdaLN uniform-mask equals scalar (no t2v regression)" {
+    const dir = std.mem.span(std.c.getenv("LTX_TEST_MODEL") orelse return error.SkipZigTest);
+    const allocator = testing.allocator;
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const cpu_s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(cpu_s);
+
+    const vp = try std.fmt.allocPrintSentinel(allocator, "{s}/transformer-dev.safetensors", .{dir}, 0);
+    defer allocator.free(vp);
+    var comp = try loadComponent(allocator, vp, cpu_s);
+    defer comp.deinit();
+    var it = comp.map.iterator();
+    while (it.next()) |e| _ = mlx.mlx_array_eval(e.value_ptr.*);
+
+    const cfg = LtxConfig{};
+    const F: u32 = 2;
+    const Hh: u32 = 4;
+    const Ww: u32 = 4;
+    const Nv = F * Hh * Ww; // 32
+    const Na: u32 = 9;
+    const Nt: u32 = 16;
+
+    const vlat = try mlxRandomNormal(&[_]c_int{ 1, @intCast(Nv), 128 }, 1, s);
+    defer _ = mlx.mlx_array_free(vlat);
+    const alat = try mlxRandomNormal(&[_]c_int{ 1, @intCast(Na), 128 }, 2, s);
+    defer _ = mlx.mlx_array_free(alat);
+    const vtext = try mlxRandomNormal(&[_]c_int{ 1, @intCast(Nt), 4096 }, 3, s);
+    defer _ = mlx.mlx_array_free(vtext);
+    const atext = try mlxRandomNormal(&[_]c_int{ 1, @intCast(Nt), 2048 }, 4, s);
+    defer _ = mlx.mlx_array_free(atext);
+
+    const vpos = try computeVideoPositions(allocator, F, Hh, Ww, 24.0);
+    defer allocator.free(vpos);
+    const apos = try computeAudioPositions(allocator, Na);
+    defer allocator.free(apos);
+
+    const sigma: f32 = 0.6;
+    const scalar = try ditForward(&comp, allocator, cfg, vlat, alat, sigma, vtext, atext, vpos, apos, null, .{}, s);
+    defer _ = mlx.mlx_array_free(scalar.v);
+    defer _ = mlx.mlx_array_free(scalar.a);
+
+    const ones = try allocator.alloc(f32, Nv);
+    defer allocator.free(ones);
+    @memset(ones, 1.0);
+    const pt = try ditForward(&comp, allocator, cfg, vlat, alat, sigma, vtext, atext, vpos, apos, ones, .{}, s);
+    defer _ = mlx.mlx_array_free(pt.v);
+    defer _ = mlx.mlx_array_free(pt.a);
+
+    var sv = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sv);
+    try mlx.check(mlx.mlx_astype(&sv, scalar.v, .float32, s));
+    _ = mlx.mlx_array_eval(sv);
+    var pv = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(pv);
+    try mlx.check(mlx.mlx_astype(&pv, pt.v, .float32, s));
+    _ = mlx.mlx_array_eval(pv);
+    var sa = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sa);
+    try mlx.check(mlx.mlx_astype(&sa, scalar.a, .float32, s));
+    _ = mlx.mlx_array_eval(sa);
+    var pa = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(pa);
+    try mlx.check(mlx.mlx_astype(&pa, pt.a, .float32, s));
+    _ = mlx.mlx_array_eval(pa);
+
+    const vn: usize = @intCast(mlx.mlx_array_size(sv));
+    const an: usize = @intCast(mlx.mlx_array_size(sa));
+    const sv_d = mlx.mlx_array_data_float32(sv).?;
+    const pv_d = mlx.mlx_array_data_float32(pv).?;
+    const sa_d = mlx.mlx_array_data_float32(sa).?;
+    const pa_d = mlx.mlx_array_data_float32(pa).?;
+    // cross-correlate the two runs (corrF32 expects a slice as the reference).
+    var vdot: f64 = 0;
+    var vna: f64 = 0;
+    var vnb: f64 = 0;
+    var vmax: f64 = 0;
+    for (0..vn) |k| {
+        vdot += @as(f64, sv_d[k]) * pv_d[k];
+        vna += @as(f64, sv_d[k]) * sv_d[k];
+        vnb += @as(f64, pv_d[k]) * pv_d[k];
+        vmax = @max(vmax, @abs(@as(f64, sv_d[k]) - pv_d[k]));
+    }
+    var adot: f64 = 0;
+    var ana: f64 = 0;
+    var anb: f64 = 0;
+    for (0..an) |k| {
+        adot += @as(f64, sa_d[k]) * pa_d[k];
+        ana += @as(f64, sa_d[k]) * sa_d[k];
+        anb += @as(f64, pa_d[k]) * pa_d[k];
+    }
+    const vcorr = vdot / (@sqrt(vna) * @sqrt(vnb));
+    const acorr = adot / (@sqrt(ana) * @sqrt(anb));
+    std.debug.print("[ltx-pt] uniform-mask video corr={d:.8} max_abs={d:.6} audio corr={d:.8}\n", .{ vcorr, vmax, acorr });
+    try testing.expect(vcorr > 0.9999);
+    try testing.expect(acorr > 0.9999);
 }
 
 // Stage 4a: dynamicShiftSchedule matches the reference ltx2_schedule. Cheap,
@@ -3318,7 +5101,7 @@ test "ltx DiT ditSampleCfg reproduces guided denoise loop" {
     defer allocator.free(sigmas);
 
     const cfg = LtxConfig{};
-    const out = try ditSampleCfg(&comp, allocator, cfg, nv.x, na.x, cv.x, ca.x, ngv.x, nga.x, vpos, apos, sigmas, 3.0, 7.0, 0.7, null, s);
+    const out = try ditSampleCfg(&comp, allocator, cfg, nv.x, na.x, cv.x, ca.x, ngv.x, nga.x, vpos, apos, sigmas, .{ .cfg = 3.0, .rescale = 0.7 }, .{ .cfg = 7.0, .rescale = 0.7 }, null, null, null, .{}, s);
     defer _ = mlx.mlx_array_free(out.v);
     defer _ = mlx.mlx_array_free(out.a);
 
@@ -3467,4 +5250,323 @@ test "ltx DiT encodeTextLtx reproduces PromptEncoder" {
     std.debug.print("[ltx-text] video corr={d:.6} audio corr={d:.6}\n", .{ vc, ac });
     try testing.expect(vc > 0.99);
     try testing.expect(ac > 0.99);
+}
+
+// ── Two-stage pipeline: hermetic unit tests (no weights) ──
+
+test "res2s phi + coefficients match the reference math" {
+    // Golden values computed with the reference utils/res2s.py (Python f64).
+    const cases = [_]struct { h: f64, a21: f64, b1: f64, b2: f64 }{
+        .{ .h = 0.05, .a21 = 0.4938017594333477, .b1 = -0.008128090585528325, .b2 = 0.983539600571248 },
+        .{ .h = 0.2231435513142097, .a21 = 0.4731161101376686, .b1 = -0.03330570328566285, .b2 = 0.9295897268305728 },
+        .{ .h = 0.5, .a21 = 0.44239843385719024, .b1 = -0.06530659712633424, .b2 = 0.8522452777010674 },
+        .{ .h = 1.0, .a21 = 0.3934693402873666, .b1 = -0.103638323514327, .b2 = 0.7357588823428847 },
+        .{ .h = 2.0, .a21 = 0.31606027941427883, .b1 = -0.13533528323661276, .b2 = 0.5676676416183064 },
+    };
+    for (cases) |c| {
+        const co = res2sCoefficients(c.h);
+        try testing.expectApproxEqAbs(c.a21, co.a21, 1e-12);
+        try testing.expectApproxEqAbs(c.b1, co.b1, 1e-12);
+        try testing.expectApproxEqAbs(c.b2, co.b2, 1e-12);
+    }
+    // phi_j(0) = 1/j!
+    try testing.expectApproxEqAbs(@as(f64, 1.0), res2sPhi(1, 0.0), 1e-15);
+    try testing.expectApproxEqAbs(@as(f64, 0.5), res2sPhi(2, 0.0), 1e-15);
+}
+
+test "STAGE_2_SIGMAS + distilled schedule shape" {
+    try testing.expectEqual(@as(usize, 4), STAGE_2_SIGMAS.len);
+    try testing.expectApproxEqAbs(@as(f32, 0.909375), STAGE_2_SIGMAS[0], 1e-7);
+    try testing.expectApproxEqAbs(@as(f32, 0.0), STAGE_2_SIGMAS[3], 1e-7);
+    const allocator = testing.allocator;
+    // distilled → always the trained 8-step table, regardless of requested steps
+    const d = try oneStageSigmas(allocator, true, 12, 999);
+    defer allocator.free(d);
+    try testing.expectEqual(@as(usize, 9), d.len);
+    try testing.expectApproxEqAbs(@as(f32, 1.0), d[0], 1e-7);
+    try testing.expectApproxEqAbs(@as(f32, 0.0), d[8], 1e-7);
+    // dev → dynamic-shift schedule with the requested step count
+    const dyn = try oneStageSigmas(allocator, false, 12, 999);
+    defer allocator.free(dyn);
+    try testing.expectEqual(@as(usize, 13), dyn.len);
+}
+
+test "GuiderParams needs* gating" {
+    const off = GuiderParams{};
+    try testing.expect(!off.needsUncond() and !off.needsPerturbed() and !off.needsModality() and !off.needsGuidance());
+    const cfg_only = GuiderParams{ .cfg = 3.0 };
+    try testing.expect(cfg_only.needsUncond() and cfg_only.needsGuidance());
+    // stg without blocks → the perturbed forward is a no-op and is skipped
+    const stg_no_blocks = GuiderParams{ .stg = 1.0 };
+    try testing.expect(!stg_no_blocks.needsPerturbed());
+    const stg = GuiderParams{ .stg = 1.0, .stg_blocks = &.{28} };
+    try testing.expect(stg.needsPerturbed());
+    const modality = GuiderParams{ .modality = 3.0 };
+    try testing.expect(modality.needsModality() and modality.needsGuidance());
+}
+
+fn testArr(vals: []const f32, shape: []const c_int) mlx.mlx_array {
+    return mlx.mlx_array_new_data(vals.ptr, shape.ptr, @intCast(shape.len), .float32);
+}
+
+fn readAll(alloc: std.mem.Allocator, x: mlx.mlx_array, s: S) ![]f32 {
+    var f = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(f);
+    try mlx.check(mlx.mlx_astype(&f, x, .float32, s));
+    _ = mlx.mlx_array_eval(f);
+    const n: usize = @intCast(mlx.mlx_array_size(f));
+    const data = mlx.mlx_array_data_float32(f).?;
+    const out = try alloc.alloc(f32, n);
+    @memcpy(out, data[0..n]);
+    return out;
+}
+
+test "guiderCalculate matches the reference formula (cfg + stg + modality + rescale off)" {
+    const allocator = testing.allocator;
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const shape = [_]c_int{ 1, 2, 2 };
+    const cond = testArr(&.{ 1.0, 2.0, 3.0, 4.0 }, &shape);
+    defer _ = mlx.mlx_array_free(cond);
+    const uncond = testArr(&.{ 0.5, 1.0, 1.5, 2.0 }, &shape);
+    defer _ = mlx.mlx_array_free(uncond);
+    const ptb = testArr(&.{ 0.0, 1.0, 2.0, 3.0 }, &shape);
+    defer _ = mlx.mlx_array_free(ptb);
+    const mod = testArr(&.{ 1.0, 1.0, 1.0, 1.0 }, &shape);
+    defer _ = mlx.mlx_array_free(mod);
+    const p = GuiderParams{ .cfg = 3.0, .stg = 2.0, .modality = 1.5, .stg_blocks = &.{28} };
+    const pred = try guiderCalculate(cond, uncond, ptb, mod, p, s);
+    defer _ = mlx.mlx_array_free(pred);
+    const got = try readAll(allocator, pred, s);
+    defer allocator.free(got);
+    // pred = cond + 2*(cond-uncond) + 2*(cond-ptb) + 0.5*(cond-mod)
+    const expect = [_]f32{
+        1.0 + 2.0 * 0.5 + 2.0 * 1.0 + 0.5 * 0.0,
+        2.0 + 2.0 * 1.0 + 2.0 * 1.0 + 0.5 * 1.0,
+        3.0 + 2.0 * 1.5 + 2.0 * 1.0 + 0.5 * 2.0,
+        4.0 + 2.0 * 2.0 + 2.0 * 1.0 + 0.5 * 3.0,
+    };
+    for (got, expect) |g, e| try testing.expectApproxEqAbs(e, g, 1e-5);
+}
+
+test "guiderCalculate no-op params returns cond unchanged" {
+    const allocator = testing.allocator;
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const shape = [_]c_int{ 1, 2, 2 };
+    const cond = testArr(&.{ 1.0, -2.0, 3.5, 0.25 }, &shape);
+    defer _ = mlx.mlx_array_free(cond);
+    const pred = try guiderCalculate(cond, null, null, null, .{}, s);
+    defer _ = mlx.mlx_array_free(pred);
+    const got = try readAll(allocator, pred, s);
+    defer allocator.free(got);
+    for (got, [_]f32{ 1.0, -2.0, 3.5, 0.25 }) |g, e| try testing.expectApproxEqAbs(e, g, 0.0);
+}
+
+test "bongAnchor closed form equals the reference 100-round iteration" {
+    const allocator = testing.allocator;
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const shape = [_]c_int{ 1, 2, 2 };
+    const x_mid = testArr(&.{ 0.3, -1.2, 2.4, 0.9 }, &shape);
+    defer _ = mlx.mlx_array_free(x_mid);
+    const d1 = testArr(&.{ 1.1, 0.4, -0.5, 2.0 }, &shape);
+    defer _ = mlx.mlx_array_free(d1);
+    const r: f32 = 0.11; // h*a21 for a typical small step (h<0.5 ⇒ r<0.25)
+    // reference: iterate x_anchor = x_mid - r*(d1 - x_anchor), 100 rounds
+    const xm = try readAll(allocator, x_mid, s);
+    defer allocator.free(xm);
+    const dd = try readAll(allocator, d1, s);
+    defer allocator.free(dd);
+    var iter = [_]f32{ 0.0, 0.0, 0.0, 0.0 }; // starts from x_mid? reference starts from prior anchor; contraction converges from anywhere
+    @memcpy(&iter, xm);
+    for (0..100) |_| {
+        for (0..4) |i| iter[i] = xm[i] - r * (dd[i] - iter[i]);
+    }
+    const closed = try bongAnchor(x_mid, d1, r, s);
+    defer _ = mlx.mlx_array_free(closed);
+    const got = try readAll(allocator, closed, s);
+    defer allocator.free(got);
+    for (got, iter) |g, e| try testing.expectApproxEqAbs(e, g, 1e-5);
+}
+
+test "channelwiseNormalize: zero mean / unit std per channel over tokens" {
+    const allocator = testing.allocator;
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    // [1, 4 tokens, 2 channels] with distinct scales per channel
+    const vals = [_]f32{ 10.0, -3.0, 12.0, 0.5, 14.0, 2.0, 8.0, -1.5 };
+    const x = testArr(&vals, &[_]c_int{ 1, 4, 2 });
+    defer _ = mlx.mlx_array_free(x);
+    const n = try channelwiseNormalize(x, s);
+    defer _ = mlx.mlx_array_free(n);
+    const got = try readAll(allocator, n, s);
+    defer allocator.free(got);
+    for (0..2) |c| {
+        var mean: f64 = 0;
+        for (0..4) |t| mean += got[t * 2 + c];
+        mean /= 4.0;
+        var vv: f64 = 0;
+        for (0..4) |t| {
+            const d = got[t * 2 + c] - mean;
+            vv += d * d;
+        }
+        const stddev = @sqrt(vv / 4.0);
+        try testing.expectApproxEqAbs(@as(f64, 0.0), mean, 1e-4);
+        try testing.expectApproxEqAbs(@as(f64, 1.0), stddev, 1e-3);
+    }
+}
+
+test "pixelShuffle2d rearranges (c,p1,p2) like the reference" {
+    const allocator = testing.allocator;
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    // [1,1,1,4] with C=1, factor 2: channels (c p1 p2) → output 2x2 spatial
+    const vals = [_]f32{ 0.0, 1.0, 2.0, 3.0 };
+    const x = testArr(&vals, &[_]c_int{ 1, 1, 1, 4 });
+    defer _ = mlx.mlx_array_free(x);
+    const y = try pixelShuffle2d(x, 2, s);
+    defer _ = mlx.mlx_array_free(y);
+    const sh = mlx.getShape(y);
+    try testing.expectEqual(@as(c_int, 2), sh[1]);
+    try testing.expectEqual(@as(c_int, 2), sh[2]);
+    try testing.expectEqual(@as(c_int, 1), sh[3]);
+    const got = try readAll(allocator, y, s);
+    defer allocator.free(got);
+    // rearrange "(c p1 p2) h w -> c (h p1) (w p2)": out[(p1,p2)] = in[p1*2+p2]
+    for (got, [_]f32{ 0.0, 1.0, 2.0, 3.0 }) |g, e| try testing.expectApproxEqAbs(e, g, 0.0);
+}
+
+test "groupNorm32 matches hand-computed PyTorch GroupNorm" {
+    const allocator = testing.allocator;
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    // [1,1,1,2,32]: G=32 ⇒ each channel is its own group over D*H*W=2 elems.
+    var vals: [64]f32 = undefined;
+    for (0..64) |i| vals[i] = @floatFromInt(i % 7);
+    const x = testArr(&vals, &[_]c_int{ 1, 1, 1, 2, 32 });
+    defer _ = mlx.mlx_array_free(x);
+    var wvals: [32]f32 = undefined;
+    var bvals: [32]f32 = undefined;
+    for (0..32) |i| {
+        wvals[i] = 2.0;
+        bvals[i] = -1.0;
+    }
+    const w = testArr(&wvals, &[_]c_int{32});
+    defer _ = mlx.mlx_array_free(w);
+    const b = testArr(&bvals, &[_]c_int{32});
+    defer _ = mlx.mlx_array_free(b);
+    const y = try groupNorm32(x, w, b, s);
+    defer _ = mlx.mlx_array_free(y);
+    const got = try readAll(allocator, y, s);
+    defer allocator.free(got);
+    for (0..32) |c| {
+        const a = vals[c]; // (w=0, c)
+        const bb = vals[32 + c]; // (w=1, c)
+        const mean = (a + bb) / 2.0;
+        const vv = ((a - mean) * (a - mean) + (bb - mean) * (bb - mean)) / 2.0;
+        const inv = 1.0 / @sqrt(vv + 1e-5);
+        try testing.expectApproxEqAbs(2.0 * ((a - mean) * inv) - 1.0, got[c], 1e-3);
+        try testing.expectApproxEqAbs(2.0 * ((bb - mean) * inv) - 1.0, got[32 + c], 1e-3);
+    }
+}
+
+test "lerpToSigma renoises to the requested sigma" {
+    const allocator = testing.allocator;
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const shape = [_]c_int{ 1, 1, 2 };
+    const clean = testArr(&.{ 1.0, -1.0 }, &shape);
+    defer _ = mlx.mlx_array_free(clean);
+    const noise = testArr(&.{ 0.5, 0.5 }, &shape);
+    defer _ = mlx.mlx_array_free(noise);
+    const y = try lerpToSigma(clean, noise, 0.909375, s);
+    defer _ = mlx.mlx_array_free(y);
+    const got = try readAll(allocator, y, s);
+    defer allocator.free(got);
+    try testing.expectApproxEqAbs(@as(f32, 0.5 * 0.909375 + 1.0 * 0.090625), got[0], 2e-3);
+    try testing.expectApproxEqAbs(@as(f32, 0.5 * 0.909375 - 1.0 * 0.090625), got[1], 2e-3);
+}
+
+test "sdeStep terminal sigma returns the denoised prediction" {
+    const allocator = testing.allocator;
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const shape = [_]c_int{ 1, 1, 2 };
+    const sample = testArr(&.{ 3.0, -3.0 }, &shape);
+    defer _ = mlx.mlx_array_free(sample);
+    const denoised = testArr(&.{ 1.0, 2.0 }, &shape);
+    defer _ = mlx.mlx_array_free(denoised);
+    const noise = testArr(&.{ 9.0, 9.0 }, &shape);
+    defer _ = mlx.mlx_array_free(noise);
+    const y = try sdeStep(sample, denoised, 0.4, 0.0, noise, s);
+    defer _ = mlx.mlx_array_free(y);
+    const got = try readAll(allocator, y, s);
+    defer allocator.free(got);
+    try testing.expectApproxEqAbs(@as(f32, 1.0), got[0], 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 2.0), got[1], 1e-6);
+}
+
+test "patchifyVideo is the inverse of unpatchifyVideo" {
+    const allocator = testing.allocator;
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var vals: [24]f32 = undefined;
+    for (0..24) |i| vals[i] = @floatFromInt(i);
+    const tokens = testArr(&vals, &[_]c_int{ 1, 6, 4 }); // F*H*W=6 tokens, C=4
+    defer _ = mlx.mlx_array_free(tokens);
+    const latent = try unpatchifyVideo(tokens, 1, 2, 3, s);
+    defer _ = mlx.mlx_array_free(latent);
+    const back = try patchifyVideo(latent, s);
+    defer _ = mlx.mlx_array_free(back);
+    const got = try readAll(allocator, back, s);
+    defer allocator.free(got);
+    for (got, vals) |g, e| try testing.expectApproxEqAbs(e, g, 0.0);
+}
+
+// Weights-gated: the full spatial-x2 upsampler reproduces the reference
+// LatentUpsampler (fixtures from tests/dump_ltx_upsampler_fixtures.py).
+test "ltx latent upsampler reproduces reference LatentUpsampler" {
+    const dir = std.mem.span(std.c.getenv("LTX_TEST_MODEL") orelse return error.SkipZigTest);
+    const lp = std.mem.span(std.c.getenv("LTX_UP_LATENT") orelse return error.SkipZigTest);
+    const op = std.mem.span(std.c.getenv("LTX_UP_OUT") orelse return error.SkipZigTest);
+    const allocator = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const cpu_s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(cpu_s);
+
+    const up_path = try std.fmt.allocPrintSentinel(allocator, "{s}/" ++ UPSAMPLER_PREFIX ++ ".safetensors", .{dir}, 0);
+    defer allocator.free(up_path);
+    var comp = try loadComponent(allocator, up_path, cpu_s);
+    defer comp.deinit();
+
+    const lat_buf = try readF32(io, allocator, lp);
+    defer allocator.free(lat_buf);
+    const ref = try readF32(io, allocator, op);
+    defer allocator.free(ref);
+    try testing.expectEqual(@as(usize, 1 * 128 * 3 * 4 * 5), lat_buf.len);
+
+    const lat_f = mlx.mlx_array_new_data(lat_buf.ptr, &[_]c_int{ 1, 128, 3, 4, 5 }, 5, .float32);
+    defer _ = mlx.mlx_array_free(lat_f);
+    var lat = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(lat);
+    try mlx.check(mlx.mlx_astype(&lat, lat_f, .bfloat16, s));
+
+    const out = try upsampleLatentX2(&comp, allocator, lat, s);
+    defer _ = mlx.mlx_array_free(out);
+    const osh = mlx.getShape(out);
+    try testing.expectEqual(@as(c_int, 8), osh[3]);
+    try testing.expectEqual(@as(c_int, 10), osh[4]);
+
+    var of = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(of);
+    try mlx.check(mlx.mlx_astype(&of, out, .float32, s));
+    _ = mlx.mlx_array_eval(of);
+    const got = mlx.mlx_array_data_float32(of).?;
+    try testing.expectEqual(ref.len, @as(usize, @intCast(mlx.mlx_array_size(of))));
+    const c = corrF32(got, ref, 0);
+    std.debug.print("[ltx-upsampler] cos={d:.6}\n", .{c});
+    try testing.expect(c > 0.999);
 }

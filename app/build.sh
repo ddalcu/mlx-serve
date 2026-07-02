@@ -213,9 +213,11 @@ chmod -R u+w "$APP"
 ENTITLEMENTS="$SCRIPT_DIR/MLXCore.entitlements"
 if [ "$IDENTITY" = "-" ]; then
     SIGN_OPTS=(--force --sign -)
-    # Ad-hoc dev builds run without hardened runtime, so the mic prompt works
-    # without entitlements — sign the app process the same way as everything else.
-    APP_SIGN_OPTS=("${SIGN_OPTS[@]}")
+    # Ad-hoc dev builds run without hardened runtime (mic prompt works without
+    # entitlements), but the Agent Sandbox needs com.apple.security.virtualization
+    # on the PROCESS or VZVirtualMachine refuses to start — and that entitlement
+    # works fine with ad-hoc signing. Apply the same entitlements file.
+    APP_SIGN_OPTS=("${SIGN_OPTS[@]}" --entitlements "$ENTITLEMENTS")
 else
     SIGN_OPTS=(--force --options runtime --sign "$IDENTITY")
     # Under hardened runtime the mic-using process (MLXCore) and the .app need

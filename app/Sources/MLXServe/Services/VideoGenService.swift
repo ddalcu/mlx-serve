@@ -55,12 +55,9 @@ final class VideoGenService: ObservableObject {
         let outputPath = Self.makeOutputPath(prompt: request.prompt)
         let prompt = request.prompt
         let fps = request.fps
-        let numFrames = request.numFrames
-        let height = request.height
-        let width = request.width
-        let seed = request.seed
         let steps = request.steps
         let keep = request.keepResident
+        let firstFramePath = request.firstFrameImagePath
 
         task = Task {
             var loadedId: String? = nil
@@ -68,15 +65,22 @@ final class VideoGenService: ObservableObject {
                 if !keep, let id = loadedId { try? await server.unloadModel(id: id) }
             }
             do {
+                // Image-to-video: read the first-frame image file → base64 OFF the
+                // main actor (the file can be multi-MB; reading it synchronously in
+                // generate() blocked the UI). The server VAE-encodes it and pins it
+                // as the clean first frame. Mirrors AudioGenService's `ref_audio`.
+                let firstFrameB64: String? = await Task.detached(priority: .userInitiated) {
+                    firstFramePath.flatMap { path in
+                        (try? Data(contentsOf: URL(fileURLWithPath: path)))?.base64EncodedString()
+                    }
+                }.value
                 let port = try await server.ensureRunning(forGenModelDir: modelDir)
                 if Task.isCancelled { phase = .idle; return }
                 let info = try await server.loadModel(id: modelDir)
                 loadedId = info.name
                 if Task.isCancelled { await releaseIfNeeded(); phase = .idle; return }
-                let body: [String: Any] = [
-                    "model": info.name, "prompt": prompt, "num_frames": numFrames,
-                    "height": height, "width": width, "steps": steps, "seed": seed,
-                ]
+                let body = Self.requestBody(model: info.name, prompt: prompt,
+                                            request: request, firstFrameB64: firstFrameB64)
                 // SSE: the server pushes `progress` events per denoise step, then a
                 // `complete` event with the frames. Drive a determinate bar from them.
                 var decoded: DecodedFrames? = nil
@@ -110,7 +114,9 @@ final class VideoGenService: ObservableObject {
                     try VideoGenService.writeMP4(
                         rgb: frames.rgb, frames: frames.frames,
                         width: frames.width, height: frames.height,
-                        fps: outFps, to: URL(fileURLWithPath: outputPath))
+                        fps: outFps, to: URL(fileURLWithPath: outputPath),
+                        audioPCM: frames.audioPCM, audioSampleRate: frames.audioSampleRate,
+                        audioChannels: frames.audioChannels)
                 }.value
                 phase = .completed(path: outputPath)
                 insertRecent(outputPath)
@@ -129,6 +135,30 @@ final class VideoGenService: ObservableObject {
         task = nil
     }
 
+    // MARK: - Request body (pure so tests can pin the wire contract)
+
+    /// Build the `/v1/video/generations` request body. Pure + static because the
+    /// pipeline/CFG/STG fields silently not being sent is exactly the bug that
+    /// made the Quality preset (cfg 3.0, twoStage) run as unguided one-stage —
+    /// tests pin every field here so the UI model can't drift from the wire.
+    nonisolated static func requestBody(model: String, prompt: String,
+                                        request: VideoGenRequest, firstFrameB64: String?) -> [String: Any] {
+        let pipeline: String
+        switch request.mode {
+        case .oneStage:   pipeline = "one_stage"
+        case .twoStage:   pipeline = "two_stage"
+        case .twoStageHQ: pipeline = "two_stage_hq"
+        }
+        var body: [String: Any] = [
+            "model": model, "prompt": prompt, "num_frames": request.numFrames,
+            "height": request.height, "width": request.width, "steps": request.steps,
+            "seed": request.seed,
+            "pipeline": pipeline, "cfg_scale": request.cfgScale, "stg_scale": request.stgScale,
+        ]
+        if let firstFrameB64 { body["first_frame_image"] = firstFrameB64 }
+        return body
+    }
+
     // MARK: - Decode + mux (pure / nonisolated so they're testable + off-main)
 
     struct DecodedFrames: Equatable {
@@ -137,9 +167,14 @@ final class VideoGenService: ObservableObject {
         var height: Int
         var width: Int
         var fps: Int
+        // Optional sound track (present when the server decoded the LTX audio
+        // latent): interleaved signed-16-bit little-endian PCM.
+        var audioPCM: Data? = nil
+        var audioSampleRate: Int = 16000
+        var audioChannels: Int = 2
     }
 
-    /// Parse the native server's `{frames,height,width,fps,format,data}` body.
+    /// Parse the native server's `{frames,height,width,fps,format,data,…audio}` body.
     nonisolated static func decodeFrames(_ body: Data) -> DecodedFrames? {
         guard let obj = try? JSONSerialization.jsonObject(with: body) as? [String: Any] else { return nil }
         return decodeFrames(obj)
@@ -156,13 +191,31 @@ final class VideoGenService: ObservableObject {
               rgb.count == frames * height * width * 3
         else { return nil }
         let fps = (obj["fps"] as? Int) ?? 24
-        return DecodedFrames(rgb: rgb, frames: frames, height: height, width: width, fps: fps)
+        var out = DecodedFrames(rgb: rgb, frames: frames, height: height, width: width, fps: fps)
+        // Audio is optional + best-effort: a malformed/absent track never blocks
+        // the (always-present) video.
+        if obj["audio_format"] as? String == "pcm_s16le",
+           let ab64 = obj["audio_data"] as? String,
+           let pcm = Data(base64Encoded: ab64), !pcm.isEmpty {
+            let sr = (obj["audio_sample_rate"] as? Int) ?? 16000
+            let ch = (obj["audio_channels"] as? Int) ?? 2
+            // Server-controlled fields: an invalid sample rate / channel count
+            // drops the audio rather than crash the mux downstream
+            // (bytesPerFrame = 2 * channels would divide by zero).
+            if sr > 0, ch > 0 {
+                out.audioPCM = pcm
+                out.audioSampleRate = sr
+                out.audioChannels = ch
+            }
+        }
+        return out
     }
 
-    enum MuxError: Error { case writerInit, noPool, finishFailed(String) }
+    enum MuxError: Error { case writerInit, noPool, finishFailed(String), audioBuffer }
 
-    /// Mux raw RGB frames → h264 mp4 via AVAssetWriter.
-    nonisolated static func writeMP4(rgb: Data, frames: Int, width: Int, height: Int, fps: Int, to url: URL) throws {
+    /// Mux raw RGB frames (+ optional stereo PCM) → h264/aac mp4 via AVAssetWriter.
+    nonisolated static func writeMP4(rgb: Data, frames: Int, width: Int, height: Int, fps: Int, to url: URL,
+                                     audioPCM: Data? = nil, audioSampleRate: Int = 16000, audioChannels: Int = 2) throws {
         try? FileManager.default.removeItem(at: url)
         let writer = try AVAssetWriter(outputURL: url, fileType: .mp4)
         let settings: [String: Any] = [
@@ -180,8 +233,40 @@ final class VideoGenService: ObservableObject {
         let adaptor = AVAssetWriterInputPixelBufferAdaptor(assetWriterInput: input, sourcePixelBufferAttributes: attrs)
         guard writer.canAdd(input) else { throw MuxError.writerInit }
         writer.add(input)
+
+        // Optional audio track (AAC, transcoded from the source LPCM).
+        // channels/sampleRate are server-controlled: invalid values (≤ 0) skip
+        // the audio input ENTIRELY — never divide by zero in appendAudio, never
+        // create a starved sibling input the video loop would wedge on.
+        var audioInput: AVAssetWriterInput? = nil
+        if let pcm = audioPCM, !pcm.isEmpty, audioChannels > 0, audioSampleRate > 0 {
+            // No explicit bitrate: at 16 kHz the AAC encoder rejects high rates
+            // (e.g. 128 kbps → -12651 "encoding parameters not supported"); let it
+            // pick a valid rate for the sample rate/channel count.
+            let aset: [String: Any] = [
+                AVFormatIDKey: kAudioFormatMPEG4AAC,
+                AVSampleRateKey: audioSampleRate,
+                AVNumberOfChannelsKey: audioChannels,
+            ]
+            let ai = AVAssetWriterInput(mediaType: .audio, outputSettings: aset)
+            ai.expectsMediaDataInRealTime = false
+            if writer.canAdd(ai) { writer.add(ai); audioInput = ai }
+        }
+
         guard writer.startWriting() else { throw writer.error ?? MuxError.writerInit }
         writer.startSession(atSourceTime: .zero)
+
+        // Append the FULL audio track (one buffer) and mark it finished BEFORE the
+        // video loop. A multi-input AVAssetWriter applies backpressure to keep the
+        // tracks interleaved: if we pushed every video frame first, the muxer would
+        // stop accepting video (isReadyForMoreMediaData → false forever) to wait for
+        // audio data near the same timeline — but that audio only gets appended
+        // after the loop, so the video busy-wait deadlocks. Finishing audio up front
+        // leaves the video input with no active sibling to wait on.
+        if let ai = audioInput, let pcm = audioPCM {
+            try appendAudio(ai, pcm: pcm, sampleRate: audioSampleRate, channels: audioChannels)
+        }
+
         guard let pool = adaptor.pixelBufferPool else { throw MuxError.noPool }
 
         let ts: Int32 = 600
@@ -214,12 +299,77 @@ final class VideoGenService: ObservableObject {
             }
         }
         input.markAsFinished()
+
         let sem = DispatchSemaphore(value: 0)
         writer.finishWriting { sem.signal() }
         sem.wait()
         if writer.status != .completed {
-            throw MuxError.finishFailed(writer.error?.localizedDescription ?? "unknown")
+            throw MuxError.finishFailed(String(describing: writer.error))
         }
+    }
+
+    /// Wrap interleaved s16le PCM in a single CMSampleBuffer and append it to the
+    /// audio writer input (the writer transcodes LPCM → AAC).
+    nonisolated static func appendAudio(_ ai: AVAssetWriterInput, pcm: Data, sampleRate: Int, channels: Int) throws {
+        // Every early return MUST finish the input: an added-but-never-finished
+        // audio input is a starved sibling the muxer waits on forever, wedging
+        // the video loop (the documented multi-input AVAssetWriter class).
+        guard channels > 0, sampleRate > 0 else { ai.markAsFinished(); return }
+        let bytesPerFrame = 2 * channels
+        let numFrames = pcm.count / bytesPerFrame
+        guard numFrames > 0 else { ai.markAsFinished(); return }
+
+        var asbd = AudioStreamBasicDescription(
+            mSampleRate: Float64(sampleRate),
+            mFormatID: kAudioFormatLinearPCM,
+            mFormatFlags: kAudioFormatFlagIsSignedInteger | kAudioFormatFlagIsPacked,
+            mBytesPerPacket: UInt32(bytesPerFrame),
+            mFramesPerPacket: 1,
+            mBytesPerFrame: UInt32(bytesPerFrame),
+            mChannelsPerFrame: UInt32(channels),
+            mBitsPerChannel: 16,
+            mReserved: 0)
+        // A channel layout is required for the AAC encoder to accept multi-channel
+        // input (otherwise finishWriting fails with "Cannot Encode Media").
+        var layout = AudioChannelLayout()
+        layout.mChannelLayoutTag = channels == 1 ? kAudioChannelLayoutTag_Mono : kAudioChannelLayoutTag_Stereo
+        var format: CMAudioFormatDescription?
+        let fmtStatus = withUnsafePointer(to: &layout) { lp in
+            CMAudioFormatDescriptionCreate(allocator: kCFAllocatorDefault, asbd: &asbd,
+                                           layoutSize: MemoryLayout<AudioChannelLayout>.size, layout: lp,
+                                           magicCookieSize: 0, magicCookie: nil, extensions: nil,
+                                           formatDescriptionOut: &format)
+        }
+        guard fmtStatus == noErr, let fmt = format else { throw MuxError.audioBuffer }
+
+        var blockBuffer: CMBlockBuffer?
+        let dataLen = numFrames * bytesPerFrame
+        guard CMBlockBufferCreateWithMemoryBlock(allocator: kCFAllocatorDefault, memoryBlock: nil,
+                                                  blockLength: dataLen, blockAllocator: kCFAllocatorDefault,
+                                                  customBlockSource: nil, offsetToData: 0, dataLength: dataLen,
+                                                  flags: kCMBlockBufferAssureMemoryNowFlag, blockBufferOut: &blockBuffer) == noErr,
+              let bb = blockBuffer else { throw MuxError.audioBuffer }
+        let copyStatus = pcm.withUnsafeBytes { raw -> OSStatus in
+            CMBlockBufferReplaceDataBytes(with: raw.baseAddress!, blockBuffer: bb,
+                                          offsetIntoDestination: 0, dataLength: dataLen)
+        }
+        guard copyStatus == noErr else { throw MuxError.audioBuffer }
+
+        var sampleBuffer: CMSampleBuffer?
+        var timing = CMSampleTimingInfo(duration: CMTime(value: 1, timescale: Int32(sampleRate)),
+                                        presentationTimeStamp: CMTime(value: 0, timescale: Int32(sampleRate)),
+                                        decodeTimeStamp: .invalid)
+        var sampleSize = bytesPerFrame
+        guard CMSampleBufferCreate(allocator: kCFAllocatorDefault, dataBuffer: bb, dataReady: true,
+                                   makeDataReadyCallback: nil, refcon: nil, formatDescription: fmt,
+                                   sampleCount: numFrames, sampleTimingEntryCount: 1, sampleTimingArray: &timing,
+                                   sampleSizeEntryCount: 1, sampleSizeArray: &sampleSize,
+                                   sampleBufferOut: &sampleBuffer) == noErr, let sb = sampleBuffer
+        else { throw MuxError.audioBuffer }
+
+        while !ai.isReadyForMoreMediaData { usleep(500) }
+        ai.append(sb)
+        ai.markAsFinished()
     }
 
     // MARK: - Private

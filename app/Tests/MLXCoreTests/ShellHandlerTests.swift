@@ -165,4 +165,64 @@ final class ShellHandlerTests: XCTestCase {
         XCTAssertTrue(out.contains("bg1"), out)
         XCTAssertTrue(reg.isAlive(handle: "bg1"), "redundant & must not orphan the tracked process")
     }
+
+    // MARK: - Sandbox routing (background must never escape to the host)
+
+    /// With the Agent Sandbox ON, a background-flagged command must NEVER reach
+    /// the host ProcessRegistry — that executes on the host and defeats the
+    /// isolation promise (the agent prompt actively suggests run_in_background).
+    func testRouteSandboxOnNeverYieldsHostBackground() {
+        for amp in [false, true] {
+            for hasRegistry in [false, true] {
+                XCTAssertEqual(
+                    ShellHandler.route(sandboxEnabled: true, wantsBackground: true,
+                                       hasTrailingAmp: amp, hasRegistry: hasRegistry),
+                    .sandboxBackground,
+                    "flagged background with sandbox on must run inside the guest (amp=\(amp) registry=\(hasRegistry))")
+            }
+        }
+        // A bare trailing `&` (no flag) goes through the normal guest foreground
+        // path — the guest shell backgrounds it itself.
+        XCTAssertEqual(ShellHandler.route(sandboxEnabled: true, wantsBackground: false,
+                                          hasTrailingAmp: true, hasRegistry: true),
+                       .sandboxForeground)
+        XCTAssertEqual(ShellHandler.route(sandboxEnabled: true, wantsBackground: false,
+                                          hasTrailingAmp: false, hasRegistry: true),
+                       .sandboxForeground)
+    }
+
+    /// Sandbox off keeps today's host behavior exactly.
+    func testRouteSandboxOffPreservesHostBehavior() {
+        XCTAssertEqual(ShellHandler.route(sandboxEnabled: false, wantsBackground: true,
+                                          hasTrailingAmp: false, hasRegistry: true),
+                       .hostBackground)
+        XCTAssertEqual(ShellHandler.route(sandboxEnabled: false, wantsBackground: false,
+                                          hasTrailingAmp: true, hasRegistry: true),
+                       .hostBackground)
+        XCTAssertEqual(ShellHandler.route(sandboxEnabled: false, wantsBackground: true,
+                                          hasTrailingAmp: false, hasRegistry: false),
+                       .hostBackgroundUnavailable,
+                       "explicit flag with no registry keeps the graceful error")
+        XCTAssertEqual(ShellHandler.route(sandboxEnabled: false, wantsBackground: false,
+                                          hasTrailingAmp: true, hasRegistry: false),
+                       .hostForeground,
+                       "bare & with no registry runs foreground, as before")
+        XCTAssertEqual(ShellHandler.route(sandboxEnabled: false, wantsBackground: false,
+                                          hasTrailingAmp: false, hasRegistry: true),
+                       .hostForeground)
+    }
+
+    func testSandboxBackgroundCommandWrapsDetachedWithLog() {
+        let wrapped = ShellHandler.sandboxBackgroundCommand("python3 -m http.server 8080",
+                                                            logPath: "/tmp/mlx-bg-1.log")
+        XCTAssertEqual(wrapped, "(python3 -m http.server 8080) </dev/null >>/tmp/mlx-bg-1.log 2>&1 &")
+    }
+
+    func testSandboxBackgroundLogPathIsUniquePerInvocation() {
+        let a = ShellHandler.sandboxBackgroundLogPath(now: Date(timeIntervalSince1970: 1))
+        let b = ShellHandler.sandboxBackgroundLogPath(now: Date(timeIntervalSince1970: 2))
+        XCTAssertTrue(a.hasPrefix("/tmp/mlx-bg-"), a)
+        XCTAssertTrue(a.hasSuffix(".log"), a)
+        XCTAssertNotEqual(a, b, "each invocation needs its own guest log file")
+    }
 }

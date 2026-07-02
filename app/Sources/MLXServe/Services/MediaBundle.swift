@@ -90,10 +90,16 @@ extension MediaBundle {
         )
     }
 
-    /// LTX-Video: pull ONLY the 3 safetensors the engine reads (allowlist) plus
+    /// LTX-Video: pull ONLY the safetensors the engine reads (allowlist) plus
     /// the small json configs — the repo also carries ~50 GB of LoRAs /
     /// upscalers / alternate transformers we never touch. Depends on the
     /// Gemma-3-12B text encoder (a normal chat model the app downloads).
+    ///
+    /// `audio_vae.safetensors` + `vocoder.safetensors` (the audio VAE + BigVGAN
+    /// vocoder, ~0.37 GB together) are allowlisted so the generated video gets a
+    /// SOUND track — the `dgrauet/ltx-2.3-mlx-q4` repo ships both. They're
+    /// deliberately NOT ready markers: a checkpoint without them still completes
+    /// and plays (silently). The server loads both from the model dir.
     static func ltx(repo: String, displayName: String) -> MediaBundle {
         MediaBundle(
             id: "ltx:\(repo)",
@@ -103,6 +109,16 @@ extension MediaBundle {
                     repo: repo,
                     selection: FileSelection(keepSafetensors: [
                         "transformer-dev.safetensors", "connector.safetensors", "vae_decoder.safetensors",
+                        "audio_vae.safetensors", "vocoder.safetensors",
+                        // VAE encoder (~0.6 GB) → image-to-video first-frame conditioning.
+                        // Not a ready marker (like the audio files): I2V is optional.
+                        "vae_encoder.safetensors",
+                        // Two-stage + proper one-stage pipelines (~11 GB + ~1 GB):
+                        // the distilled transformer + x2 spatial upscaler the server's
+                        // `pipeline: two_stage[_hq]` modes read. Allowlisted like the
+                        // VAE encoder — NOT ready markers, so existing dev-only
+                        // installs keep working (readiness/gating unchanged).
+                        "transformer-distilled.safetensors", "spatial_upscaler_x2_v1_1.safetensors",
                     ]),
                     readyMarkers: [
                         "config.json", "transformer-dev.safetensors",
@@ -111,8 +127,9 @@ extension MediaBundle {
                 ),
                 ltxGemmaComponent,
             ],
-            // ~18 GB (3 LTX files) + ~8 GB (Gemma-3-12B 4-bit).
-            sizeEstimateGB: 26
+            // ~18 GB (3 LTX) + ~0.6 GB (VAE encoder) + ~0.37 GB (audio VAE + vocoder)
+            // + ~12 GB (distilled transformer + x2 upscaler) + ~8 GB (Gemma-3-12B 4-bit).
+            sizeEstimateGB: 39
         )
     }
 

@@ -419,8 +419,9 @@ struct VideoGenRequest {
     var steps: Int
     var cfgScale: Double
     var stgScale: Double = 0.0
-    /// Optional first-frame image for image-to-video conditioning (2-stage
-    /// pipelines only — the distilled 1-stage pipeline doesn't accept it).
+    /// Optional first-frame image for image-to-video conditioning — supported
+    /// by every pipeline mode (the server VAE-encodes it and pins it as the
+    /// clean first latent frame).
     var firstFrameImagePath: String? = nil
     /// Keep the model resident after this generation (default off → unload).
     var keepResident: Bool = false

@@ -1,7 +1,24 @@
 import SwiftUI
 import AppKit
 
+/// Process entry point. Normally hands off to the SwiftUI app, but first honors
+/// an opt-in diagnostic: `SANDBOX_SMOKE=1` boots the agent-sandbox Linux guest
+/// (Virtualization.framework) and runs a few commands through it, then exits —
+/// a way to prove the sandbox path end-to-end from a properly-entitled binary
+/// (VZ needs the virtualization entitlement on the *process*, which the signed
+/// MLXCore binary has but the `xctest` host does not). No effect on normal
+/// launches. `CONTAIN_SMOKE=1` is honored as a legacy alias.
 @main
+struct MLXCoreEntryPoint {
+    static func main() {
+        let env = ProcessInfo.processInfo.environment
+        if env["SANDBOX_SMOKE"] == "1" || env["CONTAIN_SMOKE"] == "1" {
+            SandboxSmoke.run()
+        }
+        MLXCoreApp.main()
+    }
+}
+
 struct MLXCoreApp: App {
     private static let menuBarIcon: NSImage = {
         // Try Bundle.main (works in .app bundles) then SPM bundle (works in dev builds)
@@ -89,7 +106,8 @@ struct MLXCoreApp: App {
                 openAudioGen: { openAndFocus("audioGen") },
                 openSettings: { openAndFocus("settings") },
                 openServerLog: { openAndFocus("serverLog") },
-                openTasks: { openAndFocus("tasks") }
+                openTasks: { openAndFocus("tasks") },
+                openSandboxTerminal: { openAndFocus("sandboxTerminal") }
             )
                 .environmentObject(appState)
                 .environmentObject(appState.server)
@@ -185,6 +203,13 @@ struct MLXCoreApp: App {
                 .environmentObject(appState.server)
         }
         .defaultSize(width: 900, height: 560)
+
+        // Live terminal into the agent sandbox guest — see the agent's commands
+        // and run your own in the same isolated Linux VM.
+        Window("Sandbox Terminal", id: "sandboxTerminal") {
+            SandboxTerminalView()
+        }
+        .defaultSize(width: 720, height: 520)
 
         // Scheduled / on-demand agent tasks — the unattended "claw" surface.
         Window("Tasks", id: "tasks") {

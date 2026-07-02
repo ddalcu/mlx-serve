@@ -140,6 +140,14 @@ struct StatusMenuView: View {
     let openSettings: () -> Void
     let openServerLog: () -> Void
     let openTasks: () -> Void
+    var openSandboxTerminal: () -> Void = {}
+
+    /// Observes the shared sandbox so the tray badge appears/updates live when
+    /// the Agent Sandbox is turned on and when its guest boots. Safe to observe
+    /// from the tray: the per-command transcript lives in the separate
+    /// `AgentSandbox.transcriptStore` (observed only by the Sandbox Terminal),
+    /// so command churn never re-renders this menu.
+    @ObservedObject private var sandbox = AgentSandbox.shared
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -481,6 +489,35 @@ struct StatusMenuView: View {
                 .padding(.vertical, 8)
 
             Divider().padding(.horizontal, 12)
+
+            // Agent-sandbox badge — visible only while the sandbox is enabled.
+            // Green box = a guest is live; click to open the Sandbox Terminal and
+            // run commands / watch the agent in the isolated Linux VM.
+            if sandbox.isEnabled {
+                Button {
+                    openSandboxTerminal()
+                } label: {
+                    HStack(spacing: 8) {
+                        Image(systemName: "shippingbox.fill")
+                            .foregroundStyle(sandbox.guestRunning ? Color.green : Color.orange)
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text("Agent Sandbox is on").font(.callout.weight(.medium))
+                            Text(sandbox.guestRunning ? "Guest running — open the terminal"
+                                                      : "Idle — boots on the first command")
+                                .font(.caption2).foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        Image(systemName: "terminal").foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .padding(.horizontal, 16).padding(.vertical, 8)
+                .help("Open the Sandbox Terminal")
+
+                Divider().padding(.horizontal, 12)
+            }
 
             // Chat, Tasks, Claude Code & Quit
             HStack(spacing: 8) {

@@ -413,12 +413,17 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
             var agentVolatileTail = ""
             if config.agentMode {
                 let skills = AgentPrompt.skillManager.matchingSkills(for: userMsg)
-                // Stable, cacheable core: base instructions + memory instructions
-                // + MCP listing. The model's tool block (rendered by the chat
-                // template) sits in front of all of this, so as long as this
-                // prefix stays byte-identical the server reuses the whole
-                // tool+instruction KV across requests.
-                systemPrompt = AgentPrompt.systemPrompt + AgentPrompt.memory
+                // Stable, cacheable core: base instructions + execution
+                // environment + memory instructions + MCP listing. The model's
+                // tool block (rendered by the chat template) sits in front of
+                // all of this, so as long as this prefix stays byte-identical
+                // the server reuses the whole tool+instruction KV across
+                // requests. The environment section is stable within a session
+                // (it only changes when the user flips the Agent Sandbox
+                // setting — one KV re-prefill, then cached again).
+                systemPrompt = AgentPrompt.systemPrompt
+                    + AgentPrompt.executionEnvironmentSection(sandboxed: AgentSandbox.shared.isEnabled)
+                    + AgentPrompt.memory
                 if !mcpListing.isEmpty {
                     systemPrompt += "\n\n# MCP Tools\nIn addition to the built-in tools above, the user has connected these MCP servers. Their tools are namespaced as `<server>__<tool>`:\n\n\(mcpListing)"
                 }

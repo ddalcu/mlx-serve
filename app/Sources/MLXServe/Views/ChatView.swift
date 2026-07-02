@@ -836,20 +836,24 @@ struct ChatDetailView: View {
         }
         .toolbar {
             ToolbarItem(placement: .automatic) {
-                if isAgentMode {
-                    WorkingDirectoryIndicator(path: workingDirectoryBinding)
+                // Sandbox badge: visible when tools are live (Agent or MCP mode)
+                // AND the Agent Sandbox is on — the signal that shell commands
+                // run isolated from this Mac. No badge when tools run on the
+                // host (absence = not sandboxed; never imply safety we don't have).
+                if (isAgentMode || mcpMode) && appState.serverOptions.sandbox.enabled {
+                    Button {
+                        openWindow(id: "sandboxTerminal")
+                    } label: {
+                        Image(systemName: "lock.shield.fill")
+                            .font(.system(size: 12))
+                            .foregroundStyle(.green)
+                    }
+                    .help("Secured by the Agent Sandbox — the agent's shell commands run inside an isolated Linux VM that can only touch the working folder. Click to open the Sandbox Terminal.")
                 }
             }
             ToolbarItem(placement: .automatic) {
                 if isAgentMode {
-                    Button {
-                        let path = NSString(string: "~/.mlx-serve").expandingTildeInPath
-                        NSWorkspace.shared.open(URL(fileURLWithPath: path))
-                    } label: {
-                        Image(systemName: "folder.badge.gearshape")
-                            .font(.system(size: 12))
-                    }
-                    .help("Open ~/.mlx-serve in Finder — your skills/, system-prompt.md, memory.md, chat-history.json, and downloaded models live here.")
+                    WorkingDirectoryIndicator(path: workingDirectoryBinding)
                 }
             }
             ToolbarItem(placement: .automatic) {

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Native LTX-Video 2.3 text-to-video endpoint smoke test.
-# Usage: LTX_MODEL=<dir> [LTX_GEMMA_DIR=<dir>] ./tests/test_video_gen.sh [port]
+# Native LTX-Video 2.3 text-to-video endpoint smoke test (incl. audio track).
+# Usage: LTX_MODEL=<dir> [LTX_GEMMA_DIR=<dir>] [LTX_AUDIO_VAE=<file>] ./tests/test_video_gen.sh [port]
 set -uo pipefail
 PORT="${1:-11331}"
 MODEL="${LTX_MODEL:-$(ls -d ~/.cache/huggingface/hub/models--dgrauet--ltx-2.3-mlx-q4/snapshots/* 2>/dev/null | head -1)}"
@@ -8,6 +8,18 @@ MODEL="${LTX_MODEL:-$(ls -d ~/.cache/huggingface/hub/models--dgrauet--ltx-2.3-ml
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$ROOT/zig-out/bin/mlx-serve"
 [ -x "$BIN" ] || { echo "FAIL: build first (zig build -Doptimize=ReleaseFast)"; exit 1; }
+
+# Audio is decoded only when the q4 audio weights (audio_vae.safetensors +
+# vocoder.safetensors) sit in the model dir. When both are present the response
+# MUST carry a non-silent stereo track synced to the video duration.
+# Override the lookup dir with LTX_AUDIO_DIR if your audio files live elsewhere.
+AUDIO_DIR="${LTX_AUDIO_DIR:-$MODEL}"
+EXPECT_AUDIO=0
+if [ -f "$AUDIO_DIR/audio_vae.safetensors" ] && [ -f "$AUDIO_DIR/vocoder.safetensors" ]; then
+  export LTX_AUDIO_DIR="$AUDIO_DIR"; EXPECT_AUDIO=1; echo "audio VAE+vocoder found in $AUDIO_DIR -> expecting a sound track"
+else
+  echo "no audio VAE/vocoder in $AUDIO_DIR -> video-only run"
+fi
 
 "$BIN" --model "$MODEL" --serve --port "$PORT" >/tmp/test_video_server.log 2>&1 &
 SRV=$!
@@ -28,10 +40,12 @@ code=$(curl -s --max-time 600 -X POST "http://127.0.0.1:$PORT/v1/video/generatio
   -o "$OUT" -w "%{http_code}")
 [ "$code" = "200" ] || { echo "FAIL: http $code"; head -c 300 "$OUT"; exit 1; }
 
-# decode b64 RGB frames, verify dims + that it is real content (not uniform/garbage)
-python3 - "$OUT" <<'PY'
-import sys, json, base64
+# decode b64 RGB frames, verify dims + that it is real content (not uniform/garbage),
+# and (when the audio VAE is present) a non-silent stereo track synced to the clip.
+python3 - "$OUT" "$EXPECT_AUDIO" <<'PY'
+import sys, json, base64, struct, math, wave
 d = json.load(open(sys.argv[1]))
+expect_audio = sys.argv[2] == "1"
 assert d["format"] == "rgb8", d
 F, H, W = d["frames"], d["height"], d["width"]
 raw = base64.b64decode(d["data"])
@@ -39,6 +53,27 @@ assert len(raw) == F * H * W * 3, f"len {len(raw)} != {F*H*W*3}"
 lo, hi = min(raw), max(raw)
 assert hi - lo > 40, f"frames look uniform ({lo}..{hi}) — likely broken decode"
 print(f"PASS: /v1/video/generations -> {F} frames {W}x{H}, {len(raw)} rgb bytes, range {lo}..{hi}")
+
+has_audio = "audio_data" in d
+if expect_audio:
+    assert has_audio, "audio VAE present but response has NO audio_data"
+if has_audio:
+    assert d["audio_format"] == "pcm_s16le", d["audio_format"]
+    sr, ch = d["audio_sample_rate"], d["audio_channels"]
+    assert ch == 2, f"expected stereo, got {ch}ch"
+    pcm = base64.b64decode(d["audio_data"])
+    n = len(pcm) // 2
+    samples = struct.unpack("<%dh" % n, pcm)
+    aframes = n // ch
+    adur = aframes / sr
+    vdur = F / d["fps"]
+    peak = max(abs(s) for s in samples)
+    rms = math.sqrt(sum(s * s for s in samples) / n)
+    assert peak > 50, f"audio is silent (peak {peak})"
+    # duration must track the video within ~150 ms (causal-crop slack)
+    assert abs(adur - vdur) < 0.15, f"audio {adur:.3f}s vs video {vdur:.3f}s out of sync"
+    w = wave.open("/tmp/test_video_gen.wav", "wb"); w.setnchannels(ch); w.setsampwidth(2); w.setframerate(sr); w.writeframes(pcm); w.close()
+    print(f"PASS: audio track {ch}ch {sr}Hz {adur:.3f}s (video {vdur:.3f}s) peak={peak} rms={rms:.0f} -> /tmp/test_video_gen.wav")
 PY
 rc=$?
 
@@ -66,12 +101,117 @@ print(f"PASS: SSE stream -> {prog} progress events + complete ({complete['frames
 PY
 [ $? -eq 0 ] || rc=1
 
-# Optional: mux to mp4 if ffmpeg is present (proves a playable clip).
+# ── Image-to-video (first-frame conditioning) ──────────────────────────────
+# Only when the VAE encoder is present. A high-contrast left/right split image
+# is pinned as the clean first frame; if conditioning works the decoded frame 0
+# reconstructs the split (left dark, right bright) regardless of the prompt.
+if [ -f "$MODEL/vae_encoder.safetensors" ]; then
+  echo "vae_encoder.safetensors found -> testing image-to-video"
+  IMG=/tmp/test_i2v_input.png
+  python3 - "$IMG" <<'PY'
+import sys, struct, zlib
+W, H = 384, 256
+def chunk(t, d): return struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d) & 0xffffffff)
+raw = bytearray()
+for y in range(H):
+    raw.append(0)  # filter byte
+    for x in range(W):
+        v = 20 if x < W // 2 else 235   # left dark, right bright
+        raw += bytes((v, v, v))
+png = b"\x89PNG\r\n\x1a\n"
+png += chunk(b"IHDR", struct.pack(">IIBBBBB", W, H, 8, 2, 0, 0, 0))
+png += chunk(b"IDAT", zlib.compress(bytes(raw), 9))
+png += chunk(b"IEND", b"")
+open(sys.argv[1], "wb").write(png)
+PY
+  B64=$(base64 < "$IMG" | tr -d '\n')
+  I2V=/tmp/test_video_i2v.json
+  python3 -c "import json,sys;json.dump({'prompt':'a red fox running through a snowy forest','num_frames':9,'height':256,'width':384,'steps':4,'seed':7,'first_frame_image':sys.argv[1]}, open('/tmp/test_i2v_req.json','w'))" "$B64"
+  code=$(curl -s --max-time 600 -X POST "http://127.0.0.1:$PORT/v1/video/generations" -H 'Content-Type: application/json' \
+    --data @/tmp/test_i2v_req.json -o "$I2V" -w "%{http_code}")
+  if [ "$code" = "200" ]; then
+    python3 - "$I2V" <<'PY'
+import sys, json, base64
+d = json.load(open(sys.argv[1]))
+F, H, W = d["frames"], d["height"], d["width"]
+raw = base64.b64decode(d["data"])
+# frame 0, RGB → grayscale; compare left vs right half means.
+f0 = raw[:H * W * 3]
+def gray(px, i): return (px[i] + px[i+1] + px[i+2]) / 3.0
+left = right = nl = nr = 0.0
+for y in range(H):
+    for x in range(W):
+        g = gray(f0, (y * W + x) * 3)
+        if x < W // 2: left += g; nl += 1
+        else: right += g; nr += 1
+lm, rm = left / nl, right / nr
+print(f"I2V frame0 left_mean={lm:.1f} right_mean={rm:.1f}")
+# The pinned first frame must reconstruct the split: right (235) clearly brighter
+# than left (20). A t2v (ignored image) frame 0 would not show this structure.
+assert rm - lm > 30, f"first frame did not adhere to conditioning image (left {lm:.1f} vs right {rm:.1f})"
+print("PASS: image-to-video first frame adheres to the conditioning image")
+PY
+    [ $? -eq 0 ] || rc=1
+  else
+    echo "FAIL: I2V http $code"; head -c 300 "$I2V"; rc=1
+  fi
+else
+  echo "no vae_encoder.safetensors in $MODEL -> skipping image-to-video test"
+fi
+
+# ── Two-stage pipeline (dev CFG half-res → x2 upsample → distilled refine) ──
+# Needs BOTH transformer variants + the spatial upsampler + the VAE encoder
+# (latent statistics). Small canvas keeps the guided stage affordable.
+if [ -f "$MODEL/transformer-dev.safetensors" ] && [ -f "$MODEL/transformer-distilled.safetensors" ] \
+   && [ -f "$MODEL/spatial_upscaler_x2_v1_1.safetensors" ] && [ -f "$MODEL/vae_encoder.safetensors" ]; then
+  echo "two-stage prerequisites found -> testing pipeline=two_stage"
+  TS=/tmp/test_video_two_stage.json
+  code=$(curl -s --max-time 1200 -X POST "http://127.0.0.1:$PORT/v1/video/generations" -H 'Content-Type: application/json' \
+    -d '{"prompt":"a red fox running through a snowy forest","pipeline":"two_stage","num_frames":9,"height":256,"width":384,"steps":4,"seed":42}' \
+    -o "$TS" -w "%{http_code}")
+  if [ "$code" = "200" ]; then
+    python3 - "$TS" <<'PY'
+import sys, json, base64
+d = json.load(open(sys.argv[1]))
+F, H, W = d["frames"], d["height"], d["width"]
+raw = base64.b64decode(d["data"])
+assert len(raw) == F * H * W * 3, f"len {len(raw)} != {F*H*W*3}"
+# two-stage refines at the FULL grid: 256x384 in → 256x384 out
+assert (H, W) == (256, 384), f"unexpected output dims {W}x{H}"
+lo, hi = min(raw), max(raw)
+assert hi - lo > 40, f"two-stage frames look uniform ({lo}..{hi})"
+print(f"PASS: two_stage -> {F} frames {W}x{H}, range {lo}..{hi}")
+PY
+    [ $? -eq 0 ] || rc=1
+  else
+    echo "FAIL: two_stage http $code"; head -c 300 "$TS"; rc=1
+  fi
+  # invalid grid (not divisible by 64) must 400, never silently downgrade
+  code=$(curl -s --max-time 60 -X POST "http://127.0.0.1:$PORT/v1/video/generations" -H 'Content-Type: application/json' \
+    -d '{"prompt":"x","pipeline":"two_stage","num_frames":9,"height":224,"width":384,"steps":2,"seed":1}' \
+    -o /dev/null -w "%{http_code}")
+  if [ "$code" = "400" ]; then
+    echo "PASS: two_stage rejects a non-/64 grid with 400"
+  else
+    echo "FAIL: two_stage non-/64 grid returned $code (want 400)"; rc=1
+  fi
+else
+  echo "two-stage weights incomplete in $MODEL -> skipping two-stage test"
+fi
+
+# Optional: mux to mp4 if ffmpeg is present (proves a playable clip, with sound
+# when an audio track was decoded above into /tmp/test_video_gen.wav).
 if [ $rc -eq 0 ] && command -v ffmpeg >/dev/null 2>&1; then
   python3 -c "import json,base64;d=json.load(open('$OUT'));open('/tmp/tvg.rgb','wb').write(base64.b64decode(d['data']));print(d['width'],d['height'],d['frames'])" >/tmp/tvg.dims
   read W H F < /tmp/tvg.dims
-  ffmpeg -y -f rawvideo -pix_fmt rgb24 -s "${W}x${H}" -r 24 -i /tmp/tvg.rgb -frames:v "$F" \
-    -c:v libx264 -pix_fmt yuv420p /tmp/test_video_gen.mp4 >/dev/null 2>&1 \
-    && echo "PASS: muxed /tmp/test_video_gen.mp4"
+  if [ -f /tmp/test_video_gen.wav ]; then
+    ffmpeg -y -f rawvideo -pix_fmt rgb24 -s "${W}x${H}" -r 24 -i /tmp/tvg.rgb -frames:v "$F" \
+      -i /tmp/test_video_gen.wav -c:v libx264 -pix_fmt yuv420p -c:a aac -shortest /tmp/test_video_gen.mp4 >/dev/null 2>&1 \
+      && echo "PASS: muxed /tmp/test_video_gen.mp4 (with audio)"
+  else
+    ffmpeg -y -f rawvideo -pix_fmt rgb24 -s "${W}x${H}" -r 24 -i /tmp/tvg.rgb -frames:v "$F" \
+      -c:v libx264 -pix_fmt yuv420p /tmp/test_video_gen.mp4 >/dev/null 2>&1 \
+      && echo "PASS: muxed /tmp/test_video_gen.mp4 (video only)"
+  fi
 fi
 exit $rc

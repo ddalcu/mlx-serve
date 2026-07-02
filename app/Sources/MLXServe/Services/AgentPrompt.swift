@@ -32,11 +32,11 @@ enum AgentPrompt {
     private static let memoryPath = (mlxServeDir as NSString).appendingPathComponent("memory.md")
 
     static let defaultPromptFile = """
-        You are an autonomous agent on macOS. Finish the task yourself — don't ask for confirmation between steps. Reply to the user only when the task is done, or when you hit an ambiguity no tool can resolve.
+        You are an autonomous agent. Finish the task yourself — don't ask for confirmation between steps. Reply to the user only when the task is done, or when you hit an ambiguity no tool can resolve.
 
         # Tools
 
-        Prefer the dedicated tools over shell equivalents: readFile (not cat/head/tail), writeFile (not echo), editFile (not sed/awk), searchFiles (not grep/rg), listFiles (not find/ls -R). Use shell for build/test, git, installing packages, process management, and anything with no dedicated tool — it runs as a login shell (node, npm, python, brew on PATH).
+        Prefer the dedicated tools over shell equivalents: readFile (not cat/head/tail), writeFile (not echo), editFile (not sed/awk), searchFiles (not grep/rg), listFiles (not find/ls -R). Use shell for build/test, git, installing packages, process management, and anything with no dedicated tool. Where shell commands actually run (host or sandbox) is stated in the Execution environment section below — use only commands that exist there.
 
         Tool arguments must be valid JSON, e.g. {"command": "ls -la"}. NEVER call a tool with empty {} — always include the required parameters; if unsure, gather context with readFile/listFiles first.
 
@@ -48,7 +48,7 @@ enum AgentPrompt {
 
         # Shell
 
-        - Each call is a fresh login shell: `cd` does NOT persist — chain it (`cd dir && cmd`). Output is prefixed with [cwd: …].
+        - `cd` does NOT persist between calls — chain it (`cd dir && cmd`). Output is prefixed with [cwd: …].
         - For a long-lived process (server, watcher — anything that won't return on its own), set run_in_background:"true" (or just append `&`). It returns instantly with a handle (bg1, bg2, …) and keeps running so you can continue. Inspect it with readProcessOutput or curl, stop it with killProcess, list them with listProcesses.
         - Interactive scaffolders fail here (no TTY): `npm create …`, `npx sv create`, `create-react-app`, and `npm init` without `-y` hit EOF. Use non-interactive flags (`-y`/`--yes`) or build the project by hand (`npm install <deps>`, then write the config/source files yourself). Plain `npm install` and most `npx` commands are fine.
 
@@ -60,6 +60,27 @@ enum AgentPrompt {
 
         Be concise; lead with actions. When a tool fails, read the error, fix your parameters, and try a different approach — never repeat the same failing call. When done, briefly summarize what changed and what to verify. Use saveMemory for durable user preferences or project facts.
         """
+
+    /// Sandbox-aware "where do shell commands actually run" section, appended
+    /// to the agent system prompt at request time (ChatTurnEngine reads the
+    /// live sandbox setting). The base prompt file stays OS-NEUTRAL so one
+    /// user-editable prompt serves both environments — without this split a
+    /// macOS-flavored prompt sends `brew`/`open` into the Linux guest, and a
+    /// Linux-flavored one sends `apt-get` at the host.
+    static func executionEnvironmentSection(sandboxed: Bool) -> String {
+        if sandboxed {
+            return "\n\n# Execution environment\n"
+                + "Shell commands run inside an isolated Linux VM (Debian, aarch64, GNU userland) — NOT on the host Mac. "
+                + "python3/pip, node/npm, git, and curl are available; macOS-only commands (brew, open, pbcopy, osascript, defaults) are NOT — use Linux equivalents (apt-get to add packages). "
+                + "The working folder is mounted at /workspace inside the VM; the file tools (readFile/writeFile/editFile/…) see the same files from the host side, so use them interchangeably with shell paths. "
+                + "The VM may have no network access — if a download or install fails with a network error, say so instead of retrying. "
+                + "run_in_background starts the process inside the VM and appends its output to a log file the tool result names — check it with shell (e.g. tail that file); readProcessOutput/killProcess handles do not apply here. "
+                + "Exported shell variables persist between calls."
+        }
+        return "\n\n# Execution environment\n"
+            + "Shell commands run directly on this Mac (macOS, zsh login shell, BSD userland; node, npm, python, git, and brew are on PATH). "
+            + "Each call is a fresh login shell."
+    }
 
     /// The agent system prompt. `~/.mlx-serve/system-prompt.md` is the single
     /// editable source of truth: seeded with `defaultPromptFile` on first use,
@@ -82,7 +103,9 @@ enum AgentPrompt {
     /// Pure resolution of the on-disk prompt file to the effective prompt: an
     /// empty file — or one still holding the legacy additive stub from before
     /// the prompt was unified into this file — yields the built-in default;
-    /// anything else is the user's own prompt, verbatim (trimmed).
+    /// anything else is the user's own prompt, verbatim (trimmed). A file
+    /// holding a superseded shipped default is handled by the existing
+    /// "Update System Prompt" menu flow (`isPromptOutdated`), not migrated here.
     static func resolvePrompt(fileContent: String) -> String {
         let trimmed = fileContent.trimmingCharacters(in: .whitespacesAndNewlines)
         if trimmed.isEmpty || trimmed.contains("These are appended to the base system prompt") {

@@ -20,12 +20,16 @@ const krea = @import("krea.zig");
 const nsfw = @import("nsfw.zig");
 const tts = @import("tts.zig");
 const ltx = @import("ltx_video.zig");
+const ltx_audio = @import("ltx_audio.zig");
 const tok_mod = @import("tokenizer.zig");
 const model_mod = @import("model.zig");
 const chat_mod = @import("chat.zig");
 const log = @import("log.zig");
 const sse = @import("gen_sse.zig");
 const server_mod = @import("server.zig");
+const stb = @cImport({
+    @cInclude("stb_image.h");
+});
 
 const Conn = server_mod.Conn;
 
@@ -74,6 +78,8 @@ pub fn modalityFromType(model_type: []const u8) ?Modality {
 /// frees) or null on any read/parse error. Cheap — used both to route to a media
 /// modality and to pick the image backend (FLUX vs Krea).
 pub fn peekModelType(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) ?[]u8 {
+    // Guard the openFileAbsolute assert (ReleaseFast UB on relative/empty paths).
+    if (model_dir.len == 0 or !std.fs.path.isAbsolute(model_dir)) return null;
     const path = std.fmt.allocPrint(allocator, "{s}/config.json", .{model_dir}) catch return null;
     defer allocator.free(path);
     const file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return null;
@@ -101,10 +107,9 @@ pub fn detectModality(io: std.Io, allocator: std.mem.Allocator, model_dir: []con
     if (modality == .video) {
         // Require the connector — distinguishes the LTX bundle from any other
         // "AudioVideo" config and ensures the text path can load.
-        const conn_path = std.fmt.allocPrint(allocator, "{s}/connector.safetensors", .{model_dir}) catch return null;
+        const conn_path = std.fmt.allocPrintSentinel(allocator, "{s}/connector.safetensors", .{model_dir}, 0) catch return null;
         defer allocator.free(conn_path);
-        const cf = std.Io.Dir.openFileAbsolute(io, conn_path, .{}) catch return null;
-        cf.close(io);
+        if (!fileExists(io, conn_path)) return null;
     }
     return modality;
 }
@@ -374,34 +379,67 @@ const LTX_NEGATIVE_PROMPT =
     "hands, inconsistent perspective, camera shake, color banding, cartoonish rendering, " ++
     "3D CGI look, unrealistic materials, uncanny valley effect, exaggerated expressions";
 
-/// Video backend (currently LTX-Video 2.3). Holds the three components + the
+/// LTX transformer variants: DEV (non-distilled, needs CFG — two-stage stage 1)
+/// vs DISTILLED (guidance baked in — one-stage + two-stage stage 2).
+pub const TransformerVariant = enum {
+    dev,
+    distilled,
+
+    pub fn fileName(self: TransformerVariant) []const u8 {
+        return switch (self) {
+            .dev => "transformer-dev.safetensors",
+            .distilled => "transformer-distilled.safetensors",
+        };
+    }
+};
+
+/// Video backend (currently LTX-Video 2.3). Holds the components + the
 /// resolved Gemma text-encoder dir + its tokenizer. Components load on the CPU
-/// stream; the forward graph runs on the GPU stream.
+/// stream; the forward graph runs on the GPU stream. The 11 GB transformer slot
+/// holds ONE variant at a time; `ensureTransformer` swaps it (deinit + reload)
+/// so dev + distilled are never resident together.
 pub const VideoEngine = struct {
     allocator: std.mem.Allocator,
     s: mlx.mlx_stream,
     transformer: ltx.Component,
+    transformer_variant: TransformerVariant,
     connector: ltx.Component,
     vae: ltx.Component,
+    audio: ?ltx.Component = null, // audio VAE + vocoder; null → video has no sound
+    vae_encoder: ?ltx.Component = null, // image VAE encoder; null → image-to-video + two-stage disabled
+    upsampler: ?ltx.Component = null, // spatial x2 latent upsampler; lazy-loaded for two-stage
     tok: tok_mod.Tokenizer,
     gemma_dir: []u8,
+    model_dir: []u8,
 
     pub fn load(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !*VideoEngine {
         const self = try allocator.create(VideoEngine);
         errdefer allocator.destroy(self);
+        self.* = undefined;
         self.allocator = allocator;
+        self.audio = null;
+        self.vae_encoder = null;
+        self.upsampler = null;
 
         self.gemma_dir = try resolveGemmaDir(io, allocator);
         errdefer allocator.free(self.gemma_dir);
         log.info("[video] gemma text encoder: {s}\n", .{self.gemma_dir});
+        self.model_dir = try allocator.dupe(u8, model_dir);
+        errdefer allocator.free(self.model_dir);
 
         const cpu_s = mlx.mlx_default_cpu_stream_new();
         self.s = mlx.mlx_default_gpu_stream_new();
 
-        const tp = try std.fmt.allocPrintSentinel(allocator, "{s}/transformer-dev.safetensors", .{model_dir}, 0);
-        defer allocator.free(tp);
-        self.transformer = try ltx.loadComponent(allocator, tp, cpu_s);
+        // Initial transformer: prefer DISTILLED (the correct one-stage default —
+        // the dev model without CFG produces visibly worse output); fall back to
+        // dev for bundles downloaded before transformer-distilled shipped.
+        const initial: TransformerVariant = if (self.hasVariant(io, .distilled)) .distilled else .dev;
+        self.transformer = try loadTransformerVariant(allocator, model_dir, initial, cpu_s);
+        self.transformer_variant = initial;
         errdefer self.transformer.deinit();
+        if (initial == .dev)
+            log.warn("[video] transformer-distilled.safetensors not found — one-stage falls back to the dev transformer (download the distilled variant for reference-quality fast generations)\n", .{});
+
         const cp = try std.fmt.allocPrintSentinel(allocator, "{s}/connector.safetensors", .{model_dir}, 0);
         defer allocator.free(cp);
         self.connector = try ltx.loadComponent(allocator, cp, cpu_s);
@@ -413,20 +451,197 @@ pub const VideoEngine = struct {
         var it = self.vae.map.iterator();
         while (it.next()) |e| _ = mlx.mlx_array_eval(e.value_ptr.*); // VAE conv graph wants materialized weights
 
+        // Optional audio VAE + vocoder → the generated video gets a sound track.
+        // Absent (video-only checkpoints, or not yet downloaded) is graceful.
+        self.audio = loadAudioVae(io, allocator, model_dir, cpu_s);
+        errdefer if (self.audio) |*a| a.deinit();
+
+        // Optional VAE encoder → image-to-video (first-frame conditioning) and
+        // the two-stage latent (de)normalization. Absent is graceful → t2v only.
+        self.vae_encoder = loadVaeEncoder(io, allocator, model_dir, cpu_s);
+        errdefer if (self.vae_encoder) |*e| e.deinit();
+
         self.tok = try tok_mod.loadTokenizerAny(io, allocator, self.gemma_dir);
-        log.info("[video] LTX components + tokenizer ready\n", .{});
+        log.info("[video] LTX components + tokenizer ready (transformer={s})\n", .{@tagName(initial)});
         return self;
+    }
+
+    fn hasVariant(self: *VideoEngine, io: std.Io, variant: TransformerVariant) bool {
+        var buf: [1024]u8 = undefined;
+        const p = std.fmt.bufPrintZ(&buf, "{s}/{s}", .{ self.model_dir, variant.fileName() }) catch return false;
+        return fileExists(io, p);
+    }
+
+    /// Swap the transformer slot to `want` (no-op when already loaded). The old
+    /// component is freed BEFORE the new one loads so dev + distilled (11 GB
+    /// each) never coexist.
+    pub fn ensureTransformer(self: *VideoEngine, want: TransformerVariant) !void {
+        if (self.transformer_variant == want) return;
+        log.info("[video] swapping transformer: {s} -> {s}\n", .{ @tagName(self.transformer_variant), @tagName(want) });
+        self.transformer.deinit();
+        const cpu_s = mlx.mlx_default_cpu_stream_new();
+        self.transformer = try loadTransformerVariant(self.allocator, self.model_dir, want, cpu_s);
+        self.transformer_variant = want;
+    }
+
+    /// Lazily load the spatial-x2 upsampler for the two-stage boundary.
+    pub fn ensureUpsampler(self: *VideoEngine, io: std.Io) !*const ltx.Component {
+        if (self.upsampler) |*u| return u;
+        var buf: [1024]u8 = undefined;
+        const p = std.fmt.bufPrintZ(&buf, "{s}/{s}.safetensors", .{ self.model_dir, ltx.UPSAMPLER_PREFIX }) catch return error.MissingUpsampler;
+        if (!fileExists(io, p)) return error.MissingUpsampler;
+        const cpu_s = mlx.mlx_default_cpu_stream_new();
+        var comp = try ltx.loadComponent(self.allocator, p, cpu_s);
+        var it = comp.map.iterator();
+        while (it.next()) |e| _ = mlx.mlx_array_eval(e.value_ptr.*); // conv graph wants materialized weights
+        self.upsampler = comp;
+        log.info("[video] latent upsampler ready ({d} tensors)\n", .{comp.count()});
+        return &self.upsampler.?;
     }
 
     pub fn deinit(self: *VideoEngine) void {
         self.transformer.deinit();
         self.connector.deinit();
         self.vae.deinit();
+        if (self.audio) |*a| a.deinit();
+        if (self.vae_encoder) |*e| e.deinit();
+        if (self.upsampler) |*u| u.deinit();
         self.tok.deinit();
         self.allocator.free(self.gemma_dir);
+        self.allocator.free(self.model_dir);
         self.allocator.destroy(self);
     }
 };
+
+fn loadTransformerVariant(allocator: std.mem.Allocator, model_dir: []const u8, variant: TransformerVariant, cpu_s: mlx.mlx_stream) !ltx.Component {
+    const tp = try std.fmt.allocPrintSentinel(allocator, "{s}/{s}", .{ model_dir, variant.fileName() }, 0);
+    defer allocator.free(tp);
+    return ltx.loadComponent(allocator, tp, cpu_s);
+}
+
+/// Load the LTX VAE encoder (`vae_encoder.safetensors`, ~0.6 GB, MLX-layout
+/// bf16) from the model dir for image-to-video. Absent → null (I2V disabled,
+/// text-to-video unaffected). Mirrors `loadAudioVae`.
+fn loadVaeEncoder(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, cpu_s: mlx.mlx_stream) ?ltx.Component {
+    var p: [1024]u8 = undefined;
+    const path = std.fmt.bufPrintZ(&p, "{s}/vae_encoder.safetensors", .{model_dir}) catch return null;
+    if (!fileExists(io, path)) {
+        log.info("[video] no vae_encoder.safetensors in {s} — image-to-video disabled (text-to-video only)\n", .{model_dir});
+        return null;
+    }
+    var comp = ltx.loadComponent(allocator, path, cpu_s) catch |e| {
+        log.warn("[video] vae_encoder load failed ({}) — image-to-video disabled\n", .{e});
+        return null;
+    };
+    var it = comp.map.iterator();
+    while (it.next()) |e| _ = mlx.mlx_array_eval(e.value_ptr.*); // conv graph wants materialized weights
+    log.info("[video] VAE encoder ready ({d} tensors) — image-to-video enabled\n", .{comp.count()});
+    return comp;
+}
+
+/// Decode a PNG/JPEG image (raw file bytes) → BCFHW `[1,3,1,target_h,target_w]`
+/// bf16 in [-1,1], bilinear-resized (matches the reference `x/127.5 - 1`
+/// normalization; the resize is bilinear, not LANCZOS — close enough for the
+/// first-frame anchor and not parity-tested). Returns null on decode failure.
+fn decodeImageToBCFHW(allocator: std.mem.Allocator, encoded: []const u8, target_h: u32, target_w: u32, s: mlx.mlx_stream) ?mlx.mlx_array {
+    var w: c_int = 0;
+    var h: c_int = 0;
+    var ch: c_int = 0;
+    const src_ptr = stb.stbi_load_from_memory(encoded.ptr, @intCast(encoded.len), &w, &h, &ch, 3) orelse return null;
+    defer stb.stbi_image_free(src_ptr);
+    const sw: usize = @intCast(w);
+    const sh: usize = @intCast(h);
+    if (sw == 0 or sh == 0) return null;
+    const src = src_ptr[0 .. sw * sh * 3];
+
+    const th: usize = target_h;
+    const tw: usize = target_w;
+    const out = allocator.alloc(f32, 3 * th * tw) catch return null;
+    defer allocator.free(out);
+
+    const clampIdx = struct {
+        fn f(v: isize, n: usize) usize {
+            if (v < 0) return 0;
+            const uv: usize = @intCast(v);
+            return if (uv >= n) n - 1 else uv;
+        }
+    }.f;
+
+    var oy: usize = 0;
+    while (oy < th) : (oy += 1) {
+        const fy = (@as(f32, @floatFromInt(oy)) + 0.5) * @as(f32, @floatFromInt(sh)) / @as(f32, @floatFromInt(th)) - 0.5;
+        const fy0 = @floor(fy);
+        const wy = fy - fy0;
+        const y0 = clampIdx(@intFromFloat(fy0), sh);
+        const y1 = clampIdx(@as(isize, @intFromFloat(fy0)) + 1, sh);
+        var ox: usize = 0;
+        while (ox < tw) : (ox += 1) {
+            const fx = (@as(f32, @floatFromInt(ox)) + 0.5) * @as(f32, @floatFromInt(sw)) / @as(f32, @floatFromInt(tw)) - 0.5;
+            const fx0 = @floor(fx);
+            const wx = fx - fx0;
+            const x0 = clampIdx(@intFromFloat(fx0), sw);
+            const x1 = clampIdx(@as(isize, @intFromFloat(fx0)) + 1, sw);
+            var c: usize = 0;
+            while (c < 3) : (c += 1) {
+                const p00: f32 = @floatFromInt(src[(y0 * sw + x0) * 3 + c]);
+                const p10: f32 = @floatFromInt(src[(y0 * sw + x1) * 3 + c]);
+                const p01: f32 = @floatFromInt(src[(y1 * sw + x0) * 3 + c]);
+                const p11: f32 = @floatFromInt(src[(y1 * sw + x1) * 3 + c]);
+                const top = p00 * (1.0 - wx) + p10 * wx;
+                const bot = p01 * (1.0 - wx) + p11 * wx;
+                const v = top * (1.0 - wy) + bot * wy;
+                out[c * th * tw + oy * tw + ox] = v / 127.5 - 1.0;
+            }
+        }
+    }
+
+    const arr = mlx.mlx_array_new_data(out.ptr, &[_]c_int{ 1, 3, 1, @intCast(th), @intCast(tw) }, 5, .float32);
+    defer _ = mlx.mlx_array_free(arr);
+    var bf = mlx.mlx_array_new();
+    if (mlx.mlx_astype(&bf, arr, .bfloat16, s) != 0) {
+        _ = mlx.mlx_array_free(bf);
+        return null;
+    }
+    _ = mlx.mlx_array_eval(bf);
+    return bf;
+}
+
+/// Load the LTX audio VAE + vocoder (`audio_vae.safetensors` + `vocoder.safetensors`,
+/// the q4 MLX-layout files from `dgrauet/ltx-2.3-mlx-q4`) from the model dir, or
+/// from `$LTX_AUDIO_DIR`. Both files absent → null (the video stays silent).
+fn loadAudioVae(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, cpu_s: mlx.mlx_stream) ?ltx.Component {
+    // The directory holding the two audio files: model dir, or an override.
+    const dir: []const u8 = if (std.c.getenv("LTX_AUDIO_DIR")) |env| blk: {
+        const e = std.mem.span(env);
+        break :blk if (e.len > 0) e else model_dir;
+    } else model_dir;
+    var ap: [1024]u8 = undefined;
+    var vp: [1024]u8 = undefined;
+    const audio_path = std.fmt.bufPrintZ(&ap, "{s}/audio_vae.safetensors", .{dir}) catch return null;
+    const voc_path = std.fmt.bufPrintZ(&vp, "{s}/vocoder.safetensors", .{dir}) catch return null;
+    if (!fileExists(io, audio_path) or !fileExists(io, voc_path)) {
+        log.info("[video] no audio VAE/vocoder in {s} — generated video will be silent\n", .{dir});
+        return null;
+    }
+    var comp = ltx_audio.loadAudioComponents(allocator, audio_path, voc_path, cpu_s) catch |e| {
+        log.warn("[video] audio VAE load failed ({}) — video will be silent\n", .{e});
+        return null;
+    };
+    log.info("[video] audio VAE + vocoder ready ({d} tensors) — video will have sound\n", .{comp.count()});
+    return comp;
+}
+
+fn fileExists(io: std.Io, path: [:0]const u8) bool {
+    // openFileAbsolute ASSERTS the path is absolute — a failed assert is
+    // `unreachable`, i.e. ReleaseFast UB that can miscompile the CALLER (see
+    // the openDirAbsolute gotcha in CLAUDE.md). Paths here come from --model /
+    // $LTX_AUDIO_DIR / $LTX_GEMMA_DIR, all user-controlled, so guard first.
+    if (path.len == 0 or !std.fs.path.isAbsolute(path)) return false;
+    if (std.Io.Dir.openFileAbsolute(io, path, .{})) |f| {
+        f.close(io);
+        return true;
+    } else |_| return false;
+}
 
 /// LTX's text encoder is Gemma-3-12B (4-bit). It's a normal downloadable model
 /// the app pulls into `~/.mlx-serve/models` (as the LTX bundle dependency, and
@@ -441,9 +656,13 @@ const LTX_GEMMA_REPO_DIR = "mlx-community/gemma-3-12b-it-4bit";
 fn resolveGemmaDir(io: std.Io, allocator: std.mem.Allocator) ![]u8 {
     if (std.c.getenv("LTX_GEMMA_DIR")) |env| {
         const e = std.mem.span(env);
-        if (e.len > 0) return allocator.dupe(u8, e);
+        // A relative override would feed openFileAbsolute's assert downstream
+        // (ReleaseFast UB) — ignore it loudly instead.
+        if (e.len > 0 and std.fs.path.isAbsolute(e)) return allocator.dupe(u8, e);
+        if (e.len > 0) log.warn("[video] ignoring non-absolute LTX_GEMMA_DIR: {s}\n", .{e});
     }
     const home = std.mem.span(std.c.getenv("HOME") orelse return error.NoGemmaDir);
+    if (!std.fs.path.isAbsolute(home)) return error.NoGemmaDir;
     // 2-level `<author>/<name>` layout (what DownloadManager writes), then a
     // flat `<name>` layout (legacy / manual placement).
     const candidates = [_][]const u8{ LTX_GEMMA_REPO_DIR, "gemma-3-12b-it-4bit" };
@@ -451,15 +670,12 @@ fn resolveGemmaDir(io: std.Io, allocator: std.mem.Allocator) ![]u8 {
         const dir = std.fmt.allocPrint(allocator, "{s}/.mlx-serve/models/{s}", .{ home, rel }) catch continue;
         var ok = false;
         {
-            const cfg = std.fmt.allocPrint(allocator, "{s}/config.json", .{dir}) catch {
+            const cfg = std.fmt.allocPrintSentinel(allocator, "{s}/config.json", .{dir}, 0) catch {
                 allocator.free(dir);
                 continue;
             };
             defer allocator.free(cfg);
-            if (std.Io.Dir.openFileAbsolute(io, cfg, .{})) |f| {
-                f.close(io);
-                ok = true;
-            } else |_| {}
+            ok = fileExists(io, cfg);
         }
         if (ok) return dir; // caller owns
         allocator.free(dir);
@@ -647,6 +863,84 @@ pub fn handleAudio(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
 }
 
 /// POST /v1/video/generations — base64 RGB8 frames (or SSE progress + complete).
+/// Convert interleaved f32 PCM in [-1,1] to little-endian signed 16-bit bytes.
+fn f32ToPcm16leBytes(allocator: std.mem.Allocator, pcm: []const f32) ![]u8 {
+    const out = try allocator.alloc(u8, pcm.len * 2);
+    for (pcm, 0..) |v, i| {
+        const clamped = @max(@as(f32, -1.0), @min(@as(f32, 1.0), v));
+        const iv: i16 = @intFromFloat(@round(clamped * 32767.0));
+        const u: u16 = @bitCast(iv);
+        out[i * 2] = @intCast(u & 0xff);
+        out[i * 2 + 1] = @intCast((u >> 8) & 0xff);
+    }
+    return out;
+}
+
+/// The three LTX pipelines. `one_stage` = distilled fast path (reference
+/// TextToVideoPipeline); the two-stage modes generate at half resolution with
+/// the dev model + full guidance, upscale latents, then refine with the
+/// distilled model (reference TwoStagePipeline / TwoStageHQPipeline).
+pub const VideoPipeline = enum {
+    one_stage,
+    two_stage,
+    two_stage_hq,
+
+    pub fn fromBody(body: []const u8) VideoPipeline {
+        const raw = extractJsonString(body, "pipeline") orelse return .one_stage;
+        if (std.mem.eql(u8, raw, "two_stage")) return .two_stage;
+        if (std.mem.eql(u8, raw, "two_stage_hq")) return .two_stage_hq;
+        return .one_stage;
+    }
+};
+
+/// STG perturbs block 28 by default (reference MultiModalGuiderParams for the
+/// Euler two-stage pipeline; HQ uses no STG blocks).
+const STG_BLOCKS_DEFAULT = [_]u32{28};
+
+pub const VideoGuiders = struct {
+    vp: ltx.GuiderParams,
+    ap: ltx.GuiderParams,
+    stage1_steps_default: u32,
+};
+
+/// Reference per-pipeline guidance defaults, with per-request overrides:
+/// `cfg_scale` (video), `cfg_audio_scale` (audio), `stg_scale`.
+pub fn videoGuiderDefaults(pipeline: VideoPipeline, cfg_video: ?f32, cfg_audio: ?f32, stg: ?f32) VideoGuiders {
+    switch (pipeline) {
+        // one-stage (distilled) is designed for cfg 1.0 — no guidance, one DiT
+        // forward/step. Overridable; rescale only engages when guided.
+        .one_stage => return .{
+            .vp = .{ .cfg = cfg_video orelse 1.0, .rescale = 0.7 },
+            .ap = .{ .cfg = cfg_audio orelse (cfg_video orelse 1.0), .rescale = 0.7 },
+            .stage1_steps_default = 30,
+        },
+        .two_stage => return .{
+            .vp = .{ .cfg = cfg_video orelse 3.0, .stg = stg orelse 0.0, .rescale = 0.7, .modality = 3.0, .stg_blocks = &STG_BLOCKS_DEFAULT },
+            .ap = .{ .cfg = cfg_audio orelse 7.0, .stg = stg orelse 0.0, .rescale = 0.7, .modality = 3.0, .stg_blocks = &STG_BLOCKS_DEFAULT },
+            .stage1_steps_default = 30,
+        },
+        // HQ: res_2s sampler, no STG blocks, softer video rescale (0.45), full
+        // audio rescale (1.0).
+        .two_stage_hq => return .{
+            .vp = .{ .cfg = cfg_video orelse 3.0, .stg = stg orelse 0.0, .rescale = 0.45, .modality = 3.0, .stg_blocks = &.{} },
+            .ap = .{ .cfg = cfg_audio orelse 7.0, .stg = stg orelse 0.0, .rescale = 1.0, .modality = 3.0, .stg_blocks = &.{} },
+            .stage1_steps_default = 15,
+        },
+    }
+}
+
+/// Stage-2 transformer provider for the two-stage boundary: swaps the engine's
+/// transformer slot from dev to distilled (freeing dev first).
+const Stage2Swap = struct {
+    engine: *VideoEngine,
+
+    fn swap(ctx: *anyopaque) anyerror!*const ltx.Component {
+        const self: *Stage2Swap = @ptrCast(@alignCast(ctx));
+        try self.engine.ensureTransformer(.distilled);
+        return &self.engine.transformer;
+    }
+};
+
 pub fn handleVideo(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []const u8, engine: *VideoEngine) !void {
     const prompt_raw = extractJsonString(body, "prompt") orelse return sendError(conn, 400, "missing 'prompt'");
     const prompt = try jsonUnescape(allocator, prompt_raw);
@@ -657,22 +951,107 @@ pub fn handleVideo(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: 
     const height: u32 = @intCast(extractJsonInt(body, "height") orelse 256);
     const width: u32 = @intCast(extractJsonInt(body, "width") orelse 384);
     const seed: u64 = extractJsonInt(body, "seed") orelse 42;
-    const steps: u32 = @intCast(extractJsonInt(body, "steps") orelse 30);
     const frame_rate: f32 = 24.0;
 
+    const pipeline = VideoPipeline.fromBody(body);
+    const cfg_video: ?f32 = if (extractJsonFloat(body, "cfg_scale")) |v| @floatCast(v) else null;
+    const cfg_audio: ?f32 = if (extractJsonFloat(body, "cfg_audio_scale")) |v| @floatCast(v) else null;
+    const stg: ?f32 = if (extractJsonFloat(body, "stg_scale")) |v| @floatCast(v) else null;
+    const guiders = videoGuiderDefaults(pipeline, cfg_video, cfg_audio, stg);
+    const steps: u32 = @intCast(extractJsonInt(body, "steps") orelse guiders.stage1_steps_default);
+    const stage2_steps: u32 = @intCast(extractJsonInt(body, "stage2_steps") orelse 0);
+
     const want_stream = sse.bodyWantsTrue(body, "stream");
-    log.info("[video] generating {d}f {d}x{d} steps={d} stream={}: {d} chars\n", .{ num_frames, height, width, steps, want_stream, prompt.len });
+    log.info("[video] generating {s} {d}f {d}x{d} steps={d} cfg={d:.1}/{d:.1} stg={d:.1} stream={}: {d} chars\n", .{ @tagName(pipeline), num_frames, height, width, steps, guiders.vp.cfg, guiders.ap.cfg, guiders.vp.stg, want_stream, prompt.len });
+
+    // Two-stage prerequisites: even half-res grid, the VAE encoder (latent
+    // statistics), the upsampler, and BOTH transformer variants on disk.
+    // Missing pieces are an explicit 400 — never a silent one-stage downgrade.
+    if (pipeline != .one_stage) {
+        if (height % 64 != 0 or width % 64 != 0)
+            return sendError(conn, 400, "two-stage pipelines need width/height divisible by 64 (half-resolution stage)");
+        if (engine.vae_encoder == null)
+            return sendError(conn, 400, "two-stage pipelines require vae_encoder.safetensors (latent statistics) — download it into the model dir");
+        if (!engine.hasVariant(io, .dev))
+            return sendError(conn, 400, "two-stage pipelines require transformer-dev.safetensors — download it into the model dir");
+        if (!engine.hasVariant(io, .distilled))
+            return sendError(conn, 400, "two-stage pipelines require transformer-distilled.safetensors (stage-2 refine) — download it into the model dir");
+        _ = engine.ensureUpsampler(io) catch
+            return sendError(conn, 400, "two-stage pipelines require spatial_upscaler_x2_v1_1.safetensors — download it into the model dir");
+    }
 
     const pos_ids = try ltxTokenizePadded(allocator, &engine.tok, prompt);
     defer allocator.free(pos_ids);
     const neg_ids = try ltxTokenizePadded(allocator, &engine.tok, LTX_NEGATIVE_PROMPT);
     defer allocator.free(neg_ids);
 
+    // Optional image-to-video: `first_frame_image` is a base64 PNG/JPEG (the app
+    // sends the picked file). Decode + preprocess to the encoder's pixel grid
+    // ((H/32)*32 × (W/32)*32). Graceful: missing encoder, bad image, or no field
+    // → text-to-video (mirrors `ref_audio` in handleAudio).
+    var cond_img: ?mlx.mlx_array = null;
+    defer if (cond_img) |c| {
+        _ = mlx.mlx_array_free(c);
+    };
+    var cond_img_half: ?mlx.mlx_array = null; // two-stage stage-1 grid
+    defer if (cond_img_half) |c| {
+        _ = mlx.mlx_array_free(c);
+    };
+    var enc_ptr: ?*const ltx.Component = null;
+    if (extractJsonString(body, "first_frame_image")) |raw_img| {
+        if (engine.vae_encoder) |*ve| {
+            const b64 = try jsonUnescape(allocator, raw_img); // handles \/ from Swift JSONSerialization
+            defer allocator.free(b64);
+            if (b64.len > 0) {
+                if (base64DecodeAlloc(allocator, b64)) |img_bytes| {
+                    defer allocator.free(img_bytes);
+                    const enc_h = (height / 32) * 32;
+                    const enc_w = (width / 32) * 32;
+                    if (decodeImageToBCFHW(allocator, img_bytes, enc_h, enc_w, engine.s)) |arr| {
+                        cond_img = arr;
+                        enc_ptr = ve;
+                        log.info("[video] image-to-video: first frame {d}x{d}\n", .{ enc_h, enc_w });
+                    } else log.warn("[video] first_frame_image decode failed — text-to-video\n", .{});
+                    // Two-stage conditions stage 1 at the half-resolution grid
+                    // (the reference re-prepares the image per stage).
+                    if (pipeline != .one_stage and cond_img != null) {
+                        const half_h = ((height / 2) / 32) * 32;
+                        const half_w = ((width / 2) / 32) * 32;
+                        cond_img_half = decodeImageToBCFHW(allocator, img_bytes, half_h, half_w, engine.s);
+                        if (cond_img_half == null) log.warn("[video] half-res first frame decode failed — stage 1 unconditioned\n", .{});
+                    }
+                } else |e| log.warn("[video] first_frame_image base64 decode failed: {} — text-to-video\n", .{e});
+            }
+        } else {
+            log.warn("[video] vae_encoder not loaded — ignoring first_frame_image (text-to-video)\n", .{});
+        }
+    }
+
     var sctx = sse.StreamCtx{ .conn = conn };
     const prog: ?ltx.Progress = if (want_stream) sctx.progress() else null;
     if (want_stream) try conn.writeAll(sse.headers);
 
-    var frames = ltx.generateVideoFrames(io, allocator, .{}, &engine.transformer, &engine.connector, &engine.vae, engine.gemma_dir, pos_ids, neg_ids, LTX_PAD_ID, num_frames, height, width, frame_rate, steps, seed, 3.0, 7.0, 0.7, prog, engine.s) catch |err| {
+    var frames = switch (pipeline) {
+        .one_stage => blk: {
+            // Run the schedule the loaded variant was trained for; the request
+            // never forces a swap here (dev-only bundles keep working).
+            const distilled = engine.transformer_variant == .distilled;
+            break :blk ltx.generateVideoFrames(io, allocator, .{}, &engine.transformer, &engine.connector, &engine.vae, enc_ptr, cond_img, engine.gemma_dir, pos_ids, neg_ids, LTX_PAD_ID, num_frames, height, width, frame_rate, steps, distilled, seed, guiders.vp, guiders.ap, prog, engine.s);
+        },
+        .two_stage, .two_stage_hq => blk: {
+            engine.ensureTransformer(.dev) catch |err| break :blk err;
+            var swapper = Stage2Swap{ .engine = engine };
+            const opts = ltx.TwoStageOpts{
+                .hq = pipeline == .two_stage_hq,
+                .stage1_steps = steps,
+                .stage2_steps = stage2_steps,
+                .upsampler = engine.ensureUpsampler(io) catch |err| break :blk err,
+                .swap_ctx = @ptrCast(&swapper),
+                .swap = Stage2Swap.swap,
+            };
+            break :blk ltx.generateVideoFramesTwoStage(io, allocator, .{}, &engine.transformer, &engine.connector, &engine.vae, &engine.vae_encoder.?, cond_img_half, cond_img, engine.gemma_dir, pos_ids, neg_ids, LTX_PAD_ID, num_frames, height, width, frame_rate, opts, seed, guiders.vp, guiders.ap, prog, engine.s);
+        },
+    } catch |err| {
         log.err("[video] generation failed: {}\n", .{err});
         if (want_stream) {
             conn.writeAll("data: {\"type\":\"error\",\"message\":\"generation failed\"}\n\n") catch {};
@@ -688,6 +1067,31 @@ pub fn handleVideo(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: 
     defer allocator.free(b64);
     _ = std.base64.standard.Encoder.encode(b64, frames.rgb);
 
+    // ── optional audio: decode the DiT audio latent → 16-bit PCM, base64 ──
+    var audio_b64: ?[]u8 = null;
+    defer if (audio_b64) |a| allocator.free(a);
+    var audio_sr: u32 = 0;
+    var audio_ch: u32 = 0;
+    if (engine.audio) |*acomp| {
+        if (frames.audio_latent) |al| {
+            if (ltx_audio.decodeAudio(allocator, acomp, al, engine.s)) |wav_v| {
+                var wav = wav_v;
+                defer wav.deinit(allocator);
+                const pcm = try f32ToPcm16leBytes(allocator, wav.pcm);
+                defer allocator.free(pcm);
+                const al_len = std.base64.standard.Encoder.calcSize(pcm.len);
+                const ab = try allocator.alloc(u8, al_len);
+                _ = std.base64.standard.Encoder.encode(ab, pcm);
+                audio_b64 = ab;
+                audio_sr = wav.sample_rate;
+                audio_ch = wav.channels;
+                log.info("[video] -> audio {d} samples {d}ch {d}Hz ({d} pcm bytes)\n", .{ wav.frames, wav.channels, wav.sample_rate, pcm.len });
+            } else |err| {
+                log.warn("[video] audio decode failed: {} — video stays silent\n", .{err});
+            }
+        }
+    }
+
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(allocator);
     const prefix = if (want_stream) "data: {\"type\":\"complete\"," else "{\"created\":0,";
@@ -695,7 +1099,15 @@ pub fn handleVideo(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: 
     defer allocator.free(head);
     try out.appendSlice(allocator, head);
     try out.appendSlice(allocator, b64);
-    try out.appendSlice(allocator, if (want_stream) "\"}\n\n" else "\"}");
+    try out.appendSlice(allocator, "\"");
+    if (audio_b64) |ab| {
+        const ah = try std.fmt.allocPrint(allocator, ",\"audio_sample_rate\":{d},\"audio_channels\":{d},\"audio_format\":\"pcm_s16le\",\"audio_data\":\"", .{ audio_sr, audio_ch });
+        defer allocator.free(ah);
+        try out.appendSlice(allocator, ah);
+        try out.appendSlice(allocator, ab);
+        try out.appendSlice(allocator, "\"");
+    }
+    try out.appendSlice(allocator, if (want_stream) "}\n\n" else "}");
     if (want_stream) {
         try conn.writeAll(out.items);
         return;
@@ -882,6 +1294,21 @@ fn extractJsonInt(body: []const u8, key: []const u8) ?u64 {
     return std.fmt.parseInt(u64, body[start..i], 10) catch null;
 }
 
+/// Parse a JSON number (int or float) for `key`. Accepts a leading sign, digits,
+/// and a decimal point (no exponent — gen params don't need it).
+fn extractJsonFloat(body: []const u8, key: []const u8) ?f64 {
+    var key_pat_buf: [64]u8 = undefined;
+    const key_pat = std.fmt.bufPrint(&key_pat_buf, "\"{s}\"", .{key}) catch return null;
+    const ki = std.mem.indexOf(u8, body, key_pat) orelse return null;
+    var i = ki + key_pat.len;
+    while (i < body.len and (body[i] == ' ' or body[i] == ':' or body[i] == '\t')) i += 1;
+    const start = i;
+    if (i < body.len and (body[i] == '-' or body[i] == '+')) i += 1;
+    while (i < body.len and (std.ascii.isDigit(body[i]) or body[i] == '.')) i += 1;
+    if (i == start) return null;
+    return std.fmt.parseFloat(f64, body[start..i]) catch null;
+}
+
 /// Base64-decode (standard alphabet) into an owned buffer.
 fn base64DecodeAlloc(allocator: std.mem.Allocator, b64: []const u8) ![]u8 {
     const dec = std.base64.standard.Decoder;
@@ -1018,6 +1445,33 @@ test "Modality.modelType round-trips through modalityFromType" {
     }
 }
 
+test "f32ToPcm16leBytes converts, clamps, and is little-endian" {
+    const alloc = testing.allocator;
+    // 0.0 → 0; 1.0 → 32767; -1.0 → -32767; out-of-range clamps; midscale rounds.
+    const pcm = [_]f32{ 0.0, 1.0, -1.0, 2.0, -2.0, 0.5 };
+    const bytes = try f32ToPcm16leBytes(alloc, &pcm);
+    defer alloc.free(bytes);
+    try testing.expectEqual(@as(usize, 12), bytes.len);
+    const read = struct {
+        fn le(b: []const u8, i: usize) i16 {
+            return @bitCast(@as(u16, b[i * 2]) | (@as(u16, b[i * 2 + 1]) << 8));
+        }
+    }.le;
+    try testing.expectEqual(@as(i16, 0), read(bytes, 0));
+    try testing.expectEqual(@as(i16, 32767), read(bytes, 1));
+    try testing.expectEqual(@as(i16, -32767), read(bytes, 2));
+    try testing.expectEqual(@as(i16, 32767), read(bytes, 3)); // 2.0 clamps to 1.0
+    try testing.expectEqual(@as(i16, -32767), read(bytes, 4)); // -2.0 clamps to -1.0
+    try testing.expectEqual(@as(i16, @intFromFloat(@round(0.5 * 32767.0))), read(bytes, 5));
+}
+
+test "extractJsonFloat parses cfg scales (int + float + sign)" {
+    try testing.expectEqual(@as(?f64, 1.0), extractJsonFloat("{\"cfg_scale\": 1.0}", "cfg_scale"));
+    try testing.expectEqual(@as(?f64, 3.5), extractJsonFloat("{\"cfg_scale\":3.5,\"x\":1}", "cfg_scale"));
+    try testing.expectEqual(@as(?f64, 7), extractJsonFloat("{\"cfg_audio_scale\": 7}", "cfg_audio_scale"));
+    try testing.expectEqual(@as(?f64, null), extractJsonFloat("{\"prompt\":\"hi\"}", "cfg_scale"));
+}
+
 test "extractJsonInt parses seed/steps" {
     try testing.expectEqual(@as(?u64, 7), extractJsonInt("{\"seed\": 7}", "seed"));
     try testing.expectEqual(@as(?u64, 20), extractJsonInt("{\"steps\":20,\"x\":1}", "steps"));
@@ -1056,4 +1510,51 @@ test "buildStubCpuState builds a media stub keyed by modality" {
     try testing.expectEqualStrings("flux2", stub.config.model_type);
     try testing.expect(!stub.config.is_encoder_only);
     try testing.expectEqual(modalityFromType(stub.config.model_type).?, Modality.image);
+}
+
+test "VideoPipeline.fromBody parses the pipeline field" {
+    try testing.expectEqual(VideoPipeline.one_stage, VideoPipeline.fromBody("{\"prompt\":\"x\"}"));
+    try testing.expectEqual(VideoPipeline.one_stage, VideoPipeline.fromBody("{\"pipeline\":\"one_stage\"}"));
+    try testing.expectEqual(VideoPipeline.two_stage, VideoPipeline.fromBody("{\"pipeline\":\"two_stage\"}"));
+    try testing.expectEqual(VideoPipeline.two_stage_hq, VideoPipeline.fromBody("{\"pipeline\":\"two_stage_hq\"}"));
+    try testing.expectEqual(VideoPipeline.one_stage, VideoPipeline.fromBody("{\"pipeline\":\"garbage\"}"));
+}
+
+test "videoGuiderDefaults mirrors the reference per-pipeline guidance" {
+    // one-stage: no guidance by default (single forward), override respected
+    const one = videoGuiderDefaults(.one_stage, null, null, null);
+    try testing.expect(!one.vp.needsGuidance());
+    try testing.expect(!one.ap.needsGuidance());
+    try testing.expectEqual(@as(u32, 30), one.stage1_steps_default);
+    const one_ovr = videoGuiderDefaults(.one_stage, 3.0, null, null);
+    try testing.expectApproxEqAbs(@as(f32, 3.0), one_ovr.vp.cfg, 0.0);
+    try testing.expectApproxEqAbs(@as(f32, 3.0), one_ovr.ap.cfg, 0.0); // audio follows video override
+
+    // two-stage: cfg 3/7, rescale 0.7, modality 3.0, STG block 28 available
+    const two = videoGuiderDefaults(.two_stage, null, null, null);
+    try testing.expectApproxEqAbs(@as(f32, 3.0), two.vp.cfg, 0.0);
+    try testing.expectApproxEqAbs(@as(f32, 7.0), two.ap.cfg, 0.0);
+    try testing.expectApproxEqAbs(@as(f32, 0.7), two.vp.rescale, 0.0);
+    try testing.expectApproxEqAbs(@as(f32, 3.0), two.vp.modality, 0.0);
+    try testing.expectEqual(@as(usize, 1), two.vp.stg_blocks.len);
+    try testing.expectEqual(@as(u32, 28), two.vp.stg_blocks[0]);
+    try testing.expect(!two.vp.needsPerturbed()); // stg defaults 0.0
+    const two_stg = videoGuiderDefaults(.two_stage, null, null, 1.0);
+    try testing.expect(two_stg.vp.needsPerturbed());
+
+    // HQ: rescale 0.45 video / 1.0 audio, no STG blocks, 15 default steps
+    const hq = videoGuiderDefaults(.two_stage_hq, null, null, null);
+    try testing.expectApproxEqAbs(@as(f32, 0.45), hq.vp.rescale, 0.0);
+    try testing.expectApproxEqAbs(@as(f32, 1.0), hq.ap.rescale, 0.0);
+    try testing.expectEqual(@as(usize, 0), hq.vp.stg_blocks.len);
+    try testing.expectEqual(@as(u32, 15), hq.stage1_steps_default);
+    const hq_stg = videoGuiderDefaults(.two_stage_hq, null, null, 1.0);
+    try testing.expect(!hq_stg.vp.needsPerturbed()); // no blocks → no perturbed forward
+}
+
+test "fileExists guards non-absolute paths (openFileAbsolute UB class)" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    // Relative and empty paths must return false, not hit the stdlib assert.
+    try testing.expect(!fileExists(io, "relative/path.safetensors"));
+    try testing.expect(!fileExists(io, ""));
 }

@@ -9,5 +9,15 @@
 	     prompt text; this is what actually unlocks the capability. -->
 	<key>com.apple.security.device.audio-input</key>
 	<true/>
+
+	<!-- Agent Sandbox: lets the app create Linux guest VMs via Apple's
+	     Virtualization.framework (VZVirtualMachine). Without this, VM start
+	     fails with a missing-entitlement error and the sandbox can't boot.
+	     Grantable for Developer ID + notarization AND compatible with the App
+	     Sandbox / Mac App Store (UTM ships on the MAS with it). Only exercised
+	     when the user turns the Agent Sandbox on in Settings; a normal launch
+	     never touches VZ. -->
+	<key>com.apple.security.virtualization</key>
+	<true/>
 </dict>
 </plist>
