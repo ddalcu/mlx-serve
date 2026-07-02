@@ -28,6 +28,17 @@ brew install --cask mlx-core   # GUI menu bar app
 brew install mlx-serve          # CLI server only
 ```
 
+Then, Ollama-style:
+
+```bash
+mlx-serve run gemma4        # downloads Gemma 4 E4B (4-bit), serves it, chats right in your terminal
+mlx-serve pull qwen3.6:27b  # just download (resumable, straight from Hugging Face)
+mlx-serve list              # what's on disk
+mlx-serve serve             # serve everything you've pulled — models load on demand by name
+```
+
+Short names, `org/repo` HuggingFace ids, and `name:tag` all work. And because mlx-serve **speaks the Ollama API** (`/api/chat`, `/api/generate`, `/api/tags`, `/api/embed`, `/api/pull`, …) alongside OpenAI and Anthropic, your existing Ollama-connected tools — Raycast, Obsidian, Enchanted, Open WebUI, `ollama-python`/`js` — work unchanged: point them at `http://localhost:11234` and keep your workflow, on a faster engine.
+
 ## Why mlx-serve
 
 If you're already on LM Studio, Ollama, or `mlx-lm` and wondering whether to switch — here's the short version, head-to-head:
@@ -38,6 +49,8 @@ If you're already on LM Studio, Ollama, or `mlx-lm` and wondering whether to swi
 | GGUF models (llama.cpp) | ✅ **embedded** | ✅ | ✅ | ❌ |
 | OpenAI-compatible API | ✅ | ✅ | partial | ❌ |
 | Anthropic Messages API | ✅ | ❌ | ❌ | ❌ |
+| Ollama API (drop-in for Ollama clients) | ✅ | ❌ | ✅ native | ❌ |
+| `run <model>` CLI with auto-download + REPL | ✅ | ❌ | ✅ | ❌ |
 | OpenAI Responses API + WebSockets | ✅ | ❌ | ❌ | ❌ |
 | DeepSeek V4 Flash (284B) | ✅ via ds4 | ❌ | ❌ | ❌ |
 | Speculative decoding (PLD + drafter) | ✅ | ❌ | partial | drafter only |
@@ -86,6 +99,8 @@ Across 18 cells (best mlx-serve vs best LM Studio, geomean): **+35%**. Reproduce
 - **OpenAI-compatible API** — `/v1/chat/completions`, `/v1/completions`, `/v1/embeddings`, `/v1/models`, streaming SSE, tools, JSON-schema constrained decoding, logprobs.
 - **OpenAI Responses API** — `/v1/responses` with `previous_response_id` chains, per-event `sequence_number`, the `/v1/responses/compact` opaque history blob, and a WebSocket transport on the same endpoint.
 - **Anthropic Messages API** — `/v1/messages` works with Claude Code (`ANTHROPIC_BASE_URL=http://localhost:11234`) and the Anthropic SDK.
+- **Ollama-compatible API** — `/api/chat`, `/api/generate`, `/api/tags`, `/api/show`, `/api/ps`, `/api/embed`, `/api/pull` speak the Ollama wire (NDJSON streaming, tool calls with object arguments, `thinking`, `format` JSON schemas, `name:latest` model names), so the whole Ollama client ecosystem works against mlx-serve unchanged.
+- **Ollama-grade CLI** — `mlx-serve run gemma4` downloads (resumable), serves, and drops you into a streaming chat REPL; `pull` / `list` / `serve` manage a shared `~/.mlx-serve/models` store the GUI app uses too.
 - **Speculative decoding** — PLD (model-agnostic n-gram lookup, on by default) + the Gemma 4 cross-attention drafter. Adaptive prompt-time and runtime gates keep novel-content workloads at parity; agentic code loops see up to 1.6×.
 - **KV-cache quantization** — 4-bit / 8-bit / TurboQuant variants shrink KV memory ~4× / ~2× / further still, so 16K contexts fit on hardware that couldn't hold them dense.
 - **Continuous batching** — `--max-concurrent N` batches decode requests through one forward pass for ~1.6× throughput at 4-way parallel.

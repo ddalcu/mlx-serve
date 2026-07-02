@@ -427,16 +427,25 @@ fn vaeUpsample(comp: *const ltx.Component, base: []const u8, x: mlx.mlx_array, s
     return contiguous(cropped, s);
 }
 
-/// Decode a DiT audio latent `[1, Na, 128]` → stereo mel `[1, 2, T, 64]` (NCHW).
-pub fn audioVaeDecode(comp: *const ltx.Component, latent: mlx.mlx_array, s: S) !mlx.mlx_array {
-    const na = mlx.getShape(latent)[1];
-    // ── denormalize on the [1,Na,128] patchified latent ──
-    // Key spelling differs by source: q4 repo uses `_mean_of_means`/`_std_of_means`;
-    // the distilled checkpoint uses the hyphenated `mean-of-means`/`std-of-means`.
+/// per_channel_statistics (mean, std) `[128]` lookup. Key spelling differs by
+/// source: the q4 repo uses `_mean_of_means`/`_std_of_means`; the distilled
+/// checkpoint uses the hyphenated `mean-of-means`/`std-of-means`. Borrowed
+/// arrays — do not free.
+fn audioLatentStats(comp: *const ltx.Component) !struct { mean: mlx.mlx_array, std_: mlx.mlx_array } {
     const mean = comp.get("audio_vae.per_channel_statistics._mean_of_means") orelse
         comp.get("audio_vae.per_channel_statistics.mean-of-means") orelse return error.MissingAudioWeight;
     const std_ = comp.get("audio_vae.per_channel_statistics._std_of_means") orelse
         comp.get("audio_vae.per_channel_statistics.std-of-means") orelse return error.MissingAudioWeight;
+    return .{ .mean = mean, .std_ = std_ };
+}
+
+/// Decode a DiT audio latent `[1, Na, 128]` → stereo mel `[1, 2, T, 64]` (NCHW).
+pub fn audioVaeDecode(comp: *const ltx.Component, latent: mlx.mlx_array, s: S) !mlx.mlx_array {
+    const na = mlx.getShape(latent)[1];
+    // ── denormalize on the [1,Na,128] patchified latent ──
+    const stats = try audioLatentStats(comp);
+    const mean = stats.mean;
+    const std_ = stats.std_;
     const mr = try reshape(mean, &[_]c_int{ 1, 1, 128 }, s);
     defer _ = mlx.mlx_array_free(mr);
     const sr = try reshape(std_, &[_]c_int{ 1, 1, 128 }, s);
@@ -511,6 +520,270 @@ pub fn audioVaeDecode(comp: *const ltx.Component, latent: mlx.mlx_array, s: S) !
     freeReplace(&x, out);
     _ = mlx.mlx_array_eval(x);
     return x;
+}
+
+// ════════════════════════════════════════════════════════════════════════
+// Audio VAE ENCODER — the audio-to-video conditioning path. Mirrors the
+// reference audio_vae/{processor,encoder}.py: 16 kHz STEREO waveform →
+// log-mel [1,2,T',64] (n_fft 1024, hop 160, 64 slaney mels, PERIODIC Hann,
+// reflect-pad center, power=1 magnitude, log floor 1e-5) → causal conv
+// encoder (128→256→512, two stride-2 downsamples: T'/4, freq 64→16) →
+// the 8 MEAN channels of double_z → per-channel-statistics NORMALIZE →
+// DiT audio tokens [1, T, 128] (c outer × f inner, the decoder convention).
+// Weights ride in the same audio_vae.safetensors (`audio_vae.encoder.*`)
+// that loadAudioComponents already merges — no loader change.
+// ════════════════════════════════════════════════════════════════════════
+
+pub const COND_SAMPLE_RATE: u32 = 16000;
+const ENC_N_FFT: usize = 1024;
+const ENC_HOP: usize = 160;
+const ENC_N_MELS: usize = 64;
+const ENC_N_FREQS: usize = ENC_N_FFT / 2 + 1;
+
+// Slaney mel scale: linear below 1 kHz, log above (torchaudio mel_scale="slaney").
+fn hzToMelSlaney(f: f64) f64 {
+    return if (f < 1000.0) 3.0 * f / 200.0 else 15.0 + 27.0 * @log(f / 1000.0) / @log(6.4);
+}
+fn melToHzSlaney(m: f64) f64 {
+    return if (m < 15.0) 200.0 * m / 3.0 else 1000.0 * @exp((m - 15.0) * @log(6.4) / 27.0);
+}
+
+/// Slaney-scale, slaney-area-normalized mel filterbank `[64, 513]` (f32).
+fn buildEncMelFilterbank(allocator: std.mem.Allocator) !mlx.mlx_array {
+    const nyq: f64 = @as(f64, @floatFromInt(COND_SAMPLE_RATE)) / 2.0;
+    var all_freqs: [ENC_N_FREQS]f64 = undefined;
+    for (0..ENC_N_FREQS) |i| all_freqs[i] = nyq * @as(f64, @floatFromInt(i)) / @as(f64, @floatFromInt(ENC_N_FREQS - 1));
+    const m_min = hzToMelSlaney(0.0);
+    const m_max = hzToMelSlaney(nyq);
+    var f_pts: [ENC_N_MELS + 2]f64 = undefined;
+    for (0..ENC_N_MELS + 2) |i| {
+        const m = m_min + (m_max - m_min) * @as(f64, @floatFromInt(i)) / @as(f64, @floatFromInt(ENC_N_MELS + 1));
+        f_pts[i] = melToHzSlaney(m);
+    }
+    const fb = try allocator.alloc(f32, ENC_N_MELS * ENC_N_FREQS);
+    defer allocator.free(fb);
+    for (0..ENC_N_MELS) |m| {
+        const lo = f_pts[m];
+        const ctr = f_pts[m + 1];
+        const hi = f_pts[m + 2];
+        const enorm = 2.0 / (hi - lo); // slaney area norm
+        for (0..ENC_N_FREQS) |f| {
+            const fr = all_freqs[f];
+            const up = (fr - lo) / (ctr - lo);
+            const down = (hi - fr) / (hi - ctr);
+            var v = @min(up, down);
+            if (v < 0) v = 0;
+            fb[m * ENC_N_FREQS + f] = @floatCast(v * enorm);
+        }
+    }
+    const shape = [_]c_int{ @intCast(ENC_N_MELS), @intCast(ENC_N_FREQS) };
+    return mlx.mlx_array_new_data(fb.ptr, &shape, 2, .float32);
+}
+
+/// Reflect-pad (mirror, no boundary repeat) — torchaudio center=True,
+/// pad_mode="reflect". Needs `x.len > pad`. Caller frees.
+fn reflectPadCenterF32(allocator: std.mem.Allocator, x: []const f32, pad: usize) ![]f32 {
+    const out = try allocator.alloc(f32, x.len + 2 * pad);
+    for (0..pad) |i| out[i] = x[pad - i];
+    @memcpy(out[pad .. pad + x.len], x);
+    for (0..pad) |i| out[pad + x.len + i] = x[x.len - 2 - i];
+    return out;
+}
+
+/// Log-mel of interleaved STEREO f32 PCM at 16 kHz → NCHW `[1, 2, T', 64]`.
+pub fn melSpectrogramStereo(allocator: std.mem.Allocator, pcm: []const f32, s: S) !mlx.mlx_array {
+    const nsm = pcm.len / 2; // frames per channel
+    const pad = ENC_N_FFT / 2;
+    if (nsm <= pad) return error.AudioTooShort;
+    const frames = (nsm + 2 * pad - ENC_N_FFT) / ENC_HOP + 1;
+
+    // De-interleave + reflect-pad + frame both channels into [2*frames, n_fft].
+    const chan = try allocator.alloc(f32, nsm);
+    defer allocator.free(chan);
+    const fbuf = try allocator.alloc(f32, 2 * frames * ENC_N_FFT);
+    defer allocator.free(fbuf);
+    for (0..2) |c| {
+        for (0..nsm) |i| chan[i] = pcm[i * 2 + c];
+        const padded = try reflectPadCenterF32(allocator, chan, pad);
+        defer allocator.free(padded);
+        for (0..frames) |i| {
+            const base = i * ENC_HOP;
+            @memcpy(fbuf[(c * frames + i) * ENC_N_FFT ..][0..ENC_N_FFT], padded[base .. base + ENC_N_FFT]);
+        }
+    }
+    const fshape = [_]c_int{ @intCast(2 * frames), @intCast(ENC_N_FFT) };
+    var x = mlx.mlx_array_new_data(fbuf.ptr, &fshape, 2, .float32);
+
+    // Periodic Hann (np.hanning(n+1)[:-1] — denominator n, unlike the TTS
+    // side's symmetric window).
+    {
+        var wbuf: [ENC_N_FFT]f32 = undefined;
+        for (0..ENC_N_FFT) |i| {
+            wbuf[i] = @floatCast(0.5 * (1.0 - @cos(2.0 * std.math.pi * @as(f64, @floatFromInt(i)) / @as(f64, @floatFromInt(ENC_N_FFT)))));
+        }
+        const wsh = [_]c_int{@intCast(ENC_N_FFT)};
+        const win = mlx.mlx_array_new_data(&wbuf, &wsh, 1, .float32);
+        defer _ = mlx.mlx_array_free(win);
+        var xw = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_multiply(&xw, x, win, s));
+        freeReplace(&x, xw);
+    }
+    // rfft → magnitude (power=1.0: plain |spec|, no eps)
+    {
+        var spec = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_fft_rfft(&spec, x, @intCast(ENC_N_FFT), 1, mlx.MLX_FFT_NORM_BACKWARD, s));
+        freeReplace(&x, spec);
+        var mag = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_abs(&mag, x, s));
+        freeReplace(&x, mag);
+    }
+    // mel = mag @ basis.T → [2*frames, 64]; log(max(mel, 1e-5))
+    {
+        const basis = try buildEncMelFilterbank(allocator);
+        defer _ = mlx.mlx_array_free(basis);
+        const basis_t = try transposeTo(basis, &[_]c_int{ 1, 0 }, s);
+        defer _ = mlx.mlx_array_free(basis_t);
+        var mel = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_matmul(&mel, x, basis_t, s));
+        freeReplace(&x, mel);
+        const floor_a = mlx.mlx_array_new_float(1e-5);
+        defer _ = mlx.mlx_array_free(floor_a);
+        var cl = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_maximum(&cl, x, floor_a, s));
+        freeReplace(&x, cl);
+        var lg = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_log(&lg, x, s));
+        freeReplace(&x, lg);
+    }
+    // [2*frames, 64] → [1, 2, frames, 64] (channel-0 rows come first)
+    {
+        const r = try reshape(x, &[_]c_int{ 1, 2, @intCast(frames), @intCast(ENC_N_MELS) }, s);
+        freeReplace(&x, r);
+    }
+    _ = mlx.mlx_array_eval(x);
+    return x;
+}
+
+/// Encoder downsample stage: causal pad (time lo=2, freq hi=1), stride-2 conv.
+/// The key is a DIRECT Conv2d (`….downsample.conv.{weight,bias}`), not the
+/// WrappedConv2d `.conv.conv` nesting.
+fn encDownsample(comp: *const ltx.Component, base: []const u8, x: mlx.mlx_array, s: S) !mlx.mlx_array {
+    var wbuf: [256]u8 = undefined;
+    var bbuf: [256]u8 = undefined;
+    const w = comp.get(key(&wbuf, "{s}.weight", .{base})) orelse return error.MissingAudioWeight;
+    const b = comp.get(key(&bbuf, "{s}.bias", .{base}));
+    const axes = [_]c_int{ 1, 2 };
+    const lo = [_]c_int{ 2, 0 };
+    const hi = [_]c_int{ 0, 1 };
+    const zero = mlx.mlx_array_new_float(0);
+    defer _ = mlx.mlx_array_free(zero);
+    var padded = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_pad(&padded, x, &axes, 2, &lo, 2, &hi, 2, zero, "constant", s));
+    defer _ = mlx.mlx_array_free(padded);
+    return conv2dMlx(padded, w, b, .{ 2, 2 }, .{ 0, 0 }, s);
+}
+
+/// Encode a stereo log-mel `[1,2,T',64]` (NCHW) → normalized DiT audio tokens
+/// `[1, T, 128]`.
+pub fn audioVaeEncode(comp: *const ltx.Component, mel_nchw: mlx.mlx_array, s: S) !mlx.mlx_array {
+    // NCHW → NHWC [1, T', 64, 2]
+    var x = try transposeTo(mel_nchw, &[_]c_int{ 0, 2, 3, 1 }, s);
+    {
+        const cc = try contiguous(x, s);
+        freeReplace(&x, cc);
+    }
+    errdefer _ = mlx.mlx_array_free(x);
+    {
+        const nx = try causalConv2d(comp, "audio_vae.encoder.conv_in.conv", x, s);
+        freeReplace(&x, nx);
+    }
+    // down levels (128 → 256 → 512): 2 res blocks each; downsample on 0 and 1
+    var level: u32 = 0;
+    while (level < 3) : (level += 1) {
+        var blk: u32 = 0;
+        while (blk < 2) : (blk += 1) {
+            var bb: [256]u8 = undefined;
+            const nx = try resnetBlock2d(comp, key(&bb, "audio_vae.encoder.down.{d}.block.{d}", .{ level, blk }), x, s);
+            freeReplace(&x, nx);
+        }
+        if (level != 2) {
+            var db: [256]u8 = undefined;
+            const nx = try encDownsample(comp, key(&db, "audio_vae.encoder.down.{d}.downsample.conv", .{level}), x, s);
+            freeReplace(&x, nx);
+        }
+        _ = mlx.mlx_array_eval(x);
+    }
+    inline for (.{ "block_1", "block_2" }) |blk| {
+        const nx = try resnetBlock2d(comp, "audio_vae.encoder.mid." ++ blk, x, s);
+        freeReplace(&x, nx);
+    }
+    {
+        const pn = try pixelNorm(x, s);
+        freeReplace(&x, pn);
+        const a = try siluA(x, s);
+        freeReplace(&x, a);
+        const co = try causalConv2d(comp, "audio_vae.encoder.conv_out.conv", x, s);
+        freeReplace(&x, co);
+    }
+    // NHWC [1, T, 16(freq), 16(ch double_z)]: keep the 8 MEAN channels, then
+    // (b,t,f,c) → (b,t,c,f) → [1,T,128] (c outer × f inner — decoder convention).
+    {
+        const m = try sliceAxis(x, 3, 0, 8, s);
+        freeReplace(&x, m);
+        const t = try transposeTo(x, &[_]c_int{ 0, 1, 3, 2 }, s);
+        freeReplace(&x, t);
+        const cc = try contiguous(x, s);
+        freeReplace(&x, cc);
+    }
+    const t_dim = mlx.getShape(x)[1];
+    {
+        const r = try reshape(x, &[_]c_int{ 1, t_dim, 128 }, s);
+        freeReplace(&x, r);
+    }
+    // normalize: (x - mean) / (std + 1e-8)
+    {
+        const stats = try audioLatentStats(comp);
+        const mr = try reshape(stats.mean, &[_]c_int{ 1, 1, 128 }, s);
+        defer _ = mlx.mlx_array_free(mr);
+        const sr = try reshape(stats.std_, &[_]c_int{ 1, 1, 128 }, s);
+        defer _ = mlx.mlx_array_free(sr);
+        const eps = mlx.mlx_array_new_float(1e-8);
+        defer _ = mlx.mlx_array_free(eps);
+        var se = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(se);
+        try mlx.check(mlx.mlx_add(&se, sr, eps, s));
+        var xm = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_subtract(&xm, x, mr, s));
+        freeReplace(&x, xm);
+        var xn = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_divide(&xn, x, se, s));
+        freeReplace(&x, xn);
+    }
+    _ = mlx.mlx_array_eval(x);
+    return x;
+}
+
+/// One-shot conditioning encode: interleaved STEREO f32 PCM at 16 kHz → DiT
+/// audio tokens `[1, min(T, max_tokens), 128]` (bf16). `max_tokens` is the
+/// video-duration token budget (computeAudioTokenCount) — the reference
+/// truncates the latent, never pads.
+pub fn encodeAudioCond(allocator: std.mem.Allocator, comp: *const ltx.Component, pcm: []const f32, max_tokens: u32, s: S) !mlx.mlx_array {
+    const mel = try melSpectrogramStereo(allocator, pcm, s);
+    defer _ = mlx.mlx_array_free(mel);
+    var tokens = try audioVaeEncode(comp, mel, s);
+    errdefer _ = mlx.mlx_array_free(tokens);
+    const t_dim = mlx.getShape(tokens)[1];
+    if (t_dim > max_tokens) {
+        const sl = try sliceAxis(tokens, 1, 0, @intCast(max_tokens), s);
+        freeReplace(&tokens, sl);
+        const cc = try contiguous(tokens, s);
+        freeReplace(&tokens, cc);
+    }
+    var bf = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_astype(&bf, tokens, .bfloat16, s));
+    _ = mlx.mlx_array_free(tokens);
+    _ = mlx.mlx_array_eval(bf);
+    return bf;
 }
 
 // ════════════════════════════════════════════════════════════════════════
@@ -999,6 +1272,120 @@ test "conv2d valid shape with PyTorch-layout weight" {
     try testing.expectEqual(@as(c_int, 16), sh[1]);
     try testing.expectEqual(@as(c_int, 20), sh[2]);
     try testing.expectEqual(@as(c_int, 512), sh[3]);
+}
+
+test "ltx mel spectrogram: 1s stereo 16k → [1, 2, 101, 64] log-mel" {
+    const alloc = testing.allocator;
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    // 1 s of interleaved stereo: 440 Hz left, 220 Hz right.
+    const n: usize = 16000;
+    const pcm = try alloc.alloc(f32, n * 2);
+    defer alloc.free(pcm);
+    for (0..n) |i| {
+        const t = @as(f32, @floatFromInt(i)) / 16000.0;
+        pcm[i * 2] = 0.5 * @sin(2.0 * std.math.pi * 440.0 * t);
+        pcm[i * 2 + 1] = 0.5 * @sin(2.0 * std.math.pi * 220.0 * t);
+    }
+    const mel = try melSpectrogramStereo(alloc, pcm, s);
+    defer _ = mlx.mlx_array_free(mel);
+    const sh = mlx.getShape(mel);
+    try testing.expectEqual(@as(c_int, 1), sh[0]);
+    try testing.expectEqual(@as(c_int, 2), sh[1]);
+    try testing.expectEqual(@as(c_int, 101), sh[2]); // 16000/160 + 1
+    try testing.expectEqual(@as(c_int, 64), sh[3]);
+    const vals = evalRead(mel, s);
+    const floor: f32 = @log(1e-5);
+    var above_floor: usize = 0;
+    for (vals) |v| {
+        try testing.expect(std.math.isFinite(v));
+        try testing.expect(v >= floor - 1e-3);
+        if (v > floor + 1.0) above_floor += 1;
+    }
+    // A sine has real energy — most bins must be above the log floor.
+    try testing.expect(above_floor > vals.len / 8);
+}
+
+test "melSpectrogramStereo rejects too-short audio (reflect pad bound)" {
+    const alloc = testing.allocator;
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const pcm = [_]f32{0.0} ** 512; // 256 frames/ch < 513 minimum
+    try testing.expectError(error.AudioTooShort, melSpectrogramStereo(alloc, &pcm, s));
+}
+
+test "audio VAE encoder: 0.5s → [1, 13, 128] normalized tokens (weights-gated)" {
+    const alloc = testing.allocator;
+    const s = mlx.mlx_default_gpu_stream_new();
+    var comp = (try loadAudioComp(alloc)) orelse return error.SkipZigTest;
+    defer comp.deinit();
+
+    // Deterministic pseudo-noise, 0.5 s stereo.
+    const n: usize = 8000;
+    const pcm = try alloc.alloc(f32, n * 2);
+    defer alloc.free(pcm);
+    var state: u32 = 0x12345678;
+    for (pcm) |*v| {
+        state = state *% 1664525 +% 1013904223;
+        v.* = (@as(f32, @floatFromInt(state >> 8)) / 8388608.0 - 1.0) * 0.3;
+    }
+    const tokens = try encodeAudioCond(alloc, &comp, pcm, 9999, s);
+    defer _ = mlx.mlx_array_free(tokens);
+    const sh = mlx.getShape(tokens);
+    try testing.expectEqual(@as(c_int, 1), sh[0]);
+    try testing.expectEqual(@as(c_int, 13), sh[1]); // 51 mel frames → ceil/2 → ceil/2
+    try testing.expectEqual(@as(c_int, 128), sh[2]);
+    const vals = evalRead(tokens, s);
+    var mean_abs: f64 = 0;
+    for (vals) |v| {
+        try testing.expect(std.math.isFinite(v));
+        mean_abs += @abs(v);
+    }
+    mean_abs /= @floatFromInt(vals.len);
+    // per_channel_statistics normalization → roughly unit scale
+    std.debug.print("[ltx-audio] encoder mean|x|={d:.4}\n", .{mean_abs});
+    try testing.expect(mean_abs > 0.02 and mean_abs < 20.0);
+
+    // max_tokens truncation path
+    const trunc = try encodeAudioCond(alloc, &comp, pcm, 5, s);
+    defer _ = mlx.mlx_array_free(trunc);
+    try testing.expectEqual(@as(c_int, 5), mlx.getShape(trunc)[1]);
+}
+
+test "audio VAE encoder matches the reference latent (cos)" {
+    const alloc = testing.allocator;
+    const s = mlx.mlx_default_gpu_stream_new();
+    const wave_p = std.mem.span(std.c.getenv("LTX_AUDIO_ENC_WAVE") orelse return error.SkipZigTest);
+    const lat_p = std.mem.span(std.c.getenv("LTX_AUDIO_ENC_LATENT") orelse return error.SkipZigTest);
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var comp = (try loadAudioComp(alloc)) orelse return error.SkipZigTest;
+    defer comp.deinit();
+
+    // Fixture waveform: interleaved stereo f32 @ 16 kHz (see dump script).
+    const pcm = try readRawF32(io, alloc, wave_p);
+    defer alloc.free(pcm);
+    const ref_lat = try readRawF32(io, alloc, lat_p);
+    defer alloc.free(ref_lat);
+
+    const tokens = try encodeAudioCond(alloc, &comp, pcm, 9999, s);
+    defer _ = mlx.mlx_array_free(tokens);
+    const got = evalRead(tokens, s);
+    const cos = cosine(got, ref_lat);
+    const min: f64 = if (std.c.getenv("LTX_AUDIO_ENC_MIN")) |v| (std.fmt.parseFloat(f64, std.mem.span(v)) catch 0.99) else 0.99;
+    std.debug.print("[ltx-audio] encoder latent cos={d:.5} (min {d:.3}), n={d} vs {d}\n", .{ cos, min, got.len, ref_lat.len });
+    try testing.expect(cos > min);
+}
+
+test "audioVaeEncode surfaces MissingAudioWeight on a wrong-keyed checkpoint" {
+    const allocator = std.testing.allocator;
+    var comp = ltx.Component{ .map = std.StringHashMap(mlx.mlx_array).init(allocator), .allocator = allocator };
+    defer comp.deinit();
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const vals = [_]f32{0.0} ** (2 * 64);
+    const mel = mlx.mlx_array_new_data(&vals, &[_]c_int{ 1, 2, 1, 64 }, 4, .float32);
+    defer _ = mlx.mlx_array_free(mel);
+    try std.testing.expectError(error.MissingAudioWeight, audioVaeEncode(&comp, mel, s));
 }
 
 test "audioVaeDecode surfaces MissingAudioWeight instead of panicking on a wrong-keyed checkpoint" {

@@ -1,6 +1,7 @@
 import SwiftUI
 import AppKit
 import AVKit
+import AVFoundation
 import UniformTypeIdentifiers
 
 /// Video generation window — LTX-Video 2.3, run natively by the mlx-serve server.
@@ -25,6 +26,25 @@ struct VideoGenView: View {
     @State private var stgScale: Double = 0.0
     @State private var seed: Int = 42
     @State private var firstFrameImageURL: URL? = nil
+    // ── Speech & sound (audio-to-video) ──
+    /// Where the conditioning clip comes from. `.none` → the model invents a
+    /// soundtrack from the prompt; `.file`/`.speech` freeze a real clip.
+    enum A2VSource: String, CaseIterable, Identifiable {
+        case none = "None"
+        case file = "Audio file"
+        case speech = "Speak text"
+        var id: String { rawValue }
+    }
+    @State private var audioSource: A2VSource = .none
+    /// The attached clip (picked file or TTS output). Transient, like the
+    /// first-frame image.
+    @State private var audioURL: URL? = nil
+    @State private var audioDuration: Double? = nil
+    @State private var speechText: String = ""
+    @State private var audioPlayer: AVAudioPlayer? = nil
+    /// Local TTS runner — chains Qwen3-TTS (load → speak → unload) on the same
+    /// server, then attaches the WAV as the a2vid clip.
+    @StateObject private var tts = AudioGenService()
     @State private var showRAMWarning: Bool = false
     @State private var ramWarningMessage: String = ""
     @State private var pendingRequest: VideoGenRequest? = nil
@@ -61,6 +81,12 @@ struct VideoGenView: View {
                 player?.play()
             }
         }
+        // TTS finished → attach the spoken line as the a2vid clip.
+        .onChange(of: tts.phase) { _, phase in
+            if case .completed(let path) = phase, audioSource == .speech {
+                attachAudio(URL(fileURLWithPath: path))
+            }
+        }
     }
 
     private var readyView: some View {
@@ -73,6 +99,7 @@ struct VideoGenView: View {
                     resolutionSection
                     framesSection
                     firstFrameSection
+                    speechSection
                     if showAdvanced { advancedSection } else { advancedToggle }
                     actionRow
                 }
@@ -203,7 +230,10 @@ struct VideoGenView: View {
     private var qualityHint: String {
         let s = model.settings(quality)
         let durationSec = Double(s.numFrames) / Double(model.fps)
-        return "\(modeLabel(s.mode)), \(s.steps) steps, \(s.numFrames) frames (~\(String(format: "%.1f", durationSec))s)"
+        // With a clip attached, a one-stage preset runs two-stage on the wire
+        // (audio-to-video requires it) — say so instead of lying "1-stage".
+        let label = (audioURL != nil && s.mode == .oneStage) ? "2-stage (audio-to-video)" : modeLabel(s.mode)
+        return "\(label), \(s.steps) steps, \(s.numFrames) frames (~\(String(format: "%.1f", durationSec))s)"
     }
 
     private func modeLabel(_ m: VideoPipelineMode) -> String {
@@ -341,6 +371,192 @@ struct VideoGenView: View {
                 .help("Select an image to use as the first frame of the video.")
             }
         }
+    }
+
+    // ── Speech & sound (audio-to-video) ──
+    // Attach real speech/audio and the model generates the video AGAINST it:
+    // voices, lip sync and performance follow the clip, and the clip itself
+    // becomes the mp4's soundtrack (guaranteed words — no hoping the joint
+    // model nails quoted dialogue). Two sources: any audio file, or a line
+    // synthesized by the local Qwen3-TTS voice right from this pane.
+    private var speechSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text("Speech & sound").font(.subheadline.weight(.semibold))
+                Spacer()
+                Text("optional — audio-to-video")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Picker("", selection: $audioSource) {
+                ForEach(A2VSource.allCases) { s in Text(s.rawValue).tag(s) }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .onChange(of: audioSource) { _, s in
+                if s == .none { clearAudio() }
+            }
+
+            switch audioSource {
+            case .none:
+                Text("The model invents a soundtrack from your prompt. Attach speech to make characters say exact words.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            case .file:
+                if audioURL == nil {
+                    Button {
+                        chooseAudioFile()
+                    } label: {
+                        Label("Choose audio…", systemImage: "waveform.badge.plus")
+                            .font(.caption)
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.bordered)
+                    .help("WAV, MP3, M4A or AAC. The clip drives the performance and becomes the video's soundtrack.")
+                }
+            case .speech:
+                speechComposer
+            }
+
+            if audioURL != nil {
+                attachedAudioChip
+                Text("Voices, lip sync and timing follow this clip — it becomes the video's soundtrack. Runs on the 2-stage pipeline.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    /// The "Speak text" composer: a line + Create speech via local Qwen3-TTS.
+    @ViewBuilder
+    private var speechComposer: some View {
+        let ttsPreset = AudioModelPreset.all.first { ServerManager.resolveModelDir(repo: $0.repo) != nil }
+        TextField("Line to speak — e.g. Good morning. Coffee's ready.", text: $speechText, axis: .vertical)
+            .textFieldStyle(.roundedBorder)
+            .lineLimit(2...4)
+            .font(.body)
+        if let preset = ttsPreset {
+            HStack(spacing: 8) {
+                if tts.isRunning {
+                    ProgressView().controlSize(.small)
+                    if case .running(_, _, let msg) = tts.phase {
+                        Text(msg).font(.caption).foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Button("Cancel") { tts.cancel() }
+                        .font(.caption)
+                } else {
+                    Button {
+                        tts.generate(AudioGenRequest(model: preset, text: speechText), server: server)
+                    } label: {
+                        Label(audioURL == nil ? "Create speech" : "Recreate speech", systemImage: "waveform")
+                            .font(.caption)
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(speechText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    Text(preset.name).font(.caption2).foregroundStyle(.secondary)
+                    Spacer()
+                }
+            }
+            if case .failed(let msg) = tts.phase {
+                Text(msg).font(.caption2).foregroundStyle(.orange)
+            }
+        } else {
+            Text("Download a voice first — open the Audio window and grab Qwen3-TTS, then come back.")
+                .font(.caption2)
+                .foregroundStyle(.orange)
+        }
+    }
+
+    /// Attached-clip chip: name, duration, preview play/stop, clear.
+    private var attachedAudioChip: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "waveform")
+                .foregroundStyle(.tint)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(audioURL?.lastPathComponent ?? "")
+                    .font(.caption)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                if let d = audioDuration {
+                    Text(String(format: "%.1fs%@", d, clipOutlastsVideo ? " — trimmed to the video length" : ""))
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            Spacer()
+            Button {
+                togglePreview()
+            } label: {
+                Image(systemName: audioPlayer?.isPlaying == true ? "stop.fill" : "play.fill")
+            }
+            .buttonStyle(.borderless)
+            .help("Preview the clip")
+            Button {
+                clearAudio()
+            } label: {
+                Image(systemName: "xmark.circle.fill")
+            }
+            .buttonStyle(.borderless)
+            .foregroundStyle(.secondary)
+            .help("Remove the clip")
+        }
+        .padding(6)
+        .background(RoundedRectangle(cornerRadius: 6).fill(Color.secondary.opacity(0.08)))
+    }
+
+    /// Whether the attached clip is longer than the selected video length.
+    private var clipOutlastsVideo: Bool {
+        guard let d = audioDuration else { return false }
+        return d > Double(numFrames) / Double(fps) + 0.05
+    }
+
+    private func chooseAudioFile() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.audio, .wav, .mp3, .mpeg4Audio]
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        if panel.runModal() == .OK, let url = panel.url {
+            attachAudio(url)
+        }
+    }
+
+    /// Attach a clip and snap the frame count up to cover it (capped at the
+    /// model max; the server trims a longer clip to the video).
+    private func attachAudio(_ url: URL) {
+        audioPlayer?.stop()
+        audioPlayer = nil
+        audioURL = url
+        audioDuration = Self.audioDuration(of: url)
+        if let d = audioDuration, let f = model.framesCovering(durationSeconds: d) {
+            numFrames = f
+        }
+    }
+
+    private func clearAudio() {
+        audioPlayer?.stop()
+        audioPlayer = nil
+        audioURL = nil
+        audioDuration = nil
+    }
+
+    private func togglePreview() {
+        if audioPlayer?.isPlaying == true {
+            audioPlayer?.stop()
+            audioPlayer = nil
+            return
+        }
+        guard let url = audioURL, let p = try? AVAudioPlayer(contentsOf: url) else { return }
+        audioPlayer = p
+        p.play()
+    }
+
+    static func audioDuration(of url: URL) -> Double? {
+        guard let f = try? AVAudioFile(forReading: url) else { return nil }
+        let sr = f.processingFormat.sampleRate
+        guard sr > 0 else { return nil }
+        return Double(f.length) / sr
     }
 
     private var advancedToggle: some View {
@@ -629,6 +845,7 @@ struct VideoGenView: View {
             cfgScale: cfgScale,
             stgScale: stgScale,
             firstFrameImagePath: firstFrameImageURL?.path,
+            audioPath: audioURL?.path,
             keepResident: keepResident
         )
         persist()

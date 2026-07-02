@@ -287,6 +287,15 @@ struct VideoModelPreset: Identifiable, Hashable {
         qualityProfiles[q] ?? qualityProfiles[defaultQuality]!
     }
 
+    /// Frame count that COVERS an attached audio clip: the smallest ladder
+    /// value ≥ duration×fps, capped at the model's max (a longer clip is
+    /// trimmed to the video by the server). nil for a zero/invalid duration.
+    func framesCovering(durationSeconds: Double) -> Int? {
+        guard durationSeconds > 0, let cap = frameOptions.last else { return nil }
+        let needed = Int((durationSeconds * Double(fps)).rounded(.up))
+        return frameOptions.first(where: { $0 >= needed }) ?? cap
+    }
+
     /// LTX-2.3 trained resolutions. README default is 480×704 (portrait).
     private static let ltxResolutions: [ResolutionOption] = [
         .init(width: 704,  height: 480, label: "704 × 480 (landscape 3:2)"),
@@ -405,6 +414,50 @@ struct ImageGenRequest {
     /// Apply the server's NSFW content filter (on by default). Off → sends
     /// `"safety": false` so the server skips it for this request.
     var safeMode: Bool = true
+    /// Image-to-image: path to a source PNG/JPEG. The server resizes it to the
+    /// requested resolution, VAE-encodes it, and partially renoises.
+    var initImagePath: String? = nil
+    /// How far to renoise the source (1 = ignore it, low = small change).
+    /// Only meaningful with `initImagePath`.
+    var strength: Double = 0.6
+    /// Conditioning rebalance (Advanced): global multiplier on the prompt
+    /// embeddings. 1.0 = off.
+    var condGain: Double = 1.0
+    /// Conditioning rebalance (Advanced): per-tapped-encoder-layer weights as
+    /// the user typed them — comma/space separated, `condWeightCount` values
+    /// (12 for Krea, 3 for FLUX). Empty = off.
+    var condWeightsText: String = ""
+    /// Style LoRA (Advanced): absolute path to a .safetensors adapter applied
+    /// to the DiT at runtime. nil = none.
+    var loraPath: String? = nil
+    /// LoRA strength multiplier (on top of the file's own alpha/rank scale).
+    var loraScale: Double = 1.0
+}
+
+extension ImageModelPreset {
+    /// Number of tapped text-encoder layers the backend fuses — the count
+    /// `cond_weights` must supply (Krea stacks 12 layers; FLUX concatenates 3).
+    var condWeightCount: Int { variant == .krea2Turbo ? 12 : 3 }
+}
+
+extension ImageGenRequest {
+    /// Number of values `condWeightsText` must supply — one per tapped text
+    /// encoder layer (Krea stacks 12 layers; FLUX concatenates 3).
+    var condWeightCount: Int { model.condWeightCount }
+
+    /// Parse a comma/space-separated weights string → doubles. Empty tokens
+    /// are skipped; any unparseable token (or no tokens) → nil.
+    static func parseCondWeights(_ text: String) -> [Double]? {
+        let tokens = text.split(whereSeparator: { $0 == "," || $0.isWhitespace })
+        guard !tokens.isEmpty else { return nil }
+        var out: [Double] = []
+        out.reserveCapacity(tokens.count)
+        for t in tokens {
+            guard let v = Double(t), v.isFinite else { return nil }
+            out.append(v)
+        }
+        return out
+    }
 }
 
 struct VideoGenRequest {
@@ -423,6 +476,11 @@ struct VideoGenRequest {
     /// by every pipeline mode (the server VAE-encodes it and pins it as the
     /// clean first latent frame).
     var firstFrameImagePath: String? = nil
+    /// Optional speech/audio clip for audio-to-video: the soundtrack is frozen
+    /// as conditioning (voices, lip sync and performance follow it) and the
+    /// ORIGINAL clip is muxed into the mp4. Any AVFoundation-readable format;
+    /// forces a two-stage pipeline.
+    var audioPath: String? = nil
     /// Keep the model resident after this generation (default off → unload).
     var keepResident: Bool = false
 }

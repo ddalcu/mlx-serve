@@ -19,6 +19,7 @@ const model_mod = @import("model.zig");
 const sse = @import("gen_sse.zig");
 const png = @import("png.zig");
 const tok_mod = @import("tokenizer.zig");
+const lora_mod = @import("lora.zig");
 
 const Weights = model_mod.Weights;
 const S = mlx.mlx_stream;
@@ -185,6 +186,7 @@ const MixedLinear = struct {
     add_bias: ?mlx.mlx_array = null,
     bits: u32 = 0,
     group_size: u32 = 0,
+    lora: ?lora_mod.Ref = null, // runtime adapter (non-owning; gen.zig owns the File)
 
     /// `in_features` is the module's input dim (known per call); used only on
     /// the quantized path to solve (bits, group_size) from packed geometry.
@@ -248,7 +250,14 @@ const MixedLinear = struct {
         if (self.add_bias) |b| {
             const r = try addA(o, b, s);
             _ = mlx.mlx_array_free(o);
-            return r;
+            o = r;
+        }
+        if (self.lora) |lr| {
+            const d = try lora_mod.delta(xb, lr, s);
+            defer _ = mlx.mlx_array_free(d);
+            const r = try addA(o, d, s);
+            _ = mlx.mlx_array_free(o);
+            o = r;
         }
         return o;
     }
@@ -1273,6 +1282,37 @@ pub fn loadDit(io: std.Io, allocator: std.mem.Allocator, s: S, model_dir: []cons
     return d;
 }
 
+/// Attach runtime LoRA adapters from `lf` to every matching DiT linear.
+/// Non-owning: `lf` must outlive the attach. Returns the match count.
+pub fn attachLora(dit: *Dit, lf: *const lora_mod.File, user_scale: f32) u32 {
+    detachLora(dit);
+    var matched: u32 = 0;
+    var kbuf: [128]u8 = undefined;
+    for (dit.blocks, 0..) |*b, i| {
+        const mods = .{
+            .{ "attn.wq", &b.attn.wq },   .{ "attn.wk", &b.attn.wk },
+            .{ "attn.wv", &b.attn.wv },   .{ "attn.gate", &b.attn.gate },
+            .{ "attn.wo", &b.attn.wo },
+            .{ "mlp.gate", &b.mlp.gate }, .{ "mlp.up", &b.mlp.up },
+            .{ "mlp.down", &b.mlp.down },
+        };
+        inline for (mods) |m| {
+            const key = std.fmt.bufPrint(&kbuf, "blocks.{d}.{s}", .{ i, m[0] }) catch "";
+            if (lf.find(key)) |e| {
+                m[1].lora = .{ .at = e.at, .bt = e.bt, .scale = e.scale * user_scale };
+                matched += 1;
+            }
+        }
+    }
+    return matched;
+}
+
+pub fn detachLora(dit: *Dit) void {
+    for (dit.blocks) |*b| {
+        inline for (.{ &b.attn.wq, &b.attn.wk, &b.attn.wv, &b.attn.gate, &b.attn.wo, &b.mlp.gate, &b.mlp.up, &b.mlp.down }) |ml| ml.lora = null;
+    }
+}
+
 // ════════════════════════════════════════════════════════════════════════
 // B3. Autoencoder — Qwen-Image 3D causal VAE (decode path only, T=1, f32).
 //     Raw diffusers tensor names; conv weights transposed to MLX layout at load.
@@ -1700,6 +1740,241 @@ pub fn loadVae(io: std.Io, allocator: std.mem.Allocator, s: S, model_dir: []cons
     return v;
 }
 
+/// Spatial downsample for the encoder's Resample blocks: per-frame (T=1)
+/// asymmetric (0,1,0,1) zero-pad + 3x3 stride-2 conv (WanResample downsample2d;
+/// the temporal time_conv never fires at T=1, mirroring the decoder convention).
+fn downsampleSpatial(x: mlx.mlx_array, w: mlx.mlx_array, b: mlx.mlx_array, s: S) !mlx.mlx_array {
+    const sh = mlx.getShape(x); // [1,C,1,H,W]
+    const C = sh[1];
+    const H = sh[3];
+    const Wd = sh[4];
+    const nchw = try reshape(x, &[_]c_int{ 1, C, H, Wd }, s);
+    defer _ = mlx.mlx_array_free(nchw);
+    const nhwc = try transpose(nchw, &[_]c_int{ 0, 2, 3, 1 }, s);
+    defer _ = mlx.mlx_array_free(nhwc);
+    const axes = [_]c_int{ 1, 2 };
+    const low = [_]c_int{ 0, 0 };
+    const high = [_]c_int{ 1, 1 };
+    const zero = scalarF(0.0);
+    defer _ = mlx.mlx_array_free(zero);
+    var p = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(p);
+    try mlx.check(mlx.mlx_pad(&p, nhwc, &axes, 2, &low, 2, &high, 2, zero, "constant", s));
+    const pc = try contig(p, s);
+    defer _ = mlx.mlx_array_free(pc);
+    var o = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(o);
+    try mlx.check(mlx.mlx_conv2d(&o, pc, w, 2, 2, 0, 0, 1, 1, 1, s));
+    const ob = try addA(o, b, s);
+    defer _ = mlx.mlx_array_free(ob);
+    const back = try transpose(ob, &[_]c_int{ 0, 3, 1, 2 }, s); // NCHW
+    defer _ = mlx.mlx_array_free(back);
+    const bsh = mlx.getShape(back);
+    return reshape(back, &[_]c_int{ 1, C, 1, bsh[2], bsh[3] }, s);
+}
+
+/// One entry of the encoder's flat down_blocks list (resnets at 0,1,3,4,6,7,9,10;
+/// spatial resamples at 2,5,8).
+const EncBlock = union(enum) {
+    res: ResBlock3D,
+    down: struct { w: mlx.mlx_array, b: mlx.mlx_array },
+};
+
+/// Qwen-Image 3D VAE encoder (T=1) — structural mirror of the decoder. Feeds
+/// img2img: pixels → per-channel-normalized latents, the space `Vae.decode` reads.
+pub const VaeEncoder = struct {
+    allocator: std.mem.Allocator,
+    s: S,
+    conv_in_w: mlx.mlx_array,
+    conv_in_b: mlx.mlx_array,
+    blocks: [11]EncBlock,
+    mid_r0: ResBlock3D,
+    mid_attn: AttnBlock3D,
+    mid_r1: ResBlock3D,
+    norm_out: mlx.mlx_array,
+    conv_out_w: mlx.mlx_array,
+    conv_out_b: mlx.mlx_array,
+    quant_w: mlx.mlx_array,
+    quant_b: mlx.mlx_array,
+
+    pub fn deinit(self: *VaeEncoder) void {
+        inline for (.{ "conv_in_w", "conv_in_b", "norm_out", "conv_out_w", "conv_out_b", "quant_w", "quant_b" }) |f| _ = mlx.mlx_array_free(@field(self, f));
+        for (&self.blocks) |*blk| switch (blk.*) {
+            .res => |*r| r.deinit(),
+            .down => |*d| {
+                _ = mlx.mlx_array_free(d.w);
+                _ = mlx.mlx_array_free(d.b);
+            },
+        };
+        self.mid_r0.deinit();
+        self.mid_attn.deinit();
+        self.mid_r1.deinit();
+    }
+
+    /// image [1,3,H,W] f32 [0,1] (NCHW, H/W multiples of 16) → latents
+    /// [1,16,H/8,W/8] f32, per-channel NORMALIZED ((z-mean)/std; distribution
+    /// mean — deterministic, no sampling).
+    pub fn encode(self: *VaeEncoder, img: mlx.mlx_array) !mlx.mlx_array {
+        const s = self.s;
+        const ish = mlx.getShape(img); // [1,3,H,W]
+        // [0,1] → [-1,1], lift to NCTHW (T=1)
+        const two = scalarF(2.0);
+        defer _ = mlx.mlx_array_free(two);
+        const one = scalarF(1.0);
+        defer _ = mlx.mlx_array_free(one);
+        const x2 = try mulA(img, two, s);
+        defer _ = mlx.mlx_array_free(x2);
+        const xm = try subA(x2, one, s);
+        defer _ = mlx.mlx_array_free(xm);
+        const x5 = try reshape(xm, &[_]c_int{ 1, 3, 1, ish[2], ish[3] }, s);
+        defer _ = mlx.mlx_array_free(x5);
+
+        var h = try causalConv3d(x5, self.conv_in_w, self.conv_in_b, 1, s);
+        for (&self.blocks) |*blk| {
+            const nh = switch (blk.*) {
+                .res => |*rb| try rb.forward(h, s),
+                .down => |*d| try downsampleSpatial(h, d.w, d.b, s),
+            };
+            _ = mlx.mlx_array_free(h);
+            h = nh;
+        }
+        {
+            const nh = try self.mid_r0.forward(h, s);
+            _ = mlx.mlx_array_free(h);
+            h = nh;
+        }
+        {
+            const nh = try self.mid_attn.forward(h, s);
+            _ = mlx.mlx_array_free(h);
+            h = nh;
+        }
+        {
+            const nh = try self.mid_r1.forward(h, s);
+            _ = mlx.mlx_array_free(h);
+            h = nh;
+        }
+        const hn = try rmsChannels(h, self.norm_out, s);
+        _ = mlx.mlx_array_free(h);
+        defer _ = mlx.mlx_array_free(hn);
+        const ha = try silu(hn, s);
+        defer _ = mlx.mlx_array_free(ha);
+        const co = try causalConv3d(ha, self.conv_out_w, self.conv_out_b, 1, s); // [1,32,1,h,w]
+        defer _ = mlx.mlx_array_free(co);
+        const qc = try causalConv3d(co, self.quant_w, self.quant_b, 0, s);
+        defer _ = mlx.mlx_array_free(qc);
+        // mean = first 16 channels; logvar discarded.
+        const qsh = mlx.getShape(qc);
+        const start = [_]c_int{ 0, 0, 0, 0, 0 };
+        const stop = [_]c_int{ 1, 16, 1, qsh[3], qsh[4] };
+        const strides = [_]c_int{ 1, 1, 1, 1, 1 };
+        var mean = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(mean);
+        try mlx.check(mlx.mlx_slice(&mean, qc, &start, 5, &stop, 5, &strides, 5, s));
+        const meanc = try contig(mean, s);
+        defer _ = mlx.mlx_array_free(meanc);
+        const mf = try astype(meanc, .float32, s);
+        defer _ = mlx.mlx_array_free(mf);
+        // normalize: (z - MEAN) / STD (inverse of decode's denorm)
+        const stdv = mlx.mlx_array_new_data(&LATENTS_STD, &[_]c_int{ 1, 16, 1, 1, 1 }, 5, .float32);
+        defer _ = mlx.mlx_array_free(stdv);
+        const meanv = mlx.mlx_array_new_data(&LATENTS_MEAN, &[_]c_int{ 1, 16, 1, 1, 1 }, 5, .float32);
+        defer _ = mlx.mlx_array_free(meanv);
+        const centered = try subA(mf, meanv, s);
+        defer _ = mlx.mlx_array_free(centered);
+        const zn = try divA(centered, stdv, s);
+        defer _ = mlx.mlx_array_free(zn);
+        // drop T → [1,16,h,w]
+        const out = try reshape(zn, &[_]c_int{ 1, 16, qsh[3], qsh[4] }, s);
+        defer _ = mlx.mlx_array_free(out);
+        return contig(out, s);
+    }
+};
+
+pub fn loadVaeEncoder(io: std.Io, allocator: std.mem.Allocator, s: S, model_dir: []const u8) !VaeEncoder {
+    const dir = try fmtKey(allocator, "{s}/vae", .{model_dir});
+    defer allocator.free(dir);
+    var w = try model_mod.loadWeights(io, allocator, dir);
+    defer w.deinit();
+    var v: VaeEncoder = undefined;
+    v.allocator = allocator;
+    v.s = s;
+    v.conv_in_w = try loadConv3dW(&w, allocator, "encoder.conv_in", s);
+    v.conv_in_b = try loadVec(&w, allocator, "encoder.conv_in", "bias", s);
+    for (0..11) |bi| {
+        const pfx = try fmtKey(allocator, "encoder.down_blocks.{d}", .{bi});
+        defer allocator.free(pfx);
+        if (bi == 2 or bi == 5 or bi == 8) {
+            const rp = try fmtKey(allocator, "{s}.resample.1", .{pfx});
+            defer allocator.free(rp);
+            v.blocks[bi] = .{ .down = .{
+                .w = try loadConv2dW(&w, allocator, rp, s),
+                .b = try loadVec(&w, allocator, rp, "bias", s),
+            } };
+        } else {
+            v.blocks[bi] = .{ .res = try loadResBlock(&w, allocator, pfx, s) };
+        }
+    }
+    v.mid_r0 = try loadResBlock(&w, allocator, "encoder.mid_block.resnets.0", s);
+    v.mid_r1 = try loadResBlock(&w, allocator, "encoder.mid_block.resnets.1", s);
+    v.mid_attn = .{
+        .norm = try loadGamma(&w, allocator, "encoder.mid_block.attentions.0.norm", s),
+        .qkv_w = try loadConv2dW(&w, allocator, "encoder.mid_block.attentions.0.to_qkv", s),
+        .qkv_b = try loadVec(&w, allocator, "encoder.mid_block.attentions.0.to_qkv", "bias", s),
+        .proj_w = try loadConv2dW(&w, allocator, "encoder.mid_block.attentions.0.proj", s),
+        .proj_b = try loadVec(&w, allocator, "encoder.mid_block.attentions.0.proj", "bias", s),
+    };
+    v.norm_out = try loadGamma(&w, allocator, "encoder.norm_out", s);
+    v.conv_out_w = try loadConv3dW(&w, allocator, "encoder.conv_out", s);
+    v.conv_out_b = try loadVec(&w, allocator, "encoder.conv_out", "bias", s);
+    v.quant_w = try loadConv3dW(&w, allocator, "quant_conv", s);
+    v.quant_b = try loadVec(&w, allocator, "quant_conv", "bias", s);
+    return v;
+}
+
+/// Conditioning rebalance: scale the stacked context [1,L,taps,d] by a global
+/// `gain` and optional per-tapped-layer `weights` (len must equal the tap axis
+/// — 12 for Krea). Returns a NEW array in the input dtype.
+pub fn applyCondRebalance(ctx: mlx.mlx_array, gain: f32, weights: ?[]const f32, s: S) !mlx.mlx_array {
+    const sh = mlx.getShape(ctx); // [1,L,n,d]
+    const dt = mlx.mlx_array_dtype(ctx);
+    var cur = blk: {
+        var c = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_array_set(&c, ctx));
+        break :blk c;
+    };
+    if (weights) |w| {
+        if (w.len != @as(usize, @intCast(sh[2]))) {
+            _ = mlx.mlx_array_free(cur);
+            return error.InvalidCondWeights;
+        }
+        const wsh = [_]c_int{ 1, 1, sh[2], 1 };
+        const wa = mlx.mlx_array_new_data(w.ptr, &wsh, 4, .float32);
+        defer _ = mlx.mlx_array_free(wa);
+        const scaled = mulA(cur, wa, s) catch |e| {
+            _ = mlx.mlx_array_free(cur);
+            return e;
+        };
+        _ = mlx.mlx_array_free(cur);
+        cur = scaled;
+    }
+    if (gain != 1.0) {
+        const ga = scalarF(gain);
+        defer _ = mlx.mlx_array_free(ga);
+        const scaled = mulA(cur, ga, s) catch |e| {
+            _ = mlx.mlx_array_free(cur);
+            return e;
+        };
+        _ = mlx.mlx_array_free(cur);
+        cur = scaled;
+    }
+    if (mlx.mlx_array_dtype(cur) != dt) {
+        const back = try astype(cur, dt, s);
+        _ = mlx.mlx_array_free(cur);
+        cur = back;
+    }
+    return cur;
+}
+
 // ════════════════════════════════════════════════════════════════════════
 // B4. Sampler (flow-match Euler, resolution-shifted schedule) + pipeline.
 // ════════════════════════════════════════════════════════════════════════
@@ -1782,12 +2057,25 @@ fn buildPositions(allocator: std.mem.Allocator, txtlen: usize, h_: usize, w_: us
 // Engine — owns the three sub-models + tokenizer. load/deinit/generate(Png).
 // ════════════════════════════════════════════════════════════════════════
 
+/// Per-request generation options beyond the core prompt/size/steps.
+pub const GenOpts = struct {
+    /// img2img: source pixels [1,3,H,W] f32 [0,1], pre-resized to the target
+    /// size. VAE-encoded internally and mixed with noise at the start timestep.
+    init_image: ?mlx.mlx_array = null,
+    /// First schedule index to run (img2img skip; 0 = full schedule).
+    start_step: u32 = 0,
+    /// Conditioning rebalance: global gain + per-tapped-layer weights (len 12).
+    cond_gain: f32 = 1.0,
+    cond_weights: ?[]const f32 = null,
+};
+
 pub const Engine = struct {
     allocator: std.mem.Allocator,
     s: S,
     te: Conditioner,
     dit: Dit,
     vae: Vae,
+    vae_enc: ?VaeEncoder,
     tok: tok_mod.Tokenizer,
 
     pub fn load(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !*Engine {
@@ -1801,6 +2089,11 @@ pub const Engine = struct {
         errdefer self.dit.deinit();
         self.vae = try loadVae(io, allocator, self.s, model_dir);
         errdefer self.vae.deinit();
+        self.vae_enc = loadVaeEncoder(io, allocator, self.s, model_dir) catch |e| blk: {
+            log.warn("[image] krea VAE encoder load failed ({}) — image-to-image disabled\n", .{e});
+            break :blk null;
+        };
+        errdefer if (self.vae_enc) |*e| e.deinit();
         const tok_dir = try std.fmt.allocPrint(allocator, "{s}/tokenizer", .{model_dir});
         defer allocator.free(tok_dir);
         self.tok = try tok_mod.loadTokenizerAny(io, allocator, tok_dir);
@@ -1812,6 +2105,7 @@ pub const Engine = struct {
         self.te.deinit();
         self.dit.deinit();
         self.vae.deinit();
+        if (self.vae_enc) |*e| e.deinit();
         self.tok.deinit();
         self.allocator.destroy(self);
     }
@@ -1851,6 +2145,10 @@ pub const Engine = struct {
     /// Full pipeline. ids/mask are the templated 546-length sequence. Returns
     /// [1,3,H,W] f32 in [0,1] (owned mlx array; caller frees).
     pub fn generate(self: *Engine, allocator: std.mem.Allocator, ids: []const i32, mask: []const i32, seed: u64, steps: u32, width: u32, height: u32, progress: ?sse.Progress) !mlx.mlx_array {
+        return self.generateWithOpts(allocator, ids, mask, seed, steps, width, height, .{}, progress);
+    }
+
+    pub fn generateWithOpts(self: *Engine, allocator: std.mem.Allocator, ids: []const i32, mask: []const i32, seed: u64, steps: u32, width: u32, height: u32, opts: GenOpts, progress: ?sse.Progress) !mlx.mlx_array {
         const s = self.s;
         const cfg = self.dit.cfg;
         const align_ = SPATIAL_SCALE * cfg.patch; // 16
@@ -1863,8 +2161,13 @@ pub const Engine = struct {
         const img_len = h_ * w_;
 
         // 1. text encode → context [1,512,12,txtdim], validity [512]
-        const ctx = try self.te.encode(ids, mask);
+        var ctx = try self.te.encode(ids, mask);
         defer _ = mlx.mlx_array_free(ctx);
+        if (opts.cond_gain != 1.0 or opts.cond_weights != null) {
+            const re = try applyCondRebalance(ctx, opts.cond_gain, opts.cond_weights, s);
+            _ = mlx.mlx_array_free(ctx);
+            ctx = re;
+        }
         const txtlen: usize = @intCast(mlx.getShape(ctx)[1]);
 
         // 2. init noise [1,16,lat_h,lat_w] → patchify [1,img_len,64]
@@ -1901,7 +2204,36 @@ pub const Engine = struct {
         // 4. schedule + denoise (8 steps, guidance 0)
         const ts = try computeTimesteps(allocator, img_len, steps);
         defer allocator.free(ts);
-        for (0..steps) |i| {
+        const start_step: u32 = @min(opts.start_step, steps - 1);
+
+        // img2img: VAE-encode the source, mix x = (1-t)·z0 + t·noise at the
+        // start timestep (flow-match scale_noise).
+        if (opts.init_image) |pix| {
+            const ve = if (self.vae_enc) |*e| e else return error.NoVaeEncoder;
+            const z0 = try ve.encode(pix); // [1,16,lat_h,lat_w] f32 normalized
+            defer _ = mlx.mlx_array_free(z0);
+            const z_bf = try astype(z0, .bfloat16, s);
+            defer _ = mlx.mlx_array_free(z_bf);
+            const z_tok = try patchify(z_bf, @intCast(cfg.patch), s);
+            defer _ = mlx.mlx_array_free(z_tok);
+            const t0: f32 = @floatCast(ts[start_step]);
+            const ta = scalarF(t0);
+            defer _ = mlx.mlx_array_free(ta);
+            const oma = scalarF(1.0 - t0);
+            defer _ = mlx.mlx_array_free(oma);
+            const zs = try mulA(z_tok, oma, s);
+            defer _ = mlx.mlx_array_free(zs);
+            const ns = try mulA(img, ta, s);
+            defer _ = mlx.mlx_array_free(ns);
+            const mixed = try addA(zs, ns, s);
+            defer _ = mlx.mlx_array_free(mixed);
+            const mixed_bf = try astype(mixed, .bfloat16, s);
+            _ = mlx.mlx_array_free(img);
+            img = mixed_bf;
+        }
+
+        const run_steps = steps - start_step;
+        for (start_step..steps) |i| {
             const tc: f32 = @floatCast(ts[i]);
             const tp: f32 = @floatCast(ts[i + 1]);
             const v = try self.dit.forwardPrebuilt(img, ctx, tc, rope.cos, rope.sin, full_mask, txt_mask, s);
@@ -1914,7 +2246,7 @@ pub const Engine = struct {
             _ = mlx.mlx_array_free(img);
             img = ni;
             _ = mlx.mlx_array_eval(img);
-            if (progress) |p| p.emit("Generating", @intCast(i + 1), steps);
+            if (progress) |p| p.emit("Generating", @intCast(i + 1 - start_step), run_steps);
         }
         if (progress) |p| p.emit("Decoding image", steps, steps);
 
@@ -1946,10 +2278,15 @@ pub const Engine = struct {
     /// Tokenize + run the pipeline → image [1,3,H,W] f32 [0,1] (owned mlx array;
     /// caller frees). Lets the caller run the content filter before PNG-encoding.
     pub fn generateImage(self: *Engine, allocator: std.mem.Allocator, prompt: []const u8, width: u32, height: u32, seed: u64, steps: u32, progress: ?sse.Progress) !mlx.mlx_array {
+        return self.generateImageOpts(allocator, prompt, width, height, seed, steps, .{}, progress);
+    }
+
+    /// `generateImage` with per-request options (img2img + conditioning rebalance).
+    pub fn generateImageOpts(self: *Engine, allocator: std.mem.Allocator, prompt: []const u8, width: u32, height: u32, seed: u64, steps: u32, opts: GenOpts, progress: ?sse.Progress) !mlx.mlx_array {
         const pr = try self.buildPromptIds(allocator, prompt);
         defer allocator.free(pr.ids);
         defer allocator.free(pr.mask);
-        return self.generate(allocator, pr.ids, pr.mask, seed, steps, width, height, progress);
+        return self.generateWithOpts(allocator, pr.ids, pr.mask, seed, steps, width, height, opts, progress);
     }
 
     /// Tokenize, run the pipeline, return PNG bytes (caller frees).
@@ -2119,6 +2456,145 @@ fn cosine(data: []const f32, ref: []const f32) f64 {
         nb += @as(f64, ref[i]) * ref[i];
     }
     return dot / (std.math.sqrt(na) * std.math.sqrt(nb));
+}
+
+test "MixedLinear applies an attached LoRA delta (bf16 path)" {
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    // Base: identity [in=2,out=2] (pre-transposed layout). x = [1,2].
+    const wv = [_]f32{ 1, 0, 0, 1 };
+    const wsh = [_]c_int{ 2, 2 };
+    const wf = mlx.mlx_array_new_data(&wv, &wsh, 2, .float32);
+    defer _ = mlx.mlx_array_free(wf);
+    const wbf = try astype(wf, .bfloat16, s);
+    var ml = MixedLinear{ .quantized = false, .w = wbf };
+    defer ml.deinit();
+    const xv = [_]f32{ 1, 2 };
+    const xs = [_]c_int{ 1, 2 };
+    const x = mlx.mlx_array_new_data(&xv, &xs, 2, .float32);
+    defer _ = mlx.mlx_array_free(x);
+    // Without LoRA: y = x.
+    const y0 = try ml.forward(x, s);
+    defer _ = mlx.mlx_array_free(y0);
+    const y0f = try astype(y0, .float32, s);
+    defer _ = mlx.mlx_array_free(y0f);
+    _ = mlx.mlx_array_eval(y0f);
+    const d0 = mlx.mlx_array_data_float32(y0f) orelse return error.NoData;
+    try testing.expectApproxEqAbs(@as(f32, 1), d0[0], 1e-3);
+    try testing.expectApproxEqAbs(@as(f32, 2), d0[1], 1e-3);
+    // LoRA: at [2,1]=[1;1], bt [1,2]=[2,4], scale .5 → delta = [3,6]; y = [4,8].
+    const atv = [_]f32{ 1, 1 };
+    const ats = [_]c_int{ 2, 1 };
+    const atf = mlx.mlx_array_new_data(&atv, &ats, 2, .float32);
+    defer _ = mlx.mlx_array_free(atf);
+    const at = try astype(atf, .bfloat16, s);
+    defer _ = mlx.mlx_array_free(at);
+    const btv = [_]f32{ 2, 4 };
+    const bts = [_]c_int{ 1, 2 };
+    const btf = mlx.mlx_array_new_data(&btv, &bts, 2, .float32);
+    defer _ = mlx.mlx_array_free(btf);
+    const bt = try astype(btf, .bfloat16, s);
+    defer _ = mlx.mlx_array_free(bt);
+    ml.lora = .{ .at = at, .bt = bt, .scale = 0.5 };
+    const y1 = try ml.forward(x, s);
+    defer _ = mlx.mlx_array_free(y1);
+    const y1f = try astype(y1, .float32, s);
+    defer _ = mlx.mlx_array_free(y1f);
+    _ = mlx.mlx_array_eval(y1f);
+    const d1 = mlx.mlx_array_data_float32(y1f) orelse return error.NoData;
+    try testing.expectApproxEqAbs(@as(f32, 4), d1[0], 1e-2);
+    try testing.expectApproxEqAbs(@as(f32, 8), d1[1], 1e-2);
+    // Detached again: back to base.
+    ml.lora = null;
+    const y2 = try ml.forward(x, s);
+    defer _ = mlx.mlx_array_free(y2);
+    const y2f = try astype(y2, .float32, s);
+    defer _ = mlx.mlx_array_free(y2f);
+    _ = mlx.mlx_array_eval(y2f);
+    const d2 = mlx.mlx_array_data_float32(y2f) orelse return error.NoData;
+    try testing.expectApproxEqAbs(@as(f32, 1), d2[0], 1e-3);
+}
+
+test "krea applyCondRebalance scales tapped layers and global gain" {
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    // ctx [1,2,3,2]: 2 tokens × 3 tapped layers × hidden 2.
+    const vals = [_]f32{ 1, 2, 3, 4, 5, 6, 10, 20, 30, 40, 50, 60 };
+    const sh = [_]c_int{ 1, 2, 3, 2 };
+    const ctx = mlx.mlx_array_new_data(&vals, &sh, 4, .float32);
+    defer _ = mlx.mlx_array_free(ctx);
+    const w = [_]f32{ 2, 3, 4 };
+    const out = try applyCondRebalance(ctx, 0.5, &w, s);
+    defer _ = mlx.mlx_array_free(out);
+    _ = mlx.mlx_array_eval(out);
+    const d = mlx.mlx_array_data_float32(out) orelse return error.NoData;
+    // Token 0: layer0 [1,2]*2*.5, layer1 [3,4]*3*.5, layer2 [5,6]*4*.5
+    const expect0 = [_]f32{ 1, 2, 4.5, 6, 10, 12 };
+    for (expect0, 0..) |e, i| try testing.expectApproxEqAbs(e, d[i], 1e-5);
+    // Gain-only path.
+    const g = try applyCondRebalance(ctx, 2.0, null, s);
+    defer _ = mlx.mlx_array_free(g);
+    _ = mlx.mlx_array_eval(g);
+    const gd = mlx.mlx_array_data_float32(g) orelse return error.NoData;
+    try testing.expectApproxEqAbs(@as(f32, 2), gd[0], 1e-5);
+    try testing.expectApproxEqAbs(@as(f32, 120), gd[11], 1e-5);
+    // Count must match the tap axis.
+    const bad = [_]f32{ 1, 2 };
+    try testing.expectError(error.InvalidCondWeights, applyCondRebalance(ctx, 1.0, &bad, s));
+}
+
+// VAE encoder guard: encode a synthetic smooth image, decode it back — the
+// pixels must round-trip through the oracle-validated decoder.  KREA_TEST_MODEL
+test "krea VAE encoder round-trips through the decoder" {
+    const model_dir = std.mem.span(std.c.getenv("KREA_TEST_MODEL") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var enc = try loadVaeEncoder(io, a, s, model_dir);
+    defer enc.deinit();
+    var vae = try loadVae(io, a, s, model_dir);
+    defer vae.deinit();
+    const HW: usize = 512;
+    const img_buf = try a.alloc(f32, 3 * HW * HW);
+    defer a.free(img_buf);
+    for (0..HW) |y| for (0..HW) |x| {
+        const fy: f32 = @as(f32, @floatFromInt(y)) / (HW - 1);
+        const fx: f32 = @as(f32, @floatFromInt(x)) / (HW - 1);
+        img_buf[0 * HW * HW + y * HW + x] = fx;
+        img_buf[1 * HW * HW + y * HW + x] = fy;
+        img_buf[2 * HW * HW + y * HW + x] = 0.5 * (fx + fy);
+    };
+    const ish = [_]c_int{ 1, 3, @intCast(HW), @intCast(HW) };
+    const img = mlx.mlx_array_new_data(img_buf.ptr, &ish, 4, .float32);
+    defer _ = mlx.mlx_array_free(img);
+    const lat = try enc.encode(img);
+    defer _ = mlx.mlx_array_free(lat);
+    const lsh = mlx.getShape(lat);
+    try testing.expectEqual(@as(c_int, 16), lsh[1]);
+    try testing.expectEqual(@as(c_int, @intCast(HW / 8)), lsh[2]);
+    const lat_f = try astype(lat, .float32, s);
+    defer _ = mlx.mlx_array_free(lat_f);
+    const dec = try vae.decode(lat_f); // [-1,1]
+    defer _ = mlx.mlx_array_free(dec);
+    const df = try astype(dec, .float32, s);
+    defer _ = mlx.mlx_array_free(df);
+    _ = mlx.mlx_array_eval(df);
+    const n: usize = @intCast(mlx.mlx_array_size(df));
+    try testing.expectEqual(img_buf.len, n);
+    const data = mlx.mlx_array_data_float32(df) orelse return error.NoData;
+    var mapped = try a.alloc(f32, n);
+    defer a.free(mapped);
+    var mae: f64 = 0;
+    for (0..n) |i| {
+        mapped[i] = data[i] * 0.5 + 0.5;
+        mae += @abs(@as(f64, mapped[i]) - img_buf[i]);
+    }
+    mae /= @floatFromInt(n);
+    const corr = cosine(mapped, img_buf);
+    std.debug.print("[krea-vae-enc] roundtrip corr={d:.6} mae={d:.5}\n", .{ corr, mae });
+    try testing.expect(corr > 0.99);
+    try testing.expect(mae < 0.05);
 }
 
 // Stage 1: text encoder. KREA_TEST_MODEL, KREA_IDS, KREA_MASK, KREA_PE.

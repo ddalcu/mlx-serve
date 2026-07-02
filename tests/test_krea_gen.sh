@@ -66,6 +66,78 @@ PY
 # 4. Server survives the gen.
 curl -sf "http://127.0.0.1:$PORT/health" >/dev/null || { echo "FAIL: server died after Krea gen"; exit 1; }
 
+# 4b. image-to-image: half-dark/half-bright source at low strength keeps its
+# split; wrong cond_weights count is a 400 (Krea taps 12 encoder layers).
+SRC=/tmp/test_krea_img2img_src.png
+python3 - "$SRC" <<'PY'
+import sys, struct, zlib
+W = H = 512
+rows = b""
+for y in range(H):
+    row = bytearray([0])
+    for x in range(W):
+        v = 235 if x >= W // 2 else 20
+        row += bytes([v, v, v])
+    rows += bytes(row)
+def chunk(t, d):
+    return struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d))
+open(sys.argv[1], "wb").write(
+    b"\x89PNG\r\n\x1a\n"
+    + chunk(b"IHDR", struct.pack(">IIBBBBB", W, H, 8, 2, 0, 0, 0))
+    + chunk(b"IDAT", zlib.compress(rows)) + chunk(b"IEND", b""))
+PY
+python3 - "$SRC" /tmp/test_krea_i2i_req.json <<PY
+import json, base64, sys
+b64 = base64.b64encode(open(sys.argv[1], "rb").read()).decode()
+json.dump({"model": "$KREA_ID", "prompt": "a photo", "size": "512x512", "steps": 8,
+           "strength": 0.25, "image": b64, "seed": 7,
+           "cond_weights": "1 1 1 1 1 1 1 1 1 1 1 1"}, open(sys.argv[2], "w"))
+PY
+code=$(api /v1/images/generations -X POST -H 'Content-Type: application/json' \
+  -d @/tmp/test_krea_i2i_req.json -o /tmp/test_krea_i2i.json -w "%{http_code}")
+[ "$code" = "200" ] || { echo "FAIL: krea img2img http $code"; head -c 300 /tmp/test_krea_i2i.json; exit 1; }
+grep -q "\[image\] img2img:" /tmp/test_krea_server.log || { echo "FAIL: no img2img engagement log"; exit 1; }
+python3 - /tmp/test_krea_i2i.json <<'PY'
+import sys, json, base64, zlib, struct
+png = base64.b64decode(json.load(open(sys.argv[1]))["data"][0]["b64_json"])
+pos, idat, w, h = 8, b"", 0, 0
+while pos < len(png):
+    ln, typ = struct.unpack(">I4s", png[pos:pos+8]); data = png[pos+8:pos+8+ln]; pos += 12 + ln
+    if typ == b"IHDR": w, h, _, ct = struct.unpack(">IIBB", data[:10]); assert ct == 2
+    elif typ == b"IDAT": idat += data
+raw = zlib.decompress(idat)
+stride = w * 3
+prev = bytearray(stride)
+left_sum = right_sum = 0; n = 0
+for y in range(h):
+    f = raw[y * (stride + 1)]
+    line = bytearray(raw[y * (stride + 1) + 1 : (y + 1) * (stride + 1)])
+    for i in range(stride):
+        a = line[i - 3] if i >= 3 else 0
+        b = prev[i]
+        c = prev[i - 3] if i >= 3 else 0
+        if f == 1: line[i] = (line[i] + a) & 0xFF
+        elif f == 2: line[i] = (line[i] + b) & 0xFF
+        elif f == 3: line[i] = (line[i] + (a + b) // 2) & 0xFF
+        elif f == 4:
+            p = a + b - c
+            pa, pb, pc = abs(p - a), abs(p - b), abs(p - c)
+            pr = a if (pa <= pb and pa <= pc) else (b if pb <= pc else c)
+            line[i] = (line[i] + pr) & 0xFF
+    prev = line
+    if y % 16 == 0:
+        for x in range(0, w // 2, 8): left_sum += line[x * 3]; n += 1
+        for x in range(w // 2, w, 8): right_sum += line[x * 3]
+left, right = left_sum / n, right_sum / n
+print(f"PASS: krea img2img strength=0.25 kept the split (left {left:.0f}, right {right:.0f})")
+assert right - left > 60, f"img2img lost the source structure (left {left:.0f}, right {right:.0f})"
+PY
+[ $? -eq 0 ] || exit 1
+code=$(api /v1/images/generations -X POST -H 'Content-Type: application/json' \
+  -d "{\"model\":\"$KREA_ID\",\"prompt\":\"x\",\"steps\":2,\"cond_weights\":\"1 1 1\"}" -o /dev/null -w "%{http_code}")
+[ "$code" = "400" ] || { echo "FAIL: 3 cond_weights on Krea returned $code (want 400)"; exit 1; }
+echo "PASS: 3 cond_weights on Krea -> 400 (needs 12)"
+
 # 5. Coexistence with a chat model.
 if [ -n "$CHAT" ]; then
   CHAT_ID="$(basename "$CHAT")"

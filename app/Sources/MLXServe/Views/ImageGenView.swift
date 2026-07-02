@@ -1,5 +1,6 @@
 import SwiftUI
 import AppKit
+import UniformTypeIdentifiers
 
 /// Image generation window — native FLUX.2 and Krea-2-Turbo (no Python).
 /// The model picker lists every `ImageModelPreset`; the server auto-routes to
@@ -31,6 +32,16 @@ struct ImageGenView: View {
     /// Apply the NSFW content filter (on by default). Off → sends safety:false so
     /// the server skips it. (The license expects filtering in deployments.)
     @State private var safeMode: Bool = true
+    /// Image-to-image source (transient — not persisted, like video's first frame).
+    @State private var initImageURL: URL? = nil
+    /// img2img renoise strength: low = stay close to the source, high = mostly prompt.
+    @State private var strength: Double = 0.6
+    /// Conditioning rebalance (Advanced): global gain on the prompt embeddings.
+    @State private var condGain: Double = 1.0
+    /// Conditioning rebalance (Advanced): per-tapped-layer weights as typed.
+    @State private var condWeightsText: String = ""
+    /// Style LoRA (Advanced): .safetensors adapter path ("" = none).
+    @State private var loraPath: String = ""
     /// True while `hydrate()` seeds `@State` from saved settings. Hydrating
     /// `model`/`quality` fires their `.onChange` (applyModelDefaults /
     /// applyQualityDefaults) which would clobber the just-restored
@@ -66,16 +77,18 @@ struct ImageGenView: View {
 
     private var readyView: some View {
         HSplitView {
-            VStack(alignment: .leading, spacing: 14) {
-                promptSection
-                modelSection
-                qualitySection
-                resolutionSection
-                if showAdvanced { advancedSection } else { advancedToggle }
-                Spacer()
-                actionRow
+            ScrollView {
+                VStack(alignment: .leading, spacing: 14) {
+                    promptSection
+                    sourceImageSection
+                    modelSection
+                    qualitySection
+                    resolutionSection
+                    if showAdvanced { advancedSection } else { advancedToggle }
+                    actionRow
+                }
+                .padding(16)
             }
-            .padding(16)
             .frame(minWidth: 340, idealWidth: 380)
 
             VStack(spacing: 12) {
@@ -107,6 +120,62 @@ struct ImageGenView: View {
                 .overlay(
                     RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.3), lineWidth: 0.5)
                 )
+        }
+    }
+
+    private var sourceImageSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Source image (optional)").font(.subheadline.weight(.semibold))
+            if let url = initImageURL {
+                HStack(spacing: 8) {
+                    if let img = NSImage(contentsOf: url) {
+                        Image(nsImage: img)
+                            .resizable()
+                            .scaledToFill()
+                            .frame(width: 40, height: 40)
+                            .clipShape(RoundedRectangle(cornerRadius: 4))
+                    }
+                    Text(url.lastPathComponent)
+                        .font(.caption)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Spacer()
+                    Button {
+                        initImageURL = nil
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                    }
+                    .buttonStyle(.borderless)
+                    .foregroundStyle(.secondary)
+                    .help("Remove the source image (back to text-to-image)")
+                }
+                .padding(6)
+                .background(RoundedRectangle(cornerRadius: 6).fill(Color.secondary.opacity(0.08)))
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack {
+                        Text("Variation strength").font(.caption)
+                        Spacer()
+                        Text(String(format: "%.0f%%", strength * 100))
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Slider(value: $strength, in: 0.1...1.0, step: 0.05)
+                        .onChange(of: strength) { _, _ in guard !hydrating else { return }; persist() }
+                    Text("Low = stay close to the source; high = mostly the prompt.")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            } else {
+                Button {
+                    chooseSourceImage()
+                } label: {
+                    Label("Choose image…", systemImage: "photo.badge.plus")
+                        .font(.caption)
+                }
+                Text("Generate a variation of an existing image, guided by the prompt (image-to-image).")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
         }
     }
 
@@ -206,6 +275,107 @@ struct ImageGenView: View {
             Toggle("Safe mode (NSFW content filter)", isOn: $safeMode)
                 .font(.caption)
                 .help("On (default): generated images are screened by an on-device NSFW classifier and explicit results are blocked. Off: no filtering — you are responsible for the output.")
+
+            Divider()
+            Text("Conditioning rebalance").font(.caption.weight(.semibold))
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Global gain").font(.caption)
+                Stepper(value: $condGain, in: 0...4, step: 0.1) {
+                    Text(String(format: "%.1f", condGain))
+                }
+                .onChange(of: condGain) { _, _ in guard !hydrating else { return }; persist() }
+            }
+            VStack(alignment: .leading, spacing: 4) {
+                Text("Layer weights (\(model.condWeightCount) numbers, comma or space separated)")
+                    .font(.caption)
+                TextField("", text: $condWeightsText, prompt: Text(defaultWeightsPlaceholder))
+                    .textFieldStyle(.roundedBorder)
+                    .font(.caption.monospaced())
+                    .onChange(of: condWeightsText) { _, _ in guard !hydrating else { return }; persist() }
+                if !condWeightsValid {
+                    Text("Needs exactly \(model.condWeightCount) numbers — one per tapped encoder layer.")
+                        .font(.caption2)
+                        .foregroundStyle(.red)
+                } else {
+                    Text("Scales each tapped text-encoder layer's contribution (1 = neutral). Empty = off.")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
+
+            Divider()
+            Text("Style LoRA").font(.caption.weight(.semibold))
+            if loraPath.isEmpty {
+                Button {
+                    chooseLora()
+                } label: {
+                    Label("Choose .safetensors…", systemImage: "paintpalette")
+                        .font(.caption)
+                }
+                Text("Apply a LoRA adapter to the image model for a custom style.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            } else {
+                HStack(spacing: 8) {
+                    Image(systemName: "paintpalette")
+                        .foregroundStyle(.secondary)
+                    Text(URL(fileURLWithPath: loraPath).lastPathComponent)
+                        .font(.caption)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .help(loraPath)
+                    Spacer()
+                    Button {
+                        loraPath = ""
+                        persist()
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                    }
+                    .buttonStyle(.borderless)
+                    .foregroundStyle(.secondary)
+                    .help("Remove the LoRA")
+                }
+                .padding(6)
+                .background(RoundedRectangle(cornerRadius: 6).fill(Color.secondary.opacity(0.08)))
+            }
+        }
+    }
+
+    /// Placeholder showing the right count for the selected model's backend.
+    private var defaultWeightsPlaceholder: String {
+        Array(repeating: "1", count: model.condWeightCount).joined(separator: " ")
+    }
+
+    /// Empty = feature off = valid; otherwise it must parse to exactly the
+    /// backend's tap count (the server 400s on a wrong count).
+    private var condWeightsValid: Bool {
+        let t = condWeightsText.trimmingCharacters(in: .whitespaces)
+        if t.isEmpty { return true }
+        return ImageGenRequest.parseCondWeights(t)?.count == model.condWeightCount
+    }
+
+    private func chooseSourceImage() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.image, .png, .jpeg, .heic]
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        if panel.runModal() == .OK, let url = panel.url {
+            initImageURL = url
+        }
+    }
+
+    private func chooseLora() {
+        let panel = NSOpenPanel()
+        if let st = UTType(filenameExtension: "safetensors") {
+            panel.allowedContentTypes = [st]
+        }
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        if panel.runModal() == .OK, let url = panel.url {
+            loraPath = url.path
+            persist()
         }
     }
 
@@ -250,7 +420,7 @@ struct ImageGenView: View {
                     }
                     .buttonStyle(.borderedProminent)
                     .keyboardShortcut(.return, modifiers: [.command])
-                    .disabled(prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !downloads.bundleReady(model.bundle))
+                    .disabled(prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !downloads.bundleReady(model.bundle) || !condWeightsValid)
                 }
             }
         }
@@ -342,6 +512,14 @@ struct ImageGenView: View {
         negative = s.negativePrompt
         safeMode = s.safeMode
         keepResident = s.keepResident
+        strength = s.strength
+        condGain = s.condGain
+        condWeightsText = s.condWeightsText
+        loraPath = s.loraPath
+        // The LoRA file may have moved since last session — drop a stale path.
+        if !loraPath.isEmpty && !FileManager.default.fileExists(atPath: loraPath) {
+            loraPath = ""
+        }
     }
 
     /// Capture the current controls as the new last-used settings.
@@ -356,6 +534,10 @@ struct ImageGenView: View {
         s.negativePrompt = negative
         s.safeMode = safeMode
         s.keepResident = keepResident
+        s.strength = strength
+        s.condGain = condGain
+        s.condWeightsText = condWeightsText
+        s.loraPath = loraPath
         s.save()
     }
 
@@ -389,7 +571,12 @@ struct ImageGenView: View {
             steps: steps,
             guidance: guidance,
             keepResident: keepResident,
-            safeMode: safeMode
+            safeMode: safeMode,
+            initImagePath: initImageURL?.path,
+            strength: strength,
+            condGain: condGain,
+            condWeightsText: condWeightsText,
+            loraPath: loraPath.isEmpty ? nil : loraPath
         )
         persist()  // final capture — the agent's generate_image reuses these
 

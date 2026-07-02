@@ -42,6 +42,9 @@ var active_conn_threads = std.atomic.Value(u32).init(0);
 
 const io_util = @import("io_util.zig");
 const ws_mod = @import("ws.zig");
+const ollama_mod = @import("ollama.zig");
+const cli_mod = @import("cli.zig");
+const build_options = @import("build_options");
 const nowSecs = io_util.nowSecs;
 const nowMs = io_util.nowMs;
 const Stopwatch = io_util.Stopwatch;
@@ -128,6 +131,12 @@ pub const Conn = struct {
     /// would otherwise be HTTP/SSE is reshaped into WS text frames at the
     /// `sendResponse` / `sendAnthropicEvent` chokepoints.
     ws_mode: ?*WsBridge = null,
+    /// Non-null while an Ollama /api/* handler runs an inner /v1 handler:
+    /// every write the inner handler makes is fed to the sink (SSE → NDJSON
+    /// re-framing) instead of the socket. The sink writes its translated
+    /// output through `writer()` directly, bypassing this hook — same
+    /// interception pattern as `ws_mode`. See src/ollama.zig.
+    ollama_sink: ?*ollama_mod.Sink = null,
 
     pub fn init(c: *Conn, stream: std.Io.net.Stream, io: std.Io) void {
         c.stream = stream;
@@ -135,6 +144,7 @@ pub const Conn = struct {
         c.write_state = stream.writer(io, &c.write_buf);
         c.read_state = stream.reader(io, &c.read_buf);
         c.ws_mode = null;
+        c.ollama_sink = null;
     }
 
     pub fn writer(c: *Conn) *std.Io.Writer {
@@ -146,15 +156,18 @@ pub const Conn = struct {
     }
 
     pub fn writeAll(c: *Conn, data: []const u8) !void {
+        if (c.ollama_sink) |s| return s.feed(data);
         try c.writer().writeAll(data);
         try c.writer().flush();
     }
 
     pub fn writeAllNoFlush(c: *Conn, data: []const u8) !void {
+        if (c.ollama_sink) |s| return s.feed(data);
         try c.writer().writeAll(data);
     }
 
     pub fn flush(c: *Conn) !void {
+        if (c.ollama_sink != null) return;
         try c.writer().flush();
     }
 
@@ -1010,6 +1023,15 @@ fn handleConnection(
         return;
     }
 
+    // ── Ollama-compatible API (/api/*): endpoints that must not trigger a
+    //    model load (version/tags/ps/show/pull/unsupported) are handled
+    //    here; /api/chat, /api/generate and /api/embed(dings) fall through
+    //    to the model-resolution path below. Glue lives at the bottom of
+    //    this file; pure translation in src/ollama.zig.
+    if (std.mem.startsWith(u8, path, "/api/")) {
+        if (try handleOllamaEarly(allocator, stream, method, path, request_body)) return;
+    }
+
     // ── Plan 05 Phase D: resolve the request's target model via the
     //    scheduler (which delegates the fast path to registry.ensureLoaded
     //    and handles cold-load + eviction internally). Absent `model`
@@ -1030,11 +1052,18 @@ fn handleConnection(
     var requested_model_id = parseModelFromBody(request_body) orelse "";
     if (requested_model_id.len > 0 and !std.mem.eql(u8, requested_model_id, "mlx-serve")) {
         if (registry.peek(requested_model_id) == null) {
+            // Ollama clients send tagged/short names ("qwen3.6:latest");
+            // resolve them against registry ids before giving up. Scoped to
+            // /api/ paths so /v1 fallback semantics stay pinned.
+            var resolved: ?[]const u8 = null;
+            if (std.mem.startsWith(u8, path, "/api/")) {
+                resolved = ollamaResolveRegistryId(stream.io, registry, requested_model_id);
+            }
             // Unknown id — fall back to the default model rather than 404,
             // so off-the-shelf SDK clients keep working. Multi-model
             // clients that care about routing precision pass an exact id
             // we registered (and `peek` will find it).
-            requested_model_id = "";
+            requested_model_id = resolved orelse "";
         }
     }
     const lm = scheduler.ensureLoaded(requested_model_id) catch |err| switch (err) {
@@ -1160,10 +1189,434 @@ fn handleConnection(
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
         const body = request[header_end + 4 .. total_read];
         try handleGen(allocator, stream, body, lm, .video);
+    } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/api/chat")) {
+        if (config.is_encoder_only) {
+            try sendOllamaError(allocator, stream, "400 Bad Request", "encoder-only model does not support chat; use /api/embed");
+            return;
+        }
+        try handleOllamaChat(allocator, stream, request_body, lm);
+    } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/api/generate")) {
+        if (config.is_encoder_only) {
+            try sendOllamaError(allocator, stream, "400 Bad Request", "encoder-only model does not support generation; use /api/embed");
+            return;
+        }
+        try handleOllamaGenerate(allocator, stream, request_body, lm);
+    } else if (std.mem.eql(u8, method, "POST") and (std.mem.eql(u8, path, "/api/embed") or std.mem.eql(u8, path, "/api/embeddings"))) {
+        try handleOllamaEmbed(allocator, stream, request_body, lm, std.mem.eql(u8, path, "/api/embeddings"));
     } else {
         log.warn("{s} {s} -> 404\n", .{ method, path });
         try sendErrorResponse(allocator, stream, "404 Not Found", "not_found", "The requested endpoint does not exist", null);
     }
+}
+
+// ── Ollama-compatible API (/api/*) glue ─────────────────────────────────
+// Pure translation (request shapes, SSE→NDJSON sink, renderers) lives in
+// src/ollama.zig; this section owns routing targets, registry access, and
+// the Conn sink hook. The inner /v1 handlers are reused verbatim — an
+// /api/chat request becomes a /v1/chat/completions body whose SSE output
+// the Sink re-frames into Ollama NDJSON on the real socket.
+
+/// Sink output path: writes translated bytes DIRECTLY through the Conn's
+/// writer interface, bypassing the `ollama_sink` hook in writeAll.
+fn ollamaSinkOut(impl: *anyopaque, data: []const u8) anyerror!void {
+    const c: *Conn = @ptrCast(@alignCast(impl));
+    try c.writer().writeAll(data);
+    try c.writer().flush();
+}
+
+fn ollamaSinkNowMs(impl: *anyopaque) i64 {
+    const c: *Conn = @ptrCast(@alignCast(impl));
+    return nowMs(c.io);
+}
+
+fn sendOllamaError(allocator: std.mem.Allocator, stream: *Conn, status: []const u8, message: []const u8) !void {
+    var out: std.Io.Writer.Allocating = .init(allocator);
+    defer out.deinit();
+    try out.writer.writeAll("{\"error\":");
+    try ollama_mod.writeJsonString(&out.writer, message);
+    try out.writer.writeAll("}");
+    try sendResponse(stream, status, "application/json", out.written());
+}
+
+/// /api/* endpoints that must not trigger a model load. Returns true when
+/// the request was fully handled.
+fn handleOllamaEarly(allocator: std.mem.Allocator, stream: *Conn, method: []const u8, path: []const u8, body: []const u8) !bool {
+    const is_get = std.mem.eql(u8, method, "GET");
+    const is_post = std.mem.eql(u8, method, "POST");
+    if ((is_get or std.mem.eql(u8, method, "HEAD")) and std.mem.eql(u8, path, "/api/version")) {
+        log.debug("{s} /api/version -> 200\n", .{method});
+        const vbody = try std.fmt.allocPrint(allocator, "{{\"version\":\"{s}\"}}", .{build_options.version});
+        defer allocator.free(vbody);
+        try sendResponse(stream, "200 OK", "application/json", if (is_get) vbody else "");
+        return true;
+    }
+    if (is_get and std.mem.eql(u8, path, "/api/tags")) {
+        log.debug("GET  /api/tags -> 200\n", .{});
+        try handleOllamaTags(allocator, stream, false);
+        return true;
+    }
+    if (is_get and std.mem.eql(u8, path, "/api/ps")) {
+        log.debug("GET  /api/ps -> 200\n", .{});
+        try handleOllamaTags(allocator, stream, true);
+        return true;
+    }
+    if (is_post and std.mem.eql(u8, path, "/api/show")) {
+        try handleOllamaShow(allocator, stream, body);
+        return true;
+    }
+    if (is_post and std.mem.eql(u8, path, "/api/pull")) {
+        try handleOllamaPull(allocator, stream, body);
+        return true;
+    }
+    // Registry-mutating Ollama endpoints we deliberately don't support get
+    // an explicit, actionable error instead of a bare 404.
+    const unsupported = [_][]const u8{ "/api/create", "/api/copy", "/api/delete", "/api/push", "/api/blobs" };
+    for (unsupported) |prefix| {
+        if (std.mem.startsWith(u8, path, prefix)) {
+            log.warn("{s} {s} -> 501 (unsupported ollama endpoint)\n", .{ method, path });
+            try sendOllamaError(allocator, stream, "501 Not Implemented", "this Ollama endpoint is not supported by mlx-serve; manage models via /v1/load-model, /api/pull, or the MLX Core app");
+            return true;
+        }
+    }
+    return false;
+}
+
+/// Ollama-style model name → registered model id, or null. Registry ids
+/// are stable for the process lifetime (unload keeps the stub), so the
+/// returned slice stays valid after the mutex drops.
+fn ollamaResolveRegistryId(io: std.Io, registry: *ModelRegistry, name: []const u8) ?[]const u8 {
+    registry.mutex.lockUncancelable(io);
+    defer registry.mutex.unlock(io);
+    var ids_buf: [128][]const u8 = undefined;
+    var n: usize = 0;
+    var it = registry.entries.valueIterator();
+    while (it.next()) |ep| {
+        if (n >= ids_buf.len) break;
+        ids_buf[n] = ep.*.id;
+        n += 1;
+    }
+    const idx = ollama_mod.resolveName(name, ids_buf[0..n]) orelse return null;
+    return ids_buf[idx];
+}
+
+fn ollamaQuantOf(id: []const u8) []const u8 {
+    if (std.ascii.indexOfIgnoreCase(id, "4bit") != null) return "4bit";
+    if (std.ascii.indexOfIgnoreCase(id, "8bit") != null) return "8bit";
+    if (std.ascii.indexOfIgnoreCase(id, "bf16") != null) return "BF16";
+    if (std.ascii.indexOfIgnoreCase(id, "nvfp4") != null) return "NVFP4";
+    if (std.ascii.indexOfIgnoreCase(id, "q4") != null) return "Q4";
+    if (std.ascii.indexOfIgnoreCase(id, "q8") != null) return "Q8";
+    return "";
+}
+
+/// Snapshot one registry entry into the pure TagEntry shape. Caller holds
+/// the registry mutex; id/arch_hint slices are entry-owned and stable.
+fn ollamaTagEntryOf(io: std.Io, e: *LoadedModel) ollama_mod.TagEntry {
+    const family: []const u8 = if (e.config) |c| c.model_type else (if (e.arch_hint.len > 0) e.arch_hint else "unknown");
+    const is_gguf = e.ds4_engine != null or e.llama_engine != null or std.mem.endsWith(u8, e.path, ".gguf");
+    var modified_ms: i64 = 0;
+    // config.json mtime; .gguf entries fall back to 0 (epoch) rather than
+    // paying a parent-dir walk. Guard the absolute-path precondition —
+    // openDirAbsolute on a non-absolute path is ReleaseFast UB (CLAUDE.md).
+    if (!is_gguf and e.path.len > 0 and std.fs.path.isAbsolute(e.path)) {
+        if (std.Io.Dir.openDirAbsolute(io, e.path, .{})) |d| {
+            var dir = d;
+            defer dir.close(io);
+            if (dir.statFile(io, "config.json", .{})) |st| {
+                modified_ms = st.mtime.toMilliseconds();
+            } else |_| {}
+        } else |_| {}
+    }
+    return .{
+        .id = e.id,
+        .size_bytes = e.bytes_on_disk orelse 0,
+        .modified_ms = modified_ms,
+        .family = family,
+        .format = if (is_gguf) "gguf" else "safetensors",
+        .quant = ollamaQuantOf(e.id),
+    };
+}
+
+/// GET /api/tags (`ps_only=false`: every registered model) and GET /api/ps
+/// (`ps_only=true`: only GPU-resident entries, with residency bytes).
+fn handleOllamaTags(allocator: std.mem.Allocator, stream: *Conn, ps_only: bool) !void {
+    const registry = global_registry orelse {
+        try sendOllamaError(allocator, stream, "503 Service Unavailable", "registry not ready");
+        return;
+    };
+    var body: []u8 = undefined;
+    {
+        registry.mutex.lockUncancelable(stream.io);
+        defer registry.mutex.unlock(stream.io);
+        if (ps_only) {
+            var entries = std.ArrayList(ollama_mod.PsEntry).empty;
+            defer entries.deinit(allocator);
+            var it = registry.entries.valueIterator();
+            while (it.next()) |ep| {
+                const e = ep.*;
+                if (e.state != .ready) continue;
+                try entries.append(allocator, .{
+                    .tag = ollamaTagEntryOf(stream.io, e),
+                    .resident_bytes = e.bytes_resident,
+                });
+            }
+            body = try ollama_mod.renderPsJson(allocator, entries.items);
+        } else {
+            var entries = std.ArrayList(ollama_mod.TagEntry).empty;
+            defer entries.deinit(allocator);
+            var it = registry.entries.valueIterator();
+            while (it.next()) |ep| {
+                try entries.append(allocator, ollamaTagEntryOf(stream.io, ep.*));
+            }
+            body = try ollama_mod.renderTagsJson(allocator, entries.items);
+        }
+    }
+    defer allocator.free(body);
+    try sendResponse(stream, "200 OK", "application/json", body);
+}
+
+/// POST /api/show — model metadata + capabilities.
+fn handleOllamaShow(allocator: std.mem.Allocator, stream: *Conn, body: []const u8) !void {
+    const registry = global_registry orelse {
+        try sendOllamaError(allocator, stream, "503 Service Unavailable", "registry not ready");
+        return;
+    };
+    var requested: []const u8 = "";
+    var parsed_body: ?std.json.Parsed(std.json.Value) = null;
+    defer if (parsed_body) |*p| p.deinit();
+    if (std.json.parseFromSlice(std.json.Value, allocator, body, .{})) |parsed| {
+        parsed_body = parsed;
+        if (parsed.value == .object) {
+            // "model" is current; "name" is the pre-0.5 client field.
+            if (parsed.value.object.get("model")) |m| {
+                if (m == .string) requested = m.string;
+            } else if (parsed.value.object.get("name")) |m| {
+                if (m == .string) requested = m.string;
+            }
+        }
+    } else |_| {}
+    if (requested.len == 0) {
+        try sendOllamaError(allocator, stream, "400 Bad Request", "model is required");
+        return;
+    }
+
+    var rendered: ?[]u8 = null;
+    {
+        registry.mutex.lockUncancelable(stream.io);
+        defer registry.mutex.unlock(stream.io);
+        var ids_buf: [128][]const u8 = undefined;
+        var n: usize = 0;
+        var entry_buf: [128]*LoadedModel = undefined;
+        var it = registry.entries.valueIterator();
+        while (it.next()) |ep| {
+            if (n >= ids_buf.len) break;
+            ids_buf[n] = ep.*.id;
+            entry_buf[n] = ep.*;
+            n += 1;
+        }
+        if (ollama_mod.resolveName(requested, ids_buf[0..n])) |idx| {
+            const e = entry_buf[idx];
+            const template: []const u8 = if (e.chat_config) |cc| cc.chat_template else "";
+            const is_encoder = if (e.config) |c| c.is_encoder_only else std.mem.eql(u8, e.arch_hint, "bert");
+            const has_chat = !is_encoder;
+            rendered = try ollama_mod.renderShowJson(allocator, .{
+                .tag = ollamaTagEntryOf(stream.io, e),
+                .context_length = if (e.config) |c| getEffectiveContextLength(c) else 0,
+                .template = template,
+                .has_chat = has_chat,
+                .has_tools = has_chat,
+                .has_vision = e.vision_encoder != null,
+                .has_thinking = has_chat and chatTemplateSupportsThinking(template),
+                .has_embedding = is_encoder,
+            });
+        }
+    }
+    if (rendered) |r| {
+        defer allocator.free(r);
+        log.debug("POST /api/show -> 200 ({s})\n", .{requested});
+        try sendResponse(stream, "200 OK", "application/json", r);
+    } else {
+        log.warn("POST /api/show -> 404 (unknown model {s})\n", .{requested});
+        try sendOllamaError(allocator, stream, "404 Not Found", "model not found");
+    }
+}
+
+/// Progress reporter for /api/pull: each status line becomes an Ollama
+/// NDJSON `{"status":"…"}` chunk on the wire.
+const OllamaPullSink = struct {
+    stream: *Conn,
+    allocator: std.mem.Allocator,
+    quiet: bool = false,
+    headers_sent: bool = false,
+    write_failed: bool = false,
+
+    fn report(impl: *anyopaque, line: []const u8) void {
+        const self: *OllamaPullSink = @ptrCast(@alignCast(impl));
+        if (self.quiet) return;
+        self.emit("status", line) catch {
+            self.write_failed = true;
+        };
+    }
+
+    fn emit(self: *OllamaPullSink, key: []const u8, line: []const u8) !void {
+        if (!self.headers_sent) {
+            self.headers_sent = true;
+            try self.stream.writeAll("HTTP/1.1 200 OK\r\n" ++
+                "Content-Type: application/x-ndjson\r\n" ++
+                "Cache-Control: no-cache\r\n" ++
+                "Connection: close\r\n" ++
+                "Access-Control-Allow-Origin: *\r\n" ++
+                "\r\n");
+        }
+        var out: std.Io.Writer.Allocating = .init(self.allocator);
+        defer out.deinit();
+        try out.writer.writeAll("{\"");
+        try out.writer.writeAll(key);
+        try out.writer.writeAll("\":");
+        try ollama_mod.writeJsonString(&out.writer, line);
+        try out.writer.writeAll("}\n");
+        try self.stream.writeAll(out.written());
+    }
+};
+
+/// POST /api/pull — native HF download into ~/.mlx-serve/models (same
+/// resolver + layout as `mlx-serve pull`), then register-by-path so the
+/// model is immediately loadable by name. Streams NDJSON status lines
+/// unless the client passed `stream:false`.
+fn handleOllamaPull(allocator: std.mem.Allocator, stream: *Conn, body: []const u8) !void {
+    var requested: []const u8 = "";
+    var wants_stream = true;
+    var parsed_body: ?std.json.Parsed(std.json.Value) = null;
+    defer if (parsed_body) |*p| p.deinit();
+    if (std.json.parseFromSlice(std.json.Value, allocator, body, .{})) |parsed| {
+        parsed_body = parsed;
+        if (parsed.value == .object) {
+            if (parsed.value.object.get("model")) |m| {
+                if (m == .string) requested = m.string;
+            } else if (parsed.value.object.get("name")) |m| {
+                if (m == .string) requested = m.string;
+            }
+            if (parsed.value.object.get("stream")) |s| {
+                wants_stream = s == .bool and s.bool;
+            }
+        }
+    } else |_| {}
+    if (requested.len == 0) {
+        try sendOllamaError(allocator, stream, "400 Bad Request", "model is required");
+        return;
+    }
+    const resolved = cli_mod.resolveShortName(requested) orelse {
+        try sendOllamaError(allocator, stream, "404 Not Found", "unknown model name; use a known short name or a HuggingFace 'org/repo' id");
+        return;
+    };
+    const home = std.mem.span(std.c.getenv("HOME") orelse "/tmp");
+    const dest = try cli_mod.modelDestPath(allocator, home, resolved.repo);
+    defer allocator.free(dest);
+
+    log.info("POST /api/pull {s} -> {s}\n", .{ requested, dest });
+    var sink = OllamaPullSink{ .stream = stream, .allocator = allocator, .quiet = !wants_stream };
+    const reporter = cli_mod.Reporter{ .impl = &sink, .reportFn = &OllamaPullSink.report };
+    if (!cli_mod.modelPresent(stream.io, dest)) {
+        cli_mod.pullRepo(allocator, stream.io, resolved, dest, reporter, false) catch {
+            if (sink.headers_sent) {
+                sink.emit("error", "pull failed (partials kept — retry to resume)") catch {};
+            } else {
+                try sendOllamaError(allocator, stream, "500 Internal Server Error", "pull failed (partials kept — retry to resume)");
+            }
+            return;
+        };
+    }
+    // Make it loadable by name right away. GGUF-only dirs (no config.json)
+    // aren't registerable this way — they still work via --model / the app.
+    if (global_registry) |registry| {
+        _ = registry.registerByPath(stream.io, dest) catch {};
+    }
+    sink.quiet = false;
+    sink.emit("status", "success") catch {};
+}
+
+fn handleOllamaChat(allocator: std.mem.Allocator, stream: *Conn, body: []const u8, lm: *LoadedModel) !void {
+    var tr = ollama_mod.translateChatRequest(allocator, body) catch |err| switch (err) {
+        error.InvalidRequest => {
+            log.warn("POST /api/chat -> 400 (invalid request)\n", .{});
+            try sendOllamaError(allocator, stream, "400 Bad Request", "invalid chat request: model and messages are required");
+            return;
+        },
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    defer tr.deinit(allocator);
+    log.debug("POST /api/chat (stream={any}) -> inner /v1/chat/completions\n", .{tr.wants_stream});
+    var sink = ollama_mod.Sink.init(allocator, .{
+        .mode = .chat,
+        .wants_stream = tr.wants_stream,
+        .model = tr.model,
+        .out_impl = stream,
+        .outFn = &ollamaSinkOut,
+        .nowMsFn = &ollamaSinkNowMs,
+    });
+    defer sink.deinit();
+    stream.ollama_sink = &sink;
+    defer stream.ollama_sink = null;
+    try handleChatCompletions(allocator, stream, tr.body, lm);
+    stream.ollama_sink = null;
+    try sink.finish();
+}
+
+fn handleOllamaGenerate(allocator: std.mem.Allocator, stream: *Conn, body: []const u8, lm: *LoadedModel) !void {
+    var tr = ollama_mod.translateGenerateRequest(allocator, body) catch |err| switch (err) {
+        error.InvalidRequest => {
+            log.warn("POST /api/generate -> 400 (invalid request)\n", .{});
+            try sendOllamaError(allocator, stream, "400 Bad Request", "invalid generate request: prompt is required");
+            return;
+        },
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    defer tr.deinit(allocator);
+    log.debug("POST /api/generate (stream={any}, raw={any}) -> inner {s}\n", .{ tr.wants_stream, tr.raw, if (tr.raw) "/v1/completions" else "/v1/chat/completions" });
+    var sink = ollama_mod.Sink.init(allocator, .{
+        .mode = .generate,
+        .wants_stream = tr.wants_stream,
+        .model = tr.model,
+        .out_impl = stream,
+        .outFn = &ollamaSinkOut,
+        .nowMsFn = &ollamaSinkNowMs,
+    });
+    defer sink.deinit();
+    stream.ollama_sink = &sink;
+    defer stream.ollama_sink = null;
+    if (tr.raw) {
+        try handleCompletions(allocator, stream, tr.body, lm);
+    } else {
+        try handleChatCompletions(allocator, stream, tr.body, lm);
+    }
+    stream.ollama_sink = null;
+    try sink.finish();
+}
+
+fn handleOllamaEmbed(allocator: std.mem.Allocator, stream: *Conn, body: []const u8, lm: *LoadedModel, legacy: bool) !void {
+    var tr = ollama_mod.translateEmbedRequest(allocator, body, legacy) catch |err| switch (err) {
+        error.InvalidRequest => {
+            log.warn("POST /api/embed -> 400 (invalid request)\n", .{});
+            try sendOllamaError(allocator, stream, "400 Bad Request", if (legacy) "invalid request: prompt is required" else "invalid request: input is required");
+            return;
+        },
+        error.OutOfMemory => return error.OutOfMemory,
+    };
+    defer tr.deinit(allocator);
+    var sink = ollama_mod.Sink.init(allocator, .{
+        .mode = .chat, // unused for embed; finishEmbed re-renders the capture
+        .wants_stream = false,
+        .model = tr.model,
+        .out_impl = stream,
+        .outFn = &ollamaSinkOut,
+        .nowMsFn = &ollamaSinkNowMs,
+    });
+    defer sink.deinit();
+    stream.ollama_sink = &sink;
+    defer stream.ollama_sink = null;
+    try handleEmbeddings(allocator, stream, tr.body, lm);
+    stream.ollama_sink = null;
+    try sink.finishEmbed(legacy);
 }
 
 fn getEffectiveContextLength(config: *const model_mod.ModelConfig) u32 {

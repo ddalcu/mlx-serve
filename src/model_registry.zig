@@ -626,6 +626,10 @@ pub const ModelRegistry = struct {
             if (self.entries.get(base)) |existing| return existing.id;
         }
 
+        // A discovery entry may hold this path under an org/name id whose
+        // basename differs — resolve by path before probing the filesystem.
+        if (self.peekByPath(trimmed)) |existing| return existing.id;
+
         const probe = try model_discovery.probeModelDir(io, self.allocator, trimmed);
         defer self.allocator.free(probe.model_type);
 
@@ -644,6 +648,26 @@ pub const ModelRegistry = struct {
     pub fn setDefault(self: *ModelRegistry, id: []const u8) !void {
         const entry = self.entries.get(id) orelse return error.UnknownModelId;
         self.default_id = entry.id;
+    }
+
+    /// Look up an entry by its on-disk path (trailing slashes ignored).
+    /// Same read-only contract as `peek`. Exists so the `--model` path and
+    /// register-by-path flows reuse a discovery entry even when their
+    /// basename-derived id differs from the discovered `org/name` id —
+    /// two ids for one path would let the same weights load twice.
+    pub fn peekByPath(self: *ModelRegistry, path: []const u8) ?*LoadedModel {
+        var trimmed = path;
+        while (trimmed.len > 0 and trimmed[trimmed.len - 1] == '/') trimmed = trimmed[0 .. trimmed.len - 1];
+        if (trimmed.len == 0) return null;
+        self.mutex.lockUncancelable(self.io);
+        defer self.mutex.unlock(self.io);
+        var it = self.entries.valueIterator();
+        while (it.next()) |entry_ptr| {
+            var entry_path: []const u8 = entry_ptr.*.path;
+            while (entry_path.len > 0 and entry_path[entry_path.len - 1] == '/') entry_path = entry_path[0 .. entry_path.len - 1];
+            if (std.mem.eql(u8, entry_path, trimmed)) return entry_ptr.*;
+        }
+        return null;
     }
 
     /// Look up an entry by id without taking a refcount. Returns null if
@@ -1022,6 +1046,28 @@ test "ModelRegistry: registerByPath reuses an existing id without touching the f
     const id = try reg.registerByPath(io, "/nonexistent/parent/bge-x/");
     try testing.expectEqualStrings("bge-x", id);
     try testing.expectEqual(stub.id.ptr, id.ptr);
+}
+
+test "ModelRegistry: peekByPath dedupes org/name discovery ids against basename registration" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var reg = try ModelRegistry.init(testing.allocator, io, null, 3, 0, null);
+    defer reg.deinit();
+    // Discovery registered this model under its org/name id (two-level scan).
+    const stub = try reg.registerStubWithArch("mlx-community/gemma-x", "/models/mlx-community/gemma-x", 64, "gemma4");
+    // The --model path registration must find the SAME entry via its path
+    // (basename "gemma-x" doesn't match the org/name id) — otherwise the
+    // same weights end up registered twice and can double-load.
+    const by_path = reg.peekByPath("/models/mlx-community/gemma-x");
+    try testing.expect(by_path != null);
+    try testing.expectEqual(stub, by_path.?);
+    // Trailing slash normalizes.
+    try testing.expectEqual(stub, reg.peekByPath("/models/mlx-community/gemma-x/").?);
+    try testing.expect(reg.peekByPath("/models/elsewhere") == null);
+    // registerByPath also resolves through the path before creating a stub
+    // (basename fast path misses, path match hits, no filesystem probe).
+    const id = try reg.registerByPath(io, "/models/mlx-community/gemma-x/");
+    try testing.expectEqualStrings("mlx-community/gemma-x", id);
+    try testing.expectEqual(@as(usize, 1), reg.entries.count());
 }
 
 test "ModelRegistry: registerByPath rejects a nonexistent directory" {

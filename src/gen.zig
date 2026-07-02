@@ -17,10 +17,12 @@ const std = @import("std");
 const mlx = @import("mlx.zig");
 const flux = @import("flux.zig");
 const krea = @import("krea.zig");
+const lora_mod = @import("lora.zig");
 const nsfw = @import("nsfw.zig");
 const tts = @import("tts.zig");
 const ltx = @import("ltx_video.zig");
 const ltx_audio = @import("ltx_audio.zig");
+const wav_mod = @import("wav.zig");
 const tok_mod = @import("tokenizer.zig");
 const model_mod = @import("model.zig");
 const chat_mod = @import("chat.zig");
@@ -130,6 +132,7 @@ const FluxImpl = struct {
     te: flux.TextEncoder,
     dit: flux.Dit,
     vae: flux.Vae,
+    vae_enc: ?flux.VaeEncoder,
     tok: tok_mod.Tokenizer,
 
     fn load(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !FluxImpl {
@@ -141,6 +144,11 @@ const FluxImpl = struct {
         errdefer self.dit.deinit();
         self.vae = try flux.loadVae(io, allocator, self.s, model_dir);
         errdefer self.vae.deinit();
+        self.vae_enc = flux.loadVaeEncoder(io, allocator, self.s, model_dir) catch |e| blk: {
+            log.warn("[image] FLUX VAE encoder load failed ({}) — image-to-image disabled\n", .{e});
+            break :blk null;
+        };
+        errdefer if (self.vae_enc) |*e| e.deinit();
         // Tokenizer lives in the `tokenizer/` subdir for FLUX.2.
         const tok_dir = try std.fmt.allocPrint(allocator, "{s}/tokenizer", .{model_dir});
         defer allocator.free(tok_dir);
@@ -153,12 +161,13 @@ const FluxImpl = struct {
         self.te.deinit();
         self.dit.deinit();
         self.vae.deinit();
+        if (self.vae_enc) |*e| e.deinit();
         self.tok.deinit();
     }
 
     /// Tokenize the prompt (Qwen3 chat template) and run the FLUX pipeline →
     /// image [1,3,H,W] f32 in [0,1] (owned mlx array; caller frees).
-    fn generateImage(self: *FluxImpl, allocator: std.mem.Allocator, prompt: []const u8, width: u32, height: u32, seed: u64, steps: u32, progress: ?sse.Progress) !mlx.mlx_array {
+    fn generateImage(self: *FluxImpl, allocator: std.mem.Allocator, prompt: []const u8, width: u32, height: u32, seed: u64, steps: u32, opts: ImageGenOpts, progress: ?sse.Progress) !mlx.mlx_array {
         // mflux Qwen3 chat template (enable_thinking=False adds an empty <think> block).
         const templated = try std.fmt.allocPrint(allocator, "<|im_start|>user\n{s}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n", .{prompt});
         defer allocator.free(templated);
@@ -180,11 +189,22 @@ const FluxImpl = struct {
                 mask[i] = 0;
             }
         }
-        return flux.generate(&self.te, &self.dit, &self.vae, ids, mask, seed, steps, height, width, progress);
+        var fopts = flux.GenOpts{ .cond_gain = opts.cond_gain, .cond_weights = opts.cond_weights };
+        var init_lat: ?mlx.mlx_array = null;
+        defer if (init_lat) |l| {
+            _ = mlx.mlx_array_free(l);
+        };
+        if (opts.init_image) |pix| {
+            const ve = if (self.vae_enc) |*e| e else return error.NoVaeEncoder;
+            init_lat = try ve.encode(pix);
+            fopts.init_latents = init_lat;
+            fopts.start_step = img2imgStartStep(steps, opts.strength);
+        }
+        return flux.generateWithOpts(&self.te, &self.dit, &self.vae, ids, mask, seed, steps, height, width, fopts, progress);
     }
 
-    fn generatePng(self: *FluxImpl, allocator: std.mem.Allocator, prompt: []const u8, width: u32, height: u32, seed: u64, steps: u32, progress: ?sse.Progress) ![]u8 {
-        const img = try self.generateImage(allocator, prompt, width, height, seed, steps, progress);
+    fn generatePng(self: *FluxImpl, allocator: std.mem.Allocator, prompt: []const u8, width: u32, height: u32, seed: u64, steps: u32, opts: ImageGenOpts, progress: ?sse.Progress) ![]u8 {
+        const img = try self.generateImage(allocator, prompt, width, height, seed, steps, opts, progress);
         defer _ = mlx.mlx_array_free(img);
         return krea.imageToPng(allocator, img, self.s);
     }
@@ -199,16 +219,36 @@ const ImageBackend = union(enum) {
     krea: *krea.Engine,
 };
 
+/// Per-request image-generation options shared by both backends.
+pub const ImageGenOpts = struct {
+    /// img2img source pixels [1,3,H,W] f32 [0,1], pre-resized to the target
+    /// size (VAE-encoded by the backend).
+    init_image: ?mlx.mlx_array = null,
+    /// How far to renoise the source (diffusers convention: 1 = ignore it,
+    /// low = small change). Only meaningful with `init_image`.
+    strength: f32 = 0.6,
+    /// Conditioning rebalance: global gain × per-tapped-layer weights
+    /// (FLUX: 3 taps, Krea: 12 taps).
+    cond_gain: f32 = 1.0,
+    cond_weights: ?[]const f32 = null,
+};
+
 /// Image modality engine. The slot on `LoadedModel` stays modality-named; the
 /// internals are swappable per architecture (`ImageBackend`).
 pub const ImageEngine = struct {
     allocator: std.mem.Allocator,
     backend: ImageBackend,
+    // Runtime LoRA state: the File owns the adapter arrays the attached Refs
+    // point at, so it must live until the next detach (clearLora).
+    lora_file: ?lora_mod.File = null,
+    lora_path: ?[]u8 = null,
+    lora_scale: f32 = 1.0,
+    lora_matched: u32 = 0,
 
     pub fn load(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !*ImageEngine {
         const self = try allocator.create(ImageEngine);
         errdefer allocator.destroy(self);
-        self.allocator = allocator;
+        self.* = .{ .allocator = allocator, .backend = undefined };
         // Re-peek the arch to pick the backend (detectModality already proved
         // config.json parses). `krea*` → Krea; everything else → FLUX.
         const is_krea = blk: {
@@ -225,6 +265,7 @@ pub const ImageEngine = struct {
     }
 
     pub fn deinit(self: *ImageEngine) void {
+        self.clearLora();
         switch (self.backend) {
             .flux => |*f| f.deinit(),
             .krea => |k| k.deinit(),
@@ -232,29 +273,95 @@ pub const ImageEngine = struct {
         self.allocator.destroy(self);
     }
 
-    pub fn generatePng(self: *ImageEngine, allocator: std.mem.Allocator, prompt: []const u8, width: u32, height: u32, seed: u64, steps: u32, progress: ?sse.Progress) ![]u8 {
+    fn stream(self: *ImageEngine) mlx.mlx_stream {
         return switch (self.backend) {
-            .flux => |*f| f.generatePng(allocator, prompt, width, height, seed, steps, progress),
-            .krea => |k| k.generatePng(allocator, prompt, width, height, seed, steps, progress),
+            .flux => |*f| f.s,
+            .krea => |k| k.s,
         };
+    }
+
+    /// Number of tapped text-encoder layers `cond_weights` must cover.
+    pub fn condWeightCount(self: *const ImageEngine) usize {
+        return switch (self.backend) {
+            .flux => 3,
+            .krea => 12,
+        };
+    }
+
+    /// True when the VAE encoder loaded, i.e. img2img is available.
+    pub fn supportsImg2Img(self: *const ImageEngine) bool {
+        return switch (self.backend) {
+            .flux => |*f| f.vae_enc != null,
+            .krea => |k| k.vae_enc != null,
+        };
+    }
+
+    /// Reconcile the engine's attached LoRA with the request: `path == null`
+    /// detaches; a new path (or scale) loads + attaches; the same path+scale is
+    /// a no-op reuse. Returns the number of matched DiT modules.
+    pub fn setLora(self: *ImageEngine, path: ?[]const u8, scale: f32) !u32 {
+        if (path) |p| {
+            if (self.lora_path) |cur| {
+                if (std.mem.eql(u8, cur, p) and scale == self.lora_scale) return self.lora_matched;
+            }
+            self.clearLora();
+            var lf = try lora_mod.loadFile(self.allocator, p);
+            const matched = switch (self.backend) {
+                .flux => |*f| flux.attachLora(&f.dit, &lf, scale),
+                .krea => |k| krea.attachLora(&k.dit, &lf, scale),
+            };
+            if (matched == 0) {
+                lf.deinit();
+                return error.LoraNoMatch;
+            }
+            self.lora_file = lf;
+            self.lora_path = try self.allocator.dupe(u8, p);
+            self.lora_scale = scale;
+            self.lora_matched = matched;
+            return matched;
+        }
+        self.clearLora();
+        return 0;
+    }
+
+    fn clearLora(self: *ImageEngine) void {
+        switch (self.backend) {
+            .flux => |*f| flux.detachLora(&f.dit),
+            .krea => |k| krea.detachLora(&k.dit),
+        }
+        if (self.lora_file) |*lf| lf.deinit();
+        self.lora_file = null;
+        if (self.lora_path) |p| self.allocator.free(p);
+        self.lora_path = null;
+        self.lora_matched = 0;
+    }
+
+    pub fn generatePng(self: *ImageEngine, allocator: std.mem.Allocator, prompt: []const u8, width: u32, height: u32, seed: u64, steps: u32, progress: ?sse.Progress) ![]u8 {
+        const img = try self.generateImage(allocator, prompt, width, height, seed, steps, .{}, progress);
+        defer _ = mlx.mlx_array_free(img);
+        return krea.imageToPng(allocator, img, self.stream());
     }
 
     /// Generate the raw image [1,3,H,W] f32 [0,1] (owned mlx array). Lets the
     /// caller run the content filter on the pixels before PNG-encoding.
-    pub fn generateImage(self: *ImageEngine, allocator: std.mem.Allocator, prompt: []const u8, width: u32, height: u32, seed: u64, steps: u32, progress: ?sse.Progress) !mlx.mlx_array {
+    pub fn generateImage(self: *ImageEngine, allocator: std.mem.Allocator, prompt: []const u8, width: u32, height: u32, seed: u64, steps: u32, opts: ImageGenOpts, progress: ?sse.Progress) !mlx.mlx_array {
         return switch (self.backend) {
-            .flux => |*f| f.generateImage(allocator, prompt, width, height, seed, steps, progress),
-            .krea => |k| k.generateImage(allocator, prompt, width, height, seed, steps, progress),
+            .flux => |*f| f.generateImage(allocator, prompt, width, height, seed, steps, opts, progress),
+            .krea => |k| blk: {
+                const kopts = krea.GenOpts{
+                    .init_image = opts.init_image,
+                    .start_step = if (opts.init_image != null) img2imgStartStep(steps, opts.strength) else 0,
+                    .cond_gain = opts.cond_gain,
+                    .cond_weights = opts.cond_weights,
+                };
+                break :blk k.generateImageOpts(allocator, prompt, width, height, seed, steps, kopts, progress);
+            },
         };
     }
 
     /// Encode an image [1,3,H,W] f32 [0,1] → PNG bytes (caller frees).
     pub fn toPng(self: *ImageEngine, allocator: std.mem.Allocator, img: mlx.mlx_array) ![]u8 {
-        const s = switch (self.backend) {
-            .flux => |*f| f.s,
-            .krea => |k| k.s,
-        };
-        return krea.imageToPng(allocator, img, s);
+        return krea.imageToPng(allocator, img, self.stream());
     }
 
     /// Resolve a requested WxH per backend. FLUX has a fixed 1024² latent grid;
@@ -371,16 +478,21 @@ const LTX_PAD_LEN: usize = 256; // gemma left-pad length
 const LTX_PAD_ID: i32 = 0; // gemma <pad>
 const LTX_GEMMA_BOS: i32 = 2; // <bos>
 
-// Reference DEFAULT_NEGATIVE_PROMPT, verbatim. The audio tail (lip sync,
-// muted/distorted voice, background noise, dialogue terms) is load-bearing
-// for speech when audio CFG runs; if the whole thing ever exceeds
-// LTX_PAD_LEN, ltxPadWithBos left-truncates and keeps that tail.
+// Reference DEFAULT_NEGATIVE_PROMPT, plus a subtitle/caption block after
+// "artifacts around text": quoted dialogue in the prompt makes the model burn
+// scrambled subtitle-like captions into the frame; these terms steer CFG away
+// from that. The audio tail (lip sync, muted/distorted voice, background
+// noise, dialogue terms) is load-bearing for speech when audio CFG runs; if
+// the whole thing ever exceeds LTX_PAD_LEN (~229 tokens today, 256 budget),
+// ltxPadWithBos left-truncates and keeps that tail.
 const LTX_NEGATIVE_PROMPT =
     "blurry, out of focus, overexposed, underexposed, low contrast, washed out colors, " ++
     "excessive noise, grainy texture, poor lighting, flickering, motion blur, distorted " ++
     "proportions, unnatural skin tones, deformed facial features, asymmetrical face, " ++
     "missing facial features, extra limbs, disfigured hands, wrong hand count, artifacts " ++
-    "around text, inconsistent perspective, camera shake, incorrect depth of field, " ++
+    "around text, subtitles, closed captions, burned-in captions, on-screen text, " ++
+    "text overlay, lower thirds, karaoke-style lyrics, watermark, " ++
+    "inconsistent perspective, camera shake, incorrect depth of field, " ++
     "background too sharp, background clutter, distracting reflections, harsh shadows, " ++
     "inconsistent lighting direction, color banding, cartoonish rendering, 3D CGI look, " ++
     "unrealistic materials, uncanny valley effect, incorrect ethnicity, wrong gender, " ++
@@ -617,6 +729,66 @@ fn decodeImageToBCFHW(allocator: std.mem.Allocator, encoded: []const u8, target_
     return bf;
 }
 
+/// Decode a PNG/JPEG image (raw file bytes) → `[1,3,target_h,target_w]` f32
+/// in [0,1], bilinear-resized (the img2img source; image engines convert to
+/// [-1,1] internally). Returns null on decode failure.
+fn decodeImageToBCHW(allocator: std.mem.Allocator, encoded: []const u8, target_h: u32, target_w: u32) ?mlx.mlx_array {
+    var w: c_int = 0;
+    var h: c_int = 0;
+    var ch: c_int = 0;
+    const src_ptr = stb.stbi_load_from_memory(encoded.ptr, @intCast(encoded.len), &w, &h, &ch, 3) orelse return null;
+    defer stb.stbi_image_free(src_ptr);
+    const sw: usize = @intCast(w);
+    const sh: usize = @intCast(h);
+    if (sw == 0 or sh == 0) return null;
+    const src = src_ptr[0 .. sw * sh * 3];
+
+    const th: usize = target_h;
+    const tw: usize = target_w;
+    const out = allocator.alloc(f32, 3 * th * tw) catch return null;
+    defer allocator.free(out);
+
+    const clampIdx = struct {
+        fn f(v: isize, n: usize) usize {
+            if (v < 0) return 0;
+            const uv: usize = @intCast(v);
+            return if (uv >= n) n - 1 else uv;
+        }
+    }.f;
+
+    var oy: usize = 0;
+    while (oy < th) : (oy += 1) {
+        const fy = (@as(f32, @floatFromInt(oy)) + 0.5) * @as(f32, @floatFromInt(sh)) / @as(f32, @floatFromInt(th)) - 0.5;
+        const fy0 = @floor(fy);
+        const wy = fy - fy0;
+        const y0 = clampIdx(@intFromFloat(fy0), sh);
+        const y1 = clampIdx(@as(isize, @intFromFloat(fy0)) + 1, sh);
+        var ox: usize = 0;
+        while (ox < tw) : (ox += 1) {
+            const fx = (@as(f32, @floatFromInt(ox)) + 0.5) * @as(f32, @floatFromInt(sw)) / @as(f32, @floatFromInt(tw)) - 0.5;
+            const fx0 = @floor(fx);
+            const wx = fx - fx0;
+            const x0 = clampIdx(@intFromFloat(fx0), sw);
+            const x1 = clampIdx(@as(isize, @intFromFloat(fx0)) + 1, sw);
+            var c: usize = 0;
+            while (c < 3) : (c += 1) {
+                const p00: f32 = @floatFromInt(src[(y0 * sw + x0) * 3 + c]);
+                const p10: f32 = @floatFromInt(src[(y0 * sw + x1) * 3 + c]);
+                const p01: f32 = @floatFromInt(src[(y1 * sw + x0) * 3 + c]);
+                const p11: f32 = @floatFromInt(src[(y1 * sw + x1) * 3 + c]);
+                const top = p00 * (1.0 - wx) + p10 * wx;
+                const bot = p01 * (1.0 - wx) + p11 * wx;
+                const v = top * (1.0 - wy) + bot * wy;
+                out[c * th * tw + oy * tw + ox] = v / 255.0;
+            }
+        }
+    }
+
+    const arr = mlx.mlx_array_new_data(out.ptr, &[_]c_int{ 1, 3, @intCast(th), @intCast(tw) }, 4, .float32);
+    _ = mlx.mlx_array_eval(arr);
+    return arr;
+}
+
 /// Load the LTX audio VAE + vocoder (`audio_vae.safetensors` + `vocoder.safetensors`,
 /// the q4 MLX-layout files from `dgrauet/ltx-2.3-mlx-q4`) from the model dir, or
 /// from `$LTX_AUDIO_DIR`. Both files absent → null (the video stays silent).
@@ -753,13 +925,78 @@ pub fn handleImage(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: 
     const seed: u64 = extractJsonInt(body, "seed") orelse 42;
     const steps: u32 = @intCast(extractJsonInt(body, "steps") orelse 4);
 
+    // img2img: `image` (base64 PNG/JPEG) + `strength` (0,1] — the source is
+    // resized to the resolved size, VAE-encoded, and partially renoised.
+    var init_img: ?mlx.mlx_array = null;
+    defer if (init_img) |ii| {
+        _ = mlx.mlx_array_free(ii);
+    };
+    var strength: f32 = 0.6;
+    if (extractJsonString(body, "image")) |raw_img| {
+        if (!engine.supportsImg2Img())
+            return sendError(conn, 400, "image-to-image needs the VAE encoder weights, which failed to load for this model");
+        if (extractJsonFloat(body, "strength")) |sv| {
+            if (!(sv > 0.0 and sv <= 1.0)) return sendError(conn, 400, "'strength' must be in (0,1]");
+            strength = @floatCast(sv);
+        }
+        const img_bytes = base64DecodeAlloc(allocator, raw_img) catch
+            return sendError(conn, 400, "invalid base64 in 'image'");
+        defer allocator.free(img_bytes);
+        init_img = decodeImageToBCHW(allocator, img_bytes, height, width) orelse
+            return sendError(conn, 400, "could not decode 'image' (PNG/JPEG supported)");
+        log.info("[image] img2img: source {d} bytes, strength={d:.2}\n", .{ img_bytes.len, strength });
+    }
+
+    // Conditioning rebalance: global gain + per-tapped-layer weights.
+    var cond_gain: f32 = 1.0;
+    if (extractJsonFloat(body, "cond_gain")) |g| {
+        if (!(g >= 0.0 and g <= 10.0)) return sendError(conn, 400, "'cond_gain' must be in [0,10]");
+        cond_gain = @floatCast(g);
+    }
+    var wbuf: [16]f32 = undefined;
+    var cond_weights: ?[]const f32 = null;
+    if (std.mem.indexOf(u8, body, "\"cond_weights\"") != null) {
+        const wl = extractCondWeights(body, &wbuf) orelse
+            return sendError(conn, 400, "invalid 'cond_weights' (numbers, comma/space separated, or a JSON array)");
+        if (wl.len != engine.condWeightCount()) {
+            var msg_buf: [128]u8 = undefined;
+            const msg = std.fmt.bufPrint(&msg_buf, "'cond_weights' needs exactly {d} values for this model (got {d})", .{ engine.condWeightCount(), wl.len }) catch "wrong 'cond_weights' count";
+            return sendError(conn, 400, msg);
+        }
+        cond_weights = wl;
+        log.info("[image] rebalance: gain={d:.2} weights={d}\n", .{ cond_gain, wl.len });
+    }
+
+    // Style LoRA: absolute path to a .safetensors adapter (+ optional scale).
+    // No `lora_path` in the request detaches whatever was attached before.
+    if (extractJsonString(body, "lora_path")) |lp_raw| {
+        const lp = try jsonUnescape(allocator, lp_raw);
+        defer allocator.free(lp);
+        const lscale: f32 = @floatCast(extractJsonFloat(body, "lora_scale") orelse 1.0);
+        const matched = engine.setLora(lp, lscale) catch |err| switch (err) {
+            error.LoraNoMatch => return sendError(conn, 400, "LoRA has no modules matching this model's DiT — wrong LoRA for this architecture?"),
+            error.BadLoraPath => return sendError(conn, 400, "'lora_path' must be an absolute path to a .safetensors file"),
+            error.OutOfMemory => return err,
+            else => return sendError(conn, 400, "failed to load the LoRA file"),
+        };
+        log.info("[image] lora: matched {d} modules from {s} (scale {d:.2})\n", .{ matched, lp, lscale });
+    } else {
+        _ = engine.setLora(null, 1.0) catch {};
+    }
+
     const want_stream = sse.bodyWantsTrue(body, "stream");
     log.info("[image] generating {d}x{d} steps={d} stream={}: {d} chars\n", .{ width, height, steps, want_stream, prompt.len });
     var sctx = sse.StreamCtx{ .conn = conn };
     const prog: ?sse.Progress = if (want_stream) sctx.progress() else null;
     if (want_stream) try conn.writeAll(sse.headers);
 
-    const img = engine.generateImage(allocator, prompt, width, height, seed, steps, prog) catch |err| {
+    const gen_opts = ImageGenOpts{
+        .init_image = init_img,
+        .strength = strength,
+        .cond_gain = cond_gain,
+        .cond_weights = cond_weights,
+    };
+    const img = engine.generateImage(allocator, prompt, width, height, seed, steps, gen_opts, prog) catch |err| {
         log.err("[image] generation failed: {}\n", .{err});
         if (want_stream) {
             sse.sendError(conn, "generation failed");
@@ -915,6 +1152,26 @@ pub const VideoGuiders = struct {
 };
 
 /// Reference per-pipeline guidance defaults, with per-request overrides:
+/// Audio-to-video pipeline gate: the reference a2vid pipelines are two-stage
+/// only (stage 1 needs real CFG against the frozen soundtrack; the distilled
+/// one-stage schedule was never trained with audio conditioning). Returns the
+/// 400 message, or null when the pipeline is allowed.
+pub fn a2vidPipelineError(pipeline: VideoPipeline) ?[]const u8 {
+    return switch (pipeline) {
+        .one_stage => "audio-to-video requires a two-stage pipeline — set \"pipeline\":\"two_stage\" or \"two_stage_hq\"",
+        .two_stage, .two_stage_hq => null,
+    };
+}
+
+/// Sample count (interleaved, all channels) to mux for a2vid: the ORIGINAL
+/// clip trimmed to the video duration — never longer than the clip itself.
+pub fn a2vidMuxSampleCount(pcm_len: usize, channels: u32, sample_rate: u32, video_frames: u32, fps: f32) usize {
+    if (channels == 0 or fps <= 0) return 0;
+    const dur_s = @as(f64, @floatFromInt(video_frames)) / @as(f64, fps);
+    const max_frames: usize = @intFromFloat(dur_s * @as(f64, @floatFromInt(sample_rate)));
+    return @min(pcm_len - pcm_len % channels, max_frames * channels);
+}
+
 /// `cfg_scale` (video), `cfg_audio_scale` (audio), `stg_scale`.
 pub fn videoGuiderDefaults(pipeline: VideoPipeline, cfg_video: ?f32, cfg_audio: ?f32, stg: ?f32) VideoGuiders {
     switch (pipeline) {
@@ -991,6 +1248,46 @@ pub fn handleVideo(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: 
             return sendError(conn, 400, "two-stage pipelines require spatial_upscaler_x2_v1_1.safetensors — download it into the model dir");
     }
 
+    // ── audio-to-video: `audio` is a base64 WAV (PCM16/24/f32, any rate,
+    // mono/stereo). Unlike `first_frame_image` this is NOT graceful — the user
+    // asked for THIS soundtrack, so a silent downgrade to generated audio
+    // would be a wrong result. Explicit 400s instead.
+    var audio_cond: ?mlx.mlx_array = null;
+    defer if (audio_cond) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    var a2v_pcm: ?wav_mod.Decoded = null; // original decode — muxed into the mp4
+    defer if (a2v_pcm) |d| allocator.free(d.pcm);
+    if (extractJsonString(body, "audio")) |raw_audio| {
+        const b64 = try jsonUnescape(allocator, raw_audio); // handles \/ from Swift
+        defer allocator.free(b64);
+        if (b64.len > 0) {
+            if (a2vidPipelineError(pipeline)) |msg| return sendError(conn, 400, msg);
+            if (engine.audio == null)
+                return sendError(conn, 400, "audio-to-video requires audio_vae.safetensors (encoder) — download it into the model dir");
+            const wav_bytes = base64DecodeAlloc(allocator, b64) catch
+                return sendError(conn, 400, "audio: invalid base64");
+            defer allocator.free(wav_bytes);
+            const dec = wav_mod.decode(allocator, wav_bytes) catch
+                return sendError(conn, 400, "audio: expected a PCM16/PCM24/float32 WAV");
+            a2v_pcm = dec;
+            // Conditioning path: stereo @ 16 kHz → mel → VAE encode → [1,Na,128],
+            // truncated to the video's token budget (the reference never pads).
+            const stereo = try wav_mod.toStereoInterleaved(allocator, dec.pcm, dec.channels);
+            defer allocator.free(stereo);
+            const cond_pcm = try wav_mod.resampleLinear(allocator, stereo, 2, dec.sample_rate, ltx_audio.COND_SAMPLE_RATE);
+            defer allocator.free(cond_pcm);
+            const max_tokens = ltx.computeAudioTokenCount(num_frames, frame_rate);
+            audio_cond = ltx_audio.encodeAudioCond(allocator, &engine.audio.?, cond_pcm, max_tokens, engine.s) catch |err| {
+                if (err == error.AudioTooShort)
+                    return sendError(conn, 400, "audio: clip too short (needs at least ~50 ms)");
+                log.err("[video] audio conditioning encode failed: {}\n", .{err});
+                return sendError(conn, 500, "audio: conditioning encode failed");
+            };
+            log.info("[video] audio-to-video: {d} tokens (budget {d}) from {d} Hz {d}ch clip\n", .{ mlx.getShape(audio_cond.?)[1], max_tokens, dec.sample_rate, dec.channels });
+        }
+    }
+
     const pos_ids = try ltxTokenizePadded(allocator, &engine.tok, prompt);
     defer allocator.free(pos_ids);
     const neg_ids = try ltxTokenizePadded(allocator, &engine.tok, LTX_NEGATIVE_PROMPT);
@@ -1060,7 +1357,7 @@ pub fn handleVideo(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: 
                 .swap_ctx = @ptrCast(&swapper),
                 .swap = Stage2Swap.swap,
             };
-            break :blk ltx.generateVideoFramesTwoStage(io, allocator, .{}, &engine.transformer, &engine.connector, &engine.vae, &engine.vae_encoder.?, cond_img_half, cond_img, engine.gemma_dir, pos_ids, neg_ids, LTX_PAD_ID, num_frames, height, width, frame_rate, opts, seed, guiders.vp, guiders.ap, prog, engine.s);
+            break :blk ltx.generateVideoFramesTwoStage(io, allocator, .{}, &engine.transformer, &engine.connector, &engine.vae, &engine.vae_encoder.?, cond_img_half, cond_img, audio_cond, engine.gemma_dir, pos_ids, neg_ids, LTX_PAD_ID, num_frames, height, width, frame_rate, opts, seed, guiders.vp, guiders.ap, prog, engine.s);
         },
     } catch |err| {
         log.err("[video] generation failed: {}\n", .{err});
@@ -1078,12 +1375,33 @@ pub fn handleVideo(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: 
     defer allocator.free(b64);
     _ = std.base64.standard.Encoder.encode(b64, frames.rgb);
 
-    // ── optional audio: decode the DiT audio latent → 16-bit PCM, base64 ──
+    // ── optional audio: decode the DiT audio latent → 16-bit PCM, base64.
+    // a2vid: the ORIGINAL input clip is muxed instead (reference behavior —
+    // higher fidelity than a VAE round-trip), trimmed to the video duration.
     var audio_b64: ?[]u8 = null;
     defer if (audio_b64) |a| allocator.free(a);
     var audio_sr: u32 = 0;
     var audio_ch: u32 = 0;
-    if (engine.audio) |*acomp| {
+    if (a2v_pcm) |dec| {
+        // >2-channel sources downmix to stereo (the client's mux path only
+        // builds mono/stereo layouts).
+        const mux_pcm: []const f32 = if (dec.channels > 2)
+            try wav_mod.toStereoInterleaved(allocator, dec.pcm, dec.channels)
+        else
+            dec.pcm;
+        defer if (dec.channels > 2) allocator.free(@constCast(mux_pcm));
+        const mux_ch: u32 = @min(dec.channels, 2);
+        const n = a2vidMuxSampleCount(mux_pcm.len, mux_ch, dec.sample_rate, frames.frames, frame_rate);
+        const pcm = try f32ToPcm16leBytes(allocator, mux_pcm[0..n]);
+        defer allocator.free(pcm);
+        const al_len = std.base64.standard.Encoder.calcSize(pcm.len);
+        const ab = try allocator.alloc(u8, al_len);
+        _ = std.base64.standard.Encoder.encode(ab, pcm);
+        audio_b64 = ab;
+        audio_sr = dec.sample_rate;
+        audio_ch = mux_ch;
+        log.info("[video] -> original audio passthrough {d} samples {d}ch {d}Hz\n", .{ n / mux_ch, mux_ch, dec.sample_rate });
+    } else if (engine.audio) |*acomp| {
         if (frames.audio_latent) |al| {
             if (ltx_audio.decodeAudio(allocator, acomp, al, engine.s)) |wav_v| {
                 var wav = wav_v;
@@ -1318,6 +1636,53 @@ fn extractJsonFloat(body: []const u8, key: []const u8) ?f64 {
     while (i < body.len and (std.ascii.isDigit(body[i]) or body[i] == '.')) i += 1;
     if (i == start) return null;
     return std.fmt.parseFloat(f64, body[start..i]) catch null;
+}
+
+/// Parse a comma/whitespace-separated float list ("1,2,3" / "0.5 1 -2") into
+/// `buf`. Empty tokens are skipped; any unparseable token or more values than
+/// `buf` holds → null. Returns the filled slice of `buf`.
+fn parseFloatList(text: []const u8, buf: []f32) ?[]f32 {
+    var n: usize = 0;
+    var it = std.mem.tokenizeAny(u8, text, ", \t\r\n");
+    while (it.next()) |tok| {
+        if (n >= buf.len) return null;
+        buf[n] = std.fmt.parseFloat(f32, tok) catch return null;
+        if (!std.math.isFinite(buf[n])) return null;
+        n += 1;
+    }
+    if (n == 0) return null;
+    return buf[0..n];
+}
+
+/// Map an img2img strength onto the denoise schedule: skip the first
+/// `steps - round(steps·strength)` steps (diffusers convention: strength 1 →
+/// full schedule from pure noise; low strength → few steps, small change).
+/// Clamped so at least one step always runs.
+fn img2imgStartStep(steps: u32, strength: f32) u32 {
+    const fsteps: f32 = @floatFromInt(steps);
+    const run: u32 = @intFromFloat(@round(fsteps * std.math.clamp(strength, 0.0, 1.0)));
+    const start = steps -| run;
+    return @min(start, steps -| 1);
+}
+
+/// Extract the `cond_weights` request field: either a JSON number array
+/// (`[1, 0.5, …]`) or a comma/space-separated string (`"1 0.5 …"`).
+fn extractCondWeights(body: []const u8, buf: []f32) ?[]f32 {
+    var key_pat_buf: [64]u8 = undefined;
+    const key_pat = std.fmt.bufPrint(&key_pat_buf, "\"{s}\"", .{"cond_weights"}) catch return null;
+    const ki = std.mem.indexOf(u8, body, key_pat) orelse return null;
+    var i = ki + key_pat.len;
+    while (i < body.len and (body[i] == ' ' or body[i] == ':' or body[i] == '\t')) i += 1;
+    if (i >= body.len) return null;
+    if (body[i] == '[') {
+        const end = std.mem.indexOfScalarPos(u8, body, i + 1, ']') orelse return null;
+        return parseFloatList(body[i + 1 .. end], buf);
+    }
+    if (body[i] == '"') {
+        const end = std.mem.indexOfScalarPos(u8, body, i + 1, '"') orelse return null;
+        return parseFloatList(body[i + 1 .. end], buf);
+    }
+    return null;
 }
 
 /// Base64-decode (standard alphabet) into an owned buffer.
@@ -1563,6 +1928,25 @@ test "videoGuiderDefaults mirrors the reference per-pipeline guidance" {
     try testing.expect(!hq_stg.vp.needsPerturbed()); // no blocks → no perturbed forward
 }
 
+test "a2vid pipeline gate: one-stage rejected, two-stage variants allowed" {
+    try testing.expect(a2vidPipelineError(.one_stage) != null);
+    try testing.expect(a2vidPipelineError(.two_stage) == null);
+    try testing.expect(a2vidPipelineError(.two_stage_hq) == null);
+}
+
+test "a2vidMuxSampleCount trims to video duration and never exceeds the clip" {
+    // 10 s stereo 48 kHz clip, 4 s of video (97 frames @ 24 fps ≈ 4.0417 s).
+    const clip: usize = 10 * 48000 * 2;
+    const n = a2vidMuxSampleCount(clip, 2, 48000, 97, 24.0);
+    try testing.expectEqual(@as(usize, 194000 * 2), n); // floor(97/24*48000)*2
+    // Clip shorter than the video → the whole clip, channel-aligned.
+    try testing.expectEqual(@as(usize, 8000), a2vidMuxSampleCount(8000, 2, 48000, 97, 24.0));
+    try testing.expectEqual(@as(usize, 8000), a2vidMuxSampleCount(8001, 2, 48000, 97, 24.0));
+    // Degenerate inputs
+    try testing.expectEqual(@as(usize, 0), a2vidMuxSampleCount(100, 0, 48000, 97, 24.0));
+    try testing.expectEqual(@as(usize, 0), a2vidMuxSampleCount(100, 2, 48000, 97, 0.0));
+}
+
 test "LTX negative prompt keeps the reference audio negatives (speech guidance)" {
     // The audio tail of the reference DEFAULT_NEGATIVE_PROMPT does real work
     // for dialogue: with audio CFG active (two-stage, ap.cfg=7.0) these terms
@@ -1585,9 +1969,73 @@ test "LTX negative prompt keeps the reference audio negatives (speech guidance)"
     }
 }
 
+test "LTX negative prompt suppresses burned-in subtitles/captions (quoted-dialogue class)" {
+    // Quoted dialogue in the prompt is LTX's speech trigger, but the model
+    // also reads quotes as ON-SCREEN TEXT and burns scrambled subtitle-like
+    // captions into the frame. These terms steer CFG away from that failure
+    // (they only act when a guider runs the negative forward — two-stage, or
+    // cfg > 1). They must sit BEFORE the audio tail so an overflow
+    // left-truncation sheds them ahead of the load-bearing speech negatives;
+    // the full prompt encodes to ~229 gemma tokens, under the 256 pad.
+    const subtitle_negatives = [_][]const u8{
+        "subtitles",
+        "closed captions",
+        "burned-in captions",
+        "on-screen text",
+        "text overlay",
+        "lower thirds",
+        "karaoke-style lyrics",
+        "watermark",
+    };
+    for (subtitle_negatives) |term| {
+        try testing.expect(std.mem.indexOf(u8, LTX_NEGATIVE_PROMPT, term) != null);
+    }
+    const first_audio = std.mem.indexOf(u8, LTX_NEGATIVE_PROMPT, "mismatched lip sync").?;
+    for (subtitle_negatives) |term| {
+        try testing.expect(std.mem.indexOf(u8, LTX_NEGATIVE_PROMPT, term).? < first_audio);
+    }
+}
+
 test "fileExists guards non-absolute paths (openFileAbsolute UB class)" {
     const io = std.Io.Threaded.global_single_threaded.io();
     // Relative and empty paths must return false, not hit the stdlib assert.
     try testing.expect(!fileExists(io, "relative/path.safetensors"));
     try testing.expect(!fileExists(io, ""));
+}
+
+test "parseFloatList splits on commas/spaces and rejects garbage" {
+    var buf: [16]f32 = undefined;
+    const a = parseFloatList("1,2,3", &buf).?;
+    try testing.expectEqual(@as(usize, 3), a.len);
+    try testing.expectEqual(@as(f32, 2.0), a[1]);
+    const b = parseFloatList("  0.5 1.25\t-2 ", &buf).?;
+    try testing.expectEqual(@as(usize, 3), b.len);
+    try testing.expectEqual(@as(f32, -2.0), b[2]);
+    const c = parseFloatList("1, 2,, 3", &buf).?; // empty tokens skipped
+    try testing.expectEqual(@as(usize, 3), c.len);
+    try testing.expect(parseFloatList("1,x,3", &buf) == null);
+    try testing.expect(parseFloatList("", &buf) == null);
+    try testing.expect(parseFloatList("1 2 3 4 5 6 7 8 9 10 11 12 13 14 15 16 17", &buf) == null); // > buf.len
+}
+
+test "img2imgStartStep maps strength onto the schedule (diffusers convention)" {
+    // strength 1.0 → start at 0 (≈ full noise); 0.5 on 8 steps → skip 4;
+    // tiny strength still runs at least 1 step.
+    try testing.expectEqual(@as(u32, 0), img2imgStartStep(8, 1.0));
+    try testing.expectEqual(@as(u32, 4), img2imgStartStep(8, 0.5));
+    try testing.expectEqual(@as(u32, 6), img2imgStartStep(8, 0.25));
+    try testing.expectEqual(@as(u32, 7), img2imgStartStep(8, 0.01));
+    try testing.expectEqual(@as(u32, 2), img2imgStartStep(4, 0.6));
+    try testing.expectEqual(@as(u32, 0), img2imgStartStep(1, 0.3));
+}
+
+test "extractCondWeights accepts a JSON array or a separated string" {
+    var buf: [16]f32 = undefined;
+    const a = extractCondWeights("{\"cond_weights\":[1, 2.5, -3]}", &buf).?;
+    try testing.expectEqual(@as(usize, 3), a.len);
+    try testing.expectEqual(@as(f32, 2.5), a[1]);
+    const b = extractCondWeights("{\"cond_weights\":\"1 1 1 1\"}", &buf).?;
+    try testing.expectEqual(@as(usize, 4), b.len);
+    try testing.expect(extractCondWeights("{}", &buf) == null);
+    try testing.expect(extractCondWeights("{\"cond_weights\":[1,bad]}", &buf) == null);
 }

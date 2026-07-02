@@ -37,9 +37,12 @@ test {
     _ = @import("tts.zig");
     _ = @import("flux.zig");
     _ = @import("krea.zig");
+    _ = @import("lora.zig");
     _ = @import("nsfw.zig");
     _ = @import("ltx_video.zig");
     _ = @import("ltx_audio.zig");
     _ = @import("png.zig");
     _ = @import("gen.zig");
+    _ = @import("ollama.zig");
+    _ = @import("cli.zig");
 }

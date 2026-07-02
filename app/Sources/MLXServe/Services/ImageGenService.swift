@@ -53,14 +53,11 @@ final class ImageGenService: ObservableObject {
         log = []
 
         let outputPath = Self.makeOutputPath(prompt: request.prompt)
-        let prompt = request.prompt
-        let size = "\(request.width)x\(request.height)"
         let steps = request.steps
         // Send a concrete seed so "random" (-1) actually varies; the server
         // otherwise defaults to a fixed seed.
         let seedToSend = request.seed >= 0 ? request.seed : Int.random(in: 0...0xFFFF_FFFF)
         let keep = request.keepResident
-        let safeMode = request.safeMode
 
         task = Task {
             var loadedId: String? = nil
@@ -76,8 +73,7 @@ final class ImageGenService: ObservableObject {
                 // SSE: per-step `progress` events drive a determinate bar, then a
                 // `complete` event carries the PNG.
                 var png: Data? = nil
-                var genJson: [String: Any] = ["model": info.name, "prompt": prompt, "size": size, "steps": steps, "seed": seedToSend]
-                if !safeMode { genJson["safety"] = false }  // opt out of the server NSFW filter
+                let genJson = Self.requestJson(for: request, modelName: info.name, seed: seedToSend)
                 for try await ev in api.streamGeneration(
                     port: port, path: "/v1/images/generations",
                     json: genJson) {
@@ -143,7 +139,6 @@ final class ImageGenService: ObservableObject {
         }
 
         let outputPath = Self.makeOutputPath(prompt: request.prompt)
-        let size = "\(request.width)x\(request.height)"
         let seedToSend = request.seed >= 0 ? request.seed : Int.random(in: 0...0xFFFF_FFFF)
         let keep = request.keepResident
 
@@ -155,9 +150,7 @@ final class ImageGenService: ObservableObject {
         }
         do {
             var png: Data? = nil
-            var genJson: [String: Any] = ["model": info.name, "prompt": request.prompt,
-                                          "size": size, "steps": request.steps, "seed": seedToSend]
-            if !request.safeMode { genJson["safety"] = false }
+            let genJson = Self.requestJson(for: request, modelName: info.name, seed: seedToSend)
             for try await ev in api.streamGeneration(
                 port: port, path: "/v1/images/generations", json: genJson) {
                 switch ev["type"] as? String {
@@ -174,6 +167,38 @@ final class ImageGenService: ObservableObject {
             await releaseIfNeeded()
             throw error
         }
+    }
+
+    /// Build the `/v1/images/generations` body for a request. Pure + static so
+    /// the contract is unit-testable: plain text-to-image bodies carry ONLY the
+    /// classic fields; img2img (`image`+`strength`), conditioning rebalance
+    /// (`cond_gain`+`cond_weights`), and LoRA (`lora_path`+`lora_scale`) are
+    /// added only when set, so the server sees no behavior change otherwise.
+    static func requestJson(for request: ImageGenRequest, modelName: String, seed: Int) -> [String: Any] {
+        var json: [String: Any] = [
+            "model": modelName,
+            "prompt": request.prompt,
+            "size": "\(request.width)x\(request.height)",
+            "steps": request.steps,
+            "seed": seed,
+        ]
+        if !request.safeMode { json["safety"] = false }
+        if let src = request.initImagePath,
+           let data = FileManager.default.contents(atPath: src) {
+            json["image"] = data.base64EncodedString()
+            json["strength"] = request.strength
+        }
+        if request.condGain != 1.0 { json["cond_gain"] = request.condGain }
+        if !request.condWeightsText.trimmingCharacters(in: .whitespaces).isEmpty,
+           let weights = ImageGenRequest.parseCondWeights(request.condWeightsText),
+           weights.count == request.condWeightCount {
+            json["cond_weights"] = weights
+        }
+        if let lora = request.loraPath, !lora.isEmpty {
+            json["lora_path"] = lora
+            if request.loraScale != 1.0 { json["lora_scale"] = request.loraScale }
+        }
+        return json
     }
 
     /// Extract the base64 PNG from an OpenAI `{data:[{b64_json}]}` response body.

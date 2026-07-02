@@ -2334,6 +2334,13 @@ pub fn ditForward(
     // Nv video tokens. When non-null the VIDEO stream's AdaLN runs PER-TOKEN
     // (clean tokens get timestep 0 → unmodulated); null → scalar t2v (unchanged).
     cond_mask: ?[]const f32,
+    // a2vid frozen-audio conditioning: a separate SCALAR timestep for the AUDIO
+    // stream (0.0 = clean/frozen). Mirrors the reference `audio_timesteps`
+    // per-token branch for the uniform case: ONLY audio_adaln_single (which
+    // also feeds the audio output head) and av_ca_audio switch to it — the
+    // v2a/a2v gates and audio-prompt AdaLN stay on the global sigma
+    // (model.py:260-263). null → audio shares `sigma` (unchanged).
+    audio_sigma: ?f32,
     ptb: DitPerturb,
     s: S,
 ) !BlockOut {
@@ -2376,10 +2383,20 @@ pub fn ditForward(
     defer _ = mlx.mlx_array_free(v_ada.embedded);
     defer _ = mlx.mlx_array_free(v_avca.params);
     defer _ = mlx.mlx_array_free(v_avca.embedded);
-    const a_ada = try ditAdaLNSingle(comp, alloc, t_sin, "transformer.audio_adaln_single", s);
+    // Audio AdaLN sinusoid: the global t_sin, or the a2vid audio-scalar one.
+    var t_sin_a = t_sin;
+    var t_sin_a_owned = false;
+    defer if (t_sin_a_owned) {
+        _ = mlx.mlx_array_free(t_sin_a);
+    };
+    if (audio_sigma) |asig| {
+        t_sin_a = try ditTimestepSinusoid(asig * cfg.timestep_scale, 256, s);
+        t_sin_a_owned = true;
+    }
+    const a_ada = try ditAdaLNSingle(comp, alloc, t_sin_a, "transformer.audio_adaln_single", s);
     defer _ = mlx.mlx_array_free(a_ada.params);
     defer _ = mlx.mlx_array_free(a_ada.embedded);
-    const a_avca = try ditAdaLNSingle(comp, alloc, t_sin, "transformer.av_ca_audio_scale_shift_adaln_single", s);
+    const a_avca = try ditAdaLNSingle(comp, alloc, t_sin_a, "transformer.av_ca_audio_scale_shift_adaln_single", s);
     defer _ = mlx.mlx_array_free(a_avca.params);
     defer _ = mlx.mlx_array_free(a_avca.embedded);
     const a2v_gate = try ditAdaLNSingle(comp, alloc, t_sin_gate, "transformer.av_ca_a2v_gate_adaln_single", s);
@@ -2620,12 +2637,15 @@ fn guiderCalculate(cond: mlx.mlx_array, uncond: ?mlx.mlx_array, ptb: ?mlx.mlx_ar
 /// `cond_mask` is present the VIDEO x0 uses PER-TOKEN sigma (`mask*sigma`) so
 /// clean tokens (mask=0) get x0 = x_t (unchanged), matching X0Model's per-token
 /// path. Audio always uses scalar sigma.
-fn ditX0(comp: *const Component, alloc: std.mem.Allocator, cfg: LtxConfig, vx: mlx.mlx_array, ax: mlx.mlx_array, sigma: f32, vtext: mlx.mlx_array, atext: mlx.mlx_array, vpos: []const f32, apos: []const f32, cond_mask: ?[]const f32, ptb: DitPerturb, s: S) !BlockOut {
-    const vel = try ditForward(comp, alloc, cfg, vx, ax, sigma, vtext, atext, vpos, apos, cond_mask, ptb, s);
+fn ditX0(comp: *const Component, alloc: std.mem.Allocator, cfg: LtxConfig, vx: mlx.mlx_array, ax: mlx.mlx_array, sigma: f32, vtext: mlx.mlx_array, atext: mlx.mlx_array, vpos: []const f32, apos: []const f32, cond_mask: ?[]const f32, audio_sigma: ?f32, ptb: DitPerturb, s: S) !BlockOut {
+    const vel = try ditForward(comp, alloc, cfg, vx, ax, sigma, vtext, atext, vpos, apos, cond_mask, audio_sigma, ptb, s);
     defer _ = mlx.mlx_array_free(vel.v);
     defer _ = mlx.mlx_array_free(vel.a);
     const sig = mlx.mlx_array_new_float(sigma);
     defer _ = mlx.mlx_array_free(sig);
+    // Audio x0 sigma: the a2vid scalar when set (0.0 → x0 = x_t, frozen).
+    const sig_a = mlx.mlx_array_new_float(audio_sigma orelse sigma);
+    defer _ = mlx.mlx_array_free(sig_a);
     // Video sigma: scalar `sig`, or per-token `[1,Nv,1]` = mask*sigma.
     var vsig = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(vsig);
@@ -2652,7 +2672,7 @@ fn ditX0(comp: *const Component, alloc: std.mem.Allocator, cfg: LtxConfig, vx: m
     try mlx.check(mlx.mlx_astype(&x0v, x0vf, .bfloat16, s));
     var sa = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(sa);
-    try mlx.check(mlx.mlx_multiply(&sa, vel.a, sig, s));
+    try mlx.check(mlx.mlx_multiply(&sa, vel.a, sig_a, s));
     var x0af = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(x0af);
     try mlx.check(mlx.mlx_subtract(&x0af, ax, sa, s));
@@ -2700,9 +2720,16 @@ fn ditX0Guided(
     cond_mask: ?[]const f32,
     clean_v: ?mlx.mlx_array,
     mask_dev: ?mlx.mlx_array,
+    // a2vid frozen-audio conditioning: the clean (encoded) audio tokens. When
+    // set, every forward runs the audio stream at timestep 0 and the audio x0
+    // is pinned to these tokens (an all-zeros audio denoise mask in reference
+    // terms) — the audio stream conditions video through attention but is
+    // never regenerated.
+    frozen_a: ?mlx.mlx_array,
     s: S,
 ) !BlockOut {
-    const cond = try ditX0(comp, alloc, cfg, vx, ax, sigma, cond_v, cond_a, video_pos, audio_pos, cond_mask, .{}, s);
+    const audio_sigma: ?f32 = if (frozen_a != null) 0.0 else null;
+    const cond = try ditX0(comp, alloc, cfg, vx, ax, sigma, cond_v, cond_a, video_pos, audio_pos, cond_mask, audio_sigma, .{}, s);
     defer _ = mlx.mlx_array_free(cond.v);
     defer _ = mlx.mlx_array_free(cond.a);
 
@@ -2714,7 +2741,7 @@ fn ditX0Guided(
         _ = mlx.mlx_array_free(n.a);
     };
     if (vp.needsUncond() or ap.needsUncond()) {
-        neg = try ditX0(comp, alloc, cfg, vx, ax, sigma, neg_v orelse cond_v, neg_a orelse cond_a, video_pos, audio_pos, cond_mask, .{}, s);
+        neg = try ditX0(comp, alloc, cfg, vx, ax, sigma, neg_v orelse cond_v, neg_a orelse cond_a, video_pos, audio_pos, cond_mask, audio_sigma, .{}, s);
     }
 
     // STG-perturbed forward (skip self-attn in the guiders' blocks; one forward
@@ -2729,7 +2756,7 @@ fn ditX0Guided(
             .stg_video_blocks = if (vp.needsPerturbed()) vp.stg_blocks else &.{},
             .stg_audio_blocks = if (ap.needsPerturbed()) ap.stg_blocks else &.{},
         };
-        ptb = try ditX0(comp, alloc, cfg, vx, ax, sigma, cond_v, cond_a, video_pos, audio_pos, cond_mask, perturb, s);
+        ptb = try ditX0(comp, alloc, cfg, vx, ax, sigma, cond_v, cond_a, video_pos, audio_pos, cond_mask, audio_sigma, perturb, s);
     }
 
     // Isolated-modality forward (drop A2V + V2A cross-attention everywhere).
@@ -2739,19 +2766,28 @@ fn ditX0Guided(
         _ = mlx.mlx_array_free(m.a);
     };
     if (vp.needsModality() or ap.needsModality()) {
-        mod = try ditX0(comp, alloc, cfg, vx, ax, sigma, cond_v, cond_a, video_pos, audio_pos, cond_mask, .{ .skip_av_cross = true }, s);
+        mod = try ditX0(comp, alloc, cfg, vx, ax, sigma, cond_v, cond_a, video_pos, audio_pos, cond_mask, audio_sigma, .{ .skip_av_cross = true }, s);
     }
 
     var v_x0 = try guiderCalculate(cond.v, if (neg) |n| n.v else null, if (ptb) |p| p.v else null, if (mod) |m| m.v else null, vp, s);
     errdefer _ = mlx.mlx_array_free(v_x0);
-    const a_x0 = try guiderCalculate(cond.a, if (neg) |n| n.a else null, if (ptb) |p| p.a else null, if (mod) |m| m.a else null, ap, s);
+    var a_x0 = try guiderCalculate(cond.a, if (neg) |n| n.a else null, if (ptb) |p| p.a else null, if (mod) |m| m.a else null, ap, s);
+    errdefer _ = mlx.mlx_array_free(a_x0);
 
     // Pin the conditioned (clean) video tokens to the reference latent (I2V);
-    // audio is never conditioned, so its mask is all-ones — a no-op we skip.
+    // without I2V the video mask is all-ones — a no-op we skip.
     if (cond_mask != null) {
         const blended = try applyDenoiseMask(v_x0, clean_v.?, mask_dev.?, s);
         _ = mlx.mlx_array_free(v_x0);
         v_x0 = blended;
+    }
+    // a2vid: the audio denoise mask is all-ZEROS — the blend is a full
+    // replacement with the clean tokens (apply_denoise_mask with mask=0).
+    if (frozen_a) |fa| {
+        _ = mlx.mlx_array_free(a_x0);
+        var pinned = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_array_set(&pinned, fa));
+        a_x0 = pinned;
     }
     return .{ .v = v_x0, .a = a_x0 };
 }
@@ -2781,6 +2817,9 @@ pub fn ditSampleCfg(
     // are pinned each step via `applyDenoiseMask` before the Euler step.
     cond_mask: ?[]const f32,
     clean_v: ?mlx.mlx_array,
+    // a2vid: clean audio tokens to freeze through the loop (caller passes them
+    // as `noise_a` too — clean is the loop's exact fixed point).
+    frozen_a: ?mlx.mlx_array,
     progress: ?Progress,
     win: ProgressWindow,
     s: S,
@@ -2804,7 +2843,7 @@ pub fn ditSampleCfg(
     while (i + 1 < sigmas.len) : (i += 1) {
         const sigma = sigmas[i];
         const sigma_next = sigmas[i + 1];
-        const x0 = try ditX0Guided(comp, alloc, cfg, vx, ax, sigma, cond_v, cond_a, neg_v, neg_a, vp, ap, video_pos, audio_pos, cond_mask, clean_v, if (cond_mask != null) mask_dev else null, s);
+        const x0 = try ditX0Guided(comp, alloc, cfg, vx, ax, sigma, cond_v, cond_a, neg_v, neg_a, vp, ap, video_pos, audio_pos, cond_mask, clean_v, if (cond_mask != null) mask_dev else null, frozen_a, s);
         defer _ = mlx.mlx_array_free(x0.v);
         defer _ = mlx.mlx_array_free(x0.a);
         const nvx = try eulerStep(vx, x0.v, sigma, sigma_next, s);
@@ -3051,6 +3090,10 @@ pub fn ditSampleRes2s(
     ap: GuiderParams,
     cond_mask: ?[]const f32,
     clean_v: ?mlx.mlx_array,
+    // a2vid frozen audio: clean tokens re-pinned at every prediction (the
+    // reference res2s keeps SDE-noising the traveling audio latent but its x0
+    // is always the clean tokens at audio timestep 0).
+    frozen_a: ?mlx.mlx_array,
     seed: u64,
     progress: ?Progress,
     win: ProgressWindow,
@@ -3097,7 +3140,7 @@ pub fn ditSampleRes2s(
         const sub_sigma: f32 = @floatCast(@sqrt(@as(f64, sigma) * @as(f64, sigma_next)));
 
         // Stage 1: predict at the current point.
-        const d1 = try res2sPredict(comp, alloc, cfg, vx, ax, sigma, cond_v, cond_a, neg_v, neg_a, vp, ap, video_pos, audio_pos, cond_mask, clean_v, mask_opt, s);
+        const d1 = try res2sPredict(comp, alloc, cfg, vx, ax, sigma, cond_v, cond_a, neg_v, neg_a, vp, ap, video_pos, audio_pos, cond_mask, clean_v, mask_opt, frozen_a, s);
         defer _ = mlx.mlx_array_free(d1.v);
         defer _ = mlx.mlx_array_free(d1.a);
 
@@ -3149,7 +3192,7 @@ pub fn ditSampleRes2s(
         }
 
         // Stage 2: predict at the substep.
-        const d2 = try res2sPredict(comp, alloc, cfg, x_mid_v, x_mid_a, sub_sigma, cond_v, cond_a, neg_v, neg_a, vp, ap, video_pos, audio_pos, cond_mask, clean_v, mask_opt, s);
+        const d2 = try res2sPredict(comp, alloc, cfg, x_mid_v, x_mid_a, sub_sigma, cond_v, cond_a, neg_v, neg_a, vp, ap, video_pos, audio_pos, cond_mask, clean_v, mask_opt, frozen_a, s);
         defer _ = mlx.mlx_array_free(d2.v);
         defer _ = mlx.mlx_array_free(d2.a);
         var eps2_v = mlx.mlx_array_new();
@@ -3189,7 +3232,7 @@ pub fn ditSampleRes2s(
 
     // Terminal cleanup: one last x0 prediction at the injected minimal sigma.
     if (terminal_zero) {
-        const x0 = try res2sPredict(comp, alloc, cfg, vx, ax, sigmas[n_full_steps], cond_v, cond_a, neg_v, neg_a, vp, ap, video_pos, audio_pos, cond_mask, clean_v, mask_opt, s);
+        const x0 = try res2sPredict(comp, alloc, cfg, vx, ax, sigmas[n_full_steps], cond_v, cond_a, neg_v, neg_a, vp, ap, video_pos, audio_pos, cond_mask, clean_v, mask_opt, frozen_a, s);
         _ = mlx.mlx_array_free(vx);
         _ = mlx.mlx_array_free(ax);
         vx = x0.v;
@@ -3203,12 +3246,12 @@ pub fn ditSampleRes2s(
 }
 
 /// Guided x0 prediction on f32 latents (res2s loop body): bf16 forward, f32 out.
-fn res2sPredict(comp: *const Component, alloc: std.mem.Allocator, cfg: LtxConfig, vx_f32: mlx.mlx_array, ax_f32: mlx.mlx_array, sigma: f32, cond_v: mlx.mlx_array, cond_a: mlx.mlx_array, neg_v: ?mlx.mlx_array, neg_a: ?mlx.mlx_array, vp: GuiderParams, ap: GuiderParams, video_pos: []const f32, audio_pos: []const f32, cond_mask: ?[]const f32, clean_v: ?mlx.mlx_array, mask_dev: ?mlx.mlx_array, s: S) !BlockOut {
+fn res2sPredict(comp: *const Component, alloc: std.mem.Allocator, cfg: LtxConfig, vx_f32: mlx.mlx_array, ax_f32: mlx.mlx_array, sigma: f32, cond_v: mlx.mlx_array, cond_a: mlx.mlx_array, neg_v: ?mlx.mlx_array, neg_a: ?mlx.mlx_array, vp: GuiderParams, ap: GuiderParams, video_pos: []const f32, audio_pos: []const f32, cond_mask: ?[]const f32, clean_v: ?mlx.mlx_array, mask_dev: ?mlx.mlx_array, frozen_a: ?mlx.mlx_array, s: S) !BlockOut {
     const vb = try asBf16(vx_f32, s);
     defer _ = mlx.mlx_array_free(vb);
     const ab = try asBf16(ax_f32, s);
     defer _ = mlx.mlx_array_free(ab);
-    const x0 = try ditX0Guided(comp, alloc, cfg, vb, ab, sigma, cond_v, cond_a, neg_v, neg_a, vp, ap, video_pos, audio_pos, cond_mask, clean_v, mask_dev, s);
+    const x0 = try ditX0Guided(comp, alloc, cfg, vb, ab, sigma, cond_v, cond_a, neg_v, neg_a, vp, ap, video_pos, audio_pos, cond_mask, clean_v, mask_dev, frozen_a, s);
     defer _ = mlx.mlx_array_free(x0.v);
     defer _ = mlx.mlx_array_free(x0.a);
     return .{ .v = try asF32(x0.v, s), .a = try asF32(x0.a, s) };
@@ -3804,7 +3847,7 @@ pub fn generateVideoFrames(
 
     // ── denoise ──
     const total_steps: u32 = @intCast(sigmas.len - 1);
-    const final = try ditSampleCfg(transformer, alloc, cfg, sampler_v, noise_a, pos.video, pos.audio, if (neg) |n| n.video else null, if (neg) |n| n.audio else null, vpos, apos, sigmas, vp, ap, cond_mask, clean_v, progress, .{ .label = "Generating", .base = 0, .total = total_steps }, s);
+    const final = try ditSampleCfg(transformer, alloc, cfg, sampler_v, noise_a, pos.video, pos.audio, if (neg) |n| n.video else null, if (neg) |n| n.audio else null, vpos, apos, sigmas, vp, ap, cond_mask, clean_v, null, progress, .{ .label = "Generating", .base = 0, .total = total_steps }, s);
     defer _ = mlx.mlx_array_free(final.v);
     // final.a (audio latent [1, Na, 128]) is transferred to the caller below for
     // optional audio decode; if anything fails before then, free it.
@@ -3918,6 +3961,11 @@ pub fn generateVideoFramesTwoStage(
     vae_encoder: *const Component,
     cond_image_half: ?mlx.mlx_array,
     cond_image_full: ?mlx.mlx_array,
+    // a2vid: encoded clean audio tokens [1,Na,128] (encodeAudioCond). Stage 1
+    // FREEZES them (audio timestep 0, x0 pinned) so the video is generated
+    // against the real soundtrack; stage 2 renoises + jointly refines exactly
+    // like t2v. null → normal t2v/i2v audio generation.
+    audio_cond: ?mlx.mlx_array,
     gemma_dir: []const u8,
     pos_ids: []const i32,
     neg_ids: []const i32,
@@ -3941,7 +3989,10 @@ pub fn generateVideoFramesTwoStage(
     const H2 = H1 * 2;
     const W2 = W1 * 2;
     const Nv2 = F * H2 * W2;
-    const Na = computeAudioTokenCount(num_frames, frame_rate);
+    // a2vid: the conditioning clip may be SHORTER than the video's token
+    // budget (the reference truncates the latent but never pads) — the token
+    // count, and therefore the positions, follow the actual audio.
+    const Na: u32 = if (audio_cond) |ac| @intCast(mlx.getShape(ac)[1]) else computeAudioTokenCount(num_frames, frame_rate);
     const n_stage2: u32 = if (opts.stage2_steps == 0) STAGE_2_SIGMAS.len - 1 else @min(opts.stage2_steps, STAGE_2_SIGMAS.len - 1);
     const total: u32 = opts.stage1_steps + n_stage2;
     log.info("[ltx] two-stage{s}: stage1 {d}x{d} (Nv={d}) {d} steps, stage2 {d}x{d} (Nv={d}) {d} steps\n", .{ if (opts.hq) " HQ" else "", H1 * 32, W1 * 32, Nv1, opts.stage1_steps, H2 * 32, W2 * 32, Nv2, n_stage2 });
@@ -3970,8 +4021,17 @@ pub fn generateVideoFramesTwoStage(
 
     const noise_v1 = try mlxRandomNormal(&[_]c_int{ 1, @intCast(Nv1), 128 }, seed, s);
     defer _ = mlx.mlx_array_free(noise_v1);
-    const noise_a = try mlxRandomNormal(&[_]c_int{ 1, @intCast(Na), 128 }, seed + 1, s);
+    // a2vid: stage 1's audio latent STARTS clean and stays frozen (reference
+    // audio_state_1: latent = clean tokens, denoise_mask = 0). t2v: noise.
+    const noise_a = if (audio_cond) |ac| blk: {
+        var c = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_array_set(&c, ac));
+        break :blk c;
+    } else try mlxRandomNormal(&[_]c_int{ 1, @intCast(Na), 128 }, seed + 1, s);
     defer _ = mlx.mlx_array_free(noise_a);
+    // Frozen audio must not be guided (reference a2vid stage 1: audio guider =
+    // defaults). Structural, not caller-optional.
+    const ap1: GuiderParams = if (audio_cond != null) .{} else ap;
 
     var cond1: ?I2VCond = null;
     defer if (cond1) |*c| c.deinit(alloc);
@@ -3984,9 +4044,9 @@ pub fn generateVideoFramesTwoStage(
     const stage1_v = if (cond1) |c| c.init_latent else noise_v1;
     const win1 = ProgressWindow{ .label = "Stage 1", .base = 0, .total = total };
     const out1 = if (opts.hq)
-        try ditSampleRes2s(transformer, alloc, cfg, stage1_v, noise_a, pos.video, pos.audio, if (neg) |n| n.video else null, if (neg) |n| n.audio else null, vpos1, apos, sigmas1, vp, ap, if (cond1) |c| c.mask else null, if (cond1) |c| c.clean else null, seed, progress, win1, s)
+        try ditSampleRes2s(transformer, alloc, cfg, stage1_v, noise_a, pos.video, pos.audio, if (neg) |n| n.video else null, if (neg) |n| n.audio else null, vpos1, apos, sigmas1, vp, ap1, if (cond1) |c| c.mask else null, if (cond1) |c| c.clean else null, audio_cond, seed, progress, win1, s)
     else
-        try ditSampleCfg(transformer, alloc, cfg, stage1_v, noise_a, pos.video, pos.audio, if (neg) |n| n.video else null, if (neg) |n| n.audio else null, vpos1, apos, sigmas1, vp, ap, if (cond1) |c| c.mask else null, if (cond1) |c| c.clean else null, progress, win1, s);
+        try ditSampleCfg(transformer, alloc, cfg, stage1_v, noise_a, pos.video, pos.audio, if (neg) |n| n.video else null, if (neg) |n| n.audio else null, vpos1, apos, sigmas1, vp, ap1, if (cond1) |c| c.mask else null, if (cond1) |c| c.clean else null, audio_cond, progress, win1, s);
     var audio1: ?mlx.mlx_array = out1.a;
     defer if (audio1) |a| {
         _ = mlx.mlx_array_free(a);
@@ -4040,7 +4100,7 @@ pub fn generateVideoFramesTwoStage(
     defer alloc.free(vpos2);
 
     const stage2_v = if (cond2) |c| c.init_latent else noisy_v2;
-    const out2 = try ditSampleCfg(dit2, alloc, cfg, stage2_v, noisy_a2, pos.video, pos.audio, null, null, vpos2, apos, sigmas2, .{}, .{}, if (cond2) |c| c.mask else null, if (cond2) |c| c.clean else null, progress, .{ .label = "Stage 2", .base = opts.stage1_steps, .total = total }, s);
+    const out2 = try ditSampleCfg(dit2, alloc, cfg, stage2_v, noisy_a2, pos.video, pos.audio, null, null, vpos2, apos, sigmas2, .{}, .{}, if (cond2) |c| c.mask else null, if (cond2) |c| c.clean else null, null, progress, .{ .label = "Stage 2", .base = opts.stage1_steps, .total = total }, s);
     defer _ = mlx.mlx_array_free(out2.v);
     // stage-2 audio replaces stage-1 as the decoded track.
     _ = mlx.mlx_array_free(audio1.?);
@@ -4899,7 +4959,7 @@ test "ltx DiT ditForward reproduces LTXModel velocity" {
     defer allocator.free(apos);
 
     const cfg = LtxConfig{};
-    const out = try ditForward(&comp, allocator, cfg, vlat.x, alat.x, 0.7, vtext.x, atext.x, vpos, apos, null, .{}, s);
+    const out = try ditForward(&comp, allocator, cfg, vlat.x, alat.x, 0.7, vtext.x, atext.x, vpos, apos, null, null, .{}, s);
     defer _ = mlx.mlx_array_free(out.v);
     defer _ = mlx.mlx_array_free(out.a);
 
@@ -4969,14 +5029,14 @@ test "ltx DiT per-token AdaLN uniform-mask equals scalar (no t2v regression)" {
     defer allocator.free(apos);
 
     const sigma: f32 = 0.6;
-    const scalar = try ditForward(&comp, allocator, cfg, vlat, alat, sigma, vtext, atext, vpos, apos, null, .{}, s);
+    const scalar = try ditForward(&comp, allocator, cfg, vlat, alat, sigma, vtext, atext, vpos, apos, null, null, .{}, s);
     defer _ = mlx.mlx_array_free(scalar.v);
     defer _ = mlx.mlx_array_free(scalar.a);
 
     const ones = try allocator.alloc(f32, Nv);
     defer allocator.free(ones);
     @memset(ones, 1.0);
-    const pt = try ditForward(&comp, allocator, cfg, vlat, alat, sigma, vtext, atext, vpos, apos, ones, .{}, s);
+    const pt = try ditForward(&comp, allocator, cfg, vlat, alat, sigma, vtext, atext, vpos, apos, ones, null, .{}, s);
     defer _ = mlx.mlx_array_free(pt.v);
     defer _ = mlx.mlx_array_free(pt.a);
 
@@ -5027,6 +5087,137 @@ test "ltx DiT per-token AdaLN uniform-mask equals scalar (no t2v regression)" {
     std.debug.print("[ltx-pt] uniform-mask video corr={d:.8} max_abs={d:.6} audio corr={d:.8}\n", .{ vcorr, vmax, acorr });
     try testing.expect(vcorr > 0.9999);
     try testing.expect(acorr > 0.9999);
+}
+
+// a2vid tripwire (same class as the per-token AdaLN test above): a scalar
+// audio_sigma EQUAL to the global sigma must reproduce the legacy shared-sigma
+// path exactly — proving the frozen-audio plumbing adds no t2v regression.
+// A scalar-path regression can't be caught by comparing against the reference
+// (both would change); self-equivalence can.
+//   LTX_TEST_MODEL = ltx-2.3-mlx-q4 snapshot dir (for transformer-dev.safetensors)
+test "ltx DiT audio_sigma == sigma equals the shared-sigma path (a2vid tripwire)" {
+    const dir = std.mem.span(std.c.getenv("LTX_TEST_MODEL") orelse return error.SkipZigTest);
+    const allocator = testing.allocator;
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const cpu_s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(cpu_s);
+
+    const vp = try std.fmt.allocPrintSentinel(allocator, "{s}/transformer-dev.safetensors", .{dir}, 0);
+    defer allocator.free(vp);
+    var comp = try loadComponent(allocator, vp, cpu_s);
+    defer comp.deinit();
+    var it = comp.map.iterator();
+    while (it.next()) |e| _ = mlx.mlx_array_eval(e.value_ptr.*);
+
+    const cfg = LtxConfig{};
+    const Nv: u32 = 2 * 4 * 4;
+    const Na: u32 = 9;
+    const Nt: u32 = 16;
+    const vlat = try mlxRandomNormal(&[_]c_int{ 1, @intCast(Nv), 128 }, 11, s);
+    defer _ = mlx.mlx_array_free(vlat);
+    const alat = try mlxRandomNormal(&[_]c_int{ 1, @intCast(Na), 128 }, 12, s);
+    defer _ = mlx.mlx_array_free(alat);
+    const vtext = try mlxRandomNormal(&[_]c_int{ 1, @intCast(Nt), 4096 }, 13, s);
+    defer _ = mlx.mlx_array_free(vtext);
+    const atext = try mlxRandomNormal(&[_]c_int{ 1, @intCast(Nt), 2048 }, 14, s);
+    defer _ = mlx.mlx_array_free(atext);
+    const vpos = try computeVideoPositions(allocator, 2, 4, 4, 24.0);
+    defer allocator.free(vpos);
+    const apos = try computeAudioPositions(allocator, Na);
+    defer allocator.free(apos);
+
+    const sigma: f32 = 0.6;
+    const legacy = try ditForward(&comp, allocator, cfg, vlat, alat, sigma, vtext, atext, vpos, apos, null, null, .{}, s);
+    defer _ = mlx.mlx_array_free(legacy.v);
+    defer _ = mlx.mlx_array_free(legacy.a);
+    const split = try ditForward(&comp, allocator, cfg, vlat, alat, sigma, vtext, atext, vpos, apos, null, sigma, .{}, s);
+    defer _ = mlx.mlx_array_free(split.v);
+    defer _ = mlx.mlx_array_free(split.a);
+
+    inline for (.{ .{ legacy.v, split.v, "video" }, .{ legacy.a, split.a, "audio" } }) |pair| {
+        var lf = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(lf);
+        try mlx.check(mlx.mlx_astype(&lf, pair[0], .float32, s));
+        _ = mlx.mlx_array_eval(lf);
+        var sf = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(sf);
+        try mlx.check(mlx.mlx_astype(&sf, pair[1], .float32, s));
+        _ = mlx.mlx_array_eval(sf);
+        const n: usize = @intCast(mlx.mlx_array_size(lf));
+        const ld = mlx.mlx_array_data_float32(lf).?;
+        const sd = mlx.mlx_array_data_float32(sf).?;
+        var dot: f64 = 0;
+        var na_: f64 = 0;
+        var nb_: f64 = 0;
+        for (0..n) |k| {
+            dot += @as(f64, ld[k]) * sd[k];
+            na_ += @as(f64, ld[k]) * ld[k];
+            nb_ += @as(f64, sd[k]) * sd[k];
+        }
+        const corr = dot / (@sqrt(na_) * @sqrt(nb_));
+        std.debug.print("[ltx-a2vid] audio_sigma==sigma {s} corr={d:.8}\n", .{ pair[2], corr });
+        try testing.expect(corr > 0.9999);
+    }
+}
+
+// Frozen audio must be an exact fixed point of the guided Euler loop: with
+// `frozen_a` set, the returned audio latent is the clean conditioning tokens,
+// bit-for-bit, regardless of video guidance running around it.
+//   LTX_TEST_MODEL = ltx-2.3-mlx-q4 snapshot dir (for transformer-dev.safetensors)
+test "ltx a2vid frozen audio is a fixed point of the guided Euler loop" {
+    const dir = std.mem.span(std.c.getenv("LTX_TEST_MODEL") orelse return error.SkipZigTest);
+    const allocator = testing.allocator;
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const cpu_s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(cpu_s);
+
+    const vp = try std.fmt.allocPrintSentinel(allocator, "{s}/transformer-dev.safetensors", .{dir}, 0);
+    defer allocator.free(vp);
+    var comp = try loadComponent(allocator, vp, cpu_s);
+    defer comp.deinit();
+    var it = comp.map.iterator();
+    while (it.next()) |e| _ = mlx.mlx_array_eval(e.value_ptr.*);
+
+    const cfg = LtxConfig{};
+    const Nv: u32 = 2 * 4 * 4;
+    const Na: u32 = 9;
+    const Nt: u32 = 16;
+    const noise_v = try mlxRandomNormal(&[_]c_int{ 1, @intCast(Nv), 128 }, 21, s);
+    defer _ = mlx.mlx_array_free(noise_v);
+    const clean_a = try mlxRandomNormal(&[_]c_int{ 1, @intCast(Na), 128 }, 22, s);
+    defer _ = mlx.mlx_array_free(clean_a);
+    const vtext = try mlxRandomNormal(&[_]c_int{ 1, @intCast(Nt), 4096 }, 23, s);
+    defer _ = mlx.mlx_array_free(vtext);
+    const atext = try mlxRandomNormal(&[_]c_int{ 1, @intCast(Nt), 2048 }, 24, s);
+    defer _ = mlx.mlx_array_free(atext);
+    const vpos = try computeVideoPositions(allocator, 2, 4, 4, 24.0);
+    defer allocator.free(vpos);
+    const apos = try computeAudioPositions(allocator, Na);
+    defer allocator.free(apos);
+
+    const sigmas = [_]f32{ 0.9, 0.45, 0.0 };
+    const out = try ditSampleCfg(&comp, allocator, cfg, noise_v, clean_a, vtext, atext, vtext, atext, vpos, apos, &sigmas, .{ .cfg = 3.0, .rescale = 0.7 }, .{}, null, null, clean_a, null, .{}, s);
+    defer _ = mlx.mlx_array_free(out.v);
+    defer _ = mlx.mlx_array_free(out.a);
+
+    var cf = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(cf);
+    try mlx.check(mlx.mlx_astype(&cf, clean_a, .float32, s));
+    _ = mlx.mlx_array_eval(cf);
+    var of = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(of);
+    try mlx.check(mlx.mlx_astype(&of, out.a, .float32, s));
+    _ = mlx.mlx_array_eval(of);
+    const n: usize = @intCast(mlx.mlx_array_size(cf));
+    try testing.expectEqual(n, @as(usize, @intCast(mlx.mlx_array_size(of))));
+    const cd = mlx.mlx_array_data_float32(cf).?;
+    const od = mlx.mlx_array_data_float32(of).?;
+    var max_abs: f64 = 0;
+    for (0..n) |k| max_abs = @max(max_abs, @abs(@as(f64, cd[k]) - od[k]));
+    std.debug.print("[ltx-a2vid] frozen-audio fixed point max_abs={d:.8}\n", .{max_abs});
+    try testing.expect(max_abs == 0.0);
 }
 
 // Stage 4a: dynamicShiftSchedule matches the reference ltx2_schedule. Cheap,
@@ -5101,7 +5292,7 @@ test "ltx DiT ditSampleCfg reproduces guided denoise loop" {
     defer allocator.free(sigmas);
 
     const cfg = LtxConfig{};
-    const out = try ditSampleCfg(&comp, allocator, cfg, nv.x, na.x, cv.x, ca.x, ngv.x, nga.x, vpos, apos, sigmas, .{ .cfg = 3.0, .rescale = 0.7 }, .{ .cfg = 7.0, .rescale = 0.7 }, null, null, null, .{}, s);
+    const out = try ditSampleCfg(&comp, allocator, cfg, nv.x, na.x, cv.x, ca.x, ngv.x, nga.x, vpos, apos, sigmas, .{ .cfg = 3.0, .rescale = 0.7 }, .{ .cfg = 7.0, .rescale = 0.7 }, null, null, null, null, .{}, s);
     defer _ = mlx.mlx_array_free(out.v);
     defer _ = mlx.mlx_array_free(out.a);
 

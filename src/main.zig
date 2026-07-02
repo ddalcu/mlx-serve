@@ -18,6 +18,7 @@ const ds4_arch = @import("arch/ds4.zig");
 const llama_arch = @import("arch/llama.zig");
 const ds4_ffi = @import("ds4_ffi.zig");
 const gen_mod = @import("gen.zig");
+const cli_mod = @import("cli.zig");
 const log = @import("log.zig");
 
 pub const VERSION: []const u8 = build_options.version;
@@ -29,13 +30,33 @@ const DEFAULT_MODEL_DIR = ""; // pass --model <path> to specify
 // threading it through runDs4Serve's already-long parameter list.
 var ds4_ssd_streaming: bool = false;
 
+/// `mlx-serve run` REPL thread: chats against the in-process server over
+/// its own Ollama /api/chat endpoint, then brings the server down cleanly
+/// (SIGTERM → the serve loop's shutdown path) when the user exits.
+fn replThreadMain(allocator: std.mem.Allocator, io: std.Io, port: u16) void {
+    cli_mod.runRepl(allocator, io, port) catch |err| {
+        log.warn("chat REPL exited: {s}\n", .{@errorName(err)});
+    };
+    std.posix.raise(std.posix.SIG.TERM) catch {};
+}
+
 fn printUsage(io: std.Io) void {
     var stdout_buf: [4096]u8 = undefined;
     var stdout_w = std.Io.File.stdout().writer(io, &stdout_buf);
     stdout_w.interface.writeAll(
         \\mlx-serve — MLX inference server for Apple Silicon
         \\
-        \\Usage: mlx-serve [options]
+        \\Usage: mlx-serve <command> [options]
+        \\       mlx-serve [options]
+        \\
+        \\Commands:
+        \\  run <model>         Download if needed, serve it, and chat right here
+        \\                      (short name like "gemma4", "qwen3.6:27b", or any
+        \\                      HuggingFace "org/repo")
+        \\  pull <model>        Download a model into ~/.mlx-serve/models
+        \\  list                Show downloaded models
+        \\  serve               Start the server over ~/.mlx-serve/models
+        \\                      (every pulled model loads on demand by name)
         \\
         \\Options:
         \\  --model <dir>       Path to MLX model directory (required)
@@ -176,6 +197,44 @@ pub fn main(init: std.process.Init) !void {
         return;
     }
 
+    // ── Subcommands (Ollama-grade CLI): `mlx-serve run|pull|list|serve` ──
+    // `pull` and `list` finish here; `run` and `serve` fall through into the
+    // normal flag parse (skipping the consumed positionals) and serve path.
+    var arg_start: usize = 1;
+    var run_model_dir: ?[]u8 = null;
+    defer if (run_model_dir) |d| allocator.free(d);
+    var use_default_models_root = false;
+    var repl_after_serve = false;
+    if (args.len >= 2 and args[1].len > 0 and args[1][0] != '-') {
+        const cmd = args[1];
+        if (std.mem.eql(u8, cmd, "pull")) {
+            if (args.len < 3) {
+                log.err("usage: mlx-serve pull <model>\n", .{});
+                std.process.exit(1);
+            }
+            try cli_mod.cmdPull(allocator, io, args[2]);
+            return;
+        } else if (std.mem.eql(u8, cmd, "list")) {
+            try cli_mod.cmdList(allocator, io);
+            return;
+        } else if (std.mem.eql(u8, cmd, "run")) {
+            if (args.len < 3) {
+                log.err("usage: mlx-serve run <model> [options]\n", .{});
+                std.process.exit(1);
+            }
+            run_model_dir = try cli_mod.ensureModelAvailable(allocator, io, args[2]);
+            arg_start = 3;
+            use_default_models_root = true;
+            repl_after_serve = std.Io.File.stdin().isTty(io) catch false;
+        } else if (std.mem.eql(u8, cmd, "serve")) {
+            arg_start = 2;
+            use_default_models_root = true;
+        } else {
+            log.err("unknown command '{s}' (expected run, pull, list, or serve)\n", .{cmd});
+            std.process.exit(1);
+        }
+    }
+
     var model_dir: []const u8 = DEFAULT_MODEL_DIR;
     var models_root: ?[]const u8 = null; // --model-dir for plan 05 discovery
     var port: u16 = 11234;
@@ -224,7 +283,8 @@ pub fn main(init: std.process.Init) !void {
     // GGUF engine routing override. null → auto (decided by gguf_meta on
     // file inspection); set explicitly via --engine to force ds4 or llama.
     var engine_override: ?gguf_meta.Engine = null;
-    var i: usize = 1;
+    var log_level_explicit = false;
+    var i: usize = arg_start;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--version")) {
             var ver_buf: [64]u8 = undefined;
@@ -305,6 +365,7 @@ pub fn main(init: std.process.Init) !void {
             i += 1;
             if (log.Level.fromString(args[i])) |level| {
                 log.setLevel(level);
+                log_level_explicit = true;
             }
         } else if (std.mem.eql(u8, args[i], "--warmup-eager")) {
             warmup_eager = true;
@@ -443,6 +504,24 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
+    // Subcommand plumbing: `run <model>` supplies the model dir + serve
+    // mode; `run`/`serve` default the discovery root to ~/.mlx-serve/models
+    // so every pulled model is loadable by name (Ollama-style).
+    var default_models_root_storage: ?[]u8 = null;
+    defer if (default_models_root_storage) |r| allocator.free(r);
+    if (run_model_dir) |d| {
+        model_dir = d;
+        serve_mode = true;
+    }
+    if (use_default_models_root) {
+        serve_mode = true;
+        if (models_root == null) {
+            const home = std.mem.span(std.c.getenv("HOME") orelse "/tmp");
+            default_models_root_storage = try cli_mod.modelsRootPath(allocator, home);
+            models_root = default_models_root_storage;
+        }
+    }
+
     // Plan 05 Phase 1: model discovery. When --model-dir is passed, scan
     // the directory for subdirectories containing config.json. The
     // discovered list is published via /v1/models. v1: routing still goes
@@ -479,6 +558,20 @@ pub fn main(init: std.process.Init) !void {
             log.err("Stop it first (pkill -f mlx-serve) or use a different port (--port {d}).\n", .{port + 1});
             std.process.exit(1);
         }
+    }
+
+    // `mlx-serve run` on a TTY: chat REPL on a side thread. It polls
+    // /health until the model is up, then drives the server's own /api/chat
+    // (Ollama NDJSON) endpoint. Quiet the request logs so streamed tokens
+    // aren't interleaved with [info] lines — unless the user asked for a
+    // level explicitly.
+    if (repl_after_serve and serve_mode) {
+        if (!log_level_explicit) log.setLevel(.warn);
+        const t = std.Thread.spawn(.{}, replThreadMain, .{ allocator, io, port }) catch |err| blk: {
+            log.warn("could not start chat REPL: {s}\n", .{@errorName(err)});
+            break :blk null;
+        };
+        if (t) |thread| thread.detach();
     }
 
     // ── GGUF early-branch: route to an embedded engine ──
@@ -732,8 +825,15 @@ pub fn main(init: std.process.Init) !void {
         // Register the loaded model. Use the pre-registered discovery entry
         // when available (so id/path/bytes_on_disk are consistent across
         // /v1/models listings); otherwise create a fresh stub.
-        const entry = if (registry.peek(model_id)) |e| e else try registry.registerStub(model_id, model_dir, null);
-        try registry.setDefault(model_id);
+        const entry = if (registry.peek(model_id)) |e|
+            e
+        else if (registry.peekByPath(model_dir)) |e|
+            // Discovered under an org/name id whose basename differs from
+            // model_id — reuse it, never register the same path twice.
+            e
+        else
+            try registry.registerStub(model_id, model_dir, null);
+        try registry.setDefault(entry.id);
 
         // Ownership-transfer defer: registry takes ownership of
         // config/tok/chat_config IF the inference-thread load installed
@@ -1224,8 +1324,13 @@ fn runGenServe(
     const registry = try model_registry_mod.ModelRegistry.init(allocator, io, discovery, max_resident_models, effective_max_resident_mem, idle_evict_secs);
     defer registry.deinit();
 
-    const entry = if (registry.peek(model_id)) |e| e else try registry.registerStubWithArch(model_id, model_dir, null, modality.modelType());
-    try registry.setDefault(model_id);
+    const entry = if (registry.peek(model_id)) |e|
+        e
+    else if (registry.peekByPath(model_dir)) |e|
+        e
+    else
+        try registry.registerStubWithArch(model_id, model_dir, null, modality.modelType());
+    try registry.setDefault(entry.id);
 
     // Registry takes ownership of the stub if the inference thread installed it.
     defer if (entry.config != null) {

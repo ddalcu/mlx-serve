@@ -199,6 +199,82 @@ else
   echo "two-stage weights incomplete in $MODEL -> skipping two-stage test"
 fi
 
+# ── Audio-to-video (a2vid): user WAV frozen as the soundtrack ───────────────
+# Needs the two-stage prerequisites + the audio VAE (encoder weights ride in
+# audio_vae.safetensors). The ORIGINAL clip must come back in the response
+# (native rate/channels, trimmed to the video duration); the ENGAGEMENT proof
+# is the server-log line — response presence alone can't distinguish a silent
+# fallback to generated audio (the spec-decode dispatch lesson).
+if [ -f "$MODEL/transformer-dev.safetensors" ] && [ -f "$MODEL/transformer-distilled.safetensors" ] \
+   && [ -f "$MODEL/spatial_upscaler_x2_v1_1.safetensors" ] && [ -f "$MODEL/vae_encoder.safetensors" ] \
+   && [ "$EXPECT_AUDIO" = "1" ]; then
+  echo "a2vid prerequisites found -> testing audio-to-video"
+  WAV=/tmp/test_a2v_input.wav
+  python3 - "$WAV" <<'PY'
+import sys, wave, struct, math
+sr = 44100  # NOT 16 kHz — exercises the server-side resample of the cond path
+n = sr      # 1 s stereo, longer than the 9-frame clip so mux trimming shows
+with wave.open(sys.argv[1], "wb") as w:
+    w.setnchannels(2); w.setsampwidth(2); w.setframerate(sr)
+    frames = bytearray()
+    for i in range(n):
+        t = i / sr
+        l = int(0.5 * 32767 * math.sin(2 * math.pi * 440 * t))
+        r = int(0.5 * 32767 * math.sin(2 * math.pi * 660 * t))
+        frames += struct.pack("<hh", l, r)
+    w.writeframes(bytes(frames))
+PY
+  B64=$(base64 < "$WAV" | tr -d '\n')
+  python3 -c "import json,sys;json.dump({'prompt':'a woman speaking to the camera in a bright kitchen, natural voice','pipeline':'two_stage','num_frames':9,'height':256,'width':384,'steps':4,'seed':11,'audio':sys.argv[1]}, open('/tmp/test_a2v_req.json','w'))" "$B64"
+  A2V=/tmp/test_video_a2v.json
+  code=$(curl -s --max-time 1200 -X POST "http://127.0.0.1:$PORT/v1/video/generations" -H 'Content-Type: application/json' \
+    --data @/tmp/test_a2v_req.json -o "$A2V" -w "%{http_code}")
+  if [ "$code" = "200" ]; then
+    python3 - "$A2V" <<'PY'
+import sys, json, base64, struct, math
+d = json.load(open(sys.argv[1]))
+F, H, W = d["frames"], d["height"], d["width"]
+raw = base64.b64decode(d["data"])
+assert len(raw) == F * H * W * 3, f"len {len(raw)} != {F*H*W*3}"
+assert "audio_data" in d, "a2vid response missing audio_data"
+assert d["audio_sample_rate"] == 44100, f"expected ORIGINAL 44100 Hz passthrough, got {d['audio_sample_rate']}"
+assert d["audio_channels"] == 2, d["audio_channels"]
+pcm = base64.b64decode(d["audio_data"])
+total = len(pcm) // 2  # s16 samples, interleaved
+want_frames = int(F / 24.0 * 44100)
+assert total == want_frames * 2, f"expected {want_frames} trimmed sample-frames, got {total//2}"
+# The muxed track must be the ORIGINAL clip (440 Hz left channel), not a VAE
+# re-synth: compare against the source sine (PCM16 round-trip tolerance).
+bad = 0
+for i in range(1000):
+    l = struct.unpack_from("<h", pcm, i * 4)[0]
+    ref = 0.5 * 32767 * math.sin(2 * math.pi * 440 * (i / 44100.0))
+    if abs(l - ref) > 3: bad += 1
+assert bad < 5, f"muxed audio deviates from the original clip ({bad}/1000 samples off)"
+print(f"PASS: a2vid -> {F} frames + original 44.1 kHz clip trimmed to {total//2} sample-frames")
+PY
+    [ $? -eq 0 ] || rc=1
+    if grep -q "audio-to-video:" /tmp/test_video_server.log; then
+      echo "PASS: a2vid conditioning engaged (server log)"
+    else
+      echo "FAIL: no a2vid engagement line in server log (silent t2v fallback?)"; rc=1
+    fi
+  else
+    echo "FAIL: a2vid http $code"; head -c 300 "$A2V"; rc=1
+  fi
+  # one-stage + audio must 400 — a2vid is two-stage only, never a silent ignore
+  python3 -c "import json;r=json.load(open('/tmp/test_a2v_req.json'));r['pipeline']='one_stage';json.dump(r,open('/tmp/test_a2v_req_1s.json','w'))"
+  code=$(curl -s --max-time 60 -X POST "http://127.0.0.1:$PORT/v1/video/generations" -H 'Content-Type: application/json' \
+    --data @/tmp/test_a2v_req_1s.json -o /dev/null -w "%{http_code}")
+  if [ "$code" = "400" ]; then
+    echo "PASS: a2vid rejects pipeline=one_stage with 400"
+  else
+    echo "FAIL: a2vid one_stage returned $code (want 400)"; rc=1
+  fi
+else
+  echo "a2vid prerequisites incomplete in $MODEL -> skipping audio-to-video test"
+fi
+
 # Optional: mux to mp4 if ffmpeg is present (proves a playable clip, with sound
 # when an audio track was decoded above into /tmp/test_video_gen.wav).
 if [ $rc -eq 0 ] && command -v ffmpeg >/dev/null 2>&1; then

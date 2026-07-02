@@ -29,6 +29,15 @@ struct ImageGenSettings: Codable, Equatable {
     var negativePrompt: String = ""
     var safeMode: Bool = true
     var keepResident: Bool = false
+    /// img2img renoise strength (the source image path itself is transient —
+    /// not persisted, like video's first-frame).
+    var strength: Double = 0.6
+    /// Conditioning rebalance (Advanced): global gain + weights text.
+    var condGain: Double = 1.0
+    var condWeightsText: String = ""
+    /// Style LoRA (Advanced): sticky adapter path ("" = none) + strength.
+    var loraPath: String = ""
+    var loraScale: Double = 1.0
 
     private static let storageKey = "imageGenSettings"
 
@@ -73,6 +82,11 @@ extension ImageGenSettings {
         if let v = try c.decodeIfPresent(String.self, forKey: .negativePrompt) { negativePrompt = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .safeMode) { safeMode = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .keepResident) { keepResident = v }
+        if let v = try c.decodeIfPresent(Double.self, forKey: .strength) { strength = v }
+        if let v = try c.decodeIfPresent(Double.self, forKey: .condGain) { condGain = v }
+        if let v = try c.decodeIfPresent(String.self, forKey: .condWeightsText) { condWeightsText = v }
+        if let v = try c.decodeIfPresent(String.self, forKey: .loraPath) { loraPath = v }
+        if let v = try c.decodeIfPresent(Double.self, forKey: .loraScale) { loraScale = v }
     }
 }
 

@@ -71,6 +71,92 @@ final class MediaGenServiceTests: XCTestCase {
         XCTAssertEqual(body["first_frame_image"] as? String, "QUJD")
     }
 
+    // MARK: - Audio-to-video request contract
+
+    func testRequestBodyCarriesAudioWhenPresent() {
+        let req = VideoGenRequest(model: .ltx23Q4, prompt: "p", width: 704, height: 480,
+                                  numFrames: 97, fps: 24, mode: .twoStage, steps: 30, cfgScale: 3.0)
+        let body = VideoGenService.requestBody(model: "m", prompt: "p", request: req,
+                                               firstFrameB64: nil, audioB64: "V0FW")
+        XCTAssertEqual(body["audio"] as? String, "V0FW")
+        // absent when there's no clip — the server treats presence as intent
+        let none = VideoGenService.requestBody(model: "m", prompt: "p", request: req,
+                                               firstFrameB64: nil, audioB64: nil)
+        XCTAssertNil(none["audio"])
+    }
+
+    func testRequestBodyAudioForcesTwoStageAndReferenceGuidance() {
+        // a2vid is two-stage only (the server 400s one_stage+audio). A Fast
+        // (one-stage) preset with a clip attached must upgrade to two_stage AND
+        // drop its one-stage guidance values (cfg 1.0 would run stage 1
+        // unguided) so the server's reference defaults (cfg 3/7) apply.
+        let req = VideoGenRequest(model: .ltx23Q4, prompt: "p", width: 704, height: 480,
+                                  numFrames: 97, fps: 24, mode: .oneStage, steps: 12, cfgScale: 1.0)
+        let body = VideoGenService.requestBody(model: "m", prompt: "p", request: req,
+                                               firstFrameB64: nil, audioB64: "V0FW")
+        XCTAssertEqual(body["pipeline"] as? String, "two_stage")
+        XCTAssertNil(body["cfg_scale"])
+        XCTAssertNil(body["stg_scale"])
+        // An explicit two-stage request keeps the user's guidance untouched.
+        var hq = VideoGenRequest(model: .ltx23Q4, prompt: "p", width: 704, height: 480,
+                                 numFrames: 97, fps: 24, mode: .twoStageHQ, steps: 15, cfgScale: 4.0)
+        hq.stgScale = 0.5
+        let hqBody = VideoGenService.requestBody(model: "m", prompt: "p", request: hq,
+                                                 firstFrameB64: nil, audioB64: "V0FW")
+        XCTAssertEqual(hqBody["pipeline"] as? String, "two_stage_hq")
+        XCTAssertEqual(hqBody["cfg_scale"] as? Double, 4.0)
+        XCTAssertEqual(hqBody["stg_scale"] as? Double, 0.5)
+    }
+
+    func testAudioFileToWavBase64TranscodesToPcm16Wav() throws {
+        // Write a float32 WAV via AVAudioFile (any AVFoundation-readable format
+        // works — this pins the transcode-to-PCM16-WAV contract the Zig server
+        // parses), then round-trip through the helper.
+        let dir = FileManager.default.temporaryDirectory
+        let src = dir.appendingPathComponent("a2v_test_\(UUID().uuidString).wav")
+        defer { try? FileManager.default.removeItem(at: src) }
+        let sr = 22050.0
+        // Scope the writer: AVAudioFile flushes its header on dealloc (there is
+        // no explicit close on this deployment target) — reading before the
+        // writer dies sees an empty file.
+        try autoreleasepool {
+            let fmt = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: sr, channels: 1, interleaved: false)!
+            let file = try AVAudioFile(forWriting: src, settings: fmt.settings, commonFormat: .pcmFormatFloat32, interleaved: false)
+            let n: AVAudioFrameCount = 22050 // 1 s
+            let buf = AVAudioPCMBuffer(pcmFormat: fmt, frameCapacity: n)!
+            buf.frameLength = n
+            for i in 0..<Int(n) {
+                buf.floatChannelData![0][i] = 0.4 * sin(2.0 * .pi * 440.0 * Float(i) / Float(sr))
+            }
+            try file.write(from: buf)
+        }
+
+        let b64 = VideoGenService.audioFileToWavBase64(path: src.path)
+        let wav = try XCTUnwrap(b64.flatMap { Data(base64Encoded: $0) })
+        // RIFF/WAVE with a PCM16 fmt chunk at the source rate.
+        XCTAssertEqual(String(data: wav.prefix(4), encoding: .ascii), "RIFF")
+        XCTAssertEqual(String(data: wav.subdata(in: 8..<12), encoding: .ascii), "WAVE")
+        let audioFormat = wav.subdata(in: 20..<22).withUnsafeBytes { $0.load(as: UInt16.self) }
+        let bits = wav.subdata(in: 34..<36).withUnsafeBytes { $0.load(as: UInt16.self) }
+        let rate = wav.subdata(in: 24..<28).withUnsafeBytes { $0.load(as: UInt32.self) }
+        XCTAssertEqual(audioFormat, 1) // PCM
+        XCTAssertEqual(bits, 16)
+        XCTAssertEqual(rate, 22050)
+        XCTAssertGreaterThan(wav.count, 44 + 20000) // ~1 s of PCM16 mono
+        // Unreadable path → nil, never a throw/crash.
+        XCTAssertNil(VideoGenService.audioFileToWavBase64(path: "/nonexistent/clip.m4a"))
+    }
+
+    func testFramesCoveringAudioDurationSnapsUpOnLadder() {
+        // Attaching a clip auto-suggests a frame count that COVERS it: the
+        // smallest 8N+1 ladder value ≥ duration*fps, capped at the model max.
+        let m = VideoModelPreset.ltx23Q4
+        XCTAssertEqual(m.framesCovering(durationSeconds: 2.0), 49)   // 48 frames → 49
+        XCTAssertEqual(m.framesCovering(durationSeconds: 0.1), m.frameOptions.first) // tiny clip → floor
+        XCTAssertEqual(m.framesCovering(durationSeconds: 3600), m.frameOptions.last) // longer than cap → max
+        XCTAssertNil(m.framesCovering(durationSeconds: 0))           // no/empty clip → no suggestion
+    }
+
     // MARK: - Video response decode (the /v1/video/generations contract)
 
     func testDecodeFramesParsesRgb8Body() {
@@ -272,5 +358,73 @@ final class MediaGenServiceTests: XCTestCase {
         XCTAssertFalse(vid.keepResident)
         let aud = AudioGenRequest(model: .qwen3TTS06B, text: "x")
         XCTAssertFalse(aud.keepResident)
+    }
+
+    // MARK: - Image request body (img2img + rebalance + LoRA)
+
+    func testImageRequestJsonDefaultsOmitImg2ImgRebalanceAndLora() {
+        let req = ImageGenRequest(model: .flux2Klein4B_Q4, prompt: "x", width: 1024, height: 1024, steps: 4, guidance: 0.5)
+        let json = ImageGenService.requestJson(for: req, modelName: "m", seed: 7)
+        XCTAssertEqual(json["prompt"] as? String, "x")
+        XCTAssertEqual(json["seed"] as? Int, 7)
+        // No behavior change for plain text-to-image requests.
+        XCTAssertNil(json["image"])
+        XCTAssertNil(json["strength"])
+        XCTAssertNil(json["cond_gain"])
+        XCTAssertNil(json["cond_weights"])
+        XCTAssertNil(json["lora_path"])
+    }
+
+    func testImageRequestJsonIncludesImg2ImgFields() throws {
+        let tmp = FileManager.default.temporaryDirectory
+            .appendingPathComponent("img2img-src-\(UUID().uuidString).png")
+        let bytes = Data([0x89, 0x50, 0x4E, 0x47, 1, 2, 3, 4])
+        try bytes.write(to: tmp)
+        defer { try? FileManager.default.removeItem(at: tmp) }
+
+        var req = ImageGenRequest(model: .flux2Klein4B_Q4, prompt: "x", width: 1024, height: 1024, steps: 8, guidance: 0.5)
+        req.initImagePath = tmp.path
+        req.strength = 0.45
+        let json = ImageGenService.requestJson(for: req, modelName: "m", seed: 1)
+        XCTAssertEqual(json["image"] as? String, bytes.base64EncodedString())
+        XCTAssertEqual(json["strength"] as? Double, 0.45)
+    }
+
+    func testImageRequestJsonMissingSourceFileDropsImg2Img() {
+        var req = ImageGenRequest(model: .flux2Klein4B_Q4, prompt: "x", width: 1024, height: 1024, steps: 8, guidance: 0.5)
+        req.initImagePath = "/definitely/not/a/real/file.png"
+        req.strength = 0.4
+        let json = ImageGenService.requestJson(for: req, modelName: "m", seed: 1)
+        XCTAssertNil(json["image"])
+        XCTAssertNil(json["strength"])
+    }
+
+    func testImageRequestJsonIncludesRebalanceAndLora() {
+        var req = ImageGenRequest(model: .krea2Turbo, prompt: "x", width: 1024, height: 1024, steps: 8, guidance: 0.5)
+        req.condGain = 1.5
+        req.condWeightsText = "1, 1 1 1 1 1 0.5 1 1 1 1 2"
+        req.loraPath = "/tmp/style.safetensors"
+        let json = ImageGenService.requestJson(for: req, modelName: "m", seed: 1)
+        XCTAssertEqual(json["cond_gain"] as? Double, 1.5)
+        let w = json["cond_weights"] as? [Double]
+        XCTAssertEqual(w?.count, 12)
+        XCTAssertEqual(w?[6], 0.5)
+        XCTAssertEqual(w?[11], 2)
+        XCTAssertEqual(json["lora_path"] as? String, "/tmp/style.safetensors")
+    }
+
+    func testParseCondWeightsAcceptsCommasAndSpacesRejectsGarbage() {
+        XCTAssertEqual(ImageGenRequest.parseCondWeights("1,2,3"), [1, 2, 3])
+        XCTAssertEqual(ImageGenRequest.parseCondWeights(" 0.5  1\t-2 "), [0.5, 1, -2])
+        XCTAssertEqual(ImageGenRequest.parseCondWeights("1, 2,, 3"), [1, 2, 3])
+        XCTAssertNil(ImageGenRequest.parseCondWeights("1,x,3"))
+        XCTAssertNil(ImageGenRequest.parseCondWeights(""))
+        XCTAssertNil(ImageGenRequest.parseCondWeights("  "))
+    }
+
+    func testCondWeightCountFollowsBackend() {
+        // FLUX taps encoder layers 9/18/27 → 3 weights; Krea taps 12 layers.
+        XCTAssertEqual(ImageGenRequest(model: .flux2Klein4B_Q4, prompt: "x", width: 1024, height: 1024, steps: 4, guidance: 0.5).condWeightCount, 3)
+        XCTAssertEqual(ImageGenRequest(model: .krea2Turbo, prompt: "x", width: 1024, height: 1024, steps: 8, guidance: 0.5).condWeightCount, 12)
     }
 }

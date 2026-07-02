@@ -58,6 +58,7 @@ final class VideoGenService: ObservableObject {
         let steps = request.steps
         let keep = request.keepResident
         let firstFramePath = request.firstFrameImagePath
+        let audioPath = request.audioPath
 
         task = Task {
             var loadedId: String? = nil
@@ -74,13 +75,26 @@ final class VideoGenService: ObservableObject {
                         (try? Data(contentsOf: URL(fileURLWithPath: path)))?.base64EncodedString()
                     }
                 }.value
+                // Audio-to-video: transcode the clip to a PCM16 WAV off-main
+                // (AVFoundation decode of an mp3/m4a can take a moment). A
+                // failed transcode is a hard error — the user asked for THIS
+                // soundtrack, so silently generating audio instead would be a
+                // wrong result (mirrors the server's explicit 400s).
+                let audioB64: String? = await Task.detached(priority: .userInitiated) {
+                    audioPath.flatMap { Self.audioFileToWavBase64(path: $0) }
+                }.value
+                if audioPath != nil, audioB64 == nil {
+                    phase = .failed("Couldn't read the audio clip. Pick a WAV, MP3, M4A, or AAC file.")
+                    return
+                }
                 let port = try await server.ensureRunning(forGenModelDir: modelDir)
                 if Task.isCancelled { phase = .idle; return }
                 let info = try await server.loadModel(id: modelDir)
                 loadedId = info.name
                 if Task.isCancelled { await releaseIfNeeded(); phase = .idle; return }
                 let body = Self.requestBody(model: info.name, prompt: prompt,
-                                            request: request, firstFrameB64: firstFrameB64)
+                                            request: request, firstFrameB64: firstFrameB64,
+                                            audioB64: audioB64)
                 // SSE: the server pushes `progress` events per denoise step, then a
                 // `complete` event with the frames. Drive a determinate bar from them.
                 var decoded: DecodedFrames? = nil
@@ -142,21 +156,95 @@ final class VideoGenService: ObservableObject {
     /// made the Quality preset (cfg 3.0, twoStage) run as unguided one-stage —
     /// tests pin every field here so the UI model can't drift from the wire.
     nonisolated static func requestBody(model: String, prompt: String,
-                                        request: VideoGenRequest, firstFrameB64: String?) -> [String: Any] {
-        let pipeline: String
+                                        request: VideoGenRequest, firstFrameB64: String?,
+                                        audioB64: String? = nil) -> [String: Any] {
+        var pipeline: String
         switch request.mode {
         case .oneStage:   pipeline = "one_stage"
         case .twoStage:   pipeline = "two_stage"
         case .twoStageHQ: pipeline = "two_stage_hq"
         }
+        // Audio-to-video is two-stage only (the server 400s one_stage+audio).
+        // A one-stage preset with a clip attached upgrades to two_stage and
+        // DROPS its guidance values — one-stage's cfg 1.0 would run stage 1
+        // unguided; omitting the fields lets the server apply the reference
+        // two-stage defaults (cfg 3.0 video / 7.0 audio).
+        let hasAudio = (audioB64?.isEmpty == false)
+        var dropGuidance = false
+        if hasAudio, request.mode == .oneStage {
+            pipeline = "two_stage"
+            dropGuidance = true
+        }
         var body: [String: Any] = [
             "model": model, "prompt": prompt, "num_frames": request.numFrames,
             "height": request.height, "width": request.width, "steps": request.steps,
             "seed": request.seed,
-            "pipeline": pipeline, "cfg_scale": request.cfgScale, "stg_scale": request.stgScale,
+            "pipeline": pipeline,
         ]
+        if !dropGuidance {
+            body["cfg_scale"] = request.cfgScale
+            body["stg_scale"] = request.stgScale
+        }
         if let firstFrameB64 { body["first_frame_image"] = firstFrameB64 }
+        if hasAudio, let audioB64 { body["audio"] = audioB64 }
         return body
+    }
+
+    /// Longest clip shipped to the server. LTX's frame ladder tops out around
+    /// 8 s of video; 30 s keeps the base64 payload bounded when a user picks a
+    /// full song (the server trims to the video duration anyway).
+    nonisolated static let maxAudioSeconds: Double = 30
+
+    /// Read ANY AVFoundation-readable audio file (wav/mp3/m4a/aac/…) and
+    /// transcode to a 16-bit PCM WAV at the source sample rate, ≤2 channels,
+    /// base64-encoded for the `audio` request field. Returns nil on any
+    /// failure (the caller surfaces it as a user-facing error — a2vid must
+    /// never silently fall back to generated audio).
+    nonisolated static func audioFileToWavBase64(path: String) -> String? {
+        guard let file = try? AVAudioFile(forReading: URL(fileURLWithPath: path)) else { return nil }
+        let srcFmt = file.processingFormat
+        let sr = srcFmt.sampleRate
+        let ch = min(srcFmt.channelCount, 2)
+        guard sr > 0, ch > 0,
+              let dstFmt = AVAudioFormat(commonFormat: .pcmFormatInt16, sampleRate: sr,
+                                         channels: ch, interleaved: true),
+              let converter = AVAudioConverter(from: srcFmt, to: dstFmt) else { return nil }
+
+        let totalFrames = AVAudioFrameCount(min(Double(file.length), sr * maxAudioSeconds))
+        guard totalFrames > 0,
+              let srcBuf = AVAudioPCMBuffer(pcmFormat: srcFmt, frameCapacity: totalFrames),
+              let dstBuf = AVAudioPCMBuffer(pcmFormat: dstFmt, frameCapacity: totalFrames) else { return nil }
+        do { try file.read(into: srcBuf, frameCount: totalFrames) } catch { return nil }
+
+        var fed = false
+        var convErr: NSError?
+        let status = converter.convert(to: dstBuf, error: &convErr) { _, outStatus in
+            if fed { outStatus.pointee = .endOfStream; return nil }
+            fed = true
+            outStatus.pointee = .haveData
+            return srcBuf
+        }
+        guard status != .error, convErr == nil, dstBuf.frameLength > 0,
+              let data = dstBuf.int16ChannelData else { return nil }
+
+        let frames = Int(dstBuf.frameLength)
+        let channels = Int(ch)
+        let dataBytes = frames * channels * 2
+        var wav = Data(capacity: 44 + dataBytes)
+        func u16(_ v: UInt16) { withUnsafeBytes(of: v.littleEndian) { wav.append(contentsOf: $0) } }
+        func u32(_ v: UInt32) { withUnsafeBytes(of: v.littleEndian) { wav.append(contentsOf: $0) } }
+        wav.append(contentsOf: Array("RIFF".utf8)); u32(UInt32(36 + dataBytes))
+        wav.append(contentsOf: Array("WAVE".utf8))
+        wav.append(contentsOf: Array("fmt ".utf8)); u32(16)
+        u16(1); u16(UInt16(channels)); u32(UInt32(sr))
+        u32(UInt32(sr) * UInt32(channels) * 2); u16(UInt16(channels * 2)); u16(16)
+        wav.append(contentsOf: Array("data".utf8)); u32(UInt32(dataBytes))
+        // int16ChannelData is interleaved when the format is interleaved:
+        // channel 0's pointer covers frames*channels samples.
+        data[0].withMemoryRebound(to: UInt8.self, capacity: dataBytes) { p in
+            wav.append(UnsafeBufferPointer(start: p, count: dataBytes))
+        }
+        return wav.base64EncodedString()
     }
 
     // MARK: - Decode + mux (pure / nonisolated so they're testable + off-main)

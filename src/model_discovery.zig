@@ -205,7 +205,15 @@ pub fn discoverModels(io: std.Io, allocator: std.mem.Allocator, model_dir: []con
         return err;
     };
     defer dir.close(io);
+    return discoverModelsInDir(io, allocator, dir, model_dir);
+}
 
+/// Core scan over an already-open root. Two layouts are recognized:
+///   <root>/<model>/config.json               → id "<model>"
+///   <root>/<org>/<model>/config.json         → id "<org>/<model>"
+/// The second is the HF-style layout `~/.mlx-serve/models` uses (the app's
+/// DownloadManager and `mlx-serve pull` both write there).
+pub fn discoverModelsInDir(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir, model_dir: []const u8) !DiscoveryResult {
     var found = std.ArrayList(DiscoveredModel).empty;
     errdefer {
         for (found.items) |*m| {
@@ -221,61 +229,18 @@ pub fn discoverModels(io: std.Io, allocator: std.mem.Allocator, model_dir: []con
         if (entry.kind != .directory and entry.kind != .sym_link) continue;
         if (entry.name.len == 0 or entry.name[0] == '.') continue;
 
-        // Confirm it has a config.json
-        var sub = dir.openDir(io, entry.name, .{}) catch continue;
-        defer sub.close(io);
+        const is_model_dir = try tryAddModel(io, allocator, dir, entry.name, "", model_dir, &found);
+        if (is_model_dir) continue;
 
-        const cfg_stat = sub.statFile(io, "config.json", .{}) catch continue;
-        if (cfg_stat.kind != .file) continue;
-
-        // Filter by supported model_type AND quantization scheme. Catches:
-        //   - partially-downloaded checkpoints (missing/garbage config)
-        //   - unsupported arches (e.g. deepseek_v4, MLA + indexer)
-        //   - unsupported quants (modes outside supported_quant_modes)
-        // before they reach the tokenizer/weight loaders.
-        const model_type: []const u8 = switch (peekConfig(io, allocator, dir, entry.name)) {
-            .missing_or_unparseable => {
-                log.info("[discovery] skip {s}: config.json missing or unparseable", .{entry.name});
-                continue;
-            },
-            .unsupported_arch => |mt| {
-                defer allocator.free(mt);
-                log.info("[discovery] skip {s}: unsupported model_type '{s}'", .{ entry.name, mt });
-                continue;
-            },
-            .unsupported_quant => |mode| {
-                defer allocator.free(mode);
-                log.info("[discovery] skip {s}: unsupported quantization mode '{s}' (supported: affine, nvfp4, mxfp4, mxfp8)", .{ entry.name, mode });
-                continue;
-            },
-            .supported => |mt| mt, // ownership moves to the DiscoveredModel
-        };
-        errdefer if (model_type.len > 0) allocator.free(model_type);
-
-        // Compute weight bytes (sum of *.safetensors sizes) — best-effort.
-        var bytes: u64 = 0;
-        var bytes_ok = false;
-        var sub_iter_dir = dir.openDir(io, entry.name, .{ .iterate = true }) catch null;
-        if (sub_iter_dir) |*sd| {
-            defer sd.close(io);
-            var sd_iter = sd.iterate();
-            while (sd_iter.next(io) catch null) |sub_entry| {
-                if (sub_entry.kind != .file) continue;
-                if (!std.mem.endsWith(u8, sub_entry.name, ".safetensors")) continue;
-                const st = sd.statFile(io, sub_entry.name, .{}) catch continue;
-                bytes += @intCast(st.size);
-                bytes_ok = true;
-            }
+        // No config.json at this level — maybe an org dir (org/repo layout).
+        var org = dir.openDir(io, entry.name, .{ .iterate = true }) catch continue;
+        defer org.close(io);
+        var org_iter = org.iterate();
+        while (org_iter.next(io) catch null) |org_entry| {
+            if (org_entry.kind != .directory and org_entry.kind != .sym_link) continue;
+            if (org_entry.name.len == 0 or org_entry.name[0] == '.') continue;
+            _ = try tryAddModel(io, allocator, org, org_entry.name, entry.name, model_dir, &found);
         }
-
-        const id = try allocator.dupe(u8, entry.name);
-        const path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ trimTrailingSlash(model_dir), entry.name });
-        try found.append(allocator, .{
-            .id = id,
-            .path = path,
-            .bytes_on_disk = if (bytes_ok) bytes else null,
-            .model_type = model_type,
-        });
     }
 
     // Stable order: by id ascending, so listing is deterministic.
@@ -285,6 +250,83 @@ pub fn discoverModels(io: std.Io, allocator: std.mem.Allocator, model_dir: []con
         .models = try found.toOwnedSlice(allocator),
         .allocator = allocator,
     };
+}
+
+/// Inspect `parent/<name>` as a model-dir candidate; append to `found` if
+/// it holds a supported config.json. Returns true when the dir was
+/// model-shaped (config.json present — even if unsupported), so callers
+/// know not to descend into it looking for an org layout.
+fn tryAddModel(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    parent: std.Io.Dir,
+    name: []const u8,
+    id_prefix: []const u8,
+    model_dir: []const u8,
+    found: *std.ArrayList(DiscoveredModel),
+) !bool {
+    var sub = parent.openDir(io, name, .{}) catch return false;
+    defer sub.close(io);
+
+    const cfg_stat = sub.statFile(io, "config.json", .{}) catch return false;
+    if (cfg_stat.kind != .file) return false;
+
+    // Filter by supported model_type AND quantization scheme. Catches:
+    //   - partially-downloaded checkpoints (missing/garbage config)
+    //   - unsupported arches (e.g. deepseek_v4, MLA + indexer)
+    //   - unsupported quants (modes outside supported_quant_modes)
+    // before they reach the tokenizer/weight loaders.
+    const model_type: []const u8 = switch (peekConfig(io, allocator, parent, name)) {
+        .missing_or_unparseable => {
+            log.info("[discovery] skip {s}: config.json missing or unparseable", .{name});
+            return true;
+        },
+        .unsupported_arch => |mt| {
+            defer allocator.free(mt);
+            log.info("[discovery] skip {s}: unsupported model_type '{s}'", .{ name, mt });
+            return true;
+        },
+        .unsupported_quant => |mode| {
+            defer allocator.free(mode);
+            log.info("[discovery] skip {s}: unsupported quantization mode '{s}' (supported: affine, nvfp4, mxfp4, mxfp8)", .{ name, mode });
+            return true;
+        },
+        .supported => |mt| mt, // ownership moves to the DiscoveredModel
+    };
+    errdefer if (model_type.len > 0) allocator.free(model_type);
+
+    // Compute weight bytes (sum of *.safetensors sizes) — best-effort.
+    var bytes: u64 = 0;
+    var bytes_ok = false;
+    var sub_iter_dir = parent.openDir(io, name, .{ .iterate = true }) catch null;
+    if (sub_iter_dir) |*sd| {
+        defer sd.close(io);
+        var sd_iter = sd.iterate();
+        while (sd_iter.next(io) catch null) |sub_entry| {
+            if (sub_entry.kind != .file) continue;
+            if (!std.mem.endsWith(u8, sub_entry.name, ".safetensors")) continue;
+            const st = sd.statFile(io, sub_entry.name, .{}) catch continue;
+            bytes += @intCast(st.size);
+            bytes_ok = true;
+        }
+    }
+
+    const id = if (id_prefix.len > 0)
+        try std.fmt.allocPrint(allocator, "{s}/{s}", .{ id_prefix, name })
+    else
+        try allocator.dupe(u8, name);
+    errdefer allocator.free(id);
+    const path = if (id_prefix.len > 0)
+        try std.fmt.allocPrint(allocator, "{s}/{s}/{s}", .{ trimTrailingSlash(model_dir), id_prefix, name })
+    else
+        try std.fmt.allocPrint(allocator, "{s}/{s}", .{ trimTrailingSlash(model_dir), name });
+    try found.append(allocator, .{
+        .id = id,
+        .path = path,
+        .bytes_on_disk = if (bytes_ok) bytes else null,
+        .model_type = model_type,
+    });
+    return true;
 }
 
 fn trimTrailingSlash(s: []const u8) []const u8 {
@@ -452,6 +494,35 @@ fn lessThanById(_: void, a: DiscoveredModel, b: DiscoveredModel) bool {
 // ── Tests ──
 
 const testing = std.testing;
+
+test "discoverModels finds flat and org/repo model dirs" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "flat-model");
+    try tmp.dir.writeFile(io, .{ .sub_path = "flat-model/config.json", .data = "{\"model_type\":\"gemma3\"}" });
+    // HF-style org/repo layout — the DownloadManager / `mlx-serve pull`
+    // convention. Must be discovered with id "org/name".
+    try tmp.dir.createDirPath(io, "mlx-community/nested-model");
+    try tmp.dir.writeFile(io, .{ .sub_path = "mlx-community/nested-model/config.json", .data = "{\"model_type\":\"qwen3\"}" });
+    // Junk that must not surface: an org dir with a non-model child, and a
+    // dot-dir.
+    try tmp.dir.createDirPath(io, "empty-org/not-a-model");
+    try tmp.dir.createDirPath(io, ".hidden/whatever");
+
+    var result = try discoverModelsInDir(io, allocator, tmp.dir, "/models-root");
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 2), result.models.len);
+    try std.testing.expectEqualStrings("flat-model", result.models[0].id);
+    try std.testing.expectEqualStrings("/models-root/flat-model", result.models[0].path);
+    try std.testing.expectEqualStrings("gemma3", result.models[0].model_type);
+    try std.testing.expectEqualStrings("mlx-community/nested-model", result.models[1].id);
+    try std.testing.expectEqualStrings("/models-root/mlx-community/nested-model", result.models[1].path);
+    try std.testing.expectEqualStrings("qwen3", result.models[1].model_type);
+}
 
 test "trimTrailingSlash" {
     try testing.expectEqualStrings("foo", trimTrailingSlash("foo/"));
