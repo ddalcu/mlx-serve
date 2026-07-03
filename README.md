@@ -53,17 +53,18 @@ If you're already on LM Studio, Ollama, or `mlx-lm` and wondering whether to swi
 | `run <model>` CLI with auto-download + REPL | ✅ | ❌ | ✅ | ❌ |
 | OpenAI Responses API + WebSockets | ✅ | ❌ | ❌ | ❌ |
 | DeepSeek V4 Flash (284B) | ✅ via ds4 | ❌ | ❌ | ❌ |
-| Speculative decoding (PLD + drafter) | ✅ | ❌ | partial | drafter only |
+| Speculative decoding (PLD + drafter + native MTP) | ✅ | ❌ | partial | drafter only |
 | Decode speed (geomean vs LM Studio, identical weights) | **+35%** (MLX) | baseline | ~−15% (GGUF, est.¹) | +11% (MLX) |
 | KV-cache quantization (4/8-bit + TurboQuant) | ✅ | ❌ | partial | ✅ |
 | Continuous batching | ✅ | ❌ | ✅ | ❌ |
 | Built-in agent loop + MCP client | ✅ 10 tools | ❌ | ❌ | ❌ |
+| Sandboxed agent shell (isolated Linux VM) | ✅ | ❌ | ❌ | ❌ |
 | One-click launchers (Claude Code, OpenCode, Pi) | ✅ | ❌ | ❌ | ❌ |
 | Python required at runtime | ❌ | ❌ | ❌ | ✅ |
 | Native menu-bar app (no Electron) | ✅ | ❌ Electron | ❌ | ❌ |
-| **Image Generation** | ✅ | ❌ | ❌ | ❌ |
-| **Video Generation** | ✅ | ❌ | ❌ | ❌ |
-| **Audio Generation** | ✅ | ❌ | ❌ | ❌ |
+| **Image generation + photo editing** | ✅ | ❌ | ❌ | ❌ |
+| **Video generation** (text / image / audio → video) | ✅ | ❌ | ❌ | ❌ |
+| **Audio generation + voice cloning** | ✅ | ❌ | ❌ | ❌ |
 | License | MIT | proprietary | MIT | MIT |
 
 ¹ Ollama can't run MLX, so the comparison is GGUF-vs-GGUF. 
@@ -102,6 +103,7 @@ Across 18 cells (best mlx-serve vs best LM Studio, geomean): **+35%**. Reproduce
 - **Ollama-compatible API** — `/api/chat`, `/api/generate`, `/api/tags`, `/api/show`, `/api/ps`, `/api/embed`, `/api/pull` speak the Ollama wire (NDJSON streaming, tool calls with object arguments, `thinking`, `format` JSON schemas, `name:latest` model names), so the whole Ollama client ecosystem works against mlx-serve unchanged.
 - **Ollama-grade CLI** — `mlx-serve run gemma4` downloads (resumable), serves, and drops you into a streaming chat REPL; `pull` / `list` / `serve` manage a shared `~/.mlx-serve/models` store the GUI app uses too.
 - **Speculative decoding** — PLD (model-agnostic n-gram lookup, on by default) + the Gemma 4 cross-attention drafter. Adaptive prompt-time and runtime gates keep novel-content workloads at parity; agentic code loops see up to 1.6×.
+- **Native multi-token prediction (Qwen 3.6)** — checkpoints shipping a trained `mtp/` sidecar (like [Qwen3.6-27B-4bit-MTP](https://huggingface.co/ddalcu/Qwen3.6-27B-4bit-MTP-MLX-Serve)) speculate with the model's own head automatically: up to 1.8× on agent-style edit loops, self-tuning draft depth, zero setup.
 - **KV-cache quantization** — 4-bit / 8-bit / TurboQuant variants shrink KV memory ~4× / ~2× / further still, so 16K contexts fit on hardware that couldn't hold them dense.
 - **Continuous batching** — `--max-concurrent N` batches decode requests through one forward pass for ~1.6× throughput at 4-way parallel.
 - **Prefix cache** — shared system-prompt KV reuse across turns and across conversations. v26.5.7 adds an LRU of llama.cpp KV sessions so multi-doc agent loops stay warm.
@@ -118,6 +120,12 @@ Menu-bar app that wraps the server with a full UI:
 - **Chat interface** — multi-session chat with markdown rendering. Drop in PDFs (PDFKit-extracted) or images alongside text.
 - **Agent mode** — 10 built-in tools (shell, cwd, readFile, writeFile, editFile, searchFiles, listFiles, browse, webSearch, saveMemory) with automatic tool calling loop and a per-tool approval dialog (**Allow** / **Deny** / **Always allow this session**).
 - **MCP client** — curated marketplace of stdio + HTTP MCP servers (GitHub, Azure DevOps, DBHub, Docker, Kubernetes, Playwright, Slack, Notion, Filesystem, Shell) plus your own from `~/.mlx-serve/mcp.json`.
+- **Agent Sandbox** — flip one toggle and every agent shell command runs inside an isolated Linux VM built on Apple's Virtualization framework: boots in under a second, guest servers mirror to `localhost` live (an Express app on guest port 8080 is `http://localhost:8080` on your Mac), and a green shield in the toolbar shows when commands run isolated. Let the agent go wild — your Mac stays untouched.
+- **⌃Space Quick Launcher** — a Spotlight-style prompt panel over any app: hit ⌃Space, ask, and the answer streams in from your local model. Follow-ups keep context; ⌘↩ hands the conversation off to the full chat window.
+- **Hands-free Voice Mode** — say "Hey Loki" and just talk: on-device speech recognition (audio never leaves the Mac), spoken replies with barge-in interruption, and voice-driven agent tools — all from the menu bar with no window open.
+- **Telegram bridge** — message your local model from your phone: no public URL, no port-forwarding, no cloud relay. Agent tools and scheduled tasks work remotely; the bot locks to the first chat that messages it.
+- **Scheduled tasks** — hand the agent a goal and a schedule in plain English ("weekdays at 8am, check my watched sites and write a briefing") and it runs unattended, with saved transcripts.
+- **Document folder RAG** — attach a folder of mixed files and ask questions about them; GPU-batched embeddings index ~500 files in ~7 s, everything in memory, nothing leaves the Mac.
 - **Editable system prompt + persistent memory** — `~/.mlx-serve/system-prompt.md` and `~/.mlx-serve/memory.md`.
 - **Prompt-based skills** — drop `.md` files into `~/.mlx-serve/skills/` with YAML frontmatter to teach the agent custom capabilities triggered by keywords.
 - **Engine-aware Settings window** (Cmd+,) — every server-launch flag and per-request default, with sections that show only the knobs relevant to the engine you've loaded (MLX vs GGUF vs ds4).
@@ -131,6 +139,14 @@ The tray has **ImageGen**, **VideoGen** and **AudioGen** buttons that run [FLUX.
 Launch MLX Core, click the ImageGen, VideoGen or AudioGen tray icon, and hit **Download**. Each panel remembers your last-used model, quality, resolution, steps and seed between sessions, so you don't re-pick them every time.
 
 You can also **generate images straight from chat**: in Agent mode, ask for an image and it renders inline in the conversation using your saved Image settings — double-click any chat image to open it full-size in Preview. (Audio and video generation live in their tray windows for now.)
+
+And it goes well beyond text-to-X:
+
+- **Edit photos with instructions** — attach a picture, type *"make the hair blue"* or *"remove the monitor in the background"*, and FLUX.2-klein edits it while keeping subject, pose, and scene intact (in-context reference conditioning — 0.97 structural correlation measured live). The source keeps its own aspect ratio, never squished.
+- **Image-to-image variations** — every image model (Krea-2 included) takes a source image plus a strength slider, from subtle remix to full re-imagination.
+- **Animate your photos** — drop a picture into the Video pane's First-frame slot and LTX animates forward from it, starting exactly on your image.
+- **Talking characters** — put spoken lines in quotes in the video prompt, attach a real speech or music clip, or type a line for Qwen3-TTS to voice — the video is generated *against* that soundtrack, performance synced, and the original audio (not a re-synthesis) lands in the mp4.
+- **Style LoRAs** — attach any diffusers-format LoRA `.safetensors` to restyle LTX, FLUX, or Krea generations at runtime — no re-quantization, zero quality loss on the base weights.
 
 **Models:**
 
@@ -152,7 +168,8 @@ Outputs go to `~/.mlx-serve/generations/images/YYYY-MM-DD/` and `.../videos/YYYY
 |---|---|---|---|---|
 | **Gemma 4** | `gemma4` | `gemma-4-e2b-it-4bit`, `gemma-4-e4b-it-8bit`, `gemma-4-26b-a4b-it-4bit` | Gemma turns | SigLIP |
 | **Gemma 3** | `gemma3` | `gemma-3-12b-it-qat-4bit` | Gemma turns | -- |
-| **Qwen 3 / 3.5 / 3.6** | `qwen3`, `qwen3_5`, `qwen3_5_moe`, `qwen3_next` | `Qwen3-4B`, `Qwen3.5-4B`, `Qwen3.6-35B-A3B` | ChatML | -- |
+| **DiffusionGemma** | `diffusion_gemma` | `diffusiongemma-26B-A4B-it-4bit` | Gemma turns (block diffusion) | -- |
+| **Qwen 3 / 3.5 / 3.6** | `qwen3`, `qwen3_5`, `qwen3_5_moe`, `qwen3_next` | `Qwen3-4B`, `Qwen3.5-4B`, `Qwen3.6-35B-A3B` | ChatML | Qwen3-VL |
 | **Nemotron-H** | `nemotron_h` | Nemotron-3-Nano-4B | ChatML | -- |
 | **LFM2** | `lfm2` | LFM2.5-350M | ChatML | -- |
 | **Llama** | `llama` | Llama 3, Llama 3.1, Llama 3.2 | Llama-3 | -- |
@@ -386,7 +403,7 @@ Yes — every cell, every model we've benchmarked. On identical 4-bit MLX weight
 For most use cases, yes. mlx-serve runs the same MLX and GGUF models, exposes an OpenAI-compatible API on the same kind of port, and ships a native menu-bar app instead of an Electron one. It also adds things LM Studio doesn't have: a real Anthropic Messages API (works with Claude Code), the OpenAI Responses API + WebSockets, MCP tool calling, agent mode with 10 built-in tools, KV-cache quantization, continuous batching, and the [antirez/ds4](https://github.com/antirez/ds4) engine for DeepSeek V4 Flash.
 
 ### Does mlx-serve replace Ollama?
-On Apple Silicon, yes. Ollama is cross-platform and uses llama.cpp; mlx-serve runs llama.cpp **and** native MLX with the Mac-specific optimizations Ollama doesn't ship (Metal kernels through mlx-c, JIT-compiled activations, shared-prefix KV cache, the Gemma 4 cross-attention drafter). If you're on a Mac and only need the model APIs, you can drop in `http://localhost:11234` wherever you had `http://localhost:11434` — both wires are OpenAI-compatible.
+On Apple Silicon, yes — mlx-serve **speaks the Ollama API natively** (`/api/chat`, `/api/generate`, `/api/tags`, `/api/embed`, `/api/pull`, …), so Raycast, Obsidian, Enchanted, Open WebUI, and `ollama-python`/`js` work unchanged: drop in `http://localhost:11234` wherever you had `http://localhost:11434`. The CLI workflow matches too (`mlx-serve run gemma4`, `pull`, `list`, `serve`). Underneath, you get llama.cpp **and** native MLX with the Mac-specific optimizations Ollama doesn't ship (Metal kernels through mlx-c, speculative decoding, shared-prefix KV cache, the Gemma 4 cross-attention drafter).
 
 ### Can I run GGUF models on my Mac without Python?
 Yes. mlx-serve embeds llama.cpp's inference library (`libllama`) inside the same signed, notarized binary. Point `--model` at any `.gguf` and the server auto-detects the format and routes to the right engine — no `pip`, no venv, no `llama-server` to install separately. DeepSeek V4 Flash GGUFs go through the dedicated [antirez/ds4](https://github.com/antirez/ds4) engine instead, also embedded.

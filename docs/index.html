@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>mlx-serve — Run any LLM on your Mac · MLX + GGUF · faster than LM Studio · OpenAI + Anthropic API</title>
   <meta name="description" content="Native Zig inference server for Apple Silicon. Runs any LLM — MLX and GGUF — faster than LM Studio. OpenAI- and Anthropic-compatible (Claude Code) APIs. No Python. Drop-in alternative to LM Studio, Ollama, and llama.cpp on macOS. Gemma 4, Qwen 3.6, Llama 3, Mistral, DeepSeek V4 Flash — local, MIT-licensed.">
-  <meta name="keywords" content="MLX, MLX server, mlx-serve, Apple Silicon LLM, local LLM Mac, LM Studio alternative, Ollama alternative, llama.cpp Mac, GGUF Apple Silicon, OpenAI compatible local, Anthropic API local, Claude Code local, DeepSeek V4 Flash, Gemma 4, Qwen 3.6, M1 M2 M3 M4 LLM, native MLX inference">
+  <meta name="keywords" content="MLX, MLX server, mlx-serve, Apple Silicon LLM, local LLM Mac, LM Studio alternative, Ollama alternative, Ollama API compatible, Ollama drop-in replacement, llama.cpp Mac, GGUF Apple Silicon, OpenAI compatible local, Anthropic API local, Claude Code local, DeepSeek V4 Flash, Gemma 4, Qwen 3.6, M1 M2 M3 M4 LLM, native MLX inference, local image generation Mac, AI photo editing local, image to video Mac, AI agent sandbox">
   <meta name="author" content="David Dalcu">
   <link rel="canonical" href="https://ddalcu.github.io/mlx-serve/">
   <!-- Open Graph -->
@@ -88,7 +88,7 @@
         "name": "Does mlx-serve replace Ollama on Mac?",
         "acceptedAnswer": {
           "@type": "Answer",
-          "text": "On Apple Silicon, yes. Ollama is cross-platform and uses llama.cpp; mlx-serve runs llama.cpp AND native MLX with the Mac-specific optimizations Ollama doesn't ship — Metal kernels through mlx-c, JIT-compiled activations, shared-prefix KV cache, and the Gemma 4 cross-attention drafter. The OpenAI-compatible wire is identical, so you can drop in http://localhost:11234 wherever you had http://localhost:11434."
+          "text": "On Apple Silicon, yes — mlx-serve speaks the Ollama API natively (/api/chat, /api/generate, /api/tags, /api/embed, /api/pull), so Raycast, Obsidian, Enchanted, Open WebUI, and ollama-python/js work unchanged: drop in http://localhost:11234 wherever you had http://localhost:11434. The CLI workflow matches too — mlx-serve run gemma4 downloads, serves, and chats in one command. Underneath, it runs llama.cpp AND native MLX with the Mac-specific optimizations Ollama doesn't ship — Metal kernels through mlx-c, speculative decoding, and a shared-prefix KV cache."
         }
       },
       {
@@ -128,7 +128,7 @@
         "name": "Can mlx-serve generate images, video, and audio locally?",
         "acceptedAnswer": {
           "@type": "Answer",
-          "text": "Yes — all on-device, no Python. Image: Krea-2-Turbo (a 12.9B photorealistic model) and FLUX.2 run natively on MLX, validated pixel-faithful to the reference (end-to-end cosine 0.9996); generate from the menu-bar tray, or just ask the agent for an image in chat and it renders inline. Video: LTX-Video 2.3 turns a prompt or a first frame into a ~4-second clip with synced audio. Audio: Qwen3-TTS does zero-shot voice cloning from a few seconds of reference audio, no transcript needed. Chat and every media type share one local server and one memory budget — a model loads on demand and unloads when done."
+          "text": "Yes — all on-device, no Python. Image: Krea-2-Turbo (a 12.9B photorealistic model) and FLUX.2 run natively on MLX, validated pixel-faithful to the reference (end-to-end cosine 0.9996); it also edits photos from a plain instruction ('make the hair blue') while keeping subject and scene, does image-to-image variations with a strength slider, and takes runtime style LoRAs. Video: LTX-Video 2.3 turns a prompt, a photo, or a soundtrack into a clip with synced audio — put spoken lines in quotes and characters talk, lips synced to the voice. Audio: Qwen3-TTS does zero-shot voice cloning from a few seconds of reference audio, no transcript needed. Chat and every media type share one local server and one memory budget — a model loads on demand and unloads when done."
         }
       },
       {
@@ -1085,8 +1085,8 @@
   <section class="hero">
     <div class="hero-glow"><span class="g1"></span><span class="g2"></span><span class="g3"></span></div>
     <a href="https://github.com/ddalcu/mlx-serve/releases/latest" class="hero-badge">
-      <span class="new-pill">v26.6.13</span>
-      Image, video &amp; audio generation — Krea-2 &amp; FLUX.2 run locally, all native
+      <span class="new-pill">v26.7.1</span>
+      Edit photos with words · talking-character video · ⌃Space launcher · drop-in Ollama API
       <span class="arrow">→</span>
     </a>
     <h1>Run any LLM<br>on your <span class="grad">Mac</span></h1>
@@ -1118,8 +1118,8 @@
   <!-- MARQUEE -->
   <div class="marquee" aria-hidden="true">
     <div class="marquee-track">
-      <span class="marquee-item">MLX + GGUF</span><span class="marquee-item">Krea-2 Image Gen</span><span class="marquee-item">Video + Audio Gen</span><span class="marquee-item">Voice Cloning</span><span class="marquee-item">DiffusionGemma</span><span class="marquee-item">DeepSeek V4 Flash</span><span class="marquee-item">Gemma 4</span><span class="marquee-item">Qwen 3.6 MTP</span><span class="marquee-item">Llama 3</span><span class="marquee-item">NVFP4 / MXFP4</span><span class="marquee-item">Mistral</span><span class="marquee-item">Nemotron-H</span><span class="marquee-item">LFM2.5</span><span class="marquee-item">Document RAG</span><span class="marquee-item">OpenAI API</span><span class="marquee-item">Anthropic API</span><span class="marquee-item">Claude Code</span><span class="marquee-item">MCP</span>
-      <span class="marquee-item">MLX + GGUF</span><span class="marquee-item">Krea-2 Image Gen</span><span class="marquee-item">Video + Audio Gen</span><span class="marquee-item">Voice Cloning</span><span class="marquee-item">DiffusionGemma</span><span class="marquee-item">DeepSeek V4 Flash</span><span class="marquee-item">Gemma 4</span><span class="marquee-item">Qwen 3.6 MTP</span><span class="marquee-item">Llama 3</span><span class="marquee-item">NVFP4 / MXFP4</span><span class="marquee-item">Mistral</span><span class="marquee-item">Nemotron-H</span><span class="marquee-item">LFM2.5</span><span class="marquee-item">Document RAG</span><span class="marquee-item">OpenAI API</span><span class="marquee-item">Anthropic API</span><span class="marquee-item">Claude Code</span><span class="marquee-item">MCP</span>
+      <span class="marquee-item">MLX + GGUF</span><span class="marquee-item">Ollama API</span><span class="marquee-item">Photo Editing</span><span class="marquee-item">Image-to-Video</span><span class="marquee-item">Talking Characters</span><span class="marquee-item">Style LoRAs</span><span class="marquee-item">Agent Sandbox</span><span class="marquee-item">⌃Space Launcher</span><span class="marquee-item">Krea-2 Image Gen</span><span class="marquee-item">Voice Cloning</span><span class="marquee-item">DiffusionGemma</span><span class="marquee-item">DeepSeek V4 Flash</span><span class="marquee-item">Gemma 4</span><span class="marquee-item">Qwen 3.6 MTP</span><span class="marquee-item">Llama 3</span><span class="marquee-item">NVFP4 / MXFP4</span><span class="marquee-item">Document RAG</span><span class="marquee-item">OpenAI API</span><span class="marquee-item">Anthropic API</span><span class="marquee-item">Claude Code</span><span class="marquee-item">MCP</span>
+      <span class="marquee-item">MLX + GGUF</span><span class="marquee-item">Ollama API</span><span class="marquee-item">Photo Editing</span><span class="marquee-item">Image-to-Video</span><span class="marquee-item">Talking Characters</span><span class="marquee-item">Style LoRAs</span><span class="marquee-item">Agent Sandbox</span><span class="marquee-item">⌃Space Launcher</span><span class="marquee-item">Krea-2 Image Gen</span><span class="marquee-item">Voice Cloning</span><span class="marquee-item">DiffusionGemma</span><span class="marquee-item">DeepSeek V4 Flash</span><span class="marquee-item">Gemma 4</span><span class="marquee-item">Qwen 3.6 MTP</span><span class="marquee-item">Llama 3</span><span class="marquee-item">NVFP4 / MXFP4</span><span class="marquee-item">Document RAG</span><span class="marquee-item">OpenAI API</span><span class="marquee-item">Anthropic API</span><span class="marquee-item">Claude Code</span><span class="marquee-item">MCP</span>
     </div>
   </div>
 
@@ -1255,6 +1255,13 @@
         <p>Drop-in chat completions, streaming, tool calling, embeddings, the Responses API and WebSockets — plus a native Anthropic Messages endpoint, so you can point Claude Code at a local model.</p>
       </div>
       <div class="feature-card reveal">
+        <div class="feature-icon" style="background: linear-gradient(135deg, #0071e3, #30d158);">
+          <svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/></svg>
+        </div>
+        <h3>Drop-in Ollama API</h3>
+        <p>mlx-serve speaks the Ollama wire natively — <code>/api/chat</code>, <code>/api/generate</code>, <code>/api/tags</code>, <code>/api/embed</code>, <code>/api/pull</code>. Point Raycast, Obsidian, Enchanted, Open WebUI, or ollama-python/js at your mlx-serve port and they just work — same models, faster engine. And <code>mlx-serve run gemma4</code> pulls, serves, and chats from one command.</p>
+      </div>
+      <div class="feature-card reveal">
         <div class="feature-icon fi-batch">
           <svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg>
         </div>
@@ -1274,6 +1281,20 @@
         </div>
         <h3>Built-in agent + MCP</h3>
         <p>Ten built-in tools — shell, file read/write/edit, search, browse, web search, memory — with a per-tool approval dialog. Connect MCP servers from a curated marketplace, or extend with markdown skills.</p>
+      </div>
+      <div class="feature-card reveal">
+        <div class="feature-icon" style="background: linear-gradient(135deg, #30d158, #1d1d1f);">
+          <svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/><path d="m9 12 2 2 4-4"/></svg>
+        </div>
+        <h3>Agent Sandbox — a VM, not your Mac</h3>
+        <p>One toggle routes every agent shell command into an isolated Linux VM built on Apple's own Virtualization framework. It boots in under a second, servers the agent starts mirror live to <code>localhost</code>, and a green shield shows when commands run isolated. Let the agent go wild — your files stay untouched.</p>
+      </div>
+      <div class="feature-card reveal">
+        <div class="feature-icon" style="background: linear-gradient(135deg, #ff9f0a, #bf5af2);">
+          <svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>
+        </div>
+        <h3>⌃Space Quick Launcher</h3>
+        <p>A Spotlight-style panel that summons over any app: hit <b>⌃Space</b>, type, and the answer streams in from your local model — no window shuffling. Follow-ups keep their context, <b>⌘↩</b> hands the thread to the chat window, and Esc dismisses while the reply finishes in your sidebar.</p>
       </div>
       <div class="feature-card reveal">
         <div class="feature-icon fi-app">
@@ -1321,15 +1342,15 @@
         <div class="feature-icon" style="background: linear-gradient(135deg, #ff9f0a, #ff375f);">
           <svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.1-3.1a2 2 0 0 0-2.8 0L6 21"/></svg>
         </div>
-        <h3>Image generation — Krea-2 &amp; FLUX.2</h3>
-        <p><b>Krea-2-Turbo</b>, a 12.9B photorealistic model, runs entirely on your Mac — validated pixel-faithful to the reference (end-to-end cosine 0.9996), any size from 256² to 2048². FLUX.2 too. Generate from the tray, or just ask the agent in chat and the image renders inline. An on-device NSFW filter screens results; nothing leaves your Mac.</p>
+        <h3>Image generation &amp; photo editing</h3>
+        <p><b>Krea-2-Turbo</b> (12.9B, photorealistic) and <b>FLUX.2</b> run entirely on your Mac — validated pixel-faithful to the reference, any size 256²–2048². And it edits, not just generates: attach a photo, type <i>"make the hair blue"</i>, and the subject, pose, and scene survive. Image-to-image variations with a strength slider, runtime style LoRAs, inline generation from chat. Nothing leaves your Mac.</p>
       </div>
       <div class="feature-card reveal">
         <div class="feature-icon" style="background: linear-gradient(135deg, #ff453a, #ff9f0a);">
           <svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m22 8-6 4 6 4V8Z"/><rect x="2" y="6" width="14" height="12" rx="2" ry="2"/></svg>
         </div>
-        <h3>Video generation</h3>
-        <p>LTX-Video 2.3 turns a prompt — or a first frame — into a ~4-second 24 fps clip with synced audio, all on-device. Image-to-video conditioning, and one- or two-stage pipelines that trade speed for quality. Outputs MP4.</p>
+        <h3>Video generation — with a voice</h3>
+        <p>LTX-Video 2.3 turns a prompt, a photo, or a soundtrack into a 24 fps clip with synced audio, all on-device. Put spoken lines in quotes and your characters <b>talk</b>; attach a real voice clip — or a line spoken by local TTS — and the performance follows it, original audio muxed into the MP4. Animate a photo from the First-frame slot; two-stage presets when you want maximum quality, ~2× faster this release.</p>
       </div>
       <div class="feature-card reveal">
         <div class="feature-icon" style="background: linear-gradient(135deg, #30d158, #0a84ff);">
@@ -1363,15 +1384,15 @@
           </button>
         </div>
         <div class="code-body">
-<pre><span class="comment"># Build from source (or grab a release)</span>
-<span class="cmd">git clone</span> https://github.com/ddalcu/mlx-serve
-<span class="cmd">cd</span> mlx-serve
-<span class="cmd">zig build</span> <span class="flag">-Doptimize=ReleaseFast</span>
+<pre><span class="comment"># Install via Homebrew (or grab the app from Releases)</span>
+<span class="cmd">brew tap</span> ddalcu/mlx-serve https://github.com/ddalcu/mlx-serve
+<span class="cmd">brew install</span> mlx-serve
 
-<span class="comment"># Serve a model — speculative decoding (PLD) is on by default</span>
-<span class="cmd">./zig-out/bin/mlx-serve</span> \
-  <span class="flag">--model</span> <span class="string">~/models/gemma-4-e4b-it-4bit</span> \
-  <span class="flag">--serve</span> <span class="flag">--port</span> <span class="string">8080</span></pre>
+<span class="comment"># One command: download, serve, chat — Ollama-style</span>
+<span class="cmd">mlx-serve run</span> <span class="string">gemma4</span>
+
+<span class="comment"># Or serve everything you've pulled, loading on demand</span>
+<span class="cmd">mlx-serve serve</span></pre>
         </div>
       </div>
 
@@ -1484,7 +1505,7 @@
       </details>
       <details class="faq-item">
         <summary>Does mlx-serve replace Ollama on Mac?</summary>
-        <p>On Apple Silicon, yes. Ollama is cross-platform and uses llama.cpp; mlx-serve runs llama.cpp <b>and</b> native MLX with the Mac-specific optimizations Ollama doesn't ship — Metal kernels through mlx-c, JIT-compiled activations, shared-prefix KV cache, and the Gemma 4 cross-attention drafter. The OpenAI-compatible wire is identical, so you can drop in <code>http://localhost:11234</code> wherever you had <code>http://localhost:11434</code>.</p>
+        <p>On Apple Silicon, yes — mlx-serve <b>speaks the Ollama API natively</b> (<code>/api/chat</code>, <code>/api/generate</code>, <code>/api/tags</code>, <code>/api/embed</code>, <code>/api/pull</code>…), so Raycast, Obsidian, Enchanted, Open WebUI, and ollama-python/js work unchanged: drop in <code>http://localhost:11234</code> wherever you had <code>http://localhost:11434</code>. The CLI matches too — <code>mlx-serve run gemma4</code> downloads, serves, and chats in one command. Underneath, it runs llama.cpp <b>and</b> native MLX with the Mac-specific optimizations Ollama doesn't ship — Metal kernels through mlx-c, speculative decoding, and a shared-prefix KV cache.</p>
       </details>
       <details class="faq-item">
         <summary>Can I run GGUF models on Mac without Python?</summary>
@@ -1520,7 +1541,7 @@
       </details>
       <details class="faq-item">
         <summary>Can mlx-serve generate images, video, and audio locally?</summary>
-        <p>Yes — all on-device, no Python. <b>Image:</b> <b>Krea-2-Turbo</b> (a 12.9B photorealistic model) and FLUX.2 run natively on MLX, validated pixel-faithful to the reference; generate from the menu-bar tray, or just ask the agent for an image in chat and it renders inline. <b>Video:</b> LTX-Video 2.3 turns a prompt or a first frame into a ~4-second clip with synced audio. <b>Audio:</b> Qwen3-TTS does zero-shot voice cloning from a few seconds of reference audio — no transcript needed. Chat and every media type share one local server and one memory budget: a model loads on demand and unloads when done, so a chat model and a media model can coexist.</p>
+        <p>Yes — all on-device, no Python. <b>Image:</b> <b>Krea-2-Turbo</b> (a 12.9B photorealistic model) and FLUX.2 run natively on MLX, validated pixel-faithful to the reference — and it <b>edits photos from a plain instruction</b> ("make the hair blue") while keeping subject and scene, does image-to-image variations with a strength slider, and takes runtime style LoRAs. <b>Video:</b> LTX-Video 2.3 turns a prompt, a photo, or a soundtrack into a clip with synced audio — put spoken lines in quotes and characters talk, lips synced to the voice. <b>Audio:</b> Qwen3-TTS does zero-shot voice cloning from a few seconds of reference audio — no transcript needed. Chat and every media type share one local server and one memory budget: a model loads on demand and unloads when done, so a chat model and a media model can coexist.</p>
       </details>
       <details class="faq-item">
         <summary>Where does my data go?</summary>
@@ -1545,7 +1566,7 @@
       <li><a href="https://github.com/ddalcu/mlx-serve/issues" target="_blank" rel="noopener">Issues</a></li>
       <li><a href="https://github.com/ddalcu/mlx-serve/stargazers" target="_blank" rel="noopener">★ Star</a></li>
     </ul>
-    <p class="footer-copy">MIT License · mlx-serve <span style="opacity:0.7;">v26.6.13</span> · built for Apple Silicon</p>
+    <p class="footer-copy">MIT License · mlx-serve <span style="opacity:0.7;">v26.7.1</span> · built for Apple Silicon</p>
   </footer>
 
   <script>
