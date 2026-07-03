@@ -1076,6 +1076,13 @@ fn handleConnection(
             return;
         },
         error.NoDefaultModel => {
+            // Headless gen-only boot (media models resident, no default chat
+            // model): /props keeps answering with the live memory counters —
+            // the app's tray polls it, and a 503 here read as "0 MB".
+            if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/props")) {
+                try handlePropsNoModel(allocator, stream);
+                return;
+            }
             try sendErrorResponse(allocator, stream, "503 Service Unavailable", "no_model", "No default model configured", 503);
             return;
         },
@@ -2395,6 +2402,23 @@ fn handleProps(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel) !v
     const available_mem = metrics.getAvailableMemBytes();
 
     const body = try renderPropsBody(allocator, config, ctx_str, active_mem, peak_mem, available_mem, safe_ctx);
+    defer allocator.free(body);
+    try sendResponse(stream, "200 OK", "application/json", body);
+}
+
+/// Memory-only `/props` for a boot with no default chat model (headless
+/// media-gen serving). Same `memory` object shape as `renderPropsBody` —
+/// `MemoryInfo.parse` client-side reads only that key — with the model
+/// fields omitted (there is no model config to describe).
+fn handlePropsNoModel(allocator: std.mem.Allocator, stream: *Conn) !void {
+    var active_mem: usize = 0;
+    var peak_mem: usize = 0;
+    _ = mlx.mlx_get_active_memory(&active_mem);
+    _ = mlx.mlx_get_peak_memory(&peak_mem);
+    const available_mem = metrics.getAvailableMemBytes();
+    const body = try std.fmt.allocPrint(allocator,
+        \\{{"total_slots":1,"memory":{{"active_bytes":{d},"peak_bytes":{d},"available_bytes":{d},"max_safe_context":0}}}}
+    , .{ active_mem, peak_mem, available_mem });
     defer allocator.free(body);
     try sendResponse(stream, "200 OK", "application/json", body);
 }

@@ -312,14 +312,18 @@ enum AgentEngine {
         return []
     }
 
-    /// Get the example JSON format from a tool's description.
+    /// Get the example JSON format from a tool's description. Slices from the
+    /// first `{` after the first "Example" marker, so wording variants like
+    /// "Example line-based: {…}" still yield a real example — an exact
+    /// "Example: " match silently degraded editFile's error steer to `{}`.
     static func toolExample(for toolName: String) -> String {
         for def in AgentPrompt.toolDefinitions {
             guard let fn = def["function"] as? [String: Any],
                   fn["name"] as? String == toolName,
                   let desc = fn["description"] as? String,
-                  let range = desc.range(of: "Example: ") else { continue }
-            return String(desc[range.upperBound...])
+                  let marker = desc.range(of: "Example") else { continue }
+            guard let brace = desc.range(of: "{", range: marker.upperBound..<desc.endIndex) else { continue }
+            return String(desc[brace.lowerBound...])
         }
         return "{}"
     }

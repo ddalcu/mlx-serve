@@ -64,6 +64,80 @@ final class MediaGenServiceTests: XCTestCase {
         XCTAssertEqual(pipeline(.twoStageHQ), "two_stage_hq")
     }
 
+    func testRequestBodyCarriesLoraWhenSet() {
+        var req = VideoGenRequest(model: .ltx23Q4, prompt: "p", width: 704, height: 480,
+                                  numFrames: 9, fps: 24, mode: .oneStage, steps: 8, cfgScale: 1.0)
+        req.loraPath = "/tmp/style.safetensors"
+        req.loraScale = 0.8
+        let body = VideoGenService.requestBody(model: "m", prompt: "p", request: req, firstFrameB64: nil)
+        XCTAssertEqual(body["lora_path"] as? String, "/tmp/style.safetensors")
+        XCTAssertEqual(body["lora_scale"] as? Double, 0.8)
+        // No LoRA → fields absent (a missing lora_path means detach server-side).
+        req.loraPath = nil
+        let bare = VideoGenService.requestBody(model: "m", prompt: "p", request: req, firstFrameB64: nil)
+        XCTAssertNil(bare["lora_path"])
+        XCTAssertNil(bare["lora_scale"])
+    }
+
+    func testCancelledErrorsMapToCancellationNotFailure() {
+        // A user cancel surfaces from URLSession as URLError.cancelled, NOT
+        // CancellationError — treating it as generic failure showed "Failed"
+        // after every Cancel click.
+        XCTAssertTrue(VideoGenService.isCancellation(CancellationError()))
+        XCTAssertTrue(VideoGenService.isCancellation(URLError(.cancelled)))
+        XCTAssertFalse(VideoGenService.isCancellation(URLError(.timedOut)))
+        XCTAssertFalse(VideoGenService.isCancellation(APIError.badStatus(code: 500, detail: "x")))
+    }
+
+    func testResidencyEntryMatching() {
+        // Discovered two-level id ("org/model") — the normal pull layout.
+        XCTAssertTrue(VideoGenService.entryMatches(
+            id: "dgrauet/ltx-2.3-mlx-q4", repo: "dgrauet/ltx-2.3-mlx-q4", dirBasename: "ltx-2.3-mlx-q4"))
+        // Path-registered ids: absolute path or bare basename.
+        XCTAssertTrue(VideoGenService.entryMatches(
+            id: "/x/models/dgrauet/ltx-2.3-mlx-q4", repo: "dgrauet/ltx-2.3-mlx-q4", dirBasename: "ltx-2.3-mlx-q4"))
+        XCTAssertTrue(VideoGenService.entryMatches(
+            id: "ltx-2.3-mlx-q4", repo: "dgrauet/ltx-2.3-mlx-q4", dirBasename: "ltx-2.3-mlx-q4"))
+        // A different model never matches.
+        XCTAssertFalse(VideoGenService.entryMatches(
+            id: "google/gemma-3-12b-it-4bit", repo: "dgrauet/ltx-2.3-mlx-q4", dirBasename: "ltx-2.3-mlx-q4"))
+        XCTAssertFalse(VideoGenService.entryMatches(
+            id: "org/other", repo: "dgrauet/ltx-2.3-mlx-q4", dirBasename: nil))
+    }
+
+    func testResidencyComputedFromModelsListNotProps() {
+        // The live bug: GPU memory came from /props, which 503s on a headless
+        // gen-only boot ("No default model configured") → "GPU memory 0 MB"
+        // while 30 GB of LTX was resident. Residency must reduce over the
+        // /v1/models snapshot (a no-model endpoint) instead.
+        let ltx = APIClient.parseModelInfo([
+            "id": "dgrauet/ltx-2.3-mlx-q4", "loaded": true,
+            "bytes_resident": UInt64(31_801_302_892),
+        ])
+        let chatLoaded = APIClient.parseModelInfo([
+            "id": "google/gemma-4-12b", "loaded": true,
+            "bytes_resident": UInt64(8_000_000_000),
+        ])
+        let chatUnloaded = APIClient.parseModelInfo([
+            "id": "google/gemma-3-4b", "loaded": false, "bytes_resident": UInt64(0),
+        ])
+
+        let r = VideoGenService.residency(
+            from: [ltx, chatLoaded, chatUnloaded],
+            repo: "dgrauet/ltx-2.3-mlx-q4", dirBasename: "ltx-2.3-mlx-q4")
+        XCTAssertTrue(r.loaded)
+        XCTAssertEqual(r.bytesResident, 31_801_302_892)
+        // GPU total sums every LOADED entry — unloaded stubs contribute nothing.
+        XCTAssertEqual(r.gpuResidentBytes, 39_801_302_892)
+
+        // Pane's model absent from the registry → not loaded, but the total
+        // still reports who holds the GPU.
+        let miss = VideoGenService.residency(
+            from: [chatLoaded], repo: "dgrauet/ltx-2.3-mlx-q4", dirBasename: "ltx-2.3-mlx-q4")
+        XCTAssertFalse(miss.loaded)
+        XCTAssertEqual(miss.gpuResidentBytes, 8_000_000_000)
+    }
+
     func testRequestBodyIncludesFirstFrameWhenPresent() {
         let req = VideoGenRequest(model: .ltx23Q4, prompt: "p", width: 704, height: 480,
                                   numFrames: 9, fps: 24, mode: .oneStage, steps: 8, cfgScale: 1.0)

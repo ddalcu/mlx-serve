@@ -498,12 +498,12 @@ struct EditFileHandler: ToolHandler {
         }
 
         // Line-number-based editing: startLine/endLine + replace
-        if let startStr = parameters["startLine"], let startLine = Int(startStr) {
+        if let startStr = parameters["startLine"], let startLine = Self.parseLineNumber(startStr) {
             guard let replace = parameters["replace"] else {
                 throw ToolError.executionFailed("editFile with startLine/endLine requires 'replace' parameter. You sent startLine=\(startStr) but no replace content. Example: {\"path\": \"file.js\", \"startLine\": \"5\", \"endLine\": \"8\", \"replace\": \"new code\"}")
             }
             let lines = content.components(separatedBy: "\n")
-            let endLine = Int(parameters["endLine"] ?? startStr) ?? startLine
+            let endLine = Self.parseLineNumber(parameters["endLine"]) ?? startLine
             let actualStart = max(1, startLine)
             let actualEnd = min(lines.count, endLine)
 
@@ -523,7 +523,13 @@ struct EditFileHandler: ToolHandler {
 
         // Text-based editing: find + replace
         guard let find = parameters["find"], !find.isEmpty else {
-            throw ToolError.missingParameter("Either 'find' or 'startLine' is required")
+            // Name the gap relative to what WAS sent: a model that dropped only
+            // startLine (live: 12 identical retries) needs "add startLine to the
+            // call you just made", not a restatement of the two modes.
+            if let endStr = parameters["endLine"], !endStr.isEmpty {
+                throw ToolError.executionFailed("editFile line-based mode needs BOTH startLine and endLine. You sent endLine=\(endStr) but no startLine — resend the same call with startLine added (the first line to replace, from readFile). Example: {\"path\": \"\(path)\", \"startLine\": \"45\", \"endLine\": \"\(endStr)\", \"replace\": \"new code\"}")
+            }
+            throw ToolError.missingParameter("Either 'find' (exact text to replace) or 'startLine'+'endLine' (line numbers from readFile) is required")
         }
         let replace = parameters["replace"] ?? ""
 
@@ -540,6 +546,16 @@ struct EditFileHandler: ToolHandler {
         content = content.replacingOccurrences(of: find, with: replace)
         try content.write(toFile: fullPath, atomically: true, encoding: .utf8)
         return "Edited \(path)"
+    }
+
+    /// Tolerant line-number parse: "45", "45,", " 45 " all read as 45. A weak
+    /// model's dirty value must not demote a line-based edit into the find
+    /// branch (startLine) or silently collapse the range (endLine) — the same
+    /// class as WriteFileHandler.appendFlagIsTrue's tolerant flag parse.
+    static func parseLineNumber(_ value: String?) -> Int? {
+        guard let value else { return nil }
+        let digits = value.drop(while: { !$0.isNumber }).prefix(while: { $0.isNumber })
+        return digits.isEmpty ? nil : Int(digits)
     }
 }
 

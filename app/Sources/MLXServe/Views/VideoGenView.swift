@@ -25,6 +25,8 @@ struct VideoGenView: View {
     @State private var cfgScale: Double = 1.0
     @State private var stgScale: Double = 0.0
     @State private var seed: Int = 42
+    /// Style LoRA (Advanced): .safetensors adapter path ("" = none).
+    @State private var loraPath: String = ""
     @State private var firstFrameImageURL: URL? = nil
     // ── Speech & sound (audio-to-video) ──
     /// Where the conditioning clip comes from. `.none` → the model invents a
@@ -79,6 +81,18 @@ struct VideoGenView: View {
             if case .completed(let path) = phase {
                 player = AVPlayer(url: URL(fileURLWithPath: path))
                 player?.play()
+            }
+            // Load/unload just happened (or a cancel left the model resident)
+            // — reflect it in the residency row right away.
+            let repo = model.repo
+            Task { await service.refreshResidency(repo: repo, server: server) }
+        }
+        // Slow residency poll while the window is open: is the model loaded,
+        // and how much GPU memory the server holds. Never starts the server.
+        .task {
+            while !Task.isCancelled {
+                await service.refreshResidency(repo: model.repo, server: server)
+                try? await Task.sleep(nanoseconds: 3_000_000_000)
             }
         }
         // TTS finished → attach the spoken line as the a2vid clip.
@@ -601,6 +615,87 @@ struct VideoGenView: View {
             Toggle("Keep model loaded after generating", isOn: $keepResident)
                 .font(.caption)
                 .help("On: the model stays resident so the next generation is instant. Off (default): it's unloaded to free GPU memory.")
+            residencyRow
+
+            Divider()
+            Text("Style LoRA").font(.caption.weight(.semibold))
+            if loraPath.isEmpty {
+                Button {
+                    chooseLora()
+                } label: {
+                    Label("Choose .safetensors…", systemImage: "paintpalette")
+                        .font(.caption)
+                }
+                Text("Apply a LoRA adapter to the video model for a custom style.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            } else {
+                HStack(spacing: 8) {
+                    Image(systemName: "paintpalette")
+                        .foregroundStyle(.secondary)
+                    Text(URL(fileURLWithPath: loraPath).lastPathComponent)
+                        .font(.caption)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .help(loraPath)
+                    Spacer()
+                    Button {
+                        loraPath = ""
+                        persist()
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                    }
+                    .buttonStyle(.borderless)
+                    .foregroundStyle(.secondary)
+                    .help("Remove the LoRA")
+                }
+                .padding(6)
+                .background(RoundedRectangle(cornerRadius: 6).fill(Color.secondary.opacity(0.08)))
+            }
+        }
+    }
+
+    /// Live "is the model resident, and what does the GPU hold" line under the
+    /// keep-loaded toggle — fed by the slow `/v1/models` poll.
+    private var residencyRow: some View {
+        HStack(spacing: 6) {
+            Circle()
+                .fill(service.residency?.loaded == true ? Color.green : Color.secondary.opacity(0.4))
+                .frame(width: 7, height: 7)
+            Text(residencyText)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .help("Live server state: whether this model is loaded, and the total memory held by all loaded models.")
+    }
+
+    private var residencyText: String {
+        guard server.status == .running, let r = service.residency else {
+            return "Model not loaded"
+        }
+        let gpu = MemoryInfo.format(r.gpuResidentBytes)
+        if r.loaded {
+            return "Model loaded · GPU memory \(gpu)"
+        }
+        // Other models resident without this one → say who holds the GPU
+        // (a chat model, or another pane's model).
+        if r.gpuResidentBytes > (1 << 29) {
+            return "Model not loaded · GPU memory \(gpu) in use"
+        }
+        return "Model not loaded"
+    }
+
+    private func chooseLora() {
+        let panel = NSOpenPanel()
+        if let st = UTType(filenameExtension: "safetensors") {
+            panel.allowedContentTypes = [st]
+        }
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        if panel.runModal() == .OK, let url = panel.url {
+            loraPath = url.path
+            persist()
         }
     }
 
@@ -708,6 +803,8 @@ struct VideoGenView: View {
                     }
                 case .completed(let path):
                     completedPreview(path: path)
+                case .cancelled:
+                    ContentUnavailableView("Cancelled", systemImage: "stop.circle", description: Text("Generation was cancelled."))
                 case .failed(let msg):
                     ContentUnavailableView {
                         Label("Failed", systemImage: "exclamationmark.triangle")
@@ -776,6 +873,11 @@ struct VideoGenView: View {
         stgScale = s.stgScale
         seed = s.seed
         keepResident = s.keepResident
+        loraPath = s.loraPath
+        // The LoRA file may have moved since last session — drop a stale path.
+        if !loraPath.isEmpty && !FileManager.default.fileExists(atPath: loraPath) {
+            loraPath = ""
+        }
         clampFramesToRAM()
     }
 
@@ -792,6 +894,7 @@ struct VideoGenView: View {
         s.stgScale = stgScale
         s.seed = seed
         s.keepResident = keepResident
+        s.loraPath = loraPath
         s.save()
     }
 
@@ -846,7 +949,8 @@ struct VideoGenView: View {
             stgScale: stgScale,
             firstFrameImagePath: firstFrameImageURL?.path,
             audioPath: audioURL?.path,
-            keepResident: keepResident
+            keepResident: keepResident,
+            loraPath: loraPath.isEmpty ? nil : loraPath
         )
         persist()
 

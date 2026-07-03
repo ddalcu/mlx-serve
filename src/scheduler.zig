@@ -2798,6 +2798,12 @@ fn runGenRequest(sch: *Scheduler, req: *GenRequest) void {
     req.model.gen_busy = true;
     req.run(req.ctx);
     req.model.gen_busy = false;
+    // Return the generation's transients to the OS. MLX parks freed buffers
+    // in its allocator cache (RSS stays), and unlike chat decode (which
+    // clears every 256 steps in generate.zig) a media gen frees tens of GB
+    // of denoise/VAE/encoder buffers in one burst — without this, each
+    // generation ratchets process RSS upward (observed ~100 GB by gen 2).
+    _ = mlx.mlx_clear_cache();
     req.done_mu.lockUncancelable(sch.io);
     req.done = true;
     req.done_cond.broadcast(sch.io);
@@ -2816,6 +2822,10 @@ fn runUnloadRequest(sch: *Scheduler, req: *UnloadRequest) void {
         @as(f64, @floatFromInt(bytes)) / 1_073_741_824.0,
     });
     entry.unloadResident();
+    // unloadResident freed the arrays into MLX's allocator cache — clear it
+    // so the unload actually returns the memory to the OS (the whole point
+    // of the load→generate→unload flow).
+    _ = mlx.mlx_clear_cache();
     // Drop any borrowed views that pointed at this entry so post-unload reads
     // don't dangle (gen entries leave xfm null already, but an LLM unload
     // must clear them).

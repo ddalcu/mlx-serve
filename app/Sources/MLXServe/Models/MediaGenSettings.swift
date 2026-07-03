@@ -146,6 +146,9 @@ struct VideoGenSettings: Codable, Equatable {
     var stgScale: Double = 0.0
     var seed: Int = 42
     var keepResident: Bool = false
+    /// Style LoRA (Advanced): sticky adapter path ("" = none) + strength.
+    var loraPath: String = ""
+    var loraScale: Double = 1.0
 
     private static let storageKey = "videoGenSettings"
 
@@ -186,5 +189,7 @@ extension VideoGenSettings {
         if let v = try c.decodeIfPresent(Double.self, forKey: .stgScale) { stgScale = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .seed) { seed = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .keepResident) { keepResident = v }
+        if let v = try c.decodeIfPresent(String.self, forKey: .loraPath) { loraPath = v }
+        if let v = try c.decodeIfPresent(Double.self, forKey: .loraScale) { loraScale = v }
     }
 }

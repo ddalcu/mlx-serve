@@ -182,7 +182,6 @@ private struct AttachmentPreviewRow: View {
                              icon: "waveform", tint: .purple) { audio.remove(at: idx) }
                 }
             }
-            .padding(.horizontal, 4)
         }
         .frame(height: 64)
     }
@@ -284,7 +283,6 @@ private struct DocumentFolderChip: View {
         .background(Color.secondary.opacity(0.15))
         .clipShape(RoundedRectangle(cornerRadius: 10))
         .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.horizontal, 4)
     }
 
     private var iconName: String {
@@ -328,7 +326,8 @@ private struct MicButton: View {
                 }
             }
             .foregroundStyle(recorder.isRecording ? Color.white : Color.secondary)
-            .frame(minWidth: 28, minHeight: 28, maxHeight: 28)
+            .frame(minWidth: ChatMetrics.composerIconSize,
+                   minHeight: ChatMetrics.composerIconSize, maxHeight: ChatMetrics.composerIconSize)
             .padding(.horizontal, recorder.isRecording ? 8 : 0)
             .background(recorder.isRecording ? Color.red : Color.secondary.opacity(0.15))
             .clipShape(Capsule())
@@ -341,6 +340,9 @@ private struct MicButton: View {
                         .allowsHitTesting(false)
                 }
             }
+            // Same full-height frame as the attach/send controls so the
+            // bottom-aligned composer row centers everything against the pill.
+            .frame(minWidth: ChatMetrics.composerControlSize, minHeight: ChatMetrics.composerControlSize)
         }
         .buttonStyle(.plain)
         .help(recorder.isRecording ? "Stop recording and attach" : "Record audio for the model to hear")
@@ -483,7 +485,8 @@ struct ChatSidebar: View {
                     .frame(maxWidth: .infinity)
             }
             .buttonStyle(.bordered)
-            .padding(10)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 10)
         }
     }
 
@@ -547,6 +550,9 @@ struct ChatDetailView: View {
     // post-generation code set it true to (re)focus the field.
     @State private var inputFocused = false
     @State private var composerHeight: CGFloat = 36
+    /// Measured width of this chat pane — drives the toolbar pill density
+    /// (full captions vs icon-only) via `ChatMetrics.useCompactToggles`.
+    @State private var detailWidth: CGFloat = 0
     // Pre-send intent nudge: when a message looks agentic / MCP-bound but the
     // matching mode is off, confirm before sending. `intentSuppress` remembers a
     // per-session "Send anyway" so we stop nagging that chat (keyed by session
@@ -594,6 +600,213 @@ struct ChatDetailView: View {
             inAppThinking: enableThinking, inAppAgent: isAgentMode, inAppMCP: mcpMode)
     }
 
+    // MARK: Toolbar mode pills (Think / Agent / MCP)
+    //
+    // All three share ChatMetrics' pill geometry — an EXPLICIT height and icon
+    // slot, because SF symbols at the same point size have different intrinsic
+    // sizes (brain vs wrench vs puzzle) and padding-derived capsules came out
+    // subtly unequal. Rendered inside the chatHeaderBar strip.
+
+    /// The chat pane's header control strip: sandbox badge + working-dir chip
+    /// (agent mode), voice, settings, the mode pills, and the server dot.
+    /// Rendered as OUR OWN row (safeAreaInset), not NSToolbar items — see the
+    /// call site for why.
+    @ViewBuilder
+    private var chatHeaderBar: some View {
+        HStack(spacing: 10) {
+            Spacer(minLength: 0)
+            // Sandbox badge: visible when tools are live (Agent or MCP mode)
+            // AND the Agent Sandbox is on — the signal that shell commands
+            // run isolated from this Mac. No badge when tools run on the
+            // host (absence = not sandboxed; never imply safety we don't have).
+            if (isAgentMode || mcpMode) && appState.serverOptions.sandbox.enabled {
+                Button {
+                    openWindow(id: "sandboxTerminal")
+                } label: {
+                    Image(systemName: "lock.shield.fill")
+                        .font(.system(size: 12))
+                        .foregroundStyle(.green)
+                }
+                .buttonStyle(.borderless)
+                .help("Secured by the Agent Sandbox — the agent's shell commands run inside an isolated Linux VM that can only touch the working folder. Click to open the Sandbox Terminal.")
+            }
+            if isAgentMode {
+                WorkingDirectoryIndicator(path: workingDirectoryBinding)
+            }
+            Button {
+                startVoiceMode()
+            } label: {
+                Image(systemName: "waveform")
+                    .font(.system(size: 12))
+                    .foregroundStyle(server.status == .running ? .primary : .tertiary)
+            }
+            .buttonStyle(.borderless)
+            .disabled(server.status != .running)
+            .help("Voice mode — talk to the model hands-free. Speech-to-text and text-to-speech run locally on your Mac; the model only handles text (and tools/thinking if enabled).")
+            Button {
+                openWindow(id: "settings")
+            } label: {
+                Image(systemName: "gear")
+                    .font(.system(size: 12))
+                    .foregroundStyle(.primary)
+            }
+            .buttonStyle(.borderless)
+            .help("Open Settings (⌘,) — server flags, speculative decoding, performance (continuous batching, KV-quant, prefix cache), and per-request defaults.")
+            // Adaptive pills: full when the chat pane is roomy, icon-only when
+            // narrow (MCP drops its gear) — decided from the measured pane width.
+            modePillCluster(compact: ChatMetrics.useCompactToggles(forDetailWidth: detailWidth))
+            Circle()
+                .fill(server.status == .running ? .green : .red)
+                .frame(width: 8, height: 8)
+                .help(server.status == .running ? "Server running" : "Server stopped")
+        }
+        .padding(.horizontal, ChatMetrics.gutter)
+        .padding(.vertical, 8)
+        .background(.bar)
+        .overlay(alignment: .bottom) { Divider() }
+    }
+
+    /// The whole cluster at one density — chosen by the measured pane width
+    /// (see `chatHeaderBar`).
+    @ViewBuilder
+    private func modePillCluster(compact: Bool) -> some View {
+        HStack(spacing: ChatMetrics.togglePillSpacing) {
+            thinkToggle(compact: compact)
+            agentToggle(compact: compact)
+            mcpToggle(compact: compact)
+        }
+        .fixedSize()
+    }
+
+    /// Shared pill label: fixed icon slot (+ caption when not compact) inside
+    /// the pinned height.
+    @ViewBuilder
+    private func pillLabel(icon: String, title: String, isOn: Bool, onColor: Color, compact: Bool) -> some View {
+        HStack(spacing: 4) {
+            Image(systemName: icon)
+                .font(.system(size: 11, weight: .medium))
+                .frame(width: ChatMetrics.togglePillIconSize, height: ChatMetrics.togglePillIconSize)
+            if !compact {
+                Text(title)
+                    .font(.caption.weight(.medium))
+            }
+        }
+        .foregroundStyle(isOn ? .white : .secondary)
+        .padding(.horizontal, ChatMetrics.togglePillPaddingH)
+        .frame(height: ChatMetrics.togglePillHeight)
+        .background(isOn ? onColor : Color.secondary.opacity(0.12))
+        .clipShape(Capsule())
+        // Whole capsule is clickable — a .plain Button without an explicit
+        // content shape only hit-tests the drawn pixels.
+        .contentShape(Capsule())
+    }
+
+    private func thinkToggle(compact: Bool) -> some View {
+        Button {
+            if isExternalBridgeSession {
+                // Telegram session: write the shared config so the toggle
+                // stays in sync with Settings and the bridge reads it live.
+                appState.serverOptions.telegram.enableThinking.toggle()
+            } else if !enableThinking && isAgentMode {
+                showThinkingInAgentConfirm = true
+            } else {
+                enableThinking.toggle()
+            }
+        } label: {
+            pillLabel(icon: "brain", title: "Think", isOn: toolbarToggles.thinking, onColor: .blue, compact: compact)
+        }
+        .buttonStyle(.plain)
+        .help("Thinking Mode (\(toolbarToggles.thinking ? "ON" : "OFF")) — when the model supports it, it'll emit a private reasoning trace before the visible answer. Slower but better on reasoning-heavy prompts.")
+    }
+
+    private func agentToggle(compact: Bool) -> some View {
+        Button {
+            if isExternalBridgeSession {
+                // Telegram session: flip the shared config (in sync with
+                // Settings); no per-session approval state applies here.
+                appState.serverOptions.telegram.agentMode.toggle()
+            } else {
+                isAgentMode.toggle()
+                // Re-arm the approval gate every time the user re-enters
+                // Agent mode. "Always allow this session" decays here —
+                // for THIS tab only; other tabs keep their decision.
+                if !isAgentMode { toolAllowList.rearm(sessionId) }
+                // Thinking + tool-calling loops degrade quality on most
+                // local models — auto-off when entering Agent mode.
+                if isAgentMode { enableThinking = false }
+            }
+        } label: {
+            pillLabel(icon: "wrench", title: "Agent", isOn: toolbarToggles.agent, onColor: .orange, compact: compact)
+        }
+        .buttonStyle(.plain)
+        .help("""
+        Agent Mode (\(toolbarToggles.agent ? "ON" : "OFF")) — the model runs a tool-calling loop with these 10 built-in tools:
+          • shell — run a shell command in the workspace
+          • cwd — change the workspace working directory
+          • readFile — read a file (with line range)
+          • writeFile — create or overwrite a small file
+          • editFile — line- or text-based edit of an existing file
+          • searchFiles — ripgrep-style content search across the workspace
+          • listFiles — list paths with glob + recursive options
+          • browse — navigate + extract text/HTML via WKWebView
+          • webSearch — DuckDuckGo search
+          • saveMemory — persist a fact to ~/.mlx-serve/memory.md
+        Off: a regular chat with no tools.
+        """)
+    }
+
+    private func mcpToggle(compact: Bool) -> some View {
+        HStack(spacing: 0) {
+            Button {
+                if isExternalBridgeSession {
+                    // Telegram session: flip the shared config (synced with Settings).
+                    appState.serverOptions.telegram.useMCP.toggle()
+                } else {
+                    mcpMode.toggle()
+                }
+            } label: {
+                HStack(spacing: 4) {
+                    Image(systemName: "puzzlepiece.extension")
+                        .font(.system(size: 11, weight: .medium))
+                        .frame(width: ChatMetrics.togglePillIconSize, height: ChatMetrics.togglePillIconSize)
+                    if !compact {
+                        Text("MCP")
+                            .font(.caption.weight(.medium))
+                    }
+                }
+                .foregroundStyle(toolbarToggles.mcp ? .white : .secondary)
+                .padding(.leading, ChatMetrics.togglePillPaddingH)
+                // Compact drops the gear half, so the toggle carries the
+                // trailing padding itself to stay a symmetric capsule.
+                .padding(.trailing, compact ? ChatMetrics.togglePillPaddingH : 0)
+                .frame(height: ChatMetrics.togglePillHeight)
+                // The capsule background lives on the OUTER HStack, so this
+                // button's label is transparent — without an explicit content
+                // shape only the glyph/text pixels hit-test, which is why the
+                // MCP toggle "didn't always click".
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            if !compact {
+                Button { showMCPMarketplace = true } label: {
+                    Image(systemName: "gearshape.fill")
+                        .font(.system(size: 10, weight: .medium))
+                        .foregroundStyle(toolbarToggles.mcp ? .white.opacity(0.85) : .secondary)
+                        .padding(.trailing, ChatMetrics.togglePillPaddingH)
+                        .padding(.leading, 4)
+                        .frame(height: ChatMetrics.togglePillHeight)
+                        .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help("Open MCP Marketplace — browse and enable Model Context Protocol servers (GitHub, Filesystem, Slack, Notion, Playwright, Docker, etc.). Each enabled server's tools become callable in Agent Mode.")
+            }
+        }
+        .frame(height: ChatMetrics.togglePillHeight)
+        .background(toolbarToggles.mcp ? .purple : Color.secondary.opacity(0.12))
+        .clipShape(Capsule())
+        .help("MCP Mode (\(toolbarToggles.mcp ? "ON" : "OFF")) — when on, tools from every enabled Model Context Protocol server are added to the Agent's toolset (alongside the 10 built-ins). Tap the gear to open the Marketplace and toggle servers on/off.")
+    }
+
     var body: some View {
         VStack(spacing: 0) {
             // Messages
@@ -620,7 +833,7 @@ struct ChatDetailView: View {
                                 }
                             )
                     }
-                    .padding(16)
+                    .padding(ChatMetrics.gutter)
                 }
                 .coordinateSpace(name: "chatScroll")
                 .background(
@@ -718,7 +931,7 @@ struct ChatDetailView: View {
                         Image(systemName: "paperclip")
                             .font(.system(size: 13, weight: .medium))
                             .foregroundStyle(.secondary)
-                            .frame(width: 28, height: 28)
+                            .frame(width: ChatMetrics.composerIconSize, height: ChatMetrics.composerIconSize)
                             .background(Color.secondary.opacity(0.15))
                             .clipShape(Circle())
                     }
@@ -729,10 +942,10 @@ struct ChatDetailView: View {
                     .menuStyle(.button)
                     .buttonStyle(.plain)
                     .menuIndicator(.hidden)
-                    .frame(width: 28, height: 28)
-                    // Menu's bottom edge sits a hair lower than a plain Button's
-                    // did — lift it to line up with the input pill and send button.
-                    .padding(.bottom, 2)
+                    // Full control frame == the pill's resting height, so the
+                    // bottom-aligned row centers the circle against the pill
+                    // with no nudge padding (ChatMetrics contract).
+                    .frame(width: ChatMetrics.composerControlSize, height: ChatMetrics.composerControlSize)
                     .help("Attach files, or a document folder to ask questions about")
 
                     // Mic — only on models that actually understand audio
@@ -749,7 +962,7 @@ struct ChatDetailView: View {
                                       measuredHeight: $composerHeight,
                                       isIdle: composerState == .idle,
                                       onSend: { sendMessage() })
-                        .frame(height: max(36, composerHeight))
+                        .frame(height: max(ChatMetrics.composerMinHeight, composerHeight))
                         .padding(.horizontal, 5)
                         .disabled(server.status != .running)
                         .background(Color(nsColor: .textBackgroundColor))
@@ -777,8 +990,9 @@ struct ChatDetailView: View {
                         }
                     } label: {
                         Image(systemName: composerState == .generatingHere ? "stop.circle.fill" : "arrow.up.circle.fill")
-                            .font(.system(size: 28))
+                            .font(.system(size: ChatMetrics.composerIconSize))
                             .foregroundStyle(composerState == .generatingHere ? .red : .accentColor)
+                            .frame(width: ChatMetrics.composerControlSize, height: ChatMetrics.composerControlSize)
                     }
                     .buttonStyle(.plain)
                     // Stop is always tappable for the owning chat. Otherwise: Send,
@@ -793,9 +1007,17 @@ struct ChatDetailView: View {
                 }
               }   // end else (non-Telegram composer)
             }
-            .padding(.horizontal, 12)
+            .padding(.horizontal, ChatMetrics.gutter)
             .padding(.vertical, 8)
         }
+        // Track the pane's width for the toolbar pill density decision.
+        .background(
+            GeometryReader { geo in
+                Color.clear
+                    .onAppear { detailWidth = geo.size.width }
+                    .onChange(of: geo.size.width) { _, w in detailWidth = w }
+            }
+        )
         .onDrop(of: [.image, .pdf, .audio], isTargeted: nil) { providers in
             for provider in providers {
                 if provider.hasItemConformingToTypeIdentifier(UTType.pdf.identifier) {
@@ -834,164 +1056,16 @@ struct ChatDetailView: View {
             }
             return true
         }
-        .toolbar {
-            ToolbarItem(placement: .automatic) {
-                // Sandbox badge: visible when tools are live (Agent or MCP mode)
-                // AND the Agent Sandbox is on — the signal that shell commands
-                // run isolated from this Mac. No badge when tools run on the
-                // host (absence = not sandboxed; never imply safety we don't have).
-                if (isAgentMode || mcpMode) && appState.serverOptions.sandbox.enabled {
-                    Button {
-                        openWindow(id: "sandboxTerminal")
-                    } label: {
-                        Image(systemName: "lock.shield.fill")
-                            .font(.system(size: 12))
-                            .foregroundStyle(.green)
-                    }
-                    .help("Secured by the Agent Sandbox — the agent's shell commands run inside an isolated Linux VM that can only touch the working folder. Click to open the Sandbox Terminal.")
-                }
-            }
-            ToolbarItem(placement: .automatic) {
-                if isAgentMode {
-                    WorkingDirectoryIndicator(path: workingDirectoryBinding)
-                }
-            }
-            ToolbarItem(placement: .automatic) {
-                Button {
-                    startVoiceMode()
-                } label: {
-                    Image(systemName: "waveform")
-                        .font(.system(size: 12))
-                }
-                .disabled(server.status != .running)
-                .help("Voice mode — talk to the model hands-free. Speech-to-text and text-to-speech run locally on your Mac; the model only handles text (and tools/thinking if enabled).")
-            }
-            ToolbarItem(placement: .automatic) {
-                Button {
-                    openWindow(id: "settings")
-                } label: {
-                    Image(systemName: "gear")
-                        .font(.system(size: 12))
-                }
-                .help("Open Settings (⌘,) — server flags, speculative decoding, performance (continuous batching, KV-quant, prefix cache), and per-request defaults.")
-            }
-            ToolbarItem(placement: .automatic) {
-                Button {
-                    if isExternalBridgeSession {
-                        // Telegram session: write the shared config so the toggle
-                        // stays in sync with Settings and the bridge reads it live.
-                        appState.serverOptions.telegram.enableThinking.toggle()
-                    } else if !enableThinking && isAgentMode {
-                        showThinkingInAgentConfirm = true
-                    } else {
-                        enableThinking.toggle()
-                    }
-                } label: {
-                    HStack(spacing: 4) {
-                        Image(systemName: "brain")
-                            .font(.system(size: 11, weight: .medium))
-                        Text("Think")
-                            .font(.caption.weight(.medium))
-                    }
-                    .foregroundStyle(toolbarToggles.thinking ? .white : .secondary)
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 4)
-                    .background(toolbarToggles.thinking ? .blue : Color.secondary.opacity(0.12))
-                    .clipShape(Capsule())
-                }
-                .buttonStyle(.plain)
-                .help("Thinking Mode (\(toolbarToggles.thinking ? "ON" : "OFF")) — when the model supports it, it'll emit a private reasoning trace before the visible answer. Slower but better on reasoning-heavy prompts.")
-                .padding(.leading, 8)
-                .padding(.trailing, 4)
-            }
-            ToolbarItem(placement: .automatic) {
-                Button {
-                    if isExternalBridgeSession {
-                        // Telegram session: flip the shared config (in sync with
-                        // Settings); no per-session approval state applies here.
-                        appState.serverOptions.telegram.agentMode.toggle()
-                    } else {
-                        isAgentMode.toggle()
-                        // Re-arm the approval gate every time the user re-enters
-                        // Agent mode. "Always allow this session" decays here —
-                        // for THIS tab only; other tabs keep their decision.
-                        if !isAgentMode { toolAllowList.rearm(sessionId) }
-                        // Thinking + tool-calling loops degrade quality on most
-                        // local models — auto-off when entering Agent mode.
-                        if isAgentMode { enableThinking = false }
-                    }
-                } label: {
-                    HStack(spacing: 4) {
-                        Image(systemName: "wrench")
-                            .font(.system(size: 11, weight: .medium))
-                        Text("Agent")
-                            .font(.caption.weight(.medium))
-                    }
-                    .foregroundStyle(toolbarToggles.agent ? .white : .secondary)
-                    .padding(.horizontal, 8)
-                    .padding(.vertical, 4)
-                    .background(toolbarToggles.agent ? .orange : Color.secondary.opacity(0.12))
-                    .clipShape(Capsule())
-                }
-                .buttonStyle(.plain)
-                .help("""
-                Agent Mode (\(toolbarToggles.agent ? "ON" : "OFF")) — the model runs a tool-calling loop with these 10 built-in tools:
-                  • shell — run a shell command in the workspace
-                  • cwd — change the workspace working directory
-                  • readFile — read a file (with line range)
-                  • writeFile — create or overwrite a small file
-                  • editFile — line- or text-based edit of an existing file
-                  • searchFiles — ripgrep-style content search across the workspace
-                  • listFiles — list paths with glob + recursive options
-                  • browse — navigate + extract text/HTML via WKWebView
-                  • webSearch — DuckDuckGo search
-                  • saveMemory — persist a fact to ~/.mlx-serve/memory.md
-                Off: a regular chat with no tools.
-                """)
-            }
-            ToolbarItem(placement: .automatic) {
-                HStack(spacing: 0) {
-                    Button {
-                        if isExternalBridgeSession {
-                            // Telegram session: flip the shared config (synced with Settings).
-                            appState.serverOptions.telegram.useMCP.toggle()
-                        } else {
-                            mcpMode.toggle()
-                        }
-                    } label: {
-                        HStack(spacing: 4) {
-                            Image(systemName: "puzzlepiece.extension")
-                                .font(.system(size: 11, weight: .medium))
-                            Text("MCP")
-                                .font(.caption.weight(.medium))
-                        }
-                        .foregroundStyle(toolbarToggles.mcp ? .white : .secondary)
-                        .padding(.leading, 8)
-                        .padding(.vertical, 4)
-                    }
-                    .buttonStyle(.plain)
-                    Button { showMCPMarketplace = true } label: {
-                        Image(systemName: "gearshape.fill")
-                            .font(.system(size: 10, weight: .medium))
-                            .foregroundStyle(toolbarToggles.mcp ? .white.opacity(0.85) : .secondary)
-                            .padding(.trailing, 8)
-                            .padding(.leading, 4)
-                            .padding(.vertical, 4)
-                    }
-                    .buttonStyle(.plain)
-                    .help("Open MCP Marketplace — browse and enable Model Context Protocol servers (GitHub, Filesystem, Slack, Notion, Playwright, Docker, etc.). Each enabled server's tools become callable in Agent Mode.")
-                }
-                .background(toolbarToggles.mcp ? .purple : Color.secondary.opacity(0.12))
-                .clipShape(Capsule())
-                .help("MCP Mode (\(toolbarToggles.mcp ? "ON" : "OFF")) — when on, tools from every enabled Model Context Protocol server are added to the Agent's toolset (alongside the 10 built-ins). Tap the gear to open the Marketplace and toggle servers on/off.")
-            }
-            ToolbarItem(placement: .automatic) {
-                Circle()
-                    .fill(server.status == .running ? .green : .red)
-                    .frame(width: 8, height: 8)
-                    .padding(.horizontal, 8)
-                    .help(server.status == .running ? "Server running" : "Server stopped")
-            }
+        // Header control strip — deliberately NOT NSToolbar items. The AppKit
+        // bridge does not re-measure a toolbar item whose SwiftUI content
+        // changes size (enabling Agent mode grows the strip with the shield +
+        // workspace chip), so NSToolbar clipped the controls into a mangled »
+        // overflow menu until a window resize forced a fresh layout — and it
+        // did so REGARDLESS of grouping (separate items, ViewThatFits, one
+        // merged item all failed). A plain view row pinned to the pane's top
+        // has no overflow mechanism to misfire.
+        .safeAreaInset(edge: .top, spacing: 0) {
+            chatHeaderBar
         }
         .sheet(isPresented: $showMCPMarketplace) {
             MCPMarketplaceView()
@@ -1591,8 +1665,8 @@ struct ContextMonitor: View {
                     .foregroundStyle(isLive ? Color.accentColor : .secondary)
             }
         }
-        .padding(.horizontal, 12)
-        .padding(.top, 4)
+        .padding(.horizontal, ChatMetrics.gutter)
+        .padding(.top, 6)
     }
 }
 
@@ -1845,14 +1919,15 @@ struct MessageBubble: View {
                             GeneratingIndicator()
                         }
                     }
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 8)
+                    .padding(.horizontal, ChatMetrics.bubblePaddingH)
+                    .padding(.vertical, ChatMetrics.bubblePaddingV)
                     .background(message.role == .user ? Color.accentColor : Color(.controlBackgroundColor))
                     .foregroundStyle(message.role == .user ? .white : .primary)
-                    .clipShape(RoundedRectangle(cornerRadius: 14))
+                    .clipShape(RoundedRectangle(cornerRadius: ChatMetrics.bubbleCornerRadius))
                 }
 
-                // Token usage stats
+                // Token usage stats — indented to the bubble's text column so
+                // the caption reads as part of the reply, not the bubble edge.
                 if message.role == .assistant, !message.isStreaming,
                    let prompt = message.promptTokens, let completion = message.completionTokens {
                     HStack(spacing: 8) {
@@ -1863,6 +1938,7 @@ struct MessageBubble: View {
                     }
                     .font(.caption2.monospaced())
                     .foregroundStyle(.tertiary)
+                    .padding(.leading, ChatMetrics.statsIndent)
                 }
             }
 
@@ -1977,12 +2053,12 @@ private struct ToolCallRow: View {
                 headerRow
                 if expanded { expandedResults }
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
+            .padding(.horizontal, ChatMetrics.bubblePaddingH)
+            .padding(.vertical, ChatMetrics.bubblePaddingV)
             .background(Color(.controlBackgroundColor))
-            .clipShape(RoundedRectangle(cornerRadius: 14))
+            .clipShape(RoundedRectangle(cornerRadius: ChatMetrics.bubbleCornerRadius))
             .overlay(
-                RoundedRectangle(cornerRadius: 14)
+                RoundedRectangle(cornerRadius: ChatMetrics.bubbleCornerRadius)
                     .strokeBorder(Color.green.opacity(isRunningBackground ? 0.7 : 0), lineWidth: 1.5)
             )
             .animation(.easeInOut(duration: 0.2), value: isRunningBackground)

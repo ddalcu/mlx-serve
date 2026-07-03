@@ -220,6 +220,10 @@ struct ModelInfo {
     /// only BERT entries, loaded or stub). DocumentIndex uses this to pick a
     /// GPU embedder for folder indexing.
     var supportsEmbeddings: Bool = false
+    /// Raw `capabilities` array as the server sent it ("chat", "vision",
+    /// "image", "video", "audio", "embeddings", …). `slotKind` classifies a
+    /// registry entry into a tray slot from these.
+    var capabilities: [String] = []
     /// True when the running server was launched with `--drafter <dir>` and
     /// the drafter+target pair validated. Drives the green status pill.
     var drafterLoaded: Bool = false
@@ -275,6 +279,45 @@ struct ModelInfo {
         if mtpLoaded { return "+MTP" }
         if drafterLoaded { return "+Drafter" }
         return nil
+    }
+
+    /// Classify a registry entry into a tray slot from its capabilities.
+    /// "chat" wins first: a multimodal chat model also advertises "vision"/
+    /// "audio" (input modalities), while gen engines advertise ONLY their
+    /// output modality ("image" / "video" / "audio").
+    var slotKind: ModelSlotKind {
+        if capabilities.contains("chat") { return .chat }
+        if capabilities.contains("video") { return .videoGen }
+        if capabilities.contains("image") { return .imageGen }
+        if capabilities.contains("audio") { return .audioGen }
+        if supportsEmbeddings || capabilities.contains("embeddings") { return .embedding }
+        return .chat
+    }
+}
+
+/// What a resident registry entry is FOR — drives the icon + label on the
+/// tray's model slots (chat model vs image/video/audio generator).
+enum ModelSlotKind {
+    case chat, imageGen, videoGen, audioGen, embedding
+
+    var icon: String {
+        switch self {
+        case .chat:      return "bubble.left.and.bubble.right"
+        case .imageGen:  return "photo"
+        case .videoGen:  return "film"
+        case .audioGen:  return "waveform"
+        case .embedding: return "doc.text.magnifyingglass"
+        }
+    }
+
+    var label: String {
+        switch self {
+        case .chat:      return "Chat"
+        case .imageGen:  return "Image generation"
+        case .videoGen:  return "Video generation"
+        case .audioGen:  return "Audio generation"
+        case .embedding: return "Embeddings"
+        }
     }
 }
 
@@ -661,7 +704,10 @@ let gemmaModelOptions: [GemmaModelOption] = [
 /// range of Macs (the 4-bit 31B is ~18 GB vs 33 GB at 8-bit) so most users
 /// can install something useful without bouncing into the full Model Browser.
 /// DSV4 has only the one GGUF, so it rides along unconditionally.
-let gemmaModelOptionsTrayMenu = gemmaModelOptions.filter { $0.id.contains("4bit") || $0.id.contains("dsv4") }
+/// Excludes Gemma 3/4 12B and E2B since they're available in the model browser.
+let gemmaModelOptionsTrayMenu = gemmaModelOptions.filter {
+    !$0.id.contains("12b") && !$0.id.contains("e2b") && ($0.id.contains("4bit") || $0.id.contains("dsv4"))
+}
 
 /// Subset of `gemmaModelOptions` visible on the current host. Hides entries
 /// whose `minHostRamBytes` exceeds the system RAM.

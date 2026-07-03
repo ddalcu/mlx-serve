@@ -158,6 +158,42 @@ final class APIClientLoadModelTests: XCTestCase {
         XCTAssertFalse(APIClient.parseModelInfo(["id": "x", "meta": [:]]).supportsVision)
     }
 
+    func testSlotKindClassifiesTrayModelSlots() {
+        // Gen engines advertise ONLY their output modality; chat models lead
+        // with "chat" (their "vision"/"audio" caps are INPUT modalities and
+        // must not misfile them as generators).
+        let video = APIClient.parseModelInfo([
+            "id": "dgrauet/ltx-2.3-mlx-q4", "capabilities": ["video"],
+            "meta": ["architecture": "AudioVideo"],
+        ])
+        XCTAssertEqual(video.slotKind, .videoGen)
+
+        let image = APIClient.parseModelInfo([
+            "id": "flux2-klein", "capabilities": ["image"], "meta": [:],
+        ])
+        XCTAssertEqual(image.slotKind, .imageGen)
+
+        let tts = APIClient.parseModelInfo([
+            "id": "qwen3-tts", "capabilities": ["audio"], "meta": [:],
+        ])
+        XCTAssertEqual(tts.slotKind, .audioGen)
+
+        let multimodalChat = APIClient.parseModelInfo([
+            "id": "gemma-4-12b-it-4bit",
+            "capabilities": ["chat", "vision", "audio", "streaming"],
+            "meta": ["architecture": "gemma4"],
+        ])
+        XCTAssertEqual(multimodalChat.slotKind, .chat)
+
+        let encoder = APIClient.parseModelInfo([
+            "id": "bge-small", "capabilities": ["embeddings"], "meta": [:],
+        ])
+        XCTAssertEqual(encoder.slotKind, .embedding)
+
+        // Pre-capability server (no array) → chat, the safe default.
+        XCTAssertEqual(APIClient.parseModelInfo(["id": "x", "meta": [:]]).slotKind, .chat)
+    }
+
     func testParseModelInfoFromUnloadedEntry() {
         // Phase E stub form: state present, bytes_resident=0, bytes_on_disk
         // either top-level or under meta (we accept both).

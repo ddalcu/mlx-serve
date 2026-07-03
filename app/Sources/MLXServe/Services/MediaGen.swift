@@ -491,6 +491,11 @@ struct VideoGenRequest {
     var audioPath: String? = nil
     /// Keep the model resident after this generation (default off → unload).
     var keepResident: Bool = false
+    /// Style LoRA (Advanced): absolute path to a .safetensors adapter applied
+    /// to the DiT at runtime. nil = none.
+    var loraPath: String? = nil
+    /// LoRA strength multiplier (on top of the file's own alpha/rank scale).
+    var loraScale: Double = 1.0
 }
 
 struct AudioGenRequest {

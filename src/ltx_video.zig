@@ -34,6 +34,7 @@ const std = @import("std");
 const mlx = @import("mlx.zig");
 const log = @import("log.zig");
 const model_mod = @import("model.zig");
+const lora_mod = @import("lora.zig");
 
 const S = mlx.mlx_stream;
 
@@ -83,6 +84,11 @@ pub const LtxConfig = struct {
 pub const Component = struct {
     map: std.StringHashMap(mlx.mlx_array),
     allocator: std.mem.Allocator,
+    // Runtime LoRA (non-owning; gen.VideoEngine owns the File and re-installs
+    // the pointer after every transformer swap). Checked by dQLin only — the
+    // DiT projections are the modules video LoRAs target.
+    lora: ?*const lora_mod.File = null,
+    lora_scale: f32 = 1.0,
 
     pub fn deinit(self: *Component) void {
         var it = self.map.iterator();
@@ -129,14 +135,20 @@ pub fn loadComponent(allocator: std.mem.Allocator, path: [:0]const u8, s: S) !Co
         var key: ?[*:0]const u8 = null;
         var value = mlx.mlx_array_new();
         const rc = mlx.mlx_map_string_to_array_iterator_next(&key, &value, iter);
-        if (rc != 0) break;
-        const k = key orelse break;
-        const key_slice = std.mem.span(k);
+        if (rc != 0 or key == null) {
+            _ = mlx.mlx_array_free(value);
+            break;
+        }
+        const key_slice = std.mem.span(key.?);
         const owned_key = try allocator.dupe(u8, key_slice);
         errdefer allocator.free(owned_key);
-        var owned_val = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_array_set(&owned_val, value));
-        try comp.map.put(owned_key, owned_val);
+        // Transfer the iterator's reference straight into the map (the
+        // model.zig loadSafetensorsFile pattern). The old copy-via-
+        // mlx_array_set left `value`'s reference dangling on the floor —
+        // a phantom +1 on EVERY tensor, so Component.deinit could never
+        // release the buffers and each engine unload leaked the whole
+        // materialized component set (~18 GB per video load→gen→unload).
+        try comp.map.put(owned_key, value);
     }
     log.info("[ltx] loaded {d} tensors from {s}\n", .{ comp.count(), path });
     return comp;
@@ -1618,6 +1630,8 @@ fn ditAdaLNSingle(comp: *const Component, alloc: std.mem.Allocator, t_sin: mlx.m
 /// q4 linear over a Component: y = x @ dequant(<base>.weight).T + <base>.bias.
 /// Mirrors `gQLin` (affine g64 b4) but reads from a Component and adds the
 /// quantized Linear's separate bf16 `.bias` (present on every DiT projection).
+/// When a LoRA is installed on the Component, adds scale·(x@Aᵀ)@Bᵀ unfused
+/// (same contract as the image backends' QLinear.forward).
 fn dQLin(comp: *const Component, alloc: std.mem.Allocator, x: mlx.mlx_array, base: []const u8, s: S) !mlx.mlx_array {
     const wk = try std.fmt.allocPrint(alloc, "{s}.weight", .{base});
     defer alloc.free(wk);
@@ -1632,6 +1646,14 @@ fn dQLin(comp: *const Component, alloc: std.mem.Allocator, x: mlx.mlx_array, bas
     const bi = comp.get(bk) orelse return error.MissingDitWeight;
     var mm = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_quantized_matmul(&mm, x, wq, sc, bi, true, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(4), "affine", s));
+    if (loraRefFor(comp, base)) |ref| {
+        const d = try lora_mod.delta(x, ref, s);
+        defer _ = mlx.mlx_array_free(d);
+        var summed = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_add(&summed, mm, d, s));
+        _ = mlx.mlx_array_free(mm);
+        mm = summed;
+    }
     if (comp.get(lbk)) |lb| {
         var out = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_add(&out, mm, lb, s));
@@ -1639,6 +1661,64 @@ fn dQLin(comp: *const Component, alloc: std.mem.Allocator, x: mlx.mlx_array, bas
         return out;
     }
     return mm;
+}
+
+/// LoRA adapter for a dQLin base key, or null. Adapter modules are keyed with
+/// wrapper prefixes stripped (`lora.parseKey` drops `transformer.` /
+/// `diffusion_model.`), so drop our `transformer.` prefix before matching;
+/// diffusers FF naming (`ff.net.0.proj` / `ff.net.2`) is accepted as an alias
+/// for this checkpoint's `ff.proj_in` / `ff.proj_out`.
+fn loraRefFor(comp: *const Component, base: []const u8) ?lora_mod.Ref {
+    const lf = comp.lora orelse return null;
+    var mod = base;
+    if (std.mem.startsWith(u8, mod, "transformer.")) mod = mod["transformer.".len..];
+    const e = lf.find(mod) orelse blk: {
+        var buf: [512]u8 = undefined;
+        break :blk lf.find(ffAlias(&buf, mod) orelse return null) orelse return null;
+    };
+    return .{ .at = e.at, .bt = e.bt, .scale = e.scale * comp.lora_scale };
+}
+
+/// Map between our FF projection names and diffusers' (both directions):
+/// `…ff.proj_in` ↔ `…ff.net.0.proj`, `…ff.proj_out` ↔ `…ff.net.2`.
+fn ffAlias(buf: []u8, mod: []const u8) ?[]const u8 {
+    const pairs = .{
+        .{ ".proj_in", ".net.0.proj" },
+        .{ ".proj_out", ".net.2" },
+        .{ ".net.0.proj", ".proj_in" },
+        .{ ".net.2", ".proj_out" },
+    };
+    inline for (pairs) |p| {
+        if (std.mem.endsWith(u8, mod, p[0]))
+            return std.fmt.bufPrint(buf, "{s}{s}", .{ mod[0 .. mod.len - p[0].len], p[1] }) catch null;
+    }
+    return null;
+}
+
+/// Count adapter entries in `lf` that target a projection present in this
+/// component — setLora uses it to reject wrong-architecture LoRA files.
+pub fn countLoraMatches(comp: *const Component, lf: *const lora_mod.File) u32 {
+    var n: u32 = 0;
+    for (lf.entries) |*e| {
+        if (loraModulePresent(comp, e.module)) n += 1;
+    }
+    return n;
+}
+
+fn loraModulePresent(comp: *const Component, module: []const u8) bool {
+    var abuf: [512]u8 = undefined;
+    var kbuf: [600]u8 = undefined;
+    const candidates = [_]?[]const u8{ module, ffAlias(&abuf, module) };
+    for (candidates) |cand| {
+        const mod = cand orelse continue;
+        if (std.fmt.bufPrint(&kbuf, "transformer.{s}.weight", .{mod})) |key| {
+            if (comp.map.contains(key)) return true;
+        } else |_| {}
+        if (std.fmt.bufPrint(&kbuf, "{s}.weight", .{mod})) |key| {
+            if (comp.map.contains(key)) return true;
+        } else |_| {}
+    }
+    return false;
 }
 
 /// AdaLN scalar unpack: `reshape(params,[1,P,dim]) + table[None]`. `params` is
@@ -2857,7 +2937,18 @@ pub fn ditSampleCfg(
         owned = true;
         _ = mlx.mlx_array_eval(vx);
         _ = mlx.mlx_array_eval(ax);
-        if (progress) |p| p.emit(win.label, win.base + @as(u32, @intCast(i + 1)), total);
+        if (progress) |p| {
+            p.emit(win.label, win.base + @as(u32, @intCast(i + 1)), total);
+            // Client hung up (progress write failed) → stop burning GPU on a
+            // video nobody will receive; the queued next request unblocks.
+            if (p.cancelled()) {
+                if (owned) {
+                    _ = mlx.mlx_array_free(vx);
+                    _ = mlx.mlx_array_free(ax);
+                }
+                return error.Cancelled;
+            }
+        }
     }
     if (!owned) { // no steps → copy inputs so caller owns the result
         var cv = mlx.mlx_array_new();
@@ -3227,7 +3318,11 @@ pub fn ditSampleRes2s(
         }
         _ = mlx.mlx_array_eval(vx);
         _ = mlx.mlx_array_eval(ax);
-        if (progress) |p| p.emit(win.label, win.base + @as(u32, @intCast(step + 1)), total);
+        if (progress) |p| {
+            p.emit(win.label, win.base + @as(u32, @intCast(step + 1)), total);
+            // vx/ax are released by the function's errdefers.
+            if (p.cancelled()) return error.Cancelled;
+        }
     }
 
     // Terminal cleanup: one last x0 prediction at the injected minimal sigma.
@@ -3778,6 +3873,10 @@ pub fn generateVideoFrames(
         _ = mlx.mlx_array_eval(neg.?.video);
         _ = mlx.mlx_array_eval(neg.?.audio);
     }
+    // Each encodeTextLtx loaded + freed the full Gemma encoder (~8 GB) —
+    // freed buffers sit in MLX's allocator cache. Trim before the denoise
+    // loop so they don't ride on top of the transformer's peak working set.
+    _ = mlx.mlx_clear_cache();
 
     // ── positions + schedule ──
     const vpos = try computeVideoPositions(alloc, F, H, W, frame_rate);
@@ -4010,6 +4109,9 @@ pub fn generateVideoFramesTwoStage(
         _ = mlx.mlx_array_eval(neg.?.video);
         _ = mlx.mlx_array_eval(neg.?.audio);
     }
+    // Trim the two freed Gemma-encoder loads out of MLX's allocator cache
+    // before the denoise stages (same rationale as generateVideoFrames).
+    _ = mlx.mlx_clear_cache();
 
     // ── stage 1: half resolution, guided ──
     const vpos1 = try computeVideoPositions(alloc, F, H1, W1, frame_rate);
@@ -5760,4 +5862,60 @@ test "ltx latent upsampler reproduces reference LatentUpsampler" {
     const c = corrF32(got, ref, 0);
     std.debug.print("[ltx-upsampler] cos={d:.6}\n", .{c});
     try testing.expect(c > 0.999);
+}
+
+test "loadComponent releases every tensor on deinit (phantom-ref leak class)" {
+    // Live 2026-07-03: every video load→generate→unload cycle leaked the
+    // whole materialized engine (~18 GB) because loadComponent kept the
+    // iterator's +1 reference on each tensor (copied via mlx_array_set,
+    // never freed the original handle) — Component.deinit decremented to 1,
+    // never 0. This pins the invariant hermetically: load a real (tiny)
+    // safetensors, materialize, deinit → active memory returns to baseline.
+    const allocator = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const cpu = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(cpu);
+
+    // 1 MB f32 tensor, saved as a real safetensors file.
+    const n: usize = 256 * 1024;
+    const buf = try allocator.alloc(f32, n);
+    defer allocator.free(buf);
+    for (buf, 0..) |*v, i| v.* = @floatFromInt(i % 7);
+    const shape = [_]c_int{@intCast(n)};
+    const arr = mlx.mlx_array_new_data(buf.ptr, &shape, 1, .float32);
+    defer _ = mlx.mlx_array_free(arr);
+    const save_map = mlx.mlx_map_string_to_array_new();
+    defer _ = mlx.mlx_map_string_to_array_free(save_map);
+    _ = mlx.mlx_map_string_to_array_insert(save_map, "w.weight", arr);
+    const meta = mlx.mlx_map_string_to_string_new();
+    defer _ = mlx.mlx_map_string_to_string_free(meta);
+    const path = try std.fs.path.joinZ(allocator, &.{ ".zig-cache", "tmp", &tmp.sub_path, "leak.safetensors" });
+    defer allocator.free(path);
+    try mlx.check(mlx.mlx_save_safetensors(path.ptr, save_map, meta));
+
+    _ = mlx.mlx_clear_cache();
+    var before: usize = 0;
+    _ = mlx.mlx_get_active_memory(&before);
+
+    var comp = try loadComponent(allocator, path, cpu);
+    var materialized = false;
+    var it = comp.map.iterator();
+    while (it.next()) |e| {
+        _ = mlx.mlx_array_eval(e.value_ptr.*);
+        materialized = true;
+    }
+    try testing.expect(materialized);
+    var during: usize = 0;
+    _ = mlx.mlx_get_active_memory(&during);
+    try testing.expect(during >= before + n * 4); // tensor resident while loaded
+
+    comp.deinit();
+    _ = mlx.mlx_clear_cache();
+    var after: usize = 0;
+    _ = mlx.mlx_get_active_memory(&after);
+    // A leaked reference keeps the 1 MB buffer active forever; allow small
+    // allocator slack but nowhere near the tensor size.
+    try testing.expect(after <= before + 128 * 1024);
 }

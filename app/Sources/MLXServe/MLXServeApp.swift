@@ -124,6 +124,11 @@ struct MLXCoreApp: App {
                 .onChange(of: appState.pendingTaskDeepLink) { _, taskId in
                     if taskId != nil { openAndFocus("tasks") }
                 }
+                // Quick launcher "Open in chat" (⌘↩): same always-present bridge —
+                // the launcher panel can't reach SwiftUI's openWindow itself.
+                .onChange(of: appState.quickLauncherChatOpenTick) { _, _ in
+                    openAndFocus("chat")
+                }
         }
         .menuBarExtraStyle(.window)
 

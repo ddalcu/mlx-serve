@@ -554,6 +554,13 @@ pub const VideoEngine = struct {
     tok: tok_mod.Tokenizer,
     gemma_dir: []u8,
     model_dir: []u8,
+    // Runtime LoRA state (mirrors ImageEngine): the File owns the adapter
+    // arrays the transformer Component's `lora` pointer reads through, so it
+    // must live until the next detach (clearLora).
+    lora_file: ?lora_mod.File = null,
+    lora_path: ?[]u8 = null,
+    lora_scale: f32 = 1.0,
+    lora_matched: u32 = 0,
 
     pub fn load(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !*VideoEngine {
         const self = try allocator.create(VideoEngine);
@@ -563,6 +570,10 @@ pub const VideoEngine = struct {
         self.audio = null;
         self.vae_encoder = null;
         self.upsampler = null;
+        self.lora_file = null;
+        self.lora_path = null;
+        self.lora_scale = 1.0;
+        self.lora_matched = 0;
 
         self.gemma_dir = try resolveGemmaDir(io, allocator);
         errdefer allocator.free(self.gemma_dir);
@@ -625,6 +636,50 @@ pub const VideoEngine = struct {
         const cpu_s = mlx.mlx_default_cpu_stream_new();
         self.transformer = try loadTransformerVariant(self.allocator, self.model_dir, want, cpu_s);
         self.transformer_variant = want;
+        // The fresh Component boots with `lora = null` — re-install the
+        // attached adapter so a mid-pipeline swap (Stage2Swap) keeps it.
+        self.applyLora();
+    }
+
+    /// Reconcile the attached LoRA with the request (mirrors ImageEngine):
+    /// `path == null` detaches; the same path+scale is a no-op reuse; a new
+    /// path/scale loads + installs on the transformer Component. Returns the
+    /// number of adapter modules present in the DiT.
+    pub fn setLora(self: *VideoEngine, path: ?[]const u8, scale: f32) !u32 {
+        if (path) |p| {
+            if (self.lora_path) |cur| {
+                if (std.mem.eql(u8, cur, p) and scale == self.lora_scale) return self.lora_matched;
+            }
+            self.clearLora();
+            var lf = try lora_mod.loadFile(self.allocator, p);
+            const matched = ltx.countLoraMatches(&self.transformer, &lf);
+            if (matched == 0) {
+                lf.deinit();
+                return error.LoraNoMatch;
+            }
+            self.lora_file = lf;
+            self.lora_path = try self.allocator.dupe(u8, p);
+            self.lora_scale = scale;
+            self.lora_matched = matched;
+            self.applyLora();
+            return matched;
+        }
+        self.clearLora();
+        return 0;
+    }
+
+    fn clearLora(self: *VideoEngine) void {
+        self.transformer.lora = null;
+        if (self.lora_file) |*lf| lf.deinit();
+        self.lora_file = null;
+        if (self.lora_path) |p| self.allocator.free(p);
+        self.lora_path = null;
+        self.lora_matched = 0;
+    }
+
+    fn applyLora(self: *VideoEngine) void {
+        self.transformer.lora = if (self.lora_file) |*lf| lf else null;
+        self.transformer.lora_scale = self.lora_scale;
     }
 
     /// Lazily load the spatial-x2 upsampler for the two-stage boundary.
@@ -643,6 +698,7 @@ pub const VideoEngine = struct {
     }
 
     pub fn deinit(self: *VideoEngine) void {
+        self.clearLora();
         self.transformer.deinit();
         self.connector.deinit();
         self.vae.deinit();
@@ -1338,6 +1394,24 @@ pub fn handleVideo(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: 
             return sendError(conn, 400, "two-stage pipelines require spatial_upscaler_x2_v1_1.safetensors — download it into the model dir");
     }
 
+    // Style LoRA: absolute path to a .safetensors adapter (+ optional scale),
+    // applied to the DiT at runtime. No `lora_path` in the request detaches
+    // whatever was attached before (same contract as handleImage).
+    if (extractJsonString(body, "lora_path")) |lp_raw| {
+        const lp = try jsonUnescape(allocator, lp_raw);
+        defer allocator.free(lp);
+        const lscale: f32 = @floatCast(extractJsonFloat(body, "lora_scale") orelse 1.0);
+        const matched = engine.setLora(lp, lscale) catch |err| switch (err) {
+            error.LoraNoMatch => return sendError(conn, 400, "LoRA has no modules matching this model's DiT — wrong LoRA for this architecture?"),
+            error.BadLoraPath => return sendError(conn, 400, "'lora_path' must be an absolute path to a .safetensors file"),
+            error.OutOfMemory => return err,
+            else => return sendError(conn, 400, "failed to load the LoRA file"),
+        };
+        log.info("[video] lora: matched {d} modules from {s} (scale {d:.2})\n", .{ matched, lp, lscale });
+    } else {
+        _ = engine.setLora(null, 1.0) catch {};
+    }
+
     // ── audio-to-video: `audio` is a base64 WAV (PCM16/24/f32, any rate,
     // mono/stereo). Unlike `first_frame_image` this is NOT graceful — the user
     // asked for THIS soundtrack, so a silent downgrade to generated audio
@@ -1450,6 +1524,12 @@ pub fn handleVideo(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: 
             break :blk ltx.generateVideoFramesTwoStage(io, allocator, .{}, &engine.transformer, &engine.connector, &engine.vae, &engine.vae_encoder.?, cond_img_half, cond_img, audio_cond, engine.gemma_dir, pos_ids, neg_ids, LTX_PAD_ID, num_frames, height, width, frame_rate, opts, seed, guiders.vp, guiders.ap, prog, engine.s);
         },
     } catch |err| {
+        if (err == error.Cancelled) {
+            // Client hung up mid-generation (progress write failed) — the
+            // denoise loop aborted; nothing to write, the socket is dead.
+            log.info("[video] generation cancelled — client disconnected\n", .{});
+            return;
+        }
         log.err("[video] generation failed: {}\n", .{err});
         if (want_stream) {
             conn.writeAll("data: {\"type\":\"error\",\"message\":\"generation failed\"}\n\n") catch {};

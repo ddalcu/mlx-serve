@@ -149,6 +149,7 @@ class APIClient {
             supportsAudio: supportsAudio,
             supportsVision: supportsVision,
             supportsEmbeddings: supportsEmbeddings,
+            capabilities: caps,
             drafterLoaded: meta["drafter_loaded"] as? Bool ?? false,
             drafterPath: meta["drafter_path"] as? String,
             mtpLoaded: meta["mtp_loaded"] as? Bool ?? false,

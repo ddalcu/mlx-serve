@@ -454,6 +454,11 @@ class ServerManager: ObservableObject {
         guard status == .running else { return }
         if visible {
             Task { await self.refreshStatus() }
+            // One-shot registry snapshot so the model slots are fresh when the
+            // popover opens (covers loads/unloads made outside this app). The
+            // 3 s ticker still deliberately skips /v1/models — see
+            // refreshStatus for the rationale.
+            Task { await self.refreshModels() }
             startSlowPolling()
         } else {
             pollSource?.cancel()

@@ -16,15 +16,43 @@ final class VideoGenService: ObservableObject {
         case idle
         case running(step: Int, total: Int, message: String)
         case completed(path: String)
+        case cancelled
         case failed(String)
+    }
+
+    /// Live residency of the pane's model: is it loaded server-side, and how
+    /// many bytes the server holds resident across ALL loaded models. Polled
+    /// by the view from `/v1/models` only — see `refreshResidency`.
+    struct Residency: Equatable {
+        var loaded: Bool
+        var bytesResident: UInt64
+        var gpuResidentBytes: Int64
     }
 
     @Published private(set) var phase: Phase = .idle
     @Published private(set) var recent: [String] = []
     @Published private(set) var log: [String] = []
+    @Published private(set) var residency: Residency? = nil
 
     private var task: Task<Void, Never>?
     private let api = APIClient()
+    /// Monotonic generation id. Phase writes from a superseded task are
+    /// dropped — cancel-then-regenerate used to race the old task's catch
+    /// (setting .failed/.idle) against the new run's .running.
+    private var generationSeq = 0
+
+    private func setPhase(_ p: Phase, for gen: Int) {
+        guard gen == generationSeq else { return }
+        phase = p
+    }
+
+    /// A cancelled URLSession request surfaces as URLError.cancelled, not
+    /// CancellationError — both mean "the user hit Cancel", never "Failed".
+    nonisolated static func isCancellation(_ error: Error) -> Bool {
+        if error is CancellationError { return true }
+        if let u = error as? URLError, u.code == .cancelled { return true }
+        return false
+    }
 
     init() {
         loadRecent()
@@ -49,6 +77,8 @@ final class VideoGenService: ObservableObject {
         }
 
         task?.cancel()
+        generationSeq += 1
+        let gen = generationSeq
         phase = .running(step: 0, total: 3, message: "Loading model…")
         log = []
 
@@ -84,14 +114,18 @@ final class VideoGenService: ObservableObject {
                     audioPath.flatMap { Self.audioFileToWavBase64(path: $0) }
                 }.value
                 if audioPath != nil, audioB64 == nil {
-                    phase = .failed("Couldn't read the audio clip. Pick a WAV, MP3, M4A, or AAC file.")
+                    setPhase(.failed("Couldn't read the audio clip. Pick a WAV, MP3, M4A, or AAC file."), for: gen)
                     return
                 }
                 let port = try await server.ensureRunning(forGenModelDir: modelDir)
-                if Task.isCancelled { phase = .idle; return }
+                if Task.isCancelled { setPhase(.cancelled, for: gen); return }
                 let info = try await server.loadModel(id: modelDir)
                 loadedId = info.name
-                if Task.isCancelled { await releaseIfNeeded(); phase = .idle; return }
+                // Cancelled right after load: deliberately leave the model
+                // resident (an unload from a cancelled task can't run anyway,
+                // and the likely next action is a retry — the residency row
+                // in the pane shows the state).
+                if Task.isCancelled { setPhase(.cancelled, for: gen); return }
                 let body = Self.requestBody(model: info.name, prompt: prompt,
                                             request: request, firstFrameB64: firstFrameB64,
                                             audioB64: audioB64)
@@ -105,12 +139,12 @@ final class VideoGenService: ObservableObject {
                         let step = ev["step"] as? Int ?? 0
                         let total = ev["total"] as? Int ?? steps
                         let stage = ev["stage"] as? String ?? "Generating"
-                        phase = .running(step: step, total: max(total, 1), message: "\(stage)…")
+                        setPhase(.running(step: step, total: max(total, 1), message: "\(stage)…"), for: gen)
                     case "complete":
                         decoded = Self.decodeFrames(ev)
                     case "error":
                         await releaseIfNeeded()
-                        phase = .failed(ev["message"] as? String ?? "Generation failed.")
+                        setPhase(.failed(ev["message"] as? String ?? "Generation failed."), for: gen)
                         return
                     default:
                         break
@@ -118,11 +152,11 @@ final class VideoGenService: ObservableObject {
                 }
                 await releaseIfNeeded()
                 guard let frames = decoded else {
-                    phase = .failed("Server returned no video frames.")
+                    setPhase(.failed("Server returned no video frames."), for: gen)
                     return
                 }
-                if Task.isCancelled { phase = .idle; return }
-                phase = .running(step: steps, total: steps, message: "Encoding mp4…")
+                if Task.isCancelled { setPhase(.cancelled, for: gen); return }
+                setPhase(.running(step: steps, total: steps, message: "Encoding mp4…"), for: gen)
                 let outFps = frames.fps > 0 ? frames.fps : fps
                 try await Task.detached(priority: .userInitiated) {
                     try VideoGenService.writeMP4(
@@ -132,14 +166,19 @@ final class VideoGenService: ObservableObject {
                         audioPCM: frames.audioPCM, audioSampleRate: frames.audioSampleRate,
                         audioChannels: frames.audioChannels)
                 }.value
-                phase = .completed(path: outputPath)
+                setPhase(.completed(path: outputPath), for: gen)
                 insertRecent(outputPath)
-            } catch is CancellationError {
-                await releaseIfNeeded()
-                phase = .idle
             } catch {
+                if Task.isCancelled || Self.isCancellation(error) {
+                    // User cancelled. No unload: the server aborts the denoise
+                    // loop itself when the socket closes, and the model stays
+                    // resident for an instant retry (visible in the pane's
+                    // residency row).
+                    setPhase(.cancelled, for: gen)
+                    return
+                }
                 await releaseIfNeeded()
-                phase = .failed(error.localizedDescription)
+                setPhase(.failed(error.localizedDescription), for: gen)
             }
         }
     }
@@ -147,6 +186,53 @@ final class VideoGenService: ObservableObject {
     func cancel() {
         task?.cancel()
         task = nil
+        // Instant feedback; the cancelled task's own catch re-confirms it.
+        if isRunning { phase = .cancelled }
+    }
+
+    // MARK: - Residency (model loaded? GPU memory?)
+
+    /// Refresh `residency` from `/v1/models` ONLY — a no-model endpoint that
+    /// reports `loaded` + `bytes_resident` per registry entry. Deliberately
+    /// NOT `/props`: that route resolves the DEFAULT model, so on a headless
+    /// gen-only boot it 503s (the live "GPU memory 0 MB" bug), and it can
+    /// even cold-load an evicted default chat model from a mere status poll.
+    /// Cheap localhost GET; never starts the server — a stopped server reads
+    /// as "not loaded".
+    func refreshResidency(repo: String, server: ServerManager) async {
+        guard server.status == .running else {
+            residency = nil
+            return
+        }
+        guard let entries = try? await api.fetchAllModels(port: server.port) else {
+            residency = nil
+            return
+        }
+        let dirBase = ServerManager.resolveModelDir(repo: repo)
+            .map { URL(fileURLWithPath: $0).lastPathComponent }
+        residency = Self.residency(from: entries, repo: repo, dirBasename: dirBase)
+    }
+
+    /// Pure reduction of a `/v1/models` snapshot into the pane's residency:
+    /// this model's loaded flag, plus the summed resident bytes of every
+    /// loaded entry ("what does the GPU hold" — chat models included).
+    nonisolated static func residency(from entries: [ModelInfo], repo: String, dirBasename: String?) -> Residency {
+        let entry = entries.first { entryMatches(id: $0.name, repo: repo, dirBasename: dirBasename) }
+        let total = entries.filter(\.loaded)
+            .reduce(Int64(0)) { $0 + Int64(clamping: $1.bytesResident) }
+        return Residency(
+            loaded: entry?.loaded ?? false,
+            bytesResident: entry?.bytesResident ?? 0,
+            gpuResidentBytes: total
+        )
+    }
+
+    /// Registry ids are `org/model` for discovered dirs, or an absolute path /
+    /// bare basename for path-registered models — match any of those shapes.
+    nonisolated static func entryMatches(id: String, repo: String, dirBasename: String?) -> Bool {
+        if id == repo { return true }
+        guard let base = dirBasename, !base.isEmpty else { return false }
+        return id == base || id.hasSuffix("/" + base)
     }
 
     // MARK: - Request body (pure so tests can pin the wire contract)
@@ -187,6 +273,10 @@ final class VideoGenService: ObservableObject {
         }
         if let firstFrameB64 { body["first_frame_image"] = firstFrameB64 }
         if hasAudio, let audioB64 { body["audio"] = audioB64 }
+        if let lora = request.loraPath, !lora.isEmpty {
+            body["lora_path"] = lora
+            if request.loraScale != 1.0 { body["lora_scale"] = request.loraScale }
+        }
         return body
     }
 
