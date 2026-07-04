@@ -530,7 +530,7 @@ pub const MeshEngine = struct {
         self.engine = try hy3d.Engine.load(io, allocator, model_dir);
         self.paint_dir = findPaintDir(allocator, model_dir);
         if (self.paint_dir) |p| log.info("[mesh] paint (texture) weights available: {s}\n", .{p});
-        self.rig_dir = findSiblingModelDir(allocator, model_dir, "unirig-skeleton-8bit", "UNIRIG_DIR");
+        self.rig_dir = findRigDir(allocator, model_dir);
         if (self.rig_dir) |p| log.info("[mesh] rig (UniRig) weights available: {s}\n", .{p});
         log.info("[mesh] Hunyuan3D shape engine ready\n", .{});
         return self;
@@ -545,16 +545,28 @@ pub const MeshEngine = struct {
 };
 
 /// Locate the paint-stage model dir: `HY3D_PAINT_DIR` env override, else the
-/// converted sibling `<parent-of-shape-dir>/hunyuan3d-2-1-paint-8bit` (the
-/// shape model ships at `.../local/hunyuan3d-2-1-8bit`, the paint convert
-/// script writes next to it). Returns null (graceful) when absent.
+/// combined single-HF-repo layout `<shape_dir>/paint`, else the converted
+/// sibling `<parent-of-shape-dir>/hunyuan3d-2-1-paint-8bit` (the local
+/// convert script writes next to the shape dir). Returns null (graceful)
+/// when absent.
 fn findPaintDir(allocator: std.mem.Allocator, shape_dir: []const u8) ?[]u8 {
-    return findSiblingModelDir(allocator, shape_dir, "hunyuan3d-2-1-paint-8bit", "HY3D_PAINT_DIR");
+    return findStageModelDir(allocator, shape_dir, "paint", "hunyuan3d-2-1-paint-8bit", "HY3D_PAINT_DIR");
 }
 
-/// Shared sibling-model discovery: `env_var` override (absolute + has a
-/// config.json), else `<parent-of-shape-dir>/<sibling_name>`.
-fn findSiblingModelDir(allocator: std.mem.Allocator, shape_dir: []const u8, sibling_name: []const u8, env_var: [*:0]const u8) ?[]u8 {
+/// Locate the UniRig stage dir (same contract as `findPaintDir`:
+/// `UNIRIG_DIR` env, `<shape_dir>/unirig`, sibling `unirig-skeleton-8bit`).
+fn findRigDir(allocator: std.mem.Allocator, shape_dir: []const u8) ?[]u8 {
+    return findStageModelDir(allocator, shape_dir, "unirig", "unirig-skeleton-8bit", "UNIRIG_DIR");
+}
+
+/// Shared stage-model discovery, in priority order:
+///   1. `env_var` override (absolute + has a config.json) — debugging seam;
+///      when set, it is the ONLY candidate (no silent fallback).
+///   2. `<shape_dir>/<subdir_name>` — the combined single-HF-repo layout
+///      (shape at the root, stage weights in subdirs; ONE download).
+///   3. `<parent-of-shape-dir>/<sibling_name>` — the local convert-script
+///      layout (three sibling dirs under `.../local/`).
+fn findStageModelDir(allocator: std.mem.Allocator, shape_dir: []const u8, subdir_name: []const u8, sibling_name: []const u8, env_var: [*:0]const u8) ?[]u8 {
     if (std.c.getenv(env_var)) |v| {
         const p = std.mem.span(v);
         if (p.len > 0 and std.fs.path.isAbsolute(p) and dirHasConfig(p)) {
@@ -562,6 +574,10 @@ fn findSiblingModelDir(allocator: std.mem.Allocator, shape_dir: []const u8, sibl
         }
         return null;
     }
+    if (std.fs.path.join(allocator, &.{ shape_dir, subdir_name })) |sub| {
+        if (dirHasConfig(sub)) return sub;
+        allocator.free(sub);
+    } else |_| {}
     const parent = std.fs.path.dirname(shape_dir) orelse return null;
     const sib = std.fs.path.join(allocator, &.{ parent, sibling_name }) catch return null;
     if (dirHasConfig(sib)) return sib;
@@ -2563,4 +2579,62 @@ test "extractCondWeights accepts a JSON array or a separated string" {
     try testing.expectEqual(@as(usize, 4), b.len);
     try testing.expect(extractCondWeights("{}", &buf) == null);
     try testing.expect(extractCondWeights("{\"cond_weights\":[1,bad]}", &buf) == null);
+}
+
+test "paint/rig stage dirs resolve from the combined single-repo layout (subdir first, sibling fallback)" {
+    const allocator = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io_tmp = std.Io.Threaded.global_single_threaded.io();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io_tmp, &root_buf);
+    const root = root_buf[0..root_len];
+
+    const mkModelDir = struct {
+        fn call(a: std.mem.Allocator, tmp_dir: std.Io.Dir, base: []const u8, rel: []const u8) ![]u8 {
+            const io = std.Io.Threaded.global_single_threaded.io();
+            try tmp_dir.createDirPath(io, rel);
+            const cfg_rel = try std.fs.path.join(a, &.{ rel, "config.json" });
+            defer a.free(cfg_rel);
+            const f = try tmp_dir.createFile(io, cfg_rel, .{});
+            f.close(io);
+            return std.fs.path.join(a, &.{ base, rel });
+        }
+    }.call;
+
+    // Combined single-HF-repo layout: shape at the root, paint/ + unirig/ inside.
+    const shape = try mkModelDir(allocator, tmp.dir, root, "combined");
+    defer allocator.free(shape);
+    const paint_sub = try mkModelDir(allocator, tmp.dir, root, "combined/paint");
+    defer allocator.free(paint_sub);
+    const rig_sub = try mkModelDir(allocator, tmp.dir, root, "combined/unirig");
+    defer allocator.free(rig_sub);
+
+    const paint = findPaintDir(allocator, shape) orelse return error.TestExpectedResult;
+    defer allocator.free(paint);
+    try testing.expectEqualStrings(paint_sub, paint);
+    const rig = findRigDir(allocator, shape) orelse return error.TestExpectedResult;
+    defer allocator.free(rig);
+    try testing.expectEqualStrings(rig_sub, rig);
+
+    // Legacy local-convert layout (sibling dirs) still resolves.
+    const shape2 = try mkModelDir(allocator, tmp.dir, root, "local/hunyuan3d-2-1-8bit");
+    defer allocator.free(shape2);
+    const paint_sib = try mkModelDir(allocator, tmp.dir, root, "local/hunyuan3d-2-1-paint-8bit");
+    defer allocator.free(paint_sib);
+    const rig_sib = try mkModelDir(allocator, tmp.dir, root, "local/unirig-skeleton-8bit");
+    defer allocator.free(rig_sib);
+
+    const paint2 = findPaintDir(allocator, shape2) orelse return error.TestExpectedResult;
+    defer allocator.free(paint2);
+    try testing.expectEqualStrings(paint_sib, paint2);
+    const rig2 = findRigDir(allocator, shape2) orelse return error.TestExpectedResult;
+    defer allocator.free(rig2);
+    try testing.expectEqualStrings(rig_sib, rig2);
+
+    // Nothing anywhere -> graceful null (texture/rig requests 400).
+    const bare = try mkModelDir(allocator, tmp.dir, root, "bare/shape-only");
+    defer allocator.free(bare);
+    try testing.expect(findPaintDir(allocator, bare) == null);
+    try testing.expect(findRigDir(allocator, bare) == null);
 }

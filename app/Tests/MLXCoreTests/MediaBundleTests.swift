@@ -175,56 +175,73 @@ final class MediaBundleTests: XCTestCase {
 
     // MARK: - 3D (Hunyuan3D) bundle + local-repo readiness
 
-    func testModel3DBundleIsSingleFlatComponentWithAllowlist() {
+    func testModel3DBundleIsOneRecursiveHFRepoWithAllStages() {
         let b = Model3DModelPreset.hunyuan3d21_8bit.bundle
-        // One local component, no dependency, non-recursive (the dir is flat).
+        // ONE published HF repo carries all three stages (shape at the root,
+        // paint/ + unirig/ subdirs) — a single download, no dependency repos.
         XCTAssertEqual(b.components.count, 1)
         XCTAssertTrue(b.dependencyRepos.isEmpty)
-        XCTAssertEqual(b.primaryRepo, "local/hunyuan3d-2-1-8bit")
+        XCTAssertEqual(b.primaryRepo, "ddalcu/Hunyuan3D-2.1-MLX-Serve-8bit")
         let comp = b.components[0]
-        XCTAssertFalse(comp.selection.recursive)
-        // Allowlist keeps ONLY the three engine safetensors (a future HF repo
-        // wouldn't drag in extras).
-        XCTAssertEqual(comp.selection.keepSafetensors?.count, 3)
-        for f in ["dit.safetensors", "conditioner.safetensors", "vae.safetensors"] {
+        // Recursive so the paint/ + unirig/ subdirs ride the same pull.
+        XCTAssertTrue(comp.selection.recursive)
+        // Allowlist covers exactly the seven engine weights across the stages.
+        XCTAssertEqual(comp.selection.keepSafetensors?.count, 7)
+        for f in ["dit.safetensors", "conditioner.safetensors", "vae.safetensors",
+                  "unet.safetensors", "unet_dual.safetensors", "dino.safetensors",
+                  "skeleton.safetensors"] {
             XCTAssertTrue(comp.selection.keepSafetensors?.contains(f) ?? false, "missing allowlist \(f)")
         }
-        // Ready markers: config + the three safetensors.
-        for marker in ["config.json", "dit.safetensors", "conditioner.safetensors", "vae.safetensors"] {
+        // Ready markers span all three stages so a partial pull never reads
+        // ready (texture/rig would 400 at request time).
+        for marker in ["config.json", "dit.safetensors", "conditioner.safetensors", "vae.safetensors",
+                       "paint/config.json", "paint/unet.safetensors", "paint/unet_dual.safetensors",
+                       "paint/dino.safetensors", "paint/vae.safetensors",
+                       "unirig/config.json", "unirig/skeleton.safetensors"] {
             XCTAssertTrue(comp.readyMarkers.contains(marker), "missing readyMarker \(marker)")
         }
     }
 
-    func testLocalRepoReadinessChecksOnDiskPresence() throws {
-        // A `local/` (convert-on-device) repo has no download; readiness is
-        // purely "are the converted weights on disk under models/local/…".
+    func testModel3DReadinessRequiresAllThreeStages() throws {
+        // A shape-only dir (partial download / the pre-combined local layout)
+        // must NOT read as ready — texture/rig requests would 400.
         let fm = FileManager.default
         let root = NSTemporaryDirectory() + "hy3dtest-\(UUID().uuidString)"
-        let modelDir = (root as NSString).appendingPathComponent("local/hunyuan3d-2-1-8bit")
+        let modelDir = (root as NSString).appendingPathComponent("ddalcu/Hunyuan3D-2.1-MLX-Serve-8bit")
         try fm.createDirectory(atPath: modelDir, withIntermediateDirectories: true)
         defer { try? fm.removeItem(atPath: root) }
 
         let comp = Model3DModelPreset.hunyuan3d21_8bit.bundle.components[0]
         // Nothing present → not ready.
         XCTAssertFalse(DownloadManager.componentReady(comp, modelsRoot: root))
-        // config.json alone → the existingModelDir resolves, but a marker is
-        // missing (and no safetensors) → still not ready.
+        // Shape stage alone → still not ready (paint/unirig markers missing).
         fm.createFile(atPath: (modelDir as NSString).appendingPathComponent("config.json"), contents: Data("{}".utf8))
-        XCTAssertFalse(DownloadManager.componentReady(comp, modelsRoot: root))
-        // Add the three safetensors markers → ready.
         for f in ["dit.safetensors", "conditioner.safetensors", "vae.safetensors"] {
             fm.createFile(atPath: (modelDir as NSString).appendingPathComponent(f), contents: Data([0, 1, 2]))
         }
+        XCTAssertFalse(DownloadManager.componentReady(comp, modelsRoot: root))
+        // Paint stage lands → still waiting on unirig.
+        try fm.createDirectory(atPath: (modelDir as NSString).appendingPathComponent("paint"), withIntermediateDirectories: true)
+        for f in ["paint/config.json", "paint/unet.safetensors", "paint/unet_dual.safetensors",
+                  "paint/dino.safetensors", "paint/vae.safetensors"] {
+            fm.createFile(atPath: (modelDir as NSString).appendingPathComponent(f), contents: Data([0, 1, 2]))
+        }
+        XCTAssertFalse(DownloadManager.componentReady(comp, modelsRoot: root))
+        // UniRig stage lands → ready.
+        try fm.createDirectory(atPath: (modelDir as NSString).appendingPathComponent("unirig"), withIntermediateDirectories: true)
+        for f in ["unirig/config.json", "unirig/skeleton.safetensors"] {
+            fm.createFile(atPath: (modelDir as NSString).appendingPathComponent(f), contents: Data([0, 1, 2]))
+        }
         XCTAssertTrue(DownloadManager.componentReady(comp, modelsRoot: root))
-        // Removing one required weight breaks readiness again.
-        try fm.removeItem(atPath: (modelDir as NSString).appendingPathComponent("vae.safetensors"))
+        // Removing one stage weight breaks readiness again.
+        try fm.removeItem(atPath: (modelDir as NSString).appendingPathComponent("paint/unet.safetensors"))
         XCTAssertFalse(DownloadManager.componentReady(comp, modelsRoot: root))
     }
 
-    func testHunyuanPresetIsLocalOnly() {
-        // The `local/` prefix drives the pane's "convert locally" hint (no
-        // download button). Flipping to a real HF repo later drops the flag.
-        XCTAssertTrue(Model3DModelPreset.hunyuan3d21_8bit.isLocalOnly)
+    func testHunyuanPresetDownloadsFromHF() {
+        // Published combined repo — the pane shows the standard download bar,
+        // not the "convert locally" hint.
+        XCTAssertFalse(Model3DModelPreset.hunyuan3d21_8bit.isLocalOnly)
         XCTAssertTrue(Model3DModelPreset.all.contains(.hunyuan3d21_8bit))
     }
 

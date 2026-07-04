@@ -14,10 +14,23 @@ Qwen3-TTS voice cloning + voice input.
 | Phase | What | Status |
 |---|---|---|
 | P1 | Shape: photo → untextured GLB (`.mesh` modality, Hunyuan3D-2.1 shape stage) | **DONE, validated 2026-07-03/04** |
-| P1.x | Loose ends: FlashVDM speedup, HF weight publish, pane polish | open (small, independent) |
-| P2 | Texture: full PBR (albedo + metallic-roughness) — **user chose option B** (full PBR in one go, not albedo-first) | NEXT — fully designed in §5 |
-| P3 | Rig & animate: auto-rig + skeletal idle/emote + TTS-driven jaw | open (outline §6) |
-| P4 | Avatar loop: persona + RAG + voice clone + speech pipelining + avatar window | open (integration only, §7) |
+| P1.x | Loose ends: FlashVDM speedup, HF weight publish, pane polish | FlashVDM + pane polish **DONE** (6× volume decode, default res 384, history thumbnails); **HF publish still open — needs user sign-off + user-run upload** |
+| P2 | Texture: full PBR (albedo + metallic-roughness) — **user chose option B** (full PBR in one go, not albedo-first) | **DONE** — all `HY3DP_*` oracles pass at fp16 (full UNet step cos 1.00000), live 8-bit e2e green; §5.8.14 follow-ups (UniPC-15, RealESRGAN, >6-view) still optional/open |
+| P3 | Rig & animate: auto-rig + skeletal idle/emote + TTS-driven jaw | **DONE** — UniRig skeleton (`unirig_skeleton.zig`, oracles exact) + geodesic voxel skinning (`voxel_skin.zig`; PTv3 neural skinner deliberately deferred), glTF skins, `SkeletalAnimator` idle/emote/jaw |
+| P4 | Avatar loop: persona + RAG + voice clone + speech pipelining + avatar window | **DONE (implemented + unit-tested)** — `AvatarEngine`/`AvatarView`/`SentenceStreamer`/`AvatarPersona`; §8 live conversation-demo gate still to be reproduced on the dev Mac with converted weights |
+
+**Status 2026-07-04 (128 GB Mac):** Zig 722 pass / 0 fail; Swift 1111 / 0 fail; chat 37/37.
+Weights re-converted HERE from source ckpts (`~/hy3d-scratch/` sources, venv there too) into
+`~/.mlx-serve/models/local/{hunyuan3d-2-1-8bit,hunyuan3d-2-1-paint-8bit,unirig-skeleton-8bit}`;
+`test_3d_{gen,paint,rig}.sh` ALL PASS live (shape verts 72,128 == dev-Mac record). §4.2 done up
+to the upload: COMBINED single repo staged at `~/hf-staging/Hunyuan3D-2.1-MLX-Serve-8bit`
+(shape root + `paint/` + `unirig/` + README/licenses), server resolves stage subdirs
+(`gen.findStageModelDir`, subdir → sibling → env), Swift preset/bundle flipped to
+`ddalcu/Hunyuan3D-2.1-MLX-Serve-8bit` (recursive pull, all-stage ready markers). Both paint+rig
+integration tests ALL PASS against the combined layout. **USER ACTION: run the
+`hf upload-large-folder` command to publish.** Also fixed en route: ready mesh models reported
+`capabilities: []` (missing mesh arm in `readyCapsJson`) + test_3d_gen.sh check 1 was non-fatal.
+Remaining: optional §5.8.14 follow-ups; live §8 avatar demo; `plan-tts-8bit.md` separate side-plan.
 
 ## 2. Current state (verified)
 

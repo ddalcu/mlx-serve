@@ -158,9 +158,8 @@ extension MediaBundle {
     /// engine safetensors (`dit`, `conditioner`, `vae`). Non-recursive with a
     /// safetensors allowlist so a future published HF repo pulls ONLY those
     /// three. Ready when all four markers are present. For a `local/`
-    /// (convert-on-device) repo there's no download — readiness still checks
-    /// local presence under `~/.mlx-serve/models/local/...`, so flipping to a
-    /// real HF repo later needs no change here.
+    /// (convert-on-device) repo there's no download — readiness checks disk
+    /// presence either way, so local and published repos share this factory.
     static func model3d(repo: String, displayName: String, sizeGB: Double) -> MediaBundle {
         MediaBundle(
             id: "model3d:\(repo)",
@@ -168,12 +167,25 @@ extension MediaBundle {
             components: [
                 MediaComponent(
                     repo: repo,
-                    selection: FileSelection(keepSafetensors: [
+                    // Recursive: the combined repo ships the paint (texture)
+                    // stage in `paint/` and the UniRig auto-rig stage in
+                    // `unirig/` beside the root shape weights — one pull
+                    // lights up all three. Allowlist = exactly the seven
+                    // engine weights (extras in the repo never download).
+                    selection: FileSelection(recursive: true, keepSafetensors: [
                         "dit.safetensors", "conditioner.safetensors", "vae.safetensors",
+                        "unet.safetensors", "unet_dual.safetensors", "dino.safetensors",
+                        "skeleton.safetensors",
                     ]),
+                    // All three stages must be present — a partial pull that
+                    // reads "ready" would 400 on texture/rig requests.
                     readyMarkers: [
                         "config.json", "dit.safetensors",
                         "conditioner.safetensors", "vae.safetensors",
+                        "paint/config.json", "paint/unet.safetensors",
+                        "paint/unet_dual.safetensors", "paint/dino.safetensors",
+                        "paint/vae.safetensors",
+                        "unirig/config.json", "unirig/skeleton.safetensors",
                     ]
                 ),
             ],
@@ -218,6 +230,6 @@ extension VideoModelPreset {
 
 extension Model3DModelPreset {
     var bundle: MediaBundle {
-        .model3d(repo: repo, displayName: name, sizeGB: Double(approxRAMGB))
+        .model3d(repo: repo, displayName: name, sizeGB: approxDownloadGB)
     }
 }

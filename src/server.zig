@@ -1845,6 +1845,54 @@ fn optSamplingRecJson(allocator: std.mem.Allocator, comptime T: type, v: ?T) ![]
 }
 
 /// Render the JSON metadata fragment for one entry. For `.ready` entries
+/// Capability flags for a READY registry entry, kept as plain booleans so the
+/// JSON assembly below is hermetically testable without a LoadedModel. Every
+/// engine slot on LoadedModel must have a flag here — a missing arm renders a
+/// ready model with an empty capabilities list (the live `.mesh`/"3d" hole).
+const ReadyCaps = struct {
+    has_chat: bool = false,
+    has_vision: bool = false,
+    has_audio: bool = false,
+    has_reasoning: bool = false,
+    is_encoder_only: bool = false,
+    has_image_engine: bool = false,
+    has_audio_engine: bool = false,
+    has_video_engine: bool = false,
+    has_mesh_engine: bool = false,
+};
+
+/// `capabilities` JSON array for a ready model. Caller deinits.
+fn readyCapsJson(allocator: std.mem.Allocator, c: ReadyCaps) !std.ArrayList(u8) {
+    var caps = std.ArrayList(u8).empty;
+    errdefer caps.deinit(allocator);
+    try caps.append(allocator, '[');
+    var n_caps: usize = 0;
+    const append_cap = struct {
+        fn call(a: std.mem.Allocator, b: *std.ArrayList(u8), n: *usize, name: []const u8) !void {
+            if (n.* > 0) try b.append(a, ',');
+            try b.append(a, '"');
+            try b.appendSlice(a, name);
+            try b.append(a, '"');
+            n.* += 1;
+        }
+    }.call;
+    if (c.has_chat) try append_cap(allocator, &caps, &n_caps, "chat");
+    if (c.has_chat) try append_cap(allocator, &caps, &n_caps, "tool_use");
+    if (c.has_chat) try append_cap(allocator, &caps, &n_caps, "streaming");
+    if (c.has_vision) try append_cap(allocator, &caps, &n_caps, "vision");
+    if (c.has_audio) try append_cap(allocator, &caps, &n_caps, "audio");
+    if (c.has_reasoning) try append_cap(allocator, &caps, &n_caps, "reasoning");
+    if (c.has_chat) try append_cap(allocator, &caps, &n_caps, "json_schema");
+    if (c.is_encoder_only) try append_cap(allocator, &caps, &n_caps, "embeddings");
+    // Native media-generation engines (resident).
+    if (c.has_image_engine) try append_cap(allocator, &caps, &n_caps, "image");
+    if (c.has_audio_engine and !c.has_audio) try append_cap(allocator, &caps, &n_caps, "audio");
+    if (c.has_video_engine) try append_cap(allocator, &caps, &n_caps, "video");
+    if (c.has_mesh_engine) try append_cap(allocator, &caps, &n_caps, "3d");
+    try caps.append(allocator, ']');
+    return caps;
+}
+
 /// pulls full capabilities/dimensions off the resident config/chat_config;
 /// for non-ready entries renders a lightweight stub with state +
 /// bytes_on_disk only. Returns an allocator-owned string; caller frees.
@@ -1865,36 +1913,21 @@ fn renderModelEntry(
             try std.fmt.allocPrint(allocator, "null", .{});
         defer allocator.free(ctx_str);
 
-        var caps = std.ArrayList(u8).empty;
-        defer caps.deinit(allocator);
-        try caps.append(allocator, '[');
-        var n_caps: usize = 0;
         const has_chat = !config.is_encoder_only and chat_config.chat_template.len > 0;
         const has_vision = entry.vision_encoder != null;
         const has_audio = if (entry.vision_encoder) |ve| ve.supportsAudio() else false;
-        const has_reasoning = has_chat and chatTemplateSupportsThinking(chat_config.chat_template);
-        const append_cap = struct {
-            fn call(a: std.mem.Allocator, b: *std.ArrayList(u8), n: *usize, name: []const u8) !void {
-                if (n.* > 0) try b.append(a, ',');
-                try b.append(a, '"');
-                try b.appendSlice(a, name);
-                try b.append(a, '"');
-                n.* += 1;
-            }
-        }.call;
-        if (has_chat) try append_cap(allocator, &caps, &n_caps, "chat");
-        if (has_chat) try append_cap(allocator, &caps, &n_caps, "tool_use");
-        if (has_chat) try append_cap(allocator, &caps, &n_caps, "streaming");
-        if (has_vision) try append_cap(allocator, &caps, &n_caps, "vision");
-        if (has_audio) try append_cap(allocator, &caps, &n_caps, "audio");
-        if (has_reasoning) try append_cap(allocator, &caps, &n_caps, "reasoning");
-        if (has_chat) try append_cap(allocator, &caps, &n_caps, "json_schema");
-        if (config.is_encoder_only) try append_cap(allocator, &caps, &n_caps, "embeddings");
-        // Native media-generation engines (resident).
-        if (entry.image_engine != null) try append_cap(allocator, &caps, &n_caps, "image");
-        if (entry.audio_engine != null and !has_audio) try append_cap(allocator, &caps, &n_caps, "audio");
-        if (entry.video_engine != null) try append_cap(allocator, &caps, &n_caps, "video");
-        try caps.append(allocator, ']');
+        var caps = try readyCapsJson(allocator, .{
+            .has_chat = has_chat,
+            .has_vision = has_vision,
+            .has_audio = has_audio,
+            .has_reasoning = has_chat and chatTemplateSupportsThinking(chat_config.chat_template),
+            .is_encoder_only = config.is_encoder_only,
+            .has_image_engine = entry.image_engine != null,
+            .has_audio_engine = entry.audio_engine != null,
+            .has_video_engine = entry.video_engine != null,
+            .has_mesh_engine = entry.mesh_engine != null,
+        });
+        defer caps.deinit(allocator);
 
         var mods = std.ArrayList(u8).empty;
         defer mods.deinit(allocator);
@@ -10546,4 +10579,34 @@ test "optSamplingRecJson emits number when present, null when absent" {
     const none = try optSamplingRecJson(a, u32, null);
     defer a.free(none);
     try std.testing.expectEqualStrings("null", none);
+}
+
+test "readyCapsJson: every resident media engine surfaces its capability (mesh -> 3d)" {
+    const a = std.testing.allocator;
+
+    // A ready 3D shape model (no chat template, no encoder) must advertise
+    // "3d" — the stub path already did; the READY path shipped without the
+    // mesh arm and rendered [] (live 2026-07-04, test_3d_gen.sh check 1).
+    var mesh = try readyCapsJson(a, .{ .has_mesh_engine = true });
+    defer mesh.deinit(a);
+    try std.testing.expectEqualStrings("[\"3d\"]", mesh.items);
+
+    // The other three engine slots keep their existing capability names.
+    var img = try readyCapsJson(a, .{ .has_image_engine = true });
+    defer img.deinit(a);
+    try std.testing.expectEqualStrings("[\"image\"]", img.items);
+    var aud = try readyCapsJson(a, .{ .has_audio_engine = true });
+    defer aud.deinit(a);
+    try std.testing.expectEqualStrings("[\"audio\"]", aud.items);
+    var vid = try readyCapsJson(a, .{ .has_video_engine = true });
+    defer vid.deinit(a);
+    try std.testing.expectEqualStrings("[\"video\"]", vid.items);
+
+    // Chat-class flags are unaffected by the media arms.
+    var chat = try readyCapsJson(a, .{ .has_chat = true, .has_reasoning = true });
+    defer chat.deinit(a);
+    try std.testing.expectEqualStrings(
+        "[\"chat\",\"tool_use\",\"streaming\",\"reasoning\",\"json_schema\"]",
+        chat.items,
+    );
 }

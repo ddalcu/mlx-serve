@@ -42,7 +42,7 @@ d=json.load(sys.stdin)['data']
 m=[x for x in d if x['id']=='$HY3D_ID' and x['state']=='ready' and '3d' in x.get('capabilities',[])]
 assert m, 'Hunyuan3D not ready with 3d cap: '+json.dumps(d)
 print('PASS: load-model by path -> 3D model ready, capabilities', m[0]['capabilities'])
-"
+" || { echo "FAIL: ready 3D model missing '3d' capability"; exit 1; }
 
 # 2. Build a test photo: dark disc centered on white (an unambiguous subject).
 SRC=/tmp/test_3d_src.png

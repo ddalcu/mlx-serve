@@ -399,24 +399,28 @@ struct AudioModelPreset: Identifiable, Hashable {
 
 // MARK: - 3D presets (image → mesh)
 
-/// A single-image-to-3D model served by mlx-serve's NATIVE Hunyuan3D engine
-/// (shape stage). The engine dispatches on `config.json`'s `model_type`, so only
-/// converted Hunyuan3D checkpoints load here.
+/// A single-image-to-3D model served by mlx-serve's NATIVE Hunyuan3D engine.
+/// The engine dispatches on `config.json`'s `model_type`, so only converted
+/// Hunyuan3D checkpoints load here.
 ///
-/// LOCAL-ONLY for now: the preset `repo` starts with `local/`, so there's no HF
-/// download — the weights are converted on-device (see the repo README /
-/// `tests/convert_hunyuan3d_weights.py`) into `~/.mlx-serve/models/local/...`.
-/// The pane shows a "convert locally" hint instead of a Download button while
-/// they're absent. Flipping to a published HF repo later is a one-line `repo`
-/// change — everything downstream keys off the bundle, not the `local/` prefix.
+/// ONE combined HF repo carries all three stages: shape weights at the root,
+/// the paint (texture) stage in `paint/`, and the UniRig auto-rig stage in
+/// `unirig/` — a single download lights up shape + texture + rig (the server
+/// resolves the subdirs via `gen.findStageModelDir`). A `local/` repo prefix
+/// still marks a convert-on-device build (`tests/convert_hunyuan3d_weights.py`
+/// et al.), for which the pane shows a "convert locally" hint instead of a
+/// Download button.
 struct Model3DModelPreset: Identifiable, Hashable {
     let id: String
     let name: String
     /// Model directory under `~/.mlx-serve/models`. A `local/` prefix marks a
     /// convert-on-device model (no HF pull); any other prefix is a normal repo.
     let repo: String
-    /// Peak unified-memory footprint, GB — drives the soft RAM gate.
+    /// Peak unified-memory footprint, GB — drives the soft RAM gate. The paint
+    /// stage is the peak (shape frees before it loads).
     let approxRAMGB: Int
+    /// Full bundle download size, GB (shape + paint + unirig).
+    let approxDownloadGB: Double
 
     static func == (lhs: Self, rhs: Self) -> Bool { lhs.id == rhs.id }
     func hash(into hasher: inout Hasher) { hasher.combine(id) }
@@ -426,12 +430,13 @@ struct Model3DModelPreset: Identifiable, Hashable {
     /// button while its weights are absent.
     var isLocalOnly: Bool { repo.hasPrefix("local/") }
 
-    /// Hunyuan3D 2.1 shape model, 8-bit. The only supported 3D checkpoint today.
+    /// Hunyuan3D 2.1, 8-bit — the combined shape + paint + UniRig repo.
     static let hunyuan3d21_8bit = Model3DModelPreset(
         id: "hunyuan3d-2-1-8bit",
         name: "Hunyuan3D 2.1 (8-bit)",
-        repo: "local/hunyuan3d-2-1-8bit",
-        approxRAMGB: 4
+        repo: "ddalcu/Hunyuan3D-2.1-MLX-Serve-8bit",
+        approxRAMGB: 5,
+        approxDownloadGB: 8.5
     )
 
     /// Catalog. One entry today; grows as more 3D checkpoints convert.
