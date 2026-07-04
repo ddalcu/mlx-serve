@@ -193,3 +193,56 @@ extension VideoGenSettings {
         if let v = try c.decodeIfPresent(Double.self, forKey: .loraScale) { loraScale = v }
     }
 }
+
+// MARK: - 3D
+
+struct Model3DGenSettings: Codable, Equatable {
+    var modelId: String = Model3DModelPreset.hunyuan3d21_8bit.id
+    var steps: Int = 30
+    var guidance: Double = 5.0
+    /// Marching-cubes octree resolution (128 / 256 / 384 — the reference
+    /// default, affordable since the FlashVDM hierarchical volume decode).
+    var resolution: Int = 384
+    var keepResident: Bool = false
+    /// Slowly rotate + "breathe" the previewed model on a turntable.
+    var turntable: Bool = true
+    /// P2 paint stage (full PBR texture). Off until validated end to end.
+    var texture: Bool = false
+    /// P3 auto-rig stage (skeleton + skin weights). Off by default.
+    var rig: Bool = false
+
+    private static let storageKey = "model3dGenSettings"
+
+    static func load() -> Model3DGenSettings {
+        guard let data = UserDefaults.standard.data(forKey: storageKey),
+              let v = try? JSONDecoder().decode(Model3DGenSettings.self, from: data) else {
+            return Model3DGenSettings()
+        }
+        return v
+    }
+
+    func save() {
+        guard let data = try? JSONEncoder().encode(self) else { return }
+        UserDefaults.standard.set(data, forKey: Self.storageKey)
+    }
+}
+
+extension Model3DGenSettings {
+    var resolvedModel: Model3DModelPreset {
+        Model3DModelPreset.all.first { $0.id == modelId } ?? .hunyuan3d21_8bit
+    }
+
+    init(from decoder: Decoder) throws {
+        self.init()
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        if let v = try c.decodeIfPresent(String.self, forKey: .modelId) { modelId = v }
+        if let v = try c.decodeIfPresent(Int.self, forKey: .steps) { steps = v }
+        if let v = try c.decodeIfPresent(Double.self, forKey: .guidance) { guidance = v }
+        // Legacy migration: pre-FlashVDM builds persisted a 380 "fine" option.
+        if let v = try c.decodeIfPresent(Int.self, forKey: .resolution) { resolution = v == 380 ? 384 : v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .keepResident) { keepResident = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .turntable) { turntable = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .texture) { texture = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .rig) { rig = v }
+    }
+}

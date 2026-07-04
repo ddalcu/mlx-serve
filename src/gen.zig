@@ -22,6 +22,11 @@ const nsfw = @import("nsfw.zig");
 const tts = @import("tts.zig");
 const ltx = @import("ltx_video.zig");
 const ltx_audio = @import("ltx_audio.zig");
+const hy3d = @import("hunyuan3d.zig");
+const hy3d_paint = @import("hunyuan3d_paint.zig");
+const unirig = @import("unirig_skeleton.zig");
+const voxel_skin = @import("voxel_skin.zig");
+const glb_mod = @import("glb.zig");
 const wav_mod = @import("wav.zig");
 const png_mod = @import("png.zig");
 const tok_mod = @import("tokenizer.zig");
@@ -43,12 +48,14 @@ pub const Modality = enum {
     image,
     audio,
     video,
+    mesh,
 
     pub fn capability(self: Modality) []const u8 {
         return switch (self) {
             .image => "image",
             .audio => "audio",
             .video => "video",
+            .mesh => "3d",
         };
     }
 
@@ -60,6 +67,7 @@ pub const Modality = enum {
             .image => "flux2",
             .audio => "qwen3_tts",
             .video => "AudioVideo",
+            .mesh => "hunyuan3d_2_1",
         };
     }
 };
@@ -74,6 +82,7 @@ pub fn modalityFromType(model_type: []const u8) ?Modality {
     if (std.mem.startsWith(u8, model_type, "krea")) return .image;
     if (std.mem.eql(u8, model_type, "qwen3_tts")) return .audio;
     if (std.mem.eql(u8, model_type, "AudioVideo")) return .video;
+    if (std.mem.startsWith(u8, model_type, "hunyuan3d")) return .mesh;
     return null;
 }
 
@@ -493,6 +502,82 @@ pub const AudioEngine = struct {
         self.allocator.destroy(self);
     }
 };
+
+/// Mesh backend (currently Hunyuan3D-2.1 shape). Thin owner of the hunyuan3d
+/// engine — the DINO conditioner, DiT, and ShapeVAE decoder live in
+/// `src/hunyuan3d.zig` (mirrors `AudioEngine` over `tts.Synthesizer`). When a
+/// second 3D arch arrives this becomes an `ImageBackend`-style tagged union.
+pub const MeshEngine = struct {
+    allocator: std.mem.Allocator,
+    engine: *hy3d.Engine,
+    /// P2 paint (texture) stage dir, discovered lazily beside the shape model
+    /// (SIBLING dir `<models root>/local/hunyuan3d-2-1-paint-8bit` or the
+    /// `HY3D_PAINT_DIR` override). Null → `"texture": true` requests get a 400.
+    /// The paint engine itself loads per-request and frees after (memory
+    /// staging: shape 3.5 GB + paint ~4.6 GB never both need residency —
+    /// the shape stage completes before the paint stage starts).
+    paint_dir: ?[]u8 = null,
+    /// P3 auto-rig (UniRig skeleton) dir, same sibling-discovery pattern
+    /// (`local/unirig-skeleton-8bit` or `UNIRIG_DIR`). Null → `"rig": true`
+    /// requests get a 400.
+    rig_dir: ?[]u8 = null,
+
+    pub fn load(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !*MeshEngine {
+        const self = try allocator.create(MeshEngine);
+        errdefer allocator.destroy(self);
+        self.allocator = allocator;
+        self.paint_dir = null;
+        self.engine = try hy3d.Engine.load(io, allocator, model_dir);
+        self.paint_dir = findPaintDir(allocator, model_dir);
+        if (self.paint_dir) |p| log.info("[mesh] paint (texture) weights available: {s}\n", .{p});
+        self.rig_dir = findSiblingModelDir(allocator, model_dir, "unirig-skeleton-8bit", "UNIRIG_DIR");
+        if (self.rig_dir) |p| log.info("[mesh] rig (UniRig) weights available: {s}\n", .{p});
+        log.info("[mesh] Hunyuan3D shape engine ready\n", .{});
+        return self;
+    }
+
+    pub fn deinit(self: *MeshEngine) void {
+        if (self.paint_dir) |p| self.allocator.free(p);
+        if (self.rig_dir) |p| self.allocator.free(p);
+        self.engine.deinit();
+        self.allocator.destroy(self);
+    }
+};
+
+/// Locate the paint-stage model dir: `HY3D_PAINT_DIR` env override, else the
+/// converted sibling `<parent-of-shape-dir>/hunyuan3d-2-1-paint-8bit` (the
+/// shape model ships at `.../local/hunyuan3d-2-1-8bit`, the paint convert
+/// script writes next to it). Returns null (graceful) when absent.
+fn findPaintDir(allocator: std.mem.Allocator, shape_dir: []const u8) ?[]u8 {
+    return findSiblingModelDir(allocator, shape_dir, "hunyuan3d-2-1-paint-8bit", "HY3D_PAINT_DIR");
+}
+
+/// Shared sibling-model discovery: `env_var` override (absolute + has a
+/// config.json), else `<parent-of-shape-dir>/<sibling_name>`.
+fn findSiblingModelDir(allocator: std.mem.Allocator, shape_dir: []const u8, sibling_name: []const u8, env_var: [*:0]const u8) ?[]u8 {
+    if (std.c.getenv(env_var)) |v| {
+        const p = std.mem.span(v);
+        if (p.len > 0 and std.fs.path.isAbsolute(p) and dirHasConfig(p)) {
+            return allocator.dupe(u8, p) catch null;
+        }
+        return null;
+    }
+    const parent = std.fs.path.dirname(shape_dir) orelse return null;
+    const sib = std.fs.path.join(allocator, &.{ parent, sibling_name }) catch return null;
+    if (dirHasConfig(sib)) return sib;
+    allocator.free(sib);
+    return null;
+}
+
+fn dirHasConfig(dir: []const u8) bool {
+    if (dir.len == 0 or !std.fs.path.isAbsolute(dir)) return false; // openDirAbsolute UB guard
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cfg = std.fmt.bufPrint(&buf, "{s}/config.json", .{dir}) catch return false;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const f = std.Io.Dir.openFileAbsolute(io, cfg, .{}) catch return false;
+    f.close(io);
+    return true;
+}
 
 const LTX_PAD_LEN: usize = 256; // gemma left-pad length
 const LTX_PAD_ID: i32 = 0; // gemma <pad>
@@ -1614,6 +1699,219 @@ pub fn handleVideo(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: 
     return sendBytesJson(conn, allocator, out.items);
 }
 
+/// Shape → raw mesh → paint (texture) stage → textured GLB. The paint engine
+/// loads lazily per request and frees before returning.
+fn paintedGlb(allocator: std.mem.Allocator, engine: *MeshEngine, rgba: []const u8, w: u32, h: u32, shape_opts: hy3d.MeshOpts, body: []const u8, prog: ?sse.Progress) ![]u8 {
+    const paint_dir = engine.paint_dir orelse return error.PaintUnavailable; // guarded at parse
+    var mesh = try engine.engine.generateMeshRaw(allocator, rgba, w, h, shape_opts, prog);
+    defer mesh.deinit(allocator);
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const paint = try hy3d_paint.PaintEngine.load(io, allocator, paint_dir);
+    defer paint.deinit();
+
+    var popts = hy3d_paint.PaintOpts{ .seed = shape_opts.seed };
+    if (extractJsonInt(body, "texture_steps")) |ts| {
+        if (ts >= 1 and ts <= 100) popts.steps = @intCast(ts);
+    }
+    return paint.paintMeshToGlb(allocator, &mesh, rgba, w, h, popts, prog);
+}
+
+/// Shape → skeleton (UniRig) → geodesic skin weights → rigged GLB, optionally
+/// through the paint stage first (skin weights are computed on the FINAL
+/// vertex set — the paint unwrap seam-duplicates vertices). Engines load
+/// lazily per request and free before returning.
+fn riggedGlb(allocator: std.mem.Allocator, engine: *MeshEngine, rgba: []const u8, w: u32, h: u32, shape_opts: hy3d.MeshOpts, want_texture: bool, body: []const u8, prog: ?sse.Progress) ![]u8 {
+    const rig_dir = engine.rig_dir orelse return error.RigUnavailable; // guarded at parse
+    var mesh = try engine.engine.generateMeshRaw(allocator, rgba, w, h, shape_opts, prog);
+    defer mesh.deinit(allocator);
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    // Optional paint stage first (its engine frees before the rig loads).
+    var painted: ?hy3d_paint.PaintedMesh = null;
+    defer if (painted) |*p| p.deinit(allocator);
+    if (want_texture) {
+        const paint_dir = engine.paint_dir orelse return error.PaintUnavailable;
+        const paint = try hy3d_paint.PaintEngine.load(io, allocator, paint_dir);
+        defer paint.deinit();
+        var popts = hy3d_paint.PaintOpts{ .seed = shape_opts.seed };
+        if (extractJsonInt(body, "texture_steps")) |ts| {
+            if (ts >= 1 and ts <= 100) popts.steps = @intCast(ts);
+        }
+        painted = try paint.paintMesh(allocator, &mesh, rgba, w, h, popts, prog);
+    }
+
+    // Skeleton prediction on the original mesh geometry.
+    if (prog) |p| p.emit("rig-skeleton", 0, 1);
+    const rig = try unirig.Engine.load(io, allocator, rig_dir);
+    defer rig.deinit();
+    var skel = try rig.generateSkeleton(allocator, mesh.vertices, mesh.normals, mesh.indices, .{ .seed = shape_opts.seed });
+    defer skel.deinit(allocator);
+    if (prog) |p| {
+        if (p.cancelled()) return error.Cancelled;
+        p.emit("rig-skeleton", 1, 1);
+    }
+
+    const jn = skel.joints.len;
+    if (jn == 0) return error.EmptySkeleton;
+    const jpos = try allocator.alloc(f32, jn * 3);
+    defer allocator.free(jpos);
+    const jpar = try allocator.alloc(i32, jn);
+    defer allocator.free(jpar);
+    for (skel.joints, 0..) |j, i| {
+        jpos[i * 3 + 0] = j[0];
+        jpos[i * 3 + 1] = j[1];
+        jpos[i * 3 + 2] = j[2];
+        jpar[i] = if (skel.parents[i]) |p| @intCast(p) else -1;
+    }
+
+    // Geodesic skin weights on the FINAL vertex set.
+    if (prog) |p| p.emit("rig-skin", 0, 1);
+    const skin_pos: []const f32 = if (painted) |*p| p.positions else mesh.vertices;
+    const skin_idx: []const u32 = if (painted) |*p| p.indices else mesh.indices;
+    var sw = try voxel_skin.computeSkinWeights(allocator, skin_pos, skin_idx, jpos, jpar, .{});
+    defer sw.deinit();
+    if (prog) |p| {
+        if (p.cancelled()) return error.Cancelled;
+        p.emit("rig-skin", 1, 1);
+    }
+
+    const skeleton = glb_mod.Skeleton{
+        .joint_positions = jpos,
+        .parents = jpar,
+        .joints = sw.joints,
+        .weights = sw.weights,
+    };
+    if (painted) |*p| {
+        const tm = p.textured();
+        return glb_mod.writeGlbRigged(allocator, &tm, &skeleton);
+    }
+    // Untextured rigged GLB: zero UVs + a neutral 2×2 gray albedo (every
+    // texcoord samples one texel — spec-legal flat gray; the writer requires
+    // a texture slot, and viewers get a sane default look).
+    const nverts = mesh.vertices.len / 3;
+    const uvs0 = try allocator.alloc(f32, nverts * 2);
+    defer allocator.free(uvs0);
+    @memset(uvs0, 0);
+    const gray = [_]u8{ 168, 168, 172 } ** 4;
+    const gray_png = try png_mod.encodeRgb(allocator, &gray, 2, 2);
+    defer allocator.free(gray_png);
+    const tm = glb_mod.TexturedMesh{
+        .positions = mesh.vertices,
+        .normals = mesh.normals,
+        .uvs = uvs0,
+        .indices = mesh.indices,
+        .albedo_png = gray_png,
+        .mr_png = null,
+    };
+    return glb_mod.writeGlbRigged(allocator, &tm, &skeleton);
+}
+
+/// POST /v1/3d/generations — base64 GLB (or SSE progress + complete).
+/// The engine takes straight-alpha RGBA8 (its preprocess recenters the subject
+/// via the alpha bbox and composites on white — so an app-side cutout with real
+/// alpha conditions best, and an opaque photo still works as a fallback).
+pub fn handleMesh(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, engine: *MeshEngine) !void {
+    const raw_img = extractJsonString(body, "image") orelse return sendError(conn, 400, "missing 'image' (base64 PNG/JPEG of the subject)");
+    const b64 = try jsonUnescape(allocator, raw_img); // handles \/ from Swift JSONSerialization
+    defer allocator.free(b64);
+    if (b64.len == 0) return sendError(conn, 400, "empty 'image'");
+    const img_bytes = base64DecodeAlloc(allocator, b64) catch
+        return sendError(conn, 400, "invalid base64 in 'image'");
+    defer allocator.free(img_bytes);
+    const img = decodeImageRgba(allocator, img_bytes) orelse
+        return sendError(conn, 400, "could not decode 'image' (PNG/JPEG supported)");
+    defer allocator.free(img.pix);
+
+    const steps: u32 = @intCast(extractJsonInt(body, "steps") orelse 30);
+    const res: u32 = @intCast(extractJsonInt(body, "octree_resolution") orelse 256);
+    if (res < 64 or res > 512) return sendError(conn, 400, "'octree_resolution' must be in [64,512]");
+    const seed: u64 = extractJsonInt(body, "seed") orelse 42;
+    var guidance: f32 = 5.0;
+    if (extractJsonFloat(body, "guidance_scale")) |g| {
+        if (!(g >= 0.0 and g <= 20.0)) return sendError(conn, 400, "'guidance_scale' must be in [0,20]");
+        guidance = @floatCast(g);
+    }
+
+    // P2 texture stage (opt-in): requires the converted paint weights. The
+    // 400 here is explicit — never a silent untextured downgrade (the a2vid
+    // precedent: the user asked for THIS output).
+    const want_texture = sse.bodyWantsTrue(body, "texture");
+    if (want_texture and engine.paint_dir == null)
+        return sendError(conn, 400, "texture requested but the paint weights are not installed (run tests/convert_hunyuan3d_paint_weights.py, or set HY3D_PAINT_DIR)");
+    // P3 auto-rig stage (opt-in): UniRig skeleton + geodesic skin weights.
+    const want_rig = sse.bodyWantsTrue(body, "rig");
+    if (want_rig and engine.rig_dir == null)
+        return sendError(conn, 400, "rig requested but the UniRig weights are not installed (run tests/convert_unirig_weights.py, or set UNIRIG_DIR)");
+
+    const want_stream = sse.bodyWantsTrue(body, "stream");
+    log.info("[mesh] generating steps={d} res={d} guidance={d:.1} seed={d} texture={} stream={} from {d}x{d} image\n", .{ steps, res, guidance, seed, want_texture, want_stream, img.w, img.h });
+    var sctx = sse.StreamCtx{ .conn = conn };
+    const prog: ?sse.Progress = if (want_stream) sctx.progress() else null;
+    if (want_stream) try conn.writeAll(sse.headers);
+
+    const opts = hy3d.MeshOpts{ .steps = steps, .guidance = guidance, .seed = seed, .octree_resolution = res };
+    const glb_bytes = blk: {
+        if (want_rig) {
+            // Rig path (optionally textured): shape → skeleton → skin → GLB.
+            break :blk riggedGlb(allocator, engine, img.pix, img.w, img.h, opts, want_texture, body, prog);
+        }
+        if (!want_texture) {
+            break :blk engine.engine.generateGlb(allocator, img.pix, img.w, img.h, opts, prog);
+        }
+        // Texture path: shape → raw mesh → paint stage (loaded per request,
+        // freed after — the paint UNet+DINO+VAE ride ~4.6 GB beside the
+        // 3.5 GB shape engine only for the duration of this request).
+        break :blk paintedGlb(allocator, engine, img.pix, img.w, img.h, opts, body, prog);
+    } catch |err| {
+        if (err == error.Cancelled) {
+            // Client hung up mid-generation (progress write failed) — nothing
+            // to write, the socket is dead.
+            log.info("[mesh] generation cancelled — client disconnected\n", .{});
+            return;
+        }
+        log.err("[mesh] generation failed: {}\n", .{err});
+        if (want_stream) {
+            sse.sendError(conn, "generation failed");
+            return;
+        }
+        return sendError(conn, 500, "generation failed");
+    };
+    defer allocator.free(glb_bytes);
+    log.info("[mesh] -> {d} GLB bytes\n", .{glb_bytes.len});
+
+    const b64_len = std.base64.standard.Encoder.calcSize(glb_bytes.len);
+    const ob64 = try allocator.alloc(u8, b64_len);
+    defer allocator.free(ob64);
+    _ = std.base64.standard.Encoder.encode(ob64, glb_bytes);
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+    try out.appendSlice(allocator, if (want_stream) "data: {\"type\":\"complete\",\"format\":\"glb\",\"data\":\"" else "{\"created\":0,\"format\":\"glb\",\"data\":\"");
+    try out.appendSlice(allocator, ob64);
+    try out.appendSlice(allocator, if (want_stream) "\"}\n\n" else "\"}");
+    if (want_stream) {
+        try conn.writeAll(out.items);
+        return;
+    }
+    return sendBytesJson(conn, allocator, out.items);
+}
+
+/// Decode a PNG/JPEG image (raw file bytes) → owned straight-alpha RGBA8
+/// pixels + dims (stb forces 4 channels; 3-channel sources get opaque alpha).
+fn decodeImageRgba(allocator: std.mem.Allocator, encoded: []const u8) ?struct { pix: []u8, w: u32, h: u32 } {
+    var w: c_int = 0;
+    var h: c_int = 0;
+    var ch: c_int = 0;
+    const src_ptr = stb.stbi_load_from_memory(encoded.ptr, @intCast(encoded.len), &w, &h, &ch, 4) orelse return null;
+    defer stb.stbi_image_free(src_ptr);
+    if (w <= 0 or h <= 0) return null;
+    const n: usize = @as(usize, @intCast(w)) * @as(usize, @intCast(h)) * 4;
+    const out = allocator.alloc(u8, n) catch return null;
+    @memcpy(out, src_ptr[0..n]);
+    return .{ .pix = out, .w = @intCast(w), .h = @intCast(h) };
+}
+
 // ════════════════════════════════════════════════════════════════════════
 // Stub CPU state for a media model. The gen path bypasses the transformer, so
 // `config`/`tokenizer`/`chat_config` on the LoadedModel are minimal stubs that
@@ -1927,15 +2225,21 @@ fn jsonUnescape(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
 
 const testing = std.testing;
 
-test "modalityFromType classifies the media archs + markers (incl. krea)" {
+test "modalityFromType classifies the media archs + markers (incl. krea + hunyuan3d)" {
     try testing.expectEqual(Modality.image, modalityFromType("flux2-klein-4b").?);
     try testing.expectEqual(Modality.image, modalityFromType("flux2").?);
     try testing.expectEqual(Modality.image, modalityFromType("krea2_turbo").?);
     try testing.expectEqual(Modality.image, modalityFromType("krea").?);
     try testing.expectEqual(Modality.audio, modalityFromType("qwen3_tts").?);
     try testing.expectEqual(Modality.video, modalityFromType("AudioVideo").?);
+    try testing.expectEqual(Modality.mesh, modalityFromType("hunyuan3d_2_1").?);
+    try testing.expectEqual(Modality.mesh, modalityFromType("hunyuan3d").?);
     try testing.expectEqual(@as(?Modality, null), modalityFromType("gemma4"));
     try testing.expectEqual(@as(?Modality, null), modalityFromType("qwen3_5_moe"));
+}
+
+test "Modality.mesh advertises the 3d capability" {
+    try testing.expectEqualStrings("3d", Modality.mesh.capability());
 }
 
 test "bodyDisablesSafety detects per-request opt-out" {
@@ -1986,7 +2290,7 @@ test "ImageEngine FLUX generatePng produces a PNG (characterization)" {
 }
 
 test "Modality.modelType round-trips through modalityFromType" {
-    for ([_]Modality{ .image, .audio, .video }) |m| {
+    for ([_]Modality{ .image, .audio, .video, .mesh }) |m| {
         try testing.expectEqual(m, modalityFromType(m.modelType()).?);
     }
 }

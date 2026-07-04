@@ -1208,6 +1208,10 @@ fn handleConnection(
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
         const body = request[header_end + 4 .. total_read];
         try handleGen(allocator, stream, body, lm, .video);
+    } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/3d/generations")) {
+        const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
+        const body = request[header_end + 4 .. total_read];
+        try handleGen(allocator, stream, body, lm, .mesh);
     } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/api/chat")) {
         if (config.is_encoder_only) {
             try sendOllamaError(allocator, stream, "400 Bad Request", "encoder-only model does not support chat; use /api/embed");
@@ -2238,6 +2242,7 @@ fn genJobRun(ctx: *anyopaque) void {
         .image => if (job.lm.image_engine) |e| media_mod.handleImage(job.conn.io, job.allocator, job.conn, job.body, e) else error.WrongModality,
         .audio => if (job.lm.audio_engine) |e| media_mod.handleAudio(job.allocator, job.conn, job.body, e) else error.WrongModality,
         .video => if (job.lm.video_engine) |e| media_mod.handleVideo(job.conn.io, job.allocator, job.conn, job.body, e) else error.WrongModality,
+        .mesh => if (job.lm.mesh_engine) |e| media_mod.handleMesh(job.allocator, job.conn, job.body, e) else error.WrongModality,
     };
     result catch |err| {
         log.warn("[gen] {s} job failed: {s}\n", .{ @tagName(job.modality), @errorName(err) });
@@ -2257,9 +2262,10 @@ fn handleGen(allocator: std.mem.Allocator, stream: *Conn, body: []const u8, lm: 
         .image => lm.image_engine != null,
         .audio => lm.audio_engine != null,
         .video => lm.video_engine != null,
+        .mesh => lm.mesh_engine != null,
     };
     if (!ok) {
-        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Target model does not support this media modality. Load the matching image/audio/video model and target it by id.", 400);
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Target model does not support this media modality. Load the matching image/audio/video/3D model and target it by id.", 400);
         return;
     }
     var job = GenJob{ .allocator = allocator, .conn = stream, .body = body, .lm = lm, .modality = modality };

@@ -397,6 +397,47 @@ struct AudioModelPreset: Identifiable, Hashable {
     static let all: [AudioModelPreset] = [.qwen3TTS06B, .qwen3TTS17B]
 }
 
+// MARK: - 3D presets (image → mesh)
+
+/// A single-image-to-3D model served by mlx-serve's NATIVE Hunyuan3D engine
+/// (shape stage). The engine dispatches on `config.json`'s `model_type`, so only
+/// converted Hunyuan3D checkpoints load here.
+///
+/// LOCAL-ONLY for now: the preset `repo` starts with `local/`, so there's no HF
+/// download — the weights are converted on-device (see the repo README /
+/// `tests/convert_hunyuan3d_weights.py`) into `~/.mlx-serve/models/local/...`.
+/// The pane shows a "convert locally" hint instead of a Download button while
+/// they're absent. Flipping to a published HF repo later is a one-line `repo`
+/// change — everything downstream keys off the bundle, not the `local/` prefix.
+struct Model3DModelPreset: Identifiable, Hashable {
+    let id: String
+    let name: String
+    /// Model directory under `~/.mlx-serve/models`. A `local/` prefix marks a
+    /// convert-on-device model (no HF pull); any other prefix is a normal repo.
+    let repo: String
+    /// Peak unified-memory footprint, GB — drives the soft RAM gate.
+    let approxRAMGB: Int
+
+    static func == (lhs: Self, rhs: Self) -> Bool { lhs.id == rhs.id }
+    func hash(into hasher: inout Hasher) { hasher.combine(id) }
+
+    /// True when the model has no published HF repo yet and must be converted
+    /// locally — the pane shows a "convert locally" hint instead of a download
+    /// button while its weights are absent.
+    var isLocalOnly: Bool { repo.hasPrefix("local/") }
+
+    /// Hunyuan3D 2.1 shape model, 8-bit. The only supported 3D checkpoint today.
+    static let hunyuan3d21_8bit = Model3DModelPreset(
+        id: "hunyuan3d-2-1-8bit",
+        name: "Hunyuan3D 2.1 (8-bit)",
+        repo: "local/hunyuan3d-2-1-8bit",
+        approxRAMGB: 4
+    )
+
+    /// Catalog. One entry today; grows as more 3D checkpoints convert.
+    static let all: [Model3DModelPreset] = [.hunyuan3d21_8bit]
+}
+
 // MARK: - Requests
 
 struct ImageGenRequest {
@@ -514,6 +555,29 @@ struct AudioGenRequest {
     var temperature: Double = 0.7
     /// Keep the model resident after this generation (default off → unload).
     var keepResident: Bool = false
+}
+
+struct Model3DGenRequest {
+    var model: Model3DModelPreset
+    /// Path to the source photo (PNG/JPEG). The subject is cut out and
+    /// composited on white before encoding (the reference pipeline's rembg step).
+    var photoPath: String
+    /// Denoising steps for the shape flow.
+    var steps: Int = 30
+    /// Classifier-free guidance scale.
+    var guidanceScale: Double = 5.0
+    /// Marching-cubes octree resolution — higher = finer mesh, more memory/time.
+    var octreeResolution: Int = 384
+    /// Generation seed. -1 → a random seed is drawn per request.
+    var seed: Int = -1
+    /// Keep the model resident after this generation (default off → unload).
+    var keepResident: Bool = false
+    /// Run the P2 paint stage (full PBR texture) after shape generation.
+    /// Off by default until the paint port is validated end to end.
+    var texture: Bool = false
+    /// Run the P3 auto-rig stage (UniRig skeleton + geodesic skin weights) so
+    /// the exported GLB animates. Off by default.
+    var rig: Bool = false
 }
 
 // MARK: - RAM checks

@@ -7,6 +7,7 @@ enum MediaStorage {
     static let imagesRoot: String = make("images")
     static let videosRoot: String = make("videos")
     static let audiosRoot: String = make("audio")
+    static let models3dRoot: String = make("models3d")
 
     private static func make(_ name: String) -> String {
         let dir = NSString(string: "~/.mlx-serve/generations/\(name)").expandingTildeInPath

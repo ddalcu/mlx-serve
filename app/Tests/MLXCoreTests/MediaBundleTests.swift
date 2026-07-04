@@ -173,6 +173,61 @@ final class MediaBundleTests: XCTestCase {
         XCTAssertTrue(r.safeMode)
     }
 
+    // MARK: - 3D (Hunyuan3D) bundle + local-repo readiness
+
+    func testModel3DBundleIsSingleFlatComponentWithAllowlist() {
+        let b = Model3DModelPreset.hunyuan3d21_8bit.bundle
+        // One local component, no dependency, non-recursive (the dir is flat).
+        XCTAssertEqual(b.components.count, 1)
+        XCTAssertTrue(b.dependencyRepos.isEmpty)
+        XCTAssertEqual(b.primaryRepo, "local/hunyuan3d-2-1-8bit")
+        let comp = b.components[0]
+        XCTAssertFalse(comp.selection.recursive)
+        // Allowlist keeps ONLY the three engine safetensors (a future HF repo
+        // wouldn't drag in extras).
+        XCTAssertEqual(comp.selection.keepSafetensors?.count, 3)
+        for f in ["dit.safetensors", "conditioner.safetensors", "vae.safetensors"] {
+            XCTAssertTrue(comp.selection.keepSafetensors?.contains(f) ?? false, "missing allowlist \(f)")
+        }
+        // Ready markers: config + the three safetensors.
+        for marker in ["config.json", "dit.safetensors", "conditioner.safetensors", "vae.safetensors"] {
+            XCTAssertTrue(comp.readyMarkers.contains(marker), "missing readyMarker \(marker)")
+        }
+    }
+
+    func testLocalRepoReadinessChecksOnDiskPresence() throws {
+        // A `local/` (convert-on-device) repo has no download; readiness is
+        // purely "are the converted weights on disk under models/local/…".
+        let fm = FileManager.default
+        let root = NSTemporaryDirectory() + "hy3dtest-\(UUID().uuidString)"
+        let modelDir = (root as NSString).appendingPathComponent("local/hunyuan3d-2-1-8bit")
+        try fm.createDirectory(atPath: modelDir, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(atPath: root) }
+
+        let comp = Model3DModelPreset.hunyuan3d21_8bit.bundle.components[0]
+        // Nothing present → not ready.
+        XCTAssertFalse(DownloadManager.componentReady(comp, modelsRoot: root))
+        // config.json alone → the existingModelDir resolves, but a marker is
+        // missing (and no safetensors) → still not ready.
+        fm.createFile(atPath: (modelDir as NSString).appendingPathComponent("config.json"), contents: Data("{}".utf8))
+        XCTAssertFalse(DownloadManager.componentReady(comp, modelsRoot: root))
+        // Add the three safetensors markers → ready.
+        for f in ["dit.safetensors", "conditioner.safetensors", "vae.safetensors"] {
+            fm.createFile(atPath: (modelDir as NSString).appendingPathComponent(f), contents: Data([0, 1, 2]))
+        }
+        XCTAssertTrue(DownloadManager.componentReady(comp, modelsRoot: root))
+        // Removing one required weight breaks readiness again.
+        try fm.removeItem(atPath: (modelDir as NSString).appendingPathComponent("vae.safetensors"))
+        XCTAssertFalse(DownloadManager.componentReady(comp, modelsRoot: root))
+    }
+
+    func testHunyuanPresetIsLocalOnly() {
+        // The `local/` prefix drives the pane's "convert locally" hint (no
+        // download button). Flipping to a real HF repo later drops the flag.
+        XCTAssertTrue(Model3DModelPreset.hunyuan3d21_8bit.isLocalOnly)
+        XCTAssertTrue(Model3DModelPreset.all.contains(.hunyuan3d21_8bit))
+    }
+
     func testKreaPresetIsDistilledTurboDefaults() {
         let p = ImageModelPreset.krea2Turbo
         XCTAssertEqual(p.variant, .krea2Turbo)

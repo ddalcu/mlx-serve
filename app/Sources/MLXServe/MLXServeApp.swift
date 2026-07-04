@@ -85,6 +85,8 @@ struct MLXCoreApp: App {
             case "imageGen": title = "Image Generation"
             case "videoGen": title = "Video Generation"
             case "audioGen": title = "Audio Generation"
+            case "model3dGen": title = "3D Generation"
+            case "avatar": title = "Avatar"
             case "settings": title = "Settings"
             case "serverLog": title = "Server Log"
             case "tasks": title = "Tasks"
@@ -104,6 +106,8 @@ struct MLXCoreApp: App {
                 openImageGen: { openAndFocus("imageGen") },
                 openVideoGen: { openAndFocus("videoGen") },
                 openAudioGen: { openAndFocus("audioGen") },
+                openModel3DGen: { openAndFocus("model3dGen") },
+                openAvatar: { openAndFocus("avatar") },
                 openSettings: { openAndFocus("settings") },
                 openServerLog: { openAndFocus("serverLog") },
                 openTasks: { openAndFocus("tasks") },
@@ -189,6 +193,24 @@ struct MLXCoreApp: App {
                 .environmentObject(appState)
         }
         .defaultSize(width: 900, height: 660)
+
+        Window("3D Generation", id: "model3dGen") {
+            Model3DGenView()
+                .environmentObject(appState.model3dGen)
+                .environmentObject(appState.server)
+                .environmentObject(appState.downloads)
+                .environmentObject(appState)
+        }
+        .defaultSize(width: 960, height: 700)
+
+        Window("Avatar", id: "avatar") {
+            AvatarView()
+                .environmentObject(appState.avatarEngine)
+                .environmentObject(appState.server)
+                .environmentObject(appState.model3dGen)
+                .environmentObject(appState)
+        }
+        .defaultSize(width: 620, height: 760)
 
         Window("Settings", id: "settings") {
             SettingsView()

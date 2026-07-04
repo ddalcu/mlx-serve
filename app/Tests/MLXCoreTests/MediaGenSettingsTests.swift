@@ -143,4 +143,58 @@ final class MediaGenSettingsTests: XCTestCase {
         XCTAssertEqual(decoded.mode, VideoGenSettings().mode)
         XCTAssertEqual(decoded.numFrames, VideoGenSettings().numFrames)
     }
+
+    // MARK: - 3D settings (Hunyuan3D pane)
+
+    func testModel3DSettingsRoundTrips() throws {
+        var s = Model3DGenSettings()
+        s.steps = 45
+        s.guidance = 6.5
+        s.resolution = 128
+        s.keepResident = true
+        s.turntable = false
+        let decoded = try JSONDecoder().decode(Model3DGenSettings.self, from: try JSONEncoder().encode(s))
+        XCTAssertEqual(decoded, s)
+    }
+
+    func testModel3DLegacy380ResolutionMigratesTo384() throws {
+        // Pre-FlashVDM builds persisted a "380 (fine)" picker option; the pane
+        // now offers the reference-default 384 — decode migrates 380 so the
+        // segmented picker never comes up with no selected option.
+        var s = Model3DGenSettings()
+        s.resolution = 380
+        let decoded = try JSONDecoder().decode(Model3DGenSettings.self, from: try JSONEncoder().encode(s))
+        XCTAssertEqual(decoded.resolution, 384)
+    }
+
+    func testModel3DResolvesModelByIdAndFallsBack() {
+        var s = Model3DGenSettings()
+        s.modelId = Model3DModelPreset.hunyuan3d21_8bit.id
+        XCTAssertEqual(s.resolvedModel.id, Model3DModelPreset.hunyuan3d21_8bit.id)
+        s.modelId = "nope/nope"
+        XCTAssertEqual(s.resolvedModel.id, Model3DModelPreset.hunyuan3d21_8bit.id)
+    }
+
+    func testModel3DDefaultsMatchThePreset() {
+        // The pane's defaults must line up with the request contract: 30 steps,
+        // guidance 5.0, octree 384 (reference default — affordable since the
+        // FlashVDM hierarchical volume decode), turntable on, keep-loaded off.
+        let s = Model3DGenSettings()
+        XCTAssertEqual(s.steps, 30)
+        XCTAssertEqual(s.guidance, 5.0)
+        XCTAssertEqual(s.resolution, 384)
+        XCTAssertTrue(s.turntable)
+        XCTAssertFalse(s.keepResident)
+    }
+
+    func testModel3DMigrationSafeDecodeDropsKey() throws {
+        var obj = try JSONSerialization.jsonObject(
+            with: try JSONEncoder().encode(Model3DGenSettings())) as! [String: Any]
+        obj.removeValue(forKey: "resolution")
+        obj.removeValue(forKey: "turntable")
+        let decoded = try JSONDecoder().decode(
+            Model3DGenSettings.self, from: try JSONSerialization.data(withJSONObject: obj))
+        XCTAssertEqual(decoded.resolution, Model3DGenSettings().resolution)
+        XCTAssertEqual(decoded.turntable, Model3DGenSettings().turntable)
+    }
 }

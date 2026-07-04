@@ -43,7 +43,7 @@ const supported_model_types = [_][]const u8{
     "deepseek_v4",
 };
 
-/// Native media-generation archs (image / audio / video), served by the
+/// Native media-generation archs (image / audio / video / 3D), served by the
 /// unified engines in `gen.zig`. Recognized here so `--model-dir` discovery
 /// and `/v1/load-model` by-path accept them; the modality engine (not the MLX
 /// transformer) handles the load. Kept as inline string checks so this module
@@ -52,7 +52,8 @@ fn isMediaModelType(model_type: []const u8) bool {
     return std.mem.startsWith(u8, model_type, "flux2") or
         std.mem.startsWith(u8, model_type, "krea") or
         std.mem.eql(u8, model_type, "qwen3_tts") or
-        std.mem.eql(u8, model_type, "AudioVideo");
+        std.mem.eql(u8, model_type, "AudioVideo") or
+        std.mem.startsWith(u8, model_type, "hunyuan3d");
 }
 
 fn isSupportedModelType(model_type: []const u8) bool {
@@ -598,6 +599,8 @@ test "isSupportedModelType accepts native media archs (image/audio/video)" {
     try testing.expect(isMediaModelType("flux2-klein-9b"));
     try testing.expect(isMediaModelType("krea2_turbo"));
     try testing.expect(isSupportedModelType("krea2_turbo"));
+    try testing.expect(isMediaModelType("hunyuan3d_2_1"));
+    try testing.expect(isSupportedModelType("hunyuan3d_2_1"));
     try testing.expect(!isMediaModelType("gemma4"));
 }
 

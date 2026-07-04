@@ -620,3 +620,20 @@ before tool parsing on the streaming paths (this is how the `<|"|>` malformation
 caught). Verified end-to-end: 3/3 pi runs of the exact failing task ("make a new html
 design for @mlx_info.html called mlx_pi1.html") on the 12B create exactly `mlx_pi1.html`,
 no tag leaks, proper final summaries.
+
+## 2026-07-04 — FlashVDM-class hierarchical volume decode (P1.x-1)
+
+Coarse-to-fine SDF sampling (`decodeVolumeHierarchical`, coarse stride 4, sign-change
+cells dilated by one, far field trilinear) replaces the dense (R+1)³ sweep in the
+Hunyuan3D shape engine. A/B on the dev Mac (16 GB, 8-bit build, same binary — res 383
+falls back to the dense path, res 384 takes the hierarchical path; steps 8, seed 7):
+
+| res | volume-stage queries | volume-stage time | whole request |
+|---|---|---|---|
+| 384 hierarchical | 9,215,125 (6.2× fewer) | **157.4 s** | 248 s |
+| 383 dense        | 56,623,104             | **951.7 s** | 1048 s |
+
+→ 6.0× on the volume stage, 4.2× end-to-end at the reference-default resolution.
+Mesh is byte-identical (hermetic guards: hierarchical == dense on analytic SDFs;
+live: 72,128 verts at res 128, exactly the P1 dense-run count; oracle 5 unchanged
+at cos 0.999896). Default pane resolution raised 256 → 384 on the back of this.

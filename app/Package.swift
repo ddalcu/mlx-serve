@@ -36,7 +36,11 @@ let package = Package(
                 // VoicePreprocessor round-trip test.
                 .product(name: "SwiftOGG", package: "swift-ogg"),
             ],
-            path: "Tests/MLXCoreTests"
+            path: "Tests/MLXCoreTests",
+            // The GLB test fixture is loaded by source-relative path (#filePath),
+            // not as a bundled resource — exclude it so SwiftPM doesn't flag it
+            // as an unhandled resource.
+            exclude: ["Fixtures"]
         ),
     ]
 )

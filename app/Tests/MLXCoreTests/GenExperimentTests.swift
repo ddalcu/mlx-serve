@@ -9,7 +9,7 @@ import XCTest
 // =============================================================================
 
 private enum GenExperimentReplica: String, CaseIterable, Identifiable {
-    case image, video, audio
+    case image, video, audio, model3d, avatar
 
     var id: String { rawValue }
 
@@ -18,6 +18,8 @@ private enum GenExperimentReplica: String, CaseIterable, Identifiable {
         case .image: "photo.on.rectangle.angled"
         case .video: "film.stack"
         case .audio: "waveform"
+        case .model3d: "cube.transparent"
+        case .avatar: "person.crop.circle.badge.moon"
         }
     }
 
@@ -26,6 +28,8 @@ private enum GenExperimentReplica: String, CaseIterable, Identifiable {
         case .image: "ImageGen"
         case .video: "VideoGen"
         case .audio: "AudioGen"
+        case .model3d: "3D"
+        case .avatar: "Avatar"
         }
     }
 
@@ -34,18 +38,20 @@ private enum GenExperimentReplica: String, CaseIterable, Identifiable {
         case .image: "Image Generation (FLUX.2 / Krea-2)"
         case .video: "Video Generation (LTX-Video 2.3)"
         case .audio: "Audio Generation — neural TTS & voice cloning"
+        case .model3d: "3D Generation — photo to mesh (Hunyuan3D 2.1)"
+        case .avatar: "Avatar — a 3D persona that talks back in a cloned voice"
         }
     }
 }
 
 final class GenExperimentTests: XCTestCase {
 
-    /// The section must contain exactly the three media tools, in display
-    /// order. Adding a fourth gen feature without surfacing it here is the
-    /// regression this pins.
-    func testSectionHasExactlyTheThreeMediaToolsInOrder() {
+    /// The section must contain exactly the media tools, in display order.
+    /// Adding a gen feature without surfacing it here is the regression this
+    /// pins (3D is the fourth).
+    func testSectionHasExactlyTheMediaToolsInOrder() {
         XCTAssertEqual(GenExperimentReplica.allCases.map(\.title),
-                       ["ImageGen", "VideoGen", "AudioGen"])
+                       ["ImageGen", "VideoGen", "AudioGen", "3D", "Avatar"])
     }
 
     /// Every tile has a non-empty tooltip naming its modality.

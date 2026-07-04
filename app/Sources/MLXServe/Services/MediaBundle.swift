@@ -154,6 +154,33 @@ extension MediaBundle {
         )
     }
 
+    /// Hunyuan3D (shape stage): a flat model dir — `config.json` + the three
+    /// engine safetensors (`dit`, `conditioner`, `vae`). Non-recursive with a
+    /// safetensors allowlist so a future published HF repo pulls ONLY those
+    /// three. Ready when all four markers are present. For a `local/`
+    /// (convert-on-device) repo there's no download — readiness still checks
+    /// local presence under `~/.mlx-serve/models/local/...`, so flipping to a
+    /// real HF repo later needs no change here.
+    static func model3d(repo: String, displayName: String, sizeGB: Double) -> MediaBundle {
+        MediaBundle(
+            id: "model3d:\(repo)",
+            displayName: displayName,
+            components: [
+                MediaComponent(
+                    repo: repo,
+                    selection: FileSelection(keepSafetensors: [
+                        "dit.safetensors", "conditioner.safetensors", "vae.safetensors",
+                    ]),
+                    readyMarkers: [
+                        "config.json", "dit.safetensors",
+                        "conditioner.safetensors", "vae.safetensors",
+                    ]
+                ),
+            ],
+            sizeEstimateGB: sizeGB
+        )
+    }
+
     /// The Gemma-3-12B text encoder LTX needs — also a standalone chat model.
     /// Standard MLX layout (config + tokenizer + sharded safetensors).
     static let ltxGemmaRepo = "mlx-community/gemma-3-12b-it-4bit"
@@ -186,5 +213,11 @@ extension AudioModelPreset {
 extension VideoModelPreset {
     var bundle: MediaBundle {
         .ltx(repo: repo, displayName: name)
+    }
+}
+
+extension Model3DModelPreset {
+    var bundle: MediaBundle {
+        .model3d(repo: repo, displayName: name, sizeGB: Double(approxRAMGB))
     }
 }
