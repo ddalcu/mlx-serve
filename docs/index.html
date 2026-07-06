@@ -37,12 +37,14 @@
     "downloadUrl": "https://github.com/ddalcu/mlx-serve/releases/latest",
     "codeRepository": "https://github.com/ddalcu/mlx-serve",
     "license": "https://opensource.org/licenses/MIT",
-    "softwareVersion": "v26.7.1",
+    "softwareVersion": "v26.7.2",
     "author": { "@type": "Person", "name": "David Dalcu" },
     "description": "Native Zig inference server for Apple Silicon that runs any LLM — MLX and GGUF — with OpenAI- and Anthropic-compatible APIs. Faster than LM Studio. No Python. MIT licensed.",
     "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
     "featureList": [
       "Runs any MLX or GGUF model on Apple Silicon",
+      "Text-to-music generation (ACE-Step) on-device",
+      "Photo to textured 3D model (Hunyuan3D-2.1) on-device",
       "OpenAI-compatible chat completions API",
       "Anthropic Messages API (works with Claude Code)",
       "OpenAI Responses API + WebSocket transport",
@@ -1146,14 +1148,14 @@
     <a href="#" class="nav-logo">
       <img src="appiconb.png" alt="MLX Core" class="nav-logo-img">
       <span>mlx-serve</span>
-      <span class="nav-ver">v26.7.1</span>
+      <span class="nav-ver">v26.7.2</span>
     </a>
     <ul class="nav-links">
       <li><a href="#explore" class="hide-mobile">Deep dives</a></li>
       <li><a href="#performance" class="hide-mobile">Performance</a></li>
-      <li><a href="#deepseek" class="hide-mobile">DeepSeek V4</a></li>
       <li><a href="#features" class="hide-mobile">Features</a></li>
-      <li><a href="#models" class="hide-mobile">Models</a></li>
+      <li><a href="api/" class="hide-mobile">API</a></li>
+      <li><a href="cli/" class="hide-mobile">CLI</a></li>
       <li><a href="#faq" class="hide-mobile">FAQ</a></li>
       <li>
         <a href="https://github.com/ddalcu/mlx-serve" class="nav-github" target="_blank" rel="noopener" aria-label="GitHub">
@@ -1167,12 +1169,12 @@
   <section class="hero">
     <div class="hero-glow"><span class="g1"></span><span class="g2"></span><span class="g3"></span></div>
     <a href="https://github.com/ddalcu/mlx-serve/releases/latest" class="hero-badge">
-      <span class="new-pill">v26.7.1</span>
-      Edit photos with words · talking-character video · ⌃Space launcher · your Ollama apps just work
+      <span class="new-pill">v26.7.2</span>
+      Type a vibe, get a song · photo → 3D model · your voice everywhere · the app updates itself
       <span class="arrow">→</span>
     </a>
     <h1>Run any LLM<br>on your <span class="grad">Mac</span></h1>
-    <p class="hero-sub">Your own private AI — chat, coding agents, images, video, and voice — <strong>running entirely on your&nbsp;Mac</strong>. Free and open source, faster than LM Studio, and your data never leaves the machine.</p>
+    <p class="hero-sub">Your own private AI — chat, coding agents, images, video, music, 3D models, and voice — <strong>running entirely on your&nbsp;Mac</strong>. Free and open source, faster than LM Studio, and your data never leaves the machine.</p>
     <div class="hero-ctas">
       <a href="https://github.com/ddalcu/mlx-serve/releases/latest/download/MLXCore.dmg" class="btn btn-primary">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
@@ -1207,6 +1209,18 @@
         <span class="explore-kicker">Animate</span>
         <h3>Turn photos into video</h3>
         <p>Clips with synced sound — even talking characters.</p>
+        <span class="go">Deep dive →</span>
+      </a>
+      <a class="explore-card" href="music-generation/" style="--ec:#bf5af2;">
+        <span class="explore-kicker">Compose</span>
+        <h3>Type a vibe, get a song</h3>
+        <p>Original 48 kHz stereo music — lyrics optional.</p>
+        <span class="go">Deep dive →</span>
+      </a>
+      <a class="explore-card" href="3d-generation/" style="--ec:#0a84ff;">
+        <span class="explore-kicker">Sculpt</span>
+        <h3>Turn photos into 3D models</h3>
+        <p>One picture in, a textured GLB mesh out.</p>
         <span class="go">Deep dive →</span>
       </a>
       <a class="explore-card" href="voice-cloning/" style="--ec:#7048e8;">
@@ -1270,8 +1284,8 @@
   <!-- MARQUEE -->
   <div class="marquee" aria-hidden="true">
     <div class="marquee-track">
-      <span class="marquee-item">Any Open Model</span><span class="marquee-item">Ollama Compatible</span><span class="marquee-item">Photo Editing</span><span class="marquee-item">Image-to-Video</span><span class="marquee-item">Talking Characters</span><span class="marquee-item">Style LoRAs</span><span class="marquee-item">Agent Sandbox</span><span class="marquee-item">⌃Space Launcher</span><span class="marquee-item">Krea-2 Image Gen</span><span class="marquee-item">Voice Cloning</span><span class="marquee-item">DiffusionGemma</span><span class="marquee-item">DeepSeek V4 Flash</span><span class="marquee-item">Gemma 4</span><span class="marquee-item">Qwen 3.6</span><span class="marquee-item">Llama 3</span><span class="marquee-item">Private by Design</span><span class="marquee-item">Document RAG</span><span class="marquee-item">OpenAI API</span><span class="marquee-item">Anthropic API</span><span class="marquee-item">Claude Code</span><span class="marquee-item">MCP</span>
-      <span class="marquee-item">Any Open Model</span><span class="marquee-item">Ollama Compatible</span><span class="marquee-item">Photo Editing</span><span class="marquee-item">Image-to-Video</span><span class="marquee-item">Talking Characters</span><span class="marquee-item">Style LoRAs</span><span class="marquee-item">Agent Sandbox</span><span class="marquee-item">⌃Space Launcher</span><span class="marquee-item">Krea-2 Image Gen</span><span class="marquee-item">Voice Cloning</span><span class="marquee-item">DiffusionGemma</span><span class="marquee-item">DeepSeek V4 Flash</span><span class="marquee-item">Gemma 4</span><span class="marquee-item">Qwen 3.6</span><span class="marquee-item">Llama 3</span><span class="marquee-item">Private by Design</span><span class="marquee-item">Document RAG</span><span class="marquee-item">OpenAI API</span><span class="marquee-item">Anthropic API</span><span class="marquee-item">Claude Code</span><span class="marquee-item">MCP</span>
+      <span class="marquee-item">Any Open Model</span><span class="marquee-item">Text-to-Music</span><span class="marquee-item">Photo → 3D</span><span class="marquee-item">Ollama Compatible</span><span class="marquee-item">Photo Editing</span><span class="marquee-item">Image-to-Video</span><span class="marquee-item">Talking Characters</span><span class="marquee-item">Style LoRAs</span><span class="marquee-item">Agent Sandbox</span><span class="marquee-item">⌃Space Launcher</span><span class="marquee-item">Krea-2 Image Gen</span><span class="marquee-item">Voice Cloning</span><span class="marquee-item">DiffusionGemma</span><span class="marquee-item">DeepSeek V4 Flash</span><span class="marquee-item">Gemma 4</span><span class="marquee-item">Qwen 3.6</span><span class="marquee-item">Llama 3</span><span class="marquee-item">Private by Design</span><span class="marquee-item">Document RAG</span><span class="marquee-item">OpenAI API</span><span class="marquee-item">Anthropic API</span><span class="marquee-item">Claude Code</span><span class="marquee-item">MCP</span>
+      <span class="marquee-item">Any Open Model</span><span class="marquee-item">Text-to-Music</span><span class="marquee-item">Photo → 3D</span><span class="marquee-item">Ollama Compatible</span><span class="marquee-item">Photo Editing</span><span class="marquee-item">Image-to-Video</span><span class="marquee-item">Talking Characters</span><span class="marquee-item">Style LoRAs</span><span class="marquee-item">Agent Sandbox</span><span class="marquee-item">⌃Space Launcher</span><span class="marquee-item">Krea-2 Image Gen</span><span class="marquee-item">Voice Cloning</span><span class="marquee-item">DiffusionGemma</span><span class="marquee-item">DeepSeek V4 Flash</span><span class="marquee-item">Gemma 4</span><span class="marquee-item">Qwen 3.6</span><span class="marquee-item">Llama 3</span><span class="marquee-item">Private by Design</span><span class="marquee-item">Document RAG</span><span class="marquee-item">OpenAI API</span><span class="marquee-item">Anthropic API</span><span class="marquee-item">Claude Code</span><span class="marquee-item">MCP</span>
     </div>
   </div>
 
@@ -1512,6 +1526,30 @@
         <a class="card-more" href="video-generation/">Video generation, in depth →</a>
       </div>
       <div class="feature-card reveal">
+        <div class="feature-icon" style="background: linear-gradient(135deg, #bf5af2, #ff375f);">
+          <svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>
+        </div>
+        <h3>Type a vibe, get a song</h3>
+        <p><b>New:</b> describe a track — <i>"upbeat synthwave with driving bass"</i> — optionally paste lyrics, and ACE-Step 1.5 Turbo composes original 48 kHz stereo music in 8 diffusion steps, entirely on-device. 10 seconds to 10 minutes; BPM, key, and time signature steerable; instrumental or vocal. Every track saves its exact prompt and settings beside it, so any take is reproducible.</p>
+        <a class="card-more" href="music-generation/">Music generation, in depth →</a>
+      </div>
+      <div class="feature-card reveal">
+        <div class="feature-icon" style="background: linear-gradient(135deg, #0a84ff, #30d158);">
+          <svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><polyline points="3.27 6.96 12 12.01 20.73 6.96"/><line x1="12" y1="22.08" x2="12" y2="12"/></svg>
+        </div>
+        <h3>Photo → 3D model</h3>
+        <p><b>New:</b> drop in a photo and Hunyuan3D-2.1 — ported natively to Apple Silicon — builds a 3D mesh: the subject is cut out automatically, the shape is generated on-device, and an optional full-PBR paint stage textures it from the same photo. The finished GLB spins in a built-in viewer and opens anywhere glTF does.</p>
+        <a class="card-more" href="3d-generation/">Photo → 3D, in depth →</a>
+      </div>
+      <div class="feature-card reveal">
+        <div class="feature-icon" style="background: linear-gradient(135deg, #0071e3, #5e5ce6);">
+          <svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 12a9 9 0 1 1-9-9"/><polyline points="21 3 21 9 15 9"/></svg>
+        </div>
+        <h3>The app updates itself</h3>
+        <p>MLX Core checks the releases page once a day and shows a banner when a new version ships — one click downloads the notarized build, swaps it in place, and relaunches. Models, chats, and settings untouched. And the welcome screen now installs the <code>mlx-serve</code> command onto your PATH with one click.</p>
+        <a class="card-more" href="cli/">The CLI, documented →</a>
+      </div>
+      <div class="feature-card reveal">
         <div class="feature-icon" style="background: linear-gradient(135deg, #30d158, #0a84ff);">
           <svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/><path d="m9 16 2 2 4-4"/></svg>
         </div>
@@ -1574,7 +1612,7 @@
           </button>
         </div>
         <div class="code-body">
-<pre><span class="cmd">curl</span> <span class="url">http://localhost:8080/v1/chat/completions</span> \
+<pre><span class="cmd">curl</span> <span class="url">http://localhost:11234/v1/chat/completions</span> \
   <span class="flag">-H</span> <span class="string">"Content-Type: application/json"</span> \
   <span class="flag">-d</span> <span class="string">'{
     "messages": [{"role": "user", "content": "Hello!"}],
@@ -1582,7 +1620,7 @@
   }'</span>
 
 <span class="comment"># Point Claude Code at your Mac</span>
-<span class="cmd">export</span> ANTHROPIC_BASE_URL=<span class="url">http://localhost:8080</span></pre>
+<span class="cmd">export</span> ANTHROPIC_BASE_URL=<span class="url">http://localhost:11234</span></pre>
         </div>
       </div>
 
@@ -1767,18 +1805,22 @@
       <li><a href="https://github.com/ddalcu/mlx-serve/stargazers" target="_blank" rel="noopener">★ Star</a></li>
     </ul>
     <ul class="footer-dives">
+      <li><a href="api/">API documentation</a></li>
+      <li><a href="cli/">CLI reference</a></li>
       <li><a href="claude-code-local/">Claude Code, local</a></li>
       <li><a href="lm-studio-alternative/">LM Studio alternative</a></li>
       <li><a href="ollama-alternative/">Ollama alternative</a></li>
       <li><a href="image-generation/">Image generation</a></li>
       <li><a href="video-generation/">Video generation</a></li>
+      <li><a href="music-generation/">Music generation</a></li>
+      <li><a href="3d-generation/">3D generation</a></li>
       <li><a href="voice-cloning/">Voice cloning</a></li>
       <li><a href="tool-calling/">Tool calling</a></li>
       <li><a href="agent-sandbox/">Agent Sandbox</a></li>
       <li><a href="speculative-decoding/">Speculative decoding</a></li>
       <li><a href="local-ai-assistant/">Always-on assistant</a></li>
     </ul>
-    <p class="footer-copy">MIT License · mlx-serve <span style="opacity:0.7;">v26.7.1</span> · built for Apple Silicon</p>
+    <p class="footer-copy">MIT License · mlx-serve <span style="opacity:0.7;">v26.7.2</span> · built for Apple Silicon</p>
   </footer>
 
   <script>

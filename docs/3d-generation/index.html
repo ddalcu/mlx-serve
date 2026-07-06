@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Photo to 3D Model on Mac — Local Image-to-3D with PBR Textures · mlx-serve</title>
+  <meta name="description" content="Turn a single photo into a textured 3D model on your Apple Silicon Mac. Hunyuan3D-2.1 runs natively on MLX — shape generation, marching cubes, and a full PBR texture stage, all on-device. Standard GLB output that opens in Blender, Unity, and any glTF viewer.">
+  <meta name="keywords" content="photo to 3D model Mac, image to 3D local, Hunyuan3D Mac, AI 3D model generator offline, 3D mesh from photo, GLB generator Apple Silicon, on-device 3D generation, PBR texture generation">
+  <meta name="author" content="David Dalcu">
+  <link rel="canonical" href="https://ddalcu.github.io/mlx-serve/3d-generation/">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://ddalcu.github.io/mlx-serve/3d-generation/">
+  <meta property="og:title" content="One photo in. A textured 3D model out. All on your Mac.">
+  <meta property="og:description" content="Hunyuan3D-2.1 ported natively to Apple Silicon: shape generation, PBR texturing, and a built-in 3D viewer — no cloud, no upload, standard glTF output.">
+  <meta property="og:image" content="https://ddalcu.github.io/mlx-serve/screenshots/3d-generation.png">
+  <meta property="og:site_name" content="mlx-serve">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="One photo in. A textured 3D model out. All on your Mac.">
+  <meta name="twitter:description" content="Local image-to-3D with full PBR texturing — standard GLB output, no cloud.">
+  <meta name="twitter:image" content="https://ddalcu.github.io/mlx-serve/screenshots/3d-generation.png">
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "BreadcrumbList",
+    "itemListElement": [
+      { "@type": "ListItem", "position": 1, "name": "mlx-serve", "item": "https://ddalcu.github.io/mlx-serve/" },
+      { "@type": "ListItem", "position": 2, "name": "3D generation", "item": "https://ddalcu.github.io/mlx-serve/3d-generation/" }
+    ]
+  }
+  </script>
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "FAQPage",
+    "mainEntity": [
+      {
+        "@type": "Question",
+        "name": "Can I turn a photo into a 3D model locally on a Mac?",
+        "acceptedAnswer": { "@type": "Answer", "text": "Yes. mlx-serve runs Hunyuan3D-2.1 natively on Apple Silicon: drop in one photo and it generates a 3D mesh on-device — the subject is cut out automatically, the diffusion shape model builds the geometry, and an optional paint stage textures it from the same photo. The result is a standard GLB file." }
+      },
+      {
+        "@type": "Question",
+        "name": "Does it generate textures too?",
+        "acceptedAnswer": { "@type": "Answer", "text": "Yes — turn on Texture (PBR) and a multiview paint stage generates albedo and metallic-roughness maps across six views and bakes them into a 2K texture atlas. The output is a standard glTF PBR model that renders correctly in any viewer, validated against the PyTorch reference at cosine 1.000 on the full denoiser step." }
+      },
+      {
+        "@type": "Question",
+        "name": "What format is the output and where can I use it?",
+        "acceptedAnswer": { "@type": "Answer", "text": "A standard GLB (binary glTF) — it opens in Blender, Unity, Unreal, three.js, and any glTF viewer. The app also shows it spinning in a built-in 3D viewer, and every past generation stays one click away in a history shelf." }
+      },
+      {
+        "@type": "Question",
+        "name": "What photos work best for image-to-3D?",
+        "acceptedAnswer": { "@type": "Answer", "text": "A clear single subject works best — the app cuts it out from the background automatically. Product shots, characters, toys, and objects photographed from a three-quarter angle give the model the most shape information to work with." }
+      }
+    ]
+  }
+  </script>
+  <link rel="icon" href="../appiconb.png">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="../assets/feature.css">
+  <style>:root { --accent: #0a84ff; --accent2: #30d158; }</style>
+</head>
+<body>
+
+  <nav>
+    <a href="../" class="nav-logo">
+      <img src="../appiconb.png" alt="MLX Core" class="nav-logo-img">
+      <span>mlx-serve</span>
+    </a>
+    <ul class="nav-links">
+      <li><a href="../" class="hide-mobile">Overview</a></li>
+      <li><a href="../image-generation/" class="hide-mobile">Image</a></li>
+      <li><a href="#faq" class="hide-mobile">FAQ</a></li>
+      <li><a href="https://github.com/ddalcu/mlx-serve" class="nav-github" target="_blank" rel="noopener" aria-label="GitHub"><svg viewBox="0 0 16 16"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg></a></li>
+      <li><a href="https://github.com/ddalcu/mlx-serve/releases/latest/download/MLXCore.dmg" class="nav-dl">Download</a></li>
+    </ul>
+  </nav>
+
+  <section class="hero-f">
+    <div class="hero-f-glow"><span class="g1"></span><span class="g2"></span></div>
+    <div class="crumbs"><a href="../">mlx-serve</a><span class="sep">/</span><span class="here">Deep dive · 3D generation</span></div>
+    <h1>One photo in.<br><span class="grad">A 3D model out.</span></h1>
+    <p class="hero-f-sub">Drop in a picture and Hunyuan3D-2.1 — ported natively to Apple Silicon — builds the mesh <b>on your Mac</b>: subject cut out automatically, geometry generated, and an optional paint stage that textures the model <b>from the same photo</b>. Standard GLB out; opens anywhere glTF does.</p>
+    <div class="hero-ctas">
+      <a href="https://github.com/ddalcu/mlx-serve/releases/latest/download/MLXCore.dmg" class="btn btn-primary">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+        Download MLX Core
+      </a>
+      <a href="#how" class="btn btn-secondary">How it works</a>
+    </div>
+    <div class="hero-f-meta">
+      <span><b>Full PBR texturing</b> optional</span>
+      <span><b>Standard GLB</b> — Blender, Unity, three.js</span>
+      <span><b>One-click</b> model download</span>
+    </div>
+  </section>
+
+  <section class="section" id="how">
+    <div class="split">
+      <div class="split-copy reveal">
+        <span class="split-kicker">How it works</span>
+        <h3>Drop a photo. Watch it take shape.</h3>
+        <p>Open the 3D pane, drop in a picture, generate. The subject is <b>cut out from the background automatically</b>, a 3.3-billion-parameter diffusion shape model builds the geometry, and the finished model spins in a <b>built-in 3D viewer</b> with a gentle turntable idle. Every past generation stays one click away in a thumbnail history shelf.</p>
+        <p>Turn on <b>Texture (PBR)</b> and the same photo paints the mesh: a multiview diffusion stage generates albedo and metallic-roughness maps across six views and bakes them into a 2K texture atlas — a standard glTF PBR material that renders correctly in any engine.</p>
+      </div>
+      <div class="split-visual reveal">
+        <figure class="shot">
+          <div class="shot-frame"><img src="../screenshots/3d-generation.png" alt="MLX Core 3D pane — a photo turned into a textured 3D model spinning in the built-in viewer, with a generation history shelf" loading="lazy"></div>
+          <figcaption>The 3D pane: photo in, textured model spinning in the built-in viewer.</figcaption>
+        </figure>
+      </div>
+    </div>
+
+    <div class="split flip">
+      <div class="split-copy reveal">
+        <span class="split-kicker">Under the hood</span>
+        <h3>The whole pipeline, ported — not proxied</h3>
+        <p>Everything runs inside the same no-Python binary: the diffusion shape transformer, SDF decoding, marching-cubes surface extraction, UV unwrapping, the 2-billion-parameter multiview paint UNet, texture baking and inpainting, and a glTF writer. The texture stage is validated against the PyTorch reference at <b>cosine 1.000</b> on the full denoiser step.</p>
+        <p>Surface extraction samples coarse-to-fine — <b>6× faster</b> than a dense sweep at the highest resolution, with byte-identical geometry — which is why the default mesh detail is the reference's "fine" setting. One click downloads the whole stack (shape + texture in a single package), and it runs on a 16 GB Mac.</p>
+      </div>
+      <div class="split-visual reveal">
+        <ul class="ticks">
+          <li><svg viewBox="0 0 24 24" fill="none"><polyline points="20 6 9 17 4 12"/></svg><span><b>No upload</b> — your photos and models never leave the machine.</span></li>
+          <li><svg viewBox="0 0 24 24" fill="none"><polyline points="20 6 9 17 4 12"/></svg><span><b>Standard output</b> — GLB with PBR materials, no proprietary format.</span></li>
+          <li><svg viewBox="0 0 24 24" fill="none"><polyline points="20 6 9 17 4 12"/></svg><span><b>Reference-faithful</b> — per-component numerical oracles against the original.</span></li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <section class="section section-alt">
+    <div class="section-header reveal">
+      <div class="section-label">Beyond the pane</div>
+      <h2 class="section-title">From snapshot to asset pipeline</h2>
+    </div>
+    <div class="mini-grid">
+      <div class="mini-card reveal">
+        <span class="mini-k">API</span>
+        <h4>One endpoint for developers</h4>
+        <p><code>POST /v1/3d/generations</code> with a base64 photo — add <code>"texture": true</code> for the PBR paint stage — returns a base64 GLB. SSE progress in stream mode. <a class="prose-link" href="../api/">Full API docs</a>.</p>
+      </div>
+      <div class="mini-card reveal">
+        <span class="mini-k">Create</span>
+        <h4>Generate the photo first</h4>
+        <p>No photo? <a class="prose-link" href="../image-generation/">Generate one</a> — prompt an object into existence with Krea-2 or FLUX.2, then lift it into 3D. The whole chain runs on one machine.</p>
+      </div>
+      <div class="mini-card reveal">
+        <span class="mini-k">Detail</span>
+        <h4>Dial the resolution</h4>
+        <p>Mesh detail is adjustable (octree resolution 64–512) — draft fast at low res, then re-run fine for the keeper. A seed makes any result repeatable.</p>
+      </div>
+      <div class="mini-card reveal">
+        <span class="mini-k">Viewer</span>
+        <h4>See it before you export</h4>
+        <p>The built-in viewer spins the model with a turntable idle; the history shelf keeps clickable thumbnails of every generation, and the GLB is one click from Finder.</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="faq">
+    <div class="section-header reveal">
+      <div class="section-label">FAQ</div>
+      <h2 class="section-title">Local image-to-3D, answered</h2>
+    </div>
+    <div class="faq-wrap reveal">
+      <details class="faq-item">
+        <summary>What photos work best?</summary>
+        <p>A clear single subject — product shots, characters, toys, objects. A three-quarter angle gives the model the most shape information. The background is removed automatically, so you don't need a clean cutout (though transparency helps).</p>
+      </details>
+      <details class="faq-item">
+        <summary>Where can I use the output?</summary>
+        <p>It's a standard GLB (binary glTF) with PBR materials — it opens in Blender, Unity, Unreal, three.js, and any glTF viewer, no conversion needed.</p>
+      </details>
+      <details class="faq-item">
+        <summary>What hardware do I need?</summary>
+        <p>An Apple Silicon Mac with 16 GB of memory runs the full pipeline, texturing included. The model stack downloads with one click and loads on demand.</p>
+      </details>
+      <details class="faq-item">
+        <summary>How faithful is the port?</summary>
+        <p>Component by component, it's validated against the reference implementation with numerical oracles — the texture stage's full denoiser step matches at cosine 1.000, and the fast surface extraction produces byte-identical geometry to the dense reference path.</p>
+      </details>
+    </div>
+  </section>
+
+  <section class="section section-alt">
+    <div class="section-header reveal">
+      <div class="section-label">Go deeper</div>
+      <h2 class="section-title">More deep dives</h2>
+    </div>
+    <div class="related-grid reveal">
+      <a class="related-card" href="../image-generation/"><span class="related-kicker">Media</span><h4>Image generation &amp; editing <span class="go">→</span></h4><p>FLUX.2 + Krea-2, instruction edits, style LoRAs.</p></a>
+      <a class="related-card" href="../music-generation/"><span class="related-kicker">Media</span><h4>Music generation <span class="go">→</span></h4><p>Type a vibe, get a 48 kHz stereo song — on device.</p></a>
+      <a class="related-card" href="../video-generation/"><span class="related-kicker">Media</span><h4>Video generation <span class="go">→</span></h4><p>Text, photo, or soundtrack to video — on device.</p></a>
+      <a class="related-card" href="../voice-cloning/"><span class="related-kicker">Audio</span><h4>Voice cloning &amp; TTS <span class="go">→</span></h4><p>Six seconds of audio, no transcript, all local.</p></a>
+      <a class="related-card" href="../api/"><span class="related-kicker">Developers</span><h4>API documentation <span class="go">→</span></h4><p>OpenAI, Anthropic &amp; Ollama-compatible — one port.</p></a>
+      <a class="related-card" href="../lm-studio-alternative/"><span class="related-kicker">Comparison</span><h4>LM Studio alternative <span class="go">→</span></h4><p>Same weights, faster engine — every cell we benchmark.</p></a>
+    </div>
+  </section>
+
+  <section class="section" style="padding-top: 0;">
+    <div class="cta-band reveal">
+      <h2>Your photos. Your models. Your machine.</h2>
+      <p>Download MLX Core, grab the 3D stack with one click, and turn the nearest object into an asset.</p>
+      <div class="hero-ctas">
+        <a href="https://github.com/ddalcu/mlx-serve/releases/latest/download/MLXCore.dmg" class="btn btn-primary">Download for Mac</a>
+        <a href="https://github.com/ddalcu/mlx-serve" class="btn btn-secondary" target="_blank" rel="noopener">View on GitHub</a>
+      </div>
+    </div>
+  </section>
+
+  <footer>
+    <ul class="footer-links">
+      <li><a href="../">Home</a></li>
+      <li><a href="https://github.com/ddalcu/mlx-serve" target="_blank" rel="noopener">GitHub</a></li>
+      <li><a href="https://github.com/ddalcu/mlx-serve/releases" target="_blank" rel="noopener">Releases</a></li>
+      <li><a href="https://github.com/ddalcu/mlx-serve/blob/main/CHANGELOG.md" target="_blank" rel="noopener">Changelog</a></li>
+      <li><a href="https://github.com/ddalcu/mlx-serve/issues" target="_blank" rel="noopener">Issues</a></li>
+    </ul>
+    <p class="footer-copy">MIT License · mlx-serve · built for Apple Silicon</p>
+  </footer>
+
+  <script src="../assets/feature.js"></script>
+</body>
+</html>

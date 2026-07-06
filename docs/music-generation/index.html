@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>AI Music Generation on Mac — Local Text-to-Music, No Cloud · mlx-serve</title>
+  <meta name="description" content="Generate original music on your Apple Silicon Mac: describe a style, optionally add lyrics, and ACE-Step 1.5 XL Turbo composes 48 kHz stereo tracks in 8 diffusion steps — entirely on-device. 10 seconds to 10 minutes, BPM/key/time-signature steerable, instrumental or vocal.">
+  <meta name="keywords" content="AI music generation Mac, local text to music, ACE-Step Mac, generate music offline, AI song generator local, music generation Apple Silicon, on-device music AI, suno alternative local">
+  <meta name="author" content="David Dalcu">
+  <link rel="canonical" href="https://ddalcu.github.io/mlx-serve/music-generation/">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://ddalcu.github.io/mlx-serve/music-generation/">
+  <meta property="og:title" content="Type a vibe, get a song — AI music generation on your Mac">
+  <meta property="og:description" content="Describe a track, optionally paste lyrics, and an on-device music model composes original 48 kHz stereo audio in 8 diffusion steps. No cloud, no subscription, no usage caps.">
+  <meta property="og:image" content="https://ddalcu.github.io/mlx-serve/screenshots/audio-generation.png">
+  <meta property="og:site_name" content="mlx-serve">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="Type a vibe, get a song — AI music generation on your Mac">
+  <meta name="twitter:description" content="Original 48 kHz stereo music from a text prompt, entirely on-device. Lyrics optional, BPM and key steerable.">
+  <meta name="twitter:image" content="https://ddalcu.github.io/mlx-serve/screenshots/audio-generation.png">
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "BreadcrumbList",
+    "itemListElement": [
+      { "@type": "ListItem", "position": 1, "name": "mlx-serve", "item": "https://ddalcu.github.io/mlx-serve/" },
+      { "@type": "ListItem", "position": 2, "name": "Music generation", "item": "https://ddalcu.github.io/mlx-serve/music-generation/" }
+    ]
+  }
+  </script>
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "FAQPage",
+    "mainEntity": [
+      {
+        "@type": "Question",
+        "name": "Can I generate music locally on a Mac?",
+        "acceptedAnswer": { "@type": "Answer", "text": "Yes. mlx-serve runs ACE-Step 1.5 XL Turbo natively on Apple Silicon: describe a style, optionally add lyrics, and it composes original 48 kHz stereo music in 8 diffusion steps — entirely on-device. The model is a ~6.3 GB download and runs comfortably in about 9 GB of memory." }
+      },
+      {
+        "@type": "Question",
+        "name": "Can it sing my lyrics?",
+        "acceptedAnswer": { "@type": "Answer", "text": "Yes — paste lyrics and the track is sung; leave them empty for an instrumental. Verse/chorus structure tags in the lyrics steer the arrangement, and the vocal language is selectable." }
+      },
+      {
+        "@type": "Question",
+        "name": "How long can generated tracks be?",
+        "acceptedAnswer": { "@type": "Answer", "text": "Anywhere from 10 seconds to 10 minutes per generation. You can also steer BPM, key/scale, and time signature, or leave them free for the model to choose." }
+      },
+      {
+        "@type": "Question",
+        "name": "Is there a music generation API?",
+        "acceptedAnswer": { "@type": "Answer", "text": "Yes — POST /v1/audio/music-generations with a prompt, optional lyrics, duration, and musical steering fields returns a 48 kHz stereo WAV. Streaming mode reports per-step progress over SSE." }
+      }
+    ]
+  }
+  </script>
+  <link rel="icon" href="../appiconb.png">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="../assets/feature.css">
+  <style>:root { --accent: #bf5af2; --accent2: #ff375f; }</style>
+</head>
+<body>
+
+  <nav>
+    <a href="../" class="nav-logo">
+      <img src="../appiconb.png" alt="MLX Core" class="nav-logo-img">
+      <span>mlx-serve</span>
+    </a>
+    <ul class="nav-links">
+      <li><a href="../" class="hide-mobile">Overview</a></li>
+      <li><a href="../voice-cloning/" class="hide-mobile">Voice</a></li>
+      <li><a href="#faq" class="hide-mobile">FAQ</a></li>
+      <li><a href="https://github.com/ddalcu/mlx-serve" class="nav-github" target="_blank" rel="noopener" aria-label="GitHub"><svg viewBox="0 0 16 16"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg></a></li>
+      <li><a href="https://github.com/ddalcu/mlx-serve/releases/latest/download/MLXCore.dmg" class="nav-dl">Download</a></li>
+    </ul>
+  </nav>
+
+  <section class="hero-f">
+    <div class="hero-f-glow"><span class="g1"></span><span class="g2"></span></div>
+    <div class="crumbs"><a href="../">mlx-serve</a><span class="sep">/</span><span class="here">Deep dive · Music generation</span></div>
+    <h1>Type a vibe.<br><span class="grad">Get a song.</span></h1>
+    <p class="hero-f-sub">"Upbeat synthwave with driving bass" — and ACE-Step 1.5 XL Turbo composes an <b>original 48 kHz stereo track</b> in 8 diffusion steps, entirely on your Mac. Paste lyrics and it sings them; leave them out for an instrumental. No cloud, no subscription, <b>no usage caps</b>.</p>
+    <div class="hero-ctas">
+      <a href="https://github.com/ddalcu/mlx-serve/releases/latest/download/MLXCore.dmg" class="btn btn-primary">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+        Download MLX Core
+      </a>
+      <a href="#how" class="btn btn-secondary">How it works</a>
+    </div>
+    <div class="hero-f-meta">
+      <span><b>8 diffusion steps</b> per track</span>
+      <span><b>10 s – 10 min</b> per generation</span>
+      <span><b>48 kHz stereo</b> output</span>
+    </div>
+  </section>
+
+  <section class="section" id="how">
+    <div class="split">
+      <div class="split-copy reveal">
+        <span class="split-kicker">How it works</span>
+        <h3>Describe. Generate. Keep every take.</h3>
+        <p>Open the Audio pane's <b>Music</b> tab, describe the style — genre, mood, instrumentation — and generate. Want vocals? Paste lyrics (verse/chorus tags steer the arrangement) and pick the vocal language. Want control? Pin the <b>BPM, key, and time signature</b>; leave them free and the model chooses.</p>
+        <p>Style-prompt starters and original lyric templates ship in the Examples menus, and you can save your own to reuse. Every track lands in a persistent history — play, stop, reveal in Finder — with a <b>settings file beside it</b> recording the exact prompt, lyrics, and parameters, so any take is reproducible.</p>
+      </div>
+      <div class="split-visual reveal">
+        <figure class="shot">
+          <div class="shot-frame"><img src="../screenshots/audio-generation.png" alt="MLX Core Audio pane, Music tab — style prompt, lyrics, duration and musical steering controls with a generation history" loading="lazy"></div>
+          <figcaption>The Music tab: style prompt, optional lyrics, musical steering — and a history of every take.</figcaption>
+        </figure>
+      </div>
+    </div>
+
+    <div class="split flip">
+      <div class="split-copy reveal">
+        <span class="split-kicker">Under the hood</span>
+        <h3>A music diffusion model, ported natively</h3>
+        <p>ACE-Step 1.5 XL Turbo runs on the same no-Python engine as everything else here: a text encoder conditions a 32-layer diffusion transformer, an audio VAE decodes to waveform, and the turbo schedule needs just <b>8 steps</b> end to end. The port is validated against the reference implementation with per-component numerical oracles.</p>
+        <p>One click downloads the converted model (~6.3 GB); it generates comfortably in about <b>9 GB of memory</b>, loads on demand, and frees itself afterwards — chat and music coexist in one server process.</p>
+      </div>
+      <div class="split-visual reveal">
+        <ul class="ticks">
+          <li><svg viewBox="0 0 24 24" fill="none"><polyline points="20 6 9 17 4 12"/></svg><span><b>No subscription, no credits</b> — generate all night on your own silicon.</span></li>
+          <li><svg viewBox="0 0 24 24" fill="none"><polyline points="20 6 9 17 4 12"/></svg><span><b>Your lyrics stay yours</b> — nothing you write leaves the machine.</span></li>
+          <li><svg viewBox="0 0 24 24" fill="none"><polyline points="20 6 9 17 4 12"/></svg><span><b>Works offline</b> — once the model is downloaded, airplane mode is fine.</span></li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <section class="section section-alt">
+    <div class="section-header reveal">
+      <div class="section-label">Beyond the pane</div>
+      <h2 class="section-title">Music that plugs into everything else</h2>
+    </div>
+    <div class="mini-grid">
+      <div class="mini-card reveal">
+        <span class="mini-k">API</span>
+        <h4>One endpoint for developers</h4>
+        <p><code>POST /v1/audio/music-generations</code> with a prompt, optional lyrics, duration, and musical steering — get a 48 kHz stereo WAV back, with per-step SSE progress. <a class="prose-link" href="../api/">Full API docs</a>.</p>
+      </div>
+      <div class="mini-card reveal">
+        <span class="mini-k">Video</span>
+        <h4>Score your generated videos</h4>
+        <p>Feed a generated track into <a class="prose-link" href="../video-generation/">audio-to-video</a> and the visuals perform to your soundtrack — beat, mood, and all.</p>
+      </div>
+      <div class="mini-card reveal">
+        <span class="mini-k">Voice</span>
+        <h4>Sibling tab: cloning &amp; TTS</h4>
+        <p>The Audio pane's Voice tab does <a class="prose-link" href="../voice-cloning/">zero-shot voice cloning</a> — six seconds of audio, no transcript, bit-for-bit validated.</p>
+      </div>
+      <div class="mini-card reveal">
+        <span class="mini-k">Reproducible</span>
+        <h4>Every take documented</h4>
+        <p>A <code>.txt</code> sidecar beside each track records the model, prompt, lyrics, and parameters — recreate or iterate on any result later.</p>
+      </div>
+    </div>
+  </section>
+
+  <section class="section" id="faq">
+    <div class="section-header reveal">
+      <div class="section-label">FAQ</div>
+      <h2 class="section-title">Local music generation, answered</h2>
+    </div>
+    <div class="faq-wrap reveal">
+      <details class="faq-item">
+        <summary>What hardware do I need?</summary>
+        <p>An Apple Silicon Mac with 16 GB works well — the 8-bit model generates in about 9 GB of memory and is a ~6.3 GB one-click download.</p>
+      </details>
+      <details class="faq-item">
+        <summary>Can it sing my lyrics?</summary>
+        <p>Yes. Paste lyrics and the vocal performance follows them — structure tags like verse and chorus steer the arrangement, and the vocal language is selectable. Empty lyrics produce an instrumental.</p>
+      </details>
+      <details class="faq-item">
+        <summary>How much control do I get over the music itself?</summary>
+        <p>Style, mood, and instrumentation come from the prompt; BPM (30–300), key/scale, and time signature can be pinned exactly or left to the model. Track length runs from 10 seconds to 10 minutes, and a seed makes any generation repeatable.</p>
+      </details>
+      <details class="faq-item">
+        <summary>Who owns the output?</summary>
+        <p>It's generated on your machine from your prompt — there's no service holding rights over your renders. ACE-Step is an open-weights model; check its license for the fine print on commercial use of outputs.</p>
+      </details>
+    </div>
+  </section>
+
+  <section class="section section-alt">
+    <div class="section-header reveal">
+      <div class="section-label">Go deeper</div>
+      <h2 class="section-title">More deep dives</h2>
+    </div>
+    <div class="related-grid reveal">
+      <a class="related-card" href="../voice-cloning/"><span class="related-kicker">Audio</span><h4>Voice cloning &amp; TTS <span class="go">→</span></h4><p>Six seconds of audio, no transcript, all local.</p></a>
+      <a class="related-card" href="../3d-generation/"><span class="related-kicker">Media</span><h4>Photo → 3D model <span class="go">→</span></h4><p>One picture in, a textured GLB mesh out.</p></a>
+      <a class="related-card" href="../video-generation/"><span class="related-kicker">Media</span><h4>Video generation <span class="go">→</span></h4><p>Text, photo, or soundtrack to video — on device.</p></a>
+      <a class="related-card" href="../image-generation/"><span class="related-kicker">Media</span><h4>Image generation &amp; editing <span class="go">→</span></h4><p>FLUX.2 + Krea-2, instruction edits, style LoRAs.</p></a>
+      <a class="related-card" href="../api/"><span class="related-kicker">Developers</span><h4>API documentation <span class="go">→</span></h4><p>OpenAI, Anthropic &amp; Ollama-compatible — one port.</p></a>
+      <a class="related-card" href="../local-ai-assistant/"><span class="related-kicker">App</span><h4>Always-on assistant <span class="go">→</span></h4><p>⌃Space launcher, voice, Telegram, scheduled tasks.</p></a>
+    </div>
+  </section>
+
+  <section class="section" style="padding-top: 0;">
+    <div class="cta-band reveal">
+      <h2>Your studio. Your silicon. No meter running.</h2>
+      <p>Download MLX Core, grab the music model with one click, and render as many takes as you like.</p>
+      <div class="hero-ctas">
+        <a href="https://github.com/ddalcu/mlx-serve/releases/latest/download/MLXCore.dmg" class="btn btn-primary">Download for Mac</a>
+        <a href="https://github.com/ddalcu/mlx-serve" class="btn btn-secondary" target="_blank" rel="noopener">View on GitHub</a>
+      </div>
+    </div>
+  </section>
+
+  <footer>
+    <ul class="footer-links">
+      <li><a href="../">Home</a></li>
+      <li><a href="https://github.com/ddalcu/mlx-serve" target="_blank" rel="noopener">GitHub</a></li>
+      <li><a href="https://github.com/ddalcu/mlx-serve/releases" target="_blank" rel="noopener">Releases</a></li>
+      <li><a href="https://github.com/ddalcu/mlx-serve/blob/main/CHANGELOG.md" target="_blank" rel="noopener">Changelog</a></li>
+      <li><a href="https://github.com/ddalcu/mlx-serve/issues" target="_blank" rel="noopener">Issues</a></li>
+    </ul>
+    <p class="footer-copy">MIT License · mlx-serve · built for Apple Silicon</p>
+  </footer>
+
+  <script src="../assets/feature.js"></script>
+</body>
+</html>

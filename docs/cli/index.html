@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>CLI Reference — run, pull, list, serve · mlx-serve</title>
+  <meta name="description" content="The mlx-serve command line: download and chat with a model in one command, serve your whole model library on demand, and tune everything — context, KV quantization, speculative decoding, multi-model residency — from flags. Full reference.">
+  <meta name="keywords" content="mlx-serve CLI, local LLM command line Mac, ollama alternative CLI, MLX serve command, run LLM terminal Mac, Apple Silicon LLM server CLI">
+  <meta name="author" content="David Dalcu">
+  <link rel="canonical" href="https://ddalcu.github.io/mlx-serve/cli/">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://ddalcu.github.io/mlx-serve/cli/">
+  <meta property="og:title" content="mlx-serve CLI — one command from zero to chatting">
+  <meta property="og:description" content="mlx-serve run gemma4 downloads, serves, and chats. Full flag reference for the server that powers MLX Core.">
+  <meta property="og:site_name" content="mlx-serve">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="mlx-serve CLI reference">
+  <meta name="twitter:description" content="One command from zero to chatting with a local model — full flag reference.">
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "BreadcrumbList",
+    "itemListElement": [
+      { "@type": "ListItem", "position": 1, "name": "mlx-serve", "item": "https://ddalcu.github.io/mlx-serve/" },
+      { "@type": "ListItem", "position": 2, "name": "CLI reference", "item": "https://ddalcu.github.io/mlx-serve/cli/" }
+    ]
+  }
+  </script>
+  <link rel="icon" href="../appiconb.png">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="../assets/feature.css">
+  <style>
+    :root { --accent: #d97706; --accent2: #0071e3; }
+    .doc-section { max-width: 880px; margin: 0 auto; padding: 40px 24px; }
+    .doc-section h2 { font-size: 26px; font-weight: 700; letter-spacing: -0.02em; margin: 40px 0 8px; }
+    .doc-section h3 { font-size: 18px; font-weight: 650; margin: 30px 0 8px; }
+    .doc-section p { font-size: 15px; line-height: 1.65; color: var(--text-secondary); margin-bottom: 12px; }
+    .doc-section p b, .doc-section p strong { color: var(--text-primary); }
+    .doc-section a { color: var(--accent2); }
+    .flag-table { width: 100%; border-collapse: collapse; margin: 14px 0 22px; font-size: 13.5px; }
+    .flag-table th { text-align: left; font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-tertiary); padding: 8px 10px; border-bottom: 1px solid rgba(128,128,128,0.25); }
+    .flag-table td { padding: 9px 10px; border-bottom: 1px solid rgba(128,128,128,0.12); vertical-align: top; color: var(--text-secondary); line-height: 1.5; }
+    .flag-table td:first-child { white-space: nowrap; }
+    .flag-table code, .doc-section p code, .doc-section li code {
+      font-family: 'JetBrains Mono', monospace; font-size: 12.5px;
+      background: rgba(128,128,128,0.13); padding: 2px 6px; border-radius: 5px; color: var(--text-primary);
+    }
+    .code-doc { background: var(--code-bg); color: var(--code-text); border-radius: 12px; padding: 18px 20px; overflow-x: auto; margin: 14px 0 22px; }
+    .code-doc pre { font-family: 'JetBrains Mono', monospace; font-size: 12.5px; line-height: 1.6; }
+    .code-doc .c { color: #7f848e; }
+    .doc-toc { display: flex; flex-wrap: wrap; gap: 8px; margin: 18px 0 6px; }
+    .doc-toc a { font-size: 13px; text-decoration: none; padding: 6px 12px; border-radius: 99px; background: rgba(128,128,128,0.1); color: var(--text-secondary); }
+    .doc-toc a:hover { background: rgba(217,119,6,0.14); color: var(--accent); }
+    .note { border-left: 3px solid var(--accent); background: rgba(217,119,6,0.07); padding: 10px 14px; border-radius: 0 10px 10px 0; font-size: 14px; color: var(--text-secondary); margin: 14px 0; }
+  </style>
+</head>
+<body>
+
+  <nav>
+    <a href="../" class="nav-logo">
+      <img src="../appiconb.png" alt="MLX Core" class="nav-logo-img">
+      <span>mlx-serve</span>
+    </a>
+    <ul class="nav-links">
+      <li><a href="../" class="hide-mobile">Overview</a></li>
+      <li><a href="../api/" class="hide-mobile">API</a></li>
+      <li><a href="#flags" class="hide-mobile">Flags</a></li>
+      <li><a href="https://github.com/ddalcu/mlx-serve" class="nav-github" target="_blank" rel="noopener" aria-label="GitHub"><svg viewBox="0 0 16 16"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg></a></li>
+      <li><a href="https://github.com/ddalcu/mlx-serve/releases/latest/download/MLXCore.dmg" class="nav-dl">Download</a></li>
+    </ul>
+  </nav>
+
+  <section class="hero-f">
+    <div class="hero-f-glow"><span class="g1"></span><span class="g2"></span></div>
+    <div class="crumbs"><a href="../">mlx-serve</a><span class="sep">/</span><span class="here">CLI reference</span></div>
+    <h1>One command from zero<br><span class="grad">to chatting.</span></h1>
+    <p class="hero-f-sub"><code>mlx-serve run gemma4</code> downloads the model, starts the server, and drops you into a chat — Ollama-style. The same binary powers the MLX Core app; everything the app does over HTTP, you can drive from the terminal.</p>
+    <div class="hero-f-meta">
+      <span><b>run · pull · list · serve</b></span>
+      <span>Default port <b>11234</b></span>
+      <span>Models in <b>~/.mlx-serve/models</b></span>
+    </div>
+  </section>
+
+  <section class="doc-section">
+    <div class="doc-toc">
+      <a href="#install">Install</a>
+      <a href="#commands">Commands</a>
+      <a href="#names">Model names</a>
+      <a href="#flags">Flag reference</a>
+      <a href="#recipes">Recipes</a>
+    </div>
+
+    <h2 id="install">Install</h2>
+    <p>Three ways to get the <code>mlx-serve</code> command:</p>
+    <table class="flag-table">
+      <tr><th>Method</th><th>How</th></tr>
+      <tr><td><b>From the app</b></td><td>The <a href="https://github.com/ddalcu/mlx-serve/releases/latest/download/MLXCore.dmg">MLX Core</a> welcome screen has a one-click <b>Install</b> button that puts <code>mlx-serve</code> on your PATH — into <code>~/.local/bin</code> or <code>~/bin</code> if you have one (no password), else <code>/usr/local/bin</code> after a single admin prompt. Never touches your shell config. New in v26.7.2.</td></tr>
+      <tr><td><b>Homebrew</b></td><td><code>brew tap ddalcu/mlx-serve https://github.com/ddalcu/mlx-serve &amp;&amp; brew install mlx-serve</code></td></tr>
+      <tr><td><b>From source</b></td><td><code>zig build -Doptimize=ReleaseFast</code> (needs <code>brew install mlx-c webp</code>).</td></tr>
+    </table>
+
+    <h2 id="commands">Commands</h2>
+    <div class="code-doc"><pre><span class="c"># Download if needed, serve, and chat right here</span>
+mlx-serve run gemma4
+
+<span class="c"># Download a model into ~/.mlx-serve/models</span>
+mlx-serve pull qwen3.6:27b
+
+<span class="c"># Show downloaded models</span>
+mlx-serve list
+
+<span class="c"># Headless server over everything you've pulled — loads on demand by name</span>
+mlx-serve serve</pre></div>
+    <table class="flag-table">
+      <tr><th>Command</th><th>What it does</th></tr>
+      <tr><td><code>run &lt;model&gt;</code></td><td>Pull-if-missing, start the server, and open an interactive chat REPL in the terminal. Ctrl-C leaves the server behind nothing — it exits with you.</td></tr>
+      <tr><td><code>pull &lt;model&gt;</code></td><td>Resumable download into <code>~/.mlx-serve/models/&lt;org&gt;/&lt;repo&gt;</code> — interrupted pulls continue where they left off.</td></tr>
+      <tr><td><code>list</code></td><td>Everything on disk, with sizes.</td></tr>
+      <tr><td><code>serve</code></td><td>Serve the whole library on demand: any <a href="../api/">API</a> request naming a pulled model loads it on the fly. This is the drop-in <a href="../ollama-alternative/">Ollama replacement</a> mode — add <code>--port 11434</code> and Ollama clients connect unchanged.</td></tr>
+    </table>
+
+    <h2 id="names">Model names</h2>
+    <p>Anywhere a <code>&lt;model&gt;</code> is accepted: a short alias (<code>gemma4</code>, <code>qwen3.6:27b</code> — sizes pick quantized builds curated for Apple Silicon), a HuggingFace <code>org/repo</code>, or an <code>hf.co/org/repo</code> URL. GGUF files work too — they route automatically to the embedded llama.cpp engine (DeepSeek-V4-Flash quants to the ds4 engine).</p>
+
+    <h2 id="flags">Flag reference</h2>
+    <p>From <code>mlx-serve --help</code>, grouped. Flags compose with <code>serve</code> and <code>run</code>.</p>
+
+    <h3>Core serving</h3>
+    <table class="flag-table">
+      <tr><th>Flag</th><th>Meaning</th></tr>
+      <tr><td><code>--model &lt;dir&gt;</code></td><td>Path to a model directory (alternative to the pulled-library workflow).</td></tr>
+      <tr><td><code>--serve</code></td><td>HTTP server mode (with <code>--model</code>; the <code>serve</code> subcommand implies it).</td></tr>
+      <tr><td><code>--host &lt;ip&gt;</code> / <code>--port &lt;n&gt;</code></td><td>Bind address and port (defaults <code>0.0.0.0</code> : <code>11234</code>).</td></tr>
+      <tr><td><code>--model-dir &lt;dir&gt;</code></td><td>Directory of models to discover at startup — they appear in <code>/v1/models</code> and load on demand.</td></tr>
+      <tr><td><code>--ctx-size &lt;n&gt;</code></td><td>Max context length (default: auto-budgeted from the model max and available GPU memory).</td></tr>
+      <tr><td><code>--timeout &lt;n&gt;</code></td><td><b>Stall</b> timeout: abort after <i>n</i> seconds without a new token (default 300, 0 = off). A request that keeps generating never times out.</td></tr>
+      <tr><td><code>--log-level &lt;lvl&gt;</code></td><td><code>error</code> · <code>warn</code> · <code>info</code> (default) · <code>debug</code>.</td></tr>
+    </table>
+
+    <h3>Sampling &amp; generation defaults</h3>
+    <table class="flag-table">
+      <tr><th>Flag</th><th>Meaning</th></tr>
+      <tr><td><code>--temp</code> / <code>--top-p</code> / <code>--top-k</code></td><td>Serve-mode defaults for requests that omit them (request body → these flags → the model's <code>generation_config.json</code> → engine defaults).</td></tr>
+      <tr><td><code>--max-tokens &lt;n&gt;</code></td><td>Generation cap for <code>--prompt</code> mode (default 100).</td></tr>
+      <tr><td><code>--reasoning-budget &lt;n&gt;</code></td><td>Max thinking tokens per request on reasoning models.</td></tr>
+      <tr><td><code>--prompt &lt;text&gt;</code> / <code>--stream</code></td><td>One-shot offline generation, no server.</td></tr>
+      <tr><td><code>--no-vision</code></td><td>Skip loading the vision encoder (saves memory on multimodal checkpoints).</td></tr>
+      <tr><td><code>--no-safety</code></td><td>Disable the image-generation NSFW filter (or per request with <code>"safety": false</code>).</td></tr>
+    </table>
+
+    <h3>Speed: speculative decoding</h3>
+    <p>All three paths produce output equivalent to plain decoding — see the <a href="../speculative-decoding/">deep dive</a>.</p>
+    <table class="flag-table">
+      <tr><th>Flag</th><th>Meaning</th></tr>
+      <tr><td><code>--pld</code> / <code>--no-pld</code></td><td>Prompt Lookup Decoding — on by default, big wins on echo-heavy work (code edits, RAG, agents). <code>--pld-draft-len</code>, <code>--pld-key-len</code> tune it.</td></tr>
+      <tr><td><code>--drafter &lt;dir&gt;</code></td><td>Gemma 4 assistant-drafter checkpoint; <code>--draft-block-size</code> overrides the per-target auto block size.</td></tr>
+      <tr><td><code>--no-mtp</code> / <code>--mtp-depth &lt;n&gt;</code></td><td>Qwen native multi-token-prediction head (auto-loaded when the checkpoint ships one; priority MTP &gt; drafter &gt; PLD).</td></tr>
+    </table>
+
+    <h3>Memory: KV cache &amp; residency</h3>
+    <table class="flag-table">
+      <tr><th>Flag</th><th>Meaning</th></tr>
+      <tr><td><code>--kv-quant &lt;mode&gt;</code></td><td>KV-cache quantization: <code>off</code> (default) · <code>4</code> · <code>8</code> · <code>turbo2</code> · <code>turbo4</code> (Hadamard-rotated). Up to ~4× longer contexts in the same memory; per-request override via the <code>kv_quant</code> body field.</td></tr>
+      <tr><td><code>--kv-attn-mode</code></td><td><code>dense</code> (default) or <code>fused</code> — attention path for quantized KV.</td></tr>
+      <tr><td><code>--prefix-cache-entries</code> / <code>--prefix-cache-mem</code></td><td>Hot prompt-prefix cache: entry count and byte budget (default 2 GB, LRU-evicted).</td></tr>
+      <tr><td><code>--max-resident-models &lt;n&gt;</code></td><td>How many models stay loaded at once (default 3, LRU).</td></tr>
+      <tr><td><code>--max-resident-mem &lt;n&gt;|auto</code></td><td>Byte cap across all loaded models (default: 80% of the MLX wired limit).</td></tr>
+      <tr><td><code>--idle-evict-secs &lt;n&gt;</code></td><td>Evict idle models after <i>n</i> seconds (default: off).</td></tr>
+      <tr><td><code>--max-concurrent &lt;n&gt;</code></td><td>Request submit-queue size for concurrent batched decoding.</td></tr>
+      <tr><td><code>--skip-mem-preflight</code></td><td>Bypass the conservative free-RAM check before a model load.</td></tr>
+      <tr><td><code>--tokenize-cache-entries &lt;n&gt;</code></td><td>Per-model LRU of chat-template render + tokenize results (default 4).</td></tr>
+    </table>
+
+    <h3>GGUF engines</h3>
+    <table class="flag-table">
+      <tr><th>Flag</th><th>Meaning</th></tr>
+      <tr><td><code>--engine auto|ds4|llama</code></td><td>Engine for <code>.gguf</code> inputs only — <code>auto</code> reads the file's architecture metadata (safetensors always run the native MLX engine).</td></tr>
+      <tr><td><code>--llama-cache-entries &lt;n&gt;</code></td><td>Resident KV sessions for llama.cpp-served GGUFs (default 4).</td></tr>
+      <tr><td><code>--ssd-streaming</code></td><td>DeepSeek-V4-Flash: stream expert weights from SSD instead of holding the full model in RAM.</td></tr>
+    </table>
+
+    <h2 id="recipes">Recipes</h2>
+    <div class="code-doc"><pre><span class="c"># Drop-in Ollama replacement — same port, your Ollama apps connect unchanged</span>
+mlx-serve serve --port 11434
+
+<span class="c"># Claude Code against your local model</span>
+mlx-serve run gemma4          <span class="c"># in one terminal</span>
+export ANTHROPIC_BASE_URL=http://localhost:11234
+export ANTHROPIC_API_KEY=unused
+claude                        <span class="c"># in another</span>
+
+<span class="c"># Long-context agent box: 8-bit KV cache + tight timeout logging</span>
+mlx-serve serve --kv-quant 8 --log-level debug
+
+<span class="c"># Serve a folder of models you manage yourself</span>
+mlx-serve --serve --model-dir ~/models --port 11234</pre></div>
+    <p class="note">The full, always-current list is <code>mlx-serve --help</code> — this page tracks it release to release.</p>
+  </section>
+
+  <section class="section" style="padding-top: 0;">
+    <div class="cta-band reveal">
+      <h2>Two commands from an empty Mac.</h2>
+      <p><code>brew install mlx-serve</code> · <code>mlx-serve run gemma4</code> — or take the app and get the CLI from its welcome screen.</p>
+      <div class="hero-ctas">
+        <a href="https://github.com/ddalcu/mlx-serve/releases/latest/download/MLXCore.dmg" class="btn btn-primary">Download for Mac</a>
+        <a href="../api/" class="btn btn-secondary">API documentation</a>
+      </div>
+    </div>
+  </section>
+
+  <footer>
+    <ul class="footer-links">
+      <li><a href="../">Home</a></li>
+      <li><a href="../api/">API</a></li>
+      <li><a href="https://github.com/ddalcu/mlx-serve" target="_blank" rel="noopener">GitHub</a></li>
+      <li><a href="https://github.com/ddalcu/mlx-serve/releases" target="_blank" rel="noopener">Releases</a></li>
+      <li><a href="https://github.com/ddalcu/mlx-serve/blob/main/CHANGELOG.md" target="_blank" rel="noopener">Changelog</a></li>
+    </ul>
+    <p class="footer-copy">MIT License · mlx-serve · built for Apple Silicon</p>
+  </footer>
+
+  <script src="../assets/feature.js"></script>
+</body>
+</html>

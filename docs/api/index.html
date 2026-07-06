@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>API Documentation — OpenAI, Anthropic &amp; Ollama-compatible local server · mlx-serve</title>
+  <meta name="description" content="Full API reference for mlx-serve: OpenAI-compatible chat, completions and embeddings, Anthropic Messages, the Responses API, Ollama /api endpoints, plus local image, video, music, voice and 3D generation — all served from one process on your Mac.">
+  <meta name="keywords" content="mlx-serve API, local OpenAI API Mac, Anthropic API local, Ollama API compatible, local LLM server API, MLX API server, on-device image generation API, local TTS API, text to music API">
+  <meta name="author" content="David Dalcu">
+  <link rel="canonical" href="https://ddalcu.github.io/mlx-serve/api/">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://ddalcu.github.io/mlx-serve/api/">
+  <meta property="og:title" content="mlx-serve API documentation — three APIs your tools already speak">
+  <meta property="og:description" content="OpenAI, Anthropic and Ollama-compatible endpoints, plus image, video, music, voice and 3D generation — one local server, one port, no API key.">
+  <meta property="og:site_name" content="mlx-serve">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="mlx-serve API documentation">
+  <meta name="twitter:description" content="OpenAI, Anthropic and Ollama-compatible endpoints, plus on-device media generation — one local server, no API key.">
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "BreadcrumbList",
+    "itemListElement": [
+      { "@type": "ListItem", "position": 1, "name": "mlx-serve", "item": "https://ddalcu.github.io/mlx-serve/" },
+      { "@type": "ListItem", "position": 2, "name": "API documentation", "item": "https://ddalcu.github.io/mlx-serve/api/" }
+    ]
+  }
+  </script>
+  <link rel="icon" href="../appiconb.png">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="../assets/feature.css">
+  <style>
+    :root { --accent: #0071e3; --accent2: #30d158; }
+    .doc-section { max-width: 880px; margin: 0 auto; padding: 40px 24px; }
+    .doc-section h2 { font-size: 26px; font-weight: 700; letter-spacing: -0.02em; margin: 40px 0 8px; }
+    .doc-section h3 { font-size: 18px; font-weight: 650; margin: 30px 0 8px; }
+    .doc-section p { font-size: 15px; line-height: 1.65; color: var(--text-secondary); margin-bottom: 12px; }
+    .doc-section p b, .doc-section p strong { color: var(--text-primary); }
+    .doc-section a { color: var(--accent); }
+    .ep-table { width: 100%; border-collapse: collapse; margin: 14px 0 22px; font-size: 13.5px; }
+    .ep-table th { text-align: left; font-size: 12px; text-transform: uppercase; letter-spacing: 0.05em; color: var(--text-tertiary); padding: 8px 10px; border-bottom: 1px solid rgba(128,128,128,0.25); }
+    .ep-table td { padding: 9px 10px; border-bottom: 1px solid rgba(128,128,128,0.12); vertical-align: top; color: var(--text-secondary); line-height: 1.5; }
+    .ep-table td:first-child { white-space: nowrap; }
+    .ep-table code, .doc-section p code, .doc-section li code {
+      font-family: 'JetBrains Mono', monospace; font-size: 12.5px;
+      background: rgba(128,128,128,0.13); padding: 2px 6px; border-radius: 5px; color: var(--text-primary);
+    }
+    .method { display: inline-block; font-family: 'JetBrains Mono', monospace; font-size: 11px; font-weight: 700; padding: 2px 7px; border-radius: 5px; margin-right: 6px; }
+    .m-post { background: rgba(48,209,88,0.15); color: #1d9d4e; }
+    .m-get { background: rgba(0,113,227,0.13); color: #0071e3; }
+    .m-del { background: rgba(255,69,58,0.13); color: #d63a31; }
+    .m-ws { background: rgba(191,90,242,0.14); color: #a34fd6; }
+    .code-doc { background: var(--code-bg); color: var(--code-text); border-radius: 12px; padding: 18px 20px; overflow-x: auto; margin: 14px 0 22px; }
+    .code-doc pre { font-family: 'JetBrains Mono', monospace; font-size: 12.5px; line-height: 1.6; }
+    .code-doc .c { color: #7f848e; } /* comment */
+    .doc-toc { display: flex; flex-wrap: wrap; gap: 8px; margin: 18px 0 6px; }
+    .doc-toc a { font-size: 13px; text-decoration: none; padding: 6px 12px; border-radius: 99px; background: rgba(128,128,128,0.1); color: var(--text-secondary); }
+    .doc-toc a:hover { background: rgba(0,113,227,0.12); color: var(--accent); }
+    .note { border-left: 3px solid var(--accent); background: rgba(0,113,227,0.06); padding: 10px 14px; border-radius: 0 10px 10px 0; font-size: 14px; color: var(--text-secondary); margin: 14px 0; }
+  </style>
+</head>
+<body>
+
+  <nav>
+    <a href="../" class="nav-logo">
+      <img src="../appiconb.png" alt="MLX Core" class="nav-logo-img">
+      <span>mlx-serve</span>
+    </a>
+    <ul class="nav-links">
+      <li><a href="../" class="hide-mobile">Overview</a></li>
+      <li><a href="../cli/" class="hide-mobile">CLI</a></li>
+      <li><a href="#media" class="hide-mobile">Media APIs</a></li>
+      <li><a href="https://github.com/ddalcu/mlx-serve" class="nav-github" target="_blank" rel="noopener" aria-label="GitHub"><svg viewBox="0 0 16 16"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg></a></li>
+      <li><a href="https://github.com/ddalcu/mlx-serve/releases/latest/download/MLXCore.dmg" class="nav-dl">Download</a></li>
+    </ul>
+  </nav>
+
+  <section class="hero-f">
+    <div class="hero-f-glow"><span class="g1"></span><span class="g2"></span></div>
+    <div class="crumbs"><a href="../">mlx-serve</a><span class="sep">/</span><span class="here">API documentation</span></div>
+    <h1>One local server.<br><span class="grad">Three APIs your tools already speak.</span></h1>
+    <p class="hero-f-sub">Everything below is served by <b>one process on one port</b> — chat, embeddings, and image / video / music / voice / 3D generation. OpenAI-compatible, Anthropic-compatible, and Ollama-compatible, so existing SDKs and apps connect unchanged. <b>No API key</b> — it's your machine.</p>
+    <div class="hero-f-meta">
+      <span>Base URL <b>http://localhost:11234</b></span>
+      <span><b>No auth</b> — any key accepted</span>
+      <span><b>SSE streaming</b> everywhere</span>
+    </div>
+  </section>
+
+  <section class="doc-section">
+    <div class="doc-toc">
+      <a href="#start">Getting started</a>
+      <a href="#openai">OpenAI-compatible</a>
+      <a href="#extensions">Extensions</a>
+      <a href="#anthropic">Anthropic Messages</a>
+      <a href="#responses">Responses API</a>
+      <a href="#ollama">Ollama API</a>
+      <a href="#media">Media generation</a>
+      <a href="#management">Model management</a>
+    </div>
+
+    <h2 id="start">Getting started</h2>
+    <p>Start the server from the <a href="https://github.com/ddalcu/mlx-serve/releases/latest/download/MLXCore.dmg">MLX Core app</a> (it runs whenever a model is loaded) or from the <a href="../cli/">CLI</a>:</p>
+    <div class="code-doc"><pre>mlx-serve serve          <span class="c"># serves everything under ~/.mlx-serve/models, loads on demand</span>
+mlx-serve run gemma4     <span class="c"># or: download one model, serve it, and chat</span></pre></div>
+    <p>The default port is <code>11234</code> (<code>--port</code> to change it). Models are addressed by name — the <code>model</code> field accepts a model's directory name, an <code>org/repo</code> id, or an Ollama-style short name with tag. A request naming a discovered-but-unloaded model loads it on the fly.</p>
+    <div class="code-doc"><pre>curl http://localhost:11234/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "gemma-4-e4b-it-8bit",
+    "messages": [{"role": "user", "content": "Why is the sky blue?"}],
+    "stream": true
+  }'</pre></div>
+    <p>Or with the OpenAI SDK — just point <code>base_url</code> at your Mac:</p>
+    <div class="code-doc"><pre>from openai import OpenAI
+client = OpenAI(base_url="http://localhost:11234/v1", api_key="unused")
+r = client.chat.completions.create(
+    model="gemma-4-e4b-it-8bit",
+    messages=[{"role": "user", "content": "Hello!"}])
+print(r.choices[0].message.content)</pre></div>
+
+    <h2 id="openai">OpenAI-compatible endpoints</h2>
+    <table class="ep-table">
+      <tr><th>Endpoint</th><th>What it does</th></tr>
+      <tr><td><span class="method m-get">GET</span><code>/health</code></td><td>Liveness probe — <code>200</code> when the server is up.</td></tr>
+      <tr><td><span class="method m-get">GET</span><code>/v1/models</code></td><td>Every model the server can serve — loaded or discoverable — with a <code>capabilities</code> array (<code>chat</code>, <code>embeddings</code>, <code>image</code>, <code>audio</code>, <code>music</code>, <code>video</code>, <code>3d</code>) so clients know what each one can do.</td></tr>
+      <tr><td><span class="method m-post">POST</span><code>/v1/chat/completions</code></td><td>Chat with streaming (SSE), tool calling, vision (image parts on multimodal models), JSON mode / <code>response_format</code>, and thinking models. The workhorse endpoint.</td></tr>
+      <tr><td><span class="method m-post">POST</span><code>/v1/completions</code></td><td>Raw text completion (no chat template) — FIM / code-completion friendly.</td></tr>
+      <tr><td><span class="method m-post">POST</span><code>/v1/embeddings</code></td><td>Batched embeddings from encoder models (e.g. <code>bge-small-en-v1.5-8bit</code>) — the whole input array runs as one padded GPU forward.</td></tr>
+    </table>
+
+    <h2 id="extensions">Request extensions beyond OpenAI</h2>
+    <p>All optional; every endpoint stays spec-compatible without them.</p>
+    <table class="ep-table">
+      <tr><th>Field</th><th>Meaning</th></tr>
+      <tr><td><code>enable_thinking</code></td><td>Toggle thinking/reasoning on models that support it; reasoning arrives as <code>reasoning_content</code>, never leaked into the visible text.</td></tr>
+      <tr><td><code>reasoning_budget</code></td><td>Cap thinking tokens per request.</td></tr>
+      <tr><td><code>kv_quant</code></td><td>Per-request KV-cache quantization: <code>"off"</code>, <code>4</code>, <code>8</code>, <code>"turbo2"</code>, <code>"turbo4"</code>.</td></tr>
+      <tr><td><code>enable_pld</code> / <code>enable_drafter</code> / <code>enable_mtp</code></td><td>Per-request control over the three speculative-decoding paths (<a href="../speculative-decoding/">deep dive</a>). Defaults are already sensible — outputs stay equivalent either way.</td></tr>
+    </table>
+    <p class="note">Sampling defaults resolve in this order: request body → server launch flags → the model's own <code>generation_config.json</code> → engine defaults. Clients that omit <code>temperature</code>/<code>top_p</code>/<code>top_k</code> get what the model's authors recommend.</p>
+
+    <h2 id="anthropic">Anthropic Messages API</h2>
+    <p><code>POST /v1/messages</code> implements the Anthropic Messages API — typed content blocks, <code>tool_use</code> / <code>tool_result</code>, thinking blocks, and the full SSE event lifecycle (<code>message_start</code>, <code>content_block_delta</code>, …). It's what lets <a href="../claude-code-local/">Claude Code run against your local model</a>:</p>
+    <div class="code-doc"><pre>export ANTHROPIC_BASE_URL=http://localhost:11234
+export ANTHROPIC_API_KEY=unused
+claude   <span class="c"># Claude Code now talks to your Mac</span></pre></div>
+
+    <h2 id="responses">OpenAI Responses API</h2>
+    <table class="ep-table">
+      <tr><th>Endpoint</th><th>What it does</th></tr>
+      <tr><td><span class="method m-post">POST</span><code>/v1/responses</code></td><td>The stateful Responses API: typed output items, <code>previous_response_id</code> chaining, tool calls, sequence-numbered SSE events.</td></tr>
+      <tr><td><span class="method m-get">GET</span><code>/v1/responses/{id}</code></td><td>Fetch a stored response.</td></tr>
+      <tr><td><span class="method m-del">DELETE</span><code>/v1/responses/{id}</code></td><td>Delete a stored response.</td></tr>
+      <tr><td><span class="method m-post">POST</span><code>/v1/responses/compact</code></td><td>Compact a long conversation into an opaque token-light blob that round-trips through the next request.</td></tr>
+      <tr><td><span class="method m-ws">WS</span><code>/v1/responses</code></td><td>Same endpoint over WebSocket: send <code>response.create</code>-shaped JSON frames, receive each SSE event as one text frame.</td></tr>
+    </table>
+
+    <h2 id="ollama">Ollama-compatible API</h2>
+    <p>Tools built for Ollama — Raycast, Obsidian, Enchanted, Open WebUI, <code>ollama-python</code>/<code>js</code> — connect unchanged (<a href="../ollama-alternative/">the swap, in depth</a>). Run on Ollama's port and nothing needs configuring at all: <code>mlx-serve serve --port 11434</code>.</p>
+    <table class="ep-table">
+      <tr><th>Endpoint</th><th>What it does</th></tr>
+      <tr><td><span class="method m-post">POST</span><code>/api/chat</code> · <code>/api/generate</code></td><td>Ollama chat / generate, NDJSON streaming, tool calls with object arguments, <code>think</code>, images.</td></tr>
+      <tr><td><span class="method m-post">POST</span><code>/api/embed</code> · <code>/api/embeddings</code></td><td>Embeddings, new and legacy shapes.</td></tr>
+      <tr><td><span class="method m-get">GET</span><code>/api/tags</code> · <code>/api/ps</code> · <code>/api/version</code></td><td>Model listing, loaded models, version.</td></tr>
+      <tr><td><span class="method m-post">POST</span><code>/api/show</code> · <code>/api/pull</code></td><td>Model metadata; native HuggingFace pull by short name.</td></tr>
+    </table>
+
+    <h2 id="media">Media generation</h2>
+    <p>Each media endpoint accepts <code>"stream": true</code> for SSE progress events ending in a base64 <code>complete</code> payload; without it the response is the finished artifact. Load and unload media models like any other (<a href="#management">below</a>) — chat and media coexist in one process.</p>
+
+    <h3><span class="method m-post">POST</span><code>/v1/images/generations</code></h3>
+    <p>FLUX.2-klein and Krea-2-Turbo (<a href="../image-generation/">deep dive</a>). Returns base64 PNG.</p>
+    <table class="ep-table">
+      <tr><th>Field</th><th>Meaning</th></tr>
+      <tr><td><code>prompt</code></td><td>Required.</td></tr>
+      <tr><td><code>size</code></td><td><code>"WxH"</code>. Krea: any multiple of 16 in 256–2048; FLUX: 1024×1024.</td></tr>
+      <tr><td><code>image</code> + <code>mode</code></td><td>Base64 source image with <code>"variation"</code> (img2img, plus <code>strength</code> 0–1) or <code>"edit"</code> (FLUX.2 instruction edit — "make the hair blue" keeps subject and scene).</td></tr>
+      <tr><td><code>lora_path</code> / <code>lora_scale</code></td><td>Runtime style LoRA (<code>.safetensors</code>, diffusers layout) — no re-quantization, applied unfused.</td></tr>
+      <tr><td><code>cond_gain</code> / <code>cond_weights</code></td><td>Text-conditioning rebalance knobs.</td></tr>
+      <tr><td><code>steps</code>, <code>seed</code>, <code>safety</code></td><td>Sampler steps, reproducibility, NSFW filter (<code>false</code> to disable per request).</td></tr>
+    </table>
+
+    <h3><span class="method m-post">POST</span><code>/v1/audio/speech</code></h3>
+    <p>Qwen3-TTS text-to-speech and zero-shot voice cloning (<a href="../voice-cloning/">deep dive</a>). Returns WAV bytes.</p>
+    <table class="ep-table">
+      <tr><th>Field</th><th>Meaning</th></tr>
+      <tr><td><code>input</code></td><td>The text to speak. Required.</td></tr>
+      <tr><td><code>ref_audio</code></td><td>Optional base64 WAV (24 kHz mono) — a few seconds of any voice clones it zero-shot, no transcript needed.</td></tr>
+    </table>
+
+    <h3><span class="method m-post">POST</span><code>/v1/audio/music-generations</code></h3>
+    <p>ACE-Step text-to-music — describe a track, get 48 kHz stereo WAV (<a href="../music-generation/">deep dive</a>). New in v26.7.2.</p>
+    <table class="ep-table">
+      <tr><th>Field</th><th>Meaning</th></tr>
+      <tr><td><code>prompt</code></td><td>Style / genre / mood description. Required.</td></tr>
+      <tr><td><code>lyrics</code></td><td>Optional lyrics; empty means instrumental.</td></tr>
+      <tr><td><code>duration_seconds</code></td><td>10–600, default 60.</td></tr>
+      <tr><td><code>bpm</code> / <code>keyscale</code> / <code>timesignature</code></td><td>Musical steering — e.g. <code>120</code>, <code>"C major"</code>, <code>"4/4"</code>.</td></tr>
+      <tr><td><code>vocal_language</code>, <code>seed</code></td><td>Vocal language (default <code>"en"</code>); reproducibility.</td></tr>
+    </table>
+
+    <h3><span class="method m-post">POST</span><code>/v1/video/generations</code></h3>
+    <p>LTX-Video — text, image, or audio to video with synced sound (<a href="../video-generation/">deep dive</a>).</p>
+    <table class="ep-table">
+      <tr><th>Field</th><th>Meaning</th></tr>
+      <tr><td><code>prompt</code></td><td>Required. Quoted lines become spoken dialogue.</td></tr>
+      <tr><td><code>width</code> / <code>height</code> / <code>num_frames</code></td><td>Output geometry and length (24 fps).</td></tr>
+      <tr><td><code>pipeline</code></td><td><code>"one_stage"</code> (fast default), <code>"two_stage"</code>, <code>"two_stage_hq"</code> — dev-model guidance at half resolution, learned 2× upsample, distilled refine.</td></tr>
+      <tr><td><code>first_frame_image</code></td><td>Base64 photo pinned as frame 0 — image-to-video.</td></tr>
+      <tr><td><code>audio</code></td><td>Base64 WAV soundtrack the video performs to (two-stage only); the original clip is muxed into the MP4.</td></tr>
+      <tr><td><code>cfg_scale</code> / <code>stg_scale</code> / <code>cfg_audio_scale</code> / <code>steps</code> / <code>stage2_steps</code> / <code>seed</code></td><td>Guidance and sampler knobs; sensible per-pipeline defaults.</td></tr>
+    </table>
+
+    <h3><span class="method m-post">POST</span><code>/v1/3d/generations</code></h3>
+    <p>Hunyuan3D-2.1 — one photo in, a GLB mesh out; optional full-PBR texturing (<a href="../3d-generation/">deep dive</a>). New in v26.7.2.</p>
+    <table class="ep-table">
+      <tr><th>Field</th><th>Meaning</th></tr>
+      <tr><td><code>image</code></td><td>Base64 PNG/JPEG of the subject. Required. A cutout with transparency conditions best.</td></tr>
+      <tr><td><code>texture</code></td><td><code>true</code> runs the multiview paint stage — albedo + metallic-roughness baked into a 2K atlas (<code>texture_steps</code> to tune).</td></tr>
+      <tr><td><code>octree_resolution</code></td><td>Mesh detail, 64–512 (default 256; the app uses 384).</td></tr>
+      <tr><td><code>steps</code> / <code>guidance_scale</code> / <code>seed</code></td><td>Diffusion steps (default 30), guidance 0–20 (default 5), reproducibility.</td></tr>
+    </table>
+    <p>Response: <code>{"created": …, "format": "glb", "data": "&lt;base64 GLB&gt;"}</code> — standard glTF, opens anywhere.</p>
+
+    <h2 id="management">Model management</h2>
+    <table class="ep-table">
+      <tr><th>Endpoint</th><th>What it does</th></tr>
+      <tr><td><span class="method m-post">POST</span><code>/v1/load-model</code></td><td><code>{"model": "&lt;id or absolute path&gt;"}</code> — load a discovered model, or register + load one from anywhere on disk. Multiple models stay resident (LRU-evicted under a memory cap).</td></tr>
+      <tr><td><span class="method m-post">POST</span><code>/v1/unload-model</code></td><td><code>{"model": "&lt;id&gt;"}</code> — free a model's memory now.</td></tr>
+    </table>
+    <p class="note">Requests are queued per model and batch-decode together where the architecture allows; a media generation runs on the same GPU and briefly pauses chat decode — one machine, one memory budget, no surprises.</p>
+  </section>
+
+  <section class="section" style="padding-top: 0;">
+    <div class="cta-band reveal">
+      <h2>Point your code at your Mac.</h2>
+      <p>Download MLX Core or <code>brew install mlx-serve</code>, load a model, and every endpoint above is live on localhost.</p>
+      <div class="hero-ctas">
+        <a href="https://github.com/ddalcu/mlx-serve/releases/latest/download/MLXCore.dmg" class="btn btn-primary">Download for Mac</a>
+        <a href="../cli/" class="btn btn-secondary">CLI reference</a>
+      </div>
+    </div>
+  </section>
+
+  <footer>
+    <ul class="footer-links">
+      <li><a href="../">Home</a></li>
+      <li><a href="../cli/">CLI</a></li>
+      <li><a href="https://github.com/ddalcu/mlx-serve" target="_blank" rel="noopener">GitHub</a></li>
+      <li><a href="https://github.com/ddalcu/mlx-serve/releases" target="_blank" rel="noopener">Releases</a></li>
+      <li><a href="https://github.com/ddalcu/mlx-serve/blob/main/CHANGELOG.md" target="_blank" rel="noopener">Changelog</a></li>
+    </ul>
+    <p class="footer-copy">MIT License · mlx-serve · built for Apple Silicon</p>
+  </footer>
+
+  <script src="../assets/feature.js"></script>
+</body>
+</html>
