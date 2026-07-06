@@ -36,6 +36,7 @@ struct MLXCoreApp: App {
         return NSImage(systemSymbolName: "brain.head.profile", accessibilityDescription: "MLX Core")!
     }()
 
+    @NSApplicationDelegateAdaptor(MLXCoreAppDelegate.self) private var appDelegate
     @StateObject private var appState = AppState()
     @StateObject private var hfSearch = HFSearchService()
     @Environment(\.openWindow) private var openWindow
@@ -186,6 +187,7 @@ struct MLXCoreApp: App {
         Window("Audio Generation", id: "audioGen") {
             AudioGenView()
                 .environmentObject(appState.audioGen)
+                .environmentObject(appState.musicGen)
                 .environmentObject(appState.server)
                 .environmentObject(appState.downloads)
                 .environmentObject(appState)

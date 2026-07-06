@@ -45,6 +45,21 @@ let supportedModelTypes: Set<String> = [
     "gguf", "deepseek_v4",
 ]
 
+/// model_type prefixes/exact values for native media-generation checkpoints
+/// (image/audio/video/3D/music) served by the Zig gen engines, not the chat
+/// transformer. These are real, loadable downloads — just not chat models —
+/// so they must pass the architecture gate (not show "Unsupported
+/// architecture" in the Downloaded tab) while still being excluded from
+/// chat-model pickers (`LocalModel.isChatPickable` checks this separately).
+/// Mirrors `model_discovery.isMediaModelType` (Zig).
+private let mediaModelTypePrefixes: [String] = ["flux2", "krea", "hunyuan3d"]
+private let mediaModelTypeExactValues: Set<String> = ["qwen3_tts", "AudioVideo", "acestep"]
+
+func isMediaModelType(_ modelType: String) -> Bool {
+    if mediaModelTypeExactValues.contains(modelType) { return true }
+    return mediaModelTypePrefixes.contains { modelType.hasPrefix($0) }
+}
+
 struct HFModel: Identifiable, Codable {
     let id: String
     let downloads: Int?

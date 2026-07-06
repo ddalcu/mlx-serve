@@ -36,7 +36,7 @@ LOG="$(mktemp)"
 echo "→ starting mlx-serve on :$PORT with $MODEL"
 "$BIN" --model "$MODEL" --serve --port "$PORT" --log-level info > "$LOG" 2>&1 &
 SERVER_PID=$!
-cleanup() { kill "$SERVER_PID" 2>/dev/null; rm -f "$LOG"; }
+cleanup() { kill "$SERVER_PID" 2>/dev/null; rm -f "$LOG" "${LOG2:-}"; rm -rf "${SCRATCH:-}"; }
 trap cleanup EXIT
 
 # Wait for health (model load + Metal warmup can take a few seconds).
@@ -92,6 +92,52 @@ if [ -n "${C2:-}" ] && [ "${C2:-0}" -gt 0 ]; then
 else
     bad "prefix reuse (req2 should reuse the shared prefix)" "req1 cached_n=${C1:-?}, req2 cached_n=${C2:-?}; req2=$(echo "$REQ2" | head -c 200)"
 fi
+
+# 7. Issue #59: headless multi-model serve (`mlx-serve serve` over
+#    ~/.mlx-serve/models) must DISCOVER pulled GGUF dirs — which ship no
+#    config.json — and cold-load them on demand through the embedded engine.
+#    Simulate the pull layout in a scratch --model-dir: <org>/<repo>/<x>.gguf
+#    (symlinked — the discovery scan stats through links so multi-GB weights
+#    don't need copying).
+kill "$SERVER_PID" 2>/dev/null; wait "$SERVER_PID" 2>/dev/null
+MODEL_ABS="$(cd "$(dirname "$MODEL")" && pwd)/$(basename "$MODEL")"
+SCRATCH="$(mktemp -d)"
+mkdir -p "$SCRATCH/testorg/test-model-GGUF"
+ln -s "$MODEL_ABS" "$SCRATCH/testorg/test-model-GGUF/model.gguf"
+LOG2="$(mktemp)"
+echo "→ restarting headless on :$PORT with --model-dir $SCRATCH"
+"$BIN" --serve --port "$PORT" --model-dir "$SCRATCH" --log-level info > "$LOG2" 2>&1 &
+SERVER_PID=$!
+for i in $(seq 1 30); do
+    if curl -fs --max-time 2 "$BASE/health" 2>/dev/null | grep -q '"ok"'; then break; fi
+    if ! kill -0 "$SERVER_PID" 2>/dev/null; then echo -e "${RED}headless server died${NC}"; tail -20 "$LOG2"; exit 1; fi
+    sleep 1
+done
+
+assert_contains "headless boot discovers the GGUF dir"      "Discovered 1 model" "$(cat "$LOG2")"
+STUBS="$(curl -fs --max-time 5 "$BASE/v1/models")"
+assert_contains "stub listed under its org/repo id"         'testorg/test-model-GGUF' "$STUBS"
+assert_contains "stub advertises gguf architecture"         '"architecture":"gguf"'   "$STUBS"
+assert_contains "stub advertises chat capability"           '"chat"'                  "$STUBS"
+
+# Cold-load on first use: naming the discovered id must open the llama
+# engine on demand (no --model at boot) and answer.
+COLD="$(curl -fs --max-time 120 "$BASE/v1/chat/completions" -H 'Content-Type: application/json' \
+    -d '{"model":"testorg/test-model-GGUF","messages":[{"role":"user","content":"Reply with exactly: hello"}],"max_tokens":16,"temperature":0}')"
+assert_contains "cold-loaded chat answers"                  '"content"'               "$COLD"
+assert_contains "cold load engaged the llama engine"        "\[llama\] engine ready"  "$(cat "$LOG2")"
+READY="$(curl -fs --max-time 5 "$BASE/v1/models")"
+assert_contains "entry now ready"                           '"state":"ready"'         "$READY"
+
+# Unload returns the entry to a reloadable stub; a follow-up request
+# cold-loads it again (the reload path frees + rebuilds the engine).
+curl -fs --max-time 60 -X POST "$BASE/v1/unload-model" -H 'Content-Type: application/json' \
+    -d '{"model":"testorg/test-model-GGUF"}' > /dev/null
+UNLOADED="$(curl -fs --max-time 5 "$BASE/v1/models")"
+assert_contains "unload returns entry to stub"              '"state":"unloaded"'      "$UNLOADED"
+RELOAD="$(curl -fs --max-time 120 "$BASE/v1/chat/completions" -H 'Content-Type: application/json' \
+    -d '{"model":"testorg/test-model-GGUF","messages":[{"role":"user","content":"Say hi"}],"max_tokens":8,"temperature":0}')"
+assert_contains "reload after unload answers"               '"content"'               "$RELOAD"
 
 echo ""
 echo -e "  ${GREEN}$PASS passed${NC}, $([ "$FAIL" -gt 0 ] && echo -e "${RED}$FAIL failed${NC}" || echo "0 failed")"

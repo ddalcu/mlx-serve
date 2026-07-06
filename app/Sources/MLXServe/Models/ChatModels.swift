@@ -525,18 +525,20 @@ struct LocalModel: Identifiable, Hashable {
     var activeExperts: Int? = nil
 
     var isSupportedArchitecture: Bool {
-        supportedModelTypes.contains(modelType)
+        supportedModelTypes.contains(modelType) || isMediaModelType(modelType)
     }
 
     /// Offerable by chat-model pickers (tray menu, task sheet, auto-select):
     /// a base checkpoint whose architecture serves chat completions. Excludes
-    /// drafters, media models (LTX "AudioVideo", FLUX/Krea, Qwen3-TTS), the
-    /// Falconsai NSFW classifier ("vit"), and embeddings-only "bert" encoders
-    /// — those live under ~/.mlx-serve/models as gen-pane / doc-RAG
-    /// dependencies and load by path, never as the tray's primary model. The
-    /// Model Browser's Downloaded tab still lists them (size + delete).
+    /// drafters, media models (LTX "AudioVideo", FLUX/Krea, Qwen3-TTS,
+    /// Hunyuan3D, AceStep), the Falconsai NSFW classifier ("vit"), and
+    /// embeddings-only "bert" encoders — those live under ~/.mlx-serve/models
+    /// as gen-pane / doc-RAG dependencies and load by path, never as the
+    /// tray's primary model. The Model Browser's Downloaded tab still lists
+    /// them (size + delete) and, since they ARE supported architectures,
+    /// no longer flags them "Unsupported".
     var isChatPickable: Bool {
-        kind == .base && isSupportedArchitecture && modelType != "bert"
+        kind == .base && isSupportedArchitecture && modelType != "bert" && !isMediaModelType(modelType)
     }
 
     /// Likely tool/function-calling support (name heuristic, shared with the

@@ -227,6 +227,20 @@ final class DownloadManagerLayoutTests: XCTestCase {
         }
     }
 
+    func testMediaModelTypesAreSupportedArchitectures() {
+        // Native media-gen checkpoints (3D shape+paint, image, video, TTS,
+        // music) are real, loadable models — just not chat models. They must
+        // NOT be flagged "Unsupported architecture" in the Downloaded tab.
+        // Mirrors `model_discovery.isMediaModelType` (Zig).
+        for mt in ["hunyuan3d_2_1", "hunyuan3d_2_1_paint", "krea2_turbo", "AudioVideo", "qwen3_tts", "flux2-klein-4b", "acestep"] {
+            let m = LocalModel(
+                id: "test:\(mt)", name: mt, path: "/tmp/\(mt)",
+                sizeFormatted: "1 GB", modelType: mt, source: .custom, kind: .base
+            )
+            XCTAssertTrue(m.isSupportedArchitecture, "\"\(mt)\" must be a recognized media model type")
+        }
+    }
+
     func testGemma3TextIsSupportedArchitecture() {
         // Text-only Gemma 3 (Gemma3ForCausalLM) ships model_type "gemma3_text"
         // — e.g. mlx-community/gemma-3-12b-it-qat-abliterated-lm-4bit. A locally

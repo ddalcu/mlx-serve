@@ -31,6 +31,7 @@ const supported_model_types = [_][]const u8{
     "gemma3",       "gemma3_text",
     "gemma4",       "gemma4_text",
     "gemma4_unified", "gemma4_unified_text",
+    "diffusion_gemma",
     "qwen2",
     "qwen3",        "qwen3_5",        "qwen3_5_text",
     "qwen3_5_moe",  "qwen3_5_moe_text",
@@ -52,6 +53,7 @@ pub fn isMediaModelType(model_type: []const u8) bool {
     return std.mem.startsWith(u8, model_type, "flux2") or
         std.mem.startsWith(u8, model_type, "krea") or
         std.mem.eql(u8, model_type, "qwen3_tts") or
+        std.mem.eql(u8, model_type, "acestep") or
         std.mem.eql(u8, model_type, "AudioVideo") or
         std.mem.startsWith(u8, model_type, "hunyuan3d");
 }
@@ -132,6 +134,219 @@ fn peekConfig(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir, entry_n
         }
     }
     return .{ .supported = allocator.dupe(u8, mt_val.string) catch return .missing_or_unparseable };
+}
+
+/// Result of scanning a directory for LLM `.gguf` files (mmproj sidecars
+/// excluded). `pick` is the alphabetically-smallest LLM gguf basename — the
+/// same deterministic file `resolveGgufFile` loads — so callers can report
+/// the bytes that will actually become resident, not the sum of every quant
+/// in a multi-quant repo.
+const GgufScan = struct {
+    pick: ?[]u8 = null,
+    pick_bytes: u64 = 0,
+    saw_mmproj: bool = false,
+};
+
+/// Scan an iterable dir for LLM `.gguf` entries. Symlinked files count
+/// (statFile follows links) — users symlink multi-GB weights rather than
+/// copy them. Caller frees `pick`.
+fn scanLlmGguf(io: std.Io, allocator: std.mem.Allocator, dir: *std.Io.Dir) !GgufScan {
+    var scan: GgufScan = .{};
+    errdefer if (scan.pick) |p| allocator.free(p);
+    var it = dir.iterate();
+    while (it.next(io) catch null) |entry| {
+        if (!std.mem.endsWith(u8, entry.name, ".gguf")) continue;
+        if (isMmprojGgufBasename(entry.name)) {
+            scan.saw_mmproj = true;
+            continue;
+        }
+        const st = dir.statFile(io, entry.name, .{}) catch continue;
+        if (st.kind != .file) continue;
+        if (scan.pick == null or std.mem.lessThan(u8, entry.name, scan.pick.?)) {
+            if (scan.pick) |p| allocator.free(p);
+            scan.pick = try allocator.dupe(u8, entry.name);
+            scan.pick_bytes = @intCast(st.size);
+        }
+    }
+    return scan;
+}
+
+/// True if `path` points at a .gguf file or a directory containing an LLM
+/// one (mmproj sidecars don't count — a folder holding only an mmproj file
+/// is not a valid LLM path). Accepts directories so users can pass the
+/// canonical `~/.mlx-serve/models/<owner>/<repo>/` shape.
+///
+/// Empty / non-absolute paths (e.g. headless boot with no --model) return
+/// false — guarded BEFORE `openDirAbsolute`, which ASSERTS the path is
+/// absolute (`unreachable` on "") and in ReleaseFast that's UB that
+/// miscompiles the caller (see the openDirAbsolute gotcha in CLAUDE.md).
+pub fn isGgufModelPath(io: std.Io, path: []const u8) bool {
+    if (path.len == 0 or !std.fs.path.isAbsolute(path)) return false;
+    // A direct .gguf file path always routes to the gguf branch so
+    // `resolveGgufFile` can emit a precise error if it's actually an
+    // mmproj sidecar (falling through to the MLX path would produce an
+    // opaque "no config.json" failure instead).
+    if (std.mem.endsWith(u8, path, ".gguf")) return true;
+    var dir = std.Io.Dir.openDirAbsolute(io, path, .{ .iterate = true }) catch return false;
+    defer dir.close(io);
+    var it = dir.iterate();
+    while (it.next(io) catch null) |entry| {
+        if (!std.mem.endsWith(u8, entry.name, ".gguf")) continue;
+        if (isMmprojGgufBasename(entry.name)) continue;
+        const st = dir.statFile(io, entry.name, .{}) catch continue;
+        if (st.kind == .file) return true;
+    }
+    return false;
+}
+
+/// Resolve the actual .gguf file path. When `path` is a directory, return
+/// the alphabetically-smallest non-mmproj `.gguf` entry within it (caller
+/// frees) — deterministic so "load order depends on readdir(3) iteration
+/// order" can't happen and the user can predict which quant loads when both
+/// `Q4_K_M.gguf` and `Q8_0.gguf` sit in one folder. When `path` is already
+/// a file, return a dup. Errors:
+///   error.NoGgufFile         — no .gguf files at all
+///   error.OnlyMmprojGgufFile — directory (or path) had only mmproj sidecars
+///
+/// Does NOT log on error — the caller decides whether the error is "fatal
+/// user load" (then call `logResolveGgufError`) or "silent probe".
+pub fn resolveGgufFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8) ![]u8 {
+    if (std.mem.endsWith(u8, path, ".gguf")) {
+        if (isMmprojGgufBasename(std.fs.path.basename(path))) {
+            return error.OnlyMmprojGgufFile;
+        }
+        return allocator.dupe(u8, path);
+    }
+    var dir = try std.Io.Dir.openDirAbsolute(io, path, .{ .iterate = true });
+    defer dir.close(io);
+    const scan = try scanLlmGguf(io, allocator, &dir);
+    if (scan.pick) |p| {
+        defer allocator.free(p);
+        return std.fmt.allocPrint(allocator, "{s}/{s}", .{ trimTrailingSlash(path), p });
+    }
+    if (scan.saw_mmproj) return error.OnlyMmprojGgufFile;
+    return error.NoGgufFile;
+}
+
+/// Emit a user-facing, actionable error message for the failures
+/// `resolveGgufFile` can return. Call from the fatal load path; probes
+/// should NOT log and let the eventual resolveGgufFile re-attempt surface
+/// the error once.
+pub fn logResolveGgufError(path: []const u8, err: anyerror) void {
+    switch (err) {
+        error.OnlyMmprojGgufFile => {
+            // Discriminate between "user pointed at the mmproj file
+            // directly" and "directory had only mmproj sidecars".
+            if (std.mem.endsWith(u8, path, ".gguf")) {
+                log.err("'{s}' is an mmproj sidecar (CLIP vision/audio encoder), not an LLM. Point at the language-model .gguf (typically the same directory, e.g. `*-Q4_K_M.gguf`).\n", .{path});
+            } else {
+                log.err("'{s}' contains only mmproj sidecars (multimodal projection / CLIP encoders). Download or move the matching language-model .gguf (e.g. `*-Q4_K_M.gguf`) into this directory.\n", .{path});
+            }
+        },
+        error.NoGgufFile => log.err("'{s}' contains no .gguf files.\n", .{path}),
+        else => log.err("resolveGgufFile('{s}'): {s}\n", .{ path, @errorName(err) }),
+    }
+}
+
+/// Coarse classification of a model for UX surfaces — the `mlx-serve list`
+/// TYPE column and the `run` chat-REPL preflight. Mirrors how serving
+/// actually routes the directory (media engines, embedded GGUF engines,
+/// encoder-only, drafter sidecars).
+pub const ModelKind = enum {
+    chat,
+    image,
+    audio,
+    video,
+    mesh,
+    embed,
+    drafter,
+    unsupported,
+
+    /// Short label for the `list` TYPE column.
+    pub fn label(self: ModelKind) []const u8 {
+        return switch (self) {
+            .chat => "chat",
+            .image => "image",
+            .audio => "audio",
+            .video => "video",
+            .mesh => "3d",
+            .embed => "embed",
+            .drafter => "drafter",
+            .unsupported => "unsupported",
+        };
+    }
+
+    /// Human phrase for refusal messages ("'X' is <describe>").
+    pub fn describe(self: ModelKind) []const u8 {
+        return switch (self) {
+            .chat => "a chat model",
+            .image => "an image generation model",
+            .audio => "an audio generation model",
+            .video => "a video generation model",
+            .mesh => "a 3D generation model",
+            .embed => "an embedding encoder (use /v1/embeddings)",
+            .drafter => "a speculative-decoding drafter sidecar, not a standalone model (load it via --drafter beside a Gemma 4 target)",
+            .unsupported => "an architecture mlx-serve does not support",
+        };
+    }
+
+    /// The generation endpoint that DOES serve this kind, when one exists.
+    pub fn genEndpoint(self: ModelKind) ?[]const u8 {
+        return switch (self) {
+            .image => "/v1/images/generations",
+            .audio => "/v1/audio/speech (TTS) or /v1/audio/music-generations (music)",
+            .video => "/v1/video/generations",
+            .mesh => "/v1/3d/generations",
+            else => null,
+        };
+    }
+};
+
+/// Map a config.json `model_type` to its ModelKind. "gguf" is the synthetic
+/// type discovery assigns to GGUF dirs — chat via the embedded engines.
+pub fn modelKindFromType(model_type: []const u8) ModelKind {
+    if (std.mem.eql(u8, model_type, "bert")) return .embed;
+    if (std.mem.endsWith(u8, model_type, "_assistant")) return .drafter;
+    if (std.mem.startsWith(u8, model_type, "flux2") or
+        std.mem.startsWith(u8, model_type, "krea")) return .image;
+    if (std.mem.eql(u8, model_type, "qwen3_tts") or
+        std.mem.eql(u8, model_type, "acestep")) return .audio;
+    if (std.mem.eql(u8, model_type, "AudioVideo")) return .video;
+    if (std.mem.startsWith(u8, model_type, "hunyuan3d")) return .mesh;
+    if (std.mem.eql(u8, model_type, "gguf")) return .chat;
+    if (isSupportedModelType(model_type)) return .chat;
+    return .unsupported;
+}
+
+/// Classify an ABSOLUTE model dir. An LLM `.gguf` wins (embedded chat
+/// engine — same precedence as routing); else config.json's model_type;
+/// null when the dir is not model-shaped at all.
+pub fn classifyModelPath(io: std.Io, allocator: std.mem.Allocator, abs_path: []const u8) ?ModelKind {
+    if (abs_path.len == 0 or !std.fs.path.isAbsolute(abs_path)) return null;
+    if (isGgufModelPath(io, abs_path)) return .chat;
+    const trimmed = trimTrailingSlash(abs_path);
+    const base = std.fs.path.basename(trimmed);
+    const parent = std.fs.path.dirname(trimmed) orelse return null;
+    if (base.len == 0 or parent.len == 0) return null;
+    var dir = std.Io.Dir.openDirAbsolute(io, parent, .{}) catch return null;
+    defer dir.close(io);
+    return switch (peekConfig(io, allocator, dir, base)) {
+        .missing_or_unparseable => null,
+        // Raw model_type still classifies the KIND even when serving would
+        // skip it (drafters, vit, ...) — that's exactly what the label is for.
+        .unsupported_arch => |mt| blk: {
+            defer allocator.free(mt);
+            break :blk modelKindFromType(mt);
+        },
+        .unsupported_quant => |mode| blk: {
+            allocator.free(mode);
+            break :blk .unsupported;
+        },
+        .supported => |mt| blk: {
+            defer allocator.free(mt);
+            break :blk modelKindFromType(mt);
+        },
+    };
 }
 
 pub const DiscoveredModel = struct {
@@ -254,9 +469,10 @@ pub fn discoverModelsInDir(io: std.Io, allocator: std.mem.Allocator, dir: std.Io
 }
 
 /// Inspect `parent/<name>` as a model-dir candidate; append to `found` if
-/// it holds a supported config.json. Returns true when the dir was
-/// model-shaped (config.json present — even if unsupported), so callers
-/// know not to descend into it looking for an org layout.
+/// it holds an LLM `.gguf` or a supported config.json. Returns true when
+/// the dir was model-shaped (gguf present, or config.json present — even
+/// if unsupported), so callers know not to descend into it looking for an
+/// org layout.
 fn tryAddModel(
     io: std.Io,
     allocator: std.mem.Allocator,
@@ -266,49 +482,68 @@ fn tryAddModel(
     model_dir: []const u8,
     found: *std.ArrayList(DiscoveredModel),
 ) !bool {
-    var sub = parent.openDir(io, name, .{}) catch return false;
+    var sub = parent.openDir(io, name, .{ .iterate = true }) catch return false;
     defer sub.close(io);
 
-    const cfg_stat = sub.statFile(io, "config.json", .{}) catch return false;
-    if (cfg_stat.kind != .file) return false;
+    var bytes: u64 = 0;
+    var bytes_ok = false;
 
-    // Filter by supported model_type AND quantization scheme. Catches:
-    //   - partially-downloaded checkpoints (missing/garbage config)
-    //   - unsupported arches (e.g. deepseek_v4, MLA + indexer)
-    //   - unsupported quants (modes outside supported_quant_modes)
-    // before they reach the tokenizer/weight loaders.
-    const model_type: []const u8 = switch (peekConfig(io, allocator, parent, name)) {
-        .missing_or_unparseable => {
-            log.info("[discovery] skip {s}: config.json missing or unparseable", .{name});
-            return true;
-        },
-        .unsupported_arch => |mt| {
-            defer allocator.free(mt);
-            log.info("[discovery] skip {s}: unsupported model_type '{s}'", .{ name, mt });
-            return true;
-        },
-        .unsupported_quant => |mode| {
-            defer allocator.free(mode);
-            log.info("[discovery] skip {s}: unsupported quantization mode '{s}' (supported: affine, nvfp4, mxfp4, mxfp8)", .{ name, mode });
-            return true;
-        },
-        .supported => |mt| mt, // ownership moves to the DiscoveredModel
+    // GGUF first (issue #59) — mirrors `--model` routing, where isGgufPath
+    // is checked BEFORE any config.json parse ("GGUF files bypass the MLX
+    // dispatch entirely"). Pulled GGUF repos usually ship no config.json at
+    // all, and the ones that do (unsloth) ship the ORIGINAL model's — an
+    // MLX classification would cold-load into a missing-safetensors failure.
+    const model_type: []const u8 = blk: {
+        const scan = scanLlmGguf(io, allocator, &sub) catch GgufScan{};
+        if (scan.pick) |p| {
+            allocator.free(p);
+            bytes = scan.pick_bytes;
+            bytes_ok = true;
+            break :blk try allocator.dupe(u8, "gguf");
+        }
+
+        const cfg_stat = sub.statFile(io, "config.json", .{}) catch return false;
+        if (cfg_stat.kind != .file) return false;
+
+        // Filter by supported model_type AND quantization scheme. Catches:
+        //   - partially-downloaded checkpoints (missing/garbage config)
+        //   - unsupported arches (e.g. deepseek_v4, MLA + indexer)
+        //   - unsupported quants (modes outside supported_quant_modes)
+        // before they reach the tokenizer/weight loaders.
+        break :blk switch (peekConfig(io, allocator, parent, name)) {
+            .missing_or_unparseable => {
+                log.info("[discovery] skip {s}: config.json missing or unparseable", .{name});
+                return true;
+            },
+            .unsupported_arch => |mt| {
+                defer allocator.free(mt);
+                log.info("[discovery] skip {s}: unsupported model_type '{s}'", .{ name, mt });
+                return true;
+            },
+            .unsupported_quant => |mode| {
+                defer allocator.free(mode);
+                log.info("[discovery] skip {s}: unsupported quantization mode '{s}' (supported: affine, nvfp4, mxfp4, mxfp8)", .{ name, mode });
+                return true;
+            },
+            .supported => |mt| mt, // ownership moves to the DiscoveredModel
+        };
     };
     errdefer if (model_type.len > 0) allocator.free(model_type);
 
     // Compute weight bytes (sum of *.safetensors sizes) — best-effort.
-    var bytes: u64 = 0;
-    var bytes_ok = false;
-    var sub_iter_dir = parent.openDir(io, name, .{ .iterate = true }) catch null;
-    if (sub_iter_dir) |*sd| {
-        defer sd.close(io);
-        var sd_iter = sd.iterate();
-        while (sd_iter.next(io) catch null) |sub_entry| {
-            if (sub_entry.kind != .file) continue;
-            if (!std.mem.endsWith(u8, sub_entry.name, ".safetensors")) continue;
-            const st = sd.statFile(io, sub_entry.name, .{}) catch continue;
-            bytes += @intCast(st.size);
-            bytes_ok = true;
+    // GGUF entries already carry the picked file's size instead.
+    if (!bytes_ok) {
+        var sub_iter_dir = parent.openDir(io, name, .{ .iterate = true }) catch null;
+        if (sub_iter_dir) |*sd| {
+            defer sd.close(io);
+            var sd_iter = sd.iterate();
+            while (sd_iter.next(io) catch null) |sub_entry| {
+                if (sub_entry.kind != .file) continue;
+                if (!std.mem.endsWith(u8, sub_entry.name, ".safetensors")) continue;
+                const st = sd.statFile(io, sub_entry.name, .{}) catch continue;
+                bytes += @intCast(st.size);
+                bytes_ok = true;
+            }
         }
     }
 
@@ -357,6 +592,20 @@ pub fn probeModelDir(io: std.Io, allocator: std.mem.Allocator, abs_path: []const
 
     var dir = std.Io.Dir.openDirAbsolute(io, parent, .{}) catch return error.ModelDirNotFound;
     defer dir.close(io);
+
+    // GGUF first — same precedence as tryAddModel and `--model` routing.
+    gguf: {
+        var sub = dir.openDir(io, base, .{ .iterate = true }) catch break :gguf;
+        defer sub.close(io);
+        const scan = scanLlmGguf(io, allocator, &sub) catch break :gguf;
+        if (scan.pick) |p| {
+            allocator.free(p);
+            return .{
+                .model_type = try allocator.dupe(u8, "gguf"),
+                .bytes_on_disk = scan.pick_bytes,
+            };
+        }
+    }
 
     const model_type: []const u8 = switch (peekConfig(io, allocator, dir, base)) {
         .missing_or_unparseable => return error.ModelDirNotFound,
@@ -525,6 +774,196 @@ test "discoverModels finds flat and org/repo model dirs" {
     try std.testing.expectEqualStrings("qwen3", result.models[1].model_type);
 }
 
+test "discoverModels finds GGUF dirs without config.json (issue #59)" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    // Pulled GGUF repo layout: `<org>/<repo>/<quant>.gguf`, NO config.json
+    // (bartowski / unsloth-style multi-quant repos ship only .gguf files).
+    // `mlx-serve list` already counts these as models; discovery must agree.
+    try tmp.dir.createDirPath(io, "bartowski/some-model-GGUF");
+    try tmp.dir.writeFile(io, .{ .sub_path = "bartowski/some-model-GGUF/model-IQ2_M.gguf", .data = "0123" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "bartowski/some-model-GGUF/model-Q4_K_M.gguf", .data = "01234567" });
+    // Flat single-file layout.
+    try tmp.dir.createDirPath(io, "flat-gguf");
+    try tmp.dir.writeFile(io, .{ .sub_path = "flat-gguf/tiny.gguf", .data = "x" });
+    // mmproj sidecar ONLY → not an LLM dir, must not be discovered.
+    try tmp.dir.createDirPath(io, "sidecar-only");
+    try tmp.dir.writeFile(io, .{ .sub_path = "sidecar-only/mmproj-foo.gguf", .data = "x" });
+    // Interrupted pull → .partial is not a .gguf, must not be discovered.
+    try tmp.dir.createDirPath(io, "partial");
+    try tmp.dir.writeFile(io, .{ .sub_path = "partial/model.gguf.partial", .data = "x" });
+
+    var result = try discoverModelsInDir(io, allocator, tmp.dir, "/root");
+    defer result.deinit();
+
+    try testing.expectEqual(@as(usize, 2), result.models.len);
+    try testing.expectEqualStrings("bartowski/some-model-GGUF", result.models[0].id);
+    try testing.expectEqualStrings("gguf", result.models[0].model_type);
+    // bytes = the file the loader will pick (alphabetically-smallest LLM
+    // .gguf — resolveGgufFile's rule), NOT the sum of every quant in the dir.
+    try testing.expectEqual(@as(?u64, 4), result.models[0].bytes_on_disk);
+    try testing.expectEqualStrings("flat-gguf", result.models[1].id);
+    try testing.expectEqualStrings("gguf", result.models[1].model_type);
+}
+
+test "discoverModels: a .gguf beside config.json wins (mirrors --model routing)" {
+    // `--model <dir>` checks isGgufPath BEFORE parsing config.json, so a dir
+    // holding both routes to the embedded engine. Discovery must classify it
+    // identically — some GGUF repos (unsloth) ship the original config.json
+    // next to the quants, and an MLX classification would cold-load into a
+    // missing-safetensors failure.
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "both");
+    try tmp.dir.writeFile(io, .{ .sub_path = "both/config.json", .data = "{\"model_type\":\"qwen3\"}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "both/model-Q4_K_M.gguf", .data = "01234567" });
+
+    var result = try discoverModelsInDir(io, allocator, tmp.dir, "/root");
+    defer result.deinit();
+
+    try testing.expectEqual(@as(usize, 1), result.models.len);
+    try testing.expectEqualStrings("gguf", result.models[0].model_type);
+}
+
+test "probeModelDir accepts a GGUF dir (register-by-path / /api/pull)" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "some-model-GGUF");
+    try tmp.dir.writeFile(io, .{ .sub_path = "some-model-GGUF/model-Q4_K_M.gguf", .data = "01234567" });
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &path_buf);
+    const abs = try std.fmt.allocPrint(allocator, "{s}/some-model-GGUF", .{path_buf[0..root_len]});
+    defer allocator.free(abs);
+
+    const probe = try probeModelDir(io, allocator, abs);
+    defer allocator.free(probe.model_type);
+    try testing.expectEqualStrings("gguf", probe.model_type);
+    try testing.expectEqual(@as(?u64, 8), probe.bytes_on_disk);
+}
+
+test "resolveGgufFile: deterministic pick, mmproj filtering, precise errors" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "multi");
+    try tmp.dir.writeFile(io, .{ .sub_path = "multi/model-Q8_0.gguf", .data = "x" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "multi/model-Q4_K_M.gguf", .data = "x" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "multi/mmproj-model.gguf", .data = "x" });
+    try tmp.dir.createDirPath(io, "sidecar-only");
+    try tmp.dir.writeFile(io, .{ .sub_path = "sidecar-only/mmproj-foo.gguf", .data = "x" });
+    try tmp.dir.createDirPath(io, "empty");
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &path_buf);
+    const root = path_buf[0..root_len];
+
+    // Directory: alphabetically-smallest non-mmproj .gguf wins.
+    const multi = try std.fmt.allocPrint(allocator, "{s}/multi", .{root});
+    defer allocator.free(multi);
+    const picked = try resolveGgufFile(io, allocator, multi);
+    defer allocator.free(picked);
+    try testing.expect(std.mem.endsWith(u8, picked, "/multi/model-Q4_K_M.gguf"));
+    try testing.expect(isGgufModelPath(io, multi));
+
+    // Direct file path: dup'd through; mmproj file rejected precisely.
+    const direct = try std.fmt.allocPrint(allocator, "{s}/multi/model-Q8_0.gguf", .{root});
+    defer allocator.free(direct);
+    const direct_res = try resolveGgufFile(io, allocator, direct);
+    defer allocator.free(direct_res);
+    try testing.expectEqualStrings(direct, direct_res);
+    const mmproj_file = try std.fmt.allocPrint(allocator, "{s}/multi/mmproj-model.gguf", .{root});
+    defer allocator.free(mmproj_file);
+    try testing.expectError(error.OnlyMmprojGgufFile, resolveGgufFile(io, allocator, mmproj_file));
+
+    // Sidecar-only dir vs genuinely empty dir: distinct errors, and neither
+    // counts as a GGUF model path.
+    const sidecar = try std.fmt.allocPrint(allocator, "{s}/sidecar-only", .{root});
+    defer allocator.free(sidecar);
+    try testing.expectError(error.OnlyMmprojGgufFile, resolveGgufFile(io, allocator, sidecar));
+    try testing.expect(!isGgufModelPath(io, sidecar));
+    const empty = try std.fmt.allocPrint(allocator, "{s}/empty", .{root});
+    defer allocator.free(empty);
+    try testing.expectError(error.NoGgufFile, resolveGgufFile(io, allocator, empty));
+    try testing.expect(!isGgufModelPath(io, empty));
+
+    // Empty / relative paths: never a GGUF path (the openDirAbsolute
+    // ReleaseFast-UB guard).
+    try testing.expect(!isGgufModelPath(io, ""));
+    try testing.expect(!isGgufModelPath(io, "relative/dir"));
+}
+
+test "modelKindFromType labels every family (list TYPE column + run preflight)" {
+    // Chat: MLX archs, the synthetic gguf type, and DiffusionGemma (which
+    // was missing from the discovery allowlist despite being servable).
+    try testing.expectEqual(ModelKind.chat, modelKindFromType("gemma4"));
+    try testing.expectEqual(ModelKind.chat, modelKindFromType("qwen3_5_moe"));
+    try testing.expectEqual(ModelKind.chat, modelKindFromType("gguf"));
+    try testing.expectEqual(ModelKind.chat, modelKindFromType("diffusion_gemma"));
+    try testing.expect(isSupportedModelType("diffusion_gemma"));
+    // Media modalities.
+    try testing.expectEqual(ModelKind.image, modelKindFromType("flux2-klein-4b"));
+    try testing.expectEqual(ModelKind.image, modelKindFromType("krea2_turbo"));
+    try testing.expectEqual(ModelKind.audio, modelKindFromType("qwen3_tts"));
+    try testing.expectEqual(ModelKind.audio, modelKindFromType("acestep"));
+    try testing.expectEqual(ModelKind.video, modelKindFromType("AudioVideo"));
+    try testing.expectEqual(ModelKind.mesh, modelKindFromType("hunyuan3d_2_1"));
+    // Encoders, drafter sidecars, and genuinely unsupported archs.
+    try testing.expectEqual(ModelKind.embed, modelKindFromType("bert"));
+    try testing.expectEqual(ModelKind.drafter, modelKindFromType("gemma4_assistant"));
+    try testing.expectEqual(ModelKind.drafter, modelKindFromType("gemma4_unified_assistant"));
+    try testing.expectEqual(ModelKind.unsupported, modelKindFromType("vit"));
+    // Labels stay column-friendly.
+    try testing.expectEqualStrings("3d", ModelKind.mesh.label());
+    try testing.expectEqualStrings("chat", ModelKind.chat.label());
+}
+
+test "classifyModelPath: gguf/media/drafter dirs classify; junk is null" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "g");
+    try tmp.dir.writeFile(io, .{ .sub_path = "g/model-Q4_K_M.gguf", .data = "x" });
+    try tmp.dir.createDirPath(io, "img");
+    try tmp.dir.writeFile(io, .{ .sub_path = "img/config.json", .data = "{\"model_type\":\"flux2-klein-4b\"}" });
+    try tmp.dir.createDirPath(io, "drafter");
+    try tmp.dir.writeFile(io, .{ .sub_path = "drafter/config.json", .data = "{\"model_type\":\"gemma4_assistant\"}" });
+    try tmp.dir.createDirPath(io, "junk");
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &path_buf);
+    const root = path_buf[0..root_len];
+
+    const cases = .{
+        .{ "g", ModelKind.chat },
+        .{ "img", ModelKind.image },
+        .{ "drafter", ModelKind.drafter },
+    };
+    inline for (cases) |c| {
+        const p = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ root, c[0] });
+        defer allocator.free(p);
+        try testing.expectEqual(c[1], classifyModelPath(io, allocator, p).?);
+    }
+    const junk = try std.fmt.allocPrint(allocator, "{s}/junk", .{root});
+    defer allocator.free(junk);
+    try testing.expect(classifyModelPath(io, allocator, junk) == null);
+    try testing.expect(classifyModelPath(io, allocator, "") == null);
+    try testing.expect(classifyModelPath(io, allocator, "rel/path") == null);
+}
+
 test "trimTrailingSlash" {
     try testing.expectEqualStrings("foo", trimTrailingSlash("foo/"));
     try testing.expectEqualStrings("foo", trimTrailingSlash("foo//"));
@@ -601,6 +1040,8 @@ test "isSupportedModelType accepts native media archs (image/audio/video)" {
     try testing.expect(isSupportedModelType("krea2_turbo"));
     try testing.expect(isMediaModelType("hunyuan3d_2_1"));
     try testing.expect(isSupportedModelType("hunyuan3d_2_1"));
+    try testing.expect(isMediaModelType("acestep"));
+    try testing.expect(isSupportedModelType("acestep"));
     try testing.expect(!isMediaModelType("gemma4"));
 }
 

@@ -1288,7 +1288,11 @@ private struct VoiceCloneSectionContent: View {
             HStack(spacing: 8) {
                 if !appState.serverOptions.voiceClonePath.isEmpty {
                     Image(systemName: "waveform").foregroundStyle(.secondary)
-                    Text((appState.serverOptions.voiceClonePath as NSString).lastPathComponent)
+                    // Prefer the display label — the stored file is always the
+                    // normalized "voice-clone.wav", which says nothing.
+                    Text(appState.serverOptions.voiceCloneLabel.isEmpty
+                         ? (appState.serverOptions.voiceClonePath as NSString).lastPathComponent
+                         : appState.serverOptions.voiceCloneLabel)
                         .font(.caption).lineLimit(1).truncationMode(.middle)
                     Button { clearVoice() } label: { Image(systemName: "xmark.circle.fill") }
                         .buttonStyle(.borderless).foregroundStyle(.secondary)
@@ -1319,13 +1323,11 @@ private struct VoiceCloneSectionContent: View {
 
     private func chooseVoiceFile() {
         voiceError = nil
-        let panel = NSOpenPanel()
-        panel.allowedContentTypes = [.audio, .wav, .mp3, .mpeg4Audio, .aiff]
-        panel.canChooseFiles = true; panel.canChooseDirectories = false
-        guard panel.runModal() == .OK, let url = panel.url else { return }
         do {
-            let normalized = try AudioReference.normalizedReferenceWav(fromFile: url)
-            appState.serverOptions.voiceClonePath = VoiceCloneClipStore.persist(normalized)
+            guard let picked = try VoiceCloneMenuModel.pickAndPersistClip() else { return }
+            appState.serverOptions.voiceClonePath = picked.path
+            appState.serverOptions.voiceCloneLabel = picked.label
+            appState.serverOptions.voiceCloneEnabled = true
         } catch {
             voiceError = error.localizedDescription
         }
@@ -1348,12 +1350,17 @@ private struct VoiceCloneSectionContent: View {
         do {
             let normalized = try AudioReference.normalizedReferenceWav(fromRecordedPCM: data)
             appState.serverOptions.voiceClonePath = VoiceCloneClipStore.persist(normalized)
+            appState.serverOptions.voiceCloneLabel = "Recorded clip"
+            appState.serverOptions.voiceCloneEnabled = true
         } catch {
             voiceError = error.localizedDescription
         }
     }
 
-    private func clearVoice() { appState.serverOptions.voiceClonePath = "" }
+    private func clearVoice() {
+        appState.serverOptions.voiceClonePath = ""
+        appState.serverOptions.voiceCloneLabel = ""
+    }
 }
 
 // MARK: - Agent sandbox section

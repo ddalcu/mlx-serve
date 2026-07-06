@@ -187,42 +187,7 @@ struct VoiceTrayPanel: View {
     }
 
     private var voicePicker: some View {
-        Menu {
-            ForEach(voice.availableVoices) { v in
-                Button {
-                    voice.selectVoice(v.id)
-                } label: {
-                    if v.id == voice.selectedVoiceId {
-                        Label(v.displayName, systemImage: "checkmark")
-                    } else {
-                        Text(v.displayName)
-                    }
-                }
-            }
-            if voice.availableVoices.isEmpty {
-                Text("No voices installed")
-            }
-            Divider()
-            Button("Download more voices…") {
-                if let url = URL(string: "x-apple.systempreferences:com.apple.preference.universalaccess?SpokenContent") {
-                    NSWorkspace.shared.open(url)
-                }
-            }
-        } label: {
-            HStack(spacing: 4) {
-                Image(systemName: "speaker.wave.2.fill").font(.caption2)
-                Text(selectedVoiceName).font(.caption).lineLimit(1)
-                Image(systemName: "chevron.up.chevron.down").font(.system(size: 8))
-            }
-        }
-        .menuStyle(.borderlessButton)
-        .menuIndicator(.hidden)
-        .fixedSize()
-        .help("Choose the speech voice. Add higher-quality voices in System Settings → Accessibility → Spoken Content.")
-    }
-
-    private var selectedVoiceName: String {
-        voice.availableVoices.first { $0.id == voice.selectedVoiceId }?.name ?? "Voice"
+        VoiceSelectorMenu(voice: voice, compact: true)
     }
 
     // MARK: Inline approval card (auto-approve off)

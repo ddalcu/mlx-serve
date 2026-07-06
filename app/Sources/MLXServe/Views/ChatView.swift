@@ -402,8 +402,9 @@ struct ChatView: View {
         }
         .navigationTitle("")
         .onAppear {
-            // Menu bar apps need explicit activation for keyboard focus
-            NSApp.setActivationPolicy(.regular)
+            // Menu bar apps need explicit activation for keyboard focus.
+            // (The .regular policy flip is handled app-wide by
+            // ActivationPolicyManager when this window becomes key.)
             DispatchQueue.main.async {
                 NSApp.activate(ignoringOtherApps: true)
             }

@@ -1,13 +1,111 @@
 import SwiftUI
 import AppKit
-import AVKit
 import UniformTypeIdentifiers
 
-/// Audio generation window — neural TTS with zero-shot voice cloning, run
-/// natively by the embedded mlx-serve server. Same shell as ImageGen/VideoGen: a model
-/// picker, the text to speak, a reference-voice section (record or pick a file)
-/// with an optional transcript, and a player for the result.
+/// Audio generation window — two tabs over one window: **Voice** (neural TTS
+/// with zero-shot voice cloning, Qwen3-TTS) and **Music** (prompt-driven music
+/// generation, ACE-Step). Each tab is its own self-contained pane; this
+/// container only hosts the segmented switcher.
 struct AudioGenView: View {
+    enum Tab: String, CaseIterable {
+        case voice = "Voice"
+        case music = "Music"
+    }
+
+    @State private var tab: Tab = .voice
+
+    var body: some View {
+        VStack(spacing: 0) {
+            Picker("", selection: $tab) {
+                ForEach(Tab.allCases, id: \.self) { t in
+                    Text(t.rawValue).tag(t)
+                }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .frame(width: 240)
+            .padding(.top, 10)
+            .padding(.bottom, 2)
+
+            switch tab {
+            case .voice: VoiceGenView()
+            case .music: MusicGenView()
+            }
+        }
+    }
+}
+
+/// Vertical list of past generations, shared by the Voice and Music tabs.
+/// Every file the service ever wrote stays listed (newest first, uncapped);
+/// clicking a row plays it through the owning tab's player, replacing
+/// whatever was playing.
+struct AudioHistoryShelf: View {
+    let title: String
+    let paths: [String]
+    let playingPath: String?
+    let onPlay: (String) -> Void
+    let onStop: () -> Void
+
+    var body: some View {
+        Group {
+            if !paths.isEmpty {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(title).font(.caption.weight(.semibold)).foregroundStyle(.secondary)
+                    ScrollView {
+                        VStack(spacing: 2) {
+                            ForEach(paths, id: \.self) { path in
+                                row(path)
+                            }
+                        }
+                    }
+                    .frame(maxHeight: 150)
+                }
+            }
+        }
+    }
+
+    private func row(_ path: String) -> some View {
+        let playing = playingPath == path
+        return HStack(spacing: 8) {
+            Image(systemName: playing ? "speaker.wave.2.fill" : "waveform")
+                .foregroundStyle(playing ? AnyShapeStyle(.tint) : AnyShapeStyle(.secondary))
+                .frame(width: 16)
+            Text(URL(fileURLWithPath: path).lastPathComponent)
+                .font(.caption)
+                .lineLimit(1).truncationMode(.middle)
+                .help(path)
+            Spacer()
+            Button {
+                playing ? onStop() : onPlay(path)
+            } label: {
+                Image(systemName: playing ? "stop.fill" : "play.fill")
+            }
+            .buttonStyle(.borderless)
+            .help(playing ? "Stop" : "Play")
+            Button {
+                NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
+            } label: { Image(systemName: "folder") }
+            .buttonStyle(.borderless)
+            .foregroundStyle(.secondary)
+            .help("Reveal in Finder")
+        }
+        .padding(.vertical, 3)
+        .padding(.horizontal, 6)
+        .background(
+            RoundedRectangle(cornerRadius: 5)
+                .fill(playing ? Color.accentColor.opacity(0.12) : Color.clear)
+        )
+        .contentShape(Rectangle())
+        .onTapGesture { playing ? onStop() : onPlay(path) }
+    }
+}
+
+/// Voice tab — neural TTS with zero-shot voice cloning, run natively by the
+/// embedded mlx-serve server. Same shell as ImageGen/VideoGen: a model
+/// picker, the text to speak, a reference-voice section (record or pick a file)
+/// with an optional transcript, and a player for the result. (Extracted
+/// verbatim from the pre-tabs AudioGenView — zero behavior change.)
+struct VoiceGenView: View {
     @EnvironmentObject var service: AudioGenService
     @EnvironmentObject var server: ServerManager
     @EnvironmentObject var downloads: DownloadManager
@@ -26,7 +124,7 @@ struct AudioGenView: View {
     @State private var showRAMWarning: Bool = false
     @State private var ramWarningMessage: String = ""
     @State private var pendingRequest: AudioGenRequest? = nil
-    @State private var player: AVPlayer?
+    @StateObject private var clipPlayer = AudioClipPlayer()
     /// Keep the model resident after generating (default off → unload).
     @State private var keepResident: Bool = false
     /// Hydration guard — see ImageGenView for the full rationale.
@@ -49,11 +147,18 @@ struct AudioGenView: View {
         .onChange(of: temperature) { _, _ in guard !hydrating else { return }; persist() }
         .onChange(of: keepResident) { _, _ in guard !hydrating else { return }; persist() }
         .onChange(of: service.phase) { _, phase in
-            if case .completed(let path) = phase {
-                player = AVPlayer(url: URL(fileURLWithPath: path))
-                player?.play()
-            }
+            // A new generation stops whatever is still playing.
+            if case .running = phase { stopPlayback() }
+            if case .completed(let path) = phase { play(path) }
         }
+    }
+
+    private func play(_ path: String) {
+        clipPlayer.play(path)
+    }
+
+    private func stopPlayback() {
+        clipPlayer.stop()
     }
 
     private var readyView: some View {
@@ -72,6 +177,13 @@ struct AudioGenView: View {
 
             VStack(spacing: 12) {
                 previewArea
+                AudioHistoryShelf(
+                    title: "History",
+                    paths: service.recent,
+                    playingPath: clipPlayer.playingPath,
+                    onPlay: { play($0) },
+                    onStop: { stopPlayback() }
+                )
                 outputFolderLink
             }
             .padding(16)
@@ -281,11 +393,11 @@ struct AudioGenView: View {
             Image(systemName: "waveform.circle.fill")
                 .font(.system(size: 64)).foregroundStyle(.tint)
             HStack(spacing: 10) {
-                Button { player?.seek(to: .zero); player?.play() } label: {
+                Button { clipPlayer.play(path) } label: {
                     Label("Play", systemImage: "play.fill")
                 }
                 .buttonStyle(.bordered)
-                Button { player?.pause() } label: {
+                Button { clipPlayer.pause() } label: {
                     Label("Pause", systemImage: "pause.fill")
                 }
                 .buttonStyle(.bordered)
@@ -363,9 +475,7 @@ struct AudioGenView: View {
     }
 
     private func playReference(_ url: URL) {
-        let p = AVPlayer(url: url)
-        p.play()
-        player = p
+        clipPlayer.play(url.path)
     }
 
     // MARK: - Sticky settings

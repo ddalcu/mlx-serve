@@ -20,6 +20,7 @@ const krea = @import("krea.zig");
 const lora_mod = @import("lora.zig");
 const nsfw = @import("nsfw.zig");
 const tts = @import("tts.zig");
+const acestep = @import("acestep.zig");
 const ltx = @import("ltx_video.zig");
 const ltx_audio = @import("ltx_audio.zig");
 const hy3d = @import("hunyuan3d.zig");
@@ -80,9 +81,36 @@ pub fn modalityFromType(model_type: []const u8) ?Modality {
     if (std.mem.startsWith(u8, model_type, "flux2")) return .image;
     if (std.mem.startsWith(u8, model_type, "krea")) return .image;
     if (std.mem.eql(u8, model_type, "qwen3_tts")) return .audio;
+    if (std.mem.eql(u8, model_type, "acestep")) return .audio;
     if (std.mem.eql(u8, model_type, "AudioVideo")) return .video;
     if (std.mem.startsWith(u8, model_type, "hunyuan3d")) return .mesh;
     return null;
+}
+
+/// Endpoint-level media route. `.speech` and `.music` share the `.audio`
+/// modality/engine slot — the loaded `AudioBackend` arm decides which endpoint
+/// is valid (wrong pairing → explicit 400, never a silent misinterpretation).
+pub const GenRoute = enum {
+    image,
+    speech,
+    music,
+    video,
+    mesh,
+
+    pub fn modality(self: GenRoute) Modality {
+        return switch (self) {
+            .image => .image,
+            .speech, .music => .audio,
+            .video => .video,
+            .mesh => .mesh,
+        };
+    }
+};
+
+/// Which audio backend a `model_type` selects (pure; pins the dispatch the
+/// `AudioEngine.load` re-peek performs).
+pub fn audioBackendKindForType(model_type: []const u8) enum { tts, music } {
+    return if (std.mem.eql(u8, model_type, "acestep")) .music else .tts;
 }
 
 /// Peek `model_dir/config.json` for its `model_type` string (owned dupe, caller
@@ -545,24 +573,42 @@ fn bodyDisablesSafety(body: []const u8) bool {
     return std.mem.startsWith(u8, body[i..], "false");
 }
 
-/// Audio backend (currently Qwen3-TTS). The `tts.Synthesizer` already bundles
-/// talker + codec + tokenizer, so this is a thin owner.
+/// The audio modality hosts MULTIPLE architectures (the `ImageBackend`
+/// convention): Qwen3-TTS speech synthesis and ACE-Step music generation.
+pub const AudioBackend = union(enum) {
+    tts: tts.Synthesizer,
+    music: *acestep.Engine,
+};
+
+/// Audio engine — a tagged-union owner, dispatched on `config.json`'s
+/// `model_type` at load (`qwen3_tts` → TTS, `acestep` → music). The
+/// `LoadedModel.audio_engine` slot stays single + modality-named.
 pub const AudioEngine = struct {
     allocator: std.mem.Allocator,
-    synth: tts.Synthesizer,
+    backend: AudioBackend,
 
     pub fn load(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !*AudioEngine {
         const self = try allocator.create(AudioEngine);
         errdefer allocator.destroy(self);
         self.allocator = allocator;
+        const mt = peekModelType(io, allocator, model_dir);
+        defer if (mt) |m| allocator.free(m);
+        if (mt != null and audioBackendKindForType(mt.?) == .music) {
+            self.backend = .{ .music = try acestep.Engine.load(io, allocator, model_dir) };
+            log.info("[audio] ACE-Step music engine ready\n", .{});
+            return self;
+        }
         const s = mlx.mlx_default_gpu_stream_new();
-        self.synth = try tts.Synthesizer.load(io, allocator, s, model_dir);
-        log.info("[audio] TTS synthesizer ready (sample_rate={d})\n", .{self.synth.model.cfg.sample_rate});
+        self.backend = .{ .tts = try tts.Synthesizer.load(io, allocator, s, model_dir) };
+        log.info("[audio] TTS synthesizer ready (sample_rate={d})\n", .{self.backend.tts.model.cfg.sample_rate});
         return self;
     }
 
     pub fn deinit(self: *AudioEngine) void {
-        self.synth.deinit();
+        switch (self.backend) {
+            .tts => |*synth| synth.deinit(),
+            .music => |e| e.deinit(),
+        }
         self.allocator.destroy(self);
     }
 };
@@ -1347,6 +1393,10 @@ pub fn handleImage(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: 
 
 /// POST /v1/audio/speech — WAV bytes (or SSE progress + base64-WAV complete).
 pub fn handleAudio(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, engine: *AudioEngine) !void {
+    const synth = switch (engine.backend) {
+        .tts => |*t| t,
+        .music => return sendError(conn, 400, "loaded audio model is a music generator; POST /v1/audio/music-generations"),
+    };
     const input = extractJsonString(body, "input") orelse extractJsonString(body, "text") orelse return sendError(conn, 400, "missing 'input'");
     const text = try jsonUnescape(allocator, input);
     defer allocator.free(text);
@@ -1364,7 +1414,7 @@ pub fn handleAudio(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
             if (base64DecodeAlloc(allocator, b64)) |wav_bytes| {
                 defer allocator.free(wav_bytes);
                 if (decodeWavToF32(allocator, wav_bytes)) |samples| {
-                    if (engine.synth.supportsCloning()) {
+                    if (synth.supportsCloning()) {
                         ref_samples = samples;
                         log.info("[audio] reference voice: {d} samples → cloning\n", .{samples.len});
                     } else {
@@ -1382,7 +1432,7 @@ pub fn handleAudio(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
     const prog: ?sse.Progress = if (want_stream) sctx.progress() else null;
     if (want_stream) try conn.writeAll(sse.headers);
 
-    const wav = engine.synth.synthesizeWav(text, 2048, prog, ref_samples) catch |err| {
+    const wav = synth.synthesizeWav(text, 2048, prog, ref_samples) catch |err| {
         log.err("[audio] synthesis failed: {}\n", .{err});
         if (want_stream) {
             sse.sendError(conn, "synthesis failed");
@@ -1392,6 +1442,89 @@ pub fn handleAudio(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
     };
     defer allocator.free(wav);
     log.info("[audio] -> {d} WAV bytes\n", .{wav.len});
+    if (want_stream) {
+        const b64_len = std.base64.standard.Encoder.calcSize(wav.len);
+        const b64 = try allocator.alloc(u8, b64_len);
+        defer allocator.free(b64);
+        _ = std.base64.standard.Encoder.encode(b64, wav);
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(allocator);
+        try out.appendSlice(allocator, "data: {\"type\":\"complete\",\"format\":\"wav\",\"data\":\"");
+        try out.appendSlice(allocator, b64);
+        try out.appendSlice(allocator, "\"}\n\n");
+        try conn.writeAll(out.items);
+        return;
+    }
+    return sendBytes(conn, allocator, "audio/wav", wav);
+}
+
+/// `POST /v1/audio/music-generations` — ACE-Step text2music.
+/// `{"model", "prompt" (style/genre/mood, REQUIRED), "lyrics" ("" →
+/// "[Instrumental]"), "vocal_language" ("en"), "bpm", "keyscale",
+/// "timesignature", "duration_seconds" (default 60, valid 10–600), "seed",
+/// "stream"}`. Response mirrors `/v1/audio/speech`: raw `audio/wav` bytes
+/// non-stream; SSE `progress` per stage/step + a base64 `complete` event when
+/// streaming. Targeting a TTS voice model here is an explicit 400.
+pub fn handleMusic(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, engine: *AudioEngine) !void {
+    const music = switch (engine.backend) {
+        .music => |m| m,
+        .tts => return sendError(conn, 400, "loaded audio model is a TTS voice; POST /v1/audio/speech"),
+    };
+    const raw_prompt = extractJsonString(body, "prompt") orelse return sendError(conn, 400, "missing 'prompt' (style/genre/mood description)");
+    const prompt = try jsonUnescape(allocator, raw_prompt);
+    defer allocator.free(prompt);
+    if (prompt.len == 0) return sendError(conn, 400, "empty 'prompt'");
+
+    var lyrics: []u8 = try allocator.dupe(u8, "");
+    defer allocator.free(lyrics);
+    if (extractJsonString(body, "lyrics")) |raw| {
+        allocator.free(lyrics);
+        lyrics = try jsonUnescape(allocator, raw);
+    }
+    var language: []u8 = try allocator.dupe(u8, "en");
+    defer allocator.free(language);
+    if (extractJsonString(body, "vocal_language")) |raw| {
+        allocator.free(language);
+        language = try jsonUnescape(allocator, raw);
+    }
+    const keyscale = extractJsonString(body, "keyscale") orelse "";
+    const timesignature = extractJsonString(body, "timesignature") orelse "";
+    var bpm: ?u32 = null;
+    if (extractJsonInt(body, "bpm")) |b| {
+        if (b < 30 or b > 300) return sendError(conn, 400, "'bpm' must be in [30,300]");
+        bpm = @intCast(b);
+    }
+    const duration: u32 = @intCast(extractJsonInt(body, "duration_seconds") orelse 60);
+    if (duration < acestep.MIN_DURATION_S or duration > acestep.MAX_DURATION_S)
+        return sendError(conn, 400, "'duration_seconds' must be in [10,600]");
+    const seed: u64 = extractJsonInt(body, "seed") orelse 42;
+
+    const want_stream = sse.bodyWantsTrue(body, "stream");
+    log.info("[music] generating {d}s seed={d} lyrics={d}ch stream={}\n", .{ duration, seed, lyrics.len, want_stream });
+    var sctx = sse.StreamCtx{ .conn = conn };
+    const prog: ?sse.Progress = if (want_stream) sctx.progress() else null;
+    if (want_stream) try conn.writeAll(sse.headers);
+
+    const req = acestep.MusicRequest{
+        .caption = prompt,
+        .lyrics = lyrics,
+        .language = language,
+        .bpm = bpm,
+        .keyscale = keyscale,
+        .timesignature = timesignature,
+        .duration_s = duration,
+        .seed = seed,
+    };
+    const wav = music.generateWav(allocator, req, prog) catch |err| {
+        log.err("[music] generation failed: {}\n", .{err});
+        if (want_stream) {
+            sse.sendError(conn, "music generation failed");
+            return;
+        }
+        return sendError(conn, 500, "music generation failed");
+    };
+    defer allocator.free(wav);
+    log.info("[music] -> {d} WAV bytes\n", .{wav.len});
     if (want_stream) {
         const b64_len = std.base64.standard.Encoder.calcSize(wav.len);
         const b64 = try allocator.alloc(u8, b64_len);
@@ -2200,6 +2333,7 @@ test "modalityFromType classifies the media archs + markers (incl. krea + hunyua
     try testing.expectEqual(Modality.image, modalityFromType("krea2_turbo").?);
     try testing.expectEqual(Modality.image, modalityFromType("krea").?);
     try testing.expectEqual(Modality.audio, modalityFromType("qwen3_tts").?);
+    try testing.expectEqual(Modality.audio, modalityFromType("acestep").?);
     try testing.expectEqual(Modality.video, modalityFromType("AudioVideo").?);
     try testing.expectEqual(Modality.mesh, modalityFromType("hunyuan3d_2_1").?);
     try testing.expectEqual(Modality.mesh, modalityFromType("hunyuan3d").?);
@@ -2209,6 +2343,19 @@ test "modalityFromType classifies the media archs + markers (incl. krea + hunyua
 
 test "Modality.mesh advertises the 3d capability" {
     try testing.expectEqualStrings("3d", Modality.mesh.capability());
+}
+
+test "GenRoute: speech + music share the audio modality slot" {
+    try testing.expectEqual(Modality.audio, GenRoute.speech.modality());
+    try testing.expectEqual(Modality.audio, GenRoute.music.modality());
+    try testing.expectEqual(Modality.image, GenRoute.image.modality());
+    try testing.expectEqual(Modality.mesh, GenRoute.mesh.modality());
+}
+
+test "audioBackendKindForType routes acestep to music, everything else to tts" {
+    try testing.expect(audioBackendKindForType("acestep") == .music);
+    try testing.expect(audioBackendKindForType("qwen3_tts") == .tts);
+    try testing.expect(audioBackendKindForType("gemma4") == .tts);
 }
 
 test "bodyDisablesSafety detects per-request opt-out" {

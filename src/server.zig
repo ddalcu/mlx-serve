@@ -1078,6 +1078,25 @@ fn handleConnection(
             requested_model_id = resolved orelse "";
         }
     }
+    // Text-gen route aimed at a KNOWN non-text model: reject before
+    // ensureLoaded, or the request cold-loads a multi-GB media model just
+    // to earn its 400. The post-load `text_gen_reject` below stays the
+    // authoritative crash barrier (this peek can't see `--model` primaries
+    // with no arch hint until they're resident).
+    if (requested_model_id.len > 0 and isTextGenRoute(method, path)) {
+        if (registry.peek(requested_model_id)) |peeked| {
+            if (textGenRejectReason(textGenTargetOf(peeked))) |reason| {
+                if (std.mem.eql(u8, path, "/v1/messages")) {
+                    try sendAnthropicError(allocator, stream, "invalid_request_error", reason, 400);
+                } else if (std.mem.startsWith(u8, path, "/api/")) {
+                    try sendOllamaError(allocator, stream, "400 Bad Request", reason);
+                } else {
+                    try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", reason, 400);
+                }
+                return;
+            }
+        }
+    }
     const lm = scheduler.ensureLoaded(requested_model_id) catch |err| switch (err) {
         error.UnknownModelId => {
             try sendErrorResponse(allocator, stream, "404 Not Found", "model_not_found", "Unknown model id", 404);
@@ -1129,17 +1148,20 @@ fn handleConnection(
     defer scheduler.release(lm);
 
     // ── Phase C: handlers take `lm` directly and extract their own
-    //    locals. handleConnection only needs `config` for the encoder-
-    //    only dispatch guard.
-    const config = lm.config.?;
+    //    locals. handleConnection only needs one decision for every
+    //    text-generation route: encoder-only AND media (image/audio/video/
+    //    3D) models get a clean 400 instead of reaching a prefill that has
+    //    no transformer to run (the SIGSEGV class documented on
+    //    textGenRejectReason).
+    const text_gen_reject: ?[]const u8 = textGenRejectReason(textGenTargetOf(lm));
 
     // ── WebSocket upgrade for /v1/responses ──
     // Detect Upgrade: websocket BEFORE the regular route dispatch so the
     // GET method (used for the upgrade handshake) doesn't fall through to
     // the 404 branch.
     if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/v1/responses") and ws_mod.isUpgrade(request[0..header_end_pos])) {
-        if (config.is_encoder_only) {
-            try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Encoder-only models do not support text generation. Use /v1/embeddings instead.", 400);
+        if (text_gen_reject) |reason| {
+            try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", reason, 400);
             return;
         }
         try handleResponsesWebSocket(allocator, stream, request[0..header_end_pos], lm);
@@ -1153,16 +1175,16 @@ fn handleConnection(
         log.debug("GET  /props -> 200\n", .{});
         try handleProps(allocator, stream, lm);
     } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/chat/completions")) {
-        if (config.is_encoder_only) {
-            try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Encoder-only models do not support text generation. Use /v1/embeddings instead.", 400);
+        if (text_gen_reject) |reason| {
+            try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", reason, 400);
             return;
         }
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
         const body = request[header_end + 4 .. total_read];
         try handleChatCompletions(allocator, stream, body, lm);
     } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/completions")) {
-        if (config.is_encoder_only) {
-            try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Encoder-only models do not support text generation. Use /v1/embeddings instead.", 400);
+        if (text_gen_reject) |reason| {
+            try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", reason, 400);
             return;
         }
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
@@ -1173,16 +1195,16 @@ fn handleConnection(
         const body = request[header_end + 4 .. total_read];
         try handleEmbeddings(allocator, stream, body, lm);
     } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/messages")) {
-        if (config.is_encoder_only) {
-            try sendAnthropicError(allocator, stream, "invalid_request_error", "Encoder-only models do not support text generation. Use /v1/embeddings instead.", 400);
+        if (text_gen_reject) |reason| {
+            try sendAnthropicError(allocator, stream, "invalid_request_error", reason, 400);
             return;
         }
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
         const body = request[header_end + 4 .. total_read];
         try handleAnthropicMessages(allocator, stream, body, lm);
     } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/responses")) {
-        if (config.is_encoder_only) {
-            try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Encoder-only models do not support text generation. Use /v1/embeddings instead.", 400);
+        if (text_gen_reject) |reason| {
+            try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", reason, 400);
             return;
         }
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
@@ -1203,7 +1225,11 @@ fn handleConnection(
     } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/audio/speech")) {
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
         const body = request[header_end + 4 .. total_read];
-        try handleGen(allocator, stream, body, lm, .audio);
+        try handleGen(allocator, stream, body, lm, .speech);
+    } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/audio/music-generations")) {
+        const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
+        const body = request[header_end + 4 .. total_read];
+        try handleGen(allocator, stream, body, lm, .music);
     } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/video/generations")) {
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
         const body = request[header_end + 4 .. total_read];
@@ -1213,14 +1239,14 @@ fn handleConnection(
         const body = request[header_end + 4 .. total_read];
         try handleGen(allocator, stream, body, lm, .mesh);
     } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/api/chat")) {
-        if (config.is_encoder_only) {
-            try sendOllamaError(allocator, stream, "400 Bad Request", "encoder-only model does not support chat; use /api/embed");
+        if (text_gen_reject) |reason| {
+            try sendOllamaError(allocator, stream, "400 Bad Request", reason);
             return;
         }
         try handleOllamaChat(allocator, stream, request_body, lm);
     } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/api/generate")) {
-        if (config.is_encoder_only) {
-            try sendOllamaError(allocator, stream, "400 Bad Request", "encoder-only model does not support generation; use /api/embed");
+        if (text_gen_reject) |reason| {
+            try sendOllamaError(allocator, stream, "400 Bad Request", reason);
             return;
         }
         try handleOllamaGenerate(allocator, stream, request_body, lm);
@@ -1336,7 +1362,10 @@ fn ollamaQuantOf(id: []const u8) []const u8 {
 /// the registry mutex; id/arch_hint slices are entry-owned and stable.
 fn ollamaTagEntryOf(io: std.Io, e: *LoadedModel) ollama_mod.TagEntry {
     const family: []const u8 = if (e.config) |c| c.model_type else (if (e.arch_hint.len > 0) e.arch_hint else "unknown");
-    const is_gguf = e.ds4_engine != null or e.llama_engine != null or std.mem.endsWith(u8, e.path, ".gguf");
+    // arch_hint "gguf" covers unloaded discovery stubs whose PATH is a
+    // directory of .gguf files (issue #59) — no engine yet, no .gguf suffix.
+    const is_gguf = e.ds4_engine != null or e.llama_engine != null or
+        std.mem.endsWith(u8, e.path, ".gguf") or std.mem.eql(u8, e.arch_hint, "gguf");
     var modified_ms: i64 = 0;
     // config.json mtime; .gguf entries fall back to 0 (epoch) rather than
     // paying a parent-dir walk. Guard the absolute-path precondition —
@@ -1857,6 +1886,9 @@ const ReadyCaps = struct {
     is_encoder_only: bool = false,
     has_image_engine: bool = false,
     has_audio_engine: bool = false,
+    /// Audio engine's backend is the ACE-Step music generator (advertises
+    /// "music" ADDITIVELY beside "audio", the ready-model "3d" precedent).
+    has_music_backend: bool = false,
     has_video_engine: bool = false,
     has_mesh_engine: bool = false,
 };
@@ -1887,10 +1919,86 @@ fn readyCapsJson(allocator: std.mem.Allocator, c: ReadyCaps) !std.ArrayList(u8) 
     // Native media-generation engines (resident).
     if (c.has_image_engine) try append_cap(allocator, &caps, &n_caps, "image");
     if (c.has_audio_engine and !c.has_audio) try append_cap(allocator, &caps, &n_caps, "audio");
+    if (c.has_music_backend) try append_cap(allocator, &caps, &n_caps, "music");
     if (c.has_video_engine) try append_cap(allocator, &caps, &n_caps, "video");
     if (c.has_mesh_engine) try append_cap(allocator, &caps, &n_caps, "3d");
     try caps.append(allocator, ']');
     return caps;
+}
+
+/// Facts about a request's target model that decide whether a TEXT-
+/// GENERATION route (/v1/chat/completions, /v1/completions, /v1/messages,
+/// /v1/responses + WS, /api/chat, /api/generate) may serve it. Extracted
+/// from a LoadedModel by `textGenTargetOf`; kept as plain facts so the
+/// decision is hermetically testable.
+const TextGenTarget = struct {
+    is_encoder_only: bool = false,
+    arch_hint: []const u8 = "",
+    has_image_engine: bool = false,
+    has_audio_engine: bool = false,
+    has_video_engine: bool = false,
+    has_mesh_engine: bool = false,
+    /// A text-capable LM is resident (transformer / ds4 / llama engine) —
+    /// or the entry isn't loaded yet, in which case stubs default to
+    /// "assume text until the arch hint or a load says otherwise".
+    has_text_lm: bool = true,
+};
+
+/// Reason a text-generation route must reject this model with a 400, or
+/// null when it can serve text. Crash class (live SIGSEGV 2026-07-06): a
+/// chat request routed at a media model has only the gen stub CPU state —
+/// the empty stub tokenizer produced 0 prompt tokens and prefill deref'd
+/// `transformer == null`, killing the whole server from one request (any
+/// remote client naming a media model could down it). Media entries are
+/// detected BOTH pre-load (discovery arch_hint) and post-load (engine
+/// slots) — either alone has gaps: `--model` primaries carry no hint,
+/// engines exist only while resident.
+fn textGenRejectReason(t: TextGenTarget) ?[]const u8 {
+    if (t.is_encoder_only) return "Encoder-only models do not support text generation. Use /v1/embeddings instead.";
+    const modality: ?media_mod.Modality = blk: {
+        if (t.has_image_engine) break :blk .image;
+        if (t.has_video_engine) break :blk .video;
+        if (t.has_mesh_engine) break :blk .mesh;
+        if (t.has_audio_engine) break :blk .audio;
+        break :blk media_mod.modalityFromType(t.arch_hint);
+    };
+    if (modality) |m| return switch (m) {
+        .image => "This is an image generation model; it cannot serve chat/text requests. Use POST /v1/images/generations instead.",
+        .audio => "This is an audio generation model; it cannot serve chat/text requests. Use POST /v1/audio/speech (TTS) or /v1/audio/music-generations (music) instead.",
+        .video => "This is a video generation model; it cannot serve chat/text requests. Use POST /v1/video/generations instead.",
+        .mesh => "This is a 3D generation model; it cannot serve chat/text requests. Use POST /v1/3d/generations instead.",
+    };
+    if (!t.has_text_lm) return "This model cannot serve text generation (no language model resident).";
+    return null;
+}
+
+fn textGenTargetOf(lm: *LoadedModel) TextGenTarget {
+    return .{
+        .is_encoder_only = if (lm.config) |c| c.is_encoder_only else false,
+        .arch_hint = lm.arch_hint,
+        .has_image_engine = lm.image_engine != null,
+        .has_audio_engine = lm.audio_engine != null,
+        .has_video_engine = lm.video_engine != null,
+        .has_mesh_engine = lm.mesh_engine != null,
+        .has_text_lm = lm.state != .ready or lm.transformer != null or
+            lm.ds4_engine != null or lm.llama_engine != null,
+    };
+}
+
+/// True for the routes textGenRejectReason protects — used for the
+/// pre-load peek so naming a media model in a chat request doesn't
+/// cold-load gigabytes just to earn its 400.
+fn isTextGenRoute(method: []const u8, path: []const u8) bool {
+    if (std.mem.eql(u8, method, "POST")) {
+        const routes = [_][]const u8{
+            "/v1/chat/completions", "/v1/completions", "/v1/messages",
+            "/v1/responses",        "/api/chat",       "/api/generate",
+        };
+        for (routes) |r| if (std.mem.eql(u8, path, r)) return true;
+        return false;
+    }
+    // WebSocket upgrade handshake for /v1/responses.
+    return std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/v1/responses");
 }
 
 /// pulls full capabilities/dimensions off the resident config/chat_config;
@@ -1924,6 +2032,7 @@ fn renderModelEntry(
             .is_encoder_only = config.is_encoder_only,
             .has_image_engine = entry.image_engine != null,
             .has_audio_engine = entry.audio_engine != null,
+            .has_music_backend = if (entry.audio_engine) |ae| ae.backend == .music else false,
             .has_video_engine = entry.video_engine != null,
             .has_mesh_engine = entry.mesh_engine != null,
         });
@@ -2020,12 +2129,24 @@ fn renderModelEntry(
     // present. Reasoning/audio stay load-gated (they need the live template /
     // encoder), so an unloaded stub may under-report those two.
     const is_encoder_stub = std.mem.eql(u8, entry.arch_hint, "bert");
+    // GGUF discovery stub (issue #59): no config.json to read StubMeta from,
+    // but the embedded llama/ds4 engines always serve chat (the GGUF's own
+    // template is adopted at load), so advertise the chat capability set the
+    // ready path would.
+    const is_gguf_stub = std.mem.eql(u8, entry.arch_hint, "gguf");
     // Native media-gen stub (image/audio/video) — advertise the modality from
     // the discovery-peeked arch_hint so the app can find it before loading.
     const media_modality = media_mod.modalityFromType(entry.arch_hint);
     const caps_part: []const u8 = blk: {
-        if (media_modality) |m| break :blk try std.fmt.allocPrint(allocator, ",\"capabilities\":[\"{s}\"]", .{m.capability()});
+        if (media_modality) |m| {
+            // The music backend advertises "music" beside "audio" on the stub
+            // too (matches the ready-path readyCapsJson additive rule).
+            if (m == .audio and media_mod.audioBackendKindForType(entry.arch_hint) == .music)
+                break :blk try allocator.dupe(u8, ",\"capabilities\":[\"audio\",\"music\"]");
+            break :blk try std.fmt.allocPrint(allocator, ",\"capabilities\":[\"{s}\"]", .{m.capability()});
+        }
         if (is_encoder_stub) break :blk try allocator.dupe(u8, ",\"capabilities\":[\"embeddings\"]");
+        if (is_gguf_stub) break :blk try allocator.dupe(u8, ",\"capabilities\":[\"chat\",\"tool_use\",\"streaming\",\"json_schema\"]");
         if (!sm.found or !(sm.has_chat or sm.has_vision)) break :blk try allocator.dupe(u8, "");
         var b = std.ArrayList(u8).empty;
         errdefer b.deinit(allocator);
@@ -2054,7 +2175,7 @@ fn renderModelEntry(
 
     const mods_part: []const u8 = if (sm.found and sm.has_vision)
         ",\"input_modalities\":[\"text\",\"image\"]"
-    else if (sm.found and sm.has_chat)
+    else if ((sm.found and sm.has_chat) or is_gguf_stub)
         ",\"input_modalities\":[\"text\"]"
     else
         "";
@@ -2264,21 +2385,22 @@ const GenJob = struct {
     conn: *Conn,
     body: []const u8,
     lm: *model_registry_mod.LoadedModel,
-    modality: media_mod.Modality,
+    route: media_mod.GenRoute,
 };
 
 /// Inference-thread entry point for a gen job. Dispatches on the engine slot
 /// and writes the full HTTP/SSE response to the (parked) connection.
 fn genJobRun(ctx: *anyopaque) void {
     const job: *GenJob = @ptrCast(@alignCast(ctx));
-    const result = switch (job.modality) {
+    const result = switch (job.route) {
         .image => if (job.lm.image_engine) |e| media_mod.handleImage(job.conn.io, job.allocator, job.conn, job.body, e) else error.WrongModality,
-        .audio => if (job.lm.audio_engine) |e| media_mod.handleAudio(job.allocator, job.conn, job.body, e) else error.WrongModality,
+        .speech => if (job.lm.audio_engine) |e| media_mod.handleAudio(job.allocator, job.conn, job.body, e) else error.WrongModality,
+        .music => if (job.lm.audio_engine) |e| media_mod.handleMusic(job.allocator, job.conn, job.body, e) else error.WrongModality,
         .video => if (job.lm.video_engine) |e| media_mod.handleVideo(job.conn.io, job.allocator, job.conn, job.body, e) else error.WrongModality,
         .mesh => if (job.lm.mesh_engine) |e| media_mod.handleMesh(job.allocator, job.conn, job.body, e) else error.WrongModality,
     };
     result catch |err| {
-        log.warn("[gen] {s} job failed: {s}\n", .{ @tagName(job.modality), @errorName(err) });
+        log.warn("[gen] {s} job failed: {s}\n", .{ @tagName(job.route), @errorName(err) });
     };
 }
 
@@ -2286,12 +2408,12 @@ fn genJobRun(ctx: *anyopaque) void {
 /// already-resolved + refcounted model (so it can't be evicted mid-gen). The
 /// generation runs on the scheduler's inference thread (the sole mlx caller);
 /// the body writes its own response. A wrong-modality target gets a clear 400.
-fn handleGen(allocator: std.mem.Allocator, stream: *Conn, body: []const u8, lm: *model_registry_mod.LoadedModel, modality: media_mod.Modality) !void {
+fn handleGen(allocator: std.mem.Allocator, stream: *Conn, body: []const u8, lm: *model_registry_mod.LoadedModel, route: media_mod.GenRoute) !void {
     const scheduler = global_scheduler orelse {
         try sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", "Scheduler not ready", 503);
         return;
     };
-    const ok = switch (modality) {
+    const ok = switch (route.modality()) {
         .image => lm.image_engine != null,
         .audio => lm.audio_engine != null,
         .video => lm.video_engine != null,
@@ -2301,7 +2423,7 @@ fn handleGen(allocator: std.mem.Allocator, stream: *Conn, body: []const u8, lm: 
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Target model does not support this media modality. Load the matching image/audio/video/3D model and target it by id.", 400);
         return;
     }
-    var job = GenJob{ .allocator = allocator, .conn = stream, .body = body, .lm = lm, .modality = modality };
+    var job = GenJob{ .allocator = allocator, .conn = stream, .body = body, .lm = lm, .route = route };
     var req = scheduler_mod.GenRequest{ .ctx = &job, .run = genJobRun, .model = lm };
     scheduler.runGeneration(&req) catch |err| switch (err) {
         error.Shutdown => {
@@ -10580,6 +10702,57 @@ test "optSamplingRecJson emits number when present, null when absent" {
     try std.testing.expectEqualStrings("null", none);
 }
 
+test "textGenRejectReason: media + encoder models rejected, chat models pass (SIGSEGV class 2026-07-06)" {
+    // Chat-capable targets pass — resident MLX LM, embedded engines, and
+    // unloaded stubs with a chat arch hint (or none: benefit of the doubt
+    // until load).
+    try std.testing.expect(textGenRejectReason(.{ .arch_hint = "gemma4" }) == null);
+    try std.testing.expect(textGenRejectReason(.{ .arch_hint = "gguf" }) == null);
+    try std.testing.expect(textGenRejectReason(.{}) == null);
+
+    // The live crash shape: a resident image model — engine slot set, no
+    // transformer. Must reject, never reach prefill.
+    {
+        const r = textGenRejectReason(.{ .has_image_engine = true, .has_text_lm = false });
+        try std.testing.expect(r != null);
+        try std.testing.expect(std.mem.indexOf(u8, r.?, "/v1/images/generations") != null);
+    }
+    // Pre-load detection via the discovery arch hint — no engine resident yet.
+    {
+        const r = textGenRejectReason(.{ .arch_hint = "flux2-klein-4b" });
+        try std.testing.expect(std.mem.indexOf(u8, r.?, "/v1/images/generations") != null);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, textGenRejectReason(.{ .arch_hint = "hunyuan3d_2_1" }).?, "/v1/3d/generations") != null);
+    try std.testing.expect(std.mem.indexOf(u8, textGenRejectReason(.{ .arch_hint = "qwen3_tts" }).?, "/v1/audio/speech") != null);
+    try std.testing.expect(std.mem.indexOf(u8, textGenRejectReason(.{ .arch_hint = "acestep" }).?, "music-generations") != null);
+    try std.testing.expect(std.mem.indexOf(u8, textGenRejectReason(.{ .arch_hint = "AudioVideo" }).?, "/v1/video/generations") != null);
+    try std.testing.expect(std.mem.indexOf(u8, textGenRejectReason(.{ .has_mesh_engine = true }).?, "/v1/3d/generations") != null);
+
+    // Encoder-only keeps its dedicated message (pre-existing guard, now
+    // routed through the same decision).
+    try std.testing.expect(std.mem.indexOf(u8, textGenRejectReason(.{ .is_encoder_only = true }).?, "/v1/embeddings") != null);
+
+    // Catch-all: a READY entry with no LM and no engines (future modality)
+    // still rejects instead of crashing.
+    try std.testing.expect(textGenRejectReason(.{ .has_text_lm = false }) != null);
+}
+
+test "isTextGenRoute covers exactly the guarded surfaces" {
+    try std.testing.expect(isTextGenRoute("POST", "/v1/chat/completions"));
+    try std.testing.expect(isTextGenRoute("POST", "/v1/completions"));
+    try std.testing.expect(isTextGenRoute("POST", "/v1/messages"));
+    try std.testing.expect(isTextGenRoute("POST", "/v1/responses"));
+    try std.testing.expect(isTextGenRoute("POST", "/api/chat"));
+    try std.testing.expect(isTextGenRoute("POST", "/api/generate"));
+    try std.testing.expect(isTextGenRoute("GET", "/v1/responses")); // WS upgrade
+    // Media + embedding routes must NOT be gated — they serve these models.
+    try std.testing.expect(!isTextGenRoute("POST", "/v1/images/generations"));
+    try std.testing.expect(!isTextGenRoute("POST", "/v1/audio/speech"));
+    try std.testing.expect(!isTextGenRoute("POST", "/v1/embeddings"));
+    try std.testing.expect(!isTextGenRoute("POST", "/api/embed"));
+    try std.testing.expect(!isTextGenRoute("GET", "/v1/models"));
+}
+
 test "readyCapsJson: every resident media engine surfaces its capability (mesh -> 3d)" {
     const a = std.testing.allocator;
 
@@ -10597,6 +10770,10 @@ test "readyCapsJson: every resident media engine surfaces its capability (mesh -
     var aud = try readyCapsJson(a, .{ .has_audio_engine = true });
     defer aud.deinit(a);
     try std.testing.expectEqualStrings("[\"audio\"]", aud.items);
+    // A music-backend audio engine advertises "music" ADDITIVELY beside "audio".
+    var mus = try readyCapsJson(a, .{ .has_audio_engine = true, .has_music_backend = true });
+    defer mus.deinit(a);
+    try std.testing.expectEqualStrings("[\"audio\",\"music\"]", mus.items);
     var vid = try readyCapsJson(a, .{ .has_video_engine = true });
     defer vid.deinit(a);
     try std.testing.expectEqualStrings("[\"video\"]", vid.items);

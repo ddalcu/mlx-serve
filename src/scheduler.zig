@@ -46,6 +46,8 @@ const chat_mod = @import("chat.zig");
 const prefix_cache_mod = @import("prefix_cache.zig");
 const tokenize_cache_mod = @import("tokenize_cache.zig");
 const model_registry_mod = @import("model_registry.zig");
+const model_discovery = @import("model_discovery.zig");
+const gguf_meta = @import("gguf_meta.zig");
 const arch_ds4 = if (@import("build_options").ios) @import("arch/ds4_stub.zig") else @import("arch/ds4.zig");
 const arch_llama = if (@import("build_options").ios) @import("arch/llama_stub.zig") else @import("arch/llama.zig");
 const log = @import("log.zig");
@@ -180,6 +182,12 @@ pub const LoadParams = struct {
     /// `config`/`tok`/`chat_config` are still required (they seed the
     /// scheduler's borrowed-view fields) but are never installed on an entry.
     no_initial_load: bool = false,
+    /// The --ctx-size launch flag (0 = unset). Cold-loaded GGUF entries have
+    /// no config.json to size their context from, so `preloadCpuState` sizes
+    /// the stub config with this — same rule as the startup GGUF paths
+    /// (llama: ctx or 8192; ds4: clampSessionCtx). MLX cold loads read their
+    /// own config.json and ignore it.
+    ctx_size: u32 = 0,
 };
 
 /// Submit-time parameters. `prompt_ids` and `eos_token_ids` are duped into the
@@ -844,11 +852,13 @@ pub const LoadRequest = struct {
     done_mu: std.Io.Mutex = .init,
     done_cond: std.Io.Condition = .init,
 
-    /// Mirror `LoadParams.ds4_path`. The cold-load path (Phase D's
-    /// `ensureLoaded`) doesn't yet support ds4-on-demand loading; ds4 only
-    /// lands via the startup `LoadParams`, so this stays empty on the cold
-    /// path for now.
+    /// Mirror `LoadParams.ds4_path` / `LoadParams.llama_path`. Set by
+    /// `ensureLoaded` when the entry's path resolves to a GGUF (issue #59):
+    /// the resolved .gguf file routes the load through the matching
+    /// embedded-engine arm in `doLoadOnInferenceThread` instead of the MLX
+    /// safetensors path. Borrowed from the conn thread until `done`.
     ds4_path: []const u8 = "",
+    llama_path: []const u8 = "",
 };
 
 /// Media-generation work item. Posted by `runGeneration` from a connection
@@ -909,6 +919,9 @@ pub const Scheduler = struct {
     drafter: ?*DrafterModel,
     drafter_block_size: u32,
     kv_quant_config: transformer_mod.KVQuantConfig,
+    /// `LoadParams.ctx_size` — the --ctx-size launch flag, kept for sizing
+    /// GGUF stub configs on cold loads (see preloadGgufCpuState).
+    gguf_ctx_size: u32,
 
     // ── Borrowed refs (CPU-only state owned by the LoadedModel). ──
     config: *const ModelConfig,
@@ -1031,6 +1044,7 @@ pub const Scheduler = struct {
             .drafter = null,
             .drafter_block_size = params.draft_block_size,
             .kv_quant_config = params.kv_quant_config,
+            .gguf_ctx_size = params.ctx_size,
             // Initial borrowed-view refs point at the (heap-allocated) CPU
             // state carried on LoadParams; once the inference thread
             // installs them on `entry`, the views still resolve to the
@@ -1353,7 +1367,7 @@ pub const Scheduler = struct {
         // entry `.error_state` so /v1/models surfaces the failure (and
         // future ensureLoaded calls fail fast instead of re-tripping the
         // same parse error). FileNotFound / parse errors land here.
-        const cpu_state = preloadCpuState(self.allocator, self.io, entry.path) catch |err| {
+        const cpu_state = preloadCpuState(self.allocator, self.io, entry.path, self.gguf_ctx_size) catch |err| {
             self.registry.mutex.lockUncancelable(self.io);
             self.registry.markErrorLocked(entry, @errorName(err));
             self.registry.mutex.unlock(self.io);
@@ -1365,6 +1379,10 @@ pub const Scheduler = struct {
         var owned = cpu_state;
         var owned_active: bool = true;
         defer if (owned_active) freeCpuState(self.allocator, &owned);
+        // The resolved .gguf path (when this is a GGUF entry) is borrowed by
+        // the LoadRequest until `done`; the engines dupe what they keep, so
+        // it's released here on success AND failure.
+        defer if (owned.gguf) |g| self.allocator.free(g.path);
 
         // Victims selected by the eviction planner (multi-victim: one load may
         // need to free several models to fit). Lives on this stack frame; the
@@ -1451,6 +1469,13 @@ pub const Scheduler = struct {
             .prefix_cache_mem_bytes = 0,
             .evict_entries = victims_buf[0..n_victims],
             .allocator = self.allocator,
+        };
+        // GGUF entry: route through the matching embedded-engine arm in
+        // doLoadOnInferenceThread (issue #59 — discovered/pulled GGUF dirs
+        // cold-load on demand like MLX ones).
+        if (owned.gguf) |g| switch (g.engine) {
+            .ds4 => req.ds4_path = g.path,
+            .llama => req.llama_path = g.path,
         };
 
         {
@@ -1679,14 +1704,26 @@ fn boxInit(
     return ptr;
 }
 
+/// Routing decision for a GGUF entry resolved at preload time: the actual
+/// `.gguf` file (owned by the conn thread, freed after the load completes —
+/// the engines dupe/copy what they keep) and which embedded engine serves it.
+const GgufRoute = struct {
+    path: []u8,
+    engine: gguf_meta.Engine,
+};
+
 /// Plan 05 Phase D: pre-loaded CPU state bundle. Built by the conn thread
 /// (CPU only — file I/O + parse, no mlx) ahead of posting a LoadRequest.
 /// Ownership transfers to the entry on successful load; on failure the
-/// conn thread frees via `freeCpuState`.
+/// conn thread frees via `freeCpuState`. `gguf` (when set) stays owned by
+/// the conn thread either way.
 const CpuState = struct {
     config: *ModelConfig,
     tok: *Tokenizer,
     chat_config: *ChatConfig,
+    /// Non-null when the model is a GGUF served by an embedded engine
+    /// (issue #59: discovered/pulled GGUF dirs cold-load on demand).
+    gguf: ?GgufRoute = null,
 };
 
 /// Phase D: parse config.json, tokenizer, and chat config from `model_dir`
@@ -1697,7 +1734,15 @@ const CpuState = struct {
 /// is registered AFTER the successful init so a downstream failure doesn't
 /// call deinit on uninitialized memory. ModelConfig has no allocator-owned
 /// fields, so `allocator.destroy` is sufficient there.
-fn preloadCpuState(allocator: std.mem.Allocator, io: std.Io, model_dir: []const u8) !CpuState {
+fn preloadCpuState(allocator: std.mem.Allocator, io: std.Io, model_dir: []const u8, gguf_ctx_size: u32) !CpuState {
+    // GGUF first — mirrors `--model` routing in main.zig, where isGgufPath
+    // is checked before any config.json read ("GGUF files bypass the MLX
+    // dispatch entirely"). The embedded engine owns the real tokenizer +
+    // chat template, so the CPU state is a stub, like the media path below.
+    if (model_discovery.isGgufModelPath(io, model_dir)) {
+        return preloadGgufCpuState(allocator, io, model_dir, gguf_ctx_size);
+    }
+
     // Media model (image/audio/video): the engine owns the real tokenizer +
     // forward path, so we hand the inference thread a minimal stub instead of
     // parsing a transformer-shaped config (which would fail on a flux2/
@@ -1745,12 +1790,114 @@ fn preloadCpuState(allocator: std.mem.Allocator, io: std.Io, model_dir: []const 
     return .{ .config = config, .tok = tok, .chat_config = cc };
 }
 
+/// Frees the three CPU-state pointers. Does NOT free `s.gguf` — the
+/// resolved .gguf path is borrowed by the LoadRequest until `done` and is
+/// freed by ensureLoaded's own defer on both success and failure paths
+/// (on success the three pointers transfer to the entry, so this function
+/// is skipped, but the path must still be released).
 fn freeCpuState(allocator: std.mem.Allocator, s: *CpuState) void {
     allocator.destroy(s.config);
     s.tok.deinit();
     allocator.destroy(s.tok);
     s.chat_config.deinit();
     allocator.destroy(s.chat_config);
+}
+
+/// GGUF cold-load preload: resolve the actual .gguf file, pick the embedded
+/// engine from its header metadata (the issue #15 rule in gguf_meta.zig;
+/// unreadable metadata defaults to llama with a log line, mirroring
+/// main.zig's chooseGgufEngine), and build the stub CPU state.
+fn preloadGgufCpuState(allocator: std.mem.Allocator, io: std.Io, model_dir: []const u8, ctx_size: u32) !CpuState {
+    const gguf_path = model_discovery.resolveGgufFile(io, allocator, model_dir) catch |err| {
+        model_discovery.logResolveGgufError(model_dir, err);
+        return err;
+    };
+    errdefer allocator.free(gguf_path);
+
+    const engine: gguf_meta.Engine = blk: {
+        var info = gguf_meta.readFromFile(io, allocator, gguf_path) catch |err| {
+            log.warn("[gguf] route: metadata read failed ({s}); defaulting to llama\n", .{@errorName(err)});
+            break :blk .llama;
+        };
+        defer info.deinit(allocator);
+        const e = gguf_meta.preferredEngine(info);
+        log.info("[gguf] engine: {s} (arch={s}, ds4-lora={})\n", .{
+            @tagName(e),
+            info.architecture orelse "?",
+            info.has_ds4_lora_rank,
+        });
+        break :blk e;
+    };
+
+    var state = try buildGgufStubCpuState(allocator, engine, ctx_size);
+    state.gguf = .{ .path = gguf_path, .engine = engine };
+    return state;
+}
+
+/// Stub CPU state for a GGUF cold load. Mirrors the stubs main.zig's
+/// `runLlamaServe`/`runDs4Serve` build for the startup path: the embedded
+/// engine owns the real tokenizer + chat template (the llama arm adopts the
+/// GGUF's embedded template at load), so only `model_type` (echoed in
+/// /v1/models + engine-arm dispatch guards) and `max_position_embeddings`
+/// (session sizing in runPrefillLlama/runPrefillDs4 + the server's context
+/// guard) matter. `ctx_size` is the --ctx-size launch flag; 0 → the same
+/// defaults the startup paths use (8192 for llama — the GGUF's trained
+/// context isn't readable until the engine opens; ds4's own default via
+/// clampSessionCtx).
+fn buildGgufStubCpuState(allocator: std.mem.Allocator, engine: gguf_meta.Engine, ctx_size: u32) !CpuState {
+    const config = try allocator.create(ModelConfig);
+    errdefer allocator.destroy(config);
+    config.* = switch (engine) {
+        .llama => ModelConfig{
+            .model_type = "gguf",
+            .weight_prefix = "model",
+            .head_dim = 128,
+            .max_position_embeddings = if (ctx_size > 0) ctx_size else 8192,
+            .is_encoder_only = false,
+        },
+        .ds4 => ModelConfig{
+            .model_type = "deepseek_v4",
+            .weight_prefix = "model",
+            .num_hidden_layers = 61,
+            .hidden_size = 7168,
+            .head_dim = 128,
+            .num_attention_heads = 56,
+            .num_key_value_heads = 56,
+            .max_position_embeddings = arch_ds4.clampSessionCtx(ctx_size),
+            .is_encoder_only = false,
+        },
+    };
+
+    const tok = try allocator.create(Tokenizer);
+    errdefer allocator.destroy(tok);
+    var byte_map: [256]u21 = undefined;
+    for (0..256) |b| byte_map[b] = @intCast(b);
+    tok.* = .{
+        .vocab = std.StringHashMap(u32).init(allocator),
+        .id_to_token = std.AutoHashMap(u32, []const u8).init(allocator),
+        .merge_ranks = @TypeOf(tok.merge_ranks).init(allocator),
+        .allocator = allocator,
+        .special_tokens = std.StringHashMap(u32).init(allocator),
+        .tok_type = .byte_level_bpe,
+        .byte_to_unicode = byte_map,
+        .unicode_to_byte = std.AutoHashMap(u21, u8).init(allocator),
+        .bos_id = null,
+        .eos_id = null,
+        .parsed_json = null,
+    };
+    errdefer tok.deinit();
+
+    const cc = try allocator.create(ChatConfig);
+    errdefer allocator.destroy(cc);
+    cc.* = .{
+        .chat_template = try allocator.dupe(u8, ""),
+        .bos_token = null,
+        .eos_token = null,
+        .add_bos_token = false,
+        .allocator = allocator,
+    };
+
+    return .{ .config = config, .tok = tok, .chat_config = cc };
 }
 
 /// ds4 load on the inference thread. Mirrors the MLX path's "open weights
@@ -2071,8 +2218,8 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     //    (eos slices, context length, model name) keep working.
     //
     //    `params` is anytype — either `LoadParams` (startup) or `*LoadRequest`
-    //    (on-demand cold-load). The latter doesn't yet support ds4 (Phase D
-    //    cold-load is MLX-only), so we read `ds4_path` from the value type's
+    //    (on-demand cold-load; `ensureLoaded` sets `ds4_path`/`llama_path`
+    //    when the entry resolves to a GGUF). Read from the value type's
     //    fields after a deref-when-pointer.
     const Ty = @TypeOf(params);
     const TyInfo = @typeInfo(Ty);
@@ -2081,9 +2228,8 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         try doLoadDs4OnInferenceThread(sch, params);
         return;
     }
-    // ── llama.cpp fast path: same shape as ds4, for any other GGUF. Cold-load
-    //    (LoadRequest) is MLX-only for now, so this only fires on startup
-    //    LoadParams that carry a non-empty `llama_path`.
+    // ── llama.cpp fast path: same shape as ds4, for any other GGUF. Fires on
+    //    startup LoadParams AND cold-load LoadRequests carrying `llama_path`.
     if (@hasField(Inner, "llama_path") and params.llama_path.len > 0) {
         try doLoadLlamaOnInferenceThread(sch, params);
         return;
@@ -3780,4 +3926,30 @@ test "modelBatchable permits pure-attention" {
     // Defaults are all zero / null → vanilla pure-attention path.
     var cfg = std.mem.zeroes(model_mod.ModelConfig);
     try testing.expect(modelBatchable(&cfg));
+}
+
+test "buildGgufStubCpuState: llama stub carries gguf model_type + ctx sizing" {
+    const a = std.testing.allocator;
+    // No --ctx-size → the same 8192 default runLlamaServe uses (the GGUF's
+    // trained context isn't readable until the engine opens).
+    var s = try buildGgufStubCpuState(a, .llama, 0);
+    defer freeCpuState(a, &s);
+    try testing.expectEqualStrings("gguf", s.config.model_type);
+    try testing.expectEqual(@as(u32, 8192), s.config.max_position_embeddings);
+    try testing.expect(s.gguf == null); // route is attached by preloadGgufCpuState
+    try testing.expectEqual(@as(usize, 0), s.chat_config.chat_template.len);
+
+    // Explicit --ctx-size flows through to session sizing + context guard.
+    var s2 = try buildGgufStubCpuState(a, .llama, 4096);
+    defer freeCpuState(a, &s2);
+    try testing.expectEqual(@as(u32, 4096), s2.config.max_position_embeddings);
+}
+
+test "buildGgufStubCpuState: ds4 stub carries deepseek_v4 + clamped ctx" {
+    const a = std.testing.allocator;
+    // Under-sized ctx floors at ds4's prefill chunk, exactly like runDs4Serve.
+    var s = try buildGgufStubCpuState(a, .ds4, 512);
+    defer freeCpuState(a, &s);
+    try testing.expectEqualStrings("deepseek_v4", s.config.model_type);
+    try testing.expectEqual(arch_ds4.clampSessionCtx(512), s.config.max_position_embeddings);
 }

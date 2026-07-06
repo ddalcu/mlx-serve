@@ -65,6 +65,20 @@ PY
 # 4. Server survives a gen, still healthy.
 curl -sf "http://127.0.0.1:$PORT/health" >/dev/null || { echo "FAIL: server died after image gen"; exit 1; }
 
+# 4b. A CHAT request aimed at the resident image model must 400 with an
+#     actionable message — pre-guard this SIGSEGV'd the whole server (the gen
+#     stub tokenizer yields 0 tokens and prefill derefs a null transformer):
+#     one remote request could kill the process. Same for /v1/messages and
+#     the Ollama surface, which share the textGenRejectReason guard.
+CHAT_AT_FLUX=$(api /v1/chat/completions -X POST -H 'Content-Type: application/json' \
+  -d "{\"model\":\"$FLUX_ID\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}],\"max_tokens\":8}")
+echo "$CHAT_AT_FLUX" | grep -q "images/generations" || { echo "FAIL: chat at image model should 400 with a redirect, got: $(echo "$CHAT_AT_FLUX" | head -c 200)"; exit 1; }
+MSG_AT_FLUX=$(api /v1/messages -X POST -H 'Content-Type: application/json' \
+  -d "{\"model\":\"$FLUX_ID\",\"max_tokens\":8,\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}")
+echo "$MSG_AT_FLUX" | grep -q "invalid_request_error" || { echo "FAIL: /v1/messages at image model should 400, got: $(echo "$MSG_AT_FLUX" | head -c 200)"; exit 1; }
+curl -sf "http://127.0.0.1:$PORT/health" >/dev/null || { echo "FAIL: server DIED on chat-at-image-model (the SIGSEGV class is back)"; exit 1; }
+echo "PASS: chat/messages at the image model -> clean 400s, server alive"
+
 # 5. Coexistence: load a chat model alongside FLUX, BOTH resident, chat streams.
 if [ -n "$CHAT" ]; then
   CHAT_ID="$(basename "$CHAT")"

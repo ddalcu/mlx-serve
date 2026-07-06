@@ -217,3 +217,4 @@ final class AudioGenTests: XCTestCase {
         XCTAssertEqual(floatSamplesReplica(from: blob), original)
     }
 }
+

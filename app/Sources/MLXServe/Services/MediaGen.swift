@@ -467,6 +467,242 @@ struct Model3DModelPreset: Identifiable, Hashable {
     static let all: [Model3DModelPreset] = [.hunyuan3d21_8bit]
 }
 
+/// ACE-Step music-generation checkpoints (the second audio backend beside
+/// Qwen3-TTS). Same local-convert convention as `Model3DModelPreset`.
+struct MusicModelPreset: Identifiable, Hashable {
+    let id: String
+    let name: String
+    /// Model directory under `~/.mlx-serve/models`. A `local/` prefix marks a
+    /// convert-on-device model (no HF pull); any other prefix is a normal repo.
+    let repo: String
+    /// Peak unified-memory footprint, GB — drives the soft RAM gate
+    /// (DiT + Qwen3-Embedding text encoder + Oobleck VAE resident together).
+    let approxRAMGB: Int
+    /// On-disk weight size, GB.
+    let approxDownloadGB: Double
+    /// Turbo checkpoints are distillation-fixed at 8 steps — not user-editable
+    /// (the LTX distilled-sigmas convention).
+    let fixedSteps: Int
+    /// Whether the checkpoint conditions on lyrics (all ACE-Step 1.5 do).
+    let supportsLyrics: Bool
+
+    static func == (lhs: Self, rhs: Self) -> Bool { lhs.id == rhs.id }
+    func hash(into hasher: inout Hasher) { hasher.combine(id) }
+
+    /// True when the model has no published HF repo yet and must be converted
+    /// locally — the pane shows a "convert locally" hint instead of a download
+    /// button while its weights are absent.
+    var isLocalOnly: Bool { repo.hasPrefix("local/") }
+
+    /// ACE-Step v1.5 XL Turbo, 8-bit — 4B-class DiT, 8-step distilled.
+    /// Published converted repo (DiT+encoders, Oobleck VAE, Qwen3-Embedding
+    /// text encoder in one bundle) — one-click download in the Music tab.
+    static let acestepXLTurbo8bit = MusicModelPreset(
+        id: "acestep-v15-xl-turbo-8bit",
+        name: "ACE-Step 1.5 XL Turbo (8-bit)",
+        repo: "ddalcu/ACE-Step-1.5-XL-Turbo-MLX-Serve-8bit",
+        approxRAMGB: 9,
+        approxDownloadGB: 6.3,
+        fixedSteps: 8,
+        supportsLyrics: true
+    )
+
+    /// Catalog. One entry today (the XL Turbo build); grows as more ACE-Step
+    /// variants convert.
+    static let all: [MusicModelPreset] = [.acestepXLTurbo8bit]
+}
+
+/// Dropdown catalogs for the Music tab's advanced options. Users shouldn't
+/// have to know the server's value grammar — every entry here is a value the
+/// engine accepts verbatim (languages ⊆ the reference VALID_LANGUAGES, bpm in
+/// [30,300], keyscales in note+accidental+mode form, time signatures in
+/// {2,3,4,6}). "Auto" rows map to nil/"" → the field is omitted from the
+/// request and the model decides.
+enum MusicOptions {
+    /// (label, language code). Codes are the reference pipeline's VALID_LANGUAGES.
+    static let languages: [(label: String, code: String)] = [
+        ("Auto", "unknown"),
+        ("English", "en"), ("Spanish", "es"), ("French", "fr"),
+        ("German", "de"), ("Italian", "it"), ("Portuguese", "pt"),
+        ("Japanese", "ja"), ("Korean", "ko"), ("Chinese", "zh"),
+        ("Cantonese", "yue"), ("Russian", "ru"), ("Hindi", "hi"),
+        ("Arabic", "ar"), ("Dutch", "nl"), ("Polish", "pl"),
+        ("Turkish", "tr"), ("Vietnamese", "vi"), ("Swedish", "sv"),
+    ]
+
+    /// (label, bpm). Labels carry the genre anchor so non-musicians can pick.
+    static let bpms: [(label: String, bpm: Int)] = [
+        ("60 — slow ballad", 60),
+        ("75 — downtempo", 75),
+        ("85 — hip-hop", 85),
+        ("95 — groove", 95),
+        ("105 — mid-tempo pop", 105),
+        ("120 — pop / house", 120),
+        ("128 — EDM", 128),
+        ("140 — trap / techno", 140),
+        ("160 — punk / footwork", 160),
+        ("174 — drum & bass", 174),
+    ]
+
+    /// All 24 conventional keys (12 pitch classes × major/minor).
+    static let keyscales: [String] = {
+        let notes = ["C", "C#", "D", "Eb", "E", "F", "F#", "G", "Ab", "A", "Bb", "B"]
+        return notes.map { "\($0) major" } + notes.map { "\($0) minor" }
+    }()
+
+    /// (label, wire value). The engine takes the beats-per-bar number.
+    static let timeSignatures: [(label: String, value: String)] = [
+        ("4/4", "4"), ("3/4", "3"), ("2/4", "2"), ("6/8", "6"),
+    ]
+}
+
+/// A reusable named prompt for the Music tab's Examples menus — a built-in
+/// starter or a user-saved one (persisted via `MusicPromptLibrary`). Used for
+/// BOTH the style-prompt and lyrics fields; `title` is the display + dedup key.
+struct MusicPrompt: Codable, Equatable, Identifiable {
+    let title: String
+    let body: String
+    var id: String { title }
+
+    /// Built-in style-prompt starters (genre / mood / instrumentation).
+    static let builtinStyles: [MusicPrompt] = [
+        MusicPrompt(title: "Synthwave",
+            body: "Upbeat 80s synthwave with a driving analog bass line, dreamy lush pads, punchy retro drum machine, and a catchy soaring lead synth melody. Retro-futuristic, neon night-drive mood."),
+        MusicPrompt(title: "Lo-fi study beats",
+            body: "Chill lo-fi hip hop with a dusty vinyl texture, warm mellow Rhodes piano chords, soft boom-bap drums, gentle tape saturation, and a relaxed nostalgic late-night mood."),
+        MusicPrompt(title: "Epic orchestral",
+            body: "Epic cinematic orchestral trailer music with thunderous taiko drums, soaring string ostinatos, heroic brass fanfares, and a choir swelling to a triumphant climax."),
+        MusicPrompt(title: "Modern pop",
+            body: "Bright modern pop with punchy drums, shimmering synths, a bouncy bass groove, and a catchy female vocal hook. Radio-ready, feel-good summer energy."),
+        MusicPrompt(title: "Acoustic folk",
+            body: "Intimate acoustic folk ballad with fingerpicked guitar, soft warm male vocals, gentle harmonies, and a touch of cello. Quiet fireside atmosphere, honest and tender."),
+        MusicPrompt(title: "Stadium rock",
+            body: "High-energy stadium rock anthem with crunchy electric guitars, pounding drums, a driving bass, and powerful raspy male vocals building into a huge singalong chorus."),
+        MusicPrompt(title: "Deep house",
+            body: "Warm deep house with a rolling four-on-the-floor kick, deep sub bass, silky filtered chords, soft vocal chops, and a hypnotic late-night club groove."),
+        MusicPrompt(title: "Jazz trio",
+            body: "Relaxed late-night jazz trio with brushed drums, walking upright bass, and warm improvised piano. Smoky lounge atmosphere, tender and swinging."),
+        MusicPrompt(title: "Trap",
+            body: "Hard-hitting trap beat with booming 808 bass, crisp rattling hi-hats, dark atmospheric bells, and punchy snappy snares. Confident, cinematic, modern."),
+        MusicPrompt(title: "Cinematic ambient",
+            body: "Slow cinematic ambient with evolving warm synth pads, distant piano, soft field-recording textures, and a gentle emotional swell. Spacious, reflective, calm."),
+    ]
+
+    /// Built-in lyric templates — ORIGINAL, royalty-free skeletons across the
+    /// song types people reach for most, meant as editable starting points.
+    /// (These are original placeholder lyrics, NOT reproductions of any
+    /// existing song — real lyrics are copyrighted and users add their own.)
+    static let builtinLyrics: [MusicPrompt] = [
+        MusicPrompt(title: "Pop hook", body: """
+            [Verse]
+            Woke up with the sunlight spilling on the floor
+            Got that feeling something good is knocking at my door
+            Phone down, head up, stepping into gold
+            Every little moment worth a hundred more
+
+            [Chorus]
+            We're alive tonight, hearts on fire
+            Dancing till the stars retire
+            Turn it up, don't let it fade
+            This is the memory we made
+            """),
+        MusicPrompt(title: "Acoustic ballad", body: """
+            [Verse]
+            The kettle hums a tired song, the winter's at the door
+            Your letters in a shoebox that I don't read anymore
+            But the garden that we planted still comes up every spring
+            Some things keep their promises without us doing anything
+
+            [Chorus]
+            So I'll leave the porch light burning, like the old days
+            Half the town away from you, and half a life too late
+            If you ever wander home, you won't have to knock
+            The door was never locked
+            """),
+        MusicPrompt(title: "Rock anthem", body: """
+            [Verse]
+            Concrete under worn-out shoes, we've been running all our lives
+            Every no we ever heard just sharpened up our knives
+            They said settle, we said never, wrote it on the wall
+
+            [Chorus]
+            We are the thunder, hear us roar
+            Kicking down that closed door
+            Louder than they've ever known
+            Tonight we take the throne
+            """),
+        MusicPrompt(title: "Love song", body: """
+            [Verse]
+            You found me in the noise of an ordinary day
+            Quiet as a Sunday, you just took my breath away
+            No grand parade, no fireworks, no scene
+            Just your hand in mine and everything between
+
+            [Chorus]
+            And I'd choose you, I'd choose you again
+            Every version of this world I'm ever in
+            Come the highs, come the lows, come whatever's true
+            I would still, I would always choose you
+            """),
+        MusicPrompt(title: "Breakup song", body: """
+            [Verse]
+            I still take the long way, drive right past your street
+            Left your hoodie in the closet, couldn't fold it up so neat
+            Everybody says that time is gonna set me free
+            But the clocks all move so slow when you're not here with me
+
+            [Chorus]
+            So I'm learning how to miss you and let you go
+            Two things I never thought that I could hold
+            You were half of every plan I ever made
+            Now I'm building something new out of the shade
+            """),
+        MusicPrompt(title: "Party anthem", body: """
+            [Verse]
+            Lights down low, the whole room starting to move
+            Bassline hitting like it's got something to prove
+            No worries left outside on the floor
+            Hands to the ceiling, then we ask for more
+
+            [Chorus]
+            Turn it up, turn it up, let the whole night ring
+            We came here to dance, we came here to sing
+            Nobody's tired, nobody's slow
+            Tonight we let it all go
+            """),
+    ]
+}
+
+/// Pure helpers for the Music tab's saved-prompt library. Deduped by title
+/// (case-sensitive), newest-first; uncapped (prompts are small text).
+enum MusicPromptStore {
+    /// Auto-title from a body: the first non-empty, non-`[section]` line,
+    /// collapsed and capped at 40 chars. "" → "Untitled".
+    static func autoTitle(from body: String) -> String {
+        let lines = body.split(whereSeparator: \.isNewline).map { $0.trimmingCharacters(in: .whitespaces) }
+        let first = lines.first { line in
+            !line.isEmpty && !(line.hasPrefix("[") && line.hasSuffix("]"))
+        } ?? ""
+        let collapsed = first.split(whereSeparator: { $0 == " " || $0 == "\t" }).joined(separator: " ")
+        if collapsed.isEmpty { return "Untitled" }
+        if collapsed.count > 40 {
+            return String(collapsed.prefix(40)).trimmingCharacters(in: .whitespaces) + "…"
+        }
+        return collapsed
+    }
+
+    /// Front-insert `prompt`, removing any earlier entry with the same title.
+    static func adding(_ prompt: MusicPrompt, to list: [MusicPrompt]) -> [MusicPrompt] {
+        var out = list
+        out.removeAll { $0.title == prompt.title }
+        out.insert(prompt, at: 0)
+        return out
+    }
+
+    static func removing(title: String, from list: [MusicPrompt]) -> [MusicPrompt] {
+        list.filter { $0.title != title }
+    }
+}
 // MARK: - Requests
 
 struct ImageGenRequest {
@@ -582,6 +818,26 @@ struct AudioGenRequest {
     var speed: Double = 1.0
     /// Sampling temperature — higher is more expressive/varied.
     var temperature: Double = 0.7
+    /// Keep the model resident after this generation (default off → unload).
+    var keepResident: Bool = false
+}
+
+struct MusicGenRequest {
+    var model: MusicModelPreset
+    /// Style/genre/mood description — the "in the style of…" prompt.
+    var prompt: String
+    /// Optional lyrics; empty → the server's "[Instrumental]" convention.
+    var lyrics: String = ""
+    /// Vocal language code ("en", "zh", …) — only meaningful with lyrics.
+    var vocalLanguage: String = "en"
+    /// Optional musical metadata; nil/empty → the model decides ("N/A").
+    var bpm: Int? = nil
+    var keyscale: String = ""
+    var timesignature: String = ""
+    /// Track length in seconds (server-valid 10–600).
+    var durationSeconds: Int = 60
+    /// -1 = fresh random seed per generation.
+    var seed: Int = -1
     /// Keep the model resident after this generation (default off → unload).
     var keepResident: Bool = false
 }

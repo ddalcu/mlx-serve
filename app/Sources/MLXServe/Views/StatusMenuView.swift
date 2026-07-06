@@ -111,9 +111,9 @@ enum GenExperiment: String, CaseIterable, Identifiable {
 
     var title: String {
         switch self {
-        case .image: "ImageGen"
-        case .video: "VideoGen"
-        case .audio: "AudioGen"
+        case .image: "Image"
+        case .video: "Video"
+        case .audio: "Audio"
         case .model3d: "3D"
         }
     }
@@ -123,7 +123,7 @@ enum GenExperiment: String, CaseIterable, Identifiable {
         switch self {
         case .image: "Image Generation (FLUX.2 / Krea-2)"
         case .video: "Video Generation (LTX-Video 2.3)"
-        case .audio: "Audio Generation — neural TTS & voice cloning"
+        case .audio: "Audio Generation — voice cloning & music"
         case .model3d: "3D Generation — photo to mesh (Hunyuan3D 2.1)"
         }
     }

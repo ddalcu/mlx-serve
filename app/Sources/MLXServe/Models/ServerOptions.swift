@@ -133,6 +133,15 @@ struct ServerOptions: Codable, Equatable {
     /// `sandbox` — it's deliberately excluded from `serverLaunchEquals` and
     /// `toCLIArgs`: changing it must never prompt a server restart.
     var voiceClonePath: String = ""
+    /// Whether voice mode actually speaks with the clone. Selecting a system
+    /// voice in the voice picker flips this off WITHOUT deleting the clip, so
+    /// switching back to "My voice" stays one click. Defaults true — a clip
+    /// set before this toggle existed keeps cloning (legacy behavior).
+    var voiceCloneEnabled: Bool = true
+    /// Human-readable name for the clip shown in the voice picker (the picked
+    /// file's name, or "Recorded clip") — the stored clip itself is always
+    /// normalized to `voice-clone.wav`, which is useless as a display name.
+    var voiceCloneLabel: String = ""
 
     enum LogLevel: String, Codable, CaseIterable, Identifiable {
         case error, warn, info, debug
@@ -525,6 +534,8 @@ extension ServerOptions {
         if let v = try c.decodeIfPresent(TelegramConfig.self, forKey: .telegram) { telegram = v }
         if let v = try c.decodeIfPresent(SandboxConfig.self, forKey: .sandbox) { sandbox = v }
         if let v = try c.decodeIfPresent(String.self, forKey: .voiceClonePath) { voiceClonePath = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .voiceCloneEnabled) { voiceCloneEnabled = v }
+        if let v = try c.decodeIfPresent(String.self, forKey: .voiceCloneLabel) { voiceCloneLabel = v }
     }
 }
 

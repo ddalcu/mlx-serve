@@ -55,6 +55,7 @@ final class AudioGenService: ObservableObject {
         let outputPath = Self.makeOutputPath(text: request.text)
         let text = request.text
         let keep = request.keepResident
+        let sidecar = Self.settingsText(request, modelName: request.model.name)
         // Reference voice for zero-shot cloning: the recorded/picked clip is
         // already normalized to 24 kHz mono WAV by AudioReference. Send it
         // base64 as `ref_audio`; the server runs it through the ECAPA-TDNN
@@ -109,6 +110,9 @@ final class AudioGenService: ObservableObject {
                     return
                 }
                 try wav.write(to: URL(fileURLWithPath: outputPath))
+                // Settings sidecar: <clip>.txt with the text + voice params.
+                try? sidecar.write(to: URL(fileURLWithPath: Self.sidecarPath(forWav: outputPath)),
+                                   atomically: true, encoding: .utf8)
                 phase = .completed(path: outputPath)
                 insertRecent(outputPath)
             } catch is CancellationError {
@@ -134,26 +138,33 @@ final class AudioGenService: ObservableObject {
     }
 
     private func insertRecent(_ path: String) {
-        recent.removeAll { $0 == path }
-        recent.insert(path, at: 0)
-        if recent.count > 40 { recent.removeLast(recent.count - 40) }
+        recent = MediaRecents.inserting(path, into: recent)
     }
 
     private func loadRecent() {
-        let root = MediaStorage.audiosRoot
-        let fm = FileManager.default
-        guard let days = try? fm.contentsOfDirectory(atPath: root) else { return }
-        var paths: [(String, Date)] = []
-        for day in days.sorted(by: >) {
-            let dayDir = (root as NSString).appendingPathComponent(day)
-            guard let files = try? fm.contentsOfDirectory(atPath: dayDir) else { continue }
-            for f in files where f.hasSuffix(".wav") {
-                let full = (dayDir as NSString).appendingPathComponent(f)
-                let date = (try? fm.attributesOfItem(atPath: full)[.modificationDate] as? Date) ?? .distantPast
-                paths.append((full, date))
-            }
+        recent = MediaRecents.scan(root: MediaStorage.audiosRoot, suffix: ".wav")
+    }
+
+    /// `<clip>.txt` settings sidecar written beside each generated clip.
+    nonisolated static func settingsText(_ request: AudioGenRequest, modelName: String) -> String {
+        var lines: [String] = [
+            "model: \(modelName)",
+            "speed: \(String(format: "%.2f", request.speed))",
+            "temperature: \(String(format: "%.2f", request.temperature))",
+        ]
+        if let ref = request.refAudioPath, !ref.isEmpty {
+            lines.append("reference_voice: \((ref as NSString).lastPathComponent)")
         }
-        recent = paths.sorted { $0.1 > $1.1 }.prefix(40).map(\.0)
+        let refText = request.refText.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !refText.isEmpty { lines.append("reference_transcript: \(refText)") }
+        var out = lines.joined(separator: "\n")
+        out += "\n\n# Text\n" + request.text.trimmingCharacters(in: .whitespacesAndNewlines)
+        return out + "\n"
+    }
+
+    /// `<clip>.wav` → `<clip>.txt` companion path.
+    nonisolated static func sidecarPath(forWav wavPath: String) -> String {
+        (wavPath as NSString).deletingPathExtension + ".txt"
     }
 
     /// Slug + dated `.wav` path under `audiosRoot`, mirroring the image/video

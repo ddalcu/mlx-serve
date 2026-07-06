@@ -225,6 +225,22 @@ pub fn main(init: std.process.Init) !void {
                 std.process.exit(1);
             }
             run_model_dir = try cli_mod.ensureModelAvailable(allocator, io, args[2]);
+            // `run` is the chat UX — refuse non-chat models up front with
+            // the serve alternative instead of booting a server whose chat
+            // surface can only 400 (pre-guard it SIGSEGV'd: the media stub
+            // tokenizer yields 0 tokens and prefill derefs a null
+            // transformer — see server.zig textGenRejectReason).
+            if (model_discovery.classifyModelPath(io, allocator, run_model_dir.?)) |kind| {
+                if (kind != .chat) {
+                    log.err("'{s}' is {s} — `mlx-serve run` starts a chat REPL, which it can't serve.\n", .{ args[2], kind.describe() });
+                    if (kind.genEndpoint()) |ep| {
+                        log.err("serve it for API/app use instead:\n", .{});
+                        log.err("  mlx-serve --model \"{s}\" --serve\n", .{run_model_dir.?});
+                        log.err("  then POST {s}\n", .{ep});
+                    }
+                    std.process.exit(1);
+                }
+            }
             arg_start = 3;
             use_default_models_root = true;
             repl_after_serve = std.Io.File.stdin().isTty(io) catch false;
@@ -875,6 +891,7 @@ pub fn main(init: std.process.Init) !void {
             .tok = tok,
             .chat_config = chat_config,
             .model_dir = model_dir,
+            .ctx_size = ctx_size,
             .drafter_dir = drafter_dir orelse "",
             .mtp_enabled = enable_mtp,
             .mtp_depth = mtp_depth,
@@ -1051,109 +1068,13 @@ fn portInUse(io: std.Io, port: u16) bool {
     return true;
 }
 
-/// Parse a size-style CLI argument: bare integer = bytes, suffix `KB`/`MB`/
-/// `GB` (case-insensitive) multiplies by 1024^N, "0"/"off" = 0. Used by
-/// `--prefix-cache-mem`; returns `error.InvalidSize` on malformed input.
-/// True if `path` points at a .gguf file or a directory that contains one.
-/// We accept directories so users can pass the canonical
-/// `~/.mlx-serve/models/<owner>/<repo>/` shape Swift sets up. `mmproj-*.gguf`
-/// sidecars are NOT counted — a directory containing only an mmproj file
-/// is not a valid LLM path (`isMmprojGgufBasename` lives next to
-/// `isDs4GgufBasename` in `model_discovery.zig`).
-
-fn isGgufPath(io: std.Io, path: []const u8) bool {
-    // Empty / non-absolute path (e.g. headless boot with no --model): not a
-    // GGUF. Guard before `openDirAbsolute`, which ASSERTS the path is absolute
-    // (`unreachable` on "") — in ReleaseFast that's UB that miscompiles the
-    // caller (the headless branch below was silently eliminated until this).
-    if (path.len == 0 or !std.fs.path.isAbsolute(path)) return false;
-    // For a direct .gguf file path: always route to the llama branch so
-    // `resolveGgufFile` can emit a precise error if it's actually an
-    // mmproj sidecar. Falling through to the MLX path on a mmproj.gguf
-    // produces an opaque "no config.json" failure instead.
-    if (std.mem.endsWith(u8, path, ".gguf")) return true;
-    var dir = std.Io.Dir.openDirAbsolute(io, path, .{ .iterate = true }) catch return false;
-    defer dir.close(io);
-    var it = dir.iterate();
-    while (it.next(io) catch return false) |entry| {
-        if (entry.kind != .file) continue;
-        if (!std.mem.endsWith(u8, entry.name, ".gguf")) continue;
-        // For directories we DO filter mmproj sidecars from "is this a GGUF
-        // dir?" — a folder with only mmproj.gguf shouldn't be classified as
-        // a llama LLM. `resolveGgufFile` then reports
-        // `error.OnlyMmprojGgufFile` if the user explicitly targets such a
-        // dir.
-        if (model_discovery.isMmprojGgufBasename(entry.name)) continue;
-        return true;
-    }
-    return false;
-}
-
-/// Resolve the actual .gguf file path. When `path` is a directory, return
-/// the first non-mmproj `.gguf` entry within it (caller frees). When `path`
-/// is already a file, return a dup. Errors:
-///   error.NoGgufFile         — no .gguf files at all
-///   error.OnlyMmprojGgufFile — directory (or path) had only mmproj sidecars
-///
-/// This function does NOT log on error — the caller decides whether the
-/// error is "fatal user load" (then call `logResolveGgufError` to surface
-/// the actionable message) or "silent probe" (e.g. `isDs4Gguf` checks the
-/// basename and would otherwise double-print on a mmproj path).
-fn resolveGgufFile(io: std.Io, allocator: std.mem.Allocator, path: []const u8) ![]u8 {
-    if (std.mem.endsWith(u8, path, ".gguf")) {
-        if (model_discovery.isMmprojGgufBasename(std.fs.path.basename(path))) {
-            return error.OnlyMmprojGgufFile;
-        }
-        return allocator.dupe(u8, path);
-    }
-    var dir = try std.Io.Dir.openDirAbsolute(io, path, .{ .iterate = true });
-    defer dir.close(io);
-    var it = dir.iterate();
-    var saw_mmproj = false;
-    var pick: ?[]u8 = null;
-    errdefer if (pick) |p| allocator.free(p);
-    while (try it.next(io)) |entry| {
-        if (entry.kind != .file) continue;
-        if (!std.mem.endsWith(u8, entry.name, ".gguf")) continue;
-        if (model_discovery.isMmprojGgufBasename(entry.name)) {
-            saw_mmproj = true;
-            continue;
-        }
-        // Deterministic pick when multiple LLM .ggufs are present: keep the
-        // alphabetically smallest. Avoids "load order depends on readdir(3)
-        // iteration order" (filesystem-dependent on macOS) and lets the
-        // user predict which quant gets loaded when they drop both
-        // `Q4_K_M.gguf` and `Q8_0.gguf` into one folder.
-        if (pick == null or std.mem.lessThan(u8, entry.name, std.fs.path.basename(pick.?))) {
-            if (pick) |p| allocator.free(p);
-            pick = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ path, entry.name });
-        }
-    }
-    if (pick) |p| return p;
-    if (saw_mmproj) return error.OnlyMmprojGgufFile;
-    return error.NoGgufFile;
-}
-
-/// Emit a user-facing, actionable error message for the failures
-/// `resolveGgufFile` can return. Call from the fatal load path; probes
-/// (e.g. routing-decision helpers) should NOT log and let the eventual
-/// resolveGgufFile re-attempt surface the error once.
-fn logResolveGgufError(path: []const u8, err: anyerror) void {
-    switch (err) {
-        error.OnlyMmprojGgufFile => {
-            // Discriminate between "user pointed at the mmproj file
-            // directly" and "directory had only mmproj sidecars" via the
-            // suffix check we already did in resolveGgufFile.
-            if (std.mem.endsWith(u8, path, ".gguf")) {
-                log.err("'{s}' is an mmproj sidecar (CLIP vision/audio encoder), not an LLM. Point at the language-model .gguf (typically the same directory, e.g. `*-Q4_K_M.gguf`).\n", .{path});
-            } else {
-                log.err("'{s}' contains only mmproj sidecars (multimodal projection / CLIP encoders). Download or move the matching language-model .gguf (e.g. `*-Q4_K_M.gguf`) into this directory.\n", .{path});
-            }
-        },
-        error.NoGgufFile => log.err("'{s}' contains no .gguf files.\n", .{path}),
-        else => log.err("resolveGgufFile('{s}'): {s}\n", .{ path, @errorName(err) }),
-    }
-}
+// GGUF path helpers (`isGgufModelPath` / `resolveGgufFile` /
+// `logResolveGgufError`) live in `model_discovery.zig` — shared with
+// discovery and the scheduler's cold-load path, and hermetically tested
+// there (main.zig is the executable root and not in the test pool).
+const isGgufPath = model_discovery.isGgufModelPath;
+const resolveGgufFile = model_discovery.resolveGgufFile;
+const logResolveGgufError = model_discovery.logResolveGgufError;
 
 /// Decide which embedded engine serves a `.gguf` file (or dir containing one).
 ///
@@ -1365,6 +1286,7 @@ fn runGenServe(
         .tok = stub.tok,
         .chat_config = stub.chat_config,
         .model_dir = model_dir,
+        .ctx_size = ctx_size,
         .load_vision = false,
         .warmup_eager = false,
         .draft_block_size = 0,
@@ -1467,6 +1389,7 @@ fn runHeadlessServe(
         .tok = stub.tok,
         .chat_config = stub.chat_config,
         .model_dir = "",
+        .ctx_size = ctx_size,
         .no_initial_load = true,
         .load_vision = false,
         .warmup_eager = false,
@@ -1663,6 +1586,7 @@ fn runDs4Serve(
         .tok = tok_storage,
         .chat_config = chat_config_storage,
         .model_dir = gguf_path_owned, // unused on the ds4 branch but kept symmetric
+        .ctx_size = ctx_size,
         .drafter_dir = "",
         .load_vision = false,
         .warmup_eager = false,
@@ -1923,6 +1847,7 @@ fn runLlamaServe(
         .tok = tok_storage,
         .chat_config = chat_config_storage,
         .model_dir = gguf_path_owned, // unused on the llama branch but kept symmetric
+        .ctx_size = ctx_size,
         .drafter_dir = "",
         .load_vision = false,
         .warmup_eager = false,
@@ -1958,6 +1883,9 @@ fn runLlamaServe(
     });
 }
 
+/// Parse a size-style CLI argument: bare integer = bytes, suffix `KB`/`MB`/
+/// `GB` (case-insensitive) multiplies by 1024^N, "0"/"off" = 0. Used by
+/// `--prefix-cache-mem`; returns `error.InvalidSize` on malformed input.
 fn parseSizeArg(s: []const u8) !u64 {
     if (std.mem.eql(u8, s, "off") or std.mem.eql(u8, s, "0")) return 0;
     var end: usize = s.len;
@@ -1979,10 +1907,7 @@ fn parseSizeArg(s: []const u8) !u64 {
     return n * mult;
 }
 
-// Pure-function tests for `isMmprojGgufBasename` live with the
-// implementation in `src/model_discovery.zig` (where they get picked up
-// by `zig build test`); main.zig itself is the executable root and is
-// not in the test pool. The directory-walk behavior of `resolveGgufFile`
-// is covered by integration: pointing the loader at a directory that
-// contains both `mmproj-*.gguf` and the real LLM .gguf now reliably
-// picks the LLM (manually verified after fixing the sidecar-skip).
+// Tests for the GGUF path helpers (`isMmprojGgufBasename`,
+// `isGgufModelPath`, `resolveGgufFile`) live with the implementations in
+// `src/model_discovery.zig` (where they get picked up by `zig build test`);
+// main.zig itself is the executable root and is not in the test pool.

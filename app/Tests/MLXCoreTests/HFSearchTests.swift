@@ -767,3 +767,17 @@ final class MemoryInfoFormatRangeTests: XCTestCase {
         XCTAssertEqual(a, b)
     }
 }
+
+// =============================================================================
+// MARK: - Model browser search defaults
+// =============================================================================
+
+@MainActor
+final class HFSearchDefaultsTests: XCTestCase {
+    /// The format filter defaults to MLX — the native engine's format — not
+    /// "Both": mixing GGUF into the default results buries the recommended
+    /// MLX builds. GGUF stays one click away in the segmented picker.
+    func testFormatFilterDefaultsToMlx() {
+        XCTAssertEqual(HFSearchService().format, .mlx)
+    }
+}

@@ -33,7 +33,10 @@ class HFSearchService: ObservableObject {
     @Published var isLoading = false
     @Published var error: String?
     @Published var searchQuery = ""
-    @Published var format: ModelFormat = .both
+    // Default to MLX (the native engine's format), not Both — mixing GGUF
+    // into the default results buries the recommended MLX builds. GGUF/Both
+    // stay one click away in the browser's segmented picker.
+    @Published var format: ModelFormat = .mlx
     @Published var sortField: HFSortField = .downloads
     @Published var sortDescending = true
     @Published var hasMore = true

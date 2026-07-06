@@ -132,6 +132,45 @@ extension AudioGenSettings {
     }
 }
 
+// MARK: - Music
+
+struct MusicGenSettings: Codable, Equatable {
+    var modelId: String = MusicModelPreset.acestepXLTurbo8bit.id
+    var durationSeconds: Int = 60
+    var vocalLanguage: String = "en"
+    var keepResident: Bool = false
+
+    private static let storageKey = "musicGenSettings"
+
+    static func load() -> MusicGenSettings {
+        guard let data = UserDefaults.standard.data(forKey: storageKey),
+              let v = try? JSONDecoder().decode(MusicGenSettings.self, from: data) else {
+            return MusicGenSettings()
+        }
+        return v
+    }
+
+    func save() {
+        guard let data = try? JSONEncoder().encode(self) else { return }
+        UserDefaults.standard.set(data, forKey: Self.storageKey)
+    }
+}
+
+extension MusicGenSettings {
+    var resolvedModel: MusicModelPreset {
+        MusicModelPreset.all.first { $0.id == modelId } ?? .acestepXLTurbo8bit
+    }
+
+    init(from decoder: Decoder) throws {
+        self.init()
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        if let v = try c.decodeIfPresent(String.self, forKey: .modelId) { modelId = v }
+        if let v = try c.decodeIfPresent(Int.self, forKey: .durationSeconds) { durationSeconds = v }
+        if let v = try c.decodeIfPresent(String.self, forKey: .vocalLanguage) { vocalLanguage = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .keepResident) { keepResident = v }
+    }
+}
+
 // MARK: - Video
 
 struct VideoGenSettings: Codable, Equatable {

@@ -86,10 +86,8 @@ class AppState: ObservableObject {
     lazy var imageGen = ImageGenService()
     lazy var videoGen = VideoGenService()
     lazy var audioGen = AudioGenService()
+    lazy var musicGen = MusicGenService()
     lazy var model3dGen = Model3DGenService()
-    @Published var hasSeenWelcome: Bool {
-        didSet { UserDefaults.standard.set(hasSeenWelcome, forKey: "hasSeenWelcome") }
-    }
     @Published var autoStartServer: Bool {
         didSet { UserDefaults.standard.set(autoStartServer, forKey: "autoStartServer") }
     }
@@ -181,7 +179,6 @@ class AppState: ObservableObject {
     }()
 
     init() {
-        self.hasSeenWelcome = UserDefaults.standard.bool(forKey: "hasSeenWelcome")
         self.autoStartServer = UserDefaults.standard.bool(forKey: "autoStartServer")
         self.hotSwitchEnabled = UserDefaults.standard.bool(forKey: "hotSwitchEnabled")
         self.selectedModelPath = UserDefaults.standard.string(forKey: "selectedModelPath") ?? ""
@@ -233,13 +230,15 @@ class AppState: ObservableObject {
         updates.willRelaunch = { [weak self] in self?.server.stop() }
         updates.startAutoCheck()
 
-        // Show welcome window on first launch
-        if !hasSeenWelcome {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
-                Self.showWelcomeWindow {
-                    self?.hasSeenWelcome = true
-                }
-            }
+        // Keep the activation policy in sync with open windows: any real
+        // window (Chat, media panes, the intro window) makes the app
+        // ⌘Tab-selectable; menu-bar-only → back to accessory.
+        ActivationPolicyManager.shared.start()
+
+        // Show the welcome window on every launch — it's the app's intro /
+        // quick-start screen and hosts the CLI install button.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+            Self.showWelcomeWindow { Self._welcomeWindow?.close() }
         }
 
         // Auto-start server if enabled and a model is available

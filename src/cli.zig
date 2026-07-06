@@ -20,6 +20,7 @@
 
 const std = @import("std");
 const ollama = @import("ollama.zig");
+const model_discovery = @import("model_discovery.zig");
 const log = @import("log.zig");
 
 // ── Alias table ─────────────────────────────────────────────────────────
@@ -445,7 +446,7 @@ pub fn cmdList(allocator: std.mem.Allocator, io: std.Io) !void {
     };
     defer dir.close(io);
 
-    try w.print("{s: <56} {s: >10}\n", .{ "NAME", "SIZE" });
+    try w.print("{s: <56} {s: <12} {s: >10}\n", .{ "NAME", "TYPE", "SIZE" });
     var count: usize = 0;
     var it = dir.iterate();
     while (it.next(io) catch null) |entry| {
@@ -454,7 +455,7 @@ pub fn cmdList(allocator: std.mem.Allocator, io: std.Io) !void {
         var sub = dir.openDir(io, entry.name, .{ .iterate = true }) catch continue;
         defer sub.close(io);
         if (isModelDir(io, &sub)) {
-            try printModelRow(io, w, &sub, entry.name);
+            try printModelRow(io, allocator, w, &sub, entry.name, root);
             count += 1;
             continue;
         }
@@ -467,7 +468,7 @@ pub fn cmdList(allocator: std.mem.Allocator, io: std.Io) !void {
             if (!isModelDir(io, &leaf)) continue;
             var name_buf: [512]u8 = undefined;
             const full = std.fmt.bufPrint(&name_buf, "{s}/{s}", .{ entry.name, sub_entry.name }) catch continue;
-            try printModelRow(io, w, &leaf, full);
+            try printModelRow(io, allocator, w, &leaf, full, root);
             count += 1;
         }
     }
@@ -487,16 +488,49 @@ fn isModelDir(io: std.Io, dir: *std.Io.Dir) bool {
     return false;
 }
 
-fn printModelRow(io: std.Io, w: *std.Io.Writer, dir: *std.Io.Dir, name: []const u8) !void {
+fn printModelRow(io: std.Io, allocator: std.mem.Allocator, w: *std.Io.Writer, dir: *std.Io.Dir, name: []const u8, root: []const u8) !void {
+    const bytes = dirBytesOneLevel(io, dir);
+    // TYPE from the same classification serving uses (gguf → chat via the
+    // embedded engines, media modalities, embed, drafter, unsupported) so
+    // the list is honest about which rows `run` can actually chat with.
+    const abs = std.fmt.allocPrint(allocator, "{s}/{s}", .{ root, name }) catch null;
+    defer if (abs) |a| allocator.free(a);
+    const kind_label: []const u8 = blk: {
+        const a = abs orelse break :blk "?";
+        const kind = model_discovery.classifyModelPath(io, allocator, a) orelse break :blk "?";
+        break :blk kind.label();
+    };
+    var size_buf: [32]u8 = undefined;
+    try w.print("{s: <56} {s: <12} {s: >10}\n", .{ name, kind_label, formatSize(&size_buf, bytes) });
+}
+
+/// Sum file bytes in a model dir INCLUDING one level of subdirectories —
+/// media bundles keep their weights in transformer/ vae/ text_encoder/ etc.
+/// (the same one-level layout assumption `modelPresent` makes). Top-level-
+/// only summing showed a 7 GB FLUX bundle as "6 KB".
+fn dirBytesOneLevel(io: std.Io, dir: *std.Io.Dir) u64 {
     var bytes: u64 = 0;
     var it = dir.iterate();
     while (it.next(io) catch null) |entry| {
-        if (entry.kind != .file) continue;
-        const st = dir.statFile(io, entry.name, .{}) catch continue;
-        bytes += st.size;
+        switch (entry.kind) {
+            .file, .sym_link => {
+                const st = dir.statFile(io, entry.name, .{}) catch continue;
+                if (st.kind == .file) bytes += @intCast(st.size);
+            },
+            .directory => {
+                var sub = dir.openDir(io, entry.name, .{ .iterate = true }) catch continue;
+                defer sub.close(io);
+                var sit = sub.iterate();
+                while (sit.next(io) catch null) |se| {
+                    if (se.kind != .file) continue;
+                    const st = sub.statFile(io, se.name, .{}) catch continue;
+                    bytes += @intCast(st.size);
+                }
+            },
+            else => {},
+        }
     }
-    var size_buf: [32]u8 = undefined;
-    try w.print("{s: <56} {s: >10}\n", .{ name, formatSize(&size_buf, bytes) });
+    return bytes;
 }
 
 pub fn formatSize(buf: []u8, bytes: u64) []const u8 {
@@ -880,4 +914,22 @@ test "cli: formatSize" {
     try testing.expectEqualStrings("5.2 GB", formatSize(&buf, 5_600_000_000));
     try testing.expectEqualStrings("35 MB", formatSize(&buf, 36_700_160));
     try testing.expectEqualStrings("2 KB", formatSize(&buf, 2048));
+}
+
+test "cli: dirBytesOneLevel counts weight subdirs (FLUX bundle showed 6 KB)" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    // Media-bundle shape: small top-level config + the actual weights one
+    // level down in transformer/ and vae/ (the modelPresent layout).
+    try tmp.dir.createDirPath(io, "m/transformer");
+    try tmp.dir.createDirPath(io, "m/vae");
+    try tmp.dir.writeFile(io, .{ .sub_path = "m/config.json", .data = "{}" }); // 2 bytes
+    try tmp.dir.writeFile(io, .{ .sub_path = "m/transformer/w.safetensors", .data = "0123456789" }); // 10
+    try tmp.dir.writeFile(io, .{ .sub_path = "m/vae/w.safetensors", .data = "0123" }); // 4
+
+    var m = try tmp.dir.openDir(io, "m", .{ .iterate = true });
+    defer m.close(io);
+    try testing.expectEqual(@as(u64, 16), dirBytesOneLevel(io, &m));
 }

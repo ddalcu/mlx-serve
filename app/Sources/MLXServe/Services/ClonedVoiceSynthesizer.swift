@@ -84,8 +84,10 @@ final class ClonedVoiceSynthesizer: SpeechSynthesizing {
         self.init(
             system: SystemSpeechSynthesizer(),
             clipPath: {
-                let path = ServerOptions.load().voiceClonePath
-                return path.isEmpty ? nil : path
+                // The voice picker can switch back to a system voice without
+                // deleting the clip — honor that toggle here.
+                let o = ServerOptions.load()
+                return (o.voiceCloneEnabled && !o.voiceClonePath.isEmpty) ? o.voiceClonePath : nil
             },
             synthesizeClone: { text, clip in await tts.synthesize(text: text, refClipPath: clip) },
             playClone: { data in await player.play(data) },

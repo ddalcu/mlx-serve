@@ -109,45 +109,7 @@ struct VoiceModeView: View {
     // MARK: Voice picker
 
     private var voicePicker: some View {
-        Menu {
-            ForEach(controller.availableVoices) { v in
-                Button {
-                    controller.selectVoice(v.id)
-                } label: {
-                    if v.id == controller.selectedVoiceId {
-                        Label(v.displayName, systemImage: "checkmark")
-                    } else {
-                        Text(v.displayName)
-                    }
-                }
-            }
-            if controller.availableVoices.isEmpty {
-                Text("No voices installed")
-            }
-            Divider()
-            Button("Download more voices…") {
-                if let url = URL(string: "x-apple.systempreferences:com.apple.preference.universalaccess?SpokenContent") {
-                    NSWorkspace.shared.open(url)
-                }
-            }
-        } label: {
-            HStack(spacing: 6) {
-                Image(systemName: "speaker.wave.2.fill")
-                Text(selectedVoiceName).lineLimit(1)
-                Image(systemName: "chevron.up.chevron.down").font(.caption2)
-            }
-            .font(.subheadline)
-            .padding(.horizontal, 14).padding(.vertical, 7)
-            .background(.thinMaterial, in: Capsule())
-        }
-        .menuStyle(.borderlessButton)
-        .menuIndicator(.hidden)
-        .fixedSize()
-        .help("Choose the speech voice. Add higher-quality voices in System Settings → Accessibility → Spoken Content.")
-    }
-
-    private var selectedVoiceName: String {
-        controller.availableVoices.first { $0.id == controller.selectedVoiceId }?.name ?? "Voice"
+        VoiceSelectorMenu(voice: controller, compact: false)
     }
 
     // MARK: Toggles + controls

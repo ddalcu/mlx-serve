@@ -22,7 +22,7 @@ final class LocalModelPickerTests: XCTestCase {
         // the other media archs, and embeddings-only encoders must never be
         // offered by a chat-model picker. Strings are the exact model_type
         // values from real ~/.mlx-serve/models checkpoints.
-        for mt in ["AudioVideo", "vit", "flux2-klein-4b", "krea2_turbo", "qwen3_tts", "moss_tts_nano", "bert"] {
+        for mt in ["AudioVideo", "vit", "flux2-klein-4b", "krea2_turbo", "qwen3_tts", "moss_tts_nano", "bert", "hunyuan3d_2_1", "hunyuan3d_2_1_paint", "acestep"] {
             XCTAssertFalse(model(mt).isChatPickable, "\"\(mt)\" must not be chat-pickable")
         }
     }

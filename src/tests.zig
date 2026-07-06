@@ -45,6 +45,7 @@ test {
     _ = @import("marching_cubes.zig");
     _ = @import("glb.zig");
     _ = @import("hunyuan3d.zig");
+    _ = @import("acestep.zig");
     _ = @import("uvwrap.zig");
     _ = @import("hunyuan3d_paint.zig");
     _ = @import("hunyuan3d_paint_unet.zig");

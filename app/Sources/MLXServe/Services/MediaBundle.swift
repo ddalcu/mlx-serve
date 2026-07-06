@@ -193,6 +193,33 @@ extension MediaBundle {
         )
     }
 
+    /// ACE-Step music (text2music): a flat converted dir — `config.json` +
+    /// `model.safetensors` (DiT + condition encoder) + `vae.safetensors`
+    /// (Oobleck) + the `text_encoder/` Qwen3-Embedding subdir. Single
+    /// self-contained repo, no external-component dependencies (the simplest
+    /// bundle yet). Local-convert repos share this factory with any future
+    /// published one (readiness checks disk presence either way).
+    static func music(repo: String, displayName: String, sizeGB: Double) -> MediaBundle {
+        MediaBundle(
+            id: "music:\(repo)",
+            displayName: displayName,
+            components: [
+                MediaComponent(
+                    repo: repo,
+                    selection: FileSelection(recursive: true, keepSafetensors: [
+                        "model.safetensors", "vae.safetensors",
+                    ]),
+                    readyMarkers: [
+                        "config.json", "model.safetensors", "vae.safetensors",
+                        "text_encoder/config.json", "text_encoder/model.safetensors",
+                        "text_encoder/tokenizer.json",
+                    ]
+                ),
+            ],
+            sizeEstimateGB: sizeGB
+        )
+    }
+
     /// The Gemma-3-12B text encoder LTX needs — also a standalone chat model.
     /// Standard MLX layout (config + tokenizer + sharded safetensors).
     static let ltxGemmaRepo = "mlx-community/gemma-3-12b-it-4bit"
@@ -231,5 +258,11 @@ extension VideoModelPreset {
 extension Model3DModelPreset {
     var bundle: MediaBundle {
         .model3d(repo: repo, displayName: name, sizeGB: approxDownloadGB)
+    }
+}
+
+extension MusicModelPreset {
+    var bundle: MediaBundle {
+        .music(repo: repo, displayName: name, sizeGB: approxDownloadGB)
     }
 }
