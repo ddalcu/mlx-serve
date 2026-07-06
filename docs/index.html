@@ -82,7 +82,7 @@
         "name": "Does mlx-serve replace LM Studio?",
         "acceptedAnswer": {
           "@type": "Answer",
-          "text": "For most use cases, yes. mlx-serve runs the same MLX and GGUF models, exposes an OpenAI-compatible API, and ships a native menu-bar app instead of an Electron one. It also adds things LM Studio doesn't have: a real Anthropic Messages API (works with Claude Code), the OpenAI Responses API + WebSockets, MCP tool calling, agent mode with 10 built-in tools, KV-cache quantization, continuous batching, and the antirez/ds4 engine for DeepSeek V4 Flash."
+          "text": "For most use cases, yes. mlx-serve runs the same MLX and GGUF models, exposes an OpenAI-compatible API, and ships a native menu-bar app instead of an Electron one. It goes deeper on the API surface than LM Studio's newer compatibility endpoints — fuller Anthropic Messages and OpenAI Responses coverage, plus a WebSocket transport — and adds things LM Studio doesn't have: MCP tool calling, agent mode with 10 built-in tools, KV-cache quantization, continuous batching, and the antirez/ds4 engine for DeepSeek V4 Flash."
         }
       },
       {
@@ -1739,7 +1739,7 @@
       </details>
       <details class="faq-item">
         <summary>Does mlx-serve replace LM Studio?</summary>
-        <p>For most use cases, yes. mlx-serve runs the same MLX and GGUF models, exposes an OpenAI-compatible API on the same kind of port, and ships a native menu-bar app instead of an Electron one. It also adds things LM Studio doesn't have: a real <b>Anthropic Messages API</b> (works with Claude Code), the <b>OpenAI Responses API + WebSockets</b>, <b>MCP tool calling</b>, agent mode with 10 built-in tools, KV-cache quantization, continuous batching, and the <a href="https://github.com/antirez/ds4" target="_blank" rel="noopener">antirez/ds4</a> engine for DeepSeek V4 Flash.</p>
+        <p>For most use cases, yes. mlx-serve runs the same MLX and GGUF models, exposes an OpenAI-compatible API on the same kind of port, and ships a native menu-bar app instead of an Electron one. It goes deeper on the API surface than LM Studio's newer compatibility endpoints — fuller <b>Anthropic Messages</b> and <b>OpenAI Responses</b> coverage, plus a WebSocket transport — and adds things LM Studio doesn't have: <b>MCP tool calling</b>, agent mode with 10 built-in tools, KV-cache quantization, continuous batching, and the <a href="https://github.com/antirez/ds4" target="_blank" rel="noopener">antirez/ds4</a> engine for DeepSeek V4 Flash.</p>
       </details>
       <details class="faq-item">
         <summary>Does mlx-serve replace Ollama on Mac?</summary>

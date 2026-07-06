@@ -50,10 +50,10 @@ If you're already on LM Studio, Ollama, or `mlx-lm` and wondering whether to swi
 | MLX models (native Apple) | ✅ | ✅ | ❌ | ✅ |
 | GGUF models (llama.cpp) | ✅ **embedded** | ✅ | ✅ | ❌ |
 | OpenAI-compatible API | ✅ | ✅ | partial | ❌ |
-| Anthropic Messages API | ✅ | ❌ | ❌ | ❌ |
+| Anthropic Messages API | ✅ | 🟡 partial² | ❌ | ❌ |
 | Ollama API (drop-in for Ollama clients) | ✅ | ❌ | ✅ native | ❌ |
 | `run <model>` CLI with auto-download + REPL | ✅ | ❌ | ✅ | ❌ |
-| OpenAI Responses API + WebSockets | ✅ | ❌ | ❌ | ❌ |
+| OpenAI Responses API + WebSockets | ✅ | 🟡 partial² | ❌ | ❌ |
 | DeepSeek V4 Flash (284B) | ✅ via ds4 | ❌ | ❌ | ❌ |
 | Speculative decoding (PLD + drafter + native MTP) | ✅ | ❌ | partial | drafter only |
 | Decode speed (geomean vs LM Studio, identical weights) | **+35%** (MLX) | baseline | ~−15% (GGUF, est.¹) | +11% (MLX) |
@@ -70,6 +70,7 @@ If you're already on LM Studio, Ollama, or `mlx-lm` and wondering whether to swi
 | License | MIT | proprietary | MIT | MIT |
 
 ¹ Ollama can't run MLX, so the comparison is GGUF-vs-GGUF. 
+² Recent LM Studio builds ship Anthropic `/v1/messages` and OpenAI `/v1/responses` compatibility endpoints, with partial coverage of each surface — mlx-serve additionally implements e.g. the Responses WebSocket transport and `/v1/responses/compact`.
 
 ### Benchmarks (Apple M4, 16 GB · identical weights · ctx=4096 · temp=0)
 
@@ -402,7 +403,7 @@ Reproduce: `./tests/bench.sh --family gemma --lmstudio --omlx` (or `qwen36`). Re
 Yes — every cell, every model we've benchmarked. On identical 4-bit MLX weights mlx-serve wins by **+35% geomean across 18 workloads** (Gemma 4 E2B/E4B/31B/26B-A4B-MoE and Qwen 3.6 27B/35B-A3B-MoE). On the **same `.gguf` file** as LM Studio (`gemma-4-E4B-it-Q4_K_M.gguf`), mlx-serve's embedded llama.cpp wrapper still wins **+12-15% on decode** and **+5% on prefill**. Speculative decoding pushes the lead further on echo-heavy and code-completion workloads — up to 2.65× on Gemma 4 E4B echo.
 
 ### Does mlx-serve replace LM Studio?
-For most use cases, yes. mlx-serve runs the same MLX and GGUF models, exposes an OpenAI-compatible API on the same kind of port, and ships a native menu-bar app instead of an Electron one. It also adds things LM Studio doesn't have: a real Anthropic Messages API (works with Claude Code), the OpenAI Responses API + WebSockets, MCP tool calling, agent mode with 10 built-in tools, KV-cache quantization, continuous batching, and the [antirez/ds4](https://github.com/antirez/ds4) engine for DeepSeek V4 Flash.
+For most use cases, yes. mlx-serve runs the same MLX and GGUF models, exposes an OpenAI-compatible API on the same kind of port, and ships a native menu-bar app instead of an Electron one. It goes deeper on the API surface than LM Studio's newer compatibility endpoints — fuller Anthropic Messages and OpenAI Responses coverage, plus a WebSocket transport and response compaction — and adds things LM Studio doesn't have: MCP tool calling, agent mode with 10 built-in tools, KV-cache quantization, continuous batching, and the [antirez/ds4](https://github.com/antirez/ds4) engine for DeepSeek V4 Flash.
 
 ### Does mlx-serve replace Ollama?
 On Apple Silicon, yes — mlx-serve **speaks the Ollama API natively** (`/api/chat`, `/api/generate`, `/api/tags`, `/api/embed`, `/api/pull`, …), so Raycast, Obsidian, Enchanted, Open WebUI, and `ollama-python`/`js` work unchanged: drop in `http://localhost:11234` wherever you had `http://localhost:11434`. The CLI workflow matches too (`mlx-serve run gemma4`, `pull`, `list`, `serve`). Underneath, you get llama.cpp **and** native MLX with the Mac-specific optimizations Ollama doesn't ship (Metal kernels through mlx-c, speculative decoding, shared-prefix KV cache, the Gemma 4 cross-attention drafter).

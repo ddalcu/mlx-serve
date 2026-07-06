@@ -237,6 +237,7 @@ table.tbl { width: 100%; border-collapse: collapse; font-size: 14px; min-width: 
 .tbl td.hl { background: var(--accent-soft); font-weight: 600; color: var(--text-primary); }
 .tbl .yes { color: var(--green); font-weight: 700; }
 .tbl .no { color: var(--text-tertiary); }
+.tbl .part { color: #d97706; font-weight: 700; }
 .tbl-note { max-width: 900px; margin: 16px auto 0; text-align: center; font-size: 12.5px; color: var(--text-tertiary); line-height: 1.6; }
 
 /* ─── CODE BLOCKS ─── */

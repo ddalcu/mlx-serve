@@ -46,7 +46,7 @@
       {
         "@type": "Question",
         "name": "What does mlx-serve have that LM Studio doesn't?",
-        "acceptedAnswer": { "@type": "Answer", "text": "A native Anthropic Messages API (Claude Code works out of the box), the OpenAI Responses API with WebSockets, a drop-in Ollama API, agent mode with 10 built-in tools and MCP, an isolated Linux VM sandbox for agent shell commands, speculative decoding, KV-cache quantization, continuous batching, DeepSeek V4 Flash via the embedded ds4 engine, and fully local image, video, and voice generation. It's also MIT-licensed and a native menu-bar app rather than Electron." }
+        "acceptedAnswer": { "@type": "Answer", "text": "Deeper Anthropic Messages and OpenAI Responses coverage than LM Studio’s newer compatibility endpoints (including a WebSocket transport and response compaction), a drop-in Ollama API, agent mode with 10 built-in tools and MCP, an isolated Linux VM sandbox for agent shell commands, speculative decoding, KV-cache quantization, continuous batching, DeepSeek V4 Flash via the embedded ds4 engine, and fully local image, video, and voice generation. It's also MIT-licensed and a native menu-bar app rather than Electron." }
       },
       {
         "@type": "Question",
@@ -132,8 +132,8 @@
           <tr><td>MLX + GGUF models</td><td class="hl"><span class="yes">✓</span></td><td><span class="yes">✓</span></td></tr>
           <tr><td>Decode speed, identical weights</td><td class="hl">+35% geomean</td><td>baseline</td></tr>
           <tr><td>OpenAI-compatible API</td><td class="hl"><span class="yes">✓</span></td><td><span class="yes">✓</span></td></tr>
-          <tr><td>Anthropic Messages API (Claude Code)</td><td class="hl"><span class="yes">✓</span></td><td><span class="no">✗</span></td></tr>
-          <tr><td>OpenAI Responses API + WebSockets</td><td class="hl"><span class="yes">✓</span></td><td><span class="no">✗</span></td></tr>
+          <tr><td>Anthropic Messages API (Claude Code)</td><td class="hl"><span class="yes">✓</span></td><td><span class="part">partial</span></td></tr>
+          <tr><td>OpenAI Responses API + WebSockets</td><td class="hl"><span class="yes">✓</span></td><td><span class="part">partial</span></td></tr>
           <tr><td>Ollama API (drop-in for Ollama clients)</td><td class="hl"><span class="yes">✓</span></td><td><span class="no">✗</span></td></tr>
           <tr><td>Speculative decoding (PLD + drafter + MTP)</td><td class="hl"><span class="yes">✓</span></td><td><span class="no">✗</span></td></tr>
           <tr><td>KV-cache quantization</td><td class="hl"><span class="yes">✓</span></td><td><span class="no">✗</span></td></tr>
@@ -162,7 +162,7 @@
         <ul class="ticks">
           <li><svg viewBox="0 0 24 24" fill="none"><polyline points="20 6 9 17 4 12"/></svg><span><b>Zero re-downloads</b> — your LM Studio model folder is auto-discovered.</span></li>
           <li><svg viewBox="0 0 24 24" fill="none"><polyline points="20 6 9 17 4 12"/></svg><span><b>Same API shape</b> — point Continue, Cursor, Open WebUI at the new port.</span></li>
-          <li><svg viewBox="0 0 24 24" fill="none"><polyline points="20 6 9 17 4 12"/></svg><span><b>Plus Claude Code</b> — a real Anthropic endpoint LM Studio never had.</span></li>
+          <li><svg viewBox="0 0 24 24" fill="none"><polyline points="20 6 9 17 4 12"/></svg><span><b>Plus Claude Code</b> — fuller Anthropic-endpoint coverage than LM Studio’s newer compat layer.</span></li>
           <li><svg viewBox="0 0 24 24" fill="none"><polyline points="20 6 9 17 4 12"/></svg><span><b>Signed &amp; notarized</b> — no "unidentified developer" dialogs.</span></li>
         </ul>
       </div>
@@ -185,7 +185,7 @@
       </details>
       <details class="faq-item">
         <summary>What does it add beyond speed?</summary>
-        <p>An Anthropic Messages API (<a href="../claude-code-local/">Claude Code works natively</a>), the OpenAI Responses API + WebSockets, a <a href="../ollama-alternative/">drop-in Ollama API</a>, agent mode with MCP, an <a href="../agent-sandbox/">isolated Linux VM for agent shell commands</a>, <a href="../speculative-decoding/">speculative decoding</a>, KV-cache quantization, continuous batching, DeepSeek V4 Flash, and fully local <a href="../image-generation/">image</a>, <a href="../video-generation/">video</a>, and <a href="../voice-cloning/">voice</a> generation.</p>
+        <p>Deeper Anthropic Messages (<a href="../claude-code-local/">Claude Code works natively</a>) and OpenAI Responses coverage than LM Studio’s newer compatibility endpoints — including a WebSocket transport and response compaction — a <a href="../ollama-alternative/">drop-in Ollama API</a>, agent mode with MCP, an <a href="../agent-sandbox/">isolated Linux VM for agent shell commands</a>, <a href="../speculative-decoding/">speculative decoding</a>, KV-cache quantization, continuous batching, DeepSeek V4 Flash, and fully local <a href="../image-generation/">image</a>, <a href="../video-generation/">video</a>, and <a href="../voice-cloning/">voice</a> generation.</p>
       </details>
       <details class="faq-item">
         <summary>Is it open source?</summary>
