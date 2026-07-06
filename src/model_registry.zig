@@ -26,8 +26,8 @@ const drafter_mod = @import("drafter.zig");
 const prefix_cache_mod = @import("prefix_cache.zig");
 const tokenize_cache_mod = @import("tokenize_cache.zig");
 const model_discovery = @import("model_discovery.zig");
-const arch_ds4 = @import("arch/ds4.zig");
-const arch_llama = @import("arch/llama.zig");
+const arch_ds4 = if (@import("build_options").ios) @import("arch/ds4_stub.zig") else @import("arch/ds4.zig");
+const arch_llama = if (@import("build_options").ios) @import("arch/llama_stub.zig") else @import("arch/llama.zig");
 const gen_mod = @import("gen.zig");
 const log = @import("log.zig");
 
@@ -875,7 +875,28 @@ pub const ModelRegistry = struct {
         self.lru_clock += 1;
         entry.last_used_ns = self.lru_clock;
         self.current_resident_bytes += bytes_resident;
+        // Headless default promotion: a server started without --model has no
+        // default, so requests addressing the "mlx-serve" alias (the app's
+        // chat/avatar surfaces, Claude Code) 503 with no_model even after the
+        // user loads a chat model via /v1/load-model — the live gen-first→
+        // chat-later hole (2026-07-05). The FIRST chat-capable model to finish
+        // loading becomes the default; media engines and embedding encoders
+        // never qualify, and an existing default is never stolen.
+        if (self.default_id.len == 0 and chatCapable(entry)) {
+            self.default_id = entry.id;
+            log.info("[registry] default model -> {s} (first chat-capable load on a headless server)\n", .{entry.id});
+        }
         self.state_cond.broadcast(self.io);
+    }
+
+    /// Can this READY entry serve chat/completions? Media models (image/
+    /// audio/video/mesh — identified by model_type, so no engine pointers
+    /// are needed) and embedding encoders cannot.
+    fn chatCapable(entry: *const LoadedModel) bool {
+        const cfg = entry.config orelse return false;
+        if (cfg.is_encoder_only) return false;
+        if (model_discovery.isMediaModelType(cfg.model_type)) return false;
+        return true;
     }
 
     /// Reserve `estimated` bytes against `reserved_bytes` for an entry that has
@@ -1367,4 +1388,68 @@ test "reservation: released back to zero on markReady / markUnloaded" {
     try testing.expectEqual(@as(u64, 0), reg.reserved_bytes); // reservation cleared
     try testing.expectEqual(@as(u64, 480), reg.current_resident_bytes); // actual counted
     try testing.expectEqual(@as(u64, 0), a.load_estimate);
+}
+
+test "ModelRegistry: first chat-capable ready load becomes the default on a headless server" {
+    // gen-first→chat-later hole (live 2026-07-05): a server started headless
+    // (no --model) has no default, so requests addressing the "mlx-serve"
+    // alias 503 with no_model even after the user loads a chat model via
+    // /v1/load-model. The FIRST chat-capable load is promoted; media engines
+    // and embedding encoders never qualify; an existing default is never
+    // stolen.
+    var reg = try ModelRegistry.init(testing.allocator, std.Io.Threaded.global_single_threaded.io(), null, 8, 0, null);
+    defer reg.deinit();
+
+    // A ready MEDIA model must not become the default.
+    const mesh = try reg.registerStub("hy3d", "/m/hy3d", 64);
+    var mesh_cfg = model_mod.ModelConfig{};
+    mesh_cfg.model_type = "hunyuan3d_2_1";
+    mesh.config = &mesh_cfg;
+    reg.mutex.lockUncancelable(reg.io);
+    reg.markReadyLocked(mesh, 64);
+    reg.mutex.unlock(reg.io);
+    try testing.expectEqualStrings("", reg.default_id);
+
+    // A ready embedding ENCODER must not become the default.
+    const bge = try reg.registerStub("bge", "/m/bge", 64);
+    var bge_cfg = model_mod.ModelConfig{};
+    bge_cfg.model_type = "bert";
+    bge_cfg.is_encoder_only = true;
+    bge.config = &bge_cfg;
+    reg.mutex.lockUncancelable(reg.io);
+    reg.markReadyLocked(bge, 64);
+    reg.mutex.unlock(reg.io);
+    try testing.expectEqualStrings("", reg.default_id);
+
+    // The first chat-capable load IS promoted...
+    const chat = try reg.registerStub("gemma", "/m/gemma", 64);
+    var chat_cfg = model_mod.ModelConfig{};
+    chat_cfg.model_type = "gemma4";
+    chat.config = &chat_cfg;
+    reg.mutex.lockUncancelable(reg.io);
+    reg.markReadyLocked(chat, 64);
+    reg.mutex.unlock(reg.io);
+    try testing.expectEqualStrings("gemma", reg.default_id);
+
+    // ...and the alias resolves to it now.
+    const via_alias = try reg.ensureLoaded("mlx-serve");
+    try testing.expectEqual(chat, via_alias);
+    reg.release(via_alias);
+
+    // A LATER chat load never steals an existing default.
+    const chat2 = try reg.registerStub("qwen", "/m/qwen", 64);
+    var chat2_cfg = model_mod.ModelConfig{};
+    chat2_cfg.model_type = "qwen3";
+    chat2.config = &chat2_cfg;
+    reg.mutex.lockUncancelable(reg.io);
+    reg.markReadyLocked(chat2, 64);
+    reg.mutex.unlock(reg.io);
+    try testing.expectEqualStrings("gemma", reg.default_id);
+
+    // The configs are STACK-allocated test doubles — detach them before
+    // registry deinit tries to free entry-owned configs.
+    mesh.config = null;
+    bge.config = null;
+    chat.config = null;
+    chat2.config = null;
 }

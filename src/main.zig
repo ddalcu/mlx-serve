@@ -334,6 +334,9 @@ pub fn main(init: std.process.Init) !void {
             timeout = try std.fmt.parseInt(u32, args[i], 10);
         } else if (std.mem.eql(u8, args[i], "--no-vision")) {
             no_vision = true;
+            // Module global so on-demand /v1/load-model cold loads honor the
+            // flag too (they used to hardcode vision from config.has_vision).
+            scheduler_mod.no_vision_global = true;
         } else if (std.mem.eql(u8, args[i], "--skip-mem-preflight")) {
             scheduler_mod.skip_mem_preflight = true;
         } else if (std.mem.eql(u8, args[i], "--no-safety")) {

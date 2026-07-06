@@ -124,6 +124,16 @@ struct ServerOptions: Codable, Equatable {
     /// toggling it must never prompt a server restart.
     var sandbox: SandboxConfig = SandboxConfig()
 
+    // MARK: Voice clone (app-level — NOT a server-launch flag, NOT per-request)
+    /// Absolute path to the normalized voice-clone reference clip (24 kHz mono
+    /// WAV) that hands-free voice mode speaks with, via Qwen3-TTS zero-shot
+    /// cloning (`/v1/audio/speech` + `ref_audio`). Empty = no clone — voice
+    /// mode uses the macOS system voice. Recorded/picked in Settings ▸ Voice.
+    /// Consumed app-side by `ClonedVoiceSynthesizer`, so — like `telegram` and
+    /// `sandbox` — it's deliberately excluded from `serverLaunchEquals` and
+    /// `toCLIArgs`: changing it must never prompt a server restart.
+    var voiceClonePath: String = ""
+
     enum LogLevel: String, Codable, CaseIterable, Identifiable {
         case error, warn, info, debug
         var id: String { rawValue }
@@ -514,6 +524,7 @@ extension ServerOptions {
         if let v = try c.decodeIfPresent(TriState.self, forKey: .perRequestEnableDrafter) { perRequestEnableDrafter = v }
         if let v = try c.decodeIfPresent(TelegramConfig.self, forKey: .telegram) { telegram = v }
         if let v = try c.decodeIfPresent(SandboxConfig.self, forKey: .sandbox) { sandbox = v }
+        if let v = try c.decodeIfPresent(String.self, forKey: .voiceClonePath) { voiceClonePath = v }
     }
 }
 

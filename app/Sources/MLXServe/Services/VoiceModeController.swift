@@ -139,8 +139,13 @@ final class VoiceModeController: ObservableObject {
         setUpVoices(voices)
     }
 
-    convenience init() {
-        self.init(recognizer: makeSpeechRecognizer(), synthesizer: SystemSpeechSynthesizer())
+    /// Production wiring: the system synthesizer is wrapped in the voice-clone
+    /// router — when a clone clip is set in Settings, answers are spoken in the
+    /// cloned voice via the server's TTS; otherwise (or on a failed synthesis)
+    /// the wrapped system voice speaks. The controller only sees the protocol.
+    convenience init(server: ServerManager) {
+        self.init(recognizer: makeSpeechRecognizer(),
+                  synthesizer: ClonedVoiceSynthesizer(server: server))
     }
 
     /// Wire the controller to the app: use its `ChatTurnEngine` as the runner and
@@ -283,7 +288,7 @@ final class VoiceModeController: ObservableObject {
         if pendingApproval != nil { resolve(.deny) }
         send(.stop)
         recognizer.stop()
-        synthesizer.stop()
+        synthesizer.shutdown()   // stop + release the clone TTS model, if loaded
         resetTurn()
         partialTranscript = ""
         level = 0

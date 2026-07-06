@@ -209,6 +209,22 @@ final class ServerOptionsTests: XCTestCase {
         XCTAssertEqual(opts, decoded)
     }
 
+    /// The voice-clone clip is an app-side setting (voice mode reads it per
+    /// utterance): it must round-trip, legacy blobs must decode to "no clone",
+    /// and it must never touch the launch flags or the restart detector.
+    func testVoiceClonePathRoundTripsLegacyDecodesEmpty() throws {
+        var opts = ServerOptions()
+        opts.voiceClonePath = "/Users/x/.mlx-serve/voice-clips/voice-clone.wav"
+        let decoded = try JSONDecoder().decode(ServerOptions.self, from: try JSONEncoder().encode(opts))
+        XCTAssertEqual(decoded.voiceClonePath, opts.voiceClonePath)
+        // A blob saved before the field existed decodes to the default (no clone).
+        let legacy = try JSONDecoder().decode(ServerOptions.self, from: Data("{}".utf8))
+        XCTAssertEqual(legacy.voiceClonePath, "")
+        // NOT a server-launch flag: no CLI change, no restart prompt.
+        XCTAssertEqual(opts.toCLIArgs(), ServerOptions().toCLIArgs())
+        XCTAssertTrue(opts.serverLaunchEquals(ServerOptions()))
+    }
+
     // MARK: - GGUF + common-engine flags
 
     func testLlamaKvQuantOmittedAtDefault() {

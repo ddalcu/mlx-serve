@@ -16,10 +16,10 @@ const pld_index = @import("pld_index.zig");
 const prefix_cache_mod = @import("prefix_cache.zig");
 const tokenize_cache_mod = @import("tokenize_cache.zig");
 const scheduler_mod = @import("scheduler.zig");
-const ds4_ffi = @import("ds4_ffi.zig");
+const ds4_ffi = if (@import("build_options").ios) @import("ds4_ffi_stub.zig") else @import("ds4_ffi.zig");
 const model_registry_mod = @import("model_registry.zig");
 const model_discovery = @import("model_discovery.zig");
-const arch_llama = @import("arch/llama.zig");
+const arch_llama = if (@import("build_options").ios) @import("arch/llama_stub.zig") else @import("arch/llama.zig");
 const media_mod = @import("gen.zig");
 const stb = @cImport({ @cInclude("stb_image.h"); });
 const webp = @cImport({ @cInclude("webp/decode.h"); });
@@ -2483,7 +2483,6 @@ fn handleStatusPage(
     stream: *Conn,
     lm: *LoadedModel,
 ) !void {
-    const main_mod = @import("main.zig");
     const config = lm.config.?;
     const chat_config = lm.chat_config.?;
 
@@ -2502,7 +2501,7 @@ fn handleStatusPage(
     defer allocator.free(model_id_esc);
     const arch_esc = try htmlEscape(allocator, config.model_type);
     defer allocator.free(arch_esc);
-    const version_esc = try htmlEscape(allocator, main_mod.VERSION);
+    const version_esc = try htmlEscape(allocator, build_options.version);
     defer allocator.free(version_esc);
 
     // Capability pills

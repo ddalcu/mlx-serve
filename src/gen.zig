@@ -24,8 +24,6 @@ const ltx = @import("ltx_video.zig");
 const ltx_audio = @import("ltx_audio.zig");
 const hy3d = @import("hunyuan3d.zig");
 const hy3d_paint = @import("hunyuan3d_paint.zig");
-const unirig = @import("unirig_skeleton.zig");
-const voxel_skin = @import("voxel_skin.zig");
 const glb_mod = @import("glb.zig");
 const wav_mod = @import("wav.zig");
 const png_mod = @import("png.zig");
@@ -33,6 +31,7 @@ const tok_mod = @import("tokenizer.zig");
 const model_mod = @import("model.zig");
 const chat_mod = @import("chat.zig");
 const log = @import("log.zig");
+const metrics = @import("status.zig");
 const sse = @import("gen_sse.zig");
 const server_mod = @import("server.zig");
 const stb = @cImport({
@@ -139,17 +138,53 @@ const FLUX_SEQ_LEN: usize = 512; // mflux Qwen3 tokenizer max_length
 /// Holds the three sub-models + tokenizer; owned by the `ImageBackend` union.
 const FluxImpl = struct {
     s: mlx.mlx_stream,
-    te: flux.TextEncoder,
+    /// Text encoder — nullable because LOW-MEM mode (iPhone) loads it lazily
+    /// per request and frees it right after the prompt encode: it's ~half the
+    /// pipeline's resident bytes but runs exactly one forward per generation.
+    te: ?flux.TextEncoder,
     dit: flux.Dit,
     vae: flux.Vae,
     vae_enc: ?flux.VaeEncoder,
     tok: tok_mod.Tokenizer,
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    model_dir: []u8,
+    low_mem: bool,
+
+    /// Low-mem policy, pure for testing: iOS always (jetsam ceilings);
+    /// MLXSERVE_LOWMEM=1/0 forces either way; otherwise AUTO on machines with
+    /// ≤ 16 GB of RAM — measured cost is ~0.1–0.3 s per image (the encoder
+    /// mmap-reloads from page cache) vs ~1.8 GB lower peak, a clear win when
+    /// the Metal working-set ceiling is ~12 GB (16 GB mini class).
+    fn lowMemFromInputs(is_ios: bool, env: ?[]const u8, total_ram_bytes: u64) bool {
+        if (is_ios) return true;
+        if (env) |e| {
+            if (std.mem.eql(u8, e, "1")) return true;
+            if (std.mem.eql(u8, e, "0")) return false;
+        }
+        return total_ram_bytes > 0 and total_ram_bytes <= 17 * 1024 * 1024 * 1024;
+    }
+
+    fn lowMemDefault() bool {
+        const env: ?[]const u8 = if (std.c.getenv("MLXSERVE_LOWMEM")) |v| std.mem.sliceTo(v, 0) else null;
+        return lowMemFromInputs(@import("build_options").ios, env, metrics.getTotalMemBytes());
+    }
 
     fn load(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !FluxImpl {
         var self: FluxImpl = undefined;
+        self.io = io;
+        self.allocator = allocator;
+        self.low_mem = lowMemDefault();
+        self.model_dir = try allocator.dupe(u8, model_dir);
+        errdefer allocator.free(self.model_dir);
         self.s = mlx.mlx_default_gpu_stream_new();
-        self.te = try flux.loadTextEncoder(io, allocator, self.s, model_dir);
-        errdefer self.te.deinit();
+        if (self.low_mem) {
+            self.te = null;
+            log.info("[image] FLUX low-mem mode: text encoder loads per request\n", .{});
+        } else {
+            self.te = try flux.loadTextEncoder(io, allocator, self.s, model_dir);
+        }
+        errdefer if (self.te) |*t| t.deinit();
         self.dit = try flux.loadDit(io, allocator, self.s, model_dir);
         errdefer self.dit.deinit();
         self.vae = try flux.loadVae(io, allocator, self.s, model_dir);
@@ -168,11 +203,12 @@ const FluxImpl = struct {
     }
 
     fn deinit(self: *FluxImpl) void {
-        self.te.deinit();
+        if (self.te) |*t| t.deinit();
         self.dit.deinit();
         self.vae.deinit();
         if (self.vae_enc) |*e| e.deinit();
         self.tok.deinit();
+        self.allocator.free(self.model_dir);
     }
 
     /// Tokenize the prompt (Qwen3 chat template) and run the FLUX pipeline →
@@ -215,7 +251,23 @@ const FluxImpl = struct {
             fopts.init_latents = init_lat;
             fopts.start_step = img2imgStartStep(steps, opts.strength);
         }
-        return flux.generateWithOpts(&self.te, &self.dit, &self.vae, ids, mask, seed, steps, height, width, fopts, progress);
+        // Phased text encoder: encode the prompt (materialized inside
+        // encodePrompt — mlx laziness would otherwise pin the weights), then
+        // in low-mem mode free the encoder + its cache before the denoise
+        // loop. Same math either way: the conditioning tensor is already
+        // computed, so outputs are byte-identical to the resident-TE path
+        // (pinned by tests/test_flux_lowmem.sh).
+        if (self.te == null) {
+            self.te = try flux.loadTextEncoder(self.io, self.allocator, self.s, self.model_dir);
+        }
+        const cond = try flux.encodePrompt(&self.te.?, ids, mask, fopts);
+        if (self.low_mem) {
+            self.te.?.deinit();
+            self.te = null;
+            _ = mlx.mlx_clear_cache();
+            log.info("[image] low-mem: text encoder freed after encode\n", .{});
+        }
+        return flux.generateFromCondWithOpts(&self.dit, &self.vae, cond, ids.len, seed, steps, height, width, fopts, progress);
     }
 
     fn generatePng(self: *FluxImpl, allocator: std.mem.Allocator, prompt: []const u8, width: u32, height: u32, seed: u64, steps: u32, opts: ImageGenOpts, progress: ?sse.Progress) ![]u8 {
@@ -393,15 +445,27 @@ pub const ImageEngine = struct {
         return krea.imageToPng(allocator, img, self.stream());
     }
 
-    /// Resolve a requested WxH per backend. FLUX has a fixed 1024² latent grid;
+    /// Resolve a requested WxH per backend. FLUX (klein) honors any multiple
+    /// of 32 in [256, 1536] — its patchify/VAE are shape-derived (pinned by
+    /// the non-square edit round-trip test), and smaller grids are the
+    /// activation-memory lever that lets 8 GB iPhones generate at all.
     /// Krea accepts any multiple of 16 in [256, 2048].
     pub fn normalizeSize(self: *const ImageEngine, req_w: u32, req_h: u32) struct { w: u32, h: u32 } {
         return switch (self.backend) {
-            .flux => .{ .w = 1024, .h = 1024 },
+            .flux => .{ .w = clampFluxDim(req_w), .h = clampFluxDim(req_h) },
             .krea => .{ .w = clampKreaDim(req_w), .h = clampKreaDim(req_h) },
         };
     }
 };
+
+/// Round a requested dimension to a multiple of 32 in [256, 1536] (klein's
+/// crop granularity — the same /32 rule fitRefDims uses; ~1MP trained scale,
+/// 1536 covers the widest preset edge). 0/omitted → the 1024 default.
+pub fn clampFluxDim(v: u32) u32 {
+    if (v == 0) return 1024;
+    const rounded = ((v + 31) / 32) * 32;
+    return std.math.clamp(rounded, 256, 1536);
+}
 
 /// Round a requested dimension to a multiple of 16 in [256, 2048] (Krea's
 /// VAE ×8 + DiT patch ×2 alignment).
@@ -517,10 +581,6 @@ pub const MeshEngine = struct {
     /// staging: shape 3.5 GB + paint ~4.6 GB never both need residency —
     /// the shape stage completes before the paint stage starts).
     paint_dir: ?[]u8 = null,
-    /// P3 auto-rig (UniRig skeleton) dir, same sibling-discovery pattern
-    /// (`local/unirig-skeleton-8bit` or `UNIRIG_DIR`). Null → `"rig": true`
-    /// requests get a 400.
-    rig_dir: ?[]u8 = null,
 
     pub fn load(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !*MeshEngine {
         const self = try allocator.create(MeshEngine);
@@ -530,15 +590,12 @@ pub const MeshEngine = struct {
         self.engine = try hy3d.Engine.load(io, allocator, model_dir);
         self.paint_dir = findPaintDir(allocator, model_dir);
         if (self.paint_dir) |p| log.info("[mesh] paint (texture) weights available: {s}\n", .{p});
-        self.rig_dir = findRigDir(allocator, model_dir);
-        if (self.rig_dir) |p| log.info("[mesh] rig (UniRig) weights available: {s}\n", .{p});
         log.info("[mesh] Hunyuan3D shape engine ready\n", .{});
         return self;
     }
 
     pub fn deinit(self: *MeshEngine) void {
         if (self.paint_dir) |p| self.allocator.free(p);
-        if (self.rig_dir) |p| self.allocator.free(p);
         self.engine.deinit();
         self.allocator.destroy(self);
     }
@@ -551,12 +608,6 @@ pub const MeshEngine = struct {
 /// when absent.
 fn findPaintDir(allocator: std.mem.Allocator, shape_dir: []const u8) ?[]u8 {
     return findStageModelDir(allocator, shape_dir, "paint", "hunyuan3d-2-1-paint-8bit", "HY3D_PAINT_DIR");
-}
-
-/// Locate the UniRig stage dir (same contract as `findPaintDir`:
-/// `UNIRIG_DIR` env, `<shape_dir>/unirig`, sibling `unirig-skeleton-8bit`).
-fn findRigDir(allocator: std.mem.Allocator, shape_dir: []const u8) ?[]u8 {
-    return findStageModelDir(allocator, shape_dir, "unirig", "unirig-skeleton-8bit", "UNIRIG_DIR");
 }
 
 /// Shared stage-model discovery, in priority order:
@@ -1733,96 +1784,6 @@ fn paintedGlb(allocator: std.mem.Allocator, engine: *MeshEngine, rgba: []const u
     return paint.paintMeshToGlb(allocator, &mesh, rgba, w, h, popts, prog);
 }
 
-/// Shape → skeleton (UniRig) → geodesic skin weights → rigged GLB, optionally
-/// through the paint stage first (skin weights are computed on the FINAL
-/// vertex set — the paint unwrap seam-duplicates vertices). Engines load
-/// lazily per request and free before returning.
-fn riggedGlb(allocator: std.mem.Allocator, engine: *MeshEngine, rgba: []const u8, w: u32, h: u32, shape_opts: hy3d.MeshOpts, want_texture: bool, body: []const u8, prog: ?sse.Progress) ![]u8 {
-    const rig_dir = engine.rig_dir orelse return error.RigUnavailable; // guarded at parse
-    var mesh = try engine.engine.generateMeshRaw(allocator, rgba, w, h, shape_opts, prog);
-    defer mesh.deinit(allocator);
-    const io = std.Io.Threaded.global_single_threaded.io();
-
-    // Optional paint stage first (its engine frees before the rig loads).
-    var painted: ?hy3d_paint.PaintedMesh = null;
-    defer if (painted) |*p| p.deinit(allocator);
-    if (want_texture) {
-        const paint_dir = engine.paint_dir orelse return error.PaintUnavailable;
-        const paint = try hy3d_paint.PaintEngine.load(io, allocator, paint_dir);
-        defer paint.deinit();
-        var popts = hy3d_paint.PaintOpts{ .seed = shape_opts.seed };
-        if (extractJsonInt(body, "texture_steps")) |ts| {
-            if (ts >= 1 and ts <= 100) popts.steps = @intCast(ts);
-        }
-        painted = try paint.paintMesh(allocator, &mesh, rgba, w, h, popts, prog);
-    }
-
-    // Skeleton prediction on the original mesh geometry.
-    if (prog) |p| p.emit("rig-skeleton", 0, 1);
-    const rig = try unirig.Engine.load(io, allocator, rig_dir);
-    defer rig.deinit();
-    var skel = try rig.generateSkeleton(allocator, mesh.vertices, mesh.normals, mesh.indices, .{ .seed = shape_opts.seed });
-    defer skel.deinit(allocator);
-    if (prog) |p| {
-        if (p.cancelled()) return error.Cancelled;
-        p.emit("rig-skeleton", 1, 1);
-    }
-
-    const jn = skel.joints.len;
-    if (jn == 0) return error.EmptySkeleton;
-    const jpos = try allocator.alloc(f32, jn * 3);
-    defer allocator.free(jpos);
-    const jpar = try allocator.alloc(i32, jn);
-    defer allocator.free(jpar);
-    for (skel.joints, 0..) |j, i| {
-        jpos[i * 3 + 0] = j[0];
-        jpos[i * 3 + 1] = j[1];
-        jpos[i * 3 + 2] = j[2];
-        jpar[i] = if (skel.parents[i]) |p| @intCast(p) else -1;
-    }
-
-    // Geodesic skin weights on the FINAL vertex set.
-    if (prog) |p| p.emit("rig-skin", 0, 1);
-    const skin_pos: []const f32 = if (painted) |*p| p.positions else mesh.vertices;
-    const skin_idx: []const u32 = if (painted) |*p| p.indices else mesh.indices;
-    var sw = try voxel_skin.computeSkinWeights(allocator, skin_pos, skin_idx, jpos, jpar, .{});
-    defer sw.deinit();
-    if (prog) |p| {
-        if (p.cancelled()) return error.Cancelled;
-        p.emit("rig-skin", 1, 1);
-    }
-
-    const skeleton = glb_mod.Skeleton{
-        .joint_positions = jpos,
-        .parents = jpar,
-        .joints = sw.joints,
-        .weights = sw.weights,
-    };
-    if (painted) |*p| {
-        const tm = p.textured();
-        return glb_mod.writeGlbRigged(allocator, &tm, &skeleton);
-    }
-    // Untextured rigged GLB: zero UVs + a neutral 2×2 gray albedo (every
-    // texcoord samples one texel — spec-legal flat gray; the writer requires
-    // a texture slot, and viewers get a sane default look).
-    const nverts = mesh.vertices.len / 3;
-    const uvs0 = try allocator.alloc(f32, nverts * 2);
-    defer allocator.free(uvs0);
-    @memset(uvs0, 0);
-    const gray = [_]u8{ 168, 168, 172 } ** 4;
-    const gray_png = try png_mod.encodeRgb(allocator, &gray, 2, 2);
-    defer allocator.free(gray_png);
-    const tm = glb_mod.TexturedMesh{
-        .positions = mesh.vertices,
-        .normals = mesh.normals,
-        .uvs = uvs0,
-        .indices = mesh.indices,
-        .albedo_png = gray_png,
-        .mr_png = null,
-    };
-    return glb_mod.writeGlbRigged(allocator, &tm, &skeleton);
-}
-
 /// POST /v1/3d/generations — base64 GLB (or SSE progress + complete).
 /// The engine takes straight-alpha RGBA8 (its preprocess recenters the subject
 /// via the alpha bbox and composites on white — so an app-side cutout with real
@@ -1855,10 +1816,6 @@ pub fn handleMesh(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, e
     const want_texture = sse.bodyWantsTrue(body, "texture");
     if (want_texture and engine.paint_dir == null)
         return sendError(conn, 400, "texture requested but the paint weights are not installed (run tests/convert_hunyuan3d_paint_weights.py, or set HY3D_PAINT_DIR)");
-    // P3 auto-rig stage (opt-in): UniRig skeleton + geodesic skin weights.
-    const want_rig = sse.bodyWantsTrue(body, "rig");
-    if (want_rig and engine.rig_dir == null)
-        return sendError(conn, 400, "rig requested but the UniRig weights are not installed (run tests/convert_unirig_weights.py, or set UNIRIG_DIR)");
 
     const want_stream = sse.bodyWantsTrue(body, "stream");
     log.info("[mesh] generating steps={d} res={d} guidance={d:.1} seed={d} texture={} stream={} from {d}x{d} image\n", .{ steps, res, guidance, seed, want_texture, want_stream, img.w, img.h });
@@ -1868,10 +1825,6 @@ pub fn handleMesh(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, e
 
     const opts = hy3d.MeshOpts{ .steps = steps, .guidance = guidance, .seed = seed, .octree_resolution = res };
     const glb_bytes = blk: {
-        if (want_rig) {
-            // Rig path (optionally textured): shape → skeleton → skin → GLB.
-            break :blk riggedGlb(allocator, engine, img.pix, img.w, img.h, opts, want_texture, body, prog);
-        }
         if (!want_texture) {
             break :blk engine.engine.generateGlb(allocator, img.pix, img.w, img.h, opts, prog);
         }
@@ -2519,6 +2472,28 @@ test "img2imgStartStep maps strength onto the schedule (diffusers convention)" {
     try testing.expectEqual(@as(u32, 0), img2imgStartStep(1, 0.3));
 }
 
+test "flux low-mem policy: iOS always, env forces both ways, small-RAM Macs auto-enable" {
+    const GB = 1024 * 1024 * 1024;
+    const f = FluxImpl.lowMemFromInputs;
+    try testing.expect(f(true, null, 128 * GB)); // iOS: always, RAM irrelevant
+    try testing.expect(f(false, "1", 128 * GB)); // env force-on
+    try testing.expect(!f(false, "0", 8 * GB)); // env force-off beats auto
+    try testing.expect(f(false, null, 16 * GB)); // 16 GB mini: auto ON
+    try testing.expect(f(false, null, 8 * GB)); // 8 GB: auto ON
+    try testing.expect(!f(false, null, 24 * GB)); // 24 GB+: off (reload is pure loss)
+    try testing.expect(!f(false, null, 0)); // unknown RAM: don't guess
+}
+
+test "clampFluxDim honors requested sizes on the /32 grid (512/768 are the 8GB-iPhone levers)" {
+    try testing.expectEqual(@as(u32, 512), clampFluxDim(512));
+    try testing.expectEqual(@as(u32, 768), clampFluxDim(768));
+    try testing.expectEqual(@as(u32, 1024), clampFluxDim(1024));
+    try testing.expectEqual(@as(u32, 1024), clampFluxDim(0)); // omitted → default
+    try testing.expectEqual(@as(u32, 512), clampFluxDim(500)); // round up to /32
+    try testing.expectEqual(@as(u32, 256), clampFluxDim(100)); // floor
+    try testing.expectEqual(@as(u32, 1536), clampFluxDim(4096)); // cap
+}
+
 test "fitRefDims preserves aspect, caps at ~1MP, rounds to multiples of 32, never upscales" {
     // 2:1 landscape above the cap → scaled down, aspect kept (±32-rounding).
     const a = fitRefDims(2000, 1000);
@@ -2581,7 +2556,7 @@ test "extractCondWeights accepts a JSON array or a separated string" {
     try testing.expect(extractCondWeights("{\"cond_weights\":[1,bad]}", &buf) == null);
 }
 
-test "paint/rig stage dirs resolve from the combined single-repo layout (subdir first, sibling fallback)" {
+test "paint stage dir resolves from the combined single-repo layout (subdir first, sibling fallback)" {
     const allocator = testing.allocator;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -2602,39 +2577,28 @@ test "paint/rig stage dirs resolve from the combined single-repo layout (subdir 
         }
     }.call;
 
-    // Combined single-HF-repo layout: shape at the root, paint/ + unirig/ inside.
+    // Combined single-HF-repo layout: shape at the root, paint/ inside.
     const shape = try mkModelDir(allocator, tmp.dir, root, "combined");
     defer allocator.free(shape);
     const paint_sub = try mkModelDir(allocator, tmp.dir, root, "combined/paint");
     defer allocator.free(paint_sub);
-    const rig_sub = try mkModelDir(allocator, tmp.dir, root, "combined/unirig");
-    defer allocator.free(rig_sub);
 
     const paint = findPaintDir(allocator, shape) orelse return error.TestExpectedResult;
     defer allocator.free(paint);
     try testing.expectEqualStrings(paint_sub, paint);
-    const rig = findRigDir(allocator, shape) orelse return error.TestExpectedResult;
-    defer allocator.free(rig);
-    try testing.expectEqualStrings(rig_sub, rig);
 
     // Legacy local-convert layout (sibling dirs) still resolves.
     const shape2 = try mkModelDir(allocator, tmp.dir, root, "local/hunyuan3d-2-1-8bit");
     defer allocator.free(shape2);
     const paint_sib = try mkModelDir(allocator, tmp.dir, root, "local/hunyuan3d-2-1-paint-8bit");
     defer allocator.free(paint_sib);
-    const rig_sib = try mkModelDir(allocator, tmp.dir, root, "local/unirig-skeleton-8bit");
-    defer allocator.free(rig_sib);
 
     const paint2 = findPaintDir(allocator, shape2) orelse return error.TestExpectedResult;
     defer allocator.free(paint2);
     try testing.expectEqualStrings(paint_sib, paint2);
-    const rig2 = findRigDir(allocator, shape2) orelse return error.TestExpectedResult;
-    defer allocator.free(rig2);
-    try testing.expectEqualStrings(rig_sib, rig2);
 
-    // Nothing anywhere -> graceful null (texture/rig requests 400).
+    // Nothing anywhere -> graceful null (texture requests 400).
     const bare = try mkModelDir(allocator, tmp.dir, root, "bare/shape-only");
     defer allocator.free(bare);
     try testing.expect(findPaintDir(allocator, bare) == null);
-    try testing.expect(findRigDir(allocator, bare) == null);
 }

@@ -96,7 +96,7 @@ private struct ClaudeShape: Shape {
 /// section's membership, ordering, and help text stay unit-testable. Kept in
 /// sync with `GenExperimentTests`.
 enum GenExperiment: String, CaseIterable, Identifiable {
-    case image, video, audio, model3d, avatar
+    case image, video, audio, model3d
 
     var id: String { rawValue }
 
@@ -106,7 +106,6 @@ enum GenExperiment: String, CaseIterable, Identifiable {
         case .video: "film.stack"
         case .audio: "waveform"
         case .model3d: "cube.transparent"
-        case .avatar: "person.crop.circle.badge.moon"
         }
     }
 
@@ -116,7 +115,6 @@ enum GenExperiment: String, CaseIterable, Identifiable {
         case .video: "VideoGen"
         case .audio: "AudioGen"
         case .model3d: "3D"
-        case .avatar: "Avatar"
         }
     }
 
@@ -127,7 +125,6 @@ enum GenExperiment: String, CaseIterable, Identifiable {
         case .video: "Video Generation (LTX-Video 2.3)"
         case .audio: "Audio Generation — neural TTS & voice cloning"
         case .model3d: "3D Generation — photo to mesh (Hunyuan3D 2.1)"
-        case .avatar: "Avatar — a 3D persona that talks back in a cloned voice"
         }
     }
 }
@@ -146,7 +143,6 @@ struct StatusMenuView: View {
     let openVideoGen: () -> Void
     let openAudioGen: () -> Void
     let openModel3DGen: () -> Void
-    var openAvatar: () -> Void = {}
     let openSettings: () -> Void
     let openServerLog: () -> Void
     let openTasks: () -> Void
@@ -576,7 +572,6 @@ struct StatusMenuView: View {
         case .video: openVideoGen()
         case .audio: openAudioGen()
         case .model3d: openModel3DGen()
-        case .avatar: openAvatar()
         }
     }
 

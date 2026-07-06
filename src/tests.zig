@@ -44,10 +44,6 @@ test {
     _ = @import("png.zig");
     _ = @import("marching_cubes.zig");
     _ = @import("glb.zig");
-    _ = @import("fps.zig");
-    _ = @import("unirig_tokenizer.zig");
-    _ = @import("unirig_skeleton.zig");
-    _ = @import("voxel_skin.zig");
     _ = @import("hunyuan3d.zig");
     _ = @import("uvwrap.zig");
     _ = @import("hunyuan3d_paint.zig");

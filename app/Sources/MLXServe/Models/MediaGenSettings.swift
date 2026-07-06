@@ -96,7 +96,7 @@ extension ImageGenSettings {
 // MARK: - Audio
 
 struct AudioGenSettings: Codable, Equatable {
-    var modelId: String = AudioModelPreset.qwen3TTS06B.id
+    var modelId: String = AudioModelPreset.qwen3TTS06B8bit.id
     var speed: Double = 1.0
     var temperature: Double = 0.7
     var keepResident: Bool = false
@@ -119,7 +119,7 @@ struct AudioGenSettings: Codable, Equatable {
 
 extension AudioGenSettings {
     var resolvedModel: AudioModelPreset {
-        AudioModelPreset.all.first { $0.id == modelId } ?? .qwen3TTS06B
+        AudioModelPreset.all.first { $0.id == modelId } ?? .qwen3TTS06B8bit
     }
 
     init(from decoder: Decoder) throws {
@@ -208,8 +208,6 @@ struct Model3DGenSettings: Codable, Equatable {
     var turntable: Bool = true
     /// P2 paint stage (full PBR texture). Off until validated end to end.
     var texture: Bool = false
-    /// P3 auto-rig stage (skeleton + skin weights). Off by default.
-    var rig: Bool = false
 
     private static let storageKey = "model3dGenSettings"
 
@@ -243,6 +241,5 @@ extension Model3DGenSettings {
         if let v = try c.decodeIfPresent(Bool.self, forKey: .keepResident) { keepResident = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .turntable) { turntable = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .texture) { texture = v }
-        if let v = try c.decodeIfPresent(Bool.self, forKey: .rig) { rig = v }
     }
 }

@@ -104,7 +104,41 @@ fn fmtKey(a: std.mem.Allocator, comptime f: []const u8, args: anytype) ![]u8 {
     return std.fmt.allocPrint(a, f, args);
 }
 
-// ── Quantized Linear (affine 4-bit, group_size 64) ──
+// ── Quantized Linear (affine; bits/group inferred per weight) ──
+
+/// Infer (bits, group_size) of an affine-quantized weight from its packed
+/// geometry. `w` packs `in` logical columns into u32s (w_cols = in·bits/32)
+/// and scales have s_cols = in/gs, so w_cols·32/s_cols = bits·gs. The product
+/// alone is ambiguous ((3,64) vs (6,32)…), so group sizes are tried in
+/// convention order: mflux and mlx-community conversions use 64 (the mlx
+/// default); 32 and 128 are fallbacks. Lets ONE loader serve the 3/4/6/8-bit
+/// klein builds (the 3-bit one is what fits 8 GB iPhones).
+const QuantGeometry = struct { bits: u32, group_size: u32 };
+
+fn inferQuantGeometry(w_cols: usize, s_cols: usize) QuantGeometry {
+    const fallback: QuantGeometry = .{ .bits = 4, .group_size = 64 };
+    if (s_cols == 0 or (w_cols * 32) % s_cols != 0) return fallback;
+    const product = w_cols * 32 / s_cols; // bits · group_size
+    const valid_bits = [_]u32{ 2, 3, 4, 5, 6, 8 };
+    for ([_]u32{ 64, 32, 128 }) |gs| {
+        if (product % gs != 0) continue;
+        const bits: u32 = @intCast(product / gs);
+        for (valid_bits) |vb| {
+            if (bits == vb) return .{ .bits = bits, .group_size = gs };
+        }
+    }
+    return fallback;
+}
+
+/// Geometry of a loaded (weight, scales) pair → inferred quant params.
+fn inferQuantGeometryOf(w: mlx.mlx_array, scales: mlx.mlx_array) QuantGeometry {
+    const wsh = mlx.getShape(w);
+    const ssh = mlx.getShape(scales);
+    if (wsh.len == 0 or ssh.len == 0) return .{ .bits = 4, .group_size = 64 };
+    const w_cols: usize = @intCast(wsh[wsh.len - 1]);
+    const s_cols: usize = @intCast(ssh[ssh.len - 1]);
+    return inferQuantGeometry(w_cols, s_cols);
+}
 
 const QLinear = struct {
     w: mlx.mlx_array,
@@ -124,12 +158,16 @@ const QLinear = struct {
         defer a.free(bk);
         const ak = try fmtKey(a, "{s}.bias", .{prefix});
         defer a.free(ak);
-        return .{
+        var ql: QLinear = .{
             .w = try ownWeight(w, wk),
             .scales = try ownWeight(w, sk),
             .biases = try ownWeight(w, bk),
             .add_bias = ownOpt(w, ak),
         };
+        const geo = inferQuantGeometryOf(ql.w, ql.scales);
+        ql.bits = geo.bits;
+        ql.group_size = geo.group_size;
+        return ql;
     }
     fn deinit(self: *QLinear) void {
         _ = mlx.mlx_array_free(self.w);
@@ -403,7 +441,8 @@ pub fn loadTextEncoder(io: std.Io, allocator: std.mem.Allocator, s: S, model_dir
     defer _ = mlx.mlx_array_free(es);
     const eb = try ownWeight(&w, "embed_tokens.biases");
     defer _ = mlx.mlx_array_free(eb);
-    te.embed_table = try dequantTable(ew, es, eb, 4, 64, s);
+    const embed_geo = inferQuantGeometryOf(ew, es);
+    te.embed_table = try dequantTable(ew, es, eb, embed_geo.bits, embed_geo.group_size, s);
     te.norm = try ownWeight(&w, "norm.weight");
 
     te.layers = try allocator.alloc(TeLayer, te.cfg.te_layers);
@@ -1835,21 +1874,39 @@ pub fn generate(te: *TextEncoder, dit: *Dit, vae: *Vae, ids: []const i32, mask: 
     return generateWithOpts(te, dit, vae, ids, mask, seed, steps, height, width, .{}, progress);
 }
 
+/// Stage 1 alone: encode the prompt (+ optional conditioning rebalance) and
+/// MATERIALIZE the result. The eval matters: mlx is lazy, and a low-memory
+/// host (the iPhone) frees the 1.7 GB text encoder right after this returns —
+/// an unevaluated graph would pin the encoder weights via refcounts and the
+/// free would reclaim nothing.
+pub fn encodePrompt(te: *TextEncoder, ids: []const i32, mask: []const i32, opts: GenOpts) !mlx.mlx_array {
+    var enc = try te.encode(ids, mask);
+    if (opts.cond_gain != 1.0 or opts.cond_weights != null) {
+        const re = try applyCondRebalance(enc, opts.cond_gain, opts.cond_weights, te.s);
+        _ = mlx.mlx_array_free(enc);
+        enc = re;
+    }
+    _ = mlx.mlx_array_eval(enc);
+    return enc;
+}
+
 pub fn generateWithOpts(te: *TextEncoder, dit: *Dit, vae: *Vae, ids: []const i32, mask: []const i32, seed: u64, steps: u32, height: u32, width: u32, opts: GenOpts, progress: ?sse.Progress) !mlx.mlx_array {
+    const enc = try encodePrompt(te, ids, mask, opts);
+    return generateFromCondWithOpts(dit, vae, enc, ids.len, seed, steps, height, width, opts, progress);
+}
+
+/// Stages 2+ (latents init → denoise loop → VAE decode) from a pre-computed
+/// prompt encoding. Takes ownership of `enc_owned`. `prompt_len` = token count
+/// of the encoded prompt (drives the text position ids).
+pub fn generateFromCondWithOpts(dit: *Dit, vae: *Vae, enc_owned: mlx.mlx_array, prompt_len: usize, seed: u64, steps: u32, height: u32, width: u32, opts: GenOpts, progress: ?sse.Progress) !mlx.mlx_array {
     const s = dit.s;
     const a = dit.allocator;
     const lh = height / 16;
     const lw = width / 16;
     const nlat = lh * lw;
 
-    // 1. text encode (+ optional conditioning rebalance)
-    var enc = try te.encode(ids, mask);
+    const enc = enc_owned;
     defer _ = mlx.mlx_array_free(enc);
-    if (opts.cond_gain != 1.0 or opts.cond_weights != null) {
-        const re = try applyCondRebalance(enc, opts.cond_gain, opts.cond_weights, s);
-        _ = mlx.mlx_array_free(enc);
-        enc = re;
-    }
 
     // 2. latents init: random.normal([1,128,lh,lw], key(seed)) → pack [1,nlat,128]
     var key = mlx.mlx_array_new(); defer _ = mlx.mlx_array_free(key);
@@ -1864,7 +1921,7 @@ pub fn generateWithOpts(te: *TextEncoder, dit: *Dit, vae: *Vae, ids: []const i32
     { var c = mlx.mlx_array_new(); try mlx.check(mlx.mlx_contiguous(&c, latents, false, s)); _ = mlx.mlx_array_free(latents); latents = c; }
 
     const img_ids = try buildLatentIds(a, lh, lw); defer a.free(img_ids);
-    const txt_ids = try buildTextIds(a, @intCast(ids.len)); defer a.free(txt_ids);
+    const txt_ids = try buildTextIds(a, @intCast(prompt_len)); defer a.free(txt_ids);
 
     // Reference-image editing: pack the CLEAN reference latents into tokens
     // with t=10 position ids (official FLUX.2 convention). They ride along in
@@ -2141,4 +2198,114 @@ test "flux text encoder reproduces prompt_embeds" {
     const rel = rmse / std.math.sqrt(nb / @as(f64, @floatFromInt(n)));
     std.debug.print("[flux-te] n={d} corr={d:.6} rmse={d:.4} rel={d:.5} maxabs={d:.1}\n", .{ n, corr, rmse, rel, maxabs });
     try testing.expect(corr > 0.9995);
+}
+
+test "flux inferQuantGeometry resolves mflux/mlx-community bit widths" {
+    // in = 3072 logical columns at gs = 64 → s_cols = 48; w_cols = in·bits/32.
+    try testing.expectEqual(@as(u32, 3), inferQuantGeometry(288, 48).bits); // 3-bit (8 GB iPhones)
+    try testing.expectEqual(@as(u32, 64), inferQuantGeometry(288, 48).group_size);
+    try testing.expectEqual(@as(u32, 4), inferQuantGeometry(384, 48).bits);
+    try testing.expectEqual(@as(u32, 5), inferQuantGeometry(480, 48).bits);
+    try testing.expectEqual(@as(u32, 6), inferQuantGeometry(576, 48).bits);
+    try testing.expectEqual(@as(u32, 8), inferQuantGeometry(768, 48).bits);
+    // gs-128 conversion of the same 4-bit width: s_cols = 24 → product 512;
+    // 512/64 = 8 valid → convention prefers 64 (correct for every catalog
+    // repo; a real gs-128 build would need explicit metadata to win here).
+    try testing.expectEqual(@as(u32, 8), inferQuantGeometry(384, 24).bits);
+    // Degenerate/odd geometry falls back to the historical 4/64.
+    try testing.expectEqual(@as(u32, 4), inferQuantGeometry(0, 0).bits);
+    try testing.expectEqual(@as(u32, 4), inferQuantGeometry(383, 48).bits);
+}
+
+test "flux QLinear with inferred sub-4-bit geometry matches the dequantized reference" {
+    // Quantize a synthetic weight at each shipped bit width, build a QLinear
+    // through the same inference the loader uses, and require its forward to
+    // match dense matmul against the dequantized weight. Catches both a wrong
+    // (bits, gs) inference and any mlx kernel gap at that width.
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+
+    const out_f = 64;
+    const in_f = 128;
+    var wbuf: [out_f * in_f]f32 = undefined;
+    var state: u64 = 0x2545F4914F6CDD1D;
+    for (&wbuf) |*v| {
+        state = state *% 6364136223846793005 +% 1442695040888963407;
+        v.* = @as(f32, @floatFromInt(@as(i32, @bitCast(@as(u32, @truncate(state >> 33)))))) / 2.147e9;
+    }
+    const wsh = [_]c_int{ out_f, in_f };
+    const wdense = mlx.mlx_array_new_data(&wbuf, &wsh, 2, .float32);
+    defer _ = mlx.mlx_array_free(wdense);
+
+    var xbuf: [in_f]f32 = undefined;
+    for (&xbuf) |*v| {
+        state = state *% 6364136223846793005 +% 1442695040888963407;
+        v.* = @as(f32, @floatFromInt(@as(i32, @bitCast(@as(u32, @truncate(state >> 33)))))) / 2.147e9;
+    }
+    const xsh = [_]c_int{ 1, in_f };
+    const x = mlx.mlx_array_new_data(&xbuf, &xsh, 2, .float32);
+    defer _ = mlx.mlx_array_free(x);
+
+    for ([_]u8{ 3, 4, 6, 8 }) |bits| {
+        var vec = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(vec);
+        try mlx.check(mlx.mlx_quantize(
+            &vec,
+            wdense,
+            mlx.mlx_optional_int.some(64),
+            mlx.mlx_optional_int.some(bits),
+            "affine",
+            .{},
+            s,
+        ));
+        var ql: QLinear = .{ .w = mlx.mlx_array_new(), .scales = mlx.mlx_array_new(), .biases = mlx.mlx_array_new() };
+        defer ql.deinit();
+        try mlx.check(mlx.mlx_vector_array_get(&ql.w, vec, 0));
+        try mlx.check(mlx.mlx_vector_array_get(&ql.scales, vec, 1));
+        try mlx.check(mlx.mlx_vector_array_get(&ql.biases, vec, 2));
+
+        const geo = inferQuantGeometryOf(ql.w, ql.scales);
+        try testing.expectEqual(@as(u32, bits), geo.bits);
+        try testing.expectEqual(@as(u32, 64), geo.group_size);
+        ql.bits = geo.bits;
+        ql.group_size = geo.group_size;
+
+        const got = try ql.forward(x, s);
+        defer _ = mlx.mlx_array_free(got);
+
+        // Reference: x @ dequantize(w)ᵀ.
+        const wref = try dequantTable(ql.w, ql.scales, ql.biases, geo.bits, geo.group_size, s);
+        defer _ = mlx.mlx_array_free(wref);
+        var wt = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(wt);
+        const axes = [_]c_int{ 1, 0 };
+        try mlx.check(mlx.mlx_transpose_axes(&wt, wref, &axes, 2, s));
+        var ref = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(ref);
+        try mlx.check(mlx.mlx_matmul(&ref, x, wt, s));
+
+        _ = mlx.mlx_array_eval(got);
+        _ = mlx.mlx_array_eval(ref);
+        var gf = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(gf);
+        var rf = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(rf);
+        try mlx.check(mlx.mlx_astype(&gf, got, .float32, s));
+        try mlx.check(mlx.mlx_astype(&rf, ref, .float32, s));
+        _ = mlx.mlx_array_eval(gf);
+        _ = mlx.mlx_array_eval(rf);
+        const gd = mlx.mlx_array_data_float32(gf) orelse return error.NoData;
+        const rd = mlx.mlx_array_data_float32(rf) orelse return error.NoData;
+        var dot: f64 = 0;
+        var ng: f64 = 0;
+        var nr: f64 = 0;
+        for (0..out_f) |i| {
+            dot += @as(f64, gd[i]) * rd[i];
+            ng += @as(f64, gd[i]) * gd[i];
+            nr += @as(f64, rd[i]) * rd[i];
+        }
+        const cos = dot / (@max(std.math.sqrt(ng * nr), 1e-12));
+        std.debug.print("[flux-qgeo] bits={d} cos={d:.6}\n", .{ bits, cos });
+        try testing.expect(cos > 0.999);
+    }
 }

@@ -87,11 +87,6 @@ class AppState: ObservableObject {
     lazy var videoGen = VideoGenService()
     lazy var audioGen = AudioGenService()
     lazy var model3dGen = Model3DGenService()
-    /// The Avatar window's talk-back loop (persona + cloned voice + sentence
-    /// pipelining). App-level like `taskScheduler`/`voice` so it runs its OWN
-    /// generation and never fights the chat window, and survives the window
-    /// opening/closing.
-    lazy var avatarEngine = AvatarEngine(appState: self)
     @Published var hasSeenWelcome: Bool {
         didSet { UserDefaults.standard.set(hasSeenWelcome, forKey: "hasSeenWelcome") }
     }
@@ -174,7 +169,7 @@ class AppState: ObservableObject {
     /// view) so it survives chat-window open/close and runs from the menu-bar
     /// tray. `bind` wires it to `chatEngine` and the active session once.
     lazy var voice: VoiceModeController = {
-        let controller = VoiceModeController()
+        let controller = VoiceModeController(server: server)
         controller.bind(appState: self)
         return controller
     }()

@@ -11,29 +11,45 @@ protocol WakeChime: AnyObject {
 
 /// Two short ascending sine notes (E5 → B5) with click-free Hann envelopes —
 /// a friendly rising "bdp" distinct from the loading cue's single low blip.
-/// Owns its own `AVAudioEngine`, independent of mic capture; the engine is
-/// started lazily on first play and kept warm so repeats are instant.
+/// Owns its own `AVAudioEngine`, independent of mic capture.
+///
+/// The WHOLE audio graph is built lazily on first `play()` — never at init.
+/// The chime is constructed inside `VoiceModeController`, which the menu-bar
+/// tray forces at APP LAUNCH; building an engine graph there brings up the
+/// CoreAudio HAL, whose voice-isolation evaluation consults the microphone
+/// TCC service → the app prompted for the mic at launch instead of at
+/// voice-mode enable (live 2026-07-05; see the CLAUDE.md gotcha). Once built,
+/// the engine is kept warm so repeats are instant. Laziness pinned by
+/// `VoiceActivityTests.testWakeChimeBuildsNoEngineAtInit`.
 final class SystemWakeChime: WakeChime {
-    private let engine = AVAudioEngine()
-    private let player = AVAudioPlayerNode()
-    private let buffer: AVAudioPCMBuffer
-
-    init() {
-        let sampleRate = 44_100.0
-        let format = AVAudioFormat(standardFormatWithSampleRate: sampleRate, channels: 1)!
-        buffer = SystemWakeChime.makeChime(format: format, sampleRate: sampleRate)
-        engine.attach(player)
-        engine.connect(player, to: engine.mainMixerNode, format: format)
-        engine.mainMixerNode.outputVolume = 0.3
-    }
+    private(set) var engine: AVAudioEngine?
+    private var player: AVAudioPlayerNode?
+    private var buffer: AVAudioPCMBuffer?
 
     func play() {
+        let (engine, player, buffer) = ensureEngine()
         do {
             if !engine.isRunning { try engine.start() }
         } catch { return }
         if !player.isPlaying { player.play() }
         // `.interrupts` so a rapid re-trigger restarts cleanly rather than queueing.
         player.scheduleBuffer(buffer, at: nil, options: .interrupts, completionHandler: nil)
+    }
+
+    private func ensureEngine() -> (AVAudioEngine, AVAudioPlayerNode, AVAudioPCMBuffer) {
+        if let engine, let player, let buffer { return (engine, player, buffer) }
+        let sampleRate = 44_100.0
+        let format = AVAudioFormat(standardFormatWithSampleRate: sampleRate, channels: 1)!
+        let buf = SystemWakeChime.makeChime(format: format, sampleRate: sampleRate)
+        let eng = AVAudioEngine()
+        let node = AVAudioPlayerNode()
+        eng.attach(node)
+        eng.connect(node, to: eng.mainMixerNode, format: format)
+        eng.mainMixerNode.outputVolume = 0.3
+        engine = eng
+        player = node
+        buffer = buf
+        return (eng, node, buf)
     }
 
     /// Two 85 ms notes (E5 → B5) under Hann windows so each fades in/out clickless.

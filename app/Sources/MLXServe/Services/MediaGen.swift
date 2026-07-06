@@ -371,30 +371,54 @@ struct AudioModelPreset: Identifiable, Hashable {
     static func == (lhs: Self, rhs: Self) -> Bool { lhs.id == rhs.id }
     func hash(into hasher: inout Hasher) { hasher.combine(id) }
 
-    /// Qwen3-TTS 0.6B (Base) — the lightest supported model. Default.
+    /// Qwen3-TTS 0.6B (Base) 8-bit — the lightest supported model. Default.
+    /// Affine 8-bit talker + code predictor; the codec decoder and speaker
+    /// encoder stay unquantized, so cloning fidelity is unchanged.
+    static let qwen3TTS06B8bit = AudioModelPreset(
+        id: "mlx-audio/qwen3-tts-0.6b-base-8bit",
+        name: "Qwen3-TTS 0.6B 8-bit (balanced, ~2 GB)",
+        repo: "mlx-community/Qwen3-TTS-12Hz-0.6B-Base-8bit",
+        approxDownloadGB: 2.0,
+        approxRAMGB: 3,
+        recommendedRefSeconds: 8
+    )
+
+    /// Qwen3-TTS 0.6B (Base) bf16 — full-precision fidelity fallback.
     static let qwen3TTS06B = AudioModelPreset(
         id: "mlx-audio/qwen3-tts-0.6b-base",
-        name: "Qwen3-TTS 0.6B (balanced, ~1.5 GB)",
+        name: "Qwen3-TTS 0.6B bf16 (full precision, ~2.5 GB)",
         repo: "mlx-community/Qwen3-TTS-12Hz-0.6B-Base-bf16",
-        approxDownloadGB: 1.5,
+        approxDownloadGB: 2.5,
         approxRAMGB: 4,
         recommendedRefSeconds: 8
     )
 
-    /// Qwen3-TTS 1.7B (Base) — highest fidelity here; best for expressive,
-    /// long-form cloning when the Mac has the headroom.
+    /// Qwen3-TTS 1.7B (Base) 8-bit — the quality pick: ~30% smaller download
+    /// than bf16 and lower RAM, with near-identical output.
+    static let qwen3TTS17B8bit = AudioModelPreset(
+        id: "mlx-audio/qwen3-tts-1.7b-base-8bit",
+        name: "Qwen3-TTS 1.7B 8-bit (quality, ~3.1 GB)",
+        repo: "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-8bit",
+        approxDownloadGB: 3.1,
+        approxRAMGB: 5,
+        recommendedRefSeconds: 8
+    )
+
+    /// Qwen3-TTS 1.7B (Base) bf16 — highest fidelity here; best for
+    /// expressive, long-form cloning when the Mac has the headroom.
     static let qwen3TTS17B = AudioModelPreset(
         id: "mlx-audio/qwen3-tts-1.7b-base",
-        name: "Qwen3-TTS 1.7B (quality, ~3.5 GB)",
+        name: "Qwen3-TTS 1.7B bf16 (max fidelity, ~4.5 GB)",
         repo: "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-bf16",
-        approxDownloadGB: 3.5,
+        approxDownloadGB: 4.5,
         approxRAMGB: 8,
         recommendedRefSeconds: 8
     )
 
-    /// Catalog ordered lightest → heaviest. Default (`first`) is Qwen3-TTS 0.6B.
+    /// Catalog ordered lightest → heaviest. Default (`first`) is the 8-bit
+    /// Qwen3-TTS 0.6B; bf16 builds stay as fidelity fallbacks.
     /// Only `qwen3_tts` models — the native engine can't serve other TTS archs.
-    static let all: [AudioModelPreset] = [.qwen3TTS06B, .qwen3TTS17B]
+    static let all: [AudioModelPreset] = [.qwen3TTS06B8bit, .qwen3TTS06B, .qwen3TTS17B8bit, .qwen3TTS17B]
 }
 
 // MARK: - 3D presets (image → mesh)
@@ -403,13 +427,13 @@ struct AudioModelPreset: Identifiable, Hashable {
 /// The engine dispatches on `config.json`'s `model_type`, so only converted
 /// Hunyuan3D checkpoints load here.
 ///
-/// ONE combined HF repo carries all three stages: shape weights at the root,
-/// the paint (texture) stage in `paint/`, and the UniRig auto-rig stage in
-/// `unirig/` — a single download lights up shape + texture + rig (the server
-/// resolves the subdirs via `gen.findStageModelDir`). A `local/` repo prefix
-/// still marks a convert-on-device build (`tests/convert_hunyuan3d_weights.py`
-/// et al.), for which the pane shows a "convert locally" hint instead of a
-/// Download button.
+/// ONE combined HF repo carries both stages: shape weights at the root and
+/// the paint (texture) stage in `paint/` — a single download lights up
+/// shape + texture (the server resolves the subdir via
+/// `gen.findStageModelDir`). A `local/` repo prefix still marks a
+/// convert-on-device build (`tests/convert_hunyuan3d_weights.py` et al.),
+/// for which the pane shows a "convert locally" hint instead of a Download
+/// button.
 struct Model3DModelPreset: Identifiable, Hashable {
     let id: String
     let name: String
@@ -419,7 +443,7 @@ struct Model3DModelPreset: Identifiable, Hashable {
     /// Peak unified-memory footprint, GB — drives the soft RAM gate. The paint
     /// stage is the peak (shape frees before it loads).
     let approxRAMGB: Int
-    /// Full bundle download size, GB (shape + paint + unirig).
+    /// Full bundle download size, GB (shape + paint).
     let approxDownloadGB: Double
 
     static func == (lhs: Self, rhs: Self) -> Bool { lhs.id == rhs.id }
@@ -430,7 +454,7 @@ struct Model3DModelPreset: Identifiable, Hashable {
     /// button while its weights are absent.
     var isLocalOnly: Bool { repo.hasPrefix("local/") }
 
-    /// Hunyuan3D 2.1, 8-bit — the combined shape + paint + UniRig repo.
+    /// Hunyuan3D 2.1, 8-bit — the combined shape + paint repo.
     static let hunyuan3d21_8bit = Model3DModelPreset(
         id: "hunyuan3d-2-1-8bit",
         name: "Hunyuan3D 2.1 (8-bit)",
@@ -580,9 +604,6 @@ struct Model3DGenRequest {
     /// Run the P2 paint stage (full PBR texture) after shape generation.
     /// Off by default until the paint port is validated end to end.
     var texture: Bool = false
-    /// Run the P3 auto-rig stage (UniRig skeleton + geodesic skin weights) so
-    /// the exported GLB animates. Off by default.
-    var rig: Bool = false
 }
 
 // MARK: - RAM checks

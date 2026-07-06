@@ -17,14 +17,42 @@ protocol SpeechSynthesizing: AnyObject {
     func enqueue(_ text: String)
     /// Cancel everything immediately (barge-in / mode close).
     func stop()
+    /// Voice mode is closing for good: stop AND release any resident audio
+    /// resources (e.g. unload a server-side TTS model). Distinct from `stop()`,
+    /// which also fires on barge-in mid-session where resources should stay
+    /// warm. Default implementation just stops.
+    func shutdown()
+}
+
+extension SpeechSynthesizing {
+    func shutdown() { stop() }
 }
 
 /// `AVSpeechSynthesizer`-backed implementation. Tracks an explicit pending count
 /// instead of relying on `AVSpeechSynthesizer.isSpeaking`, so `isSpeaking` flips
 /// synchronously on `enqueue`/`stop` and the drain callback is race-free.
+///
+/// The `AVSpeechSynthesizer` itself is created lazily on the FIRST utterance —
+/// never at init. This object is constructed inside `VoiceModeController`,
+/// which the menu-bar tray forces at APP LAUNCH, and instantiating
+/// AVSpeechSynthesizer brings up CoreAudio's voice-processing ("chat flavor")
+/// machinery, which consults the microphone TCC service → the app prompted
+/// for the mic at launch instead of at voice-mode enable (live 2026-07-05;
+/// tccd AUTHREQ 1.9 s after launch). Laziness pinned by
+/// `VoiceActivityTests.testSystemSynthesizerBuildsNoAVSpeechSynthesizerAtInit`.
 @MainActor
 final class SystemSpeechSynthesizer: NSObject, SpeechSynthesizing {
-    private let synth = AVSpeechSynthesizer()
+    /// Lazy backing store — internal (not private) so tests can assert init
+    /// builds nothing. Access through `synth` everywhere except `stop()`,
+    /// which must never FORCE creation just to stop nothing.
+    private(set) var synthStorage: AVSpeechSynthesizer?
+    private var synth: AVSpeechSynthesizer {
+        if let s = synthStorage { return s }
+        let s = AVSpeechSynthesizer()
+        s.delegate = self
+        synthStorage = s
+        return s
+    }
     private var pending = 0
 
     /// Optional explicit voice; nil → the system default for the user's language.
@@ -41,11 +69,6 @@ final class SystemSpeechSynthesizer: NSObject, SpeechSynthesizing {
     var onQueueDrained: (() -> Void)?
     var isSpeaking: Bool { pending > 0 }
 
-    override init() {
-        super.init()
-        synth.delegate = self
-    }
-
     func enqueue(_ text: String) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
@@ -60,7 +83,7 @@ final class SystemSpeechSynthesizer: NSObject, SpeechSynthesizing {
 
     func stop() {
         pending = 0
-        synth.stopSpeaking(at: .immediate)
+        synthStorage?.stopSpeaking(at: .immediate)
     }
 
     private func finishedOne() {

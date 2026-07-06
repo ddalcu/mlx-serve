@@ -77,6 +77,39 @@ class ServerManager: ObservableObject {
         launch(args: args, options: options)
     }
 
+    /// Has a headless server already had the selected chat model hot-loaded
+    /// by `ensureDefaultChatModel`? Reset on every launch; only consulted for
+    /// headless launches (`currentModelPath` empty).
+    private var chatDefaultEnsured = false
+
+    /// Should a chat surface hot-load the selected model before its turn?
+    /// True exactly when: the server is running, it was launched HEADLESS
+    /// (media-first — no `--model`, so the registry has NO default and the
+    /// "mlx-serve" alias 503s with no_model), we haven't already ensured it,
+    /// and the app actually has a selected model to offer. Pure + static so
+    /// the gen-first→chat-later hole (live 2026-07-05) stays unit-pinned.
+    nonisolated static func shouldEnsureChatDefault(running: Bool, launchedModelPath: String,
+                                                    alreadyEnsured: Bool, selectedModelPath: String) -> Bool {
+        running && launchedModelPath.isEmpty && !alreadyEnsured && !selectedModelPath.isEmpty
+    }
+
+    /// Called by chat surfaces (chat window / quick launcher via
+    /// ChatTurnEngine, the avatar) before a turn: when the running server was
+    /// started headless for media generation, hot-load the user's selected
+    /// chat model by ABSOLUTE PATH (works for org/name two-level dirs; the
+    /// server dedups by path and promotes the first chat-capable load to its
+    /// default, so the alias-addressed request that follows resolves).
+    /// Failures are left to the request itself to surface.
+    func ensureDefaultChatModel(selectedModelPath: String) async {
+        guard Self.shouldEnsureChatDefault(running: status == .running,
+                                           launchedModelPath: currentModelPath,
+                                           alreadyEnsured: chatDefaultEnsured,
+                                           selectedModelPath: selectedModelPath) else { return }
+        if (try? await loadModel(id: selectedModelPath)) != nil {
+            chatDefaultEnsured = true
+        }
+    }
+
     /// Start the server HEADLESS — no `--model`, just `--model-dir` so the
     /// registry discovers chat models while media + chat load on demand via
     /// `/v1/load-model`. Used by `ensureRunning(forGenModelDir:)` when the user
@@ -96,6 +129,7 @@ class ServerManager: ObservableObject {
         port = options.port
         status = .starting
         lastError = ""
+        chatDefaultEnsured = false
         clearServerLog()
 
         // Reap orphaned mlx-serve processes still bound to our port (e.g. left

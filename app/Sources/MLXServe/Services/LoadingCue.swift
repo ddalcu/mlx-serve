@@ -13,25 +13,24 @@ protocol LoadingCue: AnyObject {
 /// Soft sine "blip" with a smooth (click-free) envelope, low volume, repeated
 /// every ~1.6 s. Uses its own `AVAudioEngine` for output — independent of the
 /// mic capture engine, and the mic is off while we're loading anyway.
+///
+/// The audio graph is built lazily on first `start()` — never at init. Like
+/// the wake chime, this object is constructed inside `VoiceModeController`
+/// at APP LAUNCH, and building an engine graph there brings up the CoreAudio
+/// HAL whose voice-isolation evaluation consults the mic TCC service → a
+/// launch-time microphone prompt (live 2026-07-05). Laziness pinned by
+/// `VoiceActivityTests.testLoadingCueBuildsNoEngineAtInitOrStop`.
 final class SystemLoadingCue: LoadingCue {
-    private let engine = AVAudioEngine()
-    private let player = AVAudioPlayerNode()
-    private let buffer: AVAudioPCMBuffer
+    private(set) var engine: AVAudioEngine?
+    private var player: AVAudioPlayerNode?
+    private var buffer: AVAudioPCMBuffer?
     private var timer: Timer?
     private var running = false
-
-    init() {
-        let sampleRate = 44_100.0
-        let format = AVAudioFormat(standardFormatWithSampleRate: sampleRate, channels: 1)!
-        buffer = SystemLoadingCue.makeBlip(format: format, sampleRate: sampleRate)
-        engine.attach(player)
-        engine.connect(player, to: engine.mainMixerNode, format: format)
-        engine.mainMixerNode.outputVolume = 0.16   // keep it subtle
-    }
 
     func start() {
         guard !running else { return }
         running = true
+        let (engine, player, _) = ensureEngine()
         do {
             if !engine.isRunning { try engine.start() }
         } catch { running = false; return }
@@ -46,13 +45,29 @@ final class SystemLoadingCue: LoadingCue {
         guard running else { return }
         running = false
         timer?.invalidate(); timer = nil
-        player.stop()
-        engine.pause()
+        player?.stop()
+        engine?.pause()
     }
 
     private func playOnce() {
-        guard running else { return }
+        guard running, let player, let buffer else { return }
         player.scheduleBuffer(buffer, at: nil, options: [], completionHandler: nil)
+    }
+
+    private func ensureEngine() -> (AVAudioEngine, AVAudioPlayerNode, AVAudioPCMBuffer) {
+        if let engine, let player, let buffer { return (engine, player, buffer) }
+        let sampleRate = 44_100.0
+        let format = AVAudioFormat(standardFormatWithSampleRate: sampleRate, channels: 1)!
+        let buf = SystemLoadingCue.makeBlip(format: format, sampleRate: sampleRate)
+        let eng = AVAudioEngine()
+        let node = AVAudioPlayerNode()
+        eng.attach(node)
+        eng.connect(node, to: eng.mainMixerNode, format: format)
+        eng.mainMixerNode.outputVolume = 0.16   // keep it subtle
+        engine = eng
+        player = node
+        buffer = buf
+        return (eng, node, buf)
     }
 
     /// ~160 ms, 396 Hz sine under a Hann window so it fades in/out without clicks.

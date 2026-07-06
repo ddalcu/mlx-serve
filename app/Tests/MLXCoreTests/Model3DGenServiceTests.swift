@@ -107,28 +107,6 @@ final class Model3DGenServiceTests: XCTestCase {
         XCTAssertFalse(legacy.texture)
     }
 
-    // MARK: - Rig (auto-skeleton) stage
-
-    func testRigDefaultsOffAndRidesTheRequestBody() {
-        var req = Model3DGenRequest(model: .hunyuan3d21_8bit, photoPath: "/tmp/x.png")
-        XCTAssertFalse(req.rig, "rig stage is opt-in")
-        let off = Model3DGenService.requestJson(for: req, modelName: "m", imageB64: "QUJD", seed: 1)
-        XCTAssertEqual(off["rig"] as? Bool, false)
-        req.rig = true
-        let on = Model3DGenService.requestJson(for: req, modelName: "m", imageB64: "QUJD", seed: 1)
-        XCTAssertEqual(on["rig"] as? Bool, true)
-    }
-
-    func testModel3DSettingsPersistRigToggle() throws {
-        var s = Model3DGenSettings()
-        XCTAssertFalse(s.rig)
-        s.rig = true
-        let decoded = try JSONDecoder().decode(Model3DGenSettings.self, from: try JSONEncoder().encode(s))
-        XCTAssertTrue(decoded.rig)
-        let legacy = try JSONDecoder().decode(Model3DGenSettings.self, from: Data("{}".utf8))
-        XCTAssertFalse(legacy.rig)
-    }
-
     // MARK: - History shelf (thumbnails + click-to-preview)
 
     func testThumbnailPathSitsBesideTheGlb() {

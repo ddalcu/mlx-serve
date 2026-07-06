@@ -48,7 +48,7 @@ const supported_model_types = [_][]const u8{
 /// and `/v1/load-model` by-path accept them; the modality engine (not the MLX
 /// transformer) handles the load. Kept as inline string checks so this module
 /// stays filesystem-only (no mlx/gen import). Mirrors `gen.modalityFromType`.
-fn isMediaModelType(model_type: []const u8) bool {
+pub fn isMediaModelType(model_type: []const u8) bool {
     return std.mem.startsWith(u8, model_type, "flux2") or
         std.mem.startsWith(u8, model_type, "krea") or
         std.mem.eql(u8, model_type, "qwen3_tts") or

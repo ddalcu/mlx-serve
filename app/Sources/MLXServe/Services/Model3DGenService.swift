@@ -151,7 +151,6 @@ final class Model3DGenService: ObservableObject {
             "octree_resolution": request.octreeResolution,
             "seed": seed,
             "texture": request.texture,
-            "rig": request.rig,
         ]
     }
 

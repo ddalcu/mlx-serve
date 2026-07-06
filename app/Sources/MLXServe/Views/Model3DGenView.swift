@@ -23,7 +23,6 @@ struct Model3DGenView: View {
     @State private var keepResident: Bool = false
     @State private var turntable: Bool = true
     @State private var texture: Bool = false
-    @State private var rig: Bool = false
     @State private var showAdvanced: Bool = false
 
     @State private var showRAMWarning: Bool = false
@@ -51,7 +50,6 @@ struct Model3DGenView: View {
         .onChange(of: keepResident) { _, _ in guard !hydrating else { return }; persist() }
         .onChange(of: turntable) { _, _ in guard !hydrating else { return }; persist() }
         .onChange(of: texture) { _, _ in guard !hydrating else { return }; persist() }
-        .onChange(of: rig) { _, _ in guard !hydrating else { return }; persist() }
     }
 
     private var readyView: some View {
@@ -176,9 +174,6 @@ struct Model3DGenView: View {
             Toggle("Texture (PBR)", isOn: $texture)
                 .font(.caption)
                 .help("After the shape stage, paint a full PBR texture (albedo + metallic-roughness) onto the mesh from the same photo. Needs the converted paint weights (~4.6 GB).")
-            Toggle("Rig (skeleton)", isOn: $rig)
-                .font(.caption)
-                .help("Auto-rig the mesh with a UniRig skeleton + geodesic skin weights so it can animate (idle sway; the avatar drives its jaw from speech). Needs the converted UniRig weights (~0.4 GB).")
             Toggle("Keep model loaded after generating", isOn: $keepResident)
                 .font(.caption)
                 .help("On: the model stays resident so the next generation is instant. Off (default): it's unloaded to free GPU memory.")
@@ -253,13 +248,13 @@ struct Model3DGenView: View {
 
     private func completedPreview(path: String) -> some View {
         VStack(spacing: 8) {
-            Model3DSceneView(url: URL(fileURLWithPath: path), turntable: turntable)
+            Model3DSceneView(url: URL(fileURLWithPath: path), animate: turntable)
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
                 .clipShape(RoundedRectangle(cornerRadius: 8))
             HStack(spacing: 10) {
                 Toggle("Animate", isOn: $turntable)
                     .toggleStyle(.switch).font(.caption)
-                    .help("Slowly rotate + gently pulse the model on a turntable.")
+                    .help("Idle motion: the model turns on a turntable with a gentle breathing pulse.")
                 Spacer()
                 Text(URL(fileURLWithPath: path).lastPathComponent)
                     .font(.caption).foregroundStyle(.secondary)
@@ -333,7 +328,6 @@ struct Model3DGenView: View {
         keepResident = s.keepResident
         turntable = s.turntable
         texture = s.texture
-        rig = s.rig
     }
 
     private func persist() {
@@ -345,7 +339,6 @@ struct Model3DGenView: View {
         s.keepResident = keepResident
         s.turntable = turntable
         s.texture = texture
-        s.rig = rig
         s.save()
     }
 
@@ -360,8 +353,7 @@ struct Model3DGenView: View {
             guidanceScale: guidance,
             octreeResolution: resolution,
             keepResident: keepResident,
-            texture: texture,
-            rig: rig
+            texture: texture
         )
         persist()
         let total = RAMChecker.totalGB
@@ -589,16 +581,6 @@ enum GLBMeshLoader {
                     geometry.materials = [material]
                 }
                 let meshNode = SCNNode(geometry: geometry)
-                // Skinned mesh (P3 rig stage): JOINTS_0/WEIGHTS_0 + a skin →
-                // SCNSkinner with the joint node hierarchy.
-                if let jointsIdx = attrs["JOINTS_0"] as? Int,
-                   let weightsIdx = attrs["WEIGHTS_0"] as? Int,
-                   let skinner = buildSkinner(gltf: gltf, raw: raw, bin: bin,
-                                              geometry: geometry, scene: scene,
-                                              jointsAccessor: jointsIdx, weightsAccessor: weightsIdx,
-                                              vertexCount: positions.count) {
-                    meshNode.skinner = skinner
-                }
                 scene.rootNode.addChildNode(meshNode)
                 built = true
             }
@@ -649,122 +631,6 @@ enum GLBMeshLoader {
             material.roughness.contents = pbr["roughnessFactor"] as? Double ?? 1.0
         }
         return material
-    }
-
-    /// Build an SCNSkinner from the writer's skin layout (skins[0], joint
-    /// nodes with translations + children, MAT4 float IBMs, u16 VEC4 JOINTS_0,
-    /// float VEC4 WEIGHTS_0). Attaches the bone root to the scene so viewers
-    /// can animate it. Returns nil for anything outside that shape.
-    private static func buildSkinner(gltf: [String: Any], raw: UnsafeRawBufferPointer, bin: Range<Int>,
-                                     geometry: SCNGeometry, scene: SCNScene,
-                                     jointsAccessor: Int, weightsAccessor: Int,
-                                     vertexCount: Int) -> SCNSkinner? {
-        guard let skins = gltf["skins"] as? [[String: Any]], let skin = skins.first,
-              let gltfNodes = gltf["nodes"] as? [[String: Any]],
-              let jointNodeIndices = skin["joints"] as? [Int],
-              let ibmAccessor = skin["inverseBindMatrices"] as? Int,
-              let accessors = gltf["accessors"] as? [[String: Any]],
-              let views = gltf["bufferViews"] as? [[String: Any]] else { return nil }
-
-        // 1. Build SCNNodes for every glTF node index we need (joints only),
-        //    then wire the hierarchy from each node's `children`.
-        var scnNodes: [Int: SCNNode] = [:]
-        for idx in jointNodeIndices {
-            guard idx >= 0, idx < gltfNodes.count else { return nil }
-            let n = SCNNode()
-            if let t = gltfNodes[idx]["translation"] as? [Any], t.count == 3 {
-                func f(_ v: Any) -> CGFloat { CGFloat((v as? NSNumber)?.doubleValue ?? 0) }
-                n.position = SCNVector3(f(t[0]), f(t[1]), f(t[2]))
-            }
-            scnNodes[idx] = n
-        }
-        for idx in jointNodeIndices {
-            guard let children = gltfNodes[idx]["children"] as? [Int] else { continue }
-            for c in children {
-                if let childNode = scnNodes[c] { scnNodes[idx]?.addChildNode(childNode) }
-            }
-        }
-        let bones: [SCNNode] = jointNodeIndices.compactMap { scnNodes[$0] }
-        guard bones.count == jointNodeIndices.count else { return nil }
-        // Attach every parentless bone (the root) to the scene graph.
-        for bone in bones where bone.parent == nil {
-            scene.rootNode.addChildNode(bone)
-        }
-
-        // 2. Inverse bind matrices: MAT4 float, glTF column-major → SCNMatrix4
-        //    sequential field fill (m41..m43 become the translation row).
-        guard let ibms = readMat4(accessors, views, raw, bin, ibmAccessor),
-              ibms.count == bones.count else { return nil }
-
-        // 3. Bone weights + indices geometry sources.
-        guard let (jointsData, jointsStride) = readRawAccessor(accessors, views, raw, bin, jointsAccessor,
-                                                               expectType: "VEC4", componentType: 5123, componentSize: 2, components: 4, count: vertexCount),
-              let (weightsData, weightsStride) = readRawAccessor(accessors, views, raw, bin, weightsAccessor,
-                                                                 expectType: "VEC4", componentType: 5126, componentSize: 4, components: 4, count: vertexCount)
-        else { return nil }
-        let weightsSource = SCNGeometrySource(data: weightsData, semantic: .boneWeights,
-                                              vectorCount: vertexCount, usesFloatComponents: true,
-                                              componentsPerVector: 4, bytesPerComponent: 4,
-                                              dataOffset: 0, dataStride: weightsStride)
-        let indicesSource = SCNGeometrySource(data: jointsData, semantic: .boneIndices,
-                                              vectorCount: vertexCount, usesFloatComponents: false,
-                                              componentsPerVector: 4, bytesPerComponent: 2,
-                                              dataOffset: 0, dataStride: jointsStride)
-        return SCNSkinner(baseGeometry: geometry,
-                          bones: bones,
-                          boneInverseBindTransforms: ibms.map { NSValue(scnMatrix4: $0) },
-                          boneWeights: weightsSource,
-                          boneIndices: indicesSource)
-    }
-
-    /// Read a MAT4 FLOAT accessor as SceneKit matrices (sequential fill —
-    /// glTF column-major lands translation in m41/m42/m43).
-    private static func readMat4(_ accessors: [[String: Any]], _ views: [[String: Any]],
-                                 _ raw: UnsafeRawBufferPointer, _ bin: Range<Int>, _ idx: Int) -> [SCNMatrix4]? {
-        guard idx >= 0, idx < accessors.count else { return nil }
-        let acc = accessors[idx]
-        guard acc["type"] as? String == "MAT4", (acc["componentType"] as? Int) == 5126,
-              let count = acc["count"] as? Int,
-              let vIdx = acc["bufferView"] as? Int, vIdx >= 0, vIdx < views.count else { return nil }
-        let view = views[vIdx]
-        let start = bin.lowerBound + ((view["byteOffset"] as? Int) ?? 0) + ((acc["byteOffset"] as? Int) ?? 0)
-        var out: [SCNMatrix4] = []
-        out.reserveCapacity(count)
-        for i in 0..<count {
-            let base = start + i * 64
-            guard base + 64 <= bin.upperBound else { return nil }
-            var m: [CGFloat] = []
-            for c in 0..<16 {
-                m.append(CGFloat(raw.loadUnaligned(fromByteOffset: base + c * 4, as: Float.self)))
-            }
-            out.append(SCNMatrix4(
-                m11: m[0], m12: m[1], m13: m[2], m14: m[3],
-                m21: m[4], m22: m[5], m23: m[6], m24: m[7],
-                m31: m[8], m32: m[9], m33: m[10], m34: m[11],
-                m41: m[12], m42: m[13], m43: m[14], m44: m[15]))
-        }
-        return out
-    }
-
-    /// Copy an accessor's raw bytes into a tightly-packed Data (validating the
-    /// exact component layout the writer emits). Returns (data, stride).
-    private static func readRawAccessor(_ accessors: [[String: Any]], _ views: [[String: Any]],
-                                        _ raw: UnsafeRawBufferPointer, _ bin: Range<Int>, _ idx: Int,
-                                        expectType: String, componentType: Int, componentSize: Int,
-                                        components: Int, count: Int) -> (Data, Int)? {
-        guard idx >= 0, idx < accessors.count else { return nil }
-        let acc = accessors[idx]
-        guard acc["type"] as? String == expectType,
-              (acc["componentType"] as? Int) == componentType,
-              (acc["count"] as? Int) == count,
-              let vIdx = acc["bufferView"] as? Int, vIdx >= 0, vIdx < views.count else { return nil }
-        let view = views[vIdx]
-        let elemSize = componentSize * components
-        let start = bin.lowerBound + ((view["byteOffset"] as? Int) ?? 0) + ((acc["byteOffset"] as? Int) ?? 0)
-        let stride = (view["byteStride"] as? Int) ?? elemSize
-        guard stride == elemSize, start + count * elemSize <= bin.upperBound,
-              let base = raw.baseAddress else { return nil }
-        return (Data(bytes: base.advanced(by: start), count: count * elemSize), elemSize)
     }
 
     /// Read a VEC2 FLOAT accessor as `[CGPoint]` (texture coordinates).
@@ -855,19 +721,18 @@ enum GLBMeshLoader {
 /// SceneKit preview of the generated GLB. Mirrors VideoGenView's
 /// `AVPlayerViewRepresentable` — a thin `NSViewRepresentable` so the media
 /// preview lives in AppKit, not a state-driven SwiftUI generic. Reloads only
-/// when the file changes; the "Animate" turntable is v1 (procedural
-/// `SCNAction`s, no rig).
-///
-/// Not private — the Avatar window (`AvatarView`) reuses it to render the
-/// persona's 3D model with the same turntable idle.
+/// when the file changes; the "Animate" idle is a procedural turntable spin
+/// plus a gentle breathing scale pulse (plain `SCNAction`s).
 struct Model3DSceneView: NSViewRepresentable {
+    /// Turntable revolution period, seconds.
+    static let turntablePeriod: TimeInterval = 12
+    /// Breathing pulse: ±3 % scale over a 4 s out/back cycle.
+    static let breathePeriod: TimeInterval = 4
+    static let breatheScale: CGFloat = 1.03
+
     let url: URL?
-    let turntable: Bool
-    /// Normalized [0,1] speech envelope (avatar): nods the heuristic head bone
-    /// of a SKINNED model while >0. Ignored for unskinned meshes. (P3.4)
-    var jawAmplitude: Double = 0
-    /// One-shot emote clip (avatar). A new trigger restarts the clip. (P3.3)
-    var emote: EmoteTrigger? = nil
+    /// Idle motion (the pane's "Animate" toggle): spin + breathe when true.
+    var animate: Bool = true
 
     func makeNSView(context: Context) -> SCNView {
         let view = SCNView()
@@ -882,13 +747,10 @@ struct Model3DSceneView: NSViewRepresentable {
             context.coordinator.loadedURL = url
             let scene = url.flatMap { GLBMeshLoader.loadScene(url: $0) }
             nsView.scene = scene
-            let node = scene.flatMap { GLBMeshLoader.firstGeometryNode(in: $0) }
-            context.coordinator.modelNode = node
-            context.coordinator.captureSkeleton(of: node)
+            context.coordinator.modelNode = scene.flatMap { GLBMeshLoader.firstGeometryNode(in: $0) }
+            context.coordinator.animating = nil
         }
-        context.coordinator.jawTarget = jawAmplitude
-        context.coordinator.emote = emote
-        applyAnimation(to: context.coordinator.modelNode, coordinator: context.coordinator)
+        context.coordinator.setAnimating(animate)
     }
 
     func makeCoordinator() -> Coordinator { Coordinator() }
@@ -896,102 +758,26 @@ struct Model3DSceneView: NSViewRepresentable {
     final class Coordinator {
         var loadedURL: URL?
         var modelNode: SCNNode?
-        // Skinned-model state (P3.3/3.4).
-        var bones: [SCNNode] = []
-        var boneDepths: [Int] = []
-        var bindEulers: [SCNVector3] = []
-        var speechBone: Int?
-        var rootBone: Int?
-        var jawTarget: Double = 0
-        var emote: EmoteTrigger?
-        var idleInstalled = false
+        /// nil = fresh load (actions must be (re)installed either way).
+        var animating: Bool?
 
-        /// Capture the skinner's bone set at bind pose: depths for the idle
-        /// sway, the highest-leaf bone for the speech nod (UniRig joints are
-        /// unnamed — SkeletalAnimator's heuristic picks).
-        func captureSkeleton(of node: SCNNode?) {
-            bones = node?.skinner?.bones ?? []
-            idleInstalled = false
-            guard !bones.isEmpty else {
-                boneDepths = []
-                bindEulers = []
-                speechBone = nil
-                return
-            }
-            let boneSet = Set(bones.map { ObjectIdentifier($0) })
-            var parents: [Int?] = []
-            for bone in bones {
-                if let p = bone.parent, boneSet.contains(ObjectIdentifier(p)) {
-                    parents.append(bones.firstIndex(where: { $0 === p }))
-                } else {
-                    parents.append(nil)
-                }
-            }
-            boneDepths = SkeletalAnimator.depths(parents: parents)
-            bindEulers = bones.map { $0.eulerAngles }
-            var positions: [Double] = []
-            for bone in bones {
-                let w = bone.worldPosition
-                positions.append(contentsOf: [Double(w.x), Double(w.y), Double(w.z)])
-            }
-            speechBone = SkeletalAnimator.pickSpeechBone(positions: positions, parents: parents)
-            rootBone = parents.firstIndex(where: { $0 == nil })
-        }
-    }
-
-    /// Unskinned: slow turntable spin + subtle "breathing" scale (v1).
-    /// Skinned (P3.3): the rig replaces the turntable — a per-bone idle sway
-    /// plus the speech-envelope jaw/head nod, driven per frame off the
-    /// coordinator so amplitude updates flow without re-installing actions.
-    private func applyAnimation(to node: SCNNode?, coordinator: Coordinator) {
-        guard let node else { return }
-        if !coordinator.bones.isEmpty {
-            guard turntable else {
-                if coordinator.idleInstalled {
-                    node.removeAllActions()
-                    coordinator.idleInstalled = false
-                    for (i, bone) in coordinator.bones.enumerated() where i < coordinator.bindEulers.count {
-                        bone.eulerAngles = coordinator.bindEulers[i]
-                    }
-                }
-                return
-            }
-            guard !coordinator.idleInstalled else { return }
-            coordinator.idleInstalled = true
+        func setAnimating(_ on: Bool) {
+            guard on != animating, let node = modelNode else { return }
+            animating = on
             node.removeAllActions()
-            let start = CACurrentMediaTime()
-            let driver = SCNAction.customAction(duration: 3600) { [weak coordinator] _, _ in
-                guard let c = coordinator else { return }
-                let t = CACurrentMediaTime() - start
-                var emoteHead = 0.0
-                var emoteRoot = 0.0
-                if let trig = c.emote {
-                    let off = SkeletalAnimator.emoteOffset(trig.kind, elapsed: CACurrentMediaTime() - trig.startedAt)
-                    emoteHead = off.head
-                    emoteRoot = off.root
-                }
-                for (i, bone) in c.bones.enumerated() where i < c.bindEulers.count {
-                    var e = c.bindEulers[i]
-                    e.z += CGFloat(SkeletalAnimator.idleSwayRadians(depth: c.boneDepths[i], time: t))
-                    if i == c.speechBone {
-                        e.x += CGFloat(SkeletalAnimator.jawAngle(amplitude: c.jawTarget) + emoteHead)
-                    }
-                    if i == c.rootBone {
-                        e.z += CGFloat(emoteRoot)
-                    }
-                    bone.eulerAngles = e
-                }
+            guard on else {
+                node.scale = SCNVector3(1, 1, 1)
+                return
             }
-            node.runAction(.repeatForever(driver))
-            return
+            let spin = SCNAction.rotateBy(x: 0, y: 2 * .pi, z: 0,
+                                          duration: Model3DSceneView.turntablePeriod)
+            let half = Model3DSceneView.breathePeriod / 2
+            let out = SCNAction.scale(to: Model3DSceneView.breatheScale, duration: half)
+            out.timingMode = .easeInEaseOut
+            let back = SCNAction.scale(to: 1.0, duration: half)
+            back.timingMode = .easeInEaseOut
+            node.runAction(.repeatForever(spin))
+            node.runAction(.repeatForever(.sequence([out, back])))
         }
-        node.removeAllActions()
-        guard turntable else { return }
-        node.runAction(.repeatForever(.rotateBy(x: 0, y: .pi * 2, z: 0, duration: 12)))
-        let out = SCNAction.scale(to: 1.03, duration: 2.0)
-        let back = SCNAction.scale(to: 0.97, duration: 2.0)
-        out.timingMode = .easeInEaseOut
-        back.timingMode = .easeInEaseOut
-        node.runAction(.repeatForever(.sequence([out, back])))
     }
 }

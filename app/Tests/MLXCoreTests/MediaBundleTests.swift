@@ -148,6 +148,21 @@ final class MediaBundleTests: XCTestCase {
         XCTAssertTrue(t.components[0].readyMarkers.contains("speech_tokenizer"))
     }
 
+    func testDefaultTtsPresetIsEightBitAndBundleRecursive() {
+        // 8-bit is the default voice model (smaller download, lower RAM); the
+        // bf16 presets stay in the catalog as fidelity fallbacks.
+        let d = AudioModelPreset.all.first
+        XCTAssertEqual(d?.id, AudioModelPreset.qwen3TTS06B8bit.id)
+        XCTAssertTrue(d?.repo.hasSuffix("-8bit") ?? false)
+        // Same repo layout as bf16 (config + model + speech_tokenizer/) — the
+        // recursive TTS bundle factory applies unchanged.
+        let b = AudioModelPreset.qwen3TTS06B8bit.bundle
+        XCTAssertEqual(b.components.count, 1)
+        XCTAssertTrue(b.components[0].selection.recursive)
+        XCTAssertTrue(b.components[0].readyMarkers.contains("speech_tokenizer"))
+        XCTAssertEqual(AudioModelPreset.qwen3TTS17B8bit.repo, "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-8bit")
+    }
+
     func testKreaBundleIsSinglePublicRecursiveComponent() {
         let k = ImageModelPreset.krea2Turbo.bundle
         // One public component, no gated dependency, recursive (pulls the weight subdirs).

@@ -82,14 +82,24 @@ class BaseSpeechRecognizer: NSObject, SpeechRecognizing {
     var onUnrecognizedSpeech: (() -> Void)?
     var onError: ((String) -> Void)?
 
-    /// RMS above this counts as speech; tuned for float32 mic input.
-    var voiceThreshold: Float = 0.015
+    /// Quiet-room speech bar (absolute RMS). The EFFECTIVE threshold is
+    /// `VoiceActivity.speechThreshold` — this floored value scaled above the
+    /// tracked ambient level, so fan/AC noise reads as silence instead of
+    /// pinning `lastVoiceAt` forever (the 2026-07-05 never-finalizes wedge).
+    var voiceThreshold: Float = VoiceActivity.minSpeechThreshold
     /// Silence this long after speech ends a turn.
     var silenceTimeout: TimeInterval = 1.1
+    /// Backstop: with words in hand and no NEW word for this long, finalize
+    /// even if the energy VAD still reads "speech" (noise misclassification).
+    var transcriptStallTimeout: TimeInterval = 2.0
 
     private var speaking = false
     private var lastVoiceAt = Date()
     private var silenceTimer: Timer?
+    /// Sliding-minimum ambient tracker feeding the adaptive threshold.
+    private var ambient = AmbientFloor()
+    /// When recognition last produced DIFFERENT text (the stall clock).
+    private var lastTranscriptChangeAt = Date()
 
     /// The transcript the silence finalizer will emit. Subclasses set this as
     /// recognition results arrive (and call `publishPartial`).
@@ -150,6 +160,8 @@ class BaseSpeechRecognizer: NSObject, SpeechRecognizing {
         currentTranscript = ""
         partialTranscript = ""
         lastVoiceAt = Date()
+        lastTranscriptChangeAt = Date()
+        ambient = AmbientFloor()
 
         try prepareRecognition(inputFormat: format)
 
@@ -178,6 +190,7 @@ class BaseSpeechRecognizer: NSObject, SpeechRecognizing {
 
     /// Subclasses call this when a new (partial) transcript is available.
     func publishPartial(_ text: String) {
+        if text != currentTranscript { lastTranscriptChangeAt = Date() }
         currentTranscript = text
         partialTranscript = text
         onPartialTranscript?(text)
@@ -187,7 +200,8 @@ class BaseSpeechRecognizer: NSObject, SpeechRecognizing {
 
     private func noteAudio(rms: Float) {
         level = min(1, rms * 6)
-        if rms > voiceThreshold {
+        let floor = ambient.ingest(rms)
+        if rms > VoiceActivity.speechThreshold(floor: floor, minThreshold: voiceThreshold) {
             lastVoiceAt = Date()
             if !speaking { speaking = true; onSpeechStarted?() }
         }
@@ -195,8 +209,13 @@ class BaseSpeechRecognizer: NSObject, SpeechRecognizing {
 
     private func checkSilence() {
         guard speaking else { return }
-        guard Date().timeIntervalSince(lastVoiceAt) >= silenceTimeout else { return }
         let text = currentTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard VoiceActivity.shouldFinalize(
+            silenceElapsed: Date().timeIntervalSince(lastVoiceAt),
+            silenceTimeout: silenceTimeout,
+            hasTranscript: !text.isEmpty,
+            transcriptStallElapsed: Date().timeIntervalSince(lastTranscriptChangeAt),
+            stallTimeout: transcriptStallTimeout) else { return }
         speaking = false
         currentTranscript = ""
         partialTranscript = ""

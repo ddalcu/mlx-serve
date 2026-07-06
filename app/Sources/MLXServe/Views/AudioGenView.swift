@@ -15,7 +15,7 @@ struct AudioGenView: View {
     @StateObject private var recorder = AudioRecorder()
 
     @State private var text: String = ""
-    @State private var model: AudioModelPreset = .qwen3TTS06B
+    @State private var model: AudioModelPreset = .qwen3TTS06B8bit
     @State private var refAudioURL: URL? = nil
     @State private var refText: String = ""
     @State private var speed: Double = 1.0

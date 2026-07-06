@@ -280,6 +280,9 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
     private func streamPlainResponse(api: APIClient, sessionId: UUID,
                                      messages: [[String: Any]], config: TurnConfig) async {
         do {
+            // A media-first server runs headless (no default model) — hot-load
+            // the selected chat model once so the request below resolves.
+            await server.ensureDefaultChatModel(selectedModelPath: appState.selectedModelPath)
             // Pin the request to the active model (server-resolved default if
             // nil) so hot-switch can finish in-flight requests on the old model.
             let stream = api.streamChat(
@@ -535,6 +538,9 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                 mcpToolsJSON: mcpToolsJSON,
                 docsToolJSON: config.documentIndex != nil ? AgentPrompt.searchDocumentsToolJSON : nil
             )
+            // Headless (media-first) server → ensure the selected chat model
+            // is loaded + promoted before the alias-addressed request.
+            await server.ensureDefaultChatModel(selectedModelPath: appState.selectedModelPath)
             let stream = api.streamChat(
                 port: server.port,
                 messages: messages,

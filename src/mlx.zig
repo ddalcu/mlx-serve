@@ -348,9 +348,28 @@ pub extern "c" fn mlx_set_error_handler(handler: mlx_error_handler_func, data: ?
 
 // ── Zig helper wrappers ──
 
-/// Get GPU stream (default)
+/// Get the default compute stream. Normally the GPU (Metal) stream. When MLX
+/// was built without a Metal backend (e.g. the iOS Simulator slice, where MLX's
+/// Metal device can't be constructed), there is no GPU stream — fall back to the
+/// CPU stream so the engine runs on the Accelerate backend. The check is cached;
+/// on real hardware Metal is always available, so this is the GPU stream as
+/// before with no measurable overhead.
+var no_gpu_backend_cache: ?bool = null;
+
+/// True when MLX has no Metal/GPU backend (e.g. the iOS Simulator slice built
+/// with MLX_BUILD_METAL=OFF). Callers use this to take CPU-only paths and skip
+/// GPU-only work (kernel-fusion JIT compilation). Always false on real hardware.
+pub fn noGpuBackend() bool {
+    if (no_gpu_backend_cache == null) {
+        var avail: bool = false;
+        _ = mlx_metal_is_available(&avail);
+        no_gpu_backend_cache = !avail;
+    }
+    return no_gpu_backend_cache.?;
+}
+
 pub fn gpuStream() mlx_stream {
-    return mlx_default_gpu_stream_new();
+    return if (noGpuBackend()) mlx_default_cpu_stream_new() else mlx_default_gpu_stream_new();
 }
 
 /// Print an array for debugging

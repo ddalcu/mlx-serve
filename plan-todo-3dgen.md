@@ -1,5 +1,16 @@
 # 3DGen roadmap — handoff plan (written 2026-07-04)
 
+> **2026-07-05 DESCOPE:** the avatar experiment (P3 rig + P4 avatar window + the follow-up
+> mouth-articulation work) was stripped — the talking-avatar results were not realistic enough
+> to ship. What SHIPS from this plan is P1 + P1.x + P2: photo → shape → full-PBR textured GLB,
+> turntable preview, history shelf, one-click combined download. The voice-clone piece of P4
+> survives in a different form: a global "Voice clone clip" in Settings ▸ Voice that hands-free
+> voice mode speaks with (`ClonedVoiceSynthesizer`, Qwen3-TTS `ref_audio`). Sections on rig /
+> avatar / mouth below are HISTORICAL — the code they describe was removed from the tree
+> (`unirig_*`, `voxel_skin`, `fps`, `face_anchor`, `mouth_*`, `AvatarEngine`/`AvatarView`/
+> `SkeletalAnimator`); the published HF repo still carries the `unirig/` subdir, which the app
+> now simply ignores.
+
 This document is the complete, self-contained TODO for finishing the 3DGen → virtual-avatar
 feature. It assumes NO context beyond this file + the repo's `CLAUDE.md`. Phase 1 is DONE and
 validated; everything else is specified here in execution order. Read §3 (house rules) before
@@ -14,10 +25,10 @@ Qwen3-TTS voice cloning + voice input.
 | Phase | What | Status |
 |---|---|---|
 | P1 | Shape: photo → untextured GLB (`.mesh` modality, Hunyuan3D-2.1 shape stage) | **DONE, validated 2026-07-03/04** |
-| P1.x | Loose ends: FlashVDM speedup, HF weight publish, pane polish | FlashVDM + pane polish **DONE** (6× volume decode, default res 384, history thumbnails); **HF publish still open — needs user sign-off + user-run upload** |
+| P1.x | Loose ends: FlashVDM speedup, HF weight publish, pane polish | **DONE** — FlashVDM (6× volume decode, default res 384), history thumbnails, and HF publish (combined `ddalcu/Hunyuan3D-2.1-MLX-Serve-8bit`, uploaded + verified 2026-07-04) |
 | P2 | Texture: full PBR (albedo + metallic-roughness) — **user chose option B** (full PBR in one go, not albedo-first) | **DONE** — all `HY3DP_*` oracles pass at fp16 (full UNet step cos 1.00000), live 8-bit e2e green; §5.8.14 follow-ups (UniPC-15, RealESRGAN, >6-view) still optional/open |
-| P3 | Rig & animate: auto-rig + skeletal idle/emote + TTS-driven jaw | **DONE** — UniRig skeleton (`unirig_skeleton.zig`, oracles exact) + geodesic voxel skinning (`voxel_skin.zig`; PTv3 neural skinner deliberately deferred), glTF skins, `SkeletalAnimator` idle/emote/jaw |
-| P4 | Avatar loop: persona + RAG + voice clone + speech pipelining + avatar window | **DONE (implemented + unit-tested)** — `AvatarEngine`/`AvatarView`/`SentenceStreamer`/`AvatarPersona`; §8 live conversation-demo gate still to be reproduced on the dev Mac with converted weights |
+| P3 | Rig & animate: auto-rig + skeletal idle/emote + TTS-driven jaw | **DESCOPED 2026-07-05** — was done (UniRig + voxel skinning, oracles exact) but stripped with the avatar: not realistic enough to ship |
+| P4 | Avatar loop: persona + RAG + voice clone + speech pipelining + avatar window | **DESCOPED 2026-07-05** — window/engine/persona removed; the voice-clone + sentence-pipelining piece lives on as voice mode's `ClonedVoiceSynthesizer` (Settings ▸ Voice clip) |
 
 **Status 2026-07-04 (128 GB Mac):** Zig 722 pass / 0 fail; Swift 1111 / 0 fail; chat 37/37.
 Weights re-converted HERE from source ckpts (`~/hy3d-scratch/` sources, venv there too) into
@@ -27,8 +38,9 @@ to the upload: COMBINED single repo staged at `~/hf-staging/Hunyuan3D-2.1-MLX-Se
 (shape root + `paint/` + `unirig/` + README/licenses), server resolves stage subdirs
 (`gen.findStageModelDir`, subdir → sibling → env), Swift preset/bundle flipped to
 `ddalcu/Hunyuan3D-2.1-MLX-Serve-8bit` (recursive pull, all-stage ready markers). Both paint+rig
-integration tests ALL PASS against the combined layout. **USER ACTION: run the
-`hf upload-large-folder` command to publish.** Also fixed en route: ready mesh models reported
+integration tests ALL PASS against the combined layout. **PUBLISHED 2026-07-04** — user
+uploaded; the repo was re-downloaded fresh from HF and all three integration tests pass
+against the published artifact (discovery lists it exactly once, no subdir leakage). Also fixed en route: ready mesh models reported
 `capabilities: []` (missing mesh arm in `readyCapsJson`) + test_3d_gen.sh check 1 was non-fatal.
 Remaining: optional §5.8.14 follow-ups; live §8 avatar demo; `plan-tts-8bit.md` separate side-plan.
 

@@ -46,8 +46,8 @@ const chat_mod = @import("chat.zig");
 const prefix_cache_mod = @import("prefix_cache.zig");
 const tokenize_cache_mod = @import("tokenize_cache.zig");
 const model_registry_mod = @import("model_registry.zig");
-const arch_ds4 = @import("arch/ds4.zig");
-const arch_llama = @import("arch/llama.zig");
+const arch_ds4 = if (@import("build_options").ios) @import("arch/ds4_stub.zig") else @import("arch/ds4.zig");
+const arch_llama = if (@import("build_options").ios) @import("arch/llama_stub.zig") else @import("arch/llama.zig");
 const log = @import("log.zig");
 const io_util = @import("io_util.zig");
 const status = @import("status.zig");
@@ -1442,7 +1442,7 @@ pub const Scheduler = struct {
             .chat_config = owned.chat_config,
             .model_dir = entry.path,
             .drafter_dir = "", // Phase E will wire the load-model API to set this.
-            .load_vision = owned.config.has_vision,
+            .load_vision = coldLoadVision(owned.config.has_vision),
             .warmup_eager = true,
             .draft_block_size = drafter_mod.DEFAULT_BLOCK_SIZE,
             .draft_block_size_explicit = false,
@@ -1975,6 +1975,45 @@ fn modelDiskBytes(io: std.Io, model_dir: []const u8) u64 {
 /// (`MLX_SERVE_SKIP_MEM_PREFLIGHT`) it replaced.
 pub var skip_mem_preflight: bool = false;
 
+/// Process-wide vision opt-out (`--no-vision` / the iPhone app, which has no
+/// image-input UI yet). A module global for the same reason as
+/// `skip_mem_preflight`: it must apply to on-demand /v1/load-model cold loads
+/// too, not just the startup `LoadParams` — the cold-load path used to
+/// hardcode `load_vision = config.has_vision` and silently ignore the flag.
+pub var no_vision_global: bool = false;
+
+/// Should a cold load bring up the checkpoint's vision tower?
+pub fn coldLoadVision(has_vision: bool) bool {
+    return has_vision and !no_vision_global;
+}
+
+test "coldLoadVision honors the process-wide vision opt-out" {
+    no_vision_global = false;
+    try std.testing.expect(coldLoadVision(true));
+    try std.testing.expect(!coldLoadVision(false));
+    no_vision_global = true;
+    defer no_vision_global = false;
+    try std.testing.expect(!coldLoadVision(true));
+}
+
+/// Which "available memory" figure the preflight should trust. On iOS the
+/// host-wide number is meaningless — the OS keeps RAM full (file cache,
+/// jetsam-evictable background apps) and will evict on our behalf, so the
+/// per-PROCESS jetsam headroom (`os_proc_available_memory`, nonzero only on
+/// iOS) is the figure that decides whether the load survives. Live bug: an
+/// 8 GB iPhone reported ~4 GB host-free and the preflight refused a 3.6 GB
+/// model that fit comfortably inside the ~6.4 GB process limit.
+fn effectiveAvailableBytes(host_avail: u64, proc_avail: u64) u64 {
+    return if (proc_avail > 0) proc_avail else host_avail;
+}
+
+test "effectiveAvailableBytes prefers the per-process jetsam headroom when present" {
+    const GB: u64 = 1024 * 1024 * 1024;
+    try std.testing.expectEqual(6 * GB, effectiveAvailableBytes(4 * GB, 6 * GB)); // iOS: proc wins
+    try std.testing.expectEqual(4 * GB, effectiveAvailableBytes(4 * GB, 0)); // macOS: proc query = 0 → host
+    try std.testing.expectEqual(@as(u64, 0), effectiveAvailableBytes(0, 0)); // both unknown → 0 (never blocks)
+}
+
 fn memInsufficientForLoad(weights_bytes: u64, avail_bytes: u64) bool {
     if (weights_bytes == 0 or avail_bytes == 0) return false;
     // Headroom over the weights for warmup compute buffers + a baseline KV cache.
@@ -2067,7 +2106,11 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // its memory" case. Bypass with --skip-mem-preflight.
     if (!skip_mem_preflight) {
         const weights_bytes = modelDiskBytes(sch.io, params.model_dir);
-        const avail_bytes = status.getAvailableMemBytes();
+        const avail_bytes = effectiveAvailableBytes(status.getAvailableMemBytes(), status.getProcAvailableMemBytes());
+        log.info("[preflight] weights ~{d:.2} GB, available {d:.2} GB\n", .{
+            @as(f64, @floatFromInt(weights_bytes)) / (1024.0 * 1024.0 * 1024.0),
+            @as(f64, @floatFromInt(avail_bytes)) / (1024.0 * 1024.0 * 1024.0),
+        });
         if (memInsufficientForLoad(weights_bytes, avail_bytes)) {
             const gb = 1024.0 * 1024.0 * 1024.0;
             log.err("Insufficient memory to load model: weights ~{d:.1} GB but only {d:.1} GB free. Close other models/apps (or wait for a prior mlx-serve to fully exit) and retry; pass --skip-mem-preflight to override.\n", .{
@@ -2129,19 +2172,24 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     }
 
     // JIT-compile activation kernels. These are bound to THIS thread's mlx
-    // stream — that's exactly the point of doing them here.
-    if (params.config.hidden_act == .gelu_approx) {
-        xfm_ptr.compileGelu();
-        xfm_ptr.compileGeglu();
-    }
-    if (params.config.final_logit_softcapping > 0.0) {
-        xfm_ptr.compileSoftcap();
-    }
-    if (xfm_ptr.moe_layers != null) {
-        xfm_ptr.compileMoeRouting();
-    }
-    if (params.config.linear_num_key_heads > 0) {
-        xfm_ptr.compileGdnGate();
+    // stream — that's exactly the point of doing them here. Skipped entirely
+    // when there's no GPU backend (iOS Simulator's CPU-only MLX): mlx_compile
+    // is Metal kernel fusion and requests a GPU stream that doesn't exist; the
+    // runtime falls back to the uncompiled paths when compiled_* stays null.
+    if (!mlx.noGpuBackend()) {
+        if (params.config.hidden_act == .gelu_approx) {
+            xfm_ptr.compileGelu();
+            xfm_ptr.compileGeglu();
+        }
+        if (params.config.final_logit_softcapping > 0.0) {
+            xfm_ptr.compileSoftcap();
+        }
+        if (xfm_ptr.moe_layers != null) {
+            xfm_ptr.compileMoeRouting();
+        }
+        if (params.config.linear_num_key_heads > 0) {
+            xfm_ptr.compileGdnGate();
+        }
     }
 
     // Phase 2 experiment: opt-in full-forward Metal fusion via
@@ -2797,7 +2845,30 @@ fn finishLoadRequest(sch: *Scheduler, req: *LoadRequest, err_name: ?[]const u8) 
 /// and signal `done` so the conn thread in `runGeneration` wakes.
 fn runGenRequest(sch: *Scheduler, req: *GenRequest) void {
     req.model.gen_busy = true;
+    // On small-RAM machines (≤16 GB — mini class; also the phone), bound
+    // MLX's buffer-cache growth DURING the generation: the post-request
+    // clear below can't help mid-loop, and a diffusion denoise + VAE decode
+    // otherwise accumulates GBs of one-off transients against a ~12 GB Metal
+    // working-set ceiling. 1 GB still covers step-to-step buffer reuse.
+    // Never RAISE a tighter existing cap (the iOS boot cap is 384 MB).
+    const small_ram = blk: {
+        const total = status.getTotalMemBytes();
+        break :blk total > 0 and total <= 17 * 1024 * 1024 * 1024;
+    };
+    var prev_cache_limit: usize = 0;
+    if (small_ram) {
+        const cap: usize = 1024 * 1024 * 1024;
+        _ = mlx.mlx_set_cache_limit(&prev_cache_limit, cap);
+        if (prev_cache_limit < cap) {
+            var tmp: usize = 0;
+            _ = mlx.mlx_set_cache_limit(&tmp, prev_cache_limit);
+        }
+    }
     req.run(req.ctx);
+    if (small_ram) {
+        var tmp: usize = 0;
+        _ = mlx.mlx_set_cache_limit(&tmp, prev_cache_limit);
+    }
     req.model.gen_busy = false;
     // Return the generation's transients to the OS. MLX parks freed buffers
     // in its allocator cache (RSS stays), and unlike chat decode (which

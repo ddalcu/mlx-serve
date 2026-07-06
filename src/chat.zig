@@ -3,9 +3,9 @@ const jinja_c = @cImport({
     @cInclude("jinja_wrapper.h");
 });
 const tokenizer_mod = @import("tokenizer.zig");
-const arch_ds4 = @import("arch/ds4.zig");
-const ds4_ffi = @import("ds4_ffi.zig");
-const arch_llama = @import("arch/llama.zig");
+const arch_ds4 = if (@import("build_options").ios) @import("arch/ds4_stub.zig") else @import("arch/ds4.zig");
+const ds4_ffi = if (@import("build_options").ios) @import("ds4_ffi_stub.zig") else @import("ds4_ffi.zig");
+const arch_llama = if (@import("build_options").ios) @import("arch/llama_stub.zig") else @import("arch/llama.zig");
 const log = @import("log.zig");
 
 const Tokenizer = tokenizer_mod.Tokenizer;

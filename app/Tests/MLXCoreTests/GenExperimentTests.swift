@@ -9,7 +9,7 @@ import XCTest
 // =============================================================================
 
 private enum GenExperimentReplica: String, CaseIterable, Identifiable {
-    case image, video, audio, model3d, avatar
+    case image, video, audio, model3d
 
     var id: String { rawValue }
 
@@ -19,7 +19,6 @@ private enum GenExperimentReplica: String, CaseIterable, Identifiable {
         case .video: "film.stack"
         case .audio: "waveform"
         case .model3d: "cube.transparent"
-        case .avatar: "person.crop.circle.badge.moon"
         }
     }
 
@@ -29,7 +28,6 @@ private enum GenExperimentReplica: String, CaseIterable, Identifiable {
         case .video: "VideoGen"
         case .audio: "AudioGen"
         case .model3d: "3D"
-        case .avatar: "Avatar"
         }
     }
 
@@ -39,7 +37,6 @@ private enum GenExperimentReplica: String, CaseIterable, Identifiable {
         case .video: "Video Generation (LTX-Video 2.3)"
         case .audio: "Audio Generation — neural TTS & voice cloning"
         case .model3d: "3D Generation — photo to mesh (Hunyuan3D 2.1)"
-        case .avatar: "Avatar — a 3D persona that talks back in a cloned voice"
         }
     }
 }
@@ -51,7 +48,7 @@ final class GenExperimentTests: XCTestCase {
     /// pins (3D is the fourth).
     func testSectionHasExactlyTheMediaToolsInOrder() {
         XCTAssertEqual(GenExperimentReplica.allCases.map(\.title),
-                       ["ImageGen", "VideoGen", "AudioGen", "3D", "Avatar"])
+                       ["ImageGen", "VideoGen", "AudioGen", "3D"])
     }
 
     /// Every tile has a non-empty tooltip naming its modality.

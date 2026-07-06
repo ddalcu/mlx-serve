@@ -19,9 +19,10 @@ private struct AudioPresetReplica {
 }
 
 private let audioPresetsReplica: [AudioPresetReplica] = [
-    .init(id: "mlx-audio/moss-tts-nano-100m",   repo: "mlx-community/MOSS-TTS-Nano-100M",                  approxRAMGB: 2),
-    .init(id: "mlx-audio/qwen3-tts-0.6b-base",  repo: "mlx-community/Qwen3-TTS-12Hz-0.6B-Base-bf16",      approxRAMGB: 4),
-    .init(id: "mlx-audio/qwen3-tts-1.7b-base",  repo: "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-bf16",      approxRAMGB: 8),
+    .init(id: "mlx-audio/qwen3-tts-0.6b-base-8bit", repo: "mlx-community/Qwen3-TTS-12Hz-0.6B-Base-8bit", approxRAMGB: 3),
+    .init(id: "mlx-audio/qwen3-tts-0.6b-base",      repo: "mlx-community/Qwen3-TTS-12Hz-0.6B-Base-bf16", approxRAMGB: 4),
+    .init(id: "mlx-audio/qwen3-tts-1.7b-base-8bit", repo: "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-8bit", approxRAMGB: 5),
+    .init(id: "mlx-audio/qwen3-tts-1.7b-base",      repo: "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-bf16", approxRAMGB: 8),
 ]
 
 // --- AudioGenService.buildArgs replica ---
@@ -103,9 +104,9 @@ final class AudioGenTests: XCTestCase {
         // Unique ids.
         XCTAssertEqual(Set(audioPresetsReplica.map(\.id)).count, audioPresetsReplica.count,
                        "Preset ids must be unique")
-        // Default (first) is the lightest model.
-        XCTAssertEqual(audioPresetsReplica.first?.id, "mlx-audio/moss-tts-nano-100m",
-                       "MOSS-TTS Nano should be the default (first) preset")
+        // Default (first) is the lightest model — the 8-bit 0.6B.
+        XCTAssertEqual(audioPresetsReplica.first?.id, "mlx-audio/qwen3-tts-0.6b-base-8bit",
+                       "Qwen3-TTS 0.6B 8-bit should be the default (first) preset")
         // Every repo is an open mlx-community mirror (downloads without a login).
         for p in audioPresetsReplica {
             XCTAssertTrue(p.repo.hasPrefix("mlx-community/"),

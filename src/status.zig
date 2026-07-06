@@ -1,4 +1,6 @@
 const std = @import("std");
+const builtin = @import("builtin");
+const is_macos = builtin.os.tag == .macos;
 
 // ── macOS Mach externs ──
 
@@ -102,6 +104,25 @@ fn computeAvailableBytes(total_mem: u64, wire_pages: u64, compressor_pages: u64,
     return total_mem - used;
 }
 
+extern "c" fn os_proc_available_memory() usize;
+
+/// Per-process memory headroom before jetsam (iOS only — the entitlement-
+/// aware figure that actually governs whether a big allocation survives).
+/// Returns 0 on macOS, where the concept doesn't apply; the symbol is only
+/// referenced on iOS builds so macOS links are unaffected.
+pub fn getProcAvailableMemBytes() u64 {
+    if (comptime builtin.os.tag != .ios) return 0;
+    return @intCast(os_proc_available_memory());
+}
+
+/// Total physical RAM (hw.memsize; works on macOS and iOS). 0 on failure.
+pub fn getTotalMemBytes() u64 {
+    var total_mem: u64 = 0;
+    var len: usize = @sizeOf(u64);
+    if (sysctlbyname("hw.memsize", @ptrCast(&total_mem), &len, null, 0) != 0) return 0;
+    return total_mem;
+}
+
 pub fn getAvailableMemBytes() u64 {
     var total_mem: u64 = 0;
     var len: usize = @sizeOf(u64);
@@ -175,6 +196,10 @@ pub fn getCpuPct() u32 {
 }
 
 pub fn getGpuPct() u32 {
+    // IOKit's IOServiceMatching/AGXAccelerator path is macOS-only; the symbols
+    // aren't in the public iOS SDK (and apps are sandboxed from the GPU service
+    // registry anyway). On iOS we report 0 — the value is only a log-line stat.
+    if (comptime !is_macos) return 0;
     const matching = IOServiceMatching("AGXAccelerator") orelse return 0;
     var iter: u32 = 0;
     if (IOServiceGetMatchingServices(0, matching, &iter) != 0) return 0;

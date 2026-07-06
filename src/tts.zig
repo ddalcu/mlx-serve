@@ -11,9 +11,13 @@
 //! plain RoPE — the config's interleaved-MRoPE collapses to plain RoPE in the
 //! base TTS path because all 3 position axes share the same `arange` positions).
 //!
-//! This module reuses the codebase's bf16-Linear idioms (pre-transposed weights
-//! + `mlx_matmul`) rather than the quantized path: Qwen3-TTS bf16 checkpoints
-//! store dense weights. The talker forward uses full re-forward (no KV cache) —
+//! Talker + code-predictor linears go through `TtsLinear` (the krea.zig
+//! MixedLinear pattern): dense bf16 (pre-transposed weights + `mlx_matmul`)
+//! OR affine-quantized (`mlx_quantized_matmul`, bits/group_size inferred from
+//! tensor geometry) — so both the bf16 and the mlx-community `-8bit`
+//! checkpoints load transparently. The codec decoder and speaker encoder stay
+//! dense (mlx-community doesn't quantize them). The talker forward uses full
+//! re-forward in the uncached path —
 //! sequences are short (~30 prefix + ≤~1000 frames) and full re-forward is
 //! mathematically identical to the cached path under causal attention, which
 //! keeps the first correctness milestone simple. KV-cache optimization is a
@@ -276,6 +280,13 @@ fn ownWeight(w: *const Weights, key: []const u8) !mlx.mlx_array {
     return owned;
 }
 
+fn ownOpt(w: *const Weights, key: []const u8) ?mlx.mlx_array {
+    const a = w.get(key) orelse return null;
+    var o = mlx.mlx_array_new();
+    mlx.check(mlx.mlx_array_set(&o, a)) catch return null;
+    return o;
+}
+
 /// Own + transpose a 2-D `[out, in]` weight to `[in, out]` for `matmul(x, w_t)`.
 fn ownT(w: *const Weights, key: []const u8, s: S) !mlx.mlx_array {
     const raw = try ownWeight(w, key);
@@ -297,24 +308,128 @@ fn ownWfmt(w: *const Weights, alloc: std.mem.Allocator, comptime fmt: []const u8
     return ownWeight(w, key);
 }
 
+// ── Mixed dense/quantized linear (the krea.zig MixedLinear pattern) ──
+
+/// Solve (bits, group_size) from packed-quantized tensor geometry (the
+/// flux.zig convention): `w` packs `in` logical columns into u32s
+/// (w_cols = in·bits/32) and scales have s_cols = in/gs, so
+/// w_cols·32/s_cols = bits·gs. The product alone is ambiguous ((8,64) vs
+/// (4,128)…), so group sizes are tried in convention order: mlx-community
+/// conversions use 64 (the mlx default); 32 and 128 are fallbacks.
+const QuantGeometry = struct { bits: u32, group_size: u32 };
+
+fn inferQuantGeometry(w_cols: usize, s_cols: usize) QuantGeometry {
+    const fallback: QuantGeometry = .{ .bits = 8, .group_size = 64 };
+    if (s_cols == 0 or (w_cols * 32) % s_cols != 0) return fallback;
+    const product = w_cols * 32 / s_cols; // bits · group_size
+    const valid_bits = [_]u32{ 2, 3, 4, 5, 6, 8 };
+    for ([_]u32{ 64, 32, 128 }) |gs| {
+        if (product % gs != 0) continue;
+        const bits: u32 = @intCast(product / gs);
+        for (valid_bits) |vb| {
+            if (bits == vb) return .{ .bits = bits, .group_size = gs };
+        }
+    }
+    return fallback;
+}
+
+/// bf16 OR affine-quantized linear. If `<prefix>.scales` exists the module is
+/// quantized: own the packed weight + scales + biases, infer (bits, group_size)
+/// from geometry. Otherwise the dense branch is byte-identical to the original
+/// bf16 path (pre-transposed weight + `mlx_matmul`, no extra casts). An
+/// additive `<prefix>.bias` rides along in both branches (the 8-bit repos keep
+/// `.bias` on text_projection/small_to_mtp even where `.biases` are the quant
+/// zero-points).
+const TtsLinear = struct {
+    quantized: bool,
+    w: mlx.mlx_array, // quantized: packed u32 [out, in*bits/32]; dense: pre-transposed [in, out]
+    scales: mlx.mlx_array = .{ .ctx = null },
+    biases: mlx.mlx_array = .{ .ctx = null },
+    add_bias: ?mlx.mlx_array = null,
+    bits: u32 = 0,
+    group_size: u32 = 0,
+
+    fn load(w: *const Weights, alloc: std.mem.Allocator, prefix: []const u8, s: S) !TtsLinear {
+        const wk = try std.fmt.allocPrint(alloc, "{s}.weight", .{prefix});
+        defer alloc.free(wk);
+        const sk = try std.fmt.allocPrint(alloc, "{s}.scales", .{prefix});
+        defer alloc.free(sk);
+        const bk = try std.fmt.allocPrint(alloc, "{s}.biases", .{prefix});
+        defer alloc.free(bk);
+        const ak = try std.fmt.allocPrint(alloc, "{s}.bias", .{prefix});
+        defer alloc.free(ak);
+
+        if (ownOpt(w, sk)) |scales| {
+            const weight = try ownWeight(w, wk);
+            const biases = try ownWeight(w, bk);
+            const wsh = mlx.getShape(weight);
+            const ssh = mlx.getShape(scales);
+            const geo = inferQuantGeometry(@intCast(wsh[wsh.len - 1]), @intCast(ssh[ssh.len - 1]));
+            return .{
+                .quantized = true,
+                .w = weight,
+                .scales = scales,
+                .biases = biases,
+                .add_bias = ownOpt(w, ak),
+                .bits = geo.bits,
+                .group_size = geo.group_size,
+            };
+        }
+        return .{ .quantized = false, .w = try ownT(w, wk, s), .add_bias = ownOpt(w, ak) };
+    }
+
+    fn deinit(self: *TtsLinear) void {
+        _ = mlx.mlx_array_free(self.w);
+        if (self.quantized) {
+            _ = mlx.mlx_array_free(self.scales);
+            _ = mlx.mlx_array_free(self.biases);
+        }
+        if (self.add_bias) |b| _ = mlx.mlx_array_free(b);
+    }
+
+    fn forward(self: *const TtsLinear, x: mlx.mlx_array, s: S) !mlx.mlx_array {
+        var o = mlx.mlx_array_new();
+        if (self.quantized) {
+            try mlx.check(mlx.mlx_quantized_matmul(&o, x, self.w, self.scales, self.biases, true, mlx.mlx_optional_int.some(@intCast(self.group_size)), mlx.mlx_optional_int.some(@intCast(self.bits)), "affine", s));
+        } else {
+            try mlx.check(mlx.mlx_matmul(&o, x, self.w, s));
+        }
+        if (self.add_bias) |b| {
+            const r = try addA(o, b, s);
+            _ = mlx.mlx_array_free(o);
+            o = r;
+        }
+        return o;
+    }
+};
+
+fn loadLinearFmt(w: *const Weights, alloc: std.mem.Allocator, s: S, comptime fmt: []const u8, args: anytype) !TtsLinear {
+    const prefix = try std.fmt.allocPrint(alloc, fmt, args);
+    defer alloc.free(prefix);
+    return TtsLinear.load(w, alloc, prefix, s);
+}
+
 // ── Qwen3 layer (shared by talker + code predictor) ──
 
 const QwenLayer = struct {
     input_norm: mlx.mlx_array,
     post_norm: mlx.mlx_array,
-    q_w_t: mlx.mlx_array,
-    k_w_t: mlx.mlx_array,
-    v_w_t: mlx.mlx_array,
-    o_w_t: mlx.mlx_array,
+    q: TtsLinear,
+    k: TtsLinear,
+    v: TtsLinear,
+    o: TtsLinear,
     q_norm: mlx.mlx_array,
     k_norm: mlx.mlx_array,
-    gate_w_t: mlx.mlx_array,
-    up_w_t: mlx.mlx_array,
-    down_w_t: mlx.mlx_array,
+    gate: TtsLinear,
+    up: TtsLinear,
+    down: TtsLinear,
 
     fn deinit(self: *QwenLayer) void {
-        inline for (.{ self.input_norm, self.post_norm, self.q_w_t, self.k_w_t, self.v_w_t, self.o_w_t, self.q_norm, self.k_norm, self.gate_w_t, self.up_w_t, self.down_w_t }) |a| {
+        inline for (.{ self.input_norm, self.post_norm, self.q_norm, self.k_norm }) |a| {
             _ = mlx.mlx_array_free(a);
+        }
+        inline for (.{ &self.q, &self.k, &self.v, &self.o, &self.gate, &self.up, &self.down }) |l| {
+            l.deinit();
         }
     }
 };
@@ -341,11 +456,11 @@ fn qwenLayerForward(x: mlx.mlx_array, layer: *const QwenLayer, d: QwenDims, s: S
     const xn = try rms(x, layer.input_norm, d.eps, s);
     defer _ = mlx.mlx_array_free(xn);
 
-    const q = try matmul(xn, layer.q_w_t, s);
+    const q = try layer.q.forward(xn, s);
     defer _ = mlx.mlx_array_free(q);
-    const k = try matmul(xn, layer.k_w_t, s);
+    const k = try layer.k.forward(xn, s);
     defer _ = mlx.mlx_array_free(k);
-    const v = try matmul(xn, layer.v_w_t, s);
+    const v = try layer.v.forward(xn, s);
     defer _ = mlx.mlx_array_free(v);
 
     // reshape per head, QK-norm over head_dim, transpose to [1,H,L,D].
@@ -388,7 +503,7 @@ fn qwenLayerForward(x: mlx.mlx_array, layer: *const QwenLayer, d: QwenDims, s: S
     defer _ = mlx.mlx_array_free(at);
     const af = try reshape(at, &[_]c_int{ 1, L, heads * hd }, s);
     defer _ = mlx.mlx_array_free(af);
-    const o = try matmul(af, layer.o_w_t, s);
+    const o = try layer.o.forward(af, s);
     defer _ = mlx.mlx_array_free(o);
     const h1 = try addA(x, o, s);
     defer _ = mlx.mlx_array_free(h1);
@@ -396,13 +511,13 @@ fn qwenLayerForward(x: mlx.mlx_array, layer: *const QwenLayer, d: QwenDims, s: S
     // MLP (SwiGLU).
     const hn = try rms(h1, layer.post_norm, d.eps, s);
     defer _ = mlx.mlx_array_free(hn);
-    const g = try matmul(hn, layer.gate_w_t, s);
+    const g = try layer.gate.forward(hn, s);
     defer _ = mlx.mlx_array_free(g);
-    const u = try matmul(hn, layer.up_w_t, s);
+    const u = try layer.up.forward(hn, s);
     defer _ = mlx.mlx_array_free(u);
     const act = try swiglu(g, u, s);
     defer _ = mlx.mlx_array_free(act);
-    const down = try matmul(act, layer.down_w_t, s);
+    const down = try layer.down.forward(act, s);
     defer _ = mlx.mlx_array_free(down);
     _ = hidden;
     return addA(h1, down, s);
@@ -465,11 +580,11 @@ fn qwenLayerCached(x: mlx.mlx_array, layer: *const QwenLayer, d: QwenDims, lc: *
     const xn = try rms(x, layer.input_norm, d.eps, s);
     defer _ = mlx.mlx_array_free(xn);
 
-    const q = try matmul(xn, layer.q_w_t, s);
+    const q = try layer.q.forward(xn, s);
     defer _ = mlx.mlx_array_free(q);
-    const k = try matmul(xn, layer.k_w_t, s);
+    const k = try layer.k.forward(xn, s);
     defer _ = mlx.mlx_array_free(k);
-    const v = try matmul(xn, layer.v_w_t, s);
+    const v = try layer.v.forward(xn, s);
     defer _ = mlx.mlx_array_free(v);
 
     const q4 = try reshape(q, &[_]c_int{ 1, L, heads, hd }, s);
@@ -533,20 +648,20 @@ fn qwenLayerCached(x: mlx.mlx_array, layer: *const QwenLayer, d: QwenDims, lc: *
     defer _ = mlx.mlx_array_free(at);
     const af = try reshape(at, &[_]c_int{ 1, L, heads * hd }, s);
     defer _ = mlx.mlx_array_free(af);
-    const o = try matmul(af, layer.o_w_t, s);
+    const o = try layer.o.forward(af, s);
     defer _ = mlx.mlx_array_free(o);
     const h1 = try addA(x, o, s);
     defer _ = mlx.mlx_array_free(h1);
 
     const hnn = try rms(h1, layer.post_norm, d.eps, s);
     defer _ = mlx.mlx_array_free(hnn);
-    const g = try matmul(hnn, layer.gate_w_t, s);
+    const g = try layer.gate.forward(hnn, s);
     defer _ = mlx.mlx_array_free(g);
-    const u = try matmul(hnn, layer.up_w_t, s);
+    const u = try layer.up.forward(hnn, s);
     defer _ = mlx.mlx_array_free(u);
     const act = try swiglu(g, u, s);
     defer _ = mlx.mlx_array_free(act);
-    const down = try matmul(act, layer.down_w_t, s);
+    const down = try layer.down.forward(act, s);
     defer _ = mlx.mlx_array_free(down);
     return addA(h1, down, s);
 }
@@ -576,21 +691,18 @@ pub const TtsModel = struct {
     // Talker.
     text_embedding: mlx.mlx_array, // [text_vocab, t_hidden]
     codec_embedding: mlx.mlx_array, // [codec_vocab, t_hidden]
-    text_proj_fc1_t: mlx.mlx_array,
-    text_proj_fc1_b: mlx.mlx_array,
-    text_proj_fc2_t: mlx.mlx_array,
-    text_proj_fc2_b: mlx.mlx_array,
+    text_proj_fc1: TtsLinear,
+    text_proj_fc2: TtsLinear,
     talker_layers: []QwenLayer,
     talker_norm: mlx.mlx_array,
-    codec_head_t: mlx.mlx_array, // [t_hidden, codec_vocab]
+    codec_head: TtsLinear, // [codec_vocab, t_hidden]
 
     // Code predictor.
     cp_layers: []QwenLayer,
     cp_norm: mlx.mlx_array,
     cp_codec_embedding: []mlx.mlx_array, // [num_code_groups-1] each [codec_vocab, t_hidden]
-    cp_lm_head_t: []mlx.mlx_array, // [num_code_groups-1] each [cp_hidden, codec_vocab]
-    cp_small_to_mtp_t: ?mlx.mlx_array, // [t_hidden, cp_hidden] when present
-    cp_small_to_mtp_b: ?mlx.mlx_array,
+    cp_lm_head: []TtsLinear, // [num_code_groups-1] each [codec_vocab, cp_hidden]
+    cp_small_to_mtp: ?TtsLinear, // [cp_hidden, t_hidden] when present
 
     // ECAPA-TDNN speaker encoder (zero-shot voice cloning). Present on the
     // `-Base` checkpoints (which ship `speaker_encoder.*`); null otherwise.
@@ -601,34 +713,31 @@ pub const TtsModel = struct {
         if (self.speaker) |*sp| sp.deinit();
         _ = mlx.mlx_array_free(self.text_embedding);
         _ = mlx.mlx_array_free(self.codec_embedding);
-        _ = mlx.mlx_array_free(self.text_proj_fc1_t);
-        _ = mlx.mlx_array_free(self.text_proj_fc1_b);
-        _ = mlx.mlx_array_free(self.text_proj_fc2_t);
-        _ = mlx.mlx_array_free(self.text_proj_fc2_b);
+        self.text_proj_fc1.deinit();
+        self.text_proj_fc2.deinit();
         for (self.talker_layers) |*l| l.deinit();
         a.free(self.talker_layers);
         _ = mlx.mlx_array_free(self.talker_norm);
-        _ = mlx.mlx_array_free(self.codec_head_t);
+        self.codec_head.deinit();
         for (self.cp_layers) |*l| l.deinit();
         a.free(self.cp_layers);
         _ = mlx.mlx_array_free(self.cp_norm);
         for (self.cp_codec_embedding) |e| _ = mlx.mlx_array_free(e);
         a.free(self.cp_codec_embedding);
-        for (self.cp_lm_head_t) |e| _ = mlx.mlx_array_free(e);
-        a.free(self.cp_lm_head_t);
-        if (self.cp_small_to_mtp_t) |t| _ = mlx.mlx_array_free(t);
-        if (self.cp_small_to_mtp_b) |b| _ = mlx.mlx_array_free(b);
+        for (self.cp_lm_head) |*l| l.deinit();
+        a.free(self.cp_lm_head);
+        if (self.cp_small_to_mtp) |*l| l.deinit();
     }
 
     /// text_projection(text_embedding(ids)) → [1, N, t_hidden].
     fn projectText(self: *const TtsModel, ids: []const i32) !mlx.mlx_array {
         const e = try embed(self.text_embedding, ids, self.cfg.t_hidden, self.s);
         defer _ = mlx.mlx_array_free(e);
-        const fc1 = try linearBias(e, self.text_proj_fc1_t, self.text_proj_fc1_b, self.s);
+        const fc1 = try self.text_proj_fc1.forward(e, self.s);
         defer _ = mlx.mlx_array_free(fc1);
         const act = try silu(fc1, self.s);
         defer _ = mlx.mlx_array_free(act);
-        return linearBias(act, self.text_proj_fc2_t, self.text_proj_fc2_b, self.s);
+        return self.text_proj_fc2.forward(act, self.s);
     }
 
     fn talkerDims(self: *const TtsModel) QwenDims {
@@ -751,7 +860,7 @@ pub const TtsModel = struct {
             const last_hidden = try sliceSeq(hidden, L - 1, L, hc, s); // [1,1,H]
             defer _ = mlx.mlx_array_free(last_hidden);
 
-            const logits0 = try matmul(last_hidden, self.codec_head_t, s); // [1,1,codec_vocab]
+            const logits0 = try self.codec_head.forward(last_hidden, s); // [1,1,codec_vocab]
             defer _ = mlx.mlx_array_free(logits0);
             const code0 = try self.sampleCode0(logits0, suppress_mask, code0_hist.items, &rng);
 
@@ -851,8 +960,8 @@ pub const TtsModel = struct {
     /// Project a `[1,N,t_hidden]` input to the code-predictor hidden space via
     /// `small_to_mtp_projection` (present when t_hidden != cp_hidden).
     fn projectMtp(self: *const TtsModel, x: mlx.mlx_array) !mlx.mlx_array {
-        if (self.cp_small_to_mtp_t) |w_t| {
-            return linearBias(x, w_t, self.cp_small_to_mtp_b.?, self.s);
+        if (self.cp_small_to_mtp) |*l| {
+            return l.forward(x, self.s);
         }
         var c = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_array_set(&c, x));
@@ -897,7 +1006,7 @@ pub const TtsModel = struct {
             const L: c_int = mlx.getShape(hidden)[1];
             const last = try sliceSeq(hidden, L - 1, L, cph, s);
             defer _ = mlx.mlx_array_free(last);
-            const logits = try matmul(last, self.cp_lm_head_t[step], s);
+            const logits = try self.cp_lm_head[step].forward(last, s);
             defer _ = mlx.mlx_array_free(logits);
             const code = try sampleToken(logits, cfg.temperature, cfg.top_k, rng, s);
             codes[step + 1] = code;
@@ -1041,12 +1150,10 @@ pub fn loadModel(io: std.Io, allocator: std.mem.Allocator, s: S, model_dir: []co
 
     m.text_embedding = try ownWeight(&w, "talker.model.text_embedding.weight");
     m.codec_embedding = try ownWeight(&w, "talker.model.codec_embedding.weight");
-    m.text_proj_fc1_t = try ownT(&w, "talker.text_projection.linear_fc1.weight", s);
-    m.text_proj_fc1_b = try ownWeight(&w, "talker.text_projection.linear_fc1.bias");
-    m.text_proj_fc2_t = try ownT(&w, "talker.text_projection.linear_fc2.weight", s);
-    m.text_proj_fc2_b = try ownWeight(&w, "talker.text_projection.linear_fc2.bias");
+    m.text_proj_fc1 = try TtsLinear.load(&w, allocator, "talker.text_projection.linear_fc1", s);
+    m.text_proj_fc2 = try TtsLinear.load(&w, allocator, "talker.text_projection.linear_fc2", s);
     m.talker_norm = try ownWeight(&w, "talker.model.norm.weight");
-    m.codec_head_t = try ownT(&w, "talker.codec_head.weight", s);
+    m.codec_head = try TtsLinear.load(&w, allocator, "talker.codec_head", s);
 
     m.talker_layers = try allocator.alloc(QwenLayer, cfg.t_layers);
     for (m.talker_layers, 0..) |*layer, i| {
@@ -1061,18 +1168,16 @@ pub fn loadModel(io: std.Io, allocator: std.mem.Allocator, s: S, model_dir: []co
     }
     const n_cp_emb = cfg.num_code_groups - 1;
     m.cp_codec_embedding = try allocator.alloc(mlx.mlx_array, n_cp_emb);
-    m.cp_lm_head_t = try allocator.alloc(mlx.mlx_array, n_cp_emb);
+    m.cp_lm_head = try allocator.alloc(TtsLinear, n_cp_emb);
     for (0..n_cp_emb) |i| {
         m.cp_codec_embedding[i] = try ownWfmt(&w, allocator, "talker.code_predictor.model.codec_embedding.{d}.weight", .{i});
-        m.cp_lm_head_t[i] = try ownTfmt(&w, s, allocator, "talker.code_predictor.lm_head.{d}.weight", .{i});
+        m.cp_lm_head[i] = try loadLinearFmt(&w, allocator, s, "talker.code_predictor.lm_head.{d}", .{i});
     }
     // small_to_mtp_projection present only when talker_hidden != cp_hidden.
     if (cfg.t_hidden != cfg.cp_hidden) {
-        m.cp_small_to_mtp_t = try ownT(&w, "talker.code_predictor.small_to_mtp_projection.weight", s);
-        m.cp_small_to_mtp_b = try ownWeight(&w, "talker.code_predictor.small_to_mtp_projection.bias");
+        m.cp_small_to_mtp = try TtsLinear.load(&w, allocator, "talker.code_predictor.small_to_mtp_projection", s);
     } else {
-        m.cp_small_to_mtp_t = null;
-        m.cp_small_to_mtp_b = null;
+        m.cp_small_to_mtp = null;
     }
 
     // Speaker encoder for zero-shot voice cloning — present on `-Base`
@@ -1093,15 +1198,15 @@ fn loadQwenLayer(w: *const Weights, allocator: std.mem.Allocator, s: S, comptime
     return QwenLayer{
         .input_norm = try ownWfmt(w, allocator, prefix, .{ idx, "input_layernorm.weight" }),
         .post_norm = try ownWfmt(w, allocator, prefix, .{ idx, "post_attention_layernorm.weight" }),
-        .q_w_t = try ownTfmt(w, s, allocator, prefix, .{ idx, "self_attn.q_proj.weight" }),
-        .k_w_t = try ownTfmt(w, s, allocator, prefix, .{ idx, "self_attn.k_proj.weight" }),
-        .v_w_t = try ownTfmt(w, s, allocator, prefix, .{ idx, "self_attn.v_proj.weight" }),
-        .o_w_t = try ownTfmt(w, s, allocator, prefix, .{ idx, "self_attn.o_proj.weight" }),
+        .q = try loadLinearFmt(w, allocator, s, prefix, .{ idx, "self_attn.q_proj" }),
+        .k = try loadLinearFmt(w, allocator, s, prefix, .{ idx, "self_attn.k_proj" }),
+        .v = try loadLinearFmt(w, allocator, s, prefix, .{ idx, "self_attn.v_proj" }),
+        .o = try loadLinearFmt(w, allocator, s, prefix, .{ idx, "self_attn.o_proj" }),
         .q_norm = try ownWfmt(w, allocator, prefix, .{ idx, "self_attn.q_norm.weight" }),
         .k_norm = try ownWfmt(w, allocator, prefix, .{ idx, "self_attn.k_norm.weight" }),
-        .gate_w_t = try ownTfmt(w, s, allocator, prefix, .{ idx, "mlp.gate_proj.weight" }),
-        .up_w_t = try ownTfmt(w, s, allocator, prefix, .{ idx, "mlp.up_proj.weight" }),
-        .down_w_t = try ownTfmt(w, s, allocator, prefix, .{ idx, "mlp.down_proj.weight" }),
+        .gate = try loadLinearFmt(w, allocator, s, prefix, .{ idx, "mlp.gate_proj" }),
+        .up = try loadLinearFmt(w, allocator, s, prefix, .{ idx, "mlp.up_proj" }),
+        .down = try loadLinearFmt(w, allocator, s, prefix, .{ idx, "mlp.down_proj" }),
     };
 }
 
@@ -2431,6 +2536,21 @@ test "embed uses the table's native width, not a mismatched hidden (0.6B-Base cr
     try std.testing.expectEqual(@as(c_int, 4), sh[2]); // native H — NOT the passed 2
 }
 
+test "inferQuantGeometry resolves the mlx-community TTS bit widths" {
+    // 8-bit gs64 (the shipped -8bit repos): in=1024 → w_cols=256, s_cols=16.
+    // product 512 is ambiguous with (4,128); the gs preference order [64,32,128]
+    // must resolve to (8,64) — mlx-community always converts at gs 64.
+    try std.testing.expectEqual(@as(u32, 8), inferQuantGeometry(256, 16).bits);
+    try std.testing.expectEqual(@as(u32, 64), inferQuantGeometry(256, 16).group_size);
+    // 4-bit gs64: in=2048 → w_cols=256, s_cols=32.
+    try std.testing.expectEqual(@as(u32, 4), inferQuantGeometry(256, 32).bits);
+    try std.testing.expectEqual(@as(u32, 64), inferQuantGeometry(256, 32).group_size);
+    // 6-bit gs64: in=1024 → w_cols=192, s_cols=16.
+    try std.testing.expectEqual(@as(u32, 6), inferQuantGeometry(192, 16).bits);
+    // Degenerate geometry → safe fallback.
+    try std.testing.expectEqual(@as(u32, 8), inferQuantGeometry(256, 0).bits);
+}
+
 test "parseConfig reads talker dims" {
     const json =
         \\{"tts_bos_token_id":151672,"tts_eos_token_id":151673,"tts_pad_token_id":151671,
@@ -2726,6 +2846,122 @@ test "Synthesizer: native text to WAV" {
     try std.testing.expect(wav.len > 44 + 1000); // real audio, not just a header
     try std.testing.expectEqualSlices(u8, "RIFF", wav[0..4]);
     std.debug.print("[tts-synth] WAV {d} bytes ({d:.2}s)\n", .{ wav.len, @as(f32, @floatFromInt(wav.len - 44)) / 2.0 / 24000.0 });
+}
+
+// 8-bit quantized checkpoint (mlx-community/Qwen3-TTS-12Hz-*-Base-8bit):
+// affine 8-bit talker + code-predictor linears (group_size 64), dense
+// embeddings/norms/speaker-encoder/codec. The dense-bf16-only loader chokes on
+// the packed uint32 weights — this is the red/green gate for TtsLinear.
+//   TTS_QUANT_TEST_MODEL = 8-bit model dir
+test "8-bit quantized checkpoint loads and produces non-silent audio" {
+    const model_dir = std.mem.span(std.c.getenv("TTS_QUANT_TEST_MODEL") orelse return error.SkipZigTest);
+    const allocator = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+
+    var m = try loadModel(io, allocator, s, model_dir);
+    defer m.deinit();
+    m.cfg.temperature = 0.0; // greedy → deterministic
+
+    // Pre-tokenized "Hello world, this is a test of the local text to speech
+    // engine." in the reference chat-template shape (same ids the Synthesizer
+    // test pins against HF AutoTokenizer).
+    const ids = [_]i32{ 151644, 77091, 198, 9707, 1879, 11, 419, 374, 264, 1273, 315, 279, 2205, 1467, 311, 8806, 4712, 13, 151645, 198, 151644, 77091, 198 };
+    const codes = try m.generateCodes(&ids, 64, null, null);
+    defer allocator.free(codes);
+    try std.testing.expect(codes.len > 4); // real speech, not an instant EOS
+    for (codes) |frame| for (frame) |c| {
+        try std.testing.expect(c < m.cfg.codec_vocab);
+    };
+
+    var dec = try loadCodecDecoder(io, allocator, s, model_dir);
+    defer dec.deinit();
+    const wav_samples = try dec.decode(codes);
+    defer allocator.free(wav_samples);
+    var peak: f32 = 0;
+    for (wav_samples) |x| {
+        try std.testing.expect(std.math.isFinite(x));
+        peak = @max(peak, @abs(x));
+    }
+    std.debug.print("[tts-quant] {d} frames → {d} samples ({d:.2}s), peak={d:.4}\n", .{ codes.len, wav_samples.len, @as(f32, @floatFromInt(wav_samples.len)) / 24000.0, peak });
+    try std.testing.expect(peak > 0.02); // non-silent
+}
+
+// Parity: the same greedy prompt + synthetic reference clip through the bf16
+// and 8-bit builds. Quantization changes numerics (codes are NOT bit-exact),
+// but coherent 8-bit speech tracks the bf16 reference in shape: similar
+// duration, non-silent, and decoded RMS energy in the same band. A broken
+// quant path (wrong bits/gs, missing zero-points) produces near-instant EOS,
+// silence, or noise-floor output — all caught below.
+//   TTS_PARITY_BF16 = bf16 model dir; TTS_PARITY_8BIT = 8-bit model dir
+test "8-bit checkpoint parity vs bf16 (greedy, cloned voice)" {
+    const bf16_dir = std.mem.span(std.c.getenv("TTS_PARITY_BF16") orelse return error.SkipZigTest);
+    const q8_dir = std.mem.span(std.c.getenv("TTS_PARITY_8BIT") orelse return error.SkipZigTest);
+    const allocator = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+
+    const ids = [_]i32{ 151644, 77091, 198, 9707, 1879, 11, 419, 374, 264, 1273, 315, 279, 2205, 1467, 311, 8806, 4712, 13, 151645, 198, 151644, 77091, 198 };
+
+    // Synthetic 1 s "voice-ish" reference clip: a 160 Hz fundamental with
+    // harmonics and a slow AM envelope. Deterministic; the speaker encoder is
+    // dense in BOTH builds so any output delta comes from the quantized talker.
+    const ref = try allocator.alloc(f32, 24000);
+    defer allocator.free(ref);
+    for (ref, 0..) |*x, i| {
+        const t = @as(f32, @floatFromInt(i)) / 24000.0;
+        const env = 0.5 + 0.5 * @sin(2.0 * std.math.pi * 3.0 * t);
+        x.* = env * (0.30 * @sin(2.0 * std.math.pi * 160.0 * t) + 0.15 * @sin(2.0 * std.math.pi * 320.0 * t) + 0.08 * @sin(2.0 * std.math.pi * 480.0 * t));
+    }
+
+    const Result = struct { frames: usize, peak: f32, rms: f64, code0: [16]u32 };
+    var results: [2]Result = undefined;
+    for ([_][]const u8{ bf16_dir, q8_dir }, 0..) |dir, di| {
+        var m = try loadModel(io, allocator, s, dir);
+        defer m.deinit();
+        m.cfg.temperature = 0.0;
+        var spk: ?mlx.mlx_array = null;
+        defer if (spk) |e| {
+            _ = mlx.mlx_array_free(e);
+        };
+        if (m.speaker) |*sp| spk = try sp.embed(ref);
+        const codes = try m.generateCodes(&ids, 128, null, spk);
+        defer allocator.free(codes);
+        try std.testing.expect(codes.len > 4);
+
+        var dec = try loadCodecDecoder(io, allocator, s, dir);
+        defer dec.deinit();
+        const wav = try dec.decode(codes);
+        defer allocator.free(wav);
+        var peak: f32 = 0;
+        var se: f64 = 0;
+        for (wav) |x| {
+            peak = @max(peak, @abs(x));
+            se += @as(f64, x) * @as(f64, x);
+        }
+        results[di] = .{
+            .frames = codes.len,
+            .peak = peak,
+            .rms = std.math.sqrt(se / @as(f64, @floatFromInt(wav.len))),
+            .code0 = codes[0],
+        };
+    }
+
+    var f0_match: usize = 0;
+    for (results[0].code0, results[1].code0) |a, b| {
+        if (a == b) f0_match += 1;
+    }
+    const fa: f64 = @floatFromInt(results[0].frames);
+    const fb: f64 = @floatFromInt(results[1].frames);
+    const dur_ratio = fb / fa;
+    const rms_ratio = results[1].rms / results[0].rms;
+    std.debug.print("[tts-parity] bf16: {d} frames peak={d:.3} rms={d:.4} | 8bit: {d} frames peak={d:.3} rms={d:.4} | dur_ratio={d:.3} rms_ratio={d:.3} frame0 {d}/16\n", .{ results[0].frames, results[0].peak, results[0].rms, results[1].frames, results[1].peak, results[1].rms, dur_ratio, rms_ratio, f0_match });
+
+    try std.testing.expect(results[0].peak > 0.02 and results[1].peak > 0.02); // both non-silent
+    try std.testing.expect(dur_ratio > 0.8 and dur_ratio < 1.25); // similar duration (~20%)
+    try std.testing.expect(rms_ratio > 0.5 and rms_ratio < 2.0); // same energy band
 }
 
 fn readF32File(io: std.Io, allocator: std.mem.Allocator, path: []const u8) ![]f32 {

@@ -99,7 +99,7 @@ final class MediaGenSettingsTests: XCTestCase {
     func testAudioUnknownModelFallsBackToDefault() {
         var s = AudioGenSettings()
         s.modelId = "nope/nope"
-        XCTAssertEqual(s.resolvedModel.id, AudioModelPreset.qwen3TTS06B.id)
+        XCTAssertEqual(s.resolvedModel.id, AudioModelPreset.qwen3TTS06B8bit.id)
     }
 
     func testVideoUnknownModelAndResolutionFallBack() {

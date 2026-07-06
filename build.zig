@@ -46,6 +46,10 @@ pub fn build(b: *std.Build) void {
 
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "version", version);
+    // false for the macOS exe/tests; the iOS static-lib step (`zig build ios-lib`)
+    // builds its own options with ios=true so the engine swaps the macOS-only
+    // ds4 + llama.cpp engines for no-op stubs (iOS serves MLX safetensors only).
+    build_options.addOption(bool, "ios", false);
 
     // ds4 Metal kernel sources embedded via @embedFile and exposed as a
     // named module so src/arch/ds4.zig can import them with `@import("ds4_metal_sources")`
@@ -176,6 +180,92 @@ pub fn build(b: *std.Build) void {
     const run_unit_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
+
+    // ── iOS on-device engine: a static library (libmlxserve.a) linking the
+    //    MLX-only decode path. ds4 + llama.cpp are stubbed (build_options.ios =
+    //    true). Two slices: `zig build ios-lib` (device, arm64-iphoneos) and
+    //    `zig build ios-lib-sim` (arm64 iphonesimulator). Driven by the iPhone
+    //    app project's build scripts (../mlx-iphone/scripts/build-zig-ios.sh),
+    //    which supply the matching --sysroot and copy the artifact out of
+    //    zig-out/ios/<sdk>/lib. `-Dios-include=<dir>` points at the iOS dist's
+    //    include dir for third-party headers (webp); defaults to Homebrew's,
+    //    whose versions are pinned identical by verifyBrewDeps.
+    const ios_include = b.option([]const u8, "ios-include", "Include dir for webp/stb headers when cross-compiling the iOS lib") orelse "/opt/homebrew/include";
+    addIosLib(b, version, ios_include, .{ .step = "ios-lib", .abi = .none, .sdk = "iphoneos" });
+    addIosLib(b, version, ios_include, .{ .step = "ios-lib-sim", .abi = .simulator, .sdk = "iphonesimulator" });
+}
+
+const IosSlice = struct { step: []const u8, abi: std.Target.Abi, sdk: []const u8 };
+
+fn addIosLib(b: *std.Build, version: []const u8, ios_include: []const u8, slice: IosSlice) void {
+    // Min 18.0 to match the MLX metallib (Metal 3.2). abi=.none → device,
+    // abi=.simulator → iOS Simulator slice.
+    const ios_target = b.resolveTargetQuery(.{
+        .cpu_arch = .aarch64,
+        .os_tag = .ios,
+        .os_version_min = .{ .semver = .{ .major = 18, .minor = 0, .patch = 0 } },
+        .abi = slice.abi,
+    });
+
+    const ios_options = b.addOptions();
+    ios_options.addOption([]const u8, "version", version);
+    ios_options.addOption(bool, "ios", true);
+
+    const mod = b.createModule(.{
+        .root_source_file = b.path("src/ios_lib.zig"),
+        .target = ios_target,
+        .optimize = .ReleaseFast,
+        .link_libc = true,
+        .link_libcpp = true,
+        .imports = &.{
+            .{ .name = "build_options", .module = ios_options.createModule() },
+        },
+    });
+
+    // Apple cross-compiles don't auto-resolve the SDK's libc/frameworks from
+    // --sysroot alone, so wire them explicitly (resolved per slice via xcrun).
+    //
+    // NO iOS SDK → register NOTHING (the `ios-lib` steps just don't exist in
+    // this environment) instead of failing the whole configure: app/build.sh
+    // pins DEVELOPER_DIR to the CommandLineTools for the macOS link, and CLT
+    // ships no iOS SDKs — a @panic here aborted every macOS app build even
+    // though nobody asked for an iOS step.
+    var code: u8 = undefined;
+    const sdk_path = b.runAllowFail(
+        &.{ "xcrun", "--sdk", slice.sdk, "--show-sdk-path" },
+        &code,
+        .ignore, // silent when absent — CLT environments hit this on purpose
+    ) catch return;
+    const ios_sdk = std.mem.trim(u8, sdk_path, " \n\r\t");
+    if (ios_sdk.len == 0) return;
+    mod.addSystemIncludePath(.{ .cwd_relative = b.fmt("{s}/usr/include", .{ios_sdk}) });
+    mod.addFrameworkPath(.{ .cwd_relative = b.fmt("{s}/System/Library/Frameworks", .{ios_sdk}) });
+
+    // Headers for the @cImport sites (jinja_wrapper.h, stb_image.h, webp/decode.h).
+    // The matching static archives are linked by Xcode at final app-link time.
+    mod.addIncludePath(b.path("lib/jinja_cpp"));
+    mod.addIncludePath(b.path("lib"));
+    mod.addIncludePath(.{ .cwd_relative = ios_include });
+    mod.addCSourceFile(.{ .file = b.path("lib/stb_image_impl.c"), .flags = &.{"-O2"} });
+    mod.addCSourceFile(.{ .file = b.path("lib/stb_image_write_impl.c"), .flags = &.{"-O2"} });
+    // xatlas UV unwrapping (C++), used by the Hunyuan3D texture paint stage via
+    // src/uvwrap.zig extern decls — compiled into the lib like the macOS exe.
+    mod.addCSourceFile(.{ .file = b.path("lib/xatlas/xatlas.cpp"), .flags = &.{ "-std=c++17", "-O2", "-DNDEBUG" } });
+    mod.addCSourceFile(.{ .file = b.path("lib/xatlas/xatlas_shim.cpp"), .flags = &.{ "-std=c++17", "-O2", "-DNDEBUG" } });
+    mod.addIncludePath(b.path("lib/xatlas"));
+
+    const lib = b.addLibrary(.{
+        .name = "mlxserve",
+        .root_module = mod,
+        .linkage = .static,
+    });
+    lib.bundle_compiler_rt = true;
+
+    const install = b.addInstallArtifact(lib, .{
+        .dest_dir = .{ .override = .{ .custom = b.fmt("ios/{s}/lib", .{slice.sdk}) } },
+    });
+    const step = b.step(slice.step, b.fmt("Build the iOS engine static lib ({s})", .{slice.sdk}));
+    step.dependOn(&install.step);
 }
 
 fn addDs4Sources(b: *std.Build, module: *std.Build.Module) void {
