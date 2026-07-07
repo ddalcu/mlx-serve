@@ -1203,14 +1203,22 @@ pub fn loadWeightsWithVision(io: std.Io, allocator: std.mem.Allocator, model_dir
 }
 
 fn loadWeightsOpt(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, load_vision: bool) !Weights {
+    var dir = try std.Io.Dir.openDirAbsolute(io, model_dir, .{ .iterate = true });
+    defer dir.close(io);
+    return loadWeightsFromOpenDir(io, allocator, dir, model_dir, load_vision);
+}
+
+/// Load every `*.safetensors` in an already-open `dir` into a Weights map.
+/// `model_dir` is the on-disk path string, used both to build the per-file
+/// absolute path for `mlx_load_safetensors` and to phrase the error message.
+/// Split out of `loadWeightsOpt` so the incomplete-checkpoint guard below is
+/// unit-testable against a `tmpDir` (mirrors `model_discovery.discoverModelsInDir`).
+fn loadWeightsFromOpenDir(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir, model_dir: []const u8, load_vision: bool) !Weights {
     var weights = Weights.init(allocator);
     errdefer weights.deinit();
 
     const s = mlx.mlx_default_cpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
-
-    var dir = try std.Io.Dir.openDirAbsolute(io, model_dir, .{ .iterate = true });
-    defer dir.close(io);
 
     var file_count: u32 = 0;
     var it = dir.iterate();
@@ -1229,6 +1237,19 @@ fn loadWeightsOpt(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u
         log.info("Loading {s}...\n", .{entry.name});
         try loadSafetensorsFile(allocator, &weights, path, s, load_vision);
         file_count += 1;
+    }
+
+    // Incomplete-checkpoint guard. A dir with config/tokenizer but no (or no
+    // usable) *.safetensors is the classic interrupted-download shape: the
+    // small files land first, the multi-GB weight shards never finalize. Before
+    // this guard the loader returned an empty map and the caller crashed with a
+    // misleading `MISSING WEIGHT: <prefix>.embed_tokens.weight` (the first
+    // weight looked up) + `unreachable`, pointing at the model arch instead of
+    // the download. Fail here with an actionable message, mirroring the
+    // tokenizer path's "incomplete download?" hint (see main.zig).
+    if (weights.count() == 0) {
+        log.err("no usable weights loaded from {s} ({d} *.safetensors file(s) found) — the checkpoint looks like an incomplete download (config/tokenizer present, weight shards missing). Re-download the model (e.g. `mlx-serve pull <model>`) or delete the dir and re-fetch.\n", .{ model_dir, file_count });
+        return error.NoWeightFiles;
     }
 
     log.info("Loaded {d} weights from {d} file(s)\n", .{ weights.count(), file_count });
@@ -1320,6 +1341,30 @@ test "ModelConfig defaults" {
     try testing.expectEqual(@as(u32, 0), config.quant_bits); // 0 = dense bf16 (no "quantization" key)
     try testing.expectEqual(@as(u32, 64), config.quant_group_size);
     try testing.expect(!config.tie_word_embeddings);
+}
+
+test "loadWeights on a weightless dir (incomplete download) errors clearly, not empty map" {
+    // Reproduces the live misdiagnosis: an interrupted `hf download`/`mlx-serve
+    // pull` lands config + tokenizer but never finalizes the *.safetensors
+    // weight shards. Before the guard, loadWeights returned an empty map and
+    // the caller crashed with a misleading "MISSING WEIGHT:
+    // model.embed_tokens.weight" (the first weight looked up) + `unreachable`,
+    // pointing at the model arch instead of the incomplete checkpoint.
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = "{\"model_type\":\"mistral\"}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "tokenizer.json", .data = "{}" });
+    // The index file names the shards but is NOT itself a weight file — it must
+    // not be mistaken for one (it ends in .json, not .safetensors).
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data = "{}" });
+
+    try std.testing.expectError(
+        error.NoWeightFiles,
+        loadWeightsFromOpenDir(io, allocator, tmp.dir, "/incomplete-model", false),
+    );
 }
 
 test "ModelConfig addEosToken" {
@@ -1944,6 +1989,42 @@ test "ModelConfig parses gemma4_unified vision + audio multimodal fields" {
     try testing.expectEqual(@as(u32, 258882), config.eoi_token_id);
     try testing.expectEqual(@as(u32, 256000), config.boa_token_id);
     try testing.expectEqual(@as(u32, 258883), config.eoa_token_id);
+}
+
+test "parseConfigFromJson mistral honors explicit head_dim (≠ hidden/heads), flat prefix, quant" {
+    // Mistral-Small-24B-Instruct-2501-4bit. The distinguishing trait vs the
+    // llama-family default is that head_dim (128) is EXPLICIT and does NOT
+    // equal hidden_size/num_attention_heads (5120/32 = 160). The mistral arm
+    // must HONOR the explicit value (null-check, never recompute) — recomputing
+    // to 160 would corrupt the Q/K/V reshape. Red-on-revert if the arm ever
+    // unconditionally sets head_dim = hidden/heads. Also pins flat "model"
+    // prefix (text-only, not the multimodal "language_model.model"), quant_bits
+    // from the top-level "quantization" block, layer count, and untied lm_head.
+    const json =
+        \\{
+        \\  "model_type": "mistral",
+        \\  "hidden_size": 5120,
+        \\  "num_attention_heads": 32,
+        \\  "num_key_value_heads": 8,
+        \\  "head_dim": 128,
+        \\  "num_hidden_layers": 40,
+        \\  "intermediate_size": 32768,
+        \\  "vocab_size": 131072,
+        \\  "rms_norm_eps": 1e-05,
+        \\  "rope_theta": 100000000.0,
+        \\  "tie_word_embeddings": false,
+        \\  "quantization": {"group_size": 64, "bits": 4}
+        \\}
+    ;
+    const config = try parseConfigFromJson(testing.allocator, json);
+    try testing.expectEqualStrings("mistral", config.model_type);
+    try testing.expectEqualStrings("model", config.weight_prefix);
+    try testing.expectEqual(@as(u32, 128), config.head_dim); // honored, NOT 5120/32=160
+    try testing.expectEqual(@as(u32, 32), config.num_attention_heads);
+    try testing.expectEqual(@as(u32, 40), config.num_hidden_layers);
+    try testing.expectEqual(@as(u32, 131072), config.vocab_size);
+    try testing.expectEqual(@as(u32, 4), config.quant_bits);
+    try testing.expect(!config.tie_word_embeddings);
 }
 
 test "parseConfigFromJson dense bf16 qwen3_5_moe → quant_bits 0" {
