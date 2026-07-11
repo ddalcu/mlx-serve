@@ -955,6 +955,18 @@ pub const Scheduler = struct {
     prefix_cache_disk_bytes: u64,
     ssm_checkpoint_stride: u32,
     ssm_checkpoint_max: u32,
+    /// Launch-flag MTP + embedded-llama.cpp settings, retained (same rationale
+    /// as the prefix-cache fields above) so COLD-LOADED models — on-demand
+    /// `/v1/load-model`, model switches — honor `--no-mtp` / `--mtp-depth` /
+    /// `--llama-cache-entries` / `--llama-kv-quant` like the `--model` primary.
+    /// Pre-plumbing, the cold-load `LoadRequest` used its struct defaults
+    /// (mtp on, default depth, 4 llama sessions, F16 KV), silently ignoring
+    /// these flags on every on-demand load and model switch.
+    mtp_enabled: bool,
+    mtp_depth: u32,
+    llama_cache_entries: u32,
+    llama_kv_type_k: i32,
+    llama_kv_type_v: i32,
 
     // ── Borrowed refs (CPU-only state owned by the LoadedModel). ──
     config: *const ModelConfig,
@@ -1105,6 +1117,11 @@ pub const Scheduler = struct {
             .prefix_cache_disk_bytes = params.prefix_cache_disk_bytes,
             .ssm_checkpoint_stride = params.ssm_checkpoint_stride,
             .ssm_checkpoint_max = params.ssm_checkpoint_max,
+            .mtp_enabled = params.mtp_enabled,
+            .mtp_depth = params.mtp_depth,
+            .llama_cache_entries = params.llama_cache_entries,
+            .llama_kv_type_k = params.llama_kv_type_k,
+            .llama_kv_type_v = params.llama_kv_type_v,
             // Initial borrowed-view refs point at the (heap-allocated) CPU
             // state carried on LoadParams; once the inference thread
             // installs them on `entry`, the views still resolve to the
@@ -1537,6 +1554,16 @@ pub const Scheduler = struct {
             .prefix_cache_disk_bytes = self.prefix_cache_disk_bytes,
             .ssm_checkpoint_stride = self.ssm_checkpoint_stride,
             .ssm_checkpoint_max = self.ssm_checkpoint_max,
+            // Cold loads honor the launch-flag MTP + embedded-llama.cpp
+            // settings too (same reason as prefix-cache above) — pre-plumbing
+            // these were LoadRequest defaults, so --no-mtp / --mtp-depth /
+            // --llama-cache-entries / --llama-kv-quant were silently dropped
+            // on every on-demand load and model switch.
+            .mtp_enabled = self.mtp_enabled,
+            .mtp_depth = self.mtp_depth,
+            .llama_cache_entries = self.llama_cache_entries,
+            .llama_kv_type_k = self.llama_kv_type_k,
+            .llama_kv_type_v = self.llama_kv_type_v,
             .evict_entries = victims_buf[0..n_victims],
             .allocator = self.allocator,
         };
