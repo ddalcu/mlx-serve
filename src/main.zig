@@ -779,7 +779,7 @@ pub fn main(init: std.process.Init) !void {
         if (model_dir.len == 0) {
             const discovery_for_registry = discovery_storage;
             discovery_storage = null; // ownership moves to the registry
-            try runHeadlessServe(io, allocator, discovery_for_registry, host, port, ctx_size, timeout, reasoning_budget, max_resident_models, max_resident_mem, max_resident_mem_explicit, idle_evict_secs);
+            try runHeadlessServe(io, allocator, discovery_for_registry, host, port, ctx_size, timeout, reasoning_budget, max_resident_models, max_resident_mem, max_resident_mem_explicit, idle_evict_secs, kv_quant_config);
             return;
         }
 
@@ -1419,6 +1419,7 @@ fn runHeadlessServe(
     max_resident_mem: u64,
     max_resident_mem_explicit: bool,
     idle_evict_secs: ?u32,
+    kv_quant_config: transformer_mod.KVQuantConfig,
 ) !void {
     log.info("mlx-serve {s} (headless — models load on demand)\n", .{VERSION});
     log.info("[args] serve: {s}:{d}\n", .{ host, port });
@@ -1484,7 +1485,7 @@ fn runHeadlessServe(
         .load_vision = false,
         .warmup_eager = false,
         .draft_block_size = 0,
-        .kv_quant_config = transformer_mod.KVQuantConfig.dense,
+        .kv_quant_config = kv_quant_config,
         // Seed the scheduler's prefix-cache config from the server globals so
         // on-demand (headless/discover-mode) loads get the SAME hot prefix
         // cache as a `--model` startup load. Previously hardcoded to 0, which
