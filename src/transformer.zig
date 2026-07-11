@@ -4598,6 +4598,15 @@ pub const Transformer = struct {
             }
         }
 
+        // Models whose head_dim exceeds MLX's fused-SDPA support (>128, e.g.
+        // 256) fall onto the score-materializing attention path, whose
+        // [heads, chunk, ctx] scratch plus the per-layer dense KV dequant would
+        // accumulate across layers under MLX lazy-eval and OOM on long prompts.
+        // Eval after each layer so each layer's transient frees before the next
+        // builds, bounding peak to ~1 layer. Fused head dims (<=128) keep the
+        // coarser cadence.
+        const moe_eval_cadence: u32 = if (cfg.head_dim > 128) 1 else MOE_EVAL_EVERY_N_LAYERS;
+
         for (0..cfg.num_hidden_layers) |layer_idx| {
             const li: u32 = @intCast(layer_idx);
             const lw = &ml[layer_idx];
@@ -4638,7 +4647,7 @@ pub const Transformer = struct {
                 h = h_next;
             }
 
-            if (is_prefill and (layer_idx + 1) % MOE_EVAL_EVERY_N_LAYERS == 0) {
+            if (is_prefill and (layer_idx + 1) % moe_eval_cadence == 0) {
                 try mlx.check(mlx.mlx_array_eval(h));
             }
         }

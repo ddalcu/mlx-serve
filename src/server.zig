@@ -2122,16 +2122,25 @@ fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_len:
     const kv_heads: u64 = config.num_key_value_heads;
     const hdim: u64 = config.head_dim;
     const hidden: u64 = config.hidden_size;
-    const ffn: u64 = @max(config.intermediate_size, config.moe_intermediate_size + config.shared_expert_intermediate_size);
+    const ffn: u64 = if (config.isMoe())
+        config.moe_intermediate_size + config.shared_expert_intermediate_size
+    else
+        config.intermediate_size;
+    // Active KV-quant width in bits: dense fp16 = 16, affine q8 = 8, q4 = 4.
+    const kv_bits: u64 = if (global_scheduler) |sch|
+        (if (sch.kv_quant_config.scheme == .off) 16 else sch.kv_quant_config.bits)
+    else
+        16;
 
     // KV cache (all layers, fp16): layers × 2(K+V) × seq × kv_heads × head_dim × 2 bytes.
     // This is persistent for the rest of the request, so it's a real hard cost.
-    const kv_bytes: u64 = layers * 2 * seq * kv_heads * hdim * 2;
+    const kv_bytes: u64 = layers * 2 * seq * kv_heads * hdim * kv_bits / 8;
     // Per-layer working memory during prefill (fp16). The transformer eval()s every N layers,
     // so transient tensors from earlier layers are released. Peak is bounded by a single layer:
     //   QKV projections (~3× seq × hidden) + MLP intermediates (~3× seq × ffn) + residuals.
     // A ~8× seq × max(hidden, ffn) × 2-byte envelope captures this with headroom.
-    const working_bytes: u64 = 8 * seq * @max(hidden, ffn) * 2;
+    const chunk_seq: u64 = @min(seq, @as(u64, @intCast(generate_mod.prefill_chunk_override)));
+    const working_bytes: u64 = 8 * chunk_seq * @max(hidden, ffn) * 2;
     // Total estimate with 25% safety margin
     const needed: u64 = (kv_bytes + working_bytes) * 5 / 4;
 

@@ -742,7 +742,13 @@ pub const Generator = struct {
         // PREFILL_CHUNK overridable via env MLX_SERVE_PREFILL_CHUNK for tuning,
         // or via the module-level `prefill_chunk_override` (set by --prefill-chunk
         // CLI flag in main.zig). Env var wins if both are set.
-        const PREFILL_CHUNK: usize = readEnvUsize("MLX_SERVE_PREFILL_CHUNK", prefill_chunk_override);
+        var PREFILL_CHUNK: usize = readEnvUsize("MLX_SERVE_PREFILL_CHUNK", prefill_chunk_override);
+        // Large head_dim (>128, e.g. 256) misses MLX's fused SDPA kernel and
+        // falls onto the score-materializing path, whose [heads, chunk, ctx]
+        // scratch scales with the chunk - an 8K chunk OOMs the command buffer at
+        // long contexts. Cap the chunk so that scratch stays bounded; fused head
+        // dims (<=128) keep the full chunk for prefill throughput.
+        if (xfm.config.head_dim > 128 and PREFILL_CHUNK > 512) PREFILL_CHUNK = 512;
         // Phase-level prefill instrumentation. Enabled at debug level OR via
         // MLX_SERVE_PREFILL_TRACE=1 (which forces the trace line at info).
         // Phase 0 of plan 04 — gives us a decomposed view of where cold prefill
