@@ -94,68 +94,6 @@ final class ModelFormatTests: XCTestCase {
         ).isSupportedArchitecture)
     }
 
-    // MARK: - Drafter-pairing chip suppression on GGUF rows
-
-    /// The Gemma 4 assistant drafter is an MLX-only kernel — it cross-
-    /// attends into the target's MLX KV cache. A GGUF base served by
-    /// llama.cpp has no MLX KV to attend into, so "Pair with drafter" must
-    /// NOT show up on Gemma 4 GGUF Model Browser rows (the chip used to
-    /// read as if the GGUF model itself was a drafter, doubly wrong).
-    func testDrafterPairingHiddenOnGgufRows() {
-        // Gemma 4 GGUF repacks — pairing must be suppressed.
-        XCTAssertNil(DownloadManager.drafterPairingVariant(
-            repoId: "lmstudio-community/gemma-4-E4B-it-GGUF",
-            isDrafter: false, isGgufRepo: true
-        ))
-        XCTAssertNil(DownloadManager.drafterPairingVariant(
-            repoId: "lmstudio-community/gemma-4-E2B-it-GGUF",
-            isDrafter: false, isGgufRepo: true
-        ))
-        XCTAssertNil(DownloadManager.drafterPairingVariant(
-            repoId: "bartowski/gemma-4-26b-a4b-it-GGUF",
-            isDrafter: false, isGgufRepo: true
-        ))
-
-        // The matching MLX base rows DO offer pairing.
-        XCTAssertEqual(
-            DownloadManager.drafterPairingVariant(
-                repoId: "mlx-community/gemma-4-E4B-it-4bit",
-                isDrafter: false, isGgufRepo: false
-            ),
-            .E4B
-        )
-        XCTAssertEqual(
-            DownloadManager.drafterPairingVariant(
-                repoId: "mlx-community/gemma-4-E2B-it-4bit",
-                isDrafter: false, isGgufRepo: false
-            ),
-            .E2B
-        )
-        XCTAssertEqual(
-            DownloadManager.drafterPairingVariant(
-                repoId: "mlx-community/gemma-4-26b-a4b-it-4bit",
-                isDrafter: false, isGgufRepo: false
-            ),
-            .moe26B
-        )
-
-        // Drafter rows themselves never offer self-pairing.
-        XCTAssertNil(DownloadManager.drafterPairingVariant(
-            repoId: "mlx-community/gemma-4-E4B-it-assistant-bf16",
-            isDrafter: true, isGgufRepo: false
-        ))
-
-        // Non-Gemma-4 rows are nil regardless of format.
-        XCTAssertNil(DownloadManager.drafterPairingVariant(
-            repoId: "mlx-community/Qwen3.6-27B-4bit",
-            isDrafter: false, isGgufRepo: false
-        ))
-        XCTAssertNil(DownloadManager.drafterPairingVariant(
-            repoId: "lmstudio-community/Qwen3.6-27B-GGUF",
-            isDrafter: false, isGgufRepo: true
-        ))
-    }
-
     // MARK: - Quant label extraction for the picker
 
     func testQuantLabelExtractsQuantToken() {

@@ -12,13 +12,30 @@ TEAM_ID="${APPLE_TEAM_ID:?Set APPLE_TEAM_ID in env}"
 
 cd "$SCRIPT_DIR"
 
+MAS="${MAS:-0}"
+if [ "$MAS" = "1" ]; then
+    echo "=== $MAS ==="
+    INFO_PLIST_SRC="$SCRIPT_DIR/Info-MAS.plist"
+    APP_ENTITLEMENTS="$SCRIPT_DIR/MLXCore-MAS.entitlements"
+    HELPER_ENTITLEMENTS="$SCRIPT_DIR/mlx-serve-MAS.entitlements"
+    SWIFT_MODE_FLAGS=(-Xswiftc -DMAS_BUILD)
+    ZIG_MODE_FLAGS=(-Dmas=true)
+else
+    INFO_PLIST_SRC="$SCRIPT_DIR/Info.plist"
+    APP_ENTITLEMENTS="$SCRIPT_DIR/MLXCore.entitlements"
+    HELPER_ENTITLEMENTS=""            # DMG helper carries no entitlements
+    SWIFT_MODE_FLAGS=()
+    ZIG_MODE_FLAGS=()
+fi
+
 # Set calver version (YY.M.N) — auto-increment N from last GitHub release
 YM="$(date +%y.%-m)"
 LAST_N=$(gh release list --limit 50 --json tagName --jq "[.[] | .tagName | select(startswith(\"v${YM}.\"))] | map(split(\".\")[2] | tonumber) | max // 0" 2>/dev/null || echo "0")
 NEXT_N=$((LAST_N + 1))
 CALVER="${YM}.${NEXT_N}"
-/usr/libexec/PlistBuddy -c "Set :CFBundleVersion $CALVER" Info.plist
-/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $CALVER" Info.plist
+# Stamp the version into whichever Info.plist this build mode ships.
+/usr/libexec/PlistBuddy -c "Set :CFBundleVersion $CALVER" "$INFO_PLIST_SRC"
+/usr/libexec/PlistBuddy -c "Set :CFBundleShortVersionString $CALVER" "$INFO_PLIST_SRC"
 export MLX_SERVE_VERSION="$CALVER"
 
 echo "=== Building MLX Core v$CALVER ==="
@@ -32,7 +49,7 @@ echo "→ Compiling Swift..."
 # exist in 6.1. Swift 5 mode downgrades those to warnings. Until the swift-sdk
 # pin can move past 0.11 (or CI moves to a Swift 6.3 runner), this flag keeps
 # the build green on both old and new toolchains.
-SWIFT_BUILD_FLAGS=(-c release -Xswiftc -swift-version -Xswiftc 5)
+SWIFT_BUILD_FLAGS=(-c release -Xswiftc -swift-version -Xswiftc 5 ${SWIFT_MODE_FLAGS[@]+"${SWIFT_MODE_FLAGS[@]}"})
 swift build "${SWIFT_BUILD_FLAGS[@]}" 2>&1 | tail -5
 SWIFT_BIN="$(swift build "${SWIFT_BUILD_FLAGS[@]}" --show-bin-path)/MLXCore"
 if [ ! -f "$SWIFT_BIN" ]; then
@@ -47,7 +64,9 @@ cd "$PROJECT_ROOT"
 # Stage libllama (llama.cpp GGUF engine) before the Zig build links against it.
 echo "→ Fetching libllama..."
 bash "$PROJECT_ROOT/scripts/fetch-llama.sh"
-DEVELOPER_DIR=/Library/Developer/CommandLineTools zig build -Doptimize=ReleaseFast -Dversion="$MLX_SERVE_VERSION" 2>&1 | tail -3
+DEVELOPER_DIR=/Library/Developer/CommandLineTools zig build -Doptimize=ReleaseFast -Dversion="$MLX_SERVE_VERSION" ${ZIG_MODE_FLAGS[@]+"${ZIG_MODE_FLAGS[@]}"} 2>&1 | tail -3
+# The bundled guest agent (static aarch64-linux ELF) rides inside the app.
+DEVELOPER_DIR=/Library/Developer/CommandLineTools zig build vz-agent 2>&1 | tail -1
 MLX_BIN="zig-out/bin/mlx-serve"
 if [ ! -f "$MLX_BIN" ]; then
     echo "ERROR: Zig build failed"
@@ -87,8 +106,24 @@ cp -R "$SCRIPT_DIR/Sources/MLXServe/Resources/"* "$CONTENTS/Resources/" 2>/dev/n
 # mlx-serve Zig binary
 cp "$PROJECT_ROOT/$MLX_BIN" "$CONTENTS/MacOS/mlx-serve"
 
-# Info.plist
-cp "$SCRIPT_DIR/Info.plist" "$CONTENTS/"
+# Info.plist (the build-mode variant, already version-stamped)
+cp "$INFO_PLIST_SRC" "$CONTENTS/Info.plist"
+
+if [ "$MAS" = "1" ]; then
+    echo "→ Staging bundled guest (kernel + rootfs + vz-agent)..."
+    bash "$PROJECT_ROOT/scripts/fetch-guest-rootfs.sh"
+    mkdir -p "$CONTENTS/Resources/guest"
+    cp "$PROJECT_ROOT/lib/guest/kernel"        "$CONTENTS/Resources/guest/kernel"
+    cp "$PROJECT_ROOT/lib/guest/rootfs.tar.gz" "$CONTENTS/Resources/guest/rootfs.tar.gz"
+    cp "$PROJECT_ROOT/zig-out/guest/vz-agent"  "$CONTENTS/Resources/guest/vz-agent"
+    cp "$SCRIPT_DIR/PrivacyInfo.xcprivacy"     "$CONTENTS/Resources/PrivacyInfo.xcprivacy"
+    # The embedded provisioning profile is required for a Mac App Store binary.
+    if [ -n "${MAS_PROVISION_PROFILE:-}" ] && [ -f "$MAS_PROVISION_PROFILE" ]; then
+        cp "$MAS_PROVISION_PROFILE" "$CONTENTS/embedded.provisionprofile"
+    else
+        echo "  WARNING: set MAS_PROVISION_PROFILE"
+    fi
+fi
 
 # App icon
 if [ -f "$ICON_DIR/AppIcon.icns" ]; then
@@ -210,7 +245,7 @@ chmod -R u+w "$APP"
 
 # Hardened runtime requires a real Team ID — skip it for ad-hoc ("-") signing,
 # otherwise dyld rejects framework loads with "different Team IDs".
-ENTITLEMENTS="$SCRIPT_DIR/MLXCore.entitlements"
+ENTITLEMENTS="$APP_ENTITLEMENTS"
 if [ "$IDENTITY" = "-" ]; then
     SIGN_OPTS=(--force --sign -)
     # Ad-hoc dev builds run without hardened runtime (mic prompt works without
@@ -218,6 +253,13 @@ if [ "$IDENTITY" = "-" ]; then
     # on the PROCESS or VZVirtualMachine refuses to start — and that entitlement
     # works fine with ad-hoc signing. Apply the same entitlements file.
     APP_SIGN_OPTS=("${SIGN_OPTS[@]}" --entitlements "$ENTITLEMENTS")
+elif [ "$MAS" = "1" ]; then
+    SIGN_OPTS=(--force --sign "$IDENTITY")
+    MAS_BUNDLE_ID="$(/usr/libexec/PlistBuddy -c "Print :CFBundleIdentifier" "$INFO_PLIST_SRC")"
+    RENDERED_ENTITLEMENTS="$(mktemp -t MLXCore-MAS-rendered).entitlements"
+    bash "$PROJECT_ROOT/scripts/render-mas-entitlements.sh" \
+        "$APP_ENTITLEMENTS" "$TEAM_ID" "$MAS_BUNDLE_ID" "$RENDERED_ENTITLEMENTS"
+    APP_SIGN_OPTS=("${SIGN_OPTS[@]}" --entitlements "$RENDERED_ENTITLEMENTS")
 else
     SIGN_OPTS=(--force --options runtime --sign "$IDENTITY")
     # Under hardened runtime the mic-using process (MLXCore) and the .app need
@@ -239,13 +281,39 @@ for fw in "$CONTENTS/Frameworks/"*.framework; do
     [ -d "$fw" ] && codesign "${SIGN_OPTS[@]}" "$fw" && echo "  Signed: $(basename "$fw")"
 done
 
-# Sign executables — the mic-using app process and bundle get the entitlement.
-codesign "${SIGN_OPTS[@]}" "$CONTENTS/MacOS/mlx-serve" && echo "  Signed: mlx-serve"
+
+if [ "$MAS" = "1" ] && [ -n "$HELPER_ENTITLEMENTS" ]; then
+    codesign "${SIGN_OPTS[@]}" --entitlements "$HELPER_ENTITLEMENTS" "$CONTENTS/MacOS/mlx-serve" && echo "  Signed: mlx-serve (sandbox+inherit)"
+else
+    codesign "${SIGN_OPTS[@]}" "$CONTENTS/MacOS/mlx-serve" && echo "  Signed: mlx-serve"
+fi
 codesign "${APP_SIGN_OPTS[@]}" "$CONTENTS/MacOS/MLXCore" && echo "  Signed: MLXCore"
 codesign "${APP_SIGN_OPTS[@]}" "$APP" && echo "  Signed: $APP_NAME.app"
 
 # Verify
 codesign -vv "$APP" 2>&1 | head -3
+
+if [ "$MAS" = "1" ]; then
+    echo "→ Building App Store .pkg..."
+    PKG_PATH="$SCRIPT_DIR/MLXCore-MAS.pkg"
+    INSTALLER_IDENTITY="${APPLE_INSTALLER_ID:-3rd Party Mac Developer Installer: David Dalcu ($TEAM_ID)}"
+    if [ "$IDENTITY" = "-" ]; then
+        echo "  (ad-hoc build — skipping productbuild; a real 'Apple Distribution' identity is required to submit)"
+    else
+        productbuild --component "$APP" /Applications \
+            --sign "$INSTALLER_IDENTITY" \
+            "$PKG_PATH"
+        echo ""
+        echo "=== Mac App Store build complete! ==="
+        echo "App: $APP"
+        echo "Pkg: $PKG_PATH"
+        echo "Version: v$MLX_SERVE_VERSION"
+        echo ""
+        echo "To submit: open the .pkg in Transporter, or:"
+        echo "  xcrun altool --upload-app -f \"$PKG_PATH\" -t macos --apple-id \"\$APPLE_ID\" --password \"\$APPLE_ID_PASSWORD\""
+    fi
+    exit 0
+fi
 
 # ── Phase 6: Notarize ──
 if [ "${SKIP_NOTARIZE:-}" = "1" ]; then

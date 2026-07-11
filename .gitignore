@@ -45,3 +45,7 @@ tests/fixtures/acestep/
 tests/fixtures/hy3d/
 tests/fixtures/krea/
 tests/fixtures/ltx/
+/lib/guest/
+
+# XcodeGen output — regenerate with `cd app && xcodegen generate` (spec: app/project.yml)
+/app/MLXCore.xcodeproj/

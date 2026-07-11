@@ -83,6 +83,25 @@ final class PerSessionUIStateTests: XCTestCase {
         XCTAssertEqual(back.mode, .agent)
     }
 
+    /// The attached document folder (mini RAG) persists per session so it can be
+    /// re-indexed after a relaunch — under the App Sandbox the matching
+    /// security-scoped bookmark is what makes the path reachable again.
+    func testAttachedFolderPathSurvivesCodableRoundTrip() throws {
+        var s = ChatSession(title: "t")
+        s.attachedFolderPath = "/Users/someone/Documents/papers"
+        let back = try JSONDecoder().decode(ChatSession.self, from: JSONEncoder().encode(s))
+        XCTAssertEqual(back.attachedFolderPath, "/Users/someone/Documents/papers")
+    }
+
+    func testLegacySessionWithoutAttachedFolderDecodesToNil() throws {
+        let legacy = """
+        {"id":"\(UUID().uuidString)","title":"old","messages":[],
+         "createdAt":0,"updatedAt":0,"mode":"chat","isExternalBridge":false}
+        """.data(using: .utf8)!
+        let back = try JSONDecoder().decode(ChatSession.self, from: legacy)
+        XCTAssertNil(back.attachedFolderPath, "missing key → no folder, not a decode failure")
+    }
+
     func testLegacySessionWithoutTogglesDecodesToOff() throws {
         // A chat saved before these fields existed must still decode (no throw),
         // defaulting both toggles off — same back-compat pattern as workingDirectory.

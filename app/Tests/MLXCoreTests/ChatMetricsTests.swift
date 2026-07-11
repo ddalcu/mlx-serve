@@ -37,19 +37,6 @@ final class ChatMetricsTests: XCTestCase {
         XCTAssertLessThan(ChatMetrics.togglePillIconSize, ChatMetrics.togglePillHeight)
     }
 
-    func testCompactToggleDecisionByDetailWidth() {
-        // The toolbar cannot be trusted to adapt the pill cluster itself
-        // (ViewThatFits inside an NSToolbar item measures once at ideal size
-        // and overflows the whole cluster into »). We decide density from the
-        // measured chat-pane width instead: icon-only below the threshold,
-        // full pills at/above it, and full while unmeasured (width 0).
-        let t = ChatMetrics.togglePillCompactThreshold
-        XCTAssertFalse(ChatMetrics.useCompactToggles(forDetailWidth: 0), "unmeasured → full")
-        XCTAssertTrue(ChatMetrics.useCompactToggles(forDetailWidth: t - 1))
-        XCTAssertFalse(ChatMetrics.useCompactToggles(forDetailWidth: t))
-        XCTAssertFalse(ChatMetrics.useCompactToggles(forDetailWidth: t + 200))
-    }
-
     func testModePillClusterOwnsItsSpacing() {
         // The three pills ride ONE ToolbarItem with an explicit HStack gap, so
         // in-cluster spacing is ours — uniform on both sides of Agent — rather

@@ -49,6 +49,34 @@ final class WakeWordTests: XCTestCase {
         XCTAssertNil(WakeWord.strip("   "))
     }
 
+    // MARK: - Custom phrases (Settings ▸ Voice ▸ Wake phrase)
+
+    func testCustomPhraseWakesAndTheOldNameStopsWaking() {
+        XCTAssertEqual(WakeWord.strip("Hey Jarvis, lights on", phrase: "hey jarvis"), "lights on")
+        // Greeting variants and the bare exact name work for custom phrases too.
+        XCTAssertEqual(WakeWord.strip("Okay Jarvis go ahead", phrase: "hey jarvis"), "go ahead")
+        XCTAssertEqual(WakeWord.strip("Jarvis, status?", phrase: "hey jarvis"), "status?")
+        // Renaming the assistant retires the old name.
+        XCTAssertNil(WakeWord.strip("Hey Loki, lights on", phrase: "hey jarvis"))
+    }
+
+    /// The Settings field stores whatever the user typed; consumers normalize.
+    func testNormalizePhraseToleratesUserFormatting() {
+        XCTAssertEqual(WakeWord.normalizePhrase("  Hey,  JARVIS! "), "hey jarvis")
+        XCTAssertEqual(WakeWord.normalizePhrase("Hey Loki"), WakeWord.defaultPhrase)
+        // Empty / punctuation-only input can't be a phrase → nil, so callers
+        // fall back to the default instead of a never-matching gate.
+        XCTAssertNil(WakeWord.normalizePhrase(""))
+        XCTAssertNil(WakeWord.normalizePhrase("  …!  "))
+    }
+
+    func testDisplayAndAssistantNameDeriveFromThePhrase() {
+        XCTAssertEqual(WakeWord.display("hey jarvis"), "Hey Jarvis")
+        XCTAssertEqual(WakeWord.assistantName("hey jarvis"), "Jarvis")
+        // Single-token phrase: the whole phrase is the name.
+        XCTAssertEqual(WakeWord.assistantName("computer"), "Computer")
+    }
+
     func testWakeWordMustBeAWholeWord() {
         // A token that merely starts with the name doesn't count.
         XCTAssertNil(WakeWord.strip("lokimon is a game"))

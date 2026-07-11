@@ -120,6 +120,67 @@ struct MCPCatalogEntry: Identifiable, Hashable {
     }
 }
 
+/// MCP servers whose executables are PRE-BAKED into the bundled guest image.
+///
+/// Why this exists (proven live): `npx -y <package>` inside the guest contacts
+/// registry.npmjs.org even when the package is already installed — npx ignores
+/// `npm -g` globals — so every MCP start DOWNLOADED CODE at runtime, which App
+/// Review guideline 2.5.2 forbids. The baked bins run fine when invoked
+/// directly (and with guest networking OFF). This table translates the npx form
+/// the catalog/mcp.json authors into the direct-bin form the guest executes.
+enum MCPGuestPrebaked {
+
+    /// npm package → executable name inside the guest rootfs.
+    ///
+    /// DOCUMENTED DUPLICATION: must match what the `ddalcu/agent-shell-mlxserve`
+    /// image bakes in (same convention as `isMediaModelType` ↔ `modalityFromType`).
+    /// Adding a server = bake the bin into the image AND add a row here.
+    static let prebakedGuestBins: [String: String] = [
+        "@modelcontextprotocol/server-filesystem": "mcp-server-filesystem",
+        "@modelcontextprotocol/server-github": "mcp-server-github",
+    ]
+
+    /// Pure translator: the direct guest invocation for (command, args), or nil
+    /// when the server is not pre-baked. Handles three author spellings:
+    /// the catalog's `npx -y <package> [args…]`, a version-pinned
+    /// `npx <package>@<version>`, and the direct bin name itself.
+    static func translate(command: String, args: [String]) -> (command: String, args: [String])? {
+        if prebakedGuestBins.values.contains(command) { return (command, args) }
+        guard command == "npx" || command.hasSuffix("/npx") else { return nil }
+        // npx [-y|--yes|…] <package>[@version] [server args…]
+        var rest = args[...]
+        while let first = rest.first, first.hasPrefix("-") { rest = rest.dropFirst() }
+        guard let token = rest.first, let bin = prebakedGuestBins[packageBaseName(token)] else {
+            return nil
+        }
+        return (bin, Array(rest.dropFirst()))
+    }
+
+    /// "@scope/name@1.2.3" → "@scope/name"; "name@latest" → "name". The leading
+    /// "@" of a scoped package is not a version separator.
+    static func packageBaseName(_ token: String) -> String {
+        guard let at = token[token.index(after: token.startIndex)...].lastIndex(of: "@") else {
+            return token
+        }
+        return String(token[..<at])
+    }
+
+    /// What actually runs in the guest, by build policy.
+    ///
+    /// `prebakedOnly` (the Mac App Store build): a server outside the table is
+    /// an explicit, honest error — never a silent npx download. Otherwise (the
+    /// DMG build): pre-baked servers still translate (they then work with guest
+    /// networking off), everything else runs as authored, as it always did.
+    static func invocation(command: String, args: [String],
+                           prebakedOnly: Bool) throws -> (command: String, args: [String]) {
+        if let direct = translate(command: command, args: args) { return direct }
+        guard !prebakedOnly else {
+            throw MCPSpawnError.notPrebaked(command: ([command] + args).joined(separator: " "))
+        }
+        return (command, args)
+    }
+}
+
 enum MCPCatalog {
     static let entries: [MCPCatalogEntry] = [
         .init(
@@ -295,5 +356,27 @@ enum MCPCatalog {
     /// Look up a catalog entry by ID. Returns nil if the server is custom (not in the curated list).
     static func entry(for id: String) -> MCPCatalogEntry? {
         entries.first { $0.id == id }
+    }
+
+    /// The entries the marketplace may OFFER. Under the pre-baked-only policy
+    /// (Mac App Store build) only servers whose bins ride the bundled guest
+    /// image are shown — offering one that would error at spawn with
+    /// "not in the bundled image" is a dead toggle.
+    static func visibleEntries(
+        prebakedOnly: Bool = BuildFeatures.current.guest.mcpServers == .prebaked
+    ) -> [MCPCatalogEntry] {
+        guard prebakedOnly else { return entries }
+        return entries.filter { MCPGuestPrebaked.translate(command: $0.command, args: $0.args) != nil }
+    }
+
+    /// `entry(for:)` restricted to the visible set. A configured catalog server
+    /// that is HIDDEN in this build (e.g. playwright carried over from a DMG
+    /// install) then renders in the marketplace's custom section instead of
+    /// disappearing while still erroring at spawn.
+    static func visibleEntry(
+        for id: String,
+        prebakedOnly: Bool = BuildFeatures.current.guest.mcpServers == .prebaked
+    ) -> MCPCatalogEntry? {
+        visibleEntries(prebakedOnly: prebakedOnly).first { $0.id == id }
     }
 }

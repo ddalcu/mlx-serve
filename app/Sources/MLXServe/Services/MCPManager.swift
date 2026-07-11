@@ -12,59 +12,39 @@ import AppKit
 @MainActor
 final class MCPManager: ObservableObject, MCPToolRouting {
 
-    /// One running server. Stdio sessions retain the Process and pipes; HTTP sessions only retain
-    /// the MCP Client (no subprocess). All stdio fields are nil for HTTP sessions.
+    /// One running server. Stdio sessions retain the child (a host `Process` or
+    /// a `GuestMCPBridge`) and its stderr capture; HTTP sessions only retain the
+    /// MCP Client. All stdio fields are nil for HTTP sessions.
     final class Session {
         let id: String
-        let process: Process?           // nil for HTTP transport
-        let stdinPipe: Pipe?
-        let stdoutPipe: Pipe?
-        let stderrPipe: Pipe?
+        /// nil for HTTP transport. `MCPChild` so a server running inside the
+        /// Agent Sandbox guest satisfies the same contract as a host process.
+        let child: MCPChild?
+        private let stderrBox: StderrBox?
         let client: Client
         var tools: [Tool]
-        // Rolling stderr capture for surfacing server errors in the UI (stdio only).
-        private(set) var stderrTail: String = ""
 
-        /// Stdio transport — child process + pipes.
-        init(id: String, process: Process, stdin: Pipe, stdout: Pipe, stderr: Pipe,
-             client: Client, tools: [Tool]) {
+        /// Rolling stderr capture for surfacing server errors in the UI (stdio
+        /// only). The spawner already drains the stream into `StderrBox`, so
+        /// this just reads the tail rather than owning a second drain.
+        var stderrTail: String { String((stderrBox?.snapshot() ?? "").suffix(4_000)) }
+
+        /// Stdio transport — host process or guest bridge.
+        init(id: String, child: MCPChild, stderr: StderrBox, client: Client, tools: [Tool]) {
             self.id = id
-            self.process = process
-            self.stdinPipe = stdin
-            self.stdoutPipe = stdout
-            self.stderrPipe = stderr
+            self.child = child
+            self.stderrBox = stderr
             self.client = client
             self.tools = tools
-            // Drain stderr in the background so the pipe buffer never fills up (would block the child).
-            // Detach on EOF — see spawnAndConnect's identical fix; otherwise readabilityHandler hot-loops.
-            stderr.fileHandleForReading.readabilityHandler = { [weak self] handle in
-                let data = handle.availableData
-                if data.isEmpty {
-                    handle.readabilityHandler = nil
-                    return
-                }
-                guard let self else { return }
-                if let chunk = String(data: data, encoding: .utf8) {
-                    Task { @MainActor in
-                        self.stderrTail = String((self.stderrTail + chunk).suffix(4_000))
-                    }
-                }
-            }
         }
 
         /// HTTP transport — no subprocess, just an MCP Client backed by `HTTPClientTransport`.
         init(id: String, client: Client, tools: [Tool]) {
             self.id = id
-            self.process = nil
-            self.stdinPipe = nil
-            self.stdoutPipe = nil
-            self.stderrPipe = nil
+            self.child = nil
+            self.stderrBox = nil
             self.client = client
             self.tools = tools
-        }
-
-        deinit {
-            stderrPipe?.fileHandleForReading.readabilityHandler = nil
         }
     }
 
@@ -146,8 +126,8 @@ final class MCPManager: ObservableObject, MCPToolRouting {
         guard let session = sessions.removeValue(forKey: id) else { return }
         // Stdio sessions: terminate the child first so its stdout pipe EOFs and the SDK's read loop
         // can exit, otherwise disconnect() hangs awaiting it. HTTP sessions just disconnect cleanly.
-        if let process = session.process, process.isRunning {
-            process.terminate()
+        if let child = session.child, child.isRunning {
+            child.terminate()
         }
         await session.client.disconnect()
     }
@@ -252,8 +232,8 @@ final class MCPManager: ObservableObject, MCPToolRouting {
             guard let session else { return }
             // Stdio sessions: terminate the child so its stdout pipe EOFs and the SDK's StdioTransport
             // readLoop wakes. HTTP sessions: skip — there's no child to kill, just disconnect.
-            if let process = session.process, process.isRunning {
-                process.terminate()
+            if let child = session.child, child.isRunning {
+                child.terminate()
             }
             // Then kick off the SDK's `disconnect()` on a detached Task. Disconnect resumes any
             // pending request continuations (line 302-304 of swift-sdk Client.swift), which makes
@@ -282,7 +262,7 @@ final class MCPManager: ObservableObject, MCPToolRouting {
             if watchdogFired.isSet {
                 let stderrTail = session.stderrTail.trimmingCharacters(in: .whitespacesAndNewlines)
                 let stderrSnippet = stderrTail.isEmpty ? "" : "\n\nServer stderr:\n\(String(stderrTail.suffix(600)))"
-                if let process = session.process, process.isRunning { process.terminate() }
+                if let child = session.child, child.isRunning { child.terminate() }
                 sessions.removeValue(forKey: serverID)
                 return "MCP tool '\(toolName)' timed out after \(Int(timeout))s. The '\(serverID)' server isn't responding — its upstream may be down (e.g. Docker daemon not running, kubeconfig context unreachable, network blocked).\(stderrSnippet)"
             }
@@ -341,78 +321,52 @@ final class MCPManager: ObservableObject, MCPToolRouting {
     }
 
     /// Spawn one server, connect over stdio, perform handshake, list tools.
+    ///
+    /// WHERE it spawns is decided by `MCPSpawnerRouter`: on the host when the
+    /// Agent Sandbox is off, inside the Linux guest when it is on (and always,
+    /// in the Mac App Store build). Before that seam existed, a sandboxed
+    /// session still ran its MCP servers on the host with the user's full
+    /// filesystem permissions.
     private func spawnAndConnect(id: String, entry: MCPServerEntry) async throws -> Session {
         guard let command = entry.command, !command.isEmpty else {
             throw MCPSpawnError.malformedEntry
         }
         let args = entry.args ?? []
+        let spawner = MCPSpawnerRouter.spawner(sandboxEnabled: AgentSandbox.shared.isEnabled)
 
-        // Pre-flight: confirm the command exists on the user's PATH. Cheaper and clearer than
-        // letting the shell fail with `command not found` and waiting 30s for the MCP handshake to time out.
-        let exists = await Self.commandExists(command)
+        // Pre-flight: confirm the command exists WHERE IT WILL RUN. Cheaper and clearer than letting
+        // the shell fail with `command not found` and waiting 30s for the MCP handshake to time out.
+        let exists = await spawner.commandExists(command)
         if !exists {
             throw MCPSpawnError.commandNotFound(command: command, hint: Self.installHint(for: command))
         }
-
-        let process = Process()
-        // Run via login zsh so PATH includes Homebrew (npx, uvx, docker) — same approach as CLILauncher.
-        // `-l -c "exec ..."` makes the shell exec the target so the FDs survive without an extra hop.
-        process.executableURL = URL(fileURLWithPath: "/bin/zsh")
-        process.arguments = ["-l", "-c", Self.shellEscape(command: command, args: args)]
 
         // cwd resolution order: per-entry `cwd` in mcp.json > the active chat session's working dir
         // (set by ChatView before each spawn) > ~/.mlx-serve/workspace. So filesystem/shell MCP
         // servers automatically inherit the user's current chat cwd unless mcp.json pins one.
         let resolvedCwd = Self.resolveWorkingDirectory(entry.cwd ?? defaultCwd)
-        process.currentDirectoryURL = URL(fileURLWithPath: resolvedCwd)
 
-        // Merge user environment + per-server env. Values from entry.env win.
-        var env = ProcessInfo.processInfo.environment
-        for (k, v) in entry.env ?? [:] { env[k] = v }
-        process.environment = env
+        // Per-server env overrides ONLY. Each spawner lays them over the right
+        // base: the host spawner over the app's macOS environment (as before),
+        // the guest spawner over the guest IMAGE's env — forwarding the whole
+        // macOS environment there would clobber the guest's PATH/HOME with host
+        // paths and break every server in the guest.
+        let env = entry.env ?? [:]
 
-        let stdin = Pipe()
-        let stdout = Pipe()
-        let stderr = Pipe()
-        process.standardInput = stdin
-        process.standardOutput = stdout
-        process.standardError = stderr
-
-        // Capture stderr eagerly so a fast crash (npm install failure, missing native dep, bad args) leaves us
-        // with a useful error message instead of an empty buffer.
-        // Foundation gotcha: once the child closes stderr (EOF), the readabilityHandler keeps firing forever
-        // and `availableData` returns empty data immediately — a hot CPU loop. Detect EOF and detach the
-        // handler so we don't starve the rest of the program.
-        let stderrBox = StderrBox()
-        stderr.fileHandleForReading.readabilityHandler = { handle in
-            let data = handle.availableData
-            if data.isEmpty {
-                handle.readabilityHandler = nil
-                return
-            }
-            if let chunk = String(data: data, encoding: .utf8) {
-                stderrBox.append(chunk)
-            }
-        }
-
-        try process.run()
-
-        // Wrap pipe FDs as System.FileDescriptor so StdioTransport can use them.
-        let inputFD = FileDescriptor(rawValue: stdout.fileHandleForReading.fileDescriptor)
-        let outputFD = FileDescriptor(rawValue: stdin.fileHandleForWriting.fileDescriptor)
-        let transport = StdioTransport(input: inputFD, output: outputFD)
+        let stdio = try await spawner.open(command: command, args: args, cwd: resolvedCwd, env: env)
+        let stderrBox = stdio.stderr
+        let child = stdio.child
+        let transport = StdioTransport(input: stdio.input, output: stdio.output)
 
         let client = Client(name: "mlx-serve-mcp", version: "1.0.0")
 
-        // Race the MCP handshake against a child-exit watcher: if the subprocess dies before connecting
+        // Race the MCP handshake against a child-exit watcher: if the server dies before connecting
         // (e.g. npx exits because the package wasn't found / install failed / runtime missing), we surface
         // the captured stderr immediately instead of waiting out the 30s connect timeout.
         do {
-            try await Self.connectOrFailFast(client: client, transport: transport, process: process, stderrBox: stderrBox)
+            try await Self.connectOrFailFast(client: client, transport: transport, child: child, stderrBox: stderrBox)
         } catch {
-            // Stop the stderr handler and tear down before bubbling up.
-            stderr.fileHandleForReading.readabilityHandler = nil
-            if process.isRunning { process.terminate() }
+            if child.isRunning { child.terminate() }
             throw error
         }
 
@@ -423,9 +377,8 @@ final class MCPManager: ObservableObject, MCPToolRouting {
                 return tools
             }
         } catch {
-            stderr.fileHandleForReading.readabilityHandler = nil
             await client.disconnect()
-            if process.isRunning { process.terminate() }
+            if child.isRunning { child.terminate() }
             // Surface stderr context if listTools failed because the child crashed.
             let tail = stderrBox.snapshot().trimmingCharacters(in: .whitespacesAndNewlines)
             if !tail.isEmpty {
@@ -434,13 +387,7 @@ final class MCPManager: ObservableObject, MCPToolRouting {
             throw error
         }
 
-        // Hand the stderr drain off to the long-lived Session for ongoing capture.
-        stderr.fileHandleForReading.readabilityHandler = nil
-        return Session(
-            id: id, process: process,
-            stdin: stdin, stdout: stdout, stderr: stderr,
-            client: client, tools: listed
-        )
+        return Session(id: id, child: child, stderr: stderrBox, client: client, tools: listed)
     }
 
     /// Race `client.connect(transport:)` against process death. The first to finish wins; the loser
@@ -456,8 +403,13 @@ final class MCPManager: ObservableObject, MCPToolRouting {
     /// Instead we use an unstructured `withCheckedContinuation` and Process's `terminationHandler`
     /// (synchronous, fires from a background queue the moment the OS reaps the child). Whoever
     /// resumes first wins; the other path keeps running but the parent has already moved on.
-    private static func connectOrFailFast(client: Client, transport: StdioTransport, process: Process, stderrBox: StderrBox) async throws {
+    private static func connectOrFailFast(client: Client, transport: StdioTransport, child: MCPChild, stderrBox: StderrBox) async throws {
         let resumed = OneShotResume()
+        // Held so the death watcher can be cancelled once the handshake settles;
+        // otherwise it keeps polling at 10 Hz for the server's whole lifetime.
+        let watcher = TaskBox()
+        defer { watcher.task?.cancel() }
+
         let result: Result<Void, Error> = await withCheckedContinuation { continuation in
             // Path A: the SDK's MCP handshake completes successfully → resume with .success.
             Task {
@@ -472,13 +424,22 @@ final class MCPManager: ObservableObject, MCPToolRouting {
                     }
                 }
             }
-            // Path B: the child process dies before the handshake completes → resume with the
-            // captured stderr. terminationHandler fires synchronously on a background queue.
-            process.terminationHandler = { proc in
-                resumed.tryResume {
-                    let tail = stderrBox.snapshot().trimmingCharacters(in: .whitespacesAndNewlines)
-                    let err = MCPSpawnError.serverExitedEarly(status: proc.terminationStatus, stderr: tail)
-                    continuation.resume(returning: .failure(err))
+            // Path B: the server dies before the handshake completes → resume with the captured
+            // stderr, rather than waiting out the 30s cap.
+            //
+            // Polled rather than `Process.terminationHandler`: a server running in the Agent Sandbox
+            // guest is not a host process and has no such callback. 100 ms is invisible next to a spawn.
+            watcher.task = Task {
+                while !Task.isCancelled {
+                    if !child.isRunning {
+                        resumed.tryResume {
+                            let tail = stderrBox.snapshot().trimmingCharacters(in: .whitespacesAndNewlines)
+                            let err = MCPSpawnError.serverExitedEarly(status: child.exitStatus ?? -1, stderr: tail)
+                            continuation.resume(returning: .failure(err))
+                        }
+                        return
+                    }
+                    try? await Task.sleep(nanoseconds: 100_000_000)
                 }
             }
             // Belt-and-suspenders: hard cap at 30s in case neither path fires (process is alive but
@@ -491,31 +452,20 @@ final class MCPManager: ObservableObject, MCPToolRouting {
             }
         }
         try result.get()
-        // Clear the handler so it doesn't fire later for unrelated terminations.
-        process.terminationHandler = nil
+    }
+
+    /// Lets `connectOrFailFast` cancel the death watcher it starts inside the
+    /// continuation body (which runs synchronously, so the task is set before
+    /// the await resumes).
+    private final class TaskBox: @unchecked Sendable {
+        var task: Task<Void, Never>?
     }
 
     /// Run `command -v <name>` via a login shell. Returns true iff the command resolves on PATH.
     /// Login shell (`zsh -l`) so Homebrew, nvm, asdf, and `~/.local/bin` are honored.
-    nonisolated static func commandExists(_ command: String) async -> Bool {
-        await withCheckedContinuation { continuation in
-            let p = Process()
-            p.executableURL = URL(fileURLWithPath: "/bin/zsh")
-            // Single-quote the command name so weird inputs can't escape into shell injection.
-            let safe = command.replacingOccurrences(of: "'", with: "'\"'\"'")
-            p.arguments = ["-l", "-c", "command -v '\(safe)' >/dev/null 2>&1"]
-            p.standardOutput = Pipe()
-            p.standardError = Pipe()
-            p.terminationHandler = { proc in
-                continuation.resume(returning: proc.terminationStatus == 0)
-            }
-            do {
-                try p.run()
-            } catch {
-                continuation.resume(returning: false)
-            }
-        }
-    }
+    /// Command existence now depends on WHERE the server runs — see
+    /// `MCPSpawner.commandExists`. `MCPManager` no longer probes the host directly.
+
 
     /// Human-readable install hint for the common runtimes our catalog depends on. Falls back to a
     /// generic message for unknown commands.
@@ -548,13 +498,9 @@ final class MCPManager: ObservableObject, MCPToolRouting {
         return path
     }
 
-    private static func shellEscape(command: String, args: [String]) -> String {
-        // Single-quote each token so spaces/specials don't reinterpret. Embed literal single-quotes via '"'"'.
-        let parts = ([command] + args).map { token -> String in
-            "'" + token.replacingOccurrences(of: "'", with: "'\"'\"'") + "'"
-        }
-        return "exec " + parts.joined(separator: " ")
-    }
+    /// Command-line quoting moved to `MCPCommandLine.shellEscape`, shared by the
+    /// host and guest spawners so both build the same invocation.
+
 
     // MARK: - Internal: tool encoding/decoding
 
@@ -606,14 +552,16 @@ final class MCPManager: ObservableObject, MCPToolRouting {
         var parts: [String] = []
         for item in content {
             switch item {
-            case .text(let text):
+            case .text(let text, _, _):
                 parts.append(text)
-            case .image(_, let mimeType, _):
+            case .image(_, let mimeType, _, _):
                 parts.append("[image: \(mimeType)]")
-            case .audio(_, let mimeType):
+            case .audio(_, let mimeType, _, _):
                 parts.append("[audio: \(mimeType)]")
-            case .resource(let uri, let mimeType, _):
-                parts.append("[resource: \(uri) (\(mimeType))]")
+            case .resource(let resource, _, _):
+                parts.append("[resource: \(resource.uri) (\(resource.mimeType ?? "unknown"))]")
+            case .resourceLink(let uri, let name, _, _, let mimeType, _):
+                parts.append("[resource link: \(name) — \(uri)\(mimeType.map { " (\($0))" } ?? "")]")
             }
         }
         return parts.isEmpty ? "(no content)" : parts.joined(separator: "\n")
@@ -656,11 +604,16 @@ enum MCPSpawnError: LocalizedError {
     case serverFailedToList(detail: String)
     case httpConnectFailed(url: String, detail: String)
     case malformedEntry
+    /// Pre-baked-only policy (Mac App Store build): the server isn't in the
+    /// bundled guest image, and fetching it at runtime would download code.
+    case notPrebaked(command: String)
 
     var errorDescription: String? {
         switch self {
         case .commandNotFound(let command, let hint):
             return "'\(command)' not found on PATH. \(hint)"
+        case .notPrebaked(let command):
+            return "This build runs MCP servers from the bundled sandbox image; '\(command)' isn't in it. Use a server from the marketplace (Filesystem, GitHub) or an HTTP MCP server (\"url\" entry in mcp.json)."
         case .serverExitedEarly(let status, let stderr):
             let body = stderr.isEmpty ? "(no stderr captured)" : String(stderr.suffix(800))
             return "MCP server exited before connecting (status \(status)).\n\(body)"

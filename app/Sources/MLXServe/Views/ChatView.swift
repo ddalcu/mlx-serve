@@ -381,6 +381,13 @@ struct ChatView: View {
         NavigationSplitView(columnVisibility: $columnVisibility) {
             ChatSidebar()
                 .navigationSplitViewColumnWidth(min: 180, ideal: 220, max: 280)
+                // No toolbar band over the SIDEBAR column: scrolled session
+                // rows stay fully visible to the window's top edge instead of
+                // dimming under a material strip — the list reads as sitting
+                // on top of the toolbar. The detail column keeps its own
+                // 0.8-opacity band (set in ChatDetailView); the two sections
+                // are styled independently.
+                .toolbarBackground(.hidden, for: .windowToolbar)
         } detail: {
             if let sessionId = appState.activeChatId,
                appState.chatSessions.contains(where: { $0.id == sessionId }) {
@@ -551,9 +558,6 @@ struct ChatDetailView: View {
     // post-generation code set it true to (re)focus the field.
     @State private var inputFocused = false
     @State private var composerHeight: CGFloat = 36
-    /// Measured width of this chat pane — drives the toolbar pill density
-    /// (full captions vs icon-only) via `ChatMetrics.useCompactToggles`.
-    @State private var detailWidth: CGFloat = 0
     // Pre-send intent nudge: when a message looks agentic / MCP-bound but the
     // matching mode is off, confirm before sending. `intentSuppress` remembers a
     // per-session "Send anyway" so we stop nagging that chat (keyed by session
@@ -606,34 +610,23 @@ struct ChatDetailView: View {
     // All three share ChatMetrics' pill geometry — an EXPLICIT height and icon
     // slot, because SF symbols at the same point size have different intrinsic
     // sizes (brain vs wrench vs puzzle) and padding-derived capsules came out
-    // subtly unequal. Rendered inside the chatHeaderBar strip.
+    // subtly unequal. Rendered inside the `headerControls` toolbar item.
 
-    /// The chat pane's header control strip: sandbox badge + working-dir chip
-    /// (agent mode), voice, settings, the mode pills, and the server dot.
-    /// Rendered as OUR OWN row (safeAreaInset), not NSToolbar items — see the
-    /// call site for why.
-    @ViewBuilder
-    private var chatHeaderBar: some View {
+    /// The chat pane's top-right control cluster: voice, settings, and the
+    /// mode pills — rides ONE real ToolbarItem so it lives in the window's
+    /// toolbar band, clickable and aligned with the traffic lights. History,
+    /// in order: these were NSToolbar items (mangled by the » eviction bug
+    /// when agent mode grew them), then a custom safeAreaInset strip
+    /// (double-spaced under the empty toolbar band), then the strip pulled
+    /// into the band via ignoresSafeArea (native look, but the titlebar
+    /// layer swallowed every click). Real toolbar items are the only
+    /// clickable residents of that band, and they are safe ONLY because this
+    /// cluster is static-size: the icon-only compact mode is gone, and the
+    /// workspace folder control lives INSIDE the Agent pill as an
+    /// always-present icon (the MCP-gear pattern) instead of a name-sized
+    /// chip. Do not add anything here whose size changes at runtime.
+    private var headerControls: some View {
         HStack(spacing: 10) {
-            Spacer(minLength: 0)
-            // Sandbox badge: visible when tools are live (Agent or MCP mode)
-            // AND the Agent Sandbox is on — the signal that shell commands
-            // run isolated from this Mac. No badge when tools run on the
-            // host (absence = not sandboxed; never imply safety we don't have).
-            if (isAgentMode || mcpMode) && appState.serverOptions.sandbox.enabled {
-                Button {
-                    openWindow(id: "sandboxTerminal")
-                } label: {
-                    Image(systemName: "lock.shield.fill")
-                        .font(.system(size: 12))
-                        .foregroundStyle(.green)
-                }
-                .buttonStyle(.borderless)
-                .help("Secured by the Agent Sandbox — the agent's shell commands run inside an isolated Linux VM that can only touch the working folder. Click to open the Sandbox Terminal.")
-            }
-            if isAgentMode {
-                WorkingDirectoryIndicator(path: workingDirectoryBinding)
-            }
             Button {
                 startVoiceMode()
             } label: {
@@ -653,44 +646,29 @@ struct ChatDetailView: View {
             }
             .buttonStyle(.borderless)
             .help("Open Settings (⌘,) — server flags, speculative decoding, performance (continuous batching, KV-quant, prefix cache), and per-request defaults.")
-            // Adaptive pills: full when the chat pane is roomy, icon-only when
-            // narrow (MCP drops its gear) — decided from the measured pane width.
-            modePillCluster(compact: ChatMetrics.useCompactToggles(forDetailWidth: detailWidth))
-            Circle()
-                .fill(server.status == .running ? .green : .red)
-                .frame(width: 8, height: 8)
-                .help(server.status == .running ? "Server running" : "Server stopped")
+            modePillCluster
         }
-        .padding(.horizontal, ChatMetrics.gutter)
-        .padding(.vertical, 8)
-        .background(.bar)
-        .overlay(alignment: .bottom) { Divider() }
     }
 
-    /// The whole cluster at one density — chosen by the measured pane width
-    /// (see `chatHeaderBar`).
     @ViewBuilder
-    private func modePillCluster(compact: Bool) -> some View {
+    private var modePillCluster: some View {
         HStack(spacing: ChatMetrics.togglePillSpacing) {
-            thinkToggle(compact: compact)
-            agentToggle(compact: compact)
-            mcpToggle(compact: compact)
+            thinkToggle
+            agentToggle
+            mcpToggle
         }
         .fixedSize()
     }
 
-    /// Shared pill label: fixed icon slot (+ caption when not compact) inside
-    /// the pinned height.
+    /// Shared pill label: fixed icon slot + caption inside the pinned height.
     @ViewBuilder
-    private func pillLabel(icon: String, title: String, isOn: Bool, onColor: Color, compact: Bool) -> some View {
+    private func pillLabel(icon: String, title: String, isOn: Bool, onColor: Color) -> some View {
         HStack(spacing: 4) {
             Image(systemName: icon)
                 .font(.system(size: 11, weight: .medium))
                 .frame(width: ChatMetrics.togglePillIconSize, height: ChatMetrics.togglePillIconSize)
-            if !compact {
-                Text(title)
-                    .font(.caption.weight(.medium))
-            }
+            Text(title)
+                .font(.caption.weight(.medium))
         }
         .foregroundStyle(isOn ? .white : .secondary)
         .padding(.horizontal, ChatMetrics.togglePillPaddingH)
@@ -702,7 +680,7 @@ struct ChatDetailView: View {
         .contentShape(Capsule())
     }
 
-    private func thinkToggle(compact: Bool) -> some View {
+    private var thinkToggle: some View {
         Button {
             if isExternalBridgeSession {
                 // Telegram session: write the shared config so the toggle
@@ -714,32 +692,73 @@ struct ChatDetailView: View {
                 enableThinking.toggle()
             }
         } label: {
-            pillLabel(icon: "brain", title: "Think", isOn: toolbarToggles.thinking, onColor: .blue, compact: compact)
+            pillLabel(icon: "brain", title: "Think", isOn: toolbarToggles.thinking, onColor: .blue)
         }
         .buttonStyle(.plain)
         .help("Thinking Mode (\(toolbarToggles.thinking ? "ON" : "OFF")) — when the model supports it, it'll emit a private reasoning trace before the visible answer. Slower but better on reasoning-heavy prompts.")
     }
 
-    private func agentToggle(compact: Bool) -> some View {
-        Button {
-            if isExternalBridgeSession {
-                // Telegram session: flip the shared config (in sync with
-                // Settings); no per-session approval state applies here.
-                appState.serverOptions.telegram.agentMode.toggle()
-            } else {
-                isAgentMode.toggle()
-                // Re-arm the approval gate every time the user re-enters
-                // Agent mode. "Always allow this session" decays here —
-                // for THIS tab only; other tabs keep their decision.
-                if !isAgentMode { toolAllowList.rearm(sessionId) }
-                // Thinking + tool-calling loops degrade quality on most
-                // local models — auto-off when entering Agent mode.
-                if isAgentMode { enableThinking = false }
+    /// Split pill like `mcpToggle`: the wrench+caption half toggles Agent
+    /// mode, the folder half picks the workspace directory. The folder icon
+    /// is ALWAYS present (static pill size — the » toolbar gotcha); the
+    /// current workspace rides both halves' tooltips.
+    private var agentToggle: some View {
+        HStack(spacing: 0) {
+            Button {
+                if isExternalBridgeSession {
+                    // Telegram session: flip the shared config (in sync with
+                    // Settings); no per-session approval state applies here.
+                    appState.serverOptions.telegram.agentMode.toggle()
+                } else {
+                    isAgentMode.toggle()
+                    // Re-arm the approval gate every time the user re-enters
+                    // Agent mode. "Always allow this session" decays here —
+                    // for THIS tab only; other tabs keep their decision.
+                    if !isAgentMode { toolAllowList.rearm(sessionId) }
+                    // Thinking + tool-calling loops degrade quality on most
+                    // local models — auto-off when entering Agent mode.
+                    if isAgentMode { enableThinking = false }
+                }
+            } label: {
+                HStack(spacing: 4) {
+                    Image(systemName: "wrench")
+                        .font(.system(size: 11, weight: .medium))
+                        .frame(width: ChatMetrics.togglePillIconSize, height: ChatMetrics.togglePillIconSize)
+                    Text("Agent")
+                        .font(.caption.weight(.medium))
+                }
+                .foregroundStyle(toolbarToggles.agent ? .white : .secondary)
+                .padding(.leading, ChatMetrics.togglePillPaddingH)
+                .frame(height: ChatMetrics.togglePillHeight)
+                // Capsule background lives on the OUTER HStack — without an
+                // explicit content shape only the drawn pixels hit-test.
+                .contentShape(Rectangle())
             }
-        } label: {
-            pillLabel(icon: "wrench", title: "Agent", isOn: toolbarToggles.agent, onColor: .orange, compact: compact)
+            .buttonStyle(.plain)
+            Button {
+                if let picked = WorkspacePicker.pickDirectory() {
+                    workingDirectoryBinding.wrappedValue = picked
+                }
+            } label: {
+                Image(systemName: "folder.fill")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(toolbarToggles.agent ? .white.opacity(0.85) : .secondary)
+                    .padding(.trailing, ChatMetrics.togglePillPaddingH)
+                    .padding(.leading, 4)
+                    .frame(height: ChatMetrics.togglePillHeight)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help("""
+            Workspace — the working directory for every Agent tool call.
+            shell, readFile, writeFile, editFile, searchFiles, listFiles, browse all resolve relative paths from here. When the Agent Sandbox is on, this folder is what's mounted at /workspace in the VM.
+            Current: \(session?.workingDirectory ?? "not set")
+            Click to pick a new folder.
+            """)
         }
-        .buttonStyle(.plain)
+        .frame(height: ChatMetrics.togglePillHeight)
+        .background(toolbarToggles.agent ? .orange : Color.secondary.opacity(0.12))
+        .clipShape(Capsule())
         .help("""
         Agent Mode (\(toolbarToggles.agent ? "ON" : "OFF")) — the model runs a tool-calling loop with these 10 built-in tools:
           • shell — run a shell command in the workspace
@@ -753,10 +772,11 @@ struct ChatDetailView: View {
           • webSearch — DuckDuckGo search
           • saveMemory — persist a fact to ~/.mlx-serve/memory.md
         Off: a regular chat with no tools.
+        Workspace: \(session?.workingDirectory ?? "not set") — tap the folder icon to change it.
         """)
     }
 
-    private func mcpToggle(compact: Bool) -> some View {
+    private var mcpToggle: some View {
         HStack(spacing: 0) {
             Button {
                 if isExternalBridgeSession {
@@ -770,16 +790,11 @@ struct ChatDetailView: View {
                     Image(systemName: "puzzlepiece.extension")
                         .font(.system(size: 11, weight: .medium))
                         .frame(width: ChatMetrics.togglePillIconSize, height: ChatMetrics.togglePillIconSize)
-                    if !compact {
-                        Text("MCP")
-                            .font(.caption.weight(.medium))
-                    }
+                    Text("MCP")
+                        .font(.caption.weight(.medium))
                 }
                 .foregroundStyle(toolbarToggles.mcp ? .white : .secondary)
                 .padding(.leading, ChatMetrics.togglePillPaddingH)
-                // Compact drops the gear half, so the toggle carries the
-                // trailing padding itself to stay a symmetric capsule.
-                .padding(.trailing, compact ? ChatMetrics.togglePillPaddingH : 0)
                 .frame(height: ChatMetrics.togglePillHeight)
                 // The capsule background lives on the OUTER HStack, so this
                 // button's label is transparent — without an explicit content
@@ -788,19 +803,17 @@ struct ChatDetailView: View {
                 .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            if !compact {
-                Button { showMCPMarketplace = true } label: {
-                    Image(systemName: "gearshape.fill")
-                        .font(.system(size: 10, weight: .medium))
-                        .foregroundStyle(toolbarToggles.mcp ? .white.opacity(0.85) : .secondary)
-                        .padding(.trailing, ChatMetrics.togglePillPaddingH)
-                        .padding(.leading, 4)
-                        .frame(height: ChatMetrics.togglePillHeight)
-                        .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-                .help("Open MCP Marketplace — browse and enable Model Context Protocol servers (GitHub, Filesystem, Slack, Notion, Playwright, Docker, etc.). Each enabled server's tools become callable in Agent Mode.")
+            Button { showMCPMarketplace = true } label: {
+                Image(systemName: "gearshape.fill")
+                    .font(.system(size: 10, weight: .medium))
+                    .foregroundStyle(toolbarToggles.mcp ? .white.opacity(0.85) : .secondary)
+                    .padding(.trailing, ChatMetrics.togglePillPaddingH)
+                    .padding(.leading, 4)
+                    .frame(height: ChatMetrics.togglePillHeight)
+                    .contentShape(Rectangle())
             }
+            .buttonStyle(.plain)
+            .help("Open MCP Marketplace — browse and enable Model Context Protocol servers (GitHub, Filesystem, Slack, Notion, Playwright, Docker, etc.). Each enabled server's tools become callable in Agent Mode.")
         }
         .frame(height: ChatMetrics.togglePillHeight)
         .background(toolbarToggles.mcp ? .purple : Color.secondary.opacity(0.12))
@@ -911,6 +924,13 @@ struct ChatDetailView: View {
                     DocumentFolderChip(index: docIndex) {
                         docIndex.cancel()
                         appState.documentIndexes.removeValue(forKey: sessionId)
+                        // Detach is a user decision — drop the persisted pick
+                        // too, or the folder would re-attach on next launch.
+                        if let idx = appState.chatSessions.firstIndex(where: { $0.id == sessionId }) {
+                            appState.chatSessions[idx].attachedFolderPath = nil
+                        }
+                        SecurityScopedBookmark.clear(
+                            name: SecurityScopedBookmark.attachedFolderName(sessionId))
                     }
                 }
 
@@ -1011,14 +1031,6 @@ struct ChatDetailView: View {
             .padding(.horizontal, ChatMetrics.gutter)
             .padding(.vertical, 8)
         }
-        // Track the pane's width for the toolbar pill density decision.
-        .background(
-            GeometryReader { geo in
-                Color.clear
-                    .onAppear { detailWidth = geo.size.width }
-                    .onChange(of: geo.size.width) { _, w in detailWidth = w }
-            }
-        )
         .onDrop(of: [.image, .pdf, .audio], isTargeted: nil) { providers in
             for provider in providers {
                 if provider.hasItemConformingToTypeIdentifier(UTType.pdf.identifier) {
@@ -1057,17 +1069,32 @@ struct ChatDetailView: View {
             }
             return true
         }
-        // Header control strip — deliberately NOT NSToolbar items. The AppKit
-        // bridge does not re-measure a toolbar item whose SwiftUI content
-        // changes size (enabling Agent mode grows the strip with the shield +
-        // workspace chip), so NSToolbar clipped the controls into a mangled »
-        // overflow menu until a window resize forced a fresh layout — and it
-        // did so REGARDLESS of grouping (separate items, ViewThatFits, one
-        // merged item all failed). A plain view row pinned to the pane's top
-        // has no overflow mechanism to misfire.
-        .safeAreaInset(edge: .top, spacing: 0) {
-            chatHeaderBar
+        // ONE static-size toolbar item — see `headerControls` for why this is
+        // safe despite the » eviction gotcha (its content never changes size).
+        .toolbar {
+            if #available(macOS 26.0, *) {
+                // Liquid Glass gives every toolbar item its own capsule
+                // background + border; hide it so the controls float bare on
+                // the content, matching the sidebar's seamless look.
+                ToolbarItem(placement: .primaryAction) {
+                    headerControls
+                }
+                .sharedBackgroundVisibility(.hidden)
+            } else {
+                ToolbarItem(placement: .primaryAction) {
+                    headerControls
+                }
+            }
         }
+        // The bar background is the window background color at 0.8 opacity —
+        // not `.hidden` (transcript bubbles scrolled under the band and bled
+        // through the controls), not the default material (a visibly
+        // different translucent strip), and not fully opaque (too blunt a
+        // cutoff against the transcript). The slight translucency reads as
+        // glass: passing content dims to a hint instead of bleeding through.
+        // The per-item glass capsule is a separate layer, hidden above.
+        .toolbarBackground(Color(nsColor: .windowBackgroundColor).opacity(0.8), for: .windowToolbar)
+        .toolbarBackground(.visible, for: .windowToolbar)
         .sheet(isPresented: $showMCPMarketplace) {
             MCPMarketplaceView()
                 .environmentObject(mcpManager)
@@ -1099,6 +1126,7 @@ struct ChatDetailView: View {
         .onAppear {
             inputFocused = true
             syncTogglesFromSession()
+            restoreAttachedFolderIfNeeded()
             scrollMonitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { event in
                 if event.scrollingDeltaY > 0 {
                     // Scrolling up — disengage auto-scroll
@@ -1190,6 +1218,7 @@ struct ChatDetailView: View {
             // keyed by session id, so each tab keeps its own decision across
             // switches (a session re-arms only when its Agent toggle goes off).
             syncTogglesFromSession()
+            restoreAttachedFolderIfNeeded()
         }
     }
 
@@ -1213,8 +1242,37 @@ struct ChatDetailView: View {
     /// every entry point behaves identically. Embeds on the local server's GPU;
     /// auto-downloads the default encoder model (35 MB, one-time) when none is
     /// available. Server down → lexical-only retrieval. Must run on the main actor.
+    ///
+    /// The pick is persisted (path on the session, security-scoped bookmark in
+    /// defaults) so the index can be rebuilt after a relaunch — under the App
+    /// Sandbox the panel's grant dies with the process; the bookmark is what
+    /// makes the folder reachable again. See `restoreAttachedFolderIfNeeded`.
     private func attachDocumentFolder(_ url: URL) {
+        SecurityScopedBookmark.store(url, name: SecurityScopedBookmark.attachedFolderName(sessionId))
+        if let idx = appState.chatSessions.firstIndex(where: { $0.id == sessionId }) {
+            appState.chatSessions[idx].attachedFolderPath = url.path
+        }
         appState.documentIndexes[sessionId]?.cancel()
+        let index = DocumentIndex(folderURL: url,
+                                  embedderProvider: ServerEmbedding.autoProvider(port: server.port))
+        appState.documentIndexes[sessionId] = index
+        index.startIndexing()
+    }
+
+    /// Rebuild a persisted attached folder's index after a relaunch. The view is
+    /// reused across tabs, so this runs on appear AND on every session change;
+    /// a session with a live index (or none attached) is a no-op.
+    private func restoreAttachedFolderIfNeeded() {
+        guard !isExternalBridgeSession,
+              appState.documentIndexes[sessionId] == nil,
+              let path = session?.attachedFolderPath else { return }
+        // Resolve the bookmark first (starts the sandbox grant). A missing or
+        // dead bookmark (DMG build, folder relocated) falls back to the raw
+        // path — outside the sandbox it is directly accessible anyway.
+        let url = SecurityScopedBookmark.startAccessOnce(
+            name: SecurityScopedBookmark.attachedFolderName(sessionId))
+            ?? URL(fileURLWithPath: path)
+        guard FileManager.default.fileExists(atPath: url.path) else { return }
         let index = DocumentIndex(folderURL: url,
                                   embedderProvider: ServerEmbedding.autoProvider(port: server.port))
         appState.documentIndexes[sessionId] = index
@@ -1441,8 +1499,16 @@ struct ChatDetailView: View {
             set: { newValue in
                 if let idx = appState.chatSessions.firstIndex(where: { $0.id == sessionId }) {
                     appState.chatSessions[idx].workingDirectory = newValue
+                    // Persist the panel's grant: without a security-scoped
+                    // bookmark, a folder outside the container is unreachable
+                    // after relaunch under the App Sandbox. Resolved at the
+                    // agent-turn seam (ChatTurnEngine.runAgentTurn).
+                    let slot = SecurityScopedBookmark.workingFolderName(sessionId)
                     if let dir = newValue {
                         appState.agentMemory.recordDirectory(dir)
+                        SecurityScopedBookmark.store(URL(fileURLWithPath: dir), name: slot)
+                    } else {
+                        SecurityScopedBookmark.clear(name: slot)
                     }
                 }
             }
@@ -1799,50 +1865,8 @@ struct GeneratingIndicator: View {
     }
 }
 
-/// Reads macOS GPU utilization and memory pressure via IOKit/Mach (same APIs as status.zig).
-enum SystemMetrics {
-
-    /// GPU utilization percentage (0–100) via IOKit AGXAccelerator.
-    static func gpuUtilization() -> UInt32 {
-        var iter: io_iterator_t = 0
-        guard let matching = IOServiceMatching("AGXAccelerator") else { return 0 }
-        guard IOServiceGetMatchingServices(kIOMainPortDefault, matching, &iter) == KERN_SUCCESS else { return 0 }
-        defer { IOObjectRelease(iter) }
-
-        let entry = IOIteratorNext(iter)
-        guard entry != 0 else { return 0 }
-        defer { IOObjectRelease(entry) }
-
-        var propsRef: Unmanaged<CFMutableDictionary>?
-        guard IORegistryEntryCreateCFProperties(entry, &propsRef, kCFAllocatorDefault, 0) == KERN_SUCCESS,
-              let props = propsRef?.takeRetainedValue() as? [String: Any],
-              let perf = props["PerformanceStatistics"] as? [String: Any],
-              let util = perf["Device Utilization %"] as? Int else { return 0 }
-        return UInt32(min(max(util, 0), 100))
-    }
-
-    /// System memory pressure as percentage (0–100) via Mach host_statistics64.
-    static func memoryPressure() -> UInt32 {
-        var totalMem: UInt64 = 0
-        var len = MemoryLayout<UInt64>.size
-        guard sysctlbyname("hw.memsize", &totalMem, &len, nil, 0) == 0, totalMem > 0 else { return 0 }
-
-        var pageSize: vm_size_t = 0
-        guard host_page_size(mach_host_self(), &pageSize) == KERN_SUCCESS, pageSize > 0 else { return 0 }
-
-        var stats = vm_statistics64()
-        var count = mach_msg_type_number_t(MemoryLayout<vm_statistics64>.size / MemoryLayout<Int32>.size)
-        let result = withUnsafeMutablePointer(to: &stats) { ptr in
-            ptr.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { intPtr in
-                host_statistics64(mach_host_self(), HOST_VM_INFO64, intPtr, &count)
-            }
-        }
-        guard result == KERN_SUCCESS else { return 0 }
-
-        let used = (UInt64(stats.active_count) + UInt64(stats.wire_count) + UInt64(stats.compressor_page_count)) * UInt64(pageSize)
-        return UInt32(used * 100 / totalMem)
-    }
-}
+// `SystemMetrics` (GPU utilization, memory pressure, and the libproc/Mach
+// replacements for lsof/ps/vm_stat) lives in Services/SystemMetrics.swift.
 
 // MARK: - Message Bubble
 

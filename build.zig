@@ -44,8 +44,11 @@ pub fn build(b: *std.Build) void {
     // Version from build option or default
     const version = b.option([]const u8, "version", "Version string") orelse "0.1.0-dev";
 
+    const mas = b.option(bool, "mas", "MAS build (no curl/model-pull subprocess)") orelse false;
+
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "version", version);
+    build_options.addOption(bool, "mas", mas);
     // false for the macOS exe/tests; the iOS static-lib step (`zig build ios-lib`)
     // builds its own options with ios=true so the engine swaps the macOS-only
     // ds4 + llama.cpp engines for no-op stubs (iOS serves MLX safetensors only).
@@ -181,6 +184,19 @@ pub fn build(b: *std.Build) void {
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
 
+    // ── vz-agent: the Agent Sandbox's guest-side binary.
+    //
+    // A standalone static aarch64-linux-musl ELF (~200 KB) that the app injects
+    // into the guest rootfs before boot, exactly like `/.vz-init`. It serves the
+    // vsock exec protocol (`src/vz_agent.zig`), replacing the hvc1 console shell.
+    //
+    // It is NOT imported by main.zig — it links nothing but libc and never runs
+    // on macOS. Its tests do, though: `serveConnection` is OS-agnostic, so the
+    // whole request → spawn → stream → exit path is exercised over a socketpair
+    // here on the host. Wire them into `zig build test` explicitly, since the
+    // main test module's root never reaches this file.
+    addVzAgent(b, target, optimize, test_step);
+
     // ── iOS on-device engine: a static library (libmlxserve.a) linking the
     //    MLX-only decode path. ds4 + llama.cpp are stubbed (build_options.ios =
     //    true). Two slices: `zig build ios-lib` (device, arm64-iphoneos) and
@@ -193,6 +209,65 @@ pub fn build(b: *std.Build) void {
     const ios_include = b.option([]const u8, "ios-include", "Include dir for webp/stb headers when cross-compiling the iOS lib") orelse "/opt/homebrew/include";
     addIosLib(b, version, ios_include, .{ .step = "ios-lib", .abi = .none, .sdk = "iphoneos" });
     addIosLib(b, version, ios_include, .{ .step = "ios-lib-sim", .abi = .simulator, .sdk = "iphonesimulator" });
+}
+
+/// `zig build vz-agent` → `zig-out/guest/vz-agent` (static aarch64 Linux ELF),
+/// plus the host-side unit tests wired into `zig build test`.
+fn addVzAgent(
+    b: *std.Build,
+    host_target: std.Build.ResolvedTarget,
+    host_optimize: std.builtin.OptimizeMode,
+    test_step: *std.Build.Step,
+) void {
+    // Guest binary. musl + static so it runs on ANY base image — the bundled
+    // Debian rootfs for the App Store build, or a user-chosen alpine/slim image.
+    const guest_target = b.resolveTargetQuery(.{
+        .cpu_arch = .aarch64,
+        .os_tag = .linux,
+        .abi = .musl,
+    });
+    const guest = b.addExecutable(.{
+        .name = "vz-agent",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/vz_agent.zig"),
+            .target = guest_target,
+            // Size, not speed: it shuttles bytes between a socket and a pipe.
+            .optimize = .ReleaseSmall,
+            .link_libc = true,
+        }),
+    });
+    const install = b.addInstallArtifact(guest, .{
+        .dest_dir = .{ .override = .{ .custom = "guest" } },
+    });
+    const step = b.step("vz-agent", "Build the Agent Sandbox guest binary (static aarch64-linux)");
+    step.dependOn(&install.step);
+
+    // Host-side tests of the same source.
+    const tests = b.addTest(.{
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/vz_agent.zig"),
+            .target = host_target,
+            .optimize = host_optimize,
+            .link_libc = true,
+        }),
+    });
+    test_step.dependOn(&b.addRunArtifact(tests).step);
+
+    // A macOS-native build of the SAME source, which listens on a unix socket
+    // instead of vsock. `GuestExecInteropTests` (Swift) drives it, so the host
+    // frame driver and the guest agent are proven against each other without a
+    // VM — the golden-byte tests alone can't catch a streaming bug.
+    const host_agent = b.addExecutable(.{
+        .name = "vz-agent-host",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/vz_agent.zig"),
+            .target = host_target,
+            .optimize = host_optimize,
+            .link_libc = true,
+        }),
+    });
+    const host_step = b.step("vz-agent-host", "Build vz-agent natively (unix-socket mode, for interop tests)");
+    host_step.dependOn(&b.addInstallArtifact(host_agent, .{}).step);
 }
 
 const IosSlice = struct { step: []const u8, abi: std.Target.Abi, sdk: []const u8 };

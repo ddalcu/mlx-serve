@@ -356,6 +356,27 @@ Matches mlx-lm (Python) generation speed while using less memory and starting 3�
 Run 3 times and take the average of runs 2-3 (run 1 includes model loading from disk).
 </details>
 
+## Tuning for maximum performance
+
+The defaults are already the fast path — **if you have plenty of RAM, the fastest configuration is the one you get out of the box** (dense KV cache, PLD on, prefix + tokenize caches on). Every speed-relevant knob is a *memory-for-speed* trade in one direction or the other; here's what each one actually costs, measured live on Gemma 4 E4B 4-bit (Apple M-series):
+
+| Knob (CLI flag / Settings) | Default | What it does to speed | Flip it when… |
+|---|---|---|---|
+| **KV cache quantization** (`--kv-quant`, Settings ▸ Performance) | off | ≈ **−10% decode** at 2–4K context, worse as context grows (every token pays a dequantize step). Saves 2× (8-bit) / 4× (4-bit) KV RAM. | …memory is the constraint: long contexts or big models on a 16 GB Mac. **Leave off for max tokens/sec.** |
+| **PLD speculative decoding** (`--pld`) | on | **+44–61%** on agent loops, code editing, RAG (anywhere output echoes the prompt). Auto-gates itself off on novel prose. | Leave on. Use `--no-pld` only for clean apples-to-apples benchmark numbers. |
+| **Sampling** (`temperature` / `top_p` / `top_k`) | model defaults | Full sampling costs **~6% decode** vs greedy (`temperature: 0`) — a per-token top-k/top-p pass over a 262K vocab isn't free. | Use temp 0 for benchmarks and deterministic runs; keep sampling for chat quality. |
+| **Continuous batching** (`--max-concurrent`) | 1 | ~1.6× *total* throughput at 4-way on dense models, at some per-request latency cost. | …several clients share the server. |
+| **Prefix cache** (`--prefix-cache-entries/-mem`, SSD tier opt-in) | on | Warm TTFT: repeated system prompts / multi-turn chats skip re-prefill (an 11K-token restart TTFT drops 5.9 s → 0.7 s with the SSD tier). | Leave on. Cap entries on RAM-tight Macs (the app does this automatically). |
+| **Drafter / native MTP** (`--drafter`, `mtp/` sidecar) | opt-in | Up to **+47%** (Gemma 4 dense) / **1.8×** (Qwen 3.6 MTP checkpoints) on code-edit loops. | …you run those model families a lot — see [Speculative Decoding](#speculative-decoding). |
+
+Building from source? **Always `zig build -Doptimize=ReleaseFast`** — a bare `zig build` produces a Debug binary that's 2–4× slower and looks like a regression.
+
+**Benchmarking mlx-serve fairly:**
+
+- Bench a clean server (`--kv-quant off --no-pld`, temp 0), not the app's production instance — the app may be running with agent-tuned settings (KV-quant, PLD, sampling defaults) that trade benchmark tokens/sec for memory and agent throughput.
+- mlx-serve puts SSE bytes on the wire immediately, so benchmark tools that time "first response" measure header arrival, not prompt processing — compare **end-to-end TTFT** and **decode tok/s**, and prefer ≥256-token generations (32-token windows under-amortize per-request overhead).
+- `./tests/bench.sh --family gemma --lmstudio` runs the same prompts against both engines and renders the comparison chart.
+
 ## Speculative Decoding
 
 Two flavors, both greedy-equivalent (byte-identical at temp=0 within the first 30 tokens; mathematically exact at temp > 0 via the Leviathan probability-ratio sampler):

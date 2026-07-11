@@ -305,6 +305,10 @@ class AppState: ObservableObject {
         processRegistry.killSession(id)
         documentIndexes[id]?.cancel()
         documentIndexes.removeValue(forKey: id)
+        // Drop the session's security-scoped bookmarks with it — a deleted chat
+        // must not keep durable access to the folders it was granted.
+        SecurityScopedBookmark.clear(name: SecurityScopedBookmark.workingFolderName(id))
+        SecurityScopedBookmark.clear(name: SecurityScopedBookmark.attachedFolderName(id))
         chatSessions.removeAll { $0.id == id }
         // Stop the in-flight turn if it belonged to this session — otherwise
         // it ghost-runs invisibly, holds the shared engine (every other chat

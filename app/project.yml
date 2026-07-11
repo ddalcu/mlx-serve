@@ -1,0 +1,75 @@
+name: MLXCore
+options:
+  createIntermediateGroups: true
+  deploymentTarget:
+    macOS: "26.0"   # matches Info-MAS.plist LSMinimumSystemVersion
+
+settings:
+  base:
+    # swift-sdk 0.10.x breaks under Swift 6 language mode — same pin rationale
+    # as build.sh's `-swift-version 5`.
+    SWIFT_VERSION: "5.0"
+    # The script phases write into the built .app and read Homebrew paths.
+    ENABLE_USER_SCRIPT_SANDBOXING: "NO"
+
+packages:
+  swift-sdk:
+    url: https://github.com/modelcontextprotocol/swift-sdk.git
+    minVersion: 0.12.1
+    maxVersion: 0.13.0
+  swift-collections:
+    url: https://github.com/apple/swift-collections.git
+    majorVersion: 1.0.0
+  swift-ogg:
+    url: https://github.com/element-hq/swift-ogg.git
+    majorVersion: 0.0.4
+
+targets:
+  MLXCore:
+    type: application
+    platform: macOS
+    sources:
+      # Mirrors Package.swift's target (path: Sources/MLXServe, exclude: Resources).
+      - path: Sources/MLXServe
+        excludes:
+          - Resources
+      # build.sh copies Resources/* flat into Contents/Resources — the
+      # resources build phase does the same.
+      - path: Sources/MLXServe/Resources
+        buildPhase: resources
+      - path: PrivacyInfo.xcprivacy
+        buildPhase: resources
+    dependencies:
+      - package: swift-sdk
+        product: MCP
+      - package: swift-collections
+        product: OrderedCollections
+      - package: swift-ogg
+        product: SwiftOGG
+    settings:
+      base:
+        # CFBundleExecutable in Info-MAS.plist is MLXCore.
+        PRODUCT_NAME: MLXCore
+        PRODUCT_BUNDLE_IDENTIFIER: com.dalcu.mlx-core.mas
+        INFOPLIST_FILE: Info-MAS.plist
+        GENERATE_INFOPLIST_FILE: "NO"
+        CODE_SIGN_ENTITLEMENTS: MLXCore-MAS.entitlements
+        CODE_SIGN_STYLE: Automatic
+        DEVELOPMENT_TEAM: "${APPLE_TEAM_ID}"
+        # MAS uses the App Sandbox, not hardened runtime (that's the DMG path).
+        ENABLE_HARDENED_RUNTIME: "NO"
+        # The embed phase drops libllama/libmlx* into Contents/Frameworks.
+        LD_RUNPATH_SEARCH_PATHS: "$(inherited) @executable_path/../Frameworks"
+      configs:
+        debug:
+          SWIFT_ACTIVE_COMPILATION_CONDITIONS: "DEBUG MAS_BUILD"
+        release:
+          SWIFT_ACTIVE_COMPILATION_CONDITIONS: "MAS_BUILD"
+    preBuildScripts:
+      - name: Build mlx-serve (Zig) + guest assets
+        script: exec bash "${SRCROOT}/../scripts/xcode-build-server.sh"
+        basedOnDependencyAnalysis: false
+    postBuildScripts:
+      - name: Embed mlx-serve, engine dylibs & guest
+        script: exec bash "${SRCROOT}/../scripts/xcode-embed-server.sh"
+        basedOnDependencyAnalysis: false

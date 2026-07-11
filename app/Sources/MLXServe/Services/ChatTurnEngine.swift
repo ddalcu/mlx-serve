@@ -262,7 +262,9 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
         // short and free of URLs/Markdown.
         var messagesArray = history
         if config.voiceStyle {
-            messagesArray.insert(["role": "system", "content": VoicePrompt.systemPrompt()], at: 0)
+            messagesArray.insert(["role": "system",
+                                  "content": VoicePrompt.systemPrompt(phrase: appState.serverOptions.wakePhrase)],
+                                 at: 0)
         }
 
         // Streaming placeholder for the UI — appended AFTER the request body is
@@ -347,6 +349,13 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
         isGenerating = true
         let api = APIClient()
         let workDir = config.workingDirectory
+        // Under the App Sandbox a user-picked working folder outside the
+        // container is unreachable after a relaunch until its security-scoped
+        // bookmark is resolved. This is the single seam every agent turn passes
+        // through (chat window, Quick Launcher, voice), so shell/file tools and
+        // MCP servers below always run with the grant live. No bookmark stored
+        // (default workspace, DMG build) → no-op.
+        SecurityScopedBookmark.startAccessOnce(name: SecurityScopedBookmark.workingFolderName(sessionId))
 
         generationTask = Task { [weak self] in
             guard let self else { return }
@@ -512,7 +521,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                                                     grounding: grounding)
             // Voice mode: tools/thinking run silently; only the final answer is
             // spoken, so steer it to a short, speakable reply (no URLs/Markdown).
-            if config.voiceStyle { systemPrompt = VoicePrompt.decorate(systemPrompt) }
+            if config.voiceStyle { systemPrompt = VoicePrompt.decorate(systemPrompt, phrase: appState.serverOptions.wakePhrase) }
             var messages: [[String: Any]] = [["role": "system", "content": systemPrompt]]
             // Some models (e.g. Gemma 4 E4B) can't generate after tool results without
             // a user message. Add a nudge so the model knows to synthesize a response —

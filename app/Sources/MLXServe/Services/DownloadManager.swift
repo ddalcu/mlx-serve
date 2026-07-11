@@ -1086,29 +1086,6 @@ class DownloadManager: ObservableObject {
         return nil
     }
 
-    /// Decide whether to surface the "Pair with drafter" chip on a Model
-    /// Browser row. Three rules, in order:
-    ///   1. Drafter checkpoints themselves never offer pairing.
-    ///   2. GGUF repos never offer pairing — the Gemma 4 assistant drafter
-    ///      is an MLX-only kernel (cross-attends into the target's MLX KV
-    ///      cache), so a GGUF base served by llama.cpp can't use it.
-    ///   3. Otherwise, if the path looks like a Gemma 4 size token, return
-    ///      the matching variant.
-    /// Pulled out of `ModelBrowserRow.pairableVariant` so it's directly
-    /// unit-testable — the row's `@EnvironmentObject` makes the view itself
-    /// awkward to construct in isolation.
-    nonisolated static func drafterPairingVariant(
-        repoId: String,
-        isDrafter: Bool,
-        isGgufRepo: Bool
-    ) -> GemmaVariant? {
-        if isDrafter { return nil }
-        if isGgufRepo { return nil }
-        let lower = repoId.lowercased()
-        guard lower.contains("gemma-4") else { return nil }
-        return gemmaVariantFor(modelPath: lower, isMoE: lower.contains("26b-a4b"))
-    }
-
     func gemmaVariantFor(modelPath: String, isMoE: Bool) -> GemmaVariant? {
         Self.gemmaVariantFor(modelPath: modelPath, isMoE: isMoE)
     }

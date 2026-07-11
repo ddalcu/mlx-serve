@@ -30,6 +30,11 @@ def main():
 
     body = json.loads(sys.stdin.read())
     body["stream"] = True
+    # Ask for usage on the final chunk (OpenAI stream_options). Engines that
+    # batch several tokens into one SSE delta (stream-interval > 1) would
+    # otherwise read low from piece-counting alone; usage_ct below corrects
+    # that. Engines that ignore stream_options keep the piece-count path.
+    body.setdefault("stream_options", {"include_usage": True})
 
     req = urllib.request.Request(
         url,
@@ -40,6 +45,7 @@ def main():
     first = last = None
     n = 0
     rn = 0
+    usage_ct = 0
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         for raw in resp:
             line = raw.decode("utf-8", "replace").strip()
@@ -52,6 +58,9 @@ def main():
                 obj = json.loads(payload)
             except json.JSONDecodeError:
                 continue
+            u = obj.get("usage") or {}
+            if u.get("completion_tokens"):
+                usage_ct = int(u["completion_tokens"])
             choices = obj.get("choices") or []
             if not choices:
                 continue
@@ -70,6 +79,11 @@ def main():
                 last = now
 
     total = n + rn
+    # Prefer the engine's own completion_tokens when it exceeds the piece
+    # count (deltas were batched); keep the piece count as the floor (LM
+    # Studio's usage undercounts once reasoning is involved).
+    if usage_ct > total:
+        total = usage_ct
     if first is None or last is None or total < 2 or last <= first:
         print("0|%d|%d" % (total, rn))
         return

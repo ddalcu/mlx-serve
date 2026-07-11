@@ -29,13 +29,22 @@ enum CLIInstaller {
     enum InstallError: LocalizedError {
         case binaryNotFound
         case adminFailed(String)
+        case unavailableInThisBuild
 
         var errorDescription: String? {
             switch self {
             case .binaryNotFound: return "mlx-serve binary not found in the app bundle."
             case .adminFailed(let msg): return msg
+            case .unavailableInThisBuild:
+                return "CLI install isn't available in the App Store build (it can't symlink outside the sandbox). Download the CLI from GitHub, or use the direct-download build of the app."
             }
         }
+    }
+
+    /// The App Store build can't symlink onto the user's PATH — writing to a
+    /// shared location and the `osascript` admin prompt are both disallowed.
+    static func requireInstallable() throws {
+        guard BuildFeatures.current.cliInstaller else { throw InstallError.unavailableInThisBuild }
     }
 
     // MARK: - Pure decision logic
@@ -116,6 +125,7 @@ enum CLIInstaller {
     /// or dangling link/file at the target name first.
     @discardableResult
     static func installIntoHomeBin(directory: String, binarySource: String) throws -> String {
+        try requireInstallable()
         let fm = FileManager.default
         try fm.createDirectory(atPath: directory, withIntermediateDirectories: true)
         let link = directory + "/" + linkName
@@ -132,6 +142,7 @@ enum CLIInstaller {
     /// Runs the Process off the main thread (call from a background task).
     @discardableResult
     static func installWithAdmin(binarySource: String) throws -> String {
+        try requireInstallable()
         let shellCmd = adminInstallShellCommand(binarySource: binarySource)
         let escaped = shellCmd
             .replacingOccurrences(of: "\\", with: "\\\\")

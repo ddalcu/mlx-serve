@@ -16,6 +16,27 @@ import Foundation
 enum WakeWord {
     static let defaultPhrase = "hey loki"
 
+    /// Normalize a user-typed phrase from Settings ("  Hey,  JARVIS! " →
+    /// "hey jarvis"). Returns nil when no word survives — callers fall back
+    /// to `defaultPhrase` so a blank field can never produce a gate that
+    /// matches nothing.
+    static func normalizePhrase(_ raw: String) -> String? {
+        let toks = tokenize(raw).map(\.norm)
+        return toks.isEmpty ? nil : toks.joined(separator: " ")
+    }
+
+    /// Title-cased phrase for UI labels and prompts ("hey jarvis" → "Hey Jarvis").
+    static func display(_ phrase: String) -> String {
+        phrase.split(separator: " ")
+            .map { $0.prefix(1).uppercased() + $0.dropFirst() }
+            .joined(separator: " ")
+    }
+
+    /// The assistant's name — the phrase's last word ("hey jarvis" → "Jarvis").
+    static func assistantName(_ phrase: String) -> String {
+        display(phrase).split(separator: " ").last.map(String.init) ?? display(phrase)
+    }
+
     /// Stand-alone greetings tolerated before the name, so "Loki", "Hi Loki" and
     /// "OK Loki" all open the assistant just like "Hey Loki".
     private static let greetings = ["hey", "hi", "hello", "ok", "okay", "yo"]

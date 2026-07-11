@@ -38,6 +38,14 @@ enum SandboxSmoke {
         cfg.workspacePath = share
         cfg.guestWorkspacePath = "/workspace"
         cfg.workdir = share != nil ? "/workspace" : "/"
+
+        // Pick the transport exactly like production: vsock when the kernel has
+        // it AND we have a vz-agent to inject, else the legacy console shell.
+        let agentBinary = AgentSandbox.agentBinaryPath()
+        let kernelData = try? Data(contentsOf: URL(fileURLWithPath: kernel), options: .mappedIfSafe)
+        cfg.transport = AgentSandbox.chooseTransport(kernelData: kernelData, agentBinary: agentBinary)
+        cfg.agentBinaryPath = agentBinary
+        log("[smoke] transport=\(cfg.transport) agent=\(agentBinary ?? "none")")
         cfg.ramBytes = ramGB * 1024 * 1024 * 1024
 
         do {
@@ -73,8 +81,13 @@ enum SandboxSmoke {
             check("echo HELLO_FROM_SWIFT_$((6*7))", expectContains: "HELLO_FROM_SWIFT_42")
             check("uname -sm", expectContains: "Linux")
             check("sh -c 'exit 7'", expectExit: 7)                     // exit code plumbed
-            check("X=hi; echo state_$X", expectContains: "state_hi")   // shell state persists
-            check("echo persisted_$X", expectContains: "persisted_hi") // …across exec calls
+            check("X=hi; echo state_$X", expectContains: "state_hi")   // env within one command
+            if cfg.transport == .legacyConsole {
+                // Only the legacy persistent shell carries state between execs.
+                // Under vsock each command is its own `sh -c` (matches the host
+                // path), so this would deliberately NOT persist.
+                check("echo persisted_$X", expectContains: "persisted_hi")
+            }
             if share != nil {
                 check("ls /workspace", expectExit: 0)                  // virtiofs share works
             }
@@ -96,7 +109,7 @@ enum SandboxSmoke {
                 } else {
                     log("[smoke] (real provisioning: fetch kernel + pull \(Self.guestArchNote))")
                 }
-                let image = env["SANDBOX_SMOKE_IMAGE"] ?? env["CONTAIN_SMOKE_IMAGE"] ?? "ddalcu/agent-shell"
+                let image = env["SANDBOX_SMOKE_IMAGE"] ?? env["CONTAIN_SMOKE_IMAGE"] ?? "ddalcu/agent-shell-mlxserve"
                 AgentSandbox.shared.configure(enabled: true, baseImage: image)
                 let handler = ShellHandler(timeoutSeconds: 40)
                 let routed = syncAwait {
@@ -258,7 +271,7 @@ enum SandboxSmoke {
     }
 
     static var guestArchNote: String {
-        let img = ProcessInfo.processInfo.environment["SANDBOX_SMOKE_IMAGE"] ?? "ddalcu/agent-shell"
+        let img = ProcessInfo.processInfo.environment["SANDBOX_SMOKE_IMAGE"] ?? "ddalcu/agent-shell-mlxserve"
         return "\(img) (\(AgentSandbox.guestArch))"
     }
 

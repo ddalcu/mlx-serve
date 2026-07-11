@@ -62,12 +62,15 @@ struct SettingsView: View {
                         title: "Voice",
                         subtitle: "Clone your voice once — hands-free voice mode answers in it via the local TTS model. No clip set: answers use the macOS system voice. Applies to the next spoken sentence — no restart needed."
                     ) {
+                        WakePhraseSectionContent()
                         VoiceCloneSectionContent()
                     }
 
                     SettingsSection(
                         title: "Agent Sandbox",
-                        subtitle: "Run the agent's shell commands inside an isolated Linux sandbox instead of directly on this Mac. Off by default; applies to the next command — no restart needed."
+                        subtitle: BuildFeatures.current.hostShell
+                            ? "Run the agent's shell commands inside an isolated Linux sandbox instead of directly on this Mac. Off by default; applies to the next command — no restart needed."
+                            : "Agent shell commands always run inside an isolated Linux sandbox in this build — they never touch macOS directly. The guest OS ships inside the app."
                     ) {
                         SandboxSectionContent()
                     }
@@ -79,11 +82,15 @@ struct SettingsView: View {
                         MessagingSectionContent(bridge: appState.telegramBridge)
                     }
 
-                    SettingsSection(
-                        title: "Updates",
-                        subtitle: "New versions ship on the project's GitHub releases page. Installing downloads the notarized app, swaps it in place, and relaunches — chats, models, and settings are untouched."
-                    ) {
-                        UpdatesSectionContent(updates: appState.updates)
+                    // The Mac App Store updates the app itself; a pane offering a
+                    // DMG self-update would be dead UI there (and an App Review flag).
+                    if BuildFeatures.current.selfUpdate {
+                        SettingsSection(
+                            title: "Updates",
+                            subtitle: "New versions ship on the project's GitHub releases page. Installing downloads the notarized app, swaps it in place, and relaunches — chats, models, and settings are untouched."
+                        ) {
+                            UpdatesSectionContent(updates: appState.updates)
+                        }
                     }
 
                     if filtering && visibleRows == 0 {
@@ -1503,6 +1510,32 @@ private struct RequestDefaultsSectionContent: View {
     }
 }
 
+// MARK: - Voice (wake phrase) section
+
+/// The hands-free wake phrase ("Hey Loki" by default). App-side like the
+/// clone clip — binds straight through `appState.serverOptions.wakePhrase`,
+/// applied live by `VoiceModeController` (no restart). Stored as typed;
+/// matching normalizes case/punctuation and the assistant renames itself
+/// after the phrase's last word in the voice system prompt.
+private struct WakePhraseSectionContent: View {
+    @EnvironmentObject var appState: AppState
+
+    private static let explainer = "What you say to address the assistant in hands-free voice mode. Case and punctuation don't matter, and common greetings (hey, hi, okay…) are accepted before the name. The assistant takes the last word as its name. Empty = \"Hey Loki\"."
+
+    var body: some View {
+        SearchableRow(searchText: ["Wake phrase", "Hey Loki", Self.explainer]) {
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Wake phrase").font(.subheadline.weight(.semibold))
+                TextField("Hey Loki", text: $appState.serverOptions.wakePhrase)
+                    .textFieldStyle(.roundedBorder)
+                    .frame(maxWidth: 220)
+                Text(Self.explainer)
+                    .font(.caption2).foregroundStyle(.secondary)
+            }
+        }
+    }
+}
+
 // MARK: - Voice (clone clip) section
 
 /// The global voice-clone clip: pick an audio file or record a few seconds,
@@ -1616,13 +1649,18 @@ private struct SandboxSectionContent: View {
     @EnvironmentObject var appState: AppState
 
     var body: some View {
-        SettingsRow(
-            title: "Sandbox agent commands",
-            explainer: "OFF = the agent runs shell commands directly on macOS (fast, full access to your files). ON = commands run inside an isolated Linux sandbox that can only touch the current working folder, so a bad command can't harm the rest of your Mac. Costs a bit more memory while active because it spins up a lightweight virtual machine for the session."
-        ) {
-            Toggle("", isOn: $appState.serverOptions.sandbox.enabled)
-                .labelsHidden()
-                .toggleStyle(.switch)
+        // No host shell in the App Store build → the sandbox can't be turned
+        // off (`AgentSandbox.resolveEnabled`), so offering the toggle would be
+        // a lie; the base image is likewise locked to the bundled guest.
+        if BuildFeatures.current.hostShell {
+            SettingsRow(
+                title: "Sandbox agent commands",
+                explainer: "OFF = the agent runs shell commands directly on macOS (fast, full access to your files). ON = commands run inside an isolated Linux sandbox that can only touch the current working folder, so a bad command can't harm the rest of your Mac. Costs a bit more memory while active because it spins up a lightweight virtual machine for the session."
+            ) {
+                Toggle("", isOn: $appState.serverOptions.sandbox.enabled)
+                    .labelsHidden()
+                    .toggleStyle(.switch)
+            }
         }
 
         SettingsRow(
@@ -1634,15 +1672,17 @@ private struct SandboxSectionContent: View {
                 .toggleStyle(.switch)
         }
 
-        SettingsRow(
-            title: "Base image",
-            explainer: "The Docker/OCI image the sandbox boots from. Must have an arm64 build (Apple Silicon) — an amd64-only image won't boot. The default ddalcu/agent-shell is a purpose-built agentic shell (Node.js + Python3/pip + git/curl + apt). Pulled once on first use, then cached; a heavier image uses more disk and takes longer the first time."
-        ) {
-            TextField("", text: $appState.serverOptions.sandbox.baseImage,
-                      prompt: Text("ddalcu/agent-shell"))
-                .textFieldStyle(.roundedBorder)
-                .font(.body.monospaced())
-                .frame(width: 260)
+        if BuildFeatures.current.ociPull {
+            SettingsRow(
+                title: "Base image",
+                explainer: "The Docker/OCI image the sandbox boots from. Must have an arm64 build (Apple Silicon) — an amd64-only image won't boot. The default ddalcu/agent-shell-mlxserve is a purpose-built agentic shell (Node.js + Python3/pip + git/curl + apt). Pulled once on first use, then cached; a heavier image uses more disk and takes longer the first time."
+            ) {
+                TextField("", text: $appState.serverOptions.sandbox.baseImage,
+                          prompt: Text("ddalcu/agent-shell-mlxserve"))
+                    .textFieldStyle(.roundedBorder)
+                    .font(.body.monospaced())
+                    .frame(width: 260)
+            }
         }
     }
 }

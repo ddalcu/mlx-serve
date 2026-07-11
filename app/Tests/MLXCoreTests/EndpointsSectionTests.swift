@@ -21,4 +21,18 @@ final class EndpointsSectionTests: XCTestCase {
             "http://localhost:8080/"
         )
     }
+
+    /// The `/v1/` base is what most people paste into an OpenAI-compatible
+    /// client, so the accordion offers it as its own copy row. Same
+    /// trailing-slash tolerance as `rootURL`.
+    func testV1BaseURLIsTheClientBase() {
+        XCTAssertEqual(
+            EndpointsSection.v1BaseURL("http://localhost:11234"),
+            "http://localhost:11234/v1/"
+        )
+        XCTAssertEqual(
+            EndpointsSection.v1BaseURL("http://localhost:8080/"),
+            "http://localhost:8080/v1/"
+        )
+    }
 }

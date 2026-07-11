@@ -1765,6 +1765,12 @@ const OllamaPullSink = struct {
 /// model is immediately loadable by name. Streams NDJSON status lines
 /// unless the client passed `stream:false`.
 fn handleOllamaPull(allocator: std.mem.Allocator, stream: *Conn, body: []const u8) !void {
+    // No `curl`, no arbitrary-path downloads in the App Store build — the Swift
+    // app owns model downloads via URLSession into the container.
+    if (@import("build_options").mas) {
+        try sendOllamaError(allocator, stream, "501 Not Implemented", "model pull is unavailable in this build");
+        return;
+    }
     var requested: []const u8 = "";
     var wants_stream = true;
     var parsed_body: ?std.json.Parsed(std.json.Value) = null;

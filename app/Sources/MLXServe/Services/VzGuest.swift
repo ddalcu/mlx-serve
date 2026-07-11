@@ -202,6 +202,23 @@ private final class ConsoleBuffer: @unchecked Sendable {
 /// a single stream, one command at a time). All VZVirtualMachine calls happen on
 /// `vmQueue` (the queue the VM was bound to at init).
 final class VzGuest {
+
+    /// How the host talks to the guest.
+    ///
+    /// `.vsock` is the real transport: `vz-agent` (`src/vz_agent.zig`) listens
+    /// on `AF_VSOCK`, one connection per process, so exit codes are real, stdout
+    /// and stderr stay separated, and MCP servers get their own connections. It
+    /// requires a kernel with `CONFIG_VSOCKETS` + `CONFIG_VIRTIO_VSOCKETS`
+    /// (contain's `kernels-v3`) and the `vz-agent` binary to inject.
+    ///
+    /// `.legacyConsole` is the previous design — one persistent `/bin/sh` on the
+    /// hvc1 tty, framed by `ShellSentinel`. Kept so a stale cached kernel still
+    /// boots, and so `SandboxSmoke` can prove both arms before it is deleted.
+    enum Transport: Equatable {
+        case vsock
+        case legacyConsole
+    }
+
     struct Config {
         var kernelPath: String
         var rootfsDir: String
@@ -214,15 +231,27 @@ final class VzGuest {
         var workdir: String? = "/workspace"
         var ramBytes: UInt64 = 1 << 30 // rootfs is demand-paged over virtiofs — workload headroom only
         var cpuCount: Int = 4
-        /// NAT networking + the live port-report stream on hvc2. When false the
-        /// guest gets NO network device and never DHCPs — fully isolated.
+        /// NAT networking + the live port-report stream. When false the guest
+        /// gets NO network device and never DHCPs — fully isolated.
         var network: Bool = false
+
+        var transport: Transport = .vsock
+        /// Host path to the `vz-agent` ELF, copied into the rootfs before boot.
+        /// Required by `.vsock`; ignored by `.legacyConsole`.
+        var agentBinaryPath: String? = nil
     }
 
     struct ExecResult {
+        /// stdout and stderr merged, in arrival order — what the agent reads.
         var output: String
+        /// Separated streams. Empty on `.legacyConsole`, which cannot tell them
+        /// apart: one tty carried both.
+        var stdout: String = ""
+        var stderr: String = ""
         var exitCode: Int32
         var timedOut: Bool
+        /// The child's pid inside the guest. Only `.vsock` reports one.
+        var pid: Int32? = nil
     }
 
     enum GuestError: Error, CustomStringConvertible {
@@ -243,6 +272,20 @@ final class VzGuest {
     static let rootfsTag = "rootfs"
     static let workspaceTag = "workspace"
     static let initScriptGuestPath = "/.vz-init"
+    /// Where the guest agent is injected, alongside `/.vz-init`. Host-injected
+    /// rather than baked into the image, so ANY base image works.
+    static let agentGuestPath = "/.vz-agent"
+
+    /// The guest console device the monitor loop writes its report to.
+    ///
+    /// hvc numbering follows `serialPorts` ORDER, so removing the shell port
+    /// renumbers everything after it. `.legacyConsole` has three ports
+    /// (boot, shell, monitor) → hvc2; `.vsock` has two (boot, monitor) → hvc1.
+    /// Getting this wrong is silent: the monitor writes into a device nobody
+    /// reads, and the tray's RAM readout plus the live port map just stop.
+    static func monitorDevice(transport: Transport) -> String {
+        transport == .vsock ? "/dev/hvc1" : "/dev/hvc2"
+    }
 
     /// Kernel command line. With `network`, `ip=dhcp` makes the KERNEL acquire
     /// address/gateway/DNS from VZ's NAT (CONFIG_IP_PNP — verified present in
@@ -264,15 +307,21 @@ final class VzGuest {
 
     /// The `/.vz-init` PID-1 script written into the rootfs dir before boot.
     /// Mounts the kernel filesystems + the workspace share, applies the image's
-    /// env/workdir, then hands a persistent `/bin/sh` the DEDICATED hvc1 channel
-    /// as its controlling tty. When the shell exits, the guest powers off
-    /// (contain's proven poweroff sequence — slim images ship no poweroff binary,
-    /// so SysRq 'o' is the fallback).
+    /// env/workdir, then hands control to the transport:
     ///
-    /// We deliberately run /bin/sh (dash), NOT interactive bash: a host driver
-    /// feeding commands over a byte stream + matching an exit-code sentinel needs
-    /// a clean, predictable stream; readline escapes and job control fight that.
-    /// A command that genuinely needs bash can invoke `bash -c '…'` explicitly.
+    ///  * `.vsock` — execs `/.vz-agent`, which serves one process per AF_VSOCK
+    ///    connection. No tty, no persistent shell.
+    ///  * `.legacyConsole` — hands a persistent `/bin/sh` the dedicated hvc1
+    ///    channel as its controlling tty.
+    ///
+    /// When that process exits, the guest powers off (contain's proven poweroff
+    /// sequence — slim images ship no poweroff binary, so SysRq 'o' is the
+    /// fallback).
+    ///
+    /// The legacy arm deliberately runs /bin/sh (dash), NOT interactive bash: a
+    /// host driver feeding commands over a byte stream + matching an exit-code
+    /// sentinel needs a clean, predictable stream; readline escapes and job
+    /// control fight that.
     static func buildInitScript(config: Config) -> String {
         var s = """
         #!/bin/sh
@@ -297,13 +346,15 @@ final class VzGuest {
 
             """
         }
-        // Guest monitor: stream a once-a-second report to the host over the
-        // THIRD console port — RAM (/proc/meminfo, feeds the tray readout)
-        // always, plus the guest IP + /proc/net/tcp(6) when networked (feeds
-        // the live port map, SandboxPortForwarder). Framed with =EOS= so the
-        // host can split complete snapshots. Runs detached so it never blocks
-        // the shell channel.
-        s += "i=0; while [ ! -e /dev/hvc2 ] && [ $i -lt 100 ]; do sleep 0.1; i=$((i+1)); done\n"
+        // Guest monitor: stream a once-a-second report to the host over the LAST
+        // console port — RAM (/proc/meminfo, feeds the tray readout) always,
+        // plus the guest IP + /proc/net/tcp(6) when networked (feeds the live
+        // port map, SandboxPortForwarder). Framed with =EOS= so the host can
+        // split complete snapshots. Runs detached so it never blocks anything.
+        //
+        // The device number depends on the transport — see `monitorDevice`.
+        let monitor = monitorDevice(transport: config.transport)
+        s += "i=0; while [ ! -e \(monitor) ] && [ $i -lt 100 ]; do sleep 0.1; i=$((i+1)); done\n"
         s += "( while true; do\n"
         s += "    grep -E '^(MemTotal|MemAvailable)' /proc/meminfo 2>/dev/null\n"
         if config.network {
@@ -314,7 +365,7 @@ final class VzGuest {
         }
         s += "    printf '=EOS=\\n'\n"
         s += "    sleep 1\n"
-        s += "  done ) >/dev/hvc2 2>/dev/null &\n\n"
+        s += "  done ) >\(monitor) 2>/dev/null &\n\n"
         for entry in config.imageEnv {
             guard let eq = entry.firstIndex(of: "="), eq != entry.startIndex else { continue }
             let key = String(entry[..<eq])
@@ -324,9 +375,18 @@ final class VzGuest {
         if let wd = config.workdir {
             s += "cd \(shellQuote(wd)) 2>/dev/null\n"
         }
+
+        switch config.transport {
+        case .vsock:
+            // The agent never returns; if it does, the guest is broken, so fall
+            // through to poweroff rather than leaving a VM spinning.
+            s += "\(agentGuestPath)\n"
+        case .legacyConsole:
+            s += "i=0; while [ ! -e /dev/hvc1 ] && [ $i -lt 100 ]; do sleep 0.1; i=$((i+1)); done\n"
+            s += "setsid -c /bin/sh </dev/hvc1 >/dev/hvc1 2>&1\n"
+        }
+
         s += """
-        i=0; while [ ! -e /dev/hvc1 ] && [ $i -lt 100 ]; do sleep 0.1; i=$((i+1)); done
-        setsid -c /bin/sh </dev/hvc1 >/dev/hvc1 2>&1
         sync
         poweroff -f 2>/dev/null
         halt -f 2>/dev/null
@@ -344,6 +404,11 @@ final class VzGuest {
     private let shellConsole = ConsoleBuffer()
     private let vmQueue = DispatchQueue(label: "mlxserve.vzguest")
     private var vm: VZVirtualMachine?
+    /// nil until `boot`; nil forever on `.legacyConsole`.
+    private var socketDevice: VZVirtioSocketDevice?
+    /// The config `boot` ran with. `.legacyConsole` before boot so a stray
+    /// `exec` can't try to open a vsock stream that was never configured.
+    private var config = Config(kernelPath: "", rootfsDir: "", transport: .legacyConsole)
     private var delegateBox: DelegateBox?
     private let execLock = NSLock()
     private var seq = 0
@@ -399,6 +464,8 @@ final class VzGuest {
     /// main thread. `readyTimeout` covers kernel boot + shell spawn (virtiofs
     /// root boots in well under a second; the margin is for cold page-ins).
     func boot(_ cfg: Config, readyTimeout: TimeInterval = 60) throws {
+        config = cfg
+
         // 1. Write the init script into the rootfs the kernel will mount as /.
         let initHostPath = cfg.rootfsDir + Self.initScriptGuestPath
         do {
@@ -406,6 +473,22 @@ final class VzGuest {
             try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: initHostPath)
         } catch {
             throw GuestError.bootFailed("could not write \(initHostPath): \(error)")
+        }
+
+        // 1b. Inject the guest agent beside it. Host-injected rather than baked
+        // into the image, so a user-chosen base image needs no cooperation.
+        if cfg.transport == .vsock {
+            guard let source = cfg.agentBinaryPath, FileManager.default.isReadableFile(atPath: source) else {
+                throw GuestError.bootFailed("vz-agent binary missing (build it with `zig build vz-agent`)")
+            }
+            let destination = cfg.rootfsDir + Self.agentGuestPath
+            do {
+                try? FileManager.default.removeItem(atPath: destination)
+                try FileManager.default.copyItem(atPath: source, toPath: destination)
+                try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: destination)
+            } catch {
+                throw GuestError.bootFailed("could not install \(destination): \(error)")
+            }
         }
 
         // 2. Assemble the VM.
@@ -427,10 +510,18 @@ final class VzGuest {
                 fileHandleForWriting: outPipe.fileHandleForWriting)
             return p
         }
-        // Index order is guest hvc order (spike-verified): 0 = boot console,
-        // 1 = shell, 2 = net-report stream (present always so hvc numbering is
-        // stable; the monitor loop only writes to it when networking is on).
-        vmConfig.serialPorts = [serialPort(bootIn, bootOut), serialPort(shellIn, shellOut), serialPort(netIn, netOut)]
+        // Index order is guest hvc order (spike-verified). `.legacyConsole`:
+        // 0 = boot console, 1 = shell, 2 = net-report. `.vsock` drops the shell
+        // port entirely, so the net-report becomes hvc1 — `monitorDevice` and
+        // `buildInitScript` must agree with this list, or the monitor writes to
+        // a device nobody reads.
+        switch cfg.transport {
+        case .vsock:
+            vmConfig.serialPorts = [serialPort(bootIn, bootOut), serialPort(netIn, netOut)]
+            vmConfig.socketDevices = [VZVirtioSocketDeviceConfiguration()]
+        case .legacyConsole:
+            vmConfig.serialPorts = [serialPort(bootIn, bootOut), serialPort(shellIn, shellOut), serialPort(netIn, netOut)]
+        }
 
         let rootfsDev = VZVirtioFileSystemDeviceConfiguration(tag: Self.rootfsTag)
         rootfsDev.share = VZSingleDirectoryShare(
@@ -460,7 +551,9 @@ final class VzGuest {
 
         // 3. Console capture + start.
         bootOut.fileHandleForReading.readabilityHandler = { [bootConsole] h in bootConsole.append(h.availableData) }
-        shellOut.fileHandleForReading.readabilityHandler = { [shellConsole] h in shellConsole.append(h.availableData) }
+        if cfg.transport == .legacyConsole {
+            shellOut.fileHandleForReading.readabilityHandler = { [shellConsole] h in shellConsole.append(h.availableData) }
+        }
         netOut.fileHandleForReading.readabilityHandler = { [netSplitter, weak self] h in
             for snapshot in netSplitter.feed(h.availableData) {
                 self?.onNetSnapshot?(snapshot)
@@ -468,6 +561,7 @@ final class VzGuest {
         }
 
         let machine = vmQueue.sync { VZVirtualMachine(configuration: vmConfig, queue: vmQueue) }
+        socketDevice = vmQueue.sync { machine.socketDevices.first as? VZVirtioSocketDevice }
         let box = DelegateBox { [weak self] in
             guard let self else { return }
             self.stopped.lock(); self.stoppedFlag = true; self.stopped.unlock()
@@ -491,10 +585,16 @@ final class VzGuest {
             throw GuestError.bootFailed(startError.localizedDescription)
         }
 
-        // 4. Handshake: repeatedly nudge the shell until the (echo-proof) ready
-        // marker appears — proof it's actually executing, not just echoing.
-        // Probes sent before /.vz-init attaches the shell are simply dropped by
-        // the closed port; the retry loop is what makes this robust.
+        // 4. Handshake.
+        if cfg.transport == .vsock {
+            try waitForAgent(deadline: Date().addingTimeInterval(readyTimeout))
+            return
+        }
+
+        // Legacy: repeatedly nudge the shell until the (echo-proof) ready marker
+        // appears — proof it's actually executing, not just echoing. Probes sent
+        // before /.vz-init attaches the shell are simply dropped by the closed
+        // port; the retry loop is what makes this robust.
         let deadline = Date().addingTimeInterval(readyTimeout)
         let probe = ShellSentinel.readyProbe(nonce: nonce)
         var lastProbe = Date.distantPast
@@ -529,10 +629,103 @@ final class VzGuest {
 
     // MARK: Exec
 
-    /// Run one command in the guest shell and return its merged output + exit
-    /// code. Blocking. On timeout, sends Ctrl-C (SIGINT via the hvc tty line
-    /// discipline) and returns `timedOut = true` with whatever output arrived.
-    func exec(_ command: String, timeout: TimeInterval = 120) throws -> ExecResult {
+    /// Open one connection to the guest agent.
+    ///
+    /// `VZVirtioSocketDevice` calls must happen on the queue the VM was created
+    /// with, so the connect is dispatched there and the caller blocks on a
+    /// semaphore. Never call this FROM `vmQueue` — the completion handler runs
+    /// there too, and you would deadlock.
+    func openStream(port: UInt32 = GuestProtocol.execPort, timeout: TimeInterval = 10) throws -> GuestByteStream {
+        guard let device = socketDevice else {
+            throw GuestError.bootFailed("guest has no vsock device (transport is \(config.transport))")
+        }
+        if isFinished { throw GuestError.guestExited }
+
+        var outcome: Result<VZVirtioSocketConnection, Error>?
+        let done = DispatchSemaphore(value: 0)
+        vmQueue.async {
+            // NS_REFINED_FOR_SWIFT: the handler takes a Result, not (conn, err).
+            device.connect(toPort: port) { result in
+                outcome = result
+                done.signal()
+            }
+        }
+        guard done.wait(timeout: .now() + timeout) == .success else {
+            throw GuestError.bootFailed("vsock connect to port \(port) timed out")
+        }
+        return makeGuestStream(from: try outcome!.get())
+    }
+
+    /// Poll the agent's port until it accepts. Replaces the legacy ready-probe
+    /// handshake: a successful connect IS the proof the agent is serving.
+    private func waitForAgent(deadline: Date) throws {
+        var lastError: Error?
+        while Date() < deadline {
+            if isFinished { throw GuestError.guestExited }
+            do {
+                let stream = try openStream(timeout: 2)
+                stream.close()
+                return
+            } catch {
+                lastError = error
+                Thread.sleep(forTimeInterval: 0.05)
+            }
+        }
+        throw GuestError.bootFailed("guest agent never accepted on vsock port \(GuestProtocol.execPort)"
+            + (lastError.map { ": \($0)" } ?? ""))
+    }
+
+    /// Run one command in the guest and return its output + exit code. Blocking.
+    ///
+    /// `.vsock` runs each command as its own `sh -c`, so shell-local state
+    /// (`export FOO=1`, `cd`) does NOT persist between calls — exactly like the
+    /// host path, which spawns a fresh `zsh -l -c` per command. Filesystem state
+    /// (installed packages, files) persists as before. Callers that need a
+    /// sticky cwd pass it in.
+    func exec(_ command: String, cwd: String? = nil, timeout: TimeInterval = 120) throws -> ExecResult {
+        guard vm != nil, !isFinished else { throw GuestError.guestExited }
+
+        if config.transport == .vsock {
+            let stream = try openStream()
+            defer { stream.close() }
+            // `output` is stdout+stderr in ARRIVAL order (as well as two pipes
+            // can express it) — built from the streaming callbacks, not by
+            // concatenating the finished buffers, which would shove all of a
+            // compiler's stderr after all of its stdout.
+            var merged = Data()
+            let result = try GuestExec.run(
+                stream: stream,
+                request: .init(command: command, cwd: cwd ?? ""),
+                timeout: timeout,
+                streaming: .init(onStdout: { merged.append($0) }, onStderr: { merged.append($0) }))
+            return ExecResult(
+                output: String(decoding: merged, as: UTF8.self),
+                stdout: result.stdout,
+                stderr: result.stderr,
+                exitCode: result.exitCode,
+                timedOut: result.timedOut,
+                pid: result.pid)
+        }
+        return try execLegacy(command, timeout: timeout)
+    }
+
+    /// Start a process that outlives its connection, logging to `logPath`.
+    /// Returns the guest pid so the host can `kill` it later.
+    func execDetached(command: String, cwd: String?, logPath: String, timeout: TimeInterval = 30) throws -> Int32? {
+        guard config.transport == .vsock else { throw GuestError.bootFailed("detached exec needs the vsock transport") }
+        let stream = try openStream()
+        defer { stream.close() }
+        let result = try GuestExec.run(
+            stream: stream,
+            request: .init(command: command, cwd: cwd ?? "", logPath: logPath, detach: true),
+            timeout: timeout)
+        return result.pid
+    }
+
+    /// Legacy hvc1 shell. Merged output only — one tty carried stdout and
+    /// stderr, so they cannot be told apart. On timeout, sends Ctrl-C (SIGINT
+    /// via the tty line discipline).
+    private func execLegacy(_ command: String, timeout: TimeInterval) throws -> ExecResult {
         execLock.lock(); defer { execLock.unlock() }
         guard vm != nil else { throw GuestError.guestExited }
         if isFinished { throw GuestError.guestExited }

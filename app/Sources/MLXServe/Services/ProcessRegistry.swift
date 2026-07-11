@@ -358,28 +358,18 @@ final class ProcessRegistry: ObservableObject {
         }
     }
 
-    /// All transitive child pids of `pid` from one `ps` snapshot. Used to tear
+    /// All transitive child pids of `pid` from one libproc snapshot. Used to tear
     /// down a server's whole subtree on kill. Best-effort: a process that has
     /// double-forked / re-parented away (a true daemon) escapes this, same as it
     /// would escape a process-group kill.
+    ///
+    /// Was `/bin/ps -axo pid=,ppid=`; `ps` is not reachable from inside the App
+    /// Sandbox container. See `SystemMetrics.processParentMap`.
     nonisolated static func descendantPids(of pid: Int32) -> [Int32] {
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: "/bin/ps")
-        task.arguments = ["-axo", "pid=,ppid="]
-        let pipe = Pipe()
-        task.standardOutput = pipe
-        task.standardError = FileHandle.nullDevice
-        do { try task.run() } catch { return [] }
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        task.waitUntilExit()
-        let out = String(data: data, encoding: .utf8) ?? ""
-
         // Build parent → children adjacency, then BFS from `pid`.
         var children: [Int32: [Int32]] = [:]
-        for line in out.split(whereSeparator: \.isNewline) {
-            let cols = line.split(whereSeparator: { $0 == " " || $0 == "\t" }).compactMap { Int32($0) }
-            guard cols.count == 2 else { continue }
-            children[cols[1], default: []].append(cols[0])
+        for (child, parent) in SystemMetrics.processParentMap() {
+            children[parent, default: []].append(child)
         }
         var result: [Int32] = []
         var queue = children[pid] ?? []

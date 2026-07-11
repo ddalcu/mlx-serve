@@ -132,7 +132,7 @@ struct VoiceTrayPanel: View {
 
     private var chips: some View {
         HStack(spacing: 6) {
-            chip("Hey Loki", system: "mic.circle", on: voice.requireWakeWord) {
+            chip(voice.wakePhraseDisplay, system: "mic.circle", on: voice.requireWakeWord) {
                 voice.requireWakeWord.toggle()
             }
             chip("Agent", system: "wrench", on: voice.agentMode) {
@@ -147,7 +147,7 @@ struct VoiceTrayPanel: View {
             }
             Spacer(minLength: 0)
         }
-        .help("“Hey Loki”: only send a request when you address the assistant by name — it ignores other talk. Turn off for always-on listening.")
+        .help("“\(voice.wakePhraseDisplay)”: only send a request when you address the assistant by name — it ignores other talk. Turn off for always-on listening. Customize the phrase in Settings ▸ Voice.")
     }
 
     private var autoApproveRow: some View {

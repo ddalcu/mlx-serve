@@ -877,34 +877,16 @@ enum RAMChecker {
     }
 
     /// Free + inactive memory in GB (pages we can reclaim without paging).
-    /// Approximation via `vm_stat`. Close enough for the "do you have
-    /// headroom" gate before kicking a multi-GB model load.
+    /// Close enough for the "do you have headroom" gate before kicking a
+    /// multi-GB model load.
+    ///
+    /// Was a `/usr/bin/vm_stat` subprocess; now `host_statistics64` directly
+    /// (`SystemMetrics.availableBytes`), which vm_stat is itself a printer for.
+    /// The binary isn't reachable inside the App Sandbox container.
     static var availableGB: Int {
-        let proc = Process()
-        proc.executableURL = URL(fileURLWithPath: "/usr/bin/vm_stat")
-        let pipe = Pipe()
-        proc.standardOutput = pipe
-        proc.standardError = Pipe()
-        do { try proc.run() } catch { return totalGB }
-        proc.waitUntilExit()
-        guard let text = String(data: pipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) else { return totalGB }
-
-        var pageSize: Int = 4096
-        if let match = text.range(of: #"page size of (\d+)"#, options: .regularExpression) {
-            let s = String(text[match])
-            let digits = s.filter { $0.isNumber }
-            if let n = Int(digits) { pageSize = n }
-        }
-
-        func pages(for key: String) -> Int {
-            guard let line = text.split(separator: "\n").first(where: { $0.contains(key) }) else { return 0 }
-            let digits = line.filter { $0.isNumber }
-            return Int(digits) ?? 0
-        }
-        let free = pages(for: "Pages free")
-        let inactive = pages(for: "Pages inactive")
-        let bytes = (free + inactive) * pageSize
-        return bytes / (1024 * 1024 * 1024)
+        let bytes = SystemMetrics.availableBytes()
+        guard bytes > 0 else { return totalGB } // kernel query failed; assume headroom
+        return Int(bytes / (1024 * 1024 * 1024))
     }
 
     /// Frame count an LTX run can safely fit at the chosen resolution.

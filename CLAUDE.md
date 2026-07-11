@@ -81,7 +81,8 @@ Sampling defaults for request fields the client OMITS resolve as: request body >
 - Direct `swift build` (escape hatch only — fast iteration on a Swift-only change): `cd app && swift build -c release -Xswiftc -swift-version -Xswiftc 5`. Don't ship a build that didn't go through `build.sh`.
 - **Rebuild Jinja** (after `lib/jinja_cpp/*.cpp` changes): `cd lib/jinja_cpp && for f in jinja_wrapper caps lexer parser runtime jinja_string value; do clang++ -std=c++17 -O2 -DNDEBUG -I . -c $f.cpp -o obj/$f.o; done && ar rcs libjinja.a obj/*.o`
 
-The `-Xswiftc -swift-version -Xswiftc 5` flag forces Swift 5 mode under Swift 6.3 (Xcode 26+) — required because the pinned `swift-sdk` 0.10.x emits `[#SendingRisksDataRace]` errors otherwise. Pin held at 0.10.x for macos-14 / Swift 6.1 CI compat. `app/build.sh` already passes the flag; only direct `swift build`/`swift test` need it.
+The `-Xswiftc -swift-version -Xswiftc 5` flag forces Swift 5 mode under Swift 6.3 (Xcode 26+). It is VESTIGIAL since the `swift-sdk` bump to 0.12.x (0.12.1+ compiles cleanly in its own language mode; the flag existed for 0.10.x's `[#SendingRisksDataRace]` errors) — plain `swift build`/`swift test` work too — but `app/build.sh` and CI still pass it, and it stays harmless because our own package is tools-version 5.9. **Keep `swift-sdk` >= 0.12.1**: 0.10.x cannot compile in the Mac App Store Xcode project at all (Xcode never applies the global flag to package dependencies). The old 0.10.x pin existed for the retired macos-14 / Swift 6.1 runner; CI now runs macos-26.
+
 
 ## Testing
 

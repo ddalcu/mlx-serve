@@ -55,15 +55,15 @@ final class SandboxPortForwarderTests: XCTestCase {
 
     func testMemoryDisplayTextQuantizesAndFormats() {
         // Quantized to 16 MB steps so a jittering guest doesn't re-render the
-        // tray every second (the MenuBarExtra churn class).
+        // tray every second (the MenuBarExtra churn class). Shows only the
+        // USED figure — the "/ total" suffix was tray noise.
         XCTAssertEqual(AgentSandbox.memoryDisplayText(availableKB: 612_340, totalKB: 1_010_536),
-                       "384 MB / 987 MB RAM")
+                       "384 MB RAM")
         // Nearby readings quantize to the SAME string (no publish).
         XCTAssertEqual(AgentSandbox.memoryDisplayText(availableKB: 610_000, totalKB: 1_010_536),
                        AgentSandbox.memoryDisplayText(availableKB: 612_340, totalKB: 1_010_536))
-        // Multi-GB guests read in GB with one decimal.
         XCTAssertEqual(AgentSandbox.memoryDisplayText(availableKB: 2_000_000, totalKB: 4_100_000),
-                       "2048 MB / 3.9 GB RAM")
+                       "2048 MB RAM")
     }
 
     func testParseSnapshotSurvivesTtyCrlfLineEndings() {

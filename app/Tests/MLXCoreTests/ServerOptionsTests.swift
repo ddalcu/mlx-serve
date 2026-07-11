@@ -779,7 +779,7 @@ extension ServerOptionsTests {
     func testSandboxDefaultsOff() {
         let s = ServerOptions().sandbox
         XCTAssertFalse(s.enabled, "the sandbox must be opt-in (off by default)")
-        XCTAssertEqual(s.baseImage, "ddalcu/agent-shell",
+        XCTAssertEqual(s.baseImage, "ddalcu/agent-shell-mlxserve",
                        "default base image must be arm64 — the HVF guest can't run an amd64-only image")
     }
 
@@ -800,7 +800,7 @@ extension ServerOptionsTests {
         let legacy = #"{"host":"0.0.0.0","port":11234}"#.data(using: .utf8)!
         let decoded = try JSONDecoder().decode(ServerOptions.self, from: legacy)
         XCTAssertFalse(decoded.sandbox.enabled)
-        XCTAssertEqual(decoded.sandbox.baseImage, "ddalcu/agent-shell")
+        XCTAssertEqual(decoded.sandbox.baseImage, "ddalcu/agent-shell-mlxserve")
     }
 
     func testSandboxNetworkDefaultsOnAndDecodesLegacyBlobs() throws {
@@ -839,6 +839,39 @@ extension ServerOptionsTests {
         o.sandbox = .init(enabled: true, baseImage: "alpine")
         o = ServerOptions()
         XCTAssertFalse(o.sandbox.enabled)
-        XCTAssertEqual(o.sandbox.baseImage, "ddalcu/agent-shell")
+        XCTAssertEqual(o.sandbox.baseImage, "ddalcu/agent-shell-mlxserve")
+    }
+
+    // MARK: - Speed/memory trade-off options must state BOTH sides
+
+    /// Users flip options wanting maximum performance; an explainer that sells
+    /// only the RAM win reads as a free upgrade. KV-cache quantization costs
+    /// measurable decode speed (dequantize on every step, growing with context
+    /// depth — ~10% on Gemma 4 E4B at 2–4K, live-measured 2026-07-10), so its
+    /// explainer must say so and steer plenty-of-RAM users to leave it off.
+    func testKVQuantExplainersStateTheDecodeCostNotJustTheRAMWin() throws {
+        for key in ["kvQuant", "llamaKvQuant"] {
+            let field = try XCTUnwrap(ServerOptions.serverFlagFields[key], key)
+            let text = field.explainer.lowercased()
+            XCTAssertTrue(text.contains("slower") || text.contains("decode speed"),
+                          "\(key) explainer must state the decode cost: \(field.explainer)")
+            XCTAssertTrue(text.contains("leave") && text.contains("off"),
+                          "\(key) explainer must steer plenty-of-RAM users to leave it off")
+        }
+    }
+
+    /// The voice wake phrase is an app-side setting (like the voice-clone
+    /// fields): defaults to "hey loki", survives a legacy config blob that
+    /// predates the field, and round-trips a custom value.
+    func testWakePhraseDefaultsAndDecodesTolerantly() throws {
+        XCTAssertEqual(ServerOptions().wakePhrase, "hey loki")
+
+        let legacy = try JSONDecoder().decode(ServerOptions.self, from: Data("{}".utf8))
+        XCTAssertEqual(legacy.wakePhrase, "hey loki")
+
+        var o = ServerOptions()
+        o.wakePhrase = "hey jarvis"
+        let back = try JSONDecoder().decode(ServerOptions.self, from: JSONEncoder().encode(o))
+        XCTAssertEqual(back.wakePhrase, "hey jarvis")
     }
 }

@@ -23,7 +23,9 @@ struct MCPMarketplaceView: View {
             ScrollView {
                 LazyVStack(alignment: .leading, spacing: 12) {
                     introSection
-                    ForEach(MCPCatalog.entries) { entry in
+                    // Only servers this build can actually run: the MAS build
+                    // offers just the ones pre-baked into the bundled guest image.
+                    ForEach(MCPCatalog.visibleEntries()) { entry in
                         MCPCatalogRow(
                             entry: entry,
                             isEnabled: bindingForEnabled(entry.id),
@@ -134,8 +136,11 @@ struct MCPMarketplaceView: View {
 
     private var customServersSection: some View {
         // Preserve the order users hand-edited in mcp.json — no alphabetic sort.
+        // Keyed on the VISIBLE catalog: an entry whose curated row is hidden in
+        // this build (e.g. playwright config carried over from a DMG install)
+        // surfaces here with its spawn error instead of disappearing.
         let custom = mcpManager.config.mcpServers.filter { id, _ in
-            MCPCatalog.entry(for: id) == nil
+            MCPCatalog.visibleEntry(for: id) == nil
         }
         if custom.isEmpty {
             return AnyView(EmptyView())
@@ -251,7 +256,7 @@ struct MCPMarketplaceView: View {
         // render — we don't want to auto-spawn every enabled server just because the user opened the sheet.
         guard hydrated else { return }
         // Build a partial config update for just this entry from the current form state.
-        guard let entry = MCPCatalog.entry(for: entryID) else { return }
+        guard let entry = MCPCatalog.visibleEntry(for: entryID) else { return }
         let isOn = enabledByID[entryID] ?? false
         var newConfig = mcpManager.config
         if isOn {
@@ -298,7 +303,7 @@ struct MCPMarketplaceView: View {
 
     private func hydrateFromConfig() {
         mcpManager.reloadConfig()
-        for entry in MCPCatalog.entries {
+        for entry in MCPCatalog.visibleEntries() {
             if let server = mcpManager.config.mcpServers[entry.id] {
                 enabledByID[entry.id] = server.isEnabled
                 valuesByID[entry.id] = entry.extractValues(from: server)
@@ -314,7 +319,10 @@ struct MCPMarketplaceView: View {
 
     private func saveAndDismiss() {
         var newConfig = mcpManager.config
-        for entry in MCPCatalog.entries {
+        // Visible entries only: Save must never touch config for rows this build
+        // doesn't render (their enabledByID is never hydrated, so iterating the
+        // full catalog would silently disable a carried-over hidden entry).
+        for entry in MCPCatalog.visibleEntries() {
             let isOn = enabledByID[entry.id] ?? false
             let values = valuesByID[entry.id] ?? [:]
             if isOn {

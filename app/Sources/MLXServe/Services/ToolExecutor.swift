@@ -42,6 +42,17 @@ struct ShellHandler: ToolHandler {
     /// so the caller can surface it on `ToolResult.backgroundHandle`.
     var handleBox: ProcessHandleBox? = nil
 
+    /// Whether a host shell exists at all. False in the App Store build, where
+    /// every command routes into the guest. Injectable so host-behavior tests
+    /// can force the Developer ID path regardless of the build they run under.
+    var hostShellAllowed: Bool = BuildFeatures.current.hostShell
+    /// Whether the Agent Sandbox is on. A CLOSURE read at execution time (the
+    /// setting changes between calls); injectable beside `hostShellAllowed`
+    /// because the MAS build forces the sandbox on (`AgentSandbox.resolveEnabled`)
+    /// — without the seam, host-behavior tests in the MAS test binary would
+    /// route into a guest that xctest can never boot.
+    var sandboxEnabled: () -> Bool = { AgentSandbox.shared.isEnabled }
+
     func execute(parameters: [String: String], workingDirectory: String?) async throws -> String {
         guard let command = parameters["command"] else {
             throw ToolError.missingParameter("command")
@@ -58,10 +69,11 @@ struct ShellHandler: ToolHandler {
         let wantsBackground = Self.isTruthyFlag(parameters["run_in_background"])
         let hasTrailingAmp = Self.hasTrailingBackgroundOperator(command)
 
-        switch Self.route(sandboxEnabled: AgentSandbox.shared.isEnabled,
+        switch Self.route(sandboxEnabled: sandboxEnabled(),
                           wantsBackground: wantsBackground,
                           hasTrailingAmp: hasTrailingAmp,
-                          hasRegistry: registry != nil) {
+                          hasRegistry: registry != nil,
+                          hostShellAllowed: hostShellAllowed) {
         case .hostBackground:
             return await startInBackground(command: command, cwd: cwd, workingDirectory: workingDirectory)
         case .hostBackgroundUnavailable:
@@ -110,10 +122,20 @@ struct ShellHandler: ToolHandler {
     }
 
     static func route(sandboxEnabled: Bool, wantsBackground: Bool,
-                      hasTrailingAmp: Bool, hasRegistry: Bool) -> ShellRoute {
-        if sandboxEnabled {
+                      hasTrailingAmp: Bool, hasRegistry: Bool,
+                      hostShellAllowed: Bool = BuildFeatures.current.hostShell) -> ShellRoute {
+        // The App Store build has no host shell (App Review 2.5.2 + the sandbox
+        // container can't reach /bin/zsh). Force every command into the guest,
+        // regardless of the user's sandbox toggle.
+        if sandboxEnabled || !hostShellAllowed {
             // NEVER the host registry while sandboxed — regardless of registry.
-            return wantsBackground ? .sandboxBackground : .sandboxForeground
+            // A bare trailing `&` is background intent, exactly as on the host
+            // path below. It must NOT run foreground: under the vsock exec
+            // transport the orphaned process holds the shell's stdout pipe, so
+            // a foreground `cmd &` would sit until the timeout kills the call
+            // (the legacy console shell happened to return promptly, which is
+            // why this ever routed foreground).
+            return (wantsBackground || hasTrailingAmp) ? .sandboxBackground : .sandboxForeground
         }
         if hasRegistry, wantsBackground || hasTrailingAmp { return .hostBackground }
         if wantsBackground { return .hostBackgroundUnavailable }
@@ -562,8 +584,6 @@ struct EditFileHandler: ToolHandler {
 // MARK: - Search Files
 
 struct SearchFilesHandler: ToolHandler {
-    private let shellHandler = ShellHandler()
-
     func execute(parameters: [String: String], workingDirectory: String?) async throws -> String {
         guard let pattern = parameters["pattern"] else {
             throw ToolError.missingParameter("pattern")
@@ -571,36 +591,21 @@ struct SearchFilesHandler: ToolHandler {
         let path = parameters["path"] ?? "."
         // Confine search path to workspace
         let confinedPath = try resolveAndConfine(path, workingDirectory: workingDirectory)
-        let maxResults = Int(parameters["maxResults"] ?? "100") ?? 100
-        let escaped = shellEscape(pattern)
-        let escapedPath = shellEscape(confinedPath)
 
-        // Use ripgrep if available, fallback to grep
-        let useRg = FileManager.default.fileExists(atPath: "/opt/homebrew/bin/rg")
-            || FileManager.default.fileExists(atPath: "/usr/local/bin/rg")
-
-        var command: String
-        if useRg {
-            command = "rg -n --no-heading"
-            if let include = parameters["include"] {
-                command += " -g \(shellEscape(include))"
-            }
-            if let context = parameters["context"], let ctx = Int(context), ctx > 0 {
-                command += " -C \(min(ctx, 10))"
-            }
-            command += " \(escaped) \(escapedPath) 2>/dev/null | head -\(maxResults)"
-        } else {
-            command = "grep -rn"
-            if let include = parameters["include"] {
-                command += " --include=\(shellEscape(include))"
-            }
-            command += " \(escaped) \(escapedPath) 2>/dev/null | head -\(maxResults)"
-        }
-        return try await shellHandler.execute(parameters: ["command": command], workingDirectory: workingDirectory)
-    }
-
-    private func shellEscape(_ s: String) -> String {
-        "'" + s.replacingOccurrences(of: "'", with: "'\\''") + "'"
+        let options = FileSearcher.Options(
+            root: confinedPath,
+            pattern: pattern,
+            include: parameters["include"],
+            contextLines: Int(parameters["context"] ?? "0") ?? 0,
+            maxResults: Int(parameters["maxResults"] ?? "100") ?? 100
+        )
+        // The walk is synchronous and can touch thousands of files; `execute`
+        // inherits the caller's actor (ToolExecutor is @MainActor), so hop off
+        // it or a large workspace freezes the UI mid-search.
+        let lines = await Task.detached(priority: .userInitiated) {
+            FileSearcher.search(options)
+        }.value
+        return FileSearcher.render(lines, pattern: pattern)
     }
 }
 
@@ -660,37 +665,10 @@ struct ListFilesHandler: ToolHandler {
         return result + suffix
     }
 
-    /// Simple glob matching supporting * and ** wildcards.
+    /// Simple glob matching supporting * and ** wildcards. Shared with
+    /// `FileSearcher`'s `include` filter — see `Glob`.
     private func matchesGlob(_ path: String, pattern: String) -> Bool {
-        // Convert glob to regex: * matches non-slash, ** matches anything
-        var regex = "^"
-        var i = pattern.startIndex
-        while i < pattern.endIndex {
-            let c = pattern[i]
-            if c == "*" {
-                let next = pattern.index(after: i)
-                if next < pattern.endIndex && pattern[next] == "*" {
-                    regex += ".*"
-                    i = pattern.index(after: next)
-                    // Skip trailing slash after **
-                    if i < pattern.endIndex && pattern[i] == "/" {
-                        i = pattern.index(after: i)
-                    }
-                    continue
-                } else {
-                    regex += "[^/]*"
-                }
-            } else if c == "?" {
-                regex += "[^/]"
-            } else if c == "." {
-                regex += "\\."
-            } else {
-                regex += String(c)
-            }
-            i = pattern.index(after: i)
-        }
-        regex += "$"
-        return path.range(of: regex, options: .regularExpression) != nil
+        Glob.matches(path, pattern: pattern)
     }
 }
 

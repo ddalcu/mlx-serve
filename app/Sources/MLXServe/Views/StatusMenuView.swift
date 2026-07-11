@@ -2,6 +2,14 @@ import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
 
+/// Shared geometry for the tray footer's Chat / Tasks / Code buttons —
+/// they live in three files (StatusMenuView, CLILauncher,
+/// CLISetupInstructions), and with inlined values the icon-to-text gap
+/// drifted (Chat/Tasks at the 8pt HStack default, Code at an explicit 6).
+enum TrayFooterMetrics {
+    static let iconSpacing: CGFloat = 6
+}
+
 /// Claude logo icon from the official Claude AI symbol SVG.
 struct ClaudeIcon: View {
     var size: CGFloat = 14
@@ -377,37 +385,24 @@ struct StatusMenuView: View {
                 .padding(.horizontal, 16)
                 .padding(.vertical, 10)
 
-                // Live metrics panel — only shown when the server was launched
-                // with --metrics (opt-in; see ServerOptions.enableMetrics). The
-                // panel is hosted on the index page now, so this opens root `/`.
-                if appState.serverOptions.enableMetrics {
-                    Divider().padding(.horizontal, 12)
-                    Button {
-                        if let root = EndpointsSection.rootURL(server.baseURL) {
-                            NSWorkspace.shared.open(root)
-                        }
-                    } label: {
-                        HStack(spacing: 4) {
-                            Image(systemName: "chart.bar.xaxis")
-                            Text("Open Metrics Panel")
-                        }
-                    }
-                    .buttonStyle(.plain)
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 6)
-                }
-
-                // Endpoints
+                // Endpoints. The Metrics button rides the header row (the
+                // Browse-on-Download-Models pattern) — shown only when the
+                // server was launched with --metrics (opt-in; see
+                // ServerOptions.enableMetrics). The panel is hosted on the
+                // index page, so it opens root `/`.
                 Divider().padding(.horizontal, 12)
-                EndpointsSection(baseURL: server.baseURL)
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 10)
+                EndpointsSection(
+                    baseURL: server.baseURL,
+                    showsMetricsButton: appState.serverOptions.enableMetrics
+                )
+                .padding(.horizontal, 16)
+                .padding(.vertical, 10)
             }
 
             Divider().padding(.horizontal, 12)
 
-            // Downloads. "Browse More Models" sits on the header row, NOT inside
-            // the disclosure: reaching the Model Browser shouldn't require first
+            // Downloads. "Browse" sits on the header row, NOT inside the
+            // disclosure: reaching the Model Browser shouldn't require first
             // expanding a curated quick-download list you may not care about.
             // It's a sibling of the disclosure button, not nested in its label,
             // so the two tap targets stay distinct.
@@ -436,7 +431,7 @@ struct StatusMenuView: View {
                     } label: {
                         HStack(spacing: 4) {
                             Image(systemName: "magnifyingglass")
-                            Text("Browse More Models")
+                            Text("Browse")
                         }
                     }
                     .buttonStyle(.bordered)
@@ -535,7 +530,7 @@ struct StatusMenuView: View {
                 Button {
                     openChat()
                 } label: {
-                    HStack {
+                    HStack(spacing: TrayFooterMetrics.iconSpacing) {
                         Image(systemName: "bubble.left.and.bubble.right")
                         Text("Chat")
                     }
@@ -547,21 +542,36 @@ struct StatusMenuView: View {
                 Button {
                     openTasks()
                 } label: {
-                    HStack {
+                    HStack(spacing: TrayFooterMetrics.iconSpacing) {
                         Image(systemName: "clock.badge.checkmark")
                         Text("Tasks")
                     }
                     .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.bordered)
+                .disabled(server.status != .running)
                 .help("Scheduled Tasks")
 
-                CLILauncherButton(
-                    baseURL: server.baseURL,
-                    servedModelId: server.modelInfo?.name ?? "mlx-serve",
-                    serverContextLength: server.modelInfo?.contextLength,
-                    isEnabled: server.status == .running
-                )
+                // The App Store build can't detect or launch other apps'
+                // CLIs, so its Code button shows copy-paste terminal
+                // instructions instead — the app only displays text, the
+                // user runs it (CLISetupInstructions). The DMG build keeps
+                // the one-click launcher.
+                if BuildFeatures.current.cliLauncher {
+                    CLILauncherButton(
+                        baseURL: server.baseURL,
+                        servedModelId: server.modelInfo?.name ?? "mlx-serve",
+                        serverContextLength: server.modelInfo?.contextLength,
+                        isEnabled: server.status == .running
+                    )
+                } else {
+                    CLISetupInstructionsButton(
+                        baseURL: server.baseURL,
+                        servedModelId: server.modelInfo?.name ?? "mlx-serve",
+                        serverContextLength: server.modelInfo?.contextLength,
+                        isEnabled: server.status == .running
+                    )
+                }
 
                 Button {
                     server.stop()
@@ -843,6 +853,10 @@ struct StatusDot: View {
 
 struct EndpointsSection: View {
     let baseURL: String
+    /// Puts a "Metrics" button on the header row (the Browse-on-Download-
+    /// Models pattern). Callers gate it on `ServerOptions.enableMetrics` —
+    /// the panel only exists when the server got `--metrics`.
+    var showsMetricsButton: Bool = false
     @State private var copiedEndpoint: String?
     @State private var isExpanded = false
 
@@ -860,31 +874,64 @@ struct EndpointsSection: View {
     /// it normalizes to exactly one trailing slash regardless of how `baseURL`
     /// is formatted.
     static func rootURL(_ baseURL: String) -> URL? {
-        let trimmed = baseURL.hasSuffix("/") ? String(baseURL.dropLast()) : baseURL
-        return URL(string: trimmed + "/")
+        URL(string: normalized(baseURL) + "/")
+    }
+
+    /// The OpenAI-compatible client base (`/v1/`) — what most people actually
+    /// need from this accordion: the string they paste into a client's
+    /// "base URL" field. Same trailing-slash tolerance as `rootURL`.
+    static func v1BaseURL(_ baseURL: String) -> String {
+        normalized(baseURL) + "/v1/"
+    }
+
+    private static func normalized(_ baseURL: String) -> String {
+        baseURL.hasSuffix("/") ? String(baseURL.dropLast()) : baseURL
     }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
-            Button {
-                withAnimation(.easeInOut(duration: 0.2)) {
-                    isExpanded.toggle()
+            HStack(spacing: 6) {
+                Button {
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        isExpanded.toggle()
+                    }
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "chevron.right")
+                            .font(.caption2)
+                            .rotationEffect(.degrees(isExpanded ? 90 : 0))
+                        Text("Endpoints")
+                            .font(.subheadline.weight(.medium))
+                        Spacer(minLength: 0)
+                    }
+                    .foregroundStyle(.secondary)
+                    .contentShape(Rectangle())
                 }
-            } label: {
-                HStack(spacing: 4) {
-                    Image(systemName: "chevron.right")
-                        .font(.caption2)
-                        .rotationEffect(.degrees(isExpanded ? 90 : 0))
-                    Text("Endpoints")
-                        .font(.subheadline.weight(.medium))
-                    Spacer()
+                .buttonStyle(.plain)
+
+                if showsMetricsButton {
+                    Button {
+                        if let root = Self.rootURL(baseURL) {
+                            NSWorkspace.shared.open(root)
+                        }
+                    } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: "chart.bar.xaxis")
+                            Text("Metrics")
+                        }
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .help("Open the live metrics panel in your browser")
                 }
-                .foregroundStyle(.secondary)
-                .contentShape(Rectangle())
             }
-            .buttonStyle(.plain)
 
             if isExpanded {
+                // The /v1/ client base — the row most people came for, so it
+                // leads the list. A copy target like the API endpoints below.
+                copyRow(method: "BASE", display: Self.v1BaseURL(baseURL),
+                        copyKey: "/v1/", copyString: Self.v1BaseURL(baseURL))
+
                 // Root status page — click anywhere on the row to open it in the
                 // default browser (not a copy target like the API endpoints below).
                 Button {
@@ -914,34 +961,42 @@ struct EndpointsSection: View {
                 .padding(.vertical, 1)
 
                 ForEach(endpoints, id: \.path) { ep in
-                    HStack(spacing: 4) {
-                        Text(ep.method)
-                            .font(.system(size: 9, weight: .bold, design: .monospaced))
-                            .foregroundStyle(ep.method == "GET" ? .green : .blue)
-                            .frame(width: 30, alignment: .leading)
-                        Text(baseURL + ep.path)
-                            .font(.system(size: 10, design: .monospaced))
-                            .lineLimit(1)
-                            .truncationMode(.middle)
-                        Spacer()
-                        Button {
-                            NSPasteboard.general.clearContents()
-                            NSPasteboard.general.setString(baseURL + ep.path, forType: .string)
-                            copiedEndpoint = ep.path
-                            DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
-                                if copiedEndpoint == ep.path { copiedEndpoint = nil }
-                            }
-                        } label: {
-                            Image(systemName: copiedEndpoint == ep.path ? "checkmark" : "doc.on.doc")
-                                .font(.caption2)
-                        }
-                        .buttonStyle(.plain)
-                        .foregroundStyle(copiedEndpoint == ep.path ? .green : .secondary)
-                    }
-                    .padding(.vertical, 1)
+                    copyRow(method: ep.method, display: baseURL + ep.path,
+                            copyKey: ep.path, copyString: baseURL + ep.path)
                 }
             }
         }
+    }
+
+    /// One copy-target row: METHOD tag, monospaced URL, copy button with the
+    /// 1.5 s checkmark flash. `copyKey` identifies the row for the flash.
+    private func copyRow(method: String, display: String,
+                         copyKey: String, copyString: String) -> some View {
+        HStack(spacing: 4) {
+            Text(method)
+                .font(.system(size: 9, weight: .bold, design: .monospaced))
+                .foregroundStyle(method == "GET" ? .green : .blue)
+                .frame(width: 30, alignment: .leading)
+            Text(display)
+                .font(.system(size: 10, design: .monospaced))
+                .lineLimit(1)
+                .truncationMode(.middle)
+            Spacer()
+            Button {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(copyString, forType: .string)
+                copiedEndpoint = copyKey
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                    if copiedEndpoint == copyKey { copiedEndpoint = nil }
+                }
+            } label: {
+                Image(systemName: copiedEndpoint == copyKey ? "checkmark" : "doc.on.doc")
+                    .font(.caption2)
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(copiedEndpoint == copyKey ? .green : .secondary)
+        }
+        .padding(.vertical, 1)
     }
 }
 

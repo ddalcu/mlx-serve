@@ -107,9 +107,14 @@ struct WelcomeView: View {
             // CLI install row — puts an `mlx-serve` symlink on the PATH so
             // the server runs from Terminal. Rendered in every state (fixed
             // height) so the pre-sized welcome window never clips.
-            cliSection
-                .padding(.horizontal, 28)
-                .padding(.bottom, 14)
+            // The App Store build never probes (see the `.task` below), so the
+            // row would sit on `cliProbe == nil` forever — a permanent spinner
+            // offering an install that can't happen. Drop it entirely.
+            if BuildFeatures.current.cliInstaller {
+                cliSection
+                    .padding(.horizontal, 28)
+                    .padding(.bottom, 14)
+            }
 
             // Dismiss button
             Button {
@@ -135,6 +140,8 @@ struct WelcomeView: View {
         }
         .opacity(appeared ? 1 : 0)
         .task {
+            // The App Store build can't install a CLI symlink, so don't offer it.
+            guard BuildFeatures.current.cliInstaller else { return }
             let probe = await Task.detached { CLIInstaller.probe() }.value
             cliProbe = probe
         }

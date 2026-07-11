@@ -26,6 +26,12 @@ final class CLILauncher: ObservableObject {
 
     /// Re-scan PATH. Cheap — three `which` calls in a single shell invocation.
     func refresh() async {
+        // The App Store build cannot detect or launch other apps (App Review
+        // 2.5.2) — it has no host shell to scan PATH with, either. Stay empty.
+        guard BuildFeatures.current.cliLauncher else {
+            self.hasScanned = true
+            return
+        }
         let found = await Self.detectInstalled()
         self.available = found
         self.hasScanned = true
@@ -134,7 +140,7 @@ struct LauncherCLI: Identifiable, Equatable {
     let iconSystemName: String?
     let useClaudeIcon: Bool
     /// Optional side-effect invoked before the terminal script runs (e.g. write
-    /// `~/.pi/agent/models.json`).
+    /// pi's `models.json` into its dedicated `~/.mlx-serve/pi/` config dir).
     let prepareConfig: (@Sendable (_ baseURL: String, _ servedModelId: String,
                                   _ budget: AgentBudget.Budget) -> Void)?
     /// Shell body that sets env vars and execs the CLI. Does NOT include the shebang.
@@ -165,16 +171,22 @@ extension LauncherCLI {
         }
     )
 
-    /// pi (https://github.com/badlogic/pi-mono) — OpenAI-compatible. Needs a
-    /// `~/.pi/agent/models.json` entry naming our provider.
+    /// pi (https://github.com/earendil-works/pi, pi.dev) — OpenAI-compatible.
+    /// Needs a `models.json` naming our provider; ours lives in a dedicated
+    /// config dir selected via `PI_CODING_AGENT_DIR`.
     static let pi = LauncherCLI(
         id: "pi",
         displayName: "pi",
         binaryName: "pi",
         iconSystemName: "terminal",
         useClaudeIcon: false,
+        // A dedicated config dir (via PI_CODING_AGENT_DIR) rather than the real
+        // ~/.pi/agent: writing models.json there would DESTROY any providers
+        // the user already configured. Same isolation move as OPENCODE_CONFIG,
+        // and the same dir the MAS instructions panel tells the user to create
+        // (CLISetupInstructionsTests pins the two against each other).
         prepareConfig: { baseURL, model, budget in
-            let dir = NSString(string: "~/.pi/agent").expandingTildeInPath
+            let dir = NSString(string: "~/.mlx-serve/pi").expandingTildeInPath
             try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
             let config = AgentConfigs.piModelsJSON(baseURL: baseURL, model: model, budget: budget)
             let path = (dir as NSString).appendingPathComponent("models.json")
@@ -182,6 +194,7 @@ extension LauncherCLI {
         },
         scriptBody: { _, model, cdLine, _ in
             """
+            export PI_CODING_AGENT_DIR="$HOME/.mlx-serve/pi"
             \(cdLine)
             pi --provider mlx --model \(model)
             """
@@ -189,23 +202,20 @@ extension LauncherCLI {
     )
 
     /// opencode (https://opencode.ai) — registers a custom OpenAI-compatible
-    /// provider via a dedicated `OPENCODE_CONFIG` file so the user's main
-    /// `~/.config/opencode/opencode.json` is left untouched.
+    /// provider via the inline `OPENCODE_CONFIG_CONTENT` env var, which MERGES
+    /// over the user's global/project config (their settings and plugins keep
+    /// working) and needs no file writes at all. Same block as the MAS
+    /// instructions panel (CLISetupInstructionsTests pins the two together).
     static let opencode = LauncherCLI(
         id: "opencode",
         displayName: "OpenCode",
         binaryName: "opencode",
         iconSystemName: "chevron.left.forwardslash.chevron.right",
         useClaudeIcon: false,
-        prepareConfig: { baseURL, model, budget in
-            let config = AgentConfigs.opencodeJSON(baseURL: baseURL, model: model, budget: budget)
-            let path = NSTemporaryDirectory() + "mlx-opencode-config.json"
-            try? config.write(toFile: path, atomically: true, encoding: String.Encoding.utf8)
-        },
-        scriptBody: { _, model, cdLine, _ in
-            let configPath = NSTemporaryDirectory() + "mlx-opencode-config.json"
-            return """
-            export OPENCODE_CONFIG='\(configPath)'
+        prepareConfig: nil,
+        scriptBody: { baseURL, model, cdLine, budget in
+            """
+            export OPENCODE_CONFIG_CONTENT='\(AgentConfigs.opencodeJSON(baseURL: baseURL, model: model, budget: budget))'
             \(cdLine)
             opencode --model mlx/\(model)
             """
@@ -263,21 +273,19 @@ struct CLILauncherButton: View {
                         }
                     }
                 } label: {
-                    HStack(spacing: 6) {
+                    HStack(spacing: TrayFooterMetrics.iconSpacing) {
                         Image(systemName: "terminal")
                         Text("Code")
                     }
                     .frame(maxWidth: .infinity)
                 }
-                .menuStyle(.borderlessButton)
+                // Standard bordered-button chrome so the menu is visually
+                // identical to its sibling Chat/Tasks buttons — the previous
+                // hand-rolled stroke + material background rendered as an
+                // odd-one-out outlined pill in the tray footer.
+                .menuStyle(.button)
+                .buttonStyle(.bordered)
                 .menuIndicator(.hidden)
-                .padding(.horizontal, 6)
-                .padding(.vertical, 3)
-                .background(
-                    RoundedRectangle(cornerRadius: 5)
-                        .strokeBorder(.tertiary, lineWidth: 0.5)
-                        .background(RoundedRectangle(cornerRadius: 5).fill(.regularMaterial))
-                )
                 .disabled(!isEnabled)
                 .help("Launch coding agent (\(detector.available.map(\.displayName).joined(separator: ", ")))")
             }
@@ -288,7 +296,7 @@ struct CLILauncherButton: View {
     /// Tray launcher label — icon + "Code" so it sits alongside the Chat/Tasks buttons.
     @ViewBuilder
     private func label(for cli: LauncherCLI) -> some View {
-        HStack(spacing: 6) {
+        HStack(spacing: TrayFooterMetrics.iconSpacing) {
             if cli.useClaudeIcon {
                 ClaudeIcon(size: 12)
             } else {

@@ -8,6 +8,11 @@ struct ChatSession: Identifiable, Codable {
     var updatedAt: Date
     var mode: ChatMode
     var workingDirectory: String?
+    /// The attached document folder (mini RAG), persisted so the index can be
+    /// rebuilt after a relaunch. The matching security-scoped bookmark
+    /// (`SecurityScopedBookmark.attachedFolderName(id)`) is what keeps the path
+    /// reachable under the App Sandbox once the NSOpenPanel grant is gone.
+    var attachedFolderPath: String?
     /// Non-nil marks this session as the transient vehicle for an unattended task
     /// run (see TaskScheduler). Such sessions are filtered out of the chat sidebar
     /// and never persisted to chat-history.json — their transcript lives under
@@ -33,6 +38,7 @@ struct ChatSession: Identifiable, Codable {
         self.updatedAt = Date()
         self.mode = .chat
         self.workingDirectory = ChatSession.defaultWorkingDirectory
+        self.attachedFolderPath = nil
         self.taskRunId = nil
         self.isExternalBridge = false
         self.enableThinking = false
@@ -40,7 +46,7 @@ struct ChatSession: Identifiable, Codable {
     }
 
     enum CodingKeys: String, CodingKey {
-        case id, title, messages, createdAt, updatedAt, mode, workingDirectory, taskRunId, isExternalBridge, enableThinking, useMCP
+        case id, title, messages, createdAt, updatedAt, mode, workingDirectory, attachedFolderPath, taskRunId, isExternalBridge, enableThinking, useMCP
     }
 
     init(from decoder: Decoder) throws {
@@ -61,6 +67,8 @@ struct ChatSession: Identifiable, Codable {
         // at ~/.mlx-serve/workspace so the agent's tools and MCP servers both have a sane default.
         let decoded = try c.decodeIfPresent(String.self, forKey: .workingDirectory)
         workingDirectory = decoded ?? ChatSession.defaultWorkingDirectory
+        // Sessions saved before attach-a-folder persisted simply have none.
+        attachedFolderPath = try c.decodeIfPresent(String.self, forKey: .attachedFolderPath)
     }
 
     /// Shared default cwd for all chat sessions. Same path used by CLILauncher, AgentEngine,

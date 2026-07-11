@@ -122,7 +122,15 @@ final class CLIInstallerTests: XCTestCase {
         return dir
     }
 
+    func testInstallIsUnavailableInTheAppStoreBuild() throws {
+        try XCTSkipIf(BuildFeatures.current.cliInstaller, "only meaningful in the App Store build")
+        XCTAssertThrowsError(try CLIInstaller.installIntoHomeBin(directory: "/tmp/x", binarySource: "/tmp/y")) { error in
+            XCTAssertTrue("\(error)".contains("unavailableInThisBuild"), "\(error)")
+        }
+    }
+
     func testInstallIntoHomeBinCreatesSymlink() throws {
+        try XCTSkipUnless(BuildFeatures.current.cliInstaller, "CLI install is compiled out of the App Store build")
         let dir = try makeTempDir()
         let source = dir + "/fake-mlx-serve"
         FileManager.default.createFile(atPath: source, contents: Data("x".utf8))
@@ -134,6 +142,7 @@ final class CLIInstallerTests: XCTestCase {
     }
 
     func testInstallReplacesStaleOrDanglingLink() throws {
+        try XCTSkipUnless(BuildFeatures.current.cliInstaller, "CLI install is compiled out of the App Store build")
         let dir = try makeTempDir()
         let source = dir + "/fake-mlx-serve"
         FileManager.default.createFile(atPath: source, contents: Data("x".utf8))

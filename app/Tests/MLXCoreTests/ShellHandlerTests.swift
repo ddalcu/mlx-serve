@@ -7,7 +7,7 @@ import XCTest
 final class ShellHandlerTests: XCTestCase {
 
     func testEchoSucceeds() async throws {
-        let out = try await ShellHandler().execute(parameters: ["command": "echo hello"], workingDirectory: nil)
+        let out = try await ShellHandler(hostShellAllowed: true, sandboxEnabled: { false }).execute(parameters: ["command": "echo hello"], workingDirectory: nil)
         XCTAssertTrue(out.contains("hello"), out)
         XCTAssertFalse(out.contains("timed out"), out)
         XCTAssertFalse(out.contains("exit code"), out)
@@ -16,7 +16,7 @@ final class ShellHandlerTests: XCTestCase {
     func testChildStdinIsEmpty() async throws {
         // Contract: the child's stdin is /dev/null, so a command that consumes
         // stdin sees zero bytes (and an interactive prompt would hit EOF).
-        let out = try await ShellHandler().execute(parameters: ["command": "wc -c"], workingDirectory: nil)
+        let out = try await ShellHandler(hostShellAllowed: true, sandboxEnabled: { false }).execute(parameters: ["command": "wc -c"], workingDirectory: nil)
         // `wc -c` over /dev/null prints 0.
         XCTAssertTrue(out.contains("0"), out)
         XCTAssertFalse(out.contains("timed out"), out)
@@ -24,7 +24,7 @@ final class ShellHandlerTests: XCTestCase {
 
     func testTimeoutKillsHangingCommandQuickly() async throws {
         let start = Date()
-        let out = try await ShellHandler(timeoutSeconds: 2).execute(parameters: ["command": "sleep 20"], workingDirectory: nil)
+        let out = try await ShellHandler(timeoutSeconds: 2, hostShellAllowed: true, sandboxEnabled: { false }).execute(parameters: ["command": "sleep 20"], workingDirectory: nil)
         let elapsed = Date().timeIntervalSince(start)
         XCTAssertTrue(out.contains("timed out"), out)
         // Must be bounded by the timeout, not the 20s sleep.
@@ -32,20 +32,20 @@ final class ShellHandlerTests: XCTestCase {
     }
 
     func testNonZeroExitReported() async throws {
-        let out = try await ShellHandler().execute(parameters: ["command": "exit 7"], workingDirectory: nil)
+        let out = try await ShellHandler(hostShellAllowed: true, sandboxEnabled: { false }).execute(parameters: ["command": "exit 7"], workingDirectory: nil)
         XCTAssertTrue(out.contains("[exit code: 7]"), out)
     }
 
     func testRunsInWorkingDirectory() async throws {
         let tmp = NSTemporaryDirectory()
-        let out = try await ShellHandler().execute(parameters: ["command": "pwd"], workingDirectory: tmp)
+        let out = try await ShellHandler(hostShellAllowed: true, sandboxEnabled: { false }).execute(parameters: ["command": "pwd"], workingDirectory: tmp)
         let resolved = (tmp as NSString).standardizingPath
         XCTAssertTrue(out.contains(resolved) || out.contains(tmp), out)
     }
 
     func testMissingCommandThrows() async {
         do {
-            _ = try await ShellHandler().execute(parameters: [:], workingDirectory: nil)
+            _ = try await ShellHandler(hostShellAllowed: true, sandboxEnabled: { false }).execute(parameters: [:], workingDirectory: nil)
             XCTFail("expected missingParameter")
         } catch {
             // expected
@@ -61,7 +61,7 @@ final class ShellHandlerTests: XCTestCase {
         let reg = ProcessRegistry()
         defer { reg.killAll() }
         let start = Date()
-        let out = try await ShellHandler(registry: reg).execute(
+        let out = try await ShellHandler(registry: reg, hostShellAllowed: true, sandboxEnabled: { false }).execute(
             parameters: ["command": "sleep 5", "run_in_background": "true"], workingDirectory: nil)
         let elapsed = Date().timeIntervalSince(start)
         XCTAssertLessThan(elapsed, 2, "background start must return promptly (elapsed \(elapsed)s)")
@@ -72,7 +72,7 @@ final class ShellHandlerTests: XCTestCase {
     /// Without a registry the flag degrades to a graceful error — no crash, no
     /// orphaned process.
     func testRunInBackgroundWithoutRegistryIsGraceful() async throws {
-        let out = try await ShellHandler().execute(
+        let out = try await ShellHandler(hostShellAllowed: true, sandboxEnabled: { false }).execute(
             parameters: ["command": "sleep 1", "run_in_background": "true"], workingDirectory: nil)
         XCTAssertTrue(out.lowercased().contains("background"), out)
         XCTAssertFalse(out.contains("bg1"), out)
@@ -84,7 +84,7 @@ final class ShellHandlerTests: XCTestCase {
     func testForegroundTimeoutAdoptsInsteadOfKilling() async throws {
         let reg = ProcessRegistry()
         defer { reg.killAll() }
-        let out = try await ShellHandler(timeoutSeconds: 1, registry: reg).execute(
+        let out = try await ShellHandler(timeoutSeconds: 1, registry: reg, hostShellAllowed: true, sandboxEnabled: { false }).execute(
             parameters: ["command": "sleep 30"], workingDirectory: nil)
         XCTAssertTrue(out.contains("managed in the background"), out)
         XCTAssertTrue(out.contains("NOT killed"), out)
@@ -114,7 +114,7 @@ final class ShellHandlerTests: XCTestCase {
         let reg = ProcessRegistry()
         defer { reg.killAll() }
         let start = Date()
-        let out = try await ShellHandler(registry: reg).execute(
+        let out = try await ShellHandler(registry: reg, hostShellAllowed: true, sandboxEnabled: { false }).execute(
             parameters: ["command": "sleep 30", "run_in_background": "1"], workingDirectory: nil)
         XCTAssertLessThan(Date().timeIntervalSince(start), 3, "run_in_background:1 must background, not block")
         XCTAssertTrue(out.contains("bg1"), out)
@@ -146,7 +146,7 @@ final class ShellHandlerTests: XCTestCase {
         let reg = ProcessRegistry()
         defer { reg.killAll() }
         let start = Date()
-        let out = try await ShellHandler(registry: reg).execute(
+        let out = try await ShellHandler(registry: reg, hostShellAllowed: true, sandboxEnabled: { false }).execute(
             parameters: ["command": "sleep 30 &"], workingDirectory: nil)
         XCTAssertLessThan(Date().timeIntervalSince(start), 3, "auto-background should return promptly")
         XCTAssertTrue(out.contains("bg1"), out)
@@ -160,7 +160,7 @@ final class ShellHandlerTests: XCTestCase {
     func testRedundantAmpersandWithFlagStaysTracked() async throws {
         let reg = ProcessRegistry()
         defer { reg.killAll() }
-        let out = try await ShellHandler(registry: reg).execute(
+        let out = try await ShellHandler(registry: reg, hostShellAllowed: true, sandboxEnabled: { false }).execute(
             parameters: ["command": "sleep 30 &", "run_in_background": "true"], workingDirectory: nil)
         XCTAssertTrue(out.contains("bg1"), out)
         XCTAssertTrue(reg.isAlive(handle: "bg1"), "redundant & must not orphan the tracked process")
@@ -171,6 +171,18 @@ final class ShellHandlerTests: XCTestCase {
     /// With the Agent Sandbox ON, a background-flagged command must NEVER reach
     /// the host ProcessRegistry — that executes on the host and defeats the
     /// isolation promise (the agent prompt actively suggests run_in_background).
+    /// The App Store build has no host shell, so EVERY command routes into the
+    /// guest regardless of the user's sandbox toggle.
+    func testRouteWithoutHostShellForcesGuest() {
+        for wantsBackground in [true, false] {
+            let route = ShellHandler.route(sandboxEnabled: false, wantsBackground: wantsBackground,
+                                           hasTrailingAmp: false, hasRegistry: true,
+                                           hostShellAllowed: false)
+            XCTAssertEqual(route, wantsBackground ? .sandboxBackground : .sandboxForeground,
+                           "no host shell must never route to a host process")
+        }
+    }
+
     func testRouteSandboxOnNeverYieldsHostBackground() {
         for amp in [false, true] {
             for hasRegistry in [false, true] {
@@ -181,11 +193,15 @@ final class ShellHandlerTests: XCTestCase {
                     "flagged background with sandbox on must run inside the guest (amp=\(amp) registry=\(hasRegistry))")
             }
         }
-        // A bare trailing `&` (no flag) goes through the normal guest foreground
-        // path — the guest shell backgrounds it itself.
+        // A bare trailing `&` routes to the managed guest background path, same
+        // as it routes to the managed HOST background path when the sandbox is
+        // off. Under vsock a foreground `cmd &` would otherwise WAIT on the
+        // orphan's inherited stdout pipe until the timeout kills the call —
+        // the legacy console shell returned promptly, so this only became
+        // visible with the exec transport.
         XCTAssertEqual(ShellHandler.route(sandboxEnabled: true, wantsBackground: false,
                                           hasTrailingAmp: true, hasRegistry: true),
-                       .sandboxForeground)
+                       .sandboxBackground)
         XCTAssertEqual(ShellHandler.route(sandboxEnabled: true, wantsBackground: false,
                                           hasTrailingAmp: false, hasRegistry: true),
                        .sandboxForeground)
@@ -193,21 +209,27 @@ final class ShellHandlerTests: XCTestCase {
 
     /// Sandbox off keeps today's host behavior exactly.
     func testRouteSandboxOffPreservesHostBehavior() {
-        XCTAssertEqual(ShellHandler.route(sandboxEnabled: false, wantsBackground: true,
+        // Developer ID: a host shell exists. (The App Store build has none — see
+        // testRouteWithoutHostShellForcesGuest.)
+        func route(sandboxEnabled: Bool, wantsBackground: Bool, hasTrailingAmp: Bool, hasRegistry: Bool) -> ShellHandler.ShellRoute {
+            ShellHandler.route(sandboxEnabled: sandboxEnabled, wantsBackground: wantsBackground,
+                               hasTrailingAmp: hasTrailingAmp, hasRegistry: hasRegistry, hostShellAllowed: true)
+        }
+        XCTAssertEqual(route(sandboxEnabled: false, wantsBackground: true,
                                           hasTrailingAmp: false, hasRegistry: true),
                        .hostBackground)
-        XCTAssertEqual(ShellHandler.route(sandboxEnabled: false, wantsBackground: false,
+        XCTAssertEqual(route(sandboxEnabled: false, wantsBackground: false,
                                           hasTrailingAmp: true, hasRegistry: true),
                        .hostBackground)
-        XCTAssertEqual(ShellHandler.route(sandboxEnabled: false, wantsBackground: true,
+        XCTAssertEqual(route(sandboxEnabled: false, wantsBackground: true,
                                           hasTrailingAmp: false, hasRegistry: false),
                        .hostBackgroundUnavailable,
                        "explicit flag with no registry keeps the graceful error")
-        XCTAssertEqual(ShellHandler.route(sandboxEnabled: false, wantsBackground: false,
+        XCTAssertEqual(route(sandboxEnabled: false, wantsBackground: false,
                                           hasTrailingAmp: true, hasRegistry: false),
                        .hostForeground,
                        "bare & with no registry runs foreground, as before")
-        XCTAssertEqual(ShellHandler.route(sandboxEnabled: false, wantsBackground: false,
+        XCTAssertEqual(route(sandboxEnabled: false, wantsBackground: false,
                                           hasTrailingAmp: false, hasRegistry: true),
                        .hostForeground)
     }
@@ -243,7 +265,7 @@ final class ShellHandlerTests: XCTestCase {
     func testRegisterSandboxBackgroundSetsHandleBoxAndRegisters() async {
         let reg = ProcessRegistry(); defer { reg.killAll() }
         let box = ProcessHandleBox()
-        let handler = ShellHandler(registry: reg, handleBox: box)
+        let handler = ShellHandler(registry: reg, handleBox: box, hostShellAllowed: true, sandboxEnabled: { false })
         let msg = await handler.registerSandboxBackground(
             command: "python3 -m http.server 8080", guestPID: 4242,
             logPath: "/tmp/mlx-bg-1.log", cwd: "/work")
@@ -261,7 +283,7 @@ final class ShellHandlerTests: XCTestCase {
     /// path degrades to the log-only message — no handle, no crash.
     func testRegisterSandboxBackgroundWithoutRegistryFallsBack() async {
         let box = ProcessHandleBox()
-        let handler = ShellHandler(handleBox: box)
+        let handler = ShellHandler(handleBox: box, hostShellAllowed: true, sandboxEnabled: { false })
         let msg = await handler.registerSandboxBackground(
             command: "srv", guestPID: 5, logPath: "/tmp/x.log", cwd: "/work")
         XCTAssertNil(box.handle)

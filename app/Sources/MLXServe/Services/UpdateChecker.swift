@@ -198,6 +198,10 @@ final class UpdateChecker: ObservableObject {
     /// surface them plus an explicit "up to date".
     @discardableResult
     func check(userInitiated: Bool = false) async -> AppUpdate? {
+        // The Mac App Store updates the app itself; a self-updater that
+        // downloads and swaps the bundle is forbidden (App Review 2.5.2). No
+        // network check, no install path.
+        guard BuildFeatures.current.selfUpdate else { return nil }
         switch phase {
         case .checking, .downloading, .installing: return available
         default: break

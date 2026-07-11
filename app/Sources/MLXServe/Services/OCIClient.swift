@@ -2,9 +2,10 @@ import Foundation
 import Compression
 
 /// Minimal, dependency-free OCI/Docker registry client: pulls an image's arm64
-/// rootfs (anonymous auth token dance → manifest → layers → bsdtar unpack with
-/// whiteout handling) and extracts the image config (Env/WorkingDir) the guest
-/// init script needs. Replaces libcontain's `contain_pull_image`.
+/// rootfs (anonymous auth token dance → manifest → layers → in-process
+/// `TarReader` unpack with whiteout handling) and extracts the image config
+/// (Env/WorkingDir) the guest init script needs. Replaces libcontain's
+/// `contain_pull_image`. No subprocesses — App Sandbox safe.
 ///
 /// Scope: anonymous pulls (public images), tag or digest refs, Docker Hub +
 /// generic v2 registries (ghcr.io etc). Pure parsing helpers are unit-tested;
@@ -154,7 +155,7 @@ enum OCIClient {
         return applied
     }
 
-    // MARK: gunzip (kernel release asset; layers go through bsdtar)
+    // MARK: gunzip (kernel release asset + gzip image layers)
 
     /// Decompress a gzip container (RFC 1952 header + raw DEFLATE payload) using
     /// the Compression framework — no Process, sandbox-safe, works for the ~12 MB
@@ -401,21 +402,29 @@ enum OCIClient {
         return parseImageConfig(cfgData)
     }
 
-    /// Unpack one layer tarball with bsdtar (auto-detects gzip/zstd). No `-p`:
-    /// the guest runs as root regardless, and setuid bits from the tar would
-    /// need root to restore on the host side.
-    private static func extractLayer(_ tarball: URL, into dir: URL) throws {
-        let p = Process()
-        p.executableURL = URL(fileURLWithPath: "/usr/bin/tar")
-        p.arguments = ["-x", "-f", tarball.path, "-C", dir.path]
-        let stderr = Pipe()
-        p.standardError = stderr
-        p.standardOutput = FileHandle.nullDevice
-        try p.run()
-        p.waitUntilExit()
-        guard p.terminationStatus == 0 else {
-            let err = String(decoding: stderr.fileHandleForReading.readDataToEndOfFile(), as: UTF8.self)
-            throw PullError(message: "layer unpack failed: \(err.prefix(400))")
+    /// Unpack one layer tarball in-process (`TarReader`). This used to shell out
+    /// to `/usr/bin/tar`, which is unreachable from inside the App Sandbox
+    /// container and is a host escape from the Agent Sandbox.
+    ///
+    /// Compression is sniffed from the magic bytes rather than trusted from the
+    /// manifest's `mediaType`. Zstd layers (`application/vnd.oci.image.layer.v1
+    /// .tar+zstd`) are rejected loudly: the Compression framework has no zstd
+    /// decoder, and silently mis-unpacking a rootfs is far worse than failing.
+    static func extractLayer(_ tarball: URL, into dir: URL) throws {
+        let raw = try Data(contentsOf: tarball, options: .mappedIfSafe)
+        try TarReader.extract(try decompressLayer(raw), into: dir)
+    }
+
+    /// gzip (`1f 8b`) → inflate. zstd (`28 b5 2f fd`) → unsupported. Otherwise
+    /// assume a plain tar stream.
+    static func decompressLayer(_ raw: Data) throws -> Data {
+        let magic = [UInt8](raw.prefix(4))
+        if magic.count >= 2, magic[0] == 0x1f, magic[1] == 0x8b {
+            return try gunzip(raw)
         }
+        if magic.count >= 4, magic[0] == 0x28, magic[1] == 0xb5, magic[2] == 0x2f, magic[3] == 0xfd {
+            throw PullError(message: "layer is zstd-compressed, which this client cannot decode — use a gzip-layer image")
+        }
+        return raw
     }
 }

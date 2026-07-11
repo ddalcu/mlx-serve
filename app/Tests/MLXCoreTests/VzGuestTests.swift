@@ -7,10 +7,20 @@ import XCTest
 /// (run in the signed app: SANDBOX_SMOKE=1).
 final class VzGuestTests: XCTestCase {
 
+    /// The legacy hvc1-shell layout. Explicit, because the DEFAULT transport is
+    /// now `.vsock` — these assertions are about the arm that is on its way out.
     private func baseConfig() -> VzGuest.Config {
         var c = VzGuest.Config(kernelPath: "/k", rootfsDir: "/r")
         c.workspacePath = "/Users/d/proj"
         c.workdir = "/workspace"
+        c.transport = .legacyConsole
+        return c
+    }
+
+    private func vsockConfig() -> VzGuest.Config {
+        var c = baseConfig()
+        c.transport = .vsock
+        c.agentBinaryPath = "/tmp/vz-agent"
         return c
     }
 
@@ -56,7 +66,7 @@ final class VzGuestTests: XCTestCase {
         XCTAssertFalse(s.contains("mount -t virtiofs \(VzGuest.workspaceTag)"))
     }
 
-    func testInitScriptRunsShellOnSecondConsolePort() {
+    func testLegacyInitScriptRunsShellOnSecondConsolePort() {
         let s = VzGuest.buildInitScript(config: baseConfig())
         // The shell lives on /dev/hvc1 — a dedicated clean channel. hvc0 keeps
         // kernel printk so boot failures stay diagnosable without polluting the
@@ -68,6 +78,49 @@ final class VzGuestTests: XCTestCase {
         // poweroff_seq: slim images ship no poweroff binary → sysrq fallback).
         XCTAssertTrue(s.contains("poweroff -f"))
         XCTAssertTrue(s.contains("echo o > /proc/sysrq-trigger"))
+    }
+
+    // MARK: vsock transport
+
+    func testVsockInitScriptExecsTheAgentAndHasNoShell() {
+        let s = VzGuest.buildInitScript(config: vsockConfig())
+        XCTAssertTrue(s.contains(VzGuest.agentGuestPath),
+                      "PID 1 must hand off to the guest agent")
+        XCTAssertFalse(s.contains("setsid -c /bin/sh"),
+                       "the persistent hvc1 shell is the legacy transport")
+        // If the agent ever returns, the guest must power off, not spin.
+        XCTAssertTrue(s.contains("poweroff -f"))
+    }
+
+    /// hvc numbering follows `serialPorts` order. `.vsock` drops the shell port,
+    /// so the monitor slides from hvc2 to hvc1. Getting this wrong is SILENT:
+    /// the monitor writes to a device nobody reads, and the tray's RAM readout
+    /// plus the live port map simply stop, with no error anywhere.
+    func testMonitorDeviceFollowsTheSerialPortCount() {
+        XCTAssertEqual(VzGuest.monitorDevice(transport: .legacyConsole), "/dev/hvc2")
+        XCTAssertEqual(VzGuest.monitorDevice(transport: .vsock), "/dev/hvc1")
+    }
+
+    func testVsockInitScriptWritesTheMonitorToHvc1NotHvc2() {
+        var c = vsockConfig()
+        c.network = true
+        let s = VzGuest.buildInitScript(config: c)
+
+        XCTAssertTrue(s.contains(">/dev/hvc1 2>/dev/null &"),
+                      "the monitor loop must target hvc1 when the shell port is gone")
+        XCTAssertFalse(s.contains("/dev/hvc2"),
+                       "hvc2 does not exist with only two serial ports")
+        // Everything the host parser needs must still be there.
+        XCTAssertTrue(s.contains("=EOS="))
+        XCTAssertTrue(s.contains("=IP="))
+        XCTAssertTrue(s.contains("/proc/net/tcp"))
+    }
+
+    func testLegacyInitScriptStillWritesTheMonitorToHvc2() {
+        var c = baseConfig()
+        c.network = true
+        let s = VzGuest.buildInitScript(config: c)
+        XCTAssertTrue(s.contains(">/dev/hvc2 2>/dev/null &"))
     }
 
     func testInitScriptExportsImageEnvShellQuoted() {
@@ -102,7 +155,7 @@ final class VzGuestTests: XCTestCase {
 
     // MARK: networking in the init script
 
-    func testInitScriptNetworkOnWiresDnsAndPortMonitor() {
+    func testLegacyInitScriptNetworkOnWiresDnsAndPortMonitor() {
         var c = baseConfig()
         c.network = true
         let s = VzGuest.buildInitScript(config: c)

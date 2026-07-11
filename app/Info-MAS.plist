@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDisplayName</key>
+	<string>MLX Core</string>
+	<key>CFBundleExecutable</key>
+	<string>MLXCore</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
+	<key>CFBundleIdentifier</key>
+	<string>com.dalcu.mlx-core.mas</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>MLX Core</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>26.7.6</string>
+	<key>CFBundleVersion</key>
+	<string>26.7.6</string>
+	<key>ITSAppUsesNonExemptEncryption</key>
+	<false/>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.developer-tools</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>26.0</string>
+	<key>LSUIElement</key>
+	<true/>
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+	</dict>
+	<key>NSHumanReadableCopyright</key>
+	<string>Copyright 2026 David Dalcu. All rights reserved.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>MLX Core records audio from your microphone so multimodal models (like Gemma 4 12B) can listen to and respond to your voice.</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>MLX Core uses Apple's on-device speech recognition in Voice mode so you can talk to the model hands-free, even with no internet. Your audio is transcribed locally on your Mac; this app forces on-device recognition and never sends your speech to Apple's servers. (The wording above is Apple's standard text for this permission.)</string>
+</dict>
+</plist>

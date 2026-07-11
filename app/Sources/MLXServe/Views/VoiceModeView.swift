@@ -120,7 +120,7 @@ struct VoiceModeView: View {
         // pushes the circle buttons off the bottom of the sheet.
         VStack(spacing: 10) {
             HStack(spacing: 8) {
-                chip("Hey Loki", system: "mic.circle", on: controller.requireWakeWord) { controller.requireWakeWord.toggle() }
+                chip(controller.wakePhraseDisplay, system: "mic.circle", on: controller.requireWakeWord) { controller.requireWakeWord.toggle() }
                 chip("Think", system: "brain", on: controller.enableThinking) { controller.enableThinking.toggle() }
                 chip("Agent", system: "wrench", on: controller.agentMode) {
                     controller.agentMode.toggle()

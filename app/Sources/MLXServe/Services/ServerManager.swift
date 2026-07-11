@@ -621,36 +621,19 @@ class ServerManager: ObservableObject {
         }
     }
 
+    /// Was `/usr/sbin/lsof -nP -iTCP:<port> -sTCP:LISTEN -t`; now libproc, which
+    /// is what lsof itself reads. `lsof` is not reachable from inside the App
+    /// Sandbox container. See `SystemMetrics`.
     private func pidsListening(on port: UInt16) -> [pid_t] {
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: "/usr/sbin/lsof")
-        task.arguments = ["-nP", "-iTCP:\(port)", "-sTCP:LISTEN", "-t"]
-        let pipe = Pipe()
-        task.standardOutput = pipe
-        task.standardError = FileHandle.nullDevice
-        do { try task.run() } catch { return [] }
-        task.waitUntilExit()
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        let output = String(data: data, encoding: .utf8) ?? ""
-        return output.split(whereSeparator: { $0.isNewline || $0.isWhitespace })
-            .compactMap { pid_t($0) }
+        SystemMetrics.pidsListening(onTCPPort: port)
     }
 
+    /// Was `/bin/ps -p <pid> -o comm=` plus `lastPathComponent`; now
+    /// `proc_pidpath`. Note the two can report different *paths* for the same
+    /// process (ps reports the launch path, proc_pidpath resolves symlinks) —
+    /// the last component, which is all this compares, agrees.
     private func processName(pid: pid_t) -> String {
-        let task = Process()
-        task.executableURL = URL(fileURLWithPath: "/bin/ps")
-        task.arguments = ["-p", "\(pid)", "-o", "comm="]
-        let pipe = Pipe()
-        task.standardOutput = pipe
-        task.standardError = FileHandle.nullDevice
-        do { try task.run() } catch { return "" }
-        task.waitUntilExit()
-        let data = pipe.fileHandleForReading.readDataToEndOfFile()
-        let raw = (String(data: data, encoding: .utf8) ?? "")
-            .trimmingCharacters(in: .whitespacesAndNewlines)
-        // `ps -o comm=` returns the full path of the executable on macOS;
-        // take the last path component for prefix matching.
-        return (raw as NSString).lastPathComponent
+        SystemMetrics.processName(pid: pid)
     }
 
     private func resolveBinaryPath() -> String {

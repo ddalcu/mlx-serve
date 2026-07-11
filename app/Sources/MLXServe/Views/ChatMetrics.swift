@@ -43,18 +43,4 @@ enum ChatMetrics {
     static let togglePillHeight: CGFloat = 24
     static let togglePillIconSize: CGFloat = 15
     static let togglePillSpacing: CGFloat = 8
-
-    /// Chat-pane width below which the mode pills drop their captions
-    /// (icon-only, MCP loses its gear). The decision is OURS, from measured
-    /// width — ViewThatFits inside an NSToolbar item measures once at ideal
-    /// size and shoves the whole cluster into the » overflow menu instead of
-    /// re-proposing narrower. Default window (900) with the sidebar open
-    /// leaves ~650 of detail, comfortably full-pill; icon-only kicks in when
-    /// the sidebar + a narrow window squeeze the pane.
-    static let togglePillCompactThreshold: CGFloat = 600
-
-    /// Width 0 = not measured yet → assume roomy (full pills).
-    static func useCompactToggles(forDetailWidth width: CGFloat) -> Bool {
-        width > 0 && width < togglePillCompactThreshold
-    }
 }

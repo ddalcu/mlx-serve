@@ -165,9 +165,13 @@ struct MLXCoreApp: App {
                 // Lets model rows tell "selected" from "actually loaded" — the
                 // In-use badge reads `server.status`.
                 .environmentObject(appState.server)
-                .frame(minWidth: 700, minHeight: 400)
+                // Floor derived from sidebar + detail minimums — a smaller
+                // literal here caps the window's reported minimum and lets
+                // the Discover table clip off the right edge.
+                .frame(minWidth: ModelBrowserMetrics.minWindowWidth, minHeight: 400)
         }
-        .defaultSize(width: 900, height: 600)
+        .defaultSize(width: ModelBrowserMetrics.defaultWindowWidth,
+                     height: ModelBrowserMetrics.defaultWindowHeight)
 
         Window("Image Generation", id: "imageGen") {
             ImageGenView()

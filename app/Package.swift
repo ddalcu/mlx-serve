@@ -5,10 +5,16 @@ let package = Package(
     name: "MLXCore",
     platforms: [.macOS(.v14)],
     dependencies: [
-        // Pinned to 0.10.x — last version without Swift 6.2-only `withThrowingTaskGroup { ... }`
-        // syntax. macos-14's Xcode is Swift 6.1.x. 0.11 added 2025-11-25 spec coverage + icons +
-        // elicitation updates we don't use; 0.12 added OAuth we don't use.
-        .package(url: "https://github.com/modelcontextprotocol/swift-sdk.git", "0.10.2" ..< "0.11.0"),
+        // 0.12.x needs Swift 6.2+ (uses 6.2-only `withThrowingTaskGroup { }`
+        // syntax) — fine everywhere since CI moved to the macos-26 runner
+        // (Xcode 26 / Swift 6.3); the old 0.10.x pin existed only for the
+        // retired macos-14 / Swift 6.1 runner. 0.10.x is UNBUILDABLE on Swift
+        // 6.3 in its own Swift-6 language mode ([#SendingRisksDataRace] in
+        // NetworkTransport.swift), which the SwiftPM path papered over with a
+        // global `-swift-version 5` but the Mac App Store Xcode project
+        // (project.yml) cannot — packages there compile with their own
+        // settings. Keep this pin >= 0.12.1 or the Xcode build breaks.
+        .package(url: "https://github.com/modelcontextprotocol/swift-sdk.git", "0.12.1" ..< "0.13.0"),
         // Already pulled transitively by swift-sdk; declared here so we can use OrderedDictionary
         // directly to preserve user-edited key order in mcp.json.
         .package(url: "https://github.com/apple/swift-collections.git", from: "1.0.0"),

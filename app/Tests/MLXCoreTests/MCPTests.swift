@@ -1,5 +1,6 @@
 import XCTest
 import Foundation
+import MCP
 @testable import MLXCore
 
 final class MCPTests: XCTestCase {
@@ -295,16 +296,21 @@ final class MCPTests: XCTestCase {
 
     // MARK: - Spawn pre-flight & error messages
 
+    // The preflight moved onto `MCPSpawner`, because "does this command exist"
+    // depends on WHERE the server will run — the host, or the sandbox guest.
+    // HostMCPSpawner is compiled out of the App Store build.
+    #if !MAS_BUILD
     func testCommandExistsTrueForKnownBinary() async {
         // /bin/sh always exists on macOS, and `command -v sh` resolves it via the login shell.
-        let exists = await MCPManager.commandExists("sh")
+        let exists = await HostMCPSpawner().commandExists("sh")
         XCTAssertTrue(exists)
     }
 
     func testCommandExistsFalseForGarbageName() async {
-        let exists = await MCPManager.commandExists("definitely-not-a-real-binary-xyz-9z")
+        let exists = await HostMCPSpawner().commandExists("definitely-not-a-real-binary-xyz-9z")
         XCTAssertFalse(exists)
     }
+    #endif
 
     func testInstallHintMentionsNodeForNpx() {
         let hint = MCPManager.installHint(for: "npx")
@@ -440,5 +446,28 @@ final class MCPTests: XCTestCase {
 
         // Neither.
         XCTAssertNil(ChatTurnEngine.combinedToolsJSON(agentMode: false, mcpToolsJSON: nil))
+    }
+
+    // MARK: - Tool result rendering (swift-sdk 0.12 content shapes)
+
+    /// Characterization for the 0.10 → 0.12 SDK bump: text flattens verbatim,
+    /// non-text content is summarized, and the new resourceLink case renders
+    /// a readable line instead of being dropped.
+    func testRenderToolContentFlattensTextAndSummarizesTheRest() {
+        let content: [Tool.Content] = [
+            .text(text: "hello", annotations: nil, _meta: nil),
+            .image(data: "…", mimeType: "image/png", annotations: nil, _meta: nil),
+            .audio(data: "…", mimeType: "audio/wav", annotations: nil, _meta: nil),
+            .resource(resource: .text("body", uri: "file:///a.txt", mimeType: "text/plain"),
+                      annotations: nil, _meta: nil),
+            .resourceLink(uri: "https://x.test/doc", name: "doc"),
+        ]
+        let out = MCPManager.renderToolContent(content)
+        XCTAssertTrue(out.contains("hello"))
+        XCTAssertTrue(out.contains("[image: image/png]"))
+        XCTAssertTrue(out.contains("[audio: audio/wav]"))
+        XCTAssertTrue(out.contains("[resource: file:///a.txt (text/plain)]"))
+        XCTAssertTrue(out.contains("doc") && out.contains("https://x.test/doc"))
+        XCTAssertEqual(MCPManager.renderToolContent([]), "(no content)")
     }
 }

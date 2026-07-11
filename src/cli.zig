@@ -19,6 +19,7 @@
 //! here; only the thin curl/spawn wrappers need a live network.
 
 const std = @import("std");
+const build_options = @import("build_options");
 const ollama = @import("ollama.zig");
 const model_discovery = @import("model_discovery.zig");
 const log = @import("log.zig");
@@ -324,6 +325,13 @@ fn modelPresentInDir(io: std.Io, dir: std.Io.Dir) bool {
 /// Download `resolved.repo` into `dest_dir`. Skips files already complete
 /// on disk (size match), resumes partials, reports per-file progress.
 pub fn pullRepo(allocator: std.mem.Allocator, io: std.Io, resolved: Resolved, dest_dir: []const u8, reporter: Reporter, show_progress: bool) !void {
+    // The Mac App Store build has no `curl` (the sandboxed helper can't reach
+    // it) and must not download to arbitrary paths — the Swift app owns model
+    // downloads via URLSession into the container.
+    if (build_options.mas) {
+        reporter.say("model pull is unavailable in this build", .{});
+        return error.PullUnavailable;
+    }
     reporter.say("pulling manifest for {s}", .{resolved.repo});
     const tree_url = try std.fmt.allocPrint(allocator, "https://huggingface.co/api/models/{s}/tree/main?recursive=true", .{resolved.repo});
     defer allocator.free(tree_url);

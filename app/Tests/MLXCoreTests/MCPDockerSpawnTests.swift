@@ -28,6 +28,7 @@ final class MCPDockerSpawnTests: XCTestCase {
     }
 
     func testStartEnabledFailsFastWhenServerDiesDuringInit() async throws {
+        try XCTSkipUnless(BuildFeatures.current.hostShell, "spawns a host script; the App Store build routes MCP into the guest")
         // Hermetic stand-in for docker-mcp's daemon-down behavior: print the failure to stderr and
         // exit non-zero before ever speaking MCP. The real `npx -y docker-mcp` proved too
         // environment-dependent for CI (cold npx cache or a hung child outlives the 30s connect
@@ -101,7 +102,10 @@ final class MCPDockerSpawnTests: XCTestCase {
     /// Case B: the command exists (npx) but the package it's asked to run doesn't.
     /// npx itself prints "404 Not Found" to stderr and exits — terminationHandler fast-fails for us.
     func testStartEnabledFailsFastWhenNpxPackageIsMissing() async throws {
-        guard await MCPManager.commandExists("npx") else {
+        #if MAS_BUILD
+        throw XCTSkip("host npx spawn is compiled out of the App Store build")
+        #else
+        guard await HostMCPSpawner().commandExists("npx") else {
             throw XCTSkip("npx not on PATH")
         }
         let manager = MCPManager()
@@ -126,6 +130,7 @@ final class MCPDockerSpawnTests: XCTestCase {
         let recognized = lower.contains("exit") || lower.contains("404") || lower.contains("not found") || lower.contains("error")
         XCTAssertTrue(recognized, "Error should surface npm failure; got: \(err)")
         print("[test] missing-package elapsed=\(String(format: "%.2f", elapsed))s, error=\(String(err.prefix(400)))")
+        #endif
     }
 
     /// Regression: when an entry that previously failed to start is later disabled, the stale error

@@ -52,7 +52,9 @@ enum AgentBudget {
 /// config silently strands the user on the CLI's own defaults.
 enum AgentConfigs {
 
-    /// `~/.pi/agent/models.json`
+    /// pi `models.json` — written to the dedicated `~/.mlx-serve/pi/` config
+    /// dir (selected via `PI_CODING_AGENT_DIR`), never the user's real
+    /// `~/.pi/agent`, so their own providers are never overwritten.
     static func piModelsJSON(baseURL: String, model: String, budget: AgentBudget.Budget) -> String {
         """
         {
@@ -77,7 +79,9 @@ enum AgentConfigs {
         """
     }
 
-    /// `$OPENCODE_CONFIG`
+    /// opencode provider block — shipped INLINE via `OPENCODE_CONFIG_CONTENT`
+    /// (merges over the user's own config; no file writes). The launch scripts
+    /// single-quote it, so the output must never contain a single quote.
     static func opencodeJSON(baseURL: String, model: String, budget: AgentBudget.Budget) -> String {
         """
         {

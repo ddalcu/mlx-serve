@@ -195,49 +195,21 @@ struct AgentModeToggle: View {
     }
 }
 
-// MARK: - Working Directory Indicator
+// MARK: - Workspace folder picker
 
-struct WorkingDirectoryIndicator: View {
-    @Binding var path: String?
-
-    /// The toolbar chip shows only the folder's NAME — the full path lives in
-    /// the tooltip. A full home-dir path ate toolbar width and leaked into
-    /// screenshots. Trailing slashes are tolerated; the filesystem root has no
-    /// name to abbreviate to.
-    static func displayName(_ path: String) -> String {
-        let trimmed = path.hasSuffix("/") && path.count > 1 ? String(path.dropLast()) : path
-        let name = (trimmed as NSString).lastPathComponent
-        return name.isEmpty ? trimmed : name
-    }
-
-    var body: some View {
-        Button {
-            pickDirectory()
-        } label: {
-            if let path {
-                Text(Self.displayName(path))
-                    .font(.caption)
-                    .lineLimit(1)
-            } else {
-                Text("Set folder")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-            }
-        }
-        .buttonStyle(.borderless)
-        .padding(.horizontal, 8)
-        .help("Workspace — the working directory for every Agent tool call.\nshell, readFile, writeFile, editFile, searchFiles, listFiles, browse all resolve relative paths from here. When the Agent Sandbox is on, this folder is what's mounted at /workspace in the VM.\nCurrent: \(path ?? "not set")\nClick to pick a new folder.")
-    }
-
-    private func pickDirectory() {
+/// The workspace-folder picker behind the Agent pill's folder icon (the old
+/// name-sized toolbar chip is gone — a variable-width chip in the toolbar
+/// either wasted a fixed slot or re-tripped the » eviction bug; the current
+/// folder shows in the pill's tooltip instead).
+enum WorkspacePicker {
+    static func pickDirectory() -> String? {
         let panel = NSOpenPanel()
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
         panel.allowsMultipleSelection = false
         panel.canCreateDirectories = true
         panel.prompt = "Select Working Directory"
-        if panel.runModal() == .OK, let url = panel.url {
-            path = url.path
-        }
+        guard panel.runModal() == .OK, let url = panel.url else { return nil }
+        return url.path
     }
 }

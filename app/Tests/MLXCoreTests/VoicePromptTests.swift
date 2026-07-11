@@ -56,4 +56,18 @@ final class VoicePromptTests: XCTestCase {
         XCTAssertEqual(VoicePrompt.decorate(nil), VoicePrompt.speakingStyle)
         XCTAssertEqual(VoicePrompt.decorate(""), VoicePrompt.speakingStyle)
     }
+
+    /// A custom wake phrase renames the assistant everywhere in the voice
+    /// prompt — identity, the quoted wake phrase — with no trace of the
+    /// default name. Raw user formatting is tolerated.
+    func testIdentityFollowsTheCustomWakePhrase() {
+        let p = VoicePrompt.systemPrompt(now: Self.fixedNow, phrase: "Hey, JARVIS!")
+        XCTAssertTrue(p.contains("You are Jarvis"))
+        XCTAssertTrue(p.contains("\"Hey Jarvis\""))
+        XCTAssertFalse(p.contains("Loki"))
+
+        let d = VoicePrompt.decorate("You are an agent.", phrase: "hey jarvis")
+        XCTAssertTrue(d.contains("Jarvis"))
+        XCTAssertFalse(d.contains("Loki"))
+    }
 }

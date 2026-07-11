@@ -57,7 +57,13 @@ final class AgentSandbox: ObservableObject, @unchecked Sendable {
     @Published private(set) var guestMemoryText: String?
 
     private let lock = NSLock()
-    private var enabled = false
+    private var enabled = AgentSandbox.resolveEnabled(requested: false)
+    /// Transport the live guest booted with. Read by the MCP spawner and the
+    /// background-process path; `.legacyConsole` until a guest exists.
+    private(set) var transport: VzGuest.Transport = .legacyConsole
+    /// Sandbox Terminal working directory. Under vsock each command is its own
+    /// shell, so an interactive `cd` is carried here instead of in the guest.
+    private var terminalCwd = "/workspace"
     /// Seeded from the settings model's default (single source of truth —
     /// pinned by ServerOptionsTests); AppState overwrites it via `configure()`
     /// at launch and on every settings change.
@@ -84,14 +90,13 @@ final class AgentSandbox: ObservableObject, @unchecked Sendable {
     /// Tray RAM readout: used (total − available) quantized to 16 MB so nearby
     /// readings map to the SAME string (no per-second tray re-render); totals
     /// ≥ 1000 MB read in GB with one decimal.
+    /// Used-only readout ("384 MB RAM") — the "/ total" suffix was tray
+    /// noise. `totalKB` still feeds the used computation (meminfo reports
+    /// available, not used).
     static func memoryDisplayText(availableKB: Int, totalKB: Int) -> String {
         let usedMB = Double(max(0, totalKB - availableKB)) / 1024.0
         let quantized = Int((usedMB / 16.0).rounded()) * 16
-        let totalMB = Double(totalKB) / 1024.0
-        let totalText = totalMB >= 1000
-            ? String(format: "%.1f GB", Double(totalKB) / (1024.0 * 1024.0))
-            : "\(Int(totalMB.rounded())) MB"
-        return "\(quantized) MB / \(totalText) RAM"
+        return "\(quantized) MB RAM"
     }
 
     // Live guest + the host dir it shares at /workspace. Guarded by `bootLock`.
@@ -108,20 +113,33 @@ final class AgentSandbox: ObservableObject, @unchecked Sendable {
 
     var isEnabled: Bool { lock.lock(); defer { lock.unlock() }; return enabled }
 
+    /// A build with no host shell (the App Store build) cannot have the sandbox
+    /// off: `ShellHandler.route` already forces every command into the guest,
+    /// so a false `isEnabled` would only LIE downstream — the system prompt's
+    /// execution-environment section would describe a macOS/zsh/brew host the
+    /// commands never touch, and the Sandbox Terminal + tray section would stay
+    /// hidden while a guest is actually running. The settings toggle (and any
+    /// stale persisted `enabled:false`) still rules the Developer ID build.
+    static func resolveEnabled(requested: Bool,
+                               hostShellAllowed: Bool = BuildFeatures.current.hostShell) -> Bool {
+        requested || !hostShellAllowed
+    }
+
     /// Apply the Settings values. Turning the sandbox off, or changing the base
     /// image or the network mode, tears down any live guest so the next command
     /// re-provisions with the new configuration.
     func configure(enabled: Bool, baseImage: String, network: Bool = ServerOptions.SandboxConfig().network) {
+        let effective = Self.resolveEnabled(requested: enabled)
         let trimmed = baseImage.trimmingCharacters(in: .whitespacesAndNewlines)
         lock.lock()
         let imageChanged = trimmed != self.baseImage && !trimmed.isEmpty
         let networkChanged = network != self.networkEnabled
         let wasEnabled = self.enabled
-        self.enabled = enabled
+        self.enabled = effective
         self.networkEnabled = network
         if !trimmed.isEmpty { self.baseImage = trimmed }
         lock.unlock()
-        if (!enabled && wasEnabled) || (enabled && (imageChanged || networkChanged)) {
+        if (!effective && wasEnabled) || (effective && (imageChanged || networkChanged)) {
             teardown()
         }
     }
@@ -203,6 +221,51 @@ final class AgentSandbox: ObservableObject, @unchecked Sendable {
         "cd \(VzGuest.shellQuote(guestCwd)) 2>/dev/null; \(command)"
     }
 
+    // MARK: Sandbox Terminal cwd (pure)
+
+    /// Marker the terminal wrapper prints its final `$PWD` on.
+    static let cwdMarker = "__VZ_CWD__"
+
+    /// The Sandbox Terminal lets an interactive `cd` stick between commands.
+    /// The legacy transport got that for free: one long-lived shell held the
+    /// cwd. Under vsock every command is its own `sh -c`, so the shell's final
+    /// `$PWD` is echoed on a marker line and carried forward by the host.
+    ///
+    /// The exit status is preserved explicitly — `printf` would otherwise
+    /// clobber `$?`.
+    static func wrapUserCommand(_ command: String, guestCwd: String) -> String {
+        "cd \(VzGuest.shellQuote(guestCwd)) 2>/dev/null\n"
+            + command + "\n"
+            + "__vz_rc=$?; printf '\\n\(cwdMarker)%s\\n' \"$PWD\"; exit $__vz_rc"
+    }
+
+    /// Strip the marker line and report the cwd it carried. A command that
+    /// killed its own shell never prints one — then the cwd simply doesn't move.
+    static func splitCwdMarker(_ output: String) -> (body: String, cwd: String?) {
+        guard let range = output.range(of: cwdMarker, options: .backwards) else {
+            return (output, nil)
+        }
+        let cwd = output[range.upperBound...]
+            .prefix { !$0.isNewline }
+            .trimmingCharacters(in: .whitespaces)
+        var body = String(output[..<range.lowerBound])
+        if body.hasSuffix("\n") { body.removeLast() }
+        return (body, cwd.isEmpty ? nil : cwd)
+    }
+
+    /// vsock arm of `runUserCommand`: the marker rides STDOUT (the wrapper's
+    /// `printf` writes it there), so it must be parsed out of stdout ALONE and
+    /// stderr re-attached afterwards. Splitting the MERGED output instead
+    /// silently drops everything past the marker — which is exactly where a
+    /// failing command's stderr lands.
+    static func composeUserOutput(stdout: String, stderr: String) -> (body: String, cwd: String?) {
+        let split = splitCwdMarker(stdout)
+        guard !stderr.isEmpty else { return split }
+        if split.body.isEmpty { return (stderr, split.cwd) }
+        let joiner = split.body.hasSuffix("\n") ? "" : "\n"
+        return (split.body + joiner + stderr, split.cwd)
+    }
+
     /// The host dir shared into the guest when no working directory was
     /// supplied (e.g. the Sandbox Terminal boots the guest before any agent
     /// command): the app's default session workspace — the same
@@ -241,6 +304,51 @@ final class AgentSandbox: ObservableObject, @unchecked Sendable {
     /// stale and must be re-fetched.
     static func kernelHasVirtiofsSupport(_ kernelData: Data) -> Bool {
         kernelData.range(of: Data("virtiofs".utf8)) != nil
+    }
+
+    /// The vsock transport needs `CONFIG_VSOCKETS` + `CONFIG_VIRTIO_VSOCKETS`
+    /// (contain's `kernels-v3`). Without them the guest agent's `bind()` fails
+    /// with EAFNOSUPPORT and the guest boots into a VM nobody can talk to, so we
+    /// fall back to the legacy console shell rather than hanging on the ready
+    /// handshake.
+    static func kernelHasVsockSupport(_ kernelData: Data) -> Bool {
+        kernelData.range(of: Data("virtio_vsock".utf8)) != nil
+    }
+
+    /// Where the `vz-agent` ELF lives, most-preferred first:
+    ///  1. `VZ_AGENT_PATH` — dev override, and how the smoke test injects one.
+    ///  2. `Contents/Resources/guest/vz-agent` — the shipped app bundle.
+    ///  3. `zig-out/guest/vz-agent` beside the executable — `swift run` builds.
+    static func agentBinaryPath(
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        bundleResourceURL: URL? = Bundle.main.resourceURL,
+        executableURL: URL? = Bundle.main.executableURL
+    ) -> String? {
+        let fm = FileManager.default
+        if let override = environment["VZ_AGENT_PATH"], fm.isReadableFile(atPath: override) {
+            return override
+        }
+        if let bundled = bundleResourceURL?.appendingPathComponent("guest/vz-agent").path,
+           fm.isReadableFile(atPath: bundled) {
+            return bundled
+        }
+        if let dev = executableURL?
+            .deletingLastPathComponent()
+            .appendingPathComponent("../../../../zig-out/guest/vz-agent")
+            .standardizedFileURL.path,
+           fm.isReadableFile(atPath: dev) {
+            return dev
+        }
+        return nil
+    }
+
+    /// vsock only when BOTH halves are present. Either missing → the legacy
+    /// console shell, which still works. Never a hang, never a silent no-op.
+    static func chooseTransport(kernelData: Data?, agentBinary: String?) -> VzGuest.Transport {
+        guard agentBinary != nil, let kernelData, kernelHasVsockSupport(kernelData) else {
+            return .legacyConsole
+        }
+        return .vsock
     }
 
     // MARK: Execution
@@ -339,10 +447,14 @@ final class AgentSandbox: ObservableObject, @unchecked Sendable {
         }
     }
 
-    /// Run a command typed by the user in the Sandbox Terminal. Same guest/shell
-    /// as the agent (state is shared), recorded in the transcript. Unlike the
-    /// agent path it does NOT cd-wrap, so an interactive `cd` sticks. Never
-    /// throws — provisioning/boot errors are recorded as a `.system` entry.
+    /// Run a command typed by the user in the Sandbox Terminal. Same guest as
+    /// the agent (filesystem state is shared), recorded in the transcript. An
+    /// interactive `cd` sticks between commands.
+    ///
+    /// Under `.legacyConsole` that came free — one long-lived shell held the
+    /// cwd. Under `.vsock` each command is its own `sh -c`, so the shell echoes
+    /// its final `$PWD` on a marker line and we carry it forward. Never throws —
+    /// provisioning/boot errors are recorded as a `.system` entry.
     func runUserCommand(_ command: String, timeout: Double = 60) async {
         let trimmed = command.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
@@ -355,16 +467,102 @@ final class AgentSandbox: ObservableObject, @unchecked Sendable {
             DispatchQueue.global(qos: .userInitiated).async {
                 do {
                     let (g, _) = try self.ensureBooted(image: image, workingDirectory: root)
-                    let r = try g.exec(trimmed, timeout: timeout)
-                    self.record(Entry(source: .user, command: trimmed, output: TerminalOutput.sanitize(r.output),
-                                      exitCode: r.timedOut ? nil : r.exitCode,
-                                      timedOut: r.timedOut, at: Date()))
+
+                    var output: String
+                    var result: VzGuest.ExecResult
+                    if self.transport == .vsock {
+                        let cwd = { self.bootLock.lock(); defer { self.bootLock.unlock() }; return self.terminalCwd }()
+                        result = try g.exec(Self.wrapUserCommand(trimmed, guestCwd: cwd), timeout: timeout)
+                        let split = Self.composeUserOutput(stdout: result.stdout, stderr: result.stderr)
+                        output = split.body
+                        if let moved = split.cwd {
+                            self.bootLock.lock(); self.terminalCwd = moved; self.bootLock.unlock()
+                        }
+                    } else {
+                        result = try g.exec(trimmed, timeout: timeout)
+                        output = result.output
+                    }
+
+                    self.record(Entry(source: .user, command: trimmed, output: TerminalOutput.sanitize(output),
+                                      exitCode: result.timedOut ? nil : result.exitCode,
+                                      timedOut: result.timedOut, at: Date()))
                 } catch {
                     self.record(Entry(source: .system, command: trimmed,
                                       output: "\(error)", exitCode: -1, at: Date()))
                 }
                 cont.resume()
             }
+        }
+    }
+
+    // MARK: MCP servers in the guest
+
+    /// Preflight for `GuestMCPSpawner`: does this command exist in the guest?
+    func guestCommandSucceeds(_ command: String) async -> Bool {
+        let image = { lock.lock(); defer { lock.unlock() }; return baseImage }()
+        return await withCheckedContinuation { (cont: CheckedContinuation<Bool, Never>) in
+            DispatchQueue.global(qos: .userInitiated).async {
+                do {
+                    let (g, _) = try self.ensureBooted(image: image, workingDirectory: nil)
+                    let r = try g.exec(command, timeout: 20)
+                    cont.resume(returning: !r.timedOut && r.exitCode == 0)
+                } catch {
+                    cont.resume(returning: false)
+                }
+            }
+        }
+    }
+
+    /// Start a stdio MCP server inside the guest and bridge its stdio to a
+    /// descriptor the MCP SDK can drive.
+    ///
+    /// This is the fix for the confinement hole: previously the server ran on
+    /// the host with the user's full permissions even while the Agent Sandbox
+    /// was on. `cwd` was set, but a cwd is not a permission boundary.
+    func openMCPBridge(command: String, hostCwd: String, env: [String: String]) async throws -> GuestMCPBridge {
+        let image = { lock.lock(); defer { lock.unlock() }; return baseImage }()
+        return try await withCheckedThrowingContinuation { cont in
+            DispatchQueue.global(qos: .userInitiated).async {
+                do {
+                    let (g, root) = try self.ensureBooted(image: image, workingDirectory: hostCwd)
+                    guard self.transport == .vsock else {
+                        throw SandboxError(message:
+                            "MCP servers need the vsock guest transport (kernel \(Self.kernelTag) + vz-agent); "
+                            + "the guest booted the legacy console shell")
+                    }
+                    // Only the shared folder exists in the guest; anything else
+                    // maps to /workspace rather than silently landing elsewhere.
+                    let guestCwd = Self.guestPath(hostPath: hostCwd, sharedRoot: root).path
+
+                    let stream = try g.openStream()
+                    let request = GuestProtocol.Request(
+                        command: command,
+                        cwd: guestCwd,
+                        env: env.sorted { $0.key < $1.key }.map { (key: $0.key, value: $0.value) })
+                    try stream.write(GuestProtocol.frame(.request, request.encode()))
+
+                    cont.resume(returning: try GuestMCPBridge(stream: stream))
+                } catch {
+                    cont.resume(throwing: error)
+                }
+            }
+        }
+    }
+
+    /// The kernel+rootfs source for this build: bundled on the App Store,
+    /// downloaded on Developer ID. The download arm delegates to the existing
+    /// `provisionKernel`/`provisionRootfs` (which own the caching); the bundled
+    /// arm unpacks `Contents/Resources/guest/` into the container.
+    private func makeProvisioner() -> SandboxProvisioner {
+        switch SandboxProvisionerFactory.kind() {
+        case .downloading:
+            return DownloadingProvisioner(
+                fetchKernel: { try self.provisionKernel() },
+                pullRootfs: { try self.provisionRootfs(image: $0) })
+        case .bundled:
+            return BundledProvisioner(
+                resourcesURL: Bundle.main.resourceURL ?? URL(fileURLWithPath: "."),
+                containerRoot: cacheDir)
         }
     }
 
@@ -380,12 +578,17 @@ final class AgentSandbox: ObservableObject, @unchecked Sendable {
         // root (remount) — tear down and boot fresh with the right share.
         guest?.shutdown(); guest = nil; sharedRoot = nil
         forwarder?.stop(); forwarder = nil
+        terminalCwd = "/workspace" // a fresh guest starts in its workdir
 
         #if !arch(arm64)
         throw SandboxError(message: "the Agent Sandbox requires Apple Silicon (the guest kernel is arm64)")
         #else
-        let kernel = try provisionKernel()
-        let rootfs = try provisionRootfs(image: image)
+        // Developer ID fetches the kernel + rootfs; the App Store build unpacks
+        // them from the bundle (guideline 2.5.2 forbids downloading them). Same
+        // guest either way — just a different source.
+        let provisioner = makeProvisioner()
+        let kernel = try provisioner.kernelPath()
+        let rootfs = try provisioner.rootfsDir(image: image)
         let root = workingDirectory ?? Self.fallbackSharedRoot()
 
         // The image's Env/WorkingDir (written by the pull) feed the init script;
@@ -400,6 +603,22 @@ final class AgentSandbox: ObservableObject, @unchecked Sendable {
         cfg.guestWorkspacePath = "/workspace"
         cfg.imageEnv = imageConfig.env
         cfg.workdir = "/workspace"
+
+        // vsock only when the kernel supports it AND we have an agent to inject;
+        // otherwise the legacy console shell, which every kernel can run.
+        let agentBinary = Self.agentBinaryPath()
+        let kernelData = try? Data(contentsOf: URL(fileURLWithPath: kernel), options: .mappedIfSafe)
+        cfg.transport = Self.chooseTransport(kernelData: kernelData, agentBinary: agentBinary)
+        cfg.agentBinaryPath = agentBinary
+        transport = cfg.transport
+
+        // The App Store build's guest is bundled: there is no download path to a
+        // different kernel or a missing agent, so a legacy fallback there means
+        // something is wrong with the bundle. Fail loudly rather than boot a VM
+        // whose MCP servers can never connect.
+        if BuildFeatures.current.isMAS && cfg.transport == .legacyConsole {
+            throw SandboxError(message: "the bundled guest is missing vsock support or the vz-agent binary — the app bundle is incomplete")
+        }
         let net = { lock.lock(); defer { lock.unlock() }; return networkEnabled }()
         cfg.network = net
         // The rootfs is demand-paged over virtiofs (not RAM-resident like the old
@@ -461,10 +680,25 @@ final class AgentSandbox: ObservableObject, @unchecked Sendable {
     // MARK: Provisioning
 
     /// contain's prebuilt minimal guest kernel (6.6, virtio-pci + virtiofs +
-    /// virtio-console, ~37 MB raw / ~12 MB gz). Same asset the contain CLI
-    /// fetches; pinned by tag, bumped only when the kernel is rebuilt.
+    /// virtio-console + virtio-vsock, ~37 MB raw / ~12 MB gz). Same asset the
+    /// contain CLI fetches; pinned by tag, bumped only when the kernel is rebuilt.
+    ///
+    /// `kernels-v3` added `CONFIG_VSOCKETS` + `CONFIG_VIRTIO_VSOCKETS`, which the
+    /// guest agent needs. A `kernels-v2` cache still boots — it just falls back
+    /// to the legacy console shell (see `chooseTransport`).
+    static let kernelTag = "kernels-v3"
     static let kernelURL = URL(string:
-        "https://github.com/ddalcu/contain/releases/download/kernels-v2/kernel-contain-arm64.gz")!
+        "https://github.com/ddalcu/contain/releases/download/\(kernelTag)/kernel-contain-arm64.gz")!
+
+    /// Cache filename. Tag-versioned rather than sniffed, so bumping the kernel
+    /// invalidates every old cache by construction instead of by remembering to
+    /// add another `kernelHas…Support` byte check.
+    static func kernelCacheName(tag: String = kernelTag) -> String { "kernel-\(tag)" }
+
+    /// Cached kernels from other tags, which `provisionKernel` prunes.
+    static func staleKernelNames(_ existing: [String], tag: String = kernelTag) -> [String] {
+        existing.filter { ($0 == "kernel" || $0.hasPrefix("kernel-")) && $0 != kernelCacheName(tag: tag) }
+    }
 
     /// Base directory for cached sandbox artifacts. Migrates the pre-VZ
     /// `~/.mlx-serve/contain` cache in place on first touch (same layout — the
@@ -488,8 +722,16 @@ final class AgentSandbox: ObservableObject, @unchecked Sendable {
             return override
         }
         let fm = FileManager.default
-        let dest = cacheDir.appendingPathComponent("kernel")
+        let dest = cacheDir.appendingPathComponent(Self.kernelCacheName())
         try fm.createDirectory(at: cacheDir, withIntermediateDirectories: true)
+
+        // Drop caches from older tags — including the untagged `kernel` file the
+        // pre-vsock builds wrote.
+        let existing = (try? fm.contentsOfDirectory(atPath: cacheDir.path)) ?? []
+        for stale in Self.staleKernelNames(existing) {
+            try? fm.removeItem(at: cacheDir.appendingPathComponent(stale))
+        }
+
         if let cached = try? Data(contentsOf: dest, options: .alwaysMapped) {
             if Self.kernelHasVirtiofsSupport(cached) { return dest.path }
             try? fm.removeItem(at: dest) // pre-virtiofs kernel — re-fetch

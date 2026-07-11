@@ -1,0 +1,41 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Mac App Store entitlements for the MLXCore app process.
+
+	     The App Sandbox is mandatory on the store. Under it, ~/.mlx-serve
+	     resolves to the app's container (~/Library/Containers/…/Data), which the
+	     mlx-serve helper inherits — so the model store, kv-cache, logs and
+	     workspace relocate with zero code changes. -->
+	<key>com.apple.security.app-sandbox</key>
+	<true/>
+
+	<!-- Boot the Linux guest (Virtualization.framework). Grantable on a Mac App
+	     Store provisioning profile — UTM ships on the store with it. NOT the
+	     Hypervisor.framework entitlement (com.apple.security.hypervisor), which
+	     is a different, lower-level API. -->
+	<key>com.apple.security.virtualization</key>
+	<true/>
+
+	<!-- Outbound: HuggingFace model downloads, the guest's NAT networking, and
+	     talking to a user-configured remote MCP server. -->
+	<key>com.apple.security.network.client</key>
+	<true/>
+	<!-- Inbound: the local OpenAI/Anthropic-compatible server other apps on the
+	     machine connect to. -->
+	<key>com.apple.security.network.server</key>
+	<true/>
+
+	<!-- Files the user explicitly picks (attach-a-folder, voice-clone clip,
+	     image/audio inputs). Persisted picks get a security-scoped bookmark. -->
+	<key>com.apple.security.files.user-selected.read-write</key>
+	<true/>
+	<key>com.apple.security.files.bookmarks.app-scope</key>
+	<true/>
+
+	<!-- Microphone, for Voice mode + multimodal audio input. -->
+	<key>com.apple.security.device.audio-input</key>
+	<true/>
+</dict>
+</plist>

@@ -72,8 +72,9 @@ final class VoiceModeController: ObservableObject {
     /// Surfaced as a "Go ahead…" hint in the tray/orb.
     @Published private(set) var awaitingWakeQuery = false
 
-    /// The phrase to listen for. Fixed to "Hey Loki" today; a stored property so
-    /// tests can override it and a future settings field can change it.
+    /// The phrase to listen for. Follows Settings ▸ Voice ▸ Wake phrase live
+    /// (subscribed in `bind(appState:)`, normalized, blank → default); a
+    /// stored property so tests can set it directly.
     var wakePhrase: String = WakeWord.defaultPhrase
 
     /// Seconds of continued listening after the assistant answers (or after a
@@ -161,6 +162,15 @@ final class VoiceModeController: ObservableObject {
             let wd = appState.chatSessions.first { $0.id == sid }?.workingDirectory
             return (sid, wd)
         }
+
+        // Wake phrase from Settings ▸ Voice, applied live — the user's raw
+        // typing is normalized ("Hey, Jarvis!" → "hey jarvis"); a blank field
+        // falls back to the default rather than a never-matching gate.
+        appState.$serverOptions
+            .map { WakeWord.normalizePhrase($0.wakePhrase) ?? WakeWord.defaultPhrase }
+            .removeDuplicates()
+            .sink { [weak self] in self?.wakePhrase = $0 }
+            .store(in: &cancellables)
 
         // Feed the active session's trailing assistant message into the
         // synthesizer whenever the conversation changes OR generation flips.
@@ -571,11 +581,7 @@ final class VoiceModeController: ObservableObject {
     }
 
     /// The wake phrase title-cased for display ("hey loki" → "Hey Loki").
-    var wakePhraseDisplay: String {
-        wakePhrase.split(separator: " ")
-            .map { $0.prefix(1).uppercased() + $0.dropFirst() }
-            .joined(separator: " ")
-    }
+    var wakePhraseDisplay: String { WakeWord.display(wakePhrase) }
 
     // MARK: Helpers
 

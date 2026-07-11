@@ -171,6 +171,11 @@ struct ServerOptions: Codable, Equatable {
     /// file's name, or "Recorded clip") — the stored clip itself is always
     /// normalized to `voice-clone.wav`, which is useless as a display name.
     var voiceCloneLabel: String = ""
+    /// Wake phrase for hands-free voice mode ("hey loki" by default). Stored
+    /// as the user typed it in Settings ▸ Voice; consumers normalize through
+    /// `WakeWord.normalizePhrase` (blank → default). App-side like the other
+    /// voice fields — never a server-launch flag.
+    var wakePhrase: String = WakeWord.defaultPhrase
 
     enum LogLevel: String, Codable, CaseIterable, Identifiable {
         case error, warn, info, debug
@@ -309,10 +314,10 @@ struct ServerOptions: Codable, Equatable {
         var enabled: Bool = false
         /// OCI/Docker base image pulled once for the sandbox rootfs. MUST have an
         /// arm64 build (the HVF guest is arm64) — an amd64-only image fails to
-        /// boot. Defaults to `ddalcu/agent-shell`: a purpose-built arm64 agentic
+        /// boot. Defaults to `ddalcu/agent-shell-mlxserve`: a purpose-built arm64 agentic
         /// shell (Debian glibc + Node.js + Python3/pip + git/curl + apt, ~129 MB).
         /// Any arm64 image works; e.g. `python:3.12-slim` or `debian:stable-slim`.
-        var baseImage: String = "ddalcu/agent-shell"
+        var baseImage: String = "ddalcu/agent-shell-mlxserve"
         /// Outbound network for the guest (NAT) + live guest→host port mapping:
         /// a server the agent starts on guest port N becomes reachable at
         /// `localhost:N` on this Mac. Off → the guest has NO network device at
@@ -597,6 +602,7 @@ extension ServerOptions {
         if let v = try c.decodeIfPresent(String.self, forKey: .voiceClonePath) { voiceClonePath = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .voiceCloneEnabled) { voiceCloneEnabled = v }
         if let v = try c.decodeIfPresent(String.self, forKey: .voiceCloneLabel) { voiceCloneLabel = v }
+        if let v = try c.decodeIfPresent(String.self, forKey: .wakePhrase) { wakePhrase = v }
     }
 }
 
@@ -726,7 +732,7 @@ extension ServerOptions {
             needsRestart: true),
         "kvQuant": .init(
             title: "KV cache quantization",
-            explainer: "Shrinks the KV cache: 4-bit ≈ 4× smaller, 8-bit ≈ 2×. Lets a 16K context fit on hardware that couldn't hold it dense, or doubles the parallel-request budget. TurboQuant variants add a per-layer Hadamard rotation for heavy-tailed activations.",
+            explainer: "A memory-for-speed trade, not a free upgrade: shrinks KV-cache RAM (8-bit ≈ 2× smaller, 4-bit ≈ 4×) but makes decode ~10% slower at typical contexts — and slower still on long ones, since every generated token pays a dequantize step. Turn on when memory is the constraint (long contexts or big models on a 16 GB Mac); leave OFF for maximum tokens/sec if you have plenty of RAM. TurboQuant variants add a per-layer Hadamard rotation for heavy-tailed activations.",
             needsRestart: true),
         "prefixCacheEntries": .init(
             title: "Prefix cache entries",
@@ -750,7 +756,7 @@ extension ServerOptions {
             needsRestart: true),
         "llamaKvQuant": .init(
             title: "KV cache quantization",
-            explainer: "llama.cpp's KV-quant scheme (ggml Q8_0 / Q4_0). Distinct from the MLX KV-quant — uses different kernels. Auto-enables flash-attn on the server side when non-default.",
+            explainer: "llama.cpp's KV-quant scheme (ggml Q8_0 / Q4_0). Same trade as the MLX version: less KV RAM, slower decode — leave off for maximum tokens/sec if you have plenty of RAM. Distinct kernels from the MLX KV-quant; auto-enables flash-attn on the server side when non-default.",
             needsRestart: true),
         "llamaCacheEntries": .init(
             title: "Session cache entries",
