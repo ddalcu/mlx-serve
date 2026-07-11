@@ -2111,15 +2111,42 @@ fn computeMemoryContext(config: *const model_mod.ModelConfig) u32 {
     );
 }
 
-/// Estimate peak GPU memory for prefill and reject if it would exceed Metal buffer limit.
-/// Metal has a max buffer size (~75% of unified memory). If this is exceeded, the Metal
-/// runtime throws an uncatchable C++ exception that crashes the process.
-///
-/// MLX uses `mlx_fast_scaled_dot_product_attention` — a fused flash-attention-style kernel
-/// that tiles over seq and never materializes the full [heads, seq, seq] attention matrix.
-/// So peak memory is dominated by (a) the persistent KV cache and (b) per-layer working
-/// tensors (QKV projections, MLP intermediates). There is no seq² term.
-fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_len: usize, config: *const model_mod.ModelConfig, is_anthropic: bool) !bool {
+/// Pure memory model behind checkAttentionMemory. All quantities in bytes,
+/// 25% safety margin included. `chunk` must be the SAME prefill chunk
+/// generate.zig will pick (generate_mod.effectivePrefillChunk) so the
+/// admission guard and the real prefill cannot drift. Terms:
+///   - kv: persistent for the request; billed at the ACTIVE kv-quant width
+///     (+0.5 bit/elem group scale/bias overhead when quantized), not a
+///     hardcoded fp16.
+///   - scores: the composed-SDPA scratch [heads, chunk, seq] — materialized
+///     only for head_dim > 128, which misses MLX's fused kernel (every
+///     Gemma-4 / Qwen3.5-3.6 checkpoint ships head_dim 256). Bounded to ~one
+///     layer by the adaptive eval cadence (transformer.prefillEvalCadence).
+///   - dequant: dense-fp16 rebuild of the FULL quantized cache each layer
+///     (KVCache.denseView under --kv-quant).
+///   - mlp: QKV/MLP transient envelope; ~3 layers coexist between eval
+///     points, and it is CHUNK-bounded, never seq-scaled — the old
+///     8×seq×ffn envelope over-billed a 255K prompt by ~60 GB and rejected
+///     requests that fit comfortably (PR #69).
+pub fn prefillMemoryNeeded(seq: u64, heads: u64, kv_heads: u64, layers: u64, hdim: u64, hidden: u64, ffn: u64, kv_bits: u64, chunk: u64) u64 {
+    const kv_bytes: u64 = if (kv_bits >= 16)
+        layers * 2 * seq * kv_heads * hdim * 2
+    else
+        layers * 2 * seq * kv_heads * hdim * (2 * kv_bits + 1) / 16;
+    const scores: u64 = if (hdim > 128) heads * chunk * seq * 2 else 0;
+    const dequant: u64 = if (kv_bits < 16) 2 * seq * kv_heads * hdim * 2 else 0;
+    const mlp: u64 = 8 * chunk * @max(hidden, ffn) * 2;
+    return (kv_bytes + scores + dequant + 3 * mlp) * 5 / 4;
+}
+
+/// Estimate peak GPU memory for prefill and reject if it would exceed the Metal
+/// working-set ceiling. Exceeding it throws an uncatchable C++ exception on a
+/// Metal completion-handler thread and kills the process, so PREVENTION is the
+/// only lever — this guard must track what the prefill actually allocates
+/// (prefillMemoryNeeded above; chunk choice from generate.effectivePrefillChunk).
+/// `kv_override` is the per-request `kv_quant` body field where the surface
+/// parses one (chat/messages/responses); null falls back to the process default.
+fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_len: usize, config: *const model_mod.ModelConfig, is_anthropic: bool, kv_override: ?transformer_mod.KVQuantConfig) !bool {
     const heads = config.num_attention_heads;
     if (heads == 0) return true; // unknown architecture, skip check
 
@@ -2128,18 +2155,16 @@ fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_len:
     const kv_heads: u64 = config.num_key_value_heads;
     const hdim: u64 = config.head_dim;
     const hidden: u64 = config.hidden_size;
+    // Deliberately the conservative @max: MoE checkpoints often omit
+    // intermediate_size (struct default 15360 leaks in) but the envelope is
+    // chunk-bounded now, so a fat ffn costs MBs of estimate, not GBs.
     const ffn: u64 = @max(config.intermediate_size, config.moe_intermediate_size + config.shared_expert_intermediate_size);
 
-    // KV cache (all layers, fp16): layers × 2(K+V) × seq × kv_heads × head_dim × 2 bytes.
-    // This is persistent for the rest of the request, so it's a real hard cost.
-    const kv_bytes: u64 = layers * 2 * seq * kv_heads * hdim * 2;
-    // Per-layer working memory during prefill (fp16). The transformer eval()s every N layers,
-    // so transient tensors from earlier layers are released. Peak is bounded by a single layer:
-    //   QKV projections (~3× seq × hidden) + MLP intermediates (~3× seq × ffn) + residuals.
-    // A ~8× seq × max(hidden, ffn) × 2-byte envelope captures this with headroom.
-    const working_bytes: u64 = 8 * seq * @max(hidden, ffn) * 2;
-    // Total estimate with 25% safety margin
-    const needed: u64 = (kv_bytes + working_bytes) * 5 / 4;
+    const kv_cfg: transformer_mod.KVQuantConfig = kv_override orelse
+        (if (global_scheduler) |sch| sch.kv_quant_config else transformer_mod.KVQuantConfig.dense);
+    const kv_bits: u64 = if (kv_cfg.scheme == .off) 16 else kv_cfg.bits;
+    const chunk: u64 = @intCast(generate_mod.effectivePrefillChunk(config.head_dim, config.num_attention_heads, prompt_len));
+    const needed: u64 = prefillMemoryNeeded(seq, heads, kv_heads, layers, hdim, hidden, ffn, kv_bits, chunk);
 
     // Available = GPU allocation ceiling minus current usage (model weights,
     // resident hot-cache KV, etc.). The ceiling is the LESSER of Metal's static
@@ -3825,7 +3850,7 @@ fn handleChatCompletions(
     }
 
     // Check if attention computation would exceed GPU memory
-    if (!try checkAttentionMemory(allocator, stream, prompt_ids.len, config, false)) return;
+    if (!try checkAttentionMemory(allocator, stream, prompt_ids.len, config, false, kv_quant_override)) return;
 
     // Clamp max_tokens to stay within context window
     const effective_max_tokens = clampMaxTokens(max_tokens, prompt_ids.len, effective_ctx);
@@ -4075,7 +4100,8 @@ fn handleCompletions(
     }
 
     // Check if attention computation would exceed GPU memory
-    if (!try checkAttentionMemory(allocator, stream, prompt_ids.len, config, false)) return;
+    // (/v1/completions has no per-request kv_quant field -> process default.)
+    if (!try checkAttentionMemory(allocator, stream, prompt_ids.len, config, false, null)) return;
 
     // Clamp max_tokens to stay within context window
     const effective_max_tokens = clampMaxTokens(max_tokens, prompt_ids.len, effective_ctx);
@@ -7522,7 +7548,7 @@ fn handleAnthropicMessages(
     }
 
     // Check if attention computation would exceed GPU memory
-    if (!try checkAttentionMemory(allocator, stream, prompt_ids.len, config, true)) return;
+    if (!try checkAttentionMemory(allocator, stream, prompt_ids.len, config, true, kv_quant_override)) return;
 
     const effective_max_tokens = clampMaxTokens(max_tokens, prompt_ids.len, effective_ctx);
     log.info("  prompt={d} tokens, max_gen={d}, ctx={d}\n", .{ prompt_ids.len, effective_max_tokens, effective_ctx });
@@ -8875,7 +8901,8 @@ fn handleResponses(
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Prompt exceeds maximum context length", 400);
         return;
     }
-    if (!try checkAttentionMemory(allocator, stream, prompt_ids.len, config, false)) return;
+    const kv_quant_override = parseKvQuantOverride(root);
+    if (!try checkAttentionMemory(allocator, stream, prompt_ids.len, config, false, kv_quant_override)) return;
     const effective_max_tokens = clampMaxTokens(max_tokens, prompt_ids.len, effective_ctx);
 
     // ── sampling ──
@@ -9003,7 +9030,6 @@ fn handleResponses(
     defer if (streamed_message_id) |id| allocator.free(id);
 
     // Wave 1.A: per-request KV-quant override (Responses path mirror).
-    const kv_quant_override = parseKvQuantOverride(root);
 
     // Per-request PLD override for the Responses path. Mirror the
     // chat-completions auto-disable logic exactly so the same prompt picks
@@ -11643,4 +11669,56 @@ test "readyCapsJson: every resident media engine surfaces its capability (mesh -
         "[\"chat\",\"tool_use\",\"streaming\",\"reasoning\",\"json_schema\"]",
         chat.items,
     );
+}
+
+test "prefillMemoryNeeded: quantized KV is billed at its real width, not fp16" {
+    const t = std.testing;
+    // 26B-A4B shape at 100K ctx, chunk 512 (what the bounded chunk picks there).
+    // fp16: kv 30x2x100000x8x256x2 = 24.576 GB; scores 16x512x100000x2 = 1.6384 GB;
+    //       mlp 3x8x512x2816x2 = 69.2 MB; x1.25 margin.
+    try t.expectEqual(
+        @as(u64, 32_854_507_520),
+        prefillMemoryNeeded(100_000, 16, 8, 30, 256, 2816, 2112, 16, 512),
+    );
+    // 4-bit: kv billed at (2*4+1)/16 bytes/elem (payload + group scale/bias)
+    // = 6.912 GB, plus the 0.8192 GB per-layer dense dequant transient.
+    try t.expectEqual(
+        @as(u64, 11_798_507_520),
+        prefillMemoryNeeded(100_000, 16, 8, 30, 256, 2816, 2112, 4, 512),
+    );
+    // Direction: quantized admission must be under half the fp16 bill.
+    try t.expect(prefillMemoryNeeded(100_000, 16, 8, 30, 256, 2816, 2112, 4, 512) * 2 <
+        prefillMemoryNeeded(100_000, 16, 8, 30, 256, 2816, 2112, 16, 512));
+}
+
+test "prefillMemoryNeeded: working set is chunk-bounded — the 255K MoE prompt is admittable" {
+    const t = std.testing;
+    // The PR-#69 failure case: Qwen3.6-35B-A3B shape (whose checkpoint OMITS
+    // intermediate_size, so the struct default 15360 leaks into ffn) at 262144
+    // tokens with 4-bit KV. kv 6.04 GB + scores 4.29 GB + dequant 0.54 GB +
+    // mlp 0.377 GB, x1.25 = ~13.1 GiB — admittable on a big Mac.
+    const needed = prefillMemoryNeeded(262_144, 16, 2, 40, 256, 2048, 15360, 4, 512);
+    try t.expectEqual(@as(u64, 14_061_404_160), needed);
+    try t.expect(needed < 16 << 30);
+    // The retired seq-scaled envelope billed 8 x seq x ffn x 2 working bytes
+    // (~64 GB) on top of fp16 KV (~21.5 GB) -> ~107 GB and a spurious 400.
+    const old_estimate: u64 = (40 * 2 * 262_144 * 2 * 256 * 2 + 8 * 262_144 * 15360 * 2) * 5 / 4;
+    try t.expect(needed < old_estimate / 7);
+}
+
+test "prefillMemoryNeeded: unfused head dims bill the materialized score scratch" {
+    const t = std.testing;
+    // Same shape, head_dim 128 vs 256 (kv scaled by hdim too, so compare the
+    // full bills computed by hand): hd=128 fp16 -> kv 12.288 GB + 0 scores +
+    // mlp 69.2 MB, x1.25.
+    try t.expectEqual(
+        @as(u64, 15_446_507_520),
+        prefillMemoryNeeded(100_000, 16, 8, 30, 128, 2816, 2112, 16, 512),
+    );
+    // hd=256 adds the [heads, chunk, seq] score tensor (the guard must see
+    // what the composed SDPA path actually allocates). Decomposition: the
+    // hd-128 bill + the KV doubling from 128->256 (12.288 GB x1.25) + the
+    // score tensor (16x512x100000x2 = 1.6384 GB x1.25).
+    const with_scores = prefillMemoryNeeded(100_000, 16, 8, 30, 256, 2816, 2112, 16, 512);
+    try t.expectEqual(@as(u64, 15_446_507_520 + 15_360_000_000 + 2_048_000_000), with_scores);
 }

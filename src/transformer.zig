@@ -3230,6 +3230,41 @@ pub const Transformer = struct {
     const MOE_EVAL_EVERY_N_LAYERS: u32 = 4;
     const RECURRENCE_EVAL_INTERVAL: usize = 32;
 
+    /// Per-layer prefill transient (bytes) above which the layer loop eval()s
+    /// after EVERY layer instead of the coarse default cadence. Between eval
+    /// points ~3 layers' transients coexist under MLX lazy eval, so a
+    /// multi-GB transient triples; eval-per-layer bounds peak to ~1 layer.
+    /// Two transients count (both scale with total_kv, so short prompts keep
+    /// the coarse cadence and pay nothing):
+    ///   - the composed-SDPA score tensor [heads, chunk, total_kv] — only for
+    ///     head_dim > 128, which misses MLX's fused kernel (every Gemma-4 and
+    ///     Qwen3.5/3.6 checkpoint ships head_dim 256);
+    ///   - the dense-fp16 rebuild of a quantized KV cache (denseView runs
+    ///     per layer under --kv-quant, over the FULL cache).
+    /// Budget calibrated LIVE on gemma-4-26B-A4B-qat-4bit (M4 Max):
+    /// eval-per-layer costs ~4.5% prefill at a 5K prompt (845 MB scores —
+    /// below this budget, coarse cadence kept) and ~0% at 102K (3.4 GB
+    /// scores — flips to per-layer, peak 51.6 -> 27.0 GB, prefill +14%).
+    /// 2 GiB puts the flip at ~8K tokens on 16-head/256-hd geometry, where
+    /// the ~3% sync cost buys a 13.7 -> 4.3 GB transient bound — the margin
+    /// that keeps a 32 GB Mac serving a 26B alive.
+    const PREFILL_EVAL_TRANSIENT_BUDGET: u64 = 2 << 30;
+
+    /// Pure cadence pick for the prefill layer loops (standard/MoE/hybrid).
+    fn prefillEvalCadence(
+        default_cadence: u32,
+        head_dim: u32,
+        n_heads: u32,
+        kv_heads: u32,
+        chunk_len: u64,
+        total_kv: u64,
+        kv_dequant: bool,
+    ) u32 {
+        const scores: u64 = if (head_dim > 128) @as(u64, n_heads) * chunk_len * total_kv * 2 else 0;
+        const dequant: u64 = if (kv_dequant) 2 * total_kv * @as(u64, kv_heads) * @as(u64, head_dim) * 2 else 0;
+        return if (scores + dequant > PREFILL_EVAL_TRANSIENT_BUDGET) 1 else default_cadence;
+    }
+
     /// Default forward context, routing through the Transformer's own state.
     /// Used by the single-slot legacy path and by Phase-2 prefill on a slot
     /// that has had its KVCache temporarily swapped onto the Transformer.
@@ -3786,6 +3821,19 @@ pub const Transformer = struct {
             }
         }
 
+        // Eval cadence: drop to per-layer when this chunk's score/dequant
+        // transients are large (unfused head_dim > 128 at long ctx, or a
+        // quantized cache's dense rebuild) — see prefillEvalCadence.
+        const std_eval_cadence = prefillEvalCadence(
+            EVAL_EVERY_N_LAYERS,
+            @max(hd, ghd),
+            h_count,
+            @max(kv_h, gkv_h),
+            @intCast(seq_len),
+            @intCast(total_kv),
+            ctx.cache.config.scheme != .off,
+        );
+
         // Gemma 4 PLE: compute per-layer input embeddings once before the layer loop.
         // For vision: zero out image token IDs before PLE (reference: text_mask = ~image_mask).
         var ple_input: ?mlx.mlx_array = null;
@@ -4077,7 +4125,7 @@ pub const Transformer = struct {
                 h = h_scaled;
             }
 
-            if (is_prefill and (layer_idx + 1) % EVAL_EVERY_N_LAYERS == 0) {
+            if (is_prefill and (layer_idx + 1) % std_eval_cadence == 0) {
                 try mlx.check(mlx.mlx_array_eval(h));
             }
         }
@@ -4598,6 +4646,19 @@ pub const Transformer = struct {
             }
         }
 
+        // Eval cadence: drop to per-layer when this chunk's score/dequant
+        // transients are large (unfused head_dim > 128 at long ctx, or a
+        // quantized cache's dense rebuild) — see prefillEvalCadence.
+        const moe_eval_cadence = prefillEvalCadence(
+            MOE_EVAL_EVERY_N_LAYERS,
+            cfg.head_dim,
+            cfg.num_attention_heads,
+            cfg.num_key_value_heads,
+            @intCast(seq_len),
+            @as(u64, @intCast(offset)) + @as(u64, @intCast(seq_len)),
+            ctx.cache.config.scheme != .off,
+        );
+
         for (0..cfg.num_hidden_layers) |layer_idx| {
             const li: u32 = @intCast(layer_idx);
             const lw = &ml[layer_idx];
@@ -4638,7 +4699,7 @@ pub const Transformer = struct {
                 h = h_next;
             }
 
-            if (is_prefill and (layer_idx + 1) % MOE_EVAL_EVERY_N_LAYERS == 0) {
+            if (is_prefill and (layer_idx + 1) % moe_eval_cadence == 0) {
                 try mlx.check(mlx.mlx_array_eval(h));
             }
         }
@@ -5045,6 +5106,20 @@ pub const Transformer = struct {
         const batch: c_int = x_shape[0];
         const seq_len: c_int = x_shape[1];
 
+        // Eval cadence: drop to per-layer when this chunk's score/dequant
+        // transients are large — see prefillEvalCadence. LFM2/Nemotron-H ride
+        // fused head dims, but a quantized KV cache's dense rebuild (and a
+        // future head_dim-256 hybrid like qwen3_next) still counts.
+        const hybrid_eval_cadence = prefillEvalCadence(
+            MOE_EVAL_EVERY_N_LAYERS,
+            cfg.head_dim,
+            cfg.num_attention_heads,
+            cfg.num_key_value_heads,
+            @intCast(seq_len),
+            @as(u64, @intCast(offset)) + @as(u64, @intCast(seq_len)),
+            ctx.cache.config.scheme != .off,
+        );
+
         for (0..cfg.num_hidden_layers) |layer_idx| {
             const li: u32 = @intCast(layer_idx);
             const lw = &hl[layer_idx];
@@ -5081,7 +5156,7 @@ pub const Transformer = struct {
                 h = h_next;
             }
 
-            if (seq_len > 1 and (layer_idx + 1) % MOE_EVAL_EVERY_N_LAYERS == 0) {
+            if (seq_len > 1 and (layer_idx + 1) % hybrid_eval_cadence == 0) {
                 try mlx.check(mlx.mlx_array_eval(h));
             }
 
@@ -9750,4 +9825,39 @@ fn gdnTestRunSeqAt(q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, g: mlx.
     var out = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_reshape(&out, sliced, &fshape, 4, s));
     return out;
+}
+
+test "prefillEvalCadence: small transients keep the coarse cadence" {
+    const t = std.testing;
+    // 26B geometry, short prompt: 16 heads x 2048 chunk x 2048 kv x 2B = 128 MB
+    // of unfused scores — well inside the budget, keep today's cadence.
+    try t.expectEqual(@as(u32, 4), Transformer.prefillEvalCadence(4, 256, 16, 8, 2048, 2048, false));
+    // The LIVE-measured no-regression point: a 5,140-token agent prompt
+    // (845 MB scores) must keep cadence 4 — flipping it cost a measured 4.5%
+    // prefill for zero memory benefit (peak 18.1 GB both ways).
+    try t.expectEqual(@as(u32, 4), Transformer.prefillEvalCadence(4, 256, 16, 8, 5140, 5140, false));
+    // Fused head dim + dense KV: no transient at all, keep even the 48 default.
+    try t.expectEqual(@as(u32, 48), Transformer.prefillEvalCadence(48, 128, 8, 8, 8192, 500_000, false));
+}
+
+test "prefillEvalCadence: big unfused score tensor forces eval-per-layer" {
+    const t = std.testing;
+    // 16 heads x 8192 chunk x 16384 kv x 2B = 4 GiB > 2 GiB budget: bounds a
+    // ~13 GB windowed transient to ~4 GB. (8192 chunk x 8192 kv sits exactly
+    // ON the 2 GiB budget and deliberately keeps the coarse cadence.)
+    try t.expectEqual(@as(u32, 1), Transformer.prefillEvalCadence(4, 256, 16, 8, 8192, 16384, false));
+    try t.expectEqual(@as(u32, 4), Transformer.prefillEvalCadence(4, 256, 16, 8, 8192, 8192, false));
+    // The capped 1024 chunk at 102K ctx still materializes 3.4 GB — the chunk
+    // cap (generate.zig) does NOT restore the coarse cadence at long context.
+    // (Live: this cadence measured peak 27.0 GB and +14% prefill vs baseline.)
+    try t.expectEqual(@as(u32, 1), Transformer.prefillEvalCadence(4, 256, 16, 8, 1024, 102_448, false));
+}
+
+test "prefillEvalCadence: quantized-KV dequant forces eval-per-layer even at fused head dims" {
+    const t = std.testing;
+    // hd 128 is fused (zero scores) but denseView rebuilds the FULL cache per
+    // layer under --kv-quant: 2 x 600K x 8 x 128 x 2B = 2.46 GB > 2 GiB.
+    try t.expectEqual(@as(u32, 1), Transformer.prefillEvalCadence(48, 128, 8, 8, 8192, 600_000, true));
+    // Same shape with dense fp16 KV: nothing to dequantize, keep coarse.
+    try t.expectEqual(@as(u32, 48), Transformer.prefillEvalCadence(48, 128, 8, 8, 8192, 600_000, false));
 }

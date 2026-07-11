@@ -1,5 +1,12 @@
 # Changelog
 
+## v26.7.6 — Long contexts that actually fit
+
+- **Long prompts no longer OOM-crash the server far below the advertised context.** On every Gemma-4 and Qwen 3.5/3.6 model, a long prompt could kill the whole server with a Metal out-of-memory abort (a 255K prompt died around 100K) because prefill scratch memory silently grew with prompt length. Prefill now bounds that scratch automatically — measured on a 102K-token prompt: peak memory dropped from 51.6 GB to 27.0 GB and prefill got 14% *faster*, with byte-identical output. Short and typical prompts are untouched.
+- **The memory admission check now tells the truth.** It accounts for KV-cache quantization (including the per-request `kv_quant` override), so quantized long-context requests that comfortably fit are no longer spuriously rejected with a "requires ~100 GB" error — and requests that genuinely won't fit get a clean 400 instead of a dead server.
+
+---
+
 ## v26.7.5 — Tool calls that don't fight your agent
 
 - **Local agents stop looping on tool calls they already got right.** Point a coding agent (Claude Code, pi, opencode) at a local model and weaker or reasoning-distilled models routinely mistype a tool argument — sending Python's `False` where JSON wants `false`, or a list of edits as a quoted string — so strict clients reject the call with "expected boolean, provided string." The model can't see its own serialized request, so it "fixes" a value that was already correct and burns turn after turn (one captured session failed six times in a row, then gave up on editing and rewrote whole files). The server now reads the tool's own schema and corrects the argument's type before the client ever sees it, so the call goes through the first time.

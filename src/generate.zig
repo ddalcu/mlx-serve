@@ -31,6 +31,49 @@ const KVCache = transformer_mod.KVCache;
 pub var prefill_chunk_override: usize = 8192;
 pub var prefill_trace_force: bool = false;
 
+/// One layer's materialized-score budget for unfused-SDPA prefill (see
+/// boundedPrefillChunk). 4 GiB keeps the full 8K chunk for every context up
+/// to ~16K on 16-head models (further on fewer heads) and degrades gradually
+/// to the 512 floor as heads × context grows toward 262K.
+pub const PREFILL_SCORES_BUDGET_BYTES: u64 = 4 << 30;
+/// Lower bound for the auto-capped prefill chunk; also its rounding grain
+/// (repeating chunk sizes let the MLX allocator cache reuse score buffers).
+pub const PREFILL_CHUNK_FLOOR: usize = 512;
+
+/// MLX's fused SDPA kernels cover head_dim <= 128. Every Gemma-4 and
+/// Qwen3.5/3.6 checkpoint ships head_dim=256, which falls back to the
+/// composed path that MATERIALIZES a [heads, chunk, total_kv] bf16 score
+/// tensor per layer — at an 8K chunk × 255K ctx × 16 heads that is ~67 GB
+/// and an uncatchable Metal command-buffer OOM. Cap the chunk so ONE layer's
+/// score tensor stays within PREFILL_SCORES_BUDGET_BYTES at this prompt's
+/// FINAL KV length (the last chunk attends to everything). Fused head dims
+/// and short contexts return `base_chunk` untouched, so typical traffic
+/// keeps full prefill throughput; the cap only bites when heads × total_ctx
+/// actually outgrows the budget. Never raises a caller-lowered base.
+pub fn boundedPrefillChunk(base_chunk: usize, head_dim: u32, n_heads: u32, total_ctx: usize) usize {
+    if (head_dim <= 128 or n_heads == 0 or total_ctx == 0) return base_chunk;
+    const per_row: u64 = @as(u64, n_heads) * @as(u64, total_ctx) * 2;
+    const max_chunk: u64 = PREFILL_SCORES_BUDGET_BYTES / per_row;
+    if (max_chunk >= base_chunk) return base_chunk;
+    const floored = @max(
+        @as(u64, PREFILL_CHUNK_FLOOR),
+        max_chunk - (max_chunk % PREFILL_CHUNK_FLOOR),
+    );
+    return @intCast(@min(floored, @as(u64, base_chunk)));
+}
+
+/// The prefill chunk `initWithOptions` will actually use for a request:
+/// MLX_SERVE_PREFILL_CHUNK env (explicit tuning knob — honored verbatim,
+/// never safety-capped) > --prefill-chunk / default, capped by
+/// boundedPrefillChunk. Exported so server.zig's admission guard
+/// (checkAttentionMemory) models the SAME chunk the prefill will run with —
+/// the guard and the real prefill must not drift.
+pub fn effectivePrefillChunk(head_dim: u32, n_heads: u32, total_ctx: usize) usize {
+    const env_chunk = readEnvUsize("MLX_SERVE_PREFILL_CHUNK", 0);
+    if (env_chunk > 0) return env_chunk;
+    return boundedPrefillChunk(prefill_chunk_override, head_dim, n_heads, total_ctx);
+}
+
 /// Read an unsigned integer from an environment variable, falling back to
 /// `default` when unset, empty, or unparseable. Uses libc getenv to stay
 /// allocator-free at call sites.
@@ -741,8 +784,21 @@ pub const Generator = struct {
         // in a single forward pass for spliceVisionEmbeddings to work correctly.
         // PREFILL_CHUNK overridable via env MLX_SERVE_PREFILL_CHUNK for tuning,
         // or via the module-level `prefill_chunk_override` (set by --prefill-chunk
-        // CLI flag in main.zig). Env var wins if both are set.
-        const PREFILL_CHUNK: usize = readEnvUsize("MLX_SERVE_PREFILL_CHUNK", prefill_chunk_override);
+        // CLI flag in main.zig). Env var wins if both are set (and skips the
+        // safety cap below — it's the explicit escape hatch).
+        //
+        // Safety cap: on unfused head dims (>128 — every Gemma-4/Qwen3.5/3.6)
+        // the composed SDPA materializes [heads, chunk, total_kv] scores per
+        // layer, so the chunk shrinks with the prompt's FINAL KV length to keep
+        // that one tensor bounded (boundedPrefillChunk). Warm-path restores
+        // start at ssm_checkpoint_pos_offset, so the final KV length is that
+        // offset plus everything we're about to forward.
+        const total_ctx_for_chunk = options.ssm_checkpoint_pos_offset + prompt_ids.len;
+        const PREFILL_CHUNK: usize = effectivePrefillChunk(
+            xfm.config.head_dim,
+            xfm.config.num_attention_heads,
+            total_ctx_for_chunk,
+        );
         // Phase-level prefill instrumentation. Enabled at debug level OR via
         // MLX_SERVE_PREFILL_TRACE=1 (which forces the trace line at info).
         // Phase 0 of plan 04 — gives us a decomposed view of where cold prefill
@@ -778,8 +834,12 @@ pub const Generator = struct {
         // coarsening it to PREFILL_CHUNK silently disabled every prefix-cache hit
         // under 8K-token prompts (caught live by llmprobe cache-hit-reported on
         // Qwen3.6-27B dense, 2026-06-10).
+        // Coarsen against the UNCAPPED base chunk: the head_dim safety cap
+        // above must not densify MoE checkpoint spacing (16× more captures at
+        // 255K ctx otherwise). nextChunkEnd already shortens a chunk to land
+        // on stride boundaries, so a capped chunk stays compatible.
         const ssm_cp_stride: usize = if (want_ssm_cp)
-            effectiveSsmCheckpointStride(@intCast(options.ssm_checkpoint_stride), xfm.config.isMoe(), PREFILL_CHUNK)
+            effectiveSsmCheckpointStride(@intCast(options.ssm_checkpoint_stride), xfm.config.isMoe(), @max(PREFILL_CHUNK, prefill_chunk_override))
         else
             0;
         // Absolute KV position of `prompt_ids[0]`. Warm-path callers (the
@@ -4892,6 +4952,42 @@ test "prefillChunkCount: SSM-checkpoint stride controls cold-prefill chunking" {
     // prefix tail of 200 (abs 2000..2200), stride 256 -> boundary 2048/2304? only
     // 2048 falls inside (2000..2200) -> 2 chunks.
     try testing.expectEqual(@as(usize, 2), prefillChunkCount(200, PREFILL_CHUNK, true, 256, 2000));
+}
+
+test "boundedPrefillChunk: fused head dims and short contexts keep the base chunk" {
+    // head_dim <= 128 rides MLX's fused SDPA — no materialized scores, no cap,
+    // at ANY context length.
+    try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 128, 16, 1_000_000));
+    try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 64, 32, 1_000_000));
+    // Unfused (256) but short context: 16 heads x 8192 ctx x 8192 chunk x 2B
+    // = 2 GiB scores, inside the 4 GiB budget -> full chunk kept. This is the
+    // fleet-protection property: every Gemma-4 / Qwen3.5/3.6 checkpoint ships
+    // head_dim 256, so typical prompts must keep full prefill throughput.
+    try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 256, 16, 8192));
+    // Degenerate inputs never cap.
+    try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 256, 0, 100_000));
+    try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 256, 16, 0));
+}
+
+test "boundedPrefillChunk: unfused long context shrinks to the scores budget, floored and rounded" {
+    // gemma-4-26B geometry (16 heads): budget/(16*ctx*2) …
+    // ctx 32768 -> exactly 4096.
+    try testing.expectEqual(@as(usize, 4096), boundedPrefillChunk(8192, 256, 16, 32768));
+    // ctx 100000 -> raw 1342, rounded down to the 512 grain -> 1024.
+    try testing.expectEqual(@as(usize, 1024), boundedPrefillChunk(8192, 256, 16, 100_000));
+    // ctx 262144 (the PR-#69 255K case) -> 512.
+    try testing.expectEqual(@as(usize, 512), boundedPrefillChunk(8192, 256, 16, 262_144));
+    // Qwen3.6-27B geometry (24 heads) at 262144: raw 341 -> floor 512.
+    try testing.expectEqual(@as(usize, 512), boundedPrefillChunk(8192, 256, 24, 262_144));
+    // e4b geometry (8 heads) at 131072: exactly 2048.
+    try testing.expectEqual(@as(usize, 2048), boundedPrefillChunk(8192, 256, 8, 131_072));
+}
+
+test "boundedPrefillChunk: never raises a caller-lowered base chunk" {
+    // --prefill-chunk 1024 with headroom for 4096: the explicit lower value wins.
+    try testing.expectEqual(@as(usize, 1024), boundedPrefillChunk(1024, 256, 16, 32768));
+    // Even the floor never raises a tiny explicit base.
+    try testing.expectEqual(@as(usize, 256), boundedPrefillChunk(256, 256, 16, 262_144));
 }
 
 test "effectiveSsmCheckpointStride: MoE coarsens to PREFILL_CHUNK, dense keeps fine" {
