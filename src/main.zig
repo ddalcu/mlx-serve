@@ -1485,9 +1485,19 @@ fn runHeadlessServe(
         .warmup_eager = false,
         .draft_block_size = 0,
         .kv_quant_config = transformer_mod.KVQuantConfig.dense,
-        .prefix_cache_capacity = 0,
-        .prefix_cache_mem_bytes = 0,
-        .tokenize_cache_entries = 0,
+        // Seed the scheduler's prefix-cache config from the server globals so
+        // on-demand (headless/discover-mode) loads get the SAME hot prefix
+        // cache as a `--model` startup load. Previously hardcoded to 0, which
+        // left `Scheduler.prefix_cache_capacity == 0` → every model loaded via
+        // `ensureLoaded` skipped `HotPrefixCache` init → cross-turn KV reuse
+        // was silently dead for the entire headless serving mode (the default
+        // `serve` path). Mirrors the LoadParams built in `main()`.
+        .prefix_cache_capacity = server_mod.prefix_cache_capacity,
+        .prefix_cache_mem_bytes = server_mod.prefix_cache_mem_bytes,
+        .prefix_cache_disk_bytes = server_mod.prefix_cache_disk_bytes,
+        .ssm_checkpoint_stride = server_mod.ssm_checkpoint_stride,
+        .ssm_checkpoint_max = server_mod.ssm_checkpoint_max,
+        .tokenize_cache_entries = server_mod.tokenize_cache_entries,
         .metrics = server_mod.g_metrics,
     };
 
