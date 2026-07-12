@@ -88,7 +88,17 @@ pub const MtpModel = struct {
     mlp_up: QLinear,
     mlp_down: QLinear,
 
+    /// Optional DRAFT-ONLY low-bit lm_head, requantized from the trunk's at
+    /// bind time (MLX_SERVE_MTP_DRAFT_HEAD_BITS, default 3, 0 disables).
+    /// Only draft steps project through it — VERIFICATION always uses the
+    /// trunk head, so the output distribution is untouched; drafts just read
+    /// ~40% fewer bytes per full-vocab projection (the dominant draft cost).
+    draft_head: ?QLinear = null,
+    draft_head_bits: u32 = 0,
+    draft_head_group: u32 = 0,
+
     pub fn deinit(self: *MtpModel) void {
+        if (self.draft_head) |*dh| dh.deinit();
         _ = mlx.mlx_array_free(self.fc_w_t);
         _ = mlx.mlx_array_free(self.pre_fc_norm_emb);
         _ = mlx.mlx_array_free(self.pre_fc_norm_hidden);
@@ -115,8 +125,10 @@ pub const MtpModel = struct {
 
     /// Validate the head against the target trunk: dims must line up and the
     /// trunk must be a Qwen 3.5/3.6-family hybrid (full-attention MTP layer
-    /// cross-checks `attn_output_gate`).
-    pub fn bind(self: *const MtpModel, target: *Transformer) !void {
+    /// cross-checks `attn_output_gate`). On success, optionally builds the
+    /// draft-only low-bit lm_head (a failed build only logs — drafts fall
+    /// back to the trunk head).
+    pub fn bind(self: *MtpModel, target: *Transformer) !void {
         const cfg = &target.config;
         if (!cfg.attn_output_gate) return error.UnsupportedMtpArch;
         const fc_shape = mlx.getShape(self.fc_w_t);
@@ -124,18 +136,90 @@ pub const MtpModel = struct {
             fc_shape[0] != @as(c_int, @intCast(cfg.hidden_size * 2)) or
             fc_shape[1] != @as(c_int, @intCast(cfg.hidden_size)))
             return error.MtpTargetMismatch;
+
+        self.buildDraftHead(target) catch |err| {
+            log.warn("[mtp] draft lm_head build failed ({s}) — drafts use the trunk head\n", .{@errorName(err)});
+        };
+    }
+
+    /// MLX_SERVE_MTP_DRAFT_HEAD_BITS: absent → 3 (default on)
+    /// a supported bit width → that; anything else ("0", "off") → disabled.
+    fn draftHeadBitsFromEnv() u32 {
+        const p = std.c.getenv("MLX_SERVE_MTP_DRAFT_HEAD_BITS") orelse return 3;
+        const raw = std.mem.span(p);
+        const v = std.fmt.parseInt(u32, raw, 10) catch return 0;
+        return switch (v) {
+            2, 3, 4, 6, 8 => v,
+            else => 0,
+        };
+    }
+
+    fn buildDraftHead(self: *MtpModel, target: *Transformer) !void {
+        const bits = draftHeadBitsFromEnv();
+        if (bits == 0) return;
+        if (target.lm_head_s.ctx == null) return; // dense bf16 head — nothing to shrink
+        const cfg = &target.config;
+        if (bits >= cfg.quant_bits) return; // no byte saving over the trunk head
+        const group: u32 = 64;
+
+        var dh = try requantizeRows(
+            self.s,
+            target.lm_head_w,
+            target.lm_head_s,
+            target.lm_head_b,
+            cfg.quant_group_size,
+            cfg.quant_bits,
+            cfg.quant_mode.cstr(),
+            group,
+            bits,
+            32768,
+        );
+        errdefer dh.deinit();
+
+        // Materialize now so the first draft doesn't pay for it.
+        {
+            const eval_vec = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(eval_vec);
+            _ = mlx.mlx_vector_array_append_value(eval_vec, dh.w);
+            _ = mlx.mlx_vector_array_append_value(eval_vec, dh.s);
+            _ = mlx.mlx_vector_array_append_value(eval_vec, dh.b);
+            try mlx.check(mlx.mlx_eval(eval_vec));
+        }
+
+        self.draft_head = dh;
+        self.draft_head_bits = bits;
+        self.draft_head_group = group;
+        log.info("[mtp] draft-only lm_head requantized to {d}-bit/gs{d}\n", .{ bits, group });
     }
 };
+
+/// Sidecar file layouts we accept, in priority order. The native layout wins
+/// so a repo shipping several keeps loading exactly what it loaded before.
+/// Root-level names are what others publish (mutual compat: their
+/// loader accepts our `mtp/weights.safetensors` too).
+pub const sidecar_rel_paths = [_][]const u8{
+    "mtp/weights.safetensors", // mlx-serve native (ddalcu repos, build_mtp_sidecar.py)
+    "mtp.safetensors", // others
+    "model-mtp.safetensors", // others
+};
+
+/// Relative path (one of `sidecar_rel_paths`) of the first present, non-empty
+/// sidecar file under `dir`, or null when the model ships no MTP head.
+pub fn resolveMtpSidecarInDir(io: std.Io, dir: std.Io.Dir) ?[]const u8 {
+    for (&sidecar_rel_paths) |rel| {
+        const st = dir.statFile(io, rel, .{}) catch continue;
+        if (st.size > 0) return rel;
+    }
+    return null;
+}
 
 /// True when `model_dir` carries an MTP sidecar file we know how to load.
 /// `model_dir` is absolute (same contract as `model.parseConfig`).
 pub fn hasMtpSidecar(io: std.Io, model_dir: []const u8) bool {
-    var buf: [std.fs.max_path_bytes]u8 = undefined;
-    const parent = std.fmt.bufPrint(&buf, "{s}/mtp", .{model_dir}) catch return false;
-    var dir = std.Io.Dir.openDirAbsolute(io, parent, .{}) catch return false;
+    if (model_dir.len == 0 or !std.fs.path.isAbsolute(model_dir)) return false;
+    var dir = std.Io.Dir.openDirAbsolute(io, model_dir, .{}) catch return false;
     defer dir.close(io);
-    const st = dir.statFile(io, "weights.safetensors", .{}) catch return false;
-    return st.size > 0;
+    return resolveMtpSidecarInDir(io, dir) != null;
 }
 
 fn ownWeight(w: *const Weights, key: []const u8) !mlx.mlx_array {
@@ -181,6 +265,115 @@ fn loadLinear(w: *const Weights, allocator: std.mem.Allocator, prefix: []const u
     };
 }
 
+/// Requantize a row-quantized affine weight `(w, scales, biases)` from
+/// `(from_gs, from_bits)` to `(to_gs, to_bits)`, chunk-wise over rows so the
+/// dequantized bf16 transient stays bounded (~chunk_rows × in_features × 2 B
+/// instead of the whole matrix — a 248K×5120 lm_head would otherwise
+/// materialize 2.5 GB). Rows quantize independently in MLX's affine packing,
+/// so per-chunk triples concatenate along axis 0 into a valid whole.
+pub fn requantizeRows(
+    s: mlx.mlx_stream,
+    w: mlx.mlx_array,
+    scales: mlx.mlx_array,
+    biases: mlx.mlx_array,
+    from_gs: u32,
+    from_bits: u32,
+    from_mode: [*:0]const u8,
+    to_gs: u32,
+    to_bits: u32,
+    chunk_rows: c_int,
+) !QLinear {
+    const w_shape = mlx.getShape(w);
+    if (w_shape.len != 2) return error.UnsupportedDraftHeadShape;
+    const rows: c_int = w_shape[0];
+
+    const wv = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(wv);
+    const sv = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(sv);
+    const bv = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(bv);
+
+    var r0: c_int = 0;
+    while (r0 < rows) : (r0 += chunk_rows) {
+        const r1: c_int = @min(rows, r0 + chunk_rows);
+
+        var dense = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(dense);
+        {
+            var wq = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(wq);
+            var sq = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(sq);
+            var bq = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(bq);
+            try sliceRows(&wq, w, r0, r1, s);
+            try sliceRows(&sq, scales, r0, r1, s);
+            if (biases.ctx != null) try sliceRows(&bq, biases, r0, r1, s);
+            try mlx.check(mlx.mlx_dequantize(
+                &dense,
+                wq,
+                sq,
+                bq,
+                mlx.mlx_optional_int.some(@intCast(from_gs)),
+                mlx.mlx_optional_int.some(@intCast(from_bits)),
+                from_mode,
+                .{}, // global_scale
+                .{ .value = .bfloat16, .has_value = true },
+                s,
+            ));
+        }
+
+        var triple = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(triple);
+        try mlx.check(mlx.mlx_quantize(
+            &triple,
+            dense,
+            mlx.mlx_optional_int.some(@intCast(to_gs)),
+            mlx.mlx_optional_int.some(@intCast(to_bits)),
+            "affine",
+            .{}, // global_scale
+            s,
+        ));
+        if (mlx.mlx_vector_array_size(triple) != 3) return error.UnexpectedQuantizeOutput;
+        var part = [3]mlx.mlx_array{ mlx.mlx_array_new(), mlx.mlx_array_new(), mlx.mlx_array_new() };
+        try mlx.check(mlx.mlx_vector_array_get(&part[0], triple, 0));
+        try mlx.check(mlx.mlx_vector_array_get(&part[1], triple, 1));
+        try mlx.check(mlx.mlx_vector_array_get(&part[2], triple, 2));
+        // Realize the chunk so its dense transient can be reclaimed before
+        // the next chunk builds (lazy eval would otherwise stack them all).
+        {
+            const ev = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(ev);
+            for (part) |p| _ = mlx.mlx_vector_array_append_value(ev, p);
+            try mlx.check(mlx.mlx_eval(ev));
+        }
+        _ = mlx.mlx_vector_array_append_value(wv, part[0]);
+        _ = mlx.mlx_vector_array_append_value(sv, part[1]);
+        _ = mlx.mlx_vector_array_append_value(bv, part[2]);
+        for (part) |p| _ = mlx.mlx_array_free(p);
+    }
+
+    var out = QLinear{
+        .w = mlx.mlx_array_new(),
+        .s = mlx.mlx_array_new(),
+        .b = mlx.mlx_array_new(),
+    };
+    errdefer out.deinit();
+    try mlx.check(mlx.mlx_concatenate_axis(&out.w, wv, 0, s));
+    try mlx.check(mlx.mlx_concatenate_axis(&out.s, sv, 0, s));
+    try mlx.check(mlx.mlx_concatenate_axis(&out.b, bv, 0, s));
+    return out;
+}
+
+fn sliceRows(out: *mlx.mlx_array, src: mlx.mlx_array, r0: c_int, r1: c_int, s: mlx.mlx_stream) !void {
+    const shape = mlx.getShape(src);
+    const start = [_]c_int{ r0, 0 };
+    const stop = [_]c_int{ r1, shape[1] };
+    const strides = [_]c_int{ 1, 1 };
+    try mlx.check(mlx.mlx_slice(out, src, &start, 2, &stop, 2, &strides, 2, s));
+}
+
 /// Infer the quant group size from packed-weight vs scales geometry:
 /// expanded_cols = packed_cols * (32/bits); group = expanded_cols / scale_cols.
 fn inferGroupSize(q: *const QLinear, bits: u32) ?u32 {
@@ -212,16 +405,22 @@ fn inferBits(q: *const QLinear, hidden: u32) ?u32 {
     };
 }
 
-/// Load the MTP head from `<model_dir>/mtp/weights.safetensors`.
+/// Load the MTP head from the model's sidecar file (any `sidecar_rel_paths`
+/// layout — native `mtp/weights.safetensors` and other compatible ones).
 pub fn loadMtp(
     io: std.Io,
     allocator: std.mem.Allocator,
     s: mlx.mlx_stream,
     model_dir: []const u8,
 ) !MtpModel {
-    var dir_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const mtp_dir = try std.fmt.bufPrint(&dir_buf, "{s}/mtp", .{model_dir});
-    var weights = try model_mod.loadWeights(io, allocator, mtp_dir);
+    const rel = blk: {
+        var dir = try std.Io.Dir.openDirAbsolute(io, model_dir, .{});
+        defer dir.close(io);
+        break :blk resolveMtpSidecarInDir(io, dir) orelse return error.MissingMtpWeight;
+    };
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const sidecar_path = try std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ model_dir, rel });
+    var weights = try model_mod.loadWeightsSingleFile(allocator, sidecar_path);
     defer weights.deinit();
 
     var m = MtpModel{
@@ -361,8 +560,26 @@ fn embedTargetTokens(
     return out;
 }
 
-/// Project the MTP post-norm hidden through the TARGET's lm_head.
-fn targetLmHead(target: *Transformer, x: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
+/// Project the MTP post-norm hidden through the lm_head. Draft steps go
+/// through the low-bit draft-only head when one was built (verification
+/// never routes here — trunk logits come from the trunk forward).
+fn targetLmHead(self: *const MtpModel, target: *Transformer, x: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
+    if (self.draft_head) |*dh| {
+        var out = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_quantized_matmul(
+            &out,
+            x,
+            dh.w,
+            dh.s,
+            dh.b,
+            true,
+            mlx.mlx_optional_int.some(@intCast(self.draft_head_group)),
+            mlx.mlx_optional_int.some(@intCast(self.draft_head_bits)),
+            "affine",
+            s,
+        ));
+        return out;
+    }
     var out = mlx.mlx_array_new();
     if (target.lm_head_s.ctx == null) {
         // Dense bf16 lm_head is stored [vocab, hidden]; contract via lazy transpose.
@@ -573,7 +790,7 @@ pub fn forward(
     if (!want_logits) {
         return .{ .logits = .{ .ctx = null }, .hidden_next = post };
     }
-    const logits = targetLmHead(target, post, s) catch |err| {
+    const logits = targetLmHead(self, target, post, s) catch |err| {
         _ = mlx.mlx_array_free(post);
         return err;
     };
@@ -621,6 +838,95 @@ pub fn stepArr(
 // ── Tests ──
 
 const testing = std.testing;
+
+test "mtp: requantizeRows round-trips through a finer re-encode (chunked)" {
+    const s = mlx.gpuStream();
+    const rows: usize = 64;
+    const cols: usize = 256;
+
+    var prng = std.Random.DefaultPrng.init(42);
+    const buf = try testing.allocator.alloc(f32, rows * cols);
+    defer testing.allocator.free(buf);
+    for (buf) |*x| x.* = prng.random().floatNorm(f32);
+    const shape = [_]c_int{ @intCast(rows), @intCast(cols) };
+    const dense_f32 = mlx.mlx_array_new_data(buf.ptr, &shape, 2, .float32);
+    defer _ = mlx.mlx_array_free(dense_f32);
+    var dense = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(dense);
+    try mlx.check(mlx.mlx_astype(&dense, dense_f32, .bfloat16, s));
+
+    // "Trunk" 4-bit/gs64 triple.
+    var triple = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(triple);
+    try mlx.check(mlx.mlx_quantize(&triple, dense, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(4), "affine", .{}, s));
+    var q4 = QLinear{ .w = mlx.mlx_array_new(), .s = mlx.mlx_array_new(), .b = mlx.mlx_array_new() };
+    defer q4.deinit();
+    try mlx.check(mlx.mlx_vector_array_get(&q4.w, triple, 0));
+    try mlx.check(mlx.mlx_vector_array_get(&q4.s, triple, 1));
+    try mlx.check(mlx.mlx_vector_array_get(&q4.b, triple, 2));
+
+    // Requantize to 8-bit/gs64, chunked at 16 rows (4 chunks → exercises concat).
+    var q8 = try requantizeRows(s, q4.w, q4.s, q4.b, 64, 4, "affine", 64, 8, 16);
+    defer q8.deinit();
+
+    // Dequantize both and compare — an 8-bit re-encode of 4-bit-quantized
+    // values is near-lossless, so cosine must be ~1.
+    var deq = [2]mlx.mlx_array{ mlx.mlx_array_new(), mlx.mlx_array_new() };
+    defer for (deq) |d| {
+        _ = mlx.mlx_array_free(d);
+    };
+    try mlx.check(mlx.mlx_dequantize(&deq[0], q4.w, q4.s, q4.b, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(4), "affine", .{}, .{ .value = .float32, .has_value = true }, s));
+    try mlx.check(mlx.mlx_dequantize(&deq[1], q8.w, q8.s, q8.b, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(8), "affine", .{}, .{ .value = .float32, .has_value = true }, s));
+    for (deq) |d| try mlx.check(mlx.mlx_array_eval(d));
+
+    const a = mlx.mlx_array_data_float32(deq[0]).?;
+    const b = mlx.mlx_array_data_float32(deq[1]).?;
+    var dot: f64 = 0;
+    var na: f64 = 0;
+    var nb: f64 = 0;
+    for (0..rows * cols) |i| {
+        dot += @as(f64, a[i]) * b[i];
+        na += @as(f64, a[i]) * a[i];
+        nb += @as(f64, b[i]) * b[i];
+    }
+    const cos = dot / (@sqrt(na) * @sqrt(nb));
+    try testing.expect(cos > 0.999);
+
+    // Shape sanity: 8-bit packs 4 in-features per u32 → cols/4 packed cols.
+    const w8_shape = mlx.getShape(q8.w);
+    try testing.expectEqual(@as(c_int, @intCast(rows)), w8_shape[0]);
+    try testing.expectEqual(@as(c_int, @intCast(cols / 4)), w8_shape[1]);
+}
+
+test "mtp: sidecar resolution accepts native and Forge layouts in priority order" {
+    const io = testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    // Nothing present → null.
+    try testing.expectEqual(@as(?[]const u8, null), resolveMtpSidecarInDir(io, tmp.dir));
+
+    // MTPLX Forge legacy root file alone.
+    try tmp.dir.writeFile(io, .{ .sub_path = "model-mtp.safetensors", .data = "x" });
+    try testing.expectEqualStrings("model-mtp.safetensors", resolveMtpSidecarInDir(io, tmp.dir).?);
+
+    // Forge current name outranks legacy.
+    try tmp.dir.writeFile(io, .{ .sub_path = "mtp.safetensors", .data = "x" });
+    try testing.expectEqualStrings("mtp.safetensors", resolveMtpSidecarInDir(io, tmp.dir).?);
+
+    // Native mlx-serve layout outranks both Forge names.
+    try tmp.dir.createDirPath(io, "mtp");
+    try tmp.dir.writeFile(io, .{ .sub_path = "mtp/weights.safetensors", .data = "x" });
+    try testing.expectEqualStrings("mtp/weights.safetensors", resolveMtpSidecarInDir(io, tmp.dir).?);
+}
+
+test "mtp: empty sidecar file is not a sidecar" {
+    const io = testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "mtp.safetensors", .data = "" });
+    try testing.expectEqual(@as(?[]const u8, null), resolveMtpSidecarInDir(io, tmp.dir));
+}
 
 test "mtp: inferGroupSize geometry" {
     // 4-bit packed: weight [out, in*4/32] u32, scales [out, in/group].

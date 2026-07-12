@@ -990,7 +990,7 @@ pub fn main(init: std.process.Init) !void {
             .prefix_cache_capacity = server_mod.prefix_cache_capacity,
             .prefix_cache_mem_bytes = server_mod.prefix_cache_mem_bytes,
             .prefix_cache_disk_bytes = server_mod.prefix_cache_disk_bytes,
-            .ssm_checkpoint_stride = server_mod.ssm_checkpoint_stride,
+            .ssm_checkpoint_stride = server_mod.effectiveSsmCheckpointStride(server_mod.ssm_checkpoint_stride, server_mod.prefix_cache_capacity),
             .ssm_checkpoint_max = server_mod.ssm_checkpoint_max,
             .tokenize_cache_entries = server_mod.tokenize_cache_entries,
             .llama_cache_entries = server_mod.llama_cache_entries,
@@ -1065,12 +1065,18 @@ pub fn main(init: std.process.Init) !void {
         var mtp_head: ?mtp_mod.MtpModel = null;
         defer if (mtp_head) |*h| h.deinit();
         if (enable_mtp and mtp_mod.hasMtpSidecar(io, model_dir)) {
-            mtp_head = try mtp_mod.loadMtp(io, allocator, xfm.s, model_dir);
-            mtp_head.?.bind(&xfm) catch |err| {
-                log.warn("[mtp] sidecar incompatible with target ({any}) — disabled\n", .{err});
-                mtp_head.?.deinit();
-                mtp_head = null;
-            };
+            // A failed load (e.g. a sidecar layout we can't bind yet) only
+            // disables the head — mirrors the serve path's graceful degrade.
+            if (mtp_mod.loadMtp(io, allocator, xfm.s, model_dir)) |loaded| {
+                mtp_head = loaded;
+                mtp_head.?.bind(&xfm) catch |err| {
+                    log.warn("[mtp] sidecar incompatible with target ({any}) — disabled\n", .{err});
+                    mtp_head.?.deinit();
+                    mtp_head = null;
+                };
+            } else |err| {
+                log.warn("[mtp] failed to load sidecar ({any}) — disabled\n", .{err});
+            }
         }
 
         const user_prompt = prompt orelse "What is 2+2? Answer in one sentence.";
@@ -1496,7 +1502,7 @@ fn runHeadlessServe(
         .prefix_cache_capacity = server_mod.prefix_cache_capacity,
         .prefix_cache_mem_bytes = server_mod.prefix_cache_mem_bytes,
         .prefix_cache_disk_bytes = server_mod.prefix_cache_disk_bytes,
-        .ssm_checkpoint_stride = server_mod.ssm_checkpoint_stride,
+        .ssm_checkpoint_stride = server_mod.effectiveSsmCheckpointStride(server_mod.ssm_checkpoint_stride, server_mod.prefix_cache_capacity),
         .ssm_checkpoint_max = server_mod.ssm_checkpoint_max,
         .tokenize_cache_entries = server_mod.tokenize_cache_entries,
         .metrics = server_mod.g_metrics,

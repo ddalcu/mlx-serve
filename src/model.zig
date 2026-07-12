@@ -1209,6 +1209,27 @@ pub fn loadWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
     return loadWeightsOpt(io, allocator, model_dir, false);
 }
 
+/// Load ONE safetensors file (absolute path) into a Weights map — for
+/// sidecar files that live beside the trunk shards (e.g. a root-level
+/// `mtp.safetensors`), where a directory scan would sweep in the trunk.
+pub fn loadWeightsSingleFile(allocator: std.mem.Allocator, abs_path: []const u8) !Weights {
+    var weights = Weights.init(allocator);
+    errdefer weights.deinit();
+
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+
+    const pathz = try allocator.dupeZ(u8, abs_path);
+    defer allocator.free(pathz);
+    try loadSafetensorsFile(allocator, &weights, pathz, s, false);
+
+    if (weights.count() == 0) {
+        log.err("no usable weights loaded from {s} — corrupt or empty safetensors file?\n", .{abs_path});
+        return error.NoWeightFiles;
+    }
+    return weights;
+}
+
 pub fn loadWeightsWithVision(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !Weights {
     return loadWeightsOpt(io, allocator, model_dir, true);
 }

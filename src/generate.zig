@@ -231,6 +231,15 @@ pub fn prefillTokensPerSec(prompt_tokens: u32, cached_tokens: u32, prefill_ns: u
 /// silently tanks MoE prefill throughput (~25% on 35B-class models for an
 /// 850-token prompt at stride 256). Keeping typical prompts single-chunk is what
 /// `ssm_checkpoint_stride`'s default guards.
+/// A trailing remainder smaller than this merges into the preceding chunk
+/// instead of becoming its own chunk. Chat-templated prompts routinely land a
+/// token or two past a chunk multiple (an "8192-token" prompt tokenizes to
+/// 8193); a 1-token final chunk pays a full graph build + eval barrier +
+/// cache clear for one token. The merged chunk's attention-score transient
+/// grows by at most TAIL_MERGE_MAX/default_chunk (~6% at 8192) — within the
+/// score-budget slack `boundedPrefillChunk` already carries.
+pub const TAIL_MERGE_MAX: usize = 512;
+
 pub fn nextChunkEnd(
     pos: usize,
     prefix_len: usize,
@@ -247,6 +256,9 @@ pub fn nextChunkEnd(
         if (next_boundary_abs > abs_pos and next_boundary_abs < abs_end) {
             end = next_boundary_abs - ssm_cp_offset;
         }
+    } else if (end < prefix_len and prefix_len - end < TAIL_MERGE_MAX) {
+        // No checkpoint alignment to respect — absorb a tiny tail.
+        end = prefix_len;
     }
     return end;
 }
@@ -2391,10 +2403,12 @@ pub const Generator = struct {
         const m: u32 = @max(@as(u32, 1), self.mtp_depth_current);
         const t1: u32 = self.next_token_id;
 
-        // ── Phase 0: snapshot the MTP history at the round boundary ──
+        // ── Phase 0: record the MTP history length at the round boundary ──
+        // No snapshot: a snapshot refcount-shares the head's KV buffer, which
+        // forces every draft append's slice_update to copy-on-write the WHOLE
+        // history buffer (~268 MB/append at 64k). Rollback is truncate —
+        // offset-only — since draft entries only ever append past mtp_off0.
         const mtp_off0: usize = mc.step;
-        var mtp_snap = try mc.snapshot();
-        defer mtp_snap.deinit();
 
         // ── Phase 1: draft m tokens lazily, no per-step CPU sync ──
         // Each step's sampled token ([1] lazy array) feeds the next step's
@@ -2418,12 +2432,18 @@ pub const Generator = struct {
         };
 
         {
+            // Draft proposal sampler. Greedy (argmax) drafts make the one-hot
+            // proposal model exact AND remove draft-side sampling noise from
+            // the acceptance rate; opt in via MLX_SERVE_MTP_DRAFT_GREEDY=1.
+            var draft_sampling = self.sampling;
+            if (mtpDraftGreedy()) draft_sampling.temperature = 0.0;
+
             var prev_tok_arr: mlx.mlx_array = t1_arr;
             var i: u32 = 0;
             while (i < m) : (i += 1) {
                 const h_prev_arg: mlx.mlx_array = if (h_prev_owner) |h| h else self.last_hidden;
                 const step_out = try mtp_mod.stepArr(head, xfm, mc, prev_tok_arr, h_prev_arg, @intCast(mtp_off0 + i));
-                draft_arrs[i] = sampleTokenLazy(step_out.logits, self.sampling, s);
+                draft_arrs[i] = sampleTokenLazy(step_out.logits, draft_sampling, s);
                 _ = mlx.mlx_array_free(step_out.logits);
                 if (h_prev_owner) |h_old| {
                     _ = mlx.mlx_array_free(h_old);
@@ -2433,19 +2453,20 @@ pub const Generator = struct {
             }
         }
 
-        // ── Phase 2: snapshot trunk KV + SSM + MoE offset ──
-        var kv_snap = try self.ctx.cache.snapshot();
-        defer kv_snap.deinit();
-        var ssm_snaps: ?[]SSMCacheEntrySnapshot = null;
-        defer if (ssm_snaps) |snaps| {
-            for (snaps) |*sn| ssmSnapshotDeinit(sn);
-            xfm.allocator.free(snaps);
-        };
-        if (self.ctx.ssm_entries) |entries| {
-            const out = try xfm.allocator.alloc(SSMCacheEntrySnapshot, entries.len);
-            for (entries, 0..) |*entry, idx| out[idx] = ssmSnapshot(entry);
-            ssm_snaps = out;
-        }
+        // ── Phase 2: record rollback anchors (NO snapshot on the GDN path) ──
+        // A KVCache.snapshot() refcount-shares the KV buffers, which forces
+        // verify's slice_update writes to COPY-on-write every full-attention
+        // layer's WHOLE buffer — ~4.3 GB per round at 64k context, the
+        // dominant round cost at long context. On a GDN trunk (every real MTP
+        // target is qwen3_5-family hybrid) rollback needs only the pre-verify
+        // LENGTH (KV truncate is offset-only; the stale tail past it is
+        // unreachable) plus the verify pass's per-position SSM capture, so no
+        // snapshot is taken at all. A hypothetical pure-attention target
+        // (ssm_entries == null) keeps the proven snapshot + re-forward path.
+        const kv_step_snap = self.ctx.cache.step;
+        const gdn_trunk = self.ctx.ssm_entries != null;
+        var kv_snap: ?transformer_mod.KVCacheSnapshot = if (gdn_trunk) null else try self.ctx.cache.snapshot();
+        defer if (kv_snap) |*snap| snap.deinit();
         const moe_seq_offset_snap = self.ctx.moe_seq_offset.*;
 
         // ── Phase 3: verify input [t1, drafts...] as one [1, 1+m] tensor ──
@@ -2476,30 +2497,128 @@ pub const Generator = struct {
         var new_hidden = mlx.mlx_array_new();
         var verify_hidden_all = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(verify_hidden_all);
+        // Enable per-position SSM capture for the verify pass on a GDN trunk
+        // so partial accept can roll back without re-forwarding the accepted
+        // prefix (mirrors nextPld — the re-forward re-runs the 48-layer
+        // sequential recurrence AND a full trunk weight read, and at depth > 1
+        // MOST rounds are partial, so it dominated the round cost).
+        self.ctx.capture_ssm_seq = self.ctx.ssm_entries != null;
         // Captures the post-final-norm hidden at the LAST position (next
         // round's h_prev) AND all 1+m positions (history re-append).
         const verify_logits = try xfm.forwardWithCaptureAll(&self.ctx, verify_input, &new_hidden, &verify_hidden_all);
+        self.ctx.capture_ssm_seq = false;
+        // Always free the transient capture buffers before returning, however
+        // we exit this round (full accept, partial accept, or error).
+        defer if (self.ctx.ssm_entries) |entries| {
+            for (entries) |*entry| transformer_mod.ssmFreeSpecCapture(entry);
+        };
         self.mtp_attempted += 1;
 
         // ── Phase 4: decide longest accepted prefix ──
+        // Stochastic path is fully BATCHED: accept probabilities for every
+        // draft AND a candidate correction token for every possible reject
+        // position are built lazily (draft ids stay lazy arrays — never read
+        // on the CPU inside a graph-building loop), then ONE async eval
+        // realizes the whole round. The old per-draft probAt()/sampleResidual()
+        // calls cost one GPU round-trip sync EACH — 3-5 syncs per round that
+        // stalled the pipeline for milliseconds while the GPU sat idle.
         const stochastic = self.sampling.temperature > 0.01;
         const vl_shape = mlx.getShape(verify_logits);
 
-        var per_pos_logits: ?[]mlx.mlx_array = null;
-        defer if (per_pos_logits) |slots| {
+        var per_pos_probs: ?[]mlx.mlx_array = null;
+        defer if (per_pos_probs) |slots| {
             for (slots) |arr| _ = mlx.mlx_array_free(arr);
             allocator.free(slots);
         };
+        var accept_p_vec = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(accept_p_vec);
+        var corr_samples: ?[]mlx.mlx_array = null;
+        defer if (corr_samples) |slots| {
+            for (slots) |arr| _ = mlx.mlx_array_free(arr);
+            allocator.free(slots);
+        };
+
         if (stochastic) {
-            const slots = try allocator.alloc(mlx.mlx_array, 1 + m);
             const slice_strides = [_]c_int{ 1, 1, 1 };
+            // Filtered + softmaxed target probs for ALL 1+m positions in one
+            // batched kernel set, then per-position slice VIEWS (no copies).
+            const probs_all = try probsAllPositions(verify_logits, self.sampling, s);
+            defer _ = mlx.mlx_array_free(probs_all);
+            const slots = try allocator.alloc(mlx.mlx_array, 1 + m);
+            per_pos_probs = slots;
             for (slots, 0..) |*slot, idx| {
                 slot.* = mlx.mlx_array_new();
                 const start = [_]c_int{ 0, @intCast(idx), 0 };
                 const stop = [_]c_int{ vl_shape[0], @as(c_int, @intCast(idx)) + 1, vl_shape[2] };
-                try mlx.check(mlx.mlx_slice(slot, verify_logits, &start, 3, &stop, 3, &slice_strides, 3, s));
+                try mlx.check(mlx.mlx_slice(slot, probs_all, &start, 3, &stop, 3, &slice_strides, 3, s));
             }
-            per_pos_logits = slots;
+
+            // accept_p_vec[k] = target_p[k][draft_k], gathered with the LAZY
+            // draft id array → [m] f32 after one eval.
+            {
+                const taken = try allocator.alloc(mlx.mlx_array, m);
+                defer {
+                    for (taken) |arr| _ = mlx.mlx_array_free(arr);
+                    allocator.free(taken);
+                }
+                for (0..m) |k| {
+                    taken[k] = mlx.mlx_array_new();
+                    try mlx.check(mlx.mlx_take_axis(&taken[k], slots[k], draft_arrs[k], -1, s));
+                }
+                const vec = mlx.mlx_vector_array_new();
+                defer _ = mlx.mlx_vector_array_free(vec);
+                for (taken) |arr| _ = mlx.mlx_vector_array_append_value(vec, arr);
+                var cat = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(cat);
+                try mlx.check(mlx.mlx_concatenate_axis(&cat, vec, 0, s));
+                try mlx.check(mlx.mlx_astype(&accept_p_vec, cat, .float32, s));
+            }
+
+            // Candidate correction for every possible reject position a<m
+            // (residual sample) plus the full-accept bonus at a=m. Only the
+            // one at the realized `accepted` is read; the rest are a few
+            // vocab-length ops of throwaway GPU work — far cheaper than a
+            // second synchronous softmax+categorical round-trip.
+            var indices = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(indices);
+            try mlx.check(mlx.mlx_arange(&indices, 0, @as(f64, @floatFromInt(vl_shape[2])), 1, .int32, s));
+
+            const corrs = try allocator.alloc(mlx.mlx_array, 1 + m);
+            corr_samples = corrs;
+            for (corrs, 0..) |*slot, a| {
+                slot.* = mlx.mlx_array_new();
+                if (a < m) {
+                    // residual = max(target_p − one_hot(draft_a), 0); the
+                    // one-hot is built from the lazy draft id (arange == id).
+                    var onehot_b = mlx.mlx_array_new();
+                    defer _ = mlx.mlx_array_free(onehot_b);
+                    try mlx.check(mlx.mlx_equal(&onehot_b, indices, draft_arrs[a], s));
+                    var onehot = mlx.mlx_array_new();
+                    defer _ = mlx.mlx_array_free(onehot);
+                    try mlx.check(mlx.mlx_astype(&onehot, onehot_b, .float32, s));
+                    var diff = mlx.mlx_array_new();
+                    defer _ = mlx.mlx_array_free(diff);
+                    try mlx.check(mlx.mlx_subtract(&diff, per_pos_probs.?[a], onehot, s));
+                    const zero = mlx.mlx_array_new_float(0.0);
+                    defer _ = mlx.mlx_array_free(zero);
+                    var residual = mlx.mlx_array_new();
+                    defer _ = mlx.mlx_array_free(residual);
+                    try mlx.check(mlx.mlx_maximum(&residual, diff, zero, s));
+                    var log_res = mlx.mlx_array_new();
+                    defer _ = mlx.mlx_array_free(log_res);
+                    try mlx.check(mlx.mlx_log(&log_res, residual, s));
+                    const null_key = mlx.mlx_array_new();
+                    defer _ = mlx.mlx_array_free(null_key);
+                    try mlx.check(mlx.mlx_random_categorical(slot, log_res, -1, null_key, s));
+                } else {
+                    var log_p = mlx.mlx_array_new();
+                    defer _ = mlx.mlx_array_free(log_p);
+                    try mlx.check(mlx.mlx_log(&log_p, per_pos_probs.?[m], s));
+                    const null_key = mlx.mlx_array_new();
+                    defer _ = mlx.mlx_array_free(null_key);
+                    try mlx.check(mlx.mlx_random_categorical(slot, log_p, -1, null_key, s));
+                }
+            }
         }
 
         var verify_argmax = mlx.mlx_array_new();
@@ -2514,7 +2633,10 @@ pub const Generator = struct {
             const eval_vec = mlx.mlx_vector_array_new();
             defer _ = mlx.mlx_vector_array_free(eval_vec);
             for (draft_arrs) |arr| _ = mlx.mlx_vector_array_append_value(eval_vec, arr);
-            if (!stochastic) {
+            if (stochastic) {
+                _ = mlx.mlx_vector_array_append_value(eval_vec, accept_p_vec);
+                for (corr_samples.?) |arr| _ = mlx.mlx_vector_array_append_value(eval_vec, arr);
+            } else {
                 _ = mlx.mlx_vector_array_append_value(eval_vec, verify_argmax);
             }
             _ = mlx.mlx_vector_array_append_value(eval_vec, new_hidden);
@@ -2536,12 +2658,13 @@ pub const Generator = struct {
         var accepted: u32 = 0;
         if (stochastic) {
             // One-hot proposal (argmax draft): accept with min(1, target_p).
+            try mlx.check(mlx.mlx_array_eval(accept_p_vec));
+            const p_data = mlx.mlx_array_data_float32(accept_p_vec) orelse {
+                return error.MlxArrayDataNull;
+            };
             var k: u32 = 0;
             while (k < m) : (k += 1) {
-                const target_p = try probsAtLastPos(per_pos_logits.?[k], self.sampling, s);
-                defer _ = mlx.mlx_array_free(target_p);
-                const p_draft = try probAt(target_p, drafts[k], s);
-                const accept_prob: f32 = @min(1.0, p_draft);
+                const accept_prob: f32 = @min(1.0, p_data[k]);
                 const u: f32 = self.prng.random().float(f32);
                 if (u >= accept_prob) break;
                 accepted += 1;
@@ -2560,16 +2683,12 @@ pub const Generator = struct {
 
         const next_pending: u32 = blk: {
             if (stochastic) {
-                const correction_logits = per_pos_logits.?[accepted];
-                const probs = try probsAtLastPos(correction_logits, self.sampling, s);
-                defer _ = mlx.mlx_array_free(probs);
-                if (accepted < m) {
-                    const onehot = try pldOneHotRow(drafts[accepted], vl_shape[2], s);
-                    defer _ = mlx.mlx_array_free(onehot);
-                    break :blk try sampleResidual(probs, onehot, s);
-                } else {
-                    break :blk try sampleFromProbs(probs, s);
-                }
+                // Pre-sampled in the round batch; realized already.
+                const corr = corr_samples.?[accepted];
+                try mlx.check(mlx.mlx_array_eval(corr));
+                var v: i32 = 0;
+                try mlx.check(mlx.mlx_array_item_int32(&v, corr));
+                break :blk @intCast(v);
             } else {
                 const argmax_data = mlx.mlx_array_data_int32(verify_argmax) orelse {
                     return error.MlxArrayDataNull;
@@ -2581,11 +2700,12 @@ pub const Generator = struct {
         log.debug("  [mtp-round] off0={d} t1={d} drafts={any} accepted={d}\n", .{ mtp_off0, t1, drafts, accepted });
 
         // ── Phase 5a: rebuild the MTP committed history from true hiddens ──
-        // Restore to the round boundary, then append (h_prev, t1) followed by
+        // Truncate to the round boundary (offset-only — the draft entries all
+        // live past mtp_off0), then append (h_prev, t1) followed by
         // (verify_hidden[i], drafts[i]) for each committed draft. Uses the
         // ORIGINAL verify hiddens — identical values to what a repair forward
         // recomputes, so partial accepts don't need a second capture.
-        try mc.restore(&mtp_snap);
+        try mc.truncate(mtp_off0, s);
         {
             const n_commit: usize = accepted;
             const hist_tokens = try allocator.alloc(u32, 1 + n_commit);
@@ -2640,28 +2760,65 @@ pub const Generator = struct {
             };
         }
 
-        // Partial accept: roll back the trunk and re-forward
-        // [t1, drafts[0..accepted]] with last-hidden capture.
+        // Partial accept: roll back the trunk. On a GDN trunk the verify pass
+        // captured per-position SSM/conv state, so roll back by truncating the
+        // KV cache to the accepted length and slicing the capture — NO
+        // re-forward of the accepted prefix (mirrors nextPld's fast path; the
+        // re-forward is a full trunk weight read, and at depth > 1 most rounds
+        // are partial, so it dominated the round cost). The next round's
+        // h_prev is the TRUE verify hidden at the last committed position
+        // (input index `accepted`), which forwardWithCaptureAll captured.
+        // Non-GDN archs keep the proven restore + re-forward fallback.
         _ = mlx.mlx_array_free(new_hidden);
 
-        try self.ctx.cache.restore(&kv_snap);
-        if (ssm_snaps) |snaps| {
-            for (self.ctx.ssm_entries.?, snaps) |*entry, *sn| try ssmRestore(entry, sn);
-        }
-        self.ctx.moe_seq_offset.* = moe_seq_offset_snap;
-
-        const re_seq_len: c_int = @intCast(1 + accepted);
-        const re_input_buf = try allocator.alloc(i32, 1 + accepted);
-        defer allocator.free(re_input_buf);
-        re_input_buf[0] = @intCast(t1);
-        for (drafts[0..accepted], 0..) |d, idx| re_input_buf[1 + idx] = @intCast(d);
-        const re_shape = [_]c_int{ 1, re_seq_len };
-        const re_input = mlx.mlx_array_new_data(re_input_buf.ptr, &re_shape, 2, .int32);
-        defer _ = mlx.mlx_array_free(re_input);
+        const gdn_captured = if (self.ctx.ssm_entries) |entries|
+            entries.len > 0 and entries[0].spec_state_seq.ctx != null
+        else
+            false;
 
         var re_new_hidden = mlx.mlx_array_new();
-        const re_logits = try xfm.forwardWithCapture(&self.ctx, re_input, &re_new_hidden);
-        _ = mlx.mlx_array_free(re_logits);
+        if (gdn_captured) {
+            const accepted_len: usize = 1 + @as(usize, accepted);
+            // `truncate` overwrites cache.step with its length arg; on this
+            // family cache.step is a stale counter the model never reads
+            // (positioning is moe_seq_offset), so preserve the pre-verify
+            // value — keeps prefix-cache kv_step bookkeeping identical to
+            // the restore-based fallback (same rule as nextPld).
+            try self.ctx.cache.truncate(moe_seq_offset_snap + accepted_len, s);
+            self.ctx.cache.step = kv_step_snap;
+            for (self.ctx.ssm_entries.?) |*entry| {
+                try transformer_mod.ssmRollbackFromCapture(entry, accepted, s);
+            }
+            self.ctx.moe_seq_offset.* = moe_seq_offset_snap + accepted_len;
+
+            const vh_shape = mlx.getShape(verify_hidden_all);
+            const start = [_]c_int{ 0, @intCast(accepted), 0 };
+            const stop = [_]c_int{ 1, @as(c_int, @intCast(accepted)) + 1, vh_shape[2] };
+            const strides = [_]c_int{ 1, 1, 1 };
+            try mlx.check(mlx.mlx_slice(&re_new_hidden, verify_hidden_all, &start, 3, &stop, 3, &strides, 3, s));
+        } else if (kv_snap) |*snap| {
+            try self.ctx.cache.restore(snap);
+            self.ctx.moe_seq_offset.* = moe_seq_offset_snap;
+
+            const re_seq_len: c_int = @intCast(1 + accepted);
+            const re_input_buf = try allocator.alloc(i32, 1 + accepted);
+            defer allocator.free(re_input_buf);
+            re_input_buf[0] = @intCast(t1);
+            for (drafts[0..accepted], 0..) |d, idx| re_input_buf[1 + idx] = @intCast(d);
+            const re_shape = [_]c_int{ 1, re_seq_len };
+            const re_input = mlx.mlx_array_new_data(re_input_buf.ptr, &re_shape, 2, .int32);
+            defer _ = mlx.mlx_array_free(re_input);
+
+            const re_logits = try xfm.forwardWithCapture(&self.ctx, re_input, &re_new_hidden);
+            _ = mlx.mlx_array_free(re_logits);
+        } else {
+            // GDN trunk whose verify pass produced no capture — cannot roll
+            // back safely. Unreachable on real targets (every qwen3_5-family
+            // GDN layer populates the capture when capture_ssm_seq is set);
+            // pinned by tests/test_mtp_equivalence.sh.
+            _ = mlx.mlx_array_free(re_new_hidden);
+            return error.MtpRollbackUnavailable;
+        }
 
         const tokens = try allocator.alloc(u32, 1 + accepted);
         tokens[0] = t1;
@@ -2697,10 +2854,34 @@ pub const Generator = struct {
     // verify overhead.
     pub const MTP_DEPTH_WINDOW: u32 = 16; // rounds in the moving window
     pub const MTP_DEPTH_SWITCH_WARMUP: u32 = 5; // rounds before re-evaluating after a switch
-    pub const MTP_DEMOTE_BELOW: f32 = 0.60; // per-draft rate at depth > 1 → step down
-    pub const MTP_PROMOTE_ABOVE: f32 = 0.85; // per-draft rate below configured depth → step up
+    // Thresholds assume the capture-based rollback (no re-forward on partial
+    // accept): a rejected draft costs ONLY its own MTP-layer + draft-head
+    // pass (~2 ms), not a second trunk forward (~30-50 ms). Extra depth pays
+    // whenever the marginal accept probability clears draft-cost/trunk-cost
+    // ≈ 0.05-0.10, so the demote floor sits far lower than the old
+    // re-forward-era 0.60 — hysteresis band keeps switch churn down.
+    pub const MTP_DEMOTE_BELOW: f32 = 0.40; // per-draft rate at depth > 1 → step down
+    pub const MTP_PROMOTE_ABOVE: f32 = 0.60; // per-draft rate below configured depth → step up
     pub const MTP_DISABLE_BELOW: f32 = 0.50; // per-draft rate at depth 1 → disable (sticky)
     pub const MTP_PROMOTE_COOLDOWN: u32 = 32; // rounds promotion stays blocked after a demotion
+
+    /// Greedy (argmax) MTP draft proposals — DEFAULT ON: the acceptance rule
+    /// (`min(1, p_target[draft])` + one-hot residual) models the proposal as
+    /// deterministic, so argmax drafts make the math exact where sampled
+    /// drafts only approximated it — and measured per-draft acceptance is
+    /// equal-or-higher with far less run-to-run variance (drafts no longer
+    /// carry sampling noise). MLX_SERVE_MTP_DRAFT_GREEDY=0 reverts.
+    var mtp_draft_greedy_cache: ?bool = null;
+    fn mtpDraftGreedy() bool {
+        if (mtp_draft_greedy_cache) |v| return v;
+        var on = true;
+        if (std.c.getenv("MLX_SERVE_MTP_DRAFT_GREEDY")) |p| {
+            const val = std.mem.span(p);
+            if (val.len > 0 and val[0] == '0') on = false;
+        }
+        mtp_draft_greedy_cache = on;
+        return on;
+    }
 
     /// Pure depth-policy step. `rate` is the windowed per-draft acceptance
     /// probability. Returns the new depth; 0 means "disable speculation".
@@ -3103,6 +3284,42 @@ fn lazyForward(xfm: *Transformer, ctx: *ForwardCtx, lazy_token: mlx.mlx_array) !
 /// in the stochastic-verify accept test must be computed via this function so
 /// the ratio `p[draft] / q[draft]` is well-defined over the kept support.
 /// Caller owns the returned array; shape `[B, V]`.
+/// Batched sibling of `probsAtLastPos`: temperature → top-k → top-p →
+/// softmax over EVERY position of `[1, L, V]` logits in one set of
+/// row-parallel kernels. A per-position loop pays L separate ~vocab-sized
+/// sort/topk kernel launches per spec-decode round; batched it's one each.
+/// All filter helpers operate on the last axis, so leading dims pass through.
+fn probsAllPositions(logits_3d: mlx.mlx_array, sampling: SamplingParams, s: mlx.mlx_stream) !mlx.mlx_array {
+    var current = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_array_set(&current, logits_3d));
+
+    if (sampling.temperature != 1.0) {
+        const t = mlx.mlx_array_new_float(sampling.temperature);
+        defer _ = mlx.mlx_array_free(t);
+        var scaled = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_divide(&scaled, current, t, s));
+        _ = mlx.mlx_array_free(current);
+        current = scaled;
+    }
+    if (sampling.top_k > 0) {
+        var masked = mlx.mlx_array_new();
+        applyTopK(&masked, current, sampling.top_k, s) catch {};
+        _ = mlx.mlx_array_free(current);
+        current = masked;
+    }
+    if (sampling.top_p < 1.0) {
+        var masked = mlx.mlx_array_new();
+        applyTopP(&masked, current, sampling.top_p, s) catch {};
+        _ = mlx.mlx_array_free(current);
+        current = masked;
+    }
+
+    var probs = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_softmax_axis(&probs, current, -1, true, s));
+    _ = mlx.mlx_array_free(current);
+    return probs;
+}
+
 fn probsAtLastPos(logits_3d: mlx.mlx_array, sampling: SamplingParams, s: mlx.mlx_stream) !mlx.mlx_array {
     const shape = mlx.getShape(logits_3d);
     const seq_len = shape[1];
@@ -4937,11 +5154,31 @@ test "isDegenerateTailLoop does not fire on healthy or briefly-repeating output"
     try testing.expect(!isDegenerateTailLoop(&[_]u32{ 1, 1 }, P, R));
 }
 
+test "nextChunkEnd: a tiny trailing remainder merges into the last chunk" {
+    // A chat-templated prompt often lands a token or two past the chunk size
+    // (8192-target prompts tokenize to 8193). A 1-token trailing chunk pays a
+    // FULL graph + eval-barrier + cache-clear for one token — pure overhead.
+    // Without checkpoint alignment, remainders under the merge floor extend
+    // the current chunk instead.
+    try testing.expectEqual(@as(usize, 8193), nextChunkEnd(0, 8193, 8192, false, 0, 0));
+    // A substantial remainder stays its own chunk.
+    try testing.expectEqual(@as(usize, 8192), nextChunkEnd(0, 8192 + 600, 8192, false, 0, 0));
+    // Mid-prompt chunks are untouched.
+    try testing.expectEqual(@as(usize, 8192), nextChunkEnd(0, 16385, 8192, false, 0, 0));
+    try testing.expectEqual(@as(usize, 16385), nextChunkEnd(8192, 16385, 8192, false, 0, 0));
+    // With SSM-checkpoint alignment active, behavior is unchanged (boundaries
+    // must stay stride-aligned for the prefix cache).
+    try testing.expectEqual(@as(usize, 8192), nextChunkEnd(0, 8193, 8192, true, 8192, 0));
+}
+
 test "prefillChunkCount: SSM-checkpoint stride controls cold-prefill chunking" {
     const PREFILL_CHUNK: usize = 8192;
     // Non-hybrid (or checkpointing off): a sub-PREFILL_CHUNK prompt is ONE chunk.
     try testing.expectEqual(@as(usize, 1), prefillChunkCount(851, PREFILL_CHUNK, false, 0, 0));
     try testing.expectEqual(@as(usize, 1), prefillChunkCount(8000, PREFILL_CHUNK, false, 0, 0));
+    // Tail merge: one token past a chunk boundary is still ONE chunk.
+    try testing.expectEqual(@as(usize, 1), prefillChunkCount(8193, PREFILL_CHUNK, false, 0, 0));
+    try testing.expectEqual(@as(usize, 2), prefillChunkCount(16385, PREFILL_CHUNK, false, 0, 0));
     // The regression: a fine stride splits an 851-token prefill into 4 chunks
     // (851 spans boundaries 256/512/768). Harmless on compute-bound dense models
     // but on a memory-bound MoE prefill each chunk re-streams the expert weights
@@ -5013,14 +5250,18 @@ test "mtpNextDepth: adaptive depth policy transitions" {
     const configured: u32 = 3;
     // Hot at configured depth: stay.
     try testing.expectEqual(@as(u32, 3), Generator.mtpNextDepth(3, configured, 0.9));
-    // Sagging at depth > 1: step down (one level at a time).
-    try testing.expectEqual(@as(u32, 2), Generator.mtpNextDepth(3, configured, 0.48));
-    try testing.expectEqual(@as(u32, 1), Generator.mtpNextDepth(2, configured, 0.55));
-    // Mid-band: hold.
-    try testing.expectEqual(@as(u32, 2), Generator.mtpNextDepth(2, configured, 0.70));
-    try testing.expectEqual(@as(u32, 1), Generator.mtpNextDepth(1, configured, 0.73));
-    // Hot below configured depth: promote.
-    try testing.expectEqual(@as(u32, 2), Generator.mtpNextDepth(1, configured, 0.89));
+    // Sagging at depth > 1: step down (one level at a time). The demote
+    // floor is 0.40 under capture-based rollback (a rejected draft costs
+    // only its own head pass, not a trunk re-forward).
+    try testing.expectEqual(@as(u32, 2), Generator.mtpNextDepth(3, configured, 0.35));
+    try testing.expectEqual(@as(u32, 1), Generator.mtpNextDepth(2, configured, 0.30));
+    // Mid-band (0.40..0.60): hold.
+    try testing.expectEqual(@as(u32, 3), Generator.mtpNextDepth(3, configured, 0.48));
+    try testing.expectEqual(@as(u32, 2), Generator.mtpNextDepth(2, configured, 0.55));
+    try testing.expectEqual(@as(u32, 1), Generator.mtpNextDepth(1, configured, 0.55));
+    // Hot below configured depth: promote (band top is 0.60).
+    try testing.expectEqual(@as(u32, 2), Generator.mtpNextDepth(1, configured, 0.73));
+    try testing.expectEqual(@as(u32, 3), Generator.mtpNextDepth(2, configured, 0.70));
     // Never exceeds configured.
     try testing.expectEqual(@as(u32, 3), Generator.mtpNextDepth(3, configured, 0.99));
     // Depth 1 below the floor: disable (0).

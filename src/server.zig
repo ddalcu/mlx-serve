@@ -531,6 +531,22 @@ pub var ssm_checkpoint_stride: u32 = 256;
 /// long prompts. 0 = unlimited (rely on the prefix-cache byte budget alone).
 pub var ssm_checkpoint_max: u32 = 32;
 
+/// SSM prefill checkpoints exist ONLY to feed the hot prefix cache (RAM +
+/// disk tiers key their hybrid restores off them). With the cache disabled
+/// (`--prefix-cache-entries 0`) every capture is a 48-layer materialize +
+/// eval thrown straight away — measured ~2-4% of short-prompt prefill on
+/// Qwen3.6-27B. Single chokepoint for every LoadParams builder.
+pub fn effectiveSsmCheckpointStride(stride: u32, cache_capacity: u32) u32 {
+    if (cache_capacity == 0) return 0;
+    return stride;
+}
+
+test "effectiveSsmCheckpointStride: disabled prefix cache disables checkpoint capture" {
+    try std.testing.expectEqual(@as(u32, 0), effectiveSsmCheckpointStride(256, 0));
+    try std.testing.expectEqual(@as(u32, 256), effectiveSsmCheckpointStride(256, 32));
+    try std.testing.expectEqual(@as(u32, 0), effectiveSsmCheckpointStride(0, 32));
+}
+
 /// Iteration 2 (perf-plan Phase 4 #3): LRU capacity of the per-LoadedModel
 /// chat-template tokenize cache. 0 disables (every request re-renders +
 /// re-tokenizes, restoring pre-Iteration-2 behavior). Default 4 is small
