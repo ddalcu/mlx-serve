@@ -99,6 +99,7 @@ pub extern "c" fn mlx_array_set(arr: *mlx_array, src: mlx_array) c_int;
 pub extern "c" fn mlx_array_tostring(str: *mlx_string, arr: mlx_array) c_int;
 pub extern "c" fn mlx_array_ndim(arr: mlx_array) usize;
 pub extern "c" fn mlx_array_shape(arr: mlx_array) [*]const c_int;
+pub extern "c" fn mlx_array_strides(arr: mlx_array) [*]const usize;
 pub extern "c" fn mlx_array_size(arr: mlx_array) usize;
 pub extern "c" fn mlx_array_dtype(arr: mlx_array) mlx_dtype;
 pub extern "c" fn mlx_array_eval(arr: mlx_array) c_int;

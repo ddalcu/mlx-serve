@@ -36,17 +36,35 @@ const Transformer = transformer_mod.Transformer;
 const KVCache = transformer_mod.KVCache;
 const Weights = model_mod.Weights;
 
-/// Default draft depth (tokens drafted per round). Measured on Qwen3.6-27B
-/// 4-bit (M4 Max, greedy, 200-250 tokens): depth 1 captures nearly all of
-/// the win on BOTH workload classes — creative 32.4 tok/s (73% per-draft,
-/// 1.11× AR) and code 41.6 tok/s (93% per-draft, 1.43× AR) — while depth 2
-/// adds only ~2% on code (42.2) and REGRESSES creative to ~29 via adaptive
-/// demotion churn. Deeper drafting costs an extra full-vocab lm_head
-/// projection per level per round, so the marginal return collapses fast.
-/// Users can opt into deeper rounds with `--mtp-depth`; the Generator's
-/// adaptive controller then demotes/promotes within [1, configured].
-pub const DEFAULT_DEPTH: u32 = 1;
+/// Default draft depth (tokens drafted per round). Flipped 1 -> 3 after the
+/// round-v2 rebuild made rejected drafts ~free (scalar-anchor rollback + the
+/// 3-bit draft-only lm_head replaced the old full trunk re-forward): the old
+/// cost model was what made depth 1 optimal. 2026-07-12 validation matrix on
+/// Qwen3.6-27B 4-bit (M4 Max, adaptive controller active, decode tok/s
+/// depth-3 vs depth-1): code 54.3 vs 43.3 (+25%), coding-agent ladder 2K
+/// 52.1 vs 41.4 (+26%) and 16K 43.9 vs 38.1 (+15%), 2-turn pi agentic
+/// (weighted) 48.6 vs 40.9 (+19%), creative temp-0.8 39.1 vs 37.9 (+3% —
+/// the class that REGRESSED under the old cost model now holds even at ~30%
+/// per-draft acceptance because the controller demotes without churn).
+/// Users can cap rounds with `--mtp-depth`; the Generator's adaptive
+/// controller demotes/promotes within [1, configured].
+pub const DEFAULT_DEPTH: u32 = 3;
 pub const MAX_DEPTH: u32 = 8;
+
+/// Prefill history windowing (OPT-IN via `--mtp-history-window <n>`; mirrors
+/// others `last_window 8192` above a 16384-token threshold): prompts whose
+/// forwarded tail exceeds the threshold only build MTP history for the LAST
+/// n positions — earlier chunks skip the full-hidden capture AND the head
+/// forward entirely (and become eligible for the compiled trunk forward).
+/// A history that starts mid-sequence is already a supported state: warm
+/// hot-cache hits produce exactly that (RoPE offsets are cache-relative).
+/// DEFAULT IS FULL HISTORY (0): the A/B failed for windowing on the stock
+/// Qwen head — 64K ctx measured 68.2% -> 54.0% per-draft acceptance and
+/// -4.2 decode tok/s for zero prefill benefit.
+/// `SUGGESTED_HISTORY_WINDOW` is what to pass when
+/// experimenting with window-trained sidecars.
+pub const SUGGESTED_HISTORY_WINDOW: usize = 8192;
+pub const HISTORY_WINDOW_THRESHOLD: usize = 16384;
 
 /// One linear: quantized (w packed u32, s/b bf16) when `s.ctx != null`,
 /// otherwise a pre-transposed bf16 weight `[in, out]` for plain matmul.
@@ -59,6 +77,47 @@ const QLinear = struct {
         _ = mlx.mlx_array_free(self.w);
         _ = mlx.mlx_array_free(self.s);
         _ = mlx.mlx_array_free(self.b);
+    }
+};
+
+/// MTP MLP: dense SwiGLU (0.8B/27B-class sidecars) or the sparse MoE of a
+/// qwen3_5_moe trunk (35B-A3B-class sidecars: router `mlp.gate` + packed
+/// `switch_mlp` experts + shared expert + shared-expert gate). The MoE arm
+/// stores the trunk's own `MoeMlpWeights` shape and forwards through
+/// `Transformer.moeMLP` — same math, same gather-sort path, same per-weight
+/// quant resolution (the sidecar mixes bits AND group sizes, e.g. 8-bit/gs-128
+/// shared expert over a 4-bit/gs-64 trunk — `affineParamsFromGeometry`).
+const MtpMlp = union(enum) {
+    dense: struct {
+        gate: QLinear,
+        up: QLinear,
+        down: QLinear,
+    },
+    moe: transformer_mod.MoeMlpWeights,
+
+    fn deinit(self: *MtpMlp) void {
+        switch (self.*) {
+            .dense => |*d| {
+                d.gate.deinit();
+                d.up.deinit();
+                d.down.deinit();
+            },
+            .moe => |*m| {
+                const arrs = [_]mlx.mlx_array{
+                    m.router_w,      m.router_s,      m.router_b,
+                    m.switch_gate_w, m.switch_gate_s, m.switch_gate_b,
+                    m.switch_up_w,   m.switch_up_s,   m.switch_up_b,
+                    m.switch_down_w, m.switch_down_s, m.switch_down_b,
+                    m.shared_gate_w, m.shared_gate_s, m.shared_gate_b,
+                    m.shared_up_w,   m.shared_up_s,   m.shared_up_b,
+                    m.shared_down_w, m.shared_down_s, m.shared_down_b,
+                };
+                for (arrs) |a| _ = mlx.mlx_array_free(a);
+                if (m.shared_expert_gate_w) |a| _ = mlx.mlx_array_free(a);
+                if (m.shared_expert_gate_s) |a| _ = mlx.mlx_array_free(a);
+                if (m.shared_expert_gate_b) |a| _ = mlx.mlx_array_free(a);
+            },
+        }
     }
 };
 
@@ -84,9 +143,7 @@ pub const MtpModel = struct {
     k: QLinear,
     v: QLinear,
     o: QLinear,
-    mlp_gate: QLinear,
-    mlp_up: QLinear,
-    mlp_down: QLinear,
+    mlp: MtpMlp,
 
     /// Optional DRAFT-ONLY low-bit lm_head, requantized from the trunk's at
     /// bind time (MLX_SERVE_MTP_DRAFT_HEAD_BITS, default 3, 0 disables).
@@ -111,9 +168,7 @@ pub const MtpModel = struct {
         self.k.deinit();
         self.v.deinit();
         self.o.deinit();
-        self.mlp_gate.deinit();
-        self.mlp_up.deinit();
-        self.mlp_down.deinit();
+        self.mlp.deinit();
     }
 
     /// A fresh single-layer KV cache for the MTP attention layer. Always
@@ -405,6 +460,33 @@ fn inferBits(q: *const QLinear, hidden: u32) ?u32 {
     };
 }
 
+/// Root prefix the sidecar's keys carry: mlx-serve-native sidecars use bare
+/// `mtp.*`, mlx-lm-exported ones (the 35B-A3B artifacts) `language_model.mtp.*`.
+fn mtpKeyPrefix(weights: *const Weights) []const u8 {
+    if (weights.get("language_model.mtp.fc.weight") != null) return "language_model.";
+    return "";
+}
+
+/// Own an optional tensor — absent keys become a null-ctx handle (the trunk's
+/// `orelse mlx.mlx_array_new()` convention for optional scales/biases).
+fn ownWeightOpt(w: *const Weights, key: []const u8) mlx.mlx_array {
+    const arr = w.get(key) orelse return mlx.mlx_array_new();
+    var owned = mlx.mlx_array_new();
+    _ = mlx.mlx_array_set(&owned, arr);
+    return owned;
+}
+
+/// Load a `<prefix>.{weight,scales?,biases?}` triple raw (no transpose) —
+/// the shape the trunk's gather/qmatmul paths expect for MoE tensors.
+fn loadMoeTriple(w: *const Weights, prefix: []const u8) !struct { w: mlx.mlx_array, s: mlx.mlx_array, b: mlx.mlx_array } {
+    var key_buf: [256]u8 = undefined;
+    return .{
+        .w = try ownWeight(w, try std.fmt.bufPrint(&key_buf, "{s}.weight", .{prefix})),
+        .s = ownWeightOpt(w, try std.fmt.bufPrint(&key_buf, "{s}.scales", .{prefix})),
+        .b = ownWeightOpt(w, try std.fmt.bufPrint(&key_buf, "{s}.biases", .{prefix})),
+    };
+}
+
 /// Load the MTP head from the model's sidecar file (any `sidecar_rel_paths`
 /// layout — native `mtp/weights.safetensors` and other compatible ones).
 pub fn loadMtp(
@@ -423,34 +505,90 @@ pub fn loadMtp(
     var weights = try model_mod.loadWeightsSingleFile(allocator, sidecar_path);
     defer weights.deinit();
 
+    const p = mtpKeyPrefix(&weights);
+    var kb: [256]u8 = undefined;
+    const K = struct {
+        fn k(buf: []u8, pref: []const u8, rest: []const u8) []const u8 {
+            return std.fmt.bufPrint(buf, "{s}mtp.{s}", .{ pref, rest }) catch unreachable;
+        }
+    };
+
+    // MLP flavor: a `switch_mlp` router/expert pack marks a MoE-trunk sidecar
+    // (35B-A3B); plain gate/up/down is the dense one-layer head.
+    const is_moe = weights.get(K.k(&kb, p, "layers.0.mlp.switch_mlp.gate_proj.weight")) != null;
+
     var m = MtpModel{
         .allocator = allocator,
         .s = s,
         .quant_bits = 0, // inferred from tensor geometry below
         .quant_group_size = 0,
-        .fc_w_t = try ownAndTranspose2D(&weights, "mtp.fc.weight", s),
-        .pre_fc_norm_emb = try ownWeight(&weights, "mtp.pre_fc_norm_embedding.weight"),
-        .pre_fc_norm_hidden = try ownWeight(&weights, "mtp.pre_fc_norm_hidden.weight"),
-        .final_norm = try ownWeight(&weights, "mtp.norm.weight"),
-        .input_norm = try ownWeight(&weights, "mtp.layers.0.input_layernorm.weight"),
-        .post_attn_norm = try ownWeight(&weights, "mtp.layers.0.post_attention_layernorm.weight"),
-        .q_norm = try ownWeight(&weights, "mtp.layers.0.self_attn.q_norm.weight"),
-        .k_norm = try ownWeight(&weights, "mtp.layers.0.self_attn.k_norm.weight"),
-        .q = try loadLinear(&weights, allocator, "mtp.layers.0.self_attn.q_proj", s),
-        .k = try loadLinear(&weights, allocator, "mtp.layers.0.self_attn.k_proj", s),
-        .v = try loadLinear(&weights, allocator, "mtp.layers.0.self_attn.v_proj", s),
-        .o = try loadLinear(&weights, allocator, "mtp.layers.0.self_attn.o_proj", s),
-        .mlp_gate = try loadLinear(&weights, allocator, "mtp.layers.0.mlp.gate_proj", s),
-        .mlp_up = try loadLinear(&weights, allocator, "mtp.layers.0.mlp.up_proj", s),
-        .mlp_down = try loadLinear(&weights, allocator, "mtp.layers.0.mlp.down_proj", s),
+        .fc_w_t = try ownAndTranspose2D(&weights, K.k(&kb, p, "fc.weight"), s),
+        .pre_fc_norm_emb = try ownWeight(&weights, K.k(&kb, p, "pre_fc_norm_embedding.weight")),
+        .pre_fc_norm_hidden = try ownWeight(&weights, K.k(&kb, p, "pre_fc_norm_hidden.weight")),
+        .final_norm = try ownWeight(&weights, K.k(&kb, p, "norm.weight")),
+        .input_norm = try ownWeight(&weights, K.k(&kb, p, "layers.0.input_layernorm.weight")),
+        .post_attn_norm = try ownWeight(&weights, K.k(&kb, p, "layers.0.post_attention_layernorm.weight")),
+        .q_norm = try ownWeight(&weights, K.k(&kb, p, "layers.0.self_attn.q_norm.weight")),
+        .k_norm = try ownWeight(&weights, K.k(&kb, p, "layers.0.self_attn.k_norm.weight")),
+        .q = try loadLinear(&weights, allocator, K.k(&kb, p, "layers.0.self_attn.q_proj"), s),
+        .k = try loadLinear(&weights, allocator, K.k(&kb, p, "layers.0.self_attn.k_proj"), s),
+        .v = try loadLinear(&weights, allocator, K.k(&kb, p, "layers.0.self_attn.v_proj"), s),
+        .o = try loadLinear(&weights, allocator, K.k(&kb, p, "layers.0.self_attn.o_proj"), s),
+        .mlp = if (is_moe) blk: {
+            // Router (`mlp.gate`) via loadLinear: a bf16 router gets
+            // pre-transposed for the trunk's dense-matmul fallback, a
+            // quantized one loads verbatim.
+            const router = try loadLinear(&weights, allocator, K.k(&kb, p, "layers.0.mlp.gate"), s);
+            // Packed 3D expert tensors load raw (the trunk's gather paths own
+            // the orientation); 2D shared/seg linears ride loadLinear so a
+            // bf16 build gets the dense pre-transpose, exactly like the trunk.
+            const sg = try loadMoeTriple(&weights, K.k(&kb, p, "layers.0.mlp.switch_mlp.gate_proj"));
+            const su = try loadMoeTriple(&weights, K.k(&kb, p, "layers.0.mlp.switch_mlp.up_proj"));
+            const sd = try loadMoeTriple(&weights, K.k(&kb, p, "layers.0.mlp.switch_mlp.down_proj"));
+            const shg = try loadLinear(&weights, allocator, K.k(&kb, p, "layers.0.mlp.shared_expert.gate_proj"), s);
+            const shu = try loadLinear(&weights, allocator, K.k(&kb, p, "layers.0.mlp.shared_expert.up_proj"), s);
+            const shd = try loadLinear(&weights, allocator, K.k(&kb, p, "layers.0.mlp.shared_expert.down_proj"), s);
+            const seg = try loadLinear(&weights, allocator, K.k(&kb, p, "layers.0.mlp.shared_expert_gate"), s);
+            break :blk .{ .moe = .{
+                .router_w = router.w,
+                .router_s = router.s,
+                .router_b = router.b,
+                .switch_gate_w = sg.w,
+                .switch_gate_s = sg.s,
+                .switch_gate_b = sg.b,
+                .switch_up_w = su.w,
+                .switch_up_s = su.s,
+                .switch_up_b = su.b,
+                .switch_down_w = sd.w,
+                .switch_down_s = sd.s,
+                .switch_down_b = sd.b,
+                .shared_gate_w = shg.w,
+                .shared_gate_s = shg.s,
+                .shared_gate_b = shg.b,
+                .shared_up_w = shu.w,
+                .shared_up_s = shu.s,
+                .shared_up_b = shu.b,
+                .shared_down_w = shd.w,
+                .shared_down_s = shd.s,
+                .shared_down_b = shd.b,
+                .shared_expert_gate_w = seg.w,
+                .shared_expert_gate_s = seg.s,
+                .shared_expert_gate_b = seg.b,
+            } };
+        } else .{ .dense = .{
+            .gate = try loadLinear(&weights, allocator, K.k(&kb, p, "layers.0.mlp.gate_proj"), s),
+            .up = try loadLinear(&weights, allocator, K.k(&kb, p, "layers.0.mlp.up_proj"), s),
+            .down = try loadLinear(&weights, allocator, K.k(&kb, p, "layers.0.mlp.down_proj"), s),
+        } },
     };
     errdefer m.deinit();
 
     // Sidecars carry no quant metadata — infer bits from packed-column
     // geometry against the hidden size (exact: the bf16 fc weight pins
-    // hidden), then group size from the scales shape. Falls back to the
-    // common 4-bit/group-64 only if geometry is degenerate (bf16-only
-    // sidecars never consult these).
+    // hidden), then group size from the scales shape. These are FALLBACK
+    // globals: qLinearFwd re-solves per weight/call via
+    // affineParamsFromGeometry, since sidecars mix bits AND group sizes
+    // (the 35B-A3B head: q/k 5-bit gs-128, v 6-bit gs-128, o 4-bit gs-64).
     {
         const fc_shape = mlx.getShape(m.fc_w_t); // [2H, H] (pre-transposed)
         const hidden: u32 = if (fc_shape.len == 2) @intCast(fc_shape[1]) else 0;
@@ -462,17 +600,39 @@ pub fn loadMtp(
     {
         const eval_vec = mlx.mlx_vector_array_new();
         defer _ = mlx.mlx_vector_array_free(eval_vec);
-        const all = [_]mlx.mlx_array{
-            m.fc_w_t,           m.pre_fc_norm_emb, m.pre_fc_norm_hidden, m.final_norm,
-            m.input_norm,       m.post_attn_norm,  m.q_norm,             m.k_norm,
-            m.q.w,              m.k.w,             m.v.w,                m.o.w,
-            m.mlp_gate.w,       m.mlp_up.w,        m.mlp_down.w,
+        const base = [_]mlx.mlx_array{
+            m.fc_w_t,     m.pre_fc_norm_emb, m.pre_fc_norm_hidden, m.final_norm,
+            m.input_norm, m.post_attn_norm,  m.q_norm,             m.k_norm,
+            m.q.w,        m.k.w,             m.v.w,                m.o.w,
         };
-        for (all) |a| _ = mlx.mlx_vector_array_append_value(eval_vec, a);
+        for (base) |a| _ = mlx.mlx_vector_array_append_value(eval_vec, a);
+        switch (m.mlp) {
+            .dense => |*d| {
+                _ = mlx.mlx_vector_array_append_value(eval_vec, d.gate.w);
+                _ = mlx.mlx_vector_array_append_value(eval_vec, d.up.w);
+                _ = mlx.mlx_vector_array_append_value(eval_vec, d.down.w);
+            },
+            .moe => |*mw| {
+                const moe_ws = [_]mlx.mlx_array{
+                    mw.router_w, mw.switch_gate_w, mw.switch_up_w, mw.switch_down_w,
+                    mw.shared_gate_w, mw.shared_up_w, mw.shared_down_w,
+                };
+                for (moe_ws) |a| _ = mlx.mlx_vector_array_append_value(eval_vec, a);
+                if (mw.shared_expert_gate_w) |a| _ = mlx.mlx_vector_array_append_value(eval_vec, a);
+            },
+        }
         _ = mlx.mlx_eval(eval_vec);
     }
 
-    log.info("[mtp] loaded native MTP head (bits={d}, group={d})\n", .{ m.quant_bits, m.quant_group_size });
+    // Bits/group here are only the degenerate-geometry FALLBACK — every
+    // quantized matmul re-solves per weight (affineParamsFromGeometry), since
+    // sidecars mix widths (the 35B-A3B head: 5/6-bit gs-128 q/k/v beside
+    // 4-bit gs-64 o and experts).
+    log.info("[mtp] loaded native MTP head ({s}; per-weight quant, fallback bits={d}/gs={d})\n", .{
+        if (is_moe) "moe-mlp" else "dense-mlp",
+        m.quant_bits,
+        m.quant_group_size,
+    });
     return m;
 }
 
@@ -484,12 +644,26 @@ inline fn rmsNormFn(x: mlx.mlx_array, w: mlx.mlx_array, eps: f32, s: mlx.mlx_str
     return out;
 }
 
-/// Quantized (or pre-transposed bf16) linear projection.
+/// Quantized (or pre-transposed bf16) linear projection. Quant params are
+/// solved PER WEIGHT from packed-column geometry against the activation's
+/// inner dim (sidecars mix bits and group sizes across tensors — the
+/// 35B-A3B head runs 5-bit/gs-128 q/k beside 4-bit/gs-64 o); the load-time
+/// globals are only the fallback for degenerate geometry.
 fn qLinearFwd(self: *const MtpModel, x: mlx.mlx_array, lin: *const QLinear) !mlx.mlx_array {
     var out = mlx.mlx_array_new();
     if (lin.s.ctx == null) {
         try mlx.check(mlx.mlx_matmul(&out, x, lin.w, self.s));
         return out;
+    }
+    var bits = self.quant_bits;
+    var group = self.quant_group_size;
+    const x_shape = mlx.getShape(x);
+    if (x_shape.len > 0 and x_shape[x_shape.len - 1] > 0) {
+        const in_dim: u32 = @intCast(x_shape[x_shape.len - 1]);
+        if (transformer_mod.affineParamsFromGeometry(lin.w, lin.s, in_dim)) |qp| {
+            bits = qp.bits;
+            group = qp.group_size;
+        }
     }
     try mlx.check(mlx.mlx_quantized_matmul(
         &out,
@@ -498,8 +672,8 @@ fn qLinearFwd(self: *const MtpModel, x: mlx.mlx_array, lin: *const QLinear) !mlx
         lin.s,
         lin.b,
         true,
-        mlx.mlx_optional_int.some(@intCast(self.quant_group_size)),
-        mlx.mlx_optional_int.some(@intCast(self.quant_bits)),
+        mlx.mlx_optional_int.some(@intCast(group)),
+        mlx.mlx_optional_int.some(@intCast(bits)),
         "affine",
         self.s,
     ));
@@ -737,8 +911,20 @@ pub fn forward(
     defer _ = mlx.mlx_array_free(attn_out);
     const none_mask = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(none_mask);
-    const mask_mode: [*:0]const u8 = if (seq_len > 1) "causal" else "";
-    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, kv_view.k, kv_view.v, attn_scale, mask_mode, none_mask, .{ .ctx = null }, s));
+    // Multi-token (history rebuild / draft batch): try the fused hd-256
+    // flash kernel first — same dispatch the trunk's prefill uses.
+    var fused_done = false;
+    if (seq_len > 1) {
+        if (try transformer_mod.fusedSdpa256Prefill(s, q_rope, kv_view.k, kv_view.v, attn_scale, 0)) |fused| {
+            _ = mlx.mlx_array_free(attn_out);
+            attn_out = fused;
+            fused_done = true;
+        }
+    }
+    if (!fused_done) {
+        const mask_mode: [*:0]const u8 = if (seq_len > 1) "causal" else "";
+        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, kv_view.k, kv_view.v, attn_scale, mask_mode, none_mask, .{ .ctx = null }, s));
+    }
 
     var attn_t = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(attn_t);
@@ -761,23 +947,30 @@ pub fn forward(
     defer _ = mlx.mlx_array_free(h1);
     try mlx.check(mlx.mlx_add(&h1, x, o_out, s));
 
-    // MLP: down(silu(gate) * up)
+    // MLP: dense SwiGLU, or the trunk's own sparse-MoE forward (router +
+    // switch experts + shared expert — same math/quant resolution as a
+    // trunk qwen3_5_moe layer).
     const ff_normed = try rmsNormFn(h1, self.post_attn_norm, eps, s);
     defer _ = mlx.mlx_array_free(ff_normed);
-    const g = try qLinearFwd(self, ff_normed, &self.mlp_gate);
-    defer _ = mlx.mlx_array_free(g);
-    const up = try qLinearFwd(self, ff_normed, &self.mlp_up);
-    defer _ = mlx.mlx_array_free(up);
-    var g_sig = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(g_sig);
-    try mlx.check(mlx.mlx_sigmoid(&g_sig, g, s));
-    var g_silu = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(g_silu);
-    try mlx.check(mlx.mlx_multiply(&g_silu, g, g_sig, s));
-    var act = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(act);
-    try mlx.check(mlx.mlx_multiply(&act, g_silu, up, s));
-    const mlp_out = try qLinearFwd(self, act, &self.mlp_down);
+    const mlp_out = switch (self.mlp) {
+        .dense => |*d| blk: {
+            const g = try qLinearFwd(self, ff_normed, &d.gate);
+            defer _ = mlx.mlx_array_free(g);
+            const up = try qLinearFwd(self, ff_normed, &d.up);
+            defer _ = mlx.mlx_array_free(up);
+            var g_sig = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(g_sig);
+            try mlx.check(mlx.mlx_sigmoid(&g_sig, g, s));
+            var g_silu = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(g_silu);
+            try mlx.check(mlx.mlx_multiply(&g_silu, g, g_sig, s));
+            var act = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(act);
+            try mlx.check(mlx.mlx_multiply(&act, g_silu, up, s));
+            break :blk try qLinearFwd(self, act, &d.down);
+        },
+        .moe => |*mw| try target.moeMLP(ff_normed, mw),
+    };
     defer _ = mlx.mlx_array_free(mlp_out);
 
     var x_out = mlx.mlx_array_new();
@@ -906,7 +1099,6 @@ test "mtp: sidecar resolution accepts native and Forge layouts in priority order
     // Nothing present → null.
     try testing.expectEqual(@as(?[]const u8, null), resolveMtpSidecarInDir(io, tmp.dir));
 
-    // MTPLX Forge legacy root file alone.
     try tmp.dir.writeFile(io, .{ .sub_path = "model-mtp.safetensors", .data = "x" });
     try testing.expectEqualStrings("model-mtp.safetensors", resolveMtpSidecarInDir(io, tmp.dir).?);
 
@@ -947,4 +1139,93 @@ test "mtp: inferGroupSize geometry" {
     // The real sidecar geometry: in=5120 packed to 640 u32 cols at 4 bits,
     // scales 160 cols → group 32.
     try testing.expectEqual(@as(u32, 32), (5120 / 160));
+}
+
+test "loadMtp: MoE sidecar layout (language_model. prefix, switch_mlp experts)" {
+    // Synthetic 35B-A3B-shaped sidecar: `language_model.mtp.*` keys, MoE MLP
+    // (router `mlp.gate` + 3D switch_mlp experts + shared expert + SEG), all
+    // bf16 (quantized loading shares the same key paths). Red-on-revert: the
+    // pre-MoE loader misses `mtp.fc.weight` (prefix) and `mlp.gate_proj`
+    // (dense-only MLP) and returns error.MissingMtpWeight.
+    const io = testing.io;
+    const allocator = testing.allocator;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const save_map = mlx.mlx_map_string_to_array_new();
+    defer _ = mlx.mlx_map_string_to_array_free(save_map);
+    var owned: std.ArrayList(mlx.mlx_array) = .empty;
+    defer {
+        for (owned.items) |a| _ = mlx.mlx_array_free(a);
+        owned.deinit(allocator);
+    }
+    const put = struct {
+        fn f(map: mlx.mlx_map_string_to_array, list: *std.ArrayList(mlx.mlx_array), alloc: std.mem.Allocator, key: [*:0]const u8, shape: []const c_int, st: mlx.mlx_stream) !void {
+            var a = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_zeros(&a, shape.ptr, shape.len, .bfloat16, st));
+            try mlx.check(mlx.mlx_array_eval(a));
+            _ = mlx.mlx_map_string_to_array_insert(map, key, a);
+            try list.append(alloc, a);
+        }
+    }.f;
+
+    // hidden 8, head_dim 4, 2 q heads (x2 for the q/gate split), 4 experts,
+    // expert inter 16, shared inter 16.
+    try put(save_map, &owned, allocator, "language_model.mtp.fc.weight", &.{ 16, 8 }, s);
+    try put(save_map, &owned, allocator, "language_model.mtp.pre_fc_norm_embedding.weight", &.{8}, s);
+    try put(save_map, &owned, allocator, "language_model.mtp.pre_fc_norm_hidden.weight", &.{8}, s);
+    try put(save_map, &owned, allocator, "language_model.mtp.norm.weight", &.{8}, s);
+    try put(save_map, &owned, allocator, "language_model.mtp.layers.0.input_layernorm.weight", &.{8}, s);
+    try put(save_map, &owned, allocator, "language_model.mtp.layers.0.post_attention_layernorm.weight", &.{8}, s);
+    try put(save_map, &owned, allocator, "language_model.mtp.layers.0.self_attn.q_norm.weight", &.{4}, s);
+    try put(save_map, &owned, allocator, "language_model.mtp.layers.0.self_attn.k_norm.weight", &.{4}, s);
+    try put(save_map, &owned, allocator, "language_model.mtp.layers.0.self_attn.q_proj.weight", &.{ 16, 8 }, s);
+    try put(save_map, &owned, allocator, "language_model.mtp.layers.0.self_attn.k_proj.weight", &.{ 8, 8 }, s);
+    try put(save_map, &owned, allocator, "language_model.mtp.layers.0.self_attn.v_proj.weight", &.{ 8, 8 }, s);
+    try put(save_map, &owned, allocator, "language_model.mtp.layers.0.self_attn.o_proj.weight", &.{ 8, 8 }, s);
+    try put(save_map, &owned, allocator, "language_model.mtp.layers.0.mlp.gate.weight", &.{ 4, 8 }, s);
+    try put(save_map, &owned, allocator, "language_model.mtp.layers.0.mlp.switch_mlp.gate_proj.weight", &.{ 4, 16, 8 }, s);
+    try put(save_map, &owned, allocator, "language_model.mtp.layers.0.mlp.switch_mlp.up_proj.weight", &.{ 4, 16, 8 }, s);
+    try put(save_map, &owned, allocator, "language_model.mtp.layers.0.mlp.switch_mlp.down_proj.weight", &.{ 4, 8, 16 }, s);
+    try put(save_map, &owned, allocator, "language_model.mtp.layers.0.mlp.shared_expert.gate_proj.weight", &.{ 16, 8 }, s);
+    try put(save_map, &owned, allocator, "language_model.mtp.layers.0.mlp.shared_expert.up_proj.weight", &.{ 16, 8 }, s);
+    try put(save_map, &owned, allocator, "language_model.mtp.layers.0.mlp.shared_expert.down_proj.weight", &.{ 8, 16 }, s);
+    try put(save_map, &owned, allocator, "language_model.mtp.layers.0.mlp.shared_expert_gate.weight", &.{ 1, 8 }, s);
+
+    var dir_buf: [512]u8 = undefined;
+    const dir_n = try tmp.dir.realPath(io, &dir_buf);
+    const dir_abs = dir_buf[0..dir_n];
+    const file_path = try std.fs.path.joinZ(allocator, &.{ dir_abs, "model-mtp.safetensors" });
+    defer allocator.free(file_path);
+    const meta = mlx.mlx_map_string_to_string_new();
+    defer _ = mlx.mlx_map_string_to_string_free(meta);
+    try mlx.check(mlx.mlx_save_safetensors(file_path.ptr, save_map, meta));
+
+    var m = try loadMtp(io, allocator, s, dir_abs);
+    defer m.deinit();
+
+    // MoE arm selected; router pre-transposed for the trunk's dense fallback
+    // ([hidden, experts]); packed switch experts kept raw 3D.
+    switch (m.mlp) {
+        .dense => return error.TestUnexpectedResult,
+        .moe => |*mw| {
+            const rs = mlx.getShape(mw.router_w);
+            try testing.expectEqual(@as(c_int, 8), rs[0]);
+            try testing.expectEqual(@as(c_int, 4), rs[1]);
+            const sgs = mlx.getShape(mw.switch_gate_w);
+            try testing.expectEqual(@as(usize, 3), sgs.len);
+            try testing.expectEqual(@as(c_int, 4), sgs[0]);
+            // Shared expert + SEG present (Qwen3.5-style gated combination).
+            try testing.expect(mw.shared_expert_gate_w != null);
+            // bf16 shared linears pre-transposed: [in, out] = [8, 16].
+            const shs = mlx.getShape(mw.shared_gate_w);
+            try testing.expectEqual(@as(c_int, 8), shs[0]);
+            try testing.expectEqual(@as(c_int, 16), shs[1]);
+        },
+    }
+    // fc transposed to [H, 2H].
+    const fcs = mlx.getShape(m.fc_w_t);
+    try testing.expectEqual(@as(c_int, 8), fcs[0]);
+    try testing.expectEqual(@as(c_int, 16), fcs[1]);
 }

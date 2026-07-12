@@ -59,8 +59,11 @@ trap cleanup EXIT
 
 start_server() { # extra args...
     : > "$LOGFILE"
+    # The SSD tier is OPT-IN since the off-by-default flip (ad3fd24) — the
+    # suite must enable it explicitly. Callers' "$@" comes later, so section
+    # 5's `--prefix-cache-disk off` still wins (last flag parses last).
     HOME="$SCRATCH_HOME" "$BINARY" --model "$MODEL" --serve --port "$PORT" \
-        --ctx-size 8192 --no-pld --log-level info "$@" > "$LOGFILE" 2>&1 &
+        --ctx-size 8192 --no-pld --log-level info --prefix-cache-disk 4GB "$@" > "$LOGFILE" 2>&1 &
     SERVER_PID=$!
     for i in $(seq 1 90); do
         if curl -s -f "$BASE/health" > /dev/null 2>&1; then return 0; fi

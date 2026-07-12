@@ -194,6 +194,385 @@ fn getGdnKernelSeq() !mlx.mlx_fast_metal_kernel {
     gdn_kernel_seq_cached = kernel;
     return kernel;
 }
+
+// ── Fused head_dim-256 prefill attention (flash-style Metal kernel) ──
+//
+// MLX's fused SDPA (steel_attention) covers head_dim <= 128; every Gemma-4
+// and Qwen3.5/3.6 checkpoint ships head_dim 256, which used to fall back to
+// the composed path that MATERIALIZES a [heads, chunk, total_kv] bf16 score
+// tensor per layer (26.8 GB/layer at a 102K prompt — the long-context OOM
+// class, commit 7550895 budgeted around it). This kernel is a faithful
+// self-contained port of MLX's steel attention (FA-2 online softmax,
+// BQ=32/BK=16, 4 simdgroups, float32 accumulation, exp2 softmax) specialized
+// to BD=256, extended with an optional sliding-window band so Gemma's local
+// layers ("array" mask during prefill) are covered too. The score tensor
+// never exists — O(tile) working memory — so the three prefill OOM guards
+// (generate.boundedPrefillChunk / prefillEvalCadence / server.prefillMemoryNeeded)
+// drop their score term via `prefillHeadDimFused` when this kernel is active.
+//
+// Scope: seq_len > 1 (prefill), any batch, GQA (Hq % Hk == 0), bf16, causal
+// bottom-right alignment (query row r sits at absolute KV position
+// kL - qL + r, matching MLX "causal" and createSlidingWindowMask semantics).
+// K/V may be non-contiguous cache views (strides used; innermost dim must be
+// contiguous — guaranteed for slices along T). Kill switch:
+// MLX_SERVE_FUSED_256=0 restores the composed path AND the old guard
+// budgeting (one shared predicate, so guards and dispatch cannot drift).
+const ATTN256_KERNEL_HEADER =
+    \\#include <metal_simdgroup_matrix>
+    \\
+    \\// Fragment layout mirrors MLX steel BaseMMAFrag<float,8,8>: each thread
+    \\// of a simdgroup holds 2 adjacent elements of an 8x8 tile; the hardware
+    \\// mma runs on simdgroup_float8x8 built from those elements. The 4 threads
+    \\// holding one row differ in lane bits 0 and 3 (see msv_coord).
+    \\inline short2 msv_coord(ushort lane) {
+    \\  const short qid = lane / 4;
+    \\  const short fm = (qid & 4) + ((lane / 2) % 4);
+    \\  const short fn = (qid & 2) * 2 + (lane % 2) * 2;
+    \\  return short2(fn, fm);
+    \\}
+    \\
+    \\inline void msv_mma(thread float2 &d, float2 a, float2 b) {
+    \\  metal::simdgroup_float8x8 D, A, B, C;
+    \\  A.thread_elements()[0] = a.x;
+    \\  A.thread_elements()[1] = a.y;
+    \\  B.thread_elements()[0] = b.x;
+    \\  B.thread_elements()[1] = b.y;
+    \\  C.thread_elements()[0] = d.x;
+    \\  C.thread_elements()[1] = d.y;
+    \\  simdgroup_multiply_accumulate(D, A, B, C);
+    \\  d.x = D.thread_elements()[0];
+    \\  d.y = D.thread_elements()[1];
+    \\}
+    \\
+    \\inline float msv_row_max(float2 v) {
+    \\  float t = metal::max(v.x, v.y);
+    \\  t = metal::max(t, metal::simd_shuffle_xor(t, ushort(1)));
+    \\  t = metal::max(t, metal::simd_shuffle_xor(t, ushort(8)));
+    \\  return t;
+    \\}
+    \\
+    \\inline float msv_row_sum(float2 v) {
+    \\  float t = v.x + v.y;
+    \\  t += metal::simd_shuffle_xor(t, ushort(1));
+    \\  t += metal::simd_shuffle_xor(t, ushort(8));
+    \\  return t;
+    \\}
+    \\
+;
+
+const ATTN256_KERNEL_SOURCE =
+    \\constexpr int BQ = 32;
+    \\constexpr int BK = 16;
+    \\constexpr int BD = 256;
+    \\constexpr int LDQ = BD + 8;
+    \\constexpr int LDK = BK + 8;
+    \\constexpr int LDV = BD + 8;
+    \\
+    \\const int qL = q_shape[2];
+    \\const int kL = k_shape[2];
+    \\const int Hq = q_shape[1];
+    \\const int Hk = k_shape[1];
+    \\const int gqa = Hq / Hk;
+    \\
+    \\const int tqx = int(threadgroup_position_in_grid.x);
+    \\const int hq = int(threadgroup_position_in_grid.y);
+    \\const int bb = int(threadgroup_position_in_grid.z);
+    \\const ushort lane = ushort(thread_index_in_simdgroup);
+    \\const ushort warp = ushort(simdgroup_index_in_threadgroup);
+    \\const int tix = int(thread_index_in_threadgroup);
+    \\
+    \\// exp2-based softmax (steel convention): fold log2(e) into the scale.
+    \\const float scale_log2e = scl[0] * 1.44269504088896340736f;
+    \\const int SW = win[0];
+    \\
+    \\// Bottom-right aligned causal: query row r of this chunk sits at
+    \\// absolute KV position q_off + r.
+    \\const int q_off = kL - qL;
+    \\
+    \\const device T* Qp = q + bb * q_strides[0] + hq * q_strides[1]
+    \\    + (long)(tqx * BQ) * q_strides[2];
+    \\const device T* Kp = k + bb * k_strides[0] + (hq / gqa) * k_strides[1];
+    \\const device T* Vp = v + bb * v_strides[0] + (hq / gqa) * v_strides[1];
+    \\device T* Op = out + (((long)bb * Hq + hq) * (long)qL + (long)(tqx * BQ)) * BD;
+    \\
+    \\// K^T tile [BD][LDK] (6144 elems) is strictly larger than the V tile
+    \\// [BK][LDV] (4224) — share one buffer, steel-style (barriers separate
+    \\// the K reads from the V staging).
+    \\threadgroup T Qs[BQ * LDQ];
+    \\threadgroup T KVs[LDK * BD];
+    \\threadgroup T* Ks = KVs;
+    \\threadgroup T* Vs = KVs;
+    \\
+    \\// Stage Q once (zero-fill past the partial tail tile).
+    \\const int q_rows = metal::min(BQ, qL - tqx * BQ);
+    \\for (int i = tix; i < BQ * BD; i += 128) {
+    \\  const int r = i >> 8;
+    \\  const int c = i & (BD - 1);
+    \\  Qs[r * LDQ + c] = (r < q_rows) ? Qp[r * q_strides[2] + c] : T(0);
+    \\}
+    \\
+    \\const short2 sc = msv_coord(lane);
+    \\const short sn = sc.x;
+    \\const short sm = sc.y;
+    \\const short tm = 8 * short(warp);
+    \\const int Qs_off = (tm + sm) * LDQ + sn;
+    \\const int Ks_off = sm * LDK + sn;
+    \\const int Vs_off = sm * LDV + sn;
+    \\
+    \\float2 Ofrag[BD / 8];
+    \\for (int i = 0; i < BD / 8; ++i) Ofrag[i] = float2(0.0f);
+    \\// Init max FINITE (not -inf) so the rescale factor exp2(old-new) can
+    \\// never be exp2(nan); masked scores use true -INFINITY so a row whose
+    \\// first blocks are fully banded out contributes exp2(-inf)=0, not 1.
+    \\float max_score = -3.0e38f;
+    \\float sum_score = 0.0f;
+    \\
+    \\const int NK = (kL + BK - 1) / BK;
+    \\const int q_lo = tqx * BQ + q_off;
+    \\const int q_hi = q_lo + BQ - 1;
+    \\const int kb_lim = metal::min(NK, (q_hi + BK) / BK);
+    \\int kb = 0;
+    \\if (SW > 0) kb = metal::max(0, q_lo - SW + 1) / BK;
+    \\const int kb_min_causal = metal::max(0, q_lo) / BK;
+    \\const int row_pos = q_lo + tm + sm;
+    \\
+    \\for (; kb < kb_lim; kb++) {
+    \\  const int c0 = kb * BK;
+    \\  const int rows_k = metal::min(BK, kL - c0);
+    \\
+    \\  // Stage K transposed: Ks[d][kk].
+    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\  for (int i = tix; i < BK * BD; i += 128) {
+    \\    const int r = i >> 8;
+    \\    const int c = i & (BD - 1);
+    \\    Ks[c * LDK + r] = (r < rows_k) ? Kp[(long)(c0 + r) * k_strides[2] + c] : T(0);
+    \\  }
+    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\
+    \\  // S = Q @ K^T for this simdgroup's 8 query rows.
+    \\  float2 Sfrag[BK / 8];
+    \\  for (int i = 0; i < BK / 8; ++i) Sfrag[i] = float2(0.0f);
+    \\  for (int dd = 0; dd < BD / 8; ++dd) {
+    \\    const float2 qf = float2(float(Qs[Qs_off + dd * 8]),
+    \\                             float(Qs[Qs_off + dd * 8 + 1]));
+    \\    const int kbase = Ks_off + dd * 8 * LDK;
+    \\    const float2 kf0 = float2(float(Ks[kbase]), float(Ks[kbase + 1]));
+    \\    const float2 kf1 = float2(float(Ks[kbase + 8]), float(Ks[kbase + 9]));
+    \\    msv_mma(Sfrag[0], qf, kf0);
+    \\    msv_mma(Sfrag[1], qf, kf1);
+    \\  }
+    \\  Sfrag[0] *= scale_log2e;
+    \\  Sfrag[1] *= scale_log2e;
+    \\
+    \\  // Masking: kL remainder + causal + sliding band, all element-wise.
+    \\  const bool tail_k = (rows_k < BK);
+    \\  const bool need_causal = (kb >= kb_min_causal);
+    \\  const bool need_band = (SW > 0) && (c0 <= q_hi - SW);
+    \\  if (tail_k || need_causal || need_band) {
+    \\    for (int kt = 0; kt < BK / 8; ++kt) {
+    \\      for (int jj = 0; jj < 2; ++jj) {
+    \\        const int col = c0 + kt * 8 + sn + jj;
+    \\        bool masked = false;
+    \\        if (tail_k && col >= kL) masked = true;
+    \\        if (need_causal && row_pos < col) masked = true;
+    \\        if (need_band && (row_pos - col) >= SW) masked = true;
+    \\        if (masked) Sfrag[kt][jj] = -INFINITY;
+    \\      }
+    \\    }
+    \\  }
+    \\
+    \\  // Stage V (same smem as K — K reads are done).
+    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\  for (int i = tix; i < BK * BD; i += 128) {
+    \\    const int r = i >> 8;
+    \\    const int c = i & (BD - 1);
+    \\    Vs[r * LDV + c] = (r < rows_k) ? Vp[(long)(c0 + r) * v_strides[2] + c] : T(0);
+    \\  }
+    \\
+    \\  // Online softmax (registers only, overlaps the V staging above).
+    \\  float new_max = max_score;
+    \\  new_max = metal::max(new_max, msv_row_max(Sfrag[0]));
+    \\  new_max = metal::max(new_max, msv_row_max(Sfrag[1]));
+    \\  Sfrag[0] = metal::exp2(Sfrag[0] - new_max);
+    \\  Sfrag[1] = metal::exp2(Sfrag[1] - new_max);
+    \\  const float factor = metal::exp2(max_score - new_max);
+    \\  max_score = new_max;
+    \\  const float rowsum = msv_row_sum(Sfrag[0]) + msv_row_sum(Sfrag[1]);
+    \\  sum_score = sum_score * factor + rowsum;
+    \\  for (int i = 0; i < BD / 8; ++i) Ofrag[i] *= factor;
+    \\
+    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\
+    \\  // O += P @ V.
+    \\  for (int id = 0; id < BD / 8; ++id) {
+    \\    const int vbase = Vs_off + id * 8;
+    \\    const float2 vf0 = float2(float(Vs[vbase]), float(Vs[vbase + 1]));
+    \\    const float2 vf1 = float2(float(Vs[vbase + 8 * LDV]),
+    \\                              float(Vs[vbase + 8 * LDV + 1]));
+    \\    msv_mma(Ofrag[id], Sfrag[0], vf0);
+    \\    msv_mma(Ofrag[id], Sfrag[1], vf1);
+    \\  }
+    \\}
+    \\
+    \\// Normalize + store (output is freshly allocated, contiguous).
+    \\const int local_row = tm + sm;
+    \\if (local_row < q_rows) {
+    \\  const float inv = 1.0f / sum_score;
+    \\  device T* Optr = Op + (long)local_row * BD + sn;
+    \\  for (int id = 0; id < BD / 8; ++id) {
+    \\    Optr[id * 8] = T(Ofrag[id].x * inv);
+    \\    Optr[id * 8 + 1] = T(Ofrag[id].y * inv);
+    \\  }
+    \\}
+;
+
+var attn256_kernel_cached: ?mlx.mlx_fast_metal_kernel = null;
+
+fn getAttn256Kernel() !mlx.mlx_fast_metal_kernel {
+    if (attn256_kernel_cached) |kk| return kk;
+    const input_names = [_][*:0]const u8{ "q", "k", "v", "scl", "win" };
+    const output_names = [_][*:0]const u8{"out"};
+    const in_vec = mlx.mlx_vector_string_new_data(&input_names, input_names.len);
+    defer _ = mlx.mlx_vector_string_free(in_vec);
+    const out_vec = mlx.mlx_vector_string_new_data(&output_names, output_names.len);
+    defer _ = mlx.mlx_vector_string_free(out_vec);
+    const kernel = mlx.mlx_fast_metal_kernel_new(
+        "msv_attn_p256",
+        in_vec,
+        out_vec,
+        ATTN256_KERNEL_SOURCE,
+        ATTN256_KERNEL_HEADER,
+        false, // ensure_row_contiguous=false — K/V are cache VIEWS; a forced
+        // contiguous copy of the full cache per layer would erase the win.
+        false,
+    );
+    if (kernel.ctx == null) return error.MetalKernelCompileFailed;
+    attn256_kernel_cached = kernel;
+    return kernel;
+}
+
+/// Kill switch (MLX_SERVE_FUSED_256=0 disables the kernel entirely). Test
+/// seam: `fused256_override` forces BOTH arms on/off without the environment.
+pub var fused256_override: ?bool = null;
+var fused256_env_cached: ?bool = null;
+var fused256_causal_env_cached: ?bool = null;
+
+pub fn fused256Enabled() bool {
+    if (fused256_override) |v| return v;
+    if (fused256_env_cached) |v| return v;
+    const raw = std.c.getenv("MLX_SERVE_FUSED_256");
+    const enabled = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
+    fused256_env_cached = enabled;
+    return enabled;
+}
+
+/// The plain-CAUSAL arm is EXPERIMENTAL, default off (MLX_SERVE_FUSED_256_CAUSAL=1
+/// enables). Measured on Qwen3.6-27B (24q/4kv, gqa 6) at 16K ctx: fused causal
+/// 186 tok/s vs composed 216 — each threadgroup re-stages its kv-group's K/V
+/// while the composed batched GEMM shares the K operand across the 6 q-heads
+/// of a group. Until the kernel batches a kv-group's q-heads per threadgroup,
+/// causal stays composed. The SLIDING-BAND arm (window > 0) has no such
+/// competition — composed computes full-width scores + a GB-scale mask while
+/// the kernel block-skips outside the band (gemma-26B 99K: 317 -> 712 tok/s)
+/// — so it rides the master switch alone.
+pub fn fused256CausalEnabled() bool {
+    if (fused256_override) |v| return v;
+    if (!fused256Enabled()) return false;
+    if (fused256_causal_env_cached) |v| return v;
+    const raw = std.c.getenv("MLX_SERVE_FUSED_256_CAUSAL");
+    const enabled = raw != null and std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "1");
+    fused256_causal_env_cached = enabled;
+    return enabled;
+}
+
+/// ONE predicate consumed by the three prefill OOM guards AND the dispatch
+/// sites: true when prefill attention at this head_dim will NOT materialize
+/// the composed [heads, chunk, total_kv] score tensor — either MLX's own
+/// fused kernel covers it (<= 128) or our hd-256 kernel does for EVERY arm.
+/// Keyed on the CAUSAL arm: with causal composed (the default), score
+/// tensors still materialize for causal layers (gemma global layers, every
+/// qwen full-attn layer), so the guards must keep billing them; sliding
+/// layers going fused only makes that conservative, never wrong. Guards and
+/// dispatch must never drift (the effectivePrefillChunk rule).
+pub fn prefillHeadDimFused(head_dim: u32) bool {
+    return head_dim <= 128 or (head_dim == 256 and fused256CausalEnabled());
+}
+
+/// Try the fused hd-256 flash prefill kernel (msv_attn_p256). Returns null
+/// when a precondition doesn't hold — the caller falls back to the composed
+/// path. `window` > 0 adds the sliding-band mask (Gemma local layers,
+/// createSlidingWindowMask semantics: key masked when row_abs - col >=
+/// window); 0 = plain bottom-right causal. Free function (stream param) so
+/// the MTP head can use it too.
+///
+/// STRUCTURAL precondition (not checkable — lazy arrays carry no strides at
+/// graph-build time): q/k/v innermost dim contiguous. True for fresh
+/// rope/transpose outputs, cache views (slices along T of a contiguous
+/// buffer), and dequantized dense views — i.e. every attention call site.
+pub fn fusedSdpa256Prefill(
+    s: mlx.mlx_stream,
+    q: mlx.mlx_array,
+    k: mlx.mlx_array,
+    v: mlx.mlx_array,
+    scale: f32,
+    window: c_int,
+) !?mlx.mlx_array {
+    // Band arm rides the master switch; plain causal is opt-in (see
+    // fused256CausalEnabled — composed GQA GEMM wins causal today).
+    if (window > 0) {
+        if (!fused256Enabled()) return null;
+    } else {
+        if (!fused256CausalEnabled()) return null;
+    }
+    if (mlx.mlx_array_ndim(q) != 4 or mlx.mlx_array_ndim(k) != 4 or mlx.mlx_array_ndim(v) != 4) return null;
+    const qs = mlx.getShape(q);
+    const ks = mlx.getShape(k);
+    const vs = mlx.getShape(v);
+    if (qs[3] != 256 or ks[3] != 256 or vs[3] != 256) return null;
+    // Short sequences (<= 8: decode AND spec-decode VERIFY forwards) belong
+    // to MLX's sdpa_vector, which covers hd 256 natively and beats a 32-row
+    // prefill tile walking the whole KV for a 2-4-row query — dispatching
+    // those here measured decode 48 -> 18 tok/s at 4K ctx on the 27B (MTP
+    // verify is seq 1+depth). Mirrors MLX's own supports_sdpa_full gate.
+    if (qs[2] <= 8) return null;
+    if (ks[1] <= 0 or @rem(qs[1], ks[1]) != 0) return null;
+    if (ks[2] < qs[2] or ks[2] != vs[2] or ks[1] != vs[1] or ks[0] != qs[0] or vs[0] != qs[0]) return null;
+    if (mlx.mlx_array_dtype(q) != .bfloat16 or mlx.mlx_array_dtype(k) != .bfloat16 or mlx.mlx_array_dtype(v) != .bfloat16) return null;
+
+    const kernel = getAttn256Kernel() catch return null;
+
+    const one = [_]c_int{1};
+    const scl_data = [_]f32{scale};
+    const scl = mlx.mlx_array_new_data(&scl_data, &one, 1, .float32);
+    defer _ = mlx.mlx_array_free(scl);
+    const win_data = [_]i32{@intCast(window)};
+    const win = mlx.mlx_array_new_data(&win_data, &one, 1, .int32);
+    defer _ = mlx.mlx_array_free(win);
+
+    const config = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(config);
+    const o_shape = [_]c_int{ qs[0], qs[1], qs[2], 256 };
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &o_shape, 4, .bfloat16));
+    // One threadgroup (32,4,1) per 32-row q tile per head per batch; grid is
+    // in THREADS (dispatch_threads), padded to whole tiles so every
+    // threadgroup is full (the cooperative staging loops assume 128).
+    const nq_tiles: c_int = @divTrunc(qs[2] + 31, 32);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, nq_tiles * 32, qs[1] * 4, qs[0]));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 32, 4, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "T", .bfloat16));
+
+    const inputs_arr = [_]mlx.mlx_array{ q, k, v, scl, win };
+    const inputs_vec = mlx.mlx_vector_array_new_data(&inputs_arr, inputs_arr.len);
+    defer _ = mlx.mlx_vector_array_free(inputs_vec);
+
+    var outputs_vec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(outputs_vec);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kernel, inputs_vec, config, s));
+    if (mlx.mlx_vector_array_size(outputs_vec) != 1) return error.MetalKernelBadOutputCount;
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_vector_array_get(&out, outputs_vec, 0));
+    return out;
+}
 const model_mod = @import("model.zig");
 const log = @import("log.zig");
 
@@ -1411,7 +1790,7 @@ const DenseMlpWeights = struct {
     down_b: mlx.mlx_array,
 };
 
-const MoeMlpWeights = struct {
+pub const MoeMlpWeights = struct {
     router_w: mlx.mlx_array,
     router_s: mlx.mlx_array,
     router_b: mlx.mlx_array,
@@ -1528,7 +1907,7 @@ const HybridLayerWeights = struct {
 // matching the perf commit's intent of "eliminate per-call detect overhead" while
 // supporting mixed-precision quantization (Gemma-4 MoE per-layer bits, etc.).
 const BITS_CACHE_CAP: usize = 1024; // plenty for 60 layers × ~10 quant weights × factor
-const QuantParams = struct { bits: u32, group_size: u32, mode: QuantMode = .affine };
+pub const QuantParams = struct { bits: u32, group_size: u32, mode: QuantMode = .affine };
 const QuantParamsCache = struct {
     keys: [BITS_CACHE_CAP]?*anyopaque = [_]?*anyopaque{null} ** BITS_CACHE_CAP,
     vals_bits: [BITS_CACHE_CAP]u8 = [_]u8{0} ** BITS_CACHE_CAP,
@@ -3237,8 +3616,9 @@ pub const Transformer = struct {
     /// Two transients count (both scale with total_kv, so short prompts keep
     /// the coarse cadence and pay nothing):
     ///   - the composed-SDPA score tensor [heads, chunk, total_kv] — only for
-    ///     head_dim > 128, which misses MLX's fused kernel (every Gemma-4 and
-    ///     Qwen3.5/3.6 checkpoint ships head_dim 256);
+    ///     head_dims no fused kernel covers (prefillHeadDimFused: <= 128 via
+    ///     MLX, 256 via msv_attn_p256; unfused only via the kill switch or an
+    ///     exotic dim);
     ///   - the dense-fp16 rebuild of a quantized KV cache (denseView runs
     ///     per layer under --kv-quant, over the FULL cache).
     /// Budget calibrated LIVE on gemma-4-26B-A4B-qat-4bit (M4 Max):
@@ -3260,7 +3640,7 @@ pub const Transformer = struct {
         total_kv: u64,
         kv_dequant: bool,
     ) u32 {
-        const scores: u64 = if (head_dim > 128) @as(u64, n_heads) * chunk_len * total_kv * 2 else 0;
+        const scores: u64 = if (!prefillHeadDimFused(head_dim)) @as(u64, n_heads) * chunk_len * total_kv * 2 else 0;
         const dequant: u64 = if (kv_dequant) 2 * total_kv * @as(u64, kv_heads) * @as(u64, head_dim) * 2 else 0;
         return if (scores + dequant > PREFILL_EVAL_TRANSIENT_BUDGET) 1 else default_cadence;
     }
@@ -3811,8 +4191,13 @@ pub const Transformer = struct {
             const sw: c_int = @intCast(cfg.sliding_window);
             if (is_prefill) {
                 // During prefill, K has all total_kv entries (no windowing in views).
-                // The sliding window mask limits attention scope.
-                local_prefill_mask = try self.createSlidingWindowMask(seq_len, total_kv, sw);
+                // The sliding window mask limits attention scope. Skipped when
+                // the fused hd-256 kernel band-masks in-kernel — the
+                // [1,1,chunk,total_kv] mask is itself GBs at long context; the
+                // "array" arm lazily builds it if a per-call check declines.
+                if (!(fused256Enabled() and cfg.head_dim == 256 and seq_len >= 2)) {
+                    local_prefill_mask = try self.createSlidingWindowMask(seq_len, total_kv, sw);
+                }
             }
             if (!is_prefill and total_kv > sw) {
                 // During decode, K view has min(total_kv, sw) entries.
@@ -4043,9 +4428,33 @@ pub const Transformer = struct {
                 _ = mlx.mlx_array_free(attn_out);
                 attn_out = fused;
             } else if (std.mem.eql(u8, sel_mode, "causal")) {
-                try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "causal", none_mask, .{ .ctx = null }, self.s));
+                if (try fusedSdpa256Prefill(self.s, q_rope, full_k, full_v, attn_scale, 0)) |fused| {
+                    _ = mlx.mlx_array_free(attn_out);
+                    attn_out = fused;
+                } else {
+                    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "causal", none_mask, .{ .ctx = null }, self.s));
+                }
             } else if (std.mem.eql(u8, sel_mode, "array")) {
-                try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "array", sel_mask, .{ .ctx = null }, self.s));
+                var fused_done = false;
+                if (is_prefill and cfg.has_sliding_window) {
+                    // Sliding-window prefill: the band mask runs in-kernel.
+                    if (try fusedSdpa256Prefill(self.s, q_rope, full_k, full_v, attn_scale, @intCast(cfg.sliding_window))) |fused| {
+                        _ = mlx.mlx_array_free(attn_out);
+                        attn_out = fused;
+                        fused_done = true;
+                    }
+                }
+                if (!fused_done) {
+                    if (sel_mask.ctx == null) {
+                        // The eager mask build was skipped because the fused
+                        // kernel was expected to cover this layer but a
+                        // per-call precondition declined — build it now (and
+                        // keep it for the remaining layers).
+                        local_prefill_mask = try self.createSlidingWindowMask(seq_len, total_kv, @intCast(cfg.sliding_window));
+                        sel_mask = local_prefill_mask;
+                    }
+                    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "array", sel_mask, .{ .ctx = null }, self.s));
+                }
             } else {
                 try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "", none_mask, .{ .ctx = null }, self.s));
             }
@@ -4638,7 +5047,12 @@ pub const Transformer = struct {
             const sw: c_int = @intCast(cfg.sliding_window);
             const total_kv: c_int = @as(c_int, @intCast(offset)) + seq_len;
             if (is_prefill) {
-                local_prefill_mask = try self.createSlidingWindowMask(seq_len, total_kv, sw);
+                // Skipped when the fused hd-256 kernel band-masks in-kernel
+                // (the mask itself is chunk x total_kv — GBs at long ctx);
+                // gemma4MoeAttnWith lazily builds it if a call declines.
+                if (!(fused256Enabled() and cfg.head_dim == 256 and seq_len >= 2)) {
+                    local_prefill_mask = try self.createSlidingWindowMask(seq_len, total_kv, sw);
+                }
             }
             if (!is_prefill and total_kv > sw) {
                 const local_kv_len: c_int = @min(total_kv, sw);
@@ -4670,7 +5084,7 @@ pub const Transformer = struct {
             const attn_out = switch (lw.attn) {
                 .linear => |la| try self.gatedDeltaNet(normed, &la, &ctx.ssm_entries.?[layer_idx], batch, seq_len),
                 .full => |fa| if (is_gemma4)
-                    try self.gemma4MoeAttnWith(ctx, normed, &fa, li, @intCast(offset), batch, seq_len, is_prefill, local_prefill_mask, local_decode_mask)
+                    try self.gemma4MoeAttnWith(ctx, normed, &fa, li, @intCast(offset), batch, seq_len, is_prefill, &local_prefill_mask, local_decode_mask)
                 else
                     try self.gatedFullAttnWith(ctx, normed, &fa, li, @intCast(offset), batch, seq_len, is_prefill),
             };
@@ -5660,7 +6074,12 @@ pub const Transformer = struct {
         var attn_out = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(attn_out);
         if (is_prefill) {
-            try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_t, k_t, v_t, attn_scale, "causal", none_mask, .{ .ctx = null }, self.s));
+            if (try fusedSdpa256Prefill(self.s, q_t, k_t, v_t, attn_scale, 0)) |fused| {
+                _ = mlx.mlx_array_free(attn_out);
+                attn_out = fused;
+            } else {
+                try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_t, k_t, v_t, attn_scale, "causal", none_mask, .{ .ctx = null }, self.s));
+            }
         } else {
             try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_t, k_t, v_t, attn_scale, "", none_mask, .{ .ctx = null }, self.s));
         }
@@ -5956,7 +6375,12 @@ pub const Transformer = struct {
             _ = mlx.mlx_array_free(attn_out);
             attn_out = fused;
         } else if (is_prefill) {
-            try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "causal", none_mask, .{ .ctx = null }, self.s));
+            if (try fusedSdpa256Prefill(self.s, q_rope, full_k, full_v, attn_scale, 0)) |fused| {
+                _ = mlx.mlx_array_free(attn_out);
+                attn_out = fused;
+            } else {
+                try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "causal", none_mask, .{ .ctx = null }, self.s));
+            }
         } else {
             try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "", none_mask, .{ .ctx = null }, self.s));
         }
@@ -5997,7 +6421,10 @@ pub const Transformer = struct {
         batch: c_int,
         seq_len: c_int,
         is_prefill: bool,
-        local_prefill_mask: mlx.mlx_array,
+        // Pointer: the caller may have SKIPPED the eager sliding-mask build
+        // (fused hd-256 kernel expected to band-mask in-kernel); if a per-call
+        // check declines, the mask is built here once and cached back.
+        local_prefill_mask: *mlx.mlx_array,
         local_decode_mask: mlx.mlx_array,
     ) !mlx.mlx_array {
         const cfg = &self.config;
@@ -6095,26 +6522,47 @@ pub const Transformer = struct {
         var attn_out = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(attn_out);
 
+        // Causal prefill arms first try the fused hd-256 flash kernel (null =
+        // precondition miss -> composed fallback, identical to before).
         if (!cfg.has_sliding_window) {
             if (is_prefill) {
-                try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "causal", none_mask, .{ .ctx = null }, self.s));
+                if (try fusedSdpa256Prefill(self.s, q_rope, full_k, full_v, attn_scale, 0)) |fused| {
+                    _ = mlx.mlx_array_free(attn_out);
+                    attn_out = fused;
+                } else {
+                    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "causal", none_mask, .{ .ctx = null }, self.s));
+                }
             } else {
                 try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "", none_mask, .{ .ctx = null }, self.s));
             }
         } else {
             const sw: c_int = @intCast(cfg.sliding_window);
             const total_kv: c_int = offset + seq_len;
-            if (is_prefill and is_global) {
-                try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "causal", none_mask, .{ .ctx = null }, self.s));
-            } else if (is_prefill and total_kv <= sw) {
-                // Everything fits in the window: the sliding mask degenerates
-                // to plain causal. Use the "causal" fast path — same kernel
-                // (and reduction order) the mlx-lm/mlx-vlm reference picks for
-                // short prompts, which keeps near-tie MoE router decisions
-                // from flipping vs the reference (DiffusionGemma parity).
-                try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "causal", none_mask, .{ .ctx = null }, self.s));
+            if (is_prefill and (is_global or total_kv <= sw)) {
+                // Global layers, or everything fits in the window (the sliding
+                // mask degenerates to plain causal — same kernel and reduction
+                // order the mlx-lm/mlx-vlm reference picks for short prompts,
+                // which keeps near-tie MoE router decisions from flipping vs
+                // the reference; DiffusionGemma parity).
+                if (try fusedSdpa256Prefill(self.s, q_rope, full_k, full_v, attn_scale, 0)) |fused| {
+                    _ = mlx.mlx_array_free(attn_out);
+                    attn_out = fused;
+                } else {
+                    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "causal", none_mask, .{ .ctx = null }, self.s));
+                }
             } else if (is_prefill) {
-                try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "array", local_prefill_mask, .{ .ctx = null }, self.s));
+                // Sliding-window prefill: band mask runs in-kernel when fused.
+                if (try fusedSdpa256Prefill(self.s, q_rope, full_k, full_v, attn_scale, sw)) |fused| {
+                    _ = mlx.mlx_array_free(attn_out);
+                    attn_out = fused;
+                } else {
+                    if (local_prefill_mask.ctx == null) {
+                        // Eager build was skipped for the fused path but this
+                        // call declined — build once, cache for later layers.
+                        local_prefill_mask.* = try self.createSlidingWindowMask(seq_len, total_kv, sw);
+                    }
+                    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "array", local_prefill_mask.*, .{ .ctx = null }, self.s));
+                }
             } else if (is_global) {
                 try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "", none_mask, .{ .ctx = null }, self.s));
             } else if (@as(c_int, @intCast(ctx.cache.seqLen(layer))) <= sw) {
@@ -6471,7 +6919,7 @@ pub const Transformer = struct {
 
     // ── Sparse MoE MLP ──
 
-    fn moeMLP(self: *Transformer, x: mlx.mlx_array, mw: *const MoeMlpWeights) !mlx.mlx_array {
+    pub fn moeMLP(self: *Transformer, x: mlx.mlx_array, mw: *const MoeMlpWeights) !mlx.mlx_array {
         return self.moeMLP2(x, x, mw);
     }
 
@@ -7592,6 +8040,36 @@ inline fn lastDim(x: mlx.mlx_array) ?u32 {
 ///   apply: w_cols*32/s_cols only pins bits×gs, so solve exactly with the
 ///   caller's `in_dim` (activation inner dim); without a hint, assume mlx-lm's
 ///   override default group size 64.
+/// Solve an affine weight's exact (bits, group_size) from packed-column
+/// geometry when the input dimension is known:
+///   bits = w_cols * 32 / in_dim,  group_size = in_dim / s_cols
+/// Returns null unless both divide EXACTLY and land on values MLX's affine
+/// packing supports — callers then fall back to config-based detection.
+/// This is what lets a sidecar (e.g. an MTP head quantized 5-bit/gs-128 over
+/// a 4-bit/gs-64 trunk) resolve per-weight instead of inheriting the trunk's
+/// group size.
+pub fn affineParamsFromGeometry(w: mlx.mlx_array, sc: mlx.mlx_array, in_dim: u32) ?QuantParams {
+    if (sc.ctx == null or in_dim == 0) return null;
+    const w_shape = mlx.getShape(w);
+    const s_shape = mlx.getShape(sc);
+    if (w_shape.len < 2 or s_shape.len < 2) return null;
+    const w_cols: u32 = @intCast(w_shape[w_shape.len - 1]);
+    const s_cols: u32 = @intCast(s_shape[s_shape.len - 1]);
+    if (w_cols == 0 or s_cols == 0) return null;
+    if ((w_cols * 32) % in_dim != 0 or in_dim % s_cols != 0) return null;
+    const bits = (w_cols * 32) / in_dim;
+    const gs = in_dim / s_cols;
+    switch (bits) {
+        2, 3, 4, 5, 6, 8 => {},
+        else => return null,
+    }
+    switch (gs) {
+        32, 64, 128 => {},
+        else => return null,
+    }
+    return .{ .bits = bits, .group_size = gs, .mode = .affine };
+}
+
 fn computeQuantParams(config: *const ModelConfig, w: mlx.mlx_array, sc: mlx.mlx_array, in_dim: ?u32) QuantParams {
     const w_shape = mlx.getShape(w);
     const s_shape = mlx.getShape(sc);
@@ -7607,6 +8085,13 @@ fn computeQuantParams(config: *const ModelConfig, w: mlx.mlx_array, sc: mlx.mlx_
     }
 
     if (config.quant_mode == .affine) {
+        // Exact per-weight solve when the caller knows the input dim — a
+        // hinted tensor whose geometry contradicts the config's group size
+        // (MTP sidecars mix gs 128/64/32 over a gs-64 trunk) resolves to its
+        // TRUE params. Consistent tensors solve to the config values anyway.
+        if (in_dim) |in| {
+            if (affineParamsFromGeometry(w, sc, in)) |qp| return qp;
+        }
         return .{
             .bits = detectQuantBits(w, sc, config.quant_group_size),
             .group_size = config.quant_group_size,
@@ -8525,6 +9010,66 @@ test "captureSsmCheckpoint materializes state copies (parent-buffer retention cl
 
     // Null ssm_state stays null (LFM2 gated_conv shape).
     try testing.expect(cp.layers[0].ssm_state.ctx == null);
+}
+
+test "affineParamsFromGeometry: exact per-weight solve for off-config sidecar quants" {
+    // Real geometries from the stamsam 35B-A3B MTP sidecar over a 4-bit/gs-64
+    // affine trunk: q_proj 5-bit/gs-128, v_proj 6-bit/gs-128, shared expert
+    // 8-bit/gs-128, switch experts 4-bit/gs-64. The old config-gs detection
+    // (detectQuantBits with gs 64) returns garbage for the gs-128 tensors.
+    const s = mlx.gpuStream();
+    const H = 2048; // sidecar hidden
+
+    const mk = struct {
+        fn arr(shape: []const c_int, dt: mlx.mlx_dtype, st: mlx.mlx_stream) !mlx.mlx_array {
+            var a = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_zeros(&a, shape.ptr, shape.len, dt, st));
+            return a;
+        }
+    };
+
+    // q_proj: w [8192, 320] u32, scales [8192, 16] bf16 → 5-bit / gs 128.
+    const wq = try mk.arr(&.{ 8192, 320 }, .uint32, s);
+    defer _ = mlx.mlx_array_free(wq);
+    const sq = try mk.arr(&.{ 8192, 16 }, .bfloat16, s);
+    defer _ = mlx.mlx_array_free(sq);
+    const qp_q = affineParamsFromGeometry(wq, sq, H) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(u32, 5), qp_q.bits);
+    try testing.expectEqual(@as(u32, 128), qp_q.group_size);
+
+    // v_proj: w [512, 384] u32, scales [512, 16] bf16 → 6-bit / gs 128.
+    const wv = try mk.arr(&.{ 512, 384 }, .uint32, s);
+    defer _ = mlx.mlx_array_free(wv);
+    const sv = try mk.arr(&.{ 512, 16 }, .bfloat16, s);
+    defer _ = mlx.mlx_array_free(sv);
+    const qp_v = affineParamsFromGeometry(wv, sv, H) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(u32, 6), qp_v.bits);
+    try testing.expectEqual(@as(u32, 128), qp_v.group_size);
+
+    // Switch experts (3D): w [256, 512, 256] u32, scales [256, 512, 32] bf16
+    // → 4-bit / gs 64 (trunk-standard — must still solve).
+    const we = try mk.arr(&.{ 256, 512, 256 }, .uint32, s);
+    defer _ = mlx.mlx_array_free(we);
+    const se = try mk.arr(&.{ 256, 512, 32 }, .bfloat16, s);
+    defer _ = mlx.mlx_array_free(se);
+    const qp_e = affineParamsFromGeometry(we, se, H) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(u32, 4), qp_e.bits);
+    try testing.expectEqual(@as(u32, 64), qp_e.group_size);
+
+    // Degenerate: bits wouldn't divide exactly → null (caller falls back).
+    const qp_bad = affineParamsFromGeometry(wq, sq, 3000);
+    try testing.expect(qp_bad == null);
+
+    // And through computeQuantParams on an AFFINE gs-64 config: the hinted
+    // exact solve must WIN over the config group size (pre-fix this returned
+    // bits 10 / gs 64 for the q_proj geometry).
+    var cfg = ModelConfig{};
+    cfg.quant_bits = 4;
+    cfg.quant_group_size = 64;
+    cfg.quant_mode = .affine;
+    const qp_via = computeQuantParams(&cfg, wq, sq, H);
+    try testing.expectEqual(@as(u32, 5), qp_via.bits);
+    try testing.expectEqual(@as(u32, 128), qp_via.group_size);
 }
 
 test "computeQuantParams resolves mixed nvfp4 + affine-override weights" {
@@ -9829,6 +10374,8 @@ fn gdnTestRunSeqAt(q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, g: mlx.
 
 test "prefillEvalCadence: small transients keep the coarse cadence" {
     const t = std.testing;
+    fused256_override = false;
+    defer fused256_override = null;
     // 26B geometry, short prompt: 16 heads x 2048 chunk x 2048 kv x 2B = 128 MB
     // of unfused scores — well inside the budget, keep today's cadence.
     try t.expectEqual(@as(u32, 4), Transformer.prefillEvalCadence(4, 256, 16, 8, 2048, 2048, false));
@@ -9840,8 +10387,21 @@ test "prefillEvalCadence: small transients keep the coarse cadence" {
     try t.expectEqual(@as(u32, 48), Transformer.prefillEvalCadence(48, 128, 8, 8, 8192, 500_000, false));
 }
 
+test "prefillEvalCadence: fused hd-256 kernel drops the score term" {
+    const t = std.testing;
+    // With msv_attn_p256 active (the default) the score transient never
+    // exists — hd 256 keeps the coarse cadence at any context, exactly like
+    // hd 128. The dequant term must still fire under --kv-quant.
+    fused256_override = true;
+    defer fused256_override = null;
+    try t.expectEqual(@as(u32, 4), Transformer.prefillEvalCadence(4, 256, 16, 8, 8192, 102_448, false));
+    try t.expectEqual(@as(u32, 1), Transformer.prefillEvalCadence(4, 256, 16, 8, 8192, 400_000, true));
+}
+
 test "prefillEvalCadence: big unfused score tensor forces eval-per-layer" {
     const t = std.testing;
+    fused256_override = false;
+    defer fused256_override = null;
     // 16 heads x 8192 chunk x 16384 kv x 2B = 4 GiB > 2 GiB budget: bounds a
     // ~13 GB windowed transient to ~4 GB. (8192 chunk x 8192 kv sits exactly
     // ON the 2 GiB budget and deliberately keeps the coarse cadence.)
@@ -9860,4 +10420,172 @@ test "prefillEvalCadence: quantized-KV dequant forces eval-per-layer even at fus
     try t.expectEqual(@as(u32, 1), Transformer.prefillEvalCadence(48, 128, 8, 8, 8192, 600_000, true));
     // Same shape with dense fp16 KV: nothing to dequantize, keep coarse.
     try t.expectEqual(@as(u32, 48), Transformer.prefillEvalCadence(48, 128, 8, 8, 8192, 600_000, false));
+}
+
+// ── fused hd-256 prefill attention parity ──
+
+/// Composed reference for the fused kernel tests: MLX's own SDPA (which takes
+/// the composed matmul→softmax→matmul path at head_dim 256).
+fn attn256Reference(
+    q: mlx.mlx_array,
+    k: mlx.mlx_array,
+    v: mlx.mlx_array,
+    scale: f32,
+    mode: [*:0]const u8,
+    mask: mlx.mlx_array,
+    s: mlx.mlx_stream,
+) !mlx.mlx_array {
+    var ref = mlx.mlx_array_new();
+    const none = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&ref, q, k, v, scale, mode, if (mask.ctx != null) mask else none, .{ .ctx = null }, s));
+    return ref;
+}
+
+fn attn256RandBf16(rnd: std.Random, shape: []const c_int, s: mlx.mlx_stream) !mlx.mlx_array {
+    var n: usize = 1;
+    for (shape) |d| n *= @intCast(d);
+    const data = try std.testing.allocator.alloc(f32, n);
+    defer std.testing.allocator.free(data);
+    for (data) |*x| x.* = rnd.float(f32) - 0.5;
+    const f32arr = mlx.mlx_array_new_data(data.ptr, shape.ptr, @intCast(shape.len), .float32);
+    defer _ = mlx.mlx_array_free(f32arr);
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_astype(&out, f32arr, .bfloat16, s));
+    return out;
+}
+
+fn attn256MaxDiff(a: mlx.mlx_array, b: mlx.mlx_array, s: mlx.mlx_stream) !f32 {
+    var a32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(a32);
+    var b32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(b32);
+    try mlx.check(mlx.mlx_astype(&a32, a, .float32, s));
+    try mlx.check(mlx.mlx_astype(&b32, b, .float32, s));
+    try mlx.check(mlx.mlx_array_eval(a32));
+    try mlx.check(mlx.mlx_array_eval(b32));
+    const ad = mlx.mlx_array_data_float32(a32) orelse return error.InvalidDtype;
+    const bd = mlx.mlx_array_data_float32(b32) orelse return error.InvalidDtype;
+    const n = mlx.mlx_array_size(a32);
+    if (n != mlx.mlx_array_size(b32)) return error.ShapeMismatch;
+    var max_diff: f32 = 0;
+    for (0..n) |i| max_diff = @max(max_diff, @abs(ad[i] - bd[i]));
+    return max_diff;
+}
+
+test "fusedSdpa256Prefill: causal parity vs composed SDPA (GQA, ragged shapes, chunk offset)" {
+    const s = mlx.gpuStream();
+    fused256_override = true;
+    defer fused256_override = null;
+    var prng = std.Random.DefaultPrng.init(0x256256);
+    const rnd = prng.random();
+
+    // qL=70 (partial 32-tile), kL=193 (partial 16-block), offset 123 (chunked
+    // prefill bottom-right alignment), Hq=6/Hk=2 (gqa 3).
+    const q_shape = [_]c_int{ 1, 6, 70, 256 };
+    const kv_shape = [_]c_int{ 1, 2, 193, 256 };
+    const q = try attn256RandBf16(rnd, &q_shape, s);
+    defer _ = mlx.mlx_array_free(q);
+    const k = try attn256RandBf16(rnd, &kv_shape, s);
+    defer _ = mlx.mlx_array_free(k);
+    const v = try attn256RandBf16(rnd, &kv_shape, s);
+    defer _ = mlx.mlx_array_free(v);
+    const scale: f32 = 1.0 / 16.0; // 1/sqrt(256)
+
+    const fused = (try fusedSdpa256Prefill(s, q, k, v, scale, 0)) orelse return error.FusedDeclined;
+    defer _ = mlx.mlx_array_free(fused);
+    const ref = try attn256Reference(q, k, v, scale, "causal", .{ .ctx = null }, s);
+    defer _ = mlx.mlx_array_free(ref);
+
+    // Not byte-parity: the composed path rounds softmax probs to bf16 before
+    // the AV matmul, the fused kernel keeps float32 — bf16-rounding-scale
+    // differences only.
+    // Measured 0.00049 (one bf16 ULP at 0.5 magnitude) on this seed.
+    const max_diff = try attn256MaxDiff(fused, ref, s);
+    try std.testing.expect(max_diff < 0.005);
+}
+
+test "fusedSdpa256Prefill: sliding-band parity vs composed 'array' mask (Gemma local layers)" {
+    const s = mlx.gpuStream();
+    fused256_override = true;
+    defer fused256_override = null;
+    var prng = std.Random.DefaultPrng.init(0xBA9D);
+    const rnd = prng.random();
+
+    const qL: c_int = 70;
+    const kL: c_int = 193;
+    const sw: c_int = 40;
+    const q_shape = [_]c_int{ 1, 4, qL, 256 };
+    const kv_shape = [_]c_int{ 1, 4, kL, 256 };
+    const q = try attn256RandBf16(rnd, &q_shape, s);
+    defer _ = mlx.mlx_array_free(q);
+    const k = try attn256RandBf16(rnd, &kv_shape, s);
+    defer _ = mlx.mlx_array_free(k);
+    const v = try attn256RandBf16(rnd, &kv_shape, s);
+    defer _ = mlx.mlx_array_free(v);
+    const scale: f32 = 1.0;
+
+    // Reference mask: exactly createSlidingWindowMask semantics — masked when
+    // col > row_abs (causal) or row_abs - col >= sw, row_abs = kL - qL + r.
+    const mask_n: usize = @intCast(qL * kL);
+    const mask_data = try std.testing.allocator.alloc(f32, mask_n);
+    defer std.testing.allocator.free(mask_data);
+    const off: c_int = kL - qL;
+    var r: c_int = 0;
+    while (r < qL) : (r += 1) {
+        var c: c_int = 0;
+        while (c < kL) : (c += 1) {
+            const row_abs = off + r;
+            const masked = (c > row_abs) or (row_abs - c >= sw);
+            mask_data[@intCast(r * kL + c)] = if (masked) -std.math.inf(f32) else 0.0;
+        }
+    }
+    const mask_shape = [_]c_int{ 1, 1, qL, kL };
+    const mask_f32 = mlx.mlx_array_new_data(mask_data.ptr, &mask_shape, 4, .float32);
+    defer _ = mlx.mlx_array_free(mask_f32);
+    var mask = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(mask);
+    try mlx.check(mlx.mlx_astype(&mask, mask_f32, .bfloat16, s));
+
+    const fused = (try fusedSdpa256Prefill(s, q, k, v, scale, sw)) orelse return error.FusedDeclined;
+    defer _ = mlx.mlx_array_free(fused);
+    const ref = try attn256Reference(q, k, v, scale, "array", mask, s);
+    defer _ = mlx.mlx_array_free(ref);
+
+    const max_diff = try attn256MaxDiff(fused, ref, s);
+    try std.testing.expect(max_diff < 0.02);
+}
+
+test "fusedSdpa256Prefill: declines cleanly outside its envelope" {
+    const s = mlx.gpuStream();
+    var prng = std.Random.DefaultPrng.init(0xDEC1);
+    const rnd = prng.random();
+
+    // Wrong head_dim -> null.
+    const q128_shape = [_]c_int{ 1, 4, 64, 128 };
+    const q128 = try attn256RandBf16(rnd, &q128_shape, s);
+    defer _ = mlx.mlx_array_free(q128);
+    fused256_override = true;
+    defer fused256_override = null;
+    try std.testing.expect((try fusedSdpa256Prefill(s, q128, q128, q128, 1.0, 0)) == null);
+
+    // Decode/verify shapes (seq <= 8) -> null (sdpa_vector owns hd 256
+    // there; stealing MTP verify forwards measured decode 48 -> 18 tok/s).
+    const q1_shape = [_]c_int{ 1, 4, 1, 256 };
+    const q8_shape = [_]c_int{ 1, 4, 8, 256 };
+    const kv_shape = [_]c_int{ 1, 4, 64, 256 };
+    const q1 = try attn256RandBf16(rnd, &q1_shape, s);
+    defer _ = mlx.mlx_array_free(q1);
+    const q8 = try attn256RandBf16(rnd, &q8_shape, s);
+    defer _ = mlx.mlx_array_free(q8);
+    const k1 = try attn256RandBf16(rnd, &kv_shape, s);
+    defer _ = mlx.mlx_array_free(k1);
+    try std.testing.expect((try fusedSdpa256Prefill(s, q1, k1, k1, 1.0, 0)) == null);
+    try std.testing.expect((try fusedSdpa256Prefill(s, q8, k1, k1, 1.0, 0)) == null);
+
+    // Kill switch -> null even for a conforming call.
+    fused256_override = false;
+    const q_shape = [_]c_int{ 1, 4, 64, 256 };
+    const q = try attn256RandBf16(rnd, &q_shape, s);
+    defer _ = mlx.mlx_array_free(q);
+    try std.testing.expect((try fusedSdpa256Prefill(s, q, q, q, 1.0, 0)) == null);
 }

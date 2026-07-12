@@ -8,12 +8,15 @@
 #      `[spec-stats] mode=mtp` with attempts > 0 per request. This is the
 #      anti-dispatch-hole check: output-equality alone can't see a silent
 #      fallback to regular decode (the drafter shipped exactly that bug).
-#   1b. ACCEPTANCE FLOOR — at least one request must report per_draft_pct
-#      >= 50%. A structurally broken head (e.g. the delta-encoded-norms
-#      trap: sidecar built without the +1 fold-in) still "engages" but
-#      accepts ~0% before the runtime gate silently falls back to regular
-#      decode — equivalence and engagement checks both pass in that state.
-#      Healthy depth-1 acceptance on this prompt measures ~73%.
+#   1b. ACCEPTANCE FLOOR — at least one request must report
+#      avg_per_round >= 0.5 (accepted tokens per attempt). A structurally
+#      broken head (e.g. the delta-encoded-norms trap: sidecar built without
+#      the +1 fold-in) still "engages" but accepts ~0 per round before the
+#      runtime gate silently falls back to regular decode — equivalence and
+#      engagement checks both pass in that state. avg_per_round is the
+#      depth-independent floor: healthy measures ~0.7 at depth 1 and ~0.75+
+#      at the depth-3 default even on creative temp-0 content where the
+#      chained per_draft_pct legitimately dilutes to ~25%.
 #   2. EQUIVALENCE — at temp=0 the first $PREFIX_CHARS characters match a
 #      --no-mtp baseline byte-for-byte. (Full-output equality is NOT
 #      required: INT4 weights make batched verify forwards (qmm) reduce in
@@ -22,7 +25,12 @@
 #
 # Usage: MTP_TEST_MODEL=<model-dir> ./tests/test_mtp_equivalence.sh [port]
 # Default model: ~/hf-staging/Qwen3.6-27B-4bit-MTP-MLX-Serve (any Qwen 3.5/3.6
-# dir with an mtp/weights.safetensors sidecar works)
+# dir with an MTP sidecar — mtp/weights.safetensors, mtp.safetensors, or
+# model-mtp.safetensors — works).
+#
+# MoE trunks (35B-A3B) keep MTP default-OFF per request; set MTP_FORCE_ENABLE=1
+# to inject "enable_mtp":true into every request body so engagement +
+# acceptance-floor checks exercise the MoE-MLP sidecar arm.
 
 set -u
 MODEL="${MTP_TEST_MODEL:-$HOME/hf-staging/Qwen3.6-27B-4bit-MTP-MLX-Serve}"
@@ -34,8 +42,13 @@ BIN="./zig-out/bin/mlx-serve"
 PREFIX_CHARS="${PREFIX_CHARS:-100}"
 MAX_TOKENS=120
 PROMPT="Write a short story about a robot learning to paint."
+# Injected into every request body; empty by default (server defaults apply).
+OPTIN=""
+if [ "${MTP_FORCE_ENABLE:-0}" = "1" ]; then
+    OPTIN='"enable_mtp":true,'
+fi
 
-if [ ! -d "$MODEL" ] || [ ! -f "$MODEL/mtp/weights.safetensors" ]; then
+if [ ! -d "$MODEL" ] || { [ ! -f "$MODEL/mtp/weights.safetensors" ] && [ ! -f "$MODEL/mtp.safetensors" ] && [ ! -f "$MODEL/model-mtp.safetensors" ]; }; then
     echo "SKIP: model with MTP sidecar not found at $MODEL"
     exit 0
 fi
@@ -64,14 +77,14 @@ stop_server() {
 
 chat_nonstream() {
     curl -s "http://127.0.0.1:$PORT/v1/chat/completions" -H 'Content-Type: application/json' -d "{
-        \"model\":\"default\",\"stream\":false,\"temperature\":0,\"max_tokens\":$MAX_TOKENS,
+        $OPTIN\"model\":\"default\",\"stream\":false,\"temperature\":0,\"max_tokens\":$MAX_TOKENS,
         \"messages\":[{\"role\":\"user\",\"content\":\"$PROMPT\"}]}" |
         python3 -c "import json,sys; print(json.load(sys.stdin)['choices'][0]['message']['content'], end='')"
 }
 
 chat_stream() {
     curl -sN "http://127.0.0.1:$PORT/v1/chat/completions" -H 'Content-Type: application/json' -d "{
-        \"model\":\"default\",\"stream\":true,\"temperature\":0,\"max_tokens\":$MAX_TOKENS,
+        $OPTIN\"model\":\"default\",\"stream\":true,\"temperature\":0,\"max_tokens\":$MAX_TOKENS,
         \"messages\":[{\"role\":\"user\",\"content\":\"$PROMPT\"}]}" |
         python3 -c "
 import json, sys
@@ -88,7 +101,7 @@ print(''.join(out), end='')"
 
 messages_nonstream() {
     curl -s "http://127.0.0.1:$PORT/v1/messages" -H 'Content-Type: application/json' -d "{
-        \"model\":\"default\",\"stream\":false,\"max_tokens\":$MAX_TOKENS,\"temperature\":0,
+        $OPTIN\"model\":\"default\",\"stream\":false,\"max_tokens\":$MAX_TOKENS,\"temperature\":0,
         \"messages\":[{\"role\":\"user\",\"content\":\"$PROMPT\"}]}" |
         python3 -c "import json,sys; print(''.join(b.get('text','') for b in json.load(sys.stdin)['content']), end='')"
 }
@@ -145,12 +158,14 @@ chat_stream > /tmp/mtp_on_chat_stream.txt
 check "chat stream" /tmp/mtp_base_chat.txt /tmp/mtp_on_chat_stream.txt yes
 messages_nonstream > /tmp/mtp_on_msg.txt
 check "messages non-stream" /tmp/mtp_base_msg.txt /tmp/mtp_on_msg.txt yes
-# Acceptance floor: a broken head engages but accepts ~0%.
-BEST_ACCEPT=$(grep -o 'per_draft_pct=[0-9.]*' "$LOG" | cut -d= -f2 | sort -n | tail -1)
-if python3 -c "import sys; sys.exit(0 if float('${BEST_ACCEPT:-0}') >= 50.0 else 1)"; then
-    echo "PASS [acceptance floor] (best per_draft_pct=${BEST_ACCEPT}%)"; PASS=$((PASS+1))
+# Acceptance floor: a broken head engages but accepts ~0 tokens per round.
+# avg_per_round is depth-independent (per_draft_pct divides by depth and
+# legitimately dilutes on chained creative drafts at the depth-3 default).
+BEST_ACCEPT=$(grep -o 'avg_per_round=[0-9.]*' "$LOG" | cut -d= -f2 | sort -n | tail -1)
+if python3 -c "import sys; sys.exit(0 if float('${BEST_ACCEPT:-0}') >= 0.5 else 1)"; then
+    echo "PASS [acceptance floor] (best avg_per_round=${BEST_ACCEPT})"; PASS=$((PASS+1))
 else
-    echo "FAIL [acceptance floor]: best per_draft_pct=${BEST_ACCEPT:-none} < 50% — head is drafting garbage"
+    echo "FAIL [acceptance floor]: best avg_per_round=${BEST_ACCEPT:-none} < 0.5 — head is drafting garbage"
     FAIL=$((FAIL+1))
 fi
 # Per-request opt-out must fall back to regular decode.

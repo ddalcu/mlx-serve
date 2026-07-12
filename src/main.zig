@@ -110,9 +110,14 @@ fn printUsage(io: std.Io) void {
         \\  --no-mtp            Disable the Qwen native MTP head (auto-loaded
         \\                        when the model dir ships mtp/weights.safetensors;
         \\                        priority: MTP > drafter > PLD).
-        \\  --mtp-depth <n>     Max tokens drafted per MTP round (default: 1).
+        \\  --mtp-depth <n>     Max tokens drafted per MTP round (default: 3).
         \\                        Depths >1 adapt down per-request when the
         \\                        acceptance rate sags.
+        \\  --mtp-history-window <n>
+        \\                      MTP prefill-history window: prompts forwarding
+        \\                        more than 16384 tokens only build head history
+        \\                        for the last <n> (default: 0 = full history;
+        \\                        windowing costs acceptance on stock Qwen heads).
         \\  --kv-quant <mode>   KV-cache quantization scheme:
         \\                        off (default), 4, 8     — affine group quant.
         \\                        turbo2, turbo4          — Hadamard-rotated
@@ -414,6 +419,12 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--mtp-depth") and i + 1 < args.len) {
             i += 1;
             mtp_depth = @min(mtp_mod.MAX_DEPTH, @max(1, try std.fmt.parseInt(u32, args[i], 10)));
+        } else if (std.mem.eql(u8, args[i], "--mtp-history-window") and i + 1 < args.len) {
+            i += 1;
+            // 0 = full history; otherwise the last-N-token window applied
+            // above mtp.HISTORY_WINDOW_THRESHOLD (set-once module override,
+            // same contract as --prefill-chunk).
+            generate_mod.mtp_history_window_override = try std.fmt.parseInt(usize, args[i], 10);
         } else if (std.mem.eql(u8, args[i], "--reasoning-budget") and i + 1 < args.len) {
             i += 1;
             reasoning_budget = try std.fmt.parseInt(i32, args[i], 10);

@@ -31,6 +31,32 @@ const KVCache = transformer_mod.KVCache;
 pub var prefill_chunk_override: usize = 8192;
 pub var prefill_trace_force: bool = false;
 
+/// MTP prefill-history window (`--mtp-history-window`; 0 = full history).
+/// Same set-once-at-CLI-parse contract as `prefill_chunk_override`.
+/// DEFAULT 0 (full): the A/B gate failed for windowing — at 64K ctx on the
+/// stock Qwen3.6-27B head, window 8192 cost 14 acceptance points (68.2% ->
+/// 54.0%) and 4.2 decode tok/s for ZERO prefill benefit (184.7 vs 185.1
+/// tok/s); at 32K it was a wash. Qwen's stock head drafts from deep history.
+pub var mtp_history_window_override: usize = 0;
+
+/// Effective MTP history window for a prefill forwarding `prefix_len`
+/// positions: 0 (capture everything) unless windowing is on AND the tail is
+/// past the threshold — short/medium prompts keep byte-identical behavior.
+pub fn effectiveMtpHistoryWindow(prefix_len: usize, window: usize) usize {
+    if (window == 0 or prefix_len <= mtp_mod.HISTORY_WINDOW_THRESHOLD) return 0;
+    return window;
+}
+
+/// Does prefill chunk [pos, end) contribute MTP history? Zero window = all
+/// chunks; otherwise only chunks overlapping the last `window` positions of
+/// the prefix (a boundary chunk contributes whole — the window is a floor,
+/// never an exact cut, so acceptance never loses mid-chunk context).
+pub fn chunkNeedsMtpHistory(pos: usize, end: usize, prefix_len: usize, window: usize) bool {
+    _ = pos;
+    if (window == 0) return true;
+    return end > prefix_len - @min(window, prefix_len);
+}
+
 /// One layer's materialized-score budget for unfused-SDPA prefill (see
 /// boundedPrefillChunk). 4 GiB keeps the full 8K chunk for every context up
 /// to ~16K on 16-head models (further on fewer heads) and degrades gradually
@@ -50,6 +76,15 @@ pub const PREFILL_CHUNK_FLOOR: usize = 512;
 /// and short contexts return `base_chunk` untouched, so typical traffic
 /// keeps full prefill throughput; the cap only bites when heads × total_ctx
 /// actually outgrows the budget. Never raises a caller-lowered base.
+///
+/// DELIBERATELY ignores the msv_attn_p256 fused kernel (unlike
+/// prefillEvalCadence / prefillMemoryNeeded, which drop their score term via
+/// transformer.prefillHeadDimFused): the fused kernel removes the SCORE
+/// transient, but a big chunk still scales the OTHER per-chunk transients
+/// (MoE gather buffers, per-chunk KV concat) — measured LIVE on
+/// gemma-4-26B-A4B at a 99K prompt: fused @ chunk 8192 = 736 tok/s / 61.2 GB
+/// peak vs fused @ chunk 1024 = 712 tok/s / 39.5 GB. +3% speed is not worth
+/// +22 GB peak (a 64 GB Mac dies), so the cap stays keyed on raw head_dim.
 pub fn boundedPrefillChunk(base_chunk: usize, head_dim: u32, n_heads: u32, total_ctx: usize) usize {
     if (head_dim <= 128 or n_heads == 0 or total_ctx == 0) return base_chunk;
     const per_row: u64 = @as(u64, n_heads) * @as(u64, total_ctx) * 2;
@@ -874,6 +909,10 @@ pub const Generator = struct {
             const prefix_len = prompt_ids.len - 1;
             const has_vision = ctx.vision_embeddings != null;
             const default_chunk = if (has_vision) prefix_len else PREFILL_CHUNK;
+            // Last-window MTP history: chunks entirely before the window skip
+            // the full-hidden capture AND the head forward (see
+            // mtp.SUGGESTED_HISTORY_WINDOW). 0 = capture every chunk.
+            const mtp_hist_window = effectiveMtpHistoryWindow(prefix_len, mtp_history_window_override);
 
             var pos: usize = 0;
             while (pos < prefix_len) {
@@ -918,16 +957,20 @@ pub const Generator = struct {
                     break :blk ctx.ssm_entries.?.ptr == xfm.ssm_entries.?.ptr and
                         ctx.ssm_entries.?.len == xfm.ssm_entries.?.len;
                 };
+                // History windowing: a chunk before the window needs no
+                // capture, which ALSO re-qualifies it for the compiled
+                // trunk forward (capture is what disqualifies MTP chunks).
+                const mtp_capture = mtp_active and chunkNeedsMtpHistory(pos, end, prefix_len, mtp_hist_window);
                 var chunk_hidden_all = mlx.mlx_array_new();
                 defer _ = mlx.mlx_array_free(chunk_hidden_all);
                 const chunk_logits = if (xfm.compiled_forward != null and
-                    !mtp_active and
+                    !mtp_capture and
                     ctx.cache == &xfm.cache and
                     ssm_match and
                     ctx.capture_hidden == null and
                     ctx.vision_embeddings == null)
                     try xfm.forwardCompiled(chunk_input)
-                else if (mtp_active) blk: {
+                else if (mtp_capture) blk: {
                     var last_unused = mlx.mlx_array_new();
                     defer _ = mlx.mlx_array_free(last_unused);
                     break :blk try xfm.forwardWithCaptureAll(&ctx, chunk_input, &last_unused, &chunk_hidden_all);
@@ -939,7 +982,7 @@ pub const Generator = struct {
                 // tokens [pos+1, end+1) — prompt_ids[end] always exists since
                 // the chunk loop spans [0, prefix_len) and prompt_ids has
                 // prefix_len + 1 entries.
-                if (mtp_active) {
+                if (mtp_capture) {
                     try mtp_mod.appendHistory(
                         options.mtp.?,
                         xfm,
@@ -5196,7 +5239,7 @@ test "boundedPrefillChunk: fused head dims and short contexts keep the base chun
     // at ANY context length.
     try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 128, 16, 1_000_000));
     try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 64, 32, 1_000_000));
-    // Unfused (256) but short context: 16 heads x 8192 ctx x 8192 chunk x 2B
+    // hd 256 but short context: 16 heads x 8192 ctx x 8192 chunk x 2B
     // = 2 GiB scores, inside the 4 GiB budget -> full chunk kept. This is the
     // fleet-protection property: every Gemma-4 / Qwen3.5/3.6 checkpoint ships
     // head_dim 256, so typical prompts must keep full prefill throughput.
@@ -5206,7 +5249,17 @@ test "boundedPrefillChunk: fused head dims and short contexts keep the base chun
     try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 256, 16, 0));
 }
 
-test "boundedPrefillChunk: unfused long context shrinks to the scores budget, floored and rounded" {
+test "boundedPrefillChunk: caps hd-256 long context even with the fused kernel active" {
+    // The msv_attn_p256 kernel removes the SCORE transient, but a big chunk
+    // still scales the MoE-gather / KV-concat transients — measured +22 GB
+    // peak for +3% speed at a 99K prompt. The cap deliberately ignores
+    // prefillHeadDimFused (see the fn doc); pin that with the override ON.
+    transformer_mod.fused256_override = true;
+    defer transformer_mod.fused256_override = null;
+    try testing.expectEqual(@as(usize, 1024), boundedPrefillChunk(8192, 256, 16, 100_000));
+}
+
+test "boundedPrefillChunk: long context shrinks to the scores budget, floored and rounded" {
     // gemma-4-26B geometry (16 heads): budget/(16*ctx*2) …
     // ctx 32768 -> exactly 4096.
     try testing.expectEqual(@as(usize, 4096), boundedPrefillChunk(8192, 256, 16, 32768));
@@ -5218,6 +5271,29 @@ test "boundedPrefillChunk: unfused long context shrinks to the scores budget, fl
     try testing.expectEqual(@as(usize, 512), boundedPrefillChunk(8192, 256, 24, 262_144));
     // e4b geometry (8 heads) at 131072: exactly 2048.
     try testing.expectEqual(@as(usize, 2048), boundedPrefillChunk(8192, 256, 8, 131_072));
+}
+
+test "MTP history window: threshold gate and chunk membership" {
+    // Below/at the 16384 threshold the window never engages — behavior (and
+    // temp-0 output) stays byte-identical to full-history capture.
+    try testing.expectEqual(@as(usize, 0), effectiveMtpHistoryWindow(1000, 8192));
+    try testing.expectEqual(@as(usize, 0), effectiveMtpHistoryWindow(16384, 8192));
+    try testing.expectEqual(@as(usize, 8192), effectiveMtpHistoryWindow(16385, 8192));
+    try testing.expectEqual(@as(usize, 8192), effectiveMtpHistoryWindow(65536, 8192));
+    // 0 = full history at any length (the --mtp-history-window 0 escape).
+    try testing.expectEqual(@as(usize, 0), effectiveMtpHistoryWindow(65536, 0));
+
+    // Chunk membership at prefix 32768, window 8192: the window starts at
+    // 24576. Chunks entirely before it skip capture; the boundary chunk
+    // (ending past 24576) captures WHOLE.
+    try testing.expect(!chunkNeedsMtpHistory(0, 8192, 32768, 8192));
+    try testing.expect(!chunkNeedsMtpHistory(16384, 24576, 32768, 8192));
+    try testing.expect(chunkNeedsMtpHistory(24576, 32768, 32768, 8192));
+    try testing.expect(chunkNeedsMtpHistory(20000, 24577, 32768, 8192));
+    // Zero window: every chunk captures.
+    try testing.expect(chunkNeedsMtpHistory(0, 8192, 32768, 0));
+    // Window >= prefix degenerates to full capture (no underflow).
+    try testing.expect(chunkNeedsMtpHistory(0, 512, 4096, 8192));
 }
 
 test "boundedPrefillChunk: never raises a caller-lowered base chunk" {

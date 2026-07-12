@@ -1,4 +1,4 @@
-[![ddalcu%2Fmlx-serve | Trendshift](https://trendshift.io/api/badge/repositories/43025)](https://trendshift.io/repositories/43025)
+![mlx-serve — the unified AI powerhouse on Apple Silicon: chat, coding agents, image, video, music, voice clone, 3D](docs/assets/mlx-serve-header.png)
 
 # mlx-serve — run any LLM on your Mac
 
@@ -11,14 +11,11 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue?style=flat-square)](LICENSE)
 [![macOS](https://img.shields.io/badge/macOS-Apple%20Silicon-black?style=flat-square&logo=apple)](https://github.com/ddalcu/mlx-serve/releases/latest)
 [![Zig](https://img.shields.io/badge/built%20with-Zig-f7a41d?style=flat-square&logo=zig)](https://ziglang.org)
+[![ddalcu%2Fmlx-serve | Trendshift](https://trendshift.io/api/badge/repositories/43025)](https://trendshift.io/repositories/43025)
 
 **[ddalcu.github.io/mlx-serve](https://ddalcu.github.io/mlx-serve/)** · [Download MLX Core.app](https://github.com/ddalcu/mlx-serve/releases/latest) · [Changelog](CHANGELOG.md)
 
-> ★ **If mlx-serve saves you from spinning up another Electron app, [star the repo](https://github.com/ddalcu/mlx-serve/stargazers) — it genuinely helps people find this.**
-
-mlx-serve is a native Zig server that runs **any LLM on Apple Silicon** — MLX-format models *and* every GGUF on HuggingFace (Qwen, Llama, Mistral, Gemma, DeepSeek V4 Flash, thousands more). It exposes **OpenAI-compatible** *and* **Anthropic-compatible** HTTP APIs out of the box, so the same `http://localhost:11234` works with Claude Code, the OpenAI SDK, Continue, Cursor, Open WebUI, and anything else that speaks one of those wires. Ships with **MLX Core**, a macOS menu-bar app with chat, agent mode, MCP tool calling, and model management.
-
-![MLX Core](docs/demo-diffusion.gif)
+mlx-serve is a native Zig server that runs **any LLM on Apple Silicon** — MLX-format models *and* every GGUF on HuggingFace (Qwen, Llama, Mistral, Gemma, DeepSeek V4 Flash, thousands more). It exposes **OpenAI-compatible** *and* **Anthropic-compatible** HTTP APIs out of the box, so the same `http://localhost:11234` works with Claude Code, the OpenAI SDK, Continue, Cursor, Open WebUI, and anything else that speaks one of those wires. Beyond text, the same server generates **images, video, music, speech (with voice cloning), and 3D models** — all natively on MLX. Ships with **MLX Core**, a macOS menu-bar app with chat, agent mode, MCP tool calling, and model management.
 
 [<img src="docs/appiconb.png" width="48" align="center">](https://github.com/ddalcu/mlx-serve/releases/latest) **[Download MLX Core.app](https://github.com/ddalcu/mlx-serve/releases/latest)** — latest release for macOS (Apple Silicon)
 
@@ -66,7 +63,9 @@ If you're already on LM Studio, Ollama, or `mlx-lm` and wondering whether to swi
 | Native menu-bar app (no Electron) | ✅ | ❌ Electron | ❌ | ❌ |
 | **Image generation + photo editing** | ✅ | ❌ | ❌ | ❌ |
 | **Video generation** (text / image / audio → video) | ✅ | ❌ | ❌ | ❌ |
-| **Audio generation + voice cloning** | ✅ | ❌ | ❌ | ❌ |
+| **Speech + voice cloning** | ✅ | ❌ | ❌ | ❌ |
+| **Music generation** | ✅ | ❌ | ❌ | ❌ |
+| **3D generation** (image → textured 3D model) | ✅ | ❌ | ❌ | ❌ |
 | License | MIT | proprietary | MIT | MIT |
 
 ¹ Ollama can't run MLX, so the comparison is GGUF-vs-GGUF. 
@@ -95,7 +94,6 @@ If you're already on LM Studio, Ollama, or `mlx-lm` and wondering whether to swi
 Across 18 cells (best mlx-serve vs best LM Studio, geomean): **+35%**. Reproduce with [`tests/bench.sh --family gemma --lmstudio --omlx`](tests/bench.sh).
 
 ![mlx-serve vs LM Studio — Gemma 4 (M4 Max)](docs/perf-vs-lmstudio-gemma-26.5.6.png)
-![mlx-serve GGUF vs LM Studio GGUF — same file, Apple M4](docs/perf-vs-lmstudio-omlx-gemma-20260526-121327.png)
 
 ## Features
 
@@ -106,7 +104,8 @@ Across 18 cells (best mlx-serve vs best LM Studio, geomean): **+35%**. Reproduce
 - **Ollama-compatible API** — `/api/chat`, `/api/generate`, `/api/tags`, `/api/show`, `/api/ps`, `/api/embed`, `/api/pull` speak the Ollama wire (NDJSON streaming, tool calls with object arguments, `thinking`, `format` JSON schemas, `name:latest` model names), so the whole Ollama client ecosystem works against mlx-serve unchanged.
 - **Ollama-grade CLI** — `mlx-serve run gemma4` downloads (resumable), serves, and drops you into a streaming chat REPL; `pull` / `list` / `serve` manage a shared `~/.mlx-serve/models` store the GUI app uses too.
 - **Speculative decoding** — PLD (model-agnostic n-gram lookup, on by default) + the Gemma 4 cross-attention drafter. Adaptive prompt-time and runtime gates keep novel-content workloads at parity; agentic code loops see up to 1.6×.
-- **Native multi-token prediction (Qwen 3.6)** — checkpoints shipping a trained `mtp/` sidecar (like [Qwen3.6-27B-4bit-MTP](https://huggingface.co/ddalcu/Qwen3.6-27B-4bit-MTP-MLX-Serve)) speculate with the model's own head automatically: up to 1.8× on agent-style edit loops, self-tuning draft depth, zero setup.
+- **Native multi-token prediction (Qwen 3.5/3.6)** — checkpoints shipping a trained MTP sidecar (like [Qwen3.6-27B-4bit-MTP](https://huggingface.co/ddalcu/Qwen3.6-27B-4bit-MTP-MLX-Serve), or [MTPLX](https://github.com/youssofal/MTPLX)-published artifacts, loaded unmodified) speculate with the model's own head automatically: 3 drafts per round with a self-tuning depth controller, +15–26% on coding-agent loops, MoE sidecars (35B-A3B) supported. In a fresh head-to-head on identical prompts, mlx-serve out-decodes the reference MTP runtime on all 8 ladder cells from 0.5K to 64K context (+11–27%).
+- **Long-context prefill that flies** — a custom flash-attention Metal kernel handles Gemma's sliding-window layers during prefill, skipping everything outside the attention window: 2.2× prefill (299 → 671 tok/s) on a ~100K-token prompt with *less* peak memory.
 - **KV-cache quantization** — 4-bit / 8-bit / TurboQuant variants shrink KV memory ~4× / ~2× / further still, so 16K contexts fit on hardware that couldn't hold them dense.
 - **Continuous batching** — `--max-concurrent N` batches decode requests through one forward pass for ~1.6× throughput at 4-way parallel.
 - **Prefix cache** — shared system-prompt KV reuse across turns and across conversations. v26.5.7 adds an LRU of llama.cpp KV sessions so multi-doc agent loops stay warm.
@@ -116,6 +115,8 @@ Across 18 cells (best mlx-serve vs best LM Studio, geomean): **+35%**. Reproduce
 - **No Python** — single Zig binary, no `pip`, no venv. The MLX Core app ships everything signed and notarized.
 
 ## MLX Core (macOS App)
+
+![MLX Core](docs/demo-diffusion.gif)
 
 Menu-bar app that wraps the server with a full UI:
 
@@ -133,15 +134,13 @@ Menu-bar app that wraps the server with a full UI:
 - **Prompt-based skills** — drop `.md` files into `~/.mlx-serve/skills/` with YAML frontmatter to teach the agent custom capabilities triggered by keywords.
 - **Engine-aware Settings window** (Cmd+,) — every server-launch flag and per-request default, with sections that show only the knobs relevant to the engine you've loaded (MLX vs GGUF vs ds4).
 - **Server management** — start/stop, live log buffer, restart-on-flag-change banner.
-- **Image / Video Generation** — Krea-2, FLUX.2 and LTX-Video 2.3 native via mlx-serve zig server.
+- **Image / Video / Music / Speech / 3D generation** — Krea-2, FLUX.2, LTX-Video 2.3, ACE-Step, Qwen3-TTS and Hunyuan3D, all native via the mlx-serve zig server.
 
-### Image / Video Generation 
+### Image / Video / Music / Speech / 3D Generation
 
-The tray has **ImageGen**, **VideoGen** and **AudioGen** buttons that run [FLUX.2](https://huggingface.co/black-forest-labs), [LTX-Video 2.3](https://github.com/dgrauet/ltx-2-mlx) and [Qwen3-TTS](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-Base) through our zig server. All three run natively on MLX. 
+One server, five modalities — the tray has **ImageGen**, **VideoGen**, **AudioGen** (speech + music) and **3D** panels that run [FLUX.2](https://huggingface.co/black-forest-labs) / Krea-2, [LTX-Video 2.3](https://github.com/dgrauet/ltx-2-mlx), [ACE-Step 1.5](https://huggingface.co/ddalcu/ACE-Step-1.5-XL-Turbo-MLX-Serve-8bit), [Qwen3-TTS](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-Base), and [Hunyuan3D-2.1](https://huggingface.co/ddalcu/Hunyuan3D-2.1-MLX-Serve-8bit) natively on MLX. Click a panel, hit **Download**, generate. Each panel remembers your last-used model, quality, resolution, steps and seed between sessions.
 
-Launch MLX Core, click the ImageGen, VideoGen or AudioGen tray icon, and hit **Download**. Each panel remembers your last-used model, quality, resolution, steps and seed between sessions, so you don't re-pick them every time.
-
-You can also **generate images straight from chat**: in Agent mode, ask for an image and it renders inline in the conversation using your saved Image settings — double-click any chat image to open it full-size in Preview. (Audio and video generation live in their tray windows for now.)
+You can also **generate images straight from chat**: in Agent mode, ask for an image and it renders inline in the conversation using your saved Image settings — double-click any chat image to open it full-size in Preview.
 
 And it goes well beyond text-to-X:
 
@@ -149,6 +148,9 @@ And it goes well beyond text-to-X:
 - **Image-to-image variations** — every image model (Krea-2 included) takes a source image plus a strength slider, from subtle remix to full re-imagination.
 - **Animate your photos** — drop a picture into the Video pane's First-frame slot and LTX animates forward from it, starting exactly on your image.
 - **Talking characters** — put spoken lines in quotes in the video prompt, attach a real speech or music clip, or type a line for Qwen3-TTS to voice — the video is generated *against* that soundtrack, performance synced, and the original audio (not a re-synthesis) lands in the mp4.
+- **Clone a voice from seconds of audio** — record or pick a clip in Settings ▸ Voice and Qwen3-TTS speaks in that voice — in the AudioGen panel, in hands-free Voice Mode, everywhere.
+- **Compose full music tracks** — ACE-Step 1.5 turns a style prompt (and optional lyrics) into a 48 kHz stereo track: a 30-second song renders in about 4 seconds.
+- **Turn a photo into a 3D model** — Hunyuan3D-2.1 converts an image into a watertight GLB mesh, optionally with full PBR textures — drops straight into a game engine or slicer.
 - **Style LoRAs** — attach any diffusers-format LoRA `.safetensors` to restyle LTX, FLUX, or Krea generations at runtime — no re-quantization, zero quality loss on the base weights.
 
 **Models:**
@@ -157,11 +159,13 @@ And it goes well beyond text-to-X:
 |---|---|---|---|
 | Image | FLUX.2-klein 4B 4-bit (mflux, ~5 GB pre-quantized) | Krea-2-Turbo-MLX-Serve-mixed-4-8 | 8 / 12 / 16 GB |
 | Video | LTX-Video 2.3 Q4 | — | 24 GB RAM, ~50 GB first-run download (LTX 41 GB + Gemma 8 GB) |
-| Audio | Qwen3-TTS 1.7b | — | 8 GB RAM, ~3.5 GB first-run download |
+| Speech | Qwen3-TTS 1.7b (voice cloning) | Qwen3-TTS 0.6b | 8 GB RAM, ~3.5 GB first-run download |
+| Music | ACE-Step 1.5 XL Turbo 8-bit | — | 8 GB RAM, ~6.2 GB first-run download |
+| 3D | Hunyuan3D-2.1 8-bit (shape + PBR texture) | — | 16 GB RAM |
 
 > The 41 GB LTX snapshot ships **both** transformer variants (1-stage distilled + 2-stage dev, ~11 GB each) plus a 7.6 GB distillation LoRA, so you can switch between Fast/Good/Quality/Super offline without re-downloading.
 
-Outputs go to `~/.mlx-serve/generations/images/YYYY-MM-DD/` and `.../videos/YYYY-MM-DD/`.
+Outputs go to `~/.mlx-serve/generations/` under per-modality, per-date folders.
 
 > The app won't let you start a generation if there isn't enough free RAM. If the mlx-serve server is running and competing for memory, you'll be prompted to stop it first.
 
@@ -254,7 +258,7 @@ Requires `APPLE_DEVELOPER_ID` and `APPLE_TEAM_ID` environment variables for code
 | `--max-tokens N` | `100` | Maximum tokens to generate |
 | `--temp F` | `0.0` | Sampling temperature (0 = greedy) |
 | `--ctx-size N` | auto | Context window size (auto = computed from GPU memory) |
-| `--timeout N` | `300` | Request timeout in seconds |
+| `--timeout N` | `300` | Stall timeout — seconds *without a new token* (a request that keeps producing never times out) |
 | `--reasoning-budget N` | `-1` | Thinking token budget (`-1` = unlimited, `0` = no thinking) |
 | `--no-vision` | off | Disable vision encoder even if model supports it |
 | `--pld` / `--no-pld` | on | Prompt Lookup Decoding (model-agnostic spec-decode) |
@@ -262,13 +266,18 @@ Requires `APPLE_DEVELOPER_ID` and `APPLE_TEAM_ID` environment variables for code
 | `--pld-key-len N` | `3` | N-gram match key length for PLD |
 | `--drafter DIR` | none | Gemma 4 assistant drafter checkpoint (e.g. `gemma-4-E4B-it-assistant-bf16`) |
 | `--draft-block-size N` | `4` | Drafts per round for the Gemma 4 drafter |
+| `--no-mtp` | on when sidecar present | Disable the Qwen native MTP head |
+| `--mtp-depth N` | `3` | Max tokens drafted per MTP round (adaptive controller tunes within `[1, N]`) |
 | `--kv-quant {off,4,8,turbo2,turbo4}` | off | KV-cache quantization scheme (MLX path) |
 | `--llama-kv-quant {off,q8,q4}` | off | KV-cache quantization for GGUF (llama.cpp path) |
-| `--llama-cache-entries N` | `1` | Multi-session LRU for llama.cpp (warm multi-doc agents) |
+| `--llama-cache-entries N` | `4` | Multi-session LRU for llama.cpp (warm multi-doc agents) |
 | `--tokenize-cache-entries N` | `4` | Chat-template + tokenize cache size |
 | `--max-concurrent N` | `1` | Continuous-batch decode parallelism |
 | `--prefix-cache-entries N` | auto | Shared-prefix KV cache entry cap |
 | `--prefix-cache-mem N{KB,MB,GB}` | `2 GB` | Shared-prefix KV cache memory cap |
+| `--prefix-cache-disk N{MB,GB}` | off | SSD tier: prefixes survive restarts (11K-token restart TTFT 5.9 s → 0.7 s) |
+| `--metrics` | off | Prometheus `/metrics` + live dashboard panel on `/` |
+| `--api-key KEY` | none | Require a key for non-localhost requests (localhost stays open) |
 | `--model-dir PATH` | none | Discover and serve every model in a folder (LRU resident set) |
 | `--log-level` | `info` | Log level (error, warn, info, debug) |
 
@@ -367,7 +376,8 @@ The defaults are already the fast path — **if you have plenty of RAM, the fast
 | **Sampling** (`temperature` / `top_p` / `top_k`) | model defaults | Full sampling costs **~6% decode** vs greedy (`temperature: 0`) — a per-token top-k/top-p pass over a 262K vocab isn't free. | Use temp 0 for benchmarks and deterministic runs; keep sampling for chat quality. |
 | **Continuous batching** (`--max-concurrent`) | 1 | ~1.6× *total* throughput at 4-way on dense models, at some per-request latency cost. | …several clients share the server. |
 | **Prefix cache** (`--prefix-cache-entries/-mem`, SSD tier opt-in) | on | Warm TTFT: repeated system prompts / multi-turn chats skip re-prefill (an 11K-token restart TTFT drops 5.9 s → 0.7 s with the SSD tier). | Leave on. Cap entries on RAM-tight Macs (the app does this automatically). |
-| **Drafter / native MTP** (`--drafter`, `mtp/` sidecar) | opt-in | Up to **+47%** (Gemma 4 dense) / **1.8×** (Qwen 3.6 MTP checkpoints) on code-edit loops. | …you run those model families a lot — see [Speculative Decoding](#speculative-decoding). |
+| **Native MTP** (auto when the checkpoint ships an MTP sidecar) | on | **+25%** code, **+15–26%** coding-agent loops (Qwen 3.6, depth-3 drafting with a self-tuning controller). | Leave on. `--no-mtp` for benchmarks; per-request `enable_mtp` opts MoE trunks in. |
+| **Drafter** (`--drafter`) | opt-in | Up to **+47%** (Gemma 4 dense) on code-edit loops. | …you run Gemma 4 a lot — see [Speculative Decoding](#speculative-decoding). |
 
 Building from source? **Always `zig build -Doptimize=ReleaseFast`** — a bare `zig build` produces a Debug binary that's 2–4× slower and looks like a regression.
 
@@ -379,8 +389,9 @@ Building from source? **Always `zig build -Doptimize=ReleaseFast`** — a bare `
 
 ## Speculative Decoding
 
-Two flavors, both greedy-equivalent (byte-identical at temp=0 within the first 30 tokens; mathematically exact at temp > 0 via the Leviathan probability-ratio sampler):
+Three flavors, all greedy-equivalent (byte-identical at temp=0 within the first 30 tokens; mathematically exact at temp > 0 via the Leviathan probability-ratio sampler):
 
+- **Native MTP** (Qwen 3.5/3.6) — checkpoints with a trained multi-token-prediction sidecar draft with the model's *own* head: 3 tokens per round by default, a windowed controller that self-tunes depth per request, and MoE sidecars (35B-A3B) supported. Auto-loads, zero setup. Measured against [MTPLX](https://github.com/youssofal/MTPLX) (the reference MTP runtime) on identical prompts: faster decode at all 8 ladder contexts, 0.5K–64K (+11–27%).
 - **PLD** (Prompt Lookup Decoding) — model-agnostic n-gram match in `prompt + generated_tokens`. Default-on (`--pld`); zero per-model setup. Wins on agentic loops, RAG, code editing, anywhere the answer echoes prompt content.
 - **Gemma 4 assistant drafter** — Google's small 4-layer cross-attention drafters (`gemma-4-{E2B,E4B,26B-A4B,31B}-it-assistant-bf16`). Opt-in via `--drafter <dir>`. The drafter cross-attends into the target's KV cache — no separate weights duplicated.
 
@@ -413,7 +424,6 @@ Reproduce with **`./tests/bench.sh --family gemma`** (mlx-serve only — emits p
 | Qwen 3.6 27B | **+60%** | +24% | +32% |
 | Qwen 3.6 35B-A3B-MoE | **+88%** | +20% | +25% |
 
-![Gemma 4](docs/perf-vs-lmstudio-gemma-26.5.6.png)
 ![Qwen 3.6](docs/perf-vs-lmstudio-qwen36-26.5.6.png)
 
 Reproduce: `./tests/bench.sh --family gemma --lmstudio --omlx` (or `qwen36`). Requires `lms`, `jq`, `python3`, `matplotlib`; `--omlx` requires `omlx` on PATH.
@@ -444,6 +454,9 @@ Yes, on 96 GB+ Apple Silicon Macs. Open the MLX Core Model Browser, pick DeepSee
 ### What models are supported?
 Native MLX dispatch for Gemma 3/4, Qwen 3 / 3.5 / 3.6 / 3-Next, Llama 3.x, Mistral, Nemotron-H, LFM2.5, and DeepSeek V4 Flash. Anything else as GGUF via embedded llama.cpp — Qwen, Llama, Mistral, Gemma, DeepSeek, Phi, Yi, and thousands more available on HuggingFace.
 
+### How does it compare to MTPLX for Qwen MTP models?
+[MTPLX](https://github.com/youssofal/MTPLX) is a focused Python runtime built around Qwen's native multi-token-prediction heads, and it set the bar here. mlx-serve loads the same MTP sidecar artifacts (including MTPLX-published ones) with zero setup and, in a same-machine head-to-head on identical prompts and sampling, decodes faster at all 8 ladder contexts from 0.5K to 64K (+11–27%) with prefill ahead at 6 of 8. You also get the rest of the stack — OpenAI/Anthropic/Ollama APIs, GGUF, the agent app — in one binary with no Python.
+
 ### Does it support tools / function calling?
 Yes, on both API surfaces. The server detects tool-call patterns across architectures (Hermes XML, Gemma 4 `<|tool_call>`, raw JSON, ChatML), repairs common Qwen 3.5/3.6 escape quirks, and emits OpenAI-style `tool_calls` deltas in the SSE stream. The MLX Core app ships 10 built-in tools (shell, file I/O, search, browse, web search, memory) and connects to MCP servers from a curated marketplace.
 
@@ -469,6 +482,7 @@ mlx-serve stands on a lot of open-source shoulders. Huge thanks to all of these 
 - [**mlx-lm**](https://github.com/ml-explore/mlx-lm) (Apple) — the reference Python implementation we cross-check against on every release. Many architecture quirks were nailed down by reading mlx-lm side-by-side.
 - [**llama.cpp**](https://github.com/ggerganov/llama.cpp) — embedded as `libllama` for the GGUF inference path. Also vendored under `lib/jinja_cpp/` for the C++17 Jinja2 chat-template engine plus the bundled [**nlohmann/json**](https://github.com/nlohmann/json) header.
 - [**antirez/ds4**](https://github.com/antirez/ds4) — the embedded engine that serves DeepSeek-V4-Flash via GGUF. Vendored under `lib/ds4/` pinned at commit `477c0e8`; native Metal kernels, official-logits-validated. Salvatore did the hard part.
+- [**MTPLX**](https://github.com/youssofal/MTPLX) (Youssofal) — the runtime that proved Qwen's native multi-token-prediction heads were being left on the table on Apple Silicon. mlx-serve loads MTPLX-published MTP sidecar artifacts unmodified (27B and 35B-A3B), and their prefill-ladder benchmark is the bar our MTP numbers are measured against — the head-to-head made both projects faster.
 
 ### Model architectures + tokenizers
 
