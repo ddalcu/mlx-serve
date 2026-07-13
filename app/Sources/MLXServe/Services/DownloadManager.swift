@@ -185,6 +185,15 @@ class DownloadManager: ObservableObject {
         start(repoId: Self.nsfwClassifierRepo) {}
     }
 
+    /// Repos the app auto-provisions for its own internal use (a "vit"
+    /// architecture the model picker already flags red as "Unsupported",
+    /// since it isn't a chat model) — never something the user chose to
+    /// download, so `discoverLocalModels` drops them before anything renders.
+    /// Matched by `LocalModel.name`, which for the standard nested layout
+    /// (`<root>/<org>/<repo>`) is exactly the `org/repo` string these repoIds
+    /// already are.
+    nonisolated static let internalHelperRepos: Set<String> = [nsfwClassifierRepo]
+
     /// User-configurable extra discovery root. Persisted in UserDefaults under
     /// `customModelPath` so it survives app restarts. The raw stored value is
     /// kept verbatim (we don't erase a broken path) so the user can see and
@@ -1000,7 +1009,9 @@ class DownloadManager: ObservableObject {
             }
         }
 
-        return out.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+        return out
+            .filter { !Self.internalHelperRepos.contains($0.name) }
+            .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
     }
 
     /// `model_type` values that identify a Gemma 4 assistant drafter

@@ -39,20 +39,21 @@ final class ModelBrowserSectionTests: XCTestCase {
 
     // MARK: - Badges
 
-    private func counts(myModels: Int = 0, active: Int = 0, drafters: Int = 0) -> ModelBrowserBadgeCounts {
-        ModelBrowserBadgeCounts(myModels: myModels, activeDownloads: active, draftersReady: drafters)
+    private func counts(myModels: Int = 0, active: Int = 0, drafters: Int = 0, media: Int = 0) -> ModelBrowserBadgeCounts {
+        ModelBrowserBadgeCounts(myModels: myModels, activeDownloads: active, draftersReady: drafters, mediaReady: media)
     }
 
     func testDiscoverNeverCarriesABadge() {
-        let c = counts(myModels: 9, active: 3, drafters: 2)
+        let c = counts(myModels: 9, active: 3, drafters: 2, media: 4)
         XCTAssertNil(c.badge(for: .discover))
     }
 
     func testBadgesShowTheirCount() {
-        let c = counts(myModels: 3, active: 1, drafters: 2)
+        let c = counts(myModels: 3, active: 1, drafters: 2, media: 4)
         XCTAssertEqual(c.badge(for: .myModels), "3")
         XCTAssertEqual(c.badge(for: .downloads), "1")
         XCTAssertEqual(c.badge(for: .drafters), "2")
+        XCTAssertEqual(c.badge(for: .media), "4")
     }
 
     func testZeroCountsHideTheBadgeEntirely() {
@@ -60,6 +61,7 @@ final class ModelBrowserSectionTests: XCTestCase {
         XCTAssertNil(c.badge(for: .myModels))
         XCTAssertNil(c.badge(for: .downloads))
         XCTAssertNil(c.badge(for: .drafters))
+        XCTAssertNil(c.badge(for: .media))
     }
 
     /// An in-flight download must be visible from Discover — that's the whole

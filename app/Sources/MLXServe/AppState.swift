@@ -37,7 +37,12 @@ class AppState: ObservableObject {
                     let id = (selectedModelPath as NSString).lastPathComponent
                     let drafterPath: String? = downloads.recommendedDrafterFromPath(selectedModelPath)?.url.path
                     let mgr = server
-                    Task { @MainActor in
+                    // Tracked so `useModelAndAwaitReady` can await this exact
+                    // switch — hot-switch never moves `server.status` off
+                    // `.running` (the process itself never restarts), so
+                    // polling status alone can't tell "old model still
+                    // resident" from "new model resident".
+                    pendingModelLoadTask = Task { @MainActor in
                         do {
                             _ = try await mgr.loadModel(id: id, drafterPath: drafterPath)
                         } catch {
@@ -51,12 +56,18 @@ class AppState: ObservableObject {
                         }
                     }
                 } else {
+                    pendingModelLoadTask = nil
                     server.stop()
                     server.start(modelPath: selectedModelPath, options: serverOptions)
                 }
+            } else {
+                pendingModelLoadTask = nil
             }
         }
     }
+    /// Set only while a hot-switch triggered by `selectedModelPath`'s `didSet`
+    /// is in flight — see `useModelAndAwaitReady`.
+    private var pendingModelLoadTask: Task<Void, Never>?
     /// Plan 05 Phase G — when true, model picker changes call /v1/load-model
     /// on the running server instead of restarting. Falls back to restart on
     /// failure. Defaults off so existing behavior is unchanged for users who
@@ -145,6 +156,13 @@ class AppState: ObservableObject {
     /// window open — same bridge as the task-notification deep-link) and opens
     /// the chat window. An Int tick so every bump fires onChange, no reset dance.
     @Published var quickLauncherChatOpenTick = 0
+
+    /// Bumped by the welcome window's "Browse Models" nudge (shown when no
+    /// chat model is downloaded yet) — the welcome window is a bare
+    /// `NSHostingView` outside the SwiftUI Scene graph, so it can't reach
+    /// `openWindow` itself. Same always-present-menu-bar-label bridge as
+    /// `quickLauncherChatOpenTick`.
+    @Published var pendingModelBrowserOpenTick = 0
 
     /// Owns the global hotkey + floating panel. App-level like the voice
     /// controller so it works with every window closed.
@@ -237,8 +255,12 @@ class AppState: ObservableObject {
 
         // Show the welcome window on every launch — it's the app's intro /
         // quick-start screen and hosts the CLI install button.
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
-            Self.showWelcomeWindow { Self._welcomeWindow?.close() }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
+            Self.showWelcomeWindow(
+                hasChatModels: self?.localModels.contains(where: \.isChatPickable) ?? true,
+                onDismiss: { Self._welcomeWindow?.close() },
+                onOpenModelBrowser: { self?.pendingModelBrowserOpenTick += 1 }
+            )
         }
 
         // Auto-start server if enabled and a model is available
@@ -273,6 +295,55 @@ class AppState: ObservableObject {
         if baseModels.first(where: { $0.path == selectedModelPath }) == nil,
            let first = baseModels.first {
             selectedModelPath = first.path
+        }
+    }
+
+    /// What `useModelAndAwaitReady` must do once `selectedModelPath`'s
+    /// `didSet` has run, given the server's status BEFORE that assignment.
+    /// Pure so the branch is unit-tested without a real `ServerManager`.
+    enum UseModelStartAction: Equatable {
+        /// `didSet` only reacts to `.running`/`.starting` — nothing was
+        /// kicked off, so the caller must start the server itself.
+        case startExplicitly
+        /// `didSet` already kicked off a hot-switch or restart as a
+        /// fire-and-forget task — the caller just waits for it.
+        case awaitPendingSwitch
+    }
+
+    nonisolated static func useModelStartAction(forStatusBefore status: ServerStatus) -> UseModelStartAction {
+        switch status {
+        case .stopped, .error: return .startExplicitly
+        case .running, .starting: return .awaitPendingSwitch
+        }
+    }
+
+    /// Backs the Model Browser's "Use" button: select `path`, make the server
+    /// actually serve it (starting it if stopped, hot-switching/restarting if
+    /// already running — same logic `selectedModelPath`'s `didSet` always
+    /// ran, just now awaitable), and return once it's ready. The caller opens
+    /// the Chat window on `true` — a click should end in a ready-to-chat
+    /// server, not just a selection the user then has to start by hand.
+    /// Returns `false` on failure/timeout (mirrors the existing tray/gen-pane
+    /// "start and wait" error handling — the caller just skips opening chat;
+    /// `server.status` already surfaces the failure elsewhere).
+    @MainActor
+    @discardableResult
+    func useModelAndAwaitReady(atPath path: String) async -> Bool {
+        let statusBefore = server.status
+        selectedModelPath = path
+        switch Self.useModelStartAction(forStatusBefore: statusBefore) {
+        case .startExplicitly:
+            server.start(modelPath: path, options: serverOptions)
+        case .awaitPendingSwitch:
+            // Wait before checking `waitUntilRunning` below (a no-op if the
+            // hot-switch left status at `.running` the whole time).
+            await pendingModelLoadTask?.value
+        }
+        do {
+            try await server.waitUntilRunning(timeout: 240)
+            return true
+        } catch {
+            return false
         }
     }
 
@@ -404,8 +475,12 @@ class AppState: ObservableObject {
 
     // MARK: - Welcome Window
 
-    private static func showWelcomeWindow(onDismiss: @escaping () -> Void) {
-        let view = WelcomeView(onDismiss: onDismiss)
+    private static func showWelcomeWindow(
+        hasChatModels: Bool,
+        onDismiss: @escaping () -> Void,
+        onOpenModelBrowser: @escaping () -> Void
+    ) {
+        let view = WelcomeView(onDismiss: onDismiss, hasChatModels: hasChatModels, onOpenModelBrowser: onOpenModelBrowser)
         let hostingView = NSHostingView(rootView: view)
 
         // Let SwiftUI compute the intrinsic size

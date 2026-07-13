@@ -182,15 +182,23 @@ struct HFModel: Identifiable, Codable {
 
     /// Whether this repo is a Gemma 4 assistant drafter checkpoint. Drafters
     /// pair with a base Gemma 4 model via `--drafter <dir>`; loading one as a
-    /// target on its own would fail. Case-sensitive on the size designator
-    /// since that's how `mlx-community` publishes them today (`E2B`, `E4B`,
-    /// `26B-A4B`, `31B`).
-    var isDrafter: Bool { Self.drafterRepoRegex.firstMatch(in: id, range: NSRange(id.startIndex..., in: id)) != nil }
-
-    private static let drafterRepoRegex: NSRegularExpression = {
-        let pattern = #"^mlx-community/gemma-4-(E2B|E4B|26B-A4B|31B)-it-assistant-bf16$"#
-        return try! NSRegularExpression(pattern: pattern)
-    }()
+    /// target on its own would fail, and they already have a dedicated home
+    /// (the Drafters tab), so Discover hides them entirely.
+    ///
+    /// Search-result metadata carries no `model_type`, so this is name-based:
+    /// any Gemma 4 repo whose name carries "assistant" as its own
+    /// hyphen-delimited token. Drafters ship under more than one author
+    /// (`mlx-community` for the community bf16/qat/quant builds, `google` for
+    /// the official 12B upload) and in many quant/qat permutations
+    /// (`-assistant-bf16`, `-qat-assistant-4bit`, `-qat-assistant-mxfp8`, …),
+    /// so this checks the NAME SHAPE rather than a fixed list of exact
+    /// strings — the previous regex only matched the original bf16-only,
+    /// four-size-only naming and missed every qat/quant/12B variant
+    /// mlx-community has since published.
+    var isDrafter: Bool {
+        let tokens = modelName.lowercased().split(separator: "-").map(String.init)
+        return tokens.contains("gemma") && tokens.contains("4") && tokens.contains("assistant")
+    }
 
     var author: String {
         id.split(separator: "/").first.map(String.init) ?? ""

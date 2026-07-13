@@ -12,6 +12,11 @@ import Foundation
 /// Naming rule: nothing here is called "Downloaded". `myModels` is what you
 /// have, `downloads` is what is transferring right now.
 enum ModelBrowserSection: String, CaseIterable, Identifiable, Hashable {
+    /// Every curated Gemma 4 / Qwen 3.5-3.6 checkpoint, grouped by family and
+    /// explained in plain English — the friendly front door for someone who
+    /// has never picked a local model before. Lands first; Discover is the
+    /// power-user HuggingFace search.
+    case recommended
     /// Search HuggingFace. On-disk models stay listed here, marked, never hidden.
     case discover
     /// Everything on this Mac that the tray picker can offer, grouped by source.
@@ -20,24 +25,30 @@ enum ModelBrowserSection: String, CaseIterable, Identifiable, Hashable {
     case downloads
     /// The curated Gemma 4 assistant-drafter catalog.
     case drafters
+    /// Media-gen model catalog (image/audio/video/music), grouped by modality.
+    case media
 
     var id: String { rawValue }
 
     var title: String {
         switch self {
-        case .discover:  return "Discover"
-        case .myModels:  return "My Models"
-        case .downloads: return "Downloads"
-        case .drafters:  return "Drafters"
+        case .recommended: return "Recommended"
+        case .discover:     return "Discover"
+        case .myModels:     return "My Models"
+        case .downloads:    return "Downloads"
+        case .drafters:     return "Drafters"
+        case .media:        return "Media"
         }
     }
 
     var systemImage: String {
         switch self {
-        case .discover:  return "magnifyingglass"
-        case .myModels:  return "internaldrive"
-        case .downloads: return "arrow.down.circle"
-        case .drafters:  return "sparkles"
+        case .recommended: return "star"
+        case .discover:     return "magnifyingglass"
+        case .myModels:     return "internaldrive"
+        case .downloads:    return "arrow.down.circle"
+        case .drafters:     return "sparkles"
+        case .media:        return "photo.on.rectangle.angled"
         }
     }
 
@@ -66,14 +77,18 @@ struct ModelBrowserBadgeCounts: Equatable {
     /// what the Downloads pane lists.
     let activeDownloads: Int
     let draftersReady: Int
+    /// Media (image/audio/video/music) bundles fully on disk.
+    let mediaReady: Int
 
     func badge(for section: ModelBrowserSection) -> String? {
         let n: Int
         switch section {
-        case .discover:  return nil
-        case .myModels:  n = myModels
-        case .downloads: n = activeDownloads
-        case .drafters:  n = draftersReady
+        case .recommended: return nil
+        case .discover:     return nil
+        case .myModels:     n = myModels
+        case .downloads:    n = activeDownloads
+        case .drafters:     n = draftersReady
+        case .media:        n = mediaReady
         }
         return n > 0 ? "\(n)" : nil
     }

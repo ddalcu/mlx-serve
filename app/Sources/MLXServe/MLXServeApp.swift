@@ -132,6 +132,11 @@ struct MLXCoreApp: App {
                 .onChange(of: appState.quickLauncherChatOpenTick) { _, _ in
                     openAndFocus("chat")
                 }
+                // Welcome window's "Browse Models" nudge: same bridge — it's a
+                // bare NSHostingView outside the Scene graph.
+                .onChange(of: appState.pendingModelBrowserOpenTick) { _, _ in
+                    openAndFocus("modelBrowser")
+                }
         }
         .menuBarExtraStyle(.window)
 

@@ -40,11 +40,8 @@ struct ResolutionOption: Hashable, Identifiable {
 // MARK: - Image presets
 
 /// mflux variant — picks the model class and `ModelConfig` factory the
-/// Python script will use. Both run on MLX with native 4/8-bit
-/// quantization; `flux2Klein` is newer and smaller (4B params) than the
-/// 12B FLUX.1 transformer.
+/// Python script will use. Both run on MLX with native 4/8-bit quantization.
 enum FluxVariant: String, Hashable, Codable {
-    case flux1            // FLUX.1 schnell / dev — uses Flux1 class
     case flux2Klein4B     // FLUX.2-klein 4B params — uses Flux2Klein, ModelConfig.flux2_klein_4b()
     case flux2Klein9B     // FLUX.2-klein 9B params — uses Flux2Klein, ModelConfig.flux2_klein_9b()
     case krea2Turbo       // Krea-2-Turbo single-stream MMDiT — served by the krea image backend
@@ -74,6 +71,8 @@ struct ImageModelPreset: Identifiable, Hashable {
     let defaultResolution: ResolutionOption
     let qualityProfiles: [QualityPreset: ImageQualitySettings]
     let defaultQuality: QualityPreset
+    /// Plain-English explanation shown under the model in the Media pane.
+    let description: String
 
     static func == (lhs: Self, rhs: Self) -> Bool { lhs.id == rhs.id }
     func hash(into hasher: inout Hasher) { hasher.combine(id) }
@@ -112,87 +111,8 @@ struct ImageModelPreset: Identifiable, Hashable {
             .quality:      .init(steps: 12, guidance: 1.5),
             .superQuality: .init(steps: 20, guidance: 1.5),
         ],
-        defaultQuality: .good
-    )
-
-    /// FLUX.1-schnell 4-bit — Apache 2.0 distilled, 1–4 step inference.
-    static let schnellQ4 = ImageModelPreset(
-        id: "mflux/schnell-q4",
-        name: "FLUX.1-schnell 4-bit (~10 GB)",
-        variant: .flux1,
-        configName: "schnell",
-        repo: "dhairyashil/FLUX.1-schnell-mflux-4bit",
-        approxDownloadGB: 10,
-        approxRAMGB: 8,
-        resolutions: fluxResolutions,
-        defaultResolution: fluxResolutions[0],
-        qualityProfiles: [
-            .fast:         .init(steps: 2,  guidance: 0.0),
-            .good:         .init(steps: 4,  guidance: 0.0),
-            .quality:      .init(steps: 6,  guidance: 0.0),
-            .superQuality: .init(steps: 12, guidance: 0.0),
-        ],
-        defaultQuality: .good
-    )
-
-    /// FLUX.1-dev 4-bit — non-commercial license, higher quality than schnell.
-    static let devQ4 = ImageModelPreset(
-        id: "mflux/dev-q4",
-        name: "FLUX.1-dev 4-bit (~10 GB)",
-        variant: .flux1,
-        configName: "dev",
-        repo: "dhairyashil/FLUX.1-dev-mflux-4bit",
-        approxDownloadGB: 10,
-        approxRAMGB: 12,
-        resolutions: fluxResolutions,
-        defaultResolution: fluxResolutions[0],
-        qualityProfiles: [
-            .fast:         .init(steps: 14, guidance: 3.0),
-            .good:         .init(steps: 20, guidance: 3.5),
-            .quality:      .init(steps: 28, guidance: 3.5),
-            .superQuality: .init(steps: 50, guidance: 4.5),
-        ],
-        defaultQuality: .quality
-    )
-
-    /// FLUX.1-schnell 8-bit — higher fidelity than Q4.
-    static let schnellQ8 = ImageModelPreset(
-        id: "mflux/schnell-q8",
-        name: "FLUX.1-schnell 8-bit (~18 GB)",
-        variant: .flux1,
-        configName: "schnell",
-        repo: "dhairyashil/FLUX.1-schnell-mflux-8bit",
-        approxDownloadGB: 18,
-        approxRAMGB: 12,
-        resolutions: fluxResolutions,
-        defaultResolution: fluxResolutions[0],
-        qualityProfiles: [
-            .fast:         .init(steps: 2,  guidance: 0.0),
-            .good:         .init(steps: 4,  guidance: 0.0),
-            .quality:      .init(steps: 6,  guidance: 0.0),
-            .superQuality: .init(steps: 12, guidance: 0.0),
-        ],
-        defaultQuality: .good
-    )
-
-    /// FLUX.1-dev 8-bit.
-    static let devQ8 = ImageModelPreset(
-        id: "mflux/dev-q8",
-        name: "FLUX.1-dev 8-bit (~18 GB)",
-        variant: .flux1,
-        configName: "dev",
-        repo: "dhairyashil/FLUX.1-dev-mflux-8bit",
-        approxDownloadGB: 18,
-        approxRAMGB: 16,
-        resolutions: fluxResolutions,
-        defaultResolution: fluxResolutions[0],
-        qualityProfiles: [
-            .fast:         .init(steps: 14, guidance: 3.0),
-            .good:         .init(steps: 20, guidance: 3.5),
-            .quality:      .init(steps: 28, guidance: 3.5),
-            .superQuality: .init(steps: 50, guidance: 4.5),
-        ],
-        defaultQuality: .quality
+        defaultQuality: .good,
+        description: "A fast, lightweight image generator — great for everyday text-to-image and quick edits without a huge download."
     )
 
     // Krea-2-Turbo accepts any multiple of 16 in [256, 2048]; offer a few
@@ -231,13 +151,14 @@ struct ImageModelPreset: Identifiable, Hashable {
             .quality:      .init(steps: 12, guidance: 0.0),
             .superQuality: .init(steps: 16, guidance: 0.0),
         ],
-        defaultQuality: .good
+        defaultQuality: .good,
+        description: "A larger, high-fidelity image model tuned for photorealistic results in just a few steps — best when quality matters more than download size."
     )
 
     /// Catalog ordered cheapest → heaviest. Default (`first`) is FLUX.2-klein
     /// 4B Q4 — smallest download.
     static let all: [ImageModelPreset] = [
-        .flux2Klein4B_Q4, .schnellQ4, .devQ4, .schnellQ8, .devQ8, .krea2Turbo,
+        .flux2Klein4B_Q4, .krea2Turbo,
     ]
 }
 
@@ -279,6 +200,8 @@ struct VideoModelPreset: Identifiable, Hashable {
     let defaultQuality: QualityPreset
     let maxFrames: Int
     let frameOptions: [Int]
+    /// Plain-English explanation shown under the model in the Media pane.
+    let description: String
 
     static func == (lhs: Self, rhs: Self) -> Bool { lhs.id == rhs.id }
     func hash(into hasher: inout Hasher) { hasher.combine(id) }
@@ -339,7 +262,8 @@ struct VideoModelPreset: Identifiable, Hashable {
             ],
             defaultQuality: .good,
             maxFrames: cap,
-            frameOptions: frameLadder(maxFrames: cap)
+            frameOptions: frameLadder(maxFrames: cap),
+            description: "Generates short video clips from a text prompt (and optionally a starting image or audio track), with sound built in. The heaviest model here — it also pulls a Gemma text encoder on first use."
         )
     }()
 
@@ -367,6 +291,8 @@ struct AudioModelPreset: Identifiable, Hashable {
     /// Suggested reference-clip length for good cloning, in seconds. Surfaced
     /// as a hint next to the record button.
     let recommendedRefSeconds: Int
+    /// Plain-English explanation shown under the model in the Media pane.
+    let description: String
 
     static func == (lhs: Self, rhs: Self) -> Bool { lhs.id == rhs.id }
     func hash(into hasher: inout Hasher) { hasher.combine(id) }
@@ -380,7 +306,8 @@ struct AudioModelPreset: Identifiable, Hashable {
         repo: "mlx-community/Qwen3-TTS-12Hz-0.6B-Base-8bit",
         approxDownloadGB: 2.0,
         approxRAMGB: 3,
-        recommendedRefSeconds: 8
+        recommendedRefSeconds: 8,
+        description: "The lightest voice model — quick to generate speech and clone a voice from a short reference clip, with a small memory footprint."
     )
 
     /// Qwen3-TTS 0.6B (Base) bf16 — full-precision fidelity fallback.
@@ -390,7 +317,8 @@ struct AudioModelPreset: Identifiable, Hashable {
         repo: "mlx-community/Qwen3-TTS-12Hz-0.6B-Base-bf16",
         approxDownloadGB: 2.5,
         approxRAMGB: 4,
-        recommendedRefSeconds: 8
+        recommendedRefSeconds: 8,
+        description: "The same small voice model at full precision — slightly more accurate output than the 8-bit build, at a bit more memory."
     )
 
     /// Qwen3-TTS 1.7B (Base) 8-bit — the quality pick: ~30% smaller download
@@ -401,7 +329,8 @@ struct AudioModelPreset: Identifiable, Hashable {
         repo: "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-8bit",
         approxDownloadGB: 3.1,
         approxRAMGB: 5,
-        recommendedRefSeconds: 8
+        recommendedRefSeconds: 8,
+        description: "A larger voice model for more natural, expressive speech — 8-bit keeps the download and memory reasonable."
     )
 
     /// Qwen3-TTS 1.7B (Base) bf16 — highest fidelity here; best for
@@ -412,7 +341,8 @@ struct AudioModelPreset: Identifiable, Hashable {
         repo: "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-bf16",
         approxDownloadGB: 4.5,
         approxRAMGB: 8,
-        recommendedRefSeconds: 8
+        recommendedRefSeconds: 8,
+        description: "The highest-fidelity voice model here, at full precision — best for expressive, long-form narration when you have the RAM to spare."
     )
 
     /// Catalog ordered lightest → heaviest. Default (`first`) is the 8-bit
@@ -485,6 +415,8 @@ struct MusicModelPreset: Identifiable, Hashable {
     let fixedSteps: Int
     /// Whether the checkpoint conditions on lyrics (all ACE-Step 1.5 do).
     let supportsLyrics: Bool
+    /// Plain-English explanation shown under the model in the Media pane.
+    let description: String
 
     static func == (lhs: Self, rhs: Self) -> Bool { lhs.id == rhs.id }
     func hash(into hasher: inout Hasher) { hasher.combine(id) }
@@ -504,7 +436,8 @@ struct MusicModelPreset: Identifiable, Hashable {
         approxRAMGB: 9,
         approxDownloadGB: 6.3,
         fixedSteps: 8,
-        supportsLyrics: true
+        supportsLyrics: true,
+        description: "Generates full songs — instrumental or with sung lyrics — from a style description in just 8 steps. One self-contained download."
     )
 
     /// Catalog. One entry today (the XL Turbo build); grows as more ACE-Step
@@ -755,7 +688,7 @@ extension ImageModelPreset {
     var condWeightCount: Int { variant == .krea2Turbo ? 12 : 3 }
 
     /// Instruction editing (in-context reference conditioning) is a trained
-    /// FLUX.2 capability; FLUX.1 and Krea can only do renoise variations.
+    /// FLUX.2 capability; Krea can only do renoise variations.
     var supportsReferenceEdit: Bool { variant == .flux2Klein4B || variant == .flux2Klein9B }
 }
 

@@ -146,6 +146,32 @@ final class DownloadManagerLayoutTests: XCTestCase {
         XCTAssertEqual(found.first?.url.path, primary)
     }
 
+    // MARK: - Internal helper models (hidden from the Model Browser)
+
+    /// Class guard: the NSFW classifier is an app-internal dependency, not a
+    /// model the user chose — it must be in the exclusion set `discoverLocalModels`
+    /// filters against, or it reappears in My Models (as a confusing red
+    /// "Unsupported" row, since its `vit` architecture isn't a chat model).
+    func testInternalHelperReposExcludesTheNsfwClassifier() {
+        XCTAssertTrue(DownloadManager.internalHelperRepos.contains(DownloadManager.nsfwClassifierRepo))
+    }
+
+    /// Regression guard for the exact filter `discoverLocalModels` applies to
+    /// its scan results: the classifier must never survive it, while a real
+    /// downloaded model passes through untouched.
+    func testInternalHelperFilterHidesOnlyTheClassifier() {
+        let classifier = LocalModel(
+            id: "mlxServe:\(DownloadManager.nsfwClassifierRepo)", name: DownloadManager.nsfwClassifierRepo,
+            path: "/tmp/classifier", sizeFormatted: "1 GB", modelType: "vit", source: .mlxServe, kind: .base
+        )
+        let realModel = LocalModel(
+            id: "mlxServe:mlx-community/gemma-4-e4b-it-4bit", name: "mlx-community/gemma-4-e4b-it-4bit",
+            path: "/tmp/gemma", sizeFormatted: "5 GB", modelType: "gemma4", source: .mlxServe, kind: .base
+        )
+        let filtered = [classifier, realModel].filter { !DownloadManager.internalHelperRepos.contains($0.name) }
+        XCTAssertEqual(filtered.map(\.name), [realModel.name])
+    }
+
     func testGemmaVariantParsing() {
         XCTAssertEqual(DownloadManager.gemmaVariantFor(modelPath: "/m/gemma-4-e4b-it-4bit", isMoE: false), .E4B)
         XCTAssertEqual(DownloadManager.gemmaVariantFor(modelPath: "/m/gemma-4-e2b-it-8bit", isMoE: false), .E2B)

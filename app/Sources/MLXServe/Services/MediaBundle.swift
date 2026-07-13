@@ -49,6 +49,16 @@ struct MediaBundle: Identifiable, Equatable {
     var primaryRepo: String { components.first!.repo }
     var dependencyRepos: [String] { Array(components.dropFirst().map(\.repo)) }
 
+    /// "~15 GB" / "~2.5 GB" — whole numbers at 1 GB+, one decimal below (a
+    /// TTS model rounding to "~0 GB" would be a lie). Shared by
+    /// `BundleDownloadBar` and the Model Browser's Media pane so the two
+    /// surfaces can't drift onto different rounding rules.
+    var approxSizeLabel: String {
+        sizeEstimateGB >= 1
+            ? String(format: "~%.0f GB", sizeEstimateGB)
+            : String(format: "~%.1f GB", sizeEstimateGB)
+    }
+
     static func == (l: MediaBundle, r: MediaBundle) -> Bool { l.id == r.id }
 }
 
@@ -266,3 +276,37 @@ extension MusicModelPreset {
         .music(repo: repo, displayName: name, sizeGB: approxDownloadGB)
     }
 }
+
+// MARK: - Media pane generic surface
+
+/// Common surface every media-gen preset (image/audio/video/music) exposes to
+/// the Model Browser's Media tab, so ONE generic row renders all four
+/// modalities instead of four near-duplicate views. `Model3DModelPreset`
+/// deliberately does NOT conform — the Media tab covers exactly the four
+/// modalities the user asked for; 3D stays its own thing for now.
+protocol MediaModelPreset: Identifiable, Hashable where ID == String {
+    var name: String { get }
+    var bundle: MediaBundle { get }
+    /// Plain-English explanation shown under the model in the Media pane —
+    /// the same idea as `RecommendedModelPick.blurb`.
+    var description: String { get }
+    /// Peak unified-memory footprint, GB — already the full RAM-needed
+    /// figure (not raw weight size), unlike `RecommendedModelPick.sizeGB`,
+    /// so `meetsSystemRequirements` below needs no extra overhead multiplier.
+    var approxRAMGB: Int { get }
+}
+
+extension MediaModelPreset {
+    /// Whether this Mac's physical RAM covers what the model needs. A soft
+    /// signal for the UI (show a warning, never a download/use gate) — same
+    /// "warn, don't block" policy as `RecommendedModelPick.meetsSystemRequirements`
+    /// and `ImageGenView`'s oversized-model alert.
+    func meetsSystemRequirements(physicalMemoryBytes: UInt64) -> Bool {
+        physicalMemoryBytes >= UInt64(approxRAMGB) * 1_073_741_824
+    }
+}
+
+extension ImageModelPreset: MediaModelPreset {}
+extension AudioModelPreset: MediaModelPreset {}
+extension VideoModelPreset: MediaModelPreset {}
+extension MusicModelPreset: MediaModelPreset {}

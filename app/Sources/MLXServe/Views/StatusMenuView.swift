@@ -137,6 +137,16 @@ enum GenExperiment: String, CaseIterable, Identifiable {
     }
 }
 
+/// Whether the tray panel's "no models yet" message should show, in place of
+/// the model picker + Start Server controls. Checked against the
+/// CHAT-PICKABLE subset, not the raw list — a Mac with only media/drafter
+/// downloads has a non-empty `localModels` but nothing the picker can
+/// actually offer, which used to fall through to a broken empty dropdown
+/// instead of this message. Pure so it's unit-tested without SwiftUI.
+func trayHasNoUsableModels(_ localModels: [LocalModel]) -> Bool {
+    !localModels.contains { $0.isChatPickable }
+}
+
 struct StatusMenuView: View {
     @EnvironmentObject var appState: AppState
     @EnvironmentObject var server: ServerManager
@@ -198,22 +208,31 @@ struct StatusMenuView: View {
                         .foregroundStyle(.secondary)
                 }
 
-                if appState.localModels.isEmpty {
-                    Text("No models found. Download one below.")
-                        .font(.caption)
-                        .foregroundStyle(.tertiary)
+                // Hide drafter checkpoints (they pair with a base model via
+                // the Drafter toggle in Settings) and media / non-chat models
+                // (LTX, bert encoders) — not loadable as the server's primary
+                // chat model. The empty-state check below must use THIS
+                // filtered set, not the raw `localModels` — a Mac with only
+                // media/drafter downloads has a non-empty `localModels` but
+                // nothing the picker can actually offer, which used to render
+                // a broken empty dropdown instead of this message.
+                let pickableModels = appState.localModels.filter { $0.isChatPickable }
+
+                if trayHasNoUsableModels(appState.localModels) {
+                    VStack(alignment: .leading, spacing: 4) {
+                        Text("No models yet")
+                            .font(.caption.weight(.medium))
+                        Text("Download a model below to start chatting.")
+                            .font(.caption)
+                            .foregroundStyle(.tertiary)
+                    }
                 } else {
                     // Model picker + Settings shortcut on the same row so the
                     // gear lives where the user picks what to load. Tuning
                     // anything else lives in the Settings window the gear opens.
                     HStack(spacing: 6) {
                         Picker("Model", selection: $appState.selectedModelPath) {
-                            // Hide drafter checkpoints (they pair with a base
-                            // model via the Drafter toggle in Settings) and
-                            // media / non-chat models (LTX, Falconsai NSFW
-                            // classifier, bert encoders) — not loadable as the
-                            // server's primary chat model.
-                            let pickable = appState.localModels.filter { $0.isChatPickable }
+                            let pickable = pickableModels
                             // macOS .menu Pickers key the checkmark by item
                             // TITLE — two same-named rows (one GGUF, one MLX)
                             // both rendered selected. Suffix duplicated names

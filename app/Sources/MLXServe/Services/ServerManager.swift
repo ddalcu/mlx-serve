@@ -578,7 +578,9 @@ class ServerManager: ObservableObject {
     }
 
     /// Poll `status` until the health loop flips it to `.running` (or `.error`).
-    private func waitUntilRunning(timeout: TimeInterval) async throws {
+    /// Internal (not `private`) — `AppState.useModelAndAwaitReady` awaits this
+    /// too, for the Model Browser's "Use" button.
+    func waitUntilRunning(timeout: TimeInterval) async throws {
         let deadline = Date().addingTimeInterval(timeout)
         while Date() < deadline {
             switch status {

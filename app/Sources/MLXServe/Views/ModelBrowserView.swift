@@ -1,6 +1,6 @@
 import SwiftUI
 
-/// Model Browser: a sidebar over four destinations (`ModelBrowserSection`).
+/// Model Browser: a sidebar over six destinations (`ModelBrowserSection`).
 ///
 /// It used to be one pane with a `Toggle("Downloaded")` push-button that swapped
 /// the data source underneath you, and it deleted on-disk models from the search
@@ -13,10 +13,10 @@ struct ModelBrowserView: View {
     @EnvironmentObject var downloads: DownloadManager
     @EnvironmentObject var appState: AppState
 
-    @State private var selection: ModelBrowserSection? = .discover
+    @State private var selection: ModelBrowserSection? = .recommended
     @State private var localFilter = ""
 
-    private var section: ModelBrowserSection { selection ?? .discover }
+    private var section: ModelBrowserSection { selection ?? .recommended }
 
     /// Downloading *or* failed — both belong in the queue and both earn a badge.
     private var activeDownloads: [(repoId: String, state: DownloadManager.DownloadState)] {
@@ -26,11 +26,21 @@ struct ModelBrowserView: View {
             .map { (repoId: $0.key, state: $0.value) }
     }
 
+    /// Media bundles fully on disk, across all four modality catalogs.
+    private var mediaReadyCount: Int {
+        func readyCount<P: MediaModelPreset>(_ presets: [P]) -> Int {
+            presets.filter { downloads.bundleReady($0.bundle) }.count
+        }
+        return readyCount(ImageModelPreset.all) + readyCount(AudioModelPreset.all)
+            + readyCount(VideoModelPreset.all) + readyCount(MusicModelPreset.all)
+    }
+
     private var badges: ModelBrowserBadgeCounts {
         ModelBrowserBadgeCounts(
             myModels: appState.localModels.count,
             activeDownloads: activeDownloads.count,
-            draftersReady: GemmaVariant.allCases.filter { downloads.isReady($0.drafterRepoId) }.count
+            draftersReady: GemmaVariant.allCases.filter { downloads.isReady($0.drafterRepoId) }.count,
+            mediaReady: mediaReadyCount
         )
     }
 
@@ -96,11 +106,267 @@ struct ModelBrowserView: View {
     @ViewBuilder
     private var detail: some View {
         switch section {
-        case .discover:  DiscoverPane()
-        case .myModels:  MyModelsPane(filter: $localFilter)
-        case .downloads: DownloadsPane(items: activeDownloads)
-        case .drafters:  DraftersPane()
+        case .recommended: RecommendedPane()
+        case .discover:     DiscoverPane()
+        case .myModels:     MyModelsPane(filter: $localFilter)
+        case .downloads:    DownloadsPane(items: activeDownloads)
+        case .drafters:     DraftersPane()
+        case .media:        MediaPane()
         }
+    }
+}
+
+// MARK: - Recommended
+
+/// Every curated Gemma 4 / Qwen 3.5-3.6 checkpoint, grouped by family and
+/// explained in plain English. This is the friendly front door for someone
+/// who has never picked a local model before — Discover's HuggingFace search
+/// (with its 1M+ repos, quant/pull-count columns, and RAM-fitness dots)
+/// assumes you already know roughly what you're looking for.
+private struct RecommendedPane: View {
+    private var physicalMemory: UInt64 { ProcessInfo.processInfo.physicalMemory }
+    private var ramLabel: String { MemoryInfo.format(Int64(physicalMemory)) }
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 20) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Your Mac has \(ramLabel) of memory")
+                        .font(.title3.weight(.semibold))
+                    Text("Here are the recommended models for you to download.")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                }
+                .padding(.top, 4)
+
+                ModelGroupSection(
+                    title: "Gemma 4",
+                    subtitle: "Google's Gemma 4 family.",
+                    systemImage: "g.circle",
+                    tint: .blue
+                ) {
+                    RecommendedFamilyRows(picks: RecommendedModelPick.gemmaCatalog, physicalMemoryBytes: physicalMemory)
+                }
+
+                ModelGroupSection(
+                    title: "Qwen",
+                    subtitle: "Alibaba's Qwen 3.5/3.6 family — the larger checkpoints ship a native speed boost.",
+                    systemImage: "q.circle",
+                    tint: .teal
+                ) {
+                    RecommendedFamilyRows(picks: RecommendedModelPick.qwenCatalog, physicalMemoryBytes: physicalMemory)
+                }
+            }
+            .padding(16)
+        }
+        .navigationTitle("Recommended")
+    }
+}
+
+/// A family's rows, split into what this Mac's RAM covers and what it
+/// doesn't. The first group renders inline; the second sits behind a
+/// collapsed "Requires more RAM" disclosure — nothing is ever dropped from
+/// the list, it's just deferred until the user asks to see it, rather than
+/// cluttering the default view (or, as an earlier iteration did, rendering
+/// inline at reduced opacity).
+private struct RecommendedFamilyRows: View {
+    let picks: [RecommendedModelPick]
+    let physicalMemoryBytes: UInt64
+    @State private var showsRequiresMoreRAM = false
+
+    var body: some View {
+        let split = picks.partitionedByRequirements(physicalMemoryBytes: physicalMemoryBytes)
+
+        ForEach(split.fits) { pick in
+            RecommendedModelListRow(pick: pick, physicalMemoryBytes: physicalMemoryBytes)
+            Divider().padding(.horizontal, 12)
+        }
+
+        if !split.requiresMoreRAM.isEmpty {
+            Button {
+                withAnimation { showsRequiresMoreRAM.toggle() }
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: showsRequiresMoreRAM ? "chevron.down" : "chevron.right")
+                        .font(.caption2.weight(.semibold))
+                    Text("Requires more RAM (\(split.requiresMoreRAM.count))")
+                        .font(.caption.weight(.medium))
+                    Spacer()
+                }
+                .foregroundStyle(.secondary)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            Divider().padding(.horizontal, 12)
+
+            if showsRequiresMoreRAM {
+                ForEach(split.requiresMoreRAM) { pick in
+                    RecommendedModelListRow(pick: pick, physicalMemoryBytes: physicalMemoryBytes)
+                    Divider().padding(.horizontal, 12)
+                }
+            }
+        }
+    }
+}
+
+/// One list row for a chat-model recommendation: name, tagline, a plain-
+/// English description underneath, capability chips, and the Download/Use
+/// action — the list-style analogue of the Media pane's `MediaModelRow`, with
+/// the richer copy this pane needs.
+private struct RecommendedModelListRow: View {
+    let pick: RecommendedModelPick
+    let physicalMemoryBytes: UInt64
+
+    @EnvironmentObject var downloads: DownloadManager
+    @EnvironmentObject var appState: AppState
+    @EnvironmentObject var server: ServerManager
+    @State private var confirmDelete = false
+
+    private var isReady: Bool { downloads.isReady(pick.repoId) }
+    private var state: DownloadManager.DownloadState? { downloads.downloads[pick.repoId] }
+
+    /// Soft signal only — sorts the pick behind the family's "Requires more
+    /// RAM" disclosure and explains why there. Never blocks downloading or
+    /// using it (same "warn, don't gate" policy as Discover's RAM-fitness dot
+    /// and ImageGenView's oversized-model alert).
+    private var meetsRequirements: Bool {
+        pick.meetsSystemRequirements(physicalMemoryBytes: physicalMemoryBytes)
+    }
+
+    /// The on-disk model this row's repo resolves to, once downloaded —
+    /// mirrors `ModelBrowserRow.usableModel`.
+    private var usableModel: LocalModel? {
+        ModelBrowserUse.pickableModel(
+            atPath: downloads.existingModelDir(for: pick.repoId),
+            in: appState.localModels
+        )
+    }
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 12) {
+            VStack(alignment: .leading, spacing: 3) {
+                HStack(spacing: 6) {
+                    Text(pick.name)
+                        .font(.callout.weight(.medium))
+                    Text(pick.tagline)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                Text(pick.blurb)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                HStack(spacing: 6) {
+                    ForEach(pick.highlights, id: \.self) { chip in
+                        Text(chip)
+                            .font(.system(size: 9).weight(.medium))
+                            .padding(.horizontal, 5)
+                            .padding(.vertical, 2)
+                            .background(.quaternary, in: Capsule())
+                    }
+                }
+
+                if !meetsRequirements {
+                    Label(
+                        "Needs about \(String(format: "%.0f", pick.approxRAMNeededGB)) GB of RAM — your Mac has \(MemoryInfo.format(Int64(physicalMemoryBytes)))",
+                        systemImage: "exclamationmark.triangle"
+                    )
+                    .font(.caption2.weight(.medium))
+                    .foregroundStyle(.orange)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            VStack(alignment: .trailing, spacing: 4) {
+                Text(pick.sizeLabel)
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                actionControl
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+    }
+
+    @ViewBuilder
+    private var actionControl: some View {
+        if isReady {
+            HStack(spacing: 6) {
+                if let usable = usableModel {
+                    let use = ModelUseState.resolve(
+                        selected: appState.selectedModelPath == usable.path,
+                        serverStatus: server.status
+                    )
+                    if use == .idle {
+                        UseModelButton(path: usable.path, name: usable.name)
+                    } else {
+                        ModelUseBadge(state: use)
+                    }
+                } else {
+                    Text("✓ On disk")
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(.green)
+                }
+                Button {
+                    confirmDelete = true
+                } label: {
+                    Image(systemName: "trash")
+                        .foregroundStyle(.red.opacity(0.7))
+                }
+                .buttonStyle(.plain)
+                .help("Delete model")
+                .alert("Delete Model", isPresented: $confirmDelete) {
+                    Button("Cancel", role: .cancel) {}
+                    Button("Delete", role: .destructive) {
+                        downloads.deleteModel(repoId: pick.repoId)
+                        appState.refreshModels()
+                    }
+                } message: {
+                    Text("Delete \(pick.name)? This will remove all downloaded files.")
+                }
+            }
+        } else if let state, state.status == .downloading {
+            HStack(spacing: 6) {
+                VStack(alignment: .trailing, spacing: 1) {
+                    ProgressView(value: state.fileProgress)
+                        .frame(width: 70)
+                    Text("\(state.percentFormatted) \(state.speedFormatted)")
+                        .font(.system(size: 9).monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+                Button {
+                    downloads.cancel(pick.repoId)
+                    appState.refreshModels()
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .help("Cancel download")
+            }
+        } else if let state, state.status == .failed {
+            VStack(alignment: .trailing, spacing: 2) {
+                Button(downloads.hasPartialDownload(pick.repoId) ? "Resume" : "Retry") { startDownload() }
+                    .controlSize(.small)
+                if let error = state.error {
+                    Text(error)
+                        .font(.system(size: 9))
+                        .foregroundStyle(.red)
+                        .lineLimit(1)
+                }
+            }
+        } else {
+            Button(downloads.hasPartialDownload(pick.repoId) ? "Resume" : "Download") { startDownload() }
+                .controlSize(.small)
+        }
+    }
+
+    private func startDownload() {
+        downloads.start(repoId: pick.repoId) { appState.refreshModels() }
     }
 }
 
@@ -385,13 +651,18 @@ private struct DraftersPane: View {
 
     var body: some View {
         VStack(spacing: 0) {
-            HStack(spacing: 8) {
-                Image(systemName: "sparkles")
-                    .foregroundStyle(.purple)
-                Text("Pair a drafter with a Gemma 4 base model for +27–40% on code & agents.")
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 8) {
+                    Image(systemName: "sparkles")
+                        .foregroundStyle(.purple)
+                    Text("What's a drafter?")
+                        .font(.subheadline.weight(.semibold))
+                    Spacer()
+                }
+                Text("A small, fast helper model that runs alongside your main chat model. It guesses several upcoming words at once, and the main model quickly double-checks those guesses — when they're right (which is often), you get the exact same answer, just noticeably faster. It never changes what the model says, only how quickly it says it. This helps most with coding and multi-step agent work (using tools, editing files): +27–40% faster in our tests. A drafter only works alongside the specific Gemma 4 model size it's built for — pick the one matching your chat model below.")
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                Spacer()
+                    .fixedSize(horizontal: false, vertical: true)
             }
             .padding(12)
             .background(Color.purple.opacity(0.06))
@@ -408,6 +679,256 @@ private struct DraftersPane: View {
             }
         }
         .navigationTitle("Drafters")
+    }
+}
+
+// MARK: - Media pane
+
+/// Every media-generation model (image/audio/video/music), grouped by
+/// modality. Its own sidebar destination — there's one catalog per modality
+/// and none of them are large enough to need Discover-style search, so one
+/// scrollable page beats splitting each modality into its own sidebar row.
+private struct MediaPane: View {
+    private var physicalMemory: UInt64 { ProcessInfo.processInfo.physicalMemory }
+
+    var body: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 20) {
+                ModelGroupSection(
+                    title: "Image",
+                    subtitle: "Text-to-image generation and image editing.",
+                    systemImage: "photo",
+                    tint: .pink
+                ) {
+                    ForEach(ImageModelPreset.all) { MediaModelRow(preset: $0, physicalMemoryBytes: physicalMemory) }
+                }
+                ModelGroupSection(
+                    title: "Audio",
+                    subtitle: "Text-to-speech, with optional voice cloning.",
+                    systemImage: "waveform",
+                    tint: .green
+                ) {
+                    ForEach(AudioModelPreset.all) { MediaModelRow(preset: $0, physicalMemoryBytes: physicalMemory) }
+                }
+                ModelGroupSection(
+                    title: "Video",
+                    subtitle: "Text/image-to-video, with optional audio.",
+                    systemImage: "film",
+                    tint: .indigo
+                ) {
+                    ForEach(VideoModelPreset.all) { MediaModelRow(preset: $0, physicalMemoryBytes: physicalMemory) }
+                }
+                ModelGroupSection(
+                    title: "Music",
+                    subtitle: "Text-to-music, with optional lyrics.",
+                    systemImage: "music.note",
+                    tint: .orange
+                ) {
+                    ForEach(MusicModelPreset.all) { MediaModelRow(preset: $0, physicalMemoryBytes: physicalMemory) }
+                }
+            }
+            .padding(16)
+        }
+        .navigationTitle("Media")
+    }
+}
+
+/// One family/modality group's header (icon, name, what it's for) over its
+/// list of rows — shared by the Recommended pane (grouped by model family)
+/// and the Media pane (grouped by modality).
+private struct ModelGroupSection<Content: View>: View {
+    let title: String
+    let subtitle: String
+    let systemImage: String
+    let tint: Color
+    @ViewBuilder let content: Content
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                Image(systemName: systemImage)
+                    .foregroundStyle(tint)
+                    .frame(width: 18)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(title).font(.subheadline.weight(.semibold))
+                    Text(subtitle).font(.caption2).foregroundStyle(.secondary)
+                }
+                Spacer()
+            }
+
+            VStack(spacing: 0) {
+                content
+            }
+            .background(.quaternary.opacity(0.15), in: RoundedRectangle(cornerRadius: 8))
+        }
+    }
+}
+
+/// One row for any media preset (image/audio/video/music) — generic over
+/// `MediaModelPreset` so the four modalities share this instead of four
+/// near-duplicate views. Download/progress/retry mirrors `BundleDownloadBar`;
+/// unlike a chat model there's no "Use" (each gen pane keeps its own sticky
+/// model selection), so the terminal state is just on-disk + Delete.
+private struct MediaModelRow<Preset: MediaModelPreset>: View {
+    let preset: Preset
+    let physicalMemoryBytes: UInt64
+    @EnvironmentObject var downloads: DownloadManager
+    @EnvironmentObject var appState: AppState
+    @State private var confirmDelete = false
+
+    private var bundle: MediaBundle { preset.bundle }
+    private var isReady: Bool { downloads.bundleReady(bundle) }
+    private var active: (repo: String, index: Int, count: Int, state: DownloadManager.DownloadState)? {
+        downloads.activeBundleComponent(bundle)
+    }
+
+    /// Soft signal only — shows a warning, never blocks downloading or using
+    /// it (same "warn, don't gate" policy as the Recommended pane).
+    private var meetsRequirements: Bool {
+        preset.meetsSystemRequirements(physicalMemoryBytes: physicalMemoryBytes)
+    }
+
+    var body: some View {
+        HStack(alignment: .top, spacing: 12) {
+            VStack(alignment: .leading, spacing: 3) {
+                Text(preset.name)
+                    .font(.callout.weight(.medium))
+
+                Text(preset.description)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+
+                if bundle.components.count > 1 {
+                    Text("Includes \(bundle.components.count) models (e.g. a text encoder)")
+                        .font(.caption2)
+                        .foregroundStyle(.tertiary)
+                }
+
+                if !meetsRequirements {
+                    Label(
+                        "Needs about \(preset.approxRAMGB) GB of RAM — your Mac has \(MemoryInfo.format(Int64(physicalMemoryBytes)))",
+                        systemImage: "exclamationmark.triangle"
+                    )
+                    .font(.caption2.weight(.medium))
+                    .foregroundStyle(.orange)
+                }
+
+                if let active, active.state.status == .failed, let error = active.state.error {
+                    Text(error)
+                        .font(.system(size: 9))
+                        .foregroundStyle(.red)
+                        .lineLimit(1)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            VStack(alignment: .trailing, spacing: 4) {
+                Text(bundle.approxSizeLabel)
+                    .font(.caption2)
+                    .foregroundStyle(.tertiary)
+                actionControl
+            }
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+    }
+
+    @ViewBuilder
+    private var actionControl: some View {
+        if isReady {
+            HStack(spacing: 6) {
+                Text("✓ On disk")
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.green)
+                Button {
+                    confirmDelete = true
+                } label: {
+                    Image(systemName: "trash")
+                        .foregroundStyle(.red.opacity(0.7))
+                }
+                .buttonStyle(.plain)
+                .help("Delete model")
+                .alert("Delete Model", isPresented: $confirmDelete) {
+                    Button("Cancel", role: .cancel) {}
+                    Button("Delete", role: .destructive) {
+                        downloads.deleteModel(repoId: bundle.primaryRepo)
+                        appState.refreshModels()
+                    }
+                } message: {
+                    Text("Delete \(preset.name)? This will remove the downloaded files.")
+                }
+            }
+        } else if let active, active.state.status == .downloading {
+            HStack(spacing: 6) {
+                VStack(alignment: .trailing, spacing: 1) {
+                    ProgressView(value: active.state.fileProgress)
+                        .frame(width: 70)
+                    Text("\(active.state.percentFormatted) \(active.state.speedFormatted)")
+                        .font(.system(size: 9).monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+                Button {
+                    downloads.cancelBundle(bundle)
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .foregroundStyle(.secondary)
+                }
+                .buttonStyle(.plain)
+                .help("Cancel download")
+            }
+        } else if active?.state.status == .failed {
+            Button("Retry") { startDownload() }
+                .controlSize(.small)
+        } else {
+            Button("Download") { startDownload() }
+                .controlSize(.small)
+        }
+    }
+
+    private func startDownload() {
+        downloads.startBundle(bundle) { appState.refreshModels() }
+    }
+}
+
+// MARK: - Use button
+
+/// The "Use" control for any Model Browser row (Discover / My Models /
+/// Recommended): selects the model, makes the server actually load it
+/// (starting it if stopped, hot-switching/restarting if already running),
+/// and once it's ready opens the Chat window — a click ends in a
+/// ready-to-chat server, not just a selection the user then has to start
+/// themselves. Shared so the three rows can't drift onto three slightly
+/// different "Use" behaviors.
+private struct UseModelButton: View {
+    let path: String
+    let name: String
+    @EnvironmentObject var appState: AppState
+    @Environment(\.openWindow) private var openWindow
+    @State private var isLoading = false
+
+    var body: some View {
+        Button {
+            Task {
+                isLoading = true
+                let ready = await appState.useModelAndAwaitReady(atPath: path)
+                isLoading = false
+                if ready {
+                    openWindow(id: "chat")
+                }
+            }
+        } label: {
+            if isLoading {
+                ProgressView()
+                    .controlSize(.small)
+                    .frame(width: 30)
+            } else {
+                Text("Use")
+            }
+        }
+        .controlSize(.small)
+        .disabled(isLoading)
+        .help("Load \(name) as the server's model, then open chat")
     }
 }
 
@@ -692,9 +1213,7 @@ private struct ModelBrowserRow: View {
                         serverStatus: server.status
                     )
                     if use == .idle {
-                        Button("Use") { appState.selectedModelPath = usable.path }
-                            .controlSize(.small)
-                            .help("Load \(usable.name) as the server's model")
+                        UseModelButton(path: usable.path, name: usable.name)
                     } else {
                         ModelUseBadge(state: use)
                     }
@@ -897,9 +1416,7 @@ private struct LocalModelRow: View {
             HStack(spacing: 6) {
                 if model.isChatPickable {
                     if useState == .idle {
-                        Button("Use") { appState.selectedModelPath = model.path }
-                            .controlSize(.small)
-                            .help("Load \(model.name) as the server's model")
+                        UseModelButton(path: model.path, name: model.name)
                     } else {
                         ModelUseBadge(state: useState)
                     }

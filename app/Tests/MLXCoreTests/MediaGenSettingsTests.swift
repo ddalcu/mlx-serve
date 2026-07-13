@@ -11,7 +11,7 @@ final class MediaGenSettingsTests: XCTestCase {
 
     func testImageSettingsRoundTrips() throws {
         var s = ImageGenSettings()
-        s.modelId = "mflux/dev-q4"
+        s.modelId = "mflux/flux2-klein-4b-q4"
         s.quality = .superQuality
         s.resolutionId = "1216x832"
         s.steps = 33
@@ -54,14 +54,14 @@ final class MediaGenSettingsTests: XCTestCase {
 
     func testImageResolvesModelById() {
         var s = ImageGenSettings()
-        s.modelId = "mflux/dev-q4"
-        XCTAssertEqual(s.resolvedModel.id, "mflux/dev-q4")
+        s.modelId = "krea/krea-2-turbo-mlx-serve"
+        XCTAssertEqual(s.resolvedModel.id, "krea/krea-2-turbo-mlx-serve")
     }
 
     func testImageResolvesResolutionById() {
         var s = ImageGenSettings()
         s.resolutionId = "1216x832"
-        let m = ImageModelPreset.devQ4
+        let m = ImageModelPreset.flux2Klein4B_Q4
         XCTAssertEqual(s.resolvedResolution(for: m).id, "1216x832")
         XCTAssertEqual(s.resolvedResolution(for: m).width, 1216)
         XCTAssertEqual(s.resolvedResolution(for: m).height, 832)
@@ -92,7 +92,7 @@ final class MediaGenSettingsTests: XCTestCase {
     func testImageUnknownResolutionFallsBackToModelDefault() {
         var s = ImageGenSettings()
         s.resolutionId = "9999x9999"
-        let m = ImageModelPreset.devQ4
+        let m = ImageModelPreset.flux2Klein4B_Q4
         XCTAssertEqual(s.resolvedResolution(for: m).id, m.defaultResolution.id)
     }
 

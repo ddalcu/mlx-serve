@@ -124,8 +124,12 @@ class HFSearchService: ObservableObject {
         }
 
         // Filter out MLX-format DeepSeek-V4 checkpoints — the Zig MLX path
-        // rejects them; users grab the GGUF + ds4 entry from the built-in catalog.
-        let filtered = rawAll.filter { !$0.id.lowercased().contains("deepseek-v4-flash") }
+        // rejects them; users grab the GGUF + ds4 entry from the built-in
+        // catalog. Also filter out Gemma 4 assistant drafters — they aren't
+        // loadable as a chat target on their own, and already have a
+        // dedicated home (the Drafters tab), so showing them in Discover
+        // (e.g. searching "assistant") was just confusing clutter.
+        let filtered = rawAll.filter { !$0.id.lowercased().contains("deepseek-v4-flash") && !$0.isDrafter }
 
         var seen = Set(fetchedModels.map { $0.id })
         for m in filtered where !seen.contains(m.id) {

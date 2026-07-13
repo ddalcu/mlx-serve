@@ -578,9 +578,8 @@ final class MediaGenServiceTests: XCTestCase {
     }
 
     func testSupportsReferenceEditFollowsVariant() {
-        // Editing is a trained FLUX.2 capability; FLUX.1 and Krea don't have it.
+        // Editing is a trained FLUX.2 capability; Krea doesn't have it.
         XCTAssertTrue(ImageModelPreset.flux2Klein4B_Q4.supportsReferenceEdit)
         XCTAssertFalse(ImageModelPreset.krea2Turbo.supportsReferenceEdit)
-        XCTAssertFalse(ImageModelPreset.schnellQ4.supportsReferenceEdit)
     }
 }

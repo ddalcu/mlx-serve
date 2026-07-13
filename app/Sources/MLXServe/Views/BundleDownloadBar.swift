@@ -32,7 +32,7 @@ struct BundleDownloadBar: View {
             Button {
                 downloads.startBundle(bundle) { appState.refreshModels() }
             } label: {
-                Label("Download (~\(sizeText) GB)", systemImage: "arrow.down.circle")
+                Label("Download (\(bundle.approxSizeLabel))", systemImage: "arrow.down.circle")
                     .frame(maxWidth: .infinity)
             }
             .buttonStyle(.borderedProminent)
@@ -71,11 +71,5 @@ struct BundleDownloadBar: View {
             }
             .buttonStyle(.bordered).controlSize(.small)
         }
-    }
-
-    private var sizeText: String {
-        bundle.sizeEstimateGB >= 1
-            ? String(format: "%.0f", bundle.sizeEstimateGB)
-            : String(format: "%.1f", bundle.sizeEstimateGB)
     }
 }

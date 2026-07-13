@@ -781,3 +781,64 @@ final class HFSearchDefaultsTests: XCTestCase {
         XCTAssertEqual(HFSearchService().format, .mlx)
     }
 }
+
+// =============================================================================
+// MARK: - HFModel.isDrafter (Discover hides assistant drafters)
+//
+// Live bug: searching "assistant" in Discover surfaced every Gemma 4
+// assistant-drafter checkpoint (mlx-community's qat/quant/bf16 permutations)
+// even though they already have a dedicated home, the Drafters tab, and
+// aren't loadable as a chat target on their own. The original `isDrafter`
+// regex only matched the ORIGINAL naming (`-it-assistant-bf16`, four exact
+// size tokens, `mlx-community/` only) and missed every `-qat-assistant-*`,
+// non-bf16-quant, and non-mlx-community (e.g. google's official 12B) variant
+// — this pins the broadened, name-shape-based detection against real repo
+// ids pulled from a live search.
+// =============================================================================
+
+final class HFModelIsDrafterTests: XCTestCase {
+    private func hf(id: String) -> HFModel {
+        HFModel(id: id, downloads: 10, likes: 1, lastModified: nil,
+                tags: nil, safetensors: nil, pipelineTag: "text-generation")
+    }
+
+    /// Every drafter shape actually seen in a live "assistant" search —
+    /// the regression list from the screenshot that started this fix.
+    func testRealDrafterVariantsAreAllDetected() {
+        let ids = [
+            "mlx-community/gemma-4-12B-it-qat-assistant-4bit",
+            "mlx-community/gemma-4-26B-A4B-it-assistant-bf16",
+            "mlx-community/gemma-4-31B-it-qat-assistant-bf16",
+            "mlx-community/gemma-4-31B-it-assistant-bf16",
+            "mlx-community/gemma-4-12B-it-assistant-bf16",
+            "mlx-community/gemma-4-26B-A4B-it-qat-assistant-4bit",
+            "mlx-community/gemma-4-E4B-it-assistant-bf16",
+            "mlx-community/gemma-4-12B-it-assistant-4bit",
+            "mlx-community/gemma-4-31B-it-qat-assistant-4bit",
+            "mlx-community/gemma-4-31B-it-qat-assistant-mxfp8",
+            "mlx-community/gemma-4-26B-A4B-it-qat-assistant-bf16",
+            "mlx-community/gemma-4-26B-A4B-it-qat-assistant-mxfp8",
+        ]
+        for id in ids {
+            XCTAssertTrue(hf(id: id).isDrafter, id)
+        }
+    }
+
+    /// Drafters ship under more than one author — the fix must not be
+    /// pinned to `mlx-community/`.
+    func testDrafterDetectionIsNotLimitedToMlxCommunity() {
+        XCTAssertTrue(hf(id: "google/gemma-4-12b-it-assistant-bf16").isDrafter)
+    }
+
+    /// A real Gemma 4 CHAT model — must stay visible in Discover.
+    func testOrdinaryGemma4ChatModelIsNotADrafter() {
+        XCTAssertFalse(hf(id: "mlx-community/gemma-4-e4b-it-4bit").isDrafter)
+        XCTAssertFalse(hf(id: "mlx-community/gemma-4-31b-it-8bit").isDrafter)
+    }
+
+    /// A non-Gemma-4 model must never be caught by the "assistant" token
+    /// alone — the heuristic requires the gemma-4 shape too.
+    func testNonGemma4ModelWithAssistantInNameIsNotADrafter() {
+        XCTAssertFalse(hf(id: "someone/my-assistant-bot-7b").isDrafter)
+    }
+}

@@ -2,6 +2,15 @@ import SwiftUI
 
 struct WelcomeView: View {
     let onDismiss: () -> Void
+    /// False when no downloaded model can serve chat — drives the "you'll
+    /// need a model first" nudge below the feature cards. A one-time snapshot
+    /// taken when the window is shown (this window isn't live-updating), not
+    /// a reactive binding.
+    let hasChatModels: Bool
+    /// Bumps `AppState.pendingModelBrowserOpenTick` — this window is a bare
+    /// `NSHostingView` outside the SwiftUI Scene graph, so it can't call
+    /// `openWindow` itself.
+    let onOpenModelBrowser: () -> Void
 
     @State private var pulseMenu = false
     @State private var appeared = false
@@ -83,6 +92,14 @@ struct WelcomeView: View {
             }
             .padding(.horizontal, 28)
             .padding(.bottom, 16)
+
+            // No downloaded model can serve chat yet — point straight at the
+            // Model Browser instead of leaving the user to discover it.
+            if !hasChatModels {
+                noModelsHint
+                    .padding(.horizontal, 28)
+                    .padding(.bottom, 16)
+            }
 
             // Tray hint
             HStack(spacing: 6) {
@@ -170,6 +187,40 @@ struct WelcomeView: View {
             let probe = await Task.detached { CLIInstaller.probe() }.value
             cliProbe = probe
         }
+    }
+
+    // MARK: - No models yet
+
+    @ViewBuilder private var noModelsHint: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(alignment: .top, spacing: 10) {
+                Image(systemName: "arrow.down.circle")
+                    .font(.system(size: 16))
+                    .foregroundColor(.accentColor)
+                    .frame(width: 24, alignment: .center)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("You'll need a model first")
+                        .font(.subheadline.weight(.semibold))
+                    Text("Nothing is downloaded yet — grab one from the Model Browser before you can start chatting.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            Button {
+                onOpenModelBrowser()
+                onDismiss()
+                NSApp.keyWindow?.close()
+            } label: {
+                Text("Browse Models")
+                    .font(.subheadline.weight(.medium))
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 3)
+            }
+            .buttonStyle(.bordered)
+        }
+        .padding(12)
+        .background(RoundedRectangle(cornerRadius: 8).fill(Color.accentColor.opacity(0.08)))
     }
 
     // MARK: - CLI install row

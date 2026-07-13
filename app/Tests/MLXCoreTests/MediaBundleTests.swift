@@ -260,6 +260,16 @@ final class MediaBundleTests: XCTestCase {
         XCTAssertTrue(Model3DModelPreset.all.contains(.hunyuan3d21_8bit))
     }
 
+    /// Class guard: the image catalog is FLUX.2 + Krea only. FLUX.1
+    /// (schnell/dev) was dropped as a picker option — a future preset must
+    /// not reintroduce the `.flux1` variant tag or a "FLUX.1" name.
+    func testImageCatalogHasNoFlux1Entries() {
+        for p in ImageModelPreset.all {
+            XCTAssertNotEqual(p.variant.rawValue, "flux1", p.id)
+            XCTAssertFalse(p.name.contains("FLUX.1"), p.id)
+        }
+    }
+
     func testKreaPresetIsDistilledTurboDefaults() {
         let p = ImageModelPreset.krea2Turbo
         XCTAssertEqual(p.variant, .krea2Turbo)
@@ -275,5 +285,89 @@ final class MediaBundleTests: XCTestCase {
             XCTAssertEqual(r.height % 16, 0)
             XCTAssertTrue(r.width >= 256 && r.width <= 2048 && r.height >= 256 && r.height <= 2048)
         }
+    }
+
+    // MARK: - approxSizeLabel
+
+    func testApproxSizeLabelRoundsWholeAtOneGBAndAbove() {
+        XCTAssertEqual(ImageModelPreset.flux2Klein4B_Q4.bundle.approxSizeLabel, "~5 GB")
+        XCTAssertEqual(ImageModelPreset.krea2Turbo.bundle.approxSizeLabel, "~15 GB")
+        XCTAssertEqual(AudioModelPreset.qwen3TTS06B8bit.bundle.approxSizeLabel, "~2 GB")
+    }
+
+    /// A model whose bundle rounds to "~0 GB" below 1 GB would read as free —
+    /// keep one decimal under the 1 GB floor. Built directly (no current
+    /// catalog entry is this small) so the assertion can't silently stop
+    /// exercising the branch if the catalog changes.
+    func testApproxSizeLabelKeepsOneDecimalBelowOneGB() {
+        let bundle = MediaBundle.tts(repo: "org/tiny-tts", displayName: "Tiny TTS", sizeGB: 0.4)
+        XCTAssertEqual(bundle.approxSizeLabel, "~0.4 GB")
+    }
+
+    // MARK: - MediaModelPreset (Media tab generic surface)
+
+    /// Every catalog the Media tab renders must be non-empty and free of
+    /// duplicate ids — the tab is a `ForEach` over each catalog keyed by id.
+    func testMediaCatalogsAreNonEmptyWithUniqueIds() {
+        func assertUnique<P: MediaModelPreset>(_ presets: [P], _ label: String) {
+            XCTAssertFalse(presets.isEmpty, label)
+            let ids = presets.map(\.id)
+            XCTAssertEqual(ids.count, Set(ids).count, "\(label) has a duplicate id")
+        }
+        assertUnique(ImageModelPreset.all, "image")
+        assertUnique(AudioModelPreset.all, "audio")
+        assertUnique(VideoModelPreset.all, "video")
+        assertUnique(MusicModelPreset.all, "music")
+    }
+
+    /// Every preset resolves to a real bundle with a primary repo and a
+    /// non-empty size label — the two things the generic Media row renders.
+    func testEveryMediaPresetResolvesADisplayableBundle() {
+        func assertDisplayable<P: MediaModelPreset>(_ presets: [P], _ label: String) {
+            for p in presets {
+                XCTAssertFalse(p.bundle.primaryRepo.isEmpty, "\(label)/\(p.id)")
+                XCTAssertFalse(p.bundle.approxSizeLabel.isEmpty, "\(label)/\(p.id)")
+            }
+        }
+        assertDisplayable(ImageModelPreset.all, "image")
+        assertDisplayable(AudioModelPreset.all, "audio")
+        assertDisplayable(VideoModelPreset.all, "video")
+        assertDisplayable(MusicModelPreset.all, "music")
+    }
+
+    /// Every preset needs a real, non-stub plain-English description — the
+    /// Media pane renders it under the model name, same idea as
+    /// `RecommendedModelPick.blurb`.
+    func testEveryMediaPresetHasNonEmptyDescription() {
+        func assertDescribed<P: MediaModelPreset>(_ presets: [P], _ label: String) {
+            for p in presets {
+                XCTAssertGreaterThan(p.description.count, 20, "\(label)/\(p.id) description reads as a stub")
+            }
+        }
+        assertDescribed(ImageModelPreset.all, "image")
+        assertDescribed(AudioModelPreset.all, "audio")
+        assertDescribed(VideoModelPreset.all, "video")
+        assertDescribed(MusicModelPreset.all, "music")
+    }
+
+    // MARK: - MediaModelPreset.meetsSystemRequirements
+
+    /// `approxRAMGB` is already the full peak-footprint figure (not raw
+    /// weight size), so the comparison needs no extra overhead multiplier —
+    /// unlike `RecommendedModelPick.meetsSystemRequirements`.
+    func testMediaPresetMeetsRequirementsWhenRamCoversTheFootprint() {
+        XCTAssertTrue(ImageModelPreset.flux2Klein4B_Q4.meetsSystemRequirements(physicalMemoryBytes: 16 * 1_073_741_824))
+    }
+
+    func testMediaPresetDoesNotMeetRequirementsWhenTooBig() {
+        // LTX: approxRAMGB 24 — an 8 GB Mac falls short.
+        XCTAssertFalse(VideoModelPreset.ltx23Q4.meetsSystemRequirements(physicalMemoryBytes: 8 * 1_073_741_824))
+    }
+
+    /// The boundary is exact (`>=`), not a soft margin — a Mac with exactly
+    /// the footprint's RAM counts as meeting it.
+    func testMediaPresetRequirementsBoundaryIsInclusive() {
+        let bytes = UInt64(ImageModelPreset.krea2Turbo.approxRAMGB) * 1_073_741_824
+        XCTAssertTrue(ImageModelPreset.krea2Turbo.meetsSystemRequirements(physicalMemoryBytes: bytes))
     }
 }
