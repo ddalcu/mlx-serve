@@ -337,6 +337,39 @@ pub const ModelConfig = struct {
         if (!self.isEosToken(106)) self.addEosToken(106);
     }
 
+    /// Fill still-null sampling recommendations with the FAMILY's documented
+    /// upstream defaults. Community re-quants/distills routinely ship no
+    /// generation_config.json (live 2026-07-13: a Qwen3.6-35B distill served
+    /// to pi resolved omitted fields to the hardcoded 1.0/1.0/off — full
+    /// untruncated tail sampling on a 4-bit MoE — and a 16K-token agent turn
+    /// degenerated into word salad). Same pattern as the gemma3 head-count
+    /// gotcha: when resolution relies on per-arch defaults a minimal
+    /// checkpoint may omit, fill them explicitly.
+    ///
+    /// Deliberately fills ONLY the truncation knobs (top_k/top_p — what keeps
+    /// the tail out of the sample space), never temperature: a null temp stays
+    /// the neutral 1.0, and explicit request/flag/file values always win
+    /// (this runs AFTER generation_config.json parse, nulls only).
+    pub fn applyFamilySamplingDefaults(self: *ModelConfig) void {
+        const t = self.model_type;
+        // Qwen 3.x family only — Qwen2.5's upstream defaults differ (top_p
+        // 0.8); never guess numbers the family didn't document.
+        const is_qwen = std.mem.eql(u8, t, "qwen3") or
+            std.mem.eql(u8, t, "qwen3_moe") or
+            std.mem.eql(u8, t, "qwen3_5_moe") or
+            std.mem.eql(u8, t, "qwen3_next");
+        const is_gemma = std.mem.eql(u8, t, "gemma3") or
+            std.mem.eql(u8, t, "gemma4") or
+            std.mem.eql(u8, t, "diffusion_gemma");
+        if (is_qwen) {
+            if (self.gen_top_k == null) self.gen_top_k = 20;
+            if (self.gen_top_p == null) self.gen_top_p = 0.95;
+        } else if (is_gemma) {
+            if (self.gen_top_k == null) self.gen_top_k = 64;
+            if (self.gen_top_p == null) self.gen_top_p = 0.95;
+        }
+    }
+
     pub fn isEosToken(self: *const ModelConfig, id: u32) bool {
         for (self.eos_token_ids[0..self.num_eos_tokens]) |eos| {
             if (id == eos) return true;
@@ -428,6 +461,10 @@ pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
             config.gen_top_k = gd.top_k;
         } else |_| {}
     } else |_| {}
+    // Community re-quants often ship NO generation_config.json; fill the
+    // still-null truncation knobs with the family's documented defaults so
+    // omitted-field resolution never bottoms out at untruncated sampling.
+    config.applyFamilySamplingDefaults();
 
     return config;
 }
@@ -1397,6 +1434,51 @@ test "loadWeights on a weightless dir (incomplete download) errors clearly, not 
         error.NoWeightFiles,
         loadWeightsFromOpenDir(io, allocator, tmp.dir, "/incomplete-model", false),
     );
+}
+
+test "applyFamilySamplingDefaults: qwen family gets top_k 20 / top_p 0.95 when the checkpoint ships no generation_config" {
+    // Live soak capture 2026-07-13 (stamsam Qwen3.6-35B distill, served to pi):
+    // the community re-quant ships NO generation_config.json, so omitted-field
+    // sampling resolution bottomed out at the hardcoded 1.0/1.0/off — full
+    // untruncated tail sampling on a 4-bit MoE. A 16K-token turn degenerated
+    // into word salad (zero tool calls) and burned the client's whole output
+    // budget. Qwen's own recommendation for the family is top_k 20/top_p 0.95;
+    // fill exactly the truncation knobs, never temperature.
+    var qwen = ModelConfig{ .model_type = "qwen3_5_moe" };
+    qwen.applyFamilySamplingDefaults();
+    try testing.expectEqual(@as(?u32, 20), qwen.gen_top_k);
+    try testing.expectEqual(@as(?f32, 0.95), qwen.gen_top_p);
+    try testing.expectEqual(@as(?f32, null), qwen.gen_temperature);
+
+    var gemma = ModelConfig{ .model_type = "gemma4" };
+    gemma.applyFamilySamplingDefaults();
+    try testing.expectEqual(@as(?u32, 64), gemma.gen_top_k);
+    try testing.expectEqual(@as(?f32, 0.95), gemma.gen_top_p);
+
+    // Families without a documented upstream recommendation stay null.
+    var llama = ModelConfig{ .model_type = "llama" };
+    llama.applyFamilySamplingDefaults();
+    try testing.expectEqual(@as(?u32, null), llama.gen_top_k);
+    try testing.expectEqual(@as(?f32, null), llama.gen_top_p);
+}
+
+test "applyFamilySamplingDefaults never overrides explicit generation_config values" {
+    // The checkpoint's own generation_config.json (parsed before this runs)
+    // always wins — the family fallback fills NULLS only.
+    var config = ModelConfig{ .model_type = "qwen3_5_moe" };
+    config.gen_top_k = 40;
+    config.gen_top_p = 0.8;
+    config.gen_temperature = 0.6;
+    config.applyFamilySamplingDefaults();
+    try testing.expectEqual(@as(?u32, 40), config.gen_top_k);
+    try testing.expectEqual(@as(?f32, 0.8), config.gen_top_p);
+    try testing.expectEqual(@as(?f32, 0.6), config.gen_temperature);
+    // Partial file: only the missing knob is filled.
+    var partial = ModelConfig{ .model_type = "qwen3" };
+    partial.gen_top_p = 0.8;
+    partial.applyFamilySamplingDefaults();
+    try testing.expectEqual(@as(?u32, 20), partial.gen_top_k);
+    try testing.expectEqual(@as(?f32, 0.8), partial.gen_top_p);
 }
 
 test "ModelConfig addEosToken" {

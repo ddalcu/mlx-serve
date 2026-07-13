@@ -60,6 +60,7 @@ FAMILIES = {
             ("lmstudio-alt",      "none",    "LM Studio (GGUF)",            "#d1d5db", False, False, "LM-GG"),
             ("mlx-serve-gguf",    "none",    "MLX-serve (GGUF / llama.cpp)", "#a78bfa", False, False, "MLXS-GG"),
             ("omlx",              "none",    "oMLX",                        "#10b981", False, False, "oMLX"),
+            ("mtplx",             "auto",    "MTPLX (auto)",                "#f59e0b", False, False, "MTPLX"),
             ("mlx-serve",         "none",    "MLX-serve (MLX, --no-pld)",   "#2563eb", False, True,  "MLXS-NPLD"),
             ("mlx-serve",         "pld",     "MLX-serve (MLX, --pld)",      "#16a34a", False, True,  "MLXS-PLD"),
             ("mlx-serve",         "drafter", "MLX-serve (MLX, --drafter)",  "#ea580c", False, True,  "MLXS-DRFT"),
@@ -68,18 +69,21 @@ FAMILIES = {
     "qwen36": {
         "title": "MLX-serve vs LM Studio — Qwen 3.6 (Apple Silicon, decode tok/s)",
         "x_label": lambda key: {
-            "qwen36-27b":      "27B (4bit)",
-            "qwen36-35b-a3b":  "35B-A3B (4bit)",
+            "qwen36-27b":          "27B (4bit)",
+            "qwen36-35b-a3b":      "35B-A3B (4bit)",
+            "qwen36-27b-mtplxopt": "27B (MTPLX-opt 4bit)",
         }.get(key, key),
         "model_order": [
             "qwen36-27b",
             "qwen36-35b-a3b",
+            "qwen36-27b-mtplxopt",
         ],
         "variants": [
             ("lmstudio-baseline", "none", "LM Studio (MLX, baseline)",   "#9ca3af", True,  False, "LM-MLX"),
             ("lmstudio-alt",      "none", "LM Studio (GGUF)",            "#d1d5db", False, False, "LM-GG"),
             ("mlx-serve-gguf",    "none", "MLX-serve (GGUF / llama.cpp)", "#a78bfa", False, False, "MLXS-GG"),
             ("omlx",              "none", "oMLX",                        "#10b981", False, False, "oMLX"),
+            ("mtplx",             "auto", "MTPLX (auto)",                "#f59e0b", False, False, "MTPLX"),
             ("mlx-serve",         "none", "MLX-serve (MLX, --no-pld)",   "#2563eb", False, True,  "MLXS-NPLD"),
             ("mlx-serve",         "pld",  "MLX-serve (MLX, --pld)",      "#16a34a", False, True,  "MLXS-PLD"),
             ("mlx-serve",         "mtp",  "MLX-serve (MLX, native MTP)", "#ea580c", False, True,  "MLXS-MTP"),

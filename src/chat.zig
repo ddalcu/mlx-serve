@@ -1624,6 +1624,13 @@ pub fn parseToolCalls(allocator: std.mem.Allocator, text: []const u8) !?[]Parsed
                 }
             }
         }
+        // Everything appended in this block was inferred from BARE JSON — no
+        // tag syntax anywhere. Mark provenance so the request chokepoint
+        // (server.parseToolCallsForRequest → filterInferredBySchema) can
+        // validate the name against the declared tools: the first balanced
+        // {"name": …} object in truncated prose/code is routinely a DATA
+        // record, not a call (the George Washington class).
+        for (calls.items) |*tc| tc.inferred = true;
     }
 
     if (calls.items.len == 0) return null;
@@ -1667,6 +1674,14 @@ fn jsonIsValidObject(allocator: std.mem.Allocator, s: []const u8) bool {
 pub const ParsedToolCall = struct {
     name: []const u8,
     arguments: []const u8, // JSON string
+    /// True when the call was HEURISTICALLY inferred from bare JSON in the
+    /// output (no tag syntax — the model never said "this is a tool call").
+    /// The request chokepoint validates inferred names against the declared
+    /// tools schema: a truncated DATA object like {"name": "George
+    /// Washington", "num": 1, …} must never become a tool call (live pi
+    /// capture 2026-07-13). Explicit tag-format calls keep flowing even with
+    /// unknown names — "tool not found" is feedback the model corrects from.
+    inferred: bool = false,
 };
 
 /// Locate a tool's `properties` map in an OpenAI-shaped tools array. Accepts
@@ -1931,6 +1946,63 @@ pub fn coerceToolArgsToSchema(
         allocator.free(call.arguments);
         call.arguments = rewritten;
     }
+}
+
+/// Does the OpenAI-shaped tools array declare a function with this name?
+/// Accepts both the wrapped ({"type":"function","function":{…}}) and flat
+/// forms, mirroring `toolPropertiesFor`. An unparseable/odd `tools_json`
+/// returns TRUE — never drop a call because OUR schema parse failed.
+pub fn toolNameIsDeclared(allocator: std.mem.Allocator, tools_json: []const u8, name: []const u8) bool {
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, tools_json, .{}) catch return true;
+    defer parsed.deinit();
+    if (parsed.value != .array) return true;
+    for (parsed.value.array.items) |tool_val| {
+        if (tool_val != .object) continue;
+        const func = blk: {
+            if (tool_val.object.get("function")) |f| {
+                if (f == .object) break :blk f.object;
+            }
+            break :blk tool_val.object;
+        };
+        const nv = func.get("name") orelse continue;
+        if (nv == .string and std.mem.eql(u8, nv.string, name)) return true;
+    }
+    return false;
+}
+
+/// Drop HEURISTICALLY-inferred raw-JSON calls (`ParsedToolCall.inferred`)
+/// whose name the request never declared. The George Washington class: a
+/// generation truncated mid-data-script leaves `{"name": "George Washington",
+/// "num": 1, …}` as the first balanced object, and the flat-shape synthesis
+/// promoted it to a tool call the client can only answer with "tool not
+/// found" — burning the turn. Explicit tag-format calls are NEVER dropped
+/// here (undeclared name → honest client feedback the model corrects from).
+///
+/// Returns the retained slice (shrunk in place), or null when every call was
+/// dropped — the caller treats that exactly like "no tool calls", so the text
+/// stays visible content and finish_reason (e.g. "length") is preserved.
+pub fn filterInferredBySchema(
+    allocator: std.mem.Allocator,
+    calls: []ParsedToolCall,
+    tools_json: []const u8,
+) !?[]ParsedToolCall {
+    var kept: usize = 0;
+    for (calls) |tc| {
+        if (!tc.inferred or toolNameIsDeclared(allocator, tools_json, tc.name)) {
+            calls[kept] = tc;
+            kept += 1;
+        } else {
+            log.warn("  [tool-parse] dropped inferred raw-JSON call '{s}' — name not among the request's tools (data object, not a call)\n", .{tc.name});
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+    }
+    if (kept == calls.len) return calls;
+    if (kept == 0) {
+        allocator.free(calls);
+        return null;
+    }
+    return try allocator.realloc(calls, kept);
 }
 
 /// Last-resort tool-call inference for models that emit JUST the arguments
@@ -4040,6 +4112,110 @@ test "parseToolCalls returns null for name-only object (no real args)" {
     const text = "<tool_call>\n{\"name\": \"shell\"}\n</tool_call>";
     const result = try parseToolCalls(allocator, text);
     try testing.expect(result == null);
+}
+
+test "parseToolCalls marks raw-JSON fallback calls as inferred, tag calls as explicit" {
+    const allocator = testing.allocator;
+    // Tagged call → explicit (never schema-name-filtered).
+    {
+        const calls = (try parseToolCalls(allocator, "<tool_call>{\"name\":\"shell\",\"arguments\":{\"command\":\"ls\"}}</tool_call>")).?;
+        defer {
+            for (calls) |tc| {
+                allocator.free(tc.name);
+                allocator.free(tc.arguments);
+            }
+            allocator.free(calls);
+        }
+        try testing.expect(!calls[0].inferred);
+    }
+    // Bare raw-JSON object → inferred (flat shape included).
+    {
+        const calls = (try parseToolCalls(allocator, "prefix text {\"name\": \"George Washington\", \"num\": 1, \"party\": \"None\"} suffix")).?;
+        defer {
+            for (calls) |tc| {
+                allocator.free(tc.name);
+                allocator.free(tc.arguments);
+            }
+            allocator.free(calls);
+        }
+        try testing.expect(calls[0].inferred);
+        try testing.expectEqualStrings("George Washington", calls[0].name);
+    }
+}
+
+test "filterInferredBySchema drops undeclared inferred calls, keeps declared and explicit ones" {
+    const allocator = testing.allocator;
+    const tools =
+        \\[{"type":"function","function":{"name":"write","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}}]
+    ;
+    // Inferred + undeclared → dropped; slice becomes null.
+    {
+        var calls = try allocator.alloc(ParsedToolCall, 1);
+        calls[0] = .{
+            .name = try allocator.dupe(u8, "George Washington"),
+            .arguments = try allocator.dupe(u8, "{\"num\":1}"),
+            .inferred = true,
+        };
+        try testing.expect((try filterInferredBySchema(allocator, calls, tools)) == null);
+    }
+    // Inferred + declared → kept.
+    {
+        var calls = try allocator.alloc(ParsedToolCall, 1);
+        calls[0] = .{
+            .name = try allocator.dupe(u8, "write"),
+            .arguments = try allocator.dupe(u8, "{\"path\":\"a\"}"),
+            .inferred = true,
+        };
+        const kept = (try filterInferredBySchema(allocator, calls, tools)).?;
+        defer {
+            for (kept) |tc| {
+                allocator.free(tc.name);
+                allocator.free(tc.arguments);
+            }
+            allocator.free(kept);
+        }
+        try testing.expectEqual(@as(usize, 1), kept.len);
+    }
+    // Explicit + undeclared → kept (client feedback, not our guess); the
+    // inferred sibling with an undeclared name is dropped and the slice shrinks.
+    {
+        var calls = try allocator.alloc(ParsedToolCall, 2);
+        calls[0] = .{
+            .name = try allocator.dupe(u8, "searchWeb"),
+            .arguments = try allocator.dupe(u8, "{\"q\":\"zig\"}"),
+            .inferred = false,
+        };
+        calls[1] = .{
+            .name = try allocator.dupe(u8, "John Adams"),
+            .arguments = try allocator.dupe(u8, "{\"num\":2}"),
+            .inferred = true,
+        };
+        const kept = (try filterInferredBySchema(allocator, calls, tools)).?;
+        defer {
+            for (kept) |tc| {
+                allocator.free(tc.name);
+                allocator.free(tc.arguments);
+            }
+            allocator.free(kept);
+        }
+        try testing.expectEqual(@as(usize, 1), kept.len);
+        try testing.expectEqualStrings("searchWeb", kept[0].name);
+    }
+}
+
+test "toolNameIsDeclared: wrapped + flat forms; unparseable schema never drops" {
+    const allocator = testing.allocator;
+    const wrapped =
+        \\[{"type":"function","function":{"name":"write","parameters":{"type":"object","properties":{}}}}]
+    ;
+    const flat =
+        \\[{"name":"write","parameters":{"type":"object","properties":{}}}]
+    ;
+    try testing.expect(toolNameIsDeclared(allocator, wrapped, "write"));
+    try testing.expect(toolNameIsDeclared(allocator, flat, "write"));
+    try testing.expect(!toolNameIsDeclared(allocator, wrapped, "George Washington"));
+    // Broken schema JSON → safe default TRUE (never drop on OUR parse failure).
+    try testing.expect(toolNameIsDeclared(allocator, "not json", "anything"));
 }
 
 test "parseToolCalls multiple calls" {

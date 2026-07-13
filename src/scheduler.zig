@@ -109,8 +109,9 @@ pub const LoadParams = struct {
     drafter_dir: []const u8 = "",
     /// Auto-load the Qwen native MTP sidecar when the model dir ships one.
     mtp_enabled: bool = true,
-    /// Default MTP draft depth (CLI --mtp-depth).
-    mtp_depth: u32 = mtp_mod.DEFAULT_DEPTH,
+    /// Max MTP draft depth (CLI --mtp-depth; 0 = auto, resolved by
+    /// generate_mod.resolveMtpDepthCap at load/Generator init).
+    mtp_depth: u32 = 0,
     /// Whether to also load vision-tower weights. Combined with
     /// `config.has_vision` — false here disables vision regardless of config.
     load_vision: bool = false,
@@ -220,7 +221,8 @@ pub const SubmitParams = struct {
     drafter_block_size: u32 = 4,
     enable_mtp: bool = false,
     mtp: ?*mtp_mod.MtpModel = null,
-    mtp_depth: u32 = mtp_mod.DEFAULT_DEPTH,
+    /// 0 = auto (see generate_mod.resolveMtpDepthCap).
+    mtp_depth: u32 = 0,
     pld_draft_len: u32 = 5,
     pld_key_len: u32 = 3,
     /// Phase 2 (Plan ricky): route SDPA through `kv_quant.quantAttention`
@@ -820,8 +822,9 @@ pub const LoadRequest = struct {
     ds4_ssd_streaming: bool = false,
     /// Auto-load the Qwen native MTP sidecar when the model dir ships one.
     mtp_enabled: bool = true,
-    /// Default MTP draft depth (CLI --mtp-depth).
-    mtp_depth: u32 = mtp_mod.DEFAULT_DEPTH,
+    /// Max MTP draft depth (CLI --mtp-depth; 0 = auto, resolved by
+    /// generate_mod.resolveMtpDepthCap at load/Generator init).
+    mtp_depth: u32 = 0,
 
     load_vision: bool = false,
     warmup_eager: bool = true,
@@ -2541,7 +2544,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                 h.* = loaded;
                 if (h.bind(xfm_ptr)) {
                     mtp_ptr = h;
-                    log.info("MTP head ready (depth={d}).\n", .{params.mtp_depth});
+                    log.info("MTP head ready (depth={d}).\n", .{generate_mod.Generator.resolveMtpDepthCap(params.mtp_depth)});
                 } else |bind_err| {
                     log.warn("MTP sidecar incompatible with target ({s}) — disabled.\n", .{@errorName(bind_err)});
                     h.deinit();
@@ -2588,7 +2591,9 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     entry.drafter = drafter_ptr;
     entry.drafter_block_size = sch.drafter_block_size;
     entry.mtp = mtp_ptr;
-    entry.mtp_depth = params.mtp_depth;
+    // Resolve the auto (0) cap here so every downstream reader of
+    // `lm.mtp_depth` (server log lines, slot params) sees the real value.
+    entry.mtp_depth = generate_mod.Generator.resolveMtpDepthCap(params.mtp_depth);
     entry.drafter_path = drafter_path_owned;
     drafter_path_owned = &[_]u8{}; // disarm the errdefer
     // Transfer ownership of the heap-allocated CPU state from `params` to

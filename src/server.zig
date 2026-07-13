@@ -749,7 +749,15 @@ fn parseToolCallsForRequest(
     text: []const u8,
     tools_json: ?[]const u8,
 ) !?[]chat_mod.ParsedToolCall {
-    const calls = (try chat_mod.parseToolCalls(allocator, text)) orelse
+    var parsed_calls = try chat_mod.parseToolCalls(allocator, text);
+    // Heuristically-inferred raw-JSON calls must name a DECLARED tool — a
+    // truncated data object ({"name": "George Washington", …}) is not a call.
+    // Deliberately NOT gated on g_tool_autocorrect: this corrects our own
+    // heuristic's false positive, not the model's output.
+    if (parsed_calls) |c| {
+        if (tools_json) |tj| parsed_calls = try chat_mod.filterInferredBySchema(allocator, c, tj);
+    }
+    const calls = parsed_calls orelse
         (if (tools_json) |tj| try chat_mod.inferBareJsonToolCalls(allocator, text, tj) else null) orelse
         return null;
     if (g_tool_autocorrect) {
@@ -11503,6 +11511,80 @@ test "parseToolCallsForRequest: --no-tool-autocorrect leaves args verbatim" {
     const ra = parsed.value.object.get("replace_all").?;
     try std.testing.expect(ra == .string); // NOT coerced — verbatim
     try std.testing.expectEqualStrings("False", ra.string);
+}
+
+test "parseToolCallsForRequest: truncated DATA object is not promoted to a tool call (George Washington class)" {
+    // Live pi capture 2026-07-13 (Qwen3.6-35B-A3B distilled): generation hit
+    // max_tokens midway through a presidents data script. The raw-JSON fallback
+    // found the first balanced object — {"name": "George Washington", "num": 1,
+    // …} — and the flat-shape synthesis promoted it to a TOOL CALL named
+    // "George Washington" (args = every key but "name"). pi answered "Tool
+    // George Washington not found", the model retried the identical mega-write,
+    // and the session burned two full 16K-token turns making zero progress.
+    // A HEURISTICALLY inferred call (no tag syntax — the model never said
+    // "tool call") must carry a name the request actually declared; otherwise
+    // the text stays visible and finish_reason="length" reaches the client
+    // untouched, so its truncation recovery fires instead of a bogus tool loop.
+    const allocator = std.testing.allocator;
+    const tools =
+        \\[{"type":"function","function":{"name":"write","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}},{"type":"function","function":{"name":"read","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}}]
+    ;
+    const text = "Now let me build a generator script that creates all 46 president pages with real historical data:\n\n" ++
+        "presidents = [\n" ++
+        "  {\"name\": \"George Washington\", \"num\": 1, \"party\": \"None (Federalist-leaning)\", \"term\": \"1789\u{2013}1797\", \"vice\": \"John Adams\"},\n" ++
+        "  {\"name\": \"John Adams\", \"num\": 2, \"party\": \"Federalist\",";
+    const calls = try parseToolCallsForRequest(allocator, text, tools);
+    defer if (calls) |cs| {
+        for (cs) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(cs);
+    };
+    try std.testing.expect(calls == null);
+}
+
+test "parseToolCallsForRequest: raw-JSON call with a DECLARED name still parses" {
+    // The counterweight to the George Washington guard: models without a
+    // trained tool format (Gemma 3) emit fenced raw-JSON calls, and those must
+    // keep working when the name matches a declared tool.
+    const allocator = std.testing.allocator;
+    const tools =
+        \\[{"type":"function","function":{"name":"write","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}}]
+    ;
+    const text = "```json\n{\"name\": \"write\", \"arguments\": {\"path\": \"a.txt\", \"content\": \"hi\"}}\n```";
+    const calls = (try parseToolCallsForRequest(allocator, text, tools)) orelse
+        return error.ExpectedToolCall;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try std.testing.expectEqualStrings("write", calls[0].name);
+}
+
+test "parseToolCallsForRequest: tag-format call with an UNDECLARED name is kept" {
+    // An EXPLICIT tag-format call (<tool_call>…) to a name the request never
+    // declared still goes to the client — "tool not found" is model-visible
+    // feedback the model can correct from. Only HEURISTIC raw-JSON inference
+    // gets schema-name validation; this pins the filter against over-reach.
+    const allocator = std.testing.allocator;
+    const tools =
+        \\[{"type":"function","function":{"name":"write","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}}]
+    ;
+    const text = "<tool_call>{\"name\":\"searchWeb\",\"arguments\":{\"q\":\"zig\"}}</tool_call>";
+    const calls = (try parseToolCallsForRequest(allocator, text, tools)) orelse
+        return error.ExpectedToolCall;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try std.testing.expectEqualStrings("searchWeb", calls[0].name);
 }
 
 test "parseToolCallsForRequest: coercion fires across think on/off × qwen/gemma" {

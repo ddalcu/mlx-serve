@@ -4,6 +4,8 @@ Current benchmark state, one page: the final numbers, how to reproduce them, and
 rules that keep them honest. The full historical narrative (2026-04 → 2026-07 session
 entries, bisects, retractions) lives in this file's **git history**.
 
+Keep this document lightweight, data in table format only, no paragraphs, no fluff, no details.
+
 Hardware: Apple M4 Max, 128 GB, AC power, idle machine. Engines: LM Studio 0.4.15+2,
 MTPLX 2.0.2, mlx-lm 0.31.3. Identical weights within every row. Last refreshed
 **2026-07-12** (v26.7.6-pending).

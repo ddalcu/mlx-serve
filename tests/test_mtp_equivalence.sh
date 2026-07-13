@@ -179,6 +179,47 @@ if [ "$ENGAGE_PRE" -eq "$ENGAGE_POST" ]; then
 else
     echo "FAIL [enable_mtp:false opt-out]: MTP ran despite per-request disable"; FAIL=$((FAIL+1))
 fi
+
+# EV-controller engagement (dispatch-hole lesson: output equality can't see a
+# silent fallback). An ECHO workload is the max-confidence case: past the
+# ~10-round warmup the chain confidence clears any tau, so chunk-B extension
+# must fire (ext_rounds > 0 in [spec-stats]) under the adaptive default.
+ECHO_PROMPT="Repeat the following code block back EXACTLY as written, no commentary: def gcd(a, b):\\n    while b:\\n        a, b = b, a % b\\n    return a\\n\\ndef fib(n, memo={}):\\n    if n in memo: return memo[n]\\n    if n < 2: return n\\n    memo[n] = fib(n-1, memo) + fib(n-2, memo)\\n    return memo[n]\\n\\ndef reverse_string(s):\\n    out = ''\\n    for ch in s:\\n        out = ch + out\\n    return out"
+curl -s "http://127.0.0.1:$PORT/v1/chat/completions" -H 'Content-Type: application/json' -d "{
+    $OPTIN\"model\":\"default\",\"stream\":false,\"temperature\":0,\"max_tokens\":160,
+    \"messages\":[{\"role\":\"user\",\"content\":\"$ECHO_PROMPT\"}]}" >/dev/null
+EXT=$(grep -o 'ext_rounds=[0-9]*' "$LOG" | tail -1 | cut -d= -f2)
+if [ "${EXT:-0}" -gt 0 ]; then
+    echo "PASS [EV chunk-B extension engages on echo] (ext_rounds=$EXT)"; PASS=$((PASS+1))
+else
+    echo "FAIL [EV chunk-B extension]: ext_rounds=${EXT:-none} on a max-confidence echo — extension path never fired"
+    FAIL=$((FAIL+1))
+fi
+stop_server
+
+echo "── fixed-depth server (MLX_SERVE_MTP_ADAPTIVE=0) ──"
+# The env kill switch must fully revert: legacy cap 3 (not the adaptive auto
+# cap) and zero chunk-B extensions on the same echo workload.
+pkill -f "mlx-serve.*--port $PORT" 2>/dev/null
+sleep 1
+MLX_SERVE_MTP_ADAPTIVE=0 "$BIN" --model "$MODEL" --serve --port "$PORT" --no-pld --log-level info >"$LOG" 2>&1 &
+SERVER_PID=$!
+for _ in $(seq 1 120); do
+    curl -s "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break
+    sleep 1
+done
+curl -s "http://127.0.0.1:$PORT/v1/chat/completions" -H 'Content-Type: application/json' -d "{
+    $OPTIN\"model\":\"default\",\"stream\":false,\"temperature\":0,\"max_tokens\":160,
+    \"messages\":[{\"role\":\"user\",\"content\":\"$ECHO_PROMPT\"}]}" >/dev/null
+FIXED_STATS=$(grep -o '\[spec-stats\] mode=mtp.*' "$LOG" | tail -1)
+FIXED_EXT=$(echo "$FIXED_STATS" | grep -o 'ext_rounds=[0-9]*' | cut -d= -f2)
+FIXED_DEPTH=$(echo "$FIXED_STATS" | grep -o ' depth=[0-9]*' | grep -o '[0-9]*')
+if [ "${FIXED_EXT:-1}" = "0" ] && [ "${FIXED_DEPTH:-0}" = "3" ]; then
+    echo "PASS [MLX_SERVE_MTP_ADAPTIVE=0 reverts to fixed depth 3, no extension]"; PASS=$((PASS+1))
+else
+    echo "FAIL [adaptive kill switch]: depth=${FIXED_DEPTH:-none} ext_rounds=${FIXED_EXT:-none} (want depth=3 ext_rounds=0)"
+    FAIL=$((FAIL+1))
+fi
 stop_server
 
 echo

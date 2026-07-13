@@ -110,9 +110,11 @@ fn printUsage(io: std.Io) void {
         \\  --no-mtp            Disable the Qwen native MTP head (auto-loaded
         \\                        when the model dir ships mtp/weights.safetensors;
         \\                        priority: MTP > drafter > PLD).
-        \\  --mtp-depth <n>     Max tokens drafted per MTP round (default: 3).
-        \\                        Depths >1 adapt down per-request when the
-        \\                        acceptance rate sags.
+        \\  --mtp-depth <n>     Max tokens drafted per MTP round (default:
+        \\                        adaptive — the EV controller plans depth
+        \\                        per round up to 7; MLX_SERVE_MTP_ADAPTIVE=0
+        \\                        reverts to the fixed windowed controller,
+        \\                        cap 3). Pass an explicit <n> to hard-cap.
         \\  --mtp-history-window <n>
         \\                      MTP prefill-history window: prompts forwarding
         \\                        more than 16384 tokens only build head history
@@ -311,7 +313,7 @@ pub fn main(init: std.process.Init) !void {
     var draft_block_size: u32 = drafter_mod.DEFAULT_BLOCK_SIZE;
     var draft_block_size_explicit: bool = false; // user passed --draft-block-size?
     var enable_mtp = true; // Qwen native MTP head (auto when sidecar present; --no-mtp to disable)
-    var mtp_depth: u32 = mtp_mod.DEFAULT_DEPTH;
+    var mtp_depth: u32 = 0; // 0 = auto (resolveMtpDepthCap: EV cap 7 / fixed cap 3); explicit flag wins
     // Plan 04 Phase 1: pre-fault weights and pre-compile kernels at boot.
     // Default ON in serve mode — small boot-time cost, big cold-prefill win.
     // --no-warmup-eager opts out for benchmarking / minimal-footprint deployments.

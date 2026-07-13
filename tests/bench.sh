@@ -71,6 +71,29 @@ LMS_PORT=1234
 # the engine-comparison cells (slower; each adds boot+warmup time per row).
 INCLUDE_LMSTUDIO=0
 INCLUDE_OMLX=0
+INCLUDE_MTPLX=0
+# --mlx-only: drop the mlx-serve GGUF alt cell (MLX-format checkpoints only).
+MLX_ONLY=0
+# MTPLX (github.com/youssofal/mtplx) — the reference native-MTP runtime.
+# OpenAI-compatible `mtplx serve`. Its chat path REQUIRES an MTPLX-verified
+# MTP artifact (a Youssofal/*-MTPLX-Optimized-* checkpoint or its target/
+# +assistant/ pair) — plain mlx-community checkpoints fail at request time
+# (its runtime can't consume our sidecar layout, and --stock-ar/--no-load-mtp
+# still refuse with "MTP is not enabled"). So mtplx cells only make sense on
+# rows whose checkpoint IS an MTPLX artifact; elsewhere they fail fast and
+# the cell is skipped. Binary resolution: PATH first, then the local repo venv.
+MTPLX_PORT=11252
+MTPLX_BIN="${MTPLX_BIN:-}"
+if [[ -z "$MTPLX_BIN" ]]; then
+    if command -v mtplx >/dev/null 2>&1; then
+        MTPLX_BIN="$(command -v mtplx)"
+    elif [[ -x "$HOME/projects/agents/MTPLX/venv/bin/mtplx" ]]; then
+        MTPLX_BIN="$HOME/projects/agents/MTPLX/venv/bin/mtplx"
+    fi
+fi
+# Set by start_engine's mtplx arm from /v1/models (mtplx lowercases the dir
+# basename into its served id — never guess it).
+MTPLX_MODEL_ID=""
 # Concurrent throughput mode (folded from the old bench_concurrent.py). When >1,
 # starts mlx-serve with --max-concurrent N and emits an extra `decode_c<N>`
 # row per cell that fires N parallel requests; the row's tok/s is the aggregate
@@ -108,6 +131,11 @@ Options:
                        model load on the warmup curl.
   --omlx               Include oMLX cells. Requires \`omlx\` on PATH; silently
                        skipped if missing.
+  --mtplx              Include MTPLX cells (reference native-MTP runtime).
+                       Only meaningful on rows whose checkpoint is an MTPLX
+                       artifact (Youssofal/*-MTPLX-Optimized-*); other rows'
+                       mtplx cells fail the warmup and are skipped.
+  --mlx-only           Drop the mlx-serve GGUF alt cell (MLX checkpoints only).
   --concurrent N       Also emit a \`decode_c<N>\` row per mlx-serve cell. The
                        server is started with --max-concurrent N and N parallel
                        /v1/chat/completions are fired; the row's tok/s is the
@@ -141,6 +169,8 @@ while [[ $# -gt 0 ]]; do
         --thinking)   THINKING=1; shift ;;
         --lmstudio)   INCLUDE_LMSTUDIO=1; shift ;;
         --omlx)       INCLUDE_OMLX=1; shift ;;
+        --mtplx)      INCLUDE_MTPLX=1; shift ;;
+        --mlx-only)   MLX_ONLY=1; shift ;;
         --concurrent) CONCURRENT="$2"; shift 2 ;;
         --out)        PNG_OUT="$2"; shift 2 ;;
         --keep-csv)   KEEP_CSV="$2"; shift 2 ;;
@@ -222,7 +252,7 @@ case "$FAMILY" in
         # that builds up during the row falls on the comparison engines, not
         # on us. lms_alt rows skip silently when the row has no GGUF key
         # configured (31B, 26B-A4B currently).
-        SPECS=("mlx-serve::none" "mlx-serve::pld" "mlx-serve::drafter" "mlx-serve:alt:none" "omlx:base:none" "lmstudio:lms_baseline:none" "lmstudio:lms_alt:none")
+        SPECS=("mlx-serve::none" "mlx-serve::pld" "mlx-serve::drafter" "mlx-serve:alt:none" "omlx:base:none" "mtplx:base:auto" "lmstudio:lms_baseline:none" "lmstudio:lms_alt:none")
         # Gemma 4 has no thinking mode; the LMS workaround is a no-op.
         LMS_THINKING_WORKAROUND=0
         ;;
@@ -238,6 +268,13 @@ case "$FAMILY" in
             # mlx-community/ prefix) — verified via /v1/models on 0.4.15.
             "qwen36-27b|$LMS_DIR/mlx-community/Qwen3.6-27B-4bit|qwen3.6-27b|qwen/qwen3.6-27b||$GGUF_DIR/Qwen3.6-27B-GGUF/Qwen3.6-27B-Q4_K_M.gguf"
             "qwen36-35b-a3b|$LMS_DIR/mlx-community/Qwen3.6-35B-A3B-4bit|qwen3.6-35b-a3b|qwen/qwen3.6-35b-a3b||$GGUF_DIR/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-Q4_K_M.gguf"
+            # The MTPLX-artifact row (the July-12 context-ladder checkpoint):
+            # 4-bit trunk + MTPLX-calibrated MTP adapter. mlx-serve loads the
+            # artifact unmodified (mtp/ sidecar), MTPLX gets its native MTP,
+            # oMLX serves the trunk AR — identical weights on every engine.
+            # This is the ONLY row where an mtplx cell can run; skipped
+            # silently if the dir is absent.
+            "qwen36-27b-mtplxopt|$LMS_DIR/Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed|qwen3.6-27b-mtplx-optimized-speed|||"
         )
         # Same ordering rule as gemma: mlx-serve MLX first (cool machine),
         # mlx-serve GGUF next, omlx in the middle, LMS specs last so any
@@ -248,7 +285,7 @@ case "$FAMILY" in
         # gets its own labeled cell; `none`/`pld` pass --no-mtp so their
         # labels stay truthful (priority is MTP > PLD when the sidecar is
         # loaded — without --no-mtp both cells would silently measure MTP).
-        SPECS=("mlx-serve::none" "mlx-serve::pld" "mlx-serve::mtp" "mlx-serve:alt:none" "omlx:base:none" "lmstudio:lms_baseline:none" "lmstudio:lms_alt:none")
+        SPECS=("mlx-serve::none" "mlx-serve::pld" "mlx-serve::mtp" "mlx-serve:alt:none" "omlx:base:none" "mtplx:base:auto" "lmstudio:lms_baseline:none" "lmstudio:lms_alt:none")
         # Qwen 3.6's chat template auto-activates `<think>` mode; LM Studio
         # ignores `chat_template_kwargs.enable_thinking:false`, so build_body_lms
         # uses the stacked workaround when this flag is on.
@@ -269,6 +306,17 @@ if [[ "$RAW" -eq 1 ]]; then
         _raw_specs+=("$_s")
     done
     SPECS=("${_raw_specs[@]}")
+fi
+
+# --mlx-only: drop the mlx-serve GGUF alt cell — every remaining cell loads
+# MLX-format safetensors.
+if [[ "$MLX_ONLY" -eq 1 ]]; then
+    _mlx_specs=()
+    for _s in "${SPECS[@]}"; do
+        [[ "$_s" == "mlx-serve:alt:"* ]] && continue
+        _mlx_specs+=("$_s")
+    done
+    SPECS=("${_mlx_specs[@]}")
 fi
 
 # ── Test prompts (identical wording across engines so cross-bench numbers compare) ──
@@ -358,6 +406,16 @@ build_body_omlx() {
         '{model:$model, messages:[{role:"user",content:$p}], max_tokens:$mt, temperature:0.0, top_p:1.0, stream:false, chat_template_kwargs:{enable_thinking:$think}}'
 }
 
+# MTPLX is OpenAI-compatible and honors chat_template_kwargs. The served model
+# id is captured from /v1/models at boot (MTPLX_MODEL_ID) — it lowercases the
+# checkpoint dir basename, so never derive it client-side.
+build_body_mtplx() {
+    local prompt="$1" mt="$2"
+    local think=false; [[ "$THINKING" == "1" ]] && think=true
+    jq -nc --arg p "$prompt" --arg model "$MTPLX_MODEL_ID" --argjson mt "$mt" --argjson think "$think" \
+        '{model:$model, messages:[{role:"user",content:$p}], max_tokens:$mt, temperature:0.0, top_p:1.0, stream:false, chat_template_kwargs:{enable_thinking:$think}}'
+}
+
 # ── HTTP helpers ──
 salted() { echo "[run-$1-$RANDOM] $2"; }
 
@@ -367,6 +425,7 @@ send_one() {
     case "$engine" in
         lmstudio)  port="$LMS_PORT" ;;
         omlx)      port="$OMLX_PORT" ;;
+        mtplx)     port="$MTPLX_PORT" ;;
         *)         port="$SERVER_PORT" ;;
     esac
     local t0 t1 resp
@@ -408,7 +467,7 @@ bench_decode() {
     # oMLX routes requests by the basename of the model dir, not the full path.
     local omlx_model_id; omlx_model_id="$(basename "$model")"
     local port
-    case "$engine" in lmstudio) port="$LMS_PORT";; omlx) port="$OMLX_PORT";; *) port="$SERVER_PORT";; esac
+    case "$engine" in lmstudio) port="$LMS_PORT";; omlx) port="$OMLX_PORT";; mtplx) port="$MTPLX_PORT";; *) port="$SERVER_PORT";; esac
     # Decode rate is measured from the STREAM (tests/_decode_stream.py): it counts
     # actual content+reasoning delta pieces and times first->last token, so it does
     # NOT depend on the server's usage/token accounting (LM Studio reports those
@@ -422,6 +481,7 @@ bench_decode() {
         case "$engine" in
             mlx-serve) body=$(build_body_mlx  "$(salted "$i" "$prompt")" "$spec"  "$mt") ;;
             omlx)      body=$(build_body_omlx "$(salted "$i" "$prompt")" "$omlx_model_id" "$mt") ;;
+            mtplx)     body=$(build_body_mtplx "$(salted "$i" "$prompt")" "$mt") ;;
             *)         body=$(build_body_lms  "$(salted "$i" "$prompt")" "$model" "$mt") ;;
         esac
         local out; out=$(printf '%s' "$body" | python3 "$SCRIPT_DIR/_decode_stream.py" "http://127.0.0.1:$port/v1/chat/completions" 240)
@@ -444,6 +504,7 @@ bench_prefill() {
         case "$engine" in
             mlx-serve) body=$(build_body_mlx  "$(salted "$i" "$PREFILL_PROMPT")" "$spec"  1) ;;
             omlx)      body=$(build_body_omlx "$(salted "$i" "$PREFILL_PROMPT")" "$omlx_model_id" 1) ;;
+            mtplx)     body=$(build_body_mtplx "$(salted "$i" "$PREFILL_PROMPT")" 1) ;;
             *)         body=$(build_body_lms  "$(salted "$i" "$PREFILL_PROMPT")" "$model" 1) ;;
         esac
         IFS='|' read -r elapsed pt ct rt < <(send_one "$engine" "$body")
@@ -475,6 +536,7 @@ bench_decode_concurrent() {
     case "$engine" in
         lmstudio) port="$LMS_PORT" ;;
         omlx)     port="$OMLX_PORT" ;;
+        mtplx)    port="$MTPLX_PORT" ;;
         *)        port="$SERVER_PORT" ;;
     esac
     local outdir; outdir=$(mktemp -d -t bench_conc.XXXXXX)
@@ -485,6 +547,7 @@ bench_decode_concurrent() {
         case "$engine" in
             mlx-serve) body=$(build_body_mlx  "$(salted "c$i" "$prompt")" "$spec"  "$mt") ;;
             omlx)      body=$(build_body_omlx "$(salted "c$i" "$prompt")" "$omlx_model_id" "$mt") ;;
+            mtplx)     body=$(build_body_mtplx "$(salted "c$i" "$prompt")" "$mt") ;;
             *)         body=$(build_body_lms  "$(salted "c$i" "$prompt")" "$model" "$mt") ;;
         esac
         (
@@ -542,8 +605,12 @@ stop_all_engines() {
     pkill -9 -x mlx-serve 2>/dev/null
     # oMLX launches as `python3 -m omlx.cli serve …` — match by `omlx.cli`.
     pkill -9 -f "omlx.cli" 2>/dev/null
+    # MTPLX's server process carries the venv script path in its cmdline; the
+    # port sweep below is the authoritative kill (a plain `pkill -f mtplx`
+    # would be too broad).
+    pkill -9 -f "bin/mtplx serve" 2>/dev/null
     # Belt-and-suspenders: clear known ports if anything survived.
-    for p in "$SERVER_PORT" "$OMLX_PORT"; do
+    for p in "$SERVER_PORT" "$OMLX_PORT" "$MTPLX_PORT"; do
         local pids; pids="$(lsof -ti:"$p" 2>/dev/null)"
         [[ -n "$pids" ]] && echo "$pids" | xargs -r kill -9 2>/dev/null
     done
@@ -556,7 +623,7 @@ stop_all_engines() {
     local waited=0
     while (( waited < 30 )); do
         local busy=0
-        for p in "$SERVER_PORT" "$OMLX_PORT" "$LMS_PORT"; do
+        for p in "$SERVER_PORT" "$OMLX_PORT" "$LMS_PORT" "$MTPLX_PORT"; do
             if lsof -ti:"$p" >/dev/null 2>&1; then busy=1; break; fi
         done
         (( busy == 0 )) && break
@@ -640,6 +707,54 @@ start_engine() {
             if ! curl -sf -m 600 -X POST "http://127.0.0.1:$OMLX_PORT/v1/chat/completions" \
                 -H "Content-Type: application/json" -d "$warmup_body" >/dev/null 2>&1; then
                 echo "  omlx warmup failed for $model_id (check /tmp/bench_vs_lms_omlx.log)" >&2
+                return 1
+            fi
+            ;;
+        mtplx)
+            if [[ -z "$MTPLX_BIN" ]]; then
+                echo "  mtplx binary not found (PATH or ~/projects/agents/MTPLX/venv/bin)" >&2
+                return 1
+            fi
+            # `--generation-mode auto` is the only mode that serves chat: its
+            # ar/--stock-ar/--no-load-mtp combinations all refuse requests
+            # with "MTP is not enabled for this runtime" (probed live,
+            # MTPLX 2.0.2). On a checkpoint without an MTPLX-compatible MTP
+            # artifact the warmup below fails and the cell is skipped.
+            # Thinking parity: MTPLX ignores chat_template_kwargs
+            # .enable_thinking (probed: thinking_leaked=163 on the smoke
+            # cell) — suppression is the server-side --reasoning flag.
+            local reason_flag="off"
+            [[ "$THINKING" == "1" ]] && reason_flag="on"
+            "$MTPLX_BIN" serve --model "$model_or_path" --host 127.0.0.1 \
+                --port "$MTPLX_PORT" --context-window "$CTX" \
+                --generation-mode auto --reasoning "$reason_flag" --yes \
+                >/tmp/bench_vs_lms_mtplx.log 2>&1 &
+            local pid=$!
+            ENGINE_PID="$pid"
+            for i in $(seq 1 240); do
+                curl -sf "http://127.0.0.1:$MTPLX_PORT/v1/models" >/dev/null 2>&1 && break
+                sleep 0.5
+                kill -0 "$pid" 2>/dev/null || { echo "  mtplx died (tail of /tmp/bench_vs_lms_mtplx.log:)" >&2; tail -n 10 /tmp/bench_vs_lms_mtplx.log >&2; return 1; }
+                [[ "$i" -eq 240 ]] && { echo "  mtplx /v1/models never came up" >&2; return 1; }
+            done
+            # MTPLX lowercases the dir basename into its served id — read it
+            # back instead of guessing.
+            MTPLX_MODEL_ID="$(curl -sf "http://127.0.0.1:$MTPLX_PORT/v1/models" | python3 -c 'import json,sys
+try:
+    d=json.load(sys.stdin); print(d["data"][0]["id"])
+except Exception:
+    pass')"
+            [[ -z "$MTPLX_MODEL_ID" ]] && { echo "  mtplx /v1/models gave no model id" >&2; return 1; }
+            local warmup_body
+            warmup_body=$(jq -nc --arg model "$MTPLX_MODEL_ID" '{model:$model,messages:[{role:"user",content:"hi"}],max_tokens:1,stream:false}')
+            local warmup_resp
+            warmup_resp=$(curl -sf -m 600 -X POST "http://127.0.0.1:$MTPLX_PORT/v1/chat/completions" \
+                -H "Content-Type: application/json" -d "$warmup_body" 2>/dev/null)
+            # MTPLX returns HTTP 200 with an {"error": …} body on runtime
+            # incompatibility (the sidecar shape-mismatch class) — curl -f
+            # can't see that, so check the body.
+            if [[ -z "$warmup_resp" ]] || echo "$warmup_resp" | grep -q '"error"'; then
+                echo "  mtplx warmup failed for $model_or_path — no MTPLX-compatible MTP artifact? (check /tmp/bench_vs_lms_mtplx.log)" >&2
                 return 1
             fi
             ;;
@@ -766,8 +881,16 @@ if [[ "$INCLUDE_OMLX" -eq 1 ]]; then
         echo "--omlx passed but omlx not on PATH; cells will be skipped" >&2
     fi
 fi
-[[ "$INCLUDE_LMSTUDIO" -eq 0 && "$INCLUDE_OMLX" -eq 0 ]] && \
-    echo "(mlx-serve only — pass --lmstudio and/or --omlx to add comparison engines)" >&2
+HAS_MTPLX=0
+if [[ "$INCLUDE_MTPLX" -eq 1 ]]; then
+    if [[ -n "$MTPLX_BIN" && -x "$MTPLX_BIN" ]]; then
+        HAS_MTPLX=1
+    else
+        echo "--mtplx passed but no mtplx binary found; cells will be skipped" >&2
+    fi
+fi
+[[ "$INCLUDE_LMSTUDIO" -eq 0 && "$INCLUDE_OMLX" -eq 0 && "$INCLUDE_MTPLX" -eq 0 ]] && \
+    echo "(mlx-serve only — pass --lmstudio/--omlx/--mtplx to add comparison engines)" >&2
 
 for row in "${TARGETS[@]}"; do
     IFS='|' read -r logical mlxserve_path lms_baseline lms_alt drafter mlxserve_gguf_path <<<"$row"
@@ -796,6 +919,11 @@ for row in "${TARGETS[@]}"; do
                 [[ "$HAS_OMLX" -eq 1 ]] || { echo "  SKIP ${logical}/omlx/${spec} (omlx not on PATH)" >&2; continue; }
                 run_cell "${logical}/omlx/${spec}"               "omlx"      "$mlxserve_path" "$spec" "" ""
                 ;;
+            "mtplx|base")
+                [[ "$INCLUDE_MTPLX" -eq 1 ]] || continue
+                [[ "$HAS_MTPLX" -eq 1 ]] || { echo "  SKIP ${logical}/mtplx/${spec} (mtplx binary not found)" >&2; continue; }
+                run_cell "${logical}/mtplx/${spec}"              "mtplx"     "$mlxserve_path" "$spec" "" ""
+                ;;
             "mlx-serve|alt")
                 # mlx-serve loading the same .gguf LM Studio uses. PLD /
                 # drafter silently no-op on the llama.cpp path (those are
@@ -823,7 +951,7 @@ lms unload --all >/dev/null 2>&1 || true
 
 # Render the engine-comparison chart only when there's something to compare —
 # a bar chart of mlx-serve-only cells is just the CSV with extra steps.
-if [[ "$INCLUDE_LMSTUDIO" -eq 1 || "$INCLUDE_OMLX" -eq 1 ]]; then
+if [[ "$INCLUDE_LMSTUDIO" -eq 1 || "$INCLUDE_OMLX" -eq 1 || "$INCLUDE_MTPLX" -eq 1 ]]; then
     mkdir -p "$(dirname "$PNG_OUT")"
     python3 "$SCRIPT_DIR/plot_vs_lmstudio_omlx.py" "$OUT" "$PNG_OUT" --family "$FAMILY"
     echo

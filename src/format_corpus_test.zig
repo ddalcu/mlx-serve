@@ -88,6 +88,12 @@ const pi_edit_tool_schema =
     \\[{"type":"function","function":{"name":"edit","description":"Edit a file","parameters":{"type":"object","properties":{"path":{"type":"string"},"edits":{"type":"array","items":{"type":"object"}},"dry_run":{"type":"boolean"}},"required":["path","edits"]}}}]
 ;
 
+/// pi-style write/read pair — used by the hallucinated-raw-JSON (George
+/// Washington) entries to exercise the inferred-name-must-be-declared filter.
+const write_read_tools_schema =
+    \\[{"type":"function","function":{"name":"write","description":"Write a file","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}},{"type":"function","function":{"name":"read","description":"Read a file","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}}]
+;
+
 const corpus = [_]Expect{
     // ── Qwen 3.5/3.6 (<think> family, template-injected opener) ─────────────
     .{
@@ -636,6 +642,39 @@ const corpus = [_]Expect{
         .content_contains = "Settings",
         .no_tool_calls = true,
     },
+    // ── Hallucinated raw-JSON tool calls (George Washington class) ──────────
+    .{
+        // Live pi capture 2026-07-13 (Qwen3.6-35B-A3B distilled): generation
+        // hit max_tokens midway through a presidents data script. The raw-JSON
+        // fallback found the first balanced object — {"name": "George
+        // Washington", "num": 1, …} — and the flat-shape synthesis promoted it
+        // to a TOOL CALL named "George Washington". pi answered "Tool George
+        // Washington not found"; the model retried the identical mega-write and
+        // the session burned two 16K-token turns making zero progress. With the
+        // request's tools schema present, an INFERRED call whose name is
+        // undeclared is dropped: the text stays visible content and the
+        // client's own truncation recovery (finish_reason="length") fires.
+        .family = "qwen",
+        .name = "truncated data dict with a name field is not a hallucinated tool call",
+        .raw = "Now let me build a generator script that creates all 46 president pages:\n\n" ++
+            "presidents = [\n" ++
+            "  {\"name\": \"George Washington\", \"num\": 1, \"party\": \"None (Federalist-leaning)\", \"term\": \"1789\u{2013}1797\", \"vice\": \"John Adams\"},\n" ++
+            "  {\"name\": \"John Adams\", \"num\": 2, \"party\": \"Federalist\",",
+        .tools_json = write_read_tools_schema,
+        .no_tool_calls = true,
+        .content_contains = "presidents = [",
+    },
+    .{
+        // The counterweight: models WITHOUT a trained tool format (Gemma 3)
+        // emit fenced raw-JSON calls — a declared name must keep parsing.
+        .family = "gemma3",
+        .name = "fenced raw-JSON call with a DECLARED name still parses",
+        .raw = "```json\n{\"name\": \"write\", \"arguments\": {\"path\": \"a.txt\", \"content\": \"hi\"}}\n```",
+        .tools_json = write_read_tools_schema,
+        .tool_name = "write",
+        .tool_arg_key = "path",
+        .tool_arg_value = "a.txt",
+    },
 };
 
 /// Control tags that must never appear in visible content, regardless of
@@ -662,7 +701,7 @@ test "format corpus: recorded model outputs across families" {
 
         // ── Tool calls (when calls parse, content is suppressed and only
         // tool deltas + reasoning are emitted). ──
-        const calls = try chat.parseToolCalls(allocator, raw);
+        var calls = try chat.parseToolCalls(allocator, raw);
         defer if (calls) |cs| {
             for (cs) |tc| {
                 allocator.free(tc.name);
@@ -671,10 +710,14 @@ test "format corpus: recorded model outputs across families" {
             allocator.free(cs);
         };
 
-        // Mirror the server: when the request declared tools, the parsed
-        // arguments are coerced to the schema's types before any client sees
-        // them (server.parseToolCallsForRequest).
+        // Mirror the server chokepoint (server.parseToolCallsForRequest): when
+        // the request declared tools, (1) heuristically-inferred raw-JSON calls
+        // must name a DECLARED tool — a truncated data object is never a call
+        // (George Washington class; every entry with a tools_json is covered
+        // automatically) — then (2) arguments are coerced to the schema's types
+        // before any client sees them.
         if (entry.tools_json) |tj| {
+            if (calls) |cs| calls = try chat.filterInferredBySchema(allocator, cs, tj);
             if (calls) |cs| try chat.coerceToolArgsToSchema(allocator, cs, tj);
         }
 

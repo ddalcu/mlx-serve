@@ -3703,6 +3703,24 @@ pub const Transformer = struct {
     /// that keeps a 32 GB Mac serving a 26B alive.
     const PREFILL_EVAL_TRANSIENT_BUDGET: u64 = 2 << 30;
 
+    /// Forwards narrower than this skip the mid-loop eval cadence entirely.
+    /// Spec-decode VERIFY forwards (PLD/drafter/MTP: seq 2..~9) ride the
+    /// prefill layer loops because they're multi-token, but their lazy-graph
+    /// transients are decode-scale (KB-MB) — the periodic eval() that bounds
+    /// GB-scale prefill-chunk transients only costs them synchronous
+    /// pipeline drains. Measured (qwen3.6-27B, 64 layers, cadence 4 = 16
+    /// drains per MTP round): depth-1 rounds 48 ms where the AR forward is
+    /// ~34 ms, and the drain tax grows superlinearly with draft depth.
+    /// seq-1 decode never ran cadence evals, so exempting verify-width
+    /// forwards bounds nothing that wasn't already unbounded at decode.
+    const PREFILL_EVAL_MIN_SEQ: c_int = 32;
+
+    /// Pure gate: does the mid-loop eval cadence apply to a forward of this
+    /// width? (True = real prefill chunk; false = decode/spec-verify shape.)
+    pub fn prefillEvalCadenceApplies(seq_len: c_int) bool {
+        return seq_len >= PREFILL_EVAL_MIN_SEQ;
+    }
+
     /// Pure cadence pick for the prefill layer loops (standard/MoE/hybrid).
     fn prefillEvalCadence(
         default_cadence: u32,
@@ -4607,7 +4625,7 @@ pub const Transformer = struct {
                 h = h_scaled;
             }
 
-            if (is_prefill and (layer_idx + 1) % std_eval_cadence == 0) {
+            if (is_prefill and prefillEvalCadenceApplies(seq_len) and (layer_idx + 1) % std_eval_cadence == 0) {
                 try mlx.check(mlx.mlx_array_eval(h));
             }
         }
@@ -5186,7 +5204,7 @@ pub const Transformer = struct {
                 h = h_next;
             }
 
-            if (is_prefill and (layer_idx + 1) % moe_eval_cadence == 0) {
+            if (is_prefill and prefillEvalCadenceApplies(seq_len) and (layer_idx + 1) % moe_eval_cadence == 0) {
                 try mlx.check(mlx.mlx_array_eval(h));
             }
         }
@@ -5643,7 +5661,7 @@ pub const Transformer = struct {
                 h = h_next;
             }
 
-            if (seq_len > 1 and (layer_idx + 1) % hybrid_eval_cadence == 0) {
+            if (prefillEvalCadenceApplies(seq_len) and (layer_idx + 1) % hybrid_eval_cadence == 0) {
                 try mlx.check(mlx.mlx_array_eval(h));
             }
 
@@ -10484,6 +10502,24 @@ test "prefillEvalCadence: big unfused score tensor forces eval-per-layer" {
     // cap (generate.zig) does NOT restore the coarse cadence at long context.
     // (Live: this cadence measured peak 27.0 GB and +14% prefill vs baseline.)
     try t.expectEqual(@as(u32, 1), Transformer.prefillEvalCadence(4, 256, 16, 8, 1024, 102_448, false));
+}
+
+test "prefillEvalCadenceApplies: spec-verify-width forwards skip the cadence entirely" {
+    const t = std.testing;
+    // Spec-decode verify forwards (PLD/drafter/MTP: seq 2..9) are
+    // decode-shaped — KB-scale transients — but ride the prefill layer loop
+    // because they're multi-token. The mid-loop eval() cadence only costs
+    // them synchronous pipeline drains (measured: cadence 4 on the 64-layer
+    // qwen3.6-27B = 16 drains per MTP round, ~13 ms of a 48 ms depth-1
+    // round, superlinear in draft depth). seq-1 decode never ran cadence
+    // evals, so exempting verify widths bounds nothing new.
+    try t.expect(!Transformer.prefillEvalCadenceApplies(2));
+    try t.expect(!Transformer.prefillEvalCadenceApplies(9));
+    try t.expect(!Transformer.prefillEvalCadenceApplies(31));
+    // Real prefill chunks keep the cadence (and the budget-driven flip).
+    try t.expect(Transformer.prefillEvalCadenceApplies(32));
+    try t.expect(Transformer.prefillEvalCadenceApplies(512));
+    try t.expect(Transformer.prefillEvalCadenceApplies(8192));
 }
 
 test "prefillEvalCadence: quantized-KV dequant forces eval-per-layer even at fused head dims" {
