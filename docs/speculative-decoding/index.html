@@ -4,20 +4,20 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Speculative Decoding on Apple Silicon — PLD, Drafters, Native MTP · mlx-serve</title>
-  <meta name="description" content="Three speculation engines make local LLMs decode up to 2.65× faster on Apple Silicon with mathematically exact output: Prompt Lookup Decoding (on by default, any model), the Gemma 4 cross-attention drafter, and Qwen 3.6's native multi-token-prediction head. Adaptive gates keep novel content at parity.">
+  <meta name="description" content="Three speculation engines make local LLMs decode up to 2.1× faster on Apple Silicon with mathematically exact output: Prompt Lookup Decoding (on by default, any model), the Gemma 4 cross-attention drafter, and Qwen 3.6's native multi-token-prediction head. Adaptive gates keep novel content at parity.">
   <meta name="keywords" content="speculative decoding Apple Silicon, prompt lookup decoding, PLD LLM, draft model speculative decoding Mac, multi-token prediction Qwen, MTP inference, faster local LLM decode, MLX speculative decoding, exact speculative sampling">
   <meta name="author" content="David Dalcu">
   <link rel="canonical" href="https://ddalcu.github.io/mlx-serve/speculative-decoding/">
   <meta property="og:type" content="website">
   <meta property="og:url" content="https://ddalcu.github.io/mlx-serve/speculative-decoding/">
   <meta property="og:title" content="Speculative decoding: same output, just faster">
-  <meta property="og:description" content="PLD, cross-attention drafters, and native MTP — up to 2.65× on the workloads that matter, with mathematically exact output and gates that know when to quit.">
-  <meta property="og:image" content="https://ddalcu.github.io/mlx-serve/perf-vs-lmstudio-gemma-26.5.6.png">
+  <meta property="og:description" content="PLD, cross-attention drafters, and native MTP — up to 2.1× on the workloads that matter, with mathematically exact output and gates that know when to quit.">
+  <meta property="og:image" content="https://ddalcu.github.io/mlx-serve/perf-vs-lmstudio-gemma-26.7.6.png">
   <meta property="og:site_name" content="mlx-serve">
   <meta name="twitter:card" content="summary_large_image">
   <meta name="twitter:title" content="Speculative decoding: same output, just faster">
-  <meta name="twitter:description" content="PLD, cross-attention drafters, and native MTP — up to 2.65× with mathematically exact output.">
-  <meta name="twitter:image" content="https://ddalcu.github.io/mlx-serve/perf-vs-lmstudio-gemma-26.5.6.png">
+  <meta name="twitter:description" content="PLD, cross-attention drafters, and native MTP — up to 2.1× with mathematically exact output.">
+  <meta name="twitter:image" content="https://ddalcu.github.io/mlx-serve/perf-vs-lmstudio-gemma-26.7.6.png">
   <script type="application/ld+json">
   {
     "@context": "https://schema.org",
@@ -46,7 +46,7 @@
       {
         "@type": "Question",
         "name": "What is native multi-token prediction (MTP)?",
-        "acceptedAnswer": { "@type": "Answer", "text": "Some Qwen 3.6 checkpoints ship a small trained head that predicts the next few tokens alongside the main forward pass. mlx-serve auto-loads it and speculates with the model's own predictions — up to 1.8× on agent-style edit loops and 1.43× on code, with a controller that watches acceptance per request and adapts draft depth. Zero setup." }
+        "acceptedAnswer": { "@type": "Answer", "text": "Some Qwen 3.6 checkpoints ship a small trained head that predicts the next few tokens alongside the main forward pass. mlx-serve auto-loads it and speculates with the model's own predictions — 2× on code and agent-style edit loops (29 to 58 tok/s on Qwen3.6-27B), with a controller that watches acceptance per request and adapts draft depth. Zero setup." }
       },
       {
         "@type": "Question",
@@ -61,6 +61,7 @@
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
   <link rel="stylesheet" href="../assets/feature.css">
+  <link rel="stylesheet" href="../assets/perf-chart.css">
   <style>:root { --accent: #d97706; --accent2: #ff6723; }</style>
 </head>
 <body>
@@ -83,7 +84,7 @@
     <div class="hero-f-glow"><span class="g1"></span><span class="g2"></span></div>
     <div class="crumbs"><a href="../">mlx-serve</a><span class="sep">/</span><span class="here">Deep dive · Speculative decoding</span></div>
     <h1>Same output.<br><span class="grad">Just faster.</span></h1>
-    <p class="hero-f-sub">Three speculation engines draft tokens ahead and let the model <b>verify them exactly</b> — byte-identical greedy output, mathematically exact sampling. Up to <b>2.65×</b> on the workloads local models actually run.</p>
+    <p class="hero-f-sub">Three speculation engines draft tokens ahead and let the model <b>verify them exactly</b> — byte-identical greedy output, mathematically exact sampling. Up to <b>2.1×</b> on the workloads local models actually run.</p>
     <div class="hero-ctas">
       <a href="https://github.com/ddalcu/mlx-serve/releases/latest/download/MLXCore.dmg" class="btn btn-primary">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
@@ -105,15 +106,23 @@
       <p class="section-desc">Apple M-series, 4-bit MLX weights, temp 0. Reproduce with <code>tests/bench.sh</code> — the harness ships in the repo.</p>
     </div>
     <div class="stat-band reveal" style="margin-bottom: 56px;">
-      <div class="stat"><div class="n">2.65×</div><div class="l">echo workloads · Gemma 4 E4B + PLD</div></div>
+      <div class="stat"><div class="n">2.1×</div><div class="l">echo workloads · Gemma 4 E2B + PLD (407 tok/s)</div></div>
       <div class="stat"><div class="n">1.61×</div><div class="l">agentic code edits · Gemma 4 E4B</div></div>
-      <div class="stat"><div class="n">1.8×</div><div class="l">agent edit loops · Qwen 3.6 native MTP</div></div>
+      <div class="stat"><div class="n">2×</div><div class="l">code &amp; agent edits · Qwen 3.6 native MTP</div></div>
       <div class="stat"><div class="n">1.0×</div><div class="l">creative writing — gated, no regression</div></div>
     </div>
-    <figure class="shot reveal">
-      <div class="shot-frame"><img src="../perf-vs-lmstudio-gemma-26.5.6.png" alt="Benchmark chart showing mlx-serve PLD and drafter speedups vs LM Studio across Gemma 4 models" loading="lazy"></div>
-      <figcaption>PLD takes the top bar on echo-heavy workloads; the drafter wins Gemma 4 code completion.</figcaption>
-    </figure>
+    <div class="chart-card reveal">
+      <div class="chart-pills" id="chartPills"></div>
+      <div class="chart-canvas-wrap">
+        <canvas id="perfChart"></canvas>
+        <div class="chart-tooltip" id="chartTooltip"></div>
+      </div>
+      <div class="chart-legend" id="chartLegend"></div>
+      <p class="chart-caption">
+        <b>Decode</b> = free-form generation · <b>Echo</b> = high-repetition (where PLD shines) · <b>Code</b> = code completion (where the drafter and native MTP shine).
+        Tokens per second — higher is better. Apple M4 Max (128 GB) · identical 4-bit MLX weights · ctx 4096 · temp 0 · LM Studio (MLX runtime) as baseline. Hover a bar for the exact number.
+      </p>
+    </div>
   </section>
 
   <section class="section section-alt" id="engines">
@@ -135,7 +144,7 @@
       <div class="mini-card reveal">
         <span class="mini-k">MTP · Qwen 3.6</span>
         <h4>The model drafts itself</h4>
-        <p>Checkpoints shipping a trained <code>mtp/</code> sidecar speculate with <b>the model's own prediction head</b> — auto-loaded, self-tuning depth, up to 1.8× on agent loops and 1.43× on code. Zero setup.</p>
+        <p>Checkpoints shipping a trained <code>mtp/</code> sidecar speculate with <b>the model's own prediction head</b> — auto-loaded, self-tuning depth-3 drafting, 2× on code and agent edits (29 → 58.4 tok/s on the 27B) — and it out-decodes the reference MTP runtime at all 8 context rungs, 0.5K–64K. Zero setup.</p>
       </div>
     </div>
   </section>
@@ -262,5 +271,6 @@
   </footer>
 
   <script src="../assets/feature.js"></script>
+  <script src="../assets/perf-chart.js"></script>
 </body>
 </html>

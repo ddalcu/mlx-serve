@@ -55,6 +55,7 @@ set -uo pipefail
 # ── Defaults ──
 FAMILY=""
 ONLY=""   # substring filter on the logical target name (e.g. "e2b", "31b"); empty = all
+SPECS_ONLY="" # substring filter on the spec entry (e.g. "mlx-serve", "lmstudio"); empty = all
 RAW=0     # when 1, drop the PLD/drafter mlx-serve cells (raw apples-to-apples only)
 THINKING=0 # when 1, enable reasoning on every engine (fair same-workload Qwen comparison)
 RUNS=2
@@ -98,6 +99,10 @@ across {none, pld, drafter} and the prefill/decode/echo/code prompts. Add
 
 Options:
   --family NAME        Model family: 'gemma' or 'qwen36' (required)
+  --only SUBSTR        Only run targets whose logical name contains SUBSTR
+  --specs SUBSTR       Only run spec entries containing SUBSTR (e.g.
+                       'mlx-serve' or 'lmstudio') — split long rows across
+                       invocations, then merge the --keep-csv slices
   --lmstudio           Include LM Studio cells (MLX baseline + GGUF alt where
                        configured). Requires \`lms\` CLI; LM Studio handles JIT
                        model load on the warmup curl.
@@ -131,6 +136,7 @@ while [[ $# -gt 0 ]]; do
     case "$1" in
         --family)     FAMILY="$2"; shift 2 ;;
         --only)       ONLY="$2"; shift 2 ;;
+        --specs)      SPECS_ONLY="$2"; shift 2 ;;
         --raw)        RAW=1; shift ;;
         --thinking)   THINKING=1; shift ;;
         --lmstudio)   INCLUDE_LMSTUDIO=1; shift ;;
@@ -200,7 +206,12 @@ case "$FAMILY" in
             "gemma4-e4b-4bit|$LMS_DIR/mlx-community/gemma-4-e4b-it-4bit|mlx-community/gemma-4-e4b-it|google/gemma-4-e4b|$DM/gemma-4-E4B-it-assistant-bf16|$GGUF_DIR/gemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q4_K_M.gguf"
             "gemma4-12b-4bit|$LMS_DIR/mlx-community/gemma-4-12B-it-4bit|mlx-community/gemma-4-12b-it|google/gemma-4-12b|$DM/gemma-4-12B-it-assistant-bf16|$GGUF_DIR/gemma-4-12B-it-GGUF/gemma-4-12B-it-Q4_K_M.gguf"
             "gemma4-12b-qat-4bit|$LMS_DIR/mlx-community/gemma-4-12b-it-qat-4bit|mlx-community/gemma-4-12b-it-qat|google/gemma-4-12b-qat|$DM/gemma-4-12B-it-assistant-bf16|$GGUF_DIR/gemma-4-12B-it-QAT-GGUF/gemma-4-12B-it-QAT-Q4_0.gguf"
-            "gemma4-26b-a4b-moe-4bit|$MD/gemma-4-26b-a4b-it-4bit|mlx-community/gemma-4-26b-a4b-it|google/gemma-4-26b-a4b|$DM/gemma-4-26B-A4B-it-assistant-bf16|$GGUF_DIR/gemma-4-26B-A4B-it-GGUF/gemma-4-26B-A4B-it-Q4_K_M.gguf"
+            # 26B-A4B row: the QAT 4-bit checkpoint (the non-qat MLX dir was
+            # retired). Both engines load the SAME weights from the LMS dir;
+            # LM Studio advertises this side-loaded dir with a bare id (no
+            # mlx-community/ prefix) — verified via /v1/models. The GGUF alt
+            # stays the non-QAT Q4_K_M (same file on both engines).
+            "gemma4-26b-a4b-moe-qat-4bit|$LMS_DIR/mlx-community/gemma-4-26B-A4B-it-qat-4bit|gemma-4-26b-a4b-it-qat|google/gemma-4-26b-a4b|$DM/gemma-4-26B-A4B-it-assistant-bf16|$GGUF_DIR/gemma-4-26B-A4B-it-GGUF/gemma-4-26B-A4B-it-Q4_K_M.gguf"
             "gemma4-31b-4bit|$LMS_DIR/mlx-community/gemma-4-31b-it-4bit|mlx-community/gemma-4-31b-it|google/gemma-4-31b|$DM/gemma-4-31B-it-assistant-bf16|$GGUF_DIR/gemma-4-31B-it-GGUF/gemma-4-31B-it-Q4_K_M.gguf"
         )
         # Specs measured (per row): mlx-serve {none,pld,drafter} + mlx-serve
@@ -223,13 +234,21 @@ case "$FAMILY" in
         # the more representative production checkpoint here). GGUFs are the
         # lmstudio-community Q4_K_M vendored builds.
         TARGETS=(
-            "qwen36-27b|$LMS_DIR/mlx-community/Qwen3.6-27B-4bit|mlx-community/qwen3.6-27b|qwen/qwen3.6-27b||$GGUF_DIR/Qwen3.6-27B-GGUF/Qwen3.6-27B-Q4_K_M.gguf"
-            "qwen36-35b-a3b|$LMS_DIR/mlx-community/Qwen3.6-35B-A3B-4bit|mlx-community/qwen3.6-35b-a3b|qwen/qwen3.6-35b-a3b||$GGUF_DIR/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-Q4_K_M.gguf"
+            # LM Studio advertises these side-loaded dirs with bare ids (no
+            # mlx-community/ prefix) — verified via /v1/models on 0.4.15.
+            "qwen36-27b|$LMS_DIR/mlx-community/Qwen3.6-27B-4bit|qwen3.6-27b|qwen/qwen3.6-27b||$GGUF_DIR/Qwen3.6-27B-GGUF/Qwen3.6-27B-Q4_K_M.gguf"
+            "qwen36-35b-a3b|$LMS_DIR/mlx-community/Qwen3.6-35B-A3B-4bit|qwen3.6-35b-a3b|qwen/qwen3.6-35b-a3b||$GGUF_DIR/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-Q4_K_M.gguf"
         )
         # Same ordering rule as gemma: mlx-serve MLX first (cool machine),
         # mlx-serve GGUF next, omlx in the middle, LMS specs last so any
         # thermal throttling penalises the comparison engines, not us.
-        SPECS=("mlx-serve::none" "mlx-serve::pld" "mlx-serve:alt:none" "omlx:base:none" "lmstudio:lms_baseline:none" "lmstudio:lms_alt:none")
+        # `mtp` = the native multi-token-prediction sidecar shipped inside
+        # these checkpoints (mtp/weights.safetensors / model-mtp.safetensors).
+        # It is mlx-serve's out-of-the-box default on the dense 27B, so it
+        # gets its own labeled cell; `none`/`pld` pass --no-mtp so their
+        # labels stay truthful (priority is MTP > PLD when the sidecar is
+        # loaded — without --no-mtp both cells would silently measure MTP).
+        SPECS=("mlx-serve::none" "mlx-serve::pld" "mlx-serve::mtp" "mlx-serve:alt:none" "omlx:base:none" "lmstudio:lms_baseline:none" "lmstudio:lms_alt:none")
         # Qwen 3.6's chat template auto-activates `<think>` mode; LM Studio
         # ignores `chat_template_kwargs.enable_thinking:false`, so build_body_lms
         # uses the stacked workaround when this flag is on.
@@ -246,7 +265,7 @@ esac
 if [[ "$RAW" -eq 1 ]]; then
     _raw_specs=()
     for _s in "${SPECS[@]}"; do
-        [[ "$_s" == *":pld" || "$_s" == *":drafter" ]] && continue
+        [[ "$_s" == *":pld" || "$_s" == *":drafter" || "$_s" == *":mtp" ]] && continue
         _raw_specs+=("$_s")
     done
     SPECS=("${_raw_specs[@]}")
@@ -286,12 +305,16 @@ def is_palindrome(s: str) -> bool:
 # silently ignores chat_template_kwargs.enable_thinking:false on this family.
 build_body_mlx() {
     local prompt="$1" spec="$2" mt="$3"
-    local epld=false edrft=false think=false
+    local epld=false edrft=false emtp=false think=false
     [[ "$spec" == "pld" ]]     && epld=true
     [[ "$spec" == "drafter" ]] && edrft=true
+    # enable_mtp:true is the per-request opt-in for MoE targets (default-off
+    # there); on dense targets it matches the default. none/pld cells rely on
+    # the server-side --no-mtp instead so this stays a plain default-false.
+    [[ "$spec" == "mtp" ]]     && emtp=true
     [[ "$THINKING" == "1" ]]   && think=true
-    jq -nc --arg p "$prompt" --argjson mt "$mt" --argjson epld "$epld" --argjson edrft "$edrft" --argjson think "$think" \
-        '{model:"x", messages:[{role:"user",content:$p}], max_tokens:$mt, temperature:0.0, top_p:1.0, stream:false, enable_thinking:$think, enable_pld:$epld, enable_drafter:$edrft}'
+    jq -nc --arg p "$prompt" --argjson mt "$mt" --argjson epld "$epld" --argjson edrft "$edrft" --argjson emtp "$emtp" --argjson think "$think" \
+        '{model:"x", messages:[{role:"user",content:$p}], max_tokens:$mt, temperature:0.0, top_p:1.0, stream:false, enable_thinking:$think, enable_pld:$epld, enable_drafter:$edrft, enable_mtp:$emtp}'
 }
 
 build_body_lms() {
@@ -550,8 +573,9 @@ start_engine() {
         mlx-serve)
             local extra=""
             case "$spec" in
-                none)    extra="--no-pld" ;;
-                pld)     extra="" ;;
+                none)    extra="--no-pld --no-mtp" ;;
+                pld)     extra="--no-mtp" ;;
+                mtp)     extra="--no-pld" ;;
                 drafter) [[ -z "$drafter" ]] && { echo "  drafter spec missing --drafter dir" >&2; return 1; }
                          extra="--no-pld --drafter $drafter" ;;
             esac
@@ -751,6 +775,11 @@ for row in "${TARGETS[@]}"; do
     [[ -d "$mlxserve_path" ]] || { echo "SKIP missing $mlxserve_path" >&2; continue; }
 
     for spec_entry in "${SPECS[@]}"; do
+        # --specs: substring filter on the spec entry ("mlx-serve" matches all
+        # four mlx-serve cells incl. the GGUF alt; "lmstudio" the two LMS
+        # cells). Lets a long row be split across invocations so each stays
+        # under an external per-call time cap; merge the --keep-csv slices.
+        [[ -n "$SPECS_ONLY" && "$spec_entry" != *"$SPECS_ONLY"* ]] && continue
         IFS=':' read -r engine variant spec <<<"$spec_entry"
         case "$engine|$variant" in
             "lmstudio|lms_baseline")

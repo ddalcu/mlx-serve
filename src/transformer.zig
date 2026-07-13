@@ -201,11 +201,13 @@ fn getGdnKernelSeq() !mlx.mlx_fast_metal_kernel {
 // and Qwen3.5/3.6 checkpoint ships head_dim 256, which used to fall back to
 // the composed path that MATERIALIZES a [heads, chunk, total_kv] bf16 score
 // tensor per layer (26.8 GB/layer at a 102K prompt — the long-context OOM
-// class, commit 7550895 budgeted around it). This kernel is a faithful
-// self-contained port of MLX's steel attention (FA-2 online softmax,
-// BQ=32/BK=16, 4 simdgroups, float32 accumulation, exp2 softmax) specialized
-// to BD=256, extended with an optional sliding-window band so Gemma's local
-// layers ("array" mask during prefill) are covered too. The score tensor
+// class, commit 7550895 budgeted around it). This kernel started as a
+// faithful self-contained port of MLX's steel attention (FA-2 online
+// softmax, float32 accumulation, exp2 softmax) specialized to BD=256; the
+// v2 tiles (BQ=64, BK=32, 8 simdgroups, register-resident Q, uint4 staging
+// — see the geometry comment above ATTN256_KERNEL_SOURCE) are our own,
+// picked by micro-bench sweep. An optional sliding-window band covers
+// Gemma's local layers ("array" mask during prefill) too. The score tensor
 // never exists — O(tile) working memory — so the three prefill OOM guards
 // (generate.boundedPrefillChunk / prefillEvalCadence / server.prefillMemoryNeeded)
 // drop their score term via `prefillHeadDimFused` when this kernel is active.
@@ -260,13 +262,27 @@ const ATTN256_KERNEL_HEADER =
     \\
 ;
 
+// v2 tile geometry (2026-07-12 micro-bench sweep on the M4 Max, Qwen 24q/4kv
+// and Gemma geometries): BQ=64 with 8 simdgroups halves the K/V staging walks
+// per query row vs the v1 32-row tile; BK=32 halves the per-column softmax
+// rescale + barrier overhead; Q lives in REGISTERS loaded straight from
+// global (no Q smem at all — that memory goes to the wider K tile); staging
+// runs on uint4 (8 bf16 per instruction, was scalar). Measured vs v1 at
+// (qL x kL): (2048x16384) 250 -> 73 ms, (2048x65536) 999 -> 325 ms,
+// (8192x8192) 279 -> 77 ms. vs the composed path the v2 kernel wins where
+// kL <= ~4*qL (+63% at ratio 1, +15% at 2, +1.8% at 4) and loses beyond
+// (-2.3% at 6, -6% at 8) — the causal arm's ratio gate (fusedSdpa256Prefill)
+// encodes exactly that envelope. Rejected variants (measured worse): BK=8
+// ping-pong (per-block rescale doubles), V-from-global fragments (device
+// loads too slow), K-only double-buffer (barrier structure unchanged),
+// Q-smem BQ=32 with 2 threadgroups/core (SLC thrash at long kL).
 const ATTN256_KERNEL_SOURCE =
-    \\constexpr int BQ = 32;
-    \\constexpr int BK = 16;
+    \\constexpr int BQ = 64;
+    \\constexpr int BK = 32;
     \\constexpr int BD = 256;
-    \\constexpr int LDQ = BD + 8;
     \\constexpr int LDK = BK + 8;
     \\constexpr int LDV = BD + 8;
+    \\constexpr int NT = 256;
     \\
     \\const int qL = q_shape[2];
     \\const int kL = k_shape[2];
@@ -295,29 +311,40 @@ const ATTN256_KERNEL_SOURCE =
     \\const device T* Vp = v + bb * v_strides[0] + (hq / gqa) * v_strides[1];
     \\device T* Op = out + (((long)bb * Hq + hq) * (long)qL + (long)(tqx * BQ)) * BD;
     \\
-    \\// K^T tile [BD][LDK] (6144 elems) is strictly larger than the V tile
-    \\// [BK][LDV] (4224) — share one buffer, steel-style (barriers separate
+    \\// K^T tile [BD][LDK] (20.5 KB) is strictly larger than the V tile
+    \\// [BK][LDV] (16.9 KB) — share one buffer, steel-style (barriers separate
     \\// the K reads from the V staging).
-    \\threadgroup T Qs[BQ * LDQ];
     \\threadgroup T KVs[LDK * BD];
     \\threadgroup T* Ks = KVs;
     \\threadgroup T* Vs = KVs;
     \\
-    \\// Stage Q once (zero-fill past the partial tail tile).
     \\const int q_rows = metal::min(BQ, qL - tqx * BQ);
-    \\for (int i = tix; i < BQ * BD; i += 128) {
-    \\  const int r = i >> 8;
-    \\  const int c = i & (BD - 1);
-    \\  Qs[r * LDQ + c] = (r < q_rows) ? Qp[r * q_strides[2] + c] : T(0);
-    \\}
     \\
     \\const short2 sc = msv_coord(lane);
     \\const short sn = sc.x;
     \\const short sm = sc.y;
     \\const short tm = 8 * short(warp);
-    \\const int Qs_off = (tm + sm) * LDQ + sn;
     \\const int Ks_off = sm * LDK + sn;
     \\const int Vs_off = sm * LDV + sn;
+    \\
+    \\// Q fragment straight from global into registers, once per threadgroup:
+    \\// row (tm+sm), element pairs (dd*8+sn, +1). sn is always even, so the
+    \\// vec2 load is 4B-aligned for any row whose stride is even (structural:
+    \\// q rows stride 256). Rows past the ragged tail read zero — their
+    \\// outputs are discarded by the store guard.
+    \\float2 Qfrag[BD / 8];
+    \\{
+    \\  const int qr = tm + sm;
+    \\  if (qr < q_rows) {
+    \\    const device T* Qrow = Qp + (long)qr * q_strides[2];
+    \\    for (int dd = 0; dd < BD / 8; ++dd) {
+    \\      const vec<T, 2> p = *((const device vec<T, 2>*)(Qrow + dd * 8 + sn));
+    \\      Qfrag[dd] = float2(float(p.x), float(p.y));
+    \\    }
+    \\  } else {
+    \\    for (int dd = 0; dd < BD / 8; ++dd) Qfrag[dd] = float2(0.0f);
+    \\  }
+    \\}
     \\
     \\float2 Ofrag[BD / 8];
     \\for (int i = 0; i < BD / 8; ++i) Ofrag[i] = float2(0.0f);
@@ -340,12 +367,26 @@ const ATTN256_KERNEL_SOURCE =
     \\  const int c0 = kb * BK;
     \\  const int rows_k = metal::min(BK, kL - c0);
     \\
-    \\  // Stage K transposed: Ks[d][kk].
+    \\  // Stage K transposed (Ks[d][kk]): uint4 global loads (8 bf16 each),
+    \\  // scalar transposed scatter into smem.
     \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\  for (int i = tix; i < BK * BD; i += 128) {
-    \\    const int r = i >> 8;
-    \\    const int c = i & (BD - 1);
-    \\    Ks[c * LDK + r] = (r < rows_k) ? Kp[(long)(c0 + r) * k_strides[2] + c] : T(0);
+    \\  for (int i = tix; i < BK * (BD / 8); i += NT) {
+    \\    const int r = i >> 5;
+    \\    const int c8 = i & 31;
+    \\    uint4 w = uint4(0);
+    \\    if (r < rows_k) {
+    \\      w = *((const device uint4*)(Kp + (long)(c0 + r) * k_strides[2]) + c8);
+    \\    }
+    \\    thread T* e = (thread T*)&w;
+    \\    const int cb = c8 * 8;
+    \\    Ks[(cb + 0) * LDK + r] = e[0];
+    \\    Ks[(cb + 1) * LDK + r] = e[1];
+    \\    Ks[(cb + 2) * LDK + r] = e[2];
+    \\    Ks[(cb + 3) * LDK + r] = e[3];
+    \\    Ks[(cb + 4) * LDK + r] = e[4];
+    \\    Ks[(cb + 5) * LDK + r] = e[5];
+    \\    Ks[(cb + 6) * LDK + r] = e[6];
+    \\    Ks[(cb + 7) * LDK + r] = e[7];
     \\  }
     \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
     \\
@@ -353,16 +394,21 @@ const ATTN256_KERNEL_SOURCE =
     \\  float2 Sfrag[BK / 8];
     \\  for (int i = 0; i < BK / 8; ++i) Sfrag[i] = float2(0.0f);
     \\  for (int dd = 0; dd < BD / 8; ++dd) {
-    \\    const float2 qf = float2(float(Qs[Qs_off + dd * 8]),
-    \\                             float(Qs[Qs_off + dd * 8 + 1]));
+    \\    const float2 qf = Qfrag[dd];
     \\    const int kbase = Ks_off + dd * 8 * LDK;
     \\    const float2 kf0 = float2(float(Ks[kbase]), float(Ks[kbase + 1]));
     \\    const float2 kf1 = float2(float(Ks[kbase + 8]), float(Ks[kbase + 9]));
+    \\    const float2 kf2 = float2(float(Ks[kbase + 16]), float(Ks[kbase + 17]));
+    \\    const float2 kf3 = float2(float(Ks[kbase + 24]), float(Ks[kbase + 25]));
     \\    msv_mma(Sfrag[0], qf, kf0);
     \\    msv_mma(Sfrag[1], qf, kf1);
+    \\    msv_mma(Sfrag[2], qf, kf2);
+    \\    msv_mma(Sfrag[3], qf, kf3);
     \\  }
     \\  Sfrag[0] *= scale_log2e;
     \\  Sfrag[1] *= scale_log2e;
+    \\  Sfrag[2] *= scale_log2e;
+    \\  Sfrag[3] *= scale_log2e;
     \\
     \\  // Masking: kL remainder + causal + sliding band, all element-wise.
     \\  const bool tail_k = (rows_k < BK);
@@ -381,23 +427,32 @@ const ATTN256_KERNEL_SOURCE =
     \\    }
     \\  }
     \\
-    \\  // Stage V (same smem as K — K reads are done).
+    \\  // Stage V (same smem as K — K reads are done): uint4 on both sides.
     \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\  for (int i = tix; i < BK * BD; i += 128) {
-    \\    const int r = i >> 8;
-    \\    const int c = i & (BD - 1);
-    \\    Vs[r * LDV + c] = (r < rows_k) ? Vp[(long)(c0 + r) * v_strides[2] + c] : T(0);
+    \\  for (int i = tix; i < BK * (BD / 8); i += NT) {
+    \\    const int r = i >> 5;
+    \\    const int c8 = i & 31;
+    \\    uint4 w = uint4(0);
+    \\    if (r < rows_k) {
+    \\      w = *((const device uint4*)(Vp + (long)(c0 + r) * v_strides[2]) + c8);
+    \\    }
+    \\    *((threadgroup uint4*)(Vs + r * LDV) + c8) = w;
     \\  }
     \\
     \\  // Online softmax (registers only, overlaps the V staging above).
     \\  float new_max = max_score;
     \\  new_max = metal::max(new_max, msv_row_max(Sfrag[0]));
     \\  new_max = metal::max(new_max, msv_row_max(Sfrag[1]));
+    \\  new_max = metal::max(new_max, msv_row_max(Sfrag[2]));
+    \\  new_max = metal::max(new_max, msv_row_max(Sfrag[3]));
     \\  Sfrag[0] = metal::exp2(Sfrag[0] - new_max);
     \\  Sfrag[1] = metal::exp2(Sfrag[1] - new_max);
+    \\  Sfrag[2] = metal::exp2(Sfrag[2] - new_max);
+    \\  Sfrag[3] = metal::exp2(Sfrag[3] - new_max);
     \\  const float factor = metal::exp2(max_score - new_max);
     \\  max_score = new_max;
-    \\  const float rowsum = msv_row_sum(Sfrag[0]) + msv_row_sum(Sfrag[1]);
+    \\  const float rowsum = msv_row_sum(Sfrag[0]) + msv_row_sum(Sfrag[1])
+    \\      + msv_row_sum(Sfrag[2]) + msv_row_sum(Sfrag[3]);
     \\  sum_score = sum_score * factor + rowsum;
     \\  for (int i = 0; i < BD / 8; ++i) Ofrag[i] *= factor;
     \\
@@ -409,8 +464,14 @@ const ATTN256_KERNEL_SOURCE =
     \\    const float2 vf0 = float2(float(Vs[vbase]), float(Vs[vbase + 1]));
     \\    const float2 vf1 = float2(float(Vs[vbase + 8 * LDV]),
     \\                              float(Vs[vbase + 8 * LDV + 1]));
+    \\    const float2 vf2 = float2(float(Vs[vbase + 16 * LDV]),
+    \\                              float(Vs[vbase + 16 * LDV + 1]));
+    \\    const float2 vf3 = float2(float(Vs[vbase + 24 * LDV]),
+    \\                              float(Vs[vbase + 24 * LDV + 1]));
     \\    msv_mma(Ofrag[id], Sfrag[0], vf0);
     \\    msv_mma(Ofrag[id], Sfrag[1], vf1);
+    \\    msv_mma(Ofrag[id], Sfrag[2], vf2);
+    \\    msv_mma(Ofrag[id], Sfrag[3], vf3);
     \\  }
     \\}
     \\
@@ -455,7 +516,7 @@ fn getAttn256Kernel() !mlx.mlx_fast_metal_kernel {
 /// seam: `fused256_override` forces BOTH arms on/off without the environment.
 pub var fused256_override: ?bool = null;
 var fused256_env_cached: ?bool = null;
-var fused256_causal_env_cached: ?bool = null;
+var fused256_causal_env_cached: ?Fused256CausalMode = null;
 
 pub fn fused256Enabled() bool {
     if (fused256_override) |v| return v;
@@ -466,36 +527,48 @@ pub fn fused256Enabled() bool {
     return enabled;
 }
 
-/// The plain-CAUSAL arm is EXPERIMENTAL, default off (MLX_SERVE_FUSED_256_CAUSAL=1
-/// enables). Measured on Qwen3.6-27B (24q/4kv, gqa 6) at 16K ctx: fused causal
-/// 186 tok/s vs composed 216 — each threadgroup re-stages its kv-group's K/V
-/// while the composed batched GEMM shares the K operand across the 6 q-heads
-/// of a group. Until the kernel batches a kv-group's q-heads per threadgroup,
-/// causal stays composed. The SLIDING-BAND arm (window > 0) has no such
-/// competition — composed computes full-width scores + a GB-scale mask while
-/// the kernel block-skips outside the band (gemma-26B 99K: 317 -> 712 tok/s)
-/// — so it rides the master switch alone.
-pub fn fused256CausalEnabled() bool {
-    if (fused256_override) |v| return v;
-    if (!fused256Enabled()) return false;
+/// Plain-CAUSAL dispatch mode. Default `.off`: composed GQA GEMM keeps
+/// causal prefill. The v2 kernel BEATS composed on the µbench at kL <= 2*qL
+/// (+63% at ratio 1, +15% at 2, +80% at 8192x8192) — but LIVE on the
+/// Qwen3.6-27B ladder (transposed-Q views, warm GPU, kernel interleaved
+/// with GDN/MLP work in one command stream) every ratio-gated variant
+/// measured a NET LOSS in same-boot A/Bs (8K: fused-to-ratio-4 231.5,
+/// fused-to-ratio-2 232.9, composed 234.7 tok/s — monotonic: more fused =
+/// slower). Until that µbench-vs-live gap is understood, causal stays
+/// composed; the 2048 chunk cap (generate.boundedPrefillChunk, non-sliding
+/// archs) is what actually closed the qwen prefill gap.
+/// MLX_SERVE_FUSED_256_CAUSAL=1 forces ALL causal calls through the kernel
+/// (perf experiments — the v2 tiles cut the forced path's deficit from
+/// ~3.5x at long kv to ~6-10%). The SLIDING-BAND arm (window > 0) has no
+/// such competition — composed computes full-width scores + a GB-scale mask
+/// while the kernel block-skips outside the band (gemma-26B 99K: 317 -> 712
+/// tok/s) — so it rides the master switch alone.
+pub const Fused256CausalMode = enum { all, off };
+
+pub fn fused256CausalMode() Fused256CausalMode {
+    if (fused256_override) |v| return if (v) .all else .off;
+    if (!fused256Enabled()) return .off;
     if (fused256_causal_env_cached) |v| return v;
-    const raw = std.c.getenv("MLX_SERVE_FUSED_256_CAUSAL");
-    const enabled = raw != null and std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "1");
-    fused256_causal_env_cached = enabled;
-    return enabled;
+    const mode: Fused256CausalMode = blk: {
+        const raw = std.c.getenv("MLX_SERVE_FUSED_256_CAUSAL") orelse break :blk .off;
+        if (std.mem.eql(u8, std.mem.sliceTo(raw, 0), "1")) break :blk .all;
+        break :blk .off;
+    };
+    fused256_causal_env_cached = mode;
+    return mode;
 }
 
 /// ONE predicate consumed by the three prefill OOM guards AND the dispatch
 /// sites: true when prefill attention at this head_dim will NOT materialize
 /// the composed [heads, chunk, total_kv] score tensor — either MLX's own
 /// fused kernel covers it (<= 128) or our hd-256 kernel does for EVERY arm.
-/// Keyed on the CAUSAL arm: with causal composed (the default), score
+/// Keyed on causal mode `.all`: with causal composed (the default), score
 /// tensors still materialize for causal layers (gemma global layers, every
 /// qwen full-attn layer), so the guards must keep billing them; sliding
 /// layers going fused only makes that conservative, never wrong. Guards and
 /// dispatch must never drift (the effectivePrefillChunk rule).
 pub fn prefillHeadDimFused(head_dim: u32) bool {
-    return head_dim <= 128 or (head_dim == 256 and fused256CausalEnabled());
+    return head_dim <= 128 or (head_dim == 256 and fused256CausalMode() == .all);
 }
 
 /// Try the fused hd-256 flash prefill kernel (msv_attn_p256). Returns null
@@ -518,11 +591,11 @@ pub fn fusedSdpa256Prefill(
     window: c_int,
 ) !?mlx.mlx_array {
     // Band arm rides the master switch; plain causal is opt-in (see
-    // fused256CausalEnabled — composed GQA GEMM wins causal today).
+    // fused256CausalMode — composed wins live on qwen chunked prefill).
     if (window > 0) {
         if (!fused256Enabled()) return null;
     } else {
-        if (!fused256CausalEnabled()) return null;
+        if (fused256CausalMode() == .off) return null;
     }
     if (mlx.mlx_array_ndim(q) != 4 or mlx.mlx_array_ndim(k) != 4 or mlx.mlx_array_ndim(v) != 4) return null;
     const qs = mlx.getShape(q);
@@ -553,12 +626,12 @@ pub fn fusedSdpa256Prefill(
     defer _ = mlx.mlx_fast_metal_kernel_config_free(config);
     const o_shape = [_]c_int{ qs[0], qs[1], qs[2], 256 };
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &o_shape, 4, .bfloat16));
-    // One threadgroup (32,4,1) per 32-row q tile per head per batch; grid is
+    // One threadgroup (32,8,1) per 64-row q tile per head per batch; grid is
     // in THREADS (dispatch_threads), padded to whole tiles so every
-    // threadgroup is full (the cooperative staging loops assume 128).
-    const nq_tiles: c_int = @divTrunc(qs[2] + 31, 32);
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, nq_tiles * 32, qs[1] * 4, qs[0]));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 32, 4, 1));
+    // threadgroup is full (the cooperative staging loops assume NT=256).
+    const nq_tiles: c_int = @divTrunc(qs[2] + 63, 64);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, nq_tiles * 32, qs[1] * 8, qs[0]));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 32, 8, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "T", .bfloat16));
 
     const inputs_arr = [_]mlx.mlx_array{ q, k, v, scl, win };
@@ -10588,4 +10661,58 @@ test "fusedSdpa256Prefill: declines cleanly outside its envelope" {
     const q = try attn256RandBf16(rnd, &q_shape, s);
     defer _ = mlx.mlx_array_free(q);
     try std.testing.expect((try fusedSdpa256Prefill(s, q, q, q, 1.0, 0)) == null);
+}
+
+test "fusedSdpa256Prefill: causal defaults composed, band defaults fused" {
+    const s = mlx.gpuStream();
+    var prng = std.Random.DefaultPrng.init(0x4A7E);
+    const rnd = prng.random();
+
+    // No override, no env: the causal arm must DECLINE even at the kernel's
+    // best shape (kL == qL, +63% on the µbench) — live same-boot A/Bs on the
+    // 27B measured every fused-causal variant as a net loss (see
+    // fused256CausalMode), so composed keeps causal until that gap is
+    // understood. The band arm (window > 0) stays fused by default.
+    std.debug.assert(fused256_override == null);
+    const q_shape = [_]c_int{ 1, 6, 64, 256 };
+    const q = try attn256RandBf16(rnd, &q_shape, s);
+    defer _ = mlx.mlx_array_free(q);
+    const kv_shape = [_]c_int{ 1, 2, 64, 256 };
+    const k = try attn256RandBf16(rnd, &kv_shape, s);
+    defer _ = mlx.mlx_array_free(k);
+
+    try std.testing.expect((try fusedSdpa256Prefill(s, q, k, k, 1.0, 0)) == null);
+
+    const banded = try fusedSdpa256Prefill(s, q, k, k, 1.0, 40);
+    try std.testing.expect(banded != null);
+    if (banded) |f| _ = mlx.mlx_array_free(f);
+}
+
+test "fusedSdpa256Prefill: causal parity at Qwen 24q/4kv geometry (gqa 6, ragged 64-row tile)" {
+    const s = mlx.gpuStream();
+    fused256_override = true;
+    defer fused256_override = null;
+    var prng = std.Random.DefaultPrng.init(0x27B27B);
+    const rnd = prng.random();
+
+    // The production Qwen3.6-27B full-attention geometry: 24 q heads over 4
+    // kv heads (gqa 6), hd 256. qL=97 exercises a partial 64-row q tile,
+    // kL=250 a partial kv block; offset 153 = chunked-prefill alignment.
+    const q_shape = [_]c_int{ 1, 24, 97, 256 };
+    const kv_shape = [_]c_int{ 1, 4, 250, 256 };
+    const q = try attn256RandBf16(rnd, &q_shape, s);
+    defer _ = mlx.mlx_array_free(q);
+    const k = try attn256RandBf16(rnd, &kv_shape, s);
+    defer _ = mlx.mlx_array_free(k);
+    const v = try attn256RandBf16(rnd, &kv_shape, s);
+    defer _ = mlx.mlx_array_free(v);
+    const scale: f32 = 1.0 / 16.0;
+
+    const fused = (try fusedSdpa256Prefill(s, q, k, v, scale, 0)) orelse return error.FusedDeclined;
+    defer _ = mlx.mlx_array_free(fused);
+    const ref = try attn256Reference(q, k, v, scale, "causal", .{ .ctx = null }, s);
+    defer _ = mlx.mlx_array_free(ref);
+
+    const max_diff = try attn256MaxDiff(fused, ref, s);
+    try std.testing.expect(max_diff < 0.005);
 }

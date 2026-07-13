@@ -85,16 +85,32 @@ pub const PREFILL_CHUNK_FLOOR: usize = 512;
 /// gemma-4-26B-A4B at a 99K prompt: fused @ chunk 8192 = 736 tok/s / 61.2 GB
 /// peak vs fused @ chunk 1024 = 712 tok/s / 39.5 GB. +3% speed is not worth
 /// +22 GB peak (a 64 GB Mac dies), so the cap stays keyed on raw head_dim.
-pub fn boundedPrefillChunk(base_chunk: usize, head_dim: u32, n_heads: u32, total_ctx: usize) usize {
+///
+/// `sliding_band_arch` (config.has_sliding_window) picks the policy family:
+/// archs WITHOUT sliding-band layers (qwen3_5/3_6: GDN + full attention)
+/// additionally cap the auto chunk at 2048 — composed-causal prefill
+/// measured strictly faster and ~9 GB lighter there (see the inline
+/// comment). Gemma keeps the formula-only policy for its fused band layers.
+pub fn boundedPrefillChunk(base_chunk: usize, head_dim: u32, n_heads: u32, total_ctx: usize, sliding_band_arch: bool) usize {
     if (head_dim <= 128 or n_heads == 0 or total_ctx == 0) return base_chunk;
+    // Archs with NO sliding-band layers (has_sliding_window=false: the
+    // qwen3_5/3_6 class) run every hd-256 prefill through the composed
+    // causal path, where SMALL chunks measured strictly faster AND lighter
+    // on the 27B (2026-07-12 ladder, M4 Max): 8K 225 -> 235.8 tok/s and
+    // peak 28.9 -> 19.8 GB at chunk 2048; 32K 205.4 -> 209.3. Chunk
+    // boundaries ARE block-level causal skipping for composed attention.
+    // Sliding-band archs (gemma) keep big chunks — their local layers run
+    // the fused band kernel, which block-skips in-kernel and wants the
+    // fewest KV re-walks (26B@99K: 712 tok/s at the formula chunk).
+    const causal_cap: usize = if (sliding_band_arch) base_chunk else @min(base_chunk, 2048);
     const per_row: u64 = @as(u64, n_heads) * @as(u64, total_ctx) * 2;
     const max_chunk: u64 = PREFILL_SCORES_BUDGET_BYTES / per_row;
-    if (max_chunk >= base_chunk) return base_chunk;
+    if (max_chunk >= causal_cap) return causal_cap;
     const floored = @max(
         @as(u64, PREFILL_CHUNK_FLOOR),
         max_chunk - (max_chunk % PREFILL_CHUNK_FLOOR),
     );
-    return @intCast(@min(floored, @as(u64, base_chunk)));
+    return @intCast(@min(floored, @as(u64, causal_cap)));
 }
 
 /// The prefill chunk `initWithOptions` will actually use for a request:
@@ -103,10 +119,10 @@ pub fn boundedPrefillChunk(base_chunk: usize, head_dim: u32, n_heads: u32, total
 /// boundedPrefillChunk. Exported so server.zig's admission guard
 /// (checkAttentionMemory) models the SAME chunk the prefill will run with —
 /// the guard and the real prefill must not drift.
-pub fn effectivePrefillChunk(head_dim: u32, n_heads: u32, total_ctx: usize) usize {
+pub fn effectivePrefillChunk(head_dim: u32, n_heads: u32, total_ctx: usize, sliding_band_arch: bool) usize {
     const env_chunk = readEnvUsize("MLX_SERVE_PREFILL_CHUNK", 0);
     if (env_chunk > 0) return env_chunk;
-    return boundedPrefillChunk(prefill_chunk_override, head_dim, n_heads, total_ctx);
+    return boundedPrefillChunk(prefill_chunk_override, head_dim, n_heads, total_ctx, sliding_band_arch);
 }
 
 /// Read an unsigned integer from an environment variable, falling back to
@@ -845,6 +861,7 @@ pub const Generator = struct {
             xfm.config.head_dim,
             xfm.config.num_attention_heads,
             total_ctx_for_chunk,
+            xfm.config.has_sliding_window,
         );
         // Phase-level prefill instrumentation. Enabled at debug level OR via
         // MLX_SERVE_PREFILL_TRACE=1 (which forces the trace line at info).
@@ -5237,16 +5254,16 @@ test "prefillChunkCount: SSM-checkpoint stride controls cold-prefill chunking" {
 test "boundedPrefillChunk: fused head dims and short contexts keep the base chunk" {
     // head_dim <= 128 rides MLX's fused SDPA — no materialized scores, no cap,
     // at ANY context length.
-    try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 128, 16, 1_000_000));
-    try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 64, 32, 1_000_000));
+    try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 128, 16, 1_000_000, true));
+    try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 64, 32, 1_000_000, true));
     // hd 256 but short context: 16 heads x 8192 ctx x 8192 chunk x 2B
     // = 2 GiB scores, inside the 4 GiB budget -> full chunk kept. This is the
     // fleet-protection property: every Gemma-4 / Qwen3.5/3.6 checkpoint ships
     // head_dim 256, so typical prompts must keep full prefill throughput.
-    try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 256, 16, 8192));
+    try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 256, 16, 8192, true));
     // Degenerate inputs never cap.
-    try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 256, 0, 100_000));
-    try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 256, 16, 0));
+    try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 256, 0, 100_000, true));
+    try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 256, 16, 0, true));
 }
 
 test "boundedPrefillChunk: caps hd-256 long context even with the fused kernel active" {
@@ -5256,21 +5273,21 @@ test "boundedPrefillChunk: caps hd-256 long context even with the fused kernel a
     // prefillHeadDimFused (see the fn doc); pin that with the override ON.
     transformer_mod.fused256_override = true;
     defer transformer_mod.fused256_override = null;
-    try testing.expectEqual(@as(usize, 1024), boundedPrefillChunk(8192, 256, 16, 100_000));
+    try testing.expectEqual(@as(usize, 1024), boundedPrefillChunk(8192, 256, 16, 100_000, true));
 }
 
 test "boundedPrefillChunk: long context shrinks to the scores budget, floored and rounded" {
     // gemma-4-26B geometry (16 heads): budget/(16*ctx*2) …
     // ctx 32768 -> exactly 4096.
-    try testing.expectEqual(@as(usize, 4096), boundedPrefillChunk(8192, 256, 16, 32768));
+    try testing.expectEqual(@as(usize, 4096), boundedPrefillChunk(8192, 256, 16, 32768, true));
     // ctx 100000 -> raw 1342, rounded down to the 512 grain -> 1024.
-    try testing.expectEqual(@as(usize, 1024), boundedPrefillChunk(8192, 256, 16, 100_000));
+    try testing.expectEqual(@as(usize, 1024), boundedPrefillChunk(8192, 256, 16, 100_000, true));
     // ctx 262144 (the PR-#69 255K case) -> 512.
-    try testing.expectEqual(@as(usize, 512), boundedPrefillChunk(8192, 256, 16, 262_144));
+    try testing.expectEqual(@as(usize, 512), boundedPrefillChunk(8192, 256, 16, 262_144, true));
     // Qwen3.6-27B geometry (24 heads) at 262144: raw 341 -> floor 512.
-    try testing.expectEqual(@as(usize, 512), boundedPrefillChunk(8192, 256, 24, 262_144));
+    try testing.expectEqual(@as(usize, 512), boundedPrefillChunk(8192, 256, 24, 262_144, true));
     // e4b geometry (8 heads) at 131072: exactly 2048.
-    try testing.expectEqual(@as(usize, 2048), boundedPrefillChunk(8192, 256, 8, 131_072));
+    try testing.expectEqual(@as(usize, 2048), boundedPrefillChunk(8192, 256, 8, 131_072, true));
 }
 
 test "MTP history window: threshold gate and chunk membership" {
@@ -5298,9 +5315,32 @@ test "MTP history window: threshold gate and chunk membership" {
 
 test "boundedPrefillChunk: never raises a caller-lowered base chunk" {
     // --prefill-chunk 1024 with headroom for 4096: the explicit lower value wins.
-    try testing.expectEqual(@as(usize, 1024), boundedPrefillChunk(1024, 256, 16, 32768));
+    try testing.expectEqual(@as(usize, 1024), boundedPrefillChunk(1024, 256, 16, 32768, true));
     // Even the floor never raises a tiny explicit base.
-    try testing.expectEqual(@as(usize, 256), boundedPrefillChunk(256, 256, 16, 262_144));
+    try testing.expectEqual(@as(usize, 256), boundedPrefillChunk(256, 256, 16, 262_144, true));
+}
+
+test "boundedPrefillChunk: composed-causal hd-256 archs cap at 2048" {
+    // Archs with NO sliding-band layers (qwen3_5/3_6 class: GDN + full
+    // attention, has_sliding_window=false) run every hd-256 prefill through
+    // the composed causal path, where SMALLER chunks measured faster on the
+    // 27B ladder (2026-07-12, M4 Max): 8K prompt 225 -> 235.8 tok/s at
+    // chunk 2048 (peak 28.9 -> 19.8 GB), 32K 205.4 -> 209.3. Chunking IS
+    // block-level causal skipping for composed attention, and the score
+    // transient shrinks with it. Cap the auto chunk at 2048.
+    try testing.expectEqual(@as(usize, 2048), boundedPrefillChunk(8192, 256, 24, 8192, false));
+    try testing.expectEqual(@as(usize, 2048), boundedPrefillChunk(8192, 256, 24, 16384, false));
+    try testing.expectEqual(@as(usize, 2048), boundedPrefillChunk(8192, 256, 24, 32768, false));
+    // The scores-budget formula still wins BELOW the cap: 64K on 24 heads
+    // yields 1024 (measured better than 2048 there: 186 vs 182.3 tok/s).
+    try testing.expectEqual(@as(usize, 1024), boundedPrefillChunk(8192, 256, 24, 65536, false));
+    // Never raises a caller-lowered base.
+    try testing.expectEqual(@as(usize, 1024), boundedPrefillChunk(1024, 256, 24, 8192, false));
+    // Sliding-band archs (gemma: fused band kernel wants big chunks) keep
+    // the formula-only policy.
+    try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 256, 16, 8192, true));
+    // Fused head dims never cap regardless of arch.
+    try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 128, 24, 1_000_000, false));
 }
 
 test "effectiveSsmCheckpointStride: MoE coarsens to PREFILL_CHUNK, dense keeps fine" {

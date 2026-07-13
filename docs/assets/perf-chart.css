@@ -1,0 +1,95 @@
+/* Interactive performance chart (mlx-serve vs LM Studio, per-model pills).
+   Shared by index.html and speculative-decoding/. Data lives in
+   perf-chart.js; numbers come from docs/perf-csvs/{gemma,qwen36}-26.7.6.csv.
+   Requires the site's CSS vars (--white/--radius/--shadow-elevated/--ink/
+   --green/--mono/--border/--blue/--text-*), defined in both index.html's
+   inline styles and assets/feature.css. */
+
+/* ─── CHART ─── */
+.chart-card {
+  max-width: 980px;
+  margin: 0 auto;
+  background: var(--white);
+  border-radius: var(--radius);
+  box-shadow: var(--shadow-elevated);
+  padding: 28px 28px 24px;
+}
+
+.chart-pills { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; margin-bottom: 22px; }
+
+.chart-pill {
+  font-family: var(--mono);
+  font-size: 12.5px;
+  font-weight: 500;
+  padding: 7px 14px;
+  border-radius: 100px;
+  border: 1px solid var(--border);
+  background: var(--white);
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: all 0.18s ease;
+  white-space: nowrap;
+}
+
+.chart-pill:hover { border-color: var(--blue); color: var(--blue); }
+
+.chart-pill.active {
+  background: var(--text-primary);
+  color: var(--white);
+  border-color: var(--text-primary);
+}
+
+.chart-canvas-wrap { position: relative; width: 100%; height: 380px; }
+#perfChart { width: 100%; height: 100%; display: block; }
+
+.chart-tooltip {
+  position: absolute;
+  pointer-events: none;
+  background: var(--ink);
+  color: var(--white);
+  border-radius: 9px;
+  padding: 9px 12px;
+  font-size: 12px;
+  line-height: 1.45;
+  opacity: 0;
+  transform: translate(-50%, -118%);
+  transition: opacity 0.12s ease;
+  white-space: nowrap;
+  box-shadow: 0 8px 30px rgba(0,0,0,0.25);
+  z-index: 5;
+}
+
+.chart-tooltip .tt-series { font-family: var(--mono); font-weight: 600; }
+.chart-tooltip .tt-val { color: #9fe6ff; font-family: var(--mono); }
+.chart-tooltip .tt-delta { color: var(--green); font-family: var(--mono); }
+
+.chart-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 18px;
+  justify-content: center;
+  margin-top: 18px;
+}
+
+.legend-item { display: flex; align-items: center; gap: 7px; font-size: 13px; color: var(--text-secondary); }
+.legend-swatch { width: 13px; height: 13px; border-radius: 4px; flex-shrink: 0; }
+
+.chart-caption {
+  max-width: 760px;
+  margin: 22px auto 0;
+  text-align: center;
+  font-size: 12.5px;
+  color: var(--text-tertiary);
+  line-height: 1.6;
+}
+
+.chart-caption b { color: var(--text-secondary); font-weight: 600; }
+
+/* Responsive (mirrors the host pages' breakpoints) */
+@media (max-width: 720px) {
+  .chart-canvas-wrap { height: 320px; }
+  .chart-card { padding: 20px 14px 18px; }
+}
+@media (max-width: 480px) {
+  .chart-canvas-wrap { height: 300px; }
+}

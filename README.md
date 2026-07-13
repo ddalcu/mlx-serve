@@ -2,7 +2,7 @@
 
 # mlx-serve — run any LLM on your Mac
 
-**OpenAI- and Anthropic-compatible local inference for Apple Silicon — MLX *and* GGUF — faster than LM Studio on the same file. No Python. No cloud. No Electron.**
+**OpenAI- and Anthropic-compatible local inference for Apple Silicon — MLX *and* GGUF — faster than LM Studio on identical MLX weights. No Python. No cloud. No Electron.**
 
 [![Release](https://img.shields.io/github/v/release/ddalcu/mlx-serve?style=flat-square&color=0071e3)](https://github.com/ddalcu/mlx-serve/releases/latest)
 [![Stars](https://img.shields.io/github/stars/ddalcu/mlx-serve?style=flat-square&color=f7a41d)](https://github.com/ddalcu/mlx-serve/stargazers)
@@ -53,7 +53,7 @@ If you're already on LM Studio, Ollama, or `mlx-lm` and wondering whether to swi
 | OpenAI Responses API + WebSockets | ✅ | 🟡 partial² | ❌ | ❌ |
 | DeepSeek V4 Flash (284B) | ✅ via ds4 | ❌ | ❌ | ❌ |
 | Speculative decoding (PLD + drafter + native MTP) | ✅ | ❌ | partial | drafter only |
-| Decode speed (geomean vs LM Studio, identical weights) | **+35%** (MLX) | baseline | ~−15% (GGUF, est.¹) | +11% (MLX) |
+| Decode speed (geomean vs LM Studio, identical weights) | **+48%** (MLX) | baseline | ~−15% (GGUF, est.¹) | +11% (MLX) |
 | KV-cache quantization (4/8-bit + TurboQuant) | ✅ | ❌ | partial | ✅ |
 | Continuous batching | ✅ | ❌ | ✅ | ❌ |
 | Built-in agent loop + MCP client | ✅ 10 tools | ❌ | ❌ | ❌ |
@@ -71,29 +71,18 @@ If you're already on LM Studio, Ollama, or `mlx-lm` and wondering whether to swi
 ¹ Ollama can't run MLX, so the comparison is GGUF-vs-GGUF. 
 ² Recent LM Studio builds ship Anthropic `/v1/messages` and OpenAI `/v1/responses` compatibility endpoints, with partial coverage of each surface — mlx-serve additionally implements e.g. the Responses WebSocket transport and `/v1/responses/compact`.
 
-### Benchmarks (Apple M4, 16 GB · identical weights · ctx=4096 · temp=0)
+### Benchmarks (Apple M4 Max, 128 GB · identical weights · ctx=4096 · temp=0 · LM Studio 0.4.15)
 
-**Same `.gguf` file, both engines:** mlx-serve's embedded llama.cpp beats LM Studio's wrapper on `gemma-4-E4B-it-Q4_K_M.gguf`:
+**Same 4-bit MLX weights**, decode tok/s — raw single-stream speed plus mlx-serve's speculative-decode wins:
 
-| Workload | LM Studio (GGUF) | mlx-serve (GGUF) | Δ |
-|---|---:|---:|---:|
-| Free-form decode | 24.6 tok/s | **28.2 tok/s** | **+15%** |
-| Echo | 22.3 | **25.1** | **+13%** |
-| Code completion | 23.0 | **25.7** | **+12%** |
-| Prefill | 349 | **367** | **+5%** |
-
-**Same 4-bit MLX weights**, plus mlx-serve's optional speculative-decode wins:
-
-| Model | Workload | LM Studio | mlx-serve | mlx-serve + PLD | mlx-serve + Drafter |
+| Model | Workload | LM Studio | mlx-serve | mlx-serve + PLD | mlx-serve + Drafter / MTP |
 |---|---|---:|---:|---:|---:|
-| Gemma 4 E2B | Echo | 125 tok/s | 164 (**+31%**) | **269 (+115%)** | 192 (+54%) |
-| Gemma 4 E4B | Code | 89.2 | 101 (+13%) | 100 | **131 (+47%)** |
-| Gemma 4 26B-A4B MoE | Echo | 72.6 | 91.1 (+25%) | **125 (+72%)** | — |
-| Qwen 3.6 35B-A3B MoE | Echo | 83.0 | 101 (+22%) | **140 (+69%)** | — |
+| Gemma 4 E2B | Echo | 192.8 tok/s | 194.2 | **407 (+111%)** | 233 (+21%) |
+| Gemma 4 E4B | Code | 118.8 | 117.9 | 119.9 | **194 (+64%)** |
+| Qwen 3.6 27B | Code | 29.5 | 29.0 | 30.3 | **58.4 (+98%)** |
+| Qwen 3.6 35B-A3B MoE | Echo | 103.0 | 130.0 (+26%) | **239 (+132%)** | 186 (+80%) |
 
-Across 18 cells (best mlx-serve vs best LM Studio, geomean): **+35%**. Reproduce with [`tests/bench.sh --family gemma --lmstudio --omlx`](tests/bench.sh).
-
-![mlx-serve vs LM Studio — Gemma 4 (M4 Max)](docs/perf-vs-lmstudio-gemma-26.5.6.png)
+Across 18 cells (best mlx-serve vs best LM Studio per model × workload, geomean): **+48%** — still **+38%** with native MTP excluded. Prefill on the same weights: 1.8–2.5× on the small Gemmas, +17–19% on the MoEs. Per-model breakdown and chart in [vs. LM Studio](#vs-lm-studio-http-vs-http).
 
 ## Features
 
@@ -104,8 +93,8 @@ Across 18 cells (best mlx-serve vs best LM Studio, geomean): **+35%**. Reproduce
 - **Ollama-compatible API** — `/api/chat`, `/api/generate`, `/api/tags`, `/api/show`, `/api/ps`, `/api/embed`, `/api/pull` speak the Ollama wire (NDJSON streaming, tool calls with object arguments, `thinking`, `format` JSON schemas, `name:latest` model names), so the whole Ollama client ecosystem works against mlx-serve unchanged.
 - **Ollama-grade CLI** — `mlx-serve run gemma4` downloads (resumable), serves, and drops you into a streaming chat REPL; `pull` / `list` / `serve` manage a shared `~/.mlx-serve/models` store the GUI app uses too.
 - **Speculative decoding** — PLD (model-agnostic n-gram lookup, on by default) + the Gemma 4 cross-attention drafter. Adaptive prompt-time and runtime gates keep novel-content workloads at parity; agentic code loops see up to 1.6×.
-- **Native multi-token prediction (Qwen 3.5/3.6)** — checkpoints shipping a trained MTP sidecar (like [Qwen3.6-27B-4bit-MTP](https://huggingface.co/ddalcu/Qwen3.6-27B-4bit-MTP-MLX-Serve), or [MTPLX](https://github.com/youssofal/MTPLX)-published artifacts, loaded unmodified) speculate with the model's own head automatically: 3 drafts per round with a self-tuning depth controller, +15–26% on coding-agent loops, MoE sidecars (35B-A3B) supported. In a fresh head-to-head on identical prompts, mlx-serve out-decodes the reference MTP runtime on all 8 ladder cells from 0.5K to 64K context (+11–27%).
-- **Long-context prefill that flies** — a custom flash-attention Metal kernel handles Gemma's sliding-window layers during prefill, skipping everything outside the attention window: 2.2× prefill (299 → 671 tok/s) on a ~100K-token prompt with *less* peak memory.
+- **Native multi-token prediction (Qwen 3.5/3.6)** — checkpoints shipping a trained MTP sidecar (like [Qwen3.6-27B-4bit-MTP](https://huggingface.co/ddalcu/Qwen3.6-27B-4bit-MTP-MLX-Serve), or [MTPLX](https://github.com/youssofal/MTPLX)-published artifacts, loaded unmodified) speculate with the model's own head automatically: 3 drafts per round with a self-tuning depth controller, +15–26% on coding-agent loops, MoE sidecars (35B-A3B) supported. In a fresh head-to-head on the identical checkpoint and prompts, mlx-serve beats the reference MTP runtime on all 8 ladder cells from 0.5K to 64K context — decode +11–30% AND prefill ahead at all 8.
+- **Long-context prefill that flies** — a custom flash-attention Metal kernel handles Gemma's sliding-window layers during prefill, skipping everything outside the attention window: 2.4× prefill (299 → 715 tok/s) on a ~100K-token prompt with *less* peak memory. Qwen 3.5/3.6 long prompts prefill in architecture-tuned chunks: ~5% faster with peak memory down ~9 GB on the 27B.
 - **KV-cache quantization** — 4-bit / 8-bit / TurboQuant variants shrink KV memory ~4× / ~2× / further still, so 16K contexts fit on hardware that couldn't hold them dense.
 - **Continuous batching** — `--max-concurrent N` batches decode requests through one forward pass for ~1.6× throughput at 4-way parallel.
 - **Prefix cache** — shared system-prompt KV reuse across turns and across conversations. v26.5.7 adds an LRU of llama.cpp KV sessions so multi-doc agent loops stay warm.
@@ -188,7 +177,7 @@ Any quantized MLX model using one of the above architectures works natively. Any
 
 ## Prerequisites
 
-- macOS 26+ with Apple Silicon (M1/M2/M3/M4) — the released app bundles MLX dylibs built for macOS 26; older macOS needs a from-source build against a local mlx
+- macOS 26+ with Apple Silicon (M1/M2/M3/M4/M5) — the released app bundles MLX dylibs built for macOS 26; older macOS needs a from-source build against a local mlx
 - [Zig 0.16+](https://ziglang.org/download/) *(only if building from source)*
 - mlx-c and libwebp *(only if building from source)*:
 
@@ -336,7 +325,7 @@ Stateful chains via `previous_response_id`, full streaming SSE with per-event `s
 
 ## Performance
 
-Benchmarked on Apple M4 (16 GB unified memory):
+Benchmarked on Apple M4 (16 GB unified memory; measured pre-v26.7.6 — prefill numbers predate the flash-attention prefill kernel and the chunk retune, so treat them as conservative floors):
 
 | Model | Prefill | Decode | Memory |
 |---|---|---|---|
@@ -391,9 +380,13 @@ Building from source? **Always `zig build -Doptimize=ReleaseFast`** — a bare `
 
 Three flavors, all greedy-equivalent (byte-identical at temp=0 within the first 30 tokens; mathematically exact at temp > 0 via the Leviathan probability-ratio sampler):
 
-- **Native MTP** (Qwen 3.5/3.6) — checkpoints with a trained multi-token-prediction sidecar draft with the model's *own* head: 3 tokens per round by default, a windowed controller that self-tunes depth per request, and MoE sidecars (35B-A3B) supported. Auto-loads, zero setup. Measured against [MTPLX](https://github.com/youssofal/MTPLX) (the reference MTP runtime) on identical prompts: faster decode at all 8 ladder contexts, 0.5K–64K (+11–27%).
+- **Native MTP** (Qwen 3.5/3.6) — checkpoints with a trained multi-token-prediction sidecar draft with the model's *own* head: 3 tokens per round by default, a windowed controller that self-tunes depth per request, and MoE sidecars (35B-A3B) supported. Auto-loads, zero setup. Measured against [MTPLX](https://github.com/youssofal/MTPLX) (the reference MTP runtime) on the identical checkpoint and prompts: faster decode at all 8 ladder contexts, 0.5K–64K (+11–30%), with prefill ahead at all 8 too.
 - **PLD** (Prompt Lookup Decoding) — model-agnostic n-gram match in `prompt + generated_tokens`. Default-on (`--pld`); zero per-model setup. Wins on agentic loops, RAG, code editing, anywhere the answer echoes prompt content.
 - **Gemma 4 assistant drafter** — Google's small 4-layer cross-attention drafters (`gemma-4-{E2B,E4B,26B-A4B,31B}-it-assistant-bf16`). Opt-in via `--drafter <dir>`. The drafter cross-attends into the target's KV cache — no separate weights duplicated.
+
+![Native MTP head-to-head — LM Studio vs MTPLX vs MLX-serve](docs/perf-mtp-ladder-26.7.6.png)
+
+*Three engines, one identical checkpoint ([Qwen3.6-27B-MTPLX-Optimized-Speed](https://huggingface.co/Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed), 4-bit + its calibrated MTP adapter; Apple M4 Max, coding-agent prompts, temp 0.6, fresh loads, cold prompts, best-of-N per cell). Decode: mlx-serve leads [MTPLX](https://github.com/youssofal/MTPLX) 2.0.2 at all 8 rungs (+11–30%) and LM Studio 0.4.15 — which has no MTP support, so it decodes plain AR — by +54–89%. Prefill: mlx-serve is ahead of MTPLX at all 8 rungs (+1.4–3.7%) and within ±2.5% of LM Studio at every rung while also paying the MTP-history capture that buys its decode lead — all three engines share the same MLX composed-attention floor on this hd-256 hybrid arch. (An earlier revision showed LM Studio "winning" 8K+ prefill by 45–75%; that was its prompt cache reusing the ladder's nested prompts — 2048-token-chunk granular — not prefill speed. Measured cold, its 8K–64K rungs drop from 311/359/368/324 to 239/227/215/189 tok/s.)*
 
 Both share an **adaptive prompt-time gate**: a 3-gram repetition score on the prompt (`spec_gate_threshold = 0.01`) auto-disables speculation on novel content, so creative writing and one-shot Q&A run at parity with `--no-pld` instead of paying per-step verify overhead. A **runtime acceptance gate** further disables speculation mid-decode if per-draft acceptance falls below break-even (0.50 after 5 attempts). Sticky for the rest of the request. Both modes apply uniformly across all four API surfaces (chat completions, Anthropic messages, OpenAI responses, legacy completions), streaming and non-streaming, including requests with tools — agentic tool loops are speculative decoding's best workload (~2× on file-edit tool calls).
 
@@ -413,25 +406,27 @@ Reproduce with **`./tests/bench.sh --family gemma`** (mlx-serve only — emits p
 
 ### vs. LM Studio (HTTP-vs-HTTP)
 
-**+35% faster overall** (geomean across 18 cells, best mlx-serve vs best LMS, identical 4-bit weights, ctx=4096, temp=0).
+**+48% faster overall** (geomean across 18 cells, best mlx-serve vs best LM Studio 0.4.15 per model × workload, identical 4-bit weights, ctx=4096, temp=0, Apple M4 Max). **+38%** with native MTP excluded.
 
 | Model | Echo | Code | Free-form |
 |---|---:|---:|---:|
-| Gemma 4 E2B | **+122%** | **+47%** | +20% |
-| Gemma 4 E4B | **+97%** | **+53%** | **+35%** |
-| Gemma 4 31B | +20% | +4% | -1% |
-| Gemma 4 26B-A4B-MoE | **+66%** | +23% | +31% |
-| Qwen 3.6 27B | **+60%** | +24% | +32% |
-| Qwen 3.6 35B-A3B-MoE | **+88%** | +20% | +25% |
+| Gemma 4 E2B | **+111%** | **+25%** | +2% |
+| Gemma 4 E4B | **+113%** | **+64%** | 0% |
+| Gemma 4 31B | **+98%** | +24% | -1% |
+| Gemma 4 26B-A4B-MoE (QAT) | **+62%** | +5% | 0% |
+| Qwen 3.6 27B | **+112%** | **+98%** | **+32%** |
+| Qwen 3.6 35B-A3B-MoE | **+132%** | **+70%** | **+32%** |
 
-![Qwen 3.6](docs/perf-vs-lmstudio-qwen36-26.5.6.png)
 
-Reproduce: `./tests/bench.sh --family gemma --lmstudio --omlx` (or `qwen36`). Requires `lms`, `jq`, `python3`, `matplotlib`; `--omlx` requires `omlx` on PATH.
+
+![mlx-serve vs LM Studio — Qwen 3.6 (M4 Max)](docs/perf-vs-lmstudio-qwen36-26.7.6.png)
+
+Reproduce: `./tests/bench.sh --family gemma --lmstudio` (or `qwen36`). Requires `lms`, `jq`, `python3`, `matplotlib`.
 
 ## FAQ
 
 ### Is mlx-serve faster than LM Studio?
-Yes — every cell, every model we've benchmarked. On identical 4-bit MLX weights mlx-serve wins by **+35% geomean across 18 workloads** (Gemma 4 E2B/E4B/31B/26B-A4B-MoE and Qwen 3.6 27B/35B-A3B-MoE). On the **same `.gguf` file** as LM Studio (`gemma-4-E4B-it-Q4_K_M.gguf`), mlx-serve's embedded llama.cpp wrapper still wins **+12-15% on decode** and **+5% on prefill**. Speculative decoding pushes the lead further on echo-heavy and code-completion workloads — up to 2.65× on Gemma 4 E4B echo.
+Yes, where it counts. On identical 4-bit MLX weights mlx-serve wins by **+48% geomean across 18 workloads** (Gemma 4 E2B/E4B/31B/26B-A4B-MoE and Qwen 3.6 27B/35B-A3B-MoE, vs LM Studio 0.4.15; +38% with native MTP excluded). Recent LM Studio builds have caught up on raw single-stream Gemma decode and the lead comes from speculative decoding (PLD up to **2.3×** on echo-heavy work, drafter **+64%** and native MTP **+98%** on code), **1.8–2.5× prefill** on the small Gemmas, and a faster Qwen-MoE decode path (**+26%** raw on 35B-A3B).
 
 ### Does mlx-serve replace LM Studio?
 For most use cases, yes. mlx-serve runs the same MLX and GGUF models, exposes an OpenAI-compatible API on the same kind of port, and ships a native menu-bar app instead of an Electron one. It goes deeper on the API surface than LM Studio's newer compatibility endpoints — fuller Anthropic Messages and OpenAI Responses coverage, plus a WebSocket transport and response compaction — and adds things LM Studio doesn't have: MCP tool calling, agent mode with 10 built-in tools, KV-cache quantization, continuous batching, and the [antirez/ds4](https://github.com/antirez/ds4) engine for DeepSeek V4 Flash.
@@ -455,13 +450,13 @@ Yes, on 96 GB+ Apple Silicon Macs. Open the MLX Core Model Browser, pick DeepSee
 Native MLX dispatch for Gemma 3/4, Qwen 3 / 3.5 / 3.6 / 3-Next, Llama 3.x, Mistral, Nemotron-H, LFM2.5, and DeepSeek V4 Flash. Anything else as GGUF via embedded llama.cpp — Qwen, Llama, Mistral, Gemma, DeepSeek, Phi, Yi, and thousands more available on HuggingFace.
 
 ### How does it compare to MTPLX for Qwen MTP models?
-[MTPLX](https://github.com/youssofal/MTPLX) is a focused Python runtime built around Qwen's native multi-token-prediction heads, and it set the bar here. mlx-serve loads the same MTP sidecar artifacts (including MTPLX-published ones) with zero setup and, in a same-machine head-to-head on identical prompts and sampling, decodes faster at all 8 ladder contexts from 0.5K to 64K (+11–27%) with prefill ahead at 6 of 8. You also get the rest of the stack — OpenAI/Anthropic/Ollama APIs, GGUF, the agent app — in one binary with no Python.
+[MTPLX](https://github.com/youssofal/MTPLX) is a focused Python runtime built around Qwen's native multi-token-prediction heads, and it set the bar here. mlx-serve loads the same MTP sidecar artifacts (including MTPLX-published ones) with zero setup and, in a same-machine head-to-head on the identical checkpoint, prompts, and sampling, decodes faster at all 8 ladder contexts from 0.5K to 64K (+11–30%) with prefill ahead at all 8 (+1.4–3.7%). You also get the rest of the stack — OpenAI/Anthropic/Ollama APIs, GGUF, the agent app — in one binary with no Python.
 
 ### Does it support tools / function calling?
 Yes, on both API surfaces. The server detects tool-call patterns across architectures (Hermes XML, Gemma 4 `<|tool_call>`, raw JSON, ChatML), repairs common Qwen 3.5/3.6 escape quirks, and emits OpenAI-style `tool_calls` deltas in the SSE stream. The MLX Core app ships 10 built-in tools (shell, file I/O, search, browse, web search, memory) and connects to MCP servers from a curated marketplace.
 
 ### How does it stay this small / fast?
-Zig with direct `mlx-c` FFI — no Python runtime, no Electron, no IPC bridge. The release binary is ~4.5 MB. Eager warmup at boot page-faults weights and pre-compiles decode kernels (first request 3.5× faster). Multi-turn agent loops reuse KV across turns and skip re-prefilling system prompts via a shared-prefix cache. Tokenize caching turns the second hit on a long conversation into a memcpy.
+Zig with direct `mlx-c` FFI — no Python runtime, no Electron, no IPC bridge. The release binary is ~7 MB. Eager warmup at boot page-faults weights and pre-compiles decode kernels (first request 3.5× faster). Multi-turn agent loops reuse KV across turns and skip re-prefilling system prompts via a shared-prefix cache. Tokenize caching turns the second hit on a long conversation into a memcpy.
 
 ### Is the inference exact, or quantized output drift?
 For greedy decoding (temp=0), mlx-serve is byte-identical to the reference for the first ~30-80 generated tokens, with the long-tail divergence inherent to INT4 float-reduction order (documented in `CLAUDE.md`). For temp > 0, the Leviathan probability-ratio sampler keeps speculative decoding mathematically exact in distribution. Equivalence is pinned by `tests/test_pld_equivalence.sh`, `test_drafter_equivalence.sh`, and `test_kv_quant_equivalence.sh`.

@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>mlx-serve — Run any LLM on your Mac · MLX + GGUF · faster than LM Studio · OpenAI + Anthropic API</title>
   <meta name="description" content="Native Zig inference server for Apple Silicon. Runs any LLM — MLX and GGUF — faster than LM Studio. OpenAI- and Anthropic-compatible (Claude Code) APIs. No Python. Drop-in alternative to LM Studio, Ollama, and llama.cpp on macOS. Gemma 4, Qwen 3.6, Llama 3, Mistral, DeepSeek V4 Flash — local, MIT-licensed.">
-  <meta name="keywords" content="MLX, MLX server, mlx-serve, Apple Silicon LLM, local LLM Mac, LM Studio alternative, Ollama alternative, Ollama API compatible, Ollama drop-in replacement, llama.cpp Mac, GGUF Apple Silicon, OpenAI compatible local, Anthropic API local, Claude Code local, DeepSeek V4 Flash, Gemma 4, Qwen 3.6, M1 M2 M3 M4 LLM, native MLX inference, local image generation Mac, AI photo editing local, image to video Mac, AI agent sandbox">
+  <meta name="keywords" content="MLX, MLX server, mlx-serve, Apple Silicon LLM, local LLM Mac, LM Studio alternative, Ollama alternative, Ollama API compatible, Ollama drop-in replacement, llama.cpp Mac, GGUF Apple Silicon, OpenAI compatible local, Anthropic API local, Claude Code local, DeepSeek V4 Flash, Gemma 4, Qwen 3.6, M1 M2 M3 M4 M5 LLM, native MLX inference, local image generation Mac, AI photo editing local, image to video Mac, AI agent sandbox">
   <meta name="author" content="David Dalcu">
   <link rel="canonical" href="https://ddalcu.github.io/mlx-serve/">
   <!-- Open Graph -->
@@ -32,12 +32,12 @@
     "applicationCategory": "DeveloperApplication",
     "applicationSubCategory": "AI Inference Server",
     "operatingSystem": "macOS 26+ (Apple Silicon)",
-    "processorRequirements": "Apple Silicon (M1, M2, M3, M4)",
+    "processorRequirements": "Apple Silicon (M1, M2, M3, M4, M5)",
     "url": "https://ddalcu.github.io/mlx-serve/",
     "downloadUrl": "https://github.com/ddalcu/mlx-serve/releases/latest",
     "codeRepository": "https://github.com/ddalcu/mlx-serve",
     "license": "https://opensource.org/licenses/MIT",
-    "softwareVersion": "v26.7.4",
+    "softwareVersion": "v26.7.6",
     "author": { "@type": "Person", "name": "David Dalcu" },
     "description": "Native Zig inference server for Apple Silicon that runs any LLM — MLX and GGUF — with OpenAI- and Anthropic-compatible APIs. Faster than LM Studio. No Python. MIT licensed.",
     "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
@@ -77,7 +77,7 @@
         "name": "Is mlx-serve faster than LM Studio?",
         "acceptedAnswer": {
           "@type": "Answer",
-          "text": "Yes — every cell, every model we've benchmarked. On identical 4-bit MLX weights mlx-serve wins by +39% geomean across 18 workloads (Gemma 4 and Qwen 3.6 families). On the same .gguf file as LM Studio, mlx-serve's embedded llama.cpp wrapper still wins +12-15% on decode and +5% on prefill. Speculative decoding pushes the lead further on echo-heavy and code-completion workloads — up to 2.65× on Gemma 4 E4B echo."
+          "text": "Yes, where it counts — +48% geomean across 18 workloads on identical 4-bit MLX weights (Gemma 4 and Qwen 3.6 families, vs LM Studio 0.4.15). The lead comes from speculative decoding: PLD up to 2.1× on echo-heavy work, the Gemma drafter +65% and native Qwen MTP +98% on code, and a faster MoE decode path (+27% raw on Qwen 35B-A3B)."
         }
       },
       {
@@ -526,86 +526,6 @@
 
     .perf-label { font-size: 13.5px; color: var(--text-tertiary); margin-top: 10px; text-align: center; max-width: 160px; }
 
-    /* ─── CHART ─── */
-    .chart-card {
-      max-width: 980px;
-      margin: 0 auto;
-      background: var(--white);
-      border-radius: var(--radius);
-      box-shadow: var(--shadow-elevated);
-      padding: 28px 28px 24px;
-    }
-
-    .chart-pills { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; margin-bottom: 22px; }
-
-    .chart-pill {
-      font-family: var(--mono);
-      font-size: 12.5px;
-      font-weight: 500;
-      padding: 7px 14px;
-      border-radius: 100px;
-      border: 1px solid var(--border);
-      background: var(--white);
-      color: var(--text-secondary);
-      cursor: pointer;
-      transition: all 0.18s ease;
-      white-space: nowrap;
-    }
-
-    .chart-pill:hover { border-color: var(--blue); color: var(--blue); }
-
-    .chart-pill.active {
-      background: var(--text-primary);
-      color: var(--white);
-      border-color: var(--text-primary);
-    }
-
-    .chart-canvas-wrap { position: relative; width: 100%; height: 380px; }
-    #perfChart { width: 100%; height: 100%; display: block; }
-
-    .chart-tooltip {
-      position: absolute;
-      pointer-events: none;
-      background: var(--ink);
-      color: var(--white);
-      border-radius: 9px;
-      padding: 9px 12px;
-      font-size: 12px;
-      line-height: 1.45;
-      opacity: 0;
-      transform: translate(-50%, -118%);
-      transition: opacity 0.12s ease;
-      white-space: nowrap;
-      box-shadow: 0 8px 30px rgba(0,0,0,0.25);
-      z-index: 5;
-    }
-
-    .chart-tooltip .tt-series { font-family: var(--mono); font-weight: 600; }
-    .chart-tooltip .tt-val { color: #9fe6ff; font-family: var(--mono); }
-    .chart-tooltip .tt-delta { color: var(--green); font-family: var(--mono); }
-
-    .chart-legend {
-      display: flex;
-      flex-wrap: wrap;
-      gap: 18px;
-      justify-content: center;
-      margin-top: 18px;
-    }
-
-    .legend-item { display: flex; align-items: center; gap: 7px; font-size: 13px; color: var(--text-secondary); }
-    .legend-swatch { width: 13px; height: 13px; border-radius: 4px; flex-shrink: 0; }
-
-    .chart-caption {
-      max-width: 760px;
-      margin: 22px auto 0;
-      text-align: center;
-      font-size: 12.5px;
-      color: var(--text-tertiary);
-      line-height: 1.6;
-    }
-
-    .chart-caption b { color: var(--text-secondary); font-weight: 600; }
-
     /* ─── DEEPSEEK ─── */
     .deepseek {
       position: relative;
@@ -735,7 +655,7 @@
     /* ─── SPEC DECODE ─── */
     .spec-grid {
       display: grid;
-      grid-template-columns: repeat(3, 1fr);
+      grid-template-columns: repeat(2, 1fr);
       gap: 20px;
       max-width: 980px;
       margin: 0 auto 28px;
@@ -763,6 +683,7 @@
 
     .spec-tag.pld { color: #1a8a3d; background: rgba(48,209,88,0.14); }
     .spec-tag.drafter { color: #b4710b; background: rgba(247,164,29,0.16); }
+    .spec-tag.mtp { background: rgba(191,90,242,.12); color: #bf5af2; }
     .spec-tag.gate { color: var(--blue); background: var(--blue-subtle); }
 
     .spec-card h3 { font-size: 18px; font-weight: 600; letter-spacing: -0.01em; margin-bottom: 9px; }
@@ -1130,8 +1051,6 @@
       .features-grid { grid-template-columns: 1fr 1fr; gap: 14px; }
       .perf-stats { gap: 30px 40px; }
       .models-grid { grid-template-columns: 1fr 1fr; }
-      .chart-canvas-wrap { height: 320px; }
-      .chart-card { padding: 20px 14px 18px; }
     }
 
     @media (max-width: 480px) {
@@ -1140,9 +1059,9 @@
       .hero-ctas { flex-direction: column; align-items: center; }
       .hero h1 { font-size: 34px; letter-spacing: -0.03em; }
       .perf-stats { gap: 26px 32px; }
-      .chart-canvas-wrap { height: 300px; }
     }
   </style>
+  <link rel="stylesheet" href="assets/perf-chart.css">
 </head>
 <body>
 
@@ -1151,7 +1070,7 @@
     <a href="#" class="nav-logo">
       <img src="appiconb.png" alt="MLX Core" class="nav-logo-img">
       <span>mlx-serve</span>
-      <span class="nav-ver">v26.7.4</span>
+      <span class="nav-ver">v26.7.6</span>
     </a>
     <ul class="nav-links">
       <li><a href="#explore" class="hide-mobile">Deep dives</a></li>
@@ -1172,8 +1091,8 @@
   <section class="hero">
     <div class="hero-glow"><span class="g1"></span><span class="g2"></span><span class="g3"></span></div>
     <a href="https://github.com/ddalcu/mlx-serve/releases/latest" class="hero-badge">
-      <span class="new-pill">v26.7.4</span>
-      Long chats resume instantly · watch your server live · agent sessions that don't time out
+      <span class="new-pill">v26.7.6</span>
+      Frontier-class coding on a 32 GB Mac · the fastest Qwen on Apple Silicon · up to 2.3× faster than LM Studio
       <span class="arrow">→</span>
     </a>
     <h1>Run any LLM<br>on your <span class="grad">Mac</span></h1>
@@ -1189,7 +1108,7 @@
     </div>
     <div class="hero-meta">
       <div class="hero-meta-item"><strong>macOS 26+</strong></div>
-      <div class="hero-meta-item"><strong>M1 – M4</strong></div>
+      <div class="hero-meta-item"><strong>M1 – M5</strong></div>
       <div class="hero-meta-item"><strong>Free &amp; open source</strong></div>
       <a href="https://github.com/ddalcu/mlx-serve/stargazers" class="hero-meta-item" style="text-decoration:none;color:var(--text-tertiary);" target="_blank" rel="noopener">★ <strong>Star on GitHub</strong></a>
     </div>
@@ -1253,7 +1172,7 @@
       <a class="explore-card" href="lm-studio-alternative/" style="--ec:#0071e3;">
         <span class="explore-kicker">Compare</span>
         <h3>Faster than LM Studio</h3>
-        <p>+35% on identical models — keeps your library.</p>
+        <p>+48% on identical models — keeps your library.</p>
         <span class="go">Deep dive →</span>
       </a>
       <a class="explore-card" href="ollama-alternative/" style="--ec:#0d8a45;">
@@ -1302,11 +1221,11 @@
 
     <div class="perf-stats reveal">
       <div class="perf-stat">
-        <div class="perf-number" data-target="176">176</div>
+        <div class="perf-number" data-target="199">199</div>
         <div class="perf-label">tok/s decode · Gemma 4 E2B 4-bit</div>
       </div>
       <div class="perf-stat">
-        <div class="perf-number" data-target="3749" data-comma="1">3,749</div>
+        <div class="perf-number" data-target="4891" data-comma="1">4,891</div>
         <div class="perf-label">tok/s prefill</div>
       </div>
       <div class="perf-stat">
@@ -1327,7 +1246,7 @@
       </div>
       <div class="chart-legend" id="chartLegend"></div>
       <p class="chart-caption">
-        <b>Decode</b> = free-form generation · <b>Echo</b> = high-repetition (where PLD shines) · <b>Code</b> = code completion (where the drafter shines).
+        <b>Decode</b> = free-form generation · <b>Echo</b> = high-repetition (where PLD shines) · <b>Code</b> = code completion (where the drafter and native MTP shine).
         Tokens per second — how fast the AI writes; higher is better. Apple M4 Max (128 GB) · identical 4-bit MLX weights · ctx 4096 · temp 0 · LM Studio (MLX runtime) as baseline.
       </p>
     </div>
@@ -1373,7 +1292,7 @@
   <section class="section section-alt" id="speculative">
     <div class="section-header reveal">
       <div class="section-label">Speculative Decoding</div>
-      <h2 class="section-title">Two ways to draft ahead</h2>
+      <h2 class="section-title">Three ways to draft ahead</h2>
       <p class="section-desc">Generate multiple tokens per forward pass, verified exactly — so output is identical, just faster. Works on every API surface, streaming or not, tools included: agent loops that echo file contents into edits decode at ~2×. Smart gates keep it on where it pays and step aside where it doesn't.</p>
     </div>
     <div class="spec-grid">
@@ -1381,13 +1300,19 @@
         <span class="spec-tag pld">PLD</span>
         <h3>Prompt Lookup Decoding</h3>
         <p>Model-agnostic n-gram drafting from the prompt + generated text. Works on every architecture — Gemma, Qwen, Llama, Mistral, Nemotron-H, LFM2.5 — with nothing extra to download.</p>
-        <div class="spec-win">up to <span>2×</span> on agent tool loops, echo &amp; RAG</div>
+        <div class="spec-win">up to <span>2.1×</span> on agent tool loops, echo &amp; RAG</div>
       </div>
       <div class="spec-card reveal">
         <span class="spec-tag drafter">DRAFTER</span>
         <h3>Gemma 4 assistant drafter</h3>
         <p>A tiny cross-attention drafter reuses the target model's own K/V cache to propose blocks of tokens. Tuned block sizes per target (E2B → 31B).</p>
-        <div class="spec-win">up to <span>+30%</span> on Gemma 4 code completion</div>
+        <div class="spec-win">up to <span>+65%</span> on Gemma 4 code completion</div>
+      </div>
+      <div class="spec-card reveal">
+        <span class="spec-tag mtp">MTP</span>
+        <h3>Qwen native multi-token prediction</h3>
+        <p>Qwen 3.5/3.6 checkpoints with a trained MTP sidecar draft with the model's <em>own</em> head — 3 tokens per round, a controller that self-tunes depth per request, MoE sidecars included. Auto-loads, zero setup.</p>
+        <div class="spec-win">up to <span>2×</span> on code &amp; agent edits (Qwen3.6-27B)</div>
       </div>
       <div class="spec-card reveal">
         <span class="spec-tag gate">ADAPTIVE</span>
@@ -1397,7 +1322,7 @@
       </div>
     </div>
     <p class="spec-note reveal">
-      <b>Qwen 3.6 native MTP.</b> Models with a trained MTP sidecar (like <a href="https://huggingface.co/ddalcu/Qwen3.6-27B-4bit-MTP-MLX-Serve" target="_blank" rel="noopener" style="color:var(--blue)">ddalcu/Qwen3.6-27B-4bit-MTP-MLX-Serve</a>) auto-load it and speculate from the model's own head — up to <b>1.8×</b> on agent-style edit loops (29 → 51.6 tok/s on Qwen3.6-27B 4-bit, M4 Max), 1.43× on code. The controller watches its own acceptance rate per request and adapts draft depth on the fly. Zero setup — drop in the model and it's on. <a href="speculative-decoding/" style="color:var(--blue);text-decoration:none;">Speculative decoding, in depth →</a>
+      <b>How fast is native MTP?</b> On Qwen3.6-27B 4-bit (M4 Max): code completion <b>29.0 → 58.4 tok/s (2×)</b>, echo/edit loops 58.7 tok/s, free-form +38% — with sidecars like <a href="https://huggingface.co/ddalcu/Qwen3.6-27B-4bit-MTP-MLX-Serve" target="_blank" rel="noopener" style="color:var(--blue)">ddalcu/Qwen3.6-27B-4bit-MTP-MLX-Serve</a>. In a head-to-head on the identical checkpoint and prompts, mlx-serve out-decodes the reference MTP runtime at <b>all 8 context rungs</b> from 0.5K to 64K (+11–30%) — and at 64K context it decodes <b>33.5 tok/s where plain autoregressive does 21.7</b>. <a href="speculative-decoding/" style="color:var(--blue);text-decoration:none;">Speculative decoding, in depth →</a>
     </p>
   </section>
 
@@ -1759,7 +1684,7 @@
     <div class="faq-wrap reveal">
       <details class="faq-item">
         <summary>Is mlx-serve faster than LM Studio?</summary>
-        <p>Yes — every cell, every model we've benchmarked. On identical 4-bit MLX weights mlx-serve wins by <b>+39% geomean across 18 workloads</b> (Gemma 4 E2B/E4B/31B/26B-A4B-MoE and Qwen 3.6 27B/35B-A3B-MoE). On the <b>same <code>.gguf</code> file</b> as LM Studio (<code>gemma-4-E4B-it-Q4_K_M.gguf</code>), mlx-serve's embedded llama.cpp wrapper still wins <b>+12-15% on decode</b> and <b>+5% on prefill</b>. Speculative decoding pushes the lead further on echo-heavy and code-completion workloads — up to 2.65× on Gemma 4 E4B echo.</p>
+        <p>Yes, where it counts — <b>+48% geomean across 18 workloads</b> on identical 4-bit MLX weights (Gemma 4 E2B/E4B/31B/26B-A4B-MoE and Qwen 3.6 27B/35B-A3B-MoE, vs LM Studio 0.4.15). The lead comes from speculative decoding: PLD up to <b>2.1×</b> on echo-heavy work, the Gemma drafter <b>+65%</b> and native Qwen MTP <b>+98%</b> on code, plus a faster MoE decode path (+27% raw on Qwen 35B-A3B).</p>
       </details>
       <details class="faq-item">
         <summary>Does mlx-serve replace LM Studio?</summary>
@@ -1844,7 +1769,7 @@
       <li><a href="speculative-decoding/">Speculative decoding</a></li>
       <li><a href="local-ai-assistant/">Always-on assistant</a></li>
     </ul>
-    <p class="footer-copy">MIT License · mlx-serve <span style="opacity:0.7;">v26.7.4</span> · built for Apple Silicon</p>
+    <p class="footer-copy">MIT License · mlx-serve <span style="opacity:0.7;">v26.7.6</span> · built for Apple Silicon</p>
   </footer>
 
   <script>
@@ -1896,209 +1821,8 @@
       });
     }
 
-    // ─── Performance chart (real data, mlx-serve v26.5.6 vs LM Studio, M4 Max 128GB) ───
-    // Workloads: [Decode, Echo, Code] in tokens/sec.
-    const PERF = {
-      'gemma-e2b':   { name: 'Gemma 4 E2B', series: {
-        'LM Studio': [146.3, 125.0, 137.6], 'mlx-serve': [176.6, 164.0, 169.8],
-        '+ PLD': [155.0, 269.1, 166.4], '+ Drafter': [153.8, 192.0, 201.6] } },
-      'gemma-e4b':   { name: 'Gemma 4 E4B', series: {
-        'LM Studio': [94.8, 81.4, 89.2], 'mlx-serve': [110.7, 97.6, 101.0],
-        '+ PLD': [98.6, 158.8, 100.2], '+ Drafter': [101.7, 129.2, 131.4] } },
-      'gemma-31b':   { name: 'Gemma 4 31B', series: {
-        'LM Studio': [22.4, 19.3, 19.3], 'mlx-serve': [23.9, 19.7, 20.5],
-        '+ PLD': [23.3, 26.7, 18.6] } },
-      'gemma-26moe': { name: 'Gemma 4 26B-A4B MoE', series: {
-        'LM Studio': [80.5, 72.6, 76.1], 'mlx-serve': [106.6, 91.1, 96.5],
-        '+ PLD': [97.3, 125.2, 91.7] } },
-      'qwen-27b':    { name: 'Qwen 3.6 27B', series: {
-        'LM Studio': [26.2, 21.9, 23.0], 'mlx-serve': [27.5, 22.9, 24.0],
-        '+ PLD': [26.4, 33.6, 23.1] } },
-      'qwen-35moe':  { name: 'Qwen 3.6 35B-A3B MoE', series: {
-        'LM Studio': [97.6, 83.0, 88.9], 'mlx-serve': [118.2, 100.9, 105.5],
-        '+ PLD': [103.7, 140.3, 97.4] } },
-    };
-    const WORKLOADS = ['Decode', 'Echo', 'Code'];
-    const COLORS = {
-      'LM Studio': '#c2c2cc', 'mlx-serve': '#0071e3',
-      '+ PLD': '#30d158', '+ Drafter': '#f7a41d'
-    };
-
-    const canvas = document.getElementById('perfChart');
-    const ctx = canvas.getContext('2d');
-    const tooltip = document.getElementById('chartTooltip');
-    let activeKey = 'gemma-e2b';
-    let animProgress = 0, animRAF = null;
-    let hitRects = [];
-
-    function niceMax(v) {
-      const steps = [10, 20, 25, 40, 50, 80, 100, 120, 150, 200, 250, 300];
-      for (const s of steps) if (v <= s) return s;
-      return Math.ceil(v / 100) * 100;
-    }
-
-    function roundedTopRect(c, x, y, w, h, r) {
-      r = Math.min(r, w / 2, Math.abs(h));
-      c.beginPath();
-      c.moveTo(x, y + h);
-      c.lineTo(x, y + r);
-      c.arcTo(x, y, x + r, y, r);
-      c.lineTo(x + w - r, y);
-      c.arcTo(x + w, y, x + w, y + r, r);
-      c.lineTo(x + w, y + h);
-      c.closePath();
-    }
-
-    function drawChart() {
-      const dpr = window.devicePixelRatio || 1;
-      const wrap = canvas.parentElement;
-      const W = wrap.clientWidth, H = wrap.clientHeight;
-      canvas.width = W * dpr; canvas.height = H * dpr;
-      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
-      ctx.clearRect(0, 0, W, H);
-
-      const data = PERF[activeKey];
-      const seriesNames = Object.keys(data.series);
-      const padL = 46, padR = 14, padT = 16, padB = 40;
-      const plotW = W - padL - padR, plotH = H - padT - padB;
-      const baseY = padT + plotH;
-
-      let maxVal = 0;
-      seriesNames.forEach(s => data.series[s].forEach(v => { if (v > maxVal) maxVal = v; }));
-      const top = niceMax(maxVal);
-
-      // grid + y labels
-      ctx.font = '500 11px ' + getComputedStyle(document.body).getPropertyValue('--mono');
-      ctx.textBaseline = 'middle';
-      const lines = 4;
-      for (let i = 0; i <= lines; i++) {
-        const val = top * i / lines;
-        const y = baseY - plotH * i / lines;
-        ctx.strokeStyle = 'rgba(0,0,0,0.06)';
-        ctx.lineWidth = 1;
-        ctx.beginPath(); ctx.moveTo(padL, y + 0.5); ctx.lineTo(W - padR, y + 0.5); ctx.stroke();
-        ctx.fillStyle = '#86868b'; ctx.textAlign = 'right';
-        ctx.fillText(Math.round(val), padL - 10, y);
-      }
-
-      const groupW = plotW / WORKLOADS.length;
-      const innerPad = groupW * 0.16;
-      const usable = groupW - innerPad * 2;
-      const gap = 6;
-      const barW = (usable - gap * (seriesNames.length - 1)) / seriesNames.length;
-
-      hitRects = [];
-      ctx.textAlign = 'center';
-
-      WORKLOADS.forEach((wl, wi) => {
-        const gx = padL + groupW * wi + innerPad;
-        seriesNames.forEach((s, si) => {
-          const val = data.series[s][wi];
-          const fullH = plotH * (val / top);
-          const h = fullH * animProgress;
-          const x = gx + si * (barW + gap);
-          const y = baseY - h;
-          ctx.fillStyle = COLORS[s] || '#999';
-          roundedTopRect(ctx, x, y, barW, h, 4);
-          ctx.fill();
-          hitRects.push({ x, y: baseY - fullH, w: barW, h: fullH, series: s, workload: wl, value: val });
-        });
-        // workload label
-        ctx.fillStyle = '#1d1d1f';
-        ctx.font = '600 12px -apple-system, sans-serif';
-        ctx.textBaseline = 'top';
-        ctx.fillText(wl, padL + groupW * wi + groupW / 2, baseY + 12);
-        ctx.textBaseline = 'middle';
-      });
-    }
-
-    function runAnim() {
-      cancelAnimationFrame(animRAF);
-      animProgress = 0;
-      const start = performance.now(), dur = 750;
-      function step(now) {
-        const p = Math.min(1, (now - start) / dur);
-        animProgress = 1 - Math.pow(1 - p, 3);
-        drawChart();
-        if (p < 1) animRAF = requestAnimationFrame(step);
-        else { animProgress = 1; drawChart(); }
-      }
-      animRAF = requestAnimationFrame(step);
-    }
-
-    function buildPills() {
-      const wrap = document.getElementById('chartPills');
-      wrap.innerHTML = '';
-      Object.keys(PERF).forEach(key => {
-        const b = document.createElement('button');
-        b.className = 'chart-pill' + (key === activeKey ? ' active' : '');
-        b.textContent = PERF[key].name;
-        b.onclick = () => {
-          activeKey = key;
-          wrap.querySelectorAll('.chart-pill').forEach(p => p.classList.remove('active'));
-          b.classList.add('active');
-          buildLegend();
-          runAnim();
-        };
-        wrap.appendChild(b);
-      });
-    }
-
-    function buildLegend() {
-      const wrap = document.getElementById('chartLegend');
-      wrap.innerHTML = '';
-      Object.keys(PERF[activeKey].series).forEach(s => {
-        const item = document.createElement('div');
-        item.className = 'legend-item';
-        item.innerHTML = '<span class="legend-swatch" style="background:' + (COLORS[s] || '#999') + '"></span>' + s;
-        wrap.appendChild(item);
-      });
-    }
-
-    // hover tooltip
-    canvas.addEventListener('mousemove', (e) => {
-      const r = canvas.getBoundingClientRect();
-      const mx = e.clientX - r.left, my = e.clientY - r.top;
-      let hit = null;
-      for (const b of hitRects) {
-        if (mx >= b.x && mx <= b.x + b.w && my >= b.y && my <= b.y + b.h) { hit = b; break; }
-      }
-      if (hit) {
-        const base = PERF[activeKey].series['LM Studio'][WORKLOADS.indexOf(hit.workload)];
-        let delta = '';
-        if (hit.series !== 'LM Studio' && base) {
-          const pct = Math.round((hit.value / base - 1) * 100);
-          if (pct > 0) delta = '<div class="tt-delta">+' + pct + '% vs LM Studio</div>';
-        }
-        tooltip.innerHTML = '<div class="tt-series">' + hit.series + ' · ' + hit.workload + '</div>' +
-          '<div class="tt-val">' + hit.value.toFixed(1) + ' tok/s</div>' + delta;
-        tooltip.style.left = (hit.x + hit.w / 2) + 'px';
-        tooltip.style.top = hit.y + 'px';
-        tooltip.style.opacity = '1';
-      } else {
-        tooltip.style.opacity = '0';
-      }
-    });
-    canvas.addEventListener('mouseleave', () => { tooltip.style.opacity = '0'; });
-
-    // init + animate when scrolled into view
-    buildPills();
-    buildLegend();
-    drawChart();
-    let chartShown = false;
-    const chartObserver = new IntersectionObserver((entries) => {
-      entries.forEach(entry => {
-        if (entry.isIntersecting && !chartShown) { chartShown = true; runAnim(); }
-      });
-    }, { threshold: 0.25 });
-    chartObserver.observe(canvas.parentElement);
-
-    let resizeTO;
-    window.addEventListener('resize', () => {
-      clearTimeout(resizeTO);
-      resizeTO = setTimeout(drawChart, 120);
-    });
   </script>
+  <script src="assets/perf-chart.js"></script>
 
 </body>
 </html>
