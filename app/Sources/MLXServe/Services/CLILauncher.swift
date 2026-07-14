@@ -106,7 +106,7 @@ final class CLILauncher: ObservableObject {
         let defaultWS = NSString(string: "~/.mlx-serve/workspace").expandingTildeInPath
         try? FileManager.default.createDirectory(atPath: defaultWS, withIntermediateDirectories: true)
         panel.directoryURL = URL(fileURLWithPath: defaultWS)
-        guard panel.runModal() == .OK, let url = panel.url else { return }
+        guard AppActivation.runModal(panel) == .OK, let url = panel.url else { return }
         launch(cli, baseURL: baseURL, servedModelId: servedModelId,
                budget: budget, workingDirectory: url.path)
     }

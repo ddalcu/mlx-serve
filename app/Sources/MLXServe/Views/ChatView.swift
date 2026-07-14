@@ -409,11 +409,13 @@ struct ChatView: View {
         }
         .navigationTitle("")
         .onAppear {
-            // Menu bar apps need explicit activation for keyboard focus.
-            // (The .regular policy flip is handled app-wide by
-            // ActivationPolicyManager when this window becomes key.)
+            // Menu bar apps need explicit activation for keyboard focus — and
+            // the `.regular` flip must come FIRST. (The old comment here claimed
+            // ActivationPolicyManager would handle it "when this window becomes
+            // key", which is the bug: an inactive accessory app has no key
+            // window, so that notification never arrives.)
             DispatchQueue.main.async {
-                NSApp.activate(ignoringOtherApps: true)
+                AppActivation.focus()
             }
         }
     }
@@ -638,7 +640,7 @@ struct ChatDetailView: View {
             .disabled(server.status != .running)
             .help("Voice mode — talk to the model hands-free. Speech-to-text and text-to-speech run locally on your Mac; the model only handles text (and tools/thinking if enabled).")
             Button {
-                openWindow(id: "settings")
+                AppActivation.openWindow(id: "settings", using: openWindow)
             } label: {
                 Image(systemName: "gear")
                     .font(.system(size: 12))
@@ -1232,7 +1234,7 @@ struct ChatDetailView: View {
         panel.allowsMultipleSelection = false
         panel.message = "Choose a folder of documents to ask questions about (txt, md, pdf, json, yaml, csv …)"
         panel.prompt = "Attach"
-        panel.begin { response in
+        AppActivation.beginPanel(panel) { response in
             guard response == .OK, let url = panel.url else { return }
             DispatchQueue.main.async { attachDocumentFolder(url) }
         }
@@ -1337,7 +1339,7 @@ struct ChatDetailView: View {
         panel.allowedContentTypes = audioSupported ? [.image, .pdf, .audio] : [.image, .pdf]
         panel.allowsMultipleSelection = true
         panel.canChooseDirectories = false
-        panel.begin { response in
+        AppActivation.beginPanel(panel) { response in
             guard response == .OK else { return }
             for url in panel.urls {
                 if url.pathExtension.lowercased() == "pdf" {

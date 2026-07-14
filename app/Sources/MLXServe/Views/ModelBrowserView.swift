@@ -914,7 +914,7 @@ private struct UseModelButton: View {
                 let ready = await appState.useModelAndAwaitReady(atPath: path)
                 isLoading = false
                 if ready {
-                    openWindow(id: "chat")
+                    AppActivation.openWindow(id: "chat", using: openWindow)
                 }
             }
         } label: {
@@ -1199,74 +1199,82 @@ private struct ModelBrowserRow: View {
 
     @ViewBuilder
     private var actionCell: some View {
-        switch action {
-        case .unsupported:
-            Image(systemName: "nosign")
-                .foregroundStyle(.secondary)
-                .font(.caption)
-
-        case .onDisk:
-            HStack(spacing: 6) {
-                if let usable = usableModel {
-                    let use = ModelUseState.resolve(
-                        selected: appState.selectedModelPath == usable.path,
-                        serverStatus: server.status
-                    )
-                    if use == .idle {
-                        UseModelButton(path: usable.path, name: usable.name)
-                    } else {
-                        ModelUseBadge(state: use)
-                    }
-                } else {
-                    Text("✓ On disk")
-                        .font(.caption.weight(.medium))
-                        .foregroundStyle(.green)
-                }
-                deleteButton
-            }
-
-        case .downloading(let progress):
-            HStack(spacing: 4) {
-                VStack(spacing: 1) {
-                    ProgressView(value: progress)
-                        .frame(width: 50)
-                    Text(state?.percentFormatted ?? "")
-                        .font(.system(size: 9).monospacedDigit())
-                        .foregroundStyle(.secondary)
-                }
-                Button {
-                    downloads.cancel(model.id)
-                    appState.refreshModels()
-                } label: {
-                    Image(systemName: "xmark.circle.fill")
-                        .foregroundStyle(.secondary)
-                }
-                .buttonStyle(.plain)
-                .help("Cancel download")
-            }
-
-        case .failed(let resumable):
-            if model.isGgufRepo {
-                GgufDownloadMenu(repoId: model.id, label: "Retry")
+        // A GGUF repo is a FOLDER OF QUANTS, not a model, so it never reaches a
+        // terminal "on disk" state: owning Q4_K_M says nothing about whether you
+        // also want Q8_0. Its cell stays a menu that marks what you have and
+        // keeps offering what you don't — the old `.onDisk` collapse to
+        // "✓ On disk" + trash left no way back to the quant picker.
+        if model.isGgufRepo, action != .unsupported {
+            if case .downloading(let progress) = action {
+                downloadingCell(progress: progress)
             } else {
+                GgufQuantMenu(repoId: model.id, state: state)
+            }
+        } else {
+            switch action {
+            case .unsupported:
+                Image(systemName: "nosign")
+                    .foregroundStyle(.secondary)
+                    .font(.caption)
+
+            case .onDisk:
+                HStack(spacing: 6) {
+                    if let usable = usableModel {
+                        let use = ModelUseState.resolve(
+                            selected: appState.selectedModelPath == usable.path,
+                            serverStatus: server.status
+                        )
+                        if use == .idle {
+                            UseModelButton(path: usable.path, name: usable.name)
+                        } else {
+                            ModelUseBadge(state: use)
+                        }
+                    } else {
+                        Text("✓ On disk")
+                            .font(.caption.weight(.medium))
+                            .foregroundStyle(.green)
+                    }
+                    deleteButton
+                }
+
+            case .downloading(let progress):
+                downloadingCell(progress: progress)
+
+            case .failed(let resumable):
                 Button(resumable ? "Resume" : "Retry") {
                     downloads.start(repoId: model.id) { appState.refreshModels() }
                 }
                 .font(.callout)
                 .controlSize(.small)
-            }
 
-        case .notDownloaded(let resumable):
-            if model.isGgufRepo {
-                // GGUF repos ship many quants — pick one from a menu.
-                GgufDownloadMenu(repoId: model.id, label: resumable ? "Resume" : "Download")
-            } else {
+            case .notDownloaded(let resumable):
                 Button(resumable ? "Resume" : "Download") {
                     downloads.start(repoId: model.id) { appState.refreshModels() }
                 }
                 .font(.callout)
                 .controlSize(.small)
             }
+        }
+    }
+
+    private func downloadingCell(progress: Double) -> some View {
+        HStack(spacing: 4) {
+            VStack(spacing: 1) {
+                ProgressView(value: progress)
+                    .frame(width: 50)
+                Text(state?.percentFormatted ?? "")
+                    .font(.system(size: 9).monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+            Button {
+                downloads.cancel(model.id)
+                appState.refreshModels()
+            } label: {
+                Image(systemName: "xmark.circle.fill")
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.plain)
+            .help("Cancel download")
         }
     }
 
@@ -1292,41 +1300,110 @@ private struct ModelBrowserRow: View {
     }
 }
 
-/// Download button for a GGUF repo: a menu of the repo's quant files. The list
-/// is fetched lazily from the HF tree API the first time the menu is shown.
-private struct GgufDownloadMenu: View {
+/// The action cell for a GGUF repo: one menu covering every quant, in every
+/// state.
+///
+/// A GGUF repo ships a folder of quants and the user picks which to run, so this
+/// control never "completes". Quants on disk carry a ✓ and load on click; the
+/// rest download on click; each can be deleted individually. The repo's file
+/// list is fetched lazily from the HF tree API the first time the menu opens —
+/// what's on DISK, though, is read every render, so a finished download shows up
+/// without a refetch.
+private struct GgufQuantMenu: View {
     let repoId: String
-    let label: String
+    let state: DownloadManager.DownloadState?
     @EnvironmentObject var downloads: DownloadManager
     @EnvironmentObject var appState: AppState
-    @State private var quants: [String] = []
+    @State private var remote: [String] = []
     @State private var loaded = false
+    @State private var pendingDelete: GgufQuant?
+
+    private var menu: GgufQuantMenuModel.Menu {
+        GgufQuantMenuModel.build(
+            remote: remote,
+            onDisk: downloads.downloadedGgufFiles(repoId: repoId)
+        )
+    }
+
+    /// Where a quant lives on disk — the path the server loads and the tray
+    /// picker selects, so "Use" here and picking it in the tray are the same act.
+    private func path(of quant: GgufQuant) -> String? {
+        guard let dir = downloads.existingModelDir(for: repoId) else { return nil }
+        return (dir as NSString).appendingPathComponent(quant.filename)
+    }
 
     var body: some View {
+        let m = menu
         Menu {
-            if !loaded {
-                Text("Loading quants…")
-            } else if quants.isEmpty {
-                Text("No GGUF files found")
-            } else {
-                ForEach(quants, id: \.self) { file in
-                    Button(DownloadManager.quantLabel(forFilename: file)) {
-                        downloads.startGguf(repoId: repoId, ggufFilename: file) {
-                            appState.refreshModels()
+            if !m.onDisk.isEmpty {
+                Section("On this Mac") {
+                    ForEach(m.onDisk) { quant in
+                        Button {
+                            guard let p = path(of: quant) else { return }
+                            Task { _ = await appState.useModelAndAwaitReady(atPath: p) }
+                        } label: {
+                            let selected = path(of: quant) == appState.selectedModelPath
+                            Label(
+                                selected ? "\(quant.label) — in use" : "\(quant.label) — use",
+                                systemImage: selected ? "checkmark.circle.fill" : "checkmark"
+                            )
                         }
                     }
                 }
             }
+
+            Section(m.onDisk.isEmpty ? "Choose a quant" : "Download another") {
+                if !loaded {
+                    Text("Loading quants…")
+                } else if m.available.isEmpty {
+                    Text(m.onDisk.isEmpty ? "No GGUF files found" : "Every quant is downloaded")
+                } else {
+                    ForEach(m.available) { quant in
+                        Button(quant.label) {
+                            downloads.startGguf(repoId: repoId, ggufFilename: quant.filename) {
+                                appState.refreshModels()
+                            }
+                        }
+                    }
+                }
+            }
+
+            if !m.onDisk.isEmpty {
+                // Deletes remove ONE quant. Its siblings are separate models the
+                // user didn't ask to delete.
+                Menu("Delete") {
+                    ForEach(m.onDisk) { quant in
+                        Button(quant.label, role: .destructive) { pendingDelete = quant }
+                    }
+                }
+            }
         } label: {
-            Text(label)
+            Text(GgufQuantMenuModel.buttonLabel(
+                onDisk: m.onDisk,
+                failed: state?.status == .failed,
+                hasPartial: downloads.hasPartialDownload(repoId)
+            ))
         }
         .font(.callout)
         .controlSize(.small)
         .fixedSize()
         .task {
             guard !loaded else { return }
-            quants = await downloads.listGgufFiles(repoId: repoId)
+            remote = await downloads.listGgufFiles(repoId: repoId)
             loaded = true
+        }
+        .alert("Delete Quant", isPresented: .init(
+            get: { pendingDelete != nil },
+            set: { if !$0 { pendingDelete = nil } }
+        ), presenting: pendingDelete) { quant in
+            Button("Cancel", role: .cancel) { pendingDelete = nil }
+            Button("Delete", role: .destructive) {
+                if let p = path(of: quant) { downloads.removeGgufQuant(at: p) }
+                pendingDelete = nil
+                appState.refreshModels()
+            }
+        } message: { quant in
+            Text("Delete the \(quant.label) quant? Other quants of this model stay on disk.")
         }
     }
 }
@@ -1351,7 +1428,9 @@ private struct LocalModelRow: View {
         HStack(spacing: 8) {
             VStack(alignment: .leading, spacing: 1) {
                 HStack(spacing: 6) {
-                    Text(model.name)
+                    // `displayLabel`, so two quants of one GGUF repo are two
+                    // distinguishable rows rather than two identical ones.
+                    Text(model.displayLabel)
                         .font(.callout.weight(.medium))
                         .lineLimit(1)
                     // Drafter checkpoints are real, supported models — they
@@ -1429,15 +1508,19 @@ private struct LocalModelRow: View {
                 }
                 .buttonStyle(.plain)
                 .font(.callout)
-                .help("Delete model")
-                .alert("Delete Model", isPresented: $confirmDelete) {
+                .help(model.quantFile != nil ? "Delete this quant" : "Delete model")
+                .alert(model.quantFile != nil ? "Delete Quant" : "Delete Model", isPresented: $confirmDelete) {
                     Button("Cancel", role: .cancel) {}
                     Button("Delete", role: .destructive) {
                         downloads.deleteModel(model)
                         appState.refreshModels()
                     }
                 } message: {
-                    Text("Delete \(model.name)? This will remove all downloaded files.")
+                    // A GGUF row is ONE quant of a repo — deleting it must not
+                    // promise (or perform) the removal of its siblings.
+                    Text(model.quantFile != nil
+                         ? "Delete \(model.displayLabel)? Other quants of this model stay on disk."
+                         : "Delete \(model.name)? This will remove all downloaded files.")
                 }
             }
             .frame(width: 120, alignment: .trailing)

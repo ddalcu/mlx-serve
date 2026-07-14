@@ -429,7 +429,7 @@ struct ImageGenView: View {
         panel.canChooseFiles = true
         panel.canChooseDirectories = false
         panel.allowsMultipleSelection = false
-        if panel.runModal() == .OK, let url = panel.url {
+        if AppActivation.runModal(panel) == .OK, let url = panel.url {
             initImageURL = url
         }
     }
@@ -440,7 +440,7 @@ struct ImageGenView: View {
         panel.canChooseFiles = true
         panel.canChooseDirectories = false
         panel.allowsMultipleSelection = false
-        if panel.runModal() == .OK, let url = panel.url, refImageURLs.count < 3 {
+        if AppActivation.runModal(panel) == .OK, let url = panel.url, refImageURLs.count < 3 {
             refImageURLs.append(url)
         }
     }
@@ -453,7 +453,7 @@ struct ImageGenView: View {
         panel.canChooseFiles = true
         panel.canChooseDirectories = false
         panel.allowsMultipleSelection = false
-        if panel.runModal() == .OK, let url = panel.url {
+        if AppActivation.runModal(panel) == .OK, let url = panel.url {
             loraPath = url.path
             persist()
         }

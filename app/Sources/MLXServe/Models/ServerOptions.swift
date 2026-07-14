@@ -48,6 +48,17 @@ struct ServerOptions: Codable, Equatable {
     var drafterPath: String = ""        // empty = no drafter
     var draftBlockSize: Int = 4
 
+    /// Native multi-token prediction (Qwen 3.5/3.6 checkpoints that ship a
+    /// trained `mtp/` sidecar head). Default ON, mirroring the server — the head
+    /// auto-loads when present and models without one are unaffected, so
+    /// `toCLIArgs` emits `--no-mtp` ONLY when the user turns it off.
+    var enableMTP: Bool = true
+    /// How many tokens the MTP head drafts per round. `0` = auto, which is the
+    /// server's own default (`--mtp-depth 0` → the adaptive EV controller tunes
+    /// depth live from the measured acceptance rate). A fixed value is a
+    /// benchmarking lever; emitted only when non-zero.
+    var mtpDepth: Int = 0
+
     // Performance (server-launch flags)
     /// Continuous batching: max in-flight chat requests batched through one
     /// forward pass. 1 = serial (default). Hybrid SSM / MoE models clamp to 1
@@ -350,6 +361,8 @@ struct ServerOptions: Codable, Equatable {
         pldKeyLen == other.pldKeyLen &&
         drafterPath == other.drafterPath &&
         draftBlockSize == other.draftBlockSize &&
+        enableMTP == other.enableMTP &&
+        mtpDepth == other.mtpDepth &&
         maxConcurrent == other.maxConcurrent &&
         kvQuant == other.kvQuant &&
         prefixCacheEntries == other.prefixCacheEntries &&
@@ -440,6 +453,15 @@ struct ServerOptions: Codable, Equatable {
         if !drafterPath.isEmpty {
             args += ["--drafter", drafterPath,
                      "--draft-block-size", "\(draftBlockSize)"]
+        }
+        // MTP: the server auto-loads a checkpoint's `mtp/` head and defaults
+        // depth to auto, so a default launch emits NOTHING here (guarded by
+        // testDefaultLaunchOmitsAllMatchDefaultFlags).
+        if !enableMTP {
+            args += ["--no-mtp"]
+        }
+        if mtpDepth > 0 {
+            args += ["--mtp-depth", "\(mtpDepth)"]
         }
         // Performance: only emit non-default flags so the CLI tail stays
         // readable in log lines and `ps`. Server defaults are 1 / off / 2GB.
@@ -576,6 +598,8 @@ extension ServerOptions {
         if let v = try c.decodeIfPresent(Int.self, forKey: .pldKeyLen) { pldKeyLen = v }
         if let v = try c.decodeIfPresent(String.self, forKey: .drafterPath) { drafterPath = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .draftBlockSize) { draftBlockSize = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .enableMTP) { enableMTP = v }
+        if let v = try c.decodeIfPresent(Int.self, forKey: .mtpDepth) { mtpDepth = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .maxConcurrent) { maxConcurrent = v }
         if let v = try c.decodeIfPresent(KVQuant.self, forKey: .kvQuant) { kvQuant = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .prefixCacheEntries) { prefixCacheEntries = v }
@@ -706,9 +730,17 @@ extension ServerOptions {
             title: "Tool-call auto-correct",
             explainer: "Coerce tool-call arguments to the types the tool schema declares (e.g. a model sending Python's \"False\" or a list-as-string) so strict clients like Claude Code stop rejecting them with \"expected boolean, provided string\". Recommended on. Turn off to pass the model's arguments through exactly as written.",
             needsRestart: true),
+        "enableMTP": .init(
+            title: "Multi-Token Prediction (recommended)",
+            explainer: "Qwen 3.5 / 3.6 models that ship a trained MTP head guess several of the next tokens at once and check them all in a single pass — typically a big speed-up on replies, with output identical to normal decoding. It switches on by itself for models that have the head, and does nothing for models that don't, so there's rarely a reason to turn it off.",
+            needsRestart: true),
+        "mtpDepth": .init(
+            title: "Tokens guessed ahead",
+            explainer: "How many tokens the MTP head guesses per step. Automatic (recommended) tunes this live — it guesses deeper while the model keeps accepting the guesses and backs off when it doesn't. Pick a fixed number only if you're measuring performance.",
+            needsRestart: true),
         "enablePLD": .init(
             title: "Enable PLD (recommended)",
-            explainer: "Prompt Lookup Decoding. Big wins on echo-heavy workloads (code editing, RAG, agent loops). The adaptive prompt-time gate auto-disables it on novel content.",
+            explainer: "Prompt Lookup Decoding. Big wins on echo-heavy workloads (code editing, RAG, agent loops). The adaptive prompt-time gate auto-disables it on novel content. On models with a native MTP head, MTP takes priority and PLD stays dormant — except MoE models (e.g. 35B-A3B), where PLD is the default speedup.",
             needsRestart: true),
         "pldDraftLen": .init(
             title: "PLD draft length",

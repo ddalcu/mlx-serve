@@ -17,20 +17,38 @@ enum VoiceCloneMenuModel {
         !clipPath.isEmpty && cloneEnabled && ttsModelDownloaded
     }
 
+    /// Longest clip name the tray will render. The label is a FILENAME the user
+    /// picked, so it can be arbitrarily long — and the menu-bar panel is a fixed
+    /// narrow column that a 200-character name blows out sideways, dragging the
+    /// whole tray layout with it. Clamp at the source: both places that render
+    /// the name go through the helpers below.
+    static let maxClipLabelLength = 10
+
+    /// The clip name as the tray may show it: never longer than
+    /// `maxClipLabelLength`, with an ellipsis marking what was cut. The stored
+    /// `voiceCloneLabel` keeps its full value — this is display-only.
+    static func clipDisplayName(_ label: String, maxLength: Int = maxClipLabelLength) -> String {
+        let trimmed = label.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard trimmed.count > maxLength, maxLength > 0 else { return trimmed }
+        return String(trimmed.prefix(maxLength)) + "…"
+    }
+
     /// Collapsed picker label: the clip's name while the clone is active,
     /// otherwise the system voice that will actually speak.
     static func collapsedLabel(clipPath: String, cloneEnabled: Bool, ttsModelDownloaded: Bool,
                                cloneLabel: String, systemVoiceName: String?) -> String {
         if cloneIsActive(clipPath: clipPath, cloneEnabled: cloneEnabled,
                          ttsModelDownloaded: ttsModelDownloaded) {
-            return cloneLabel.isEmpty ? "My voice" : cloneLabel
+            let name = clipDisplayName(cloneLabel)
+            return name.isEmpty ? "My voice" : name
         }
         return systemVoiceName ?? "Voice"
     }
 
     /// Menu-row title for the clone entry.
     static func cloneItemTitle(label: String) -> String {
-        label.isEmpty ? "My voice" : "My voice — \(label)"
+        let name = clipDisplayName(label)
+        return name.isEmpty ? "My voice" : "My voice — \(name)"
     }
 
     /// Why the clone rows are disabled; nil when cloning can work. Having no
@@ -58,7 +76,7 @@ enum VoiceCloneMenuModel {
         panel.allowedContentTypes = [.audio, .wav, .mp3, .mpeg4Audio, .aiff]
         panel.canChooseFiles = true
         panel.canChooseDirectories = false
-        guard panel.runModal() == .OK, let url = panel.url else { return nil }
+        guard AppActivation.runModal(panel) == .OK, let url = panel.url else { return nil }
         let normalized = try AudioReference.normalizedReferenceWav(fromFile: url)
         return (VoiceCloneClipStore.persist(normalized), url.lastPathComponent)
     }

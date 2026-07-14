@@ -8,6 +8,10 @@ class DownloadManager: ObservableObject {
     /// In-flight `download`/`downloadGguf` tasks keyed by repoId, so the
     /// Cancel button can interrupt them. Removed in the wrapper's `defer`.
     private var activeTasks: [String: Task<Void, Never>] = [:]
+    /// The `.gguf` a repo's in-flight transfer is fetching, so a cancel can be
+    /// scoped to that one quant instead of the whole folder (which may already
+    /// hold quants downloaded earlier).
+    private var activeGgufFile: [String: String] = [:]
 
     struct DownloadState {
         var progress: Double = 0
@@ -51,24 +55,39 @@ class DownloadManager: ObservableObject {
     // through the discoverer's fallback scan and `existingModelDir(for:)` —
     // no automatic migration; users can move dirs manually if they want.
 
-    /// True iff a filename is a GGUF mlx-serve can serve. As of the embedded
-    /// llama.cpp engine that's ANY `.gguf` EXCEPT mmproj sidecars (CLIP
-    /// vision / audio encoders shipped alongside vision-enabled LLMs —
-    /// `mmproj-*.gguf` files have `general.architecture=clip` and llama.cpp
-    /// refuses to load them as language models). DeepSeek-V4-Flash routes
-    /// to the ds4 engine, everything else to llama.cpp (server-side, by
-    /// `ggufModelType`).
+    /// True iff a filename is a GGUF mlx-serve can serve — i.e. a language-model
+    /// quant, not one of the SIDECARS a GGUF folder ships beside it. As of the
+    /// embedded llama.cpp engine that's ANY `.gguf` except `isGgufSidecar`.
+    /// DeepSeek-V4-Flash routes to the ds4 engine, everything else to llama.cpp
+    /// (server-side, by `ggufModelType`).
     nonisolated static func isSupportedGguf(_ filename: String) -> Bool {
         let lower = filename.lowercased()
         guard lower.hasSuffix(".gguf") else { return false }
-        return !isMmprojGguf(filename)
+        return !isGgufSidecar(filename)
     }
 
-    /// True iff a basename is a multimodal-projection sidecar — the
-    /// `mmproj-*.gguf` convention used by llama.cpp tooling, ollama, and
-    /// LM Studio for the side-loaded CLIP vision / audio encoders. Mirrors
-    /// the Zig `model_discovery.isMmprojGgufBasename` so client and server
-    /// agree on which artifacts are LLMs.
+    /// True iff a basename is a non-LLM `.gguf` companion file. Two kinds ship
+    /// today, and NEITHER is loadable as a language model:
+    ///
+    /// - `mmproj-*.gguf` — the multimodal-projection sidecar (llama.cpp / ollama /
+    ///   LM Studio convention for side-loaded CLIP vision & audio encoders;
+    ///   `general.architecture=clip`, llama.cpp refuses to load it as an LLM).
+    /// - `*tokenizer*.gguf` — audio/speech tokenizers shipped beside a TTS model
+    ///   (live: `qwen3-tts-tokenizer-f16.gguf`, 341 MB, sitting next to
+    ///   `qwen3-tts-0.6b-f16.gguf`).
+    ///
+    /// This has to be exhaustive because discovery lists EVERY quant in a folder
+    /// as a separately selectable model — anything not filtered here becomes a
+    /// tray entry the user can pick and the server can only fail to load. Mirrors
+    /// the Zig `model_discovery.isGgufSidecarBasename` so client and server agree.
+    nonisolated static func isGgufSidecar(_ filename: String) -> Bool {
+        let lower = (filename as NSString).lastPathComponent.lowercased()
+        guard lower.hasSuffix(".gguf") else { return false }
+        return lower.hasPrefix("mmproj") || lower.contains("tokenizer")
+    }
+
+    /// Retained for the mmproj-specific call sites (the Swift mirror of the
+    /// server's `isMmprojGgufBasename`).
     nonisolated static func isMmprojGguf(_ filename: String) -> Bool {
         let lower = filename.lowercased()
         return lower.hasSuffix(".gguf") && lower.hasPrefix("mmproj")
@@ -141,19 +160,54 @@ class DownloadManager: ObservableObject {
     }
 
     /// Path of an existing model on disk. Prefers the new 2-level layout; falls
-    /// back to the legacy flat layout. Returns nil when neither has a `config.json`.
+    /// back to the legacy flat layout. Returns nil when neither holds a model.
+    ///
+    /// "Holds a model" is `config.json` OR at least one servable `.gguf` — a
+    /// GGUF download writes exactly one file and no config, so gating purely on
+    /// config.json made every GGUF folder unresolvable (which in turn made
+    /// `isReady`'s GGUF fast-path below dead code, and a downloaded quant read
+    /// as missing the moment the in-memory download row went away).
     nonisolated static func existingModelDir(rootDir: String, repoId: String) -> String? {
         let fm = FileManager.default
         let new = newLayoutDir(rootDir: rootDir, repoId: repoId)
-        if fm.fileExists(atPath: (new as NSString).appendingPathComponent("config.json")) {
-            return new
-        }
+        if holdsModel(new, fm: fm) { return new }
         let name = repoId.split(separator: "/").last.map(String.init) ?? repoId
         let legacy = (rootDir as NSString).appendingPathComponent(name)
-        if fm.fileExists(atPath: (legacy as NSString).appendingPathComponent("config.json")) {
-            return legacy
-        }
+        if holdsModel(legacy, fm: fm) { return legacy }
         return nil
+    }
+
+    private nonisolated static func holdsModel(_ dir: String, fm: FileManager) -> Bool {
+        if fm.fileExists(atPath: (dir as NSString).appendingPathComponent("config.json")) { return true }
+        return !ggufQuantFiles(inDir: dir).isEmpty
+    }
+
+    /// Servable `.gguf` basenames in a directory, sorted. Excludes mmproj
+    /// sidecars (CLIP encoders, not language models) and sub-1 MB stubs, and
+    /// `.partial` files are a different extension so an in-flight transfer never
+    /// counts as an on-disk quant.
+    nonisolated static func ggufQuantFiles(inDir dir: String) -> [String] {
+        let fm = FileManager.default
+        guard let entries = try? fm.contentsOfDirectory(atPath: dir) else { return [] }
+        return entries
+            .filter { isSupportedGguf($0) }
+            .filter { name in
+                let size = (try? fm.attributesOfItem(atPath: (dir as NSString).appendingPathComponent(name))[.size] as? UInt64) ?? 0
+                return size >= 1_000_000
+            }
+            .sorted()
+    }
+
+    /// The quants of `repoId` present on disk. Empty for a safetensors repo or
+    /// one we don't have. Drives the Discover row's quant menu (which quants
+    /// carry a checkmark) — a repo is never "done", only "has these so far".
+    nonisolated static func downloadedGgufFiles(rootDir: String, repoId: String) -> [String] {
+        guard let dir = existingModelDir(rootDir: rootDir, repoId: repoId) else { return [] }
+        return ggufQuantFiles(inDir: dir)
+    }
+
+    func downloadedGgufFiles(repoId: String) -> [String] {
+        Self.downloadedGgufFiles(rootDir: modelsDir, repoId: repoId)
     }
 
     func newLayoutDir(for repoId: String) -> String {
@@ -573,15 +627,32 @@ class DownloadManager: ObservableObject {
     }
 
     /// GGUF analogue of `start(repoId:onFinish:)`.
+    ///
+    /// Cancellation is scoped to the ONE quant being fetched: a repo folder can
+    /// already hold quants the user downloaded earlier, and the generic
+    /// whole-folder wipe would delete them as collateral for cancelling a
+    /// second download.
     func startGguf(repoId: String, ggufFilename: String, onFinish: @escaping @MainActor () -> Void) {
         activeTasks[repoId]?.cancel()
+        activeGgufFile[repoId] = ggufFilename
         let task = Task { @MainActor [weak self] in
             await self?.downloadGguf(repoId: repoId, ggufFilename: ggufFilename)
-            self?.finalizeIfCancelled(repoId: repoId)
+            self?.finalizeIfCancelledGguf(repoId: repoId, ggufFilename: ggufFilename)
+            self?.activeGgufFile.removeValue(forKey: repoId)
             self?.activeTasks.removeValue(forKey: repoId)
             onFinish()
         }
         activeTasks[repoId] = task
+    }
+
+    /// Post-await cleanup for `startGguf`. Removes only the cancelled quant (and
+    /// its `.partial`), taking the folder down only when nothing servable is
+    /// left — never a sibling quant.
+    private func finalizeIfCancelledGguf(repoId: String, ggufFilename: String) {
+        guard Task.isCancelled else { return }
+        downloads.removeValue(forKey: repoId)
+        let dir = existingModelDir(for: repoId) ?? newLayoutDir(for: repoId)
+        removeGgufQuant(at: (dir as NSString).appendingPathComponent(ggufFilename))
     }
 
     /// Cancel an in-flight download. The state row disappears from the UI and
@@ -596,7 +667,16 @@ class DownloadManager: ObservableObject {
         activeTasks[repoId]?.cancel()
         if activeTasks[repoId] == nil {
             downloads.removeValue(forKey: repoId)
-            wipeDownloadDir(repoId)
+            // A GGUF folder can hold quants from earlier downloads — those are
+            // finished models, not this transfer's remnants, so the whole-folder
+            // wipe must not run over them.
+            if let gguf = activeGgufFile[repoId] {
+                let dir = existingModelDir(for: repoId) ?? newLayoutDir(for: repoId)
+                removeGgufQuant(at: (dir as NSString).appendingPathComponent(gguf))
+                activeGgufFile.removeValue(forKey: repoId)
+            } else if downloadedGgufFiles(repoId: repoId).isEmpty {
+                wipeDownloadDir(repoId)
+            }
         }
     }
 
@@ -657,6 +737,38 @@ class DownloadManager: ObservableObject {
             try? fm.removeItem(atPath: authorDir)
         }
         return !fm.fileExists(atPath: modelDir)
+    }
+
+    /// Delete ONE quant of a GGUF repo, leaving its siblings alone. A repo
+    /// folder holds many independently-loadable quants, so removing the folder
+    /// (what `removeModelFiles` does) would destroy quants the user never asked
+    /// to delete. When the last servable quant goes the folder goes with it —
+    /// an orphaned mmproj sidecar or README is dead weight — and an emptied
+    /// author dir is pruned, never climbing past a scan root.
+    /// Returns true when the file is gone.
+    @discardableResult
+    nonisolated static func removeGgufQuant(at path: String, roots: [String]) -> Bool {
+        let fm = FileManager.default
+        guard fm.fileExists(atPath: path) else { return false }
+        try? fm.removeItem(atPath: path)
+        try? fm.removeItem(atPath: path + ".partial")
+
+        let dir = (path as NSString).deletingLastPathComponent
+        if ggufQuantFiles(inDir: dir).isEmpty,
+           !fm.fileExists(atPath: (dir as NSString).appendingPathComponent("config.json")) {
+            removeModelFiles(at: dir, roots: roots)
+        }
+        return !fm.fileExists(atPath: path)
+    }
+
+    /// Instance form, scoped to every root we scan (a GGUF quant can live under
+    /// LM Studio's tree or a custom folder, not just `~/.mlx-serve/models`).
+    @discardableResult
+    func removeGgufQuant(at path: String) -> Bool {
+        var roots = [modelsDir]
+        if let lms = lmStudioRoot { roots.append(lms) }
+        if let custom = resolvedCustomRoot() { roots.append(custom) }
+        return Self.removeGgufQuant(at: path, roots: roots)
     }
 
     /// Download a single GGUF artifact from a HuggingFace repo. Used by the
@@ -840,43 +952,54 @@ class DownloadManager: ObservableObject {
         return false
     }
 
-    private func makeLocalModel(at dirPath: String, displayName: String, idKey: String, source: LocalModelSource) -> LocalModel? {
+    /// Every model a directory holds.
+    ///
+    /// A safetensors checkpoint is exactly one model (the directory). A GGUF
+    /// repo is one model PER QUANT: the folder ships `…-Q4_K_M.gguf`,
+    /// `…-Q8_0.gguf`, … and each is independently loadable, so each gets its own
+    /// `LocalModel` whose `path` is the FILE. Previously this returned only the
+    /// alphabetically-smallest quant and silently dropped the rest, which is why
+    /// the tray picker could never offer a second quant of a repo you'd
+    /// downloaded two of.
+    ///
+    /// `nonisolated` + static so it's testable against a temp dir.
+    nonisolated static func makeLocalModels(atDir dirPath: String, displayName: String, idKey: String, source: LocalModelSource) -> [LocalModel] {
         let resolved = (dirPath as NSString).resolvingSymlinksInPath
         let entries = (try? FileManager.default.contentsOfDirectory(atPath: resolved)) ?? []
 
-        // GGUF fast-path: surface ANY non-mmproj `.gguf` as a selectable base
-        // model. Sort first so the pick is deterministic across filesystems
-        // (FileManager.contentsOfDirectory order is APFS-specific). When a
-        // folder ships both `gemma-4-E4B-it-Q4_K_M.gguf` and `Q8_0.gguf`
-        // we deterministically pick the alphabetically-smallest basename
-        // (matches the Zig server's `resolveGgufFile` tiebreaker).
-        // `isSupportedGguf` already filters mmproj sidecars
-        // (`mmproj-*.gguf`, the CLIP vision/audio encoders) so they can't
-        // be picked here — the previous code grabbed them on Gemma 4 VL
-        // / Qwen 3.6 VL repos and the server then 404'd with
-        // 'unsupported model architecture: clip'.
-        let ggufCandidates = entries.filter { Self.isSupportedGguf($0) }.sorted()
-        if let gguf = ggufCandidates.first,
-           let modelType = Self.ggufModelType(forBasename: gguf) {
-            let ggufPath = (resolved as NSString).appendingPathComponent(gguf)
-            let size = (try? FileManager.default.attributesOfItem(atPath: ggufPath)[.size] as? UInt64) ?? 0
-            return LocalModel(
-                id: "\(source.rawValue):\(idKey)",
-                name: displayName,
-                path: ggufPath,
-                sizeFormatted: MemoryInfo.format(Int64(size)),
-                modelType: modelType,
-                source: source,
-                kind: .base
-            )
+        // GGUF: one entry per servable quant, sorted so the order is stable
+        // across filesystems (FileManager.contentsOfDirectory order is
+        // APFS-specific). `ggufQuantFiles` already drops mmproj sidecars
+        // (`mmproj-*.gguf`, the CLIP vision/audio encoders) — the old code
+        // grabbed those on Gemma 4 VL / Qwen 3.6 VL repos and the server then
+        // 404'd with 'unsupported model architecture: clip'.
+        let quants = ggufQuantFiles(inDir: resolved)
+        if !quants.isEmpty {
+            return quants.compactMap { gguf -> LocalModel? in
+                guard let modelType = ggufModelType(forBasename: gguf) else { return nil }
+                let ggufPath = (resolved as NSString).appendingPathComponent(gguf)
+                let size = (try? FileManager.default.attributesOfItem(atPath: ggufPath)[.size] as? UInt64) ?? 0
+                return LocalModel(
+                    // The file, not the folder — two quants of one repo must not
+                    // collide on id or SwiftUI collapses them into one row.
+                    id: "\(source.rawValue):\(idKey)#\(gguf)",
+                    name: displayName,
+                    path: ggufPath,
+                    sizeFormatted: MemoryInfo.format(Int64(size)),
+                    modelType: modelType,
+                    source: source,
+                    kind: .base,
+                    quantFile: gguf
+                )
+            }
         }
 
         let configPath = (resolved as NSString).appendingPathComponent("config.json")
-        guard FileManager.default.fileExists(atPath: configPath) else { return nil }
+        guard FileManager.default.fileExists(atPath: configPath) else { return [] }
 
-        guard entries.contains(where: { $0.hasSuffix(".safetensors") && !$0.hasSuffix(".index.json") }) else { return nil }
+        guard entries.contains(where: { $0.hasSuffix(".safetensors") && !$0.hasSuffix(".index.json") }) else { return [] }
 
-        let meta = Self.parseConfigMetadata(atPath: configPath)
+        let meta = parseConfigMetadata(atPath: configPath)
         let modelType = meta.modelType
 
         let size = directorySize(resolved)
@@ -886,8 +1009,8 @@ class DownloadManager: ObservableObject {
         // them out. `gemma4_unified_assistant` is the newer "unified"
         // architecture (spans dense + MoE targets) shipped with the 12B
         // drafter — same UI treatment as `gemma4_assistant`.
-        let kind: ModelKind = Self.drafterModelTypes.contains(modelType) ? .drafter : .base
-        return LocalModel(
+        let kind: ModelKind = drafterModelTypes.contains(modelType) ? .drafter : .base
+        return [LocalModel(
             id: "\(source.rawValue):\(idKey)",
             name: displayName,
             path: resolved,
@@ -900,7 +1023,7 @@ class DownloadManager: ObservableObject {
             contextLength: meta.contextLength,
             numExperts: meta.numExperts,
             activeExperts: meta.activeExperts
-        )
+        )]
     }
 
     /// Metadata read from a model's `config.json` — the authoritative source for
@@ -946,23 +1069,22 @@ class DownloadManager: ObservableObject {
         // New: <root>/<author>/<name>/config.json (matches LM Studio).
         // Legacy: <root>/<name>/config.json — kept working for users who had
         // models predating the migration that the auto-migrator couldn't classify.
+        // Whether `entry` is itself a model dir (legacy flat) or an author dir
+        // (new layout) is decided by what `makeLocalModels` finds in it — NOT by
+        // config.json, which a GGUF-only folder never has.
         if let entries = try? fm.contentsOfDirectory(atPath: modelsDir) {
             for entry in entries where !entry.hasPrefix(".") {
                 let entryPath = (modelsDir as NSString).appendingPathComponent(entry)
-                let directConfig = (entryPath as NSString).appendingPathComponent("config.json")
-                if fm.fileExists(atPath: directConfig) {
+                let direct = Self.makeLocalModels(atDir: entryPath, displayName: entry, idKey: entry, source: .mlxServe)
+                if !direct.isEmpty {
                     // Legacy flat layout: entry IS the model dir.
-                    if let m = makeLocalModel(at: entryPath, displayName: entry, idKey: entry, source: .mlxServe) {
-                        out.append(m)
-                    }
+                    out.append(contentsOf: direct)
                 } else if let children = try? fm.contentsOfDirectory(atPath: entryPath) {
                     // New layout: entry is an author dir, scan one level deeper.
                     for child in children where !child.hasPrefix(".") {
                         let childPath = (entryPath as NSString).appendingPathComponent(child)
                         let display = "\(entry)/\(child)"
-                        if let m = makeLocalModel(at: childPath, displayName: display, idKey: display, source: .mlxServe) {
-                            out.append(m)
-                        }
+                        out.append(contentsOf: Self.makeLocalModels(atDir: childPath, displayName: display, idKey: display, source: .mlxServe))
                     }
                 }
             }
@@ -977,9 +1099,7 @@ class DownloadManager: ObservableObject {
                 for repo in repos where !repo.hasPrefix(".") {
                     let repoPath = (pubPath as NSString).appendingPathComponent(repo)
                     let display = "\(pub)/\(repo)"
-                    if let m = makeLocalModel(at: repoPath, displayName: display, idKey: display, source: .lmStudio) {
-                        out.append(m)
-                    }
+                    out.append(contentsOf: Self.makeLocalModels(atDir: repoPath, displayName: display, idKey: display, source: .lmStudio))
                 }
             }
         }
@@ -992,18 +1112,14 @@ class DownloadManager: ObservableObject {
            let entries = try? fm.contentsOfDirectory(atPath: root) {
             for entry in entries where !entry.hasPrefix(".") {
                 let entryPath = (root as NSString).appendingPathComponent(entry)
-                let directConfig = (entryPath as NSString).appendingPathComponent("config.json")
-                if fm.fileExists(atPath: directConfig) {
-                    if let m = makeLocalModel(at: entryPath, displayName: entry, idKey: "custom:\(entry)", source: .custom) {
-                        out.append(m)
-                    }
+                let direct = Self.makeLocalModels(atDir: entryPath, displayName: entry, idKey: "custom:\(entry)", source: .custom)
+                if !direct.isEmpty {
+                    out.append(contentsOf: direct)
                 } else if let children = try? fm.contentsOfDirectory(atPath: entryPath) {
                     for child in children where !child.hasPrefix(".") {
                         let childPath = (entryPath as NSString).appendingPathComponent(child)
                         let display = "\(entry)/\(child)"
-                        if let m = makeLocalModel(at: childPath, displayName: display, idKey: "custom:\(display)", source: .custom) {
-                            out.append(m)
-                        }
+                        out.append(contentsOf: Self.makeLocalModels(atDir: childPath, displayName: display, idKey: "custom:\(display)", source: .custom))
                     }
                 }
             }
@@ -1011,7 +1127,10 @@ class DownloadManager: ObservableObject {
 
         return out
             .filter { !Self.internalHelperRepos.contains($0.name) }
-            .sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+            // By label, not name: sibling quants of one repo share a name, and a
+            // name-only sort leaves their relative order at the mercy of the
+            // filesystem.
+            .sorted { $0.displayLabel.localizedCaseInsensitiveCompare($1.displayLabel) == .orderedAscending }
     }
 
     /// `model_type` values that identify a Gemma 4 assistant drafter
@@ -1119,10 +1238,18 @@ class DownloadManager: ObservableObject {
         var roots = [modelsDir]
         if let lms = lmStudioRoot { roots.append(lms) }
         if let custom = resolvedCustomRoot() { roots.append(custom) }
-        Self.removeModelFiles(at: model.path, roots: roots)
+        if model.quantFile != nil {
+            // One quant of a GGUF repo — remove that file only. Its siblings are
+            // separate models the user didn't ask to delete.
+            Self.removeGgufQuant(at: model.path, roots: roots)
+        } else {
+            Self.removeModelFiles(at: model.path, roots: roots)
+        }
         // Clear any lingering download-state row, keyed by the clean repoId
-        // (drop the `source:` prefix the LocalModel id carries).
-        let cleanId = model.id.split(separator: ":", maxSplits: 1).last.map(String.init) ?? model.id
+        // (drop the `source:` prefix and the `#quant.gguf` suffix the
+        // LocalModel id carries).
+        let afterSource = model.id.split(separator: ":", maxSplits: 1).last.map(String.init) ?? model.id
+        let cleanId = afterSource.split(separator: "#", maxSplits: 1).first.map(String.init) ?? afterSource
         downloads.removeValue(forKey: cleanId)
     }
 
@@ -1151,7 +1278,7 @@ class DownloadManager: ObservableObject {
         downloads.removeValue(forKey: repoId)
     }
 
-    private func directorySize(_ path: String) -> UInt64 {
+    nonisolated private static func directorySize(_ path: String) -> UInt64 {
         guard let enumerator = FileManager.default.enumerator(atPath: path) else { return 0 }
         var total: UInt64 = 0
         while let file = enumerator.nextObject() as? String {

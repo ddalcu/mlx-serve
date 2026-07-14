@@ -154,6 +154,16 @@ pub const MtpModel = struct {
     draft_head_bits: u32 = 0,
     draft_head_group: u32 = 0,
 
+    /// Cross-request EV controller seed (inference thread only, like every
+    /// mutable field here): the last HEALTHY request's per-index acceptance
+    /// EMAs + base depth, written by `Generator.deinit`, consumed by the
+    /// first `nextMtp` round of the next request. A fresh controller burns
+    /// ~10 legacy-warmup rounds plus a +1/round base climb per request —
+    /// a third of a short protocol-style generation; seeding restores the
+    /// learned surface from round 1. Never written by disabled/short runs.
+    ev_seed_accept: ?[MAX_DEPTH]f32 = null,
+    ev_seed_m_lo: u32 = 1,
+
     pub fn deinit(self: *MtpModel) void {
         if (self.draft_head) |*dh| dh.deinit();
         _ = mlx.mlx_array_free(self.fc_w_t);
@@ -195,6 +205,15 @@ pub const MtpModel = struct {
         self.buildDraftHead(target) catch |err| {
             log.warn("[mtp] draft lm_head build failed ({s}) — drafts use the trunk head\n", .{@errorName(err)});
         };
+        // NOTE (2026-07-13): mlx_compile'ing the offset-free front/back
+        // halves of the seq-1 draft step (the compileMoeRouting pattern,
+        // weights captured via payload) was built, verified equivalent at
+        // toy scale, and A/B'd live on the 27B — DEAD EVEN at depths 3 and 6
+        // (interleaved traced boots, <0.2 ms/step delta). The draft step is
+        // qmm-weight-read-bound and MLX's lazy pipeline already batches
+        // dispatch, so there is no launch overhead for compile to remove.
+        // Removed rather than shipped dark; frontChain/backChain keep the
+        // step's halves factored if a future backend changes the calculus.
     }
 
     /// MLX_SERVE_MTP_DRAFT_HEAD_BITS: absent → 3 (default on)
@@ -665,6 +684,14 @@ fn qLinearFwd(self: *const MtpModel, x: mlx.mlx_array, lin: *const QLinear) !mlx
             group = qp.group_size;
         }
     }
+    // Multi-row head forwards (the merged history+draft consume, prefill
+    // history rebuilds) ride the same verify-width split-K kernel as the
+    // trunk; ineligible shapes (seq 1 drafts, 5/6-bit MoE sidecars) fall
+    // through to stock.
+    if (try transformer_mod.verifyQmm(self.s, x, lin.w, lin.s, lin.b, bits, group)) |vy| {
+        _ = mlx.mlx_array_free(out);
+        return vy;
+    }
     try mlx.check(mlx.mlx_quantized_matmul(
         &out,
         x,
@@ -779,42 +806,36 @@ fn targetLmHead(self: *const MtpModel, target: *Transformer, x: mlx.mlx_array, s
     return out;
 }
 
-pub const StepOut = struct {
-    /// `[1, L, vocab]` logits, or `.ctx == null` when `want_logits` was false.
-    logits: mlx.mlx_array,
-    /// `[1, L, H]` MTP post-norm hidden — the next depth's `hidden` input.
-    hidden_next: mlx.mlx_array,
+/// Outputs of the pre-rope half of the MTP layer. All arrays owned.
+const FrontOut = struct {
+    q_t: mlx.mlx_array, // [1, H, L, D] normed, pre-rope
+    k_t: mlx.mlx_array, // [1, Hkv, L, D] normed, pre-rope
+    v_t: mlx.mlx_array, // [1, Hkv, L, D]
+    gate: mlx.mlx_array, // [1, L, H*D] raw output gate (pre-sigmoid)
+    x: mlx.mlx_array, // [1, L, H] fc output — the residual input
+
+    fn deinit(self: *FrontOut) void {
+        _ = mlx.mlx_array_free(self.q_t);
+        _ = mlx.mlx_array_free(self.k_t);
+        _ = mlx.mlx_array_free(self.v_t);
+        _ = mlx.mlx_array_free(self.gate);
+        _ = mlx.mlx_array_free(self.x);
+    }
 };
 
-/// Core MTP forward over `L` positions.
-///
-/// `id_arr`     — `[L]` int32 token ids (may be a lazy array mid-chain)
-/// `hidden`     — `[1, L, H]` trunk (depth 1) or MTP (depth >1) hidden states
-/// `cache`      — the head's own single-layer KV cache; entries appended here
-/// `rope_offset`— RoPE position of the FIRST of the L tokens (cache-relative)
-///
-/// Appends L entries to `cache`. Multi-token calls use a causal mask
-/// (bottom-right aligned, matching trunk chunked prefill).
-pub fn forward(
-    self: *const MtpModel,
-    target: *Transformer,
-    cache: *KVCache,
-    id_arr: mlx.mlx_array,
-    hidden: mlx.mlx_array,
-    rope_offset: c_int,
-    want_logits: bool,
-) !StepOut {
+/// Pre-rope half of the MTP layer: fc(concat([norm(embed), norm(hidden)])),
+/// input_norm, q/k/v projections, q/gate split, per-head norms, transposes.
+/// Offset-free — the body the compiled front closure traces AND the
+/// uncompiled fallback.
+fn frontChain(self: *const MtpModel, target: *Transformer, id_arr: mlx.mlx_array, hidden: mlx.mlx_array) !FrontOut {
     const s = self.s;
     const cfg = &target.config;
     const h_count: c_int = @intCast(cfg.num_attention_heads);
     const kv_h: c_int = @intCast(cfg.num_key_value_heads);
     const hd: c_int = @intCast(cfg.head_dim);
-    const hidden_size: c_int = @intCast(cfg.hidden_size);
     const eps = cfg.rms_norm_eps;
     const h_shape = mlx.getShape(hidden);
     const seq_len: c_int = h_shape[1];
-    const attn_scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(cfg.query_pre_attn_scalar)));
-    const rope_dims: c_int = @intFromFloat(@as(f32, @floatFromInt(cfg.head_dim)) * cfg.partial_rotary_factor);
     const flat_shape = [_]c_int{ 1, seq_len, h_count * hd };
 
     // fc(concat([norm(embed), norm(hidden)]))
@@ -835,7 +856,7 @@ pub fn forward(
         try mlx.check(mlx.mlx_concatenate_axis(&cat, vec, 2, s));
     }
     var x = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(x);
+    errdefer _ = mlx.mlx_array_free(x);
     try mlx.check(mlx.mlx_matmul(&x, cat, self.fc_w_t, s));
 
     // ── Decoder layer: gated full attention ──
@@ -849,7 +870,7 @@ pub fn forward(
     var queries = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(queries);
     var gate = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(gate);
+    errdefer _ = mlx.mlx_array_free(gate);
     {
         const q_gate_shape = [_]c_int{ 1, seq_len, h_count, hd * 2 };
         var q_gate_r = mlx.mlx_array_new();
@@ -888,43 +909,30 @@ pub fn forward(
 
     const perm = [_]c_int{ 0, 2, 1, 3 };
     var q_t = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(q_t);
+    errdefer _ = mlx.mlx_array_free(q_t);
     var k_t = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(k_t);
+    errdefer _ = mlx.mlx_array_free(k_t);
     var v_t = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(v_t);
+    errdefer _ = mlx.mlx_array_free(v_t);
     try mlx.check(mlx.mlx_transpose_axes(&q_t, q_normed, &perm, 4, s));
     try mlx.check(mlx.mlx_transpose_axes(&k_t, k_normed, &perm, 4, s));
     try mlx.check(mlx.mlx_transpose_axes(&v_t, v_r, &perm, 4, s));
 
-    var q_rope = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(q_rope);
-    var k_rope = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(k_rope);
-    try mlx.check(mlx.mlx_fast_rope(&q_rope, q_t, rope_dims, false, mlx.mlx_optional_float.some(cfg.rope_theta), 1.0, rope_offset, .{ .ctx = null }, s));
-    try mlx.check(mlx.mlx_fast_rope(&k_rope, k_t, rope_dims, false, mlx.mlx_optional_float.some(cfg.rope_theta), 1.0, rope_offset, .{ .ctx = null }, s));
+    return .{ .q_t = q_t, .k_t = k_t, .v_t = v_t, .gate = gate, .x = x };
+}
 
-    var kv_view = try cache.update(0, k_rope, v_t, s, 0);
-    defer kv_view.deinit();
-
-    var attn_out = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(attn_out);
-    const none_mask = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(none_mask);
-    // Multi-token (history rebuild / draft batch): try the fused hd-256
-    // flash kernel first — same dispatch the trunk's prefill uses.
-    var fused_done = false;
-    if (seq_len > 1) {
-        if (try transformer_mod.fusedSdpa256Prefill(s, q_rope, kv_view.k, kv_view.v, attn_scale, 0)) |fused| {
-            _ = mlx.mlx_array_free(attn_out);
-            attn_out = fused;
-            fused_done = true;
-        }
-    }
-    if (!fused_done) {
-        const mask_mode: [*:0]const u8 = if (seq_len > 1) "causal" else "";
-        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, kv_view.k, kv_view.v, attn_scale, mask_mode, none_mask, .{ .ctx = null }, s));
-    }
+/// Post-sdpa half of the MTP layer: output gate, o_proj, residual,
+/// post_attn_norm, MLP, residual, final_norm. Offset-free — the body the
+/// compiled back closure traces AND the uncompiled fallback. Returns the
+/// post-final-norm hidden (owned).
+fn backChain(self: *const MtpModel, target: *Transformer, attn_out: mlx.mlx_array, gate: mlx.mlx_array, x: mlx.mlx_array, seq_len: c_int) !mlx.mlx_array {
+    const s = self.s;
+    const cfg = &target.config;
+    const h_count: c_int = @intCast(cfg.num_attention_heads);
+    const hd: c_int = @intCast(cfg.head_dim);
+    const eps = cfg.rms_norm_eps;
+    const flat_shape = [_]c_int{ 1, seq_len, h_count * hd };
+    const perm = [_]c_int{ 0, 2, 1, 3 };
 
     var attn_t = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(attn_t);
@@ -977,17 +985,106 @@ pub fn forward(
     defer _ = mlx.mlx_array_free(x_out);
     try mlx.check(mlx.mlx_add(&x_out, h1, mlp_out, s));
 
-    _ = hidden_size;
-    const post = try rmsNormFn(x_out, self.final_norm, eps, s);
+    return rmsNormFn(x_out, self.final_norm, eps, s);
+}
+
+pub const StepOut = struct {
+    /// `[1, 1, vocab]` LAST-row logits, or `.ctx == null` when `want_logits`
+    /// was false (multi-row calls never project the history rows — only the
+    /// last row feeds the draft chain).
+    logits: mlx.mlx_array,
+    /// MTP post-norm hidden — the next depth's `hidden` input. `[1, 1, H]`
+    /// (last row) when `want_logits`, the full `[1, L, H]` otherwise.
+    hidden_next: mlx.mlx_array,
+};
+
+/// Core MTP forward over `L` positions.
+///
+/// `id_arr`     — `[L]` int32 token ids (may be a lazy array mid-chain)
+/// `hidden`     — `[1, L, H]` trunk (depth 1) or MTP (depth >1) hidden states
+/// `cache`      — the head's own single-layer KV cache; entries appended here
+/// `rope_offset`— RoPE position of the FIRST of the L tokens (cache-relative)
+///
+/// Appends L entries to `cache`. Multi-token calls use a causal mask
+/// (bottom-right aligned, matching trunk chunked prefill).
+pub fn forward(
+    self: *const MtpModel,
+    target: *Transformer,
+    cache: *KVCache,
+    id_arr: mlx.mlx_array,
+    hidden: mlx.mlx_array,
+    rope_offset: c_int,
+    want_logits: bool,
+) !StepOut {
+    const s = self.s;
+    const cfg = &target.config;
+    const hidden_size: c_int = @intCast(cfg.hidden_size);
+    const h_shape = mlx.getShape(hidden);
+    const seq_len: c_int = h_shape[1];
+    const attn_scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(cfg.query_pre_attn_scalar)));
+    const rope_dims: c_int = @intFromFloat(@as(f32, @floatFromInt(cfg.head_dim)) * cfg.partial_rotary_factor);
+
+    var front = try frontChain(self, target, id_arr, hidden);
+    defer front.deinit();
+
+    var q_rope = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(q_rope);
+    var k_rope = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(k_rope);
+    try mlx.check(mlx.mlx_fast_rope(&q_rope, front.q_t, rope_dims, false, mlx.mlx_optional_float.some(cfg.rope_theta), 1.0, rope_offset, .{ .ctx = null }, s));
+    try mlx.check(mlx.mlx_fast_rope(&k_rope, front.k_t, rope_dims, false, mlx.mlx_optional_float.some(cfg.rope_theta), 1.0, rope_offset, .{ .ctx = null }, s));
+
+    var kv_view = try cache.update(0, k_rope, front.v_t, s, 0);
+    defer kv_view.deinit();
+
+    var attn_out = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(attn_out);
+    const none_mask = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(none_mask);
+    // Multi-token (history rebuild / draft batch): try the fused hd-256
+    // flash kernel first — same dispatch the trunk's prefill uses.
+    var fused_done = false;
+    if (seq_len > 1) {
+        if (try transformer_mod.fusedSdpa256Prefill(s, q_rope, kv_view.k, kv_view.v, attn_scale, 0)) |fused| {
+            _ = mlx.mlx_array_free(attn_out);
+            attn_out = fused;
+            fused_done = true;
+        }
+    }
+    if (!fused_done) {
+        const mask_mode: [*:0]const u8 = if (seq_len > 1) "causal" else "";
+        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, kv_view.k, kv_view.v, attn_scale, mask_mode, none_mask, .{ .ctx = null }, s));
+    }
+
+    const post = try backChain(self, target, attn_out, front.gate, front.x, seq_len);
 
     if (!want_logits) {
         return .{ .logits = .{ .ctx = null }, .hidden_next = post };
     }
-    const logits = targetLmHead(self, target, post, s) catch |err| {
+    // Logits (and the chained hidden) are only ever consumed for the LAST
+    // row — the draft chain's next token / confidence. Multi-row calls (the
+    // merged history+draft forward) slice to the last row BEFORE the vocab
+    // head projection: projecting the history rows through a 248k-vocab head
+    // is pure waste, and a [1,L,H] hidden_next would break the L=1 chain.
+    var post_last = post;
+    if (seq_len > 1) {
+        var sliced = mlx.mlx_array_new();
+        const start = [_]c_int{ 0, seq_len - 1, 0 };
+        const stop = [_]c_int{ 1, seq_len, hidden_size };
+        const strides = [_]c_int{ 1, 1, 1 };
+        mlx.check(mlx.mlx_slice(&sliced, post, &start, 3, &stop, 3, &strides, 3, s)) catch |err| {
+            _ = mlx.mlx_array_free(sliced);
+            _ = mlx.mlx_array_free(post);
+            return err;
+        };
         _ = mlx.mlx_array_free(post);
+        post_last = sliced;
+    }
+    const logits = targetLmHead(self, target, post_last, s) catch |err| {
+        _ = mlx.mlx_array_free(post_last);
         return err;
     };
-    return .{ .logits = logits, .hidden_next = post };
+    return .{ .logits = logits, .hidden_next = post_last };
 }
 
 /// Append committed-history entries: pair `hidden[:, i, :]` with
@@ -1228,4 +1325,198 @@ test "loadMtp: MoE sidecar layout (language_model. prefix, switch_mlp experts)" 
     const fcs = mlx.getShape(m.fc_w_t);
     try testing.expectEqual(@as(c_int, 8), fcs[0]);
     try testing.expectEqual(@as(c_int, 16), fcs[1]);
+}
+
+test "mtp: multi-row forward projects the LAST row only and equals appendHistory + stepArr" {
+    // The deferred-history round shape (Generator.nextMtp) folds the old
+    // appendHistory head forward into the next round's first draft step: ONE
+    // (n+1)-row forward over [committed..., t1] must append the same cache
+    // entries AND produce the same last-row logits/hidden as the two-call
+    // sequence appendHistory([committed], hist_hidden) + stepArr(t1, h_prev).
+    // Logits must be [1, 1, V]: projecting every row through the vocab head
+    // is pure waste, and the caller (draft chain) only consumes the last row.
+    const io = testing.io;
+    const allocator = testing.allocator;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    // ── synthetic DENSE sidecar (random bf16; zeros would make every rms-norm
+    // output zero and the equivalence trivially true) ──
+    var prng = std.Random.DefaultPrng.init(7);
+    const save_map = mlx.mlx_map_string_to_array_new();
+    defer _ = mlx.mlx_map_string_to_array_free(save_map);
+    var owned: std.ArrayList(mlx.mlx_array) = .empty;
+    defer {
+        for (owned.items) |a| _ = mlx.mlx_array_free(a);
+        owned.deinit(allocator);
+    }
+    const putRand = struct {
+        fn f(map: mlx.mlx_map_string_to_array, list: *std.ArrayList(mlx.mlx_array), alloc: std.mem.Allocator, rng: *std.Random.DefaultPrng, key: [*:0]const u8, shape: []const c_int, st: mlx.mlx_stream) !mlx.mlx_array {
+            var n: usize = 1;
+            for (shape) |d| n *= @intCast(d);
+            const buf = try alloc.alloc(f32, n);
+            defer alloc.free(buf);
+            for (buf) |*x| x.* = rng.random().floatNorm(f32) * 0.5;
+            const f32_arr = mlx.mlx_array_new_data(buf.ptr, shape.ptr, @intCast(shape.len), .float32);
+            defer _ = mlx.mlx_array_free(f32_arr);
+            var a = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_astype(&a, f32_arr, .bfloat16, st));
+            try mlx.check(mlx.mlx_array_eval(a));
+            _ = mlx.mlx_map_string_to_array_insert(map, key, a);
+            try list.append(alloc, a);
+            return a;
+        }
+    }.f;
+
+    // hidden 8, head_dim 4, 2 q heads (x2 for the q/gate split), 2 kv heads,
+    // mlp inter 16, vocab 16.
+    // Disk orientation is torch [out, in]: fc maps concat(2H) -> H.
+    _ = try putRand(save_map, &owned, allocator, &prng, "mtp.fc.weight", &.{ 8, 16 }, s);
+    _ = try putRand(save_map, &owned, allocator, &prng, "mtp.pre_fc_norm_embedding.weight", &.{8}, s);
+    _ = try putRand(save_map, &owned, allocator, &prng, "mtp.pre_fc_norm_hidden.weight", &.{8}, s);
+    _ = try putRand(save_map, &owned, allocator, &prng, "mtp.norm.weight", &.{8}, s);
+    _ = try putRand(save_map, &owned, allocator, &prng, "mtp.layers.0.input_layernorm.weight", &.{8}, s);
+    _ = try putRand(save_map, &owned, allocator, &prng, "mtp.layers.0.post_attention_layernorm.weight", &.{8}, s);
+    _ = try putRand(save_map, &owned, allocator, &prng, "mtp.layers.0.self_attn.q_norm.weight", &.{4}, s);
+    _ = try putRand(save_map, &owned, allocator, &prng, "mtp.layers.0.self_attn.k_norm.weight", &.{4}, s);
+    _ = try putRand(save_map, &owned, allocator, &prng, "mtp.layers.0.self_attn.q_proj.weight", &.{ 16, 8 }, s);
+    _ = try putRand(save_map, &owned, allocator, &prng, "mtp.layers.0.self_attn.k_proj.weight", &.{ 8, 8 }, s);
+    _ = try putRand(save_map, &owned, allocator, &prng, "mtp.layers.0.self_attn.v_proj.weight", &.{ 8, 8 }, s);
+    _ = try putRand(save_map, &owned, allocator, &prng, "mtp.layers.0.self_attn.o_proj.weight", &.{ 8, 8 }, s);
+    _ = try putRand(save_map, &owned, allocator, &prng, "mtp.layers.0.mlp.gate_proj.weight", &.{ 16, 8 }, s);
+    _ = try putRand(save_map, &owned, allocator, &prng, "mtp.layers.0.mlp.up_proj.weight", &.{ 16, 8 }, s);
+    _ = try putRand(save_map, &owned, allocator, &prng, "mtp.layers.0.mlp.down_proj.weight", &.{ 8, 16 }, s);
+
+    var dir_buf: [512]u8 = undefined;
+    const dir_n = try tmp.dir.realPath(io, &dir_buf);
+    const dir_abs = dir_buf[0..dir_n];
+    const file_path = try std.fs.path.joinZ(allocator, &.{ dir_abs, "model-mtp.safetensors" });
+    defer allocator.free(file_path);
+    const meta = mlx.mlx_map_string_to_string_new();
+    defer _ = mlx.mlx_map_string_to_string_free(meta);
+    try mlx.check(mlx.mlx_save_safetensors(file_path.ptr, save_map, meta));
+
+    var m = try loadMtp(io, allocator, s, dir_abs);
+    defer m.deinit();
+
+    // ── toy target: only the fields forward() reads (config scalars, dense
+    // bf16 embed table, dense bf16 lm_head) ──
+    var emb_prng = std.Random.DefaultPrng.init(11);
+    const mk2d = struct {
+        fn f(alloc: std.mem.Allocator, rng: *std.Random.DefaultPrng, rows: usize, cols: usize, st: mlx.mlx_stream) !mlx.mlx_array {
+            const buf = try alloc.alloc(f32, rows * cols);
+            defer alloc.free(buf);
+            for (buf) |*x| x.* = rng.random().floatNorm(f32) * 0.5;
+            const shape = [_]c_int{ @intCast(rows), @intCast(cols) };
+            const f32_arr = mlx.mlx_array_new_data(buf.ptr, &shape, 2, .float32);
+            defer _ = mlx.mlx_array_free(f32_arr);
+            var a = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_astype(&a, f32_arr, .bfloat16, st));
+            try mlx.check(mlx.mlx_array_eval(a));
+            return a;
+        }
+    }.f;
+    const emb_w = try mk2d(allocator, &emb_prng, 16, 8, s);
+    defer _ = mlx.mlx_array_free(emb_w);
+    const lm_w = try mk2d(allocator, &emb_prng, 16, 8, s);
+    defer _ = mlx.mlx_array_free(lm_w);
+
+    var xfm: Transformer = undefined;
+    xfm.config = .{};
+    xfm.config.hidden_size = 8;
+    xfm.config.num_attention_heads = 2;
+    xfm.config.num_key_value_heads = 2;
+    xfm.config.head_dim = 4;
+    xfm.config.query_pre_attn_scalar = 4;
+    xfm.config.partial_rotary_factor = 0.5;
+    xfm.config.attn_output_gate = true;
+    xfm.emb_w = emb_w;
+    xfm.emb_s = .{ .ctx = null };
+    xfm.emb_b = .{ .ctx = null };
+    xfm.lm_head_w = lm_w;
+    xfm.lm_head_s = .{ .ctx = null };
+    xfm.lm_head_b = .{ .ctx = null };
+
+    // ── shared inputs: 3 hidden rows, tokens [5, 7] committed + t1 = 9 ──
+    var hid_prng = std.Random.DefaultPrng.init(23);
+    const hid_buf = try allocator.alloc(f32, 3 * 8);
+    defer allocator.free(hid_buf);
+    for (hid_buf) |*x| x.* = hid_prng.random().floatNorm(f32) * 0.5;
+    const hid_shape = [_]c_int{ 1, 3, 8 };
+    const hid_f32 = mlx.mlx_array_new_data(hid_buf.ptr, &hid_shape, 3, .float32);
+    defer _ = mlx.mlx_array_free(hid_f32);
+    var hidden3 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(hidden3);
+    try mlx.check(mlx.mlx_astype(&hidden3, hid_f32, .bfloat16, s));
+
+    const strides = [_]c_int{ 1, 1, 1 };
+    var hid01 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(hid01);
+    try mlx.check(mlx.mlx_slice(&hid01, hidden3, &[_]c_int{ 0, 0, 0 }, 3, &[_]c_int{ 1, 2, 8 }, 3, &strides, 3, s));
+    var hid2 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(hid2);
+    try mlx.check(mlx.mlx_slice(&hid2, hidden3, &[_]c_int{ 0, 2, 0 }, 3, &[_]c_int{ 1, 3, 8 }, 3, &strides, 3, s));
+
+    // ── reference: appendHistory([5,7]) then stepArr(9) ──
+    var cache_a = try m.makeCache(allocator);
+    defer cache_a.deinit();
+    try appendHistory(&m, &xfm, &cache_a, &[_]u32{ 5, 7 }, hid01, 0);
+    const t9 = [_]i32{9};
+    const t9_shape = [_]c_int{1};
+    const t9_arr = mlx.mlx_array_new_data(&t9, &t9_shape, 1, .int32);
+    defer _ = mlx.mlx_array_free(t9_arr);
+    const ref = try stepArr(&m, &xfm, &cache_a, t9_arr, hid2, 2);
+    defer {
+        _ = mlx.mlx_array_free(ref.logits);
+        _ = mlx.mlx_array_free(ref.hidden_next);
+    }
+
+    // ── merged: one 3-row forward over [5, 7, 9] ──
+    var cache_b = try m.makeCache(allocator);
+    defer cache_b.deinit();
+    const ids3 = [_]i32{ 5, 7, 9 };
+    const ids3_shape = [_]c_int{3};
+    const ids3_arr = mlx.mlx_array_new_data(&ids3, &ids3_shape, 1, .int32);
+    defer _ = mlx.mlx_array_free(ids3_arr);
+    const merged = try forward(&m, &xfm, &cache_b, ids3_arr, hidden3, 0, true);
+    defer {
+        _ = mlx.mlx_array_free(merged.logits);
+        _ = mlx.mlx_array_free(merged.hidden_next);
+    }
+
+    // Same cache length; logits/hidden are LAST-row-only.
+    try testing.expectEqual(cache_a.step, cache_b.step);
+    const ml_shape = mlx.getShape(merged.logits);
+    try testing.expectEqual(@as(c_int, 1), ml_shape[1]);
+    try testing.expectEqual(@as(c_int, 16), ml_shape[2]);
+    const mh_shape = mlx.getShape(merged.hidden_next);
+    try testing.expectEqual(@as(c_int, 1), mh_shape[1]);
+
+    // Value equivalence vs the two-call reference (bf16 reduction-order
+    // tolerance at toy scale).
+    const close = struct {
+        fn f(a: mlx.mlx_array, b: mlx.mlx_array, n: usize, st: mlx.mlx_stream) !void {
+            var af = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(af);
+            var bf = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(bf);
+            try mlx.check(mlx.mlx_astype(&af, a, .float32, st));
+            try mlx.check(mlx.mlx_astype(&bf, b, .float32, st));
+            try mlx.check(mlx.mlx_array_eval(af));
+            try mlx.check(mlx.mlx_array_eval(bf));
+            const ad = mlx.mlx_array_data_float32(af).?;
+            const bd = mlx.mlx_array_data_float32(bf).?;
+            for (0..n) |i| {
+                const denom = @max(1.0, @max(@abs(ad[i]), @abs(bd[i])));
+                if (@abs(ad[i] - bd[i]) / denom > 0.05) {
+                    std.debug.print("mismatch at {d}: {d} vs {d}\n", .{ i, ad[i], bd[i] });
+                    return error.TestExpectedApproxEq;
+                }
+            }
+        }
+    }.f;
+    try close(merged.logits, ref.logits, 16, s);
+    try close(merged.hidden_next, ref.hidden_next, 8, s);
+
 }

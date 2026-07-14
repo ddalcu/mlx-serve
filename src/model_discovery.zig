@@ -156,8 +156,10 @@ fn scanLlmGguf(io: std.Io, allocator: std.mem.Allocator, dir: *std.Io.Dir) !Gguf
     var it = dir.iterate();
     while (it.next(io) catch null) |entry| {
         if (!std.mem.endsWith(u8, entry.name, ".gguf")) continue;
-        if (isMmprojGgufBasename(entry.name)) {
-            scan.saw_mmproj = true;
+        // Sidecars are never candidates. `saw_mmproj` stays mmproj-specific —
+        // it only drives the "this folder holds ONLY a CLIP encoder" error text.
+        if (isGgufSidecarBasename(entry.name)) {
+            if (isMmprojGgufBasename(entry.name)) scan.saw_mmproj = true;
             continue;
         }
         const st = dir.statFile(io, entry.name, .{}) catch continue;
@@ -192,7 +194,7 @@ pub fn isGgufModelPath(io: std.Io, path: []const u8) bool {
     var it = dir.iterate();
     while (it.next(io) catch null) |entry| {
         if (!std.mem.endsWith(u8, entry.name, ".gguf")) continue;
-        if (isMmprojGgufBasename(entry.name)) continue;
+        if (isGgufSidecarBasename(entry.name)) continue;
         const st = dir.statFile(io, entry.name, .{}) catch continue;
         if (st.kind == .file) return true;
     }
@@ -411,6 +413,36 @@ pub fn isMmprojGgufBasename(basename: []const u8) bool {
         if (std.ascii.toLower(c) != p) return false;
     }
     return true;
+}
+
+/// True if `basename` is a non-LLM `.gguf` COMPANION file rather than a
+/// language-model quant. Two kinds ship today:
+///
+///   - `mmproj-*.gguf`  — multimodal-projection / CLIP encoder (see above).
+///   - `*tokenizer*.gguf` — audio/speech tokenizer shipped beside a TTS model
+///     (real: `qwen3-tts-tokenizer-f16.gguf` next to `qwen3-tts-0.6b-f16.gguf`).
+///
+/// `scanLlmGguf` picks the alphabetically-smallest candidate, so a folder whose
+/// tokenizer happens to sort first would otherwise be loaded AS the LLM. Mirrors
+/// the Swift `DownloadManager.isGgufSidecar` — the macOS app lists every quant
+/// in a folder as a separately selectable model, so the two must agree on which
+/// files are models or the app offers one the server can't load.
+pub fn isGgufSidecarBasename(basename: []const u8) bool {
+    if (!std.mem.endsWith(u8, basename, ".gguf")) return false;
+    if (isMmprojGgufBasename(basename)) return true;
+    return asciiContainsIgnoreCase(basename, "tokenizer");
+}
+
+fn asciiContainsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
+    if (needle.len == 0 or haystack.len < needle.len) return false;
+    var i: usize = 0;
+    outer: while (i + needle.len <= haystack.len) : (i += 1) {
+        for (haystack[i..][0..needle.len], needle) |c, n| {
+            if (std.ascii.toLower(c) != n) continue :outer;
+        }
+        return true;
+    }
+    return false;
 }
 
 /// Scan `model_dir` for subdirectories containing `config.json`.
@@ -1013,6 +1045,23 @@ test "isMmprojGgufBasename catches the multimodal-projection sidecars" {
     try testing.expect(!isMmprojGgufBasename("mmproj"));
     // Suffix-only — model-mmproj.gguf is NOT the convention.
     try testing.expect(!isMmprojGgufBasename("model-mmproj.gguf"));
+}
+
+test "isGgufSidecarBasename also rejects the tokenizer sidecars" {
+    // A GGUF folder ships non-LLM `.gguf` companions beside the quants. mmproj
+    // (CLIP) was the known one; a SPEECH TOKENIZER is the other — live, on a
+    // real Mac: `qwen3-tts-tokenizer-f16.gguf` (341 MB) sits next to
+    // `qwen3-tts-0.6b-f16.gguf`. Neither is a language model, and the
+    // alphabetical directory pick only avoids the tokenizer by luck of the
+    // name — a repo whose tokenizer sorts first would load it as the LLM.
+    try testing.expect(isGgufSidecarBasename("mmproj-gemma-4-E4B-it-BF16.gguf"));
+    try testing.expect(isGgufSidecarBasename("qwen3-tts-tokenizer-f16.gguf"));
+    try testing.expect(isGgufSidecarBasename("TOKENIZER-f16.gguf"));
+
+    try testing.expect(!isGgufSidecarBasename("gemma-4-E4B-it-Q4_K_M.gguf"));
+    try testing.expect(!isGgufSidecarBasename("Qwen3.5-4B-IQ4_NL.gguf"));
+    try testing.expect(!isGgufSidecarBasename("qwen3-tts-0.6b-f16.gguf"));
+    try testing.expect(!isGgufSidecarBasename("tokenizer.json"));
 }
 
 test "isSupportedModelType accepts qwen3_moe (Qwen3-30B-A3B)" {

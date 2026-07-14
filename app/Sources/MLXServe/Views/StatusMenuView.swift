@@ -654,8 +654,11 @@ struct StatusMenuView: View {
     /// they switch (auto-sync swaps `drafterPath` to the matching one on
     /// model change). When drafter is off, no badges anywhere.
     private func modelPickerLabel(_ model: LocalModel, dupNames: Set<String>) -> String {
-        var label = model.name
-        if dupNames.contains(model.name) {
+        // `displayLabel`, not `name`: a GGUF repo ships several quants and each
+        // is its own row here, so the row has to say WHICH quant it loads
+        // ("unsloth/Qwen3.5-4B-GGUF · Q4_K_M") — sibling quants share a name.
+        var label = model.displayLabel
+        if dupNames.contains(label) {
             label += " · \(model.engine.shortLabel)"
         }
         guard !appState.serverOptions.drafterPath.isEmpty,
@@ -1020,6 +1023,10 @@ struct EndpointsSection: View {
 }
 
 /// Show folder picker and launch Claude Code in the selected directory.
+/// `@MainActor` because a modal panel can only run on the main thread — it was
+/// already relying on that implicitly; presenting it through `AppActivation`
+/// (which touches `NSApp`) just makes the requirement explicit.
+@MainActor
 func launchClaudeCodeWithPicker(baseURL: String, serverContextLength: Int? = nil) {
     let panel = NSOpenPanel()
     panel.canChooseDirectories = true
@@ -1031,7 +1038,7 @@ func launchClaudeCodeWithPicker(baseURL: String, serverContextLength: Int? = nil
     let defaultWS = NSString(string: "~/.mlx-serve/workspace").expandingTildeInPath
     try? FileManager.default.createDirectory(atPath: defaultWS, withIntermediateDirectories: true)
     panel.directoryURL = URL(fileURLWithPath: defaultWS)
-    guard panel.runModal() == .OK, let url = panel.url else { return }
+    guard AppActivation.runModal(panel) == .OK, let url = panel.url else { return }
     launchClaudeCode(baseURL: baseURL, workingDirectory: url.path,
                      serverContextLength: serverContextLength)
 }
@@ -1212,7 +1219,7 @@ struct ServerLogWindowView: View {
         let stamp = ISO8601DateFormatter().string(from: Date())
             .replacingOccurrences(of: ":", with: "-")
         panel.nameFieldStringValue = "mlx-serve-\(stamp).log"
-        guard panel.runModal() == .OK, let url = panel.url else { return }
+        guard AppActivation.runModal(panel) == .OK, let url = panel.url else { return }
         try? server.currentServerLogSnapshot()
             .write(to: url, atomically: true, encoding: .utf8)
     }

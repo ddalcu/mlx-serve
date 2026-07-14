@@ -74,28 +74,12 @@ struct MLXCoreApp: App {
         return tinted
     }()
 
+    /// Opening a window used to be `openWindow(id:)` → `activate()` while the
+    /// app was still `.accessory` — the inverted order that left the window
+    /// semi-focused until the user clicked or typed. `AppActivation` flips to
+    /// `.regular` first; see the ordering rule in that file.
     private func openAndFocus(_ id: String) {
-        openWindow(id: id)
-        NSApplication.shared.activate(ignoringOtherApps: true)
-        // Bring the specific window to front
-        DispatchQueue.main.async {
-            let title: String
-            switch id {
-            case "chat": title = "MLX Core"
-            case "modelBrowser": title = "Model Browser"
-            case "imageGen": title = "Image Generation"
-            case "videoGen": title = "Video Generation"
-            case "audioGen": title = "Audio Generation"
-            case "model3dGen": title = "3D Generation"
-            case "settings": title = "Settings"
-            case "serverLog": title = "Server Log"
-            case "tasks": title = "Tasks"
-            default: title = "Browser"
-            }
-            NSApplication.shared.windows
-                .first { $0.title == title }?
-                .makeKeyAndOrderFront(nil)
-        }
+        AppActivation.openWindow(id: id, using: openWindow)
     }
 
     var body: some Scene {
@@ -220,9 +204,12 @@ struct MLXCoreApp: App {
                 .environmentObject(appState)
                 .environmentObject(appState.server)
                 .environmentObject(appState.downloads)
-                .frame(minWidth: 720, minHeight: 560)
+                // Wider since the category sidebar landed: it takes ~200pt, and
+                // the form's rows (label + explainer + control) were already
+                // tight at the old 720 minimum.
+                .frame(minWidth: 900, minHeight: 560)
         }
-        .defaultSize(width: 820, height: 700)
+        .defaultSize(width: 1020, height: 700)
 
         // Dedicated terminal-style window for the server's live stderr.
         // The inline log on the tray popover is still there for a glance;

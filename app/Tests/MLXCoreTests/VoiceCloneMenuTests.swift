@@ -103,4 +103,41 @@ final class VoiceCloneOptionsCodingTests: XCTestCase {
         XCTAssertFalse(back.voiceCloneEnabled)
         XCTAssertEqual(back.voiceCloneLabel, "morgan.mp3")
     }
+
+    // MARK: - The tray can't be widened by a filename
+
+    /// The clip label is a FILENAME the user picked, so it can be arbitrarily
+    /// long — and the tray panel is a fixed narrow column. A 200-character name
+    /// stretched it sideways and dragged the rest of the tray's layout with it.
+    /// Every place the tray renders the name goes through these two helpers, so
+    /// clamping here fixes it everywhere.
+    func testAnAbsurdlyLongClipNameIsClampedForTheTray() {
+        let monster = String(repeating: "a", count: 200) + ".wav"
+
+        let collapsed = VoiceCloneMenuModel.collapsedLabel(
+            clipPath: "/tmp/clip.wav", cloneEnabled: true, ttsModelDownloaded: true,
+            cloneLabel: monster, systemVoiceName: "Jamie")
+        XCTAssertLessThanOrEqual(collapsed.count, VoiceCloneMenuModel.maxClipLabelLength + 1,
+                                 "the collapsed picker must not grow with the filename")
+        XCTAssertTrue(collapsed.hasSuffix("…"), "say the name was cut, don't just chop it")
+
+        let item = VoiceCloneMenuModel.cloneItemTitle(label: monster)
+        XCTAssertLessThanOrEqual(item.count, "My voice — ".count + VoiceCloneMenuModel.maxClipLabelLength + 1)
+    }
+
+    /// A name that already fits is left exactly as it is — no stray ellipsis.
+    func testAShortClipNameIsUntouched() {
+        XCTAssertEqual(VoiceCloneMenuModel.clipDisplayName("morgan.mp3"), "morgan.mp3")
+        XCTAssertEqual(VoiceCloneMenuModel.cloneItemTitle(label: "morgan.mp3"), "My voice — morgan.mp3")
+    }
+
+    /// Truncation is display-only: the STORED label keeps its full value, so the
+    /// Settings pane (which has room) and any future rename still see the real
+    /// filename.
+    func testTruncationIsDisplayOnly() {
+        let monster = String(repeating: "b", count: 100) + ".wav"
+        var o = ServerOptions()
+        o.voiceCloneLabel = monster
+        XCTAssertEqual(o.voiceCloneLabel, monster, "the model keeps the full name; only the tray clamps it")
+    }
 }

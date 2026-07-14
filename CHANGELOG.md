@@ -1,5 +1,17 @@
 # Changelog
 
+## v26.7.7 — The fastest MTP runtime on Apple Silicon
+
+- **New verify-tuned Metal kernels make speculative decoding decisively faster.** Quantized matmuls in the 2–7-row shapes that speculative verification actually uses, now run through custom split-K kernels held near the memory-bandwidth floor. On Qwen3.6-27B the verify round dropped from 76 ms to 54 ms at depth 3 and from 119 ms to 90 ms at depth 6 — and the same kernels accelerate PLD and drafter verification on every 4-bit model, Gemma included, with byte-identical output pinned by tests.
+- **Head-to-head vs the reference MTP runtime on its own published checkpoint: faster warm AND 2× faster cold.** Same machine, same prompts, same weights, back-to-back runs: warm decode 75–79 tok/s vs 69–74, and first-request decode 70 vs 35 tok/s. Every claim measured in paired same-session runs.
+- **Dynamic draft depth on Qwen MTP models.** The speculative controller plans every round from live per-position acceptance estimates — drafting deeper on easy stretches and pulling back instantly on hard ones — and now remembers what it learned across requests, so a warm server hits full speed from the first tokens of a new request instead of re-calibrating each time. Creative writing still falls back to plain decoding cleanly when drafting stops paying.
+- **Agent chats no longer lose their MTP speedup.** An old routing rule sent repetitive-looking prompts (agent histories, tool results) to prompt-lookahead drafting instead of the MTP head; when lookahead acceptance then collapsed mid-request, decoding fell all the way back to plain speed — measured live at 28 tok/s on a session the MTP head decodes at 55–75. The rule is retired: the MTP head now runs whenever it's loaded.
+- **New settings panel.** Rewrote the settings pannel to be more UX friendly, now has a sidebar to filter down options.
+- **Fix server crash** If you sent some un-expected payloads on some endpoints it would crash the server.
+- **Support for multiple different GGUF quant** Fixes issue #76, once you downloaded a GGUF quant you were stuck with that, now you can download & select others also.
+- **Swift window focus issue** Sometimes the windows would not properly focus on click, and put them in a weird state, now fixed.
+---
+
 ## v26.7.6 — Long contexts that actually fit, and fly
 
 - **Gemma long-context prefill more than doubled.** A custom flash-attention Metal kernel now handles Gemma's sliding-window attention during prefill, skipping everything outside each layer's attention window instead of computing and masking it — and a second round of kernel tuning (wider tiles, half the memory traffic per query row) added another ~10% on top. Measured on gemma-4-26B-A4B with a ~100K-token prompt: 299 → 715 tok/s prefill (2.4×) at identical peak memory and byte-identical output; Gemma E4B prefill up 4% too.
@@ -12,7 +24,7 @@
 - **MLX Core app improvements.** Customizable voice wake word (make it "Hey Jarvis"), the Claude Code / pi / opencode launchers no longer overwrite your existing CLI settings, the agent gained built-in file-search, archive, and system-info tools instead of shelling out for them, and assorted chat, model-browser, and HuggingFace-search UI fixes.
 - **Re-benchmarked against current LM Studio: +48% geomean on identical MLX weights.** The comparison matrix was re-run against LM Studio 0.4.15 across six models (Gemma 4 E2B/E4B/31B/26B-A4B, Qwen 3.6 27B/35B-A3B) — up from +35% at the last measurement, driven by speculative decoding, faster prefill, and the new native-MTP cells. README charts and tables refreshed, including a new MTP context-ladder chart.
 - **Long prompts no longer OOM-crash the server, and the memory check tells the truth.** On every Gemma-4 and Qwen 3.5/3.6 model, a long prompt could kill the whole server with a Metal out-of-memory abort (a 255K prompt died around 100K) because prefill scratch memory silently grew with prompt length. Prefill now bounds that scratch automatically — a 102K-token prompt's peak dropped from 51.6 GB to 27.0 GB while getting 14% *faster* — and the admission check now accounts for KV-cache quantization (including the per-request `kv_quant` override), so quantized long-context requests that comfortably fit are no longer spuriously rejected with a "requires ~100 GB" error.
-- 
+
 ---
 
 ## v26.7.5 — Tool calls that don't fight your agent

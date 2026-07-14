@@ -20,28 +20,66 @@ struct SettingsView: View {
     /// survived. The matching rule is pure and tested — `SettingsSearch`.
     @State private var searchQuery = ""
 
+    /// Sidebar selection. `.all` (the default) renders the whole form — exactly
+    /// what this screen was before the sidebar existed; a category renders just
+    /// that section. Never coexists with search text: see `SettingsSelection`.
+    @State private var selection: SettingsSelection = .all
+
     /// Rows still visible under the current filter, summed up the tree from
     /// `SettingsVisibleRowCountKey`. Drives the "no matches" placeholder.
     @State private var visibleRows = 0
 
     private var filtering: Bool { !SettingsSearch.tokens(searchQuery).isEmpty }
 
+    /// Categories the form actually renders for the active engine — the sidebar
+    /// must never offer a section that isn't there.
+    private var categories: [SettingsCategory] {
+        SettingsCategory.visible(engine: server.modelInfo?.engine,
+                                 selfUpdate: BuildFeatures.current.selfUpdate)
+    }
+
     var body: some View {
+        NavigationSplitView {
+            SettingsSidebar(categories: categories, selection: $selection) {
+                // Picking a category clears the search: the two are alternative
+                // ways to narrow, and letting them stack strands the user on an
+                // empty pane with a stale query they can't see.
+                searchQuery = ""
+            }
+        } detail: {
+            form
+        }
+        .navigationTitle("Settings")
+        // An engine switch can retire the selected category (load a GGUF model
+        // while "MLX Performance" is selected) — fall back to All rather than
+        // leave a blank pane.
+        .onChange(of: categories) { _, visible in
+            selection = SettingsSelection.reconciled(selection, visible: visible)
+        }
+    }
+
+    private var form: some View {
         VStack(spacing: 0) {
             if server.needsRestartFor(appState.serverOptions) {
                 RestartBanner()
             }
             SettingsSearchField(text: $searchQuery)
+                // Typing searches across EVERYTHING, so it snaps the sidebar
+                // back to All — a search that silently only looked inside the
+                // selected category would hide its own best answers.
+                .onChange(of: searchQuery) { _, q in
+                    selection = SettingsSelection.afterQueryEdit(query: q, current: selection)
+                }
             ScrollView {
                 VStack(alignment: .leading, spacing: 0) {
                     SettingsSection(
-                        title: "Model Folders",
+                        category: .modelFolders,
                         subtitle: "Always scans ~/.mlx-serve/models and ~/.lmstudio/models. Add one more folder here if your models live elsewhere — no restart needed."
                     ) {
                         ModelFoldersSectionContent()
                     }
                     SettingsSection(
-                        title: "Server",
+                        category: .server,
                         subtitle: "Server-launch flags. Restart the server to apply changes."
                     ) {
                         ServerSectionContent()
@@ -52,14 +90,14 @@ struct SettingsView: View {
                     // rather not show that picker at all than mislead.
                     EngineAwareSections()
                     SettingsSection(
-                        title: "Per-Request Defaults",
+                        category: .requestDefaults,
                         subtitle: "Apply on the next chat request — no restart needed."
                     ) {
                         RequestDefaultsSectionContent()
                     }
 
                     SettingsSection(
-                        title: "Voice",
+                        category: .voice,
                         subtitle: "Clone your voice once — hands-free voice mode answers in it via the local TTS model. No clip set: answers use the macOS system voice. Applies to the next spoken sentence — no restart needed."
                     ) {
                         WakePhraseSectionContent()
@@ -67,7 +105,7 @@ struct SettingsView: View {
                     }
 
                     SettingsSection(
-                        title: "Agent Sandbox",
+                        category: .sandbox,
                         subtitle: BuildFeatures.current.hostShell
                             ? "Run the agent's shell commands inside an isolated Linux sandbox instead of directly on this Mac. Off by default; applies to the next command — no restart needed."
                             : "Agent shell commands always run inside an isolated Linux sandbox in this build — they never touch macOS directly. The guest OS ships inside the app."
@@ -76,7 +114,7 @@ struct SettingsView: View {
                     }
 
                     SettingsSection(
-                        title: "Messaging — Telegram bot",
+                        category: .messaging,
                         subtitle: "Message your local model from your phone via a Telegram bot. No public URL or port-forwarding needed — the app long-polls Telegram over your normal internet connection, so it works behind home Wi-Fi."
                     ) {
                         MessagingSectionContent(bridge: appState.telegramBridge)
@@ -84,9 +122,11 @@ struct SettingsView: View {
 
                     // The Mac App Store updates the app itself; a pane offering a
                     // DMG self-update would be dead UI there (and an App Review flag).
+                    // `SettingsCategory.visible(selfUpdate:)` mirrors this so the
+                    // sidebar never lists a section that isn't built.
                     if BuildFeatures.current.selfUpdate {
                         SettingsSection(
-                            title: "Updates",
+                            category: .updates,
                             subtitle: "New versions ship on the project's GitHub releases page. Installing downloads the notarized app, swaps it in place, and relaunches — chats, models, and settings are untouched."
                         ) {
                             UpdatesSectionContent(updates: appState.updates)
@@ -100,13 +140,46 @@ struct SettingsView: View {
                     ResetDefaultsFooter()
                 }
                 .environment(\.settingsSearchQuery, searchQuery)
+                .environment(\.settingsSelection, selection)
                 .onPreferenceChange(SettingsVisibleRowCountKey.self) { visibleRows = $0 }
                 .padding(.horizontal, 24)
                 .padding(.vertical, 20)
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
         }
-        .navigationTitle("Settings")
+    }
+}
+
+// MARK: - Sidebar
+
+/// Category filter for the form: "All Settings" plus one row per section that
+/// the active engine actually renders. Icons are SF Symbols — free with the OS,
+/// no assets.
+private struct SettingsSidebar: View {
+    let categories: [SettingsCategory]
+    @Binding var selection: SettingsSelection
+    /// Run when the user picks a row — clears the search field (a category and a
+    /// query never coexist).
+    let onPick: () -> Void
+
+    var body: some View {
+        List(selection: Binding(
+            get: { selection },
+            set: { newValue in
+                selection = newValue
+                onPick()
+            }
+        )) {
+            Label("All Settings", systemImage: "square.grid.2x2")
+                .tag(SettingsSelection.all)
+            Section {
+                ForEach(categories) { category in
+                    Label(category.sidebarLabel, systemImage: category.icon)
+                        .tag(SettingsSelection.category(category))
+                }
+            }
+        }
+        .navigationSplitViewColumnWidth(min: 180, ideal: 200, max: 260)
     }
 }
 
@@ -124,6 +197,19 @@ extension EnvironmentValues {
     fileprivate var settingsSearchQuery: String {
         get { self[SettingsSearchQueryKey.self] }
         set { self[SettingsSearchQueryKey.self] = newValue }
+    }
+}
+
+/// The sidebar's category filter, pushed down so each `SettingsSection` — and
+/// `EngineAwareSections`, which builds its own — can decide whether it renders.
+private struct SettingsSelectionKey: EnvironmentKey {
+    static let defaultValue: SettingsSelection = .all
+}
+
+extension EnvironmentValues {
+    fileprivate var settingsSelection: SettingsSelection {
+        get { self[SettingsSelectionKey.self] }
+        set { self[SettingsSelectionKey.self] = newValue }
     }
 }
 
@@ -209,42 +295,57 @@ private struct NoSearchResults: View {
 
 // MARK: - Reset to Defaults footer
 
-/// Single button that restores the Settings screen to the values in
-/// `ServerOptions()`, keeping the Telegram bot token (see
-/// `ServerOptions.resetToDefaults(preserving:)` for why). Confirms before
-/// discarding the user's tuning because some fields (drafter path, custom
-/// temperature, etc.) take meaningful effort to set up.
+/// Restores the fields of whatever the sidebar has selected — that one section,
+/// or (under "All Settings") the whole screen, keeping the Telegram bot token.
+///
+/// The scope FOLLOWS the sidebar, and the confirmation says which scope it is
+/// before anything is wiped. It has to: a button labelled "Reset to Defaults"
+/// sitting at the bottom of the Voice pane reads as "reset Voice", so it had
+/// better not be quietly wiping the server flags too. Sections with nothing of
+/// their own to reset (Model Folders, Updates) show no button rather than a
+/// button that does nothing — see `SettingsReset`.
 private struct ResetDefaultsFooter: View {
     @EnvironmentObject var appState: AppState
+    @Environment(\.settingsSelection) private var selection
     @State private var showConfirm = false
 
-    private static let helpText = "Restores every Server / Speculative Decoding / Performance / Per-Request field to its built-in default. Your Telegram bot token is kept. Server-launch fields still need a restart to take effect."
+    private var label: String { SettingsReset.buttonLabel(selection) }
+
+    private var helpText: String { SettingsReset.confirmMessage(selection) }
+
+    /// Nothing to reset in this section → no button.
+    private var hidden: Bool {
+        if case .category(let c) = selection { return !SettingsReset.isResettable(c) }
+        return false
+    }
 
     var body: some View {
-        SearchableRow(searchText: ["Reset to Defaults", Self.helpText]) {
-            HStack {
-                Spacer()
-                Button(role: .destructive) {
-                    showConfirm = true
-                } label: {
-                    Label("Reset to Defaults", systemImage: "arrow.uturn.backward.circle")
+        if !hidden {
+            SearchableRow(searchText: [label, helpText]) {
+                HStack {
+                    Spacer()
+                    Button(role: .destructive) {
+                        showConfirm = true
+                    } label: {
+                        Label(label, systemImage: "arrow.uturn.backward.circle")
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .help(helpText)
                 }
-                .buttonStyle(.bordered)
-                .controlSize(.small)
-                .help(Self.helpText)
-            }
-            .padding(.top, 4)
-            .confirmationDialog(
-                "Reset all settings to defaults?",
-                isPresented: $showConfirm,
-                titleVisibility: .visible
-            ) {
-                Button("Reset", role: .destructive) {
-                    appState.serverOptions = ServerOptions.resetToDefaults(preserving: appState.serverOptions)
+                .padding(.top, 4)
+                .confirmationDialog(
+                    SettingsReset.confirmTitle(selection),
+                    isPresented: $showConfirm,
+                    titleVisibility: .visible
+                ) {
+                    Button("Reset", role: .destructive) {
+                        appState.serverOptions = SettingsReset.apply(selection, to: appState.serverOptions)
+                    }
+                    Button("Cancel", role: .cancel) { }
+                } message: {
+                    Text(helpText)
                 }
-                Button("Cancel", role: .cancel) { }
-            } message: {
-                Text("This restores every field on this screen — server flags, speculative decoding, performance (continuous batching / KV-quant / prefix cache), and per-request defaults — to the values that ship with the app. Your Telegram bot token is kept, since only @BotFather can reissue it. The change is local; the running server keeps its current flags until you hit Restart Now.")
             }
         }
     }
@@ -330,21 +431,17 @@ private struct RestartBanner: View {
 private struct EngineAwareSections: View {
     @EnvironmentObject var server: ServerManager
     @Environment(\.settingsSearchQuery) private var query
+    @Environment(\.settingsSelection) private var selection
 
     /// Resolved engine for routing UI decisions. Nil when no model has
     /// loaded yet (server stopped or first start in progress) — that
     /// case shows all sections so users can pre-tune.
+    ///
+    /// `SettingsCategory.visible(engine:)` applies the SAME rule to the sidebar,
+    /// so the list and the form can't disagree about what exists.
     private var engine: ServerEngine? { server.modelInfo?.engine }
 
     var body: some View {
-        // Always-shown universal performance knob (applies to every engine).
-        SettingsSection(
-            title: "Performance (all engines)",
-            subtitle: "Tunables that apply regardless of engine. Server-launch flag — restart to apply."
-        ) {
-            CommonPerformanceSectionContent()
-        }
-
         // Engine-specific sections. Show all when no model is loaded so
         // the user can pre-tune; otherwise show only the matching set.
         let showMLX = (engine == nil || engine == .mlx)
@@ -353,22 +450,32 @@ private struct EngineAwareSections: View {
 
         if showMLX {
             SettingsSection(
-                title: "Speculative Decoding (MLX only)",
-                subtitle: "Big throughput wins on echo-heavy work; gates auto-disable on novel content. PLD + drafter are MLX-only kernels — they no-op on GGUF / DSV4."
+                category: .specDecode,
+                subtitle: "Big throughput wins on echo-heavy work; gates auto-disable on novel content. PLD, the drafter, and MTP are MLX-only — they no-op on GGUF / DSV4."
             ) {
                 SpecDecodeSectionContent()
             }
-            SettingsSection(
-                title: "MLX Performance",
-                subtitle: "Continuous batching, KV-cache quantization, and the cross-request hot prefix cache. MLX-only — distinct kernels from llama.cpp."
-            ) {
+        }
+
+        // ONE Performance section. The universal rows always apply; the MLX-only
+        // ones (continuous batching, KV-quant, hot prefix cache) join them when
+        // an MLX model is serving — on GGUF/DSV4 they'd silently no-op, so they
+        // stay hidden rather than lie.
+        SettingsSection(
+            category: .performance,
+            subtitle: showMLX
+                ? "Continuous batching, KV-cache quantization, and the cross-request hot prefix cache. Server-launch flags — restart to apply."
+                : "Tunables that apply regardless of engine. Server-launch flags — restart to apply."
+        ) {
+            CommonPerformanceSectionContent()
+            if showMLX {
                 PerformanceSectionContent()
             }
         }
 
         if showLlama {
             SettingsSection(
-                title: "GGUF Performance (llama.cpp)",
+                category: .ggufPerformance,
                 subtitle: "Knobs that apply when an embedded llama.cpp engine is serving a `.gguf` model. Distinct from the MLX Performance section — different kernels, different KV layout."
             ) {
                 LlamaPerformanceSectionContent()
@@ -377,14 +484,16 @@ private struct EngineAwareSections: View {
 
         if showDs4 {
             SettingsSection(
-                title: "DeepSeek-V4 (ds4 engine)",
+                category: .ds4,
                 subtitle: "Knobs for the embedded ds4 engine serving DeepSeek-V4-Flash. Ignored by the MLX and llama.cpp engines."
             ) {
                 Ds4PerformanceSectionContent()
             }
         }
 
-        if engine == nil && SettingsSearch.tokens(query).isEmpty {
+        // The pre-tune banner explains why EVERY engine section is on screen —
+        // meaningless once the sidebar has narrowed to one of them.
+        if engine == nil, selection == .all, SettingsSearch.tokens(query).isEmpty {
             HStack(spacing: 8) {
                 Image(systemName: "info.circle")
                     .foregroundStyle(.secondary)
@@ -402,12 +511,18 @@ private struct EngineAwareSections: View {
 // MARK: - Section frame
 
 private struct SettingsSection<Content: View>: View {
-    let title: String
+    /// Identity. The sidebar row and this header both read their text from it,
+    /// so a section can never exist without a way to reach it (and its two
+    /// labels can't drift). Pinned by `testEverySettingsSectionDeclaresACategory`.
+    let category: SettingsCategory
     let subtitle: String
     @ViewBuilder var content: Content
 
     @Environment(\.settingsSearchQuery) private var query
+    @Environment(\.settingsSelection) private var selection
     @State private var visibleRows = 0
+
+    private var title: String { category.title }
 
     /// Both filter decisions (what query the rows see, whether to hide the
     /// chrome) live in the pure, tested `SettingsSearch.SectionFilter`.
@@ -415,7 +530,20 @@ private struct SettingsSection<Content: View>: View {
         SettingsSearch.section(query: query, title: title)
     }
 
+    @ViewBuilder
     var body: some View {
+        // Sidebar filter. Unlike the search filter below — which must keep a
+        // collapsed section's rows in the tree so they can publish their count
+        // and bring the section back — this one drops the subtree outright. It
+        // can: a category is only ever selected while the search field is EMPTY
+        // (SettingsSelection's invariant), so no row count depends on it.
+        if selection.shows(category) {
+            sectionBody
+        }
+    }
+
+    @ViewBuilder
+    private var sectionBody: some View {
         // `content` keeps rendering even when collapsed (as a stack of empty
         // rows), because it is the only thing that publishes
         // `SettingsVisibleRowCountKey`. Dropping it from the tree would pin
@@ -561,7 +689,7 @@ private struct ModelFoldersSectionContent: View {
            !existing.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             panel.directoryURL = URL(fileURLWithPath: (existing as NSString).expandingTildeInPath)
         }
-        if panel.runModal() == .OK, let url = panel.url {
+        if AppActivation.runModal(panel) == .OK, let url = panel.url {
             downloads.customRoot = url.path
             appState.refreshModels()
         }
@@ -936,6 +1064,67 @@ private struct SpecDecodeSectionContent: View {
                 .disabled(!pldUsable)
             }
         }
+
+        // Native multi-token prediction — the model's OWN trained head, so it's
+        // a different mechanism from PLD (which guesses by copying from the
+        // prompt) and from the drafter (a separate small model). It needs no
+        // extra download and no compatible pairing: a Qwen 3.5/3.6 checkpoint
+        // either ships the head or it doesn't.
+        SettingsSubheader("Multi-Token Prediction — Qwen 3.5 / 3.6")
+        if let m = meta["enableMTP"] {
+            SettingsRow(
+                title: m.title,
+                explainer: m.explainer,
+                isDirty: dirty.dirty(\.enableMTP)
+            ) {
+                Toggle("", isOn: opts.enableMTP)
+                    .labelsHidden()
+                    .toggleStyle(.switch)
+            }
+        }
+        if let m = meta["mtpDepth"] {
+            SettingsRow(
+                title: m.title,
+                explainer: m.explainer,
+                isDirty: dirty.dirty(\.mtpDepth)
+            ) {
+                // 0 is the server's "auto" sentinel (the adaptive controller);
+                // 1...6 is the fixed range it accepts — 7+ hits a measured
+                // occupancy cliff in the verify kernel, so it isn't offered.
+                Picker("", selection: opts.mtpDepth) {
+                    Text("Automatic").tag(0)
+                    ForEach(1...6, id: \.self) { n in
+                        Text("\(n) token\(n == 1 ? "" : "s")").tag(n)
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.menu)
+                .frame(width: 140)
+                .disabled(!appState.serverOptions.enableMTP)
+            }
+        }
+    }
+}
+
+/// A labelled group INSIDE a section (e.g. the MTP block within Speculative
+/// Decoding). Chrome, not content: it hides itself while a search filter is
+/// active, so a group header can't be left stranded above rows the filter
+/// removed. (A category selection never coexists with a query, so the sidebar
+/// can't strand it either.)
+private struct SettingsSubheader: View {
+    let text: String
+    @Environment(\.settingsSearchQuery) private var query
+
+    init(_ text: String) { self.text = text }
+
+    var body: some View {
+        if SettingsSearch.tokens(query).isEmpty {
+            Text(text)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
+                .textCase(.uppercase)
+                .padding(.top, 4)
+        }
     }
 }
 
@@ -1273,7 +1462,7 @@ private struct DrafterRow: View {
                 // isn't on disk. Jump straight to the Model Browser so the
                 // user can pick the right `*-it-assistant-bf16` repo.
                 Button("Browse") {
-                    openWindow(id: "modelBrowser")
+                    AppActivation.openWindow(id: "modelBrowser", using: openWindow)
                 }
                 .controlSize(.small)
                 .padding(.top, 2)

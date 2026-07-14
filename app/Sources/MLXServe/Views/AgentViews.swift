@@ -202,6 +202,9 @@ struct AgentModeToggle: View {
 /// either wasted a fixed slot or re-tripped the » eviction bug; the current
 /// folder shows in the pill's tooltip instead).
 enum WorkspacePicker {
+    /// `@MainActor`: a modal panel only runs on the main thread (already true in
+    /// practice — `AppActivation` just makes it explicit).
+    @MainActor
     static func pickDirectory() -> String? {
         let panel = NSOpenPanel()
         panel.canChooseDirectories = true
@@ -209,7 +212,7 @@ enum WorkspacePicker {
         panel.allowsMultipleSelection = false
         panel.canCreateDirectories = true
         panel.prompt = "Select Working Directory"
-        guard panel.runModal() == .OK, let url = panel.url else { return nil }
+        guard AppActivation.runModal(panel) == .OK, let url = panel.url else { return nil }
         return url.path
     }
 }

@@ -312,7 +312,7 @@ struct Model3DGenView: View {
         panel.canChooseFiles = true
         panel.canChooseDirectories = false
         panel.allowsMultipleSelection = false
-        if panel.runModal() == .OK, let url = panel.url {
+        if AppActivation.runModal(panel) == .OK, let url = panel.url {
             photoURL = url
         }
     }

@@ -531,7 +531,7 @@ struct VideoGenView: View {
         panel.canChooseFiles = true
         panel.canChooseDirectories = false
         panel.allowsMultipleSelection = false
-        if panel.runModal() == .OK, let url = panel.url {
+        if AppActivation.runModal(panel) == .OK, let url = panel.url {
             attachAudio(url)
         }
     }
@@ -693,7 +693,7 @@ struct VideoGenView: View {
         panel.canChooseFiles = true
         panel.canChooseDirectories = false
         panel.allowsMultipleSelection = false
-        if panel.runModal() == .OK, let url = panel.url {
+        if AppActivation.runModal(panel) == .OK, let url = panel.url {
             loraPath = url.path
             persist()
         }
@@ -705,7 +705,7 @@ struct VideoGenView: View {
         panel.canChooseFiles = true
         panel.canChooseDirectories = false
         panel.allowsMultipleSelection = false
-        if panel.runModal() == .OK, let url = panel.url {
+        if AppActivation.runModal(panel) == .OK, let url = panel.url {
             firstFrameImageURL = url
         }
     }

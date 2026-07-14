@@ -1,11 +1,14 @@
 #!/bin/bash
 # bench.sh — unified mlx-serve performance bench.
 #
-# Default run is mlx-serve only across {none,pld,drafter} × prefill/decode/echo/code
-# prompts (fast dev-loop iteration). Pass --lmstudio and/or --omlx to add the
-# apples-to-apples comparison cells that produce charts in
-# docs/perf-vs-lmstudio-omlx*.png. Pass --concurrent N to also emit batched
-# throughput rows (folded from the old bench_concurrent.py).
+# Default run is mlx-serve only across {none,pld,drafter} × prefill/code
+# prompts (fast dev-loop iteration; echo and free-form are opt-in via
+# --echo / --freeform since 2026-07-14), MLX-format checkpoints only. Pass
+# --lmstudio and/or --omlx to add the apples-to-apples comparison cells that
+# produce charts in docs/perf-vs-lmstudio-omlx*.png — --lmstudio includes the
+# LM Studio GGUF alt cell (the canonical chart's BASELINE); pass --gguf to
+# also add the mlx-serve llama.cpp GGUF alt cell. Pass --concurrent N to also
+# emit batched throughput rows (folded from the old bench_concurrent.py).
 #
 # Two model families are shipped:
 #   --family gemma   Gemma 4 E2B (8bit), E4B (8bit), 31B (8bit), 26B-A4B-MoE
@@ -58,6 +61,22 @@ ONLY=""   # substring filter on the logical target name (e.g. "e2b", "31b"); emp
 SPECS_ONLY="" # substring filter on the spec entry (e.g. "mlx-serve", "lmstudio"); empty = all
 RAW=0     # when 1, drop the PLD/drafter mlx-serve cells (raw apples-to-apples only)
 THINKING=0 # when 1, enable reasoning on every engine (fair same-workload Qwen comparison)
+FREEFORM=0 # when 1, also measure the free-form/creative decode cell (retired
+           # from the default matrix 2026-07-14 — it was a parity case on
+           # every engine and cost a third of each cell's decode time; the
+           # chart no longer plots it)
+INCLUDE_ECHO=0 # when 1, also measure the echo (verbatim recitation) cell.
+               # Retired from the default matrix 2026-07-14 alongside the
+               # chart's echo panel: it is spec-decode's synthetic best case
+               # (prompt-lookup's home turf) and doubled every cell's decode
+               # time; code completion is the honest workload.
+ISOLATE_SPECS=0 # when 1, boot a fresh mlx-serve per spec (the pre-2026-07-14
+                # behavior). Default shares ONE boot per model across the
+                # none/pld/drafter/mtp cells: every spec is already selected
+                # per REQUEST via explicit enable_pld/enable_drafter/
+                # enable_mtp body fields (build_body_mlx always sends all
+                # three), so the per-spec launch flags were redundant — and
+                # the shared boot cuts ~3 model loads per row.
 RUNS=2
 MAX_TOKENS=128
 CTX=4096
@@ -72,7 +91,14 @@ LMS_PORT=1234
 INCLUDE_LMSTUDIO=0
 INCLUDE_OMLX=0
 INCLUDE_MTPLX=0
-# --mlx-only: drop the mlx-serve GGUF alt cell (MLX-format checkpoints only).
+# --gguf gates ONLY the mlx-serve llama.cpp GGUF alt cell (opt-in — the
+# mlx-serve side of the matrix is MLX-format by default). The LM Studio GGUF
+# alt cell is NOT behind this flag: it rides --lmstudio, because it is the
+# canonical chart's baseline (2026-07-14 — "what LM Studio users actually
+# run" is the GGUF default, not the MLX beta path).
+INCLUDE_GGUF=0
+# --mlx-only: retained for back-compat; redundant unless --gguf is also
+# passed (it then re-drops the mlx-serve GGUF alt cell).
 MLX_ONLY=0
 # MTPLX (github.com/youssofal/mtplx) — the reference native-MTP runtime.
 # OpenAI-compatible `mtplx serve`. Its chat path REQUIRES an MTPLX-verified
@@ -114,28 +140,35 @@ fi
 
 usage() {
     cat <<EOF
-Usage: $0 --family <gemma|qwen36> [options]
+Usage: $0 --family <all|gemma|qwen36> [options]
 
-The default run measures mlx-serve only (MLX safetensors + GGUF where vendored)
-across {none, pld, drafter} and the prefill/decode/echo/code prompts. Add
---lmstudio and/or --omlx to include the comparison engines.
+The default run measures mlx-serve only across {none, pld, drafter, mtp} and
+the prefill/code prompts (echo and free-form are opt-in). Add --lmstudio
+and/or --omlx to include the comparison engines.
 
 Options:
-  --family NAME        Model family: 'gemma' or 'qwen36' (required)
+  --family NAME        Model matrix: 'all' (gemma + qwen36 combined — the
+                       canonical single-chart run), 'gemma', or 'qwen36'
+                       (required)
   --only SUBSTR        Only run targets whose logical name contains SUBSTR
   --specs SUBSTR       Only run spec entries containing SUBSTR (e.g.
                        'mlx-serve' or 'lmstudio') — split long rows across
                        invocations, then merge the --keep-csv slices
-  --lmstudio           Include LM Studio cells (MLX baseline + GGUF alt where
-                       configured). Requires \`lms\` CLI; LM Studio handles JIT
-                       model load on the warmup curl.
+  --lmstudio           Include LM Studio cells (GGUF alt — the chart baseline
+                       — + MLX where configured). Requires \`lms\` CLI; LM
+                       Studio handles JIT model load on the warmup curl.
   --omlx               Include oMLX cells. Requires \`omlx\` on PATH; silently
                        skipped if missing.
   --mtplx              Include MTPLX cells (reference native-MTP runtime).
                        Only meaningful on rows whose checkpoint is an MTPLX
                        artifact (Youssofal/*-MTPLX-Optimized-*); other rows'
                        mtplx cells fail the warmup and are skipped.
-  --mlx-only           Drop the mlx-serve GGUF alt cell (MLX checkpoints only).
+  --gguf               Include the mlx-serve llama.cpp GGUF alt cell. Off by
+                       default — the mlx-serve side of the matrix is
+                       MLX-format only. (The LM Studio GGUF alt cell rides
+                       --lmstudio, not this flag.)
+  --mlx-only           Back-compat: re-drop the mlx-serve GGUF alt cell.
+                       Redundant unless --gguf is passed.
   --concurrent N       Also emit a \`decode_c<N>\` row per mlx-serve cell. The
                        server is started with --max-concurrent N and N parallel
                        /v1/chat/completions are fired; the row's tok/s is the
@@ -144,8 +177,20 @@ Options:
                        docs/perf-vs-lmstudio-omlx-<family>-YYYYMMDD-HHMMSS.png
                        The chart is skipped when no comparison engines are
                        enabled (a single-engine bar chart isn't useful).
-  --keep-csv PATH      Also retain the raw CSV at this path. By default the
-                       CSV is written to a temp file and deleted on exit.
+  --keep-csv PATH      CSV output path. Default (since 2026-07-14):
+                       docs/perf-csvs/bench-<family>-YYYYMMDD-HHMMSS.csv —
+                       always retained (also on ctrl-C, with partial rows);
+                       only a header-only run leaves nothing behind.
+  --freeform           Also measure the free-form/creative decode cell
+                       (dropped from the default matrix and chart 2026-07-14).
+  --echo               Also measure the echo (verbatim recitation) cell
+                       (dropped from the default matrix and chart 2026-07-14
+                       — spec-decode's synthetic best case; code completion
+                       is the honest default workload).
+  --isolate-specs      Boot a fresh mlx-serve per spec cell instead of
+                       sharing one boot per model (slower; the shared boot is
+                       measurement-identical since specs are selected per
+                       request).
   --runs N             Repeats per cell (run 1 dropped as warmup; default: 2)
   --max-tokens N       Decode budget (default: 128)
   --ctx-size N         Context size across all engines (default: 4096)
@@ -167,9 +212,13 @@ while [[ $# -gt 0 ]]; do
         --specs)      SPECS_ONLY="$2"; shift 2 ;;
         --raw)        RAW=1; shift ;;
         --thinking)   THINKING=1; shift ;;
+        --freeform)   FREEFORM=1; shift ;;
+        --echo)       INCLUDE_ECHO=1; shift ;;
+        --isolate-specs) ISOLATE_SPECS=1; shift ;;
         --lmstudio)   INCLUDE_LMSTUDIO=1; shift ;;
         --omlx)       INCLUDE_OMLX=1; shift ;;
         --mtplx)      INCLUDE_MTPLX=1; shift ;;
+        --gguf)       INCLUDE_GGUF=1; shift ;;
         --mlx-only)   MLX_ONLY=1; shift ;;
         --concurrent) CONCURRENT="$2"; shift 2 ;;
         --out)        PNG_OUT="$2"; shift 2 ;;
@@ -197,8 +246,13 @@ cd "$REPO_ROOT"
 TS="$(date +%Y%m%d-%H%M%S)"
 [[ -z "$PNG_OUT" ]] && PNG_OUT="docs/perf-vs-lmstudio-omlx-${FAMILY}-${TS}.png"
 
-# Raw CSV is an internal artifact of the run. Use a temp file unless the
-# caller explicitly asked for it via --keep-csv.
+# The CSV is ALWAYS retained (2026-07-14): re-rendering / restyling a chart
+# from a kept CSV is free, re-running the bench is an hour. --keep-csv PATH
+# overrides the timestamped default. The run writes to a temp file first so
+# an aborted run can't leave a half-written file at the final path; the EXIT
+# trap copies whatever was measured (interrupts keep partial results — they
+# merge into a later run's CSV via the --specs slicing workflow).
+[[ -z "$KEEP_CSV" ]] && KEEP_CSV="docs/perf-csvs/bench-${FAMILY}-${TS}.csv"
 OUT="$(mktemp -t bench_vs_lms.XXXXXX).csv"
 
 # ── Family-specific cell definitions ──
@@ -212,87 +266,93 @@ OUT="$(mktemp -t bench_vs_lms.XXXXXX).csv"
 #                         GGUF cell. Same artifact LMS loads for `lms_alt` so
 #                         the head-to-head is apples-to-apples. Empty/missing
 #                         skips the mlx-serve-gguf cell for this row.
-declare -a TARGETS
+declare -a TARGETS=()
+# Shared path roots (used by both families' target definitions).
+MD="$HOME/.mlx-serve/models"
+DM="$MD/mlx-community"
+LMS_DIR="$HOME/.lmstudio/models"
+# Vendored GGUFs — same files LM Studio loads under the hood (the LM Studio
+# GGUF alt cell rides --lmstudio; the .gguf FILE paths below feed only the
+# opt-in --gguf mlx-serve llama.cpp cell).
+GGUF_DIR="$LMS_DIR/lmstudio-community"
+
+# LM Studio 0.3+ model IDs are the upstream HF org/name. Verify with
+# `curl -sf http://127.0.0.1:1234/v1/models` — the MLX baseline lives under
+# `mlx-community/<name>`, the GGUF alt under `google/<name>`. The script
+# tolerates missing rows: any TARGETS entry whose `mlxserve_path` is absent
+# skips silently. E2B was retired from the matrix 2026-07-13 (tiny-model row
+# added wall time without informing engine comparisons).
+add_gemma_targets() {
+    TARGETS+=(
+        "gemma4-e4b-4bit|$LMS_DIR/mlx-community/gemma-4-e4b-it-4bit|mlx-community/gemma-4-e4b-it|google/gemma-4-e4b|$DM/gemma-4-E4B-it-assistant-bf16|$GGUF_DIR/gemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q4_K_M.gguf"
+        "gemma4-12b-4bit|$LMS_DIR/mlx-community/gemma-4-12B-it-4bit|mlx-community/gemma-4-12b-it|google/gemma-4-12b|$DM/gemma-4-12B-it-assistant-bf16|$GGUF_DIR/gemma-4-12B-it-GGUF/gemma-4-12B-it-Q4_K_M.gguf"
+        "gemma4-12b-qat-4bit|$LMS_DIR/mlx-community/gemma-4-12b-it-qat-4bit|mlx-community/gemma-4-12b-it-qat|google/gemma-4-12b-qat|$DM/gemma-4-12B-it-assistant-bf16|$GGUF_DIR/gemma-4-12B-it-QAT-GGUF/gemma-4-12B-it-QAT-Q4_0.gguf"
+        # 26B-A4B row: the QAT 4-bit checkpoint (the non-qat MLX dir was
+        # retired). LM Studio advertises this side-loaded dir with a bare id
+        # (no mlx-community/ prefix) — verified via /v1/models. NO drafter
+        # dir (2026-07-14): the drafter cell on this MoE row measured the
+        # known drafter-on-MoE regression — a config that defaults OFF in
+        # the server — so it burned a boot + cells to chart a non-default
+        # setup. PLD is the spec story on this row.
+        "gemma4-26b-a4b-moe-qat-4bit|$LMS_DIR/mlx-community/gemma-4-26B-A4B-it-qat-4bit|gemma-4-26b-a4b-it-qat|google/gemma-4-26b-a4b||$GGUF_DIR/gemma-4-26B-A4B-it-GGUF/gemma-4-26B-A4B-it-Q4_K_M.gguf"
+        "gemma4-31b-4bit|$LMS_DIR/mlx-community/gemma-4-31b-it-4bit|mlx-community/gemma-4-31b-it|google/gemma-4-31b|$DM/gemma-4-31B-it-assistant-bf16|$GGUF_DIR/gemma-4-31B-it-GGUF/gemma-4-31B-it-Q4_K_M.gguf"
+    )
+}
+
+# All engines load the same standard mlx-community 4-bit MLX weights (not
+# the unsloth UD variants). The MTPLX-artifact row: 4-bit trunk +
+# MTPLX-calibrated MTP adapter; mlx-serve loads it unmodified (mtp/ sidecar),
+# MTPLX gets its native MTP, oMLX serves the trunk AR — identical weights on
+# every engine. It is the ONLY row where an mtplx cell can run.
+add_qwen36_targets() {
+    # Qwen lms_alt ids are the FULL indexed identifiers
+    # (publisher/repo/file.gguf): these GGUFs are side-loaded (no LM Studio
+    # Hub virtual-model manifest, unlike the gemma `google/...` ids), so the
+    # short hub id doesn't exist — but LM Studio JIT-loads the full
+    # identifier fine (verified live 2026-07-14). The mtplxopt row has no
+    # GGUF counterpart (MTPLX artifacts are MLX-only) — empty lms_alt.
+    TARGETS+=(
+        "qwen36-27b|$LMS_DIR/mlx-community/Qwen3.6-27B-4bit|qwen3.6-27b|lmstudio-community/Qwen3.6-27B-GGUF/Qwen3.6-27B-Q4_K_M.gguf||$GGUF_DIR/Qwen3.6-27B-GGUF/Qwen3.6-27B-Q4_K_M.gguf"
+        "qwen36-35b-a3b|$LMS_DIR/mlx-community/Qwen3.6-35B-A3B-4bit|qwen3.6-35b-a3b|lmstudio-community/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-Q4_K_M.gguf||$GGUF_DIR/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-Q4_K_M.gguf"
+        "qwen36-27b-mtplxopt|$LMS_DIR/Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed|qwen3.6-27b-mtplx-optimized-speed|||"
+    )
+}
+
+# Spec ordering rule (all families): mlx-serve MLX first (cool machine),
+# mlx-serve GGUF next, omlx in the middle, LMS specs last so any thermal
+# throttling that builds up during the row falls on the comparison engines,
+# not on us. `mtp` cells only run on rows whose checkpoint ships an MTP
+# sidecar (guarded in the dispatch loop); `drafter` cells only on rows with a
+# drafter dir; `none`/`pld` pass --no-mtp so their labels stay truthful
+# (priority is MTP > PLD when a sidecar is loaded).
 case "$FAMILY" in
     gemma)
-        MD="$HOME/.mlx-serve/models"
-        DM="$MD/mlx-community"
-        # 4-bit across the board (apples-to-apples MLX 4-bit vs GGUF Q4 vs
-        # mlx-serve 4-bit). All four targets get both MLX baseline and GGUF alt.
-        LMS_DIR="$HOME/.lmstudio/models"
-        # Vendored GGUFs — same files LM Studio loads under the hood. Default
-        # to the LM Studio community dir under $LMS_DIR; override the per-row
-        # path in TARGETS if your GGUFs live elsewhere.
-        GGUF_DIR="$LMS_DIR/lmstudio-community"
-        # LM Studio 0.3+ model IDs are the upstream HF org/name. Verify with
-        # `curl -sf http://127.0.0.1:1234/v1/models` — the MLX baseline lives
-        # under `mlx-community/<name>`, the GGUF alt under `google/<name>` (or
-        # `<name>` without an org for some entries). Older `*-it-mlx` /
-        # `<name>` fuzzy IDs no longer JIT-load and timed out the bench
-        # silently. The script tolerates missing rows: any TARGETS entry
-        # whose `mlxserve_path` is absent skips silently.
-        TARGETS=(
-            "gemma4-e2b-4bit|$LMS_DIR/mlx-community/gemma-4-e2b-it-4bit|mlx-community/gemma-4-e2b-it|google/gemma-4-e2b|$DM/gemma-4-E2B-it-assistant-bf16|$GGUF_DIR/gemma-4-E2B-it-GGUF/gemma-4-E2B-it-Q4_K_M.gguf"
-            "gemma4-e4b-4bit|$LMS_DIR/mlx-community/gemma-4-e4b-it-4bit|mlx-community/gemma-4-e4b-it|google/gemma-4-e4b|$DM/gemma-4-E4B-it-assistant-bf16|$GGUF_DIR/gemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q4_K_M.gguf"
-            "gemma4-12b-4bit|$LMS_DIR/mlx-community/gemma-4-12B-it-4bit|mlx-community/gemma-4-12b-it|google/gemma-4-12b|$DM/gemma-4-12B-it-assistant-bf16|$GGUF_DIR/gemma-4-12B-it-GGUF/gemma-4-12B-it-Q4_K_M.gguf"
-            "gemma4-12b-qat-4bit|$LMS_DIR/mlx-community/gemma-4-12b-it-qat-4bit|mlx-community/gemma-4-12b-it-qat|google/gemma-4-12b-qat|$DM/gemma-4-12B-it-assistant-bf16|$GGUF_DIR/gemma-4-12B-it-QAT-GGUF/gemma-4-12B-it-QAT-Q4_0.gguf"
-            # 26B-A4B row: the QAT 4-bit checkpoint (the non-qat MLX dir was
-            # retired). Both engines load the SAME weights from the LMS dir;
-            # LM Studio advertises this side-loaded dir with a bare id (no
-            # mlx-community/ prefix) — verified via /v1/models. The GGUF alt
-            # stays the non-QAT Q4_K_M (same file on both engines).
-            "gemma4-26b-a4b-moe-qat-4bit|$LMS_DIR/mlx-community/gemma-4-26B-A4B-it-qat-4bit|gemma-4-26b-a4b-it-qat|google/gemma-4-26b-a4b|$DM/gemma-4-26B-A4B-it-assistant-bf16|$GGUF_DIR/gemma-4-26B-A4B-it-GGUF/gemma-4-26B-A4B-it-Q4_K_M.gguf"
-            "gemma4-31b-4bit|$LMS_DIR/mlx-community/gemma-4-31b-it-4bit|mlx-community/gemma-4-31b-it|google/gemma-4-31b|$DM/gemma-4-31B-it-assistant-bf16|$GGUF_DIR/gemma-4-31B-it-GGUF/gemma-4-31B-it-Q4_K_M.gguf"
-        )
-        # Specs measured (per row): mlx-serve {none,pld,drafter} + mlx-serve
-        # GGUF (none — PLD/drafter are MLX-only and silently no-op on the
-        # llama.cpp path) + omlx baseline + lms_baseline + lms_alt (GGUF).
-        # Order matters: mlx-serve MLX first (cool machine), mlx-serve GGUF
-        # next, omlx in the middle, LMS specs last so any thermal throttling
-        # that builds up during the row falls on the comparison engines, not
-        # on us. lms_alt rows skip silently when the row has no GGUF key
-        # configured (31B, 26B-A4B currently).
+        add_gemma_targets
         SPECS=("mlx-serve::none" "mlx-serve::pld" "mlx-serve::drafter" "mlx-serve:alt:none" "omlx:base:none" "mtplx:base:auto" "lmstudio:lms_baseline:none" "lmstudio:lms_alt:none")
         # Gemma 4 has no thinking mode; the LMS workaround is a no-op.
         LMS_THINKING_WORKAROUND=0
         ;;
     qwen36)
-        LMS_DIR="$HOME/.lmstudio/models"
-        GGUF_DIR="$LMS_DIR/lmstudio-community"
-        # All engines load the same standard mlx-community 4-bit MLX weights
-        # (not the unsloth UD variants — those are bigger on disk and we want
-        # the more representative production checkpoint here). GGUFs are the
-        # lmstudio-community Q4_K_M vendored builds.
-        TARGETS=(
-            # LM Studio advertises these side-loaded dirs with bare ids (no
-            # mlx-community/ prefix) — verified via /v1/models on 0.4.15.
-            "qwen36-27b|$LMS_DIR/mlx-community/Qwen3.6-27B-4bit|qwen3.6-27b|qwen/qwen3.6-27b||$GGUF_DIR/Qwen3.6-27B-GGUF/Qwen3.6-27B-Q4_K_M.gguf"
-            "qwen36-35b-a3b|$LMS_DIR/mlx-community/Qwen3.6-35B-A3B-4bit|qwen3.6-35b-a3b|qwen/qwen3.6-35b-a3b||$GGUF_DIR/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-Q4_K_M.gguf"
-            # The MTPLX-artifact row (the July-12 context-ladder checkpoint):
-            # 4-bit trunk + MTPLX-calibrated MTP adapter. mlx-serve loads the
-            # artifact unmodified (mtp/ sidecar), MTPLX gets its native MTP,
-            # oMLX serves the trunk AR — identical weights on every engine.
-            # This is the ONLY row where an mtplx cell can run; skipped
-            # silently if the dir is absent.
-            "qwen36-27b-mtplxopt|$LMS_DIR/Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed|qwen3.6-27b-mtplx-optimized-speed|||"
-        )
-        # Same ordering rule as gemma: mlx-serve MLX first (cool machine),
-        # mlx-serve GGUF next, omlx in the middle, LMS specs last so any
-        # thermal throttling penalises the comparison engines, not us.
-        # `mtp` = the native multi-token-prediction sidecar shipped inside
-        # these checkpoints (mtp/weights.safetensors / model-mtp.safetensors).
-        # It is mlx-serve's out-of-the-box default on the dense 27B, so it
-        # gets its own labeled cell; `none`/`pld` pass --no-mtp so their
-        # labels stay truthful (priority is MTP > PLD when the sidecar is
-        # loaded — without --no-mtp both cells would silently measure MTP).
+        add_qwen36_targets
         SPECS=("mlx-serve::none" "mlx-serve::pld" "mlx-serve::mtp" "mlx-serve:alt:none" "omlx:base:none" "mtplx:base:auto" "lmstudio:lms_baseline:none" "lmstudio:lms_alt:none")
         # Qwen 3.6's chat template auto-activates `<think>` mode; LM Studio
         # ignores `chat_template_kwargs.enable_thinking:false`, so build_body_lms
         # uses the stacked workaround when this flag is on.
         LMS_THINKING_WORKAROUND=1
         ;;
+    all)
+        # The canonical combined matrix (one CSV → the single gemma+qwen
+        # chart, tests/plot_vs_lmstudio_omlx.py --family all). Union of both
+        # families' specs; per-row guards drop the inapplicable ones, and
+        # LMS_THINKING_WORKAROUND is set PER ROW in the dispatch loop (Qwen
+        # rows need it, Gemma rows must not carry the extra system message).
+        add_gemma_targets
+        add_qwen36_targets
+        SPECS=("mlx-serve::none" "mlx-serve::pld" "mlx-serve::drafter" "mlx-serve::mtp" "mlx-serve:alt:none" "omlx:base:none" "mtplx:base:auto" "lmstudio:lms_baseline:none" "lmstudio:lms_alt:none")
+        LMS_THINKING_WORKAROUND=0
+        ;;
     *)
-        echo "Unknown family '$FAMILY' (try gemma or qwen36)" >&2
+        echo "Unknown family '$FAMILY' (try all, gemma, or qwen36)" >&2
         exit 1
         ;;
 esac
@@ -645,6 +705,12 @@ start_engine() {
                 mtp)     extra="--no-pld" ;;
                 drafter) [[ -z "$drafter" ]] && { echo "  drafter spec missing --drafter dir" >&2; return 1; }
                          extra="--no-pld --drafter $drafter" ;;
+                # Shared boot (default path): server defaults (--pld on, MTP
+                # sidecar auto-load) + the drafter when the row has one. The
+                # spec is selected per REQUEST — build_body_mlx always sends
+                # explicit enable_pld/enable_drafter/enable_mtp — so this one
+                # boot serves every mlx-serve cell of the row.
+                multi)   [[ -n "$drafter" && -d "$drafter" ]] && extra="--drafter $drafter" ;;
             esac
             # --max-concurrent N enables N-way batched scheduling on dense archs.
             # Always pass the flag — N=1 (default) matches single-slot behavior.
@@ -783,12 +849,20 @@ emit() {
 
 run_cell() {
     local label_prefix="$1" engine="$2" model_or_path="$3" spec="$4" drafter="$5" notes="$6"
-    local label="${label_prefix}"
-    echo "  >> $label / $engine / $spec" >&2
+    echo "  >> $label_prefix / $engine / $spec" >&2
     if ! start_engine "$engine" "$model_or_path" "$spec" "$drafter"; then
-        echo "  SKIP $label" >&2
+        echo "  SKIP $label_prefix" >&2
         return
     fi
+    measure_cell "$label_prefix" "$engine" "$model_or_path" "$spec" "$drafter" "$notes" "$spec"
+}
+
+# Measure one cell against an ALREADY-BOOTED engine. `boot_spec` is what a
+# mid-cell restart re-boots with: the cell's own spec on the isolated path,
+# "multi" on the shared-boot path.
+measure_cell() {
+    local label_prefix="$1" engine="$2" model_or_path="$3" spec="$4" drafter="$5" notes="$6" boot_spec="$7"
+    local label="${label_prefix}"
 
     local out tps pt ct rt cell_notes retry_out prompt kind
 
@@ -812,7 +886,7 @@ run_cell() {
         if [[ "$tps_in" != "0" ]]; then echo ""; return; fi
         if ! engine_alive; then
             echo "  $engine died mid-cell ($kind) — restarting and retrying once" >&2
-            if ! start_engine "$engine" "$model_or_path" "$spec" "$drafter"; then
+            if ! start_engine "$engine" "$model_or_path" "$boot_spec" "$drafter"; then
                 echo "  retry: start_engine failed; giving up on $label" >&2
                 return
             fi
@@ -832,7 +906,14 @@ run_cell() {
     [[ -n "$retry_out" ]] && { out="$retry_out"; IFS='|' read -r tps pt <<<"$out"; }
     emit "$label" "$engine" "$model_or_path" "$spec" "prefill" "$tps" "0" "$pt" "1" "$notes"
 
-    for kind in decode echo code; do
+    # Default decode cell set is CODE ONLY (2026-07-14). Echo (--echo) is
+    # spec-decode's synthetic best case and doubled every cell's decode time;
+    # free-form (--freeform) measured parity on every engine. Code completion
+    # is the honest workload the chart leads with.
+    local kinds="code"
+    [[ "$INCLUDE_ECHO" -eq 1 ]] && kinds="echo $kinds"
+    [[ "$FREEFORM" -eq 1 ]] && kinds="decode $kinds"
+    for kind in $kinds; do
         case "$kind" in
             decode) prompt="$DECODE_PROMPT" ;;
             echo)   prompt="$ECHO_PROMPT" ;;
@@ -859,11 +940,39 @@ run_cell() {
     fi
 }
 
+# Shared-boot row runner (default mlx-serve path): ONE server boot per model
+# serves every mlx-serve spec cell of the row — the spec is fully selected by
+# the request body, so this is measurement-identical to per-spec boots while
+# skipping ~3 redundant model loads per row. All cells share the same boot's
+# thermal state, which is FAIRER within the row than staggered boots.
+run_mlx_row() {
+    local logical="$1" model_or_path="$2" drafter="$3"
+    shift 3
+    local specs=("$@")
+    [[ ${#specs[@]} -eq 0 ]] && return
+    echo "  >> ${logical}/mlx-serve/{${specs[*]}} (shared boot)" >&2
+    if ! start_engine "mlx-serve" "$model_or_path" "multi" "$drafter"; then
+        echo "  SKIP ${logical}/mlx-serve (shared boot failed)" >&2
+        return
+    fi
+    local spec
+    for spec in "${specs[@]}"; do
+        measure_cell "${logical}/mlx-serve/${spec}" "mlx-serve" "$model_or_path" "$spec" "$drafter" "" "multi"
+    done
+}
+
 cleanup() {
     stop_all_engines
     lms unload --all >/dev/null 2>&1 || true
-    # Remove the temp CSV unless the caller asked to keep it.
-    if [[ -z "$KEEP_CSV" && -n "$OUT" && -f "$OUT" ]]; then
+    # Retain the CSV (runs on normal exit AND interrupts, so a ctrl-C'd run
+    # keeps its partial rows). A header-only CSV (nothing measured — e.g. a
+    # filtered dry run) is not worth littering docs/perf-csvs with.
+    if [[ -n "$OUT" && -f "$OUT" ]]; then
+        if [[ "$(wc -l < "$OUT")" -gt 1 ]]; then
+            mkdir -p "$(dirname "$KEEP_CSV")"
+            cp "$OUT" "$KEEP_CSV"
+            echo "CSV retained at $KEEP_CSV"
+        fi
         rm -f "$OUT"
     fi
 }
@@ -896,7 +1005,52 @@ for row in "${TARGETS[@]}"; do
     IFS='|' read -r logical mlxserve_path lms_baseline lms_alt drafter mlxserve_gguf_path <<<"$row"
     [[ -n "$ONLY" && "$logical" != *"$ONLY"* ]] && { echo "SKIP $logical (--only $ONLY)" >&2; continue; }
     [[ -d "$mlxserve_path" ]] || { echo "SKIP missing $mlxserve_path" >&2; continue; }
+    # family=all mixes Gemma and Qwen rows; the LMS thinking workaround is a
+    # Qwen-only need (its lighter combo adds a system message + /no_think
+    # suffix that Gemma rows must not carry — prompt parity per row).
+    if [[ "$FAMILY" == "all" ]]; then
+        if [[ "$logical" == qwen* ]]; then LMS_THINKING_WORKAROUND=1; else LMS_THINKING_WORKAROUND=0; fi
+    fi
 
+    # ── Pass 1: mlx-serve MLX cells — collect the row's applicable specs and
+    # run them against ONE shared boot (or per-spec boots with
+    # --isolate-specs). mlx-serve entries lead every family's SPECS list, so
+    # running them first preserves the cool-machine-first thermal ordering.
+    row_mlx_specs=()
+    for spec_entry in "${SPECS[@]}"; do
+        [[ -n "$SPECS_ONLY" && "$spec_entry" != *"$SPECS_ONLY"* ]] && continue
+        IFS=':' read -r engine variant spec <<<"$spec_entry"
+        [[ "$engine|$variant" == "mlx-serve|" ]] || continue
+        if [[ "$spec" == "drafter" && ( -z "$drafter" || ! -d "$drafter" ) ]]; then
+            continue
+        fi
+        # The `mtp` cell only makes sense on rows whose checkpoint ships an
+        # MTP sidecar (ANY of the three accepted layouts) — without one it
+        # would silently measure plain decode under an "mtp" label. NOTE:
+        # this must be an any-of check per file — `ls a b c` exits non-zero
+        # when ANY operand is missing, which silently skipped the mtp cell
+        # on EVERY row in the 2026-07-14 run (no model ships all three
+        # names).
+        if [[ "$spec" == "mtp" &&
+              ! -e "$mlxserve_path/mtp/weights.safetensors" &&
+              ! -e "$mlxserve_path/mtp.safetensors" &&
+              ! -e "$mlxserve_path/model-mtp.safetensors" ]]; then
+            continue
+        fi
+        row_mlx_specs+=("$spec")
+    done
+    if [[ ${#row_mlx_specs[@]} -gt 0 ]]; then
+        if [[ "$ISOLATE_SPECS" -eq 1 ]]; then
+            for spec in "${row_mlx_specs[@]}"; do
+                run_cell "${logical}/mlx-serve/${spec}" "mlx-serve" "$mlxserve_path" "$spec" "$drafter" ""
+            done
+        else
+            run_mlx_row "$logical" "$mlxserve_path" "$drafter" "${row_mlx_specs[@]}"
+        fi
+    fi
+
+    # ── Pass 2: everything else (GGUF alt, comparison engines) — one boot
+    # per cell as before. ──
     for spec_entry in "${SPECS[@]}"; do
         # --specs: substring filter on the spec entry ("mlx-serve" matches all
         # four mlx-serve cells incl. the GGUF alt; "lmstudio" the two LMS
@@ -910,6 +1064,10 @@ for row in "${TARGETS[@]}"; do
                 run_cell "${logical}/lmstudio-baseline/${spec}"  "lmstudio"  "$lms_baseline"  "$spec" "" ""
                 ;;
             "lmstudio|lms_alt")
+                # The LM Studio GGUF cell is part of the default --lmstudio
+                # set (2026-07-14): it is the canonical chart's BASELINE —
+                # the llama.cpp GGUF path is what LM Studio users actually
+                # run. --gguf gates only the mlx-serve llama.cpp alt below.
                 [[ "$INCLUDE_LMSTUDIO" -eq 1 ]] || continue
                 [[ -z "$lms_alt" ]] && continue
                 run_cell "${logical}/lmstudio-alt/${spec}"       "lmstudio"  "$lms_alt"       "$spec" "" ""
@@ -925,10 +1083,12 @@ for row in "${TARGETS[@]}"; do
                 run_cell "${logical}/mtplx/${spec}"              "mtplx"     "$mlxserve_path" "$spec" "" ""
                 ;;
             "mlx-serve|alt")
-                # mlx-serve loading the same .gguf LM Studio uses. PLD /
+                # mlx-serve loading the same .gguf LM Studio uses. Opt-in via
+                # --gguf (the default matrix is MLX-format only). PLD /
                 # drafter silently no-op on the llama.cpp path (those are
                 # MLX-only kernels), so the only meaningful spec here is
                 # `none` — the SPECS list reflects that.
+                [[ "$INCLUDE_GGUF" -eq 1 ]] || continue
                 if [[ -z "$mlxserve_gguf_path" || ! -e "$mlxserve_gguf_path" ]]; then
                     echo "  SKIP ${logical}/mlx-serve-gguf/${spec} (no mlxserve_gguf_path or file missing)" >&2
                     continue
@@ -936,11 +1096,8 @@ for row in "${TARGETS[@]}"; do
                 run_cell "${logical}/mlx-serve-gguf/${spec}"     "mlx-serve" "$mlxserve_gguf_path" "$spec" "" ""
                 ;;
             "mlx-serve|")
-                # Empty variant = MLX safetensors path (default).
-                if [[ "$spec" == "drafter" && ( -z "$drafter" || ! -d "$drafter" ) ]]; then
-                    continue
-                fi
-                run_cell "${logical}/mlx-serve/${spec}"          "mlx-serve" "$mlxserve_path" "$spec" "$drafter" ""
+                # Handled in pass 1 (shared-boot path).
+                continue
                 ;;
         esac
     done
@@ -960,10 +1117,5 @@ else
     echo "(chart skipped — no comparison engines; pass --lmstudio/--omlx to render)" >&2
 fi
 
-# Optionally retain the raw CSV; otherwise it's a tempfile and gets cleaned
-# up by the EXIT trap below.
-if [[ -n "$KEEP_CSV" ]]; then
-    mkdir -p "$(dirname "$KEEP_CSV")"
-    cp "$OUT" "$KEEP_CSV"
-    echo "CSV retained at $KEEP_CSV"
-fi
+# CSV retention happens in the EXIT trap (cleanup) so interrupted runs keep
+# their partial rows too.

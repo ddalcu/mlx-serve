@@ -531,6 +531,11 @@ struct LocalModel: Identifiable, Hashable {
     var numExperts: Int? = nil
     /// Active MoE experts per token (`num_experts_per_tok`).
     var activeExperts: Int? = nil
+    /// The `.gguf` basename this model IS, when it's one quant of a GGUF repo.
+    /// A repo folder holds many quants and each is separately loadable, so
+    /// discovery emits one `LocalModel` per file and `path` points at the file.
+    /// nil for MLX checkpoints, whose `path` is the directory.
+    var quantFile: String? = nil
 
     var isSupportedArchitecture: Bool {
         supportedModelTypes.contains(modelType) || isMediaModelType(modelType)
@@ -611,16 +616,27 @@ struct LocalModel: Identifiable, Hashable {
         return modelType == "deepseek_v4" ? .ds4 : .llamaCpp
     }
 
-    /// Display names shared by more than one model. macOS `.menu` Pickers key
-    /// the checkmark state by item TITLE, so two same-named rows (one GGUF,
-    /// one MLX) both render selected — rows whose name is in this set need an
-    /// engine suffix to keep titles unique.
+    /// What every picker and list row shows. For a GGUF quant that's the repo
+    /// name plus the quant it is (`unsloth/Qwen3.5-4B-GGUF · Q4_K_M`) — sibling
+    /// quants share a `name`, so the name alone can't tell them apart, and
+    /// `name` has to stay the repo name because filters and grouping key off it.
+    var displayLabel: String {
+        guard let quantFile else { return name }
+        return "\(name) · \(DownloadManager.quantLabel(forFilename: quantFile))"
+    }
+
+    /// Display labels shared by more than one model. macOS `.menu` Pickers key
+    /// the checkmark state by item TITLE, so two same-titled rows (one GGUF,
+    /// one MLX) both render selected — rows whose label is in this set need an
+    /// engine suffix to keep titles unique. Computed on `displayLabel`, not
+    /// `name`: two quants of one repo share a name but are already distinct
+    /// here, and tagging them both "· GGUF" would leave them identical.
     static func duplicateNames(in models: [LocalModel]) -> Set<String> {
         var seen = Set<String>()
         var dups = Set<String>()
         for m in models {
-            if !seen.insert(m.name).inserted {
-                dups.insert(m.name)
+            if !seen.insert(m.displayLabel).inserted {
+                dups.insert(m.displayLabel)
             }
         }
         return dups

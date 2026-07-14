@@ -328,7 +328,6 @@ const spec_gate_threshold: f32 = 0.01;
 /// The score is computed on the PROMPT and can't see which way the GENERATION
 /// will go, so anything below a clearly-dominant-echo score routes to the robust
 /// head (40-42 tok/s, reliable). User `enable_mtp` in the body overrides.
-const mtp_pld_echo_threshold: f32 = 0.13;
 
 // Plan 05: drafter state moved to `LoadedModel` (per-model `drafter`,
 // `drafter_block_size`, `drafter_path`). The previous module-level
@@ -3125,6 +3124,10 @@ fn handleEmbeddings(
         return;
     };
     defer parsed.deinit();
+    if (parsed.value != .object) {
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Request body must be a JSON object", null);
+        return;
+    }
     const root = parsed.value.object;
 
     // Parse input — can be a string or array of strings
@@ -3271,6 +3274,10 @@ fn handleTokenize(
         return;
     };
     defer parsed.deinit();
+    if (parsed.value != .object) {
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Request body must be a JSON object", 400);
+        return;
+    }
     const root = parsed.value.object;
 
     const content = if (root.get("content")) |v| (if (v == .string) v.string else null) else null;
@@ -3321,6 +3328,10 @@ fn handleDetokenize(
         return;
     };
     defer parsed.deinit();
+    if (parsed.value != .object) {
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Request body must be a JSON object", 400);
+        return;
+    }
     const root = parsed.value.object;
 
     const tokens_val = root.get("tokens") orelse {
@@ -3382,6 +3393,14 @@ fn handleChatCompletions(
     };
     defer parsed.deinit();
 
+    // A valid-JSON body that isn't an object (e.g. `42` or `[1,2]`) would panic
+    // on the `.object` field access below and take the whole server down, so
+    // reject it as a 400 like any other malformed request.
+    if (parsed.value != .object) {
+        log.warn("POST /v1/chat/completions -> 400 (body is not a JSON object)\n", .{});
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Request body must be a JSON object", 400);
+        return;
+    }
     const root = parsed.value.object;
 
     // Extract messages
@@ -3390,6 +3409,14 @@ fn handleChatCompletions(
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "'messages' is a required field", 400);
         return;
     };
+
+    // `messages` present but not an array (e.g. a string) would panic on the
+    // `.array` access below. Reject rather than crash.
+    if (messages_val != .array) {
+        log.warn("POST /v1/chat/completions -> 400 (messages is not an array)\n", .{});
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "'messages' must be an array", 400);
+        return;
+    }
 
     var messages = std.ArrayList(chat_mod.Message).empty;
     defer messages.deinit(allocator);
@@ -3402,6 +3429,10 @@ fn handleChatCompletions(
     }
 
     for (messages_val.array.items) |msg_val| {
+        // A non-object array element (e.g. `messages:[1,2,3]`) would panic on
+        // `.object`. Skip it rather than crash — consistent with how malformed
+        // inner fields are already tolerated below.
+        if (msg_val != .object) continue;
         const obj = msg_val.object;
         const role_val = obj.get("role") orelse continue;
         if (role_val != .string) continue;
@@ -3909,13 +3940,15 @@ fn handleChatCompletions(
                 enable_drafter = false;
             }
         }
-        // MTP/PLD coexistence: on heavy-echo prompts PLD's long n-gram drafts
-        // beat the depth-1 MTP head, so route this request to PLD; novel and
-        // light-echo content stays on the robust MTP head. User enable_mtp wins.
-        if (enable_mtp and enable_pld and score >= mtp_pld_echo_threshold and root.get("enable_mtp") == null) {
-            log.info("  mtp=disabled (heavy echo ngram-score={d:.3} >= {d:.3}; PLD wins)\n", .{ score, mtp_pld_echo_threshold });
-            enable_mtp = false;
-        }
+        // NOTE (2026-07-13): the old heavy-echo MTP->PLD routing (score >=
+        // 0.13 disabled MTP) was RETIRED with the verify-qmm kernels + EV
+        // depth. The prompt-time n-gram score cannot separate "output will
+        // echo verbatim" (PLD excels: 83 vs 75 tok/s live) from
+        // "repetitive-looking agent context" (PLD flaps at ~45% per-draft,
+        // runtime-disables, and lands on plain AR at 28 tok/s with the MTP
+        // head idle) — live captures scored 0.334 vs 0.365, inseparable.
+        // MTP now wins whenever loaded (generator priority); force PLD with
+        // enable_pld:true + enable_mtp:false.
     }
 
     // Prompt caching: reuse KV cache for shared prefix.
@@ -3994,6 +4027,11 @@ fn handleCompletions(
     };
     defer parsed.deinit();
 
+    if (parsed.value != .object) {
+        log.warn("POST /v1/completions -> 400 (body is not a JSON object)\n", .{});
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Request body must be a JSON object", 400);
+        return;
+    }
     const root = parsed.value.object;
 
     // Extract prompt (required)
@@ -4147,11 +4185,8 @@ fn handleCompletions(
                 enable_drafter = false;
             }
         }
-        // MTP/PLD coexistence: heavy-echo -> PLD, novel/light-echo -> MTP.
-        if (enable_mtp and enable_pld and score >= mtp_pld_echo_threshold and root.get("enable_mtp") == null) {
-            log.info("  mtp=disabled (heavy echo ngram-score={d:.3} >= {d:.3}; PLD wins)\n", .{ score, mtp_pld_echo_threshold });
-            enable_mtp = false;
-        }
+        // Heavy-echo MTP->PLD routing retired 2026-07-13 (see the NOTE at the
+        // chat-completions site): MTP wins whenever loaded.
     }
 
     const eos_slice = config.eosTokenSlice();
@@ -7158,6 +7193,11 @@ fn handleAnthropicMessages(
         return;
     };
     defer parsed.deinit();
+    if (parsed.value != .object) {
+        log.warn("POST /v1/messages -> 400 (body is not a JSON object)\n", .{});
+        try sendAnthropicError(allocator, stream, "invalid_request_error", "Request body must be a JSON object", 400);
+        return;
+    }
     const root = parsed.value.object;
 
     // max_tokens is required in Anthropic API
@@ -7558,11 +7598,8 @@ fn handleAnthropicMessages(
                 enable_drafter = false;
             }
         }
-        // MTP/PLD coexistence: heavy-echo -> PLD, novel/light-echo -> MTP.
-        if (enable_mtp and enable_pld and score >= mtp_pld_echo_threshold and root.get("enable_mtp") == null) {
-            log.info("  mtp=disabled (heavy echo ngram-score={d:.3} >= {d:.3}; PLD wins)\n", .{ score, mtp_pld_echo_threshold });
-            enable_mtp = false;
-        }
+        // Heavy-echo MTP->PLD routing retired 2026-07-13 (see the NOTE at the
+        // chat-completions site): MTP wins whenever loaded.
     }
 
     // Context size enforcement
@@ -8671,6 +8708,11 @@ fn handleResponses(
         return;
     };
     defer parsed.deinit();
+    if (parsed.value != .object) {
+        log.warn("POST /v1/responses -> 400 (body is not a JSON object)\n", .{});
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Request body must be a JSON object", 400);
+        return;
+    }
     const root = parsed.value.object;
 
     // ── input (required) ──
@@ -9097,11 +9139,8 @@ fn handleResponses(
                 enable_drafter_resp = false;
             }
         }
-        // MTP/PLD coexistence: heavy-echo -> PLD, novel/light-echo -> MTP.
-        if (enable_mtp_resp and enable_pld_resp and score >= mtp_pld_echo_threshold and root.get("enable_mtp") == null) {
-            log.info("  mtp=disabled (heavy echo ngram-score={d:.3} >= {d:.3}; PLD wins)\n", .{ score, mtp_pld_echo_threshold });
-            enable_mtp_resp = false;
-        }
+        // Heavy-echo MTP->PLD routing retired 2026-07-13 (see the NOTE at the
+        // chat-completions site): MTP wins whenever loaded.
     }
 
     var result: generate_mod.GenerationResult = undefined;

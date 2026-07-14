@@ -483,6 +483,12 @@ pub const Generator = struct {
     mtp_ev_m_lo_prev: u32 = 1,
     /// Per-phase wall-time trace (MLX_SERVE_MTP_TRACE=1; else untouched).
     mtp_trace: MtpTrace = .{},
+    /// Deferred committed-history append: the round's (tokens, true verify
+    /// hiddens) pair, folded into the NEXT round's first draft step as one
+    /// multi-row head forward instead of a separate appendHistory forward.
+    /// Rounds with no successor (EOS/length/runtime disable) never pay for
+    /// the append; the stash is freed unconsumed in `deinit`.
+    mtp_hist_stash: ?MtpHistStash = null,
 
     // ── Phase 1: SSM checkpoints captured during prefill ──
     /// Owned SSM-state snapshots taken at stride-aligned positions during
@@ -1401,6 +1407,22 @@ pub const Generator = struct {
         if (self.mtp_cache) |*mc| {
             mc.deinit();
             self.mtp_cache = null;
+        }
+        if (self.mtp_hist_stash) |*st| {
+            st.deinit();
+            self.mtp_hist_stash = null;
+        }
+        // Publish the EV surface for the next request (cross-request seed).
+        // Only healthy runs qualify — a runtime-disabled or barely-sampled
+        // run would poison the next request's plans (inference thread only,
+        // same discipline as every other head-state write).
+        if (self.mtp) |head| {
+            if (mtpAdaptiveEnabled() and mtpEvSeedEnabled() and
+                !self.spec_disabled_runtime and self.mtp_attempted >= 8)
+            {
+                head.ev_seed_accept = self.mtp_ev_accept;
+                head.ev_seed_m_lo = self.mtp_ev_m_lo_prev;
+            }
         }
         // Free any SSM checkpoints the caller didn't claim. Each layer-slice
         // was allocated by `ssm_checkpoint_alloc` (= the allocator passed to
@@ -2460,6 +2482,34 @@ pub const Generator = struct {
     /// entries built from MTP-PREDICTED hiddens; after the verify decision we
     /// restore the round-boundary snapshot and re-append the committed pairs
     /// from TRUE trunk hiddens, so the history never accumulates drift.
+    pub const MtpHistStash = struct {
+        /// `[n]` int32 committed token ids: `[t1, drafts[0..accepted]]`.
+        ids: mlx.mlx_array,
+        /// `[1, n, H]` trunk hiddens paired 1:1 with `ids` (a lazy concat of
+        /// last_hidden + a verify-capture slice — the handle pins the ~90 KB
+        /// parent until consumed, deliberately NOT a deep copy).
+        hidden: mlx.mlx_array,
+        n: usize,
+        /// Head-cache position of ids[0]'s entry (the producing round's
+        /// mtp_off0). The consume-time truncate drops the producing round's
+        /// stale draft tail past it.
+        off0: usize,
+
+        pub fn deinit(self: *MtpHistStash) void {
+            _ = mlx.mlx_array_free(self.ids);
+            _ = mlx.mlx_array_free(self.hidden);
+        }
+    };
+
+    /// Round origin of the MTP head cache: with a pending stash the cache
+    /// still holds the PREVIOUS round's draft tail (its step is stale), so
+    /// the committed length is the stash origin plus the entries the stash
+    /// itself will append; without one, the cache is fully committed.
+    pub fn mtpRoundOff0(stash: ?MtpHistStash, cache_step: usize) usize {
+        if (stash) |st| return st.off0 + st.n;
+        return cache_step;
+    }
+
     pub fn nextMtp(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepResult {
         if (self.done) return null;
         std.debug.assert(self.mtp != null);
@@ -2485,6 +2535,20 @@ pub const Generator = struct {
         const s = xfm.s;
         const head = self.mtp.?;
         const mc = &self.mtp_cache.?;
+        // Cross-request EV seed: inherit the head's last healthy acceptance
+        // surface so the controller plans from round 1 instead of re-warming
+        // (~10 legacy rounds + a +1/round base climb — a third of a short
+        // generation). Demotion stays instant (EMA decay + sticky disable are
+        // per-request), so a workload change costs a few rounds, not the win.
+        if (self.mtp_ev_rounds == 0 and self.mtp_attempted == 0 and
+            mtpAdaptiveEnabled() and mtpEvSeedEnabled())
+        {
+            if (head.ev_seed_accept) |seed| {
+                self.mtp_ev_accept = seed;
+                self.mtp_ev_m_lo_prev = @min(@max(head.ev_seed_m_lo, 1), mtp_mod.MAX_DEPTH);
+                self.mtp_ev_rounds = MTP_EV_WARMUP_ROUNDS;
+            }
+        }
         // Round plan: fixed mode (and EV warmup) is today's single chunk at
         // the windowed adaptive depth; post-warmup EV mode plans a base chunk
         // m_lo plus a confidence-gated extension to m_hi (see the EV
@@ -2505,7 +2569,10 @@ pub const Generator = struct {
         // forces every draft append's slice_update to copy-on-write the WHOLE
         // history buffer (~268 MB/append at 64k). Rollback is truncate —
         // offset-only — since draft entries only ever append past mtp_off0.
-        const mtp_off0: usize = mc.step;
+        // With a pending history stash the cache still holds the PREVIOUS
+        // round's draft tail (mc.step is stale until the consume-time
+        // truncate), so the committed origin comes from the stash.
+        const mtp_off0: usize = mtpRoundOff0(self.mtp_hist_stash, mc.step);
 
         // ── Phase 1: draft m tokens lazily, no per-step CPU sync ──
         // Each step's sampled token ([1] lazy array) feeds the next step's
@@ -2553,7 +2620,39 @@ pub const Generator = struct {
             var i: u32 = 0;
             while (i < m) : (i += 1) {
                 const h_prev_arg: mlx.mlx_array = if (h_prev_owner) |h| h else self.last_hidden;
-                const step_out = try mtp_mod.stepArr(head, xfm, mc, prev_tok_arr, h_prev_arg, @intCast(mtp_off0 + i));
+                const step_out = if (i == 0 and self.mtp_hist_stash != null) blk: {
+                    // Deferred history append (stashed at the END of the
+                    // previous round, Phase 5a) merged into this round's
+                    // first draft: ONE (n+1)-row head forward appends the
+                    // committed-history entries AND the first draft entry,
+                    // replacing the old per-round appendHistory forward.
+                    // RoPE offsets and cache-append order are byte-identical
+                    // to the appendHistory-then-stepArr sequence (pinned by
+                    // the merged-forward equivalence test in mtp.zig).
+                    var st = self.mtp_hist_stash.?;
+                    self.mtp_hist_stash = null;
+                    defer st.deinit();
+                    // Drop the previous round's stale draft tail — the old
+                    // Phase 5a truncate, moved to consume time (offset-only).
+                    try mc.truncate(st.off0, s);
+                    var merged_ids = mlx.mlx_array_new();
+                    defer _ = mlx.mlx_array_free(merged_ids);
+                    var merged_hidden = mlx.mlx_array_new();
+                    defer _ = mlx.mlx_array_free(merged_hidden);
+                    {
+                        const idv = mlx.mlx_vector_array_new();
+                        defer _ = mlx.mlx_vector_array_free(idv);
+                        _ = mlx.mlx_vector_array_append_value(idv, st.ids);
+                        _ = mlx.mlx_vector_array_append_value(idv, prev_tok_arr);
+                        try mlx.check(mlx.mlx_concatenate_axis(&merged_ids, idv, 0, s));
+                        const hv = mlx.mlx_vector_array_new();
+                        defer _ = mlx.mlx_vector_array_free(hv);
+                        _ = mlx.mlx_vector_array_append_value(hv, st.hidden);
+                        _ = mlx.mlx_vector_array_append_value(hv, h_prev_arg);
+                        try mlx.check(mlx.mlx_concatenate_axis(&merged_hidden, hv, 1, s));
+                    }
+                    break :blk try mtp_mod.forward(head, xfm, mc, merged_ids, merged_hidden, @intCast(st.off0), true);
+                } else try mtp_mod.stepArr(head, xfm, mc, prev_tok_arr, h_prev_arg, @intCast(mtp_off0 + i));
                 draft_arrs[i] = sampleTokenLazy(step_out.logits, draft_sampling, s);
                 n_drafted = i + 1;
                 if (conf_arrs != null and i < m_lo) {
@@ -2852,22 +2951,30 @@ pub const Generator = struct {
         }
         log.debug("  [mtp-round] off0={d} t1={d} m={d}/{d} drafts={any} accepted={d}\n", .{ mtp_off0, t1, m, m_max, drafts[0..m], accepted });
 
-        // ── Phase 5a: rebuild the MTP committed history from true hiddens ──
-        // Truncate to the round boundary (offset-only — the draft entries all
-        // live past mtp_off0), then append (h_prev, t1) followed by
-        // (verify_hidden[i], drafts[i]) for each committed draft. Uses the
-        // ORIGINAL verify hiddens — identical values to what a repair forward
-        // recomputes, so partial accepts don't need a second capture.
-        try mc.truncate(mtp_off0, s);
+        // ── Phase 5a: stash the committed history for a DEFERRED append ──
+        // The old shape paid a second head forward (appendHistory) here every
+        // round to rebuild history from true verify hiddens — then the next
+        // round's first draft re-entered the head anyway. Instead, stash the
+        // (tokens, hiddens) pair — tokens as [t1, drafts[0..accepted]], the
+        // hiddens the SAME concat of h_prev + ORIGINAL verify hiddens the old
+        // appendHistory received — and fold the append into that first draft
+        // step (the i==0 merged branch above). The head cache keeps this
+        // round's draft tail past mtp_off0 until the consume-time truncate;
+        // nothing reads it in between. Rounds with no successor (EOS/length/
+        // runtime disable) never pay for the append; deinit frees the stash.
         {
+            std.debug.assert(self.mtp_hist_stash == null);
             const n_commit: usize = accepted;
-            const hist_tokens = try allocator.alloc(u32, 1 + n_commit);
-            defer allocator.free(hist_tokens);
-            hist_tokens[0] = t1;
-            for (drafts[0..n_commit], 0..) |d, idx| hist_tokens[1 + idx] = d;
+            const ids_i32 = try allocator.alloc(i32, 1 + n_commit);
+            defer allocator.free(ids_i32);
+            ids_i32[0] = @intCast(t1);
+            for (drafts[0..n_commit], 0..) |d, idx| ids_i32[1 + idx] = @intCast(d);
+            const id_shape = [_]c_int{@intCast(1 + n_commit)};
+            const stash_ids = mlx.mlx_array_new_data(ids_i32.ptr, &id_shape, 1, .int32);
+            errdefer _ = mlx.mlx_array_free(stash_ids);
 
             var hist_hidden = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(hist_hidden);
+            errdefer _ = mlx.mlx_array_free(hist_hidden);
             if (n_commit == 0) {
                 try mlx.check(mlx.mlx_array_set(&hist_hidden, self.last_hidden));
             } else {
@@ -2884,7 +2991,12 @@ pub const Generator = struct {
                 _ = mlx.mlx_vector_array_append_value(vec, vh_slice);
                 try mlx.check(mlx.mlx_concatenate_axis(&hist_hidden, vec, 1, s));
             }
-            try mtp_mod.appendHistory(head, xfm, mc, hist_tokens, hist_hidden, @intCast(mtp_off0));
+            self.mtp_hist_stash = .{
+                .ids = stash_ids,
+                .hidden = hist_hidden,
+                .n = 1 + n_commit,
+                .off0 = mtp_off0,
+            };
         }
         if (tracing) {
             self.mtp_trace.add(.hist, ph.read());
@@ -3123,10 +3235,12 @@ pub const Generator = struct {
     // fixed-depth controller above).
 
     /// Default depth cap when `--mtp-depth` is not passed (0 = auto) and the
-    /// EV controller is active. 7 keeps the verify forward at seq 1+7 = 8,
-    /// the sdpa_vector fast-path ceiling for head_dim-256 targets — seq 9
-    /// would fall to the composed prefill path mid-decode.
-    pub const MTP_ADAPTIVE_DEFAULT_CAP: u32 = 7;
+    /// EV controller is active. 6 keeps the verify forward at seq 1+6 = 7,
+    /// the split-K verify-qmm kernel's ceiling (M=8 hits a spill/occupancy
+    /// cliff, and on the kernel's cost surface depth 6 strictly dominates
+    /// depth 7-on-stock: max 7 tokens at ~84 ms beats max 8 at ~115 ms).
+    /// Seq 7 also stays under sdpa_vector's hd-256 ceiling (seq <= 8).
+    pub const MTP_ADAPTIVE_DEFAULT_CAP: u32 = 6;
     /// Rounds of legacy (fixed-depth windowed) behavior while the EMAs fill.
     /// Warmup, but converges in ROUNDS, not 43 s of offline calibration.
     pub const MTP_EV_WARMUP_ROUNDS: u32 = 10;
@@ -3149,14 +3263,20 @@ pub const Generator = struct {
     pub const MTP_EV_TAU_MAX: f32 = 0.95;
 
     /// Round-cost model in units of the fixed round cost (verify-forward
-    /// floor + round eval/read + history + commit ≈ 1.0 ≈ 42 ms on the 27B).
-    /// Ratios are machine-stable where absolute ms are not. Measured via
-    /// MLX_SERVE_MTP_TRACE on Qwen3.6-27B GDN (M4 Max, 2026-07-13, saturated
-    /// fixed depths): T(1)=48, T(3)=66, T(6)=115 ms — the surface is
-    /// PIECEWISE: ~8 ms marginal per position while the verify width sits in
-    /// the flat region (seq <= ~4; qmv-class kernels), then ~16.5 ms/pos
-    /// beyond it (the GDN recurrence kernel is sequential over T, the same
-    /// ladder the tiny-prefill probe shows: fwd(4)=43 -> fwd(8)=87 ms).
+    /// floor + round eval/read + commit ≈ 1.0 ≈ 32 ms on the 27B since the
+    /// deferred history append). Ratios are machine-stable where absolute ms
+    /// are not. Refit via MLX_SERVE_MTP_TRACE on Qwen3.6-27B GDN (M4 Max,
+    /// 2026-07-13, saturated fixed depths, same-session sweep AFTER the
+    /// deferred-append round shape landed): T(1)=42.0, T(3)=62.6,
+    /// T(6)=111.6, T(7)=114.9 ms — the surface is PIECEWISE: ~10.3 ms
+    /// marginal per position in the flat verify region (seq <= 4), ~16.3
+    /// ms/pos for positions 4-6, and position 7 nearly free (+3.3 ms —
+    /// verify seq 8 rides the same row tile as 5-7), averaged into
+    /// per_pos_hi. ATTRIBUTION (the GDN-vs-qmm µbench in transformer.zig,
+    /// MLX_SERVE_GDN_UBENCH=1): the ladder is ~90% qmm ROW-COUNT cost — the
+    /// GDN recurrence kernel is nearly flat over verify widths (0.13→0.26 ms
+    /// per dispatch, T 2→64) and contributes <1 ms/round; the earlier
+    /// "GDN sequential width ramp" reading was a mis-attribution.
     /// The old linear ~1.5 ms/pos model came from a depth-6 run whose
     /// windowed controller was silently demoting underneath — never fit
     /// costs from a run whose realized m_avg you didn't check.
@@ -3165,11 +3285,17 @@ pub const Generator = struct {
     pub const MtpEvCosts = struct {
         draft: f32, // one sequential MTP-head step (fwd + draft lm_head)
         per_pos_lo: f32, // marginal verify+capture per position, flat region
-        per_pos_hi: f32, // ... beyond flat_max (GDN sequential width ramp)
+        per_pos_hi: f32, // ... beyond flat_max (qmm row-tile ramp)
         flat_max: u32, // last draft index in the flat verify region
         sync: f32, // the chunk-A confidence read-back
     };
-    pub const MTP_EV_DEFAULT_COSTS: MtpEvCosts = .{ .draft = 0.10, .per_pos_lo = 0.09, .per_pos_hi = 0.22, .flat_max = 3, .sync = 0.02 };
+    /// 2026-07-13 refit #2, AFTER the split-K verify-qmm kernel landed
+    /// (transformer.verifyQmm): same-session saturated sweep T(1)=44.6,
+    /// T(3)=54.4, T(6)=89.9 ms → floor ≈ 40 ms, flat marginal 4.9 ms/pos
+    /// (the kernel holds verify qmms near the weight-stream floor through
+    /// M=7), ramp 11.8 ms/pos (stock lm_head at growing M + attention +
+    /// eval/read).
+    pub const MTP_EV_DEFAULT_COSTS: MtpEvCosts = .{ .draft = 0.06, .per_pos_lo = 0.06, .per_pos_hi = 0.24, .flat_max = 3, .sync = 0.02 };
 
     /// Marginal round cost of draft position k (1-based).
     pub fn mtpEvMarginalCost(costs: MtpEvCosts, k: u32) f32 {
@@ -3347,6 +3473,20 @@ pub const Generator = struct {
             if (val.len > 0 and val[0] == '0') on = false;
         }
         mtp_adaptive_cache = on;
+        return on;
+    }
+
+    /// Cross-request EV seeding gate — MLX_SERVE_MTP_EV_SEED=0 disables
+    /// (same-boot A/B lever; default ON).
+    var mtp_ev_seed_cache: ?bool = null;
+    fn mtpEvSeedEnabled() bool {
+        if (mtp_ev_seed_cache) |v| return v;
+        var on = true;
+        if (std.c.getenv("MLX_SERVE_MTP_EV_SEED")) |p| {
+            const val = std.mem.span(p);
+            if (val.len > 0 and val[0] == '0') on = false;
+        }
+        mtp_ev_seed_cache = on;
         return on;
     }
 
@@ -5989,12 +6129,51 @@ test "mtpEvPlanFor: unobserved deep indices at the prior still open the extensio
     try testing.expectApproxEqAbs(@as(f32, -0.1168), plan.tau_ln, 5e-3);
 }
 
+test "mtpEvPlanFor: DEFAULT costs carry the post-verify-qmm surface (2026-07-13 refit #2)" {
+    // Pins MTP_EV_DEFAULT_COSTS to the surface measured AFTER the split-K
+    // verify-qmm kernel (same-session saturated sweep, Youssofal 27B,
+    // M4 Max: T(1)=44.6, T(3)=54.4, T(6)=89.9 ms → floor ≈ 40 ms,
+    // draft+lo = 0.12, draft+hi = 0.30). Flat-region positions are now
+    // nearly free, so the base holds 3 deep into marginal acceptance where
+    // the pre-kernel surface demoted to 2.
+    const costs = Generator.MTP_EV_DEFAULT_COSTS;
+    // Hot uniform 90%: base rides the flat region, extension into the ramp.
+    const hot = [_]f32{ 0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9 };
+    const hot_plan = Generator.mtpEvPlanFor(&hot, 8, costs, 8);
+    try testing.expectEqual(@as(u32, 3), hot_plan.m_lo);
+    try testing.expectEqual(@as(u32, 5), hot_plan.m_hi);
+    try testing.expectApproxEqAbs(@as(f32, -0.1196), hot_plan.tau_ln, 5e-3);
+    // Marginal 75%: base stays 3 on the cheap flat region, short extension.
+    const mid = [_]f32{ 0.75, 0.75, 0.75, 0.75, 0.75, 0.75, 0.75, 0.75 };
+    const mid_plan = Generator.mtpEvPlanFor(&mid, 8, costs, 8);
+    try testing.expectEqual(@as(u32, 3), mid_plan.m_lo);
+    try testing.expectEqual(@as(u32, 4), mid_plan.m_hi);
+    try testing.expectApproxEqAbs(@as(f32, -0.2179), mid_plan.tau_ln, 5e-3);
+}
+
 test "mtpEvPlanFor: cap 1 is a plain depth-1 round" {
     const costs = Generator.MTP_EV_DEFAULT_COSTS;
     const a = [_]f32{ 0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9 };
     const plan = Generator.mtpEvPlanFor(&a, 1, costs, 8);
     try testing.expectEqual(@as(u32, 1), plan.m_lo);
     try testing.expectEqual(@as(u32, 1), plan.m_hi);
+}
+
+test "mtpRoundOff0: a pending history stash overrides the stale cache length" {
+    // No stash: the head cache is fully committed — its step IS the origin.
+    try testing.expectEqual(@as(usize, 42), Generator.mtpRoundOff0(null, 42));
+    // Pending stash: the cache still carries the previous round's draft tail
+    // (step is stale/uncommitted), so the origin is where the stash's entries
+    // will END once the consume-time truncate + merged forward run. A round
+    // that read mc.step here would draft at the WRONG RoPE offsets.
+    const st = Generator.MtpHistStash{
+        .ids = .{ .ctx = null },
+        .hidden = .{ .ctx = null },
+        .n = 3, // t1 + 2 accepted drafts
+        .off0 = 40,
+    };
+    // cache_step (46 = 40 committed + 6 stale draft entries) must be ignored.
+    try testing.expectEqual(@as(usize, 43), Generator.mtpRoundOff0(st, 46));
 }
 
 test "mtpEvObserve: conditional EMA updates hit accepted indices, the reject index, and nothing past it" {

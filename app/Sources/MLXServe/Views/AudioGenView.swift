@@ -436,7 +436,7 @@ struct VoiceGenView: View {
         panel.canChooseFiles = true
         panel.canChooseDirectories = false
         panel.allowsMultipleSelection = false
-        guard panel.runModal() == .OK, let url = panel.url else { return }
+        guard AppActivation.runModal(panel) == .OK, let url = panel.url else { return }
         do {
             refAudioURL = try AudioReference.normalizedReferenceWav(fromFile: url)
         } catch {
