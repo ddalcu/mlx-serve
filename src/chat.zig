@@ -994,18 +994,24 @@ pub fn stripThinkBlock(text: []const u8) []const u8 {
     return trimTrailingThinkClosers(trimmed);
 }
 
-/// Trim trailing think/channel CLOSE markers (and surrounding whitespace) from
-/// visible content. A close marker is never valid at the tail of content — but a
-/// degenerate model can spam them (live: a Gemma variant emitted 16 bare
+/// Trim trailing think/channel/tool CLOSE markers (and surrounding whitespace)
+/// from visible content. A close marker is never valid at the tail of content —
+/// but a degenerate model can spam them (live: a Gemma variant emitted 16 bare
 /// `<channel|>` after its answer; the leading strip cuts the FIRST close, the
-/// trailing-OPEN strip ignores closes, so they leaked). Loops so a run of closers
-/// is fully removed. Returns a prefix slice (no allocation).
+/// trailing-OPEN strip ignores closes, so they leaked). The Gemma tool CLOSE
+/// `<tool_call|>` is here too: a degenerate 1-token bare close with no
+/// `<|tool_call>` opener leaked as the entire content (live 2026-07-16 soak,
+/// gemma-4-26B). parseToolCalls runs BEFORE this strip and extracts any real
+/// call, so any residual `<tool_call|>` reaching here is orphan by construction.
+/// Loops so a run of closers is fully removed. Returns a prefix slice (no alloc).
 fn trimTrailingThinkClosers(content: []const u8) []const u8 {
     var s = content;
     while (true) {
         const t = std.mem.trimEnd(u8, s, "\n \t\r");
         if (std.mem.endsWith(u8, t, "<channel|>")) {
             s = t[0 .. t.len - "<channel|>".len];
+        } else if (std.mem.endsWith(u8, t, "<tool_call|>")) {
+            s = t[0 .. t.len - "<tool_call|>".len];
         } else if (endsWithThinkCloseTag(t)) |l| {
             s = t[0 .. t.len - l];
         } else {
@@ -2764,17 +2770,42 @@ fn parseHy3ToolCalls(allocator: std.mem.Allocator, text: []const u8, calls: *std
     var pos: usize = 0;
     while (std.mem.indexOfPos(u8, text, pos, "<tool_call")) |p| {
         const after_base = p + "<tool_call".len;
-        // Suffixed form only: `<tool_call:sfx>`. Bare `<tool_call>` (Hermes)
-        // and the plural wrapper `<tool_calls:sfx>` fall through.
-        if (after_base >= text.len or text[after_base] != ':') {
+        var name_start: usize = undefined;
+        if (after_base < text.len and text[after_base] == ':') {
+            // Canonical singular per-call opener `<tool_call:sfx>`.
+            const open_len = suffixedTagLenAt(text[p..], "<tool_call") orelse {
+                pos = after_base;
+                continue;
+            };
+            name_start = p + open_len;
+        } else if (std.mem.startsWith(u8, text[p..], "<tool_calls:")) {
+            // Suffixed plural WRAPPER `<tool_calls:sfx>` (hy3 only — the BARE
+            // DSV4/generic `<tool_calls>` wrapper is a different format and must
+            // fall through to its own parser). Normally an inner singular
+            // `<tool_call:sfx>` opener follows — defer to it (the next loop
+            // iteration parses that). A weak model (Hy3-REAP62, live 2026-07-16
+            // raw capture) DROPS the singular opener and jumps straight to the
+            // NAME, leaking the whole (otherwise well-formed) call; recover by
+            // treating the wrapper's end as the opener. Same weak-model
+            // delimiter-drop class as the <tool_sep> drop below, one delimiter over.
+            const wrap_len = suffixedTagLenAt(text[p..], "<tool_calls") orelse {
+                pos = after_base;
+                continue;
+            };
+            var probe = p + wrap_len;
+            while (probe < text.len and std.ascii.isWhitespace(text[probe])) probe += 1;
+            const inner_singular = std.mem.startsWith(u8, text[probe..], "<tool_call") and
+                probe + "<tool_call".len < text.len and text[probe + "<tool_call".len] == ':';
+            if (inner_singular) {
+                pos = p + wrap_len;
+                continue;
+            }
+            name_start = p + wrap_len;
+        } else {
+            // Bare `<tool_call>` (Hermes) — not this format; fall through.
             pos = after_base;
             continue;
         }
-        const open_len = suffixedTagLenAt(text[p..], "<tool_call") orelse {
-            pos = after_base;
-            continue;
-        };
-        const name_start = p + open_len;
 
         // NAME runs to the first structural marker after the opener. Canonically
         // that's <tool_sep:sfx>; a mangled call (weak model dropped <tool_sep> —
@@ -8025,6 +8056,21 @@ test "stripThinkBlock removes trailing </think> close spam too" {
     try testing.expect(std.mem.indexOf(u8, content, "The answer.") != null);
 }
 
+test "stripThinkBlock removes orphan Gemma <tool_call|> close from content (no-tag-leak)" {
+    // Live 2026-07-16 soak (gemma-4-26B-A4B-it-qat-4bit, tools present, a "no
+    // tools needed" probe at temp 0.7): the model degenerated into a bare
+    // 1-token <tool_call|> CLOSE with NO <|tool_call> opener, so parseToolCalls
+    // found no call and the orphan control token leaked as the ENTIRE visible
+    // content (server response content == "<tool_call|>"). A tool CLOSE marker is
+    // never valid at the tail of content — same class as the <channel|> spam.
+    // parseToolCalls already extracted any real call before this strip runs, so
+    // any residual <tool_call|> here is orphan by construction.
+    try testing.expectEqualStrings("", stripThinkBlock("<tool_call|>"));
+    try testing.expectEqualStrings("Sure.", stripThinkBlock("Sure.<tool_call|>"));
+    // Legit prose (no control token) is untouched.
+    try testing.expectEqualStrings("2 + 2 = 4", stripThinkBlock("2 + 2 = 4"));
+}
+
 test "splitThinkBlock content never keeps trailing channel close spam" {
     const text = "<|channel>thought\nplan<channel|>\n<|channel>\nThe answer.<channel|><channel|><channel|>";
     const split = splitThinkBlock(text, true, false);
@@ -8195,6 +8241,41 @@ test "parseToolCalls hy3: dropped <tool_sep> + mangled key-close still recovers 
     const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, calls[0].arguments, .{});
     defer parsed.deinit();
     try testing.expectEqualStrings("ls -la", parsed.value.object.get("command").?.string);
+}
+
+test "parseToolCalls hy3: dropped singular <tool_call> opener (plural wrapper only) still recovers" {
+    // Live 2026-07-16 RAW capture (pipenetwork/Hy3-REAP62 via the running server,
+    // MLX_SERVE_RAW_DUMP_FILE): the pruned model emitted the PLURAL wrapper
+    // <tool_calls:opensource> and jumped STRAIGHT to the NAME, dropping the
+    // singular per-call <tool_call:opensource> opener the parser keys on — so the
+    // whole (well-structured, complete) call LEAKED as content (finish_reason
+    // stop). Same weak-model delimiter-drop class as the <tool_sep> drop above,
+    // one delimiter over. The call is otherwise regular (name/key closed with
+    // </arg_value>), so recover the FULL call incl. the quote-bearing content.
+    const raw = "<tool_calls:opensource>\n" ++
+        "write_file</arg_value:opensource>\n" ++
+        "<arg_key:opensource>path</arg_value:opensource>\n" ++
+        "<arg_value:opensource>page.html</arg_value:opensource>\n" ++
+        "<arg_key:opensource>content</arg_value:opensource>\n" ++
+        "<arg_value:opensource><meta charset=\"UTF-8\"><a href=\"/x\">L</a><div class=\"hero\">Hi</div></arg_value:opensource>\n" ++
+        "</tool_call:opensource>\n</tool_calls:opensource>";
+    const calls = (try parseToolCalls(testing.allocator, raw)).?;
+    defer {
+        for (calls) |tc| {
+            testing.allocator.free(tc.name);
+            testing.allocator.free(tc.arguments);
+        }
+        testing.allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("write_file", calls[0].name);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("page.html", parsed.value.object.get("path").?.string);
+    try testing.expectEqualStrings(
+        "<meta charset=\"UTF-8\"><a href=\"/x\">L</a><div class=\"hero\">Hi</div>",
+        parsed.value.object.get("content").?.string,
+    );
 }
 
 test "parseToolCalls hy3: suffixed think close before the wrapper still parses" {

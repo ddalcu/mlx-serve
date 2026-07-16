@@ -213,6 +213,17 @@ const corpus = [_]Expect{
         .content_exact = "The answer is 42.",
     },
     .{
+        // Live 2026-07-16 soak: gemma-4-26B degenerated into a bare 1-token
+        // <tool_call|> CLOSE with NO <|tool_call> opener (a "no tools needed"
+        // probe with tools present, temp 0.7). parseToolCalls found no call, so
+        // the orphan control token used to leak as the WHOLE content. A tool
+        // CLOSE is never valid at the tail of content (universal no-tag-leak).
+        .family = "gemma4",
+        .name = "orphan <tool_call|> close never leaks into content",
+        .raw = "<tool_call|>",
+        .content_exact = "",
+    },
+    .{
         // BUG 4 (2026-06-10 pi session, verbatim capture): the LAST string
         // value lost its closing <|"|> delimiter and carried a stray markdown
         // backtick. The unterminated-string scan used to run to end of body,
@@ -867,6 +878,28 @@ const corpus = [_]Expect{
         .tool_arg_value = "Tokyo",
         .tool_bool_key = "celsius",
         .tool_bool_value = true,
+    },
+    .{
+        // LIVE capture 2026-07-16 (pipenetwork/Hy3-REAP62 via MLX_SERVE_RAW_DUMP_FILE,
+        // the soak): the pruned model emitted the PLURAL wrapper
+        // <tool_calls:opensource> and jumped STRAIGHT to the NAME, dropping the
+        // singular per-call <tool_call:opensource> opener the parser keys on — so
+        // the whole (well-formed, complete) call LEAKED as content. Same
+        // weak-model delimiter-drop class as the dropped-<tool_sep> entry, one
+        // delimiter over. Recover the full call incl. the quote-bearing content
+        // (the universal no-tag-leak + valid-JSON-args invariants cover it).
+        .family = "hy3",
+        .name = "LIVE: dropped singular <tool_call> opener (plural wrapper only) still recovers",
+        .raw = "<tool_calls:opensource>\n" ++
+            "write_file</arg_value:opensource>\n" ++
+            "<arg_key:opensource>path</arg_value:opensource>\n" ++
+            "<arg_value:opensource>page.html</arg_value:opensource>\n" ++
+            "<arg_key:opensource>content</arg_value:opensource>\n" ++
+            "<arg_value:opensource><meta charset=\"UTF-8\"><a href=\"/x\">L</a><div class=\"hero\">Hi</div></arg_value:opensource>\n" ++
+            "</tool_call:opensource>\n</tool_calls:opensource>",
+        .tool_name = "write_file",
+        .tool_arg_key = "path",
+        .tool_arg_value = "page.html",
     },
 };
 

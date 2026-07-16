@@ -448,7 +448,7 @@
     }
 
     /* ─── EXPLORE: deep-dive launcher ─── */
-    .explore { padding: 30px 24px 14px; }
+    .explore { padding: 96px 24px 44px; }
     .explore-header { text-align: center; max-width: 640px; margin: 0 auto 28px; }
     .explore-title { font-size: clamp(24px, 3.2vw, 34px); font-weight: 700; letter-spacing: -0.025em; line-height: 1.1; }
     .explore-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px; max-width: 1060px; margin: 0 auto; }
@@ -1013,6 +1013,102 @@
     .faq-item p a { color: var(--blue); text-decoration: none; }
     .faq-item p a:hover { text-decoration: underline; }
 
+    /* ─── CONSUMER SECTIONS (shared design language with onboarding/ + deep-dive pages) ─── */
+    :root { --accent: var(--blue); --accent2: var(--green); --accent-soft: var(--blue-subtle); }
+
+    .split { display: grid; grid-template-columns: 1.02fr 0.98fr; gap: 56px; align-items: center; max-width: 1000px; margin: 0 auto; }
+    .split + .split { margin-top: 84px; }
+    .split.flip .split-copy { order: 2; }
+    .split.flip .split-visual { order: 1; }
+    .split-copy, .split-visual { min-width: 0; }
+    .split-kicker {
+      display: inline-block; font-family: var(--mono); font-size: 11px; font-weight: 600;
+      letter-spacing: 0.05em; text-transform: uppercase;
+      color: var(--accent); background: var(--accent-soft);
+      padding: 4px 10px; border-radius: 6px; margin-bottom: 14px;
+    }
+    .split h3 { font-size: clamp(22px, 2.8vw, 28px); font-weight: 700; letter-spacing: -0.02em; line-height: 1.15; margin-bottom: 12px; }
+    .split p { font-size: 15px; color: var(--text-secondary); line-height: 1.62; margin-bottom: 12px; }
+    .split p b { color: var(--text-primary); font-weight: 600; }
+
+    .ticks { list-style: none; display: flex; flex-direction: column; gap: 10px; margin-top: 16px; }
+    .ticks li { display: flex; align-items: flex-start; gap: 10px; font-size: 14px; color: var(--text-secondary); line-height: 1.55; }
+    .ticks li b { color: var(--text-primary); font-weight: 600; }
+    .ticks svg { width: 17px; height: 17px; flex-shrink: 0; margin-top: 2px; stroke: var(--accent); }
+
+    .mini-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 18px; max-width: 1000px; margin: 0 auto; }
+    .mini-card {
+      display: block; padding: 26px 24px; background: var(--white); border-radius: var(--radius);
+      box-shadow: var(--shadow-card); transition: transform 0.25s ease, box-shadow 0.25s ease;
+      text-decoration: none; color: inherit;
+    }
+    .mini-card:hover { transform: translateY(-3px); box-shadow: var(--shadow-elevated); }
+    .mini-k {
+      display: inline-block; font-family: var(--mono); font-size: 10.5px; font-weight: 700;
+      letter-spacing: 0.05em; text-transform: uppercase;
+      color: var(--accent); background: var(--accent-soft);
+      padding: 3px 8px; border-radius: 5px; margin-bottom: 13px;
+    }
+    .mini-head { display: flex; align-items: center; gap: 10px; margin-bottom: 13px; }
+    .mini-head .mini-k { margin-bottom: 0; }
+    .mini-icon {
+      width: 34px; height: 34px; border-radius: 9px; flex-shrink: 0;
+      display: flex; align-items: center; justify-content: center;
+    }
+    .mini-icon svg { width: 17px; height: 17px; }
+    .mini-card h4 { font-size: 16px; font-weight: 600; letter-spacing: -0.01em; margin-bottom: 7px; }
+    .mini-card p { font-size: 13.5px; color: var(--text-secondary); line-height: 1.55; }
+    .mini-card p b { color: var(--text-primary); font-weight: 600; }
+
+    .stat-band { display: flex; justify-content: center; gap: 52px; flex-wrap: wrap; max-width: 900px; margin: 0 auto; }
+    .stat { display: flex; flex-direction: column; align-items: center; }
+    .stat .n {
+      font-family: var(--mono); font-size: clamp(32px, 4.8vw, 46px); font-weight: 700;
+      letter-spacing: -0.03em; line-height: 1; font-variant-numeric: tabular-nums;
+      background: linear-gradient(135deg, var(--accent), var(--accent2));
+      -webkit-background-clip: text; -webkit-text-fill-color: transparent; background-clip: text;
+    }
+    .stat .l { font-size: 13px; color: var(--text-tertiary); margin-top: 9px; text-align: center; max-width: 170px; line-height: 1.4; }
+
+    .shot { max-width: 920px; margin: 0 auto; }
+    .split .shot, .split-visual .shot { max-width: none; }
+    .shot-frame {
+      border-radius: 14px; overflow: hidden;
+      box-shadow: var(--shadow-elevated), 0 20px 70px rgba(0, 0, 0, 0.12);
+      background: linear-gradient(160deg, var(--bg-alt), #fff);
+    }
+    .shot-frame img { width: 100%; display: block; }
+    .shot figcaption { margin-top: 13px; text-align: center; font-size: 13px; color: var(--text-tertiary); line-height: 1.5; }
+    .shot.missing .shot-frame {
+      aspect-ratio: 16 / 10; display: flex; align-items: center; justify-content: center;
+      border: 1.5px dashed color-mix(in srgb, var(--accent) 32%, transparent); box-shadow: none;
+      background: radial-gradient(circle at 30% 20%, var(--accent-soft), transparent 60%), linear-gradient(160deg, var(--bg-alt), #fff);
+    }
+    .shot.missing .shot-frame img { display: none; }
+    .shot-row { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; max-width: 1000px; margin: 0 auto; align-items: start; }
+    .shot-row .shot { max-width: none; }
+
+    .phone-shots { display: flex; gap: 18px; justify-content: center; align-items: flex-start; }
+    .phone-shot { margin: 0; }
+    .phone-shot img {
+      height: clamp(300px, 26vw, 440px); width: auto; display: block;
+      border-radius: 22px; border: 1px solid var(--border);
+      box-shadow: var(--shadow-elevated), 0 20px 70px rgba(0, 0, 0, 0.12);
+    }
+
+    .btn-appstore { background: var(--ink); color: var(--white); }
+    .btn-appstore:hover { transform: scale(1.02); }
+    .btn-appstore svg { width: 19px; height: 19px; fill: currentColor; }
+
+    .kbd {
+      font-family: var(--mono); font-size: 0.82em; font-weight: 600;
+      background: var(--bg-alt); border: 1px solid var(--border);
+      border-bottom-width: 2px; border-radius: 6px; padding: 2px 7px;
+      color: var(--text-primary); white-space: nowrap;
+    }
+    .prose-link { color: var(--accent); text-decoration: none; }
+    .prose-link:hover { text-decoration: underline; }
+
     /* ─── FOOTER ─── */
     footer { padding: 44px 24px; text-align: center; border-top: 0.5px solid var(--border); }
 
@@ -1038,6 +1134,12 @@
     @media (max-width: 860px) {
       .deepseek-grid { grid-template-columns: 1fr; gap: 40px; }
       .spec-grid { grid-template-columns: 1fr; }
+      .split { grid-template-columns: 1fr; gap: 32px; }
+      .split.flip .split-copy { order: 1; }
+      .split.flip .split-visual { order: 2; }
+      .split + .split { margin-top: 64px; }
+      .shot-row { grid-template-columns: 1fr; }
+      .stat-band { gap: 28px 38px; }
     }
 
     @media (max-width: 768px) {
@@ -1095,8 +1197,8 @@
       Frontier-class coding on a 32 GB Mac · the fastest Qwen on Apple Silicon · up to 2.3× faster than LM Studio
       <span class="arrow">→</span>
     </a>
-    <h1>Run any LLM<br>on your <span class="grad">Mac</span></h1>
-    <p class="hero-sub">Your own private AI — chat, coding agents, images, video, music, 3D models, and voice — <strong>running entirely on your&nbsp;Mac</strong>. Free and open source, faster than LM Studio, and your data never leaves the machine.</p>
+    <h1>A private AI that<br>lives on your <span class="grad">Mac</span></h1>
+    <p class="hero-sub">Chat with it, ask it about your own documents, make images, music, video and 3D, and let it run errands on your computer — <strong>free, open source, and fully offline</strong>. It runs every major open model, faster than LM&nbsp;Studio, and nothing you type ever leaves the machine.</p>
     <div class="hero-ctas">
       <a href="https://github.com/ddalcu/mlx-serve/releases/latest/download/MLXCore.dmg" class="btn btn-primary">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
@@ -1111,6 +1213,257 @@
       <div class="hero-meta-item"><strong>M1 – M5</strong></div>
       <div class="hero-meta-item"><strong>Free &amp; open source</strong></div>
       <a href="https://github.com/ddalcu/mlx-serve/stargazers" class="hero-meta-item" style="text-decoration:none;color:var(--text-tertiary);" target="_blank" rel="noopener">★ <strong>Star on GitHub</strong></a>
+    </div>
+  </section>
+
+  <!-- SCREENSHOT -->
+  <section class="screenshot-section">
+    <div class="screenshot-wrap">
+      <img src="demo-diffusion.gif" alt="MLX Core app — DiffusionGemma block diffusion running live in the chat interface" loading="lazy">
+    </div>
+  </section>
+
+  <!-- MARQUEE -->
+  <div class="marquee" aria-hidden="true">
+    <div class="marquee-track">
+      <span class="marquee-item">Any Open Model</span><span class="marquee-item">Text-to-Music</span><span class="marquee-item">Photo → 3D</span><span class="marquee-item">Ollama Compatible</span><span class="marquee-item">Photo Editing</span><span class="marquee-item">Image-to-Video</span><span class="marquee-item">Talking Characters</span><span class="marquee-item">Style LoRAs</span><span class="marquee-item">Agent Sandbox</span><span class="marquee-item">⌃Space Launcher</span><span class="marquee-item">Krea-2 Image Gen</span><span class="marquee-item">Voice Cloning</span><span class="marquee-item">DiffusionGemma</span><span class="marquee-item">DeepSeek V4 Flash</span><span class="marquee-item">Gemma 4</span><span class="marquee-item">Qwen 3.6</span><span class="marquee-item">Llama 3</span><span class="marquee-item">Private by Design</span><span class="marquee-item">Document RAG</span><span class="marquee-item">Live Metrics</span><span class="marquee-item">OpenAI API</span><span class="marquee-item">Anthropic API</span><span class="marquee-item">Claude Code</span><span class="marquee-item">MCP</span>
+      <span class="marquee-item">Any Open Model</span><span class="marquee-item">Text-to-Music</span><span class="marquee-item">Photo → 3D</span><span class="marquee-item">Ollama Compatible</span><span class="marquee-item">Photo Editing</span><span class="marquee-item">Image-to-Video</span><span class="marquee-item">Talking Characters</span><span class="marquee-item">Style LoRAs</span><span class="marquee-item">Agent Sandbox</span><span class="marquee-item">⌃Space Launcher</span><span class="marquee-item">Krea-2 Image Gen</span><span class="marquee-item">Voice Cloning</span><span class="marquee-item">DiffusionGemma</span><span class="marquee-item">DeepSeek V4 Flash</span><span class="marquee-item">Gemma 4</span><span class="marquee-item">Qwen 3.6</span><span class="marquee-item">Llama 3</span><span class="marquee-item">Private by Design</span><span class="marquee-item">Document RAG</span><span class="marquee-item">Live Metrics</span><span class="marquee-item">OpenAI API</span><span class="marquee-item">Anthropic API</span><span class="marquee-item">Claude Code</span><span class="marquee-item">MCP</span>
+    </div>
+  </div>
+
+  <!-- THREE THINGS THAT FEEL LIKE MAGIC -->
+  <section class="section" id="magic">
+    <div class="section-header reveal">
+      <div class="section-label">Try this first</div>
+      <h2 class="section-title">Three things that feel like magic</h2>
+      <p class="section-desc">The fastest way to "get" it. Each takes under a minute — and each is something only an AI <b>on your own Mac</b> can do.</p>
+    </div>
+
+    <div class="split">
+      <div class="split-copy reveal">
+        <span class="split-kicker">One · ⌃Space</span>
+        <h3>Ask anything, from anywhere</h3>
+        <p>Press <span class="kbd">⌃Space</span> over any app — your browser, an email, a game — and a little prompt box appears. Ask your question; the answer <b>streams in right there</b>. No tab-switching, no logging in.</p>
+        <p>It's the fastest quick-question, "what's the word for…" habit you'll pick up. Follow-ups remember the conversation, and <span class="kbd">Esc</span> tucks it away.</p>
+      </div>
+      <div class="split-visual reveal">
+        <figure class="shot">
+          <div class="shot-frame"><img src="screenshots/quick-launcher.png" alt="The Quick Launcher: a Spotlight-style prompt panel floating over another app" loading="lazy"></div>
+          <figcaption>⌃Space over any app — ask, read, dismiss.</figcaption>
+        </figure>
+      </div>
+    </div>
+
+    <div class="split flip">
+      <div class="split-copy reveal">
+        <span class="split-kicker">Two · Your files</span>
+        <h3>Chat with your own documents</h3>
+        <p>Drag a <b>folder</b> into the chat and ask about what's inside — a lease, a stack of PDFs, your class notes, a pile of receipts. <i>"Which invoice is unpaid?"</i> · <i>"Summarize this into five bullets."</i> · <i>"Quiz me on chapter 3."</i></p>
+        <p>Because nothing leaves your Mac, this is the stuff you'd <b>never</b> paste into an online chatbot — taxes, medical letters, contracts — answered safely at home.</p>
+      </div>
+      <div class="split-visual reveal">
+        <figure class="shot">
+          <div class="shot-frame"><img src="mlxcore-screenshot-1.png" alt="Asking a local model questions about your own documents in the chat window" loading="lazy"></div>
+          <figcaption>Attach a folder and ask — your documents stay on your machine.</figcaption>
+        </figure>
+      </div>
+    </div>
+
+    <div class="split">
+      <div class="split-copy reveal">
+        <span class="split-kicker">Three · Voice</span>
+        <h3>Just talk to it, hands-free</h3>
+        <p>Turn on Voice Mode from the menu bar, say <b>"Hey Loki,"</b> and speak. It listens, thinks, and <b>answers out loud</b> — perfect while cooking, tidying, or away from the keyboard. Your voice is transcribed on the Mac and never uploaded.</p>
+        <p>Want it to reply in a familiar voice? Record a short clip and it can even answer in <a class="prose-link" href="voice-cloning/">a cloned voice</a>.</p>
+      </div>
+      <div class="split-visual reveal">
+        <figure class="shot">
+          <div class="shot-frame"><img src="screenshots/voice-mode-orb.png" alt="Hands-free Voice Mode with an animated listening orb" loading="lazy"></div>
+          <figcaption>Hands-free Voice Mode — say the wake word and just talk.</figcaption>
+        </figure>
+      </div>
+    </div>
+  </section>
+
+  <!-- CREATIVE STUDIO -->
+  <section class="section section-alt" id="studio">
+    <div class="section-header reveal">
+      <div class="section-label">A creative studio in one app</div>
+      <h2 class="section-title">Not just chat — it makes things</h2>
+      <p class="section-desc">Pictures, music, voices, video, even 3D models — all generated <b>on your Mac</b>, with no monthly fee and no watermark. Pick a tab, describe what you want, and go.</p>
+    </div>
+
+    <div class="mini-grid reveal">
+      <a class="mini-card" href="image-generation/">
+        <div class="mini-head">
+          <div class="mini-icon" style="background: linear-gradient(135deg, #d6336c, #ff9f0a);">
+            <svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.1-3.1a2 2 0 0 0-2.8 0L6 21"/></svg>
+          </div>
+          <span class="mini-k">Images</span>
+        </div>
+        <h4>Make art from a sentence</h4>
+        <p>Describe a picture — <i>"a watercolor fox in a snowy forest at golden hour"</i> — and get it in seconds. Great for cards, wallpapers, posters, and ideas.</p>
+      </a>
+      <a class="mini-card" href="image-generation/">
+        <div class="mini-head">
+          <div class="mini-icon" style="background: linear-gradient(135deg, #ff375f, #bf5af2);">
+            <svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m21.64 3.64-1.28-1.28a1.21 1.21 0 0 0-1.72 0L2.36 18.64a1.21 1.21 0 0 0 0 1.72l1.28 1.28a1.2 1.2 0 0 0 1.72 0L21.64 5.36a1.2 1.2 0 0 0 0-1.72Z"/><path d="m14 7 3 3"/><path d="M5 6v4"/><path d="M19 14v4"/><path d="M10 2v2"/><path d="M7 8H3"/><path d="M21 16h-4"/><path d="M11 3H9"/></svg>
+          </div>
+          <span class="mini-k">Photo editing</span>
+        </div>
+        <h4>Edit a photo by just asking</h4>
+        <p>Drop in a photo and say <i>"make the sky a sunset"</i> or <i>"remove the background."</i> It keeps the rest of the picture — no design skills needed.</p>
+      </a>
+      <a class="mini-card" href="music-generation/">
+        <div class="mini-head">
+          <div class="mini-icon" style="background: linear-gradient(135deg, #bf5af2, #5e5ce6);">
+            <svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 18V5l12-2v13"/><circle cx="6" cy="18" r="3"/><circle cx="18" cy="16" r="3"/></svg>
+          </div>
+          <span class="mini-k">Music</span>
+        </div>
+        <h4>Turn a mood into a track</h4>
+        <p><i>"Lo-fi study beat, 90 bpm, rainy."</i> Get original background music and jingles you can actually use — nothing to license.</p>
+      </a>
+      <a class="mini-card" href="voice-cloning/">
+        <div class="mini-head">
+          <div class="mini-icon" style="background: linear-gradient(135deg, #7048e8, #da77f2);">
+            <svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="11 5 6 9 2 9 2 15 6 15 11 19 11 5"/><path d="M15.54 8.46a5 5 0 0 1 0 7.07"/><path d="M19.07 4.93a10 10 0 0 1 0 14.14"/></svg>
+          </div>
+          <span class="mini-k">Voice</span>
+        </div>
+        <h4>Any text, read aloud</h4>
+        <p>Turn writing into natural speech — DIY audiobooks, voiceovers, or practice scripts — optionally in a voice you cloned from a few seconds of audio.</p>
+      </a>
+      <a class="mini-card" href="video-generation/">
+        <div class="mini-head">
+          <div class="mini-icon" style="background: linear-gradient(135deg, #ff453a, #ff9f0a);">
+            <svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m22 8-6 4 6 4V8Z"/><rect x="2" y="6" width="14" height="12" rx="2" ry="2"/></svg>
+          </div>
+          <span class="mini-k">Video</span>
+        </div>
+        <h4>Bring a photo to life</h4>
+        <p>Animate a still image or generate a short clip from a prompt — with a soundtrack, or characters that speak your lines.</p>
+      </a>
+      <a class="mini-card" href="3d-generation/">
+        <div class="mini-head">
+          <div class="mini-icon" style="background: linear-gradient(135deg, #0a84ff, #30d158);">
+            <svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 16V8a2 2 0 0 0-1-1.73l-7-4a2 2 0 0 0-2 0l-7 4A2 2 0 0 0 3 8v8a2 2 0 0 0 1 1.73l7 4a2 2 0 0 0 2 0l7-4A2 2 0 0 0 21 16z"/><polyline points="3.27 6.96 12 12.01 20.73 6.96"/><line x1="12" y1="22.08" x2="12" y2="12"/></svg>
+          </div>
+          <span class="mini-k">3D</span>
+        </div>
+        <h4>A photo into a 3D model</h4>
+        <p>Snap or drop a single photo and get a 3D model out — handy for 3D printing, games, and AR tinkering.</p>
+      </a>
+    </div>
+
+    <div class="shot-row reveal" style="margin-top:40px;">
+      <figure class="shot">
+        <div class="shot-frame"><img src="screenshots/imagegen-pane.png" alt="The image generation pane creating a picture from a text prompt" loading="lazy"></div>
+        <figcaption>Type a description, get a picture — free and local.</figcaption>
+      </figure>
+      <figure class="shot">
+        <div class="shot-frame"><img src="screenshots/videogen-pane.png" alt="The video generation pane creating a clip from a prompt with LTX-Video" loading="lazy"></div>
+        <figcaption>Generate a video from a prompt or a photo.</figcaption>
+      </figure>
+    </div>
+  </section>
+
+  <!-- AN ASSISTANT WITH HANDS -->
+  <section class="section" id="agent">
+    <div class="section-header reveal">
+      <div class="section-label">It can actually do things</div>
+      <h2 class="section-title">An assistant with hands</h2>
+      <p class="section-desc">Flip on <b>Agent mode</b> and it can tidy files, look things up, and build small things for you — with a safety rail you control.</p>
+    </div>
+
+    <div class="split">
+      <div class="split-copy reveal">
+        <span class="split-kicker">Agent mode</span>
+        <h3>Give it a chore, watch it work</h3>
+        <p>Ask in plain words: <i>"Organize my Downloads folder by type."</i> · <i>"Rename these photos by the date they were taken."</i> · <i>"Build me a little birthday-countdown web page"</i> — and it opens it in your browser when it's done.</p>
+        <ul class="ticks">
+          <li><svg viewBox="0 0 24 24" fill="none" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg><span><b>You set the leash.</b> Choose how much it's allowed to do; anything riskier pauses and asks first.</span></li>
+          <li><svg viewBox="0 0 24 24" fill="none" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg><span><b>It stays in its lane.</b> File actions are confined to a folder you pick — or to <a class="prose-link" href="agent-sandbox/">an isolated Linux VM</a>.</span></li>
+          <li><svg viewBox="0 0 24 24" fill="none" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg><span><b>Nothing to configure.</b> The tools are built in — just describe the goal.</span></li>
+        </ul>
+      </div>
+      <div class="split-visual reveal">
+        <figure class="shot">
+          <div class="shot-frame"><img src="screenshots/agent-tool-calls.png" alt="Agent mode running tools to complete a task, with each step shown" loading="lazy"></div>
+          <figcaption>Agent mode shows each step it takes — no black box.</figcaption>
+        </figure>
+      </div>
+    </div>
+
+    <div class="mini-grid reveal" style="margin-top:56px;">
+      <a class="mini-card" href="local-ai-assistant/">
+        <span class="mini-k">Schedules</span>
+        <h4>Daily jobs, on autopilot</h4>
+        <p>Hand it a recurring task — <i>"every morning at 8, summarize my watched sites"</i> — and it runs on its own, saving a transcript each time.</p>
+      </a>
+      <a class="mini-card" href="local-ai-assistant/">
+        <span class="mini-k">Telegram</span>
+        <h4>Text your Mac from your phone</h4>
+        <p>Message your own model from anywhere through a private Telegram bot — no cloud AI, and only your chat can reach it.</p>
+      </a>
+      <a class="mini-card" href="claude-code-local/">
+        <span class="mini-k">For the curious</span>
+        <h4>Power tools, when you want them</h4>
+        <p>Coding assistants, a built-in API, and a sandbox are all in there — ignore them until you're ready, then dive in.</p>
+      </a>
+    </div>
+  </section>
+
+  <!-- IPHONE APP -->
+  <section class="section section-alt" id="iphone">
+    <div class="section-header reveal">
+      <div class="section-label">Also on iPhone</div>
+      <h2 class="section-title">The same AI, in your pocket</h2>
+      <p class="section-desc"><b>MLX Chat — Local AI</b> puts this exact open-source engine on your iPhone: chat, voice cloning, image and music generation — all on-device, all offline.</p>
+    </div>
+    <div class="split">
+      <div class="split-copy reveal">
+        <span class="split-kicker">MLX Chat — Local AI</span>
+        <h3>One engine, Mac to iPhone</h3>
+        <p>It's not a companion app that phones home to a server — the <b>same mlx-serve engine</b> behind everything on this page is compiled straight into the app and runs on the phone's GPU. No cloud, no account, and it works in airplane mode.</p>
+        <ul class="ticks">
+          <li><svg viewBox="0 0 24 24" fill="none" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg><span><b>Chat</b> with Gemma 4 running on the phone — or use built-in Apple Intelligence with nothing to download.</span></li>
+          <li><svg viewBox="0 0 24 24" fill="none" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg><span><b>Clone your voice</b> from an 8-second sample, then have it read anything aloud.</span></li>
+          <li><svg viewBox="0 0 24 24" fill="none" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg><span><b>Make images and music</b> right on the phone — the same FLUX.2 and ACE-Step models as the Mac app.</span></li>
+        </ul>
+        <p style="margin-top:20px;margin-bottom:8px;">
+          <a href="https://apps.apple.com/us/app/mlx-chat-local-ai/id6787603518" class="btn btn-appstore" target="_blank" rel="noopener">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M17.05 20.28c-.98.95-2.05.8-3.08.35-1.09-.46-2.09-.48-3.24 0-1.44.62-2.2.44-3.06-.35C2.79 15.25 3.51 7.59 9.05 7.31c1.35.07 2.29.74 3.08.8 1.18-.24 2.31-.93 3.57-.84 1.51.12 2.65.72 3.4 1.8-3.12 1.87-2.38 5.98.48 7.13-.57 1.5-1.31 2.99-2.53 4.08zM12.03 7.25c-.15-2.23 1.66-4.07 3.74-4.25.29 2.58-2.34 4.5-3.74 4.25z"/></svg>
+            Download on the App Store
+          </a>
+        </p>
+        <p style="font-size:12.5px;color:var(--text-tertiary);">Needs a recent iPhone — A17 Pro-class or newer, iOS 26+.</p>
+      </div>
+      <div class="split-visual reveal">
+        <div class="phone-shots">
+          <figure class="phone-shot">
+            <img src="screenshots/iphone-chat.png" alt="MLX Chat on iPhone streaming a local model's answer" loading="lazy">
+          </figure>
+          <figure class="phone-shot">
+            <img src="screenshots/iphone-images.png" alt="MLX Chat on iPhone generating an image on-device" loading="lazy">
+          </figure>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- WHY LOCAL -->
+  <section class="section" id="private">
+    <div class="section-header reveal">
+      <div class="section-label">Why it's different</div>
+      <h2 class="section-title">The whole point is that it's yours</h2>
+      <p class="section-desc">A cloud chatbot meters you, remembers you, and needs a signal. This one asks for none of that — because it never leaves your Mac.</p>
+    </div>
+    <div class="stat-band reveal">
+      <div class="stat"><div class="n">$0</div><div class="l">forever — no subscription</div></div>
+      <div class="stat"><div class="n">0</div><div class="l">accounts, keys, or sign-ups</div></div>
+      <div class="stat"><div class="n">100%</div><div class="l">runs on your own Mac</div></div>
+      <div class="stat"><div class="n">✈️</div><div class="l">works with no internet</div></div>
     </div>
   </section>
 
@@ -1202,27 +1555,12 @@
     </div>
   </section>
 
-  <!-- SCREENSHOT -->
-  <section class="screenshot-section">
-    <div class="screenshot-wrap">
-      <img src="demo-diffusion.gif" alt="MLX Core app — DiffusionGemma block diffusion running live in the chat interface" loading="lazy">
-    </div>
-  </section>
-
-  <!-- MARQUEE -->
-  <div class="marquee" aria-hidden="true">
-    <div class="marquee-track">
-      <span class="marquee-item">Any Open Model</span><span class="marquee-item">Text-to-Music</span><span class="marquee-item">Photo → 3D</span><span class="marquee-item">Ollama Compatible</span><span class="marquee-item">Photo Editing</span><span class="marquee-item">Image-to-Video</span><span class="marquee-item">Talking Characters</span><span class="marquee-item">Style LoRAs</span><span class="marquee-item">Agent Sandbox</span><span class="marquee-item">⌃Space Launcher</span><span class="marquee-item">Krea-2 Image Gen</span><span class="marquee-item">Voice Cloning</span><span class="marquee-item">DiffusionGemma</span><span class="marquee-item">DeepSeek V4 Flash</span><span class="marquee-item">Gemma 4</span><span class="marquee-item">Qwen 3.6</span><span class="marquee-item">Llama 3</span><span class="marquee-item">Private by Design</span><span class="marquee-item">Document RAG</span><span class="marquee-item">Live Metrics</span><span class="marquee-item">OpenAI API</span><span class="marquee-item">Anthropic API</span><span class="marquee-item">Claude Code</span><span class="marquee-item">MCP</span>
-      <span class="marquee-item">Any Open Model</span><span class="marquee-item">Text-to-Music</span><span class="marquee-item">Photo → 3D</span><span class="marquee-item">Ollama Compatible</span><span class="marquee-item">Photo Editing</span><span class="marquee-item">Image-to-Video</span><span class="marquee-item">Talking Characters</span><span class="marquee-item">Style LoRAs</span><span class="marquee-item">Agent Sandbox</span><span class="marquee-item">⌃Space Launcher</span><span class="marquee-item">Krea-2 Image Gen</span><span class="marquee-item">Voice Cloning</span><span class="marquee-item">DiffusionGemma</span><span class="marquee-item">DeepSeek V4 Flash</span><span class="marquee-item">Gemma 4</span><span class="marquee-item">Qwen 3.6</span><span class="marquee-item">Llama 3</span><span class="marquee-item">Private by Design</span><span class="marquee-item">Document RAG</span><span class="marquee-item">Live Metrics</span><span class="marquee-item">OpenAI API</span><span class="marquee-item">Anthropic API</span><span class="marquee-item">Claude Code</span><span class="marquee-item">MCP</span>
-    </div>
-  </div>
-
   <!-- PERFORMANCE -->
   <section class="section" id="performance">
     <div class="section-header reveal">
-      <div class="section-label">Performance</div>
+      <div class="section-label">For developers</div>
       <h2 class="section-title">Faster than LM Studio.<br>Every model.</h2>
-      <p class="section-desc">Identical 4-bit MLX weights, same machine, same prompts. mlx-serve wins every cell — and speculative decoding pushes the lead further on the workloads where it counts. <a href="lm-studio-alternative/" style="color:var(--blue);text-decoration:none;">Full LM Studio comparison →</a></p>
+      <p class="section-desc">Under the hood, MLX Core is <b>mlx-serve</b> — a native Zig inference server for Apple Silicon with OpenAI- and Anthropic-compatible APIs. Identical 4-bit MLX weights, same machine, same prompts: it wins every cell, and speculative decoding pushes the lead further where it counts. <a href="lm-studio-alternative/" style="color:var(--blue);text-decoration:none;">Full LM Studio comparison →</a></p>
     </div>
 
     <div class="perf-stats reveal">
@@ -1239,8 +1577,8 @@
         <div class="perf-label">params, DeepSeek V4 Flash — local</div>
       </div>
       <div class="perf-stat">
-        <div class="perf-number" data-target="0">0</div>
-        <div class="perf-label">accounts, subscriptions, or cloud calls</div>
+        <div class="perf-number" data-target="48" data-suffix="%">48%</div>
+        <div class="perf-label">geomean faster than LM Studio · 18 workloads</div>
       </div>
     </div>
 
@@ -1689,6 +2027,14 @@
     </div>
     <div class="faq-wrap reveal">
       <details class="faq-item">
+        <summary>Do I need to be technical to use this?</summary>
+        <p>No. MLX Core is a normal menu-bar app: install it, click to download the recommended model — it's sized to your Mac — and start chatting. The advanced bits (agent tools, coding assistants, the developer API) stay out of the way until you go looking for them. There's a friendly <a href="onboarding/">5-minute getting-started tour</a> when you're ready.</p>
+      </details>
+      <details class="faq-item">
+        <summary>Is it really free?</summary>
+        <p>Yes — completely. Open source under the MIT license: no subscription, no account, no per-message cost. You download a model once and use it as much as you like — and the images, music, voice, video, and 3D are free to make too.</p>
+      </details>
+      <details class="faq-item">
         <summary>Is mlx-serve faster than LM Studio?</summary>
         <p>Yes, where it counts — <b>+48% geomean across 18 workloads</b> on identical 4-bit MLX weights (Gemma 4 E2B/E4B/31B/26B-A4B-MoE and Qwen 3.6 27B/35B-A3B-MoE, vs LM Studio 0.4.15). The lead comes from speculative decoding: PLD up to <b>2.1×</b> on echo-heavy work, the Gemma drafter <b>+65%</b> and native Qwen MTP <b>+98%</b> on code, plus a faster MoE decode path (+27% raw on Qwen 35B-A3B).</p>
       </details>
@@ -1754,6 +2100,7 @@
   <footer>
     <ul class="footer-links">
       <li><a href="https://github.com/ddalcu/mlx-serve" target="_blank" rel="noopener">GitHub</a></li>
+      <li><a href="https://apps.apple.com/us/app/mlx-chat-local-ai/id6787603518" target="_blank" rel="noopener">iPhone app</a></li>
       <li><a href="https://github.com/ddalcu/mlx-serve/releases" target="_blank" rel="noopener">Releases</a></li>
       <li><a href="https://github.com/ddalcu/mlx-serve/blob/main/CHANGELOG.md" target="_blank" rel="noopener">Changelog</a></li>
       <li><a href="https://github.com/ddalcu/mlx-serve/issues" target="_blank" rel="noopener">Issues</a></li>
@@ -1816,6 +2163,13 @@
       });
     }, { threshold: 0.5 });
     document.querySelectorAll('[data-target]').forEach(el => countObserver.observe(el));
+
+    // ─── Missing-screenshot fallback (shared with deep-dive pages) ───
+    document.querySelectorAll('.shot img').forEach((img) => {
+      const markMissing = () => { const shot = img.closest('.shot'); if (shot) shot.classList.add('missing'); };
+      img.addEventListener('error', markMissing);
+      if (img.complete && img.naturalWidth === 0) markMissing();
+    });
 
     // ─── Copy code ───
     function copyCode(btn) {

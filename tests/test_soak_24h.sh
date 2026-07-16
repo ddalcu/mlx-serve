@@ -251,7 +251,14 @@ else
 fi
 
 # Health-check failures recorded? Surface them.
-HEALTH_FAILS=$(grep -c HEALTH-FAIL "$SERVER_LOG" 2>/dev/null || echo 0)
+# NOTE: `grep -c` prints "0" AND exits 1 when there are no matches, so a
+# `|| echo 0` fallback fires TOO and yields "0\n0" — which makes the `-gt`
+# below die with "integer expression expected", i.e. the WARN silently never
+# evaluates in the healthy case (live 2026-07-16 soak). Swallow grep's exit with
+# `|| true` and default only when the output is EMPTY (file missing → exit 2,
+# no stdout). Verified: clean→0, 2 failures→2 (warn fires), missing file→0.
+HEALTH_FAILS=$(grep -c HEALTH-FAIL "$SERVER_LOG" 2>/dev/null || true)
+HEALTH_FAILS=${HEALTH_FAILS:-0}
 if [ "$HEALTH_FAILS" -gt 0 ]; then
     echo -e "${YELLOW}WARN${NC} $HEALTH_FAILS /health timeouts observed during run"
 fi

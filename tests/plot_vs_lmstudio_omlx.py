@@ -96,10 +96,13 @@ FAMILIES = {
         # zero-slot. The mtplxopt row has no GGUF counterpart, so its deltas
         # fall back to the LM Studio MLX bar (see baseline_fallback).
         "variants": [
+            # Competitors ride ONE neutral gray ramp (light → dark, in the order
+            # they get harder to beat: LM-GGUF → LM-MLX → oMLX → MTPLX) so the
+            # only saturated bar in the chart is ours. Tailwind gray 300/400/500/600.
             ("lmstudio-alt",      "none", "LM Studio (GGUF, baseline)", "#d1d5db", True,  False, "LM-GGUF"),
             ("lmstudio-baseline", "none", "LM Studio (MLX)",            "#9ca3af", False, False, "LM-MLX"),
-            ("omlx",              "none", "oMLX",                       "#10b981", False, False, "oMLX"),
-            ("mtplx",             "auto", "MTPLX",                      "#f59e0b", False, False, "MTPLX"),
+            ("omlx",              "none", "oMLX",                       "#6b7280", False, False, "oMLX"),
+            ("mtplx",             "auto", "MTPLX",                      "#4b5563", False, False, "MTPLX"),
             ("mlx-serve",         "best", "MLX-serve (best config)",    "#2563eb", False, True,  "MLX-Serve"),
         ],
         "baseline_fallback": [("lmstudio-baseline", "none")],
@@ -125,8 +128,8 @@ FAMILIES = {
             ("lmstudio-baseline", "none",    "LM Studio (MLX, baseline)",   "#9ca3af", True,  False, "LM-MLX"),
             ("lmstudio-alt",      "none",    "LM Studio (GGUF)",            "#d1d5db", False, False, "LM-GG"),
             ("mlx-serve-gguf",    "none",    "MLX-serve (GGUF / llama.cpp)", "#a78bfa", False, False, "MLXS-GG"),
-            ("omlx",              "none",    "oMLX",                        "#10b981", False, False, "oMLX"),
-            ("mtplx",             "auto",    "MTPLX (auto)",                "#f59e0b", False, False, "MTPLX"),
+            ("omlx",              "none",    "oMLX",                        "#6b7280", False, False, "oMLX"),
+            ("mtplx",             "auto",    "MTPLX (auto)",                "#4b5563", False, False, "MTPLX"),
             ("mlx-serve",         "none",    "MLX-serve (MLX, --no-pld)",   "#2563eb", False, True,  "MLXS-NPLD"),
             ("mlx-serve",         "pld",     "MLX-serve (MLX, --pld)",      "#16a34a", False, True,  "MLXS-PLD"),
             ("mlx-serve",         "drafter", "MLX-serve (MLX, --drafter)",  "#ea580c", False, True,  "MLXS-DRFT"),
@@ -148,8 +151,8 @@ FAMILIES = {
             ("lmstudio-baseline", "none", "LM Studio (MLX, baseline)",   "#9ca3af", True,  False, "LM-MLX"),
             ("lmstudio-alt",      "none", "LM Studio (GGUF)",            "#d1d5db", False, False, "LM-GG"),
             ("mlx-serve-gguf",    "none", "MLX-serve (GGUF / llama.cpp)", "#a78bfa", False, False, "MLXS-GG"),
-            ("omlx",              "none", "oMLX",                        "#10b981", False, False, "oMLX"),
-            ("mtplx",             "auto", "MTPLX (auto)",                "#f59e0b", False, False, "MTPLX"),
+            ("omlx",              "none", "oMLX",                        "#6b7280", False, False, "oMLX"),
+            ("mtplx",             "auto", "MTPLX (auto)",                "#4b5563", False, False, "MTPLX"),
             ("mlx-serve",         "none", "MLX-serve (MLX, --no-pld)",   "#2563eb", False, True,  "MLXS-NPLD"),
             ("mlx-serve",         "pld",  "MLX-serve (MLX, --pld)",      "#16a34a", False, True,  "MLXS-PLD"),
             ("mlx-serve",         "mtp",  "MLX-serve (MLX, native MTP)", "#ea580c", False, True,  "MLXS-MTP"),

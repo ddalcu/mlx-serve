@@ -420,11 +420,11 @@ Reproduce with **`./tests/bench.sh --family gemma`** (mlx-serve only — emits p
 
 
 
-![mlx-serve vs LM Studio (GGUF + MLX) · oMLX · MTPLX — Gemma 4 + Qwen 3.6, code completion (M4 Max)](docs/perf-vs-lmstudio-omlx-all-26.7.7.png)
+![mlx-serve vs LM Studio (GGUF + MLX) · oMLX · MTPLX — Gemma 4 + Qwen 3.6, code completion (M4 Max)](docs/perf-vs-lmstudio-omlx-all-26.7.9.png)
 
 *Code completion decode tok/s, identical weights per box (Apple M4 Max, ctx=4096, temp=0). Baseline is **LM Studio GGUF** — the llama.cpp path most LM Studio users actually run — with LM Studio MLX, oMLX, and MTPLX beside it. The blue bar is mlx-serve's best configuration for that model, with the winning speculative mode named in the label (PLD / drafter / native MTP). MTPLX shows 0 where it can't run (it requires its own MTP artifacts).*
 
-Reproduce: `./tests/bench.sh --family all --lmstudio --omlx --mtplx`. Requires `lms`, `jq`, `python3`, `matplotlib` (CSV: [`docs/perf-csvs/all-26.7.7.csv`](docs/perf-csvs/all-26.7.7.csv)).
+Reproduce: `./tests/bench.sh --family all --lmstudio --omlx --mtplx`. Requires `lms`, `jq`, `python3`, `matplotlib` (CSV: [`docs/perf-csvs/all-26.7.9.csv`](docs/perf-csvs/all-26.7.9.csv)).
 
 ## FAQ
 

@@ -8,7 +8,7 @@ Keep this document lightweight, data in table format only, no paragraphs, no flu
 
 Hardware: Apple M4 Max, 128 GB, AC power, idle machine. Engines: LM Studio 0.4.15+2,
 MTPLX 2.0.2, mlx-lm 0.31.3. Identical weights within every row. Last refreshed
-**2026-07-13** (v26.7.7).
+**2026-07-16** (feature/more-hy3-fixes soak; v26.7.7 baseline).
 
 ## Native-MTP context ladder — Qwen3.6-27B, identical checkpoint on all 3 engines
 
@@ -83,6 +83,28 @@ CSVs: `docs/perf-csvs/{gemma,qwen36}-26.7.6.csv` · chart:
 | Qwen 3.6 27B | +112% | +98% | +32% |
 | Qwen 3.6 35B-A3B-MoE | +132% | +70% | +32% |
 
+### Refresh 2026-07-16 (`feature/more-hy3-fixes` soak) — all 4 engines, code cell (echo/free-form opt-in)
+
+CSV: `docs/perf-csvs/all-26.7.9.csv` · chart:
+`docs/perf-vs-lmstudio-omlx-all-26.7.9.png`. vs `all-26.7.7.csv` (same
+methodology): **no regression** — every mlx-serve decode cell within ±5%.
+**oMLX — not LM Studio — is the competitor to watch.**
+
+| Model | LM-GGUF | LM-MLX | oMLX | MTPLX | mlx-serve (best) | vs GGUF | **vs oMLX** |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| Gemma 4 E4B 4bit | 93 | 117 | 125 | — | **174** (drafter) | +87% | **+39%** |
+| Gemma 4 31B 4bit | 22 | 26 | 25 | — | **32** (drafter) | +45% | +28% |
+| Gemma 4 26B-A4B-MoE (QAT) | 96 | 117 | 125 | — | **127** (PLD) | +33% | **+1.6%** |
+| Qwen 3.6 27B 4bit | 23 | 23 | 30 | — | **76** (MTP) | +234% | +153% |
+| Qwen 3.6 35B-A3B-MoE | 89 | 88 | 149 | 52 | **215** (MTP) | +143% | **+44%** |
+| Qwen 3.6 27B MTPLX-opt | — | 30 | 30 | 75 | **78** (MTP) | +162% | **+4% vs MTPLX** |
+
+| Side finding | Result |
+|---|---|
+| `verifyQmm` on the gemma-E4B drafter verify shape (M=5) | **net loss**: 173.4 ON vs 177.7 OFF (`MLX_SERVE_VERIFY_QMM=0`), same engagement ⇒ kernel cost. Small; not a blocker |
+| hy_v3 manual reading (no bench family) | Hy3-oQ2e (295B-A21B 2-bit) decode 25–28 tok/s · Hy3-REAP62 4-bit ~26 tok/s |
+| **A GGUF-only chart flatters us** | vs LM-GGUF the 26B-A4B row reads +33%; vs oMLX it is **+1.6%**. Never quote a win without naming the engine it's over. |
+
 ## Long-context prefill (hd-256)
 
 | Case | Result |
@@ -112,6 +134,19 @@ CSVs: `docs/perf-csvs/ttft-ssd-kv-cache-{baseline-20260706,final-20260707}.csv`.
 - **Same-boot A/Bs only** for kernel/dispatch decisions: warm-GPU rungs read 2–4% below
   cold single-cell boots (thermal), and an isolated-kernel µbench win can still be a
   live loss. Treat sub-2% single-run deltas as noise.
+- **Diff only against a CSV from the SAME bench methodology.** Shared-boot landed in
+  v26.7.7; `{gemma,qwen36}-26.7.6.csv` are per-spec-boot AND pre-`verifyQmm`, so a
+  `--family all` run diffed against them mixes a methodology change with a code epoch.
+  Use `all-<version>.csv`. (2026-07-16: this produced a bogus "−10.6% drafter
+  regression" that evaporated against `all-26.7.7.csv` at −3.8%.)
+- **"Reproducible ⇒ not variance" is FALSE for spec-decode cells.** N samples inside one
+  condition (same boot style, same warm state, back-to-back) agree tightly and still
+  miss a ~5% cross-run spread: `gemma4-e4b/drafter/code` read 173.4±0.5 four times, then
+  182.1 on the same binary in a `--family all` run. Sample across runs/boot-orders
+  before any regression claim.
+- **LM Studio's own cells drift too.** In the 2026-07-16 refresh the 4 worst cells vs
+  baseline were all `lmstudio-baseline` (−9…−23%) — their engine/version, not ours.
+  Check the engine column before attributing a delta to mlx-serve.
 - **Thermal soak >> thermal drift**: same-config warm readings fell 63.8 → 51 tok/s
   over 90 min of continuous GPU load, zero code change. Cross-session absolute
   comparisons need a cooled machine; only same-session ratios are trustworthy.

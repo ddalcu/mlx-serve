@@ -1,5 +1,17 @@
 # Changelog
 
+## v26.7.9 — DeepSeek drafts ahead, and sturdier tool calls
+
+- **DeepSeek V4 Flash learns to draft ahead.** The 284B flagship now uses its published draft head for speculative decoding: the app downloads the small companion file automatically beside the model, and the server drafts and verifies several tokens per pass with identical output. On by default; `--no-ds4-mtp` turns it off.
+- **The community builds of Hunyuan 3 now load.** Popular conversions published with a different internal weight layout — including the smaller pruned variants that fit more comfortably on a 128 GB Mac — used to fail at startup with a "missing weight" error. The server now handles both layouts; measured on an M4 Max, both the full 2-bit build and a 4-bit pruned one decode at ~26–28 tok/s.
+- **Giant split GGUFs are now first-class.** Quants that Hugging Face ships as multiple shard files — like Hunyuan 3's ~89 GB 1-bit build — now download as one unit, show their real size, and load as a single model. Also fixed: models cached by other Hugging Face tools could show up as 0 MB and vanish from the picker.
+- **Agents survive sloppier tool calls.** A six-hour agent soak caught three more ways a small or heavily-pruned model can mangle a tool call — dropped separators, mismatched closing tags, and a stray close marker leaking into the visible reply. All three are now repaired into clean calls (or stripped) instead of derailing the agent into retry loops. The full benchmark matrix was re-run afterwards: no speed regressions anywhere.
+- **No more false "not enough memory" rejections on DeepSeek and GGUF models.** Requests to the embedded engines were being screened by a memory estimate built for the MLX engine, so a prompt the same server had just handled fine on another model could bounce with a bogus "requires ~25 GB of GPU memory" error.
+- **Know exactly what you're running.** `mlx-serve --version` — and the app's Settings — now report the version of every embedded engine (MLX, llama.cpp, ds4), and the menu-bar tray gains a one-click copy button for full model names.
+- **A new front door, and an iPhone in the family.** The website home page is redesigned around what the app does for you — with a friendly getting-started guide for people new to local AI — and the same open-source engine now powers **MLX Chat — Local AI** on the iPhone App Store: chat, voice cloning, image and music generation, fully on-device.
+
+---
+
 ## v26.7.8 — Hunyuan 3: a 295B flagship on your Mac
 
 - **Tencent's Hunyuan 3 (295B-A21B) runs natively.** The strongest open model mlx-serve has ever served: `mlx-serve run hy3` pulls the 2-bit mixed-precision build (~105 GB) and serves it at ~26 tok/s decode with ~235 tok/s prefill on an M4 Max — thinking, tool calling, streaming, and all four API surfaces included. Recommended for Macs with more than 128 GB of memory; on a 128 GB Mac it runs with a minimal context window. Its native multi-token-prediction head works too: opt in per request with `enable_mtp: true` (+11% on code-edit workloads with `--mtp-depth 1`).

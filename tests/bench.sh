@@ -751,10 +751,18 @@ stop_all_engines() {
     # kernel time to reclaim the prior model's MLX buffers (5-20 GB) before the
     # next engine allocates — when this is too short, oMLX in particular has
     # been observed to die mid-prefill on the next cell.
+    # Wait only for the ports we actually KILLED above (same list as the sweep).
+    # NOT LMS_PORT: LM Studio's server is a persistent daemon we deliberately
+    # never kill — its MODEL is freed by `lms unload --all`, not by dropping the
+    # socket — so waiting on it can NEVER succeed and burns the full 30s timeout
+    # + sleep 5 on EVERY start_engine. With --lmstudio that was ~40 s × 17 starts
+    # = ~11 min of dead wait in a 20 min `--family all` run (measured 2026-07-16;
+    # the run is ~4.7 min of actual generation). Waiting for a port you never
+    # free is a category error — keep this list == the kill list above.
     local waited=0
     while (( waited < 30 )); do
         local busy=0
-        for p in "$SERVER_PORT" "$OMLX_PORT" "$LMS_PORT" "$MTPLX_PORT"; do
+        for p in "$SERVER_PORT" "$OMLX_PORT" "$MTPLX_PORT"; do
             if lsof -ti:"$p" >/dev/null 2>&1; then busy=1; break; fi
         done
         (( busy == 0 )) && break
