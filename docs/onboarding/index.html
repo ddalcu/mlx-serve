@@ -1,0 +1,511 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Getting Started with MLX Core — Your Private, Free, Offline AI for Mac</title>
+  <meta name="description" content="Just installed MLX Core? Here's what to do with it. A friendly guide for everyone: chat privately, ask questions about your own files, generate images, music, voice, video and 3D, and let it do real work on your Mac — all on-device, free forever, and offline.">
+  <meta name="keywords" content="private AI Mac, free local AI, offline AI assistant, AI app for beginners, local ChatGPT alternative Mac, on-device AI, MLX Core getting started, what can I do with local AI, private AI for non-technical, ask AI about my documents, generate images on Mac free, AI music generator Mac, voice cloning Mac">
+  <meta name="author" content="David Dalcu">
+  <link rel="canonical" href="https://ddalcu.github.io/mlx-serve/onboarding/">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://ddalcu.github.io/mlx-serve/onboarding/">
+  <meta property="og:title" content="You installed MLX Core. Here's the fun part.">
+  <meta property="og:description" content="A private AI that lives on your Mac — free, offline, and genuinely useful. Chat, ask about your own files, make images, music and voice, and let it run errands on your computer. Here's how to start in 5 minutes.">
+  <meta property="og:image" content="https://ddalcu.github.io/mlx-serve/mlxcore-screenshot-1.png">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta property="og:site_name" content="mlx-serve">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="You installed MLX Core. Here's the fun part.">
+  <meta name="twitter:description" content="A private AI that lives on your Mac — free, offline, useful. Chat, ask about your files, make images/music/voice, and let it run errands. Start in 5 minutes.">
+  <meta name="twitter:image" content="https://ddalcu.github.io/mlx-serve/mlxcore-screenshot-1.png">
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "BreadcrumbList",
+    "itemListElement": [
+      { "@type": "ListItem", "position": 1, "name": "mlx-serve", "item": "https://ddalcu.github.io/mlx-serve/" },
+      { "@type": "ListItem", "position": 2, "name": "Getting started", "item": "https://ddalcu.github.io/mlx-serve/onboarding/" }
+    ]
+  }
+  </script>
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "HowTo",
+    "name": "Get started with MLX Core on your Mac",
+    "description": "Set up a private, free, offline AI assistant on an Apple Silicon Mac in three steps — open it from the menu bar, download a model, and start chatting.",
+    "totalTime": "PT5M",
+    "tool": [{ "@type": "HowToTool", "name": "MLX Core (macOS app)" }],
+    "step": [
+      { "@type": "HowToStep", "position": 1, "name": "Open it from the menu bar", "text": "MLX Core lives in the menu bar at the top-right of your screen, not in the Dock. Click its icon and choose Open Chat." },
+      { "@type": "HowToStep", "position": 2, "name": "Download a model", "text": "Open Models, pick the recommended one — it is sized to your Mac — and click Download. This happens once; afterwards it runs offline." },
+      { "@type": "HowToStep", "position": 3, "name": "Start chatting", "text": "Type a question and press return, or press Control+Space anywhere to summon the quick launcher. Everything runs on your Mac." }
+    ]
+  }
+  </script>
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "FAQPage",
+    "mainEntity": [
+      {
+        "@type": "Question",
+        "name": "Is MLX Core really free?",
+        "acceptedAnswer": { "@type": "Answer", "text": "Yes — completely. It is open source under the MIT license, with no subscription, no accounts, and no per-message cost. You download a model once and then run it as much as you like on your own Mac. Making images, music, voice, video, and 3D is free too." }
+      },
+      {
+        "@type": "Question",
+        "name": "Is my data private?",
+        "acceptedAnswer": { "@type": "Answer", "text": "Yes. Everything runs on your Mac. There is no telemetry, no analytics, and no cloud service in the loop — the app talks only to your own computer. You can turn Wi-Fi off and it still works. That is why it is safe to ask about personal documents you would never paste into an online chatbot." }
+      },
+      {
+        "@type": "Question",
+        "name": "Do I need to be technical to use it?",
+        "acceptedAnswer": { "@type": "Answer", "text": "No. It is a normal Mac app that lives in your menu bar. Click to download a recommended model, then chat like you would with any assistant. The advanced features (agent tools, coding, API) are there when you want them, hidden until then." }
+      },
+      {
+        "@type": "Question",
+        "name": "What kind of Mac do I need?",
+        "acceptedAnswer": { "@type": "Answer", "text": "An Apple Silicon Mac (M1, M2, M3, M4, or M5) running a recent macOS. Small, fast models run comfortably on 8–16GB of memory; more memory lets you run larger, smarter models and generate video or 3D." }
+      },
+      {
+        "@type": "Question",
+        "name": "Does it work without internet?",
+        "acceptedAnswer": { "@type": "Answer", "text": "Yes. You need internet once to download a model. After that, chatting, image generation, voice, and the rest all work fully offline — on a plane, in a cabin, anywhere." }
+      }
+    ]
+  }
+  </script>
+  <link rel="icon" href="../appiconb.png">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="../assets/feature.css">
+  <style>
+    :root { --accent: #0071e3; --accent2: #30d158; }
+
+    /* ─── numbered getting-started steps ─── */
+    .steps { display: grid; grid-template-columns: repeat(3, 1fr); gap: 18px; max-width: 1000px; margin: 0 auto; }
+    .step {
+      position: relative; background: var(--white); border: 1px solid var(--border);
+      border-radius: var(--radius); box-shadow: var(--shadow-card); padding: 28px 26px;
+      transition: transform 0.25s ease, box-shadow 0.25s ease;
+    }
+    .step:hover { transform: translateY(-3px); box-shadow: var(--shadow-elevated); }
+    .step-num {
+      font-family: var(--mono); font-weight: 700; font-size: 15px; color: var(--white);
+      width: 36px; height: 36px; border-radius: 50%; display: flex; align-items: center; justify-content: center;
+      background: linear-gradient(135deg, var(--accent), var(--accent2)); margin-bottom: 16px;
+    }
+    .step h4 { font-size: 17px; font-weight: 600; letter-spacing: -0.01em; margin-bottom: 7px; }
+    .step p { font-size: 14px; color: var(--text-secondary); line-height: 1.6; }
+    .step p b { color: var(--text-primary); font-weight: 600; }
+    .step p code {
+      font-family: var(--mono); font-size: 0.85em; background: var(--bg-alt);
+      color: var(--text-primary); padding: 1.5px 6px; border-radius: 5px;
+    }
+    @media (max-width: 860px) { .steps { grid-template-columns: 1fr; } }
+
+    /* ─── ideas gallery (concrete prompts, grouped by who'd love them) ─── */
+    .idea-groups { max-width: 1020px; margin: 0 auto; display: flex; flex-direction: column; gap: 36px; }
+    .idea-group-head { display: flex; align-items: baseline; gap: 12px; margin-bottom: 16px; flex-wrap: wrap; }
+    .idea-group-head .ig-kicker {
+      font-family: var(--mono); font-size: 10.5px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase;
+      color: var(--accent); background: var(--accent-soft); padding: 3px 9px; border-radius: 5px;
+    }
+    .idea-group-head h3 { font-size: 19px; font-weight: 700; letter-spacing: -0.02em; }
+    .idea-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 14px; }
+    .idea {
+      background: var(--white); border: 1px solid var(--border); border-radius: var(--radius-sm);
+      box-shadow: var(--shadow-card); padding: 18px 20px;
+      transition: transform 0.2s ease, box-shadow 0.2s ease, border-color 0.2s ease;
+    }
+    .idea:hover { transform: translateY(-2px); box-shadow: var(--shadow-elevated); border-color: color-mix(in srgb, var(--accent) 26%, transparent); }
+    .idea .q { font-size: 14.5px; font-weight: 600; letter-spacing: -0.01em; line-height: 1.4; margin-bottom: 6px; }
+    .idea .q::before { content: '\201C'; color: var(--accent); font-weight: 700; }
+    .idea .q::after { content: '\201D'; color: var(--accent); font-weight: 700; }
+    .idea .h { font-size: 12.5px; color: var(--text-tertiary); line-height: 1.5; }
+    .idea .h b { color: var(--text-secondary); font-weight: 600; }
+
+    /* Creative-studio screenshot pair — equal height, top-aligned, side by side */
+    #studio .shot-row { display: flex; justify-content: center; align-items: flex-start; gap: 20px; flex-wrap: wrap; }
+    #studio .shot-row .shot { max-width: none; margin: 0; }
+    #studio .shot-row .shot-frame img { height: clamp(200px, 27vw, 330px); width: auto; max-width: 100%; display: block; }
+  </style>
+</head>
+<body>
+
+  <nav>
+    <a href="../" class="nav-logo">
+      <img src="../appiconb.png" alt="MLX Core" class="nav-logo-img">
+      <span>mlx-serve</span>
+    </a>
+    <ul class="nav-links">
+      <li><a href="../" class="hide-mobile">Overview</a></li>
+      <li><a href="#studio" class="hide-mobile">What it makes</a></li>
+      <li><a href="#ideas" class="hide-mobile">Ideas</a></li>
+      <li><a href="#faq" class="hide-mobile">FAQ</a></li>
+      <li><a href="https://github.com/ddalcu/mlx-serve" class="nav-github" target="_blank" rel="noopener" aria-label="GitHub"><svg viewBox="0 0 16 16"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg></a></li>
+      <li><a href="https://github.com/ddalcu/mlx-serve/releases/latest/download/MLXCore.dmg" class="nav-dl">Download</a></li>
+    </ul>
+  </nav>
+
+  <section class="hero-f">
+    <div class="hero-f-glow"><span class="g1"></span><span class="g2"></span></div>
+    <div class="crumbs"><a href="../">mlx-serve</a><span class="sep">/</span><span class="here">Welcome · Getting started</span></div>
+    <h1>You installed MLX Core.<br><span class="grad">Here's the fun part.</span></h1>
+    <p class="hero-f-sub">It's a real AI assistant that lives entirely on your Mac — so it's <b>private</b>, <b>free forever</b>, and <b>works offline</b>. Chat with it, ask it about your own files, make images, music and voices, and let it run errands on your computer. Here's how to start in five minutes.</p>
+    <div class="hero-ctas">
+      <a href="https://github.com/ddalcu/mlx-serve/releases/latest/download/MLXCore.dmg" class="btn btn-primary">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+        Download for Mac
+      </a>
+      <a href="#start" class="btn btn-secondary">Take the 5-minute tour</a>
+    </div>
+    <div class="hero-f-meta">
+      <span><b>100%</b> on your Mac</span>
+      <span><b>Free</b> — no accounts, no subscription</span>
+      <span><b>Works offline</b></span>
+    </div>
+  </section>
+
+  <section class="section" style="padding-top: 12px;">
+    <figure class="shot reveal" data-pending="screenshot pending — mlxcore-screenshot-1.png">
+      <div class="shot-frame"><img src="../mlxcore-screenshot-1.png" alt="The MLX Core chat window running a local model on a Mac" loading="lazy"></div>
+      <figcaption>MLX Core — a friendly menu-bar app with a chat window, running a model entirely on your Mac.</figcaption>
+    </figure>
+  </section>
+
+  <!-- ─── GETTING STARTED ─── -->
+  <section class="section section-alt" id="start">
+    <div class="section-header reveal">
+      <div class="section-label">Start here</div>
+      <h2 class="section-title">Up and running in three steps</h2>
+      <p class="section-desc">No terminal, no setup, no keys to copy. If you can install an app, you can do this.</p>
+    </div>
+    <div class="steps reveal">
+      <div class="step">
+        <div class="step-num">1</div>
+        <h4>Find it in your menu bar</h4>
+        <p>MLX Core doesn't open a big window on its own — it lives in the <b>menu bar</b> at the top-right of your screen. Click its icon and choose <b>Open Chat</b>.</p>
+      </div>
+      <div class="step">
+        <div class="step-num">2</div>
+        <h4>Download a model</h4>
+        <p>Open <b>Models</b> and pick the recommended one — it's sized to your Mac. Click <b>Download</b> and wait a minute. This happens <b>once</b>; after that it runs offline.</p>
+      </div>
+      <div class="step">
+        <div class="step-num">3</div>
+        <h4>Start chatting</h4>
+        <p>Type a question and press return. Or, from <i>any</i> app, press <span class="kbd">⌃Space</span> to summon a quick prompt box. That's it — you're talking to your own private AI.</p>
+      </div>
+    </div>
+    <p class="section-desc reveal" style="text-align:center; max-width:620px; margin:36px auto 0; font-size:14.5px; color:var(--text-tertiary);">A "model" is the AI's brain — a file you download once. Bigger models are smarter but slower; the recommended one is a great place to start, and you can grab others any time.</p>
+  </section>
+
+  <!-- ─── TRY THESE FIRST ─── -->
+  <section class="section" id="first">
+    <div class="section-header reveal">
+      <div class="section-label">Try these first</div>
+      <h2 class="section-title">Three things that feel like magic</h2>
+      <p class="section-desc">The fastest way to "get" it. Each one takes under a minute and shows what only a <b>local</b> AI can do.</p>
+    </div>
+
+    <div class="split">
+      <div class="split-copy reveal">
+        <span class="split-kicker">One · ⌃Space</span>
+        <h3>Ask anything, from anywhere</h3>
+        <p>Press <span class="kbd">⌃Space</span> over any app — your browser, an email, a game — and a little prompt box appears. Ask your question; the answer <b>streams in right there</b>. No tab-switching, no logging in.</p>
+        <p>It's the fastest note-to-self, quick-question, "what's the word for…" habit you'll pick up. Follow-ups remember the conversation, and <span class="kbd">Esc</span> tucks it away.</p>
+      </div>
+      <div class="split-visual reveal">
+        <figure class="shot" data-pending="screenshot pending — quick-launcher.png">
+          <div class="shot-frame"><img src="../screenshots/quick-launcher.png" alt="The Quick Launcher: a Spotlight-style prompt panel floating over another app" loading="lazy"></div>
+          <figcaption>⌃Space over any app — ask, read, dismiss.</figcaption>
+        </figure>
+      </div>
+    </div>
+
+    <div class="split flip">
+      <div class="split-copy reveal">
+        <span class="split-kicker">Two · Your files</span>
+        <h3>Chat with your own documents</h3>
+        <p>Drag a <b>folder</b> into the chat and ask about what's inside — a lease, a stack of PDFs, your class notes, a pile of receipts. <i>"Which invoice is unpaid?"</i> · <i>"Summarize this into five bullets."</i> · <i>"Quiz me on chapter 3."</i></p>
+        <p>Because nothing leaves your Mac, this is the stuff you'd <b>never</b> paste into an online chatbot — taxes, medical letters, contracts — answered safely at home.</p>
+      </div>
+      <div class="split-visual reveal">
+        <figure class="shot" data-pending="screenshot pending — mlxcore-screenshot-1.png">
+          <div class="shot-frame"><img src="../mlxcore-screenshot-1.png" alt="Asking a local model questions about your own documents in the chat window" loading="lazy"></div>
+          <figcaption>Attach a folder and ask — your documents stay on your machine.</figcaption>
+        </figure>
+      </div>
+    </div>
+
+    <div class="split">
+      <div class="split-copy reveal">
+        <span class="split-kicker">Three · Voice</span>
+        <h3>Just talk to it, hands-free</h3>
+        <p>Turn on Voice Mode from the menu bar, say <b>"Hey Loki,"</b> and speak. It listens, thinks, and <b>answers out loud</b> — perfect while cooking, tidying, or away from the keyboard. Your voice is transcribed on the Mac and never uploaded.</p>
+        <p>Want it to reply in a familiar voice? Record a short clip and it can even answer in <a class="prose-link" href="../voice-cloning/">a cloned voice</a>.</p>
+      </div>
+      <div class="split-visual reveal">
+        <figure class="shot" data-pending="screenshot pending — voice-mode-orb.png">
+          <div class="shot-frame"><img src="../screenshots/voice-mode-orb.png" alt="Hands-free Voice Mode with an animated listening orb" loading="lazy"></div>
+          <figcaption>Hands-free Voice Mode — say the wake word and just talk.</figcaption>
+        </figure>
+      </div>
+    </div>
+  </section>
+
+  <!-- ─── CREATIVE STUDIO ─── -->
+  <section class="section section-alt" id="studio">
+    <div class="section-header reveal">
+      <div class="section-label">A creative studio in one app</div>
+      <h2 class="section-title">Not just chat — it makes things</h2>
+      <p class="section-desc">Pictures, music, voices, video, even 3D models — all generated <b>on your Mac</b>, with no monthly fee and no watermark. Pick a tab, describe what you want, and go.</p>
+    </div>
+
+    <div class="mini-grid reveal">
+      <div class="mini-card">
+        <span class="mini-k">Images</span>
+        <h4>Make art from a sentence</h4>
+        <p>Describe a picture — <i>"a watercolor fox in a snowy forest at golden hour"</i> — and get it in seconds. Great for cards, wallpapers, posters, and ideas.</p>
+      </div>
+      <div class="mini-card">
+        <span class="mini-k">Photo editing</span>
+        <h4>Edit a photo by just asking</h4>
+        <p>Drop in a photo and say <i>"make the sky a sunset"</i> or <i>"remove the background."</i> It keeps the rest of the picture — no design skills needed.</p>
+      </div>
+      <div class="mini-card">
+        <span class="mini-k">Music</span>
+        <h4>Turn a mood into a track</h4>
+        <p><i>"Lo-fi study beat, 90 bpm, rainy."</i> Get original background music and jingles you can actually use — nothing to license.</p>
+      </div>
+      <div class="mini-card">
+        <span class="mini-k">Voice</span>
+        <h4>Any text, read aloud</h4>
+        <p>Turn writing into natural speech — DIY audiobooks, voiceovers, or practice scripts — optionally in a voice you cloned from a few seconds of audio.</p>
+      </div>
+      <div class="mini-card">
+        <span class="mini-k">Video</span>
+        <h4>Bring a photo to life</h4>
+        <p>Animate a still image or generate a short clip from a prompt — with a soundtrack, or characters that speak your lines.</p>
+      </div>
+      <div class="mini-card">
+        <span class="mini-k">3D</span>
+        <h4>A photo into a 3D model</h4>
+        <p>Snap or drop a single photo and get a 3D model out — handy for 3D printing, games, and AR tinkering.</p>
+      </div>
+    </div>
+
+    <div class="shot-row reveal" style="margin-top:40px;">
+      <figure class="shot" data-pending="screenshot pending — imagegen-pane.png">
+        <div class="shot-frame"><img src="../screenshots/imagegen-pane.png" alt="The image generation pane creating a picture from a text prompt" loading="lazy"></div>
+        <figcaption>Type a description, get a picture — free and local.</figcaption>
+      </figure>
+      <figure class="shot" data-pending="screenshot pending — videogen-pane.png">
+        <div class="shot-frame"><img src="../screenshots/videogen-pane.png" alt="The video generation pane creating a clip from a prompt with LTX-Video" loading="lazy"></div>
+        <figcaption>Generate a video from a prompt or a photo.</figcaption>
+      </figure>
+    </div>
+  </section>
+
+  <!-- ─── GET THINGS DONE ─── -->
+  <section class="section" id="agent">
+    <div class="section-header reveal">
+      <div class="section-label">It can actually do things</div>
+      <h2 class="section-title">An assistant with hands</h2>
+      <p class="section-desc">Flip on <b>Agent mode</b> and it can tidy files, look things up, and build small things for you — with a safety rail you control.</p>
+    </div>
+
+    <div class="split">
+      <div class="split-copy reveal">
+        <span class="split-kicker">Agent mode</span>
+        <h3>Give it a chore, watch it work</h3>
+        <p>Ask in plain words: <i>"Organize my Downloads folder by type."</i> · <i>"Rename these photos by the date they were taken."</i> · <i>"Build me a little birthday-countdown web page"</i> — and it opens it in your browser when it's done.</p>
+        <ul class="ticks">
+          <li><svg viewBox="0 0 24 24" fill="none" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg><span><b>You set the leash.</b> Choose how much it's allowed to do; anything riskier pauses and asks first.</span></li>
+          <li><svg viewBox="0 0 24 24" fill="none" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg><span><b>It stays in its lane.</b> File actions are confined to a folder you pick.</span></li>
+          <li><svg viewBox="0 0 24 24" fill="none" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg><span><b>Nothing to configure.</b> The tools are built in — just describe the goal.</span></li>
+        </ul>
+      </div>
+      <div class="split-visual reveal">
+        <figure class="shot" data-pending="screenshot pending — agent-tool-calls.png">
+          <div class="shot-frame"><img src="../screenshots/agent-tool-calls.png" alt="Agent mode running tools to complete a task, with each step shown" loading="lazy"></div>
+          <figcaption>Agent mode shows each step it takes — no black box.</figcaption>
+        </figure>
+      </div>
+    </div>
+
+    <div class="section-header reveal" style="margin-top:80px;">
+      <h2 class="section-title" style="font-size:clamp(24px,3.4vw,32px);">…and it can keep working while you don't</h2>
+    </div>
+    <div class="mini-grid reveal">
+      <a class="mini-card" href="../local-ai-assistant/" style="text-decoration:none;color:inherit;">
+        <span class="mini-k">Schedules</span>
+        <h4>Daily jobs, on autopilot</h4>
+        <p>Hand it a recurring task — <i>"every morning at 8, summarize my watched sites"</i> — and it runs on its own, saving a transcript each time.</p>
+      </a>
+      <a class="mini-card" href="../local-ai-assistant/" style="text-decoration:none;color:inherit;">
+        <span class="mini-k">Telegram</span>
+        <h4>Text your Mac from your phone</h4>
+        <p>Message your own model from anywhere through a private Telegram bot — no cloud AI, and only your chat can reach it.</p>
+      </a>
+      <a class="mini-card" href="../claude-code-local/" style="text-decoration:none;color:inherit;">
+        <span class="mini-k">For the curious</span>
+        <h4>Power tools, when you want them</h4>
+        <p>Coding assistants, a built-in API, and a sandbox are all in there — ignore them until you're ready, then dive in.</p>
+      </a>
+    </div>
+  </section>
+
+  <!-- ─── IDEAS GALLERY ─── -->
+  <section class="section section-alt" id="ideas">
+    <div class="section-header reveal">
+      <div class="section-label">Cool things to try</div>
+      <h2 class="section-title">Steal these ideas</h2>
+      <p class="section-desc">Copy any line straight into the chat. This is what a private, always-available AI is actually good for.</p>
+    </div>
+
+    <div class="idea-groups">
+      <div class="idea-group reveal">
+        <div class="idea-group-head"><span class="ig-kicker">Everyday</span><h3>Your quiet, capable helper</h3></div>
+        <div class="idea-grid">
+          <div class="idea"><div class="q">Reply to this email — polite but firm.</div><div class="h">Paste the message; get a first draft you can tweak.</div></div>
+          <div class="idea"><div class="q">Explain this in plain English.</div><div class="h">Attach a bill, lease, or contract clause and ask.</div></div>
+          <div class="idea"><div class="q">Plan a 3-day trip to Lisbon on a budget.</div><div class="h">Just ask — no login, no paywall.</div></div>
+          <div class="idea"><div class="q">Help me word a difficult message.</div><div class="h">Think it through privately, then send.</div></div>
+        </div>
+      </div>
+
+      <div class="idea-group reveal">
+        <div class="idea-group-head"><span class="ig-kicker">Your files</span><h3>Answers from your own documents</h3></div>
+        <div class="idea-grid">
+          <div class="idea"><div class="q">Which of these invoices isn't paid?</div><div class="h"><b>Attach a folder</b> of receipts and let it check.</div></div>
+          <div class="idea"><div class="q">Summarize this 40-page report in 5 bullets.</div><div class="h">Drop in the PDF; get the gist in seconds.</div></div>
+          <div class="idea"><div class="q">Quiz me on my lecture notes.</div><div class="h">Point it at your notes folder before an exam.</div></div>
+          <div class="idea"><div class="q">Find the clause about cancellation.</div><div class="h">Search a stack of documents by meaning, not keywords.</div></div>
+        </div>
+      </div>
+
+      <div class="idea-group reveal">
+        <div class="idea-group-head"><span class="ig-kicker">Creative</span><h3>Make something today</h3></div>
+        <div class="idea-grid">
+          <div class="idea"><div class="q">A cozy cabin in the snow, storybook style.</div><div class="h"><b>Images</b> tab — describe it, generate.</div></div>
+          <div class="idea"><div class="q">Make the sky in this photo a sunset.</div><div class="h">Drop a photo and describe the change.</div></div>
+          <div class="idea"><div class="q">Upbeat 8-bit game music, 30 seconds.</div><div class="h"><b>Music</b> tab — original, license-free.</div></div>
+          <div class="idea"><div class="q">Read this bedtime story in my voice.</div><div class="h">Clone your voice, paste the text.</div></div>
+          <div class="idea"><div class="q">Turn this sneaker photo into a 3D model.</div><div class="h"><b>3D</b> tab — one image in, a model out.</div></div>
+          <div class="idea"><div class="q">Animate this photo of my dog.</div><div class="h"><b>Video</b> tab — bring a still to life.</div></div>
+        </div>
+      </div>
+
+      <div class="idea-group reveal">
+        <div class="idea-group-head"><span class="ig-kicker">Get it done</span><h3>Hand off the busywork</h3></div>
+        <div class="idea-grid">
+          <div class="idea"><div class="q">Organize my Downloads folder by type.</div><div class="h"><b>Agent mode</b> — it sorts, you approve.</div></div>
+          <div class="idea"><div class="q">Rename these photos by the date taken.</div><div class="h">Batch chores done in one go.</div></div>
+          <div class="idea"><div class="q">Build me a birthday-countdown web page.</div><div class="h">It writes it and opens it in your browser.</div></div>
+          <div class="idea"><div class="q">Every morning, brief me on my sites.</div><div class="h"><b>Schedule</b> it once; read the results daily.</div></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ─── WHY LOCAL ─── -->
+  <section class="section">
+    <div class="section-header reveal">
+      <div class="section-label">Why it's different</div>
+      <h2 class="section-title">The whole point is that it's yours</h2>
+      <p class="section-desc">A cloud chatbot meters you, remembers you, and needs a signal. This one asks for none of that — because it never leaves your Mac.</p>
+    </div>
+    <div class="stat-band reveal">
+      <div class="stat"><div class="n">$0</div><div class="l">forever — no subscription</div></div>
+      <div class="stat"><div class="n">0</div><div class="l">accounts, keys, or sign-ups</div></div>
+      <div class="stat"><div class="n">100%</div><div class="l">runs on your own Mac</div></div>
+      <div class="stat"><div class="n">✈️</div><div class="l">works with no internet</div></div>
+    </div>
+  </section>
+
+  <!-- ─── FAQ ─── -->
+  <section class="section section-alt" id="faq">
+    <div class="section-header reveal">
+      <div class="section-label">FAQ</div>
+      <h2 class="section-title">The questions everyone asks first</h2>
+    </div>
+    <div class="faq-wrap reveal">
+      <details class="faq-item" open>
+        <summary>Is it really free?</summary>
+        <p>Yes — completely. It's open source under the MIT license: no subscription, no accounts, no per-message cost. You download a model once and use it as much as you like. Even the images, music, voice, video, and 3D are free to make.</p>
+      </details>
+      <details class="faq-item">
+        <summary>Is my data private?</summary>
+        <p>Yes. Everything runs on your Mac — no telemetry, no analytics, no cloud service in the loop. You can turn Wi-Fi off and it still works. That's exactly why it's safe to ask about personal documents you'd never paste into an online chatbot. (One note: if you connect the optional Telegram bot, those messages travel through Telegram like any chat — but the AI, your files, and the tools all stay on your Mac.)</p>
+      </details>
+      <details class="faq-item">
+        <summary>Do I need to be technical?</summary>
+        <p>Not at all. It's a normal menu-bar app: click to download a recommended model, then chat. The advanced bits — agent tools, coding assistants, the developer API — stay out of your way until you go looking for them.</p>
+      </details>
+      <details class="faq-item">
+        <summary>What Mac do I need?</summary>
+        <p>An Apple Silicon Mac — that's any M1, M2, M3, M4, or M5. Small, quick models run happily on 8–16GB of memory; more memory unlocks larger, smarter models and heavier things like video and 3D. The app recommends a model that fits your machine.</p>
+      </details>
+      <details class="faq-item">
+        <summary>Which model should I pick?</summary>
+        <p>Start with the recommended one — it balances speed and quality for your Mac. When you're curious, open Models and try a bigger one; smarter usually means a little slower. You can keep several and switch anytime.</p>
+      </details>
+      <details class="faq-item">
+        <summary>Does it work offline?</summary>
+        <p>Yes. You need internet once, to download a model. After that, chatting, image generation, voice, and the rest all work fully offline — on a plane, in a cabin, anywhere.</p>
+      </details>
+      <details class="faq-item">
+        <summary>Will it slow my Mac down?</summary>
+        <p>It uses the graphics chip while it's answering, then goes idle. You can unload the model when you're done to free up memory, and load it again in a click next time.</p>
+      </details>
+    </div>
+  </section>
+
+  <!-- ─── RELATED ─── -->
+  <section class="section">
+    <div class="section-header reveal">
+      <div class="section-label">Go deeper</div>
+      <h2 class="section-title">Explore what else it does</h2>
+    </div>
+    <div class="related-grid reveal">
+      <a class="related-card" href="../local-ai-assistant/"><span class="related-kicker">Assistant</span><h4>Always-on assistant <span class="go">→</span></h4><p>Launcher, voice, phone, and schedules.</p></a>
+      <a class="related-card" href="../image-generation/"><span class="related-kicker">Media</span><h4>Image generation &amp; editing <span class="go">→</span></h4><p>Make and edit pictures, on device.</p></a>
+      <a class="related-card" href="../music-generation/"><span class="related-kicker">Media</span><h4>Music generation <span class="go">→</span></h4><p>Original tracks from a text prompt.</p></a>
+      <a class="related-card" href="../voice-cloning/"><span class="related-kicker">Media</span><h4>Voice cloning &amp; speech <span class="go">→</span></h4><p>Your voice, from seconds of audio.</p></a>
+      <a class="related-card" href="../video-generation/"><span class="related-kicker">Media</span><h4>Video generation <span class="go">→</span></h4><p>Text, photo, or soundtrack to video.</p></a>
+      <a class="related-card" href="../3d-generation/"><span class="related-kicker">Media</span><h4>3D generation <span class="go">→</span></h4><p>Turn a photo into a 3D model.</p></a>
+    </div>
+  </section>
+
+  <!-- ─── CTA ─── -->
+  <section class="section" style="padding-top: 0;">
+    <div class="cta-band reveal">
+      <h2>Your own AI, waiting in the menu bar.</h2>
+      <p>Free, private, and offline — with no accounts and nothing to cancel. Download it, download a model, and ask it your first question.</p>
+      <div class="hero-ctas">
+        <a href="https://github.com/ddalcu/mlx-serve/releases/latest/download/MLXCore.dmg" class="btn btn-primary">Download for Mac</a>
+        <a href="../" class="btn btn-secondary">See everything it does</a>
+      </div>
+    </div>
+  </section>
+
+  <footer>
+    <ul class="footer-links">
+      <li><a href="../">Home</a></li>
+      <li><a href="https://github.com/ddalcu/mlx-serve" target="_blank" rel="noopener">GitHub</a></li>
+      <li><a href="https://github.com/ddalcu/mlx-serve/releases" target="_blank" rel="noopener">Releases</a></li>
+      <li><a href="https://github.com/ddalcu/mlx-serve/blob/main/CHANGELOG.md" target="_blank" rel="noopener">Changelog</a></li>
+      <li><a href="https://github.com/ddalcu/mlx-serve/issues" target="_blank" rel="noopener">Issues</a></li>
+    </ul>
+    <p class="footer-copy">MIT License · mlx-serve · built for Apple Silicon</p>
+  </footer>
+
+  <script src="../assets/feature.js"></script>
+</body>
+</html>

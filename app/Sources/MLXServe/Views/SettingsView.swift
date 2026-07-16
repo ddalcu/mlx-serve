@@ -2048,6 +2048,19 @@ private struct MessagingSectionContent: View {
 /// mirrors the tray banner's one-click update.
 private struct UpdatesSectionContent: View {
     @ObservedObject var updates: UpdateChecker
+    /// Read once from `mlx-serve --version` (a print-and-exit that never boots
+    /// the server), so the embedded-engine versions show even when it's stopped.
+    @State private var engineVersions: [EngineVersion] = []
+
+    /// Engine rows to display — drops the `mlx-serve` app row (already shown as
+    /// "Installed version"). Falls back to the compile-time llama pin so the
+    /// section is never empty if the probe hasn't returned yet.
+    private var engineRows: [EngineVersion] {
+        let rows = engineVersions.filter { $0.name != "mlx-serve" }
+        return rows.isEmpty
+            ? [EngineVersion(name: "llama.cpp", version: UpdateChecker.bundledLlamaTag)]
+            : rows
+    }
 
     var body: some View {
         SettingsRow(
@@ -2077,6 +2090,22 @@ private struct UpdatesSectionContent: View {
             .disabled(busy)
         }
 
+        // Embedded-engine versions, read from `mlx-serve --version` — a
+        // print-and-exit path that never binds a port or loads a model, so
+        // Settings shows them even when the server is stopped.
+        ForEach(engineRows) { row in
+            SettingsRow(
+                title: "\(Self.engineLabel(row.name)) — \(row.version)",
+                explainer: Self.engineExplainer(row.name)
+            ) {
+                EmptyView()
+            }
+        }
+        .task {
+            guard engineVersions.isEmpty else { return }
+            engineVersions = await EngineVersions.probe(binaryPath: ServerManager.resolveBinaryPath())
+        }
+
         if let update = updates.available {
             SettingsRow(
                 title: "MLX Core v\(update.version) is available",
@@ -2103,6 +2132,31 @@ private struct UpdatesSectionContent: View {
         switch updates.phase {
         case .checking, .downloading, .installing: return true
         default: return false
+        }
+    }
+
+    /// Friendly display name for a raw `--version` component name.
+    private static func engineLabel(_ name: String) -> String {
+        switch name {
+        case "mlx": return "MLX"
+        case "mlx-c": return "mlx-c"
+        case "ggml": return "ggml"
+        case "llama.cpp": return "llama.cpp"
+        case "gguf": return "GGUF format"
+        case "ds4": return "ds4"
+        default: return name
+        }
+    }
+
+    private static func engineExplainer(_ name: String) -> String {
+        switch name {
+        case "mlx": return "Apple's MLX array framework — the native engine for `.safetensors` models."
+        case "mlx-c": return "The C bindings the server links MLX through."
+        case "ggml": return "The tensor library under the llama.cpp GGUF engine (with its short commit)."
+        case "llama.cpp": return "Pinned llama.cpp release serving `.gguf` models. Ships inside the app download."
+        case "gguf": return "GGUF file-format version the engine reads."
+        case "ds4": return "Embedded ds4 engine (DeepSeek-V4-Flash), pinned commit."
+        default: return ""
         }
     }
 

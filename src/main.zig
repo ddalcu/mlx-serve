@@ -21,8 +21,18 @@ const gen_mod = @import("gen.zig");
 const cli_mod = @import("cli.zig");
 const log = @import("log.zig");
 const metrics_mod = @import("metrics.zig");
+const version_mod = @import("version.zig");
 
 pub const VERSION: []const u8 = build_options.version;
+
+// ggml runtime version (llama.cpp), linked into the macOS exe. Referenced only
+// by the `--version` report, which runs before any engine init.
+extern "c" fn ggml_version() [*:0]const u8;
+extern "c" fn ggml_commit() [*:0]const u8;
+
+// GGUF file-format version — the compiled `GGUF_VERSION` in
+// lib/llama/include/gguf.h. Keep in sync if a llama.cpp bump changes it.
+const GGUF_FORMAT_VERSION = "3";
 
 const DEFAULT_MODEL_DIR = ""; // pass --model <path> to specify
 
@@ -30,6 +40,10 @@ const DEFAULT_MODEL_DIR = ""; // pass --model <path> to specify
 // parsing, read by the ds4 serve + offline open paths. Module-level to avoid
 // threading it through runDs4Serve's already-long parameter list.
 var ds4_ssd_streaming: bool = false;
+// Auto-load the ds4 MTP draft head (beside the model) for speculative decode.
+// Default on; `--no-ds4-mtp` disables it, and it's forced off under
+// `--ssd-streaming` (ds4 refuses the combination). Read by the same ds4 paths.
+var ds4_mtp: bool = true;
 
 /// `mlx-serve run` REPL thread: chats against the in-process server over
 /// its own Ollama /api/chat endpoint, then brings the server down cleanly
@@ -175,6 +189,10 @@ fn printUsage(io: std.Io) void {
         \\                        model in RAM (skips full residency + warmup).
         \\                        Use when the model is larger than available
         \\                        memory. Ignored by the MLX + llama.cpp engines.
+        \\  --no-ds4-mtp        ds4 only: don't auto-load the MTP draft head
+        \\                        (speculative decode). On by default when the
+        \\                        model dir ships one; auto-off under
+        \\                        --ssd-streaming (ds4 refuses the combination).
         \\  --model-dir <dir>   Directory of MLX models to discover at startup.
         \\                        Discovered siblings appear in /v1/models and
         \\                        can be loaded on-demand via /v1/load-model
@@ -349,9 +367,26 @@ pub fn main(init: std.process.Init) !void {
     var i: usize = arg_start;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--version")) {
-            var ver_buf: [64]u8 = undefined;
+            // Report app + every embedded engine version WITHOUT booting the
+            // server (the macOS app spawns this and parses it — src/version.zig,
+            // Swift EngineVersions). MLX + ggml self-report at runtime; mlx-c /
+            // ds4 / the llama.cpp tag have no runtime API and ride build options.
+            var mlx_ver = mlx.mlx_string_new();
+            defer _ = mlx.mlx_string_free(mlx_ver);
+            _ = mlx.mlx_version(&mlx_ver);
+            const info = version_mod.Info{
+                .app = VERSION,
+                .mlx = std.mem.span(mlx.mlx_string_data(mlx_ver)),
+                .mlx_c = build_options.mlx_c_version,
+                .ggml = std.mem.span(ggml_version()),
+                .ggml_commit = std.mem.span(ggml_commit()),
+                .llama_tag = build_options.llama_tag,
+                .gguf_format = GGUF_FORMAT_VERSION,
+                .ds4_commit = build_options.ds4_commit,
+            };
+            var ver_buf: [512]u8 = undefined;
             var ver_w = std.Io.File.stdout().writer(io, &ver_buf);
-            ver_w.interface.writeAll("mlx-serve " ++ VERSION ++ "\n") catch {};
+            version_mod.writeReport(&ver_w.interface, info) catch {};
             ver_w.interface.flush() catch {};
             return;
         } else if (std.mem.eql(u8, args[i], "--help") or std.mem.eql(u8, args[i], "-h")) {
@@ -585,6 +620,8 @@ pub fn main(init: std.process.Init) !void {
             }
         } else if (std.mem.eql(u8, args[i], "--ssd-streaming")) {
             ds4_ssd_streaming = true;
+        } else if (std.mem.eql(u8, args[i], "--no-ds4-mtp")) {
+            ds4_mtp = false;
         } else if (std.mem.eql(u8, args[i], "--kv-attn-mode") and i + 1 < args.len) {
             i += 1;
             if (std.mem.eql(u8, args[i], "dense")) {
@@ -1260,10 +1297,22 @@ fn runDs4Offline(
 
     log.info("[ds4] backend: Metal, model: {s}\n", .{gguf_path});
 
+    // Auto-load the MTP draft head beside the model for speculative decode
+    // (mirrors the serve path); skipped under ssd-streaming (ds4 refuses both).
+    const mtp_path: ?[]u8 = if (ds4_mtp and !ds4_ssd_streaming)
+        model_discovery.findDs4MtpSidecar(io, allocator, gguf_path)
+    else
+        null;
+    defer if (mtp_path) |p| allocator.free(p);
+    if (mtp_path) |p| log.info("[ds4] MTP draft head: {s}\n", .{p});
+
     var engine = ds4_arch.Ds4Engine.open(allocator, gguf_path, .{
         .backend = .metal,
         .warm_weights = true,
         .ssd_streaming = ds4_ssd_streaming,
+        .mtp_path = mtp_path,
+        .mtp_draft_tokens = if (mtp_path != null) 4 else 0,
+        .mtp_margin = 3.0,
     }) catch |err| {
         log.err("[ds4] engine open failed: {s}\n", .{@errorName(err)});
         return err;
@@ -1737,6 +1786,7 @@ fn runDs4Serve(
         .tokenize_cache_entries = server_mod.tokenize_cache_entries,
         .ds4_path = gguf_path_owned,
         .ds4_ssd_streaming = ds4_ssd_streaming,
+        .ds4_mtp = ds4_mtp,
         .metrics = server_mod.g_metrics,
     };
 

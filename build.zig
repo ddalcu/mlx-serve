@@ -46,9 +46,24 @@ pub fn build(b: *std.Build) void {
 
     const mas = b.option(bool, "mas", "MAS build (no curl/model-pull subprocess)") orelse false;
 
+    // Engine-version pins surfaced by `mlx-serve --version` (the macOS app spawns
+    // it and parses the output — see src/version.zig). These are the versions
+    // that have NO runtime query API (MLX + ggml report themselves at runtime):
+    //   --mlx-c-version  Homebrew mlx-c version (build.sh: `brew list --versions mlx-c`)
+    //   --ds4-commit     pinned ds4 submodule short commit (build.sh: `git rev-parse`)
+    //   --llama-tag      llama.cpp release tag; defaults from lib/llama/.version
+    //                    (written by scripts/fetch-llama.sh) so a plain dev build
+    //                    still reports it. app/build.sh passes all three.
+    const mlx_c_version = b.option([]const u8, "mlx-c-version", "Homebrew mlx-c version") orelse "unknown";
+    const ds4_commit = b.option([]const u8, "ds4-commit", "Pinned ds4 submodule short commit") orelse "unknown";
+    const llama_tag = b.option([]const u8, "llama-tag", "llama.cpp release tag (bNNNN)") orelse readLlamaTag(b) orelse "unknown";
+
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "version", version);
     build_options.addOption(bool, "mas", mas);
+    build_options.addOption([]const u8, "mlx_c_version", mlx_c_version);
+    build_options.addOption([]const u8, "ds4_commit", ds4_commit);
+    build_options.addOption([]const u8, "llama_tag", llama_tag);
     // false for the macOS exe/tests; the iOS static-lib step (`zig build ios-lib`)
     // builds its own options with ios=true so the engine swaps the macOS-only
     // ds4 + llama.cpp engines for no-op stubs (iOS serves MLX safetensors only).
@@ -381,6 +396,21 @@ fn addDs4Sources(b: *std.Build, module: *std.Build.Module) void {
         "-Wno-deprecated-declarations",
     };
     module.addCSourceFile(.{ .file = b.path("lib/ds4/ds4_metal.m"), .flags = objc_flags });
+}
+
+/// The llama.cpp tag staged by scripts/fetch-llama.sh (it writes LLAMA_TAG to
+/// `lib/llama/.version`). Read at configure time so a plain `zig build` reports
+/// the real tag without app/build.sh having to pass `--llama-tag`. Returns null
+/// (→ "unknown") when llama hasn't been fetched yet.
+fn readLlamaTag(b: *std.Build) ?[]const u8 {
+    const bytes = b.build_root.handle.readFileAlloc(
+        b.graph.io,
+        "lib/llama/.version",
+        b.allocator,
+        .limited(256),
+    ) catch return null;
+    const trimmed = std.mem.trim(u8, bytes, " \t\r\n");
+    return if (trimmed.len == 0) null else b.dupe(trimmed);
 }
 
 fn addLlamaLib(b: *std.Build, module: *std.Build.Module) void {

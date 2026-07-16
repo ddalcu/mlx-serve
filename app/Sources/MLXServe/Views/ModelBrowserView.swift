@@ -158,12 +158,12 @@ private struct RecommendedPane: View {
                 }
 
                 ModelGroupSection(
-                    title: "Hunyuan",
-                    subtitle: "Tencent's flagship 295B — the largest open model this app runs, for Macs with more than 128 GB.",
-                    systemImage: "h.circle",
+                    title: "Largest models (96 GB+ RAM)",
+                    subtitle: "The biggest models this app runs — DeepSeek-V4-Flash (ds4) and Tencent's 295B Hunyuan 3 — for Macs with a lot of memory.",
+                    systemImage: "memorychip",
                     tint: .red
                 ) {
-                    RecommendedFamilyRows(picks: RecommendedModelPick.hunyuanCatalog, physicalMemoryBytes: physicalMemory)
+                    RecommendedFamilyRows(picks: RecommendedModelPick.largestCatalog, physicalMemoryBytes: physicalMemory)
                 }
             }
             .padding(16)
@@ -233,7 +233,20 @@ private struct RecommendedModelListRow: View {
     @EnvironmentObject var server: ServerManager
     @State private var confirmDelete = false
 
-    private var isReady: Bool { downloads.isReady(pick.repoId) }
+    /// For a GGUF pick, the specific quant file on disk (the repo ships many);
+    /// nil until the folder resolves. Drives ready/use so a *different* quant of
+    /// the same repo doesn't read as this pick being downloaded.
+    private var ggufFilePath: String? {
+        guard let f = pick.ggufFilename, let dir = downloads.existingModelDir(for: pick.repoId) else { return nil }
+        return (dir as NSString).appendingPathComponent(f)
+    }
+    private var isReady: Bool {
+        if pick.ggufFilename != nil {
+            guard let p = ggufFilePath else { return false }
+            return FileManager.default.fileExists(atPath: p)
+        }
+        return downloads.isReady(pick.repoId)
+    }
     private var state: DownloadManager.DownloadState? { downloads.downloads[pick.repoId] }
 
     /// Soft signal only — sorts the pick behind the family's "Requires more
@@ -247,10 +260,10 @@ private struct RecommendedModelListRow: View {
     /// The on-disk model this row's repo resolves to, once downloaded —
     /// mirrors `ModelBrowserRow.usableModel`.
     private var usableModel: LocalModel? {
-        ModelBrowserUse.pickableModel(
-            atPath: downloads.existingModelDir(for: pick.repoId),
-            in: appState.localModels
-        )
+        // A GGUF quant's LocalModel.path is the FILE, not the repo dir — resolve
+        // against the specific quant so "Use" loads exactly this pick.
+        let path = pick.ggufFilename != nil ? ggufFilePath : downloads.existingModelDir(for: pick.repoId)
+        return ModelBrowserUse.pickableModel(atPath: path, in: appState.localModels)
     }
 
     var body: some View {
@@ -375,7 +388,16 @@ private struct RecommendedModelListRow: View {
     }
 
     private func startDownload() {
-        downloads.start(repoId: pick.repoId) { appState.refreshModels() }
+        if let f = pick.ggufFilename {
+            // GGUF/ds4 pick: fetch the specific quant (the download path also
+            // auto-pulls the ds4 MTP draft head).
+            downloads.startGguf(
+                repoId: pick.repoId,
+                quant: GgufQuant(filename: f, label: DownloadManager.quantLabel(forFilename: f))
+            ) { appState.refreshModels() }
+        } else {
+            downloads.start(repoId: pick.repoId) { appState.refreshModels() }
+        }
     }
 }
 
@@ -1330,12 +1352,16 @@ private struct GgufQuantMenu: View {
     private var menu: GgufQuantMenuModel.Menu {
         GgufQuantMenuModel.build(
             remote: remote,
-            onDisk: downloads.downloadedGgufFiles(repoId: repoId)
+            // Recursive paths so a sharded quant's nested shards are seen and an
+            // incomplete split reads as available (resume), not on-disk.
+            onDisk: downloads.downloadedGgufPaths(repoId: repoId)
         )
     }
 
     /// Where a quant lives on disk — the path the server loads and the tray
     /// picker selects, so "Use" here and picking it in the tray are the same act.
+    /// `quant.filename` is the repo-relative PRIMARY shard, so this resolves to
+    /// the `-00001` shard for a sharded quant (libllama auto-loads the rest).
     private func path(of quant: GgufQuant) -> String? {
         guard let dir = downloads.existingModelDir(for: repoId) else { return nil }
         return (dir as NSString).appendingPathComponent(quant.filename)
@@ -1369,7 +1395,9 @@ private struct GgufQuantMenu: View {
                 } else {
                     ForEach(m.available) { quant in
                         Button(quant.label) {
-                            downloads.startGguf(repoId: repoId, ggufFilename: quant.filename) {
+                            // Pass the whole quant — a sharded one pulls every
+                            // shard into `<model>/<quant>/`.
+                            downloads.startGguf(repoId: repoId, quant: quant) {
                                 appState.refreshModels()
                             }
                         }
@@ -1509,27 +1537,38 @@ private struct LocalModelRow: View {
                         ModelUseBadge(state: useState)
                     }
                 }
-                Button {
-                    confirmDelete = true
-                } label: {
-                    Image(systemName: "trash")
-                        .foregroundStyle(.red.opacity(0.7))
-                }
-                .buttonStyle(.plain)
-                .font(.callout)
-                .help(model.quantFile != nil ? "Delete this quant" : "Delete model")
-                .alert(model.quantFile != nil ? "Delete Quant" : "Delete Model", isPresented: $confirmDelete) {
-                    Button("Cancel", role: .cancel) {}
-                    Button("Delete", role: .destructive) {
-                        downloads.deleteModel(model)
-                        appState.refreshModels()
+                if let reason = model.externalReadOnlyReason {
+                    // Read-only: this model lives outside ~/.mlx-serve (LM Studio,
+                    // the HF hub cache, or a user-added custom folder). The app
+                    // loads it but never deletes into another tool's / the user's
+                    // tree, so we surface a badge instead of a trash.
+                    Image(systemName: "externaldrive.badge.icloud")
+                        .font(.callout)
+                        .foregroundStyle(.secondary)
+                        .help(reason)
+                } else {
+                    Button {
+                        confirmDelete = true
+                    } label: {
+                        Image(systemName: "trash")
+                            .foregroundStyle(.red.opacity(0.7))
                     }
-                } message: {
-                    // A GGUF row is ONE quant of a repo — deleting it must not
-                    // promise (or perform) the removal of its siblings.
-                    Text(model.quantFile != nil
-                         ? "Delete \(model.displayLabel)? Other quants of this model stay on disk."
-                         : "Delete \(model.name)? This will remove all downloaded files.")
+                    .buttonStyle(.plain)
+                    .font(.callout)
+                    .help(model.quantFile != nil ? "Delete this quant" : "Delete model")
+                    .alert(model.quantFile != nil ? "Delete Quant" : "Delete Model", isPresented: $confirmDelete) {
+                        Button("Cancel", role: .cancel) {}
+                        Button("Delete", role: .destructive) {
+                            downloads.deleteModel(model)
+                            appState.refreshModels()
+                        }
+                    } message: {
+                        // A GGUF row is ONE quant of a repo — deleting it must not
+                        // promise (or perform) the removal of its siblings.
+                        Text(model.quantFile != nil
+                             ? "Delete \(model.displayLabel)? Other quants of this model stay on disk."
+                             : "Delete \(model.name)? This will remove all downloaded files.")
+                    }
                 }
             }
             .frame(width: 120, alignment: .trailing)

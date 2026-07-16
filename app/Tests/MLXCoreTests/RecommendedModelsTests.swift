@@ -17,8 +17,8 @@ final class RecommendedModelsTests: XCTestCase {
     func testExactlyThreeFamiliesArePresent() {
         let families = Set(RecommendedModelPick.gemmaCatalog.map(\.family))
             .union(RecommendedModelPick.qwenCatalog.map(\.family))
-            .union(RecommendedModelPick.hunyuanCatalog.map(\.family))
-        XCTAssertEqual(families, [.gemma, .qwen, .hunyuan])
+            .union(RecommendedModelPick.largestCatalog.map(\.family))
+        XCTAssertEqual(families, [.gemma, .qwen, .largest])
     }
 
     /// A family catalog can't be empty — a section with zero rows would be a
@@ -26,7 +26,7 @@ final class RecommendedModelsTests: XCTestCase {
     func testNeitherFamilyCatalogIsEmpty() {
         XCTAssertFalse(RecommendedModelPick.gemmaCatalog.isEmpty)
         XCTAssertFalse(RecommendedModelPick.qwenCatalog.isEmpty)
-        XCTAssertFalse(RecommendedModelPick.hunyuanCatalog.isEmpty)
+        XCTAssertFalse(RecommendedModelPick.largestCatalog.isEmpty)
     }
 
     /// Every entry in `gemmaCatalog` is actually Gemma, and every entry in
@@ -38,8 +38,8 @@ final class RecommendedModelsTests: XCTestCase {
         for p in RecommendedModelPick.qwenCatalog {
             XCTAssertEqual(p.family, .qwen, p.id)
         }
-        for p in RecommendedModelPick.hunyuanCatalog {
-            XCTAssertEqual(p.family, .hunyuan, p.id)
+        for p in RecommendedModelPick.largestCatalog {
+            XCTAssertEqual(p.family, .largest, p.id)
         }
     }
 
@@ -50,21 +50,21 @@ final class RecommendedModelsTests: XCTestCase {
         XCTAssertEqual(gemmaSizes, gemmaSizes.sorted())
         let qwenSizes = RecommendedModelPick.qwenCatalog.map(\.sizeGB)
         XCTAssertEqual(qwenSizes, qwenSizes.sorted())
-        let hunyuanSizes = RecommendedModelPick.hunyuanCatalog.map(\.sizeGB)
+        let hunyuanSizes = RecommendedModelPick.largestCatalog.map(\.sizeGB)
         XCTAssertEqual(hunyuanSizes, hunyuanSizes.sorted())
     }
 
     /// No id collisions within or across the two catalogs — ids key the
     /// SwiftUI `ForEach`/download-state lookups.
     func testNoDuplicateIdsAcrossBothCatalogs() {
-        let ids = (RecommendedModelPick.gemmaCatalog + RecommendedModelPick.qwenCatalog + RecommendedModelPick.hunyuanCatalog).map(\.id)
+        let ids = (RecommendedModelPick.gemmaCatalog + RecommendedModelPick.qwenCatalog + RecommendedModelPick.largestCatalog).map(\.id)
         XCTAssertEqual(ids.count, Set(ids).count)
     }
 
     /// Every repo id must look like a real, resolvable HuggingFace path
     /// (`org/repo`, no whitespace) — a typo here silently 404s the download.
     func testRepoIdsAreWellFormed() {
-        for p in RecommendedModelPick.gemmaCatalog + RecommendedModelPick.qwenCatalog + RecommendedModelPick.hunyuanCatalog {
+        for p in RecommendedModelPick.gemmaCatalog + RecommendedModelPick.qwenCatalog + RecommendedModelPick.largestCatalog {
             XCTAssertTrue(p.repoId.contains("/"), p.repoId)
             XCTAssertFalse(p.repoId.contains(" "), p.repoId)
             XCTAssertEqual(p.repoId.split(separator: "/").count, 2, p.repoId)
@@ -74,7 +74,7 @@ final class RecommendedModelsTests: XCTestCase {
     /// Every entry needs real, non-empty plain-English copy — an empty blurb
     /// or tagline would silently render a blank description.
     func testEveryPickHasNonEmptyBeginnerCopy() {
-        for p in RecommendedModelPick.gemmaCatalog + RecommendedModelPick.qwenCatalog + RecommendedModelPick.hunyuanCatalog {
+        for p in RecommendedModelPick.gemmaCatalog + RecommendedModelPick.qwenCatalog + RecommendedModelPick.largestCatalog {
             XCTAssertFalse(p.name.isEmpty, p.id)
             XCTAssertFalse(p.tagline.isEmpty, p.id)
             XCTAssertGreaterThan(p.blurb.count, 40, "\(p.id) blurb reads as a stub")
@@ -107,18 +107,17 @@ final class RecommendedModelsTests: XCTestCase {
         XCTAssertTrue(pick.meetsSystemRequirements(physicalMemoryBytes: 32 * GiB))
     }
 
-    /// Hunyuan 3 is the "over 128 GB" recommendation: on a 128 GB Mac it
-    /// sorts behind the "Requires more RAM" disclosure (it RUNS there, with a
-    /// minimal context window — the blurb says so — but the recommendation
-    /// targets bigger Macs), while a 192 GB+ Mac sees it inline. The override
-    /// exists because the generic weights×1.2 formula reads 105 GB as
-    /// "fits on 128" — measured live, a 128 GB Mac needs the memory-preflight
-    /// override and pins a ~3K context.
-    func testHunyuan3IsGatedAbove128GB() {
+    /// Hunyuan 3 is now the imatrix 2-bit oQ2e build (~84 GB, full 192-expert
+    /// model) — the largest pick that still fits a 128 GB Mac WITH a usable
+    /// context window. It sorts INLINE on 128 GB (weights×1.2 ≈ 100 GB ≤ 128)
+    /// but lands behind the "Requires more RAM" disclosure on a 96 GB Mac. The
+    /// older ~105 GB mixed build was gated above 128 because it left almost no
+    /// context; this build is the fix, so the gate moved down.
+    func testHunyuan3FitsOn128GBButNotBelow() {
         let hy3 = RecommendedModelPick.hy3_295b
-        XCTAssertFalse(hy3.meetsSystemRequirements(physicalMemoryBytes: 128 * GiB))
-        XCTAssertTrue(hy3.meetsSystemRequirements(physicalMemoryBytes: 192 * GiB))
-        XCTAssertTrue(hy3.blurb.contains("128 GB"), "blurb must carry the runs-on-128 caveat")
+        XCTAssertTrue(hy3.meetsSystemRequirements(physicalMemoryBytes: 128 * GiB))
+        XCTAssertFalse(hy3.meetsSystemRequirements(physicalMemoryBytes: 96 * GiB))
+        XCTAssertTrue(hy3.blurb.contains("128 GB"), "blurb must name the 128 GB target")
     }
 
     // MARK: - Partitioning (inline vs "Requires more RAM" disclosure)
@@ -164,6 +163,25 @@ final class RecommendedModelsTests: XCTestCase {
         let repoIds = Set(RecommendedModelPick.gemmaCatalog.map(\.repoId))
         XCTAssertTrue(repoIds.contains("mlx-community/gemma-4-e4b-it-4bit"))
         XCTAssertTrue(repoIds.contains("mlx-community/gemma-4-12b-it-4bit"))
+    }
+
+    /// The "Largest models" section holds the biggest picks, ordered smallest-
+    /// first like every other catalog: the compact ~84 GB Hunyuan 3 oQ2e build
+    /// then the ~87 GB DeepSeek-V4-Flash ds4 GGUF.
+    func testLargestSectionHoldsHunyuanThenDeepseek() {
+        XCTAssertEqual(RecommendedModelPick.largestCatalog.map(\.id), ["hy3-oq2e", "deepseek-v4-flash"])
+    }
+
+    /// DeepSeek-V4-Flash is a GGUF/ds4 pick: it names the specific imatrix quant
+    /// to download (the repo ships many), which routes the pane to the GGUF
+    /// download path + ds4 MTP auto-download. Safetensors picks carry no file.
+    func testDeepseekV4FlashIsAnImatrixGgufPick() {
+        let ds4 = RecommendedModelPick.deepseekV4Flash
+        XCTAssertEqual(ds4.family, .largest)
+        XCTAssertEqual(ds4.repoId, "antirez/deepseek-v4-gguf")
+        XCTAssertEqual(ds4.ggufFilename?.contains("imatrix"), true, "curated pick must be the imatrix build")
+        XCTAssertEqual(ds4.ggufFilename?.contains("IQ2XXS"), true)
+        XCTAssertNil(RecommendedModelPick.gemmaE4B.ggufFilename, "safetensors picks fetch the whole repo")
     }
 
     /// The old 0.8B entry-level Qwen pick was replaced with 9B — too small

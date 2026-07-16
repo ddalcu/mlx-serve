@@ -200,8 +200,37 @@ final class ModelBrowserSectionTests: XCTestCase {
     }
 
     func testEverySourceHasAGroupTitle() {
-        for source in [LocalModelSource.mlxServe, .lmStudio, .custom] {
+        for source in [LocalModelSource.mlxServe, .lmStudio, .huggingFace, .custom] {
             XCTAssertFalse(ModelBrowserUse.groupTitle(source).isEmpty, "\(source)")
+        }
+    }
+
+    /// HF cache models group into their own section, ordered after LM Studio's
+    /// "Other Discovered Models" and before the user's custom folder.
+    func testHuggingFaceModelsGroupIntoTheirOwnSectionInOrder() {
+        let hf = LocalModel(id: "/hf/a", name: "mlx-community/Qwen3", path: "/hf/a", sizeFormatted: "1 GB",
+                            modelType: "qwen3", source: .huggingFace, kind: .base)
+        let mlx = local("mlx-b", path: "/mlx/b")
+        let groups = ModelBrowserUse.groupedBySource([hf, mlx], filter: "")
+        XCTAssertEqual(groups.map(\.source), [.mlxServe, .huggingFace])
+        XCTAssertFalse(ModelBrowserUse.groupTitle(.huggingFace).isEmpty)
+    }
+
+    /// Only models physically in `~/.mlx-serve/models` (source `.mlxServe`) are
+    /// app-deletable. LM Studio's folder, the Hugging Face hub cache, and a
+    /// user-added custom folder are all owned by another tool or the user — the
+    /// app loads them read-only and never offers a trash for them (deleting an
+    /// HF snapshot orphans shared blobs; the others simply aren't ours to remove).
+    func testOnlyMlxServeModelsAreDeletable() {
+        let mine = LocalModel(id: "x", name: "n", path: "/p", sizeFormatted: "1 GB",
+                              modelType: "qwen3", source: .mlxServe, kind: .base)
+        XCTAssertTrue(mine.isDeletable)
+        XCTAssertNil(mine.externalReadOnlyReason)
+        for src in [LocalModelSource.lmStudio, .huggingFace, .custom] {
+            let m = LocalModel(id: "x", name: "n", path: "/p", sizeFormatted: "1 GB",
+                               modelType: "qwen3", source: src, kind: .base)
+            XCTAssertFalse(m.isDeletable, "\(src) lives outside ~/.mlx-serve and must not be deletable")
+            XCTAssertNotNil(m.externalReadOnlyReason, "\(src) needs a read-only badge explanation")
         }
     }
 }

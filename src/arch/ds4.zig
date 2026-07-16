@@ -204,7 +204,9 @@ pub const OpenOptions = struct {
     n_threads: c_int = 0,
     warm_weights: bool = true,
     quality: bool = false,
-    mtp_path: ?[:0]const u8 = null,
+    /// Optional MTP draft-head GGUF (ds4 speculative decode). The engine dupes
+    /// it to a NUL-terminated string, so a plain slice is fine here.
+    mtp_path: ?[]const u8 = null,
     mtp_draft_tokens: c_int = 0,
     mtp_margin: f32 = 0,
     /// SSD weight-streaming (issue #39): skip full model residency + warmup and

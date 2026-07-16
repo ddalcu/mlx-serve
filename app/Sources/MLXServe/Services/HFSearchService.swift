@@ -209,7 +209,10 @@ class HFSearchService: ObservableObject {
         await withTaskGroup(of: (String, FallbackSize)?.self) { group in
             for model in models {
                 group.addTask {
-                    guard let url = URL(string: "https://huggingface.co/api/models/\(model.id)/tree/main") else { return nil }
+                    // `?recursive=true` so a sharded GGUF's nested shards are
+                    // listed — `parseFallbackSize` sums each quant's shards, so
+                    // a subfoldered repo reports a real size instead of "—".
+                    guard let url = URL(string: "https://huggingface.co/api/models/\(model.id)/tree/main?recursive=true") else { return nil }
                     guard let (data, response) = try? await URLSession.shared.data(from: url),
                           let http = response as? HTTPURLResponse, http.statusCode == 200,
                           let raw = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else { return nil }
@@ -288,20 +291,23 @@ class HFSearchService: ObservableObject {
 
     /// Decide which fallback-size shape to record for a model given its
     /// tree-API file list. Safetensors wins when present (matches existing
-    /// behavior). Otherwise consider non-mmproj top-level `.gguf` files
-    /// ≥ 1 MB — single → `ggufSingle`, two or more → `ggufRange` (min, max).
-    /// Returns nil when the repo has neither (the caller leaves the model
-    /// with `ramEstimate == "Unknown"`).
+    /// behavior). Otherwise the servable `.gguf` files are folded into quants
+    /// (shard groups) and each quant's shards are SUMMED — single quant →
+    /// `ggufSingle`, two or more → `ggufRange` (min, max) across the quant
+    /// totals. Returns nil when the repo has neither (the caller leaves the
+    /// model with `ramEstimate == "Unknown"`).
     ///
     /// Why exclude:
-    /// - mmproj sidecars (`mmproj-*.gguf`): CLIP vision/audio encoders, not
-    ///   loadable as LLMs by either engine — `DownloadManager.isMmprojGguf`
-    ///   filters them everywhere else; mirror that here so the row's size
-    ///   doesn't pull in a 200 MB sidecar that the user can't actually pick.
-    /// - subdir files (path contains `/`): split-shard GGUF layouts the
-    ///   single-file download path can't reassemble.
-    /// - files < 1 MB: README stubs / LFS pointer files that occasionally
-    ///   show up with non-zero sizes; would skew the min downward.
+    /// - mmproj / tokenizer sidecars: CLIP encoders / speech tokenizers, not
+    ///   loadable as LLMs — `DownloadManager.isSupportedGguf` filters them
+    ///   everywhere else; mirror that here so the row's size doesn't pull in a
+    ///   200 MB sidecar the user can't actually pick.
+    /// - files < 1 MB: README stubs / LFS pointer files that occasionally show
+    ///   up with non-zero sizes; would skew the min downward.
+    ///
+    /// Split shards (`<quant>/<quant>-00001-of-MMMMM.gguf`) are NOT excluded any
+    /// more — they're summed into their quant, since the download path now
+    /// reassembles a sharded quant.
     nonisolated static func parseFallbackSize(files: [TreeFileEntry]) -> FallbackSize? {
         let safetensorsSum = files
             .filter { $0.path.hasSuffix(".safetensors") }
@@ -310,20 +316,19 @@ class HFSearchService: ObservableObject {
             return .safetensorsSum(safetensorsSum)
         }
 
-        let ggufSizes: [Int64] = files
-            .filter { entry in
-                let lower = entry.path.lowercased()
-                guard lower.hasSuffix(".gguf") else { return false }
-                if entry.path.contains("/") { return false }                  // subdir / split shard
-                if (entry.path as NSString).lastPathComponent
-                    .lowercased().hasPrefix("mmproj") { return false }        // CLIP sidecar
-                return entry.size >= 1_000_000
-            }
-            .map(\.size)
+        let sizeByPath: [String: Int64] = Dictionary(
+            files
+                .filter { DownloadManager.isSupportedGguf($0.path) && $0.size >= 1_000_000 }
+                .map { ($0.path, $0.size) },
+            uniquingKeysWith: { first, _ in first }
+        )
+        let quantTotals: [Int64] = GgufQuant.groupQuants(Array(sizeByPath.keys))
+            .map { quant in quant.allFiles.reduce(Int64(0)) { $0 + (sizeByPath[$1] ?? 0) } }
+            .filter { $0 > 0 }
             .sorted()
 
-        guard let lo = ggufSizes.first else { return nil }
-        let hi = ggufSizes.last ?? lo
+        guard let lo = quantTotals.first else { return nil }
+        let hi = quantTotals.last ?? lo
         return lo == hi ? .ggufSingle(lo) : .ggufRange(min: lo, max: hi)
     }
 }

@@ -155,6 +155,9 @@ struct StatusMenuView: View {
     /// Slot ids with an unload in flight (the eject button becomes a spinner —
     /// an unload can take seconds while the server drains a running request).
     @State private var unloadingIds: Set<String> = []
+    /// The model slot whose name was just copied — flips its copy icon to a
+    /// checkmark for 1.5 s, then reverts (mirrors the endpoint-copy feedback).
+    @State private var copiedModelName: String?
     let openChat: () -> Void
     let openModelBrowser: () -> Void
     let openImageGen: () -> Void
@@ -240,6 +243,7 @@ struct StatusMenuView: View {
                             let dupNames = LocalModel.duplicateNames(in: pickable)
                             let mlxServe = pickable.filter { $0.source == .mlxServe }
                             let lmStudio = pickable.filter { $0.source == .lmStudio }
+                            let huggingFace = pickable.filter { $0.source == .huggingFace }
                             let custom = pickable.filter { $0.source == .custom }
                             if !mlxServe.isEmpty {
                                 Section("MLX-Serve Models") {
@@ -251,6 +255,13 @@ struct StatusMenuView: View {
                             if !lmStudio.isEmpty {
                                 Section("Other Discovered Models") {
                                     ForEach(lmStudio) { model in
+                                        Text(modelPickerLabel(model, dupNames: dupNames)).tag(model.path)
+                                    }
+                                }
+                            }
+                            if !huggingFace.isEmpty {
+                                Section("Hugging Face Cache") {
+                                    ForEach(huggingFace) { model in
                                         Text(modelPickerLabel(model, dupNames: dupNames)).tag(model.path)
                                     }
                                 }
@@ -712,6 +723,23 @@ struct StatusMenuView: View {
                     .font(.caption2.monospaced())
                     .foregroundStyle(.tertiary)
             }
+            // Copy the model's full name/id to the clipboard (paste into a curl,
+            // a config file, etc.) — the row truncates it, so copy is the only
+            // way to get the whole string.
+            Button {
+                NSPasteboard.general.clearContents()
+                NSPasteboard.general.setString(info.name, forType: .string)
+                copiedModelName = info.name
+                DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+                    if copiedModelName == info.name { copiedModelName = nil }
+                }
+            } label: {
+                Image(systemName: copiedModelName == info.name ? "checkmark" : "doc.on.doc")
+                    .font(.caption2)
+            }
+            .buttonStyle(.borderless)
+            .foregroundStyle(copiedModelName == info.name ? .green : .secondary)
+            .help("Copy model name")
             if unloadingIds.contains(info.name) {
                 ProgressView()
                     .controlSize(.mini)

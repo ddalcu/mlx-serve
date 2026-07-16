@@ -13,7 +13,7 @@
 # Bump LLAMA_TAG to upgrade; CI and local builds re-fetch automatically.
 set -euo pipefail
 
-LLAMA_TAG="${LLAMA_TAG:-b9999}"
+LLAMA_TAG="${LLAMA_TAG:-b10034}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"

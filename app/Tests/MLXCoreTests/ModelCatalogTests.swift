@@ -19,6 +19,24 @@ final class ModelCatalogTests: XCTestCase {
         )
     }
 
+    /// The DeepSeek-V4-Flash ds4 entry rides in the tray, points at the imatrix
+    /// quant (better quality at the same size), and — being a `deepseek_v4`
+    /// GGUF — its download auto-pulls the MTP draft head via the shared
+    /// `startGguf` path (`DownloadManager.mtpSidecarPath`). Pins that the tray
+    /// download gets the imatrix model + MTP without a tray-specific code path.
+    func testDeepseekV4FlashTrayEntryUsesImatrixAndTriggersMtpAutoDownload() {
+        guard let ds4 = gemmaModelOptions.first(where: { $0.id == "dsv4-flash-gguf" }) else {
+            return XCTFail("DeepSeek-V4-Flash (ds4) must be in the curated catalog")
+        }
+        XCTAssertTrue(gemmaModelOptionsTrayMenu.contains { $0.id == ds4.id },
+                      "DS4 must surface in the menu-bar tray (id carries the \"dsv4\" token)")
+        let file = ds4.ggufFilename ?? ""
+        XCTAssertTrue(file.contains("imatrix"), "tray DS4 must download the imatrix build, got \(file)")
+        XCTAssertTrue(file.contains("IQ2XXS"))
+        // A `deepseek_v4` primary is what routes the download to MTP auto-pull.
+        XCTAssertEqual(DownloadManager.ggufModelType(forBasename: file), "deepseek_v4")
+    }
+
     /// Class guard: ids are the dictionary key into download state, so collisions
     /// silently merge two models' progress.
     func testCatalogIdsAreUnique() {

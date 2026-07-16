@@ -178,6 +178,10 @@ pub const LoadParams = struct {
     /// SSD weight-streaming for the ds4 engine (issue #39): stream experts from
     /// disk instead of requiring the full model resident in RAM.
     ds4_ssd_streaming: bool = false,
+    /// Auto-load the ds4 MTP draft head (found beside the model) for speculative
+    /// decode. Default on; forced off when `ds4_ssd_streaming` (ds4 refuses the
+    /// combination). `--no-ds4-mtp` disables it.
+    ds4_mtp: bool = true,
     /// Like `ds4_path` but for the generic llama.cpp engine (any GGUF except
     /// DeepSeek-V4-Flash). The inference thread opens a `LlamaEngine` and
     /// installs it on the entry's `llama_engine` field. Mutually exclusive with
@@ -820,6 +824,10 @@ pub const LoadRequest = struct {
     /// SSD weight-streaming for cold-loaded ds4 models (issue #39). The CLI
     /// startup path supplies this via LoadParams; cold-load defaults it off.
     ds4_ssd_streaming: bool = false,
+    /// Auto-load the ds4 MTP draft head beside a cold-loaded ds4 model. Default
+    /// on (a switched-to ds4 model gets speculative decode); forced off under
+    /// `ds4_ssd_streaming`.
+    ds4_mtp: bool = true,
     /// Auto-load the Qwen native MTP sidecar when the model dir ships one.
     mtp_enabled: bool = true,
     /// Max MTP draft depth (CLI --mtp-depth; 0 = auto, resolved by
@@ -2005,12 +2013,40 @@ fn buildGgufStubCpuState(allocator: std.mem.Allocator, engine: gguf_meta.Engine,
 /// embedded engine. The stub `config`/`tok`/`chat_config` come in via
 /// `params.config`/`params.tok`/`params.chat_config` (main.zig allocates
 /// them); the entry takes ownership.
+/// ds4 MTP speculative-decode defaults. `draft_tokens` MUST be > 1 to engage
+/// (ds4 gates on it); margin 3.0 mirrors ds4's own default acceptance margin.
+/// The scratch buffer holds the verified token + up to ds4's 16-draft cap.
+const DS4_MTP_DRAFT_TOKENS: c_int = 4;
+const DS4_MTP_MARGIN: f32 = 3.0;
+const DS4_MTP_MAX_TOKENS: usize = 17;
+
+/// Whether a ds4 decode step should use MTP speculative decode: the engine
+/// loaded a draft head (`has_mtp`), it's configured for >1 draft token, and
+/// sampling is greedy (ds4's spec path is argmax-based — temp>0 falls back to
+/// the normal sampler). Pure + unit-tested; mirrors ds4's own CLI gate.
+fn ds4MtpShouldEngage(has_mtp: bool, draft_tokens: c_int, temperature: f32) bool {
+    return has_mtp and draft_tokens > 1 and temperature <= 0.0;
+}
+
 fn doLoadDs4OnInferenceThread(sch: *Scheduler, params: anytype) !void {
     log.info("[ds4] opening engine: {s}\n", .{params.ds4_path});
+    // Auto-load the MTP draft head sitting beside the model for speculative
+    // decode. ds4 refuses `--mtp` together with `--ssd-streaming`, so the sidecar
+    // is only sought when streaming is off; `ds4_mtp` (default on) gates opt-out.
+    const mtp_path: ?[]u8 = if (params.ds4_mtp and !params.ds4_ssd_streaming)
+        model_discovery.findDs4MtpSidecar(sch.io, sch.allocator, params.ds4_path)
+    else
+        null;
+    defer if (mtp_path) |p| sch.allocator.free(p);
+    if (mtp_path) |p| log.info("[ds4] MTP draft head: {s}\n", .{p});
+
     const engine = try arch_ds4.Ds4Engine.open(sch.allocator, params.ds4_path, .{
         .backend = .metal,
         .warm_weights = true,
         .ssd_streaming = params.ds4_ssd_streaming,
+        .mtp_path = mtp_path,
+        .mtp_draft_tokens = if (mtp_path != null) DS4_MTP_DRAFT_TOKENS else 0,
+        .mtp_margin = DS4_MTP_MARGIN,
     });
     errdefer engine.close();
     log.info("[ds4] engine ready (EOS={d}, has_mtp={})\n", .{ engine.eosToken(), engine.hasMtp() });
@@ -3482,6 +3518,38 @@ fn runDs4DecodeTick(sch: *Scheduler, slot: *Slot, session: *arch_ds4.Ds4Session)
         return;
     }
 
+    // MTP speculative decode: ONE call commits the sampled token AND drafts +
+    // verifies several more, advancing ds4's KV internally (no separate eval).
+    // It emits `[sampled, accepted…]`, so this tick may push several tokens.
+    // Mirrors ds4's own CLI loop; engages only under greedy sampling.
+    if (ds4MtpShouldEngage(engine.hasMtp(), engine.mtpDraftTokens(), slot.sampling.temperature)) {
+        var spec_buf: [DS4_MTP_MAX_TOKENS]i32 = undefined;
+        const done: i64 = @intCast(slot.completion_tokens);
+        const cap: i64 = @intCast(slot.max_tokens);
+        const remaining: i32 = @intCast(@max(@as(i64, 1), cap - done));
+        const n = session.evalSpeculative(next_id, remaining, engine.eosToken(), spec_buf[0..]) catch {
+            slot.markError("ds4_spec_failed");
+            return;
+        };
+        const n_usize: usize = if (n > 0) @intCast(n) else 0;
+        for (spec_buf[0..n_usize]) |t| {
+            const t_u32: u32 = @intCast(t);
+            // EOS may appear mid-batch — stop, and never emit it.
+            if (t == engine.eosToken() or generate_mod.isEosId(t_u32, slot.eos_token_ids)) {
+                finishSlot(sch, slot, "stop");
+                return;
+            }
+            slot.pushToken(t_u32);
+            if (t_u32 != 0) slot.was_pad_only = false;
+            slot.completion_tokens += 1;
+            if (slot.completion_tokens >= slot.max_tokens) {
+                finishSlot(sch, slot, "length");
+                return;
+            }
+        }
+        return;
+    }
+
     slot.pushToken(tok_u32);
     if (tok_u32 != 0) slot.was_pad_only = false;
     slot.completion_tokens += 1;
@@ -3494,6 +3562,16 @@ fn runDs4DecodeTick(sch: *Scheduler, slot: *Slot, session: *arch_ds4.Ds4Session)
         finishSlot(sch, slot, "length");
         return;
     }
+}
+
+test "ds4MtpShouldEngage: draft head + >1 draft tokens + greedy" {
+    // Engages only greedily (ds4's spec path is argmax) with a loaded head.
+    try std.testing.expect(ds4MtpShouldEngage(true, 4, 0.0));
+    try std.testing.expect(ds4MtpShouldEngage(true, 2, -1.0));
+    // No head, or 1 draft token, or sampling (temp>0) → regular decode.
+    try std.testing.expect(!ds4MtpShouldEngage(false, 4, 0.0));
+    try std.testing.expect(!ds4MtpShouldEngage(true, 1, 0.0));
+    try std.testing.expect(!ds4MtpShouldEngage(true, 4, 0.7));
 }
 
 /// llama.cpp decode tick: argmax (temp < 0.01, matching the MLX greedy

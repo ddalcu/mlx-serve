@@ -8387,28 +8387,32 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
                 lw.mlp.moe.router_scale = folded;
             }
         } else if (layer_is_moe and is_hy3) {
-            // Hy3 (hy_v3): stacked experts under mlp.experts.* (already
-            // [E, out, packed] in MLX conversions — never per-expert), the
-            // QUANTIZED router under mlp.router.gate.* (8-bit on shipped
-            // checkpoints; scales optional for a bf16 parity build), the
-            // f32 selection bias mlp.expert_bias, and an UNGATED shared
-            // expert under mlp.shared_mlp.* (absent on 0-shared configs —
-            // binds empty and moeMLP skips the branch). route_norm and
-            // router_scaling_factor ride on the weights struct so moeMLP2
-            // needs no config re-derivation per call.
+            // Hy3 (hy_v3): stacked experts (already [E, out, packed] in MLX
+            // conversions — never per-expert), the QUANTIZED router under
+            // mlp.router.gate.* (8-bit on shipped checkpoints; scales optional
+            // for a bf16 build — mlx-community oQ2e ships a bf16 router), the
+            // f32 selection bias mlp.expert_bias, and an UNGATED shared expert
+            // under mlp.shared_mlp.* (absent on 0-shared configs — binds empty
+            // and moeMLP skips the branch). route_norm and router_scaling_factor
+            // ride on the weights struct so moeMLP2 needs no config re-derivation
+            // per call. The expert container name varies by converter
+            // (`mlp.experts.*` in ox-ox builds, `mlp.switch_mlp.*` in mlx-lm
+            // builds) — probe once and thread the resolved name through.
+            const ex = hy3ExpertContainer(weights, name_buf, prefix, li);
+            var exbuf: [64]u8 = undefined;
             lw.mlp = .{ .moe = .{
                 .router_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.router.gate.weight"),
                 .router_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.router.gate.scales") orelse mlx.mlx_array_new(),
                 .router_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.router.gate.biases") orelse mlx.mlx_array_new(),
-                .switch_gate_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.experts.gate_proj.weight"),
-                .switch_gate_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.experts.gate_proj.scales") orelse mlx.mlx_array_new(),
-                .switch_gate_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.experts.gate_proj.biases") orelse mlx.mlx_array_new(),
-                .switch_up_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.experts.up_proj.weight"),
-                .switch_up_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.experts.up_proj.scales") orelse mlx.mlx_array_new(),
-                .switch_up_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.experts.up_proj.biases") orelse mlx.mlx_array_new(),
-                .switch_down_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.experts.down_proj.weight"),
-                .switch_down_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.experts.down_proj.scales") orelse mlx.mlx_array_new(),
-                .switch_down_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.experts.down_proj.biases") orelse mlx.mlx_array_new(),
+                .switch_gate_w = getLayerWeight(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "gate_proj.weight")),
+                .switch_gate_s = getLayerWeightOpt(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "gate_proj.scales")) orelse mlx.mlx_array_new(),
+                .switch_gate_b = getLayerWeightOpt(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "gate_proj.biases")) orelse mlx.mlx_array_new(),
+                .switch_up_w = getLayerWeight(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "up_proj.weight")),
+                .switch_up_s = getLayerWeightOpt(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "up_proj.scales")) orelse mlx.mlx_array_new(),
+                .switch_up_b = getLayerWeightOpt(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "up_proj.biases")) orelse mlx.mlx_array_new(),
+                .switch_down_w = getLayerWeight(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "down_proj.weight")),
+                .switch_down_s = getLayerWeightOpt(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "down_proj.scales")) orelse mlx.mlx_array_new(),
+                .switch_down_b = getLayerWeightOpt(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "down_proj.biases")) orelse mlx.mlx_array_new(),
                 .shared_gate_w = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_mlp.gate_proj.weight") orelse mlx.mlx_array_new(),
                 .shared_gate_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_mlp.gate_proj.scales") orelse mlx.mlx_array_new(),
                 .shared_gate_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_mlp.gate_proj.biases") orelse mlx.mlx_array_new(),
@@ -9221,6 +9225,28 @@ fn getLayerWeight(weights: *const Weights, buf: *[256]u8, prefix: []const u8, la
         log.err("MISSING WEIGHT: {s}\n", .{name});
         unreachable;
     };
+}
+
+/// Build a "<container>.<leaf>" layer-weight suffix into `buf`. Used where the
+/// stacked-MoE-expert container is named differently across converters — hy_v3
+/// experts are `mlp.experts.*` in ox-ox-style MLX builds and `mlp.switch_mlp.*`
+/// in mlx-lm builds (mlx-community Hy3-oQ2*, pipenetwork Hy3-REAP*), same
+/// [E, out, in] tensor either way. Uses its own buffer so it can compose with
+/// getLayerWeight's separate key buffer in one expression.
+fn moeExpertSuffix(buf: []u8, container: []const u8, leaf: []const u8) []const u8 {
+    return std.fmt.bufPrint(buf, "{s}.{s}", .{ container, leaf }) catch unreachable;
+}
+
+/// Resolve the hy_v3 stacked-expert container name for a layer. ox-ox-style MLX
+/// conversions stack the experts under `mlp.experts.*`; mlx-lm's converter
+/// (mlx-community Hy3-oQ2*, pipenetwork Hy3-REAP*) names the SAME [E, out, in]
+/// tensors `mlp.switch_mlp.*`. Prefers `experts` when present, so an ox-ox
+/// checkpoint binds byte-identically to before this fallback existed.
+fn hy3ExpertContainer(weights: *const Weights, buf: *[256]u8, prefix: []const u8, layer: u32) []const u8 {
+    return if (getLayerWeightOpt(weights, buf, prefix, layer, "mlp.experts.gate_proj.weight") != null)
+        "mlp.experts"
+    else
+        "mlp.switch_mlp";
 }
 
 /// Fetch a quantization scale/bias tensor, tolerant of dense bf16 models.
@@ -10085,6 +10111,42 @@ fn testReadF32(arr: mlx.mlx_array, out: []f32, s: mlx.mlx_stream) !void {
     try mlx.check(mlx.mlx_eval(ev));
     const data = mlx.mlx_array_data_float32(flat) orelse return error.TestUnexpectedNullData;
     @memcpy(out, data[0..out.len]);
+}
+
+test "hy3ExpertContainer resolves both mlx-lm switch_mlp and ox-ox experts naming" {
+    // hy_v3 MoE experts stack under `mlp.experts.*` in ox-ox-style MLX builds
+    // but `mlp.switch_mlp.*` in mlx-lm builds (mlx-community Hy3-oQ2e,
+    // pipenetwork Hy3-REAP*). Same [E, out, in] tensor; the loader must accept
+    // either name or it crashes with MISSING WEIGHT at load (live 2026-07-16).
+    const allocator = testing.allocator;
+    var buf: [256]u8 = undefined;
+    const put = struct {
+        fn add(w: *Weights, alloc: std.mem.Allocator, key: []const u8) !void {
+            const k = try alloc.dupe(u8, key);
+            try w.map.put(k, mlx.mlx_array_new());
+        }
+    }.add;
+
+    // mlx-lm build: only switch_mlp present → resolver picks it (was the crash).
+    {
+        var w = Weights.init(allocator);
+        defer w.deinit();
+        try put(&w, allocator, "model.layers.1.mlp.switch_mlp.gate_proj.weight");
+        try testing.expectEqualStrings("mlp.switch_mlp", hy3ExpertContainer(&w, &buf, "model", 1));
+    }
+    // ox-ox build: experts present → preferred, so it binds byte-identically.
+    {
+        var w = Weights.init(allocator);
+        defer w.deinit();
+        try put(&w, allocator, "model.layers.1.mlp.experts.gate_proj.weight");
+        try testing.expectEqualStrings("mlp.experts", hy3ExpertContainer(&w, &buf, "model", 1));
+    }
+    // The suffix builder composes the resolved container with each leaf.
+    var sbuf: [64]u8 = undefined;
+    try testing.expectEqualStrings(
+        "mlp.switch_mlp.down_proj.scales",
+        moeExpertSuffix(&sbuf, "mlp.switch_mlp", "down_proj.scales"),
+    );
 }
 
 test "splitPackedGateUp slices DiffusionGemma experts.gate_up_proj into gate/up halves" {

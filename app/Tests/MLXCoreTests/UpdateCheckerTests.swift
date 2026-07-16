@@ -54,6 +54,19 @@ final class UpdateCheckerTests: XCTestCase {
         XCTAssertFalse(UpdateChecker.isNewer("v26.8.0", than: "dev"))
     }
 
+    // MARK: - Bundled llama.cpp tag (surfaced in Settings ▸ Updates)
+
+    /// The pinned llama.cpp release must mirror `LLAMA_TAG` in
+    /// `scripts/fetch-llama.sh` (the source of truth). This pins the shape
+    /// (`b<digits>`) so an accidental blanking/typo is caught; keep the value
+    /// itself in sync with the fetch script when bumping the engine.
+    func testBundledLlamaTagIsAWellFormedRelease() {
+        XCTAssertEqual(UpdateChecker.bundledLlamaTag, "b10034",
+                       "keep in sync with LLAMA_TAG in scripts/fetch-llama.sh")
+        XCTAssertTrue(UpdateChecker.bundledLlamaTag.hasPrefix("b"))
+        XCTAssertTrue(UpdateChecker.bundledLlamaTag.dropFirst().allSatisfy(\.isNumber))
+    }
+
     // MARK: - GitHub releases/latest JSON → AppUpdate
 
     private func releaseJSON(

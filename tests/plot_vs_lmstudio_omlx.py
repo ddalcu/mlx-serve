@@ -267,6 +267,7 @@ def render(csv_path: Path, png_out: Path, family: str,
     # mlx-serve spec cells a spec="best" variant collapses over, and the
     # display name the delta label uses for the winning spec.
     BEST_SPECS = {"none": "AR", "pld": "PLD", "drafter": "drafter", "mtp": "MTP"}
+    SPEC_DISPLAY_TO_KEY = {disp: s for s, disp in BEST_SPECS.items()}
 
     def cell_val(logical: str, variant: str, spec: str, key: str):
         """(value, winning_spec_display) for one cell; spec 'best' takes the
@@ -476,6 +477,51 @@ def render(csv_path: Path, png_out: Path, family: str,
                             ha="center", va="bottom",
                             fontsize=9, color=gcolor, fontweight="bold",
                         )
+        # Embedded top-left prefill mini-chart per model group: a small
+        # horizontal reference chart (own x-scale, own group's engines only)
+        # instead of a second bar sharing the decode axis — prefill tok/s is
+        # 5-15x decode tok/s, so a shared axis would squash the decode bars.
+        # Pinned to a strip above panel_max (no real bar can reach it, since
+        # ymax = panel_max * 1.18) so it never overlaps a decode bar.
+        for mi, logical in enumerate(models):
+            rows = []  # (color, short, prefill_value), top-to-bottom = variant order
+            for vi in group_layout[mi]:
+                variant, spec, _label, color, _is_baseline, _show_delta, short = variants[vi]
+                val, win = cell_val(logical, variant, spec, workload_key)
+                if spec == "best" and win is not None:
+                    pf_val = data.get((logical, variant, SPEC_DISPLAY_TO_KEY[win]), {}).get("prefill", 0)
+                else:
+                    pf_val = cell_val(logical, variant, spec, "prefill")[0]
+                if pf_val > 0:
+                    rows.append((color, short, pf_val))
+            if not rows:
+                continue
+            gx = x[mi]
+            box_left = gx - group_step * 0.48
+            box_w = group_step * 0.96
+            inset_ax = ax.inset_axes(
+                [box_left + box_w * 0.03, ymax * 0.855, box_w * 0.40, ymax * 0.12],
+                transform=ax.transData,
+            )
+            pf_max = max(v for _, _, v in rows)
+            ys = np.arange(len(rows))[::-1]
+            for (rcolor, rshort, pf_val), y in zip(rows, ys):
+                inset_ax.barh(y, pf_val, height=0.6, color=rcolor,
+                               edgecolor="#1f2937", linewidth=0.3, zorder=2)
+                inset_ax.text(pf_val + pf_max * 0.06, y, f"{pf_val:.0f}",
+                              va="center", ha="left", fontsize=4.6, color="#374151")
+            inset_ax.set_xlim(0, pf_max * 1.5)
+            inset_ax.set_ylim(-0.6, len(rows) - 0.4)
+            inset_ax.set_xticks([])
+            inset_ax.set_yticks([])
+            for spine in inset_ax.spines.values():
+                spine.set_visible(True)
+                spine.set_color("#e5e7eb")
+                spine.set_linewidth(0.5)
+            inset_ax.set_facecolor("white")
+            inset_ax.patch.set_alpha(0.95)
+            inset_ax.set_title("prefill tok/s", fontsize=4.8, color="#6b7280",
+                               pad=1.2, loc="left")
         if legend_handles is None:
             legend_handles, legend_labels = ax.get_legend_handles_labels()
         ax.set_xticks(x)

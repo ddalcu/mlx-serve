@@ -44,6 +44,23 @@ final class GgufQuantTests: XCTestCase {
         return dir
     }
 
+    /// A sharded/subfoldered GGUF repo as HF lays out a large quant and
+    /// `downloadGguf` writes it: `<model>/<quant>/<quant>-NNNNN-of-MMMMM.gguf`.
+    /// `quants` maps a quant subfolder name → its shard basenames.
+    @discardableResult
+    private func makeShardedGgufRepo(_ repoId: String, quants: [String: [String]]) throws -> String {
+        let dir = DownloadManager.newLayoutDir(rootDir: tempRoot, repoId: repoId)
+        for (sub, shards) in quants {
+            let subDir = (dir as NSString).appendingPathComponent(sub)
+            try FileManager.default.createDirectory(atPath: subDir, withIntermediateDirectories: true)
+            for f in shards {
+                let path = (subDir as NSString).appendingPathComponent(f)
+                try Data(count: 2_000_000).write(to: URL(fileURLWithPath: path))
+            }
+        }
+        return dir
+    }
+
     // MARK: - Disk resolution
 
     func testExistingModelDirResolvesGgufOnlyFolder() throws {
@@ -91,8 +108,14 @@ final class GgufQuantTests: XCTestCase {
     func testTokenizerSidecarIsNotAQuant() throws {
         XCTAssertFalse(DownloadManager.isSupportedGguf("qwen3-tts-tokenizer-f16.gguf"))
         XCTAssertFalse(DownloadManager.isSupportedGguf("mmproj-F16.gguf"))
+        // The MTP draft head (antirez/deepseek-v4-gguf) is a speculative-decode
+        // dependency, not a selectable chat quant — it was leaking into the
+        // Discover dropdown as a bogus "Q4K" entry.
+        XCTAssertFalse(DownloadManager.isSupportedGguf("DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf"))
         XCTAssertTrue(DownloadManager.isSupportedGguf("qwen3-tts-0.6b-f16.gguf"))
         XCTAssertTrue(DownloadManager.isSupportedGguf("Qwen3.5-4B-Q4_K_M.gguf"))
+        // A real chat quant whose long scheme name merely contains "mtp" is fine.
+        XCTAssertTrue(DownloadManager.isSupportedGguf("DeepSeek-V4-Flash-IQ2XXS-chat-v2.gguf"))
 
         let dir = try makeGgufRepo("local/qwen3-tts-0.6b", files: [
             "qwen3-tts-0.6b-f16.gguf",
@@ -103,6 +126,108 @@ final class GgufQuantTests: XCTestCase {
         )
         XCTAssertEqual(models.map(\.quantFile), ["qwen3-tts-0.6b-f16.gguf"],
                        "the tokenizer sidecar is not a selectable model")
+    }
+
+    // MARK: - Sharded repos on disk
+
+    func testDownloadedGgufPathsFindsEveryShard() throws {
+        try makeShardedGgufRepo("vcruz305/Hy3-GGUF", quants: [
+            "Hy3-IQ1_M": ["Hy3-IQ1_M-00001-of-00002.gguf", "Hy3-IQ1_M-00002-of-00002.gguf"],
+        ])
+        XCTAssertEqual(
+            DownloadManager.downloadedGgufPaths(rootDir: tempRoot, repoId: "vcruz305/Hy3-GGUF"),
+            ["Hy3-IQ1_M/Hy3-IQ1_M-00001-of-00002.gguf", "Hy3-IQ1_M/Hy3-IQ1_M-00002-of-00002.gguf"],
+            "shards live in a subfolder — the walk must recurse and return repo-relative paths"
+        )
+    }
+
+    func testExistingModelDirResolvesShardedFolder() throws {
+        let dir = try makeShardedGgufRepo("vcruz305/Hy3-GGUF", quants: [
+            "Hy3-IQ1_M": ["Hy3-IQ1_M-00001-of-00002.gguf", "Hy3-IQ1_M-00002-of-00002.gguf"],
+        ])
+        XCTAssertEqual(DownloadManager.existingModelDir(rootDir: tempRoot, repoId: "vcruz305/Hy3-GGUF"), dir,
+                       "a folder whose only .gguf files are nested shards still holds a model")
+    }
+
+    func testShardedDiscoveryEmitsOneModelPointingAtThePrimaryShard() throws {
+        let dir = try makeShardedGgufRepo("vcruz305/Hy3-GGUF", quants: [
+            "Hy3-IQ1_M": ["Hy3-IQ1_M-00001-of-00002.gguf", "Hy3-IQ1_M-00002-of-00002.gguf"],
+            "Hy3-IQ2_M": ["Hy3-IQ2_M-00001-of-00003.gguf", "Hy3-IQ2_M-00002-of-00003.gguf", "Hy3-IQ2_M-00003-of-00003.gguf"],
+        ])
+        let models = DownloadManager.makeLocalModels(
+            atDir: dir, displayName: "vcruz305/Hy3-GGUF",
+            idKey: "vcruz305/Hy3-GGUF", source: .mlxServe
+        ).sorted { $0.displayLabel < $1.displayLabel }
+
+        XCTAssertEqual(models.count, 2, "one model per shard GROUP, not per shard file")
+        XCTAssertEqual(models.map(\.displayLabel), [
+            "vcruz305/Hy3-GGUF · IQ1_M",
+            "vcruz305/Hy3-GGUF · IQ2_M",
+        ])
+        // path = the primary (-00001) shard — llama.cpp auto-loads the rest.
+        XCTAssertEqual(models[0].path, (dir as NSString).appendingPathComponent("Hy3-IQ1_M/Hy3-IQ1_M-00001-of-00002.gguf"))
+        XCTAssertEqual(models[1].path, (dir as NSString).appendingPathComponent("Hy3-IQ2_M/Hy3-IQ2_M-00001-of-00003.gguf"))
+        XCTAssertTrue(models.allSatisfy { $0.isChatPickable })
+        XCTAssertEqual(Set(models.map(\.id)).count, 2, "ids stay unique across sharded quants")
+    }
+
+    func testDeletingAShardedQuantRemovesEveryShardAndTheSubfolder() throws {
+        let dir = try makeShardedGgufRepo("vcruz305/Hy3-GGUF", quants: [
+            "Hy3-IQ1_M": ["Hy3-IQ1_M-00001-of-00002.gguf", "Hy3-IQ1_M-00002-of-00002.gguf"],
+            "Hy3-IQ2_M": ["Hy3-IQ2_M-00001-of-00002.gguf", "Hy3-IQ2_M-00002-of-00002.gguf"],
+        ])
+        let primary = (dir as NSString).appendingPathComponent("Hy3-IQ1_M/Hy3-IQ1_M-00001-of-00002.gguf")
+
+        XCTAssertTrue(DownloadManager.removeGgufQuant(at: primary, roots: [tempRoot]))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: (dir as NSString).appendingPathComponent("Hy3-IQ1_M")),
+                       "the whole quant subfolder (every shard) is gone")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: (dir as NSString).appendingPathComponent("Hy3-IQ2_M")),
+                      "a sibling quant subfolder survives")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: dir))
+    }
+
+    /// The discovery walk calls `makeLocalModels` on an AUTHOR dir first and
+    /// recurses into children only when it returns []. A sharded model's shards
+    /// live TWO levels below the author (`author/model/quant/shard`), so the
+    /// author-level call must find nothing — otherwise every sharded repo under
+    /// one author collapses into a single bogus author-named model and the real
+    /// per-repo entries are never produced.
+    func testMakeLocalModelsOnAnAuthorDirFindsNothingSoDiscoveryRecurses() throws {
+        try makeShardedGgufRepo("vcruz305/Hy3-GGUF", quants: [
+            "Hy3-IQ1_M": ["Hy3-IQ1_M-00001-of-00002.gguf", "Hy3-IQ1_M-00002-of-00002.gguf"],
+        ])
+        // A second sharded repo under the SAME author — must not merge with the first.
+        try makeShardedGgufRepo("vcruz305/Other-GGUF", quants: [
+            "Other-Q4_K_M": ["Other-Q4_K_M-00001-of-00002.gguf", "Other-Q4_K_M-00002-of-00002.gguf"],
+        ])
+        let author = (tempRoot as NSString).appendingPathComponent("vcruz305")
+        let atAuthor = DownloadManager.makeLocalModels(
+            atDir: author, displayName: "vcruz305", idKey: "vcruz305", source: .mlxServe)
+        XCTAssertTrue(atAuthor.isEmpty, "an author dir is not a model — recurse into it, never merge its repos")
+    }
+
+    /// An interrupted split download (some shards present) is not a loadable
+    /// model — it must not appear in the tray; it stays a resumable partial.
+    func testMakeLocalModelsSkipsIncompleteShardedQuant() throws {
+        let dir = try makeShardedGgufRepo("vcruz305/Hy3-GGUF", quants: [
+            "Hy3-IQ1_M": ["Hy3-IQ1_M-00001-of-00002.gguf"],   // only 1 of 2
+        ])
+        let models = DownloadManager.makeLocalModels(
+            atDir: dir, displayName: "vcruz305/Hy3-GGUF", idKey: "vcruz305/Hy3-GGUF", source: .mlxServe)
+        XCTAssertTrue(models.isEmpty, "an incomplete split isn't a loadable model")
+    }
+
+    func testDeletingTheLastShardedQuantRemovesTheRepoAndPrunesTheAuthorDir() throws {
+        let dir = try makeShardedGgufRepo("vcruz305/Hy3-GGUF", quants: [
+            "Hy3-IQ1_M": ["Hy3-IQ1_M-00001-of-00002.gguf", "Hy3-IQ1_M-00002-of-00002.gguf"],
+        ])
+        let primary = (dir as NSString).appendingPathComponent("Hy3-IQ1_M/Hy3-IQ1_M-00001-of-00002.gguf")
+
+        XCTAssertTrue(DownloadManager.removeGgufQuant(at: primary, roots: [tempRoot]))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: dir), "empty repo folder goes with the last quant")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: (tempRoot as NSString).appendingPathComponent("vcruz305")),
+                       "the now-empty author dir is pruned")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: tempRoot), "never climb past a scan root")
     }
 
     // MARK: - Discovery: one model per quant
@@ -260,6 +385,164 @@ final class GgufQuantTests: XCTestCase {
             remote: ["Q-Q4_K_M.gguf", "Q-Q8_0.gguf"], onDisk: ["Q-Q4_K_M.gguf"]
         )
         XCTAssertFalse(menu.available.isEmpty, "a downloaded quant must not close the door on the others")
+    }
+
+    // MARK: - MTP auto-download resolver
+
+    func testMtpSidecarPathFindsTheDraftHead() {
+        // Real antirez/deepseek-v4-gguf tree: the MTP draft head is fetched
+        // alongside whichever chat quant the user picks.
+        let files = [
+            "DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf",
+            "DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf",
+            "imatrix/DeepSeek-V4-Flash-chat-v2-routed-moe-ds4-1p5m.dat",
+            "README.md",
+        ]
+        XCTAssertEqual(DownloadManager.mtpSidecarPath(in: files), "DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf")
+    }
+
+    func testMtpSidecarPathNilWhenNoDraftHead() {
+        XCTAssertNil(DownloadManager.mtpSidecarPath(in: ["Model-Q4_K_M.gguf", "Model-Q8_0.gguf", "README.md"]))
+    }
+
+    // MARK: - Sharded / subfoldered quants (a quant = a shard group)
+    //
+    // Large GGUFs (anything HF splits over ~50 GB) ship each quant as a
+    // SUBFOLDER of split shards: `Hy3-IQ1_M/Hy3-IQ1_M-00001-of-00002.gguf`,
+    // `…-00002-of-00002.gguf`. The single-file assumption dropped all of them.
+    // A quant is now a shard group: primary = the `-00001` shard (the path the
+    // server loads), completeness = present-shard-count == MMMMM.
+
+    func testGroupQuantsFoldsShardsIntoOneQuant() {
+        let quants = GgufQuant.groupQuants([
+            "Hy3-IQ1_M/Hy3-IQ1_M-00002-of-00002.gguf",
+            "Hy3-IQ1_M/Hy3-IQ1_M-00001-of-00002.gguf",
+        ])
+        XCTAssertEqual(quants.count, 1, "the two shards are ONE quant")
+        XCTAssertEqual(quants[0].label, "IQ1_M")
+        XCTAssertEqual(quants[0].filename, "Hy3-IQ1_M/Hy3-IQ1_M-00001-of-00002.gguf",
+                       "primary = the -00001 shard (the path the server loads)")
+        XCTAssertEqual(quants[0].shards.count, 2)
+        XCTAssertEqual(quants[0].allFiles.sorted(), [
+            "Hy3-IQ1_M/Hy3-IQ1_M-00001-of-00002.gguf",
+            "Hy3-IQ1_M/Hy3-IQ1_M-00002-of-00002.gguf",
+        ])
+        XCTAssertTrue(quants[0].isComplete, "both shards present ⇒ complete")
+    }
+
+    func testGroupQuantsSeparatesDistinctSubfolderedQuants() {
+        let quants = GgufQuant.groupQuants([
+            "Hy3-IQ1_M/Hy3-IQ1_M-00001-of-00002.gguf",
+            "Hy3-IQ1_M/Hy3-IQ1_M-00002-of-00002.gguf",
+            "Hy3-IQ2_M/Hy3-IQ2_M-00001-of-00003.gguf",
+            "Hy3-IQ2_M/Hy3-IQ2_M-00002-of-00003.gguf",
+            "Hy3-IQ2_M/Hy3-IQ2_M-00003-of-00003.gguf",
+        ]).sorted { $0.label < $1.label }
+        XCTAssertEqual(quants.map(\.label), ["IQ1_M", "IQ2_M"])
+        XCTAssertEqual(quants[0].shards.count, 2)
+        XCTAssertEqual(quants[1].shards.count, 3)
+    }
+
+    // MARK: - Label disambiguation (colliding quant tokens)
+    //
+    // antirez/deepseek-v4-gguf encodes tier (Flash vs Pro), quant scheme, AND an
+    // imatrix flag in each filename, but `quantLabel` keeps only the quant token
+    // — so four distinct IQ2XXS files all showed as "IQ2XXS" in the dropdown with
+    // no way to tell them apart. When labels collide, the distinguishing filename
+    // tokens (tier / imatrix prioritized) are appended.
+
+    func testGroupQuantsDisambiguatesFourWayCollision() {
+        let quants = GgufQuant.groupQuants([
+            "DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf",
+            "DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2.gguf",
+            "DeepSeek-V4-Pro-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-Instruct-imatrix.gguf",
+            "DeepSeek-V4-Pro-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-Instruct.gguf",
+        ])
+        XCTAssertEqual(quants.count, 4)
+        XCTAssertEqual(Set(quants.map(\.label)), [
+            "IQ2XXS · Flash · imatrix",
+            "IQ2XXS · Flash",
+            "IQ2XXS · Pro · imatrix",
+            "IQ2XXS · Pro",
+        ])
+    }
+
+    func testGroupQuantsImatrixOnlyDifference() {
+        // The base (no imatrix) keeps the plain label; only the imatrix one is tagged.
+        let quants = GgufQuant.groupQuants([
+            "Model-IQ2XXS-imatrix.gguf",
+            "Model-IQ2XXS.gguf",
+        ])
+        XCTAssertEqual(Set(quants.map(\.label)), ["IQ2XXS · imatrix", "IQ2XXS"])
+    }
+
+    func testGroupQuantsNonCollidingLabelsStayPlain() {
+        let quants = GgufQuant.groupQuants([
+            "Model-Q4_K_M.gguf",
+            "Model-Q8_0.gguf",
+        ])
+        XCTAssertEqual(quants.map(\.label), ["Q4_K_M", "Q8_0"], "unique labels get no suffix")
+    }
+
+    func testGroupQuantsCollisionWithNoTierOrQualityMarkerFallsBackToUniqueToken() {
+        // Two files whose only difference is a non-tier, non-imatrix token still
+        // get distinguished by that token.
+        let quants = GgufQuant.groupQuants([
+            "Model-Q4_K_M-chat.gguf",
+            "Model-Q4_K_M-instruct.gguf",
+        ])
+        XCTAssertEqual(Set(quants.map(\.label)), ["Q4_K_M · chat", "Q4_K_M · instruct"])
+    }
+
+    func testGroupQuantsSingleFileUnchanged() {
+        // A non-split quant is a group of one with an EMPTY shards list (the
+        // single-file callers — the existing menu tests — depend on this).
+        let quants = GgufQuant.groupQuants([
+            "Qwen3.5-4B-Q8_0.gguf",
+            "Qwen3.5-4B-Q4_K_M.gguf",
+            "mmproj-F16.gguf",          // sidecar, dropped
+        ])
+        XCTAssertEqual(quants.map(\.filename), ["Qwen3.5-4B-Q4_K_M.gguf", "Qwen3.5-4B-Q8_0.gguf"])
+        XCTAssertTrue(quants.allSatisfy { $0.shards.isEmpty }, "single-file ⇒ empty shard list")
+        XCTAssertEqual(quants.map(\.allFiles), [["Qwen3.5-4B-Q4_K_M.gguf"], ["Qwen3.5-4B-Q8_0.gguf"]])
+        XCTAssertTrue(quants.allSatisfy { $0.isComplete })
+    }
+
+    func testShardCountParsesTotal() {
+        XCTAssertEqual(GgufQuant.shardCount(forName: "Hy3-IQ1_M-00001-of-00002.gguf"), 2)
+        XCTAssertEqual(GgufQuant.shardCount(forName: "Hy3-IQ2_M/Hy3-IQ2_M-00003-of-00007.gguf"), 7)
+        XCTAssertNil(GgufQuant.shardCount(forName: "Qwen3.5-4B-Q4_K_M.gguf"), "non-split ⇒ nil")
+    }
+
+    /// A partial group (1 of 2 shards on disk) is NOT on-disk in the menu —
+    /// it's an interrupted download that should read as available/resume.
+    func testPartialShardGroupIsNotOnDisk() {
+        let menu = GgufQuantMenuModel.build(
+            remote: [
+                "Hy3-IQ1_M/Hy3-IQ1_M-00001-of-00002.gguf",
+                "Hy3-IQ1_M/Hy3-IQ1_M-00002-of-00002.gguf",
+            ],
+            onDisk: ["Hy3-IQ1_M/Hy3-IQ1_M-00001-of-00002.gguf"]   // only 1 of 2
+        )
+        XCTAssertTrue(menu.onDisk.isEmpty, "an incomplete shard group isn't on disk")
+        XCTAssertEqual(menu.available.map(\.label), ["IQ1_M"], "it's offered as available (resume)")
+    }
+
+    func testCompleteShardGroupIsOnDisk() {
+        let menu = GgufQuantMenuModel.build(
+            remote: [
+                "Hy3-IQ1_M/Hy3-IQ1_M-00001-of-00002.gguf",
+                "Hy3-IQ1_M/Hy3-IQ1_M-00002-of-00002.gguf",
+                "Hy3-IQ2_M/Hy3-IQ2_M-00001-of-00002.gguf",
+                "Hy3-IQ2_M/Hy3-IQ2_M-00002-of-00002.gguf",
+            ],
+            onDisk: [
+                "Hy3-IQ1_M/Hy3-IQ1_M-00001-of-00002.gguf",
+                "Hy3-IQ1_M/Hy3-IQ1_M-00002-of-00002.gguf",
+            ]
+        )
+        XCTAssertEqual(menu.onDisk.map(\.label), ["IQ1_M"])
+        XCTAssertEqual(menu.available.map(\.label), ["IQ2_M"], "the other quant is still downloadable")
     }
 
     func testQuantMenuButtonLabelStates() {

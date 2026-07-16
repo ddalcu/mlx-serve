@@ -61,7 +61,7 @@ pub const aliases = [_]Alias{
     // Tencent Hunyuan 3 (hy_v3, 295B-A21B MoE) — mixed 2/3-bit experts +
     // 8-bit attention/router/shared, MTP layer included. ~110 GB on disk;
     // needs a 128 GB Mac.
-    .{ .name = "hy3", .tag = "295b", .repo = "ox-ox/Hy3-295B-Instruct-w2q3exp-AProjQ8-SExpQ8-OutQ8-MTP-mlx", .is_default = true },
+    .{ .name = "hy3", .tag = "295b", .repo = "mlx-community/Hy3-oQ2e", .is_default = true },
     .{ .name = "bge-small", .tag = "en", .repo = "mlx-community/bge-small-en-v1.5-8bit", .is_default = true },
 };
 

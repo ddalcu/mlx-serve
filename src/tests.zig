@@ -3,6 +3,7 @@
 
 test {
     _ = @import("log.zig");
+    _ = @import("version.zig");
     _ = @import("chat.zig");
     _ = @import("format_corpus_test.zig");
     _ = @import("tool_traffic_replay_test.zig");

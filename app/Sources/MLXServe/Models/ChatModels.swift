@@ -456,6 +456,10 @@ enum ServerStatus: Equatable {
 enum LocalModelSource: String, Codable, Hashable {
     case mlxServe
     case lmStudio
+    /// Discovered in the Hugging Face hub cache (`~/.cache/huggingface/hub`,
+    /// where `huggingface_hub` / `mlx_lm` download). Read-only in the app — the
+    /// cache's blob/ref/symlink structure is managed by `huggingface-cli`.
+    case huggingFace
     case custom
 }
 
@@ -539,6 +543,27 @@ struct LocalModel: Identifiable, Hashable {
 
     var isSupportedArchitecture: Bool {
         supportedModelTypes.contains(modelType) || isMediaModelType(modelType)
+    }
+
+    /// True only for models physically in `~/.mlx-serve/models` (source
+    /// `.mlxServe`) — the one tree the app owns and may delete. LM Studio's
+    /// folder, the Hugging Face hub cache, and a user-added custom folder are
+    /// all owned by another tool or the user; the app loads them but must never
+    /// delete into them (deleting an HF snapshot orphans shared blobs and
+    /// dangles `refs/main`; the others simply aren't ours to remove).
+    var isDeletable: Bool {
+        source == .mlxServe
+    }
+
+    /// Non-nil when this model is read-only (not `isDeletable`): the user-facing
+    /// reason shown on the badge that replaces the trash. nil for `.mlxServe`.
+    var externalReadOnlyReason: String? {
+        switch source {
+        case .mlxServe: return nil
+        case .lmStudio: return "In LM Studio\u{2019}s models folder \u{2014} manage it in LM Studio. MLX Core loads it read-only."
+        case .huggingFace: return "In the Hugging Face cache \u{2014} manage with huggingface-cli. MLX Core loads it read-only."
+        case .custom: return "In a custom models folder you added \u{2014} MLX Core loads it read-only and won\u{2019}t delete it."
+        }
     }
 
     /// Offerable by chat-model pickers (tray menu, task sheet, auto-select):
@@ -730,18 +755,22 @@ let gemmaModelOptions: [GemmaModelOption] = [
         id: "dsv4-flash-gguf",
         displayName: "DeepSeek-V4-Flash (ds4)",
         repoId: "antirez/deepseek-v4-gguf",
-        sizeEstimate: "~85 GB, needs 96 GB+ RAM",
-        ggufFilename: "DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2.gguf",
+        sizeEstimate: "~87 GB, needs 96 GB+ RAM",
+        // imatrix-calibrated IQ2XXS — better quality at the same size; the
+        // download path also auto-pulls the MTP draft head for ds4 spec-decode.
+        ggufFilename: "DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf",
         minHostRamBytes: 96 * (UInt64(1) << 30)
     ),
     // Tencent Hunyuan 3 (hy_v3): 295B-A21B MoE, 256K context, Apache 2.0.
-    // Mixed 2/3-bit experts + 8-bit attention/router/shared expert (RTN
-    // affine), MTP layer included for future self-speculative decode.
+    // The imatrix-calibrated 2-bit build (mlx-community oQ2e): the FULL
+    // 192-expert model with attention/router/shared-expert/embeddings kept at
+    // 8-bit, ~84 GB — so a 128 GB Mac loads it WITH real context headroom
+    // (the older ~110 GB mixed build loaded but left almost none). No MTP head.
     GemmaModelOption(
-        id: "hy3-295b-2bit",
+        id: "hy3-oq2e",
         displayName: "Hunyuan 3 295B-A21B (2-bit)",
-        repoId: "ox-ox/Hy3-295B-Instruct-w2q3exp-AProjQ8-SExpQ8-OutQ8-MTP-mlx",
-        sizeEstimate: "~110 GB, needs 128 GB RAM",
+        repoId: "mlx-community/Hy3-oQ2e",
+        sizeEstimate: "~84 GB, needs 128 GB RAM",
         minHostRamBytes: 128 * (UInt64(1) << 30)
     ),
 ]

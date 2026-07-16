@@ -428,10 +428,42 @@ pub fn isMmprojGgufBasename(basename: []const u8) bool {
 /// the Swift `DownloadManager.isGgufSidecar` — the macOS app lists every quant
 /// in a folder as a separately selectable model, so the two must agree on which
 /// files are models or the app offers one the server can't load.
+/// True for an MTP draft-head GGUF — the llama.cpp / ds4 speculative-decode
+/// sidecar (e.g. `DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf`). NOT loadable as a
+/// chat model: it's a dependency of the main quant, loaded beside it by the ds4
+/// engine for a faster decode. Matched as a delimited `-MTP-` token so a real
+/// model that merely contains the letters "mtp" isn't caught.
+pub fn isMtpGgufBasename(basename: []const u8) bool {
+    if (!std.mem.endsWith(u8, basename, ".gguf")) return false;
+    return asciiContainsIgnoreCase(basename, "-mtp-") or asciiContainsIgnoreCase(basename, "-mtp.");
+}
+
 pub fn isGgufSidecarBasename(basename: []const u8) bool {
     if (!std.mem.endsWith(u8, basename, ".gguf")) return false;
     if (isMmprojGgufBasename(basename)) return true;
-    return asciiContainsIgnoreCase(basename, "tokenizer");
+    if (asciiContainsIgnoreCase(basename, "tokenizer")) return true;
+    return isMtpGgufBasename(basename);
+}
+
+/// Full path to the ds4 MTP draft-head GGUF sitting beside `model_file_path`
+/// (the primary quant), or null when there is none. The primary's parent
+/// directory is scanned for a `-MTP-` GGUF. Caller owns the returned slice.
+/// Used to auto-enable ds4 speculative decode: the app downloads the MTP file
+/// into the same folder as the chosen quant, and the engine finds it here.
+pub fn findDs4MtpSidecar(io: std.Io, allocator: std.mem.Allocator, model_file_path: []const u8) ?[]u8 {
+    const dir_path = std.fs.path.dirname(model_file_path) orelse return null;
+    // openDirAbsolute asserts (→ ReleaseFast UB) on a non-absolute path.
+    if (dir_path.len == 0 or !std.fs.path.isAbsolute(dir_path)) return null;
+    var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch return null;
+    defer dir.close(io);
+    var it = dir.iterate();
+    while (it.next(io) catch null) |entry| {
+        if (!isMtpGgufBasename(entry.name)) continue;
+        const st = dir.statFile(io, entry.name, .{}) catch continue;
+        if (st.kind != .file) continue;
+        return std.fs.path.join(allocator, &.{ dir_path, entry.name }) catch return null;
+    }
+    return null;
 }
 
 fn asciiContainsIgnoreCase(haystack: []const u8, needle: []const u8) bool {
@@ -1081,9 +1113,23 @@ test "isGgufSidecarBasename also rejects the tokenizer sidecars" {
     try testing.expect(isGgufSidecarBasename("qwen3-tts-tokenizer-f16.gguf"));
     try testing.expect(isGgufSidecarBasename("TOKENIZER-f16.gguf"));
 
+    // MTP draft-head sidecar (llama.cpp / ds4 speculative decode) — live in
+    // antirez/deepseek-v4-gguf, sitting beside the chat quants. Not a chat
+    // model; it must never appear as a selectable quant.
+    try testing.expect(isGgufSidecarBasename("DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf"));
+    try testing.expect(isGgufSidecarBasename("some-model-mtp.gguf"));
+    // isMtpGgufBasename is the specific predicate the engine uses to FIND the
+    // draft head (a subset of the sidecar filter).
+    try testing.expect(isMtpGgufBasename("DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf"));
+    try testing.expect(!isMtpGgufBasename("mmproj-F16.gguf"));
+    try testing.expect(!isMtpGgufBasename("DeepSeek-V4-Flash-IQ2XXS-chat-v2.gguf"));
+
     try testing.expect(!isGgufSidecarBasename("gemma-4-E4B-it-Q4_K_M.gguf"));
     try testing.expect(!isGgufSidecarBasename("Qwen3.5-4B-IQ4_NL.gguf"));
     try testing.expect(!isGgufSidecarBasename("qwen3-tts-0.6b-f16.gguf"));
+    // A real chat quant whose scheme name merely contains the letters "mtp"
+    // (no delimited `-MTP-` token) is NOT a sidecar.
+    try testing.expect(!isGgufSidecarBasename("DeepSeek-V4-Flash-IQ2XXS-chat-v2.gguf"));
     try testing.expect(!isGgufSidecarBasename("tokenizer.json"));
 }
 

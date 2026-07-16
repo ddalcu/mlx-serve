@@ -77,10 +77,13 @@ class ServerManager: ObservableObject {
         currentModelPath = resolvedModel
 
         var args = ["--model", resolvedModel]
-        // Plan 05 Phase G — pass the parent directory as --model-dir so the
-        // registry discovers all siblings at startup. Lets the user hot-load
-        // any sibling later via the model picker (when hot-switch is on).
-        let modelDir = (resolvedModel as NSString).deletingLastPathComponent
+        // Discover the user's WHOLE model library at startup so `/v1/models`
+        // matches the app's model dropdown — not just the selected model's org
+        // folder. The server scans the models root two levels deep
+        // (`<root>/<org>/<model>`); the selected model still loads via `--model`
+        // and dedups against its discovered entry by path. (Was: the selected
+        // model's parent dir, which scoped discovery to one org.)
+        let modelDir = Self.discoveryModelDir(selectedModel: resolvedModel, modelsRoot: Self.modelsRoot)
         args += options.toCLIArgs(modelDirOverride: modelDir.isEmpty ? nil : modelDir)
         launch(args: args, options: options)
     }
@@ -146,7 +149,7 @@ class ServerManager: ObservableObject {
         // the port.
         killOrphanedServers(on: port)
 
-        let binaryPath = resolveBinaryPath()
+        let binaryPath = Self.resolveBinaryPath()
         guard FileManager.default.fileExists(atPath: binaryPath) else {
             status = .error("Binary not found at: \(binaryPath)")
             lastError = "mlx-serve binary not found"
@@ -593,6 +596,25 @@ class ServerManager: ObservableObject {
         throw GenServerError.startFailed("server did not become ready in time")
     }
 
+    /// The canonical download store — the SINGLE source of truth for models the
+    /// app manages. `--model-dir` points here so discovery sees everything.
+    nonisolated static let modelsRoot = NSString(string: "~/.mlx-serve/models").expandingTildeInPath
+
+    /// The `--model-dir` to launch with so the registry discovers the user's
+    /// whole library (making `/v1/models` match the model dropdown), not just
+    /// the selected model's org folder. When the selected model lives under the
+    /// models root, scan the WHOLE root (`<root>/<org>/<model>` two-level
+    /// discovery). When it lives OUTSIDE (LM Studio / a custom folder the app
+    /// can point at), fall back to its parent so at least its siblings surface —
+    /// the server takes a single `--model-dir`, so the mlx-serve root is the
+    /// right default for everything the app itself downloaded. Pure + testable.
+    nonisolated static func discoveryModelDir(selectedModel: String, modelsRoot: String) -> String {
+        let model = (selectedModel as NSString).standardizingPath
+        let root = (modelsRoot as NSString).standardizingPath
+        if model == root || model.hasPrefix(root + "/") { return modelsRoot }
+        return (selectedModel as NSString).deletingLastPathComponent
+    }
+
     /// Resolve a HuggingFace repo id to its local model directory under
     /// `~/.mlx-serve/models` — the SINGLE source of truth for downloaded
     /// models. No HF-cache fallback: the app owns downloads (chat + media), so
@@ -638,7 +660,11 @@ class ServerManager: ObservableObject {
         SystemMetrics.processName(pid: pid)
     }
 
-    private func resolveBinaryPath() -> String {
+    /// Resolve the `mlx-serve` binary the app runs — bundled beside the Swift
+    /// executable, else the dev `zig-out/bin/mlx-serve`, else the bare name.
+    /// `nonisolated static` so version probing (`EngineVersions.probe`) can find
+    /// it without touching `@MainActor` server state.
+    nonisolated static func resolveBinaryPath() -> String {
         // 1. Bundled: Contents/MacOS/mlx-serve (same dir as the Swift binary)
         if let execURL = Bundle.main.executableURL {
             let bundled = execURL.deletingLastPathComponent().appendingPathComponent("mlx-serve").path

@@ -426,16 +426,33 @@ final class HFFallbackSizeTests: XCTestCase {
         )
     }
 
-    func testSubdirGguf_isExcluded() {
-        // Split-shard layouts (`shard/part-001.gguf`) can't be reassembled by
-        // the single-file download path — don't include them in the row's
-        // displayed range, which advertises top-level pickable files.
+    func testShardedQuant_summedIntoOneSize() {
+        // A single large quant HF split into shards (over ~50 GB) reports ONE
+        // size — the SUM of its shards — not a range and not "—". This is
+        // `vcruz305/Hy3-GGUF`'s IQ1_M as HF lays it out; the download path
+        // reassembles it, so its size must surface.
         let files: [Entry] = [
-            .init(path: "shard/part-001.gguf", size: 5_000_000_000),
-            .init(path: "shard/part-002.gguf", size: 5_000_000_000),
-            .init(path: "Q4_K_M.gguf", size: 2_600_000_000),
+            .init(path: "Hy3-IQ1_M/Hy3-IQ1_M-00001-of-00002.gguf", size: 30_000_000_000),
+            .init(path: "Hy3-IQ1_M/Hy3-IQ1_M-00002-of-00002.gguf", size: 25_000_000_000),
         ]
-        XCTAssertEqual(HFSearchService.parseFallbackSize(files: files), .ggufSingle(2_600_000_000))
+        XCTAssertEqual(HFSearchService.parseFallbackSize(files: files), .ggufSingle(55_000_000_000))
+    }
+
+    func testTwoShardedQuants_range() {
+        // Two subfoldered quants → a min/max range across the SUMMED quant
+        // totals (IQ1_M = 55 GB, IQ2_M = 85 GB), the shape that lets the row
+        // show "51.2–79.2 GB" instead of "—".
+        let files: [Entry] = [
+            .init(path: "Hy3-IQ1_M/Hy3-IQ1_M-00001-of-00002.gguf", size: 30_000_000_000),
+            .init(path: "Hy3-IQ1_M/Hy3-IQ1_M-00002-of-00002.gguf", size: 25_000_000_000),
+            .init(path: "Hy3-IQ2_M/Hy3-IQ2_M-00001-of-00003.gguf", size: 30_000_000_000),
+            .init(path: "Hy3-IQ2_M/Hy3-IQ2_M-00002-of-00003.gguf", size: 30_000_000_000),
+            .init(path: "Hy3-IQ2_M/Hy3-IQ2_M-00003-of-00003.gguf", size: 25_000_000_000),
+        ]
+        XCTAssertEqual(
+            HFSearchService.parseFallbackSize(files: files),
+            .ggufRange(min: 55_000_000_000, max: 85_000_000_000)
+        )
     }
 
     func testEmptyOrNoLLMArtifacts_returnsNil() {
@@ -607,6 +624,24 @@ final class HFModelQuantGateTests: XCTestCase {
         let m = HFModel(id: "x/some-diffusion-mxfp6", downloads: 1, likes: 1, lastModified: nil,
                         tags: ["diffusers"], safetensors: nil, pipelineTag: nil)
         XCTAssertEqual(m.incompatibleReason, "Unsupported architecture")
+    }
+
+    func testHunyuan3IsSupportedArchitecture() {
+        // Tencent Hunyuan 3 (config.json model_type=hy_v3) is served by the MLX
+        // engine since the HY3 release — the search/recommended rows must not
+        // flag the real repo "Unsupported architecture". Its HF tags carry no
+        // gemma/qwen/llama family prefix, only hunyuan/hy_v3/hy3 (verified live
+        // against the shipped default mlx-community/Hy3-oQ2e), so the tag gate
+        // has to know them.
+        let m = mlx(id: "mlx-community/Hy3-oQ2e",
+                    tags: ["mlx", "safetensors", "hy_v3", "oq", "oqe", "imatrix",
+                           "quantized", "moe", "hunyuan", "text-generation", "conversational"])
+        XCTAssertTrue(m.isSupportedArchitecture,
+                      "hy_v3 is served (supportedModelTypes + Zig supported_model_types) — the HF tag gate must accept it")
+        XCTAssertNil(m.incompatibleReason)
+        // Keep the tag gate in lockstep with the model_type gate the local
+        // (downloaded) rows use — both must agree hy_v3 is supported.
+        XCTAssertTrue(supportedModelTypes.contains("hy_v3"))
     }
 }
 

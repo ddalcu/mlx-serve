@@ -2198,6 +2198,21 @@ pub fn prefillMemoryNeeded(seq: u64, heads: u64, kv_heads: u64, layers: u64, hdi
     return (kv_bytes + scores + dequant + 3 * mlp) * 5 / 4;
 }
 
+/// Whether the MLX-prefill attention-memory preflight applies to a request.
+/// The guard (`checkAttentionMemory`/`prefillMemoryNeeded`) models the MLX
+/// transformer's per-token working set. The embedded ds4 (DeepSeek-V4-Flash)
+/// and llama.cpp engines NEVER take that path — they own their KV *outside*
+/// MLX — so the estimate is pure fiction for them. Their stub `ModelConfig`
+/// still advertises head/layer counts (ds4: 56 heads, 61 layers, hidden 7168),
+/// so without this early-out the guard projected ~25 GB for an 8.6K-token ds4
+/// prompt and 400-rejected it — a prompt the SAME server had just served on the
+/// MLX qwen35 engine one model-switch earlier (live 2026-07-15, pi + ds4). Skip
+/// the memory guard whenever an embedded engine will serve; the context-length
+/// guard still bounds the prompt against ds4's own session ctx.
+fn mlxMemoryGuardApplies(uses_ds4: bool, uses_llama: bool) bool {
+    return !(uses_ds4 or uses_llama);
+}
+
 /// Estimate peak GPU memory for prefill and reject if it would exceed the Metal
 /// working-set ceiling. Exceeding it throws an uncatchable C++ exception on a
 /// Metal completion-handler thread and kills the process, so PREVENTION is the
@@ -2205,7 +2220,11 @@ pub fn prefillMemoryNeeded(seq: u64, heads: u64, kv_heads: u64, layers: u64, hdi
 /// (prefillMemoryNeeded above; chunk choice from generate.effectivePrefillChunk).
 /// `kv_override` is the per-request `kv_quant` body field where the surface
 /// parses one (chat/messages/responses); null falls back to the process default.
-fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_len: usize, config: *const model_mod.ModelConfig, is_anthropic: bool, kv_override: ?transformer_mod.KVQuantConfig) !bool {
+/// `lm` is the resolved model: an embedded-engine model skips this guard
+/// entirely (see `mlxMemoryGuardApplies`) — this is the single chokepoint, so
+/// every current and future call site is covered without per-site gating.
+fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_len: usize, config: *const model_mod.ModelConfig, is_anthropic: bool, kv_override: ?transformer_mod.KVQuantConfig, lm: *const LoadedModel) !bool {
+    if (!mlxMemoryGuardApplies(lm.ds4_engine != null, lm.llama_engine != null)) return true;
     const heads = config.num_attention_heads;
     if (heads == 0) return true; // unknown architecture, skip check
 
@@ -3980,7 +3999,7 @@ fn handleChatCompletions(
     }
 
     // Check if attention computation would exceed GPU memory
-    if (!try checkAttentionMemory(allocator, stream, prompt_ids.len, config, false, kv_quant_override)) return;
+    if (!try checkAttentionMemory(allocator, stream, prompt_ids.len, config, false, kv_quant_override, lm)) return;
 
     // Clamp max_tokens to stay within context window
     const effective_max_tokens = clampMaxTokens(max_tokens, prompt_ids.len, effective_ctx);
@@ -4238,7 +4257,7 @@ fn handleCompletions(
 
     // Check if attention computation would exceed GPU memory
     // (/v1/completions has no per-request kv_quant field -> process default.)
-    if (!try checkAttentionMemory(allocator, stream, prompt_ids.len, config, false, null)) return;
+    if (!try checkAttentionMemory(allocator, stream, prompt_ids.len, config, false, null, lm)) return;
 
     // Clamp max_tokens to stay within context window
     const effective_max_tokens = clampMaxTokens(max_tokens, prompt_ids.len, effective_ctx);
@@ -7689,7 +7708,7 @@ fn handleAnthropicMessages(
     }
 
     // Check if attention computation would exceed GPU memory
-    if (!try checkAttentionMemory(allocator, stream, prompt_ids.len, config, true, kv_quant_override)) return;
+    if (!try checkAttentionMemory(allocator, stream, prompt_ids.len, config, true, kv_quant_override, lm)) return;
 
     const effective_max_tokens = clampMaxTokens(max_tokens, prompt_ids.len, effective_ctx);
     log.info("  prompt={d} tokens, max_gen={d}, ctx={d}\n", .{ prompt_ids.len, effective_max_tokens, effective_ctx });
@@ -9057,7 +9076,7 @@ fn handleResponses(
         return;
     }
     const kv_quant_override = parseKvQuantOverride(root);
-    if (!try checkAttentionMemory(allocator, stream, prompt_ids.len, config, false, kv_quant_override)) return;
+    if (!try checkAttentionMemory(allocator, stream, prompt_ids.len, config, false, kv_quant_override, lm)) return;
     const effective_max_tokens = clampMaxTokens(max_tokens, prompt_ids.len, effective_ctx);
 
     // ── sampling ──
@@ -11953,6 +11972,20 @@ test "readyCapsJson: every resident media engine surfaces its capability (mesh -
         "[\"chat\",\"tool_use\",\"streaming\",\"reasoning\",\"json_schema\"]",
         chat.items,
     );
+}
+
+test "mlxMemoryGuardApplies: embedded engines (ds4/llama) skip the MLX-prefill memory guard" {
+    const t = std.testing;
+    // MLX model — no embedded engine — the guard applies (real per-token working set).
+    try t.expect(mlxMemoryGuardApplies(false, false));
+    // ds4 (DeepSeek-V4-Flash): its stub config advertises 56 heads / 61 layers,
+    // so the guard would project ~25 GB for an 8.6K-token prompt and 400-reject
+    // a request ds4 serves fine (live 2026-07-15: the SAME prompt had succeeded
+    // on the MLX qwen35 engine one model-switch earlier). ds4 owns its KV
+    // outside MLX, so the guard is skipped.
+    try t.expect(!mlxMemoryGuardApplies(true, false));
+    // llama.cpp GGUF engine: same reasoning — no MLX prefill path.
+    try t.expect(!mlxMemoryGuardApplies(false, true));
 }
 
 test "prefillMemoryNeeded: a prompt shorter than the chunk bills the prompt-width forward, not the chunk cap" {

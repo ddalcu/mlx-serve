@@ -1100,16 +1100,18 @@ for row in "${TARGETS[@]}"; do
             continue
         fi
         # The `mtp` cell only makes sense on rows whose checkpoint ships an
-        # MTP sidecar (ANY of the three accepted layouts) — without one it
-        # would silently measure plain decode under an "mtp" label. NOTE:
-        # this must be an any-of check per file — `ls a b c` exits non-zero
-        # when ANY operand is missing, which silently skipped the mtp cell
-        # on EVERY row in the 2026-07-14 run (no model ships all three
-        # names).
+        # MTP sidecar (ANY of the four accepted layouts — mirrors
+        # mtp.sidecar_rel_paths in src/mtp.zig, incl. the OptiQ layout) —
+        # without one it would silently measure plain decode under an "mtp"
+        # label. NOTE: this must be an any-of check per file — `ls a b c`
+        # exits non-zero when ANY operand is missing, which silently
+        # skipped the mtp cell on EVERY row in the 2026-07-14 run (no model
+        # ships all three names).
         if [[ "$spec" == "mtp" &&
               ! -e "$mlxserve_path/mtp/weights.safetensors" &&
               ! -e "$mlxserve_path/mtp.safetensors" &&
-              ! -e "$mlxserve_path/model-mtp.safetensors" ]]; then
+              ! -e "$mlxserve_path/model-mtp.safetensors" &&
+              ! -e "$mlxserve_path/optiq/mtp.safetensors" ]]; then
             continue
         fi
         row_mlx_specs+=("$spec")

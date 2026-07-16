@@ -628,7 +628,164 @@ final class DownloadManagerLayoutTests: XCTestCase {
         XCTAssertEqual(meta, DownloadManager.ConfigMetadata())
     }
 
+    // MARK: - Hugging Face hub cache discovery
+    //
+    // The huggingface_hub / mlx_lm default cache lays each repo out as
+    // `models--<org>--<repo>/snapshots/<commit>/`, whose files are SYMLINKS into
+    // a sibling `blobs/` dir; `refs/main` names the active commit. This is a
+    // different shape from LM Studio's plain `<org>/<repo>/`, so it gets its own
+    // scan helpers — these pin them.
+
+    func testHuggingFaceRepoIdFromCacheDirRecoversOrgAndName() {
+        // HF replaces `/` with `--`; the repo NAME itself may carry single dashes.
+        XCTAssertEqual(
+            DownloadManager.huggingFaceRepoId(fromCacheDir: "models--Jundot--Qwen3.6-35B-A3B-oQ4e-mtp"),
+            "Jundot/Qwen3.6-35B-A3B-oQ4e-mtp")
+        XCTAssertEqual(
+            DownloadManager.huggingFaceRepoId(fromCacheDir: "models--gpt2"),
+            "gpt2", "a bare repo with no org stays a single component")
+    }
+
+    func testHuggingFaceActiveSnapshotResolvesRefMain() throws {
+        let commit = "2523e7a5702d38a1a319c50d193cbac20f9ecb78"
+        let snap = try makeFakeHFRepo(root: tempRoot, org: "acme", repo: "demo",
+                                      commit: commit, files: ["config.json": "{}"])
+        let repoDir = (tempRoot as NSString).appendingPathComponent("models--acme--demo")
+        XCTAssertEqual(DownloadManager.huggingFaceActiveSnapshotDir(repoDir: repoDir), snap,
+                       "refs/main must select the matching snapshot dir")
+    }
+
+    func testHuggingFaceActiveSnapshotFallsBackToSoleSnapshot() throws {
+        // No refs/main (writeRef: false) but exactly one snapshot → use it.
+        let snap = try makeFakeHFRepo(root: tempRoot, org: "acme", repo: "solo",
+                                      commit: "abc123", files: ["config.json": "{}"],
+                                      writeRef: false)
+        let repoDir = (tempRoot as NSString).appendingPathComponent("models--acme--solo")
+        XCTAssertEqual(DownloadManager.huggingFaceActiveSnapshotDir(repoDir: repoDir), snap)
+    }
+
+    func testHuggingFaceActiveSnapshotNilWhenAmbiguousAndNoRef() throws {
+        // Two snapshots and no ref to disambiguate → refuse to guess.
+        _ = try makeFakeHFRepo(root: tempRoot, org: "acme", repo: "multi",
+                               commit: "aaa", files: ["config.json": "{}"], writeRef: false)
+        _ = try makeFakeHFRepo(root: tempRoot, org: "acme", repo: "multi",
+                               commit: "bbb", files: ["config.json": "{}"], writeRef: false)
+        let repoDir = (tempRoot as NSString).appendingPathComponent("models--acme--multi")
+        XCTAssertNil(DownloadManager.huggingFaceActiveSnapshotDir(repoDir: repoDir))
+    }
+
+    func testDiscoverHuggingFaceModelsFindsCompleteSnapshotAsHFSource() throws {
+        let commit = "cafebabe"
+        // 2 MiB so it formats to a non-zero "MB" (MemoryInfo.format truncates to
+        // whole MB below 1 GB) — the point is that the symlinked blob's real size
+        // is counted, not the ~20 B link size that would read as "0 MB".
+        let bigWeights = String(repeating: "x", count: 2 * 1024 * 1024)
+        let snap = try makeFakeHFRepo(
+            root: tempRoot, org: "mlx-community", repo: "Qwen3-Demo-4bit", commit: commit,
+            files: ["config.json": "{\"model_type\":\"qwen3\"}",
+                    "model.safetensors": bigWeights,
+                    "tokenizer.json": "{}"])
+
+        let models = DownloadManager.discoverHuggingFaceModels(in: tempRoot)
+        XCTAssertEqual(models.count, 1)
+        let m = try XCTUnwrap(models.first)
+        XCTAssertEqual(m.source, .huggingFace)
+        XCTAssertEqual(m.name, "mlx-community/Qwen3-Demo-4bit", "display name is the recovered repo id")
+        XCTAssertEqual(m.modelType, "qwen3")
+        // Path is the SNAPSHOT dir the server loads (standardized, so /private-normalized).
+        XCTAssertEqual((m.path as NSString).standardizingPath, (snap as NSString).standardizingPath)
+        // Size must resolve through the symlinks — the weight blob is 4 KB, so a
+        // link-size read (~20 B → "Zero KB") is the regression this guards.
+        XCTAssertNotEqual(m.sizeFormatted, MemoryInfo.format(0))
+    }
+
+    func testDiscoverHuggingFaceModelsFindsSymlinkedGgufQuant() throws {
+        // A complete GGUF in the HF cache is a SYMLINK into blobs/. The ≥1 MB
+        // "servable quant" filter stats the file, so it must follow the link —
+        // otherwise the ~76 B link size fails the filter and EVERY HF-cached
+        // GGUF (bartowski, Hy3-GGUF, …) is silently invisible.
+        let bigGguf = String(repeating: "g", count: 2 * 1024 * 1024)
+        _ = try makeFakeHFRepo(root: tempRoot, org: "bartowski", repo: "Demo-GGUF",
+                               commit: "feedface", files: ["Demo-Q4_K_M.gguf": bigGguf])
+        let models = DownloadManager.discoverHuggingFaceModels(in: tempRoot)
+        let m = try XCTUnwrap(models.first { $0.name == "bartowski/Demo-GGUF" })
+        XCTAssertEqual(m.source, .huggingFace)
+        XCTAssertNotNil(m.quantFile, "a GGUF row carries its quant filename")
+        XCTAssertNotEqual(m.sizeFormatted, MemoryInfo.format(0), "blob size, not link size")
+    }
+
+    func testDiscoverHuggingFaceModelsDropsSubOneMegabyteGgufStub() throws {
+        // The incomplete/pointer case (a 76 B LFS stub, real in the live cache):
+        // following the link reveals it's tiny, so it's correctly not offered.
+        _ = try makeFakeHFRepo(root: tempRoot, org: "acme", repo: "Stub-GGUF",
+                               commit: "0bad", files: ["Stub-Q4_K_M.gguf": "tiny"])
+        XCTAssertTrue(DownloadManager.discoverHuggingFaceModels(in: tempRoot).isEmpty)
+    }
+
+    func testDiscoverHuggingFaceModelsSkipsIncompleteSnapshot() throws {
+        // A snapshot with only a README (no config.json / no safetensors / no
+        // gguf) is a partial or metadata-only pull — not loadable, must be dropped.
+        _ = try makeFakeHFRepo(root: tempRoot, org: "acme", repo: "readme-only",
+                               commit: "deadbeef", files: ["README.md": "hi"])
+        XCTAssertTrue(DownloadManager.discoverHuggingFaceModels(in: tempRoot).isEmpty)
+    }
+
+    func testDiscoverHuggingFaceModelsIgnoresNonModelPrefixDirs() throws {
+        // datasets--/spaces-- cache dirs share the hub root but aren't models.
+        let datasets = ((tempRoot as NSString).appendingPathComponent("datasets--acme--corpus") as NSString)
+            .appendingPathComponent("snapshots")
+        try FileManager.default.createDirectory(atPath: datasets, withIntermediateDirectories: true)
+        XCTAssertTrue(DownloadManager.discoverHuggingFaceModels(in: tempRoot).isEmpty)
+    }
+
+    // Size accounting must follow symlinks so an HF snapshot (all symlinked
+    // blobs) doesn't report ~0 B. Real files are unaffected (no-op resolve).
+    func testDirectorySizeResolvesSymlinkedBlobs() throws {
+        let blobs = (tempRoot as NSString).appendingPathComponent("blobs")
+        let snap = (tempRoot as NSString).appendingPathComponent("snap")
+        try FileManager.default.createDirectory(atPath: blobs, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(atPath: snap, withIntermediateDirectories: true)
+        let blob = (blobs as NSString).appendingPathComponent("weights")
+        try String(repeating: "y", count: 2000).write(toFile: blob, atomically: true, encoding: .utf8)
+        try FileManager.default.createSymbolicLink(
+            atPath: (snap as NSString).appendingPathComponent("model.safetensors"),
+            withDestinationPath: "../blobs/weights")
+
+        XCTAssertGreaterThanOrEqual(DownloadManager.directorySizeForTesting(snap), 2000,
+            "symlinked blob size must be counted, not the ~20 B link size")
+    }
+
     // MARK: - Helpers
+
+    /// Build a Hugging Face hub-cache repo: `models--<org>--<repo>/` with a
+    /// `blobs/` dir, a `snapshots/<commit>/` whose files are RELATIVE symlinks
+    /// into blobs (exactly how huggingface_hub materializes them), and — unless
+    /// `writeRef` is false — `refs/main` → commit. Returns the snapshot dir path.
+    @discardableResult
+    private func makeFakeHFRepo(root: String, org: String, repo: String, commit: String,
+                               files: [String: String], writeRef: Bool = true) throws -> String {
+        let fm = FileManager.default
+        let repoDir = (root as NSString).appendingPathComponent("models--\(org)--\(repo)")
+        let blobs = (repoDir as NSString).appendingPathComponent("blobs")
+        let snap = ((repoDir as NSString).appendingPathComponent("snapshots") as NSString)
+            .appendingPathComponent(commit)
+        try fm.createDirectory(atPath: blobs, withIntermediateDirectories: true)
+        try fm.createDirectory(atPath: snap, withIntermediateDirectories: true)
+        for (name, contents) in files {
+            let blobName = "blob-\(name)"
+            try contents.write(toFile: (blobs as NSString).appendingPathComponent(blobName),
+                               atomically: true, encoding: .utf8)
+            try fm.createSymbolicLink(atPath: (snap as NSString).appendingPathComponent(name),
+                                      withDestinationPath: "../../blobs/\(blobName)")
+        }
+        if writeRef {
+            let refsDir = (repoDir as NSString).appendingPathComponent("refs")
+            try fm.createDirectory(atPath: refsDir, withIntermediateDirectories: true)
+            try commit.write(toFile: (refsDir as NSString).appendingPathComponent("main"),
+                             atomically: true, encoding: .utf8)
+        }
+        return snap
+    }
 
     /// Minimal model dir layout: just `config.json`. The path-resolution and
     /// migration logic only checks for that file's presence.

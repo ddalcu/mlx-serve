@@ -17,11 +17,13 @@ private let bytesPerGiB: Double = 1_073_741_824
 /// +20% RAM-with-overhead figure `HFModel.ramEstimate` shows elsewhere) —
 /// not guessed from the model name.
 
-/// Which curated family a pick belongs to — also the pane's section headers.
+/// Which curated section a pick belongs to. Gemma/Qwen are vendor families;
+/// `largest` is a RAM tier — the biggest models this app runs (DeepSeek-V4-Flash
+/// via ds4, Hunyuan 3), grouped by "needs a very large Mac" rather than vendor.
 enum RecommendedModelFamily: String {
     case gemma = "Gemma"
     case qwen = "Qwen"
-    case hunyuan = "Hunyuan"
+    case largest = "Largest models"
 }
 
 /// One curated, plain-English download recommendation.
@@ -41,11 +43,16 @@ struct RecommendedModelPick: Identifiable, Hashable {
     /// Short capability chips (e.g. "Best for coding").
     let highlights: [String]
     /// Overrides the generic weights×1.2 RAM estimate for picks where that
-    /// formula misleads. Hunyuan 3's 105 GB weights read as "fits on 128 GB"
-    /// by the formula, but measured live a 128 GB Mac loads it only with the
-    /// memory-preflight override and a ~3K context — the honest
-    /// recommendation gate is above 128.
+    /// formula misleads (e.g. a build whose runtime footprint or context needs
+    /// push the honest recommendation gate above what the on-disk size implies).
+    /// Currently unused — every pick is well-modeled by the ×1.2 estimate.
     var ramOverrideGB: Double? = nil
+    /// For a GGUF/ds4 pick: the specific `.gguf` file this recommendation
+    /// downloads (the repo ships many; the curated pick names one known-good
+    /// quant). nil for a safetensors pick, whose whole repo is fetched. When
+    /// set, the pane downloads via the GGUF path (and auto-pulls the ds4 MTP
+    /// draft head) instead of the safetensors-tree path.
+    var ggufFilename: String? = nil
 
     var sizeLabel: String { String(format: "~%.1f GB", sizeGB) }
 
@@ -171,21 +178,39 @@ extension RecommendedModelPick {
         highlights: ["Best for coding", "Built-in speed boost", "Great at agent tasks"]
     )
 
-    /// Tencent Hunyuan 3 (295B-A21B MoE, 2-bit mixed quant) — the largest
-    /// open model this app runs. The recommendation targets Macs with MORE
-    /// than 128 GB (the `ramOverrideGB` gate); on a 128 GB Mac it loads and
-    /// answers correctly but only a minimal context window fits beside the
-    /// weights, so the blurb says so instead of hiding it.
+    /// Tencent Hunyuan 3 (295B-A21B MoE) — the largest open model this app
+    /// runs. This is the imatrix-calibrated 2-bit build (mlx-community oQ2e):
+    /// the FULL 192-expert model with attention/router/shared-expert/embeddings
+    /// kept at 8-bit, ~84 GB. Unlike the older ~105 GB mixed build (which loaded
+    /// on a 128 GB Mac but left almost no room for context), this fits 128 GB
+    /// with a usable window, so it's recommended INLINE on 128 GB — the generic
+    /// weights×1.2 formula (~100 GB) already gates it above a 96 GB Mac.
     static let hy3_295b = RecommendedModelPick(
-        id: "hy3-295b-2bit",
+        id: "hy3-oq2e",
         name: "Hunyuan 3 295B",
         tagline: "The biggest model here",
-        blurb: "Tencent's flagship open model — 295 billion parameters, of which it wakes only 21 billion per word (mixture of experts). Top-tier reasoning, agent work, and tool use, entirely on your Mac. Best on Macs with more than 128 GB of memory; on a 128 GB Mac it runs with a minimal context window (short conversations only).",
-        repoId: "ox-ox/Hy3-295B-Instruct-w2q3exp-AProjQ8-SExpQ8-OutQ8-MTP-mlx",
-        sizeGB: 105.0,
-        family: .hunyuan,
-        highlights: ["Flagship quality", "Mixture of experts", "256K context"],
-        ramOverrideGB: 135.0
+        blurb: "Tencent's flagship open model — 295 billion parameters, of which it wakes only 21 billion per word (mixture of experts). Top-tier reasoning, agent work, and tool use, entirely on your Mac. This is the full model stored compactly (importance-calibrated 2-bit), so on a 128 GB Mac it runs with a genuinely usable context window rather than just a few sentences. Best on Macs with 128 GB of memory or more.",
+        repoId: "mlx-community/Hy3-oQ2e",
+        sizeGB: 83.7,
+        family: .largest,
+        highlights: ["Flagship quality", "Mixture of experts", "256K context"]
+    )
+
+    /// DeepSeek-V4-Flash via the embedded ds4 engine — a frontier-scale model
+    /// on a very large Mac. The curated pick is the imatrix-calibrated IQ2XXS
+    /// build (best quality-per-byte that fits a 96 GB Mac); the pane pulls the
+    /// MTP draft head beside it so ds4 speculative decode is available.
+    static let deepseekV4Flash = RecommendedModelPick(
+        id: "deepseek-v4-flash",
+        name: "DeepSeek-V4-Flash",
+        tagline: "Frontier model, on your Mac",
+        blurb: "A frontier-scale DeepSeek model that runs entirely on your Mac through the ds4 engine — top-tier reasoning, coding, and agent work. It wakes only a fraction of itself per word (mixture of experts) and ships a built-in draft head so it can predict several words at once for a faster decode. Needs a lot of memory — best on Macs with 96 GB or more.",
+        repoId: "antirez/deepseek-v4-gguf",
+        sizeGB: 86.7,
+        family: .largest,
+        highlights: ["Frontier quality", "Mixture of experts", "Built-in speed boost"],
+        ramOverrideGB: 96.0,
+        ggufFilename: "DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf"
     )
 
     static let qwen36_35bA3b = RecommendedModelPick(
@@ -213,9 +238,12 @@ extension RecommendedModelPick {
         .qwen35_9b, .qwen36_27bMtp, .qwen36_35bA3b,
     ]
 
-    /// Tencent Hunyuan picks — currently the one 295B flagship.
-    static let hunyuanCatalog: [RecommendedModelPick] = [
-        .hy3_295b,
+    /// The largest models this app runs, ascending by on-disk size (the app's
+    /// smallest-first convention) — Hunyuan 3 295B (the compact ~84 GB oQ2e
+    /// build) then DeepSeek-V4-Flash (~87 GB ds4 GGUF). Grouped by "needs a
+    /// very large Mac" rather than by vendor.
+    static let largestCatalog: [RecommendedModelPick] = [
+        .hy3_295b, .deepseekV4Flash,
     ]
 }
 

@@ -27,6 +27,12 @@ final class UpdateChecker: ObservableObject {
     nonisolated static let latestReleaseURL = URL(string: "https://api.github.com/repos/\(repo)/releases/latest")!
     /// The app-installer asset uploaded by the release flow (build.sh phase 7).
     nonisolated static let preferredAssetName = "MLXCore.dmg"
+
+    /// The embedded llama.cpp release the bundle ships (the GGUF engine). KEEP
+    /// IN SYNC with `LLAMA_TAG` in `scripts/fetch-llama.sh` — that script is the
+    /// source of truth for the version staged into `Frameworks/libllama.dylib`;
+    /// this mirror only surfaces it in Settings ▸ Updates. Documented duplication.
+    nonisolated static let bundledLlamaTag = "b10034"
     nonisolated static let autoCheckInterval: TimeInterval = 24 * 3600
     nonisolated static let lastCheckKey = "lastUpdateCheckAt"
     nonisolated static let autoCheckEnabledKey = "autoCheckUpdates"

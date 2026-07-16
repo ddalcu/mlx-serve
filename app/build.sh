@@ -64,7 +64,15 @@ cd "$PROJECT_ROOT"
 # Stage libllama (llama.cpp GGUF engine) before the Zig build links against it.
 echo "→ Fetching libllama..."
 bash "$PROJECT_ROOT/scripts/fetch-llama.sh"
-DEVELOPER_DIR=/Library/Developer/CommandLineTools zig build -Doptimize=ReleaseFast -Dversion="$MLX_SERVE_VERSION" ${ZIG_MODE_FLAGS[@]+"${ZIG_MODE_FLAGS[@]}"} 2>&1 | tail -3
+# Engine-version pins surfaced by `mlx-serve --version` (parsed by the app so
+# Settings can show engine versions without booting the server — src/version.zig).
+# MLX + ggml self-report at runtime; these three have no runtime API:
+MLXC_VERSION="$(brew list --versions mlx-c 2>/dev/null | awk '{print $2}')"
+DS4_COMMIT="$(git -C "$PROJECT_ROOT/lib/ds4" rev-parse --short HEAD 2>/dev/null)"
+LLAMA_TAG="$(cat "$PROJECT_ROOT/lib/llama/.version" 2>/dev/null)"
+DEVELOPER_DIR=/Library/Developer/CommandLineTools zig build -Doptimize=ReleaseFast -Dversion="$MLX_SERVE_VERSION" \
+  -Dmlx-c-version="${MLXC_VERSION:-unknown}" -Dds4-commit="${DS4_COMMIT:-unknown}" -Dllama-tag="${LLAMA_TAG:-unknown}" \
+  ${ZIG_MODE_FLAGS[@]+"${ZIG_MODE_FLAGS[@]}"} 2>&1 | tail -3
 # The bundled guest agent (static aarch64-linux ELF) rides inside the app.
 DEVELOPER_DIR=/Library/Developer/CommandLineTools zig build vz-agent 2>&1 | tail -1
 MLX_BIN="zig-out/bin/mlx-serve"
