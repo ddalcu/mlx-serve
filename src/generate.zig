@@ -1260,7 +1260,10 @@ pub const Generator = struct {
             try mlx.check(mlx.mlx_array_item_int32(&first_val, sample_lazy));
             _ = mlx.mlx_array_free(sample_lazy);
 
-            const mtp_nax_profile = mtp_active and options.mtp.?.m5NaxCostProfileEnabled(xfm);
+            const mtp_cost_profile: mtp_mod.MtpCostProfile = if (mtp_active)
+                options.mtp.?.m5NaxCostProfile(xfm)
+            else
+                .generic;
             var gen = Generator{
                 .xfm = xfm,
                 .ctx = ctx,
@@ -1286,8 +1289,8 @@ pub const Generator = struct {
                 .drafter_block_size = options.drafter_block_size,
                 .mtp = if (mtp_active) options.mtp else null,
                 .mtp_cache = mtp_cache,
-                .mtp_depth = resolveMtpDepthCap(options.mtp_depth, mtp_nax_profile),
-                .mtp_ev_costs = mtpEvCosts(mtp_nax_profile),
+                .mtp_depth = resolveMtpDepthCapForProfile(options.mtp_depth, mtp_cost_profile),
+                .mtp_ev_costs = mtpEvCosts(mtp_cost_profile),
                 // Start at depth 1 and climb with evidence: the cheap depth
                 // is the safe default (1.11x on cold/creative content), and
                 // hot workloads promote within ~8 rounds.
@@ -3330,6 +3333,21 @@ pub const Generator = struct {
         .nax_from = 7,
         .per_pos_nax = 0.04,
     };
+    /// M5 Max/G17 affine-4/gs-32 sidecar refit (2026-07-18). A saturated
+    /// fixed-depth sweep gave T(1)=36.04, T(3)=43.01, T(6)=62.56, and
+    /// T(8)=66.06 ms. The fitted composite marginals (`draft + verify`) are
+    /// .107/.200/.054; depths 4 and 5 independently validate the rounded
+    /// .11/.20/.05 surface after matching-baseline correction. The split
+    /// between draft and verify is not separately identifiable.
+    pub const MTP_EV_G17_NAX_Q4_GS32_COSTS: MtpEvCosts = .{
+        .draft = 0.03,
+        .per_pos_lo = 0.08,
+        .per_pos_hi = 0.17,
+        .flat_max = 3,
+        .sync = 0.02,
+        .nax_from = 7,
+        .per_pos_nax = 0.02,
+    };
 
     /// Marginal round cost of draft position k (1-based).
     pub fn mtpEvMarginalCost(costs: MtpEvCosts, k: u32) f32 {
@@ -3351,17 +3369,32 @@ pub const Generator = struct {
     };
 
     /// Resolve the configured depth cap. 0 = auto (`--mtp-depth` not passed):
-    /// MTP_ADAPTIVE_NAX_CAP only when the EV controller and the target's NAX
+    /// MTP_ADAPTIVE_NAX_CAP only when the EV controller and a calibrated G17
     /// cost profile are both active, MTP_ADAPTIVE_DEFAULT_CAP otherwise, and
     /// DEFAULT_DEPTH in fixed mode. Explicit values always win.
-    pub fn mtpDepthCapFor(configured: u32, adaptive: bool, nax_profile: bool) u32 {
+    pub fn mtpDepthCapForProfile(configured: u32, adaptive: bool, profile: mtp_mod.MtpCostProfile) u32 {
         if (configured != 0) return @min(mtp_mod.MAX_DEPTH, @max(1, configured));
         if (!adaptive) return mtp_mod.DEFAULT_DEPTH;
-        return if (nax_profile) MTP_ADAPTIVE_NAX_CAP else MTP_ADAPTIVE_DEFAULT_CAP;
+        return switch (profile) {
+            .generic => MTP_ADAPTIVE_DEFAULT_CAP,
+            .g17_nax_q8_gs32, .g17_nax_q4_gs32 => MTP_ADAPTIVE_NAX_CAP,
+        };
     }
 
+    pub fn resolveMtpDepthCapForProfile(configured: u32, profile: mtp_mod.MtpCostProfile) u32 {
+        return mtpDepthCapForProfile(configured, mtpAdaptiveEnabled(), profile);
+    }
+
+    /// Legacy q8 boolean selector retained for source compatibility.
+    pub fn mtpDepthCapFor(configured: u32, adaptive: bool, nax_profile: bool) u32 {
+        const profile: mtp_mod.MtpCostProfile = if (nax_profile) .g17_nax_q8_gs32 else .generic;
+        return mtpDepthCapForProfile(configured, adaptive, profile);
+    }
+
+    /// Legacy q8 boolean selector retained for source compatibility.
     pub fn resolveMtpDepthCap(configured: u32, nax_profile: bool) u32 {
-        return mtpDepthCapFor(configured, mtpAdaptiveEnabled(), nax_profile);
+        const profile: mtp_mod.MtpCostProfile = if (nax_profile) .g17_nax_q8_gs32 else .generic;
+        return resolveMtpDepthCapForProfile(configured, profile);
     }
 
     /// Expected committed tokens for an m-deep round: the always-committed t1
@@ -3568,17 +3601,27 @@ pub const Generator = struct {
     /// profile), so a value copied from an M1-M4 tuning run means the same
     /// thing on M5. Empty/partial/malformed values are ignored atomically;
     /// they must not silently leave an auto-cap-8 target on generic costs.
-    pub fn mtpEvCostsFor(nax_profile: bool, override: ?[]const u8) MtpEvCosts {
-        const selected = if (nax_profile) MTP_EV_G17_NAX_COSTS else MTP_EV_DEFAULT_COSTS;
+    pub fn mtpEvCostsForProfile(profile: mtp_mod.MtpCostProfile, override: ?[]const u8) MtpEvCosts {
+        const selected = switch (profile) {
+            .generic => MTP_EV_DEFAULT_COSTS,
+            .g17_nax_q8_gs32 => MTP_EV_G17_NAX_COSTS,
+            .g17_nax_q4_gs32 => MTP_EV_G17_NAX_Q4_GS32_COSTS,
+        };
         if (override) |raw| {
             return parseMtpEvCostsOverride(raw) orelse selected;
         }
         return selected;
     }
 
-    fn mtpEvCosts(nax_profile: bool) MtpEvCosts {
-        return mtpEvCostsFor(
-            nax_profile,
+    /// Legacy q8 boolean selector retained for source compatibility.
+    pub fn mtpEvCostsFor(nax_profile: bool, override: ?[]const u8) MtpEvCosts {
+        const profile: mtp_mod.MtpCostProfile = if (nax_profile) .g17_nax_q8_gs32 else .generic;
+        return mtpEvCostsForProfile(profile, override);
+    }
+
+    fn mtpEvCosts(profile: mtp_mod.MtpCostProfile) MtpEvCosts {
+        return mtpEvCostsForProfile(
+            profile,
             if (std.c.getenv("MLX_SERVE_MTP_EV_COSTS")) |p| std.mem.span(p) else null,
         );
     }
@@ -6160,22 +6203,30 @@ test "MTP EV seed defaults on and explicit zero disables" {
     try testing.expect(!Generator.mtpEvSeedEnabledFromEnv("0-disabled"));
 }
 
-test "mtpDepthCapFor: auto cap follows the selected NAX profile; explicit always wins" {
+test "mtpDepthCapFor: auto cap follows the selected cost profile; explicit always wins" {
     // 0 = auto (--mtp-depth not passed).
-    try testing.expectEqual(Generator.MTP_ADAPTIVE_DEFAULT_CAP, Generator.mtpDepthCapFor(0, true, false));
-    try testing.expectEqual(@as(u32, 6), Generator.mtpDepthCapFor(0, true, false));
-    try testing.expectEqual(Generator.MTP_ADAPTIVE_NAX_CAP, Generator.mtpDepthCapFor(0, true, true));
-    try testing.expectEqual(@as(u32, 8), Generator.mtpDepthCapFor(0, true, true));
-    try testing.expectEqual(mtp_mod.DEFAULT_DEPTH, Generator.mtpDepthCapFor(0, false, false));
-    try testing.expectEqual(mtp_mod.DEFAULT_DEPTH, Generator.mtpDepthCapFor(0, false, true));
+    try testing.expectEqual(Generator.MTP_ADAPTIVE_DEFAULT_CAP, Generator.mtpDepthCapForProfile(0, true, .generic));
+    try testing.expectEqual(@as(u32, 6), Generator.mtpDepthCapForProfile(0, true, .generic));
+    for ([_]mtp_mod.MtpCostProfile{ .g17_nax_q8_gs32, .g17_nax_q4_gs32 }) |profile| {
+        try testing.expectEqual(Generator.MTP_ADAPTIVE_NAX_CAP, Generator.mtpDepthCapForProfile(0, true, profile));
+        try testing.expectEqual(@as(u32, 8), Generator.mtpDepthCapForProfile(0, true, profile));
+    }
+    for ([_]mtp_mod.MtpCostProfile{ .generic, .g17_nax_q8_gs32, .g17_nax_q4_gs32 }) |profile| {
+        try testing.expectEqual(mtp_mod.DEFAULT_DEPTH, Generator.mtpDepthCapForProfile(0, false, profile));
+    }
     // Explicit values ignore both controller mode and profile, and remain
     // clamped to [1, MAX_DEPTH].
-    try testing.expectEqual(@as(u32, 5), Generator.mtpDepthCapFor(5, true, false));
-    try testing.expectEqual(@as(u32, 5), Generator.mtpDepthCapFor(5, false, true));
-    try testing.expectEqual(@as(u32, 7), Generator.mtpDepthCapFor(7, true, false));
-    try testing.expectEqual(@as(u32, 8), Generator.mtpDepthCapFor(8, true, false));
-    try testing.expectEqual(@as(u32, 2), Generator.mtpDepthCapFor(2, true, true));
-    try testing.expectEqual(mtp_mod.MAX_DEPTH, Generator.mtpDepthCapFor(12, true, false));
+    try testing.expectEqual(@as(u32, 5), Generator.mtpDepthCapForProfile(5, true, .generic));
+    try testing.expectEqual(@as(u32, 5), Generator.mtpDepthCapForProfile(5, false, .g17_nax_q8_gs32));
+    try testing.expectEqual(@as(u32, 7), Generator.mtpDepthCapForProfile(7, true, .generic));
+    try testing.expectEqual(@as(u32, 8), Generator.mtpDepthCapForProfile(8, true, .generic));
+    try testing.expectEqual(@as(u32, 2), Generator.mtpDepthCapForProfile(2, true, .g17_nax_q4_gs32));
+    try testing.expectEqual(mtp_mod.MAX_DEPTH, Generator.mtpDepthCapForProfile(12, true, .generic));
+
+    // The original boolean helpers remain source-compatible and map true to
+    // the pre-existing q8 profile.
+    try testing.expectEqual(@as(u32, 6), Generator.mtpDepthCapFor(0, true, false));
+    try testing.expectEqual(@as(u32, 8), Generator.mtpDepthCapFor(0, true, true));
 }
 
 test "mtpFloorDisableObserve: extension misses do not poison depth one" {
@@ -6295,22 +6346,29 @@ test "mtpEvRoundCost: piecewise marginals (flat verify region, then the GDN widt
     try testing.expectApproxEqAbs(@as(f32, 0.32), Generator.mtpEvMarginalCost(costs, 4), 1e-6);
 }
 
-test "mtpEvCostsFor: G17 NAX profile is explicit and env tuning stays generic" {
-    const generic = Generator.mtpEvCostsFor(false, null);
+test "mtpEvCostsFor: G17 profiles are explicit and env tuning stays generic" {
+    const generic = Generator.mtpEvCostsForProfile(.generic, null);
     try testing.expectEqual(Generator.MTP_EV_DEFAULT_COSTS, generic);
 
-    const nax = Generator.mtpEvCostsFor(true, null);
-    try testing.expectEqual(Generator.MTP_EV_G17_NAX_COSTS, nax);
-    try testing.expectEqual(@as(u32, 7), nax.nax_from);
+    const q8 = Generator.mtpEvCostsForProfile(.g17_nax_q8_gs32, null);
+    try testing.expectEqual(Generator.MTP_EV_G17_NAX_COSTS, q8);
+    try testing.expectEqual(@as(u32, 7), q8.nax_from);
+
+    const q4 = Generator.mtpEvCostsForProfile(.g17_nax_q4_gs32, null);
+    try testing.expectEqual(Generator.MTP_EV_G17_NAX_Q4_GS32_COSTS, q4);
+    try testing.expectEqual(@as(u32, 7), q4.nax_from);
 
     // An explicit four-value override retains its historical meaning instead
-    // of inheriting an implicit hardware-only third region.
-    const tuned = Generator.mtpEvCostsFor(true, "0.10, 0.11, 0.22, 0.03");
-    try testing.expectApproxEqAbs(@as(f32, 0.10), tuned.draft, 1e-6);
-    try testing.expectApproxEqAbs(@as(f32, 0.11), tuned.per_pos_lo, 1e-6);
-    try testing.expectApproxEqAbs(@as(f32, 0.22), tuned.per_pos_hi, 1e-6);
-    try testing.expectApproxEqAbs(@as(f32, 0.03), tuned.sync, 1e-6);
-    try testing.expectEqual(@as(u32, 0), tuned.nax_from);
+    // of inheriting an implicit hardware-only third region, for every profile.
+    for ([_]mtp_mod.MtpCostProfile{ .generic, .g17_nax_q8_gs32, .g17_nax_q4_gs32 }) |profile| {
+        const tuned = Generator.mtpEvCostsForProfile(profile, "0.10, 0.11, 0.22, 0.03");
+        try testing.expectApproxEqAbs(@as(f32, 0.10), tuned.draft, 1e-6);
+        try testing.expectApproxEqAbs(@as(f32, 0.11), tuned.per_pos_lo, 1e-6);
+        try testing.expectApproxEqAbs(@as(f32, 0.22), tuned.per_pos_hi, 1e-6);
+        try testing.expectApproxEqAbs(@as(f32, 0.03), tuned.sync, 1e-6);
+        try testing.expectEqual(@as(u32, 0), tuned.nax_from);
+        try testing.expectApproxEqAbs(@as(f32, 0.0), tuned.per_pos_nax, 1e-6);
+    }
 
     // Invalid overrides are atomic no-ops. In particular, an empty variable
     // must not combine cap 8 with the generic costs that previously starved it.
@@ -6323,8 +6381,13 @@ test "mtpEvCostsFor: G17 NAX profile is explicit and env tuning stays generic" {
         "0.10,-0.11,0.22,0.03",
     };
     for (invalid) |raw| {
-        try testing.expectEqual(Generator.MTP_EV_G17_NAX_COSTS, Generator.mtpEvCostsFor(true, raw));
+        try testing.expectEqual(Generator.MTP_EV_DEFAULT_COSTS, Generator.mtpEvCostsForProfile(.generic, raw));
+        try testing.expectEqual(Generator.MTP_EV_G17_NAX_COSTS, Generator.mtpEvCostsForProfile(.g17_nax_q8_gs32, raw));
+        try testing.expectEqual(Generator.MTP_EV_G17_NAX_Q4_GS32_COSTS, Generator.mtpEvCostsForProfile(.g17_nax_q4_gs32, raw));
     }
+
+    try testing.expectEqual(Generator.MTP_EV_DEFAULT_COSTS, Generator.mtpEvCostsFor(false, null));
+    try testing.expectEqual(Generator.MTP_EV_G17_NAX_COSTS, Generator.mtpEvCostsFor(true, null));
 }
 
 test "MTP_EV_G17_NAX_COSTS reproduces the measured M5 depth-6/depth-8 ratio" {
@@ -6338,7 +6401,20 @@ test "MTP_EV_G17_NAX_COSTS reproduces the measured M5 depth-6/depth-8 ratio" {
     try testing.expectApproxEqAbs(@as(f32, 0.10), Generator.mtpEvMarginalCost(costs, 7), 1e-6);
 }
 
-test "mtpEvPlanFor: M5 NAX surface opens depth 8 from realistic warmup EMAs" {
+test "MTP_EV_G17_NAX_Q4_GS32_COSTS encodes calibrated composite marginals" {
+    const costs = Generator.MTP_EV_G17_NAX_Q4_GS32_COSTS;
+    try testing.expect(costs.draft > 0.0);
+    try testing.expect(costs.per_pos_lo > 0.0);
+    try testing.expect(costs.per_pos_hi > 0.0);
+    try testing.expect(costs.per_pos_nax > 0.0);
+    try testing.expectApproxEqAbs(@as(f32, 0.11), Generator.mtpEvMarginalCost(costs, 3), 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 0.20), Generator.mtpEvMarginalCost(costs, 4), 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 0.05), Generator.mtpEvMarginalCost(costs, 7), 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 1.93), Generator.mtpEvRoundCost(costs, 6, false), 1e-5);
+    try testing.expectApproxEqAbs(@as(f32, 2.03), Generator.mtpEvRoundCost(costs, 8, false), 1e-5);
+}
+
+test "mtpEvPlanFor: M5 NAX surfaces open depth 8 from realistic warmup EMAs" {
     const p = Generator.MTP_EV_PRIOR;
     const a = [_]f32{ 0.97, 0.89, p, p, p, p, p, p };
 
@@ -6349,15 +6425,19 @@ test "mtpEvPlanFor: M5 NAX surface opens depth 8 from realistic warmup EMAs" {
 
     // The M5 fit captures both its cheaper intermediate widths and the NAX
     // takeover at draft position 7, so the same evidence reaches depth 8.
-    const nax = Generator.mtpEvPlanFor(&a, 8, Generator.MTP_EV_G17_NAX_COSTS, 3);
-    try testing.expectEqual(@as(u32, 3), nax.m_lo);
-    try testing.expectEqual(@as(u32, 8), nax.m_hi);
-    try testing.expect(nax.tau_ln < 0.0);
+    for ([_]Generator.MtpEvCosts{ Generator.MTP_EV_G17_NAX_COSTS, Generator.MTP_EV_G17_NAX_Q4_GS32_COSTS }) |costs| {
+        const nax = Generator.mtpEvPlanFor(&a, 8, costs, 3);
+        try testing.expectEqual(@as(u32, 3), nax.m_lo);
+        try testing.expectEqual(@as(u32, 8), nax.m_hi);
+        try testing.expect(nax.tau_ln < 0.0);
+    }
 
     const cold = [_]f32{ 0.2, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1 };
-    const cold_plan = Generator.mtpEvPlanFor(&cold, 8, Generator.MTP_EV_G17_NAX_COSTS, 8);
-    try testing.expectEqual(@as(u32, 1), cold_plan.m_lo);
-    try testing.expectEqual(@as(u32, 1), cold_plan.m_hi);
+    for ([_]Generator.MtpEvCosts{ Generator.MTP_EV_G17_NAX_COSTS, Generator.MTP_EV_G17_NAX_Q4_GS32_COSTS }) |costs| {
+        const cold_plan = Generator.mtpEvPlanFor(&cold, 8, costs, 8);
+        try testing.expectEqual(@as(u32, 1), cold_plan.m_lo);
+        try testing.expectEqual(@as(u32, 1), cold_plan.m_hi);
+    }
 }
 
 test "mtpEvPlanFor: mid-decay acceptance picks a shallow base and a confidence-gated extension" {

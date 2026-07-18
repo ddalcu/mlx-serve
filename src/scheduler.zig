@@ -2574,15 +2574,15 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // an `mtp/weights.safetensors` sidecar that binds to this trunk; a
     // failed load or bind only disables the head — the model still serves.
     var mtp_ptr: ?*mtp_mod.MtpModel = null;
-    var mtp_nax_profile = false;
+    var mtp_cost_profile: mtp_mod.MtpCostProfile = .generic;
     if (params.mtp_enabled and mtp_mod.hasMtpSidecar(sch.io, params.model_dir)) {
         if (sch.allocator.create(mtp_mod.MtpModel)) |h| {
             if (mtp_mod.loadMtp(sch.io, sch.allocator, mlx.gpuStream(), params.model_dir)) |loaded| {
                 h.* = loaded;
                 if (h.bind(xfm_ptr)) {
                     mtp_ptr = h;
-                    mtp_nax_profile = h.m5NaxCostProfileEnabled(xfm_ptr);
-                    log.info("MTP head ready (depth={d}).\n", .{generate_mod.Generator.resolveMtpDepthCap(params.mtp_depth, mtp_nax_profile)});
+                    mtp_cost_profile = h.m5NaxCostProfile(xfm_ptr);
+                    log.info("MTP head ready (depth={d}).\n", .{generate_mod.Generator.resolveMtpDepthCapForProfile(params.mtp_depth, mtp_cost_profile)});
                 } else |bind_err| {
                     log.warn("MTP sidecar incompatible with target ({s}) — disabled.\n", .{@errorName(bind_err)});
                     h.deinit();
@@ -2631,7 +2631,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     entry.mtp = mtp_ptr;
     // Resolve the auto (0) cap here so every downstream reader of
     // `lm.mtp_depth` (server log lines, slot params) sees the real value.
-    entry.mtp_depth = generate_mod.Generator.resolveMtpDepthCap(params.mtp_depth, mtp_nax_profile);
+    entry.mtp_depth = generate_mod.Generator.resolveMtpDepthCapForProfile(params.mtp_depth, mtp_cost_profile);
     entry.drafter_path = drafter_path_owned;
     drafter_path_owned = &[_]u8{}; // disarm the errdefer
     // Transfer ownership of the heap-allocated CPU state from `params` to
