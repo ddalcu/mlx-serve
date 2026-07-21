@@ -1306,6 +1306,9 @@ pub fn endsWithPartialThinkOpen(buf: []const u8) bool {
 ///     accepted families: `<tool>`, `<tool …>`, `<tool_call…>`, `<tool_calls…>`,
 ///     `<tool_request…>`, `<tool_requests…>` (mirrors `parseToolCalls`).
 ///   * `buf` contains the Gemma 4 `<|tool_call` substring.
+///   * `buf` contains `<function` followed by whitespace (MiniCPM5's
+///     `<function name="…">`, and incidentally the equals-sign Hermes
+///     function-tag form too).
 ///   * `buf[0] == '{'` and `buf` contains `"name"` (raw JSON tool-call shape).
 ///   * `buf` ends with a partial prefix that could grow into one of the above
 ///     in the next token (`<`, `<t`, `<to`, `<too`, `<tool`, or any prefix
@@ -1334,6 +1337,25 @@ pub fn streamShouldBufferForTools(buf: []const u8) bool {
         scan = after;
     }
 
+    // `<function…` family: MiniCPM5's `<function name="…">` (space then a
+    // quoted attribute) — walk every `<function` occurrence, accept the
+    // first one immediately followed by whitespace. This also naturally
+    // covers the pre-existing equals-sign Hermes function-tag format
+    // (`<function=NAME>`, see parseHermesToolCall) which shares the same
+    // `<function` marker but was never covered by this gate before — a
+    // strict improvement, not a behavior change, since that format was
+    // simply never held during streaming until now. A bare `<function>`
+    // with no attribute at all (not part of either format) is left alone,
+    // matching how unrelated `<toolkit>`/`<toolbar>` prose flows through
+    // the `<tool` family above.
+    scan = 0;
+    while (std.mem.indexOf(u8, buf[scan..], "<function")) |rel| {
+        const after = scan + rel + "<function".len;
+        if (after >= buf.len) return true; // truncated mid-prefix → in progress
+        if (std.ascii.isWhitespace(buf[after])) return true;
+        scan = after;
+    }
+
     // Trailing partial prefixes — the next streamed token could complete any
     // of these into a real tool open. Order doesn't matter; first endsWith
     // hit wins. Listed shortest-first for legibility.
@@ -1341,6 +1363,7 @@ pub fn streamShouldBufferForTools(buf: []const u8) bool {
         "<",     "<t",     "<to",     "<too",     "<tool",
         "<|",    "<|t",    "<|to",    "<|too",    "<|tool",
         "<|tool_", "<|tool_c", "<|tool_ca", "<|tool_cal",
+        "<f",    "<fu",    "<fun",     "<func",    "<functi", "<functio", "<function",
     };
     for (tail_prefixes) |p| {
         if (std.mem.endsWith(u8, buf, p)) return true;
@@ -1743,6 +1766,17 @@ pub fn parseToolCalls(allocator: std.mem.Allocator, text: []const u8) !?[]Parsed
             if (parseHermesToolCall(allocator, effective_text)) |tc| {
                 try calls.append(allocator, tc);
             }
+        }
+    }
+
+    // MiniCPM5 V3 XML: `<function name="X"><param name="K">V</param>…</function>`,
+    // zero or more consecutive calls, no outer wrapper. Tried only after every
+    // other explicit tag format above has had its shot, and before the
+    // raw-JSON guessing fallback below — an explicit recognized tag always
+    // wins over heuristic inference.
+    if (calls.items.len == 0) {
+        if (std.mem.indexOf(u8, effective_text, "<function") != null) {
+            try parseMiniCpm5ToolCalls(allocator, effective_text, &calls);
         }
     }
 
@@ -4000,6 +4034,177 @@ fn parseHermesToolCall(allocator: std.mem.Allocator, block: []const u8) ?ParsedT
         .name = allocator.dupe(u8, fn_name) catch return null,
         .arguments = allocator.dupe(u8, args_map.items) catch return null,
     };
+}
+
+/// MiniCPM5 V3 XML tool calls — attribute-quoted, one call per `<function>`
+/// tag, no outer wrapper:
+///   <function name="shell">
+///     <param name="command">pwd</param>
+///   </function>
+/// Multiple calls appear as consecutive `<function name="…">…</function>`
+/// blocks. A `<param>` value may be CDATA-wrapped
+/// (`<param name="x"><![CDATA[ … ]]></param>`) — the payload is used
+/// verbatim. This is its own scan, not part of the generic `<tool` family or
+/// the equals-sign Hermes function-tag scan just above (`<function=NAME>`):
+/// the marker is `<function` followed by WHITESPACE (the attribute form),
+/// which the equals-sign form never produces (its char right after
+/// `<function` is always `=`), so the two can never false-fire on each
+/// other. Duplicate `<param name="K">` — first occurrence wins, mirroring
+/// `parseHermesToolCall`'s `<parameter=>` dedup and `parseHy3ToolCalls`'s
+/// `<arg_key>` dedup (both exist because std.json rejects duplicate object
+/// keys). An unrecognized function name or an undeclared parameter is never
+/// rejected here — schema validation is centralized downstream
+/// (`toolCallConformsToSchema` et al., `src/server.zig`'s
+/// `parseToolCallsForRequest`), exactly as for every other tag-format
+/// dialect. Truncation (EOS or max_tokens mid-call): when no `</function>`
+/// close is found, the param scan is bounded by end-of-text instead — any
+/// COMPLETE `<param>…</param>` pairs before the cut still recover (mirrors
+/// `parseHy3ToolCalls`'s `call_end` fallback); a partial trailing value is
+/// never salvaged.
+fn parseMiniCpm5ToolCalls(allocator: std.mem.Allocator, text: []const u8, calls: *std.ArrayList(ParsedToolCall)) !void {
+    var pos: usize = 0;
+    while (std.mem.indexOfPos(u8, text, pos, "<function")) |p| {
+        const after = p + "<function".len;
+        // The attribute form requires whitespace right after `<function` —
+        // anything else is the equals-sign Hermes form or unrelated text
+        // (e.g. `<functional>`), left for that scan / plain content.
+        if (after >= text.len or !std.ascii.isWhitespace(text[after])) {
+            pos = after;
+            continue;
+        }
+        const tag_end = std.mem.indexOfScalarPos(u8, text, after, '>') orelse {
+            pos = text.len; // Unterminated opening tag — nothing left to recover.
+            break;
+        };
+        const open_tag = text[after..tag_end];
+        const fn_name = miniCpm5AttrValue(open_tag, "name") orelse {
+            // No `name="…"` attribute — not a recognizable MiniCPM5 call.
+            pos = tag_end + 1;
+            continue;
+        };
+        if (fn_name.len == 0) {
+            pos = tag_end + 1;
+            continue;
+        }
+
+        const body_start = tag_end + 1;
+        const close_pos = miniCpm5FindCloseTag(text, body_start, "</function>");
+        const body_end = if (close_pos) |cp| cp else text.len;
+        const body = text[body_start..body_end];
+
+        var args_map: std.json.ObjectMap = .empty;
+        defer args_map.deinit(allocator);
+
+        var pscan: usize = 0;
+        while (std.mem.indexOfPos(u8, body, pscan, "<param")) |pp| {
+            const p_after = pp + "<param".len;
+            if (p_after >= body.len or !std.ascii.isWhitespace(body[p_after])) {
+                pscan = p_after;
+                continue;
+            }
+            const p_tag_end = std.mem.indexOfScalarPos(u8, body, p_after, '>') orelse break;
+            const p_open_tag = body[p_after..p_tag_end];
+            const p_name = miniCpm5AttrValue(p_open_tag, "name") orelse {
+                pscan = p_tag_end + 1;
+                continue;
+            };
+            const p_val_start = p_tag_end + 1;
+            const p_close_pos = miniCpm5FindCloseTag(body, p_val_start, "</param>") orelse break;
+            const value = miniCpm5ParamValue(body[p_val_start..p_close_pos]);
+
+            if (p_name.len > 0 and args_map.getEntry(p_name) == null) {
+                try args_map.put(allocator, p_name, .{ .string = value });
+            }
+            pscan = p_close_pos + "</param>".len;
+        }
+
+        const args_str = try std.json.Stringify.valueAlloc(allocator, std.json.Value{ .object = args_map }, .{});
+        errdefer allocator.free(args_str);
+        const name_owned = try allocator.dupe(u8, fn_name);
+        errdefer allocator.free(name_owned);
+        try calls.append(allocator, .{ .name = name_owned, .arguments = args_str });
+
+        pos = if (close_pos) |cp| cp + "</function>".len else text.len;
+    }
+}
+
+/// Find `close_tag` (`</param>` or `</function>`) starting at `from`,
+/// skipping over the payload of any `<![CDATA[ … ]]>` span encountered along
+/// the way. A CDATA payload may legitimately contain the literal closing-tag
+/// text — e.g. a `write_file` call whose content documents this very XML
+/// format, or writes an unrelated `</param>`-shaped snippet — and CDATA's
+/// whole purpose is to carry such content safely; a naive substring search
+/// would truncate the value/call at that inner occurrence. An unterminated
+/// CDATA open (no matching `]]>`) has no knowable end, so the search gives
+/// up (null) rather than guess — the caller's existing truncation path
+/// already treats "no close found" as EOS/max_tokens truncation.
+fn miniCpm5FindCloseTag(haystack: []const u8, from: usize, close_tag: []const u8) ?usize {
+    var i = from;
+    while (true) {
+        const cdata_at = std.mem.indexOfPos(u8, haystack, i, "<![CDATA[");
+        const close_at = std.mem.indexOfPos(u8, haystack, i, close_tag);
+        if (cdata_at) |cd| {
+            if (close_at == null or cd < close_at.?) {
+                const payload_start = cd + "<![CDATA[".len;
+                const end_pos = std.mem.indexOfPos(u8, haystack, payload_start, "]]>") orelse return null;
+                i = end_pos + "]]>".len;
+                continue;
+            }
+        }
+        return close_at;
+    }
+}
+
+/// Extract `key="value"` or `key='value'` from an opening tag's attribute
+/// span (the text strictly between the tag name and its closing `>`).
+/// Requires a word boundary before `key` so `data-name=` can't match `name=`.
+/// An unquoted `key=value` is malformed (MiniCPM5 always quotes) and yields
+/// null, same as a missing key.
+fn miniCpm5AttrValue(tag_attrs: []const u8, key: []const u8) ?[]const u8 {
+    var buf: [40]u8 = undefined;
+    if (key.len + 1 > buf.len) return null;
+    const needle = std.fmt.bufPrint(&buf, "{s}=", .{key}) catch return null;
+    var search_from: usize = 0;
+    while (std.mem.indexOf(u8, tag_attrs[search_from..], needle)) |rel| {
+        const at = search_from + rel;
+        if (at > 0) {
+            const before = tag_attrs[at - 1];
+            if (std.ascii.isAlphanumeric(before) or before == '_' or before == '-') {
+                search_from = at + needle.len;
+                continue;
+            }
+        }
+        const q_pos = at + needle.len;
+        if (q_pos >= tag_attrs.len) return null;
+        const quote = tag_attrs[q_pos];
+        if (quote != '"' and quote != '\'') {
+            search_from = q_pos;
+            continue;
+        }
+        const val_start = q_pos + 1;
+        const val_end_rel = std.mem.indexOfScalar(u8, tag_attrs[val_start..], quote) orelse return null;
+        return tag_attrs[val_start .. val_start + val_end_rel];
+    }
+    return null;
+}
+
+/// Resolve a `<param>` body to its final value. CDATA form
+/// (`<![CDATA[ … ]]>`, detected after trimming incidental surrounding
+/// whitespace) yields its payload byte-exact and unfiltered — CDATA's whole
+/// purpose is to carry content verbatim. Otherwise mirrors
+/// `parseHermesToolCall`'s plain-value handling: strip only the newlines a
+/// multi-line `<param>\nvalue\n</param>` formatting adds; interior
+/// leading/trailing spaces (shell flags, indentation) are kept.
+fn miniCpm5ParamValue(raw: []const u8) []const u8 {
+    const probe = std.mem.trim(u8, raw, " \t\n\r");
+    const cdata_open = "<![CDATA[";
+    if (std.mem.startsWith(u8, probe, cdata_open)) {
+        const body = probe[cdata_open.len..];
+        if (std.mem.lastIndexOf(u8, body, "]]>")) |close| {
+            return body[0..close];
+        }
+    }
+    return std.mem.trim(u8, raw, "\n\r");
 }
 
 /// A parameter name from a well-formed `<parameter=NAME>` tag is a short token
@@ -8293,4 +8498,348 @@ test "parseToolCalls hy3: suffixed think close before the wrapper still parses" 
     }
     try testing.expectEqual(@as(usize, 1), calls.len);
     try testing.expectEqualStrings("list_files", calls[0].name);
+}
+
+// ── MiniCPM5 V3 XML (`<function name="X"><param name="K">V</param></function>`) ──
+
+test "parseToolCalls minicpm5: single string arg (shell pwd)" {
+    const raw = "<function name=\"shell\">\n  <param name=\"command\">pwd</param>\n</function>";
+    const calls = (try parseToolCalls(testing.allocator, raw)).?;
+    defer {
+        for (calls) |tc| {
+            testing.allocator.free(tc.name);
+            testing.allocator.free(tc.arguments);
+        }
+        testing.allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("shell", calls[0].name);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("pwd", parsed.value.object.get("command").?.string);
+}
+
+test "parseToolCalls minicpm5: shell echo hello" {
+    const raw = "<function name=\"shell\">\n  <param name=\"command\">echo hello</param>\n</function>";
+    const calls = (try parseToolCalls(testing.allocator, raw)).?;
+    defer {
+        for (calls) |tc| {
+            testing.allocator.free(tc.name);
+            testing.allocator.free(tc.arguments);
+        }
+        testing.allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("shell", calls[0].name);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("echo hello", parsed.value.object.get("command").?.string);
+}
+
+test "parseToolCalls minicpm5: git status" {
+    const raw = "<function name=\"shell\">\n  <param name=\"command\">git status</param>\n</function>";
+    const calls = (try parseToolCalls(testing.allocator, raw)).?;
+    defer {
+        for (calls) |tc| {
+            testing.allocator.free(tc.name);
+            testing.allocator.free(tc.arguments);
+        }
+        testing.allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("git status", parsed.value.object.get("command").?.string);
+}
+
+test "parseToolCalls minicpm5: git log -1" {
+    const raw = "<function name=\"shell\">\n  <param name=\"command\">git log -1</param>\n</function>";
+    const calls = (try parseToolCalls(testing.allocator, raw)).?;
+    defer {
+        for (calls) |tc| {
+            testing.allocator.free(tc.name);
+            testing.allocator.free(tc.arguments);
+        }
+        testing.allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("git log -1", parsed.value.object.get("command").?.string);
+}
+
+test "parseToolCalls minicpm5: multiple arguments in one call" {
+    const raw = "<function name=\"write_file\">\n" ++
+        "  <param name=\"path\">notes.txt</param>\n" ++
+        "  <param name=\"content\">hello world</param>\n" ++
+        "</function>";
+    const calls = (try parseToolCalls(testing.allocator, raw)).?;
+    defer {
+        for (calls) |tc| {
+            testing.allocator.free(tc.name);
+            testing.allocator.free(tc.arguments);
+        }
+        testing.allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("write_file", calls[0].name);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqual(@as(usize, 2), parsed.value.object.count());
+    try testing.expectEqualStrings("notes.txt", parsed.value.object.get("path").?.string);
+    try testing.expectEqualStrings("hello world", parsed.value.object.get("content").?.string);
+}
+
+test "parseToolCalls minicpm5: CDATA param value kept verbatim" {
+    const raw = "<function name=\"write_file\">\n" ++
+        "  <param name=\"path\"><![CDATA[notes.txt]]></param>\n" ++
+        "  <param name=\"content\"><![CDATA[line one\nline <two> & \"three\"]]></param>\n" ++
+        "</function>";
+    const calls = (try parseToolCalls(testing.allocator, raw)).?;
+    defer {
+        for (calls) |tc| {
+            testing.allocator.free(tc.name);
+            testing.allocator.free(tc.arguments);
+        }
+        testing.allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("line one\nline <two> & \"three\"", parsed.value.object.get("content").?.string);
+}
+
+test "parseToolCalls minicpm5: CDATA payload containing a literal </param> is not truncated" {
+    // A write_file call documenting this very XML format — the CDATA payload
+    // legitimately contains the substring `</param>`. A naive substring
+    // search for the closing tag would cut the value there; CDATA exists
+    // precisely so this content is carried verbatim.
+    const raw = "<function name=\"write_file\">\n" ++
+        "  <param name=\"path\">docs.txt</param>\n" ++
+        "  <param name=\"content\"><![CDATA[Example: <param name=\"x\">y</param> then more text]]></param>\n" ++
+        "</function>";
+    const calls = (try parseToolCalls(testing.allocator, raw)).?;
+    defer {
+        for (calls) |tc| {
+            testing.allocator.free(tc.name);
+            testing.allocator.free(tc.arguments);
+        }
+        testing.allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings(
+        "Example: <param name=\"x\">y</param> then more text",
+        parsed.value.object.get("content").?.string,
+    );
+}
+
+test "parseToolCalls minicpm5: CDATA payload containing a literal </function> is not truncated, and a second real call still parses" {
+    const raw = "<function name=\"write_file\">\n" ++
+        "  <param name=\"path\">docs.txt</param>\n" ++
+        "  <param name=\"content\"><![CDATA[Close a call with </function> like this]]></param>\n" ++
+        "</function>\n" ++
+        "<function name=\"shell\">\n  <param name=\"command\">pwd</param>\n</function>";
+    const calls = (try parseToolCalls(testing.allocator, raw)).?;
+    defer {
+        for (calls) |tc| {
+            testing.allocator.free(tc.name);
+            testing.allocator.free(tc.arguments);
+        }
+        testing.allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 2), calls.len);
+    const first = try std.json.parseFromSlice(std.json.Value, testing.allocator, calls[0].arguments, .{});
+    defer first.deinit();
+    try testing.expectEqualStrings("Close a call with </function> like this", first.value.object.get("content").?.string);
+    try testing.expectEqualStrings("shell", calls[1].name);
+    const second = try std.json.parseFromSlice(std.json.Value, testing.allocator, calls[1].arguments, .{});
+    defer second.deinit();
+    try testing.expectEqualStrings("pwd", second.value.object.get("command").?.string);
+}
+
+test "parseToolCalls minicpm5: two sequential calls, no wrapper" {
+    const raw = "<function name=\"shell\">\n  <param name=\"command\">pwd</param>\n</function>\n" ++
+        "<function name=\"shell\">\n  <param name=\"command\">ls -la</param>\n</function>";
+    const calls = (try parseToolCalls(testing.allocator, raw)).?;
+    defer {
+        for (calls) |tc| {
+            testing.allocator.free(tc.name);
+            testing.allocator.free(tc.arguments);
+        }
+        testing.allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 2), calls.len);
+    const first = try std.json.parseFromSlice(std.json.Value, testing.allocator, calls[0].arguments, .{});
+    defer first.deinit();
+    try testing.expectEqualStrings("pwd", first.value.object.get("command").?.string);
+    const second = try std.json.parseFromSlice(std.json.Value, testing.allocator, calls[1].arguments, .{});
+    defer second.deinit();
+    try testing.expectEqualStrings("ls -la", second.value.object.get("command").?.string);
+}
+
+test "parseToolCalls minicpm5: duplicate param — first occurrence wins" {
+    const raw = "<function name=\"shell\">\n" ++
+        "  <param name=\"command\">pwd</param>\n" ++
+        "  <param name=\"command\">ls -la</param>\n" ++
+        "</function>";
+    const calls = (try parseToolCalls(testing.allocator, raw)).?;
+    defer {
+        for (calls) |tc| {
+            testing.allocator.free(tc.name);
+            testing.allocator.free(tc.arguments);
+        }
+        testing.allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("pwd", parsed.value.object.get("command").?.string);
+}
+
+test "parseToolCalls minicpm5: undeclared function name is still parsed (kept, not guessed away)" {
+    const raw = "<function name=\"delete_everything\">\n  <param name=\"path\">/</param>\n</function>";
+    const calls = (try parseToolCalls(testing.allocator, raw)).?;
+    defer {
+        for (calls) |tc| {
+            testing.allocator.free(tc.name);
+            testing.allocator.free(tc.arguments);
+        }
+        testing.allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("delete_everything", calls[0].name);
+    try testing.expectEqual(false, calls[0].inferred);
+}
+
+test "parseToolCalls minicpm5: missing param is never fabricated" {
+    const raw = "<function name=\"write\">\n  <param name=\"path\">notes.txt</param>\n</function>";
+    const calls = (try parseToolCalls(testing.allocator, raw)).?;
+    defer {
+        for (calls) |tc| {
+            testing.allocator.free(tc.name);
+            testing.allocator.free(tc.arguments);
+        }
+        testing.allocator.free(calls);
+    }
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqual(@as(usize, 1), parsed.value.object.count());
+    try testing.expect(parsed.value.object.get("content") == null);
+}
+
+test "parseToolCalls minicpm5: unrecognized param passes through untouched" {
+    const raw = "<function name=\"shell\">\n" ++
+        "  <param name=\"command\">pwd</param>\n" ++
+        "  <param name=\"timeout_ms\">5000</param>\n" ++
+        "</function>";
+    const calls = (try parseToolCalls(testing.allocator, raw)).?;
+    defer {
+        for (calls) |tc| {
+            testing.allocator.free(tc.name);
+            testing.allocator.free(tc.arguments);
+        }
+        testing.allocator.free(calls);
+    }
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("5000", parsed.value.object.get("timeout_ms").?.string);
+}
+
+test "parseToolCalls minicpm5: malformed open tag (dropped quote) never guesses a call" {
+    const raw = "<function name=\"shell>\n  <param name=\"command\">pwd</param>\n</function>\nI'll run that now.";
+    const calls = try parseToolCalls(testing.allocator, raw);
+    try testing.expect(calls == null);
+}
+
+test "parseToolCalls minicpm5: prose before and after a call, and function-like false positives" {
+    const raw = "Sure, let me check the working directory.\n" ++
+        "<function name=\"shell\">\n  <param name=\"command\">pwd</param>\n</function>\n" ++
+        "Done — see the result above.";
+    const calls = (try parseToolCalls(testing.allocator, raw)).?;
+    defer {
+        for (calls) |tc| {
+            testing.allocator.free(tc.name);
+            testing.allocator.free(tc.arguments);
+        }
+        testing.allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("shell", calls[0].name);
+
+    // `<functional>`/`<function-like>` are prose, not the attribute-quoted
+    // MiniCPM5 form (no whitespace right after `<function`) — no call.
+    const prose = "Wrap it in a <functional> or <function-like> block — just prose, no call here.";
+    try testing.expect(try parseToolCalls(testing.allocator, prose) == null);
+}
+
+test "parseToolCalls minicpm5: no tool call in plain prose" {
+    const raw = "The `shell` function name attribute isn't used here at all — just chatting.";
+    try testing.expect(try parseToolCalls(testing.allocator, raw) == null);
+}
+
+test "parseToolCalls minicpm5: existing bare Hermes <function=...> form is unaffected" {
+    const raw = "<function=shell><parameter=command>pwd</parameter></function>";
+    const calls = (try parseToolCalls(testing.allocator, raw)).?;
+    defer {
+        for (calls) |tc| {
+            testing.allocator.free(tc.name);
+            testing.allocator.free(tc.arguments);
+        }
+        testing.allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("shell", calls[0].name);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("pwd", parsed.value.object.get("command").?.string);
+}
+
+test "parseToolCalls minicpm5: adversarial malformed input never hangs or crashes" {
+    const inputs = [_][]const u8{
+        "<function",
+        "<function ",
+        "<function name=",
+        "<function name=\"",
+        "<function name=\"a\">",
+        "<function name=\"a\"><param",
+        "<function name=\"a\"><param name=",
+        "<function name=\"a\"><param name=\"\"></param></function>",
+        "<function name=\"\"></function>",
+        "<function><function><function>",
+        "<function name=\"a\">" ** 200,
+    };
+    for (inputs) |raw| {
+        const calls = try parseToolCalls(testing.allocator, raw);
+        if (calls) |cs| {
+            for (cs) |tc| {
+                testing.allocator.free(tc.name);
+                testing.allocator.free(tc.arguments);
+            }
+            testing.allocator.free(cs);
+        }
+    }
+}
+
+test "streamShouldBufferForTools: MiniCPM5 <function name=...> open" {
+    try testing.expect(streamShouldBufferForTools("<function name=\"shell\">"));
+    try testing.expect(streamShouldBufferForTools("<function name=\"shell\">\n  <param name=\"command\">pwd"));
+    try testing.expect(streamShouldBufferForTools("<function name=\"shell\">\n  <param name=\"command\">pwd</param></functio"));
+    try testing.expect(streamShouldBufferForTools("Sure, running that:\n<function name=\"shell\">"));
+}
+
+test "streamShouldBufferForTools: trailing partial prefixes of <function" {
+    try testing.expect(streamShouldBufferForTools("<f"));
+    try testing.expect(streamShouldBufferForTools("<fu"));
+    try testing.expect(streamShouldBufferForTools("<fun"));
+    try testing.expect(streamShouldBufferForTools("<func"));
+    try testing.expect(streamShouldBufferForTools("<functi"));
+    try testing.expect(streamShouldBufferForTools("<functio"));
+    try testing.expect(streamShouldBufferForTools("<function"));
+}
+
+test "streamShouldBufferForTools: false positive — bare <function> with no attribute" {
+    try testing.expect(!streamShouldBufferForTools("here is <function>"));
+    try testing.expect(!streamShouldBufferForTools("Wrap it in a <functional> block"));
 }

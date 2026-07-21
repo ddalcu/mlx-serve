@@ -108,6 +108,12 @@ const write_read_tools_schema =
     \\[{"type":"function","function":{"name":"write","description":"Write a file","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}},{"type":"function","function":{"name":"read","description":"Read a file","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}}]
 ;
 
+/// MiniCPM5's own headline example tool — reused by the minicpm5 corpus
+/// entries below (single-arg happy path, undeclared-param pass-through).
+const shell_tool_schema =
+    \\[{"type":"function","function":{"name":"shell","description":"Run a shell command","parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}}}]
+;
+
 const corpus = [_]Expect{
     // ── Qwen 3.5/3.6 (<think> family, template-injected opener) ─────────────
     .{
@@ -900,6 +906,111 @@ const corpus = [_]Expect{
         .tool_name = "write_file",
         .tool_arg_key = "path",
         .tool_arg_value = "page.html",
+    },
+
+    // ── MiniCPM5 V3 XML (`<function name="X"><param name="K">V</param></function>`) ──
+    .{
+        .family = "minicpm5",
+        .name = "single string arg (shell pwd)",
+        .raw = "<function name=\"shell\">\n  <param name=\"command\">pwd</param>\n</function>",
+        .tools_json = shell_tool_schema,
+        .tool_name = "shell",
+        .tool_arg_key = "command",
+        .tool_arg_value = "pwd",
+    },
+    .{
+        .family = "minicpm5",
+        .name = "shell echo hello",
+        .raw = "<function name=\"shell\">\n  <param name=\"command\">echo hello</param>\n</function>",
+        .tools_json = shell_tool_schema,
+        .tool_name = "shell",
+        .tool_arg_key = "command",
+        .tool_arg_value = "echo hello",
+    },
+    .{
+        .family = "minicpm5",
+        .name = "git status",
+        .raw = "<function name=\"shell\">\n  <param name=\"command\">git status</param>\n</function>",
+        .tools_json = shell_tool_schema,
+        .tool_name = "shell",
+        .tool_arg_key = "command",
+        .tool_arg_value = "git status",
+    },
+    .{
+        .family = "minicpm5",
+        .name = "CDATA-wrapped param value kept verbatim",
+        .raw = "<function name=\"write_file\">\n  <param name=\"path\"><![CDATA[notes.txt]]></param>\n  <param name=\"content\"><![CDATA[line one\nline <two> & \"three\"]]></param>\n</function>",
+        .tool_name = "write_file",
+        .tool_arg_key = "content",
+        .tool_arg_value = "line one\nline <two> & \"three\"",
+    },
+    .{
+        .family = "minicpm5",
+        .name = "two sequential calls, no wrapper",
+        .raw = "<function name=\"shell\">\n  <param name=\"command\">pwd</param>\n</function>\n<function name=\"shell\">\n  <param name=\"command\">ls -la</param>\n</function>",
+        .tools_json = shell_tool_schema,
+        .tool_count = 2,
+        .tool_arg_key = "command",
+        .tool_arg_value = "pwd",
+        .last_tool_arg_value = "ls -la",
+    },
+    .{
+        .family = "minicpm5",
+        .name = "undeclared function name is kept (not silently guessed away)",
+        .raw = "<function name=\"delete_everything\">\n  <param name=\"path\">/</param>\n</function>",
+        .tools_json = write_read_tools_schema,
+        .tool_name = "delete_everything",
+        .tool_arg_key = "path",
+        .tool_arg_value = "/",
+    },
+    .{
+        .family = "minicpm5",
+        .name = "missing required param is never fabricated",
+        .raw = "<function name=\"write\">\n  <param name=\"path\">notes.txt</param>\n</function>",
+        .tools_json = write_read_tools_schema,
+        .tool_name = "write",
+        .tool_arg_key = "path",
+        .tool_arg_value = "notes.txt",
+        .tool_arg_absent = "content",
+    },
+    .{
+        .family = "minicpm5",
+        .name = "undeclared param passes through untouched",
+        .raw = "<function name=\"shell\">\n  <param name=\"command\">pwd</param>\n  <param name=\"timeout_ms\">5000</param>\n</function>",
+        .tools_json = shell_tool_schema,
+        .tool_name = "shell",
+        .tool_arg_key = "timeout_ms",
+        .tool_arg_value = "5000",
+    },
+    .{
+        .family = "minicpm5",
+        .name = "duplicate param — first occurrence wins",
+        .raw = "<function name=\"shell\">\n  <param name=\"command\">pwd</param>\n  <param name=\"command\">ls -la</param>\n</function>",
+        .tools_json = shell_tool_schema,
+        .tool_name = "shell",
+        .tool_arg_key = "command",
+        .tool_arg_value = "pwd",
+    },
+    .{
+        .family = "minicpm5",
+        .name = "malformed: dropped attribute quote never guesses a call",
+        .raw = "<function name=\"shell>\n  <param name=\"command\">pwd</param>\n</function>\nI'll run that now.",
+        .no_tool_calls = true,
+    },
+    .{
+        .family = "minicpm5",
+        .name = "prose before and after a call",
+        .raw = "Sure, let me check the working directory.\n<function name=\"shell\">\n  <param name=\"command\">pwd</param>\n</function>\nDone — see the result above.",
+        .tools_json = shell_tool_schema,
+        .tool_name = "shell",
+        .tool_arg_key = "command",
+        .tool_arg_value = "pwd",
+    },
+    .{
+        .family = "minicpm5",
+        .name = "plain prose, and function-like tags are not mistaken for a call",
+        .raw = "Wrap the config in a <functional> or <function-like> block — this is just prose, no call here.",
+        .no_tool_calls = true,
     },
 };
 
