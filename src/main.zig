@@ -163,6 +163,24 @@ fn printUsage(io: std.Io) void {
         \\                        evictions instead of recomputed. Can use many
         \\                        GB of disk, so it's opt-in; e.g. 10GB. 0/off
         \\                        disables.
+        \\  --ssm-checkpoint-stride <n>
+        \\                      Hybrid SSM architectures only (e.g. Qwen3.5/3.6
+        \\                        GDN): capture an SSM/conv state checkpoint every
+        \\                        <n> tokens during chunked prefill, so a later
+        \\                        request sharing a prefix can restore mid-prompt
+        \\                        instead of re-prefilling (default: 256). 0
+        \\                        disables capture — hybrid models then bypass the
+        \\                        hot prefix cache entirely. On MoE targets the
+        \\                        effective stride is raised to the prefill chunk,
+        \\                        because each checkpoint forces a chunk boundary
+        \\                        and every extra chunk re-streams the expert
+        \\                        weights; see --prefill-chunk.
+        \\  --ssm-checkpoint-max <n>
+        \\                      Cap on SSM checkpoints retained per cache entry
+        \\                        (default: 32). The first stride-aligned position
+        \\                        is always kept; beyond the cap the oldest are
+        \\                        dropped. 0 = unlimited, bounded only by the
+        \\                        prefix cache's byte budget.
         \\  --tokenize-cache-entries <n>
         \\                      Per-model LRU cache of chat-template render +
         \\                        tokenize results (default: 4). Skips re-
