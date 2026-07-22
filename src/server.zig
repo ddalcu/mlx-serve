@@ -8163,13 +8163,20 @@ fn handleAnthropicStreaming(
         }
 
         if (has_tools) {
-            // Buffer for tool detection
+            // Buffer for tool detection. Uses the SAME gate as the
+            // chat-completions stream (chat.streamShouldBufferForTools) —
+            // this used to be its own narrower, hand-rolled check covering
+            // only `<tool_call`/`<|tool_call`/raw-JSON, which left every
+            // other tag-format dialect (bare DSV4 `<tool>`, Hy3, Gemma 4
+            // custom, bare-Hermes `<function=`, MiniCPM5 `<function name=`)
+            // unrecognized here: the raw tag leaked as a live text_delta
+            // stream, and a SEPARATE, correct tool_use block was then also
+            // emitted once the full buffered text was parsed at end-of-
+            // stream — duplicated content, not a missing call. One shared
+            // function now backs both protocols' streaming gates.
             try token_texts.append(allocator, token_text);
             const buf = text_buf.items;
-            const maybe_tool = std.mem.indexOf(u8, buf, "<tool_call") != null or
-                std.mem.indexOf(u8, buf, "<|tool_call") != null or
-                (buf.len > 0 and buf[0] == '{' and std.mem.indexOf(u8, buf, "\"name\"") != null) or
-                (buf.len >= 1 and buf[buf.len - 1] == '<');
+            const maybe_tool = chat_mod.streamShouldBufferForTools(buf);
 
             if (!maybe_tool) {
                 // Shared gate with the chat-completions stream (the two paths
@@ -11788,6 +11795,31 @@ test "parseToolCallsForRequest: tag-format call with an UNDECLARED name is kept"
         allocator.free(calls);
     }
     try std.testing.expectEqualStrings("searchWeb", calls[0].name);
+}
+
+test "parseToolCallsForRequest: MiniCPM5 V3 XML through the real server chokepoint" {
+    // Exercises the EXACT function every HTTP dispatch site in this file calls
+    // (server.zig:4812/5701/7868/8423/9575), proving the new dialect is wired
+    // all the way through — not just reachable from chat.parseToolCalls in
+    // isolation. Uses the Agent shell tool's real declared schema shape.
+    const allocator = std.testing.allocator;
+    const tools =
+        \\[{"type":"function","function":{"name":"shell","parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}}}]
+    ;
+    const text = "<function name=\"shell\">\n  <param name=\"command\">git status</param>\n</function>";
+    const calls = (try parseToolCallsForRequest(allocator, text, tools)) orelse
+        return error.ExpectedToolCall;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try std.testing.expectEqualStrings("shell", calls[0].name);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings("git status", parsed.value.object.get("command").?.string);
 }
 
 test "parseToolCallsForRequest: coercion fires across think on/off × qwen/gemma" {
