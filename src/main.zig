@@ -836,7 +836,7 @@ pub fn main(init: std.process.Init) !void {
         if (model_dir.len == 0) {
             const discovery_for_registry = discovery_storage;
             discovery_storage = null; // ownership moves to the registry
-            try runHeadlessServe(io, allocator, discovery_for_registry, host, port, ctx_size, timeout, reasoning_budget, max_resident_models, max_resident_mem, max_resident_mem_explicit, idle_evict_secs, kv_quant_config, force_mtp);
+            try runHeadlessServe(io, allocator, discovery_for_registry, host, port, ctx_size, timeout, reasoning_budget, max_resident_models, max_resident_mem, max_resident_mem_explicit, idle_evict_secs, kv_quant_config, force_mtp, enable_pld);
             return;
         }
 
@@ -1497,6 +1497,7 @@ fn runHeadlessServe(
     idle_evict_secs: ?u32,
     kv_quant_config: transformer_mod.KVQuantConfig,
     force_mtp: bool,
+    enable_pld: bool,
 ) !void {
     log.info("mlx-serve {s} (headless — models load on demand)\n", .{VERSION});
     log.info("[args] serve: {s}:{d}\n", .{ host, port });
@@ -1586,7 +1587,12 @@ fn runHeadlessServe(
         .default_temperature = null,
         .default_top_p = null,
         .default_top_k = null,
-        .default_enable_pld = false,
+        // Honor --pld/--no-pld in headless mode. Hardcoding this false meant
+        // the flag's default never reached a headless request — only an
+        // explicit per-request "enable_pld": true did — while MLX Core's own
+        // UI describes Auto as "follow the server's --pld setting". Mirrors
+        // the --model startup path in main().
+        .default_enable_pld = enable_pld,
         .default_pld_draft_len = 5,
         .default_pld_key_len = 3,
         .default_kv_attn_fused = false,
