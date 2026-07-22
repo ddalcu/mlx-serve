@@ -8163,13 +8163,20 @@ fn handleAnthropicStreaming(
         }
 
         if (has_tools) {
-            // Buffer for tool detection
+            // Buffer for tool detection. Uses the SAME gate as the
+            // chat-completions stream (chat.streamShouldBufferForTools) —
+            // this used to be its own narrower, hand-rolled check covering
+            // only `<tool_call`/`<|tool_call`/raw-JSON, which left every
+            // other tag-format dialect (bare DSV4 `<tool>`, Hy3, Gemma 4
+            // custom, bare-Hermes `<function=`, MiniCPM5 `<function name=`)
+            // unrecognized here: the raw tag leaked as a live text_delta
+            // stream, and a SEPARATE, correct tool_use block was then also
+            // emitted once the full buffered text was parsed at end-of-
+            // stream — duplicated content, not a missing call. One shared
+            // function now backs both protocols' streaming gates.
             try token_texts.append(allocator, token_text);
             const buf = text_buf.items;
-            const maybe_tool = std.mem.indexOf(u8, buf, "<tool_call") != null or
-                std.mem.indexOf(u8, buf, "<|tool_call") != null or
-                (buf.len > 0 and buf[0] == '{' and std.mem.indexOf(u8, buf, "\"name\"") != null) or
-                (buf.len >= 1 and buf[buf.len - 1] == '<');
+            const maybe_tool = chat_mod.streamShouldBufferForTools(buf);
 
             if (!maybe_tool) {
                 // Shared gate with the chat-completions stream (the two paths
