@@ -17,6 +17,7 @@ const std = @import("std");
 const mlx = @import("mlx.zig");
 const flux = @import("flux.zig");
 const krea = @import("krea.zig");
+const mage_flow_mod = @import("mage_flow.zig");
 const lora_mod = @import("lora.zig");
 const nsfw = @import("nsfw.zig");
 const tts = @import("tts.zig");
@@ -78,6 +79,7 @@ pub const Modality = enum {
 pub fn modalityFromType(model_type: []const u8) ?Modality {
     if (std.mem.startsWith(u8, model_type, "flux2")) return .image;
     if (std.mem.startsWith(u8, model_type, "krea")) return .image;
+    if (std.mem.startsWith(u8, model_type, "mage_flow") or std.mem.eql(u8, model_type, "mageflow")) return .image;
     if (std.mem.eql(u8, model_type, "qwen3_tts")) return .audio;
     if (std.mem.eql(u8, model_type, "acestep")) return .audio;
     if (std.mem.eql(u8, model_type, "AudioVideo")) return .video;
@@ -117,6 +119,17 @@ pub fn audioBackendKindForType(model_type: []const u8) enum { tts, music } {
 pub fn peekModelType(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) ?[]u8 {
     // Guard the openFileAbsolute assert (ReleaseFast UB on relative/empty paths).
     if (model_dir.len == 0 or !std.fs.path.isAbsolute(model_dir)) return null;
+    if (readConfigModelType(io, allocator, model_dir)) |mt| return mt;
+    // Diffusers-style repos (Mage-Flow) have no root config.json / model_type —
+    // the pipeline identity lives in model_index.json's `_class_name`. Synthesize
+    // the "mage_flow" marker so routing + the backend dispatch light up.
+    if (isMageFlowRepo(io, allocator, model_dir)) return allocator.dupe(u8, "mage_flow") catch null;
+    return null;
+}
+
+/// Read `model_dir/config.json`'s `model_type` (owned dupe) or null on any
+/// read/parse error or when the field is absent.
+fn readConfigModelType(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) ?[]u8 {
     const path = std.fmt.allocPrint(allocator, "{s}/config.json", .{model_dir}) catch return null;
     defer allocator.free(path);
     const file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return null;
@@ -131,6 +144,25 @@ pub fn peekModelType(io: std.Io, allocator: std.mem.Allocator, model_dir: []cons
     const mt = parsed.value.object.get("model_type") orelse return null;
     if (mt != .string) return null;
     return allocator.dupe(u8, mt.string) catch null;
+}
+
+/// True when `model_dir/model_index.json` marks a MageFlow pipeline (its
+/// `_class_name` is "MageFlowPipeline", or the `_mage_flow_version` tag exists).
+fn isMageFlowRepo(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) bool {
+    const path = std.fmt.allocPrint(allocator, "{s}/model_index.json", .{model_dir}) catch return false;
+    defer allocator.free(path);
+    const file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return false;
+    defer file.close(io);
+    var rb: [4096]u8 = undefined;
+    var rs = file.reader(io, &rb);
+    const content = rs.interface.allocRemaining(allocator, .limited(1024 * 1024)) catch return false;
+    defer allocator.free(content);
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    if (parsed.value.object.get("_mage_flow_version") != null) return true;
+    const cn = parsed.value.object.get("_class_name") orelse return false;
+    return cn == .string and std.mem.eql(u8, cn.string, "MageFlowPipeline");
 }
 
 /// Classify a model dir into a media modality (reads its `model_type`), or null
@@ -319,6 +351,7 @@ const FluxImpl = struct {
 const ImageBackend = union(enum) {
     flux: FluxImpl,
     krea: *krea.Engine,
+    mage_flow: *mage_flow_mod.Engine,
 };
 
 /// Most reference images an edit request may carry (the primary 'image' plus
@@ -363,18 +396,20 @@ pub const ImageEngine = struct {
         const self = try allocator.create(ImageEngine);
         errdefer allocator.destroy(self);
         self.* = .{ .allocator = allocator, .backend = undefined };
-        // Re-peek the arch to pick the backend (detectModality already proved
-        // config.json parses). `krea*` → Krea; everything else → FLUX.
-        const is_krea = blk: {
-            const mt = peekModelType(io, allocator, model_dir) orelse break :blk false;
+        // Re-peek the arch to pick the backend (detectModality already proved the
+        // config parses). `mage_flow*` → MageFlow; `krea*` → Krea; else FLUX.
+        if (peekModelType(io, allocator, model_dir)) |mt| {
             defer allocator.free(mt);
-            break :blk std.mem.startsWith(u8, mt, "krea");
-        };
-        if (is_krea) {
-            self.backend = .{ .krea = try krea.Engine.load(io, allocator, model_dir) };
-        } else {
-            self.backend = .{ .flux = try FluxImpl.load(io, allocator, model_dir) };
+            if (std.mem.startsWith(u8, mt, "mage_flow") or std.mem.eql(u8, mt, "mageflow")) {
+                self.backend = .{ .mage_flow = try mage_flow_mod.Engine.load(io, allocator, model_dir) };
+                return self;
+            }
+            if (std.mem.startsWith(u8, mt, "krea")) {
+                self.backend = .{ .krea = try krea.Engine.load(io, allocator, model_dir) };
+                return self;
+            }
         }
+        self.backend = .{ .flux = try FluxImpl.load(io, allocator, model_dir) };
         return self;
     }
 
@@ -383,6 +418,7 @@ pub const ImageEngine = struct {
         switch (self.backend) {
             .flux => |*f| f.deinit(),
             .krea => |k| k.deinit(),
+            .mage_flow => |m| m.deinit(),
         }
         self.allocator.destroy(self);
     }
@@ -391,6 +427,7 @@ pub const ImageEngine = struct {
         return switch (self.backend) {
             .flux => |*f| f.s,
             .krea => |k| k.s,
+            .mage_flow => |m| m.s,
         };
     }
 
@@ -399,6 +436,7 @@ pub const ImageEngine = struct {
         return switch (self.backend) {
             .flux => 3,
             .krea => 12,
+            .mage_flow => 0, // conditioning-rebalance not wired for MageFlow yet
         };
     }
 
@@ -407,6 +445,7 @@ pub const ImageEngine = struct {
         return switch (self.backend) {
             .flux => |*f| f.vae_enc != null,
             .krea => |k| k.vae_enc != null,
+            .mage_flow => false, // img2img lands with the MageFlow VAE encoder
         };
     }
 
@@ -416,6 +455,7 @@ pub const ImageEngine = struct {
         return switch (self.backend) {
             .flux => |*f| f.vae_enc != null,
             .krea => false,
+            .mage_flow => false, // MageFlow edit variant is a later phase
         };
     }
 
@@ -432,6 +472,7 @@ pub const ImageEngine = struct {
             const matched = switch (self.backend) {
                 .flux => |*f| flux.attachLora(&f.dit, &lf, scale),
                 .krea => |k| krea.attachLora(&k.dit, &lf, scale),
+                .mage_flow => 0, // MageFlow does not support LoRA (matches mflux)
             };
             if (matched == 0) {
                 lf.deinit();
@@ -451,6 +492,7 @@ pub const ImageEngine = struct {
         switch (self.backend) {
             .flux => |*f| flux.detachLora(&f.dit),
             .krea => |k| krea.detachLora(&k.dit),
+            .mage_flow => {}, // no LoRA attached
         }
         if (self.lora_file) |*lf| lf.deinit();
         self.lora_file = null;
@@ -480,6 +522,9 @@ pub const ImageEngine = struct {
                 };
                 break :blk k.generateImageOpts(allocator, prompt, width, height, seed, steps, kopts, progress);
             },
+            // Port in progress: config loads, forward pass not wired yet. Returns
+            // error.MageFlowNotImplemented → handleImage surfaces an honest 501.
+            .mage_flow => |m| m.generateImage(allocator, prompt, width, height, seed, steps),
         };
     }
 
@@ -497,6 +542,8 @@ pub const ImageEngine = struct {
         return switch (self.backend) {
             .flux => .{ .w = clampFluxDim(req_w), .h = clampFluxDim(req_h) },
             .krea => .{ .w = clampKreaDim(req_w), .h = clampKreaDim(req_h) },
+            // MageFlow is native-resolution, VAE downsample 16 → multiples of 16.
+            .mage_flow => .{ .w = clampKreaDim(req_w), .h = clampKreaDim(req_h) },
         };
     }
 };
@@ -1389,6 +1436,16 @@ pub fn handleImage(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: 
     };
     const img = engine.generateImage(allocator, prompt, width, height, seed, steps, gen_opts, prog) catch |err| {
         log.err("[image] generation failed: {}\n", .{err});
+        // MageFlow port-in-progress: config loads but the forward pass isn't
+        // wired yet — report it honestly (501) instead of a generic failure.
+        if (err == error.MageFlowNotImplemented) {
+            const m501 = "MageFlow image generation is not yet implemented in this build";
+            if (want_stream) {
+                sse.sendError(conn, m501);
+                return;
+            }
+            return sendError(conn, 501, m501);
+        }
         if (want_stream) {
             sse.sendError(conn, "generation failed");
             return;
@@ -2439,8 +2496,35 @@ test "modalityFromType classifies the media archs + markers (incl. krea + hunyua
     try testing.expectEqual(Modality.video, modalityFromType("AudioVideo").?);
     try testing.expectEqual(Modality.mesh, modalityFromType("hunyuan3d_2_1").?);
     try testing.expectEqual(Modality.mesh, modalityFromType("hunyuan3d").?);
+    try testing.expectEqual(Modality.image, modalityFromType("mage_flow").?);
+    try testing.expectEqual(Modality.image, modalityFromType("mageflow").?);
     try testing.expectEqual(@as(?Modality, null), modalityFromType("gemma4"));
     try testing.expectEqual(@as(?Modality, null), modalityFromType("qwen3_5_moe"));
+}
+
+test "mage_flow detects from the official diffusers layout (model_index.json, no root config.json)" {
+    const allocator = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root_buf);
+    const root = root_buf[0..root_len];
+
+    // Official Mage-Flow repos have no root config.json/model_type — the
+    // pipeline identity lives in model_index.json (_class_name).
+    try tmp.dir.createDirPath(io, "mf");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "mf/model_index.json",
+        .data = "{\"_class_name\":\"MageFlowPipeline\",\"_mage_flow_version\":\"0.1.0\"}",
+    });
+    const model_dir = try std.fs.path.join(allocator, &.{ root, "mf" });
+    defer allocator.free(model_dir);
+
+    const mt = peekModelType(io, allocator, model_dir) orelse return error.TestExpectedResult;
+    defer allocator.free(mt);
+    try testing.expectEqualStrings("mage_flow", mt);
+    try testing.expectEqual(Modality.image, detectModality(io, allocator, model_dir).?);
 }
 
 test "Modality.mesh advertises the 3d capability" {

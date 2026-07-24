@@ -54,6 +54,8 @@ const supported_model_types = [_][]const u8{
 pub fn isMediaModelType(model_type: []const u8) bool {
     return std.mem.startsWith(u8, model_type, "flux2") or
         std.mem.startsWith(u8, model_type, "krea") or
+        std.mem.startsWith(u8, model_type, "mage_flow") or
+        std.mem.eql(u8, model_type, "mageflow") or
         std.mem.eql(u8, model_type, "qwen3_tts") or
         std.mem.eql(u8, model_type, "acestep") or
         std.mem.eql(u8, model_type, "AudioVideo") or
@@ -312,7 +314,9 @@ pub fn modelKindFromType(model_type: []const u8) ModelKind {
     if (std.mem.eql(u8, model_type, "bert")) return .embed;
     if (std.mem.endsWith(u8, model_type, "_assistant")) return .drafter;
     if (std.mem.startsWith(u8, model_type, "flux2") or
-        std.mem.startsWith(u8, model_type, "krea")) return .image;
+        std.mem.startsWith(u8, model_type, "krea") or
+        std.mem.startsWith(u8, model_type, "mage_flow") or
+        std.mem.eql(u8, model_type, "mageflow")) return .image;
     if (std.mem.eql(u8, model_type, "qwen3_tts") or
         std.mem.eql(u8, model_type, "acestep")) return .audio;
     if (std.mem.eql(u8, model_type, "AudioVideo")) return .video;
@@ -851,6 +855,15 @@ fn lessThanById(_: void, a: DiscoveredModel, b: DiscoveredModel) bool {
 // ── Tests ──
 
 const testing = std.testing;
+
+test "mage_flow classifies as image media (modelKind + isMediaModelType)" {
+    try testing.expect(isMediaModelType("mage_flow"));
+    try testing.expect(isMediaModelType("mageflow"));
+    try testing.expectEqual(ModelKind.image, modelKindFromType("mage_flow"));
+    try testing.expectEqual(ModelKind.image, modelKindFromType("mageflow"));
+    // Guardrail: a regular LM must not be swept up by the prefix match.
+    try testing.expect(!isMediaModelType("gemma4"));
+}
 
 test "discoverModels finds flat and org/repo model dirs" {
     const io = std.testing.io;
