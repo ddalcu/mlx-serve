@@ -7084,10 +7084,16 @@ pub const Transformer = struct {
 
         // Qwen3-VL interleaved M-RoPE: build the per-prefill-chunk cos/sin once
         // (shared by every full-attn layer this forward), freed after the loop.
-        // Decode (seq_len==1) leaves these null → gatedFullAttnWith uses the
-        // scalar offset+delta path.
+        // Generated-token forwards start past the explicit position table and
+        // use the scalar offset+delta path, including multi-token speculative
+        // verification.
         if (ctx.mrope_pos != null and is_prefill and @as(usize, @intCast(offset)) + @as(usize, @intCast(seq_len)) <= ctx.mrope_total) {
-            const cs = try self.buildMropeCosSin(ctx, @intCast(offset), @intCast(seq_len));
+            const positions = mrope.PositionContext{
+                .pos = ctx.mrope_pos.?,
+                .total = ctx.mrope_total,
+                .delta = ctx.mrope_delta,
+            };
+            const cs = try self.buildMropeCosSin(positions, @intCast(offset), @intCast(seq_len));
             ctx.mrope_cos_cur = cs.cos;
             ctx.mrope_sin_cur = cs.sin;
         }
@@ -8377,16 +8383,15 @@ pub const Transformer = struct {
 
     // ── Full Attention for MoE models (with optional output gate) ──
 
-    /// Build per-token interleaved-M-RoPE cos/sin [1,1,seq_len,rope_dims] (bf16)
-    /// for prompt positions [offset, offset+seq_len) from `ctx.mrope_pos`. The
-    /// 3D (t,h,w) divergence only matters at image tokens (prefill); text tokens
-    /// have t=h=w so this collapses to ordinary partial RoPE.
-    fn buildMropeCosSin(self: *Transformer, ctx: *ForwardCtx, offset: usize, seq_len: usize) !struct { cos: mlx.mlx_array, sin: mlx.mlx_array } {
+    /// Build per-token interleaved-M-RoPE cos/sin [1,1,seq_len,rope_dims] (bf16).
+    /// Positions inside the prompt come from the explicit 3-D table; positions
+    /// beyond it are generated text and collapse to scalar `absolute + delta`.
+    /// `positions.base` lets a suffix-only speculative KV cache map its relative
+    /// offsets back to the full prompt table.
+    pub fn buildMropeCosSin(self: *Transformer, positions: mrope.PositionContext, offset: usize, seq_len: usize) !struct { cos: mlx.mlx_array, sin: mlx.mlx_array } {
         const cfg = &self.config;
         const rope_dims: usize = @intFromFloat(@as(f32, @floatFromInt(cfg.head_dim)) * cfg.partial_rotary_factor);
         const half = rope_dims / 2;
-        const pos = ctx.mrope_pos.?;
-        const total = ctx.mrope_total;
 
         const inv_freq = try self.allocator.alloc(f64, half);
         defer self.allocator.free(inv_freq);
@@ -8404,7 +8409,7 @@ pub const Transformer = struct {
             const o = i * rope_dims;
             for (0..half) |d| {
                 const axis: usize = sel[d];
-                const pid: f64 = @floatFromInt(pos[axis * total + p]);
+                const pid: f64 = @floatFromInt(positions.axisPosition(axis, p));
                 const angle = pid * inv_freq[d];
                 const c: f32 = @floatCast(@cos(angle));
                 const s: f32 = @floatCast(@sin(angle));
@@ -8431,7 +8436,7 @@ pub const Transformer = struct {
     /// precomputed cos/sin [1,1,S,rope_dims] (broadcast over B,H); pass remaining
     /// dims through. Equivalent to `mlx_fast_rope(traditional=false)` but with
     /// per-token (M-RoPE) angles instead of a scalar offset.
-    fn applyMrope(self: *Transformer, arr: mlx.mlx_array, cos: mlx.mlx_array, sin: mlx.mlx_array, rope_dims: c_int) !mlx.mlx_array {
+    pub fn applyMrope(self: *Transformer, arr: mlx.mlx_array, cos: mlx.mlx_array, sin: mlx.mlx_array, rope_dims: c_int) !mlx.mlx_array {
         const sh = mlx.getShape(arr);
         const b = sh[0];
         const h = sh[1];

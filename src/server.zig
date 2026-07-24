@@ -7449,7 +7449,32 @@ fn parseAudioContent(allocator: std.mem.Allocator, data: []const u8) ?chat_mod.A
 /// Derive per-request image preprocessing params from the loaded model config.
 fn visionPreprocFromConfig(config: *const model_mod.ModelConfig) chat_mod.VisionPreproc {
     if (!config.qwen_vision) return .{};
-    return .{ .qwen = true, .patch = config.qv_patch, .tps = config.qv_temporal_patch, .merge = config.qv_merge };
+    return .{
+        .qwen = true,
+        .patch = config.qv_patch,
+        .tps = config.qv_temporal_patch,
+        .merge = config.qv_merge,
+        .min_pixels = config.qv_min_pixels,
+        .max_pixels = config.qv_max_pixels,
+    };
+}
+
+test "visionPreprocFromConfig threads Qwen processor bounds" {
+    const config = model_mod.ModelConfig{
+        .qwen_vision = true,
+        .qv_patch = 14,
+        .qv_temporal_patch = 2,
+        .qv_merge = 2,
+        .qv_min_pixels = 65536,
+        .qv_max_pixels = 16777216,
+    };
+    const vp = visionPreprocFromConfig(&config);
+    try std.testing.expect(vp.qwen);
+    try std.testing.expectEqual(@as(u32, 14), vp.patch);
+    try std.testing.expectEqual(@as(u32, 2), vp.tps);
+    try std.testing.expectEqual(@as(u32, 2), vp.merge);
+    try std.testing.expectEqual(@as(u32, 65536), vp.min_pixels);
+    try std.testing.expectEqual(@as(u32, 16777216), vp.max_pixels);
 }
 
 fn parseImageUrlContent(allocator: std.mem.Allocator, url: []const u8, vp: chat_mod.VisionPreproc) ?chat_mod.ImageData {
@@ -7551,7 +7576,14 @@ fn decodeImageToPixels(allocator: std.mem.Allocator, encoded: []const u8, vp: ch
     // [N, C·tps·ps·ps]. The encoder is QwenVision; `grid_h/grid_w` carry the full
     // patch grid (token count = (gh/merge)·(gw/merge)).
     if (vp.qwen) {
-        const rs = qwen_vision.smartResizeDefault(src_h, src_w);
+        const factor = std.math.mul(u32, vp.patch, vp.merge) catch return null;
+        if (factor == 0 or vp.tps == 0) return null;
+        const min_pixels = if (vp.min_pixels > 0) vp.min_pixels else qwen_vision.MIN_PIXELS;
+        const max_pixels = if (vp.max_pixels >= min_pixels)
+            vp.max_pixels
+        else
+            @max(qwen_vision.MAX_PIXELS, min_pixels);
+        const rs = qwen_vision.smartResizeImage(src_h, src_w, factor, min_pixels, max_pixels);
         const rh = rs.h;
         const rw = rs.w;
         const C: u32 = 3;
@@ -7563,20 +7595,16 @@ fn decodeImageToPixels(allocator: std.mem.Allocator, encoded: []const u8, vp: ch
 
         const chw = allocator.alloc(f32, @as(usize, C) * plane) catch return null;
         defer allocator.free(chw);
-        for (0..rh) |ty| {
-            for (0..rw) |tx| {
-                const sx_f = @as(f32, @floatFromInt(tx)) * @as(f32, @floatFromInt(src_w)) / @as(f32, @floatFromInt(rw));
-                const sy_f = @as(f32, @floatFromInt(ty)) * @as(f32, @floatFromInt(src_h)) / @as(f32, @floatFromInt(rh));
-                const sx: usize = @min(@as(usize, @intFromFloat(sx_f)), src_w - 1);
-                const sy: usize = @min(@as(usize, @intFromFloat(sy_f)), src_h - 1);
-                const sidx = (sy * src_w + sx) * 3;
-                const didx = ty * rw + tx;
-                inline for (0..3) |c| {
-                    // (x/255 − 0.5)/0.5 == x/127.5 − 1.0
-                    chw[c * plane + didx] = @as(f32, @floatFromInt(px[sidx + c])) / 127.5 - 1.0;
-                }
-            }
-        }
+        const source_len: usize = @as(usize, src_h) * src_w * C;
+        qwen_vision.resizeRgbBicubicNormalizedChw(
+            allocator,
+            chw,
+            px[0..source_len],
+            src_h,
+            src_w,
+            rh,
+            rw,
+        ) catch return null;
 
         const pv_bytes = allocator.alloc(u8, n * feat * 4) catch return null;
         const pv_f32 = @as([*]f32, @alignCast(@ptrCast(pv_bytes.ptr)))[0 .. n * feat];

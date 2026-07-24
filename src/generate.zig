@@ -359,6 +359,15 @@ pub fn effectiveSsmCheckpointStride(base: usize, is_moe: bool, prefill_chunk: us
     return base;
 }
 
+/// Vision embeddings are scattered from the beginning of their source tensor
+/// within a forward pass, so checkpoint-aligned chunk boundaries would restart
+/// that scatter and reuse the first image features in every chunk. Keep vision
+/// prefill single-pass; image-bearing prompts are excluded from prefix reuse
+/// independently because equal placeholder IDs do not imply equal images.
+pub fn shouldCheckpointSsmPrefill(stride: u32, has_ssm: bool, has_vision: bool) bool {
+    return stride > 0 and has_ssm and !has_vision;
+}
+
 /// Number of chunks a cold prefill of `prefix_len` tokens splits into for the
 /// given chunk size / SSM-checkpoint stride. Mirrors the loop in `init` exactly
 /// (drives the same `nextChunkEnd`), so a test on this is a faithful proxy for
@@ -475,6 +484,10 @@ pub const Generator = struct {
     // `deinit`).
     mtp: ?*mtp_mod.MtpModel = null,
     mtp_cache: ?KVCache = null,
+    /// Absolute target position represented by MTP-cache position 0. Usually
+    /// zero; nonzero when the head keeps only a suffix of a restored/long
+    /// prompt. Used to map the sidecar's relative offsets into Qwen M-RoPE.
+    mtp_position_base: usize = 0,
     /// CONFIGURED max tokens drafted per round (verify length = depth + 1).
     mtp_depth: u32 = mtp_mod.DEFAULT_DEPTH,
     /// CURRENT adaptive depth (see updateMtpDepth). Starts at `mtp_depth`,
@@ -972,10 +985,12 @@ pub const Generator = struct {
             for (ssm_checkpoints.items) |*cp| cp.deinit(allocator);
             ssm_checkpoints.deinit(allocator);
         }
-        const want_ssm_cp =
-            options.ssm_checkpoint_stride > 0 and
-            ctx.ssm_entries != null and
-            ctx.ssm_entries.?.len > 0;
+        const has_vision = ctx.vision_embeddings != null;
+        const want_ssm_cp = shouldCheckpointSsmPrefill(
+            options.ssm_checkpoint_stride,
+            ctx.ssm_entries != null and ctx.ssm_entries.?.len > 0,
+            has_vision,
+        );
         // Coarsen the checkpoint stride for MoE so memory-bound expert-weight
         // re-streaming doesn't tax cold prefill (see effectiveSsmCheckpointStride).
         // The predicate is config.isMoe() (real experts), NOT moe_layers != null:
@@ -1006,10 +1021,11 @@ pub const Generator = struct {
         const mtp_active = options.mtp_enabled and options.mtp != null;
         var mtp_cache: ?KVCache = if (mtp_active) try options.mtp.?.makeCache(allocator) else null;
         errdefer if (mtp_cache) |*mc| mc.deinit();
+        var mtp_position_base: usize = ssm_cp_offset;
+        var mtp_history_started = false;
 
         if (prompt_ids.len > 1) {
             const prefix_len = prompt_ids.len - 1;
-            const has_vision = ctx.vision_embeddings != null;
             const default_chunk = if (has_vision) prefix_len else PREFILL_CHUNK;
             // Last-window MTP history: chunks entirely before the window skip
             // the full-hidden capture AND the head forward (see
@@ -1085,13 +1101,25 @@ pub const Generator = struct {
                 // the chunk loop spans [0, prefix_len) and prompt_ids has
                 // prefix_len + 1 entries.
                 if (mtp_capture) {
-                    try mtp_mod.appendHistory(
+                    if (!mtp_history_started) {
+                        std.debug.assert(mtp_cache.?.step == 0);
+                        mtp_position_base = ssm_cp_offset + pos;
+                        mtp_history_started = true;
+                    }
+                    const mtp_mrope_ctx: ?mtp_mod.MropeContext = if (ctx.mrope_pos) |positions| .{
+                        .pos = positions,
+                        .total = ctx.mrope_total,
+                        .delta = ctx.mrope_delta,
+                        .base = mtp_position_base,
+                    } else null;
+                    try mtp_mod.appendHistoryWithMrope(
                         options.mtp.?,
                         xfm,
                         &mtp_cache.?,
                         prompt_ids[pos + 1 .. end + 1],
                         chunk_hidden_all,
                         @intCast(mtp_cache.?.step),
+                        mtp_mrope_ctx,
                     );
                 }
 
@@ -1337,6 +1365,7 @@ pub const Generator = struct {
                 .drafter_block_size = options.drafter_block_size,
                 .mtp = if (mtp_active) options.mtp else null,
                 .mtp_cache = mtp_cache,
+                .mtp_position_base = mtp_position_base,
                 .mtp_depth = resolveMtpDepthCapForProfile(options.mtp_depth, mtp_cost_profile),
                 .mtp_ev_costs = mtpEvCosts(mtp_cost_profile),
                 // Start at depth 1 and climb with evidence: the cheap depth
@@ -2578,6 +2607,16 @@ pub const Generator = struct {
         return cache_step;
     }
 
+    fn mtpMropeContext(self: *const Generator) ?mtp_mod.MropeContext {
+        const positions = self.ctx.mrope_pos orelse return null;
+        return .{
+            .pos = positions,
+            .total = self.ctx.mrope_total,
+            .delta = self.ctx.mrope_delta,
+            .base = self.mtp_position_base,
+        };
+    }
+
     /// One round's lazily-built MTP draft chain — the Phase 0/1 state that
     /// cross-round pre-drafting (`mtpMaybePreDraft`) moves into the PREVIOUS
     /// round's tail. Owns every handle it holds; `deinit` frees whatever was
@@ -2667,6 +2706,7 @@ pub const Generator = struct {
         const head = self.mtp.?;
         const mc = &self.mtp_cache.?;
         const draft_sampling = mtpDraftSamplingFor(self.sampling, mtpDraftGreedy());
+        const mtp_mrope_ctx = self.mtpMropeContext();
         std.debug.assert(chain.n_drafted == from);
         var i: u32 = from;
         while (i < to) : (i += 1) {
@@ -2703,8 +2743,8 @@ pub const Generator = struct {
                     _ = mlx.mlx_vector_array_append_value(hv, h_prev_arg);
                     try mlx.check(mlx.mlx_concatenate_axis(&merged_hidden, hv, 1, s));
                 }
-                break :blk try mtp_mod.forward(head, xfm, mc, merged_ids, merged_hidden, @intCast(st.off0), true);
-            } else try mtp_mod.stepArr(head, xfm, mc, prev_tok_arr, h_prev_arg, @intCast(chain.off0 + i));
+                break :blk try mtp_mod.forwardWithMrope(head, xfm, mc, merged_ids, merged_hidden, @intCast(st.off0), true, mtp_mrope_ctx);
+            } else try mtp_mod.stepArrWithMrope(head, xfm, mc, prev_tok_arr, h_prev_arg, @intCast(chain.off0 + i), mtp_mrope_ctx);
             if (chain.q_probs) |slots| {
                 // Sharp proposal: q = filtered softmax of the draft-head
                 // logits at the FIXED sharpened constants; the draft is
@@ -6957,6 +6997,25 @@ test "effectiveSsmCheckpointStride: MoE coarsens to PREFILL_CHUNK, dense keeps f
     // (was 4 at the raw 256), while a dense/non-MoE hybrid stays at 4.
     try testing.expectEqual(@as(usize, 1), prefillChunkCount(851, PREFILL_CHUNK, true, effectiveSsmCheckpointStride(256, true, PREFILL_CHUNK), 0));
     try testing.expectEqual(@as(usize, 4), prefillChunkCount(851, PREFILL_CHUNK, true, effectiveSsmCheckpointStride(256, false, PREFILL_CHUNK), 0));
+}
+
+test "vision prefill is not split at SSM checkpoint boundaries" {
+    const prefix_len: usize = 1587;
+    const checkpoint_stride: u32 = 256;
+
+    const vision_checkpoints = shouldCheckpointSsmPrefill(checkpoint_stride, true, true);
+    try testing.expect(!vision_checkpoints);
+    try testing.expectEqual(
+        prefix_len,
+        nextChunkEnd(0, prefix_len, prefix_len, vision_checkpoints, @intCast(checkpoint_stride), 0),
+    );
+
+    const text_checkpoints = shouldCheckpointSsmPrefill(checkpoint_stride, true, false);
+    try testing.expect(text_checkpoints);
+    try testing.expectEqual(
+        @as(usize, checkpoint_stride),
+        nextChunkEnd(0, prefix_len, prefix_len, text_checkpoints, @intCast(checkpoint_stride), 0),
+    );
 }
 
 fn mtpEvTestGenerator() Generator {

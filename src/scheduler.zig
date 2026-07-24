@@ -498,14 +498,13 @@ pub const Slot = struct {
             .timeout_ns = params.timeout_ns,
             .has_tools = params.has_tools,
             .enable_pld = params.enable_pld,
-            // MTP/drafter do extra speculative forwards that don't yet carry
-            // Qwen3-VL M-RoPE positions — disable them for image requests so the
-            // spec path can't desync image-token positions. PLD is fine (it only
-            // engages on text decode, which uses the scalar offset+delta path).
+            // The external drafter does not yet carry Qwen3-VL M-RoPE
+            // positions. Native Qwen MTP does: its prompt-history KV uses the
+            // explicit image positions and generated text uses offset+delta.
             .enable_drafter = params.enable_drafter and params.vision_embeddings == null,
             .drafter = params.drafter,
             .drafter_block_size = params.drafter_block_size,
-            .enable_mtp = params.enable_mtp and params.vision_embeddings == null,
+            .enable_mtp = params.enable_mtp,
             .mtp = params.mtp,
             .mtp_depth = params.mtp_depth,
             .pld_draft_len = params.pld_draft_len,

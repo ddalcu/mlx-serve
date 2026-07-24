@@ -207,12 +207,23 @@ pub fn build(b: *std.Build) void {
     test_mod.linkFramework("Metal", .{});
 
     const test_filter = b.option([]const u8, "test-filter", "Only run tests whose name contains this substring");
+    const qwen_preprocess_fixture = b.option(
+        []const u8,
+        "qwen-preprocess-fixture",
+        "CPU reference fixture for the gated Qwen preprocessing parity test",
+    );
     const unit_tests = b.addTest(.{
         .root_module = test_mod,
         .filters = if (test_filter) |f| &.{f} else &.{},
     });
 
     const run_unit_tests = b.addRunArtifact(unit_tests);
+    if (qwen_preprocess_fixture) |fixture| {
+        run_unit_tests.setEnvironmentVariable("QWEN_PREPROCESS_FIXTURE", fixture);
+        run_unit_tests.addFileInput(.{ .cwd_relative = b.fmt("{s}/manifest.json", .{fixture}) });
+        run_unit_tests.addFileInput(.{ .cwd_relative = b.fmt("{s}/source_rgb.bin", .{fixture}) });
+        run_unit_tests.addFileInput(.{ .cwd_relative = b.fmt("{s}/pixel_values.bin", .{fixture}) });
+    }
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
 

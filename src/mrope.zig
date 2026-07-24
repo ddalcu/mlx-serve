@@ -31,6 +31,34 @@ pub const RopeIndex = struct {
     }
 };
 
+/// Borrowed view of a flat axis-major M-RoPE position table.
+///
+/// `base` maps a cache-relative position to its absolute position in `pos`.
+/// The trunk uses `base = 0`. A speculative head may retain only a suffix of
+/// the prompt in its own KV cache, so its cache position 0 can correspond to a
+/// later absolute prompt position.
+pub const PositionContext = struct {
+    pos: []const i32,
+    total: usize,
+    delta: i32,
+    base: usize = 0,
+
+    pub fn absolutePosition(self: PositionContext, relative: usize) usize {
+        return self.base + relative;
+    }
+
+    /// Return one axis' position id. Positions inside the prompt use the
+    /// explicit 3-D table; generated text beyond it has t=h=w and follows the
+    /// scalar decode position `absolute + delta`.
+    pub fn axisPosition(self: PositionContext, axis: usize, relative: usize) i32 {
+        std.debug.assert(axis < 3);
+        std.debug.assert(self.pos.len >= 3 * self.total);
+        const absolute = self.absolutePosition(relative);
+        if (absolute < self.total) return self.pos[axis * self.total + absolute];
+        return @as(i32, @intCast(absolute)) + self.delta;
+    }
+};
+
 /// Map each of the `freq_dim` rotary frequencies to a position axis (0=t,1=h,2=w)
 /// for the INTERLEAVED scheme. Mirrors `_interleaved_position_selector`: axis 1
 /// (h) claims indices 1,4,7,… and axis 2 (w) claims 2,5,8,…, each bounded by
@@ -221,4 +249,31 @@ test "mrope computeInvFreq base case" {
     // j=1 → theta^(-2/64) = 10e6^(-1/32)
     const expect1 = std.math.pow(f64, 10_000_000.0, -1.0 / 32.0);
     try std.testing.expectApproxEqAbs(expect1, f[1], 1e-12);
+}
+
+test "mrope PositionContext maps suffix caches and generated text" {
+    // Three axis-major rows, four prompt positions.
+    const pos = [_]i32{
+        0, 1, 2, 3,
+        0, 1, 7, 8,
+        0, 1, 9, 10,
+    };
+    const ctx = PositionContext{
+        .pos = &pos,
+        .total = 4,
+        .delta = -2,
+        .base = 2,
+    };
+
+    // Cache-relative 0 is absolute prompt position 2.
+    try std.testing.expectEqual(@as(usize, 2), ctx.absolutePosition(0));
+    try std.testing.expectEqual(@as(i32, 2), ctx.axisPosition(0, 0));
+    try std.testing.expectEqual(@as(i32, 7), ctx.axisPosition(1, 0));
+    try std.testing.expectEqual(@as(i32, 9), ctx.axisPosition(2, 0));
+
+    // Cache-relative 2 is absolute position 4, just past the table. Generated
+    // text collapses to one scalar position on every axis: 4 + (-2) = 2.
+    inline for (0..3) |axis| {
+        try std.testing.expectEqual(@as(i32, 2), ctx.axisPosition(axis, 2));
+    }
 }

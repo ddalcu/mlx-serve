@@ -34,6 +34,8 @@ pub const VisionPreproc = struct {
     patch: u32 = 16,
     tps: u32 = 2,
     merge: u32 = 2,
+    min_pixels: u32 = 0,
+    max_pixels: u32 = 0,
 };
 
 /// Raw mono 16 kHz audio samples for the Gemma 4 12B unified audio embedder.

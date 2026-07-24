@@ -223,6 +223,10 @@ pub const ModelConfig = struct {
     qv_merge: u32 = 2, // spatial merge: merge×merge patches → one LLM token
     qv_num_pos_emb: u32 = 0, // learned pos table entries (e.g. 2304 = 48×48)
     qv_out_hidden: u32 = 0, // merger output dim (= text hidden_size)
+    // Image-area bounds from processor_config.json / preprocessor_config.json.
+    // 0 means absent: the Qwen processor defaults remain the fallback.
+    qv_min_pixels: u32 = 0,
+    qv_max_pixels: u32 = 0,
     // Interleaved M-RoPE sections [t, h, w]; sum = rotary_dim/2 (e.g. [11,11,10]).
     mrope_section: [3]u32 = .{ 0, 0, 0 },
     mrope_interleaved: bool = false,
@@ -523,6 +527,42 @@ pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
     // omitted-field resolution never bottoms out at untruncated sampling.
     config.applyFamilySamplingDefaults();
 
+    // Qwen image sizing is processor metadata rather than an architecture
+    // constant. Prefer processor_config.json and fill any missing field from
+    // the older preprocessor_config.json layout.
+    if (config.qwen_vision) {
+        var vision_defaults = VisionProcessorDefaults{};
+        const processor_files = [_][]const u8{
+            "processor_config.json",
+            "preprocessor_config.json",
+        };
+        for (processor_files) |name| {
+            const processor_path = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ model_dir, name });
+            defer allocator.free(processor_path);
+            if (std.Io.Dir.openFileAbsolute(io, processor_path, .{})) |processor_file| {
+                defer processor_file.close(io);
+                var processor_buf: [4096]u8 = undefined;
+                var processor_reader = processor_file.reader(io, &processor_buf);
+                if (processor_reader.interface.allocRemaining(allocator, .limited(1024 * 1024))) |processor_content| {
+                    defer allocator.free(processor_content);
+                    const parsed_defaults = parseVisionProcessorDefaultsFromJson(processor_content);
+                    if (vision_defaults.min_pixels == null)
+                        vision_defaults.min_pixels = parsed_defaults.min_pixels;
+                    if (vision_defaults.max_pixels == null)
+                        vision_defaults.max_pixels = parsed_defaults.max_pixels;
+                } else |_| {}
+            } else |_| {}
+        }
+        if (vision_defaults.min_pixels != null and
+            vision_defaults.max_pixels != null and
+            vision_defaults.min_pixels.? > vision_defaults.max_pixels.?)
+        {
+            vision_defaults = .{};
+        }
+        config.qv_min_pixels = vision_defaults.min_pixels orelse 0;
+        config.qv_max_pixels = vision_defaults.max_pixels orelse 0;
+    }
+
     return config;
 }
 
@@ -532,6 +572,57 @@ pub const GenerationDefaults = struct {
     top_p: ?f32 = null,
     top_k: ?u32 = null,
 };
+
+/// Image-area limits parsed from a Qwen processor configuration.
+pub const VisionProcessorDefaults = struct {
+    min_pixels: ?u32 = null,
+    max_pixels: ?u32 = null,
+};
+
+fn positiveJsonU32(value: ?std.json.Value) ?u32 {
+    const actual = value orelse return null;
+    return switch (actual) {
+        .integer => |i| if (i > 0 and i <= std.math.maxInt(u32)) @intCast(i) else null,
+        else => null,
+    };
+}
+
+/// Parse both processor layouts used by Qwen checkpoints:
+/// `image_processor.{min_pixels,max_pixels}` and
+/// `size.{shortest_edge,longest_edge}`.
+pub fn parseVisionProcessorDefaultsFromJson(content: []const u8) VisionProcessorDefaults {
+    var buf: [16 * 1024]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    const parsed = std.json.parseFromSlice(std.json.Value, fba.allocator(), content, .{}) catch return .{};
+    defer parsed.deinit();
+    if (parsed.value != .object) return .{};
+
+    const root = parsed.value.object;
+    const processor = if (root.get("image_processor")) |value|
+        if (value == .object) value.object else root
+    else
+        root;
+
+    var defaults = VisionProcessorDefaults{
+        .min_pixels = positiveJsonU32(processor.get("min_pixels")),
+        .max_pixels = positiveJsonU32(processor.get("max_pixels")),
+    };
+    if (processor.get("size")) |value| {
+        if (value == .object) {
+            if (defaults.min_pixels == null)
+                defaults.min_pixels = positiveJsonU32(value.object.get("shortest_edge"));
+            if (defaults.max_pixels == null)
+                defaults.max_pixels = positiveJsonU32(value.object.get("longest_edge"));
+        }
+    }
+    if (defaults.min_pixels != null and
+        defaults.max_pixels != null and
+        defaults.min_pixels.? > defaults.max_pixels.?)
+    {
+        return .{};
+    }
+    return defaults;
+}
 
 /// Pure parser for generation_config.json content. Total: malformed JSON or
 /// out-of-range values yield nulls — a corrupt config must never pin
@@ -2349,6 +2440,76 @@ test "ModelConfig parses Qwen3.5 vision tower + interleaved M-RoPE" {
     try testing.expectEqual(@as(u32, 248054), config.vision_end_token_id);
     // partial_rotary_factor → rotary_dim = 256*0.25 = 64.
     try testing.expectApproxEqAbs(@as(f32, 0.25), config.partial_rotary_factor, 1e-6);
+}
+
+test "parseVisionProcessorDefaultsFromJson supports current and legacy Qwen layouts" {
+    const current = parseVisionProcessorDefaultsFromJson(
+        \\{"image_processor":{"min_pixels":65536,"max_pixels":16777216}}
+    );
+    try testing.expectEqual(@as(?u32, 65536), current.min_pixels);
+    try testing.expectEqual(@as(?u32, 16777216), current.max_pixels);
+
+    const legacy = parseVisionProcessorDefaultsFromJson(
+        \\{"size":{"shortest_edge":3136,"longest_edge":1003520}}
+    );
+    try testing.expectEqual(@as(?u32, 3136), legacy.min_pixels);
+    try testing.expectEqual(@as(?u32, 1003520), legacy.max_pixels);
+}
+
+test "parseVisionProcessorDefaultsFromJson rejects invalid values and ranges" {
+    const reversed = parseVisionProcessorDefaultsFromJson(
+        \\{"image_processor":{"min_pixels":4096,"max_pixels":1024}}
+    );
+    try testing.expectEqual(@as(?u32, null), reversed.min_pixels);
+    try testing.expectEqual(@as(?u32, null), reversed.max_pixels);
+
+    const invalid = parseVisionProcessorDefaultsFromJson(
+        \\{"image_processor":{"min_pixels":0,"max_pixels":4294967296}}
+    );
+    try testing.expectEqual(@as(?u32, null), invalid.min_pixels);
+    try testing.expectEqual(@as(?u32, null), invalid.max_pixels);
+
+    const malformed = parseVisionProcessorDefaultsFromJson("not json");
+    try testing.expectEqual(@as(?u32, null), malformed.min_pixels);
+    try testing.expectEqual(@as(?u32, null), malformed.max_pixels);
+}
+
+test "parseConfig prefers processor_config and fills missing Qwen bounds from preprocessor_config" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const config_json =
+        \\{
+        \\  "model_type": "qwen3_5",
+        \\  "text_config": {"hidden_size": 1024, "head_dim": 128},
+        \\  "vision_config": {
+        \\    "depth": 1,
+        \\    "hidden_size": 64,
+        \\    "num_heads": 1,
+        \\    "patch_size": 16,
+        \\    "temporal_patch_size": 2,
+        \\    "spatial_merge_size": 2,
+        \\    "out_hidden_size": 1024
+        \\  }
+        \\}
+    ;
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = config_json });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "processor_config.json",
+        .data = "{\"image_processor\":{\"min_pixels\":65536}}",
+    });
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "preprocessor_config.json",
+        .data = "{\"size\":{\"shortest_edge\":3136,\"longest_edge\":16777216}}",
+    });
+
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path_len = try tmp.dir.realPath(io, &path_buf);
+    const config = try parseConfig(io, testing.allocator, path_buf[0..path_len]);
+    try testing.expect(config.qwen_vision);
+    try testing.expectEqual(@as(u32, 65536), config.qv_min_pixels);
+    try testing.expectEqual(@as(u32, 16777216), config.qv_max_pixels);
 }
 
 test "ModelConfig text-only qwen3_5 has no qwen_vision" {

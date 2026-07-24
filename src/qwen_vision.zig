@@ -16,9 +16,8 @@ const ModelConfig = model_mod.ModelConfig;
 const Weights = model_mod.Weights;
 const log = @import("log.zig");
 
-/// mlx-vlm `Qwen3VLImageProcessor` defaults (processing_qwen3_vl.py:96-98). The
-/// config.json `size.{shortest,longest}_edge` do NOT bind — these processor
-/// defaults are what actually clamp the resized area.
+/// Qwen3VLImageProcessor fallbacks (processing_qwen3_vl.py:96-98). Checkpoint
+/// processor metadata overrides these when present.
 pub const FACTOR: u32 = 32; // patch_size(16) * merge_size(2)
 pub const MIN_PIXELS: u32 = 56 * 56; // 3136
 pub const MAX_PIXELS: u32 = 14 * 14 * 4 * 1280; // 1003520
@@ -65,6 +64,180 @@ pub fn smartResizeImage(height: u32, width: u32, factor: u32, min_pixels: u32, m
 /// Convenience wrapper using the Qwen3VL processor defaults.
 pub fn smartResizeDefault(height: u32, width: u32) Resized {
     return smartResizeImage(height, width, FACTOR, MIN_PIXELS, MAX_PIXELS);
+}
+
+/// Keys bicubic kernel (a = -0.5), matching Pillow's BICUBIC filter.
+fn bicubicWeight(distance: f64) f64 {
+    const x = @abs(distance);
+    if (x <= 1.0) return (1.5 * x - 2.5) * x * x + 1.0;
+    if (x < 2.0) return ((-0.5 * x + 2.5) * x - 4.0) * x + 2.0;
+    return 0.0;
+}
+
+const BICUBIC_SUPPORT: f64 = 2.0;
+const RESAMPLE_PRECISION_BITS: u6 = 22;
+const RESAMPLE_PRECISION_SCALE: f64 = @floatFromInt(@as(i64, 1) << RESAMPLE_PRECISION_BITS);
+const RESAMPLE_ROUNDING_BIAS: i64 = @as(i64, 1) << (RESAMPLE_PRECISION_BITS - 1);
+
+const ResampleBound = struct {
+    start: usize,
+    len: usize,
+};
+
+const ResampleCoefficients = struct {
+    bounds: []ResampleBound,
+    weights: []i32,
+    kernel_size: usize,
+
+    fn deinit(self: *ResampleCoefficients, allocator: std.mem.Allocator) void {
+        allocator.free(self.weights);
+        allocator.free(self.bounds);
+        self.* = undefined;
+    }
+};
+
+/// Precompute one separable Pillow-style resize axis. Downscaling widens the
+/// filter footprint by `input_len / output_len`; this anti-aliasing step is the
+/// material difference between Image.resize(BICUBIC) and a fixed 4-tap sampler.
+fn buildResampleCoefficients(
+    allocator: std.mem.Allocator,
+    input_len: usize,
+    output_len: usize,
+) !ResampleCoefficients {
+    if (input_len == 0 or output_len == 0) return error.InvalidImageDimensions;
+
+    const scale = @as(f64, @floatFromInt(input_len)) / @as(f64, @floatFromInt(output_len));
+    const filter_scale = @max(scale, 1.0);
+    const support = BICUBIC_SUPPORT * filter_scale;
+    const kernel_size: usize = @intFromFloat(@ceil(support) * 2.0 + 1.0);
+    const weights_len = try std.math.mul(usize, output_len, kernel_size);
+
+    const bounds = try allocator.alloc(ResampleBound, output_len);
+    errdefer allocator.free(bounds);
+    const weights = try allocator.alloc(i32, weights_len);
+    errdefer allocator.free(weights);
+
+    const inverse_filter_scale = 1.0 / filter_scale;
+    for (0..output_len) |output_index| {
+        const center = (@as(f64, @floatFromInt(output_index)) + 0.5) * scale;
+        const raw_start: i64 = @intFromFloat(center - support + 0.5);
+        const raw_end: i64 = @intFromFloat(center + support + 0.5);
+        const start = if (raw_start <= 0)
+            0
+        else
+            @min(@as(usize, @intCast(raw_start)), input_len);
+        const end = if (raw_end <= 0)
+            0
+        else
+            @min(@as(usize, @intCast(raw_end)), input_len);
+        const count = end - start;
+        if (count == 0) return error.InvalidResampleCoefficients;
+
+        var total: f64 = 0.0;
+        for (0..count) |input_offset| {
+            const source_center = @as(f64, @floatFromInt(start + input_offset)) + 0.5;
+            total += bicubicWeight((source_center - center) * inverse_filter_scale);
+        }
+        if (total == 0.0) return error.InvalidResampleCoefficients;
+
+        // Pillow converts each normalized coefficient to signed 22-bit fixed
+        // point before applying it to uint8 image rows.
+        const row = weights[output_index * kernel_size ..][0..count];
+        for (row, 0..) |*weight, input_offset| {
+            const source_center = @as(f64, @floatFromInt(start + input_offset)) + 0.5;
+            const value = bicubicWeight((source_center - center) * inverse_filter_scale);
+            const scaled = value / total * RESAMPLE_PRECISION_SCALE;
+            weight.* = @intFromFloat(if (scaled < 0.0) scaled - 0.5 else scaled + 0.5);
+        }
+        bounds[output_index] = .{ .start = start, .len = count };
+    }
+
+    return .{ .bounds = bounds, .weights = weights, .kernel_size = kernel_size };
+}
+
+fn clipFixedResample(value: i64) u8 {
+    const rounded = @divFloor(value, @as(i64, 1) << RESAMPLE_PRECISION_BITS);
+    return @intCast(std.math.clamp(rounded, 0, 255));
+}
+
+fn normalizeQwenPixel(value: u8) f32 {
+    return @as(f32, @floatFromInt(value)) / 127.5 - 1.0;
+}
+
+/// Pillow-compatible bicubic resize of interleaved RGB, followed by Qwen's
+/// float32 CHW normalization (mean/std 0.5). Each separable pass is quantized
+/// to uint8, matching the reference processor's `PIL.Image.resize` boundary.
+pub fn resizeRgbBicubicNormalizedChw(
+    allocator: std.mem.Allocator,
+    dst: []f32,
+    rgb: []const u8,
+    source_h: u32,
+    source_w: u32,
+    target_h: u32,
+    target_w: u32,
+) !void {
+    const source_plane: usize = @as(usize, source_h) * source_w;
+    const target_plane: usize = @as(usize, target_h) * target_w;
+    if (source_h == 0 or source_w == 0 or target_h == 0 or target_w == 0)
+        return error.InvalidImageDimensions;
+    if (rgb.len != source_plane * 3 or dst.len != target_plane * 3)
+        return error.InvalidImageBuffer;
+
+    var horizontal_owned: ?[]u8 = null;
+    defer if (horizontal_owned) |buffer| allocator.free(buffer);
+    const horizontal: []const u8 = if (target_w != source_w) resize: {
+        const horizontal_len = try std.math.mul(usize, @as(usize, source_h) * target_w, 3);
+        const buffer = try allocator.alloc(u8, horizontal_len);
+        horizontal_owned = buffer;
+
+        var coefficients = try buildResampleCoefficients(allocator, source_w, target_w);
+        defer coefficients.deinit(allocator);
+        for (0..source_h) |y| {
+            for (0..target_w) |x| {
+                const bound = coefficients.bounds[x];
+                const weights = coefficients.weights[x * coefficients.kernel_size ..][0..bound.len];
+                inline for (0..3) |channel| {
+                    var sum: i64 = RESAMPLE_ROUNDING_BIAS;
+                    for (weights, 0..) |weight, source_offset| {
+                        const source = (y * source_w + bound.start + source_offset) * 3 + channel;
+                        sum += @as(i64, rgb[source]) * @as(i64, weight);
+                    }
+                    buffer[(y * target_w + x) * 3 + channel] = clipFixedResample(sum);
+                }
+            }
+        }
+        break :resize buffer;
+    } else rgb;
+
+    if (target_h != source_h) {
+        var coefficients = try buildResampleCoefficients(allocator, source_h, target_h);
+        defer coefficients.deinit(allocator);
+        for (0..target_h) |y| {
+            const bound = coefficients.bounds[y];
+            const weights = coefficients.weights[y * coefficients.kernel_size ..][0..bound.len];
+            for (0..target_w) |x| {
+                const destination = y * target_w + x;
+                inline for (0..3) |channel| {
+                    var sum: i64 = RESAMPLE_ROUNDING_BIAS;
+                    for (weights, 0..) |weight, source_offset| {
+                        const source = ((bound.start + source_offset) * target_w + x) * 3 + channel;
+                        sum += @as(i64, horizontal[source]) * @as(i64, weight);
+                    }
+                    dst[channel * target_plane + destination] = normalizeQwenPixel(clipFixedResample(sum));
+                }
+            }
+        }
+    } else {
+        for (0..target_h) |y| {
+            for (0..target_w) |x| {
+                const source = (y * target_w + x) * 3;
+                const destination = y * target_w + x;
+                inline for (0..3) |channel| {
+                    dst[channel * target_plane + destination] = normalizeQwenPixel(horizontal[source + channel]);
+                }
+            }
+        }
+    }
 }
 
 /// Number of LLM image-pad tokens an image of resized (H,W) expands to.
@@ -779,6 +952,71 @@ test "qwen smart_resize matches reference table" {
     }
 }
 
+test "qwen smart_resize honors checkpoint processor pixel bounds" {
+    const r = smartResizeImage(971, 1619, 32, 65536, 16777216);
+    try std.testing.expectEqual(@as(u32, 960), r.h);
+    try std.testing.expectEqual(@as(u32, 1632), r.w);
+    try std.testing.expectEqual(@as(u32, 1530), imageTokenCount(r, 16, 2));
+}
+
+test "qwen bicubic RGB preprocessing preserves colors and interpolates" {
+    const rgb = [_]u8{
+        255, 0,   0, // red
+        0,   255, 0, // green
+        0,   0,   255, // blue
+        255, 255, 255, // white
+    };
+    var same: [3 * 2 * 2]f32 = undefined;
+    try resizeRgbBicubicNormalizedChw(std.testing.allocator, &same, &rgb, 2, 2, 2, 2);
+    const expected = [_]f32{
+        1,  -1, -1, 1,
+        -1, 1,  -1, 1,
+        -1, -1, 1,  1,
+    };
+    for (same, expected) |got, want| {
+        try std.testing.expectApproxEqAbs(want, got, 1e-6);
+    }
+
+    const checker = [_]u8{
+        0,   0,   0,
+        255, 255, 255,
+        255, 255, 255,
+        0,   0,   0,
+    };
+    var upsampled: [3 * 3 * 3]f32 = undefined;
+    try resizeRgbBicubicNormalizedChw(std.testing.allocator, &upsampled, &checker, 2, 2, 3, 3);
+    const center: usize = 4;
+    const pillow_center = normalizeQwenPixel(128);
+    try std.testing.expectApproxEqAbs(pillow_center, upsampled[center], 1e-6);
+    try std.testing.expectApproxEqAbs(pillow_center, upsampled[9 + center], 1e-6);
+    try std.testing.expectApproxEqAbs(pillow_center, upsampled[18 + center], 1e-6);
+}
+
+test "qwen bicubic downscale matches Pillow anti-aliased RGB output" {
+    var rgb: [8 * 8 * 3]u8 = undefined;
+    for (0..8) |y| {
+        for (0..8) |x| {
+            for (0..3) |channel| {
+                rgb[(y * 8 + x) * 3 + channel] =
+                    @intCast((x * 31 + y * 17 + channel * 53 + x * y * 7) % 256);
+            }
+        }
+    }
+
+    var actual: [3 * 2 * 3]f32 = undefined;
+    try resizeRgbBicubicNormalizedChw(std.testing.allocator, &actual, &rgb, 8, 8, 2, 3);
+    // Pillow 12.3.0: Image.fromarray(rgb).resize((3, 2), Image.Resampling.BICUBIC)
+    // flattened as CHW after the uint8 resize boundary.
+    const expected_u8 = [_]u8{
+        73,  135, 130, 141, 123, 119,
+        124, 129, 112, 156, 115, 120,
+        156, 116, 104, 119, 125, 114,
+    };
+    for (actual, expected_u8) |got, expected| {
+        try std.testing.expectApproxEqAbs(normalizeQwenPixel(expected), got, 1e-6);
+    }
+}
+
 test "qwen buildPixelValues merge-order + [C,tps,py,px] feature layout" {
     const a = std.testing.allocator;
     // 2x2 image, patch=1, merge=2, tps=2, C=3. img[c,y,x] = c*100 + y*10 + x.
@@ -829,6 +1067,86 @@ fn readBinF32(io: std.Io, alloc: std.mem.Allocator, path: []const u8) ![]f32 {
     @memcpy(std.mem.sliceAsBytes(out), bytes[0 .. n * 4]);
     alloc.free(bytes);
     return out;
+}
+
+fn readBinU8(io: std.Io, alloc: std.mem.Allocator, path: []const u8, max_bytes: usize) ![]u8 {
+    const file = try std.Io.Dir.openFileAbsolute(io, path, .{});
+    defer file.close(io);
+    var buf: [4096]u8 = undefined;
+    var rs = file.reader(io, &buf);
+    return rs.interface.allocRemaining(alloc, .limited(max_bytes));
+}
+
+test "qwen preprocessing parity vs reference pixel_values (QWEN_PREPROCESS_FIXTURE)" {
+    const fixture_raw = std.c.getenv("QWEN_PREPROCESS_FIXTURE") orelse return error.SkipZigTest;
+    const fixture = std.mem.span(fixture_raw);
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+
+    const manifest_path = try std.fmt.allocPrint(allocator, "{s}/manifest.json", .{fixture});
+    defer allocator.free(manifest_path);
+    const manifest_bytes = try readBinU8(io, allocator, manifest_path, 1024 * 1024);
+    defer allocator.free(manifest_bytes);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, manifest_bytes, .{});
+    defer parsed.deinit();
+    const root = parsed.value.object;
+
+    const source_h: u32 = @intCast(root.get("source_height").?.integer);
+    const source_w: u32 = @intCast(root.get("source_width").?.integer);
+    const resized_h: u32 = @intCast(root.get("resized_height").?.integer);
+    const resized_w: u32 = @intCast(root.get("resized_width").?.integer);
+    const patch: u32 = @intCast(root.get("patch_size").?.integer);
+    const tps: u32 = @intCast(root.get("temporal_patch_size").?.integer);
+    const merge: u32 = @intCast(root.get("merge_size").?.integer);
+    const min_pixels: u32 = @intCast(root.get("min_pixels").?.integer);
+    const max_pixels: u32 = @intCast(root.get("max_pixels").?.integer);
+    const expected_len: usize = @intCast(root.get("pixel_values_length").?.integer);
+
+    const source_path = try std.fmt.allocPrint(allocator, "{s}/source_rgb.bin", .{fixture});
+    defer allocator.free(source_path);
+    const source = try readBinU8(io, allocator, source_path, 256 * 1024 * 1024);
+    defer allocator.free(source);
+    try std.testing.expectEqual(@as(usize, source_h) * source_w * 3, source.len);
+
+    const reference_path = try std.fmt.allocPrint(allocator, "{s}/pixel_values.bin", .{fixture});
+    defer allocator.free(reference_path);
+    const reference = try readBinF32(io, allocator, reference_path);
+    defer allocator.free(reference);
+    try std.testing.expectEqual(expected_len, reference.len);
+
+    const factor = patch * merge;
+    const resized = smartResizeImage(source_h, source_w, factor, min_pixels, max_pixels);
+    try std.testing.expectEqual(resized_h, resized.h);
+    try std.testing.expectEqual(resized_w, resized.w);
+
+    const plane: usize = @as(usize, resized.h) * resized.w;
+    const chw = try allocator.alloc(f32, 3 * plane);
+    defer allocator.free(chw);
+    try resizeRgbBicubicNormalizedChw(allocator, chw, source, source_h, source_w, resized.h, resized.w);
+
+    const actual = try allocator.alloc(f32, reference.len);
+    defer allocator.free(actual);
+    buildPixelValues(actual, chw, 3, resized.h, resized.w, patch, tps, merge);
+
+    var max_abs: f32 = 0.0;
+    var sum_abs: f64 = 0.0;
+    var over_point_one: usize = 0;
+    for (actual, reference) |got, want| {
+        const diff = @abs(got - want);
+        max_abs = @max(max_abs, diff);
+        sum_abs += diff;
+        if (diff > 0.10) over_point_one += 1;
+    }
+    const mean_abs = sum_abs / @as(f64, @floatFromInt(actual.len));
+    const fraction_over_point_one =
+        @as(f64, @floatFromInt(over_point_one)) / @as(f64, @floatFromInt(actual.len));
+    std.debug.print(
+        "qwen preprocessing parity: max_abs={d:.6} mean_abs={d:.6} over_0.10={d:.4}%\n",
+        .{ max_abs, mean_abs, fraction_over_point_one * 100.0 },
+    );
+    try std.testing.expect(max_abs < 0.30);
+    try std.testing.expect(mean_abs < 0.005);
+    try std.testing.expect(fraction_over_point_one < 0.002);
 }
 
 // Live parity vs the mlx-vlm reference vision tower. Feeds the REFERENCE's own

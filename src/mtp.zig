@@ -19,15 +19,17 @@
 //! hidden at position p_j with the token at p_j+1, built over the prompt at
 //! prefill and maintained over committed tokens each decode round (drafts
 //! append temporary entries; the round's commit restores the snapshot and
-//! re-appends from true verify hiddens). RoPE offsets are cache-relative
-//! ("cache" position mode), so a history that starts mid-conversation (KV
-//! prefix reuse) is still self-consistent.
+//! re-appends from true verify hiddens). Text-only RoPE offsets are
+//! cache-relative ("cache" position mode). Multimodal requests additionally
+//! map those cache positions to the trunk's absolute M-RoPE positions so the
+//! sidecar and trunk agree on image-token geometry.
 //!
 //! Everything MTP-specific lives in this file plus `Generator.nextMtp`
 //! (src/generate.zig); deleting the feature is removing those two.
 
 const std = @import("std");
 const mlx = @import("mlx.zig");
+const mrope = @import("mrope.zig");
 const model_mod = @import("model.zig");
 const transformer_mod = @import("transformer.zig");
 const log = @import("log.zig");
@@ -1690,6 +1692,8 @@ pub const StepOut = struct {
     hidden_next: mlx.mlx_array,
 };
 
+pub const MropeContext = mrope.PositionContext;
+
 /// Core MTP forward over `L` positions.
 ///
 /// `id_arr`     — `[L]` int32 token ids (may be a lazy array mid-chain)
@@ -1708,6 +1712,23 @@ pub fn forward(
     rope_offset: c_int,
     want_logits: bool,
 ) !StepOut {
+    return forwardWithMrope(self, target, cache, id_arr, hidden, rope_offset, want_logits, null);
+}
+
+/// MTP forward with an optional mapping from the head's cache-relative offsets
+/// to the target's M-RoPE positions. Image-prompt positions use the explicit
+/// three-axis table. Once decoding moves past that table, generated text uses
+/// the scalar `absolute + delta` fast-RoPE path.
+pub fn forwardWithMrope(
+    self: *const MtpModel,
+    target: *Transformer,
+    cache: *KVCache,
+    id_arr: mlx.mlx_array,
+    hidden: mlx.mlx_array,
+    rope_offset: c_int,
+    want_logits: bool,
+    mrope_ctx: ?MropeContext,
+) !StepOut {
     const s = self.s;
     const cfg = &target.config;
     const hidden_size: c_int = @intCast(cfg.hidden_size);
@@ -1723,8 +1744,26 @@ pub fn forward(
     defer _ = mlx.mlx_array_free(q_rope);
     var k_rope = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(k_rope);
-    try mlx.check(mlx.mlx_fast_rope(&q_rope, front.q_t, rope_dims, false, mlx.mlx_optional_float.some(cfg.rope_theta), 1.0, rope_offset, .{ .ctx = null }, s));
-    try mlx.check(mlx.mlx_fast_rope(&k_rope, front.k_t, rope_dims, false, mlx.mlx_optional_float.some(cfg.rope_theta), 1.0, rope_offset, .{ .ctx = null }, s));
+    const relative_offset: usize = @intCast(rope_offset);
+    const needs_explicit_mrope = if (mrope_ctx) |positions|
+        positions.absolutePosition(relative_offset) < positions.total
+    else
+        false;
+    if (needs_explicit_mrope) {
+        const positions = mrope_ctx.?;
+        const cs = try target.buildMropeCosSin(positions, relative_offset, @intCast(seq_len));
+        defer _ = mlx.mlx_array_free(cs.cos);
+        defer _ = mlx.mlx_array_free(cs.sin);
+        q_rope = try target.applyMrope(front.q_t, cs.cos, cs.sin, rope_dims);
+        k_rope = try target.applyMrope(front.k_t, cs.cos, cs.sin, rope_dims);
+    } else {
+        const effective_offset: c_int = if (mrope_ctx) |positions|
+            @intCast(@as(i64, @intCast(positions.absolutePosition(relative_offset))) + positions.delta)
+        else
+            rope_offset;
+        try mlx.check(mlx.mlx_fast_rope(&q_rope, front.q_t, rope_dims, false, mlx.mlx_optional_float.some(cfg.rope_theta), 1.0, effective_offset, .{ .ctx = null }, s));
+        try mlx.check(mlx.mlx_fast_rope(&k_rope, front.k_t, rope_dims, false, mlx.mlx_optional_float.some(cfg.rope_theta), 1.0, effective_offset, .{ .ctx = null }, s));
+    }
 
     var kv_view = try cache.update(0, k_rope, front.v_t, s, 0);
     defer kv_view.deinit();
@@ -1789,6 +1828,18 @@ pub fn appendHistory(
     hidden: mlx.mlx_array,
     rope_offset: c_int,
 ) !void {
+    return appendHistoryWithMrope(self, target, cache, token_ids, hidden, rope_offset, null);
+}
+
+pub fn appendHistoryWithMrope(
+    self: *const MtpModel,
+    target: *Transformer,
+    cache: *KVCache,
+    token_ids: []const u32,
+    hidden: mlx.mlx_array,
+    rope_offset: c_int,
+    mrope_ctx: ?MropeContext,
+) !void {
     if (token_ids.len == 0) return;
     const ids_i32 = try self.allocator.alloc(i32, token_ids.len);
     defer self.allocator.free(ids_i32);
@@ -1798,7 +1849,7 @@ pub fn appendHistory(
     defer _ = mlx.mlx_array_free(id_arr);
 
     // KVCache.update advances `cache.step` (layer 0) by the batch length.
-    var out = try forward(self, target, cache, id_arr, hidden, rope_offset, false);
+    var out = try forwardWithMrope(self, target, cache, id_arr, hidden, rope_offset, false, mrope_ctx);
     _ = mlx.mlx_array_free(out.hidden_next);
     out.hidden_next = .{ .ctx = null };
 }
@@ -1813,8 +1864,20 @@ pub fn stepArr(
     hidden: mlx.mlx_array,
     rope_offset: c_int,
 ) !StepOut {
+    return stepArrWithMrope(self, target, cache, prev_token_arr, hidden, rope_offset, null);
+}
+
+pub fn stepArrWithMrope(
+    self: *const MtpModel,
+    target: *Transformer,
+    cache: *KVCache,
+    prev_token_arr: mlx.mlx_array,
+    hidden: mlx.mlx_array,
+    rope_offset: c_int,
+    mrope_ctx: ?MropeContext,
+) !StepOut {
     // KVCache.update advances `cache.step` (layer 0) by 1.
-    return forward(self, target, cache, prev_token_arr, hidden, rope_offset, true);
+    return forwardWithMrope(self, target, cache, prev_token_arr, hidden, rope_offset, true, mrope_ctx);
 }
 
 // ── Tests ──
@@ -2528,6 +2591,8 @@ test "mtp: multi-row forward projects the LAST row only and equals appendHistory
     defer _ = mlx.mlx_array_free(lm_w);
 
     var xfm: Transformer = undefined;
+    xfm.allocator = allocator;
+    xfm.s = s;
     xfm.config = .{};
     xfm.config.hidden_size = 8;
     xfm.config.num_attention_heads = 2;
@@ -2623,6 +2688,38 @@ test "mtp: multi-row forward projects the LAST row only and equals appendHistory
     }.f;
     try close(merged.logits, ref.logits, 16, s);
     try close(merged.hidden_next, ref.hidden_next, 8, s);
+
+    // A sequential three-axis table must be equivalent to ordinary RoPE.
+    // Keep only two explicit positions so the final row also exercises the
+    // prompt-table → generated-text (`absolute + delta`) boundary.
+    var cache_c = try m.makeCache(allocator);
+    defer cache_c.deinit();
+    const sequential_pos = [_]i32{
+        0, 1,
+        0, 1,
+        0, 1,
+    };
+    const positioned = try forwardWithMrope(
+        &m,
+        &xfm,
+        &cache_c,
+        ids3_arr,
+        hidden3,
+        0,
+        true,
+        .{
+            .pos = &sequential_pos,
+            .total = 2,
+            .delta = 0,
+        },
+    );
+    defer {
+        _ = mlx.mlx_array_free(positioned.logits);
+        _ = mlx.mlx_array_free(positioned.hidden_next);
+    }
+    try testing.expectEqual(cache_b.step, cache_c.step);
+    try close(positioned.logits, merged.logits, 16, s);
+    try close(positioned.hidden_next, merged.hidden_next, 8, s);
 }
 
 test "mtp: index.json shard sweep is marker-gated (in-checkpoint heads)" {
