@@ -4,16 +4,17 @@ import SwiftUI
 /// Shared types for the image/video generation pipeline.
 ///
 /// Models are trained at fixed resolution buckets and have an opinionated
-/// step/CFG sweet spot per "speed vs. quality" tradeoff. The UI exposes a
+/// step-count sweet spot per "speed vs. quality" tradeoff. The UI exposes a
 /// Quality picker (Fast / Good / Quality / Super Quality) plus a model-
 /// specific resolution dropdown. Anything more granular lives behind the
 /// Advanced disclosure.
 
 // MARK: - Quality preset
 
-/// Industry-standard tier names. Each model defines its own concrete
-/// step/guidance numbers per tier so a "Fast" on FLUX.2-klein doesn't mean
-/// the same as "Fast" on FLUX.2-dev.
+/// Industry-standard tier names. Each model defines its own concrete step
+/// count per tier, so a "Fast" on FLUX.2-klein doesn't mean the same as "Fast"
+/// on FLUX.2-dev. There is no CFG here: no image backend reads a guidance
+/// field, so carrying one only invited the UI to show a knob that does nothing.
 enum QualityPreset: String, CaseIterable, Identifiable, Codable {
     case fast = "Fast"
     case good = "Good"
@@ -35,6 +36,14 @@ struct ResolutionOption: Hashable, Identifiable {
     let label: String   // e.g. "1024 × 1024 (square)"
 
     var id: String { "\(width)x\(height)" }
+
+    /// Sentinel: send NO `size`, so the server keeps the reference image's own
+    /// resolution (the edit pipeline's `max_size = source size` default). An
+    /// editor that returns a different shape than it was given is wrong by
+    /// default; a fixed bucket is the override, not the other way round.
+    static let matchSource = ResolutionOption(width: 0, height: 0, label: "Match source (keep the original size)")
+
+    var isMatchSource: Bool { width == 0 && height == 0 }
 }
 
 // MARK: - Image presets
@@ -45,11 +54,12 @@ enum FluxVariant: String, Hashable, Codable {
     case flux2Klein4B     // FLUX.2-klein 4B params — uses Flux2Klein, ModelConfig.flux2_klein_4b()
     case flux2Klein9B     // FLUX.2-klein 9B params — uses Flux2Klein, ModelConfig.flux2_klein_9b()
     case krea2Turbo       // Krea-2-Turbo single-stream MMDiT — served by the krea image backend
+    case mageFlowTurbo    // Microsoft Mage-Flow-Turbo double-stream flow DiT — served by the mage_flow backend
+    case mageFlowEditTurbo // Microsoft Mage-Flow-Edit-Turbo — same arch, edit-trained; multi-reference in-context editor
 }
 
 struct ImageQualitySettings: Hashable {
     let steps: Int
-    let guidance: Double
 }
 
 struct ImageModelPreset: Identifiable, Hashable {
@@ -106,10 +116,10 @@ struct ImageModelPreset: Identifiable, Hashable {
         resolutions: fluxResolutions,
         defaultResolution: fluxResolutions[0],
         qualityProfiles: [
-            .fast:         .init(steps: 4,  guidance: 1.0),
-            .good:         .init(steps: 8,  guidance: 1.0),
-            .quality:      .init(steps: 12, guidance: 1.5),
-            .superQuality: .init(steps: 20, guidance: 1.5),
+            .fast:         .init(steps: 4),
+            .good:         .init(steps: 8),
+            .quality:      .init(steps: 12),
+            .superQuality: .init(steps: 20),
         ],
         defaultQuality: .good,
         description: "A fast, lightweight image generator — great for everyday text-to-image and quick edits without a huge download."
@@ -145,20 +155,145 @@ struct ImageModelPreset: Identifiable, Hashable {
         resolutions: kreaResolutions,
         defaultResolution: kreaResolutions[0],
         qualityProfiles: [
-            // Distilled Turbo: guidance 0 always; steps beyond ~8 add little.
-            .fast:         .init(steps: 6,  guidance: 0.0),
-            .good:         .init(steps: 8,  guidance: 0.0),
-            .quality:      .init(steps: 12, guidance: 0.0),
-            .superQuality: .init(steps: 16, guidance: 0.0),
+            // Distilled Turbo: steps beyond ~8 add little.
+            .fast:         .init(steps: 6),
+            .good:         .init(steps: 8),
+            .quality:      .init(steps: 12),
+            .superQuality: .init(steps: 16),
         ],
         defaultQuality: .good,
         description: "A larger, high-fidelity image model tuned for photorealistic results in just a few steps — best when quality matters more than download size."
     )
 
+    /// Mage-Flow is genuinely native-resolution: the model card claims 512-2048
+    /// on ANY aspect ratio, "including extreme 4:1", and that holds — measured
+    /// on an M-series Mac, cost tracks MEGAPIXELS only, not shape (1024², 2048×512
+    /// and 512×2048 all land within a few hundred ms of each other at 4 steps).
+    /// So the menu goes all the way to 2048 and includes the panoramas; the time
+    /// hints are measured, since 2048² costs ~8× a 1024².
+    private static let mageFlowResolutions: [ResolutionOption] = [
+        .init(width: 1024, height: 1024, label: "1024 × 1024 (square) · ~6s"),
+        .init(width: 768,  height: 768,  label: "768 × 768 (square, fast)"),
+        .init(width: 512,  height: 512,  label: "512 × 512 (fastest) · ~3s"),
+        .init(width: 1024, height: 1536, label: "1024 × 1536 (portrait 2:3)"),
+        .init(width: 1536, height: 1024, label: "1536 × 1024 (landscape 3:2) · ~13s"),
+        .init(width: 1344, height: 768,  label: "1344 × 768 (landscape 16:9)"),
+        .init(width: 768,  height: 1344, label: "768 × 1344 (portrait 9:16)"),
+        .init(width: 2048, height: 1152, label: "2048 × 1152 (16:9, large)"),
+        .init(width: 2048, height: 2048, label: "2048 × 2048 (max) · ~50s"),
+        .init(width: 2048, height: 512,  label: "2048 × 512 (panorama 4:1)"),
+        .init(width: 512,  height: 2048, label: "512 × 2048 (tall 1:4)"),
+    ]
+
+    /// Microsoft Mage-Flow-Turbo — the official MIT diffusers repo (no login /
+    /// license step). Native double-stream flow DiT + Qwen3-VL text encoder +
+    /// DiCo VAE, served by the native `mage_flow` backend (auto-detected from
+    /// `model_index.json`, not `config.json`). Distilled Turbo: 4-step flow
+    /// matching, guidance 1.0 (no CFG). Runs bf16 (DiT+encoder) + f32 VAE.
+    static let mageFlowTurbo = ImageModelPreset(
+        id: "microsoft/mage-flow-turbo",
+        name: "Mage-Flow Turbo (~17 GB)",
+        variant: .mageFlowTurbo,
+        configName: "mage_flow",
+        repo: "microsoft/Mage-Flow-Turbo",
+        approxDownloadGB: 17,
+        approxRAMGB: 16,
+        resolutions: mageFlowResolutions,
+        defaultResolution: mageFlowResolutions[0],
+        qualityProfiles: [
+            // Distillation-fixed at 4 steps (`stepsAreFixed`), so every tier is
+            // 4: measured, 8 steps costs 2× and 12 costs 4× for a DIFFERENT
+            // image, not a better one. The quality picker hides for this preset.
+            .fast:         .init(steps: 4),
+            .good:         .init(steps: 4),
+            .quality:      .init(steps: 4),
+            .superQuality: .init(steps: 4),
+        ],
+        defaultQuality: .good,
+        description: "Microsoft's native-resolution image model — crisp, photorealistic results in just 4 steps, at any size from 512 to 2048 and any aspect ratio. Open (MIT) with no login or license step."
+    )
+
+    /// Microsoft Mage-Flow-Edit-Turbo — same architecture as Turbo, but
+    /// edit-trained: a multi-reference in-context editor (change / compose from
+    /// one or more reference images + a text instruction). Distilled 4-step,
+    /// guidance 1.0. Same MIT diffusers layout (`model_index.json`), served by
+    /// the `mage_flow` backend (the Edit weights light up `supportsEdit`).
+    static let mageFlowEditTurbo = ImageModelPreset(
+        id: "microsoft/mage-flow-edit-turbo",
+        name: "Mage-Flow Edit Turbo (~17 GB)",
+        variant: .mageFlowEditTurbo,
+        configName: "mage_flow",
+        repo: "microsoft/Mage-Flow-Edit-Turbo",
+        approxDownloadGB: 17,
+        approxRAMGB: 16,
+        resolutions: mageFlowResolutions,
+        defaultResolution: mageFlowResolutions[0],
+        qualityProfiles: [
+            // Same distillation-fixed 4 steps as Turbo.
+            .fast:         .init(steps: 4),
+            .good:         .init(steps: 4),
+            .quality:      .init(steps: 4),
+            .superQuality: .init(steps: 4),
+        ],
+        defaultQuality: .good,
+        description: "Microsoft's native-resolution image EDITOR — change or compose images from one or more references plus a text instruction, in just 4 steps. Keeps the source's own resolution by default. Open (MIT)."
+    )
+
+    /// Our 8-bit mirrors of the two Mage-Flow releases: same architecture, same
+    /// 4-step schedule, roughly half the download and half the resident weights.
+    /// They reuse the bf16 sibling's `variant` because quantization changes the
+    /// checkpoint, not the capability set — the engine's `MfLinear` picks
+    /// dense-vs-quantized per tensor at load, so nothing else has to know.
+    static let mageFlowTurbo8bit = ImageModelPreset(
+        id: "ddalcu/mage-flow-turbo-8bit",
+        name: "Mage-Flow Turbo 8-bit (~9 GB)",
+        variant: .mageFlowTurbo,
+        configName: "mage_flow",
+        repo: "ddalcu/Mage-Flow-Turbo-MLX-Serve-8bit",
+        approxDownloadGB: 9,
+        approxRAMGB: 10,
+        resolutions: mageFlowResolutions,
+        defaultResolution: mageFlowResolutions[0],
+        qualityProfiles: [
+            .fast:         .init(steps: 4),
+            .good:         .init(steps: 4),
+            .quality:      .init(steps: 4),
+            .superQuality: .init(steps: 4),
+        ],
+        defaultQuality: .good,
+        description: "Microsoft's native-resolution image model, quantized to 8-bit — the same crisp 4-step results at half the download and memory. Open (MIT) with no login or license step."
+    )
+
+    /// 8-bit mirror of the editor. The repo name keeps "Mage-Flow-Edit" because
+    /// the engine gates edit capability on the DIRECTORY NAME (`dirIsEdit`), and
+    /// the download dir is the repo id.
+    static let mageFlowEditTurbo8bit = ImageModelPreset(
+        id: "ddalcu/mage-flow-edit-turbo-8bit",
+        name: "Mage-Flow Edit Turbo 8-bit (~10 GB)",
+        variant: .mageFlowEditTurbo,
+        configName: "mage_flow",
+        repo: "ddalcu/Mage-Flow-Edit-Turbo-MLX-Serve-8bit",
+        approxDownloadGB: 10,
+        approxRAMGB: 11,
+        resolutions: mageFlowResolutions,
+        defaultResolution: mageFlowResolutions[0],
+        qualityProfiles: [
+            .fast:         .init(steps: 4),
+            .good:         .init(steps: 4),
+            .quality:      .init(steps: 4),
+            .superQuality: .init(steps: 4),
+        ],
+        defaultQuality: .good,
+        description: "Microsoft's native-resolution image EDITOR, quantized to 8-bit — change or compose from one or more references in 4 steps, at half the download and memory. Open (MIT)."
+    )
+
     /// Catalog ordered cheapest → heaviest. Default (`first`) is FLUX.2-klein
     /// 4B Q4 — smallest download.
     static let all: [ImageModelPreset] = [
-        .flux2Klein4B_Q4, .krea2Turbo,
+        .flux2Klein4B_Q4,                              // 5
+        .mageFlowTurbo8bit, .mageFlowEditTurbo8bit,    // 9, 10
+        .krea2Turbo,                                   // 15
+        .mageFlowTurbo, .mageFlowEditTurbo,            // 17, 17
     ]
 }
 
@@ -641,12 +776,10 @@ enum MusicPromptStore {
 struct ImageGenRequest {
     var model: ImageModelPreset
     var prompt: String
-    var negativePrompt: String = ""
     var seed: Int = -1
     var width: Int
     var height: Int
     var steps: Int
-    var guidance: Double
     /// Keep the model resident after this generation (default off → unload
     /// when done, freeing GPU memory). On → instant reuse for the next gen.
     var keepResident: Bool = false
@@ -688,12 +821,87 @@ struct ImageGenRequest {
 
 extension ImageModelPreset {
     /// Number of tapped text-encoder layers the backend fuses — the count
-    /// `cond_weights` must supply (Krea stacks 12 layers; FLUX concatenates 3).
-    var condWeightCount: Int { variant == .krea2Turbo ? 12 : 3 }
+    /// `cond_weights` must supply (Krea stacks 12 layers; FLUX concatenates 3;
+    /// Mage-Flow uses the single final hidden state — no rebalance, matching
+    /// gen.zig `condWeightCount` == 0, so the rebalance UI hides).
+    var condWeightCount: Int {
+        switch variant {
+        case .krea2Turbo: return 12
+        case .mageFlowTurbo, .mageFlowEditTurbo: return 0
+        default: return 3
+        }
+    }
 
     /// Instruction editing (in-context reference conditioning) is a trained
-    /// FLUX.2 capability; Krea can only do renoise variations.
-    var supportsReferenceEdit: Bool { variant == .flux2Klein4B || variant == .flux2Klein9B }
+    /// capability: FLUX.2-klein, and the Mage-Flow-Edit checkpoint. Krea and
+    /// Mage-Flow Turbo (txt2img) can only do renoise variations.
+    var supportsReferenceEdit: Bool {
+        variant == .flux2Klein4B || variant == .flux2Klein9B || variant == .mageFlowEditTurbo
+    }
+
+    // ── Capability flags: what the Advanced panel is allowed to offer ──
+    // Each mirrors a CONCRETE server-side fact, because a control the backend
+    // ignores is worse than a missing one — the user pays for a setting that
+    // silently does nothing (Mage-Flow shipped with five of them).
+
+    /// Renoise variations (`image` + `strength`) need the backend's VAE encoder
+    /// — `gen.ImageEngine.supportsImg2Img`. Mage-Flow has no variation path at
+    /// all: sending a source without `mode:"edit"` is a 400.
+    var supportsImg2Img: Bool {
+        switch variant {
+        case .mageFlowTurbo, .mageFlowEditTurbo: return false
+        default: return true
+        }
+    }
+
+    /// Runtime LoRA adapters attach to the DiT (`gen.ImageEngine.setLora`).
+    /// Mage-Flow has no LoRA path, so a picked adapter matches 0 modules → 400.
+    var supportsLoRA: Bool {
+        switch variant {
+        case .mageFlowTurbo, .mageFlowEditTurbo: return false
+        default: return true
+        }
+    }
+
+    /// Steps are a real knob only where the schedule isn't distilled shut.
+    /// Mage-Flow Turbo is distillation-fixed at 4: measured on an M-series Mac,
+    /// 8 steps costs 2× and 12 costs 4× for a DIFFERENT image, not a better one.
+    var stepsAreFixed: Bool {
+        switch variant {
+        case .mageFlowTurbo, .mageFlowEditTurbo: return true
+        default: return false
+        }
+    }
+
+    /// The fixed step count for a distilled preset (its `.good` profile).
+    var fixedSteps: Int { settings(.good).steps }
+
+    /// Starter prompts for the Examples menu, for the mode the pane is in.
+    /// An instruction-tuned editor's repertoire IS its prompt vocabulary — the
+    /// only way to discover that it can produce a depth map or de-rain a photo
+    /// is to be shown the sentence that does it.
+    func promptExamples(editing: Bool) -> [ImagePromptExampleGroup] {
+        guard editing && supportsReferenceEdit else { return ImagePromptExamples.textToImage }
+        switch variant {
+        case .mageFlowEditTurbo: return ImagePromptExamples.mageFlowEdit
+        default: return ImagePromptExamples.genericEdit
+        }
+    }
+
+    /// The resolution menu for the current mode. In EDIT mode an edit-capable
+    /// model offers "Match source" first — the reference pipeline's default and
+    /// the only choice that can't distort the picture the user handed over.
+    func resolutionOptions(editMode: Bool) -> [ResolutionOption] {
+        (editMode && supportsReferenceEdit) ? [.matchSource] + resolutions : resolutions
+    }
+
+    /// Keep a persisted selection valid when the mode changes (leaving edit mode
+    /// removes "Match source" from the menu — a stale selection would otherwise
+    /// leave the picker showing nothing).
+    func validResolution(_ current: ResolutionOption, editMode: Bool) -> ResolutionOption {
+        let opts = resolutionOptions(editMode: editMode)
+        return opts.contains(current) ? current : (editMode && supportsReferenceEdit ? .matchSource : defaultResolution)
+    }
 }
 
 extension ImageGenRequest {

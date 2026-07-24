@@ -293,3 +293,64 @@ code=$(curl -s -X POST "http://127.0.0.1:$PORT/v1/images/generations" -H 'Conten
   -o /dev/null -w "%{http_code}")
 [ "$code" = "400" ] || { echo "FAIL: 4 ref_images returned $code (want 400)"; exit 1; }
 echo "PASS: 4 ref_images -> 400 (cap is 3 beside the source)"
+
+# ── OpenAI-compatible POST /v1/images/edits (multipart/form-data) ──
+# The vendor surface is a pure TRANSLATION into the JSON edit path above, so the
+# only things that can break independently are the multipart parse and the
+# rejections. curl builds the same form the OpenAI SDK sends.
+EDITS="http://127.0.0.1:$PORT/v1/images/edits"
+
+# A real edit through the OpenAI shape → 200 + the SAME {data:[{b64_json}]} body.
+out=$(curl -s -X POST "$EDITS" \
+  -F "model=x" -F "prompt=make it winter" \
+  -F "image=@/tmp/test_img2img_src.png;type=image/png" \
+  -F "size=512x512")
+echo "$out" | python3 -c 'import base64,json,sys,struct
+d=json.load(sys.stdin)
+png=base64.b64decode(d["data"][0]["b64_json"])
+assert png[:8]==b"\x89PNG\r\n\x1a\n", "not a PNG"
+w,h=struct.unpack(">II",png[16:24]); print(f"  {w}x{h}, {len(png)} bytes")' \
+  || { echo "FAIL: /v1/images/edits did not return a PNG"; echo "$out" | head -c 300; exit 1; }
+echo "PASS: /v1/images/edits (multipart) -> PNG in the OpenAI response shape"
+
+# Multi-image composition: repeated image[] parts become in-context references.
+code=$(curl -s -X POST "$EDITS" -F "prompt=compose" \
+  -F "image[]=@/tmp/test_img2img_src.png;type=image/png" \
+  -F "image[]=@/tmp/test_edit_ref2.png;type=image/png" \
+  -o /dev/null -w "%{http_code}")
+[ "$code" = "200" ] || { echo "FAIL: multi-image edits returned $code (want 200)"; exit 1; }
+echo "PASS: /v1/images/edits multi-image -> 200"
+
+# Everything OpenAI accepts but we can't honor must be a NAMED 400, never a
+# silently ignored field.
+for reject in "mask=@/tmp/test_edit_ref2.png" "n=2" "response_format=url" "output_format=jpeg" "stream=true"; do
+  code=$(curl -s -X POST "$EDITS" -F "prompt=x" -F "image=@/tmp/test_img2img_src.png" -F "$reject" \
+    -o /dev/null -w "%{http_code}")
+  [ "$code" = "400" ] || { echo "FAIL: '$reject' returned $code (want 400)"; exit 1; }
+done
+echo "PASS: /v1/images/edits rejects mask/n>1/url/jpeg/stream with 400"
+
+# Missing required fields, and a JSON body posted to the multipart route.
+code=$(curl -s -X POST "$EDITS" -F "prompt=x" -o /dev/null -w "%{http_code}")
+[ "$code" = "400" ] || { echo "FAIL: edits without an image returned $code (want 400)"; exit 1; }
+code=$(curl -s -X POST "$EDITS" -H 'Content-Type: application/json' -d '{"prompt":"x"}' -o /dev/null -w "%{http_code}")
+[ "$code" = "400" ] || { echo "FAIL: JSON to /v1/images/edits returned $code (want 400)"; exit 1; }
+echo "PASS: /v1/images/edits missing-image + non-multipart -> 400"
+
+# ── edit with NO size = keep the source's own resolution ──
+# Only BYTE-BASED edit backends (Mage-Flow) resolve geometry from the reference:
+# it's the reference pipeline's `max_size = source size` default, and what the
+# app's "Match source" option sends. FLUX deliberately keeps an output grid
+# independent of its references, so this asserts only where the engine claims
+# the behavior — detected by its own log line, not assumed from the model name.
+src_dims=$(python3 -c 'import struct;d=open("/tmp/test_img2img_src.png","rb").read();print("%dx%d"%struct.unpack(">II",d[16:24]))')
+out_dims=$(curl -s -X POST "http://127.0.0.1:$PORT/v1/images/generations" -H 'Content-Type: application/json' \
+  -d @<(python3 -c 'import json,base64; b=base64.b64encode(open("/tmp/test_img2img_src.png","rb").read()).decode(); print(json.dumps({"prompt":"add a red collar","mode":"edit","image":b,"steps":4,"seed":3}))') \
+  | python3 -c 'import base64,json,struct,sys
+d=json.load(sys.stdin); png=base64.b64decode(d["data"][0]["b64_json"]); print("%dx%d"%struct.unpack(">II",png[16:24]))')
+if grep -q "size matched to source" /tmp/test_image_server.log; then
+  [ "$out_dims" = "$src_dims" ] || { echo "FAIL: sizeless edit returned $out_dims (want the source's $src_dims)"; exit 1; }
+  echo "PASS: edit without 'size' keeps the source resolution ($src_dims)"
+else
+  echo "SKIP: this backend resolves edit geometry from the request, not the reference (FLUX)"
+fi

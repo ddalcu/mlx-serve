@@ -126,6 +126,34 @@ final class MediaBundleTests: XCTestCase {
         XCTAssertTrue(DownloadManager.componentReady(comp, modelsRoot: root))
     }
 
+    /// Regression: Mage-Flow ships the diffusers layout — weight SUBDIRS and a
+    /// `model_index.json` root, NO top-level `config.json`. `existingModelDir`
+    /// only counted a dir as holding a model on `config.json` OR a `.gguf`, so a
+    /// fully-downloaded Mage-Flow never resolved: the picker showed "Download"
+    /// forever, and a click reverted instantly (files present → skip → re-check
+    /// still false). Readiness must key on the diffusers root marker too.
+    func testMageFlowDiffusersLayoutReadyWithoutRootConfig() throws {
+        let fm = FileManager.default
+        let root = NSTemporaryDirectory() + "mageflowtest-\(UUID().uuidString)"
+        let modelDir = (root as NSString).appendingPathComponent("microsoft/Mage-Flow-Turbo")
+        try fm.createDirectory(atPath: modelDir, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(atPath: root) }
+
+        let comp = ImageModelPreset.mageFlowTurbo.bundle.components[0]
+        // Empty dir → not ready.
+        XCTAssertFalse(DownloadManager.componentReady(comp, modelsRoot: root))
+        // The diffusers root marker + all four weight subdirs, plus a real
+        // safetensors — exactly the on-disk shape, and crucially NO config.json.
+        fm.createFile(atPath: (modelDir as NSString).appendingPathComponent("model_index.json"), contents: Data("{}".utf8))
+        for sub in ["transformer", "vae", "text_encoder", "scheduler"] {
+            try fm.createDirectory(atPath: (modelDir as NSString).appendingPathComponent(sub), withIntermediateDirectories: true)
+        }
+        fm.createFile(atPath: (modelDir as NSString).appendingPathComponent("transformer/diffusion_pytorch_model.safetensors"), contents: Data([0, 1, 2]))
+        XCTAssertFalse(fm.fileExists(atPath: (modelDir as NSString).appendingPathComponent("config.json")),
+                       "the fixture must have NO root config.json — that's the whole point")
+        XCTAssertTrue(DownloadManager.componentReady(comp, modelsRoot: root))
+    }
+
     // MARK: - Bundle mappings
 
     func testLtxBundleBundlesGemmaDependency() {
@@ -180,11 +208,51 @@ final class MediaBundleTests: XCTestCase {
         }
     }
 
+    func testMageFlowBundleIsSinglePublicRecursiveComponentDiffusersLayout() {
+        let b = ImageModelPreset.mageFlowTurbo.bundle
+        // One public component, no gated dependency, recursive (pulls the weight subdirs).
+        XCTAssertEqual(b.components.count, 1)
+        XCTAssertTrue(b.dependencyRepos.isEmpty)
+        XCTAssertTrue(b.components[0].selection.recursive)
+        // The README `assets/` images are junk — excluded from the pull.
+        XCTAssertTrue(b.components[0].selection.excludeSubstrings.contains("assets/"))
+        // Diffusers layout: the root marker is `model_index.json`, NOT config.json.
+        let m = b.components[0].readyMarkers
+        XCTAssertTrue(m.contains("model_index.json"))
+        XCTAssertFalse(m.contains("config.json"))
+        for marker in ["transformer", "vae", "text_encoder", "scheduler"] {
+            XCTAssertTrue(m.contains(marker), "missing readyMarker \(marker)")
+        }
+    }
+
+    func testMageFlowEditPresetIsEditCapableAndBundlesLikeTurbo() {
+        let p = ImageModelPreset.mageFlowEditTurbo
+        // The Edit checkpoint is the ONE image preset (besides FLUX) that can do
+        // reference-image instruction edits — the picker lights up on this flag.
+        XCTAssertTrue(p.supportsReferenceEdit)
+        XCTAssertFalse(ImageModelPreset.mageFlowTurbo.supportsReferenceEdit)
+        // Mage-Flow uses the final hidden state — no rebalance UI.
+        XCTAssertEqual(p.condWeightCount, 0)
+        XCTAssertTrue(ImageModelPreset.all.contains { $0.variant == .mageFlowEditTurbo })
+        XCTAssertEqual(p.repo, "microsoft/Mage-Flow-Edit-Turbo")
+        // Same diffusers-layout bundle shape as Turbo.
+        let b = p.bundle
+        XCTAssertEqual(b.components.count, 1)
+        XCTAssertTrue(b.dependencyRepos.isEmpty)
+        XCTAssertTrue(b.components[0].selection.recursive)
+        let m = b.components[0].readyMarkers
+        XCTAssertTrue(m.contains("model_index.json"))
+        XCTAssertFalse(m.contains("config.json"))
+        for marker in ["transformer", "vae", "text_encoder", "scheduler"] {
+            XCTAssertTrue(m.contains(marker), "missing readyMarker \(marker)")
+        }
+    }
+
     func testNsfwClassifierProvisioningDefaults() {
         // Shared content-filter classifier: the original public Apache-2.0 repo.
         XCTAssertEqual(DownloadManager.nsfwClassifierRepo, "Falconsai/nsfw_image_detection")
         // Safe mode is ON by default on a generation request.
-        let r = ImageGenRequest(model: .krea2Turbo, prompt: "x", width: 512, height: 512, steps: 8, guidance: 0)
+        let r = ImageGenRequest(model: .krea2Turbo, prompt: "x", width: 512, height: 512, steps: 8)
         XCTAssertTrue(r.safeMode)
     }
 
@@ -274,9 +342,9 @@ final class MediaBundleTests: XCTestCase {
         let p = ImageModelPreset.krea2Turbo
         XCTAssertEqual(p.variant, .krea2Turbo)
         XCTAssertEqual(p.defaultQuality, .good)
-        // Distilled Turbo: 8 steps, no CFG.
+        // Distilled Turbo: 8 steps (CFG isn't modelled — no image backend
+        // reads a guidance field, so the tier carries a step count only).
         XCTAssertEqual(p.settings(.good).steps, 8)
-        XCTAssertEqual(p.settings(.good).guidance, 0.0)
         // Surfaced in the catalog so the picker shows it.
         XCTAssertTrue(ImageModelPreset.all.contains(p))
         // Resolutions are all multiples of 16 in [256, 2048] (the Krea size gate).

@@ -972,12 +972,10 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
         let req = ImageGenRequest(
             model: model,
             prompt: trimmed,
-            negativePrompt: s.negativePrompt,
             seed: s.seed,
             width: resolution.width,
             height: resolution.height,
             steps: s.steps,
-            guidance: s.guidance,
             keepResident: s.keepResident,
             lanModelId: lanId,
             safeMode: s.safeMode

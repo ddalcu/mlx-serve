@@ -53,10 +53,45 @@ pub const StreamCtx = struct {
     }
 };
 
+/// Escape a message for embedding in a JSON string, TRUNCATING to fit `out`.
+/// Media-gen error bodies are built into fixed buffers from hand-written text,
+/// and both failure modes shipped: a message quoting a field value (`mode:"edit"`)
+/// emitted a body with raw quotes — invalid JSON a client can't parse — and an
+/// over-long one made `bufPrint` fail so the handler sent NO body at all.
+/// Truncation stops on a UTF-8 boundary so the tail can't be a broken sequence.
+pub fn jsonEscapeMessage(out: []u8, msg: []const u8) []const u8 {
+    var n: usize = 0;
+    var truncated = false;
+    for (msg) |c| {
+        var one: [1]u8 = .{if (c < 0x20) ' ' else c};
+        const esc: []const u8 = switch (c) {
+            '"' => "\\\"",
+            '\\' => "\\\\",
+            '\n' => "\\n",
+            '\r' => "\\r",
+            '\t' => "\\t",
+            else => one[0..1],
+        };
+        if (n + esc.len > out.len) {
+            truncated = true;
+            break;
+        }
+        @memcpy(out[n..][0..esc.len], esc);
+        n += esc.len;
+    }
+    if (truncated) {
+        while (n > 0 and (out[n - 1] & 0xC0) == 0x80) n -= 1; // continuation bytes
+        if (n > 0 and out[n - 1] >= 0x80) n -= 1; // the lead byte they belonged to
+    }
+    return out[0..n];
+}
+
 /// Write a terminal `error` SSE event.
 pub fn sendError(conn: *Conn, msg: []const u8) void {
-    var buf: [256]u8 = undefined;
-    const ev = std.fmt.bufPrint(&buf, "data: {{\"type\":\"error\",\"message\":\"{s}\"}}\n\n", .{msg}) catch return;
+    var esc_buf: [512]u8 = undefined;
+    const esc = jsonEscapeMessage(&esc_buf, msg);
+    var buf: [640]u8 = undefined;
+    const ev = std.fmt.bufPrint(&buf, "data: {{\"type\":\"error\",\"message\":\"{s}\"}}\n\n", .{esc}) catch return;
     conn.writeAll(ev) catch {};
 }
 
@@ -68,6 +103,38 @@ pub fn bodyWantsTrue(body: []const u8, key: []const u8) bool {
     var i = ki + pat.len;
     while (i < body.len and (body[i] == ' ' or body[i] == ':' or body[i] == '\t')) i += 1;
     return std.mem.startsWith(u8, body[i..], "true");
+}
+
+test "jsonEscapeMessage keeps an error body parseable (live: the mode:\"edit\" 400)" {
+    const a = std.testing.allocator;
+    var buf: [512]u8 = undefined;
+
+    // The exact message that shipped an INVALID body: raw quotes inside a JSON
+    // string. Escaped, the body must round-trip through a real JSON parser.
+    const live = "instruction editing (mode:\"edit\") requires a FLUX.2 or Mage-Flow-Edit model";
+    const body = try std.fmt.allocPrint(a, "{{\"error\":{{\"message\":\"{s}\"}}}}", .{jsonEscapeMessage(&buf, live)});
+    defer a.free(body);
+    var parsed = try std.json.parseFromSlice(std.json.Value, a, body, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(live, parsed.value.object.get("error").?.object.get("message").?.string);
+
+    // Backslashes, control bytes and newlines can't break out either.
+    const nasty = "a\\b\"c\nd\te";
+    const b2 = try std.fmt.allocPrint(a, "{{\"m\":\"{s}\"}}", .{jsonEscapeMessage(&buf, nasty)});
+    defer a.free(b2);
+    var p2 = try std.json.parseFromSlice(std.json.Value, a, b2, .{});
+    defer p2.deinit();
+    try std.testing.expectEqualStrings(nasty, p2.value.object.get("m").?.string);
+
+    // Over-long input truncates instead of vanishing, and never leaves a torn
+    // UTF-8 tail (bufPrint's `catch return` used to drop the whole response).
+    var small: [8]u8 = undefined;
+    const cut = jsonEscapeMessage(&small, "ééééééé");
+    try std.testing.expect(cut.len <= small.len);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(cut));
+    // A trailing escape is emitted whole or not at all.
+    var tiny: [1]u8 = undefined;
+    try std.testing.expectEqual(@as(usize, 0), jsonEscapeMessage(&tiny, "\"").len);
 }
 
 test "Progress.cancelled defaults false, reads the probe when set" {

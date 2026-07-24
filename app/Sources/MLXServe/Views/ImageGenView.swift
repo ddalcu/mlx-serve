@@ -2,20 +2,21 @@ import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
 
-/// Image generation window — native FLUX.2 and Krea-2-Turbo (no Python).
-/// The model picker lists every `ImageModelPreset`; the server auto-routes to
-/// the right image backend by the model's `config.json` `model_type`.
+/// Image generation window — native FLUX.2, Krea-2-Turbo and Mage-Flow (no
+/// Python). The model picker lists every `ImageModelPreset`; the server
+/// auto-routes to the right image backend by the model's `model_type`.
 ///
-/// UI layering: a Quality picker drives steps + CFG, a Resolution picker
-/// pins to model-trained buckets, and Advanced lets the user override
-/// individual fields if they really want to.
+/// UI layering: a Quality picker drives steps (hidden where the schedule is
+/// distillation-fixed), a Resolution picker pins to model-trained buckets, and
+/// Advanced lets the user override individual fields. Every control in Advanced
+/// is gated on a preset capability flag — the pane shows nothing this backend
+/// would ignore or reject.
 struct ImageGenView: View {
     @EnvironmentObject var service: ImageGenService
     @EnvironmentObject var server: ServerManager
     @EnvironmentObject var downloads: DownloadManager
 
     @State private var prompt: String = ""
-    @State private var negative: String = ""
     @State private var showAdvanced: Bool = false
     @State private var model: ImageModelPreset = .flux2Klein4B_Q4
     /// Selected network model's routing id (`<model>@<peer>`); nil = local.
@@ -23,7 +24,6 @@ struct ImageGenView: View {
     @State private var quality: QualityPreset = .good
     @State private var resolution: ResolutionOption = ImageModelPreset.flux2Klein4B_Q4.defaultResolution
     @State private var steps: Int = 8
-    @State private var guidance: Double = 0.5
     @State private var seed: Int = -1
     @State private var showRAMWarning: Bool = false
     @State private var ramWarningMessage: String = ""
@@ -54,7 +54,7 @@ struct ImageGenView: View {
     /// True while `hydrate()` seeds `@State` from saved settings. Hydrating
     /// `model`/`quality` fires their `.onChange` (applyModelDefaults /
     /// applyQualityDefaults) which would clobber the just-restored
-    /// steps/guidance/resolution — so every reset + persist is guarded on this.
+    /// steps/resolution — so every reset + persist is guarded on this.
     @State private var hydrating: Bool = false
     /// Hydrate exactly once per window lifetime (the first `.onAppear`).
     @State private var didHydrate: Bool = false
@@ -80,9 +80,7 @@ struct ImageGenView: View {
         // their sections after applying preset defaults).
         .onChange(of: resolution) { _, _ in guard !hydrating else { return }; persist() }
         .onChange(of: steps) { _, _ in guard !hydrating else { return }; persist() }
-        .onChange(of: guidance) { _, _ in guard !hydrating else { return }; persist() }
         .onChange(of: seed) { _, _ in guard !hydrating else { return }; persist() }
-        .onChange(of: negative) { _, _ in guard !hydrating else { return }; persist() }
         .onChange(of: safeMode) { _, _ in guard !hydrating else { return }; persist() }
         .onChange(of: keepResident) { _, _ in guard !hydrating else { return }; persist() }
     }
@@ -125,7 +123,25 @@ struct ImageGenView: View {
 
     private var promptSection: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text("Prompt").font(.subheadline.weight(.semibold))
+            HStack(spacing: 8) {
+                Text("Prompt").font(.subheadline.weight(.semibold))
+                Spacer()
+                // Same idiom as the Video pane. For an EDIT model this menu is
+                // the feature discovery surface: the repertoire is prompts, so
+                // an unlisted capability may as well not exist.
+                Menu("Examples") {
+                    ForEach(model.promptExamples(editing: isEditing), id: \.name) { group in
+                        Menu(group.name) {
+                            ForEach(group.examples, id: \.title) { ex in
+                                Button(ex.title) { prompt = ex.body; persist() }
+                            }
+                        }
+                    }
+                }
+                .menuStyle(.borderlessButton)
+                .fixedSize()
+                .font(.caption)
+            }
             TextEditor(text: $prompt)
                 .font(.body)
                 .frame(height: 110)
@@ -164,7 +180,11 @@ struct ImageGenView: View {
                 }
                 .padding(6)
                 .background(RoundedRectangle(cornerRadius: 6).fill(Color.secondary.opacity(0.08)))
-                if model.supportsReferenceEdit {
+                // The mode switch only makes sense where BOTH modes exist. A
+                // model with instruction editing but no VAE-encoder variation
+                // path (Mage-Flow-Edit) would otherwise offer "Variation" and
+                // get a 400 back.
+                if model.supportsReferenceEdit && model.supportsImg2Img {
                     Picker("", selection: $editMode) {
                         Text("Edit").tag(true)
                         Text("Variation").tag(false)
@@ -217,7 +237,7 @@ struct ImageGenView: View {
                             .font(.caption2)
                             .foregroundStyle(.secondary)
                     }
-                } else {
+                } else if model.supportsImg2Img {
                     VStack(alignment: .leading, spacing: 2) {
                         HStack {
                             Text("Variation strength").font(.caption)
@@ -237,13 +257,30 @@ struct ImageGenView: View {
                 Button {
                     chooseSourceImage()
                 } label: {
-                    Label("Choose image…", systemImage: "photo.badge.plus")
+                    Label(sourceImageButtonLabel, systemImage: "photo.badge.plus")
                         .font(.caption)
                 }
-                Text("Generate a variation of an existing image, guided by the prompt (image-to-image).")
+                Text(sourceImageHint)
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             }
+        }
+    }
+
+    /// What a source image is FOR on this model — instruction editing, a
+    /// renoise variation, or both. Never offers a mode the backend 400s on.
+    private var sourceImageButtonLabel: String {
+        model.supportsImg2Img ? "Choose image…" : "Choose image to edit…"
+    }
+
+    private var sourceImageHint: String {
+        switch (model.supportsReferenceEdit, model.supportsImg2Img) {
+        case (true, true):
+            return "Edit an existing image with an instruction, or generate a variation of it."
+        case (true, false):
+            return "Edit an existing image with an instruction — say what to change and the rest stays put."
+        default:
+            return "Generate a variation of an existing image, guided by the prompt (image-to-image)."
         }
     }
 
@@ -269,40 +306,63 @@ struct ImageGenView: View {
         }
     }
 
+    @ViewBuilder
     private var qualitySection: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text("Quality").font(.subheadline.weight(.semibold))
-            Picker("", selection: $quality) {
-                ForEach(QualityPreset.allCases) { q in
-                    Text(q.label).tag(q)
-                }
+        // A distilled model has ONE schedule. Offering tiers that only buy time
+        // is the same silent-no-op the capability flags exist to kill.
+        if model.stepsAreFixed {
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Quality").font(.subheadline.weight(.semibold))
+                Text("Fixed at \(model.fixedSteps) steps — this model is distilled for a \(model.fixedSteps)-step schedule, so more steps cost time without adding detail.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
-            .pickerStyle(.segmented)
-            .labelsHidden()
-            .onChange(of: quality) { _, _ in guard !hydrating else { return }; applyQualityDefaults(); persist() }
-            Text(qualityHint)
-                .font(.caption)
-                .foregroundStyle(.secondary)
+        } else {
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Quality").font(.subheadline.weight(.semibold))
+                Picker("", selection: $quality) {
+                    ForEach(QualityPreset.allCases) { q in
+                        Text(q.label).tag(q)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .onChange(of: quality) { _, _ in guard !hydrating else { return }; applyQualityDefaults(); persist() }
+                Text(qualityHint)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
         }
     }
 
-    /// Tier-specific marketing-ish hint with the actual numbers, so users see
-    /// the cost up front (e.g. "Super = 50 steps, CFG 4.5").
+    /// Tier-specific hint with the actual numbers, so users see the cost up
+    /// front. CFG is deliberately absent: no image backend reads a guidance
+    /// field, so quoting one would be inventing a knob.
     private var qualityHint: String {
-        let s = model.settings(quality)
-        return "\(s.steps) steps, CFG \(String(format: "%.1f", s.guidance))"
+        "\(model.settings(quality).steps) steps"
     }
 
     private var resolutionSection: some View {
         VStack(alignment: .leading, spacing: 6) {
             Text("Resolution").font(.subheadline.weight(.semibold))
             Picker("", selection: $resolution) {
-                ForEach(model.resolutions) { r in
+                ForEach(model.resolutionOptions(editMode: isEditing)) { r in
                     Text(r.label).tag(r)
                 }
             }
             .labelsHidden()
             .pickerStyle(.menu)
+            // Dropping the source image (or leaving edit mode) takes "Match
+            // source" off the menu — re-point the selection or the picker shows
+            // an empty label.
+            .onChange(of: isEditing) { _, editing in
+                resolution = model.validResolution(resolution, editMode: editing)
+            }
+            if resolution.isMatchSource {
+                Text("The edit comes back at the source image's own size.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
         }
     }
 
@@ -330,17 +390,19 @@ struct ImageGenView: View {
                 .buttonStyle(.plain)
                 .foregroundStyle(.secondary)
             }
+            // No CFG field and no negative prompt: NO image backend reads either
+            // one (`handleImage` parses neither, and the app never sent
+            // guidance), so both were pure decoration on every model, not just
+            // the distilled ones. Steps stay overridable even where the schedule
+            // is fixed — it's the Advanced panel, and the hint says the cost.
             HStack {
                 numberField("Steps", value: $steps, step: 1)
-                guidanceField
-            }
-            HStack {
                 numberField("Seed (-1 = random)", value: $seed, step: 1)
             }
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Negative prompt").font(.caption)
-                TextField("", text: $negative, prompt: Text("(optional, ignored by Klein)"))
-                    .textFieldStyle(.roundedBorder)
+            if model.stepsAreFixed {
+                Text("This model is distilled for \(model.fixedSteps) steps; other values cost time without adding detail.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
             }
             Toggle("Keep model loaded after generating", isOn: $keepResident)
                 .font(.caption)
@@ -349,33 +411,41 @@ struct ImageGenView: View {
                 .font(.caption)
                 .help("On (default): generated images are screened by an on-device NSFW classifier and explicit results are blocked. Off: no filtering — you are responsible for the output.")
 
-            Divider()
-            Text("Conditioning rebalance").font(.caption.weight(.semibold))
-            VStack(alignment: .leading, spacing: 2) {
-                Text("Global gain").font(.caption)
-                Stepper(value: $condGain, in: 0...4, step: 0.1) {
-                    Text(String(format: "%.1f", condGain))
+            // Rebalance scales the TAPPED text-encoder layers. A backend that
+            // conditions on a single final hidden state has none to tap
+            // (`condWeightCount == 0`), and the panel used to ask for
+            // "Layer weights (0 numbers…)".
+            if model.condWeightCount > 0 {
+                Divider()
+                Text("Conditioning rebalance").font(.caption.weight(.semibold))
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Global gain").font(.caption)
+                    Stepper(value: $condGain, in: 0...4, step: 0.1) {
+                        Text(String(format: "%.1f", condGain))
+                    }
+                    .onChange(of: condGain) { _, _ in guard !hydrating else { return }; persist() }
                 }
-                .onChange(of: condGain) { _, _ in guard !hydrating else { return }; persist() }
-            }
-            VStack(alignment: .leading, spacing: 4) {
-                Text("Layer weights (\(model.condWeightCount) numbers, comma or space separated)")
-                    .font(.caption)
-                TextField("", text: $condWeightsText, prompt: Text(defaultWeightsPlaceholder))
-                    .textFieldStyle(.roundedBorder)
-                    .font(.caption.monospaced())
-                    .onChange(of: condWeightsText) { _, _ in guard !hydrating else { return }; persist() }
-                if !condWeightsValid {
-                    Text("Needs exactly \(model.condWeightCount) numbers — one per tapped encoder layer.")
-                        .font(.caption2)
-                        .foregroundStyle(.red)
-                } else {
-                    Text("Scales each tapped text-encoder layer's contribution (1 = neutral). Empty = off.")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Layer weights (\(model.condWeightCount) numbers, comma or space separated)")
+                        .font(.caption)
+                    TextField("", text: $condWeightsText, prompt: Text(defaultWeightsPlaceholder))
+                        .textFieldStyle(.roundedBorder)
+                        .font(.caption.monospaced())
+                        .onChange(of: condWeightsText) { _, _ in guard !hydrating else { return }; persist() }
+                    if !condWeightsValid {
+                        Text("Needs exactly \(model.condWeightCount) numbers — one per tapped encoder layer.")
+                            .font(.caption2)
+                            .foregroundStyle(.red)
+                    } else {
+                        Text("Scales each tapped text-encoder layer's contribution (1 = neutral). Empty = off.")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
                 }
             }
 
+            // LoRA attaches to the DiT; a backend without that path answers 400.
+            if model.supportsLoRA {
             Divider()
             Text("Style LoRA").font(.caption.weight(.semibold))
             if loraPath.isEmpty {
@@ -411,13 +481,24 @@ struct ImageGenView: View {
                 .padding(6)
                 .background(RoundedRectangle(cornerRadius: 6).fill(Color.secondary.opacity(0.08)))
             }
+            } // model.supportsLoRA
         }
     }
 
-    /// Edit mode only applies where the model was trained for it (FLUX.2);
-    /// on other models the source image always means variation.
+    /// Edit mode only applies where the model was trained for it; on models
+    /// without that training a source image always means variation. And where
+    /// editing is the ONLY thing a source image can do (no img2img path), a
+    /// source image means edit regardless of the toggle — the mode picker is
+    /// hidden in that case, so a stale `false` would otherwise send a variation
+    /// request the backend rejects.
     private var effectiveEditMode: Bool {
-        editMode && model.supportsReferenceEdit
+        model.supportsReferenceEdit && (editMode || !model.supportsImg2Img)
+    }
+
+    /// True when the pane is set up to edit a real source image — the only
+    /// situation where "Match source" is a meaningful output size.
+    private var isEditing: Bool {
+        effectiveEditMode && initImageURL != nil
     }
 
     /// Placeholder showing the right count for the selected model's backend.
@@ -474,15 +555,6 @@ struct ImageGenView: View {
             Text(label).font(.caption)
             Stepper(value: value, step: step) {
                 Text(String(value.wrappedValue))
-            }
-        }
-    }
-
-    private var guidanceField: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text("CFG / Guidance").font(.caption)
-            Stepper(value: $guidance, in: 0...20, step: 0.5) {
-                Text(String(format: "%.1f", guidance))
             }
         }
     }
@@ -598,9 +670,7 @@ struct ImageGenView: View {
         quality = s.quality
         resolution = s.resolvedResolution(for: model)
         steps = s.steps
-        guidance = s.guidance
         seed = s.seed
-        negative = s.negativePrompt
         safeMode = s.safeMode
         keepResident = s.keepResident
         strength = s.strength
@@ -621,9 +691,7 @@ struct ImageGenView: View {
         s.quality = quality
         s.resolutionId = resolution.id
         s.steps = steps
-        s.guidance = guidance
         s.seed = seed
-        s.negativePrompt = negative
         s.safeMode = safeMode
         s.keepResident = keepResident
         s.strength = strength
@@ -638,14 +706,14 @@ struct ImageGenView: View {
 
     private func applyModelDefaults() {
         quality = model.defaultQuality
-        resolution = model.defaultResolution
+        // Resolution menus are per-model (Mage-Flow offers 2048 and 4:1 shapes
+        // FLUX doesn't), so a carried-over selection can be off-menu.
+        resolution = model.validResolution(model.defaultResolution, editMode: isEditing)
         applyQualityDefaults()
     }
 
     private func applyQualityDefaults() {
-        let s = model.settings(quality)
-        steps = s.steps
-        guidance = s.guidance
+        steps = model.settings(quality).steps
     }
 
     /// Soft gate: only block if the model truly can't fit (needs more RAM
@@ -657,12 +725,10 @@ struct ImageGenView: View {
         let req = ImageGenRequest(
             model: model,
             prompt: prompt,
-            negativePrompt: negative,
             seed: seed,
             width: resolution.width,
             height: resolution.height,
             steps: steps,
-            guidance: guidance,
             keepResident: keepResident,
             lanModelId: lanModel,
             safeMode: safeMode,

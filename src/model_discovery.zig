@@ -28,22 +28,21 @@ const log = @import("log.zig");
 /// drafters can't decode on their own, and users shouldn't see them in
 /// `/v1/models`.
 const supported_model_types = [_][]const u8{
-    "gemma3",       "gemma3_text",
-    "gemma4",       "gemma4_text",
-    "gemma4_unified", "gemma4_unified_text",
-    "diffusion_gemma",
-    "qwen2",
-    "qwen3",        "qwen3_5",        "qwen3_5_text",
-    "qwen3_5_moe",  "qwen3_5_moe_text",
-    "qwen3_moe",    "qwen3_moe_text",
-    "qwen3_next",
-    "llama",        "mistral",
-    "lfm2",         // also matches any "lfm2*" prefix (lfm2_vl etc. when added)
+    "gemma3",           "gemma3_text",
+    "gemma4",           "gemma4_text",
+    "gemma4_unified",   "gemma4_unified_text",
+    "diffusion_gemma",  "qwen2",
+    "qwen3",            "qwen3_5",
+    "qwen3_5_text",     "qwen3_5_moe",
+    "qwen3_5_moe_text", "qwen3_moe",
+    "qwen3_moe_text",   "qwen3_next",
+    "llama",            "mistral",
+    "lfm2", // also matches any "lfm2*" prefix (lfm2_vl etc. when added)
     "nemotron_h",
     "bert",
     "deepseek_v4",
-    "hy_v3",        // Tencent Hunyuan 3 (295B-A21B MoE)
-    "laguna",       // poolside Laguna S 2.1 (117.6B-A8.5B MoE coder)
+    "hy_v3", // Tencent Hunyuan 3 (295B-A21B MoE)
+    "laguna", // poolside Laguna S 2.1 (117.6B-A8.5B MoE coder)
 };
 
 /// Native media-generation archs (image / audio / video / 3D), served by the
@@ -103,7 +102,15 @@ const ConfigPeek = union(enum) {
 fn peekConfig(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir, entry_name: []const u8) ConfigPeek {
     var sub = dir.openDir(io, entry_name, .{}) catch return .missing_or_unparseable;
     defer sub.close(io);
-    var file = sub.openFile(io, "config.json", .{}) catch return .missing_or_unparseable;
+    var file = sub.openFile(io, "config.json", .{}) catch {
+        // No root config.json: a MageFlow diffusers repo carries only
+        // model_index.json (`_class_name`=="MageFlowPipeline"). Classify it so
+        // `list` + the registry treat it like any other image model. Mirrors
+        // gen.peekModelType's fallback (kept in sync — the routing side must agree).
+        if (peekMageFlowIndex(io, allocator, sub))
+            return .{ .supported = allocator.dupe(u8, "mage_flow") catch return .missing_or_unparseable };
+        return .missing_or_unparseable;
+    };
     defer file.close(io);
     var rbuf: [4096]u8 = undefined;
     var rs = file.reader(io, &rbuf);
@@ -138,6 +145,24 @@ fn peekConfig(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir, entry_n
         }
     }
     return .{ .supported = allocator.dupe(u8, mt_val.string) catch return .missing_or_unparseable };
+}
+
+/// True when `sub/model_index.json` marks a MageFlow pipeline (`_class_name` ==
+/// "MageFlowPipeline", or a `_mage_flow_version` tag). Same signature as
+/// gen.isMageFlowRepo, over an already-open Dir.
+pub fn peekMageFlowIndex(io: std.Io, allocator: std.mem.Allocator, sub: std.Io.Dir) bool {
+    var file = sub.openFile(io, "model_index.json", .{}) catch return false;
+    defer file.close(io);
+    var rbuf: [4096]u8 = undefined;
+    var rs = file.reader(io, &rbuf);
+    const bytes = rs.interface.allocRemaining(allocator, .limited(1 * 1024 * 1024)) catch return false;
+    defer allocator.free(bytes);
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, bytes, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    if (parsed.value.object.get("_mage_flow_version") != null) return true;
+    const cn = parsed.value.object.get("_class_name") orelse return false;
+    return cn == .string and std.mem.eql(u8, cn.string, "MageFlowPipeline");
 }
 
 /// Result of scanning a directory for LLM `.gguf` files (mmproj sidecars
@@ -572,8 +597,15 @@ fn tryAddModel(
             break :blk try allocator.dupe(u8, "gguf");
         }
 
-        const cfg_stat = sub.statFile(io, "config.json", .{}) catch return false;
-        if (cfg_stat.kind != .file) return false;
+        // No root config.json is not automatically "not a model": a MageFlow
+        // diffusers repo keeps every config in a component subdir and carries
+        // only `model_index.json`. `peekConfig` knows that, so hand the dir to
+        // it instead of bailing here — bailing made its fallback unreachable
+        // and left every downloaded MageFlow checkpoint invisible to `list`,
+        // `/v1/models` and the app picker. Anything with neither file still
+        // returns false below, via `.missing_or_unparseable`.
+        const has_config = if (sub.statFile(io, "config.json", .{})) |st| st.kind == .file else |_| false;
+        if (!has_config and !peekMageFlowIndex(io, allocator, sub)) return false;
 
         // Filter by supported model_type AND quantization scheme. Catches:
         //   - partially-downloaded checkpoints (missing/garbage config)
@@ -615,6 +647,11 @@ fn tryAddModel(
                 bytes_ok = true;
             }
         }
+        // A diffusers-shaped repo (MageFlow) holds NO weights at its root —
+        // they live one level down in transformer/, text_encoder/, vae/. Only
+        // descend when the flat scan came up empty, so the common MLX layout
+        // pays nothing.
+        if (!bytes_ok) bytes_ok = sumComponentWeights(io, parent, name, &bytes);
     }
 
     const id = if (id_prefix.len > 0)
@@ -633,6 +670,31 @@ fn tryAddModel(
         .model_type = model_type,
     });
     return true;
+}
+
+/// Sum `*.safetensors` one level below `parent/name` (the component subdirs of
+/// a diffusers repo). Returns true when anything was found. Best-effort: any
+/// unreadable dir is skipped, exactly like the flat scan above.
+fn sumComponentWeights(io: std.Io, parent: std.Io.Dir, name: []const u8, bytes: *u64) bool {
+    var top = parent.openDir(io, name, .{ .iterate = true }) catch return false;
+    defer top.close(io);
+    var found_any = false;
+    var it = top.iterate();
+    while (it.next(io) catch null) |entry| {
+        if (entry.kind != .directory) continue;
+        if (entry.name.len == 0 or entry.name[0] == '.') continue;
+        var comp = top.openDir(io, entry.name, .{ .iterate = true }) catch continue;
+        defer comp.close(io);
+        var cit = comp.iterate();
+        while (cit.next(io) catch null) |f| {
+            if (f.kind != .file) continue;
+            if (!std.mem.endsWith(u8, f.name, ".safetensors")) continue;
+            const st = comp.statFile(io, f.name, .{}) catch continue;
+            bytes.* += @intCast(st.size);
+            found_any = true;
+        }
+    }
+    return found_any;
 }
 
 fn trimTrailingSlash(s: []const u8) []const u8 {
@@ -929,6 +991,42 @@ test "discoverModels finds GGUF dirs without config.json (issue #59)" {
     try testing.expectEqualStrings("gguf", result.models[1].model_type);
 }
 
+test "discoverModels finds a MageFlow repo (model_index.json, no root config.json)" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    // A MageFlow repo carries NO root config.json — every config lives in a
+    // component subdir, and `model_index.json` is the only classification
+    // signal (both released repos AND our 8-bit mirrors). `peekConfig` has the
+    // fallback, but `tryAddModel` used to bail on the missing config.json
+    // before ever reaching it, so a downloaded MageFlow model was invisible to
+    // `list`, `/v1/models` and the app's model picker.
+    try tmp.dir.createDirPath(io, "microsoft/Mage-Flow-Turbo/transformer");
+    try tmp.dir.createDirPath(io, "microsoft/Mage-Flow-Turbo/vae");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "microsoft/Mage-Flow-Turbo/model_index.json",
+        .data =
+        \\{"_class_name":"MageFlowPipeline","_mage_flow_version":"0.1.0"}
+        ,
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "microsoft/Mage-Flow-Turbo/transformer/diffusion_pytorch_model.safetensors", .data = "0123456789" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "microsoft/Mage-Flow-Turbo/vae/diffusion_pytorch_model.safetensors", .data = "0123" });
+    // A configless, index-less dir stays invisible (an interrupted download).
+    try tmp.dir.createDirPath(io, "microsoft/half-pulled");
+    try tmp.dir.writeFile(io, .{ .sub_path = "microsoft/half-pulled/README.md", .data = "x" });
+
+    var result = try discoverModelsInDir(io, allocator, tmp.dir, "/root");
+    defer result.deinit();
+
+    try testing.expectEqual(@as(usize, 1), result.models.len);
+    try testing.expectEqualStrings("microsoft/Mage-Flow-Turbo", result.models[0].id);
+    try testing.expectEqualStrings("mage_flow", result.models[0].model_type);
+    // Size is the whole tree — the weights live in component subdirs.
+    try testing.expectEqual(@as(?u64, 14), result.models[0].bytes_on_disk);
+}
+
 test "discoverModels: a .gguf beside config.json wins (mirrors --model routing)" {
     // `--model <dir>` checks isGgufPath BEFORE parsing config.json, so a dir
     // holding both routes to the embedded engine. Discovery must classify it
@@ -1061,6 +1159,9 @@ test "classifyModelPath: gguf/media/drafter dirs classify; junk is null" {
     try tmp.dir.writeFile(io, .{ .sub_path = "img/config.json", .data = "{\"model_type\":\"flux2-klein-4b\"}" });
     try tmp.dir.createDirPath(io, "drafter");
     try tmp.dir.writeFile(io, .{ .sub_path = "drafter/config.json", .data = "{\"model_type\":\"gemma4_assistant\"}" });
+    // MageFlow diffusers repo: NO root config.json, only model_index.json.
+    try tmp.dir.createDirPath(io, "mage");
+    try tmp.dir.writeFile(io, .{ .sub_path = "mage/model_index.json", .data = "{\"_class_name\":\"MageFlowPipeline\"}" });
     try tmp.dir.createDirPath(io, "junk");
 
     var path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -1071,6 +1172,7 @@ test "classifyModelPath: gguf/media/drafter dirs classify; junk is null" {
         .{ "g", ModelKind.chat },
         .{ "img", ModelKind.image },
         .{ "drafter", ModelKind.drafter },
+        .{ "mage", ModelKind.image },
     };
     inline for (cases) |c| {
         const p = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ root, c[0] });

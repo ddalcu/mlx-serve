@@ -1654,6 +1654,19 @@ fn handleConnection(
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
         const body = request[header_end + 4 .. total_read];
         try handleGen(allocator, stream, body, lm, .image);
+    } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/images/edits")) {
+        // OpenAI's image-EDIT surface: multipart/form-data, not JSON. Translated
+        // into the `/v1/images/generations` edit body (gen.openaiEditFormToJson)
+        // and served by the identical path — no second inference route.
+        const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
+        const ct = findHeaderValue(request[0..header_end], "content-type") orelse "";
+        const body = request[header_end + 4 .. total_read];
+        const json = media_mod.openaiEditFormToJson(allocator, body, ct) catch |err| {
+            try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", media_mod.editFormErrorMessage(err), 400);
+            return;
+        };
+        defer allocator.free(json);
+        try handleGen(allocator, stream, json, lm, .image);
     } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/audio/speech")) {
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
         const body = request[header_end + 4 .. total_read];
@@ -6415,6 +6428,25 @@ fn findContentLength(headers: []const u8) ?usize {
                 return std.fmt.parseInt(usize, std.mem.trim(u8, line[lower.len..], " "), 10) catch null;
             }
         }
+    }
+    return null;
+}
+
+/// Case-insensitive header lookup returning the trimmed VALUE (`Content-Type`
+/// carries the multipart boundary, so `/v1/images/edits` can't be parsed from
+/// the body alone like every other endpoint).
+fn findHeaderValue(headers: []const u8, comptime name_lower: []const u8) ?[]const u8 {
+    var lines = std.mem.splitSequence(u8, headers, "\r\n");
+    while (lines.next()) |line| {
+        if (line.len <= name_lower.len or line[name_lower.len] != ':') continue;
+        var match = true;
+        for (0..name_lower.len) |j| {
+            if (std.ascii.toLower(line[j]) != name_lower[j]) {
+                match = false;
+                break;
+            }
+        }
+        if (match) return std.mem.trim(u8, line[name_lower.len + 1 ..], " \t");
     }
     return null;
 }

@@ -191,6 +191,12 @@ class DownloadManager: ObservableObject {
 
     private nonisolated static func holdsModel(_ dir: String, fm: FileManager) -> Bool {
         if fm.fileExists(atPath: (dir as NSString).appendingPathComponent("config.json")) { return true }
+        // Diffusers-layout media models (Mage-Flow) ship weight SUBDIRS and a
+        // `model_index.json` root — NO top-level config.json. Without this a
+        // fully-downloaded Mage-Flow never resolves: the picker shows "Download"
+        // forever and a click reverts (files present → size-matched skip →
+        // instant finish → re-check still false).
+        if fm.fileExists(atPath: (dir as NSString).appendingPathComponent("model_index.json")) { return true }
         // Recursive: a large GGUF quant's only `.gguf` files are nested shards
         // (`<quant>/<quant>-00001-of-00002.gguf`), so a shallow scan misses them.
         return !ggufQuantPaths(inDir: dir).isEmpty

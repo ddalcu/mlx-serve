@@ -466,7 +466,7 @@ pub fn cmdList(allocator: std.mem.Allocator, io: std.Io) !void {
         if (entry.name.len == 0 or entry.name[0] == '.') continue;
         var sub = dir.openDir(io, entry.name, .{ .iterate = true }) catch continue;
         defer sub.close(io);
-        if (isModelDir(io, &sub)) {
+        if (isModelDir(io, allocator, &sub)) {
             try printModelRow(io, allocator, w, &sub, entry.name, root);
             count += 1;
             continue;
@@ -477,7 +477,7 @@ pub fn cmdList(allocator: std.mem.Allocator, io: std.Io) !void {
             if (sub_entry.kind != .directory) continue;
             var leaf = sub.openDir(io, sub_entry.name, .{ .iterate = true }) catch continue;
             defer leaf.close(io);
-            if (!isModelDir(io, &leaf)) continue;
+            if (!isModelDir(io, allocator, &leaf)) continue;
             var name_buf: [512]u8 = undefined;
             const full = std.fmt.bufPrint(&name_buf, "{s}/{s}", .{ entry.name, sub_entry.name }) catch continue;
             try printModelRow(io, allocator, w, &leaf, full, root);
@@ -489,7 +489,7 @@ pub fn cmdList(allocator: std.mem.Allocator, io: std.Io) !void {
     }
 }
 
-fn isModelDir(io: std.Io, dir: *std.Io.Dir) bool {
+fn isModelDir(io: std.Io, allocator: std.mem.Allocator, dir: *std.Io.Dir) bool {
     if (dir.statFile(io, "config.json", .{})) |st| {
         if (st.kind == .file) return true;
     } else |_| {}
@@ -497,7 +497,10 @@ fn isModelDir(io: std.Io, dir: *std.Io.Dir) bool {
     while (it.next(io) catch null) |entry| {
         if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".gguf")) return true;
     }
-    return false;
+    // A MageFlow repo has neither: every config lives in a component subdir and
+    // `model_index.json` is the only signal. Shared with discovery so `list`
+    // and `/v1/models` cannot disagree about what counts as a model.
+    return model_discovery.peekMageFlowIndex(io, allocator, dir.*);
 }
 
 fn printModelRow(io: std.Io, allocator: std.mem.Allocator, w: *std.Io.Writer, dir: *std.Io.Dir, name: []const u8, root: []const u8) !void {
@@ -944,4 +947,44 @@ test "cli: dirBytesOneLevel counts weight subdirs (FLUX bundle showed 6 KB)" {
     var m = try tmp.dir.openDir(io, "m", .{ .iterate = true });
     defer m.close(io);
     try testing.expectEqual(@as(u64, 16), dirBytesOneLevel(io, &m));
+}
+
+test "cli: isModelDir accepts a MageFlow repo (model_index.json, no config.json)" {
+    const io = std.testing.io;
+    const a = testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    // `list` must agree with `/v1/models` about what a model is. A MageFlow
+    // repo carries only model_index.json, so a config-or-gguf test hides it
+    // from `list` while discovery serves it — the exact divergence the
+    // "one path must never classify two ways" rule exists to prevent.
+    try tmp.dir.createDirPath(io, "mage/transformer");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "mage/model_index.json",
+        .data =
+        \\{"_class_name":"MageFlowPipeline"}
+        ,
+    });
+    var mage = try tmp.dir.openDir(io, "mage", .{ .iterate = true });
+    defer mage.close(io);
+    try testing.expect(isModelDir(io, a, &mage));
+
+    // An unrelated diffusers pipeline is NOT ours — it must stay hidden.
+    try tmp.dir.createDirPath(io, "other");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "other/model_index.json",
+        .data =
+        \\{"_class_name":"StableDiffusionPipeline"}
+        ,
+    });
+    var other = try tmp.dir.openDir(io, "other", .{ .iterate = true });
+    defer other.close(io);
+    try testing.expect(!isModelDir(io, a, &other));
+
+    // An org dir (no config, no index, no gguf) stays a directory to descend.
+    try tmp.dir.createDirPath(io, "org/repo");
+    var org = try tmp.dir.openDir(io, "org", .{ .iterate = true });
+    defer org.close(io);
+    try testing.expect(!isModelDir(io, a, &org));
 }

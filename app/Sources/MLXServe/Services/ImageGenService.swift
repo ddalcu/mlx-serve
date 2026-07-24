@@ -179,10 +179,14 @@ final class ImageGenService: ObservableObject {
         var json: [String: Any] = [
             "model": modelName,
             "prompt": request.prompt,
-            "size": "\(request.width)x\(request.height)",
             "steps": request.steps,
             "seed": seed,
         ]
+        // width/height 0 = "Match source": OMIT `size` so the server keeps the
+        // reference image's own resolution instead of re-gridding it to a bucket.
+        if request.width > 0 && request.height > 0 {
+            json["size"] = "\(request.width)x\(request.height)"
+        }
         if !request.safeMode { json["safety"] = false }
         if let src = request.initImagePath,
            let data = FileManager.default.contents(atPath: src) {

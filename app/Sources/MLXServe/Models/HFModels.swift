@@ -56,7 +56,7 @@ let supportedModelTypes: Set<String> = [
 /// architecture" in the Downloaded tab) while still being excluded from
 /// chat-model pickers (`LocalModel.isChatPickable` checks this separately).
 /// Mirrors `model_discovery.isMediaModelType` (Zig).
-private let mediaModelTypePrefixes: [String] = ["flux2", "krea", "hunyuan3d"]
+private let mediaModelTypePrefixes: [String] = ["flux2", "krea", "mage_flow", "hunyuan3d"]
 private let mediaModelTypeExactValues: Set<String> = ["qwen3_tts", "AudioVideo", "acestep"]
 
 func isMediaModelType(_ modelType: String) -> Bool {

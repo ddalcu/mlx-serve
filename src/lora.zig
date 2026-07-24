@@ -125,6 +125,19 @@ fn scalarValue(arr: mlx.mlx_array, s: mlx.mlx_stream) ?f32 {
 /// arrays GPU-usable afterwards).
 pub fn loadFile(allocator: std.mem.Allocator, path: []const u8) !File {
     if (path.len == 0 or !std.fs.path.isAbsolute(path)) return error.BadLoraPath;
+    // Prove the file is there BEFORE mlx sees it. `mlx_load_safetensors` on a
+    // missing path raises an MLX error, and an MLX error is not a Zig error —
+    // it kills the process. One request with a stale `lora_path` (a moved
+    // adapter, a typo) took the whole server down, mid-conversation, for every
+    // other client too. Same class as the non-text-model 400-before-prefill
+    // rule: validate on OUR side of an uncatchable boundary.
+    {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        const f = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return error.BadLoraPath;
+        defer f.close(io);
+        const st = f.stat(io) catch return error.BadLoraPath;
+        if (st.kind != .file) return error.BadLoraPath; // a directory opens fine
+    }
     const pathz = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(pathz);
     const s = mlx.mlx_default_cpu_stream_new();
@@ -286,4 +299,22 @@ test "delta computes scale·(x@Aᵀ)@Bᵀ" {
 test "loadFile rejects relative/empty paths (openFileAbsolute UB class)" {
     try testing.expectError(error.BadLoraPath, loadFile(testing.allocator, ""));
     try testing.expectError(error.BadLoraPath, loadFile(testing.allocator, "rel/lora.safetensors"));
+}
+
+test "loadFile rejects a MISSING file before mlx can kill the process" {
+    // Live: `{"lora_path":"/tmp/nope.safetensors"}` printed
+    // `MLX error: [load_safetensors] Failed to open file` and the server was
+    // GONE — the client got a dropped connection, not a 400. mlx-c errors are
+    // fatal, so a nonexistent path must never reach `mlx_load_safetensors`.
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &buf);
+    const missing = try std.fmt.allocPrint(testing.allocator, "{s}/definitely-not-here.safetensors", .{buf[0..root_len]});
+    defer testing.allocator.free(missing);
+    try testing.expectError(error.BadLoraPath, loadFile(testing.allocator, missing));
+    // A DIRECTORY exists, so an existence check alone would wave it through to
+    // mlx and die the same way. It must be a regular file.
+    try testing.expectError(error.BadLoraPath, loadFile(testing.allocator, buf[0..root_len]));
 }

@@ -675,16 +675,23 @@ class ServerManager: ObservableObject {
     /// `~/.mlx-serve/models` — the SINGLE source of truth for downloaded
     /// models. No HF-cache fallback: the app owns downloads (chat + media), so
     /// a model the user hasn't downloaded through us simply isn't available.
-    /// nil when the dir (with a `config.json`) doesn't exist. The media-gen
-    /// services call this before loading.
+    /// nil when the model dir isn't present. The media-gen services call this
+    /// before loading.
     static func resolveModelDir(repo: String) -> String? {
+        resolveModelDir(repo: repo, modelsRoot: modelsRoot)
+    }
+
+    /// Pure, root-injectable core (testable against a temp dir). A downloaded
+    /// model is marked by `config.json` (standard MLX layout) OR
+    /// `model_index.json` (diffusers layout — Mage-Flow's weight subdirs with NO
+    /// root config); gating on config.json alone made a fully-present Mage-Flow
+    /// read as "not downloaded" and every gen service throw `.modelMissing`.
+    nonisolated static func resolveModelDir(repo: String, modelsRoot: String) -> String? {
         let fm = FileManager.default
-        let modelsRoot = NSString(string: "~/.mlx-serve/models").expandingTildeInPath
-        if let dir = DownloadManager.existingModelDir(rootDir: modelsRoot, repoId: repo),
-           fm.fileExists(atPath: (dir as NSString).appendingPathComponent("config.json")) {
-            return dir
-        }
-        return nil
+        guard let dir = DownloadManager.existingModelDir(rootDir: modelsRoot, repoId: repo) else { return nil }
+        let hasConfig = fm.fileExists(atPath: (dir as NSString).appendingPathComponent("config.json"))
+        let hasIndex = fm.fileExists(atPath: (dir as NSString).appendingPathComponent("model_index.json"))
+        return (hasConfig || hasIndex) ? dir : nil
     }
 
     private func killOrphanedServers(on port: UInt16) {

@@ -15,13 +15,31 @@ final class MediaGenSettingsTests: XCTestCase {
         s.quality = .superQuality
         s.resolutionId = "1216x832"
         s.steps = 33
-        s.guidance = 4.5
         s.seed = 7
-        s.negativePrompt = "blurry, low quality"
         s.safeMode = false
         s.keepResident = true
         let decoded = try JSONDecoder().decode(ImageGenSettings.self, from: try JSONEncoder().encode(s))
         XCTAssertEqual(decoded, s)
+    }
+
+    /// Settings saved by an older build still carry `guidance` and
+    /// `negativePrompt` — both retired once it was clear no image backend ever
+    /// read them. The tolerant decoder must ignore the leftovers rather than
+    /// throwing, or every existing user's image settings reset on upgrade.
+    func testImageSettingsIgnoresRetiredKeysFromOlderBuilds() throws {
+        let legacy = Data("""
+        {"modelId":"mflux/flux2-klein-4b-q4","quality":"Quality","resolutionId":"1216x832",
+         "steps":33,"guidance":4.5,"seed":7,"negativePrompt":"blurry","safeMode":false,
+         "keepResident":true,"strength":0.4,"editMode":false}
+        """.utf8)
+        let s = try JSONDecoder().decode(ImageGenSettings.self, from: legacy)
+        XCTAssertEqual(s.steps, 33)
+        XCTAssertEqual(s.seed, 7)
+        XCTAssertEqual(s.resolutionId, "1216x832")
+        XCTAssertFalse(s.safeMode)
+        XCTAssertTrue(s.keepResident)
+        XCTAssertEqual(s.strength, 0.4)
+        XCTAssertFalse(s.editMode)
     }
 
     func testAudioSettingsRoundTrips() throws {

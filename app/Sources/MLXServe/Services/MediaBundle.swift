@@ -230,6 +230,26 @@ extension MediaBundle {
         )
     }
 
+    /// Mage-Flow (diffusers layout): one repo with weight subdirs
+    /// (`transformer/`, `vae/`, `text_encoder/`, `scheduler/`) and NO root
+    /// config.json — detection keys on `model_index.json`. Recursive download
+    /// excluding the README `assets/` images. Ready when the index + all four
+    /// component subdirs are present.
+    static func mageFlow(repo: String, displayName: String, sizeGB: Double) -> MediaBundle {
+        MediaBundle(
+            id: "mageflow:\(repo)",
+            displayName: displayName,
+            components: [
+                MediaComponent(
+                    repo: repo,
+                    selection: FileSelection(recursive: true, excludeSubstrings: ["assets/"]),
+                    readyMarkers: ["model_index.json", "transformer", "vae", "text_encoder", "scheduler"]
+                ),
+            ],
+            sizeEstimateGB: sizeGB
+        )
+    }
+
     /// The Gemma-3-12B text encoder LTX needs — also a standalone chat model.
     /// Standard MLX layout (config + tokenizer + sharded safetensors).
     static let ltxGemmaRepo = "mlx-community/gemma-3-12b-it-4bit"
@@ -247,6 +267,8 @@ extension ImageModelPreset {
         switch variant {
         case .krea2Turbo:
             return .krea(repo: repo, displayName: name, sizeGB: Double(approxDownloadGB))
+        case .mageFlowTurbo, .mageFlowEditTurbo:
+            return .mageFlow(repo: repo, displayName: name, sizeGB: Double(approxDownloadGB))
         default:
             return .flux(repo: repo, displayName: name, sizeGB: Double(approxDownloadGB))
         }

@@ -4040,7 +4040,10 @@ fn isJsonLiteral(s: []const u8) bool {
     return true;
 }
 
-fn appendJsonString(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), s: []const u8) !void {
+/// THE JSON string escaper (quoted, control bytes \u-escaped). Public so other
+/// request builders reuse it instead of hand-rolling a second one — a duplicate
+/// escaper is exactly how the control-byte class shipped twice before.
+pub fn appendJsonString(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), s: []const u8) !void {
     try buf.append(allocator, '"');
     for (s) |c| {
         switch (c) {
