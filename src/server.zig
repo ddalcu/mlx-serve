@@ -6339,13 +6339,42 @@ fn logHttpSseData(data: []const u8) void {
     logHttpBody("[http] sse data", data);
 }
 
+/// Cap on how much of a BINARY body reaches the debug log.
+const BODY_LOG_LIMIT = 4096;
+
+/// True when every byte is printable or ordinary whitespace. Multibyte UTF-8
+/// (≥0x80) counts as text, so an emoji in a chat body doesn't demote it.
+fn bodyIsText(body: []const u8) bool {
+    for (body) |c| {
+        if (c == '\n' or c == '\r' or c == '\t') continue;
+        if (c < 0x20 or c == 0x7f) return false;
+    }
+    return true;
+}
+
+/// Bounded, strictly-printable view of a body, copied into `out`.
+fn bodyPreview(out: []u8, body: []const u8) []const u8 {
+    const n = @min(@min(body.len, out.len), BODY_LOG_LIMIT);
+    for (body[0..n], 0..) |c, i| {
+        out[i] = if (c == '\n' or c == '\r' or c == '\t' or (c >= 0x20 and c < 0x7f)) c else '.';
+    }
+    return out[0..n];
+}
+
 fn logHttpBody(label: []const u8, body: []const u8) void {
     if (body.len == 0) return;
-    log.debug("{s} ({d}b):\n{s}\n", .{
-        label,
-        body.len,
-        body,
-    });
+    // Text bodies go out WHOLE — reading a full request body out of the debug
+    // log is the documented way to reproduce a tool-calling bug.
+    if (bodyIsText(body)) {
+        log.debug("{s} ({d}b):\n{s}\n", .{ label, body.len, body });
+        return;
+    }
+    // Binary is a different story. `/v1/images/edits` is multipart, so one image
+    // upload wrote raw PNG bytes into the log, and a body near the 64 MB request
+    // cap blew through the 32 MB rotation — taking the post-mortem file with it.
+    var buf: [BODY_LOG_LIMIT]u8 = undefined;
+    const preview = bodyPreview(&buf, body);
+    log.debug("{s} ({d}b binary, first {d} sanitized):\n{s}…\n", .{ label, body.len, preview.len, preview });
 }
 
 const GaugeSamplerCtx = struct {
@@ -11457,6 +11486,39 @@ test "findContentLength case insensitive" {
 test "findContentLength returns null when missing" {
     try testing.expect(findContentLength("Host: localhost\r\nAccept: */*") == null);
     try testing.expect(findContentLength("") == null);
+}
+
+test "debug body log bounds BINARY but never truncates text (multipart PNG class)" {
+    // `/v1/images/edits` is the first binary body we serve. `logHttpBody` dumped
+    // whatever it got verbatim, so at --log-level debug one image upload wrote
+    // raw PNG bytes into the log — and a body near the 64 MB request cap blew
+    // straight through the 32 MB rotation, taking the post-mortem file with it.
+    //
+    // Text bodies must stay WHOLE: reading a full request body out of the debug
+    // log is the documented way to reproduce a tool-calling bug.
+    try testing.expect(bodyIsText("{\"model\":\"x\",\"prompt\":\"hi\"}"));
+    try testing.expect(bodyIsText("multi\nline\twith\r\nwhitespace"));
+    try testing.expect(bodyIsText("utf8 stays text: é ✓ 🎉")); // multibyte, not control
+    try testing.expect(!bodyIsText("\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR"));
+    // The real shape: text multipart framing wrapped around a binary payload.
+    try testing.expect(!bodyIsText("--B\r\nContent-Disposition: form-data; name=\"image\"\r\n\r\n\x89PNG\x00\x01\r\n--B--"));
+
+    // A binary preview is bounded AND strictly printable ASCII.
+    var buf: [64]u8 = undefined;
+    const png = "\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\xffbinary tail";
+    const p = bodyPreview(&buf, png);
+    try testing.expect(p.len <= buf.len);
+    for (p) |c| try testing.expect(c == '\n' or c == '\r' or c == '\t' or (c >= 0x20 and c < 0x7f));
+
+    // Larger than the sink → truncated, never streamed.
+    const big = try testing.allocator.alloc(u8, 1024 * 1024);
+    defer testing.allocator.free(big);
+    @memset(big, 0);
+    try testing.expectEqual(@as(usize, buf.len), bodyPreview(&buf, big).len);
+    // The cap is the SMALLER of the caller's buffer and the byte limit, so a
+    // generous buffer can't reintroduce the megabyte dump.
+    var huge: [BODY_LOG_LIMIT * 2]u8 = undefined;
+    try testing.expectEqual(@as(usize, BODY_LOG_LIMIT), bodyPreview(&huge, big).len);
 }
 
 test "extractJsonField extracts array" {

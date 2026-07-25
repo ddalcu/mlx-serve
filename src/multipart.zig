@@ -116,8 +116,21 @@ pub const Iterator = struct {
 };
 
 /// `name="value"` (quoted) or `name=value` out of a header line.
+///
+/// The match must sit at a PARAMETER boundary (start of line, or after a `;`).
+/// A plain substring search finds `name=` inside `filename=`, so a client that
+/// orders the two the other way round — RFC 7578 fixes no order — had its field
+/// name come back as the filename, and the part stopped being recognized.
 fn paramValue(line: []const u8, key: []const u8) ?[]const u8 {
-    const at = indexOfIgnoreCase(line, key) orelse return null;
+    var from: usize = 0;
+    const at = blk: while (from < line.len) {
+        const rel = indexOfIgnoreCase(line[from..], key) orelse return null;
+        const abs = from + rel;
+        var j = abs;
+        while (j > 0 and (line[j - 1] == ' ' or line[j - 1] == '\t')) j -= 1;
+        if (j == 0 or line[j - 1] == ';') break :blk abs;
+        from = abs + 1;
+    } else return null;
     var v = line[at + key.len ..];
     if (v.len > 0 and v[0] == '"') {
         v = v[1..];
@@ -205,6 +218,25 @@ test "Iterator: fields, files, and binary data with embedded CRLF" {
 
     try testing.expectEqual(@as(?Part, null), it.next());
     try testing.expectEqual(@as(?Part, null), it.next()); // stays done
+}
+
+test "paramValue keys on the PARAMETER, not a substring of a longer one" {
+    // `name=` also occurs inside `fileNAME=`. RFC 7578 fixes no order for the
+    // two, and a client that emits filename first made the field name come back
+    // as the FILENAME — so the part stopped being recognized as `image` and the
+    // edit request 400'd with "missing image".
+    const a = testing.allocator;
+    for ([_][]const u8{
+        "Content-Disposition: form-data; name=\"image\"; filename=\"dog.png\"",
+        "Content-Disposition: form-data; filename=\"dog.png\"; name=\"image\"",
+    }) |hdr| {
+        const form = try buildForm(a, "B", &.{.{ .hdr = hdr, .data = "PNGDATA" }});
+        defer a.free(form);
+        var it = try Iterator.init(form, "B");
+        const p = it.next().?;
+        try testing.expectEqualStrings("image", p.name);
+        try testing.expectEqualStrings("dog.png", p.filename.?);
+    }
 }
 
 test "Iterator: repeated field names are yielded in order (multi-image edit)" {

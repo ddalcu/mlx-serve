@@ -68,3 +68,26 @@ That matters more than "one serve path is wrong": **headless is the mode the Swi
 PR #95 threaded `enable_pld` into the function and left the two literals beside it untouched — so `--pld-draft-len` / `--pld-key-len` stayed silent no-ops, in the same struct literal, two lines down. That is the actual lesson: the bug is not "someone forgot a field", it is that **related settings written as sibling literals drift one at a time**, and each fix looks complete because the field it touched now works. Fix: the three travel as ONE value, `server.PldDefaults` (`fromCli` for text-gen paths, `.off` for media-gen / ds4 / llama.cpp whose decode never routes through the PLD-capable generator), built once after arg parsing in `main()` and passed whole. A future edit cannot honor one field and drop its neighbours because there is only one field. Same role `effectiveSsmCheckpointStride` plays for `LoadParams` builders.
 
 Diagnosis signature for the class: a flag that parses, documents, and boots without complaint but produces no behavioral difference, on ONE serve path only, where that path constructs a config aggregate by hand. Grep for the config literal, not the flag — the flag's parse site is always innocent. Guards: `server.PldDefaults` unit tests + `tests/test_headless_spec_flags.sh`, which boots headless over an EMPTY `--model-dir` (discovers zero models, needs no checkpoint, runs in seconds) and asserts the boot banner echoes non-default lengths — red on the pre-fix binary at `draft_len=5, key_len=3`.
+
+### `name=` matched inside `filename=` → a well-formed image upload 400'd "missing image"
+Found by pre-merge review of the MageFlow branch (2026-07-25), in `multipart.zig`, before it could reach a user. `paramValue(line, key)` pulled a `Content-Disposition` parameter with a plain `indexOfIgnoreCase` substring search. `name=` is a substring of `filename=`, so the value it returned depended entirely on which parameter the client wrote FIRST:
+
+```
+Content-Disposition: form-data; name="image"; filename="dog.png"   -> name="image"    (correct)
+Content-Disposition: form-data; filename="dog.png"; name="image"   -> name="dog.png"  (the filename)
+```
+
+RFC 7578 fixes no order for the two. Only convention puts `name` first, and curl, the OpenAI SDK and browsers all follow it — which is exactly why this would have sat there. A client that didn't (a hand-rolled form, a proxy that reorders, a language binding with a dict-ordered serializer) would upload a perfectly valid image and get back `400 missing image`, with a server log showing a part named `dog.png` that matches no field we look for. Nothing in the message would point at parameter ordering.
+
+- **Fix**: the match must sit at a parameter boundary — position 0, or preceded by `;` and optional whitespace. Non-matching hits advance the cursor and the search continues, so `filename=` is skipped rather than mistaken for `name=`.
+- **Rule**: a header-parameter lookup keys on the PARAMETER, never on a substring. Any future reader (`/v1/audio/transcriptions` is the same shape when it lands) owes the same boundary check.
+- **Guard**: `paramValue keys on the PARAMETER, not a substring of a longer one` runs the SAME part through the parser in both orders and requires identical `name`/`filename`. Verified red on revert: the original returns `dog.png` for the field name.
+
+### An unbounded debug body log meets its first BINARY body
+Same review pass. `logHttpBody` had always dumped a request/response body verbatim at `--log-level debug`, which was fine while every endpoint we served was JSON. `/v1/images/edits` is `multipart/form-data`, so the body is now raw PNG/JPEG bytes — up to the 64 MB request cap. One image upload at debug level wrote megabytes of binary into `~/.mlx-serve/logs/mlx-serve-<port>.log`, including NUL bytes, and a large enough upload rotated the 32 MB log away entirely. The file whose whole purpose is post-mortem (the app's buffer dies with the app) is destroyed by the request you were trying to debug.
+
+The fix had to not break the thing the log is for: reading a complete request body out of it is the documented way to reproduce a tool-calling bug, so truncating everything to N KB would have traded one debugging failure for another.
+
+- **Fix**: `bodyIsText` splits the two cases (printable + ordinary whitespace, with multibyte UTF-8 counting as text so an emoji in a chat body doesn't demote it). Text logs WHOLE, unchanged. Non-text logs `bodyPreview` — a bounded, strictly-printable-ASCII copy capped at `min(caller's buffer, BODY_LOG_LIMIT)` — labelled with the true byte count.
+- **Rule**: adding an endpoint whose body is not text means auditing every place that treats a body as printable. The size cap alone is not enough; NUL bytes in a log break the tools that read it.
+- **Guard**: `debug body log bounds BINARY but never truncates text (multipart PNG class)` pins both halves, including the real shape (text multipart framing wrapped around a binary payload) and that a generous caller buffer can't reintroduce the megabyte dump.

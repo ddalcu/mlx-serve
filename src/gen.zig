@@ -563,6 +563,21 @@ pub const ImageEngine = struct {
             .mage_flow => .{ .w = clampKreaDim(req_w), .h = clampKreaDim(req_h) },
         };
     }
+
+    /// The ceiling `normalizeSize` clamps a dimension to. The edit path needs it
+    /// as a NUMBER, not as a clamp: clamping width and height INDEPENDENTLY
+    /// discards the aspect ratio, which is how a 4032x3024 phone photo came back
+    /// 2048x2048. Pinned to the clamps themselves by a drift test.
+    pub fn maxDimFor(kind: std.meta.Tag(ImageBackend)) u32 {
+        return switch (kind) {
+            .flux => 1536,
+            .krea, .mage_flow => 2048,
+        };
+    }
+
+    pub fn maxDim(self: *const ImageEngine) u32 {
+        return maxDimFor(std.meta.activeTag(self.backend));
+    }
 };
 
 /// Round a requested dimension to a multiple of 32 in [256, 1536] (klein's
@@ -1237,6 +1252,37 @@ fn fitAspect(src_w: u32, src_h: u32, budget_w: u32, budget_h: u32) struct { w: u
     };
 }
 
+/// Scale (w,h) down proportionally until neither exceeds `cap`, floored to /16.
+/// Preserves the aspect ratio `fitAspect` just established. Extreme aspects can
+/// still meet the 256 floor inside `normalizeSize` — nothing can honor a 2048
+/// ceiling and a 256 floor past ~8:1 — but that is a far smaller distortion than
+/// squaring the image off.
+/// Named so the two geometry helpers below can hand results to each other —
+/// Zig treats each anonymous `struct { w, h }` as a distinct type.
+const Dims = struct { w: u32, h: u32 };
+
+fn fitWithinCap(w: u32, h: u32, cap: u32) Dims {
+    const longest = @max(w, h);
+    if (longest <= cap or longest == 0 or cap == 0) return .{ .w = w, .h = h };
+    const scale = @as(f64, @floatFromInt(cap)) / @as(f64, @floatFromInt(longest));
+    const sw = @round(@as(f64, @floatFromInt(w)) * scale);
+    const sh = @round(@as(f64, @floatFromInt(h)) * scale);
+    return .{
+        .w = @max(16, (@as(u32, @intFromFloat(sw)) / 16) * 16),
+        .h = @max(16, (@as(u32, @intFromFloat(sh)) / 16) * 16),
+    };
+}
+
+/// Output geometry for a byte-based edit: keep the primary reference's aspect at
+/// the requested pixel budget, THEN scale into the backend's dimension cap.
+/// Both steps are load-bearing — `fitAspect` alone left `normalizeSize`'s
+/// per-dimension clamp free to square the result off again, which it did for any
+/// reference bigger than the cap (i.e. every modern phone photo).
+fn resolveEditTargetSize(src_w: u32, src_h: u32, budget_w: u32, budget_h: u32, cap: u32) Dims {
+    const fit = fitAspect(src_w, src_h, budget_w, budget_h);
+    return fitWithinCap(fit.w, fit.h, cap);
+}
+
 /// Native pixel dims of an encoded PNG/JPEG, without decoding the pixels.
 fn imageNativeSize(encoded: []const u8) ?struct { w: u32, h: u32 } {
     var w: c_int = 0;
@@ -1521,9 +1567,9 @@ pub fn handleImage(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: 
                 // No size given => the reference IS the budget, which `fitAspect`
                 // resolves to the source's own dimensions (/16).
                 const fit = if (size_given)
-                    fitAspect(nat.w, nat.h, width, height)
+                    resolveEditTargetSize(nat.w, nat.h, width, height, engine.maxDim())
                 else
-                    fitAspect(nat.w, nat.h, nat.w, nat.h);
+                    resolveEditTargetSize(nat.w, nat.h, nat.w, nat.h, engine.maxDim());
                 const nz = engine.normalizeSize(fit.w, fit.h);
                 if (nz.w != width or nz.h != height)
                     log.info("[image] edit: target {d}x{d} -> {d}x{d} (primary reference is {d}x{d}, size {s})\n", .{ width, height, nz.w, nz.h, nat.w, nat.h, if (size_given) "requested" else "matched to source" });
@@ -2840,6 +2886,47 @@ test "fitAspect keeps the reference's aspect at the requested pixel budget" {
     const odd = fitAspect(1153, 769, 1153, 769);
     try testing.expectEqual(@as(u32, 0), odd.w % 16);
     try testing.expectEqual(@as(u32, 0), odd.h % 16);
+}
+
+test "resolveEditTargetSize keeps the reference's aspect ABOVE the backend cap" {
+    // The bug this pins: `fitAspect` preserved the aspect and then the
+    // per-dimension clamp in `normalizeSize` threw it away again. A 12 MP 4:3
+    // phone photo on a SIZELESS edit (the plain
+    // `client.images.edit(image=…, prompt=…)` call) came back 2048x2048 —
+    // squared off, which is the one thing an editor must never do to its input.
+    const cap: u32 = 2048;
+    const cases = [_][2]u32{
+        .{ 4032, 3024 }, // 12 MP 4:3 landscape
+        .{ 3024, 4032 }, // and portrait
+        .{ 6000, 4000 }, // 24 MP 3:2 DSLR
+        .{ 8192, 8192 }, // huge square: scales, stays square
+    };
+    for (cases) |wh| {
+        const got = resolveEditTargetSize(wh[0], wh[1], wh[0], wh[1], cap);
+        try testing.expect(got.w <= cap and got.h <= cap);
+        try testing.expect(got.w % 16 == 0 and got.h % 16 == 0);
+        // And it must survive `normalizeSize` — that clamp is the step that
+        // actually reintroduced the squash.
+        const nz_w = clampKreaDim(got.w);
+        const nz_h = clampKreaDim(got.h);
+        const src_aspect = @as(f64, @floatFromInt(wh[0])) / @as(f64, @floatFromInt(wh[1]));
+        const out_aspect = @as(f64, @floatFromInt(nz_w)) / @as(f64, @floatFromInt(nz_h));
+        try testing.expect(@abs(src_aspect - out_aspect) / src_aspect < 0.02);
+    }
+    // Below the cap nothing moves: the existing sizeless round-trip is intact.
+    for ([_][2]u32{ .{ 1152, 768 }, .{ 2048, 512 }, .{ 512, 512 } }) |wh| {
+        const same = resolveEditTargetSize(wh[0], wh[1], wh[0], wh[1], cap);
+        try testing.expectEqual(wh[0], same.w);
+        try testing.expectEqual(wh[1], same.h);
+    }
+}
+
+test "maxDim matches what normalizeSize actually clamps to (drift guard)" {
+    // Two places encode the same ceiling. If someone widens a clamp and forgets
+    // maxDim, the edit path silently starts squashing again.
+    try testing.expectEqual(clampFluxDim(99999), ImageEngine.maxDimFor(.flux));
+    try testing.expectEqual(clampKreaDim(99999), ImageEngine.maxDimFor(.krea));
+    try testing.expectEqual(clampKreaDim(99999), ImageEngine.maxDimFor(.mage_flow));
 }
 
 test "Modality.mesh advertises the 3d capability" {

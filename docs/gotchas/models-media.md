@@ -81,3 +81,23 @@ Net effect: every MageFlow checkpoint — including the two official ones, downl
 - **Fix**: `tryAddModel` falls through to `peekConfig` when either config.json OR a MageFlow index is present; `sumComponentWeights` sums one level down, but only when the flat scan found nothing (so the common MLX layout pays nothing); `peekMageFlowIndex` is now `pub` and `cli.zig` calls it instead of keeping its own answer.
 - **Rule**: a new repo LAYOUT (not just a new model_type) has to be taught to every classifier that answers "is this a model?" — currently `model_discovery.tryAddModel`, `model_discovery.peekConfig`, `cli.isModelDir`, and Swift's `existingModelDir`. A layout that only `--model` can load is a layout the app cannot see.
 - **Guards**: `discoverModels finds a MageFlow repo (model_index.json, no root config.json)` (asserts the size too — null was the second facet) and `cli: isModelDir accepts a MageFlow repo`, which also pins that an unrelated diffusers pipeline (`StableDiffusionPipeline`) stays hidden.
+
+### `fitAspect` preserved the aspect; `normalizeSize` threw it away one step later
+Found by pre-merge review of the MageFlow branch (2026-07-25). The edit path already had the right idea: MageFlow edits AT the target grid, so a square request would squash a 3:2 photo, and `fitAspect` was added to reshape the requested size to the primary reference's aspect at the same pixel budget. Its unit test passed. The integration test passed. The geometry was still wrong for most real inputs.
+
+`fitAspect`'s result goes straight into `engine.normalizeSize`, which clamps width and height **independently** through `clampKreaDim` (`[256, 2048]`). Independent clamping is not aspect-preserving. Verified against the real functions:
+
+```
+source    4032x3024  aspect 1.3333      (a 12 MP 4:3 phone photo)
+fitAspect 4032x3024                     (correct — matches the source)
+clamped   2048x2048  aspect 1.0000      (squared off)
+```
+
+So `fitAspect` did its job and the very next call undid it, producing the exact failure it was written to prevent. Reachable through the most ordinary call there is: `client.images.edit(image=…, prompt=…)` with no `size`, on any photo whose long edge exceeds 2048 — which is every modern phone camera.
+
+Why no test caught it: **every fixture was under the cap.** The unit test's "match source" round-trip used `{1152,768}, {2048,512}, {640,1600}, {512,512}`; `tests/test_mageflow_edit.sh` generates a 1152x768 source. Below 2048 the clamp is a no-op, so the composition looks correct from every angle the suite could see. A test suite that only samples inside a threshold cannot see a bug that lives above it.
+
+- **Fix**: `resolveEditTargetSize` = `fitAspect` (aspect at the budget) → `fitWithinCap` (scale BOTH dimensions by one factor until neither exceeds the cap, /16). The cap comes from `ImageEngine.maxDim()`, so the edit path gets the ceiling as a NUMBER to scale toward rather than a clamp to be squared by.
+- **Drift guard**: `maxDimFor` and the clamps encode the same ceiling in two places, so `maxDim matches what normalizeSize actually clamps to` asserts `clampFluxDim(99999) == maxDimFor(.flux)` and the Krea/MageFlow pair. Widening a clamp without touching `maxDim` reintroduces the squash silently, so the drift test is the actual long-term guard.
+- **Rule**: when one step establishes an invariant and a later step re-derives geometry, test the COMPOSITION, not the step. And pick fixtures that straddle every threshold in the pipeline — an all-under-the-cap corpus proves nothing about the cap.
+- **Guards**: `resolveEditTargetSize keeps the reference's aspect ABOVE the backend cap` (4:3 and 3:2 in both orientations, plus a huge square that must stay square, plus the under-cap round-trip so the existing sizeless behavior is pinned unchanged), and `tests/test_mageflow_edit.sh` now also drives a 3024x2016 source and asserts the output is within the cap AND still 3:2. Verified red on revert.

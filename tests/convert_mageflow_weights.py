@@ -215,6 +215,12 @@ def convert_component(src, out, component, bits, edit, keep_bf16, out_name):
 
 
 def copy_support_files(src, out):
+    # Finder litters .DS_Store into any browsed dir and `upload-large-folder`
+    # ships whatever it finds, so sweep before writing. Cheap insurance against
+    # a model card whose file list has junk in it.
+    for junk in glob.glob(os.path.join(out, "**", ".DS_Store"), recursive=True):
+        os.remove(junk)
+
     for component, names in KEEP_FILES.items():
         dst_dir = os.path.join(out, component) if component else out
         os.makedirs(dst_dir, exist_ok=True)
@@ -237,9 +243,12 @@ def copy_support_files(src, out):
 README = """---
 license: mit
 base_model: {base}
+base_model_relation: quantized
+library_name: mlx-serve
 tags:
   - mlx
   - mlx-serve
+  - quantized
   - {pipeline}
 pipeline_tag: {pipeline}
 ---

@@ -71,6 +71,33 @@ d=$(post "{\"prompt\":\"make it winter\",\"mode\":\"edit\",\"image\":\"$SRC_B64\
 grep -q "size matched to source" "$LOG" || { echo "FAIL: no match-to-source log line"; exit 1; }
 echo "PASS: edit without 'size' keeps the source resolution ($d)"
 
+# ── a source ABOVE the backend's 2048 dimension cap keeps its aspect ──
+# Every fixture above is under the cap, so they cannot see the failure this
+# guards: `fitAspect` preserved the aspect and `normalizeSize` then clamped each
+# dimension INDEPENDENTLY, squaring a 4032x3024 phone photo off to 2048x2048.
+# Any real photo lands here, via the plain `client.images.edit(image=…)` call.
+BIG=/tmp/test_mageflow_big.png
+python3 - "$BIG" <<'PY'
+import struct, sys, zlib
+W, H = 3024, 2016  # 3:2, long edge well over the 2048 cap
+row = b"\0" + bytes([200, 120, 60] * W)   # content is irrelevant; only dims are
+def chunk(t, d): return struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d) & 0xffffffff)
+open(sys.argv[1], "wb").write(
+    b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", W, H, 8, 2, 0, 0, 0))
+    + chunk(b"IDAT", zlib.compress(row * H, 1)) + chunk(b"IEND", b""))
+PY
+BIG_B64=$(b64 "$BIG")
+d=$(post "{\"prompt\":\"make it winter\",\"mode\":\"edit\",\"image\":\"$BIG_B64\",\"steps\":4,\"seed\":7,\"safety\":false}")
+case "$d" in ERR*) echo "FAIL: oversized-source edit -> $d"; exit 1;; esac
+python3 - "$d" <<'PY'
+import sys
+ow, oh = (int(v) for v in sys.argv[1].split("x"))
+assert max(ow, oh) <= 2048, f"exceeded the backend cap: {ow}x{oh}"
+assert abs(ow / oh - 3024 / 2016) < 0.05, f"aspect squashed: {ow}x{oh} from a 3:2 source"
+PY
+[ $? -eq 0 ] || exit 1
+echo "PASS: source above the cap scales instead of squashing ($d)"
+
 # ── an explicit size is a BUDGET; the source's aspect ratio still wins ──
 d=$(post "{\"prompt\":\"make it winter\",\"mode\":\"edit\",\"image\":\"$SRC_B64\",\"size\":\"1024x1024\",\"steps\":4,\"seed\":3,\"safety\":false}")
 [ "$d" != "1024x1024" ] || { echo "FAIL: square request squashed a 3:2 reference"; exit 1; }
