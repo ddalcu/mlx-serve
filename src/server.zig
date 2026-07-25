@@ -78,6 +78,7 @@ pub var g_lan_discover: bool = false;
 
 const io_util = @import("io_util.zig");
 const lan_mod = @import("lan.zig");
+const multipart = @import("multipart.zig");
 const ws_mod = @import("ws.zig");
 const ollama_mod = @import("ollama.zig");
 const cli_mod = @import("cli.zig");
@@ -499,6 +500,31 @@ pub fn parseModelFromBody(body: []const u8) ?[]const u8 {
         return body[val_start..pos];
     }
     return null;
+}
+
+/// The requested model id from a request body of EITHER shape.
+///
+/// Every endpoint we serve takes JSON except `/v1/images/edits`, which is
+/// `multipart/form-data` — and model resolution runs BEFORE that route
+/// translates the form to JSON, so a JSON-only scan reads no id and the request
+/// silently falls back to the default model. Live via Open WebUI (2026-07-25):
+/// an edit naming a Mage-Flow model ran against the default CHAT model and 400'd
+/// "Target model does not support this media modality"; on a headless boot with
+/// no default it 503'd "No default model configured" instead. Both existing edit
+/// tests boot with `--model <the image model>`, so the default was always the
+/// right one and neither could see it.
+///
+/// Every consumer of the requested id must go through here, so the LAN gate and
+/// dispatch can't disagree about which model a request names.
+pub fn parseModelFromRequest(body: []const u8, content_type: []const u8) ?[]const u8 {
+    if (multipart.boundaryFromContentType(content_type)) |boundary| {
+        var it = multipart.Iterator.init(body, boundary) catch return null;
+        while (it.next()) |part| {
+            if (std.mem.eql(u8, part.name, "model") and part.data.len > 0) return part.data;
+        }
+        return null;
+    }
+    return parseModelFromBody(body);
 }
 
 /// Module-level capacity for plan 03 hot prefix cache. main.zig writes this
@@ -1317,6 +1343,10 @@ fn handleConnection(
     // Strip query string for route matching (e.g. /v1/messages?beta=true -> /v1/messages)
     const path = if (std.mem.indexOf(u8, raw_path, "?")) |qpos| raw_path[0..qpos] else raw_path;
     const request_body = if (total_read > header_end_pos) request[header_end_pos..total_read] else "";
+    // Needed before model resolution, not just at the handler: `/v1/images/edits`
+    // carries its model in a multipart FIELD, which only the content-type's
+    // boundary lets us find (`parseModelFromRequest`).
+    const request_content_type = findHeaderValue(request[0..header_end_pos], "content-type") orelse "";
     logHttpRequest(method, raw_path, request_body);
 
     // ── API-key auth gate. When --api-key is set, every NON-LOOPBACK request
@@ -1345,7 +1375,7 @@ fn handleConnection(
     //    non-loopback requests already died above and key-holders keep full
     //    access — so this gate only exists in keyless mode.
     if (lanGateApplies(stream)) {
-        if (lanShareDenial(g_lan.?, registry, method, path, request_body, isTunneledRequest(request[0..header_end_pos]))) |denial| {
+        if (lanShareDenial(g_lan.?, registry, method, path, request_body, request_content_type, isTunneledRequest(request[0..header_end_pos]))) |denial| {
             log.debug("{s} {s} -> 403 (lan: {s})\n", .{ method, path, denial });
             try sendErrorResponse(allocator, stream, "403 Forbidden", "forbidden", denial, 403);
             return;
@@ -1473,7 +1503,7 @@ fn handleConnection(
     // names like "gpt-4" or "claude-opus-4-x" expecting the local server to
     // just respond with whatever it has loaded; the multi-model registry's
     // strict-id semantics are opt-in by sending an id we registered.
-    var requested_model_id = parseModelFromBody(request_body) orelse "";
+    var requested_model_id = parseModelFromRequest(request_body, request_content_type) orelse "";
     // ── LAN-discovered remote model (`<id>@<peer>`) → proxy the request to
     //    its host byte-for-byte, model field rewritten to the bare id.
     //    Any DIRECT client may initiate the hop (loopback app, the
@@ -6527,13 +6557,13 @@ fn isTunneledRequest(raw_headers: []const u8) bool {
 /// The effective model resolves exactly like dispatch will (unknown/absent
 /// ids fall back to the default model), so the gate can never disagree with
 /// what would actually run.
-fn lanShareDenial(l: *lan_mod.Lan, registry: *ModelRegistry, method: []const u8, path: []const u8, body: []const u8, tunneled: bool) ?[]const u8 {
+fn lanShareDenial(l: *lan_mod.Lan, registry: *ModelRegistry, method: []const u8, path: []const u8, body: []const u8, content_type: []const u8, tunneled: bool) ?[]const u8 {
     switch (lan_mod.routeClass(method, path)) {
         .open => return null,
         .denied => return "This endpoint is host-local; LAN sharing exposes inference on shared models only",
         .model_gated => {},
     }
-    const mid = parseModelFromBody(body) orelse "";
+    const mid = parseModelFromRequest(body, content_type) orelse "";
     if (lan_mod.splitRemoteId(mid) != null and registry.peek(mid) == null) {
         // A remote (@peer) id from a DIRECT client is allowed — dispatch
         // proxies exactly one hop and the peer's own gate governs its model
@@ -6750,29 +6780,79 @@ test "lanShareDenial: shared inference surface only, resolved like dispatch" {
     }
 
     // Open routes pass with no model check; host-local ones are denied.
-    try std.testing.expect(lanShareDenial(&l, reg, "GET", "/health", "", false) == null);
-    try std.testing.expect(lanShareDenial(&l, reg, "GET", "/v1/models", "", false) == null);
-    try std.testing.expect(lanShareDenial(&l, reg, "OPTIONS", "/v1/messages", "", false) == null);
-    try std.testing.expect(lanShareDenial(&l, reg, "POST", "/v1/load-model", "{}", false) != null);
-    try std.testing.expect(lanShareDenial(&l, reg, "GET", "/metrics", "", false) != null);
-    try std.testing.expect(lanShareDenial(&l, reg, "GET", "/", "", false) != null);
+    try std.testing.expect(lanShareDenial(&l, reg, "GET", "/health", "", "application/json", false) == null);
+    try std.testing.expect(lanShareDenial(&l, reg, "GET", "/v1/models", "", "application/json", false) == null);
+    try std.testing.expect(lanShareDenial(&l, reg, "OPTIONS", "/v1/messages", "", "application/json", false) == null);
+    try std.testing.expect(lanShareDenial(&l, reg, "POST", "/v1/load-model", "{}", "application/json", false) != null);
+    try std.testing.expect(lanShareDenial(&l, reg, "GET", "/metrics", "", "application/json", false) != null);
+    try std.testing.expect(lanShareDenial(&l, reg, "GET", "/", "", "application/json", false) != null);
 
     // Shared model allowed; unshared denied — on chat AND media surfaces.
-    try std.testing.expect(lanShareDenial(&l, reg, "POST", "/v1/chat/completions", "{\"model\":\"gemma-4-e4b-it-4bit\"}", false) == null);
-    try std.testing.expect(lanShareDenial(&l, reg, "POST", "/v1/chat/completions", "{\"model\":\"qwen3.6-27b\"}", false) != null);
-    try std.testing.expect(lanShareDenial(&l, reg, "POST", "/v1/images/generations", "{\"model\":\"qwen3.6-27b\"}", false) != null);
+    try std.testing.expect(lanShareDenial(&l, reg, "POST", "/v1/chat/completions", "{\"model\":\"gemma-4-e4b-it-4bit\"}", "application/json", false) == null);
+    try std.testing.expect(lanShareDenial(&l, reg, "POST", "/v1/chat/completions", "{\"model\":\"qwen3.6-27b\"}", "application/json", false) != null);
+    try std.testing.expect(lanShareDenial(&l, reg, "POST", "/v1/images/generations", "{\"model\":\"qwen3.6-27b\"}", "application/json", false) != null);
 
     // Omitted / unknown ids resolve to the default model exactly like
     // dispatch will — here the default is shared, so both pass.
-    try std.testing.expect(lanShareDenial(&l, reg, "POST", "/v1/chat/completions", "{}", false) == null);
-    try std.testing.expect(lanShareDenial(&l, reg, "POST", "/v1/messages", "{\"model\":\"gpt-4\"}", false) == null);
+    try std.testing.expect(lanShareDenial(&l, reg, "POST", "/v1/chat/completions", "{}", "application/json", false) == null);
+    try std.testing.expect(lanShareDenial(&l, reg, "POST", "/v1/messages", "{\"model\":\"gpt-4\"}", "application/json", false) == null);
 
     // @peer ids: a DIRECT client (not tunneled) may initiate the single hop —
     // the old blanket deny also 403'd the agent-sandbox guest, which reaches
     // this host over the VM NAT interface (live 2026-07-21). A request that
     // ARRIVED through a peer's tunnel never hops again (the multi-hop bound).
-    try std.testing.expect(lanShareDenial(&l, reg, "POST", "/v1/messages", "{\"model\":\"x@peer\"}", false) == null);
-    try std.testing.expect(lanShareDenial(&l, reg, "POST", "/v1/messages", "{\"model\":\"x@peer\"}", true) != null);
+    try std.testing.expect(lanShareDenial(&l, reg, "POST", "/v1/messages", "{\"model\":\"x@peer\"}", "application/json", false) == null);
+    try std.testing.expect(lanShareDenial(&l, reg, "POST", "/v1/messages", "{\"model\":\"x@peer\"}", "application/json", true) != null);
+
+    // `/v1/images/edits` is model_gated but its body is multipart, so a
+    // JSON-only scan reads NO id and every edit silently gets default-model
+    // semantics — the gate would then disagree with what dispatch runs, which
+    // is the one thing this function promises it never does.
+    const mp_ct = "multipart/form-data; boundary=B";
+    const mp_unshared = "--B\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nqwen3.6-27b\r\n--B--\r\n";
+    const mp_shared = "--B\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\ngemma-4-e4b-it-4bit\r\n--B--\r\n";
+    try std.testing.expect(lanShareDenial(&l, reg, "POST", "/v1/images/edits", mp_unshared, mp_ct, false) != null);
+    try std.testing.expect(lanShareDenial(&l, reg, "POST", "/v1/images/edits", mp_shared, mp_ct, false) == null);
+}
+
+test "parseModelFromRequest reads the model out of a multipart form, not just JSON" {
+    // `/v1/images/edits` is the ONE endpoint whose body is multipart, and model
+    // resolution runs BEFORE the route translates that form to JSON. A JSON-only
+    // scan finds no `"model":` key, so the request silently ran against the
+    // DEFAULT model: live via Open WebUI (2026-07-25) an edit naming a Mage-Flow
+    // model hit the default chat model and 400'd "Target model does not support
+    // this media modality"; headless with no default it 503'd instead.
+    const ct = "multipart/form-data; boundary=abc123";
+    // aiohttp (Open WebUI's client) writes the scalar fields first, each with
+    // its own Content-Type line, and the file part last.
+    const body =
+        "--abc123\r\nContent-Type: text/plain; charset=utf-8\r\n" ++
+        "Content-Disposition: form-data; name=\"model\"\r\n\r\nddalcu/Mage-Flow-Edit-Turbo-MLX-Serve-8bit\r\n" ++
+        "--abc123\r\nContent-Type: text/plain; charset=utf-8\r\n" ++
+        "Content-Disposition: form-data; name=\"prompt\"\r\n\r\nmake it winter\r\n" ++
+        "--abc123\r\nContent-Disposition: form-data; name=\"image\"; filename=\"i.png\"\r\n" ++
+        "Content-Type: image/png\r\n\r\n\x89PNG\r\n\x1a\n\x00\r\n--abc123--\r\n";
+    try std.testing.expectEqualStrings(
+        "ddalcu/Mage-Flow-Edit-Turbo-MLX-Serve-8bit",
+        parseModelFromRequest(body, ct) orelse "",
+    );
+
+    // A form with no `model` part is "use the default", same as JSON.
+    const no_model = "--abc123\r\nContent-Disposition: form-data; name=\"prompt\"\r\n\r\nhi\r\n--abc123--\r\n";
+    try std.testing.expect(parseModelFromRequest(no_model, ct) == null);
+    // An empty value is not an id either (aiohttp sends str(None) as "None",
+    // but an unset field arrives empty).
+    const empty = "--abc123\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\n\r\n--abc123--\r\n";
+    try std.testing.expect(parseModelFromRequest(empty, ct) == null);
+
+    // JSON bodies are untouched — same answers as the JSON-only scanner, for
+    // every other endpoint we serve.
+    try std.testing.expectEqualStrings("m1", parseModelFromRequest("{\"model\":\"m1\"}", "application/json") orelse "");
+    try std.testing.expectEqualStrings("m1", parseModelFromRequest("{\"model\":\"m1\"}", "") orelse "");
+    try std.testing.expect(parseModelFromRequest("{\"prompt\":\"x\"}", "application/json") == null);
+    // A multipart content-type with a JSON body (or a truncated form) degrades
+    // to "no id" rather than misreading one.
+    try std.testing.expect(parseModelFromRequest("{\"model\":\"m1\"}", ct) == null);
 }
 
 test "isTunneledRequest keys on the lan.tunnel marker header, case-insensitive" {

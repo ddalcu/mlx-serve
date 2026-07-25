@@ -338,6 +338,16 @@ inline fn meanAxes(x: mlx.mlx_array, axes: []const c_int, keepdims: bool, s: S) 
     try mlx.check(mlx.mlx_mean_axes(&o, x, axes.ptr, axes.len, keepdims, s));
     return o;
 }
+/// `x[lo:hi:st]`, materialized. Every slicing helper in this file routes here so
+/// the intermediate handle exists in exactly ONE place: a slice left alive holds
+/// its PARENT's buffer, so wrapping it in `contiguous` and forgetting to free it
+/// retains the whole source — correct output, ~47 MB lost per DiT block.
+fn sliceContig(x: mlx.mlx_array, lo: []const c_int, hi: []const c_int, st: []const c_int, s: S) !mlx.mlx_array {
+    var o = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(o);
+    try mlx.check(mlx.mlx_slice(&o, x, lo.ptr, lo.len, hi.ptr, hi.len, st.ptr, st.len, s));
+    return contig(o, s);
+}
 /// conv2d on NHWC; weight OHWI f32; optional bias [O]; `groups` for depthwise.
 fn conv2d(x: mlx.mlx_array, w: mlx.mlx_array, bias: ?mlx.mlx_array, stride: c_int, pad: c_int, groups: c_int, s: S) !mlx.mlx_array {
     const xc = try contig(x, s);
@@ -1687,9 +1697,7 @@ fn cropHW(x: mlx.mlx_array, h: c_int, wd: c_int, s: S) !mlx.mlx_array {
     const lo = [_]c_int{ 0, 0, 0, 0 };
     const hi = [_]c_int{ sh[0], h, wd, sh[3] };
     const st = [_]c_int{ 1, 1, 1, 1 };
-    var o = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_slice(&o, x, &lo, 4, &hi, 4, &st, 4, s));
-    return contig(o, s);
+    return sliceContig(x, &lo, &hi, &st, s);
 }
 fn expandDim1(x: mlx.mlx_array, s: S) !mlx.mlx_array {
     var o = mlx.mlx_array_new();
@@ -2326,8 +2334,8 @@ pub const Dit = struct {
             const res = try self.ditBlock(blk, img, txt, temb, cos, sin, mask, Ltxt);
             _ = mlx.mlx_array_free(img);
             _ = mlx.mlx_array_free(txt);
-            txt = res[0];
-            img = res[1];
+            img = res.img;
+            txt = res.txt;
         }
         defer _ = mlx.mlx_array_free(txt);
         defer _ = mlx.mlx_array_free(img);
@@ -2400,7 +2408,7 @@ pub const Dit = struct {
         sin: mlx.mlx_array,
         mask: ?mlx.mlx_array,
         Ltxt: c_int,
-    ) ![2]mlx.mlx_array {
+    ) !StreamPair {
         const s = self.s;
         const st = try silu(temb, s);
         defer _ = mlx.mlx_array_free(st);
@@ -2432,9 +2440,9 @@ pub const Dit = struct {
         defer _ = mlx.mlx_array_free(tmod1.gate);
 
         const attn = try jointAttn(&bw.attn, imod1.hidden, tmod1.hidden, cos, sin, mask, Ltxt, s);
-        const img_attn = attn[0];
+        const img_attn = attn.img;
         defer _ = mlx.mlx_array_free(img_attn);
-        const txt_attn = attn[1];
+        const txt_attn = attn.txt;
         defer _ = mlx.mlx_array_free(txt_attn);
 
         const img_g1 = try gateAdd(img, imod1.gate, img_attn, s);
@@ -2461,9 +2469,14 @@ pub const Dit = struct {
         defer _ = mlx.mlx_array_free(txt_ff);
         const txt_out = try gateAdd(txt_g1, tmod2.gate, txt_ff, s);
 
-        return .{ txt_out, img_out }; // (encoder_hidden_states, hidden_states)
+        return .{ .img = img_out, .txt = txt_out };
     }
 };
+
+/// The two streams a double-stream DiT carries. Named rather than a `[2]` tuple:
+/// `jointAttn` and `ditBlock` used to return the same pair in OPPOSITE orders,
+/// which is where a caller-owns mistake hides in plain sight.
+const StreamPair = struct { img: mlx.mlx_array, txt: mlx.mlx_array };
 
 const ModOut = struct { hidden: mlx.mlx_array, gate: mlx.mlx_array };
 /// _modulate: split mod[B,3C] → shift,scale,gate; return (h*(1+scale)+shift, gate).
@@ -2566,7 +2579,7 @@ fn applyRope(x: mlx.mlx_array, cos: mlx.mlx_array, sin: mlx.mlx_array, s: S) !ml
     defer _ = mlx.mlx_array_free(flat);
     return astype(flat, in_dt, s);
 }
-fn jointAttn(aw: *const DitAttnW, img_in: mlx.mlx_array, txt_in: mlx.mlx_array, cos: mlx.mlx_array, sin: mlx.mlx_array, mask: ?mlx.mlx_array, Ltxt: c_int, s: S) ![2]mlx.mlx_array {
+fn jointAttn(aw: *const DitAttnW, img_in: mlx.mlx_array, txt_in: mlx.mlx_array, cos: mlx.mlx_array, sin: mlx.mlx_array, mask: ?mlx.mlx_array, Ltxt: c_int, s: S) !StreamPair {
     // Image q/k/v.
     const iq0 = try aw.qw.forward(img_in, aw.qb, s);
     defer _ = mlx.mlx_array_free(iq0);
@@ -2633,7 +2646,7 @@ fn jointAttn(aw: *const DitAttnW, img_in: mlx.mlx_array, txt_in: mlx.mlx_array, 
     defer _ = mlx.mlx_array_free(img_slice);
     const txt_out = try aw.aow.forward(txt_slice, aw.aob, s);
     const img_out = try aw.ow.forward(img_slice, aw.ob, s);
-    return .{ img_out, txt_out };
+    return .{ .img = img_out, .txt = txt_out };
 }
 /// concat([txt, img], axis=1) then transpose to [B, H, seq, D].
 fn concatHeadsFirst(txt: mlx.mlx_array, img: mlx.mlx_array, s: S) !mlx.mlx_array {
@@ -2646,9 +2659,7 @@ fn sliceSeq(x: mlx.mlx_array, start: c_int, stop: c_int, s: S) !mlx.mlx_array {
     const lo = [_]c_int{ 0, start, 0 };
     const hi = [_]c_int{ sh[0], stop, sh[2] };
     const st = [_]c_int{ 1, 1, 1 };
-    var o = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_slice(&o, x, &lo, 3, &hi, 3, &st, 3, s));
-    return contig(o, s);
+    return sliceContig(x, &lo, &hi, &st, s);
 }
 /// Additive attention mask [B,1,1,Ltxt+Limg] from a [B,Ltxt] keep-mask.
 fn buildDitMask(txt_mask: mlx.mlx_array, Limg: c_int, s: S) !mlx.mlx_array {
@@ -3250,9 +3261,7 @@ fn sliceLast3(x: mlx.mlx_array, start: c_int, end: c_int, s: S) !mlx.mlx_array {
     const lo = [_]c_int{ 0, 0, start };
     const hi = [_]c_int{ sh[0], sh[1], end };
     const st = [_]c_int{ 1, 1, 1 };
-    var o = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_slice(&o, x, &lo, 3, &hi, 3, &st, 3, s));
-    return contig(o, s);
+    return sliceContig(x, &lo, &hi, &st, s);
 }
 
 /// One ViT block: h += attn(norm1(h)); h += mlp(norm2(h)) (gelu-tanh MLP).
@@ -3357,9 +3366,7 @@ fn sliceSeq3(x: mlx.mlx_array, start: c_int, end: c_int, s: S) !mlx.mlx_array {
     const lo = [_]c_int{ start, 0, 0 };
     const hi = [_]c_int{ end, sh[1], sh[2] };
     const st = [_]c_int{ 1, 1, 1 };
-    var o = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_slice(&o, x, &lo, 3, &hi, 3, &st, 3, s));
-    return contig(o, s);
+    return sliceContig(x, &lo, &hi, &st, s);
 }
 
 /// Patch merger: (optional post-shuffle) LayerNorm → reshape 4-token group →
@@ -3831,9 +3838,7 @@ fn sliceLastAxis(x: mlx.mlx_array, start: c_int, end: c_int, s: S) !mlx.mlx_arra
     const lo = [_]c_int{ 0, 0, 0, start };
     const hi = [_]c_int{ sh[0], sh[1], sh[2], end };
     const st = [_]c_int{ 1, 1, 1, 1 };
-    var o = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_slice(&o, x, &lo, 4, &hi, 4, &st, 4, s));
-    return contig(o, s);
+    return sliceContig(x, &lo, &hi, &st, s);
 }
 
 /// Slice the sequence axis of hidden states [1, seq, C] → [1, end-start, C].
@@ -3842,9 +3847,7 @@ fn sliceTeSeq(x: mlx.mlx_array, start: c_int, end: c_int, s: S) !mlx.mlx_array {
     const lo = [_]c_int{ 0, start, 0 };
     const hi = [_]c_int{ sh[0], end, sh[2] };
     const st = [_]c_int{ 1, 1, 1 };
-    var o = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_slice(&o, x, &lo, 3, &hi, 3, &st, 3, s));
-    return contig(o, s);
+    return sliceContig(x, &lo, &hi, &st, s);
 }
 
 // ── Tests ──
@@ -4461,6 +4464,72 @@ test "normalizeDim floors to /16 with a 16px minimum" {
     try testing.expectEqual(@as(u32, 16), normalizeDim(0));
     try testing.expectEqual(@as(u32, 16), normalizeDim(15));
     try testing.expectEqual(@as(u32, 512), normalizeDim(519));
+}
+
+/// Live MLX bytes a helper failed to give back over `iters` calls.
+///
+/// The class this measures is a materializing helper that wraps an intermediate
+/// handle (`mlx_slice` into `o`, then `contiguous(o)`) and never frees `o`: the
+/// output is correct, every parity fixture passes, and the retained bytes only
+/// show up as a footprint that climbs per generation. No output-equality test
+/// can see it — only the accounting can.
+///
+/// The input is rebuilt and freed INSIDE each iteration, because a retained
+/// slice handle keeps its PARENT's buffer alive — a caller-owned source that
+/// outlives the call hides the whole class.
+fn retainedBytes(
+    comptime call: anytype,
+    data: []const f32,
+    shape: []const c_int,
+    tail_args: anytype,
+    iters: usize,
+) !usize {
+    const once = struct {
+        fn run(d: []const f32, sh: []const c_int, tail: anytype) !void {
+            const parent = mlx.mlx_array_new_data(d.ptr, sh.ptr, @intCast(sh.len), .float32);
+            defer _ = mlx.mlx_array_free(parent);
+            const r = try @call(.auto, call, .{parent} ++ tail);
+            defer _ = mlx.mlx_array_free(r);
+            try mlx.check(mlx.mlx_array_eval(r)); // force the buffers to exist
+        }
+    }.run;
+
+    // Warm-up: the first calls pay one-time kernel/allocator setup, which is
+    // not retention.
+    for (0..2) |_| try once(data, shape, tail_args);
+    var before: usize = 0;
+    try mlx.check(mlx.mlx_get_active_memory(&before));
+    for (0..iters) |_| try once(data, shape, tail_args);
+    var after: usize = 0;
+    try mlx.check(mlx.mlx_get_active_memory(&after));
+    return if (after > before) after - before else 0;
+}
+
+test "materializing helpers hand back every array they take" {
+    const a = testing.allocator;
+    const s = mlx.mlx_default_gpu_stream_new();
+
+    // 16 KB of source, big enough that a retained slice is unmistakable
+    // against allocator noise, reshaped 3-D or 4-D per helper.
+    const v = try a.alloc(f32, 2 * 64 * 32);
+    defer a.free(v);
+    for (v, 0..) |*x, i| x.* = @floatFromInt(i % 13);
+    const sh3 = [_]c_int{ 2, 64, 32 };
+    const sh4 = [_]c_int{ 2, 4, 16, 32 };
+
+    const n: usize = 8;
+    // Every helper that slices and materializes, across the DiT, text-encoder,
+    // ViT and VAE paths — one leaking site is one leak per block per step.
+    try testing.expectEqual(@as(usize, 0), try retainedBytes(sliceSeq, v, &sh3, .{ 8, 56, s }, n));
+    try testing.expectEqual(@as(usize, 0), try retainedBytes(sliceSeq3, v, &sh3, .{ 0, 1, s }, n));
+    try testing.expectEqual(@as(usize, 0), try retainedBytes(sliceLast3, v, &sh3, .{ 4, 28, s }, n));
+    try testing.expectEqual(@as(usize, 0), try retainedBytes(sliceTeSeq, v, &sh3, .{ 8, 56, s }, n));
+    try testing.expectEqual(@as(usize, 0), try retainedBytes(sliceLastAxis, v, &sh4, .{ 4, 28, s }, n));
+    try testing.expectEqual(@as(usize, 0), try retainedBytes(cropHW, v, &sh4, .{ 3, 12, s }, n));
+    // Controls on the same shapes: a harness that reported retention for
+    // everything would fail here too.
+    try testing.expectEqual(@as(usize, 0), try retainedBytes(contig, v, &sh3, .{s}, n));
+    try testing.expectEqual(@as(usize, 0), try retainedBytes(astype, v, &sh3, .{ mlx.mlx_dtype.bfloat16, s }, n));
 }
 
 test "packLatents/unpackLatents round-trip is identity" {

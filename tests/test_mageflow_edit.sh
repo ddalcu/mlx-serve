@@ -133,4 +133,35 @@ d=json.load(sys.stdin); png=base64.b64decode(d["data"][0]["b64_json"]); print("%
 [ "$d" = "$SRC_DIMS" ] || { echo "FAIL: /v1/images/edits returned $d (want $SRC_DIMS)"; exit 1; }
 echo "PASS: OpenAI /v1/images/edits (no size) -> source resolution ($d)"
 
-echo "ALL PASS: Mage-Flow-Edit (detection, match-source, aspect budget, multi-ref, honest 400s, OpenAI surface)"
+# ── the multipart 'model' FIELD must select the model ──
+# Model resolution runs BEFORE the route translates the form to JSON, so a
+# JSON-only scan found no `"model":` key and every edit silently got
+# default-model semantics. Live via Open WebUI (2026-07-25): an edit naming a
+# Mage-Flow model ran against the default CHAT model and 400'd "does not support
+# this media modality"; headless with no default it 503'd "No default model
+# configured". Everything above boots with `--model $MODEL`, so the default is
+# ALREADY the model under test and none of it can see this class — this section
+# needs a server with NO default, where the id has to come from the form.
+MODEL_ROOT="$(cd "$MODEL/../.." && pwd)"
+MODEL_ID="$(basename "$(dirname "$MODEL")")/$(basename "$MODEL")"
+HPORT=$((PORT + 40))
+"$BIN" --serve --port "$HPORT" --model-dir "$MODEL_ROOT" >/tmp/test_mageflow_edit_headless.log 2>&1 &
+HSRV=$!
+for i in $(seq 1 180); do
+  curl -sf "http://127.0.0.1:$HPORT/health" >/dev/null 2>&1 && break
+  kill -0 $HSRV 2>/dev/null || { echo "FAIL: headless server did not start"; exit 1; }
+  sleep 1
+done
+hcode=$(curl -s -o /tmp/test_mageflow_edit_headless_body.json -w '%{http_code}' --max-time 900 \
+  -X POST "http://127.0.0.1:$HPORT/v1/images/edits" \
+  -F "model=$MODEL_ID" -F "prompt=make it winter" -F "image=@$SRC;type=image/png")
+kill $HSRV 2>/dev/null
+[ "$hcode" = "200" ] || {
+  echo "FAIL: edit naming '$MODEL_ID' on a server with no default returned $hcode (want 200)"
+  echo "      503 = the form's 'model' field was ignored and it fell back to the default"
+  head -c 300 /tmp/test_mageflow_edit_headless_body.json; echo
+  exit 1
+}
+echo "PASS: /v1/images/edits loads the model named in the form (no default configured)"
+
+echo "ALL PASS: Mage-Flow-Edit (detection, match-source, aspect budget, multi-ref, honest 400s, OpenAI surface, form-named model)"
