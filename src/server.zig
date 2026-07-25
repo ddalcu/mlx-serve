@@ -1448,6 +1448,18 @@ fn handleConnection(
         try sendResponse(stream, "200 OK", "application/json", "{\"status\":\"ok\"}");
         return;
     }
+    // The console. It belongs here, above resolution, for the same reason
+    // /v1/models does: it IS the model picker, so it has to render before
+    // anything is loaded. Dispatched after resolution it rendered one
+    // *LoadedModel and a headless boot (`mlx-serve serve`, and every
+    // app-launched server) answered 503 "No default model configured" at the
+    // root — the first page a person opens. Everything it used to render from
+    // the model it now fetches from /v1/models + /props client-side.
+    if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/")) {
+        log.debug("GET  / -> 200 (console)\n", .{});
+        try handleStatusPage(allocator, stream);
+        return;
+    }
     // Prometheus scrape endpoint. 503 when --metrics is off. Behind the global
     // API-key gate above when --api-key is set (auth already enforced here).
     if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/metrics")) {
@@ -1689,10 +1701,7 @@ fn handleConnection(
         return;
     }
 
-    if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/")) {
-        log.debug("GET  / -> 200 (status page)\n", .{});
-        try handleStatusPage(allocator, stream, lm);
-    } else if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/props")) {
+    if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/props")) {
         log.debug("GET  /props -> 200\n", .{});
         try handleProps(allocator, stream, lm);
     } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/chat/completions")) {
@@ -3371,97 +3380,44 @@ fn handlePropsNoModel(allocator: std.mem.Allocator, stream: *Conn) !void {
     try sendResponse(stream, "200 OK", "application/json", body);
 }
 
-/// Render the human-friendly landing page at `GET /`. Lists the API
-/// surface (OpenAI Chat + Responses, Anthropic Messages, embeddings,
-/// utility endpoints) and the loaded model's key facts. No JS, no
-/// external assets — single self-contained document.
-fn handleStatusPage(
-    allocator: std.mem.Allocator,
-    stream: *Conn,
-    lm: *LoadedModel,
-) !void {
-    const config = lm.config.?;
-    const chat_config = lm.chat_config.?;
-
-    // Memory + capabilities
-    var active_mem: usize = 0;
-    var peak_mem: usize = 0;
-    _ = mlx.mlx_get_active_memory(&active_mem);
-    _ = mlx.mlx_get_peak_memory(&peak_mem);
-    const ctx_len = getEffectiveContextLength(config);
-    const has_chat = readyHasChat(
-        config.is_encoder_only,
-        chat_config.chat_template.len,
-        lm.ds4_engine != null or lm.llama_engine != null,
-    );
-    const has_vision = lm.vision_encoder != null;
-    const has_reasoning = has_chat and chatTemplateSupportsThinking(chat_config.chat_template);
-
-    const model_id: []const u8 = if (lm.id.len > 0) lm.id else config.model_type;
-    const model_id_esc = try htmlEscape(allocator, model_id);
-    defer allocator.free(model_id_esc);
-    const arch_esc = try htmlEscape(allocator, config.model_type);
-    defer allocator.free(arch_esc);
+/// Render the built-in console at `GET /`: a chat playground, image
+/// generate/edit and audio tools, the live metrics panel, and the full API
+/// reference. Self-contained — no external assets, no CDN.
+///
+/// Takes NO model. Everything model-shaped (the picker, capabilities, memory)
+/// is fetched client-side from `/v1/models` + `/props`, which is what lets the
+/// page render on a server with nothing loaded — the default boot mode — and
+/// what makes the picker follow loads/unloads without a refresh.
+fn handleStatusPage(allocator: std.mem.Allocator, stream: *Conn) !void {
     const version_esc = try htmlEscape(allocator, build_options.version);
     defer allocator.free(version_esc);
 
-    // Capability pills
-    var caps_buf = std.ArrayList(u8).empty;
-    defer caps_buf.deinit(allocator);
-    if (has_chat) try caps_buf.appendSlice(allocator, "<span class=cap>chat</span>");
-    if (has_chat) try caps_buf.appendSlice(allocator, "<span class=cap>tool use</span>");
-    if (has_chat) try caps_buf.appendSlice(allocator, "<span class=cap>streaming</span>");
-    if (has_chat) try caps_buf.appendSlice(allocator, "<span class=cap>json schema</span>");
-    if (has_vision) try caps_buf.appendSlice(allocator, "<span class=cap>vision</span>");
-    if (has_reasoning) try caps_buf.appendSlice(allocator, "<span class=cap>reasoning</span>");
-    if (config.is_encoder_only) try caps_buf.appendSlice(allocator, "<span class=cap>embeddings</span>");
-
-    const mem_mb: usize = active_mem / (1024 * 1024);
-    const peak_mb: usize = peak_mem / (1024 * 1024);
-
     // Optional live-metrics panel: a mount div + the polling script (which also
-    // carries the panel markup and injects it into the mount). Rendered into the
-    // `{s}` slot right after the "Loaded model" card — but ONLY when --metrics is
-    // on. Off ⇒ empty string, so the page is byte-identical to before. This is a
-    // runtime `{s}` arg, so the JS may contain raw `{`/`}` — std.fmt does not
-    // re-parse it (which is exactly why the panel/JS can't live inline in the
-    // std.fmt-formatted index.html).
+    // carries the panel markup and injects it into the mount). Rendered into
+    // the header's `{s}` slot — but ONLY when --metrics is on; off ⇒ empty
+    // string, so nothing polls a 503 feed.
     const METRICS_SECTION = "\n<div id=mlx-metrics></div>\n<script>\n" ++ @embedFile("html/metrics.js") ++ "\n</script>\n";
     const metrics_section: []const u8 = if (g_metrics != null) METRICS_SECTION else "";
 
-    // The page template lives in src/html/index.html (@embedFile resolves
-    // relative to this source file, so no build.zig change). It is a std.fmt
-    // format string: `{{`/`}}` are literal braces in the <style> block; the
-    // `{s}`/`{d}` slots below fill in model fields, the metrics section, the
-    // curl port + model, and the footer — in this exact order.
+    // The page lives in src/html/index.html (@embedFile resolves relative to
+    // this source file, so no build.zig change) and is a std.fmt FORMAT
+    // STRING: every literal `{`/`}` in it must be doubled. That is exactly why
+    // the CSS and JS are separate files injected as RUNTIME `{s}` args —
+    // std.fmt does not re-parse a runtime argument, so app.css/app.js/
+    // metrics.js can be ordinary CSS and JavaScript. Don't inline them back.
     const body = try std.fmt.allocPrint(allocator, @embedFile("html/index.html"), .{
-        // <title>
-        model_id_esc,
-        // version
+        // <title> version
         version_esc,
-        // model card
-        model_id_esc,
-        arch_esc,
-        config.quant_bits,
-        config.quant_group_size,
-        config.num_hidden_layers,
-        config.hidden_size,
-        config.num_attention_heads,
-        config.num_key_value_heads,
-        config.head_dim,
-        config.vocab_size,
-        ctx_len,
-        config.max_position_embeddings,
-        mem_mb,
-        peak_mb,
-        caps_buf.items,
+        // <style> — src/html/app.css
+        @embedFile("html/app.css"),
+        // header version
+        version_esc,
         // optional live-metrics panel (empty when --metrics is off)
         metrics_section,
-        // curl example
+        // curl example port
         global_port,
-        model_id_esc,
-        // footer
-        model_id_esc,
+        // <script> — src/html/app.js
+        @embedFile("html/app.js"),
     });
     defer allocator.free(body);
     try sendResponse(stream, "200 OK", "text/html; charset=utf-8", body);
@@ -6920,6 +6876,27 @@ test "ROUTE_PATHS covers every path the dispatch chain compares (drift guard)" {
     }
     // The scan itself must not silently find nothing.
     try std.testing.expect(checked >= 30);
+}
+
+test "the index page documents every endpoint the server serves (drift guard)" {
+    // The API reference on `GET /` is hand-written prose, so it drifts the
+    // moment a route ships without someone remembering the page: it documented
+    // 22 of 31 endpoints and had silently omitted the ENTIRE Ollama `/api/*`
+    // surface (nine paths) since that surface was added. "Are we missing
+    // endpoints?" has to be a test, not an inspection.
+    //
+    // Same shape as the ROUTE_PATHS↔dispatch-chain guard above: two lists that
+    // must agree, checked against the file rather than trusted.
+    const page = @embedFile("html/index.html");
+    for (ROUTE_PATHS) |p| {
+        // "/" is the page itself — trivially present and not worth documenting
+        // as an endpoint row.
+        if (std.mem.eql(u8, p, "/")) continue;
+        if (std.mem.indexOf(u8, page, p) == null) {
+            std.debug.print("endpoint missing from the index page: {s}\n", .{p});
+            return error.EndpointNotDocumented;
+        }
+    }
 }
 
 test "parseModelFromRequest reads the model out of a multipart form, not just JSON" {

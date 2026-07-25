@@ -24,6 +24,45 @@ const ollama = @import("ollama.zig");
 const model_discovery = @import("model_discovery.zig");
 const log = @import("log.zig");
 
+// ── Unparsed-argument reporting ─────────────────────────────────────────
+
+/// Why main.zig's flag loop could not consume an argument.
+///
+/// The loop matches every flag by EXACT name and reads its value from the
+/// NEXT argv slot, and it used to end with no else branch at all — so a
+/// misspelled flag, or the `--flag=value` shape it never accepted, was
+/// dropped in silence. That is the worst possible outcome for a launcher: the
+/// flag parses as far as the user can tell, `--help` documents it, and the
+/// server boots clean while ignoring what was asked for. Rejecting loudly is
+/// the whole point; the variants exist only to make the message actionable.
+pub const ArgReject = enum {
+    /// `--model=/path` — value welded to the flag name.
+    equals_form,
+    /// A flag in the LAST argv slot, so its value never arrived.
+    missing_value,
+    /// Not a flag we know.
+    unknown,
+
+    /// Trailing advice for the error message. Never empty.
+    pub fn hint(self: ArgReject) []const u8 {
+        return switch (self) {
+            .equals_form => "flags take their value as a separate argument (--model <path>, not --model=<path>)",
+            .missing_value => "this flag expects a value after it, or it is misspelled",
+            .unknown => "see --help for the flag list",
+        };
+    }
+};
+
+/// Classify an argument the flag loop fell through on. `is_last` is true when
+/// it occupied the final argv slot — the only way a known value-taking flag
+/// can reach the else branch (every such arm is guarded on `i + 1 < args.len`).
+pub fn classifyUnparsedArg(arg: []const u8, is_last: bool) ArgReject {
+    const is_flag = std.mem.startsWith(u8, arg, "-");
+    if (is_flag and std.mem.indexOfScalar(u8, arg, '=') != null) return .equals_form;
+    if (is_flag and is_last) return .missing_value;
+    return .unknown;
+}
+
 // ── Alias table ─────────────────────────────────────────────────────────
 
 pub const Alias = struct {
@@ -1035,4 +1074,35 @@ test "cli: isModelDir accepts a MageFlow repo (model_index.json, no config.json)
     var org = try tmp.dir.openDir(io, "org", .{ .iterate = true });
     defer org.close(io);
     try testing.expect(!isModelDir(io, a, &org));
+}
+
+test "cli: an unparsed argument is classified, never silently ignored" {
+    // `--flag=value`: main.zig's flag loop matches names EXACTLY and takes the
+    // value as the NEXT argument, so the '='-joined form is not a near-miss,
+    // it is a shape we have never accepted. It used to fall out of the loop in
+    // silence — `--model=<path>` booted a healthy-looking headless server that
+    // then auto-picked a different model and crashed on it.
+    try testing.expectEqual(ArgReject.equals_form, classifyUnparsedArg("--model=/tmp/m", false));
+    try testing.expectEqual(ArgReject.equals_form, classifyUnparsedArg("--port=1234", false));
+    // Even in last position the '=' hint is the useful one.
+    try testing.expectEqual(ArgReject.equals_form, classifyUnparsedArg("--model=/tmp/m", true));
+
+    // A flag in the LAST position fell out because its value is missing —
+    // the loop's `i + 1 < args.len` guard is the only way to reach here.
+    try testing.expectEqual(ArgReject.missing_value, classifyUnparsedArg("--model", true));
+    try testing.expectEqual(ArgReject.missing_value, classifyUnparsedArg("-h", true));
+
+    // Anything else is simply not a flag we know.
+    try testing.expectEqual(ArgReject.unknown, classifyUnparsedArg("--frobnicate", false));
+    try testing.expectEqual(ArgReject.unknown, classifyUnparsedArg("stray", false));
+    // An '=' outside a flag is not the equals form.
+    try testing.expectEqual(ArgReject.unknown, classifyUnparsedArg("a=b", false));
+    try testing.expectEqual(ArgReject.unknown, classifyUnparsedArg("a=b", true));
+
+    // Every reason carries actionable advice, and the equals-form one names
+    // the shape that actually works.
+    for ([_]ArgReject{ .equals_form, .missing_value, .unknown }) |r| {
+        try testing.expect(r.hint().len > 0);
+    }
+    try testing.expect(std.mem.indexOf(u8, ArgReject.equals_form.hint(), "separate argument") != null);
 }

@@ -76,7 +76,7 @@ const GDN_KERNEL_SOURCE =
     \\  }
     \\  out = simd_sum(out);
     \\  if (thread_index_in_simdgroup == 0) {
-    \\    y[dv_idx] = static_cast<InT>(out);
+    \\    y[dv_idx] = static_cast<OutT>(out);
     \\  }
     \\  q_ += Hk * Dk;
     \\  k_ += Hk * Dk;
@@ -179,7 +179,7 @@ const GDN_KERNEL_SEQ_SOURCE =
     \\  }
     \\  out = simd_sum(out);
     \\  if (thread_index_in_simdgroup == 0) {
-    \\    y[dv_idx] = static_cast<InT>(out);
+    \\    y[dv_idx] = static_cast<OutT>(out);
     \\  }
     \\  if (t + 1 < T) {
     \\    auto t_state = state_seq + t * seq_stride + seq_base;
@@ -243,8 +243,10 @@ fn getGdnKernelSeq() !mlx.mlx_fast_metal_kernel {
 // threadgroup). Anything else — and decode (T==1), PLD/MTP verify, and the
 // per-position-state capture path — stays on the stock kernels.
 // Kill switch: MLX_SERVE_GDN_BLOCKED=0; block size: MLX_SERVE_GDN_BLOCK_T
-// (16|32|48, default 32 for bf16 — Metal's 32 KiB threadgroup limit
-// governs; fp32 inputs would need 16, but our GDN inputs are always bf16).
+// (16|32|48, default 32 for bf16 — Metal's 32 KiB threadgroup limit governs,
+// and it is a function of the INPUT WIDTH, not a constant: fp32 activations
+// stage twice the bytes and clamp to 16 via gdnBlockTFor. GDN inputs are NOT
+// always bf16 — an f16 checkpoint promotes its activations to f32).
 
 /// Test seam: forces the blocked-prefill route on/off without the environment.
 pub var gdn_blocked_override: ?bool = null;
@@ -270,6 +272,41 @@ pub fn gdnBlockedEligible(seq_len: c_int, dk: c_int, dv: c_int, num_k_heads: c_i
     if (dv < 32 or @rem(dv, 32) != 0) return false;
     if (num_k_heads <= 0 or @rem(num_v_heads, num_k_heads) != 0) return false;
     return true;
+}
+
+/// Metal's threadgroup memory budget per threadgroup on Apple GPUs. The
+/// blocked kernel stages k/q/v in threadgroup memory, so this is a HARD cap on
+/// TB x input width — exceed it and the kernel does not compile.
+const METAL_TG_BYTES: usize = 32 * 1024;
+
+/// Threadgroup bytes the blocked kernel stages per TB-token block:
+/// `k_s`+`q_s` [TB][Dk+8] and `v_s` [TB][DB+8] at the input width, plus the
+/// `g_s`/`b_s` [TB] f32 rows. Mirrors the declarations in
+/// GDN_KERNEL_BLOCKED_BODY — change one, change the other.
+pub fn gdnBlockedTgBytes(tb: u32, dk: c_int, in_elem_size: usize) usize {
+    const DB: usize = 32; // dv rows per threadgroup
+    const t: usize = tb;
+    const k: usize = @intCast(dk);
+    return t * (2 * (k + 8) * in_elem_size + (DB + 8) * in_elem_size + 2 * @sizeOf(f32));
+}
+
+/// Largest supported block size <= `requested` whose staging fits the budget
+/// at this input width, or null when even the smallest does not (decline the
+/// blocked route and stay on the stock kernel).
+///
+/// The width is NOT a constant: bf16 and f16 checkpoints stage 2 bytes and
+/// keep the requested size, but an f16 checkpoint promotes its activations to
+/// f32 (f16 (x) f32-scalar -> f32), and at 4 bytes TB=32 needs 40 KiB. Block
+/// size and input dtype are therefore ONE decision — picking them apart is how
+/// a valid-looking config produces a kernel that cannot compile.
+pub fn gdnBlockTFor(requested: u32, dk: c_int, in_elem_size: usize) ?u32 {
+    var best: ?u32 = null;
+    for (GDN_BLOCKED_TBS) |cand| {
+        if (cand > requested) continue;
+        if (gdnBlockedTgBytes(cand, dk, in_elem_size) > METAL_TG_BYTES) continue;
+        if (best == null or cand > best.?) best = cand;
+    }
+    return best;
 }
 
 const GDN_BLOCKED_TBS = [_]u32{ 16, 32, 48 };
@@ -318,9 +355,9 @@ const GDN_KERNEL_BLOCKED_BODY =
     \\threadgroup float g_s[TB];
     \\threadgroup float b_s[TB];
     \\
-    \\const device InT* k_base = k + ((size_t)b * T * Hk + hk) * Dk;
-    \\const device InT* q_base = q + ((size_t)b * T * Hk + hk) * Dk;
-    \\const device InT* v_base = v + ((size_t)b * T * Hv + hv) * Dv + dv0;
+    \\auto k_base = k + ((size_t)b * T * Hk + hk) * Dk;
+    \\auto q_base = q + ((size_t)b * T * Hk + hk) * Dk;
+    \\auto v_base = v + ((size_t)b * T * Hv + hv) * Dv + dv0;
     \\const size_t krow = (size_t)Hk * Dk;
     \\
     \\// state fragment in registers: [dv0+dvr][d0..d0+16]
@@ -331,19 +368,19 @@ const GDN_KERNEL_BLOCKED_BODY =
     \\    for (int i = 0; i < 4; ++i) st[i] = float4(S_in[i]);
     \\}
     \\
-    \\device InT* y_base = y + ((size_t)b * T * Hv + hv) * Dv + dv0;
+    \\device OutT* y_base = y + ((size_t)b * T * Hv + hv) * Dv + dv0;
     \\
     \\for (int t0 = 0; t0 < T; t0 += TB) {
     \\    const int tt = min(TB, T - t0);
     \\    // cooperative staging (coalesced): k/q rows, v slice, g/beta
     \\    for (int p = tid; p < tt * Dk; p += 256) {
     \\        const int r = p / Dk, d = p % Dk;
-    \\        k_s[r][d] = k_base[(size_t)(t0 + r) * krow + d];
-    \\        q_s[r][d] = q_base[(size_t)(t0 + r) * krow + d];
+    \\        k_s[r][d] = static_cast<InT>(k_base[(size_t)(t0 + r) * krow + d]);
+    \\        q_s[r][d] = static_cast<InT>(q_base[(size_t)(t0 + r) * krow + d]);
     \\    }
     \\    for (int p = tid; p < tt * DB; p += 256) {
     \\        const int r = p / DB, d = p % DB;
-    \\        v_s[r][d] = v_base[(size_t)(t0 + r) * Hv * Dv + d];
+    \\        v_s[r][d] = static_cast<InT>(v_base[(size_t)(t0 + r) * Hv * Dv + d]);
     \\    }
     \\    for (int p = tid; p < tt; p += 256) {
     \\        g_s[p] = (float)g[((size_t)b * T + t0 + p) * Hv + hv];
@@ -384,7 +421,7 @@ const GDN_KERNEL_BLOCKED_BODY =
     \\        out += simd_shuffle_down(out, 2);
     \\        out += simd_shuffle_down(out, 1);
     \\        if (seg == 0) {
-    \\            y_base[(size_t)(t0 + t) * Hv * Dv + dvr] = (InT)out;
+    \\            y_base[(size_t)(t0 + t) * Hv * Dv + dvr] = static_cast<OutT>(out);
     \\        }
     \\    }
     \\    threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -9246,6 +9283,19 @@ pub const Transformer = struct {
 
         const y_shape = [_]c_int{ batch, seq_len, num_v_heads, dv };
 
+        // The kernels specialize on the ACTUAL widths, never an assumed one.
+        // bf16 checkpoints land here as bf16, but an f16 checkpoint promotes
+        // its activations to f32 (f16 ⊕ f32-scalar → f32) and a hardcoded
+        // bf16 pointer type then fails to COMPILE, which is an uncatchable
+        // MLX error that kills the server mid-request. `g`/`beta` are read
+        // through their raw buffer names with an explicit float cast, so they
+        // are width-agnostic and need no template arg. Outputs are ours: we
+        // declare y and the state buffers bf16, so OutT/StT follow that
+        // declaration rather than the input.
+        const gdn_in_dtype = mlx.mlx_array_dtype(q_scaled);
+        const gdn_in_itemsize = mlx.mlx_array_itemsize(q_scaled);
+        const gdn_state_dtype = mlx.mlx_array_dtype(ssm.ssm_state);
+
         const config = mlx.mlx_fast_metal_kernel_config_new();
         defer _ = mlx.mlx_fast_metal_kernel_config_free(config);
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &y_shape, 4, .bfloat16));
@@ -9264,8 +9314,9 @@ pub const Transformer = struct {
             try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &state_out_shape, 4, .bfloat16));
             try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, 32, dv, batch * num_v_heads));
             try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 32, 4, 1));
-            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "InT", .bfloat16));
-            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "StT", .bfloat16));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "InT", gdn_in_dtype));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "StT", gdn_state_dtype));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "OutT", .bfloat16));
             try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "Dk", dk));
             try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "Dv", dv));
             try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "Hk", num_k_heads));
@@ -9305,8 +9356,16 @@ pub const Transformer = struct {
             // geometry (oMLX port, ~2x per GDN layer at 16K). Decode (T==1),
             // spec verify widths, and off-geometry shapes keep the stock
             // per-token kernel; the PLD capture path above is untouched.
-            const use_blocked = gdnBlockedEnabled() and gdnBlockedEligible(seq_len, dk, dv, num_k_heads, num_v_heads);
-            if (use_blocked) {
+            // Block size and input width are ONE decision: the staging arrays
+            // are declared in the input dtype, so fp32 activations need a
+            // smaller TB to fit the threadgroup budget. A null means even the
+            // smallest block overflows — decline and stay on the stock kernel
+            // rather than emit a kernel that cannot compile.
+            const blocked_tb: ?u32 = if (gdnBlockedEnabled() and gdnBlockedEligible(seq_len, dk, dv, num_k_heads, num_v_heads))
+                gdnBlockTFor(gdnBlockT(), dk, gdn_in_itemsize)
+            else
+                null;
+            if (blocked_tb) |_| {
                 // Grid: (256*(Dv/32), Hv, B) threads; threadgroup (256,1,1).
                 try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, 256 * @divExact(dv, 32), num_v_heads, batch));
                 try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 256, 1, 1));
@@ -9315,8 +9374,9 @@ pub const Transformer = struct {
                 try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, 32, dv, batch * num_v_heads));
                 try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 32, 4, 1));
             }
-            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "InT", .bfloat16));
-            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "StT", .bfloat16));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "InT", gdn_in_dtype));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "StT", gdn_state_dtype));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "OutT", .bfloat16));
             try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "Dk", dk));
             try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "Dv", dv));
             try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "Hk", num_k_heads));
@@ -9326,7 +9386,7 @@ pub const Transformer = struct {
             const inputs_vec = mlx.mlx_vector_array_new_data(&inputs_arr, inputs_arr.len);
             defer _ = mlx.mlx_vector_array_free(inputs_vec);
 
-            const gdn_kernel = if (use_blocked) try getGdnKernelBlocked(gdnBlockT()) else try getGdnKernel();
+            const gdn_kernel = if (blocked_tb) |tb| try getGdnKernelBlocked(tb) else try getGdnKernel();
             var outputs_vec = mlx.mlx_vector_array_new();
             defer _ = mlx.mlx_vector_array_free(outputs_vec);
             try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, gdn_kernel, inputs_vec, config, self.s));
@@ -14022,6 +14082,7 @@ fn gdnTestRun(comptime seq: bool, q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 32, 4, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "InT", .bfloat16));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "StT", .bfloat16));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "OutT", .bfloat16));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "Dk", Dk));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "Dv", Dv));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "Hk", Hk));
@@ -14210,6 +14271,7 @@ fn gdnTestRunSeqAt(q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, g: mlx.
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 32, 4, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "InT", .bfloat16));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "StT", .bfloat16));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "OutT", .bfloat16));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "Dk", Dk));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "Dv", Dv));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "Hk", Hk));
@@ -14310,7 +14372,12 @@ const GdnRunOut = struct { y: mlx.mlx_array, state: mlx.mlx_array };
 
 /// Run the GDN recurrence via the stock single-state kernel (blocked=false)
 /// or the blocked-seq prefill kernel (blocked=true) and return BOTH outputs.
-fn gdnRunYState(blocked: bool, tb: u32, q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, g: mlx.mlx_array, beta: mlx.mlx_array, state_in: mlx.mlx_array, B: c_int, T: c_int, Hk: c_int, Hv: c_int, Dk: c_int, Dv: c_int, s: mlx.mlx_stream) !GdnRunOut {
+fn gdnRunYState(blocked: bool, tb_requested: u32, q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, g: mlx.mlx_array, beta: mlx.mlx_array, state_in: mlx.mlx_array, B: c_int, T: c_int, Hk: c_int, Hv: c_int, Dk: c_int, Dv: c_int, s: mlx.mlx_stream) !GdnRunOut {
+    // Mirror the production route exactly: dtypes read off the arrays, block
+    // size clamped to what the staging budget allows at that width.
+    const in_dtype = mlx.mlx_array_dtype(q);
+    const st_dtype = mlx.mlx_array_dtype(state_in);
+    const tb = gdnBlockTFor(tb_requested, Dk, mlx.mlx_array_itemsize(q)) orelse return error.GdnBlockedDeclined;
     const T_scalar = mlx.mlx_array_new_int(T);
     defer _ = mlx.mlx_array_free(T_scalar);
     const y_shape = [_]c_int{ B, T, Hv, Dv };
@@ -14326,8 +14393,9 @@ fn gdnRunYState(blocked: bool, tb: u32, q: mlx.mlx_array, k: mlx.mlx_array, v: m
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, 32, Dv, B * Hv));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 32, 4, 1));
     }
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "InT", .bfloat16));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "StT", .bfloat16));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "InT", in_dtype));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "StT", st_dtype));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "OutT", .bfloat16));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "Dk", Dk));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "Dv", Dv));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "Hk", Hk));
@@ -14366,7 +14434,11 @@ fn maxAbsDiff(a: []const f32, b: []const f32) f32 {
     return m;
 }
 
-const GdnCase = struct { B: c_int, T: c_int, Hk: c_int, Hv: c_int, Dv: c_int, tb: u32 };
+/// `in_dtype` is the ACTIVATION width q/k/v arrive in. bf16 is the common
+/// case; an f16 checkpoint promotes its activations to f32 (f16 ⊕ f32 scalar),
+/// which is a different kernel specialization AND a different threadgroup
+/// budget — both covered by the sweep below.
+const GdnCase = struct { B: c_int, T: c_int, Hk: c_int, Hv: c_int, Dv: c_int, tb: u32, in_dtype: mlx.mlx_dtype = .bfloat16 };
 
 /// Runs one geometry through host ref + stock + blocked and asserts the
 /// blocked kernel is no less accurate than the stock kernel it replaces.
@@ -14437,14 +14509,19 @@ fn gdnBlockedParityCase(case: GdnCase, s: mlx.mlx_stream) !void {
     defer _ = mlx.mlx_array_free(beta);
     var st = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(st);
-    try mlx.check(mlx.mlx_astype(&q, q32, .bfloat16, s));
-    try mlx.check(mlx.mlx_astype(&kk, k32, .bfloat16, s));
-    try mlx.check(mlx.mlx_astype(&v, v32, .bfloat16, s));
+    // Mirrors the live dtype signature: q/k/v/beta follow the ACTIVATION width
+    // (bf16 checkpoints stay bf16; f16 checkpoints promote to f32), `g` is
+    // always bf16 because it comes out of our fused gate kernel, and the SSM
+    // state buffer is always bf16 because we allocate it that way. The mixed
+    // set is the point — the kernel must read each input at its own width.
+    try mlx.check(mlx.mlx_astype(&q, q32, case.in_dtype, s));
+    try mlx.check(mlx.mlx_astype(&kk, k32, case.in_dtype, s));
+    try mlx.check(mlx.mlx_astype(&v, v32, case.in_dtype, s));
     try mlx.check(mlx.mlx_astype(&g, g32, .bfloat16, s));
-    try mlx.check(mlx.mlx_astype(&beta, b32, .bfloat16, s));
+    try mlx.check(mlx.mlx_astype(&beta, b32, case.in_dtype, s));
     try mlx.check(mlx.mlx_astype(&st, st32, .bfloat16, s));
 
-    const stock = try gdnRunYState(false, 0, q, kk, v, g, beta, st, B, T, Hk, Hv, Dk, Dv, s);
+    const stock = try gdnRunYState(false, 16, q, kk, v, g, beta, st, B, T, Hk, Hv, Dk, Dv, s);
     defer _ = mlx.mlx_array_free(stock.y);
     defer _ = mlx.mlx_array_free(stock.state);
     const blocked = try gdnRunYState(true, case.tb, q, kk, v, g, beta, st, B, T, Hk, Hv, Dk, Dv, s);
@@ -14485,6 +14562,15 @@ test "GDN blocked-seq kernel: no worse than stock vs f64 ground truth (T/GQA/Dv/
         .{ .B = 2, .T = 64, .Hk = 1, .Hv = 2, .Dv = 32, .tb = 32 }, // batch>1, minimal Dv
         .{ .B = 1, .T = 65, .Hk = 1, .Hv = 2, .Dv = 64, .tb = 16 }, // TB=16 variant, ragged tail 1
         .{ .B = 1, .T = 49, .Hk = 2, .Hv = 2, .Dv = 32, .tb = 48 }, // TB=48 variant, ragged tail 1
+        // fp32 activations (f16 checkpoints promote to them — the geometry
+        // that killed the server on prism-ml/Ternary-Bonsai-27B-mlx-2bit).
+        // The kernel must specialize on the real width AND clamp the block
+        // size to fit the doubled staging; requesting 32/48 exercises both.
+        .{ .B = 1, .T = 100, .Hk = 2, .Hv = 4, .Dv = 128, .tb = 32, .in_dtype = .float32 },
+        .{ .B = 1, .T = 49, .Hk = 2, .Hv = 2, .Dv = 32, .tb = 48, .in_dtype = .float32 },
+        .{ .B = 2, .T = 64, .Hk = 1, .Hv = 2, .Dv = 64, .tb = 16, .in_dtype = .float32 },
+        // f16 activations: same 2-byte staging as bf16, different kernel.
+        .{ .B = 1, .T = 100, .Hk = 2, .Hv = 4, .Dv = 64, .tb = 32, .in_dtype = .float16 },
     };
     for (cases) |case| try gdnBlockedParityCase(case, s);
 }
@@ -14631,6 +14717,34 @@ test "GDN blocked-seq kernel: chunk-boundary state continuity (split run == full
     const part2_y = try evalToF32(al, part2.y, n2, s);
     defer al.free(part2_y);
     try testing.expect(maxAbsDiff(tail_f, part2_y) < tol);
+}
+
+test "gdnBlockTFor: the block size follows the INPUT WIDTH, not a bf16 assumption" {
+    // bf16/f16 stage 2 bytes — every supported block size fits, so the
+    // requested one stands.
+    try testing.expectEqual(@as(?u32, 16), gdnBlockTFor(16, 128, 2));
+    try testing.expectEqual(@as(?u32, 32), gdnBlockTFor(32, 128, 2));
+    try testing.expectEqual(@as(?u32, 48), gdnBlockTFor(48, 128, 2));
+
+    // fp32 activations (what an f16 checkpoint promotes to) stage 4 bytes:
+    // TB=32 needs ~40 KiB and TB=48 ~60 KiB, both past Metal's 32 KiB
+    // threadgroup budget, so each clamps DOWN rather than emitting a kernel
+    // that fails to compile and takes the server with it.
+    try testing.expectEqual(@as(?u32, 16), gdnBlockTFor(16, 128, 4));
+    try testing.expectEqual(@as(?u32, 16), gdnBlockTFor(32, 128, 4));
+    try testing.expectEqual(@as(?u32, 16), gdnBlockTFor(48, 128, 4));
+
+    // The staging budget the clamp is derived from — pinned so a change to
+    // the kernel's threadgroup declarations has to come here too.
+    try testing.expect(gdnBlockedTgBytes(48, 128, 2) <= METAL_TG_BYTES);
+    try testing.expect(gdnBlockedTgBytes(16, 128, 4) <= METAL_TG_BYTES);
+    try testing.expect(gdnBlockedTgBytes(32, 128, 4) > METAL_TG_BYTES);
+
+    // Nothing fits at all → decline the blocked route (null), never fall
+    // through to an over-budget dispatch.
+    try testing.expectEqual(@as(?u32, null), gdnBlockTFor(48, 128, 16));
+    // A request below the smallest supported block declines too.
+    try testing.expectEqual(@as(?u32, null), gdnBlockTFor(8, 128, 2));
 }
 
 test "gdnBlockedEligible: width floor + exact-128 Dk + Dv/head-group alignment" {

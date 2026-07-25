@@ -3,54 +3,83 @@
 <head>
 <meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">
-<title>mlx-serve — {s}</title>
+<!-- Inline, so the front page doesn't 404 on /favicon.ico for every visitor. -->
+<link rel=icon href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ccircle cx='16' cy='16' r='11' fill='%2310b981'/%3E%3C/svg%3E">
+<title>mlx-serve {s}</title>
 <style>
-*{{box-sizing:border-box}}
-body{{margin:0;font:14px/1.5 ui-sans-serif,system-ui,-apple-system,"SF Pro Text",Inter,sans-serif;background:#0b0d10;color:#e6e9ee}}
-.wrap{{max-width:880px;margin:0 auto;padding:32px 20px 64px}}
-h1{{margin:0 0 4px;font-size:22px;font-weight:600;letter-spacing:-.01em}}
-h1 .ver{{color:#7d8794;font-weight:400;font-size:14px;margin-left:8px}}
-.sub{{color:#7d8794;margin-bottom:28px}}
-.dot{{display:inline-block;width:8px;height:8px;border-radius:50%;background:#10b981;margin-right:6px;vertical-align:middle;box-shadow:0 0 0 4px rgba(16,185,129,.15)}}
-h2{{font-size:12px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:#9aa4b2;margin:24px 0 10px}}
-.card{{background:#13161b;border:1px solid #1f242c;border-radius:10px;padding:14px 16px;margin-bottom:10px}}
-.row{{display:flex;justify-content:space-between;gap:12px;padding:6px 0;border-bottom:1px solid #1a1e25}}
-.row:last-child{{border-bottom:0}}
-.row .k{{color:#9aa4b2}}
-.row .v{{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:#e6e9ee}}
-.caps{{display:flex;flex-wrap:wrap;gap:6px;margin-top:6px}}
-.cap{{background:#1a2330;color:#86b8ff;border:1px solid #1f3a5f;border-radius:999px;padding:2px 10px;font-size:12px}}
-.ep{{display:grid;grid-template-columns:60px 1fr;gap:12px;align-items:center;padding:8px 0;border-bottom:1px solid #1a1e25}}
-.ep:last-child{{border-bottom:0}}
-.ep .m{{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;font-weight:600;letter-spacing:.04em;text-align:center;border-radius:4px;padding:2px 0}}
-.m.get{{background:#173d33;color:#7ee2b8}}
-.m.post{{background:#1c2e57;color:#86b8ff}}
-.m.del{{background:#3d1d23;color:#ff95a8}}
-.m.ws{{background:#3a2a4d;color:#caa6ff}}
-.ep .p{{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:#e6e9ee}}
-.ep .d{{color:#7d8794;font-size:13px;margin-top:2px}}
-code{{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;background:#1a1e25;color:#86b8ff;padding:1px 6px;border-radius:4px;font-size:12px}}
-pre{{background:#13161b;border:1px solid #1f242c;border-radius:8px;padding:12px;overflow-x:auto;font-size:12px;color:#cfd6df}}
-a{{color:#86b8ff;text-decoration:none}}
-a:hover{{text-decoration:underline}}
-footer{{margin-top:36px;color:#5b6470;font-size:12px;text-align:center}}
-</style></head><body>
-<div class=wrap>
-<h1><span class=dot></span>mlx-serve<span class=ver>v{s}</span></h1>
-<div class=sub>Native MLX inference for Apple Silicon</div>
-
-<h2>Loaded model</h2>
-<div class=card>
-<div class=row><span class=k>id</span><span class=v>{s}</span></div>
-<div class=row><span class=k>architecture</span><span class=v>{s}</span></div>
-<div class=row><span class=k>quantization</span><span class=v>{d}-bit (group {d})</span></div>
-<div class=row><span class=k>layers · hidden · heads</span><span class=v>{d} · {d} · {d}/{d}kv</span></div>
-<div class=row><span class=k>head dim · vocab</span><span class=v>{d} · {d}</span></div>
-<div class=row><span class=k>context length</span><span class=v>{d} tokens (model max {d})</span></div>
-<div class=row><span class=k>GPU memory</span><span class=v>{d} MB active · {d} MB peak</span></div>
-<div class=caps>{s}</div>
-</div>
 {s}
+</style></head><body>
+<div class=app id=app>
+
+<!-- ══ Sidebar ═══════════════════════════════════════════════════════════ -->
+<aside class=side>
+<div class=side-head>
+<span class=logo></span><span class=wordmark>mlx-serve</span>
+<button class=side-toggle id=side-toggle title="Hide sidebar" aria-label="Hide sidebar"></button>
+</div>
+
+<nav class=nav>
+<button class="nav-item" data-tab="chat" id=nav-new><span class="ic ic-new"></span>New chat</button>
+<button class="nav-item" data-tab="monitor"><span class="ic ic-monitor"></span>Monitor</button>
+<button class="nav-item" data-tab="api"><span class="ic ic-api"></span>API</button>
+</nav>
+
+<div class=recents>
+<div class=recents-h>Recents</div>
+<div id=recent-list></div>
+</div>
+
+<div class=side-foot>
+<div><span class=dot></span>v{s}</div>
+<div class=stat id=hdr-models>…</div>
+<div class=stat id=hdr-mem>…</div>
+</div>
+</aside>
+
+<!-- ══ Main ══════════════════════════════════════════════════════════════ -->
+<main class=main>
+<button class=side-open id=side-open title="Show sidebar" aria-label="Show sidebar"></button>
+
+<!-- ── Chat ──────────────────────────────────────────────────────────── -->
+<section class="panel active" id=tab-chat>
+<div class=chat id=chat-empty>
+<h1 class=greeting>What's on your mind?</h1>
+</div>
+
+<div class=log id=chat-log></div>
+
+<div class=dock id=chat-dock>
+<div class=attached id=chat-attached></div>
+<div class=composer>
+<label class=plus for=chat-files title="Attach an image">
+<input id=chat-files type=file accept="image/*" multiple hidden></label>
+<textarea id=chat-input rows=1 placeholder="Ask anything, or ask for an image, a song, an edit…"></textarea>
+<button class=pill id=chat-model aria-haspopup=true>
+<span id=chat-model-name>model</span><span class=chev></span></button>
+<button class=send id=chat-send title="Send" aria-label="Send"></button>
+<button class=send stop id=chat-stop title="Stop" aria-label="Stop" hidden></button>
+</div>
+<div class=disclaimer id=chat-tools>Runs entirely on this Mac. Models can make mistakes.</div>
+</div>
+
+<div class=menu id=model-menu hidden></div>
+</section>
+
+<!-- ── Monitor ───────────────────────────────────────────────────────── -->
+<section class=panel id=tab-monitor>
+<div class=scroll>
+{s}
+<h2>Models</h2>
+<div class=card>
+<table class=models id=mon-models><tbody></tbody></table>
+</div>
+</div>
+</section>
+
+<!-- ── API ───────────────────────────────────────────────────────────── -->
+<section class=panel id=tab-api>
+<div class=scroll>
+
 <h2>OpenAI Chat Completions</h2>
 <div class=card>
 <div class=ep><span class="m post">POST</span><div><div class=p>/v1/chat/completions</div><div class=d>Streaming and non-streaming · tool calling · JSON mode · vision (when supported)</div></div></div>
@@ -69,6 +98,19 @@ footer{{margin-top:36px;color:#5b6470;font-size:12px;text-align:center}}
 <h2>Anthropic Messages</h2>
 <div class=card>
 <div class=ep><span class="m post">POST</span><div><div class=p>/v1/messages</div><div class=d>Claude SDK / Claude Code compatible · stream &amp; non-stream · tool use · thinking blocks</div></div></div>
+</div>
+
+<h2>Ollama</h2>
+<div class=card>
+<div class=ep><span class="m post">POST</span><div><div class=p>/api/chat</div><div class=d>Ollama chat · NDJSON stream (default on) · tool calls · images · <code>think</code></div></div></div>
+<div class=ep><span class="m post">POST</span><div><div class=p>/api/generate</div><div class=d>Ollama completion · templated or <code>raw</code></div></div></div>
+<div class=ep><span class="m get">GET</span><div><div class=p><a href=/api/tags>/api/tags</a></div><div class=d>List local models (<code>ollama list</code>)</div></div></div>
+<div class=ep><span class="m post">POST</span><div><div class=p>/api/show</div><div class=d>Model details, template and parameters</div></div></div>
+<div class=ep><span class="m get">GET</span><div><div class=p><a href=/api/ps>/api/ps</a></div><div class=d>Models currently resident in memory</div></div></div>
+<div class=ep><span class="m post">POST</span><div><div class=p>/api/pull</div><div class=d>Download a model from Hugging Face · NDJSON progress</div></div></div>
+<div class=ep><span class="m get">GET</span><div><div class=p><a href=/api/version>/api/version</a></div><div class=d>Version string (clients probe this to detect an Ollama server)</div></div></div>
+<div class=ep><span class="m post">POST</span><div><div class=p>/api/embed</div><div class=d>Embeddings, current shape (<code>input</code> string or array)</div></div></div>
+<div class=ep><span class="m post">POST</span><div><div class=p>/api/embeddings</div><div class=d>Embeddings, legacy shape (<code>prompt</code>)</div></div></div>
 </div>
 
 <h2>Embeddings &amp; utilities</h2>
@@ -96,17 +138,24 @@ footer{{margin-top:36px;color:#5b6470;font-size:12px;text-align:center}}
 
 <h2>Discovery</h2>
 <div class=card>
-<div class=ep><span class="m get">GET</span><div><div class=p><a href=/v1/models>/v1/models</a></div><div class=d>OpenAI models list (id, capabilities, context length)</div></div></div>
+<div class=ep><span class="m get">GET</span><div><div class=p><a href=/v1/models>/v1/models</a></div><div class=d>OpenAI models list (id, capabilities, context length) — this console's model picker</div></div></div>
 <div class=ep><span class="m get">GET</span><div><div class=p><a href=/props>/props</a></div><div class=d>llama.cpp-style server props (chat template, memory)</div></div></div>
 <div class=ep><span class="m get">GET</span><div><div class=p><a href=/health>/health</a></div><div class=d>Liveness probe</div></div></div>
 <div class=ep><span class="m get">GET</span><div><div class=p><a href=/metrics>/metrics</a></div><div class=d>Prometheus metrics, text exposition format (enable with <code>--metrics</code>)</div></div></div>
-<div class=ep><span class="m get">GET</span><div><div class=p><a href=/metrics.json>/metrics.json</a></div><div class=d>Metrics as JSON — drives the live panel above (enable with <code>--metrics</code>)</div></div></div>
+<div class=ep><span class="m get">GET</span><div><div class=p><a href=/metrics.json>/metrics.json</a></div><div class=d>Metrics as JSON — drives the Monitor panel (enable with <code>--metrics</code>)</div></div></div>
 </div>
 
 <h2>Quick start</h2>
 <pre>curl http://localhost:{d}/v1/chat/completions \
   -H 'Content-Type: application/json' \
-  -d '&#123;"model":"{s}","messages":[&#123;"role":"user","content":"hello"&#125;]&#125;'</pre>
+  -d '&#123;"model":"<span id=curl-model>your-model-id</span>","messages":[&#123;"role":"user","content":"hello"&#125;]&#125;'</pre>
 
-<footer>mlx-serve · serving <code>{s}</code></footer>
-</div></body></html>
+</div>
+</section>
+
+</main>
+</div>
+<script>
+{s}
+</script>
+</body></html>

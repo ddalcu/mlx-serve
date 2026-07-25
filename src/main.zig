@@ -74,7 +74,7 @@ fn printUsage(io: std.Io) void {
         \\                      (every pulled model loads on demand by name)
         \\
         \\Options:
-        \\  --model <dir>       Path to MLX model directory (required)
+        \\  --model <dir>       Path to MLX model directory
         \\  --serve             Start HTTP server mode
         \\  --host <ip>         Bind address (default: 0.0.0.0)
         \\  --port <n>          Bind port (default: 11234)
@@ -685,6 +685,16 @@ pub fn main(init: std.process.Init) !void {
                 log.err("--kv-attn-mode: expected 'dense' or 'fused'; got '{s}'\n", .{args[i]});
                 std.process.exit(1);
             }
+        } else {
+            // Nothing above consumed it. This loop used to end here with no
+            // else at all, so an unrecognized argument was dropped in SILENCE
+            // — `--model=<path>` (the '='-joined form none of the arms match)
+            // booted a clean-looking headless server that then auto-picked
+            // some other model. A launcher that ignores what it was asked for
+            // is worse than one that refuses to start.
+            const reason = cli_mod.classifyUnparsedArg(args[i], i + 1 == args.len);
+            log.err("unrecognized argument '{s}' — {s}\n", .{ args[i], reason.hint() });
+            std.process.exit(1);
         }
     }
 

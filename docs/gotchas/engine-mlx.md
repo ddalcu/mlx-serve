@@ -190,3 +190,91 @@ return contig(o, s);   // `o` is never freed
 - **Fix**: one `sliceContig(x, lo, hi, st, s)` owns the intermediate (`defer mlx_array_free(o)` before `return contig(o, s)`), and all six helpers delegate to it — the pattern now exists in exactly ONE place. Numerics are untouched: the same seed produces a **byte-identical PNG** before and after. `krea.zig`/`flux.zig` were already correct (`defer free(out); return contig(out, s)`), which is why only MageFlow leaked.
 - **Rule**: a helper that materializes a view owns the view — free the intermediate, don't just wrap it. `mlx_clear_cache` is NOT the fix for this class (that's the cache-growth one above); if `active_bytes` itself climbs, you are holding handles. Prefer one shared slice-and-materialize helper per file over N hand-rolled copies: this shipped six times in one file because each site was written independently.
 - Guards: `tests/test_media_gen_memory.sh` (varies the size-driving shape across generations — a fixed-size replay cannot separate a leak from size-keyed caching — and asserts three load/gen/unload cycles return to the pre-load baseline; red-on-revert at +3.18 GB across four generations) and the hermetic `materializing helpers hand back every array they take` in mage_flow.zig, which calls each helper with a source built and freed INSIDE the loop and asserts `mlx_get_active_memory` returns to baseline. **The input must be rebuilt per iteration**: a caller-owned source that outlives the call keeps the parent alive anyway, and the first version of that test passed against the broken code for exactly that reason.
+
+## GDN blocked-prefill kernel: hardcoded bf16 vs an f16 checkpoint (2026-07-25)
+
+`./mlx-serve --serve --model=~/.mlx-serve/models/…/Nanbeige…` died mid-request with
+
+```
+MLX error: [metal::Device] Unable to build metal library from source
+utils.h:476:19: error: cannot initialize a variable of type 'const device bfloat *'
+                       with an rvalue of type 'const device float *'
+const device InT* k_base = k + ((size_t)b * T * Hk + hk) * Dk;
+```
+
+Two independent bugs stacked, and the first hid the second.
+
+**It was not the model in the command.** `main.zig`'s flag loop takes values as a
+separate argv token, so `--model=<path>` matched nothing and was silently
+dropped (see docs/gotchas/server-http.md). The server went headless, and on the
+first request auto-picked `prism-ml/Ternary-Bonsai-27B-mlx-2bit` as the default
+chat model. That is what crashed. Nanbeige never loaded at all — its
+`model_type` is `nanbeige`, which discovery already skips.
+
+**The crash: the checkpoint is F16, not bf16.**
+
+```
+dtype histogram: {'U32': 498, 'F16': 1682}
+```
+
+Every other GDN model we serve is bf16. With f16 weights the activations get
+promoted to fp32 (f16 ⊕ f32-scalar → f32, the `scalarLike` class), which the
+mangled kernel name states outright — the input dtype list reads
+`float float float bfloat16_t float bfloat16_t int32_t` for
+q,k,v,g,beta,state_in,T. So q/k/v/beta are fp32 while `g` (our fused gate
+kernel's output) and the state buffer stay bf16: a genuinely MIXED input set.
+
+`transformer.zig` hardcoded `add_template_arg_dtype(config, "InT", .bfloat16)`
+at five sites, and the blocked kernel body hand-declared
+`const device InT* k_base = …` off it. fp32 buffer, bf16 pointer, compile
+failure — and an MLX compile failure is not a Zig error, it aborts the process.
+One request took the server down for every client.
+
+The comment above the kernel had predicted the whole thing and then dismissed it:
+
+> block size: MLX_SERVE_GDN_BLOCK_T (16|32|48, default 32 for bf16 — Metal's
+> 32 KiB threadgroup limit governs; fp32 inputs would need 16, **but our GDN
+> inputs are always bf16**).
+
+**Why the stock kernel survived.** `GDN_KERNEL_SOURCE` indexes the raw buffer
+names (`auto q_ = q + …`), so it adapts to whatever dtype arrives — exactly the
+house rule the blocked port broke. `MLX_SERVE_GDN_BLOCKED=0` was therefore a
+complete workaround, and that A/B is how the diagnosis was confirmed: same
+model, same 501-token request, 22.6 → coherent generation with the kernel off,
+`Unable to build metal library` with it on.
+
+**Three things the fix had to get right, not one.**
+
+1. `InT`/`StT` come from `mlx_array_dtype` of the actual arrays. `g`/`beta` need
+   no template arg at all — they are read through raw names with an explicit
+   `(float)` cast, which is why the mixed set never bothered them.
+2. **Block size follows the dtype.** The staging arrays are declared *in* `InT`
+   (`threadgroup InT k_s[TB][Dk+8]`), so fp32 doubles the footprint: at
+   Dk=128/TB=32 that is 40,192 bytes against a 32 KiB threadgroup limit.
+   `gdnBlockTFor(requested, dk, itemsize)` picks the largest supported TB that
+   fits (fp32 ⇒ 16) and returns null — decline to the stock kernel — rather than
+   ever dispatching over budget. Fixing the dtype alone would have traded a
+   compile error for a different compile error.
+3. **The store type is the OUTPUT's.** Making `InT` honest immediately broke the
+   *stock* kernel too:
+
+   ```
+   error: assigning to 'bfloat16_t' (aka 'bfloat') from incompatible type 'float'
+       y[dv_idx] = static_cast<InT>(out);
+   ```
+
+   Metal has no implicit float→bfloat conversion, and `y` is declared bf16 by us.
+   `static_cast<InT>` had only ever compiled because InT happened to equal the
+   output dtype. That is now `OutT`, set from the output declaration, in all
+   three kernel sources.
+
+Diagnosis order that worked: read the dtypes out of the mangled template name in
+the error (they are all there), then the safetensors header histogram, then
+`grep` for the hardcoded `.bfloat16` template args. The kernel name is the
+fastest signal — it tells you what MLX actually saw, not what you assumed.
+
+Guards: `gdnBlockTFor` unit test (pure, pins the staging arithmetic and the
+clamp), plus fp32 and f16 cases in the blocked-parity sweep, which run through
+the same `gdnBlockTFor` the production path does — so a regression that declines
+the blocked route instead of clamping fails with `error.GdnBlockedDeclined`
+rather than passing on the stock fallback.

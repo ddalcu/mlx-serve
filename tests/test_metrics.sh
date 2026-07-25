@@ -96,7 +96,8 @@ STATUS=$(curl -s -o /dev/null -w "%{http_code}" "$BASE/metrics.json")
 check "GET /metrics.json without --metrics → 503" "$([ "$STATUS" = "503" ] && echo 1 || echo 0)"
 
 INDEX=$(curl -s "$BASE/")
-check "index page renders (200-ish, has model card)" "$(echo "$INDEX" | grep -q "Loaded model" && echo 1 || echo 0)"
+check "index page renders (200-ish, console markup present)" \
+    "$(echo "$INDEX" | grep -q 'data-tab="chat"' && echo 1 || echo 0)"
 check "index page has NO metrics panel when --metrics off" \
     "$(echo "$INDEX" | grep -q 'id=m-status' && echo 0 || echo 1)"
 

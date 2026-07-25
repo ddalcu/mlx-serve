@@ -49,8 +49,15 @@ pub fn build(b: *std.Build) void {
         verifyMlxStage(b);
     }
 
-    // Version from build option or default
-    const version = b.option([]const u8, "version", "Version string") orelse "0.1.0-dev";
+    // App version. Release builds pass it explicitly (app/build.sh computes the
+    // next CalVer from the GitHub releases and stamps it into app/Info.plist;
+    // the release workflow passes the tag). A plain `zig build` used to fall
+    // back to a literal "0.1.0-dev", which then showed up as the version in
+    // `--version` AND on the console page — so a dev build reported a version
+    // that exists nowhere. Default to the checked-in Info.plist stamp instead:
+    // one source of truth, already in the repo, and the same string the last
+    // real build shipped. Same pattern as the engine pins below.
+    const version = b.option([]const u8, "version", "Version string") orelse readAppVersion(b) orelse "0.0.0-dev";
 
     const mas = b.option(bool, "mas", "MAS build (no curl/model-pull subprocess)") orelse false;
 
@@ -541,6 +548,26 @@ fn verifyMlxStage(b: *std.Build) void {
 /// The pinned mlx-c revision from lib/mlx/.version (written by
 /// scripts/build-mlx.sh as "mlx=<sha> mlxc=<sha> target=<ver>"), surfaced in
 /// `mlx-serve --version`. Returns null (→ "unknown") when not staged yet.
+/// `CFBundleShortVersionString` out of the checked-in app/Info.plist — the one
+/// place the current CalVer is committed (app/build.sh stamps it on every real
+/// build). Read at configure time so a plain `zig build` reports the same
+/// version the last shipped build did, instead of a made-up literal.
+fn readAppVersion(b: *std.Build) ?[]const u8 {
+    const bytes = buildRootHandle(b).readFileAlloc(
+        b.graph.io,
+        "app/Info.plist",
+        b.allocator,
+        .limited(64 * 1024),
+    ) catch return null;
+    const key = "<key>CFBundleShortVersionString</key>";
+    const at = std.mem.indexOf(u8, bytes, key) orelse return null;
+    const open = std.mem.indexOfPos(u8, bytes, at + key.len, "<string>") orelse return null;
+    const start = open + "<string>".len;
+    const end = std.mem.indexOfPos(u8, bytes, start, "</string>") orelse return null;
+    const v = std.mem.trim(u8, bytes[start..end], " \t\r\n");
+    return if (v.len > 0) b.dupe(v) else null;
+}
+
 fn readMlxcPin(b: *std.Build) ?[]const u8 {
     const bytes = buildRootHandle(b).readFileAlloc(
         b.graph.io,

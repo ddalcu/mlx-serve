@@ -1,17 +1,25 @@
 # Changelog
 
-## v26.7.11 — Mage-Flow image editing, faster MoE decode, sharper Qwen vision
+## v26.7.11 — Mage-Flow image editing, a built-in console, faster MoE decode
 
 - **Mage-Flow runs natively.** Microsoft's Mage-Flow Turbo generates images in 4 steps, and Mage-Flow Edit Turbo edits them from reference images: no masks, no fine-tuning, just the picture and what you want changed. Point it at several references and it composes them ("put the object from image 2 into image 1"). Full native port like everything else here, no Python. 8-bit conversions are on Hugging Face at 8.5 GB for generation and 9.1 GB for editing, against 16 GB for the originals.
 - **Image editing in the app.** The Image tab takes a source image now, tells you the edit comes back at your picture's own size, and hides the knobs a distilled model ignores (Mage-Flow is fixed at 4 steps, so raising it only costs you time).
 - **Edit images with the OpenAI SDK.** `client.images.edit(image=..., prompt=...)` now works against mlx-serve, including repeated `image[]` for multi-reference edits. It reaches the same engine as everything else, so it works on any edit-capable model you have loaded (FLUX.2 or Mage-Flow Edit). Anything OpenAI accepts that we can't honor gets a named 400 rather than being quietly ignored: masks, `n` > 1, URL response format, non-PNG output, streaming.
-- **Edits keep your photo's shape.** Asking for a square size while editing a 3:2 photo used to squash it before the model ever saw it, which read as the model being bad at faces rather than as a preprocessing bug. The reference image's aspect ratio now wins and the size you ask for is treated as a pixel budget. Same fix for photos larger than the 2048 limit, which were getting squared off on the way in.
-- **Image generation no longer leaks memory.** Every generation was holding on to roughly 2.2 GB per megapixel, so a 1024x1024 image cost 2.2 GB that never came back. It compounded across generations and survived unloading the model, and a normal session could reach 40 GB and up. Output is byte for byte identical to before, it just gives the memory back now.
+- **The server has a real console now.** Open its address in a browser (http://localhost:11234 by default) and you get a working chat against any model on the box, with history in the sidebar, a Monitor page showing what's loaded and the live metrics, and the full API reference. You can also just ask for things: "generate an image of a fox", attach a photo and say "make it winter", "write me a lo-fi track". It picks the right model for the job and shows the result inline, and it can answer questions about the server's own API.
 - **MoE coding models decode a lot faster.** A new in-place gather kernel for MoE decode reads the expert bank where it sits instead of paying for its size on every token. Laguna at 4-bit went from 37.0 to 55.5 tok/s on an M4 Max, and 2-bit is up 24%, both against the previous release.
-- **Qwen3-VL sees images properly, and speculative decoding stays on.** Image preprocessing now matches the reference implementation, including Pillow's bicubic downscaling, and prefill positions line up. MTP also understands vision positions now, so image chats keep speculative decoding instead of silently falling back to plain decode. (#102)
-- **Image edits from other apps pick the right model.** `/v1/images/edits` sends its model name as a form field rather than in JSON, and the server was only looking for the JSON version, so every edit ran against whatever model happened to be the default. Through Open WebUI that meant a 400 about the model not supporting images, or a 503 saying no model was configured, while the model you named sat there loaded. It now reads the name from the form like it should.
-- **Tools that scan for supported endpoints now see the real picture.** Before a model is loaded, the server answered every request with "no model configured", including requests for endpoints that don't exist. Anything that maps a server by probing its endpoints took that to mean the server answers everything, and gave up on all of them. Unknown paths now return a plain 404 like they should.
-- **Bug fixes.** `--pld` and its tuning flags are honored in headless mode, which is how the app always starts the server, so they were reaching nothing (#95). `--ssm-checkpoint-stride` and `--ssm-checkpoint-max` are documented in `--help` (#96). Multipart uploads parse no matter which order the client writes the fields. Debug logging no longer dumps raw image bytes into the log file, where one upload could blow past rotation and destroy the log you were trying to read. Our published model conversions are now correctly labelled as quantized on Hugging Face instead of showing up as fine-tunes.
+- **Bug fixes.**
+  - Image edits keep the source photo's shape instead of squashing it.
+  - Image generation no longer leaks memory (about 2.2 GB per megapixel).
+  - Qwen3-VL image preprocessing is correct, and image chats keep speculative decoding (#102).
+  - `/v1/images/edits` uses the model named in the form, not the default one.
+  - Unknown endpoints return 404 instead of "no model configured".
+  - A mistyped flag like `--model=/path` exits instead of being ignored.
+  - F16 checkpoints no longer crash on long prompts.
+  - `--pld` and its tuning flags are honored in headless mode (#95).
+  - `--ssm-checkpoint-stride` and `--ssm-checkpoint-max` are documented in `--help` (#96).
+  - Multipart uploads parse in any field order.
+  - Debug logging no longer dumps raw image bytes into the log file.
+  - Published model conversions are labelled quantized on Hugging Face, not fine-tunes.
 
 ---
 

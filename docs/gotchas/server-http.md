@@ -111,3 +111,98 @@ Sibling of the multipart-`model` bug above, same root cause: **model resolution 
 - **Why it matters beyond tidiness.** Endpoint discovery works by probing: send an empty body and read the status — 404/405 means absent, anything else means present (llmprobe's `classifyStatus`), with a sentinel request to a nonsense path to detect servers that answer everything (LM Studio's HTTP-200-with-an-error-body). Our headless 503 on the sentinel tripped exactly that defence: llmprobe concluded "server answers unknown paths with HTTP 503" and scored **every** surface absent — chat, responses, messages, embeddings, images, audio. The server looked like it implemented nothing while serving fine. Note the asymmetry that makes this hard to spot: 503 on a REAL endpoint is harmless (it classifies as present); it is the 503 on the FAKE one that poisons everything.
 - **Fix**: the `NoDefaultModel` arm answers 404 when `!routeExists(path)` before falling through to the 503. `ROUTE_PATHS` lists the 31 dispatched paths (plus the `/v1/responses/{id}` prefix) — a second list that must agree with the `if/else` chain, which is a drift class this file warns about repeatedly. The guard is a unit test that reads the chain out of `@embedFile("server.zig")`, scans for the path-equality call form, and fails on any literal missing from the table: a new route arm that forgets the table breaks CI instead of silently becoming a headless 404. (It caught a literal inside its own doc comment on the first run, which is the cheapest possible demonstration that it works.)
 - **Rule**: anything answerable without a model — does this path exist, is this body well-formed — must be answered before the model is resolved, not after. And when adding a route, remember the table; the test will remind you. Related: `/props` was already special-cased in this arm for the same reason (the app's tray polls it and read a 503 as "0 MB"), which was the hint that the arm was doing too much.
+
+### The index page rendered from a `*LoadedModel`, so the server's own front page 503'd on a headless boot (2026-07-25)
+Third in the same family as the two stories above: **model resolution runs before dispatch**, and `GET /` sat on the far side of it. `handleStatusPage(allocator, stream, lm)` took a `*LoadedModel` and rendered 21 `std.fmt` slots off it — id, arch, quant bits/group, layers/hidden/heads/kv, head dim, vocab, context, model max, active + peak MB, capability pills. With no default model the arm was never reached and the root answered `503 {"error":"No default model configured"}`. That is the boot mode the app always uses, and since `mlx-serve serve` / bare `--serve` started discovering the shared models root and loading on demand, it is the default way the server starts at all — so the first page a person opens was an error object.
+- **The page also documented 22 of 31 endpoints.** The API reference is hand-written prose; the entire Ollama `/api/*` surface (chat, generate, tags, show, ps, pull, version, embed, embeddings) had never been added to it. Nothing could notice, because "is the reference complete?" was an inspection, not a test.
+- **Fix**: `GET /` moved up beside `/health` and `/v1/models`, above resolution, and `handleStatusPage` lost its `lm` parameter entirely. Everything model-shaped is now fetched client-side from `/v1/models` (which already returns id, capabilities, state, bytes, meta per entry) and `/props` (live memory). That is not just a workaround for the 503 — the page is now a model PICKER, so it has to render before anything is loaded by construction, and the picker follows loads and unloads without a refresh.
+- **The `std.fmt` trap that shapes the whole file layout.** `index.html` is `@embedFile`d as a FORMAT STRING, so every literal `{`/`}` inside it must be doubled — which is why a page with real CSS and JS cannot be one file. `metrics.js` already had the answer: inject it as a RUNTIME `{s}` argument, because std.fmt does not re-parse runtime args. `app.css` and `app.js` follow the same pattern, and the slot count dropped from 21 to 6. Do not inline CSS or JS back into `index.html`.
+- **Guards** (three layers, because the page has three failure modes):
+  - `the index page documents every endpoint the server serves` (server.zig) — every `ROUTE_PATHS` entry must appear in `@embedFile("html/index.html")`. Red today with the nine `/api/*` paths. Same shape as the `ROUTE_PATHS`↔dispatch-chain guard, and it makes "are we missing endpoints?" un-repeatable rather than re-inspectable.
+  - `tests/test_index_page.sh` — headless over an EMPTY `--model-dir` (no checkpoint, seconds): `GET /` → 200 `text/html`, the tab/control markup is present, every endpoint path is in the served bytes, and the `#mlx-metrics` mount appears with `--metrics` and not without. Red-on-revert: 1/20 with the arm moved back below resolution.
+  - `tests/html_console_test.mjs` — the pure decision layer (capability filtering per picker, SSE frame cutting across split chunks, request/form construction, auth passthrough), plus a static cross-check that every id `app.js` reaches for exists in `index.html` and every rendered control is read by `app.js`. That last one covers the class no HTTP assertion can see: a typo'd id makes `$('chat-sned')` return null, the listener is never attached, and the button is silently dead while the page still renders, still serves, and still passes every byte-level check.
+- **Note on media**: edit capability is not API-visible — both Mage-Flow-Turbo and Mage-Flow-Edit-Turbo report `capabilities: ["image"]`, ship byte-identical configs, and the server itself gates on the directory NAME (`mage_flow.dirIsEdit`). The console mirrors that rule client-side rather than inventing one. An explicit `image_edit` capability on `/v1/models` would replace both halves; it is a server API change, not console work.
+
+### The console is a chat with tools, not a page of forms — and the live runs wrote the rules (2026-07-25)
+Second pass on the console. Images and Audio stopped being tabs: the tabs are **Monitor** (default, first — the live metrics panel plus the full model inventory), **Chat**, and **API**. Media is something you ASK for, so the chat is handed one tool per modality this server can actually serve (`mediaTools`), executes what the model calls, and renders the picture or the player inline in the assistant's bubble. The user-editable system-prompt box is gone because the console now needs that slot itself: the prompt carries the tool instructions, the model inventory, and the API reference, which is what lets the same chat answer "which endpoint edits an image?".
+
+Everything below was found by driving the real page in a real browser over CDP against a real server — none of it is visible from unit tests, and every fix landed in the pure, tested layer rather than in the DOM.
+- **A round cap does not bound cost; a budget does.** Asked for "an image of a fox", a 2B model generated the fox and then invented three more edits nobody requested — four GPU generations, tens of seconds each, off one sentence. `MAX_TOOL_ROUNDS` cannot fix that: every round is another picture. `toolInvocation` now takes `ctx.mediaUsed` and refuses beyond one media generation per user turn. The refusal has to be a SENTENCE the model can act on ("already produced one result for this request; tell the user what you made and let them ask for the next change") — a model that gets silence, or a bare error, just calls again. The same instinct applies to the tool RESULT text: "Generated the image" reads as an invitation to continue, so it ends with "Reply with one short sentence now. Do not call another tool."
+- **A tool's `model` enum and its resolution must be the same list.** The edit tool enumerated every image model while resolution merely *preferred* an edit-capable one — and an explicit choice beats a preference, so the model picked `Mage-Flow-Turbo` straight out of the enum and the edit 400'd. Offering a choice that is guaranteed to fail is the same class as advertising a capability you don't have. `editableIds` is now one list feeding both, pinned by a test that resolves every id the enum offers and asserts it comes back unchanged.
+- **Rank candidates by how likely they are to WORK.** Two Qwen3-TTS checkpoints on disk, the bf16 one an incomplete download (config + tokenizer, no safetensors). It sorted first, so every "say this out loud" spent a load attempt on it — `NoWeightFiles`, "Model load failed" — before a retry found the sibling. The pre-load tell is in `/v1/models` already: discovery sums the checkpoint's `*.safetensors`, so `bytes_on_disk: null` means the shards are missing. `rankedIds` orders resident (free, and provably loadable) → sized → unsized → `error`, and a failed tool call refreshes the model list so a retry inside the same turn ranks past the entry the registry just marked. The picker deliberately does NOT reorder: it refreshes every 15 s and would shuffle under the cursor.
+- **Whatever the system prompt leaves out, the model invents.** With only paths and one-line descriptions in the prompt, "how do I edit an image?" produced `curl -X POST https://your-ollama-ip-address/api/v1/images/edits -F "ref1=<base64>"` — wrong host, wrong path prefix, invented field names. The prompt now carries `location.origin` and a short true list of real request fields. Listing accepted and rejected fields in one sentence was not enough either: the model presented `mask`, `n`, `response_format:"url"` as available options, so rejections are now a separate, explicitly-labelled clause. And "give me a curl for the edit endpoint" was answered by GENERATING A PICTURE until the prompt said in as many words that questions are answered in text with no tool call at all.
+- **The API reference has one source.** The prompt's endpoint list is scraped from the API tab's own rendered markup (`#tab-api .ep`), so the page and the assistant cannot disagree, and the Zig drift guard (every `ROUTE_PATHS` entry appears in `index.html`) covers both at once.
+- **Guards**: `tests/html_console_test.mjs` grew to 44 tests over `mediaTools` / `toolInvocation` / `accumulateToolCalls` / `systemPrompt` — each of the bullets above is a named regression test. `tests/test_index_page.sh` pins the tab set, that Monitor ships `class="panel active"` (what a visitor sees before any JS runs), that Images/Audio tabs are GONE, and that no user system-prompt box came back.
+
+### Third pass: a sidebar, persisted chats, and the metric a client cannot measure (2026-07-25)
+Layout moved to a sidebar — **New chat / Monitor / API**, plus **Recents** — and chat became the landing view: a greeting and a centred composer that turns into a transcript on the first send. It is ONE composer element in two layouts (`.panel.empty` flips it), because two composers is two sets of listeners and one of them always rots. Temperature and max-tokens went away; model choice and Extended thinking live in the composer's pill menu, both remembered in localStorage.
+- **Recents is localStorage, and what you DON'T store is the design.** A single 1024² PNG is ~1.5 MB of base64 and the whole origin gets ~5 MB, so persisting one image-generating conversation would evict every other one. `storableTurns` replaces every `image_url` part with an `image_omitted` marker and keeps everything else — crucially including `tool_calls` and the `tool` results, or a reloaded chat could not be continued. `historyUpsert` caps by count AND by serialized size, dropping oldest-first, so a few very long chats can't wedge the store.
+- **Markdown is rendered from ESCAPED input, always.** Model output is untrusted — it routinely quotes the user, and the user may have pasted anything. The renderer escapes first and then builds a whitelisted subset (headings, lists, fences, inline code, emphasis, links), so `<script>` survives as text even inside a fence, and `[x](javascript:alert(1))` degrades to plain text because only `http(s)` produces an `href`. Text streams as plain text and is re-rendered as markdown once the turn closes: parsing per token is wasted work and fights half-written syntax.
+- **A client cannot measure decode rate against our own server.** The console showed **937 tok/s on a 2B**, and it was not an arithmetic slip: with `tools` present the server buffers tokens for tool-call detection and flushes at the end (documented above, under the keepalive class), so every SSE delta arrives in one burst — first-byte and last-byte are milliseconds apart and wall-clock decode time is ~0. The fix is not a cleverer clock: the final chunk already carries `timings` (`prompt_ms`, `prompt_per_second`, `predicted_n`, `predicted_ms`, `predicted_per_second`) measured on the server around the actual forward passes, which buffering cannot distort. The console sums that block across the turn's rounds, which also keeps a minutes-long image generation out of the denominator for free. Verified against the server's own log line for the same request: console 104.6 tok/s vs `decode: 102.1 tok/s`. **`stream_options.include_usage` is load-bearing** — the server gates the entire final chunk on it, so dropping it silently removes the only trustworthy timing a client can get. Related trap of the same shape: TTFT. A buffered stream has no observable first token either, so the console reports the server's `prompt_ms` as "prefill" rather than claiming a time-to-first-token it cannot see.
+- **A menu that opens upward is bounded by what's above it.** The model picker lists every chat model — 16 on this box — and a `max-height: 60vh` box anchored above the composer ran off the top of the window with its first entries unreachable. Clamp to `pill.top - container.top`, measured at open time.
+
+## `--model=<path>` was silently dropped (arg loop with no else) — 2026-07-25
+
+```
+./zig-out/bin/mlx-serve --serve --model=~/.mlx-serve/models/…/Nanbeige… --metrics
+…
+[args] model:
+mlx-serve 0.1.0-dev (headless — models load on demand)
+```
+
+`main.zig`'s flag loop matches every flag by EXACT name and reads its value from
+the next argv slot:
+
+```zig
+} else if (std.mem.eql(u8, args[i], "--model") and i + 1 < args.len) {
+    i += 1;
+    model_dir = args[i];
+```
+
+There is no `--model=X` arm, and the loop ended at a bare `}` with **no else
+branch at all**. zsh passes `--model=…` through as one token, nothing matched
+it, and it fell out of the loop in silence.
+
+Everything downstream then looked healthy. `[args] model:` printed empty, the
+server took the headless path (the same path the app always launches), and on
+the first chat request the registry auto-picked an unrelated default —
+`[registry] default model -> prism-ml/Ternary-Bonsai-27B-mlx-2bit` — which
+promptly crashed on a separate kernel bug (docs/gotchas/engine-mlx.md). The
+user spent the whole session believing they were debugging the model named on
+the command line. They were not; that model had never loaded, and its
+`model_type` was unsupported anyway.
+
+Same family as the `runHeadlessServe` entry above: the flag parses as far as the
+user can tell, `--help` documents it, boot is clean, and nothing anywhere
+reports that the request was ignored. A launcher that quietly ignores what it
+was asked for is worse than one that refuses to start.
+
+The loop now rejects anything it did not consume, via a pure classifier in
+`cli.zig` (main.zig is not in the test aggregator, so the testable helper lives
+there):
+
+- `.equals_form` — starts with `-` and contains `=`. The actual trap; the
+  message names the shape that works: *"flags take their value as a separate
+  argument (--model <path>, not --model=<path>)"*.
+- `.missing_value` — a flag in the LAST argv slot. This is precisely the case
+  the `i + 1 < args.len` guards let fall through, and it needs no list of flag
+  names to detect: position alone identifies it.
+- `.unknown` — everything else, pointed at `--help`.
+
+Positional subcommand arguments are consumed before the loop via `arg_start`
+(3 for `run <model>`, 2 for `serve`), so tightening the loop cannot break
+`mlx-serve run qwen3`.
+
+**Rollout check for a change like this** — hard-failing on unknown args breaks
+every caller that passes a stale flag, so before shipping, diff what callers
+send against what the loop matches:
+
+```sh
+grep -oE 'args\[i\], "(--?[a-z0-9-]+)"' src/main.zig | grep -oE '"--?[a-z0-9-]+"' | tr -d '"' | sort -u > known
+grep -rhoE '(zig-out/bin/mlx-serve|\$\{?BIN\}?)[^|;&]*' tests/*.sh | grep -oE '\-\-[a-z0-9-]+' | sort -u > used
+comm -13 known used      # must be empty
+```
+
+Also confirm `ServerOptions.toCLIArgs` emits no `=`-joined flag
+(`grep -rnE '"--[a-z-]+=' app/Sources`) — the app launches the server on every
+boot, so an `=` form there would have turned this fix into a launch failure.
