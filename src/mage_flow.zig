@@ -4494,12 +4494,30 @@ fn retainedBytes(
         }
     }.run;
 
+    // `mlx_array_free` drops OUR reference, but the buffer stays alive until
+    // the command buffer that touched it retires — so a counter read while the
+    // stream is still in flight bills work that is already on its way out.
+    // Without this the test failed for exactly ONE buffer (16384 B, the whole
+    // source array) at random — measured 5 failures in 25 runs locally, and
+    // intermittently on CI — which reads as a leak that comes and goes. With
+    // the drain: 25/25. Verified the guard still bites by deleting a free in
+    // `once` and watching it go red. Drain before every reading.
+    const drain = struct {
+        fn run() !void {
+            const st = mlx.mlx_default_gpu_stream_new();
+            defer _ = mlx.mlx_stream_free(st);
+            try mlx.check(mlx.mlx_synchronize(st));
+        }
+    }.run;
+
     // Warm-up: the first calls pay one-time kernel/allocator setup, which is
     // not retention.
     for (0..2) |_| try once(data, shape, tail_args);
+    try drain();
     var before: usize = 0;
     try mlx.check(mlx.mlx_get_active_memory(&before));
     for (0..iters) |_| try once(data, shape, tail_args);
+    try drain();
     var after: usize = 0;
     try mlx.check(mlx.mlx_get_active_memory(&after));
     return if (after > before) after - before else 0;
