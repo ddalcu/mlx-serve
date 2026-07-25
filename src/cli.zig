@@ -119,6 +119,34 @@ pub fn modelsRootPath(allocator: std.mem.Allocator, home: []const u8) ![]u8 {
     return std.fmt.allocPrint(allocator, "{s}/.mlx-serve/models", .{home});
 }
 
+/// Inputs to "which models should this boot discover?" — see
+/// `shouldDefaultModelsRoot`.
+pub const RootDefaulting = struct {
+    /// Invoked as `mlx-serve serve` / `mlx-serve run <model>` rather than flags.
+    subcommand: bool,
+    /// The process will serve HTTP (subcommand, or the `--serve` flag).
+    serve_mode: bool,
+    /// `--model <path>` (or `run <model>`) named a specific checkpoint.
+    has_explicit_model: bool,
+};
+
+/// Should an unspecified `--model-dir` fall back to `~/.mlx-serve/models`?
+///
+/// That path is already the single source of truth everywhere else — `pull`
+/// writes there, `list` reads there, the app's DownloadManager and both
+/// resolvers agree on it — so a server told to serve, but given neither a model
+/// nor a directory, has exactly one sensible place to look. Without this a bare
+/// `mlx-serve --serve` discovered nothing and answered 503 to everything.
+///
+/// The one case that must NOT default: `--model <path> --serve`, which asked
+/// for one specific model. Registering everything else on disk beside it is a
+/// different server than the one requested.
+pub fn shouldDefaultModelsRoot(in: RootDefaulting) bool {
+    if (!in.serve_mode) return false;
+    if (in.subcommand) return true; // `serve` / `run` always populate the picker
+    return !in.has_explicit_model;
+}
+
 fn homeDir() []const u8 {
     return std.mem.span(std.c.getenv("HOME") orelse return "/tmp");
 }
@@ -947,6 +975,26 @@ test "cli: dirBytesOneLevel counts weight subdirs (FLUX bundle showed 6 KB)" {
     var m = try tmp.dir.openDir(io, "m", .{ .iterate = true });
     defer m.close(io);
     try testing.expectEqual(@as(u64, 16), dirBytesOneLevel(io, &m));
+}
+
+test "cli: a serving boot with no model named falls back to the shared models root" {
+    // `mlx-serve serve` and `mlx-serve run <m>` already default the discovery
+    // root; the `--serve` FLAG form did not, so a bare `mlx-serve --serve`
+    // booted a server that had discovered nothing and could only answer 503 —
+    // never what anyone meant by "serve".
+    try testing.expect(shouldDefaultModelsRoot(.{ .subcommand = true, .serve_mode = true, .has_explicit_model = false }));
+    try testing.expect(shouldDefaultModelsRoot(.{ .subcommand = false, .serve_mode = true, .has_explicit_model = false }));
+
+    // `--model <path> --serve` asked for ONE model. Quietly registering the
+    // other 28 on disk is a different server than the one requested.
+    try testing.expect(!shouldDefaultModelsRoot(.{ .subcommand = false, .serve_mode = true, .has_explicit_model = true }));
+    // `mlx-serve run <model>` names a model AND wants the picker populated —
+    // the subcommand's existing behavior, which this must not change.
+    try testing.expect(shouldDefaultModelsRoot(.{ .subcommand = true, .serve_mode = true, .has_explicit_model = true }));
+
+    // Not serving at all (one-shot `--prompt`) never scans a root.
+    try testing.expect(!shouldDefaultModelsRoot(.{ .subcommand = false, .serve_mode = false, .has_explicit_model = true }));
+    try testing.expect(!shouldDefaultModelsRoot(.{ .subcommand = false, .serve_mode = false, .has_explicit_model = false }));
 }
 
 test "cli: isModelDir accepts a MageFlow repo (model_index.json, no config.json)" {

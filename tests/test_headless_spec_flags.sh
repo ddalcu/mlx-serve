@@ -76,7 +76,7 @@ boot() {
 
 echo "Headless spec-decode flag plumbing (port $PORT)"
 
-echo "[1/3] --pld with non-default draft/key lengths"
+echo "[1/4] --pld with non-default draft/key lengths"
 if boot --pld --pld-draft-len 8 --pld-key-len 4; then
     grep -q "PLD speculative decoding: ENABLED" "$LOG"
     check "--pld enables PLD in headless mode" "$([ $? -eq 0 ] && echo 1 || echo 0)"
@@ -88,7 +88,7 @@ else
     check "boot with --pld" 0
 fi
 
-echo "[2/3] --no-pld still disables"
+echo "[2/4] --no-pld still disables"
 if boot --no-pld --pld-draft-len 8 --pld-key-len 4; then
     grep -q "PLD speculative decoding: ENABLED" "$LOG"
     check "--no-pld keeps PLD off even with lengths passed" "$([ $? -ne 0 ] && echo 1 || echo 0)"
@@ -96,13 +96,47 @@ else
     check "boot with --no-pld" 0
 fi
 
-echo "[3/3] bare default matches the documented 5/3"
+echo "[3/4] bare default matches the documented 5/3"
 if boot; then
     grep -q "draft_len=5, key_len=3" "$LOG"
     check "default headless boot is PLD on at 5/3" "$([ $? -eq 0 ] && echo 1 || echo 0)"
 else
     check "bare default boot" 0
 fi
+
+# Model resolution runs BEFORE dispatch, so with no default model an unknown
+# path never reached the chain's 404 and came back 503 "No default model
+# configured". A path's existence has nothing to do with model state, and a
+# server that answers every unknown path with a non-404 looks like a catch-all
+# to anything that maps endpoints by probing them — llmprobe scored every
+# surface absent against a headless boot for exactly this reason (2026-07-25).
+# Headless with an EMPTY model dir is the only place this is observable.
+echo "[4/4] endpoint existence does not depend on a model being loaded"
+pkill -f "mlx-serve.*--port $PORT" 2>/dev/null
+sleep 0.5
+: > "$LOG"
+"$BINARY" --serve --model-dir "$EMPTY_DIR" --port "$PORT" --log-file off > "$LOG" 2>&1 &
+HPID=$!
+for _ in $(seq 1 60); do
+    curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break
+    sleep 0.5
+    kill -0 "$HPID" 2>/dev/null || break
+done
+post_code() {
+    curl -s -o /dev/null -w '%{http_code}' -X POST "http://127.0.0.1:$PORT$1" \
+        -H 'Content-Type: application/json' -d '{}'
+}
+unknown_code=$(post_code /v1/__no_such_endpoint__)
+known_code=$(post_code /v1/chat/completions)
+edits_code=$(post_code /v1/images/edits)
+kill "$HPID" 2>/dev/null
+wait "$HPID" 2>/dev/null
+check "unknown endpoint is 404, not no-model (got $unknown_code)" \
+    "$([ "$unknown_code" = "404" ] && echo 1 || echo 0)"
+check "a served endpoint still reports 503 no-model (got $known_code)" \
+    "$([ "$known_code" = "503" ] && echo 1 || echo 0)"
+check "a served media endpoint is not mistaken for absent (got $edits_code)" \
+    "$([ "$edits_code" = "503" ] && echo 1 || echo 0)"
 
 echo
 echo "  passed: $PASS   failed: $FAIL"

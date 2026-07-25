@@ -502,6 +502,56 @@ pub fn parseModelFromBody(body: []const u8) ?[]const u8 {
     return null;
 }
 
+/// Every path `handleConnection` dispatches. Kept beside the chain rather than
+/// derived from it because one question has to be answerable BEFORE a model is
+/// resolved: does this endpoint exist at all?
+///
+/// Resolution runs ahead of dispatch, so without this an unknown path on a
+/// server with no default model returned 503 "No default model configured"
+/// instead of 404 — and a path's existence has nothing to do with model state.
+/// The drift guard is a test that reads the dispatch chain out of this file.
+const ROUTE_PATHS = [_][]const u8{
+    "/",
+    "/api/chat",
+    "/api/embed",
+    "/api/embeddings",
+    "/api/generate",
+    "/api/ps",
+    "/api/pull",
+    "/api/show",
+    "/api/tags",
+    "/api/version",
+    "/detokenize",
+    "/health",
+    "/metrics",
+    "/metrics.json",
+    "/props",
+    "/tokenize",
+    "/v1/3d/generations",
+    "/v1/audio/music-generations",
+    "/v1/audio/speech",
+    "/v1/chat/completions",
+    "/v1/completions",
+    "/v1/embeddings",
+    "/v1/images/edits",
+    "/v1/images/generations",
+    "/v1/load-model",
+    "/v1/messages",
+    "/v1/models",
+    "/v1/responses",
+    "/v1/responses/compact",
+    "/v1/unload-model",
+    "/v1/video/generations",
+};
+
+/// Is `path` an endpoint this server serves at all (any method)?
+fn routeExists(path: []const u8) bool {
+    // `/v1/responses/{id}` (GET/DELETE) is matched by prefix, not by a literal.
+    if (std.mem.startsWith(u8, path, "/v1/responses/")) return true;
+    for (ROUTE_PATHS) |p| if (std.mem.eql(u8, path, p)) return true;
+    return false;
+}
+
 /// The requested model id from a request body of EITHER shape.
 ///
 /// Every endpoint we serve takes JSON except `/v1/images/edits`, which is
@@ -1568,6 +1618,15 @@ fn handleConnection(
             // the app's tray polls it, and a 503 here read as "0 MB".
             if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/props")) {
                 try handlePropsNoModel(allocator, stream);
+                return;
+            }
+            // An endpoint that doesn't exist is a 404 whether or not a model is
+            // loaded. Resolution runs ahead of dispatch, so without this an
+            // unknown path never reaches the chain's own 404 and reports "no
+            // model" — which reads to any endpoint-probing client as a
+            // catch-all server that implements everything.
+            if (!routeExists(path)) {
+                try sendErrorResponse(allocator, stream, "404 Not Found", "not_found", "Unknown endpoint", 404);
                 return;
             }
             try sendErrorResponse(allocator, stream, "503 Service Unavailable", "no_model", "No default model configured", 503);
@@ -6813,6 +6872,54 @@ test "lanShareDenial: shared inference surface only, resolved like dispatch" {
     const mp_shared = "--B\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\ngemma-4-e4b-it-4bit\r\n--B--\r\n";
     try std.testing.expect(lanShareDenial(&l, reg, "POST", "/v1/images/edits", mp_unshared, mp_ct, false) != null);
     try std.testing.expect(lanShareDenial(&l, reg, "POST", "/v1/images/edits", mp_shared, mp_ct, false) == null);
+}
+
+test "routeExists answers endpoint existence without consulting the model" {
+    // Whether a path EXISTS has nothing to do with which models are loaded, but
+    // model resolution runs ahead of dispatch — so on a headless boot (`--serve
+    // --model-dir`, no `--model`, how the app always launches) an unknown path
+    // never reached the 404 branch and came back 503 "No default model
+    // configured". Any client that maps endpoints by probing them then concludes
+    // the server implements EVERYTHING (llmprobe: "server answers unknown paths
+    // with HTTP 503" → every surface scored absent, live 2026-07-25).
+    try std.testing.expect(routeExists("/v1/chat/completions"));
+    try std.testing.expect(routeExists("/v1/images/edits"));
+    try std.testing.expect(routeExists("/v1/embeddings"));
+    try std.testing.expect(routeExists("/health"));
+    // `/v1/responses/{id}` is served by prefix, not by an exact literal.
+    try std.testing.expect(routeExists("/v1/responses/resp_abc123"));
+    try std.testing.expect(routeExists("/v1/responses/compact"));
+
+    try std.testing.expect(!routeExists("/v1/__llmprobe_no_such_endpoint__"));
+    try std.testing.expect(!routeExists("/v1/audio/transcriptions")); // real OpenAI route we don't serve
+    try std.testing.expect(!routeExists("/nope"));
+    try std.testing.expect(!routeExists(""));
+}
+
+test "ROUTE_PATHS covers every path the dispatch chain compares (drift guard)" {
+    // Two lists that must agree is the drift class this file already warns about
+    // elsewhere. Rather than trust a comment, read the dispatch chain itself: a
+    // new path-equality arm that nobody adds to ROUTE_PATHS makes that endpoint
+    // a 404 on a headless server — the exact failure this table exists to
+    // prevent, inverted. (This test scans for the literal call form, so don't
+    // write one inside a comment: it would be scanned like real code.)
+    const src = @embedFile("server.zig");
+    const needle = "std.mem.eql(u8, path, \"";
+    var i: usize = 0;
+    var checked: usize = 0;
+    while (std.mem.indexOfPos(u8, src, i, needle)) |at| {
+        const start = at + needle.len;
+        const end = std.mem.indexOfScalarPos(u8, src, start, '"') orelse break;
+        const literal = src[start..end];
+        i = end;
+        checked += 1;
+        if (!routeExists(literal)) {
+            std.debug.print("dispatched path missing from ROUTE_PATHS: {s}\n", .{literal});
+            return error.RoutePathNotRegistered;
+        }
+    }
+    // The scan itself must not silently find nothing.
+    try std.testing.expect(checked >= 30);
 }
 
 test "parseModelFromRequest reads the model out of a multipart form, not just JSON" {
