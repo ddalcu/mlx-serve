@@ -168,7 +168,7 @@ class HFSearchService: ObservableObject {
             return nil
         }
         do {
-            let (data, response) = try await URLSession.shared.data(from: url)
+            let (data, response) = try await DownloadSession.shared.data(for: DownloadManager.hfApiRequest(url))
             guard let httpResponse = response as? HTTPURLResponse, httpResponse.statusCode == 200 else {
                 let code = (response as? HTTPURLResponse)?.statusCode ?? 0
                 error = "HuggingFace API error (HTTP \(code))"
@@ -213,7 +213,7 @@ class HFSearchService: ObservableObject {
                     // listed — `parseFallbackSize` sums each quant's shards, so
                     // a subfoldered repo reports a real size instead of "—".
                     guard let url = URL(string: "https://huggingface.co/api/models/\(model.id)/tree/main?recursive=true") else { return nil }
-                    guard let (data, response) = try? await URLSession.shared.data(from: url),
+                    guard let (data, response) = try? await DownloadSession.shared.data(for: DownloadManager.hfApiRequest(url)),
                           let http = response as? HTTPURLResponse, http.statusCode == 200,
                           let raw = try? JSONSerialization.jsonObject(with: data) as? [[String: Any]] else { return nil }
                     let entries = Self.treeEntries(from: raw)
