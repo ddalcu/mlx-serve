@@ -191,6 +191,77 @@ final class MediaBundleTests: XCTestCase {
         XCTAssertEqual(AudioModelPreset.qwen3TTS17B8bit.repo, "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-8bit")
     }
 
+    /// Kokoro's bundle is NOT the TTS bundle. Reusing `tts(...)` demanded a
+    /// `speech_tokenizer/` Kokoro does not have, so a fully downloaded Kokoro
+    /// read as permanently incomplete — the pane would offer Download forever
+    /// and the voice would never enable. The dictionaries live in `g2p/`, so
+    /// the pull has to be recursive too.
+    func testKokoroBundleIsNotTheTtsBundle() {
+        let b = AudioModelPreset.kokoro82M.bundle
+        XCTAssertEqual(b.components.count, 1)
+        XCTAssertTrue(b.components[0].selection.recursive, "g2p/ is a subdir — a shallow pull misses the phonemizer")
+        let m = b.components[0].readyMarkers
+        for marker in ["config.json", "model.safetensors", "voices.safetensors", "g2p"] {
+            XCTAssertTrue(m.contains(marker), "missing readyMarker \(marker)")
+        }
+        XCTAssertFalse(m.contains("speech_tokenizer"),
+                       "Kokoro has no speech_tokenizer — requiring it makes a complete download read as incomplete forever")
+        XCTAssertEqual(b.primaryRepo, "ddalcu/Kokoro-82M-MLX-Serve")
+    }
+
+    /// Class guard: the `.audio` slot hosts two architectures with different
+    /// repo shapes, and `supportsCloning` is the discriminator. A third audio
+    /// backend must not silently inherit the wrong bundle.
+    func testAudioBundleDispatchFollowsTheDeclaredCapability() {
+        for p in AudioModelPreset.allIncludingVoiceOnly {
+            let m = p.bundle.components[0].readyMarkers
+            if p.supportsCloning {
+                XCTAssertTrue(m.contains("speech_tokenizer"), "\(p.id) clones — it needs the codec tokenizer")
+            } else {
+                XCTAssertTrue(m.contains("g2p"), "\(p.id) can't clone — it needs the phonemizer dictionaries")
+            }
+        }
+    }
+
+    /// Kokoro is voice-mode only. `.all` is what the MEDIA panes offer, and
+    /// both AudioGenView's reference-clip control and VideoGenView's "Speak
+    /// text" composer send `ref_audio` — which Kokoro answers with a named 400.
+    /// Keeping it out of `.all` makes that unreachable by construction; a
+    /// future "tidy up the catalog" that re-adds it would only show up as a
+    /// runtime 400 in the Video pane.
+    func testKokoroIsAbsentFromTheMediaGenCatalog() {
+        XCTAssertFalse(AudioModelPreset.all.contains { $0.id == AudioModelPreset.kokoro82M.id })
+        XCTAssertTrue(AudioModelPreset.all.allSatisfy(\.supportsCloning),
+                      "every preset a media pane can pick must accept ref_audio")
+        XCTAssertTrue(AudioModelPreset.allIncludingVoiceOnly.contains { $0.id == AudioModelPreset.kokoro82M.id },
+                      "still downloadable from the model browser")
+    }
+
+    /// The readiness contract the download bar reads, against a real temp dir:
+    /// the complete Kokoro layout is ready, and dropping `g2p/` is not.
+    func testKokoroReadinessNeedsTheG2pDictionaries() throws {
+        let fm = FileManager.default
+        let root = NSTemporaryDirectory() + "kokorotest-\(UUID().uuidString)"
+        let modelDir = (root as NSString).appendingPathComponent("ddalcu/Kokoro-82M-MLX-Serve")
+        try fm.createDirectory(atPath: modelDir, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(atPath: root) }
+
+        let comp = AudioModelPreset.kokoro82M.bundle.components[0]
+        XCTAssertFalse(DownloadManager.componentReady(comp, modelsRoot: root))
+
+        func file(_ name: String) -> String { (modelDir as NSString).appendingPathComponent(name) }
+        fm.createFile(atPath: file("config.json"), contents: Data("{}".utf8))
+        fm.createFile(atPath: file("model.safetensors"), contents: Data([0, 1, 2]))
+        fm.createFile(atPath: file("voices.safetensors"), contents: Data([0, 1, 2]))
+        try fm.createDirectory(atPath: file("g2p"), withIntermediateDirectories: true)
+        XCTAssertTrue(DownloadManager.componentReady(comp, modelsRoot: root))
+
+        // The phonemizer dictionaries are load-bearing — without them the
+        // engine has no text→IPA path, so a g2p-less dir is NOT ready.
+        try fm.removeItem(atPath: file("g2p"))
+        XCTAssertFalse(DownloadManager.componentReady(comp, modelsRoot: root))
+    }
+
     func testKreaBundleIsSinglePublicRecursiveComponent() {
         let k = ImageModelPreset.krea2Turbo.bundle
         // One public component, no gated dependency, recursive (pulls the weight subdirs).
@@ -383,7 +454,7 @@ final class MediaBundleTests: XCTestCase {
             XCTAssertEqual(ids.count, Set(ids).count, "\(label) has a duplicate id")
         }
         assertUnique(ImageModelPreset.all, "image")
-        assertUnique(AudioModelPreset.all, "audio")
+        assertUnique(AudioModelPreset.allIncludingVoiceOnly, "audio")
         assertUnique(VideoModelPreset.all, "video")
         assertUnique(MusicModelPreset.all, "music")
     }
@@ -398,7 +469,7 @@ final class MediaBundleTests: XCTestCase {
             }
         }
         assertDisplayable(ImageModelPreset.all, "image")
-        assertDisplayable(AudioModelPreset.all, "audio")
+        assertDisplayable(AudioModelPreset.allIncludingVoiceOnly, "audio")
         assertDisplayable(VideoModelPreset.all, "video")
         assertDisplayable(MusicModelPreset.all, "music")
     }
@@ -413,7 +484,7 @@ final class MediaBundleTests: XCTestCase {
             }
         }
         assertDescribed(ImageModelPreset.all, "image")
-        assertDescribed(AudioModelPreset.all, "audio")
+        assertDescribed(AudioModelPreset.allIncludingVoiceOnly, "audio")
         assertDescribed(VideoModelPreset.all, "video")
         assertDescribed(MusicModelPreset.all, "music")
     }

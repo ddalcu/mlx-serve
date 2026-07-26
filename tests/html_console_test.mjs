@@ -45,6 +45,66 @@ test('every element app.js reaches for exists in index.html', () => {
   assert.deepEqual(missing, [], 'app.js references ids absent from index.html');
 });
 
+// The scope class no pure test can see either: the pure helpers and the DOM
+// wiring live in ONE IIFE, and the helpers are handed to tests through an
+// `if (typeof globalThis !== 'undefined') { … }` block at the bottom of the
+// pure layer. A helper written INSIDE that block is block-scoped under
+// 'use strict', so it reaches the export object (built in the same block) and
+// every test here, while being invisible to the wiring below it. Live
+// 2026-07-26: four voice helpers landed inside the guard, and the first call
+// from the wiring (`if (sttSupported(window))`) threw
+// "ReferenceError: Can't find variable: sttSupported" — which aborts the rest
+// of the IIFE, so the send button, the keyboard handler and the whole boot
+// block (newChat / showTab / refreshModels) never ran. The page still renders
+// and still serves; node still loads app.js (it returns before the wiring) and
+// every test below still passed.
+test('the __mlxConsole export guard wraps ONLY the export', () => {
+  const lines = src.split('\n');
+  const start = lines.findIndex(l => l.includes("if (typeof globalThis !== 'undefined') {"));
+  assert.ok(start >= 0, 'the export guard must exist');
+  const end = lines.indexOf('  }', start + 1);
+  assert.ok(end > start, 'the export guard must close at IIFE indentation');
+
+  const declared = lines
+    .slice(start + 1, end)
+    .filter(l => /^\s*(?:function|var|let|const)\s/.test(l))
+    .map(l => l.trim());
+  assert.deepEqual(declared, [],
+    'declared inside the export guard, so invisible to the DOM wiring below — ' +
+    'move these above the guard, which must contain nothing but __mlxConsole');
+});
+
+// And the same class caught dynamically: BOOT the wiring. Every DOM access
+// goes through a Proxy that swallows anything, so this asserts one thing only
+// — the IIFE runs to the end. It is the sole test that exercises the half of
+// app.js below `typeof document`, where a ReferenceError takes out every
+// listener and the whole boot block after it.
+test('the DOM wiring boots without reaching for something out of scope', () => {
+  const saved = ['document', 'window', 'location', 'localStorage', 'fetch',
+                 'setInterval', 'setTimeout', 'AbortController']
+    .map(k => [k, Object.getOwnPropertyDescriptor(globalThis, k)]);
+  const stub = () => new Proxy(function () {}, {
+    get: (t, k) => (k === Symbol.toPrimitive || k === 'toString' ? () => '' : stub()),
+    set: () => true, apply: () => stub(), construct: () => stub(), has: () => true,
+  });
+  try {
+    globalThis.document = stub();
+    globalThis.window = stub();
+    globalThis.location = { search: '', hash: '' };
+    globalThis.localStorage = { getItem: () => null, setItem: () => {}, removeItem: () => {} };
+    globalThis.fetch = () => new Promise(() => {});
+    globalThis.setInterval = () => 0;
+    globalThis.setTimeout = () => 0;
+    globalThis.AbortController = function () { this.abort = () => {}; this.signal = {}; };
+    new Function(src)();
+  } finally {
+    for (const [k, d] of saved) {
+      if (d) Object.defineProperty(globalThis, k, d); else delete globalThis[k];
+    }
+    new Function(src)();   // restore the pure-layer export for the tests below
+  }
+});
+
 test('the sidebar destinations are New chat, Monitor, API in that order', () => {
   const html = readFileSync(join(here, '..', 'src', 'html', 'index.html'), 'utf8');
   const order = [...html.matchAll(/data-tab="(\w+)"/g)].map(m => m[1]);
@@ -777,4 +837,129 @@ test('errorText prefers the server\'s own message', () => {
   );
   assert.equal(C.errorText({ error: 'flat string' }, 400), 'flat string');
   assert.match(C.errorText(null, 503), /503/);
+});
+
+// ── Voice mode ──────────────────────────────────────────────────────────────
+// STT is the browser's (Web Speech); TTS is Kokoro on this server. Everything
+// that can be wrong without a microphone lives here.
+
+test('speakableChunks strips markup instead of reading it aloud', () => {
+  // Raw markdown read by a TTS model is unusable: a fence becomes minutes of
+  // punctuation and a URL becomes alphabet soup.
+  assert.deepEqual(C.speakableChunks('Here is **bold** and _italic_ text.'),
+                   ['Here is bold and italic text.']);
+  assert.deepEqual(C.speakableChunks('# Heading\nBody text here.'),
+                   ['Heading Body text here.']);
+  assert.deepEqual(C.speakableChunks('See [the docs](https://example.com/x) now.'),
+                   ['See the docs now.']);
+  assert.deepEqual(C.speakableChunks('Go to https://example.com/very/long/path please.'),
+                   ['Go to a link please.']);
+  assert.deepEqual(C.speakableChunks('Use `git status` first.'), ['Use git status first.']);
+  assert.deepEqual(C.speakableChunks('- one\n- two\n- three'), ['one two three']);
+  assert.deepEqual(C.speakableChunks('> quoted line here.'), ['quoted line here.']);
+});
+
+test('speakableChunks announces a code block rather than reciting it', () => {
+  const out = C.speakableChunks('First line.\n```js\nlet x = 1;\nfoo(bar);\n```\nAfter.');
+  const joined = out.join(' ');
+  assert.ok(joined.includes('(code block)'), 'the listener must know something was skipped');
+  assert.ok(!joined.includes('let x'), 'code must not be spoken');
+  assert.ok(!joined.includes('```'));
+});
+
+test('speakableChunks handles an UNTERMINATED fence (a stream cut mid-block)', () => {
+  const out = C.speakableChunks('Here you go:\n```python\nimport os');
+  const joined = out.join(' ');
+  assert.ok(!joined.includes('import os'), 'a half-streamed fence must not be recited');
+  assert.ok(joined.includes('(code block)'));
+});
+
+test('speakableChunks splits on sentence ends and keeps the terminator', () => {
+  // Question prosody depends on the model still seeing the "?".
+  const out = C.speakableChunks('One thing happened. Then another thing? Yes indeed!');
+  assert.equal(out.length, 3);
+  assert.ok(out[0].endsWith('.'));
+  assert.ok(out[1].endsWith('?'));
+  assert.ok(out[2].endsWith('!'));
+});
+
+test('speakableChunks merges runts so a word is not its own round trip', () => {
+  const out = C.speakableChunks('This is a full sentence. OK.');
+  assert.equal(out.length, 1, 'a 3-character sentence should ride along');
+  assert.ok(out[0].includes('OK'));
+});
+
+test('speakableChunks caps long clauses under Kokoro context', () => {
+  // Kokoro's context is 510 phoneme tokens: an uncapped clause 400s rather
+  // than truncating, which would drop the sentence silently.
+  const long = 'word '.repeat(400).trim() + '.';
+  const out = C.speakableChunks(long);
+  assert.ok(out.length > 1, 'must be split');
+  for (const c of out) assert.ok(c.length <= 300, `chunk too long: ${c.length}`);
+});
+
+test('speakableChunks on empty or markup-only input yields nothing to say', () => {
+  assert.deepEqual(C.speakableChunks(''), []);
+  assert.deepEqual(C.speakableChunks(null), []);
+  assert.deepEqual(C.speakableChunks('```\ncode only\n```'), ['(code block)']);
+  assert.deepEqual(C.speakableChunks('---'), []);
+});
+
+test('sttSupported detects both the standard and webkit prefixes', () => {
+  assert.equal(C.sttSupported({ SpeechRecognition: function () {} }), true);
+  assert.equal(C.sttSupported({ webkitSpeechRecognition: function () {} }), true);
+  assert.equal(C.sttSupported({}), false);
+  assert.equal(C.sttSupported(null), false);
+});
+
+test('the mic runs ONLY while listening', () => {
+  // Leaving it live during playback makes the page transcribe the assistant's
+  // own voice and answer its own sentence.
+  assert.equal(C.micShouldRun('listening'), true);
+  assert.equal(C.micShouldRun('speaking'), false);
+  assert.equal(C.micShouldRun('thinking'), false);
+  assert.equal(C.micShouldRun('off'), false);
+});
+
+test('voice state machine only returns to listening AFTER speech finishes', () => {
+  let s = 'off';
+  s = C.voiceNext(s, 'enable');      assert.equal(s, 'listening');
+  s = C.voiceNext(s, 'transcript');  assert.equal(s, 'thinking');
+  s = C.voiceNext(s, 'reply');       assert.equal(s, 'speaking');
+  // The event that would reopen the mic mid-playback must be inert.
+  assert.equal(C.voiceNext('speaking', 'transcript'), 'speaking');
+  s = C.voiceNext(s, 'spoken');      assert.equal(s, 'listening');
+});
+
+test('voice state machine: disable always wins, from any state', () => {
+  for (const st of C.VOICE_STATES) {
+    if (st === 'off') continue;
+    assert.equal(C.voiceNext(st, 'disable'), 'off', `${st} must be cancellable`);
+  }
+});
+
+test('voice state machine: a failed turn returns to listening, not a dead end', () => {
+  // An empty reply or an error must not strand voice mode in "thinking" with
+  // the mic off — that reads as the feature being broken.
+  assert.equal(C.voiceNext('thinking', 'error'), 'listening');
+});
+
+test('voice state machine ignores nonsense transitions', () => {
+  assert.equal(C.voiceNext('off', 'spoken'), 'off');
+  assert.equal(C.voiceNext('listening', 'reply'), 'listening');
+  assert.equal(C.voiceNext('off', 'bogus'), 'off');
+});
+
+test('speechBody never sends both voice and ref_audio', () => {
+  // They belong to DIFFERENT backends and each is a named 400 on the other.
+  const withVoice = C.speechBody({ model: 'm', text: 'hi', voice: 'af_heart', refAudio: 'AAAA' });
+  assert.equal(withVoice.voice, 'af_heart');
+  assert.equal(withVoice.ref_audio, undefined);
+
+  const withClip = C.speechBody({ model: 'm', text: 'hi', refAudio: 'AAAA' });
+  assert.equal(withClip.ref_audio, 'AAAA');
+  assert.equal(withClip.voice, undefined);
+
+  const plain = C.speechBody({ model: 'm', text: 'hi' });
+  assert.deepEqual(plain, { model: 'm', input: 'hi' });
 });

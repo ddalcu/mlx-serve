@@ -1565,7 +1565,19 @@ fn handleConnection(
     // names like "gpt-4" or "claude-opus-4-x" expecting the local server to
     // just respond with whatever it has loaded; the multi-model registry's
     // strict-id semantics are opt-in by sending an id we registered.
-    var requested_model_id = parseModelFromRequest(request_body, request_content_type) orelse "";
+    // Swift's JSON writers escape '/' as '\\/' (Foundation does this
+    // unconditionally, both JSONSerialization and JSONEncoder). That is legal
+    // JSON, but the id is read out of the RAW body, so an HF-style `org/repo`
+    // id arrived as `Runpod\\/FLUX.2-…`, matched nothing in the registry, and
+    // silently fell through to the default model — a 400 "does not support
+    // this media modality" on the gen endpoints, and a wrong-model answer on
+    // chat (live from the iPhone app, 2026-07-25). Canonicalise once, here,
+    // so every consumer below (proxy, peek, ensureLoaded) sees the real id.
+    var model_id_buf: [512]u8 = undefined;
+    var requested_model_id = lan_mod.unescapeJsonSlashes(
+        &model_id_buf,
+        parseModelFromRequest(request_body, request_content_type) orelse "",
+    );
     // ── LAN-discovered remote model (`<id>@<peer>`) → proxy the request to
     //    its host byte-for-byte, model field rewritten to the bare id.
     //    Any DIRECT client may initiate the hop (loopback app, the
@@ -6578,7 +6590,11 @@ fn lanShareDenial(l: *lan_mod.Lan, registry: *ModelRegistry, method: []const u8,
         .denied => return "This endpoint is host-local; LAN sharing exposes inference on shared models only",
         .model_gated => {},
     }
-    const mid = parseModelFromRequest(body, content_type) orelse "";
+    var mid_buf: [512]u8 = undefined;
+    const mid = lan_mod.unescapeJsonSlashes(
+        &mid_buf,
+        parseModelFromRequest(body, content_type) orelse "",
+    );
     if (lan_mod.splitRemoteId(mid) != null and registry.peek(mid) == null) {
         // A remote (@peer) id from a DIRECT client is allowed — dispatch
         // proxies exactly one hop and the peer's own gate governs its model

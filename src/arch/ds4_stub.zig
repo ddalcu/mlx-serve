@@ -36,7 +36,10 @@ pub const OpenOptions = struct {
     n_threads: c_int = 0,
     warm_weights: bool = true,
     quality: bool = false,
-    mtp_path: ?[:0]const u8 = null,
+    // Match arch/ds4.zig's OpenOptions.mtp_path (?[]const u8): the shared
+    // scheduler call site passes a non-sentinel slice, which coerces to the
+    // real engine's type but not to a sentinel-terminated one.
+    mtp_path: ?[]const u8 = null,
     mtp_draft_tokens: c_int = 0,
     mtp_margin: f32 = 0,
     ssd_streaming: bool = false,

@@ -16,16 +16,21 @@ import SwiftUI
 struct VoiceSelectorMenu: View {
     @ObservedObject var voice: VoiceModeController
     @EnvironmentObject var appState: AppState
+    @EnvironmentObject private var downloads: DownloadManager
     /// true = tray caption styling; false = the overlay's material pill.
     let compact: Bool
 
     /// Disk check cached per appearance — the menu body re-evaluates on every
     /// controller publish (~20 Hz while speaking), too often for a stat call.
     @State private var ttsDownloaded = false
+    @State private var kokoroDownloaded = false
     @State private var pickError: String?
+    /// Previews the voice as it is picked, so the tray is auditionable too.
+    @StateObject private var previewer = VoicePreviewer()
 
     var body: some View {
         Menu {
+            kokoroSection
             cloneSection
             systemSection
         } label: {
@@ -35,7 +40,15 @@ struct VoiceSelectorMenu: View {
         .menuIndicator(.hidden)
         .fixedSize()
         .help("Choose the speech voice — your cloned voice or a system voice. Add higher-quality system voices in System Settings → Accessibility → Spoken Content.")
-        .onAppear { ttsDownloaded = VoiceCloneMenuModel.ttsModelDownloaded() }
+        .onAppear {
+            restatVoiceModels()
+            previewer.attach(server: appState.server)
+        }
+        // A download that finishes while the tray is open would otherwise leave
+        // Kokoro looking unavailable until the menu is reopened. Re-stat when a
+        // download STATE publishes — not per render, which is what the
+        // snapshots above exist to avoid.
+        .onChange(of: voiceModelDownloadStatuses) { _, _ in restatVoiceModels() }
         .alert("Couldn't use that audio file",
                isPresented: Binding(get: { pickError != nil },
                                     set: { if !$0 { pickError = nil } })) {
@@ -47,11 +60,49 @@ struct VoiceSelectorMenu: View {
 
     // MARK: Menu sections
 
+    /// Kokoro's 54 voices, grouped by language. Selecting one switches the
+    /// engine AND plays a short sample, so picking a voice in the tray is the
+    /// same gesture as in Settings.
+    @ViewBuilder private var kokoroSection: some View {
+        Section("Kokoro voices") {
+            if let reason = VoiceCloneMenuModel.kokoroUnavailableReason(kokoroDownloaded: kokoroDownloaded) {
+                Text(reason)
+            } else {
+                ForEach(KokoroVoiceCatalog.grouped(), id: \.language) { group in
+                    Menu(group.language) {
+                        ForEach(group.voices, id: \.self) { v in
+                            Button {
+                                appState.serverOptions.voiceEngine = .kokoro
+                                appState.serverOptions.kokoroVoice = v
+                                previewer.preview(v)
+                            } label: {
+                                if kokoroActive && appState.serverOptions.kokoroVoice == v {
+                                    Label(KokoroVoiceCatalog.displayName(for: v), systemImage: "checkmark")
+                                } else {
+                                    Text(KokoroVoiceCatalog.displayName(for: v))
+                                }
+                            }
+                        }
+                    }
+                }
+                // A blend is set in Settings (it needs free text); surface it
+                // here as a tickable row when one is active so the tray never
+                // shows a plain voice while a blend is what speaks.
+                if kokoroActive && KokoroVoiceCatalog.isBlend(appState.serverOptions.kokoroVoice) {
+                    Label(KokoroVoiceCatalog.blendDisplayName(for: appState.serverOptions.kokoroVoice),
+                          systemImage: "checkmark")
+                }
+            }
+        }
+    }
+
     @ViewBuilder private var cloneSection: some View {
         Section("Your voice") {
             if !clipPath.isEmpty {
                 Button {
+                    appState.serverOptions.voiceEngine = .clone
                     appState.serverOptions.voiceCloneEnabled = true
+                    previewer.stop()
                 } label: {
                     if cloneActive {
                         Label(VoiceCloneMenuModel.cloneItemTitle(label: cloneLabel),
@@ -78,7 +129,9 @@ struct VoiceSelectorMenu: View {
                 Button {
                     // Switching to an Apple voice turns the clone off but
                     // keeps the clip — "My voice" stays one click away.
+                    appState.serverOptions.voiceEngine = .system
                     appState.serverOptions.voiceCloneEnabled = false
+                    previewer.stop()
                     voice.selectVoice(v.id)
                 } label: {
                     if v.id == voice.selectedVoiceId && !cloneActive {
@@ -122,25 +175,47 @@ struct VoiceSelectorMenu: View {
 
     private var collapsedTitle: String {
         VoiceCloneMenuModel.collapsedLabel(
+            engine: appState.serverOptions.voiceEngine,
             clipPath: clipPath,
             cloneEnabled: appState.serverOptions.voiceCloneEnabled,
             ttsModelDownloaded: ttsDownloaded,
+            kokoroDownloaded: kokoroDownloaded,
+            kokoroVoice: appState.serverOptions.kokoroVoice,
             cloneLabel: cloneLabel,
             systemVoiceName: voice.availableVoices.first { $0.id == voice.selectedVoiceId }?.name)
     }
 
     private var collapsedIcon: String {
-        cloneActive ? "person.wave.2.fill" : "speaker.wave.2.fill"
+        if kokoroActive { return "waveform" }
+        return cloneActive ? "person.wave.2.fill" : "speaker.wave.2.fill"
     }
 
     // MARK: State helpers
 
+    /// Every tracked repo's status, projected to something `onChange` can
+    /// compare. A dictionary of a handful of enums is far cheaper than the two
+    /// disk stats it gates, and watching ALL repos (not just Kokoro's) means a
+    /// finished Qwen3-TTS download un-greys the clone rows too.
+    private var voiceModelDownloadStatuses: [String: DownloadManager.DownloadState.Status] {
+        downloads.downloads.mapValues(\.status)
+    }
+
+    private func restatVoiceModels() {
+        ttsDownloaded = VoiceCloneMenuModel.ttsModelDownloaded()
+        kokoroDownloaded = VoiceCloneMenuModel.kokoroModelDownloaded()
+    }
+
     private var clipPath: String { appState.serverOptions.voiceClonePath }
     private var cloneLabel: String { appState.serverOptions.voiceCloneLabel }
     private var cloneActive: Bool {
+        appState.serverOptions.voiceEngine == .clone &&
         VoiceCloneMenuModel.cloneIsActive(clipPath: clipPath,
                                           cloneEnabled: appState.serverOptions.voiceCloneEnabled,
                                           ttsModelDownloaded: ttsDownloaded)
+    }
+    private var kokoroActive: Bool {
+        VoiceCloneMenuModel.kokoroIsActive(engine: appState.serverOptions.voiceEngine,
+                                          kokoroDownloaded: kokoroDownloaded)
     }
 
     private func pickCloneFile() {
@@ -149,6 +224,7 @@ struct VoiceSelectorMenu: View {
             appState.serverOptions.voiceClonePath = picked.path
             appState.serverOptions.voiceCloneLabel = picked.label
             appState.serverOptions.voiceCloneEnabled = true
+            appState.serverOptions.voiceEngine = .clone
         } catch {
             pickError = error.localizedDescription
         }

@@ -1844,13 +1844,130 @@ private struct VoiceCloneSectionContent: View {
     @EnvironmentObject var appState: AppState
     @StateObject private var recorder = AudioRecorder()
     @State private var voiceError: String?
+    /// Built lazily against the app's server so previews reuse the resident
+    /// Kokoro model instead of loading it per click.
+    @StateObject private var previewer = VoicePreviewer()
+    @EnvironmentObject private var downloads: DownloadManager
 
     private static let explainer = "A few seconds of clean speech works best. Answers are synthesized locally by the Audio pane's TTS model (downloaded on first use)."
+    /// Per-engine blurb. The old single string described Kokoro AND cloning and
+    /// was shown under every tab, so picking "System voice" read as advice about
+    /// a model you had not chosen.
+    private static func engineExplainer(_ e: VoiceEngine) -> String {
+        switch e {
+        case .system:
+            return "The built-in macOS voice. No download and no GPU, but the least natural of the three."
+        case .clone:
+            return "Copies the voice from the clip below using Qwen3-TTS. Slower and much heavier than Kokoro, and it needs the model downloaded from the Audio tile."
+        case .kokoro:
+            return "A small, very fast model (about 17x realtime, a tenth of the memory of the cloning model) with 54 built-in voices you can blend. It can't copy your voice."
+        }
+    }
 
     var body: some View {
-        SearchableRow(searchText: ["Voice clone clip", Self.explainer, "Record", "Choose file"]) {
-            clipBody
+        SearchableRow(searchText: ["Voice engine", "Kokoro", "System voice", "cloned"]) {
+            engineBody
         }
+        // The clip control only makes sense for the backend that can USE it —
+        // Kokoro has no cloning and asking it to clone is a named 400, so the
+        // control is hidden rather than left dead (the image-preset rule).
+        if appState.serverOptions.voiceEngine == .clone {
+            SearchableRow(searchText: ["Voice clone clip", Self.explainer, "Record", "Choose file"]) {
+                clipBody
+            }
+        }
+        if appState.serverOptions.voiceEngine == .kokoro {
+            SearchableRow(searchText: ["Kokoro voice", "blend", "preview"]
+                          + AudioModelPreset.kokoroVoices) {
+                kokoroBody
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var engineBody: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Voice engine").font(.subheadline.weight(.semibold))
+            Picker("", selection: $appState.serverOptions.voiceEngine) {
+                ForEach(VoiceEngine.allCases, id: \.self) { e in
+                    Text(e.label).tag(e)
+                }
+            }
+            .labelsHidden()
+            .pickerStyle(.segmented)
+            Text(Self.engineExplainer(appState.serverOptions.voiceEngine))
+                .font(.caption2).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+        }
+        // Stop a preview when the engine changes — otherwise a Kokoro sample
+        // keeps talking after switching to the system voice.
+        .onChange(of: appState.serverOptions.voiceEngine) { _, _ in previewer.stop() }
+        .onAppear { previewer.attach(server: appState.server) }
+    }
+
+    private var kokoroBundle: MediaBundle { AudioModelPreset.kokoro82M.bundle }
+    private var kokoroReady: Bool { downloads.bundleReady(kokoroBundle) }
+
+    @ViewBuilder
+    private var kokoroBody: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Kokoro voice").font(.subheadline.weight(.semibold))
+            // Selecting the engine has to be able to GET the model — the gen
+            // panes have had this bar all along; Settings ▸ Voice was the one
+            // place that offered a backend with no way to fetch it. Collapses to
+            // nothing once the bundle is complete.
+            BundleDownloadBar(bundle: kokoroBundle)
+            // A bare `.frame(maxWidth:)` centres the popup inside the flexible
+            // width; the row needs an explicit leading alignment plus a Spacer
+            // to sit against the left edge like every other control here.
+            HStack(spacing: 8) {
+                Picker("", selection: $appState.serverOptions.kokoroVoice) {
+                    // Grouped by language so 54 entries are navigable, and named
+                    // rather than shown as raw wire ids.
+                    ForEach(KokoroVoiceCatalog.grouped(), id: \.language) { group in
+                        Section(group.language) {
+                            ForEach(group.voices, id: \.self) { v in
+                                Text(KokoroVoiceCatalog.displayName(for: v)).tag(v)
+                            }
+                        }
+                    }
+                }
+                .labelsHidden()
+                .frame(width: 260)
+
+                Button {
+                    previewer.preview(appState.serverOptions.kokoroVoice)
+                } label: {
+                    if previewer.isPreviewing(appState.serverOptions.kokoroVoice) {
+                        ProgressView().controlSize(.small)
+                    } else {
+                        Label("Play", systemImage: "play.circle")
+                    }
+                }
+                .help(kokoroReady ? "Hear a short sample of this voice"
+                                  : "Download the model first")
+                .disabled(previewer.active != nil || !kokoroReady)
+
+                Spacer(minLength: 0)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            Text("Voices blend: type several separated by commas (af_bella,af_sky) to make a new one.")
+                .font(.caption2).foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+            if let e = previewer.error {
+                Text(e).font(.caption).foregroundStyle(.orange)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+        }
+        // Auditioning on SELECTION is the whole point — the user asked to hear
+        // the voice they just picked, not to hunt for a play button.
+        // Audition on SELECTION — but only once the weights are here, or every
+        // pick would fire a request that can only fail.
+        .onChange(of: appState.serverOptions.kokoroVoice) { _, newValue in
+            if kokoroReady { previewer.preview(newValue) }
+        }
+        .onDisappear { previewer.stop() }
     }
 
     @ViewBuilder

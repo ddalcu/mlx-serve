@@ -641,7 +641,11 @@
 
   function speechBody(o) {
     var body = { model: o.model, input: o.text };
-    if (o.refAudio) body.ref_audio = o.refAudio;
+    // ref_audio and voice belong to DIFFERENT backends and each is a named 400
+    // on the other, so never send both.
+    if (o.voice) body.voice = o.voice;
+    else if (o.refAudio) body.ref_audio = o.refAudio;
+    if (o.speed) body.speed = o.speed;
     return body;
   }
 
@@ -719,6 +723,102 @@
     return 'request failed (HTTP ' + status + ')';
   }
 
+  /// Prose a TTS model should actually SAY, cut from one markdown reply.
+  ///
+  /// Reading raw markdown aloud is unusable: a fenced code block becomes
+  /// minutes of punctuation, a URL becomes an alphabet soup, and `**bold**`
+  /// becomes "star star bold star star". So this strips the markup rather than
+  /// escaping it, drops whole code blocks (announcing them instead, so the
+  /// listener knows something was skipped), and splits on sentence ends so
+  /// playback can start on sentence 1 while the rest is still synthesizing.
+  function speakableChunks(md) {
+    if (!md) return [];
+    var text = String(md);
+
+    // Fenced code: replace the WHOLE block with a spoken marker.
+    text = text.replace(/```[\s\S]*?```/g, ' (code block) ');
+    text = text.replace(/```[\s\S]*$/, ' (code block) ');   // unterminated fence
+    // Inline code keeps its content — it is usually a short identifier.
+    text = text.replace(/`([^`]*)`/g, '$1');
+    // Links: say the label, never the URL.
+    text = text.replace(/!\[([^\]]*)\]\([^)]*\)/g, '$1');
+    text = text.replace(/\[([^\]]*)\]\([^)]*\)/g, '$1');
+    // A bare URL is unspeakable.
+    text = text.replace(/https?:\/\/\S+/g, ' a link ');
+    // Emphasis, headings, quotes, list bullets, table pipes, rules.
+    text = text.replace(/^\s{0,3}#{1,6}\s*/gm, '');
+    text = text.replace(/(\*\*|__)(.*?)\1/g, '$2');
+    text = text.replace(/(\*|_)(.*?)\1/g, '$2');
+    text = text.replace(/^\s{0,3}>\s?/gm, '');
+    text = text.replace(/^\s{0,3}[-*+]\s+/gm, '');
+    text = text.replace(/^\s{0,3}\d+[.)]\s+/gm, '');
+    text = text.replace(/^\s{0,3}([-*_]\s*){3,}$/gm, ' ');
+    text = text.replace(/\|/g, ' ');
+    text = text.replace(/\s+/g, ' ').trim();
+    if (!text) return [];
+
+    // Split after . ! ? … when followed by space/end. Keeps the terminator so
+    // the model still hears the sentence type (question prosody matters).
+    var parts = text.match(/[^.!?…]+[.!?…]+|[^.!?…]+$/g) || [text];
+    var out = [];
+    for (var i = 0; i < parts.length; i++) {
+      var t = parts[i].trim();
+      if (!t) continue;
+      // Merge a RUNT onto the previous chunk — "OK." is a whole round trip for
+      // nothing. The bar is deliberately low (8): "Yes indeed!" is a real
+      // sentence and deserves its own prosody, so a generous threshold would
+      // quietly flatten short replies together.
+      if (out.length && t.length < 8) out[out.length - 1] += ' ' + t;
+      else out.push(t);
+    }
+    // Cap each chunk: Kokoro's context is 510 phoneme tokens, and a very long
+    // clause would 400 rather than truncate.
+    var capped = [];
+    for (var j = 0; j < out.length; j++) {
+      var c = out[j];
+      while (c.length > 300) {
+        var cut = c.lastIndexOf(' ', 300);
+        if (cut <= 0) cut = 300;
+        capped.push(c.slice(0, cut).trim());
+        c = c.slice(cut).trim();
+      }
+      if (c) capped.push(c);
+    }
+    return capped;
+  }
+
+  /// Is browser speech recognition available? STT is the BROWSER's job here
+  /// (no server-side ASR endpoint exists yet), so the mic must hide rather than
+  /// offer a button that cannot work — Safari and Chrome differ on the prefix.
+  function sttSupported(win) {
+    if (!win) return false;
+    return !!(win.SpeechRecognition || win.webkitSpeechRecognition);
+  }
+
+  /// Voice-mode state machine. Explicit because the audible failure is a
+  /// half-state: the mic still listening while the reply is being spoken makes
+  /// the assistant transcribe ITSELF and answer its own sentence.
+  var VOICE_STATES = ['off', 'listening', 'thinking', 'speaking'];
+  function voiceNext(state, event) {
+    switch (state + ':' + event) {
+      case 'off:enable': return 'listening';
+      case 'listening:transcript': return 'thinking';
+      case 'listening:disable': return 'off';
+      case 'thinking:reply': return 'speaking';
+      case 'thinking:disable': return 'off';
+      case 'thinking:error': return 'listening';
+      // Back to listening only AFTER speech finishes — never during.
+      case 'speaking:spoken': return 'listening';
+      case 'speaking:disable': return 'off';
+      default: return state;
+    }
+  }
+  /// The mic may only be live while listening.
+  function micShouldRun(state) { return state === 'listening'; }
+
+  // Everything above is IIFE-scoped on purpose: the DOM wiring below calls
+  // these too, and a helper declared inside this block would be visible to the
+  // export and to the tests while being a ReferenceError on the page.
   if (typeof globalThis !== 'undefined') {
     globalThis.__mlxConsole = {
       pickModels: pickModels,
@@ -742,6 +842,11 @@
       editFields: editFields,
       musicBody: musicBody,
       speechBody: speechBody,
+      speakableChunks: speakableChunks,
+      sttSupported: sttSupported,
+      voiceNext: voiceNext,
+      micShouldRun: micShouldRun,
+      VOICE_STATES: VOICE_STATES,
       apiKeyFrom: apiKeyFrom,
       authHeaders: authHeaders,
       addTimings: addTimings,
@@ -1678,6 +1783,10 @@
       }
       setStatus(formatTurnStats(stats));
       if (finalText) messageActions(out, finalText);
+      // Voice mode: say the reply, then resume listening. Guarded on the state
+      // so a typed turn never starts talking.
+      if (VOICE.state === 'thinking' && finalText) speakReply(finalText);
+      else if (VOICE.state === 'thinking') voiceSet('error');
     } catch (err) {
       // Stopped, or navigated away mid-stream: keep whatever the model had
       // already written rather than throwing the turn away.
@@ -1710,8 +1819,147 @@
     ta.style.height = Math.min(ta.scrollHeight, 200) + 'px';
   }
 
+  // ══ Voice mode ════════════════════════════════════════════════════════════
+  // STT is the BROWSER's (Web Speech); TTS is Kokoro on this server. The mic
+  // only runs while `listening` — leave it live during playback and the page
+  // transcribes the assistant's own voice and answers itself.
+  var VOICE = { state: 'off', rec: null, audio: null, queue: [], speaking: false };
+
+  function voiceModelId() {
+    var ids = rankedIds(MODELS, 'speech');
+    return ids.length ? ids[0] : null;
+  }
+
+  function voiceSet(event) {
+    var next = voiceNext(VOICE.state, event);
+    if (next === VOICE.state) return;
+    VOICE.state = next;
+    var b = $('chat-voice');
+    b.className = 'pill' + (next === 'off' ? '' : ' on ' + next);
+    $('chat-voice-label').textContent =
+      next === 'off' ? 'Voice'
+      : next === 'listening' ? 'Listening'
+      : next === 'thinking' ? 'Thinking'
+      : 'Speaking';
+    if (micShouldRun(next)) startMic(); else stopMic();
+    if (next === 'off') stopSpeaking();
+  }
+
+  function startMic() {
+    if (VOICE.rec) return;
+    var Ctor = window.SpeechRecognition || window.webkitSpeechRecognition;
+    if (!Ctor) return;
+    var rec = new Ctor();
+    rec.lang = navigator.language || 'en-US';
+    rec.interimResults = true;
+    rec.continuous = false;
+    rec.onresult = function (e) {
+      var finalText = '';
+      for (var i = e.resultIndex; i < e.results.length; i++) {
+        if (e.results[i].isFinal) finalText += e.results[i][0].transcript;
+      }
+      if (!finalText.trim()) return;
+      $('chat-input').value = finalText.trim();
+      voiceSet('transcript');
+      sendChat();
+    };
+    // A recognizer that ends on its own (silence) must be restarted, or voice
+    // mode looks on but stops hearing anything.
+    rec.onend = function () {
+      VOICE.rec = null;
+      if (micShouldRun(VOICE.state)) startMic();
+    };
+    rec.onerror = function (e) {
+      VOICE.rec = null;
+      if (e && (e.error === 'not-allowed' || e.error === 'service-not-allowed')) {
+        setStatus('microphone blocked — allow it in the browser', 'err');
+        voiceSet('disable');
+      }
+    };
+    VOICE.rec = rec;
+    try { rec.start(); } catch (_) { VOICE.rec = null; }
+  }
+
+  function stopMic() {
+    if (!VOICE.rec) return;
+    var r = VOICE.rec;
+    VOICE.rec = null;
+    r.onend = null;
+    try { r.stop(); } catch (_) {}
+  }
+
+  function stopSpeaking() {
+    VOICE.queue = [];
+    VOICE.speaking = false;
+    if (VOICE.audio) { try { VOICE.audio.pause(); } catch (_) {} VOICE.audio = null; }
+  }
+
+  /// Speak a whole reply. Chunks are synthesized one ahead of playback so the
+  /// first sentence starts while the rest is still generating.
+  async function speakReply(text) {
+    var model = voiceModelId();
+    var chunks = speakableChunks(text);
+    if (!model || !chunks.length) { voiceSet('spoken'); return; }
+    VOICE.queue = chunks;
+    VOICE.speaking = true;
+    voiceSet('reply');
+
+    var gen = ++speakGen;
+    var pending = fetchSpeech(model, VOICE.queue[0]);
+    for (var i = 0; i < chunks.length; i++) {
+      if (gen !== speakGen) return;
+      var blobUrl = await pending;
+      if (gen !== speakGen) return;
+      pending = (i + 1 < chunks.length) ? fetchSpeech(model, chunks[i + 1]) : null;
+      if (blobUrl) await playClip(blobUrl, gen);
+    }
+    if (gen === speakGen) { VOICE.speaking = false; voiceSet('spoken'); }
+  }
+  var speakGen = 0;
+
+  async function fetchSpeech(model, text) {
+    try {
+      var r = await fetch('/v1/audio/speech', {
+        method: 'POST',
+        headers: authHeaders({ 'content-type': 'application/json' }),
+        body: JSON.stringify(speechBody({ model: model, text: text, voice: VOICE_NAME })),
+      });
+      if (!r.ok) return null;
+      return URL.createObjectURL(await r.blob());
+    } catch (_) { return null; }
+  }
+
+  function playClip(url, gen) {
+    return new Promise(function (resolve) {
+      var a = new Audio(url);
+      VOICE.audio = a;
+      a.onended = a.onerror = function () {
+        URL.revokeObjectURL(url);
+        if (VOICE.audio === a) VOICE.audio = null;
+        resolve();
+      };
+      if (gen !== speakGen) { resolve(); return; }
+      a.play().catch(function () { resolve(); });
+    });
+  }
+
+  /// Which Kokoro voice the console speaks with. Not a picker yet — the Voice
+  /// pill is a toggle — so this is the model's own default.
+  var VOICE_NAME = 'af_heart';
+
+  if (sttSupported(window)) {
+    $('chat-voice').hidden = false;
+    $('chat-voice').addEventListener('click', function () {
+      voiceSet(VOICE.state === 'off' ? 'enable' : 'disable');
+    });
+  }
+
   $('chat-send').addEventListener('click', sendChat);
-  $('chat-stop').addEventListener('click', function () { if (chatAbort) chatAbort.abort(); });
+  $('chat-stop').addEventListener('click', function () {
+    if (chatAbort) chatAbort.abort();
+    speakGen++; stopSpeaking();
+    if (VOICE.state !== 'off') voiceSet('spoken');
+  });
   $('chat-input').addEventListener('input', autoGrow);
   $('chat-input').addEventListener('keydown', function (e) {
     // Enter sends, Shift+Enter is a newline.

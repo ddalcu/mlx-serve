@@ -428,6 +428,14 @@ struct AudioModelPreset: Identifiable, Hashable {
     let recommendedRefSeconds: Int
     /// Plain-English explanation shown under the model in the Media pane.
     let description: String
+    /// Whether the backend can clone from a reference clip. Kokoro CANNOT —
+    /// asking it to is a named 400, not a silently plain-voiced answer — so the
+    /// preset declares it and the UI hides the clip control rather than
+    /// offering a dead one (the `ImageModelPreset.supportsImg2Img` rule).
+    var supportsCloning: Bool = true
+    /// Built-in voice ids, empty when the backend has none. A comma-separated
+    /// selection BLENDS them server-side.
+    var builtInVoices: [String] = []
 
     static func == (lhs: Self, rhs: Self) -> Bool { lhs.id == rhs.id }
     func hash(into hasher: inout Hasher) { hasher.combine(id) }
@@ -480,10 +488,56 @@ struct AudioModelPreset: Identifiable, Hashable {
         description: "The highest-fidelity voice model here, at full precision — best for expressive, long-form narration when you have the RAM to spare."
     )
 
-    /// Catalog ordered lightest → heaviest. Default (`first`) is the 8-bit
-    /// Qwen3-TTS 0.6B; bf16 builds stay as fidelity fallbacks.
-    /// Only `qwen3_tts` models — the native engine can't serve other TTS archs.
+    /// Kokoro-82M — the fast path. Non-autoregressive, so it is ~17x realtime
+    /// against Qwen3-TTS's ~1.3x, at a fifth of the download and a tenth of the
+    /// RAM. No cloning; instead 54 built-in voices that BLEND by naming several
+    /// (`"af_bella,af_sky"`).
+    ///
+    /// VOICE MODE ONLY — deliberately absent from `all` (see below). Everything
+    /// that speaks with it names this preset directly.
+    static let kokoro82M = AudioModelPreset(
+        id: "kokoro/kokoro-82m",
+        name: "Kokoro 82M (fastest, ~330 MB)",
+        repo: "ddalcu/Kokoro-82M-MLX-Serve",
+        approxDownloadGB: 0.35,
+        approxRAMGB: 1,
+        recommendedRefSeconds: 0,
+        description: "A tiny, very fast voice model with 54 built-in voices you can blend together. No cloning — pick or mix a voice instead.",
+        supportsCloning: false,
+        builtInVoices: kokoroVoices
+    )
+
+    /// The 54 published Kokoro voices. Prefix = language + gender
+    /// (a=American, b=British, e/f/h/i/j/p/z = other languages; f/m = female/male).
+    static let kokoroVoices: [String] = [
+        "af_alloy", "af_aoede", "af_bella", "af_heart", "af_jessica", "af_kore",
+        "af_nicole", "af_nova", "af_river", "af_sarah", "af_sky",
+        "am_adam", "am_echo", "am_eric", "am_fenrir", "am_liam", "am_michael",
+        "am_onyx", "am_puck", "am_santa",
+        "bf_alice", "bf_emma", "bf_isabella", "bf_lily",
+        "bm_daniel", "bm_fable", "bm_george", "bm_lewis",
+        "ef_dora", "em_alex", "em_santa", "ff_siwis",
+        "hf_alpha", "hf_beta", "hm_omega", "hm_psi",
+        "if_sara", "im_nicola",
+        "jf_alpha", "jf_gongitsune", "jf_nezumi", "jf_tebukuro", "jm_kumo",
+        "pf_dora", "pm_alex", "pm_santa",
+        "zf_xiaobei", "zf_xiaoni", "zf_xiaoxiao", "zf_xiaoyi",
+        "zm_yunjian", "zm_yunxi", "zm_yunxia", "zm_yunyang",
+    ]
+
+    /// Presets the MEDIA panes may offer, ordered lightest → heaviest. Default
+    /// (`first`) is the 8-bit Qwen3-TTS 0.6B; bf16 builds stay as fidelity
+    /// fallbacks.
+    ///
+    /// Cloning-capable ONLY: AudioGenView's reference-clip control and
+    /// AudioGenService's `ref_audio` both assume it, and Kokoro answers
+    /// `ref_audio` with a named 400. Keeping Kokoro out makes that impossible
+    /// BY CONSTRUCTION rather than by list ordering.
     static let all: [AudioModelPreset] = [.qwen3TTS06B8bit, .qwen3TTS06B, .qwen3TTS17B8bit, .qwen3TTS17B]
+
+    /// Every audio preset including voice-mode-only backends — for the model
+    /// browser and the catalogue guards, never for a media pane's picker.
+    static let allIncludingVoiceOnly: [AudioModelPreset] = all + [.kokoro82M]
 }
 
 // MARK: - 3D presets (image → mesh)

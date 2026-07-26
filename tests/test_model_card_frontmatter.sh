@@ -22,10 +22,33 @@
 set -u
 cd "$(dirname "$0")/.." || exit 1
 
-# converter scripts that embed a README template as a module-level constant
-CONVERTERS=(
-  tests/convert_mageflow_weights.py
+# Converters that embed a README template as a module-level constant.
+#
+# DISCOVERED, not listed. A hand-maintained list is the same class of bug this
+# file exists to catch: `convert_kokoro_weights.py` was published-ready with no
+# card at all and the list simply did not mention it, so the guard passed 4/4
+# while saying nothing. Anything matching tests/convert_*.py that defines a
+# README is now checked automatically, and the converters that have NO card are
+# named at the end so the gap stays visible instead of silent.
+CONVERTERS=()
+UNCARDED=()
+for f in tests/convert_*.py; do
+  if python3 - "$f" <<'PROBE'
+import ast, sys
+tree = ast.parse(open(sys.argv[1]).read())
+has = any(
+    isinstance(n, ast.Assign)
+    and any(isinstance(t, ast.Name) and t.id == "README" for t in n.targets)
+    for n in tree.body
 )
+sys.exit(0 if has else 1)
+PROBE
+  then
+    CONVERTERS+=("$f")
+  else
+    UNCARDED+=("$f")
+  fi
+done
 
 PASS=0; FAIL=0
 pass() { PASS=$((PASS+1)); }
@@ -85,6 +108,14 @@ PY
   fi
 done
 
+if [ "${#UNCARDED[@]}" -gt 0 ]; then
+  echo
+  echo "NOTE: ${#UNCARDED[@]} converter(s) generate no model card (not published as HF repos):"
+  for f in "${UNCARDED[@]}"; do echo "  - $f"; done
+  echo "  Add a README constant before publishing any of them."
+fi
+
 echo
+echo "checked ${#CONVERTERS[@]} card(s)"
 echo "passed: $PASS  failed: $FAIL"
 [ "$FAIL" -eq 0 ]

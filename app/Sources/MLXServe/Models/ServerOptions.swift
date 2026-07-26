@@ -12,6 +12,24 @@ import Foundation
 /// `requestDefaultFields` metadata to render labels, captions and the
 /// "needs restart" badge automatically — every option carries its own
 /// human-readable explainer.
+/// The voice backend for hands-free mode.
+enum VoiceEngine: String, Codable, CaseIterable, Sendable {
+    /// macOS `AVSpeechSynthesizer`. No download, no GPU, but robotic.
+    case system
+    /// Qwen3-TTS with the global clone clip (`voiceClonePath`).
+    case clone
+    /// Kokoro-82M with a built-in or blended voice.
+    case kokoro
+
+    var label: String {
+        switch self {
+        case .system: return "System voice"
+        case .clone: return "My cloned voice"
+        case .kokoro: return "Kokoro (fast, built-in voices)"
+        }
+    }
+}
+
 struct ServerOptions: Codable, Equatable {
     // MARK: Server-launch flags (require restart)
     var host: String = "0.0.0.0"
@@ -209,6 +227,21 @@ struct ServerOptions: Codable, Equatable {
     /// file's name, or "Recorded clip") — the stored clip itself is always
     /// normalized to `voice-clone.wav`, which is useless as a display name.
     var voiceCloneLabel: String = ""
+
+    /// Which engine hands-free voice mode speaks with. App-side only, like the
+    /// other voice fields — never a server-launch flag, so changing it must not
+    /// prompt a restart.
+    ///
+    /// `.clone` and `.kokoro` are BOTH `/v1/audio/speech`, but on different
+    /// backends with disjoint controls: the clone path sends `ref_audio` and
+    /// has no voice list, Kokoro sends `voice` and cannot clone. Sending the
+    /// wrong one is a named 400 server-side, so the engine choice decides which
+    /// field is sent rather than both being attempted.
+    var voiceEngine: VoiceEngine = .system
+    /// Which Kokoro voice to speak with. A comma-separated list BLENDS voices
+    /// (`"af_bella,af_sky"`) — the reference's own convention, passed through
+    /// verbatim.
+    var kokoroVoice: String = "af_heart"
     /// Wake phrase for hands-free voice mode ("hey loki" by default). Stored
     /// as the user typed it in Settings ▸ Voice; consumers normalize through
     /// `WakeWord.normalizePhrase` (blank → default). App-side like the other
@@ -683,6 +716,15 @@ extension ServerOptions {
         if let v = try c.decodeIfPresent(String.self, forKey: .voiceClonePath) { voiceClonePath = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .voiceCloneEnabled) { voiceCloneEnabled = v }
         if let v = try c.decodeIfPresent(String.self, forKey: .voiceCloneLabel) { voiceCloneLabel = v }
+        if let v = try c.decodeIfPresent(VoiceEngine.self, forKey: .voiceEngine) { voiceEngine = v }
+        else if let legacy = try c.decodeIfPresent(Bool.self, forKey: .voiceCloneEnabled) {
+            // Configs written before the engine picker existed only carried the
+            // clone toggle. Changing a persisted DEFAULT does nothing for
+            // existing users, so migrate the old field explicitly rather than
+            // stranding them on `.system` with a clip they already recorded.
+            voiceEngine = (legacy && !voiceClonePath.isEmpty) ? .clone : .system
+        }
+        if let v = try c.decodeIfPresent(String.self, forKey: .kokoroVoice) { kokoroVoice = v }
         if let v = try c.decodeIfPresent(String.self, forKey: .wakePhrase) { wakePhrase = v }
     }
 }

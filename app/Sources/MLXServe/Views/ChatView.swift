@@ -1140,6 +1140,10 @@ struct ChatDetailView: View {
             VoiceModeView(controller: appState.voice,
                           onClose: { showVoiceMode = false; appState.voice.end() })
                 .environmentObject(appState)
+                // The voice picker inside re-stats its models when a download
+                // publishes; a sheet doesn't inherit the presenter's
+                // environment objects, so it needs its own.
+                .environmentObject(appState.downloads)
         }
         .alert("Enable thinking in Agent mode?", isPresented: $showThinkingInAgentConfirm) {
             Button("Cancel", role: .cancel) { }

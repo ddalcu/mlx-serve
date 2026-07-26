@@ -118,6 +118,8 @@ enum SettingsReset {
                 f("voiceClonePath") { $0.voiceClonePath = $1.voiceClonePath },
                 f("voiceCloneEnabled") { $0.voiceCloneEnabled = $1.voiceCloneEnabled },
                 f("voiceCloneLabel") { $0.voiceCloneLabel = $1.voiceCloneLabel },
+                f("voiceEngine") { $0.voiceEngine = $1.voiceEngine },
+                f("kokoroVoice") { $0.kokoroVoice = $1.kokoroVoice },
                 f("wakePhrase") { $0.wakePhrase = $1.wakePhrase },
             ]
 

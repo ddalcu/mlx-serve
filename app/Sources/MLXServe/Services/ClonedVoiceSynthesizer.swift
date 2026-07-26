@@ -17,15 +17,27 @@ import AVFoundation
 /// routing decisions are unit-testable without audio hardware or a server
 /// (`ClonedVoiceSynthesizerTests`).
 @MainActor
+/// Which neural voice an utterance should use, or nil for the system voice.
+///
+/// The two arms are DIFFERENT BACKENDS with disjoint controls, which is why
+/// this is a sum type and not a pair of optional strings: Qwen3-TTS clones from
+/// a clip and has no voice list, Kokoro names a built-in voice (or a
+/// comma-separated blend) and cannot clone. Sending the wrong field is a named
+/// 400 server-side.
+enum NeuralVoice: Equatable, Sendable {
+    case clone(clipPath: String)
+    case kokoro(voice: String)
+}
+
 final class ClonedVoiceSynthesizer: SpeechSynthesizing {
     /// One sentence + the clip path → WAV bytes; nil = synthesis failed and
     /// the utterance falls back to the system voice.
-    typealias CloneSynth = (_ text: String, _ clipPath: String) async -> Data?
+    typealias CloneSynth = (_ text: String, _ voice: NeuralVoice) async -> Data?
     /// Play one WAV clip to completion.
     typealias ClonePlay = (_ audio: Data) async -> Void
 
     private let system: any SpeechSynthesizing
-    private let clipPath: () -> String?
+    private let voice: () -> NeuralVoice?
     private let synthesizeClone: CloneSynth
     private let playClone: ClonePlay
     /// Silence the in-flight clone clip immediately (barge-in).
@@ -60,13 +72,13 @@ final class ClonedVoiceSynthesizer: SpeechSynthesizing {
     }
 
     init(system: any SpeechSynthesizing,
-         clipPath: @escaping () -> String?,
+         voice: @escaping () -> NeuralVoice?,
          synthesizeClone: @escaping CloneSynth,
          playClone: @escaping ClonePlay,
          stopClonePlayback: @escaping () -> Void = {},
          unloadClone: (() async -> Void)? = nil) {
         self.system = system
-        self.clipPath = clipPath
+        self.voice = voice
         self.synthesizeClone = synthesizeClone
         self.playClone = playClone
         self.stopClonePlayback = stopClonePlayback
@@ -83,13 +95,20 @@ final class ClonedVoiceSynthesizer: SpeechSynthesizing {
         let player = VoiceClonePlayer()
         self.init(
             system: SystemSpeechSynthesizer(),
-            clipPath: {
-                // The voice picker can switch back to a system voice without
-                // deleting the clip — honor that toggle here.
+            voice: {
+                // Re-read per utterance so a Settings change applies to the very
+                // next sentence, with no restart.
                 let o = ServerOptions.load()
-                return (o.voiceCloneEnabled && !o.voiceClonePath.isEmpty) ? o.voiceClonePath : nil
+                switch o.voiceEngine {
+                case .system: return nil
+                case .kokoro:
+                    let v = o.kokoroVoice.trimmingCharacters(in: .whitespaces)
+                    return .kokoro(voice: v.isEmpty ? "af_heart" : v)
+                case .clone:
+                    return o.voiceClonePath.isEmpty ? nil : .clone(clipPath: o.voiceClonePath)
+                }
             },
-            synthesizeClone: { text, clip in await tts.synthesize(text: text, refClipPath: clip) },
+            synthesizeClone: { text, sel in await tts.synthesize(text: text, voice: sel) },
             playClone: { data in await player.play(data) },
             stopClonePlayback: { player.stop() },
             unloadClone: { await tts.unload() }
@@ -101,12 +120,12 @@ final class ClonedVoiceSynthesizer: SpeechSynthesizing {
     func enqueue(_ text: String) {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return }
-        guard let clip = clipPath(), !clip.isEmpty else {
-            system.enqueue(trimmed)     // no clone configured → system voice
+        guard let sel = voice() else {
+            system.enqueue(trimmed)     // no neural voice configured → system
             return
         }
         texts.append(trimmed)
-        pumpSynth(clip: clip)
+        pumpSynth(voice: sel)
     }
 
     func stop() {
@@ -133,14 +152,14 @@ final class ClonedVoiceSynthesizer: SpeechSynthesizing {
 
     /// Stage 1: synthesize queued sentences in order, handing each result to
     /// the play queue as soon as it's ready (playback overlaps synthesis).
-    private func pumpSynth(clip: String) {
+    private func pumpSynth(voice sel: NeuralVoice) {
         guard !synthPumping else { return }
         synthPumping = true
         let gen = generation
         Task { [weak self] in
             while let self, self.generation == gen, !self.texts.isEmpty {
                 let text = self.texts.removeFirst()
-                let audio = await self.synthesizeClone(text, clip)
+                let audio = await self.synthesizeClone(text, sel)
                 guard self.generation == gen else { return }
                 self.playQueue.append(audio.map { .clone($0) } ?? .fallback(text))
                 self.pumpPlay()
@@ -244,10 +263,15 @@ final class VoiceCloneTTS {
 
     init(server: ServerManager) { self.server = server }
 
-    func synthesize(text: String, refClipPath: String?) async -> Data? {
+    func synthesize(text: String, voice sel: NeuralVoice) async -> Data? {
         let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty else { return nil }
-        let preset = AudioGenSettings.load().resolvedModel
+        // The engine choice picks the MODEL too — Kokoro is its own checkpoint,
+        // not a mode of the Qwen3-TTS one.
+        let preset: AudioModelPreset = switch sel {
+        case .kokoro: .kokoro82M
+        case .clone: AudioGenSettings.load().resolvedModel
+        }
         guard let dir = ServerManager.resolveModelDir(repo: preset.repo) else { return nil }
         do {
             let port = try await server.ensureRunning(forGenModelDir: dir)
@@ -256,10 +280,7 @@ final class VoiceCloneTTS {
                 loadedModelId = info.name
                 loadedDir = dir
             }
-            var json: [String: Any] = ["model": loadedModelId ?? dir, "input": trimmed]
-            if let refClipPath, let data = try? Data(contentsOf: URL(fileURLWithPath: refClipPath)) {
-                json["ref_audio"] = data.base64EncodedString()
-            }
+            let json = VoiceCloneTTS.requestBody(model: loadedModelId ?? dir, text: trimmed, voice: sel)
             var wav: Data?
             for try await ev in api.streamGeneration(port: port, path: "/v1/audio/speech", json: json) {
                 if ev["type"] as? String == "complete", let b64 = ev["data"] as? String {
@@ -270,6 +291,26 @@ final class VoiceCloneTTS {
         } catch {
             return nil
         }
+    }
+
+    /// Build the `/v1/audio/speech` body. PURE and static so the field choice
+    /// is testable: the fakes in `ClonedVoiceSynthesizerTests` stub out this
+    /// whole class, so swapping `voice` for `ref_audio` here passed every
+    /// routing test while being a guaranteed 400 in production.
+    ///
+    /// Sends ONLY the field the chosen backend accepts — the other one is a
+    /// named 400 server-side, not an ignored extra.
+    static func requestBody(model: String, text: String, voice sel: NeuralVoice) -> [String: Any] {
+        var json: [String: Any] = ["model": model, "input": text]
+        switch sel {
+        case .kokoro(let v):
+            json["voice"] = v
+        case .clone(let clip):
+            if let data = try? Data(contentsOf: URL(fileURLWithPath: clip)) {
+                json["ref_audio"] = data.base64EncodedString()
+            }
+        }
+        return json
     }
 
     func unload() async {

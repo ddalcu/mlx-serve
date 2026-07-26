@@ -31,7 +31,7 @@ struct ModelBrowserView: View {
         func readyCount<P: MediaModelPreset>(_ presets: [P]) -> Int {
             presets.filter { downloads.bundleReady($0.bundle) }.count
         }
-        return readyCount(ImageModelPreset.all) + readyCount(AudioModelPreset.all)
+        return readyCount(ImageModelPreset.all) + readyCount(AudioModelPreset.allIncludingVoiceOnly)
             + readyCount(VideoModelPreset.all) + readyCount(MusicModelPreset.all)
     }
 
@@ -748,7 +748,10 @@ private struct MediaPane: View {
                     systemImage: "waveform",
                     tint: .green
                 ) {
-                    ForEach(AudioModelPreset.all) { MediaModelRow(preset: $0, physicalMemoryBytes: physicalMemory) }
+                    // The browser lists the FULL catalog — Kokoro is voice-mode
+                    // only (out of `.all`, which the media panes offer) but is
+                    // still a model the user can fetch from here.
+                    ForEach(AudioModelPreset.allIncludingVoiceOnly) { MediaModelRow(preset: $0, physicalMemoryBytes: physicalMemory) }
                 }
                 ModelGroupSection(
                     title: "Video",

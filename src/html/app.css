@@ -566,3 +566,17 @@ table.models .state.error { color: #f28b82 }
   .scroll, .log { padding-left: 16px; padding-right: 16px }
   .dock { padding-left: 12px; padding-right: 12px }
 }
+
+
+/* ── Voice mode ─────────────────────────────────────────────────────────────
+   The mic lives in the COMPOSER row, not the toolbar: the header's width
+   budget is full and anything added there re-triggers » eviction at small
+   widths (same reason the sandbox shield sits here). */
+#chat-voice.on {
+  background: color-mix(in srgb, var(--accent) 22%, transparent);
+  border-color: var(--accent);
+  color: var(--accent);
+}
+#chat-voice.listening #chat-voice-label::after { content: " ● "; color: #e5534b; }
+#chat-voice.speaking #chat-voice-label::after { content: " ♪"; }
+#chat-voice.thinking #chat-voice-label::after { content: " …"; }

@@ -102,9 +102,9 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "build_options", .module = build_options.createModule() },
             .{ .name = "ds4_metal_sources", .module = ds4_metal_sources },
-            .{ .name = "jinja_c", .module = addCHeaderModule(b, b.path("lib/jinja_cpp/jinja_wrapper.h"), b.path("lib/jinja_cpp"), target, optimize) },
-            .{ .name = "stb", .module = addCHeaderModule(b, b.path("lib/stb_image.h"), b.path("lib"), target, optimize) },
-            .{ .name = "webp", .module = addCHeaderModule(b, .{ .cwd_relative = "/opt/homebrew/include/webp/decode.h" }, .{ .cwd_relative = "/opt/homebrew/include" }, target, optimize) },
+            .{ .name = "jinja_c", .module = addCHeaderModule(b, b.path("lib/jinja_cpp/jinja_wrapper.h"), b.path("lib/jinja_cpp"), target, optimize, "") },
+            .{ .name = "stb", .module = addCHeaderModule(b, b.path("lib/stb_image.h"), b.path("lib"), target, optimize, "") },
+            .{ .name = "webp", .module = addCHeaderModule(b, .{ .cwd_relative = "/opt/homebrew/include/webp/decode.h" }, .{ .cwd_relative = "/opt/homebrew/include" }, target, optimize, "") },
         },
     });
 
@@ -182,9 +182,9 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "build_options", .module = build_options.createModule() },
             .{ .name = "ds4_metal_sources", .module = ds4_metal_sources },
-            .{ .name = "jinja_c", .module = addCHeaderModule(b, b.path("lib/jinja_cpp/jinja_wrapper.h"), b.path("lib/jinja_cpp"), target, optimize) },
-            .{ .name = "stb", .module = addCHeaderModule(b, b.path("lib/stb_image.h"), b.path("lib"), target, optimize) },
-            .{ .name = "webp", .module = addCHeaderModule(b, .{ .cwd_relative = "/opt/homebrew/include/webp/decode.h" }, .{ .cwd_relative = "/opt/homebrew/include" }, target, optimize) },
+            .{ .name = "jinja_c", .module = addCHeaderModule(b, b.path("lib/jinja_cpp/jinja_wrapper.h"), b.path("lib/jinja_cpp"), target, optimize, "") },
+            .{ .name = "stb", .module = addCHeaderModule(b, b.path("lib/stb_image.h"), b.path("lib"), target, optimize, "") },
+            .{ .name = "webp", .module = addCHeaderModule(b, .{ .cwd_relative = "/opt/homebrew/include/webp/decode.h" }, .{ .cwd_relative = "/opt/homebrew/include" }, target, optimize, "") },
         },
     });
 
@@ -335,6 +335,15 @@ fn addIosLib(b: *std.Build, version: []const u8, ios_include: []const u8, slice:
     const ios_options = b.addOptions();
     ios_options.addOption([]const u8, "version", version);
     ios_options.addOption(bool, "ios", true);
+    // Mirror the build options the shared engine sources read (server.zig,
+    // scheduler.zig). iOS is sandboxed (no curl/model-pull subprocess), so
+    // mas=true; ds4 + llama.cpp are stubbed here, so their version pins are
+    // unreported. Without these the iOS lib fails to compile ("options has no
+    // member named 'mas'/...").
+    ios_options.addOption(bool, "mas", true);
+    ios_options.addOption([]const u8, "mlx_c_version", "unknown");
+    ios_options.addOption([]const u8, "ds4_commit", "unknown");
+    ios_options.addOption([]const u8, "llama_tag", "unknown");
 
     const mod = b.createModule(.{
         .root_source_file = b.path("src/ios_lib.zig"),
@@ -372,9 +381,9 @@ fn addIosLib(b: *std.Build, version: []const u8, ios_include: []const u8, slice:
     mod.addIncludePath(b.path("lib/jinja_cpp"));
     mod.addIncludePath(b.path("lib"));
     mod.addIncludePath(.{ .cwd_relative = ios_include });
-    mod.addImport("jinja_c", addCHeaderModule(b, b.path("lib/jinja_cpp/jinja_wrapper.h"), b.path("lib/jinja_cpp"), ios_target, .ReleaseFast));
-    mod.addImport("stb", addCHeaderModule(b, b.path("lib/stb_image.h"), b.path("lib"), ios_target, .ReleaseFast));
-    mod.addImport("webp", addCHeaderModule(b, .{ .cwd_relative = b.fmt("{s}/webp/decode.h", .{ios_include}) }, .{ .cwd_relative = ios_include }, ios_target, .ReleaseFast));
+    mod.addImport("jinja_c", addCHeaderModule(b, b.path("lib/jinja_cpp/jinja_wrapper.h"), b.path("lib/jinja_cpp"), ios_target, .ReleaseFast, ios_sdk));
+    mod.addImport("stb", addCHeaderModule(b, b.path("lib/stb_image.h"), b.path("lib"), ios_target, .ReleaseFast, ios_sdk));
+    mod.addImport("webp", addCHeaderModule(b, .{ .cwd_relative = b.fmt("{s}/webp/decode.h", .{ios_include}) }, .{ .cwd_relative = ios_include }, ios_target, .ReleaseFast, ios_sdk));
     mod.addCSourceFile(.{ .file = b.path("lib/stb_image_impl.c"), .flags = &.{"-O2"} });
     mod.addCSourceFile(.{ .file = b.path("lib/stb_image_write_impl.c"), .flags = &.{"-O2"} });
     // xatlas UV unwrapping (C++), used by the Hunyuan3D texture paint stage via
@@ -406,6 +415,7 @@ fn addCHeaderModule(
     include_dir: std.Build.LazyPath,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
+    ios_sdk: []const u8,
 ) *std.Build.Module {
     const translate = b.addTranslateC(.{
         .root_source_file = header_path,
@@ -413,6 +423,13 @@ fn addCHeaderModule(
         .optimize = optimize,
     });
     translate.addIncludePath(include_dir);
+    // iOS cross-compile: addTranslateC (0.17's @cImport replacement) does NOT
+    // inherit the parent module's SDK include search the way inline @cImport
+    // used to, so a header that pulls in <stdio.h>/<inttypes.h> can't find the
+    // Apple libc and translation fails. Wire the SDK's system include here.
+    // Host builds pass "" (their toolchain resolves the system headers).
+    if (ios_sdk.len > 0)
+        translate.addSystemIncludePath(.{ .cwd_relative = b.fmt("{s}/usr/include", .{ios_sdk}) });
     return translate.createModule();
 }
 
