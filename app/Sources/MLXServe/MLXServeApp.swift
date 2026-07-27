@@ -94,6 +94,7 @@ struct MLXCoreApp: App {
                 openSettings: { openAndFocus("settings") },
                 openServerLog: { openAndFocus("serverLog") },
                 openTasks: { openAndFocus("tasks") },
+                openAgents: { openAndFocus("agents") },
                 openSandboxTerminal: { openAndFocus("sandboxTerminal") }
             )
                 .environmentObject(appState)
@@ -232,6 +233,18 @@ struct MLXCoreApp: App {
         }
         .defaultSize(width: 780, height: 560)
 
+        // Agents (personas): who you're talking to, and the settings that
+        // conversation runs under. Configuration only — chatting with an agent
+        // happens in the Chat window.
+        Window("Agents", id: "agents") {
+            AgentsWindow()
+                .environmentObject(appState)
+                .environmentObject(appState.agents)
+                .environmentObject(appState.server)
+                .frame(minWidth: 760, minHeight: 520)
+        }
+        .defaultSize(width: 900, height: 640)
+
         // Scheduled / on-demand agent tasks — the unattended "claw" surface.
         Window("Tasks", id: "tasks") {
             TasksView()
@@ -243,6 +256,9 @@ struct MLXCoreApp: App {
         .defaultSize(width: 900, height: 620)
         .commands {
             CommandMenu("Agent") {
+                Button("Agents…") { openAndFocus("agents") }
+                    .keyboardShortcut("a", modifiers: [.command, .shift])
+
                 Button("Browser") { openAndFocus("browser") }
                     .keyboardShortcut("b", modifiers: [.command, .shift])
 

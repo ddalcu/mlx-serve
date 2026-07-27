@@ -366,12 +366,29 @@ final class TaskScheduler: ObservableObject {
         Self.workDir(for: task.autonomy, taskId: task.id, runId: runId)
     }
 
+    /// The settings one run executes under: an unattended tool loop, with the
+    /// task's own model/folder as the defaults and its agent's overrides on top.
+    private func resolvedSettings(for task: ScheduledTask, runId: UUID) -> ResolvedAgentSettings {
+        appState.resolvedAgentSettings(
+            agentId: task.agentId,
+            toolsEnabled: true,
+            mcpEnabled: task.useMCP,
+            thinkingEnabled: false,
+            autoApprove: false,
+            workingDirectory: task.workingDirectory ?? workDir(for: task, runId: runId),
+            modelPath: task.modelPath)
+    }
+
     private func execute(_ task: ScheduledTask, reason: String) async {
         var run = TaskRun(taskId: task.id, status: .running, triggerReason: reason)
         activeRun = run
         appendRun(run, taskId: task.id)
 
-        guard await ensureServerReady(modelPath: task.modelPath) else {
+        // Resolve the task's agent FIRST: it can supply the model and the working
+        // directory, and every downstream step (server load, session, approval
+        // confinement, the turn itself) has to agree on those.
+        let resolved = resolvedSettings(for: task, runId: run.id)
+        guard await ensureServerReady(modelPath: resolved.modelPath) else {
             run.status = .failed
             run.finishedAt = Date()
             run.summary = "No server/model available to run this task."
@@ -379,31 +396,30 @@ final class TaskScheduler: ObservableObject {
             return
         }
 
-        let dir = workDir(for: task, runId: run.id)
         try? FileManager.default.createDirectory(atPath: TaskPaths.runDir(task.id, run.id),
                                                  withIntermediateDirectories: true)
 
         // Transient hidden session — the agent loop reads/appends through AppState.
         var session = ChatSession(title: "Task: \(task.title)")
         session.mode = .agent
-        session.workingDirectory = dir
+        session.workingDirectory = resolved.workingDirectory
+        session.agentId = task.agentId
         session.taskRunId = run.id
         appState.chatSessions.insert(session, at: 0)
 
-        await driveRun(run: run, task: task, sessionId: session.id, workDir: dir, userText: task.goal)
+        await driveRun(run: run, task: task, sessionId: session.id,
+                       resolved: resolved, userText: task.goal)
     }
 
     /// Run a (possibly resumed) session to completion, observing the dedicated
     /// engine's generation flag, then harvest the transcript. If a tool call paused
     /// the run, persist it as `needsApproval` instead of finishing.
     private func driveRun(run: TaskRun, task: ScheduledTask, sessionId: UUID,
-                          workDir: String?, userText: String) async {
+                          resolved: ResolvedAgentSettings, userText: String) async {
         var run = run
-        let approval = makeApproval(runId: run.id, autonomy: task.autonomy, workDir: workDir)
-        let config = ChatTurnEngine.TurnConfig(
-            agentMode: true, mcpMode: task.useMCP, enableThinking: false,
-            voiceStyle: false, workingDirectory: workDir
-        )
+        let approval = makeApproval(runId: run.id, autonomy: task.autonomy,
+                                    workDir: resolved.workingDirectory)
+        let config = ChatTurnEngine.TurnConfig.from(resolved)
         runEngine.runTurn(sessionId: sessionId, userText: userText,
                           images: nil, audio: nil, config: config, approval: approval)
         if runEngine.isGenerating {
@@ -492,17 +508,19 @@ final class TaskScheduler: ObservableObject {
         activeRun = run
         persistRun(run, taskId: task.id)
 
-        guard await ensureServerReady(modelPath: task.modelPath) else {
+        let resolved = resolvedSettings(for: task, runId: run.id)
+        guard await ensureServerReady(modelPath: resolved.modelPath) else {
             run.status = .failed; run.finishedAt = Date()
             run.summary = "No server/model available to resume this task."
             finalize(run, taskId: task.id)
             return
         }
 
-        let dir = workDir(for: task, runId: run.id)
+        let dir = resolved.workingDirectory ?? workDir(for: task, runId: run.id)
         var session = ChatSession(title: "Task: \(task.title)")
         session.mode = .agent
         session.workingDirectory = dir
+        session.agentId = task.agentId
         session.taskRunId = run.id
         session.messages = transcript(taskId: task.id, runId: run.id)
         appState.chatSessions.insert(session, at: 0)
@@ -523,7 +541,8 @@ final class TaskScheduler: ObservableObject {
             let repetition = AgentEngine.RepetitionTracker()
             let result = await AgentEngine.executeToolCall(
                 tc, workingDirectory: &wd, repetition: repetition, iteration: 0,
-                agentMemory: appState.agentMemory, mcpRouter: appState.mcpManager)
+                agentMemory: appState.agentMemory, mcpRouter: appState.mcpManager,
+                allowedTools: resolved.tools)
             appendToolResult(sessionId: sessionId, id: result.id, name: result.name,
                              display: "**\(result.name)** → \(String(result.output.prefix(500)))",
                              content: AgentEngine.truncateWithOverflow(result.output, toolCallId: result.id, toolName: result.name))
@@ -533,7 +552,7 @@ final class TaskScheduler: ObservableObject {
                              content: "Error: user denied this tool call. Do not retry; try a different approach or stop.")
         }
 
-        await driveRun(run: run, task: task, sessionId: sessionId, workDir: dir,
+        await driveRun(run: run, task: task, sessionId: sessionId, resolved: resolved,
                        userText: "Continue. Use the tool result above. If the task is complete, reply with a short plain-text summary — no tool calls.")
     }
 

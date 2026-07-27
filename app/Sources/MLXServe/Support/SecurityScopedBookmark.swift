@@ -87,6 +87,13 @@ enum SecurityScopedBookmark {
         "attachedFolder.\(sessionId.uuidString)"
     }
 
+    /// An agent's own working directory (the pick in the Agents window). Agents
+    /// each carry their own folder, so each needs its own bookmark — the default
+    /// workspace's global slot can't stand in for them.
+    static func agentWorkspaceName(_ agentId: UUID) -> String {
+        "agentWorkspace.\(agentId.uuidString)"
+    }
+
     // MARK: - Launch-lifetime access
 
     /// Live grants started this launch, keyed by bookmark name.

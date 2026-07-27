@@ -169,6 +169,7 @@ struct StatusMenuView: View {
     let openSettings: () -> Void
     let openServerLog: () -> Void
     let openTasks: () -> Void
+    var openAgents: () -> Void = {}
     var openSandboxTerminal: () -> Void = {}
 
     /// Observes the shared sandbox so the tray badge appears/updates live when
@@ -526,7 +527,7 @@ struct StatusMenuView: View {
 
             // Persistent, window-independent voice assistant — its own row, not
             // a button. Toggle it on and talk hands-free with no chat window.
-            VoiceTrayPanel(voice: appState.voice)
+            VoiceTrayPanel(voice: appState.voice, openAgents: openAgents)
                 .padding(.horizontal, 16)
                 .padding(.vertical, 8)
 

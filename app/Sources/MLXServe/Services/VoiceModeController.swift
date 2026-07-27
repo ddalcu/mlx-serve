@@ -103,6 +103,15 @@ final class VoiceModeController: ObservableObject {
     /// plus the app-level MCP flag and working directory for the turn config.
     /// Wired by `bind(appState:)`; set directly in tests.
     var turnContext: (() -> (sessionId: UUID, workingDirectory: String?))?
+    /// The settings the next turn runs under: the active agent's overrides folded
+    /// into the app defaults (`AgentResolution`). nil in tests → the voice-scoped
+    /// toggles below are used verbatim, which is the pre-agents behavior.
+    var resolveTurn: (() -> ResolvedAgentSettings)?
+    /// Every agent's wake phrase, so hands-free listens for all of them at once.
+    var agentPhrases: (() -> [(id: UUID, phrase: String)])?
+    /// Make an agent active. Returns nil when the switch happened, or a sentence
+    /// to SAY when it can't (its model isn't downloaded, a peer is offline).
+    var selectAgent: ((UUID) -> String?)?
 
     private let recognizer: any SpeechRecognizing
     private let synthesizer: any SpeechSynthesizing
@@ -158,9 +167,50 @@ final class VoiceModeController: ObservableObject {
         runner = appState.chatEngine
         turnContext = { [weak appState] in
             guard let appState else { return (UUID(), nil) }
-            let sid = appState.activeChatId ?? appState.newChatSession()
+            // Route by AGENT, not by whatever tab is open: each agent keeps its
+            // own conversation, so a spoken handover continues that agent's
+            // thread (creating it on first use) rather than talking into — or
+            // rebranding — someone else's. With no agent picked this is the
+            // active tab, exactly as before.
+            let sid = appState.sessionForAgent(appState.defaultAgentId)
             let wd = appState.chatSessions.first { $0.id == sid }?.workingDirectory
             return (sid, wd)
+        }
+        // Agents: which one is answering, everyone who is listening, and what a
+        // spoken switch does. The voice-scoped toggles remain the DEFAULTS the
+        // active agent overrides — with no agent picked, nothing changes.
+        resolveTurn = { [weak appState, weak self] in
+            guard let appState, let self else { return ResolvedAgentSettings() }
+            let sid = appState.activeChatId
+            let session = appState.chatSessions.first { $0.id == sid }
+            // A chat tab's own pick wins for that conversation; otherwise the
+            // tray's agent answers.
+            let agentId = session?.agentId ?? appState.defaultAgentId
+            return appState.resolvedAgentSettings(
+                agentId: agentId,
+                toolsEnabled: self.agentMode,
+                mcpEnabled: self.mcpMode,
+                thinkingEnabled: self.enableThinking,
+                autoApprove: self.autoApproveTools,
+                workingDirectory: session?.workingDirectory)
+        }
+        agentPhrases = { [weak appState] in
+            guard let appState else { return [] }
+            return appState.agents.wakePhrases
+        }
+        selectAgent = { [weak appState] id in
+            guard let appState, let agent = appState.agents.agent(id: id) else { return nil }
+            let decision = appState.agentModelDecision(for: agent)
+            if let decline = AgentModelSwitch.spokenDecline(agentName: agent.name, decision: decision) {
+                return decline
+            }
+            // Switch WHO is answering; the turn then routes itself into that
+            // agent's own thread (`turnContext`). Deliberately no `setAgent` on
+            // the current session — a handover moves the conversation, it doesn't
+            // rebrand the one you were already having.
+            appState.defaultAgentId = id
+            appState.sessionForAgent(id)
+            return nil
         }
 
         // Wake phrase from Settings ▸ Voice, applied live — the user's raw
@@ -369,13 +419,17 @@ final class VoiceModeController: ObservableObject {
     /// Agent, thinking, and MCP all come from the voice-scoped toggles.
     private func submitTurn(_ text: String) {
         guard let runner, let ctx = turnContext?() else { return }
-        let config = ChatTurnEngine.TurnConfig(
-            agentMode: agentMode,
-            mcpMode: mcpMode,
-            enableThinking: enableThinking,
-            voiceStyle: true,
-            workingDirectory: ctx.workingDirectory
-        )
+        // One builder, like every other turn site: the active agent's persona,
+        // tools, sampling and workspace, with the voice-scoped toggles as the
+        // defaults it overrides.
+        let resolved = resolveTurn?() ?? ResolvedAgentSettings(
+            agentId: nil,
+            tools: Set(AgentToolKind.allCases),
+            toolsEnabled: agentMode,
+            mcpEnabled: mcpMode,
+            thinkingEnabled: enableThinking,
+            workingDirectory: ctx.workingDirectory)
+        let config = ChatTurnEngine.TurnConfig.from(resolved, voiceStyle: true)
         runner.runTurn(sessionId: ctx.sessionId, userText: text, images: nil, audio: nil,
                        config: config, approval: { [weak self] tc in
             await self?.approvalDecision(for: tc) ?? false
@@ -476,6 +530,21 @@ final class VoiceModeController: ObservableObject {
     /// should be ignored — either no wake word was present, or it was a bare wake
     /// phrase that only arms the next utterance. Mutates `awaitingWakeQuery`.
     func wakeWordGate(_ utterance: String) -> String? {
+        // An agent's own name always addresses THAT agent — checked first, and
+        // even in always-on mode, because "hey chef" is a request to hand the
+        // conversation over, not a question for whoever is active.
+        if let phrases = agentPhrases?(), !phrases.isEmpty,
+           let hit = WakeWord.match(utterance, phrases: phrases) {
+            // A switch that can't happen is declined OUT LOUD; answering as the
+            // previous agent is the failure the user can't see.
+            if let decline = selectAgent?(hit.id) {
+                synthesizer.enqueue(decline)
+                return nil
+            }
+            chime.play()
+            if hit.query.isEmpty { armFollowUp(); return nil }
+            return hit.query
+        }
         guard requireWakeWord else { return utterance }     // always-on mode
         if awaitingWakeQuery {                              // bare wake phrase last time
             awaitingWakeQuery = false

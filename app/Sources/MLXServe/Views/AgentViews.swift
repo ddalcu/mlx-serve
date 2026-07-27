@@ -191,7 +191,7 @@ struct AgentModeToggle: View {
         }
         .toggleStyle(.button)
         .buttonStyle(.borderless)
-        .help("Agent mode")
+        .help("Tools — run a tool-calling loop")
     }
 }
 

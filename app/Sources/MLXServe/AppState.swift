@@ -103,6 +103,21 @@ class AppState: ObservableObject {
     }
     @Published var pendingSandboxAgentLaunch: SandboxAgentLaunch?
     @Published var agentMemory = AgentMemory()
+    /// Saved personas (`~/.mlx-serve/agents/index.json`) plus the read-only
+    /// starters. Views observe it directly (`.environmentObject(appState.agents)`),
+    /// the same way they observe `server` — see `AppStateAgents` for what picking
+    /// one does.
+    let agents = AgentStore()
+    /// The agent used where there's no per-conversation pick: the voice tray and
+    /// the Quick Launcher. nil = none (app defaults), which is the default.
+    @Published var defaultAgentId: UUID? {
+        didSet {
+            UserDefaults.standard.set(defaultAgentId?.uuidString, forKey: "defaultAgentId")
+            // The tray/launcher speak with this agent's voice from the next
+            // sentence; a chat tab's own pick overrides it when a turn runs there.
+            Task { await applyAgentSelection(defaultAgentId, previousWorkingDirectory: nil) }
+        }
+    }
     @Published var toolExecutor = ToolExecutor()
     /// Owns every agent-spawned background process (started via shell
     /// run_in_background, or adopted by the foreground timeout backstop).
@@ -238,8 +253,16 @@ class AppState: ObservableObject {
         }
         self.serverOptions = opts
         self.mcpMode = UserDefaults.standard.bool(forKey: "mcpMode")
+        self.defaultAgentId = UserDefaults.standard.string(forKey: "defaultAgentId")
+            .flatMap(UUID.init(uuidString:))
         self.quickLauncherEnabled = UserDefaults.standard.bool(forKey: "quickLauncherEnabled")
         server.objectWillChange
+            .sink { [weak self] _ in self?.objectWillChange.send() }
+            .store(in: &cancellables)
+        // Same forwarding for the agent store: the chat chip and the tray picker
+        // observe AppState, not the store, so a newly created or renamed agent
+        // has to reach them without waiting for an unrelated publish.
+        agents.objectWillChange
             .sink { [weak self] _ in self?.objectWillChange.send() }
             .store(in: &cancellables)
 
@@ -264,6 +287,11 @@ class AppState: ObservableObject {
 
         // And the quick launcher's global ⌃Space hotkey.
         if quickLauncherEnabled { quickLauncher.setEnabled(true) }
+
+        // The app-level agent's voice, applied once at launch (didSet doesn't
+        // fire for the init assignment above). Everything else it owns is
+        // resolved per turn.
+        ActiveAgentVoice.set(agents.agent(id: defaultAgentId)?.resolvedVoice)
 
         // Auto-update: stop the server child before the installer relaunches
         // the app (the old process's willTerminate doesn't stop it), then
@@ -416,16 +444,58 @@ class AppState: ObservableObject {
     }
     var visibleChatSessions: [ChatSession] { Self.sidebarSessions(from: chatSessions) }
 
-    func newChatSession() -> UUID {
+    func newChatSession(agentId: UUID? = nil) -> UUID {
         var session = ChatSession()
         // Seed the new tab's MCP toggle from the global default so a user who
-        // generally runs with MCP on keeps it; Think/Agent start off. Each tab
+        // generally runs with MCP on keeps it; Think/Tools start off. Each tab
         // then remembers its own choice (ChatSession.useMCP/enableThinking).
         session.useMCP = mcpMode
+        session.agentId = agentId
         chatSessions.insert(session, at: 0)
         activeChatId = session.id
         saveChatHistory()
         return session.id
+    }
+
+    /// Which existing thread a turn for `agentId` belongs in, or nil to start a
+    /// fresh one. Every agent keeps its OWN conversation, so speaking to Chef
+    /// continues Chef's thread instead of talking into whatever tab was open (and
+    /// instead of quietly rebranding that tab as Chef).
+    ///
+    /// An ACTIVE thread of the same agent wins over a more recently touched one —
+    /// the user opened that one deliberately. Task-run and Telegram-bridge
+    /// sessions are never adopted: they're hidden/transient vehicles (and task
+    /// runs now carry an `agentId` too), so a turn landing in one would corrupt a
+    /// run or write into a read-only mirror. Pure → `AgentSessionThreadTests`.
+    nonisolated static func sessionForAgent(_ agentId: UUID?,
+                                           sessions: [ChatSession],
+                                           activeId: UUID?) -> UUID? {
+        func isConversation(_ s: ChatSession) -> Bool {
+            s.taskRunId == nil && !s.isExternalBridge
+        }
+        let active = sessions.first { $0.id == activeId }.flatMap { isConversation($0) ? $0 : nil }
+        guard let agentId else {
+            // No agent: today's behavior — keep talking into the active tab.
+            return active?.id
+        }
+        if active?.agentId == agentId { return active?.id }
+        return sessions
+            .filter { $0.agentId == agentId && isConversation($0) }
+            .max { $0.updatedAt < $1.updatedAt }?
+            .id
+    }
+
+    /// The thread a turn for `agentId` runs in, creating one when the agent
+    /// doesn't have a conversation yet. Also makes it the ACTIVE chat: the voice
+    /// controller speaks the active session's trailing assistant message, so a
+    /// turn running anywhere else would never be read aloud.
+    @discardableResult
+    func sessionForAgent(_ agentId: UUID?) -> UUID {
+        if let existing = Self.sessionForAgent(agentId, sessions: chatSessions, activeId: activeChatId) {
+            if activeChatId != existing { activeChatId = existing }
+            return existing
+        }
+        return newChatSession(agentId: agentId)
     }
 
     func deleteSession(_ id: UUID) {

@@ -425,6 +425,7 @@ struct ChatView: View {
 
 struct ChatSidebar: View {
     @EnvironmentObject var appState: AppState
+    @Environment(\.openWindow) private var openWindow
     @State private var hoveredSessionId: UUID?
 
     var body: some View {
@@ -487,6 +488,22 @@ struct ChatSidebar: View {
             }
         }
         .listStyle(.sidebar)
+        // Agents above the conversation list: it's the "who" of everything below
+        // it. A real Button (never a tap gesture on a row) so the click can't be
+        // swallowed by the List's own hit-testing.
+        .safeAreaInset(edge: .top) {
+            Button {
+                AppActivation.openWindow(id: "agents", using: openWindow)
+            } label: {
+                Label("Agents", systemImage: "person.2.circle")
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .buttonStyle(.borderless)
+            .padding(.horizontal, 14)
+            .padding(.top, 8)
+            .padding(.bottom, 4)
+            .help("Create and edit agents — a saved prompt, voice, model, tools and workspace you can talk to.")
+        }
         .safeAreaInset(edge: .bottom) {
             Button {
                 _ = appState.newChatSession()
@@ -681,6 +698,60 @@ struct ChatDetailView: View {
         .help(state.help)
     }
 
+    /// Per-tab agent picker. A `Menu` (not a Picker) so an agent whose model
+    /// isn't downloaded can be a disabled row with its reason, and so "Manage
+    /// agents…" sits in the same list. Selecting one applies to SUBSEQUENT turns:
+    /// the transcript is left alone.
+    private var agentChip: some View {
+        Menu {
+            Button {
+                appState.setAgent(nil, forSession: sessionId)
+            } label: {
+                if session?.agentId == nil {
+                    Label("None (app defaults)", systemImage: "checkmark")
+                } else {
+                    Text("None (app defaults)")
+                }
+            }
+            Divider()
+            ForEach(appState.agents.allAgents) { agent in
+                let decision = appState.agentModelDecision(for: agent)
+                Button {
+                    appState.setAgent(agent.id, forSession: sessionId)
+                } label: {
+                    if session?.agentId == agent.id {
+                        Label(agent.name, systemImage: "checkmark")
+                    } else {
+                        Text(AgentModelSwitch.isSelectable(decision)
+                             ? agent.name : "\(agent.name) — model not downloaded")
+                    }
+                }
+                .disabled(!AgentModelSwitch.isSelectable(decision))
+            }
+            Divider()
+            Button("Manage Agents…") {
+                AppActivation.openWindow(id: "agents", using: openWindow)
+            }
+        } label: {
+            Image(systemName: activeAgent?.symbol ?? "person.crop.circle")
+                .font(.system(size: 13, weight: .medium))
+                .foregroundStyle(activeAgent == nil ? .secondary : Color.accentColor)
+                .frame(width: ChatMetrics.composerIconSize, height: ChatMetrics.composerIconSize)
+                .background(Color.secondary.opacity(0.15))
+                .clipShape(Circle())
+                .frame(width: ChatMetrics.composerControlSize, height: ChatMetrics.composerControlSize)
+                .contentShape(Circle())
+        }
+        .menuStyle(.button)
+        .buttonStyle(.plain)
+        .menuIndicator(.hidden)
+        .help(activeAgent.map { "Talking to \($0.name) — its prompt, tools, voice, workspace and model. Click to switch." }
+              ?? "No agent: this chat uses the app's own settings. Click to pick one.")
+    }
+
+    /// The agent this tab is talking to (nil = none).
+    private var activeAgent: Agent? { appState.agents.agent(id: session?.agentId) }
+
     @ViewBuilder
     private var modePillCluster: some View {
         HStack(spacing: ChatMetrics.togglePillSpacing) {
@@ -755,7 +826,7 @@ struct ChatDetailView: View {
                     Image(systemName: "wrench")
                         .font(.system(size: 11, weight: .medium))
                         .frame(width: ChatMetrics.togglePillIconSize, height: ChatMetrics.togglePillIconSize)
-                    Text("Agent")
+                    Text("Tools")
                         .font(.caption.weight(.medium))
                 }
                 .foregroundStyle(toolbarToggles.agent ? .white : .secondary)
@@ -781,7 +852,7 @@ struct ChatDetailView: View {
             }
             .buttonStyle(.plain)
             .help("""
-            Workspace — the working directory for every Agent tool call.
+            Workspace — the working directory for every tool call.
             shell, readFile, writeFile, editFile, searchFiles, listFiles, browse all resolve relative paths from here. When the Agent Sandbox is on, this folder is what's mounted at /workspace in the VM.
             Current: \(session?.workingDirectory ?? "not set")
             Click to pick a new folder.
@@ -791,7 +862,7 @@ struct ChatDetailView: View {
         .background(toolbarToggles.agent ? .orange : Color.secondary.opacity(0.12))
         .clipShape(Capsule())
         .help("""
-        Agent Mode (\(toolbarToggles.agent ? "ON" : "OFF")) — the model runs a tool-calling loop with these 10 built-in tools:
+        Tools (\(toolbarToggles.agent ? "ON" : "OFF")) — the model runs a tool-calling loop with these built-in tools:
           • shell — run a shell command in the workspace
           • cwd — change the workspace working directory
           • readFile — read a file (with line range)
@@ -844,12 +915,12 @@ struct ChatDetailView: View {
                     .contentShape(Rectangle())
             }
             .buttonStyle(.plain)
-            .help("Open MCP Marketplace — browse and enable Model Context Protocol servers (GitHub, Filesystem, Slack, Notion, Playwright, Docker, etc.). Each enabled server's tools become callable in Agent Mode.")
+            .help("Open MCP Marketplace — browse and enable Model Context Protocol servers (GitHub, Filesystem, Slack, Notion, Playwright, Docker, etc.). Each enabled server's tools become callable while Tools is on.")
         }
         .frame(height: ChatMetrics.togglePillHeight)
         .background(toolbarToggles.mcp ? .purple : Color.secondary.opacity(0.12))
         .clipShape(Capsule())
-        .help("MCP Mode (\(toolbarToggles.mcp ? "ON" : "OFF")) — when on, tools from every enabled Model Context Protocol server are added to the Agent's toolset (alongside the 10 built-ins). Tap the gear to open the Marketplace and toggle servers on/off.")
+        .help("MCP Mode (\(toolbarToggles.mcp ? "ON" : "OFF")) — when on, tools from every enabled Model Context Protocol server are added to the toolset (alongside the built-in tools). Tap the gear to open the Marketplace and toggle servers on/off.")
     }
 
     var body: some View {
@@ -968,6 +1039,12 @@ struct ChatDetailView: View {
                 HStack(alignment: .bottom, spacing: 8) {
                     // Sandbox status shield (green = isolated VM, gray = host).
                     sandboxShield
+
+                    // Who this tab is talking to. In the COMPOSER row, not the
+                    // toolbar band — that cluster's width budget is full, and its
+                    // label is agent-name-sized (runtime-variable), which is
+                    // exactly what re-triggers the » eviction class.
+                    agentChip
 
                     // Attachment menu (images/PDFs/audio + document folder)
                     Menu {
@@ -1145,11 +1222,11 @@ struct ChatDetailView: View {
                 // environment objects, so it needs its own.
                 .environmentObject(appState.downloads)
         }
-        .alert("Enable thinking in Agent mode?", isPresented: $showThinkingInAgentConfirm) {
+        .alert("Enable thinking with Tools on?", isPresented: $showThinkingInAgentConfirm) {
             Button("Cancel", role: .cancel) { }
             Button("Enable anyway") { enableThinking = true }
         } message: {
-            Text("Thinking is not recommended with Agent mode — most local models tool-call more reliably without it. Do you still want to enable it?")
+            Text("Thinking is not recommended with Tools on — most local models tool-call more reliably without it. Do you still want to enable it?")
         }
         // Suppressed while Voice mode is open — two sheets can't co-present on
         // macOS, so the approval would never appear and the agent loop would hang.
@@ -1207,13 +1284,13 @@ struct ChatDetailView: View {
         // Pre-send nudge to enable Agent / MCP mode when the message looks like
         // it needs it. "Send Anyway" suppresses the suggestion for this chat.
         .confirmationDialog(
-            pendingIntentPrompt == .mcp ? "Enable MCP first?" : "Enable Agent Mode first?",
+            pendingIntentPrompt == .mcp ? "Enable MCP first?" : "Turn Tools on first?",
             isPresented: Binding(get: { pendingIntentPrompt != nil },
                                  set: { if !$0 { pendingIntentPrompt = nil } }),
             titleVisibility: .visible,
             presenting: pendingIntentPrompt
         ) { prompt in
-            Button(prompt == .mcp ? "Enable MCP & Send" : "Enable Agent Mode & Send") {
+            Button(prompt == .mcp ? "Enable MCP & Send" : "Turn Tools On & Send") {
                 enableForPrompt(prompt)
                 pendingIntentPrompt = nil
                 proceedSend()
@@ -1227,7 +1304,7 @@ struct ChatDetailView: View {
         } message: { prompt in
             Text(prompt == .mcp
                  ? "This looks like it needs one of your MCP servers, but MCP mode is off. Enable it so those tools are available?"
-                 : "This looks like a task for the agent (creating files, running commands, browsing the web…), but Agent mode is off. Enable it so the model can use its tools?")
+                 : "This looks like a task for the agent (creating files, running commands, browsing the web…), but Tools is off. Turn it on so the model can use them?")
         }
         // Persist the toolbar toggles back onto the visible session so each tab
         // remembers its own Think/Agent/MCP choice. Telegram sessions write the
@@ -1576,15 +1653,19 @@ struct ChatDetailView: View {
     private func startVoiceMode() {
         guard !showVoiceMode else { return }
         // Sync the voice toggles to the chat session being opened — talking should
-        // start in the same Think/Agent/MCP mode as the chat you launched it from.
+        // start in the same Think/Tools/MCP mode as the chat you launched it from.
         if let s = session {
             appState.voice.enableThinking = s.enableThinking
             appState.voice.agentMode = s.mode == .agent
             appState.voice.mcpMode = s.useMCP
+            // …and to the same AGENT. Voice routes each turn into its agent's own
+            // thread, so without this a tray default of "Chef" would pull the
+            // conversation out of the tab you launched voice from.
+            appState.defaultAgentId = s.agentId
         }
         showVoiceMode = true
         guard !appState.voice.isActive else { return }
-        if appState.activeChatId == nil { _ = appState.newChatSession() }
+        appState.sessionForAgent(session?.agentId)
         Task { _ = await appState.voice.begin() }   // on permission failure the orb shows the error
     }
 
@@ -1667,14 +1748,18 @@ struct ChatDetailView: View {
             text = text.isEmpty ? pdfText : pdfText + "\n\n" + text
         }
 
-        let config = ChatTurnEngine.TurnConfig(
-            agentMode: isAgentMode,
-            mcpMode: mcpMode,
-            enableThinking: enableThinking,
-            voiceStyle: false,
-            workingDirectory: session?.workingDirectory,
-            documentIndex: appState.documentIndexes[sessionId]
-        )
+        // The toolbar toggles are this surface's DEFAULTS; the tab's agent (if
+        // any) overrides what it declared. One builder, so no field is read from
+        // a global here — see ChatTurnEngine.TurnConfig.
+        let resolved = appState.resolvedAgentSettings(
+            agentId: session?.agentId,
+            toolsEnabled: isAgentMode,
+            mcpEnabled: mcpMode,
+            thinkingEnabled: enableThinking,
+            autoApprove: false,
+            workingDirectory: session?.workingDirectory)
+        let config = ChatTurnEngine.TurnConfig.from(
+            resolved, documentIndex: appState.documentIndexes[sessionId])
         chatEngine.runTurn(sessionId: sessionId, userText: text,
                            images: attachedImages, audio: attachedAudio,
                            config: config,

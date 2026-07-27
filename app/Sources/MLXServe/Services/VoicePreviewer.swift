@@ -87,6 +87,36 @@ final class VoicePreviewer: ObservableObject {
         }
     }
 
+    /// Play a stored clip AS IS — the file the user uploaded or picked.
+    ///
+    /// Deliberately not a synthesis: auditioning a reference clip is "is this the
+    /// right recording?", which the raw file answers instantly and with no model
+    /// downloaded. Same generation/supersede rules as `preview` so clicking
+    /// through clips plays the last one, not all of them.
+    func playClip(path: String) {
+        let path = path.trimmingCharacters(in: .whitespaces)
+        guard !path.isEmpty else { return }
+
+        generation += 1
+        let gen = generation
+        stopPlayback()
+        error = nil
+        active = path
+
+        inFlight = Task { [weak self] in
+            guard let self else { return }
+            guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)), !data.isEmpty else {
+                self.error = "Couldn't read that clip — it may have been moved or deleted."
+                self.active = nil
+                return
+            }
+            guard self.generation == gen else { return }
+            await self.play(data)
+            guard self.generation == gen else { return }
+            self.active = nil
+        }
+    }
+
     /// Stop anything sounding and abandon in-flight work.
     func stop() {
         generation += 1

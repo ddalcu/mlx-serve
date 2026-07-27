@@ -17,6 +17,7 @@ struct NewTaskSheet: View {
     @State private var autonomy: TaskAutonomy
     @State private var modelPath: String?   // nil = use the currently-selected model
     @State private var useMCP: Bool
+    @State private var agentId: UUID?
 
     init(existing: ScheduledTask? = nil, onSubmit: @escaping (ScheduledTask) -> Void) {
         self.existing = existing
@@ -28,6 +29,7 @@ struct NewTaskSheet: View {
         _autonomy = State(initialValue: existing?.autonomy ?? .workspace)
         _modelPath = State(initialValue: existing?.modelPath)
         _useMCP = State(initialValue: existing?.useMCP ?? false)
+        _agentId = State(initialValue: existing?.agentId)
     }
 
     private var baseModels: [LocalModel] {
@@ -112,6 +114,20 @@ struct NewTaskSheet: View {
                     .font(.caption).foregroundStyle(.secondary)
             }
 
+            // Agent (optional persona; supplies the model + workspace below)
+            VStack(alignment: .leading, spacing: 6) {
+                Text("Agent").font(.subheadline.weight(.medium))
+                Picker("", selection: $agentId) {
+                    Text("None (app defaults)").tag(UUID?.none)
+                    ForEach(appState.agents.allAgents) { agent in
+                        Text(agent.name).tag(UUID?.some(agent.id))
+                    }
+                }
+                .labelsHidden()
+                Text("Run this task as one of your agents — its prompt, tools, model and workspace.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+
             // Model (optional pin)
             if !baseModels.isEmpty {
                 VStack(alignment: .leading, spacing: 6) {
@@ -157,6 +173,7 @@ struct NewTaskSheet: View {
                 scheduleText: scheduleText,
                 autonomy: autonomy,
                 modelPath: modelPath,
+                agentId: agentId,
                 useMCP: useMCP,
                 enabled: existing.enabled,
                 catchUpMissed: existing.catchUpMissed,
@@ -173,6 +190,7 @@ struct NewTaskSheet: View {
                 scheduleText: scheduleText,
                 autonomy: autonomy,
                 modelPath: modelPath,
+                agentId: agentId,
                 useMCP: useMCP
             )
         }

@@ -340,6 +340,9 @@ struct ServerOptions: Codable, Equatable {
         /// creates). Opt-in; works alongside or independently of `agentMode`.
         var useMCP: Bool = false
         var enableThinking: Bool = false
+        /// The agent (persona) the bot answers as; nil = none, i.e. the app's own
+        /// settings and the three flags above verbatim.
+        var agentId: UUID?
         /// Telegram chat IDs allowed to use the bot. Empty = adopt the first
         /// chat that messages (TOFU); the bridge appends the adopted id here.
         var allowedChatIds: [Int64] = []
@@ -742,6 +745,7 @@ extension ServerOptions.TelegramConfig {
         if let v = try c.decodeIfPresent(Bool.self, forKey: .agentMode) { agentMode = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .useMCP) { useMCP = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .enableThinking) { enableThinking = v }
+        agentId = try c.decodeIfPresent(UUID.self, forKey: .agentId)
         if let v = try c.decodeIfPresent([Int64].self, forKey: .allowedChatIds) { allowedChatIds = v }
     }
 }

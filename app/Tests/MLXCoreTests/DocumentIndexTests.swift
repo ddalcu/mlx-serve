@@ -258,14 +258,14 @@ final class DocumentIndexTests: XCTestCase {
     func testCombinedToolsJSONWithDocs() throws {
         // Docs only (plain chat + attached folder): just the search tool.
         let docsOnly = ChatTurnEngine.combinedToolsJSON(
-            agentMode: false, mcpToolsJSON: nil, docsToolJSON: AgentPrompt.searchDocumentsToolJSON)
+            tools: [], mcpToolsJSON: nil, docsToolJSON: AgentPrompt.searchDocumentsToolJSON)
         let docsArr = try XCTUnwrap(try JSONSerialization.jsonObject(
             with: docsOnly!.data(using: .utf8)!) as? [[String: Any]])
         XCTAssertEqual(docsArr.count, 1)
 
         // Agent mode + docs: built-ins plus the search tool.
         let merged = ChatTurnEngine.combinedToolsJSON(
-            agentMode: true, mcpToolsJSON: nil, docsToolJSON: AgentPrompt.searchDocumentsToolJSON)
+            tools: Set(AgentToolKind.allCases), mcpToolsJSON: nil, docsToolJSON: AgentPrompt.searchDocumentsToolJSON)
         let mergedArr = try XCTUnwrap(try JSONSerialization.jsonObject(
             with: merged!.data(using: .utf8)!) as? [[String: Any]])
         let names = mergedArr.compactMap { ($0["function"] as? [String: Any])?["name"] as? String }
@@ -273,7 +273,7 @@ final class DocumentIndexTests: XCTestCase {
         XCTAssertTrue(names.contains("shell"))
 
         // No sources at all → nil (existing behavior).
-        XCTAssertNil(ChatTurnEngine.combinedToolsJSON(agentMode: false, mcpToolsJSON: nil, docsToolJSON: nil))
+        XCTAssertNil(ChatTurnEngine.combinedToolsJSON(tools: [], mcpToolsJSON: nil, docsToolJSON: nil))
     }
 
     // MARK: - Tool dispatch through AgentEngine

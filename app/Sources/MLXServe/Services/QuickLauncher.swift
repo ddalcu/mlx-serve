@@ -53,15 +53,19 @@ enum QuickLauncherLogic {
         return !existing.contains(current)
     }
 
-    /// Launcher turns are plain chat: no agent tools, no MCP, no thinking, no
-    /// voice styling — a quick question deserves a fast, clean answer. The
-    /// full agent belongs in the chat window ("Open in chat" is one keystroke).
-    static func turnConfig() -> ChatTurnEngine.TurnConfig {
-        ChatTurnEngine.TurnConfig(agentMode: false,
-                                  mcpMode: false,
-                                  enableThinking: false,
-                                  voiceStyle: false,
-                                  workingDirectory: nil)
+    /// Launcher turns are plain chat: no tools, no MCP, no thinking, no voice
+    /// styling — a quick question deserves a fast, clean answer.
+    ///
+    /// The app-level agent's PERSONA and sampling do apply (that's what picking
+    /// one means), but its tool loop deliberately does not: this panel has no
+    /// tool-call cards and no approval surface, so a loop here would run blind.
+    /// "Open in chat" is one keystroke away, and that window has both.
+    static func turnConfig(resolved: ResolvedAgentSettings = ResolvedAgentSettings()) -> ChatTurnEngine.TurnConfig {
+        var config = ChatTurnEngine.TurnConfig.from(resolved)
+        config.agentMode = false
+        config.mcpMode = false
+        config.tools = []
+        return config
     }
 
     // MARK: Geometry
@@ -277,8 +281,9 @@ final class QuickLauncherController: NSObject, ObservableObject, NSWindowDelegat
         } else {
             sid = sessionId! // needsNewSession(false) implies non-nil
         }
+        let resolved = appState.resolvedAgentSettings(agentId: appState.defaultAgentId)
         appState.chatEngine.runTurn(sessionId: sid, userText: text, images: nil, audio: nil,
-                                    config: QuickLauncherLogic.turnConfig(),
+                                    config: QuickLauncherLogic.turnConfig(resolved: resolved),
                                     approval: { _ in false })
         updatePanelFrame(keepTopEdge: true)
     }

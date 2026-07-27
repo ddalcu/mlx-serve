@@ -2201,7 +2201,7 @@ private struct MessagingSectionContent: View {
         }
 
         SettingsRow(
-            title: "Agent mode (tools)",
+            title: "Tools",
             explainer: "OFF = plain chat (safe). ON = the bot can run shell commands and read/write files on this Mac, triggered from your phone. Confined to ~/.mlx-serve/telegram-workspace. Only enable if you understand the risk — anyone who can message the locked chat gets this power."
         ) {
             Toggle("", isOn: $appState.serverOptions.telegram.agentMode)
@@ -2211,7 +2211,7 @@ private struct MessagingSectionContent: View {
 
         SettingsRow(
             title: "MCP tools",
-            explainer: "Expose your enabled MCP servers (configured in the MCP marketplace) to the bot and to the tasks it creates. Works with or without Agent mode. Servers start on first use."
+            explainer: "Expose your enabled MCP servers (configured in the MCP marketplace) to the bot and to the tasks it creates. Works with or without Tools. Servers start on first use."
         ) {
             Toggle("", isOn: $appState.serverOptions.telegram.useMCP)
                 .labelsHidden()
@@ -2225,6 +2225,20 @@ private struct MessagingSectionContent: View {
             Toggle("", isOn: $appState.serverOptions.telegram.enableThinking)
                 .labelsHidden()
                 .toggleStyle(.switch)
+        }
+
+        SettingsRow(
+            title: "Answer as agent",
+            explainer: "Reply as one of your agents (Chat window ▸ Agents): its prompt, tools, model and workspace. \"None\" uses the settings above."
+        ) {
+            Picker("", selection: $appState.serverOptions.telegram.agentId) {
+                Text("None").tag(UUID?.none)
+                ForEach(appState.agents.allAgents) { agent in
+                    Text(agent.name).tag(UUID?.some(agent.id))
+                }
+            }
+            .labelsHidden()
+            .frame(width: 200)
         }
 
         // Allow-list / lock control.

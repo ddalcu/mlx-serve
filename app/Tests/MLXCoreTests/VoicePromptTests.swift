@@ -70,4 +70,50 @@ final class VoicePromptTests: XCTestCase {
         XCTAssertTrue(d.contains("Jarvis"))
         XCTAssertFalse(d.contains("Loki"))
     }
+
+    // MARK: - An agent's persona owns the identity
+
+    /// Live 2026-07-26: with an agent selected, the assistant said its name was
+    /// Jarvis — the app's wake-phrase name. The voice guidance is appended LAST
+    /// (so its style rules win any conflict), and it used to open with "You are
+    /// <WakePhraseName>, a friendly hands-free voice assistant", which overrode
+    /// the persona sitting above it. With a persona present the voice prompt must
+    /// carry the DELIVERY rules only and assert no identity at all.
+    func testWithAPersonaTheVoicePromptAssertsNoIdentity() {
+        let style = VoicePrompt.speakingStyle(phrase: "hey jarvis", hasPersona: true)
+        XCTAssertFalse(style.contains("Jarvis"), "no app assistant name: \(style)")
+        XCTAssertFalse(style.contains("You are "), "no competing identity claim")
+        // …but every speakability rule survives.
+        XCTAssertTrue(style.lowercased().contains("markdown"))
+        XCTAssertTrue(style.lowercased().contains("url"))
+        XCTAssertTrue(style.contains("shell command date"))
+        XCTAssertTrue(style.lowercased().contains("brief") || style.lowercased().contains("conversational"))
+    }
+
+    func testWithAPersonaTheModelIsToldToStayInCharacter() {
+        let style = VoicePrompt.speakingStyle(phrase: "hey jarvis", hasPersona: true)
+        XCTAssertTrue(style.lowercased().contains("character") || style.lowercased().contains("stay in"),
+                      "dropping the name isn't enough — say the persona above still holds: \(style)")
+    }
+
+    func testDecorateWithAPersonaKeepsTheAgentPromptInCharge() {
+        let base = "You are Sike, a blunt code reviewer."
+        let d = VoicePrompt.decorate(base, phrase: "hey jarvis", hasPersona: true)
+        XCTAssertTrue(d.hasPrefix(base))
+        XCTAssertFalse(d.contains("Jarvis"))
+        XCTAssertTrue(d.contains("Sike"), "the only name in the prompt is the agent's")
+    }
+
+    func testPlainVoiceChatWithAPersonaAlsoDropsTheAppName() {
+        let p = VoicePrompt.systemPrompt(now: Self.fixedNow, phrase: "hey jarvis", hasPersona: true)
+        XCTAssertFalse(p.contains("Jarvis"))
+        XCTAssertTrue(p.contains("current date and time is"), "grounding still applies")
+    }
+
+    func testWithoutAPersonaTheOldPromptIsByteIdentical() {
+        // No agent ⇒ nothing about the prompt changes.
+        XCTAssertEqual(VoicePrompt.speakingStyle(phrase: "hey loki", hasPersona: false),
+                       VoicePrompt.speakingStyle)
+        XCTAssertTrue(VoicePrompt.speakingStyle(phrase: "hey jarvis").contains("You are Jarvis"))
+    }
 }

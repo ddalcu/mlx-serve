@@ -25,6 +25,10 @@ struct VoiceSelectorMenu: View {
     @State private var ttsDownloaded = false
     @State private var kokoroDownloaded = false
     @State private var pickError: String?
+    /// Uploaded clips, snapshotted per appearance like the disk checks above (the
+    /// menu body re-evaluates ~20 Hz while speaking — far too often to stat a
+    /// folder).
+    @State private var clips: [VoiceClipLibrary.Clip] = []
     /// Previews the voice as it is picked, so the tray is auditionable too.
     @StateObject private var previewer = VoicePreviewer()
 
@@ -42,6 +46,7 @@ struct VoiceSelectorMenu: View {
         .help("Choose the speech voice — your cloned voice or a system voice. Add higher-quality system voices in System Settings → Accessibility → Spoken Content.")
         .onAppear {
             restatVoiceModels()
+            clips = VoiceClipLibrary.clips()
             previewer.attach(server: appState.server)
         }
         // A download that finishes while the tray is open would otherwise leave
@@ -113,7 +118,22 @@ struct VoiceSelectorMenu: View {
                 }
                 .disabled(!ttsDownloaded)
             }
-            Button(clipPath.isEmpty ? "Choose audio file to clone…" : "Choose different audio file…") {
+            // Previously uploaded clips (~/.mlx-serve/voice-clips) — one library
+            // shared with the Agents window, so a clip added there is selectable
+            // here and vice versa.
+            ForEach(clips.filter { $0.path != clipPath }) { clip in
+                Button {
+                    appState.serverOptions.voiceClonePath = clip.path
+                    appState.serverOptions.voiceCloneLabel = clip.name
+                    appState.serverOptions.voiceCloneEnabled = true
+                    appState.serverOptions.voiceEngine = .clone
+                    previewer.stop()
+                } label: {
+                    Text(clip.name)
+                }
+                .disabled(!ttsDownloaded)
+            }
+            Button(clipPath.isEmpty ? "Add voice to clone…" : "Add another voice…") {
                 pickCloneFile()
             }
             .disabled(!ttsDownloaded)
@@ -218,11 +238,15 @@ struct VoiceSelectorMenu: View {
                                           kokoroDownloaded: kokoroDownloaded)
     }
 
+    /// Add a clip to the shared library and select it. Uploads used to overwrite
+    /// the ONE `voice-clone.wav`, so a second one silently cost you the first —
+    /// now each keeps its own name and stays selectable later.
     private func pickCloneFile() {
         do {
-            guard let picked = try VoiceCloneMenuModel.pickAndPersistClip() else { return }
-            appState.serverOptions.voiceClonePath = picked.path
-            appState.serverOptions.voiceCloneLabel = picked.label
+            guard let clip = try VoiceClipLibrary.pickAndInstall() else { return }
+            clips = VoiceClipLibrary.clips()
+            appState.serverOptions.voiceClonePath = clip.path
+            appState.serverOptions.voiceCloneLabel = clip.name
             appState.serverOptions.voiceCloneEnabled = true
             appState.serverOptions.voiceEngine = .clone
         } catch {

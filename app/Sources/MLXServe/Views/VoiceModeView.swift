@@ -122,7 +122,7 @@ struct VoiceModeView: View {
             HStack(spacing: 8) {
                 chip(controller.wakePhraseDisplay, system: "mic.circle", on: controller.requireWakeWord) { controller.requireWakeWord.toggle() }
                 chip("Think", system: "brain", on: controller.enableThinking) { controller.enableThinking.toggle() }
-                chip("Agent", system: "wrench", on: controller.agentMode) {
+                chip("Tools", system: "wrench", on: controller.agentMode) {
                     controller.agentMode.toggle()
                     if controller.agentMode { controller.enableThinking = false }
                 }

@@ -5,7 +5,12 @@ enum ChatMode: String, Codable {
     case agent
 }
 
-enum AgentToolKind: String, Codable, CaseIterable {
+/// Every tool the agent loop can dispatch. The raw value IS the wire name, and
+/// the set of raw values must equal the set of names in
+/// `AgentPrompt.toolDefinitions` — a tool in the JSON with no case here can't be
+/// gated by an agent's capabilities, which is a silent hole in the whole
+/// feature. `AgentCapabilityGateTests` pins that both ways.
+enum AgentToolKind: String, Codable, CaseIterable, Sendable {
     case shell
     case readFile
     case writeFile
@@ -20,6 +25,10 @@ enum AgentToolKind: String, Codable, CaseIterable {
     case killProcess
     case readProcessOutput
     case listProcesses
+    case createTask
+    case generateImage = "generate_image"
+    case generateAudio = "generate_audio"
+    case generateVideo = "generate_video"
 
     var icon: String {
         switch self {
@@ -37,6 +46,10 @@ enum AgentToolKind: String, Codable, CaseIterable {
         case .killProcess: "xmark.octagon"
         case .readProcessOutput: "text.viewfinder"
         case .listProcesses: "list.bullet.rectangle"
+        case .createTask: "calendar.badge.clock"
+        case .generateImage: "photo"
+        case .generateAudio: "waveform"
+        case .generateVideo: "film"
         }
     }
 
@@ -56,6 +69,10 @@ enum AgentToolKind: String, Codable, CaseIterable {
         case .killProcess: "Kill Process"
         case .readProcessOutput: "Read Process Output"
         case .listProcesses: "List Processes"
+        case .createTask: "Create Task"
+        case .generateImage: "Generate Image"
+        case .generateAudio: "Generate Audio"
+        case .generateVideo: "Generate Video"
         }
     }
 }

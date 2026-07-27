@@ -128,8 +128,12 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
         self.appState = appState
     }
 
-    /// Per-turn configuration. Built by the caller (chat window from its
-    /// toolbar toggles; voice controller from its own voice-scoped toggles).
+    /// Per-turn configuration. Every field is DECIDED before it gets here —
+    /// build it with `TurnConfig.from(_:)` out of a `ResolvedAgentSettings`
+    /// rather than reading globals at the call site. Five surfaces start turns
+    /// (chat tab, voice tray, scheduled task, Telegram, Quick Launcher) and a
+    /// per-surface read is exactly how one of them ends up silently ignoring the
+    /// active agent.
     struct TurnConfig {
         var agentMode: Bool
         var mcpMode: Bool
@@ -144,6 +148,75 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
         /// chat id. Threaded into any `createTask` the agent makes so the task's
         /// result is pushed back to that chat. nil for in-app / voice turns.
         var telegramChatId: Int64? = nil
+
+        // MARK: The agent (persona) driving this turn
+
+        /// nil = no agent, i.e. today's behavior in every respect.
+        var agentId: UUID? = nil
+        /// The persona, prepended to the STABLE system-prompt prefix. "" when
+        /// there's no agent.
+        var systemPromptPrefix: String = ""
+        /// The tools this turn may advertise AND dispatch. Defaults to
+        /// everything — full access is what every surface had before agents.
+        var tools: Set<AgentToolKind> = Set(AgentToolKind.allCases)
+        /// Skip the approval gate for this turn (an agent that declared it).
+        var autoApprove: Bool = false
+        /// Sampling overrides; nil = the path's own default (the tool loop and
+        /// plain chat do NOT share one).
+        var temperature: Double? = nil
+        var maxTokens: Int? = nil
+        /// The agent's own voice for this turn; nil = follow Settings.
+        var voice: AgentVoice? = nil
+        /// The spoken name this turn answers to (the agent's phrase when it has
+        /// one). nil = the app's own phrase.
+        var wakePhrase: String? = nil
+
+        /// The one builder every turn site goes through.
+        static func from(_ r: ResolvedAgentSettings,
+                         voiceStyle: Bool = false,
+                         documentIndex: DocumentIndex? = nil,
+                         telegramChatId: Int64? = nil) -> TurnConfig {
+            TurnConfig(
+                agentMode: r.toolsEnabled,
+                mcpMode: r.mcpEnabled,
+                enableThinking: r.thinkingEnabled,
+                voiceStyle: voiceStyle,
+                workingDirectory: r.workingDirectory,
+                documentIndex: documentIndex,
+                telegramChatId: telegramChatId,
+                agentId: r.agentId,
+                systemPromptPrefix: r.systemPromptPrefix,
+                tools: r.tools,
+                autoApprove: r.autoApprove,
+                temperature: r.temperatureOverride,
+                maxTokens: r.maxTokensOverride,
+                voice: r.voiceOverride,
+                wakePhrase: r.wakePhrase
+            )
+        }
+
+        /// The tools to ADVERTISE: none unless the loop is actually running.
+        /// (`tools` itself stays the dispatch allow-list, which must keep
+        /// `searchDocuments` for docs-only turns.)
+        var advertisedTools: Set<AgentToolKind> { agentMode ? tools : [] }
+    }
+
+    // MARK: - Per-turn sampling
+
+    /// The tool loop's own temperature. Deliberately NOT the user's default chat
+    /// temperature — a tool-calling loop wants tighter sampling, and this number
+    /// predates agents, so changing it would move every existing install.
+    static let agentLoopTemperature = 0.7
+
+    /// Token cap for this turn: the agent's override, else the app default.
+    private func turnMaxTokens(_ config: TurnConfig) -> Int {
+        config.maxTokens ?? appState.maxTokens
+    }
+
+    /// Temperature for this turn: the agent's override, else the calling path's
+    /// own default (they differ — see `agentLoopTemperature`).
+    private func turnTemperature(_ config: TurnConfig, default fallback: Double) -> Double {
+        config.temperature ?? fallback
     }
 
     // MARK: - Convenience accessors
@@ -213,6 +286,13 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
 
         activeTurnSessionId = sessionId
 
+        // Publish the answering agent's voice for THIS turn. Doing it only when an
+        // agent is SELECTED left the override stale — editing the active agent's
+        // voice, or answering as a tab's agent that isn't the tray's, spoke in the
+        // app's voice instead of the agent's (a picked clone clip never reached
+        // Qwen3-TTS at all). nil restores the live per-utterance Settings read.
+        ActiveAgentVoice.set(config.voice)
+
         if config.agentMode || config.mcpMode || config.documentIndex != nil {
             runAgentTurn(sessionId: sessionId, text: text, images: images, audio: audio,
                          config: config, approval: approval)
@@ -257,13 +337,26 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
         }
         // Plain chat: no synthesized system message (see the long note in the
         // original ChatView implementation — a "formatNudge" system message was
-        // routinely read by the model AS the user's input). Voice mode is the one
-        // exception: prepend the voice-style guidance so spoken answers stay
-        // short and free of URLs/Markdown.
+        // routinely read by the model AS the user's input). Two exceptions, both
+        // things the user asked for explicitly: an agent's persona, and voice
+        // mode's style guidance (so spoken answers stay short and Markdown-free).
+        // They share ONE system message, persona first.
         var messagesArray = history
+        var plainSystemBits: [String] = []
+        let persona = config.systemPromptPrefix.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !persona.isEmpty { plainSystemBits.append(persona) }
         if config.voiceStyle {
+            // `hasPersona`: with an agent above it, the voice guidance must not
+            // name the assistant after the app's wake phrase — it's appended last,
+            // so that name would override the persona (live: an agent said it was
+            // called Jarvis).
+            plainSystemBits.append(VoicePrompt.systemPrompt(
+                phrase: config.wakePhrase ?? appState.serverOptions.wakePhrase,
+                hasPersona: !persona.isEmpty))
+        }
+        if !plainSystemBits.isEmpty {
             messagesArray.insert(["role": "system",
-                                  "content": VoicePrompt.systemPrompt(phrase: appState.serverOptions.wakePhrase)],
+                                  "content": plainSystemBits.joined(separator: "\n\n")],
                                  at: 0)
         }
 
@@ -290,8 +383,8 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
             let stream = api.streamChat(
                 port: server.port,
                 messages: messages,
-                maxTokens: appState.maxTokens,
-                temperature: appState.serverOptions.defaultTemperature,
+                maxTokens: turnMaxTokens(config),
+                temperature: turnTemperature(config, default: appState.serverOptions.defaultTemperature),
                 enableThinking: config.enableThinking || appState.serverOptions.defaultEnableThinking,
                 defaults: APIClient.RequestDefaults.from(appState.serverOptions),
                 modelId: server.chatModelId
@@ -316,7 +409,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                     // notice immediately (no agent loop to stack it). Flush any
                     // buffered text first so the notice lands after it, in order.
                     applyStreamBatch(coalescer.drain(), to: sessionId)
-                    appState.updateLastMessage(in: sessionId, content: TruncationNotice.text(maxTokens: appState.maxTokens))
+                    appState.updateLastMessage(in: sessionId, content: TruncationNotice.text(maxTokens: turnMaxTokens(config)))
                 case .done:
                     break
                 }
@@ -440,6 +533,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
             guard session(sessionId) != nil else { return }
 
             // Build message history for API
+            let turnMax = turnMaxTokens(config)
             let contextLength = AgentEngine.effectiveContextLength(
                 appContextSize: appState.contextSize,
                 modelContextLength: server.chatModelInfo?.contextLength
@@ -448,7 +542,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
             var history = AgentEngine.buildAgentHistory(
                 messages: session(sessionId)?.messages ?? [],
                 contextLength: contextLength,
-                maxTokens: appState.maxTokens,
+                maxTokens: turnMax,
                 buildMultimodalContent: { text, images in
                     Self.buildMultimodalContent(text: text, images: images, serverPreprocess: useServerPreprocess)
                 }
@@ -519,12 +613,18 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
             // chunks large writes BEFORE truncating (a static "~200 lines" hint
             // gets ignored). Stable within the session → stays in the volatile
             // tail, before the date grounding, so the KV prefix still hits.
-            systemPrompt = Self.composeSystemPrompt(stable: systemPrompt,
-                                                    volatileTail: agentVolatileTail + AgentPrompt.outputBudgetGuidance(maxTokens: appState.maxTokens, contextLength: contextLength),
+            systemPrompt = Self.composeSystemPrompt(persona: config.systemPromptPrefix,
+                                                    stable: systemPrompt,
+                                                    volatileTail: agentVolatileTail + AgentPrompt.outputBudgetGuidance(maxTokens: turnMaxTokens(config), contextLength: contextLength),
                                                     grounding: grounding)
             // Voice mode: tools/thinking run silently; only the final answer is
             // spoken, so steer it to a short, speakable reply (no URLs/Markdown).
-            if config.voiceStyle { systemPrompt = VoicePrompt.decorate(systemPrompt, phrase: appState.serverOptions.wakePhrase) }
+            if config.voiceStyle {
+                systemPrompt = VoicePrompt.decorate(
+                    systemPrompt,
+                    phrase: config.wakePhrase ?? appState.serverOptions.wakePhrase,
+                    hasPersona: !config.systemPromptPrefix.isEmpty)
+            }
             var messages: [[String: Any]] = [["role": "system", "content": systemPrompt]]
             // Some models (e.g. Gemma 4 E4B) can't generate after tool results without
             // a user message. Add a nudge so the model knows to synthesize a response —
@@ -535,7 +635,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
             }
             messages.append(contentsOf: history)
 
-            AgentEngine.dumpDebugRequest(messages: messages, maxTokens: appState.maxTokens)
+            AgentEngine.dumpDebugRequest(messages: messages, maxTokens: turnMax)
 
             // Add streaming assistant message
             var streamMsg = ChatMessage(role: .assistant, content: "")
@@ -546,7 +646,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
             var receivedToolCalls: [APIClient.ToolCall] = []
             var maxTokensHit = false
             let combinedToolsJSON = Self.combinedToolsJSON(
-                agentMode: config.agentMode,
+                tools: config.advertisedTools,
                 mcpToolsJSON: mcpToolsJSON,
                 docsToolJSON: config.documentIndex != nil ? AgentPrompt.searchDocumentsToolJSON : nil
             )
@@ -556,8 +656,8 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
             let stream = api.streamChat(
                 port: server.port,
                 messages: messages,
-                maxTokens: appState.maxTokens,
-                temperature: 0.7,
+                maxTokens: turnMaxTokens(config),
+                temperature: turnTemperature(config, default: Self.agentLoopTemperature),
                 enableThinking: config.enableThinking,
                 toolsJSON: combinedToolsJSON,
                 defaults: APIClient.RequestDefaults.from(appState.serverOptions),
@@ -719,7 +819,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                 // was cut off by the cap, surface the truncation notice exactly
                 // once here — not per iteration in the stream loop above.
                 if TruncationNotice.shouldShow(maxTokensHit: maxTokensHit, turnEnding: true, willRetry: false) {
-                    appState.updateLastMessage(in: sessionId, content: TruncationNotice.text(maxTokens: appState.maxTokens))
+                    appState.updateLastMessage(in: sessionId, content: TruncationNotice.text(maxTokens: turnMaxTokens(config)))
                 }
                 return
             }
@@ -777,7 +877,10 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
             for tc in receivedToolCalls {
                 try Task.checkCancellation()
 
-                let approved = await approval(tc)
+                // An agent that declared auto-approve skips the gate entirely —
+                // one decision, made when the agent was configured, instead of a
+                // dialog per call.
+                let approved = config.autoApprove ? true : await approval(tc)
                 guard approved else {
                     let denied = AgentEngine.ToolResult(
                         id: tc.id,
@@ -817,7 +920,8 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                             ?? "Error: image generation unavailable."
                     },
                     processRegistry: appState.processRegistry,
-                    sessionId: sessionId
+                    sessionId: sessionId,
+                    allowedTools: config.tools
                 )
                 roundOutputs.append(result.output)
                 if let handle = result.backgroundHandle { roundHandles.append(handle) }
@@ -1009,8 +1113,16 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
     /// working-dir listing, learned recent-dirs/commands) and `grounding` (date +
     /// LAN IP) change mid-session, so they go LAST — a change there re-prefills
     /// only the short tail, not the big cached prefix. Pure → unit-tested.
-    nonisolated static func composeSystemPrompt(stable: String, volatileTail: String, grounding: String) -> String {
-        var p = stable + volatileTail
+    /// `persona` (the active agent's system prompt) goes in FRONT of `stable`,
+    /// never in the tail: the tail is re-prefilled every turn, so a persona there
+    /// would cost a re-prefill per message instead of one per agent switch. It is
+    /// "" when there's no agent, and the result is then byte-identical to what
+    /// this produced before agents existed.
+    nonisolated static func composeSystemPrompt(persona: String = "",
+                                                stable: String,
+                                                volatileTail: String,
+                                                grounding: String) -> String {
+        var p = persona + stable + volatileTail
         if !grounding.isEmpty { p += "\n\n" + grounding }
         return p
     }
@@ -1040,10 +1152,14 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
             || openNoClose("<|tool_call>", "<tool_call|>")
     }
 
-    nonisolated static func combinedToolsJSON(agentMode: Bool, mcpToolsJSON: String?,
+    /// `tools` is the agent's resolved allow-list (empty = the loop's own tools
+    /// are off entirely), not a bare on/off flag — the advertised list has to
+    /// match what dispatch will actually run.
+    nonisolated static func combinedToolsJSON(tools: Set<AgentToolKind>, mcpToolsJSON: String?,
                                               docsToolJSON: String? = nil) -> String? {
         // Strip each array's outer brackets, drop empties, re-wrap as one array.
-        let parts = [agentMode ? AgentPrompt.toolDefinitionsJSON : nil, mcpToolsJSON, docsToolJSON]
+        let agentTools = tools.isEmpty ? nil : AgentPrompt.toolDefinitionsJSON(allowing: tools)
+        let parts = [agentTools, mcpToolsJSON, docsToolJSON]
             .compactMap { $0 }
             .map {
                 $0.trimmingCharacters(in: .whitespacesAndNewlines)

@@ -271,6 +271,43 @@ enum AgentPrompt {
     ]
     """#
 
+    /// `toolDefinitionsJSON` filtered to the tools an agent may use.
+    ///
+    /// The filter is LINE-BASED on the literal above, deliberately: the key order
+    /// inside each definition is load-bearing (`path` before `content`, so a
+    /// truncated call still carries the path), and a JSONSerialization round-trip
+    /// would silently reorder it. One tool per line is what makes that safe —
+    /// keep it that way.
+    ///
+    /// An empty set yields `[]`, which `ChatTurnEngine.combinedToolsJSON` drops,
+    /// so "no tools" means no `tools` field on the request rather than an empty
+    /// array the model has to interpret.
+    static func toolDefinitionsJSON(allowing allowed: Set<AgentToolKind>) -> String {
+        let kept = toolDefinitionsJSON
+            .components(separatedBy: "\n")
+            .compactMap { line -> String? in
+                let trimmed = line.trimmingCharacters(in: .whitespaces)
+                guard trimmed.hasPrefix("{") else { return nil }   // skips [ and ]
+                guard let name = toolName(inDefinitionLine: trimmed),
+                      let kind = AgentToolKind(rawValue: name),
+                      allowed.contains(kind) else { return nil }
+                // Drop the separator comma; it's re-added by the join below.
+                return trimmed.hasSuffix(",") ? String(trimmed.dropLast()) : trimmed
+            }
+        guard !kept.isEmpty else { return "[]" }
+        return "[\n  " + kept.joined(separator: ",\n  ") + "\n]"
+    }
+
+    /// The `"name":"…"` of a single tool-definition line. The function name is the
+    /// first such key on the line (parameter properties come later), so a plain
+    /// scan is enough — and stays order-preserving, unlike a parse.
+    static func toolName(inDefinitionLine line: String) -> String? {
+        guard let key = line.range(of: "\"name\":\"") else { return nil }
+        let rest = line[key.upperBound...]
+        guard let end = rest.firstIndex(of: "\"") else { return nil }
+        return String(rest[rest.startIndex..<end])
+    }
+
     /// User-facing replies for the not-yet-wired media tools. Returned verbatim
     /// as the tool result so the model relays them naturally — the audio/video
     /// generation engines exist (tray windows) but the in-chat agent path is

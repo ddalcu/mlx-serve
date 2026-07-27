@@ -114,4 +114,29 @@ final class PerSessionUIStateTests: XCTestCase {
         XCTAssertFalse(back.enableThinking, "missing Think key → off, not a decode failure")
         XCTAssertFalse(back.useMCP, "missing MCP key → off, not a decode failure")
     }
+
+    // MARK: - Which agent a tab is talking to
+
+    func testAgentIdSurvivesACodableRoundTrip() throws {
+        // Same per-tab story as Think/MCP: the picked agent belongs to the chat,
+        // not to the reused detail view or an app-wide flag.
+        var s = ChatSession(title: "t")
+        let agentId = UUID()
+        s.agentId = agentId
+        let back = try JSONDecoder().decode(ChatSession.self, from: JSONEncoder().encode(s))
+        XCTAssertEqual(back.agentId, agentId, "the tab remembers who it's talking to across a relaunch")
+    }
+
+    func testLegacySessionWithoutAnAgentDecodesToNoAgent() throws {
+        let legacy = """
+        {"id":"\(UUID().uuidString)","title":"old","messages":[],
+         "createdAt":0,"updatedAt":0,"mode":"chat","isExternalBridge":false}
+        """.data(using: .utf8)!
+        let back = try JSONDecoder().decode(ChatSession.self, from: legacy)
+        XCTAssertNil(back.agentId, "absent key → no agent → today's behavior, unchanged on upgrade")
+    }
+
+    func testNewSessionsStartWithNoAgent() {
+        XCTAssertNil(ChatSession().agentId, "the default is still \"None (app defaults)\"")
+    }
 }

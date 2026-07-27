@@ -71,6 +71,10 @@ struct ScheduledTask: Identifiable, Codable, Equatable {
     var scheduleText: String?         // verbatim NL the user typed, for re-display/edit
     var autonomy: TaskAutonomy
     var modelPath: String?            // nil = use AppState.selectedModelPath
+    /// The agent (persona) this task runs as; nil = none, i.e. the plain agent
+    /// loop it has always used. An agent supplies the model and working directory
+    /// as DEFAULTS for the two fields above, so a task can be "just run as Coder".
+    var agentId: UUID?
     var useMCP: Bool                  // expose the user's enabled MCP servers to this task
     var enabled: Bool
     var catchUpMissed: Bool           // run once on wake if a slot was missed while asleep
@@ -96,6 +100,7 @@ struct ScheduledTask: Identifiable, Codable, Equatable {
          scheduleText: String? = nil,
          autonomy: TaskAutonomy = .workspace,
          modelPath: String? = nil,
+         agentId: UUID? = nil,
          useMCP: Bool = false,
          enabled: Bool = true,
          catchUpMissed: Bool = true,
@@ -112,6 +117,7 @@ struct ScheduledTask: Identifiable, Codable, Equatable {
         self.scheduleText = scheduleText
         self.autonomy = autonomy
         self.modelPath = modelPath
+        self.agentId = agentId
         self.useMCP = useMCP
         self.enabled = enabled
         self.catchUpMissed = catchUpMissed
@@ -124,7 +130,7 @@ struct ScheduledTask: Identifiable, Codable, Equatable {
     }
 
     enum CodingKeys: String, CodingKey {
-        case id, title, goal, trigger, scheduleText, autonomy, modelPath, useMCP
+        case id, title, goal, trigger, scheduleText, autonomy, modelPath, agentId, useMCP
         case enabled, catchUpMissed, createdAt, lastRunAt, nextFireAt, workingDirectory
         case originTelegramChatId, deleteAfterRun
     }
@@ -138,6 +144,8 @@ struct ScheduledTask: Identifiable, Codable, Equatable {
         scheduleText = try c.decodeIfPresent(String.self, forKey: .scheduleText)
         autonomy = try c.decodeIfPresent(TaskAutonomy.self, forKey: .autonomy) ?? .workspace
         modelPath = try c.decodeIfPresent(String.self, forKey: .modelPath)
+        // Absent (every task saved before agents existed) → no agent.
+        agentId = try c.decodeIfPresent(UUID.self, forKey: .agentId)
         useMCP = try c.decodeIfPresent(Bool.self, forKey: .useMCP) ?? false
         enabled = try c.decodeIfPresent(Bool.self, forKey: .enabled) ?? true
         catchUpMissed = try c.decodeIfPresent(Bool.self, forKey: .catchUpMissed) ?? true

@@ -96,17 +96,10 @@ final class ClonedVoiceSynthesizer: SpeechSynthesizing {
         self.init(
             system: SystemSpeechSynthesizer(),
             voice: {
-                // Re-read per utterance so a Settings change applies to the very
-                // next sentence, with no restart.
-                let o = ServerOptions.load()
-                switch o.voiceEngine {
-                case .system: return nil
-                case .kokoro:
-                    let v = o.kokoroVoice.trimmingCharacters(in: .whitespaces)
-                    return .kokoro(voice: v.isEmpty ? "af_heart" : v)
-                case .clone:
-                    return o.voiceClonePath.isEmpty ? nil : .clone(clipPath: o.voiceClonePath)
-                }
+                // Re-read per utterance so a Settings change — or the active
+                // agent's own voice, which is preferred here — applies to the
+                // very next sentence, with no restart.
+                ActiveAgentVoice.currentNeuralVoice(options: ServerOptions.load())
             },
             synthesizeClone: { text, sel in await tts.synthesize(text: text, voice: sel) },
             playClone: { data in await player.play(data) },
@@ -268,11 +261,15 @@ final class VoiceCloneTTS {
         guard !trimmed.isEmpty else { return nil }
         // The engine choice picks the MODEL too — Kokoro is its own checkpoint,
         // not a mode of the Qwen3-TTS one.
-        let preset: AudioModelPreset = switch sel {
+        // The clone model is resolved against the DISK, not just read from the
+        // Audio pane: the configured default is the 0.6B repo, so a machine with
+        // only the 1.7B variants used to resolve nothing and fall back silently to
+        // the system voice.
+        let preset: AudioModelPreset? = switch sel {
         case .kokoro: .kokoro82M
-        case .clone: AudioGenSettings.load().resolvedModel
+        case .clone: VoiceCloneMenuModel.resolvedCloneModel()
         }
-        guard let dir = ServerManager.resolveModelDir(repo: preset.repo) else { return nil }
+        guard let preset, let dir = ServerManager.resolveModelDir(repo: preset.repo) else { return nil }
         do {
             let port = try await server.ensureRunning(forGenModelDir: dir)
             if loadedModelId == nil || loadedDir != dir {

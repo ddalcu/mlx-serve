@@ -8,6 +8,8 @@ import AppKit
 struct VoiceTrayPanel: View {
     @ObservedObject var voice: VoiceModeController
     @EnvironmentObject var appState: AppState
+    /// Opens the Agents window — the tray can't reach SwiftUI's `openWindow`.
+    var openAgents: () -> Void = {}
 
     var body: some View {
         VStack(alignment: .leading, spacing: 8) {
@@ -22,10 +24,13 @@ struct VoiceTrayPanel: View {
 
             if voice.isActive {
                 statusLine
-                chips
-                if voice.agentMode || voice.mcpMode {
-                    autoApproveRow
-                }
+                // Who am I talking to — and nothing else. The old row of chips
+                // (wake phrase / Agent / MCP / Think), the auto-approve toggle
+                // and the voice picker are all things an AGENT decides now, so
+                // the panel is down to: who, what it's doing, and the three
+                // transport buttons. With no agent picked it behaves exactly as
+                // it always did, on the app's own settings.
+                agentPicker
                 controls
                 if let req = voice.pendingApproval {
                     approvalCard(req)
@@ -53,16 +58,14 @@ struct VoiceTrayPanel: View {
         .help("Hands-free voice assistant — talk to the model with no chat window required. Speech-to-text and text-to-speech run locally on your Mac. When this popover is closed, feedback is audio-only; reopen it for status and controls.")
     }
 
-    /// On → ensure a session exists, then start listening. Off → tear down.
+    /// On → open the selected agent's thread (creating it on first use), then
+    /// start listening. Off → tear down.
     private var activeBinding: Binding<Bool> {
         Binding(
             get: { voice.isActive },
             set: { on in
                 if on {
-                    if appState.activeChatId == nil
-                        || !appState.chatSessions.contains(where: { $0.id == appState.activeChatId }) {
-                        _ = appState.newChatSession()
-                    }
+                    appState.sessionForAgent(appState.defaultAgentId)
                     Task { _ = await voice.begin() }
                 } else {
                     voice.end()
@@ -128,46 +131,55 @@ struct VoiceTrayPanel: View {
         }
     }
 
-    // MARK: Mode chips
+    // MARK: Who am I talking to
 
-    private var chips: some View {
+    /// The agent driving hands-free turns. Picking one also switches its model,
+    /// workspace and voice (`AppState.applyAgentSelection`); an agent whose model
+    /// isn't downloaded is shown as unavailable rather than silently answered by
+    /// whoever was active.
+    private var agentPicker: some View {
         HStack(spacing: 6) {
-            chip(voice.wakePhraseDisplay, system: "mic.circle", on: voice.requireWakeWord) {
-                voice.requireWakeWord.toggle()
+            Image(systemName: activeAgent?.symbol ?? "person.crop.circle")
+                .font(.system(size: 11, weight: .medium))
+                .foregroundStyle(.secondary)
+            Picker("", selection: Binding(get: { appState.defaultAgentId },
+                                          set: { appState.defaultAgentId = $0 })) {
+                Text("None (app defaults)").tag(UUID?.none)
+                ForEach(appState.agents.allAgents) { agent in
+                    Text(agentLabel(agent)).tag(UUID?.some(agent.id))
+                }
             }
-            chip("Agent", system: "wrench", on: voice.agentMode) {
-                voice.agentMode.toggle()
-                if voice.agentMode { voice.enableThinking = false }
-            }
-            chip("MCP", system: "puzzlepiece.extension", on: voice.mcpMode) {
-                voice.mcpMode.toggle()
-            }
-            chip("Think", system: "brain", on: voice.enableThinking) {
-                voice.enableThinking.toggle()
-            }
+            .labelsHidden()
+            .controlSize(.small)
+            .fixedSize()
             Spacer(minLength: 0)
+            Button("Manage…") { openAgents() }
+                .buttonStyle(.link)
+                .font(.caption2)
         }
-        .help("“\(voice.wakePhraseDisplay)”: only send a request when you address the assistant by name — it ignores other talk. Turn off for always-on listening. Customize the phrase in Settings ▸ Voice.")
+        .help("Who you're talking to. An agent brings its own prompt, voice, tools, workspace and model; “None” uses the app's own settings, exactly as before. Say another agent's wake phrase to hand the conversation over mid-session.")
     }
 
-    private var autoApproveRow: some View {
-        Toggle(isOn: $voice.autoApproveTools) {
-            Text("Auto-approve tools (hands-free)")
-                .font(.caption)
-        }
-        .toggleStyle(.switch)
-        .controlSize(.mini)
-        .help("On: tool calls run without asking — required for true hands-free use. Off: each tool call waits for you to Allow or Deny below.")
+    private var activeAgent: Agent? { appState.agents.agent(id: appState.defaultAgentId) }
+
+    private func agentLabel(_ agent: Agent) -> String {
+        AgentModelSwitch.isSelectable(appState.agentModelDecision(for: agent))
+            ? agent.name
+            : "\(agent.name) — model not downloaded"
     }
 
     // MARK: Control row
 
     private var controls: some View {
         HStack(spacing: 10) {
-            controlButton(system: "plus.bubble", label: "New", help: "Start a fresh chat session") {
+            controlButton(system: "plus.bubble", label: "New",
+                          help: "Start a fresh conversation with this agent — the old one stays in the chat list") {
                 appState.chatEngine.stop()
                 voice.bargeIn()
-                _ = appState.newChatSession()
+                // A fresh thread FOR THE SAME AGENT, so the next turn doesn't get
+                // routed straight back into the old one. The previous thread is
+                // left in the sidebar, as it always has been.
+                _ = appState.newChatSession(agentId: appState.defaultAgentId)
             }
             controlButton(system: "stop.fill", label: "Stop",
                           tint: voice.canInterrupt ? .red : nil,
@@ -182,12 +194,7 @@ struct VoiceTrayPanel: View {
                 voice.toggleMute()
             }
             Spacer(minLength: 0)
-            voicePicker
         }
-    }
-
-    private var voicePicker: some View {
-        VoiceSelectorMenu(voice: voice, compact: true)
     }
 
     // MARK: Inline approval card (auto-approve off)
@@ -230,20 +237,6 @@ struct VoiceTrayPanel: View {
     }
 
     // MARK: Small components
-
-    private func chip(_ title: String, system: String, on: Bool, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            HStack(spacing: 3) {
-                Image(systemName: system).font(.system(size: 10, weight: .medium))
-                Text(title).font(.caption2.weight(.medium))
-            }
-            .foregroundStyle(on ? .white : .secondary)
-            .padding(.horizontal, 8).padding(.vertical, 4)
-            .background(on ? Color.accentColor : Color.secondary.opacity(0.15))
-            .clipShape(Capsule())
-        }
-        .buttonStyle(.plain)
-    }
 
     private func controlButton(system: String, label: String, tint: Color? = nil,
                                help: String, action: @escaping () -> Void) -> some View {

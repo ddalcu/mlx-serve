@@ -488,6 +488,29 @@ enum AgentEngine {
         return name
     }
 
+    /// Capability gate: nil when the call may proceed, a named refusal when the
+    /// tool is outside the agent's allowed set.
+    ///
+    /// Filtering the ADVERTISED list isn't enough — models call tools that were
+    /// never advertised (a habit, a leaked example, a stale system prompt), so the
+    /// dispatcher refuses them too. Same belt-and-braces shape as
+    /// `FileToolSandboxGate`. `allowed == nil` gates nothing, which is what
+    /// callers with no agent (TestServer, older surfaces) get.
+    ///
+    /// Only names that resolve to a built-in tool are gated: MCP tools are
+    /// governed by the agent's MCP flag (their servers aren't even started when
+    /// it's off), and a genuinely unknown name keeps its existing "Unknown tool"
+    /// answer, which is what steers the model back to a real one.
+    static func disallowedToolRefusal(name raw: String, allowed: Set<AgentToolKind>?) -> String? {
+        guard let allowed else { return nil }
+        let name = canonicalToolName(raw)
+        guard let kind = AgentToolKind(rawValue: name) else { return nil }
+        guard !allowed.contains(kind) else { return nil }
+        return "Error: the `\(name)` tool is turned off for this agent, so it was not run. "
+            + "Do not call it again. Available tools are listed in this request; "
+            + "if none of them can do this, say so in plain text instead."
+    }
+
     /// Detects when the agent loop is making no progress — consecutive rounds in
     /// which every tool call failed or was blocked — so the loop can stop with a
     /// summary instead of grinding to the iteration cap on an unrecoverable name.
@@ -592,12 +615,20 @@ enum AgentEngine {
         createTask: ((_ goal: String, _ schedule: String?) async -> String)? = nil,
         generateImage: ((_ prompt: String) async -> String)? = nil,
         processRegistry: ProcessRegistry? = nil,
-        sessionId: UUID? = nil
+        sessionId: UUID? = nil,
+        allowedTools: Set<AgentToolKind>? = nil
     ) async -> ToolResult {
         // Normalize the model-emitted name (strip a leaked trailing ':' etc.)
         // before resolving the tool. Repetition tracking stays on the raw
         // `tc.name` to match the caller's `RepetitionTracker.track(toolCalls:)`.
         let name = canonicalToolName(tc.name)
+
+        // The agent's capability gate, ahead of EVERYTHING — including the
+        // meta-tools below, which aren't ToolHandlers and would otherwise run
+        // before any handler-level check could see them.
+        if let refusal = disallowedToolRefusal(name: name, allowed: allowedTools) {
+            return ToolResult(id: tc.id, name: name, output: refusal)
+        }
 
         // createTask is a meta-tool: it schedules an unattended run via the
         // TaskScheduler, which this static dispatcher can't reach. The caller

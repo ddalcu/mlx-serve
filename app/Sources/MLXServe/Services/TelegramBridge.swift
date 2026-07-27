@@ -350,14 +350,18 @@ final class TelegramBridge: ObservableObject {
         let cfg = appState.serverOptions.telegram
         let sessionId = sessionId(for: chatId, senderName: senderName, agentMode: cfg.agentMode)
         let workspace = Self.agentWorkspace
-        let turnConfig = ChatTurnEngine.TurnConfig(
-            agentMode: cfg.agentMode,
-            mcpMode: cfg.useMCP,
-            enableThinking: cfg.enableThinking,
-            voiceStyle: false,
-            workingDirectory: (cfg.agentMode || cfg.useMCP) ? workspace : nil,
-            telegramChatId: chatId   // so the agent's createTask reports back here
-        )
+        // The bot's own three flags are the DEFAULTS its agent (if one is set)
+        // overrides — same builder as every other turn site.
+        let resolved = appState.resolvedAgentSettings(
+            agentId: cfg.agentId,
+            toolsEnabled: cfg.agentMode,
+            mcpEnabled: cfg.useMCP,
+            thinkingEnabled: cfg.enableThinking,
+            autoApprove: false,
+            workingDirectory: (cfg.agentMode || cfg.useMCP) ? workspace : nil)
+        let turnConfig = ChatTurnEngine.TurnConfig.from(
+            resolved,
+            telegramChatId: chatId)   // so the agent's createTask reports back here
 
         engine.runTurn(
             sessionId: sessionId,

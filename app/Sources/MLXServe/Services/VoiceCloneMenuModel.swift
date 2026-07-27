@@ -110,10 +110,42 @@ enum VoiceCloneMenuModel {
         }
     }
 
-    /// Is the Audio pane's TTS model (the cloning backend) ready?
+    /// Which cloning model the voice path will ACTUALLY load: the Audio pane's
+    /// configured preset when it's on disk, else any other cloning-capable one
+    /// that is. nil when none are downloaded.
+    ///
+    /// Resolving against the disk rather than trusting the setting is the fix for
+    /// a silent failure: the default is the 0.6B repo, so a machine holding only
+    /// the 1.7B variants had `synthesize` return nil and every cloned sentence
+    /// come out in the system voice while the picker still showed the clip as
+    /// active. Kokoro is never a candidate — it cannot clone (`ref_audio` is a
+    /// named 400 there), which is exactly why `AudioModelPreset.all` is the
+    /// cloning-capable catalog. Pure, with the disk check injected.
+    static func resolvedCloneModel(configured: AudioModelPreset,
+                                   isDownloaded: (AudioModelPreset) -> Bool) -> AudioModelPreset? {
+        if configured.supportsCloning, isDownloaded(configured) { return configured }
+        return AudioModelPreset.all.first { $0.supportsCloning && isDownloaded($0) }
+    }
+
+    /// Can a cloned voice actually speak right now? The picker's enabled state and
+    /// the synthesizer read THIS, so the UI can't tick a voice that won't work.
+    static func cloneAvailable(configured: AudioModelPreset,
+                               isDownloaded: (AudioModelPreset) -> Bool) -> Bool {
+        resolvedCloneModel(configured: configured, isDownloaded: isDownloaded) != nil
+    }
+
+    /// The live-disk resolution (production seam).
+    @MainActor
+    static func resolvedCloneModel() -> AudioModelPreset? {
+        resolvedCloneModel(configured: AudioGenSettings.load().resolvedModel,
+                           isDownloaded: bundleOnDisk)
+    }
+
+    /// Is a cloning backend ready? (Was "is the configured one on disk", which
+    /// ignored every other downloaded variant.)
     @MainActor
     static func ttsModelDownloaded() -> Bool {
-        bundleOnDisk(AudioGenSettings.load().resolvedModel)
+        resolvedCloneModel() != nil
     }
 
     /// Is the Kokoro checkpoint ready?

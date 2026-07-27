@@ -62,6 +62,43 @@ enum WakeWord {
         return nil
     }
 
+    /// Multi-agent detection: which of several phrases opened the utterance, and
+    /// the remaining query. Every agent with a wake phrase is listening at once
+    /// (plus the app's own phrase), so the ordering matters — LONGEST phrase
+    /// first, or "hey loki" eats "hey loki coder" and the specific agent can
+    /// never be reached by voice. Blank phrases are ignored rather than matching
+    /// everything.
+    static func match(_ transcript: String,
+                      phrases: [(id: UUID, phrase: String)]) -> (id: UUID, query: String)? {
+        let candidates = phrases
+            .compactMap { entry -> (id: UUID, phrase: String, length: Int)? in
+                guard let norm = normalizePhrase(entry.phrase) else { return nil }
+                return (entry.id, norm, tokenize(norm).count)
+            }
+            .sorted { $0.length > $1.length }
+
+        for candidate in candidates {
+            if let query = strip(transcript, phrase: candidate.phrase) {
+                return (candidate.id, query)
+            }
+        }
+        return nil
+    }
+
+    /// True when `phrase` can't be told apart from one of `others` — checked when
+    /// the user saves an agent, because a colliding phrase makes BOTH agents
+    /// unreachable by voice and there's nothing to see until you try talking.
+    ///
+    /// The test is the phrase's NAME (its last word), not the whole phrase:
+    /// greetings are universal ("hey X", "ok X" and a bare "X" all open the same
+    /// gate), so two phrases ending in the same word are one gate.
+    static func collides(_ phrase: String, with others: [String]) -> Bool {
+        guard let name = normalizePhrase(phrase)?.split(separator: " ").last else { return false }
+        return others.contains { other in
+            normalizePhrase(other)?.split(separator: " ").last == name
+        }
+    }
+
     // MARK: - internals
 
     private struct Token { let norm: String; let start: String.Index }

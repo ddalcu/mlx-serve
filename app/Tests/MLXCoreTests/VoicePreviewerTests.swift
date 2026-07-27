@@ -167,6 +167,51 @@ final class VoicePreviewerTests: XCTestCase {
     /// Await the in-flight preview, then let any SUPERSEDED task unwind. Both
     /// halves matter: the second is what proves a dropped preview never
     /// surfaces late.
+    // MARK: - Auditioning an uploaded clip
+
+    /// A reference clip is auditioned by PLAYING THE FILE, not by synthesizing
+    /// with it: the question is "is this the right recording?", which the raw
+    /// audio answers instantly and with no TTS model downloaded.
+    func testPlayClipPlaysTheFileWithoutSynthesizing() async throws {
+        let path = (NSTemporaryDirectory() as NSString).appendingPathComponent("vp-\(UUID().uuidString).wav")
+        try Data("RIFFDATA".utf8).write(to: URL(fileURLWithPath: path))
+        defer { try? FileManager.default.removeItem(atPath: path) }
+
+        var synthCalls = 0
+        var played: [Data] = []
+        let p = VoicePreviewer(synthesize: { _, _ in synthCalls += 1; return nil },
+                               play: { played.append($0) })
+
+        p.playClip(path: path)
+        await settle(p)
+
+        XCTAssertEqual(synthCalls, 0, "no model is involved in hearing back a clip")
+        XCTAssertEqual(played, [Data("RIFFDATA".utf8)])
+        XCTAssertNil(p.active)
+        XCTAssertNil(p.error)
+    }
+
+    func testPlayClipReportsAMovedOrDeletedFile() async {
+        var played: [Data] = []
+        let p = VoicePreviewer(synthesize: { _, _ in nil }, play: { played.append($0) })
+
+        p.playClip(path: "/nope/gone.wav")
+        await settle(p)
+
+        XCTAssertTrue(played.isEmpty)
+        XCTAssertNotNil(p.error, "a clip that isn't there must say so, not fail silently")
+        XCTAssertNil(p.active)
+    }
+
+    func testPlayClipIgnoresAnEmptyPath() async {
+        var played: [Data] = []
+        let p = VoicePreviewer(synthesize: { _, _ in nil }, play: { played.append($0) })
+        p.playClip(path: "   ")
+        await settle(p)
+        XCTAssertTrue(played.isEmpty)
+        XCTAssertNil(p.error)
+    }
+
     private func settle(_ p: VoicePreviewer? = nil) async {
         await p?.inFlight?.value
         for _ in 0..<8 { await Task.yield() }

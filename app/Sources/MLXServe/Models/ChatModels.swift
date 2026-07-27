@@ -29,6 +29,11 @@ struct ChatSession: Identifiable, Codable {
     /// Agent toggle. See PerSessionUIStateTests.
     var enableThinking: Bool
     var useMCP: Bool
+    /// The agent (persona) this tab is talking to; nil = none, i.e. the app's own
+    /// defaults and today's behavior. Per-session like the toggles above — the
+    /// detail view is REUSED across tabs, so an app-wide "active agent" would
+    /// leak between conversations. Switching applies to subsequent turns only.
+    var agentId: UUID?
 
     init(title: String = "New Chat") {
         self.id = UUID()
@@ -43,10 +48,11 @@ struct ChatSession: Identifiable, Codable {
         self.isExternalBridge = false
         self.enableThinking = false
         self.useMCP = false
+        self.agentId = nil
     }
 
     enum CodingKeys: String, CodingKey {
-        case id, title, messages, createdAt, updatedAt, mode, workingDirectory, attachedFolderPath, taskRunId, isExternalBridge, enableThinking, useMCP
+        case id, title, messages, createdAt, updatedAt, mode, workingDirectory, attachedFolderPath, taskRunId, isExternalBridge, enableThinking, useMCP, agentId
     }
 
     init(from decoder: Decoder) throws {
@@ -63,6 +69,9 @@ struct ChatSession: Identifiable, Codable {
         // existed come back with the keys absent → default both off.
         enableThinking = try c.decodeIfPresent(Bool.self, forKey: .enableThinking) ?? false
         useMCP = try c.decodeIfPresent(Bool.self, forKey: .useMCP) ?? false
+        // Absent (every session saved before agents existed) → no agent → the
+        // app defaults, unchanged on upgrade.
+        agentId = try c.decodeIfPresent(UUID.self, forKey: .agentId)
         // Backfill: sessions saved before workingDirectory had a default come back as nil. Anchor them
         // at ~/.mlx-serve/workspace so the agent's tools and MCP servers both have a sane default.
         let decoded = try c.decodeIfPresent(String.self, forKey: .workingDirectory)
