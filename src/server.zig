@@ -2333,6 +2333,63 @@ fn physicalMemoryCeiling(working_set_limit: u64, mlx_footprint: u64, free_system
     return @min(working_set_limit, mlx_footprint +| free_system);
 }
 
+/// PURE (unit-testable): the cap to put on MLX's reclaimable buffer pool for a
+/// machine with `total_ram` bytes of physical memory. 0 when the RAM query
+/// failed — never clamp on bad data.
+///
+/// MLX's own default is `min(1.5 x working_set, 0.95 x RAM)` with a GC limit at
+/// `0.95 x working_set` (`backend/metal/allocator.cpp`) — ~121 GB / ~91 GB on a
+/// 128 GB Mac, i.e. it does not trim until the machine is already dead. Freed
+/// buffers are parked in that pool instead of going back to the OS, so anything
+/// that frees never-repeating sizes in a loop (KV growth, decode transients)
+/// grows the process footprint without moving `active_bytes` at all. Issue #110:
+/// 81.4 GB in Activity Monitor against 19.6 GB in the panel.
+///
+/// RAM/16 is big enough for the step-to-step buffer reuse the pool exists for
+/// (8 GB on a 128 GB Mac) and small enough that it can never be the footprint.
+/// The 2 GB floor keeps 8/16 GB machines from thrashing the allocator.
+pub fn mlxCacheLimitBytes(total_ram: u64) u64 {
+    if (total_ram == 0) return 0;
+    const GB: u64 = 1 << 30;
+    return @max(2 * GB, @min(8 * GB, total_ram / 16));
+}
+
+/// PURE: resolve the cap from `MLX_SERVE_CACHE_LIMIT` (bytes) over the
+/// RAM-proportional default. `0` means "leave MLX's default alone" — the
+/// same-boot A/B off-switch. Anything unparseable falls through to the default
+/// rather than silently disabling the cap.
+pub fn mlxCacheLimitFromEnv(raw: ?[]const u8, total_ram: u64) u64 {
+    if (raw) |v| {
+        const trimmed = std.mem.trim(u8, v, " \t\r\n");
+        if (std.fmt.parseInt(u64, trimmed, 10) catch null) |n| return n;
+    }
+    return mlxCacheLimitBytes(total_ram);
+}
+
+/// Impure wrapper: apply the cap to the live MLX allocator. Called ONCE from
+/// `main()`, above every subcommand branch — not per serve path, because a
+/// hand-rolled per-path config is exactly how `runHeadlessServe` (the mode the
+/// app always launches) came to silently eat the `--pld*` flags.
+///
+/// Never RAISES a tighter existing cap: `scheduler.runGenRequest` drops the pool
+/// to 1 GB on small-RAM machines during media gen, and iOS boots at 384 MB.
+pub fn applyMlxCacheLimit() void {
+    const env: ?[]const u8 = if (std.c.getenv("MLX_SERVE_CACHE_LIMIT")) |p|
+        std.mem.span(p)
+    else
+        null;
+    const cap = mlxCacheLimitFromEnv(env, metrics.getTotalMemBytes());
+    if (cap == 0) return;
+    var prev: usize = 0;
+    _ = mlx.mlx_set_cache_limit(&prev, @intCast(cap));
+    if (prev < cap) {
+        var tmp: usize = 0;
+        _ = mlx.mlx_set_cache_limit(&tmp, prev);
+        return;
+    }
+    log.info("[mem] MLX buffer-pool cap {d} MB (was {d} MB)\n", .{ cap >> 20, prev >> 20 });
+}
+
 /// Impure wrapper: current GPU allocation ceiling from live MLX + system
 /// counters. `mlx_footprint` = active (in-use) + cache (reclaimable) so an
 /// idle machine's ceiling stays ≈ the static device max (no auto-context
@@ -3307,13 +3364,19 @@ fn renderPropsBody(
     peak_mem: usize,
     available_mem: u64,
     safe_ctx: u32,
+    cache_mem: usize,
 ) ![]u8 {
     // `available_bytes` is free SYSTEM RAM, computed with the SAME formula the
     // model-load pre-flight uses (`metrics.getAvailableMemBytes`), so the tray's
     // "Free RAM" line can never drift from the number that gates a load. Distinct
     // axis from `active_bytes` (the MLX GPU-allocator footprint).
+    //
+    // `cache_bytes` is MLX's reclaimable buffer pool — memory the process HOLDS
+    // but is not using. It is a third axis again, and its absence is why #110
+    // was invisible: the panel read 19.6 GB of `active_bytes` while the process
+    // sat at 81.4 GB, and nothing we served named the other 61.
     return std.fmt.allocPrint(allocator,
-        \\{{"default_generation_settings":{{"model":"{s}","n_ctx":{s}}},"total_slots":1,"model_info":{{"vocab_size":{d},"hidden_size":{d},"num_hidden_layers":{d},"num_attention_heads":{d},"num_key_value_heads":{d},"head_dim":{d},"quantization_bits":{d},"quantization_group_size":{d},"max_position_embeddings":{d}}},"memory":{{"active_bytes":{d},"peak_bytes":{d},"available_bytes":{d},"max_safe_context":{d}}}}}
+        \\{{"default_generation_settings":{{"model":"{s}","n_ctx":{s}}},"total_slots":1,"model_info":{{"vocab_size":{d},"hidden_size":{d},"num_hidden_layers":{d},"num_attention_heads":{d},"num_key_value_heads":{d},"head_dim":{d},"quantization_bits":{d},"quantization_group_size":{d},"max_position_embeddings":{d}}},"memory":{{"active_bytes":{d},"peak_bytes":{d},"available_bytes":{d},"max_safe_context":{d},"cache_bytes":{d}}}}}
     , .{
         config.model_type,        ctx_str,
         config.vocab_size,        config.hidden_size,
@@ -3323,6 +3386,7 @@ fn renderPropsBody(
         config.max_position_embeddings,
         active_mem,               peak_mem,
         available_mem,            safe_ctx,
+        cache_mem,
     });
 }
 
@@ -3343,6 +3407,11 @@ fn handleProps(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel) !v
     // 0/0 indeterminate state for the entire DSV4 session.
     var active_mem: usize = 0;
     var peak_mem: usize = 0;
+    // MLX's reclaimable buffer pool. Always read from MLX — the embedded
+    // engines don't feed it, so it correctly reads ~0 on a ds4/llama session
+    // rather than needing a per-engine branch.
+    var cache_mem: usize = 0;
+    _ = mlx.mlx_get_cache_memory(&cache_mem);
     if (lm.ds4_engine != null) {
         // Static estimate: GGUF mmap size (set on the entry at registry-stub
         // time in `runDs4Serve`) plus ds4's reported KV/scratch for the
@@ -3370,7 +3439,7 @@ fn handleProps(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel) !v
     // "Free RAM" line stays in lockstep with what gates a load.
     const available_mem = metrics.getAvailableMemBytes();
 
-    const body = try renderPropsBody(allocator, config, ctx_str, active_mem, peak_mem, available_mem, safe_ctx);
+    const body = try renderPropsBody(allocator, config, ctx_str, active_mem, peak_mem, available_mem, safe_ctx, cache_mem);
     defer allocator.free(body);
     try sendResponse(stream, "200 OK", "application/json", body);
 }
@@ -6453,6 +6522,13 @@ fn sampleGauges(ctx: GaugeSamplerCtx) void {
     // System gauges (non-blocking syscalls).
     ctx.metrics.gpu_utilization_pct.set(@as(u64, metrics.getGpuPct()));
     ctx.metrics.memory_mb.set(@as(u64, metrics.getAppMemFootprintMb()));
+    // The two halves of the MLX allocator, so `memory_mb`'s gap has a name.
+    var mlx_active: usize = 0;
+    var mlx_cache: usize = 0;
+    _ = mlx.mlx_get_active_memory(&mlx_active);
+    _ = mlx.mlx_get_cache_memory(&mlx_cache);
+    ctx.metrics.mlx_active_bytes.set(@as(u64, mlx_active));
+    ctx.metrics.mlx_cache_bytes.set(@as(u64, mlx_cache));
 
     // Request queue depth — brief lock to read two scheduler counters only.
     ctx.scheduler.queue_mu.lockUncancelable(ctx.scheduler.io);
@@ -12410,7 +12486,7 @@ test "renderPropsBody omits chat_template" {
     config.max_position_embeddings = 8192;
     config.model_type = "gemma4";
 
-    const body = try renderPropsBody(testing.allocator, &config, "4096", 1234, 5678, 9_000_000_000, 16384);
+    const body = try renderPropsBody(testing.allocator, &config, "4096", 1234, 5678, 9_000_000_000, 16384, 4321);
     defer testing.allocator.free(body);
 
     try testing.expect(std.mem.indexOf(u8, body, "\"chat_template\"") == null);
@@ -12429,7 +12505,7 @@ test "renderPropsBody keeps fields the Swift app + integration tests rely on" {
     config.quant_group_size = 64;
     config.max_position_embeddings = 8192;
 
-    const body = try renderPropsBody(testing.allocator, &config, "4096", 1234, 5678, 9_000_000_000, 16384);
+    const body = try renderPropsBody(testing.allocator, &config, "4096", 1234, 5678, 9_000_000_000, 16384, 4321);
     defer testing.allocator.free(body);
 
     // Hit every field a known consumer reads.
@@ -12441,6 +12517,39 @@ test "renderPropsBody keeps fields the Swift app + integration tests rely on" {
     try testing.expect(std.mem.indexOf(u8, body, "\"peak_bytes\":5678") != null);     // Swift fetchProps
     try testing.expect(std.mem.indexOf(u8, body, "\"available_bytes\":9000000000") != null); // Swift fetchProps (Free RAM line)
     try testing.expect(std.mem.indexOf(u8, body, "\"max_safe_context\":16384") != null); // Swift fetchProps
+    // #110: the panel showed 19.6 GB (active) while the process held 81 GB.
+    // The missing 61 GB was MLX's reclaimable buffer pool, which nothing we
+    // expose reported — so the bug was invisible from every surface.
+    try testing.expect(std.mem.indexOf(u8, body, "\"cache_bytes\":4321") != null); // Swift fetchProps
+}
+
+test "mlxCacheLimitBytes: RAM-proportional cap, 2 GB floor, 8 GB ceiling" {
+    const GB: u64 = 1 << 30;
+    // MLX's own default is min(1.5 x working_set, 0.95 x RAM) — ~121 GB on a
+    // 128 GB Mac (`backend/metal/allocator.cpp`), i.e. it will not trim until
+    // the machine is already dead. RAM/16 keeps the pool big enough for
+    // step-to-step buffer reuse without letting it become the footprint.
+    try testing.expectEqual(8 * GB, mlxCacheLimitBytes(128 * GB));
+    try testing.expectEqual(4 * GB, mlxCacheLimitBytes(64 * GB));
+    try testing.expectEqual(2 * GB, mlxCacheLimitBytes(32 * GB)); // 2 GB exactly
+    try testing.expectEqual(2 * GB, mlxCacheLimitBytes(16 * GB)); // floor
+    try testing.expectEqual(2 * GB, mlxCacheLimitBytes(8 * GB)); // floor
+    // Ceiling holds above 128 GB (Mac Studio / M3 Ultra 512 GB).
+    try testing.expectEqual(8 * GB, mlxCacheLimitBytes(512 * GB));
+    // A failed `hw.memsize` read is 0 — never clamp on bad data.
+    try testing.expectEqual(@as(u64, 0), mlxCacheLimitBytes(0));
+}
+
+test "mlxCacheLimitFromEnv: explicit bytes win, 0 disables, garbage falls through" {
+    const GB: u64 = 1 << 30;
+    // The A/B off-switch: MLX_SERVE_CACHE_LIMIT=0 leaves MLX's default in
+    // place so the pre-#110 behavior stays reachable in a same-boot A/B.
+    try testing.expectEqual(@as(u64, 0), mlxCacheLimitFromEnv("0", 128 * GB));
+    try testing.expectEqual(@as(u64, 3 * GB), mlxCacheLimitFromEnv("3221225472", 128 * GB));
+    // Unset or unparseable → the RAM-proportional default.
+    try testing.expectEqual(8 * GB, mlxCacheLimitFromEnv(null, 128 * GB));
+    try testing.expectEqual(8 * GB, mlxCacheLimitFromEnv("lots", 128 * GB));
+    try testing.expectEqual(8 * GB, mlxCacheLimitFromEnv("", 128 * GB));
 }
 
 

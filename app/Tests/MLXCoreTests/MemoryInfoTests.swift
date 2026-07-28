@@ -32,6 +32,47 @@ final class MemoryInfoTests: XCTestCase {
         XCTAssertEqual(MemoryInfo.parse(mem).availableBytes, 0)
     }
 
+    // MARK: - MLX buffer pool (issue #110)
+
+    /// The panel showed 19.6 GB while the process held 81.4 GB. The missing
+    /// 61 GB was MLX's reclaimable buffer pool, which nothing the server served
+    /// reported — so the tray now reads it too.
+    func testParseDecodesTheMlxBufferPoolFromCacheBytes() {
+        let mem: [String: Any] = [
+            "active_bytes": Int64(19_600_000_000),
+            "peak_bytes": Int64(20_000_000_000),
+            "available_bytes": Int64(8_300_000_000),
+            "max_safe_context": 104_000,
+            "cache_bytes": Int64(61_000_000_000),
+        ]
+        let info = MemoryInfo.parse(mem)
+        XCTAssertEqual(info.cacheBytes, 61_000_000_000)
+        XCTAssertTrue(info.gpuMemoryLabel.contains("cache"),
+                      "the gap the reporter screenshotted must be named on the row")
+    }
+
+    /// An older bundled server that predates `cache_bytes` decodes to 0, and the
+    /// row falls back to exactly what it rendered before.
+    func testParseDefaultsCacheBytesToZeroWhenMissing() {
+        let mem: [String: Any] = [
+            "active_bytes": Int64(100),
+            "peak_bytes": Int64(200),
+            "max_safe_context": 4096,
+        ]
+        let info = MemoryInfo.parse(mem)
+        XCTAssertEqual(info.cacheBytes, 0)
+        XCTAssertEqual(info.gpuMemoryLabel, info.activeFormatted)
+    }
+
+    /// A pool doing its job is not news — the suffix appears only once the pool
+    /// is large enough to explain a footprint the user would notice.
+    func testGpuMemoryLabelHidesASmallHealthyPool() {
+        let small = MemoryInfo(activeBytes: 7_000_000_000, peakBytes: 7_000_000_000,
+                               availableBytes: 0, maxSafeContext: 0,
+                               cacheBytes: 400 * 1024 * 1024)
+        XCTAssertEqual(small.gpuMemoryLabel, small.activeFormatted)
+    }
+
     func testAvailableFormattedUsesSharedFormatter() {
         let info = MemoryInfo(activeBytes: 0, peakBytes: 0,
                               availableBytes: 8_589_934_592, maxSafeContext: 0)  // 8 GiB

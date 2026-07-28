@@ -3350,6 +3350,12 @@ fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
     if (hc_opt) |hc| {
         if (stream_opt) |s| hc.flushPendingDisk(s);
     }
+    // Return this turn's transients to the OS. The per-`CACHE_CLEAR_INTERVAL`
+    // clear inside `Generator.advanceStep` can't cover the tail of a turn, and
+    // MLX parks freed buffers in a size-keyed pool rather than releasing them —
+    // so without this a short turn hands everything it stranded to the next one
+    // and the process footprint ratchets across a session (issue #110).
+    _ = mlx.mlx_clear_cache();
 }
 
 /// ds4 prefill: create a session sized to the configured ctx and sync it to
@@ -4161,8 +4167,7 @@ fn runBatchedDecodeTick(sch: *Scheduler, active: []*Slot) !void {
             slot.markError(@errorName(err));
             continue;
         };
-        gen.completion_tokens += 1;
-        gen.step += 1;
+        gen.advanceStep(1);
         gen.next_token_id = @intCast(val);
 
         // Stop checks (mirrors Generator.checkStop).

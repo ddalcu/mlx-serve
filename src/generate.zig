@@ -391,6 +391,22 @@ pub fn prefillChunkCount(
     return n;
 }
 
+/// Generated tokens between two returns of the decode loop's transients to
+/// MLX's allocator. 256 is what the non-speculative paths have always used.
+pub const CACHE_CLEAR_INTERVAL: u32 = 256;
+
+/// PURE: has `interval` tokens passed since the last clear?
+///
+/// Interval arithmetic, not `step % interval == 0`: a spec-decode round emits
+/// `1 + accepted` tokens, so a modulo test can step clean over every multiple
+/// and never fire (issue #110 — at stride 5 it fires zero times in the first
+/// 1024 steps). For the stride-1 paths this is byte-identical to the modulo
+/// form it replaces.
+pub fn shouldClearAllocatorCache(step: u32, last_clear: u32, interval: u32) bool {
+    if (interval == 0) return false;
+    return step -| last_clear >= interval;
+}
+
 /// Step-based generator. Call `init` to prefill, then `next` per token.
 /// Uses a fully-lazy async pipeline matching mlx-lm: sample + next forward are
 /// built as a single lazy computation graph, async_eval'd together. The GPU
@@ -409,6 +425,9 @@ pub const Generator = struct {
     tok: *const Tokenizer,
     next_token_id: u32,
     step: u32,
+    /// `step` at the last `mlx_clear_cache()`. Advanced only by `advanceStep`,
+    /// which is the ONE place `step` may move.
+    last_cache_clear_step: u32 = 0,
     max_tokens: u32,
     sampling: SamplingParams,
     prompt_tokens: u32,
@@ -1471,6 +1490,26 @@ pub const Generator = struct {
         return gen;
     }
 
+    /// The ONE place `step` and `completion_tokens` advance — every decode path
+    /// (plain, constrained, PLD, drafter, MTP, batched) routes through here.
+    ///
+    /// Advancing them by hand is how three paths — `nextDrafter`, `nextMtp` and
+    /// `scheduler.runBatchedDecodeTick` — ended up never calling
+    /// `mlx_clear_cache()` at all (issue #110). MLX parks freed buffers in a
+    /// size-keyed pool instead of returning them to the OS, so a decode path
+    /// with no clear ratchets the process footprint while `active_bytes` stays
+    /// flat: the reporter's process reached 81 GB with the panel reading 19.6.
+    /// A `-mtp` checkpoint on a dense trunk defaults straight onto one of them.
+    /// A source-scan test pins that no new path can reintroduce the hole.
+    pub fn advanceStep(self: *Generator, n: u32) void {
+        self.completion_tokens += n;
+        self.step += n;
+        if (shouldClearAllocatorCache(self.step, self.last_cache_clear_step, CACHE_CLEAR_INTERVAL)) {
+            _ = mlx.mlx_clear_cache();
+            self.last_cache_clear_step = self.step;
+        }
+    }
+
     pub fn deinit(self: *Generator, allocator: std.mem.Allocator) void {
         if (self.last_logprob) |*lp| {
             allocator.free(lp.top_logprobs);
@@ -1579,10 +1618,8 @@ pub const Generator = struct {
         if (!self.has_pending_logits) return error.MissingPendingLogits;
 
         const token = self.next_token_id;
-        self.completion_tokens += 1;
-        self.step += 1;
+        self.advanceStep(1);
         try self.generated_ids.append(allocator, token);
-        if (self.step % 256 == 0) _ = mlx.mlx_clear_cache();
 
         const step_logits = self.pending_logits;
         self.has_pending_logits = false;
@@ -1637,10 +1674,8 @@ pub const Generator = struct {
         try self.resolvePendingToken();
         if (try self.checkStop()) return .stopped;
         const token = self.next_token_id;
-        self.completion_tokens += 1;
-        self.step += 1;
+        self.advanceStep(1);
         try self.generated_ids.append(allocator, token);
-        if (self.step % 256 == 0) _ = mlx.mlx_clear_cache();
 
         const step_logits = self.pending_logits;
         self.has_pending_logits = false;
@@ -1832,9 +1867,7 @@ pub const Generator = struct {
             const new_t1: u32 = @intCast(lv);
 
             try self.generated_ids.append(allocator, t1);
-            self.completion_tokens += 1;
-            self.step += 1;
-            if (self.step % 256 == 0) _ = mlx.mlx_clear_cache();
+            self.advanceStep(1);
             self.next_token_id = new_t1;
 
             // Yield gate: cold steps pay the unpipelined forward; if the
@@ -2082,9 +2115,7 @@ pub const Generator = struct {
         for (draft[0..accepted]) |d| try self.generated_ids.append(allocator, d);
 
         self.pld_accepted_tokens += accepted;
-        self.completion_tokens += num_emit;
-        self.step += num_emit;
-        if (self.step % 256 == 0) _ = mlx.mlx_clear_cache();
+        self.advanceStep(num_emit);
 
         // No post-step forward — `next_token_id = new_t1` and exit. The next
         // nextPld call sees t1 NOT in cache (new invariant).
@@ -2487,8 +2518,7 @@ pub const Generator = struct {
 
             self.drafter_accepted_tokens += m;
             self.next_token_id = next_pending;
-            self.step += 1 + m;
-            self.completion_tokens += 1 + m;
+            self.advanceStep(1 + m);
 
             // drafts buffer transferred into tokens copy; free original.
             allocator.free(drafts);
@@ -2539,8 +2569,7 @@ pub const Generator = struct {
 
         self.drafter_accepted_tokens += accepted;
         self.next_token_id = next_pending;
-        self.step += 1 + accepted;
-        self.completion_tokens += 1 + accepted;
+        self.advanceStep(1 + accepted);
 
         allocator.free(drafts);
         self.checkDrafterRuntimeGate();
@@ -3532,8 +3561,7 @@ pub const Generator = struct {
 
             self.mtp_accepted_tokens += m;
             self.next_token_id = next_pending;
-            self.step += 1 + m;
-            self.completion_tokens += 1 + m;
+            self.advanceStep(1 + m);
 
             if (mtpAdaptiveEnabled()) self.updateMtpEvRound(m, m) else self.updateMtpDepth(m, m);
             if (tracing) {
@@ -3626,8 +3654,7 @@ pub const Generator = struct {
 
         self.mtp_accepted_tokens += accepted;
         self.next_token_id = next_pending;
-        self.step += 1 + accepted;
-        self.completion_tokens += 1 + accepted;
+        self.advanceStep(1 + accepted);
 
         if (mtpAdaptiveEnabled()) self.updateMtpEvRound(m, accepted) else self.updateMtpDepth(m, accepted);
         if (tracing) {
@@ -4585,11 +4612,8 @@ pub const Generator = struct {
                 if (try self.checkStop()) return null;
 
                 const token = self.next_token_id;
-                self.completion_tokens += 1;
-                self.step += 1;
+                self.advanceStep(1);
                 try self.generated_ids.append(allocator, token);
-
-                if (self.step % 256 == 0) _ = mlx.mlx_clear_cache();
 
                 // Store new pending state
                 self.pending_token = lazy_token;
@@ -4615,11 +4639,8 @@ pub const Generator = struct {
         if (try self.checkStop()) return null;
 
         const token = self.next_token_id;
-        self.completion_tokens += 1;
-        self.step += 1;
+        self.advanceStep(1);
         try self.generated_ids.append(allocator, token);
-
-        if (self.step % 256 == 0) _ = mlx.mlx_clear_cache();
 
         const step_logits = if (self.has_pending_logits) blk: {
             const logits = self.pending_logits;
@@ -4767,10 +4788,8 @@ pub const Generator = struct {
             }
         }
 
-        self.completion_tokens += 1;
-        self.step += 1;
+        self.advanceStep(1);
         try self.generated_ids.append(allocator, token);
-        if (self.step % 256 == 0) _ = mlx.mlx_clear_cache();
 
         if (self.step < self.max_tokens) {
             const tok_i32: i32 = @intCast(token);
@@ -7840,3 +7859,70 @@ test "maskedMeanPoolNormalize excludes padded positions and unit-normalizes" {
 
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+
+// ── Allocator-cache clear cadence (issue #110) ───────────────────────────────
+
+test "clear cadence survives variable spec strides" {
+    // A spec-decode round emits `1 + accepted` tokens, so `step` advances by a
+    // VARIABLE amount and `step % 256 == 0` can walk clean over every multiple
+    // — silently, because a decode path that never clears is output-identical
+    // to one that does. Interval arithmetic against the last clear cannot be
+    // stepped over.
+    for ([_]u32{ 1, 3, 5, 9 }) |stride| {
+        var step: u32 = 0;
+        var last_clear: u32 = 0;
+        var clears: usize = 0;
+        var max_gap: u32 = 0;
+        while (step < 4096) {
+            step += stride;
+            if (shouldClearAllocatorCache(step, last_clear, CACHE_CLEAR_INTERVAL)) {
+                const gap = step - last_clear;
+                if (gap > max_gap) max_gap = gap;
+                last_clear = step;
+                clears += 1;
+            }
+        }
+        try testing.expect(clears >= 15);
+        // A stride can overshoot the interval by at most stride-1 tokens.
+        try testing.expect(max_gap <= CACHE_CLEAR_INTERVAL + stride);
+    }
+}
+
+test "no decode path advances `step` outside advanceStep" {
+    // Class guard for #110. `Generator.step` is the clear cadence's clock, so a
+    // path that bumps it by hand is a path that strands its round's transients
+    // in MLX's buffer pool forever — which is exactly what `nextDrafter`,
+    // `nextMtp` and `scheduler.runBatchedDecodeTick` did, and the `-mtp`
+    // checkpoints default onto one of those. A new decode path added later must
+    // route through `advanceStep` or fail here.
+    //
+    // The needles are concatenated so this test's OWN source doesn't match them.
+    const needle = ".step" ++ " +=";
+    const allowed = "self.step" ++ " += n";
+    const sources = [_]struct { name: []const u8, src: []const u8 }{
+        .{ .name = "generate.zig", .src = @embedFile("generate.zig") },
+        .{ .name = "scheduler.zig", .src = @embedFile("scheduler.zig") },
+    };
+    var total: usize = 0;
+    for (sources) |file| {
+        var it = std.mem.splitScalar(u8, file.src, '\n');
+        var lineno: usize = 0;
+        while (it.next()) |raw| {
+            lineno += 1;
+            // Strip trailing line comments: several of them spell out
+            // `cache.step += 1` while describing the KV cache's own counter.
+            const line = if (std.mem.indexOf(u8, raw, "//")) |c| raw[0..c] else raw;
+            if (std.mem.indexOf(u8, line, needle) == null) continue;
+            total += 1;
+            if (std.mem.indexOf(u8, line, allowed) == null) {
+                std.debug.print("{s}:{d}: raw step advance outside advanceStep: {s}\n", .{
+                    file.name, lineno, std.mem.trim(u8, line, " "),
+                });
+                return error.RawStepAdvance;
+            }
+        }
+    }
+    // Exactly one: the assignment inside `advanceStep`. Zero means the field was
+    // renamed and this guard went vacuous — update it with the rename.
+    try testing.expectEqual(@as(usize, 1), total);
+}

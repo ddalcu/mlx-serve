@@ -437,10 +437,26 @@ struct MemoryInfo {
     /// axis from `activeBytes` (the MLX GPU-allocator footprint).
     var availableBytes: Int64
     var maxSafeContext: Int
+    /// MLX's reclaimable buffer pool — memory the server process HOLDS but is
+    /// not using. A third axis again from `activeBytes` (in use) and
+    /// `availableBytes` (free system RAM). Issue #110 was invisible precisely
+    /// because the panel showed `activeBytes` alone: 19.6 GB on screen against
+    /// 81.4 GB in Activity Monitor, with the other 61 GB parked here. 0 when the
+    /// server build predates the field — the suffix is hidden then.
+    var cacheBytes: Int64 = 0
 
     var activeFormatted: String { Self.format(activeBytes) }
     var peakFormatted: String { Self.format(peakBytes) }
     var availableFormatted: String { Self.format(availableBytes) }
+    var cacheFormatted: String { Self.format(cacheBytes) }
+
+    /// What the tray's "GPU Memory" row reads. The cache term only appears once
+    /// it is big enough to explain a footprint the user would notice — a pool
+    /// doing its job (a few hundred MB of buffer reuse) is not news.
+    var gpuMemoryLabel: String {
+        guard cacheBytes >= 1 << 30 else { return activeFormatted }
+        return "\(activeFormatted) (+\(cacheFormatted) cache)"
+    }
 
     /// Fraction (0...1) of `totalBytes` physical RAM occupied by the model's GPU
     /// (MLX) footprint. The bar's denominator is total RAM — NOT `peak×2`, which
@@ -469,7 +485,8 @@ struct MemoryInfo {
             activeBytes: mem["active_bytes"] as? Int64 ?? 0,
             peakBytes: mem["peak_bytes"] as? Int64 ?? 0,
             availableBytes: mem["available_bytes"] as? Int64 ?? 0,
-            maxSafeContext: mem["max_safe_context"] as? Int ?? 0
+            maxSafeContext: mem["max_safe_context"] as? Int ?? 0,
+            cacheBytes: mem["cache_bytes"] as? Int64 ?? 0
         )
     }
 

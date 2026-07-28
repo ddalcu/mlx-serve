@@ -1,5 +1,12 @@
 # Changelog
 
+## v26.7.12
+
+- **Fixed runaway memory on long chats.** A long session could grow the server to tens of GB of memory it wasn't using, until you killed it — 81 GB on a 128 GB Mac in one report, while the app's panel showed 19.6 GB (#110). Three things caused it, all fixed: MLX parks freed memory in a pool it never trims on its own, the KV cache grew in a way that threw away a full copy of itself every 256 tokens, and the drafter/MTP/batched decode paths never released their working memory at all. Speculative decoding is on by default for MTP checkpoints, so that last one hit the models most likely to be used for long agent sessions.
+- **The memory panel tells you where it went.** "GPU Memory" now reads e.g. `19.6 GB (+61 GB cache)`, and `/props` and `/metrics` report the same split. The bug above was invisible for as long as the only figure we published was memory in active use.
+
+---
+
 ## v26.7.11 — Mage-Flow image editing, a built-in console, faster MoE decode
 
 - **Mage-Flow runs natively.** Microsoft's Mage-Flow Turbo generates images in 4 steps, and Mage-Flow Edit Turbo edits them from reference images: no masks, no fine-tuning, just the picture and what you want changed. Point it at several references and it composes them ("put the object from image 2 into image 1"). Full native port like everything else here, no Python. 8-bit conversions are on Hugging Face at 8.5 GB for generation and 9.1 GB for editing, against 16 GB for the originals.

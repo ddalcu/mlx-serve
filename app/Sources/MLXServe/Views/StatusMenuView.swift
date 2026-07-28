@@ -399,7 +399,7 @@ struct StatusMenuView: View {
                                 .font(.caption)
                                 .foregroundStyle(.secondary)
                             Spacer()
-                            Text(mem.activeFormatted)
+                            Text(mem.gpuMemoryLabel)
                                 .font(.caption.monospaced())
                         }
                         ProgressView(value: mem.gpuFraction(ofTotal: totalRAM))

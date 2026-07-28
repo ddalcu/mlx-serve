@@ -277,6 +277,13 @@ pub fn main(init: std.process.Init) !void {
     const allocator = init.gpa;
     const io = init.io;
 
+    // Bound MLX's reclaimable buffer pool before anything can allocate. ONCE,
+    // above every subcommand branch — a per-serve-path call is how
+    // `runHeadlessServe` (the mode the app always launches) silently ate the
+    // --pld* flags. See server.mlxCacheLimitBytes for why MLX's own default
+    // (~121 GB on a 128 GB Mac) is no defense.
+    server_mod.applyMlxCacheLimit();
+
     // Materialize CLI args from the iterator API into a flat slice
     var args_iter = try std.process.Args.Iterator.initAllocator(init.minimal.args, allocator);
     defer args_iter.deinit();

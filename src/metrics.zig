@@ -100,6 +100,15 @@ pub const Metrics = struct {
     // Slots currently in prefill. Flips as soon as prefill starts, so the panel
     // can name the phase without waiting for the first chunk's token count.
     requests_prefilling: Gauge,
+    // MLX allocator split. `memory_mb` above is the whole process footprint;
+    // these two say where it went. `mlx_active_bytes` is memory in USE,
+    // `mlx_cache_bytes` is MLX's reclaimable buffer pool — memory the process
+    // HOLDS but is not using, which MLX only returns to the OS on a
+    // `mlx_clear_cache()` or when its own (enormous) GC limit trips.
+    // `memory_mb - active` staying flat while `cache` climbs is the #110
+    // signature; without these two the gap has no name on any surface.
+    mlx_active_bytes: Gauge,
+    mlx_cache_bytes: Gauge,
 
     pub fn init() Metrics {
         return .{
@@ -124,6 +133,8 @@ pub const Metrics = struct {
             .generation_tokens_live = Gauge.init(),
             .prefill_tokens_live = Gauge.init(),
             .requests_prefilling = Gauge.init(),
+            .mlx_active_bytes = Gauge.init(),
+            .mlx_cache_bytes = Gauge.init(),
         };
     }
 
@@ -232,6 +243,8 @@ pub fn renderPrometheus(m: *const Metrics, w: *std.Io.Writer) !void {
     try writeGauge(w, "mlx_serve:generation_tokens_live", "Generation tokens completed plus generated-so-far by in-flight slots (real-time tok/s source)", m.generation_tokens_live.load());
     try writeGauge(w, "mlx_serve:prefill_tokens_live", "Prompt tokens forwarded so far by the in-flight prefill (0 when idle; real-time prefill tok/s source)", m.prefill_tokens_live.load());
     try writeGauge(w, "mlx_serve:requests_prefilling", "Requests currently in the prefill phase", m.requests_prefilling.load());
+    try writeGauge(w, "mlx_serve:mlx_active_bytes", "Bytes MLX's allocator currently has in use", m.mlx_active_bytes.load());
+    try writeGauge(w, "mlx_serve:mlx_cache_bytes", "Bytes parked in MLX's reclaimable buffer pool (held by the process, not in use)", m.mlx_cache_bytes.load());
 
     // --- Latency histograms (nanoseconds → seconds) ---
     try writeHistogram(w, "vllm:time_to_first_token_seconds", "Time to first token in seconds", &m.ttft_ns, ns_to_s);
@@ -270,7 +283,9 @@ pub fn renderJson(m: *const Metrics, w: *std.Io.Writer) !void {
             "\"memory_mb\":{d}," ++
             "\"generation_tokens_live\":{d}," ++
             "\"prefill_tokens_live\":{d}," ++
-            "\"requests_prefilling\":{d}" ++
+            "\"requests_prefilling\":{d}," ++
+            "\"mlx_active_bytes\":{d}," ++
+            "\"mlx_cache_bytes\":{d}" ++
             "}},\"histograms\":{{",
         .{
             m.prompt_tokens_total.load(),
@@ -288,6 +303,8 @@ pub fn renderJson(m: *const Metrics, w: *std.Io.Writer) !void {
             m.generation_tokens_live.load(),
             m.prefill_tokens_live.load(),
             m.requests_prefilling.load(),
+            m.mlx_active_bytes.load(),
+            m.mlx_cache_bytes.load(),
         },
     );
 

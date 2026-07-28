@@ -2311,6 +2311,53 @@ pub const KVCache = struct {
 
     const chunk_step = 256;
 
+    /// Cap on the slack a single growth event adds, in tokens. Keeps the
+    /// proportional term from over-allocating at very long context (25% of
+    /// 200 K would be 50 K tokens of headroom).
+    const max_grow_tokens = 8192;
+
+    /// PURE: the capacity the K/V buffers must be grown to so `needed` tokens
+    /// fit.
+    ///
+    /// Growing by a fixed `chunk_step` (the pre-#110 policy, still reachable
+    /// with `linear = true`) means one grow-copy-free every 256 tokens, and
+    /// every superseded buffer is orphaned: MLX only reuses a cached buffer
+    /// when `cached_size < requested + 2*page_size` (`buffer_cache.h`), and the
+    /// next KV buffer is a full chunk past that ~32 KB tolerance. On a 64
+    /// KiB/token model at 89 K context that strands ~5.6 GB per 256 generated
+    /// tokens in MLX's allocator pool — invisible to `active_bytes`, which is
+    /// how the reporter's process reached 81 GB while the panel read 19.6.
+    ///
+    /// Proportional growth (+25%, floored at one chunk, capped at
+    /// `max_grow_tokens`) turns that into ~27 growth events over a 100 K-token
+    /// walk instead of 391.
+    pub fn nextCapacityPolicy(current_cap: usize, needed: usize, linear: bool) usize {
+        if (needed <= current_cap) return current_cap;
+        const target = if (linear) needed else blk: {
+            const grow = @min(@max(current_cap / 4, chunk_step), max_grow_tokens);
+            break :blk @max(needed, current_cap + grow);
+        };
+        const n_chunks = (target + chunk_step - 1) / chunk_step;
+        return n_chunks * chunk_step;
+    }
+
+    fn nextCapacity(current_cap: usize, needed: usize) usize {
+        return nextCapacityPolicy(current_cap, needed, kvGrowLinear());
+    }
+
+    /// Kill-switch for the growth policy: `MLX_SERVE_KV_GROW=linear` restores
+    /// the pre-#110 fixed +256 growth for same-boot A/Bs.
+    var kv_grow_linear_cache: ?bool = null;
+    fn kvGrowLinear() bool {
+        if (kv_grow_linear_cache) |v| return v;
+        var linear = false;
+        if (std.c.getenv("MLX_SERVE_KV_GROW")) |p| {
+            linear = std.mem.eql(u8, std.mem.span(p), "linear");
+        }
+        kv_grow_linear_cache = linear;
+        return linear;
+    }
+
     pub fn update(self: *KVCache, layer: u32, new_k: mlx.mlx_array, new_v: mlx.mlx_array, s: mlx.mlx_stream, max_seq: u32) !DenseKVView {
         switch (self.config.scheme) {
             .off => return self.updateDense(layer, new_k, new_v, s, max_seq),
@@ -2408,8 +2455,8 @@ pub const KVCache = struct {
         // 4. Grow buffers if needed (6 of them, in lockstep on the seq axis).
         if (!entry.initialized or entry.offset + new_len > bufferCapacity(entry.keys)) {
             const needed = entry.offset + new_len;
-            const n_chunks = (needed + chunk_step - 1) / chunk_step;
-            const new_cap: c_int = @intCast(n_chunks * chunk_step);
+            const cur_cap = if (entry.initialized) bufferCapacity(entry.keys) else 0;
+            const new_cap: c_int = @intCast(nextCapacity(cur_cap, needed));
 
             try growQuantBuf(s, &entry.keys, entry.initialized, entry.offset, new_cap, B, heads, q_last, .uint32);
             try growQuantBuf(s, &entry.values, entry.initialized, entry.offset, new_cap, B, heads, q_last, .uint32);
@@ -2472,8 +2519,8 @@ pub const KVCache = struct {
             const head_dim = new_shape[3];
             const dtype = mlx.mlx_array_dtype(new_k);
             const needed = entry.offset + new_len;
-            const n_chunks = (needed + chunk_step - 1) / chunk_step;
-            const new_cap: c_int = @intCast(n_chunks * chunk_step);
+            const cur_cap = if (entry.initialized) bufferCapacity(entry.keys) else 0;
+            const new_cap: c_int = @intCast(nextCapacity(cur_cap, needed));
             const buf_shape = [_]c_int{ B, heads, new_cap, head_dim };
 
             if (entry.initialized and entry.offset > 0) {
@@ -17229,4 +17276,105 @@ test "fusedSdpa256Prefill: causal parity at Qwen 24q/4kv geometry (gqa 6, ragged
 
     const max_diff = try attn256MaxDiff(fused, ref, s);
     try std.testing.expect(max_diff < 0.005);
+}
+
+// ── KV cache growth policy (issue #110) ──────────────────────────────────────
+
+test "KVCache growth strands bounded bytes" {
+    // Walk a decode from empty to 100_000 tokens one token at a time and count
+    // what the grow-and-copy policy leaves behind. Every growth event allocates
+    // a fresh capacity-sized buffer, copies the old contents in, and frees the
+    // old one — and MLX only reuses a cached buffer when
+    // `cached_size < requested + 2*page_size` (`buffer_cache.h`), so under the
+    // old fixed +256 policy the superseded buffer is always 512 KB-plus past a
+    // 32 KB tolerance and can never be reused for the NEXT KV buffer either.
+    // On the reporter's 64-KiB/token model that is a whole KV cache orphaned
+    // per 256 generated tokens.
+    const walk = struct {
+        const Result = struct { events: usize, superseded: usize, final: usize };
+        fn run(linear: bool) Result {
+            var cap: usize = 0;
+            var events: usize = 0;
+            var superseded: usize = 0;
+            var n: usize = 1;
+            while (n <= 100_000) : (n += 1) {
+                const next = KVCache.nextCapacityPolicy(cap, n, linear);
+                if (next != cap) {
+                    events += 1;
+                    superseded += cap;
+                    cap = next;
+                }
+            }
+            return .{ .events = events, .superseded = superseded, .final = cap };
+        }
+    };
+
+    const prop = walk.run(false);
+    try testing.expect(prop.final >= 100_000);
+    try testing.expect(prop.events <= 40);
+    try testing.expect(prop.superseded <= 8 * prop.final);
+
+    // The linear policy the kill-switch keeps reachable, for contrast — these
+    // are the numbers the fix is measured against.
+    const lin = walk.run(true);
+    try testing.expectEqual(@as(usize, 391), lin.events);
+    try testing.expect(lin.superseded > 100 * lin.final);
+}
+
+test "KV growth does not ratchet the MLX buffer pool" {
+    // The reporter's mechanism (issue #110) at a size that runs in seconds and
+    // needs no checkpoint: single-token `update` calls against a real KVCache,
+    // sampling MLX's allocator pool. Nothing here calls `mlx_clear_cache` —
+    // that is the point. What the pool holds is exactly what the growth policy
+    // orphaned.
+    //
+    // 4 layers x 2 kv heads x 64 head_dim, bf16 = 2 KiB per token across all K
+    // and V buffers. Under the old +256 policy the walk to 20_000 allocates
+    // ~810_000 token-slots and frees all but the last ≈ 41 MB. Measured peak
+    // pool: 1544 MB linear vs 274 MB proportional (`MLX_SERVE_KV_GROW=linear`
+    // reproduces the former), so the bar sits between them with ~2x margin
+    // either side rather than on top of the passing number.
+    const s = mlx.gpuStream();
+    const LAYERS: u32 = 4;
+    const N: usize = 20_000;
+    const shape = [_]c_int{ 1, 2, 1, 64 };
+
+    var cache = try KVCache.init(testing.allocator, LAYERS);
+    defer cache.deinit();
+
+    _ = mlx.mlx_clear_cache();
+
+    var peak_cache: usize = 0;
+    var t: usize = 0;
+    while (t < N) : (t += 1) {
+        var layer: u32 = 0;
+        while (layer < LAYERS) : (layer += 1) {
+            var k = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(k);
+            var v = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(v);
+            try mlx.check(mlx.mlx_zeros(&k, &shape, 4, .bfloat16, s));
+            try mlx.check(mlx.mlx_zeros(&v, &shape, 4, .bfloat16, s));
+            var view = try cache.update(layer, k, v, s, 0);
+            view.deinit();
+        }
+        if (t % 32 == 0) {
+            cache.evalState();
+            var c: usize = 0;
+            _ = mlx.mlx_get_cache_memory(&c);
+            if (c > peak_cache) peak_cache = c;
+        }
+    }
+    cache.evalState();
+    var final_cache: usize = 0;
+    _ = mlx.mlx_get_cache_memory(&final_cache);
+    if (final_cache > peak_cache) peak_cache = final_cache;
+
+    if (peak_cache > 512 << 20) {
+        std.debug.print(
+            "[kv-pool] peak MLX buffer pool {d} MB after {d} single-token updates\n",
+            .{ peak_cache >> 20, N },
+        );
+        return error.BufferPoolRatcheted;
+    }
 }

@@ -278,3 +278,126 @@ clamp), plus fp32 and f16 cases in the blocked-parity sweep, which run through
 the same `gdnBlockTFor` the production path does — so a regression that declines
 the blocked route instead of clamping fails with `error.GdnBlockedDeclined`
 rather than passing on the stock fallback.
+
+### MLX's buffer pool is effectively unbounded, the clear cadence was skippable, and KV growth orphaned a whole cache every 256 tokens (#110)
+
+Live 2026-07-27, reported against `ddalcu/Qwen3.6-27B-4bit-MTP-MLX-Serve` driven from
+Zed on a 128 GB Mac: the process climbed to **81.4 GB** in Activity Monitor while the
+app's own panel read **GPU Memory 19.6 GB**, until the reporter killed it. Two
+screenshots, taken at the same moment, ~61 GB apart.
+
+Per this file's own diagnosis ladder — `active_bytes` NOT dropping after unload =
+leaked HANDLES; active flat while phys climbs = allocator-CACHE growth — that gap is
+MLX's buffer pool. Nothing was leaked; 61 GB was freed, parked, and never returned to
+the OS. Three independent defects fed it.
+
+**1. The pool has no useful bound.** `lib/mlx-src/mlx/backend/metal/allocator.cpp:63-64`:
+
+```cpp
+block_limit_ = std::min(1.5 * device_info()["max_recommended_working_set_size"], 0.95 * memsize);
+gc_limit_    = 0.95 * device_info()["max_recommended_working_set_size"];
+```
+
+~121 GB and ~91 GB on a 128 GB Mac. MLX will not trim until the machine is already
+dead. Our only real defense is explicit `mlx_clear_cache()`.
+
+**2. Three decode paths never called it.** Auditing every `self.step` advance:
+
+| path | advance | cleared? |
+|---|---|---|
+| `Generator.next` | +1 | yes, `step % 256` |
+| `Generator.nextConstrained` | +1 | yes |
+| `Generator.nextPld` | +1 / +num_emit | yes |
+| **`Generator.nextDrafter`** | +1+m / +1+accepted | **no** |
+| **`Generator.nextMtp`** | +1+m / +1+accepted | **no** |
+| **`scheduler.runBatchedDecodeTick`** | +1 | **no** |
+
+The reporter runs the `-mtp` checkpoint on a dense trunk, so `defaultEnableMtp` is on
+and every one of his decode rounds took the one path that never cleared. `finishSlot`
+didn't clear either, so what a turn stranded survived every later turn.
+
+The `% 256` form is separately broken for exactly these paths: a spec round advances by
+`1 + accepted`, so it can step clean over every multiple. Measured on the pure helper:
+**at stride 5, zero clears in steps 0..1024.** A modulo cadence and a variable stride
+are incompatible, and the failure is silent — a decode path that never clears is
+output-identical to one that does.
+
+**3. Linear KV growth made each strand enormous.** `updateDense`/`updateAffine` both
+grew by a fixed `chunk_step = 256`: allocate a new capacity-sized buffer, copy, free the
+old. MLX reuses a cached buffer only when `cached < size + 2*page_size`
+(`buffer_cache.h:34`) — the next KV buffer is 512 KB past a 32 KB tolerance, so the
+superseded buffer can never be reused for anything, least of all its own successor.
+
+The arithmetic on his model: 64 layers, `full_attention_interval: 4` → 16 attention
+layers, `head_dim: 256`, 4 KV heads, bf16 = **64 KiB/token**. At 89 K context that is
+**~5.6 GB stranded every 256 generated tokens**. Eleven growth events ≈ 61 GB — the
+observed gap, near exactly.
+
+**Fixes, all three layers:**
+
+- `server.mlxCacheLimitBytes` = `max(2 GB, min(8 GB, RAM/16))`, applied by
+  `applyMlxCacheLimit()` ONCE at the top of `main()`. Not per serve path — this is the
+  same shape as `runHeadlessServe` hand-rolling its own `ServerConfig` and silently
+  eating the `--pld*` flags. `MLX_SERVE_CACHE_LIMIT` (bytes; `0` = leave MLX's default)
+  is the A/B off-switch, and a tighter existing cap is never raised (media gen drops to
+  1 GB on small-RAM machines, iOS boots at 384 MB).
+- `Generator.advanceStep(n)` is the ONE place `step` and `completion_tokens` move, and it
+  owns the clear. The predicate is `step -| last_clear >= interval` — interval
+  arithmetic, which a variable stride cannot skip, and byte-identical to the modulo form
+  for the stride-1 paths. `finishSlot` clears once more so a turn can't hand its
+  transients to the next.
+- `KVCache.nextCapacityPolicy` grows by +25%, floored at one chunk and capped at 8192
+  tokens. Over a 100 K-token walk that is 27 growth events instead of 391, and the total
+  superseded capacity drops from ~195× the final capacity to ~5.5×.
+  `MLX_SERVE_KV_GROW=linear` restores the old policy.
+
+The slack is honest, not hidden: `denseView` slices to `entry.offset` so attention never
+sees it, and `prefix_cache.snapshotBytes` bills `mlx_array_size` (full capacity), so a
+committed hot-cache entry is charged for what it actually pins. `truncate`,
+`snapshot`/`restore` and the disk tier were all already capacity-agnostic (they work off
+`offset` and explicit chunk positions) — audited, and worth keeping that way.
+
+**Measurements.**
+
+- Hermetic star test (`KV growth does not ratchet the MLX buffer pool`): 20,000
+  single-token updates against a real 4-layer KVCache, sampling
+  `mlx_get_cache_memory()`. **1544 MB → 274 MB.** Runs in ~3 seconds and needs no
+  checkpoint — it reproduces the reporter's exact mechanism at toy scale.
+- Integration (`tests/test_kv_cache_growth_memory.sh`, his model, 23 K prompt ×3 turns):
+  `memory_mb - active_bytes` **14.61 GB → 3.87 GB** after one turn; footprint ratchet
+  across turns 1→3 is 0.56 GB; pool peaks at 2.3 GB against the 8 GB cap. Red-on-revert
+  verified against a rebuilt pre-fix binary.
+- Pool sizing, measured rather than guessed: peak pool during a **66 K-token** turn on
+  the 27B is **5.83 GB**, so the 8 GB cap has headroom at the context this class bites
+  at.
+
+**Perf.** The pool cap was the one plausible regression source, and a first pass at
+65 K decode read −14%. That was **thermal contamination plus n=1**: the isolation runs
+declined monotonically in temporal order (34.51 → 33.51 → 30.89 → 28.48) regardless of
+arm. Re-run cooled and tightly alternated per boot, the same rung gives fix
+33.76/34.90/29.96 vs old 30.56/32.10/33.35 — pair signs `+,+,−` with a spread far larger
+than the mean gap. A full ABBA `bench.sh --family all` (34 mlx-serve cells, default vs
+`MLX_SERVE_CACHE_LIMIT=0 MLX_SERVE_KV_GROW=linear`) lands at **decode −0.0%, prefill
++0.5%**. The absolute diff against `all-26.7.10.csv` looked like −12% to −25% across the
+board — and the OLD arm measured in the same session showed the same depressed
+absolutes, which is the whole reason cross-session absolutes are not admissible here.
+
+**Visibility.** This was invisible for as long as `active_bytes` was the only memory
+figure we served. `/props` now carries `memory.cache_bytes`, `/metrics` carries
+`mlx_serve:mlx_cache_bytes` + `mlx_serve:mlx_active_bytes` beside the existing
+`mlx_serve:memory_mb` (phys_footprint), and the tray renders `19.6 GB (+61 GB cache)`
+once the pool passes 1 GB. Any future instance of this class names itself.
+
+**Guards.** `KVCache growth strands bounded bytes` (pure, walks the policy and counts
+events + superseded bytes), `KV growth does not ratchet the MLX buffer pool` (real MLX),
+`clear cadence survives variable spec strides` (strides 1/3/5/9), `no decode path
+advances `step` outside advanceStep` (source scan over `@embedFile("generate.zig")` +
+`@embedFile("scheduler.zig")` — this is what stops the whack-a-mole; a new decode path
+cannot reintroduce the hole), the `mlxCacheLimitBytes`/`mlxCacheLimitFromEnv` tables, and
+`tests/test_kv_cache_growth_memory.sh`.
+
+**Noted, not fixed:** `computeMemoryContext` (server.zig) bills `num_hidden_layers` as
+full-attention layers. On `qwen3_5` only 1 in 4 are, so `kv_per_tok` is ~4× over-billed
+and auto-context is correspondingly conservative (the reporter's "GPU-safe max 104K" on
+a 256K model). Safe direction, real capability left on the table — separate change,
+separate bench.

@@ -21,7 +21,11 @@
 set -u
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-BIN="$ROOT/zig-out/bin/mlx-serve"
+# Same override convention as bench.sh's BINARY: point it at a released bundle's
+# server (`/Applications/MLX Core.app/Contents/MacOS/mlx-serve`) to A/B this
+# build against a shipped one in ONE session. Must be the in-bundle path, not a
+# copy — the bundled binary resolves its dylibs via @executable_path.
+BIN="${BINARY:-$ROOT/zig-out/bin/mlx-serve}"
 LADDER=~/mlx-bench-assets/ladder3.py
 MODEL="${MODEL:-$HOME/.mlx-serve/models/Jundot/Qwen3.6-27B-oQ4e-mtp}"
 OMLX_CLI="/Applications/oMLX.app/Contents/MacOS/omlx-cli"
