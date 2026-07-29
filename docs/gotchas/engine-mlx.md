@@ -567,3 +567,184 @@ for a future arch whose CPU side is the bottleneck. Output is bit-identical eith
 (verified: 160 greedy tokens, temp 0, byte-for-byte). **Rule**: a lever that pays in
 another engine's harness may be paying for a constraint that engine has and we do not —
 port it, measure it, and let the number decide the default.
+
+## The f16 checkpoint whose per-channel tables turned the whole residual f32
+
+**2026-07-29, `prism-ml/Ternary-Bonsai-27B-mlx-2bit`, worth 14.8%.**
+
+The Laguna YaRN-mscale bug (above) was found by luck: the MoE forward happened to carry a
+`[dtype-trace]` log and the other five forward paths had none. So the follow-up was to
+generalize the trace and sweep every arch on disk — `DtypeTrace` in `src/mlx.zig`, armed by
+all five `forward*With` paths plus batched-decode, the diffusion decoder and both vision
+towers, with a class guard (`every transformer forward path is watched by a dtype trace`)
+that keys on the forward-path SIGNATURE rather than on the shape of its layer loop. That
+distinction is load-bearing: BERT iterates its layer slice directly while every other path
+counts to `num_hidden_layers`, and a rule that keyed on the loop form would have skipped it
+silently.
+
+The trace logs both endpoints and, in between, only the layers where the dtype actually
+MOVES — so a mid-stack widening names one layer instead of drowning in forty identical
+lines, and after the first forward the whole thing costs nothing.
+
+One arch out of nine widened:
+
+```
+[dtype-trace] moe: residual in = bfloat16, first weight = n/a
+[dtype-trace] moe: residual widened at layer 0: bfloat16 -> float32
+[dtype-trace] moe: residual out = float32
+```
+
+The checkpoint is F16 throughout — despite `config.text_config.dtype: "bfloat16"`, which is
+simply wrong (read the CHECKPOINT, not the config: the Kokoro `AdaIN1d` rule again).
+`loadSafetensorsFile` already narrowed f16 `.scales`/`.biases` to bf16 (the hy_v3 mixed-dtype
+gather story), but deliberately left plain weights alone — including every NORM weight. So
+`rmsNorm(bf16 residual, f16 weight)` promoted at layer 0 and the residual stayed f32 for all
+64 layers, upcasting every weight read after it. Same class as the mscale bug, one level up:
+there it was one constant table, here it is a whole category of per-channel table.
+
+Fix: extend the load-site rule to any 1-D f16 tensor (`narrowsLoadedF16`). A 1-D tensor is a
+per-channel table — norm weight, bias, `A_log`, `dt_bias` — that is multiplied or added
+straight into the residual. Multi-dimensional dense f16 weights are left alone: those are
+matmul OPERANDS, MLX picks its kernel off that dtype, and narrowing one is a
+kernel-selection change rather than a promotion fix. Measured as a wash (23.15 vs 23.47 ms,
+inside boot drift), so the minimal rule shipped.
+
+**27.99 → 23.88 ms/forward, 14.8%**, greedy output byte-identical at temp 0 over 160 tokens,
+and a strict no-op on every bf16 checkpoint (`[dtype] narrowed 0` — Laguna, gemma4-26B-A4B
+and Qwen3.6-35B-A3B all unchanged). Kill switch `MLX_SERVE_F16_NARROW_1D=0`.
+
+**The measurement nearly went the other way, twice.** The first paired readings said the fix
+made the model 2x slower (51.3 ms) and then 5x slower (136 ms, with lm_head at 72.5 ms
+against 1.4 ms). Both were garbage — first-boot artifacts from loading an 8.4 GB checkpoint
+back-to-back with the previous one still in the page cache. Re-running the same two configs
+reversed the sign completely (23.5 vs 27.6). Then a four-boot alternating sweep drifted
+monotonically (23.5, 23.2, 32.0, 34.6) with no relation to the mode — thermal soak. Only a
+paired A/B with a 45 s cooldown between boots gave a stable answer, three rounds with no
+overlap. **A model this size needs a settle window between boots; the first boot after
+another large load is not a measurement.** Two separate wrong conclusions were one run away
+from being written down as fact.
+
+Two things found on the way and left explicitly open:
+
+- The same checkpoint's Qwen3-VL vision tower runs f32 end-to-end (`residual in = float32,
+  first weight = float16`) because its weights are 2-D f16. Vision is a one-shot prefill
+  cost, and narrowing matmul operands is a kernel-selection change that needs its own A/B —
+  not folded into this rule.
+- `diagProjBench` reshapes q back through `num_attention_heads * head_dim` and Qwen3.5-2B
+  ships a q_proj of 4096 against a computed 2048, so the diagnostic raised an MLX reshape
+  error — an uncatchable process kill — and one probe boot took the server down.
+  `projLadderFits` now declines with a log, because a silent skip is indistinguishable from
+  "this model has no dense attention".
+
+**Archs still unswept** (not on this disk): `qwen3`, `qwen3_next`, `nemotron_h`, `lfm2`,
+`hy_v3`, `diffusion_gemma`, and the media engines. The trace is armed on every path they
+would take, so booting one is now the whole check.
+
+## What a 3x forward fix invalidated: two Laguna defaults and a spec gate
+
+**2026-07-29.** Fixing the YaRN mscale promotion did not just make Laguna faster — it
+moved every ratio that had been calibrated against the slow forward. Three decisions were
+re-measured on the fixed tree and two of them flipped.
+
+### The KV half was real, but it pays LESS at long context, not more
+
+`updateDense` takes the cache dtype from `new_k`, so while the residual was f32 the
+full-attention KV was STORED in f32. Laguna XS has 10 full-attention layers of 40 (the
+other 30 cap at a 512-token sliding window), 8 KV heads x 128 head_dim.
+
+Paired ladders in one window (serial, `--no-pld`, prompt caches off, one boot per lane,
+the fix reverted at its single `constTableAs` call site for the pre lane):
+
+| ctx | pre ms/tok | post ms/tok | speedup | pre prefill | post prefill |
+|---|---|---|---|---|---|
+| 512 | 39.89 | 13.29 | 3.00x | 907 | 1232 |
+| 4096 | 41.84 | 13.83 | 3.02x | 903 | 1232 |
+| 16384 | 43.35 | 14.93 | 2.90x | 382 | 637 |
+| 32768 | 48.64 | 17.66 | 2.75x | 253 | 403 |
+| 65536 | 52.85 | 20.27 | 2.61x | 141 | 233 |
+
+Subtract the 512-token base and the KV term falls out exactly: at 32K it is 8.75 ms before
+and 4.37 ms after — **2.00x**, precisely the f32→bf16 halving, and 4.37 ms for 1.34 GB is
+307 GB/s, a sane rate. The mechanism is confirmed to two significant figures.
+
+The *prediction* that it would therefore be worth MORE than 3.03x at 32K is wrong, and
+wrong for a reason worth keeping: the forward term shrinks 3x while KV only shrinks 2x, so
+KV becomes a larger share of a smaller token and the blended ratio FALLS with context
+(3.00x → 2.61x). A fix that improves two terms by different factors does not compound.
+
+### gatherQmv lost to stock `gather_qmm` on both Laguna models
+
+`batchedExpertDecodePolicy` opted Laguna into the batched/gatherQmv expert path by default
+on a measured 17→48 tok/s. That measurement was taken while the forward was ~3x inflated.
+Re-measured on the fixed tree, alternating boots, 512-token window, serial:
+
+| model | gatherQmv | stock gather | batched take+qmm |
+|---|---|---|---|
+| Laguna XS | 13.296 ms/tok | **13.113** (+1.4%) | 14.839 |
+| Laguna S | 17.02 ms/tok | **15.45** (+9.2%) | — |
+
+Every round, no overlap. The reason is the one already written down for gemma4-26B-A4B:
+these kernels beat MLX only where the O(EXPERT-BANK-SIZE) addressing term DOMINATES the
+expert math. Making the rest of the token 3x cheaper made the expert math a much larger
+share and the bank term a smaller one, so MLX's better-tuned `gather_qmv_fast` tile wins.
+No arch opts in by default any more; both alternatives stay one env var away, and the next
+arch with a genuinely bank-dominated decode gets measured back in. Laguna XS forward:
+14.203 → 13.447 ms, ops/forward 3226 → 2329.
+
+### The PLD yield gate was warming up 4x too long
+
+The yield gate exists because PLD's cold path (no n-gram match) runs an UNPIPELINED forward
+plus a synchronous host read of the sampled token, against `next()`'s async-pipelined step.
+Its 32-step warmup was calibrated when the AR step cost 3x more; the same absolute tax is
+now a ~3x larger share.
+
+Swept on Laguna XS — one boot, serial vs unconstrained alternating per REQUEST, timings
+from the server's own `timings` object, 5 runs median. The matrix deliberately includes
+PLD's WIN case: an earlier sweep over only loss cases drove the warmup toward zero, which
+would have thrown the win away.
+
+| warmup | echo-edit | code-edit | free-form | explain | qa |
+|---|---|---|---|---|---|
+| 32 (was) | +76.9% | -4.3% | -1.2% | -1.4% | -7.2% |
+| 16 | +70.1% | -3.4% | -0.4% | -0.3% | -0.8% |
+| **8 (now)** | **+77.4%** | **+0.3%** | **-0.2%** | **-0.3%** | **-1.5%** |
+| 4 | +76.6% | +3.9% | -0.2% | -0.1% | -1.7% |
+
+8 recovers essentially the whole loss with the +77% untouched. 4 measured no worse, but a
+gate deciding on four observations is fitting noise, and a short preamble before a file
+echo is the NORMAL agent shape — exactly what a too-eager trip punishes. A premature trip
+is bounded anyway (`specShouldReenable` re-checks every 32 steps). `SPEC_YIELD_WARMUP`
+sweeps it without a rebuild.
+
+Note the shape of the loss: `free-form` and `explain` emit NO `[spec-stats]` line at all —
+PLD never engages — and were still 1.2-1.4% slower. Enabling speculation costs something
+even when the prompt gate declines it, because the request still routes through the
+unpipelined step function.
+
+### Method notes from this round
+
+- **Single runs lied three times, in both directions.** A "clean re-run" of gemma4-31b
+  produced anomalously HIGH values that got merged into the baseline, so the next run read
+  as a -14% regression; two repeats put it back at baseline. `qwen36-27b/mtp/code` read
+  74.3 against a 75 floor and then 77.3. `gemma4-31b/*/prefill` is BIMODAL (~178-191 vs
+  ~205) across the whole session. The baseline is now per-cell MEDIANS over repeated runs
+  with the spread recorded, because a one-run baseline makes every later diff a coin flip.
+- **Attribute before believing.** Every flagged cell this round was structurally
+  unreachable from the changes (gemma4 prefill cannot be touched by a PLD-decode gate, a
+  no-op f16 narrowing, or a gather policy that was already `false` for gemma4). Check
+  reachability first; it is faster than another bench run and it is what makes the repeat
+  a confirmation rather than a hope.
+- **`MLX_SERVE_DECODE_PROFILE` is not a sizing tool.** It forces an eval at every phase
+  boundary, which destroys pipelining: 47.4 ms/token against a real 13.1, with the router
+  phase absorbing sync cost and reading LARGER than the experts it gates. Use the ladder or
+  the real forward.
+- **The `diagProjBench` ladder still has a constant input**, so its `mlp` rung reads a
+  resident expert bank and is a LOWER bound (4.63 ms, 34% of the token). Feeding it eight
+  varying inputs was tried and reverted: the lazy `astype` nodes outlive their f32 sources
+  in a way the single-input form never exposed and the rungs SIGBUS (status 138). It is a
+  diagnostic; the real forward is the honest number.
+- **A ladder guard must use the same geometry the ladder does.** `projLadderFits` first
+  compared against a global `num_attention_heads * head_dim`, but the rung uses
+  `cfg.layerNumHeads(li)` — Laguna runs 48 heads on full-attention layers and 72 on sliding
+  ones, so the global form declined 30 of 40 layers and silently under-reported the
+  ladder's bytes by 5x (85 GB/s instead of 412).

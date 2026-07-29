@@ -1,7 +1,13 @@
 # Changelog
 
-## v26.7.12
+## v26.7.12 — Agents, media generation in chat, Kokoro voices
 
+- **Agents.** Named personas with their own prompt, voice, model, tools, workspace and wake phrase. A model writes the prompt for you, and every surface that can start a turn runs as that agent: chat, voice, tasks, Telegram, Quick Launcher.
+- **Kokoro voices.** Kokoro-82M runs natively: 54 built-in voices that blend, ~17x realtime, 330 MB. Qwen3-TTS stays the one that clones your own voice.
+- **Media generation in chat.** Ask for an image, a spoken line, a track or a short clip and it appears inline with a progress meter. Fast previews; the tray windows stay the place for full-quality work.
+- **Chat window pass.** Failed turns render as a card, context usage moved to a pill above the composer, and code blocks got colouring, line numbers and a copy button. Plus a toolbar model picker, web sources on answers, and per-chat tool switches.
+- **Faster model downloads.** Up to 16 ranged connections per file over one shared connection pool. The app sends your Hugging Face token now too, which is what search was getting rate limited without.
+- **Laguna decodes about 3x faster.** 24.6 to 74.7 tok/s on XS against our own previous build, traced to a constant table built at the wrong precision that widened every weight read after it. NVFP4 expert banks now decode in place as well.
 - **Fixed runaway memory on long chats.** A long session could grow the server to tens of GB of memory it wasn't using, until you killed it — 81 GB on a 128 GB Mac in one report, while the app's panel showed 19.6 GB (#110). Three things caused it, all fixed: MLX parks freed memory in a pool it never trims on its own, the KV cache grew in a way that threw away a full copy of itself every 256 tokens, and the drafter/MTP/batched decode paths never released their working memory at all. Speculative decoding is on by default for MTP checkpoints, so that last one hit the models most likely to be used for long agent sessions.
 - **The memory panel tells you where it went.** "GPU Memory" now reads e.g. `19.6 GB (+61 GB cache)`, and `/props` and `/metrics` report the same split. The bug above was invisible for as long as the only figure we published was memory in active use.
 

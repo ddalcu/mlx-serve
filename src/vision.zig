@@ -635,9 +635,12 @@ pub const VisionEncoder = struct {
 
         // 5. Transformer layers (now over `max_patches` with optional mask)
         const seq_len_for_transformer = max_patches;
-        for (self.layers) |lw| {
+        var dt = mlx.DtypeTrace.begin("siglip-vision", h, if (self.layers.len > 0) self.layers[0].q_proj.weight else null);
+        for (self.layers, 0..) |lw, layer_idx| {
             h = try self.transformerLayer(h, lw, positions, attn_mask_opt, batch, seq_len_for_transformer, num_heads, head_dim);
+            dt.layer(h, layer_idx);
         }
+        dt.end(h);
 
         // 6. Slice back to real patches before pooling. The padded rows are zero (masked in
         //    attention throughout), and our positionPool below operates on the real grid;

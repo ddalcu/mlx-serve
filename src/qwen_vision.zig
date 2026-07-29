@@ -874,7 +874,8 @@ pub const QwenVision = struct {
         defer _ = mlx.mlx_array_free(rope.cos);
         defer _ = mlx.mlx_array_free(rope.sin);
 
-        for (self.blocks) |blk| {
+        var dt = mlx.DtypeTrace.begin("qwen3vl-vision", x, if (self.blocks.len > 0) self.blocks[0].qkv_w else null);
+        for (self.blocks, 0..) |blk, block_idx| {
             // Attention residual.
             {
                 const normed = try self.layerNorm6(x, blk.norm1_w, blk.norm1_b);
@@ -901,7 +902,9 @@ pub const QwenVision = struct {
                 _ = mlx.mlx_array_free(x);
                 x = h;
             }
+            dt.layer(x, block_idx);
         }
+        dt.end(x);
 
         // Merger: LayerNorm(hidden) → reshape [N/merge², hidden·merge²] → fc2(gelu(fc1)).
         const normed = try self.layerNorm6(x, self.merger_norm_w, self.merger_norm_b);

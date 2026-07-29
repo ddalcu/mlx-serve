@@ -416,6 +416,104 @@ pub fn getShape(arr: mlx_array) []const c_int {
     return mlx_array_shape(arr)[0..ndim];
 }
 
+/// How a residual's dtype moved between two observation points.
+pub const DtypeStep = enum { quiet, widened, narrowed, changed };
+
+/// Bytes per element, for deciding whether a dtype change WIDENED the stream.
+/// Only the dtypes a residual can actually hold are named; anything else is
+/// reported as a plain change rather than guessed at.
+pub fn dtypeBytes(d: mlx_dtype) ?u8 {
+    return switch (d) {
+        .float16, .bfloat16 => 2,
+        .float32 => 4,
+        .float64 => 8,
+        else => null,
+    };
+}
+
+pub fn dtypeStep(prev: mlx_dtype, cur: mlx_dtype) DtypeStep {
+    if (prev == cur) return .quiet;
+    const pb = dtypeBytes(prev) orelse return .changed;
+    const cb = dtypeBytes(cur) orelse return .changed;
+    if (cb > pb) return .widened;
+    if (cb < pb) return .narrowed;
+    return .changed; // same width, different kernel selection (bf16 vs f16)
+}
+
+/// One-shot latches for `[dtype-trace]`, keyed by forward-path name. A vision
+/// tower and its text trunk are different paths and latch independently.
+var dtype_trace_seen: [12]?[]const u8 = @splat(null);
+
+/// True the FIRST time `path` is seen, false forever after. After the first
+/// forward the trace costs nothing — a per-layer FFI dtype read on every token
+/// would be a real (if small) tax, and identical repeated lines would bury the
+/// one line that matters.
+pub fn dtypeTraceArm(path: []const u8) bool {
+    for (&dtype_trace_seen) |*slot| {
+        if (slot.*) |seen| {
+            if (std.mem.eql(u8, seen, path)) return false;
+            continue;
+        }
+        slot.* = path;
+        return true;
+    }
+    return false; // table full — stop tracing rather than spam
+}
+
+pub fn resetDtypeTraceForTest() void {
+    dtype_trace_seen = @splat(null);
+}
+
+/// DIAGNOSTIC (`[dtype-trace]`): watch the residual stream's dtype across one
+/// forward pass.
+///
+/// A residual wider than the weights promotes EVERY projection's weight on
+/// read, so the cost lands as a UNIFORM multiple across attention, MLP and
+/// lm_head — which reads like a platform problem, not a bug. The Laguna YaRN
+/// mscale table (f32 constant multiplied into bf16 q/k) cost 3x and was
+/// invisible to op count, kernel choice, KV ablation and the CPU/GPU split.
+/// Endpoints alone say THAT it widened; per-layer lines on every layer are
+/// unreadable. So: log both endpoints, and in between log only where the dtype
+/// actually moves — one line that names the layer responsible.
+pub const DtypeTrace = struct {
+    path: []const u8,
+    on: bool,
+    last: mlx_dtype,
+
+    pub fn begin(path: []const u8, h: mlx_array, weight: ?mlx_array) DtypeTrace {
+        const on = dtypeTraceArm(path);
+        const d = mlx_array_dtype(h);
+        if (on) {
+            log.info("[dtype-trace] {s}: residual in = {s}, first weight = {s}\n", .{
+                path,
+                @tagName(d),
+                if (weight) |w| (if (w.ctx == null) "null" else @tagName(mlx_array_dtype(w))) else "n/a",
+            });
+        }
+        return .{ .path = path, .on = on, .last = d };
+    }
+
+    pub fn layer(self: *DtypeTrace, h: mlx_array, layer_idx: usize) void {
+        if (!self.on) return;
+        const d = mlx_array_dtype(h);
+        const step = dtypeStep(self.last, d);
+        if (step == .quiet) return;
+        log.info("[dtype-trace] {s}: residual {s} at layer {d}: {s} -> {s}\n", .{
+            self.path,
+            @tagName(step),
+            layer_idx,
+            @tagName(self.last),
+            @tagName(d),
+        });
+        self.last = d;
+    }
+
+    pub fn end(self: *DtypeTrace, h: mlx_array) void {
+        if (!self.on) return;
+        log.info("[dtype-trace] {s}: residual out = {s}\n", .{ self.path, @tagName(mlx_array_dtype(h)) });
+    }
+};
+
 /// Check if an mlx-c call succeeded (returns 0 on success)
 /// DIAGNOSTIC op counter. Every graph-building op funnels through `check`, so
 /// this counts ops ISSUED (not kernels dispatched — MLX fuses some). Only read

@@ -688,35 +688,6 @@ struct ChatDetailView: View {
         .overlay(Capsule().stroke(Color.secondary.opacity(0.20), lineWidth: 0.5))
     }
 
-    /// Sandbox status shield, rendered in the COMPOSER row (never in the
-    /// toolbar band: adding anything there re-triggers the » eviction class —
-    /// live regression 2026-07-19, the extra icon tipped the cluster width and
-    /// small windows overflowed everything into the » menu). Same glyph in both
-    /// states, only the color changes: green = agent tools + MCP servers run
-    /// inside the isolated Linux VM (click opens the sandbox terminal); gray =
-    /// they run on the host (tooltip names Settings, click opens it).
-    private var sandboxShield: some View {
-        let state = SandboxShield.state(
-            requestedEnabled: appState.serverOptions.sandbox.enabled)
-        return Button {
-            AppActivation.openWindow(id: state.windowId, using: openWindow)
-        } label: {
-            Image(systemName: "checkmark.shield.fill")
-                .font(.system(size: 13, weight: .medium))
-                .foregroundStyle(state.isOn ? Color.green : Color.secondary.opacity(0.6))
-                .frame(width: ChatMetrics.composerIconSize, height: ChatMetrics.composerIconSize)
-                .background(Color.secondary.opacity(0.15))
-                .clipShape(Circle())
-                // Full control frame == the pill's resting height (ChatMetrics
-                // contract, same as the paperclip) so the bottom-aligned row
-                // centers the circle against the input pill.
-                .frame(width: ChatMetrics.composerControlSize, height: ChatMetrics.composerControlSize)
-                .contentShape(Circle())
-        }
-        .buttonStyle(.plain)
-        .help(state.help)
-    }
-
     /// Per-tab agent picker. A `Menu` (not a Picker) so an agent whose model
     /// isn't downloaded can be a disabled row with its reason, and so "Manage
     /// agents…" sits in the same list. Selecting one applies to SUBSEQUENT turns:
@@ -808,35 +779,37 @@ struct ChatDetailView: View {
         .help("Thinking Mode (\(toolbarToggles.thinking ? "ON" : "OFF")) — when the model supports it, it'll emit a private reasoning trace before the visible answer. Slower but better on reasoning-heavy prompts.")
     }
 
-    /// Split pill like `mcpToggle`: the wrench+caption half toggles Agent
-    /// mode, the folder half picks the workspace directory. The folder icon
-    /// is ALWAYS present (static pill size — the » toolbar gotcha); the
-    /// current workspace rides both halves' tooltips.
-    /// One wrench that OPENS the menu rather than toggling directly.
+    /// One wrench: CLICK flips the tool loop, secondary-click opens the per-tool
+    /// switches and the workspace.
     ///
-    /// As a captioned pill this was a split control: caption toggled, chevron
-    /// opened. Icon-only there is no room for two halves, and a bare glyph that
-    /// silently means two different things depending on where you click is
-    /// worse than one that always opens — so on/off is the menu's first row,
-    /// alongside the per-tool switches and the workspace it applies to.
+    /// It used to open the menu on click, with on/off as the first row. This is
+    /// the composer's most-flipped control, so the frequent action was paying a
+    /// click plus a scan down a long list every time. A bare glyph meaning two
+    /// things by WHERE you click is still out (that was the split-pill problem);
+    /// meaning two things by WHICH button is the standard macOS split, and
+    /// `primaryAction:` also gives press-and-hold for free — the context menu is
+    /// there because press-and-hold is not something anyone discovers.
     private var agentToggle: some View {
         Menu {
             toolMenuContent
         } label: {
             modeIcon("wrench", isOn: toolbarToggles.agent, onColor: .orange)
+        } primaryAction: {
+            setToolsEnabled(!toolbarToggles.agent)
         }
         .menuStyle(.button)
         .buttonStyle(.plain)
         .menuIndicator(.hidden)
+        .contextMenu { toolMenuContent }
         .help("""
         Tools (\(toolbarToggles.agent ? "ON" : "OFF")) — the model runs a tool-calling loop with the built-in tools (shell, file read/write/edit/search, browse, webSearch, saveMemory, media generation).
         Off: a regular chat with no tools.
-        Click to turn tools on or off, choose which ones this chat may use, and set its workspace.
+        Click to turn tools \(toolbarToggles.agent ? "off" : "on"); right-click to choose which ones this chat may use and set its workspace.
         Workspace: \(session?.workingDirectory ?? "not set")
         """)
     }
 
-    /// Flip the tool loop for this chat. Shared by the menu's first row and the
+    /// Flip the tool loop for this chat. Shared by the wrench click and the
     /// pre-send intent nudge, so the approval re-arm and the thinking auto-off
     /// can't apply on one path and not the other.
     private func setToolsEnabled(_ on: Bool) {
@@ -892,15 +865,11 @@ struct ChatDetailView: View {
         appState.saveChatHistory()
     }
 
+    /// Per-tool switches + the workspace they apply to. No on/off row: that is
+    /// what a click on the wrench does, and one boolean with two controls is how
+    /// the two end up disagreeing.
     @ViewBuilder
     private var toolMenuContent: some View {
-        // The on/off switch itself — the icon opens this menu rather than
-        // toggling, so this row is the only place it lives.
-        Button(toolbarToggles.agent ? "Turn Tools Off" : "Turn Tools On") {
-            setToolsEnabled(!toolbarToggles.agent)
-        }
-
-        Divider()
         Button("Enable All Tools") { setAllTools(enabled: true) }
             .disabled(isExternalBridgeSession)
         Button("Disable All Tools") { setAllTools(enabled: false) }
@@ -938,27 +907,36 @@ struct ChatDetailView: View {
         Text(session?.workingDirectory ?? "No workspace set")
     }
 
-    /// Same shape as `agentToggle`: the icon opens a menu carrying both the
-    /// on/off row and the Marketplace the gear half used to hold.
+    /// Flip MCP for this chat — the Telegram bridge writes the shared config it
+    /// reads live, everyone else the app-level state.
+    private func setMCPEnabled(_ on: Bool) {
+        if isExternalBridgeSession {
+            appState.serverOptions.telegram.useMCP = on
+        } else {
+            mcpMode = on
+        }
+    }
+
+    /// Same shape as `agentToggle`: click toggles, secondary-click opens the
+    /// Marketplace the gear half used to hold.
     private var mcpToggle: some View {
         Menu {
-            Button(toolbarToggles.mcp ? "Turn MCP Off" : "Turn MCP On") {
-                if isExternalBridgeSession {
-                    // Telegram session: flip the shared config (synced with Settings).
-                    appState.serverOptions.telegram.useMCP.toggle()
-                } else {
-                    mcpMode.toggle()
-                }
-            }
-            Divider()
-            Button("MCP Marketplace…") { showMCPMarketplace = true }
+            mcpMenuContent
         } label: {
             modeIcon("puzzlepiece.extension", isOn: toolbarToggles.mcp, onColor: .purple)
+        } primaryAction: {
+            setMCPEnabled(!toolbarToggles.mcp)
         }
         .menuStyle(.button)
         .buttonStyle(.plain)
         .menuIndicator(.hidden)
-        .help("MCP (\(toolbarToggles.mcp ? "ON" : "OFF")) — when on, tools from every enabled Model Context Protocol server are added to the toolset alongside the built-in ones. Click to switch it, or to open the Marketplace and enable servers.")
+        .contextMenu { mcpMenuContent }
+        .help("MCP (\(toolbarToggles.mcp ? "ON" : "OFF")) — when on, tools from every enabled Model Context Protocol server are added to the toolset alongside the built-in ones. Click to turn it \(toolbarToggles.mcp ? "off" : "on"); right-click to open the Marketplace and enable servers.")
+    }
+
+    @ViewBuilder
+    private var mcpMenuContent: some View {
+        Button("MCP Marketplace…") { showMCPMarketplace = true }
     }
 
     /// A conversation with nothing in it yet. Rendered instead of an empty
@@ -1369,9 +1347,6 @@ struct ChatDetailView: View {
     @ViewBuilder
     private var composerControls: some View {
         HStack(spacing: 6) {
-        // Sandbox status shield (green = isolated VM, gray = host).
-        sandboxShield
-
         // Who this tab is talking to. In the COMPOSER row, not the
         // toolbar band — that cluster's width budget is full, and its
         // label is agent-name-sized (runtime-variable), which is
@@ -3353,31 +3328,3 @@ fileprivate final class ComposerTextView: NSTextView {
     }
 }
 
-/// Pure state for the sandbox shield (rendered by `sandboxShield` in the
-/// composer's control row; pinned by SandboxTransportTests).
-/// Green shield = the Agent Sandbox is effectively on (including builds with
-/// no host shell, where it is always on); gray = tools run on the host and
-/// the tooltip tells the user where to enable it.
-enum SandboxShield {
-    struct State {
-        let isOn: Bool
-        /// Where a click lands: the live sandbox terminal when on, Settings
-        /// (the place to enable it) when off.
-        let windowId: String
-        let help: String
-    }
-
-    static func state(requestedEnabled: Bool,
-                      hostShellAllowed: Bool = BuildFeatures.current.hostShell) -> State {
-        if AgentSandbox.resolveEnabled(requested: requestedEnabled, hostShellAllowed: hostShellAllowed) {
-            return State(
-                isOn: true,
-                windowId: "sandboxTerminal",
-                help: "Agent Sandbox ON — shell commands and MCP servers run inside an isolated Linux VM, not on your Mac. Click to open the sandbox terminal.")
-        }
-        return State(
-            isOn: false,
-            windowId: "settings",
-            help: "Agent Sandbox OFF — agent tools and MCP servers run directly on this Mac. Turn it on in Settings → Agent Sandbox. Click to open Settings.")
-    }
-}

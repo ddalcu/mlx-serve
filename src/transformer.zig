@@ -5189,6 +5189,15 @@ pub const Transformer = struct {
         return computeQuantParams(&self.config, w, sc, in_dim);
     }
 
+    /// Whether `diagProjBench`'s hand-rebuilt attention can actually reshape
+    /// this q_proj back. `q_shape` is the loaded (pre-transposed) [in, out]
+    /// matrix; `head_width` is `num_attention_heads * head_dim`, the width the
+    /// rungs reshape through.
+    fn projLadderFits(q_shape: []const c_int, head_width: c_int) bool {
+        if (q_shape.len != 2) return false;
+        return q_shape[1] == head_width;
+    }
+
     /// How much of the real attention chain a `diagProjBench` rung rebuilds.
     /// The rungs are cumulative, so the ladder walks FORWARD from the bare
     /// matmul loop to the full attention block — the direction that localizes
@@ -5225,6 +5234,16 @@ pub const Transformer = struct {
         const tio = std.Io.Threaded.global_single_threaded.io();
         const ml = self.moe_layers orelse return;
         const HID: c_int = @intCast(self.config.hidden_size);
+        // NOTE (honest caveat): this input is CONSTANT, so the MoE router
+        // picks the same top-K experts in every layer and every iteration and
+        // the `mlp` rung reads a resident expert bank — it is a LOWER BOUND on
+        // the real MoE cost, not the real cost. Feeding the ladder eight
+        // varying inputs was tried and reverted: the rungs then SIGBUS (the
+        // lazy astype nodes outlive their f32 sources in a way the
+        // single-input form never exposed), and this is a diagnostic, not
+        // shipped behaviour. Size the MoE share off the REAL forward
+        // (MLX_SERVE_DECODE_FWD_UBENCH) instead, which routes through the
+        // shipped kernels with real embeddings.
         const xsh = [_]c_int{ 1, 1, HID };
         const xb = self.allocator.alloc(f32, @intCast(HID)) catch return;
         defer self.allocator.free(xb);
@@ -5237,9 +5256,27 @@ pub const Transformer = struct {
 
         var bytes: f64 = 0;
         var eligible: usize = 0;
-        for (ml) |*lw| switch (lw.attn) {
+        var declined_shape = false;
+        for (ml, 0..) |*lw, li| switch (lw.attn) {
             .full => |fa| {
                 if (fa.q_s.ctx != null) continue;
+                // The rungs rebuild attention by hand and reshape q back
+                // through [1, 1, h_count * hd]. A checkpoint whose q_proj is
+                // wider than that product raises an MLX reshape error, which
+                // is an uncatchable process kill — decline instead, loudly,
+                // because a silent skip is indistinguishable from "this model
+                // has no dense attention".
+                //
+                // The head count is PER LAYER (`cfg.layerNumHeads`, which is
+                // what the rung itself uses) — Laguna runs 48 heads on its
+                // full-attention layers and 72 on its sliding ones, so a
+                // global `num_attention_heads * head_dim` would decline 30 of
+                // its 40 layers and quietly under-report the ladder's bytes.
+                const layer_width: c_int = @intCast(self.config.layerNumHeads(@intCast(li)) * self.config.head_dim);
+                if (!projLadderFits(mlx.getShape(fa.q_w), layer_width)) {
+                    declined_shape = true;
+                    continue;
+                }
                 eligible += 1;
                 for ([_]mlx.mlx_array{ fa.q_w, fa.k_w, fa.v_w, fa.o_w }) |w| {
                     if (w.ctx == null) continue;
@@ -5249,6 +5286,9 @@ pub const Transformer = struct {
             },
             else => {},
         };
+        if (declined_shape) {
+            log.info("[proj-bench] declined one or more layers: q_proj output != that layer's heads * head_dim — the rung reconstruction cannot rebuild this shape\n", .{});
+        }
         if (eligible == 0) return;
 
         log.info("[proj-bench] ladder over {d} dense-bf16 attention layers ({d:.2} GB/pass)\n", .{ eligible, bytes / 1.0e9 });
@@ -6478,8 +6518,9 @@ pub const Transformer = struct {
         const seq_len = id_shape[1];
 
         var h = try self.bertEmbedding(token_ids);
+        var dt = mlx.DtypeTrace.begin("bert", h, if (bert_layers.len > 0) bert_layers[0].q_w else null);
 
-        for (bert_layers) |lw| {
+        for (bert_layers, 0..) |lw, layer_idx| {
             // Self-attention
             const q = try self.qmatmulAddBias(h, lw.q_w, lw.q_s, lw.q_b, lw.q_bias);
             defer _ = mlx.mlx_array_free(q);
@@ -6563,7 +6604,9 @@ pub const Transformer = struct {
             _ = mlx.mlx_array_free(h);
 
             h = try self.layerNorm(h_plus_out, lw.out_norm_w, lw.out_norm_b);
+            dt.layer(h, layer_idx);
         }
+        dt.end(h);
 
         return h; // [B, S, H] — hidden states for mean pooling
     }
@@ -6807,6 +6850,8 @@ pub const Transformer = struct {
                 ple_input = try self.computePLEInput(token_ids, h, batch, seq_len);
             }
         }
+
+        var dt = mlx.DtypeTrace.begin("standard", h, if (self.layers.len > 0) self.layers[0].q_w else null);
 
         for (0..cfg.num_hidden_layers) |layer_idx| {
             const li: u32 = @intCast(layer_idx);
@@ -7092,7 +7137,9 @@ pub const Transformer = struct {
                 try mlx.check(mlx.mlx_array_eval(h));
             }
             self.ladderStep(h, layer_idx, seq_len);
+            dt.layer(h, layer_idx);
         }
+        dt.end(h);
 
         const final_normed = try self.rmsNorm(h, self.final_norm);
         _ = mlx.mlx_array_free(h);
@@ -7210,6 +7257,8 @@ pub const Transformer = struct {
         // Per-slot int32 kv-len buffer reused for the mask each layer.
         var kv_len_buf = try self.allocator.alloc(i32, next_tokens.len);
         defer self.allocator.free(kv_len_buf);
+
+        var dt = mlx.DtypeTrace.begin("batched-decode", h, if (self.layers.len > 0) self.layers[0].q_w else null);
 
         for (0..cfg.num_hidden_layers) |layer_idx| {
             const li: u32 = @intCast(layer_idx);
@@ -7440,7 +7489,9 @@ pub const Transformer = struct {
                 _ = mlx.mlx_array_free(h);
                 h = h_scaled;
             }
+            dt.layer(h, layer_idx);
         }
+        dt.end(h);
 
         const final_normed = try self.rmsNorm(h, self.final_norm);
         _ = mlx.mlx_array_free(h);
@@ -7597,18 +7648,10 @@ pub const Transformer = struct {
         // One-shot dtype trace. A residual stream that is wider than the
         // weights promotes EVERY projection's weight on read, which inflates
         // each stage uniformly rather than showing up as one slow op.
-        if (!dtype_traced) {
-            dtype_traced = true;
-            const fa0: ?FullAttnWeights = switch (ml[0].attn) {
-                .full => |f| f,
-                else => null,
-            };
-            log.info("[dtype-trace] residual={s} q_w={s} final_norm={s}\n", .{
-                @tagName(mlx.mlx_array_dtype(h)),
-                if (fa0) |f| @tagName(mlx.mlx_array_dtype(f.q_w)) else "n/a",
-                @tagName(mlx.mlx_array_dtype(self.final_norm)),
-            });
-        }
+        var dt = mlx.DtypeTrace.begin("moe", h, switch (ml[0].attn) {
+            .full => |f| f.q_w,
+            else => null,
+        });
 
         // Qwen3-VL interleaved M-RoPE: build the per-prefill-chunk cos/sin once
         // (shared by every full-attn layer this forward), freed after the loop.
@@ -7727,14 +7770,11 @@ pub const Transformer = struct {
                 try mlx.check(mlx.mlx_array_eval(h));
             }
             self.ladderStep(h, layer_idx, seq_len);
+            dt.layer(h, layer_idx);
         }
 
         ctx.moe_seq_offset.* += @intCast(seq_len);
-
-        if (!dtype_traced_out) {
-            dtype_traced_out = true;
-            log.info("[dtype-trace] residual AFTER the layer loop = {s}\n", .{@tagName(mlx.mlx_array_dtype(h))});
-        }
+        dt.end(h);
 
         const final_normed = try self.rmsNorm(h, self.final_norm);
         _ = mlx.mlx_array_free(h);
@@ -8092,6 +8132,11 @@ pub const Transformer = struct {
         const dbg = std.c.getenv("MLX_SERVE_DIFFUSION_TRACE") != null;
         if (dbg) debugTraceHead("embed+sc", h, self.s);
 
+        var dt = mlx.DtypeTrace.begin("diffusion-decoder", h, switch (ml[0].attn) {
+            .full => |f| f.q_w,
+            else => null,
+        });
+
         for (0..cfg.num_hidden_layers) |layer_idx| {
             const li: u32 = @intCast(layer_idx);
             const lw = &ml[layer_idx];
@@ -8115,7 +8160,9 @@ pub const Transformer = struct {
                 const label = std.fmt.bufPrint(&buf, "after layer {d}", .{layer_idx}) catch "layer";
                 debugTraceHead(label, h, self.s);
             }
+            dt.layer(h, layer_idx);
         }
+        dt.end(h);
 
         const final_normed = try self.rmsNorm(h, self.final_norm);
         _ = mlx.mlx_array_free(h);
@@ -8157,6 +8204,8 @@ pub const Transformer = struct {
             ctx.cache.config.scheme != .off,
         );
 
+        var dt = mlx.DtypeTrace.begin("hybrid", h, null);
+
         for (0..cfg.num_hidden_layers) |layer_idx| {
             const li: u32 = @intCast(layer_idx);
             const lw = &hl[layer_idx];
@@ -8197,7 +8246,9 @@ pub const Transformer = struct {
                 try mlx.check(mlx.mlx_array_eval(h));
             }
             self.ladderStep(h, layer_idx, seq_len);
+            dt.layer(h, layer_idx);
         }
+        dt.end(h);
 
         ctx.moe_seq_offset.* += @intCast(seq_len);
 
@@ -8806,6 +8857,8 @@ pub const Transformer = struct {
         const full_mask: mlx.mlx_array = ctx.key_pad_mask orelse none_mask;
         const sliding_mask: mlx.mlx_array = if (band_pad.ctx != null) band_pad else if (band.ctx != null) band else full_mask;
 
+        var dt = mlx.DtypeTrace.begin("gemma3-encoder", h, if (self.layers.len > 0) self.layers[0].q_w else null);
+
         for (0..cfg.num_hidden_layers) |layer_idx| {
             const li: u32 = @intCast(layer_idx);
             const lw = &self.layers[layer_idx];
@@ -8913,7 +8966,9 @@ pub const Transformer = struct {
             try mlx.check(mlx.mlx_add(&h_next, h, mlp_normed, self.s));
             _ = mlx.mlx_array_free(h);
             h = h_next;
+            dt.layer(h, layer_idx);
         }
+        dt.end(h);
 
         const final = try self.rmsNorm(h, self.final_norm);
         _ = mlx.mlx_array_free(h);
@@ -11831,10 +11886,6 @@ fn layerCap(n: usize) usize {
     return if (cap == 0) n else @min(cap, n);
 }
 
-/// DIAGNOSTIC: one-shot latch for the [dtype-trace] log. Module scope so it
-/// is zero-initialized regardless of how Transformer itself is constructed.
-var dtype_traced: bool = false;
-var dtype_traced_out: bool = false;
 var decode_prof: DecodeProf = .{};
 var decode_prof_enabled: ?bool = null;
 
@@ -11881,11 +11932,17 @@ fn decodeProfileEnabled() bool {
 // Policy (pure, unit-tested by `batchedExpertDecodePolicy` test):
 //   - MLX_SERVE_MOE_GATHER_DECODE=1  → hard force gather (beats everything).
 //   - MLX_SERVE_MOE_BATCHED_DECODE=1 → hard force batched (for A/B on any arch).
-//   - otherwise                      → batched ONLY for laguna, gather for the rest.
+//   - otherwise                      → stock gather, on every arch.
+//
+// The laguna default opted INTO the batched path on a 17→48 tok/s measurement
+// taken while the YaRN mscale f32 promotion inflated the whole forward ~3x.
+// Re-measured on the fixed tree it loses on both Laguna models (see the
+// `batchedExpertDecodePolicy` test for the numbers), so no arch opts in by
+// default any more. Both alternatives stay one env var away.
 fn batchedExpertDecodePolicy(model_type: []const u8, gather_force: bool, batched_force: bool) bool {
+    _ = model_type;
     if (gather_force) return false;
-    if (batched_force) return true;
-    return std.mem.eql(u8, model_type, "laguna");
+    return batched_force;
 }
 
 var moe_gather_force_env: ?bool = null;
@@ -14529,22 +14586,38 @@ test "appendHybridMlpWeights skips dense fields with null ctx (UD dense bf16)" {
     try testing.expectEqual(@as(usize, 3), mlx.mlx_vector_array_size(vec));
 }
 
-test "batchedExpertDecodePolicy: batched decode is a validated per-arch opt-in" {
-    // The batchedExpertMm decode path (take + batched quantized_matmul) dodges
-    // our self-built libmlx's serialized decode gather_qmm. It is a big win only
-    // where the per-token gather cost dominates (Laguna 2-bit large experts:
-    // 17→48 tok/s) and a NET LOSS where experts are small and the take-
-    // materialization overhead dominates (gemma4-26B-A4B: 114→85, Qwen3.6-MoE
-    // likewise — captured in the 26.7.10 bench). So it must NEVER be default-on
-    // for all quantized MoE — only Laguna opts in by default.
-    try testing.expect(batchedExpertDecodePolicy("laguna", false, false));
+test "batchedExpertDecodePolicy: stock gather is the default on EVERY arch" {
+    // History, and why the laguna opt-in was retired.
+    //
+    // The batchedExpertMm decode path (take + batched quantized_matmul) and
+    // then `gatherQmv` both exist to dodge our self-built libmlx's decode
+    // `gather_qmm`, whose cost is O(EXPERT BANK SIZE) rather than O(work).
+    // Laguna opted in by default on a measured 17→48 tok/s.
+    //
+    // That measurement was taken on a forward pass inflated ~3x by the YaRN
+    // mscale f32 promotion. With the promotion fixed the expert math is a much
+    // larger share of a much cheaper token, the O(bank) addressing term is a
+    // correspondingly smaller one, and MLX's better-tuned `gather_qmv_fast`
+    // tile wins — the SAME reasoning that already explained why gemma4-26B-A4B
+    // loses with gatherQmv. Re-measured on the fixed tree, alternating boots,
+    // 512-token window, serial:
+    //
+    //   Laguna XS  gatherQmv 13.296 ms/tok   stock 13.113   stock +1.4%
+    //   Laguna S   gatherQmv 17.02  ms/tok   stock 15.45    stock +9.2%
+    //   (batched take+qmm on XS: 14.839 — worst of the three)
+    //
+    // Both models, every round, no overlap. So there is no arch left whose
+    // default should be anything but stock gather. Both kernels stay reachable
+    // by env for A/B — the finding is about the DEFAULT, and the next arch
+    // with a genuinely bank-dominated decode can be measured back in.
+    try testing.expect(!batchedExpertDecodePolicy("laguna", false, false));
     try testing.expect(!batchedExpertDecodePolicy("gemma4_text", false, false));
     try testing.expect(!batchedExpertDecodePolicy("qwen3_5_moe", false, false));
     try testing.expect(!batchedExpertDecodePolicy("hy_v3", false, false));
     // MLX_SERVE_MOE_BATCHED_DECODE forces it on for any arch (experimentation A/B).
     try testing.expect(batchedExpertDecodePolicy("gemma4_text", false, true));
-    // MLX_SERVE_MOE_GATHER_DECODE is the hard override: beats both the laguna
-    // default and the batched force.
+    try testing.expect(batchedExpertDecodePolicy("laguna", false, true));
+    // MLX_SERVE_MOE_GATHER_DECODE is the hard override: still beats the force.
     try testing.expect(!batchedExpertDecodePolicy("laguna", true, false));
     try testing.expect(!batchedExpertDecodePolicy("gemma4_text", true, true));
 }
@@ -18353,6 +18426,108 @@ test "a constant table must not widen the activation it scales" {
     defer _ = mlx.mlx_array_free(kept);
     try mlx.check(mlx.mlx_multiply(&kept, act, matched, s));
     try std.testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(kept));
+}
+
+test "projLadderFits declines a shape its reconstruction cannot rebuild" {
+    // `diagProjBench` rebuilds attention by hand and reshapes q back through
+    // [1, 1, n_heads * head_dim]. When a checkpoint's q_proj is wider than
+    // that product the reshape raises an MLX error — and an MLX error is not
+    // a Zig error, it KILLS the process. Live on Qwen3.5-2B-bf16: q_proj
+    // emits 4096 against a computed 2048, so one diagnostic boot took the
+    // whole server down.
+    //
+    // q_w is stored [in, out] (pre-transposed at load).
+    try std.testing.expect(Transformer.projLadderFits(&.{ 2048, 2048 }, 2048));
+    try std.testing.expect(!Transformer.projLadderFits(&.{ 2048, 4096 }, 2048));
+    // Anything that is not a plain 2-D matrix is not a shape this can rebuild.
+    try std.testing.expect(!Transformer.projLadderFits(&.{ 1, 2048, 2048 }, 2048));
+    try std.testing.expect(!Transformer.projLadderFits(&.{}, 2048));
+}
+
+test "dtypeStep reports a residual change once, in the direction it moved" {
+    // Pure decision layer of [dtype-trace]. The mscale bug presented as a
+    // UNIFORM 3x with an identical op count, so the only cheap way to find the
+    // next one is to watch the residual itself — and a watcher that reports
+    // every layer is unreadable while one that reports only the endpoints
+    // can't say WHERE it happened.
+    try std.testing.expectEqual(mlx.DtypeStep.quiet, mlx.dtypeStep(.bfloat16, .bfloat16));
+    try std.testing.expectEqual(mlx.DtypeStep.widened, mlx.dtypeStep(.bfloat16, .float32));
+    try std.testing.expectEqual(mlx.DtypeStep.narrowed, mlx.dtypeStep(.float32, .bfloat16));
+    // Equal width but a different dtype still changes kernel selection.
+    try std.testing.expectEqual(mlx.DtypeStep.changed, mlx.dtypeStep(.bfloat16, .float16));
+
+    // Walk a stack that widens at layer 7 and stays wide: exactly one report,
+    // naming layer 7. A per-layer dump would emit 40 lines; endpoints alone
+    // would say "it widened" without saying where.
+    const stack = [_]mlx.mlx_dtype{
+        .bfloat16, .bfloat16, .bfloat16, .bfloat16, .bfloat16, .bfloat16, .bfloat16,
+        .float32,  .float32,  .float32,  .float32,
+    };
+    var prev = stack[0];
+    var reports: usize = 0;
+    var first_at: usize = 0;
+    for (stack[1..], 1..) |cur, idx| {
+        if (mlx.dtypeStep(prev, cur) != .quiet) {
+            if (reports == 0) first_at = idx;
+            reports += 1;
+        }
+        prev = cur;
+    }
+    try std.testing.expectEqual(@as(usize, 1), reports);
+    try std.testing.expectEqual(@as(usize, 7), first_at);
+}
+
+test "dtypeTraceArm latches one trace per forward path" {
+    // The trace must fire on the FIRST forward of each path and then cost
+    // nothing — a per-layer FFI dtype read on every token would be a real
+    // (small) tax, and repeated identical lines would bury the one that
+    // matters. Distinct paths latch independently so a vision tower and its
+    // text trunk both get traced in the same boot.
+    mlx.resetDtypeTraceForTest();
+    try std.testing.expect(mlx.dtypeTraceArm("moe"));
+    try std.testing.expect(!mlx.dtypeTraceArm("moe"));
+    try std.testing.expect(mlx.dtypeTraceArm("vision"));
+    try std.testing.expect(!mlx.dtypeTraceArm("vision"));
+    try std.testing.expect(!mlx.dtypeTraceArm("moe"));
+}
+
+test "every transformer forward path is watched by a dtype trace" {
+    // Class guard, not an instance guard. The mscale bug was found only
+    // because the MoE path happened to carry a trace; the other forward paths
+    // had none, so the same bug in a hybrid or encoder stack would have been
+    // just as invisible. Any NEW forward path must arm a trace too.
+    //
+    // The class is "a forward path", keyed on the shared signature — NOT on
+    // the shape of its layer loop. BERT iterates its layer slice directly
+    // while the others count to num_hidden_layers, and a rule that keyed on
+    // the loop form would have silently skipped it.
+    //
+    // Needles are assembled at comptime — spelled whole they would match this
+    // test's own source and the scan would satisfy itself.
+    const src = @embedFile("transformer.zig");
+    const sig_marker = "With(self: *Transformer, " ++ "ctx: *ForwardCtx";
+    const arm = "DtypeTrace." ++ "begin(";
+    const fn_marker = "\n    fn forward";
+
+    var idx: usize = 0;
+    var checked: usize = 0;
+    while (std.mem.indexOfPos(u8, src, idx, fn_marker)) |at| {
+        idx = at + fn_marker.len;
+        const line_end = std.mem.indexOfScalarPos(u8, src, at + 1, '\n') orelse src.len;
+        const sig = src[at + 1 .. line_end];
+        if (std.mem.indexOf(u8, sig, sig_marker) == null) continue;
+        // Body runs to the next fn at the same indentation.
+        const next = std.mem.indexOfPos(u8, src, line_end, "\n    fn ") orelse src.len;
+        const next_pub = std.mem.indexOfPos(u8, src, line_end, "\n    pub fn ") orelse src.len;
+        const body = src[line_end..@min(next, next_pub)];
+        checked += 1;
+        if (std.mem.indexOf(u8, body, arm) == null) {
+            std.debug.print("transformer.zig: `{s}` is a forward path but arms no dtype trace\n", .{sig});
+            return error.UnwatchedForwardPath;
+        }
+    }
+    // standard, MoE, hybrid, BERT, Gemma3 encoder.
+    try std.testing.expectEqual(@as(usize, 5), checked);
 }
 
 test "the YaRN mscale table never reaches a multiply in its load-time dtype" {

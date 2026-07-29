@@ -673,11 +673,30 @@ pub const Generator = struct {
     // Warmup 32 (not higher): the re-enable check bounds the cost of a
     // premature trip to ≤SPEC_REENABLE_INTERVAL pipelined-fallback steps,
     // so we can gate early and recover the pipeline sooner on novel content.
-    pub const YIELD_GATE_WARMUP: u64 = 32;
+    /// Steps of enabled-mode PLD before the yield gate may trip. See the
+    /// `yield-gate warmup is 8` test for the sweep this was picked from and
+    /// why it moved from 32.
+    pub const YIELD_GATE_WARMUP: u64 = 8;
     pub const YIELD_GATE_MIN_YIELD: f32 = 0.25;
 
+    /// Read the yield-gate warmup for this call. Env-overridable
+    /// (`SPEC_YIELD_WARMUP`) so the threshold can be swept without a rebuild,
+    /// exactly like `runtimeGateWarmup`. Outside `[1, 256]` falls back.
+    ///
+    /// This number is pure economics, and the economics moved: every warmup
+    /// step pays PLD's UNPIPELINED cold forward (plus a synchronous host read
+    /// of the sampled token) against `next()`'s async-pipelined step, so the
+    /// tax is a fraction of the AR step cost — and the AR step got ~3x cheaper
+    /// when the Laguna mscale promotion was fixed, which makes the same
+    /// absolute tax a ~3x larger share. 32 was calibrated before that.
+    pub fn yieldGateWarmup() u64 {
+        const n = readEnvUsize("SPEC_YIELD_WARMUP", @intCast(YIELD_GATE_WARMUP));
+        if (n < 1 or n > 256) return YIELD_GATE_WARMUP;
+        return @intCast(n);
+    }
+
     pub fn yieldGateShouldDisable(steps_total: u64, accepted: u64) bool {
-        if (steps_total < YIELD_GATE_WARMUP) return false;
+        if (steps_total < yieldGateWarmup()) return false;
         const yield_rate = @as(f32, @floatFromInt(accepted)) /
             @as(f32, @floatFromInt(steps_total));
         return yield_rate < YIELD_GATE_MIN_YIELD;
@@ -6726,6 +6745,39 @@ test "Generator.yieldGateShouldDisable trips on cold-path-dominated workloads" {
     try testing.expect(!Generator.yieldGateShouldDisable(Generator.YIELD_GATE_WARMUP - 1, 0));
     // Exactly at warmup with healthy yield: stay on.
     try testing.expect(!Generator.yieldGateShouldDisable(Generator.YIELD_GATE_WARMUP, Generator.YIELD_GATE_WARMUP));
+}
+
+test "yield-gate warmup is 8 — the cold-path tax tripled when the AR step got 3x cheaper" {
+    // This constant is pure economics and the economics MOVED. Every warmup
+    // step pays PLD's unpipelined cold forward plus a synchronous host read of
+    // the sampled token, against `next()`'s async-pipelined step — an
+    // ~absolute tax measured as a share of the AR step. Fixing the Laguna
+    // mscale promotion made that AR step ~3x cheaper, so the same tax became a
+    // ~3x larger share and 32 steps of it stopped being affordable.
+    //
+    // Swept on Laguna XS (one boot, serial vs unconstrained alternating per
+    // request, server-reported timings, 5 runs median), against a matrix that
+    // deliberately contains PLD's WIN case as well as its loss cases —
+    // tuning on loss cases alone drives the warmup to zero and throws the win
+    // away:
+    //
+    //   warmup   echo-edit   code-edit  free-form   explain      qa
+    //       32     +76.9%       -4.3%      -1.2%     -1.4%     -7.2%
+    //       16     +70.1%       -3.4%      -0.4%     -0.3%     -0.8%
+    //        8     +77.4%       +0.3%      -0.2%     -0.3%     -1.5%
+    //        4     +76.6%       +3.9%      -0.2%     -0.1%     -1.7%
+    //
+    // 8 recovers essentially the whole loss while leaving the +77% untouched.
+    // 4 measured no worse, but a gate that decides on four observations is
+    // fitting noise, and a short preamble before a file echo is the NORMAL
+    // agent shape — exactly what a too-eager trip would punish. A premature
+    // trip is bounded anyway: `specShouldReenable` re-checks every
+    // SPEC_REENABLE_INTERVAL steps.
+    try testing.expectEqual(@as(u64, 8), Generator.YIELD_GATE_WARMUP);
+
+    // Sweepable without a rebuild, same contract as `runtimeGateWarmup`:
+    // out-of-range values fall back rather than silently disabling the gate.
+    try testing.expectEqual(Generator.YIELD_GATE_WARMUP, Generator.yieldGateWarmup());
 }
 
 test "Generator.specShouldReenable gates mid-request PLD re-activation" {

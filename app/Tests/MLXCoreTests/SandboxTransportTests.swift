@@ -238,27 +238,6 @@ final class SandboxForcedOnTests: XCTestCase {
         AgentSandbox.shared.configure(enabled: before)
     }
 
-    // MARK: - Chat header sandbox shield
-
-    /// The chat header's shield chip: green + "click opens the sandbox
-    /// terminal" when the sandbox is effectively on; gray + "turn it on in
-    /// Settings" when off. Pure state so the view stays a dumb renderer; the
-    /// MAS build (no host shell) always resolves ON.
-    func testSandboxShieldState() {
-        let on = SandboxShield.state(requestedEnabled: true, hostShellAllowed: true)
-        XCTAssertTrue(on.isOn)
-        XCTAssertEqual(on.windowId, "sandboxTerminal")
-        XCTAssertTrue(on.help.contains("isolated Linux VM"))
-
-        let off = SandboxShield.state(requestedEnabled: false, hostShellAllowed: true)
-        XCTAssertFalse(off.isOn)
-        XCTAssertEqual(off.windowId, "settings")
-        XCTAssertTrue(off.help.contains("Settings"), "OFF tooltip must tell the user where to enable it")
-
-        let mas = SandboxShield.state(requestedEnabled: false, hostShellAllowed: false)
-        XCTAssertTrue(mas.isOn, "no-host-shell builds are always sandboxed — shield must show green")
-    }
-
     // MARK: - MCP placement follows the sandbox toggle (spawn-time decision class)
 
     /// A stdio MCP server is pinned to the placement it was SPAWNED with (host

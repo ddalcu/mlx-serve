@@ -1638,7 +1638,67 @@ fn loadWeightsFromOpenDir(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.
     }
 
     log.info("Loaded {d} weights from {d} file(s)\n", .{ weights.count(), file_count });
+    reportF16Narrowing();
     return weights;
+}
+
+/// Whether a just-loaded f16 tensor must be narrowed to the engine's bf16
+/// activation dtype.
+///
+/// Two shapes qualify, for the same underlying reason — an f16 value that
+/// meets a bf16 activation promotes the RESULT to f32:
+///
+///   - Quant SIDE tensors (scales/biases), which can be 2-D so they are keyed
+///     on the suffix. f16 side tensors force gather_qmm/qmatmul onto a ~4x
+///     slower mixed-dtype path (hy_v3 2-bit live, 2026-07-14: 0.70 vs 0.18 ms
+///     per 8-expert gather — 1.2 tok/s on the 295B instead of ~15+).
+///   - ANY 1-D f16 tensor: a per-channel table (norm weight, bias, A_log,
+///     dt_bias) that is multiplied or added straight into the residual. Leave
+///     one f16 and the residual turns f32 at the first layer and STAYS f32,
+///     so every later weight read is upcast — the Laguna YaRN-mscale class,
+///     one level up. Measured on prism-ml/Ternary-Bonsai-27B-mlx-2bit (the
+///     only f16 checkpoint on hand, qwen3_5 GDN hybrid): 27.99 -> 23.88
+///     ms/forward, 14.7%, three paired boots with cooldown.
+///
+/// Plain multi-dimensional WEIGHTS keep their dtype. They are matmul
+/// OPERANDS, and MLX selects its kernel off that dtype, so narrowing one is a
+/// kernel-selection change rather than a promotion fix — measured as a wash
+/// here (23.15 vs 23.47 ms, inside boot-to-boot drift), so the minimal rule
+/// is the one that ships.
+///
+/// The cast node stays lazy, so the load-time batch eval materializes bf16
+/// directly. Delta from the 3 dropped mantissa bits: cos 0.99999994 — far
+/// below any quant noise floor.
+pub fn narrowsLoadedF16(key: []const u8, ndim: usize, dtype: mlx.mlx_dtype) bool {
+    if (dtype != .float16) return false;
+    if (std.mem.endsWith(u8, key, ".scales") or std.mem.endsWith(u8, key, ".biases")) return true;
+    return ndim == 1;
+}
+
+/// Kill switch for the 1-D arm (`MLX_SERVE_F16_NARROW_1D=0`). A load-time
+/// dtype normalization is invisible once the model is up, so a one-boot A/B
+/// switch is the only way to attribute a future f16-checkpoint regression to
+/// it. The side-tensor arm predates this and is not switchable.
+var narrow_1d_env: ?bool = null;
+fn narrow1dEnabled() bool {
+    if (narrow_1d_env) |v| return v;
+    const on = blk: {
+        const raw = std.c.getenv("MLX_SERVE_F16_NARROW_1D") orelse break :blk true;
+        break :blk !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
+    };
+    narrow_1d_env = on;
+    return on;
+}
+
+/// Count of 1-D f16 tables narrowed this load — reported once per model so a
+/// declined normalization is nameable from the log instead of silently
+/// reading as "this checkpoint just isn't f16".
+var narrowed_1d: usize = 0;
+
+pub fn reportF16Narrowing() void {
+    if (narrowed_1d == 0) return;
+    log.info("[dtype] narrowed {d} 1-D f16 tables to bf16 (MLX_SERVE_F16_NARROW_1D=0 disables)\n", .{narrowed_1d});
+    narrowed_1d = 0;
 }
 
 pub fn loadSafetensorsFile(
@@ -1676,22 +1736,18 @@ pub fn loadSafetensorsFile(
             continue;
         }
 
-        // Quant SIDE tensors (scales/biases) stored as f16 beside our bf16
-        // activations force gather_qmm/qmatmul onto a ~4x slower mixed-dtype
-        // path (hy_v3 2-bit live, 2026-07-14: 0.70 vs 0.18 ms per 8-expert
-        // gather — 1.2 tok/s on the 295B instead of ~15+). Cast once here;
-        // the node stays lazy so the load-time batch eval materializes bf16
-        // directly. Dequant delta from the 3 dropped mantissa bits: cos
-        // 0.99999994 — far below any quant noise floor. Plain WEIGHTS keep
-        // their dtype (dense-f16 tables are legitimate and handled per-site).
+        // Read the shape BEFORE the cast frees `value` — a freed handle's
+        // ndim is a use-after-free, not a zero.
+        const ndim = mlx.mlx_array_ndim(value);
         var final_value = value;
-        if ((std.mem.endsWith(u8, key_str, ".scales") or std.mem.endsWith(u8, key_str, ".biases")) and
-            mlx.mlx_array_dtype(value) == .float16)
+        if (narrowsLoadedF16(key_str, ndim, mlx.mlx_array_dtype(value)) and
+            (ndim != 1 or narrow1dEnabled()))
         {
             var cast = mlx.mlx_array_new();
             try mlx.check(mlx.mlx_astype(&cast, value, .bfloat16, s));
             _ = mlx.mlx_array_free(value);
             final_value = cast;
+            if (ndim == 1) narrowed_1d += 1;
         }
 
         const owned_key = try allocator.dupe(u8, key_str);
@@ -3211,6 +3267,34 @@ test "shouldKeepWeightKey drops DiffusionGemma encoder vision tower (text-only v
     try testing.expect(shouldKeepWeightKey("model.decoder.layers.0.experts.gate_up_proj.weight", false));
     try testing.expect(shouldKeepWeightKey("model.decoder.self_conditioning.gate_proj.weight", false));
     try testing.expect(shouldKeepWeightKey("model.encoder.language_model.layers.0.layer_scalar", false));
+}
+
+test "narrowsLoadedF16 catches per-channel tables, not matmul operands" {
+    // Quant side tensors: the pre-existing rule, keyed on the suffix because
+    // they can be 2-D.
+    try testing.expect(narrowsLoadedF16("model.layers.0.mlp.down_proj.scales", 2, .float16));
+    try testing.expect(narrowsLoadedF16("model.layers.0.mlp.down_proj.biases", 2, .float16));
+
+    // Any 1-D f16 tensor is a PER-CHANNEL table — a norm weight, a bias, a
+    // gate table. It gets multiplied or added straight into the activation
+    // stream, so leaving it f16 beside a bf16 residual promotes the residual
+    // (and therefore every later weight read) to f32.
+    try testing.expect(narrowsLoadedF16("language_model.model.layers.0.input_layernorm.weight", 1, .float16));
+    try testing.expect(narrowsLoadedF16("language_model.model.layers.0.linear_attn.A_log", 1, .float16));
+    try testing.expect(narrowsLoadedF16("language_model.model.layers.0.linear_attn.dt_bias", 1, .float16));
+    try testing.expect(narrowsLoadedF16("language_model.model.norm.weight", 1, .float16));
+
+    // A 2-D dense f16 weight is a MATMUL OPERAND, not a table. MLX picks its
+    // kernel off that dtype, so narrowing it is a kernel-selection change and
+    // not this rule's business — it stays per-site.
+    try testing.expect(!narrowsLoadedF16("vision_tower.blocks.0.attn.qkv.weight", 2, .float16));
+    try testing.expect(!narrowsLoadedF16("language_model.model.layers.0.linear_attn.conv1d.weight", 3, .float16));
+
+    // Everything already in the engine's dtype, and packed weights, are left
+    // alone.
+    try testing.expect(!narrowsLoadedF16("model.layers.0.input_layernorm.weight", 1, .bfloat16));
+    try testing.expect(!narrowsLoadedF16("model.layers.0.mlp.down_proj.weight", 2, .uint32));
+    try testing.expect(!narrowsLoadedF16("model.layers.0.mlp.down_proj.scales", 2, .bfloat16));
 }
 
 test "parseGenerationDefaultsFromJson: reads model sampling recommendations" {
