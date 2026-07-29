@@ -401,3 +401,169 @@ full-attention layers. On `qwen3_5` only 1 in 4 are, so `kv_per_tok` is ~4× ove
 and auto-context is correspondingly conservative (the reporter's "GPU-safe max 104K" on
 a 256K model). Safe direction, real capability left on the table — separate change,
 separate bench.
+
+## Laguna XS 2.1 NVFP4: the decode gap was an f32 constant table (CLOSED)
+
+Measured 2026-07-28 on an M4 Max (128 GB, ~546 GB/s) against the
+Layr-Labs/mlxfast-challenge tree at `main` 55f965f — the same weights (SHA-verified
+byte-identical to the challenge's pinned revision `841778bd`), the same silicon, the same
+timed window (512-token prompt, 128 decode steps, temp 0, serial non-speculative).
+
+**Measure the reference tree in the same window as your own, every time.** Mid-session the
+box picked up concurrent GPU work from another process and every number inflated ~1.62x
+(ours 40.5 → 65.6 ms/token). Re-running THEIR harness as a control showed 13.44 → 21.78 —
+the same 1.62x — so the machine moved uniformly and the mlx-serve : mlxfast ratio was
+**3.01 in both windows, identical to three significant figures**. Without the control run
+the second window reads as a 60% regression in our tree. A cross-engine comparison is only
+as trustworthy as the interleaved re-measurement of the thing you are comparing against.
+
+| tree | decode ms/token | prefill tok/s |
+|---|---|---|
+| mlxfast **frontier** (every DARKBLOOM optimization on) | 13.442 | ~1463 |
+| mlxfast **baseline** (every DARKBLOOM flag ablated off) | 17.173 | ~1460 |
+| **mlx-serve**, as measured | 40.515 | ~1005 |
+| **mlx-serve**, after the mscale dtype fix below | **13.384** | **~1335** |
+| mlxfast frontier, control re-run in the SAME window as that fix | 13.099 | ~1451 |
+
+Their entire published optimization catalogue is worth **+27.8%** (17.17 → 13.44).
+mlx-serve started **2.36× slower than their UNOPTIMIZED baseline**, so porting their
+fusions was never going to be the lever — the gap was in our forward pass, and it was one
+line. The remaining gap after the fix is ~2% on decode and ~8% on prefill; their catalogue
+(fused QKV, gate folded into `o_proj`, a fused routed `[gate; up]` bank, a certified
+two-pass lm_head prune) is what that ~2% would have to come from, and none of it was worth
+porting on top of a forward that was widening every weight read.
+
+**Where the gap is not.** Each of these was A/B'd on the live decode and moved nothing:
+
+- MLX's command-buffer batching (`MLX_MAX_MB_PER_BUFFER` / `MLX_MAX_OPS_PER_BUFFER`).
+  Plausible on paper — MLX commits a buffer every 50 ops **or 50 MB of touched arrays**
+  (`CommandEncoder::needs_commit`), and XS's bf16 attention weights are ~33 MB EACH, so we
+  flush roughly per op. Sweeping 50 → 4096 MB: 40.9 / 40.5 / 40.9 / 41.8 ms. Flat.
+- Metal residency (`mlx_set_wired_limit`; MLX's default is 0, i.e. nothing wired, and the
+  routed expert banks are ~17.5 GB read at 8 random experts of 256 per layer). Wiring 24 GB
+  and 48 GB: 40.1 / 40.1 / 40.4 ms. Flat.
+- The MLX buffer-pool cap added in `c6413b4` (`MLX_SERVE_CACHE_LIMIT=0`). Flat.
+- `MLX_SERVE_COMPILE_FORWARD=1` — compiles, but only the prefill chunk loop routes through
+  the closure, so decode is untouched. Flat, as expected.
+
+**Where the gap IS (RESOLVED 2026-07-28): a load-time f32 constant table silently
+promoted the whole residual stream to float32.** Laguna's YaRN mscale vector
+(`yarn_mscale`, `[head_dim]`, the reference's `cos/sin *= attention_factor`) was built
+`.float32` at load and multiplied straight into post-RoPE q/k, which are bf16. mlx
+promotes bf16 ⊕ f32 → f32, so:
+
+```
+q_rope * mscale(f32)  ->  q,k become f32
+  -> SDPA runs f32     -> attn_out f32
+  -> o_proj = mlx_matmul(f32 x, bf16 o_w)   -> o_w UPCAST on every token
+  -> h + attn_out      -> the RESIDUAL is f32 from the first full-attn layer on
+  -> every later q/k/v/o/gate, every routed expert, and lm_head upcast too
+```
+
+One line, and every weight read for the rest of the forward paid a widening pass.
+`[dtype-trace]` says it plainly: residual **bfloat16** entering the layer loop,
+**float32** leaving it. Fix = `constTableAs`, which hands the table back in the
+activation's own dtype, cached per dtype (`DtypeCastCache`).
+
+| | before | after |
+|---|---|---|
+| Laguna XS forward (`MLX_SERVE_DECODE_FWD_UBENCH`) | 41.2 ms | **14.6 ms** |
+| Laguna XS decode, bench window | 40.585 ms/tok | **13.384 ms/tok** |
+| Laguna XS prefill | 994 tok/s | **1335 tok/s** |
+| Laguna S forward (also YaRN) | 23.2 ms | **17.7 ms** |
+| lm_head alone | 4.6 ms | **1.2 ms** |
+
+That is **3.03x** on decode, and it moves us from 2.36x slower than the mlxfast-challenge
+tree's *unoptimized baseline* (17.173) to within 2.2% of its fully-optimized *frontier*
+(13.384 vs a 13.099 control re-run interleaved in the same window). gemma-4-26B and
+Qwen3.6-27B are unchanged — the path is laguna-only.
+
+**Why every earlier hypothesis missed it.** The promotion is invisible to each thing you
+would naturally reach for: op count is IDENTICAL (3226 with the bug vs 3080 in a clean
+reconstruction), kernel choice is irrelevant (all three MoE decode kernels within 4%),
+the KV cache is irrelevant (bypassing it entirely moved 0.4 ms), there is no host sync
+(CPU graph build is 0.95 ms of a 41 ms token), and RAM was 94% free. It presents as a
+*uniform ~3x* on attention, MoE and lm_head alike — which reads like a global platform
+problem, not a one-line bug. The previous session's "dtype promotion ruled out, x/q_w/o_w
+all bf16" was measured **before the layer loop**, which is exactly where it is still true.
+
+**How it was actually found — bisect FORWARD, and let the reconstruction diverge.**
+`diagProjBench` grew from a bare matmul loop into a rung ladder (`ProjRung`), each rung
+adding one more piece of the real attention block, in both issue orders:
+
+```
+matmul_only  7.04 ms (405 GB/s)  442 ops     <- bare q/k/v/o
+rope         7.38                 882
+norms        7.88                1242        <- + input/post-attn norms + residuals
+mlp         13.15                3080        <- + the REAL moeMLP: a whole layer
+real_attn   36.29                3220        <- same layer, but the SHIPPED lagunaAttnWith
+```
+
+The reconstruction and the shipped function do the same number of ops on the same weights
+and are 2.8x apart, so the bug had to be *inside* `lagunaAttnWith` and could only be a
+difference the op count cannot see. Two rungs later (a `yarn_rope` rung proved the custom
+YaRN freqs array was innocent, 13.17 vs 13.25) the only remaining difference was the
+mscale multiply. **The rung that made the reconstruction disagree with the real function
+is what localized it** — a reconstruction that merely matched would have proved nothing.
+
+Probes kept, all env-gated: `MLX_SERVE_DECODE_FWD_UBENCH=N` (forward-only timing, split
+into CPU graph-build vs GPU eval, ops/forward, and a sound lm_head ablation — lm_head is
+terminal so removing it cannot change upstream work), the `diagProjBench` rung ladder it
+fires, `MLX_SERVE_LAYER_CAP=N` (layer-count sweep: Laguna XS is dead linear at
+**0.896 ms/layer + 5.2 ms fixed**, which is how "outside the loop" was priced), and
+`MLX_SERVE_LAGUNA_UBENCH=1`.
+
+**Still ruled out, each by live A/B — do not re-litigate:** command-buffer batching
+(`MLX_MAX_MB_PER_BUFFER` 50→4096, `MLX_MAX_OPS_PER_BUFFER` 50→1000); Metal residency
+(`mlx_set_wired_limit` 0→48 GB); the buffer-pool cap from `c6413b4`
+(`MLX_SERVE_CACHE_LIMIT=0`); `MLX_SERVE_COMPILE_FORWARD=1` (only the prefill chunk loop
+routes through the closure); graph-scheduler lookahead (`MLX_BFS_MAX_WIDTH` 20→4000); a
+lazy load-time transpose re-materialized per step; 2-D vs 3-D activations; dispatch count
+(trivial dependent ops are 1.7–2.4 µs each, ~2 ms of the token).
+
+**This fix is a correctness fix, not a speed/accuracy trade.** It is not bit-identical to
+the pre-fix binary, and that is the point: the f32 product was the DEVIATION. The stock
+MLX path for a bf16 Laguna is `rope_input_with_mscale<bfloat16, true>`, which applies
+`float(bfloat(x * bfloat(mscale)))` — mscale cast to bf16, product rounded to bf16 — and
+the mlxfast-challenge tree's hand-written kernel reproduces exactly that
+(`bfloat rounded_mscale = bfloat(yarn_mscale)`, then
+`float(bfloat(normalized[i] * rounded_mscale))`, `LagunaRuntimeModel.swift`). Casting the
+table to the activation dtype puts us ON that path. Running attention in accidental f32
+was never "safer": this is a quantized checkpoint calibrated against bf16 arithmetic, the
+same trap as the MageFlow Turbo rule (f32 is not "more accurate", it washes). Nothing in
+the repo pins Laguna token bytes, so there was no baseline to re-cut.
+
+**The class, and the guard.** A constant table built in one dtype at load and multiplied
+into an activation in another silently widens everything downstream of it. The two other
+f32 tables on this decode path already got it right and are the pattern to copy: the MoE
+router computes in f32 deliberately and `astype`s back to bf16 before returning, and
+M-RoPE's cos/sin are built f32 then cast to bf16 before they touch q/k. Same family as
+MageFlow's `scalarLike` rule. Guards: `constTableAs hands a load-time f32 table back in
+the activation dtype`, `a constant table must not widen the activation it scales`, and a
+source scan (`the YaRN mscale table never reaches a multiply in its load-time dtype`) —
+the scan needles are assembled at comptime, because spelled whole they appear in the
+test's own source and the scan satisfies itself (it did, on the first attempt, and passed
+green against a reverted fix).
+
+### The intra-step async-eval ladder is a null lever for us (measured, not assumed)
+
+`DARKBLOOM_DECODE_ASYNC_STAGE` is worth +9.7% in their tree: fire `asyncEval` at layer
+boundaries so the GPU starts while the CPU is still building the graph. Ported as
+`Transformer.ladderStep` / `MLX_SERVE_DECODE_ASYNC_LADDER` and swept on Laguna XS:
+
+```
+off 39.88 | stride 8 40.22 | stride 4 40.37 | stride 2 41.08 | stride 1 41.49 ms/token
+```
+
+Monotonically WORSE as the stride tightens. The reason is structural: their worker cannot
+pipeline BETWEEN steps (its protocol is one token per request), so the ladder is the only
+overlap it can buy; mlx-serve already overlaps at the step boundary (`generate.zig`'s
+build-next → `mlx_async_eval` → resolve-pending), so the overlap is already collected and
+the ladder only adds submissions. It also confirms we are **not** CPU-graph-build-bound —
+if we were, the ladder would have paid.
+
+Shipped **default OFF** with the sweep recorded in the doc comment; `"auto"`/`"<n>"` opt in
+for a future arch whose CPU side is the bottleneck. Output is bit-identical either way
+(verified: 160 greedy tokens, temp 0, byte-for-byte). **Rule**: a lever that pays in
+another engine's harness may be paying for a constraint that engine has and we do not —
+port it, measure it, and let the number decide the default.

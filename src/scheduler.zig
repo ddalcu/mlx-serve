@@ -2492,6 +2492,92 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         }
     }
 
+    // DIAGNOSTIC (MLX_SERVE_DECODE_FWD_UBENCH=N): time N decode-width forward
+    // passes back to back, with NO sampling, detokenization, stop-checking or
+    // cache bookkeeping around them. The server reports `predicted_ms` around
+    // the whole decode LOOP, so this is the only way to say how much of a
+    // token is the model and how much is everything else. Resets the KV cache
+    // afterwards so the probe cannot pollute real requests.
+    if (std.c.getenv("MLX_SERVE_DECODE_FWD_UBENCH")) |raw| {
+        const n = std.fmt.parseInt(usize, std.mem.sliceTo(raw, 0), 10) catch 0;
+        if (n > 0) {
+            const io_u = @import("io_util.zig");
+            const tio = std.Io.Threaded.global_single_threaded.io();
+            var ctx = xfm_ptr.defaultCtx();
+            const tok: i32 = 1;
+            const tsh = [_]c_int{ 1, 1 };
+            // Warm: first forward pays kernel JIT + lazy weight materialization.
+            for (0..3) |_| {
+                const ti = mlx.mlx_array_new_data(&tok, &tsh, 2, .int32);
+                defer _ = mlx.mlx_array_free(ti);
+                const lg = xfm_ptr.forwardWith(&ctx, ti) catch break;
+                _ = mlx.mlx_array_eval(lg);
+                _ = mlx.mlx_array_free(lg);
+            }
+            // Split CPU graph CONSTRUCTION from GPU execution. MLX is lazy, so
+            // `forwardWith` only issues ops — if that half dominates, the token
+            // is bounded by op count / FFI overhead, not by memory bandwidth,
+            // and no kernel-level optimization can reach it.
+            var sw = io_u.Stopwatch.init(tio);
+            var build_ns: u64 = 0;
+            var eval_ns: u64 = 0;
+            var ops_total: u64 = 0;
+            var done: usize = 0;
+            for (0..n) |_| {
+                const ti = mlx.mlx_array_new_data(&tok, &tsh, 2, .int32);
+                defer _ = mlx.mlx_array_free(ti);
+                const ops_before = mlx.op_count.load(.monotonic);
+                var swb = io_u.Stopwatch.init(tio);
+                const lg = xfm_ptr.forwardWith(&ctx, ti) catch break;
+                build_ns += swb.read();
+                ops_total += mlx.op_count.load(.monotonic) - ops_before;
+                var swe = io_u.Stopwatch.init(tio);
+                _ = mlx.mlx_array_eval(lg);
+                eval_ns += swe.read();
+                _ = mlx.mlx_array_free(lg);
+                done += 1;
+            }
+            const dn: f64 = @floatFromInt(@max(done, 1));
+            const ms = @as(f64, @floatFromInt(sw.read())) / 1.0e6 / dn;
+            log.info("[fwd-ubench] {d} decode forwards, eval-per-step: {d:.3} ms/forward (build {d:.3} ms CPU + eval {d:.3} ms GPU, {d:.0} ops/forward)\n", .{
+                done,
+                ms,
+                @as(f64, @floatFromInt(build_ns)) / 1.0e6 / dn,
+                @as(f64, @floatFromInt(eval_ns)) / 1.0e6 / dn,
+                @as(f64, @floatFromInt(ops_total)) / dn,
+            });
+
+            // Same forward with the vocab projection suppressed. lm_head is
+            // terminal — nothing downstream depends on it — so dropping it
+            // cannot change the work the rest of the graph does, which makes
+            // this the one sound ablation in the probe.
+            ctx.skip_lm_head = true;
+            for (0..3) |_| {
+                const ti = mlx.mlx_array_new_data(&tok, &tsh, 2, .int32);
+                defer _ = mlx.mlx_array_free(ti);
+                const lg = xfm_ptr.forwardWith(&ctx, ti) catch break;
+                _ = mlx.mlx_array_eval(lg);
+                _ = mlx.mlx_array_free(lg);
+            }
+            var sw_nolm = io_u.Stopwatch.init(tio);
+            var done_nolm: usize = 0;
+            for (0..n) |_| {
+                const ti = mlx.mlx_array_new_data(&tok, &tsh, 2, .int32);
+                defer _ = mlx.mlx_array_free(ti);
+                const lg = xfm_ptr.forwardWith(&ctx, ti) catch break;
+                _ = mlx.mlx_array_eval(lg);
+                _ = mlx.mlx_array_free(lg);
+                done_nolm += 1;
+            }
+            const ms_nolm = @as(f64, @floatFromInt(sw_nolm.read())) / 1.0e6 / @as(f64, @floatFromInt(@max(done_nolm, 1)));
+            ctx.skip_lm_head = false;
+            log.info("[fwd-ubench] without lm_head: {d:.3} ms/forward  => lm_head = {d:.3} ms\n", .{ ms_nolm, ms - ms_nolm });
+            xfm_ptr.diagProjBench(20, &ctx);
+            log.info("[fwd-ubench] done\n", .{});
+            xfm_ptr.resetCache() catch {};
+        }
+    }
+
     // Vision encoder if requested. `MissingVisionWeights` is a benign opt-out
     // (model declares vision in config but the safetensors didn't ship the
     // tower); other errors fail the whole load.

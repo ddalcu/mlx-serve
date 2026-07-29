@@ -258,6 +258,7 @@ pub extern "c" fn mlx_quantize(res: *mlx_vector_array, w: mlx_array, group_size:
 // Additional ops for MoE / GatedDeltaNet
 pub extern "c" fn mlx_sigmoid(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
 pub extern "c" fn mlx_sum_axis(res: *mlx_array, a: mlx_array, axis: c_int, keepdims: bool, s: mlx_stream) c_int;
+pub extern "c" fn mlx_sum(res: *mlx_array, a: mlx_array, keepdims: bool, s: mlx_stream) c_int;
 pub extern "c" fn mlx_conv1d(res: *mlx_array, input: mlx_array, weight: mlx_array, stride: c_int, padding: c_int, dilation: c_int, groups: c_int, s: mlx_stream) c_int;
 // FFT — real-input forward transform for the TTS speaker-encoder mel/STFT.
 // `mlx_fft_norm`: BACKWARD=0 (no scaling on forward; matches mx.fft.rfft default).
@@ -416,6 +417,13 @@ pub fn getShape(arr: mlx_array) []const c_int {
 }
 
 /// Check if an mlx-c call succeeded (returns 0 on success)
+/// DIAGNOSTIC op counter. Every graph-building op funnels through `check`, so
+/// this counts ops ISSUED (not kernels dispatched — MLX fuses some). Only read
+/// by the decode forward probe; the increment is a single relaxed add on a
+/// path that already does an FFI call, so it does not move any benchmark.
+pub var op_count: std.atomic.Value(u64) = .init(0);
+
 pub fn check(ret: c_int) !void {
+    _ = op_count.fetchAdd(1, .monotonic);
     if (ret != 0) return error.MlxError;
 }

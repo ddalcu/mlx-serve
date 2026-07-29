@@ -104,3 +104,40 @@ Why no test caught it: **every fixture was under the cap.** The unit test's "mat
 - **Drift guard**: `maxDimFor` and the clamps encode the same ceiling in two places, so `maxDim matches what normalizeSize actually clamps to` asserts `clampFluxDim(99999) == maxDimFor(.flux)` and the Krea/MageFlow pair. Widening a clamp without touching `maxDim` reintroduces the squash silently, so the drift test is the actual long-term guard.
 - **Rule**: when one step establishes an invariant and a later step re-derives geometry, test the COMPOSITION, not the step. And pick fixtures that straddle every threshold in the pipeline — an all-under-the-cap corpus proves nothing about the cap.
 - **Guards**: `resolveEditTargetSize keeps the reference's aspect ABOVE the backend cap` (4:3 and 3:2 in both orientations, plus a huge square that must stay square, plus the under-cap round-trip so the existing sizeless behavior is pinned unchanged), and `tests/test_mageflow_edit.sh` now also drives a 3024x2016 source and asserts the output is within the cap AND still 3:2. Verified red on revert.
+
+### Laguna YaRN: the checkpoint's `attention_factor` is not the mscale the model was trained with
+
+Found 2026-07-28 before a single Laguna-XS number was recorded, by reading poolside's own
+MLX implementations rather than trusting the config.
+
+Laguna's full-attention layers use YaRN with `factor: 32.0`. MLX's YaRN computes its
+default mscale as `0.1 * ln(factor) + 1 = 1.3465735…` when `mscale`/`mscale_all_dim` are
+left at their defaults. **Both vendored MLX Laguna implementations deliberately do not
+forward the HF `attention_factor` field** (`LagunaRuntimeModel.swift:42-48`), and
+poolside's fused RoPE kernel hardcodes the computed result, `1.3465735912322998f`.
+
+`model.zig` read the field verbatim into `config.yarn_attention_factor`, which
+`transformer.zig` applies as the mscale on the rotated dims of full-attention layers:
+
+```
+Laguna-S-2.1  config: "attention_factor": 1.3465735902799727   ← equals the computed value
+Laguna-XS-2.1 config: "attention_factor": 1.0                  ← does NOT
+```
+
+So S matched **by luck** and XS would have silently run 10 of its 40 layers with unscaled
+YaRN RoPE. Nothing crashes; the model just attends slightly wrong at long range, and every
+benchmark taken on it would be measuring a subtly different model than the reference.
+
+- **Fix**: the `laguna` arm stops reading `attention_factor` and computes
+  `0.1 * @log(yarn_factor) + 1` (guarded on `yarn_factor > 1.0`). The generic nested-rope
+  YaRN reader is untouched — other architectures legitimately honour the field.
+- **Why S stays provably unchanged**: the computed value equals the value S ships, so the
+  pre-existing S config test passes without modification. That is the regression guard.
+- **Rule**: when an arch's reference implementation deliberately IGNORES a config field,
+  the field is not the source of truth for that arch — pin the value the checkpoint was
+  trained with, and make the two configs agree by construction rather than by luck. A
+  config field that happens to hold the right number on the model you tested is the most
+  expensive kind of coincidence.
+- **Guard**: `ModelConfig: laguna YaRN mscale is COMPUTED, never read from
+  attention_factor (Laguna-XS ships 1.0)` — a config carrying `1.0` must still parse to
+  `1.3465735…`; verified red before the fix.

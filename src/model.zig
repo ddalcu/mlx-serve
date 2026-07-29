@@ -1292,7 +1292,19 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
                             if (fa.get("factor")) |x| config.yarn_factor = jsonFloat(x);
                             if (fa.get("beta_fast")) |x| config.yarn_beta_fast = jsonFloat(x);
                             if (fa.get("beta_slow")) |x| config.yarn_beta_slow = jsonFloat(x);
-                            if (fa.get("attention_factor")) |x| config.yarn_attention_factor = jsonFloat(x);
+                            // mscale is COMPUTED, never read from the config's
+                            // "attention_factor". Both vendored MLX Laguna
+                            // implementations drop that field and take MLX's
+                            // YaRN default (mscale 1 / mscale_all_dim 0 =>
+                            // 0.1*ln(factor) + 1); poolside's fused kernel
+                            // hardcodes the result. S ships the computed value
+                            // literally, XS ships 1.0 — honouring the field
+                            // would run XS's full-attention layers unscaled.
+                            // Generic YaRN readers still honour it; only this
+                            // arch pins the value the checkpoint was trained on.
+                            if (config.yarn_factor > 1.0) {
+                                config.yarn_attention_factor = 0.1 * @log(config.yarn_factor) + 1.0;
+                            }
                             if (fa.get("original_max_position_embeddings")) |x| {
                                 if (x == .integer) config.yarn_orig_max_pos = @intCast(x.integer);
                             }
@@ -2292,6 +2304,52 @@ test "ModelConfig parses laguna (poolside Laguna-S-2.1): per-layer heads, softpl
     try testing.expectEqual(@as(usize, 2), eos.len);
     try testing.expectEqual(@as(u32, 2), eos[0]);
     try testing.expectEqual(@as(u32, 24), eos[1]);
+}
+
+test "ModelConfig: laguna YaRN mscale is COMPUTED, never read from attention_factor (Laguna-XS ships 1.0)" {
+    // Laguna-XS-2.1-NVFP4-mlx's config.json carries "attention_factor": 1.0,
+    // but both vendored MLX Laguna implementations deliberately drop that field
+    // and let MLX compute its default mscale (0.1*ln(factor) + 1); poolside's
+    // own fused kernel hardcodes the result, 1.3465735912322998f. Reading the
+    // field verbatim would run 10 of XS's 40 layers with unscaled YaRN RoPE.
+    // S got away with it only because its config happens to ship the computed
+    // value; the two must agree by construction, not by luck.
+    const json =
+        \\{
+        \\  "model_type": "laguna",
+        \\  "hidden_size": 2048,
+        \\  "intermediate_size": 8192,
+        \\  "num_hidden_layers": 4,
+        \\  "num_attention_heads": 64,
+        \\  "num_key_value_heads": 8,
+        \\  "head_dim": 128,
+        \\  "rms_norm_eps": 1e-06,
+        \\  "vocab_size": 100352,
+        \\  "tie_word_embeddings": false,
+        \\  "gating": "per-head",
+        \\  "sliding_window": 512,
+        \\  "num_experts": 256,
+        \\  "num_experts_per_tok": 8,
+        \\  "moe_intermediate_size": 512,
+        \\  "mlp_only_layers": [0],
+        \\  "num_attention_heads_per_layer": [48, 64, 64, 64],
+        \\  "layer_types": ["full_attention", "sliding_attention", "sliding_attention", "sliding_attention"],
+        \\  "rope_parameters": {
+        \\    "full_attention": {
+        \\      "rope_theta": 500000.0, "rope_type": "yarn", "factor": 32.0,
+        \\      "original_max_position_embeddings": 8192, "beta_slow": 1.0, "beta_fast": 32.0,
+        \\      "attention_factor": 1.0, "partial_rotary_factor": 0.5
+        \\    },
+        \\    "sliding_attention": {"rope_type": "default", "rope_theta": 10000.0, "partial_rotary_factor": 1.0}
+        \\  },
+        \\  "quantization": {"group_size": 16, "bits": 4, "mode": "nvfp4"}
+        \\}
+    ;
+    const config = try parseConfigFromJson(testing.allocator, json);
+    try testing.expect(config.rope_yarn);
+    try testing.expectApproxEqAbs(@as(f32, 32.0), config.yarn_factor, 1e-6);
+    // 0.1 * ln(32) + 1 — the same value S's config ships literally.
+    try testing.expectApproxEqAbs(@as(f32, 1.3465735902799727), config.yarn_attention_factor, 1e-6);
 }
 
 test "ModelConfig: use_bidirectional_attention marks an embedding encoder (EmbeddingGemma, issue #79)" {
