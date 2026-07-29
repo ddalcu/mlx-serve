@@ -27,7 +27,12 @@ enum AgentToolKind: String, Codable, CaseIterable, Sendable {
     case listProcesses
     case createTask
     case generateImage = "generate_image"
-    case generateAudio = "generate_audio"
+    // Speech and music are separate tools on purpose. `generate_audio` next to
+    // `generate_music` is ambiguous — music IS audio — and their arguments have
+    // nothing in common (a line to speak vs. a style prompt, lyrics and a
+    // duration). One overloaded tool makes a small local model guess.
+    case generateSpeech = "generate_speech"
+    case generateMusic = "generate_music"
     case generateVideo = "generate_video"
 
     var icon: String {
@@ -48,7 +53,8 @@ enum AgentToolKind: String, Codable, CaseIterable, Sendable {
         case .listProcesses: "list.bullet.rectangle"
         case .createTask: "calendar.badge.clock"
         case .generateImage: "photo"
-        case .generateAudio: "waveform"
+        case .generateSpeech: "waveform"
+        case .generateMusic: "music.note"
         case .generateVideo: "film"
         }
     }
@@ -71,8 +77,55 @@ enum AgentToolKind: String, Codable, CaseIterable, Sendable {
         case .listProcesses: "List Processes"
         case .createTask: "Create Task"
         case .generateImage: "Generate Image"
-        case .generateAudio: "Generate Audio"
+        case .generateSpeech: "Generate Speech"
+        case .generateMusic: "Generate Music"
         case .generateVideo: "Generate Video"
+        }
+    }
+
+    /// Tools the chat's Tools menu can switch off.
+    ///
+    /// Everything except `searchDocuments`, whose real gate is whether a
+    /// document folder is attached — stronger than any toggle, and the reason a
+    /// docs-only chat works with Tools off. Offering a switch that the resolver
+    /// then ignores would be a lying control, so it is absent from both.
+    /// `SessionToolDisableTests` pins the two lists against each other.
+    static var chatToggleable: [AgentToolKind] {
+        allCases.filter { $0 != .searchDocuments }
+    }
+}
+
+/// How the Tools menu groups its rows.
+///
+/// Eighteen flat checkmarks is a list nobody reads; grouped, the menu answers
+/// "can this chat touch my files / run commands / reach the web" at a glance.
+/// Every toggleable tool belongs to exactly one group — a tool in none is
+/// unreachable from the UI, one in two renders twice with two checkmarks that
+/// look independent. Pinned by `SessionToolDisableTests`.
+enum AgentToolGroup: String, CaseIterable, Sendable {
+    case files
+    case shell
+    case web
+    case media
+    case knowledge
+
+    var title: String {
+        switch self {
+        case .files: "Files"
+        case .shell: "Shell & Processes"
+        case .web: "Web"
+        case .media: "Media"
+        case .knowledge: "Memory & Tasks"
+        }
+    }
+
+    var tools: [AgentToolKind] {
+        switch self {
+        case .files: [.readFile, .writeFile, .editFile, .searchFiles, .listFiles, .cwd]
+        case .shell: [.shell, .listProcesses, .readProcessOutput, .killProcess]
+        case .web: [.browse, .webSearch]
+        case .media: [.generateImage, .generateSpeech, .generateMusic, .generateVideo]
+        case .knowledge: [.saveMemory, .createTask]
         }
     }
 }

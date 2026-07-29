@@ -33,13 +33,17 @@ extension AppState {
                                thinkingEnabled: Bool = false,
                                autoApprove: Bool = false,
                                workingDirectory: String? = nil,
-                               modelPath: String? = nil) -> ResolvedAgentSettings {
+                               modelPath: String? = nil,
+                               disabledTools: Set<AgentToolKind> = []) -> ResolvedAgentSettings {
         let defaults = AppDefaultsSnapshot(
             toolsEnabled: toolsEnabled,
             mcpEnabled: mcpEnabled,
             thinkingEnabled: thinkingEnabled,
             autoApprove: autoApprove,
             tools: Set(AgentToolKind.allCases),
+            // The chat tab's own Tools menu. Surfaces without one (tasks,
+            // Telegram, the tray) pass nothing and are unaffected.
+            disabledTools: disabledTools,
             workingDirectory: workingDirectory,
             // nil = whatever model is selected right now. A surface with its own
             // pin (a scheduled task) passes it here and the agent's pin overrides.

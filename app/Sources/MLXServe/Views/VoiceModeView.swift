@@ -30,8 +30,6 @@ struct VoiceModeView: View {
 
                 transcript
 
-                voicePicker
-
                 Spacer(minLength: 8)
 
                 toggles
@@ -40,7 +38,9 @@ struct VoiceModeView: View {
             }
             .padding(24)
         }
-        .frame(minWidth: 560, minHeight: 660)
+        // Shorter than it was: the voice picker used to sit between the
+        // transcript and the toggles, and the 660 floor was sized around it.
+        .frame(minWidth: 560, minHeight: 560)
         .animation(.easeInOut(duration: 0.25), value: controller.state)
         .overlay { approvalOverlay }
     }
@@ -106,11 +106,12 @@ struct VoiceModeView: View {
             .padding(.horizontal, 16)
     }
 
-    // MARK: Voice picker
-
-    private var voicePicker: some View {
-        VoiceSelectorMenu(voice: controller, compact: false)
-    }
+    // No voice picker here. The speaking voice is a property of WHO is
+    // answering, so it is set where that is decided — Settings ▸ Voice for the
+    // app's own voice, the Agents editor for an agent's — and the synthesizer
+    // re-reads it per utterance, so a change there applies from the next
+    // sentence without this sheet mirroring the control. A third copy could
+    // only disagree with the two that own it.
 
     // MARK: Toggles + controls
 

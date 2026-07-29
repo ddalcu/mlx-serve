@@ -19,6 +19,12 @@ struct AppDefaultsSnapshot: Sendable, Equatable {
     /// Full access is the historical default: the whole tool literal is
     /// advertised whenever the loop runs.
     var tools: Set<AgentToolKind> = Set(AgentToolKind.allCases)
+    /// Tools this SURFACE has switched off (the chat tab's Tools menu, stored on
+    /// the session). Subtractive: it rides here rather than being applied at each
+    /// turn site so an agent can't be handed a capability its own settings
+    /// forbid, and so no surface can forget to apply it — same reason the whole
+    /// resolution is one chokepoint. Empty = today's behaviour, unchanged.
+    var disabledTools: Set<AgentToolKind> = []
     var workingDirectory: String?
     /// nil = whatever model is selected right now.
     var modelPath: String?
@@ -70,13 +76,35 @@ enum AgentResolution {
     /// Fold an agent's overrides into the app defaults. `agent == nil` returns
     /// the defaults verbatim — that's the upgrade guarantee, and it has its own
     /// test.
+    /// Apply the surface's per-chat switches to an allowed set.
+    ///
+    /// Subtraction only — a chat tab must not be able to grant a tool the agent
+    /// forbids. `searchDocuments` is exempt because its gate is the attached
+    /// folder, not a toggle (it is also absent from the menu, so nothing can ask
+    /// for it to be removed).
+    private static func applying(_ disabled: Set<AgentToolKind>,
+                                 to allowed: Set<AgentToolKind>) -> Set<AgentToolKind> {
+        guard !disabled.isEmpty else { return allowed }
+        return allowed.subtracting(disabled.subtracting([.searchDocuments]))
+    }
+
+    /// The loop only runs if it has a real tool left to offer. Advertising
+    /// nothing while still looping is a dead offer — the turn is plain chat.
+    /// `searchDocuments` doesn't count: it is folder-gated, not a capability.
+    private static func loopRuns(_ enabled: Bool, tools: Set<AgentToolKind>) -> Bool {
+        enabled && !tools.subtracting([.searchDocuments]).isEmpty
+    }
+
     nonisolated static func resolve(agent: Agent?, defaults: AppDefaultsSnapshot) -> ResolvedAgentSettings {
         guard let agent else {
+            let tools = applying(defaults.disabledTools, to: defaults.tools)
             return ResolvedAgentSettings(
                 agentId: nil,
                 systemPromptPrefix: "",
-                tools: defaults.tools,
-                toolsEnabled: defaults.toolsEnabled,
+                tools: tools,
+                toolsEnabled: defaults.disabledTools.isEmpty
+                    ? defaults.toolsEnabled
+                    : loopRuns(defaults.toolsEnabled, tools: tools),
                 mcpEnabled: defaults.mcpEnabled,
                 thinkingEnabled: defaults.thinkingEnabled,
                 autoApprove: defaults.autoApprove,
@@ -94,15 +122,16 @@ enum AgentResolution {
         // (`AgentWriter.brevityLine`), so it's visible and editable rather than a
         // hidden setting.
         let persona = agent.systemPrompt.trimmingCharacters(in: .whitespacesAndNewlines)
-        let capabilityTools = agent.capabilities.resolvedTools()
+        // searchDocuments rides along unconditionally: its real gate is whether a
+        // document folder is attached to the turn, which is stronger than any
+        // capability toggle (docs-only mode has Tools off and still needs it).
+        // The chat's own switches then subtract from what the agent allowed —
+        // they can take away, never add.
+        let capabilityTools = applying(defaults.disabledTools, to: agent.capabilities.resolvedTools())
 
         return ResolvedAgentSettings(
             agentId: agent.id,
             systemPromptPrefix: persona.isEmpty ? "" : persona + "\n\n",
-            // searchDocuments rides along unconditionally: its real gate is
-            // whether a document folder is attached to the turn, which is
-            // stronger than any capability toggle (docs-only mode has Tools off
-            // and still needs it).
             tools: capabilityTools.union([.searchDocuments]),
             // The loop runs whenever the agent has any tool at all — an
             // advertised tool the loop never executes would be a dead offer.

@@ -252,6 +252,9 @@ class TestServer {
             if let tcs = msg.toolCalls {
                 d["toolCalls"] = tcs.map { ["id": $0.id, "name": $0.name, "arguments": $0.arguments] }
             }
+            if let media = msg.media {
+                d["media"] = media.map { ["kind": $0.kind.rawValue, "path": $0.path, "prompt": $0.prompt] }
+            }
             return d
         }
         if let data = try? JSONSerialization.data(withJSONObject: ["messages": messages], options: .prettyPrinted),
@@ -314,12 +317,23 @@ class TestServer {
                 serverStatus = "running"
             }
         }
-        return jsonResponse([
+        var out: [String: Any] = [
             "server": serverStatus,
             "port": appState.server.port,
             "model": appState.server.currentModelPath,
             "sessions": appState.chatSessions.count,
-        ])
+        ]
+        // The chat's live media meter. Headless has no view, so this is the only
+        // way to see that the bar actually ADVANCES rather than merely compiles.
+        if let p = appState.chatEngine.mediaProgress {
+            out["media_progress"] = [
+                "kind": p.kind.rawValue, "title": p.title,
+                "step": p.step, "total": p.total,
+                "detail": p.detailText, "elapsed": p.elapsedText(),
+                "fraction": p.fraction as Any,
+            ]
+        }
+        return jsonResponse(out)
     }
 
     private func handleChat(body: String) async -> String {
@@ -466,6 +480,9 @@ class TestServer {
         appState.appendMessage(to: sessionId, message: userMsg)
 
         let api = APIClient()
+        // This harness drives the same engine as the chat window, so it owns a
+        // turn token like any other driver (see MediaTurnBudget).
+        let mediaTurn = UUID()
         let maxIterations = json["max_rounds"] as? Int ?? 10
         var padRetries = 0
         let maxPadRetries = 2
@@ -591,6 +608,14 @@ class TestServer {
                     tc, workingDirectory: &workDir,
                     repetition: repetition, iteration: iteration,
                     agentMemory: appState.agentMemory,
+                    // The REAL media path (same closure the chat window injects),
+                    // so a headless run exercises generation rather than the
+                    // "isn't available in this context" stub.
+                    generateMedia: { [weak appState] kind, mediaArgs in
+                        await appState?.chatEngine.generateMediaFromAgent(
+                            kind: kind, args: mediaArgs, turn: mediaTurn)
+                            ?? "Error: media generation unavailable."
+                    },
                     processRegistry: appState.processRegistry,
                     sessionId: sessionId
                 )
@@ -599,12 +624,27 @@ class TestServer {
                 resultMsg.isAgentSummary = true
                 appState.appendMessage(to: sessionId, message: resultMsg)
 
-                // Store tool result
+                // Store tool result. A produced track/clip is split off the same
+                // way the chat window does it: caption to the model, file to the
+                // transcript.
                 var toolMsg = ChatMessage(role: .system, content: "")
                 toolMsg.toolCallId = result.id
                 toolMsg.toolName = result.name
-                toolMsg.content = AgentEngine.truncateWithOverflow(result.output, toolCallId: result.id, toolName: result.name)
+                var mediaRef: ChatMediaRef? = nil
+                if result.output.contains(AgentMediaInline.mediaRefMarker) {
+                    let asked = tc.arguments["prompt"] ?? tc.arguments["text"] ?? ""
+                    let (caption, ref) = AgentMediaInline.splitMediaRef(result.output, prompt: asked)
+                    toolMsg.content = caption
+                    mediaRef = ref
+                } else {
+                    toolMsg.content = AgentEngine.truncateWithOverflow(result.output, toolCallId: result.id, toolName: result.name)
+                }
                 appState.appendMessage(to: sessionId, message: toolMsg)
+                if let mediaRef {
+                    var mediaMsg = ChatMessage(role: .assistant, content: "")
+                    mediaMsg.media = [mediaRef]
+                    appState.appendMessage(to: sessionId, message: mediaMsg)
+                }
             }
 
             let callSummary = receivedToolCalls.map { "\($0.name)(\($0.arguments.keys.joined(separator: ",")))" }.joined(separator: ", ")

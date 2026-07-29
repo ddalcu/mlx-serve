@@ -182,6 +182,74 @@ final class VideoGenService: ObservableObject {
         }
     }
 
+    /// Awaitable generation for the agent's `generate_video` tool. Same load →
+    /// stream → mux → unload pipeline as `generate`, returning the output mp4
+    /// path (or throwing), but WITHOUT touching this service's UI state
+    /// (`phase`/`task`/`recent`/`generationSeq`) — so a chat generation never
+    /// hijacks the Video window. `onProgress` drives the chat's own meter, which
+    /// matters most here: this is the tool that takes minutes.
+    func generateForAgent(_ request: VideoGenRequest, server: ServerManager,
+                          onProgress: ((MediaGenProgress) -> Void)? = nil) async throws -> String {
+        guard !request.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw MediaGenError.emptyInput("Prompt")
+        }
+        guard request.lanModelId != nil || ServerManager.resolveModelDir(repo: request.model.repo) != nil else {
+            throw MediaGenError.notDownloaded(request.model.name)
+        }
+
+        let outputPath = Self.makeOutputPath(prompt: request.prompt)
+        let keep = request.keepResident
+        let steps = request.steps
+        let startedAt = Date()
+        func report(_ step: Int, _ total: Int, _ message: String) {
+            onProgress?(MediaGenProgress(kind: .video, step: step, total: total,
+                                         message: message, startedAt: startedAt))
+        }
+        report(0, 0, "Loading model")
+
+        let (port, modelId, unloadId) = try await server.prepareGenModel(
+            lanModelId: request.lanModelId, repo: request.model.repo)
+        func releaseIfNeeded() async {
+            if !keep, let id = unloadId { try? await server.unloadModel(id: id) }
+        }
+        do {
+            var decoded: DecodedFrames? = nil
+            let body = Self.requestBody(model: modelId, prompt: request.prompt,
+                                        request: request, firstFrameB64: nil, audioB64: nil)
+            for try await ev in api.streamGeneration(
+                port: port, path: "/v1/video/generations", json: body) {
+                switch MediaSSE.classify(ev) {
+                case .progress(let step, let total, let stage):
+                    report(step, total == 0 ? steps : total, MediaSSE.stageLabel(stage))
+                case .complete:
+                    decoded = Self.decodeFrames(ev)
+                case .failed(let m):
+                    throw MediaGenError.server(m)
+                case .ignored:
+                    break
+                }
+            }
+            guard let frames = decoded else {
+                throw MediaGenError.server("Server returned no video frames.")
+            }
+            report(steps, steps, "Encoding mp4")
+            let outFps = frames.fps > 0 ? frames.fps : request.fps
+            try await Task.detached(priority: .userInitiated) {
+                try VideoGenService.writeMP4(
+                    rgb: frames.rgb, frames: frames.frames,
+                    width: frames.width, height: frames.height,
+                    fps: outFps, to: URL(fileURLWithPath: outputPath),
+                    audioPCM: frames.audioPCM, audioSampleRate: frames.audioSampleRate,
+                    audioChannels: frames.audioChannels)
+            }.value
+            await releaseIfNeeded()
+            return outputPath
+        } catch {
+            await releaseIfNeeded()
+            throw error
+        }
+    }
+
     func cancel() {
         task?.cancel()
         task = nil

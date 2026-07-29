@@ -4466,7 +4466,8 @@ fn handleChatCompletions(
     const effective_ctx = getEffectiveContextLength(config);
     if (prompt_ids.len > effective_ctx) {
         log.warn("POST /v1/chat/completions -> 400 (prompt {d} tokens exceeds ctx_size {d})\n", .{ prompt_ids.len, effective_ctx });
-        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Prompt exceeds maximum context length", 400);
+        var ovf_buf: [160]u8 = undefined;
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", contextOverflowMessage(&ovf_buf, prompt_ids.len, effective_ctx), 400);
         return;
     }
 
@@ -4729,7 +4730,8 @@ fn handleCompletions(
     const effective_ctx = getEffectiveContextLength(config);
     if (prompt_ids.len > effective_ctx) {
         log.warn("POST /v1/completions -> 400 (prompt {d} tokens exceeds ctx_size {d})\n", .{ prompt_ids.len, effective_ctx });
-        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Prompt exceeds maximum context length", 400);
+        var ovf_buf: [160]u8 = undefined;
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", contextOverflowMessage(&ovf_buf, prompt_ids.len, effective_ctx), 400);
         return;
     }
 
@@ -7097,6 +7099,27 @@ fn extractJsonField(body: []const u8, field: []const u8) ?[]const u8 {
     return null;
 }
 
+/// Body text for a context-overflow 400, in a caller-owned buffer.
+///
+/// The COUNTS are the point. "Prompt exceeds maximum context length" tells a
+/// client only that it failed; with both numbers the client can say how far
+/// over it went and offer the one action that fixes it (raise the context to
+/// N). Our own app renders exactly that, and the numbers are only knowable
+/// here — the request is rejected before any usage is reported.
+///
+/// The legacy sentence stays the PREFIX: `APIError.looksLikeContextOverflow`
+/// and third-party clients key on it, so appending must not move it. Output is
+/// digits and spaces, so it carries no escaping hazard into the JSON sink, and
+/// a bufPrint failure falls back to the bare sentence rather than sending no
+/// body at all (the media-gen fixed-buffer class).
+fn contextOverflowMessage(buf: []u8, prompt_tokens: usize, ctx: usize) []const u8 {
+    return std.fmt.bufPrint(
+        buf,
+        "Prompt exceeds maximum context length: {d} tokens requested, {d} available",
+        .{ prompt_tokens, ctx },
+    ) catch "Prompt exceeds maximum context length";
+}
+
 fn sendErrorResponse(allocator: std.mem.Allocator, stream: *Conn, status: []const u8, err_type: []const u8, message: []const u8, code: ?u32) !void {
     const escaped_msg = try jsonEscape(allocator, message);
     defer allocator.free(escaped_msg);
@@ -8588,7 +8611,8 @@ fn handleAnthropicMessages(
     const effective_ctx = getEffectiveContextLength(config);
     if (prompt_ids.len > effective_ctx) {
         log.warn("POST /v1/messages -> 400 (prompt {d} tokens exceeds ctx_size {d})\n", .{ prompt_ids.len, effective_ctx });
-        try sendAnthropicError(allocator, stream, "invalid_request_error", "Prompt exceeds maximum context length", 400);
+        var ovf_buf: [160]u8 = undefined;
+        try sendAnthropicError(allocator, stream, "invalid_request_error", contextOverflowMessage(&ovf_buf, prompt_ids.len, effective_ctx), 400);
         return;
     }
 
@@ -9977,7 +10001,8 @@ fn handleResponses(
     // ── context limit ──
     const effective_ctx = getEffectiveContextLength(config);
     if (prompt_ids.len > effective_ctx) {
-        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Prompt exceeds maximum context length", 400);
+        var ovf_buf: [160]u8 = undefined;
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", contextOverflowMessage(&ovf_buf, prompt_ids.len, effective_ctx), 400);
         return;
     }
     const kv_quant_override = parseKvQuantOverride(root);
@@ -13264,4 +13289,33 @@ test "formatChatUsage: prompt_tokens_details.cached_tokens always present (llmpr
     try t.expectEqualStrings(
         \\{"prompt_tokens":10,"completion_tokens":20,"total_tokens":30,"prompt_tokens_details":{"cached_tokens":4},"completion_tokens_details":{"reasoning_tokens":7}}
     , with_details);
+}
+
+test "contextOverflowMessage: the 400 names both counts so a client can act on it" {
+    const t = std.testing;
+    var buf: [160]u8 = undefined;
+
+    // The counts ARE the feature: without them a client can only say "too
+    // long", and our own app can't offer "raise the context to N" — which is
+    // the one action that fixes it.
+    const msg = contextOverflowMessage(&buf, 4108, 4096);
+    try t.expectEqualStrings(
+        "Prompt exceeds maximum context length: 4108 tokens requested, 4096 available", msg);
+
+    // Legacy prefix preserved verbatim — APIError.looksLikeContextOverflow and
+    // every third-party client key on this exact phrase.
+    try t.expect(std.mem.startsWith(u8, msg, "Prompt exceeds maximum context length"));
+
+    // No quotes or control bytes, so the message is safe to drop into a JSON
+    // error body without escaping (the appendJsonString class).
+    for (msg) |c| try t.expect(c >= 0x20 and c != '"' and c != '\\');
+}
+
+test "contextOverflowMessage: a buffer too small falls back rather than sending nothing" {
+    const t = std.testing;
+    // bufPrint failing must not propagate — the media-gen 400 that sent NO body
+    // at all when its fixed buffer overflowed is the class this guards.
+    var tiny: [8]u8 = undefined;
+    try t.expectEqualStrings("Prompt exceeds maximum context length",
+        contextOverflowMessage(&tiny, 999999, 1));
 }

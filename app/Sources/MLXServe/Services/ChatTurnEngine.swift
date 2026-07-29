@@ -71,6 +71,17 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
     /// Non-published per-delta tally; promoted into `liveCompletionTokens` on flush.
     private var liveTokenAccum: Int = 0
 
+    /// The in-flight media generation, or nil. ONE value is correct: the
+    /// inference thread serializes media gen, so two can never run at once.
+    /// Published because these block chat decode for anything from six seconds
+    /// (an image) to minutes (a clip) — a window with no feedback for that long
+    /// reads as a hang.
+    @Published private(set) var mediaProgress: MediaGenProgress?
+
+    /// ONE media generation per user turn, keyed by the turn token its driver
+    /// passes. See `MediaTurnBudget` for why it's a token and not a reset call.
+    private var mediaBudget = MediaTurnBudget()
+
     /// What the composer's primary button should show for a given chat. The
     /// engine runs one turn at a time app-wide, so a chat that doesn't own the
     /// active turn shows Send (disabled while busy), never the global Stop.
@@ -227,6 +238,26 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
         appState.chatSessions.first { $0.id == id }
     }
 
+    /// End a failed turn with a notice ROW rather than `[Error: …]` appended to
+    /// the assistant's own text.
+    ///
+    /// Two things follow from it being its own message. Whatever the model had
+    /// already streamed stays intact and readable instead of gaining a bracketed
+    /// tail that looks like something it said. And the notice is marked
+    /// `failedRetry`, so it renders in the transcript but is excluded from the
+    /// history sent back to the model — an error card fed to the next turn as
+    /// assistant output is how a model starts apologising for a server failure.
+    /// The spinner is cleared first, or `GeneratingIndicator` keeps animating on
+    /// the orphaned streaming bubble.
+    private func appendErrorNotice(_ error: Error, to sessionId: UUID) {
+        appState.updateLastMessage(in: sessionId, streaming: false)
+        var msg = ChatMessage(role: .assistant, content: "")
+        msg.isStreaming = false
+        msg.failedRetry = true
+        msg.errorNotice = ChatErrorNotice.from(error)
+        appState.appendMessage(to: sessionId, message: msg)
+    }
+
     /// Apply a coalesced streaming batch into the session. Streamed tokens are
     /// batched (see `StreamCoalescer`) rather than written one at a time so the
     /// per-token `AppState.objectWillChange` churn can't re-render — and wedge —
@@ -263,6 +294,10 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
     func stop() {
         generationTask?.cancel()
         generationTask = nil
+        // Belt and braces on the meter: the cancelled generation's own `defer`
+        // clears it as it unwinds, but a card left behind on a stopped turn is a
+        // permanent fake progress bar.
+        mediaProgress = nil
         if let sid = activeTurnSessionId {
             appState.updateLastMessage(in: sid, streaming: false)
             appState.saveChatHistory()
@@ -420,7 +455,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
         } catch {
             print("[ChatTurnEngine] Chat error: \(error)")
             try? "Chat error: \(error)\n".write(toFile: NSString(string: "~/.mlx-serve/debug.log").expandingTildeInPath, atomically: true, encoding: .utf8)
-            appState.updateLastMessage(in: sessionId, content: "\n\n[Error: \(error.localizedDescription)]")
+            appendErrorNotice(error, to: sessionId)
         }
         appState.updateLastMessage(in: sessionId, streaming: false)
         appState.saveChatHistory()
@@ -486,12 +521,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
             } catch {
                 print("[ChatTurnEngine] Agent error: \(error)")
                 try? "Agent error: \(error)\n".write(toFile: NSString(string: "~/.mlx-serve/debug.log").expandingTildeInPath, atomically: true, encoding: .utf8)
-                // Clear the spinner on the in-flight assistant message before appending the error;
-                // otherwise GeneratingIndicator stays visible on the orphaned streaming bubble.
-                self.appState.updateLastMessage(in: sessionId, streaming: false)
-                var errorMsg = ChatMessage(role: .assistant, content: "[Error: \(error.localizedDescription)]")
-                errorMsg.isStreaming = false
-                self.appState.appendMessage(to: sessionId, message: errorMsg)
+                self.appendErrorNotice(error, to: sessionId)
             }
             self.appState.saveChatHistory()
             self.isGenerating = false
@@ -505,6 +535,11 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                               workingDirectory initialWorkDir: String?,
                               approval: @escaping (APIClient.ToolCall) async -> Bool) async throws {
         var workingDirectory = initialWorkDir
+        // One media generation per USER TURN, not per round — a round cap can't
+        // bound a model that just calls again next round. This token identifies
+        // the turn for every round below.
+        let mediaTurn = UUID()
+        mediaProgress = nil
         let maxIterations = 150
         let padRetryPolicy = RetryPolicy.aggressive
         let repetition = AgentEngine.RepetitionTracker()
@@ -915,9 +950,9 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                             telegramChatId: config.telegramChatId
                         ) ?? "Error: task creation unavailable."
                     },
-                    generateImage: { [weak self] prompt in
-                        await self?.generateImageFromAgent(prompt: prompt)
-                            ?? "Error: image generation unavailable."
+                    generateMedia: { [weak self] kind, mediaArgs in
+                        await self?.generateMediaFromAgent(kind: kind, args: mediaArgs, turn: mediaTurn)
+                            ?? "Error: media generation unavailable."
                     },
                     processRegistry: appState.processRegistry,
                     sessionId: sessionId,
@@ -941,19 +976,36 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                 // model-facing content keeps just the caption/path, never the
                 // multi-KB base64 (which would blow up the context).
                 var pendingInlineImage: ChatImage? = nil
+                // A produced track or clip rides back as a PATH, not bytes — see
+                // ChatMediaRef. Same split-and-hide shape as the image marker:
+                // the model gets the caption, the user gets a player.
+                var pendingMediaRef: ChatMediaRef? = nil
                 if (result.name == "browse" || result.name == "generate_image")
                     && result.output.contains(AgentMediaInline.jpegDataURIMarker) {
-                    let (caption, jpeg) = AgentMediaInline.splitInlineImage(result.output)
+                    let (_, jpeg) = AgentMediaInline.splitInlineImage(result.output)
                     let chatImage = jpeg.map { ChatImage(data: $0) }
                     if result.name == "generate_image" {
+                        // A generated image ships BOTH markers, so the caption
+                        // comes from the ref split (which stops before the ref
+                        // line) rather than the image split (which would keep
+                        // it). The ref is what gives the picture the same
+                        // Reveal-in-Finder button as a track or a clip.
+                        let (caption, ref) = AgentMediaInline.splitMediaRef(
+                            result.output, prompt: tc.arguments["prompt"] ?? "")
                         toolMsg.content = caption.isEmpty ? "[image generated]" : caption
                         pendingInlineImage = chatImage
+                        pendingMediaRef = ref
                     } else if let chatImage {
                         toolMsg.images = [chatImage]
                         toolMsg.content = "[screenshot captured]"
                     } else {
                         toolMsg.content = AgentEngine.truncateWithOverflow(result.output, toolCallId: result.id, toolName: result.name)
                     }
+                } else if result.output.contains(AgentMediaInline.mediaRefMarker) {
+                    let asked = tc.arguments["prompt"] ?? tc.arguments["text"] ?? ""
+                    let (caption, ref) = AgentMediaInline.splitMediaRef(result.output, prompt: asked)
+                    toolMsg.content = caption.isEmpty ? "[media generated]" : caption
+                    pendingMediaRef = ref
                 } else {
                     toolMsg.content = AgentEngine.truncateWithOverflow(result.output, toolCallId: result.id, toolName: result.name)
                 }
@@ -965,12 +1017,16 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                 appState.appendMessage(to: sessionId, message: resultMsg)
                 appState.appendMessage(to: sessionId, message: toolMsg)
 
-                // Render the generated image inline AFTER the tool-call card, via
+                // Render the generated media inline AFTER the tool-call card, via
                 // a visible assistant `.message` (the only row that displays it).
-                if let pendingInlineImage {
-                    var imgMsg = ChatMessage(role: .assistant, content: "")
-                    imgMsg.images = [pendingInlineImage]
-                    appState.appendMessage(to: sessionId, message: imgMsg)
+                // ONE message even when both are set — a generated image is its
+                // bytes AND its file, and splitting them would put the caption
+                // and its Reveal button in a separate row from the picture.
+                if pendingInlineImage != nil || pendingMediaRef != nil {
+                    var mediaMsg = ChatMessage(role: .assistant, content: "")
+                    mediaMsg.images = pendingInlineImage.map { [$0] }
+                    mediaMsg.media = pendingMediaRef.map { [$0] }
+                    appState.appendMessage(to: sessionId, message: mediaMsg)
                 }
             }
 
@@ -1047,56 +1103,134 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
         }
     }
 
-    // MARK: - generate_image tool (agent-rendered images, inline in chat)
+    // MARK: - Media tools (agent-generated image / speech / music / video)
 
-    /// Backs the agent's `generate_image` tool. Renders an image from `prompt`
-    /// using the user's SAVED Image settings (`ImageGenSettings`) — never a
-    /// model/size the model chose — and returns a string carrying the caption +
-    /// a `data:image/jpeg;base64,…` payload that `runAgentLoop` splits into a
-    /// model-facing caption and an inline image message. If the saved model
-    /// isn't downloaded, returns a friendly "download it first" message instead
-    /// of silently pulling multiple GB mid-chat.
-    func generateImageFromAgent(prompt: String) async -> String {
-        let trimmed = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !trimmed.isEmpty else {
-            return "Error: generate_image needs a non-empty \"prompt\" describing the image to draw."
+    /// Backs all four `generate_*` tools. One entry point because they share
+    /// everything that matters: the per-turn budget, the "is it downloaded"
+    /// gate, the progress meter, and the caption+marker result shape the loop
+    /// splits. What differs — which arguments are read and how they're clamped —
+    /// lives in `MediaToolArgs`, which is pure and tested.
+    ///
+    /// The model NEVER picks the model or the quality: those come from the
+    /// user's saved settings for that modality, with the step/duration knobs
+    /// forced to `MediaChatDefaults` because a chat generation is a preview that
+    /// blocks chat decode while it runs.
+    /// `turn` identifies the user turn this call belongs to — mint one per turn
+    /// in the driving loop and pass the same value for every round of it.
+    func generateMediaFromAgent(kind: MediaKind, args: [String: String],
+                                turn: UUID) async -> String {
+        if let refusal = mediaBudget.claim(kind, turn: turn) { return refusal }
+        mediaProgress = nil
+        defer { mediaProgress = nil }
+        let onProgress: (MediaGenProgress) -> Void = { [weak self] p in self?.mediaProgress = p }
+        do {
+            switch kind {
+            case .image:  return try await runImageTool(args, onProgress: onProgress)
+            case .speech: return try await runSpeechTool(args, onProgress: onProgress)
+            case .music:  return try await runMusicTool(args, onProgress: onProgress)
+            case .video:  return try await runVideoTool(args, onProgress: onProgress)
+            }
+        } catch let missing as MediaToolArgs.MissingArgument {
+            return missing.localizedDescription
+        } catch {
+            return "Error generating \(kind.rawValue): \(error.localizedDescription)"
         }
+    }
+
+    /// Don't kick off a silent multi-GB download from a chat turn: if the saved
+    /// model for this modality isn't present, say so and point at the window
+    /// that has a progress bar and a RAM gate. Returns nil when it IS usable
+    /// (present locally, or a LAN id whose host has the weights).
+    private func notDownloadedNotice(repo: String, name: String, approxGB: String,
+                                     window: String, lanId: String?) -> String? {
+        guard lanId == nil, ServerManager.resolveModelDir(repo: repo) == nil else { return nil }
+        return "The \(window.lowercased()) model “\(name)” isn't downloaded yet, so I can't make that. Open the \(window) generation window once (menu-bar tray ▸ \(window)) to download it (~\(approxGB) GB), then ask me again."
+    }
+
+    private func runImageTool(_ args: [String: String],
+                              onProgress: @escaping (MediaGenProgress) -> Void) async throws -> String {
         let s = ImageGenSettings.load()
         let model = s.resolvedModel
-        // A LAN model picked in the Image pane needs no local download —
-        // the hosting Mac has the weights.
+        // A LAN model picked in the Image pane needs no local download — the
+        // hosting Mac has the weights.
         let lanId = LanPick.lanId(s.modelId)
-        // Don't kick off a silent multi-GB download from a chat turn — if the
-        // saved image model isn't present, tell the user to grab it from the
-        // Image window once (the only place with a progress bar + RAM gate).
-        guard lanId != nil || ServerManager.resolveModelDir(repo: model.repo) != nil else {
-            return "The image model “\(model.name)” isn't downloaded yet, so I can't generate an image. Open the Image generation window once (menu-bar tray ▸ Image) to download it (~\(model.approxDownloadGB) GB), then ask me again."
+        if let notice = notDownloadedNotice(repo: model.repo, name: model.name,
+                                            approxGB: "\(model.approxDownloadGB)",
+                                            window: "Image", lanId: lanId) { return notice }
+        let req = try MediaToolArgs.image(args, model: model,
+                                          saved: s.resolvedResolution(for: model),
+                                          seed: s.seed, safeMode: s.safeMode,
+                                          keepResident: s.keepResident, lanId: lanId)
+        let path = try await appState.imageGen.generateForAgent(req, server: appState.server,
+                                                                onProgress: onProgress)
+        // Caption FIRST, base64 LAST, the file reference BETWEEN them. The image
+        // is the one modality that ships both: the JPEG bytes the transcript
+        // displays, and the PNG path its Reveal-in-Finder button opens. That
+        // order is what lets `splitMediaRef` take a clean caption (everything
+        // before the ref line) while `splitInlineImage` still finds the payload;
+        // a ref line after the base64 would put the whole data URI in the
+        // caption the model reads.
+        let caption = "Generated a \(req.width)×\(req.height) image for: \(req.prompt). Saved to \(path)."
+        let ref = AgentMediaInline.mediaRefLine(kind: .image, path: path)
+        guard let dataURI = AgentMediaInline.pngFileToJpegDataURI(path) else {
+            return "\(caption)\n\(ref)"
         }
-        let resolution = s.resolvedResolution(for: model)
-        let req = ImageGenRequest(
-            model: model,
-            prompt: trimmed,
-            seed: s.seed,
-            width: resolution.width,
-            height: resolution.height,
-            steps: s.steps,
-            keepResident: s.keepResident,
-            lanModelId: lanId,
-            safeMode: s.safeMode
-        )
-        do {
-            let path = try await appState.imageGen.generateForAgent(req, server: appState.server)
-            // Caption FIRST, base64 LAST: runAgentLoop keeps the caption as the
-            // model-facing tool content and strips the data URI before the model
-            // sees it (see AgentMediaInline.splitInlineImage).
-            let caption = "Generated a \(resolution.width)×\(resolution.height) image for: \(trimmed). Saved to \(path)."
-            guard let dataURI = AgentMediaInline.pngFileToJpegDataURI(path) else {
-                return caption
-            }
-            return "\(caption)\n\(dataURI)"
-        } catch {
-            return "Error generating image: \(error.localizedDescription)"
-        }
+        return "\(caption)\n\(ref)\n\(dataURI)"
+    }
+
+    private func runSpeechTool(_ args: [String: String],
+                               onProgress: @escaping (MediaGenProgress) -> Void) async throws -> String {
+        let s = AudioGenSettings.load()
+        let model = s.resolvedModel
+        let lanId = LanPick.lanId(s.modelId)
+        if let notice = notDownloadedNotice(repo: model.repo, name: model.name,
+                                            approxGB: String(format: "%.1f", model.approxDownloadGB),
+                                            window: "Audio", lanId: lanId) { return notice }
+        var req = try MediaToolArgs.speech(args, model: model,
+                                           keepResident: s.keepResident, lanId: lanId)
+        // Model's own voice, deliberately: `generate_speech` takes no voice
+        // argument, and the Audio window's reference clip is transient view
+        // state, so there is nothing here that could honestly be cloned from.
+        req.temperature = s.temperature
+        let path = try await appState.audioGen.generateForAgent(req, server: appState.server,
+                                                                onProgress: onProgress)
+        let caption = "Spoke: “\(req.text)”. Saved to \(path)."
+        return "\(caption)\n\(AgentMediaInline.mediaRefLine(kind: .audio, path: path))"
+    }
+
+    private func runMusicTool(_ args: [String: String],
+                              onProgress: @escaping (MediaGenProgress) -> Void) async throws -> String {
+        let s = MusicGenSettings.load()
+        let model = s.resolvedModel
+        let lanId = LanPick.lanId(s.modelId)
+        if let notice = notDownloadedNotice(repo: model.repo, name: model.name,
+                                            approxGB: String(format: "%.1f", model.approxDownloadGB),
+                                            window: "Music", lanId: lanId) { return notice }
+        let req = try MediaToolArgs.music(args, model: model, language: s.vocalLanguage,
+                                          keepResident: s.keepResident, lanId: lanId)
+        let path = try await appState.musicGen.generateForAgent(req, server: appState.server,
+                                                                onProgress: onProgress)
+        let caption = "Generated a \(req.durationSeconds)s track for: \(req.prompt). Saved to \(path)."
+        return "\(caption)\n\(AgentMediaInline.mediaRefLine(kind: .audio, path: path))"
+    }
+
+    private func runVideoTool(_ args: [String: String],
+                              onProgress: @escaping (MediaGenProgress) -> Void) async throws -> String {
+        let s = VideoGenSettings.load()
+        let model = s.resolvedModel
+        let lanId = LanPick.lanId(s.modelId)
+        if let notice = notDownloadedNotice(repo: model.repo, name: model.name,
+                                            approxGB: "\(model.approxFirstRunDownloadGB)",
+                                            window: "Video", lanId: lanId) { return notice }
+        let req = try MediaToolArgs.video(args, model: model,
+                                          saved: s.resolvedResolution(for: model),
+                                          keepResident: s.keepResident, lanId: lanId)
+        let path = try await appState.videoGen.generateForAgent(req, server: appState.server,
+                                                                onProgress: onProgress)
+        let seconds = Double(req.numFrames) / Double(max(req.fps, 1))
+        let caption = String(format: "Generated a %.1fs %d×%d clip for: %@. Saved to %@.",
+                             seconds, req.width, req.height, req.prompt, path)
+        return "\(caption)\n\(AgentMediaInline.mediaRefLine(kind: .video, path: path))"
     }
 
     // MARK: - Tool JSON + multimodal content (relocated from ChatDetailView)

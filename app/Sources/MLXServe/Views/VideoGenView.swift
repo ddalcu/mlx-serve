@@ -994,19 +994,7 @@ struct VideoGenView: View {
 /// macOS 26.4 the Swift runtime fatal-aborts while resolving VideoPlayer's
 /// generic metadata when it's mounted via a state-driven transition
 /// (phase `.running` → `.completed`), crashing the whole app.
-private struct AVPlayerViewRepresentable: NSViewRepresentable {
-    let player: AVPlayer
-
-    func makeNSView(context: Context) -> AVPlayerView {
-        let view = AVPlayerView()
-        view.player = player
-        view.controlsStyle = .inline
-        return view
-    }
-
-    func updateNSView(_ nsView: AVPlayerView, context: Context) {
-        if nsView.player !== player {
-            nsView.player = player
-        }
-    }
-}
+// `AVPlayerViewRepresentable` moved to Views/ChatMediaAttachmentView.swift when
+// the chat transcript grew video attachments. SwiftUI's own `VideoPlayer`
+// fatal-aborts under state transitions on macOS 26.4, so there must be exactly
+// ONE AVPlayerView wrapper — a second copy is a second thing to get wrong.

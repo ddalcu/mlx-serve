@@ -227,6 +227,11 @@ private struct AgentEditor: View {
 
     @EnvironmentObject var appState: AppState
     @State private var showAdvancedTools = false
+    /// Collapsed state of Capabilities / Model / Workspace / Sampling. Per-agent
+    /// like `showAdvancedTools` — the editor is REUSED across selections, so it
+    /// re-syncs on the id change rather than leaking one agent's disclosure into
+    /// the next.
+    @State private var showMoreOptions = false
     @StateObject private var previewer = VoicePreviewer()
     /// Uploaded clips, re-stated when the editor appears and after an upload —
     /// not per render (the body re-evaluates far too often to stat a folder).
@@ -259,11 +264,20 @@ private struct AgentEditor: View {
             }
             identitySection
             promptSection
-            capabilitiesSection
-            modelSection
-            workspaceSection
-            voiceSection
-            samplingSection
+            // Everything below is collapsed by default. An agent is a prompt, a
+            // name and a voice; capabilities, a pinned model, a workspace and
+            // sampling are real but rarely-touched, and putting five sections of
+            // them between "what should this be?" and the Delete button made the
+            // editor read as a settings panel. The row names whatever is set
+            // behind it (`AgentAdvancedSummary`) so a collapsed non-default is
+            // still discoverable.
+            moreOptionsSection
+            if showMoreOptions {
+                capabilitiesSection
+                modelSection
+                workspaceSection
+                samplingSection
+            }
             if !readOnly {
                 Section {
                     HStack {
@@ -283,7 +297,10 @@ private struct AgentEditor: View {
         }
         // The editor is REUSED as the selection changes (same class as the chat
         // detail view), so per-agent view state has to re-sync on the id change.
-        .onChange(of: agent.id) { _, _ in showAdvancedTools = agent.capabilities.advancedTools != nil }
+        .onChange(of: agent.id) { _, _ in
+            showAdvancedTools = agent.capabilities.advancedTools != nil
+            showMoreOptions = false
+        }
         .onDisappear { onSave() }
     }
 
@@ -313,6 +330,10 @@ private struct AgentEditor: View {
                         .font(.caption2).foregroundStyle(.secondary)
                 }
             }
+            // Voice belongs to identity, not to a section of its own: how an
+            // agent SOUNDS is the same kind of fact as what it's called and what
+            // wakes it, and all three are what you set when making one.
+            voiceRows
         }
     }
 
@@ -322,6 +343,42 @@ private struct AgentEditor: View {
     private var appPhraseDisplay: String {
         WakeWord.display(WakeWord.normalizePhrase(appState.serverOptions.wakePhrase)
                          ?? WakeWord.defaultPhrase)
+    }
+
+    // MARK: More options
+
+    /// The disclosure row for the collapsed sections.
+    ///
+    /// A Button rather than a `DisclosureGroup`: the four things it reveals are
+    /// `Section`s, and nesting sections inside a disclosure loses their headers
+    /// and their grouped-form styling. Toggling a flag that gates them keeps
+    /// each section exactly as it was.
+    private var moreOptionsSection: some View {
+        Section {
+            Button {
+                withAnimation(.easeInOut(duration: 0.15)) { showMoreOptions.toggle() }
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: showMoreOptions ? "chevron.down" : "chevron.right")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                    Text("More options")
+                    Spacer()
+                    // What's set behind the row while it's shut, so a collapsed
+                    // non-default isn't a setting nobody can find again.
+                    if !showMoreOptions, let summary = AgentAdvancedSummary.text(for: agent) {
+                        Text(summary)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                            .truncationMode(.tail)
+                    }
+                }
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .help("Capabilities, model, workspace and sampling. Most agents need none of these.")
+        }
     }
 
     // MARK: Prompt
@@ -508,41 +565,40 @@ private struct AgentEditor: View {
         }
     }
 
-    // MARK: Voice
+    // MARK: Voice (rows, rendered inside Identity)
 
-    private var voiceSection: some View {
-        Section("Voice") {
-            AgentVoiceMenu(voice: $agent.voice,
-                           systemVoices: appState.voice.availableVoices,
-                           clips: clips,
-                           globalClipPath: appState.serverOptions.voiceClonePath,
-                           globalClipLabel: appState.serverOptions.voiceCloneLabel,
-                           cloneAvailable: ttsDownloaded,
-                           onAddClip: { addVoiceClip() },
-                           onRevealClips: { VoiceClipLibrary.revealInFinder() })
+    @ViewBuilder
+    private var voiceRows: some View {
+        AgentVoiceMenu(voice: $agent.voice,
+                       systemVoices: appState.voice.availableVoices,
+                       clips: clips,
+                       globalClipPath: appState.serverOptions.voiceClonePath,
+                       globalClipLabel: appState.serverOptions.voiceCloneLabel,
+                       cloneAvailable: ttsDownloaded,
+                       onAddClip: { addVoiceClip() },
+                       onRevealClips: { VoiceClipLibrary.revealInFinder() })
+            .disabled(readOnly)
+        // An agent already pointing at a clip when the model is gone would
+        // just quietly speak in the system voice — say so instead.
+        if case .clone = agent.voice, !ttsDownloaded,
+           let reason = VoiceCloneMenuModel.cloneUnavailableReason(ttsModelDownloaded: false) {
+            Label(reason, systemImage: "exclamationmark.triangle.fill")
+                .font(.caption).foregroundStyle(.orange)
+        }
+        HStack(spacing: 10) {
+            Button("Preview") { previewVoice() }
+                .disabled(previewer.active != nil || agent.voice == nil)
+            Button("Add Voice…") { addVoiceClip() }
                 .disabled(readOnly)
-            // An agent already pointing at a clip when the model is gone would
-            // just quietly speak in the system voice — say so instead.
-            if case .clone = agent.voice, !ttsDownloaded,
-               let reason = VoiceCloneMenuModel.cloneUnavailableReason(ttsModelDownloaded: false) {
-                Label(reason, systemImage: "exclamationmark.triangle.fill")
-                    .font(.caption).foregroundStyle(.orange)
+                .help("Add a recording of a voice to clone. It's normalized and kept in ~/.mlx-serve/voice-clips so any agent can use it later.")
+            if let error = previewer.error ?? clipError {
+                Text(error).font(.caption2).foregroundStyle(.orange)
             }
-            HStack(spacing: 10) {
-                Button("Preview") { previewVoice() }
-                    .disabled(previewer.active != nil || agent.voice == nil)
-                Button("Add Voice…") { addVoiceClip() }
-                    .disabled(readOnly)
-                    .help("Add a recording of a voice to clone. It's normalized and kept in ~/.mlx-serve/voice-clips so any agent can use it later.")
-                if let error = previewer.error ?? clipError {
-                    Text(error).font(.caption2).foregroundStyle(.orange)
-                }
-                Spacer()
-            }
-            if agent.voice == nil {
-                Text("Speaks with the app's voice (Settings ▸ Voice).")
-                    .font(.caption2).foregroundStyle(.secondary)
-            }
+            Spacer()
+        }
+        if agent.voice == nil {
+            Text("Speaks with the app's voice (Settings ▸ Voice).")
+                .font(.caption2).foregroundStyle(.secondary)
         }
     }
 
@@ -643,12 +699,16 @@ private struct AgentEditor: View {
 
 // MARK: - Voice picker (writes the AGENT, not the app settings)
 
-/// The same sections as `VoiceSelectorMenu` — Kokoro, your voices, system — but
-/// bound to an agent's own voice, with an explicit "App voice" entry for the nil
-/// case and the uploaded-clip library in between. A `Menu` rather than a `Picker`
-/// because it also carries ACTIONS (add a clip, open the folder), which a Picker
-/// can't hold. A separate view from the shared one because that one writes
-/// `serverOptions` by design — it IS the global picker.
+/// Kokoro, your voices, system — bound to an AGENT's own voice, with an explicit
+/// "App voice" entry for the nil case and the uploaded-clip library in between.
+/// A `Menu` rather than a `Picker` because it also carries ACTIONS (add a clip,
+/// open the folder), which a Picker can't hold.
+///
+/// There were two of these; the voice-mode sheet's copy (`VoiceSelectorMenu`)
+/// is gone. The speaking voice belongs to WHO is answering, so it is set here
+/// for an agent and in Settings ▸ Voice for the app itself — a third picker
+/// inside the orb could only disagree with the two that own it, and the
+/// synthesizer re-reads the value per utterance anyway.
 private struct AgentVoiceMenu: View {
     @Binding var voice: AgentVoice?
     let systemVoices: [VoiceOption]

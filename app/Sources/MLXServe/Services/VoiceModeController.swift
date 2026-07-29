@@ -213,11 +213,22 @@ final class VoiceModeController: ObservableObject {
             return nil
         }
 
-        // Wake phrase from Settings ▸ Voice, applied live — the user's raw
-        // typing is normalized ("Hey, Jarvis!" → "hey jarvis"); a blank field
-        // falls back to the default rather than a never-matching gate.
-        appState.$serverOptions
-            .map { WakeWord.normalizePhrase($0.wakePhrase) ?? WakeWord.defaultPhrase }
+        // Wake phrase, applied live: the ACTIVE agent's own phrase when it has
+        // one, else Settings ▸ Voice. Both are normalized ("Hey, Jarvis!" →
+        // "hey jarvis"), and a blank field falls back rather than producing a
+        // never-matching gate (`WakeWord.activePhrase`).
+        //
+        // It tracks `defaultAgentId` because that is what every route to "who is
+        // answering" already sets — the tray's pick, a spoken handover
+        // (`selectAgent`), and opening voice from a chat tab, which adopts that
+        // tab's agent. Without the agent half, voice launched from a chat with
+        // its own wake phrase kept listening for the global one while the agent
+        // introduced itself by name.
+        Publishers.CombineLatest(appState.$serverOptions, appState.$defaultAgentId)
+            .map { [weak appState] options, agentId in
+                WakeWord.activePhrase(agentPhrase: appState?.agents.agent(id: agentId)?.wakePhrase,
+                                      global: options.wakePhrase)
+            }
             .removeDuplicates()
             .sink { [weak self] in self?.wakePhrase = $0 }
             .store(in: &cancellables)

@@ -15,6 +15,12 @@ import AppKit
 /// and clears it when playback finishes on its own.
 @MainActor
 final class AudioClipPlayer: NSObject, ObservableObject, NSSoundDelegate {
+    /// One player for the chat transcript. A transcript can hold many clips and
+    /// each row is its own view, so a per-row player would let two tracks play
+    /// over each other — the media panes keep their own instance because each is
+    /// a single pane with a single shelf.
+    static let shared = AudioClipPlayer()
+
     /// The file currently playing (or paused), else nil. Drives shelf highlight.
     @Published private(set) var playingPath: String?
 

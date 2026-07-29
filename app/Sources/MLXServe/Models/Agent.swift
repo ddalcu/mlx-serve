@@ -247,7 +247,7 @@ struct AgentCapabilities: Codable, Equatable, Sendable {
     static let loopTools: Set<AgentToolKind> = [
         .shell, .cwd, .readFile, .writeFile, .editFile, .searchFiles, .listFiles,
         .saveMemory, .createTask, .listProcesses, .readProcessOutput, .killProcess,
-        .generateImage, .generateAudio, .generateVideo,
+        .generateImage, .generateSpeech, .generateMusic, .generateVideo,
     ]
 
     static let webTools: Set<AgentToolKind> = [.browse, .webSearch]
@@ -273,6 +273,21 @@ struct AgentCapabilities: Codable, Equatable, Sendable {
     /// Back to coarse control.
     mutating func closeAdvanced() { advancedTools = nil }
 
+    /// Tool names that were RENAMED, mapped to what they are now.
+    ///
+    /// The decoder drops names it doesn't recognise (a tool retired in a later
+    /// build must not fail a whole agent's decode), which means a plain rename
+    /// silently STRIPS the capability from every agent that had it. `generate_audio`
+    /// split into `generate_speech` + `generate_music`; the speech half keeps the
+    /// old name's meaning, so upgraders keep what they granted.
+    static let renamedTools: [String: AgentToolKind] = ["generate_audio": .generateSpeech]
+
+    /// Resolve one stored tool name: this build's spelling, then a rename, else
+    /// nil (drop it).
+    static func toolKind(forStoredName name: String) -> AgentToolKind? {
+        AgentToolKind(rawValue: name) ?? renamedTools[name]
+    }
+
     enum CodingKeys: String, CodingKey { case tools, mcp, web, advancedTools }
 
     init(from decoder: Decoder) throws {
@@ -282,7 +297,7 @@ struct AgentCapabilities: Codable, Equatable, Sendable {
         web = try c.decodeIfPresent(Bool.self, forKey: .web) ?? true
         // A tool name this build doesn't know is dropped, not fatal.
         if let raw = try c.decodeIfPresent([String].self, forKey: .advancedTools) {
-            advancedTools = Set(raw.compactMap(AgentToolKind.init(rawValue:)))
+            advancedTools = Set(raw.compactMap(Self.toolKind(forStoredName:)))
         }
     }
 

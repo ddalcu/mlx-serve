@@ -562,6 +562,29 @@ class AppState: ObservableObject {
         }
     }
 
+    /// Drop one message from a conversation.
+    ///
+    /// It leaves the history the model sees, not just the view — pruning a bad
+    /// turn so the next request isn't built on it is the whole point. Any
+    /// HIDDEN tool-result messages belonging to the same assistant turn go with
+    /// it: a tool result whose call is gone is an orphan the model can only be
+    /// confused by, and it is invisible, so nothing would ever clean it up.
+    func deleteMessage(in sessionId: UUID, messageId: UUID) {
+        guard let sIdx = chatSessions.firstIndex(where: { $0.id == sessionId }),
+              let mIdx = chatSessions[sIdx].messages.firstIndex(where: { $0.id == messageId })
+        else { return }
+        var removed = IndexSet(integer: mIdx)
+        var i = mIdx + 1
+        while i < chatSessions[sIdx].messages.count,
+              chatSessions[sIdx].messages[i].toolCallId != nil {
+            removed.insert(i)
+            i += 1
+        }
+        chatSessions[sIdx].messages.remove(atOffsets: removed)
+        chatSessions[sIdx].updatedAt = Date()
+        saveChatHistory()
+    }
+
     func updateLastMessage(in sessionId: UUID, content: String? = nil, reasoning: String? = nil, streaming: Bool? = nil, usage: TokenUsage? = nil) {
         guard let sIdx = chatSessions.firstIndex(where: { $0.id == sessionId }),
               !chatSessions[sIdx].messages.isEmpty else { return }

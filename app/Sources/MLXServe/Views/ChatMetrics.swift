@@ -31,16 +31,9 @@ enum ChatMetrics {
     /// `composerControlSize` frames (send symbol point size == attach circle).
     static let composerIconSize: CGFloat = 30
 
-    /// Toolbar mode pills (Think / Agent / MCP) — one geometry so the three
-    /// capsules render identically. Height and icon slot are EXPLICIT because
-    /// SF symbols at the same point size have different intrinsic sizes
-    /// (brain vs wrench vs puzzle); padding-derived heights made the pills
-    /// subtly unequal. The pills ride ONE ToolbarItem with
-    /// `togglePillSpacing` between them, so in-cluster gaps are ours and
-    /// uniform — no item ever adds outer padding of its own (a stray
-    /// leading/trailing pad on one item is what made the gaps uneven before).
-    static let togglePillPaddingH: CGFloat = 8
-    static let togglePillHeight: CGFloat = 24
-    static let togglePillIconSize: CGFloat = 15
-    static let togglePillSpacing: CGFloat = 8
+    // The Think / Agent / MCP capsules that used to live in the window toolbar
+    // had their own `togglePill*` geometry here. They are icon-only composer
+    // controls now and draw from `composerIconSize` / `composerControlSize` like
+    // every other control in that row, so the separate metrics are gone rather
+    // than left behind as a second, unused way to size a control.
 }

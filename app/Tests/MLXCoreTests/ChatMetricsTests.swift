@@ -25,24 +25,13 @@ final class ChatMetricsTests: XCTestCase {
         XCTAssertEqual(ChatMetrics.composerControlSize, ChatMetrics.composerMinHeight)
     }
 
-    func testModePillGeometryIsPinnedAndShared() {
-        // Think / Agent / MCP capsules draw from ONE geometry: an explicit
-        // height and a fixed icon slot — SF symbols at the same point size
-        // render different intrinsic sizes (brain vs wrench vs puzzle), so
-        // padding-derived heights made the three pills subtly unequal.
-        XCTAssertEqual(ChatMetrics.togglePillPaddingH, 8)
-        XCTAssertEqual(ChatMetrics.togglePillHeight, 24)
-        XCTAssertEqual(ChatMetrics.togglePillIconSize, 15)
-        // The icon slot must fit inside the pill.
-        XCTAssertLessThan(ChatMetrics.togglePillIconSize, ChatMetrics.togglePillHeight)
-    }
-
-    func testModePillClusterOwnsItsSpacing() {
-        // The three pills ride ONE ToolbarItem with an explicit HStack gap, so
-        // in-cluster spacing is ours — uniform on both sides of Agent — rather
-        // than whatever the system puts between separate toolbar items.
-        // 8 (down from 12): wide gaps push the cluster into toolbar
-        // compression on narrow windows, truncating "MCP" to "…".
-        XCTAssertEqual(ChatMetrics.togglePillSpacing, 8)
+    func testModeIconsShareTheComposerControlGeometry() {
+        // Think / Tools / MCP moved out of the window toolbar and into the
+        // composer row as bare glyphs, so they draw from the SAME circle
+        // geometry as the paperclip and Send rather than the retired
+        // `togglePill*` capsule metrics. One row, one baseline: the disc and
+        // its frame must be the composer's, and the glyph must fit the disc.
+        XCTAssertEqual(ChatMetrics.composerIconSize, 30)
+        XCTAssertLessThan(ChatMetrics.composerIconSize, ChatMetrics.composerControlSize + 1)
     }
 }

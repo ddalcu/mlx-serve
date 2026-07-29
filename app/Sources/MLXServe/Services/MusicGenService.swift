@@ -166,6 +166,66 @@ final class MusicGenService: ObservableObject {
         }
     }
 
+    /// Awaitable generation for the agent's `generate_music` tool. Same load →
+    /// stream → write → unload pipeline as `generate`, returning the output WAV
+    /// path (or throwing), but WITHOUT touching this service's UI state
+    /// (`phase`/`task`/`recent`) — so a chat generation never hijacks the Music
+    /// window. `onProgress` drives the chat's own meter.
+    func generateForAgent(_ request: MusicGenRequest, server: ServerManager,
+                          onProgress: ((MediaGenProgress) -> Void)? = nil) async throws -> String {
+        guard !request.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            throw MediaGenError.emptyInput("Prompt")
+        }
+        guard request.lanModelId != nil || ServerManager.resolveModelDir(repo: request.model.repo) != nil else {
+            throw MediaGenError.notDownloaded(request.model.name)
+        }
+
+        let outputPath = Self.makeOutputPath(prompt: request.prompt)
+        let keep = request.keepResident
+        let startedAt = Date()
+        func report(_ step: Int, _ total: Int, _ message: String) {
+            onProgress?(MediaGenProgress(kind: .music, step: step, total: total,
+                                         message: message, startedAt: startedAt))
+        }
+        report(0, 0, "Loading model")
+
+        let (port, modelId, unloadId) = try await server.prepareGenModel(
+            lanModelId: request.lanModelId, repo: request.model.repo)
+        func releaseIfNeeded() async {
+            if !keep, let id = unloadId { try? await server.unloadModel(id: id) }
+        }
+        do {
+            var wav: Data? = nil
+            let reqJson = Self.requestBody(request, modelName: modelId)
+            let resolvedSeed = reqJson["seed"] as? Int ?? request.seed
+            for try await ev in api.streamGeneration(
+                port: port, path: "/v1/audio/music-generations", json: reqJson) {
+                switch MediaSSE.classify(ev) {
+                case .progress(let step, let total, let stage):
+                    report(step, total, MediaSSE.stageLabel(stage))
+                case .complete:
+                    if let b64 = ev["data"] as? String { wav = Data(base64Encoded: b64) }
+                case .failed(let m):
+                    throw MediaGenError.server(m)
+                case .ignored:
+                    break
+                }
+            }
+            guard let wav, wav.count > 44 else {
+                throw MediaGenError.server("Server returned an empty audio response.")
+            }
+            try wav.write(to: URL(fileURLWithPath: outputPath))
+            try? Self.settingsText(request, resolvedSeed: resolvedSeed, modelName: modelId)
+                .write(to: URL(fileURLWithPath: Self.sidecarPath(forWav: outputPath)),
+                       atomically: true, encoding: .utf8)
+            await releaseIfNeeded()
+            return outputPath
+        } catch {
+            await releaseIfNeeded()
+            throw error
+        }
+    }
+
     func cancel() {
         task?.cancel()
         task = nil

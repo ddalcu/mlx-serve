@@ -613,7 +613,7 @@ enum AgentEngine {
         mcpRouter: (any MCPToolRouting)? = nil,
         documentIndex: DocumentIndex? = nil,
         createTask: ((_ goal: String, _ schedule: String?) async -> String)? = nil,
-        generateImage: ((_ prompt: String) async -> String)? = nil,
+        generateMedia: ((_ kind: MediaKind, _ args: [String: String]) async -> String)? = nil,
         processRegistry: ProcessRegistry? = nil,
         sessionId: UUID? = nil,
         allowedTools: Set<AgentToolKind>? = nil
@@ -643,20 +643,19 @@ enum AgentEngine {
         }
 
         // Media-generation meta-tools, handled before the repetition / built-in
-        // dispatch (a heavy one-shot, no workdir, not a ToolHandler). Like
-        // createTask the image generator is injected by the caller (ChatTurnEngine
-        // owns ImageGenService + AppState); audio/video are stubbed this release.
-        if name == "generate_image" {
-            let out = generateImage != nil
-                ? await generateImage!(tc.arguments["prompt"] ?? "")
-                : "Error: image generation isn't available in this context."
+        // dispatch (heavy one-shots, no workdir, not ToolHandlers). Like
+        // createTask they're injected by the caller (ChatTurnEngine owns the four
+        // gen services + AppState); absent it they're gracefully unavailable.
+        //
+        // ONE seam for all four modalities rather than four closures: the raw
+        // argument dict passes straight through to `MediaToolArgs`, so parsing
+        // and clamping stay in the one tested pure place, and the per-turn media
+        // budget is claimed at one point instead of four.
+        if let kind = MediaKind.allCases.first(where: { $0.toolName == name }) {
+            let out = generateMedia != nil
+                ? await generateMedia!(kind, tc.arguments)
+                : "Error: media generation isn't available in this context."
             return ToolResult(id: tc.id, name: name, output: out)
-        }
-        if name == "generate_audio" {
-            return ToolResult(id: tc.id, name: name, output: AgentPrompt.comingSoonAudio)
-        }
-        if name == "generate_video" {
-            return ToolResult(id: tc.id, name: name, output: AgentPrompt.comingSoonVideo)
         }
 
         // ── Single repetition guard for ALL tools — built-in and MCP alike ──

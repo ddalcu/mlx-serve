@@ -689,15 +689,20 @@ struct StatusMenuView: View {
     /// ("lan:<id>@<peer>" tags — recorded on the ServerManager and carried by
     /// every chat request; the local server proxies it to the hosting Mac).
     /// Picking a local model always clears the LAN choice.
+    /// Tag semantics live in `ChatModelSelection`, shared with the chat window's
+    /// toolbar picker — two copies is how one surface silently stops honouring a
+    /// LAN selection.
     private var trayModelSelection: Binding<String> {
         Binding(
-            get: { server.lanChatModelId.map { "lan:" + $0 } ?? appState.selectedModelPath },
+            get: { ChatModelSelection.tag(localPath: appState.selectedModelPath,
+                                          lanChatModelId: server.lanChatModelId) },
             set: { picked in
-                if picked.hasPrefix("lan:") {
-                    appState.selectLanModel(String(picked.dropFirst(4)))
-                } else {
+                switch ChatModelSelection.action(for: picked) {
+                case .selectLan(let id):
+                    appState.selectLanModel(id)
+                case .selectLocal(let path):
                     server.lanChatModelId = nil
-                    appState.selectedModelPath = picked
+                    appState.selectedModelPath = path
                 }
             }
         )

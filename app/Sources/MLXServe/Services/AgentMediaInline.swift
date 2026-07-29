@@ -32,6 +32,41 @@ enum AgentMediaInline {
         return (caption, Data(base64Encoded: b64))
     }
 
+    // MARK: - Media by reference (speech / music / video)
+
+    /// Marker line the audio/video tools append to carry the file they produced.
+    ///
+    /// Same shape as the image data URI above and for the same reason — the tool
+    /// result is a plain string by the time the loop sees it — but a PATH, not
+    /// bytes: a 30 s track is tens of MB and would ride the transcript forever.
+    /// Line format: `mlx-serve-media:<kind>:<absolute path>`.
+    static let mediaRefMarker = "mlx-serve-media:"
+
+    static func mediaRefLine(kind: ChatMediaRef.Kind, path: String) -> String {
+        "\(mediaRefMarker)\(kind.rawValue):\(path)"
+    }
+
+    /// Split a tool output carrying a trailing media-ref line into the
+    /// model-facing caption and the reference. `prompt` is what the user asked
+    /// for; it rides the ref rather than being re-derived from the caption.
+    /// Returns the whole string as caption + nil when there is no marker.
+    static func splitMediaRef(_ output: String, prompt: String) -> (caption: String, ref: ChatMediaRef?) {
+        guard let range = output.range(of: mediaRefMarker) else { return (output, nil) }
+        let caption = String(output[..<range.lowerBound])
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        let remainder = output[range.upperBound...]
+        let lineEnd = remainder.firstIndex(of: "\n") ?? remainder.endIndex
+        let line = remainder[..<lineEnd]
+        // Exactly ONE split: a path may itself contain ':'.
+        guard let sep = line.firstIndex(of: ":"),
+              let kind = ChatMediaRef.Kind(rawValue: String(line[..<sep])) else {
+            return (caption, nil)
+        }
+        let path = String(line[line.index(after: sep)...])
+        guard !path.isEmpty else { return (caption, nil) }
+        return (caption, ChatMediaRef(kind: kind, path: path, prompt: prompt))
+    }
+
     /// Transcode a PNG file on disk to a `data:image/jpeg;base64,<b64>` URI for
     /// inline display (`ChatImage` is JPEG). nil when the file can't be read or
     /// re-encoded.

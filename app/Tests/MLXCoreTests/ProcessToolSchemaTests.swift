@@ -25,21 +25,49 @@ final class ProcessToolSchemaTests: XCTestCase {
     func testToolCountIncludesNewProcessTools() {
         // 11 base (shell, cwd, writeFile, readFile, editFile, searchFiles,
         // listFiles, browse, webSearch, saveMemory, createTask) + 3 process
-        // (killProcess, readProcessOutput, listProcesses) + 3 media
-        // (generate_image, generate_audio, generate_video) = 17.
-        XCTAssertEqual(defs().count, 17)
+        // (killProcess, readProcessOutput, listProcesses) + 4 media
+        // (generate_image, generate_speech, generate_music, generate_video) = 18.
+        XCTAssertEqual(defs().count, 18)
     }
 
-    /// The media-generation tools: `generate_image` is the real, required-prompt
-    /// tool; `generate_audio`/`generate_video` are advertised "coming soon" stubs.
+    /// The four media-generation tools, each with exactly one required argument
+    /// and its optional knobs. Speech and music are separate because their
+    /// arguments have nothing in common.
     func testMediaGenerationToolsPresent() {
         let tools = byName()
-        for n in ["generate_image", "generate_audio", "generate_video"] {
+        let required = ["generate_image": "prompt", "generate_speech": "text",
+                        "generate_music": "prompt", "generate_video": "prompt"]
+        for (n, key) in required {
             XCTAssertNotNil(tools[n], "\(n) missing from schema")
+            XCTAssertEqual((tools[n]!["parameters"] as! [String: Any])["required"] as! [String], [key])
         }
-        XCTAssertEqual((tools["generate_image"]!["parameters"] as! [String: Any])["required"] as! [String], ["prompt"])
-        XCTAssertEqual((tools["generate_audio"]!["parameters"] as! [String: Any])["required"] as! [String], ["text"])
-        XCTAssertEqual((tools["generate_video"]!["parameters"] as! [String: Any])["required"] as! [String], ["prompt"])
+        XCTAssertNil(tools["generate_audio"], "generate_audio split into speech + music")
+    }
+
+    /// Every optional knob a media tool advertises must be one `MediaToolArgs`
+    /// actually reads — an argument the parser ignores is a control that does
+    /// nothing, spent out of a small model's budget.
+    func testMediaToolOptionalArgumentsAreOnesWeRead() {
+        let tools = byName()
+        let expected = ["generate_image": Set(["prompt", "size"]),
+                        "generate_speech": Set(["text", "speed"]),
+                        "generate_music": Set(["prompt", "lyrics", "duration_seconds",
+                                               "bpm", "keyscale", "time_signature", "vocal_language"]),
+                        "generate_video": Set(["prompt", "seconds", "size"])]
+        for (n, keys) in expected {
+            let props = (tools[n]!["parameters"] as! [String: Any])["properties"] as! [String: Any]
+            XCTAssertEqual(Set(props.keys), keys, "\(n) advertises the wrong argument set")
+        }
+    }
+
+    @MainActor
+    func testEveryMediaToolShowsACallTheModelCanCopy() {
+        for n in ["generate_image", "generate_speech", "generate_music", "generate_video"] {
+            let example = AgentEngine.toolExample(for: n)
+            XCTAssertTrue(example.contains("{"), "\(n) needs an Example: in its description")
+            XCTAssertTrue(example.contains("prompt") || example.contains("text"),
+                          "\(n) example must show its required key: \(example)")
+        }
     }
 
     func testShellHasOptionalRunInBackgroundParam() {

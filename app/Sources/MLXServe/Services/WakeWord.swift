@@ -25,6 +25,22 @@ enum WakeWord {
         return toks.isEmpty ? nil : toks.joined(separator: " ")
     }
 
+    /// The phrase hands-free mode should listen for right now.
+    ///
+    /// An agent's own phrase wins over the Settings one: voice launched from a
+    /// chat adopts that chat's agent — persona, voice, tools — and the phrase
+    /// has to come along, or an agent that introduces itself by name still only
+    /// answers to "hey loki" and the "Say “…”" hint tells the user to say the
+    /// wrong thing. Both sides go through `normalizePhrase`, so a half-saved or
+    /// whitespace-only agent field defers to the global setting instead of
+    /// producing a gate that never matches, and an empty global still yields
+    /// `defaultPhrase` rather than "" (which `strip` would match on everything).
+    static func activePhrase(agentPhrase: String?, global: String) -> String {
+        agentPhrase.flatMap(normalizePhrase)
+            ?? normalizePhrase(global)
+            ?? defaultPhrase
+    }
+
     /// Title-cased phrase for UI labels and prompts ("hey jarvis" → "Hey Jarvis").
     static func display(_ phrase: String) -> String {
         phrase.split(separator: " ")

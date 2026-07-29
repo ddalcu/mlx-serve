@@ -131,7 +131,9 @@ final class ImageGenService: ObservableObject {
     /// output PNG path (or throwing), but WITHOUT touching the menu-bar UI state
     /// (`phase`/`task`/`recent`) — so an agent generation never hijacks the Image
     /// window. Honors the request's `keepResident` like the interactive path.
-    func generateForAgent(_ request: ImageGenRequest, server: ServerManager) async throws -> String {
+    /// `onProgress` drives the chat's own meter.
+    func generateForAgent(_ request: ImageGenRequest, server: ServerManager,
+                          onProgress: ((MediaGenProgress) -> Void)? = nil) async throws -> String {
         guard !request.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw GenError.emptyPrompt
         }
@@ -142,6 +144,13 @@ final class ImageGenService: ObservableObject {
         let outputPath = Self.makeOutputPath(prompt: request.prompt)
         let seedToSend = request.seed >= 0 ? request.seed : Int.random(in: 0...0xFFFF_FFFF)
         let keep = request.keepResident
+        let steps = request.steps
+        let startedAt = Date()
+        func report(_ step: Int, _ total: Int, _ message: String) {
+            onProgress?(MediaGenProgress(kind: .image, step: step, total: total,
+                                         message: message, startedAt: startedAt))
+        }
+        report(0, 0, "Loading model")
 
         let (port, modelId, unloadId) = try await server.prepareGenModel(
             lanModelId: request.lanModelId, repo: request.model.repo)
@@ -153,10 +162,15 @@ final class ImageGenService: ObservableObject {
             let genJson = Self.requestJson(for: request, modelName: modelId, seed: seedToSend)
             for try await ev in api.streamGeneration(
                 port: port, path: "/v1/images/generations", json: genJson) {
-                switch ev["type"] as? String {
-                case "complete": png = Self.decodePngB64(ev)
-                case "error":    throw GenError.server(ev["message"] as? String ?? "Generation failed.")
-                default:         break
+                switch MediaSSE.classify(ev) {
+                case .progress(let step, let total, let stage):
+                    report(step, total == 0 ? steps : total, MediaSSE.stageLabel(stage))
+                case .complete:
+                    png = Self.decodePngB64(ev)
+                case .failed(let m):
+                    throw GenError.server(m)
+                case .ignored:
+                    break
                 }
             }
             guard let png else { throw GenError.server("Server returned no image data.") }
