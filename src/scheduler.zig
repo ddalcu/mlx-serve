@@ -2437,20 +2437,10 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     }
 
     // Wire model weights into GPU memory (prevents paging, matches mlx-lm).
-    {
-        var dev = mlx.mlx_device{ .ctx = null };
-        _ = mlx.mlx_get_default_device(&dev);
-        var info = mlx.mlx_device_info_new();
-        if (mlx.mlx_device_info_get(&info, dev) == 0) {
-            var max_rec: usize = 0;
-            if (mlx.mlx_device_info_get_size(&max_rec, info, "max_recommended_working_set_size") == 0 and max_rec > 0) {
-                var old_limit: usize = 0;
-                _ = mlx.mlx_set_wired_limit(&old_limit, max_rec);
-                log.debug("Wired limit set to {d} MB\n", .{max_rec / (1024 * 1024)});
-            }
-            _ = mlx.mlx_device_info_free(info);
-        }
-    }
+    // Policy in mlx.applyWiredPolicy; re-applied in runLoadRequest /
+    // runUnloadRequest so `fit` capacity tracks the live set across
+    // load/unload churn (this early call covers warmup's forwards).
+    logWiredPolicy(mlx.applyWiredPolicy());
 
     // JIT-compile activation kernels. These are bound to THIS thread's mlx
     // stream — that's exactly the point of doing them here. Skipped entirely
@@ -3199,6 +3189,14 @@ fn finishEmbedRequest(sch: *Scheduler, req: *EmbedRequest, err_name: []const u8)
 /// `req.entry`, mark ready, and broadcast `req.done_cond` so the conn
 /// thread wakes. On failure, mark `.error_state` so future ensureLoaded
 /// calls fail fast; the conn thread surfaces a 500.
+fn logWiredPolicy(r: mlx.WiredPolicyResult) void {
+    if (r.target) |t| {
+        log.info("[wired] mode={s} limit={d} MB\n", .{ @tagName(r.mode), t / (1024 * 1024) });
+    } else {
+        log.debug("[wired] mode={s} declined (no gpu / empty live set)\n", .{@tagName(r.mode)});
+    }
+}
+
 fn runLoadRequest(sch: *Scheduler, req: *LoadRequest) void {
     // Step 1: evict victims (if any) BEFORE the load, so peak GPU residency
     // never holds the old + new model at once. unloadResident() drops
@@ -3234,6 +3232,9 @@ fn runLoadRequest(sch: *Scheduler, req: *LoadRequest) void {
         req.entry.id,
         @as(f64, @floatFromInt(req.entry.bytes_resident)) / 1_073_741_824.0,
     });
+    // Re-apply so `fit` capacity covers everything this load brought in
+    // (MTP head / drafter / vision land after the mid-load apply).
+    logWiredPolicy(mlx.applyWiredPolicy());
     finishLoadRequest(sch, req, null);
 }
 
@@ -3322,6 +3323,11 @@ fn runUnloadRequest(sch: *Scheduler, req: *UnloadRequest) void {
     sch.registry.accountEvictedLocked(bytes);
     sch.registry.finalizeEvictionLocked(entry);
     sch.registry.mutex.unlock(sch.io);
+
+    // Shrink `fit` capacity back to the surviving live set — leaving the
+    // freed model's headroom in place is exactly the per-transient-commit
+    // configuration the policy exists to avoid.
+    logWiredPolicy(mlx.applyWiredPolicy());
 
     req.done_mu.lockUncancelable(sch.io);
     req.done = true;
@@ -3908,6 +3914,10 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             // chunks so a ghost 40K prefill stops within one chunk.
             .cancel_flag = &slot.cancelled,
             .prefill_progress = if (observe) &sch.inflight_prefill_tokens else null,
+            // Init's argmax-only gate must see logprobs BEFORE the split-
+            // prefill final-token forward runs — a post-init field write is
+            // too late for the certified lm_head prune.
+            .logprobs_n = slot.logprobs_n,
         },
     );
     gen.timeout_ns = slot.timeout_ns;

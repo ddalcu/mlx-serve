@@ -85,6 +85,27 @@ Net effect: every MageFlow checkpoint — including the two official ones, downl
 - **Rule**: a new repo LAYOUT (not just a new model_type) has to be taught to every classifier that answers "is this a model?" — currently `model_discovery.tryAddModel`, `model_discovery.peekConfig`, `cli.isModelDir`, and Swift's `existingModelDir`. A layout that only `--model` can load is a layout the app cannot see.
 - **Guards**: `discoverModels finds a MageFlow repo (model_index.json, no root config.json)` (asserts the size too — null was the second facet) and `cli: isModelDir accepts a MageFlow repo`, which also pins that an unrelated diffusers pipeline (`StableDiffusionPipeline`) stays hidden.
 
+#### Second instance: an mflux conversion with no index either (2026-07-29)
+
+`mlx-community/flux2-klein-9b-4bit` is the only MLX build of FLUX.2-klein 9B, and its layout is the 4B's minus one file: `transformer/`, `text_encoder/`, `vae/`, `tokenizer/`, no root `config.json`, and no `model_index.json` to fall back to. All three classifiers above had to learn a shape for the second time.
+
+- **Signal**: the DiT's own weight name, `double_stream_modulation_img`, not a directory shape. `transformer/` + `vae/` + `text_encoder/` describes most of diffusers, so a shape test adopts every future MLX conversion of anything; a weight name IS the architecture. `peekMfluxFlux2` reads the shard index when there is one and the first shard's safetensors HEADER when there isn't (a single-file conversion has no index) — in both cases a bounded 1 MB prefix via `readSliceShort`, never `allocRemaining`, which on a 2 GB shard either eats the RAM or (with a cap) errors `StreamTooLong` and silently declines the model.
+- **No third copy**: `model_discovery.zig` imports only `std` + `log`, so `gen.zig` can import IT. `gen.peekModelType` delegates rather than duplicating (the MageFlow round has two copies kept in sync by comment). `cli.isModelDir` calls the same predicate.
+- **App side**: `MediaBundle.flux(...)` listed `config.json` as a ready marker, so a complete 10 GB download of this repo would read as permanently incomplete and the pane would offer Download forever — the Kokoro-reusing-`tts()` bug exactly. `hasRootConfig: false` is a fact about the repo, declared per preset, not a preference.
+- **Guards**: `discoverModels finds an mflux FLUX.2 repo (no root config.json)`, `flux2 detects from an mflux conversion with no root config.json`, `cli: isModelDir accepts an mflux FLUX.2 repo (no config.json at all)` — each also pinning that a same-shaped repo with different weight names stays hidden — plus `testKlein9BBundleDoesNotRequireARootConfigItNeverShips`.
+
+### A model family's geometry belongs to the checkpoint the moment a second size exists (2026-07-29)
+
+Adding klein 9B to the app is a five-line preset. Running it was not: `FluxConfig`'s struct defaults WERE the 4B (5 double / 20 single blocks, inner 3072, 24 heads, joint 7680, encoder 2560/9728), `loadDit` did `d.cfg = .{}` and allocated `cfg.double_layers` blocks from it. Against a 9B checkpoint that loads 5 of its 8 double blocks and 20 of its 24 single blocks, raises NO error (the extra blocks are simply never asked for), and generates a plausible, wrong image.
+
+Reading mflux's `AVAILABLE_MODELS` shows the entire 4B→9B delta is six numbers — `num_layers` 5→8, `num_single_layers` 20→24, `num_attention_heads` 24→32, `joint_attention_dim` 7680→12288, encoder `hidden_size` 2560→4096, `intermediate_size` 9728→12288 — while head_dim 128, in_channels 128, mlp_ratio 3, RoPE theta 2000, the 36 encoder layers and the 9/18/27 taps are shared. The VAE is byte-for-byte the same tensor set (266 tensors, identical shapes), and so is the tokenizer.
+
+- **Source of truth**: the WEIGHT SHAPES. Neither checkpoint carries the numbers in json (the 9B has no config.json at all; the 4B's records only its quantization), and shapes are the one source that cannot disagree with the tensors about to be loaded. `ditConfigFrom`/`teConfigFrom` are pure functions over a probe struct, so they unit-test without mlx; the loaders fill the struct with `rowsOf` / `logicalInDim` / `countIndexed`.
+- **Trap**: encoder head counts come from `q_proj`/`k_proj` ROWS, never `hidden ÷ head_dim`. The latter reads 32 on the 9B (right, by luck) and 20 on the 4B (wrong — it has 32 q heads over a 2560 hidden).
+- **Trap**: `ff.linear_in` emits gate+up fused, so `mlp_ratio` is its rows ÷ 2 ÷ inner. Reading it as rows ÷ inner gives 6.
+- **A zero probe leaves the field alone** rather than writing 0 — an unreadable shape must not produce a `alloc(0 blocks)` that "succeeds". Whatever is actually missing gets named by the weight load a few lines later.
+- **Verified no-op on the 4B**: the derived values log identically to the old hardcoded ones (`inner=3072 heads=24x128 double=5 single=20 joint=7680`, `hidden=2560 layers=36 heads=32/8 inter=9728`) and a live 512² generation is unchanged.
+
 ### `fitAspect` preserved the aspect; `normalizeSize` threw it away one step later
 Found by pre-merge review of the MageFlow branch (2026-07-25). The edit path already had the right idea: MageFlow edits AT the target grid, so a square request would squash a 3:2 photo, and `fitAspect` was added to reshape the requested size to the primary reference's aspect at the same pixel budget. Its unit test passed. The integration test passed. The geometry was still wrong for most real inputs.
 

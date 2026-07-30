@@ -25,6 +25,7 @@ private let supportedArchitectureTagPrefixes: [String] = [
     "bert",       // encoder-only embedding models (/v1/embeddings)
     "hunyuan",    // Tencent Hunyuan 3 (model_type hy_v3) — repos tag "hunyuan"
     "hy_v3",      // …and/or the model_type verbatim (some tag only that)
+    "laguna",     // poolside Laguna S 2.1 — repos tag "laguna" and/or "laguna-s-2.1"
 ]
 
 /// model_type values from config.json that the Zig server can load.

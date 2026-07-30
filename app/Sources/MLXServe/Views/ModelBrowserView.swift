@@ -39,7 +39,6 @@ struct ModelBrowserView: View {
         ModelBrowserBadgeCounts(
             myModels: appState.localModels.count,
             activeDownloads: activeDownloads.count,
-            draftersReady: GemmaVariant.allCases.filter { downloads.isReady($0.drafterRepoId) }.count,
             mediaReady: mediaReadyCount
         )
     }
@@ -110,7 +109,6 @@ struct ModelBrowserView: View {
         case .discover:     DiscoverPane()
         case .myModels:     MyModelsPane(filter: $localFilter)
         case .downloads:    DownloadsPane(items: activeDownloads)
-        case .drafters:     DraftersPane()
         case .media:        MediaPane()
         }
     }
@@ -650,7 +648,7 @@ private struct DownloadsPane: View {
                         .foregroundStyle(.secondary)
                     Text("No downloads in progress")
                         .foregroundStyle(.secondary)
-                    Text("Start one from Discover or Drafters.")
+                    Text("Start one from Recommended or Discover.")
                         .font(.caption)
                         .foregroundStyle(.tertiary)
                 }
@@ -667,58 +665,6 @@ private struct DownloadsPane: View {
             }
         }
         .navigationTitle("Downloads")
-    }
-}
-
-// MARK: - Drafters pane
-
-/// The curated drafter catalog, previously a collapsed disclosure pinned above
-/// the search results. As its own destination it's discoverable without
-/// competing for vertical space with the model list.
-private struct DraftersPane: View {
-    @EnvironmentObject var downloads: DownloadManager
-
-    private var rows: [DrafterCatalogRow] {
-        GemmaVariant.allCases.map { v in
-            DrafterCatalogRow(
-                variant: v,
-                repoId: v.drafterRepoId,
-                pairsWith: "for \(v.label)",
-                sizeEstimate: DrafterCatalogRow.sizeEstimate(for: v)
-            )
-        }
-    }
-
-    var body: some View {
-        VStack(spacing: 0) {
-            VStack(alignment: .leading, spacing: 6) {
-                HStack(spacing: 8) {
-                    Image(systemName: "sparkles")
-                        .foregroundStyle(.purple)
-                    Text("What's a drafter?")
-                        .font(.subheadline.weight(.semibold))
-                    Spacer()
-                }
-                Text("A small, fast helper model that runs alongside your main chat model. It guesses several upcoming words at once, and the main model quickly double-checks those guesses — when they're right (which is often), you get the exact same answer, just noticeably faster. It never changes what the model says, only how quickly it says it. This helps most with coding and multi-step agent work (using tools, editing files): +27–40% faster in our tests. A drafter only works alongside the specific Gemma 4 model size it's built for — pick the one matching your chat model below.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-            }
-            .padding(12)
-            .background(Color.purple.opacity(0.06))
-
-            Divider()
-
-            ScrollView {
-                LazyVStack(spacing: 0) {
-                    ForEach(rows) { row in
-                        DrafterCatalogRowView(row: row)
-                        Divider().padding(.horizontal, 12)
-                    }
-                }
-            }
-        }
-        .navigationTitle("Drafters")
     }
 }
 
@@ -1655,108 +1601,5 @@ private struct ActiveDownloadRow: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
-    }
-}
-
-// MARK: - Curated Drafters catalog
-
-private struct DrafterCatalogRow: Identifiable {
-    let variant: GemmaVariant
-    let repoId: String
-    let pairsWith: String
-    let sizeEstimate: String
-    var id: String { repoId }
-
-    /// bf16 sizes (the uniform suffix used by `drafterRepoId`).
-    static func sizeEstimate(for v: GemmaVariant) -> String {
-        switch v {
-        case .E2B:        return "~80 MB"
-        case .E4B:        return "~120 MB"
-        case .gemma12B:   return "~850 MB"
-        case .gemma31B:   return "~150 MB"
-        case .moe26B:     return "~120 MB"
-        }
-    }
-}
-
-private struct DrafterCatalogRowView: View {
-    let row: DrafterCatalogRow
-    @EnvironmentObject var downloads: DownloadManager
-    @EnvironmentObject var appState: AppState
-    @State private var confirmDelete = false
-
-    private var isReady: Bool { downloads.isReady(row.repoId) }
-    private var state: DownloadManager.DownloadState? { downloads.downloads[row.repoId] }
-
-    var body: some View {
-        HStack(spacing: 8) {
-            VStack(alignment: .leading, spacing: 1) {
-                Text(row.variant.drafterDirName)
-                    .font(.callout.weight(.medium))
-                    .lineLimit(1)
-                HStack(spacing: 6) {
-                    Text(row.pairsWith)
-                        .font(.caption)
-                        .foregroundStyle(.purple)
-                    Text("·")
-                        .foregroundStyle(.tertiary)
-                    Text(row.sizeEstimate)
-                        .font(.caption)
-                        .foregroundStyle(.tertiary)
-                }
-            }
-            .frame(maxWidth: .infinity, alignment: .leading)
-
-            actionControl
-                .frame(width: 110, alignment: .trailing)
-        }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 6)
-    }
-
-    @ViewBuilder
-    private var actionControl: some View {
-        if isReady {
-            HStack(spacing: 6) {
-                Text("✓ Available")
-                    .font(.caption.monospacedDigit())
-                    .foregroundStyle(.green)
-                Button {
-                    confirmDelete = true
-                } label: {
-                    Image(systemName: "trash")
-                        .foregroundStyle(.red.opacity(0.7))
-                }
-                .buttonStyle(.plain)
-                .font(.callout)
-                .help("Delete drafter")
-                .alert("Delete Drafter", isPresented: $confirmDelete) {
-                    Button("Cancel", role: .cancel) {}
-                    Button("Delete", role: .destructive) {
-                        downloads.deleteModel(repoId: row.repoId)
-                        appState.refreshModels()
-                    }
-                } message: {
-                    Text("Delete \(row.variant.drafterDirName)?")
-                }
-            }
-        } else if let s = state, s.status == .downloading {
-            VStack(spacing: 1) {
-                ProgressView(value: s.fileProgress)
-                    .frame(width: 80)
-                Text(s.percentFormatted)
-                    .font(.system(size: 9).monospacedDigit())
-                    .foregroundStyle(.secondary)
-            }
-        } else {
-            Button(downloads.hasPartialDownload(row.repoId) ? "Resume" : "Download") {
-                Task {
-                    await downloads.download(repoId: row.repoId)
-                    appState.refreshModels()
-                }
-            }
-            .font(.callout)
-            .controlSize(.small)
-        }
     }
 }

@@ -38,6 +38,7 @@ const metrics = @import("status.zig");
 const sse = @import("gen_sse.zig");
 const server_mod = @import("server.zig");
 const multipart = @import("multipart.zig");
+const discovery = @import("model_discovery.zig");
 const stb = @import("stb");
 
 const Conn = server_mod.Conn;
@@ -136,7 +137,20 @@ pub fn peekModelType(io: std.Io, allocator: std.mem.Allocator, model_dir: []cons
     // the pipeline identity lives in model_index.json's `_class_name`. Synthesize
     // the "mage_flow" marker so routing + the backend dispatch light up.
     if (isMageFlowRepo(io, allocator, model_dir)) return allocator.dupe(u8, "mage_flow") catch null;
+    // Same for an mflux FLUX.2 conversion with no config.json at all (the only
+    // MLX build of klein 9B). Identified by the DiT's own weight names, through
+    // the SAME predicate discovery uses — a private copy here is how `list` and
+    // the loader end up disagreeing about whether a dir is a model.
+    if (isMfluxFlux2Repo(io, allocator, model_dir)) return allocator.dupe(u8, "flux2-klein") catch null;
     return null;
+}
+
+/// True when `model_dir` holds FLUX.2 DiT weights but no config.json to say so.
+/// Thin path→Dir wrapper over `model_discovery.peekMfluxFlux2`.
+fn isMfluxFlux2Repo(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) bool {
+    var dir = std.Io.Dir.openDirAbsolute(io, model_dir, .{}) catch return false;
+    defer dir.close(io);
+    return discovery.peekMfluxFlux2(io, allocator, dir);
 }
 
 /// Read `model_dir/config.json`'s `model_type` (owned dupe) or null on any
@@ -2858,6 +2872,33 @@ test "mage_flow detects from the official diffusers layout (model_index.json, no
     const mt = peekModelType(io, allocator, model_dir) orelse return error.TestExpectedResult;
     defer allocator.free(mt);
     try testing.expectEqualStrings("mage_flow", mt);
+    try testing.expectEqual(Modality.image, detectModality(io, allocator, model_dir).?);
+}
+
+test "flux2 detects from an mflux conversion with no root config.json" {
+    const allocator = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root_buf);
+    const root = root_buf[0..root_len];
+
+    // `mlx-community/flux2-klein-9b-4bit` — the only MLX build of klein 9B —
+    // ships no config.json, so routing has to recognize the DiT itself or the
+    // dir is unloadable. Delegates to the ONE predicate discovery uses, so the
+    // picker and the loader can never disagree about what this dir is.
+    try tmp.dir.createDirPath(io, "k9/transformer");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "k9/transformer/model.safetensors.index.json",
+        .data = "{\"weight_map\":{\"double_stream_modulation_img.linear.weight\":\"0.safetensors\"}}",
+    });
+    const model_dir = try std.fs.path.join(allocator, &.{ root, "k9" });
+    defer allocator.free(model_dir);
+
+    const mt = peekModelType(io, allocator, model_dir) orelse return error.TestExpectedResult;
+    defer allocator.free(mt);
+    try testing.expectEqualStrings("flux2-klein", mt);
     try testing.expectEqual(Modality.image, detectModality(io, allocator, model_dir).?);
 }
 

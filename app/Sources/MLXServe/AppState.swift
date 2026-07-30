@@ -23,20 +23,15 @@ class AppState: ObservableObject {
         didSet {
             UserDefaults.standard.set(selectedModelPath, forKey: "selectedModelPath")
             guard oldValue != selectedModelPath, !selectedModelPath.isEmpty else { return }
-            // Drafter auto-sync: a drafter is paired to a specific Gemma 4
-            // size (E2B / E4B / 31B / 26B-A4B). Switching the base model
-            // without swapping the drafter to match crashes the server with
-            // `DrafterTargetMismatch`. If the user already had a drafter on,
-            // try to find the matching one for the new model — fall back to
-            // clearing it (auto-disable) when no match is on disk or the new
-            // model isn't Gemma 4.
-            if !serverOptions.drafterPath.isEmpty {
-                if let match = downloads.recommendedDrafterFromPath(selectedModelPath) {
-                    serverOptions.drafterPath = match.url.path
-                } else {
-                    serverOptions.drafterPath = ""
-                }
-            }
+            // Drafter pairing: a drafter is paired to a specific Gemma 4 size,
+            // and carrying the wrong one over crashes the server with
+            // `DrafterTargetMismatch` — so every model change re-decides from
+            // scratch (`DrafterPairing.decide`). It pairs a dense Gemma 4 with
+            // the drafter that came down with it whether or not one was on
+            // before: the checkpoint is a dependency of the model now, not
+            // something the user went shopping for. `drafterOptOut` is what
+            // makes an explicit off stick.
+            syncDrafterPairing()
             // Plan 05 Phase G — when hot-switch is enabled AND the server is
             // already running, ask the server to load the new model in-place
             // instead of restarting. Falls back to restart on failure (404
@@ -46,7 +41,11 @@ class AppState: ObservableObject {
             if (server.status == .running || server.status == .starting) {
                 if hotSwitchEnabled, server.status == .running {
                     let id = (selectedModelPath as NSString).lastPathComponent
-                    let drafterPath: String? = downloads.recommendedDrafterFromPath(selectedModelPath)?.url.path
+                    // The decision `syncDrafterPairing()` just made, not a
+                    // second read of the disk: a hot-switch that ignores the
+                    // user's off switch loads a drafter the restart path
+                    // wouldn't, and only one of the two would be reproducible.
+                    let drafterPath: String? = serverOptions.drafterPath.isEmpty ? nil : serverOptions.drafterPath
                     let mgr = server
                     // Tracked so `useModelAndAwaitReady` can await this exact
                     // switch — hot-switch never moves `server.status` off
@@ -382,6 +381,37 @@ class AppState: ObservableObject {
         let repaired = reconciledModelSelection(current: selectedModelPath,
                                                 pickablePaths: baseModels.map(\.path))
         if repaired != selectedModelPath { selectedModelPath = repaired }
+        adoptNewlyAvailableDrafter()
+    }
+
+    // MARK: - Drafter pairing
+
+    /// Re-decide the drafter for the selected model. Called on every model
+    /// change — it both pairs and UNPAIRS, because a drafter carried onto the
+    /// wrong Gemma 4 size is `DrafterTargetMismatch` at server start.
+    private func syncDrafterPairing() {
+        let paired = DrafterPairing.decide(
+            modelPath: selectedModelPath,
+            optedOut: serverOptions.drafterOptOut,
+            onDiskPath: downloads.recommendedDrafterFromPath(selectedModelPath)?.url.path)
+        if serverOptions.drafterPath != paired { serverOptions.drafterPath = paired }
+    }
+
+    /// The model list changed (a download landed): fill in a pairing that
+    /// wasn't possible a moment ago — downloading a Gemma 4 fetches its drafter
+    /// too, and it finishes after the model is already selected.
+    ///
+    /// Only ever ADDS. Clearing belongs to the model switch: this runs on every
+    /// refresh (1 Hz while a download is in flight), and a user who deliberately
+    /// switched a drafter on where we don't recommend one — the MoE caution in
+    /// Settings — must not have a background rescan take it away.
+    private func adoptNewlyAvailableDrafter() {
+        guard serverOptions.drafterPath.isEmpty, !serverOptions.drafterOptOut else { return }
+        let paired = DrafterPairing.decide(
+            modelPath: selectedModelPath,
+            optedOut: false,
+            onDiskPath: downloads.recommendedDrafterFromPath(selectedModelPath)?.url.path)
+        if !paired.isEmpty { serverOptions.drafterPath = paired }
     }
 
     /// What `useModelAndAwaitReady` must do once `selectedModelPath`'s

@@ -748,3 +748,469 @@ unpipelined step function.
   `cfg.layerNumHeads(li)` — Laguna runs 48 heads on full-attention layers and 72 on sliding
   ones, so the global form declined 30 of 40 layers and silently under-reported the
   ladder's bytes by 5x (85 GB/s instead of 412).
+
+## Fusing decode dispatches: only the critical path pays (2026-07-29)
+
+Round on top of the 26.7.12 tree, on Laguna XS 2.1 NVFP4 (M4 Max, 20 GB checkpoint,
+`tests/fwd_ubench.sh`, 20 decode-width forwards per boot, paired per boot).
+
+### Pricing a dispatch: `MLX_SERVE_DISPATCH_PROBE=N`
+
+Before writing any fusion, the probe injects N extra elementwise kernels per MoE layer
+inside `moeMLP2` — a multiply by an exact 1.0, which is output-identical for every finite
+value and, crucially, FEEDS the expert path so MLX cannot elide it. That is what makes it
+sound where the obvious "run the component twice and read the marginal cost" is not: it is
+pure (no KV writes) and observable (the result is consumed).
+
+    probe   0        4        8
+    run A   13.083   13.371   13.630 ms/forward
+    run B   13.131   13.305   13.657
+
+Slope ≈ 0.067 ms per dispatch-per-layer, i.e. **~1.5–1.7 us per GPU dispatch** at 40
+layers. Handy, and misleading if used alone — see the null result below.
+
+### What that price does NOT buy: the attention output gate
+
+Laguna's per-head `softplus(g_proj(x))` gate is four dispatches a layer (cast to f32,
+logaddexp, cast back, broadcast multiply). `fusedAttnGate` replaces all four with one
+kernel that is bit-identical to the chain (MLX's `LogAddExp` text, same rounding points,
+pinned by test). By the probe slope that is worth ~0.2 ms. Measured, three pairs:
+
+    off  13.112  13.098  13.030
+    on   13.117  13.116  13.160
+
+Nothing — slightly negative. **The gate chain does not sit on the critical path**: it
+depends only on the layer input, so the GPU already overlaps it with the q/k/v projections
+and SDPA, and deleting overlapped work buys zero wall clock. The probe measures dispatches
+inserted INTO the dependency chain, so its slope is an upper bound that only materialises
+for fusions that actually shorten that chain. Ships default OFF
+(`MLX_SERVE_ATTN_GATE_FUSED=1` opts in).
+
+A first version of the same kernel was worse still (+2.3%): it staged the per-head gate in
+threadgroup memory and had ONE 256-thread group walk all 6144 activations of a row. At
+decode that is a single GPU core doing what the elementwise multiply it replaced spread
+over the whole device. Recomputing softplus once per element — 10 ALU ops on a cached
+value — and shaping the launch as one thread per output element got it back to neutral.
+A fused kernel inherits the parallel shape you give it, not the one the ops had.
+
+### What it does buy: the MoE router, and the SwiGLU
+
+Both sit on the chain (router → expert gather; gate/up → activation → down_proj), and both
+paid, byte-identical, on three consecutive pairs each:
+
+    MLX_SERVE_MOE_ROUTER_FUSED   off 13.315 13.322 13.411 | on 13.113 12.934 13.395
+    MLX_SERVE_SWIGLU_FUSED       off 13.204 13.106 13.180 | on 13.012 12.974 12.978
+
+Together, position-balanced across six pairs in both orders, medians 13.418 → 13.061,
+**−2.7%**, with `/v1/chat/completions` at temp 0 byte-identical over 260 tokens on Laguna
+XS, gemma4-26B-A4B (the softmax router arm) and dense Qwen3.6-27B (the SwiGLU arm).
+
+### Reproducing MLX's arithmetic is not the same as reproducing MLX's formula
+
+The router kernel's first version computed "the same" softmax in one clean f32 pass. It
+diverged from the chain on gemma4-26B-A4B at token ~80 — the known INT4 near-tie argmax
+class, triggered by an avoidable numerical change. Making it bit-equal took three separate
+corrections, each found by asserting BIT equality with the chain in a unit test:
+
+1. **`fast::exp`, and a multiply by the RECIPROCAL.** `softmax_single_row` divides once,
+   into a reciprocal, and uses `fast::exp` (its own comment says softmax does not need the
+   precise one). Both matter after the rounding to bf16.
+2. **The reduction TREE, not just the reduction.** MLX launches `ceil(E/4)` threads, each
+   summing four CONSECUTIVE elements in order, then one `simd_sum` per simdgroup, then a
+   final `simd_sum` over the per-simdgroup partials in lanes 0..S-1 with zeros above.
+   A strided-by-32 sum over the same 256 values is a different float and was 1 ulp off.
+   The kernel emulates those virtual threads 32 at a time so the butterfly is identical.
+3. **`sum` over the top-K accumulates in the INPUT's dtype.** `reduce.metal` instantiates
+   bfloat16 sums as `(bfloat16_t, bfloat16_t)` — U is bf16, not f32 — and `row_reduce_small`
+   gives an 8-wide row to ONE thread, folding it in ascending order. A simd butterfly in
+   f32 over the same eight probabilities is off by 2 ulps.
+
+Same discipline for the sigmoid arm: MLX's `Sigmoid` is the two-sided
+`y = 1/(1+exp(|x|)); (x<0) ? y : 1-y`, not `1/(1+exp(-x))`, and the hy3 chain casts to f32
+FIRST so that arm is genuinely f32.
+
+### A JIT custom kernel and MLX's metallib do not agree on transcendentals
+
+The fused SwiGLU replaces `sigmoid + multiply + multiply`. Writing MLX's `Sigmoid` source
+verbatim, on the same `T`, still diverged live at token ~55 while a random-sampling unit
+test said bit-identical. Cause: MLX's kernels ship in a metallib built with one Metal math
+mode; `metal_kernel` JITs custom sources with `CompileOptions{math_mode = Safe}` and mlx-c
+exposes no way to ask for another. So `1 / (1 + exp(|x|))` lands a rounding apart.
+
+An exhaustive sweep of all 65536 bf16 patterns found it on **exactly one** value
+(-6.84375, ref -0.0072631836 vs -0.0073242188). One in 65536 sounds unreachable; an
+8192-wide MLP draws 8192 values from that domain every layer, so a 260-token greedy run
+hits it in the first few dozen tokens. **A 16-bit activation has only 65536 possible
+inputs — sweep them all instead of sampling.** Random values over `[-5, 5]` plus a few
+extremes passed every time.
+
+The fix removes the transcendental instead of chasing it: `mlx_sigmoid` is evaluated over
+every 16-bit pattern once at first use and the kernel indexes the result by the input's
+bit pattern (`swigluSigTable`, 128 KB resident, built with MLX's own op so it is exact by
+construction). The two multiplies need no such care — a bf16/f16 product is exact in
+float, so one rounding is one rounding on any compiler. f32 is DECLINED outright rather
+than shipped exact-for-some-dtypes.
+
+Also rejected on the way: extending `mlx_compile` to the silu arm of `compileGeglu`. It is
+one line, gets the same 2.4%, and is NOT output-preserving — a same-binary greedy A/B
+diverged at token ~55. mlx_compile's elementwise fusion does not reproduce the chain's
+intermediate rounding.
+
+### Two other numbers from the round
+
+- **`gatherQmv` rebuilds its `mlx_fast_metal_kernel_config` on every call** — 3 per MoE
+  layer, ~10 FFI calls each — which shows up as `ops/forward` 3226 vs 2329 and **+0.4 ms
+  of CPU graph build per token**. Its GPU eval is 12.73 ms against stock `gather_qmm`'s
+  12.47, so it loses on both counts today, but roughly 60% of the gap it is charged is
+  host-side config construction, not kernel time. The new kernels cache their config keyed
+  by geometry; anything reaching for `metal_kernel` in a per-layer loop should.
+- **Layer-cap refit on the fixed tree** (`MLX_SERVE_LAYER_CAP`, N = 10/20/30/40 →
+  4.345/7.293/9.779/12.743 ms GPU): Laguna XS is linear at **0.280 ms/layer + 1.55 ms
+  fixed**, and ~0.72 ms of that fixed part is lm_head. The rest is the probe's own
+  per-forward `mlx_array_eval` sync, which a real decode loop pipelines away.
+
+## The MoE expert path: fusing gate+up flipped a losing kernel into the default (2026-07-29)
+
+Second half of the same round. The expert path was the biggest addressable block left —
+Laguna XS reads ~630 MB of expert weights per token and was doing it at roughly 175 GB/s
+against 412 GB/s for the dense attention projections in the same forward.
+
+### The kernel was never the problem; the SHAPE of the work was
+
+`gatherQmv` (our in-place gather-qmv, which reads the expert bank without materialising
+the top-K) had been demoted earlier in 26.7.12 because it lost to stock `gather_qmm`. Two
+separate things were being charged to it:
+
+- **+0.4 ms per token of CPU graph build.** It rebuilt its `mlx_fast_metal_kernel_config`
+  on every call — three calls per MoE layer, ~10 FFI calls each — which shows up as
+  `ops/forward` 3226 vs 2329. That is roughly 60% of the margin it was losing by, and none
+  of it is kernel time. Now cached, keyed by geometry.
+- **Three dispatches where one would do.** gate gather -> up gather -> activation, all
+  strictly serial into `down_proj`.
+
+`gatherQmvGateUp` computes BOTH dot products in the same simdgroup — the x element loaded
+for the gate FMA is reused for the up FMA, the two dequant chains interleave instead of
+running as separate launches, and the SwiGLU is applied before the write. It halves the
+simdgroup count rather than the work (4096 over 40 cores was ~100 per core, so there was
+occupancy to spend on ILP).
+
+    Laguna XS, ms/forward     stock 13.007 / 13.568   fused-qmv 12.768 / 13.114
+    (GPU eval)                      12.136 / 12.569             11.854 / 12.051
+
+That is the same kernel family that lost by 2% before the fusion winning by 2-3% after.
+
+### The predicate is "would the fused kernel engage", not a model_type list
+
+Split `gatherQmv` lost on Laguna AND on gemma4-26B-A4B, so no arch opted in. Rather than
+add laguna back to a list, `useGatherQmvDecode` gates on exactly the conditions the fused
+kernel needs — silu activation (it is baked into the kernel) and matching quant geometry
+on gate and up. gemma4's gelu MoE therefore keeps stock gather and cannot regress, with no
+arch name anywhere in the predicate. Validated on the two archs the predicate newly opts
+in:
+
+    Qwen3.6-35B-A3B (qwen3_5_moe, affine 4-bit gs64)
+      GPU eval  stock 7.489 / 7.558   fused 7.390 / 7.306     (total: neutral to -1.6%)
+
+Not bit-identical to stock `gather_qmm` — that is the sanctioned qmv-vs-qmm reduction-order
+class, and the evidence chain is transitive: a new test pins fused == split `gatherQmv`
+bit-for-bit, and the existing tests pin split `gatherQmv` no-worse-than-stock against fp32
+dequant ground truth. Coherence spot-checked live on Qwen3.6-35B-A3B.
+
+### Cumulative, measured properly
+
+Laguna XS decode forward, whole round in ONE window, four pairs alternating which arm
+boots first:
+
+    base  13.331  13.348  13.204  13.344   median 13.338
+    new   12.823  12.787  12.762  12.778   median 12.783   = -4.2%
+
+All four pairs favour the new tree and each arm's spread is under 0.5%.
+
+An earlier write-up of this round quoted **-5.8%**, obtained by chaining a baseline median
+from the morning's window to a post-change median from the afternoon's. That is the trap
+this very file warns about one section up, committed while documenting the round that
+found it. A cumulative figure has to come from one window with both arms interleaved, or
+it is arithmetic on two different machines. The per-lever numbers were each paired inside
+one window and are unaffected.
+
+
+## A second null: fused residual + RMSNorm (2026-07-29)
+
+mlxfast item 5's norm tail. `h = h + branch; normed = rms_norm(h, w)` is two dispatches and,
+unlike the attention gate, they really are on the critical path — so by the round's first
+rule it should have paid. It did not: six pairs in both orders (on a machine under other
+GPU load, so read the RATIO only) gave ON median 14.890 vs OFF 14.747 ms/forward, 4 of 6
+pairs favouring OFF. Ships DEFAULT OFF, `MLX_SERVE_ADD_RMSNORM_FUSED=1` opts in; the
+kernel is bit-identical to `mlx_add` + `mlx_fast_rms_norm` (all four widths x both dtypes,
+including the ragged tail and a non-power-of-2 axis) and stays for future use.
+
+The reason completes the rule. **Being on the critical path is necessary, not sufficient —
+the fusion also has to remove real work.** Here it barely does: `add` is 2 reads + 1 write
+of a 4 KB row, `rms_norm` is 1 read + 1 write, and the fused kernel still needs 2 reads +
+2 writes because the residual sum is required downstream and must be emitted as a second
+output. Net saving: one 4 KB read, in exchange for replacing MLX's metallib-compiled
+`rms_single_row` with a JIT copy compiled under a different math mode.
+
+Contrast the three that paid, each of which replaced something substantial rather than a
+launch: the router killed a 256-wide `argpartition` sort, the SwiGLU killed a three-op
+activation chain, and `gatherQmvGateUp` merged two whole GEMV passes over the expert bank.
+
+The port also has a reusable piece: replicating `rms_single_row` exactly means keeping
+MLX's launch geometry (ceil(axis/4) threads, four CONSECUTIVE elements each, `simd_sum` per
+simdgroup, a zero-initialised `local_sums` plane, one final `simd_sum` over the partials)
+so the reduction is the same TREE, plus `metal::precise::rsqrt` — upstream uses the precise
+variant precisely so this is reproducible. Anything past `RMS_LOOPED_LIMIT` (4096) switches
+MLX to a differently-shaped kernel and is declined rather than guessed at.
+
+## Item 1, fused QKV: a null at BOTH widths, and two layout traps on the way (2026-07-29)
+
+mlxfast item 1, and the one the handoff doc guessed our prefill gap was. Implemented as a
+WEIGHT-LAYOUT fusion rather than a kernel: concatenate q/k/v along their output axis at
+first use, one matmul, three slices (`buildFusedQkv` / `sliceQkvPart`,
+`MLX_SERVE_FUSED_QKV=1`). The norm half of `lagunaFusedNormQKVProjection` was deliberately
+left out — `fusedAddRmsNorm` had already shown that a 4 KB norm is not real work next to a
+33 MB weight read.
+
+**Decode** (Laguna XS, four pairs, both orders): on 12.924 / 12.890 / 12.733 / 12.669
+against off 12.750 / 12.979 / 13.023 / 12.808 — medians 12.812 vs 12.879, one pair
+favouring off and three favouring on, all inside each arm's own spread. **Prefill**
+(`tests/prefill_ab.sh`, ~7 900-token prompts, server-reported `prompt_ms`, nonce-defeated
+cache): on 8856 / 8993 / 9401 / 9157 / 9481 / 9202, off 9373 / 9773 / 9678 / 8866 / 8909 /
+9128 — the two blocks CONTRADICT each other (on wins 4% in the first, off wins 3% in the
+second). Both null.
+
+Decode is the attention-gate story again: q, k and v are independent, so the GPU was
+already overlapping their launches. Prefill is the more interesting miss — the "one pass
+over x instead of three" argument is real (32 MB read once instead of three times) but at
+M≈7900 each projection is already a compute-saturating GEMM, so the saved activation reads
+hide behind the math. Ships opt-in, and it would stay opt-in even if it had won: the
+concatenated copy is ADDITIVE (the originals stay live for other paths), +33.6 MB per layer
+= ~1.34 GB on Laguna XS.
+
+### Trap 1: concatenating pre-transposed weights silently changes which kernel runs
+
+Dense weights are lazy TRANSPOSE VIEWS of row-major `[out, in]` buffers
+(`maybeTransposeForBf16`), and mlx's matmul recognises that and dispatches the gemv that
+walks each output's row contiguously. Concatenating the VIEWS on axis 1 and materialising
+produces a genuinely row-major `[in, out_total]` matrix — a different kernel with a
+different accumulation order. It passed a small unit test and diverged on the live model at
+byte 164 of a 260-token greedy run. The fix is to transpose each back to `[out, in]`, join
+on the OUTPUT axis, materialise, and hand back a transposed view of THAT: row j of the
+joined buffer is then byte-identical to row j of the original and the same kernel reads it.
+Divergence moved from byte 164 to byte 695.
+
+### Trap 2: same layout is still not bit-identical, because mlx picks kernels by SHAPE
+
+Even with the layout right it still diverges eventually — the concatenated output is 8192
+wide where q alone was 6144, and mlx's gemv heuristics (split-K and tiling) key on that, so
+the reduction order can change. This is the sanctioned qmv-vs-qmm class, not a bug, but it
+means **a weight-layout fusion cannot be assumed output-preserving just because the maths
+is identical.** Prove it per shape or treat it as a numerics change.
+
+### And the test that should have caught trap 1
+
+The first unit test used a 256-wide contraction dim and passed both traps. Over 256 terms
+the two accumulation orders happened to agree in bf16; at 2048 they do not. A parity test
+for a reduction-order bug needs a contraction dim in the same ballpark as the real one —
+small shapes make the bug invisible, not smaller.
+
+## Decode-only dense-attention requant (`--decode-attn-quant`, 2026-07-29)
+
+Ported from the mlxfast-challenge tree's biggest single lever (their "native affine"
+DARKBLOOM_NATIVE_AFFINE_QKV / _OPROJ stack, which took their frontier from ~1.12 to
+~1.385 in two days of band-limited ratchets). The observation: Laguna ships BF16
+attention over NVFP4 experts, and at decode the four attention projections are ~3 GB of
+a ~4 GB per-token weight read. An INT8 group-32 affine side copy halves that traffic.
+
+Implementation (`transformer.zig`): `attnDqFor` builds the side copy lazily on the first
+eligible dispatch, keyed by the weight's ctx pointer (a probed-ineligible weight caches
+its refusal); `buildAttnDqCopy` transposes the loaded [in, out] dense weight back to
+[out, in], materialises, quantizes int8 g32 affine, and evals eagerly so the build never
+rides a token's graph. The dispatch hook is `attnProj`, called from `lagunaAttnWith` and
+`gatedFullAttnWith` with `batch == 1 and !is_prefill`.
+
+Measured (Laguna XS, fwd_ubench, 3 pairs alternating boot order): 13.285 -> 10.205
+ms/forward median, -23.2%, all pairs in both orders. Quality characterization: six greedy
+code/reasoning prompts on/off — two byte-identical, four diverged in WORDING while
+reaching the same correct answers (the quantized arm's Zig snippet was the more correct
+of the two). Shipped default ON per that characterization; `--no-decode-attn-quant`,
+the app Settings toggle, or `MLX_SERVE_DECODE_ATTN_QUANT=0` restore exact dense decode.
+
+The three load-bearing subtleties:
+
+1. **Spec-verify must see the SAME weights as decode.** The gate is `!is_prefill`, not
+   `seq_len == 1`: a verify forward that read the dense weights would score drafts
+   against a different distribution than the decode steps that produced them, making
+   PLD-on vs PLD-off diverge at temp 0 (the spec-equivalence invariant). With verify
+   quantized too, draft/verify/AR are all consistent and prefill stays the exact anchor.
+2. **Prefill stays dense deliberately.** It is compute-bound (no perf win available) and
+   it writes the KV that the whole conversation attends to — keeping it exact bounds the
+   compounding. Decode-written KV positions do carry the perturbation, which also means
+   a disk-cache entry written by an ON boot restored into an OFF boot differs from what
+   that boot would compute — same order of effect as the int8 step itself, noted not tagged.
+3. **The side copies are additive memory** (~9/16 of the dense attention bytes; ~1.7 GB
+   on Laguna XS) and live until the model unloads.
+
+Not attempted yet from the mlxfast stack: their NVFP4-g16 tail-layer variant (layers >=32
+of 40 quantize to 4-bit — per-layer amplification is ~15x lower late; worth another ~6% of
+the token if the band holds) and o_proj/QKV single-layer depth probes. The toggle name
+stays format-agnostic so those can land behind it.
+
+## Fused decode QK-norm+RoPE (2026-07-29, mlxfast 9e06de6 class)
+
+At decode the q/k chain (reshape → per-head RMSNorm → transpose → RoPE → YaRN mscale on
+full layers) is strictly serial ahead of SDPA — nothing overlaps it — and costs 4-6
+dispatches per layer for a few KB of work. `fusedQkNormRope` does q AND k in one
+32-thread-per-head dispatch. mlxfast promoted the same fusion at +1.73%, their largest
+single bit-exact win, AFTER first rejecting it at -0.19% — the regression was one
+redundant `threadgroup` broadcast + barrier for a value `simd_sum` already hands every
+lane; our kernel never had the barrier.
+
+The three things that made it bit-identical (pinned by the `qk norm rope fused` tests,
+max_diff exactly 0.0 across offsets and both laguna geometries):
+
+1. **cos/sin extracted, never re-derived**: a [1,1,1,rd] f32 probe (ones | zeros) through
+   the stock `mlx_fast_rope` at the token's offset rotates to exactly [cos | sin] — the
+   same floats the composed kernel uses, because the angle math inside rope is float
+   regardless of tensor dtype. Cached per rope family per offset (`qkAngleFor`): 2 probe
+   dispatches per token replace ~160 removed ones.
+2. **Every rounding boundary spelled**: RMS mirrors `rms_single_row` at axis 128 (lane
+   owns 4 contiguous elements, f32 squares in index order, one simd_sum,
+   `precise::rsqrt`), the `T(x*inv)` rounding inside the w-multiply is the value the
+   separate kernel writes, rotation is f32 with one T rounding, and mscale is a SEPARATE
+   bf16 multiply after it (matching the shipped post-rope broadcast, 1.0 on the tail).
+3. **The one bug found by the parity test**: the second-half rotation is
+   `x1*sin + x2*cos` where x2 is the lane's OWN element — writing the naively-symmetric
+   `partner*cos + own*sin` passes at offset 0 (identity rotation) and fails everywhere
+   else. A host-side reconstruction from the probe angles (6e-8 max) localized it to the
+   kernel in one step.
+
+Measured: the eval-per-step fwd_ubench read the fusion +1.2% SLOWER; the LIVE paired A/B
+(real generations, server timings, 2 pairs both orders) reads 8.94 -> 8.80 ms/tok, -1.6%,
+tight spreads. Ship decisions come from the live number (the µbench forces a sync per
+forward, which un-hides exactly the latency this fusion removes). Default ON for laguna;
+`MLX_SERVE_QK_NORM_ROPE_FUSED=0` restores the composed chain. The qwen/gemma wiring
+(gatedFullAttnWith / gemma4MoeAttnWith — every QK-norm arch has this chain) is the
+documented next step; gemma's head_dim 256 needs a different lane mapping.
+
+## Round 4 (2026-07-29): the remaining mlxfast levers — two ship, one is a µbench-vs-live scalp, one dissolves on contact with the checkpoints
+
+Fourth mining pass over the mlxfast-challenge tree, executing the "next round" list from
+`docs/perf-next-levers.md`. Outcomes, in the order attempted:
+
+### Certified lm_head prune: kernels sound, argmax provable, LIVE NULL — ships opt-in
+
+Port of `LagunaLmHeadPrune.swift` (notes/68): an init-time MXFP8-g32 copy of the dense
+bf16 lm_head (half the bytes), one coarse GEMV emitting per-row coarse logit + a
+CERTIFIED bound (half-ulp e4m3 cells + a 2^-15 rounding allowance, top cell 186) + a bf16
+pre-fill; a dense one-byte candidate mask (`coarse+delta >= max(coarse-delta) - |L|/64`);
+an exact pass whose per-row arithmetic textually replicates the stock
+`gemv_bfloat16_bm8_bn1_sm1_sn32_tm4_tn4_nc0_axpby0` (verified to be what MLX dispatches
+for this matvec) so every candidate row is bit-identical to the stock GEMV. Every
+argmax-reachable row is provably a candidate; every non-candidate is provably below the
+winner; the emitted token is the stock token.
+
+Three lessons:
+
+1. **The gate is REQUEST-level and must be known at init.** The pruned row is exact
+   at candidates and coarse elsewhere — enough for an argmax, not for a tail
+   distribution. `ForwardCtx.argmax_only` is set by the Generator (greedy or top-1, no
+   penalties, no logprobs, no grammar), and logprobs had to move into `InitOptions`:
+   the split-prefill final-token forward is a single-row dispatch that runs BEFORE any
+   post-init `gen.logprobs_n = n` write, so a logprobs request would have had its first
+   token's logprobs computed from a pruned row.
+2. **A hermetic parity test cannot see reduction order at this scale.** A deliberate
+   perturbation of the exact kernel's accumulation order (grouped instead of sequential)
+   STILL passed the bit-equality test: an f32 last-ulp difference almost always vanishes
+   in the final bf16 cast, and catching one empirically needs ~hundreds of thousands of
+   casts. The live >=160-token greedy on/off run (16M casts) is the real bit-identity
+   bar — same lesson as round 3's fused-QKV divergence at byte 164.
+3. **The µbench-vs-live class, third instance, with the strongest live design yet.**
+   µbench at the real [100352, 2048] geometry, with a separated-winner weight matrix
+   reproducing the LIVE candidate regime (median ~19 of 100352 candidates, measured by
+   `MLX_SERVE_LMHEAD_PRUNE_TRACE=1`): dense 1.04 -> pruned 0.63 ms/iter, a ~0.4 ms/token
+   saving. Live: an INTERLEAVED same-boot A/B — the gate is per-request, and
+   `presence_penalty: 1e-9` clears `argmax_only` while the lazy greedy sampler never
+   applies penalties, so the dense arm is byte-identical work in the SAME boot,
+   alternating per generation, and thermal drift cancels per pair. 20 rounds: median
+   +0.84% per pair, 3/20 wins; the on-arm's early −1.8% advantage decays within a few
+   generations while the off arm stays flat. The µbench saving does not survive the
+   live graph, and the boot-level A/B that "showed" −1.3%/+1.6% was just drift. Where
+   the ~0.5 ms goes live remains unattributed (candidates stay tiny all boot — traced;
+   the threshold chain and select are flat in the stage bisection; the exact pass with
+   a zero mask costs ~0.02 ms net). Shipped `MLX_SERVE_LMHEAD_PRUNE=1` opt-in with the
+   trace + µbench left in place for whoever picks it up.
+
+### MoE down-path tail fusion: −1.5%, bit-identical, default ON
+
+`gatherQmvDownReduce`: the decode expert tail ran down-gather -> score multiply -> sum
+over K as three serial dispatches with a [K, hidden] intermediate between them. One
+kernel now does all three: each simdgroup owns a top-K slot and computes 4 output rows
+(mlxfast tuned 1-vs-4 rows per simd; 4 won), parks bf16 row values in threadgroup
+memory, and slot 0 finishes with the composed pair's exact semantics.
+
+Bit-identity came from two replications, not one:
+- the per-row dot is the SAME `GQMV_BODY_*` text `gatherQmv` compiles (same lane-strided
+  pack loop, same 4-accumulator split, same `simd_sum((a0+a1)+(a2+a3))`, same 2^22 nvfp4
+  fold, same `T(acc)` rounding), so per-(slot,row) values match by construction;
+- the reduction replicates `mlx_multiply` + `mlx_sum_axis(-2)`: per-slot product rounded
+  to T, then an ascending T accumulate — MLX's bf16 sum reduction accumulates in the
+  INPUT dtype (the moeRouterTopK lesson generalizes from row_reduce to this col reduce).
+  The parity test runs BOTH a small geometry and the real [1,1,8,2048] because MLX picks
+  its reduce kernel by shape; both are max_diff 0.0 exactly, nvfp4 AND affine.
+
+Declines are the kernel's own conditions, incl. scores dtype == activation dtype (a
+mismatch would make the composed pair promote to f32 — replicating that would mean an
+f32 tail, so it falls back instead). Live paired A/B on Laguna XS: 8.58 vs 8.71 and
+8.56 vs 8.70 ms/tok, −1.45%/−1.53%, on-arm wins both pairs both orders. Greedy 200-token
+on/off byte-identical. `MLX_SERVE_MOE_DOWN_REDUCE_FUSED=0`.
+
+The reference's shared-expert + residual absorption (their 9th simdgroup) was NOT
+ported: our shared-expert down runs through stock qmv, and absorbing it bit-identically
+means replicating THAT kernel too; the residual+RMS+router fold
+(`DARKBLOOM_FUSED_RESIDUAL_RMS_ROUTER`) was likewise deferred — two more stock-kernel
+replicas for an upper bound of ~0.1–0.2 ms of mostly launch latency, in the same family
+as two measured nulls (fusedAttnGate, fusedAddRmsNorm).
+
+### QK-norm+RoPE for "qwen archs": the checkpoints say no
+
+The port itself was small: rd=32 support in the shipped kernel (the qwen3.5/3.6
+partial-rotary width; the `lane ^ (half_rd/4)` shuffle mapping is exact for 32/64/128),
+wiring into `gatedFullAttnWith` after the `attn_output_gate` split (the strided q view
+rides `ensure_row_contiguous` — parity-pinned including that exact case), M-RoPE decode
+handled via the offset+delta the probe row reproduces exactly. All 4 parity tests are
+max_diff 0.0.
+
+Then the engagement check: SILENT. Every qwen3.5/3.6 checkpoint on disk — 2B, 9B, 27B,
+35B — is **head_dim 256**, not 128. The "hd 128 fits as-is" line in the handoff doc was
+written from the arch family's reputation, not the checkpoints. qwen sits in gemma4's
+needs-a-new-lane-mapping bucket, and the only hd-128 QK-norm models here are the lagunas
+(already fused). The wiring ships dormant (declines at hd != 128, verified byte-identical
+composed-path behaviour on the 2B and the real 27B MoE+MTP stack), and will engage
+unchanged on a future hd-128 arch.
+
+### NVFP4-g16 tail for --decode-attn-quant: −3.3% more, quality holds, default ON
+
+mlxfast quantizes attention layers >= 32 of 40 to real nvfp4 (late-layer quantization
+amplification ~15x lower than early layers). Ours: `attnDqFor` threads the layer,
+`attnDqUseNvfp4` puts the boundary at 80% of `num_hidden_layers`
+(`MLX_SERVE_DECODE_ATTN_QUANT_NVFP4_FROM=<n>` moves it, `off` restores int8-only), and
+`AttnDqCopy` carries its own (bits, group_size, mode) so the dispatch reads the copy's
+geometry — a tail nvfp4 copy and a body int8 copy ride the same `qmatmulBits` call.
+`buildAttnDqCopy` returns 2 parts for nvfp4 (no biases by construction; null-ctx handle,
+deinit guards it).
+
+Live paired A/B on Laguna XS (on top of the down+reduce fusion): 8.25 vs 8.52 and 8.26
+vs 8.55 ms/tok, −3.15%/−3.39%, 2/2 pairs. The mandatory 6-prompt greedy
+characterization (int8-only vs nvfp4-tail, temp 0, code + arithmetic + SQL + reasoning)
+re-run: all six answers identical in substance (53361, 50 km/h, correct IPv4/SQL/
+quicksort/binary-search), wording-level divergence only — the same class as the round-3
+int8 characterization, so the tail rides the existing default-ON lossy toggle.
+
+### Prefill sorted-MoE tail: already correct by construction
+
+The investigation item ("does our sorted prefill path pay a scatterUnsort-style full
+expert-bank copy?") closes with no change: our tail already does
+`take_axis(down_squeezed, inv_order)` — an ACTIVATIONS-only gather through the inverse
+permutation, which IS mlxfast's fix. The prefill fused gate+up bank (load-time weight
+concat, additive memory) remains open in `docs/perf-next-levers.md`.

@@ -525,3 +525,125 @@ pub fn check(ret: c_int) !void {
     _ = op_count.fetchAdd(1, .monotonic);
     if (ret != 0) return error.MlxError;
 }
+
+// ---------------------------------------------------------------------------
+// Wired-residency policy (mlxfast notes/47 class).
+//
+// MLX's Metal residency set has a capacity set by `mlx_set_wired_limit`. Two
+// failure shapes bracket the useful setting:
+//  * capacity 0 (MLX default): nothing is wired, and the driver re-establishes
+//    residency for the whole RAM-resident model on every command buffer —
+//    measured upstream as 9-15 ms kernelStart gaps across a prefill.
+//  * capacity >> live bytes (our historical `max_recommended_working_set_size`):
+//    every transient allocation fits the residency set, so each alloc/evict
+//    issues a Metal commit() — per-allocation overhead on the decode path.
+// The `fit` policy wires the CURRENT live set with a small slack and no
+// headroom: weights migrate into the set in one resize commit, and every later
+// transient FAILS the fit test and stays on the commit-free unwired path.
+// Re-applied after every load/unload so the capacity tracks the live set.
+
+pub const WiredMode = enum {
+    off, // wire nothing (MLX default behavior)
+    max, // capacity = max_recommended_working_set_size (historical behavior)
+    fit, // capacity = live bytes + slack (zero headroom)
+
+    pub fn fromEnv(value: ?[]const u8) WiredMode {
+        const v = value orelse return .max;
+        if (std.mem.eql(u8, v, "off") or std.mem.eql(u8, v, "0")) return .off;
+        if (std.mem.eql(u8, v, "max")) return .max;
+        if (std.mem.eql(u8, v, "fit")) return .fit;
+        return .max;
+    }
+};
+
+/// Zero-headroom capacity for `fit` mode. `set_wired_limit` above the
+/// recommended working set is an uncatchable MLX error, so the target is
+/// clamped a margin under it; a dead device query or an empty live set
+/// declines (null) rather than wiring garbage.
+pub fn wiredFitTarget(active_bytes: usize, slack_bytes: usize, max_rec: usize) ?usize {
+    if (active_bytes == 0 or max_rec == 0) return null;
+    const margin = 256 << 20;
+    if (max_rec <= margin) return null;
+    const cap = max_rec - margin;
+    const target = active_bytes +| slack_bytes;
+    return @min(target, cap);
+}
+
+pub const WiredPolicyResult = struct { mode: WiredMode, target: ?usize };
+
+fn maxRecommendedWorkingSet() usize {
+    var dev = mlx_device{ .ctx = null };
+    _ = mlx_get_default_device(&dev);
+    var info = mlx_device_info_new();
+    defer _ = mlx_device_info_free(info);
+    if (mlx_device_info_get(&info, dev) != 0) return 0;
+    var max_rec: usize = 0;
+    if (mlx_device_info_get_size(&max_rec, info, "max_recommended_working_set_size") != 0) return 0;
+    return max_rec;
+}
+
+/// Apply the wired-residency policy. Call on the inference thread AFTER a
+/// model load or unload completes (and from the offline run path after load)
+/// so `fit` capacity tracks the live set. The caller logs the result.
+pub fn applyWiredPolicy() WiredPolicyResult {
+    const mode = WiredMode.fromEnv(if (std.c.getenv("MLX_SERVE_WIRED")) |p| std.mem.span(p) else null);
+    if (noGpuBackend()) return .{ .mode = mode, .target = null };
+    var prev: usize = 0;
+    switch (mode) {
+        .off => {
+            _ = mlx_set_wired_limit(&prev, 0);
+            return .{ .mode = mode, .target = 0 };
+        },
+        .max => {
+            const max_rec = maxRecommendedWorkingSet();
+            if (max_rec == 0) return .{ .mode = mode, .target = null };
+            _ = mlx_set_wired_limit(&prev, max_rec);
+            return .{ .mode = mode, .target = max_rec };
+        },
+        .fit => {
+            // Drop cached (free) buffers first so the resize walk wires only
+            // live weights and the capacity leaves no headroom for scratch.
+            _ = mlx_clear_cache();
+            const max_rec = maxRecommendedWorkingSet();
+            var active: usize = 0;
+            _ = mlx_get_active_memory(&active);
+            const slack_mb: usize = blk: {
+                const raw_c = std.c.getenv("MLX_SERVE_WIRED_SLACK_MB") orelse break :blk 64;
+                const raw = std.mem.span(raw_c);
+                break :blk std.fmt.parseInt(usize, raw, 10) catch 64;
+            };
+            const target = wiredFitTarget(active, slack_mb << 20, max_rec) orelse
+                return .{ .mode = mode, .target = null };
+            // Shrink-then-grow forces ResidencySet::resize to re-walk, pulling
+            // buffers allocated since the last apply out of the unwired set.
+            _ = mlx_set_wired_limit(&prev, 0);
+            _ = mlx_set_wired_limit(&prev, target);
+            return .{ .mode = mode, .target = target };
+        },
+    }
+}
+
+test "wired mode from env" {
+    const t = std.testing;
+    // Default (unset) is the historical behavior until the fit-policy A/B
+    // picks a winner; unknown values also take the default rather than
+    // silently wiring nothing.
+    try t.expectEqual(WiredMode.max, WiredMode.fromEnv(null));
+    try t.expectEqual(WiredMode.off, WiredMode.fromEnv("off"));
+    try t.expectEqual(WiredMode.off, WiredMode.fromEnv("0"));
+    try t.expectEqual(WiredMode.max, WiredMode.fromEnv("max"));
+    try t.expectEqual(WiredMode.fit, WiredMode.fromEnv("fit"));
+    try t.expectEqual(WiredMode.max, WiredMode.fromEnv("banana"));
+}
+
+test "wired fit target: zero headroom, clamped, declines empty" {
+    const t = std.testing;
+    const gb = 1 << 30;
+    // Normal: live + slack.
+    try t.expectEqual(@as(?usize, 10 * gb + (64 << 20)), wiredFitTarget(10 * gb, 64 << 20, 115 * gb));
+    // Live set near the ceiling clamps a margin under max_rec.
+    try t.expectEqual(@as(?usize, 115 * gb - (256 << 20)), wiredFitTarget(115 * gb, 64 << 20, 115 * gb));
+    // Nothing live / dead query: decline.
+    try t.expectEqual(@as(?usize, null), wiredFitTarget(0, 64 << 20, 115 * gb));
+    try t.expectEqual(@as(?usize, null), wiredFitTarget(10 * gb, 64 << 20, 0));
+}

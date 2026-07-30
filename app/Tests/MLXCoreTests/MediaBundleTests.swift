@@ -426,6 +426,46 @@ final class MediaBundleTests: XCTestCase {
         }
     }
 
+    /// The only MLX build of FLUX.2-klein 9B (`mlx-community/flux2-klein-9b-4bit`)
+    /// ships NO root config.json — same repo layout as the 4B minus that one
+    /// file. Requiring it as a ready marker is the Kokoro-vs-tts bug exactly:
+    /// a fully downloaded model that reads as permanently incomplete, so the
+    /// pane offers Download forever and Generate never enables.
+    func testKlein9BBundleDoesNotRequireARootConfigItNeverShips() {
+        let nine = ImageModelPreset.flux2Klein9B_Q4.bundle
+        XCTAssertEqual(nine.components.count, 1)
+        XCTAssertEqual(nine.primaryRepo, "mlx-community/flux2-klein-9b-4bit")
+        XCTAssertTrue(nine.components[0].selection.recursive)
+        XCTAssertFalse(nine.components[0].readyMarkers.contains("config.json"))
+        // The weight subdirs still have to be there — readiness stays real.
+        for marker in ["transformer", "vae", "text_encoder", "tokenizer"] {
+            XCTAssertTrue(nine.components[0].readyMarkers.contains(marker), "missing marker \(marker)")
+        }
+        // The 4B DOES ship one, and keeps checking for it.
+        XCTAssertTrue(ImageModelPreset.flux2Klein4B_Q4.bundle.components[0].readyMarkers.contains("config.json"))
+    }
+
+    /// 9B is a bigger klein, not a different backend: it goes through the same
+    /// FLUX engine, so it inherits the same capabilities — including reference
+    /// editing, which is what a klein is for.
+    func testKlein9BIsInTheCatalogWithFluxCapabilities() {
+        let nine = ImageModelPreset.flux2Klein9B_Q4
+        XCTAssertTrue(ImageModelPreset.all.contains(nine))
+        XCTAssertEqual(nine.variant, .flux2Klein9B)
+        XCTAssertTrue(nine.supportsReferenceEdit)
+        XCTAssertTrue(nine.supportsImg2Img)
+        XCTAssertTrue(nine.supportsLoRA)
+        XCTAssertFalse(nine.stepsAreFixed)
+        XCTAssertEqual(nine.condWeightCount, 3)   // FLUX concatenates 3 tapped encoder layers
+        // Catalog order is cheapest → heaviest; 9B is heavier than the 4B and
+        // lighter than Krea.
+        let ids = ImageModelPreset.all.map(\.id)
+        XCTAssertLessThan(ids.firstIndex(of: ImageModelPreset.flux2Klein4B_Q4.id)!,
+                          ids.firstIndex(of: nine.id)!)
+        XCTAssertLessThan(ids.firstIndex(of: nine.id)!,
+                          ids.firstIndex(of: ImageModelPreset.krea2Turbo.id)!)
+    }
+
     // MARK: - approxSizeLabel
 
     func testApproxSizeLabelRoundsWholeAtOneGBAndAbove() {

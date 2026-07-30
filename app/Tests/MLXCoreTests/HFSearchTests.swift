@@ -643,6 +643,23 @@ final class HFModelQuantGateTests: XCTestCase {
         // (downloaded) rows use — both must agree hy_v3 is supported.
         XCTAssertTrue(supportedModelTypes.contains("hy_v3"))
     }
+
+    func testLagunaIsSupportedArchitecture() {
+        // poolside Laguna S 2.1 (config.json model_type=laguna) is served by the
+        // MLX engine — Discover rows must not flag it "Unsupported architecture".
+        // Same class as hy_v3: the HF tag gate never learned the family. Tags
+        // verified live 2026-07-29: poolside/Laguna-S-2.1 carries
+        // ["laguna", "laguna-s-2.1", ...], the mlx-community oQ quants carry
+        // ["laguna", ...] — no gemma/qwen/llama prefix anywhere.
+        let m = mlx(id: "mlx-community/Laguna-S-2.1-oQ4e",
+                    tags: ["mlx", "safetensors", "laguna", "oq", "quantized", "moe",
+                           "text-generation", "conversational", "custom_code", "4-bit"])
+        XCTAssertTrue(m.isSupportedArchitecture,
+                      "laguna is served (supportedModelTypes + Zig supported_model_types) — the HF tag gate must accept it")
+        XCTAssertNil(m.incompatibleReason)
+        // Lockstep with the model_type gate the local (downloaded) rows use.
+        XCTAssertTrue(supportedModelTypes.contains("laguna"))
+    }
 }
 
 // MARK: - HFModel.quantization label parsing

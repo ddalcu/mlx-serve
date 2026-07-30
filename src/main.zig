@@ -129,6 +129,21 @@ fn printUsage(io: std.Io) void {
         \\                        a MoE checkpoint that ships a sidecar is
         \\                        otherwise reachable only via `enable_mtp:true`
         \\                        in the request body.
+        \\  --decode-attn-quant / --no-decode-attn-quant
+        \\                      Serve decode from quantized side copies of
+        \\                      DENSE (bf16/f16) attention projection weights:
+        \\                      INT8 group-32 for most layers, NVFP4 for the
+        \\                      last 20% (late layers amplify quantization
+        \\                      error far less). Cuts their per-token weight
+        \\                      read by half or more on models that ship dense
+        \\                      attention (e.g. Laguna, ~-25% decode overall).
+        \\                      LOSSY: a real requantization, applied to
+        \\                      decode/verify steps only; prefill keeps the
+        \\                      dense weights. Default ON; --no-… restores
+        \\                      exact dense decode. Env tuning:
+        \\                      MLX_SERVE_DECODE_ATTN_QUANT_NVFP4_FROM=<layer>
+        \\                      moves the 4-bit boundary, =off keeps the whole
+        \\                      stack INT8.
         \\  --mtp-depth <n>     Max tokens drafted per MTP round (default:
         \\                        adaptive — the EV controller plans depth
         \\                        per round up to 8 on eligible M5 NAX targets,
@@ -525,6 +540,10 @@ pub fn main(init: std.process.Init) !void {
             enable_mtp = false;
         } else if (std.mem.eql(u8, args[i], "--mtp")) {
             force_mtp = true;
+        } else if (std.mem.eql(u8, args[i], "--decode-attn-quant")) {
+            transformer_mod.decode_attn_quant_flag = true;
+        } else if (std.mem.eql(u8, args[i], "--no-decode-attn-quant")) {
+            transformer_mod.decode_attn_quant_flag = false;
         } else if (std.mem.eql(u8, args[i], "--mtp-depth") and i + 1 < args.len) {
             i += 1;
             mtp_depth = @min(mtp_mod.MAX_DEPTH, @max(1, try std.fmt.parseInt(u32, args[i], 10)));
@@ -1170,20 +1189,10 @@ pub fn main(init: std.process.Init) !void {
             xfm.cache = try transformer_mod.KVCache.initWithConfigAndHeadDim(allocator, config.num_hidden_layers, kv_quant_config, config.head_dim);
         }
 
-        // JIT-compile + wire memory limits.
+        // JIT-compile + wire memory limits (policy: mlx.applyWiredPolicy).
         {
-            var dev = mlx.mlx_device{ .ctx = null };
-            _ = mlx.mlx_get_default_device(&dev);
-            var info = mlx.mlx_device_info_new();
-            if (mlx.mlx_device_info_get(&info, dev) == 0) {
-                var max_rec: usize = 0;
-                if (mlx.mlx_device_info_get_size(&max_rec, info, "max_recommended_working_set_size") == 0 and max_rec > 0) {
-                    var old_limit: usize = 0;
-                    _ = mlx.mlx_set_wired_limit(&old_limit, max_rec);
-                    log.debug("Wired limit set to {d} MB\n", .{max_rec / (1024 * 1024)});
-                }
-                _ = mlx.mlx_device_info_free(info);
-            }
+            const wired = mlx.applyWiredPolicy();
+            if (wired.target) |t| log.debug("[wired] mode={s} limit={d} MB\n", .{ @tagName(wired.mode), t / (1024 * 1024) });
         }
         if (config.hidden_act == .gelu_approx) {
             xfm.compileGelu();

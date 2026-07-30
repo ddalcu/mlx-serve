@@ -1261,6 +1261,17 @@ private struct PerformanceSectionContent: View {
                 }
             }
         }
+        if let m = meta["decodeAttnQuant"] {
+            SettingsRow(
+                title: m.title,
+                explainer: m.explainer,
+                isDirty: dirty.dirty(\.decodeAttnQuant)
+            ) {
+                Toggle("", isOn: opts.decodeAttnQuant)
+                    .labelsHidden()
+                    .toggleStyle(.switch)
+            }
+        }
         if let m = meta["kvQuant"] {
             SettingsRow(
                 title: m.title,
@@ -1458,14 +1469,16 @@ private struct Ds4PerformanceSectionContent: View {
 ///     batch=1 (verify expert-routing penalty), so PLD is the recommended
 ///     path. Per-request `enable_drafter:true` still works.
 ///   - **Unavailable** → disabled toggle, with a one-line explainer naming
-///     the reason (non-Gemma-4 target, or no matching drafter on disk). When
-///     it's a missing checkpoint, a "Browse" button jumps to the Model
-///     Browser.
+///     the reason (non-Gemma-4 target, or no matching drafter on disk). A
+///     missing checkpoint gets a "Download drafter" button right here — the
+///     Model Browser's drafter catalog is gone (the drafter now rides along
+///     with its target, `DownloadManager.companionDrafterRepo`), and HF search
+///     filters drafter repos out, so this is the only way to fetch one for a
+///     Gemma 4 that landed before that.
 private struct DrafterRow: View {
     @EnvironmentObject var appState: AppState
     @EnvironmentObject var server: ServerManager
     @EnvironmentObject var downloads: DownloadManager
-    @Environment(\.openWindow) private var openWindow
 
     private var dirty: ServerLaunchDirty {
         ServerLaunchDirty(current: appState.serverOptions, last: server.liveLaunchedOptions)
@@ -1494,7 +1507,7 @@ private struct DrafterRow: View {
 
     private var explainer: String {
         if let r = recommended {
-            return "Pairs with the small assistant drafter for +27–40% on code & agents (dense Gemma 4 only). Auto-discovered: \(r.url.lastPathComponent)."
+            return "Pairs with the small assistant drafter for +27–40% on code & agents (dense Gemma 4 only). On automatically: \(r.url.lastPathComponent)."
         }
         // Server hasn't reported a model yet — either it's not started or
         // we're mid-handshake. Don't claim the architecture is wrong.
@@ -1513,7 +1526,16 @@ private struct DrafterRow: View {
         if !targetIsGemma4 {
             return "Drafter is Gemma 4 only."
         }
-        return "Drafter checkpoint not found. Download from the Model Browser."
+        if isMoeTarget {
+            return "No drafter for the MoE Gemma 4 — it regresses decode there. Use PLD instead."
+        }
+        return "Drafter checkpoint not found. New Gemma 4 downloads bring it automatically."
+    }
+
+    /// The drafter this target would pair with, whether or not it's on disk —
+    /// what the Download button fetches.
+    private var pairedDrafterRepo: String? {
+        DownloadManager.companionDrafterRepo(forRepoId: appState.selectedModelPath)
     }
 
     private var toggleEnabled: Bool { recommended != nil }
@@ -1564,14 +1586,18 @@ private struct DrafterRow: View {
                     }
                 }
                 .padding(.top, 2)
-            } else if server.modelInfo != nil && targetIsGemma4 {
-                // Server has a Gemma 4 target loaded but the matching drafter
-                // isn't on disk. Jump straight to the Model Browser so the
-                // user can pick the right `*-it-assistant-bf16` repo.
-                Button("Browse") {
-                    AppActivation.openWindow(id: "modelBrowser", using: openWindow)
+            } else if server.modelInfo != nil, targetIsGemma4, let repo = pairedDrafterRepo {
+                // A dense Gemma 4 is loaded but its drafter isn't on disk —
+                // a model downloaded before drafters rode along. Fetch it from
+                // here: the browser has no drafter catalog any more, and HF
+                // search filters these repos out, so a "Browse" button would
+                // send the user somewhere that can't help.
+                Button(downloads.downloads[repo]?.status == .downloading
+                       ? "Downloading drafter…" : "Download drafter") {
+                    downloads.start(repoId: repo) { appState.refreshModels() }
                 }
                 .controlSize(.small)
+                .disabled(downloads.downloads[repo]?.status == .downloading)
                 .padding(.top, 2)
             }
         }
@@ -1579,9 +1605,14 @@ private struct DrafterRow: View {
 
     @ViewBuilder
     private var control: some View {
+        // Off writes `drafterOptOut` as well as clearing the path: the app pairs
+        // a dense Gemma 4 with its drafter on its own now, so an empty path
+        // alone would read as "not paired yet" and pair itself again at the next
+        // model switch. Turning it back on clears the opt-out.
         let isOn = Binding<Bool>(
             get: { !appState.serverOptions.drafterPath.isEmpty },
             set: { newValue in
+                appState.serverOptions.drafterOptOut = !newValue
                 if newValue {
                     if let r = recommended {
                         appState.serverOptions.drafterPath = r.url.path

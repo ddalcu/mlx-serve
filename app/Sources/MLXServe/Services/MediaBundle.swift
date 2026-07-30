@@ -67,16 +67,25 @@ struct MediaBundle: Identifiable, Equatable {
 extension MediaBundle {
     /// FLUX (mflux): one repo with weight subdirs (`transformer/`, `vae/`,
     /// `text_encoder/`, `tokenizer/`). Recursive download; ready when all four
-    /// subdirs + config are present.
-    static func flux(repo: String, displayName: String, sizeGB: Double) -> MediaBundle {
-        MediaBundle(
+    /// subdirs are present, plus the root config.json where the conversion
+    /// ships one.
+    ///
+    /// `hasRootConfig` is not a preference — it is a fact about the repo.
+    /// `mlx-community/flux2-klein-9b-4bit` ships no config.json, and demanding
+    /// one would make a complete 10 GB download read as permanently incomplete
+    /// (the Kokoro-reusing-the-TTS-bundle bug: the pane offers Download
+    /// forever). The server classifies that repo from the DiT's weight names
+    /// instead, so nothing downstream needs the file either.
+    static func flux(repo: String, displayName: String, sizeGB: Double, hasRootConfig: Bool = true) -> MediaBundle {
+        let subdirs = ["transformer", "vae", "text_encoder", "tokenizer"]
+        return MediaBundle(
             id: "flux:\(repo)",
             displayName: displayName,
             components: [
                 MediaComponent(
                     repo: repo,
                     selection: FileSelection(recursive: true),
-                    readyMarkers: ["config.json", "transformer", "vae", "text_encoder", "tokenizer"]
+                    readyMarkers: hasRootConfig ? ["config.json"] + subdirs : subdirs
                 ),
             ],
             sizeEstimateGB: sizeGB
@@ -294,6 +303,9 @@ extension ImageModelPreset {
             return .krea(repo: repo, displayName: name, sizeGB: Double(approxDownloadGB))
         case .mageFlowTurbo, .mageFlowEditTurbo:
             return .mageFlow(repo: repo, displayName: name, sizeGB: Double(approxDownloadGB))
+        case .flux2Klein9B:
+            // The one MLX conversion of klein 9B ships no root config.json.
+            return .flux(repo: repo, displayName: name, sizeGB: Double(approxDownloadGB), hasRootConfig: false)
         default:
             return .flux(repo: repo, displayName: name, sizeGB: Double(approxDownloadGB))
         }

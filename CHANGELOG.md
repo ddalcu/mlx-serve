@@ -1,15 +1,15 @@
 # Changelog
 
-## v26.7.12 — Agents, media generation in chat, Kokoro voices
+## v26.7.12 — Laguna 5x faster, Agents, media generation in chat
 
-- **Agents.** Named personas with their own prompt, voice, model, tools, workspace and wake phrase. A model writes the prompt for you, and every surface that can start a turn runs as that agent: chat, voice, tasks, Telegram, Quick Launcher.
-- **Kokoro voices.** Kokoro-82M runs natively: 54 built-in voices that blend, ~17x realtime, 330 MB. Qwen3-TTS stays the one that clones your own voice.
-- **Media generation in chat.** Ask for an image, a spoken line, a track or a short clip and it appears inline with a progress meter. Fast previews; the tray windows stay the place for full-quality work.
-- **Chat window pass.** Failed turns render as a card, context usage moved to a pill above the composer, and code blocks got colouring, line numbers and a copy button. Plus a toolbar model picker, web sources on answers, and per-chat tool switches.
-- **Faster model downloads.** Up to 16 ranged connections per file over one shared connection pool. The app sends your Hugging Face token now too, which is what search was getting rate limited without.
-- **Laguna decodes about 3x faster.** 24.6 to 74.7 tok/s on XS against our own previous build, traced to a constant table built at the wrong precision that widened every weight read after it. NVFP4 expert banks now decode in place as well.
-- **Fixed runaway memory on long chats.** A long session could grow the server to tens of GB of memory it wasn't using, until you killed it — 81 GB on a 128 GB Mac in one report, while the app's panel showed 19.6 GB (#110). Three things caused it, all fixed: MLX parks freed memory in a pool it never trims on its own, the KV cache grew in a way that threw away a full copy of itself every 256 tokens, and the drafter/MTP/batched decode paths never released their working memory at all. Speculative decoding is on by default for MTP checkpoints, so that last one hit the models most likely to be used for long agent sessions.
-- **The memory panel tells you where it went.** "GPU Memory" now reads e.g. `19.6 GB (+61 GB cache)`, and `/props` and `/metrics` report the same split. The bug above was invisible for as long as the only figure we published was memory in active use.
+- **The big speed release.** poolside Laguna XS generates almost 5x faster than the last release, from 25 to 121 tokens per second on an M4 Max. Qwen3.6 35B jumps 20%, from 129 to 155 tokens per second, and reaches 237 with its speed helper on. Most other models pick up a little too. One piece of this trades a tiny amount of wording variation for speed on certain models; it is on by default and can be switched off in Settings ("Fast decode for bf16-attention models"). The full version-by-version history lives in benchmarks.md.
+- **Agents.** Create named assistants with their own personality, voice, model, tools and wake phrase. The app writes the persona prompt for you, and every way of starting a conversation can run as that agent: chat, voice, tasks, Telegram, Quick Launcher.
+- **Kokoro voices.** 54 built-in voices that run fully on your Mac, about 17x faster than realtime, in a 330 MB download. Voices can be blended together. Qwen3-TTS remains the one that can clone your own voice.
+- **Media generation in chat.** Ask for an image, a spoken line, a music track or a short clip right in the conversation and it appears inline with a progress bar. The bigger FLUX.2-klein 9B image model is also in the model list now (10 GB), with the same fast generation and picture editing as the small one and better prompt following.
+- **A nicer chat window.** Code blocks get colors, line numbers and a copy button. There is a model picker in the toolbar, web sources on answers, failed turns show as a tidy card instead of raw errors, and tools and MCP servers flip on and off with one click.
+- **Speed helpers set themselves up.** Download a dense Gemma 4 model and its speed-up companion model now comes along and just works, 27 to 40% faster on code and agent tasks. Nothing to pair up by hand.
+- **Faster model downloads.** Up to 16 connections per file, and model search stops getting rate limited when you have a Hugging Face token set.
+- **Fixed runaway memory on long chats.** A long session could quietly grow the server to tens of GB until you quit it (#110). Fixed, and the memory panel now shows exactly where the memory goes.
 
 ---
 

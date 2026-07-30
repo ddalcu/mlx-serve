@@ -204,6 +204,8 @@ fn dequantTable(w_q: mlx.mlx_array, scales: mlx.mlx_array, biases: mlx.mlx_array
 
 // ── Config ──
 
+/// Defaults are the klein 4B build; `ditConfigFrom`/`teConfigFrom` overwrite
+/// the six fields the 9B differs in, read off the checkpoint itself.
 pub const FluxConfig = struct {
     // DiT
     inner_dim: u32 = 3072,
@@ -226,6 +228,116 @@ pub const FluxConfig = struct {
     te_rms_eps: f32 = 1e-6,
     te_vocab: u32 = 151936,
 };
+
+// ── Geometry, derived from the checkpoint ──
+//
+// FLUX.2 klein ships as 4B and 9B. Per mflux's own model configs the ENTIRE
+// delta is six numbers — 5→8 double blocks, 20→24 single, 24→32 heads, joint
+// 7680→12288, encoder hidden 2560→4096, encoder MLP 9728→12288 — while
+// head_dim 128, in_channels 128, mlp_ratio 3, the RoPE theta, the 36 encoder
+// layers and the 9/18/27 taps are shared.
+//
+// None of it is in the checkpoint's json: the mlx-community 9B repo carries no
+// config.json at all, and the 4B's records only its quantization. So it comes
+// from the WEIGHT SHAPES, which is also the only source that cannot disagree
+// with the tensors about to be loaded — a hardcoded 5 against a 9B DiT loads 5
+// of its 8 blocks without erroring and generates a plausible WRONG image.
+
+/// The DiT shapes that vary, read off the loaded weights. Zero = unreadable,
+/// which leaves the corresponding field at its base value (the subsequent
+/// weight load names whatever is actually missing).
+pub const DitShapes = struct {
+    x_embedder_rows: u32 = 0, // → inner_dim
+    x_embedder_in_dim: u32 = 0, // → in_channels (logical, pre-packing)
+    context_in_dim: u32 = 0, // → joint_dim (logical, pre-packing)
+    norm_q_len: u32 = 0, // → head_dim
+    ff_linear_in_rows: u32 = 0, // → 2·inner·mlp_ratio (gate+up fused in one tensor)
+    double_blocks: u32 = 0,
+    single_blocks: u32 = 0,
+};
+
+pub fn ditConfigFrom(shapes: DitShapes, base: FluxConfig) FluxConfig {
+    var c = base;
+    if (shapes.x_embedder_rows != 0) c.inner_dim = shapes.x_embedder_rows;
+    if (shapes.x_embedder_in_dim != 0) c.in_channels = shapes.x_embedder_in_dim;
+    if (shapes.context_in_dim != 0) c.joint_dim = shapes.context_in_dim;
+    if (shapes.norm_q_len != 0) c.head_dim = shapes.norm_q_len;
+    if (c.head_dim != 0 and c.inner_dim % c.head_dim == 0) c.heads = c.inner_dim / c.head_dim;
+    if (shapes.ff_linear_in_rows != 0 and c.inner_dim != 0) {
+        const half: f32 = @floatFromInt(shapes.ff_linear_in_rows / 2);
+        c.mlp_ratio = half / @as(f32, @floatFromInt(c.inner_dim));
+    }
+    if (shapes.double_blocks != 0) c.double_layers = shapes.double_blocks;
+    if (shapes.single_blocks != 0) c.single_layers = shapes.single_blocks;
+    return c;
+}
+
+/// The Qwen3 encoder shapes that vary. `q_proj_rows`/`k_proj_rows` decide the
+/// head counts — NOT hidden/head_dim, which happens to agree on the 9B and is
+/// wrong on the 4B (2560/128 = 20 against 32 real q heads).
+pub const TeShapes = struct {
+    hidden: u32 = 0, // input_layernorm length
+    q_norm_len: u32 = 0, // → te_head_dim
+    q_proj_rows: u32 = 0,
+    k_proj_rows: u32 = 0,
+    gate_proj_rows: u32 = 0, // → te_inter
+    layers: u32 = 0,
+    vocab: u32 = 0,
+};
+
+pub fn teConfigFrom(shapes: TeShapes, base: FluxConfig) FluxConfig {
+    var c = base;
+    if (shapes.hidden != 0) c.te_hidden = shapes.hidden;
+    if (shapes.q_norm_len != 0) c.te_head_dim = shapes.q_norm_len;
+    if (c.te_head_dim != 0) {
+        if (shapes.q_proj_rows != 0) c.te_heads = shapes.q_proj_rows / c.te_head_dim;
+        if (shapes.k_proj_rows != 0) c.te_kv = shapes.k_proj_rows / c.te_head_dim;
+    }
+    if (shapes.gate_proj_rows != 0) c.te_inter = shapes.gate_proj_rows;
+    if (shapes.layers != 0) c.te_layers = shapes.layers;
+    if (shapes.vocab != 0) c.te_vocab = shapes.vocab;
+    return c;
+}
+
+/// First-axis extent of a loaded weight, or 0 when absent/rankless. Doubles as
+/// the length reader for the 1-D norms.
+fn rowsOf(w: *const Weights, key: []const u8) u32 {
+    const a = w.get(key) orelse return 0;
+    const sh = mlx.getShape(a);
+    if (sh.len == 0 or sh[0] < 0) return 0;
+    return @intCast(sh[0]);
+}
+
+/// Logical (pre-packing) input width of an affine-quantized linear: the packed
+/// u32 columns carry `in·bits/32` of them, and the bit width is itself inferred
+/// from the scales' geometry.
+fn logicalInDim(w: *const Weights, a: std.mem.Allocator, prefix: []const u8) u32 {
+    const wk = fmtKey(a, "{s}.weight", .{prefix}) catch return 0;
+    defer a.free(wk);
+    const sk = fmtKey(a, "{s}.scales", .{prefix}) catch return 0;
+    defer a.free(sk);
+    const wa = w.get(wk) orelse return 0;
+    const sa = w.get(sk) orelse return 0;
+    const wsh = mlx.getShape(wa);
+    if (wsh.len == 0) return 0;
+    const geo = inferQuantGeometryOf(wa, sa);
+    if (geo.bits == 0) return 0;
+    const w_cols: u32 = @intCast(wsh[wsh.len - 1]);
+    return w_cols * 32 / geo.bits;
+}
+
+/// Highest `i` for which `fmt`-with-`{d}` names a present weight, counting from
+/// 0. Bounded so a malformed map cannot spin.
+fn countIndexed(w: *const Weights, a: std.mem.Allocator, comptime fmt: []const u8) u32 {
+    const max_blocks = 256;
+    var n: u32 = 0;
+    while (n < max_blocks) : (n += 1) {
+        const key = fmtKey(a, fmt, .{n}) catch return n;
+        defer a.free(key);
+        if (w.get(key) == null) return n;
+    }
+    return n;
+}
 
 // ── Qwen3 text encoder ──
 
@@ -430,7 +542,18 @@ pub fn loadTextEncoder(io: std.Io, allocator: std.mem.Allocator, s: S, model_dir
     var w = try model_mod.loadWeights(io, allocator, dir);
     defer w.deinit();
     var te: TextEncoder = undefined;
-    te.cfg = .{};
+    te.cfg = teConfigFrom(.{
+        .hidden = rowsOf(&w, "layers.0.input_layernorm.weight"),
+        .q_norm_len = rowsOf(&w, "layers.0.self_attn.q_norm.weight"),
+        .q_proj_rows = rowsOf(&w, "layers.0.self_attn.q_proj.weight"),
+        .k_proj_rows = rowsOf(&w, "layers.0.self_attn.k_proj.weight"),
+        .gate_proj_rows = rowsOf(&w, "layers.0.mlp.gate_proj.weight"),
+        .layers = countIndexed(&w, allocator, "layers.{d}.input_layernorm.weight"),
+        .vocab = rowsOf(&w, "embed_tokens.weight"),
+    }, .{});
+    log.info("[flux] text encoder: hidden={d} layers={d} heads={d}/{d} inter={d}\n", .{
+        te.cfg.te_hidden, te.cfg.te_layers, te.cfg.te_heads, te.cfg.te_kv, te.cfg.te_inter,
+    });
     te.allocator = allocator;
     te.s = s;
 
@@ -867,7 +990,19 @@ pub fn loadDit(io: std.Io, allocator: std.mem.Allocator, s: S, model_dir: []cons
     var w = try model_mod.loadWeights(io, allocator, dir);
     defer w.deinit();
     var d: Dit = undefined;
-    d.cfg = .{}; d.allocator = allocator; d.s = s;
+    d.cfg = ditConfigFrom(.{
+        .x_embedder_rows = rowsOf(&w, "x_embedder.weight"),
+        .x_embedder_in_dim = logicalInDim(&w, allocator, "x_embedder"),
+        .context_in_dim = logicalInDim(&w, allocator, "context_embedder"),
+        .norm_q_len = rowsOf(&w, "transformer_blocks.0.attn.norm_q.weight"),
+        .ff_linear_in_rows = rowsOf(&w, "transformer_blocks.0.ff.linear_in.weight"),
+        .double_blocks = countIndexed(&w, allocator, "transformer_blocks.{d}.attn.to_q.weight"),
+        .single_blocks = countIndexed(&w, allocator, "single_transformer_blocks.{d}.attn.to_out.weight"),
+    }, .{});
+    log.info("[flux] dit: inner={d} heads={d}x{d} double={d} single={d} joint={d}\n", .{
+        d.cfg.inner_dim, d.cfg.heads, d.cfg.head_dim, d.cfg.double_layers, d.cfg.single_layers, d.cfg.joint_dim,
+    });
+    d.allocator = allocator; d.s = s;
     d.x_embedder = try QLinear.load(&w, allocator, "x_embedder");
     d.context_embedder = try QLinear.load(&w, allocator, "context_embedder");
     d.t_lin1 = try QLinear.load(&w, allocator, "time_guidance_embed.linear_1");
@@ -2265,6 +2400,84 @@ test "flux text encoder reproduces prompt_embeds" {
     const rel = rmse / std.math.sqrt(nb / @as(f64, @floatFromInt(n)));
     std.debug.print("[flux-te] n={d} corr={d:.6} rmse={d:.4} rel={d:.5} maxabs={d:.1}\n", .{ n, corr, rmse, rel, maxabs });
     try testing.expect(corr > 0.9995);
+}
+
+test "flux geometry is read off the checkpoint, not assumed (klein 4B vs 9B)" {
+    // The shapes below are the real ones, read out of the two shipped
+    // checkpoints' safetensors headers. mflux's own model configs say the whole
+    // 4B→9B delta is six numbers; everything else is shared.
+    const four = ditConfigFrom(.{
+        .x_embedder_rows = 3072,
+        .x_embedder_in_dim = 128,
+        .context_in_dim = 7680,
+        .norm_q_len = 128,
+        .ff_linear_in_rows = 18432,
+        .double_blocks = 5,
+        .single_blocks = 20,
+    }, .{});
+    try testing.expectEqual(@as(u32, 3072), four.inner_dim);
+    try testing.expectEqual(@as(u32, 24), four.heads);
+    try testing.expectEqual(@as(u32, 128), four.head_dim);
+    try testing.expectEqual(@as(u32, 5), four.double_layers);
+    try testing.expectEqual(@as(u32, 20), four.single_layers);
+    try testing.expectEqual(@as(u32, 7680), four.joint_dim);
+    try testing.expectEqual(@as(u32, 128), four.in_channels);
+    try testing.expectEqual(@as(f32, 3.0), four.mlp_ratio);
+
+    const nine = ditConfigFrom(.{
+        .x_embedder_rows = 4096,
+        .x_embedder_in_dim = 128,
+        .context_in_dim = 12288,
+        .norm_q_len = 128,
+        .ff_linear_in_rows = 24576,
+        .double_blocks = 8,
+        .single_blocks = 24,
+    }, .{});
+    try testing.expectEqual(@as(u32, 4096), nine.inner_dim);
+    try testing.expectEqual(@as(u32, 32), nine.heads);
+    try testing.expectEqual(@as(u32, 8), nine.double_layers);
+    try testing.expectEqual(@as(u32, 24), nine.single_layers);
+    try testing.expectEqual(@as(u32, 12288), nine.joint_dim);
+    try testing.expectEqual(@as(f32, 3.0), nine.mlp_ratio);
+    // Shared across both builds — a deriver that "fixes" these is wrong.
+    try testing.expectEqual(four.head_dim, nine.head_dim);
+    try testing.expectEqual(four.in_channels, nine.in_channels);
+    try testing.expectEqual(four.rope_theta_dit, nine.rope_theta_dit);
+
+    const te4 = teConfigFrom(.{
+        .hidden = 2560, .q_norm_len = 128, .q_proj_rows = 4096,
+        .k_proj_rows = 1024, .gate_proj_rows = 9728, .layers = 36, .vocab = 151936,
+    }, .{});
+    try testing.expectEqual(@as(u32, 2560), te4.te_hidden);
+    try testing.expectEqual(@as(u32, 32), te4.te_heads);
+    try testing.expectEqual(@as(u32, 8), te4.te_kv);
+    try testing.expectEqual(@as(u32, 9728), te4.te_inter);
+    try testing.expectEqual(@as(u32, 36), te4.te_layers);
+
+    const te9 = teConfigFrom(.{
+        .hidden = 4096, .q_norm_len = 128, .q_proj_rows = 4096,
+        .k_proj_rows = 1024, .gate_proj_rows = 12288, .layers = 36, .vocab = 151936,
+    }, .{});
+    try testing.expectEqual(@as(u32, 4096), te9.te_hidden);
+    try testing.expectEqual(@as(u32, 12288), te9.te_inter);
+    // The 9B's Qwen3-8B encoder keeps 32 q heads / 8 kv heads — same as the
+    // 4B's. The heads are NOT hidden/head_dim: that would read 32 here by luck
+    // and 20 on the 4B, which is wrong.
+    try testing.expectEqual(@as(u32, 32), te9.te_heads);
+    try testing.expectEqual(@as(u32, 8), te9.te_kv);
+    try testing.expectEqual(@as(u32, 36), te9.te_layers);
+    // Both DiTs concatenate three tapped encoder layers.
+    try testing.expectEqual(3 * te4.te_hidden, four.joint_dim);
+    try testing.expectEqual(3 * te9.te_hidden, nine.joint_dim);
+
+    // An unreadable probe (0) leaves the field at its base value rather than
+    // writing a zero the loader would then allocate against.
+    const empty = ditConfigFrom(.{}, .{});
+    try testing.expectEqual(@as(u32, 3072), empty.inner_dim);
+    try testing.expectEqual(@as(u32, 5), empty.double_layers);
+    const empty_te = teConfigFrom(.{}, .{});
+    try testing.expectEqual(@as(u32, 2560), empty_te.te_hidden);
+    try testing.expectEqual(@as(u32, 36), empty_te.te_layers);
 }
 
 test "flux inferQuantGeometry resolves mflux/mlx-community bit widths" {

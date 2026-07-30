@@ -510,7 +510,8 @@ class DownloadManager: ObservableObject {
         existingModelDir(for: repoId) ?? newLayoutDir(for: repoId)
     }
 
-    func download(repoId: String, selection: FileSelection = .chatDefault) async {
+    func download(repoId: String, selection: FileSelection = .chatDefault,
+                  alertOnFailure: Bool = true) async {
         let destDir = newLayoutDir(for: repoId)
 
         downloads[repoId] = DownloadState(status: .downloading, statusText: "Fetching file list...")
@@ -631,7 +632,7 @@ class DownloadManager: ObservableObject {
             if Task.isCancelled { return }
             let message = error.localizedDescription
             downloads[repoId] = DownloadState(status: .failed, error: message)
-            if !(error is CancellationError) {
+            if alertOnFailure, !(error is CancellationError) {
                 presentFailureAlert(repoId: repoId, message: message)
             }
         }
@@ -662,10 +663,51 @@ class DownloadManager: ObservableObject {
         let task = Task { @MainActor [weak self] in
             await self?.download(repoId: repoId)
             self?.finalizeIfCancelled(repoId: repoId)
+            await self?.downloadCompanionDrafterIfNeeded(for: repoId)
             self?.activeTasks.removeValue(forKey: repoId)
             onFinish()
         }
         activeTasks[repoId] = task
+    }
+
+    // MARK: - Companion drafter
+    //
+    // The Gemma 4 assistant drafter is a DEPENDENCY of the model it pairs with,
+    // not something to shop for: it only ever works alongside one Gemma 4 size,
+    // and picking it yourself means knowing that. It used to have its own Model
+    // Browser destination, which mostly generated the question "which of these
+    // is mine?". Now it rides along with its target, the same way a ds4 GGUF
+    // quant pulls its MTP head (`resolveGgufDownloadFiles`).
+
+    /// The drafter repo that pairs with `repoId`, or nil when there isn't one.
+    ///
+    /// Dense Gemma 4 only. The MoE target (26B-A4B) is excluded on purpose —
+    /// the drafter REGRESSES decode there (verify pays expert routing, so the
+    /// server defaults it off on MoE targets), and fetching a checkpoint we
+    /// then refuse to use is worse than not having it. GGUF Gemma is excluded
+    /// too: it runs on llama.cpp, which has no drafter path at all.
+    nonisolated static func companionDrafterRepo(forRepoId repoId: String) -> String? {
+        let base = (repoId as NSString).lastPathComponent.lowercased()
+        guard base.contains("gemma-4") || base.contains("gemma4") else { return nil }
+        // A drafter must not pull itself — that download is an infinite regress.
+        guard !base.contains("assistant"), !base.contains("gguf") else { return nil }
+        // One parser for "which Gemma size is this?" — `gemmaVariantFor` is the
+        // same one the pairing and auto-sync paths use, so a new size can't be
+        // taught to one of them and not the other.
+        guard let variant = gemmaVariantFor(modelPath: base, isMoE: false), variant != .moe26B else { return nil }
+        return variant.drafterRepoId
+    }
+
+    /// Fetch `repoId`'s drafter after it lands, unless it's already here.
+    /// Failures stay silent (the Downloads pane still shows the failed row):
+    /// an alert naming a repo the user never asked for reads as a bug in the
+    /// download they DID ask for.
+    private func downloadCompanionDrafterIfNeeded(for repoId: String) async {
+        guard !Task.isCancelled,
+              downloads[repoId]?.status == .completed,
+              let drafter = Self.companionDrafterRepo(forRepoId: repoId),
+              !isReady(drafter) else { return }
+        await download(repoId: drafter, alertOnFailure: false)
     }
 
     // MARK: - Media bundles

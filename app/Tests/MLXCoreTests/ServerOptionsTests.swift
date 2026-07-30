@@ -965,4 +965,24 @@ extension ServerOptionsTests {
         let back = try JSONDecoder().decode(ServerOptions.self, from: JSONEncoder().encode(o))
         XCTAssertEqual(back, o)
     }
+
+    /// Decode attention requant (`--decode-attn-quant`): server default is ON
+    /// (transformer.zig DECODE_ATTN_QUANT_DEFAULT), so a default launch emits
+    /// NOTHING and only the user's OFF emits the flag. A stored blob that
+    /// predates the field decodes to the default (tolerant decoder).
+    func testDecodeAttnQuantMirrorsServerDefaultAndEmitsOnlyOff() throws {
+        var opts = ServerOptions()
+        XCTAssertTrue(opts.decodeAttnQuant)  // transformer.zig DECODE_ATTN_QUANT_DEFAULT
+        XCTAssertFalse(opts.toCLIArgs().contains("--decode-attn-quant"))
+        XCTAssertFalse(opts.toCLIArgs().contains("--no-decode-attn-quant"))
+
+        opts.decodeAttnQuant = false
+        XCTAssertTrue(opts.toCLIArgs().contains("--no-decode-attn-quant"))
+        XCTAssertFalse(opts.toCLIArgs().contains("--decode-attn-quant"))
+
+        let legacy = try JSONDecoder().decode(ServerOptions.self, from: Data("{}".utf8))
+        XCTAssertTrue(legacy.decodeAttnQuant)
+        let back = try JSONDecoder().decode(ServerOptions.self, from: JSONEncoder().encode(opts))
+        XCTAssertEqual(back.decodeAttnQuant, false)
+    }
 }

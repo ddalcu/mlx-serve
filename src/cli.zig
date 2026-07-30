@@ -565,9 +565,12 @@ fn isModelDir(io: std.Io, allocator: std.mem.Allocator, dir: *std.Io.Dir) bool {
         if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".gguf")) return true;
     }
     // A MageFlow repo has neither: every config lives in a component subdir and
-    // `model_index.json` is the only signal. Shared with discovery so `list`
-    // and `/v1/models` cannot disagree about what counts as a model.
-    return model_discovery.peekMageFlowIndex(io, allocator, dir.*);
+    // `model_index.json` is the only signal. An mflux FLUX.2 conversion may
+    // carry neither file NOR an index — it is recognized by the DiT's own
+    // weight names. Both shared with discovery so `list` and `/v1/models`
+    // cannot disagree about what counts as a model.
+    if (model_discovery.peekMageFlowIndex(io, allocator, dir.*)) return true;
+    return model_discovery.peekMfluxFlux2(io, allocator, dir.*);
 }
 
 fn printModelRow(io: std.Io, allocator: std.mem.Allocator, w: *std.Io.Writer, dir: *std.Io.Dir, name: []const u8, root: []const u8) !void {
@@ -1074,6 +1077,35 @@ test "cli: isModelDir accepts a MageFlow repo (model_index.json, no config.json)
     var org = try tmp.dir.openDir(io, "org", .{ .iterate = true });
     defer org.close(io);
     try testing.expect(!isModelDir(io, a, &org));
+}
+
+test "cli: isModelDir accepts an mflux FLUX.2 repo (no config.json at all)" {
+    const io = std.testing.io;
+    const a = testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    // The klein 9B MLX build carries neither config.json nor model_index.json,
+    // so this is the third place that has to know the shape. Same rule as
+    // MageFlow above: `list` and `/v1/models` answer from one predicate.
+    try tmp.dir.createDirPath(io, "klein9/transformer");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "klein9/transformer/model.safetensors.index.json",
+        .data = "{\"weight_map\":{\"double_stream_modulation_img.linear.weight\":\"0.safetensors\"}}",
+    });
+    var klein = try tmp.dir.openDir(io, "klein9", .{ .iterate = true });
+    defer klein.close(io);
+    try testing.expect(isModelDir(io, a, &klein));
+
+    // A different DiT with the same directory shape is not ours.
+    try tmp.dir.createDirPath(io, "notflux/transformer");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "notflux/transformer/model.safetensors.index.json",
+        .data = "{\"weight_map\":{\"blocks.0.attn.qkv.weight\":\"0.safetensors\"}}",
+    });
+    var notflux = try tmp.dir.openDir(io, "notflux", .{ .iterate = true });
+    defer notflux.close(io);
+    try testing.expect(!isModelDir(io, a, &notflux));
 }
 
 test "cli: an unparsed argument is classified, never silently ignored" {

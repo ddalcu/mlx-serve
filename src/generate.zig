@@ -911,6 +911,13 @@ pub const Generator = struct {
         /// `initWithOptions` returns `error.Cancelled` instead of grinding
         /// out the rest of a multi-minute ghost prefill.
         cancel_flag: ?*const std.atomic.Value(bool) = null,
+        /// Per-token logprobs count for this request (0 = disabled). Callers
+        /// that set `Generator.logprobs_n` after init must ALSO pass it here:
+        /// init's split-prefill final-token forward is a single-row dispatch,
+        /// and the certified lm_head prune may only engage when the request
+        /// consumes nothing but the argmax — a logprobs request reads the
+        /// full logit row, which the pruned head does not produce.
+        logprobs_n: u32 = 0,
         /// LIVE prefill progress, in tokens actually forwarded so far by THIS
         /// prefill. Bumped once per chunk (not per token), read off-thread by
         /// the metrics gauge sampler.
@@ -949,6 +956,18 @@ pub const Generator = struct {
         // `&ctx` to every forward call below; the cache/moe/ssm fields
         // mutate in-place through their pointers.
         var ctx: ForwardCtx = options.ctx orelse xfm.defaultCtx();
+
+        // Certified lm_head prune gate: the pruned projection proves the
+        // ARGMAX, not the tail distribution, so it may engage only when this
+        // request consumes nothing else — greedy (or top-1) sampling with no
+        // logit-modifying penalties, no per-token logprobs and no grammar
+        // mask. Mirrors the `logprobs>0 + grammar disable spec` precedent:
+        // no request gets slower, some get faster.
+        ctx.argmax_only = (sampling.temperature < 0.01 or sampling.top_k == 1) and
+            sampling.repeat_penalty == 1.0 and
+            sampling.presence_penalty == 0.0 and
+            sampling.constraint == null and
+            options.logprobs_n == 0;
 
         const ids_i32 = try allocator.alloc(i32, prompt_ids.len);
         defer allocator.free(ids_i32);
@@ -5230,7 +5249,10 @@ pub fn generate(
     logprobs_n: u32,
 ) !GenerationResult {
     var timer = io_util.Stopwatch.init(io);
-    var gen = try Generator.init(io, allocator, xfm, tok, prompt_ids, max_tokens, sampling, eos_token_ids);
+    // logprobs_n rides InitOptions so init's argmax-only gate sees it (a
+    // post-init field write would let the split-prefill final-token forward
+    // engage the pruned lm_head on a logprobs request).
+    var gen = try Generator.initWithOptions(io, allocator, xfm, tok, prompt_ids, max_tokens, sampling, eos_token_ids, .{ .logprobs_n = logprobs_n });
     gen.timeout_ns = timeout_ns;
     gen.logprobs_n = logprobs_n;
     defer gen.deinit(allocator);

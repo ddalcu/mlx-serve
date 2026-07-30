@@ -83,6 +83,12 @@ struct ServerOptions: Codable, Equatable {
     var pldDraftLen: Int = 5
     var pldKeyLen: Int = 3
     var drafterPath: String = ""        // empty = no drafter
+    /// The user turned the drafter OFF. Not a launch flag — it's the bit that
+    /// `drafterPath` can't carry: an empty path means both "nothing paired yet"
+    /// and "switched off", and the app auto-pairs a dense Gemma 4 with the
+    /// drafter that came down with it (`DrafterPairing.decide`), so without
+    /// this the off would undo itself at the next model switch.
+    var drafterOptOut: Bool = false
     var draftBlockSize: Int = 4
 
     /// Native multi-token prediction (Qwen 3.5/3.6 checkpoints that ship a
@@ -95,6 +101,14 @@ struct ServerOptions: Codable, Equatable {
     /// depth live from the measured acceptance rate). A fixed value is a
     /// benchmarking lever; emitted only when non-zero.
     var mtpDepth: Int = 0
+    /// Decode attention requant: the server serves decode steps from INT8
+    /// group-32 side copies of DENSE (bf16/f16) attention projection weights —
+    /// ~23% faster decode on models that ship dense attention (Laguna; most
+    /// quantized checkpoints are unaffected). Lossy by design (a real
+    /// requantization, decode/verify only; prefill keeps the dense weights).
+    /// Default ON, mirroring transformer.zig DECODE_ATTN_QUANT_DEFAULT —
+    /// `toCLIArgs` emits `--no-decode-attn-quant` ONLY when turned off.
+    var decodeAttnQuant: Bool = true
     /// `--mtp`. A MoE checkpoint that ships an MTP head keeps it OFF for every
     /// request that omits `enable_mtp` (the server's `defaultEnableMtp`: the
     /// verify forward pays the expert-routing penalty, the same caution the
@@ -550,6 +564,10 @@ struct ServerOptions: Codable, Equatable {
         if mtpDepth > 0 {
             args += ["--mtp-depth", "\(mtpDepth)"]
         }
+        // Decode attention requant: server default is ON, so only OFF emits.
+        if !decodeAttnQuant {
+            args += ["--no-decode-attn-quant"]
+        }
         // Performance: only emit non-default flags so the CLI tail stays
         // readable in log lines and `ps`. Server defaults are 1 / off / 2GB.
         if maxConcurrent > 1 {
@@ -684,6 +702,7 @@ extension ServerOptions {
         if let v = try c.decodeIfPresent(Int.self, forKey: .pldDraftLen) { pldDraftLen = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .pldKeyLen) { pldKeyLen = v }
         if let v = try c.decodeIfPresent(String.self, forKey: .drafterPath) { drafterPath = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .drafterOptOut) { drafterOptOut = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .draftBlockSize) { draftBlockSize = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .lanShareEnabled) { lanShareEnabled = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .lanShareAll) { lanShareAll = v }
@@ -691,6 +710,7 @@ extension ServerOptions {
         if let v = try c.decodeIfPresent(Bool.self, forKey: .lanDiscoverEnabled) { lanDiscoverEnabled = v }
         if let v = try c.decodeIfPresent(String.self, forKey: .lanName) { lanName = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .enableMTP) { enableMTP = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .decodeAttnQuant) { decodeAttnQuant = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .mtpDepth) { mtpDepth = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .forceMTPOnMoE) { forceMTPOnMoE = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .maxConcurrent) { maxConcurrent = v }
@@ -885,6 +905,10 @@ extension ServerOptions {
         "maxConcurrent": .init(
             title: "Concurrent requests",
             explainer: "Continuous batching: how many chat requests share one forward pass. 1 = serial. 2 is a good default for dense models (~1.5× throughput, ~33% per-request latency cost). MoE and hybrid SSM models stay serial regardless.",
+            needsRestart: true),
+        "decodeAttnQuant": .init(
+            title: "Fast decode for bf16-attention models (recommended)",
+            explainer: "Serves decode from quantized copies of attention weights that ship un-quantized (bf16): 8-bit for most layers, 4-bit for the last fifth, where quantization error matters far less. Models like poolside Laguna decode ~25% faster overall. Slightly lossy: replies can differ in wording from the exact bf16 decode, but measured answers stay the same quality (prompt reading and speculative checks keep the exact weights). Models with fully quantized attention are unaffected. Turn off for bit-exact bf16 decoding.",
             needsRestart: true),
         "kvQuant": .init(
             title: "KV cache quantization",

@@ -66,6 +66,7 @@ enum SettingsReset {
                 f("pldDraftLen") { $0.pldDraftLen = $1.pldDraftLen },
                 f("pldKeyLen") { $0.pldKeyLen = $1.pldKeyLen },
                 f("drafterPath") { $0.drafterPath = $1.drafterPath },
+                f("drafterOptOut") { $0.drafterOptOut = $1.drafterOptOut },
                 f("draftBlockSize") { $0.draftBlockSize = $1.draftBlockSize },
                 f("enableMTP") { $0.enableMTP = $1.enableMTP },
                 f("mtpDepth") { $0.mtpDepth = $1.mtpDepth },
@@ -77,6 +78,7 @@ enum SettingsReset {
             return [
                 f("tokenizeCacheEntries") { $0.tokenizeCacheEntries = $1.tokenizeCacheEntries },
                 f("maxConcurrent") { $0.maxConcurrent = $1.maxConcurrent },
+                f("decodeAttnQuant") { $0.decodeAttnQuant = $1.decodeAttnQuant },
                 f("kvQuant") { $0.kvQuant = $1.kvQuant },
                 f("prefixCacheEntries") { $0.prefixCacheEntries = $1.prefixCacheEntries },
                 f("prefixCacheMem") { $0.prefixCacheMem = $1.prefixCacheMem },

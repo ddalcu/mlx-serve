@@ -209,8 +209,7 @@ final class HuggingFaceStubProtocol: URLProtocol {
     struct Recorded { let path: String; let range: String? }
 
     private static let lock = NSLock()
-    private static var repo = ""
-    private static var files: [(String, Data)] = []
+    private static var repos: [String: [(String, Data)]] = [:]
     private static var throttle = false
     private static var shardChunkFailuresLeft = 0
     private static var recorded: [Recorded] = []
@@ -218,10 +217,19 @@ final class HuggingFaceStubProtocol: URLProtocol {
     static func serve(repo: String, files: [(String, Data)], throttle: Bool = false,
                       failFirstNShardChunks: Int = 0) {
         lock.lock(); defer { lock.unlock() }
-        self.repo = repo
-        self.files = files
+        self.repos = repo.isEmpty ? [:] : [repo: files]
         self.throttle = throttle
         self.shardChunkFailuresLeft = failFirstNShardChunks
+        self.recorded = []
+    }
+
+    /// Several repos at once — for a download that pulls a companion (a Gemma 4
+    /// model and its assistant drafter).
+    static func serve(repos: [String: [(String, Data)]]) {
+        lock.lock(); defer { lock.unlock() }
+        self.repos = repos
+        self.throttle = false
+        self.shardChunkFailuresLeft = 0
         self.recorded = []
     }
 
@@ -249,19 +257,24 @@ final class HuggingFaceStubProtocol: URLProtocol {
         let range = request.value(forHTTPHeaderField: "Range")
         Self.lock.lock()
         Self.recorded.append(Recorded(path: path, range: range))
-        let repo = Self.repo
-        let files = Self.files
+        let repos = Self.repos
         let throttle = Self.throttle
         Self.lock.unlock()
 
         if path.hasPrefix("/api/models/") {
+            // /api/models/<org>/<name>/tree/main
+            let repo = path.dropFirst("/api/models/".count).split(separator: "/").prefix(2).joined(separator: "/")
+            guard let files = repos[repo] else {
+                send(status: 404, body: Data(), headers: [:])
+                return
+            }
             let entries = files.map { ["type": "file", "path": $0.0, "size": $0.1.count] as [String: Any] }
             send(status: 200, body: try! JSONSerialization.data(withJSONObject: entries), headers: [:])
             return
         }
 
-        let prefix = "/\(repo)/resolve/main/"
-        guard path.hasPrefix(prefix), let body = files.first(where: { $0.0 == String(path.dropFirst(prefix.count)) })?.1 else {
+        guard let (repo, files) = repos.first(where: { path.hasPrefix("/\($0.key)/resolve/main/") }),
+              let body = files.first(where: { $0.0 == String(path.dropFirst("/\(repo)/resolve/main/".count)) })?.1 else {
             send(status: 404, body: Data(), headers: [:])
             return
         }

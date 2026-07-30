@@ -23,8 +23,6 @@ enum ModelBrowserSection: String, CaseIterable, Identifiable, Hashable {
     case myModels
     /// The transfer queue: in-flight and failed downloads.
     case downloads
-    /// The curated Gemma 4 assistant-drafter catalog.
-    case drafters
     /// Media-gen model catalog (image/audio/video/music), grouped by modality.
     case media
 
@@ -36,7 +34,6 @@ enum ModelBrowserSection: String, CaseIterable, Identifiable, Hashable {
         case .discover:     return "Discover"
         case .myModels:     return "My Models"
         case .downloads:    return "Downloads"
-        case .drafters:     return "Drafters"
         case .media:        return "Media"
         }
     }
@@ -47,7 +44,6 @@ enum ModelBrowserSection: String, CaseIterable, Identifiable, Hashable {
         case .discover:     return "magnifyingglass"
         case .myModels:     return "internaldrive"
         case .downloads:    return "arrow.down.circle"
-        case .drafters:     return "sparkles"
         case .media:        return "photo.on.rectangle.angled"
         }
     }
@@ -76,7 +72,6 @@ struct ModelBrowserBadgeCounts: Equatable {
     /// Downloading *or* failed — both want the user's attention, and both are
     /// what the Downloads pane lists.
     let activeDownloads: Int
-    let draftersReady: Int
     /// Media (image/audio/video/music) bundles fully on disk.
     let mediaReady: Int
 
@@ -87,7 +82,6 @@ struct ModelBrowserBadgeCounts: Equatable {
         case .discover:     return nil
         case .myModels:     n = myModels
         case .downloads:    n = activeDownloads
-        case .drafters:     n = draftersReady
         case .media:        n = mediaReady
         }
         return n > 0 ? "\(n)" : nil

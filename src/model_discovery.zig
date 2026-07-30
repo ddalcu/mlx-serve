@@ -110,6 +110,11 @@ fn peekConfig(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir, entry_n
         // gen.peekModelType's fallback (kept in sync — the routing side must agree).
         if (peekMageFlowIndex(io, allocator, sub))
             return .{ .supported = allocator.dupe(u8, "mage_flow") catch return .missing_or_unparseable };
+        // …and an mflux FLUX.2 conversion may carry nothing at all (the only
+        // MLX build of klein 9B ships no config.json). Same fallback, keyed on
+        // the DiT's own weight names.
+        if (peekMfluxFlux2(io, allocator, sub))
+            return .{ .supported = allocator.dupe(u8, "flux2-klein") catch return .missing_or_unparseable };
         return .missing_or_unparseable;
     };
     defer file.close(io);
@@ -164,6 +169,56 @@ pub fn peekMageFlowIndex(io: std.Io, allocator: std.mem.Allocator, sub: std.Io.D
     if (parsed.value.object.get("_mage_flow_version") != null) return true;
     const cn = parsed.value.object.get("_class_name") orelse return false;
     return cn == .string and std.mem.eql(u8, cn.string, "MageFlowPipeline");
+}
+
+/// The FLUX.2 DiT's shared-modulation tensor. Unique to this architecture —
+/// no other diffusers-shaped repo names a weight this — so it identifies an
+/// mflux FLUX.2 conversion without a config.json to read.
+const flux2_dit_marker = "double_stream_modulation_img";
+
+/// True when `sub/transformer/` holds FLUX.2 DiT weights. The 4B mirror ships
+/// a root config.json and never reaches here; `mlx-community/flux2-klein-9b-4bit`
+/// ships none, and a repo the server can load but cannot SEE is the MageFlow
+/// class all over again.
+///
+/// Keyed on the architecture, never on the directory shape: transformer + vae +
+/// text_encoder describes most of diffusers. Reads the shard index when there
+/// is one, else the first shard's safetensors header (a single-file conversion
+/// has no index) — in both cases a bounded prefix, never the weights.
+/// Same signature as gen.isMfluxFlux2Repo, over an already-open Dir.
+pub fn peekMfluxFlux2(io: std.Io, allocator: std.mem.Allocator, sub: std.Io.Dir) bool {
+    var tdir = sub.openDir(io, "transformer", .{ .iterate = true }) catch return false;
+    defer tdir.close(io);
+    const cap = 1024 * 1024;
+    const buf = allocator.alloc(u8, cap) catch return false;
+    defer allocator.free(buf);
+
+    if (readPrefix(io, tdir, "model.safetensors.index.json", buf)) |idx| {
+        return std.mem.indexOf(u8, idx, flux2_dit_marker) != null;
+    }
+    // No index → a single-file conversion. The safetensors header is a JSON
+    // blob of tensor names prefixed by its own u64 length; that is enough.
+    var it = tdir.iterate();
+    while (it.next(io) catch null) |entry| {
+        if (entry.kind != .file and entry.kind != .sym_link) continue;
+        if (!std.mem.endsWith(u8, entry.name, ".safetensors")) continue;
+        const head = readPrefix(io, tdir, entry.name, buf) orelse continue;
+        if (head.len <= 8) continue;
+        return std.mem.indexOf(u8, head[8..], flux2_dit_marker) != null;
+    }
+    return false;
+}
+
+/// Read at most `buf.len` bytes of `dir/name` into `buf`; null when it can't be
+/// opened or read. Short by design — the callers want a header, not a file, and
+/// the file may be gigabytes.
+fn readPrefix(io: std.Io, dir: std.Io.Dir, name: []const u8, buf: []u8) ?[]u8 {
+    var file = dir.openFile(io, name, .{}) catch return null;
+    defer file.close(io);
+    var rbuf: [4096]u8 = undefined;
+    var rs = file.reader(io, &rbuf);
+    const n = rs.interface.readSliceShort(buf) catch return null;
+    return buf[0..n];
 }
 
 /// Result of scanning a directory for LLM `.gguf` files (mmproj sidecars
@@ -606,7 +661,9 @@ fn tryAddModel(
         // `/v1/models` and the app picker. Anything with neither file still
         // returns false below, via `.missing_or_unparseable`.
         const has_config = if (sub.statFile(io, "config.json", .{})) |st| st.kind == .file else |_| false;
-        if (!has_config and !peekMageFlowIndex(io, allocator, sub)) return false;
+        if (!has_config and
+            !peekMageFlowIndex(io, allocator, sub) and
+            !peekMfluxFlux2(io, allocator, sub)) return false;
 
         // Filter by supported model_type AND quantization scheme. Catches:
         //   - partially-downloaded checkpoints (missing/garbage config)
@@ -1025,6 +1082,49 @@ test "discoverModels finds a MageFlow repo (model_index.json, no root config.jso
     try testing.expectEqualStrings("microsoft/Mage-Flow-Turbo", result.models[0].id);
     try testing.expectEqualStrings("mage_flow", result.models[0].model_type);
     // Size is the whole tree — the weights live in component subdirs.
+    try testing.expectEqual(@as(?u64, 14), result.models[0].bytes_on_disk);
+}
+
+test "discoverModels finds an mflux FLUX.2 repo (no root config.json)" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    // The 4B mflux mirror ships a root config.json; `mlx-community/flux2-klein-9b-4bit`
+    // — the only MLX build of the 9B — ships NONE. Same class as MageFlow: the
+    // repo is a real, loadable model, so `list` / `/v1/models` / the app picker
+    // must see it. The signal is the DiT's own weight names, not a directory
+    // shape (transformer+vae+text_encoder describes half of HuggingFace).
+    try tmp.dir.createDirPath(io, "mlx-community/flux2-klein-9b-4bit/transformer");
+    try tmp.dir.createDirPath(io, "mlx-community/flux2-klein-9b-4bit/text_encoder");
+    try tmp.dir.createDirPath(io, "mlx-community/flux2-klein-9b-4bit/vae");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "mlx-community/flux2-klein-9b-4bit/transformer/model.safetensors.index.json",
+        .data =
+        \\{"weight_map":{"double_stream_modulation_img.linear.weight":"0.safetensors",
+        \\"single_stream_modulation.linear.weight":"0.safetensors"}}
+        ,
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "mlx-community/flux2-klein-9b-4bit/transformer/0.safetensors", .data = "0123456789" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "mlx-community/flux2-klein-9b-4bit/text_encoder/0.safetensors", .data = "0123" });
+    // A diffusers repo of some OTHER architecture must stay invisible — the
+    // fingerprint is what separates them, and a shape test would take both.
+    try tmp.dir.createDirPath(io, "mlx-community/some-other-dit/transformer");
+    try tmp.dir.writeFile(io, .{
+        .sub_path = "mlx-community/some-other-dit/transformer/model.safetensors.index.json",
+        .data = "{\"weight_map\":{\"blocks.0.attn.qkv.weight\":\"0.safetensors\"}}",
+    });
+    try tmp.dir.writeFile(io, .{ .sub_path = "mlx-community/some-other-dit/transformer/0.safetensors", .data = "0123" });
+
+    var result = try discoverModelsInDir(io, allocator, tmp.dir, "/root");
+    defer result.deinit();
+
+    try testing.expectEqual(@as(usize, 1), result.models.len);
+    try testing.expectEqualStrings("mlx-community/flux2-klein-9b-4bit", result.models[0].id);
+    try testing.expectEqualStrings("flux2-klein", result.models[0].model_type);
+    try testing.expectEqual(ModelKind.image, modelKindFromType(result.models[0].model_type));
+    // Weights live one level down, like every other diffusers-shaped repo.
     try testing.expectEqual(@as(?u64, 14), result.models[0].bytes_on_disk);
 }
 

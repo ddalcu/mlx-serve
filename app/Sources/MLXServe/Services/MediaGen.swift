@@ -125,6 +125,35 @@ struct ImageModelPreset: Identifiable, Hashable {
         description: "A fast, lightweight image generator — great for everyday text-to-image and quick edits without a huge download."
     )
 
+    /// FLUX.2-klein 9B 4-bit. Same architecture as the 4B — the whole delta is
+    /// six numbers (8 double / 24 single blocks, 32 heads, wider joint dim, and
+    /// a Qwen3-8B text encoder instead of the 4B's), which the engine reads off
+    /// the checkpoint rather than assuming. Twice the download for a
+    /// meaningfully stronger model at the same 4-step-ish schedule.
+    ///
+    /// `mlx-community/flux2-klein-9b-4bit` is the only MLX conversion of it and
+    /// ships NO root config.json — hence its own bundle markers, and the
+    /// server-side weight-name fingerprint that makes the dir discoverable.
+    static let flux2Klein9B_Q4 = ImageModelPreset(
+        id: "mflux/flux2-klein-9b-q4",
+        name: "FLUX.2-klein 9B 4-bit (~10 GB)",
+        variant: .flux2Klein9B,
+        configName: "flux2_klein_9b",
+        repo: "mlx-community/flux2-klein-9b-4bit",
+        approxDownloadGB: 10,
+        approxRAMGB: 16,
+        resolutions: fluxResolutions,
+        defaultResolution: fluxResolutions[0],
+        qualityProfiles: [
+            .fast:         .init(steps: 4),
+            .good:         .init(steps: 8),
+            .quality:      .init(steps: 12),
+            .superQuality: .init(steps: 20),
+        ],
+        defaultQuality: .good,
+        description: "The bigger FLUX.2-klein — stronger prompt following and detail than the 4B, with the same fast schedule and the same instruction editing. Twice the download and memory."
+    )
+
     // Krea-2-Turbo accepts any multiple of 16 in [256, 2048]; offer a few
     // common buckets (the server resolves/clamps anything off-grid).
     private static let kreaResolutions: [ResolutionOption] = [
@@ -292,6 +321,7 @@ struct ImageModelPreset: Identifiable, Hashable {
     static let all: [ImageModelPreset] = [
         .flux2Klein4B_Q4,                              // 5
         .mageFlowTurbo8bit, .mageFlowEditTurbo8bit,    // 9, 10
+        .flux2Klein9B_Q4,                              // 10
         .krea2Turbo,                                   // 15
         .mageFlowTurbo, .mageFlowEditTurbo,            // 17, 17
     ]
