@@ -1304,3 +1304,52 @@ Qwen3.6-27B +26% @37K — and a −2% regression when Laguna's 512-window slidin
 which is where the per-layer `KV_ATTN_FUSED_MIN_TK` floor comes from. The wired-site lesson
 repeated mid-round: the first Laguna A/B read EXACTLY neutral because `lagunaAttnWith` was
 not yet wired and both arms ran dense — the engagement grep (0) was the tell.
+
+## The SSM-checkpoint stride was quietly the biggest prefill lever in the engine (2026-07-30)
+
+llm_context_benchmarks read mlx-serve 19-20% behind oMLX on Qwen3.6-27B prompt processing
+at 8K/32K (196.9 vs 243.6, 179.6 vs 224.6 tok/s) while we WON decode — and the falloff
+shape (us 230→197→180 across 2k/8k/32k, them flat) pointed at something that engages
+between 2K and 8K. `MLX_SERVE_PREFILL_TRACE=1` showed an 8238-token prompt prefilling in
+**33 chunks**: the dense-hybrid arm of `effectiveSsmCheckpointStride` kept the raw
+256-token stride, and `nextChunkEnd` dutifully ended a chunk at every 256-boundary. The
+old rationale ("dense prefill is compute-bound, extra chunks are ~free") pre-dated
+`prefillDqGemm`: with the dq route gated at M ≥ 2048, EVERY projection of EVERY chunk ran
+the slow small-M qmm path, plus 33 graph builds, eval barriers and per-chunk MTP history
+captures. One flag flip (`--ssm-checkpoint-stride 2048`) recovered +19% at 8K same-session.
+Fixes, each measured paired on the 27B (M4 Max):
+
+1. **Stride never sub-divides the prefill chunk, on ANY arch** — the MoE coarsening arm
+   is now universal (`effectiveSsmCheckpointStride(base, prefill_chunk)`); tiny tails also
+   merge under checkpoint alignment (a 1-token trailing chunk existed only to lay a
+   snapshot one token before the always-on end snapshot).
+2. **SSM states are materialized in EVERY chunk's eval batch** (they were gated on
+   stride-aligned boundaries): a tail-merged final chunk ends off-boundary, and the
+   always-on end snapshot then captured an UN-evaluated state — `materializedOwnedCopy`
+   re-executed the whole last chunk's GDN scan (−4% at 8K, invisible in the trace's
+   `eval=` bucket because the re-execution bills to the capture).
+3. **Dense hd-256 fused-causal chunk cap is 8192; MoE keeps 4096** (`boundedPrefillChunk`
+   grew an `is_moe` param): dense hybrids have no expert-gather transients, and the full
+   chunk halves per-chunk dequant sweeps (+1.4% at 8K, flat at 32K). The gemma-26B@99K
+   "+3% for +22 GB peak" lesson still governs MoE.
+4. **The always-on snapshot sits `SSM_SNAPSHOT_BACKOFF` (30) tokens BEFORE prompt end,
+   and the held-back tail rides the final logits forward.** A snapshot exactly at the
+   prompt end is unreachable for the next turn's prefix match: the template's
+   generation-prompt suffix (`<|im_start|>assistant\n` + think opener) renders differently
+   once the turn enters history, so the match always lands a few tokens short —
+   `[hot-cache] hybrid miss (no checkpoint ≤ 870 of 897)` was llmprobe's
+   prompt-cache-prefix cell failing. This is the REAL mechanism behind the 2026-06-10
+   "coarsening disabled every prefix-cache hit" event; the fine stride never fixed it, it
+   just happened to lay boundaries underneath the match point. Backoff sizing matters
+   twice: 64 pushed the tail forward to seq ≥ 32, which `prefillEvalCadenceApplies`
+   treats as a prefill — ~450ms of mid-loop eval bubbles on the 27B; 30 keeps it on the
+   verify-shaped fast path (~1ms). MTP history for the held-back span is appended from
+   the final forward's capture-all (a history hole right before the generation point is
+   acceptance-critical).
+
+Result (same-session, defaults vs defaults): 2k 268 vs oMLX 243 (+10%), 8k ~tie at 252,
+32k ~tie at 224 — from −4/−19/−20%. The 8K/32K ties are physics, not a remaining bug:
+2×27e9 FLOP/token at MLX's measured 14.4 TFLOPS bf16 GEMM rate (89% of the M4 Max's
+theoretical 16.2) puts the 8K roofline at ~30.9s and both engines within 3-6% of it.
+Nobody beats anybody by 5% on a dense-27B prefill on this hardware; the winnable margins
+live at short contexts (fixed overheads) and on MoE/small models.

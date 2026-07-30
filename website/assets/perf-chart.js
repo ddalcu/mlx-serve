@@ -15,15 +15,15 @@
   // label. Gemma 4 E2B and Qwen 3.6 27B (MTPLX-opt) are not charted.
   const PERF = {
     'gemma-e4b':   { name: 'Gemma 4 E4B', series: {
-      'LM Studio': [116.2], 'mlx-serve (Drafter)': [177.6] } },
+      'LM Studio': [116.2], 'mlx-serve (Drafter)': [176.5] } },
     'gemma-31b':   { name: 'Gemma 4 31B', series: {
-      'LM Studio': [19.2], 'mlx-serve (Drafter)': [31.7] } },
+      'LM Studio': [19.2], 'mlx-serve (Drafter)': [32.5] } },
     'gemma-26moe': { name: 'Gemma 4 26B-A4B MoE', series: {
-      'LM Studio': [114.3], 'mlx-serve (PLD)': [126.4] } },
+      'LM Studio': [114.3], 'mlx-serve (PLD)': [128.9] } },
     'qwen-27b':    { name: 'Qwen 3.6 27B', series: {
-      'LM Studio': [20.0], 'mlx-serve (MTP)': [77.5] } },
+      'LM Studio': [20.0], 'mlx-serve (MTP)': [73.4] } },
     'qwen-35moe':  { name: 'Qwen 3.6 35B-A3B MoE', series: {
-      'LM Studio': [90.1], 'mlx-serve (MTP)': [229.5] } },
+      'LM Studio': [90.1], 'mlx-serve (MTP)': [233.8] } },
   };
   const WORKLOADS = ['Code'];
   const COLORS = { 'LM Studio': '#c2c2cc' };

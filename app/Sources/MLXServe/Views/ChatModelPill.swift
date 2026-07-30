@@ -24,7 +24,24 @@ struct ChatModelPill: View {
 
     /// Hard cap on the name's width. The pill's size is what keeps it safe in
     /// the toolbar, so this is a contract, not a nicety.
-    private static let maxNameWidth: CGFloat = 170
+    private static let maxNameWidth: CGFloat = 210
+
+    /// What the PILL shows: the model name without its org.
+    ///
+    /// The org is the half of a Hugging Face id that's identical across most of
+    /// your models, and it was eating the width budget from the left while the
+    /// middle-truncation ate the part that identifies the model
+    /// ("mlx-commun…B-it-qat-4bit"). The MENU keeps full ids — that's where
+    /// you're choosing between them, and two orgs can ship the same name.
+    ///
+    /// A LAN id is `org/model@peer`, so taking the last path component keeps
+    /// the peer; anything without a slash, or ending in one, is left alone
+    /// rather than rendered as an empty pill.
+    static func headerName(_ full: String) -> String {
+        guard let slash = full.lastIndex(of: "/") else { return full }
+        let tail = full[full.index(after: slash)...]
+        return tail.isEmpty ? full : String(tail)
+    }
 
     private var lanChatModels: [ModelInfo] { server.lanModels(capability: "chat") }
     private var pickableModels: [LocalModel] { appState.localModels.filter(\.isChatPickable) }
@@ -74,7 +91,7 @@ struct ChatModelPill: View {
                 Image(systemName: "cpu")
                     .font(.system(size: 11, weight: .medium))
                     .foregroundStyle(.secondary)
-                Text(displayName)
+                Text(Self.headerName(displayName))
                     .font(.callout.weight(.medium))
                     .lineLimit(1)
                     .truncationMode(.middle)

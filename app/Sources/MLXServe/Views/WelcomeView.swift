@@ -2,18 +2,30 @@ import SwiftUI
 
 struct WelcomeView: View {
     let onDismiss: () -> Void
-    /// False when no downloaded model can serve chat — drives the "you'll
-    /// need a model first" nudge below the feature cards. A one-time snapshot
-    /// taken when the window is shown (this window isn't live-updating), not
-    /// a reactive binding.
+    /// False when no downloaded model can serve chat — swaps the feature-card
+    /// footer for the starter recommendation. A one-time snapshot taken when
+    /// the window is shown (this window isn't live-updating), not a reactive
+    /// binding.
     let hasChatModels: Bool
     /// Bumps `AppState.pendingModelBrowserOpenTick` — this window is a bare
     /// `NSHostingView` outside the SwiftUI Scene graph, so it can't call
     /// `openWindow` itself.
     let onOpenModelBrowser: () -> Void
+    /// Bumps `AppState.pendingChatOpenTick`, same bridge. Fired on dismiss and
+    /// once the starter download has the server up — the window's job is to end
+    /// in a chat, not in a closed window.
+    let onOpenChat: () -> Void
+
+    /// The downloads/app state the starter card drives. Injected as environment
+    /// objects by `AppState.showWelcomeWindow` (an `NSHostingView` gets none by
+    /// default).
+    @EnvironmentObject var appState: AppState
 
     @State private var pulseMenu = false
     @State private var appeared = false
+    /// UserDefaults-backed: when set, the next launch skips this window and
+    /// opens Chat directly (`LaunchDecision.resolve`).
+    @AppStorage(LaunchDecision.suppressDefaultsKey) private var suppressWelcome = false
 
     // CLI install row state. nil probe = still checking (the probe spawns the
     // user's login shell to read the real PATH, so it runs off-main).
@@ -93,8 +105,9 @@ struct WelcomeView: View {
             .padding(.horizontal, 28)
             .padding(.bottom, 16)
 
-            // No downloaded model can serve chat yet — point straight at the
-            // Model Browser instead of leaving the user to discover it.
+            // No downloaded model can serve chat yet — offer the ONE model
+            // that fits this Mac, right here, instead of sending the user to a
+            // browser to make a taxonomy decision first.
             if !hasChatModels {
                 noModelsHint
                     .padding(.horizontal, 28)
@@ -158,8 +171,10 @@ struct WelcomeView: View {
             .buttonStyle(.plain)
             .padding(.bottom, 14)
 
-            // Dismiss button
+            // Dismiss — and land in the chat window rather than on an empty
+            // desktop with a menu-bar icon the user has to go and find.
             Button {
+                onOpenChat()
                 onDismiss()
                 NSApp.keyWindow?.close()
             } label: {
@@ -171,7 +186,13 @@ struct WelcomeView: View {
             .buttonStyle(.borderedProminent)
             .controlSize(.large)
             .padding(.horizontal, 28)
-            .padding(.bottom, 20)
+            .padding(.bottom, 10)
+
+            Toggle("Don't show this again", isOn: $suppressWelcome)
+                .toggleStyle(.checkbox)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .padding(.bottom, 16)
         }
         .frame(width: 420)
         .fixedSize(horizontal: true, vertical: true)
@@ -193,34 +214,34 @@ struct WelcomeView: View {
 
     @ViewBuilder private var noModelsHint: some View {
         VStack(alignment: .leading, spacing: 8) {
-            HStack(alignment: .top, spacing: 10) {
-                Image(systemName: "arrow.down.circle")
-                    .font(.system(size: 16))
-                    .foregroundColor(.accentColor)
-                    .frame(width: 24, alignment: .center)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("You'll need a model first")
-                        .font(.subheadline.weight(.semibold))
-                    Text("Nothing is downloaded yet — grab one from the Model Browser before you can start chatting.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .fixedSize(horizontal: false, vertical: true)
+            RecommendedStarterCard(
+                pick: RecommendedModelPick.starterPick(
+                    physicalMemoryBytes: ProcessInfo.processInfo.physicalMemory
+                ),
+                // The download's whole point is a working chat: once the server
+                // is up, put the user in it and get this window out of the way.
+                onReady: {
+                    onOpenChat()
+                    onDismiss()
                 }
-            }
+            )
+            .environmentObject(appState)
+            .environmentObject(appState.downloads)
+
+            // Still reachable for anyone who wants to choose — but secondary,
+            // and no longer the only door.
             Button {
                 onOpenModelBrowser()
                 onDismiss()
                 NSApp.keyWindow?.close()
             } label: {
                 Text("Browse Models")
-                    .font(.subheadline.weight(.medium))
+                    .font(.caption)
                     .frame(maxWidth: .infinity)
-                    .padding(.vertical, 3)
             }
-            .buttonStyle(.bordered)
+            .buttonStyle(.plain)
+            .foregroundStyle(Color.accentColor)
         }
-        .padding(12)
-        .background(RoundedRectangle(cornerRadius: 8).fill(Color.accentColor.opacity(0.08)))
     }
 
     // MARK: - CLI install row

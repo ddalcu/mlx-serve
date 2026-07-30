@@ -122,8 +122,17 @@ struct ModelBrowserView: View {
 /// (with its 1M+ repos, quant/pull-count columns, and RAM-fitness dots)
 /// assumes you already know roughly what you're looking for.
 private struct RecommendedPane: View {
+    /// Everything below the one recommendation. Collapsed by default: picking a
+    /// model used to mean choosing a vendor taxonomy before you could chat, and
+    /// the answer for someone who has downloaded nothing is one model, not
+    /// fourteen across four sections.
+    @State private var showsOtherModels = false
+
     private var physicalMemory: UInt64 { ProcessInfo.processInfo.physicalMemory }
     private var ramLabel: String { MemoryInfo.format(Int64(physicalMemory)) }
+    private var starter: RecommendedModelPick {
+        RecommendedModelPick.starterPick(physicalMemoryBytes: physicalMemory)
+    }
 
     var body: some View {
         ScrollView {
@@ -131,51 +140,84 @@ private struct RecommendedPane: View {
                 VStack(alignment: .leading, spacing: 4) {
                     Text("Your Mac has \(ramLabel) of memory")
                         .font(.title3.weight(.semibold))
-                    Text("Here are the recommended models for you to download.")
+                    Text("\(starter.name) is the best fit — download it and start chatting.")
                         .font(.callout)
                         .foregroundStyle(.secondary)
                 }
                 .padding(.top, 4)
 
+                // The recommendation, as a full row: same bars, same RAM
+                // warning, same Download/Use control as everything below it.
                 ModelGroupSection(
-                    title: "Gemma 4",
-                    subtitle: "Google's Gemma 4 family.",
-                    systemImage: "g.circle",
-                    tint: .blue
+                    title: "Best for your Mac",
+                    subtitle: "Matched to this Mac's memory. Everything else is below.",
+                    systemImage: "sparkles",
+                    tint: .accentColor
                 ) {
-                    RecommendedFamilyRows(picks: RecommendedModelPick.gemmaCatalog, physicalMemoryBytes: physicalMemory)
+                    RecommendedModelListRow(pick: starter, physicalMemoryBytes: physicalMemory)
                 }
 
-                ModelGroupSection(
-                    title: "Qwen",
-                    subtitle: "Alibaba's Qwen 3.5/3.6 family — the larger checkpoints ship a native speed boost.",
-                    systemImage: "q.circle",
-                    tint: .teal
-                ) {
-                    RecommendedFamilyRows(picks: RecommendedModelPick.qwenCatalog, physicalMemoryBytes: physicalMemory)
+                Button {
+                    withAnimation { showsOtherModels.toggle() }
+                } label: {
+                    HStack(spacing: 6) {
+                        Image(systemName: showsOtherModels ? "chevron.down" : "chevron.right")
+                            .font(.caption.weight(.semibold))
+                        Text("Other models")
+                            .font(.subheadline.weight(.semibold))
+                        Spacer()
+                    }
+                    .contentShape(Rectangle())
                 }
+                .buttonStyle(.plain)
 
-                ModelGroupSection(
-                    title: "Laguna",
-                    subtitle: "poolside's Laguna 2.1 coding models — mixture-of-experts specialists for code and agent work.",
-                    systemImage: "chevron.left.forwardslash.chevron.right",
-                    tint: .purple
-                ) {
-                    RecommendedFamilyRows(picks: RecommendedModelPick.poolsideCatalog, physicalMemoryBytes: physicalMemory)
-                }
-
-                ModelGroupSection(
-                    title: "Largest models (96 GB+ RAM)",
-                    subtitle: "The biggest models this app runs — DeepSeek-V4-Flash (ds4) and Tencent's 295B Hunyuan 3 — for Macs with a lot of memory.",
-                    systemImage: "memorychip",
-                    tint: .red
-                ) {
-                    RecommendedFamilyRows(picks: RecommendedModelPick.largestCatalog, physicalMemoryBytes: physicalMemory)
+                if showsOtherModels {
+                    otherModels
                 }
             }
             .padding(16)
         }
         .navigationTitle("Recommended")
+    }
+
+    @ViewBuilder private var otherModels: some View {
+        VStack(alignment: .leading, spacing: 20) {
+            ModelGroupSection(
+                title: "Gemma 4",
+                subtitle: "Google's Gemma 4 family.",
+                systemImage: "g.circle",
+                tint: .blue
+            ) {
+                RecommendedFamilyRows(picks: RecommendedModelPick.gemmaCatalog, physicalMemoryBytes: physicalMemory)
+            }
+
+            ModelGroupSection(
+                title: "Qwen",
+                subtitle: "Alibaba's Qwen 3.5/3.6 family — the larger checkpoints ship a native speed boost.",
+                systemImage: "q.circle",
+                tint: .teal
+            ) {
+                RecommendedFamilyRows(picks: RecommendedModelPick.qwenCatalog, physicalMemoryBytes: physicalMemory)
+            }
+
+            ModelGroupSection(
+                title: "Laguna",
+                subtitle: "poolside's Laguna 2.1 coding models — mixture-of-experts specialists for code and agent work.",
+                systemImage: "chevron.left.forwardslash.chevron.right",
+                tint: .purple
+            ) {
+                RecommendedFamilyRows(picks: RecommendedModelPick.poolsideCatalog, physicalMemoryBytes: physicalMemory)
+            }
+
+            ModelGroupSection(
+                title: "Largest models (96 GB+ RAM)",
+                subtitle: "The biggest models this app runs — DeepSeek-V4-Flash (ds4) and Tencent's 295B Hunyuan 3 — for Macs with a lot of memory.",
+                systemImage: "memorychip",
+                tint: .red
+            ) {
+                RecommendedFamilyRows(picks: RecommendedModelPick.largestCatalog, physicalMemoryBytes: physicalMemory)
+            }
+        }
     }
 }
 
@@ -227,10 +269,64 @@ private struct RecommendedFamilyRows: View {
     }
 }
 
+/// The three comparative bars under a recommendation: Intelligence, Speed,
+/// Context. They replaced capability chips ("Fast replies", "Balanced",
+/// "Coding help") that repeated the blurb and said nothing about how one pick
+/// compares to the one above it — which is the only question this pane exists
+/// to answer.
+///
+/// No number is drawn. The scores are a hand-maintained comparison between
+/// these picks (see `RecommendedModels.swift`'s header for where each comes
+/// from), and printing "62" would claim a precision they don't have. An
+/// estimated intelligence score says so in the label instead of quietly
+/// reading like a measurement.
+private struct CapabilityBars: View {
+    let pick: RecommendedModelPick
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            bar("Intelligence", pick.intelligenceBar, .blue,
+                note: pick.intelligenceIsEstimated ? "estimated" : nil,
+                help: pick.intelligenceIsEstimated
+                    ? "Our estimate — this model has no Artificial Analysis Intelligence Index entry."
+                    : "Artificial Analysis Intelligence Index, for the original weights.")
+            bar("Speed", pick.speedBar, .green, note: nil,
+                help: "Roughly how fast it replies on an Apple Silicon Mac, relative to the other models here.")
+            bar("Context", pick.contextBar, .orange, note: nil,
+                help: "How much text it can hold at once. Your Mac's memory may lower this in practice.")
+        }
+    }
+
+    private func bar(_ label: String, _ fill: Double, _ tint: Color, note: String?, help: String) -> some View {
+        HStack(spacing: 6) {
+            Text(label)
+                .font(.system(size: 9))
+                .foregroundStyle(.secondary)
+                .frame(width: 62, alignment: .leading)
+            GeometryReader { geo in
+                ZStack(alignment: .leading) {
+                    Capsule().fill(.quaternary)
+                    Capsule().fill(tint.opacity(0.75))
+                        .frame(width: max(2, geo.size.width * fill))
+                }
+            }
+            .frame(height: 4)
+            .frame(maxWidth: 120)
+            if let note {
+                Text(note)
+                    .font(.system(size: 9))
+                    .foregroundStyle(.tertiary)
+            }
+            Spacer(minLength: 0)
+        }
+        .help(help)
+    }
+}
+
 /// One list row for a chat-model recommendation: name, tagline, a plain-
-/// English description underneath, capability chips, and the Download/Use
-/// action — the list-style analogue of the Media pane's `MediaModelRow`, with
-/// the richer copy this pane needs.
+/// English description underneath, the three capability bars, and the
+/// Download/Use action — the list-style analogue of the Media pane's
+/// `MediaModelRow`, with the richer copy this pane needs.
 private struct RecommendedModelListRow: View {
     let pick: RecommendedModelPick
     let physicalMemoryBytes: UInt64
@@ -289,15 +385,8 @@ private struct RecommendedModelListRow: View {
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
 
-                HStack(spacing: 6) {
-                    ForEach(pick.highlights, id: \.self) { chip in
-                        Text(chip)
-                            .font(.system(size: 9).weight(.medium))
-                            .padding(.horizontal, 5)
-                            .padding(.vertical, 2)
-                            .background(.quaternary, in: Capsule())
-                    }
-                }
+                CapabilityBars(pick: pick)
+                    .padding(.top, 2)
 
                 if !meetsRequirements {
                     Label(

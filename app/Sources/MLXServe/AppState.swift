@@ -117,6 +117,10 @@ class AppState: ObservableObject {
             Task { await applyAgentSelection(defaultAgentId, previousWorkingDirectory: nil) }
         }
     }
+    /// The agent the Agents window should open ON, set by whoever deep-links
+    /// into it (`openAgentSettings`) and consumed by the window. Not persisted —
+    /// it's a one-shot request, not a setting.
+    @Published var pendingAgentSelection: UUID?
     @Published var toolExecutor = ToolExecutor()
     /// Owns every agent-spawned background process (started via shell
     /// run_in_background, or adopted by the foreground timeout backstop).
@@ -189,17 +193,21 @@ class AppState: ObservableObject {
             quickLauncher.setEnabled(quickLauncherEnabled)
         }
     }
-    /// Bumped by the quick launcher's "Open in chat" action. The menu-bar
-    /// label observes it (the label is always installed, so this works with no
-    /// window open — same bridge as the task-notification deep-link) and opens
-    /// the chat window. An Int tick so every bump fires onChange, no reset dance.
-    @Published var quickLauncherChatOpenTick = 0
+    /// "Open the chat window" for callers that can't reach SwiftUI's
+    /// `openWindow`: the quick launcher's "Open in chat" (a non-activating
+    /// NSPanel) and the welcome window (a bare `NSHostingView` outside the
+    /// Scene graph). The menu-bar label observes it — the label is always
+    /// installed, so this works with no window open, same bridge as the
+    /// task-notification deep-link. An Int tick so every bump fires onChange,
+    /// no reset dance. ONE bridge for both callers rather than a second
+    /// near-identical tick: they want the same window.
+    @Published var pendingChatOpenTick = 0
 
     /// Bumped by the welcome window's "Browse Models" nudge (shown when no
     /// chat model is downloaded yet) — the welcome window is a bare
     /// `NSHostingView` outside the SwiftUI Scene graph, so it can't reach
     /// `openWindow` itself. Same always-present-menu-bar-label bridge as
-    /// `quickLauncherChatOpenTick`.
+    /// `pendingChatOpenTick`.
     @Published var pendingModelBrowserOpenTick = 0
 
     /// Owns the global hotkey + floating panel. App-level like the voice
@@ -235,7 +243,15 @@ class AppState: ObservableObject {
     }()
 
     init() {
-        self.autoStartServer = UserDefaults.standard.bool(forKey: "autoStartServer")
+        // Defaults to ON when the key is absent — `UserDefaults.bool` would
+        // read a never-set key as false, which is why a fresh install used to
+        // download a model and then sit there with the server stopped. The
+        // launch gate below is `autoStartServer && !selectedModelPath.isEmpty`,
+        // so this stays a no-op until a model exists; the first download's
+        // completion hook is what actually starts it. No migration: existing
+        // users who never touched the toggle get it turned on, which is the
+        // intent.
+        self.autoStartServer = UserDefaults.standard.object(forKey: "autoStartServer") as? Bool ?? true
         self.hotSwitchEnabled = UserDefaults.standard.bool(forKey: "hotSwitchEnabled")
         self.selectedModelPath = UserDefaults.standard.string(forKey: "selectedModelPath") ?? ""
         // Load ServerOptions, then migrate legacy single-key defaults
@@ -303,14 +319,27 @@ class AppState: ObservableObject {
         // ⌘Tab-selectable; menu-bar-only → back to accessory.
         ActivationPolicyManager.shared.start()
 
-        // Show the welcome window on every launch — it's the app's intro /
-        // quick-start screen and hosts the CLI install button.
+        // The welcome window is the app's intro / quick-start screen and hosts
+        // the CLI install button, so it shows on every launch — unless the user
+        // ticked "Don't show this again", in which case the launch goes
+        // straight to Chat (`LaunchDecision`). Either way the user ends up in
+        // front of a composer rather than looking at an empty desktop.
+        let suppressed = UserDefaults.standard.bool(forKey: LaunchDecision.suppressDefaultsKey)
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
-            Self.showWelcomeWindow(
-                hasChatModels: self?.localModels.contains(where: \.isChatPickable) ?? true,
-                onDismiss: { Self._welcomeWindow?.close() },
-                onOpenModelBrowser: { self?.pendingModelBrowserOpenTick += 1 }
-            )
+            guard let self else { return }
+            let hasChat = self.localModels.contains(where: \.isChatPickable)
+            switch LaunchDecision.resolve(welcomeSuppressed: suppressed, hasChatModels: hasChat) {
+            case .openChat:
+                self.pendingChatOpenTick += 1
+            case .showWelcome:
+                Self.showWelcomeWindow(
+                    appState: self,
+                    hasChatModels: hasChat,
+                    onDismiss: { Self._welcomeWindow?.close() },
+                    onOpenModelBrowser: { self.pendingModelBrowserOpenTick += 1 },
+                    onOpenChat: { self.pendingChatOpenTick += 1 }
+                )
+            }
         }
 
         // Auto-start server if enabled and a model is available
@@ -677,11 +706,21 @@ class AppState: ObservableObject {
     // MARK: - Welcome Window
 
     private static func showWelcomeWindow(
+        appState: AppState,
         hasChatModels: Bool,
         onDismiss: @escaping () -> Void,
-        onOpenModelBrowser: @escaping () -> Void
+        onOpenModelBrowser: @escaping () -> Void,
+        onOpenChat: @escaping () -> Void
     ) {
-        let view = WelcomeView(onDismiss: onDismiss, hasChatModels: hasChatModels, onOpenModelBrowser: onOpenModelBrowser)
+        // This is an NSHostingView, so it inherits NO environment — the starter
+        // card's `@EnvironmentObject`s have to be handed to it explicitly or
+        // SwiftUI traps the first time the card renders.
+        let view = WelcomeView(onDismiss: onDismiss,
+                               hasChatModels: hasChatModels,
+                               onOpenModelBrowser: onOpenModelBrowser,
+                               onOpenChat: onOpenChat)
+            .environmentObject(appState)
+            .environmentObject(appState.downloads)
         let hostingView = NSHostingView(rootView: view)
 
         // Let SwiftUI compute the intrinsic size

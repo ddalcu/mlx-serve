@@ -231,13 +231,13 @@ final class QuickLauncherController: NSObject, ObservableObject, NSWindowDelegat
     }
 
     /// Focus the launcher's session in the chat window. The window itself is
-    /// opened by the menu-bar label observing `quickLauncherChatOpenTick` —
+    /// opened by the menu-bar label observing `pendingChatOpenTick` —
     /// SwiftUI `Window` scenes can only be opened via the `openWindow`
     /// environment, and the always-installed label is the established bridge
     /// (see the task-notification deep-link).
     func openInChat() {
         if let sessionId { appState.activeChatId = sessionId }
-        appState.quickLauncherChatOpenTick += 1
+        appState.pendingChatOpenTick += 1
         hide()
     }
 

@@ -1,4 +1,5 @@
 import Foundation
+import SwiftUI
 
 /// The app-side half of agents (personas): the defaults every turn falls back
 /// to, and what actually happens when the user picks one — model, workspace,
@@ -61,15 +62,37 @@ extension AppState {
         return agents.agent(id: session.agentId)
     }
 
-    /// Set (or clear) a tab's agent. Applies to SUBSEQUENT turns only — the
-    /// transcript stays exactly as it was, so a switch mid-conversation reads as
-    /// handing the thread to someone else rather than rewriting history.
-    func setAgent(_ agentId: UUID?, forSession sessionId: UUID) {
-        guard let idx = chatSessions.firstIndex(where: { $0.id == sessionId }) else { return }
-        guard chatSessions[idx].agentId != agentId else { return }
-        chatSessions[idx].agentId = agentId
-        saveChatHistory()
-        Task { await applyAgentSelection(agentId, previousWorkingDirectory: chatSessions[idx].workingDirectory) }
+    /// Start a NEW chat as `agentId` (nil = the app's own defaults).
+    ///
+    /// A session's agent is decided here and never again: there is deliberately
+    /// no `setAgent(_:forSession:)` any more. Switching mid-thread left half a
+    /// conversation running under someone else's prompt, tools, model and voice,
+    /// with nothing but the transcript to show where the seam was — and the
+    /// composer's Think/Tools/MCP discs flipping under you as it happened. The
+    /// choice belongs next to New Chat, which is where the button lives.
+    ///
+    /// Editing the agent still applies live: every turn re-reads
+    /// `AgentResolution`, so turning its thinking on in the editor turns it on
+    /// for the conversation already in progress.
+    @discardableResult
+    func startChat(withAgent agentId: UUID?) -> UUID {
+        let id = newChatSession(agentId: agentId)
+        // Model, workspace and voice all live OUTSIDE the turn — a session that
+        // only carried the id would run the persona against whatever model
+        // happened to be loaded.
+        let workingDirectory = chatSessions.first { $0.id == id }?.workingDirectory
+        Task { await applyAgentSelection(agentId, previousWorkingDirectory: workingDirectory) }
+        return id
+    }
+
+    /// Open the Agents window ON a specific agent.
+    ///
+    /// The window is a single reused instance that otherwise lands on whoever
+    /// sorts first, which is the wrong agent every time the user got here from a
+    /// locked composer disc that just named a different one.
+    func openAgentSettings(_ agentId: UUID, using openWindow: OpenWindowAction) {
+        pendingAgentSelection = agentId
+        AppActivation.openWindow(id: "agents", using: openWindow)
     }
 
     /// Everything that has to happen OUTSIDE the turn when an agent becomes

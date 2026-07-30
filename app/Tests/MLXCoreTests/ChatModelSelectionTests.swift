@@ -51,4 +51,36 @@ final class ChatModelSelectionTests: XCTestCase {
         XCTAssertEqual(ChatModelSelection.action(for: "/Users/me/lan/models"),
                        .selectLocal("/Users/me/lan/models"))
     }
+
+    // MARK: - Header name
+    //
+    // The toolbar pill drops the org, which is the half of a Hugging Face id
+    // that is identical across most of your models and was eating the width
+    // budget mid-truncation ("mlx-commun…B-it-qat-4bit" told you nothing). The
+    // MENU keeps full ids — that is where you're choosing between them, and two
+    // orgs can ship the same model name.
+
+    func testTheHeaderDropsTheOrg() {
+        XCTAssertEqual(ChatModelPill.headerName("mlx-community/gemma-3-12b-it-qat-4bit"),
+                       "gemma-3-12b-it-qat-4bit")
+    }
+
+    func testANameWithNoOrgIsUnchanged() {
+        XCTAssertEqual(ChatModelPill.headerName("Select a model"), "Select a model")
+        XCTAssertEqual(ChatModelPill.headerName("gemma-3-12b"), "gemma-3-12b")
+    }
+
+    /// A LAN id is `org/model@peer` — dropping the org must keep the peer, or
+    /// the pill stops saying the answer is coming from another Mac.
+    func testALanIdKeepsItsPeer() {
+        XCTAssertEqual(ChatModelPill.headerName("mlx-community/qwen3-4b@studio"),
+                       "qwen3-4b@studio")
+    }
+
+    /// Nested ids and a stray trailing slash must not produce an empty pill.
+    func testDegenerateFormsNeverGoEmpty() {
+        XCTAssertEqual(ChatModelPill.headerName("a/b/c"), "c")
+        XCTAssertEqual(ChatModelPill.headerName("org/"), "org/")
+        XCTAssertEqual(ChatModelPill.headerName(""), "")
+    }
 }

@@ -78,7 +78,7 @@ final class ComposerModeControlTests: XCTestCase {
     /// differently-worded tooltip on top of the card, and the two drift.
     func testEveryComposerControlHasOneHoverCardAndNoNativeTooltip() throws {
         let source = try chatViewSource()
-        for control in ["agentChip", "attachmentMenu", "thinkToggle", "agentToggle", "mcpToggle"] {
+        for control in ["attachmentMenu", "thinkToggle", "agentToggle", "mcpToggle"] {
             let body = try declaration(control, in: source)
             XCTAssertTrue(body.contains(".composerTip("), "\(control) has no hover card")
             XCTAssertFalse(body.contains(".help("),
@@ -129,5 +129,174 @@ final class ComposerModeControlTests: XCTestCase {
         let source = try chatViewSource()
         XCTAssertFalse(source.contains("sandboxShield"),
                        "the sandbox shield was removed from the chat composer")
+    }
+
+    // MARK: - Agent lock
+
+    /// The discs' locked values must come from the SAME resolution the turn runs
+    /// under, or they go back to disagreeing with it — which is the bug this
+    /// exists to fix (every agent defaults `web: true`, so `AgentResolution`
+    /// forced the tool loop on while the wrench still rendered OFF).
+    func testTheLockIsBuiltFromTheTurnsOwnResolutionNotFromTheAgentDirectly() throws {
+        let source = try chatViewSource()
+        let start = try XCTUnwrap(source.range(of: "private var agentModeLock: AgentModeLock? {"),
+                                  "ChatView must derive the composer's lock from a resolution")
+        let rest = source[start.upperBound...]
+        let body = String(rest[..<(rest.range(of: "\n    private ")?.lowerBound ?? rest.endIndex)])
+        XCTAssertTrue(body.contains("resolvedAgentSettings("), """
+            the lock's Tools/MCP values must come from `resolvedAgentSettings` — \
+            reading `capabilities` here would be a second copy of the rule and the \
+            icons would drift from what the turn actually runs.
+            """)
+    }
+
+    /// Belt-and-braces, same shape as the tool-dispatch refusal: the locked disc
+    /// no longer offers a primary action, and the setters refuse anyway — the
+    /// pre-send intent nudge calls them too.
+    func testTheToggleSettersRefuseWhileLocked() throws {
+        let source = try chatViewSource()
+        for setter in ["private func setToolsEnabled(_ on: Bool) {",
+                       "private func setMCPEnabled(_ on: Bool) {"] {
+            let start = try XCTUnwrap(source.range(of: setter), "missing \(setter)")
+            let rest = source[start.upperBound...]
+            let body = String(rest[..<(rest.range(of: "\n    }")?.upperBound ?? rest.endIndex)])
+            XCTAssertTrue(body.contains("LockedBy"),
+                          "\(setter) must no-op while an agent owns the control")
+        }
+    }
+
+    /// A nudge offering to turn on a mode the agent forbids is a dead offer —
+    /// accepting it changes nothing and the message sends anyway.
+    func testThePreSendNudgeIsSuppressedForLockedModes() throws {
+        let source = try chatViewSource()
+        let start = try XCTUnwrap(source.range(of: "private func detectIntentPrompt(for text: String) -> IntentPrompt? {"))
+        let rest = source[start.upperBound...]
+        let body = String(rest[..<(rest.range(of: "\n    }")?.upperBound ?? rest.endIndex)])
+        XCTAssertTrue(body.contains("LockedBy"),
+                      "detectIntentPrompt must not offer a mode the agent decides")
+    }
+
+    /// "Edit Agent…" on a locked disc must land on THAT agent, not on whoever
+    /// sorts first — the whole reason the row exists is that the user just read
+    /// the agent's name on the card.
+    func testEditAgentDeepLinksToTheAgentThatLockedTheControl() throws {
+        let source = try chatViewSource()
+        let start = try XCTUnwrap(source.range(of: "private func lockedModeMenu("),
+                                  "the locked discs must still offer a way into the agent")
+        let rest = source[start.upperBound...]
+        let body = String(rest[..<(rest.range(of: "\n    private ")?.lowerBound ?? rest.endIndex)])
+        XCTAssertTrue(body.contains("openAgentSettings("), """
+            Edit Agent… must route through `AppState.openAgentSettings` — a bare \
+            openWindow(id: "agents") opens the window on the first agent in the list.
+            """)
+    }
+
+    // MARK: - The agent is chosen when the chat is, and fixed after
+
+    /// The picker moved OUT of the composer row: it configured the whole
+    /// conversation, not the message being written, and it sat next to four
+    /// controls the agent then overrode.
+    func testTheComposerRowNoLongerHoldsTheAgentPicker() throws {
+        let source = try chatViewSource()
+        XCTAssertFalse(source.contains("agentChip"),
+                       "the agent picker lives next to New Chat now, not in the composer")
+    }
+
+    /// Switching mid-thread left half a conversation running under someone
+    /// else's prompt, tools and model, with nothing but the transcript to show
+    /// where the seam was. A session's agent is now decided when the session is
+    /// created and never after — structurally, by there being no setter.
+    func testASessionsAgentCannotBeChangedAfterItIsCreated() throws {
+        let agentsSource = try String(contentsOf: URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("Sources/MLXServe/Services/AppStateAgents.swift"), encoding: .utf8)
+        XCTAssertFalse(agentsSource.contains("func setAgent("), """
+            `setAgent(_:forSession:)` is gone on purpose — a session's agent is \
+            fixed at creation. Starting a chat AS an agent goes through \
+            `startChat(withAgent:)`.
+            """)
+        XCTAssertTrue(agentsSource.contains("func startChat(withAgent"),
+                      "the sidebar needs one call that creates the session AND applies the agent")
+    }
+
+    /// It has to actually apply the agent — its model, workspace and voice all
+    /// live outside the turn, and a session that only carries the ID would run
+    /// the persona against whatever model happened to be loaded.
+    func testStartingAChatAsAnAgentAppliesThatAgentsSelection() throws {
+        let agentsSource = try String(contentsOf: URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("Sources/MLXServe/Services/AppStateAgents.swift"), encoding: .utf8)
+        let start = try XCTUnwrap(agentsSource.range(of: "func startChat(withAgent"))
+        let rest = agentsSource[start.upperBound...]
+        let body = String(rest[..<(rest.range(of: "\n    }")?.upperBound ?? rest.endIndex)])
+        XCTAssertTrue(body.contains("newChatSession("), "it must create the session")
+        XCTAssertTrue(body.contains("applyAgentSelection("),
+                      "model / workspace / voice all live outside the turn")
+    }
+
+    func testTheAgentPickerSitsNextToNewChat() throws {
+        let source = try chatViewSource()
+        let sidebar = try XCTUnwrap(source.range(of: "struct ChatSidebar: View {"))
+        let rest = source[sidebar.upperBound...]
+        let body = String(rest[..<(rest.range(of: "\n// MARK:")?.lowerBound ?? rest.endIndex)])
+        XCTAssertTrue(body.contains("newAgentChatMenu"),
+                      "the sidebar owns the agent picker now")
+        XCTAssertTrue(body.contains("startChat(withAgent:"),
+                      "picking an agent starts a chat as that agent")
+    }
+
+    // MARK: - Content passing under floating chrome
+
+    /// Transcript text ran straight into the floating model-picker cluster.
+    /// The fix is the platform's own scroll-edge effect (`scrollEdgeEffectStyle`,
+    /// macOS 26+) on the scrolling surfaces — NOT a hand-drawn band, which is how
+    /// this went wrong the first time: a custom strip pulled in via
+    /// `ignoresSafeArea` looked native and swallowed every click in the toolbar
+    /// band's layer.
+    func testScrollingSurfacesUseTheNativeScrollEdgeEffect() throws {
+        let source = try chatViewSource()
+        let sidebar = try XCTUnwrap(source.range(of: "struct ChatSidebar: View {"))
+        let sidebarBody = String(source[sidebar.upperBound...]
+            .prefix(while: { _ in true }))
+            .components(separatedBy: "\n// MARK:").first ?? ""
+        XCTAssertTrue(sidebarBody.contains(".scrollEdgeEffectStyle("),
+                      "the session list needs the native edge effect under its chrome")
+
+        let occurrences = source.components(separatedBy: ".scrollEdgeEffectStyle(").count - 1
+        XCTAssertGreaterThanOrEqual(occurrences, 2,
+                                    "both the sidebar and the transcript scroll under floating chrome")
+    }
+
+    /// Both columns carry the SYSTEM toolbar material, and the effect needs it:
+    /// with the band hidden there is no bar for `scrollEdgeEffectStyle` to
+    /// attach to, so it drew nothing and transcript text clipped mid-line under
+    /// the model picker (live 2026-07-30). The system material is the
+    /// 100%-width surface; the hand-drawn strip that predated it is the thing
+    /// that must not come back.
+    func testBothColumnsCarryTheSystemToolbarMaterial() throws {
+        let source = try chatViewSource()
+        XCTAssertFalse(source.contains(".toolbarBackground(.hidden, for: .windowToolbar)"), """
+            hiding the band leaves the scroll-edge effect with nothing to attach \
+            to — content then runs straight into the floating controls.
+            """)
+        let visible = source.components(separatedBy: ".toolbarBackground(.visible, for: .windowToolbar)").count - 1
+        XCTAssertEqual(visible, 2, "the sidebar and the detail column must agree — the bar is one surface")
+    }
+
+    // MARK: - Hover card dismissal
+
+    /// The card is a non-hit-testing overlay, so the only thing that takes it
+    /// down is a hover-exit — which opening a menu does NOT deliver. It then sits
+    /// under the open menu. `NSMenu.didBeginTrackingNotification` fires for both
+    /// buttons (SwiftUI's `Menu` and `.contextMenu` are both NSMenus) and for
+    /// press-and-hold, so one observer covers every way in.
+    func testTheHoverCardIsTakenDownWhenAMenuOpensOverIt() throws {
+        let tipSource = try String(contentsOf: URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("Sources/MLXServe/Views/ComposerTip.swift"), encoding: .utf8)
+        XCTAssertTrue(tipSource.contains("NSMenu.didBeginTrackingNotification"), """
+            opening a menu over the composer must dismiss the hover card — left-click \
+            on the agent/attach menus, right-click on the Tools/MCP discs.
+            """)
     }
 }

@@ -91,18 +91,21 @@ pub const PREFILL_CHUNK_FLOOR: usize = 512;
 /// additionally cap the auto chunk at 2048 — composed-causal prefill
 /// measured strictly faster and ~9 GB lighter there (see the inline
 /// comment). Gemma keeps the formula-only policy for its fused band layers.
-pub fn boundedPrefillChunk(base_chunk: usize, head_dim: u32, n_heads: u32, total_ctx: usize, sliding_band_arch: bool) usize {
+pub fn boundedPrefillChunk(base_chunk: usize, head_dim: u32, n_heads: u32, total_ctx: usize, sliding_band_arch: bool, is_moe: bool) usize {
     if (head_dim <= 128 or n_heads == 0 or total_ctx == 0) return base_chunk;
     // Non-sliding hd-256 archs under FUSED causal (the default since the
     // budgeted-dispatch flip): no score tensor exists, so the scores-budget
     // formula below is moot — and its old shrink (1024 at 64K on 24 heads)
     // starved the dequant+GEMM qmm route, which needs M >= 2048 to engage
     // (the 64K rung was the ladder's weakest for exactly this reason).
-    // Chunk 4096 measured faster than 2048 same-session on the 27B even
-    // before the dq route (+1.2% 8K / +0.6% 32K) and halves the per-chunk
-    // dequant overhead on top. Never raises a caller-lowered base.
+    // MoE keeps the 4096 cap: expert-gather transients scale with the chunk
+    // (the gemma-26B@99K lesson: +3% speed for +22 GB peak is a bad trade).
+    // DENSE hybrids have no gather transients and a full-size chunk halves
+    // the per-chunk dequant sweeps: chunk 8192 measured +1.4% over 4096 at
+    // the 8K rung on Qwen3.6-27B dense (M4 Max, 2026-07-30), flat at 32K.
+    // Never raises a caller-lowered base.
     if (!sliding_band_arch and transformer_mod.fused256CausalMode() == .all) {
-        return @min(base_chunk, 4096);
+        return @min(base_chunk, if (is_moe) @as(usize, 4096) else @as(usize, 8192));
     }
     // Composed-causal fallback (MLX_SERVE_FUSED_256_CAUSAL=0): SMALL chunks
     // measured strictly faster AND lighter on the 27B (2026-07-12 ladder,
@@ -129,10 +132,10 @@ pub fn boundedPrefillChunk(base_chunk: usize, head_dim: u32, n_heads: u32, total
 /// boundedPrefillChunk. Exported so server.zig's admission guard
 /// (checkAttentionMemory) models the SAME chunk the prefill will run with —
 /// the guard and the real prefill must not drift.
-pub fn effectivePrefillChunk(head_dim: u32, n_heads: u32, total_ctx: usize, sliding_band_arch: bool) usize {
+pub fn effectivePrefillChunk(head_dim: u32, n_heads: u32, total_ctx: usize, sliding_band_arch: bool, is_moe: bool) usize {
     const env_chunk = readEnvUsize("MLX_SERVE_PREFILL_CHUNK", 0);
     if (env_chunk > 0) return env_chunk;
-    return boundedPrefillChunk(prefill_chunk_override, head_dim, n_heads, total_ctx, sliding_band_arch);
+    return boundedPrefillChunk(prefill_chunk_override, head_dim, n_heads, total_ctx, sliding_band_arch, is_moe);
 }
 
 /// Read an unsigned integer from an environment variable, falling back to
@@ -330,33 +333,74 @@ pub fn nextChunkEnd(
         const abs_end = end + ssm_cp_offset;
         const next_boundary_abs = ((abs_pos / ssm_cp_stride) + 1) * ssm_cp_stride;
         if (next_boundary_abs > abs_pos and next_boundary_abs < abs_end) {
-            end = next_boundary_abs - ssm_cp_offset;
+            // A stride boundary lands inside this chunk — end exactly on it
+            // (never tail-merge past it; the boundary IS the snapshot point).
+            return next_boundary_abs - ssm_cp_offset;
         }
-    } else if (end < prefix_len and prefix_len - end < TAIL_MERGE_MAX) {
-        // No checkpoint alignment to respect — absorb a tiny tail.
+    }
+    if (end < prefix_len and prefix_len - end < TAIL_MERGE_MAX) {
+        // Absorb a tiny tail instead of paying a full graph build + eval
+        // barrier for a few tokens. With checkpointing active this can only
+        // extend within a boundary-free span (the boundary case returned
+        // above), so at most a snapshot < TAIL_MERGE_MAX tokens before the
+        // end is skipped — and the always-on end-of-prompt snapshot lands
+        // right there anyway.
         end = prefix_len;
     }
     return end;
 }
 
-/// Effective SSM-checkpoint stride for a model, given the base (configured)
-/// stride and whether the model is MoE.
+/// Tokens held back from the chunked-prefill loop and forwarded together with
+/// the final (logits) forward when SSM checkpointing is active, so the
+/// always-on snapshot lands SSM_SNAPSHOT_BACKOFF tokens BEFORE the prompt end.
 ///
-/// On dense / non-MoE-hybrid models (dense Gemma sliding-window, LFM2, Nemotron-H)
-/// prefill is compute-bound, so a fine stride is ~free and buys finer warm
-/// mid-prompt reuse — keep the base stride. On MoE models prefill is
-/// memory-bound on the per-expert weights: every checkpoint-induced chunk
-/// re-streams ~all expert weights from HBM (the dominant cold-prefill cost), so
-/// a fine stride silently taxes prefill ~25% on 26B/35B-class MoE. For MoE we
-/// coarsen the stride to at least `prefill_chunk`, so checkpointing never
-/// sub-divides the memory-bound chunk — MoE prefill is then never over-chunked
-/// at any prompt length, while the always-on end-of-prompt snapshot still
-/// provides the dominant append-growth multi-turn reuse. `base == 0`
-/// (checkpointing disabled) is preserved.
-pub fn effectiveSsmCheckpointStride(base: usize, is_moe: bool, prefill_chunk: usize) usize {
+/// A snapshot exactly at the prompt end is unreachable for the next turn's
+/// prefix match: the template's generation-prompt suffix
+/// ("<|im_start|>assistant\n" + think opener) renders differently once the
+/// turn enters history, so the match always falls a few tokens short of the
+/// full prompt — "[hot-cache] hybrid miss (no checkpoint ≤ 870 of 897)" was
+/// llmprobe's prompt-cache-prefix cell failing (the 2026-06-10 class; fine
+/// strides used to mask it by laying boundaries underneath). 30 covers every
+/// template suffix in the fleet with margin (ChatML+think ≈ 7 tokens, laguna
+/// pre-opened think ≈ 10) while keeping the tail forward UNDER the
+/// prefill-eval-cadence threshold (seq >= 32): a 65-token tail was treated as
+/// a prefill and paid ~450ms of mid-loop eval bubbles on the 27B, where the
+/// 31-token tail rides the verify-shaped fast path. Cold cost is then ~zero
+/// (the final forward pays its full weight sweep for ONE token anyway).
+/// Warm restores re-forward ≤ backoff+1 tokens.
+pub const SSM_SNAPSHOT_BACKOFF: usize = 30;
+
+/// How many trailing prompt tokens the final (logits) forward covers: the
+/// held-back snapshot window plus the last token itself. Pure so the
+/// backoff/loop-bound interaction is unit-testable.
+pub fn ssmSnapshotBackoff(want_ssm_cp: bool, prefix_len: usize) usize {
+    if (!want_ssm_cp) return 0;
+    if (prefix_len <= SSM_SNAPSHOT_BACKOFF) return 0;
+    return SSM_SNAPSHOT_BACKOFF;
+}
+
+/// Effective SSM-checkpoint stride for a model, given the base (configured)
+/// stride: checkpointing never sub-divides the prefill chunk, on ANY arch.
+///
+/// The old policy kept the fine base stride on dense (non-MoE) hybrids on the
+/// theory that their prefill is compute-bound so extra chunks are ~free. That
+/// was true before `prefillDqGemm`: since the dq route only engages at
+/// M >= 2048, a fine stride pushes EVERY projection of EVERY chunk onto the
+/// slow small-M qmm path, and the per-chunk fixed costs (graph build, eval
+/// barrier, MTP history capture) multiply on top. Measured on Qwen3.6-27B
+/// dense GDN (M4 Max, 2026-07-30): stride 256 chunked an 8K prompt into 33
+/// pieces at 211 tok/s vs 254 at coarse chunks — a 17-20% cold-prefill tax at
+/// every context length, which is how llm_context_benchmarks read us 19%
+/// behind oMLX. MoE pays even more (expert re-streaming, ~25%).
+///
+/// Warm mid-prompt reuse granularity drops to the chunk size, but the
+/// always-on end-of-prompt snapshot still covers the dominant append-growth
+/// multi-turn case (llmprobe's cache-hit tests restore from it at any
+/// stride). `base == 0` (checkpointing disabled) is preserved, and a larger
+/// explicit stride is never shrunk.
+pub fn effectiveSsmCheckpointStride(base: usize, prefill_chunk: usize) usize {
     if (base == 0) return 0;
-    if (is_moe) return @max(base, prefill_chunk);
-    return base;
+    return @max(base, prefill_chunk);
 }
 
 /// Vision embeddings are scattered from the beginning of their source tensor
@@ -1017,6 +1061,7 @@ pub const Generator = struct {
             xfm.config.num_attention_heads,
             total_ctx_for_chunk,
             xfm.config.has_sliding_window,
+            xfm.config.isMoe(),
         );
         // Phase-level prefill instrumentation. Enabled at debug level OR via
         // MLX_SERVE_PREFILL_TRACE=1 (which forces the trace line at info).
@@ -1048,19 +1093,19 @@ pub const Generator = struct {
             ctx.ssm_entries != null and ctx.ssm_entries.?.len > 0,
             has_vision,
         );
-        // Coarsen the checkpoint stride for MoE so memory-bound expert-weight
-        // re-streaming doesn't tax cold prefill (see effectiveSsmCheckpointStride).
-        // The predicate is config.isMoe() (real experts), NOT moe_layers != null:
-        // dense qwen3_5 (GDN hybrid) rides the MoE forward path structurally, and
-        // coarsening it to PREFILL_CHUNK silently disabled every prefix-cache hit
-        // under 8K-token prompts (caught live by llmprobe cache-hit-reported on
-        // Qwen3.6-27B dense, 2026-06-10).
+        // Coarsen the checkpoint stride so checkpointing never sub-divides the
+        // prefill chunk, on ANY arch (see effectiveSsmCheckpointStride: fine
+        // strides push every projection under prefillDqGemm's M>=2048 floor and
+        // multiply per-chunk fixed costs — 17-25% cold-prefill tax measured on
+        // dense AND MoE hybrids). Warm reuse keeps chunk-granularity snapshots
+        // plus the always-on end-of-prompt snapshot (the append-growth case
+        // llmprobe's cache-hit tests pin — verified green at coarse strides).
         // Coarsen against the UNCAPPED base chunk: the head_dim safety cap
-        // above must not densify MoE checkpoint spacing (16× more captures at
+        // above must not densify checkpoint spacing (16× more captures at
         // 255K ctx otherwise). nextChunkEnd already shortens a chunk to land
         // on stride boundaries, so a capped chunk stays compatible.
         const ssm_cp_stride: usize = if (want_ssm_cp)
-            effectiveSsmCheckpointStride(@intCast(options.ssm_checkpoint_stride), xfm.config.isMoe(), @max(PREFILL_CHUNK, prefill_chunk_override))
+            effectiveSsmCheckpointStride(@intCast(options.ssm_checkpoint_stride), @max(PREFILL_CHUNK, prefill_chunk_override))
         else
             0;
         // Absolute KV position of `prompt_ids[0]`. Warm-path callers (the
@@ -1081,16 +1126,28 @@ pub const Generator = struct {
         var mtp_position_base: usize = ssm_cp_offset;
         var mtp_history_started = false;
 
+        // Start of the final (logits) forward's token span. Without SSM
+        // checkpointing this is the last prompt token (the classic 1-token
+        // logits forward); with checkpointing the chunk loop stops
+        // SSM_SNAPSHOT_BACKOFF tokens early so the always-on snapshot lands
+        // where the next turn's prefix match can actually reach it (see
+        // ssmSnapshotBackoff), and the final forward covers the held-back
+        // tail + the last token in the same weight sweep.
+        var final_start: usize = prompt_ids.len - 1;
+
         if (prompt_ids.len > 1) {
             const prefix_len = prompt_ids.len - 1;
-            const default_chunk = if (has_vision) prefix_len else PREFILL_CHUNK;
+            const snapshot_backoff = ssmSnapshotBackoff(want_ssm_cp, prefix_len);
+            const loop_end = prefix_len - snapshot_backoff;
+            final_start = loop_end;
+            const default_chunk = if (has_vision) loop_end else PREFILL_CHUNK;
             // Last-window MTP history: chunks entirely before the window skip
             // the full-hidden capture AND the head forward (see
             // mtp.SUGGESTED_HISTORY_WINDOW). 0 = capture every chunk.
             const mtp_hist_window = effectiveMtpHistoryWindow(prefix_len, mtp_history_window_override);
 
             var pos: usize = 0;
-            while (pos < prefix_len) {
+            while (pos < loop_end) {
                 // Abandoned-request abort: the client disconnected and the
                 // conn thread flagged the slot. Bail before the next chunk —
                 // the KV built so far is freed with the slot.
@@ -1107,7 +1164,7 @@ pub const Generator = struct {
                 // chunk-locally. Boundary alignment is in ABSOLUTE position
                 // (pos + offset), so the saved snapshot list is correct for
                 // the full prompt, not the truncated tail.
-                const end = nextChunkEnd(pos, prefix_len, default_chunk, want_ssm_cp, ssm_cp_stride, ssm_cp_offset);
+                const end = nextChunkEnd(pos, loop_end, default_chunk, want_ssm_cp, ssm_cp_stride, ssm_cp_offset);
                 const chunk_len: c_int = @intCast(end - pos);
                 const chunk_shape = [_]c_int{ 1, chunk_len };
                 const chunk_input = mlx.mlx_array_new_data(@ptrCast(&ids_i32[pos]), &chunk_shape, 2, .int32);
@@ -1200,13 +1257,18 @@ pub const Generator = struct {
                             _ = mlx.mlx_vector_array_append_value(eval_vec, entry.values);
                         }
                     }
-                    // Phase 1: also force SSM state to materialize so the
-                    // snapshot we take below holds a concrete tensor, not a
-                    // lazy node that would re-execute the prefill graph if
-                    // anyone reads from it later.
-                    const abs_end_for_cp = end + ssm_cp_offset;
-                    const should_capture = want_ssm_cp and ssm_cp_stride > 0 and abs_end_for_cp % ssm_cp_stride == 0;
-                    if (should_capture) {
+                    // Phase 1: also force SSM state to materialize so any
+                    // snapshot below holds a concrete tensor, not a lazy node
+                    // that would re-execute the prefill graph if anyone reads
+                    // from it later. Unconditional on EVERY chunk (not just
+                    // stride-aligned ones): a tail-merged final chunk ends
+                    // off-boundary, and the always-on end-of-prompt snapshot
+                    // then hits exactly that re-execution — capturing an
+                    // un-evaluated state re-ran the whole last chunk's GDN
+                    // scan (measured −4% on an 8K Qwen3.6-27B prefill). The
+                    // states are ~KB-to-MB scale; evaluating them alongside
+                    // the KV costs nothing measurable.
+                    if (want_ssm_cp) {
                         for (ctx.ssm_entries.?) |*ssm| {
                             if (!ssm.initialized) continue;
                             if (ssm.conv_state.ctx != null) {
@@ -1262,10 +1324,15 @@ pub const Generator = struct {
             // With it, the cache restores to position 749 (~99% of the
             // prompt) and only the last token + new tail re-forwards.
             // Skipped on `prompt_ids.len == 1` (no prefill chunks ran).
-            if (want_ssm_cp and prefix_len > 0) {
-                const final_abs = prefix_len + ssm_cp_offset;
+            if (want_ssm_cp and loop_end > 0) {
+                // The snapshot sits at the chunk loop's end — snapshot_backoff
+                // tokens BEFORE the prompt end, where the next turn's prefix
+                // match can actually reach it (the template's generation
+                // suffix renders differently in history, so a match always
+                // falls a few tokens short of the full prompt).
+                const final_abs = loop_end + ssm_cp_offset;
                 // Skip if we already captured at this exact position (the
-                // chunked loop would have done so when prefix_len happens
+                // chunked loop would have done so when loop_end happens
                 // to be a stride multiple).
                 const already_have = ssm_checkpoints.items.len > 0 and
                     ssm_checkpoints.items[ssm_checkpoints.items.len - 1].pos == final_abs;
@@ -1287,26 +1354,83 @@ pub const Generator = struct {
             }
         }
 
-        // Process last token (or single token for len=1) — this applies lm_head
-        // on just 1 token, producing the logits we need for sampling.
-        const last_shape = [_]c_int{ 1, 1 };
-        const last_idx = prompt_ids.len - 1;
-        const last_input = mlx.mlx_array_new_data(&ids_i32[last_idx], &last_shape, 2, .int32);
+        // Process the final span — the last token, plus (under SSM
+        // checkpointing) the snapshot-backoff tail held back from the chunk
+        // loop. One forward, one weight sweep, logits sliced to the last
+        // position so every consumer sees the classic [1, 1, V] shape.
+        const tail_len: usize = prompt_ids.len - final_start;
+        const last_shape = [_]c_int{ 1, @as(c_int, @intCast(tail_len)) };
+        const last_input = mlx.mlx_array_new_data(@ptrCast(&ids_i32[final_start]), &last_shape, 2, .int32);
         defer _ = mlx.mlx_array_free(last_input);
 
         // Drafter (Gemma 4 assistant) needs the post-final-norm hidden as
         // its first-step h_prev — captured here so we don't need a second
-        // forward at the start of `nextDrafter`.
+        // forward at the start of `nextDrafter`. `forwardWithCapture`
+        // captures the LAST position regardless of span length. When the
+        // span holds backed-off tokens AND MTP is active, the head's history
+        // must also cover them (a hole right before the generation point is
+        // acceptance-critical), so capture ALL positions and append.
         const drafter_active = options.drafter_enabled and options.drafter != null;
         const pld_active = options.pld_enabled;
         const need_capture = drafter_active or mtp_active;
         var captured_hidden: mlx.mlx_array = mlx.mlx_array_new();
         var has_captured_hidden = false;
         const last_start_ns = if (trace_enabled) prefill_sw.read() else 0;
-        const logits = if (need_capture) blk: {
+        const tail_mtp_capture = mtp_active and tail_len > 1;
+        var tail_hidden_all = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(tail_hidden_all);
+        const raw_logits = if (tail_mtp_capture) blk: {
+            has_captured_hidden = true;
+            break :blk try xfm.forwardWithCaptureAll(&ctx, last_input, &captured_hidden, &tail_hidden_all);
+        } else if (need_capture) blk: {
             has_captured_hidden = true;
             break :blk try xfm.forwardWithCapture(&ctx, last_input, &captured_hidden);
         } else try xfm.forwardWith(&ctx, last_input);
+        // History entries for the held-back span: (hidden[j], token[j+1]) for
+        // j in [final_start, prefix_len) — same pairing as the chunk loop.
+        // The last row's pair (hidden[last], t1) is appended by the first
+        // nextMtp round, exactly as before.
+        if (tail_mtp_capture) {
+            if (!mtp_history_started) {
+                std.debug.assert(mtp_cache.?.step == 0);
+                mtp_position_base = ssm_cp_offset + final_start;
+                mtp_history_started = true;
+            }
+            var tail_hist_hidden = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(tail_hist_hidden);
+            const all_shape = mlx.getShape(tail_hidden_all);
+            const start = [_]c_int{ 0, 0, 0 };
+            const stop = [_]c_int{ all_shape[0], @intCast(tail_len - 1), all_shape[2] };
+            const strides = [_]c_int{ 1, 1, 1 };
+            try mlx.check(mlx.mlx_slice(&tail_hist_hidden, tail_hidden_all, &start, 3, &stop, 3, &strides, 3, xfm.s));
+            const tail_mrope_ctx: ?mtp_mod.MropeContext = if (ctx.mrope_pos) |positions| .{
+                .pos = positions,
+                .total = ctx.mrope_total,
+                .delta = ctx.mrope_delta,
+                .base = mtp_position_base,
+            } else null;
+            try mtp_mod.appendHistoryWithMrope(
+                options.mtp.?,
+                xfm,
+                &mtp_cache.?,
+                prompt_ids[final_start + 1 .. prompt_ids.len],
+                tail_hist_hidden,
+                @intCast(mtp_cache.?.step),
+                tail_mrope_ctx,
+            );
+        }
+        // Slice to the last position when the span is longer than one token,
+        // so downstream sampling/grammar paths see the classic shape.
+        const logits = if (tail_len == 1) raw_logits else blk: {
+            defer _ = mlx.mlx_array_free(raw_logits);
+            const lshape = mlx.getShape(raw_logits);
+            var sliced = mlx.mlx_array_new();
+            const start = [_]c_int{ 0, lshape[1] - 1, 0 };
+            const stop = [_]c_int{ lshape[0], lshape[1], lshape[2] };
+            const strides = [_]c_int{ 1, 1, 1 };
+            try mlx.check(mlx.mlx_slice(&sliced, raw_logits, &start, 3, &stop, 3, &strides, 3, xfm.s));
+            break :blk sliced;
+        };
         if (trace_enabled) {
             const last_ns = prefill_sw.read() - last_start_ns;
             const total_ns = prefill_sw.read();
@@ -6943,9 +7067,12 @@ test "nextChunkEnd: a tiny trailing remainder merges into the last chunk" {
     // Mid-prompt chunks are untouched.
     try testing.expectEqual(@as(usize, 8192), nextChunkEnd(0, 16385, 8192, false, 0, 0));
     try testing.expectEqual(@as(usize, 16385), nextChunkEnd(8192, 16385, 8192, false, 0, 0));
-    // With SSM-checkpoint alignment active, behavior is unchanged (boundaries
-    // must stay stride-aligned for the prefix cache).
-    try testing.expectEqual(@as(usize, 8192), nextChunkEnd(0, 8193, 8192, true, 8192, 0));
+    // With SSM-checkpoint alignment active, a tiny tail STILL merges: the old
+    // 1-token trailing chunk existed only to lay a snapshot one token before
+    // the always-on end-of-prompt snapshot — pure overhead. A boundary strictly
+    // INSIDE the chunk still wins over merging (next case).
+    try testing.expectEqual(@as(usize, 8193), nextChunkEnd(0, 8193, 8192, true, 8192, 0));
+    try testing.expectEqual(@as(usize, 4096), nextChunkEnd(0, 8193, 8192, true, 4096, 0));
 }
 
 test "prefillChunkCount: SSM-checkpoint stride controls cold-prefill chunking" {
@@ -6956,10 +7083,11 @@ test "prefillChunkCount: SSM-checkpoint stride controls cold-prefill chunking" {
     // Tail merge: one token past a chunk boundary is still ONE chunk.
     try testing.expectEqual(@as(usize, 1), prefillChunkCount(8193, PREFILL_CHUNK, false, 0, 0));
     try testing.expectEqual(@as(usize, 2), prefillChunkCount(16385, PREFILL_CHUNK, false, 0, 0));
-    // The regression: a fine stride splits an 851-token prefill into 4 chunks
-    // (851 spans boundaries 256/512/768). Harmless on compute-bound dense models
-    // but on a memory-bound MoE prefill each chunk re-streams the expert weights
-    // (~25% slower on 35B-class). The non-MoE path keeps this fine stride.
+    // Mechanically, a raw fine stride still splits an 851-token prefill into 4
+    // chunks (851 spans boundaries 256/512/768) — which is why
+    // effectiveSsmCheckpointStride coarsens every stride to the prefill chunk:
+    // per-chunk costs (expert re-streaming on MoE, sub-dq-gemm-floor GEMMs +
+    // fixed overhead everywhere) taxed cold prefill 17-25%.
     try testing.expectEqual(@as(usize, 4), prefillChunkCount(851, PREFILL_CHUNK, true, 256, 0));
     // Boundary alignment is ABSOLUTE (warm path passes an offset): a tail-only
     // prefill starting mid-sequence still snaps to global strides. offset=2000,
@@ -6971,16 +7099,16 @@ test "prefillChunkCount: SSM-checkpoint stride controls cold-prefill chunking" {
 test "boundedPrefillChunk: fused head dims and short contexts keep the base chunk" {
     // head_dim <= 128 rides MLX's fused SDPA — no materialized scores, no cap,
     // at ANY context length.
-    try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 128, 16, 1_000_000, true));
-    try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 64, 32, 1_000_000, true));
+    try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 128, 16, 1_000_000, true, false));
+    try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 64, 32, 1_000_000, true, false));
     // hd 256 but short context: 16 heads x 8192 ctx x 8192 chunk x 2B
     // = 2 GiB scores, inside the 4 GiB budget -> full chunk kept. This is the
     // fleet-protection property: every Gemma-4 / Qwen3.5/3.6 checkpoint ships
     // head_dim 256, so typical prompts must keep full prefill throughput.
-    try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 256, 16, 8192, true));
+    try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 256, 16, 8192, true, false));
     // Degenerate inputs never cap.
-    try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 256, 0, 100_000, true));
-    try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 256, 16, 0, true));
+    try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 256, 0, 100_000, true, false));
+    try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 256, 16, 0, true, false));
 }
 
 test "boundedPrefillChunk: caps hd-256 long context even with the fused kernel active" {
@@ -6990,21 +7118,21 @@ test "boundedPrefillChunk: caps hd-256 long context even with the fused kernel a
     // prefillHeadDimFused (see the fn doc); pin that with the override ON.
     transformer_mod.fused256_override = true;
     defer transformer_mod.fused256_override = null;
-    try testing.expectEqual(@as(usize, 1024), boundedPrefillChunk(8192, 256, 16, 100_000, true));
+    try testing.expectEqual(@as(usize, 1024), boundedPrefillChunk(8192, 256, 16, 100_000, true, false));
 }
 
 test "boundedPrefillChunk: long context shrinks to the scores budget, floored and rounded" {
     // gemma-4-26B geometry (16 heads): budget/(16*ctx*2) …
     // ctx 32768 -> exactly 4096.
-    try testing.expectEqual(@as(usize, 4096), boundedPrefillChunk(8192, 256, 16, 32768, true));
+    try testing.expectEqual(@as(usize, 4096), boundedPrefillChunk(8192, 256, 16, 32768, true, false));
     // ctx 100000 -> raw 1342, rounded down to the 512 grain -> 1024.
-    try testing.expectEqual(@as(usize, 1024), boundedPrefillChunk(8192, 256, 16, 100_000, true));
+    try testing.expectEqual(@as(usize, 1024), boundedPrefillChunk(8192, 256, 16, 100_000, true, false));
     // ctx 262144 (the PR-#69 255K case) -> 512.
-    try testing.expectEqual(@as(usize, 512), boundedPrefillChunk(8192, 256, 16, 262_144, true));
+    try testing.expectEqual(@as(usize, 512), boundedPrefillChunk(8192, 256, 16, 262_144, true, false));
     // Qwen3.6-27B geometry (24 heads) at 262144: raw 341 -> floor 512.
-    try testing.expectEqual(@as(usize, 512), boundedPrefillChunk(8192, 256, 24, 262_144, true));
+    try testing.expectEqual(@as(usize, 512), boundedPrefillChunk(8192, 256, 24, 262_144, true, false));
     // e4b geometry (8 heads) at 131072: exactly 2048.
-    try testing.expectEqual(@as(usize, 2048), boundedPrefillChunk(8192, 256, 8, 131_072, true));
+    try testing.expectEqual(@as(usize, 2048), boundedPrefillChunk(8192, 256, 8, 131_072, true, false));
 }
 
 test "MTP history window: threshold gate and chunk membership" {
@@ -7032,30 +7160,35 @@ test "MTP history window: threshold gate and chunk membership" {
 
 test "boundedPrefillChunk: never raises a caller-lowered base chunk" {
     // --prefill-chunk 1024 with headroom for 4096: the explicit lower value wins.
-    try testing.expectEqual(@as(usize, 1024), boundedPrefillChunk(1024, 256, 16, 32768, true));
+    try testing.expectEqual(@as(usize, 1024), boundedPrefillChunk(1024, 256, 16, 32768, true, false));
     // Even the floor never raises a tiny explicit base.
-    try testing.expectEqual(@as(usize, 256), boundedPrefillChunk(256, 256, 16, 262_144, true));
+    try testing.expectEqual(@as(usize, 256), boundedPrefillChunk(256, 256, 16, 262_144, true, false));
 }
 
-test "boundedPrefillChunk: fused-causal (default) non-sliding hd-256 caps at 4096, no score-formula shrink" {
+test "boundedPrefillChunk: fused-causal (default) non-sliding hd-256 — MoE caps at 4096, dense keeps the full chunk" {
     // With the causal arm FUSED (default since the budgeted-dispatch flip) no
     // score tensor exists, so the scores-budget formula is moot for the
     // qwen3_5/3_6 class — and its old shrink to 1024 at 64K starved the
     // dequant+GEMM qmm route (engages at M >= 2048): the 64K rung was the
-    // ladder's weakest for exactly this reason. Measured on the 27B: chunk
-    // 4096 beats 2048 same-session (+1.2% 8K / +0.6% 32K even before the
-    // dq route; the per-chunk dequant overhead halves on top).
+    // ladder's weakest for exactly this reason.
     std.debug.assert(transformer_mod.fused256_override == null);
-    try testing.expectEqual(@as(usize, 4096), boundedPrefillChunk(8192, 256, 24, 8192, false));
-    try testing.expectEqual(@as(usize, 4096), boundedPrefillChunk(8192, 256, 24, 65536, false));
-    try testing.expectEqual(@as(usize, 4096), boundedPrefillChunk(8192, 256, 24, 140_000, false));
+    // DENSE hybrids (Qwen3.6-27B class): no expert-gather transients, and a
+    // full-size chunk halves per-chunk dequant sweeps — chunk 8192 measured
+    // +1.4% over 4096 at the 8K rung (M4 Max, 2026-07-30), flat at 32K.
+    try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 256, 24, 8192, false, false));
+    try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 256, 24, 65536, false, false));
+    try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 256, 24, 140_000, false, false));
+    // MoE keeps the 4096 cap: expert-gather transients scale with the chunk
+    // (gemma-26B@99K: +3% speed for +22 GB peak is a bad trade).
+    try testing.expectEqual(@as(usize, 4096), boundedPrefillChunk(8192, 256, 24, 8192, false, true));
+    try testing.expectEqual(@as(usize, 4096), boundedPrefillChunk(8192, 256, 24, 140_000, false, true));
     // Never raises a caller-lowered base.
-    try testing.expectEqual(@as(usize, 1024), boundedPrefillChunk(1024, 256, 24, 8192, false));
+    try testing.expectEqual(@as(usize, 1024), boundedPrefillChunk(1024, 256, 24, 8192, false, false));
     // Sliding-band archs (gemma: fused band kernel wants big chunks) keep
     // the formula-only policy.
-    try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 256, 16, 8192, true));
+    try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 256, 16, 8192, true, false));
     // Fused head dims never cap regardless of arch.
-    try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 128, 24, 1_000_000, false));
+    try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 128, 24, 1_000_000, false, false));
 }
 
 test "boundedPrefillChunk: composed-causal (kill switch) keeps the 2048 cap + score formula" {
@@ -7066,30 +7199,48 @@ test "boundedPrefillChunk: composed-causal (kill switch) keeps the 2048 cap + sc
     // the score transient shrinks with it.
     transformer_mod.fused256_override = false;
     defer transformer_mod.fused256_override = null;
-    try testing.expectEqual(@as(usize, 2048), boundedPrefillChunk(8192, 256, 24, 8192, false));
-    try testing.expectEqual(@as(usize, 2048), boundedPrefillChunk(8192, 256, 24, 32768, false));
+    try testing.expectEqual(@as(usize, 2048), boundedPrefillChunk(8192, 256, 24, 8192, false, false));
+    try testing.expectEqual(@as(usize, 2048), boundedPrefillChunk(8192, 256, 24, 32768, false, false));
     // The scores-budget formula still wins BELOW the cap: 64K on 24 heads
     // yields 1024 (measured better than 2048 there: 186 vs 182.3 tok/s).
-    try testing.expectEqual(@as(usize, 1024), boundedPrefillChunk(8192, 256, 24, 65536, false));
+    try testing.expectEqual(@as(usize, 1024), boundedPrefillChunk(8192, 256, 24, 65536, false, false));
 }
 
-test "effectiveSsmCheckpointStride: MoE coarsens to PREFILL_CHUNK, dense keeps fine" {
+test "ssmSnapshotBackoff: engages only under checkpointing and past the backoff length" {
+    // No checkpointing (pure-attention archs, stride 0, vision): zero — the
+    // final forward stays the classic 1-token logits pass.
+    try testing.expectEqual(@as(usize, 0), ssmSnapshotBackoff(false, 8192));
+    // Short prompts: nothing to back off (loop must keep >= 1 token).
+    try testing.expectEqual(@as(usize, 0), ssmSnapshotBackoff(true, SSM_SNAPSHOT_BACKOFF));
+    try testing.expectEqual(@as(usize, 0), ssmSnapshotBackoff(true, 1));
+    // Checkpointing + long prompt: the always-on snapshot lands backoff
+    // tokens before the prompt end, where the next turn's prefix match can
+    // reach it (template generation-suffix divergence class).
+    try testing.expectEqual(SSM_SNAPSHOT_BACKOFF, ssmSnapshotBackoff(true, 8192));
+    try testing.expectEqual(SSM_SNAPSHOT_BACKOFF, ssmSnapshotBackoff(true, SSM_SNAPSHOT_BACKOFF + 1));
+    // The tail forward must stay UNDER the prefill-eval-cadence threshold
+    // (seq >= 32 turns it into a "prefill" costing ~450ms of eval bubbles):
+    // tail = backoff + 1 <= 31.
+    try testing.expect(SSM_SNAPSHOT_BACKOFF + 1 < 32);
+}
+
+test "effectiveSsmCheckpointStride: checkpointing never sub-divides the prefill chunk (dense AND MoE)" {
     const PREFILL_CHUNK: usize = 8192;
-    // Disabled stays disabled regardless of model type.
-    try testing.expectEqual(@as(usize, 0), effectiveSsmCheckpointStride(0, false, PREFILL_CHUNK));
-    try testing.expectEqual(@as(usize, 0), effectiveSsmCheckpointStride(0, true, PREFILL_CHUNK));
-    // Non-MoE hybrid keeps the fine base stride (cheap chunking, finer warm reuse).
-    try testing.expectEqual(@as(usize, 256), effectiveSsmCheckpointStride(256, false, PREFILL_CHUNK));
-    // MoE coarsens to at least PREFILL_CHUNK so checkpointing never sub-divides
-    // the memory-bound chunk -> MoE prefill is single-chunk for any prompt the
-    // mem-bound path wouldn't already split.
-    try testing.expectEqual(@as(usize, 8192), effectiveSsmCheckpointStride(256, true, PREFILL_CHUNK));
+    // Disabled stays disabled.
+    try testing.expectEqual(@as(usize, 0), effectiveSsmCheckpointStride(0, PREFILL_CHUNK));
+    // Sub-chunk strides coarsen on ALL archs: they push every projection under
+    // prefillDqGemm's M>=2048 floor (slow small-M qmm) and multiply per-chunk
+    // fixed costs. Measured on Qwen3.6-27B dense (M4 Max, 2026-07-30): stride
+    // 256 = 33 chunks at 8K = 211 tok/s vs 254 coarse.
+    try testing.expectEqual(@as(usize, 8192), effectiveSsmCheckpointStride(256, PREFILL_CHUNK));
     // A larger explicit stride is respected (never shrunk).
-    try testing.expectEqual(@as(usize, 16384), effectiveSsmCheckpointStride(16384, true, PREFILL_CHUNK));
-    // End-to-end: with the effective stride, an 851-tok MoE prefill is 1 chunk
-    // (was 4 at the raw 256), while a dense/non-MoE hybrid stays at 4.
-    try testing.expectEqual(@as(usize, 1), prefillChunkCount(851, PREFILL_CHUNK, true, effectiveSsmCheckpointStride(256, true, PREFILL_CHUNK), 0));
-    try testing.expectEqual(@as(usize, 4), prefillChunkCount(851, PREFILL_CHUNK, true, effectiveSsmCheckpointStride(256, false, PREFILL_CHUNK), 0));
+    try testing.expectEqual(@as(usize, 16384), effectiveSsmCheckpointStride(16384, PREFILL_CHUNK));
+    // End-to-end: an 851-tok prefill is 1 chunk (was 4 at the raw 256 stride
+    // on dense hybrids — the llm_context_benchmarks small-prompt regression).
+    try testing.expectEqual(@as(usize, 1), prefillChunkCount(851, PREFILL_CHUNK, true, effectiveSsmCheckpointStride(256, PREFILL_CHUNK), 0));
+    // An 8K prefill splits only at the (memory-bound) chunk size, never
+    // finer: 2 chunks at chunk 4096, not 33.
+    try testing.expectEqual(@as(usize, 2), prefillChunkCount(8238, 4096, true, effectiveSsmCheckpointStride(256, PREFILL_CHUNK), 0));
 }
 
 test "vision prefill is not split at SSM checkpoint boundaries" {

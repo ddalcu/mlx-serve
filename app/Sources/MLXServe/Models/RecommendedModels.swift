@@ -16,6 +16,42 @@ private let bytesPerGiB: Double = 1_073_741_824
 /// convention `GemmaModelOption.sizeEstimate` uses (raw weights, not the
 /// +20% RAM-with-overhead figure `HFModel.ramEstimate` shows elsewhere) —
 /// not guessed from the model name.
+///
+/// # Capability scores (`intelligence` / `speed` / `contextTokens`)
+///
+/// The three bars the Model Browser draws. All three describe the ORIGINAL
+/// published weights, not the 4-bit/2-bit build this pick downloads — a quant
+/// moves quality a little and speed a lot, and pretending otherwise would make
+/// every bar a claim we can't source.
+///
+/// **Intelligence** is the Artificial Analysis Intelligence Index
+/// (<https://artificialanalysis.ai/models/open-source>), read on **2026-07-30**,
+/// rescaled `round(index / 60 × 100)` so the bar is "fraction of the best model
+/// available anywhere" (the index's frontier sat at 61 that day). Where a model
+/// is published in both reasoning and non-reasoning modes the REASONING number
+/// is used — this app runs them with thinking available. Models the site has no
+/// entry for carry our own estimate and `intelligenceIsEstimated = true`; there
+/// is no "unrated" state, because a missing bar reads as "bad" rather than
+/// "unknown".
+///
+/// **Speed** is always our OWN relative estimate, never the site's: their
+/// figure is measured on cloud GPUs, and that ordering does not survive the
+/// move to Apple Silicon, where decode is bandwidth-bound and ACTIVE
+/// parameters dominate. Same M4 Max in `docs/perf-csvs/all-26.7.12.csv`:
+/// `gemma4-26b-a4b` 118 tok/s against `gemma4-31b` 25 tok/s — a 4.7× gap a
+/// cloud comparison shows as nearly level. The score is `round(100 × tok/s / 200)`
+/// over PLAIN autoregressive decode, calibrated against that CSV where a row
+/// exists and estimated from active params + weight bytes elsewhere.
+/// Speculative decode (MTP/PLD/drafter) is deliberately excluded: it is a
+/// property of how we run the model rather than of the model, it moves some
+/// picks 2-3× on their own, and each pick that has one already says so in its
+/// blurb. `activeParamsB` exists so these hand-edited numbers can be CHECKED
+/// rather than trusted — see the ordering invariant in `RecommendedModelsTests`.
+///
+/// **Context** is the checkpoint's own `max_position_embeddings`, read from
+/// each repo's `config.json`. It is deliberately NOT the RAM-clamped effective
+/// window: the bars compare models to each other, and the clamp is a property
+/// of the user's Mac.
 
 /// Which curated section a pick belongs to. Gemma/Qwen are vendor families;
 /// `largest` is a RAM tier — the biggest models this app runs (DeepSeek-V4-Flash
@@ -41,8 +77,25 @@ struct RecommendedModelPick: Identifiable, Hashable {
     /// Approximate on-disk weight size in GB.
     let sizeGB: Double
     let family: RecommendedModelFamily
-    /// Short capability chips (e.g. "Best for coding").
-    let highlights: [String]
+    /// 0–100. The Artificial Analysis Intelligence Index, rescaled — see the
+    /// file header for the source, the as-of date and the rescale.
+    let intelligence: Int
+    /// True when the site had no entry for this model and `intelligence` is our
+    /// own estimate. Never a reason to hide the bar; the pane says so instead.
+    let intelligenceIsEstimated: Bool
+    /// 0–100. Our own Apple-Silicon decode estimate — never the site's
+    /// cloud-GPU speed. See the file header.
+    let speed: Int
+    /// The checkpoint's own context window (`max_position_embeddings`), NOT the
+    /// RAM-clamped effective one.
+    let contextTokens: Int
+    /// Active parameters per token, in billions — dense models count their
+    /// whole size, an MoE counts only what it wakes (Laguna S 2.1 is
+    /// 117.6B-**A8.5B**, so 8.5). Read from each repo's config/model card, and
+    /// the basis the hand-edited `speed` scores are checked against: on Apple
+    /// Silicon decode is bandwidth-bound, so a model with more active
+    /// parameters must never be scored FASTER than one with fewer.
+    let activeParamsB: Double
     /// Overrides the generic weights×1.2 RAM estimate for picks where that
     /// formula misleads (e.g. a build whose runtime footprint or context needs
     /// push the honest recommendation gate above what the on-disk size implies).
@@ -56,6 +109,25 @@ struct RecommendedModelPick: Identifiable, Hashable {
     var ggufFilename: String? = nil
 
     var sizeLabel: String { String(format: "~%.1f GB", sizeGB) }
+
+    // MARK: - Capability bars
+    //
+    // 0…1 track fills. No number is ever rendered next to them: the scores are
+    // a hand-maintained comparison between these picks, and printing "62" would
+    // claim a precision they don't have.
+
+    var intelligenceBar: Double { Double(intelligence) / 100 }
+    var speedBar: Double { Double(speed) / 100 }
+
+    /// Context on a LOG scale between 32K (empty) and 1M (full). Linear would
+    /// leave every pick but DeepSeek pinned at a quarter of the track, because
+    /// the field's windows are powers of two two doublings apart.
+    var contextBar: Double {
+        let floorTokens = 32_768.0, ceilTokens = 1_048_576.0
+        let t = Double(max(contextTokens, 1))
+        let f = (log2(t) - log2(floorTokens)) / (log2(ceilTokens) - log2(floorTokens))
+        return min(max(f, 0), 1)
+    }
 
     /// Approximate RAM this checkpoint needs once loaded — weights plus the
     /// same ~20% KV-cache/runtime-buffer overhead `HFModel.ramEstimate` and
@@ -85,7 +157,11 @@ extension RecommendedModelPick {
         repoId: "mlx-community/gemma-4-e2b-it-4bit",
         sizeGB: 3.3,
         family: .gemma,
-        highlights: ["Fast replies", "Everyday chat"]
+        intelligence: 15,
+        intelligenceIsEstimated: false,
+        speed: 90,
+        contextTokens: 131_072,
+        activeParamsB: 2.0
     )
 
     static let gemmaE4B = RecommendedModelPick(
@@ -96,7 +172,11 @@ extension RecommendedModelPick {
         repoId: "mlx-community/gemma-4-e4b-it-4bit",
         sizeGB: 4.8,
         family: .gemma,
-        highlights: ["Balanced", "Coding help"]
+        intelligence: 20,
+        intelligenceIsEstimated: false,
+        speed: 57,
+        contextTokens: 131_072,
+        activeParamsB: 4.0
     )
 
     static let gemma12B = RecommendedModelPick(
@@ -107,7 +187,11 @@ extension RecommendedModelPick {
         repoId: "mlx-community/gemma-4-12b-it-4bit",
         sizeGB: 6.3,
         family: .gemma,
-        highlights: ["Smarter", "Coding help"]
+        intelligence: 37,
+        intelligenceIsEstimated: false,
+        speed: 23,
+        contextTokens: 262_144,
+        activeParamsB: 12.0
     )
 
     static let gemma26bA4b = RecommendedModelPick(
@@ -118,7 +202,11 @@ extension RecommendedModelPick {
         repoId: "mlx-community/gemma-4-26b-a4b-it-4bit",
         sizeGB: 14.3,
         family: .gemma,
-        highlights: ["Strong reasoning", "Mixture of experts"]
+        intelligence: 33,
+        intelligenceIsEstimated: false,
+        speed: 59,
+        contextTokens: 262_144,
+        activeParamsB: 4.0
     )
 
     static let gemma31B = RecommendedModelPick(
@@ -129,7 +217,11 @@ extension RecommendedModelPick {
         repoId: "mlx-community/gemma-4-31b-it-4bit",
         sizeGB: 17.2,
         family: .gemma,
-        highlights: ["Top quality", "Writing"]
+        intelligence: 48,
+        intelligenceIsEstimated: false,
+        speed: 13,
+        contextTokens: 262_144,
+        activeParamsB: 31.0
     )
 
     static let gemma26bA4b8bit = RecommendedModelPick(
@@ -140,7 +232,11 @@ extension RecommendedModelPick {
         repoId: "mlx-community/gemma-4-26b-a4b-it-8bit",
         sizeGB: 26.0,
         family: .gemma,
-        highlights: ["Highest quality", "Mixture of experts"]
+        intelligence: 33,
+        intelligenceIsEstimated: false,
+        speed: 33,
+        contextTokens: 262_144,
+        activeParamsB: 4.0
     )
 
     static let gemma31B8bit = RecommendedModelPick(
@@ -151,7 +247,11 @@ extension RecommendedModelPick {
         repoId: "mlx-community/gemma-4-31b-it-8bit",
         sizeGB: 31.5,
         family: .gemma,
-        highlights: ["Highest quality", "Flagship"]
+        intelligence: 48,
+        intelligenceIsEstimated: false,
+        speed: 7,
+        contextTokens: 262_144,
+        activeParamsB: 31.0
     )
 
     /// Qwen 3.5 9B — the entry-level Qwen pick. Replaces the earlier 0.8B
@@ -165,7 +265,11 @@ extension RecommendedModelPick {
         repoId: "mlx-community/Qwen3.5-9B-MLX-4bit",
         sizeGB: 5.5,
         family: .qwen,
-        highlights: ["Balanced", "Coding help"]
+        intelligence: 35,
+        intelligenceIsEstimated: false,
+        speed: 28,
+        contextTokens: 262_144,
+        activeParamsB: 9.0
     )
 
     static let qwen36_27bMtp = RecommendedModelPick(
@@ -176,7 +280,11 @@ extension RecommendedModelPick {
         repoId: "ddalcu/Qwen3.6-27B-4bit-MTP-MLX-Serve",
         sizeGB: 15.0,
         family: .qwen,
-        highlights: ["Best for coding", "Built-in speed boost", "Great at agent tasks"]
+        intelligence: 62,
+        intelligenceIsEstimated: false,
+        speed: 14,
+        contextTokens: 262_144,
+        activeParamsB: 27.0
     )
 
     /// Tencent Hunyuan 3 (295B-A21B MoE) — the largest open model this app
@@ -194,7 +302,14 @@ extension RecommendedModelPick {
         repoId: "mlx-community/Hy3-oQ2e",
         sizeGB: 83.7,
         family: .largest,
-        highlights: ["Flagship quality", "Mixture of experts", "256K context"]
+        // Estimated: the site has no Hunyuan 3 entry. Placed just under
+        // DeepSeek-V4-Flash — a comparable flagship open MoE at a similar
+        // activated-parameter scale — and above every Qwen/Gemma pick here.
+        intelligence: 63,
+        intelligenceIsEstimated: true,
+        speed: 14,
+        contextTokens: 262_144,
+        activeParamsB: 21.0
     )
 
     /// DeepSeek-V4-Flash via the embedded ds4 engine — a frontier-scale model
@@ -209,7 +324,11 @@ extension RecommendedModelPick {
         repoId: "antirez/deepseek-v4-gguf",
         sizeGB: 86.7,
         family: .largest,
-        highlights: ["Frontier quality", "Mixture of experts", "Built-in speed boost"],
+        intelligence: 67,
+        intelligenceIsEstimated: false,
+        speed: 18,
+        contextTokens: 1_048_576,
+        activeParamsB: 13.0,
         ramOverrideGB: 96.0,
         ggufFilename: "DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf"
     )
@@ -222,7 +341,11 @@ extension RecommendedModelPick {
         repoId: "mlx-community/Qwen3.6-35B-A3B-4bit",
         sizeGB: 19.0,
         family: .qwen,
-        highlights: ["Strong reasoning", "Mixture of experts"]
+        intelligence: 53,
+        intelligenceIsEstimated: false,
+        speed: 76,
+        contextTokens: 262_144,
+        activeParamsB: 3.0
     )
 
     /// poolside's Laguna XS 2.1 in poolside's own NVFP4 4-bit MLX build —
@@ -237,7 +360,14 @@ extension RecommendedModelPick {
         repoId: "poolside/Laguna-XS-2.1-NVFP4-mlx",
         sizeGB: 20.1,
         family: .poolside,
-        highlights: ["Best for coding", "Mixture of experts", "121 tok/s on M4 Max"]
+        // Estimated: poolside publish no Laguna entry on the site. A coding
+        // specialist scores below its general-purpose size class on a general
+        // index, so it sits under Qwen 3.6 35B-A3B despite the same 3B active.
+        intelligence: 43,
+        intelligenceIsEstimated: true,
+        speed: 61,
+        contextTokens: 262_144,
+        activeParamsB: 3.0
     )
 
     /// poolside's Laguna S 2.1 — the full-size coding-specialist MoE (117.6B
@@ -254,7 +384,13 @@ extension RecommendedModelPick {
         repoId: "poolside/Laguna-S-2.1-NVFP4-mlx",
         sizeGB: 67.0,
         family: .poolside,
-        highlights: ["Best for coding", "Mixture of experts", "Great at agent tasks"]
+        // Estimated: no site entry (see Laguna XS). Placed between Qwen 3.6
+        // 35B-A3B and 27B — the full-size coder, still a specialist.
+        intelligence: 55,
+        intelligenceIsEstimated: true,
+        speed: 28,
+        contextTokens: 262_144,
+        activeParamsB: 8.5
     )
 }
 
@@ -285,6 +421,42 @@ extension RecommendedModelPick {
     static let largestCatalog: [RecommendedModelPick] = [
         .hy3_295b, .deepseekV4Flash,
     ]
+
+    /// Every curated pick, across all four sections — the union the score
+    /// invariants sweep and the one list a new section can't slip past.
+    static let allCatalogs: [RecommendedModelPick] =
+        gemmaCatalog + qwenCatalog + poolsideCatalog + largestCatalog
+
+    // MARK: - The starter recommendation
+
+    /// The ONE model to offer someone who has downloaded nothing yet, chosen
+    /// from this Mac's physical RAM. Total by construction — every input
+    /// returns a pick — and the single source of truth for all three surfaces
+    /// that make this recommendation: the Model Browser's "Best for your Mac"
+    /// card, the welcome window's starter card, and the chat gate. Two copies
+    /// of this decision is how two of them start recommending different models.
+    ///
+    /// Each tier is the largest pick that still leaves the machine room to do
+    /// anything else (`approxRAMNeededGB` = weights × 1.2, the app's ~20%
+    /// runtime overhead), never merely the largest that fits:
+    ///
+    /// | Physical RAM | Pick | Disk | RAM needed |
+    /// |---|---|---|---|
+    /// | ≤ 8 GB  | Gemma 4 E2B  |  3.3 GB |  4.0 GB |
+    /// | 8–16 GB | Gemma 4 E4B  |  4.8 GB |  5.8 GB |
+    /// | 16–32 GB| Gemma 4 12B  |  6.3 GB |  7.6 GB |
+    /// | 32 GB+  | Qwen 3.6 27B | 15.0 GB | 18.0 GB |
+    ///
+    /// Bands are upper-INCLUSIVE: a 16 GB Mac gets E4B, not 12B. A boundary
+    /// machine is the one with the least headroom in its band, so it takes the
+    /// smaller side.
+    static func starterPick(physicalMemoryBytes: UInt64) -> RecommendedModelPick {
+        let gib = Double(physicalMemoryBytes) / bytesPerGiB
+        if gib <= 8 { return .gemmaE2B }
+        if gib <= 16 { return .gemmaE4B }
+        if gib <= 32 { return .gemma12B }
+        return .qwen36_27bMtp
+    }
 }
 
 extension Array where Element == RecommendedModelPick {

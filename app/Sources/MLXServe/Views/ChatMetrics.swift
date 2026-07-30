@@ -1,4 +1,5 @@
 import Foundation
+import SwiftUI
 
 /// Shared layout constants for the chat column — ONE source of truth for the
 /// numbers that must agree across independent views. The transcript, context
@@ -31,9 +32,33 @@ enum ChatMetrics {
     /// `composerControlSize` frames (send symbol point size == attach circle).
     static let composerIconSize: CGFloat = 30
 
+    /// Exact height of BOTH controls in the sidebar's bottom row (New Chat +
+    /// the agent menu).
+    ///
+    /// They are `.plain` buttons drawing their own background — the same shape
+    /// as the composer's discs — precisely so this number is the height. Don't
+    /// put them back on `.buttonStyle(.bordered)`: a bordered control keeps its
+    /// INTRINSIC size and merely centers inside whatever frame it's given, so
+    /// its height can only be steered indirectly through the label, and a text
+    /// label and a bare glyph never land on the same number. Measured through
+    /// the accessibility API while both sat inside 28pt frames: New Chat 24pt,
+    /// the menu 17pt.
+    static let sidebarButtonHeight: CGFloat = 28
+    static let sidebarButtonCornerRadius: CGFloat = 6
+
     // The Think / Agent / MCP capsules that used to live in the window toolbar
     // had their own `togglePill*` geometry here. They are icon-only composer
     // controls now and draw from `composerIconSize` / `composerControlSize` like
     // every other control in that row, so the separate metrics are gone rather
     // than left behind as a second, unused way to size a control.
+}
+
+extension View {
+    /// The sidebar's bottom-row button chrome: one exact height, one fill, one
+    /// radius — applied to both controls so neither can drift from the other.
+    func sidebarActionButton() -> some View {
+        frame(height: ChatMetrics.sidebarButtonHeight)
+            .background(Color.secondary.opacity(0.15),
+                        in: RoundedRectangle(cornerRadius: ChatMetrics.sidebarButtonCornerRadius))
+    }
 }

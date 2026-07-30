@@ -8,6 +8,21 @@ import AppKit
 /// Everything an agent owns is an override of an app default, so every control
 /// here has a "use the app's setting" state. The one thing deliberately absent is
 /// the Agent Sandbox: that stays a single global flag.
+/// Which agent the window should be showing.
+///
+/// Pure because the interesting part is a three-way precedence, and the window
+/// is a single reused `Window`: a deep link ("Set by Chef · Edit Agent…" on a
+/// locked composer disc) has to retarget one that is already open on somebody
+/// else, while a plain re-publish must not yank the user's selection back to the
+/// top of the list mid-edit. Tested in `AgentsWindowFocusTests`.
+enum AgentsWindowFocus {
+    /// The id to select, or nil to leave the selection exactly as it is.
+    static func selection(pending: UUID?, current: UUID?, first: UUID?) -> UUID? {
+        if let pending { return pending }
+        return current == nil ? first : nil
+    }
+}
+
 struct AgentsWindow: View {
     @EnvironmentObject var appState: AppState
     @EnvironmentObject var store: AgentStore
@@ -55,8 +70,12 @@ struct AgentsWindow: View {
         }
         .onAppear {
             AppActivation.focus()
-            if selectedId == nil { selectedId = store.allAgents.first?.id }
+            applyFocus()
         }
+        // The window is a single reused instance, so a deep link that arrives
+        // while it is already open has to move the selection — `onAppear` alone
+        // would leave the user staring at whoever they were editing.
+        .onChange(of: appState.pendingAgentSelection) { _, _ in applyFocus() }
         .alert(item: $alertItem) { item in
             switch item.kind {
             case .message(let text):
@@ -111,6 +130,22 @@ struct AgentsWindow: View {
 
     private func bindingToDraft(_ current: Agent) -> Binding<Agent> {
         Binding(get: { draft ?? current }, set: { draft = $0 })
+    }
+
+    /// Land on whoever was asked for, then consume the request.
+    private func applyFocus() {
+        guard let id = AgentsWindowFocus.selection(pending: appState.pendingAgentSelection,
+                                                   current: selectedId,
+                                                   first: store.allAgents.first?.id) else { return }
+        appState.pendingAgentSelection = nil
+        // A deep link to the agent ALREADY showing can't rely on
+        // `onChange(of: selectedId)` — the id doesn't change, so the draft has
+        // to be reloaded here or the click does nothing at all.
+        if selectedId == id {
+            draft = store.agent(id: id)
+        } else {
+            selectedId = id
+        }
     }
 
     private func newAgent() {

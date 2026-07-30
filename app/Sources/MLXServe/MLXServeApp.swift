@@ -114,7 +114,7 @@ struct MLXCoreApp: App {
                 }
                 // Quick launcher "Open in chat" (⌘↩): same always-present bridge —
                 // the launcher panel can't reach SwiftUI's openWindow itself.
-                .onChange(of: appState.quickLauncherChatOpenTick) { _, _ in
+                .onChange(of: appState.pendingChatOpenTick) { _, _ in
                     openAndFocus("chat")
                 }
                 // Welcome window's "Browse Models" nudge: same bridge — it's a

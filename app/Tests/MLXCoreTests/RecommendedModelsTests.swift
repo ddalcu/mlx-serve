@@ -14,10 +14,17 @@ final class RecommendedModelsTests: XCTestCase {
     /// Every recommended pick across all four family sections — the union the
     /// invariant tests below sweep, so a new section can't slip past them.
     private var allRecommended: [RecommendedModelPick] {
-        RecommendedModelPick.gemmaCatalog
+        RecommendedModelPick.allCatalogs
+    }
+
+    /// `allCatalogs` is what the invariant sweeps run over, so it has to BE the
+    /// four sections — a section left out of it is a section with no guards.
+    func testAllCatalogsIsTheUnionOfTheFourSections() {
+        let union = RecommendedModelPick.gemmaCatalog
             + RecommendedModelPick.qwenCatalog
             + RecommendedModelPick.poolsideCatalog
             + RecommendedModelPick.largestCatalog
+        XCTAssertEqual(RecommendedModelPick.allCatalogs, union)
     }
 
     // MARK: - Catalog shape
@@ -92,7 +99,140 @@ final class RecommendedModelsTests: XCTestCase {
             XCTAssertFalse(p.name.isEmpty, p.id)
             XCTAssertFalse(p.tagline.isEmpty, p.id)
             XCTAssertGreaterThan(p.blurb.count, 40, "\(p.id) blurb reads as a stub")
-            XCTAssertFalse(p.highlights.isEmpty, p.id)
+        }
+    }
+
+    // MARK: - Capability scores (the three bars)
+
+    /// Every score is on the 0–100 scale the bars divide by, and every pick
+    /// names a real context window. A stray 0 or 120 renders an empty or
+    /// overflowing track with nothing else to catch it.
+    func testEveryPickHasScoresInRange() {
+        for p in allRecommended {
+            XCTAssertTrue((0...100).contains(p.intelligence), "\(p.id) intelligence \(p.intelligence)")
+            XCTAssertTrue((0...100).contains(p.speed), "\(p.id) speed \(p.speed)")
+            XCTAssertGreaterThan(p.contextTokens, 0, p.id)
+            XCTAssertGreaterThan(p.activeParamsB, 0, p.id)
+        }
+    }
+
+    /// **The invariant that makes hand-tuning the speed scores safe.** Decode
+    /// on Apple Silicon is bandwidth-bound, so a model that wakes MORE
+    /// parameters per token can never be faster than one that wakes fewer. A
+    /// tie in active params is unconstrained — that's where quantization
+    /// (26B-A4B at 4-bit vs 8-bit) and expert-bank size legitimately differ.
+    func testABiggerModelIsNeverScoredFasterThanASmallerOne() {
+        let byActiveDescending = allRecommended.sorted { $0.activeParamsB > $1.activeParamsB }
+        for (i, big) in byActiveDescending.enumerated() {
+            for small in byActiveDescending[(i + 1)...] where small.activeParamsB < big.activeParamsB {
+                XCTAssertLessThanOrEqual(
+                    big.speed, small.speed,
+                    "\(big.id) wakes \(big.activeParamsB)B and is scored FASTER (\(big.speed)) than \(small.id) at \(small.activeParamsB)B (\(small.speed))"
+                )
+            }
+        }
+    }
+
+    /// The same weights quantized twice are the same model: an 8-bit build is
+    /// slower and bigger, never smarter.
+    func testAHigherPrecisionBuildInheritsItsSiblingsIntelligence() {
+        XCTAssertEqual(RecommendedModelPick.gemma26bA4b8bit.intelligence,
+                       RecommendedModelPick.gemma26bA4b.intelligence)
+        XCTAssertEqual(RecommendedModelPick.gemma31B8bit.intelligence,
+                       RecommendedModelPick.gemma31B.intelligence)
+        XCTAssertLessThan(RecommendedModelPick.gemma31B8bit.speed,
+                          RecommendedModelPick.gemma31B.speed)
+    }
+
+    /// Only the three picks the site has no entry for are flagged estimated —
+    /// leaving a real score flagged (or an invented one unflagged) is the whole
+    /// point of carrying the flag.
+    func testOnlyTheModelsAbsentFromTheIndexAreFlaggedEstimated() {
+        let estimated = Set(allRecommended.filter(\.intelligenceIsEstimated).map(\.id))
+        XCTAssertEqual(estimated, ["laguna-xs-2.1-nvfp4", "laguna-s-2.1-nvfp4", "hy3-oq2e"])
+    }
+
+    /// The bar fractions the pane draws stay inside the track, and context —
+    /// which is compared on a log scale — orders the way the raw windows do.
+    func testBarFractionsStayInsideTheTrack() {
+        for p in allRecommended {
+            XCTAssertTrue((0...1).contains(p.intelligenceBar), p.id)
+            XCTAssertTrue((0...1).contains(p.speedBar), p.id)
+            XCTAssertTrue((0...1).contains(p.contextBar), p.id)
+        }
+        // 128K < 256K < 1M, and the 1M pick fills the track.
+        XCTAssertLessThan(RecommendedModelPick.gemmaE4B.contextBar,
+                          RecommendedModelPick.gemma12B.contextBar)
+        XCTAssertLessThan(RecommendedModelPick.gemma12B.contextBar,
+                          RecommendedModelPick.deepseekV4Flash.contextBar)
+        XCTAssertEqual(RecommendedModelPick.deepseekV4Flash.contextBar, 1.0, accuracy: 0.001)
+    }
+
+    /// The context bar shows the MODEL's window, not the RAM-clamped effective
+    /// one — pinned against each checkpoint's own `max_position_embeddings`.
+    func testContextWindowsMatchTheCheckpoints() {
+        XCTAssertEqual(RecommendedModelPick.gemmaE2B.contextTokens, 131_072)
+        XCTAssertEqual(RecommendedModelPick.gemmaE4B.contextTokens, 131_072)
+        XCTAssertEqual(RecommendedModelPick.gemma31B.contextTokens, 262_144)
+        XCTAssertEqual(RecommendedModelPick.qwen36_27bMtp.contextTokens, 262_144)
+        XCTAssertEqual(RecommendedModelPick.lagunaS21.contextTokens, 262_144)
+        XCTAssertEqual(RecommendedModelPick.deepseekV4Flash.contextTokens, 1_048_576)
+    }
+
+    /// `activeParamsB` is a fact per checkpoint, not a restatement of the
+    /// headline size: an MoE counts only what it wakes.
+    func testActiveParamsAreTheWokenParametersNotTheTotal() {
+        XCTAssertEqual(RecommendedModelPick.lagunaS21.activeParamsB, 8.5)      // 117.6B total
+        XCTAssertEqual(RecommendedModelPick.qwen36_35bA3b.activeParamsB, 3.0)  // 35B total
+        XCTAssertEqual(RecommendedModelPick.hy3_295b.activeParamsB, 21.0)      // 295B total
+        XCTAssertEqual(RecommendedModelPick.deepseekV4Flash.activeParamsB, 13.0) // 284B total
+        XCTAssertEqual(RecommendedModelPick.gemma31B.activeParamsB, 31.0)      // dense
+    }
+
+    // MARK: - Starter recommendation (RAM tiers)
+
+    /// The four bands, sampled in the middle of each.
+    func testStarterPickPerRamTier() {
+        XCTAssertEqual(RecommendedModelPick.starterPick(physicalMemoryBytes: 8 * GiB).id, "gemma-4-e2b")
+        XCTAssertEqual(RecommendedModelPick.starterPick(physicalMemoryBytes: 12 * GiB).id, "gemma-4-e4b")
+        XCTAssertEqual(RecommendedModelPick.starterPick(physicalMemoryBytes: 24 * GiB).id, "gemma-4-12b")
+        XCTAssertEqual(RecommendedModelPick.starterPick(physicalMemoryBytes: 64 * GiB).id, "qwen36-27b-mtp")
+    }
+
+    /// Bands are upper-inclusive, so a machine sitting exactly ON a boundary
+    /// takes the smaller side — it has the least headroom in its band.
+    func testStarterPickBoundariesAreExact() {
+        XCTAssertEqual(RecommendedModelPick.starterPick(physicalMemoryBytes: 16 * GiB).id, "gemma-4-e4b")
+        XCTAssertEqual(RecommendedModelPick.starterPick(physicalMemoryBytes: 17 * GiB).id, "gemma-4-12b")
+        XCTAssertEqual(RecommendedModelPick.starterPick(physicalMemoryBytes: 32 * GiB).id, "gemma-4-12b")
+        XCTAssertEqual(RecommendedModelPick.starterPick(physicalMemoryBytes: 33 * GiB).id, "qwen36-27b-mtp")
+    }
+
+    /// Every tier's pick actually runs on the SMALLEST Mac in its band — a
+    /// recommendation the machine can't load is worse than no recommendation.
+    func testEveryStarterTierFitsTheBottomOfItsBand() {
+        let bottoms: [UInt64] = [4 * GiB, 8 * GiB + 1, 16 * GiB + 1, 32 * GiB + 1]
+        for bytes in bottoms {
+            let pick = RecommendedModelPick.starterPick(physicalMemoryBytes: bytes)
+            XCTAssertTrue(pick.meetsSystemRequirements(physicalMemoryBytes: bytes),
+                          "\(pick.id) needs \(pick.approxRAMNeededGB) GB but was recommended at \(bytes / GiB) GB")
+        }
+    }
+
+    /// Total: no input can fail to produce a recommendation, including the
+    /// degenerate ones a `physicalMemory` read could theoretically hand back.
+    func testStarterPickIsTotal() {
+        for bytes: UInt64 in [0, 1, 2 * GiB, 96 * GiB, 512 * GiB, UInt64.max] {
+            XCTAssertFalse(RecommendedModelPick.starterPick(physicalMemoryBytes: bytes).repoId.isEmpty)
+        }
+    }
+
+    /// Every starter tier is a plain safetensors pick. The shared card handles
+    /// a GGUF pick (`ggufFilename` → the quant download path) because it must
+    /// not assume otherwise, but nothing routes there today.
+    func testNoStarterTierIsAGgufPick() {
+        for bytes: UInt64 in [8 * GiB, 16 * GiB, 32 * GiB, 128 * GiB] {
+            XCTAssertNil(RecommendedModelPick.starterPick(physicalMemoryBytes: bytes).ggufFilename)
         }
     }
 

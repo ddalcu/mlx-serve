@@ -23,14 +23,9 @@ struct ComposerTip: Equatable {
     /// cards, short enough that a deliberate hover feels answered.
     static let hoverDelay: TimeInterval = 0.45
 
-    static func agent(name: String?) -> ComposerTip {
-        guard let name else {
-            return ComposerTip(title: "Agent",
-                               body: "Using the app's defaults. Click to pick one.")
-        }
-        return ComposerTip(title: "Agent · \(name)",
-                           body: "Its prompt, tools, voice and model. Click to switch.")
-    }
+    // `agent(name:)` retired with the composer's agent chip — the picker sits
+    // next to New Chat now (a session's agent is fixed once it exists), and a
+    // card for a control that no longer renders is a sentence nobody can reach.
 
     static func attachments(audioSupported: Bool) -> ComposerTip {
         ComposerTip(
@@ -40,26 +35,78 @@ struct ComposerTip: Equatable {
                 : "Image or PDF — or a folder to ask questions about.")
     }
 
-    static func thinking(isOn: Bool) -> ComposerTip {
+    static func thinking(isOn: Bool, lockedBy agent: String? = nil) -> ComposerTip {
         ComposerTip(title: "Thinking · \(state(isOn))",
-                    body: "Reasoning trace before the answer. Click to turn it \(opposite(isOn)).")
+                    body: agent.map(locked)
+                        ?? "Reasoning trace before the answer. Click to turn it \(opposite(isOn)).")
     }
 
-    static func tools(isOn: Bool, workspace: String?) -> ComposerTip {
+    static func tools(isOn: Bool, workspace: String?, lockedBy agent: String? = nil) -> ComposerTip {
         ComposerTip(
             title: "Tools · \(state(isOn))",
-            body: "Shell, files, web, media. Click to turn it \(opposite(isOn)); right-click to pick tools and set the workspace.",
+            body: agent.map(locked)
+                ?? "Shell, files, web, media. Click to turn it \(opposite(isOn)); right-click to pick tools and set the workspace.",
+            // Still what every file and shell call resolves against, even when
+            // it's the agent's folder rather than the chat's.
             detail: "Workspace: \(workspace ?? "not set")")
     }
 
-    static func mcp(isOn: Bool) -> ComposerTip {
+    static func mcp(isOn: Bool, lockedBy agent: String? = nil) -> ComposerTip {
         ComposerTip(
             title: "MCP · \(state(isOn))",
-            body: "Adds your enabled MCP servers' tools. Click to turn it \(opposite(isOn)); right-click for the Marketplace.")
+            body: agent.map(locked)
+                ?? "Adds your enabled MCP servers' tools. Click to turn it \(opposite(isOn)); right-click for the Marketplace.")
+    }
+
+    /// The body a control gets while its agent owns it. The title still carries
+    /// ON/OFF — that's what the disc's colour is saying — but offering a click
+    /// that can't happen is the dead-offer class, so this names the agent and
+    /// where the setting actually lives instead.
+    private static func locked(_ agent: String) -> String {
+        "Set by the agent \(agent). Edit the agent to change it."
     }
 
     private static func state(_ isOn: Bool) -> String { isOn ? "ON" : "OFF" }
     private static func opposite(_ isOn: Bool) -> String { isOn ? "off" : "on" }
+}
+
+// MARK: - Hover lifecycle
+
+/// When the card is up, extracted from the view so the one behaviour worth
+/// pinning is testable: a dismiss must CANCEL a reveal that is already in
+/// flight. Hover, then click before the delay elapses, and without the token
+/// bump the card pops up on top of the menu you just opened.
+struct ComposerTipHoverState: Equatable {
+    private(set) var shown = false
+    /// Bumped on every event; a delayed reveal only fires while its own token is
+    /// still current.
+    private(set) var token = 0
+
+    /// The pointer entered — returns the token the delayed reveal must present.
+    mutating func hoverBegan() -> Int {
+        token &+= 1
+        return token
+    }
+
+    mutating func hoverEnded() {
+        token &+= 1
+        shown = false
+    }
+
+    /// A menu opened over the composer (either mouse button, or press-and-hold).
+    mutating func dismiss() {
+        token &+= 1
+        shown = false
+    }
+
+    /// The delayed reveal fires. False when something happened since — the
+    /// pointer moved on, or a menu took over.
+    @discardableResult
+    mutating func reveal(token t: Int) -> Bool {
+        guard t == token else { return false }
+        shown = true
+        return true
+    }
 }
 
 // MARK: - Presentation
@@ -121,27 +168,32 @@ extension View {
 /// Publishes `tip` upward while the pointer rests on the control.
 private struct ComposerTipHover: ViewModifier {
     let tip: ComposerTip
-    @State private var shown = false
-    /// Bumped on every hover change; the delayed reveal only fires if its own
-    /// token is still current, which cancels a pointer that moved on.
-    @State private var token = 0
+    @State private var state = ComposerTipHoverState()
 
     func body(content: Content) -> some View {
         content
             .onHover { inside in
-                token &+= 1
                 guard inside else {
-                    shown = false
+                    state.hoverEnded()
                     return
                 }
-                let mine = token
+                let mine = state.hoverBegan()
                 DispatchQueue.main.asyncAfter(deadline: .now() + ComposerTip.hoverDelay) {
-                    guard mine == token else { return }
-                    withAnimation(.easeOut(duration: 0.12)) { shown = true }
+                    withAnimation(.easeOut(duration: 0.12)) { _ = state.reveal(token: mine) }
                 }
             }
+            // The card is a non-hit-testing overlay, so the only thing that takes
+            // it down is the pointer leaving — and opening a menu over the
+            // composer does NOT deliver a hover-exit, so the card sat under the
+            // open menu until you hovered the control again. SwiftUI's `Menu` and
+            // `.contextMenu` are both NSMenus, so this one observer covers a
+            // left-click on the agent/attach menus, a right-click on the
+            // Tools/MCP discs, and press-and-hold.
+            .onReceive(NotificationCenter.default.publisher(for: NSMenu.didBeginTrackingNotification)) { _ in
+                withAnimation(.easeOut(duration: 0.10)) { state.dismiss() }
+            }
             .anchorPreference(key: ComposerTipKey.self, value: .bounds) {
-                shown ? ComposerTipAnchor(tip: tip, bounds: $0) : nil
+                state.shown ? ComposerTipAnchor(tip: tip, bounds: $0) : nil
             }
     }
 }

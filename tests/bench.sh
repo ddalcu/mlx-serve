@@ -326,9 +326,21 @@ add_qwen36_targets() {
     # being mlx-serve can run oMLX's model but not vice versa. lms_baseline/
     # lms_alt stay the vanilla mlx-community/GGUF ids (LM Studio can't load
     # oMLX's inline-mtp layout) so those bars remain the plain-AR reference.
+    #
+    # qwen36-35b-a3b's mlxserve_path was `$LMS_DIR/mlx-community/Qwen3.6-35B-A3B-4bit`,
+    # which for most of its life was a SYMLINK to the stamsam checkpoint below — so the
+    # historical numbers in all-*.csv are stamsam's. On 2026-07-30 that path was replaced
+    # by a real HF download of the vanilla mlx-community repo, whose 4-bit conversion
+    # ships NO mtp weights (no sidecar, no inline `*.mtp.*`) despite its config declaring
+    # `mtp_num_hidden_layers: 1`. The row's `mtp` cell then silently vanished — the
+    # row_mlx_specs gate correctly skipped it rather than measuring plain AR under an
+    # "mtp" label, but the row also stopped being comparable to its own baseline.
+    # Pointing at the stamsam dir directly restores BOTH the mtp cell and continuity
+    # with the historical rows. Named explicitly so a future re-download can't silently
+    # change what this row measures again.
     TARGETS+=(
         "qwen36-27b|$MD/Jundot/Qwen3.6-27B-oQ4e-mtp|qwen3.6-27b|lmstudio-community/Qwen3.6-27B-GGUF/Qwen3.6-27B-Q4_K_M.gguf||$GGUF_DIR/Qwen3.6-27B-GGUF/Qwen3.6-27B-Q4_K_M.gguf"
-        "qwen36-35b-a3b|$LMS_DIR/mlx-community/Qwen3.6-35B-A3B-4bit|qwen3.6-35b-a3b|lmstudio-community/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-Q4_K_M.gguf||$GGUF_DIR/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-Q4_K_M.gguf"
+        "qwen36-35b-a3b|$MD/stamsam/Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled-MLX-oQ4-MTP|qwen3.6-35b-a3b|lmstudio-community/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-Q4_K_M.gguf||$GGUF_DIR/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-Q4_K_M.gguf"
         "qwen36-27b-mtplxopt|$LMS_DIR/Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed|qwen3.6-27b-mtplx-optimized-speed|||"
     )
 }

@@ -376,19 +376,34 @@ enum PasteFileKind: String, Equatable {
 struct ChatView: View {
     @EnvironmentObject var appState: AppState
     @EnvironmentObject var server: ServerManager
+    @Environment(\.dismissWindow) private var dismissWindow
     @State private var columnVisibility = NavigationSplitViewVisibility.automatic
+
+    /// The starter recommendation this Mac gets — same function the welcome
+    /// window and the Model Browser read.
+    private var starterPick: RecommendedModelPick {
+        RecommendedModelPick.starterPick(physicalMemoryBytes: ProcessInfo.processInfo.physicalMemory)
+    }
+
+    /// Blocking whenever nothing on this Mac can serve a chat. The progress
+    /// argument is nil here on purpose: this only decides WHETHER to block, and
+    /// `appState.localModels` is what flips it back. The sheet itself observes
+    /// the download manager for the live figure.
+    private var gateIsBlocking: Bool {
+        ChatGateState.resolve(localModels: appState.localModels,
+                              activeDownload: nil,
+                              lanChatModelCount: server.lanModels(capability: "chat").count).isBlocking
+    }
 
     var body: some View {
         NavigationSplitView(columnVisibility: $columnVisibility) {
             ChatSidebar()
                 .navigationSplitViewColumnWidth(min: 180, ideal: 220, max: 280)
-                // No toolbar band over the SIDEBAR column: scrolled session
-                // rows stay fully visible to the window's top edge instead of
-                // dimming under a material strip — the list reads as sitting
-                // on top of the toolbar. The detail column keeps its own
-                // 0.8-opacity band (set in ChatDetailView); the two sections
-                // are styled independently.
-                .toolbarBackground(.hidden, for: .windowToolbar)
+                // Both columns carry the window's toolbar material, so the bar
+                // reads as one surface across the split rather than appearing
+                // only over the detail side. It is also what the list's
+                // scroll-edge effect attaches to.
+                .toolbarBackground(.visible, for: .windowToolbar)
         } detail: {
             if let sessionId = appState.activeChatId,
                appState.chatSessions.contains(where: { $0.id == sessionId }) {
@@ -408,6 +423,16 @@ struct ChatView: View {
             }
         }
         .navigationTitle("")
+        // A `.constant` binding is what makes this blocking: SwiftUI can't set
+        // it false, so Esc / click-away can't leave the user on the dead
+        // composer underneath. It still dismisses itself, because the value is
+        // recomputed every update and goes false the moment a chat model lands.
+        .sheet(isPresented: .constant(gateIsBlocking)) {
+            ChatModelGateSheet(pick: starterPick) { dismissWindow(id: "chat") }
+                .environmentObject(appState)
+                .environmentObject(appState.downloads)
+                .environmentObject(server)
+        }
         .onAppear {
             // Menu bar apps need explicit activation for keyboard focus — and
             // the `.regular` flip must come FIRST. (The old comment here claimed
@@ -417,6 +442,9 @@ struct ChatView: View {
             DispatchQueue.main.async {
                 AppActivation.focus()
             }
+            // The gate reads `localModels`; a chat window opened right after a
+            // download landed elsewhere must not show a stale one.
+            appState.refreshModels()
         }
     }
 }
@@ -425,6 +453,7 @@ struct ChatView: View {
 
 struct ChatSidebar: View {
     @EnvironmentObject var appState: AppState
+    @Environment(\.openWindow) private var openWindow
     @State private var hoveredSessionId: UUID?
 
     var body: some View {
@@ -508,22 +537,79 @@ struct ChatSidebar: View {
             }
         }
         .listStyle(.sidebar)
+        // The platform's own scroll-edge effect at BOTH ends: rows pass under
+        // the window's top edge and under the New Chat row (a `safeAreaInset`,
+        // so content scrolls beneath it), and a soft edge is how macOS frosts
+        // that overlap. Not a hand-drawn band — a custom strip pulled into this
+        // area once looked native and swallowed every click in it.
+        .scrollEdgeEffectStyle(.soft, for: [.top, .bottom])
         // No Agents / Models entries here: both windows are reachable from the
         // chat toolbar now — "Manage Agents…" in the composer's agent chip and
         // "Manage Models…" in the model picker — and each sat next to the
         // control it configures. The sidebar is the conversation list, and a
         // second route to the same two windows only competed with it.
         .safeAreaInset(edge: .bottom) {
-            Button {
-                _ = appState.newChatSession()
-            } label: {
-                Label("New Chat", systemImage: "plus")
-                    .frame(maxWidth: .infinity)
+            HStack(spacing: 8) {
+                Button {
+                    _ = appState.newChatSession()
+                } label: {
+                    Label("New Chat", systemImage: "plus")
+                        .frame(maxWidth: .infinity, maxHeight: .infinity)
+                        .contentShape(Rectangle())
+                }
+                // `.plain` + our own frame and background, NOT `.bordered` —
+                // see `ChatMetrics.sidebarButtonHeight`. It is the only way the
+                // two controls are the same height by construction rather than
+                // by whatever a style style decides their labels are worth.
+                .buttonStyle(.plain)
+                .sidebarActionButton()
+                newAgentChatMenu
             }
-            .buttonStyle(.bordered)
             .padding(.horizontal, 12)
             .padding(.vertical, 10)
         }
+    }
+
+    /// Start a chat AS an agent.
+    ///
+    /// Next to New Chat because that is WHEN the choice is made: a session's
+    /// agent is fixed once the session exists (there is no `setAgent` any more),
+    /// so this is the only place it can be picked. It used to be a chip in the
+    /// composer, where it configured the whole conversation from the row that
+    /// configures one message — and a mid-thread switch silently re-pointed the
+    /// prompt, tools, model and voice of a conversation already underway.
+    private var newAgentChatMenu: some View {
+        Menu {
+            if appState.agents.allAgents.isEmpty {
+                Text("No agents yet")
+            }
+            ForEach(appState.agents.allAgents) { agent in
+                let decision = appState.agentModelDecision(for: agent)
+                Button {
+                    appState.startChat(withAgent: agent.id)
+                } label: {
+                    // Same rule as the old chip: an agent whose pinned model
+                    // isn't downloaded says so rather than failing at send.
+                    Label(AgentModelSwitch.isSelectable(decision)
+                          ? agent.name : "\(agent.name) — model not downloaded",
+                          systemImage: agent.symbol)
+                }
+                .disabled(!AgentModelSwitch.isSelectable(decision))
+            }
+            Divider()
+            Button("Manage Agents…") {
+                AppActivation.openWindow(id: "agents", using: openWindow)
+            }
+        } label: {
+            Image(systemName: "person.badge.plus")
+                .frame(width: 34, height: ChatMetrics.sidebarButtonHeight)
+                .contentShape(Rectangle())
+        }
+        .menuStyle(.button)
+        .buttonStyle(.plain)
+        .menuIndicator(.hidden)
+        .sidebarActionButton()
+        .help("New chat with an agent — its prompt, tools, model and voice")
     }
 
     private func relativeTime(_ date: Date) -> String {
@@ -623,13 +709,38 @@ struct ChatDetailView: View {
     private var isExternalBridgeSession: Bool { session?.isExternalBridge == true }
 
     /// Resolved on/off state for the three mode toggles in the toolbar — sourced
-    /// from `serverOptions.telegram` for a Telegram session, else the in-app state.
+    /// from `serverOptions.telegram` for a Telegram session, else the in-app
+    /// state, and overridden by the tab's agent for whatever it decides.
     private var toolbarToggles: ChatModeToggles {
         let tg = appState.serverOptions.telegram
         return ChatModeToggles.resolve(
             isExternalBridge: isExternalBridgeSession,
             telegramThinking: tg.enableThinking, telegramAgent: tg.agentMode, telegramMCP: tg.useMCP,
-            inAppThinking: enableThinking, inAppAgent: isAgentMode, inAppMCP: mcpMode)
+            inAppThinking: enableThinking, inAppAgent: isAgentMode, inAppMCP: mcpMode,
+            agentLock: agentModeLock)
+    }
+
+    /// What this tab's agent decided about Think / Tools / MCP, nil with no agent.
+    ///
+    /// Built from the SAME `resolvedAgentSettings` the turn runs under, not from
+    /// the agent's `capabilities` directly: a second copy of that rule is exactly
+    /// how the discs ended up disagreeing with what ran (every agent defaults
+    /// `web: true`, so resolution forced the tool loop on while the wrench still
+    /// rendered OFF). Cheap — the resolution is a pure fold.
+    private var agentModeLock: AgentModeLock? {
+        guard let agent = activeAgent else { return nil }
+        let resolved = appState.resolvedAgentSettings(
+            agentId: agent.id,
+            toolsEnabled: isAgentMode,
+            mcpEnabled: mcpMode,
+            thinkingEnabled: enableThinking,
+            workingDirectory: session?.workingDirectory,
+            disabledTools: ChatSession.disabledToolKinds(session?.disabledTools ?? []))
+        return AgentModeLock(name: agent.name,
+                             // The only one an agent may leave to the chat.
+                             thinking: agent.enableThinking,
+                             tools: resolved.toolsEnabled,
+                             mcp: resolved.mcpEnabled)
     }
 
     // MARK: Mode controls (Think / Tools / MCP)
@@ -678,55 +789,14 @@ struct ChatDetailView: View {
         .overlay(Capsule().stroke(Color.secondary.opacity(0.20), lineWidth: 0.5))
     }
 
-    /// Per-tab agent picker. A `Menu` (not a Picker) so an agent whose model
-    /// isn't downloaded can be a disabled row with its reason, and so "Manage
-    /// agents…" sits in the same list. Selecting one applies to SUBSEQUENT turns:
-    /// the transcript is left alone.
-    private var agentChip: some View {
-        Menu {
-            Button {
-                appState.setAgent(nil, forSession: sessionId)
-            } label: {
-                if session?.agentId == nil {
-                    Label("None (app defaults)", systemImage: "checkmark")
-                } else {
-                    Text("None (app defaults)")
-                }
-            }
-            Divider()
-            ForEach(appState.agents.allAgents) { agent in
-                let decision = appState.agentModelDecision(for: agent)
-                Button {
-                    appState.setAgent(agent.id, forSession: sessionId)
-                } label: {
-                    if session?.agentId == agent.id {
-                        Label(agent.name, systemImage: "checkmark")
-                    } else {
-                        Text(AgentModelSwitch.isSelectable(decision)
-                             ? agent.name : "\(agent.name) — model not downloaded")
-                    }
-                }
-                .disabled(!AgentModelSwitch.isSelectable(decision))
-            }
-            Divider()
-            Button("Manage Agents…") {
-                AppActivation.openWindow(id: "agents", using: openWindow)
-            }
-        } label: {
-            Image(systemName: activeAgent?.symbol ?? "person.crop.circle")
-                .font(.system(size: 13, weight: .medium))
-                .foregroundStyle(activeAgent == nil ? .secondary : Color.accentColor)
-                .frame(width: ChatMetrics.composerIconSize, height: ChatMetrics.composerIconSize)
-                .background(Color.secondary.opacity(0.15))
-                .clipShape(Circle())
-                .frame(width: ChatMetrics.composerControlSize, height: ChatMetrics.composerControlSize)
-                .contentShape(Circle())
-        }
-        .menuStyle(.button)
-        .buttonStyle(.plain)
-        .menuIndicator(.hidden)
-        .composerTip(.agent(name: activeAgent?.name))
-    }
+    // The per-tab agent PICKER used to sit here, between the paperclip and the
+    // mode discs. It's next to New Chat now (`ChatSidebar.newAgentChatMenu`):
+    // it configures the whole conversation rather than the message being
+    // written, and a session's agent is fixed once the session exists — a
+    // mid-thread switch left half a conversation running under someone else's
+    // prompt, tools, model and voice, and flipped the three discs beside it
+    // while it did. The chat still SHOWS who it's talking to (the sidebar row,
+    // and the locked discs name the agent on hover).
 
     /// The agent this tab is talking to (nil = none).
     private var activeAgent: Agent? { appState.agents.agent(id: session?.agentId) }
@@ -771,35 +841,80 @@ struct ChatDetailView: View {
     /// to read from COLOR alone: tinted glyph on a tinted disc when on, secondary
     /// on the same neutral disc as the paperclip when off. Same circle geometry
     /// as every other composer control, so the row stays on one baseline.
-    private func modeIcon(_ icon: String, isOn: Bool, onColor: Color) -> some View {
+    /// `lockedBy` draws an inset ring inside the disc — the control still reads
+    /// its state from colour, and the ring says the state isn't yours to change.
+    /// A dimmed-out glyph was the alternative and it loses the ON/OFF reading,
+    /// which is the one thing the disc has to keep saying.
+    private func modeIcon(_ icon: String, isOn: Bool, onColor: Color,
+                          lockedBy: String? = nil) -> some View {
         Image(systemName: icon)
             .font(.system(size: 13, weight: .medium))
             .foregroundStyle(isOn ? onColor : Color.secondary)
             .frame(width: ChatMetrics.composerIconSize, height: ChatMetrics.composerIconSize)
             .background(isOn ? onColor.opacity(0.20) : Color.secondary.opacity(0.15))
             .clipShape(Circle())
+            .overlay {
+                if lockedBy != nil {
+                    Circle()
+                        .inset(by: 1)
+                        .strokeBorder(style: StrokeStyle(lineWidth: 1, dash: [2, 2]))
+                        .foregroundStyle((isOn ? onColor : Color.secondary).opacity(0.65))
+                        .frame(width: ChatMetrics.composerIconSize,
+                               height: ChatMetrics.composerIconSize)
+                }
+            }
             .frame(width: ChatMetrics.composerControlSize, height: ChatMetrics.composerControlSize)
             // A .plain Button without an explicit content shape only hit-tests
             // the drawn glyph pixels, not the disc.
             .contentShape(Circle())
     }
 
-    private var thinkToggle: some View {
-        Button {
-            if isExternalBridgeSession {
-                // Telegram session: write the shared config so the toggle
-                // stays in sync with Settings and the bridge reads it live.
-                appState.serverOptions.telegram.enableThinking.toggle()
-            } else if !enableThinking && isAgentMode {
-                showThinkingInAgentConfirm = true
-            } else {
-                enableThinking.toggle()
-            }
-        } label: {
-            modeIcon("brain", isOn: toolbarToggles.thinking, onColor: .blue)
+    /// What a locked disc offers instead of its own controls: who decided it, and
+    /// the way to the place where that decision lives. A locked control that does
+    /// nothing at all on click is the dead-control class — this is the same shape
+    /// as the tool menu's "not in <agent>'s capabilities" rows.
+    @ViewBuilder
+    private func lockedModeMenu(_ agentName: String) -> some View {
+        Text("Set by \(agentName)")
+        Button("Edit Agent…") {
+            // ON that agent — the window otherwise opens on whoever sorts
+            // first, which is the wrong one every time you got here from a card
+            // that just named a different name.
+            guard let id = activeAgent?.id else { return }
+            appState.openAgentSettings(id, using: openWindow)
         }
-        .buttonStyle(.plain)
-        .composerTip(.thinking(isOn: toolbarToggles.thinking))
+    }
+
+    private var thinkToggle: some View {
+        Group {
+            if let owner = toolbarToggles.thinkingLockedBy {
+                Menu {
+                    lockedModeMenu(owner)
+                } label: {
+                    modeIcon("brain", isOn: toolbarToggles.thinking, onColor: .blue, lockedBy: owner)
+                }
+                .menuStyle(.button)
+                .buttonStyle(.plain)
+                .menuIndicator(.hidden)
+            } else {
+                Button {
+                    if isExternalBridgeSession {
+                        // Telegram session: write the shared config so the toggle
+                        // stays in sync with Settings and the bridge reads it live.
+                        appState.serverOptions.telegram.enableThinking.toggle()
+                    } else if !enableThinking && isAgentMode {
+                        showThinkingInAgentConfirm = true
+                    } else {
+                        enableThinking.toggle()
+                    }
+                } label: {
+                    modeIcon("brain", isOn: toolbarToggles.thinking, onColor: .blue)
+                }
+                .buttonStyle(.plain)
+            }
+        }
+        .composerTip(.thinking(isOn: toolbarToggles.thinking,
+                               lockedBy: toolbarToggles.thinkingLockedBy))
     }
 
     /// One wrench: CLICK flips the tool loop, secondary-click opens the per-tool
@@ -812,25 +927,45 @@ struct ChatDetailView: View {
     /// meaning two things by WHICH button is the standard macOS split, and
     /// `primaryAction:` also gives press-and-hold for free — the context menu is
     /// there because press-and-hold is not something anyone discovers.
+    ///
+    /// While the tab has an agent this is a LOCKED indicator: `AgentResolution`
+    /// takes the loop straight from the agent's capabilities and ignores whatever
+    /// the chat says, so a live toggle here would be a control that changes
+    /// nothing. It shows what the agent decided and points at the editor.
     private var agentToggle: some View {
-        Menu {
-            toolMenuContent
-        } label: {
-            modeIcon("wrench", isOn: toolbarToggles.agent, onColor: .orange)
-        } primaryAction: {
-            setToolsEnabled(!toolbarToggles.agent)
+        Group {
+            if let owner = toolbarToggles.toolsLockedBy {
+                Menu {
+                    lockedModeMenu(owner)
+                } label: {
+                    modeIcon("wrench", isOn: toolbarToggles.agent, onColor: .orange, lockedBy: owner)
+                }
+            } else {
+                Menu {
+                    toolMenuContent
+                } label: {
+                    modeIcon("wrench", isOn: toolbarToggles.agent, onColor: .orange)
+                } primaryAction: {
+                    setToolsEnabled(!toolbarToggles.agent)
+                }
+                .contextMenu { toolMenuContent }
+            }
         }
         .menuStyle(.button)
         .buttonStyle(.plain)
         .menuIndicator(.hidden)
-        .contextMenu { toolMenuContent }
-        .composerTip(.tools(isOn: toolbarToggles.agent, workspace: session?.workingDirectory))
+        .composerTip(.tools(isOn: toolbarToggles.agent,
+                            workspace: session?.workingDirectory,
+                            lockedBy: toolbarToggles.toolsLockedBy))
     }
 
     /// Flip the tool loop for this chat. Shared by the wrench click and the
     /// pre-send intent nudge, so the approval re-arm and the thinking auto-off
     /// can't apply on one path and not the other.
     private func setToolsEnabled(_ on: Bool) {
+        // The agent decides this one — the disc offers no primary action while
+        // locked, but the pre-send nudge calls in here too.
+        guard toolbarToggles.toolsLockedBy == nil else { return }
         if isExternalBridgeSession {
             // Telegram session: flip the shared config (in sync with Settings);
             // no per-session approval state applies here.
@@ -918,6 +1053,7 @@ struct ChatDetailView: View {
     /// Flip MCP for this chat — the Telegram bridge writes the shared config it
     /// reads live, everyone else the app-level state.
     private func setMCPEnabled(_ on: Bool) {
+        guard toolbarToggles.mcpLockedBy == nil else { return }
         if isExternalBridgeSession {
             appState.serverOptions.telegram.useMCP = on
         } else {
@@ -928,18 +1064,29 @@ struct ChatDetailView: View {
     /// Same shape as `agentToggle`: click toggles, secondary-click opens the
     /// Marketplace the gear half used to hold.
     private var mcpToggle: some View {
-        Menu {
-            mcpMenuContent
-        } label: {
-            modeIcon("puzzlepiece.extension", isOn: toolbarToggles.mcp, onColor: .purple)
-        } primaryAction: {
-            setMCPEnabled(!toolbarToggles.mcp)
+        Group {
+            if let owner = toolbarToggles.mcpLockedBy {
+                Menu {
+                    lockedModeMenu(owner)
+                } label: {
+                    modeIcon("puzzlepiece.extension", isOn: toolbarToggles.mcp,
+                             onColor: .purple, lockedBy: owner)
+                }
+            } else {
+                Menu {
+                    mcpMenuContent
+                } label: {
+                    modeIcon("puzzlepiece.extension", isOn: toolbarToggles.mcp, onColor: .purple)
+                } primaryAction: {
+                    setMCPEnabled(!toolbarToggles.mcp)
+                }
+                .contextMenu { mcpMenuContent }
+            }
         }
         .menuStyle(.button)
         .buttonStyle(.plain)
         .menuIndicator(.hidden)
-        .contextMenu { mcpMenuContent }
-        .composerTip(.mcp(isOn: toolbarToggles.mcp))
+        .composerTip(.mcp(isOn: toolbarToggles.mcp, lockedBy: toolbarToggles.mcpLockedBy))
     }
 
     @ViewBuilder
@@ -1022,6 +1169,14 @@ struct ChatDetailView: View {
                     .padding(ChatMetrics.gutter)
                 }
                 .coordinateSpace(name: "chatScroll")
+                // Transcript text used to run straight into the floating model
+                // picker. The toolbar band's own full-width background stays
+                // hidden (the cluster carries its own material — that's what
+                // keeps content from bleeding THROUGH the controls); this is
+                // the other half, frosting the content as it passes UNDER them,
+                // drawn by the scroll view itself so nothing new can intercept
+                // a click.
+                .scrollEdgeEffectStyle(.soft, for: .top)
                 .background(
                     GeometryReader { scrollFrame in
                         Color.clear.preference(
@@ -1196,14 +1351,15 @@ struct ChatDetailView: View {
                 }
             }
         }
-        // No band across the window. The 0.8-opacity strip that used to live
-        // here existed because transcript content scrolling under the toolbar
-        // bled through the controls — that job now belongs to `floatingToolbar`,
-        // which carries its own material, so the strip is pure cost: it drew a
-        // full-width divider above a mostly empty bar. Hiding it lets the
-        // transcript run to the window's top edge, matching the sidebar column
-        // (which has hidden its own band all along).
-        .toolbarBackground(.hidden, for: .windowToolbar)
+        // The window's own toolbar material, full width. This was hidden for a
+        // while — the floating cluster carries its own material, so the band
+        // read as a divider above a mostly empty bar. But hiding it left the
+        // transcript running to the window's top edge with nothing between the
+        // two: text clipped mid-line under the model picker (live 2026-07-30),
+        // and `scrollEdgeEffectStyle` had no bar to attach to, so it drew
+        // nothing. The system material IS the 100%-width surface here — the
+        // hand-drawn strip that predated it is what must not come back.
+        .toolbarBackground(.visible, for: .windowToolbar)
         .sheet(isPresented: $showMCPMarketplace) {
             MCPMarketplaceView()
                 .environmentObject(mcpManager)
@@ -1352,12 +1508,6 @@ struct ChatDetailView: View {
     @ViewBuilder
     private var composerControls: some View {
         HStack(spacing: 6) {
-        // Who this tab is talking to. In the COMPOSER row, not the
-        // toolbar band — that cluster's width budget is full, and its
-        // label is agent-name-sized (runtime-variable), which is
-        // exactly what re-triggers the » eviction class.
-        agentChip
-
         attachmentMenu
 
         // Mic — only on models that actually understand audio
@@ -1831,14 +1981,18 @@ struct ChatDetailView: View {
     /// Decide whether to nudge before sending. MCP takes priority over Agent
     /// because a named server is the more specific signal; both are gated on the
     /// matching mode being off and the suggestion not already declined this chat.
+    ///
+    /// A mode the tab's agent decides is never nudged about: accepting would
+    /// change nothing and the message would send exactly as it was.
     private func detectIntentPrompt(for text: String) -> IntentPrompt? {
+        let toggles = toolbarToggles
         let servers = enabledMCPServerNames()
-        if !mcpMode, !servers.isEmpty,
+        if !mcpMode, toggles.mcpLockedBy == nil, !servers.isEmpty,
            !intentSuppress.isSuppressed(.mcp, for: sessionId),
            ComposerIntent.wantsMCP(text, serverNames: servers) {
             return .mcp
         }
-        if !isAgentMode,
+        if !isAgentMode, toggles.toolsLockedBy == nil,
            !intentSuppress.isSuppressed(.agent, for: sessionId),
            ComposerIntent.wantsAgent(text) {
             return .agent
@@ -2321,14 +2475,48 @@ struct ChatModeToggles: Equatable {
     var thinking: Bool
     var agent: Bool
     var mcp: Bool
+    /// Who decided each control, when it isn't the chat itself — the agent's
+    /// name, for the lock ring and the hover card. nil = the chat's own toggle.
+    var thinkingLockedBy: String? = nil
+    var toolsLockedBy: String? = nil
+    var mcpLockedBy: String? = nil
+
+    var isLocked: Bool { thinkingLockedBy != nil || toolsLockedBy != nil || mcpLockedBy != nil }
 
     static func resolve(isExternalBridge: Bool,
                         telegramThinking: Bool, telegramAgent: Bool, telegramMCP: Bool,
-                        inAppThinking: Bool, inAppAgent: Bool, inAppMCP: Bool) -> ChatModeToggles {
-        isExternalBridge
+                        inAppThinking: Bool, inAppAgent: Bool, inAppMCP: Bool,
+                        agentLock: AgentModeLock? = nil) -> ChatModeToggles {
+        let base = isExternalBridge
             ? ChatModeToggles(thinking: telegramThinking, agent: telegramAgent, mcp: telegramMCP)
             : ChatModeToggles(thinking: inAppThinking, agent: inAppAgent, mcp: inAppMCP)
+        guard let lock = agentLock else { return base }
+        return ChatModeToggles(
+            // Thinking is the one an agent may leave unset, and `AgentResolution`
+            // falls back to the surface's own value there — so locking it anyway
+            // would take away a control nobody is deciding for you.
+            thinking: lock.thinking ?? base.thinking,
+            agent: lock.tools,
+            mcp: lock.mcp,
+            thinkingLockedBy: lock.thinking == nil ? nil : lock.name,
+            toolsLockedBy: lock.name,
+            mcpLockedBy: lock.name)
     }
+}
+
+/// What the chat's agent decided about Think / Tools / MCP.
+///
+/// `AgentResolution` takes Tools and MCP straight from the agent's capabilities
+/// and ignores the chat's own toggles — so without this the discs showed one
+/// thing and the turn ran another (every agent defaults `web: true`, which forces
+/// the tool loop on while the wrench renders OFF). Built from the SAME resolution
+/// the turn uses (`ChatDetailView.agentModeLock`), so the two can't drift.
+struct AgentModeLock: Equatable {
+    var name: String
+    /// nil = the agent left thinking unset; the chat's own toggle stands.
+    var thinking: Bool?
+    var tools: Bool
+    var mcp: Bool
 }
 
 /// (both `isAgentSummary`) into one row: a `name(args)` header with the result(s)

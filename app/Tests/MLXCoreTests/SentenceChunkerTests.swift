@@ -64,4 +64,15 @@ final class SentenceChunkerTests: XCTestCase {
         var c = SentenceChunker()
         XCTAssertEqual(c.flush(), [])
     }
+
+    func testIngestAfterFlushOfTheSameTextEmitsNothing() {
+        // Voice mode re-ingests the finished answer whenever the session list
+        // republishes while TTS is still speaking; a flush must not rewind the
+        // chunker or the whole response is enqueued (and spoken) twice.
+        var c = SentenceChunker()
+        XCTAssertEqual(c.ingest(fullText: "One. Two"), ["One."])
+        XCTAssertEqual(c.flush(), ["Two"])
+        XCTAssertEqual(c.ingest(fullText: "One. Two"), [])
+        XCTAssertEqual(c.flush(), [])
+    }
 }

@@ -9,6 +9,12 @@ import Foundation
 struct SentenceChunker {
     private var emitted = 0
     private var lastText = ""
+    /// The trailing partial was released by `flush()`. Tracked instead of
+    /// zeroing `emitted`/`lastText`, which rewound the chunker: voice mode
+    /// re-ingests the finished answer whenever the session list republishes
+    /// while TTS is still speaking, and a rewound chunker re-emitted the whole
+    /// response — spoken twice.
+    private var tailFlushed = false
 
     init() {}
 
@@ -32,10 +38,9 @@ struct SentenceChunker {
         if sentences.count > emitted { result.append(contentsOf: sentences[emitted...]) }
         emitted = sentences.count
         let tail = remainder.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !tail.isEmpty {
+        if !tail.isEmpty, !tailFlushed {
             result.append(tail)
-            lastText = ""   // consumed; don't re-emit on a second flush
-            emitted = 0
+            tailFlushed = true   // consumed; don't re-emit on a later flush/ingest
         }
         return result
     }

@@ -323,6 +323,26 @@ final class VoiceModeControllerTests: XCTestCase {
         XCTAssertEqual(c.state, .listening)                  // mic reopened for next turn
     }
 
+    func testSessionRepublishAfterStreamEndsDoesNotRespeakTheAnswer() async {
+        // The Combine feed re-fires on ANY chatSessions publish (another surface
+        // touching a session, auto-title, …). When one lands after the stream
+        // ended but before the queue drains — state still `.speaking`, same
+        // message — the answer must not be enqueued a second time. Live bug:
+        // the whole response was spoken twice.
+        let (c, rec, syn) = make()
+        await beginAndSubmit(c, rec)
+        c.observeAssistant(messageId: "A", content: "One. Two. Done", generating: true)
+        c.observeAssistant(messageId: "A", content: "One. Two. Done", generating: false)
+        let spoken = syn.enqueued
+        XCTAssertEqual(c.state, .speaking)                   // queue not drained yet
+
+        c.observeAssistant(messageId: "A", content: "One. Two. Done", generating: false)
+        XCTAssertEqual(syn.enqueued, spoken, "a republish of the finished answer must not re-speak it")
+
+        syn.simulateDrain()
+        XCTAssertEqual(c.state, .listening)
+    }
+
     func testReasoningIsNeverSpoken() async {
         // The controller only ever receives visible `content`; thinking text is a
         // separate field upstream and never routed here.
