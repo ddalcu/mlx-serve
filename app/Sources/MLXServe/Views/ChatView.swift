@@ -378,6 +378,18 @@ struct ChatView: View {
     @EnvironmentObject var server: ServerManager
     @Environment(\.dismissWindow) private var dismissWindow
     @State private var columnVisibility = NavigationSplitViewVisibility.automatic
+    /// Flipped by the gate sheet's Cancel, and by nothing else.
+    ///
+    /// The sheet was first presented on a `.constant(true)` binding, which made
+    /// it properly blocking and made Cancel UNIMPLEMENTABLE: AppKit refuses to
+    /// close a window that has an attached sheet, so the click did nothing and
+    /// the user was stuck (measured through the accessibility API — the sheet
+    /// was still on screen afterwards). The binding's setter still swallows
+    /// SwiftUI's own dismissals, so Esc and click-away can't drop the user onto
+    /// the dead composer underneath; Cancel is the one door, and it ends the
+    /// sheet before closing the window. Window scenes rebuild their content on
+    /// reopen, so this resets itself.
+    @State private var gateCancelled = false
 
     /// The starter recommendation this Mac gets — same function the welcome
     /// window and the Model Browser read.
@@ -423,12 +435,12 @@ struct ChatView: View {
             }
         }
         .navigationTitle("")
-        // A `.constant` binding is what makes this blocking: SwiftUI can't set
-        // it false, so Esc / click-away can't leave the user on the dead
-        // composer underneath. It still dismisses itself, because the value is
-        // recomputed every update and goes false the moment a chat model lands.
-        .sheet(isPresented: .constant(gateIsBlocking)) {
-            ChatModelGateSheet(pick: starterPick) { dismissWindow(id: "chat") }
+        // Blocking: the setter drops SwiftUI's own dismissals, so nothing but
+        // Cancel takes this sheet down. The getter is recomputed every update,
+        // so it also clears ITSELF the moment a chat model lands.
+        .sheet(isPresented: Binding(get: { gateIsBlocking && !gateCancelled },
+                                    set: { _ in })) {
+            ChatModelGateSheet(pick: starterPick, onCancel: cancelGate)
                 .environmentObject(appState)
                 .environmentObject(appState.downloads)
                 .environmentObject(server)
@@ -446,6 +458,15 @@ struct ChatView: View {
             // download landed elsewhere must not show a stale one.
             appState.refreshModels()
         }
+    }
+
+    /// Cancel on the gate: end the sheet, THEN close the window. Both halves
+    /// are required and the order is load-bearing — a window with an attached
+    /// sheet can't be closed, and dismissing to the composer underneath is the
+    /// dead end this gate exists to replace.
+    private func cancelGate() {
+        gateCancelled = true
+        DispatchQueue.main.async { dismissWindow(id: "chat") }
     }
 }
 
