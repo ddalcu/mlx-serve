@@ -8,8 +8,8 @@ MODEL="${TTS_MODEL:-$(ls -d ~/.cache/huggingface/hub/models--mlx-community--Qwen
 BIN="${BIN:-./zig-out/bin/mlx-serve}"
 "$BIN" --model "$MODEL" --serve --port "$PORT" >/tmp/test_tts_server.log 2>&1 &
 SRV=$!; trap "kill $SRV 2>/dev/null || true" EXIT
-for i in $(seq 1 90); do grep -q "TTS server listening" /tmp/test_tts_server.log && break; sleep 1; done
-grep -q "TTS server listening" /tmp/test_tts_server.log || { echo "FAIL: server did not start"; cat /tmp/test_tts_server.log; exit 1; }
+for i in $(seq 1 90); do grep -q "Server listening" /tmp/test_tts_server.log && break; sleep 1; done
+grep -q "Server listening" /tmp/test_tts_server.log || { echo "FAIL: server did not start"; cat /tmp/test_tts_server.log; exit 1; }
 code=$(curl -s -X POST "http://127.0.0.1:$PORT/v1/audio/speech" -H 'Content-Type: application/json' \
   -d '{"model":"tts","input":"This is a native server test."}' -o /tmp/test_tts.wav -w "%{http_code}")
 [ "$code" = "200" ] || { echo "FAIL: http $code"; exit 1; }

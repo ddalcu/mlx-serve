@@ -25,43 +25,37 @@ struct ComposerTip: Equatable {
 
     static func agent(name: String?) -> ComposerTip {
         guard let name else {
-            return ComposerTip(
-                title: "Agent",
-                body: "No agent — this chat uses the app's own prompt, tools, voice and model. Click to pick one.")
+            return ComposerTip(title: "Agent",
+                               body: "Using the app's defaults. Click to pick one.")
         }
-        return ComposerTip(
-            title: "Agent · \(name)",
-            body: "This chat runs \(name)'s prompt, tools, voice, workspace and model. Click to switch agents, or to manage them.")
+        return ComposerTip(title: "Agent · \(name)",
+                           body: "Its prompt, tools, voice and model. Click to switch.")
     }
 
     static func attachments(audioSupported: Bool) -> ComposerTip {
         ComposerTip(
             title: "Attach",
             body: audioSupported
-                ? "Add an image, PDF or audio clip to this message — or attach a folder to ask questions about the documents in it."
-                : "Add an image or PDF to this message — or attach a folder to ask questions about the documents in it.")
+                ? "Image, PDF or audio — or a folder to ask questions about."
+                : "Image or PDF — or a folder to ask questions about.")
     }
 
     static func thinking(isOn: Bool) -> ComposerTip {
-        ComposerTip(
-            title: "Thinking · \(state(isOn))",
-            body: "When the model supports it, it emits a private reasoning trace before the visible answer. Slower, but better on reasoning-heavy prompts. Click to turn it \(opposite(isOn)).")
+        ComposerTip(title: "Thinking · \(state(isOn))",
+                    body: "Reasoning trace before the answer. Click to turn it \(opposite(isOn)).")
     }
 
     static func tools(isOn: Bool, workspace: String?) -> ComposerTip {
         ComposerTip(
             title: "Tools · \(state(isOn))",
-            body: """
-            The model runs a tool-calling loop with the built-in tools — shell, file read/write/edit/search, browse, webSearch, saveMemory and media generation. Off: a plain chat with no tools.
-            Click to turn it \(opposite(isOn)); right-click to choose which tools this chat may use and set its workspace.
-            """,
+            body: "Shell, files, web, media. Click to turn it \(opposite(isOn)); right-click to pick tools and set the workspace.",
             detail: "Workspace: \(workspace ?? "not set")")
     }
 
     static func mcp(isOn: Bool) -> ComposerTip {
         ComposerTip(
             title: "MCP · \(state(isOn))",
-            body: "Tools from every enabled Model Context Protocol server join the toolset alongside the built-in ones. Click to turn it \(opposite(isOn)); right-click to open the Marketplace and enable servers.")
+            body: "Adds your enabled MCP servers' tools. Click to turn it \(opposite(isOn)); right-click for the Marketplace.")
     }
 
     private static func state(_ isOn: Bool) -> String { isOn ? "ON" : "OFF" }
@@ -153,7 +147,7 @@ private struct ComposerTipHover: ViewModifier {
 }
 
 struct ComposerTipCard: View {
-    static let width: CGFloat = 300
+    static let width: CGFloat = 250
 
     let tip: ComposerTip
 

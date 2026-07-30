@@ -1214,3 +1214,56 @@ expert-bank copy?") closes with no change: our tail already does
 `take_axis(down_squeezed, inv_order)` — an ACTIVATIONS-only gather through the inverse
 permutation, which IS mlxfast's fix. The prefill fused gate+up bank (load-time weight
 concat, additive memory) remains open in `docs/perf-next-levers.md`.
+
+## A cached metal_kernel config keyed on element COUNT crashes the server on shape collision (2026-07-29)
+
+**Live failure**: voice-mode chat on `poolside/Laguna-XS-2.1-NVFP4-mlx` killed the server after a
+few turns, twice in one session. The log ends abruptly right after
+`[hot-cache] reused 1015/1032 tokens (matched 1015)` — no error in the file (the MLX fatal goes to
+stderr, which only the app's in-memory buffer sees), no crash report (the mlx-c error handler
+exits). The app-side symptom read as "server crashes with a very long base64" because the debug
+log's last big entries were the voice-clone TTS bodies (~550 KB of `ref_audio` each).
+
+**Actual error** (recovered by replaying the session):
+
+    MLX error: [matmul] Last dimension of first input with shape (1,16,512) must match
+    second to last dimension of second input with shape (8192,2048).
+
+**Root cause**: `fusedSwiGLU`'s cached `mlx_fast_metal_kernel_config` was keyed on
+`{n, tg, ndim, dtype}` — element count, not shape — while the config bakes the builder's OUTPUT
+SHAPE. On Laguna XS a MoE layer's SwiGLU at a 16-token forward has shape (1,16,512) = 8192
+elements; a dense `mlp_only` layer at decode has (1,1,8192) = the same 8192 elements, rank 3,
+bf16, tg 256. Equal key, different shape: the decode call was served the MoE config and returned
+its activation labeled (1,16,512), and the dense down-proj (`x @ W(8192,2048)`) raised an
+uncatchable frontend shape error → process death.
+
+Why EXACTLY 16 tokens: 16 × 512 == 1 × 8192. And the only source of a 16-token forward is a
+hot-cache-restore suffix prefill (cold prefills are whole prompts or ≥1024-token chunks; PLD
+verify is ≤ depth+1). Voice mode was merely the environment that produced it: short spoken turns
+→ the next prompt matches the stored entry to its FULL length → the unmatched suffix (turn
+scaffolding + a short user sentence) lands near 17 tokens → 16 after t1 is split off. Live turns
+died at suffix 17 and survived at 14/15/16/18 — the bisect that looked like a "≥16 kernel gate"
+was really "suffix−1 == 16".
+
+**Diagnosis path worth keeping**: the debug log dumps every request body whole, so the fatal
+session is REPLAYABLE — extract bodies byte-exact (`[http] request body (Nb):` + N bytes) and
+curl them back in order. A byte-exact serial replay did NOT reproduce (the fatal condition needs
+the hot-cache entry to match the previous turn's own generated reply, and a replayed server
+generates different tokens at temp 0.7); an INTERACTIVE replay (feed the server's own answers
+forward) reproduced it on turn 2. Env-var bisect then took minutes: kv-quant off → still dies,
+`--no-pld` → still dies, `--prefix-cache-entries 0` → survives, `MLX_SERVE_SWIGLU_FUSED=0` →
+survives. Note the big TTS bodies are truncated at 16 KB in the log dump, so audio bodies can't
+be replayed from the log alone (chat bodies can).
+
+**Fix**: `ShapeKey` (full dims + rank) replaces every product-derived field in the four cached
+config keys that bake input-derived shapes: `SwigluCfgKey`, `RouterCfgKey`, `AddNormCfgKey`,
+`AttnGateCfgKey`. The gather-family keys (`GateUpCfgKey`, `GqmvCfgKey`, `DownRedCfgKey`) are
+decode-only with fixed-rank shapes fully determined by {topk, n} and were left alone. Guard:
+`test "fused SwiGLU config cache keys on the SHAPE, not the element count (Laguna restore crash)"`
+— (1,16,512) then (1,1,8192), asserting the second output's shape.
+
+**Class rule**: any future cached `metal_kernel` config whose config encodes an output shape,
+grid, or template arg derived from an input shape must key on the FULL shape via `ShapeKey` —
+"same element count" is not "same geometry". Also note the observability lesson: a mislabeled
+elementwise output is byte-correct and only crashes when a downstream op checks shapes; a
+BROADCASTABLE collision would have been silently wrong instead.

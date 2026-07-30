@@ -94,10 +94,21 @@ final class ComposerModeControlTests: XCTestCase {
         let source = try chatViewSource()
         let clip = try XCTUnwrap(source.range(of: ".clipShape(RoundedRectangle(cornerRadius: 18))"),
                                  "the composer container still clips — the card must escape it")
-        let overlay = try XCTUnwrap(source.range(of: ".overlayPreferenceValue(ComposerTipKey.self)"),
+        let overlay = try XCTUnwrap(source.range(of: ".composerTipOverlay()"),
                                     "the composer container must render the hover card")
         XCTAssertLessThan(clip.lowerBound, overlay.lowerBound,
                           "the card overlay must be applied AFTER the clip, or it gets cut off")
+
+        // And the card must never take a click: it sits directly over the row's
+        // most-flipped controls, and a popover/overlay that eats the mouse-down
+        // is worse than no card at all.
+        let tipSource = try String(contentsOf: URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent().deletingLastPathComponent().deletingLastPathComponent()
+            .appendingPathComponent("Sources/MLXServe/Views/ComposerTip.swift"), encoding: .utf8)
+        XCTAssertTrue(tipSource.contains(".allowsHitTesting(false)"),
+                      "the hover card must not be a click target")
+        XCTAssertFalse(tipSource.contains(".popover("),
+                       "an NSPopover swallows the click that would toggle the control it explains")
     }
 
     /// "Enable/Disable All Tools" were bulk rows above the per-tool switches they

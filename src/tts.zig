@@ -28,6 +28,7 @@ const mlx = @import("mlx.zig");
 const log = @import("log.zig");
 const model_mod = @import("model.zig");
 const tokenizer_mod = @import("tokenizer.zig");
+const transformer_mod = @import("transformer.zig");
 const wav_mod = @import("wav.zig");
 const sse = @import("gen_sse.zig");
 
@@ -201,8 +202,19 @@ inline fn silu(x: mlx.mlx_array, s: S) !mlx.mlx_array {
     return mulA(x, sig, s);
 }
 
-/// SwiGLU: silu(gate) * up.
+/// SwiGLU: silu(gate) * up. Tries the shared fused kernel first (bit-exact —
+/// its sigmoid is a full 16-bit table; declines f32 and odd shapes), keeping
+/// the 3-dispatch chain as the fallback and the kill-switch path
+/// (MLX_SERVE_SWIGLU_FUSED=0).
 inline fn swiglu(gate: mlx.mlx_array, up: mlx.mlx_array, s: S) !mlx.mlx_array {
+    if (try transformer_mod.fusedSwiGLU(s, gate, up)) |fused| return fused;
+    return swigluPlain(gate, up, s);
+}
+
+/// The composed chain only — the form the compiled predictor chain traces
+/// (custom `metal_kernel` ops stay OUT of an mlx_compile trace; compile's own
+/// elementwise fusion replaces them there).
+inline fn swigluPlain(gate: mlx.mlx_array, up: mlx.mlx_array, s: S) !mlx.mlx_array {
     const sg = try silu(gate, s);
     defer _ = mlx.mlx_array_free(sg);
     return mulA(sg, up, s);
@@ -259,6 +271,96 @@ fn embed(table: mlx.mlx_array, ids: []const i32, hidden: u32, s: S) !mlx.mlx_arr
     const H: c_int = if (tsh.len > 0) tsh[tsh.len - 1] else 0;
     const out_shape = [_]c_int{ 1, @intCast(ids.len), H };
     return reshape(taken, &out_shape, s);
+}
+
+/// `embed` for a GPU-resident `[1]` i32 id (a lazily sampled token): the same
+/// `take_axis` + native-width reshape, so a cached row is bit-identical to the
+/// host-id path.
+fn embedIdArr(table: mlx.mlx_array, id_arr: mlx.mlx_array, s: S) !mlx.mlx_array {
+    var taken = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(taken);
+    try mlx.check(mlx.mlx_take_axis(&taken, table, id_arr, 0, s));
+    const tsh = mlx.getShape(table);
+    const H: c_int = if (tsh.len > 0) tsh[tsh.len - 1] else 0;
+    const out_shape = [_]c_int{ 1, 1, H };
+    return reshape(taken, &out_shape, s);
+}
+
+// ── GPU-chained code predictor (default ON) ──
+// The host predictor loop pays 15 CPU↔GPU round-trips per frame (one per
+// sampled codebook); measured at 19 ms/frame on the 1.7B-8bit against ~3 ms
+// of actual compute. The chain keeps every sample on the GPU (sampling is
+// already pure mlx ops keyed by a host counter, so laziness changes NOTHING
+// about the draw) and reads all 16 codes back in ONE sync at frame end.
+// Kill switch: MLX_SERVE_TTS_GPU_PREDICT=0 restores the host loop.
+var gpu_predict_env: ?bool = null;
+var gpu_predict_override: ?bool = null; // tests only
+var gpu_predict_engaged: bool = false;
+fn gpuPredictEnabled() bool {
+    if (gpu_predict_override) |v| return v;
+    if (gpu_predict_env) |v| return v;
+    const raw = std.c.getenv("MLX_SERVE_TTS_GPU_PREDICT");
+    const enabled = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
+    gpu_predict_env = enabled;
+    return enabled;
+}
+
+// Compiled predictor chain (default ON; MLX_SERVE_TTS_COMPILE=0 kills): the
+// frame loop is CPU-bound in mlx per-node eval overhead, so the 15-step chain
+// is traced ONCE by mlx_compile (fixed signature: hidden, code0, 15 keys) and
+// replayed per frame. NOT bit-identical to the lazy chain — compile's
+// elementwise fusion changes intermediate rounding (the documented silu-geglu
+// class) — so its guards are BANDS, and the kill switch restores the
+// byte-identical lazy chain.
+var cp_compile_env: ?bool = null;
+var cp_compile_override: ?bool = null; // tests only
+fn cpCompileEnabled() bool {
+    if (cp_compile_override) |v| return v;
+    if (cp_compile_env) |v| return v;
+    const raw = std.c.getenv("MLX_SERVE_TTS_COMPILE");
+    const enabled = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
+    cp_compile_env = enabled;
+    return enabled;
+}
+
+// KV-cached predictor steps (default ON; MLX_SERVE_TTS_CP_CACHE=0 restores
+// the full re-forward). Takes precedence over the compiled full-re-forward
+// chain — fewer nodes beats replayed nodes in a per-node CPU-bound loop.
+var cp_cache_env: ?bool = null;
+var cp_cache_override: ?bool = null; // tests only
+var cp_cache_engaged: bool = false;
+fn cpCacheEnabled() bool {
+    if (cp_cache_override) |v| return v;
+    if (cp_cache_env) |v| return v;
+    const raw = std.c.getenv("MLX_SERVE_TTS_CP_CACHE");
+    const enabled = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
+    cp_cache_env = enabled;
+    return enabled;
+}
+
+/// Dispatch a built subgraph without waiting (encode/execute overlap: the GPU
+/// runs step k while the CPU encodes step k+1). Timing-only — PRNG keys bind
+/// at graph BUILD, so output is byte-identical with or without the kicks.
+fn asyncKick(arr: mlx.mlx_array) void {
+    const one = [_]mlx.mlx_array{arr};
+    const vec = mlx.mlx_vector_array_new_data(&one, 1);
+    defer _ = mlx.mlx_vector_array_free(vec);
+    _ = mlx.mlx_async_eval(vec);
+}
+
+/// Predictor-chain async-eval stride: kick the GPU every N sampled codebooks
+/// (0 = never, build the whole frame then eval once). The frame graph is
+/// ~1800 tiny serial kernels, so with a single eval per frame the CPU encode
+/// serializes with GPU execution; measured stride sweep picked the default.
+var async_stride_env: ?u32 = null;
+fn ttsAsyncStride() u32 {
+    if (async_stride_env) |v| return v;
+    const v: u32 = if (std.c.getenv("MLX_SERVE_TTS_ASYNC_STRIDE")) |raw|
+        std.fmt.parseInt(u32, std.mem.sliceTo(raw, 0), 10) catch 1
+    else
+        1;
+    async_stride_env = v;
+    return v;
 }
 
 /// Linear with bias: matmul(x, w_t) + bias.
@@ -441,7 +543,37 @@ const QwenDims = struct {
     head_dim: u32,
     eps: f32,
     theta: f32,
+    /// 0-dim f32 scalar of `eps`, model-owned (null ⇒ the fused residual+norm
+    /// path declines and the composed pair runs).
+    eps_arr: mlx.mlx_array = .{ .ctx = null },
+    /// True inside an mlx_compile trace: use only stock mlx ops (no custom
+    /// metal kernels — compile's own fusion covers those chains).
+    plain_kernels: bool = false,
 };
+
+// tts-side lever for the shared fused residual+RMSNorm kernel: default ON
+// here (the frame loop is per-node CPU-bound; laguna's opt-in default stays
+// untouched). Kill switch: MLX_SERVE_TTS_ADD_RMSNORM=0.
+var tts_add_rms_env: ?bool = null;
+fn ttsAddRmsEnabled() bool {
+    if (tts_add_rms_env) |v| return v;
+    const raw = std.c.getenv("MLX_SERVE_TTS_ADD_RMSNORM");
+    const enabled = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
+    tts_add_rms_env = enabled;
+    return enabled;
+}
+
+/// Residual add + post-norm: ONE node when the fused kernel takes it
+/// (bit-identical), the composed pair otherwise. Caller frees both fields.
+fn addRmsNorm(x: mlx.mlx_array, o: mlx.mlx_array, norm_w: mlx.mlx_array, d: QwenDims, s: S) !transformer_mod.AddNormResult {
+    if (!d.plain_kernels and ttsAddRmsEnabled() and d.eps_arr.ctx != null) {
+        if (try transformer_mod.fusedAddRmsNormUngated(s, x, o, norm_w, d.eps_arr)) |r| return r;
+    }
+    const sum = try addA(x, o, s);
+    errdefer _ = mlx.mlx_array_free(sum);
+    const normed = try rms(sum, norm_w, d.eps, s);
+    return .{ .sum = sum, .normed = normed };
+}
 
 /// One Qwen3 decoder layer (full re-forward, causal, offset 0). `x` is
 /// `[1, L, hidden]`; returns `[1, L, hidden]`. Caller frees both.
@@ -505,17 +637,18 @@ fn qwenLayerForward(x: mlx.mlx_array, layer: *const QwenLayer, d: QwenDims, s: S
     defer _ = mlx.mlx_array_free(af);
     const o = try layer.o.forward(af, s);
     defer _ = mlx.mlx_array_free(o);
-    const h1 = try addA(x, o, s);
+    const hr = try addRmsNorm(x, o, layer.post_norm, d, s);
+    const h1 = hr.sum;
     defer _ = mlx.mlx_array_free(h1);
 
     // MLP (SwiGLU).
-    const hn = try rms(h1, layer.post_norm, d.eps, s);
+    const hn = hr.normed;
     defer _ = mlx.mlx_array_free(hn);
     const g = try layer.gate.forward(hn, s);
     defer _ = mlx.mlx_array_free(g);
     const u = try layer.up.forward(hn, s);
     defer _ = mlx.mlx_array_free(u);
-    const act = try swiglu(g, u, s);
+    const act = if (d.plain_kernels) try swigluPlain(g, u, s) else try swiglu(g, u, s);
     defer _ = mlx.mlx_array_free(act);
     const down = try layer.down.forward(act, s);
     defer _ = mlx.mlx_array_free(down);
@@ -571,7 +704,11 @@ const StackCache = struct {
 /// input (= RoPE position of input[0]). Prefill (offset==0, L>1) uses a causal
 /// mask; an incremental step (L==1) uses no mask (the single query attends all
 /// cached keys, which are all causally valid). This mirrors the mlx_audio path.
-fn qwenLayerCached(x: mlx.mlx_array, layer: *const QwenLayer, d: QwenDims, lc: *LayerCache, offset: u32, s: S) !mlx.mlx_array {
+/// Per-frame context for the fused QK-norm+RoPE decode path: the exact cos|sin
+/// row at this frame's offset + the eps scalar, shared by every layer.
+const FusedQkCtx = struct { angles: mlx.mlx_array, eps_arr: mlx.mlx_array };
+
+fn qwenLayerCached(x: mlx.mlx_array, layer: *const QwenLayer, d: QwenDims, lc: *LayerCache, offset: u32, fused_qk: ?*const FusedQkCtx, s: S) !mlx.mlx_array {
     const L: c_int = mlx.getShape(x)[1];
     const heads: c_int = @intCast(d.heads);
     const kv: c_int = @intCast(d.kv);
@@ -587,32 +724,47 @@ fn qwenLayerCached(x: mlx.mlx_array, layer: *const QwenLayer, d: QwenDims, lc: *
     const v = try layer.v.forward(xn, s);
     defer _ = mlx.mlx_array_free(v);
 
-    const q4 = try reshape(q, &[_]c_int{ 1, L, heads, hd }, s);
-    defer _ = mlx.mlx_array_free(q4);
-    const qn = try rms(q4, layer.q_norm, d.eps, s);
-    defer _ = mlx.mlx_array_free(qn);
-    const qt = try transpose(qn, &[_]c_int{ 0, 2, 1, 3 }, s);
-    defer _ = mlx.mlx_array_free(qt);
-
-    const k4 = try reshape(k, &[_]c_int{ 1, L, kv, hd }, s);
-    defer _ = mlx.mlx_array_free(k4);
-    const kn = try rms(k4, layer.k_norm, d.eps, s);
-    defer _ = mlx.mlx_array_free(kn);
-    const kt = try transpose(kn, &[_]c_int{ 0, 2, 1, 3 }, s);
-    defer _ = mlx.mlx_array_free(kt);
-
     const v4 = try reshape(v, &[_]c_int{ 1, L, kv, hd }, s);
     defer _ = mlx.mlx_array_free(v4);
     const vt = try transpose(v4, &[_]c_int{ 0, 2, 1, 3 }, s);
     defer _ = mlx.mlx_array_free(vt);
 
-    const base = mlx.mlx_optional_float.some(d.theta);
+    // q/k: per-head RMSNorm + RoPE + transpose — ONE fused dispatch at decode
+    // (L==1, hd 128, bit-identical to the chain below, kernel shared with the
+    // laguna path), composed chain otherwise or when the kernel declines.
     var qr = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(qr);
-    try mlx.check(mlx.mlx_fast_rope(&qr, qt, hd, false, base, 1.0, @intCast(offset), .{ .ctx = null }, s));
     var kr = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(kr);
-    try mlx.check(mlx.mlx_fast_rope(&kr, kt, hd, false, base, 1.0, @intCast(offset), .{ .ctx = null }, s));
+    var fused_done = false;
+    if (fused_qk) |fq| {
+        if (try transformer_mod.fusedQkNormRope(s, q, k, layer.q_norm, layer.k_norm, fq.angles, null, fq.eps_arr, heads, kv, hd)) |pair| {
+            _ = mlx.mlx_array_free(qr);
+            _ = mlx.mlx_array_free(kr);
+            qr = pair[0];
+            kr = pair[1];
+            fused_done = true;
+        }
+    }
+    if (!fused_done) {
+        const q4 = try reshape(q, &[_]c_int{ 1, L, heads, hd }, s);
+        defer _ = mlx.mlx_array_free(q4);
+        const qn = try rms(q4, layer.q_norm, d.eps, s);
+        defer _ = mlx.mlx_array_free(qn);
+        const qt = try transpose(qn, &[_]c_int{ 0, 2, 1, 3 }, s);
+        defer _ = mlx.mlx_array_free(qt);
+
+        const k4 = try reshape(k, &[_]c_int{ 1, L, kv, hd }, s);
+        defer _ = mlx.mlx_array_free(k4);
+        const kn = try rms(k4, layer.k_norm, d.eps, s);
+        defer _ = mlx.mlx_array_free(kn);
+        const kt = try transpose(kn, &[_]c_int{ 0, 2, 1, 3 }, s);
+        defer _ = mlx.mlx_array_free(kt);
+
+        const base = mlx.mlx_optional_float.some(d.theta);
+        try mlx.check(mlx.mlx_fast_rope(&qr, qt, hd, false, base, 1.0, @intCast(offset), .{ .ctx = null }, s));
+        try mlx.check(mlx.mlx_fast_rope(&kr, kt, hd, false, base, 1.0, @intCast(offset), .{ .ctx = null }, s));
+    }
 
     // Append to cache → full_k/full_v.
     var full_k = mlx.mlx_array_new();
@@ -650,10 +802,11 @@ fn qwenLayerCached(x: mlx.mlx_array, layer: *const QwenLayer, d: QwenDims, lc: *
     defer _ = mlx.mlx_array_free(af);
     const o = try layer.o.forward(af, s);
     defer _ = mlx.mlx_array_free(o);
-    const h1 = try addA(x, o, s);
+    const hr = try addRmsNorm(x, o, layer.post_norm, d, s);
+    const h1 = hr.sum;
     defer _ = mlx.mlx_array_free(h1);
 
-    const hnn = try rms(h1, layer.post_norm, d.eps, s);
+    const hnn = hr.normed;
     defer _ = mlx.mlx_array_free(hnn);
     const g = try layer.gate.forward(hnn, s);
     defer _ = mlx.mlx_array_free(g);
@@ -667,12 +820,26 @@ fn qwenLayerCached(x: mlx.mlx_array, layer: *const QwenLayer, d: QwenDims, lc: *
 }
 
 /// Cached Qwen3 stack forward. Advances `cache.offset` by the input length.
+/// At decode (L==1, hd 128) the exact cos|sin row for this offset is probed
+/// ONCE and every layer takes the fused QK-norm+RoPE dispatch.
 fn qwenStackCached(x_in: mlx.mlx_array, layers: []const QwenLayer, final_norm: mlx.mlx_array, d: QwenDims, cache: *StackCache, s: S) !mlx.mlx_array {
     const L: u32 = @intCast(mlx.getShape(x_in)[1]);
+    var fq_ctx: ?FusedQkCtx = null;
+    defer if (fq_ctx) |fq| {
+        _ = mlx.mlx_array_free(fq.angles);
+        _ = mlx.mlx_array_free(fq.eps_arr);
+    };
+    if (L == 1 and d.head_dim == 128 and transformer_mod.qkNormRopeFusedWanted()) {
+        const angles = try transformer_mod.ropeAngleRow(s, 128, mlx.mlx_optional_float.some(d.theta), .{ .ctx = null }, @intCast(cache.offset), std.heap.c_allocator);
+        // MUST be a 0-dim scalar: metal_kernel binds it `constant float&`
+        // (a [1] array binds `constant float*` and the kernel source fails to
+        // COMPILE at dispatch — one request kills the server).
+        fq_ctx = .{ .angles = angles, .eps_arr = mlx.mlx_array_new_float(d.eps) };
+    }
     var x = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_array_set(&x, x_in));
     for (layers, 0..) |*layer, i| {
-        const nx = try qwenLayerCached(x, layer, d, &cache.layers[i], cache.offset, s);
+        const nx = try qwenLayerCached(x, layer, d, &cache.layers[i], cache.offset, if (fq_ctx) |*fq| fq else null, s);
         _ = mlx.mlx_array_free(x);
         x = nx;
     }
@@ -708,8 +875,24 @@ pub const TtsModel = struct {
     // `-Base` checkpoints (which ship `speaker_encoder.*`); null otherwise.
     speaker: ?SpeakerEncoder = null,
 
+    // 0-dim f32 eps scalars for the fused residual+norm kernel (a [1] array
+    // binds `constant float*` and the kernel fails to COMPILE — the metal_kernel
+    // signature class).
+    t_eps_arr: mlx.mlx_array = .{ .ctx = null },
+    cp_eps_arr: mlx.mlx_array = .{ .ctx = null },
+
+    // Compiled predictor chain (lazy; rebuilt when temp/top_k change since the
+    // trace bakes them in).
+    cp_chain_compiled: ?mlx.mlx_closure = null,
+    cp_chain_temp: f32 = 0,
+    cp_chain_topk: u32 = 0,
+    cp_chain_failed: bool = false,
+
     pub fn deinit(self: *TtsModel) void {
         const a = self.allocator;
+        if (self.cp_chain_compiled) |c| _ = mlx.mlx_closure_free(c);
+        if (self.t_eps_arr.ctx != null) _ = mlx.mlx_array_free(self.t_eps_arr);
+        if (self.cp_eps_arr.ctx != null) _ = mlx.mlx_array_free(self.cp_eps_arr);
         if (self.speaker) |*sp| sp.deinit();
         _ = mlx.mlx_array_free(self.text_embedding);
         _ = mlx.mlx_array_free(self.codec_embedding);
@@ -741,10 +924,10 @@ pub const TtsModel = struct {
     }
 
     fn talkerDims(self: *const TtsModel) QwenDims {
-        return .{ .hidden = self.cfg.t_hidden, .heads = self.cfg.t_heads, .kv = self.cfg.t_kv, .head_dim = self.cfg.t_head_dim, .eps = self.cfg.t_rms_eps, .theta = self.cfg.t_rope_theta };
+        return .{ .hidden = self.cfg.t_hidden, .heads = self.cfg.t_heads, .kv = self.cfg.t_kv, .head_dim = self.cfg.t_head_dim, .eps = self.cfg.t_rms_eps, .theta = self.cfg.t_rope_theta, .eps_arr = self.t_eps_arr };
     }
     fn cpDims(self: *const TtsModel) QwenDims {
-        return .{ .hidden = self.cfg.cp_hidden, .heads = self.cfg.cp_heads, .kv = self.cfg.cp_kv, .head_dim = self.cfg.cp_head_dim, .eps = self.cfg.cp_rms_eps, .theta = self.cfg.cp_rope_theta };
+        return .{ .hidden = self.cfg.cp_hidden, .heads = self.cfg.cp_heads, .kv = self.cfg.cp_kv, .head_dim = self.cfg.cp_head_dim, .eps = self.cfg.cp_rms_eps, .theta = self.cfg.cp_rope_theta, .eps_arr = self.cp_eps_arr };
     }
 
     /// Generate the `[T, 16]` codebook matrix from text token ids (greedy).
@@ -848,10 +1031,16 @@ pub const TtsModel = struct {
 
         var trailing_idx: u32 = 0;
         var frame: u32 = 0;
+        const io_prof = std.Io.Threaded.global_single_threaded.io();
+        const gpu_chain = gpuPredictEnabled();
+        var talker_ns: u64 = 0; // host path: talker+code0 sync | gpu path: whole-frame graph build
+        var predict_ns: u64 = 0; // host path: 15-sync predictor | gpu path: the ONE eval+readback
+        var tail_ns: u64 = 0; // next-input build (host path only; the gpu path builds it pre-sync)
         while (frame < max_frames) : (frame += 1) {
             // Audio length is model-determined (until EOS), so total is unknown:
             // emit step=frame with total=0 (indeterminate) every few frames.
             if (progress) |p| if (frame % 8 == 0) p.emit("Generating audio", frame, 0);
+            const pt0 = std.Io.Timestamp.now(io_prof, .boot);
             const hidden = try qwenStackCached(input, self.talker_layers, self.talker_norm, t_dims, &talker_cache, s);
             _ = mlx.mlx_array_free(input);
             input = .{ .ctx = null }; // mark freed; reassigned below on the non-break path
@@ -862,7 +1051,135 @@ pub const TtsModel = struct {
 
             const logits0 = try self.codec_head.forward(last_hidden, s); // [1,1,codec_vocab]
             defer _ = mlx.mlx_array_free(logits0);
+
+            if (gpu_chain) {
+                // Build the WHOLE frame — code0 sample, 15-step predictor,
+                // next talker input — as one lazy graph, then sync once.
+                // On the EOS frame the predictor work is discarded (a few ms,
+                // once per request); rng advances for the discarded draws, but
+                // no kept output ever consumed those keys, so the emitted
+                // codes stay byte-identical to the host loop's (lazy chain;
+                // the COMPILED chain is the banded exception).
+                var code_arrs: [16]mlx.mlx_array = @splat(.{ .ctx = null });
+                defer for (&code_arrs) |*a| {
+                    if (a.ctx != null) _ = mlx.mlx_array_free(a.*);
+                };
+                code_arrs[0] = try self.sampleCode0Lazy(logits0, suppress_mask, code0_hist.items, &rng);
+                // Start the talker executing while the predictor chain encodes.
+                if (ttsAsyncStride() > 0) asyncKick(code_arrs[0]);
+
+                // Predictor: KV-cached steps first (fewest nodes), then the
+                // compiled full-re-forward chain, then the lazy full
+                // re-forward (the bit-exact kill-switch path).
+                var codes16: mlx.mlx_array = .{ .ctx = null };
+                var codec_sum: mlx.mlx_array = .{ .ctx = null };
+                if (cpCacheEnabled()) {
+                    try self.predictCodesCachedLazy(last_hidden, &code_arrs, &rng);
+                    codes16 = try concat(&code_arrs, 0, s);
+                    codec_sum = self.sumCodecEmbedsLazy(&code_arrs) catch |e| {
+                        _ = mlx.mlx_array_free(codes16);
+                        return e;
+                    };
+                    if (!cp_cache_engaged) {
+                        cp_cache_engaged = true;
+                        log.info("[tts] KV-cached predictor steps engaged\n", .{});
+                    }
+                } else if (self.ensureCpChain()) |closure| compiled: {
+                    var inputs: [17]mlx.mlx_array = undefined;
+                    inputs[0] = last_hidden;
+                    inputs[1] = code_arrs[0];
+                    var n_in: usize = 2;
+                    var keys: [15]mlx.mlx_array = @splat(.{ .ctx = null });
+                    defer for (&keys) |*k| {
+                        if (k.ctx != null) _ = mlx.mlx_array_free(k.*);
+                    };
+                    if (cfg.temperature > 0) {
+                        for (0..15) |i| {
+                            keys[i] = mlx.mlx_array_new();
+                            if (mlx.mlx_random_key(&keys[i], rng) != 0) break :compiled;
+                            rng +%= 1;
+                            inputs[2 + i] = keys[i];
+                        }
+                        n_in = 17;
+                    }
+                    const in_vec = mlx.mlx_vector_array_new_data(&inputs, n_in);
+                    defer _ = mlx.mlx_vector_array_free(in_vec);
+                    var out_vec = mlx.mlx_vector_array_new();
+                    defer _ = mlx.mlx_vector_array_free(out_vec);
+                    if (mlx.mlx_closure_apply(&out_vec, closure, in_vec) != 0) break :compiled;
+                    if (mlx.mlx_vector_array_size(out_vec) != 2) break :compiled;
+                    var c16 = mlx.mlx_array_new();
+                    if (mlx.mlx_vector_array_get(&c16, out_vec, 0) != 0) {
+                        _ = mlx.mlx_array_free(c16);
+                        break :compiled;
+                    }
+                    var cs = mlx.mlx_array_new();
+                    if (mlx.mlx_vector_array_get(&cs, out_vec, 1) != 0) {
+                        _ = mlx.mlx_array_free(c16);
+                        _ = mlx.mlx_array_free(cs);
+                        break :compiled;
+                    }
+                    codes16 = c16;
+                    codec_sum = cs;
+                }
+                if (codes16.ctx == null) {
+                    try self.predictCodesLazy(last_hidden, &code_arrs, &rng);
+                    codes16 = try concat(&code_arrs, 0, s);
+                    codec_sum = self.sumCodecEmbedsLazy(&code_arrs) catch |e| {
+                        _ = mlx.mlx_array_free(codes16);
+                        return e;
+                    };
+                } else if (ttsAsyncStride() > 0) asyncKick(codes16);
+                defer _ = mlx.mlx_array_free(codes16);
+                defer _ = mlx.mlx_array_free(codec_sum);
+
+                const next_text = if (trailing_idx < trailing_len) blk: {
+                    const t = try sliceSeq(trailing, @intCast(trailing_idx), @intCast(trailing_idx + 1), hc, s);
+                    break :blk t;
+                } else blk: {
+                    var t = mlx.mlx_array_new();
+                    try mlx.check(mlx.mlx_array_set(&t, tts_pad));
+                    break :blk t;
+                };
+                defer _ = mlx.mlx_array_free(next_text);
+                const next_input = try addA(next_text, codec_sum, s); // [1,1,H]
+                talker_ns += @intCast(pt0.untilNow(io_prof, .boot).nanoseconds);
+
+                // The ONE sync per frame.
+                const pt1 = std.Io.Timestamp.now(io_prof, .boot);
+                if (mlx.mlx_array_eval(codes16) != 0) {
+                    _ = mlx.mlx_array_free(next_input);
+                    return error.MlxEval;
+                }
+                const data = mlx.mlx_array_data_int32(codes16) orelse {
+                    _ = mlx.mlx_array_free(next_input);
+                    return error.NoData;
+                };
+                predict_ns += @intCast(pt1.untilNow(io_prof, .boot).nanoseconds);
+                var frame_codes: [16]u32 = undefined;
+                for (&frame_codes, 0..) |*c, i| c.* = @intCast(data[i]);
+
+                if (!gpu_predict_engaged) {
+                    gpu_predict_engaged = true;
+                    log.info("[tts] GPU-chained code predictor engaged (1 sync/frame)\n", .{});
+                }
+                if (std.c.getenv("TTS_TRACE") != null and frame < 60) std.debug.print("{d} ", .{frame_codes[0]});
+                if (frame_codes[0] == @as(u32, @intCast(cfg.codec_eos))) {
+                    _ = mlx.mlx_array_free(next_input);
+                    break;
+                }
+                const c0i: i32 = @intCast(frame_codes[0]);
+                if (std.mem.indexOfScalar(i32, code0_hist.items, c0i) == null) {
+                    try code0_hist.append(self.allocator, c0i);
+                }
+                try codes_list.append(self.allocator, frame_codes);
+                if (trailing_idx < trailing_len) trailing_idx += 1;
+                input = next_input;
+                continue;
+            }
+
             const code0 = try self.sampleCode0(logits0, suppress_mask, code0_hist.items, &rng);
+            talker_ns += @intCast(pt0.untilNow(io_prof, .boot).nanoseconds);
 
             if (std.c.getenv("TTS_TRACE") != null and frame < 60) std.debug.print("{d} ", .{code0});
             if (code0 == @as(u32, @intCast(cfg.codec_eos))) break;
@@ -874,13 +1191,16 @@ pub const TtsModel = struct {
             }
 
             // Code predictor: codebooks 1..15.
+            const pt1 = std.Io.Timestamp.now(io_prof, .boot);
             var frame_codes: [16]u32 = undefined;
             frame_codes[0] = code0;
             try self.predictCodes(last_hidden, &frame_codes, &rng);
+            predict_ns += @intCast(pt1.untilNow(io_prof, .boot).nanoseconds);
 
             try codes_list.append(self.allocator, frame_codes);
 
             // Build next position embedding: text_embed_next + Σ codec embeds.
+            const pt2 = std.Io.Timestamp.now(io_prof, .boot);
             const next_text = if (trailing_idx < trailing_len) blk: {
                 const t = try sliceSeq(trailing, @intCast(trailing_idx), @intCast(trailing_idx + 1), hc, s);
                 trailing_idx += 1;
@@ -896,8 +1216,14 @@ pub const TtsModel = struct {
             defer _ = mlx.mlx_array_free(codec_sum);
             input = try addA(next_text, codec_sum, s); // [1,1,H]
             _ = mlx.mlx_array_eval(input);
+            tail_ns += @intCast(pt2.untilNow(io_prof, .boot).nanoseconds);
         }
         if (input.ctx != null) _ = mlx.mlx_array_free(input);
+        if (gpu_chain) {
+            log.debug("[tts] frame-loop split (gpu-chain): build {d:.0} ms, sync {d:.0} ms over {d} frames\n", .{ @as(f64, @floatFromInt(talker_ns)) / 1e6, @as(f64, @floatFromInt(predict_ns)) / 1e6, codes_list.items.len });
+        } else {
+            log.debug("[tts] frame-loop split: talker+code0 {d:.0} ms, predictor {d:.0} ms, tail {d:.0} ms over {d} frames\n", .{ @as(f64, @floatFromInt(talker_ns)) / 1e6, @as(f64, @floatFromInt(predict_ns)) / 1e6, @as(f64, @floatFromInt(tail_ns)) / 1e6, codes_list.items.len });
+        }
 
         return codes_list.toOwnedSlice(self.allocator);
     }
@@ -916,9 +1242,10 @@ pub const TtsModel = struct {
         return mlx.mlx_array_new_data(buf.ptr, &shape, 3, .float32);
     }
 
-    /// suppress → repetition-penalty → sample (greedy or temp+top_k). Matches
-    /// `_sample_token`'s order for codebook-0.
-    fn sampleCode0(self: *const TtsModel, logits: mlx.mlx_array, suppress_mask: mlx.mlx_array, hist: []const i32, rng: *u64) !u32 {
+    /// suppress → repetition-penalty → sample (greedy or temp+top_k), lazily —
+    /// returns the `[1]` i32 code0 array unevaluated. Matches `_sample_token`'s
+    /// order for codebook-0.
+    fn sampleCode0Lazy(self: *const TtsModel, logits: mlx.mlx_array, suppress_mask: mlx.mlx_array, hist: []const i32, rng: *u64) !mlx.mlx_array {
         const s = self.s;
         var masked = try addA(logits, suppress_mask, s); // [1,1,V]
         defer _ = mlx.mlx_array_free(masked);
@@ -954,7 +1281,14 @@ pub const TtsModel = struct {
             _ = mlx.mlx_array_free(masked);
             masked = updated;
         }
-        return sampleToken(masked, self.cfg.temperature, self.cfg.top_k, rng, s);
+        return sampleTokenLazy(masked, self.cfg.temperature, self.cfg.top_k, rng, s);
+    }
+
+    /// Eager code0 sample (host predictor path): build lazily, read back.
+    fn sampleCode0(self: *const TtsModel, logits: mlx.mlx_array, suppress_mask: mlx.mlx_array, hist: []const i32, rng: *u64) !u32 {
+        const lazy = try self.sampleCode0Lazy(logits, suppress_mask, hist, rng);
+        defer _ = mlx.mlx_array_free(lazy);
+        return readTokenId(lazy);
     }
 
     /// Project a `[1,N,t_hidden]` input to the code-predictor hidden space via
@@ -1018,6 +1352,230 @@ pub const TtsModel = struct {
         }
     }
 
+    /// GPU-chained code predictor: identical per-step ops to `predictCodes`
+    /// (same full re-forward, same sampling keys, same embedding takes), but
+    /// every sampled code stays a lazy `[1]` i32 array feeding the next step —
+    /// zero host syncs. Fills `code_arrs[1..16]` (owned by the caller);
+    /// `code_arrs[0]` must already hold code0.
+    fn predictCodesLazy(self: *const TtsModel, talker_hidden_last: mlx.mlx_array, code_arrs: *[16]mlx.mlx_array, rng: *u64) !void {
+        const s = self.s;
+        const cfg = self.cfg;
+        const d = self.cpDims();
+        const cph: c_int = @intCast(cfg.cp_hidden);
+        const n_steps = cfg.num_code_groups - 1; // 15
+
+        var seq_items = std.ArrayList(mlx.mlx_array).empty;
+        defer {
+            for (seq_items.items) |it| _ = mlx.mlx_array_free(it);
+            seq_items.deinit(self.allocator);
+        }
+        {
+            var h = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_array_set(&h, talker_hidden_last));
+            try seq_items.append(self.allocator, h);
+            try seq_items.append(self.allocator, try embedIdArr(self.codec_embedding, code_arrs[0], s));
+        }
+
+        var step: u32 = 0;
+        while (step < n_steps) : (step += 1) {
+            const seq2048 = try concat(seq_items.items, 1, s);
+            defer _ = mlx.mlx_array_free(seq2048);
+            const cp_in = try self.projectMtp(seq2048);
+            defer _ = mlx.mlx_array_free(cp_in);
+
+            const hidden = try qwenStackForward(cp_in, self.cp_layers, self.cp_norm, d, s);
+            defer _ = mlx.mlx_array_free(hidden);
+            const L: c_int = mlx.getShape(hidden)[1];
+            const last = try sliceSeq(hidden, L - 1, L, cph, s);
+            defer _ = mlx.mlx_array_free(last);
+            const logits = try self.cp_lm_head[step].forward(last, s);
+            defer _ = mlx.mlx_array_free(logits);
+            code_arrs[step + 1] = try sampleTokenLazy(logits, cfg.temperature, cfg.top_k, rng, s);
+            const stride = ttsAsyncStride();
+            if (stride > 0 and (step + 1) % stride == 0) asyncKick(code_arrs[step + 1]);
+
+            if (step + 1 < n_steps) {
+                try seq_items.append(self.allocator, try embedIdArr(self.cp_codec_embedding[step], code_arrs[step + 1], s));
+            }
+        }
+    }
+
+    /// KV-cached predictor chain: step 0 prefills [talker_hidden, code0-embed]
+    /// (2 positions), every later step feeds ONE new position through the cp
+    /// stack — L==1, where the fused QK-norm+RoPE and residual+norm kernels
+    /// engage and per-step node count drops ~30%. Positions, causal scope and
+    /// rope offsets match the full re-forward exactly; kernel/reduction order
+    /// differ (the banded class — MLX_SERVE_TTS_CP_CACHE=0 restores the
+    /// bit-exact full re-forward).
+    fn predictCodesCachedLazy(self: *const TtsModel, talker_hidden_last: mlx.mlx_array, code_arrs: *[16]mlx.mlx_array, rng: *u64) !void {
+        const s = self.s;
+        const cfg = self.cfg;
+        const d = self.cpDims();
+        const cph: c_int = @intCast(cfg.cp_hidden);
+        const n_steps = cfg.num_code_groups - 1; // 15
+        var cache = try StackCache.init(self.allocator, self.cp_layers.len);
+        defer cache.deinit(self.allocator);
+
+        {
+            var h = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_array_set(&h, talker_hidden_last));
+            defer _ = mlx.mlx_array_free(h);
+            const e0 = try embedIdArr(self.codec_embedding, code_arrs[0], s);
+            defer _ = mlx.mlx_array_free(e0);
+            const seq = try concat(&[_]mlx.mlx_array{ h, e0 }, 1, s);
+            defer _ = mlx.mlx_array_free(seq);
+            const cp_in = try self.projectMtp(seq);
+            defer _ = mlx.mlx_array_free(cp_in);
+            const hid = try qwenStackCached(cp_in, self.cp_layers, self.cp_norm, d, &cache, s);
+            defer _ = mlx.mlx_array_free(hid);
+            const L: c_int = mlx.getShape(hid)[1];
+            const last = try sliceSeq(hid, L - 1, L, cph, s);
+            defer _ = mlx.mlx_array_free(last);
+            const logits = try self.cp_lm_head[0].forward(last, s);
+            defer _ = mlx.mlx_array_free(logits);
+            code_arrs[1] = try sampleTokenLazy(logits, cfg.temperature, cfg.top_k, rng, s);
+            if (ttsAsyncStride() > 0) asyncKick(code_arrs[1]);
+        }
+        var step: u32 = 1;
+        while (step < n_steps) : (step += 1) {
+            const e = try embedIdArr(self.cp_codec_embedding[step - 1], code_arrs[step], s);
+            defer _ = mlx.mlx_array_free(e);
+            const cp_in = try self.projectMtp(e);
+            defer _ = mlx.mlx_array_free(cp_in);
+            const hid = try qwenStackCached(cp_in, self.cp_layers, self.cp_norm, d, &cache, s);
+            defer _ = mlx.mlx_array_free(hid);
+            const logits = try self.cp_lm_head[step].forward(hid, s); // [1,1,V] — hid is the one new position
+            defer _ = mlx.mlx_array_free(logits);
+            code_arrs[step + 1] = try sampleTokenLazy(logits, cfg.temperature, cfg.top_k, rng, s);
+            const stride = ttsAsyncStride();
+            if (stride > 0 and (step + 1) % stride == 0) asyncKick(code_arrs[step + 1]);
+        }
+    }
+
+    const CpChainOut = struct { codes16: mlx.mlx_array, codec_sum: mlx.mlx_array };
+
+    /// The WHOLE 15-step predictor chain + Σ codec embeds, stock ops only —
+    /// the body the compiled closure traces ONCE and replays every frame.
+    /// `keys` carries one sampling key per step (empty ⇒ greedy argmax).
+    /// Borrows `hidden`/`code0`/`keys`; caller frees both outputs.
+    fn cpChainBody(self: *const TtsModel, hidden: mlx.mlx_array, code0: mlx.mlx_array, keys: []const mlx.mlx_array) !CpChainOut {
+        const s = self.s;
+        const cfg = self.cfg;
+        var d = self.cpDims();
+        d.plain_kernels = true; // custom metal kernels stay OUT of the trace
+        const cph: c_int = @intCast(cfg.cp_hidden);
+        const n_steps = cfg.num_code_groups - 1; // 15
+
+        var code_arrs: [16]mlx.mlx_array = @splat(.{ .ctx = null });
+        defer for (&code_arrs) |*a| {
+            if (a.ctx != null) _ = mlx.mlx_array_free(a.*);
+        };
+        {
+            var c0 = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_array_set(&c0, code0));
+            code_arrs[0] = c0;
+        }
+
+        var seq_items = std.ArrayList(mlx.mlx_array).empty;
+        defer {
+            for (seq_items.items) |it| _ = mlx.mlx_array_free(it);
+            seq_items.deinit(self.allocator);
+        }
+        {
+            var h = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_array_set(&h, hidden));
+            try seq_items.append(self.allocator, h);
+            try seq_items.append(self.allocator, try embedIdArr(self.codec_embedding, code_arrs[0], s));
+        }
+        var step: u32 = 0;
+        while (step < n_steps) : (step += 1) {
+            const seq2048 = try concat(seq_items.items, 1, s);
+            defer _ = mlx.mlx_array_free(seq2048);
+            const cp_in = try self.projectMtp(seq2048);
+            defer _ = mlx.mlx_array_free(cp_in);
+            const sh = try qwenStackForward(cp_in, self.cp_layers, self.cp_norm, d, s);
+            defer _ = mlx.mlx_array_free(sh);
+            const L: c_int = mlx.getShape(sh)[1];
+            const last = try sliceSeq(sh, L - 1, L, cph, s);
+            defer _ = mlx.mlx_array_free(last);
+            const logits = try self.cp_lm_head[step].forward(last, s);
+            defer _ = mlx.mlx_array_free(logits);
+            code_arrs[step + 1] = if (keys.len > step)
+                try sampleTokenWithKeyLazy(logits, cfg.temperature, cfg.top_k, keys[step], s)
+            else
+                try argmaxLastLazy(logits, s);
+            if (step + 1 < n_steps) {
+                try seq_items.append(self.allocator, try embedIdArr(self.cp_codec_embedding[step], code_arrs[step + 1], s));
+            }
+        }
+        const codes16 = try concat(&code_arrs, 0, s);
+        errdefer _ = mlx.mlx_array_free(codes16);
+        const codec_sum = try self.sumCodecEmbedsLazy(&code_arrs);
+        return .{ .codes16 = codes16, .codec_sum = codec_sum };
+    }
+
+    fn cpChainClosureCallback(res: *mlx.mlx_vector_array, input: mlx.mlx_vector_array, payload: ?*anyopaque) callconv(.c) c_int {
+        const self: *TtsModel = @ptrCast(@alignCast(payload.?));
+        const n_in = mlx.mlx_vector_array_size(input);
+        if (n_in < 2 or n_in > 17) return -1;
+        var arrs: [17]mlx.mlx_array = @splat(.{ .ctx = null });
+        defer for (&arrs) |*a| {
+            if (a.ctx != null) _ = mlx.mlx_array_free(a.*);
+        };
+        for (0..n_in) |i| {
+            arrs[i] = mlx.mlx_array_new();
+            if (mlx.mlx_vector_array_get(&arrs[i], input, i) != 0) return -1;
+        }
+        const out = self.cpChainBody(arrs[0], arrs[1], arrs[2..n_in]) catch return -1;
+        const out_arr = [_]mlx.mlx_array{ out.codes16, out.codec_sum };
+        res.* = mlx.mlx_vector_array_new_data(&out_arr, 2);
+        _ = mlx.mlx_array_free(out.codes16);
+        _ = mlx.mlx_array_free(out.codec_sum);
+        return 0;
+    }
+
+    /// The compiled predictor chain, built lazily on first use and rebuilt if
+    /// the sampling config changed (temp/top_k are baked into the trace).
+    /// Null ⇒ lazy-chain fallback (kill switch, compile failure).
+    fn ensureCpChain(self: *TtsModel) ?mlx.mlx_closure {
+        if (!cpCompileEnabled()) return null;
+        if (self.cp_chain_failed) return null;
+        if (self.cp_chain_compiled) |c| {
+            if (self.cp_chain_temp == self.cfg.temperature and self.cp_chain_topk == self.cfg.top_k) return c;
+            _ = mlx.mlx_closure_free(c);
+            self.cp_chain_compiled = null;
+        }
+        const raw = mlx.mlx_closure_new_func_payload(&cpChainClosureCallback, @ptrCast(self), null);
+        var compiled = mlx.mlx_closure{ .ctx = null };
+        const rc = mlx.mlx_compile(&compiled, raw, false);
+        _ = mlx.mlx_closure_free(raw);
+        if (rc != 0 or compiled.ctx == null) {
+            self.cp_chain_failed = true;
+            log.warn("[tts] predictor-chain compile failed — lazy chain fallback\n", .{});
+            return null;
+        }
+        self.cp_chain_compiled = compiled;
+        self.cp_chain_temp = self.cfg.temperature;
+        self.cp_chain_topk = self.cfg.top_k;
+        log.info("[tts] compiled predictor chain engaged (temp={d:.2} top_k={d})\n", .{ self.cfg.temperature, self.cfg.top_k });
+        return compiled;
+    }
+
+    /// `sumCodecEmbeds` over lazy id arrays — same takes, same add order.
+    fn sumCodecEmbedsLazy(self: *const TtsModel, code_arrs: *const [16]mlx.mlx_array) !mlx.mlx_array {
+        const s = self.s;
+        var acc = try embedIdArr(self.codec_embedding, code_arrs[0], s);
+        var i: u32 = 0;
+        while (i < self.cfg.num_code_groups - 1) : (i += 1) {
+            const e = try embedIdArr(self.cp_codec_embedding[i], code_arrs[i + 1], s);
+            defer _ = mlx.mlx_array_free(e);
+            const na = try addA(acc, e, s);
+            _ = mlx.mlx_array_free(acc);
+            acc = na;
+        }
+        return acc;
+    }
+
     /// Σ over the 16 codebooks of their codec embeddings → [1,1,t_hidden].
     /// code0 via talker codec_embedding; codes1..15 via cp_codec_embedding[i].
     fn sumCodecEmbeds(self: *const TtsModel, codes: *const [16]u32) !mlx.mlx_array {
@@ -1058,11 +1616,26 @@ fn buildAdditiveCausalMask(L: c_int, s: S) !mlx.mlx_array {
     return bf16_mask;
 }
 
-/// Sample a token from `logits` [1,1,V]: temp≤0 → greedy argmax; else
-/// temperature + top-k + categorical. `rng` is a counter advanced per call so
-/// successive samples decorrelate. Matches the mlx_audio sampling order.
-fn sampleToken(logits: mlx.mlx_array, temp: f32, top_k: u32, rng: *u64, s: S) !u32 {
-    if (temp <= 0) return argmaxLast(logits, s);
+/// Lazy token sample from `logits` [1,1,V]: temp≤0 → greedy argmax; else
+/// temperature + top-k + categorical. Returns an UNEVALUATED `[1]` i32 array
+/// (caller frees) so a sampled token can feed the next graph step with no
+/// host sync. `rng` is a counter advanced at BUILD time, so the key sequence
+/// is identical whether the array is read back now or later. Matches the
+/// mlx_audio sampling order.
+fn sampleTokenLazy(logits: mlx.mlx_array, temp: f32, top_k: u32, rng: *u64, s: S) !mlx.mlx_array {
+    if (temp <= 0) return argmaxLastLazy(logits, s);
+    var key = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(key);
+    try mlx.check(mlx.mlx_random_key(&key, rng.*));
+    rng.* +%= 1;
+    return sampleTokenWithKeyLazy(logits, temp, top_k, key, s);
+}
+
+/// The sampling op chain with an EXPLICIT key array — the form the compiled
+/// predictor chain traces (keys are closure INPUTS there). `sampleTokenLazy`
+/// is this plus key-from-counter, so the two can never drift.
+fn sampleTokenWithKeyLazy(logits: mlx.mlx_array, temp: f32, top_k: u32, key: mlx.mlx_array, s: S) !mlx.mlx_array {
+    if (temp <= 0) return argmaxLastLazy(logits, s);
 
     const tinv = mlx.mlx_array_new_float(1.0 / temp);
     defer _ = mlx.mlx_array_free(tinv);
@@ -1090,38 +1663,38 @@ fn sampleToken(logits: mlx.mlx_array, temp: f32, top_k: u32, rng: *u64, s: S) !u
         try mlx.check(mlx.mlx_array_set(&filtered, scaled));
     }
 
-    var key = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(key);
-    try mlx.check(mlx.mlx_random_key(&key, rng.*));
-    rng.* +%= 1;
     var sampled = mlx.mlx_array_new(); // [1,1]
     defer _ = mlx.mlx_array_free(sampled);
     try mlx.check(mlx.mlx_random_categorical(&sampled, filtered, 2, key, s));
     var as_i = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(as_i);
     try mlx.check(mlx.mlx_astype(&as_i, sampled, .int32, s));
-    var flat = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(flat);
-    try mlx.check(mlx.mlx_reshape(&flat, as_i, &[_]c_int{1}, 1, s));
-    var val: i32 = 0;
-    try mlx.check(mlx.mlx_array_item_int32(&val, flat));
-    return @intCast(val);
+    return reshape(as_i, &[_]c_int{1}, s);
 }
 
-/// argmax over the last axis of a [1,1,V] array → u32 token id.
-fn argmaxLast(x: mlx.mlx_array, s: S) !u32 {
+/// Lazy argmax over the last axis of a [1,1,V] array → `[1]` i32 (caller frees).
+fn argmaxLastLazy(x: mlx.mlx_array, s: S) !mlx.mlx_array {
     var am = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(am);
     try mlx.check(mlx.mlx_argmax_axis(&am, x, 2, false, s)); // [1,1]
     var am_i = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(am_i);
     try mlx.check(mlx.mlx_astype(&am_i, am, .int32, s));
-    var flat = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(flat);
-    try mlx.check(mlx.mlx_reshape(&flat, am_i, &[_]c_int{1}, 1, s));
+    return reshape(am_i, &[_]c_int{1}, s);
+}
+
+/// Read a `[1]` i32 token array back to the host (the one sync).
+fn readTokenId(arr: mlx.mlx_array) !u32 {
     var val: i32 = 0;
-    try mlx.check(mlx.mlx_array_item_int32(&val, flat));
+    try mlx.check(mlx.mlx_array_item_int32(&val, arr));
     return @intCast(val);
+}
+
+/// Eager sample: build lazily, read back immediately.
+fn sampleToken(logits: mlx.mlx_array, temp: f32, top_k: u32, rng: *u64, s: S) !u32 {
+    const lazy = try sampleTokenLazy(logits, temp, top_k, rng, s);
+    defer _ = mlx.mlx_array_free(lazy);
+    return readTokenId(lazy);
 }
 
 // ── Loading ──
@@ -1147,6 +1720,12 @@ pub fn loadModel(io: std.Io, allocator: std.mem.Allocator, s: S, model_dir: []co
     m.cfg = cfg;
     m.allocator = allocator;
     m.s = s;
+    m.t_eps_arr = mlx.mlx_array_new_float(cfg.t_rms_eps);
+    m.cp_eps_arr = mlx.mlx_array_new_float(cfg.cp_rms_eps);
+    m.cp_chain_compiled = null;
+    m.cp_chain_temp = 0;
+    m.cp_chain_topk = 0;
+    m.cp_chain_failed = false;
 
     m.text_embedding = try ownWeight(&w, "talker.model.text_embedding.weight");
     m.codec_embedding = try ownWeight(&w, "talker.model.codec_embedding.weight");
@@ -1639,6 +2218,9 @@ pub const SpeakerEncoder = struct {
     /// 1.7B) so the embedding inserts cleanly into the codec stream. Read from
     /// the `fc` weight at load rather than hardcoded.
     enc_dim: usize,
+    /// Full ECAPA forwards run (observability + the cache tests' proof that a
+    /// hit never re-runs the encoder).
+    embed_calls: u64 = 0,
     // dilations for the 3 SE-Res2Net blocks (enc_dilations[1..3]).
     const se_dilations = [_]usize{ 2, 3, 4 };
 
@@ -1675,6 +2257,7 @@ pub const SpeakerEncoder = struct {
 
     /// Reference audio (24 kHz mono f32) → speaker embedding `[1, enc_dim]`.
     pub fn embed(self: *SpeakerEncoder, samples: []const f32) !mlx.mlx_array {
+        self.embed_calls += 1;
         const s = self.s;
         const map = &self.map;
         const a = self.allocator;
@@ -1734,6 +2317,116 @@ fn freeSpkMap(map: *SpkMap) void {
     map.deinit();
 }
 
+// ── Speaker-embedding cache (voice-clone path) ──
+// The embedding is a pure function of the clip samples (same clip ⇒ same
+// embedding ⇒ bit-identical wav), and voice mode re-sends the SAME clip once
+// per sentence — so the ECAPA forward (~10 ms/sentence warm on the 1.7B-8bit)
+// re-ran for nothing. Content-keyed (Wyhash over the sample bytes): a
+// re-recorded clip is a different key, so invalidation is free. Entries are
+// materialized+evaled copies OWNED by the cache; `get` returns a +1-ref handle
+// the caller frees like any freshly-embedded array, so `synthesize`'s existing
+// defer stays correct on hit, miss, and cache-off paths alike. Touched only on
+// the inference thread (synthesize runs via the gen queue) — no locking.
+// Kill switch: MLX_SERVE_TTS_SPK_CACHE=0 restores the uncached path.
+const SpkEmbCache = struct {
+    const CAP = 4;
+    const Entry = struct { hash: u64, emb: mlx.mlx_array, last_use: u64 };
+    entries: [CAP]?Entry = @splat(null),
+    tick: u64 = 0,
+
+    /// +1-ref handle (caller frees) or null. Bumps recency on hit.
+    fn get(self: *SpkEmbCache, hash: u64) ?mlx.mlx_array {
+        for (&self.entries) |*slot| {
+            if (slot.*) |*e| {
+                if (e.hash != hash) continue;
+                self.tick += 1;
+                e.last_use = self.tick;
+                var out = mlx.mlx_array_new();
+                mlx.check(mlx.mlx_array_set(&out, e.emb)) catch {
+                    _ = mlx.mlx_array_free(out);
+                    return null;
+                };
+                return out;
+            }
+        }
+        return null;
+    }
+
+    /// Takes ownership of `emb`. Duplicate key keeps the existing entry and
+    /// frees the incoming array (same content by construction). When full,
+    /// evicts the least-recently-used entry.
+    fn put(self: *SpkEmbCache, hash: u64, emb: mlx.mlx_array) void {
+        self.tick += 1;
+        for (&self.entries) |*slot| {
+            if (slot.*) |*e| {
+                if (e.hash == hash) {
+                    _ = mlx.mlx_array_free(emb);
+                    e.last_use = self.tick;
+                    return;
+                }
+            }
+        }
+        var victim: usize = 0;
+        var victim_lu: u64 = std.math.maxInt(u64);
+        for (self.entries, 0..) |slot, i| {
+            const e = slot orelse {
+                victim = i;
+                victim_lu = 0;
+                break;
+            };
+            if (e.last_use < victim_lu) {
+                victim = i;
+                victim_lu = e.last_use;
+            }
+        }
+        if (self.entries[victim]) |e| _ = mlx.mlx_array_free(e.emb);
+        self.entries[victim] = .{ .hash = hash, .emb = emb, .last_use = self.tick };
+    }
+
+    fn deinit(self: *SpkEmbCache) void {
+        for (&self.entries) |*slot| {
+            if (slot.*) |e| _ = mlx.mlx_array_free(e.emb);
+            slot.* = null;
+        }
+    }
+};
+
+var spk_cache_env: ?bool = null;
+fn spkCacheEnabled() bool {
+    if (spk_cache_env) |v| return v;
+    const raw = std.c.getenv("MLX_SERVE_TTS_SPK_CACHE");
+    const enabled = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
+    spk_cache_env = enabled;
+    return enabled;
+}
+
+/// The cached clone path: hash the clip samples, serve a prior embedding on a
+/// hit, otherwise embed + materialize + eval + insert. Always returns an OWNED
+/// handle the caller frees (on hit that is a +1 ref of the cache's array,
+/// never the cache's own handle).
+fn resolveSpeakerEmbedding(enc: *SpeakerEncoder, cache: *SpkEmbCache, ref: []const f32) !mlx.mlx_array {
+    const io_t = std.Io.Threaded.global_single_threaded.io();
+    const t0 = std.Io.Timestamp.now(io_t, .boot);
+    const hash = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(ref));
+    if (cache.get(hash)) |hit| {
+        const ns: u64 = @intCast(t0.untilNow(io_t, .boot).nanoseconds);
+        log.info("[tts] speaker embedding: cache hit ({d:.2} ms)\n", .{@as(f64, @floatFromInt(ns)) / 1e6});
+        return hit;
+    }
+    const raw = try enc.embed(ref);
+    defer _ = mlx.mlx_array_free(raw);
+    // Cache a materialized owned buffer, never a view of per-request tensors
+    // (the slice-born-view class), and eval it so the cached array holds its
+    // result — not the whole lazy ECAPA graph — and hits truly skip compute.
+    const owned = try transformer_mod.materializedOwnedCopy(enc.s, raw);
+    errdefer _ = mlx.mlx_array_free(owned);
+    try mlx.check(mlx.mlx_array_eval(owned));
+    cache.put(hash, owned); // ownership → cache
+    const ns: u64 = @intCast(t0.untilNow(io_t, .boot).nanoseconds);
+    log.info("[tts] speaker embedding: computed in {d:.1} ms (cached for reuse)\n", .{@as(f64, @floatFromInt(ns)) / 1e6});
+    return cache.get(hash) orelse error.SpkCacheMiss;
+}
+
 // ════════════════════════════════════════════════════════════════════════
 // Synthesizer: text → 24 kHz waveform. Bundles the talker model, codec
 // decoder, and BPE tokenizer for a one-call native TTS API (no Python).
@@ -1744,6 +2437,9 @@ pub const Synthesizer = struct {
     codec: CodecDecoder,
     tokenizer: tokenizer_mod.Tokenizer,
     allocator: std.mem.Allocator,
+    /// Voice-clone speaker embeddings, keyed by clip content. Lives on the
+    /// loaded model (not a global) so unload frees the arrays with it.
+    spk_cache: SpkEmbCache = .{},
 
     pub fn load(io: std.Io, allocator: std.mem.Allocator, s: S, model_dir: []const u8) !Synthesizer {
         var model = try loadModel(io, allocator, s, model_dir);
@@ -1755,6 +2451,7 @@ pub const Synthesizer = struct {
     }
 
     pub fn deinit(self: *Synthesizer) void {
+        self.spk_cache.deinit();
         self.model.deinit();
         self.codec.deinit();
         self.tokenizer.deinit();
@@ -1794,17 +2491,27 @@ pub const Synthesizer = struct {
         defer {
             if (spk_emb) |e| _ = mlx.mlx_array_free(e);
         }
+        const io_t = std.Io.Threaded.global_single_threaded.io();
         if (ref_audio) |ref| {
             if (self.model.speaker) |*sp| {
                 if (progress) |p| p.emit("Encoding reference voice", 0, 0);
-                spk_emb = try sp.embed(ref);
+                spk_emb = if (spkCacheEnabled())
+                    try resolveSpeakerEmbedding(sp, &self.spk_cache, ref)
+                else
+                    try sp.embed(ref);
             }
         }
+        const t1 = std.Io.Timestamp.now(io_t, .boot);
         const codes = try self.model.generateCodes(ids, max_frames, progress, spk_emb);
+        const gen_ns: u64 = @intCast(t1.untilNow(io_t, .boot).nanoseconds);
         defer self.allocator.free(codes);
         if (codes.len == 0) return self.allocator.alloc(f32, 0);
         if (progress) |p| p.emit("Decoding audio", 0, 0);
-        return self.codec.decode(codes);
+        const t2 = std.Io.Timestamp.now(io_t, .boot);
+        const wav = try self.codec.decode(codes);
+        const dec_ns: u64 = @intCast(t2.untilNow(io_t, .boot).nanoseconds);
+        log.info("[tts] generate {d:.1} ms ({d} frames), codec decode {d:.1} ms\n", .{ @as(f64, @floatFromInt(gen_ns)) / 1e6, codes.len, @as(f64, @floatFromInt(dec_ns)) / 1e6 });
+        return wav;
     }
 
     /// text → 16-bit PCM mono WAV bytes (owned). `ref_audio` clones a voice.
@@ -2988,4 +3695,294 @@ fn readI32File(io: std.Io, allocator: std.mem.Allocator, path: []const u8) ![]i3
     const out = try allocator.alloc(i32, n);
     @memcpy(std.mem.sliceAsBytes(out), bytes[0 .. n * 4]);
     return out;
+}
+
+// ── Speaker-embedding cache (voice-clone path) tests ──
+// The cache is a pure function of clip content: same clip ⇒ same embedding ⇒
+// bit-identical wav. Hermetic tests cover the LRU mechanics with tiny arrays;
+// the TTS_TEST_MODEL-gated test pins bit-identity + skipped re-embed on the
+// real encoder.
+
+fn spkTestArray(vals: []const f32) mlx.mlx_array {
+    const shape = [_]c_int{ 1, @intCast(vals.len) };
+    return mlx.mlx_array_new_data(vals.ptr, &shape, 2, .float32);
+}
+
+fn spkTestFirstVal(arr: mlx.mlx_array) !f32 {
+    _ = mlx.mlx_array_eval(arr);
+    const d = mlx.mlx_array_data_float32(arr) orelse return error.NoData;
+    return d[0];
+}
+
+test "spk cache: miss, hit bit-identical, distinct key misses" {
+    var cache = SpkEmbCache{};
+    defer cache.deinit();
+    try std.testing.expect(cache.get(0x1234) == null);
+    const vals = [_]f32{ 1.5, -2.25, 0.0, 42.0 };
+    cache.put(0x1234, spkTestArray(&vals));
+    const hit = cache.get(0x1234) orelse return error.TestExpectedHit;
+    defer _ = mlx.mlx_array_free(hit);
+    _ = mlx.mlx_array_eval(hit);
+    const d = mlx.mlx_array_data_float32(hit) orelse return error.NoData;
+    for (vals, 0..) |v, i| try std.testing.expectEqual(v, d[i]);
+    // A different key is a miss, never a wrong-voice hit.
+    try std.testing.expect(cache.get(0x9999) == null);
+}
+
+test "spk cache: LRU eviction at capacity, recently-used survives" {
+    var cache = SpkEmbCache{};
+    defer cache.deinit();
+    var h: u64 = 1;
+    while (h <= SpkEmbCache.CAP) : (h += 1) {
+        const v = [_]f32{@as(f32, @floatFromInt(h))};
+        cache.put(h, spkTestArray(&v));
+    }
+    // Touch key 1 so key 2 is now least-recently-used.
+    const touched = cache.get(1) orelse return error.TestExpectedHit;
+    _ = mlx.mlx_array_free(touched);
+    const v_new = [_]f32{99.0};
+    cache.put(100, spkTestArray(&v_new));
+    try std.testing.expect(cache.get(2) == null); // LRU evicted
+    const survivor = cache.get(1) orelse return error.TestExpectedHit; // recently used survives
+    _ = mlx.mlx_array_free(survivor);
+    const newest = cache.get(100) orelse return error.TestExpectedHit;
+    _ = mlx.mlx_array_free(newest);
+}
+
+test "spk cache: duplicate put keeps one entry, deinit frees populated cache" {
+    var cache = SpkEmbCache{};
+    const v1 = [_]f32{7.0};
+    const v2 = [_]f32{8.0};
+    cache.put(5, spkTestArray(&v1));
+    cache.put(5, spkTestArray(&v2)); // same key: incoming freed, entry kept
+    const hit = cache.get(5) orelse return error.TestExpectedHit;
+    try std.testing.expectEqual(@as(f32, 7.0), try spkTestFirstVal(hit));
+    _ = mlx.mlx_array_free(hit);
+    cache.put(6, spkTestArray(&v2));
+    cache.deinit(); // frees both live entries; double-free/leak would crash or trip the debug allocator
+}
+
+// The cached path must (a) not re-run the encoder on a hit (embed_calls
+// counter), and (b) hand back an embedding bit-identical to the uncached one.
+//   TTS_TEST_MODEL = model dir (any Qwen3-TTS -Base checkpoint)
+test "spk cache: cached path skips encoder, bit-identical to uncached" {
+    const model_dir = std.mem.span(std.c.getenv("TTS_TEST_MODEL") orelse return error.SkipZigTest);
+    const allocator = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var w = try model_mod.loadWeights(io, allocator, model_dir);
+    defer w.deinit();
+    var enc = try SpeakerEncoder.load(allocator, &w, s);
+    defer enc.deinit();
+
+    // Synthetic deterministic 1 s clip (the 8-bit-parity test's recipe).
+    const ref = try allocator.alloc(f32, 24000);
+    defer allocator.free(ref);
+    for (ref, 0..) |*x, i| {
+        const t = @as(f32, @floatFromInt(i)) / 24000.0;
+        x.* = (0.5 + 0.5 * @sin(2.0 * std.math.pi * 3.0 * t)) * (0.30 * @sin(2.0 * std.math.pi * 160.0 * t) + 0.15 * @sin(2.0 * std.math.pi * 320.0 * t));
+    }
+
+    const uncached = try enc.embed(ref);
+    defer _ = mlx.mlx_array_free(uncached);
+    _ = mlx.mlx_array_eval(uncached);
+    try std.testing.expectEqual(@as(u64, 1), enc.embed_calls);
+
+    var cache = SpkEmbCache{};
+    defer cache.deinit();
+    const first = try resolveSpeakerEmbedding(&enc, &cache, ref);
+    defer _ = mlx.mlx_array_free(first);
+    try std.testing.expectEqual(@as(u64, 2), enc.embed_calls);
+    const second = try resolveSpeakerEmbedding(&enc, &cache, ref);
+    defer _ = mlx.mlx_array_free(second);
+    // The hit must NOT have re-run the encoder.
+    try std.testing.expectEqual(@as(u64, 2), enc.embed_calls);
+
+    const du = mlx.mlx_array_data_float32(uncached) orelse return error.NoData;
+    const d1 = mlx.mlx_array_data_float32(first) orelse return error.NoData;
+    const d2 = mlx.mlx_array_data_float32(second) orelse return error.NoData;
+    for (0..enc.enc_dim) |i| {
+        try std.testing.expectEqual(du[i], d1[i]);
+        try std.testing.expectEqual(du[i], d2[i]);
+    }
+}
+
+// ── GPU-chained code-predictor tests ──
+// The chain keeps all 16 per-frame samples on the GPU and reads them back in
+// ONE sync. Bit-identity with the host loop is by construction — sampling was
+// already pure mlx ops keyed by a host counter — and pinned here.
+
+test "gpu predict: lazy sampling matches eager readback (greedy + stochastic)" {
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const vals = [_]f32{ 0.1, 2.5, -1.0, 0.7, 2.4, -3.0, 0.2, 1.9 };
+    const shape = [_]c_int{ 1, 1, 8 };
+    const logits = mlx.mlx_array_new_data(&vals, &shape, 3, .float32);
+    defer _ = mlx.mlx_array_free(logits);
+
+    // Greedy: lazy argmax read back == eager argmax.
+    {
+        var rng_a: u64 = 7;
+        var rng_b: u64 = 7;
+        const eager = try sampleToken(logits, 0.0, 0, &rng_a, s);
+        const lazy = try sampleTokenLazy(logits, 0.0, 0, &rng_b, s);
+        defer _ = mlx.mlx_array_free(lazy);
+        try std.testing.expectEqual(eager, try readTokenId(lazy));
+        try std.testing.expectEqual(rng_a, rng_b); // greedy draws nothing
+    }
+    // Stochastic: same counter start ⇒ same key ⇒ same token; counter advances
+    // identically at BUILD time.
+    {
+        var rng_a: u64 = 42;
+        var rng_b: u64 = 42;
+        const eager = try sampleToken(logits, 0.9, 4, &rng_a, s);
+        const lazy = try sampleTokenLazy(logits, 0.9, 4, &rng_b, s);
+        defer _ = mlx.mlx_array_free(lazy);
+        try std.testing.expectEqual(eager, try readTokenId(lazy));
+        try std.testing.expectEqual(rng_a, rng_b);
+    }
+}
+
+// Full generateCodes equivalence, GPU chain vs host loop, greedy AND
+// stochastic. The seed lives in cfg so both runs draw identical keys.
+//   TTS_TEST_MODEL = model dir (any Qwen3-TTS -Base checkpoint)
+test "gpu predict: generateCodes byte-identical to host predictor loop" {
+    const model_dir = std.mem.span(std.c.getenv("TTS_TEST_MODEL") orelse return error.SkipZigTest);
+    const allocator = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var m = try loadModel(io, allocator, s, model_dir);
+    defer m.deinit();
+
+    const ids = [_]i32{ 151644, 77091, 198, 9707, 1879, 11, 419, 374, 264, 1273, 315, 279, 2205, 1467, 311, 8806, 4712, 13, 151645, 198, 151644, 77091, 198 };
+    for ([_]f32{ 0.0, 0.9 }) |temp| {
+        m.cfg.temperature = temp;
+        gpu_predict_override = false;
+        const host_codes = try m.generateCodes(&ids, 48, null, null);
+        defer allocator.free(host_codes);
+        gpu_predict_override = true;
+        const gpu_codes = try m.generateCodes(&ids, 48, null, null);
+        defer allocator.free(gpu_codes);
+        gpu_predict_override = null;
+        try std.testing.expectEqual(host_codes.len, gpu_codes.len);
+        for (host_codes, gpu_codes) |hc, gc| {
+            try std.testing.expectEqualSlices(u32, &hc, &gc);
+        }
+        try std.testing.expect(host_codes.len > 4);
+    }
+}
+
+// ── Compiled predictor-chain tests ──
+
+test "compiled chain: explicit-key sampling matches counter-key sampling" {
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const vals = [_]f32{ 0.1, 2.5, -1.0, 0.7, 2.4, -3.0, 0.2, 1.9 };
+    const shape = [_]c_int{ 1, 1, 8 };
+    const logits = mlx.mlx_array_new_data(&vals, &shape, 3, .float32);
+    defer _ = mlx.mlx_array_free(logits);
+    var rng: u64 = 42;
+    const via_counter = try sampleTokenLazy(logits, 0.9, 4, &rng, s);
+    defer _ = mlx.mlx_array_free(via_counter);
+    var key = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(key);
+    try mlx.check(mlx.mlx_random_key(&key, 42));
+    const via_key = try sampleTokenWithKeyLazy(logits, 0.9, 4, key, s);
+    defer _ = mlx.mlx_array_free(via_key);
+    try std.testing.expectEqual(try readTokenId(via_counter), try readTokenId(via_key));
+}
+
+// The compiled chain is NOT bit-identical to the lazy chain (mlx_compile's
+// elementwise fusion changes intermediate rounding — the documented silu-geglu
+// class), so the guard is a BAND: greedy codes must agree on the vast
+// majority of positions and the frame counts must be close.
+//   TTS_TEST_MODEL = model dir (any Qwen3-TTS -Base checkpoint)
+test "compiled chain: greedy codes agree with the lazy chain within band" {
+    const model_dir = std.mem.span(std.c.getenv("TTS_TEST_MODEL") orelse return error.SkipZigTest);
+    const allocator = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var m = try loadModel(io, allocator, s, model_dir);
+    defer m.deinit();
+    m.cfg.temperature = 0.0;
+
+    const ids = [_]i32{ 151644, 77091, 198, 9707, 1879, 11, 419, 374, 264, 1273, 315, 279, 2205, 1467, 311, 8806, 4712, 13, 151645, 198, 151644, 77091, 198 };
+    gpu_predict_override = true;
+    defer gpu_predict_override = null;
+    cp_compile_override = false;
+    const lazy_codes = try m.generateCodes(&ids, 48, null, null);
+    defer allocator.free(lazy_codes);
+    cp_compile_override = true;
+    const compiled_codes = try m.generateCodes(&ids, 48, null, null);
+    defer allocator.free(compiled_codes);
+    cp_compile_override = null;
+    try std.testing.expect(m.cp_chain_compiled != null); // compile must have ENGAGED
+
+    try std.testing.expect(lazy_codes.len > 4);
+    try std.testing.expect(compiled_codes.len > 4);
+    // Frame counts within 20% of each other (near-tie flips can move EOS).
+    const fl: f64 = @floatFromInt(lazy_codes.len);
+    const fc: f64 = @floatFromInt(compiled_codes.len);
+    try std.testing.expect(fc / fl > 0.8 and fc / fl < 1.25);
+    // Code agreement over the shared prefix ≥ 90% of all 16 codebooks.
+    const n = @min(lazy_codes.len, compiled_codes.len);
+    var same: usize = 0;
+    var total: usize = 0;
+    for (0..n) |f| {
+        for (0..16) |c| {
+            total += 1;
+            if (lazy_codes[f][c] == compiled_codes[f][c]) same += 1;
+        }
+    }
+    const agree = @as(f64, @floatFromInt(same)) / @as(f64, @floatFromInt(total));
+    std.debug.print("[cp-compile] code agreement {d:.4} over {d} frames\n", .{ agree, n });
+    try std.testing.expect(agree > 0.9);
+}
+
+// Same band contract for the KV-cached predictor steps (reduction-order
+// deviation vs the full re-forward — positions/rope/causal scope identical).
+//   TTS_TEST_MODEL = model dir (any Qwen3-TTS -Base checkpoint)
+test "cached predictor: greedy codes agree with full re-forward within band" {
+    const model_dir = std.mem.span(std.c.getenv("TTS_TEST_MODEL") orelse return error.SkipZigTest);
+    const allocator = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var m = try loadModel(io, allocator, s, model_dir);
+    defer m.deinit();
+    m.cfg.temperature = 0.0;
+
+    const ids = [_]i32{ 151644, 77091, 198, 9707, 1879, 11, 419, 374, 264, 1273, 315, 279, 2205, 1467, 311, 8806, 4712, 13, 151645, 198, 151644, 77091, 198 };
+    gpu_predict_override = true;
+    defer gpu_predict_override = null;
+    cp_compile_override = false;
+    defer cp_compile_override = null;
+    cp_cache_override = false;
+    const full_codes = try m.generateCodes(&ids, 48, null, null);
+    defer allocator.free(full_codes);
+    cp_cache_override = true;
+    const cached_codes = try m.generateCodes(&ids, 48, null, null);
+    defer allocator.free(cached_codes);
+    cp_cache_override = null;
+
+    try std.testing.expect(full_codes.len > 4);
+    try std.testing.expect(cached_codes.len > 4);
+    const fl: f64 = @floatFromInt(full_codes.len);
+    const fc: f64 = @floatFromInt(cached_codes.len);
+    try std.testing.expect(fc / fl > 0.8 and fc / fl < 1.25);
+    const n = @min(full_codes.len, cached_codes.len);
+    var same: usize = 0;
+    var total: usize = 0;
+    for (0..n) |f| {
+        for (0..16) |c| {
+            total += 1;
+            if (full_codes[f][c] == cached_codes[f][c]) same += 1;
+        }
+    }
+    const agree = @as(f64, @floatFromInt(same)) / @as(f64, @floatFromInt(total));
+    std.debug.print("[cp-cache] code agreement {d:.4} over {d} frames\n", .{ agree, n });
+    try std.testing.expect(agree > 0.9);
 }

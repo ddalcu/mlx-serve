@@ -1,7 +1,16 @@
 # Plan: cache the Qwen3-TTS speaker embedding (voice-clone path)
 
-Status: **not started**. Written 2026-07-26 for a future agent. Nothing here has
-been implemented or measured.
+Status: **Option A implemented 2026-07-30** (`SpkEmbCache` in `src/tts.zig`,
+content-keyed 4-entry LRU on the Synthesizer, kill switch
+`MLX_SERVE_TTS_SPK_CACHE=0`; guards: 4 unit tests + the TTS_TEST_MODEL-gated
+bit-identity test + `tests/test_tts_clone_cache.sh`). Stage 0 measured on the
+1.7B-8bit with a real 11.5 s clip: ref decode ~0.6 ms, speaker embed
+~10.5 ms warm / ~80 ms cold, generate ~1770 ms (70 frames), codec decode
+~88 ms per sentence. After: hits cost ~0.03 ms, output byte-identical to the
+pre-cache binary. The transport half (~0.6 ms) is negligible, so the cache
+keys on the decoded samples and **Option B is closed** — not worth the API
+surface. The pre-warm below is still open and remains the only lever for the
+FIRST sentence.
 
 ## The problem, precisely
 
@@ -159,6 +168,65 @@ per-sentence cost.
   succeeds (drive `VoiceCloneTTS` with a stubbed transport).
 - Unload between sentences: the next sentence recovers rather than falling back
   to the system voice. This is the one that justifies the option's complexity.
+
+## 2026-07-30 round 2: the frame loop itself (GPU chain + fusions)
+
+Shipped, all byte-identical to the composed path and pinned by
+`tests/test_tts_fastpath_equivalence.sh` + the `gpu predict` unit tests:
+
+- **GPU-chained code predictor** (`MLX_SERVE_TTS_GPU_PREDICT=0` kills): the host
+  loop paid 16 CPU↔GPU syncs per frame (code0 + 15 codebooks); the chain keeps
+  every sample lazy (sampling was ALREADY pure mlx ops keyed by a host counter,
+  so laziness changes no draw) and reads all 16 codes in ONE sync. On the EOS
+  frame the predictor build is discarded; the extra rng advances feed no kept
+  token, so output stays byte-identical.
+- **Fused kernels reused from transformer.zig** (talker + predictor):
+  `fusedSwiGLU` (exact sig-table), `fusedQkNormRope` at talker decode L==1
+  (hd 128; angles probed once per frame via `ropeAngleRow`; eps MUST be a
+  0-dim scalar — a `[1]` array binds `constant float*` and the kernel fails to
+  compile at dispatch), `fusedAddRmsNormUngated` behind
+  `MLX_SERVE_TTS_ADD_RMSNORM=0` (tts default-ON; laguna's opt-in unchanged).
+- **`MLX_SERVE_TTS_ASYNC_STRIDE`** (default 1): async-eval kick per sampled
+  codebook + one after code0, overlapping CPU encode with GPU exec. Stride 0
+  measured ~4% worse in the one alternating-boot window.
+
+**Round 3 (same day): banded levers + the corrected numbers.** Two more
+predictor modes, both reduction-order deviations (near-tie flips at temp>0
+change the rendition; greedy agreement measured 1.0000 over 48 frames):
+- **KV-cached predictor steps** (`MLX_SERVE_TTS_CP_CACHE=0` kills; DEFAULT):
+  step 0 prefills [talker_hidden, code0-embed], every later step is ONE
+  position through the cp stack — ~30% fewer graph nodes per step, and the
+  fused QK-norm+RoPE kernel engages at L==1 (cp head_dim is 128).
+- **Compiled full-re-forward chain** (`MLX_SERVE_TTS_COMPILE=0` kills): the
+  whole 15-step chain as ONE `mlx_compile` closure (fixed signature: hidden,
+  code0, 15 keys), traced once, replayed per frame. Only −3%/frame — replay
+  still schedules every op; compile fuses elementwise, not the matmul-class
+  nodes that dominate encode. Kept as the second-preference path.
+
+**Final same-window alternating A/B (engagement-verified per arm):** composed
+25.1 ms/frame (~1758 ms generate) vs full default **12.9 ms/frame** (~1031 ms)
+— **−49%/frame, 1.95x**. Sentence with the real clip: ~1.86 s → ~1.12 s,
+~5.9x realtime. Ladder: bit-exact set (GPU chain + fusions + stride-1 kicks)
+25.1 → 20.9; compiled 20.3; KV-cached 12.9.
+
+**Measurement trap that cost half a day (now a bench rule):** an earlier A/B
+concluded "wall-clock neutral" because the composed arm read ~1473 — but the
+harness passed multi-switch env prefixes as `env $VAR` under ZSH, which does
+NOT word-split, so `env "A=0 B=0"` set A to the string `"0 B=0"`, every kill
+switch stayed ON, and the "composed" arm silently ran the fast path. Single-
+switch arms were valid, which made the numbers look internally consistent. An
+A/B arm is proven by ENGAGEMENT / no-engagement lines in its own log, never by
+its launch env; the fastpath guard asserts both directions.
+
+**Remaining roadmap (after the KV-cache round landed −49%/frame):** node count
+is still the currency; the frame is now ~12.9 ms with the talker stack
+(~420 nodes) and the cached predictor (~75 nodes × 15 steps) sharing it.
+(1) Talker static-KV + fixed-shape decode (preallocated cache + slice_update +
+mask input) so its step can also shrink; (2) mega-kernels — one custom kernel
+per L==1 predictor layer (quantized GEMVs + norms + rope + sdpa in one
+dispatch) would collapse the remaining ~1,100 nodes to ~150/frame, the true
+2x-again; (3) cross-frame pipelining (read frame N's codes after building
+frame N+1; EOS one frame late). (2) is a multi-session kernel project.
 
 ## Related, probably bigger than either option
 

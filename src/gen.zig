@@ -1782,6 +1782,8 @@ pub fn handleAudio(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
     var ref_samples: ?[]f32 = null;
     defer if (ref_samples) |r| allocator.free(r);
     if (extractJsonString(body, "ref_audio")) |raw_ref| {
+        const io_t = std.Io.Threaded.global_single_threaded.io();
+        const t0 = std.Io.Timestamp.now(io_t, .boot);
         const b64 = try jsonUnescape(allocator, raw_ref); // handles \/ from Swift JSONSerialization
         defer allocator.free(b64);
         if (b64.len > 0) {
@@ -1790,7 +1792,8 @@ pub fn handleAudio(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
                 if (decodeWavToF32(allocator, wav_bytes)) |samples| {
                     if (synth.supportsCloning()) {
                         ref_samples = samples;
-                        log.info("[audio] reference voice: {d} samples → cloning\n", .{samples.len});
+                        const dec_ns: u64 = @intCast(t0.untilNow(io_t, .boot).nanoseconds);
+                        log.info("[audio] ref decode {d:.2} ms; reference voice: {d} samples → cloning\n", .{ @as(f64, @floatFromInt(dec_ns)) / 1e6, samples.len });
                     } else {
                         allocator.free(samples);
                         log.warn("[audio] model has no speaker encoder — ignoring ref_audio\n", .{});

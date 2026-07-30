@@ -21,6 +21,10 @@ final class ComposerTipTests: XCTestCase {
             // The title is a label, not a sentence — it sits on one line in a
             // 280pt card and wrapping it looks like a bug.
             XCTAssertLessThanOrEqual(tip.title.count, 32, "title too long to sit on one line: \(tip.title)")
+            // A hover card is a glance, not documentation — the first version
+            // read as three sentences of prose and nobody hovers to read that.
+            // Detail that needs a paragraph belongs in Settings or the menu.
+            XCTAssertLessThanOrEqual(tip.body.count, 120, "card body is too long to glance at: \(tip.body)")
         }
     }
 

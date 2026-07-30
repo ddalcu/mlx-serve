@@ -12437,12 +12437,30 @@ fn moeRouterThreadGroup(num_experts: c_int) c_int {
 }
 
 /// Everything the cached kernel config bakes in. A mismatch re-arms it.
+/// Full-shape component for cached metal-kernel config keys. A cached config
+/// bakes the OUTPUT SHAPES (and grid) of the call that built it, so the key
+/// must carry the caller's actual dims: keying on a PRODUCT (rows, n) collides
+/// across layouts with equal element counts and hands the colliding caller an
+/// output labeled with the FIRST caller's shape. Live 2026-07-29 (Laguna XS):
+/// a MoE-layer SwiGLU at a 16-token hot-cache-restore prefill is (1,16,512) =
+/// 8192 elements — the same count/rank/dtype as a dense mlp_only layer at
+/// decode (1,1,8192) — and the mislabeled activation killed the server in the
+/// dense down-proj matmul. Every cached config key whose config bakes an
+/// input-derived shape uses this instead of derived products.
+const ShapeKey = struct {
+    dims: [8]c_int = @splat(0),
+    len: u8 = 0,
+    fn from(sh: []const c_int) ShapeKey {
+        var key = ShapeKey{};
+        for (sh, 0..) |d, i| key.dims[i] = d;
+        key.len = @intCast(sh.len);
+        return key;
+    }
+};
+
 const RouterCfgKey = struct {
-    rows: c_int,
-    experts: c_int,
+    shape: ShapeKey,
     k: c_int,
-    tg: c_int,
-    ndim: u8,
     out_dtype: mlx.mlx_dtype,
     norm: bool,
     scale: f32,
@@ -12502,11 +12520,8 @@ fn moeRouterTopK(
     // A model's routing geometry is fixed, so one cached config per mode covers
     // decode, and prefill re-arms it once per width.
     const key = RouterCfgKey{
-        .rows = rows,
-        .experts = num_experts,
+        .shape = ShapeKey.from(lsh),
         .k = k,
-        .tg = tg,
-        .ndim = @intCast(lsh.len),
         .out_dtype = out_dtype,
         .norm = route_norm,
         .scale = route_scale,
@@ -12971,12 +12986,19 @@ const QkFusedCfgKey = struct { hq: c_int, hk: c_int, rd: c_int, scaled: bool, dt
 var qk_fused_cfg: ?mlx.mlx_fast_metal_kernel_config = null;
 var qk_fused_cfg_key: QkFusedCfgKey = std.mem.zeroes(QkFusedCfgKey);
 
+/// True when the fused QK-norm+RoPE lever is on — exported so an out-of-file
+/// caller (tts.zig's talker) can skip building the angles row when the kill
+/// switch (MLX_SERVE_QK_NORM_ROPE_FUSED=0) has it declined anyway.
+pub fn qkNormRopeFusedWanted() bool {
+    return qkNormRopeFusedEnabled();
+}
+
 /// One fused dispatch: per-head RMSNorm + RoPE (+ optional mscale) for q AND
 /// k, emitting the transposed [1,H,1,128] layout attention consumes (at L==1
 /// that is the flat buffer relabeled, so the transposes vanish too).
 /// `angles` is the [RD] f32 cos|sin row from `ropeAngleRow`. Null → caller
-/// keeps the composed chain.
-fn fusedQkNormRope(
+/// keeps the composed chain. Shared with tts.zig's talker decode (hd 128).
+pub fn fusedQkNormRope(
     s: mlx.mlx_stream,
     q_flat: mlx.mlx_array, // [1, 1, HQ*128]
     k_flat: mlx.mlx_array, // [1, 1, HK*128]
@@ -12984,7 +13006,7 @@ fn fusedQkNormRope(
     k_norm_w: mlx.mlx_array,
     angles: mlx.mlx_array,
     ms: ?mlx.mlx_array, // bf16 [128] mscale table, null = unscaled
-    eps_arr: mlx.mlx_array, // [1] f32
+    eps_arr: mlx.mlx_array, // 0-dim f32 SCALAR (binds `constant float&`; a [1] array binds a pointer and the kernel fails to compile)
     hq: c_int,
     hk: c_int,
     rd: c_int,
@@ -13041,7 +13063,7 @@ fn fusedQkNormRope(
 /// [cos(theta_p) | sin(theta_p)] — the same floats, not a re-derivation (the
 /// angle math inside `mlx_fast_rope` is float regardless of the tensor
 /// dtype, so the f32 probe reads it out exactly).
-fn ropeAngleRow(
+pub fn ropeAngleRow(
     s: mlx.mlx_stream,
     rd: c_int,
     base: mlx.mlx_optional_float,
@@ -13853,14 +13875,16 @@ fn getAddRmsNormKernel() !mlx.mlx_fast_metal_kernel {
     return kernel;
 }
 
-const AddNormCfgKey = struct { rows: c_int, axis: c_int, tg: c_int, ndim: u8, dtype: mlx.mlx_dtype };
+const AddNormCfgKey = struct { shape: ShapeKey, dtype: mlx.mlx_dtype };
 var add_rmsnorm_cfg: ?mlx.mlx_fast_metal_kernel_config = null;
 var add_rmsnorm_cfg_key: AddNormCfgKey = std.mem.zeroes(AddNormCfgKey);
 
-const AddNormResult = struct { sum: mlx.mlx_array, normed: mlx.mlx_array };
+pub const AddNormResult = struct { sum: mlx.mlx_array, normed: mlx.mlx_array };
 
 /// `sum = a + b` and `normed = rms_norm(sum, w, eps)` in one dispatch.
-/// Null → caller keeps the two ops.
+/// Null → caller keeps the two ops. This wrapper carries the laguna lever
+/// (opt-in — measured ~1% negative there, a bandwidth regime where one saved
+/// 4 KB read doesn't pay for leaving the metallib norm kernel).
 fn fusedAddRmsNorm(
     s: mlx.mlx_stream,
     a: mlx.mlx_array,
@@ -13869,6 +13893,20 @@ fn fusedAddRmsNorm(
     eps_arr: mlx.mlx_array,
 ) !?AddNormResult {
     if (!addRmsNormFusedEnabled()) return null;
+    return fusedAddRmsNormUngated(s, a, b, w, eps_arr);
+}
+
+/// The kernel minus the laguna env gate — for callers with their OWN lever
+/// whose regime differs (tts.zig's frame loop is per-NODE CPU-bound, where
+/// one node replacing two is the point). Bit-identical to the composed pair;
+/// `eps_arr` must be a 0-dim f32 scalar.
+pub fn fusedAddRmsNormUngated(
+    s: mlx.mlx_stream,
+    a: mlx.mlx_array,
+    b: mlx.mlx_array,
+    w: mlx.mlx_array,
+    eps_arr: mlx.mlx_array,
+) !?AddNormResult {
     // A Transformer built by a construction site that predates `rms_eps_arr`
     // would hand us a null handle; decline rather than pass it to mlx.
     if (w.ctx == null or eps_arr.ctx == null) return null;
@@ -13894,7 +13932,7 @@ fn fusedAddRmsNorm(
     const tg: c_int = @divTrunc(@divTrunc(axis + 3, 4) + 31, 32) * 32;
     if (tg > 1024) return null;
 
-    const key = AddNormCfgKey{ .rows = rows, .axis = axis, .tg = tg, .ndim = @intCast(ash.len), .dtype = dt };
+    const key = AddNormCfgKey{ .shape = ShapeKey.from(ash), .dtype = dt };
     if (add_rmsnorm_cfg == null or !std.meta.eql(add_rmsnorm_cfg_key, key)) {
         if (add_rmsnorm_cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
         const config = mlx.mlx_fast_metal_kernel_config_new();
@@ -14017,7 +14055,7 @@ fn getAttnGateKernel() !mlx.mlx_fast_metal_kernel {
     return kernel;
 }
 
-const AttnGateCfgKey = struct { rows: c_int, nh: c_int, hd: c_int, tg: c_int, dtype: mlx.mlx_dtype };
+const AttnGateCfgKey = struct { shape: ShapeKey, nh: c_int, dtype: mlx.mlx_dtype };
 var attn_gate_cfg: ?mlx.mlx_fast_metal_kernel_config = null;
 var attn_gate_cfg_key: AttnGateCfgKey = std.mem.zeroes(AttnGateCfgKey);
 
@@ -14042,7 +14080,7 @@ fn fusedAttnGate(
     const width = nh * hd;
     const tg: c_int = @min(@as(c_int, 256), @max(@as(c_int, 32), @divTrunc(width + 31, 32) * 32));
     if (@rem(width, tg) != 0) return null;
-    const key = AttnGateCfgKey{ .rows = rows, .nh = nh, .hd = hd, .tg = tg, .dtype = dt };
+    const key = AttnGateCfgKey{ .shape = ShapeKey.from(ash), .nh = nh, .dtype = dt };
     if (attn_gate_cfg == null or !std.meta.eql(attn_gate_cfg_key, key)) {
         if (attn_gate_cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
         const config = mlx.mlx_fast_metal_kernel_config_new();
@@ -14188,12 +14226,15 @@ fn getSwigluKernel() !mlx.mlx_fast_metal_kernel {
     return kernel;
 }
 
-const SwigluCfgKey = struct { n: c_int, tg: c_int, ndim: u8, dtype: mlx.mlx_dtype };
+const SwigluCfgKey = struct { shape: ShapeKey, dtype: mlx.mlx_dtype };
 var swiglu_cfg: ?mlx.mlx_fast_metal_kernel_config = null;
 var swiglu_cfg_key: SwigluCfgKey = std.mem.zeroes(SwigluCfgKey);
 
 /// `silu(gate) * up`, elementwise, one dispatch. Null → caller keeps the chain.
-fn fusedSwiGLU(s: mlx.mlx_stream, gate: mlx.mlx_array, up: mlx.mlx_array) !?mlx.mlx_array {
+/// Exact by construction (bit-level sigmoid table), so callers outside this
+/// file (tts.zig's talker/code-predictor MLPs) reuse it rather than growing a
+/// second kernel.
+pub fn fusedSwiGLU(s: mlx.mlx_stream, gate: mlx.mlx_array, up: mlx.mlx_array) !?mlx.mlx_array {
     if (!swigluFusedEnabled()) return null;
     const dt = mlx.mlx_array_dtype(gate);
     if (dt != mlx.mlx_array_dtype(up)) return null;
@@ -14220,7 +14261,7 @@ fn fusedSwiGLU(s: mlx.mlx_stream, gate: mlx.mlx_array, up: mlx.mlx_array) !?mlx.
     const ni: c_int = @intCast(n);
 
     const tg: c_int = @min(@as(c_int, 256), @max(@as(c_int, 32), @divTrunc(ni + 31, 32) * 32));
-    const key = SwigluCfgKey{ .n = ni, .tg = tg, .ndim = @intCast(gsh.len), .dtype = dt };
+    const key = SwigluCfgKey{ .shape = ShapeKey.from(gsh), .dtype = dt };
     if (swiglu_cfg == null or !std.meta.eql(swiglu_cfg_key, key)) {
         if (swiglu_cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
         const config = mlx.mlx_fast_metal_kernel_config_new();
@@ -16554,6 +16595,40 @@ test "fused SwiGLU is bit-identical to the sigmoid+multiply+multiply chain" {
             try testReadF32(got, got_host, s);
             try testing.expectEqualSlices(f32, ref_host, got_host);
         }
+    }
+}
+
+test "fused SwiGLU config cache keys on the SHAPE, not the element count (Laguna restore crash)" {
+    // Live 2026-07-29: a 16-token hot-cache-restore suffix prefill on Laguna
+    // XS killed the server with "[matmul] (1,16,512) vs (8192,2048)". A MoE
+    // layer's SwiGLU at 16 tokens is (1,16,512) = 8192 elements — the SAME
+    // count, rank and dtype as a dense mlp_only layer at decode (1,1,8192).
+    // The config cache was keyed on {n, tg, ndim, dtype}, so the second call
+    // reused a config whose baked OUTPUT SHAPE was the first caller's, and
+    // the dense down-proj matmul died on the mislabeled activation. The key
+    // must be the full shape; equal products are not equal shapes.
+    const s = mlx.gpuStream();
+    const allocator = testing.allocator;
+    swiglu_fused_override = true;
+    defer swiglu_fused_override = null;
+
+    const shapes = [2][3]c_int{ .{ 1, 16, 512 }, .{ 1, 1, 8192 } };
+    for (shapes) |sh| {
+        const cnt: usize = 8192;
+        const buf = try allocator.alloc(f32, cnt);
+        defer allocator.free(buf);
+        for (buf, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i % 7)) - 3.0;
+        const a32 = mlx.mlx_array_new_data(buf.ptr, &sh, 3, .float32);
+        defer _ = mlx.mlx_array_free(a32);
+        var gate = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(gate);
+        try mlx.check(mlx.mlx_astype(&gate, a32, .bfloat16, s));
+
+        const got = (try fusedSwiGLU(s, gate, gate)) orelse return error.FusedSwigluDeclined;
+        defer _ = mlx.mlx_array_free(got);
+        try mlx.check(mlx.mlx_array_eval(got));
+        const osh = mlx.getShape(got);
+        try testing.expectEqualSlices(c_int, &sh, osh);
     }
 }
 

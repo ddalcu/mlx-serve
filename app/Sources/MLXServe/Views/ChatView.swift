@@ -731,6 +731,40 @@ struct ChatDetailView: View {
     /// The agent this tab is talking to (nil = none).
     private var activeAgent: Agent? { appState.agents.agent(id: session?.agentId) }
 
+    /// Images/PDFs/audio for this message, or a folder to ask questions about.
+    /// Its own property (rather than inline in `composerControls`) so it carries
+    /// a hover card like every other glyph in the row.
+    private var attachmentMenu: some View {
+        Menu {
+            Button {
+                pickAttachment()
+            } label: {
+                Label(audioSupported ? "Attach Image, PDF, or Audio…" : "Attach Image or PDF…",
+                      systemImage: "photo.on.rectangle")
+            }
+            Button {
+                pickDocumentFolder()
+            } label: {
+                Label("Attach Folder for Q&A…", systemImage: "folder.badge.questionmark")
+            }
+        } label: {
+            Image(systemName: "paperclip")
+                .font(.system(size: 13, weight: .medium))
+                .foregroundStyle(.secondary)
+                .frame(width: ChatMetrics.composerIconSize, height: ChatMetrics.composerIconSize)
+                .background(Color.secondary.opacity(0.15))
+                .clipShape(Circle())
+        }
+        // .plain button style (not .borderlessButton menu style) — the latter
+        // substitutes its own chrome on macOS, dropping the circle background
+        // and mis-baselining the glyph.
+        .menuStyle(.button)
+        .buttonStyle(.plain)
+        .menuIndicator(.hidden)
+        .frame(width: ChatMetrics.composerControlSize, height: ChatMetrics.composerControlSize)
+        .composerTip(.attachments(audioSupported: audioSupported))
+    }
+
     /// Shared look for the composer's icon-only mode controls.
     ///
     /// Captioned pills in the toolbar became bare glyphs here, so the state has
@@ -790,12 +824,7 @@ struct ChatDetailView: View {
         .buttonStyle(.plain)
         .menuIndicator(.hidden)
         .contextMenu { toolMenuContent }
-        .help("""
-        Tools (\(toolbarToggles.agent ? "ON" : "OFF")) — the model runs a tool-calling loop with the built-in tools (shell, file read/write/edit/search, browse, webSearch, saveMemory, media generation).
-        Off: a regular chat with no tools.
-        Click to turn tools \(toolbarToggles.agent ? "off" : "on"); right-click to choose which ones this chat may use and set its workspace.
-        Workspace: \(session?.workingDirectory ?? "not set")
-        """)
+        .composerTip(.tools(isOn: toolbarToggles.agent, workspace: session?.workingDirectory))
     }
 
     /// Flip the tool loop for this chat. Shared by the wrench click and the
@@ -847,23 +876,13 @@ struct ChatDetailView: View {
         appState.saveChatHistory()
     }
 
-    private func setAllTools(enabled: Bool) {
-        guard let idx = appState.chatSessions.firstIndex(where: { $0.id == sessionId }) else { return }
-        appState.chatSessions[idx].disabledTools =
-            enabled ? [] : AgentToolKind.chatToggleable.map(\.rawValue).sorted()
-        appState.saveChatHistory()
-    }
-
     /// Per-tool switches + the workspace they apply to. No on/off row: that is
     /// what a click on the wrench does, and one boolean with two controls is how
-    /// the two end up disagreeing.
+    /// the two end up disagreeing. No bulk "all" rows either — they duplicated
+    /// the switches sitting directly beneath them, and read as a second way to
+    /// turn the loop off.
     @ViewBuilder
     private var toolMenuContent: some View {
-        Button("Enable All Tools") { setAllTools(enabled: true) }
-            .disabled(isExternalBridgeSession)
-        Button("Disable All Tools") { setAllTools(enabled: false) }
-            .disabled(isExternalBridgeSession)
-
         ForEach(AgentToolGroup.allCases, id: \.self) { group in
             Section(group.title) {
                 ForEach(group.tools, id: \.self) { tool in
@@ -920,7 +939,7 @@ struct ChatDetailView: View {
         .buttonStyle(.plain)
         .menuIndicator(.hidden)
         .contextMenu { mcpMenuContent }
-        .help("MCP (\(toolbarToggles.mcp ? "ON" : "OFF")) — when on, tools from every enabled Model Context Protocol server are added to the toolset alongside the built-in ones. Click to turn it \(toolbarToggles.mcp ? "off" : "on"); right-click to open the Marketplace and enable servers.")
+        .composerTip(.mcp(isOn: toolbarToggles.mcp))
     }
 
     @ViewBuilder
@@ -1102,6 +1121,10 @@ struct ChatDetailView: View {
                     RoundedRectangle(cornerRadius: 18)
                         .stroke(Color.secondary.opacity(0.25), lineWidth: 0.5)
                 )
+                // Hover cards for the row's bare glyphs. Drawn HERE, past the
+                // clip: an overlay on the control itself is cut off at the
+                // container's rounded edge and lands over the text field.
+                .composerTipOverlay()
               }   // end else (non-Telegram composer)
             }
             .padding(.horizontal, ChatMetrics.gutter)
@@ -1335,35 +1358,7 @@ struct ChatDetailView: View {
         // exactly what re-triggers the » eviction class.
         agentChip
 
-        // Attachment menu (images/PDFs/audio + document folder)
-        Menu {
-            Button {
-                pickAttachment()
-            } label: {
-                Label(audioSupported ? "Attach Image, PDF, or Audio…" : "Attach Image or PDF…",
-                      systemImage: "photo.on.rectangle")
-            }
-            Button {
-                pickDocumentFolder()
-            } label: {
-                Label("Attach Folder for Q&A…", systemImage: "folder.badge.questionmark")
-            }
-        } label: {
-            Image(systemName: "paperclip")
-                .font(.system(size: 13, weight: .medium))
-                .foregroundStyle(.secondary)
-                .frame(width: ChatMetrics.composerIconSize, height: ChatMetrics.composerIconSize)
-                .background(Color.secondary.opacity(0.15))
-                .clipShape(Circle())
-        }
-        // .plain button style (not .borderlessButton menu style) —
-        // the latter substitutes its own chrome on macOS, dropping
-        // the circle background and mis-baselining the glyph.
-        .menuStyle(.button)
-        .buttonStyle(.plain)
-        .menuIndicator(.hidden)
-        .frame(width: ChatMetrics.composerControlSize, height: ChatMetrics.composerControlSize)
-        .help("Attach files, or a document folder to ask questions about")
+        attachmentMenu
 
         // Mic — only on models that actually understand audio
         // (Gemma 4 12B). Tap to record, tap again to attach.
