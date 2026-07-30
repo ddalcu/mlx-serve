@@ -1,6 +1,7 @@
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const transformer_mod = @import("transformer.zig");
+const kv_quant_mod = @import("kv_quant.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const generate_mod = @import("generate.zig");
 const drafter_mod = @import("drafter.zig");
@@ -354,6 +355,54 @@ const spec_gate_threshold: f32 = 0.01;
 /// defaults that handlers might consult. Populated once by `serve()` from
 /// its CLI args; read-only afterwards (no synchronization required, the
 /// values don't change for the server's lifetime).
+pub const KvAttnMode = enum { dense, fused, auto };
+
+/// docs/kv-quant-perf.md Phase 2 — auto-mode crossover. µbench (Phase 0
+/// table in the doc): the decode kernel is ~break-even with dense-mode reads
+/// at 8K context and wins from ~16K on every measured geometry (48/8 and
+/// 32/8 at hd 128, 16/8 at hd 256), so `auto` engages fused reads from 8K
+/// prompt tokens. One constant to start (per the plan); the per-request
+/// `kv_attn_mode` field and an explicit --kv-attn-mode outrank it.
+pub const KV_ATTN_AUTO_CROSSOVER_TOKENS: usize = 8192;
+
+/// Pure resolution core (unit-tested): explicit per-request choice >
+/// server mode; `auto` = fused iff the request's EFFECTIVE cache scheme is
+/// .affine and the prompt clears the crossover.
+pub fn resolveKvAttnFusedPure(mode: KvAttnMode, explicit: ?bool, prompt_len: usize, scheme: kv_quant_mod.Scheme) bool {
+    if (explicit) |e| return e;
+    return switch (mode) {
+        .dense => false,
+        .fused => true,
+        .auto => scheme == .affine and prompt_len >= KV_ATTN_AUTO_CROSSOVER_TOKENS,
+    };
+}
+
+/// Wrapper reading the live server config + scheduler default scheme.
+fn resolveKvAttnFused(explicit: ?bool, prompt_len: usize, kv_override: ?transformer_mod.KVQuantConfig) bool {
+    const scheme: kv_quant_mod.Scheme = if (kv_override) |o|
+        o.scheme
+    else if (global_scheduler) |sch|
+        sch.kv_quant_config.scheme
+    else
+        .off;
+    return resolveKvAttnFusedPure(server_config.kv_attn_mode, explicit, prompt_len, scheme);
+}
+
+/// Per-request `kv_attn_mode` body field: "fused" | "dense" force the read
+/// path; "auto" or an absent/unrecognized value falls back to the server
+/// mode (the kv_quant field's tolerant precedent).
+fn parseKvAttnExplicit(root: std.json.ObjectMap) ?bool {
+    const v = root.get("kv_attn_mode") orelse return null;
+    switch (v) {
+        .string => |s| {
+            if (std.mem.eql(u8, s, "fused")) return true;
+            if (std.mem.eql(u8, s, "dense")) return false;
+            return null;
+        },
+        else => return null,
+    }
+}
+
 pub const ServerConfig = struct {
     /// Maximum context size (0 = unlimited). `--ctx-size N`.
     max_context_size: u32 = 0,
@@ -368,11 +417,13 @@ pub const ServerConfig = struct {
     default_pld_draft_len: u32 = 5,
     /// N-gram match key length for PLD.
     default_pld_key_len: u32 = 3,
-    /// Phase 2 (Plan ricky): default `kv_attn_fused` for new requests.
-    /// Set by `--kv-attn-mode fused`. Per-request `kv_attn_mode` body
-    /// field overrides. Only takes effect at `--kv-quant 4|8` (.affine
-    /// cache scheme); other schemes ignore it.
-    default_kv_attn_fused: bool = false,
+    /// docs/kv-quant-perf.md Phase 2: how quantized-KV requests READ the
+    /// cache at decode. `--kv-attn-mode dense|fused|auto`; per-request
+    /// `kv_attn_mode` body field ("dense"/"fused") outranks it. Only takes
+    /// effect at `--kv-quant 4|8` (.affine cache scheme); other schemes
+    /// always read dense. `auto` (the default) engages fused reads when the
+    /// prompt is at/above the measured crossover — see `resolveKvAttnFused`.
+    kv_attn_mode: KvAttnMode = .auto,
     /// Defaults for sampling fields the request OMITS, set by `--temp` /
     /// `--top-p` / `--top-k` in serve mode (the macOS app passes its Settings
     /// values so external clients like Claude Code — which send no sampling
@@ -4345,6 +4396,7 @@ fn handleChatCompletions(
             .turboquant_2, .turboquant_4 => log.info("  kv-quant override: turboquant {d}-bit (per-request)\n", .{kq.bits}),
         }
     }
+    const kv_attn_explicit = parseKvAttnExplicit(root);
 
     // Parse enable_pld: per-request override of the --pld default.
     //
@@ -4584,7 +4636,7 @@ fn handleChatCompletions(
     const sub_mrope = local_mrope;
     local_mrope = .{}; // ownership transferred to the sub-handler → slot
     if (is_stream) {
-        handleStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, include_usage, has_tools, tools_json, allow_parallel_tools, logprobs_n, enable_thinking, reasoning_budget, enable_pld, enable_drafter, enable_mtp, sub_ve, sub_mrope, kv_quant_override, tokenize_ns) catch |err| {
+        handleStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, include_usage, has_tools, tools_json, allow_parallel_tools, logprobs_n, enable_thinking, reasoning_budget, enable_pld, enable_drafter, enable_mtp, sub_ve, sub_mrope, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
             log.err("  -> streaming error: {}\n", .{err});
             // Send SSE error event so the client gets a proper error instead of a dropped connection
             const err_chunk = std.fmt.allocPrint(allocator,
@@ -4595,7 +4647,7 @@ fn handleChatCompletions(
             stream.writeAll("\n\ndata: [DONE]\n\n") catch {};
         };
     } else {
-        handleNonStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, logprobs_n, enable_thinking, reasoning_budget, enable_pld, enable_drafter, enable_mtp, sub_ve, sub_mrope, kv_quant_override, tokenize_ns) catch |err| {
+        handleNonStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, logprobs_n, enable_thinking, reasoning_budget, enable_pld, enable_drafter, enable_mtp, sub_ve, sub_mrope, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
             log.err("  -> 500 ({s})\n", .{@errorName(err)});
             sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", @errorName(err), 500) catch {};
         };
@@ -4830,7 +4882,7 @@ fn handleNonStreamingCompletion(
     const use_drafter = !use_mtp and enable_drafter and lm.drafter != null and sampling.constraint == null;
     const use_pld = !use_mtp and !use_drafter and enable_pld and sampling.constraint == null;
 
-    var result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, false, use_pld, use_drafter, use_mtp, getTimeoutNs(), null, .{}, 0, null, stream) catch |err| switch (err) {
+    var result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, false, use_pld, use_drafter, use_mtp, getTimeoutNs(), null, .{}, 0, null, null, stream) catch |err| switch (err) {
         error.GenerationFailed => return sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", "generation failed", null),
         else => return err,
     };
@@ -4933,7 +4985,7 @@ fn handleStreamingCompletion(
         .mtp_depth = lm.mtp_depth,
         .pld_draft_len = server_config.default_pld_draft_len,
         .pld_key_len = server_config.default_pld_key_len,
-        .kv_attn_fused = server_config.default_kv_attn_fused,
+        .kv_attn_fused = resolveKvAttnFused(null, prompt_ids.len, null),
         .logprobs_n = 0,
     });
     var ts = StreamingTokenStream.initFromSlot(slot_handle.?, stream_mode, eos_token_ids);
@@ -5108,6 +5160,7 @@ fn nonStreamingViaScheduler(
     logprobs_n: u32,
     /// Wave 1.A: per-request KV-quant override; null = inherit scheduler default.
     kv_quant_override: ?transformer_mod.KVQuantConfig,
+    kv_attn_explicit: ?bool,
     /// When non-null, the peer socket is probed on idle wakeups during the
     /// wait — a vanished client cancels the slot (aborting its prefill)
     /// instead of grinding out a ghost generation nobody will read.
@@ -5132,7 +5185,7 @@ fn nonStreamingViaScheduler(
         .mtp_depth = lm.mtp_depth,
         .pld_draft_len = server_config.default_pld_draft_len,
         .pld_key_len = server_config.default_pld_key_len,
-        .kv_attn_fused = server_config.default_kv_attn_fused,
+        .kv_attn_fused = resolveKvAttnFused(kv_attn_explicit, prompt_ids.len, kv_quant_override),
         .vision_embeddings = vision_embeddings,
         .mrope_pos = mrope.pos,
         .mrope_total = mrope.total,
@@ -5227,6 +5280,7 @@ fn handleNonStreamingGeneration(
     mrope: MropeData,
     /// Wave 1.A: per-request KV-quant override; null = inherit scheduler default.
     kv_quant_override: ?transformer_mod.KVQuantConfig,
+    kv_attn_explicit: ?bool,
     /// Iteration 1: tokenize_ns from the parent handleChatCompletions, so
     /// the non-streaming chat response carries `timings.tokenize_ms`.
     tokenize_ns: u64,
@@ -5255,7 +5309,7 @@ fn handleNonStreamingGeneration(
         ve_local = null;
         break :blk v;
     };
-    const result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, use_pld, use_drafter, use_mtp, getTimeoutNs(), slot_ve, mrope, logprobs_n, kv_quant_override, stream) catch |err| switch (err) {
+    const result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, use_pld, use_drafter, use_mtp, getTimeoutNs(), slot_ve, mrope, logprobs_n, kv_quant_override, kv_attn_explicit, stream) catch |err| switch (err) {
         error.GenerationFailed => {
             try sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", "generation failed", null);
             return;
@@ -5787,6 +5841,7 @@ fn handleStreamingGeneration(
     mrope: MropeData,
     /// Wave 1.A: per-request KV-quant override; null = inherit scheduler default.
     kv_quant_override: ?transformer_mod.KVQuantConfig,
+    kv_attn_explicit: ?bool,
     /// Iteration 1: tokenize_ns measured by the request handler before
     /// dispatching here. Surfaced via `timings.tokenize_ms` on the final
     /// usage SSE chunk so streaming clients see the same metric as
@@ -5846,7 +5901,7 @@ fn handleStreamingGeneration(
         .mtp_depth = lm.mtp_depth,
         .pld_draft_len = server_config.default_pld_draft_len,
         .pld_key_len = server_config.default_pld_key_len,
-        .kv_attn_fused = server_config.default_kv_attn_fused,
+        .kv_attn_fused = resolveKvAttnFused(kv_attn_explicit, prompt_ids.len, kv_quant_override),
         .logprobs_n = logprobs_n,
         .vision_embeddings = slot_ve_s,
         .mrope_pos = mrope.pos,
@@ -8565,6 +8620,7 @@ fn handleAnthropicMessages(
 
     // Wave 1.A: per-request KV-quant override (Anthropic mirror).
     const kv_quant_override = parseKvQuantOverride(root);
+    const kv_attn_explicit = parseKvAttnExplicit(root);
 
     // Per-request PLD override (mirror chat-completions behavior: tools and
     // hybrid SSM do not disable PLD; the adaptive ngram gate below and the
@@ -8678,7 +8734,7 @@ fn handleAnthropicMessages(
     const sub_ve = local_ve;
     local_ve = null;
     if (is_stream) {
-        handleAnthropicStreaming(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, enable_thinking, reasoning_budget, @intCast(prompt_ids.len), enable_pld, enable_drafter, enable_mtp, sub_ve, kv_quant_override, tokenize_ns) catch |err| {
+        handleAnthropicStreaming(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, enable_thinking, reasoning_budget, @intCast(prompt_ids.len), enable_pld, enable_drafter, enable_mtp, sub_ve, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
             log.err("  -> streaming error: {}\n", .{err});
             const err_data = std.fmt.allocPrint(allocator,
                 \\{{"type":"error","error":{{"type":"api_error","message":"Internal server error: {s}"}}}}
@@ -8687,7 +8743,7 @@ fn handleAnthropicMessages(
             sendAnthropicEvent(stream, "error", err_data) catch {};
         };
     } else {
-        handleAnthropicNonStreaming(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, enable_thinking, reasoning_budget, @intCast(prompt_ids.len), enable_pld, enable_drafter, enable_mtp, sub_ve, kv_quant_override, tokenize_ns) catch |err| {
+        handleAnthropicNonStreaming(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, enable_thinking, reasoning_budget, @intCast(prompt_ids.len), enable_pld, enable_drafter, enable_mtp, sub_ve, kv_quant_override, kv_attn_explicit, tokenize_ns) catch |err| {
             log.err("  -> 500 ({s})\n", .{@errorName(err)});
             sendAnthropicError(allocator, stream, "api_error", @errorName(err), 500) catch {};
         };
@@ -8721,6 +8777,7 @@ fn handleAnthropicNonStreaming(
     vision_embeddings: ?mlx.mlx_array,
     /// Wave 1.A: per-request KV-quant override.
     kv_quant_override: ?transformer_mod.KVQuantConfig,
+    kv_attn_explicit: ?bool,
     /// Iteration 1 instrumentation: nanoseconds of render+tokenize measured
     /// by the parent handleAnthropicMessages. Threaded through so the
     /// non-streaming response carries `timings.tokenize_ms`.
@@ -8751,7 +8808,7 @@ fn handleAnthropicNonStreaming(
     // M-RoPE: Anthropic path uses scalar-RoPE fallback for now (faithful M-RoPE
     // wired for /v1/chat/completions; see computeQwenMrope). Qwen image requests
     // still decode correctly — M-RoPE refines spatial grounding only.
-    const result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, use_pld, use_drafter, use_mtp, getTimeoutNs(), slot_ve, .{}, 0, kv_quant_override, stream) catch |err| switch (err) {
+    const result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, use_pld, use_drafter, use_mtp, getTimeoutNs(), slot_ve, .{}, 0, kv_quant_override, kv_attn_explicit, stream) catch |err| switch (err) {
         error.GenerationFailed => return sendAnthropicError(allocator, stream, "api_error", "generation failed", 500),
         else => return err,
     };
@@ -8945,6 +9002,7 @@ fn handleAnthropicStreaming(
     vision_embeddings: ?mlx.mlx_array,
     /// Wave 1.A: per-request KV-quant override.
     kv_quant_override: ?transformer_mod.KVQuantConfig,
+    kv_attn_explicit: ?bool,
     /// Iteration 1: tokenize_ns from parent handler. Anthropic streaming
     /// doesn't currently emit `timings` over SSE (spec doesn't model it),
     /// but plumbing the value through keeps the signature consistent with
@@ -8992,7 +9050,7 @@ fn handleAnthropicStreaming(
         .mtp_depth = lm.mtp_depth,
         .pld_draft_len = server_config.default_pld_draft_len,
         .pld_key_len = server_config.default_pld_key_len,
-        .kv_attn_fused = server_config.default_kv_attn_fused,
+        .kv_attn_fused = resolveKvAttnFused(kv_attn_explicit, prompt_ids.len, kv_quant_override),
         .logprobs_n = 0,
         .vision_embeddings = slot_ve_anth,
         .kv_quant_config = kv_quant_override,
@@ -10048,6 +10106,7 @@ fn handleResponses(
         return;
     }
     const kv_quant_override = parseKvQuantOverride(root);
+    const kv_attn_explicit = parseKvAttnExplicit(root);
     if (!try checkAttentionMemory(allocator, stream, prompt_ids.len, config, false, kv_quant_override, lm)) return;
     const effective_max_tokens = clampMaxTokens(max_tokens, prompt_ids.len, effective_ctx);
 
@@ -10256,7 +10315,7 @@ fn handleResponses(
             .vision_embeddings = slot_ve_resp,
             .pld_draft_len = server_config.default_pld_draft_len,
             .pld_key_len = server_config.default_pld_key_len,
-            .kv_attn_fused = server_config.default_kv_attn_fused,
+            .kv_attn_fused = resolveKvAttnFused(kv_attn_explicit, prompt_ids.len, kv_quant_override),
             .logprobs_n = 0,
             .kv_quant_config = kv_quant_override,
         });
@@ -10510,7 +10569,7 @@ fn handleResponses(
             local_ve = null;
             break :blk v;
         };
-        result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, effective_max_tokens, sampling, eos_slice, 0, active_has_tools, use_pld, use_drafter, use_mtp, getTimeoutNs(), slot_ve_ns, .{}, 0, kv_quant_override, stream) catch |err| switch (err) {
+        result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, effective_max_tokens, sampling, eos_slice, 0, active_has_tools, use_pld, use_drafter, use_mtp, getTimeoutNs(), slot_ve_ns, .{}, 0, kv_quant_override, kv_attn_explicit, stream) catch |err| switch (err) {
             error.GenerationFailed => return sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", "generation failed", null),
             else => return err,
         };
@@ -13288,6 +13347,25 @@ test "truncateEmbeddingDims: OpenAI dimensions semantics (truncate + L2-renormal
     const zt = truncateEmbeddingDims(&z, 2);
     try t.expectEqual(@as(usize, 2), zt.len);
     for (zt) |x| try t.expect(!std.math.isNan(x));
+}
+
+test "resolveKvAttnFusedPure: explicit > mode; auto keys on scheme + crossover" {
+    const t = std.testing;
+    // Explicit per-request choice outranks every mode.
+    try t.expect(resolveKvAttnFusedPure(.dense, true, 0, .off));
+    try t.expect(!resolveKvAttnFusedPure(.fused, false, 1 << 20, .affine));
+    // Fixed modes.
+    try t.expect(!resolveKvAttnFusedPure(.dense, null, 1 << 20, .affine));
+    try t.expect(resolveKvAttnFusedPure(.fused, null, 0, .affine));
+    // Auto: affine + prompt at/above the crossover.
+    try t.expect(resolveKvAttnFusedPure(.auto, null, KV_ATTN_AUTO_CROSSOVER_TOKENS, .affine));
+    try t.expect(resolveKvAttnFusedPure(.auto, null, KV_ATTN_AUTO_CROSSOVER_TOKENS + 1, .affine));
+    try t.expect(!resolveKvAttnFusedPure(.auto, null, KV_ATTN_AUTO_CROSSOVER_TOKENS - 1, .affine));
+    // Auto never engages on non-affine schemes (TurboQuant needs the
+    // rotation undo the fused path doesn't implement; off has no triples).
+    try t.expect(!resolveKvAttnFusedPure(.auto, null, 1 << 20, .off));
+    try t.expect(!resolveKvAttnFusedPure(.auto, null, 1 << 20, .turboquant_2));
+    try t.expect(!resolveKvAttnFusedPure(.auto, null, 1 << 20, .turboquant_4));
 }
 
 test "defaultEnableMtp: --mtp forces the native head on for MoE targets" {

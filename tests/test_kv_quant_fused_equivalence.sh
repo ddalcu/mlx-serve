@@ -67,11 +67,15 @@ print(json.dumps({
 
 run_and_tokenize() {
     # Args: label, extra-flags, out-var-completion, out-var-tokens
+    # Side channel: ENGAGED_FUSED / ENGAGED_KERNEL are set from the server
+    # log (one-shot "[kv-attn]" lines) before the log is deleted.
     local label="$1" extra="$2" out_compl="$3" out_tok="$4"
     echo "  starting server ($label)..." >&2
     local logfile
     logfile=$(mktemp)
-    "$BINARY" --model "$MODEL" --serve --port "$PORT" --kv-quant 4 --no-pld $extra ${MLX_SERVE_TEST_EXTRA_ARGS:-} > "$logfile" 2>&1 &
+    # MIN_TK=1: the per-layer kv floor is a PERF gate; this test's short
+    # prompt must still exercise the fused read paths for correctness.
+    MLX_SERVE_KV_ATTN_MIN_TK=1 "$BINARY" --model "$MODEL" --serve --port "$PORT" --kv-quant 4 --no-pld $extra ${MLX_SERVE_TEST_EXTRA_ARGS:-} > "$logfile" 2>&1 &
     local pid=$!
     local up=0 i
     for i in $(seq 1 60); do
@@ -98,6 +102,8 @@ run_and_tokenize() {
     tokens=$(echo "$tok_payload" | curl -s -X POST -H "Content-Type: application/json" -d @- "$BASE/tokenize" | python3 -c "import sys,json; print(','.join(str(t) for t in json.load(sys.stdin)['tokens']))")
     kill $pid 2>/dev/null || true
     wait $pid 2>/dev/null || true
+    ENGAGED_FUSED=$(grep -c "\[kv-attn\] fused engaged" "$logfile" || true)
+    ENGAGED_KERNEL=$(grep -c "\[kv-attn\] decode kernel engaged" "$logfile" || true)
     rm -f "$logfile"
     printf -v "$out_compl" '%s' "$completion"
     printf -v "$out_tok" '%s' "$tokens"
@@ -150,6 +156,10 @@ DENSE_TOK=""
 run_and_tokenize "dense" "--kv-attn-mode dense" DENSE_COMPL DENSE_TOK || exit 1
 N_DENSE=$(echo "$DENSE_TOK" | tr ',' '\n' | wc -l | tr -d ' ')
 echo "  dense: $(echo "$DENSE_COMPL" | wc -c) bytes, $N_DENSE tokens"
+if [ "${ENGAGED_FUSED:-0}" != "0" ] || [ "${ENGAGED_KERNEL:-0}" != "0" ]; then
+    echo -e "${RED}FAIL${NC} dense arm shows [kv-attn] engagement — the dense flag never landed (expectNoSpec class)."
+    exit 1
+fi
 
 sleep 2
 
@@ -158,6 +168,15 @@ FUSED_TOK=""
 run_and_tokenize "fused" "--kv-attn-mode fused" FUSED_COMPL FUSED_TOK || exit 1
 N_FUSED=$(echo "$FUSED_TOK" | tr ',' '\n' | wc -l | tr -d ' ')
 echo "  fused: $(echo "$FUSED_COMPL" | wc -c) bytes, $N_FUSED tokens"
+if [ "${ENGAGED_FUSED:-0}" = "0" ]; then
+    echo -e "${RED}FAIL${NC} fused arm never logged '[kv-attn] fused engaged' — silent fallback to dense reads."
+    exit 1
+fi
+if [ "${ENGAGED_KERNEL:-0}" = "0" ]; then
+    echo -e "${RED}FAIL${NC} fused arm never logged '[kv-attn] decode kernel engaged' — decode width fell through to the composed path."
+    exit 1
+fi
+echo "  engagement: fused=$ENGAGED_FUSED kernel=$ENGAGED_KERNEL"
 
 echo
 

@@ -161,12 +161,14 @@ fn printUsage(io: std.Io) void {
         \\                          affine at 2/4 bits; lower distortion at
         \\                          comparable storage. Per-request override
         \\                          via the `kv_quant` body field.
-        \\  --kv-attn-mode {{dense|fused}}
-        \\                      Attention path for quantized KV. `dense`
-        \\                        (default) dequantizes K/V before SDPA;
-        \\                        `fused` consumes the quant triples directly
-        \\                        via mlx_quantized_matmul (opt-in; only
-        \\                        effective at --kv-quant 4 or 8).
+        \\  --kv-attn-mode {{auto|dense|fused}}
+        \\                      Decode read path for quantized KV. `dense`
+        \\                        dequantizes K/V before SDPA; `fused` reads
+        \\                        the packed cache in place (custom kernel at
+        \\                        decode width, composed qmm at verify widths);
+        \\                        `auto` (default) picks fused from 8K prompt
+        \\                        tokens. Only effective at --kv-quant 4 or 8;
+        \\                        per-request `kv_attn_mode` field overrides.
         \\  --prefill-chunk <n> Max tokens forwarded per prefill chunk
         \\                        (default: 8192). Auto-capped further per model
         \\                        so one layer's attention scores stay within
@@ -415,7 +417,7 @@ pub fn main(init: std.process.Init) !void {
     // mlx_quantized_matmul instead of dequantizing through DenseKVView.
     // Off by default — only `.affine` cache scheme is supported by the
     // v1 fused path; TurboQuant + dense schemes ignore it.
-    var kv_attn_fused_default: bool = false;
+    var kv_attn_mode: server_mod.KvAttnMode = .auto;
     // Plan 05 Phase D: multi-model caps. Defaults aim for "comfortable on
     // 32–64 GB systems running Gemma 4 E4B-class models". Override via the
     // CLI flags below; the Swift app exposes them under Advanced settings.
@@ -704,11 +706,13 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--kv-attn-mode") and i + 1 < args.len) {
             i += 1;
             if (std.mem.eql(u8, args[i], "dense")) {
-                kv_attn_fused_default = false;
+                kv_attn_mode = .dense;
             } else if (std.mem.eql(u8, args[i], "fused")) {
-                kv_attn_fused_default = true;
+                kv_attn_mode = .fused;
+            } else if (std.mem.eql(u8, args[i], "auto")) {
+                kv_attn_mode = .auto;
             } else {
-                log.err("--kv-attn-mode: expected 'dense' or 'fused'; got '{s}'\n", .{args[i]});
+                log.err("--kv-attn-mode: expected 'dense', 'fused' or 'auto'; got '{s}'\n", .{args[i]});
                 std.process.exit(1);
             }
         } else {
@@ -912,7 +916,7 @@ pub fn main(init: std.process.Init) !void {
         .affine => log.info("[args] kv-quant: affine {d}-bit (group={d})\n", .{ kv_quant_config.bits, kv_quant_config.group_size }),
         .turboquant_2, .turboquant_4 => log.info("[args] kv-quant: turboquant {d}-bit (group={d}, Hadamard rotation)\n", .{ kv_quant_config.bits, kv_quant_config.group_size }),
     }
-    log.info("[args] kv-attn-mode: {s}\n", .{if (kv_attn_fused_default) "fused" else "dense"});
+    log.info("[args] kv-attn-mode: {s}\n", .{@tagName(kv_attn_mode)});
 
     // Set GPU as default
     var metal_avail: bool = false;
@@ -1165,7 +1169,7 @@ pub fn main(init: std.process.Init) !void {
             .default_enable_pld = cli_pld.enable,
             .default_pld_draft_len = cli_pld.draft_len,
             .default_pld_key_len = cli_pld.key_len,
-            .default_kv_attn_fused = kv_attn_fused_default,
+            .kv_attn_mode = kv_attn_mode,
             .default_force_mtp = force_mtp,
         });
     } else {
@@ -1567,7 +1571,7 @@ fn runGenServe(
         .default_enable_pld = server_mod.PldDefaults.off.enable,
         .default_pld_draft_len = server_mod.PldDefaults.off.draft_len,
         .default_pld_key_len = server_mod.PldDefaults.off.key_len,
-        .default_kv_attn_fused = false,
+        .kv_attn_mode = .auto,
     });
 }
 
@@ -1691,7 +1695,7 @@ fn runHeadlessServe(
         .default_enable_pld = pld.enable,
         .default_pld_draft_len = pld.draft_len,
         .default_pld_key_len = pld.key_len,
-        .default_kv_attn_fused = false,
+        .kv_attn_mode = .auto,
         // On-demand MLX loads auto-attach an MTP sidecar (LoadParams.mtp_enabled
         // defaults true), so the MoE force flag has to reach this path too.
         .default_force_mtp = force_mtp,
@@ -1900,7 +1904,7 @@ fn runDs4Serve(
         .default_enable_pld = server_mod.PldDefaults.off.enable,
         .default_pld_draft_len = server_mod.PldDefaults.off.draft_len,
         .default_pld_key_len = server_mod.PldDefaults.off.key_len,
-        .default_kv_attn_fused = false,
+        .kv_attn_mode = .auto,
     });
 }
 
@@ -2172,7 +2176,7 @@ fn runLlamaServe(
         .default_enable_pld = server_mod.PldDefaults.off.enable,
         .default_pld_draft_len = server_mod.PldDefaults.off.draft_len,
         .default_pld_key_len = server_mod.PldDefaults.off.key_len,
-        .default_kv_attn_fused = false,
+        .kv_attn_mode = .auto,
     });
 }
 

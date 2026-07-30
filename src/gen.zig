@@ -1771,6 +1771,31 @@ pub fn handleAudio(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
         .music => return sendError(conn, 400, "loaded audio model is a music generator; POST /v1/audio/music-generations"),
         .kokoro => |k| return handleKokoroSpeech(allocator, conn, body, k),
     };
+    // Pre-warm (docs/qwentts-cache.md): `{"warm_only":true,"ref_audio":...}`
+    // embeds + caches the clone voice WITHOUT synthesizing, so the FIRST
+    // sentence of a voice session skips the cold ECAPA forward. Misuse is a
+    // named 400, never a silent no-op (the media-gen rule).
+    if (sse.bodyWantsTrue(body, "warm_only")) {
+        if (!synth.supportsCloning()) return sendError(conn, 400, "this model has no speaker encoder; nothing to warm");
+        const raw_ref = extractJsonString(body, "ref_audio") orelse return sendError(conn, 400, "warm_only requires ref_audio");
+        const b64 = try jsonUnescape(allocator, raw_ref);
+        defer allocator.free(b64);
+        if (b64.len == 0) return sendError(conn, 400, "warm_only requires ref_audio");
+        const wav_bytes = base64DecodeAlloc(allocator, b64) catch return sendError(conn, 400, "ref_audio is not valid base64");
+        defer allocator.free(wav_bytes);
+        const samples = decodeWavToF32(allocator, wav_bytes) catch return sendError(conn, 400, "ref_audio is not a decodable WAV");
+        defer allocator.free(samples);
+        const was_cached = synth.warmSpeaker(samples) catch |err| {
+            log.err("[audio] warm_only failed: {}\n", .{err});
+            return sendError(conn, 500, "speaker embedding failed");
+        };
+        log.info("[audio] warm_only: speaker embedding {s}\n", .{if (was_cached) "already cached" else "cached"});
+        return sendBytesJson(conn, allocator, if (was_cached)
+            "{\"warmed\":true,\"cache\":\"hit\"}"
+        else
+            "{\"warmed\":true,\"cache\":\"miss\"}");
+    }
+
     const input = extractJsonString(body, "input") orelse extractJsonString(body, "text") orelse return sendError(conn, 400, "missing 'input'");
     const text = try jsonUnescape(allocator, input);
     defer allocator.free(text);
@@ -1844,6 +1869,9 @@ pub fn handleAudio(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
 /// the 54 packs, and a comma-separated list BLENDS them
 /// (`"af_bella,af_sky"`) — the reference's own convention.
 fn handleKokoroSpeech(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, engine: *kokoro.Engine) !void {
+    if (sse.bodyWantsTrue(body, "warm_only")) {
+        return sendError(conn, 400, "this model does not support voice cloning; nothing to warm");
+    }
     const input = extractJsonString(body, "input") orelse extractJsonString(body, "text") orelse
         return sendError(conn, 400, "missing 'input'");
     const text = try jsonUnescape(allocator, input);

@@ -1,9 +1,66 @@
 # KV-quant performance plan (4-bit / 8-bit / TurboQuant)
 
-Status: PLAN — written 2026-07-30, nothing below is implemented unless marked DONE.
-Audience: a future agent picking this up cold. Read this whole file before touching code,
-then read the `## Rules` engine section in the root CLAUDE.md — every trap named there has
-already been hit once.
+Status: **IMPLEMENTED 2026-07-30** (Phases 0–2 + a decode kernel that replaced Phase 1's
+composed path as the main lever; Phase 3 SKIPPED with reason, Phase 4 partially superseded —
+see "Outcome" below). Audience: a future agent picking this up cold.
+
+## Outcome (2026-07-30)
+
+- **The fused flag was a silent no-op on the live decode path** before this round:
+  `updateAffine` (what every decode forward calls) never set the quant triples on its
+  returned `DenseKVView` — only the read-only `denseView` did. `--kv-attn-mode fused`
+  engaged on nothing; tests/measure scripts compared dense against dense. Fixed + engagement
+  now asserted in `tests/test_kv_quant_fused_equivalence.sh` (fused arm must log both
+  `[kv-attn] fused engaged` and `[kv-attn] decode kernel engaged`; dense arm neither).
+- **Phase 1 (grouped-Q composed) shipped but is NOT the perf lever**: the Phase 0 µbench
+  showed composed qmm at M=g rows over batched 4-D banks runs ~6x below bandwidth and LOSES
+  to dense-mode reads at every real GQA ratio (48/8 @32K: composed 1.47 ms vs dense 1.11 vs
+  off 0.51). It remains as the verify-width (T_q 2..32) fallback.
+- **The lever is `qkv_attn_dec`** — a custom metal_kernel reading the packed affine K/V
+  views IN PLACE at decode width (T_q=1): grid over (kv_head × kv_block), per-block scores
+  computed row-per-thread with no reduction on the critical path, thread-per-element V
+  accumulate reading each packed row ONCE regardless of GQA ratio, per-block (m, l, O)
+  partials merged by a handful of KB-scale mlx ops. Threadgroup footprint kept ≤ ~10 KiB —
+  the first two designs measured 5x/1.7x SLOWER from occupancy starvation (48 threadgroups /
+  28 KiB tg-memory respectively); block size and tg-memory are ONE decision.
+- **Live same-boot interleaved A/B** (per-request `kv_attn_mode` field, prefix-cache-served
+  long prompt so each request measures decode, server's own `timings`):
+
+  | Model | ctx | kv off | kvq8 dense | kvq8 fused | fused vs dense |
+  |---|---|---|---|---|---|
+  | Laguna XS NVFP4 (48/8, hd128) | 10.7K | 96.0 | 70.3 | 77.5 | **+10%** |
+  | Laguna XS NVFP4 | 42K | 70.0 | 37.0 | 57.7 | **+56%** |
+  | Qwen3.6-27B 4b (hybrid) | 37K | · | 17.0 | 21.4 | **+26%** |
+
+  (tok/s, temp 0, 3/3 resp. 2/2 pairs each, answers same-prefix.) kv-quant remains a
+  memory feature — fused does not beat kv-off on Laguna (~-18% at 42K vs off) — but the
+  long-context penalty drops from −47% to −18%.
+- **Phase 2 shipped as default**: `--kv-attn-mode auto` (new default) engages fused reads
+  when scheme==.affine and prompt ≥ 8192 tokens (`server.KV_ATTN_AUTO_CROSSOVER_TOKENS`);
+  a per-layer kv floor (`KV_ATTN_FUSED_MIN_TK` = 1024, env-overridable
+  `MLX_SERVE_KV_ATTN_MIN_TK`) keeps short-KV layers (Laguna's 512-token sliding windows —
+  measured −2% when they fused: the split-KV merge ops don't pay at tiny T_k) on dense
+  reads even inside a fused request. Per-request `kv_attn_mode: "dense"|"fused"` outranks
+  everything. Kill switches: `MLX_SERVE_KV_ATTN_FUSED=0` (whole route),
+  `MLX_SERVE_KV_ATTN_KERNEL=0` (kernel only → composed).
+- **Wired sites**: `forwardStandardWith`, `gatedFullAttnWith`, `lagunaAttnWith` (the A/B
+  read dense-vs-dense until laguna was wired — engagement counting caught it, again).
+  `gemma4MoeAttnWith` (26B-A4B) deliberately NOT wired yet — kv-quant there silently keeps
+  dense reads (honest, just not accelerated). `forwardBatchedDecode`/`diffusionDecoderAttn`
+  keep dense reads by design.
+- **Two latent bugs this round flushed out**: (1) the composed causal arm built its mask as
+  `upper * -inf` — `0 × -inf = NaN` poisoned every sub-diagonal entry, live symptom gemma
+  answering `<pad><pad>`; (2) every parity loop was NaN-BLIND (`NaN > max_err` is false),
+  which is how (1) shipped green. All parity loops now assert finiteness first; the mask is
+  built with `mlx_where`.
+- **Phase 3 (TurboQuant fused) SKIPPED**: it would ride the composed path, which loses at
+  GQA ratios; the real fix is teaching the kernel rotation-aware dequant — separate session.
+- **Phase 4 (prefill flash kernel)**: NOT built; the decode kernel covers where kv-quant
+  lives or dies (the doc's own call). Prefill under kv-quant still pays dense
+  materialization + eval-per-layer cadence.
+
+The original plan follows for context; read the `## Rules` engine section in the root
+CLAUDE.md before touching any of this — every trap named there has already been hit once.
 
 ## Goal
 

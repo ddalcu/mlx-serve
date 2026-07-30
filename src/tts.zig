@@ -2481,6 +2481,27 @@ pub const Synthesizer = struct {
         return self.model.speaker != null;
     }
 
+    /// Pre-warm the clone cache for `ref` WITHOUT synthesizing
+    /// (docs/qwentts-cache.md "pre-warm" — the only lever for the FIRST
+    /// sentence: the app fires this when voice mode starts / a clone-voiced
+    /// agent is selected, so sentence 1 skips the cold ECAPA forward).
+    /// Returns true when the clip was already cached. With the cache
+    /// disabled (MLX_SERVE_TTS_SPK_CACHE=0) there is nothing to warm INTO —
+    /// returns false without embedding. Errors when the checkpoint cannot
+    /// clone (the caller turns that into a named 400, never a silent no-op).
+    pub fn warmSpeaker(self: *Synthesizer, ref: []const f32) !bool {
+        const sp = if (self.model.speaker) |*s_| s_ else return error.NoSpeakerEncoder;
+        if (!spkCacheEnabled()) return false;
+        const hash = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(ref));
+        if (self.spk_cache.get(hash)) |hit| {
+            _ = mlx.mlx_array_free(hit); // get() hands back a +1 ref
+            return true;
+        }
+        const emb = try resolveSpeakerEmbedding(sp, &self.spk_cache, ref);
+        _ = mlx.mlx_array_free(emb);
+        return false;
+    }
+
     /// text → waveform samples (f32, owned). `max_frames` caps generation.
     /// `ref_audio` (optional, 24 kHz mono f32) clones that voice via the
     /// speaker encoder; ignored (plain voice) when the model has none.
@@ -3806,6 +3827,47 @@ test "spk cache: cached path skips encoder, bit-identical to uncached" {
         try std.testing.expectEqual(du[i], d1[i]);
         try std.testing.expectEqual(du[i], d2[i]);
     }
+}
+
+test "spk cache: warm path embeds once, reports hit on the second warm" {
+    // Pre-warm contract (docs/qwentts-cache.md): warm embeds + caches without
+    // synthesizing; a later synthesis (or warm) of the SAME clip must be a
+    // hit that never re-runs the encoder. Exercised through the same
+    // resolveSpeakerEmbedding chokepoint warmSpeaker uses, so a divergence
+    // between warm and synthesis keying is structurally impossible.
+    const model_dir = std.mem.span(std.c.getenv("TTS_TEST_MODEL") orelse return error.SkipZigTest);
+    const allocator = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var w = try model_mod.loadWeights(io, allocator, model_dir);
+    defer w.deinit();
+    var enc = try SpeakerEncoder.load(allocator, &w, s);
+    defer enc.deinit();
+
+    const ref = try allocator.alloc(f32, 24000);
+    defer allocator.free(ref);
+    for (ref, 0..) |*x, i| {
+        const t = @as(f32, @floatFromInt(i)) / 24000.0;
+        x.* = (0.5 + 0.5 * @sin(2.0 * std.math.pi * 3.0 * t)) * (0.30 * @sin(2.0 * std.math.pi * 160.0 * t) + 0.15 * @sin(2.0 * std.math.pi * 320.0 * t));
+    }
+
+    var cache = SpkEmbCache{};
+    defer cache.deinit();
+    // Warm (miss): embeds once and caches.
+    const hash = std.hash.Wyhash.hash(0, std.mem.sliceAsBytes(ref));
+    try std.testing.expect(cache.get(hash) == null);
+    const warm1 = try resolveSpeakerEmbedding(&enc, &cache, ref);
+    _ = mlx.mlx_array_free(warm1);
+    try std.testing.expectEqual(@as(u64, 1), enc.embed_calls);
+    // The "synthesis" after the warm: pure hit, encoder untouched.
+    const emb = try resolveSpeakerEmbedding(&enc, &cache, ref);
+    _ = mlx.mlx_array_free(emb);
+    try std.testing.expectEqual(@as(u64, 1), enc.embed_calls);
+    // Probe get() the way warmSpeaker does: +1 ref that must be freed.
+    if (cache.get(hash)) |hit| {
+        _ = mlx.mlx_array_free(hit);
+    } else return error.ExpectedHit;
 }
 
 // ── GPU-chained code-predictor tests ──

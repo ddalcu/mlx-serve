@@ -1267,3 +1267,40 @@ grid, or template arg derived from an input shape must key on the FULL shape via
 "same element count" is not "same geometry". Also note the observability lesson: a mislabeled
 elementwise output is byte-correct and only crashes when a downstream op checks shapes; a
 BROADCASTABLE collision would have been silently wrong instead.
+
+## Quantized-KV fused decode reads (2026-07-30, docs/kv-quant-perf.md round)
+
+Three war stories from one round, each already distilled into a `## Rules` line:
+
+**1. The fused flag was a silent no-op on the live decode path.** `--kv-attn-mode fused`
+existed, parsed, was documented, had an equivalence script — and engaged on NOTHING. The
+decode forward calls `cache.update()`, whose affine arm returned its `DenseKVView` WITHOUT
+the quant triples; only the read-only `denseView()` (used by batched decode + diffusion,
+both deliberately excluded) set them. Every "fused vs dense" measurement to date compared
+dense against dense and read neutral. Same class as the two hardcoded `use_drafter=false`
+call sites: output-equality tests structurally cannot see a silent fallback — the
+equivalence script now FAILS unless the fused arm logs both `[kv-attn] fused engaged` and
+`[kv-attn] decode kernel engaged` and the dense arm logs neither.
+
+**2. `0 × -inf = NaN`, and every parity loop was NaN-blind.** The composed causal arm built
+its additive mask as `triu(ones) * -inf` — below the diagonal that is 0 × -inf = NaN, which
+softmax propagates everywhere. Live symptom: gemma-4-e4b answered `<pad><pad>` to any short
+prompt under the (finally-engaged) fused mode; layer-by-layer live diff showed maxdiff=nan
+from the FIRST "causal" layer onward. It shipped green because every parity comparison in
+kv_quant.zig/transformer.zig used `if (e > max_err) max_err = e` — `NaN > x` is FALSE, so an
+all-NaN candidate scores max_err 0 and PASSES. Both fixed together: masks via `mlx_where`,
+and every parity loop asserts `!isNan` per element BEFORE the diff (red-on-revert verified:
+un-fixing the mask fails 4 tests).
+
+**3. The decode kernel's first two designs lost by 5x and 1.7x — both occupancy, not math.**
+v1 (one threadgroup per q head, per-row simd_sum online-softmax chain) starved the GPU: 48
+threadgroups, serial reduction+exp chain per row. v2 (block-parallel two-phase, 2048-row
+blocks) had the right shape but 24-28 KiB of threadgroup memory per group → ~1 threadgroup
+resident per core → no latency hiding (1.9 ms vs dense 1.1 at 48/8 32K). Same kernel at
+≤10 KiB (256-row blocks) wins every ≥32K cell. The µbench→live ladder: 5.7 → 1.9 → 0.83 ms
+against dense 1.10. Live A/B (same boot, per-request `kv_attn_mode` interleave, prefix cache
+serving the long prompt so requests measure DECODE): Laguna XS +10% @10.7K, +56% @42K;
+Qwen3.6-27B +26% @37K — and a −2% regression when Laguna's 512-window sliding layers fused,
+which is where the per-layer `KV_ATTN_FUSED_MIN_TK` floor comes from. The wired-site lesson
+repeated mid-round: the first Laguna A/B read EXACTLY neutral because `lagunaAttnWith` was
+not yet wired and both arms ran dense — the engagement grep (0) was the tell.

@@ -331,6 +331,10 @@ final class VoiceModeController: ObservableObject {
         hasRecognizedSpeech = false
         send(.start)
         isActive = true
+        // Fire-and-forget: pre-embed a clone reference clip NOW so the first
+        // spoken sentence starts from a warm speaker-embedding cache
+        // (docs/qwentts-cache.md — the only lever for the first sentence).
+        synthesizer.prewarm()
         disarmFollowUp()              // a fresh session always starts behind the wake word
         startListening()
         return state == .listening

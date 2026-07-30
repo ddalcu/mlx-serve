@@ -9,6 +9,11 @@
 #         output (the kill switch restores the uncached path exactly) and no
 #         cache-hit line ever appears
 #   [4/4] cache-on and cache-off never disagree on the different-clip output
+#   [5/5] warm_only pre-warm (docs/qwentts-cache.md): warm b -> {"cache":"miss"},
+#         warm b again -> {"cache":"hit"}, the FIRST synthesis after the warm
+#         logs a cache hit (the first-sentence win the endpoint exists for),
+#         its WAV is byte-identical to the unwarmed boot's, and warm_only
+#         without ref_audio is a named 400
 # Usage: TTS_MODEL=<dir> ./tests/test_tts_clone_cache.sh [port]
 set -euo pipefail
 PORT="${1:-11378}"
@@ -39,6 +44,8 @@ for name in ('a', 'b'):
     b64 = base64.b64encode(open(os.path.join(tmp, name + '.wav'), 'rb').read()).decode()
     body = {'input': 'The cache must never change what a voice sounds like.', 'ref_audio': b64}
     json.dump(body, open(os.path.join(tmp, 'req_' + name + '.json'), 'w'))
+    json.dump({'warm_only': True, 'ref_audio': b64}, open(os.path.join(tmp, 'warm_' + name + '.json'), 'w'))
+json.dump({'warm_only': True}, open(os.path.join(tmp, 'warm_noref.json'), 'w'))
 PY
 
 wait_up() { # $1 = log
@@ -85,3 +92,20 @@ cmp -s "$TMP/off_a1.wav" "$TMP/off_a2.wav" || { echo "FAIL: [3/4] uncached path 
 echo "PASS: [3/4] kill switch: uncached path engaged, output byte-identical to cached"
 cmp -s "$TMP/on_b.wav" "$TMP/off_b.wav" || { echo "FAIL: [4/4] different-clip WAV disagrees across cache modes"; exit 1; }
 echo "PASS: [4/4] cache modes agree on the second voice too"
+
+# ── Boot 3: warm_only pre-warm ──
+LOG_WARM="$TMP/server_warm.log"
+"$BIN" --model "$MODEL" --serve --port "$PORT" >"$LOG_WARM" 2>&1 &
+SRV=$!
+wait_up "$LOG_WARM"
+W1=$(curl -s -X POST "http://127.0.0.1:$PORT/v1/audio/speech" -H 'Content-Type: application/json' --data @"$TMP/warm_b.json")
+echo "$W1" | grep -q '"cache":"miss"' || { echo "FAIL: [5/5] first warm did not report miss: $W1"; exit 1; }
+W2=$(curl -s -X POST "http://127.0.0.1:$PORT/v1/audio/speech" -H 'Content-Type: application/json' --data @"$TMP/warm_b.json")
+echo "$W2" | grep -q '"cache":"hit"' || { echo "FAIL: [5/5] second warm did not report hit: $W2"; exit 1; }
+speak "$TMP/req_b.json" "$TMP/warm_b1.wav"
+grep -q "speaker embedding: cache hit" "$LOG_WARM" || { echo "FAIL: [5/5] first synthesis after warm was not a cache hit"; exit 1; }
+cmp -s "$TMP/warm_b1.wav" "$TMP/on_b.wav" || { echo "FAIL: [5/5] warmed WAV differs from unwarmed boot's"; exit 1; }
+CODE=$(curl -s -o "$TMP/warm_err.json" -w "%{http_code}" -X POST "http://127.0.0.1:$PORT/v1/audio/speech" -H 'Content-Type: application/json' --data @"$TMP/warm_noref.json")
+[ "$CODE" = "400" ] || { echo "FAIL: [5/5] warm_only without ref_audio -> $CODE (want 400)"; exit 1; }
+kill $SRV 2>/dev/null || true; wait $SRV 2>/dev/null || true; SRV=""
+echo "PASS: [5/5] warm_only: miss then hit, first synthesis hits, named 400 without ref"

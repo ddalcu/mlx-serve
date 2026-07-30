@@ -130,6 +130,62 @@ final class ClonedVoiceSynthesizerTests: XCTestCase {
         XCTAssertEqual(body["input"] as? String, "hi")
     }
 
+    // MARK: - Pre-warm (docs/qwentts-cache.md first-sentence lever)
+
+    func testWarmBodyCarriesWarmOnlyAndRefAudioNeverInput() {
+        let tmp = URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("clip-\(UUID().uuidString).wav")
+        try? Data("RIFFfake".utf8).write(to: tmp)
+        defer { try? FileManager.default.removeItem(at: tmp) }
+
+        let body = VoiceCloneTTS.warmBody(model: "m", voice: .clone(clipPath: tmp.path))
+        XCTAssertNotNil(body)
+        XCTAssertEqual(body?["warm_only"] as? Bool, true)
+        XCTAssertNotNil(body?["ref_audio"], "the clip must be base64'd into the warm body")
+        XCTAssertNil(body?["input"], "a warm body with text would synthesize audio nobody asked for")
+        XCTAssertNil(body?["voice"])
+    }
+
+    func testWarmBodyIsNilForKokoroAndUnreadableClips() {
+        XCTAssertNil(VoiceCloneTTS.warmBody(model: "m", voice: .kokoro(voice: "af_bella")),
+                     "Kokoro voices are a table lookup — nothing to warm")
+        XCTAssertNil(VoiceCloneTTS.warmBody(model: "m", voice: .clone(clipPath: "/no/such/clip.wav")))
+    }
+
+    func testPrewarmFiresOnlyForACloneVoice() async {
+        let system = FakeSystemSynth()
+        var warmed: [NeuralVoice] = []
+        let fired = expectation(description: "warm fired")
+        let clone = ClonedVoiceSynthesizer(
+            system: system,
+            voice: { .clone(clipPath: "/clips/me.wav") },
+            synthesizeClone: { _, _ in nil },
+            playClone: { _ in },
+            prewarmClone: { sel in warmed.append(sel); fired.fulfill() })
+        clone.prewarm()
+        await fulfillment(of: [fired], timeout: 2)
+        XCTAssertEqual(warmed, [.clone(clipPath: "/clips/me.wav")])
+
+        // Kokoro / no voice: the closure must never fire.
+        var wrongWarms = 0
+        let kokoro = ClonedVoiceSynthesizer(
+            system: FakeSystemSynth(),
+            voice: { .kokoro(voice: "af_bella") },
+            synthesizeClone: { _, _ in nil },
+            playClone: { _ in },
+            prewarmClone: { _ in wrongWarms += 1 })
+        kokoro.prewarm()
+        let none = ClonedVoiceSynthesizer(
+            system: FakeSystemSynth(),
+            voice: { nil },
+            synthesizeClone: { _, _ in nil },
+            playClone: { _ in },
+            prewarmClone: { _ in wrongWarms += 1 })
+        none.prewarm()
+        // Give any stray Task a beat to run before asserting it didn't.
+        try? await Task.sleep(nanoseconds: 100_000_000)
+        XCTAssertEqual(wrongWarms, 0, "only the clone arm has anything to warm")
+    }
+
     // MARK: - Routing
 
     func testClipSetRoutesThroughClonePipelineInOrderAndDrains() async {

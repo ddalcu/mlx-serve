@@ -452,10 +452,9 @@ pub fn dequantizeAffine(
 //   k_q/sc/bi    : K affine-quantized along last axis (D). Shape of the
 //                  triple is whatever `mlx_quantize` produced.
 //   v_q/sc/bi    : V same as K.
-// GQA: when H > H_kv, `mlx_quantized_matmul` is responsible for
-// broadcasting the leading head dim — same way `mlx_matmul` does. If the
-// model uses head ratios that aren't natively supported, callers should
-// expand K/V (or fall through to the dense path) before invoking this.
+// GQA: when H > H_kv, Q is RESHAPED down to H_kv groups of g·T_q rows
+// (never the triples expanded up to H_q — that materializes the packed
+// bank ×g per layer per token). See the body comment in `quantAttention`.
 
 /// A read-only borrow of a `QuantizedKV` triple — the cache owns the
 /// arrays; the call site borrows them for the duration of one attention.
@@ -487,82 +486,55 @@ pub fn quantAttention(
     mask_arr: mlx.mlx_array,
     s: mlx.mlx_stream,
 ) !mlx.mlx_array {
-    // GQA expansion. mlx_quantized_matmul does not broadcast across the
-    // head dim the way mlx_fast_scaled_dot_product_attention does, so for
-    // models with H_q > H_kv (Gemma 4 E4B: 8 vs 2, Qwen 3.5: 32 vs 8,
-    // every modern GQA arch) we need to either repeat K/V to match H_q or
-    // reshape Q down to H_kv groups. We pick repeat: it's one op per K
-    // and V triple component (q/scales/biases), and mlx makes the result
-    // a stride-0 view so the underlying memory isn't duplicated until
-    // the kernel reads it.
+    // GQA handling (docs/kv-quant-perf.md Phase 1). mlx_quantized_matmul
+    // does not broadcast across the head dim the way
+    // mlx_fast_scaled_dot_product_attention does, and expanding the K/V
+    // triples to H_q materializes the packed bank ×(H_q/H_kv) per layer per
+    // token (mlx_quantized_matmul makes non-contiguous operands contiguous
+    // on read). Instead we reshape Q the other way:
+    //   [B, H_q, T_q, D] → [B, H_kv, g·T_q, D]   where g = H_q / H_kv.
+    // Pure relabel in logical row-major order: element (b, hkv·g+gi, t, d)
+    // maps to row r = gi·T_q + t of block hkv. The packed triples are then
+    // read IN PLACE with no expansion at all; the output reshapes back.
+    // Masking under grouped rows: row r is query position r % T_q, so a
+    // [T_q, T_k] mask TILED g times along rows (g-major, matching the row
+    // order above) masks every group identically.
     const q_shape = mlx.getShape(q_dense);
     if (q_shape.len < 4) return error.UnexpectedQShape;
     const k_q_shape = mlx.getShape(k_triple.q);
     if (k_q_shape.len < 4) return error.UnexpectedKShape;
+    const B: c_int = q_shape[0];
     const H_q: c_int = q_shape[1];
+    const T_q: c_int = q_shape[2];
+    const D: c_int = q_shape[3];
     const H_kv: c_int = k_q_shape[1];
-    const need_gqa = H_q != H_kv;
-    const repeats: c_int = if (need_gqa) @divExact(H_q, H_kv) else 1;
+    if (H_kv <= 0 or @mod(H_q, H_kv) != 0) return error.UnsupportedGqaRatio;
+    const g: c_int = @divExact(H_q, H_kv);
 
-    // Owned-or-borrowed expansion for each triple component. When
-    // `need_gqa == false` everything aliases the caller's borrows.
-    var k_q_used = k_triple.q;
-    var k_sc_used = k_triple.scales;
-    var k_bi_used = k_triple.biases;
-    var v_q_used = v_triple.q;
-    var v_sc_used = v_triple.scales;
-    var v_bi_used = v_triple.biases;
-    var owns_k_q = false;
-    var owns_k_sc = false;
-    var owns_k_bi = false;
-    var owns_v_q = false;
-    var owns_v_sc = false;
-    var owns_v_bi = false;
-    defer {
-        if (owns_k_q) _ = mlx.mlx_array_free(k_q_used);
-        if (owns_k_sc) _ = mlx.mlx_array_free(k_sc_used);
-        if (owns_k_bi) _ = mlx.mlx_array_free(k_bi_used);
-        if (owns_v_q) _ = mlx.mlx_array_free(v_q_used);
-        if (owns_v_sc) _ = mlx.mlx_array_free(v_sc_used);
-        if (owns_v_bi) _ = mlx.mlx_array_free(v_bi_used);
-    }
-    if (need_gqa) {
-        var t = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_repeat_axis(&t, k_triple.q, repeats, 1, s));
-        k_q_used = t;
-        owns_k_q = true;
-        t = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_repeat_axis(&t, k_triple.scales, repeats, 1, s));
-        k_sc_used = t;
-        owns_k_sc = true;
-        t = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_repeat_axis(&t, k_triple.biases, repeats, 1, s));
-        k_bi_used = t;
-        owns_k_bi = true;
-        t = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_repeat_axis(&t, v_triple.q, repeats, 1, s));
-        v_q_used = t;
-        owns_v_q = true;
-        t = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_repeat_axis(&t, v_triple.scales, repeats, 1, s));
-        v_sc_used = t;
-        owns_v_sc = true;
-        t = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_repeat_axis(&t, v_triple.biases, repeats, 1, s));
-        v_bi_used = t;
-        owns_v_bi = true;
+    // Group Q down to H_kv blocks. Borrow when g == 1 (no GQA).
+    var q_used = q_dense;
+    var owns_q = false;
+    defer if (owns_q) {
+        _ = mlx.mlx_array_free(q_used);
+    };
+    if (g > 1) {
+        const gshape = [_]c_int{ B, H_kv, g * T_q, D };
+        var qg = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_reshape(&qg, q_dense, &gshape, 4, s));
+        q_used = qg;
+        owns_q = true;
     }
 
     // 1) scores = Q @ K^T. transpose_w=true contracts on K's quantized
-    //    last axis (D), the same dim Q contracts. Output: [B, H, T_q, T_k].
+    //    last axis (D), the same dim Q contracts. Output: [B, H_kv, g·T_q, T_k].
     var scores = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(scores);
     try mlx.check(mlx.mlx_quantized_matmul(
         &scores,
-        q_dense,
-        k_q_used,
-        k_sc_used,
-        k_bi_used,
+        q_used,
+        k_triple.q,
+        k_triple.scales,
+        k_triple.biases,
         true,
         mlx.mlx_optional_int.some(@intCast(group_size)),
         mlx.mlx_optional_int.some(@intCast(bits)),
@@ -588,21 +560,21 @@ pub fn quantAttention(
         if (owns_pre) _ = mlx.mlx_array_free(pre_softmax);
     }
     if (std.mem.eql(u8, mask_mode, "causal")) {
-        // Causal mask: upper-triangular `-inf` matching scores shape
-        // `[..., T_q, T_k]`. For decode (T_q == 1) the mask is identically
-        // zero so we skip building it.
+        // Causal mask over the UNGROUPED query axis: T_q comes from the
+        // caller's Q shape, never from the (possibly grouped) scores rows.
+        // For decode (T_q == 1) every grouped row is the same position and
+        // the mask is identically zero — skip building it.
         const scores_shape = mlx.getShape(scaled);
         if (scores_shape.len < 2) return error.UnexpectedShape;
-        const t_q: c_int = scores_shape[scores_shape.len - 2];
         const t_k: c_int = scores_shape[scores_shape.len - 1];
-        if (t_q == 1) {
+        if (T_q == 1) {
             pre_softmax = scaled;
         } else {
             // Build a `[T_q, T_k]` additive mask: -inf above the diagonal
             // anchored to the right edge (Q position 0 corresponds to
             // K position (T_k - T_q)).
-            const offset: c_int = t_k - t_q;
-            const shape2 = [_]c_int{ t_q, t_k };
+            const offset: c_int = t_k - T_q;
+            const shape2 = [_]c_int{ T_q, t_k };
             var ones2 = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(ones2);
             try mlx.check(mlx.mlx_ones(&ones2, &shape2, 2, .bfloat16, s));
@@ -616,18 +588,59 @@ pub fn quantAttention(
             var neg_inf_bf16 = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(neg_inf_bf16);
             try mlx.check(mlx.mlx_astype(&neg_inf_bf16, neg_inf, .bfloat16, s));
+            // mask = where(upper, -inf, 0). NEVER `upper * -inf`: the
+            // below-diagonal zeros make 0 x -inf = NaN, which poisons the
+            // whole softmax (live symptom: gemma answered "<pad><pad>" —
+            // caught only once the parity loops became NaN-aware).
+            const half = mlx.mlx_array_new_float(0.5);
+            defer _ = mlx.mlx_array_free(half);
+            var upper_bool = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(upper_bool);
+            try mlx.check(mlx.mlx_greater(&upper_bool, upper, half, s));
+            const zero_f = mlx.mlx_array_new_float(0.0);
+            defer _ = mlx.mlx_array_free(zero_f);
+            var zero_bf16 = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(zero_bf16);
+            try mlx.check(mlx.mlx_astype(&zero_bf16, zero_f, .bfloat16, s));
             var add_mask = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(add_mask);
-            // mask = upper * -inf → -inf above diag, 0 elsewhere.
-            try mlx.check(mlx.mlx_multiply(&add_mask, upper, neg_inf_bf16, s));
+            try mlx.check(mlx.mlx_where(&add_mask, upper_bool, neg_inf_bf16, zero_bf16, s));
+            // Tile g-major along rows so every Q-group sees the same mask.
+            var tiled_mask = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(tiled_mask);
+            if (g > 1) {
+                const reps = [_]c_int{ g, 1 };
+                try mlx.check(mlx.mlx_tile(&tiled_mask, add_mask, &reps, 2, s));
+            } else {
+                try mlx.check(mlx.mlx_array_set(&tiled_mask, add_mask));
+            }
             pre_softmax = mlx.mlx_array_new();
             owns_pre = true;
-            try mlx.check(mlx.mlx_add(&pre_softmax, scaled, add_mask, s));
+            try mlx.check(mlx.mlx_add(&pre_softmax, scaled, tiled_mask, s));
         }
     } else if (std.mem.eql(u8, mask_mode, "array")) {
+        // External additive mask `[..., T_q, T_k]`. When Q is grouped and
+        // T_q > 1 the mask's row axis must be tiled ×g (g-major). At
+        // T_q == 1 the mask row broadcasts over the g grouped rows as-is.
+        var mask_used = mask_arr;
+        var owns_mask = false;
+        defer if (owns_mask) {
+            _ = mlx.mlx_array_free(mask_used);
+        };
+        if (g > 1 and T_q > 1) {
+            const m_shape = mlx.getShape(mask_arr);
+            if (m_shape.len < 2) return error.UnexpectedMaskShape;
+            var reps_buf: [8]c_int = .{ 1, 1, 1, 1, 1, 1, 1, 1 };
+            if (m_shape.len > reps_buf.len) return error.UnexpectedMaskShape;
+            reps_buf[m_shape.len - 2] = g;
+            var tm = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_tile(&tm, mask_arr, &reps_buf, m_shape.len, s));
+            mask_used = tm;
+            owns_mask = true;
+        }
         pre_softmax = mlx.mlx_array_new();
         owns_pre = true;
-        try mlx.check(mlx.mlx_add(&pre_softmax, scaled, mask_arr, s));
+        try mlx.check(mlx.mlx_add(&pre_softmax, scaled, mask_used, s));
     } else {
         // No mask: borrow `scaled` for the softmax input.
         pre_softmax = scaled;
@@ -645,20 +658,31 @@ pub fn quantAttention(
     //    (T_k) with V's second-to-last (T_k) — V's quantized last axis
     //    (D) becomes the output dim. mlx_quantized_matmul dequantizes V
     //    on-the-fly without materializing a dense intermediate.
-    var out = mlx.mlx_array_new();
-    errdefer _ = mlx.mlx_array_free(out);
+    var out_grouped = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(out_grouped);
     try mlx.check(mlx.mlx_quantized_matmul(
-        &out,
+        &out_grouped,
         attn,
-        v_q_used,
-        v_sc_used,
-        v_bi_used,
+        v_triple.q,
+        v_triple.scales,
+        v_triple.biases,
         false,
         mlx.mlx_optional_int.some(@intCast(group_size)),
         mlx.mlx_optional_int.some(@intCast(bits)),
         "affine",
         s,
     ));
+
+    // 6) Ungroup: [B, H_kv, g·T_q, D] → [B, H_q, T_q, D] (same relabel,
+    //    inverted). No-op reshape when g == 1.
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    if (g > 1) {
+        const oshape = [_]c_int{ B, H_q, T_q, D };
+        try mlx.check(mlx.mlx_reshape(&out, out_grouped, &oshape, 4, s));
+    } else {
+        try mlx.check(mlx.mlx_array_set(&out, out_grouped));
+    }
     return out;
 }
 
@@ -742,6 +766,7 @@ test "quantizeAffine + dequantizeAffine round-trip at 4 bits" {
     try testing.expectEqual(orig.len, got.len);
     var max_err: f32 = 0;
     for (orig, got) |o, g| {
+        try testing.expect(!std.math.isNan(g));
         const e = @abs(o - g);
         if (e > max_err) max_err = e;
     }
@@ -771,6 +796,7 @@ test "quantizeAffine + dequantizeAffine round-trip at 8 bits" {
 
     var max_err: f32 = 0;
     for (orig, got) |o, g| {
+        try testing.expect(!std.math.isNan(g));
         const e = @abs(o - g);
         if (e > max_err) max_err = e;
     }
@@ -993,6 +1019,7 @@ test "mlx_quantized_matmul transpose=true matches dequant+matmul (4-bit, 4D)" {
     var max_err: f32 = 0;
     var max_ref: f32 = 0;
     for (ref_flat, cand_flat) |r, c| {
+        try testing.expect(!std.math.isNan(c));
         const e = @abs(r - c);
         if (e > max_err) max_err = e;
         if (@abs(r) > max_ref) max_ref = @abs(r);
@@ -1056,6 +1083,10 @@ test "mlx_quantized_matmul transpose=false matches dequant+matmul (4-bit, 4D)" {
     defer testing.allocator.free(cand_flat);
     var max_err: f32 = 0;
     for (ref_flat, cand_flat) |r, c| {
+        // NaN-blind comparisons pass on an all-NaN candidate (NaN > x is
+        // false) — the composed causal arm shipped NaN for months behind
+        // exactly this hole. Finiteness is asserted BEFORE the diff.
+        try testing.expect(!std.math.isNan(c));
         const e = @abs(r - c);
         if (e > max_err) max_err = e;
     }
@@ -1123,11 +1154,308 @@ test "quantAttention matches dense SDPA at 4-bit (decode, T_q=1)" {
     try testing.expectEqual(ref_flat.len, cand_flat.len);
     var max_err: f32 = 0;
     for (ref_flat, cand_flat) |r, c| {
+        // NaN-blind comparisons pass on an all-NaN candidate (NaN > x is
+        // false) — the composed causal arm shipped NaN for months behind
+        // exactly this hole. Finiteness is asserted BEFORE the diff.
+        try testing.expect(!std.math.isNan(c));
         const e = @abs(r - c);
         if (e > max_err) max_err = e;
     }
     // Matches the bf16 reduction tolerance used elsewhere in this file.
     try testing.expect(max_err < 0.05);
+}
+
+test "quantAttention reshapes Q for GQA instead of repeating K/V triples" {
+    // Phase 1 (docs/kv-quant-perf.md): the GQA repeat materializes the packed
+    // bank ×(H_q/H_kv) per layer per token — the reshape-Q form reads the
+    // triples IN PLACE. Pin that the repeat op never comes back. The needle
+    // is concatenated so this test's own source can't match it.
+    const src = @embedFile("kv_quant.zig");
+    const start = std.mem.indexOf(u8, src, "pub fn quantAttention").?;
+    const end = std.mem.indexOfPos(u8, src, start, "// ── Tests ──").?;
+    const body = src[start..end];
+    try testing.expect(std.mem.indexOf(u8, body, "mlx_repeat" ++ "_axis") == null);
+}
+
+/// Shared harness for the grouped-Q GQA parity tests: build smooth Q at
+/// `[1, H_q, T_q, D]` and K/V at `[1, H_kv, T_k, D]`, quantize K/V, then
+/// compare `quantAttention` against dense SDPA fed the SAME dequantized K/V
+/// (no-worse-than-reference — quantization error folds into both paths;
+/// what's under test is the grouped-Q contraction + mask tiling).
+fn gqaParityCase(
+    H_q: c_int,
+    H_kv: c_int,
+    T_q: c_int,
+    T_k: c_int,
+    bits: u8,
+    mask_mode: [:0]const u8,
+    mask_arr: mlx.mlx_array,
+) !void {
+    return gqaParityCaseD(H_q, H_kv, T_q, T_k, 64, bits, mask_mode, mask_arr);
+}
+
+fn gqaParityCaseD(
+    H_q: c_int,
+    H_kv: c_int,
+    T_q: c_int,
+    T_k: c_int,
+    D: c_int,
+    bits: u8,
+    mask_mode: [:0]const u8,
+    mask_arr: mlx.mlx_array,
+) !void {
+    const s = mlx.gpuStream();
+    const q = try buildSmoothBHTD(s, 1, H_q, T_q, D);
+    defer _ = mlx.mlx_array_free(q);
+    const k_dense = try buildSmoothBHTD(s, 1, H_kv, T_k, D);
+    defer _ = mlx.mlx_array_free(k_dense);
+    const v_dense = try buildSmoothBHTD(s, 1, H_kv, T_k, D);
+    defer _ = mlx.mlx_array_free(v_dense);
+
+    var qk = try quantizeAffine(s, k_dense, 64, bits);
+    defer qk.deinit();
+    var qv = try quantizeAffine(s, v_dense, 64, bits);
+    defer qv.deinit();
+
+    const k_ref = try dequantizeAffine(s, qk.q, qk.scales, qk.biases, 64, bits);
+    defer _ = mlx.mlx_array_free(k_ref);
+    const v_ref = try dequantizeAffine(s, qv.q, qv.scales, qv.biases, 64, bits);
+    defer _ = mlx.mlx_array_free(v_ref);
+
+    const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(D)));
+    var ref = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ref);
+    // MLX's fast SDPA broadcasts GQA natively (H_q vs H_kv).
+    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(
+        &ref,
+        q,
+        k_ref,
+        v_ref,
+        scale,
+        mask_mode,
+        mask_arr,
+        .{ .ctx = null },
+        s,
+    ));
+
+    const cand = try quantAttention(
+        q,
+        .{ .q = qk.q, .scales = qk.scales, .biases = qk.biases },
+        .{ .q = qv.q, .scales = qv.scales, .biases = qv.biases },
+        bits,
+        64,
+        scale,
+        mask_mode,
+        mask_arr,
+        s,
+    );
+    defer _ = mlx.mlx_array_free(cand);
+
+    // Output shape must be the ungrouped [1, H_q, T_q, D].
+    const cand_shape = mlx.getShape(cand);
+    try testing.expectEqual(@as(usize, 4), cand_shape.len);
+    try testing.expectEqual(H_q, cand_shape[1]);
+    try testing.expectEqual(T_q, cand_shape[2]);
+    try testing.expectEqual(D, cand_shape[3]);
+
+    const ref_flat = try readF32Flat(s, ref, testing.allocator);
+    defer testing.allocator.free(ref_flat);
+    const cand_flat = try readF32Flat(s, cand, testing.allocator);
+    defer testing.allocator.free(cand_flat);
+    try testing.expectEqual(ref_flat.len, cand_flat.len);
+    var max_err: f32 = 0;
+    for (ref_flat, cand_flat) |r, c| {
+        // NaN-blind comparisons pass on an all-NaN candidate (NaN > x is
+        // false) — the composed causal arm shipped NaN for months behind
+        // exactly this hole. Finiteness is asserted BEFORE the diff.
+        try testing.expect(!std.math.isNan(c));
+        const e = @abs(r - c);
+        if (e > max_err) max_err = e;
+    }
+    if (max_err >= 0.05) {
+        std.debug.print("gqaParityCase Hq={d} Hkv={d} Tq={d} Tk={d} D={d} bits={d} mode={s}: max_err={d}\n", .{ H_q, H_kv, T_q, T_k, D, bits, mask_mode, max_err });
+    }
+    try testing.expect(max_err < 0.05);
+}
+
+test "quantAttention GQA 4:1 decode (T_q=1) matches dense SDPA, 4/8-bit" {
+    const none = mlx.mlx_array{ .ctx = null };
+    try gqaParityCase(8, 2, 1, 16, 4, "", none);
+    try gqaParityCase(8, 2, 1, 16, 8, "", none);
+}
+
+test "quantAttention GQA 6:1 decode (T_q=1) matches dense SDPA (laguna ratio)" {
+    const none = mlx.mlx_array{ .ctx = null };
+    try gqaParityCase(48, 8, 1, 24, 8, "", none);
+}
+
+test "quantAttention GQA 4:1 causal T_q=4 matches dense SDPA" {
+    const none = mlx.mlx_array{ .ctx = null };
+    try gqaParityCase(8, 2, 4, 12, 4, "causal", none);
+    try gqaParityCase(8, 2, 4, 12, 8, "causal", none);
+}
+
+test "quantAttention GQA 6:1 causal T_q=9 matches dense SDPA (MTP verify width)" {
+    const none = mlx.mlx_array{ .ctx = null };
+    try gqaParityCase(12, 2, 9, 24, 8, "causal", none);
+}
+
+test "quantAttention GQA 4:1 causal at gemma geometry (D=256, T=15, 4-bit)" {
+    // The exact live shape that answered "<pad><pad>" on gemma-4-e4b under
+    // --kv-attn-mode fused (Hq=8, Hkv=2, hd 256, 4-bit, 15-token prefill).
+    const none = mlx.mlx_array{ .ctx = null };
+    try gqaParityCaseD(8, 2, 15, 15, 256, 4, "causal", none);
+}
+
+test "quantAttention GQA 4:1 array mask T_q=4 matches dense SDPA" {
+    const s = mlx.gpuStream();
+    // Additive [1, 1, 4, 12] mask: block the first 3 kv positions for every
+    // query row (sliding-window-ish shape), 0 elsewhere.
+    const t_q: usize = 4;
+    const t_k: usize = 12;
+    var buf: [t_q * t_k]f32 = undefined;
+    for (0..t_q) |r| {
+        for (0..t_k) |c| {
+            buf[r * t_k + c] = if (c < 3) -std.math.inf(f32) else 0.0;
+        }
+    }
+    const shape = [_]c_int{ 1, 1, t_q, t_k };
+    const mask_f32 = mlx.mlx_array_new_data(&buf, &shape, 4, .float32);
+    defer _ = mlx.mlx_array_free(mask_f32);
+    var mask_bf16 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(mask_bf16);
+    try mlx.check(mlx.mlx_astype(&mask_bf16, mask_f32, .bfloat16, s));
+
+    try gqaParityCase(8, 2, 4, 12, 8, "array", mask_bf16);
+}
+
+test "kv-quant decode µbench (env-gated: MLX_SERVE_KVQ_UBENCH=1)" {
+    // Phase 0 deliverable (docs/kv-quant-perf.md): time the three decode
+    // read paths at T_q=1 — (a) fused grouped-Q quantAttention, (b) dense
+    // mode (full-cache dequant + SDPA, what --kv-quant users get today),
+    // (c) kv-quant off (SDPA over resident dense K/V). µbench wins can lose
+    // live — this SCOPES the work; the live A/B decides defaults.
+    const raw = std.c.getenv("MLX_SERVE_KVQ_UBENCH");
+    if (raw == null or std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0")) return;
+
+    const s = mlx.gpuStream();
+    const D: c_int = 128;
+    const ratios = [_][2]c_int{ .{ 8, 8 }, .{ 32, 8 }, .{ 48, 8 } };
+    const lens = [_]c_int{ 2048, 8192, 32768 };
+    const bits_list = [_]u8{ 4, 8 };
+    const iters: usize = 20;
+    const warmup: usize = 3;
+
+    std.debug.print("\n[kvq-ubench] Hq/Hkv  T_k    bits  fused_ms  dense_ms  off_ms\n", .{});
+    for (ratios) |r| {
+        const H_q = r[0];
+        const H_kv = r[1];
+        for (lens) |T_k| {
+            for (bits_list) |bits| {
+                const q = try buildSmoothBHTD(s, 1, H_q, 1, D);
+                defer _ = mlx.mlx_array_free(q);
+                const k_dense = try buildSmoothBHTD(s, 1, H_kv, T_k, D);
+                defer _ = mlx.mlx_array_free(k_dense);
+                const v_dense = try buildSmoothBHTD(s, 1, H_kv, T_k, D);
+                defer _ = mlx.mlx_array_free(v_dense);
+                var qk = try quantizeAffine(s, k_dense, 64, bits);
+                defer qk.deinit();
+                var qv = try quantizeAffine(s, v_dense, 64, bits);
+                defer qv.deinit();
+                const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(D)));
+                const none = mlx.mlx_array{ .ctx = null };
+
+                // Pre-evaluate inputs so setup cost never bills a path.
+                {
+                    const ev = mlx.mlx_vector_array_new();
+                    defer _ = mlx.mlx_vector_array_free(ev);
+                    _ = mlx.mlx_vector_array_append_value(ev, q);
+                    _ = mlx.mlx_vector_array_append_value(ev, k_dense);
+                    _ = mlx.mlx_vector_array_append_value(ev, qk.q);
+                    _ = mlx.mlx_vector_array_append_value(ev, qv.q);
+                    try mlx.check(mlx.mlx_eval(ev));
+                }
+
+                // This Zig nightly has no std.time.Timer; time via std.Io
+                // (same pattern as transformer.zig's ProfClock).
+                const io = std.Io.Threaded.global_single_threaded.io();
+                var mark = std.Io.Timestamp.now(io, .boot);
+                const Lap = struct {
+                    fn reset(m: *std.Io.Timestamp, io_: std.Io) void {
+                        m.* = std.Io.Timestamp.now(io_, .boot);
+                    }
+                    fn read(m: *const std.Io.Timestamp, io_: std.Io) u64 {
+                        return @intCast(m.untilNow(io_, .boot).nanoseconds);
+                    }
+                };
+
+                // (a) fused grouped-Q
+                var fused_ns: u64 = 0;
+                for (0..warmup + iters) |i| {
+                    if (i == warmup) Lap.reset(&mark, io);
+                    const out = try quantAttention(
+                        q,
+                        .{ .q = qk.q, .scales = qk.scales, .biases = qk.biases },
+                        .{ .q = qv.q, .scales = qv.scales, .biases = qv.biases },
+                        bits,
+                        64,
+                        scale,
+                        "",
+                        none,
+                        s,
+                    );
+                    defer _ = mlx.mlx_array_free(out);
+                    const ev = mlx.mlx_vector_array_new();
+                    defer _ = mlx.mlx_vector_array_free(ev);
+                    _ = mlx.mlx_vector_array_append_value(ev, out);
+                    try mlx.check(mlx.mlx_eval(ev));
+                }
+                fused_ns = Lap.read(&mark, io);
+
+                // (b) dense mode: full dequant + SDPA per step
+                var dense_ns: u64 = 0;
+                for (0..warmup + iters) |i| {
+                    if (i == warmup) Lap.reset(&mark, io);
+                    const kd = try dequantizeAffine(s, qk.q, qk.scales, qk.biases, 64, bits);
+                    defer _ = mlx.mlx_array_free(kd);
+                    const vd = try dequantizeAffine(s, qv.q, qv.scales, qv.biases, 64, bits);
+                    defer _ = mlx.mlx_array_free(vd);
+                    var out = mlx.mlx_array_new();
+                    defer _ = mlx.mlx_array_free(out);
+                    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&out, q, kd, vd, scale, "", none, .{ .ctx = null }, s));
+                    const ev = mlx.mlx_vector_array_new();
+                    defer _ = mlx.mlx_vector_array_free(ev);
+                    _ = mlx.mlx_vector_array_append_value(ev, out);
+                    try mlx.check(mlx.mlx_eval(ev));
+                }
+                dense_ns = Lap.read(&mark, io);
+
+                // (c) kv-quant off: SDPA over resident dense K/V
+                var off_ns: u64 = 0;
+                for (0..warmup + iters) |i| {
+                    if (i == warmup) Lap.reset(&mark, io);
+                    var out = mlx.mlx_array_new();
+                    defer _ = mlx.mlx_array_free(out);
+                    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&out, q, k_dense, v_dense, scale, "", none, .{ .ctx = null }, s));
+                    const ev = mlx.mlx_vector_array_new();
+                    defer _ = mlx.mlx_vector_array_free(ev);
+                    _ = mlx.mlx_vector_array_append_value(ev, out);
+                    try mlx.check(mlx.mlx_eval(ev));
+                }
+                off_ns = Lap.read(&mark, io);
+
+                const to_ms = struct {
+                    fn f(ns: u64, n: usize) f64 {
+                        return @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(n)) / 1e6;
+                    }
+                }.f;
+                std.debug.print("[kvq-ubench] {d}/{d}  {d}  {d}  {d:.3}  {d:.3}  {d:.3}\n", .{
+                    H_q, H_kv, T_k, bits, to_ms(fused_ns, iters), to_ms(dense_ns, iters), to_ms(off_ns, iters),
+                });
+                _ = mlx.mlx_clear_cache();
+            }
+        }
+    }
 }
 
 test "quantAttention causal mask matches dense SDPA (prefill, T_q=T_k=4)" {
@@ -1188,6 +1516,10 @@ test "quantAttention causal mask matches dense SDPA (prefill, T_q=T_k=4)" {
     defer testing.allocator.free(cand_flat);
     var max_err: f32 = 0;
     for (ref_flat, cand_flat) |r, c| {
+        // NaN-blind comparisons pass on an all-NaN candidate (NaN > x is
+        // false) — the composed causal arm shipped NaN for months behind
+        // exactly this hole. Finiteness is asserted BEFORE the diff.
+        try testing.expect(!std.math.isNan(c));
         const e = @abs(r - c);
         if (e > max_err) max_err = e;
     }

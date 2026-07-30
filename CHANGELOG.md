@@ -9,6 +9,7 @@
 - **A nicer chat window.** Code blocks get colors, line numbers and a copy button. There is a model picker in the toolbar, web sources on answers, failed turns show as a tidy card instead of raw errors, and tools and MCP servers flip on and off with one click.
 - **Speed helpers set themselves up.** Download a dense Gemma 4 model and its speed-up companion model now comes along and just works, 27 to 40% faster on code and agent tasks. Nothing to pair up by hand.
 - **Faster model downloads.** Up to 16 connections per file, and model search stops getting rate limited when you have a Hugging Face token set.
+- **KV cache quantization is now fast.** With `--kv-quant 4` or `8`, decode now reads the compressed cache in place instead of unpacking it every token: 10% faster at 10K context and 56% faster at 42K on Laguna XS, 26% faster on Qwen3.6 27B at 37K. 
 - **Fixed runaway memory on long chats.** A long session could quietly grow the server to tens of GB until you quit it (#110). Fixed, and the memory panel now shows exactly where the memory goes.
 - **Fixed thinking for some models.** Laguna needed a bit special handling for thinking tags, and potentially other models based on their chat template.
 ---

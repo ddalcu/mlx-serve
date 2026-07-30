@@ -44,6 +44,8 @@ final class ClonedVoiceSynthesizer: SpeechSynthesizing {
     private let stopClonePlayback: () -> Void
     /// Release the resident TTS model (voice mode closed). nil in tests.
     private let unloadClone: (() async -> Void)?
+    /// Pre-embed the clone reference clip (voice mode opened). nil = no-op.
+    private let prewarmClone: ((NeuralVoice) async -> Void)?
 
     /// Sentences awaiting clone synthesis (pipeline stage 1).
     private var texts: [String] = []
@@ -76,13 +78,15 @@ final class ClonedVoiceSynthesizer: SpeechSynthesizing {
          synthesizeClone: @escaping CloneSynth,
          playClone: @escaping ClonePlay,
          stopClonePlayback: @escaping () -> Void = {},
-         unloadClone: (() async -> Void)? = nil) {
+         unloadClone: (() async -> Void)? = nil,
+         prewarmClone: ((NeuralVoice) async -> Void)? = nil) {
         self.system = system
         self.voice = voice
         self.synthesizeClone = synthesizeClone
         self.playClone = playClone
         self.stopClonePlayback = stopClonePlayback
         self.unloadClone = unloadClone
+        self.prewarmClone = prewarmClone
         system.onQueueDrained = { [weak self] in self?.systemFinished() }
     }
 
@@ -104,8 +108,20 @@ final class ClonedVoiceSynthesizer: SpeechSynthesizing {
             synthesizeClone: { text, sel in await tts.synthesize(text: text, voice: sel) },
             playClone: { data in await player.play(data) },
             stopClonePlayback: { player.stop() },
-            unloadClone: { await tts.unload() }
+            unloadClone: { await tts.unload() },
+            prewarmClone: { sel in await tts.prewarm(voice: sel) }
         )
+    }
+
+    /// Voice mode opened: pre-embed the clone reference clip so the FIRST
+    /// sentence skips the cold speaker-encoder forward (the only per-session
+    /// cost the content-keyed server cache cannot hide). Only the clone arm
+    /// has anything to warm — Kokoro voices are a table lookup, the system
+    /// voice needs nothing — and failure is fine: the first sentence simply
+    /// pays what it always paid.
+    func prewarm() {
+        guard let prewarmClone, case let sel? = voice(), case .clone = sel else { return }
+        Task { await prewarmClone(sel) }
     }
 
     // MARK: - SpeechSynthesizing
@@ -314,6 +330,42 @@ final class VoiceCloneTTS {
         if let id = loadedModelId { try? await server.unloadModel(id: id) }
         loadedModelId = nil
         loadedDir = nil
+    }
+
+    /// Pre-warm the server's speaker-embedding cache for the clip
+    /// (docs/qwentts-cache.md): loads the TTS model if needed (voice mode is
+    /// about to speak through it anyway) and POSTs `warm_only` so the first
+    /// sentence's synthesis starts from a cache hit. Best-effort.
+    func prewarm(voice sel: NeuralVoice) async {
+        guard case .clone = sel else { return }
+        let preset: AudioModelPreset? = VoiceCloneMenuModel.resolvedCloneModel()
+        guard let preset, let dir = ServerManager.resolveModelDir(repo: preset.repo) else { return }
+        do {
+            let port = try await server.ensureRunning(forGenModelDir: dir)
+            if loadedModelId == nil || loadedDir != dir {
+                let info = try await server.loadModel(id: dir)
+                loadedModelId = info.name
+                loadedDir = dir
+            }
+            guard let json = VoiceCloneTTS.warmBody(model: loadedModelId ?? dir, voice: sel) else { return }
+            var req = URLRequest(url: URL(string: "http://127.0.0.1:\(port)/v1/audio/speech")!)
+            req.httpMethod = "POST"
+            req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+            req.httpBody = try? JSONSerialization.data(withJSONObject: json)
+            _ = try? await URLSession.shared.data(for: req)
+        } catch {
+            // First sentence pays the cold embed — exactly the pre-warm-less behavior.
+        }
+    }
+
+    /// Build the `warm_only` body. PURE and static (the requestBody pattern)
+    /// so the field choice is testable: `warm_only` + `ref_audio`, never
+    /// `input` — a body with text would synthesize audio nobody asked for.
+    /// nil when the clip can't be read (nothing to warm with).
+    static func warmBody(model: String, voice sel: NeuralVoice) -> [String: Any]? {
+        guard case let .clone(clip) = sel,
+              let data = try? Data(contentsOf: URL(fileURLWithPath: clip)) else { return nil }
+        return ["model": model, "warm_only": true, "ref_audio": data.base64EncodedString()]
     }
 }
 

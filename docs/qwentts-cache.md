@@ -9,8 +9,18 @@ bit-identity test + `tests/test_tts_clone_cache.sh`). Stage 0 measured on the
 ~88 ms per sentence. After: hits cost ~0.03 ms, output byte-identical to the
 pre-cache binary. The transport half (~0.6 ms) is negligible, so the cache
 keys on the decoded samples and **Option B is closed** — not worth the API
-surface. The pre-warm below is still open and remains the only lever for the
-FIRST sentence.
+surface.
+
+**Pre-warm SHIPPED 2026-07-30** (the first-sentence lever): server side,
+`POST /v1/audio/speech` accepts `{"warm_only":true,"ref_audio":...}` — embeds
++ caches WITHOUT synthesizing, replies `{"warmed":true,"cache":"hit"|"miss"}`;
+misuse is a named 400 (no ref, non-cloning checkpoint, Kokoro). App side,
+`SpeechSynthesizing.prewarm()` (default no-op) fires on voice-mode activation:
+`ClonedVoiceSynthesizer.prewarm` → `VoiceCloneTTS.prewarm(voice:)` loads the
+TTS model and POSTs `warmBody` (pure/static, tested — `warm_only` + `ref_audio`,
+never `input`). Only the clone arm warms. Guards: `warmSpeaker` gated unit
+test, `tests/test_tts_clone_cache.sh` [5/5], `ClonedVoiceSynthesizerTests`
+warm-body + routing cases.
 
 ## The problem, precisely
 

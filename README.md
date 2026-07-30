@@ -257,6 +257,7 @@ mlx-serve --model /path/to/model --prompt "What is 2+2?"
 | `--mtp-depth N` | `3` | Max tokens drafted per MTP round (adaptive controller tunes within `[1, N]`) |
 | `--no-decode-attn-quant` | on | Disable the decode-only requant of dense bf16 attention weights (the "Fast decode for bf16-attention models" toggle) |
 | `--kv-quant {off,4,8,turbo2,turbo4}` | off | KV-cache quantization scheme (MLX path) |
+| `--kv-attn-mode {auto,dense,fused}` | auto | Decode read path for quantized KV: `fused` reads the packed cache in place, `auto` engages it from 8K prompt tokens (only at `--kv-quant 4/8`; per-request `kv_attn_mode` overrides) |
 | `--llama-kv-quant {off,q8,q4}` | off | KV-cache quantization for GGUF (llama.cpp path) |
 | `--llama-cache-entries N` | `4` | Multi-session LRU for llama.cpp (warm multi-doc agents) |
 | `--tokenize-cache-entries N` | `4` | Chat-template + tokenize cache size |
@@ -286,7 +287,7 @@ curl http://localhost:8080/v1/chat/completions \
   }'
 ```
 
-Supports `messages`, `max_tokens`, `temperature`, `top_p`, `top_k`, `stream`, `tools`, `repetition_penalty`, `presence_penalty`, `logprobs`, plus a per-request `kv_quant` override. Messages can include `image_url` content blocks (base64 or URL) for vision-capable models.
+Supports `messages`, `max_tokens`, `temperature`, `top_p`, `top_k`, `stream`, `tools`, `repetition_penalty`, `presence_penalty`, `logprobs`, plus per-request `kv_quant` and `kv_attn_mode` overrides. Messages can include `image_url` content blocks (base64 or URL) for vision-capable models.
 
 ### POST /v1/messages (Anthropic)
 
@@ -355,7 +356,7 @@ The defaults are already the fast path. **If you have plenty of RAM, the fastest
 
 | Knob (CLI flag / Settings) | Default | What it does to speed | Flip it when… |
 |---|---|---|---|
-| **KV cache quantization** (`--kv-quant`) | off | ≈ **−10% decode** at 2–4K context, worse as context grows. Saves 2× (8-bit) / 4× (4-bit) KV RAM. | …memory is the constraint: long contexts or big models on a 16 GB Mac. |
+| **KV cache quantization** (`--kv-quant`) | off | ≈ **−10% decode** at 2–4K context; at long context the fused packed reads (auto from 8K) cut the penalty to ≈ −18% at 42K (was −47%). Saves 2× (8-bit) / 4× (4-bit) KV RAM. | …memory is the constraint: long contexts or big models on a 16 GB Mac. |
 | **PLD** (`--pld`) | on | Large wins on agent loops, code editing and RAG. Auto-gates itself off on novel prose. | Leave on. `--no-pld` only for apples-to-apples benchmarks. |
 | **Sampling** (`temperature` / `top_p` / `top_k`) | model defaults | Full sampling costs **~6% decode** vs greedy. | Temp 0 for benchmarks; keep sampling for chat quality. |
 | **Continuous batching** (`--max-concurrent`) | 1 | ~1.6× *total* throughput at 4-way on dense models, at some per-request latency cost. | …several clients share the server. |

@@ -22,10 +22,16 @@ protocol SpeechSynthesizing: AnyObject {
     /// which also fires on barge-in mid-session where resources should stay
     /// warm. Default implementation just stops.
     func shutdown()
+    /// Voice mode just OPENED: move whatever the first utterance would pay
+    /// off the critical path (e.g. pre-embed a clone reference clip —
+    /// docs/qwentts-cache.md's first-sentence lever). Fire-and-forget;
+    /// default implementation does nothing (the system voice has no warmup).
+    func prewarm()
 }
 
 extension SpeechSynthesizing {
     func shutdown() { stop() }
+    func prewarm() {}
 }
 
 /// `AVSpeechSynthesizer`-backed implementation. Tracks an explicit pending count
