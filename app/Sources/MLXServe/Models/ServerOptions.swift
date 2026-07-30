@@ -37,6 +37,12 @@ struct ServerOptions: Codable, Equatable {
     var ctxSize: Int = 0                // 0 = Auto (memory-bounded safe ceiling, capped at model max)
     var noVision: Bool = false
     var logLevel: LogLevel = .info
+    /// Write the server log to `~/.mlx-serve/logs/mlx-serve-<port>.log` (32 MB
+    /// rotation, per port) — THE post-mortem file; the in-app log viewer's
+    /// buffer dies with the app. Default ON, mirroring the server (the file
+    /// sink is on for all serving paths); `toCLIArgs` emits `--log-file off`
+    /// ONLY when disabled, so a default launch stays flag-free.
+    var logToFile: Bool = true
     var requestTimeout: Int = 300       // seconds; 0 = unlimited
 
     // Observability (server-launch flag). When true, launches with `--metrics`,
@@ -426,6 +432,7 @@ struct ServerOptions: Codable, Equatable {
         ctxSize == other.ctxSize &&
         noVision == other.noVision &&
         logLevel == other.logLevel &&
+        logToFile == other.logToFile &&
         requestTimeout == other.requestTimeout &&
         enableMetrics == other.enableMetrics &&
         apiKey == other.apiKey &&
@@ -501,6 +508,10 @@ struct ServerOptions: Codable, Equatable {
             "--host", trimmedHost.isEmpty ? "0.0.0.0" : trimmedHost,
             "--log-level", logLevel.rawValue,
         ]
+        // File logging is ON by default server-side — emit only the opt-out.
+        if !logToFile {
+            args += ["--log-file", "off"]
+        }
         if let dir = modelDirOverride, !dir.isEmpty {
             args += ["--model-dir", dir]
         }
@@ -694,6 +705,7 @@ extension ServerOptions {
         if let v = try c.decodeIfPresent(Int.self, forKey: .ctxSize) { ctxSize = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .noVision) { noVision = v }
         if let v = try c.decodeIfPresent(LogLevel.self, forKey: .logLevel) { logLevel = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .logToFile) { logToFile = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .requestTimeout) { requestTimeout = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .enableMetrics) { enableMetrics = v }
         if let v = try c.decodeIfPresent(String.self, forKey: .apiKey) { apiKey = v }
@@ -837,6 +849,10 @@ extension ServerOptions {
         "logLevel": .init(
             title: "Log level",
             explainer: "Server log verbosity. Use 'debug' to capture Jinja errors, KV cache hits and per-request token counts.",
+            needsRestart: true),
+        "logToFile": .init(
+            title: "Log to file",
+            explainer: "Write the server log to ~/.mlx-serve/logs/mlx-serve-<port>.log (32 MB rotation, one file per port). This is the file to check after a crash — the in-app log viewer only holds what arrived while the app was running.",
             needsRestart: true),
         "requestTimeout": .init(
             title: "Request timeout (s)",

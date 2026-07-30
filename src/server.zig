@@ -811,6 +811,21 @@ fn decodeTokens(
     return tok.decode(allocator, ids, strip_leading_space);
 }
 
+/// Assistant-history reasoning field on an incoming chat message:
+/// `reasoning_content` (our own SSE/vLLM field, what pi rounds-trips) with
+/// `reasoning` (the vLLM request spelling laguna's template reads first) as
+/// the fallback. Non-empty strings only — an empty string would render an
+/// empty <think></think> block, which is exactly the nothink signature this
+/// field exists to avoid.
+fn messageReasoningFromObj(obj: std.json.ObjectMap) ?[]const u8 {
+    inline for (.{ "reasoning_content", "reasoning" }) |key| {
+        if (obj.get(key)) |v| {
+            if (v == .string and v.string.len > 0) return v.string;
+        }
+    }
+    return null;
+}
+
 /// True when the rendered generation prompt ends inside a template-opened
 /// think block (Qwen 3.5/3.6 render `…assistant\n<think>\n` when thinking is
 /// on). Decodes the last few prompt tokens — cheap, engine-agnostic, and
@@ -4081,8 +4096,17 @@ fn handleChatCompletions(
         else
             null;
 
+        // Reasoning the client round-trips on assistant history. Dropping it
+        // starves templates that persist reasoning across turns (laguna): every
+        // prior turn renders the empty <think></think> nothink signature and
+        // the model stops thinking from turn 2 of a session.
+        const msg_reasoning: ?[]const u8 = if (std.mem.eql(u8, role_val.string, "assistant"))
+            messageReasoningFromObj(obj)
+        else
+            null;
+
         // Skip messages with no content, no tool_calls, and no images/audio
-        if (content.len == 0 and msg_tool_calls == null and msg_images == null and msg_audio == null and !std.mem.eql(u8, role_val.string, "tool")) continue;
+        if (content.len == 0 and msg_tool_calls == null and msg_images == null and msg_audio == null and msg_reasoning == null and !std.mem.eql(u8, role_val.string, "tool")) continue;
 
         try messages.append(allocator, .{
             .role = role_val.string,
@@ -4091,6 +4115,7 @@ fn handleChatCompletions(
             .tool_call_id = tool_call_id,
             .images = msg_images,
             .audio = msg_audio,
+            .reasoning_content = msg_reasoning,
         });
     }
 
@@ -8380,9 +8405,11 @@ fn handleAnthropicMessages(
                     try messages.append(allocator, .{ .role = "assistant", .content = s, .tool_calls = null, .tool_call_id = null });
                 },
                 .array => |arr| {
-                    // Extract text and tool_use blocks
+                    // Extract text, tool_use and thinking blocks
                     var text_content = std.ArrayList(u8).empty;
                     defer text_content.deinit(allocator);
+                    var think_content = std.ArrayList(u8).empty;
+                    defer think_content.deinit(allocator);
                     var tcs = std.ArrayList(chat_mod.ToolCall).empty;
 
                     for (arr.items) |block| {
@@ -8405,8 +8432,18 @@ fn handleAnthropicMessages(
                             const args_str = try args_buf.toOwnedSlice(allocator);
                             try arg_allocs.append(allocator, args_str);
                             try tcs.append(allocator, .{ .id = tc_id, .name = tc_name, .arguments = args_str });
+                        } else if (std.mem.eql(u8, btype, "thinking")) {
+                            // History reasoning → Message.reasoning_content, same
+                            // round-trip as chat completions' reasoning_content:
+                            // templates that persist reasoning across turns
+                            // (laguna) starve into nothink without it.
+                            // "redacted_thinking" stays skipped (opaque payload).
+                            const t = if (block.object.get("thinking")) |v| (if (v == .string) v.string else "") else "";
+                            if (t.len > 0) {
+                                if (think_content.items.len > 0) try think_content.append(allocator, '\n');
+                                try think_content.appendSlice(allocator, t);
+                            }
                         }
-                        // Skip "thinking" and "redacted_thinking" — model generates its own
                     }
 
                     var msg_tool_calls: ?[]const chat_mod.ToolCall = null;
@@ -8423,7 +8460,12 @@ fn handleAnthropicMessages(
                         try content_allocs.append(allocator, duped);
                         break :blk duped;
                     } else "";
-                    try messages.append(allocator, .{ .role = "assistant", .content = content, .tool_calls = msg_tool_calls, .tool_call_id = null });
+                    const msg_reasoning: ?[]const u8 = if (think_content.items.len > 0) blk: {
+                        const duped = try allocator.dupe(u8, think_content.items);
+                        try content_allocs.append(allocator, duped);
+                        break :blk duped;
+                    } else null;
+                    try messages.append(allocator, .{ .role = "assistant", .content = content, .tool_calls = msg_tool_calls, .tool_call_id = null, .reasoning_content = msg_reasoning });
                 },
                 else => {},
             };
@@ -13318,4 +13360,33 @@ test "contextOverflowMessage: a buffer too small falls back rather than sending 
     var tiny: [8]u8 = undefined;
     try t.expectEqualStrings("Prompt exceeds maximum context length",
         contextOverflowMessage(&tiny, 999999, 1));
+}
+
+test "messageReasoningFromObj: reasoning_content round-trip, reasoning fallback, empty dropped" {
+    const t = std.testing;
+    const allocator = t.allocator;
+    const cases = [_]struct { body: []const u8, want: ?[]const u8 }{
+        // pi/vLLM SSE spelling — the live laguna case (2026-07-29).
+        .{ .body = "{\"role\":\"assistant\",\"content\":\"4\",\"reasoning_content\":\"two plus two\"}", .want = "two plus two" },
+        // vLLM request spelling.
+        .{ .body = "{\"role\":\"assistant\",\"content\":\"4\",\"reasoning\":\"twice two\"}", .want = "twice two" },
+        // reasoning_content wins when both are present.
+        .{ .body = "{\"role\":\"assistant\",\"reasoning_content\":\"a\",\"reasoning\":\"b\"}", .want = "a" },
+        // Empty string is NOT reasoning — it would render the empty
+        // <think></think> nothink signature the field exists to avoid.
+        .{ .body = "{\"role\":\"assistant\",\"content\":\"4\",\"reasoning_content\":\"\"}", .want = null },
+        // Non-string shapes are ignored, never crash.
+        .{ .body = "{\"role\":\"assistant\",\"content\":\"4\",\"reasoning_content\":{\"x\":1}}", .want = null },
+        .{ .body = "{\"role\":\"assistant\",\"content\":\"4\"}", .want = null },
+    };
+    for (cases) |case| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, case.body, .{});
+        defer parsed.deinit();
+        const got = messageReasoningFromObj(parsed.value.object);
+        if (case.want) |w| {
+            try t.expectEqualStrings(w, got.?);
+        } else {
+            try t.expect(got == null);
+        }
+    }
 }

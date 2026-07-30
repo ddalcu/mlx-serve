@@ -61,14 +61,54 @@ final class ComposerModeControlTests: XCTestCase {
         }
     }
 
-    /// A right-click menu that nothing announces is a feature nobody uses.
+    /// A right-click menu that nothing announces is a feature nobody uses. The
+    /// wording moved to `ComposerTip` (pinned by `ComposerTipTests`); what this
+    /// audit still owns is that the two controls actually SHOW it.
     func testTooltipsNameBothGestures() throws {
         let source = try chatViewSource()
         for control in ["agentToggle", "mcpToggle"] {
             let body = try declaration(control, in: source)
-            XCTAssertTrue(body.lowercased().contains("right-click"),
-                          "\(control)'s tooltip must name the secondary-click menu")
+            XCTAssertTrue(body.contains(".composerTip("),
+                          "\(control) must carry the hover card that names the secondary-click menu")
         }
+    }
+
+    /// Every composer control is a bare glyph, so each one owes the user a hover
+    /// card — and exactly ONE explanation. A leftover `.help` renders a second,
+    /// differently-worded tooltip on top of the card, and the two drift.
+    func testEveryComposerControlHasOneHoverCardAndNoNativeTooltip() throws {
+        let source = try chatViewSource()
+        for control in ["agentChip", "attachmentMenu", "thinkToggle", "agentToggle", "mcpToggle"] {
+            let body = try declaration(control, in: source)
+            XCTAssertTrue(body.contains(".composerTip("), "\(control) has no hover card")
+            XCTAssertFalse(body.contains(".help("),
+                           "\(control) still has a native tooltip competing with its hover card")
+        }
+    }
+
+    /// The hover card is drawn by the COMPOSER CONTAINER, not by the control: the
+    /// container clips to its rounded rect, so a card overlaid on the disc itself
+    /// is cut off at the container's edge (and lands on top of the text field).
+    /// The anchor preference is what carries it out past the clip.
+    func testHoverCardIsRenderedOutsideTheClippedComposerContainer() throws {
+        let source = try chatViewSource()
+        let clip = try XCTUnwrap(source.range(of: ".clipShape(RoundedRectangle(cornerRadius: 18))"),
+                                 "the composer container still clips — the card must escape it")
+        let overlay = try XCTUnwrap(source.range(of: ".overlayPreferenceValue(ComposerTipKey.self)"),
+                                    "the composer container must render the hover card")
+        XCTAssertLessThan(clip.lowerBound, overlay.lowerBound,
+                          "the card overlay must be applied AFTER the clip, or it gets cut off")
+    }
+
+    /// "Enable/Disable All Tools" were bulk rows above the per-tool switches they
+    /// duplicated — the same set is one click per row away, and the pair read as
+    /// a second on/off for the loop the wrench already toggles.
+    func testToolMenuHasNoBulkAllRows() throws {
+        let source = try chatViewSource()
+        for banned in ["Enable All Tools", "Disable All Tools"] {
+            XCTAssertFalse(source.contains(banned), "\(banned) was removed as redundant")
+        }
+        XCTAssertFalse(source.contains("setAllTools"), "the bulk helper goes with its rows")
     }
 
     /// The sandbox shield is gone from the composer row (2026-07-29) — it was a

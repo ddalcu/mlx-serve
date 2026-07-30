@@ -17,7 +17,7 @@ import Foundation
 /// `TimelineView(.animation)` (the earlier attempt) did not help: both are
 /// never-settling redraw loops in the popover.
 ///
-/// The breathe lives only in the in-window orb (`VoiceModeView`), which is in a
+/// The breathe lives only in the in-window orb (`VoiceOrbView`), which is in a
 /// normal `Window` and is unaffected. Keeping this presentation time-free *by
 /// construction* (no time parameter, nothing to animate) is what guarantees the
 /// popover can't be wedged again — see `VoiceTrayDotTests` and `VoicePulse`.

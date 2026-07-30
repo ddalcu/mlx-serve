@@ -46,7 +46,7 @@
       {
         "@type": "Question",
         "name": "What is native multi-token prediction (MTP)?",
-        "acceptedAnswer": { "@type": "Answer", "text": "Some Qwen 3.6 checkpoints ship a small trained head that predicts the next few tokens alongside the main forward pass. mlx-serve auto-loads it and speculates with the model's own predictions — 2× on code and agent-style edit loops (29 to 58 tok/s on Qwen3.6-27B), with a controller that watches acceptance per request and adapts draft depth. Zero setup." }
+        "acceptedAnswer": { "@type": "Answer", "text": "Some Qwen 3.6 checkpoints ship a small trained head that predicts the next few tokens alongside the main forward pass. mlx-serve auto-loads it and speculates with the model's own predictions — 2.8x on code and agent-style edit loops (28 to 78 tok/s on Qwen3.6-27B, v26.7.12), with a controller that watches acceptance per request and adapts draft depth. Zero setup." }
       },
       {
         "@type": "Question",
@@ -70,7 +70,7 @@
     <a href="../" class="nav-logo">
       <img src="../appiconb.png" alt="MLX Core" class="nav-logo-img">
       <span>mlx-serve</span>
-      <span class="nav-ver">v26.7.10</span>
+      <span class="nav-ver">v26.7.12</span>
     </a>
     <input type="checkbox" id="nav-toggle" class="nav-toggle-input">
     <ul class="nav-links" onclick="if(event.target.closest('a')) document.getElementById('nav-toggle').checked=false">
@@ -115,8 +115,8 @@
     </div>
     <div class="stat-band reveal" style="margin-bottom: 56px;">
       <div class="stat"><div class="n">2.1×</div><div class="l">echo workloads · Gemma 4 E2B + PLD (407 tok/s)</div></div>
-      <div class="stat"><div class="n">1.61×</div><div class="l">agentic code edits · Gemma 4 E4B</div></div>
-      <div class="stat"><div class="n">2×</div><div class="l">code &amp; agent edits · Qwen 3.6 native MTP</div></div>
+      <div class="stat"><div class="n">1.5×</div><div class="l">code completion · Gemma 4 E4B drafter (117 → 178 tok/s)</div></div>
+      <div class="stat"><div class="n">2.8×</div><div class="l">code &amp; agent edits · Qwen 3.6 native MTP</div></div>
       <div class="stat"><div class="n">1.0×</div><div class="l">creative writing — gated, no regression</div></div>
     </div>
     <div class="chart-card reveal">
@@ -152,9 +152,13 @@
       <div class="mini-card reveal">
         <span class="mini-k">MTP · Qwen 3.6</span>
         <h4>The model drafts itself</h4>
-        <p>Checkpoints shipping a trained <code>mtp/</code> sidecar speculate with <b>the model's own prediction head</b> — auto-loaded, self-tuning depth-3 drafting, 2× on code and agent edits (29 → 58.4 tok/s on the 27B) — and it out-decodes the reference MTP runtime at all 8 context rungs, 0.5K–64K. Zero setup.</p>
+        <p>Checkpoints shipping a trained <code>mtp/</code> sidecar (or an oMLX oQ checkpoint with its MTP head baked in) speculate with <b>the model's own prediction head</b> — auto-loaded, self-tuning drafting, 2.8× on code and agent edits (28 → 78 tok/s on the 27B) — and it out-decodes both reference MTP runtimes, MTPLX and oMLX, at all 8 context rungs, 0.5K–64K. Zero setup.</p>
       </div>
     </div>
+    <figure class="shot reveal" style="margin-top: 40px;">
+      <div class="shot-frame"><img src="../perf-mtp-ladder-26.7.12.png" alt="Native MTP context ladder: mlx-serve vs oMLX and MTPLX on Qwen 3.6 27B, prefill and decode from 0.5K to 64K context" loading="lazy"></div>
+      <figcaption>The native-MTP context ladder, v26.7.12: same checkpoints, cold prompts, 0.5K–64K. mlx-serve out-decodes MTPLX 2.3.0 at all 8 rungs (+15–38%) and oMLX's Lightning MTP at all 8 on oMLX's own oQ4e checkpoint (+15–52%).</figcaption>
+    </figure>
   </section>
 
   <section class="section">

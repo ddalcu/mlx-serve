@@ -4,19 +4,19 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>LM Studio Alternative for Mac — Faster on the Same File · mlx-serve</title>
-  <meta name="description" content="mlx-serve is a native, MIT-licensed LM Studio alternative for Apple Silicon: +48% faster on identical MLX weights (speculative decoding included), no Electron, no Python. It even auto-discovers your existing LM Studio model folder — switch without re-downloading anything.">
+  <meta name="description" content="mlx-serve is a native, MIT-licensed LM Studio alternative for Apple Silicon: +81% faster on identical MLX weights (speculative decoding included), no Electron, no Python. It even auto-discovers your existing LM Studio model folder — switch without re-downloading anything.">
   <meta name="keywords" content="LM Studio alternative, LM Studio alternative Mac, faster than LM Studio, LM Studio vs mlx-serve, local LLM server Mac, MLX inference server, GGUF server Mac, open source LM Studio replacement, native Mac LLM app no Electron">
   <meta name="author" content="David Dalcu">
   <link rel="canonical" href="https://mlxserve.com/lm-studio-alternative/">
   <meta property="og:type" content="website">
   <meta property="og:url" content="https://mlxserve.com/lm-studio-alternative/">
   <meta property="og:title" content="The LM Studio alternative that wins on the same file">
-  <meta property="og:description" content="+48% faster on identical MLX weights. Native menu-bar app, MIT license, and it reuses your existing LM Studio model folder.">
+  <meta property="og:description" content="+81% faster on identical MLX weights. Native menu-bar app, MIT license, and it reuses your existing LM Studio model folder.">
   <meta property="og:image" content="https://mlxserve.com/perf-vs-lmstudio-gemma-26.7.6.png">
   <meta property="og:site_name" content="mlx-serve">
   <meta name="twitter:card" content="summary_large_image">
   <meta name="twitter:title" content="The LM Studio alternative that wins on the same file">
-  <meta name="twitter:description" content="+48% faster on identical MLX weights. Native app, MIT license, reuses your LM Studio models.">
+  <meta name="twitter:description" content="+81% faster on identical MLX weights. Native app, MIT license, reuses your LM Studio models.">
   <meta name="twitter:image" content="https://mlxserve.com/perf-vs-lmstudio-gemma-26.7.6.png">
   <script type="application/ld+json">
   {
@@ -36,7 +36,7 @@
       {
         "@type": "Question",
         "name": "Is mlx-serve faster than LM Studio?",
-        "acceptedAnswer": { "@type": "Answer", "text": "Yes, where it counts — +48% geomean across 18 workloads on identical 4-bit MLX weights (Gemma 4 and Qwen 3.6 families, best-vs-best, LM Studio 0.4.15). The lead comes from speculative decoding: PLD up to 2.1x on echo-heavy work, the Gemma drafter +65% and native Qwen MTP +98% on code." }
+        "acceptedAnswer": { "@type": "Answer", "text": "Yes, where it counts: on the v26.7.12 code matrix (Gemma 4 and Qwen 3.6 families, best-vs-best, LM Studio 0.4.19) mlx-serve decodes at 2.0x geomean over LM Studio's fastest engine per model, and +81% on identical MLX weights. The lead comes from speculative decoding: the Gemma drafter +53% on E4B code, native Qwen MTP +154% on the 35B-A3B." }
       },
       {
         "@type": "Question",
@@ -69,7 +69,7 @@
     <a href="../" class="nav-logo">
       <img src="../appiconb.png" alt="MLX Core" class="nav-logo-img">
       <span>mlx-serve</span>
-      <span class="nav-ver">v26.7.10</span>
+      <span class="nav-ver">v26.7.12</span>
     </a>
     <input type="checkbox" id="nav-toggle" class="nav-toggle-input">
     <ul class="nav-links" onclick="if(event.target.closest('a')) document.getElementById('nav-toggle').checked=false">
@@ -91,7 +91,7 @@
     <div class="hero-f-glow"><span class="g1"></span><span class="g2"></span></div>
     <div class="crumbs"><a href="../">mlx-serve</a><span class="sep">/</span><span class="here">Comparison · LM Studio</span></div>
     <h1>The LM Studio alternative<br>that wins <span class="grad">on the same file.</span></h1>
-    <p class="hero-f-sub">Identical weights, identical Mac, identical prompts — mlx-serve decodes <b>+48% faster (geomean)</b> on MLX models with speculative decoding. Native menu-bar app, MIT license, no Electron, no Python.</p>
+    <p class="hero-f-sub">Identical weights, identical Mac, identical prompts — mlx-serve decodes <b>+81% faster (geomean)</b> on MLX models with speculative decoding. Native menu-bar app, MIT license, no Electron, no Python.</p>
     <div class="hero-ctas">
       <a href="https://github.com/ddalcu/mlx-serve/releases/latest/download/MLXCore.dmg" class="btn btn-primary">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
@@ -110,21 +110,17 @@
     <div class="section-header reveal">
       <div class="section-label">Benchmarks</div>
       <h2 class="section-title">Every cell, every model</h2>
-      <p class="section-desc">Best mlx-serve vs best LM Studio, identical 4-bit MLX weights, ctx 4096, temp 0. Reproduce with <code>tests/bench.sh --family gemma --lmstudio</code> — the harness ships in the repo.</p>
+      <p class="section-desc">Best mlx-serve vs best LM Studio, same machine, same prompts, ctx 4096, temp 0. Reproduce with <code>tests/bench.sh --family all --lmstudio --omlx --mtplx</code> — the harness ships in the repo.</p>
     </div>
     <div class="stat-band reveal" style="margin-bottom: 56px;">
-      <div class="stat"><div class="n">+48%</div><div class="l">geomean across 18 workloads, MLX vs MLX</div></div>
-      <div class="stat"><div class="n">2×</div><div class="l">Qwen3.6-27B code · native MTP</div></div>
-      <div class="stat"><div class="n">2.1×</div><div class="l">Gemma 4 E2B echo with speculative decoding</div></div>
+      <div class="stat"><div class="n">+81%</div><div class="l">geomean on identical MLX weights, best vs best</div></div>
+      <div class="stat"><div class="n">+154%</div><div class="l">Qwen 3.6 35B-A3B code · native MTP</div></div>
+      <div class="stat"><div class="n">+53%</div><div class="l">Gemma 4 E4B code · drafter, identical weights</div></div>
       <div class="stat"><div class="n">7.7×</div><div class="l">faster warm time-to-first-token</div></div>
     </div>
     <figure class="shot reveal">
-      <div class="shot-frame"><img src="../perf-vs-lmstudio-gemma-26.7.6.png" alt="Benchmark chart: mlx-serve vs LM Studio on Gemma 4 models, identical MLX weights" loading="lazy"></div>
-      <figcaption>Gemma 4 family, identical 4-bit MLX weights — echo +60–122%, code +47–53%, free-form +20–35%.</figcaption>
-    </figure>
-    <figure class="shot reveal" style="margin-top: 28px;">
-      <div class="shot-frame"><img src="../perf-vs-lmstudio-qwen36-26.7.6.png" alt="Benchmark chart: mlx-serve vs LM Studio on Qwen 3.6 models, identical MLX weights" loading="lazy"></div>
-      <figcaption>Qwen 3.6 family — including the 35B-A3B MoE at +88% on echo.</figcaption>
+      <div class="shot-frame"><img src="../perf-vs-lmstudio-omlx-all-26.7.12.png" alt="Benchmark chart: mlx-serve vs LM Studio (GGUF and MLX), oMLX and MTPLX on Gemma 4 and Qwen 3.6, code completion decode" loading="lazy"></div>
+      <figcaption>Six models, code completion decode, v26.7.12. LM Studio GGUF and MLX, oMLX and MTPLX beside mlx-serve's best configuration, with the winning speculative mode named per bar.</figcaption>
     </figure>
   </section>
 
@@ -138,7 +134,7 @@
         <thead><tr><th>Capability</th><th class="hl">mlx-serve</th><th>LM Studio</th></tr></thead>
         <tbody>
           <tr><td>MLX + GGUF models</td><td class="hl"><span class="yes">✓</span></td><td><span class="yes">✓</span></td></tr>
-          <tr><td>Decode speed, identical weights</td><td class="hl">+48% geomean</td><td>baseline</td></tr>
+          <tr><td>Decode speed, identical weights</td><td class="hl">+81% geomean</td><td>baseline</td></tr>
           <tr><td>OpenAI-compatible API</td><td class="hl"><span class="yes">✓</span></td><td><span class="yes">✓</span></td></tr>
           <tr><td>Anthropic Messages API (Claude Code)</td><td class="hl"><span class="yes">✓</span></td><td><span class="part">partial</span></td></tr>
           <tr><td>OpenAI Responses API + WebSockets</td><td class="hl"><span class="yes">✓</span></td><td><span class="part">partial</span></td></tr>
@@ -184,7 +180,7 @@
     <div class="faq-wrap reveal">
       <details class="faq-item">
         <summary>Is mlx-serve really faster than LM Studio?</summary>
-        <p>Yes, where it counts — <b>+48% geomean across 18 workloads</b> on identical 4-bit MLX weights (Gemma 4 E2B/E4B/31B/26B-A4B-MoE, Qwen 3.6 27B/35B-A3B-MoE, vs LM Studio 0.4.15), driven by speculative decoding: PLD up to 2.1× on echo, drafter +65% and native MTP +98% on code. The benchmark harness ships in the repo so you can reproduce it on your own machine.</p>
+        <p>Yes, where it counts: on the v26.7.12 code matrix (Gemma 4 E4B/31B/26B-A4B-MoE, Qwen 3.6 27B/35B-A3B-MoE, vs LM Studio 0.4.19) mlx-serve decodes at <b>2.0× geomean over LM Studio's fastest engine per model</b>, and <b>+81%</b> on identical MLX weights, driven by speculative decoding: drafter +53% on E4B code, native MTP +154% on the 35B-A3B. The benchmark harness ships in the repo so you can reproduce it on your own machine.</p>
       </details>
       <details class="faq-item">
         <summary>Do I have to re-download my models?</summary>

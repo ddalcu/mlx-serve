@@ -1,67 +1,47 @@
 import SwiftUI
 import AppKit
 
-/// ChatGPT-style hands-free voice screen presented over the chat. A single
-/// animated orb reflects the turn state (listening / thinking / speaking) and
-/// pulses with the live mic level; the user's partial transcript shows beneath
-/// it. The model/agent pipeline is reused as-is — this view only renders state
-/// from `VoiceModeController` and forwards the agent/thinking/MCP toggles.
-struct VoiceModeView: View {
+/// The in-window face of hands-free voice: a compact talking orb rendered
+/// INLINE just above the composer. It replaced the full-window sheet — the
+/// sheet covered the transcript (the one thing a chat window is for) and its
+/// toggle row duplicated controls the composer already carries. The orb
+/// reflects the turn state (listening / thinking / speaking) via color +
+/// motion and pulses with the live mic level; the caption beneath carries the
+/// status or the user's partial transcript. Renders nothing while voice is
+/// off, so mounting it unconditionally costs no layout.
+///
+/// The model/agent pipeline is reused as-is — this view only renders state
+/// from the app-level `VoiceModeController` (which the tray shares, so voice
+/// started from either surface shows here).
+struct VoiceOrbView: View {
     @ObservedObject var controller: VoiceModeController
-    var onClose: () -> Void
 
-    var body: some View {
-        ZStack {
-            backdrop.ignoresSafeArea()
-
-            VStack(spacing: 20) {
-                Spacer(minLength: 8)
-
-                Text(statusText)
-                    .font(.title3.weight(.medium))
-                    .foregroundStyle(isError ? .red : .secondary)
-                    .multilineTextAlignment(.center)
-                    .padding(.horizontal, 24)
-                    .transition(.opacity)
-
-                orb
-                    .onTapGesture { if controller.state == .speaking { controller.bargeIn() } }
-                    .help(controller.state == .speaking ? "Tap to interrupt" : "")
-
-                transcript
-
-                Spacer(minLength: 8)
-
-                toggles
-                controls
-                    .padding(.bottom, 12)
-            }
-            .padding(24)
-        }
-        // Shorter than it was: the voice picker used to sit between the
-        // transcript and the toggles, and the 660 floor was sized around it.
-        .frame(minWidth: 560, minHeight: 560)
-        .animation(.easeInOut(duration: 0.25), value: controller.state)
-        .overlay { approvalOverlay }
-    }
-
-    // MARK: Tool-approval overlay (agent mode)
+    /// Orb diameter. 128 by design — big enough to read the state animation,
+    /// small enough that the transcript stays the window's main content.
+    static let orbSize: CGFloat = 128
 
     @ViewBuilder
-    private var approvalOverlay: some View {
-        if let req = controller.pendingApproval {
-            ZStack {
-                Color.black.opacity(0.6).ignoresSafeArea()
-                    .onTapGesture { }   // swallow taps to the orb behind
-                ToolApprovalSheet(request: req,
-                                  onAllow: { controller.resolve(.allow) },
-                                  onDeny: { controller.resolve(.deny) },
-                                  onAllowAll: { controller.resolve(.allow, allowAll: true) })
-                    .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 14))
-                    .shadow(radius: 30)
-                    .padding(24)
+    var body: some View {
+        if controller.isActive {
+            VStack(spacing: 6) {
+                orb
+                    .onTapGesture { if controller.state == .speaking { controller.bargeIn() } }
+                    .help(controller.state == .speaking ? "Tap to interrupt" : statusText)
+                caption
+                // Tool approval (agent mode, auto-approve off). Inline next to
+                // the orb: there is no sheet to host it any more, and the
+                // window-level approval sheet belongs to typed chat turns.
+                if let req = controller.pendingApproval {
+                    ToolApprovalSheet(request: req,
+                                      onAllow: { controller.resolve(.allow) },
+                                      onDeny: { controller.resolve(.deny) },
+                                      onAllowAll: { controller.resolve(.allow, allowAll: true) })
+                        .background(.quaternary.opacity(0.5), in: RoundedRectangle(cornerRadius: 10))
+                }
             }
-            .transition(.opacity)
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 4)
+            .animation(.easeInOut(duration: 0.25), value: controller.state)
         }
     }
 
@@ -78,112 +58,37 @@ struct VoiceModeView: View {
             ZStack {
                 Circle()
                     .fill(RadialGradient(colors: orbColors.map { $0.opacity(0.9) },
-                                         center: .center, startRadius: 4, endRadius: 150))
-                    .frame(width: 220, height: 220)
-                    .shadow(color: orbColors.first?.opacity(0.6) ?? .clear, radius: 40)
+                                         center: .center, startRadius: 3,
+                                         endRadius: Self.orbSize * 0.68))
+                    .frame(width: Self.orbSize, height: Self.orbSize)
+                    .shadow(color: orbColors.first?.opacity(0.5) ?? .clear, radius: 22)
                 Circle()
-                    .stroke(orbColors.first?.opacity(0.35) ?? .clear, lineWidth: 2)
-                    .frame(width: 252, height: 252)
+                    .stroke(orbColors.first?.opacity(0.35) ?? .clear, lineWidth: 1.5)
+                    .frame(width: Self.orbSize * 1.14, height: Self.orbSize * 1.14)
                     .scaleEffect(1 + CGFloat(controller.level) * 0.25)
                 if controller.state == .thinking {
                     ProgressView()
-                        .controlSize(.large)
                         .tint(.white)
                 }
             }
             .scaleEffect(scale)
             .animation(.easeOut(duration: 0.12), value: controller.level)
         }
+        // Reserve the ring's overshoot so the pulse never lands on the
+        // composer border below.
+        .frame(width: Self.orbSize * 1.2, height: Self.orbSize * 1.2)
     }
 
-    private var transcript: some View {
-        Text(controller.partialTranscript.isEmpty ? " " : controller.partialTranscript)
-            .font(.body)
-            .foregroundStyle(.primary)
+    /// One line under the orb: the partial transcript while the user is
+    /// talking, otherwise the state — which is also where a mic-permission
+    /// failure becomes visible (the old sheet's status text did that job).
+    private var caption: some View {
+        Text(controller.partialTranscript.isEmpty ? statusText : controller.partialTranscript)
+            .font(.caption)
+            .foregroundStyle(isError ? AnyShapeStyle(.red) : AnyShapeStyle(.secondary))
             .multilineTextAlignment(.center)
-            .lineLimit(3)
-            .frame(maxWidth: 420, minHeight: 56, alignment: .top)
+            .lineLimit(2)
             .padding(.horizontal, 16)
-    }
-
-    // No voice picker here. The speaking voice is a property of WHO is
-    // answering, so it is set where that is decided — Settings ▸ Voice for the
-    // app's own voice, the Agents editor for an agent's — and the synthesizer
-    // re-reads it per utterance, so a change there applies from the next
-    // sentence without this sheet mirroring the control. A third copy could
-    // only disagree with the two that own it.
-
-    // MARK: Toggles + controls
-
-    private var toggles: some View {
-        // Inline VStack (not an offset overlay) so the auto-approve row takes
-        // real layout space — otherwise it overlaps the control row below and
-        // pushes the circle buttons off the bottom of the sheet.
-        VStack(spacing: 10) {
-            HStack(spacing: 8) {
-                chip(controller.wakePhraseDisplay, system: "mic.circle", on: controller.requireWakeWord) { controller.requireWakeWord.toggle() }
-                chip("Think", system: "brain", on: controller.enableThinking) { controller.enableThinking.toggle() }
-                chip("Tools", system: "wrench", on: controller.agentMode) {
-                    controller.agentMode.toggle()
-                    if controller.agentMode { controller.enableThinking = false }
-                }
-                chip("MCP", system: "puzzlepiece.extension", on: controller.mcpMode) { controller.mcpMode.toggle() }
-            }
-            if controller.agentMode || controller.mcpMode {
-                Toggle("Auto-approve tools (hands-free)", isOn: $controller.autoApproveTools)
-                    .toggleStyle(.switch)
-                    .controlSize(.mini)
-                    .font(.caption)
-                    .fixedSize()
-            }
-        }
-    }
-
-    private var controls: some View {
-        // No "new session" button — voice mode is bound to the chat session it was
-        // launched from (its toggles are seeded from that session on open).
-        HStack(spacing: 36) {
-            circleButton(system: "stop.fill",
-                         tint: controller.canInterrupt ? .red : .secondary,
-                         help: "Stop the assistant and listen again") {
-                controller.bargeIn()
-            }
-            .disabled(!controller.canInterrupt)
-            circleButton(system: controller.isMuted ? "mic.slash.fill" : "mic.fill",
-                         tint: controller.isMuted ? .orange : .secondary,
-                         help: controller.isMuted ? "Unmute" : "Mute") {
-                controller.toggleMute()
-            }
-            circleButton(system: "xmark", tint: .red, help: "End voice mode") { onClose() }
-        }
-    }
-
-    private func chip(_ title: String, system: String, on: Bool, action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            HStack(spacing: 4) {
-                Image(systemName: system).font(.system(size: 11, weight: .medium))
-                Text(title).font(.caption.weight(.medium))
-            }
-            .foregroundStyle(on ? .white : .secondary)
-            .padding(.horizontal, 10).padding(.vertical, 5)
-            .background(on ? Color.accentColor : Color.secondary.opacity(0.15))
-            .clipShape(Capsule())
-        }
-        .buttonStyle(.plain)
-    }
-
-    private func circleButton(system: String, tint: Color, help: String,
-                              action: @escaping () -> Void) -> some View {
-        Button(action: action) {
-            Image(systemName: system)
-                .font(.system(size: 20, weight: .semibold))
-                .foregroundStyle(tint == .secondary ? Color.primary : .white)
-                .frame(width: 56, height: 56)
-                .background(tint == .secondary ? AnyShapeStyle(.thinMaterial) : AnyShapeStyle(tint))
-                .clipShape(Circle())
-        }
-        .buttonStyle(.plain)
-        .help(help)
     }
 
     // MARK: State → presentation
@@ -193,7 +98,7 @@ struct VoiceModeView: View {
     private var statusText: String {
         switch controller.state {
         case .idle:        return "Starting…"
-        case .listening:   return controller.isMuted ? "Muted — tap the mic to resume" : controller.listeningPrompt
+        case .listening:   return controller.isMuted ? "Muted — unmute in the menu bar" : controller.listeningPrompt
         case .recognizing: return "Listening…"
         case .thinking:    return "Thinking…"
         case .speaking:    return "Speaking… (tap the orb to interrupt)"
@@ -210,9 +115,33 @@ struct VoiceModeView: View {
         case .idle:                    return [.gray, Color(white: 0.4)]
         }
     }
+}
 
-    private var backdrop: some View {
-        LinearGradient(colors: [Color(white: 0.06), Color(white: 0.12)],
-                       startPoint: .top, endPoint: .bottom)
+/// The composer-row voice toggle (between the context gauge and Send). Its own
+/// observing view so the on/off tint follows the app-level controller even
+/// when voice starts from the tray or dies on its own — ChatView itself does
+/// not observe the controller.
+struct VoiceComposerToggle: View {
+    @ObservedObject var controller: VoiceModeController
+    var disabled: Bool
+    /// Starts voice with the surrounding chat's toggles/agent (ChatView's
+    /// `startVoiceMode`); turning OFF always just ends the controller.
+    var start: () -> Void
+
+    var body: some View {
+        Button {
+            if controller.isActive { controller.end() } else { start() }
+        } label: {
+            Image(systemName: "waveform")
+                .font(.system(size: 13, weight: .medium))
+                .foregroundStyle(controller.isActive ? Color.white : Color.secondary)
+                .frame(width: ChatMetrics.composerIconSize, height: ChatMetrics.composerIconSize)
+                .background(controller.isActive ? Color.accentColor : Color.secondary.opacity(0.15))
+                .clipShape(Circle())
+        }
+        .buttonStyle(.plain)
+        .frame(width: ChatMetrics.composerControlSize, height: ChatMetrics.composerControlSize)
+        .disabled(disabled)
+        .help("Voice mode (\(controller.isActive ? "ON" : "OFF")) — talk to the model hands-free. Speech-to-text and text-to-speech run locally on your Mac; the model only handles text (and tools/thinking if enabled).")
     }
 }

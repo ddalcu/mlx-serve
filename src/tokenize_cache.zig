@@ -73,6 +73,8 @@ pub const TokenizeCache = struct {
             h.update("\x1e"); // record separator
             if (m.tool_call_id) |id| h.update(id);
             h.update("\x1e");
+            if (m.reasoning_content) |rc| h.update(rc);
+            h.update("\x1e");
             if (m.tool_calls) |tcs| {
                 for (tcs) |tc| {
                     h.update(tc.name);
@@ -164,6 +166,21 @@ test "TokenizeCache key stability" {
     try std.testing.expectEqual(k1, k2);
     try std.testing.expect(k1 != k3);
     _ = allocator;
+}
+
+test "TokenizeCache key distinguishes assistant reasoning_content" {
+    // reasoning_content changes the rendered prompt for templates that
+    // persist reasoning across turns (laguna) — two histories differing
+    // only in reasoning must not collide on one cached tokenization.
+    const m1 = [_]chat_mod.Message{
+        .{ .role = "assistant", .content = "4" },
+    };
+    const m2 = [_]chat_mod.Message{
+        .{ .role = "assistant", .content = "4", .reasoning_content = "two plus two is four" },
+    };
+    const k1 = TokenizeCache.keyFor(&m1, null, null, true).?;
+    const k2 = TokenizeCache.keyFor(&m2, null, null, true).?;
+    try std.testing.expect(k1 != k2);
 }
 
 test "TokenizeCache images null key" {

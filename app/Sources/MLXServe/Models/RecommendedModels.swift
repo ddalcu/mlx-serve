@@ -225,19 +225,34 @@ extension RecommendedModelPick {
         highlights: ["Strong reasoning", "Mixture of experts"]
     )
 
-    /// poolside's Laguna S 2.1 — a coding-specialist mixture-of-experts model
-    /// (117.6B total, ~8.5B active per word). This is the compact 2-bit MLX
-    /// build (~35 GB on disk) the app was validated on, resolvable at the
-    /// on-disk repo path `pipenetwork/Laguna-S-2.1-MLX-2bit`. It's its own
-    /// family: not Gemma, not Qwen, and — at ~42 GB RAM with overhead — not a
-    /// 96 GB+ "largest" pick either, so it fits a mid-range Mac inline.
+    /// poolside's Laguna XS 2.1 in poolside's own NVFP4 4-bit MLX build —
+    /// the checkpoint the 26.7.12 decode-perf round was tuned and validated
+    /// on (121 tok/s on an M4 Max, see benchmarks.md). ~20 GB of weights, so
+    /// with the ×1.2 overhead it fits a 32 GB Mac inline.
+    static let lagunaXS21 = RecommendedModelPick(
+        id: "laguna-xs-2.1-nvfp4",
+        name: "Laguna XS 2.1",
+        tagline: "Fast coder",
+        blurb: "The smaller Laguna, same specialty: writing and editing code and multi-step \u{201c}agent\u{201d} work like using tools across a project. A 33-billion-parameter mixture-of-experts model in poolside's own 4-bit NVFP4 build, and the fastest coding model in this list: about 121 tokens per second on an M4 Max. Fits a 32 GB Mac.",
+        repoId: "poolside/Laguna-XS-2.1-NVFP4-mlx",
+        sizeGB: 20.1,
+        family: .poolside,
+        highlights: ["Best for coding", "Mixture of experts", "121 tok/s on M4 Max"]
+    )
+
+    /// poolside's Laguna S 2.1 — the full-size coding-specialist MoE (117.6B
+    /// total, ~8.5B active per word) in poolside's own NVFP4 4-bit MLX build
+    /// (~67 GB on disk, so ~80 GB RAM with the ×1.2 overhead: a 96 GB+ Mac
+    /// inline, behind "Requires more RAM" below that). Replaced the compact
+    /// 2-bit community build (`pipenetwork/Laguna-S-2.1-MLX-2bit`) — the
+    /// 2-bit's output quality is noticeably below the NVFP4 original.
     static let lagunaS21 = RecommendedModelPick(
-        id: "laguna-s-2.1-2bit",
+        id: "laguna-s-2.1-nvfp4",
         name: "Laguna S 2.1",
         tagline: "Built for code",
-        blurb: "poolside's coding-specialist model, built specifically for writing and editing code and for multi-step \u{201c}agent\u{201d} work like using tools across a whole project. It's a large mixture-of-experts model — 117 billion parameters in total, but only about 8.5 billion wake up per word — so it stays efficient for its size. This is a compact 2-bit build that fits comfortably on a Mac with a fair amount of memory.",
-        repoId: "pipenetwork/Laguna-S-2.1-MLX-2bit",
-        sizeGB: 35.2,
+        blurb: "poolside's full-size coding specialist, built for writing and editing code and for multi-step \u{201c}agent\u{201d} work like using tools across a whole project. A large mixture-of-experts model — 117 billion parameters in total, but only about 8.5 billion wake up per word — in poolside's own 4-bit NVFP4 build, the quantization the model ships in. Needs a Mac with a lot of memory; the XS above covers smaller machines.",
+        repoId: "poolside/Laguna-S-2.1-NVFP4-mlx",
+        sizeGB: 67.0,
         family: .poolside,
         highlights: ["Best for coding", "Mixture of experts", "Great at agent tasks"]
     )
@@ -256,11 +271,11 @@ extension RecommendedModelPick {
         .qwen35_9b, .qwen36_27bMtp, .qwen36_35bA3b,
     ]
 
-    /// poolside's Laguna family — currently the single 2-bit Laguna S 2.1
-    /// coder build. Its own section: a coding specialist that isn't Gemma,
-    /// Qwen, or a 96 GB+ "largest" pick.
+    /// poolside's Laguna family, ascending by size — the fast XS 2.1, then
+    /// the full-size S 2.1, both poolside's own NVFP4 builds. Its own
+    /// section: coding specialists that aren't Gemma or Qwen.
     static let poolsideCatalog: [RecommendedModelPick] = [
-        .lagunaS21,
+        .lagunaXS21, .lagunaS21,
     ]
 
     /// The largest models this app runs, ascending by on-disk size (the app's

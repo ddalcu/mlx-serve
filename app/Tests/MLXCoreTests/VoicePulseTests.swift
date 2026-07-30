@@ -2,7 +2,7 @@ import XCTest
 @testable import MLXCore
 
 /// Pins the time-driven pulse math for the in-window voice **orb**
-/// (`VoiceModeView`).
+/// (`VoiceOrbView`).
 ///
 /// Regression context: a repeating breathe hosted inside the
 /// `MenuBarExtra(.window)` popover (whether `repeatForever` or a running

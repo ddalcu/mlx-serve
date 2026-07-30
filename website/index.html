@@ -37,7 +37,7 @@
     "downloadUrl": "https://github.com/ddalcu/mlx-serve/releases/latest",
     "codeRepository": "https://github.com/ddalcu/mlx-serve",
     "license": "https://opensource.org/licenses/MIT",
-    "softwareVersion": "v26.7.10",
+    "softwareVersion": "v26.7.12",
     "author": { "@type": "Person", "name": "David Dalcu" },
     "description": "Native Zig inference server for Apple Silicon that runs any LLM — MLX and GGUF — with OpenAI- and Anthropic-compatible APIs. Faster than LM Studio. No Python. MIT licensed.",
     "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
@@ -77,7 +77,7 @@
         "name": "Is mlx-serve faster than LM Studio?",
         "acceptedAnswer": {
           "@type": "Answer",
-          "text": "Yes, where it counts — +48% geomean across 18 workloads on identical 4-bit MLX weights (Gemma 4 and Qwen 3.6 families, vs LM Studio 0.4.15). The lead comes from speculative decoding: PLD up to 2.1× on echo-heavy work, the Gemma drafter +65% and native Qwen MTP +98% on code, and a faster MoE decode path (+27% raw on Qwen 35B-A3B)."
+          "text": "Yes, where it counts: on the v26.7.12 code matrix (Gemma 4 and Qwen 3.6 families, vs LM Studio 0.4.19) mlx-serve's best configuration decodes at 2.0x geomean over LM Studio's fastest engine per model, and +81% on identical MLX weights. The lead comes from speculative decoding: the Gemma drafter +53% on E4B code, native Qwen MTP +154% on the 35B-A3B, which also decodes +70% raw (153 vs 90 tok/s)."
         }
       },
       {
@@ -1216,7 +1216,7 @@
     <a href="#" class="nav-logo">
       <img src="appiconb.png" alt="MLX Core" class="nav-logo-img">
       <span>mlx-serve</span>
-      <span class="nav-ver">v26.7.10</span>
+      <span class="nav-ver">v26.7.12</span>
     </a>
     <input type="checkbox" id="nav-toggle" class="nav-toggle-input">
     <ul class="nav-links" onclick="if(event.target.closest('a')) document.getElementById('nav-toggle').checked=false">
@@ -1576,7 +1576,7 @@
       <a class="explore-card" href="lm-studio-alternative/" style="--ec:#0071e3;">
         <span class="explore-kicker">Compare</span>
         <h3>Faster than LM Studio</h3>
-        <p>+48% on identical models — keeps your library.</p>
+        <p>+81% on identical models — keeps your library.</p>
         <span class="go">Deep dive →</span>
       </a>
       <a class="explore-card" href="ollama-alternative/" style="--ec:#0d8a45;">
@@ -1616,20 +1616,20 @@
 
     <div class="perf-stats reveal">
       <div class="perf-stat">
-        <div class="perf-number" data-target="199">199</div>
-        <div class="perf-label">tok/s decode · Gemma 4 E2B 4-bit</div>
+        <div class="perf-number" data-target="230">230</div>
+        <div class="perf-label">tok/s decode · Qwen 3.6 35B-A3B (native MTP)</div>
       </div>
       <div class="perf-stat">
-        <div class="perf-number" data-target="4891" data-comma="1">4,891</div>
-        <div class="perf-label">tok/s prefill</div>
+        <div class="perf-number" data-target="2149" data-comma="1">2,149</div>
+        <div class="perf-label">tok/s prefill · Gemma 4 E4B</div>
       </div>
       <div class="perf-stat">
-        <div class="perf-number" data-target="200" data-suffix="%">~200%</div>
+        <div class="perf-number" data-target="278" data-suffix="%">278%</div>
         <div class="perf-label">faster on Qwen 27B MTP</div>
       </div>
       <div class="perf-stat">
-        <div class="perf-number" data-target="48" data-suffix="%">48%</div>
-        <div class="perf-label">geomean faster than LM Studio · 18 workloads</div>
+        <div class="perf-number" data-target="81" data-suffix="%">81%</div>
+        <div class="perf-label">geomean faster than LM Studio · identical MLX weights</div>
       </div>
     </div>
 
@@ -1717,7 +1717,7 @@
       </div>
     </div>
     <p class="spec-note reveal">
-      <b>How fast is native MTP?</b> On Qwen3.6-27B 4-bit (M4 Max): code completion <b>29.0 → 58.4 tok/s (2×)</b>, echo/edit loops 58.7 tok/s, free-form +38% — with sidecars like <a href="https://huggingface.co/ddalcu/Qwen3.6-27B-4bit-MTP-MLX-Serve" target="_blank" rel="noopener" style="color:var(--blue)">ddalcu/Qwen3.6-27B-4bit-MTP-MLX-Serve</a>. In a head-to-head on the identical checkpoint and prompts, mlx-serve out-decodes the reference MTP runtime at <b>all 8 context rungs</b> from 0.5K to 64K (+11–30%) — and at 64K context it decodes <b>33.5 tok/s where plain autoregressive does 21.7</b>. <a href="speculative-decoding/" style="color:var(--blue);text-decoration:none;">Speculative decoding, in depth →</a>
+      <b>How fast is native MTP?</b> On Qwen3.6-27B 4-bit (M4 Max, v26.7.12): code completion <b>28 → 78 tok/s (2.8×)</b> with the checkpoint's own MTP head, loaded from a sidecar like <a href="https://huggingface.co/ddalcu/Qwen3.6-27B-4bit-MTP-MLX-Serve" target="_blank" rel="noopener" style="color:var(--blue)">ddalcu/Qwen3.6-27B-4bit-MTP-MLX-Serve</a> or straight out of an oMLX oQ checkpoint. In same-checkpoint head-to-heads, mlx-serve out-decodes MTPLX 2.3.0 at <b>all 8 context rungs</b> from 0.5K to 64K (+15–38%) and oMLX's Lightning MTP at all 8 on oMLX's own oQ4e checkpoint (+15–52%). At 64K context it decodes <b>37.4 tok/s where MTPLX does 30.3</b>. <a href="speculative-decoding/" style="color:var(--blue);text-decoration:none;">Speculative decoding, in depth →</a>
     </p>
   </section>
 
@@ -2025,10 +2025,17 @@
           </div>
         </div>
         <div class="model-card">
+          <div class="model-logo ml-mistral" style="font-size:13px;">La</div>
+          <div class="model-info">
+            <h3>Laguna 2.1</h3>
+            <p>poolside · MoE coding models · XS decodes 121 tok/s on M4 Max</p>
+          </div>
+        </div>
+        <div class="model-card">
           <div class="model-logo ml-more">+</div>
           <div class="model-info">
             <h3>And thousands more</h3>
-            <p>Nemotron-H · LFM2.5 · Qwen 3-Next · Gemma 3 · any GGUF</p>
+            <p>Hunyuan 3 · Nemotron-H · LFM2.5 · Qwen 3-Next · Gemma 3 · any GGUF</p>
           </div>
         </div>
       </div>
@@ -2058,11 +2065,25 @@
             <p>Lightricks · clips with synced sound · photo &amp; audio input</p>
           </div>
         </a>
+        <a class="model-card" href="image-generation/">
+          <div class="model-logo ml-flux" style="font-size:13px;">MF</div>
+          <div class="model-info">
+            <h3>Mage-Flow <span class="model-flag f-img">Image</span></h3>
+            <p>Microsoft · 4-step generation + instruction editing from references</p>
+          </div>
+        </a>
         <a class="model-card" href="voice-cloning/">
           <div class="model-logo ml-tts" style="font-size:11px;">TTS</div>
           <div class="model-info">
             <h3>Qwen3-TTS <span class="model-flag f-voice">Voice</span></h3>
             <p>Alibaba · speech + zero-shot voice cloning</p>
+          </div>
+        </a>
+        <a class="model-card" href="voice-cloning/">
+          <div class="model-logo ml-tts" style="font-size:11px;">KO</div>
+          <div class="model-info">
+            <h3>Kokoro-82M <span class="model-flag f-voice">Voice</span></h3>
+            <p>54 built-in voices · ~17× realtime · 345 MB, fully local</p>
           </div>
         </a>
       </div>
@@ -2087,7 +2108,7 @@
       </details>
       <details class="faq-item">
         <summary>Is mlx-serve faster than LM Studio?</summary>
-        <p>Yes, where it counts — <b>+48% geomean across 18 workloads</b> on identical 4-bit MLX weights (Gemma 4 E2B/E4B/31B/26B-A4B-MoE and Qwen 3.6 27B/35B-A3B-MoE, vs LM Studio 0.4.15). The lead comes from speculative decoding: PLD up to <b>2.1×</b> on echo-heavy work, the Gemma drafter <b>+65%</b> and native Qwen MTP <b>+98%</b> on code, plus a faster MoE decode path (+27% raw on Qwen 35B-A3B).</p>
+        <p>Yes, where it counts: on the v26.7.12 code matrix (Gemma 4 E4B/31B/26B-A4B-MoE and Qwen 3.6 27B/35B-A3B-MoE, vs LM Studio 0.4.19) mlx-serve's best configuration decodes at <b>2.0× geomean over LM Studio's fastest engine per model</b>, and <b>+81%</b> on identical MLX weights. The lead comes from speculative decoding: the Gemma drafter <b>+53%</b> on E4B code, native Qwen MTP <b>+154%</b> on the 35B-A3B, which also decodes +70% raw (153 vs 90 tok/s).</p>
       </details>
       <details class="faq-item">
         <summary>Does mlx-serve replace LM Studio?</summary>
@@ -2174,7 +2195,7 @@
       <li><a href="speculative-decoding/">Speculative decoding</a></li>
       <li><a href="local-ai-assistant/">Always-on assistant</a></li>
     </ul>
-    <p class="footer-copy">MIT License · mlx-serve <span style="opacity:0.7;">v26.7.10</span> · built for Apple Silicon</p>
+    <p class="footer-copy">MIT License · mlx-serve <span style="opacity:0.7;">v26.7.12</span> · built for Apple Silicon</p>
   </footer>
 
   <script>

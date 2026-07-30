@@ -97,22 +97,23 @@ final class AgentTurnConfigTests: XCTestCase {
 
     // MARK: - Where the persona lands
 
-    func testPersonaPrecedesTheStableBlockAndAllVolatileContent() {
-        // The persona must be in the STABLE prefix: the volatile tail is
-        // re-prefilled every turn, so a persona there would cost a re-prefill
-        // per message instead of one per agent switch.
+    func testAgentPersonaIsTheEntireSystemPrompt() {
+        // An agent's prompt REPLACES the normal system prompt — base
+        // instructions, listings, volatile tail and grounding are the app's
+        // voice, and composing them after a persona is how the persona got
+        // overridden (live 2026-07-29: Laguna answered "who are you?" with
+        // "I'm poolside Malibu" under an Elon Musk persona — the agent-prompt
+        // body opens with its own "You are an autonomous agent" claim). Tools
+        // still ride the request's tools JSON, so dispatch is unaffected; the
+        // agent's prompt has to carry anything else it needs. Matches the
+        // plain-chat path, where a persona is already the whole system message.
         let out = ChatTurnEngine.composeSystemPrompt(
-            persona: "You are a coder.\n\n",
-            stable: "STABLE-BLOCK",
+            persona: "You are Elon Musk.\n\n",
+            stable: "You are an autonomous agent. STABLE-BLOCK",
             volatileTail: "VOLATILE-TAIL",
             grounding: "Today is Monday.")
-        let personaAt = out.range(of: "You are a coder.")!.lowerBound
-        let stableAt = out.range(of: "STABLE-BLOCK")!.lowerBound
-        let tailAt = out.range(of: "VOLATILE-TAIL")!.lowerBound
-        let groundingAt = out.range(of: "Today is Monday.")!.lowerBound
-        XCTAssertTrue(personaAt < stableAt)
-        XCTAssertTrue(stableAt < tailAt)
-        XCTAssertTrue(tailAt < groundingAt)
+        XCTAssertEqual(out, "You are Elon Musk.",
+                       "the persona alone, trimmed — nothing composed around it")
     }
 
     func testNoPersonaLeavesThePromptByteIdentical() {

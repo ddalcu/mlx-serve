@@ -366,9 +366,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                     return ["role": "user", "content": Self.buildMultimodalContent(text: msg.content, images: imgs, audio: clips, serverPreprocess: useServerPreprocess)]
                 }
             }
-            var d: [String: Any] = ["role": msg.role.rawValue, "content": msg.content]
-            if msg.role == .assistant && msg.content.isEmpty { d.removeValue(forKey: "content") }
-            return d
+            return Self.plainHistoryDict(msg)
         }
         // Plain chat: no synthesized system message (see the long note in the
         // original ChatView implementation — a "formatNudge" system message was
@@ -1247,16 +1245,27 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
     /// working-dir listing, learned recent-dirs/commands) and `grounding` (date +
     /// LAN IP) change mid-session, so they go LAST — a change there re-prefills
     /// only the short tail, not the big cached prefix. Pure → unit-tested.
-    /// `persona` (the active agent's system prompt) goes in FRONT of `stable`,
-    /// never in the tail: the tail is re-prefilled every turn, so a persona there
-    /// would cost a re-prefill per message instead of one per agent switch. It is
-    /// "" when there's no agent, and the result is then byte-identical to what
-    /// this produced before agents existed.
+    /// `persona` (the active agent's system prompt) REPLACES the whole
+    /// composition: an agent's prompt is the entire system prompt, so the
+    /// normal instructions never ride along to compete with it. The
+    /// agent-prompt body opens with its own identity claim ("You are an
+    /// autonomous agent…"), which sat right after the persona and overrode it
+    /// (live 2026-07-29: Laguna answered "who are you?" with "I'm poolside
+    /// Malibu" under an Elon Musk persona) — the composeSystemPrompt instance
+    /// of the voice-prompt "Jarvis" class. Tools still ride the request's
+    /// tools JSON, so tool dispatch is unaffected; the agent's prompt has to
+    /// carry anything else it needs (matching plain chat, where a persona is
+    /// already the whole system message). Persona is "" when there's no agent,
+    /// and the result is then byte-identical to what this produced before
+    /// agents existed.
     nonisolated static func composeSystemPrompt(persona: String = "",
                                                 stable: String,
                                                 volatileTail: String,
                                                 grounding: String) -> String {
-        var p = persona + stable + volatileTail
+        if !persona.isEmpty {
+            return persona.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        var p = stable + volatileTail
         if !grounding.isEmpty { p += "\n\n" + grounding }
         return p
     }
@@ -1313,6 +1322,21 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
         case .indexing(_, let total): return total
         case .preparing, .failed, nil: return 0
         }
+    }
+
+    /// Plain-chat history dict for one message. Assistant reasoning the app
+    /// received is round-tripped as `reasoning_content` — the server forwards
+    /// it to the chat template, and templates that persist reasoning across
+    /// turns (laguna) render every prior turn as the empty <think></think>
+    /// nothink signature without it, so the model stops thinking from turn 2.
+    /// Templates that strip history reasoning (Qwen, Gemma) never read it.
+    nonisolated static func plainHistoryDict(_ msg: ChatMessage) -> [String: Any] {
+        var d: [String: Any] = ["role": msg.role.rawValue, "content": msg.content]
+        if msg.role == .assistant && msg.content.isEmpty { d.removeValue(forKey: "content") }
+        if msg.role == .assistant, let rc = msg.reasoningContent, !rc.isEmpty {
+            d["reasoning_content"] = rc
+        }
+        return d
     }
 
     /// Build OpenAI-style content blocks for a message with images (and,

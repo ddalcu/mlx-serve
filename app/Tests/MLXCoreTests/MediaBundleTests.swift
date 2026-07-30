@@ -445,6 +445,57 @@ final class MediaBundleTests: XCTestCase {
         XCTAssertTrue(ImageModelPreset.flux2Klein4B_Q4.bundle.components[0].readyMarkers.contains("config.json"))
     }
 
+    /// Third bite of the configless-repo class, and the one the marker test
+    /// above CANNOT see: dropping `config.json` from the ready markers isn't
+    /// enough, because `existingModelDir` never resolves the directory in the
+    /// first place — it counted a dir as holding a model on `config.json`,
+    /// `model_index.json` or a `.gguf`, and klein 9B ships NONE of the three.
+    /// So a complete 8.9 GB download still read as absent: the pane offered
+    /// "Download (~10 GB)" forever and a click flickered and reverted (files
+    /// present → size-matched skip → instant finish → re-check still false).
+    /// Readiness has to accept the weight-subdir shape itself.
+    func testKlein9BOnDiskWithNoRootJsonAtAllReadsAsReady() throws {
+        let fm = FileManager.default
+        let root = NSTemporaryDirectory() + "klein9b-\(UUID().uuidString)"
+        let modelDir = (root as NSString).appendingPathComponent("mlx-community/flux2-klein-9b-4bit")
+        try fm.createDirectory(atPath: modelDir, withIntermediateDirectories: true)
+        defer { try? fm.removeItem(atPath: root) }
+
+        let comp = ImageModelPreset.flux2Klein9B_Q4.bundle.components[0]
+        XCTAssertFalse(DownloadManager.componentReady(comp, modelsRoot: root))
+
+        // The real on-disk shape: four weight subdirs, weights inside them, and
+        // no root marker file of any kind.
+        for sub in ["transformer", "vae", "text_encoder", "tokenizer"] {
+            try fm.createDirectory(atPath: (modelDir as NSString).appendingPathComponent(sub), withIntermediateDirectories: true)
+        }
+        for w in ["transformer/0.safetensors", "vae/0.safetensors", "text_encoder/0.safetensors"] {
+            fm.createFile(atPath: (modelDir as NSString).appendingPathComponent(w), contents: Data([0, 1, 2]))
+        }
+        for absent in ["config.json", "model_index.json"] {
+            XCTAssertFalse(fm.fileExists(atPath: (modelDir as NSString).appendingPathComponent(absent)),
+                           "the fixture must ship NO \(absent) — that's the whole point")
+        }
+        XCTAssertTrue(DownloadManager.componentReady(comp, modelsRoot: root))
+    }
+
+    /// The flip side: the weight-subdir shape must not make a HALF-downloaded
+    /// repo read as present. A bare `transformer/` with nothing in it is a
+    /// download that got as far as creating the folder.
+    func testEmptyWeightSubdirsAreNotAModel() throws {
+        let fm = FileManager.default
+        let root = NSTemporaryDirectory() + "klein9bpartial-\(UUID().uuidString)"
+        let modelDir = (root as NSString).appendingPathComponent("mlx-community/flux2-klein-9b-4bit")
+        defer { try? fm.removeItem(atPath: root) }
+        for sub in ["transformer", "vae"] {
+            try fm.createDirectory(atPath: (modelDir as NSString).appendingPathComponent(sub), withIntermediateDirectories: true)
+        }
+        XCTAssertNil(DownloadManager.existingModelDir(rootDir: root, repoId: "mlx-community/flux2-klein-9b-4bit"))
+        // An in-flight transfer writes `.partial`, which is not a weight either.
+        fm.createFile(atPath: (modelDir as NSString).appendingPathComponent("transformer/0.safetensors.partial"), contents: Data([0]))
+        XCTAssertNil(DownloadManager.existingModelDir(rootDir: root, repoId: "mlx-community/flux2-klein-9b-4bit"))
+    }
+
     /// 9B is a bigger klein, not a different backend: it goes through the same
     /// FLUX engine, so it inherits the same capabilities — including reference
     /// editing, which is what a klein is for.

@@ -52,6 +52,12 @@ pub const Message = struct {
     tool_call_id: ?[]const u8 = null,
     images: ?[]const ImageData = null, // Preprocessed image data for vision
     audio: ?[]const AudioData = null, // Raw PCM for the unified audio embedder
+    /// Reasoning the client round-trips on assistant HISTORY messages
+    /// (`reasoning_content`/`reasoning` on chat completions, `thinking`
+    /// blocks on /v1/messages). Templates that persist reasoning across
+    /// turns (laguna) read it; templates that strip history reasoning
+    /// (Qwen, Gemma) never reference the field and render unchanged.
+    reasoning_content: ?[]const u8 = null,
 };
 
 /// Chat template configuration loaded from tokenizer_config.json.
@@ -616,6 +622,14 @@ pub fn serializeMessagesJson(allocator: std.mem.Allocator, messages: []const Mes
             // No tool_responses field needed — Gemma 4 templates handle role:"tool"
             // natively via the content field. Adding tool_responses causes the template
             // to render duplicate content, wasting tokens.
+        }
+
+        if (msg.reasoning_content) |rc| {
+            // Key omitted entirely when absent: templates gate on
+            // `message.reasoning_content is string`, and an explicit null
+            // would still pass `is defined`-style checks.
+            try buf.appendSlice(allocator, ",\"reasoning_content\":");
+            try appendJsonString(allocator, &buf, rc);
         }
 
         try buf.append(allocator, '}');
@@ -6128,6 +6142,57 @@ test "serializeMessagesJson with tool_calls" {
     // Should contain tool_calls array
     try testing.expect(std.mem.indexOf(u8, result, "\"tool_calls\"") != null);
     try testing.expect(std.mem.indexOf(u8, result, "get_weather") != null);
+}
+
+test "serializeMessagesJson carries assistant reasoning_content" {
+    const allocator = testing.allocator;
+    const messages = [_]Message{
+        .{ .role = "user", .content = "What is 2+2?" },
+        .{ .role = "assistant", .content = "4", .reasoning_content = "two plus two is four" },
+    };
+    const result = try serializeMessagesJson(allocator, &messages);
+    defer allocator.free(result);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, result, .{});
+    defer parsed.deinit();
+    const asst = parsed.value.array.items[1].object;
+    try testing.expectEqualStrings("two plus two is four", asst.get("reasoning_content").?.string);
+    // A message without the field must not carry the key at all — templates
+    // gate on `is string`, and an explicit null would still pass `is defined`.
+    try testing.expect(parsed.value.array.items[0].object.get("reasoning_content") == null);
+}
+
+test "assistant history reasoning_content reaches a template that reads it (laguna round-trip)" {
+    // laguna's chat_template.jinja persists reasoning across turns: history
+    // assistant messages render <think>{message.reasoning|reasoning_content}</think>.
+    // When the parse layer drops the field, every history turn renders the
+    // empty <think></think> nothink signature and the model stops thinking
+    // from turn 2 of a session (live 2026-07-29, pi agent on Laguna XS: one
+    // reasoning delta on the 2-msg turn, zero across the next 13k chunks).
+    // Template fragment mirrors laguna's assistant-history branch.
+    const allocator = testing.allocator;
+    var config = ChatConfig{
+        .chat_template = "{%- for message in messages -%}" ++
+            "{%- if message.role == 'assistant' -%}" ++
+            "{%- set rc = '' -%}" ++
+            "{%- if message.reasoning is string -%}{%- set rc = message.reasoning -%}" ++
+            "{%- elif message.reasoning_content is string -%}{%- set rc = message.reasoning_content -%}" ++
+            "{%- endif -%}" ++
+            "<think>{{ rc }}</think>{{ message.content }}" ++
+            "{%- endif -%}{%- endfor -%}",
+        .bos_token = null,
+        .eos_token = null,
+        .add_bos_token = false,
+        .allocator = allocator,
+    };
+    _ = &config;
+    const messages = [_]Message{
+        .{ .role = "user", .content = "What is 2+2?" },
+        .{ .role = "assistant", .content = "4", .reasoning_content = "two plus two is four" },
+    };
+    const rendered = try renderChatTemplate(allocator, &messages, &config, null, null, true);
+    defer allocator.free(rendered);
+    try testing.expect(std.mem.indexOf(u8, rendered, "<think>two plus two is four</think>4") != null);
 }
 
 test "serializeMessagesJson embeds valid-JSON arguments as object (not string)" {

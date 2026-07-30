@@ -784,6 +784,56 @@ extension ServerOptionsTests {
         let back = try JSONDecoder().decode(ServerOptions.self, from: data)
         XCTAssertFalse(back.toolAutocorrect)
     }
+
+    // ── Server log file (--log-file) ──
+    func testLogToFileDefaultsOnAndOmitsFlag() {
+        // Mirrors the server: the file sink is ON for all serving paths
+        // (~/.mlx-serve/logs/mlx-serve-<port>.log), so a default launch stays
+        // flag-free (defaults-mirror gotcha).
+        let d = ServerOptions()
+        XCTAssertTrue(d.logToFile, "file logging must default ON, matching the server")
+        XCTAssertFalse(d.toCLIArgs().contains("--log-file"),
+                       "default (on) must not emit --log-file")
+    }
+
+    func testLogToFileOffEmitsLogFileOff() {
+        var opts = ServerOptions()
+        opts.logToFile = false
+        XCTAssertTrue(contains(opts.toCLIArgs(), flag: "--log-file", value: "off"),
+                      "disabling must emit --log-file off")
+    }
+
+    func testLogToFileToggleTriggersRestart() {
+        var a = ServerOptions()
+        var b = ServerOptions()
+        b.logToFile = false
+        XCTAssertFalse(a.serverLaunchEquals(b),
+                       "toggling file logging must require a server restart")
+        a.logToFile = false
+        XCTAssertTrue(a.serverLaunchEquals(b))
+    }
+
+    func testLogToFileHasSettingsMetadata() {
+        guard let field = ServerOptions.serverFlagFields["logToFile"] else {
+            return XCTFail("logToFile metadata missing — the Settings toggle would silently disappear")
+        }
+        XCTAssertFalse(field.title.isEmpty)
+        XCTAssertFalse(field.explainer.isEmpty)
+        XCTAssertTrue(field.needsRestart, "--log-file is a launch flag — must flag a restart")
+    }
+
+    func testLogToFileRoundTripsLegacyDecodesOn() throws {
+        // A blob saved before this field must decode with file logging ON.
+        let legacy = "{\"host\":\"127.0.0.1\",\"port\":11234}"
+        let opts = try JSONDecoder().decode(ServerOptions.self, from: Data(legacy.utf8))
+        XCTAssertTrue(opts.logToFile, "legacy blob must decode file logging ON")
+        // Round-trip preserves an explicit off.
+        var off = ServerOptions()
+        off.logToFile = false
+        let data = try JSONEncoder().encode(off)
+        let back = try JSONDecoder().decode(ServerOptions.self, from: data)
+        XCTAssertFalse(back.logToFile)
+    }
 }
 
 extension ServerOptionsTests {

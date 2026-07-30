@@ -450,6 +450,25 @@ final class MediaGenServiceTests: XCTestCase {
         XCTAssertNil(ServerManager.resolveModelDir(repo: "acme/empty", modelsRoot: root))
     }
 
+    /// FLUX.2-klein 9B (`mlx-community/flux2-klein-9b-4bit`) ships the weight
+    /// subdirs and NO root json at all — not `config.json`, not
+    /// `model_index.json`. `resolveModelDir` re-checked those two markers after
+    /// `existingModelDir` had already answered the same question, so a complete
+    /// download threw `.modelMissing` at generate time. One predicate, one
+    /// answer: the duplicate marker list is what let the two sites drift.
+    func testResolveModelDirAcceptsTheConfiglessWeightSubdirLayout() throws {
+        let fm = FileManager.default
+        let root = NSTemporaryDirectory() + "resolvedir9b-\(UUID().uuidString)"
+        defer { try? fm.removeItem(atPath: root) }
+
+        let dir = (root as NSString).appendingPathComponent("mlx-community/flux2-klein-9b-4bit")
+        for sub in ["transformer", "vae", "text_encoder", "tokenizer"] {
+            try fm.createDirectory(atPath: (dir as NSString).appendingPathComponent(sub), withIntermediateDirectories: true)
+        }
+        fm.createFile(atPath: (dir as NSString).appendingPathComponent("transformer/0.safetensors"), contents: Data([0, 1, 2]))
+        XCTAssertEqual(ServerManager.resolveModelDir(repo: "mlx-community/flux2-klein-9b-4bit", modelsRoot: root), dir)
+    }
+
     // MARK: - Residency default
 
     func testKeepResidentDefaultsOff() {

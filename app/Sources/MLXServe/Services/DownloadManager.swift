@@ -194,16 +194,38 @@ class DownloadManager: ObservableObject {
     }
 
     private nonisolated static func holdsModel(_ dir: String, fm: FileManager) -> Bool {
-        if fm.fileExists(atPath: (dir as NSString).appendingPathComponent("config.json")) { return true }
-        // Diffusers-layout media models (Mage-Flow) ship weight SUBDIRS and a
-        // `model_index.json` root — NO top-level config.json. Without this a
-        // fully-downloaded Mage-Flow never resolves: the picker shows "Download"
-        // forever and a click reverts (files present → size-matched skip →
-        // instant finish → re-check still false).
-        if fm.fileExists(atPath: (dir as NSString).appendingPathComponent("model_index.json")) { return true }
+        if holdsWeightLayout(dir) { return true }
         // Recursive: a large GGUF quant's only `.gguf` files are nested shards
         // (`<quant>/<quant>-00001-of-00002.gguf`), so a shallow scan misses them.
         return !ggufQuantPaths(inDir: dir).isEmpty
+    }
+
+    /// True when `dir` holds a safetensors model of any layout we serve. The
+    /// ONE answer to "is this repo on disk?" for everything that isn't a GGUF —
+    /// `ServerManager.resolveModelDir` asks it too, because a second copy of the
+    /// marker list is exactly how the two sites drifted apart on klein 9B.
+    ///
+    /// Three shapes, each a fact about real repos rather than a preference:
+    /// standard MLX (`config.json`), diffusers (`model_index.json` + weight
+    /// subdirs, Mage-Flow), and CONFIGLESS weight subdirs — no root json at all,
+    /// which is what `mlx-community/flux2-klein-9b-4bit` ships. Gating on the
+    /// root markers made its complete 8.9 GB download read as absent forever
+    /// (the Kokoro-vs-`tts()` bug: the pane offers Download, the click reverts).
+    /// The server has the same problem and solves it the same way — it
+    /// classifies that repo from the DiT's weight NAMES (`peekMfluxFlux2`), not
+    /// from a root file.
+    nonisolated static func holdsWeightLayout(_ dir: String) -> Bool {
+        let fm = FileManager.default
+        for marker in ["config.json", "model_index.json"] {
+            if fm.fileExists(atPath: (dir as NSString).appendingPathComponent(marker)) { return true }
+        }
+        // A `transformer/` holding real weights. Deliberately not "has the
+        // subdir": a download that got as far as creating the folder must still
+        // read as incomplete, and an in-flight transfer's `.partial` is not a
+        // weight. The DiT dir is the narrowest marker that no chat model has.
+        let dit = (dir as NSString).appendingPathComponent("transformer")
+        let shards = (try? fm.contentsOfDirectory(atPath: dit)) ?? []
+        return shards.contains { $0.hasSuffix(".safetensors") }
     }
 
     /// File size in bytes, resolving symlinks first. Hugging Face snapshots

@@ -558,7 +558,6 @@ struct ChatDetailView: View {
     @State private var isAgentMode = false
     @State private var mcpMode = false
     @State private var showMCPMarketplace = false
-    @State private var showVoiceMode = false
     @State private var showThinkingInAgentConfirm = false
     @State private var executingPlanMessageId: UUID?
     @State private var isNearBottom = true
@@ -655,21 +654,12 @@ struct ChatDetailView: View {
     /// now: their captions were most of this cluster's width budget, and they
     /// configure the message being written, not the window.
     private var floatingToolbar: some View {
+        // Voice moved OUT to the composer row (`voiceToggle`): it configures
+        // the conversation you're having, not the window — and it freed this
+        // cluster's width budget.
         HStack(spacing: 4) {
             ChatModelPill(showsBackground: false)
             Divider().frame(height: 14)
-            Button {
-                startVoiceMode()
-            } label: {
-                Image(systemName: "waveform")
-                    .font(.system(size: 12))
-                    .foregroundStyle(server.status == .running ? .primary : .tertiary)
-                    .frame(width: 22, height: 22)
-                    .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            .disabled(server.status != .running)
-            .help("Voice mode — talk to the model hands-free. Speech-to-text and text-to-speech run locally on your Mac; the model only handles text (and tools/thinking if enabled).")
             Button {
                 AppActivation.openWindow(id: "settings", using: openWindow)
             } label: {
@@ -735,8 +725,7 @@ struct ChatDetailView: View {
         .menuStyle(.button)
         .buttonStyle(.plain)
         .menuIndicator(.hidden)
-        .help(activeAgent.map { "Talking to \($0.name) — its prompt, tools, voice, workspace and model. Click to switch." }
-              ?? "No agent: this chat uses the app's own settings. Click to pick one.")
+        .composerTip(.agent(name: activeAgent?.name))
     }
 
     /// The agent this tab is talking to (nil = none).
@@ -776,7 +765,7 @@ struct ChatDetailView: View {
             modeIcon("brain", isOn: toolbarToggles.thinking, onColor: .blue)
         }
         .buttonStyle(.plain)
-        .help("Thinking Mode (\(toolbarToggles.thinking ? "ON" : "OFF")) — when the model supports it, it'll emit a private reasoning trace before the visible answer. Slower but better on reasoning-heavy prompts.")
+        .composerTip(.thinking(isOn: toolbarToggles.thinking))
     }
 
     /// One wrench: CLICK flips the tool loop, secondary-click opens the per-tool
@@ -1088,6 +1077,12 @@ struct ChatDetailView: View {
                     }
                 }
 
+                // Voice mode lives INLINE: a talking orb just above the input,
+                // not a sheet over the transcript (the sheet hid the
+                // conversation and duplicated the composer's own toggles).
+                // Renders nothing while voice is off.
+                VoiceOrbView(controller: appState.voice)
+
                 // One rounded container, two rows: the input on top with the
                 // full width of the column, its controls beneath — inside the
                 // same border, so they read as belonging to it.
@@ -1190,29 +1185,16 @@ struct ChatDetailView: View {
             MCPMarketplaceView()
                 .environmentObject(mcpManager)
         }
-        // The in-window orb is just another view of the app-level voice
-        // controller. Closing the sheet (Escape) leaves voice running so it
-        // persists in the tray; the orb's red ✕ (onClose) explicitly ends it.
-        .sheet(isPresented: $showVoiceMode) {
-            VoiceModeView(controller: appState.voice,
-                          onClose: { showVoiceMode = false; appState.voice.end() })
-                .environmentObject(appState)
-                // The voice picker inside re-stats its models when a download
-                // publishes; a sheet doesn't inherit the presenter's
-                // environment objects, so it needs its own.
-                .environmentObject(appState.downloads)
-        }
         .alert("Enable thinking with Tools on?", isPresented: $showThinkingInAgentConfirm) {
             Button("Cancel", role: .cancel) { }
             Button("Enable anyway") { enableThinking = true }
         } message: {
             Text("Thinking is not recommended with Tools on — most local models tool-call more reliably without it. Do you still want to enable it?")
         }
-        // Suppressed while Voice mode is open — two sheets can't co-present on
-        // macOS, so the approval would never appear and the agent loop would hang.
-        // Voice mode renders the approval as an overlay inside its own sheet instead.
-        .sheet(item: Binding(get: { showVoiceMode ? nil : pendingApproval },
-                             set: { pendingApproval = $0 })) { req in
+        // Typed-turn approvals only. Voice turns approve through the
+        // controller's own `pendingApproval`, rendered inline next to the orb
+        // (and in the tray) — never through this sheet.
+        .sheet(item: $pendingApproval) { req in
             ToolApprovalSheet(request: req,
                               onAllow: { resolveApproval(.allow) },
                               onDeny: { resolveApproval(.deny) },
@@ -1409,6 +1391,12 @@ struct ChatDetailView: View {
                 .frame(height: ChatMetrics.composerControlSize)
         }
 
+        // Voice mode, between the context gauge and Send. A toggle: on starts
+        // hands-free with this chat's toggles/agent, off ends it. Its own
+        // observing view (see `VoiceComposerToggle`) so the tint follows the
+        // app-level controller when voice starts from the tray.
+        voiceToggle
+
         Button {
             if composerState == .generatingHere {
                 chatEngine.stop()
@@ -1432,6 +1420,13 @@ struct ChatDetailView: View {
                       && inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                       && pendingImages.isEmpty && pendingPDFs.isEmpty && pendingAudio.isEmpty))
         }
+    }
+
+    /// Composer-row voice toggle — see `VoiceComposerToggle` for why it's an
+    /// observing child view rather than a Button reading `appState.voice` here.
+    private var voiceToggle: some View {
+        VoiceComposerToggle(controller: appState.voice,
+                            disabled: server.status != .running) { startVoiceMode() }
     }
 
     // MARK: - Document Folder (mini RAG)
@@ -1783,11 +1778,11 @@ struct ChatDetailView: View {
         pendingApproval = nil
     }
 
-    /// Present the in-window voice orb. The controller is app-level and may
-    /// already be running (started from the tray) — only begin a session if it
-    /// isn't active yet, ensuring a chat session exists first.
+    /// Start hands-free voice from the composer toggle. The controller is
+    /// app-level and may already be running (started from the tray) — the orb
+    /// above the composer follows `isActive`, so there is nothing to "present".
     private func startVoiceMode() {
-        guard !showVoiceMode else { return }
+        guard !appState.voice.isActive else { return }
         // Sync the voice toggles to the chat session being opened — talking should
         // start in the same Think/Tools/MCP mode as the chat you launched it from.
         if let s = session {
@@ -1799,8 +1794,6 @@ struct ChatDetailView: View {
             // conversation out of the tab you launched voice from.
             appState.defaultAgentId = s.agentId
         }
-        showVoiceMode = true
-        guard !appState.voice.isActive else { return }
         appState.sessionForAgent(session?.agentId)
         Task { _ = await appState.voice.begin() }   // on permission failure the orb shows the error
     }
@@ -2091,6 +2084,8 @@ struct MessageBubble: View {
     /// a task run's transcript is a record, so it has no delete affordance
     /// rather than one that silently does nothing.
     var onDelete: (() -> Void)?
+    /// Explicit so the accordion HEADER can drive it, not just the chevron.
+    @State private var thinkingExpanded = false
 
     var body: some View {
         // A failure notice is not model output: it renders as its own card
@@ -2102,28 +2097,42 @@ struct MessageBubble: View {
         }
     }
 
+    /// Reasoning accordion. The WHOLE header toggles, not just the chevron:
+    /// macOS only hit-tests the disclosure triangle on a DisclosureGroup's
+    /// label, so the "Thinking" text was a dead click target — same fix as the
+    /// Agents editor's Advanced row (the label holds no buttons of its own, so
+    /// a tap gesture here can't swallow child clicks).
+    @ViewBuilder
+    private var thinkingBlock: some View {
+        if let reasoning = message.reasoningContent, !reasoning.isEmpty {
+            DisclosureGroup(isExpanded: $thinkingExpanded) {
+                Text(reasoning)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+            } label: {
+                Label("Thinking", systemImage: "brain")
+                    .font(.caption2.weight(.medium))
+                    .foregroundStyle(.secondary)
+                    .contentShape(Rectangle())
+                    .onTapGesture {
+                        withAnimation(.easeInOut(duration: 0.15)) { thinkingExpanded.toggle() }
+                    }
+            }
+            .padding(8)
+            .background(.quaternary.opacity(0.5))
+            .clipShape(RoundedRectangle(cornerRadius: 8))
+        }
+    }
+
     private var messageBody: some View {
         HStack(alignment: .top, spacing: 10) {
             if message.role == .user { Spacer(minLength: 60) }
 
             VStack(alignment: message.role == .user ? .trailing : .leading, spacing: 4) {
                 // Reasoning (collapsible)
-                if let reasoning = message.reasoningContent, !reasoning.isEmpty {
-                    DisclosureGroup {
-                        Text(reasoning)
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
-                            .textSelection(.enabled)
-                            .frame(maxWidth: .infinity, alignment: .leading)
-                    } label: {
-                        Label("Thinking", systemImage: "brain")
-                            .font(.caption2.weight(.medium))
-                            .foregroundStyle(.secondary)
-                    }
-                    .padding(8)
-                    .background(.quaternary.opacity(0.5))
-                    .clipShape(RoundedRectangle(cornerRadius: 8))
-                }
+                thinkingBlock
 
                 // Attached images. Double-click opens the full image in Preview.
                 if let images = message.images, !images.isEmpty {

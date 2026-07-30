@@ -1,6 +1,6 @@
 import Foundation
 
-/// Time-driven "breathe" math for the in-window voice orb (`VoiceModeView`).
+/// Time-driven "breathe" math for the in-window voice orb (`VoiceOrbView`).
 ///
 /// IMPORTANT — orb only, never the tray. A continuously-firing breathe wedges
 /// SwiftUI `Button` hit-testing when it's hosted inside the `MenuBarExtra(.window)`

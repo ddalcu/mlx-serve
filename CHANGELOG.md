@@ -10,7 +10,7 @@
 - **Speed helpers set themselves up.** Download a dense Gemma 4 model and its speed-up companion model now comes along and just works, 27 to 40% faster on code and agent tasks. Nothing to pair up by hand.
 - **Faster model downloads.** Up to 16 connections per file, and model search stops getting rate limited when you have a Hugging Face token set.
 - **Fixed runaway memory on long chats.** A long session could quietly grow the server to tens of GB until you quit it (#110). Fixed, and the memory panel now shows exactly where the memory goes.
-
+- **Fixed thinking for some models.** Laguna needed a bit special handling for thinking tags, and potentially other models based on their chat template.
 ---
 
 ## v26.7.11 — Mage-Flow image editing, a built-in console, faster MoE decode

@@ -27,6 +27,10 @@ enum AgentEngine {
     static func tokenCostForMessage(_ msg: ChatMessage) -> Int {
         var cost = 4  // role + formatting envelope
         cost += roughTokenCount(msg.content)
+        // Round-tripped reasoning is part of what gets sent — a long thinking
+        // trace not billed here silently blows the budget it was never
+        // counted against.
+        if let rc = msg.reasoningContent { cost += roughTokenCount(rc) }
         if let tcs = msg.toolCalls {
             for tc in tcs {
                 cost += roughTokenCount(tc.name) + roughTokenCount(tc.arguments) + 8
@@ -223,6 +227,13 @@ enum AgentEngine {
                     .replacingOccurrences(of: "<pad>", with: "")
                     .trimmingCharacters(in: .whitespacesAndNewlines)
                 dict["content"] = content.isEmpty ? "" : content
+                // Round-trip the turn's reasoning: templates that persist
+                // reasoning across turns (laguna) render <think></think> on
+                // every prior turn without it and the model stops thinking
+                // from turn 2. Key omitted when absent (`is string` gates).
+                if let rc = msg.reasoningContent, !rc.isEmpty {
+                    dict["reasoning_content"] = rc
+                }
                 dict["tool_calls"] = tcs.map { tc -> [String: Any] in
                     [
                         "id": tc.id,
@@ -254,6 +265,13 @@ enum AgentEngine {
                 dict["content"] = multimodal(content, imgs)
             } else {
                 dict["content"] = content
+            }
+            // Same reasoning round-trip as the tool-call branch above. The
+            // pinned-plan emission stays bare on purpose: it's a truncated
+            // 500-char summary of an old turn, and stale reasoning there
+            // costs budget without informing the current step.
+            if msg.role == .assistant, let rc = msg.reasoningContent, !rc.isEmpty {
+                dict["reasoning_content"] = rc
             }
             history.append(dict)
         }

@@ -42,6 +42,7 @@ enum SettingsReset {
                 f("ctxSize") { $0.ctxSize = $1.ctxSize },
                 f("noVision") { $0.noVision = $1.noVision },
                 f("logLevel") { $0.logLevel = $1.logLevel },
+                f("logToFile") { $0.logToFile = $1.logToFile },
                 // No UI row of its own (CLI-only), but it IS a server flag —
                 // some section has to own it or it can never be restored.
                 f("requestTimeout") { $0.requestTimeout = $1.requestTimeout },

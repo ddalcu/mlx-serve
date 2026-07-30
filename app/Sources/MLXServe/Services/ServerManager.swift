@@ -681,17 +681,16 @@ class ServerManager: ObservableObject {
         resolveModelDir(repo: repo, modelsRoot: modelsRoot)
     }
 
-    /// Pure, root-injectable core (testable against a temp dir). A downloaded
-    /// model is marked by `config.json` (standard MLX layout) OR
-    /// `model_index.json` (diffusers layout — Mage-Flow's weight subdirs with NO
-    /// root config); gating on config.json alone made a fully-present Mage-Flow
-    /// read as "not downloaded" and every gen service throw `.modelMissing`.
+    /// Pure, root-injectable core (testable against a temp dir). "Is it on
+    /// disk?" is `DownloadManager.holdsWeightLayout` — the ONE predicate, not a
+    /// second copy of the marker list. The re-check exists only to reject a
+    /// GGUF-only folder, which `existingModelDir` also accepts and no media
+    /// engine can load. Listing the markers here instead is what made a
+    /// fully-present Mage-Flow, and later a fully-present FLUX.2-klein 9B, throw
+    /// `.modelMissing` from every gen service.
     nonisolated static func resolveModelDir(repo: String, modelsRoot: String) -> String? {
-        let fm = FileManager.default
         guard let dir = DownloadManager.existingModelDir(rootDir: modelsRoot, repoId: repo) else { return nil }
-        let hasConfig = fm.fileExists(atPath: (dir as NSString).appendingPathComponent("config.json"))
-        let hasIndex = fm.fileExists(atPath: (dir as NSString).appendingPathComponent("model_index.json"))
-        return (hasConfig || hasIndex) ? dir : nil
+        return DownloadManager.holdsWeightLayout(dir) ? dir : nil
     }
 
     private func killOrphanedServers(on port: UInt16) {

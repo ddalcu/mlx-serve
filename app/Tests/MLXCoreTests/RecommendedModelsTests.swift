@@ -198,25 +198,41 @@ final class RecommendedModelsTests: XCTestCase {
         XCTAssertNil(RecommendedModelPick.gemmaE4B.ggufFilename, "safetensors picks fetch the whole repo")
     }
 
-    /// poolside's Laguna S 2.1 is its own family section — a coding-specialist
-    /// MoE that isn't Gemma, Qwen, or a 96 GB+ "largest" pick. It's the compact
-    /// 2-bit MLX build the app was validated on, resolvable at the on-disk repo
-    /// path `pipenetwork/Laguna-S-2.1-MLX-2bit`.
-    func testPoolsideSectionHoldsLagunaS21TwoBit() {
-        XCTAssertEqual(RecommendedModelPick.poolsideCatalog.map(\.id), ["laguna-s-2.1-2bit"])
+    /// poolside's Laguna family is its own section — coding-specialist MoEs
+    /// that aren't Gemma or Qwen. Two picks, ascending, both poolside's own
+    /// NVFP4 4-bit MLX builds: the XS 2.1 the 26.7.12 perf round was validated
+    /// on (121 tok/s decode on an M4 Max), then the full S 2.1. The old
+    /// 2-bit community S build (`pipenetwork/Laguna-S-2.1-MLX-2bit`) was
+    /// dropped: noticeably worse output quality than the NVFP4 original.
+    func testPoolsideSectionHoldsLagunaXSThenS() {
+        XCTAssertEqual(RecommendedModelPick.poolsideCatalog.map(\.id),
+                       ["laguna-xs-2.1-nvfp4", "laguna-s-2.1-nvfp4"])
+        let xs = RecommendedModelPick.lagunaXS21
+        XCTAssertEqual(xs.family, .poolside)
+        XCTAssertEqual(xs.repoId, "poolside/Laguna-XS-2.1-NVFP4-mlx")
+        XCTAssertNil(xs.ggufFilename, "the MLX build fetches the whole safetensors repo")
         let laguna = RecommendedModelPick.lagunaS21
         XCTAssertEqual(laguna.family, .poolside)
-        XCTAssertEqual(laguna.repoId, "pipenetwork/Laguna-S-2.1-MLX-2bit")
+        XCTAssertEqual(laguna.repoId, "poolside/Laguna-S-2.1-NVFP4-mlx")
         XCTAssertNil(laguna.ggufFilename, "the MLX build fetches the whole safetensors repo")
     }
 
-    /// The 2-bit Laguna build is ~35 GB on disk, so ~42 GB with the ×1.2 RAM
-    /// overhead: it fits a 48 GB Mac inline but lands behind "Requires more RAM"
-    /// on a 32 GB one — it is NOT a 96 GB+ pick and must not read as one.
-    func testLagunaFitsMidRangeMacButNotSmallOne() {
+    /// The NVFP4 Laguna S build is ~67 GB on disk, so ~80 GB with the ×1.2 RAM
+    /// overhead: it fits a 96 GB Mac inline but lands behind "Requires more RAM"
+    /// on a 64 GB one.
+    func testLagunaFitsBigMacButNotMidRangeOne() {
         let laguna = RecommendedModelPick.lagunaS21
-        XCTAssertTrue(laguna.meetsSystemRequirements(physicalMemoryBytes: 48 * GiB))
-        XCTAssertFalse(laguna.meetsSystemRequirements(physicalMemoryBytes: 32 * GiB))
+        XCTAssertTrue(laguna.meetsSystemRequirements(physicalMemoryBytes: 96 * GiB))
+        XCTAssertFalse(laguna.meetsSystemRequirements(physicalMemoryBytes: 64 * GiB))
+    }
+
+    /// The XS build is ~20 GB on disk, so ~24 GB with the ×1.2 RAM overhead:
+    /// it fits a 32 GB Mac inline but lands behind "Requires more RAM" on a
+    /// 16 GB one.
+    func testLagunaXSFitsThirtyTwoGigMacButNotSixteen() {
+        let xs = RecommendedModelPick.lagunaXS21
+        XCTAssertTrue(xs.meetsSystemRequirements(physicalMemoryBytes: 32 * GiB))
+        XCTAssertFalse(xs.meetsSystemRequirements(physicalMemoryBytes: 16 * GiB))
     }
 
     /// The old 0.8B entry-level Qwen pick was replaced with 9B — too small

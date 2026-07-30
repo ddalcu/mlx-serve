@@ -892,6 +892,17 @@ private struct ServerSectionContent: View {
                 .frame(minWidth: 180)
             }
         }
+        if let m = meta["logToFile"] {
+            SettingsRow(
+                title: m.title,
+                explainer: m.explainer,
+                isDirty: dirty.dirty(\.logToFile)
+            ) {
+                Toggle("", isOn: $appState.serverOptions.logToFile)
+                    .labelsHidden()
+                    .toggleStyle(.switch)
+            }
+        }
         if let m = meta["skipMemPreflight"] {
             SettingsRow(
                 title: m.title,

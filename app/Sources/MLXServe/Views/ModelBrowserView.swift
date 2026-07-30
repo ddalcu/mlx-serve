@@ -157,7 +157,7 @@ private struct RecommendedPane: View {
 
                 ModelGroupSection(
                     title: "Laguna",
-                    subtitle: "poolside's Laguna S 2.1 — a coding-specialist mixture-of-experts model.",
+                    subtitle: "poolside's Laguna 2.1 coding models — mixture-of-experts specialists for code and agent work.",
                     systemImage: "chevron.left.forwardslash.chevron.right",
                     tint: .purple
                 ) {
