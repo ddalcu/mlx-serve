@@ -32,7 +32,7 @@ final class QuickLauncherTests: XCTestCase {
     func testEmptyTextIsIgnored() {
         XCTAssertEqual(QuickLauncherLogic.submitDecision(text: "   \n", serverRunning: true, composer: .idle), .ignore)
         // Ignore wins even when other guards would also fire.
-        XCTAssertEqual(QuickLauncherLogic.submitDecision(text: "", serverRunning: false, composer: .busyElsewhere), .ignore)
+        XCTAssertEqual(QuickLauncherLogic.submitDecision(text: "", serverRunning: false, composer: .generatingHere), .ignore)
     }
 
     func testServerDownBlocksWithExplanation() {
@@ -43,19 +43,10 @@ final class QuickLauncherTests: XCTestCase {
         XCTAssertTrue(message.localizedCaseInsensitiveContains("server"))
     }
 
-    func testBusyElsewhereBlocks() {
-        // Another chat's turn is in flight — the launcher must never clobber it
-        // (ChatTurnEngine.runTurn cancels the in-flight turn on submission).
-        let decision = QuickLauncherLogic.submitDecision(text: "hi", serverRunning: true, composer: .busyElsewhere)
-        guard case .blocked = decision else {
-            return XCTFail("expected .blocked, got \(decision)")
-        }
-    }
-
     func testGeneratingHereStopsThenSubmits() {
         // A new question in the launcher's own conversation supersedes the
-        // in-flight answer — engine.runTurn no-ops while isGenerating, so the
-        // caller must stop() first.
+        // in-flight answer. Another chat's turn no longer blocks anything —
+        // the engine is multi-turn, so `.idle` (submit) is the only other state.
         XCTAssertEqual(QuickLauncherLogic.submitDecision(text: "hi", serverRunning: true, composer: .generatingHere), .stopThenSubmit)
     }
 

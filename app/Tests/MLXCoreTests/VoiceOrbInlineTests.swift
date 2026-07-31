@@ -58,6 +58,23 @@ final class VoiceOrbInlineTests: XCTestCase {
                       "voice toggle goes BEFORE the send button")
     }
 
+    /// Voice is ONE instance bound to ONE chat (`boundSessionId`): the orb and
+    /// the toggle's on-tint must render only in the bound session's tab. A
+    /// bare `controller.isActive` gate lights up EVERY tab (the live report:
+    /// enabling voice in agent 1's chat showed it enabled in agent 2's and in
+    /// new chats too).
+    func testOrbAndToggleAreScopedToTheBoundSession() throws {
+        let orbFile = try viewSource("VoiceModeView.swift")
+        XCTAssertTrue(orbFile.contains("voiceOwnedHere("),
+                      "orb + toggle must render from the per-session ownership decision, not bare isActive")
+        let chat = try viewSource("ChatView.swift")
+        XCTAssertTrue(chat.contains("VoiceOrbView(controller: appState.voice, sessionId: sessionId)"),
+                      "the chat column must tell the orb WHICH session it renders for")
+        XCTAssertTrue(chat.contains("VoiceComposerToggle(controller: appState.voice,\n                            sessionId: sessionId,")
+                      || chat.contains("VoiceComposerToggle(controller: appState.voice, sessionId: sessionId,"),
+                      "the composer toggle must carry its session too")
+    }
+
     func testThinkingHeaderTogglesTheAccordion() throws {
         let chat = try viewSource("ChatView.swift")
         let block = try declaration("thinkingBlock", in: chat)

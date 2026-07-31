@@ -51,22 +51,15 @@ final class PerSessionUIStateTests: XCTestCase {
 
     func testComposerIdleWhenNothingGenerating() {
         let s = UUID()
-        XCTAssertEqual(ChatTurnEngine.composerState(isGenerating: false, activeTurnSessionId: nil, for: s), .idle)
-        XCTAssertEqual(ChatTurnEngine.composerState(isGenerating: false, activeTurnSessionId: s, for: s), .idle)
+        XCTAssertEqual(ChatTurnEngine.composerState(activeTurnSessionIds: [], for: s), .idle)
     }
 
-    func testComposerGeneratingHereOnlyForActiveTurnSession() {
+    func testComposerGeneratingHereOnlyForSessionsOwningATurn() {
         let a = UUID(); let b = UUID()
-        XCTAssertEqual(ChatTurnEngine.composerState(isGenerating: true, activeTurnSessionId: a, for: a), .generatingHere,
-                       "the chat that owns the in-flight turn shows Stop")
-        XCTAssertEqual(ChatTurnEngine.composerState(isGenerating: true, activeTurnSessionId: a, for: b), .busyElsewhere,
-                       "a different chat never shows Stop — it shows Send (disabled while busy)")
-    }
-
-    func testComposerBusyElsewhereWhenActiveSessionUnknown() {
-        let s = UUID()
-        XCTAssertEqual(ChatTurnEngine.composerState(isGenerating: true, activeTurnSessionId: nil, for: s), .busyElsewhere,
-                       "generating with no recorded owner is still 'not this chat'")
+        XCTAssertEqual(ChatTurnEngine.composerState(activeTurnSessionIds: [a], for: a), .generatingHere,
+                       "the chat that owns an in-flight turn shows Stop")
+        XCTAssertEqual(ChatTurnEngine.composerState(activeTurnSessionIds: [a], for: b), .idle,
+                       "another chat's turn no longer blocks this chat's Send (multi-turn engine)")
     }
 
     // MARK: - Think / MCP toggles persist per session (ChatSession migration)

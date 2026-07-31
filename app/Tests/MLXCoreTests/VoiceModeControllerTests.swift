@@ -891,4 +891,49 @@ final class VoiceModeControllerTests: XCTestCase {
         XCTAssertNil(c.pendingApproval)
         XCTAssertEqual(c.state, .idle)
     }
+
+    // MARK: - Per-session binding (voice is ONE instance, bound to ONE chat)
+
+    /// Voice is a single physical instance (one mic, one synthesizer); what is
+    /// per-session is the BINDING — the conversation voice is in. The orb and
+    /// the composer toggle's on-tint render only in the bound chat's tab, so
+    /// enabling voice in agent 1's chat doesn't light up agent 2's or a new one.
+    func testBeginBindsVoiceToItsLaunchSession() async {
+        let (c, _, _, _, sid) = makeRunnable()
+        XCTAssertNil(c.boundSessionId, "no binding before voice starts")
+        _ = await c.begin()
+        XCTAssertEqual(c.boundSessionId, sid, "begin binds to the turn context's session")
+    }
+
+    func testEndClearsTheBinding() async {
+        let (c, _, _, _, _) = makeRunnable()
+        _ = await c.begin()
+        c.end()
+        XCTAssertNil(c.boundSessionId, "an ended voice session owns no chat")
+    }
+
+    /// A spoken turn re-binds to wherever the turn actually routed — this is
+    /// how a "hey mickey" handover moves the orb to mickey's thread (the turn
+    /// context resolves the new agent's own session).
+    func testSubmittedTurnRebindsToTheTurnsSession() async {
+        let (c, rec, _, runner, _) = makeRunnable()
+        _ = await c.begin()
+        let moved = UUID()
+        c.turnContext = { (moved, nil) }      // handover: context now resolves elsewhere
+        rec.onFinalTranscript?("hello there")
+        XCTAssertEqual(runner.calls.last?.sessionId, moved)
+        XCTAssertEqual(c.boundSessionId, moved, "the binding follows the turn")
+    }
+
+    /// The pure decision the orb + toggle render from.
+    func testVoiceOwnedHereScopesToTheBoundSession() {
+        let bound = UUID(), other = UUID()
+        XCTAssertTrue(VoiceModeController.voiceOwnedHere(isActive: true, boundSessionId: bound, sessionId: bound))
+        XCTAssertFalse(VoiceModeController.voiceOwnedHere(isActive: true, boundSessionId: bound, sessionId: other),
+                       "another chat's tab shows voice OFF")
+        XCTAssertFalse(VoiceModeController.voiceOwnedHere(isActive: false, boundSessionId: bound, sessionId: bound),
+                       "inactive voice is owned nowhere")
+        XCTAssertTrue(VoiceModeController.voiceOwnedHere(isActive: true, boundSessionId: nil, sessionId: other),
+                      "an active-but-unbound voice (defensive) shows everywhere rather than becoming invisible")
+    }
 }

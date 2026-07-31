@@ -15,6 +15,10 @@ import AppKit
 /// started from either surface shows here).
 struct VoiceOrbView: View {
     @ObservedObject var controller: VoiceModeController
+    /// The chat column this orb renders in. Voice is ONE instance bound to ONE
+    /// session (`controller.boundSessionId`) — only that session's tab shows
+    /// the orb; every other chat renders nothing.
+    var sessionId: UUID?
 
     /// Orb diameter. 128 by design — big enough to read the state animation,
     /// small enough that the transcript stays the window's main content.
@@ -22,7 +26,9 @@ struct VoiceOrbView: View {
 
     @ViewBuilder
     var body: some View {
-        if controller.isActive {
+        if VoiceModeController.voiceOwnedHere(isActive: controller.isActive,
+                                              boundSessionId: controller.boundSessionId,
+                                              sessionId: sessionId) {
             VStack(spacing: 6) {
                 orb
                     .onTapGesture { if controller.state == .speaking { controller.bargeIn() } }
@@ -123,25 +129,41 @@ struct VoiceOrbView: View {
 /// not observe the controller.
 struct VoiceComposerToggle: View {
     @ObservedObject var controller: VoiceModeController
+    /// The chat column this toggle sits in — the on-tint shows only in the
+    /// session voice is BOUND to (see `VoiceModeController.boundSessionId`).
+    var sessionId: UUID?
     var disabled: Bool
     /// Starts voice with the surrounding chat's toggles/agent (ChatView's
-    /// `startVoiceMode`); turning OFF always just ends the controller.
+    /// `startVoiceMode`). Clicking the (off-tinted) toggle in another chat
+    /// while voice runs elsewhere MOVES voice here: end + start, adopting this
+    /// chat's agent/toggles.
     var start: () -> Void
+
+    private var ownedHere: Bool {
+        VoiceModeController.voiceOwnedHere(isActive: controller.isActive,
+                                           boundSessionId: controller.boundSessionId,
+                                           sessionId: sessionId)
+    }
 
     var body: some View {
         Button {
-            if controller.isActive { controller.end() } else { start() }
+            if ownedHere {
+                controller.end()
+            } else {
+                if controller.isActive { controller.end() }   // move: release the mic first
+                start()
+            }
         } label: {
             Image(systemName: "waveform")
                 .font(.system(size: 13, weight: .medium))
-                .foregroundStyle(controller.isActive ? Color.white : Color.secondary)
+                .foregroundStyle(ownedHere ? Color.white : Color.secondary)
                 .frame(width: ChatMetrics.composerIconSize, height: ChatMetrics.composerIconSize)
-                .background(controller.isActive ? Color.accentColor : Color.secondary.opacity(0.15))
+                .background(ownedHere ? Color.accentColor : Color.secondary.opacity(0.15))
                 .clipShape(Circle())
         }
         .buttonStyle(.plain)
         .frame(width: ChatMetrics.composerControlSize, height: ChatMetrics.composerControlSize)
         .disabled(disabled)
-        .help("Voice mode (\(controller.isActive ? "ON" : "OFF")) — talk to the model hands-free. Speech-to-text and text-to-speech run locally on your Mac; the model only handles text (and tools/thinking if enabled).")
+        .help("Voice mode (\(ownedHere ? "ON in this chat" : controller.isActive ? "ON in another chat — click to move it here" : "OFF")) — talk to the model hands-free. Speech-to-text and text-to-speech run locally on your Mac; the model only handles text (and tools/thinking if enabled).")
     }
 }

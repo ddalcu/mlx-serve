@@ -569,9 +569,9 @@ class AppState: ObservableObject {
         SecurityScopedBookmark.clear(name: SecurityScopedBookmark.attachedFolderName(id))
         chatSessions.removeAll { $0.id == id }
         // Stop the in-flight turn if it belonged to this session — otherwise
-        // it ghost-runs invisibly, holds the shared engine (every other chat
-        // reports "answering another chat" with no Stop control), and no
-        // server restart can clear it. See ChatTurnEngine.turnOrphaned.
+        // it ghost-runs invisibly with no Stop control anywhere, and no server
+        // restart can clear it. The sweep is per turn: only the deleted chat's
+        // turn stops. See ChatTurnEngine.stopIfOrphaned / TurnLedger.orphaned.
         chatEngine.stopIfOrphaned()
         if activeChatId == id {
             activeChatId = chatSessions.first?.id

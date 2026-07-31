@@ -392,20 +392,32 @@ enum MediaToolArgs {
 /// harness — a second driver on the same engine — inherited a spent budget and
 /// refused every generation it was ever asked for, permanently and silently. A
 /// token can't be forgotten: a driver that doesn't have one can't call at all,
-/// and any token that differs from the last is a new turn.
+/// and any unseen token is a new turn.
+///
+/// The spend is PER TOKEN, not "reset when the token changes": with the
+/// multi-turn engine two turns generate CONCURRENTLY and interleave their
+/// claims, and a single stored token reset the budget on every alternation —
+/// unlimited generations for both. Recent tokens are kept (bounded) so an
+/// interleaved claim always finds its own tally.
 struct MediaTurnBudget {
     static let limit = 1
-    private var turn: UUID?
-    private(set) var spent = 0
+    /// How many turn tallies to retain. Only turns that actually claimed are
+    /// stored; the cap exists so a long-lived engine can't grow unbounded.
+    static let retainedTurns = 16
+    private var spentByTurn: [UUID: Int] = [:]
+    private var order: [UUID] = []   // insertion order, for eviction
 
     /// nil = go ahead. Non-nil = the refusal to hand back as the tool result.
     mutating func claim(_ kind: MediaKind, turn: UUID) -> String? {
-        if self.turn != turn {
-            self.turn = turn
-            spent = 0
+        if spentByTurn[turn] == nil {
+            spentByTurn[turn] = 0
+            order.append(turn)
+            if order.count > Self.retainedTurns {
+                spentByTurn.removeValue(forKey: order.removeFirst())
+            }
         }
-        guard spent < Self.limit else { return Self.refusal(for: kind) }
-        spent += 1
+        guard let n = spentByTurn[turn], n < Self.limit else { return Self.refusal(for: kind) }
+        spentByTurn[turn] = n + 1
         return nil
     }
 

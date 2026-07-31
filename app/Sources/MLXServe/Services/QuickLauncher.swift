@@ -28,10 +28,9 @@ enum QuickLauncherLogic {
         case submit
     }
 
-    /// The engine runs one turn at a time app-wide and `runTurn` silently
-    /// no-ops while `isGenerating` — so a busy engine must either be stopped
-    /// first (our own conversation: the new question supersedes) or block the
-    /// submit (another chat's turn: never clobber it).
+    /// The engine is multi-turn: another chat's turn never blocks the
+    /// launcher. Only OUR OWN in-flight answer needs superseding (stop first —
+    /// the new question replaces the old one in the same conversation).
     static func submitDecision(text: String,
                                serverRunning: Bool,
                                composer: ChatTurnEngine.ComposerState) -> SubmitDecision {
@@ -40,7 +39,6 @@ enum QuickLauncherLogic {
             return .blocked("Server is not running — start it from the menu bar tray.")
         }
         switch composer {
-        case .busyElsewhere: return .blocked("The model is answering another chat — try again in a moment.")
         case .generatingHere: return .stopThenSubmit
         case .idle: return .submit
         }
@@ -255,7 +253,7 @@ final class QuickLauncherController: NSObject, ObservableObject, NSWindowDelegat
             updatePanelFrame(keepTopEdge: true)
             return false
         case .stopThenSubmit:
-            appState.chatEngine.stop()
+            stopOwnTurn()
             startTurn(text)
             return true
         case .submit:
@@ -264,10 +262,15 @@ final class QuickLauncherController: NSObject, ObservableObject, NSWindowDelegat
         }
     }
 
+    /// Stop the LAUNCHER's own in-flight turn — never anyone else's. The
+    /// engine is multi-turn now, so a chat tab's answer keeps streaming.
+    func stopOwnTurn() {
+        guard let sessionId else { return }
+        appState.chatEngine.stop(sessionId: sessionId)
+    }
+
     private func composerState() -> ChatTurnEngine.ComposerState {
-        guard let sessionId else {
-            return appState.chatEngine.isGenerating ? .busyElsewhere : .idle
-        }
+        guard let sessionId else { return .idle }
         return appState.chatEngine.composerState(for: sessionId)
     }
 

@@ -1215,9 +1215,12 @@ struct ChatDetailView: View {
                         // Live media generation, under the tool-call row that
                         // started it. These block chat decode on the one GPU for
                         // anything from seconds to minutes, so the alternative is
-                        // a window that looks frozen. Only in the chat that owns
-                        // the turn — the engine runs one at a time app-wide.
-                        if composerState == .generatingHere, let progress = chatEngine.mediaProgress {
+                        // a window that looks frozen. Only in the chat whose turn
+                        // ASKED for it — with concurrent turns, ownership rides
+                        // `mediaProgressSessionId`, not just "is generating".
+                        if composerState == .generatingHere,
+                           chatEngine.mediaProgressSessionId == sessionId,
+                           let progress = chatEngine.mediaProgress {
                             MediaProgressCard(progress: progress)
                                 .id("mediaProgress")
                         }
@@ -1322,7 +1325,7 @@ struct ChatDetailView: View {
                 // not a sheet over the transcript (the sheet hid the
                 // conversation and duplicated the composer's own toggles).
                 // Renders nothing while voice is off.
-                VoiceOrbView(controller: appState.voice)
+                VoiceOrbView(controller: appState.voice, sessionId: sessionId)
 
                 // One rounded container, two rows: the input on top with the
                 // full width of the column, its controls beneath — inside the
@@ -1532,8 +1535,8 @@ struct ChatDetailView: View {
                   let idx = appState.chatSessions.firstIndex(where: { $0.id == sessionId }) else { return }
             appState.chatSessions[idx].useMCP = newValue
         }
-        .onChange(of: chatEngine.isGenerating) { _, generating in
-            if !generating { inputFocused = true }
+        .onChange(of: composerState) { _, state in
+            if state == .idle { inputFocused = true }
         }
         .onChange(of: sessionId) { _, _ in
             // The view is reused across tabs, so reload the toolbar toggles from
@@ -1581,7 +1584,7 @@ struct ChatDetailView: View {
         // (Gemma 4 12B). Tap to record, tap again to attach.
         if audioSupported {
             MicButton(recorder: recorder) { toggleRecording() }
-                .disabled(server.status != .running || chatEngine.isGenerating)
+                .disabled(server.status != .running || composerState == .generatingHere)
         }
 
         // Think / Tools / MCP. Icon-only, and here rather than in the window
@@ -1611,7 +1614,7 @@ struct ChatDetailView: View {
 
         Button {
             if composerState == .generatingHere {
-                chatEngine.stop()
+                chatEngine.stop(sessionId: sessionId)
             } else {
                 sendMessage()
             }
@@ -1623,11 +1626,9 @@ struct ChatDetailView: View {
         }
         .buttonStyle(.plain)
         // Stop is always tappable for the owning chat. Otherwise: Send,
-        // disabled when the server is down, when this chat has nothing
-        // to send, or while ANOTHER chat is mid-turn (the single-turn
-        // engine can't start a concurrent run — so don't dead-click).
+        // disabled when the server is down or when this chat has nothing to
+        // send. Another chat's turn blocks nothing — the engine is multi-turn.
         .disabled(server.status != .running
-                  || composerState == .busyElsewhere
                   || (composerState == .idle
                       && inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
                       && pendingImages.isEmpty && pendingPDFs.isEmpty && pendingAudio.isEmpty))
@@ -1637,7 +1638,7 @@ struct ChatDetailView: View {
     /// Composer-row voice toggle — see `VoiceComposerToggle` for why it's an
     /// observing child view rather than a Button reading `appState.voice` here.
     private var voiceToggle: some View {
-        VoiceComposerToggle(controller: appState.voice,
+        VoiceComposerToggle(controller: appState.voice, sessionId: sessionId,
                             disabled: server.status != .running) { startVoiceMode() }
     }
 
@@ -1938,7 +1939,7 @@ struct ChatDetailView: View {
         return ContextWindowStats.make(
             promptTokens: usage?.promptTokens ?? 0,
             completionTokens: usage?.completionTokens ?? 0,
-            liveTokens: composerState == .generatingHere ? chatEngine.liveCompletionTokens : 0,
+            liveTokens: composerState == .generatingHere ? chatEngine.liveCompletionTokens(for: sessionId) : 0,
             contextLength: usage?.contextLength
                 ?? AgentEngine.effectiveContextLength(appContextSize: appState.contextSize,
                                                       modelContextLength: server.chatModelInfo?.contextLength),
@@ -1991,8 +1992,9 @@ struct ChatDetailView: View {
     }
 
     /// Start hands-free voice from the composer toggle. The controller is
-    /// app-level and may already be running (started from the tray) — the orb
-    /// above the composer follows `isActive`, so there is nothing to "present".
+    /// app-level; the toggle already ended any voice running elsewhere (the
+    /// "move it here" click), so by the time this runs the mic is free. The
+    /// orb renders inline in the BOUND session's tab — nothing to "present".
     private func startVoiceMode() {
         guard !appState.voice.isActive else { return }
         // Sync the voice toggles to the chat session being opened — talking should
@@ -2028,7 +2030,7 @@ struct ChatDetailView: View {
         // confirm first (unless this chat already declined that suggestion). The
         // dialog's buttons call proceedSend(); nothing is consumed until then.
         let trimmed = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !chatEngine.isGenerating, server.status == .running, !trimmed.isEmpty,
+        if composerState != .generatingHere, server.status == .running, !trimmed.isEmpty,
            let prompt = detectIntentPrompt(for: trimmed) {
             pendingIntentPrompt = prompt
             return
@@ -2087,7 +2089,7 @@ struct ChatDetailView: View {
         let attachedAudio = consumePendingAudio()
         let pdfText = consumePendingPDFsAsText()
         guard !text.isEmpty || attachedImages != nil || attachedAudio != nil || !pdfText.isEmpty,
-              !chatEngine.isGenerating, server.status == .running else { return }
+              composerState != .generatingHere, server.status == .running else { return }
         inputText = ""
         if !pdfText.isEmpty {
             text = text.isEmpty ? pdfText : pdfText + "\n\n" + text

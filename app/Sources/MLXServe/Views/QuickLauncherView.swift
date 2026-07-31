@@ -116,7 +116,7 @@ struct QuickLauncherView: View {
                 .foregroundStyle(.tertiary)
             Spacer()
             if generatingHere {
-                Button("Stop") { engine.stop() }
+                Button("Stop") { controller.stopOwnTurn() }
                     .keyboardShortcut(".", modifiers: .command)
                     .controlSize(.small)
             }

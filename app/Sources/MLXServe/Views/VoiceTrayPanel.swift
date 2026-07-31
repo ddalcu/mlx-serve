@@ -174,7 +174,11 @@ struct VoiceTrayPanel: View {
         HStack(spacing: 10) {
             controlButton(system: "plus.bubble", label: "New",
                           help: "Start a fresh conversation with this agent — the old one stays in the chat list") {
-                appState.chatEngine.stop()
+                // Scoped: only the voice conversation's turn. Other chat tabs'
+                // streams keep running (multi-turn engine).
+                if let sid = appState.activeChatId {
+                    appState.chatEngine.stop(sessionId: sid)
+                }
                 voice.bargeIn()
                 // A fresh thread FOR THE SAME AGENT, so the next turn doesn't get
                 // routed straight back into the old one. The previous thread is
