@@ -84,3 +84,60 @@ final class ChatModelSelectionTests: XCTestCase {
         XCTAssertEqual(ChatModelPill.headerName(""), "")
     }
 }
+
+/// The red "Start" button beside the chat model picker: when it shows, and what
+/// it says. The chat window is where you find out the server is down — the pill
+/// just goes grey — so the fix has to be reachable from there rather than only
+/// from the tray.
+final class ChatServerStartControlTests: XCTestCase {
+
+    /// A running server has nothing to start.
+    func testHiddenWhileRunning() {
+        XCTAssertEqual(ChatServerStartControl.resolve(status: .running, hasStartableModel: true), .hidden)
+    }
+
+    /// Stopped, with something to load: the button, in red.
+    func testStartOfferedWhenStopped() {
+        XCTAssertEqual(ChatServerStartControl.resolve(status: .stopped, hasStartableModel: true), .start)
+        XCTAssertEqual(ChatServerStartControl.start.title, "Start")
+        XCTAssertTrue(ChatServerStartControl.start.isRed)
+    }
+
+    /// A crashed server is offered the same way — "Error" in the tray is not an
+    /// instruction, and the recovery is identical.
+    func testStartOfferedAfterAnError() {
+        XCTAssertEqual(ChatServerStartControl.resolve(status: .error("boom"), hasStartableModel: true), .start)
+    }
+
+    /// The same control keeps reporting while the model loads (which takes tens
+    /// of seconds) — vanishing on click would read as the click not landing.
+    func testStartingKeepsTheControlWithProgress() {
+        let c = ChatServerStartControl.resolve(status: .starting, hasStartableModel: true)
+        XCTAssertEqual(c, .starting)
+        XCTAssertEqual(c.title, "Starting…")
+        XCTAssertFalse(c.isEnabled)
+        XCTAssertFalse(c.isRed, "a control you cannot press must not shout")
+    }
+
+    /// Nothing to start ⇒ no button. A disabled red control that never explains
+    /// itself is the dead-control class; the pill already says "Select a model".
+    func testHiddenWithNothingToStart() {
+        XCTAssertEqual(ChatServerStartControl.resolve(status: .stopped, hasStartableModel: false), .hidden)
+        XCTAssertEqual(ChatServerStartControl.resolve(status: .error("x"), hasStartableModel: false), .hidden)
+    }
+
+    /// `.starting` shows even with no local model selected: that state is only
+    /// reachable because something already started it (a LAN pick boots the
+    /// server headless), and hiding it mid-load would blink the toolbar.
+    func testStartingShowsEvenWithNoLocalSelection() {
+        XCTAssertEqual(ChatServerStartControl.resolve(status: .starting, hasStartableModel: false), .starting)
+    }
+
+    /// Only `.start` is pressable — the guard against wiring the action to a
+    /// state that is already doing the thing.
+    func testOnlyStartIsPressable() {
+        XCTAssertTrue(ChatServerStartControl.start.isEnabled)
+        XCTAssertFalse(ChatServerStartControl.hidden.isEnabled)
+        XCTAssertFalse(ChatServerStartControl.starting.isEnabled)
+    }
+}

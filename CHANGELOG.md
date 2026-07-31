@@ -1,8 +1,11 @@
 # Changelog
 
-## v26.7.12 — Laguna 5x faster, Agents, media generation in chat
+## v26.7.12 — Inkling Small support, Laguna 5x faster, Agents, media generation in chat
 
 - **The big speed release.** poolside Laguna XS generates almost 5x faster than the last release, from 25 to 121 tokens per second on an M4 Max. Qwen3.6 35B jumps 20%, from 129 to 155 tokens per second, and reaches 237 with its speed helper on. Most other models pick up a little too. One piece of this trades a tiny amount of wording variation for speed on certain models; it is on by default and can be switched off in Settings ("Fast decode for bf16-attention models"). The full version-by-version history lives in benchmarks.md.
+- **Inkling Small support.** Thinking Machines' 276B model (12B active) runs end to end: chat, thinking, tool calls and streaming. It's an unusual architecture. The pruned REAP-25 4-bit build (112 GB) fits a 128 GB Mac and our output matches the reference implementation token for token. It's also fast here: 47 tokens per second on an M4 Max, where the reference engine that ships with the checkpoint manages about 3 on the same machine. Text only for now, image and audio input come later.
+  - On a 128 GB Mac, raise the GPU memory ceiling once per boot or the model barely fits: `sudo sysctl iogpu.wired_limit_mb=120000`. That took decode from 29 to 47 tokens per second and usable context from 1.5K to 17K tokens in our runs. The setting resets on reboot. Close all your apps/browsers, it can crash your Mac if you OOM.
+  - Tool calling auto-corrected
 - **Agents.** Create named assistants with their own personality, voice, model, tools and wake phrase. The app writes the persona prompt for you, and every way of starting a conversation can run as that agent: chat, voice, tasks, Telegram, Quick Launcher.
 - **Kokoro voices.** 54 built-in voices that run fully on your Mac, about 17x faster than realtime, in a 330 MB download. Voices can be blended together. Qwen3-TTS remains the one that can clone your own voice.
 - **Media generation in chat.** Ask for an image, a spoken line, a music track or a short clip right in the conversation and it appears inline with a progress bar. The bigger FLUX.2-klein 9B image model is also in the model list now (10 GB), with the same fast generation and picture editing as the small one and better prompt following.

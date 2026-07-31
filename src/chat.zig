@@ -593,7 +593,18 @@ pub fn serializeMessagesJson(allocator: std.mem.Allocator, messages: []const Mes
             try buf.appendSlice(allocator, ",\"tool_calls\":[");
             for (tcs, 0..) |tc, ti| {
                 if (ti > 0) try buf.append(allocator, ',');
-                try buf.appendSlice(allocator, "{\"type\":\"function\",\"function\":{\"name\":");
+                try buf.appendSlice(allocator, "{\"type\":\"function\",");
+                if (tc.id.len > 0) {
+                    // Inkling's template names a tool RESULT by matching
+                    // `message.tool_call_id` against the history call's `id`
+                    // (`tc.id is defined and tc.id == message.tool_call_id`) —
+                    // without the id the result renders nameless. Inert for
+                    // templates that never read it.
+                    try buf.appendSlice(allocator, "\"id\":");
+                    try appendJsonString(allocator, &buf, tc.id);
+                    try buf.append(allocator, ',');
+                }
+                try buf.appendSlice(allocator, "\"function\":{\"name\":");
                 try appendJsonString(allocator, &buf, tc.name);
                 try buf.appendSlice(allocator, ",\"arguments\":");
                 // Embed arguments as a JSON OBJECT when it parses cleanly — Qwen
@@ -667,8 +678,17 @@ fn serializeExtraContext(allocator: std.mem.Allocator, chat_config: *const ChatC
     // no_think), not enable_thinking — and default HIGH when the var is
     // absent. Always supply the mapped value so thinking-off requests
     // actually close the think block; templates that don't read it ignore it.
+    //
+    // Inkling's template ALSO reads `reasoning_effort` but with a different
+    // vocabulary (none/minimal/low/medium/high/max) and raise_exception's on
+    // anything else — hy3's "no_think" would fail the render and silently
+    // swap in fallbackFormatChat (wrong-family tags). Its thinking-off word
+    // is "none"; sniffed by the effort header string unique to that family.
+    const inkling_style = std.mem.indexOf(u8, chat_config.chat_template, "Thinking effort level") != null;
     try buf.appendSlice(allocator, if (enable_thinking)
         ",\"reasoning_effort\":\"high\""
+    else if (inkling_style)
+        ",\"reasoning_effort\":\"none\""
     else
         ",\"reasoning_effort\":\"no_think\"");
 
@@ -1000,6 +1020,8 @@ fn endsWithThinkOpenTag(text: []const u8) ?usize {
 
 /// Strip `<think>...</think>` or `<|channel>thought\n...<channel|>` block from model output.
 pub fn stripThinkBlock(text: []const u8) []const u8 {
+    // Inkling message channels: same arm as splitThinkBlock (content only).
+    if (splitInklingChannels(text)) |split| return split.content;
     const base = stripThinkBlockLeading(text);
     const trimmed = if (lastUnclosedThinkOpen(base)) |o|
         std.mem.trimEnd(u8, base[0..o.pos], "\n ")
@@ -1064,6 +1086,66 @@ pub const ThinkSplit = struct {
 };
 
 /// True when a rendered generation prompt ends inside a think block the
+const INKLING_THINKING_TAG = "<|content_thinking|>";
+const INKLING_TEXT_TAG = "<|content_text|>";
+const INKLING_END_TAG = "<|end_message|>";
+const INKLING_MODEL_TAG = "<|message_model|>";
+const INKLING_INVOKE_TAG = "<|content_invoke_tool_json|>";
+
+/// Control-channel marker TOKENS that must never appear in a visible stream
+/// delta. Every entry is a single special token in its family's vocab, so
+/// exact-match filtering at the delta level is complete — a marker can't be
+/// split across deltas. Shared by every streaming surface's flush path.
+pub fn isChannelMarkerToken(tt: []const u8) bool {
+    return std.mem.eql(u8, tt, "<|channel>") or std.mem.eql(u8, tt, "<channel|>") or
+        std.mem.eql(u8, tt, "<think>") or std.mem.eql(u8, tt, "</think>") or
+        std.mem.eql(u8, tt, INKLING_TEXT_TAG) or std.mem.eql(u8, tt, INKLING_END_TAG) or
+        std.mem.eql(u8, tt, INKLING_MODEL_TAG) or std.mem.eql(u8, tt, INKLING_THINKING_TAG);
+}
+
+/// Strip a leading `<|message_model|>` (and, on raw completions, a leading
+/// `<|end_message|>` closing the prompt's implicit message) so the channel
+/// marker is at position 0.
+fn inklingStripMessageHead(text: []const u8) []const u8 {
+    var t = std.mem.trimStart(u8, text, "\n ");
+    if (std.mem.startsWith(u8, t, INKLING_END_TAG)) t = t[INKLING_END_TAG.len..];
+    if (std.mem.startsWith(u8, t, INKLING_MODEL_TAG)) t = t[INKLING_MODEL_TAG.len..];
+    return t;
+}
+
+/// Content runs to its `<|end_message|>` (anything after is a re-opened
+/// message the stop token cut, or trailing markers — dropped).
+fn inklingTrimContentTail(content_in: []const u8) []const u8 {
+    var content = content_in;
+    if (std.mem.indexOf(u8, content, INKLING_END_TAG)) |em| content = content[0..em];
+    return std.mem.trim(u8, content, "\n ");
+}
+
+/// The Inkling arm of splitThinkBlock: null when the text carries no Inkling
+/// channel markers (every other family falls through).
+fn splitInklingChannels(text: []const u8) ?ThinkSplit {
+    const t = inklingStripMessageHead(text);
+    if (std.mem.startsWith(u8, t, INKLING_THINKING_TAG)) {
+        const body = t[INKLING_THINKING_TAG.len..];
+        if (std.mem.indexOf(u8, body, INKLING_END_TAG)) |em| {
+            const reasoning = std.mem.trim(u8, body[0..em], "\n ");
+            var content = inklingStripMessageHead(body[em + INKLING_END_TAG.len ..]);
+            if (std.mem.startsWith(u8, content, INKLING_TEXT_TAG)) content = content[INKLING_TEXT_TAG.len..];
+            return .{
+                .reasoning_content = if (reasoning.len > 0) reasoning else null,
+                .content = inklingTrimContentTail(content),
+            };
+        }
+        // Length-truncated mid-thought: reasoning, never content.
+        const reasoning = std.mem.trim(u8, body, "\n ");
+        return .{ .reasoning_content = if (reasoning.len > 0) reasoning else null, .content = "" };
+    }
+    if (std.mem.startsWith(u8, t, INKLING_TEXT_TAG)) {
+        return .{ .reasoning_content = null, .content = inklingTrimContentTail(t[INKLING_TEXT_TAG.len..]) };
+    }
+    return null;
+}
+
 /// template opened (Qwen 3.5/3.6 style: `…assistant\n<think>\n`). Callers
 /// decode the last few prompt tokens and pass the tail here. A thinking-off
 /// render ends with a CLOSED `</think>` block and must not match.
@@ -1078,6 +1160,12 @@ pub fn promptTailOpensThink(tail: []const u8) bool {
 /// think opener (see `promptTailOpensThink`), so output with no literal opener
 /// and no close tag is still reasoning — generation started inside the block.
 pub fn splitThinkBlock(text: []const u8, thinking: bool, opened_by_template: bool) ThinkSplit {
+    // Inkling (inkling_mm_model) message channels: the model emits role-less
+    // MESSAGES — `<|content_thinking|>R<|end_message|>` then
+    // `<|message_model|><|content_text|>C<|end_message|>` — not a tag pair.
+    // Keyed on channel openers no other family emits; runs regardless of the
+    // `thinking` flag because the content marker needs stripping either way.
+    if (splitInklingChannels(text)) |split| return split;
     // Gemma 4 style: <|channel>thought\n...<channel|>\n<|channel>\ncontent
     if (std.mem.indexOf(u8, text, "<channel|>")) |end| {
         const think_tag = "<|channel>thought\n";
@@ -1337,6 +1425,20 @@ pub fn streamShouldBufferForTools(buf: []const u8) bool {
     // Gemma 4 fully-formed canonical open.
     if (std.mem.indexOf(u8, buf, "<|tool_call") != null) return true;
 
+    // Inkling: the invoke marker is a SINGLE special token (arrives whole) —
+    // once present, everything from here on is call payload. Without this the
+    // NAME + full JSON streamed as visible content deltas (live 2026-07-30,
+    // first real pi session; the leak landed in pi's transcript and
+    // contaminated every later turn's history).
+    if (std.mem.indexOf(u8, buf, INKLING_INVOKE_TAG) != null) return true;
+    // Inkling NAME hold: with a message-boundary marker present (a family
+    // signal no other template emits), a segment that is still a bare
+    // identifier run may be the NAME directly before an invoke marker. Prose
+    // disambiguates within a token or two (space/punctuation); a call
+    // disambiguates at the invoke marker. An EMPTY segment never holds, so
+    // thinking splits stay prompt and marker-only flushes keep flowing.
+    if (inklingSegmentCouldBeToolName(buf)) return true;
+
     // `<tool…` family: walk every `<tool` occurrence, accept the first one
     // whose terminator is valid (mirrors parseToolCalls' acceptance rule).
     var scan: usize = 0;
@@ -1362,6 +1464,30 @@ pub fn streamShouldBufferForTools(buf: []const u8) bool {
     return false;
 }
 
+/// Inkling streaming NAME hold: true when the text after the last message
+/// boundary (<|end_message|> / <|message_model|> / <|content_text|>) is a
+/// NON-EMPTY bare identifier run — the shape of a tool NAME right before its
+/// invoke marker. A thinking message never matches (no boundary marker →
+/// whole buffer, which carries `<|`); other families never emit these
+/// markers at all.
+fn inklingSegmentCouldBeToolName(buf: []const u8) bool {
+    var seg_start: usize = 0;
+    var saw_marker = false;
+    inline for (.{ INKLING_END_TAG, INKLING_MODEL_TAG, INKLING_TEXT_TAG }) |tag| {
+        if (std.mem.lastIndexOf(u8, buf, tag)) |p| {
+            saw_marker = true;
+            seg_start = @max(seg_start, p + tag.len);
+        }
+    }
+    if (!saw_marker) return false;
+    const seg = buf[seg_start..];
+    if (seg.len == 0 or seg.len > 64) return false;
+    for (seg) |c| {
+        if (!inklingIsNameChar(c)) return false;
+    }
+    return true;
+}
+
 /// Streaming-only: what should a tools-enabled SSE path do with the buffered
 /// text so far, with respect to thinking? Shared by the chat-completions and
 /// Anthropic /v1/messages stream handlers — the two paths drifted apart once
@@ -1382,6 +1508,17 @@ pub fn streamShouldBufferForTools(buf: []const u8) bool {
 pub const StreamThinkGate = enum { flush_text, hold_thinking, split_think };
 
 pub fn streamThinkGate(buf: []const u8, enable_thinking: bool, think_closed: bool) StreamThinkGate {
+    // Inkling channels decide early: every marker is a SINGLE special token,
+    // so a leading <|content_text|> is a whole marker (the flush path's
+    // marker-token skip keeps it out of visible deltas), and a thinking
+    // message holds until its <|end_message|> arrives.
+    {
+        const ihead = inklingStripMessageHead(buf);
+        if (std.mem.startsWith(u8, ihead, INKLING_TEXT_TAG)) return .flush_text;
+        if (std.mem.startsWith(u8, ihead, INKLING_THINKING_TAG)) {
+            return if (std.mem.indexOf(u8, ihead, INKLING_END_TAG) != null) .split_think else .hold_thinking;
+        }
+    }
     const has_thinking = (enable_thinking and !think_closed) or
         std.mem.indexOf(u8, buf, "<|channel>thought") != null or
         indexOfThinkOpenTag(buf, 0) != null or
@@ -1439,11 +1576,16 @@ pub fn parseToolCalls(allocator: std.mem.Allocator, text: []const u8) !?[]Parsed
     // inner `<tool…>` blocks get a chance — this is what makes the outer
     // `<tool_calls>` wrapper case work.
     //
-    // Hy3 (Hunyuan 3) SUFFIXED tag format is tried FIRST: its wrapper
-    // (`<tool_calls:opensource>`) would also trip the generic `<tool` scan
-    // below, which would misread the non-JSON arg_key/arg_value body. When it
-    // matched, the generic scans are skipped but the shared safety net at the
-    // bottom still runs.
+    // Inkling (inkling_mm_model) is tried FIRST: its calls are MESSAGES —
+    // `NAME<|content_invoke_tool_json|>{"name":…,"args":{…}}<|end_message|>` —
+    // whose distinctive marker no other family emits; the generic `<tool`
+    // scans never see the shape and other families never carry the marker.
+    try parseInklingToolCalls(allocator, text, &calls);
+    // Hy3 (Hunyuan 3) SUFFIXED tag format is tried FIRST among the tag
+    // families: its wrapper (`<tool_calls:opensource>`) would also trip the
+    // generic `<tool` scan below, which would misread the non-JSON
+    // arg_key/arg_value body. When it matched, the generic scans are skipped
+    // but the shared safety net at the bottom still runs.
     try parseHy3ToolCalls(allocator, effective_text, &calls);
     var search_pos: usize = if (calls.items.len > 0) effective_text.len else 0;
     while (search_pos < effective_text.len) {
@@ -1760,8 +1902,12 @@ pub fn parseToolCalls(allocator: std.mem.Allocator, text: []const u8) !?[]Parsed
         }
     }
 
-    // If no <tool_call> tags, try to find raw JSON tool call(s)
-    if (calls.items.len == 0) {
+    // If no <tool_call> tags, try to find raw JSON tool call(s). Never on
+    // text carrying the Inkling invoke marker: that format OWNED the parse,
+    // and a call it deliberately skipped (no recoverable name) must not be
+    // resurrected from its payload bytes by the bare-JSON heuristic — the
+    // comment below says "no tag syntax anywhere", and there IS tag syntax.
+    if (calls.items.len == 0 and std.mem.indexOf(u8, text, INKLING_INVOKE_TAG) == null) {
         var trimmed = std.mem.trim(u8, effective_text, " \t\n\r");
         if (std.mem.startsWith(u8, trimmed, "</tool_call>")) {
             trimmed = std.mem.trim(u8, trimmed["</tool_call>".len..], " \t\n\r");
@@ -2778,6 +2924,105 @@ fn earliestIndexOfAny(text: []const u8, from: usize, needles: []const []const u8
         }
     }
     return best;
+}
+
+/// A tool-name character per the identifier alphabet every template family's
+/// names draw from. The Inkling NAME is glued directly to the invoke marker,
+/// so anything outside this set (a channel marker's `>`, a payload's `}`,
+/// prose punctuation) terminates the name run.
+fn inklingIsNameChar(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '_' or c == '.' or c == '-';
+}
+
+/// The trailing identifier run ending at `end` (exclusive). Live 2026-07-30:
+/// the boundary-based prefix scan swallowed the `<|content_text|>` marker
+/// (name `<|content_text|>bash`), and a dropped `<|end_message|>` between
+/// calls produced `}}write` — both resolve to the bare NAME here.
+fn inklingTrailingNameRun(text: []const u8, end: usize) []const u8 {
+    var start = end;
+    while (start > 0 and inklingIsNameChar(text[start - 1])) start -= 1;
+    return text[start..end];
+}
+
+/// Inkling tool calls: `NAME<|content_invoke_tool_json|>{"name":…,"args":{…}}<|end_message|>`
+/// per call (one message each; parallel calls are consecutive messages). The
+/// payload's "name" is authoritative (the prefix NAME is the same string in
+/// well-formed output, and is the fallback when the payload is truncated).
+/// Truncation salvage per the hard rule: recover NAME + `{}` — never partial
+/// argument values.
+fn parseInklingToolCalls(allocator: std.mem.Allocator, text: []const u8, calls: *std.ArrayList(ParsedToolCall)) !void {
+    var pos: usize = 0;
+    while (std.mem.indexOfPos(u8, text, pos, INKLING_INVOKE_TAG)) |inv| {
+        const prefix_name = inklingTrailingNameRun(text, inv);
+
+        // Body = the balanced JSON object right after the marker (string-aware
+        // brace scan). The next <|end_message|> is NOT a reliable terminator:
+        // the model drops it between back-to-back calls (live 2026-07-30,
+        // `{…}}write<|content_invoke_tool_json|>{…}`), and an end-tag-bounded
+        // body then swallows the following call whole. No balance by end of
+        // text = truncation → the NAME + `{}` salvage below.
+        const body_start = inv + INKLING_INVOKE_TAG.len;
+        var body: []const u8 = "";
+        const after = std.mem.trimStart(u8, text[body_start..], "\n ");
+        if (std.mem.startsWith(u8, after, "{")) {
+            if (balancedJsonObject(after)) |obj| {
+                body = obj;
+                pos = (body_start + (text.len - body_start - after.len)) + obj.len;
+            } else {
+                pos = text.len; // truncated object — nothing further to scan
+            }
+        } else {
+            // No object after the marker at all: keep the old end-tag-bounded
+            // read so a non-JSON payload still gets a parse attempt.
+            const body_end = std.mem.indexOfPos(u8, text, body_start, INKLING_END_TAG) orelse text.len;
+            body = std.mem.trim(u8, text[body_start..body_end], "\n ");
+            pos = body_end;
+        }
+
+        var name: []const u8 = prefix_name;
+        var args_json: ?[]const u8 = null; // allocated when set
+        if (std.json.parseFromSlice(std.json.Value, allocator, body, .{})) |parsed| {
+            defer parsed.deinit();
+            if (parsed.value == .object) {
+                if (parsed.value.object.get("name")) |nv| {
+                    if (nv == .string and nv.string.len > 0) {
+                        name = nv.string;
+                        // Marker-echo repair: pi's "Tool <|content_text|>bash
+                        // not found" reply taught the model to copy the garbage
+                        // name INTO its payloads (live 2026-07-30). No real
+                        // tool name contains `<|` — keep the trailing
+                        // identifier run; empty → fall back to the prefix name.
+                        if (std.mem.indexOf(u8, name, "<|") != null) {
+                            name = inklingTrailingNameRun(name, name.len);
+                            if (name.len == 0) name = prefix_name;
+                        }
+                    }
+                }
+                if (parsed.value.object.get("args")) |av| {
+                    if (av == .object) {
+                        // Re-serialize through Stringify: escaping + key dedup
+                        // by construction (the tag-converter invariant).
+                        args_json = std.json.Stringify.valueAlloc(allocator, av, .{}) catch null;
+                    }
+                }
+                // `name` borrows from `parsed` — dupe before deinit.
+                name = try allocator.dupe(u8, name);
+            } else {
+                name = try allocator.dupe(u8, name);
+            }
+        } else |_| {
+            // Truncated / mangled payload: NAME + {} (never ship fragments).
+            name = try allocator.dupe(u8, name);
+        }
+        errdefer allocator.free(name);
+        if (name.len == 0) {
+            allocator.free(name);
+            if (args_json) |a| allocator.free(a);
+            continue;
+        }
+        const arguments = args_json orelse try allocator.dupe(u8, "{}");
+        try calls.append(allocator, .{ .name = name, .arguments = arguments, .inferred = false });
+    }
 }
 
 fn parseHy3ToolCalls(allocator: std.mem.Allocator, text: []const u8, calls: *std.ArrayList(ParsedToolCall)) !void {
@@ -4209,6 +4454,184 @@ test "promptTailOpensThink detects template-injected opener" {
     // Gemma 4 prompt tail (no injected opener)
     try testing.expect(!promptTailOpensThink("<|turn>model\n"));
     try testing.expect(!promptTailOpensThink(""));
+}
+
+test "splitThinkBlock: Inkling message channels (thinking + text + truncation)" {
+    // Real REAP25 captures (2026-07-30): the model emits role-less MESSAGES —
+    // a thinking message, then a fresh <|message_model|> text message — not a
+    // tag pair. Channel markers must never leak into content or reasoning.
+    {
+        const out = "<|content_thinking|>Shorter wavelengths scatter more.<|end_message|><|message_model|><|content_text|>Rayleigh scattering.<|end_message|>";
+        const split = splitThinkBlock(out, true, false);
+        try testing.expectEqualStrings("Shorter wavelengths scatter more.", split.reasoning_content.?);
+        try testing.expectEqualStrings("Rayleigh scattering.", split.content);
+    }
+    // Thinking-off shape (live capture: chat 2+2)
+    {
+        const out = "<|content_text|>4<|end_message|>";
+        const split = splitThinkBlock(out, false, false);
+        try testing.expect(split.reasoning_content == null);
+        try testing.expectEqualStrings("4", split.content);
+    }
+    // Length-truncated mid-thought: reasoning, never content
+    {
+        const out = "<|content_thinking|>The user is asking for";
+        const split = splitThinkBlock(out, true, false);
+        try testing.expectEqualStrings("The user is asking for", split.reasoning_content.?);
+        try testing.expectEqualStrings("", split.content);
+    }
+    // Raw-completion shape: leading <|end_message|><|message_model|> before
+    // the first channel marker (no template context).
+    {
+        const out = "<|end_message|><|message_model|><|content_thinking|>Standard implementation.<|end_message|><|message_model|><|content_text|>def fib(n): ...<|end_message|>";
+        const split = splitThinkBlock(out, true, false);
+        try testing.expectEqualStrings("Standard implementation.", split.reasoning_content.?);
+        try testing.expectEqualStrings("def fib(n): ...", split.content);
+    }
+}
+
+test "parseToolCalls: Inkling invoke_tool_json family" {
+    const allocator = testing.allocator;
+    // Canonical shape from the chat template: NAME<|content_invoke_tool_json|>
+    // {"name":...,"args":{...}}<|end_message|>, optionally after a thinking message.
+    {
+        const text = "<|content_thinking|>Need the time.<|end_message|><|message_model|>get_time<|content_invoke_tool_json|>{\"name\":\"get_time\",\"args\":{\"timezone\":\"UTC\"}}<|end_message|>";
+        const calls = (try parseToolCalls(allocator, text)).?;
+        defer {
+            for (calls) |tc| {
+                allocator.free(tc.name);
+                allocator.free(tc.arguments);
+            }
+            allocator.free(calls);
+        }
+        try testing.expectEqual(@as(usize, 1), calls.len);
+        try testing.expectEqualStrings("get_time", calls[0].name);
+        try testing.expect(!calls[0].inferred);
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+        defer parsed.deinit();
+        try testing.expectEqualStrings("UTC", parsed.value.object.get("timezone").?.string);
+    }
+    // Two calls in one turn (parallel) — each its own message.
+    {
+        const text = "<|message_model|>alpha<|content_invoke_tool_json|>{\"name\":\"alpha\",\"args\":{\"a\":1}}<|end_message|><|message_model|>beta<|content_invoke_tool_json|>{\"name\":\"beta\",\"args\":{}}<|end_message|>";
+        const calls = (try parseToolCalls(allocator, text)).?;
+        defer {
+            for (calls) |tc| {
+                allocator.free(tc.name);
+                allocator.free(tc.arguments);
+            }
+            allocator.free(calls);
+        }
+        try testing.expectEqual(@as(usize, 2), calls.len);
+        try testing.expectEqualStrings("alpha", calls[0].name);
+        try testing.expectEqualStrings("beta", calls[1].name);
+    }
+    // Truncated mid-args: salvage NAME + {} — never partial values.
+    {
+        const text = "<|message_model|>write_file<|content_invoke_tool_json|>{\"name\":\"write_file\",\"args\":{\"path\":\"/tmp/x\",\"content\":\"half-writ";
+        const calls = (try parseToolCalls(allocator, text)).?;
+        defer {
+            for (calls) |tc| {
+                allocator.free(tc.name);
+                allocator.free(tc.arguments);
+            }
+            allocator.free(calls);
+        }
+        try testing.expectEqual(@as(usize, 1), calls.len);
+        try testing.expectEqualStrings("write_file", calls[0].name);
+        try testing.expectEqualStrings("{}", calls[0].arguments);
+    }
+}
+
+test "parseToolCalls: Inkling name is the trailing identifier run" {
+    const allocator = testing.allocator;
+    // Live 2026-07-30 pi session: the tool message opens with the
+    // <|content_text|> marker glued to the NAME. When the payload is
+    // truncated, the salvage name must be the bare identifier — never
+    // `<|content_text|>bash` (pi's "Tool <|content_text|>bash not found"
+    // reply taught the model to echo that garbage name back).
+    {
+        const text = "<|message_model|><|content_text|>bash<|content_invoke_tool_json|>{\"name\":\"bash\",\"args\":{\"command\":\"ls";
+        const calls = (try parseToolCalls(allocator, text)).?;
+        defer {
+            for (calls) |tc| {
+                allocator.free(tc.name);
+                allocator.free(tc.arguments);
+            }
+            allocator.free(calls);
+        }
+        try testing.expectEqual(@as(usize, 1), calls.len);
+        try testing.expectEqualStrings("bash", calls[0].name);
+        try testing.expectEqualStrings("{}", calls[0].arguments);
+    }
+    // Marker echoed INTO the payload's "name" (the self-reinforcing loop's
+    // second stage): sanitize to the trailing identifier run.
+    {
+        const text = "<|message_model|>bash<|content_invoke_tool_json|>{\"name\":\"<|content_text|>bash\",\"args\":{}}<|end_message|>";
+        const calls = (try parseToolCalls(allocator, text)).?;
+        defer {
+            for (calls) |tc| {
+                allocator.free(tc.name);
+                allocator.free(tc.arguments);
+            }
+            allocator.free(calls);
+        }
+        try testing.expectEqual(@as(usize, 1), calls.len);
+        try testing.expectEqualStrings("bash", calls[0].name);
+    }
+    // Payload name that is ONLY a marker, no prefix name either → the call
+    // has no recoverable name and is skipped.
+    {
+        const text = "<|message_model|><|content_invoke_tool_json|>{\"name\":\"<|content_text|>\",\"args\":{}}<|end_message|>";
+        const calls = try parseToolCalls(allocator, text);
+        try testing.expect(calls == null);
+    }
+}
+
+test "parseToolCalls: Inkling back-to-back invokes without <|end_message|>" {
+    const allocator = testing.allocator;
+    // Live 2026-07-30: the model drops the <|end_message|> between two calls
+    // (`{…}}write<|content_invoke_tool_json|>{…}`). Body extraction must stop
+    // at the balanced object — an end-tag-bounded body swallows call 2 whole.
+    const text = "<|message_model|><|content_text|>write<|content_invoke_tool_json|>{\"name\":\"write\",\"args\":{\"path\":\"a.js\",\"content\":\"x\"}}write<|content_invoke_tool_json|>{\"name\":\"write\",\"args\":{\"path\":\"b.js\",\"content\":\"y\"}}<|end_message|>";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 2), calls.len);
+    try testing.expectEqualStrings("write", calls[0].name);
+    try testing.expectEqualStrings("write", calls[1].name);
+    const p0 = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer p0.deinit();
+    try testing.expectEqualStrings("a.js", p0.value.object.get("path").?.string);
+    const p1 = try std.json.parseFromSlice(std.json.Value, allocator, calls[1].arguments, .{});
+    defer p1.deinit();
+    try testing.expectEqualStrings("b.js", p1.value.object.get("path").?.string);
+}
+
+test "streamShouldBufferForTools: Inkling invoke marker and NAME hold" {
+    // The invoke marker is a single special token — once present, everything
+    // from here is call payload and must never flush as content.
+    try testing.expect(streamShouldBufferForTools("<|message_model|>bash<|content_invoke_tool_json|>"));
+    try testing.expect(streamShouldBufferForTools("<|content_invoke_tool_json|>{\"name\":\"bash\""));
+    // NAME hold: an Inkling boundary marker plus a bare identifier segment
+    // could be the NAME right before the invoke marker — hold until
+    // disambiguated (prose adds a space/punct within a token or two).
+    try testing.expect(streamShouldBufferForTools("<|message_model|><|content_text|>bash"));
+    try testing.expect(streamShouldBufferForTools("<|message_model|>get_time"));
+    // Prose disambiguates → flows.
+    try testing.expect(!streamShouldBufferForTools("<|content_text|>The answer"));
+    // Completed message (empty segment after the end marker) → flows.
+    try testing.expect(!streamShouldBufferForTools("<|content_text|>4<|end_message|>"));
+    // A thinking message never trips the NAME hold (the think gate owns it).
+    try testing.expect(!streamShouldBufferForTools("<|content_thinking|>Need the time"));
+    // No Inkling markers → other families completely unaffected.
+    try testing.expect(!streamShouldBufferForTools("bash"));
+    try testing.expect(!streamShouldBufferForTools("plain prose mentioning get_time here"));
 }
 
 test "parseToolCalls JSON format" {
@@ -6075,6 +6498,82 @@ test "renderChatTemplate: REAL Hy3 chat_template.jinja renders without fallback 
         defer allocator.free(rendered);
         try testing.expect(!promptTailOpensThink(rendered));
         try testing.expect(std.mem.indexOf(u8, rendered, "<think:opensource></think:opensource>") != null);
+    }
+}
+
+test "renderChatTemplate: REAL Inkling chat_template.jinja renders without fallback (hermetic)" {
+    // src/fixtures/inkling_chat_template.jinja is the verbatim template from
+    // pipenetwork/Inkling-Small-MLX-* (Thinking Machines Inkling Small). It
+    // exercises jinja features no other family does — namespace(), dict/tuple
+    // literals, tojson(sort_keys=true, separators=(",", ":")), `is mapping` —
+    // and it RAISES on any reasoning_effort string it doesn't know (including
+    // hy3's "no_think") and on tool-call arguments passed as a JSON STRING. A
+    // raise = silent fallbackFormatChat = wrong-family tags, so the render is
+    // pinned hermetically for both thinking arms.
+    const allocator = testing.allocator;
+    const tpl = @embedFile("fixtures/inkling_chat_template.jinja");
+
+    var config = ChatConfig{
+        .chat_template = tpl,
+        .bos_token = null,
+        .eos_token = null,
+        .add_bos_token = false,
+        .allocator = allocator,
+    };
+
+    const tools_json =
+        \\[{"type":"function","function":{"name":"get_time","description":"Get time","parameters":{"type":"object","properties":{"timezone":{"type":"string"}},"required":["timezone"]}}}]
+    ;
+    const tc = [_]ToolCall{.{ .id = "tc_0", .name = "get_time", .arguments = "{\"timezone\": \"UTC\"}" }};
+    const messages = [_]Message{
+        .{ .role = "system", .content = "You are helpful." },
+        .{ .role = "user", .content = "What time is it?" },
+        .{ .role = "assistant", .content = "", .tool_calls = &tc },
+        .{ .role = "tool", .content = "12:34 UTC", .tool_call_id = "tc_0" },
+    };
+
+    // Thinking ON: effort header 0.9 (our "high"), tool declare, tool call as
+    // {"name":...,"args":{...}} with args as an OBJECT (sorted, compact), tool
+    // result named via tool_call_id lookup, generation prompt at the tail.
+    {
+        const rendered = try renderChatTemplate(allocator, &messages, &config, tools_json, null, true);
+        defer allocator.free(rendered);
+        try testing.expect(std.mem.indexOf(u8, rendered, "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|>") != null);
+        try testing.expect(std.mem.indexOf(u8, rendered, "<|message_system|>tool_declare<|content_xml|>") != null);
+        try testing.expect(std.mem.indexOf(u8, rendered, "\"name\":\"get_time\"") != null);
+        try testing.expect(std.mem.indexOf(u8, rendered, "<|message_user|><|content_text|>What time is it?<|end_message|>") != null);
+        try testing.expect(std.mem.indexOf(u8, rendered, "<|message_model|>get_time<|content_invoke_tool_json|>{\"name\":\"get_time\",\"args\":{\"timezone\":\"UTC\"}}<|end_message|>") != null);
+        try testing.expect(std.mem.indexOf(u8, rendered, "<|content_model_end_sampling|>") != null);
+        try testing.expect(std.mem.indexOf(u8, rendered, "<|message_tool|>get_time<|content_text|>12:34 UTC<|end_message|>") != null);
+        try testing.expect(std.mem.endsWith(u8, rendered, "<|message_model|>"));
+        // No fallback-format markers (a raise inside the template silently falls back).
+        try testing.expect(std.mem.indexOf(u8, rendered, "<|im_start|>") == null);
+        try testing.expect(std.mem.indexOf(u8, rendered, "<start_of_turn>") == null);
+    }
+    // Thinking OFF: the effort header must be the template's "0" form — hy3's
+    // "no_think" is UNKNOWN to this template and raises.
+    {
+        const rendered = try renderChatTemplate(allocator, &messages, &config, tools_json, null, false);
+        defer allocator.free(rendered);
+        try testing.expect(std.mem.indexOf(u8, rendered, "Thinking effort level: 0<|end_message|>") != null);
+        try testing.expect(std.mem.indexOf(u8, rendered, "<|im_start|>") == null);
+        try testing.expect(std.mem.indexOf(u8, rendered, "<start_of_turn>") == null);
+    }
+    // History reasoning round-trip (laguna class): this template PERSISTS
+    // assistant reasoning as its own <|content_thinking|> message. If the
+    // field ever stops reaching the render, prior turns silently lose their
+    // thinking blocks while turn 1 still works.
+    {
+        const hist = [_]Message{
+            .{ .role = "user", .content = "Why is the sky blue?" },
+            .{ .role = "assistant", .content = "Rayleigh scattering.", .reasoning_content = "Shorter wavelengths scatter more." },
+            .{ .role = "user", .content = "And sunsets?" },
+        };
+        const rendered = try renderChatTemplate(allocator, &hist, &config, null, null, true);
+        defer allocator.free(rendered);
+        try testing.expect(std.mem.indexOf(u8, rendered, "<|message_model|><|content_thinking|>Shorter wavelengths scatter more.<|end_message|>") != null);
+        try testing.expect(std.mem.indexOf(u8, rendered, "<|message_model|><|content_text|>Rayleigh scattering.<|end_message|>") != null);
+        try testing.expect(std.mem.endsWith(u8, rendered, "<|message_model|>"));
     }
 }
 

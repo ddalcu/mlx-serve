@@ -172,13 +172,10 @@ static value tojson(const func_args & args) {
     if (val_ascii->as_bool()) { // undefined == false
         throw not_implemented_exception("tojson ensure_ascii=true not implemented");
     }
-    if (val_sort->as_bool()) { // undefined == false
-        throw not_implemented_exception("tojson sort_keys=true not implemented");
-    }
     auto separators = (is_val<value_array>(val_separators) ? val_separators : mk_val<value_array>())->as_array();
     std::string item_sep = separators.size() > 0 ? separators[0]->as_string().str() : (indent < 0 ? ", " : ",");
     std::string key_sep = separators.size() > 1 ? separators[1]->as_string().str() : ": ";
-    std::string json_str = value_to_json(args.get_pos(0), indent, item_sep, key_sep);
+    std::string json_str = value_to_json(args.get_pos(0), indent, item_sep, key_sep, val_sort->as_bool());
     return mk_val<value_string>(json_str);
 }
 
@@ -1319,7 +1316,7 @@ void global_from_json(context & ctx, const nlohmann::ordered_json & json_obj, bo
 
 // recursively convert value to JSON string
 // TODO: avoid circular references
-static void value_to_json_internal(std::ostringstream & oss, const value & val, int curr_lvl, int indent, const std::string_view item_sep, const std::string_view key_sep) {
+static void value_to_json_internal(std::ostringstream & oss, const value & val, int curr_lvl, int indent, const std::string_view item_sep, const std::string_view key_sep, bool sort_keys) {
     auto indent_str = [indent, curr_lvl]() -> std::string {
         return (indent > 0) ? std::string(curr_lvl * indent, ' ') : "";
     };
@@ -1364,7 +1361,7 @@ static void value_to_json_internal(std::ostringstream & oss, const value & val, 
             oss << newline();
             for (size_t i = 0; i < arr.size(); ++i) {
                 oss << indent_str() << (indent > 0 ? std::string(indent, ' ') : "");
-                value_to_json_internal(oss, arr[i], curr_lvl + 1, indent, item_sep, key_sep);
+                value_to_json_internal(oss, arr[i], curr_lvl + 1, indent, item_sep, key_sep, sort_keys);
                 if (i < arr.size() - 1) {
                     oss << item_sep;
                 }
@@ -1374,16 +1371,24 @@ static void value_to_json_internal(std::ostringstream & oss, const value & val, 
         }
         oss << "]";
     } else if (is_val<value_object>(val)) {
-        const auto & obj = val->as_ordered_object(); // IMPORTANT: need to keep exact order
+        // Insertion order by default; `sort_keys=true` sorts byte-wise like
+        // Python's json.dumps(sort_keys=True) (code-point order == byte order
+        // for UTF-8).
+        auto obj = val->as_ordered_object(); // IMPORTANT: need to keep exact order
+        if (sort_keys) {
+            std::stable_sort(obj.begin(), obj.end(), [](const auto & a, const auto & b) {
+                return a.first->as_string().str() < b.first->as_string().str();
+            });
+        }
         oss << "{";
         if (!obj.empty()) {
             oss << newline();
             size_t i = 0;
             for (const auto & pair : obj) {
                 oss << indent_str() << (indent > 0 ? std::string(indent, ' ') : "");
-                value_to_json_internal(oss, mk_val<value_string>(pair.first->as_string().str()), curr_lvl + 1, indent, item_sep, key_sep);
+                value_to_json_internal(oss, mk_val<value_string>(pair.first->as_string().str()), curr_lvl + 1, indent, item_sep, key_sep, sort_keys);
                 oss << key_sep;
-                value_to_json_internal(oss, pair.second, curr_lvl + 1, indent, item_sep, key_sep);
+                value_to_json_internal(oss, pair.second, curr_lvl + 1, indent, item_sep, key_sep, sort_keys);
                 if (i < obj.size() - 1) {
                     oss << item_sep;
                 }
@@ -1398,9 +1403,9 @@ static void value_to_json_internal(std::ostringstream & oss, const value & val, 
     }
 }
 
-std::string value_to_json(const value & val, int indent, const std::string_view item_sep, const std::string_view key_sep) {
+std::string value_to_json(const value & val, int indent, const std::string_view item_sep, const std::string_view key_sep, bool sort_keys) {
     std::ostringstream oss;
-    value_to_json_internal(oss, val, 0, indent, item_sep, key_sep);
+    value_to_json_internal(oss, val, 0, indent, item_sep, key_sep, sort_keys);
     JJ_DEBUG("value_to_json: result=%s", oss.str().c_str());
     return oss.str();
 }

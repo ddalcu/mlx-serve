@@ -26,6 +26,7 @@ private let supportedArchitectureTagPrefixes: [String] = [
     "hunyuan",    // Tencent Hunyuan 3 (model_type hy_v3) — repos tag "hunyuan"
     "hy_v3",      // …and/or the model_type verbatim (some tag only that)
     "laguna",     // poolside Laguna S 2.1 — repos tag "laguna" and/or "laguna-s-2.1"
+    "inkling",    // Thinking Machines Inkling Small — repos tag "inkling" and/or "inkling_mm_model"
 ]
 
 /// model_type values from config.json that the Zig server can load.
@@ -43,6 +44,7 @@ let supportedModelTypes: Set<String> = [
     "nemotron_h",
     "hy_v3", // Tencent Hunyuan 3 (295B-A21B MoE)
     "laguna", // poolside Laguna S 2.1 (117.6B-A8.5B MoE coder)
+    "inkling_mm_model", // Thinking Machines Inkling Small (276B-A12B MoE)
     "bert", // encoder-only; serves /v1/embeddings (GPU document indexing)
     // GGUF engines: "gguf" = any model via the embedded llama.cpp engine;
     // "deepseek_v4" = DeepSeek-V4-Flash via the ds4 engine. Both are served, so

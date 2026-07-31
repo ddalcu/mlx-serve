@@ -791,6 +791,12 @@ struct ChatDetailView: View {
         // cluster's width budget.
         HStack(spacing: 4) {
             ChatModelPill(showsBackground: false)
+            // The server being down is discovered HERE — you type and nothing
+            // answers — so the fix is offered here too, next to the picker,
+            // instead of only in the tray. Transient by construction: it is
+            // gone the moment the server is up, so it costs the cluster's width
+            // budget only while it has something to say.
+            serverStartControl
             Divider().frame(height: 14)
             Button {
                 AppActivation.openWindow(id: "settings", using: openWindow)
@@ -808,6 +814,46 @@ struct ChatDetailView: View {
         .padding(.vertical, 4)
         .background(.regularMaterial, in: Capsule())
         .overlay(Capsule().stroke(Color.secondary.opacity(0.20), lineWidth: 0.5))
+    }
+
+    /// Start the server from the chat window. Drawn rather than styled
+    /// (`.plain` + explicit padding/fill) — a `.bordered` control keeps its
+    /// intrinsic size and would sit at a different height to the pill beside
+    /// it, which is the sidebar New Chat lesson.
+    @ViewBuilder private var serverStartControl: some View {
+        let control = ChatServerStartControl.resolve(
+            status: server.status,
+            hasStartableModel: !appState.selectedModelPath.isEmpty || server.lanChatModelId != nil
+        )
+        if control != .hidden {
+            Button {
+                // ONE start path, shared with the LAN toggle: it loads the
+                // selected checkpoint, or boots headless when the model
+                // answering is on another Mac. A second `server.start` call
+                // site here is how the two would drift.
+                appState.ensureServerForLan()
+            } label: {
+                HStack(spacing: 4) {
+                    if control == .starting {
+                        ProgressView().controlSize(.small).scaleEffect(0.6).frame(width: 10, height: 10)
+                    } else {
+                        Image(systemName: "play.fill").font(.system(size: 9, weight: .bold))
+                    }
+                    Text(control.title)
+                        .font(.caption.weight(.semibold))
+                }
+                .foregroundStyle(control.isRed ? Color.white : Color.secondary)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 3)
+                .background(control.isRed ? Color.red : Color.secondary.opacity(0.15), in: Capsule())
+                .contentShape(Capsule())
+            }
+            .buttonStyle(.plain)
+            .disabled(!control.isEnabled)
+            .help(control == .starting
+                  ? "Loading the model — this can take a while for a large one."
+                  : "The server isn't running, so nothing can answer. Click to start it.")
+        }
     }
 
     // The per-tab agent PICKER used to sit here, between the paperclip and the

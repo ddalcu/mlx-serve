@@ -35,3 +35,51 @@ enum ChatModelSelection {
         return .selectLan(String(tag.dropFirst(lanPrefix.count)))
     }
 }
+
+/// The "Start" button that appears beside the chat model picker while the
+/// server is down.
+///
+/// The chat window is where you FIND OUT the server is down — you type, and
+/// nothing answers — but until now the only thing it said about it was the
+/// pill's status dot going grey, and the fix lived in the menu-bar tray. So the
+/// recovery is offered where the problem shows up.
+///
+/// Red, and only red in the one state you can act on: `.starting` is the same
+/// control still reporting, not a second thing to press. Hidden when there is
+/// nothing to start, because a permanently disabled red button that never
+/// explains itself is the dead-control class — the pill already says "Select a
+/// model" in that case.
+enum ChatServerStartControl: Equatable {
+    case hidden
+    case start
+    case starting
+
+    /// - Parameter hasStartableModel: a local checkpoint is selected, or a LAN
+    ///   model is (which boots the server headless so the proxy can run).
+    static func resolve(status: ServerStatus, hasStartableModel: Bool) -> ChatServerStartControl {
+        switch status {
+        case .running:  return .hidden
+        // Always shown: this state is only reachable because something already
+        // started the server, and hiding it mid-load would blink the toolbar
+        // for the tens of seconds a model takes to load.
+        case .starting: return .starting
+        case .stopped, .error:
+            return hasStartableModel ? .start : .hidden
+        }
+    }
+
+    var title: String {
+        switch self {
+        case .hidden:   return ""
+        case .start:    return "Start"
+        case .starting: return "Starting…"
+        }
+    }
+
+    /// Red is the ATTENTION state, so it belongs to the one case that is both
+    /// actionable and a problem. A red spinner would be shouting about work
+    /// that is already going fine.
+    var isRed: Bool { self == .start }
+
+    var isEnabled: Bool { self == .start }
+}

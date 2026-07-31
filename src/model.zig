@@ -132,6 +132,25 @@ pub const ModelConfig = struct {
     yarn_beta_slow: f32 = 1.0,
     yarn_attention_factor: f32 = 1.0,
 
+    // Inkling (inkling_mm_model, Thinking Machines Inkling Small). NO RoPE:
+    // position = the RelativeLogits bias (per-layer wr_du → [heads, d_rel]
+    // relative states × a learned [d_rel, extent] profile bank → additive bias
+    // over backward distances) + four depthwise causal short-convolutions per
+    // layer + log-scaling on global layers past inkling_log_n_floor tokens.
+    inkling_d_rel: u32 = 0, // 0 = not an inkling arch
+    inkling_rel_extent: u32 = 0, // global-layer bias extent; sliding layers use their window
+    inkling_log_n_floor: u32 = 0, // 0 = log-scaling off (exact no-op below the floor)
+    inkling_log_alpha: f32 = 0.1,
+    inkling_sconv_kernel: u32 = 0, // 0 = no short convolutions
+    // Router-gated stacked shared experts (the routing "sink": their weights
+    // come from the same softmax as the routed top-k). Distinct from qwen/hy3
+    // shared experts (ungated always-added).
+    inkling_n_shared_experts: u32 = 0,
+    // muP logit scaling: hidden /= this before the unembed matmul (1 = off).
+    logits_mup_width_multiplier: f32 = 1.0,
+    // Slice logits to the first N rows (vocab padding; 0 = full vocab).
+    unpadded_vocab_size: u32 = 0,
+
     // BERT encoder-only
     is_encoder_only: bool = false,
     layer_norm_eps: f32 = 1e-12,
@@ -352,6 +371,19 @@ pub const ModelConfig = struct {
         return self.num_experts > 0;
     }
 
+    pub fn isInkling(self: *const ModelConfig) bool {
+        return std.mem.eql(u8, self.model_type, "inkling_mm_model");
+    }
+
+    /// True when per-request SSM/conv cache entries must exist: hybrid
+    /// recurrence (LFM2/Nemotron/GDN) or Inkling's four per-layer short
+    /// convolutions. Shared by Transformer.init and the scheduler's per-slot
+    /// allocation — the two predicates MUST agree or slots crash on a null
+    /// `ctx.ssm_entries` (the Qwen3.5-MoE class).
+    pub fn needsSsmEntries(self: *const ModelConfig) bool {
+        return self.has_hybrid_layers or self.full_attention_interval > 0 or self.isInkling();
+    }
+
     /// Block-diffusion checkpoint (DiffusionGemma): generation is the canvas
     /// denoising loop, not autoregressive decode.
     pub fn isDiffusion(self: *const ModelConfig) bool {
@@ -427,6 +459,14 @@ pub const ModelConfig = struct {
             if (self.gen_top_p == null) self.gen_top_p = 0.95;
         } else if (is_gemma) {
             if (self.gen_top_k == null) self.gen_top_k = 64;
+            if (self.gen_top_p == null) self.gen_top_p = 0.95;
+        } else if (std.mem.eql(u8, t, "inkling_mm_model")) {
+            // Thinking Machines publishes NO recommendation (no
+            // generation_config.json in any Inkling repo; their bundled
+            // tooling samples greedily), so top_p 0.95 is OUR choice to cut
+            // the untruncated tail — the first real pi agent session
+            // (2026-07-30) ran the hardcoded 1.0/1.0/off and degenerated
+            // into duplicated tool calls.
             if (self.gen_top_p == null) self.gen_top_p = 0.95;
         }
     }
@@ -1315,6 +1355,88 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         }
         // eos [2, 24] (〈|EOS|〉, </assistant>) parsed generically from
         // eos_token_id above; no additive terminator merge needed.
+    } else if (std.mem.eql(u8, model_type, "inkling_mm_model")) {
+        // Thinking Machines Inkling Small (276B-A12B MoE, natively multimodal;
+        // REAP builds prune n_routed_experts). NO RoPE anywhere: position =
+        // RelativeLogits bias + 4 short convs/layer + log-scaling on global
+        // layers. Per-head q/k RMSNorm with scale 1/head_dim; hybrid
+        // sliding(512)/global from local_layer_ids; dense SwiGLU bottom layers
+        // then sigmoid-routed MoE whose selected+shared logits share one
+        // logsigmoid-softmax (the shared-expert "sink"); untied quantized
+        // embed/unembed with muP logit scaling and a padded vocab. Reference:
+        // the checkpoint's bundled inkling_mlx/ (Apache-2.0, parity-validated).
+        config.model_type = "inkling_mm_model";
+        config.weight_prefix = "model.llm";
+        config.norm_has_offset = false;
+        config.scale_embeddings = false;
+        config.has_pre_ff_norm = false;
+        config.has_qk_norm = true;
+        config.hidden_act = .silu;
+        config.rope_scaling_factor = 1.0;
+        // q/k are per-head RMS-normalized → scale = 1/head_dim, expressed via
+        // the shared 1/sqrt(query_pre_attn_scalar) convention.
+        config.query_pre_attn_scalar = config.head_dim * config.head_dim;
+        // The checkpoint labels the MoE expert width `intermediate_size` (read
+        // by the generic block above) and the dense bottom-layer width
+        // `dense_intermediate_size` — opposite of our field meanings. Swap.
+        config.moe_intermediate_size = config.intermediate_size;
+        if (cfg_obj.get("dense_intermediate_size")) |v| { if (v == .integer) config.intermediate_size = @intCast(v.integer); }
+        if (cfg_obj.get("dense_mlp_idx")) |v| { if (v == .integer) config.first_k_dense_replace = @intCast(v.integer); }
+        if (cfg_obj.get("n_routed_experts")) |v| { if (v == .integer) config.num_experts = @intCast(v.integer); }
+        if (cfg_obj.get("n_shared_experts")) |v| { if (v == .integer) config.inkling_n_shared_experts = @intCast(v.integer); }
+        if (cfg_obj.get("route_scale")) |v| config.router_scaling_factor = jsonFloat(v);
+        // Position machinery.
+        if (cfg_obj.get("d_rel")) |v| { if (v == .integer) config.inkling_d_rel = @intCast(v.integer); }
+        if (cfg_obj.get("rel_extent")) |v| { if (v == .integer) config.inkling_rel_extent = @intCast(v.integer); }
+        if (cfg_obj.get("log_scaling_n_floor")) |v| { if (v == .integer) config.inkling_log_n_floor = @intCast(v.integer); }
+        if (cfg_obj.get("log_scaling_alpha")) |v| config.inkling_log_alpha = jsonFloat(v);
+        if (cfg_obj.get("sconv_kernel_size")) |v| { if (v == .integer) config.inkling_sconv_kernel = @intCast(v.integer); }
+        if (cfg_obj.get("use_sconv")) |v| { if (v == .bool and !v.bool) config.inkling_sconv_kernel = 0; }
+        // Embedding norm (use_embed_norm, default true for this family).
+        config.has_embedding_norm = true;
+        if (cfg_obj.get("use_embed_norm")) |v| { if (v == .bool) config.has_embedding_norm = v.bool; }
+        // Hybrid sliding/global: the config names LOCAL (sliding) layers and
+        // uses `sliding_window_size` (the generic block reads `sliding_window`).
+        if (cfg_obj.get("sliding_window_size")) |v| {
+            if (v == .integer) {
+                config.sliding_window = @intCast(v.integer);
+                config.has_sliding_window = true;
+            }
+        }
+        if (cfg_obj.get("local_layer_ids")) |v| {
+            if (v == .array) {
+                config.has_explicit_layer_types = true;
+                for (config.layer_is_global[0..@min(config.num_hidden_layers, 128)]) |*g| g.* = true;
+                for (v.array.items) |item| {
+                    if (item == .integer and item.integer >= 0 and item.integer < 128) {
+                        config.layer_is_global[@intCast(item.integer)] = false;
+                    }
+                }
+            }
+        }
+        // muP logits + padded vocab.
+        if (cfg_obj.get("logits_mup_width_multiplier")) |v| config.logits_mup_width_multiplier = jsonFloat(v);
+        if (cfg_obj.get("unpadded_vocab_size")) |v| { if (v == .integer) config.unpadded_vocab_size = @intCast(v.integer); }
+        if (cfg_obj.get("model_max_length")) |v| { if (v == .integer) config.max_position_embeddings = @intCast(v.integer); }
+        // v1 is text-only: the hMLP vision_config must not arm the SigLIP path
+        // (the generic vision_config block above set has_vision = true).
+        config.has_vision = false;
+        // Honest rejects: the forward implements exactly the shipped geometry
+        // and router formula. A checkpoint that diverges must refuse to load,
+        // not run silently wrong.
+        const swa_heads: u32 = if (cfg_obj.get("swa_num_attention_heads")) |v| @intCast(v.integer) else config.num_attention_heads;
+        const swa_kv: u32 = if (cfg_obj.get("swa_num_key_value_heads")) |v| @intCast(v.integer) else config.num_key_value_heads;
+        const swa_hd: u32 = if (cfg_obj.get("swa_head_dim")) |v| @intCast(v.integer) else config.head_dim;
+        if (swa_heads != config.num_attention_heads or swa_kv != config.num_key_value_heads or swa_hd != config.head_dim) {
+            log.err("inkling: sliding-attention geometry {d}/{d}/{d} differs from global {d}/{d}/{d} — not supported\n", .{ swa_heads, swa_kv, swa_hd, config.num_attention_heads, config.num_key_value_heads, config.head_dim });
+            return error.UnsupportedInklingConfig;
+        }
+        if (cfg_obj.get("gate_activation")) |v| {
+            if (v == .string and !std.mem.eql(u8, v.string, "sigmoid")) {
+                log.err("inkling: gate_activation '{s}' not supported (sigmoid only)\n", .{v.string});
+                return error.UnsupportedInklingConfig;
+            }
+        }
     } else if (std.mem.eql(u8, model_type, "qwen3_next")) {
         config.model_type = "qwen3_next";
         config.weight_prefix = "model";
@@ -1908,6 +2030,16 @@ test "applyFamilySamplingDefaults: qwen family gets top_k 20 / top_p 0.95 when t
     llama.applyFamilySamplingDefaults();
     try testing.expectEqual(@as(?u32, null), llama.gen_top_k);
     try testing.expectEqual(@as(?f32, null), llama.gen_top_p);
+
+    // Inkling ships no generation_config.json anywhere and TM publishes no
+    // sampling recommendation (their own tooling is greedy-only), so top_p
+    // 0.95 is OUR tail cut — the first real pi agent session (2026-07-30) ran
+    // wild-sampled at 1.0/1.0/off and degenerated into duplicate calls.
+    var inkling = ModelConfig{ .model_type = "inkling_mm_model" };
+    inkling.applyFamilySamplingDefaults();
+    try testing.expectEqual(@as(?u32, null), inkling.gen_top_k);
+    try testing.expectEqual(@as(?f32, 0.95), inkling.gen_top_p);
+    try testing.expectEqual(@as(?f32, null), inkling.gen_temperature);
 }
 
 test "applyFamilySamplingDefaults never overrides explicit generation_config values" {
@@ -2406,6 +2538,131 @@ test "ModelConfig: laguna YaRN mscale is COMPUTED, never read from attention_fac
     try testing.expectApproxEqAbs(@as(f32, 32.0), config.yarn_factor, 1e-6);
     // 0.1 * ln(32) + 1 — the same value S's config ships literally.
     try testing.expectApproxEqAbs(@as(f32, 1.3465735902799727), config.yarn_attention_factor, 1e-6);
+}
+
+test "ModelConfig parses inkling_mm_model (Thinking Machines Inkling Small REAP25)" {
+    // Real shape of pipenetwork/Inkling-Small-MLX-REAP25-4bit's config.json
+    // (REAP-pruned 192/256 routed experts; the full builds differ only in
+    // n_routed_experts). NO RoPE anywhere — position comes from the
+    // relative-logits bias + per-layer short convolutions + log-scaling; the
+    // checkpoint labels the MoE expert width `intermediate_size` and the dense
+    // bottom-layer width `dense_intermediate_size` (opposite of our field
+    // meanings, swapped in the arm). Scale is 1/head_dim (per-head q/k RMSNorm),
+    // not 1/sqrt(head_dim).
+    const json =
+        \\{
+        \\  "architectures": ["InklingForConditionalGeneration"],
+        \\  "model_type": "inkling_mm_model",
+        \\  "eos_token_id": 200006,
+        \\  "text_config": {
+        \\    "model_max_length": 1048576,
+        \\    "hidden_size": 4096,
+        \\    "num_hidden_layers": 42,
+        \\    "vocab_size": 201024,
+        \\    "num_attention_heads": 32,
+        \\    "num_key_value_heads": 8,
+        \\    "head_dim": 128,
+        \\    "d_rel": 16,
+        \\    "rel_extent": 1024,
+        \\    "log_scaling_n_floor": 128000,
+        \\    "log_scaling_alpha": 0.1,
+        \\    "rms_norm_eps": 1e-06,
+        \\    "use_embed_norm": true,
+        \\    "local_layer_ids": [0,1,2,3,4,6,7,8,9,10,12,13,14,15,16,18,19,20,21,22,24,25,26,27,28,30,31,32,33,34,36,37,38,39,40],
+        \\    "dense_mlp_idx": 2,
+        \\    "use_sconv": true,
+        \\    "sconv_kernel_size": 4,
+        \\    "unpadded_vocab_size": 200058,
+        \\    "logits_mup_width_multiplier": 16.0,
+        \\    "swa_head_dim": 128,
+        \\    "swa_num_attention_heads": 32,
+        \\    "swa_num_key_value_heads": 8,
+        \\    "sliding_window_size": 512,
+        \\    "n_routed_experts": 192,
+        \\    "num_experts_per_tok": 6,
+        \\    "n_shared_experts": 2,
+        \\    "shared_expert_sink": true,
+        \\    "dense_intermediate_size": 16384,
+        \\    "intermediate_size": 2048,
+        \\    "route_scale": 8.0,
+        \\    "use_gate_bias": true,
+        \\    "gate_activation": "sigmoid",
+        \\    "norm_after_topk": true,
+        \\    "use_global_scale": true
+        \\  },
+        \\  "audio_config": {"n_mel_bins": 80, "mel_vocab_size": 16},
+        \\  "vision_config": {"vision_encoder_type": "hmlp", "patch_size": 40, "n_layers": 4},
+        \\  "mtp_config": {"num_nextn_predict_layers": 8},
+        \\  "quantization": {"group_size": 64, "bits": 4, "recipe": "uniform"},
+        \\  "reap": {"kept_experts": 192}
+        \\}
+    ;
+    const config = try parseConfigFromJson(testing.allocator, json);
+    try testing.expectEqualStrings("inkling_mm_model", config.model_type);
+    try testing.expectEqualStrings("model.llm", config.weight_prefix);
+    try testing.expectEqual(@as(u32, 201024), config.vocab_size);
+    try testing.expectEqual(@as(u32, 200058), config.unpadded_vocab_size);
+    try testing.expectEqual(@as(u32, 4096), config.hidden_size);
+    try testing.expectEqual(@as(u32, 42), config.num_hidden_layers);
+    try testing.expectEqual(@as(u32, 32), config.num_attention_heads);
+    try testing.expectEqual(@as(u32, 8), config.num_key_value_heads);
+    try testing.expectEqual(@as(u32, 128), config.head_dim);
+    try testing.expectEqual(@as(u32, 1048576), config.max_position_embeddings);
+    // scale = 1/head_dim, expressed through 1/sqrt(query_pre_attn_scalar)
+    try testing.expectEqual(@as(u32, 128 * 128), config.query_pre_attn_scalar);
+    // Hybrid sliding/global from local_layer_ids: every 6th layer global.
+    try testing.expect(config.has_sliding_window);
+    try testing.expectEqual(@as(u32, 512), config.sliding_window);
+    try testing.expect(config.has_explicit_layer_types);
+    try testing.expect(config.isGlobalLayer(5));
+    try testing.expect(config.isGlobalLayer(41));
+    try testing.expect(!config.isGlobalLayer(0));
+    try testing.expect(!config.isGlobalLayer(40));
+    // Dense bottom layers vs MoE: widths swapped from the checkpoint labels.
+    try testing.expectEqual(@as(u32, 2), config.first_k_dense_replace);
+    try testing.expectEqual(@as(u32, 16384), config.intermediate_size);
+    try testing.expectEqual(@as(u32, 2048), config.moe_intermediate_size);
+    try testing.expectEqual(@as(u32, 192), config.num_experts);
+    try testing.expectEqual(@as(u32, 6), config.num_experts_per_tok);
+    try testing.expectEqual(@as(u32, 2), config.inkling_n_shared_experts);
+    try testing.expectApproxEqAbs(@as(f32, 8.0), config.router_scaling_factor, 1e-6);
+    // Position machinery: rel-logits bias + short conv + log-scaling.
+    try testing.expectEqual(@as(u32, 16), config.inkling_d_rel);
+    try testing.expectEqual(@as(u32, 1024), config.inkling_rel_extent);
+    try testing.expectEqual(@as(u32, 128000), config.inkling_log_n_floor);
+    try testing.expectApproxEqAbs(@as(f32, 0.1), config.inkling_log_alpha, 1e-6);
+    try testing.expectEqual(@as(u32, 4), config.inkling_sconv_kernel);
+    try testing.expect(config.has_embedding_norm);
+    try testing.expect(config.has_qk_norm);
+    try testing.expectEqual(HiddenAct.silu, config.hidden_act);
+    try testing.expectApproxEqAbs(@as(f32, 16.0), config.logits_mup_width_multiplier, 1e-6);
+    // v1 is text-only: the hMLP vision_config must NOT arm the SigLIP path.
+    try testing.expect(!config.has_vision);
+    try testing.expectEqual(@as(u32, 4), config.quant_bits);
+    try testing.expectEqual(@as(u32, 64), config.quant_group_size);
+    const eos = config.eosTokenSlice();
+    try testing.expectEqual(@as(usize, 1), eos.len);
+    try testing.expectEqual(@as(u32, 200006), eos[0]);
+}
+
+test "ModelConfig inkling_mm_model rejects a sliding-attention geometry that differs from global" {
+    // The config carries separate swa_* head fields; the shipped checkpoints
+    // are uniform (32/8/128 both classes) and the forward implements exactly
+    // that. A future checkpoint that diverges must be an honest reject, not a
+    // silently wrong forward.
+    const json =
+        \\{
+        \\  "model_type": "inkling_mm_model",
+        \\  "text_config": {
+        \\    "hidden_size": 4096, "num_hidden_layers": 42, "vocab_size": 201024,
+        \\    "num_attention_heads": 32, "num_key_value_heads": 8, "head_dim": 128,
+        \\    "swa_head_dim": 128, "swa_num_attention_heads": 32, "swa_num_key_value_heads": 16,
+        \\    "sliding_window_size": 512, "sconv_kernel_size": 4,
+        \\    "d_rel": 16, "rel_extent": 1024
+        \\  }
+        \\}
+    ;
+    try testing.expectError(error.UnsupportedInklingConfig, parseConfigFromJson(testing.allocator, json));
 }
 
 test "ModelConfig: use_bidirectional_attention marks an embedding encoder (EmbeddingGemma, issue #79)" {

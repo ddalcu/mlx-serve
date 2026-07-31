@@ -444,7 +444,7 @@ pub const Slot = struct {
         // slice makes the hot prefix cache treat the model as hybrid and
         // cold-prefill every request.
         var ssm_entries: ?[]SSMCacheEntry = null;
-        if (!is_embedded and (config.has_hybrid_layers or config.full_attention_interval > 0)) {
+        if (!is_embedded and config.needsSsmEntries()) {
             const entries = try allocator.alloc(SSMCacheEntry, config.num_hidden_layers);
             for (entries) |*e| {
                 e.* = .{

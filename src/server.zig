@@ -6091,9 +6091,7 @@ fn handleStreamingGeneration(
                         for (token_texts.items) |tt| {
                             defer allocator.free(tt);
                             // Skip bare channel/think tags that leak without a full block
-                            if (std.mem.eql(u8, tt, "<|channel>") or std.mem.eql(u8, tt, "<channel|>") or
-                                std.mem.eql(u8, tt, "<think>") or std.mem.eql(u8, tt, "</think>"))
-                            {
+                            if (chat_mod.isChannelMarkerToken(tt)) {
                                 continue;
                             }
                             try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = tt }, null, null, null);
@@ -6118,6 +6116,17 @@ fn handleStreamingGeneration(
                     // Remove the opener (<think> or the Hy3-suffixed form) and
                     // any leading newline.
                     var skip: usize = olen;
+                    while (skip < think_buf.items.len and think_buf.items[skip] == '\n') skip += 1;
+                    const remaining = try allocator.dupe(u8, think_buf.items[skip..]);
+                    think_buf.clearAndFree(allocator);
+                    try think_buf.appendSlice(allocator, remaining);
+                    allocator.free(remaining);
+                    skipped_think_open = true;
+                } else if (std.mem.startsWith(u8, think_buf.items, "<|content_thinking|>")) {
+                    // Inkling thinking message (opener is ONE special token) —
+                    // the message closes with <|end_message|>.
+                    think_close_tag = "<|end_message|>";
+                    var skip: usize = "<|content_thinking|>".len;
                     while (skip < think_buf.items.len and think_buf.items[skip] == '\n') skip += 1;
                     const remaining = try allocator.dupe(u8, think_buf.items[skip..]);
                     think_buf.clearAndFree(allocator);
@@ -6167,7 +6176,21 @@ fn handleStreamingGeneration(
             // families (indexOfThinkCloseTag covers bare AND suffixed </think…>).
             const think_match = chat_mod.indexOfThinkCloseTag(think_buf.items, 0);
             const channel_pos = std.mem.indexOf(u8, think_buf.items, "<channel|>");
+            // Inkling: an Inkling thinking message closes at <|end_message|>
+            // (gated on the opener having switched think_close_tag so prose
+            // that MENTIONS the literal in another family never matches), and
+            // a leading <|content_text|> means the model answered DIRECTLY —
+            // close immediately with empty reasoning.
+            const inkling_pos: ?usize = blk_i: {
+                if (std.mem.startsWith(u8, think_buf.items, "<|content_text|>")) break :blk_i 0;
+                if (std.mem.eql(u8, think_close_tag, "<|end_message|>")) {
+                    if (std.mem.indexOf(u8, think_buf.items, "<|end_message|>")) |p| break :blk_i p;
+                }
+                break :blk_i null;
+            };
+            const inkling_len: usize = if (inkling_pos != null and inkling_pos.? == 0 and std.mem.startsWith(u8, think_buf.items, "<|content_text|>")) "<|content_text|>".len else "<|end_message|>".len;
             const close_match: ?struct { pos: usize, len: usize, is_channel: bool } = blk: {
+                if (inkling_pos) |p| break :blk .{ .pos = p, .len = inkling_len, .is_channel = false };
                 if (think_match == null and channel_pos == null) break :blk null;
                 if (think_match == null) break :blk .{ .pos = channel_pos.?, .len = "<channel|>".len, .is_channel = true };
                 if (channel_pos == null) break :blk .{ .pos = think_match.?.pos, .len = think_match.?.len, .is_channel = false };
@@ -6187,6 +6210,11 @@ fn handleStreamingGeneration(
                 } else if (std.mem.startsWith(u8, content_after, "<|channel>")) {
                     content_after = content_after[10..];
                 }
+                // Strip Inkling content-message markers after the close; the
+                // content message ends at its own <|end_message|>.
+                if (std.mem.startsWith(u8, content_after, "<|message_model|>")) content_after = content_after["<|message_model|>".len..];
+                if (std.mem.startsWith(u8, content_after, "<|content_text|>")) content_after = content_after["<|content_text|>".len..];
+                if (std.mem.indexOf(u8, content_after, "<|end_message|>")) |em| content_after = content_after[0..em];
                 content_after = std.mem.trimStart(u8, content_after, "\n ");
                 if (content_after.len > 0) {
                     try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = content_after }, null, null, null);
@@ -6214,7 +6242,7 @@ fn handleStreamingGeneration(
         } else {
             defer allocator.free(token_text);
             // Skip Gemma 4 channel tags that leak after thinking blocks
-            if (std.mem.eql(u8, token_text, "<|channel>") or std.mem.eql(u8, token_text, "<channel|>")) {
+            if (chat_mod.isChannelMarkerToken(token_text)) {
                 continue;
             }
             try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = token_text }, null, null, null);
@@ -9189,13 +9217,15 @@ fn handleAnthropicStreaming(
         }
 
         if (has_tools) {
-            // Buffer for tool detection
+            // Buffer for tool detection. Detection rules live in
+            // `chat.streamShouldBufferForTools` — the SAME predicate as the
+            // chat-completions stream (this path once carried its own inline
+            // subset, which missed the Inkling invoke marker: the 2026-07-30
+            // NAME+JSON content leak, and before that the drift class the
+            // think gate was unified for).
             try token_texts.append(allocator, token_text);
             const buf = text_buf.items;
-            const maybe_tool = std.mem.indexOf(u8, buf, "<tool_call") != null or
-                std.mem.indexOf(u8, buf, "<|tool_call") != null or
-                (buf.len > 0 and buf[0] == '{' and std.mem.indexOf(u8, buf, "\"name\"") != null) or
-                (buf.len >= 1 and buf[buf.len - 1] == '<');
+            const maybe_tool = chat_mod.streamShouldBufferForTools(buf);
 
             if (!maybe_tool) {
                 // Shared gate with the chat-completions stream (the two paths
@@ -9244,9 +9274,7 @@ fn handleAnthropicStreaming(
                         for (token_texts.items) |tt| {
                             defer allocator.free(tt);
                             // Skip bare think/channel tags that leak without a block
-                            if (std.mem.eql(u8, tt, "<|channel>") or std.mem.eql(u8, tt, "<channel|>") or
-                                std.mem.eql(u8, tt, "<think>") or std.mem.eql(u8, tt, "</think>"))
-                            {
+                            if (chat_mod.isChannelMarkerToken(tt)) {
                                 continue;
                             }
                             if (!text_block_open) {
@@ -9272,6 +9300,24 @@ fn handleAnthropicStreaming(
             if (!skipped_think_open and think_buf.items.len >= 7) {
                 if (chat_mod.thinkOpenTagLenAt(think_buf.items)) |olen| {
                     var skip: usize = olen;
+                    while (skip < think_buf.items.len and think_buf.items[skip] == '\n') skip += 1;
+                    const remaining = try allocator.dupe(u8, think_buf.items[skip..]);
+                    think_buf.clearAndFree(allocator);
+                    try think_buf.appendSlice(allocator, remaining);
+                    allocator.free(remaining);
+                    skipped_think_open = true;
+                    if (!thinking_block_open) {
+                        const sd = try std.fmt.allocPrint(allocator,
+                            \\{{"type":"content_block_start","index":{d},"content_block":{{"type":"thinking","thinking":"","signature":""}}}}
+                        , .{block_index});
+                        defer allocator.free(sd);
+                        try sendAnthropicEvent(stream, "content_block_start", sd);
+                        thinking_block_open = true;
+                    }
+                } else if (std.mem.startsWith(u8, think_buf.items, "<|content_thinking|>")) {
+                    // Inkling thinking message — closes at <|end_message|>.
+                    think_close_tag = "<|end_message|>";
+                    var skip: usize = "<|content_thinking|>".len;
                     while (skip < think_buf.items.len and think_buf.items[skip] == '\n') skip += 1;
                     const remaining = try allocator.dupe(u8, think_buf.items[skip..]);
                     think_buf.clearAndFree(allocator);
@@ -9342,7 +9388,19 @@ fn handleAnthropicStreaming(
             // (indexOfThinkCloseTag covers bare AND Hy3-suffixed </think…>).
             const think_match = chat_mod.indexOfThinkCloseTag(think_buf.items, 0);
             const channel_pos = std.mem.indexOf(u8, think_buf.items, "<channel|>");
+            // Inkling: <|end_message|> closes the thinking message (gated on
+            // the opener having switched think_close_tag); a leading
+            // <|content_text|> is a DIRECT answer — empty reasoning.
+            const inkling_pos: ?usize = blk_i: {
+                if (std.mem.startsWith(u8, think_buf.items, "<|content_text|>")) break :blk_i 0;
+                if (std.mem.eql(u8, think_close_tag, "<|end_message|>")) {
+                    if (std.mem.indexOf(u8, think_buf.items, "<|end_message|>")) |p| break :blk_i p;
+                }
+                break :blk_i null;
+            };
+            const inkling_len: usize = if (inkling_pos != null and inkling_pos.? == 0 and std.mem.startsWith(u8, think_buf.items, "<|content_text|>")) "<|content_text|>".len else "<|end_message|>".len;
             const close_match: ?struct { pos: usize, len: usize, is_channel: bool } = blk: {
+                if (inkling_pos) |p| break :blk .{ .pos = p, .len = inkling_len, .is_channel = false };
                 if (think_match == null and channel_pos == null) break :blk null;
                 if (think_match == null) break :blk .{ .pos = channel_pos.?, .len = "<channel|>".len, .is_channel = true };
                 if (channel_pos == null) break :blk .{ .pos = think_match.?.pos, .len = think_match.?.len, .is_channel = false };
@@ -9363,6 +9421,9 @@ fn handleAnthropicStreaming(
                 var content_after = std.mem.trimStart(u8, think_buf.items[after..], "\n ");
                 if (std.mem.startsWith(u8, content_after, "<|channel>\n")) content_after = content_after[11..];
                 if (std.mem.startsWith(u8, content_after, "<|channel>")) content_after = content_after[10..];
+                if (std.mem.startsWith(u8, content_after, "<|message_model|>")) content_after = content_after["<|message_model|>".len..];
+                if (std.mem.startsWith(u8, content_after, "<|content_text|>")) content_after = content_after["<|content_text|>".len..];
+                if (std.mem.indexOf(u8, content_after, "<|end_message|>")) |em| content_after = content_after[0..em];
                 content_after = std.mem.trimStart(u8, content_after, "\n ");
                 if (content_after.len > 0) {
                     if (!text_block_open) {
@@ -9395,7 +9456,7 @@ fn handleAnthropicStreaming(
         } else {
             // Regular content token
             defer allocator.free(token_text);
-            if (std.mem.eql(u8, token_text, "<|channel>") or std.mem.eql(u8, token_text, "<channel|>")) continue;
+            if (chat_mod.isChannelMarkerToken(token_text)) continue;
             if (!text_block_open) {
                 const sd = try std.fmt.allocPrint(allocator,
                     \\{{"type":"content_block_start","index":{d},"content_block":{{"type":"text","text":""}}}}
@@ -10335,6 +10396,8 @@ fn handleResponses(
         var think_buf = std.ArrayList(u8).empty;
         defer think_buf.deinit(allocator);
         var skipped_think_open = false;
+        // Inkling thinking message seen — its close is <|end_message|>.
+        var inkling_think = false;
         var live_output_index: u32 = 0;
 
         while (true) {
@@ -10437,6 +10500,16 @@ fn handleResponses(
                         try think_buf.appendSlice(allocator, remaining);
                         allocator.free(remaining);
                         skipped_think_open = true;
+                    } else if (std.mem.startsWith(u8, think_buf.items, "<|content_thinking|>")) {
+                        // Inkling thinking message — closes at <|end_message|>.
+                        var skip: usize = "<|content_thinking|>".len;
+                        while (skip < think_buf.items.len and think_buf.items[skip] == '\n') skip += 1;
+                        const remaining = try allocator.dupe(u8, think_buf.items[skip..]);
+                        think_buf.clearAndFree(allocator);
+                        try think_buf.appendSlice(allocator, remaining);
+                        allocator.free(remaining);
+                        skipped_think_open = true;
+                        inkling_think = true;
                     } else if (think_buf.items.len >= 17 and std.mem.startsWith(u8, think_buf.items, "<|channel>thought")) {
                         var skip: usize = 17;
                         while (skip < think_buf.items.len and think_buf.items[skip] == '\n') skip += 1;
@@ -10452,10 +10525,16 @@ fn handleResponses(
                     }
                 }
 
-                // Detect close tag (</think> or <channel|>).
+                // Detect close tag (</think>, <channel|>, or Inkling's
+                // <|end_message|>; a leading <|content_text|> is a DIRECT
+                // Inkling answer — close immediately with empty reasoning).
                 const tp = std.mem.indexOf(u8, think_buf.items, "</think>");
                 const cp = std.mem.indexOf(u8, think_buf.items, "<channel|>");
                 const close_match: ?struct { pos: usize, tag: []const u8 } = blk: {
+                    if (std.mem.startsWith(u8, think_buf.items, "<|content_text|>")) break :blk .{ .pos = 0, .tag = "<|content_text|>" };
+                    if (inkling_think) {
+                        if (std.mem.indexOf(u8, think_buf.items, "<|end_message|>")) |p| break :blk .{ .pos = p, .tag = "<|end_message|>" };
+                    }
                     if (tp == null and cp == null) break :blk null;
                     if (tp == null) break :blk .{ .pos = cp.?, .tag = "<channel|>" };
                     if (cp == null) break :blk .{ .pos = tp.?, .tag = "</think>" };
@@ -10483,6 +10562,9 @@ fn handleResponses(
                     } else if (std.mem.startsWith(u8, content_after, "<|channel>")) {
                         content_after = content_after[10..];
                     }
+                    if (std.mem.startsWith(u8, content_after, "<|message_model|>")) content_after = content_after["<|message_model|>".len..];
+                    if (std.mem.startsWith(u8, content_after, "<|content_text|>")) content_after = content_after["<|content_text|>".len..];
+                    if (std.mem.indexOf(u8, content_after, "<|end_message|>")) |em| content_after = content_after[0..em];
                     content_after = std.mem.trimStart(u8, content_after, "\n ");
                     if (content_after.len > 0) {
                         if (!streamed_message_started) {
@@ -10516,7 +10598,7 @@ fn handleResponses(
                 }
             } else {
                 // Skip Gemma 4 channel tags that may leak after the thinking block.
-                if (std.mem.eql(u8, token_text, "<|channel>") or std.mem.eql(u8, token_text, "<channel|>")) continue;
+                if (chat_mod.isChannelMarkerToken(token_text)) continue;
                 if (!streamed_message_started) {
                     streamed_message_id = try responses_mod.makeId(stream.io, allocator, "msg");
                     streamed_message_index = live_output_index;
