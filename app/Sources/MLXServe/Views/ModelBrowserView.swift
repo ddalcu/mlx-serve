@@ -211,7 +211,7 @@ private struct RecommendedPane: View {
 
             ModelGroupSection(
                 title: "Largest models (96 GB+ RAM)",
-                subtitle: "The biggest models this app runs — DeepSeek-V4-Flash (ds4) and Tencent's 295B Hunyuan 3 — for Macs with a lot of memory.",
+                subtitle: "The biggest models this app runs — DeepSeek-V4-Flash (native MLX) and Tencent's 295B Hunyuan 3 — for Macs with a lot of memory.",
                 systemImage: "memorychip",
                 tint: .red
             ) {

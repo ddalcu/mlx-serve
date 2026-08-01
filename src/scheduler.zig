@@ -2305,7 +2305,17 @@ fn memInsufficientForLoad(weights_bytes: u64, avail_bytes: u64) bool {
     // CAVEAT: the KV cache scales with --ctx-size, which this guard doesn't see;
     // a very large context can still exceed this margin (follow-up: plumb ctx +
     // kv_quant to size KV precisely). Bypass with --skip-mem-preflight.
-    const headroom: u64 = weights_bytes / 8 + 1024 * 1024 * 1024;
+    // The proportional term is CAPPED: headroom pays for warmup buffers and a
+    // baseline KV cache, and neither scales with a MoE's TOTAL weights (our
+    // 109.7 GB DeepSeek-V4 mirror activates 13B). Uncapped, weights/8 demanded
+    // 14.7 GB on that model — 124.4 GB total — which a 128 GB Mac cannot have,
+    // so the guard refused the flagship checkpoint on exactly the hardware its
+    // model card names, while --skip-mem-preflight booted it repeatedly and
+    // served 6.7K-token prefills with ~8.6 GB to spare. 6 GB keeps the original
+    // margin for every model under 48 GB (where it was tuned) and stays inside
+    // the measured envelope above it.
+    const HEADROOM_CAP: u64 = 6 * 1024 * 1024 * 1024;
+    const headroom: u64 = @min(weights_bytes / 8, HEADROOM_CAP) + 1024 * 1024 * 1024;
     return avail_bytes < weights_bytes + headroom;
 }
 
@@ -2326,6 +2336,19 @@ test "memInsufficientForLoad: headroom + unknown-query guards" {
     // Unknown figures (query failed / size unknown) → never block.
     try std.testing.expect(!memInsufficientForLoad(0, 44 * GB));
     try std.testing.expect(!memInsufficientForLoad(42 * GB, 0));
+
+    // A PROPORTIONAL margin becomes impossible at the top of the range. Our own
+    // DeepSeek-V4-Flash mirror is 109.7 GB of weights and a 128 GB Mac reports
+    // ~118 GB available with nothing else loaded — but weights/8 demanded 14.7
+    // GB of headroom, i.e. 124.4 GB, which that machine cannot have. The guard
+    // refused to load the flagship checkpoint on exactly the hardware its model
+    // card names, while `--skip-mem-preflight` booted it repeatedly and served
+    // 6.7K-token prefills with ~8.6 GB to spare. Headroom covers warmup
+    // buffers + a baseline KV cache, and neither scales with a MoE's total
+    // weights (13B active here) — so the proportional term is CAPPED.
+    try std.testing.expect(!memInsufficientForLoad(109_730 * MB, 118_330 * MB));
+    // Still refuses when the box genuinely cannot fit it.
+    try std.testing.expect(memInsufficientForLoad(109_730 * MB, 112 * GB));
 }
 
 /// Phase A1 → Plan 05: do the full model load on the inference thread.
@@ -3832,9 +3855,22 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     slot.ctx.capture_hidden = null;
     slot.ctx.kv_attn_fused = slot.kv_attn_fused;
 
-    const use_mtp = slot.enable_mtp and slot.mtp != null;
-    const use_drafter = !use_mtp and slot.enable_drafter and slot.drafter != null;
-    const use_pld = !use_mtp and !use_drafter and slot.enable_pld;
+    // deepseek_v4: PLD/drafter/qwen-MTP verify passes through forwardWith
+    // would APPEND draft tokens to module-owned state and corrupt every later
+    // step, so their handles stay off here. The request's spec INTENT is
+    // passed through anyway (as pld_enabled) so the Generator chokepoint —
+    // the single authority since the DSpark port — can arm dsv4's OWN draft
+    // mode (stage-bearing checkpoint + clean-greedy request) or zero
+    // everything. skip_lazy_preforward deliberately ignores the intent bit:
+    // a non-armed dsv4 request keeps today's synchronous-t1 serial init.
+    const is_dsv4 = slot.model.transformer != null and slot.model.transformer.?.dsv4 != null;
+    const use_mtp = !is_dsv4 and slot.enable_mtp and slot.mtp != null;
+    const use_drafter = !use_mtp and !is_dsv4 and slot.enable_drafter and slot.drafter != null;
+    const use_pld = !use_mtp and !use_drafter and !is_dsv4 and slot.enable_pld;
+    // DSpark rides the MTP flag alone (the "model's native head" semantics):
+    // the server defaults enable_mtp ON for a stage-bearing dsv4, the n-gram
+    // prompt gate never touches it, and enable_mtp:false opts out.
+    const dsv4_spec_intent = is_dsv4 and slot.enable_mtp;
 
     // Phase A6: prefill source-of-truth is `slot.full_prompt` — the conn
     // thread's `reuseKVCache` may have trimmed `slot.prompt_ids` based on
@@ -3892,7 +3928,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
         sampling,
         slot.eos_token_ids,
         .{
-            .pld_enabled = use_pld,
+            .pld_enabled = use_pld or dsv4_spec_intent,
             .drafter_enabled = use_drafter,
             .drafter = if (use_drafter) slot.drafter else null,
             .drafter_block_size = slot.drafter_block_size,
@@ -4019,6 +4055,38 @@ fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
     }
 }
 
+/// Which spec mode a decode tick drives for a slot.
+pub const SpecTickMode = enum { dspark, mtp, drafter, pld, regular };
+
+/// Pure decode-tick dispatch decision. The slot flags carry the REQUEST's
+/// wish; the generator-side values carry what `Generator.initWithOptions`
+/// actually armed (after its deepseek_v4 spec chokepoint). Every arm must
+/// require BOTH: dispatching on the slot flag alone is the exact wiring that
+/// put PLD verify forwards through a dsv4 trunk (2026-07-31) — mtp/drafter
+/// had their generator-state conjunct (`gen.mtp != null`), model-less PLD
+/// did not, so runPrefill's `use_pld=false` shaped init options while every
+/// tick still called `gen.nextPld`.
+///
+/// DSpark (dsv4's own draft mode) wins first and rides the MTP flag alone —
+/// the "model's native head" semantics: defaulted ON server-side for a
+/// stage-bearing dsv4, never n-gram prompt-gated, `enable_mtp:false` opts
+/// out. The chokepoint only arms it after zeroing every other spec.
+pub fn specTickMode(
+    slot_enable_mtp: bool,
+    gen_has_mtp: bool,
+    slot_enable_drafter: bool,
+    gen_has_drafter: bool,
+    slot_enable_pld: bool,
+    gen_pld_enabled: bool,
+    gen_dspark_enabled: bool,
+) SpecTickMode {
+    if (gen_dspark_enabled and slot_enable_mtp) return .dspark;
+    if (slot_enable_mtp and gen_has_mtp) return .mtp;
+    if (slot_enable_drafter and gen_has_drafter) return .drafter;
+    if (slot_enable_pld and gen_pld_enabled) return .pld;
+    return .regular;
+}
+
 /// Drive one Generator step (regular / PLD / drafter) and push emitted
 /// tokens into the slot's output ring. Mirrors the existing
 /// `StreamingTokenStream` adapter contract: 0..N tokens per call, with EOS
@@ -4062,7 +4130,39 @@ fn runSingleDecodeTick(sch: *Scheduler, slot: *Slot) !void {
     // disabled branch is also where the mid-request RE-ENABLE check lives
     // (bypassing it pinned PLD off for the rest of the request even when the
     // generated tail turned echo-heavy).
-    if (slot.enable_mtp and gen.mtp != null) {
+    const tick_mode = specTickMode(
+        slot.enable_mtp,
+        gen.mtp != null,
+        slot.enable_drafter,
+        gen.drafter != null,
+        slot.enable_pld,
+        gen.pld_enabled,
+        gen.dspark_enabled,
+    );
+    if (tick_mode == .dspark) {
+        const result = try gen.nextDspark(slot.allocator);
+        if (result == null) {
+            finishSlot(sch, slot, gen.finish_reason);
+            return;
+        }
+        defer slot.allocator.free(result.?.tokens);
+        for (result.?.tokens) |t| {
+            if (slot.cancelled.load(.acquire)) return;
+            if (generate_mod.isEosId(t, slot.eos_token_ids)) {
+                finishSlot(sch, slot, "stop");
+                return;
+            }
+            slot.pushToken(t);
+            slot.completion_tokens = gen.completion_tokens;
+            if (t != 0) slot.was_pad_only = false;
+            if (slot.completion_tokens >= slot.max_tokens) {
+                finishSlot(sch, slot, "length");
+                return;
+            }
+        }
+        return;
+    }
+    if (tick_mode == .mtp) {
         const result = try gen.nextMtp(slot.allocator);
         if (result == null) {
             finishSlot(sch, slot, gen.finish_reason);
@@ -4086,7 +4186,7 @@ fn runSingleDecodeTick(sch: *Scheduler, slot: *Slot) !void {
         return;
     }
 
-    if (slot.enable_drafter and gen.drafter != null) {
+    if (tick_mode == .drafter) {
         const result = try gen.nextDrafter(slot.allocator);
         if (result == null) {
             finishSlot(sch, slot, gen.finish_reason);
@@ -4110,7 +4210,7 @@ fn runSingleDecodeTick(sch: *Scheduler, slot: *Slot) !void {
         return;
     }
 
-    if (slot.enable_pld) {
+    if (tick_mode == .pld) {
         const result = try gen.nextPld(slot.allocator, slot.pld_draft_len, slot.pld_key_len);
         if (result == null) {
             finishSlot(sch, slot, gen.finish_reason);
@@ -4330,6 +4430,36 @@ test "modelBatchable rejects MoE / hybrid / encoder / sliding-window" {
     }
 }
 
+test "modelBatchable: a PARSED deepseek_v4 config can never route to batched decode" {
+    // dsv4 is serial-only (module-owned per-request state); its exclusion
+    // from `forwardBatchedDecode` rides isMoe(), so the parse arm must never
+    // regress to leaving num_experts unset. Parse a minimal real-shaped
+    // config rather than hand-building the struct.
+    const json =
+        \\{"model_type":"deepseek_v4","hidden_size":64,"num_hidden_layers":4,
+        \\ "num_attention_heads":4,"num_key_value_heads":1,"head_dim":96,
+        \\ "qk_rope_head_dim":32,"q_lora_rank":32,"o_lora_rank":16,"o_groups":2,
+        \\ "sliding_window":8,"compress_ratios":[0,4,16,4],
+        \\ "compress_rope_theta":160000.0,"rope_theta":10000.0,
+        \\ "rope_scaling":{"factor":16,"original_max_position_embeddings":64,
+        \\  "beta_fast":32,"beta_slow":1,"type":"yarn"},
+        \\ "index_n_heads":2,"index_head_dim":32,"index_topk":4,
+        \\ "n_routed_experts":256,"num_experts_per_tok":6,"num_hash_layers":1,
+        \\ "n_shared_experts":1,"moe_intermediate_size":32,
+        \\ "routed_scaling_factor":1.5,"swiglu_limit":10.0,"norm_topk_prob":true,
+        \\ "scoring_func":"sqrtsoftplus","topk_method":"noaux_tc","hc_mult":4,
+        \\ "hc_sinkhorn_iters":20,"hc_eps":1e-6,"rms_norm_eps":1e-6,
+        \\ "vocab_size":64,"max_position_embeddings":4096}
+    ;
+    const cfg = try model_mod.parseConfigFromJson(testing.allocator, json);
+    try testing.expectEqualStrings("deepseek_v4", cfg.model_type);
+    try testing.expect(cfg.isMoe());
+    try testing.expect(!modelBatchable(&cfg));
+    // Prefix-cache exclusion rides the same parsed config (module-owned
+    // decode state — see prefix_cache.shouldUse).
+    try testing.expect(!prefix_cache_mod.HotPrefixCache.shouldUse(&cfg, true));
+}
+
 test "modelBatchable permits pure-attention" {
     // Defaults are all zero / null → vanilla pure-attention path.
     var cfg = std.mem.zeroes(model_mod.ModelConfig);
@@ -4421,4 +4551,51 @@ test "loopStopReason: a degenerate tail cut reports length, a healthy tail is no
     }
     const reason = loopStopReason(ids.items) orelse return error.TestExpectedLoopCut;
     try testing.expectEqualStrings("length", reason);
+}
+
+test "specTickMode: every spec arm requires the GENERATOR's armed state, not the slot flag alone" {
+    // The dsv4 PLD-corruption wiring class (2026-07-31): runPrefill's
+    // per-site guard computed use_pld=false for a deepseek_v4 slot and wired
+    // it into Generator init options — but the decode tick dispatched on
+    // `slot.enable_pld` alone, so every tick still called `gen.nextPld` and
+    // its verify forward appended draft tokens into dsv4's module-owned
+    // state with no rollback (mangled DSML, log 166348-166361). mtp/drafter
+    // were saved only by their accidental generator-state conjunct
+    // (`gen.mtp != null`); PLD has no model handle, so its conjunct must be
+    // the generator's post-chokepoint `pld_enabled`.
+
+    // Slot wants PLD, generator was NOT armed (chokepoint or per-site guard
+    // flipped it off) → the tick must run the regular path.
+    try testing.expectEqual(SpecTickMode.regular, specTickMode(false, false, false, false, true, false, false));
+    // Slot wants PLD and init armed it → PLD runs.
+    try testing.expectEqual(SpecTickMode.pld, specTickMode(false, false, false, false, true, true, false));
+    // Generator armed but the slot never asked (stale generator state must
+    // not resurrect spec either) → regular.
+    try testing.expectEqual(SpecTickMode.regular, specTickMode(false, false, false, false, false, true, false));
+
+    // mtp/drafter keep their existing both-sides contract.
+    try testing.expectEqual(SpecTickMode.mtp, specTickMode(true, true, false, false, false, false, false));
+    try testing.expectEqual(SpecTickMode.regular, specTickMode(true, false, false, false, false, false, false));
+    try testing.expectEqual(SpecTickMode.drafter, specTickMode(false, false, true, true, false, false, false));
+    try testing.expectEqual(SpecTickMode.regular, specTickMode(false, false, true, false, false, false, false));
+
+    // Priority: MTP > drafter > PLD (the spec-dispatch rule).
+    try testing.expectEqual(SpecTickMode.mtp, specTickMode(true, true, true, true, true, true, false));
+    try testing.expectEqual(SpecTickMode.drafter, specTickMode(false, false, true, true, true, true, false));
+
+    // DSpark: the generator's post-chokepoint bit AND the slot's MTP flag —
+    // the "model's native head" semantics (server defaults it ON for a
+    // stage-bearing dsv4; the n-gram gate never touches enable_mtp). It wins
+    // over everything (a set mtp/pld generator conjunct alongside dspark is
+    // unreachable by the chokepoint's construction, but priority must hold).
+    try testing.expectEqual(SpecTickMode.dspark, specTickMode(true, false, false, false, false, false, true));
+    try testing.expectEqual(SpecTickMode.dspark, specTickMode(true, true, true, true, true, true, true));
+    // PLD/drafter intent alone never drives dspark (their flags are
+    // prompt-gated — riding them made engagement depend on the n-gram gate).
+    try testing.expectEqual(SpecTickMode.regular, specTickMode(false, false, false, false, true, false, true));
+    try testing.expectEqual(SpecTickMode.regular, specTickMode(false, false, true, false, false, false, true));
+    // Generator armed but the request opted enable_mtp off → serial.
+    try testing.expectEqual(SpecTickMode.regular, specTickMode(false, false, false, false, false, false, true));
+    // Slot asked, generator never armed dspark → falls through as before.
+    try testing.expectEqual(SpecTickMode.regular, specTickMode(true, false, false, false, false, false, false));
 }

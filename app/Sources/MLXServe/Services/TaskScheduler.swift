@@ -542,6 +542,7 @@ final class TaskScheduler: ObservableObject {
             let result = await AgentEngine.executeToolCall(
                 tc, workingDirectory: &wd, repetition: repetition, iteration: 0,
                 agentMemory: appState.agentMemory, mcpRouter: appState.mcpManager,
+                mcpEnabled: task.useMCP,
                 allowedTools: resolved.tools)
             appendToolResult(sessionId: sessionId, id: result.id, name: result.name,
                              display: "**\(result.name)** → \(String(result.output.prefix(500)))",

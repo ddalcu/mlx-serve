@@ -15,6 +15,7 @@
 //!     - tools_json (raw bytes; null contributes a sentinel)
 //!     - tool_choice_instruction
 //!     - enable_thinking flag
+//!     - reasoning_effort string (dsv4 templates render it)
 //! Image-bearing messages are intentionally excluded — the vision pipeline
 //! re-injects per-request token positions and any cache hit there would
 //! point at stale token IDs.
@@ -63,6 +64,7 @@ pub const TokenizeCache = struct {
         tools_json: ?[]const u8,
         tool_choice_instruction: ?[]const u8,
         enable_thinking: bool,
+        reasoning_effort: ?[]const u8,
     ) ?u64 {
         for (messages) |m| if (m.images != null) return null;
         var h = std.hash.Wyhash.init(0xC0DEC0DE);
@@ -90,6 +92,11 @@ pub const TokenizeCache = struct {
         if (tool_choice_instruction) |t| h.update(t) else h.update("(no-tc)");
         h.update("\x1e");
         h.update(if (enable_thinking) "thinking=on" else "thinking=off");
+        h.update("\x1e");
+        // The effort string changes the rendered prompt for templates that
+        // map it (dsv4's high/max preamble) — two requests differing only in
+        // effort must not share a cached tokenization.
+        if (reasoning_effort) |e| h.update(e) else h.update("(no-effort)");
         return h.final();
     }
 
@@ -160,9 +167,9 @@ test "TokenizeCache key stability" {
     const m3 = [_]chat_mod.Message{
         .{ .role = "user", .content = "hello world!" }, // different content
     };
-    const k1 = TokenizeCache.keyFor(&m1, null, null, false).?;
-    const k2 = TokenizeCache.keyFor(&m2, null, null, false).?;
-    const k3 = TokenizeCache.keyFor(&m3, null, null, false).?;
+    const k1 = TokenizeCache.keyFor(&m1, null, null, false, null).?;
+    const k2 = TokenizeCache.keyFor(&m2, null, null, false, null).?;
+    const k3 = TokenizeCache.keyFor(&m3, null, null, false, null).?;
     try std.testing.expectEqual(k1, k2);
     try std.testing.expect(k1 != k3);
     _ = allocator;
@@ -178,9 +185,23 @@ test "TokenizeCache key distinguishes assistant reasoning_content" {
     const m2 = [_]chat_mod.Message{
         .{ .role = "assistant", .content = "4", .reasoning_content = "two plus two is four" },
     };
-    const k1 = TokenizeCache.keyFor(&m1, null, null, true).?;
-    const k2 = TokenizeCache.keyFor(&m2, null, null, true).?;
+    const k1 = TokenizeCache.keyFor(&m1, null, null, true, null).?;
+    const k2 = TokenizeCache.keyFor(&m2, null, null, true, null).?;
     try std.testing.expect(k1 != k2);
+}
+
+test "TokenizeCache key distinguishes reasoning_effort" {
+    // dsv4 templates render the mapped effort (high/max prepend a preamble) —
+    // a request at effort "high" must never hit the tokenization cached for
+    // the same messages at the default effort.
+    const m = [_]chat_mod.Message{
+        .{ .role = "user", .content = "prove it rigorously" },
+    };
+    const k_default = TokenizeCache.keyFor(&m, null, null, true, null).?;
+    const k_high = TokenizeCache.keyFor(&m, null, null, true, "high").?;
+    const k_max = TokenizeCache.keyFor(&m, null, null, true, "max").?;
+    try std.testing.expect(k_default != k_high);
+    try std.testing.expect(k_high != k_max);
 }
 
 test "TokenizeCache images null key" {
@@ -189,7 +210,7 @@ test "TokenizeCache images null key" {
             .{ .pixels = "", .width = 8, .height = 8 },
         } },
     };
-    try std.testing.expect(TokenizeCache.keyFor(&m_img, null, null, false) == null);
+    try std.testing.expect(TokenizeCache.keyFor(&m_img, null, null, false, null) == null);
 }
 
 test "TokenizeCache get/put + LRU eviction" {

@@ -321,21 +321,27 @@ final class RecommendedModelsTests: XCTestCase {
 
     /// The "Largest models" section holds the biggest picks, ordered smallest-
     /// first like every other catalog: the compact ~84 GB Hunyuan 3 oQ2e build
-    /// then the ~87 GB DeepSeek-V4-Flash ds4 GGUF.
+    /// then the ~118 GB native-MLX DeepSeek-V4-Flash mirror.
     func testLargestSectionHoldsHunyuanThenDeepseek() {
         XCTAssertEqual(RecommendedModelPick.largestCatalog.map(\.id), ["hy3-oq2e", "deepseek-v4-flash"])
     }
 
-    /// DeepSeek-V4-Flash is a GGUF/ds4 pick: it names the specific imatrix quant
-    /// to download (the repo ships many), which routes the pane to the GGUF
-    /// download path + ds4 MTP auto-download. Safetensors picks carry no file.
-    func testDeepseekV4FlashIsAnImatrixGgufPick() {
+    /// DeepSeek-V4-Flash is served by our OWN native `deepseek_v4` MLX arch, not
+    /// the embedded ds4 GGUF engine — so the pick is the mixed 2/3/8-bit mirror
+    /// and fetches a whole safetensors repo (no `ggufFilename`). Its RAM gate is
+    /// an explicit 128 GB: weights×1.2 would claim 141 GB and hide the model
+    /// from the exact machine the conversion was built for (~110 GB resident).
+    func testDeepseekV4FlashIsTheNativeMlxMirror() {
         let ds4 = RecommendedModelPick.deepseekV4Flash
         XCTAssertEqual(ds4.family, .largest)
-        XCTAssertEqual(ds4.repoId, "antirez/deepseek-v4-gguf")
-        XCTAssertEqual(ds4.ggufFilename?.contains("imatrix"), true, "curated pick must be the imatrix build")
-        XCTAssertEqual(ds4.ggufFilename?.contains("IQ2XXS"), true)
+        XCTAssertEqual(ds4.repoId, "ddalcu/DeepSeek-V4-Flash-0731-MLX-Serve-mixed-2-3-8bit")
+        XCTAssertNil(ds4.ggufFilename, "the native MLX mirror fetches the whole safetensors repo")
+        XCTAssertEqual(ds4.approxRAMNeededGB, 128.0)
+        XCTAssertTrue(ds4.meetsSystemRequirements(physicalMemoryBytes: 128 * GiB))
+        XCTAssertFalse(ds4.meetsSystemRequirements(physicalMemoryBytes: 96 * GiB))
         XCTAssertNil(RecommendedModelPick.gemmaE4B.ggufFilename, "safetensors picks fetch the whole repo")
+        XCTAssertFalse(RecommendedModelPick.allCatalogs.contains { $0.repoId == "antirez/deepseek-v4-gguf" },
+                       "the ds4 GGUF pick is superseded by the native mirror")
     }
 
     /// poolside's Laguna family is its own section — coding-specialist MoEs

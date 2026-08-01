@@ -516,9 +516,10 @@ enum AgentEngine {
     /// callers with no agent (TestServer, older surfaces) get.
     ///
     /// Only names that resolve to a built-in tool are gated: MCP tools are
-    /// governed by the agent's MCP flag (their servers aren't even started when
-    /// it's off), and a genuinely unknown name keeps its existing "Unknown tool"
-    /// answer, which is what steers the model back to a real one.
+    /// governed by the MCP dispatch gate (`mcpEnabled` + `mcpDisabledRefusal` —
+    /// "servers aren't started when it's off" is NOT enough, see there), and a
+    /// genuinely unknown name keeps its existing "Unknown tool" answer, which
+    /// is what steers the model back to a real one.
     static func disallowedToolRefusal(name raw: String, allowed: Set<AgentToolKind>?) -> String? {
         guard let allowed else { return nil }
         let name = canonicalToolName(raw)
@@ -527,6 +528,20 @@ enum AgentEngine {
         return "Error: the `\(name)` tool is turned off for this agent, so it was not run. "
             + "Do not call it again. Available tools are listed in this request; "
             + "if none of them can do this, say so in plain text instead."
+    }
+
+    /// Named refusal for an MCP-namespaced call arriving while the turn's MCP
+    /// toggle is OFF. The toggle must gate DISPATCH, not just server spawn and
+    /// advertising: MCP servers started by an earlier MCP-on turn stay
+    /// connected for the app's lifetime (`MCPManager.stopAll` only runs at
+    /// quit), and models re-call `<server>__<tool>` names they saw in this
+    /// chat's own history — so without this gate the call executed (or hung
+    /// against a dead upstream) in a chat where MCP was supposedly off.
+    /// Leads with the fact, forbids the retry, steers to the advertised tools.
+    static func mcpDisabledRefusal(name: String) -> String {
+        "Error: MCP is turned off for this chat, so `\(name)` was not run. "
+            + "Do not call it again — no MCP tool is available in this turn. "
+            + "Use the tools listed in this request, or answer in plain text."
     }
 
     /// Detects when the agent loop is making no progress — consecutive rounds in
@@ -629,6 +644,10 @@ enum AgentEngine {
         iteration: Int,
         agentMemory: AgentMemory,
         mcpRouter: (any MCPToolRouting)? = nil,
+        /// Whether THIS turn may execute MCP tools. Default false: secure by
+        /// default — a call site that injects a router without opting in gets
+        /// refusals (immediately visible), never silent MCP execution.
+        mcpEnabled: Bool = false,
         documentIndex: DocumentIndex? = nil,
         createTask: ((_ goal: String, _ schedule: String?) async -> String)? = nil,
         generateMedia: ((_ kind: MediaKind, _ args: [String: String]) async -> String)? = nil,
@@ -689,8 +708,13 @@ enum AgentEngine {
         if repetition.isBlocked(name: tc.name, arguments: tc.arguments, iteration: iteration) {
             output = toolBlockMessage(for: tc.name)
         } else if let mcpRouter, mcpRouter.owns(toolName: tc.name) {
-            output = await mcpRouter.executeToolCall(
-                name: tc.name, arguments: tc.arguments, rawArguments: tc.rawArguments)
+            // `owns` says the server is CONNECTED — a lifetime property, not a
+            // toggle property (sessions outlive the turn that spawned them).
+            // The turn's own MCP flag decides whether the call may execute.
+            output = mcpEnabled
+                ? await mcpRouter.executeToolCall(
+                    name: tc.name, arguments: tc.arguments, rawArguments: tc.rawArguments)
+                : mcpDisabledRefusal(name: tc.name)
         } else {
             output = await executeBuiltinTool(tc, name: name, workingDirectory: &workingDirectory,
                                               agentMemory: agentMemory, documentIndex: documentIndex,

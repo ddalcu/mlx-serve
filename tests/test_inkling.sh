@@ -27,7 +27,8 @@ fi
 
 PORT="${INKLING_TEST_PORT:-11341}"
 BIN="$(dirname "$0")/../zig-out/bin/mlx-serve"
-LOG=$(mktemp /tmp/inkling_test_serve.XXXXXX.log)
+# Trailing X's: macOS mktemp does not substitute a mid-name XXXXXX.
+LOG=$(mktemp /tmp/inkling_test_serve.XXXXXX)
 
 "$BIN" --model "$MODEL" --serve --port "$PORT" > "$LOG" 2>&1 &
 SERVER_PID=$!

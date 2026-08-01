@@ -102,4 +102,28 @@ final class MTPSettingsTests: XCTestCase {
         XCTAssertTrue(ServerOptions.serverFlagFields["enableMTP"]?.needsRestart ?? false)
         XCTAssertTrue(ServerOptions.serverFlagFields["forceMTPOnMoE"]?.needsRestart ?? false)
     }
+
+    // MARK: DSpark (DeepSeek-V4 draft stages)
+
+    /// DSpark is OPT-IN server-side (the stages cost ~11 GB resident), so the
+    /// app default is off and a default launch emits nothing.
+    func testDefaultsEmitNoDsparkFlag() {
+        XCTAssertFalse(args { _ in }.contains("--dspark"))
+    }
+
+    func testEnablingDsparkEmitsTheFlag() {
+        XCTAssertTrue(args { $0.enableDSpark = true }.contains("--dspark"))
+    }
+
+    /// Configs stored before the field existed decode to the default (off).
+    func testConfigStoredBeforeDsparkExistedDecodesToOff() throws {
+        let legacy = #"{"host":"0.0.0.0","port":11234,"enablePLD":true}"#.data(using: .utf8)!
+        let decoded = try JSONDecoder().decode(ServerOptions.self, from: legacy)
+        XCTAssertFalse(decoded.enableDSpark)
+    }
+
+    func testTheUIHasCopyForDspark() {
+        XCTAssertNotNil(ServerOptions.serverFlagFields["enableDSpark"])
+        XCTAssertTrue(ServerOptions.serverFlagFields["enableDSpark"]?.needsRestart ?? false)
+    }
 }

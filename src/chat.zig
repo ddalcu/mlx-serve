@@ -134,6 +134,8 @@ pub fn loadChatConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []con
 }
 
 /// Format chat messages into token IDs using the model's Jinja chat template.
+/// `effort` is the client's raw `reasoning_effort` string (see
+/// `serializeExtraContext`) — null when the request didn't send one.
 pub fn formatChat(
     allocator: std.mem.Allocator,
     tok: *const Tokenizer,
@@ -142,8 +144,9 @@ pub fn formatChat(
     tools_json: ?[]const u8,
     tool_choice_instruction: ?[]const u8,
     enable_thinking: bool,
+    effort: ?[]const u8,
 ) ![]u32 {
-    const rendered = try renderChatTemplate(allocator, messages, chat_config, tools_json, tool_choice_instruction, enable_thinking);
+    const rendered = try renderChatTemplate(allocator, messages, chat_config, tools_json, tool_choice_instruction, enable_thinking, effort);
     defer allocator.free(rendered);
 
 
@@ -303,8 +306,9 @@ pub fn encodeChatViaLlama(
     tools_json: ?[]const u8,
     tool_choice_instruction: ?[]const u8,
     enable_thinking: bool,
+    effort: ?[]const u8,
 ) ![]u32 {
-    const rendered = try renderChatTemplate(allocator, messages, chat_config, tools_json, tool_choice_instruction, enable_thinking);
+    const rendered = try renderChatTemplate(allocator, messages, chat_config, tools_json, tool_choice_instruction, enable_thinking, effort);
     defer allocator.free(rendered);
 
     const i32_ids = try engine.tokenizeText(allocator, rendered, false);
@@ -345,6 +349,7 @@ fn renderChatTemplate(
     tools_json: ?[]const u8,
     tool_choice_instruction: ?[]const u8,
     enable_thinking: bool,
+    effort: ?[]const u8,
 ) ![]const u8 {
     if (chat_config.chat_template.len == 0) {
         return fallbackFormatChat(allocator, messages, chat_config, tools_json, tool_choice_instruction, enable_thinking);
@@ -386,8 +391,8 @@ fn renderChatTemplate(
     const messages_json = try serializeMessagesJson(allocator, effective_messages);
     defer allocator.free(messages_json);
 
-    // Build extra context (bos_token, eos_token, enable_thinking)
-    const extra_json = try serializeExtraContext(allocator, chat_config, enable_thinking);
+    // Build extra context (bos_token, eos_token, enable_thinking, effort)
+    const extra_json = try serializeExtraContext(allocator, chat_config, enable_thinking, effort);
     defer allocator.free(extra_json);
 
     // Null-terminate strings for C
@@ -650,7 +655,22 @@ pub fn serializeMessagesJson(allocator: std.mem.Allocator, messages: []const Mes
     return buf.toOwnedSlice(allocator);
 }
 
-fn serializeExtraContext(allocator: std.mem.Allocator, chat_config: *const ChatConfig, enable_thinking: bool) ![]const u8 {
+/// OpenAI's effort vocabulary → DeepSeek's low|high|max. `medium` maps to
+/// low deliberately: DeepSeek's `high` text is "Absolute maximum with no
+/// shortcuts permitted" and its own default is low, so nothing verbose is
+/// injected unless the client explicitly asked for it. Unknown strings also
+/// fall back to low for the same reason.
+pub fn dsv4EffortFor(effort: ?[]const u8) []const u8 {
+    const e = effort orelse return "low";
+    if (std.mem.eql(u8, e, "high")) return "high";
+    if (std.mem.eql(u8, e, "xhigh") or std.mem.eql(u8, e, "max")) return "max";
+    return "low";
+}
+
+/// `effort` is the client's raw `reasoning_effort` string (null when the
+/// request didn't send one) — today only the dsv4 family maps it into the
+/// template; other families keep their fixed vocabulary.
+fn serializeExtraContext(allocator: std.mem.Allocator, chat_config: *const ChatConfig, enable_thinking: bool, effort: ?[]const u8) ![]const u8 {
     var buf = std.ArrayList(u8).empty;
     errdefer buf.deinit(allocator);
 
@@ -684,13 +704,35 @@ fn serializeExtraContext(allocator: std.mem.Allocator, chat_config: *const ChatC
     // anything else — hy3's "no_think" would fail the render and silently
     // swap in fallbackFormatChat (wrong-family tags). Its thinking-off word
     // is "none"; sniffed by the effort header string unique to that family.
+    // DeepSeek-V4-0731's encoder made `reasoning_effort` a THREE-level
+    // vocabulary (low|high|max) whose high/max levels PREPEND a verbose
+    // "Reasoning Effort: …" preamble to the whole conversation, with low (=
+    // nothing) as the reference default. hy3's blanket "high" would inject
+    // that preamble into every thinking request on this family, so dsv4 maps
+    // the CLIENT's effort string through `dsv4EffortFor` — high/max opt in,
+    // everything else (incl. absent) stays the reference default.
+    const dsv4_style = std.mem.indexOf(u8, chat_config.chat_template, "thinking_mode") != null;
     const inkling_style = std.mem.indexOf(u8, chat_config.chat_template, "Thinking effort level") != null;
-    try buf.appendSlice(allocator, if (enable_thinking)
+    if (dsv4_style) {
+        try buf.appendSlice(allocator, ",\"reasoning_effort\":\"");
+        try buf.appendSlice(allocator, dsv4EffortFor(effort));
+        try buf.append(allocator, '"');
+    } else try buf.appendSlice(allocator, if (enable_thinking)
         ",\"reasoning_effort\":\"high\""
     else if (inkling_style)
         ",\"reasoning_effort\":\"none\""
     else
         ",\"reasoning_effort\":\"no_think\"");
+
+    // DeepSeek-V4's template switches on `thinking_mode` ("chat"|"thinking",
+    // the reference encoder's own vocabulary). Only emitted when the template
+    // reads it — other families never see the key.
+    if (std.mem.indexOf(u8, chat_config.chat_template, "thinking_mode") != null) {
+        try buf.appendSlice(allocator, if (enable_thinking)
+            ",\"thinking_mode\":\"thinking\""
+        else
+            ",\"thinking_mode\":\"chat\"");
+    }
 
     try buf.append(allocator, '}');
     return buf.toOwnedSlice(allocator);
@@ -1431,6 +1473,9 @@ pub fn streamShouldBufferForTools(buf: []const u8) bool {
     // first real pi session; the leak landed in pi's transcript and
     // contaminated every later turn's history).
     if (std.mem.indexOf(u8, buf, INKLING_INVOKE_TAG) != null) return true;
+
+    // DeepSeek-V4 DSML: everything from `<｜DSML｜` on is a tool-call block.
+    if (std.mem.indexOf(u8, buf, "<｜DSML｜") != null) return true;
     // Inkling NAME hold: with a message-boundary marker present (a family
     // signal no other template emits), a segment that is still a bare
     // identifier run may be the NAME directly before an invoke marker. Prose
@@ -1457,6 +1502,10 @@ pub fn streamShouldBufferForTools(buf: []const u8) bool {
         "<",     "<t",     "<to",     "<too",     "<tool",
         "<|",    "<|t",    "<|to",    "<|too",    "<|tool",
         "<|tool_", "<|tool_c", "<|tool_ca", "<|tool_cal",
+        // DSML fullwidth-bar prefixes (`｜` = 3 bytes; cover mid-codepoint
+        // splits too in case the tokenizer spells the marker in pieces)
+        "<\xef",  "<\xef\xbd", "<｜",  "<｜D", "<｜DS", "<｜DSM",
+        "<｜DSML", "<｜DSML\xef", "<｜DSML\xef\xbd",
     };
     for (tail_prefixes) |p| {
         if (std.mem.endsWith(u8, buf, p)) return true;
@@ -1581,6 +1630,10 @@ pub fn parseToolCalls(allocator: std.mem.Allocator, text: []const u8) !?[]Parsed
     // whose distinctive marker no other family emits; the generic `<tool`
     // scans never see the shape and other families never carry the marker.
     try parseInklingToolCalls(allocator, text, &calls);
+    // DeepSeek-V4 native DSML (`<｜DSML｜invoke …>`): distinctive fullwidth-bar
+    // marker no other family emits, and the generic `<tool` scan never sees
+    // it (the byte before "tool_calls" is `｜`, not `<`).
+    try parseDsmlToolCalls(allocator, effective_text, &calls);
     // Hy3 (Hunyuan 3) SUFFIXED tag format is tried FIRST among the tag
     // families: its wrapper (`<tool_calls:opensource>`) would also trip the
     // generic `<tool` scan below, which would misread the non-JSON
@@ -2950,6 +3003,154 @@ fn inklingTrailingNameRun(text: []const u8, end: usize) []const u8 {
 /// well-formed output, and is the fallback when the payload is truncated).
 /// Truncation salvage per the hard rule: recover NAME + `{}` — never partial
 /// argument values.
+// DeepSeek-V4 native DSML markers. `｜` is the FULLWIDTH vertical bar
+// (U+FF5C, 3 bytes) — the dsml_token "｜DSML｜" appears in no other family.
+const DSML_INVOKE_TAG = "<｜DSML｜invoke";
+const DSML_INVOKE_CLOSE = "</｜DSML｜invoke>";
+const DSML_PARAM_TAG = "<｜DSML｜parameter";
+const DSML_PARAM_CLOSE = "</｜DSML｜parameter>";
+
+/// Tolerant quoted-attribute extraction from a tag-attribute segment:
+/// `name="X"` / `name='X'` / mangled unquoted `name=X` (to whitespace/`>`).
+fn dsmlAttr(seg: []const u8, comptime key: []const u8) ?[]const u8 {
+    const pat = key ++ "=";
+    var start: usize = 0;
+    while (std.mem.indexOfPos(u8, seg, start, pat)) |at| {
+        if (at > 0 and (std.ascii.isAlphanumeric(seg[at - 1]) or seg[at - 1] == '_')) {
+            start = at + pat.len;
+            continue;
+        }
+        var v = at + pat.len;
+        if (v >= seg.len) return null;
+        const q = seg[v];
+        if (q == '"' or q == '\'') {
+            v += 1;
+            const end = std.mem.indexOfScalarPos(u8, seg, v, q) orelse seg.len;
+            return seg[v..end];
+        }
+        const end = std.mem.indexOfAnyPos(u8, seg, v, " \t\n>") orelse seg.len;
+        return seg[v..end];
+    }
+    return null;
+}
+
+/// DeepSeek-V4 DSML tool calls:
+///   `<｜DSML｜tool_calls>` wrapping
+///   `<｜DSML｜invoke name="X">` +
+///   `<｜DSML｜parameter name="k" string="true|false">v</｜DSML｜parameter>`.
+/// string="true" values are raw text (JSON-escaped here); string="false"
+/// values are already JSON (validated; invalid degrades to an honest string).
+/// House conventions: the parser keys on the INVOKE marker (a dropped
+/// wrapper or invoke-close still parses — delimiter-drop class), values run
+/// to the CONFIRMED closing tag (rich values with `<`/newlines survive),
+/// truncation salvages NAME + completed pairs (fragments dropped), keys are
+/// escaped + deduped (last wins) so emitted arguments are ALWAYS valid JSON.
+fn parseDsmlToolCalls(allocator: std.mem.Allocator, text: []const u8, calls: *std.ArrayList(ParsedToolCall)) !void {
+    const Param = struct { key: []const u8, value: []const u8, is_string: bool };
+    var pos: usize = 0;
+    while (std.mem.indexOfPos(u8, text, pos, DSML_INVOKE_TAG)) |inv| {
+        var p = inv + DSML_INVOKE_TAG.len;
+        const tag_end = std.mem.indexOfScalarPos(u8, text, p, '>') orelse break;
+        const name = dsmlAttr(text[p..tag_end], "name") orelse {
+            pos = tag_end + 1;
+            continue;
+        };
+        p = tag_end + 1;
+
+        var params = std.ArrayList(Param).empty;
+        defer params.deinit(allocator);
+        while (true) {
+            const next_param = std.mem.indexOfPos(u8, text, p, DSML_PARAM_TAG);
+            const next_close = std.mem.indexOfPos(u8, text, p, DSML_INVOKE_CLOSE);
+            const next_invoke = std.mem.indexOfPos(u8, text, p, DSML_INVOKE_TAG);
+            const np = next_param orelse std.math.maxInt(usize);
+            const nc = next_close orelse std.math.maxInt(usize);
+            const ni = next_invoke orelse std.math.maxInt(usize);
+            if (np == std.math.maxInt(usize) and nc == std.math.maxInt(usize) and ni == std.math.maxInt(usize)) {
+                // truncated invoke: ship NAME + completed pairs
+                p = text.len;
+                break;
+            }
+            if (nc <= np and nc <= ni) {
+                p = nc + DSML_INVOKE_CLOSE.len;
+                break;
+            }
+            if (ni < np) {
+                // dropped invoke-close — the next call starts here; the outer
+                // loop picks it up from `p`.
+                p = ni;
+                break;
+            }
+            // parameter
+            var q = np + DSML_PARAM_TAG.len;
+            const ptag_end = std.mem.indexOfScalarPos(u8, text, q, '>') orelse {
+                p = text.len;
+                break;
+            };
+            const attrs = text[q..ptag_end];
+            const pkey = dsmlAttr(attrs, "name");
+            const pstring = dsmlAttr(attrs, "string");
+            const vstart = ptag_end + 1;
+            const vclose = std.mem.indexOfPos(u8, text, vstart, DSML_PARAM_CLOSE) orelse {
+                // unterminated value = server-cut fragment; drop it, end scan
+                p = text.len;
+                break;
+            };
+            q = vclose + DSML_PARAM_CLOSE.len;
+            if (pkey) |k| {
+                const value = text[vstart..vclose];
+                // string attr absent (mangled opener): treat JSON-parseable
+                // values as JSON, everything else as a string.
+                const is_string = if (pstring) |sf|
+                    !std.mem.eql(u8, sf, "false")
+                else
+                    !dsmlValueIsJson(allocator, value);
+                // dedup: last wins
+                var replaced = false;
+                for (params.items) |*prm| {
+                    if (std.mem.eql(u8, prm.key, k)) {
+                        prm.value = value;
+                        prm.is_string = is_string;
+                        replaced = true;
+                        break;
+                    }
+                }
+                if (!replaced) try params.append(allocator, .{ .key = k, .value = value, .is_string = is_string });
+            }
+            p = q;
+        }
+
+        // Build the arguments object: escaped keys, escaped string values,
+        // raw (validated) JSON values.
+        var out = std.ArrayList(u8).empty;
+        errdefer out.deinit(allocator);
+        try out.append(allocator, '{');
+        for (params.items, 0..) |prm, i| {
+            if (i > 0) try out.append(allocator, ',');
+            try appendJsonString(allocator, &out, prm.key);
+            try out.append(allocator, ':');
+            if (!prm.is_string and dsmlValueIsJson(allocator, prm.value)) {
+                try out.appendSlice(allocator, std.mem.trim(u8, prm.value, " \t\n\r"));
+            } else {
+                try appendJsonString(allocator, &out, prm.value);
+            }
+        }
+        try out.append(allocator, '}');
+        const name_owned = try allocator.dupe(u8, name);
+        errdefer allocator.free(name_owned);
+        try calls.append(allocator, .{ .name = name_owned, .arguments = try out.toOwnedSlice(allocator) });
+        pos = p;
+    }
+}
+
+fn dsmlValueIsJson(allocator: std.mem.Allocator, value: []const u8) bool {
+    const trimmed = std.mem.trim(u8, value, " \t\n\r");
+    if (trimmed.len == 0) return false;
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, trimmed, .{}) catch return false;
+    parsed.deinit();
+    return true;
+}
+
 fn parseInklingToolCalls(allocator: std.mem.Allocator, text: []const u8, calls: *std.ArrayList(ParsedToolCall)) !void {
     var pos: usize = 0;
     while (std.mem.indexOfPos(u8, text, pos, INKLING_INVOKE_TAG)) |inv| {
@@ -6383,7 +6584,7 @@ test "renderChatTemplate: tool result with raw ANSI escapes still renders via Ji
         // Verbatim shape from the live failure: hide-cursor ANSI code + prompt UI.
         .{ .role = "tool", .content = "\x1b[?25l\u{2502}\n\u{25c6}  Which template would you like?", .tool_call_id = "tc_0" },
     };
-    const rendered = try renderChatTemplate(allocator, &messages, &config, "[]", null, false);
+    const rendered = try renderChatTemplate(allocator, &messages, &config, "[]", null, false, null);
     defer allocator.free(rendered);
 
     try testing.expect(std.mem.indexOf(u8, rendered, "<|tool_response>") != null);
@@ -6426,7 +6627,7 @@ test "renderChatTemplate: Hy3 constructs — str.format tokens, arguments.items(
         .{ .role = "user", .content = "write it" },
         .{ .role = "assistant", .content = "", .tool_calls = &tc },
     };
-    const rendered = try renderChatTemplate(allocator, &messages, &config, "[]", null, false);
+    const rendered = try renderChatTemplate(allocator, &messages, &config, "[]", null, false, null);
     defer allocator.free(rendered);
 
     try testing.expect(std.mem.indexOf(u8, rendered, "<user:opensource>write it") != null);
@@ -6478,7 +6679,7 @@ test "renderChatTemplate: REAL Hy3 chat_template.jinja renders without fallback 
 
     // Thinking ON: generation prompt must end inside a think block.
     {
-        const rendered = try renderChatTemplate(allocator, &messages, &config, tools_json, null, true);
+        const rendered = try renderChatTemplate(allocator, &messages, &config, tools_json, null, true, null);
         defer allocator.free(rendered);
         try testing.expect(std.mem.indexOf(u8, rendered, "hy_begin_of_sentence:opensource") != null);
         try testing.expect(std.mem.indexOf(u8, rendered, "hy_User:opensource") != null);
@@ -6494,7 +6695,7 @@ test "renderChatTemplate: REAL Hy3 chat_template.jinja renders without fallback 
     }
     // Thinking OFF (reasoning_effort no_think): think opened AND closed.
     {
-        const rendered = try renderChatTemplate(allocator, &messages, &config, tools_json, null, false);
+        const rendered = try renderChatTemplate(allocator, &messages, &config, tools_json, null, false, null);
         defer allocator.free(rendered);
         try testing.expect(!promptTailOpensThink(rendered));
         try testing.expect(std.mem.indexOf(u8, rendered, "<think:opensource></think:opensource>") != null);
@@ -6536,7 +6737,7 @@ test "renderChatTemplate: REAL Inkling chat_template.jinja renders without fallb
     // {"name":...,"args":{...}} with args as an OBJECT (sorted, compact), tool
     // result named via tool_call_id lookup, generation prompt at the tail.
     {
-        const rendered = try renderChatTemplate(allocator, &messages, &config, tools_json, null, true);
+        const rendered = try renderChatTemplate(allocator, &messages, &config, tools_json, null, true, null);
         defer allocator.free(rendered);
         try testing.expect(std.mem.indexOf(u8, rendered, "<|message_system|><|content_text|>Thinking effort level: 0.9<|end_message|>") != null);
         try testing.expect(std.mem.indexOf(u8, rendered, "<|message_system|>tool_declare<|content_xml|>") != null);
@@ -6553,7 +6754,7 @@ test "renderChatTemplate: REAL Inkling chat_template.jinja renders without fallb
     // Thinking OFF: the effort header must be the template's "0" form — hy3's
     // "no_think" is UNKNOWN to this template and raises.
     {
-        const rendered = try renderChatTemplate(allocator, &messages, &config, tools_json, null, false);
+        const rendered = try renderChatTemplate(allocator, &messages, &config, tools_json, null, false, null);
         defer allocator.free(rendered);
         try testing.expect(std.mem.indexOf(u8, rendered, "Thinking effort level: 0<|end_message|>") != null);
         try testing.expect(std.mem.indexOf(u8, rendered, "<|im_start|>") == null);
@@ -6569,7 +6770,7 @@ test "renderChatTemplate: REAL Inkling chat_template.jinja renders without fallb
             .{ .role = "assistant", .content = "Rayleigh scattering.", .reasoning_content = "Shorter wavelengths scatter more." },
             .{ .role = "user", .content = "And sunsets?" },
         };
-        const rendered = try renderChatTemplate(allocator, &hist, &config, null, null, true);
+        const rendered = try renderChatTemplate(allocator, &hist, &config, null, null, true, null);
         defer allocator.free(rendered);
         try testing.expect(std.mem.indexOf(u8, rendered, "<|message_model|><|content_thinking|>Shorter wavelengths scatter more.<|end_message|>") != null);
         try testing.expect(std.mem.indexOf(u8, rendered, "<|message_model|><|content_text|>Rayleigh scattering.<|end_message|>") != null);
@@ -6588,7 +6789,7 @@ test "serializeExtraContext with thinking enabled" {
     };
     _ = &config;
 
-    const result = try serializeExtraContext(allocator, &config, true);
+    const result = try serializeExtraContext(allocator, &config, true, null);
     defer allocator.free(result);
     // Should contain enable_thinking:true
     try testing.expect(std.mem.indexOf(u8, result, "\"enable_thinking\":true") != null);
@@ -6605,9 +6806,80 @@ test "serializeExtraContext with thinking disabled" {
     };
     _ = &config;
 
-    const result = try serializeExtraContext(allocator, &config, false);
+    const result = try serializeExtraContext(allocator, &config, false, null);
     defer allocator.free(result);
     try testing.expect(std.mem.indexOf(u8, result, "\"enable_thinking\":false") != null);
+}
+
+test "dsv4EffortFor: OpenAI effort vocabulary maps onto DeepSeek's low|high|max" {
+    // medium deliberately maps LOW: DeepSeek's "high" text is a verbose
+    // "absolute maximum, no shortcuts" preamble and the reference default is
+    // low — nothing verbose is injected unless the client explicitly asked.
+    try testing.expectEqualStrings("low", dsv4EffortFor(null));
+    try testing.expectEqualStrings("low", dsv4EffortFor("none"));
+    try testing.expectEqualStrings("low", dsv4EffortFor("minimal"));
+    try testing.expectEqualStrings("low", dsv4EffortFor("low"));
+    try testing.expectEqualStrings("low", dsv4EffortFor("medium"));
+    try testing.expectEqualStrings("low", dsv4EffortFor("banana")); // unknown → default
+    try testing.expectEqualStrings("high", dsv4EffortFor("high"));
+    try testing.expectEqualStrings("max", dsv4EffortFor("xhigh"));
+    try testing.expectEqualStrings("max", dsv4EffortFor("max"));
+}
+
+test "serializeExtraContext: dsv4 gets the reference's default reasoning effort" {
+    // DeepSeek-V4-0731 turned `reasoning_effort` into low|high|max where
+    // high/max PREPEND a verbose preamble to the conversation and low adds
+    // nothing (the reference default). The hy3 convention of sending "high"
+    // for every thinking-enabled request would silently attach that preamble
+    // to every dsv4 thinking turn; the family is sniffed by `thinking_mode`,
+    // which only this template reads.
+    const allocator = testing.allocator;
+    var dsv4 = ChatConfig{
+        .chat_template = "{%- set mode = thinking_mode|default('chat') -%}",
+        .bos_token = null,
+        .eos_token = null,
+        .add_bos_token = false,
+        .allocator = allocator,
+    };
+    for ([_]bool{ true, false }) |thinking| {
+        const r = try serializeExtraContext(allocator, &dsv4, thinking, null);
+        defer allocator.free(r);
+        try testing.expect(std.mem.indexOf(u8, r, "\"reasoning_effort\":\"low\"") != null);
+        // thinking_mode still carries the on/off switch for this family.
+        try testing.expect(std.mem.indexOf(u8, r, if (thinking)
+            "\"thinking_mode\":\"thinking\""
+        else
+            "\"thinking_mode\":\"chat\"") != null);
+    }
+    // A client-supplied effort string reaches the template MAPPED through
+    // `dsv4EffortFor` — high/max opt into the verbose preamble, medium stays
+    // at the reference default (never silently verbose).
+    const mapped_cases = [_]struct { in: ?[]const u8, out: []const u8 }{
+        .{ .in = "high", .out = "\"reasoning_effort\":\"high\"" },
+        .{ .in = "max", .out = "\"reasoning_effort\":\"max\"" },
+        .{ .in = "xhigh", .out = "\"reasoning_effort\":\"max\"" },
+        .{ .in = "medium", .out = "\"reasoning_effort\":\"low\"" },
+    };
+    for (mapped_cases) |case| {
+        const r = try serializeExtraContext(allocator, &dsv4, true, case.in);
+        defer allocator.free(r);
+        try testing.expect(std.mem.indexOf(u8, r, case.out) != null);
+    }
+
+    // Other families are untouched: hy3-style keeps high/no_think.
+    var other = ChatConfig{
+        .chat_template = "{{ reasoning_effort }}",
+        .bos_token = null,
+        .eos_token = null,
+        .add_bos_token = false,
+        .allocator = allocator,
+    };
+    const on = try serializeExtraContext(allocator, &other, true, null);
+    defer allocator.free(on);
+    try testing.expect(std.mem.indexOf(u8, on, "\"reasoning_effort\":\"high\"") != null);
+    const off = try serializeExtraContext(allocator, &other, false, null);
+    defer allocator.free(off);
+    try testing.expect(std.mem.indexOf(u8, off, "\"reasoning_effort\":\"no_think\"") != null);
 }
 
 test "serializeMessagesJson basic" {
@@ -6689,7 +6961,7 @@ test "assistant history reasoning_content reaches a template that reads it (lagu
         .{ .role = "user", .content = "What is 2+2?" },
         .{ .role = "assistant", .content = "4", .reasoning_content = "two plus two is four" },
     };
-    const rendered = try renderChatTemplate(allocator, &messages, &config, null, null, true);
+    const rendered = try renderChatTemplate(allocator, &messages, &config, null, null, true, null);
     defer allocator.free(rendered);
     try testing.expect(std.mem.indexOf(u8, rendered, "<think>two plus two is four</think>4") != null);
 }
@@ -7128,7 +7400,7 @@ test "renderChatTemplate: DSV4-style template gets tool fallback applied" {
     const messages = [_]Message{
         .{ .role = "user", .content = "list my files" },
     };
-    const rendered = try renderChatTemplate(allocator, &messages, &config, tools_json, null, false);
+    const rendered = try renderChatTemplate(allocator, &messages, &config, tools_json, null, false, null);
     defer allocator.free(rendered);
     // Tool prompt should have been injected as a system message.
     try testing.expect(std.mem.indexOf(u8, rendered, "Available functions") != null);
@@ -8876,4 +9148,230 @@ test "parseToolCalls hy3: suffixed think close before the wrapper still parses" 
     }
     try testing.expectEqual(@as(usize, 1), calls.len);
     try testing.expectEqualStrings("list_files", calls[0].name);
+}
+
+// ── DeepSeek-V4 native DSML tool calls ─────────────────────────────────
+
+fn freeParsedCalls(calls: []ParsedToolCall) void {
+    for (calls) |tc| {
+        testing.allocator.free(tc.name);
+        testing.allocator.free(tc.arguments);
+    }
+    testing.allocator.free(calls);
+}
+
+test "parseToolCalls dsml: canonical two-call block, string and JSON params" {
+    const raw = "I'll check the weather.\n\n<｜DSML｜tool_calls>\n" ++
+        "<｜DSML｜invoke name=\"get_weather\">\n" ++
+        "<｜DSML｜parameter name=\"city\" string=\"true\">San Francisco</｜DSML｜parameter>\n" ++
+        "<｜DSML｜parameter name=\"days\" string=\"false\">3</｜DSML｜parameter>\n" ++
+        "</｜DSML｜invoke>\n" ++
+        "<｜DSML｜invoke name=\"get_time\">\n" ++
+        "<｜DSML｜parameter name=\"tz\" string=\"true\">PST</｜DSML｜parameter>\n" ++
+        "</｜DSML｜invoke>\n" ++
+        "</｜DSML｜tool_calls>";
+    const calls = (try parseToolCalls(testing.allocator, raw)).?;
+    defer freeParsedCalls(calls);
+    try testing.expectEqual(@as(usize, 2), calls.len);
+    try testing.expectEqualStrings("get_weather", calls[0].name);
+    try testing.expectEqualStrings("{\"city\":\"San Francisco\",\"days\":3}", calls[0].arguments);
+    try testing.expectEqualStrings("get_time", calls[1].name);
+    try testing.expectEqualStrings("{\"tz\":\"PST\"}", calls[1].arguments);
+    try testing.expect(!calls[0].inferred);
+}
+
+test "parseToolCalls dsml: dropped invoke close before the next call still parses both" {
+    // Delimiter-drop tolerance (hy3 class): the model omits </｜DSML｜invoke>
+    // between back-to-back calls.
+    const raw = "<｜DSML｜tool_calls>\n" ++
+        "<｜DSML｜invoke name=\"first\">\n" ++
+        "<｜DSML｜parameter name=\"a\" string=\"true\">x</｜DSML｜parameter>\n" ++
+        "<｜DSML｜invoke name=\"second\">\n" ++
+        "<｜DSML｜parameter name=\"b\" string=\"false\">true</｜DSML｜parameter>\n" ++
+        "</｜DSML｜invoke>\n</｜DSML｜tool_calls>";
+    const calls = (try parseToolCalls(testing.allocator, raw)).?;
+    defer freeParsedCalls(calls);
+    try testing.expectEqual(@as(usize, 2), calls.len);
+    try testing.expectEqualStrings("first", calls[0].name);
+    try testing.expectEqualStrings("{\"a\":\"x\"}", calls[0].arguments);
+    try testing.expectEqualStrings("second", calls[1].name);
+    try testing.expectEqualStrings("{\"b\":true}", calls[1].arguments);
+}
+
+test "parseToolCalls dsml: truncation salvages NAME + completed pairs, never fragments" {
+    // Server-side cut mid-value: the unterminated pair is dropped (a half-
+    // written file is worse than a re-issued write), completed pairs survive.
+    const raw = "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"write_file\">\n" ++
+        "<｜DSML｜parameter name=\"path\" string=\"true\">/tmp/a.txt</｜DSML｜parameter>\n" ++
+        "<｜DSML｜parameter name=\"content\" string=\"true\">first half of a long fi";
+    const calls = (try parseToolCalls(testing.allocator, raw)).?;
+    defer freeParsedCalls(calls);
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("write_file", calls[0].name);
+    try testing.expectEqualStrings("{\"path\":\"/tmp/a.txt\"}", calls[0].arguments);
+}
+
+test "parseToolCalls dsml: rich string value runs to the confirmed close" {
+    // Newlines, quotes, braces, `<` inside a string value — value ends ONLY
+    // at the closing parameter tag (the Gemma dropped-quote class).
+    const raw = "<｜DSML｜invoke name=\"bash\">\n" ++
+        "<｜DSML｜parameter name=\"cmd\" string=\"true\">grep -r \"a < b\" src/\necho {done}</｜DSML｜parameter>\n" ++
+        "</｜DSML｜invoke>";
+    const calls = (try parseToolCalls(testing.allocator, raw)).?;
+    defer freeParsedCalls(calls);
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("bash", calls[0].name);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("grep -r \"a < b\" src/\necho {done}", parsed.value.object.get("cmd").?.string);
+}
+
+test "parseToolCalls dsml: duplicate keys dedup (last wins) and invalid JSON value degrades to string" {
+    const raw = "<｜DSML｜invoke name=\"t\">\n" ++
+        "<｜DSML｜parameter name=\"k\" string=\"true\">old</｜DSML｜parameter>\n" ++
+        "<｜DSML｜parameter name=\"k\" string=\"true\">new</｜DSML｜parameter>\n" ++
+        "<｜DSML｜parameter name=\"n\" string=\"false\">not[json</｜DSML｜parameter>\n" ++
+        "</｜DSML｜invoke>";
+    const calls = (try parseToolCalls(testing.allocator, raw)).?;
+    defer freeParsedCalls(calls);
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("new", parsed.value.object.get("k").?.string);
+    try testing.expectEqualStrings("not[json", parsed.value.object.get("n").?.string);
+    try testing.expectEqual(@as(usize, 2), parsed.value.object.count());
+}
+
+test "parseToolCalls dsml: zero-arg call and thinking prefix" {
+    const raw = "thinking about it</think>Sure.\n\n<｜DSML｜tool_calls>\n" ++
+        "<｜DSML｜invoke name=\"list_files\">\n</｜DSML｜invoke>\n</｜DSML｜tool_calls>";
+    const calls = (try parseToolCalls(testing.allocator, raw)).?;
+    defer freeParsedCalls(calls);
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("list_files", calls[0].name);
+    try testing.expectEqualStrings("{}", calls[0].arguments);
+}
+
+test "streamShouldBufferForTools: DSML marker and partial fullwidth prefixes hold" {
+    try testing.expect(streamShouldBufferForTools("Sure.\n\n<｜DSML｜tool_calls>"));
+    try testing.expect(streamShouldBufferForTools("<｜DSML｜invoke name=\"x\">"));
+    // partial fullwidth-bar prefix at the tail — next token may complete it
+    try testing.expect(streamShouldBufferForTools("answer text <｜DSML"));
+    try testing.expect(streamShouldBufferForTools("answer text <｜"));
+    // plain prose with a fullwidth bar elsewhere must NOT hold
+    try testing.expect(!streamShouldBufferForTools("the ｜ character is fun"));
+}
+
+test "renderChatTemplate: dsv4 template renders tools + DSML history + tool_result (hermetic)" {
+    // src/fixtures/dsv4_chat_template.jinja is OUR faithful transcription of
+    // DeepSeek-V4's encoding_dsv4.py (the checkpoint ships none): TOOLS block
+    // into the system position, assistant history tool calls as DSML
+    // invoke/parameter markup (string params raw, JSON params via tojson —
+    // whose default ", "/": " separators match python json.dumps), tool role
+    // as <tool_result> user turns (consecutive results merge), thinking_mode
+    // chat|thinking with the reference's drop-thinking rule (reasoning kept
+    // only for assistant turns AFTER the last user/tool message).
+    const allocator = testing.allocator;
+    const tpl = @embedFile("fixtures/dsv4_chat_template.jinja");
+
+    var config = ChatConfig{
+        .chat_template = tpl,
+        .bos_token = null,
+        .eos_token = null,
+        .add_bos_token = false,
+        .allocator = allocator,
+    };
+
+    const tools_json =
+        \\[{"type":"function","function":{"name":"get_weather","description":"Get weather","parameters":{"type":"object","properties":{"city":{"type":"string"},"days":{"type":"integer"}},"required":["city"]}}}]
+    ;
+    const tc = [_]ToolCall{.{ .id = "tc_0", .name = "get_weather", .arguments = "{\"city\": \"Paris\", \"days\": 3}" }};
+    const messages = [_]Message{
+        .{ .role = "system", .content = "You are helpful." },
+        .{ .role = "user", .content = "Weather in Paris?" },
+        .{ .role = "assistant", .content = "", .tool_calls = &tc },
+        .{ .role = "tool", .content = "Sunny, 22C", .tool_call_id = "tc_0" },
+    };
+
+    // Thinking OFF (chat mode): assistant turns open with the bare </think>.
+    {
+        const rendered = try renderChatTemplate(allocator, &messages, &config, tools_json, null, false, null);
+        defer allocator.free(rendered);
+        try testing.expect(std.mem.indexOf(u8, rendered, "You are helpful.\n\n## Tools") != null);
+        try testing.expect(std.mem.indexOf(u8, rendered, "\"<｜DSML｜tool_calls>\" block") != null);
+        try testing.expect(std.mem.indexOf(u8, rendered, "\"name\": \"get_weather\"") != null);
+        try testing.expect(std.mem.indexOf(u8, rendered, "<｜User｜>Weather in Paris?") != null);
+        try testing.expect(std.mem.indexOf(u8, rendered, "<｜Assistant｜></think>\n\n<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"get_weather\">") != null);
+        try testing.expect(std.mem.indexOf(u8, rendered, "<｜DSML｜parameter name=\"city\" string=\"true\">Paris</｜DSML｜parameter>") != null);
+        try testing.expect(std.mem.indexOf(u8, rendered, "<｜DSML｜parameter name=\"days\" string=\"false\">3</｜DSML｜parameter>") != null);
+        try testing.expect(std.mem.indexOf(u8, rendered, "</｜DSML｜tool_calls><｜end▁of▁sentence｜>") != null);
+        try testing.expect(std.mem.indexOf(u8, rendered, "<｜User｜><tool_result>Sunny, 22C</tool_result>") != null);
+        try testing.expect(std.mem.endsWith(u8, rendered, "<｜Assistant｜></think>"));
+        // No fallback-format markers (a raise inside the template silently falls back).
+        try testing.expect(std.mem.indexOf(u8, rendered, "<|im_start|>") == null);
+        try testing.expect(std.mem.indexOf(u8, rendered, "<start_of_turn>") == null);
+    }
+    // Thinking ON with TOOLS: the reference DISABLES drop_thinking whenever
+    // tools are declared (agent sessions keep reasoning on every assistant
+    // turn — the laguna round-trip class), so the tool-calling assistant
+    // renders <think>…</think> even though a tool result follows it.
+    {
+        const rendered = try renderChatTemplate(allocator, &messages, &config, tools_json, null, true, null);
+        defer allocator.free(rendered);
+        try testing.expect(std.mem.endsWith(u8, rendered, "<｜Assistant｜><think>"));
+        try testing.expect(std.mem.indexOf(u8, rendered, "<｜Assistant｜><think></think>\n\n<｜DSML｜tool_calls>") != null);
+        // 0731's reasoning-effort preamble must NOT appear at the serializer's
+        // dsv4 default (the reference default is "low" = nothing). hy3's
+        // blanket "high" would have prepended it to every thinking request.
+        try testing.expect(std.mem.indexOf(u8, rendered, "Reasoning Effort:") == null);
+    }
+    // Client-supplied effort reaches the render MAPPED (dsv4EffortFor): the
+    // raw CLIENT vocabulary goes in ("xhigh"), the template sees "max" and
+    // prepends the max preamble. This is the end-to-end pin the unit tests
+    // can't give — the string must survive renderChatTemplate →
+    // serializeExtraContext → Jinja.
+    {
+        const user_only = [_]Message{.{ .role = "user", .content = "prove it" }};
+        const r_max = try renderChatTemplate(allocator, &user_only, &config, null, null, true, "xhigh");
+        defer allocator.free(r_max);
+        try testing.expect(std.mem.indexOf(u8, r_max, "Reasoning Effort: Beyond maximum") != null);
+        const r_high = try renderChatTemplate(allocator, &user_only, &config, null, null, true, "high");
+        defer allocator.free(r_high);
+        try testing.expect(std.mem.indexOf(u8, r_high, "Reasoning Effort: Absolute maximum") != null);
+        // Outside thinking mode the preamble never applies, whatever the effort.
+        const r_chat = try renderChatTemplate(allocator, &user_only, &config, null, null, false, "high");
+        defer allocator.free(r_chat);
+        try testing.expect(std.mem.indexOf(u8, r_chat, "Reasoning Effort:") == null);
+    }
+    // Old-turn reasoning DROPS (the reference's drop_thinking): an assistant
+    // turn with a LATER user message renders without its reasoning.
+    {
+        const hist = [_]Message{
+            .{ .role = "user", .content = "Why is the sky blue?" },
+            .{ .role = "assistant", .content = "Rayleigh scattering.", .reasoning_content = "Shorter wavelengths scatter more." },
+            .{ .role = "user", .content = "And sunsets?" },
+        };
+        const rendered = try renderChatTemplate(allocator, &hist, &config, null, null, true, null);
+        defer allocator.free(rendered);
+        try testing.expect(std.mem.indexOf(u8, rendered, "<｜Assistant｜></think>Rayleigh scattering.") != null);
+        try testing.expect(std.mem.indexOf(u8, rendered, "Shorter wavelengths") == null);
+        try testing.expect(std.mem.endsWith(u8, rendered, "<｜Assistant｜><think>"));
+    }
+    // No system message + tools: the reference delivers tools through a
+    // system/developer turn and renders `system_content + "\n\n" + tools`, so
+    // an EMPTY system turn still emits the two newlines (measured against
+    // 0731's encoder — it silently DROPS tools attached to a user message, so
+    // an empty system turn is its only way to say "tools, no system prompt").
+    // Clients routinely send user+tools with no system message, and dropping
+    // that separator shifts every token after the bos away from what the
+    // model was trained on. Pinned byte-exact by tests/dsv4_template_ab.py.
+    {
+        const no_sys = [_]Message{
+            .{ .role = "user", .content = "hi" },
+        };
+        const rendered = try renderChatTemplate(allocator, &no_sys, &config, tools_json, null, false, null);
+        defer allocator.free(rendered);
+        try testing.expect(std.mem.startsWith(u8, rendered, "<｜begin▁of▁sentence｜>\n\n## Tools"));
+        try testing.expect(std.mem.indexOf(u8, rendered, "tool name and parameter schemas to invoke tool calls.\n<｜User｜>hi") != null);
+    }
 }

@@ -96,6 +96,10 @@ pub fn makeId(io: std.Io, allocator: std.mem.Allocator, prefix: []const u8) ![]u
 pub const ReasoningConfig = struct {
     enable: bool,
     budget: i32,
+    /// The client's raw `reasoning.effort` string, borrowed from the parsed
+    /// request JSON — dsv4-family templates map it into the render
+    /// (`chat.dsv4EffortFor`); null when the request didn't send one.
+    effort: ?[]const u8 = null,
 };
 
 /// Map `reasoning.effort` → (enable_thinking, reasoning_budget).
@@ -105,7 +109,7 @@ pub fn parseReasoning(reasoning_val: ?std.json.Value, default_budget: i32) Reaso
     if (v != .object) return .{ .enable = false, .budget = default_budget };
     const effort_val = v.object.get("effort") orelse return .{ .enable = true, .budget = default_budget };
     if (effort_val != .string) return .{ .enable = true, .budget = default_budget };
-    return .{ .enable = true, .budget = effortBudget(effort_val.string, default_budget) };
+    return .{ .enable = true, .budget = effortBudget(effort_val.string, default_budget), .effort = effort_val.string };
 }
 
 /// Effort → thinking-budget mapping shared by the Responses `reasoning.effort`

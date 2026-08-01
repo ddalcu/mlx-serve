@@ -123,6 +123,11 @@ struct ServerOptions: Codable, Equatable {
     /// on flips the default for MoE targets; dense targets are unaffected
     /// (they already default ON). Off, matching the server.
     var forceMTPOnMoE: Bool = false
+    /// `--dspark`. DeepSeek-V4's DSpark draft stages are OPT-IN server-side:
+    /// enabling them materializes ~11 GB of stage weights at load (the memory
+    /// fit-gate still applies and disables with a log when the box can't hold
+    /// trunk + stages + headroom). Off, matching the server default.
+    var enableDSpark: Bool = false
 
     // Performance (server-launch flags)
     /// Continuous batching: max in-flight chat requests batched through one
@@ -450,6 +455,7 @@ struct ServerOptions: Codable, Equatable {
         enableMTP == other.enableMTP &&
         mtpDepth == other.mtpDepth &&
         forceMTPOnMoE == other.forceMTPOnMoE &&
+        enableDSpark == other.enableDSpark &&
         maxConcurrent == other.maxConcurrent &&
         kvQuant == other.kvQuant &&
         prefixCacheEntries == other.prefixCacheEntries &&
@@ -574,6 +580,11 @@ struct ServerOptions: Codable, Equatable {
         }
         if mtpDepth > 0 {
             args += ["--mtp-depth", "\(mtpDepth)"]
+        }
+        // DSpark (DeepSeek-V4 draft stages): server default is OFF (opt-in —
+        // the stages cost ~11 GB resident), so only ON emits.
+        if enableDSpark {
+            args += ["--dspark"]
         }
         // Decode attention requant: server default is ON, so only OFF emits.
         if !decodeAttnQuant {
@@ -725,6 +736,7 @@ extension ServerOptions {
         if let v = try c.decodeIfPresent(Bool.self, forKey: .decodeAttnQuant) { decodeAttnQuant = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .mtpDepth) { mtpDepth = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .forceMTPOnMoE) { forceMTPOnMoE = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .enableDSpark) { enableDSpark = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .maxConcurrent) { maxConcurrent = v }
         if let v = try c.decodeIfPresent(KVQuant.self, forKey: .kvQuant) { kvQuant = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .prefixCacheEntries) { prefixCacheEntries = v }
@@ -897,6 +909,10 @@ extension ServerOptions {
         "forceMTPOnMoE": .init(
             title: "Also use MTP on mixture-of-experts models",
             explainer: "Mixture-of-experts models (e.g. Qwen3.6 35B-A3B) leave their MTP head switched off by default, because checking several guessed tokens at once makes them re-route every expert and that can cost more than it saves. Some MoE heads are good enough to win anyway. Turn this on to use it — and measure: if replies get slower, turn it back off. Models without an MoE layout are unaffected.",
+            needsRestart: true),
+        "enableDSpark": .init(
+            title: "DSpark draft stages (DeepSeek‑V4)",
+            explainer: "DeepSeek‑V4‑Flash ships its own 3‑stage speculative draft (DSpark). Enabling it loads about 11 GB of extra draft weights at startup, so it stays off unless you turn it on — and the server still refuses when the Mac doesn't have the memory for model + draft + working room, serving normally instead. Only affects DeepSeek‑V4 models; greedy (temperature 0) requests only.",
             needsRestart: true),
         "enablePLD": .init(
             title: "Enable PLD (recommended)",

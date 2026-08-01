@@ -1,6 +1,7 @@
 const std = @import("std");
 const mlx = @import("mlx.zig");
 const transformer_mod = @import("transformer.zig");
+const dsv4_mod = @import("deepseek_v4.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const model_mod = @import("model.zig");
 const log = @import("log.zig");
@@ -517,12 +518,27 @@ pub const Generator = struct {
     /// owned slices are freed via the `allocator` argument to `deinit` for
     /// historical reasons; this one is set during `initWithOptions`.)
     prompt_ids_alloc: ?std.mem.Allocator = null,
+    /// Did init actually arm PLD for this generator (`InitOptions.pld_enabled`
+    /// AFTER the deepseek_v4 chokepoint guard)? `nextPld` declines to the
+    /// plain serial step when false, and the scheduler's tick dispatch
+    /// (`specTickMode`) requires it alongside `slot.enable_pld` — the caller's
+    /// flag alone must never put a verify forward through the trunk. This is
+    /// PLD's counterpart of the `gen.mtp != null` / `gen.drafter != null`
+    /// conjuncts; PLD has no model handle, so the bit has to be explicit.
+    pld_enabled: bool = false,
     /// Stats for PLD benchmark logging. `pld_attempted` counts every step
     /// where lookup found a candidate (so a verify forward ran);
     /// `pld_accepted_tokens` is the cumulative number of *drafted* tokens
     /// (not including the always-accepted t1) that were successfully verified.
     pld_attempted: u64 = 0,
     pld_accepted_tokens: u64 = 0,
+    /// DeepSeek-V4 DSpark: init armed the native block-parallel draft mode
+    /// (dsv4 checkpoint shipping mtp.* stages + a clean-greedy request).
+    /// Mutually exclusive with pld/drafter/mtp by the chokepoint's
+    /// construction; `nextDspark` declines to the serial step when false.
+    dspark_enabled: bool = false,
+    dspark_attempted: u64 = 0,
+    dspark_accepted_tokens: u64 = 0,
 
     // ── Gemma 4 assistant drafter state ──
     // External drafter model (cross-attends into target's KV). When
@@ -786,6 +802,15 @@ pub const Generator = struct {
     ///   the per-draft acceptance probability comparable to vLLM's reported
     ///   "62% acceptance rate" metric.
     pub fn logSpecStats(self: *const Generator) void {
+        if (self.dspark_enabled and self.dspark_attempted > 0) {
+            const avg_per_round: f64 = @as(f64, @floatFromInt(self.dspark_accepted_tokens)) /
+                @as(f64, @floatFromInt(self.dspark_attempted));
+            log.info(
+                "  [spec-stats] mode=dspark attempts={d} accepts={d} avg_per_round={d:.2}\n",
+                .{ self.dspark_attempted, self.dspark_accepted_tokens, avg_per_round },
+            );
+            return;
+        }
         if (self.mtp != null and self.mtp_attempted > 0) {
             const avg_per_round: f64 = @as(f64, @floatFromInt(self.mtp_accepted_tokens)) /
                 @as(f64, @floatFromInt(self.mtp_attempted));
@@ -991,8 +1016,46 @@ pub const Generator = struct {
         max_tokens: u32,
         sampling: SamplingParams,
         eos_token_ids: []const u32,
-        options: InitOptions,
+        options_in: InitOptions,
     ) !Generator {
+        // DeepSeek-V4 hard-off, at the ONE chokepoint every init site
+        // funnels through: dsv4's per-request state lives on the module
+        // (rings + compressed caches) and a spec VERIFY forward appends
+        // draft tokens to it with NO rollback — two rejected PLD drafts
+        // permanently corrupted a live generation (mangled DSML with dropped
+        // token runs, 2026-07-31; the per-site `is_dsv4` wiring guard in
+        // scheduler.runPrefill demonstrably did not cover the engaged path,
+        // and per-site wiring is the class the spec-dispatch rule warns
+        // about).
+        var options = options_in;
+        var dspark_active = false;
+        if (xfm.dsv4 != null and (options.pld_enabled or options.drafter_enabled or options.mtp_enabled)) {
+            // DSpark lift: dsv4's OWN draft mode (block-parallel stages +
+            // snapshot rollback inside deepseek_v4.zig) may engage when the
+            // checkpoint ships stages and the request is clean greedy — the
+            // accept rule is raw argmax equality, so any logit-modifying
+            // sampling (penalties, grammar, logprobs) stays serial. PLD /
+            // drafter / qwen-MTP remain hard-off regardless: their verify
+            // forwards go through machinery this arch cannot roll back.
+            const mdl_ds = xfm.dsv4.?;
+            const dspark_env_off = if (std.c.getenv("MLX_SERVE_DSV4_DSPARK")) |v| v[0] == '0' else false;
+            const greedy_clean = (sampling.temperature < 0.01 or sampling.top_k == 1) and
+                sampling.repeat_penalty == 1.0 and
+                sampling.presence_penalty == 0.0 and
+                sampling.constraint == null and
+                options.logprobs_n == 0;
+            if (mdl_ds.n_mtp > 0 and !dspark_env_off and greedy_clean) {
+                dspark_active = true;
+                log.info("  spec=dspark (deepseek_v4 native draft stages, block={d})\n", .{mdl_ds.ds_block});
+            } else {
+                log.info("  spec=disabled (deepseek_v4 serves serial-only)\n", .{});
+            }
+            options.pld_enabled = false;
+            options.drafter_enabled = false;
+            options.drafter = null;
+            options.mtp_enabled = false;
+            options.mtp = null;
+        }
         const s = xfm.s;
         // Per-slot ForwardCtx (Phase 2). Stored by value on the Generator;
         // callers either supply one (scheduler) or fall through to
@@ -1509,7 +1572,7 @@ pub const Generator = struct {
         // token forwarded; first sampled token deferred). The lazy
         // pre-forward path below would over-advance the cache and corrupt
         // every verify forward.
-        if (drafter_active or pld_active or mtp_active) {
+        if (drafter_active or pld_active or mtp_active or dspark_active) {
             const sample_lazy = sampleTokenLazy(logits, sampling, s);
             _ = mlx.mlx_array_free(logits);
             try mlx.check(mlx.mlx_array_eval(sample_lazy));
@@ -1542,6 +1605,8 @@ pub const Generator = struct {
                 .prng = std.Random.DefaultPrng.init(sampling.seed orelse @intCast(std.Io.Timestamp.now(io, .real).toMilliseconds())),
                 .prompt_ids_owned = prompt_owned,
                 .prompt_ids_alloc = allocator,
+                .pld_enabled = pld_active,
+                .dspark_enabled = dspark_active,
                 .drafter = if (drafter_active) options.drafter else null,
                 .drafter_block_size = options.drafter_block_size,
                 .mtp = if (mtp_active) options.mtp else null,
@@ -1878,6 +1943,44 @@ pub const Generator = struct {
     /// Returns `null` only when generation is already done. When no n-gram
     /// match exists (cold start, novel output), falls back to the regular
     /// `next()` path and returns a single-token result with `used_lookup=false`.
+    /// DeepSeek-V4 DSpark step (the arch's OWN block-parallel spec decode).
+    /// Entry/exit share the v2 spec invariant: module state = prompt +
+    /// emitted positions, t1 = `next_token_id` NOT in state, pending empty
+    /// (init's spec branch establishes it; every exit restores it). The
+    /// heavy lifting — draft, batched verify, snapshot rollback — lives in
+    /// `deepseek_v4.dsparkRound`; this wrapper only keeps the Generator's
+    /// bookkeeping (generated_ids, step accounting, the shell cache.step
+    /// that forwardDsv4WithImpl keys fresh-vs-decode on) in sync.
+    pub fn nextDspark(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepResult {
+        if (self.done) return null;
+        if (!self.dspark_enabled) {
+            // Same defensive fallback as nextPld's disarmed arm: the
+            // dispatching caller's flag alone must never run a draft.
+            const tok_opt = try self.next(allocator);
+            if (tok_opt == null) return null;
+            const tokens = try allocator.alloc(u32, 1);
+            tokens[0] = tok_opt.?;
+            return DrafterStepResult{ .tokens = tokens, .accepted_tokens = 0 };
+        }
+        if (specDecodeUnsupported(self.sampling, self.logprobs_n)) return error.SpecDecodeUnsupported;
+        const mdl = self.xfm.dsv4.?;
+        const t1 = self.next_token_id;
+        var round = try dsv4_mod.dsparkRound(mdl, allocator, &mdl.dec_state.?, t1);
+        errdefer round.deinit(allocator);
+        // dsparkRound advanced the module state — mirror it on the shell
+        // cache verbatim so a later serial fallback (or the fresh-request
+        // check keying on step==0) sees a consistent position. Generator.step
+        // itself moves through advanceStep below (the clear-cadence clock).
+        self.ctx.cache.step = mdl.dec_state.?.n;
+        self.dspark_attempted += 1;
+        self.dspark_accepted_tokens += round.accepted;
+        try self.generated_ids.appendSlice(allocator, round.tokens);
+        self.advanceStep(@intCast(round.tokens.len));
+        self.next_token_id = round.next_token;
+        // tokens ownership transfers to the caller (scheduler frees).
+        return DrafterStepResult{ .tokens = round.tokens, .accepted_tokens = round.accepted };
+    }
+
     pub fn nextPld(
         self: *Generator,
         allocator: std.mem.Allocator,
@@ -1885,6 +1988,24 @@ pub const Generator = struct {
         key_len: u32,
     ) !?PldStepResult {
         if (self.done) return null;
+        // Init never armed PLD for this generator (the deepseek_v4 chokepoint
+        // guard, or a caller that simply didn't ask). The dispatching caller's
+        // flag alone must never put a verify forward through the trunk — on
+        // dsv4 the verify appends draft tokens into module-owned state that
+        // the KV snapshot rollback cannot restore (the 2026-07-31 mangled-DSML
+        // corruption). Unlike `spec_disabled_runtime` below this is permanent:
+        // no re-enable check can ever resurrect it.
+        if (!self.pld_enabled) {
+            const tok_opt = try self.next(allocator);
+            if (tok_opt == null) return null;
+            const tokens = try allocator.alloc(u32, 1);
+            tokens[0] = tok_opt.?;
+            return PldStepResult{
+                .tokens = tokens,
+                .accepted_tokens = 0,
+                .used_lookup = false,
+            };
+        }
         // Release-enforced guard (issue #97): PLD cannot honor a grammar
         // constraint or logprobs. These were std.debug.asserts, compiled out in
         // ReleaseFast; fail loud instead of streaming off-schema output if a
@@ -8150,4 +8271,158 @@ test "no decode path advances `step` outside advanceStep" {
     // Exactly one: the assignment inside `advanceStep`. Zero means the field was
     // renamed and this guard went vacuous — update it with the rename.
     try testing.expectEqual(@as(usize, 1), total);
+}
+
+test "dsv4: nextPld on a chokepoint-disabled generator stays serial (DSV4_MINI)" {
+    // DSpark is opt-in at load; the nextDspark arm below needs it armed.
+    _ = setenv("MLX_SERVE_DSV4_DSPARK", "1", 1);
+    // The live corruption path (2026-07-31, log 166348-166361): the scheduler
+    // decode tick dispatched on `slot.enable_pld` alone, so it called
+    // `nextPld` on a generator whose init the dsv4 guard had already flipped
+    // to pld_enabled=false — and nextPld trusted its caller, ran lookup +
+    // verify forwards, and the rejected drafts left dsv4's module-owned
+    // state (rings + kv/comp caches) permanently ahead of the rolled-back
+    // KVCache shell. This test reproduces the bypassing caller directly:
+    // nextPld on such a generator must (a) report the chokepoint flip via
+    // `gen.pld_enabled == false`, (b) never run a verify forward
+    // (`pld_attempted == 0`), and (c) emit the exact serial-decode tokens.
+    //
+    // Fabricate the mini with:
+    //   python3 tests/dsv4_mlx_ref.py --fabricate /tmp/dsv4-mini
+    //   DSV4_MINI=/tmp/dsv4-mini zig build test -Dtest-filter=DSV4_MINI
+    const path_z = std.c.getenv("DSV4_MINI") orelse return;
+    if (mlx.noGpuBackend()) return;
+    const path = std.mem.span(path_z);
+    const allocator = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    const cfg_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{path});
+    defer allocator.free(cfg_path);
+    const file = try std.Io.Dir.openFileAbsolute(io, cfg_path, .{});
+    var rb: [4096]u8 = undefined;
+    var rs = file.reader(io, &rb);
+    const cfg_json = try rs.interface.allocRemaining(allocator, .limited(1 << 20));
+    file.close(io);
+    defer allocator.free(cfg_json);
+    const cfg = try model_mod.parseConfigFromJson(allocator, cfg_json);
+    const shard_path = try std.fmt.allocPrint(allocator, "{s}/model-mini.safetensors", .{path});
+    defer allocator.free(shard_path);
+    var weights = try model_mod.loadWeightsSingleFile(allocator, shard_path);
+    defer weights.deinit();
+
+    // Never read by the Generator (stored only) — see the field comment.
+    var tok_dummy: Tokenizer = undefined;
+
+    // Prompt = every vocab id once. With key_len=1 any sampled t1 < V has an
+    // earlier occurrence, so PLD's lookup ALWAYS proposes a draft — on the
+    // pre-fix code that guarantees a verify forward (and the corruption);
+    // random-content prompts can idle in the cold path and mask the bug
+    // (exactly how the first two live requests read as "guards held").
+    var prompt: [64]u32 = undefined;
+    for (&prompt, 0..) |*v, i| v.* = @intCast(i);
+    const greedy = SamplingParams{ .temperature = 0.0 };
+    const want: usize = 10;
+
+    // Serial baseline: the regular scheduler shape (skip_lazy_preforward).
+    var serial: [want]u32 = undefined;
+    {
+        var xfm = try Transformer.init(io, allocator, cfg, &weights);
+        defer xfm.deinit();
+        var gen = try Generator.initWithOptions(io, allocator, &xfm, &tok_dummy, &prompt, 16, greedy, &.{}, .{
+            .skip_lazy_preforward = true,
+        });
+        defer gen.deinit(allocator);
+        var n: usize = 0;
+        while (n < want) {
+            const t = (try gen.next(allocator)) orelse break;
+            serial[n] = t;
+            n += 1;
+        }
+        try testing.expectEqual(want, n);
+    }
+
+    // Bypass arm: init asks for PLD (the app's always-on flags), the dsv4
+    // chokepoint flips it off, and the caller drives nextPld anyway — the
+    // scheduler tick's exact live behavior before specTickMode grew the
+    // generator-state conjunct.
+    {
+        var xfm = try Transformer.init(io, allocator, cfg, &weights);
+        defer xfm.deinit();
+        var gen = try Generator.initWithOptions(io, allocator, &xfm, &tok_dummy, &prompt, 16, greedy, &.{}, .{
+            .pld_enabled = true,
+            .skip_lazy_preforward = true,
+            .lookup_prompt = &prompt,
+        });
+        defer gen.deinit(allocator);
+        try testing.expect(!gen.pld_enabled);
+
+        var pld_toks: [want]u32 = undefined;
+        var n: usize = 0;
+        while (n < want) {
+            const r = (try gen.nextPld(allocator, 4, 1)) orelse break;
+            defer allocator.free(r.tokens);
+            for (r.tokens) |t| {
+                if (n < want) {
+                    pld_toks[n] = t;
+                    n += 1;
+                }
+            }
+        }
+        try testing.expectEqual(want, n);
+        try testing.expectEqual(@as(u64, 0), gen.pld_attempted);
+        try testing.expectEqualSlices(u32, serial[0..], pld_toks[0..]);
+    }
+
+    // DSpark arm: the SAME app-shaped init (spec flags on, greedy) now arms
+    // dsv4's own draft mode on a stage-bearing checkpoint. The tick driver
+    // is nextDspark; the sequence must match serial (the batch-verify vs
+    // single-token kernel-choice class allows a late near-tie flip on the
+    // random mini — the module-level dsparkRound gate pins the loop itself,
+    // this pins the GENERATOR wiring: engagement, step accounting, and the
+    // shell-cache mirror).
+    {
+        var xfm = try Transformer.init(io, allocator, cfg, &weights);
+        defer xfm.deinit();
+        var gen = try Generator.initWithOptions(io, allocator, &xfm, &tok_dummy, &prompt, 16, greedy, &.{}, .{
+            .pld_enabled = true,
+            .mtp_enabled = true,
+            .skip_lazy_preforward = true,
+            .lookup_prompt = &prompt,
+        });
+        defer gen.deinit(allocator);
+        try testing.expect(!gen.pld_enabled);
+        try testing.expect(gen.mtp == null);
+        try testing.expect(gen.dspark_enabled);
+
+        var ds_toks: [want]u32 = undefined;
+        var n: usize = 0;
+        while (n < want) {
+            const r = (try gen.nextDspark(allocator)) orelse break;
+            defer allocator.free(r.tokens);
+            for (r.tokens) |t| {
+                if (n < want) {
+                    ds_toks[n] = t;
+                    n += 1;
+                }
+            }
+        }
+        try testing.expectEqual(want, n);
+        // ENGAGEMENT: silent serial fallback is output-identical — count rounds.
+        try testing.expect(gen.dspark_attempted >= 1);
+        // Shell cache mirrors the module state exactly.
+        try testing.expectEqual(xfm.dsv4.?.dec_state.?.n, gen.ctx.cache.step);
+        // Sequence agreement: exact up to the sanctioned near-tie window.
+        var first_div: usize = want;
+        for (0..want) |k| {
+            if (serial[k] != ds_toks[k]) {
+                first_div = k;
+                break;
+            }
+        }
+        if (first_div < 4) {
+            std.debug.print("nextDspark serial={any} dspark={any}\n", .{ serial, ds_toks });
+            try testing.expect(false);
+        }
+        std.debug.print("dsv4 nextDspark (generator): first_div={d}/{d}, rounds={d}, accepts={d}\n", .{ first_div, want, gen.dspark_attempted, gen.dspark_accepted_tokens });
+    }
 }

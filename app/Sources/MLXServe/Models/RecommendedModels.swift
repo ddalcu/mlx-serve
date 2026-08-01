@@ -55,7 +55,8 @@ private let bytesPerGiB: Double = 1_073_741_824
 
 /// Which curated section a pick belongs to. Gemma/Qwen are vendor families;
 /// `largest` is a RAM tier — the biggest models this app runs (DeepSeek-V4-Flash
-/// via ds4, Hunyuan 3), grouped by "needs a very large Mac" rather than vendor.
+/// on the native MLX arch, Hunyuan 3), grouped by "needs a very large Mac"
+/// rather than vendor.
 enum RecommendedModelFamily: String {
     case gemma = "Gemma"
     case qwen = "Qwen"
@@ -99,7 +100,8 @@ struct RecommendedModelPick: Identifiable, Hashable {
     /// Overrides the generic weights×1.2 RAM estimate for picks where that
     /// formula misleads (e.g. a build whose runtime footprint or context needs
     /// push the honest recommendation gate above what the on-disk size implies).
-    /// Currently unused — every pick is well-modeled by the ×1.2 estimate.
+    /// Used by DeepSeek-V4-Flash, where ×1.2 overshoots the real footprint by
+    /// enough to hide the model from the Mac it was converted for.
     var ramOverrideGB: Double? = nil
     /// For a GGUF/ds4 pick: the specific `.gguf` file this recommendation
     /// downloads (the repo ships many; the curated pick names one known-good
@@ -313,24 +315,35 @@ extension RecommendedModelPick {
     )
 
     /// DeepSeek-V4-Flash via the embedded ds4 engine — a frontier-scale model
-    /// on a very large Mac. The curated pick is the imatrix-calibrated IQ2XXS
-    /// build (best quality-per-byte that fits a 96 GB Mac); the pane pulls the
-    /// MTP draft head beside it so ds4 speculative decode is available.
+    /// on a very large Mac — now on our OWN native `deepseek_v4` MLX arch
+    /// rather than the embedded ds4 GGUF engine, so the curated pick is our
+    /// mixed 2/3/8-bit mirror (whole safetensors repo, no quant file to name).
+    /// It supersedes the `antirez/deepseek-v4-gguf` IQ2XXS pick: same model,
+    /// engine-native instead of converted, at the cost of the 96 GB tier —
+    /// this build wants 128 GB.
     static let deepseekV4Flash = RecommendedModelPick(
         id: "deepseek-v4-flash",
         name: "DeepSeek-V4-Flash",
-        tagline: "Frontier model, on your Mac",
-        blurb: "A frontier-scale DeepSeek model that runs entirely on your Mac through the ds4 engine — top-tier reasoning, coding, and agent work. It wakes only a fraction of itself per word (mixture of experts) and ships a built-in draft head so it can predict several words at once for a faster decode. Needs a lot of memory — best on Macs with 96 GB or more.",
-        repoId: "antirez/deepseek-v4-gguf",
-        sizeGB: 86.7,
+        tagline: "Frontier model, native MLX",
+        blurb: "A frontier-scale DeepSeek model that runs natively on Apple Silicon through MLX — no GGUF conversion, no llama.cpp — for top-tier reasoning, coding, and agent work. It wakes only a fraction of itself per word (mixture of experts) and holds around a million words of context. This is our own mixed 2/3/8-bit conversion, about 118 GB on disk, so it wants a Mac with 128 GB of memory; it also ships DeepSeek's own DSpark draft stages, which Settings can switch on for a faster reply.",
+        repoId: "ddalcu/DeepSeek-V4-Flash-0731-MLX-Serve-mixed-2-3-8bit",
+        sizeGB: 117.8,
         family: .largest,
         intelligence: 67,
         intelligenceIsEstimated: false,
-        speed: 18,
+        // Plain autoregressive decode measures ~23 tok/s on an M4 Max against
+        // Hunyuan 3's ~26, so the two score level here rather than this one
+        // sitting below it (ties are what the activeParams ordering invariant
+        // leaves free, and it floors this pick at Hunyuan's score anyway).
+        // DSpark takes it to ~35 tok/s; spec decode is excluded from the score
+        // by policy and named in the blurb instead — see the file header.
+        speed: 14,
         contextTokens: 1_048_576,
         activeParamsB: 13.0,
-        ramOverrideGB: 96.0,
-        ggufFilename: "DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf"
+        // Weights×1.2 would demand 141 GB and hide the model from the exact
+        // machine the conversion targets: it serves in ~110 GB resident on a
+        // 128 GB Mac.
+        ramOverrideGB: 128.0
     )
 
     static let qwen36_35bA3b = RecommendedModelPick(

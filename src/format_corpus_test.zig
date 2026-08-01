@@ -283,6 +283,60 @@ const corpus = [_]Expect{
         .tool_arg_key = "command",
         .tool_arg_value = "echo hello",
     },
+    // ── DSV4-Flash NATIVE DSML (`<｜DSML｜tool_calls>` blocks) ───────────────
+    .{
+        .family = "dsv4-dsml",
+        .name = "canonical DSML block after thinking",
+        .raw = "The user wants weather.</think>I'll check.\n\n<｜DSML｜tool_calls>\n" ++
+            "<｜DSML｜invoke name=\"get_weather\">\n" ++
+            "<｜DSML｜parameter name=\"city\" string=\"true\">Paris</｜DSML｜parameter>\n" ++
+            "</｜DSML｜invoke>\n</｜DSML｜tool_calls>",
+        .thinking = true,
+        .opened_by_template = true,
+        .reasoning_contains = "wants weather",
+        .tool_name = "get_weather",
+        .tool_arg_key = "city",
+        .tool_arg_value = "Paris",
+    },
+    .{
+        .family = "dsv4-dsml",
+        .name = "parallel DSML calls keep their own arguments",
+        .raw = "<｜DSML｜tool_calls>\n" ++
+            "<｜DSML｜invoke name=\"read_file\">\n" ++
+            "<｜DSML｜parameter name=\"path\" string=\"true\">a.txt</｜DSML｜parameter>\n" ++
+            "</｜DSML｜invoke>\n" ++
+            "<｜DSML｜invoke name=\"read_file\">\n" ++
+            "<｜DSML｜parameter name=\"path\" string=\"true\">b.txt</｜DSML｜parameter>\n" ++
+            "</｜DSML｜invoke>\n</｜DSML｜tool_calls>",
+        .tool_name = "read_file",
+        .tool_arg_key = "path",
+        .tool_arg_value = "a.txt",
+        .tool_count = 2,
+        .last_tool_arg_value = "b.txt",
+    },
+    .{
+        .family = "dsv4-dsml",
+        .name = "server-cut DSML value ships completed pairs, never the fragment",
+        .raw = "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"write_file\">\n" ++
+            "<｜DSML｜parameter name=\"path\" string=\"true\">/tmp/out.txt</｜DSML｜parameter>\n" ++
+            "<｜DSML｜parameter name=\"content\" string=\"true\">first half of a fi",
+        .tool_name = "write_file",
+        .tool_arg_key = "path",
+        .tool_arg_value = "/tmp/out.txt",
+        .tool_arg_absent = "content",
+    },
+    .{
+        // JSON-typed parameter (string="false") must arrive as its declared
+        // type, not a stringified spelling.
+        .family = "dsv4-dsml",
+        .name = "string=false boolean parameter keeps its JSON type",
+        .raw = "<｜DSML｜tool_calls>\n<｜DSML｜invoke name=\"set_flag\">\n" ++
+            "<｜DSML｜parameter name=\"enabled\" string=\"false\">true</｜DSML｜parameter>\n" ++
+            "</｜DSML｜invoke>\n</｜DSML｜tool_calls>",
+        .tool_name = "set_flag",
+        .tool_bool_key = "enabled",
+        .tool_bool_value = true,
+    },
     // ── Hermes XML (canonical <tool_call>JSON</tool_call>) ──────────────────
     .{
         .family = "hermes",
@@ -1140,6 +1194,8 @@ const leak_tags = [_][]const u8{
     // Inkling message-channel markers (each a single special token).
     "<|content_text|>",   "<|content_thinking|>", "<|end_message|>", "<|message_model|>",
     "<|content_invoke_tool_json|>",
+    // DeepSeek-V4 DSML marker (covers invoke/parameter/tool_calls forms).
+    "<｜DSML｜",
 };
 
 fn fail(entry: Expect, comptime what: []const u8, got: []const u8) !void {

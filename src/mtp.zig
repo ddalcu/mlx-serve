@@ -486,12 +486,20 @@ pub const sidecar_rel_paths = [_][]const u8{
     "optiq/mtp.safetensors", // oMLX OptiQ (delta-encoded norms — folded at load)
 };
 
-/// Relative path (one of `sidecar_rel_paths`) of the first present, non-empty
-/// sidecar file under `dir`, or null when the model ships no MTP head.
-pub fn resolveMtpSidecarInDir(io: std.Io, dir: std.Io.Dir) ?[]const u8 {
+/// Relative path (one of `sidecar_rel_paths`) of the first sidecar file under
+/// `dir` whose HEADER carries a marker key, or null when the model ships no
+/// loadable MTP head. The marker gate is the same one discovery and the
+/// in-checkpoint shard sweep apply — a file at a sidecar PATH is only a
+/// sidecar when it provably contains a head this loader can bind (DeepSeek-V4
+/// mirrors ship their own dsv4-shaped MTP module at `model-mtp.safetensors`;
+/// claiming it by NAME alone sent the qwen-shaped loader into
+/// MissingMtpWeight on every `--mtp` boot, live 2026-07-31).
+pub fn resolveMtpSidecarInDir(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir) ?[]const u8 {
     for (&sidecar_rel_paths) |rel| {
         const st = dir.statFile(io, rel, .{}) catch continue;
-        if (st.size > 0) return rel;
+        if (st.size == 0) continue;
+        if (!safetensorsHeaderHasMtpHead(io, allocator, dir, rel)) continue;
+        return rel;
     }
     return null;
 }
@@ -615,7 +623,7 @@ fn safetensorsHeaderHasMtpHead(io: std.Io, allocator: std.mem.Allocator, dir: st
 /// always outranks an in-checkpoint head so repos shipping both keep
 /// loading exactly what they loaded before.
 pub fn resolveMtpSource(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir) ?MtpSource {
-    if (resolveMtpSidecarInDir(io, dir)) |rel| return .{ .sidecar_file = rel };
+    if (resolveMtpSidecarInDir(io, allocator, dir)) |rel| return .{ .sidecar_file = rel };
     if (indexJsonHasMtpHead(io, allocator, dir)) return .in_checkpoint;
     if (safetensorsHeaderHasMtpHead(io, allocator, dir, "model.safetensors")) return .in_checkpoint;
     return null;
@@ -2090,30 +2098,63 @@ test "mtp: requantizeRows accepts a non-affine (mxfp8) source — the issue-#81 
     try testing.expect(cos > 0.95);
 }
 
+/// Minimal safetensors bytes whose HEADER names `key` — enough for the
+/// marker peek (the resolver never reads tensor data).
+fn writeFakeSidecar(io: std.Io, dir: std.Io.Dir, sub_path: []const u8, key: []const u8) !void {
+    var buf: [512]u8 = undefined;
+    const header = try std.fmt.bufPrint(&buf, "{{\"{s}\":{{\"dtype\":\"F32\",\"shape\":[1],\"data_offsets\":[0,4]}}}}", .{key});
+    var file_buf: [512 + 12]u8 = undefined;
+    std.mem.writeInt(u64, file_buf[0..8], header.len, .little);
+    @memcpy(file_buf[8..][0..header.len], header);
+    @memcpy(file_buf[8 + header.len ..][0..4], &[_]u8{ 0, 0, 0, 0 });
+    try dir.writeFile(io, .{ .sub_path = sub_path, .data = file_buf[0 .. 8 + header.len + 4] });
+}
+
 test "mtp: sidecar resolution accepts native and Forge layouts in priority order" {
     const io = testing.io;
+    const allocator = testing.allocator;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
 
     // Nothing present → null.
-    try testing.expectEqual(@as(?[]const u8, null), resolveMtpSidecarInDir(io, tmp.dir));
+    try testing.expectEqual(@as(?[]const u8, null), resolveMtpSidecarInDir(io, allocator, tmp.dir));
 
     // oMLX OptiQ layout is discovered when it's the only head present.
     try tmp.dir.createDirPath(io, "optiq");
-    try tmp.dir.writeFile(io, .{ .sub_path = "optiq/mtp.safetensors", .data = "x" });
-    try testing.expectEqualStrings("optiq/mtp.safetensors", resolveMtpSidecarInDir(io, tmp.dir).?);
+    try writeFakeSidecar(io, tmp.dir, "optiq/mtp.safetensors", "mtp.fc.weight");
+    try testing.expectEqualStrings("optiq/mtp.safetensors", resolveMtpSidecarInDir(io, allocator, tmp.dir).?);
 
-    try tmp.dir.writeFile(io, .{ .sub_path = "model-mtp.safetensors", .data = "x" });
-    try testing.expectEqualStrings("model-mtp.safetensors", resolveMtpSidecarInDir(io, tmp.dir).?);
+    try writeFakeSidecar(io, tmp.dir, "model-mtp.safetensors", "language_model.mtp.fc.weight");
+    try testing.expectEqualStrings("model-mtp.safetensors", resolveMtpSidecarInDir(io, allocator, tmp.dir).?);
 
-    // Forge current name outranks legacy.
-    try tmp.dir.writeFile(io, .{ .sub_path = "mtp.safetensors", .data = "x" });
-    try testing.expectEqualStrings("mtp.safetensors", resolveMtpSidecarInDir(io, tmp.dir).?);
+    // Forge current name outranks legacy (hy3's eh_proj marker also claims).
+    try writeFakeSidecar(io, tmp.dir, "mtp.safetensors", "mtp.eh_proj.weight");
+    try testing.expectEqualStrings("mtp.safetensors", resolveMtpSidecarInDir(io, allocator, tmp.dir).?);
 
     // Native mlx-serve layout outranks both Forge names.
     try tmp.dir.createDirPath(io, "mtp");
-    try tmp.dir.writeFile(io, .{ .sub_path = "mtp/weights.safetensors", .data = "x" });
-    try testing.expectEqualStrings("mtp/weights.safetensors", resolveMtpSidecarInDir(io, tmp.dir).?);
+    try writeFakeSidecar(io, tmp.dir, "mtp/weights.safetensors", "mtp.fc.weight");
+    try testing.expectEqualStrings("mtp/weights.safetensors", resolveMtpSidecarInDir(io, allocator, tmp.dir).?);
+}
+
+test "mtp: a sidecar-NAMED file without a marker key is not a sidecar (dsv4 module class)" {
+    // DeepSeek-V4 mirrors ship their OWN (dsv4-shaped) MTP module at
+    // `model-mtp.safetensors` — one of the house sidecar names. Claiming it
+    // by NAME alone sent the qwen-shaped loader into MissingMtpWeight on
+    // every `--mtp` boot (live 2026-07-31). The sidecar claim rides the same
+    // marker gate as discovery + the in-checkpoint shard sweep: the header
+    // must PROVE a loadable head.
+    const io = testing.io;
+    const allocator = testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try writeFakeSidecar(io, tmp.dir, "model-mtp.safetensors", "mtp.0.attn.wq_a.weight");
+    try testing.expectEqual(@as(?[]const u8, null), resolveMtpSidecarInDir(io, allocator, tmp.dir));
+    // …and hasMtpHead (the scheduler's attempt gate) says no as well, so a
+    // dsv4 boot with --mtp never logs a scary MissingMtpWeight warning.
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &path_buf);
+    try testing.expect(!hasMtpHead(io, allocator, path_buf[0..root_len]));
 }
 
 test "mtp: empty sidecar file is not a sidecar" {
@@ -2121,7 +2162,7 @@ test "mtp: empty sidecar file is not a sidecar" {
     var tmp = std.testing.tmpDir(.{ .iterate = true });
     defer tmp.cleanup();
     try tmp.dir.writeFile(io, .{ .sub_path = "mtp.safetensors", .data = "" });
-    try testing.expectEqual(@as(?[]const u8, null), resolveMtpSidecarInDir(io, tmp.dir));
+    try testing.expectEqual(@as(?[]const u8, null), resolveMtpSidecarInDir(io, testing.allocator, tmp.dir));
 }
 
 test "mtp: delta-encoded norms are detected and folded +1; folded norms untouched" {
@@ -2790,9 +2831,10 @@ test "mtp: resolveMtpSource — sidecar file outranks in-checkpoint; markerless 
     });
     try testing.expect(resolveMtpSource(io, allocator, tmp.dir).? == .in_checkpoint);
 
-    // A sidecar FILE always outranks the in-checkpoint head — repos shipping
-    // both keep loading exactly what they loaded before.
-    try tmp.dir.writeFile(io, .{ .sub_path = "mtp.safetensors", .data = "x" });
+    // A sidecar FILE (with a marker-bearing header — name alone no longer
+    // claims, see the dsv4-module test) always outranks the in-checkpoint
+    // head — repos shipping both keep loading exactly what they loaded before.
+    try writeFakeSidecar(io, tmp.dir, "mtp.safetensors", "mtp.fc.weight");
     const src = resolveMtpSource(io, allocator, tmp.dir).?;
     try testing.expect(src == .sidecar_file);
     try testing.expectEqualStrings("mtp.safetensors", src.sidecar_file);

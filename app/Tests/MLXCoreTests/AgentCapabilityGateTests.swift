@@ -73,10 +73,71 @@ final class AgentCapabilityGateTests: XCTestCase {
     }
 
     func testUnknownAndMcpToolsAreNotGatedHere() {
-        // MCP tools are governed by the MCP flag, and a genuinely unknown name
-        // must keep its existing "Unknown tool" answer.
+        // MCP tools are governed by the MCP DISPATCH gate below (`mcpEnabled`),
+        // and a genuinely unknown name must keep its existing "Unknown tool"
+        // answer.
         XCTAssertNil(AgentEngine.disallowedToolRefusal(name: "srv__thing", allowed: [.readFile]))
         XCTAssertNil(AgentEngine.disallowedToolRefusal(name: "nonsense", allowed: [.readFile]))
+    }
+
+    // MARK: - MCP dispatch gate (the TOGGLE, not just the session)
+
+    /// Records whether the server ever saw the call.
+    private final class FakeMCPRouter: MCPToolRouting {
+        private(set) var executeCount = 0
+        func owns(toolName: String) -> Bool { toolName.contains("__") }
+        func executeToolCall(name: String, arguments: [String: String], rawArguments: String) async -> String {
+            executeCount += 1
+            return "ok"
+        }
+    }
+
+    private func runMcpCall(router: FakeMCPRouter, mcpEnabled: Bool?) async -> AgentEngine.ToolResult {
+        var wd: String? = nil
+        let tc = APIClient.ToolCall(id: "1", name: "dbhub__execute_sql",
+                                    arguments: ["sql": "SELECT 1"], rawArguments: "{}")
+        if let mcpEnabled {
+            return await AgentEngine.executeToolCall(
+                tc, workingDirectory: &wd, repetition: AgentEngine.RepetitionTracker(),
+                iteration: 0, agentMemory: AgentMemory(), mcpRouter: router, mcpEnabled: mcpEnabled)
+        }
+        // Flag omitted — pins the default.
+        return await AgentEngine.executeToolCall(
+            tc, workingDirectory: &wd, repetition: AgentEngine.RepetitionTracker(),
+            iteration: 0, agentMemory: AgentMemory(), mcpRouter: router)
+    }
+
+    /// The hole this gate closes: MCP servers spawned by an earlier MCP-on turn
+    /// stay CONNECTED for the app's lifetime (`stopAll` only runs at quit), so
+    /// `owns()` answers true in a later MCP-OFF turn — and the model re-calls
+    /// `<server>__<tool>` names it saw in this chat's own history. Without the
+    /// gate the call executed (or hung against a dead upstream) in a chat where
+    /// MCP was supposedly off.
+    func testMcpCallIsRefusedWhenMcpIsOffEvenWithALiveSession() async {
+        let router = FakeMCPRouter()
+        let result = await runMcpCall(router: router, mcpEnabled: false)
+        XCTAssertEqual(router.executeCount, 0, "the MCP server must never see the call")
+        XCTAssertTrue(result.output.hasPrefix("Error:"), result.output)
+        XCTAssertTrue(result.output.contains("MCP is turned off"), "leads with the FACT: \(result.output)")
+        XCTAssertTrue(result.output.contains("dbhub__execute_sql"), "names the tool: \(result.output)")
+        XCTAssertTrue(result.output.contains("Do not call it again"), "forbids the retry: \(result.output)")
+    }
+
+    func testMcpCallStillExecutesWhenMcpIsOn() async {
+        let router = FakeMCPRouter()
+        let result = await runMcpCall(router: router, mcpEnabled: true)
+        XCTAssertEqual(router.executeCount, 1, "the gate must not over-block an MCP-on turn")
+        XCTAssertEqual(result.output, "ok")
+    }
+
+    /// Secure by default: a NEW call site that injects a router but forgets the
+    /// flag REFUSES (visible immediately, easy to diagnose) instead of silently
+    /// executing MCP tools in a context that never opted in.
+    func testOmittingTheFlagRefusesByDefault() async {
+        let router = FakeMCPRouter()
+        let result = await runMcpCall(router: router, mcpEnabled: nil)
+        XCTAssertEqual(router.executeCount, 0)
+        XCTAssertTrue(result.output.contains("MCP is turned off"), result.output)
     }
 
     func testNilAllowedSetGatesNothing() {

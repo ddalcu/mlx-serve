@@ -311,6 +311,12 @@ struct ModelInfo {
     /// `model_type` from config.json — "gemma4", "qwen3_5_moe", "llama", etc.
     /// Empty string when talking to a pre-drafter-UX server build.
     var architecture: String = ""
+    /// Which backend serves this entry, as the server reports it
+    /// (`meta.engine`: "mlx" | "llama" | "ds4" | "gguf" — "gguf" is an
+    /// unloaded GGUF stub whose engine is only decided at load). Empty on
+    /// servers that pre-date the field → `engine` falls back to inferring
+    /// from `architecture`.
+    var engineName: String = ""
     /// True when the model has any MoE (sparse expert) layers. Drives the
     /// soft-warning pill in Settings → Drafter, since drafter regresses on
     /// MoE targets at single-stream batch=1.
@@ -392,11 +398,21 @@ struct ModelInfo {
         return "\(name[name.startIndex..<at]) · \(name[name.index(after: at)...])"
     }
 
-    /// Which backend serves this model — derived from `architecture`
-    /// (`model_type` in config.json / the GGUF stub). Drives the engine-
-    /// aware Settings UI so toggles that don't apply (e.g. MLX `--kv-quant`
-    /// on a GGUF target) are hidden instead of silently no-op'ing.
+    /// Which backend serves this model — drives the engine-aware Settings UI
+    /// so toggles that don't apply (e.g. MLX `--kv-quant` on a GGUF target)
+    /// are hidden instead of silently no-op'ing. The server's own
+    /// `meta.engine` report wins; the `architecture` inference is the legacy
+    /// fallback for servers that pre-date the field, where it stays correct
+    /// (those builds serve deepseek_v4 ONLY via the embedded ds4 engine —
+    /// the NATIVE deepseek_v4 arch ships with the same release that added
+    /// `meta.engine`, and the two report the SAME architecture string).
     var engine: ServerEngine {
+        switch engineName {
+        case "mlx": return .mlx
+        case "ds4": return .dsv4
+        case "llama", "gguf": return .llama
+        default: break // pre-field server or unknown future value → infer
+        }
         switch architecture {
         case "gguf": return .llama
         case "deepseek_v4": return .dsv4
@@ -903,17 +919,19 @@ let gemmaModelOptions: [GemmaModelOption] = [
     // an mtp/weights.safetensors sidecar; the server auto-loads it for multi-token
     // speculative decode (~1.1–1.4× decode on agent/code workloads).
     GemmaModelOption(id: "qwen36-27b-4bit-mtp", displayName: "Qwen 3.6 27B (4-bit, MTP)", repoId: "ddalcu/Qwen3.6-27B-4bit-MTP-MLX-Serve", sizeEstimate: "~16.6 GB, needs 24 GB+ RAM"),
-    // DeepSeek-V4-Flash via ds4 GGUF — 96 GB+ Macs only. Served by the embedded
-    // ds4 engine (antirez/ds4) rather than the MLX/safetensors path.
+    // DeepSeek-V4-Flash on the NATIVE deepseek_v4 MLX arch — 128 GB Macs only.
+    // Our own mixed 2/3/8-bit safetensors mirror, so it takes the plain repo
+    // download path; it replaced the `antirez/deepseek-v4-gguf` IQ2XXS entry
+    // that the embedded ds4 engine served (same model, one engine fewer in the
+    // way, but 118 GB instead of 87 — the 96 GB tier no longer has a DeepSeek
+    // entry here). The id keeps its "dsv4" token: that is what the tray filter
+    // reads.
     GemmaModelOption(
-        id: "dsv4-flash-gguf",
-        displayName: "DeepSeek-V4-Flash (ds4)",
-        repoId: "antirez/deepseek-v4-gguf",
-        sizeEstimate: "~87 GB, needs 96 GB+ RAM",
-        // imatrix-calibrated IQ2XXS — better quality at the same size; the
-        // download path also auto-pulls the MTP draft head for ds4 spec-decode.
-        ggufFilename: "DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf",
-        minHostRamBytes: 96 * (UInt64(1) << 30)
+        id: "dsv4-flash-mlx",
+        displayName: "DeepSeek-V4-Flash (MLX native)",
+        repoId: "ddalcu/DeepSeek-V4-Flash-0731-MLX-Serve-mixed-2-3-8bit",
+        sizeEstimate: "~118 GB, needs 128 GB RAM",
+        minHostRamBytes: 128 * (UInt64(1) << 30)
     ),
     // Tencent Hunyuan 3 (hy_v3): 295B-A21B MoE, 256K context, Apache 2.0.
     // The imatrix-calibrated 2-bit build (mlx-community oQ2e): the FULL

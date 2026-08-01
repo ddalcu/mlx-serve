@@ -58,7 +58,7 @@ final class AgentRepetitionTests: XCTestCase {
         // The model loops on one identical call — fill the block window.
         for _ in 0..<8 { rep.track(toolCalls: [tc]) }
         let r = await AgentEngine.executeToolCall(
-            tc, workingDirectory: &wd, repetition: rep, iteration: 0, agentMemory: mem, mcpRouter: mcp)
+            tc, workingDirectory: &wd, repetition: rep, iteration: 0, agentMemory: mem, mcpRouter: mcp, mcpEnabled: true)
         XCTAssertTrue(r.output.hasPrefix("BLOCKED"), "looping MCP call must be blocked, got: \(r.output)")
         XCTAssertEqual(mcp.executeCount, 0, "a blocked call must never reach the MCP server")
     }
@@ -70,7 +70,7 @@ final class AgentRepetitionTests: XCTestCase {
         let mem = AgentMemory()
         let tc = APIClient.ToolCall(id: "1", name: "db__query", arguments: ["q": "hello"], rawArguments: "{}")
         let r = await AgentEngine.executeToolCall(
-            tc, workingDirectory: &wd, repetition: rep, iteration: 0, agentMemory: mem, mcpRouter: mcp)
+            tc, workingDirectory: &wd, repetition: rep, iteration: 0, agentMemory: mem, mcpRouter: mcp, mcpEnabled: true)
         XCTAssertEqual(mcp.executeCount, 1)
         XCTAssertTrue(r.output.contains("ok"))
         XCTAssertEqual(r.name, "db__query")
@@ -86,7 +86,7 @@ final class AgentRepetitionTests: XCTestCase {
             let tc = APIClient.ToolCall(id: "\(i)", name: "db__query", arguments: ["q": "SELECT \(i)"], rawArguments: "{}")
             rep.track(toolCalls: [tc])
             let r = await AgentEngine.executeToolCall(
-                tc, workingDirectory: &wd, repetition: rep, iteration: i, agentMemory: mem, mcpRouter: mcp)
+                tc, workingDirectory: &wd, repetition: rep, iteration: i, agentMemory: mem, mcpRouter: mcp, mcpEnabled: true)
             XCTAssertFalse(r.output.hasPrefix("BLOCKED"), "distinct query \(i) must not be blocked")
         }
         XCTAssertEqual(mcp.executeCount, 10)

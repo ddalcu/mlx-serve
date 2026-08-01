@@ -496,14 +496,18 @@ final class ServerOptionsTests: XCTestCase {
 
     func testEngineFromArchitecture() {
         // The Settings UI hides MLX-only sections when engine != .mlx and
-        // surfaces the GGUF section when engine == .llama. The discriminator
-        // is the `architecture` string the server reports for the active
-        // model, derived from `model_type` in config.json (or the GGUF stub).
+        // surfaces the GGUF section when engine == .llama. The PRIMARY
+        // discriminator is `meta.engine` as the server reports it; the
+        // `architecture` inference below is the legacy fallback for servers
+        // that pre-date the field.
         var info = ModelInfo(name: "x", quantBits: 4, layers: 0,
                              hiddenSize: 0, vocabSize: 0,
                              contextLength: 0, modelMaxTokens: 0,
                              architecture: "gguf")
         XCTAssertEqual(info.engine, .llama)
+        // Legacy fallback: pre-`meta.engine` servers serve deepseek_v4 ONLY
+        // via the embedded ds4 engine (the native arch ships with the same
+        // release that added the field), so the old mapping stays correct.
         info.architecture = "deepseek_v4"
         XCTAssertEqual(info.engine, .dsv4)
         info.architecture = "gemma4"
@@ -512,6 +516,33 @@ final class ServerOptionsTests: XCTestCase {
         XCTAssertEqual(info.engine, .mlx)
         info.architecture = ""  // older server build that omits the field
         XCTAssertEqual(info.engine, .mlx, "empty arch must default to .mlx (the most common path)")
+    }
+
+    func testEngineFromServerReport() {
+        // `meta.engine` outranks the architecture inference — the case that
+        // forced it: NATIVE deepseek_v4 (safetensors mirror, MLX engine) and
+        // the DeepSeek GGUF (embedded ds4 engine) report the SAME
+        // architecture string, so only the server's own engine field can
+        // label the Settings UI correctly.
+        var info = ModelInfo(name: "ddalcu/DeepSeek-V4-Flash-MLX-Serve",
+                             quantBits: 4, layers: 43,
+                             hiddenSize: 4096, vocabSize: 129280,
+                             contextLength: 0, modelMaxTokens: 0,
+                             architecture: "deepseek_v4")
+        info.engineName = "mlx"
+        XCTAssertEqual(info.engine, .mlx, "native dsv4 must get the MLX Settings profile")
+        info.engineName = "ds4"
+        XCTAssertEqual(info.engine, .dsv4)
+        info.engineName = "llama"
+        XCTAssertEqual(info.engine, .llama)
+        // Unloaded GGUF stub: engine undetermined until load — treat as the
+        // generic GGUF (llama) profile.
+        info.engineName = "gguf"
+        XCTAssertEqual(info.engine, .llama)
+        // Unknown future value: fall back to the architecture inference
+        // rather than guessing.
+        info.engineName = "quantum"
+        XCTAssertEqual(info.engine, .dsv4)
     }
 
     // MARK: helpers

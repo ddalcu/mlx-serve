@@ -89,3 +89,41 @@ The curl-validated Inkling tool support above broke on its first real workload (
 4. **Wild sampling**: pi omits temperature/top_p/top_k (confirmed null in the logged request) and Inkling ships NO generation_config.json anywhere — requests ran 1.0/1.0/off, the exact 2026-07-13 pi-budget-burn class, showing up as duplicate identical calls (capture 61961). TM publishes no recommendation (their tooling is greedy-only), so the `applyFamilySamplingDefaults` inkling arm's top_p 0.95 is documented as OUR tail cut; body > flags > this default unchanged.
 
 Guards: 4 verbatim-capture corpus entries (duplicate-with-separators, back-to-back-no-separator, marker-echoed name, content_text-prefixed single), the `last_tool_name` corpus field, the universal no-`<|`-in-NAME invariant, the "streaming tool buffer never flushes Inkling call text" replay (atomic-marker tokenization — markers are single tokens, so the replay feeds them whole), and unit tests for the name-run/balanced-body/hold logic. Meta-lesson: a format validated by curl smoke tests has not met an AGENT — the failure modes only compose under multi-turn history contamination, client error echo, and omitted sampling params.
+
+## A transcribed template's whitespace is a token-level contract (dsv4/0731, 2026-07-31)
+
+DeepSeek-V4-Flash ships no `chat_template`, so `src/fixtures/dsv4_chat_template.jinja`
+is our transcription of the release's `encoding/encoding_dsv4.py`, and the converter
+injects it into every mirror we build. Session 2 validated it 5/5 by hand; when 0731
+landed (its ONLY encoder change being `reasoning_effort` → low|high|max) that ad-hoc
+check was rebuilt as a checked-in guard, `tests/dsv4_template_ab.py`, rendering both
+sides over the shapes the server actually emits and demanding BYTE equality.
+
+It went 8/14 on the first run, and every failure was informative:
+
+1. **The reference SILENTLY DROPS tools attached to a user message.** It reads
+   `msg.get("tools")` off the first message and renders the block only from a
+   system/developer turn. Its canonical way to express "tools, no system prompt" is
+   an EMPTY system turn — which renders `content + "\n\n" + tools`, i.e. a leading
+   `\n\n` before `## Tools`. Our template emitted the separator only `if has_system`,
+   so every no-system tool request — the shape most clients send — produced
+   `<bos>## Tools` where the model was trained on `<bos>\n\n## Tools`. Two bytes,
+   but they retokenize everything after the bos. Fixed to unconditional; pinned in
+   both the A/B and the hermetic Zig render test.
+
+2. **`encode_arguments_to_dsml` `json.loads()`es the arguments** — the reference wants
+   a JSON STRING where we serialize OBJECTS (the Inkling rule: a string breaks other
+   families, so we keep objects). Handing it a dict does not raise: it lands in the
+   except branch and renders ONE parameter literally named `arguments` wrapping the
+   whole JSON. A harness that fed both sides "the same" message would have reported
+   our per-key rendering as the bug.
+
+3. A conversation ENDING on an assistant turn while still asking for a generation
+   prompt is not a shape the server produces (the reference has its own `wo_eos`
+   continuation path). The parallel-call case now ends with both tool results — the
+   real agent shape, which also exercises consecutive-`tool_result` merging.
+
+The lesson generalizes past this family: when A/B-ing a transcription against a
+reference implementation, convert the INPUT shapes to each side's own contract and
+compare only the OUTPUT. Every remaining difference is then a real defect in one of
+the two — and here the whitespace one was ours, silently, in production shapes.

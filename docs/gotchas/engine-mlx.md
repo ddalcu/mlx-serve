@@ -1358,3 +1358,270 @@ live at short contexts (fixed overheads) and on MoE/small models.
 Porting Inkling Small, the dtype question was "does the residual stream run bf16 or f32?" — the reference multiplies every dense-MLP output by a `[1]` `global_scale` tensor, and an early python probe (reference modules, MY casts: global_scale → f32 like the "keep_hi" converter comment implied) showed bf16 × f32-array promoting the whole stream to f32 from layer 0. Plan accordingly: f32 KV, f32 experts, 2x bandwidth. WRONG: the REAP25 checkpoint STORES the dense `mlp.global_scale` tensors as BF16 (the base model's were bf16, so the converter's f32-keep condition never fired); only the ROUTER's `gate.bias`/`gate.global_scale` are f32. The real stream is bf16 end-to-end. The probe proved the reference's promotion SEMANTICS while saying nothing about the checkpoint — same family as "read the CHECKPOINT, not the reference source" (Kokoro AdaIN, laguna YaRN), one level up: read the checkpoint's DTYPES, not the converter's intent.
 
 What caught it: the mandatory `[dtype-trace]` arm on first live boot read "residual widened at layer 2: bfloat16 -> float32" — layer 2, not 0. Layers 0-1 (dense) NOT widening disproved the f32-global_scale theory on the spot, and the layer-2 widening localized MY deviation: the routing weights came out of the f32 router chain and multiplied the bf16 expert outputs un-cast, where the reference does `topk_weights.astype(x.dtype)` (and rounds the shared gammas through x.dtype before its f32 shared sum). Fixed to mirror the reference; greedy output then matched the ground truth byte-for-byte on the 32-token prompt (the second prompt diverged at token ~12 into an equivalent continuation — the sanctioned INT4 kernel-order class). Related trap in the same round: the load-time fold of `gate.global_scale` into `route_scale` reads the tensor via `mlx_array_data_float32`, which returns null on a non-f32 tensor — the fold would have been a SILENT no-op had that tensor been bf16 too. Dtype-gate any raw-data read whose tensor dtype you didn't verify.
+
+## mlx_array_new_data copies shape-worth of bytes: the guard-page latent test bug (2026-07-31, dsv4 port session 2)
+
+`transformer.zig`'s "fused residual+RMSNorm declines what it cannot reproduce" test needed a
+[1, 8192] array only for its SHAPE (the fusion's decline path never reads the data), so it
+passed a 16-float stack buffer with an 8192-wide shape. `mlx_array_new_data` memcpy's
+shape×itemsize bytes — a 32 KB read out of a 64-byte buffer. That's UB, but stacks are
+mapped generously and the test stayed green for weeks; the dsv4 GPU-chain edits shifted
+code (and thus frame layout) elsewhere in the binary, the buffer landed near the stack
+guard page, and the memcpy Bus-errored — in a test whose subject had nothing to do with
+the change. Fix: the buffer is really 8192 floats now. Rule: every `mlx_array_new_data`
+buffer must be at least shape-product elements, even when "only the shape matters".
+
+## dsv4: module-owned decode state vs prefix cache + Transformer teardown (2026-07-31)
+
+DeepSeek-V4-Flash native keeps ALL per-request state (raw-kv GPU rows, compressed caches,
+compressor pending rings) on `Dsv4Model.dec_state` — the Transformer's KVCache is a
+0-entry shell whose only live field is `cache.step`, and the serving seam keys on
+`step == 0` to rebuild the state. Two lifecycle consequences, both found by review before
+they shipped:
+
+1. `HotPrefixCache.shouldUse` returned true for dsv4 (no hybrid layers), so a prefix cache
+   would attach, match a repeated prompt, trim it and set `cache.step != 0` — WITHOUT
+   restoring the module-owned state. Best case that silently serves the previous
+   request's rings (often "works" on bench re-runs of the same prompt — the worst kind of
+   wrong); on a fresh boot `mdl.dec_state.?` is null → unreachable = ReleaseFast UB.
+   `shouldUse` now rejects `deepseek_v4` by model_type until the dsv4 state rides the
+   ssm-entry machinery. Guard: prefix_cache + scheduler unit tests.
+
+2. `Transformer.deinit` had no dsv4 arm — the BERT shell inlines its fields into the
+   Transformer (freed by the normal paths), so the MODULE-POINTER pattern (`allocator.create`
+   in initDsv4) had no teardown precedent, and unloading a dsv4 model leaked the entire
+   ~108 GB of mlx handles + host arenas. Any future module-owned arch (the dsv4 pattern is
+   the template) owes the same deinit arm.
+
+## dsv4: the PLD guard bypass — a guard that shapes init options does not bind dispatch (2026-07-31)
+
+The live tool-call request on the DSV4 mirror came back with mangled DSML (dropped token
+runs, wrong-order tag fragments leaked into content) despite TWO spec guards reading as
+airtight: `scheduler.runPrefill` computed
+`is_dsv4 = slot.model.transformer.?.dsv4 != null` and hard-off'd `use_pld`, and (added the
+same session) `Generator.initWithOptions` chokepoint-forced `options.pld_enabled=false`
+when `xfm.dsv4 != null`.
+
+**The log evidence and the illusion.** `~/.mlx-serve/logs/mlx-serve-11234.log` 166348–166361:
+on the two tool-less requests, `spec-gate: ngram-score=0.000` → `pld=disabled (ngram…)` — but
+those lines are printed by the CONN THREAD in server.zig, before the scheduler ever sees the
+request. They prove nothing about what the generator ran; "the guards held" was the ngram
+gate declining naturally. On the tool request the tools JSON is repetitive, the ngram gate
+passed (0.093), and the smoking guns were generator-internal lines:
+`pld=disabled (yield gate: 0 drafted tokens over 8 steps)` (generate.zig) and
+`[spec-stats] mode=pld attempts=2` — `pld_attempted` increments only after a VERIFY forward.
+
+**Root cause: the decode tick dispatched on the slot flag alone.** `runSingleDecodeTick`:
+
+- `if (slot.enable_mtp and gen.mtp != null)` — generator-state conjunct, chokepoint nulls `gen.mtp` → safe
+- `if (slot.enable_drafter and gen.drafter != null)` — same → safe
+- `if (slot.enable_pld)` — NO generator-state conjunct (PLD has no model handle, so there
+  was nothing natural to check) → every tick called `gen.nextPld` regardless
+
+And `nextPld` trusts its caller: it checked only `done` / `specDecodeUnsupported` /
+`spec_disabled_runtime` — `InitOptions.pld_enabled` only ever influenced init behavior (skip
+of the lazy preforward, a log suffix). So both guards worked exactly as written and neither
+mattered: the tick ran nextPld's lookup, found matches in the repetitive tool schema, ran
+verify forwards `[t1, draft…]` through `forwardWith` → dsv4's module-owned decode state
+(compressor rings, kv/comp GPU caches, position bookkeeping) appended 1+m tokens, and the
+KV-snapshot rollback restored only the KVCache SHELL. Two rejected drafts left the module
+state permanently ahead of `cache.step` → every later token attended at wrong
+positions/windows → mangled DSML. mtp/drafter were saved by an ACCIDENT of representation,
+not by design.
+
+**Fix (both sides must agree, and the generator defends itself):**
+
+1. `Generator.pld_enabled` field, set from the POST-chokepoint options — PLD's explicit
+   counterpart of `gen.mtp != null`.
+2. `nextPld` self-declines at the top when `!self.pld_enabled`: delegates to the plain
+   serial `next()` (single-token PldStepResult). Unlike `spec_disabled_runtime` this is
+   permanent — the mid-request re-enable check can never resurrect it (the generated tail
+   of a tool turn IS echo-heavy; a resurrectable disable would re-corrupt).
+3. Tick dispatch through the pure `scheduler.specTickMode(slot flags × generator state)`,
+   hermetic contract test: slot-wants-pld + generator-not-armed → `.regular` for all three
+   modes, plus the MTP > drafter > PLD priority.
+
+**Regression test trick** (`generate.zig` "nextPld on a chokepoint-disabled generator stays
+serial", DSV4_MINI-gated): a random-content prompt can idle in PLD's cold path forever and
+mask the bug — the corruption needs a LOOKUP MATCH. Prompt = every vocab id once (mini
+V=64) + `key_len=1` makes any sampled t1 match an earlier position, guaranteeing a draft
+and therefore a verify forward on the broken code (red read `pld_attempted=5`; green
+requires 0 AND byte-identical tokens vs a serial-arm run on fresh weights).
+
+Audit of the other non-Generator paths: ds4/llama/diffusion slots route out of
+`runSingleDecodeTick` before the spec arms (session pointers / runner checked first) — not
+exposed to this class. Encoder-only models never reach a generator (`textGenRejectReason`).
+
+Bonus find while running the gates: the DSV4_MINI fixtures parity test leaked its
+`loadDsv4Weights` layer table on the skip path (`readAll(fixtures.json) catch return` sat
+AFTER the weight load; ownership only transfers at `initModel`). Skip-path reads now come
+first.
+
+## dsv4 DSpark: lazy stage weights + Metal's zero-filled OOM = fake 100% acceptance of `<BOS>` (2026-07-31)
+
+**Symptom** (real mirror, `MLX_SERVE_DSV4_DSPARK` default-on): greedy chat answered ~2
+correct tokens then `<｜begin▁of▁sentence｜>` (token 0) forever; `[spec-stats]` read
+`accepts=15 avg_per_round=5.00` — a fake 100%. `=0` arm byte-correct. Three mysteries had
+to explain together: (a) stage-2 `moeGpu` returned EXACT zero with healthy inputs AND
+healthy weights (ones-probes read real norms); (b) round-1 VERIFY rows — the trunk path,
+pinned 6/6 on the mini — all argmaxed 0 on a clean prefill; (c) draft `conf` values
+differed per BOOT for the identical request (1+hc_eps / the fp8 amax floor / 0 — "stale
+pool bytes").
+
+**Root cause A (the production bug)**: the DSpark stage weights were never materialized.
+MLX loads are lazy; the house materializer is the WARMUP forward — and dsv4 is the first
+arch whose warmup does not touch every loaded weight (stages only run in the draft). The
+first `dsparkRound` first-touch-materialized ~10.9 GB of 4-bit expert banks MID-REQUEST,
+on top of a 110.8 GB resident trunk, into a 118 GB `max_recommended_working_set_size` box.
+The `[dspark-trace]` active/cache/peak counters caught it as a clean ramp: 110.8 GB →
++1.15 GB per expert bank touched → 117.9 GB at stage-2's w2 gather — where Metal command
+buffers began failing `Insufficient Memory`. **Failing command buffers hand back unwritten
+(zero-filled) buffers with NO surfaced error for many evals** — draft logits all zero →
+argmax token 0; verify logits all zero → argmax token 0; they "agree", so the accept loop
+committed 5/5 `<BOS>` per round. The uncatchable MLX abort only fired boots later (or not
+at all), and where the cliff landed in the ramp varied with pool state — mystery (c)'s
+boot-to-boot nondeterminism. Every earlier structural suspect (ShapeKey collisions,
+arena/lifetime bugs in the draft) was innocent; the all-zero + independent-chains +
+nondeterminism triple is a MEMORY signature.
+
+**Fix**: `initModel` collects every stage tensor via a comptime-reflective walker
+(`appendWeightArrays` — Q triples, optionals, nested structs; a future field cannot be
+silently left out), then decides `dsparkFitsBudget(stage_bytes, trunk_bytes, max_rec,
+6 GB headroom)` on LOGICAL bytes (size × itemsize, known pre-eval) — at init the TRUNK is
+also still lazy, so `mlx_get_active_memory` sees neither side and cannot feed the
+decision (the first fix attempt used active and admitted an 11 GB overflow). Fits → one
+batched `mlx_eval` pays the true footprint at load, where preflight/wired/auto-context
+can see it. Doesn't fit → `n_mtp = 0`: DSpark disabled with a log naming every number,
+serial serve, and the untouched lazy stages cost zero bytes. `MLX_SERVE_DSV4_DSPARK=1`
+(explicit) forces past the check for paging experiments. On the 128 GB box the guard
+fires (trunk 101.4 GB logical + stages 11.0 + headroom 6.1 > 118) — the 4-bit-stage
+mirror structurally cannot serve DSpark there; that is now an honest boot-time line, not
+mid-request corruption.
+
+**Root cause B (found by the same session, SIGBUS)**: `toHostF32` did astype→eval→
+`mlx_array_data_float32`→memcpy. `mlx_astype` to the SAME dtype is a no-op VIEW, so a
+strided/broadcast **f32** input (the dsv4 stream is f32 by design) kept its strides and
+its raw buffer held FEWER elements than the logical count — the memcpy overread stale
+pool bytes (garbage norms in the trace; conf values echoing unrelated constants) and, one
+boot, crossed into another thread's stack guard region (SIGBUS in `_platform_memmove`,
+"crash was associated with thread 3 — possible stray access"). Fix: check
+`isRowMajorContiguous` AFTER eval (strides are unpopulated before), materialize via FLAT
+RESHAPE — a non-row-major layout can never be expressed as a 1-D view, so MLX must copy.
+Add-scalar-zero (the `materializedOwnedCopy` pattern) does NOT materialize a broadcast:
+MLX binary ops propagate the broadcast input's strides to the OUTPUT and compute only the
+unique elements (measured: post-add strides still `{0,1}`). bf16 inputs were always safe
+(cross-dtype astype materializes) — the class needed an f32-stream arch to surface.
+
+**Class guards**: "toHostF32 reads non-contiguous f32 views in logical order" (broadcast
++ column-slice); `dsparkFitsBudget` unit test with the real mirror's numbers; collector
+assertions in the DSV4_MINI load test; and the FULL-ACCEPT seam test
+(`dsparkRoundWith` + a draft rigged to the serial continuation) covering the no-rollback
+branch the random mini can never reach — commits the block, bonus token correct, 3 serial
+tail tokens bit-identical after the round.
+
+## DSpark round-cost round: the barrier, not the transfer (2026-07-31, dsv4)
+
+DSpark shipped correct but SLOW: 13.5–14.0 tok/s against 22.6 serial on the same box.
+The plan's first item was a per-round cost audit, and doing that before touching anything
+is what kept three plausible theories from being implemented in the wrong order.
+
+**The profiler is honest only because the phases already synced.** `MLX_SERVE_DSPARK_PROFILE`
+wall-clocks draft / snapshot / verify / rollback. Unlike `MLX_SERVE_DECODE_PROFILE` (whose
+per-phase evals kill pipelining and make it a lying sizing tool) every boundary measured
+here is ALREADY a host sync in the shipping path: the draft ends in the confidence read,
+both verify paths end in a logits read, the snapshot is pure host work. Zero added evals.
+
+First reading, 195 ms/round committing 4.69 tokens (43 ms/token): **verify 142, rollback 40,
+draft 12.6 (markov 5.0), snapshot 0.24.**
+
+**Trap inside the audit: a phase that is zero on some rounds must not be read as a per-round
+average.** Rollback showed 40 ms/round, which looked like 20% — but it is 0 on every full
+accept, so the real partial-round cost was ~65 ms. The average was right; the interpretation
+("this is a fifth of the round") was not, and it nearly demoted the biggest lever.
+
+### 1. A rollback that re-forwards the accepted prefix is a SECOND forward (+34%)
+
+The partial-accept path restored the entry snapshot and re-ran `extendState` over
+`accepted+1` tokens — a whole batched trunk forward to reproduce state the verify had
+already computed. The comment justifying it was true but too pessimistic: "the compressor
+pending rings are overwritten in place, so partial-position rollback has no anchor short of
+the snapshot". Everything ELSE already rolls back by offset (GpuRows `used`, the append-only
+compressed caches, `st.n`, the DSpark main_kv rings). So capture ONLY the rings, per token,
+while the verify runs: ~12 MB of memcpy for a whole block, measured at **0.24 ms**, replacing
+a ~65 ms forward. Round 195 → 156 ms, decode 22.9 → 30.7 tok/s.
+
+`DsparkAnchors` captures inside the compressor push loop (`captureComp`), so position p holds
+the state after p+1 tokens; `restoreToAnchor` takes offsets from the entry snapshot and ring
+contents from the anchor. Guard: "anchored rollback replays like snapshot + re-extend" runs
+BOTH strategies from the same entry state at every acceptance count and demands bit-identical
+tail decodes — proven red by sabotaging the `sc_pend` copy.
+
+### 2. A host read inside a layer loop is a GPU BARRIER (+16%)
+
+With the rollback gone, verify was 142 of a 156 ms round — and sub-lapping it showed the
+vocab head was only 5.5 ms (the M=B+1 qmm cliff was the obvious suspect and was innocent).
+The real number: **the per-layer compressor-input read was 128 ms of the 143 ms verify.**
+
+The read itself is a few KB. What costs is that each of the 41 reads DRAINS the queue and
+then idles the GPU across the host push loop, so a 43-layer forward is chopped into 41
+serialized stages. The tell was a comparison the profile made free: a batched forward at
+C≈1.6 already cost ~70 ms, while a serial `decodeStep` at C=1 costs 44 — the batched path
+was paying a fixed tax per layer that decode had already fixed for itself (perf round 10's
+`processDeferredComp`, +21.8% at the time, deferred exactly these reads).
+
+Generalized to chunks: a chunk owes the read only if it CLOSES a compression window, because
+only then is a slot emitted that the same chunk's later tokens can see. That is pure position
+arithmetic (`chunkCrossesBoundary` — no data dependency), so the decision is exact rather
+than heuristic. At a C=6 verify the 20 ratio-128 layers defer into ONE batched eval after the
+layer loop; the 21 ratio-4 layers always close a window and still stall. Round 156 → 136 ms,
+decode 30.7 → **35.3 tok/s**.
+
+**The remaining lever is now measured, not guessed**: sync is still 109 ms of the 124 ms
+verify, all of it the ratio-4 layers, and the only way to remove it is to compute the
+compressor emission itself on the GPU (pending ring mirrored GPU-side, masked softmax combine
++ norm/rope/QAT-sim, ring update by slice_update). Estimated ceiling if the barriers go: verify
+~50-60 ms, round ~70 ms, ~15 ms/token. That work also lands on batched prefill and on decode's
+remaining boundary syncs.
+
+### 3. Two levers that measured NEGATIVE, and why they stay in the tree
+
+**The confidence gate.** antirez's ds4 makes the checkpoint's confidence head its biggest
+lever: it truncates the submitted block (and skips the draft LM head entirely below the
+threshold), default `--dspark-confidence 0.9`. Our head is equally informative — harvested
+over 86 live rounds, position 0 scores mean **+5.08** on rounds that accept it vs **+0.02**
+on rounds that reject it. It still lost: no gate 30.7 tok/s, 0.5 → 29.9, **0.9 → 25.3**.
+The reason is in the same profile: our batched forward is FIXED-COST dominated. Fitting
+verify(C) across three live arms (C=6 → 143 ms, 2.86 → 109.5, 1.61 → 87.6) gives roughly
+**70 ms + 12 ms·C** — a narrower block pays nearly the same and commits less. The gate is
+shipped OFF behind `MLX_SERVE_DSV4_DSPARK_CONF` (sigmoid units, matching the reference's
+CLI) with the numbers in the source. A lever's default belongs to the engine that measured
+it, not to the engine it was ported from.
+
+**The sinkhorn config cache.** `hcPreBatch` rebuilt an `mlx_fast_metal_kernel_config` per
+call — 86 per batched forward — which is textbook "a config rebuilt per call is a CPU-side
+tax that reads as kernel cost". Caching it by token count (`sinkhornCfgFor`, the house
+ShapeKey discipline: cache small repeating widths + the prefill sub-chunk, never one-off
+remainders) measured as a wash. Kept because it is strictly less work and the table is
+bounded, but it is NOT where the fixed cost was — the barrier was.
+
+**Also fixed in passing**: `extendState` cleared the MLX allocator cache after every
+sub-chunk, correct for prefill (shapes never repeat across prompt lengths) and exactly
+wrong for spec widths (≤ block+1, repeating every round) — each clear made the next verify
+re-allocate its transients from the OS. `extendChunkShouldClearCache` keys on the house's
+"a multi-token forward is not a prefill" line (seq ≥ 32). Worth ~3%.
+
+### Result
+
+Same box, paired boots, engagement proven per arm (`[spec-stats] mode=dspark`,
+`sub/round=5.00`): serial **22.6/22.7**, DSpark **35.2/35.3 tok/s** = **1.56x** serial and
+1.32x the ds4 GGUF engine's 26.68. Prefill unchanged (135.9 / 143.2 / 127.8 tok/s at
+488 / 1970 / 7823 tokens). Quality gates: `test_dsv4.sh` 14/14 + template A/B 17/17; the
+5-task set 5/5 native (serial AND dspark) vs 5/5 ds4.
+
+**DSpark ON is not token-identical to serial** — the documented near-tie kernel-choice class
+(batched [C] verify vs [1] decode) — and the task set makes that concrete: serial answers
+"17 * 23?" with a bare `391`, DSpark with a correct but rambling paragraph. Also honest:
+on the code task BOTH our arms answer `sum(range(1, 11))**2` (wrong — square of the sum)
+where the ds4 GGUF answers `sum(i*i for i in range(1, 11))`. That is identical in serial, so
+it is our quant mix (2-bit gate/up, 3-bit down, no imatrix) against antirez's imatrix-
+calibrated IQ2XXS/Q2_K, not the engine and not DSpark.

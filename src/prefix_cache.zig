@@ -190,6 +190,12 @@ pub const HotPrefixCache = struct {
         config: *const model_mod.ModelConfig,
         enable_ssm_checkpoints: bool,
     ) bool {
+        // dsv4 keeps its per-request state (raw-kv rings, compressed caches,
+        // compressor pending windows) on the module-owned Dsv4Model, not in
+        // the KVCache — a snapshot restore would advance cache.step without
+        // rebuilding that state. Off until dsv4 state rides the ssm-entry
+        // machinery (needsSsmEntries class).
+        if (std.mem.eql(u8, config.model_type, "deepseek_v4")) return false;
         const has_ssm_layers = config.has_hybrid_layers or config.full_attention_interval > 0;
         if (has_ssm_layers and !enable_ssm_checkpoints) return false;
         return true;
@@ -719,6 +725,17 @@ test "HotPrefixCache: shouldUse gates hybrid by enable_ssm_checkpoints" {
     cfg.full_attention_interval = 4;
     try testing.expect(!HotPrefixCache.shouldUse(&cfg, false));
     try testing.expect(HotPrefixCache.shouldUse(&cfg, true));
+}
+
+test "HotPrefixCache: shouldUse rejects deepseek_v4 (module-owned decode state)" {
+    // dsv4's per-request state (raw-kv rings, compressed caches, compressor
+    // pending windows) lives on the Dsv4Model, NOT in the 0-entry KVCache
+    // shell — a snapshot restore would set cache.step without rebuilding that
+    // state, silently serving a stale ring (or crashing on a null dec_state).
+    var cfg = model_mod.ModelConfig{};
+    cfg.model_type = "deepseek_v4";
+    try testing.expect(!HotPrefixCache.shouldUse(&cfg, false));
+    try testing.expect(!HotPrefixCache.shouldUse(&cfg, true));
 }
 
 test "HotPrefixCache: init zero capacity clamps to 1" {

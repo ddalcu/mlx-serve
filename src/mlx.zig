@@ -82,6 +82,18 @@ pub extern "c" fn mlx_stream_new_device(dev: mlx_device) mlx_stream;
 pub extern "c" fn mlx_stream_free(s: mlx_stream) c_int;
 pub extern "c" fn mlx_default_cpu_stream_new() mlx_stream;
 pub extern "c" fn mlx_default_gpu_stream_new() mlx_stream;
+pub extern "c" fn mlx_stream_get_device(dev: *mlx_device, stream: mlx_stream) c_int;
+pub extern "c" fn mlx_device_get_type(dtype: *mlx_device_type, dev: mlx_device) c_int;
+
+/// True when the stream targets the GPU (custom Metal kernels require it).
+pub fn streamIsGpu(s: mlx_stream) bool {
+    var dev = mlx_device{ .ctx = null };
+    if (mlx_stream_get_device(&dev, s) != 0) return false;
+    defer _ = mlx_device_free(dev);
+    var dt: mlx_device_type = .cpu;
+    if (mlx_device_get_type(&dt, dev) != 0) return false;
+    return dt == .gpu;
+}
 pub extern "c" fn mlx_synchronize(s: mlx_stream) c_int;
 
 // Metal
@@ -166,6 +178,10 @@ pub extern "c" fn mlx_negative(res: *mlx_array, a: mlx_array, s: mlx_stream) c_i
 pub extern "c" fn mlx_maximum(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
 // Kokoro's SineGen takes the fractional part of a phase ramp (`x - floor(x)`).
 pub extern "c" fn mlx_floor(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_ceil(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_log2(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_round(res: *mlx_array, a: mlx_array, decimals: c_int, s: mlx_stream) c_int;
+pub extern "c" fn mlx_sign(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
 // Complex plumbing for Kokoro's iSTFTNet head. mlx-c has NO "build a complex
 // array from two real ones" op, so the spectrum is assembled as `re + im·i`
 // using a complex SCALAR from `mlx_array_new_complex` (float ⊕ complex
@@ -573,7 +589,7 @@ pub fn wiredFitTarget(active_bytes: usize, slack_bytes: usize, max_rec: usize) ?
 
 pub const WiredPolicyResult = struct { mode: WiredMode, target: ?usize };
 
-fn maxRecommendedWorkingSet() usize {
+pub fn maxRecommendedWorkingSet() usize {
     var dev = mlx_device{ .ctx = null };
     _ = mlx_get_default_device(&dev);
     var info = mlx_device_info_new();

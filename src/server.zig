@@ -457,9 +457,34 @@ fn resolveSamplingDefault(comptime T: type, request: ?T, cli: ?T, gen_config: ?T
 /// MoE targets default OFF because the verify forward pays the expert-routing
 /// penalty; `--mtp` (`default_force_mtp`) overrides that for operators who
 /// measured otherwise — the 35B-A3B sidecar holds ~73% per-draft.
-pub fn defaultEnableMtp(mtp_loaded: bool, is_moe: bool, force: bool) bool {
+///
+/// `dsv4_stages`: DeepSeek-V4 DSpark — the checkpoint's OWN draft stages,
+/// designed for exactly this MoE trunk. `dsv4_stages` is true only when the
+/// stages were LOADED (opt-in `--dspark` + memory fit-gate, so `n_mtp > 0`);
+/// then requests default ON outright (the qwen MoE-verify caution is about
+/// a bolted-on sidecar, not a native design). Like qwen MTP it is never
+/// subject to the n-gram prompt gate; explicit `enable_mtp:false` opts out
+/// per request.
+pub fn defaultEnableMtp(mtp_loaded: bool, is_moe: bool, force: bool, dsv4_stages: bool) bool {
+    if (dsv4_stages) return true;
     if (!mtp_loaded) return false;
     return !is_moe or force;
+}
+
+/// Does this model serve DeepSeek-V4 with DSpark draft stages loaded?
+fn dsv4DraftStages(lm: *LoadedModel) bool {
+    const x = lm.transformer orelse return false;
+    const d = x.dsv4 orelse return false;
+    return d.n_mtp > 0;
+}
+
+/// Can this model run an MTP-flagged request speculatively? Either a qwen
+/// sidecar/in-checkpoint head (lm.mtp) or dsv4's native DSpark stages. Every
+/// per-surface `enable_mtp` conjunct must use THIS, not `lm.mtp != null` —
+/// the bare conjunct silently killed the flag for dsv4 at submit while the
+/// default/dispatch layers were correct (the per-surface wiring class).
+fn mtpCapable(lm: *LoadedModel) bool {
+    return lm.mtp != null or dsv4DraftStages(lm);
 }
 
 /// parseJsonFloat variant that distinguishes "omitted / wrong type" (null)
@@ -1979,6 +2004,19 @@ fn ollamaQuantOf(id: []const u8) []const u8 {
     return "";
 }
 
+/// Which backend serves this entry — surfaced as `meta.engine` in /v1/models
+/// so the app's engine-aware Settings UI never has to INFER it from
+/// `architecture`: a NATIVE deepseek_v4 safetensors dir and a DeepSeek GGUF
+/// on the embedded ds4 engine report the SAME model_type. "gguf" = an
+/// unloaded GGUF stub whose engine (llama vs ds4) is only known once the
+/// header is read at load time.
+fn modelEngineName(has_ds4: bool, has_llama: bool, path: []const u8, arch_hint: []const u8) []const u8 {
+    if (has_ds4) return "ds4";
+    if (has_llama) return "llama";
+    if (std.mem.endsWith(u8, path, ".gguf") or std.mem.eql(u8, arch_hint, "gguf")) return "gguf";
+    return "mlx";
+}
+
 /// Snapshot one registry entry into the pure TagEntry shape. Caller holds
 /// the registry mutex; id/arch_hint slices are entry-owned and stable.
 fn ollamaTagEntryOf(io: std.Io, e: *LoadedModel) ollama_mod.TagEntry {
@@ -2940,7 +2978,7 @@ fn renderModelEntry(
         defer allocator.free(gen_top_k_str);
 
         return std.fmt.allocPrint(allocator,
-            \\{{"id":"{s}","object":"model","created":{d},"owned_by":"mlx-serve","loaded":true,"state":"ready","bytes_resident":{d},"bytes_on_disk":{s},"capabilities":{s},"input_modalities":{s},"meta":{{"architecture":"{s}","vocab_size":{d},"hidden_size":{d},"num_layers":{d},"quantization":"{d}-bit","context_length":{s},"model_max_tokens":{d},"is_moe":{s},"drafter_loaded":{s},"drafter_path":{s},"mtp_loaded":{s},"gen_temperature":{s},"gen_top_p":{s},"gen_top_k":{s}}}}}
+            \\{{"id":"{s}","object":"model","created":{d},"owned_by":"mlx-serve","loaded":true,"state":"ready","bytes_resident":{d},"bytes_on_disk":{s},"capabilities":{s},"input_modalities":{s},"meta":{{"architecture":"{s}","engine":"{s}","vocab_size":{d},"hidden_size":{d},"num_layers":{d},"quantization":"{d}-bit","context_length":{s},"model_max_tokens":{d},"is_moe":{s},"drafter_loaded":{s},"drafter_path":{s},"mtp_loaded":{s},"gen_temperature":{s},"gen_top_p":{s},"gen_top_k":{s}}}}}
         , .{
             model_id,
             nowSecs(io),
@@ -2949,6 +2987,7 @@ fn renderModelEntry(
             caps.items,
             mods.items,
             config.model_type,
+            modelEngineName(entry.ds4_engine != null, entry.llama_engine != null, entry.path, entry.arch_hint),
             config.vocab_size,
             config.hidden_size,
             config.num_hidden_layers,
@@ -3057,6 +3096,13 @@ fn renderModelEntry(
     } else &[_]u8{};
     defer if (arch_part.len > 0) allocator.free(arch_part);
 
+    // Unloaded entries have no engine attached yet — "gguf" (undetermined
+    // llama-vs-ds4) for GGUF paths/stubs, "mlx" for everything else.
+    const engine_part = try std.fmt.allocPrint(allocator, "\"engine\":\"{s}\",", .{
+        modelEngineName(false, false, entry.path, entry.arch_hint),
+    });
+    defer allocator.free(engine_part);
+
     // Dimensions/context/quant/MoE — emitted only when config.json was readable.
     const dims_part: []const u8 = if (sm.found) blk: {
         break :blk try std.fmt.allocPrint(allocator, "\"vocab_size\":{d},\"hidden_size\":{d},\"num_layers\":{d},\"quantization\":\"{d}-bit\",\"context_length\":{d},\"model_max_tokens\":{d},\"is_moe\":{s},", .{
@@ -3072,8 +3118,8 @@ fn renderModelEntry(
     defer if (dims_part.len > 0) allocator.free(dims_part);
 
     return std.fmt.allocPrint(allocator,
-        \\{{"id":"{s}","object":"model","created":0,"owned_by":"mlx-serve","loaded":false,"state":"{s}","bytes_resident":0,"bytes_on_disk":{s}{s}{s}{s},"meta":{{{s}{s}"bytes_on_disk":{s}}}}}
-    , .{ entry.id, state_str, bytes_on_disk_str, err_part, caps_part, mods_part, arch_part, dims_part, bytes_on_disk_str });
+        \\{{"id":"{s}","object":"model","created":0,"owned_by":"mlx-serve","loaded":false,"state":"{s}","bytes_resident":0,"bytes_on_disk":{s}{s}{s}{s},"meta":{{{s}{s}{s}"bytes_on_disk":{s}}}}}
+    , .{ entry.id, state_str, bytes_on_disk_str, err_part, caps_part, mods_part, arch_part, engine_part, dims_part, bytes_on_disk_str });
 }
 
 fn handleModels(
@@ -3958,7 +4004,11 @@ fn jsonEscapeOrEmpty(allocator: std.mem.Allocator, text: []const u8) EscapedText
     return .{ .slice = s, .owned = true };
 }
 
-const ReasoningEffort = struct { enable: bool, budget: i32 };
+/// `effort` is the client's raw string, borrowed from the parsed request JSON
+/// (which outlives the handler) — dsv4-family templates map it into the
+/// render via `chat.dsv4EffortFor`; every other consumer only reads
+/// enable/budget.
+const ReasoningEffort = struct { enable: bool, budget: i32, effort: ?[]const u8 = null };
 
 /// OpenAI-standard `reasoning_effort` on chat/completions (none | minimal |
 /// low | medium | high | xhigh — values are model-dependent, so unknown
@@ -3968,8 +4018,8 @@ const ReasoningEffort = struct { enable: bool, budget: i32 };
 fn parseReasoningEffort(root: std.json.ObjectMap, default_budget: i32) ?ReasoningEffort {
     const v = root.get("reasoning_effort") orelse return null;
     if (v != .string) return null;
-    if (std.mem.eql(u8, v.string, "none")) return .{ .enable = false, .budget = default_budget };
-    return .{ .enable = true, .budget = responses_mod.effortBudget(v.string, default_budget) };
+    if (std.mem.eql(u8, v.string, "none")) return .{ .enable = false, .budget = default_budget, .effort = v.string };
+    return .{ .enable = true, .budget = responses_mod.effortBudget(v.string, default_budget), .effort = v.string };
 }
 
 fn nChoicesRejectReason(root: std.json.ObjectMap) ?[]const u8 {
@@ -4460,8 +4510,8 @@ fn handleChatCompletions(
     var enable_mtp: bool = if (root.get("enable_mtp")) |v|
         (v == .bool and v.bool)
     else
-        defaultEnableMtp(lm.mtp != null, config.isMoe(), server_config.default_force_mtp);
-    if (enable_mtp and lm.mtp == null) enable_mtp = false;
+        defaultEnableMtp(lm.mtp != null, config.isMoe(), server_config.default_force_mtp, dsv4DraftStages(lm));
+    if (enable_mtp and lm.mtp == null and !dsv4DraftStages(lm)) enable_mtp = false;
     if (enable_mtp and logprobs_n > 0) {
         log.info("  mtp=disabled (logprobs requested)\n", .{});
         enable_mtp = false;
@@ -4507,7 +4557,7 @@ fn handleChatCompletions(
     // step. The cache is engine-agnostic — same hit even when the
     // underlying call is ds4 / llama / MLX formatChat.
     var tokenize_sw = Stopwatch.init(stream.io);
-    var prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, chat_config, messages.items, tools_json, tool_choice_instruction, enable_thinking);
+    var prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, chat_config, messages.items, tools_json, tool_choice_instruction, enable_thinking, if (effort_cfg) |e| e.effort else null);
     const tokenize_ns = tokenize_sw.read();
 
     // Run vision encoder if any messages contain images. Phase A8: each
@@ -4777,8 +4827,8 @@ fn handleCompletions(
     var enable_mtp: bool = if (root.get("enable_mtp")) |v|
         (v == .bool and v.bool)
     else
-        defaultEnableMtp(lm.mtp != null, config.isMoe(), server_config.default_force_mtp);
-    if (enable_mtp and lm.mtp == null) enable_mtp = false;
+        defaultEnableMtp(lm.mtp != null, config.isMoe(), server_config.default_force_mtp, dsv4DraftStages(lm));
+    if (enable_mtp and lm.mtp == null and !dsv4DraftStages(lm)) enable_mtp = false;
 
     // Log the request
     const preview_len = @min(prompt_text.?.len, 80);
@@ -4878,7 +4928,7 @@ fn handleNonStreamingCompletion(
     var timer = Stopwatch.init(stream.io);
 
     // Spec dispatch (priority MTP > drafter > PLD; mirrors handleNonStreamingGeneration).
-    const use_mtp = enable_mtp and lm.mtp != null and sampling.constraint == null;
+    const use_mtp = enable_mtp and mtpCapable(lm) and sampling.constraint == null;
     const use_drafter = !use_mtp and enable_drafter and lm.drafter != null and sampling.constraint == null;
     const use_pld = !use_mtp and !use_drafter and enable_pld and sampling.constraint == null;
 
@@ -4957,7 +5007,7 @@ fn handleStreamingCompletion(
     var timer = Stopwatch.init(stream.io);
 
     const config = lm.config.?;
-    const stream_mode = pickStreamMode(enable_pld, enable_drafter, enable_mtp, lm.drafter != null, lm.mtp != null, config.has_hybrid_layers, sampling.constraint != null, 0);
+    const stream_mode = pickStreamMode(enable_pld, enable_drafter, enable_mtp, lm.drafter != null, mtpCapable(lm), config.has_hybrid_layers, sampling.constraint != null, 0);
     if (stream_mode == .pld) log.info("  pld=enabled (streaming, draft_len={d}, key_len={d})\n", .{ server_config.default_pld_draft_len, server_config.default_pld_key_len });
     if (stream_mode == .drafter) log.info("  drafter=enabled (streaming, block_size={d})\n", .{lm.drafter_block_size});
     if (stream_mode == .mtp) log.info("  mtp=enabled (streaming, depth={d})\n", .{lm.mtp_depth});
@@ -5180,7 +5230,7 @@ fn nonStreamingViaScheduler(
         .enable_drafter = enable_drafter and lm.drafter != null,
         .drafter = if (enable_drafter) lm.drafter else null,
         .drafter_block_size = lm.drafter_block_size,
-        .enable_mtp = enable_mtp and lm.mtp != null,
+        .enable_mtp = enable_mtp and mtpCapable(lm),
         .mtp = if (enable_mtp) lm.mtp else null,
         .mtp_depth = lm.mtp_depth,
         .pld_draft_len = server_config.default_pld_draft_len,
@@ -5299,7 +5349,7 @@ fn handleNonStreamingGeneration(
     //   2. PLD next if requested AND no logprobs AND no grammar constraint
     //      (constrained decode requires per-token state advancement).
     //   3. Otherwise the regular pipeline.
-    const use_mtp = enable_mtp and logprobs_n == 0 and lm.mtp != null and sampling.constraint == null;
+    const use_mtp = enable_mtp and logprobs_n == 0 and mtpCapable(lm) and sampling.constraint == null;
     const use_drafter = !use_mtp and enable_drafter and logprobs_n == 0 and lm.drafter != null and sampling.constraint == null;
     const use_pld = !use_mtp and !use_drafter and enable_pld and logprobs_n == 0 and sampling.constraint == null;
 
@@ -5866,7 +5916,7 @@ fn handleStreamingGeneration(
     // which feeds `next` (regular), `nextPld` (1..1+draft_len tokens/step),
     // or `nextDrafter` (1..block_size tokens/step) through the same
     // one-token-at-a-time interface.
-    const stream_mode = pickStreamMode(enable_pld, enable_drafter, enable_mtp, lm.drafter != null, lm.mtp != null, config.has_hybrid_layers, sampling.constraint != null, logprobs_n);
+    const stream_mode = pickStreamMode(enable_pld, enable_drafter, enable_mtp, lm.drafter != null, mtpCapable(lm), config.has_hybrid_layers, sampling.constraint != null, logprobs_n);
     if (stream_mode == .pld) log.info("  pld=enabled (streaming, draft_len={d}, key_len={d})\n", .{ server_config.default_pld_draft_len, server_config.default_pld_key_len });
     if (stream_mode == .drafter) log.info("  drafter=enabled (streaming, block_size={d})\n", .{lm.drafter_block_size});
     if (stream_mode == .mtp) log.info("  mtp=enabled (streaming, depth={d})\n", .{lm.mtp_depth});
@@ -7299,21 +7349,24 @@ fn cachedFormatChat(
     tools_json: ?[]const u8,
     tool_choice_instruction: ?[]const u8,
     enable_thinking: bool,
+    reasoning_effort: ?[]const u8,
 ) ![]u32 {
     const cache_ptr: ?*tokenize_cache_mod.TokenizeCache = if (lm.tokenize_cache) |*tc| tc else null;
     const key_opt: ?u64 = if (cache_ptr != null)
-        tokenize_cache_mod.TokenizeCache.keyFor(messages, tools_json, tool_choice_instruction, enable_thinking)
+        tokenize_cache_mod.TokenizeCache.keyFor(messages, tools_json, tool_choice_instruction, enable_thinking, reasoning_effort)
     else
         null;
     if (cache_ptr) |cache| if (key_opt) |key| {
         if (try cache.get(io, key, allocator)) |cached| return cached;
     };
+    // ds4 renders through the GGUF engine's own template, which never reads
+    // the effort string — only the Jinja paths thread it.
     const ids = if (lm.ds4_engine) |engine|
         try chat_mod.encodeChatViaDs4(allocator, engine, messages, tools_json, tool_choice_instruction, enable_thinking)
     else if (lm.llama_engine) |engine|
-        try chat_mod.encodeChatViaLlama(allocator, engine, chat_config, messages, tools_json, tool_choice_instruction, enable_thinking)
+        try chat_mod.encodeChatViaLlama(allocator, engine, chat_config, messages, tools_json, tool_choice_instruction, enable_thinking, reasoning_effort)
     else
-        try chat_mod.formatChat(allocator, tok, messages, chat_config, tools_json, tool_choice_instruction, enable_thinking);
+        try chat_mod.formatChat(allocator, tok, messages, chat_config, tools_json, tool_choice_instruction, enable_thinking, reasoning_effort);
     if (cache_ptr) |cache| if (key_opt) |key| {
         // Insert is best-effort; an OOM in the cache shouldn't fail the
         // request — the user already has their tokenized prompt.
@@ -8671,8 +8724,8 @@ fn handleAnthropicMessages(
     var enable_mtp: bool = if (root.get("enable_mtp")) |v|
         (v == .bool and v.bool)
     else
-        defaultEnableMtp(lm.mtp != null, config.isMoe(), server_config.default_force_mtp);
-    if (enable_mtp and lm.mtp == null) enable_mtp = false;
+        defaultEnableMtp(lm.mtp != null, config.isMoe(), server_config.default_force_mtp, dsv4DraftStages(lm));
+    if (enable_mtp and lm.mtp == null and !dsv4DraftStages(lm)) enable_mtp = false;
 
     // Log request
     const last_msg = messages.items[messages.items.len - 1];
@@ -8692,7 +8745,9 @@ fn handleAnthropicMessages(
     // the cache key consistent with what the encoder actually sees.
     const effective_tools_json: ?[]const u8 = if (has_tools) tools_json else null;
     var tokenize_sw = Stopwatch.init(stream.io);
-    var prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, chat_config, messages.items, effective_tools_json, tool_choice_instruction, enable_thinking);
+    // Anthropic's thinking opt-in is a budget object — it carries no
+    // OpenAI-style effort string, so dsv4 templates get their default.
+    var prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, chat_config, messages.items, effective_tools_json, tool_choice_instruction, enable_thinking, null);
     const tokenize_ns = tokenize_sw.read();
 
     // Vision encoder: encode any images on the last user message and splice
@@ -8821,7 +8876,7 @@ fn handleAnthropicNonStreaming(
     // Speculative decoding dispatch — same priority as chat-completions
     // (drafter > PLD; PLD runs on hybrid SSM, the drafter does not).
     const config = lm.config.?;
-    const use_mtp = enable_mtp and lm.mtp != null and sampling.constraint == null;
+    const use_mtp = enable_mtp and mtpCapable(lm) and sampling.constraint == null;
     const use_drafter = !use_mtp and enable_drafter and lm.drafter != null and sampling.constraint == null and !config.has_hybrid_layers;
     const use_pld = !use_mtp and !use_drafter and enable_pld and sampling.constraint == null;
 
@@ -9047,7 +9102,7 @@ fn handleAnthropicStreaming(
     // stream adapter below feeds the per-token Anthropic state machine the
     // same way for all three modes.
     const config = lm.config.?;
-    const stream_mode = pickStreamMode(enable_pld, enable_drafter, enable_mtp, lm.drafter != null, lm.mtp != null, config.has_hybrid_layers, sampling.constraint != null, 0);
+    const stream_mode = pickStreamMode(enable_pld, enable_drafter, enable_mtp, lm.drafter != null, mtpCapable(lm), config.has_hybrid_layers, sampling.constraint != null, 0);
     if (stream_mode == .pld) log.info("  pld=enabled (streaming, draft_len={d}, key_len={d})\n", .{ server_config.default_pld_draft_len, server_config.default_pld_key_len });
     if (stream_mode == .drafter) log.info("  drafter=enabled (streaming, block_size={d})\n", .{lm.drafter_block_size});
     if (stream_mode == .mtp) log.info("  mtp=enabled (streaming, depth={d})\n", .{lm.mtp_depth});
@@ -10135,7 +10190,7 @@ fn handleResponses(
     // cache as chat-completions / messages because they all hash the
     // same canonical (messages, tools, flags) tuple.
     var tokenize_sw = Stopwatch.init(stream.io);
-    var prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, chat_config, pi.messages.items, active_tools_json, active_tool_choice_instruction, enable_thinking);
+    var prompt_ids_raw = try cachedFormatChat(allocator, stream.io, lm, tok, chat_config, pi.messages.items, active_tools_json, active_tool_choice_instruction, enable_thinking, reasoning_cfg.effort);
     const tokenize_ns = tokenize_sw.read();
 
     // ── vision encoder ──
@@ -10319,8 +10374,8 @@ fn handleResponses(
     var enable_mtp_resp: bool = if (root.get("enable_mtp")) |v|
         (v == .bool and v.bool)
     else
-        defaultEnableMtp(lm.mtp != null, config.isMoe(), server_config.default_force_mtp);
-    if (enable_mtp_resp and lm.mtp == null) enable_mtp_resp = false;
+        defaultEnableMtp(lm.mtp != null, config.isMoe(), server_config.default_force_mtp, dsv4DraftStages(lm));
+    if (enable_mtp_resp and lm.mtp == null and !dsv4DraftStages(lm)) enable_mtp_resp = false;
 
     // Adaptive spec-decode gate (Responses path; mirrors chat-completions and
     // Anthropic). Score the full prompt's 3-gram repetition; novel content
@@ -13156,7 +13211,17 @@ test "parseReasoningEffort: standard chat reasoning_effort opt-in maps to thinki
     for (cases) |case| {
         const parsed = try std.json.parseFromSlice(std.json.Value, allocator, case.body, .{});
         defer parsed.deinit();
-        try std.testing.expectEqual(case.expect, parseReasoningEffort(parsed.value.object, -1));
+        const got = parseReasoningEffort(parsed.value.object, -1);
+        if (case.expect) |want| {
+            try std.testing.expectEqual(want.enable, got.?.enable);
+            try std.testing.expectEqual(want.budget, got.?.budget);
+            // The raw client string always rides along (dsv4 templates map it
+            // into the render); it is the request body's own bytes.
+            const v = parsed.value.object.get("reasoning_effort").?;
+            try std.testing.expectEqualStrings(v.string, got.?.effort.?);
+        } else {
+            try std.testing.expect(got == null);
+        }
     }
 }
 
@@ -13453,17 +13518,21 @@ test "resolveKvAttnFusedPure: explicit > mode; auto keys on scheme + crossover" 
 test "defaultEnableMtp: --mtp forces the native head on for MoE targets" {
     const t = std.testing;
     // No sidecar loaded → never on, whatever the operator asked for.
-    try t.expect(!defaultEnableMtp(false, false, false));
-    try t.expect(!defaultEnableMtp(false, true, true));
+    try t.expect(!defaultEnableMtp(false, false, false, false));
+    try t.expect(!defaultEnableMtp(false, true, true, false));
     // Dense target with a sidecar → on by default (unchanged behavior).
-    try t.expect(defaultEnableMtp(true, false, false));
-    try t.expect(defaultEnableMtp(true, false, true));
+    try t.expect(defaultEnableMtp(true, false, false, false));
+    try t.expect(defaultEnableMtp(true, false, true, false));
     // MoE target → OFF by default (the verify-forward routing caution) ...
-    try t.expect(!defaultEnableMtp(true, true, false));
+    try t.expect(!defaultEnableMtp(true, true, false, false));
     // ... but ON when the operator passed --mtp. Without this, a MoE MTP
     // checkpoint is unreachable from any client that doesn't send
     // `enable_mtp:true` in the body (llmprobe, Claude Code, curl).
-    try t.expect(defaultEnableMtp(true, true, true));
+    try t.expect(defaultEnableMtp(true, true, true, false));
+    // DSpark: dsv4's own stages default ON outright — MoE-ness and --mtp
+    // never gate the checkpoint's native draft design.
+    try t.expect(defaultEnableMtp(false, true, false, true));
+    try t.expect(defaultEnableMtp(false, false, false, true));
 }
 
 test "formatChatUsage: prompt_tokens_details.cached_tokens always present (llmprobe chat caching)" {
@@ -13549,4 +13618,17 @@ test "messageReasoningFromObj: reasoning_content round-trip, reasoning fallback,
             try t.expect(got == null);
         }
     }
+}
+
+test "modelEngineName: native dsv4 reports mlx, embedded engines report themselves" {
+    // Loaded entries: the attached engine pointer decides.
+    try testing.expectEqualStrings("ds4", modelEngineName(true, false, "/m/DeepSeek-V4-Flash.gguf", ""));
+    try testing.expectEqualStrings("llama", modelEngineName(false, true, "/m/qwen.gguf", ""));
+    // NATIVE deepseek_v4 (safetensors dir): architecture alone can't
+    // distinguish it from the ds4 GGUF — meta.engine must.
+    try testing.expectEqualStrings("mlx", modelEngineName(false, false, "/m/ddalcu/DeepSeek-V4-Flash-MLX-Serve", "deepseek_v4"));
+    // Unloaded GGUF stubs: engine undetermined until the header is read.
+    try testing.expectEqualStrings("gguf", modelEngineName(false, false, "/m/x.gguf", ""));
+    try testing.expectEqualStrings("gguf", modelEngineName(false, false, "/m/dir", "gguf"));
+    try testing.expectEqualStrings("mlx", modelEngineName(false, false, "/m/gemma-4-12b", "gemma4"));
 }

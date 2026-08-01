@@ -151,6 +151,57 @@ pub const ModelConfig = struct {
     // Slice logits to the first N rows (vocab padding; 0 = full vocab).
     unpadded_vocab_size: u32 = 0,
 
+    // DeepSeek V4 Flash (deepseek_v4). MQA over ONE head_dim-wide latent
+    // (num_key_value_heads == 1): low-rank Q (wq_a → q_norm → wq_b, then an
+    // UNWEIGHTED per-head RMS), grouped low-rank O (o_groups slabs of
+    // o_lora_rank), rope on the last dsv4_rope_head_dim dims with INVERSE
+    // rope on the attention output; per-head attn_sink joins the softmax
+    // denominator only. Every layer slides over the last sliding_window raw
+    // latents; layers with dsv4_compress_ratios[i] != 0 add learned
+    // gated-pooling compression of the history (ratio 4 = overlapping windows
+    // + a top-dsv4_index_topk indexer over its own fp4/Hadamard-simulated
+    // compressed keys; other ratios plain, all compressed slots visible).
+    // YaRN applies ONLY on compressed layers at dsv4_compress_rope_theta
+    // (ratio-0 layers run plain rope_theta, no yarn, and there is NO yarn
+    // mscale anywhere — the reference applies none). The residual stream is
+    // dsv4_hc_mult copies mixed per token by Sinkhorn-normalized
+    // hyper-connections. The first dsv4_hash_layers MoE layers route by
+    // TOKEN ID (gate.tid2eid). Reference: the release's own
+    // inference/{model,kernel}.py; full notes in memory dsv4-port.
+    dsv4_q_lora_rank: u32 = 0, // 0 = not a deepseek_v4 arch
+    dsv4_o_lora_rank: u32 = 0,
+    dsv4_o_groups: u32 = 0,
+    dsv4_rope_head_dim: u32 = 0,
+    dsv4_hash_layers: u32 = 0,
+    dsv4_index_n_heads: u32 = 0,
+    dsv4_index_head_dim: u32 = 0,
+    dsv4_index_topk: u32 = 0,
+    dsv4_hc_mult: u32 = 0,
+    dsv4_hc_sinkhorn_iters: u32 = 0,
+    dsv4_hc_eps: f32 = 1e-6,
+    dsv4_swiglu_limit: f32 = 0.0,
+    dsv4_compress_rope_theta: f32 = 0.0,
+    // Per-layer compression ratio (0 = pure sliding window). Entries beyond
+    // num_hidden_layers describe the MTP module(s).
+    dsv4_compress_ratios: [128]u8 = @splat(0),
+    dsv4_n_compress_ratios: u32 = 0,
+    dsv4_mtp_layers: u32 = 0,
+    // DSpark block-parallel speculative decoding (0731 and later). The draft
+    // stages live under the SAME `mtp.*` namespace as the preview's single
+    // MTP module — `dspark_block_size != 0` is what tells the two apart:
+    // stage 0 projects the concatenated hidden states of
+    // `dspark_target_layer_ids` (main_proj/main_norm, replacing the preview's
+    // e_proj/h_proj) and drafts a whole block of `dspark_block_size` slots
+    // seeded with `dspark_noise_token_id`, the last stage adding a rank-
+    // `dspark_markov_rank` bigram bias plus a confidence head. Parsed here so
+    // the engine can tell a DSpark checkpoint from a preview one BEFORE
+    // touching weights; the draft path itself is not wired yet.
+    dsv4_dspark_block_size: u32 = 0,
+    dsv4_dspark_noise_token_id: u32 = 0,
+    dsv4_dspark_markov_rank: u32 = 0,
+    dsv4_dspark_target_layers: [8]u8 = @splat(0),
+    dsv4_n_dspark_target_layers: u32 = 0,
+
     // BERT encoder-only
     is_encoder_only: bool = false,
     layer_norm_eps: f32 = 1e-12,
@@ -1437,6 +1488,110 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
                 return error.UnsupportedInklingConfig;
             }
         }
+    } else if (std.mem.eql(u8, model_type, "deepseek_v4")) {
+        // DeepSeek V4 Flash (284B-A13B, 1M ctx). See the dsv4_* field block
+        // for the architecture summary; reference is the release's own
+        // inference/{model,kernel}.py (torch). Loaded from OUR converted
+        // mixed-quant mirror (tests/convert_dsv4_weights.py) — bare
+        // inference-style tensor names, stacked expert banks.
+        config.model_type = "deepseek_v4";
+        config.weight_prefix = ""; // release ships bare names (embed.weight, layers.N....)
+        config.norm_has_offset = false;
+        config.scale_embeddings = false;
+        config.has_pre_ff_norm = false;
+        config.has_qk_norm = false; // q-norm is on the lora rank + unweighted per-head RMS, handled in-arch
+        config.hidden_act = .silu;
+        if (cfg_obj.get("n_routed_experts")) |v| { if (v == .integer) config.num_experts = @intCast(v.integer); }
+        if (cfg_obj.get("num_hash_layers")) |v| { if (v == .integer) config.dsv4_hash_layers = @intCast(v.integer); }
+        if (cfg_obj.get("routed_scaling_factor")) |v| config.router_scaling_factor = jsonFloat(v);
+        if (cfg_obj.get("norm_topk_prob")) |v| { if (v == .bool) config.moe_route_norm = v.bool; }
+        if (cfg_obj.get("q_lora_rank")) |v| { if (v == .integer) config.dsv4_q_lora_rank = @intCast(v.integer); }
+        if (cfg_obj.get("o_lora_rank")) |v| { if (v == .integer) config.dsv4_o_lora_rank = @intCast(v.integer); }
+        if (cfg_obj.get("o_groups")) |v| { if (v == .integer) config.dsv4_o_groups = @intCast(v.integer); }
+        if (cfg_obj.get("qk_rope_head_dim")) |v| { if (v == .integer) config.dsv4_rope_head_dim = @intCast(v.integer); }
+        if (cfg_obj.get("index_n_heads")) |v| { if (v == .integer) config.dsv4_index_n_heads = @intCast(v.integer); }
+        if (cfg_obj.get("index_head_dim")) |v| { if (v == .integer) config.dsv4_index_head_dim = @intCast(v.integer); }
+        if (cfg_obj.get("index_topk")) |v| { if (v == .integer) config.dsv4_index_topk = @intCast(v.integer); }
+        if (cfg_obj.get("hc_mult")) |v| { if (v == .integer) config.dsv4_hc_mult = @intCast(v.integer); }
+        if (cfg_obj.get("hc_sinkhorn_iters")) |v| { if (v == .integer) config.dsv4_hc_sinkhorn_iters = @intCast(v.integer); }
+        if (cfg_obj.get("hc_eps")) |v| config.dsv4_hc_eps = jsonFloat(v);
+        if (cfg_obj.get("swiglu_limit")) |v| config.dsv4_swiglu_limit = jsonFloat(v);
+        if (cfg_obj.get("compress_rope_theta")) |v| config.dsv4_compress_rope_theta = jsonFloat(v);
+        if (cfg_obj.get("num_nextn_predict_layers")) |v| { if (v == .integer) config.dsv4_mtp_layers = @intCast(v.integer); }
+        if (cfg_obj.get("dspark_block_size")) |v| { if (v == .integer) config.dsv4_dspark_block_size = @intCast(v.integer); }
+        if (cfg_obj.get("dspark_noise_token_id")) |v| { if (v == .integer) config.dsv4_dspark_noise_token_id = @intCast(v.integer); }
+        if (cfg_obj.get("dspark_markov_rank")) |v| { if (v == .integer) config.dsv4_dspark_markov_rank = @intCast(v.integer); }
+        if (cfg_obj.get("dspark_target_layer_ids")) |v| {
+            if (v == .array) {
+                for (v.array.items, 0..) |item, i| {
+                    if (i >= config.dsv4_dspark_target_layers.len) break;
+                    if (item == .integer) config.dsv4_dspark_target_layers[i] = @intCast(item.integer);
+                }
+                config.dsv4_n_dspark_target_layers = @intCast(@min(v.array.items.len, config.dsv4_dspark_target_layers.len));
+            }
+        }
+        if (cfg_obj.get("compress_ratios")) |v| {
+            if (v == .array) {
+                for (v.array.items, 0..) |item, i| {
+                    if (i >= 128) break;
+                    if (item == .integer) config.dsv4_compress_ratios[i] = @intCast(item.integer);
+                }
+                config.dsv4_n_compress_ratios = @intCast(@min(v.array.items.len, 128));
+            }
+        }
+        // YaRN on compressed layers only; the reference applies NO mscale
+        // (softmax scale stays head_dim^-0.5 everywhere), so
+        // yarn_attention_factor stays 1.0 — do not compute the 0.1·ln(f)+1
+        // default here (laguna-class trap in the other direction).
+        if (cfg_obj.get("rope_scaling")) |rs| {
+            if (rs == .object) {
+                config.rope_yarn = true;
+                if (rs.object.get("factor")) |x| config.yarn_factor = jsonFloat(x);
+                if (rs.object.get("beta_fast")) |x| config.yarn_beta_fast = jsonFloat(x);
+                if (rs.object.get("beta_slow")) |x| config.yarn_beta_slow = jsonFloat(x);
+                if (rs.object.get("original_max_position_embeddings")) |x| {
+                    if (x == .integer) config.yarn_orig_max_pos = @intCast(x.integer);
+                }
+            }
+        }
+        // Honest rejects: the forward implements exactly sqrt(softplus)
+        // scoring with selection-only bias (noaux_tc), ONE always-on shared
+        // expert, and a single shared KV latent. Divergent checkpoints must
+        // refuse to load, not run silently wrong.
+        if (cfg_obj.get("scoring_func")) |v| {
+            if (v == .string and !std.mem.eql(u8, v.string, "sqrtsoftplus")) {
+                log.err("deepseek_v4: scoring_func '{s}' not supported (sqrtsoftplus only)\n", .{v.string});
+                return error.UnsupportedDsv4Config;
+            }
+        }
+        if (cfg_obj.get("topk_method")) |v| {
+            if (v == .string and !std.mem.eql(u8, v.string, "noaux_tc")) {
+                log.err("deepseek_v4: topk_method '{s}' not supported (noaux_tc only)\n", .{v.string});
+                return error.UnsupportedDsv4Config;
+            }
+        }
+        if (cfg_obj.get("n_shared_experts")) |v| {
+            if (v == .integer and v.integer != 1) {
+                log.err("deepseek_v4: n_shared_experts {d} not supported (exactly 1)\n", .{v.integer});
+                return error.UnsupportedDsv4Config;
+            }
+        }
+        if (config.num_key_value_heads != 1) {
+            log.err("deepseek_v4: num_key_value_heads {d} not supported (single shared KV latent)\n", .{config.num_key_value_heads});
+            return error.UnsupportedDsv4Config;
+        }
+        // The July-31 release supersedes the preview, and the preview's
+        // single next-token MTP module is no longer supported — its draft
+        // path (e_proj/h_proj over one stage) shares nothing with DSpark's
+        // block-parallel stages beyond the `mtp.*` namespace, so carrying it
+        // would mean maintaining a second architecture for a checkpoint the
+        // vendor withdrew. A preview config announces itself by declaring MTP
+        // layers with no DSpark descriptor; say so instead of loading a model
+        // whose draft weights we would silently ignore.
+        if (config.dsv4_mtp_layers > 0 and config.dsv4_dspark_block_size == 0) {
+            log.err("deepseek_v4: this is the superseded PREVIEW checkpoint (num_nextn_predict_layers={d}, no dspark_* config). Use DeepSeek-V4-Flash-0731 or later.\n", .{config.dsv4_mtp_layers});
+            return error.UnsupportedDsv4Config;
+        }
     } else if (std.mem.eql(u8, model_type, "qwen3_next")) {
         config.model_type = "qwen3_next";
         config.weight_prefix = "model";
@@ -2643,6 +2798,192 @@ test "ModelConfig parses inkling_mm_model (Thinking Machines Inkling Small REAP2
     const eos = config.eosTokenSlice();
     try testing.expectEqual(@as(usize, 1), eos.len);
     try testing.expectEqual(@as(u32, 200006), eos[0]);
+}
+
+test "ModelConfig parses deepseek_v4 (DeepSeek-V4-Flash-0731 mirror)" {
+    // Shape of our converted mirror's config.json: the deepseek-ai release
+    // config minus quantization_config (fp8 source), plus the converter's
+    // per-weight `quantization` dict. MQA over ONE 512-dim latent, low-rank
+    // Q/grouped-low-rank O, sliding-window 128 + per-layer compression
+    // (ratio 4 overlapping w/ indexer, 128 plain), Sinkhorn hyper-connections,
+    // hash routing on the first 3 layers, sqrt(softplus) scoring — all
+    // identical between the preview and 0731, which differ only by the DSpark
+    // draft module (3 stages ⇒ 46 compress_ratios, + the dspark_* block).
+    const json =
+        \\{
+        \\  "architectures": ["DeepseekV4ForCausalLM"],
+        \\  "model_type": "deepseek_v4",
+        \\  "bos_token_id": 0,
+        \\  "eos_token_id": 1,
+        \\  "head_dim": 512,
+        \\  "hidden_act": "silu",
+        \\  "hidden_size": 4096,
+        \\  "index_head_dim": 128,
+        \\  "index_n_heads": 64,
+        \\  "index_topk": 512,
+        \\  "max_position_embeddings": 1048576,
+        \\  "moe_intermediate_size": 2048,
+        \\  "n_routed_experts": 256,
+        \\  "n_shared_experts": 1,
+        \\  "norm_topk_prob": true,
+        \\  "num_attention_heads": 64,
+        \\  "num_experts_per_tok": 6,
+        \\  "num_hidden_layers": 43,
+        \\  "num_hash_layers": 3,
+        \\  "num_key_value_heads": 1,
+        \\  "num_nextn_predict_layers": 3,
+        \\  "dspark_block_size": 5,
+        \\  "dspark_noise_token_id": 128799,
+        \\  "dspark_target_layer_ids": [40, 41, 42],
+        \\  "dspark_markov_rank": 256,
+        \\  "o_groups": 8,
+        \\  "o_lora_rank": 1024,
+        \\  "q_lora_rank": 1024,
+        \\  "qk_rope_head_dim": 64,
+        \\  "hc_eps": 1e-06,
+        \\  "hc_mult": 4,
+        \\  "hc_sinkhorn_iters": 20,
+        \\  "rms_norm_eps": 1e-06,
+        \\  "rope_scaling": {
+        \\    "beta_fast": 32,
+        \\    "beta_slow": 1,
+        \\    "factor": 16,
+        \\    "original_max_position_embeddings": 65536,
+        \\    "type": "yarn"
+        \\  },
+        \\  "rope_theta": 10000,
+        \\  "routed_scaling_factor": 1.5,
+        \\  "scoring_func": "sqrtsoftplus",
+        \\  "sliding_window": 128,
+        \\  "swiglu_limit": 10.0,
+        \\  "tie_word_embeddings": false,
+        \\  "topk_method": "noaux_tc",
+        \\  "torch_dtype": "bfloat16",
+        \\  "vocab_size": 129280,
+        \\  "compress_rope_theta": 160000,
+        \\  "compress_ratios": [0, 0, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 0, 0, 0],
+        \\  "quantization": {"group_size": 64, "bits": 8, "mode": "affine",
+        \\    "layers.0.ffn.experts.w1": {"group_size": 64, "bits": 2, "mode": "affine"}}
+        \\}
+    ;
+    const config = try parseConfigFromJson(testing.allocator, json);
+    try testing.expectEqualStrings("deepseek_v4", config.model_type);
+    try testing.expectEqualStrings("", config.weight_prefix);
+    try testing.expectEqual(@as(u32, 129280), config.vocab_size);
+    try testing.expectEqual(@as(u32, 4096), config.hidden_size);
+    try testing.expectEqual(@as(u32, 43), config.num_hidden_layers);
+    try testing.expectEqual(@as(u32, 64), config.num_attention_heads);
+    try testing.expectEqual(@as(u32, 1), config.num_key_value_heads);
+    try testing.expectEqual(@as(u32, 512), config.head_dim);
+    try testing.expectEqual(@as(u32, 1048576), config.max_position_embeddings);
+    try testing.expect(config.has_sliding_window);
+    try testing.expectEqual(@as(u32, 128), config.sliding_window);
+    // MoE: 256 experts top-6, shared expert at moe width, sum-normalized
+    // weights × 1.5; hash routing on the first 3 layers.
+    try testing.expectEqual(@as(u32, 256), config.num_experts);
+    try testing.expectEqual(@as(u32, 6), config.num_experts_per_tok);
+    try testing.expectEqual(@as(u32, 2048), config.moe_intermediate_size);
+    try testing.expect(config.moe_route_norm);
+    try testing.expectApproxEqAbs(@as(f32, 1.5), config.router_scaling_factor, 1e-6);
+    try testing.expectEqual(@as(u32, 3), config.dsv4_hash_layers);
+    // Attention geometry.
+    try testing.expectEqual(@as(u32, 1024), config.dsv4_q_lora_rank);
+    try testing.expectEqual(@as(u32, 1024), config.dsv4_o_lora_rank);
+    try testing.expectEqual(@as(u32, 8), config.dsv4_o_groups);
+    try testing.expectEqual(@as(u32, 64), config.dsv4_rope_head_dim);
+    // Indexer + compression.
+    try testing.expectEqual(@as(u32, 64), config.dsv4_index_n_heads);
+    try testing.expectEqual(@as(u32, 128), config.dsv4_index_head_dim);
+    try testing.expectEqual(@as(u32, 512), config.dsv4_index_topk);
+    try testing.expectApproxEqAbs(@as(f32, 160000.0), config.dsv4_compress_rope_theta, 1e-3);
+    try testing.expectEqual(@as(u32, 46), config.dsv4_n_compress_ratios);
+    try testing.expectEqual(@as(u8, 0), config.dsv4_compress_ratios[0]);
+    try testing.expectEqual(@as(u8, 4), config.dsv4_compress_ratios[2]);
+    try testing.expectEqual(@as(u8, 128), config.dsv4_compress_ratios[3]);
+    try testing.expectEqual(@as(u8, 128), config.dsv4_compress_ratios[41]);
+    // Layer 42 IS compressed (ratio 4, with indexer) — only layers 0/1 and
+    // the MTP module run pure sliding-window attention.
+    try testing.expectEqual(@as(u8, 4), config.dsv4_compress_ratios[42]);
+    // The three trailing entries are DSpark's draft stages: pure sliding
+    // window, like layers 0/1.
+    try testing.expectEqual(@as(u8, 0), config.dsv4_compress_ratios[43]);
+    try testing.expectEqual(@as(u8, 0), config.dsv4_compress_ratios[45]);
+    // DSpark descriptor — what tells a 0731 checkpoint from the preview.
+    try testing.expectEqual(@as(u32, 5), config.dsv4_dspark_block_size);
+    try testing.expectEqual(@as(u32, 128799), config.dsv4_dspark_noise_token_id);
+    try testing.expectEqual(@as(u32, 256), config.dsv4_dspark_markov_rank);
+    try testing.expectEqual(@as(u32, 3), config.dsv4_n_dspark_target_layers);
+    try testing.expectEqual(@as(u8, 40), config.dsv4_dspark_target_layers[0]);
+    try testing.expectEqual(@as(u8, 42), config.dsv4_dspark_target_layers[2]);
+    // Hyper-connections + clipped SwiGLU.
+    try testing.expectEqual(@as(u32, 4), config.dsv4_hc_mult);
+    try testing.expectEqual(@as(u32, 20), config.dsv4_hc_sinkhorn_iters);
+    try testing.expectApproxEqAbs(@as(f32, 1e-6), config.dsv4_hc_eps, 1e-9);
+    try testing.expectApproxEqAbs(@as(f32, 10.0), config.dsv4_swiglu_limit, 1e-6);
+    // YaRN applies only on compressed layers (at compress_rope_theta);
+    // ratio-0 layers run plain rope_theta. The forward picks per layer.
+    try testing.expect(config.rope_yarn);
+    try testing.expectApproxEqAbs(@as(f32, 16.0), config.yarn_factor, 1e-6);
+    try testing.expectEqual(@as(u32, 65536), config.yarn_orig_max_pos);
+    try testing.expectApproxEqAbs(@as(f32, 10000.0), config.rope_theta, 1e-3);
+    // In-checkpoint draft stages (mtp.0/1/2.*, all ratio 0).
+    try testing.expectEqual(@as(u32, 3), config.dsv4_mtp_layers);
+    try testing.expectEqual(HiddenAct.silu, config.hidden_act);
+    try testing.expectEqual(@as(u32, 8), config.quant_bits);
+    try testing.expectEqual(@as(u32, 64), config.quant_group_size);
+    const eos = config.eosTokenSlice();
+    try testing.expectEqual(@as(usize, 1), eos.len);
+    try testing.expectEqual(@as(u32, 1), eos[0]);
+}
+
+test "ModelConfig deepseek_v4: the superseded PREVIEW checkpoint is rejected" {
+    // The preview's single next-token MTP module shares nothing with DSpark's
+    // block-parallel stages beyond the `mtp.*` namespace, and the vendor
+    // withdrew it — supporting both would mean two draft architectures. A
+    // preview config is exactly "declares MTP layers, carries no dspark_*
+    // descriptor"; loading it would silently ignore its draft weights, so it
+    // has to fail at parse with a message naming the fix.
+    const allocator = testing.allocator;
+    const json =
+        \\{
+        \\  "model_type": "deepseek_v4", "num_hidden_layers": 43, "hidden_size": 4096,
+        \\  "num_attention_heads": 64, "num_key_value_heads": 1, "head_dim": 512,
+        \\  "qk_rope_head_dim": 64, "q_lora_rank": 1024, "o_lora_rank": 1024, "o_groups": 8,
+        \\  "sliding_window": 128, "index_n_heads": 64, "index_head_dim": 128, "index_topk": 512,
+        \\  "n_routed_experts": 256, "num_experts_per_tok": 6, "moe_intermediate_size": 2048,
+        \\  "n_shared_experts": 1, "num_hash_layers": 3, "routed_scaling_factor": 1.5,
+        \\  "scoring_func": "sqrtsoftplus", "topk_method": "noaux_tc", "norm_topk_prob": true,
+        \\  "hc_mult": 4, "hc_sinkhorn_iters": 20, "hc_eps": 1e-6, "swiglu_limit": 10.0,
+        \\  "rms_norm_eps": 1e-6, "vocab_size": 129280, "max_position_embeddings": 1048576,
+        \\  "rope_theta": 10000.0, "compress_rope_theta": 160000.0,
+        \\  "num_nextn_predict_layers": 1,
+        \\  "compress_ratios": [0, 0, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 0],
+        \\  "bos_token_id": 0, "eos_token_id": 1
+        \\}
+    ;
+    try testing.expectError(error.UnsupportedDsv4Config, parseConfigFromJson(allocator, json));
+}
+
+test "ModelConfig deepseek_v4 rejects unsupported scoring/shared-expert shapes" {
+    // The forward implements exactly sqrt(softplus) scoring with
+    // selection-only bias and ONE always-on shared expert. A checkpoint that
+    // diverges must refuse to load, not run silently wrong.
+    const bad_scoring =
+        \\{"model_type": "deepseek_v4", "hidden_size": 4096, "num_hidden_layers": 43,
+        \\ "num_attention_heads": 64, "num_key_value_heads": 1, "head_dim": 512,
+        \\ "vocab_size": 129280, "n_routed_experts": 256, "num_experts_per_tok": 6,
+        \\ "n_shared_experts": 1, "moe_intermediate_size": 2048,
+        \\ "scoring_func": "softmax", "topk_method": "noaux_tc"}
+    ;
+    try testing.expectError(error.UnsupportedDsv4Config, parseConfigFromJson(testing.allocator, bad_scoring));
+    const bad_shared =
+        \\{"model_type": "deepseek_v4", "hidden_size": 4096, "num_hidden_layers": 43,
+        \\ "num_attention_heads": 64, "num_key_value_heads": 1, "head_dim": 512,
+        \\ "vocab_size": 129280, "n_routed_experts": 256, "num_experts_per_tok": 6,
+        \\ "n_shared_experts": 2, "moe_intermediate_size": 2048,
+        \\ "scoring_func": "sqrtsoftplus", "topk_method": "noaux_tc"}
+    ;
+    try testing.expectError(error.UnsupportedDsv4Config, parseConfigFromJson(testing.allocator, bad_shared));
 }
 
 test "ModelConfig inkling_mm_model rejects a sliding-attention geometry that differs from global" {

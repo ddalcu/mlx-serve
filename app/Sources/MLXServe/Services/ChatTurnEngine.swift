@@ -1044,6 +1044,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                     repetition: repetition, iteration: iteration,
                     agentMemory: appState.agentMemory,
                     mcpRouter: mcpManager,
+                    mcpEnabled: config.mcpMode,
                     documentIndex: config.documentIndex,
                     createTask: { [weak self] goal, schedule in
                         await self?.createTaskFromAgent(

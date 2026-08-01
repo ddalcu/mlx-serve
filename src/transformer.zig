@@ -1,4 +1,5 @@
 const std = @import("std");
+const dsv4_mod = @import("deepseek_v4.zig");
 const mlx = @import("mlx.zig");
 const mrope = @import("mrope.zig");
 const kv_quant = @import("kv_quant.zig");
@@ -4461,6 +4462,12 @@ pub const Transformer = struct {
     // by directly.
     yarn_mscale_cast: DtypeCastCache = .{},
 
+    // DeepSeek-V4-Flash (deepseek_v4): whole arch lives in its own module
+    // (src/deepseek_v4.zig — new attention family + Sinkhorn hyper-connections;
+    // diffusion.zig precedent). Non-null ⇒ every standard field below is empty
+    // and the forward dispatches to the module. v0 decode = full re-forward.
+    dsv4: ?*dsv4_mod.Dsv4Model = null,
+
     // BERT encoder-only (null for decoder models)
     bert_layers: ?[]BertLayerWeights,
     bert_pos_w: mlx.mlx_array,
@@ -4552,10 +4559,7 @@ pub const Transformer = struct {
         // decoder archs (EmbeddingGemma) load through the standard arm and
         // dispatch to forwardGemma3EncoderWith.
         if (config.is_encoder_only and !config.use_bidirectional_attention) return initBert(io, allocator, config, weights, &name_buf, s);
-        if (std.mem.eql(u8, config.model_type, "deepseek_v4")) {
-            log.err("MLX-format deepseek_v4 is not supported — load the GGUF checkpoint via the ds4 engine instead\n", .{});
-            return error.UnsupportedModelType;
-        }
+        if (std.mem.eql(u8, config.model_type, "deepseek_v4")) return initDsv4(allocator, config, weights, s);
 
         // Embeddings: Nemotron-H uses "backbone.embeddings", Inkling
         // "model.llm.embed", others "{prefix}.embed_tokens"
@@ -5654,6 +5658,11 @@ pub const Transformer = struct {
     }
 
     pub fn deinit(self: *Transformer) void {
+        if (self.dsv4) |mdl| {
+            mdl.deinit();
+            self.allocator.destroy(mdl);
+            self.dsv4 = null;
+        }
         if (self.compiled_forward) |cf| _ = mlx.mlx_closure_free(cf);
         if (self.compiled_gelu) |cg| _ = mlx.mlx_closure_free(cg);
         if (self.compiled_geglu) |cg| _ = mlx.mlx_closure_free(cg);
@@ -6915,6 +6924,7 @@ pub const Transformer = struct {
     }
 
     pub fn forwardWith(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_array) !mlx.mlx_array {
+        if (self.dsv4) |mdl| return forwardDsv4WithImpl(self, ctx, token_ids, mdl);
         if (self.bert_layers != null) return self.forwardBertWith(ctx, token_ids);
         // Bidirectional embedding models (EmbeddingGemma) load standard gemma3
         // weights but never run causal decode.
@@ -16770,6 +16780,110 @@ fn initBert(io: std.Io, allocator: std.mem.Allocator, config: ModelConfig, weigh
     };
 }
 
+/// DeepSeek-V4-Flash v0 forward: full re-forward over the request's whole
+/// token history each call (correctness mode — the module's incremental
+/// decode replaces this behind the same seam). SERIAL-ONLY: history lives on
+/// the model; a fresh request is detected by cache.step == 0. Returns
+/// last-position logits [1, V] f32 and advances cache.step like the standard
+/// forwards do.
+fn forwardDsv4WithImpl(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_array, mdl: *dsv4_mod.Dsv4Model) !mlx.mlx_array {
+    const n = mlx.mlx_array_size(token_ids);
+    var ids32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ids32);
+    try mlx.check(mlx.mlx_astype(&ids32, token_ids, .int32, self.s));
+    try mlx.check(mlx.mlx_array_eval(ids32));
+    const data = mlx.mlx_array_data_int32(ids32) orelse return error.NoData;
+    var logits_host: []f32 = undefined;
+    if (ctx.cache.step == 0) {
+        // fresh request: rebuild the incremental state and prefill into it
+        if (mdl.dec_state) |*ds| dsv4_mod.deinitDecodeState(ds);
+        mdl.dec_state = try dsv4_mod.initDecodeState(mdl, self.allocator);
+        const ids = try self.allocator.alloc(u32, n);
+        defer self.allocator.free(ids);
+        for (ids, data[0..n]) |*o, id| o.* = @intCast(id);
+        logits_host = try dsv4_mod.prefillIntoState(mdl, self.allocator, &mdl.dec_state.?, ids);
+    } else if (n == 1) {
+        // decode: one incremental step — decode==prefill equivalence is
+        // pinned by the DSV4_MINI test.
+        logits_host = try dsv4_mod.decodeStep(mdl, self.allocator, &mdl.dec_state.?, @intCast(data[0]));
+    } else {
+        // later prefill chunk: batched state extension (same path as the
+        // fresh prefill — extendState is base-position aware).
+        const ids = try self.allocator.alloc(u32, n);
+        defer self.allocator.free(ids);
+        for (ids, data[0..n]) |*o, id| o.* = @intCast(id);
+        logits_host = try dsv4_mod.extendState(mdl, self.allocator, &mdl.dec_state.?, ids);
+    }
+    defer self.allocator.free(logits_host);
+    ctx.cache.step += n;
+    // Callers slice the last position out of rank-3 [B, L, V] logits.
+    const shape = [_]c_int{ 1, 1, @intCast(logits_host.len) };
+    return mlx.mlx_array_new_data(logits_host.ptr, &shape, 3, .float32);
+}
+
+/// DeepSeek-V4-Flash: build the module-owned model and hand back a Transformer
+/// shell whose standard fields are all empty (the BERT pattern). The forward
+/// dispatches on `.dsv4 != null`.
+fn initDsv4(allocator: std.mem.Allocator, config: ModelConfig, weights: *const Weights, s: mlx.mlx_stream) !Transformer {
+    const dw = try dsv4_mod.loadDsv4Weights(allocator, &config, weights);
+    const mdl = try allocator.create(dsv4_mod.Dsv4Model);
+    errdefer allocator.destroy(mdl);
+    mdl.* = try dsv4_mod.initModel(allocator, &config, dw, s);
+    const cache = try KVCache.init(allocator, 0);
+    return .{
+        .config = config,
+        .cache = cache,
+        .s = s,
+        .allocator = allocator,
+        .dsv4 = mdl,
+        .emb_w = mlx.mlx_array_new(),
+        .emb_s = mlx.mlx_array_new(),
+        .emb_b = mlx.mlx_array_new(),
+        .emb_scale = null,
+        .final_norm = mlx.mlx_array_new(),
+        .lm_head_w = mlx.mlx_array_new(),
+        .lm_head_s = mlx.mlx_array_new(),
+        .lm_head_b = mlx.mlx_array_new(),
+        .layers = &.{},
+        .owns_lm_head = false,
+        .owns_norms = false,
+        .gelu_coeff = bf16Scalar(0.7978845608028654, s),
+        .gelu_inner = bf16Scalar(0.044715, s),
+        .half = bf16Scalar(0.5, s),
+        .one = bf16Scalar(1.0, s),
+        .rms_eps_arr = mlx.mlx_array_new_float(config.rms_norm_eps),
+        .three = bf16Scalar(3.0, s),
+        .neg_one = null,
+        .ple_emb_w = mlx.mlx_array_new(),
+        .ple_emb_s = mlx.mlx_array_new(),
+        .ple_emb_b = mlx.mlx_array_new(),
+        .ple_proj_w = mlx.mlx_array_new(),
+        .ple_proj_s = mlx.mlx_array_new(),
+        .ple_proj_b = mlx.mlx_array_new(),
+        .ple_proj_norm = mlx.mlx_array_new(),
+        .ple_proj_quantized = false,
+        .softcap_scalar = null,
+        .v_norm_weight = null,
+        .v_norm_weight_global = null,
+        .rope_freqs_global = null,
+        .bert_layers = null,
+        .bert_pos_w = mlx.mlx_array_new(),
+        .bert_pos_s = mlx.mlx_array_new(),
+        .bert_pos_b = mlx.mlx_array_new(),
+        .bert_toktype_w = mlx.mlx_array_new(),
+        .bert_toktype_s = mlx.mlx_array_new(),
+        .bert_toktype_b = mlx.mlx_array_new(),
+        .bert_emb_norm_w = mlx.mlx_array_new(),
+        .bert_emb_norm_b = mlx.mlx_array_new(),
+        .moe_layers = null,
+        .ssm_entries = null,
+        .moe_seq_offset = 0,
+        .hybrid_layers = null,
+        .embedding_norm = null,
+        .prompt_cache = null,
+    };
+}
+
 fn addOne(arr: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
     const one = bf16Scalar(1.0, s);
     defer _ = mlx.mlx_array_free(one);
@@ -18583,7 +18697,10 @@ test "fused residual+RMSNorm declines what it cannot reproduce" {
     const s = mlx.gpuStream();
     add_rmsnorm_override = true;
     defer add_rmsnorm_override = null;
-    var buf: [16]f32 = @splat(0.25);
+    // mlx_array_new_data COPIES shape-worth of bytes — the buffer must really
+    // hold 8192 floats (a 16-float buffer here "passed" by overreading the
+    // stack until a layout shift put the guard page in range).
+    var buf: [8192]f32 = @splat(0.25);
     // Above RMS_LOOPED_LIMIT mlx switches to a different kernel with a
     // different reduction shape.
     const big = [_]c_int{ 1, 8192 };

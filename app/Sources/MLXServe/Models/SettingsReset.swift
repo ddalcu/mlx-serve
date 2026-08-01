@@ -72,6 +72,7 @@ enum SettingsReset {
                 f("enableMTP") { $0.enableMTP = $1.enableMTP },
                 f("mtpDepth") { $0.mtpDepth = $1.mtpDepth },
                 f("forceMTPOnMoE") { $0.forceMTPOnMoE = $1.forceMTPOnMoE },
+                f("enableDSpark") { $0.enableDSpark = $1.enableDSpark },
             ]
 
         // One section, so one reset: the universal knob and the MLX-only ones.

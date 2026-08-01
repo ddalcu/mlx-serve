@@ -1221,6 +1221,19 @@ private struct SpecDecodeSectionContent: View {
                     .disabled(!appState.serverOptions.enableMTP)
             }
         }
+        // DSpark is DeepSeek-V4's own draft — independent of the Qwen MTP
+        // toggles above, so it is never disabled by them.
+        if let m = meta["enableDSpark"] {
+            SettingsRow(
+                title: m.title,
+                explainer: m.explainer,
+                isDirty: dirty.dirty(\.enableDSpark)
+            ) {
+                Toggle("", isOn: opts.enableDSpark)
+                    .labelsHidden()
+                    .toggleStyle(.switch)
+            }
+        }
     }
 }
 

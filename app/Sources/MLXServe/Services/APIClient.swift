@@ -145,6 +145,7 @@ class APIClient {
             contextLength: meta["context_length"] as? Int ?? 0,
             modelMaxTokens: meta["model_max_tokens"] as? Int ?? 0,
             architecture: meta["architecture"] as? String ?? "",
+            engineName: meta["engine"] as? String ?? "",
             isMoE: meta["is_moe"] as? Bool ?? false,
             supportsAudio: supportsAudio,
             supportsVision: supportsVision,

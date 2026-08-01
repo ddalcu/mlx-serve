@@ -29,6 +29,7 @@ pub const VERSION: []const u8 = build_options.version;
 // by the `--version` report, which runs before any engine init.
 extern "c" fn ggml_version() [*:0]const u8;
 extern "c" fn ggml_commit() [*:0]const u8;
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 
 // GGUF file-format version — the compiled `GGUF_VERSION` in
 // lib/llama/include/gguf.h. Keep in sync if a llama.cpp bump changes it.
@@ -129,6 +130,9 @@ fn printUsage(io: std.Io) void {
         \\                        a MoE checkpoint that ships a sidecar is
         \\                        otherwise reachable only via `enable_mtp:true`
         \\                        in the request body.
+        \\  --dspark            Enable DeepSeek-V4 DSpark draft stages (OFF by
+        \\                        default: the stages cost ~11 GB resident; the
+        \\                        memory fit-gate still applies at load).
         \\  --decode-attn-quant / --no-decode-attn-quant
         \\                      Serve decode from quantized side copies of
         \\                      DENSE (bf16/f16) attention projection weights:
@@ -542,6 +546,11 @@ pub fn main(init: std.process.Init) !void {
             enable_mtp = false;
         } else if (std.mem.eql(u8, args[i], "--mtp")) {
             force_mtp = true;
+        } else if (std.mem.eql(u8, args[i], "--dspark")) {
+            // DSpark (DeepSeek-V4 draft stages) is OPT-IN: the stages cost
+            // ~11 GB resident, so the default leaves them lazy and serves
+            // serial. deepseek_v4.initModel reads the env at model load.
+            _ = setenv("MLX_SERVE_DSV4_DSPARK", "1", 1);
         } else if (std.mem.eql(u8, args[i], "--decode-attn-quant")) {
             transformer_mod.decode_attn_quant_flag = true;
         } else if (std.mem.eql(u8, args[i], "--no-decode-attn-quant")) {
@@ -1237,7 +1246,7 @@ pub fn main(init: std.process.Init) !void {
             .{ .role = "user", .content = user_prompt },
         };
 
-        const prompt_ids = try chat_mod.formatChat(allocator, tok, &messages, chat_config, null, null, false);
+        const prompt_ids = try chat_mod.formatChat(allocator, tok, &messages, chat_config, null, null, false, null);
         defer allocator.free(prompt_ids);
 
         // Reset peak memory before generation
