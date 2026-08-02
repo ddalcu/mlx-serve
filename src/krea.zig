@@ -1304,6 +1304,8 @@ pub fn attachLora(dit: *Dit, stack_arg: *const lora_mod.Stack) u32 {
     var matched: u32 = 0;
     var kbuf: [128]u8 = undefined;
     var rbuf: [lora_mod.MAX_LORAS]lora_mod.Ref = undefined;
+    
+    // Main 28 blocks
     for (dit.blocks, 0..) |*b, i| {
         const mods = .{
             .{ "attn.wq", &b.attn.wq },   .{ "attn.wk", &b.attn.wk },
@@ -1321,13 +1323,92 @@ pub fn attachLora(dit: *Dit, stack_arg: *const lora_mod.Stack) u32 {
             }
         }
     }
+    
+    // Text fusion: layerwise blocks (2 layers)
+    for (&dit.layerwise, 0..) |*lb, i| {
+        const mods = .{
+            .{ "attn.wq", &lb.attn.wq }, .{ "attn.wk", &lb.attn.wk },
+            .{ "attn.wv", &lb.attn.wv }, .{ "attn.gate", &lb.attn.gate },
+            .{ "attn.wo", &lb.attn.wo },
+            .{ "mlp.gate", &lb.mlp.gate }, .{ "mlp.up", &lb.mlp.up },
+            .{ "mlp.down", &lb.mlp.down },
+        };
+        inline for (mods) |m| {
+            const key = std.fmt.bufPrint(&kbuf, "txtfusion.layerwise_blocks.{d}.{s}", .{ i, m[0] }) catch "";
+            const refs = stack_arg.findAll(key, &rbuf);
+            if (refs.len > 0) {
+                m[1].setLoraRefs(refs);
+                matched += @intCast(refs.len);
+            }
+        }
+    }
+    
+    // Text fusion: refiner blocks (2 layers)
+    for (&dit.refiner, 0..) |*rb, i| {
+        const mods = .{
+            .{ "attn.wq", &rb.attn.wq }, .{ "attn.wk", &rb.attn.wk },
+            .{ "attn.wv", &rb.attn.wv }, .{ "attn.gate", &rb.attn.gate },
+            .{ "attn.wo", &rb.attn.wo },
+            .{ "mlp.gate", &rb.mlp.gate }, .{ "mlp.up", &rb.mlp.up },
+            .{ "mlp.down", &rb.mlp.down },
+        };
+        inline for (mods) |m| {
+            const key = std.fmt.bufPrint(&kbuf, "txtfusion.refiner_blocks.{d}.{s}", .{ i, m[0] }) catch "";
+            const refs = stack_arg.findAll(key, &rbuf);
+            if (refs.len > 0) {
+                m[1].setLoraRefs(refs);
+                matched += @intCast(refs.len);
+            }
+        }
+    }
+    
+    // Projector (text fusion)
+    {
+        const key = "txtfusion.projector";
+        const refs = stack_arg.findAll(key, &rbuf);
+        if (refs.len > 0) {
+            dit.projector.setLoraRefs(refs);
+            matched += @intCast(refs.len);
+        }
+    }
+    
+    // Other DiT linears
+    {
+        const others = .{
+            .{ "first", &dit.first },
+            .{ "tmlp.0", &dit.tmlp0 },
+            .{ "tmlp.2", &dit.tmlp2 },
+            .{ "tproj.1", &dit.tproj1 },
+            .{ "txtmlp.1", &dit.txtmlp1 },
+            .{ "txtmlp.3", &dit.txtmlp3 },
+            .{ "last.linear", &dit.last_lin },
+        };
+        inline for (others) |o| {
+            const refs = stack_arg.findAll(o[0], &rbuf);
+            if (refs.len > 0) {
+                o[1].setLoraRefs(refs);
+                matched += @intCast(refs.len);
+            }
+        }
+    }
+    
     return matched;
 }
 
 pub fn detachLora(dit: *Dit) void {
+    // Main blocks
     for (dit.blocks) |*b| {
         inline for (.{ &b.attn.wq, &b.attn.wk, &b.attn.wv, &b.attn.gate, &b.attn.wo, &b.mlp.gate, &b.mlp.up, &b.mlp.down }) |ml| ml.clearLoraRefs();
     }
+    // Text fusion blocks
+    for (&dit.layerwise) |*lb| {
+        inline for (.{ &lb.attn.wq, &lb.attn.wk, &lb.attn.wv, &lb.attn.gate, &lb.attn.wo, &lb.mlp.gate, &lb.mlp.up, &lb.mlp.down }) |ml| ml.clearLoraRefs();
+    }
+    for (&dit.refiner) |*rb| {
+        inline for (.{ &rb.attn.wq, &rb.attn.wk, &rb.attn.wv, &rb.attn.gate, &rb.attn.wo, &rb.mlp.gate, &rb.mlp.up, &rb.mlp.down }) |ml| ml.clearLoraRefs();
+    }
+    // Other linears
+    inline for (.{ &dit.projector, &dit.first, &dit.tmlp0, &dit.tmlp2, &dit.tproj1, &dit.txtmlp1, &dit.txtmlp3, &dit.last_lin }) |ml| ml.clearLoraRefs();
 }
 
 // ════════════════════════════════════════════════════════════════════════

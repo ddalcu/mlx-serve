@@ -517,7 +517,12 @@ pub const ImageEngine = struct {
         for (paths, scales) |p, sc| {
             const dup_p = try self.allocator.dupe(u8, p);
             errdefer self.allocator.free(dup_p);
-            const lf = try lora_mod.loadFile(self.allocator, p);
+            const arch: lora_mod.Arch = switch (self.backend) {
+                .flux => .flux2,
+                .krea => .krea2,
+                .mage_flow => .generic,
+            };
+            const lf = try lora_mod.loadFile(self.allocator, p, arch);            
             stack.files[stack.count] = lf;
             stack.paths[stack.count] = dup_p;
             stack.scales[stack.count] = sc;
@@ -990,7 +995,7 @@ pub const VideoEngine = struct {
         for (paths, scales) |p, sc| {
             const dup_p = try self.allocator.dupe(u8, p);
             errdefer self.allocator.free(dup_p);
-            const lf = try lora_mod.loadFile(self.allocator, p);
+            const lf = try lora_mod.loadFile(self.allocator, p, .flux2);
             stack.files[stack.count] = lf;
             stack.paths[stack.count] = dup_p;
             stack.scales[stack.count] = sc;
