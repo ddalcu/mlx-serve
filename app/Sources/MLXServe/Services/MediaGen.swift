@@ -896,11 +896,10 @@ struct ImageGenRequest {
     /// the user typed them — comma/space separated, `condWeightCount` values
     /// (12 for Krea, 3 for FLUX). Empty = off.
     var condWeightsText: String = ""
-    /// Style LoRA (Advanced): absolute path to a .safetensors adapter applied
-    /// to the DiT at runtime. nil = none.
-    var loraPath: String? = nil
-    /// LoRA strength multiplier (on top of the file's own alpha/rank scale).
-    var loraScale: Double = 1.0
+    /// Style LoRAs (Advanced): stacked `.safetensors` adapters applied to the
+    /// DiT at runtime (sent as `lora_paths`/`lora_scales` — mirrors mflux).
+    /// Empty = none. Rows with an empty `path` are dropped before sending.
+    var loras: [LoraAdapter] = []
 }
 
 extension ImageModelPreset {
@@ -1035,11 +1034,10 @@ struct VideoGenRequest {
     /// (`<model>@<peer>`). The gen service then skips local resolve/load/
     /// unload — the hosting Mac loads on demand and manages its own memory.
     var lanModelId: String? = nil
-    /// Style LoRA (Advanced): absolute path to a .safetensors adapter applied
-    /// to the DiT at runtime. nil = none.
-    var loraPath: String? = nil
-    /// LoRA strength multiplier (on top of the file's own alpha/rank scale).
-    var loraScale: Double = 1.0
+    /// Style LoRAs (Advanced): stacked `.safetensors` adapters applied to the
+    /// DiT at runtime (sent as `lora_paths`/`lora_scales` — mirrors mflux).
+    /// Empty = none. Rows with an empty `path` are dropped before sending.
+    var loras: [LoraAdapter] = []
 }
 
 struct AudioGenRequest {

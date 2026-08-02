@@ -417,11 +417,9 @@ pub const ImageGenOpts = struct {
 pub const ImageEngine = struct {
     allocator: std.mem.Allocator,
     backend: ImageBackend,
-    // Runtime LoRA state: the File owns the adapter arrays the attached Refs
-    // point at, so it must live until the next detach (clearLora).
-    lora_file: ?lora_mod.File = null,
-    lora_path: ?[]u8 = null,
-    lora_scale: f32 = 1.0,
+    // Runtime LoRA state: the Stack owns the adapter arrays the attached
+    // Refs point at, so it must live until the next detach (clearLora).
+    lora_stack: ?lora_mod.Stack = null,
     lora_matched: u32 = 0,
 
     pub fn load(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !*ImageEngine {
@@ -498,33 +496,45 @@ pub const ImageEngine = struct {
         return self.backend == .mage_flow;
     }
 
-    /// Reconcile the engine's attached LoRA with the request: `path == null`
-    /// detaches; a new path (or scale) loads + attaches; the same path+scale is
-    /// a no-op reuse. Returns the number of matched DiT modules.
-    pub fn setLora(self: *ImageEngine, path: ?[]const u8, scale: f32) !u32 {
-        if (path) |p| {
-            if (self.lora_path) |cur| {
-                if (std.mem.eql(u8, cur, p) and scale == self.lora_scale) return self.lora_matched;
-            }
+    /// Reconcile the engine's attached LoRA stack with the request: an empty
+    /// `paths` detaches; the same paths+scales (same order) is a no-op
+    /// reuse; anything else clears and re-attaches every adapter. Mirrors
+    /// mflux's `lora_paths`/`lora_scales`: adapters are summed at forward
+    /// time (`lora.deltaSum`), not merged into the base weight. Returns the
+    /// total number of (module, adapter) attachments across the stack.
+    pub fn setLoras(self: *ImageEngine, paths: []const []const u8, scales: []const f32) !u32 {
+        if (paths.len == 0) {
             self.clearLora();
-            var lf = try lora_mod.loadFile(self.allocator, p);
-            const matched = switch (self.backend) {
-                .flux => |*f| flux.attachLora(&f.dit, &lf, scale),
-                .krea => |k| krea.attachLora(&k.dit, &lf, scale),
-                .mage_flow => 0, // MageFlow does not support LoRA (matches mflux)
-            };
-            if (matched == 0) {
-                lf.deinit();
-                return error.LoraNoMatch;
-            }
-            self.lora_file = lf;
-            self.lora_path = try self.allocator.dupe(u8, p);
-            self.lora_scale = scale;
-            self.lora_matched = matched;
-            return matched;
+            return 0;
+        }
+        if (paths.len > lora_mod.MAX_LORAS) return error.TooManyLoras;
+        if (self.lora_stack) |*st| {
+            if (st.matches(paths, scales)) return self.lora_matched;
         }
         self.clearLora();
-        return 0;
+        var stack: lora_mod.Stack = .{ .allocator = self.allocator };
+        errdefer stack.deinit();
+        for (paths, scales) |p, sc| {
+            const dup_p = try self.allocator.dupe(u8, p);
+            errdefer self.allocator.free(dup_p);
+            const lf = try lora_mod.loadFile(self.allocator, p);
+            stack.files[stack.count] = lf;
+            stack.paths[stack.count] = dup_p;
+            stack.scales[stack.count] = sc;
+            stack.count += 1;
+        }
+        const matched = switch (self.backend) {
+            .flux => |*f| flux.attachLora(&f.dit, &stack),
+            .krea => |k| krea.attachLora(&k.dit, &stack),
+            .mage_flow => 0, // MageFlow does not support LoRA (matches mflux)
+        };
+        if (matched == 0) {
+            stack.deinit();
+            return error.LoraNoMatch;
+        }
+        self.lora_stack = stack;
+        self.lora_matched = matched;
+        return matched;
     }
 
     fn clearLora(self: *ImageEngine) void {
@@ -533,10 +543,8 @@ pub const ImageEngine = struct {
             .krea => |k| krea.detachLora(&k.dit),
             .mage_flow => {}, // no LoRA attached
         }
-        if (self.lora_file) |*lf| lf.deinit();
-        self.lora_file = null;
-        if (self.lora_path) |p| self.allocator.free(p);
-        self.lora_path = null;
+        if (self.lora_stack) |*st| st.deinit();
+        self.lora_stack = null;
         self.lora_matched = 0;
     }
 
@@ -879,12 +887,10 @@ pub const VideoEngine = struct {
     tok: tok_mod.Tokenizer,
     gemma_dir: []u8,
     model_dir: []u8,
-    // Runtime LoRA state (mirrors ImageEngine): the File owns the adapter
+    // Runtime LoRA state (mirrors ImageEngine): the Stack owns the adapter
     // arrays the transformer Component's `lora` pointer reads through, so it
     // must live until the next detach (clearLora).
-    lora_file: ?lora_mod.File = null,
-    lora_path: ?[]u8 = null,
-    lora_scale: f32 = 1.0,
+    lora_stack: ?lora_mod.Stack = null,
     lora_matched: u32 = 0,
 
     pub fn load(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !*VideoEngine {
@@ -895,9 +901,7 @@ pub const VideoEngine = struct {
         self.audio = null;
         self.vae_encoder = null;
         self.upsampler = null;
-        self.lora_file = null;
-        self.lora_path = null;
-        self.lora_scale = 1.0;
+        self.lora_stack = null;
         self.lora_matched = 0;
 
         self.gemma_dir = try resolveGemmaDir(io, allocator);
@@ -966,45 +970,52 @@ pub const VideoEngine = struct {
         self.applyLora();
     }
 
-    /// Reconcile the attached LoRA with the request (mirrors ImageEngine):
-    /// `path == null` detaches; the same path+scale is a no-op reuse; a new
-    /// path/scale loads + installs on the transformer Component. Returns the
-    /// number of adapter modules present in the DiT.
-    pub fn setLora(self: *VideoEngine, path: ?[]const u8, scale: f32) !u32 {
-        if (path) |p| {
-            if (self.lora_path) |cur| {
-                if (std.mem.eql(u8, cur, p) and scale == self.lora_scale) return self.lora_matched;
-            }
+    /// Reconcile the attached LoRA stack with the request (mirrors
+    /// `ImageEngine.setLoras`): empty `paths` detaches; the same
+    /// paths+scales is a no-op reuse; anything else loads + installs every
+    /// adapter on the transformer Component. Returns the total number of
+    /// (module, adapter) attachments present in the DiT.
+    pub fn setLoras(self: *VideoEngine, paths: []const []const u8, scales: []const f32) !u32 {
+        if (paths.len == 0) {
             self.clearLora();
-            var lf = try lora_mod.loadFile(self.allocator, p);
-            const matched = ltx.countLoraMatches(&self.transformer, &lf);
-            if (matched == 0) {
-                lf.deinit();
-                return error.LoraNoMatch;
-            }
-            self.lora_file = lf;
-            self.lora_path = try self.allocator.dupe(u8, p);
-            self.lora_scale = scale;
-            self.lora_matched = matched;
-            self.applyLora();
-            return matched;
+            return 0;
+        }
+        if (paths.len > lora_mod.MAX_LORAS) return error.TooManyLoras;
+        if (self.lora_stack) |*st| {
+            if (st.matches(paths, scales)) return self.lora_matched;
         }
         self.clearLora();
-        return 0;
+        var stack: lora_mod.Stack = .{ .allocator = self.allocator };
+        errdefer stack.deinit();
+        for (paths, scales) |p, sc| {
+            const dup_p = try self.allocator.dupe(u8, p);
+            errdefer self.allocator.free(dup_p);
+            const lf = try lora_mod.loadFile(self.allocator, p);
+            stack.files[stack.count] = lf;
+            stack.paths[stack.count] = dup_p;
+            stack.scales[stack.count] = sc;
+            stack.count += 1;
+        }
+        const matched = ltx.countLoraMatches(&self.transformer, &stack);
+        if (matched == 0) {
+            stack.deinit();
+            return error.LoraNoMatch;
+        }
+        self.lora_stack = stack;
+        self.lora_matched = matched;
+        self.applyLora();
+        return matched;
     }
 
     fn clearLora(self: *VideoEngine) void {
         self.transformer.lora = null;
-        if (self.lora_file) |*lf| lf.deinit();
-        self.lora_file = null;
-        if (self.lora_path) |p| self.allocator.free(p);
-        self.lora_path = null;
+        if (self.lora_stack) |*st| st.deinit();
+        self.lora_stack = null;
         self.lora_matched = 0;
     }
 
     fn applyLora(self: *VideoEngine) void {
-        self.transformer.lora = if (self.lora_file) |*lf| lf else null;
-        self.transformer.lora_scale = self.lora_scale;
+        self.transformer.lora = if (self.lora_stack) |*st| st else null;
     }
 
     /// Lazily load the spatial-x2 upsampler for the two-stage boundary.
@@ -1682,21 +1693,34 @@ pub fn handleImage(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: 
         log.info("[image] rebalance: gain={d:.2} weights={d}\n", .{ cond_gain, wl.len });
     }
 
-    // Style LoRA: absolute path to a .safetensors adapter (+ optional scale).
-    // No `lora_path` in the request detaches whatever was attached before.
-    if (extractJsonString(body, "lora_path")) |lp_raw| {
-        const lp = try jsonUnescape(allocator, lp_raw);
-        defer allocator.free(lp);
-        const lscale: f32 = @floatCast(extractJsonFloat(body, "lora_scale") orelse 1.0);
-        const matched = engine.setLora(lp, lscale) catch |err| switch (err) {
-            error.LoraNoMatch => return sendError(conn, 400, "LoRA has no modules matching this model's DiT — wrong LoRA for this architecture?"),
-            error.BadLoraPath => return sendError(conn, 400, "'lora_path' must be an absolute path to a .safetensors file"),
+    // Style LoRA(s): one or more absolute paths to .safetensors adapters,
+    // each with an optional scale — mirrors mflux's `--lora-paths`/
+    // `--lora-scales`. Accepts the array form (`lora_paths`/`lora_scales`)
+    // or the original single-adapter form (`lora_path`/`lora_scale`) for
+    // backward compatibility. No LoRA fields in the request detaches
+    // whatever was attached before.
+    {
+        var lora_path_bufs: [lora_mod.MAX_LORAS][]u8 = undefined;
+        var lora_scales: [lora_mod.MAX_LORAS]f32 = undefined;
+        const lora_n = parseLoraFields(allocator, body, &lora_path_bufs, &lora_scales) catch |err| switch (err) {
+            error.TooManyLoraPaths => return sendError(conn, 400, "too many 'lora_paths' (max 8)"),
+            error.BadLoraPathsJson => return sendError(conn, 400, "invalid 'lora_paths' (must be a JSON array of strings)"),
+            error.BadLoraScalesJson => return sendError(conn, 400, "invalid 'lora_scales' (numbers, comma/space separated, or a JSON array)"),
             error.OutOfMemory => return err,
-            else => return sendError(conn, 400, "failed to load the LoRA file"),
         };
-        log.info("[image] lora: matched {d} modules from {s} (scale {d:.2})\n", .{ matched, lp, lscale });
-    } else {
-        _ = engine.setLora(null, 1.0) catch {};
+        defer for (lora_path_bufs[0..lora_n]) |p| allocator.free(p);
+
+        var lora_paths: [lora_mod.MAX_LORAS][]const u8 = undefined;
+        for (lora_path_bufs[0..lora_n], 0..) |p, i| lora_paths[i] = p;
+        const matched = engine.setLoras(lora_paths[0..lora_n], lora_scales[0..lora_n]) catch |err| switch (err) {
+            error.LoraNoMatch => return sendError(conn, 400, "LoRA(s) have no modules matching this model's DiT — wrong LoRA for this architecture?"),
+            error.BadLoraPath => return sendError(conn, 400, "'lora_path'/'lora_paths' must be absolute path(s) to .safetensors file(s)"),
+            error.TooManyLoras => return sendError(conn, 400, "too many LoRA adapters requested"),
+            error.OutOfMemory => return err,
+            else => return sendError(conn, 400, "failed to load a LoRA file"),
+        };
+        if (lora_n > 0)
+            log.info("[image] lora: matched {d} module-attachment(s) across {d} adapter(s)\n", .{ matched, lora_n });
     }
 
     const want_stream = sse.bodyWantsTrue(body, "stream");
@@ -2157,22 +2181,34 @@ pub fn handleVideo(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: 
             return sendError(conn, 400, "two-stage pipelines require spatial_upscaler_x2_v1_1.safetensors — download it into the model dir");
     }
 
-    // Style LoRA: absolute path to a .safetensors adapter (+ optional scale),
-    // applied to the DiT at runtime. No `lora_path` in the request detaches
-    // whatever was attached before (same contract as handleImage).
-    if (extractJsonString(body, "lora_path")) |lp_raw| {
-        const lp = try jsonUnescape(allocator, lp_raw);
-        defer allocator.free(lp);
-        const lscale: f32 = @floatCast(extractJsonFloat(body, "lora_scale") orelse 1.0);
-        const matched = engine.setLora(lp, lscale) catch |err| switch (err) {
-            error.LoraNoMatch => return sendError(conn, 400, "LoRA has no modules matching this model's DiT — wrong LoRA for this architecture?"),
-            error.BadLoraPath => return sendError(conn, 400, "'lora_path' must be an absolute path to a .safetensors file"),
+    // Style LoRA(s): one or more absolute paths to .safetensors adapters,
+    // each with an optional scale, applied to the DiT at runtime. Accepts
+    // the array form (`lora_paths`/`lora_scales`) or the original
+    // single-adapter form (`lora_path`/`lora_scale`) — same contract as
+    // handleImage. No LoRA fields in the request detaches whatever was
+    // attached before.
+    {
+        var lora_path_bufs: [lora_mod.MAX_LORAS][]u8 = undefined;
+        var lora_scales: [lora_mod.MAX_LORAS]f32 = undefined;
+        const lora_n = parseLoraFields(allocator, body, &lora_path_bufs, &lora_scales) catch |err| switch (err) {
+            error.TooManyLoraPaths => return sendError(conn, 400, "too many 'lora_paths' (max 8)"),
+            error.BadLoraPathsJson => return sendError(conn, 400, "invalid 'lora_paths' (must be a JSON array of strings)"),
+            error.BadLoraScalesJson => return sendError(conn, 400, "invalid 'lora_scales' (numbers, comma/space separated, or a JSON array)"),
             error.OutOfMemory => return err,
-            else => return sendError(conn, 400, "failed to load the LoRA file"),
         };
-        log.info("[video] lora: matched {d} modules from {s} (scale {d:.2})\n", .{ matched, lp, lscale });
-    } else {
-        _ = engine.setLora(null, 1.0) catch {};
+        defer for (lora_path_bufs[0..lora_n]) |p| allocator.free(p);
+
+        var lora_paths: [lora_mod.MAX_LORAS][]const u8 = undefined;
+        for (lora_path_bufs[0..lora_n], 0..) |p, i| lora_paths[i] = p;
+        const matched = engine.setLoras(lora_paths[0..lora_n], lora_scales[0..lora_n]) catch |err| switch (err) {
+            error.LoraNoMatch => return sendError(conn, 400, "LoRA(s) have no modules matching this model's DiT — wrong LoRA for this architecture?"),
+            error.BadLoraPath => return sendError(conn, 400, "'lora_path'/'lora_paths' must be absolute path(s) to .safetensors file(s)"),
+            error.TooManyLoras => return sendError(conn, 400, "too many LoRA adapters requested"),
+            error.OutOfMemory => return err,
+            else => return sendError(conn, 400, "failed to load a LoRA file"),
+        };
+        if (lora_n > 0)
+            log.info("[video] lora: matched {d} module-attachment(s) across {d} adapter(s)\n", .{ matched, lora_n });
     }
 
     // ── audio-to-video: `audio` is a base64 WAV (PCM16/24/f32, any rate,
@@ -2720,9 +2756,12 @@ fn img2imgStartStep(steps: u32, strength: f32) u32 {
 
 /// Extract the `cond_weights` request field: either a JSON number array
 /// (`[1, 0.5, …]`) or a comma/space-separated string (`"1 0.5 …"`).
-fn extractCondWeights(body: []const u8, buf: []f32) ?[]f32 {
+/// Parse a JSON key's value as either a bracketed number array
+/// (`"key": [0.8, 1.0]`) or a quoted comma/space-separated string of numbers
+/// (`"key": "0.8 1.0"`). Shared by `cond_weights` and `lora_scales`.
+fn extractFloatArrayField(body: []const u8, key: []const u8, buf: []f32) ?[]f32 {
     var key_pat_buf: [64]u8 = undefined;
-    const key_pat = std.fmt.bufPrint(&key_pat_buf, "\"{s}\"", .{"cond_weights"}) catch return null;
+    const key_pat = std.fmt.bufPrint(&key_pat_buf, "\"{s}\"", .{key}) catch return null;
     const ki = std.mem.indexOf(u8, body, key_pat) orelse return null;
     var i = ki + key_pat.len;
     while (i < body.len and (body[i] == ' ' or body[i] == ':' or body[i] == '\t')) i += 1;
@@ -2736,6 +2775,65 @@ fn extractCondWeights(body: []const u8, buf: []f32) ?[]f32 {
         return parseFloatList(body[i + 1 .. end], buf);
     }
     return null;
+}
+
+fn extractCondWeights(body: []const u8, buf: []f32) ?[]f32 {
+    return extractFloatArrayField(body, "cond_weights", buf);
+}
+
+/// Per-adapter scales for `lora_scales` (multi-LoRA counterpart of the
+/// single `lora_scale` float field).
+fn extractLoraScales(body: []const u8, buf: []f32) ?[]f32 {
+    return extractFloatArrayField(body, "lora_scales", buf);
+}
+
+const LoraFieldsError = error{ TooManyLoraPaths, BadLoraPathsJson, BadLoraScalesJson, OutOfMemory };
+
+/// Parse the LoRA fields common to image and video requests: the array form
+/// (`lora_paths` + optional `lora_scales`) or the original single-adapter
+/// form (`lora_path` + optional `lora_scale`), which is kept exactly
+/// backward-compatible. Writes up to `lora_mod.MAX_LORAS` unescaped,
+/// allocator-owned path strings into `path_bufs` (caller frees them) and
+/// their resolved scales into `scale_buf`. Returns 0 with both buffers
+/// untouched when neither field is present — the "detach whatever was
+/// attached" case. Missing `lora_scales` entries default to 1.0, matching
+/// mflux's `resolve_scales`.
+fn parseLoraFields(
+    allocator: std.mem.Allocator,
+    body: []const u8,
+    path_bufs: *[lora_mod.MAX_LORAS][]u8,
+    scale_buf: *[lora_mod.MAX_LORAS]f32,
+) LoraFieldsError!usize {
+    var n: usize = 0;
+    errdefer for (path_bufs[0..n]) |p| allocator.free(p);
+
+    if (std.mem.indexOf(u8, body, "\"lora_paths\"") != null) {
+        var it = iterJsonStringArray(body, "lora_paths") orelse return error.BadLoraPathsJson;
+        while (it.next()) |raw| {
+            if (n >= lora_mod.MAX_LORAS) return error.TooManyLoraPaths;
+            path_bufs[n] = try jsonUnescape(allocator, raw);
+            n += 1;
+        }
+        if (it.bad) return error.BadLoraPathsJson;
+    } else if (extractJsonString(body, "lora_path")) |lp_raw| {
+        path_bufs[0] = try jsonUnescape(allocator, lp_raw);
+        n = 1;
+    }
+    if (n == 0) return 0;
+
+    if (std.mem.indexOf(u8, body, "\"lora_scales\"") != null) {
+        var sbuf: [lora_mod.MAX_LORAS]f32 = undefined;
+        const sl = extractLoraScales(body, &sbuf) orelse return error.BadLoraScalesJson;
+        const m = @min(sl.len, n);
+        @memcpy(scale_buf[0..m], sl[0..m]);
+        for (scale_buf[m..n]) |*sc| sc.* = 1.0;
+    } else if (n == 1) {
+        // Legacy single-adapter form: honor 'lora_scale' exactly as before.
+        scale_buf[0] = @floatCast(extractJsonFloat(body, "lora_scale") orelse 1.0);
+    } else {
+        for (scale_buf[0..n]) |*sc| sc.* = 1.0;
+    }
+    return n;
 }
 
 /// Iterate the string elements of a JSON array field (`"key": ["a", "b"]`).

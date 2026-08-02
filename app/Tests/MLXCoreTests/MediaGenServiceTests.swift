@@ -67,16 +67,25 @@ final class MediaGenServiceTests: XCTestCase {
     func testRequestBodyCarriesLoraWhenSet() {
         var req = VideoGenRequest(model: .ltx23Q4, prompt: "p", width: 704, height: 480,
                                   numFrames: 9, fps: 24, mode: .oneStage, steps: 8, cfgScale: 1.0)
-        req.loraPath = "/tmp/style.safetensors"
-        req.loraScale = 0.8
+        req.loras = [LoraAdapter(path: "/tmp/style.safetensors", scale: 0.8)]
         let body = VideoGenService.requestBody(model: "m", prompt: "p", request: req, firstFrameB64: nil)
-        XCTAssertEqual(body["lora_path"] as? String, "/tmp/style.safetensors")
-        XCTAssertEqual(body["lora_scale"] as? Double, 0.8)
-        // No LoRA → fields absent (a missing lora_path means detach server-side).
-        req.loraPath = nil
+        XCTAssertEqual(body["lora_paths"] as? [String], ["/tmp/style.safetensors"])
+        XCTAssertEqual(body["lora_scales"] as? [Double], [0.8])
+        // Stacking: a second adapter appends to both arrays, in order.
+        req.loras.append(LoraAdapter(path: "/tmp/second.safetensors", scale: 1.2))
+        let stacked = VideoGenService.requestBody(model: "m", prompt: "p", request: req, firstFrameB64: nil)
+        XCTAssertEqual(stacked["lora_paths"] as? [String], ["/tmp/style.safetensors", "/tmp/second.safetensors"])
+        XCTAssertEqual(stacked["lora_scales"] as? [Double], [0.8, 1.2])
+        // No LoRA → fields absent (missing lora_paths means detach server-side).
+        req.loras = []
         let bare = VideoGenService.requestBody(model: "m", prompt: "p", request: req, firstFrameB64: nil)
-        XCTAssertNil(bare["lora_path"])
-        XCTAssertNil(bare["lora_scale"])
+        XCTAssertNil(bare["lora_paths"])
+        XCTAssertNil(bare["lora_scales"])
+        // A half-filled row (no path chosen yet) is dropped, not sent as "".
+        req.loras = [LoraAdapter(path: "", scale: 1.0)]
+        let empty = VideoGenService.requestBody(model: "m", prompt: "p", request: req, firstFrameB64: nil)
+        XCTAssertNil(empty["lora_paths"])
+        XCTAssertNil(empty["lora_scales"])
     }
 
     func testCancelledErrorsMapToCancellationNotFailure() {
@@ -677,7 +686,7 @@ final class MediaGenServiceTests: XCTestCase {
         XCTAssertNil(json["strength"])
         XCTAssertNil(json["cond_gain"])
         XCTAssertNil(json["cond_weights"])
-        XCTAssertNil(json["lora_path"])
+        XCTAssertNil(json["lora_paths"])
     }
 
     func testImageRequestJsonIncludesImg2ImgFields() throws {
@@ -708,14 +717,28 @@ final class MediaGenServiceTests: XCTestCase {
         var req = ImageGenRequest(model: .krea2Turbo, prompt: "x", width: 1024, height: 1024, steps: 8)
         req.condGain = 1.5
         req.condWeightsText = "1, 1 1 1 1 1 0.5 1 1 1 1 2"
-        req.loraPath = "/tmp/style.safetensors"
+        req.loras = [
+            LoraAdapter(path: "/tmp/style.safetensors", scale: 1.0),
+            LoraAdapter(path: "/tmp/character.safetensors", scale: 0.6),
+        ]
         let json = ImageGenService.requestJson(for: req, modelName: "m", seed: 1)
         XCTAssertEqual(json["cond_gain"] as? Double, 1.5)
         let w = json["cond_weights"] as? [Double]
         XCTAssertEqual(w?.count, 12)
         XCTAssertEqual(w?[6], 0.5)
         XCTAssertEqual(w?[11], 2)
-        XCTAssertEqual(json["lora_path"] as? String, "/tmp/style.safetensors")
+        XCTAssertEqual(json["lora_paths"] as? [String], ["/tmp/style.safetensors", "/tmp/character.safetensors"])
+        XCTAssertEqual(json["lora_scales"] as? [Double], [1.0, 0.6])
+    }
+
+    func testImageRequestJsonDropsHalfFilledLoraRows() {
+        // A row added by tapping "+" but never given a path must never reach
+        // the server as an empty string — it's silently dropped.
+        var req = ImageGenRequest(model: .krea2Turbo, prompt: "x", width: 1024, height: 1024, steps: 8)
+        req.loras = [LoraAdapter(path: "", scale: 1.0), LoraAdapter(path: "/tmp/ok.safetensors", scale: 0.9)]
+        let json = ImageGenService.requestJson(for: req, modelName: "m", seed: 1)
+        XCTAssertEqual(json["lora_paths"] as? [String], ["/tmp/ok.safetensors"])
+        XCTAssertEqual(json["lora_scales"] as? [Double], [0.9])
     }
 
     func testParseCondWeightsAcceptsCommasAndSpacesRejectsGarbage() {

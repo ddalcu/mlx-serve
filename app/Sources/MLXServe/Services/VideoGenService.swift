@@ -340,9 +340,12 @@ final class VideoGenService: ObservableObject {
         }
         if let firstFrameB64 { body["first_frame_image"] = firstFrameB64 }
         if hasAudio, let audioB64 { body["audio"] = audioB64 }
-        if let lora = request.loraPath, !lora.isEmpty {
-            body["lora_path"] = lora
-            if request.loraScale != 1.0 { body["lora_scale"] = request.loraScale }
+        // Stacked style LoRAs — see ImageGenService.requestJson for the same
+        // pattern (adapters sum, so several can attach at once).
+        let loras = request.loras.filter { !$0.path.isEmpty }
+        if !loras.isEmpty {
+            body["lora_paths"] = loras.map(\.path)
+            body["lora_scales"] = loras.map(\.scale)
         }
         return body
     }

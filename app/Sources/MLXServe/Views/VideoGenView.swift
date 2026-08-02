@@ -27,8 +27,9 @@ struct VideoGenView: View {
     @State private var cfgScale: Double = 1.0
     @State private var stgScale: Double = 0.0
     @State private var seed: Int = 42
-    /// Style LoRA (Advanced): .safetensors adapter path ("" = none).
-    @State private var loraPath: String = ""
+    /// Style LoRAs (Advanced): stacked `.safetensors` adapters ([] = none).
+    /// Several can attach at once — their effects sum, so order doesn't matter.
+    @State private var loras: [LoraAdapter] = []
     @State private var firstFrameImageURL: URL? = nil
     // ── Speech & sound (audio-to-video) ──
     /// Where the conditioning clip comes from. `.none` → the model invents a
@@ -628,39 +629,60 @@ struct VideoGenView: View {
             residencyRow
 
             Divider()
-            Text("Style LoRA").font(.caption.weight(.semibold))
-            if loraPath.isEmpty {
+            HStack {
+                Text("Style LoRAs").font(.caption.weight(.semibold))
+                Spacer()
+                Button {
+                    chooseLora()
+                } label: {
+                    Image(systemName: "plus.circle")
+                }
+                .buttonStyle(.borderless)
+                .disabled(loras.count >= maxLoras)
+                .help(loras.count >= maxLoras ? "Maximum \(maxLoras) LoRAs" : "Add another LoRA")
+            }
+            if loras.isEmpty {
                 Button {
                     chooseLora()
                 } label: {
                     Label("Choose .safetensors…", systemImage: "paintpalette")
                         .font(.caption)
                 }
-                Text("Apply a LoRA adapter to the video model for a custom style.")
+                Text("Apply one or more LoRA adapters to the video model for a custom style. Several can stack at once.")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             } else {
-                HStack(spacing: 8) {
-                    Image(systemName: "paintpalette")
+                ForEach(Array(loras.enumerated()), id: \.element.id) { index, lora in
+                    HStack(spacing: 8) {
+                        Image(systemName: "paintpalette")
+                            .foregroundStyle(.secondary)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(URL(fileURLWithPath: lora.path).lastPathComponent)
+                                .font(.caption)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                                .help(lora.path)
+                            Stepper(value: $loras[index].scale, in: 0...2, step: 0.05) {
+                                Text("scale \(String(format: "%.2f", lora.scale))")
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
+                            .onChange(of: loras[index].scale) { _, _ in guard !hydrating else { return }; persist() }
+                        }
+                        Spacer()
+                        Button {
+                            loras.remove(at: index)
+                            persist()
+                        } label: {
+                            Image(systemName: "xmark.circle.fill")
+                        }
+                        .buttonStyle(.borderless)
                         .foregroundStyle(.secondary)
-                    Text(URL(fileURLWithPath: loraPath).lastPathComponent)
-                        .font(.caption)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                        .help(loraPath)
-                    Spacer()
-                    Button {
-                        loraPath = ""
-                        persist()
-                    } label: {
-                        Image(systemName: "xmark.circle.fill")
+                        .help("Remove this LoRA")
                     }
-                    .buttonStyle(.borderless)
-                    .foregroundStyle(.secondary)
-                    .help("Remove the LoRA")
+                    .padding(6)
+                    .background(RoundedRectangle(cornerRadius: 6).fill(Color.secondary.opacity(0.08)))
                 }
-                .padding(6)
-                .background(RoundedRectangle(cornerRadius: 6).fill(Color.secondary.opacity(0.08)))
             }
         }
     }
@@ -695,16 +717,22 @@ struct VideoGenView: View {
         return "Model not loaded"
     }
 
+    /// Max simultaneously-attached LoRAs — mirrors the server's `lora.MAX_LORAS`.
+    private let maxLoras = 8
+
     private func chooseLora() {
+        guard loras.count < maxLoras else { return }
         let panel = NSOpenPanel()
         if let st = UTType(filenameExtension: "safetensors") {
             panel.allowedContentTypes = [st]
         }
         panel.canChooseFiles = true
         panel.canChooseDirectories = false
-        panel.allowsMultipleSelection = false
-        if AppActivation.runModal(panel) == .OK, let url = panel.url {
-            loraPath = url.path
+        panel.allowsMultipleSelection = true
+        if AppActivation.runModal(panel) == .OK {
+            for url in panel.urls.prefix(maxLoras - loras.count) {
+                loras.append(LoraAdapter(path: url.path))
+            }
             persist()
         }
     }
@@ -884,11 +912,9 @@ struct VideoGenView: View {
         stgScale = s.stgScale
         seed = s.seed
         keepResident = s.keepResident
-        loraPath = s.loraPath
-        // The LoRA file may have moved since last session — drop a stale path.
-        if !loraPath.isEmpty && !FileManager.default.fileExists(atPath: loraPath) {
-            loraPath = ""
-        }
+        loras = s.loras
+        // A LoRA file may have moved since last session — drop stale entries.
+        loras.removeAll { !FileManager.default.fileExists(atPath: $0.path) }
         clampFramesToRAM()
     }
 
@@ -905,7 +931,7 @@ struct VideoGenView: View {
         s.stgScale = stgScale
         s.seed = seed
         s.keepResident = keepResident
-        s.loraPath = loraPath
+        s.loras = loras
         s.save()
     }
 
@@ -962,7 +988,7 @@ struct VideoGenView: View {
             audioPath: audioURL?.path,
             keepResident: keepResident,
             lanModelId: lanModel,
-            loraPath: loraPath.isEmpty ? nil : loraPath
+            loras: loras
         )
         persist()
 

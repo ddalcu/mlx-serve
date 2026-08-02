@@ -4,9 +4,16 @@
 //! `<module>.lora_B.weight` [out,r] (diffusers naming; `lora_down`/`lora_up`
 //! aliases accepted) plus an optional scalar `<module>.alpha` (net scale
 //! alpha/rank, kohya convention). Adapters are NOT fused into the base
-//! weights — each attached linear computes y = base(x) + scale·(x@Aᵀ)@Bᵀ at
-//! runtime. That keeps quantized checkpoints lossless (no dequant→requant
-//! round-trip) and makes detach a pointer clear.
+//! weights — each attached linear computes y = base(x) + Σᵢ scaleᵢ·(x@Aᵀᵢ)@Bᵀᵢ
+//! at runtime, one term per attached adapter. That keeps quantized
+//! checkpoints lossless (no dequant→requant round-trip) and makes detach a
+//! pointer clear.
+//!
+//! Multiple adapters attach simultaneously via `Stack` (mirrors mflux's
+//! `lora_paths`/`lora_scales`): each loaded `File` keeps its own module→Ref
+//! mapping, `Stack.findAll` collects every file's `Ref` for a given module,
+//! and `deltaSum` adds their deltas — the same "sum, don't merge" semantics
+//! as mflux's `FusedLoRALinear`.
 
 const std = @import("std");
 const mlx = @import("mlx.zig");
@@ -72,6 +79,33 @@ pub fn delta(x: mlx.mlx_array, ref: Ref, s: mlx.mlx_stream) !mlx.mlx_array {
     return scaled;
 }
 
+/// Sum of `scale_i · (x @ Aᵀᵢ) @ Bᵀᵢ` over every attached adapter — the
+/// runtime realization of stacking multiple LoRAs on one linear (mirrors
+/// mflux's `FusedLoRALinear`, which sums per-adapter deltas rather than
+/// merging them into the base weight). Caller must ensure `refs.len >= 1`.
+pub fn deltaSum(x: mlx.mlx_array, refs: []const Ref, s: mlx.mlx_stream) !mlx.mlx_array {
+    var total = try delta(x, refs[0], s);
+    errdefer _ = mlx.mlx_array_free(total);
+    for (refs[1..]) |r| {
+        const d = try delta(x, r, s);
+        defer _ = mlx.mlx_array_free(d);
+        var summed = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(summed);
+        try mlx.check(mlx.mlx_add(&summed, total, d, s));
+        _ = mlx.mlx_array_free(total);
+        total = summed;
+    }
+    return total;
+}
+
+/// Max simultaneously-attached LoRA adapters per engine. Bounds the
+/// per-linear `Ref` array in the image/video backends and the request-body
+/// `lora_paths`/`lora_scales` arrays in gen.zig. mflux has no hard cap;
+/// eight covers every practical multi-LoRA stack (style + character + a
+/// couple of concept adapters) while keeping the per-linear footprint a
+/// fixed-size array instead of a heap allocation on the hot path.
+pub const MAX_LORAS: usize = 8;
+
 /// One loaded adapter pair, keyed by the module it targets.
 pub const Entry = struct {
     module: []u8, // owned
@@ -100,6 +134,52 @@ pub const File = struct {
             if (std.mem.eql(u8, e.module, module)) return e;
         }
         return null;
+    }
+};
+
+/// A bounded set of simultaneously-attached LoRA adapters (mflux's
+/// `lora_paths`/`lora_scales` lists). Owns every loaded `File` plus a copy
+/// of the request paths (for the no-op-reuse check in gen.zig's
+/// `setLoras`) and each file's user-requested scale. Fixed-capacity —
+/// `MAX_LORAS` — so attach/lookup never allocates on the hot path.
+pub const Stack = struct {
+    allocator: std.mem.Allocator,
+    files: [MAX_LORAS]File = undefined,
+    paths: [MAX_LORAS][]u8 = undefined, // owned, for reuse comparison
+    scales: [MAX_LORAS]f32 = undefined,
+    count: u8 = 0,
+
+    pub fn deinit(self: *Stack) void {
+        for (self.files[0..self.count]) |*f| f.deinit();
+        for (self.paths[0..self.count]) |p| self.allocator.free(p);
+        self.count = 0;
+    }
+
+    /// True when `paths`/`scales` are exactly the currently-attached set, in
+    /// order — lets `setLoras` no-op on a repeat request (mirrors the
+    /// single-adapter path's `cur == p and scale == self.lora_scale` check).
+    pub fn matches(self: *const Stack, paths: []const []const u8, scales: []const f32) bool {
+        if (paths.len != self.count or scales.len != self.count) return false;
+        for (paths, scales, 0..) |p, sc, i| {
+            if (!std.mem.eql(u8, self.paths[i], p) or sc != self.scales[i]) return false;
+        }
+        return true;
+    }
+
+    /// Collect every `Ref` across the stack's files that targets `module`,
+    /// in attach order. Order does not change the result — deltas are
+    /// summed, never fused, so it is not "later file wins" like a merged
+    /// weight would be. Writes into `out` (capacity `MAX_LORAS`) and returns
+    /// the filled prefix.
+    pub fn findAll(self: *const Stack, module: []const u8, out: *[MAX_LORAS]Ref) []Ref {
+        var n: usize = 0;
+        for (self.files[0..self.count], self.scales[0..self.count]) |*f, user_scale| {
+            if (f.find(module)) |e| {
+                out[n] = .{ .at = e.at, .bt = e.bt, .scale = e.scale * user_scale };
+                n += 1;
+            }
+        }
+        return out[0..n];
     }
 };
 
@@ -317,4 +397,6 @@ test "loadFile rejects a MISSING file before mlx can kill the process" {
     // A DIRECTORY exists, so an existence check alone would wave it through to
     // mlx and die the same way. It must be a regular file.
     try testing.expectError(error.BadLoraPath, loadFile(testing.allocator, buf[0..root_len]));
+    try testing.expectError(error.BadLoraPath, loadFile(testing.allocator, "rel/lora.safetensors"));
+    try testing.expectError(error.BadLoraPath, loadFile(testing.allocator, ""));
 }

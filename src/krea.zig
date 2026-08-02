@@ -186,7 +186,10 @@ const MixedLinear = struct {
     add_bias: ?mlx.mlx_array = null,
     bits: u32 = 0,
     group_size: u32 = 0,
-    lora: ?lora_mod.Ref = null, // runtime adapter (non-owning; gen.zig owns the File)
+    // Runtime adapters (non-owning; gen.zig's lora.Stack owns the arrays).
+    // Fixed-capacity so attach/forward never allocate.
+    lora_refs: [lora_mod.MAX_LORAS]lora_mod.Ref = undefined,
+    lora_count: u8 = 0,
 
     /// `in_features` is the module's input dim (known per call); used only on
     /// the quantized path to solve (bits, group_size) from packed geometry.
@@ -252,14 +255,24 @@ const MixedLinear = struct {
             _ = mlx.mlx_array_free(o);
             o = r;
         }
-        if (self.lora) |lr| {
-            const d = try lora_mod.delta(xb, lr, s);
+        if (self.lora_count > 0) {
+            const d = try lora_mod.deltaSum(xb, self.lora_refs[0..self.lora_count], s);
             defer _ = mlx.mlx_array_free(d);
             const r = try addA(o, d, s);
             _ = mlx.mlx_array_free(o);
             o = r;
         }
         return o;
+    }
+
+    /// Install the stacked adapter Refs for this linear (from `Stack.findAll`).
+    fn setLoraRefs(self: *MixedLinear, refs: []const lora_mod.Ref) void {
+        self.lora_count = @intCast(refs.len);
+        @memcpy(self.lora_refs[0..refs.len], refs);
+    }
+
+    fn clearLoraRefs(self: *MixedLinear) void {
+        self.lora_count = 0;
     }
 };
 
@@ -1282,12 +1295,15 @@ pub fn loadDit(io: std.Io, allocator: std.mem.Allocator, s: S, model_dir: []cons
     return d;
 }
 
-/// Attach runtime LoRA adapters from `lf` to every matching DiT linear.
-/// Non-owning: `lf` must outlive the attach. Returns the match count.
-pub fn attachLora(dit: *Dit, lf: *const lora_mod.File, user_scale: f32) u32 {
+/// Attach every adapter in `stack` to its matching DiT linear (summed at
+/// forward time — see `lora.deltaSum`). Non-owning: `stack` must outlive
+/// the attach. Returns the number of (module, matched-adapter) attachments
+/// across the whole stack (a module hit by two stacked LoRAs counts twice).
+pub fn attachLora(dit: *Dit, stack_arg: *const lora_mod.Stack) u32 {
     detachLora(dit);
     var matched: u32 = 0;
     var kbuf: [128]u8 = undefined;
+    var rbuf: [lora_mod.MAX_LORAS]lora_mod.Ref = undefined;
     for (dit.blocks, 0..) |*b, i| {
         const mods = .{
             .{ "attn.wq", &b.attn.wq },   .{ "attn.wk", &b.attn.wk },
@@ -1298,9 +1314,10 @@ pub fn attachLora(dit: *Dit, lf: *const lora_mod.File, user_scale: f32) u32 {
         };
         inline for (mods) |m| {
             const key = std.fmt.bufPrint(&kbuf, "blocks.{d}.{s}", .{ i, m[0] }) catch "";
-            if (lf.find(key)) |e| {
-                m[1].lora = .{ .at = e.at, .bt = e.bt, .scale = e.scale * user_scale };
-                matched += 1;
+            const refs = stack_arg.findAll(key, &rbuf);
+            if (refs.len > 0) {
+                m[1].setLoraRefs(refs);
+                matched += @intCast(refs.len);
             }
         }
     }
@@ -1309,7 +1326,7 @@ pub fn attachLora(dit: *Dit, lf: *const lora_mod.File, user_scale: f32) u32 {
 
 pub fn detachLora(dit: *Dit) void {
     for (dit.blocks) |*b| {
-        inline for (.{ &b.attn.wq, &b.attn.wk, &b.attn.wv, &b.attn.gate, &b.attn.wo, &b.mlp.gate, &b.mlp.up, &b.mlp.down }) |ml| ml.lora = null;
+        inline for (.{ &b.attn.wq, &b.attn.wk, &b.attn.wv, &b.attn.gate, &b.attn.wo, &b.mlp.gate, &b.mlp.up, &b.mlp.down }) |ml| ml.clearLoraRefs();
     }
 }
 
@@ -2495,7 +2512,7 @@ test "MixedLinear applies an attached LoRA delta (bf16 path)" {
     defer _ = mlx.mlx_array_free(btf);
     const bt = try astype(btf, .bfloat16, s);
     defer _ = mlx.mlx_array_free(bt);
-    ml.lora = .{ .at = at, .bt = bt, .scale = 0.5 };
+    ml.setLoraRefs(&.{.{ .at = at, .bt = bt, .scale = 0.5 }});
     const y1 = try ml.forward(x, s);
     defer _ = mlx.mlx_array_free(y1);
     const y1f = try astype(y1, .float32, s);
@@ -2505,7 +2522,7 @@ test "MixedLinear applies an attached LoRA delta (bf16 path)" {
     try testing.expectApproxEqAbs(@as(f32, 4), d1[0], 1e-2);
     try testing.expectApproxEqAbs(@as(f32, 8), d1[1], 1e-2);
     // Detached again: back to base.
-    ml.lora = null;
+    ml.clearLoraRefs();
     const y2 = try ml.forward(x, s);
     defer _ = mlx.mlx_array_free(y2);
     const y2f = try astype(y2, .float32, s);
