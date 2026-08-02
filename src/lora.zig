@@ -468,6 +468,7 @@ const Partial = struct {
     a: mlx.mlx_array = .{ .ctx = null },
     b: mlx.mlx_array = .{ .ctx = null },
     alpha: ?f32 = null,
+    flat: bool = false,
 };
 
 fn scalarValue(arr: mlx.mlx_array, s: mlx.mlx_stream) ?f32 {
@@ -538,7 +539,7 @@ pub fn loadFile(allocator: std.mem.Allocator, path: []const u8, arch: Arch) !Fil
         const gop = try partials.getOrPut(info.module);
         if (!gop.found_existing) {
             gop.key_ptr.* = try allocator.dupe(u8, info.module);
-            gop.value_ptr.* = .{};
+            gop.value_ptr.* = .{ .flat = info.flat };
         }
         switch (info.role) {
             .a => {
@@ -569,28 +570,78 @@ pub fn loadFile(allocator: std.mem.Allocator, path: []const u8, arch: Arch) !Fil
     while (it.next()) |e| {
         const p = e.value_ptr;
         if (p.a.ctx == null or p.b.ctx == null) continue; // incomplete pair
-        const rank: c_int = mlx.getShape(p.a)[0]; // A [r,in]
-        const at = try prepTransposed(p.a, s);
-        errdefer _ = mlx.mlx_array_free(at);
-        const bt = try prepTransposed(p.b, s);
-        errdefer _ = mlx.mlx_array_free(bt);
-        const scale: f32 = if (p.alpha) |al| al / @as(f32, @floatFromInt(rank)) else 1.0;
-        
-        // Canonicalize the module name for the target architecture
+        const full_rank: c_int = mlx.getShape(p.a)[0]; // A [r,in]
+        // mirrors mflux's LoraTransforms._split_qkv_down: the shared
+        // down-projection only gets split per-target when its rank divides
+        // evenly by the fan-out (3); otherwise every target shares the same
+        // full A and only B (the up-projection) is split.
+        const split_a = @rem(full_rank, 3) == 0;
+
+        // Canonicalize the module name(s) for the target architecture. A
+        // fused source tensor (e.g. BFL's packed img_attn.qkv) fans out to
+        // up to MAX_FANOUT canonical targets — one per `Split` third — and
+        // EVERY match needs its own Entry, or two of every three fused
+        // targets (to_k/to_v) would silently never get an adapter attached.
         var canon_bufs: [MAX_FANOUT]CanonBuf = undefined;
-        const matches = canonicalize(e.key_ptr.*, false, arch, &canon_bufs);
-        // For simple 1:1 mappings (including bypass LoRAs), use the first canonical name
-        try entries.append(allocator, .{
-            .module = try allocator.dupe(u8, matches[0].canon),
-            .at = at,
-            .bt = bt,
-            .scale = scale,
-        });
+        const matches = canonicalize(e.key_ptr.*, p.flat, arch, &canon_bufs);
+        for (matches) |m| {
+            const idx = splitIndex(m.split);
+            const at = if (idx) |i| (if (split_a) try prepTransposedThird(p.a, i, s) else try prepTransposed(p.a, s)) else try prepTransposed(p.a, s);
+            errdefer _ = mlx.mlx_array_free(at);
+            const bt = if (idx) |i| try prepTransposedThird(p.b, i, s) else try prepTransposed(p.b, s);
+            errdefer _ = mlx.mlx_array_free(bt);
+            // rank-for-scale mirrors mflux: it's computed from THIS target's
+            // (possibly-split) A, not the original unsplit tensor — a target
+            // that got a 1/3-rank slice of A scales alpha by 3x more.
+            const target_rank: c_int = if (idx != null and split_a) @divExact(full_rank, 3) else full_rank;
+            const scale: f32 = if (p.alpha) |al| al / @as(f32, @floatFromInt(target_rank)) else 1.0;
+            try entries.append(allocator, .{
+                .module = try allocator.dupe(u8, m.canon),
+                .at = at,
+                .bt = bt,
+                .scale = scale,
+            });
+        }
     }
     return .{ .allocator = allocator, .entries = try entries.toOwnedSlice(allocator) };
 }
 
-/// [o,i] → materialized bf16 [i,o].
+/// `Split` → which third (0/1/2) of a 3-way fused source it draws from, or
+/// `null` for an already-1:1 (`.none`) match.
+fn splitIndex(sp: Split) ?u2 {
+    return switch (sp) {
+        .none => null,
+        .third0 => 0,
+        .third1 => 1,
+        .third2 => 2,
+    };
+}
+
+/// [n, k] → the `idx`-th of 3 equal chunks along axis 0, still `[n/3, k]`
+/// and untransposed. Used both for the up-projection's output axis (always
+/// split — mirrors mflux's `_split_qkv_up`) and, when the rank divides
+/// evenly by 3, the down-projection's rank axis (mirrors `_split_qkv_down`).
+fn sliceThird(w: mlx.mlx_array, idx: u2, s: mlx.mlx_stream) !mlx.mlx_array {
+    const shape = mlx.getShape(w);
+    const n = shape[0];
+    const third = @divTrunc(n, 3);
+    const start = [_]c_int{ third * @as(c_int, idx), 0 };
+    const stop = [_]c_int{ third * (@as(c_int, idx) + 1), shape[1] };
+    const strides = [_]c_int{ 1, 1 };
+    var res = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(res);
+    try mlx.check(mlx.mlx_slice(&res, w, &start, 2, &stop, 2, &strides, 2, s));
+    return res;
+}
+
+/// [n, k] → materialized bf16 [k, n/3] for the `idx`-th third, pre-transposed
+/// exactly like `prepTransposed`.
+fn prepTransposedThird(w: mlx.mlx_array, idx: u2, s: mlx.mlx_stream) !mlx.mlx_array {
+    const piece = try sliceThird(w, idx, s);
+    defer _ = mlx.mlx_array_free(piece);
+    return prepTransposed(piece, s);
+}
+
 fn prepTransposed(w: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
     const axes = [_]c_int{ 1, 0 };
     var tensor = mlx.mlx_array_new();
@@ -660,6 +711,47 @@ test "delta computes scale·(x@Aᵀ)@Bᵀ" {
     const dd = mlx.mlx_array_data_float32(d) orelse return error.NoData;
     try testing.expectApproxEqAbs(@as(f32, 110), dd[0], 1e-4);
     try testing.expectApproxEqAbs(@as(f32, 132), dd[1], 1e-4);
+}
+
+test "prepTransposedThird slices a fused up-projection into the right q/k/v third" {
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    // Fused B [out_fused=6, r=1]: rows 0-1 = "q" third, 2-3 = "k" third,
+    // 4-5 = "v" third. Transposed+bf16, third `idx` should end up as
+    // bt [1, 2] holding exactly rows [2*idx, 2*idx+1] of the source.
+    const bv = [_]f32{ 1, 2, 10, 20, 100, 200 };
+    const bs = [_]c_int{ 6, 1 };
+    const b = mlx.mlx_array_new_data(&bv, &bs, 2, .float32);
+    defer _ = mlx.mlx_array_free(b);
+
+    const bt1 = try prepTransposedThird(b, 1, s);
+    defer _ = mlx.mlx_array_free(bt1);
+    _ = mlx.mlx_array_eval(bt1);
+    const shape = mlx.getShape(bt1);
+    try testing.expectEqual(@as(c_int, 1), shape[0]);
+    try testing.expectEqual(@as(c_int, 2), shape[1]);
+    // bf16 has limited precision but exactly represents small integers.
+    var f32_bt1 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(f32_bt1);
+    try mlx.check(mlx.mlx_astype(&f32_bt1, bt1, .float32, s));
+    _ = mlx.mlx_array_eval(f32_bt1);
+    const d = mlx.mlx_array_data_float32(f32_bt1) orelse return error.NoData;
+    try testing.expectApproxEqAbs(@as(f32, 10), d[0], 1e-4);
+    try testing.expectApproxEqAbs(@as(f32, 20), d[1], 1e-4);
+}
+
+test "canonicalize resolves Kohya flat-scheme module names, not just dotted ones" {
+    // Dotted BFL-style key, e.g. from a diffusers/BFL export.
+    var bufs: [MAX_FANOUT]CanonBuf = undefined;
+    const dotted = canonicalize("double_blocks.3.img_attn.qkv", false, .flux2, &bufs);
+    try testing.expectEqual(@as(usize, 3), dotted.len); // fused qkv fans out to q/k/v
+    try testing.expectEqualStrings("transformer_blocks.3.attn.to_q", dotted[0].canon);
+
+    // The same tensor, but as it actually appears in a Kohya `lora_unet_...`
+    // flat export: dots replaced with underscores in the module portion.
+    const flat = canonicalize("double_blocks_3_img_attn_qkv", true, .flux2, &bufs);
+    try testing.expectEqual(@as(usize, 3), flat.len);
+    try testing.expectEqualStrings("transformer_blocks.3.attn.to_q", flat[0].canon);
 }
 
 test "loadFile rejects relative/empty paths (openFileAbsolute UB class)" {
