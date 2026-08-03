@@ -50,6 +50,9 @@ test {
     _ = @import("nsfw.zig");
     _ = @import("ltx_video.zig");
     _ = @import("ltx_audio.zig");
+    _ = @import("minimax_h3.zig");
+    _ = @import("minimax_h3_vae.zig");
+    _ = @import("minimax_h3_audio.zig");
     _ = @import("png.zig");
     _ = @import("marching_cubes.zig");
     _ = @import("glb.zig");

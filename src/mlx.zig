@@ -126,6 +126,7 @@ pub extern "c" fn mlx_array_data_bool(arr: mlx_array) ?[*]const bool;
 pub extern "c" fn mlx_array_data_float32(arr: mlx_array) ?[*]const f32;
 pub extern "c" fn mlx_array_data_int32(arr: mlx_array) ?[*]const i32;
 pub extern "c" fn mlx_array_data_uint32(arr: mlx_array) ?[*]const u32;
+pub extern "c" fn mlx_array_data_uint8(arr: mlx_array) ?[*]const u8;
 
 // Vector array
 pub extern "c" fn mlx_vector_array_new() mlx_vector_array;
@@ -357,6 +358,8 @@ pub extern "c" fn mlx_random_randint(res: *mlx_array, low: mlx_array, high: mlx_
 pub extern "c" fn mlx_cummax(res: *mlx_array, a: mlx_array, axis: c_int, reverse: bool, inclusive: bool, s: mlx_stream) c_int;
 pub extern "c" fn mlx_logsumexp_axis(res: *mlx_array, a: mlx_array, axis: c_int, keepdims: bool, s: mlx_stream) c_int;
 pub extern "c" fn mlx_all(res: *mlx_array, a: mlx_array, keepdims: bool, s: mlx_stream) c_int;
+pub extern "c" fn mlx_isfinite(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_clip(res: *mlx_array, a: mlx_array, a_min: mlx_array, a_max: mlx_array, s: mlx_stream) c_int;
 pub extern "c" fn mlx_contiguous(res: *mlx_array, a: mlx_array, allow_col_major: bool, s: mlx_stream) c_int;
 pub extern "c" fn mlx_mean(res: *mlx_array, a: mlx_array, keepdims: bool, s: mlx_stream) c_int;
 pub extern "c" fn mlx_mean_axes(res: *mlx_array, a: mlx_array, axes: [*]const c_int, axes_num: usize, keepdims: bool, s: mlx_stream) c_int;

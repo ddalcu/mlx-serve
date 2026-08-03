@@ -8,6 +8,10 @@ zig-out/
 !.claude/skills/
 /models/
 *.safetensors
+# ...except small hermetic TEST fixtures. The rule above exists to keep model
+# WEIGHTS out; src/fixtures holds a 1.8 MB toy-geometry parity fixture, and a
+# test that silently skips because its fixture is untracked protects nothing.
+!src/fixtures/*.safetensors
 
 # llama.cpp libllama, staged at build time by scripts/fetch-llama.sh (not vendored)
 /lib/llama/

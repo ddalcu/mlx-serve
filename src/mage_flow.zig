@@ -521,7 +521,11 @@ fn ownOpt(w: *const Weights, key: []const u8) ?mlx.mlx_array {
 ///
 /// The VAE deliberately does NOT use this — it stays dense on its proven f32
 /// path (`loadLinT`/`linearT`), and the converter never quantizes it.
-const MfLinear = struct {
+/// Dense-or-quantized linear whose packed geometry is solved per tensor from
+/// the shapes alone. Shared with `minimax_h3.zig`: both backends must load the
+/// bf16 releases AND our affine-quantized mirrors through ONE path, and a
+/// second copy of this is a second place for the bits/group-size solve to drift.
+pub const MfLinear = struct {
     quantized: bool,
     /// quantized: packed u32 [out, in*bits/32] (`transpose_w=true` at use).
     /// dense: pre-transposed [in, out], matching the old `loadLinDt` layout.
@@ -534,7 +538,7 @@ const MfLinear = struct {
 
     /// `in_features` is the module's input dim, known at every call site from
     /// `Config`; it is what makes the packed geometry solvable.
-    fn load(w: *const Weights, a: std.mem.Allocator, prefix: []const u8, in_features: u32, dtype: mlx.mlx_dtype, s: S) !MfLinear {
+    pub fn load(w: *const Weights, a: std.mem.Allocator, prefix: []const u8, in_features: u32, dtype: mlx.mlx_dtype, s: S) !MfLinear {
         const wk = try std.fmt.allocPrint(a, "{s}.weight", .{prefix});
         defer a.free(wk);
         const sk = try std.fmt.allocPrint(a, "{s}.scales", .{prefix});
@@ -581,7 +585,7 @@ const MfLinear = struct {
         return .{ .quantized = false, .w = try astype(tc, dtype, s), .dtype = dtype };
     }
 
-    fn deinit(self: *MfLinear) void {
+    pub fn deinit(self: *MfLinear) void {
         _ = mlx.mlx_array_free(self.w);
         if (self.quantized) {
             _ = mlx.mlx_array_free(self.scales);
@@ -591,7 +595,7 @@ const MfLinear = struct {
 
     /// x[.., in] @ W (+ bias). `bias` stays a caller-owned argument so this is a
     /// drop-in for `linearT`, which is how the dense path stays unchanged.
-    fn forward(self: *const MfLinear, x: mlx.mlx_array, bias: ?mlx.mlx_array, s: S) !mlx.mlx_array {
+    pub fn forward(self: *const MfLinear, x: mlx.mlx_array, bias: ?mlx.mlx_array, s: S) !mlx.mlx_array {
         // No-op when x already matches (mlx returns the input unchanged), so the
         // dense path keeps the exact arithmetic the bf16 fixtures were pinned on.
         const xc = try astype(x, self.dtype, s);
