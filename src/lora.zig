@@ -21,9 +21,14 @@
 //! FLUX.2's own attention keeps them separate) — `ArchTable` maps every
 //! accepted spelling onto mlx-serve's own canonical module key, splitting a
 //! fused up-projection into thirds when required (mirrors mflux's
-//! `LoraTransforms.split_q_up`/`split_q_down` for the very same tensors).
-//! Down-projections are shared across a fused split unless their rank
-//! happens to divide evenly by the fan-out (mirrors mflux exactly).
+//! `LoraTransforms.split_q_up` for the very same tensors). The
+//! down-projection is always shared, full-rank, across every target of a
+//! fused split — a single adapter trained over the fused linear has one A
+//! applied identically to q/k/v. (An earlier version tried to infer a rarer
+//! "three independently-packed rank-r/3 adapters" case from the rank being
+//! divisible by 3, but that has no real signal behind it — ordinary shared
+//! ranks like 24/48/96 hit it too — and silently corrupted those adapters
+//! instead of erroring, so it was removed.)
 //!
 //! Multiple adapters attach simultaneously via `Stack` (mirrors mflux's
 //! `lora_paths`/`lora_scales`): each loaded `File` keeps its own module→Ref
@@ -571,12 +576,19 @@ pub fn loadFile(allocator: std.mem.Allocator, path: []const u8, arch: Arch) !Fil
         const p = e.value_ptr;
         if (p.a.ctx == null or p.b.ctx == null) continue; // incomplete pair
         const full_rank: c_int = mlx.getShape(p.a)[0]; // A [r,in]
-        // mirrors mflux's LoraTransforms._split_qkv_down: the shared
-        // down-projection only gets split per-target when its rank divides
-        // evenly by the fan-out (3); otherwise every target shares the same
-        // full A and only B (the up-projection) is split.
-        const split_a = @rem(full_rank, 3) == 0;
-
+        // The down-projection (A) is ALWAYS shared across every target of a
+        // fused source tensor: a LoRA trained over a fused QKV linear has
+        // ONE A applied identically to q/k/v, with only B's *output* rows
+        // split per target (mirrors mflux's `_split_qkv_up` / the shared-A
+        // half of `FusedLoRALinear`). We deliberately do NOT try to guess
+        // "these are secretly three independent rank-r/3 adapters packed
+        // block-diagonally" from the rank being divisible by 3 — that
+        // heuristic has no real signal behind it (24, 48, 96... are
+        // completely ordinary ranks for one shared adapter) and guessing
+        // wrong doesn't error, it silently feeds the DiT a corrupted 1/3-rank
+        // delta. Always sharing A is the correct behavior for every fused
+        // export this module actually targets (BFL/ComfyUI/ai-toolkit).
+        //
         // Canonicalize the module name(s) for the target architecture. A
         // fused source tensor (e.g. BFL's packed img_attn.qkv) fans out to
         // up to MAX_FANOUT canonical targets — one per `Split` third — and
@@ -586,15 +598,11 @@ pub fn loadFile(allocator: std.mem.Allocator, path: []const u8, arch: Arch) !Fil
         const matches = canonicalize(e.key_ptr.*, p.flat, arch, &canon_bufs);
         for (matches) |m| {
             const idx = splitIndex(m.split);
-            const at = if (idx) |i| (if (split_a) try prepTransposedThird(p.a, i, s) else try prepTransposed(p.a, s)) else try prepTransposed(p.a, s);
+            const at = try prepTransposed(p.a, s);
             errdefer _ = mlx.mlx_array_free(at);
             const bt = if (idx) |i| try prepTransposedThird(p.b, i, s) else try prepTransposed(p.b, s);
             errdefer _ = mlx.mlx_array_free(bt);
-            // rank-for-scale mirrors mflux: it's computed from THIS target's
-            // (possibly-split) A, not the original unsplit tensor — a target
-            // that got a 1/3-rank slice of A scales alpha by 3x more.
-            const target_rank: c_int = if (idx != null and split_a) @divExact(full_rank, 3) else full_rank;
-            const scale: f32 = if (p.alpha) |al| al / @as(f32, @floatFromInt(target_rank)) else 1.0;
+            const scale: f32 = if (p.alpha) |al| al / @as(f32, @floatFromInt(full_rank)) else 1.0;
             try entries.append(allocator, .{
                 .module = try allocator.dupe(u8, m.canon),
                 .at = at,
@@ -618,9 +626,10 @@ fn splitIndex(sp: Split) ?u2 {
 }
 
 /// [n, k] → the `idx`-th of 3 equal chunks along axis 0, still `[n/3, k]`
-/// and untransposed. Used both for the up-projection's output axis (always
-/// split — mirrors mflux's `_split_qkv_up`) and, when the rank divides
-/// evenly by 3, the down-projection's rank axis (mirrors `_split_qkv_down`).
+/// and untransposed. Used for the up-projection's output axis — always
+/// split for a fused target (mirrors mflux's `_split_qkv_up`). The
+/// down-projection is never split this way; see the shared-A note in
+/// `loadFile`.
 fn sliceThird(w: mlx.mlx_array, idx: u2, s: mlx.mlx_stream) !mlx.mlx_array {
     const shape = mlx.getShape(w);
     const n = shape[0];
@@ -738,6 +747,85 @@ test "prepTransposedThird slices a fused up-projection into the right q/k/v thir
     const d = mlx.mlx_array_data_float32(f32_bt1) orelse return error.NoData;
     try testing.expectApproxEqAbs(@as(f32, 10), d[0], 1e-4);
     try testing.expectApproxEqAbs(@as(f32, 20), d[1], 1e-4);
+}
+
+test "loadFile: rank-divisible-by-3 fused source shares full-rank A across every target (regression)" {
+    // A previous version guessed, from `rank % 3 == 0` alone, that a fused
+    // source packs three INDEPENDENT rank-r/3 adapters block-diagonally,
+    // and split A's rank axis into thirds to match. That guess has no real
+    // signal behind it — ordinary shared ranks like 3/24/48/96 hit it just
+    // as often as an actual block-diagonal export — and it silently fed the
+    // DiT a corrupted 1/3-rank delta instead of erroring. r=3 here is
+    // exactly the case that used to trigger the wrong guess; the fix is
+    // that A is now ALWAYS shared, full-rank, across every fused target —
+    // only B's output rows split by q/k/v third.
+    const a = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = try tmp.dir.realPath(io, &pbuf);
+    const path = try std.fmt.allocPrint(a, "{s}/fused.safetensors", .{root});
+    defer a.free(path);
+
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const tmap = mlx.mlx_map_string_to_array_new();
+    defer _ = mlx.mlx_map_string_to_array_free(tmap);
+    const in_dim = 8;
+    const out_fused = 12; // 3 * out(4)
+    const r = 3; // divisible by 3 -> used to (wrongly) trigger the split-A guess
+    var av: [r * in_dim]f32 = undefined;
+    for (&av, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i)) * 0.1;
+    var bv: [out_fused * r]f32 = undefined;
+    @memset(&bv, 0.1);
+    const ash = [_]c_int{ r, in_dim };
+    const bsh = [_]c_int{ out_fused, r };
+    const aarr = mlx.mlx_array_new_data(&av, &ash, 2, .float32);
+    const barr = mlx.mlx_array_new_data(&bv, &bsh, 2, .float32);
+    _ = mlx.mlx_map_string_to_array_insert(tmap, "double_blocks.0.img_attn.qkv.lora_A.weight", aarr);
+    _ = mlx.mlx_map_string_to_array_insert(tmap, "double_blocks.0.img_attn.qkv.lora_B.weight", barr);
+    _ = mlx.mlx_array_free(aarr);
+    _ = mlx.mlx_array_free(barr);
+    const mmap = mlx.mlx_map_string_to_string_new();
+    defer _ = mlx.mlx_map_string_to_string_free(mmap);
+    const pathz = try a.dupeSentinel(u8, path, 0);
+    defer a.free(pathz);
+    try mlx.check(mlx.mlx_save_safetensors(pathz, tmap, mmap));
+
+    var file = try loadFile(a, path, .flux2);
+    defer file.deinit();
+    try testing.expect(file.entries.len == 3); // fans out to q/k/v
+
+    // Reference: A transposed+bf16 the same way loadFile does, to compare
+    // byte-for-byte against every entry's `at`.
+    var full_at = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(full_at);
+    {
+        const ref_arr = mlx.mlx_array_new_data(&av, &ash, 2, .float32);
+        defer _ = mlx.mlx_array_free(ref_arr);
+        const axes = [_]c_int{ 1, 0 };
+        var tr = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(tr);
+        try mlx.check(mlx.mlx_transpose_axes(&tr, ref_arr, &axes, 2, s));
+        var c = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(c);
+        try mlx.check(mlx.mlx_contiguous(&c, tr, false, s));
+        try mlx.check(mlx.mlx_astype(&full_at, c, .bfloat16, s));
+    }
+    _ = mlx.mlx_array_eval(full_at);
+    const full_at_shape = mlx.getShape(full_at); // [in, r] — NOT [in, r/3]
+
+    for (file.entries) |ent| {
+        const at_shape = mlx.getShape(ent.at);
+        const bt_shape = mlx.getShape(ent.bt); // [r, out/3]
+        // A is untouched: every target gets the SAME full-rank [in, r].
+        try testing.expectEqual(full_at_shape[0], at_shape[0]);
+        try testing.expectEqual(full_at_shape[1], at_shape[1]);
+        try testing.expectEqual(@as(c_int, r), at_shape[1]);
+        // Contracts cleanly against the full (unsplit) rank on both sides.
+        try testing.expectEqual(at_shape[1], bt_shape[0]);
+    }
 }
 
 test "canonicalize resolves Kohya flat-scheme module names, not just dotted ones" {
