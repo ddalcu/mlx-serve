@@ -60,6 +60,7 @@ pub fn isMediaModelType(model_type: []const u8) bool {
         std.mem.eql(u8, model_type, "acestep") or
         std.mem.eql(u8, model_type, "kokoro") or
         std.mem.eql(u8, model_type, "AudioVideo") or
+        std.mem.eql(u8, model_type, "minimax_h3") or
         std.mem.startsWith(u8, model_type, "hunyuan3d");
 }
 

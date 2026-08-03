@@ -80,6 +80,21 @@ pub const Modality = enum {
 /// (stub) config's `model_type`, so it must accept the markers from
 /// `Modality.modelType` AND the raw config strings discovery peeks
 /// ("flux2-klein-4b", "qwen3_tts", "AudioVideo").
+/// Every media `model_type` this server serves. The ONE list the two
+/// duplicated predicates below are checked against.
+///
+/// `model_discovery.isMediaModelType` cannot call `modalityFromType` — that
+/// module stays filesystem-only so it never pulls in mlx — so the duplication
+/// is deliberate and documented. What was missing was a guard: `minimax_h3`
+/// was registered here and NOT there, so discovery rejected the model with
+/// "unsupported model_type" while the engine that serves it was ready and
+/// waiting. The test at the bottom of this file pins them together.
+pub const media_model_types = [_][]const u8{
+    "flux2",     "krea",      "mage_flow", "mageflow",
+    "qwen3_tts", "acestep",   "kokoro",    "AudioVideo",
+    "hunyuan3d", "minimax_h3",
+};
+
 pub fn modalityFromType(model_type: []const u8) ?Modality {
     if (std.mem.startsWith(u8, model_type, "flux2")) return .image;
     if (std.mem.startsWith(u8, model_type, "krea")) return .image;
@@ -3706,4 +3721,24 @@ test "paint stage dir resolves from the combined single-repo layout (subdir firs
     const bare = try mkModelDir(allocator, tmp.dir, root, "bare/shape-only");
     defer allocator.free(bare);
     try testing.expect(findPaintDir(allocator, bare) == null);
+}
+
+test "media model types: discovery and modality dispatch agree" {
+    // CLASS GUARD. `model_discovery.isMediaModelType` and `modalityFromType`
+    // are documented duplication (discovery must not import mlx), and they
+    // silently drifted: `minimax_h3` was added to the dispatcher but not to
+    // discovery, so `/v1/load-model` answered
+    //   400 "Model at that path has an unsupported model_type"
+    // for a model the server could actually serve. Neither side is wrong on
+    // its own — only their DISAGREEMENT is — so the check is bidirectional.
+    for (media_model_types) |mt| {
+        try std.testing.expect(discovery.isMediaModelType(mt));
+        try std.testing.expect(modalityFromType(mt) != null);
+    }
+    // And a non-media type must be rejected by BOTH, or a chat model would be
+    // routed to a media engine.
+    for ([_][]const u8{ "gemma4", "qwen3", "llama", "deepseek_v4", "bert" }) |mt| {
+        try std.testing.expect(!discovery.isMediaModelType(mt));
+        try std.testing.expect(modalityFromType(mt) == null);
+    }
 }

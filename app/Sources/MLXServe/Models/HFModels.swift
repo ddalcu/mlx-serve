@@ -60,7 +60,11 @@ let supportedModelTypes: Set<String> = [
 /// chat-model pickers (`LocalModel.isChatPickable` checks this separately).
 /// Mirrors `model_discovery.isMediaModelType` (Zig).
 private let mediaModelTypePrefixes: [String] = ["flux2", "krea", "mage_flow", "hunyuan3d"]
-private let mediaModelTypeExactValues: Set<String> = ["qwen3_tts", "AudioVideo", "acestep"]
+// Mirrors `gen.media_model_types` on the server. Drift here is not cosmetic:
+// a media model missing from this list is treated as a chat model by the
+// browser and the picker. `kokoro` is deliberately absent — it is voice-mode
+// only and never appears in the media-gen catalog (see AudioModelPreset).
+private let mediaModelTypeExactValues: Set<String> = ["qwen3_tts", "AudioVideo", "acestep", "minimax_h3"]
 
 func isMediaModelType(_ modelType: String) -> Bool {
     if mediaModelTypeExactValues.contains(modelType) { return true }

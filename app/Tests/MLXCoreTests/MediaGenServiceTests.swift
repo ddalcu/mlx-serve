@@ -882,3 +882,20 @@ extension MediaGenServiceTests {
         }
     }
 }
+
+extension MediaGenServiceTests {
+
+    /// Every video preset's backend must be recognized as a MEDIA type, or the
+    /// browser and picker treat it as a chat model. This is the client half of
+    /// the same duplication that made `/v1/load-model` answer 400 "unsupported
+    /// model_type" for MiniMax-H3: the server-side dispatcher knew the type and
+    /// discovery did not.
+    func testEveryVideoBackendIsRecognizedAsAMediaType() {
+        XCTAssertTrue(isMediaModelType("minimax_h3"))
+        XCTAssertTrue(isMediaModelType("AudioVideo"))   // LTX
+        // A chat arch must NOT be, or it would be routed to a media engine.
+        for t in ["gemma4", "qwen3", "llama", "deepseek_v4"] {
+            XCTAssertFalse(isMediaModelType(t), "\(t) must not read as media")
+        }
+    }
+}
