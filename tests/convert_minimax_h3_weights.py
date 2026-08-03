@@ -127,6 +127,14 @@ def convert_file(src_path, dst_path, label):
         "quantization": f"affine {BITS}-bit g{GROUP_SIZE}",
         "quantized_tensors": str(n_q),
         "dense_tensors": str(n_d),
+        # Section III.2 of the MiniMax H3 Community License: modified files must
+        # carry a prominent notice that they were modified. The sidecar
+        # MODIFICATIONS.md is the human-readable copy; this travels INSIDE the
+        # file, so it survives being moved out of the directory.
+        "modified_from": "MiniMaxAI/MiniMax-H3 (FL2VA)",
+        "modified_by": "mlx-serve tests/convert_minimax_h3_weights.py",
+        "modification": f"quantized to MLX affine {BITS}-bit group size {GROUP_SIZE}",
+        "license": "MiniMax H3 Community License Agreement",
     })
     total = (q_bytes + d_bytes) / 1e9
     print(f"  [{label}] {n_q} quantized / {n_d} dense -> {total:.1f} GB "
@@ -152,6 +160,39 @@ CONFIG = {
     "text_encoder": {"hidden": 5120, "layers": 50, "heads": 64, "kv_heads": 8,
                      "head_dim": 128, "intermediate": 25600, "theta": 5000000.0},
 }
+
+NOTICE = (
+    "MiniMax H3 is licensed under the MiniMax H3 Community License Agreement, "
+    "Copyright \u00a9 2026 MiniMax. All Rights Reserved.\n"
+)
+
+# Section III.2 requires modified files to carry PROMINENT notices saying so.
+# Quantizing the weights modifies them, so this ships alongside them and the
+# same statement goes into each safetensors file's own metadata.
+MODIFICATIONS = """# Modifications to MiniMax H3
+
+These files are MODIFIED versions of the MiniMax H3 Works, redistributed under
+the MiniMax H3 Community License Agreement (see LICENSE and NOTICE).
+
+Modified by: mlx-serve (https://github.com/ddalcu/mlx-serve)
+
+What changed:
+
+* `transformer.safetensors` and `text_encoder.safetensors` are QUANTIZED from
+  the original bfloat16 releases to MLX affine 8-bit, group size 64. Gathered
+  embedding tables and the checkpoint's fp32 islands (patch projections, output
+  heads, time embedder, rope inverse frequencies) are left dense.
+* `video_vae.safetensors` and `audio_vae.safetensors` are byte-for-byte copies
+  of the originals, unmodified.
+* The tokenizer files are byte-for-byte copies from `MiniMaxAI/MiniMax-H3`
+  (`FL2VA/processor/`), relocated into this directory so the model is
+  self-contained.
+* `config.json` is new, written by mlx-serve's converter to describe the
+  layout above. It is not from the original release.
+
+No weights were retrained, distilled, pruned or otherwise altered beyond the
+numeric quantization described above.
+"""
 
 README = """---
 license: other
@@ -184,6 +225,23 @@ heads, time embedder) and both VAEs.
 
 Note that quantization here buys FOOTPRINT, not speed — the workload is
 compute-bound at roughly 192,000 FLOPs per weight byte.
+
+## Modifications
+
+These are MODIFIED files. The transformer and text encoder are quantized to
+8-bit; see MODIFICATIONS.md for the full list. The VAEs and tokenizer are
+unmodified copies.
+
+## License
+
+Powered by MiniMax H3. Licensed under the MiniMax H3 Community License
+Agreement -- see LICENSE and NOTICE, both included here.
+
+**Territorial restriction.** The Agreement defines the Applicable Territory as
+worldwide EXCLUDING the European Union, the United Kingdom, the Republic of
+Korea and the United States of America, and Section V.4 prohibits use,
+reproduction, modification, distribution and display outside it. Check whether
+your jurisdiction permits you to use these files before downloading them.
 """
 
 
@@ -234,6 +292,23 @@ def main():
         p = os.path.join(tok, fn)
         if os.path.exists(p):
             shutil.copyfile(p, os.path.join(out, fn))
+    lic_src = os.path.join(os.path.dirname(tok.rstrip("/")), "..", "LICENSE")
+    lic_src = os.path.normpath(lic_src)
+    if not os.path.exists(lic_src):
+        lic_src = os.path.join(os.path.dirname(os.path.dirname(tok.rstrip("/"))), "LICENSE")
+    if not os.path.exists(lic_src):
+        raise SystemExit(
+            "LICENSE not found next to the tokenizer. Section III.1 of the MiniMax H3 "
+            "Community License requires a copy of the Agreement to accompany any "
+            "distribution, so refusing to write a directory that cannot legally be "
+            "shared.\n  Fetch it with: hf download MiniMaxAI/MiniMax-H3 LICENSE "
+            "--local-dir <staging>"
+        )
+    shutil.copyfile(lic_src, os.path.join(out, "LICENSE"))
+    with open(os.path.join(out, "NOTICE"), "w") as f:
+        f.write(NOTICE)
+    with open(os.path.join(out, "MODIFICATIONS.md"), "w") as f:
+        f.write(MODIFICATIONS)
     with open(os.path.join(out, "config.json"), "w") as f:
         json.dump(CONFIG, f, indent=2)
     with open(os.path.join(out, "README.md"), "w") as f:
