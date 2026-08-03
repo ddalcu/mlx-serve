@@ -84,6 +84,17 @@ linear ~10.7 PF, attention ~3.7 PF, AdaLN ~0.002 PF, VAE ~0.6 PF.
       hermetically, but `decodeSpatial`'s blend/trim path is only validated by
       "the 480p clip looked right." A tiled decode of a >256 px canvas should be
       compared against a reference dump, or at minimum a seam-energy check.
+- [ ] **The memory preflight over-bills staged-residency models.**
+      `modelDiskBytes` sums every safetensors in the dir, so H3 is billed
+      64.5 GB (`[preflight] weights ~64.53 GB` on a real boot). But
+      `minimax_h3.generate` loads the text encoder, frees it, THEN loads the
+      DiT, so true peak is ~35 GB plus VAEs and activations, not their sum.
+      Over-billing fails safe, but on a 48 GB Mac it refuses a load that would
+      have worked. The engine knows its own residency plan and the preflight
+      does not; either give the media path a per-backend estimate or have
+      `VideoEngine` declare a peak. Whatever shape it takes, the fix must not
+      let a backend UNDER-bill — an MLX OOM is uncatchable, so the direction of
+      the error matters more than its size.
 - [ ] **On-spec acceptance run never done**: 124 frames at 1344x768. Expect
       several hours. This is the only config inside the model's TRAINED range
       (~124-362 frames at 768 short edge); everything shipped so far is
@@ -166,6 +177,16 @@ Ordered by expected value given what is already known.
   purpose** (discovery must not import mlx) and drifted once already, producing
   a 400 for a model the server could serve. `gen.media_model_types` plus its
   bidirectional test is the guard; extend the list, not one predicate.
+- **A readiness marker belongs to a BACKEND, never to a modality.**
+  `detectModality` gated the whole `.video` modality on LTX's
+  `connector.safetensors`. H3 has no connector, so detection returned null and
+  `preloadCpuState` fell through to the MLX TEXT path — it globbed all four H3
+  safetensors into one weight map and died on `model.norm.weight`, which reads
+  as a tensor bug rather than a routing bug. `requiredMarkerFor(model_type)` is
+  the guard, and the failure now names the missing file instead of silently
+  degrading to a text load. Any per-modality condition is suspect the moment
+  that modality has two backends; the same shape is worth auditing in the
+  image/audio paths, which have had unions for longer.
 - A **permutation-invariant checksum cannot see a permutation** — the layout
   fixture pairs each column sum with a row-index-weighted one after a stereo
   channel swap slipped through.
