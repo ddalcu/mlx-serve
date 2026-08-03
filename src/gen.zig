@@ -25,6 +25,7 @@ const acestep = @import("acestep.zig");
 const kokoro = @import("kokoro.zig");
 const ltx = @import("ltx_video.zig");
 const ltx_audio = @import("ltx_audio.zig");
+const minimax_h3 = @import("minimax_h3.zig");
 const hy3d = @import("hunyuan3d.zig");
 const hy3d_paint = @import("hunyuan3d_paint.zig");
 const glb_mod = @import("glb.zig");
@@ -87,6 +88,7 @@ pub fn modalityFromType(model_type: []const u8) ?Modality {
     if (std.mem.eql(u8, model_type, "acestep")) return .audio;
     if (std.mem.eql(u8, model_type, "kokoro")) return .audio;
     if (std.mem.eql(u8, model_type, "AudioVideo")) return .video;
+    if (std.mem.eql(u8, model_type, "minimax_h3")) return .video;
     if (std.mem.startsWith(u8, model_type, "hunyuan3d")) return .mesh;
     return null;
 }
@@ -866,7 +868,80 @@ pub const TransformerVariant = enum {
 /// stream; the forward graph runs on the GPU stream. The 11 GB transformer slot
 /// holds ONE variant at a time; `ensureTransformer` swaps it (deinit + reload)
 /// so dev + distilled are never resident together.
+/// The `.video` modality slot, one arm per backend — the same shape
+/// `ImageEngine` uses for flux|krea|mage_flow. Adding a backend is one arm plus
+/// an impl file; every call site holds `*VideoEngine` and dispatches here.
 pub const VideoEngine = struct {
+    allocator: std.mem.Allocator,
+    backend: union(enum) {
+        ltx: *LtxVideoEngine,
+        h3: *H3VideoEngine,
+    },
+
+    pub fn load(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !*VideoEngine {
+        const self = try allocator.create(VideoEngine);
+        errdefer allocator.destroy(self);
+        self.* = .{ .allocator = allocator, .backend = undefined };
+        if (peekModelType(io, allocator, model_dir)) |mt| {
+            defer allocator.free(mt);
+            if (std.mem.eql(u8, mt, "minimax_h3")) {
+                self.backend = .{ .h3 = try H3VideoEngine.load(allocator, model_dir) };
+                return self;
+            }
+        }
+        self.backend = .{ .ltx = try LtxVideoEngine.load(io, allocator, model_dir) };
+        return self;
+    }
+
+    pub fn deinit(self: *VideoEngine) void {
+        switch (self.backend) {
+            .ltx => |e| e.deinit(),
+            .h3 => |e| e.deinit(),
+        }
+        self.allocator.destroy(self);
+    }
+
+    /// LoRA is an LTX-only capability; H3 ships no adapter format, so this is a
+    /// NAMED refusal rather than a silent no-op that reports a match count of 0.
+    pub fn setLora(self: *VideoEngine, path: ?[]const u8, scale: f32) !u32 {
+        return switch (self.backend) {
+            .ltx => |e| e.setLora(path, scale),
+            .h3 => if (path == null) 0 else error.LoraUnsupported,
+        };
+    }
+};
+
+/// MiniMax-H3 video+audio. Holds only paths: `minimax_h3.generate` stages the
+/// text encoder and the DiT sequentially because they cannot both be resident,
+/// so there is nothing useful to keep loaded between requests.
+pub const H3VideoEngine = struct {
+    allocator: std.mem.Allocator,
+    model_dir: []u8,
+
+    pub fn load(allocator: std.mem.Allocator, model_dir: []const u8) !*H3VideoEngine {
+        const self = try allocator.create(H3VideoEngine);
+        errdefer allocator.destroy(self);
+        self.* = .{ .allocator = allocator, .model_dir = try allocator.dupe(u8, model_dir) };
+        return self;
+    }
+
+    pub fn deinit(self: *H3VideoEngine) void {
+        self.allocator.free(self.model_dir);
+        self.allocator.destroy(self);
+    }
+
+    pub fn paths(self: *const H3VideoEngine, a: std.mem.Allocator) !minimax_h3.GenPaths {
+        return .{
+            .tokenizer_dir = self.model_dir,
+            .text_encoder = try std.fmt.allocPrint(a, "{s}/text_encoder.safetensors", .{self.model_dir}),
+            .dit = try std.fmt.allocPrint(a, "{s}/transformer.safetensors", .{self.model_dir}),
+            .vae = try std.fmt.allocPrint(a, "{s}/video_vae.safetensors", .{self.model_dir}),
+            .audio_vae = try std.fmt.allocPrint(a, "{s}/audio_vae.safetensors", .{self.model_dir}),
+        };
+    }
+};
+
+pub const LtxVideoEngine = struct {
     allocator: std.mem.Allocator,
     s: mlx.mlx_stream,
     transformer: ltx.Component,
@@ -887,8 +962,8 @@ pub const VideoEngine = struct {
     lora_scale: f32 = 1.0,
     lora_matched: u32 = 0,
 
-    pub fn load(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !*VideoEngine {
-        const self = try allocator.create(VideoEngine);
+    pub fn load(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !*LtxVideoEngine {
+        const self = try allocator.create(LtxVideoEngine);
         errdefer allocator.destroy(self);
         self.* = undefined;
         self.allocator = allocator;
@@ -945,7 +1020,7 @@ pub const VideoEngine = struct {
         return self;
     }
 
-    fn hasVariant(self: *VideoEngine, io: std.Io, variant: TransformerVariant) bool {
+    fn hasVariant(self: *LtxVideoEngine, io: std.Io, variant: TransformerVariant) bool {
         var buf: [1024]u8 = undefined;
         const p = std.fmt.bufPrintSentinel(&buf, "{s}/{s}", .{ self.model_dir, variant.fileName() }, 0) catch return false;
         return fileExists(io, p);
@@ -954,7 +1029,7 @@ pub const VideoEngine = struct {
     /// Swap the transformer slot to `want` (no-op when already loaded). The old
     /// component is freed BEFORE the new one loads so dev + distilled (11 GB
     /// each) never coexist.
-    pub fn ensureTransformer(self: *VideoEngine, want: TransformerVariant) !void {
+    pub fn ensureTransformer(self: *LtxVideoEngine, want: TransformerVariant) !void {
         if (self.transformer_variant == want) return;
         log.info("[video] swapping transformer: {s} -> {s}\n", .{ @tagName(self.transformer_variant), @tagName(want) });
         self.transformer.deinit();
@@ -970,7 +1045,7 @@ pub const VideoEngine = struct {
     /// `path == null` detaches; the same path+scale is a no-op reuse; a new
     /// path/scale loads + installs on the transformer Component. Returns the
     /// number of adapter modules present in the DiT.
-    pub fn setLora(self: *VideoEngine, path: ?[]const u8, scale: f32) !u32 {
+    pub fn setLora(self: *LtxVideoEngine, path: ?[]const u8, scale: f32) !u32 {
         if (path) |p| {
             if (self.lora_path) |cur| {
                 if (std.mem.eql(u8, cur, p) and scale == self.lora_scale) return self.lora_matched;
@@ -993,7 +1068,7 @@ pub const VideoEngine = struct {
         return 0;
     }
 
-    fn clearLora(self: *VideoEngine) void {
+    fn clearLora(self: *LtxVideoEngine) void {
         self.transformer.lora = null;
         if (self.lora_file) |*lf| lf.deinit();
         self.lora_file = null;
@@ -1002,13 +1077,13 @@ pub const VideoEngine = struct {
         self.lora_matched = 0;
     }
 
-    fn applyLora(self: *VideoEngine) void {
+    fn applyLora(self: *LtxVideoEngine) void {
         self.transformer.lora = if (self.lora_file) |*lf| lf else null;
         self.transformer.lora_scale = self.lora_scale;
     }
 
     /// Lazily load the spatial-x2 upsampler for the two-stage boundary.
-    pub fn ensureUpsampler(self: *VideoEngine, io: std.Io) !*const ltx.Component {
+    pub fn ensureUpsampler(self: *LtxVideoEngine, io: std.Io) !*const ltx.Component {
         if (self.upsampler) |*u| return u;
         var buf: [1024]u8 = undefined;
         const p = std.fmt.bufPrintSentinel(&buf, "{s}/{s}.safetensors", .{ self.model_dir, ltx.UPSAMPLER_PREFIX }, 0) catch return error.MissingUpsampler;
@@ -1022,7 +1097,7 @@ pub const VideoEngine = struct {
         return &self.upsampler.?;
     }
 
-    pub fn deinit(self: *VideoEngine) void {
+    pub fn deinit(self: *LtxVideoEngine) void {
         self.clearLora();
         self.transformer.deinit();
         self.connector.deinit();
@@ -2106,10 +2181,56 @@ pub fn videoGuiderDefaults(pipeline: VideoPipeline, cfg_video: ?f32, cfg_audio: 
     }
 }
 
+/// H3 result -> the SAME wire shape the LTX path emits (base64 rgb8 frames plus
+/// interleaved pcm_s16le), so the Swift client's existing decode and
+/// AVAssetWriter mux need no new branch.
+fn sendH3Video(allocator: std.mem.Allocator, conn: *Conn, res: *const minimax_h3.GenResult) !void {
+    const s = mlx.gpuStream();
+    const audio_mod = @import("minimax_h3_audio.zig");
+
+    // [1,3,F,H,W] in [-1,1] -> [F,H,W,3] u8
+    const rgb = try minimax_h3.pixelsToRgb8(allocator, res, s);
+    defer allocator.free(rgb);
+    log.info("[video] -> {d}f {d}x{d} ({d} rgb bytes)\n", .{ res.frame_count, res.height, res.width, rgb.len });
+
+    const b64_len = std.base64.standard.Encoder.calcSize(rgb.len);
+    const b64 = try allocator.alloc(u8, b64_len);
+    defer allocator.free(b64);
+    _ = std.base64.standard.Encoder.encode(b64, rgb);
+
+    var audio_b64: ?[]u8 = null;
+    defer if (audio_b64) |a| allocator.free(a);
+    if (res.audio) |wave| {
+        const pcm = try minimax_h3.audioToPcm16(allocator, wave, s);
+        defer allocator.free(pcm);
+        const al = std.base64.standard.Encoder.calcSize(pcm.len);
+        const ab = try allocator.alloc(u8, al);
+        _ = std.base64.standard.Encoder.encode(ab, pcm);
+        audio_b64 = ab;
+    }
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+    const head = try std.fmt.allocPrint(allocator, "{{\"created\":0,\"frames\":{d},\"height\":{d},\"width\":{d},\"fps\":24,\"format\":\"rgb8\",\"data\":\"", .{ res.frame_count, res.height, res.width });
+    defer allocator.free(head);
+    try out.appendSlice(allocator, head);
+    try out.appendSlice(allocator, b64);
+    try out.appendSlice(allocator, "\"");
+    if (audio_b64) |ab| {
+        const ah = try std.fmt.allocPrint(allocator, ",\"audio_sample_rate\":{d},\"audio_channels\":2,\"audio_format\":\"pcm_s16le\",\"audio_data\":\"", .{audio_mod.SAMPLE_RATE});
+        defer allocator.free(ah);
+        try out.appendSlice(allocator, ah);
+        try out.appendSlice(allocator, ab);
+        try out.appendSlice(allocator, "\"");
+    }
+    try out.appendSlice(allocator, "}");
+    return sendBytesJson(conn, allocator, out.items);
+}
+
 /// Stage-2 transformer provider for the two-stage boundary: swaps the engine's
 /// transformer slot from dev to distilled (freeing dev first).
 const Stage2Swap = struct {
-    engine: *VideoEngine,
+    engine: *LtxVideoEngine,
 
     fn swap(ctx: *anyopaque) anyerror!*const ltx.Component {
         const self: *Stage2Swap = @ptrCast(@alignCast(ctx));
@@ -2119,6 +2240,70 @@ const Stage2Swap = struct {
 };
 
 pub fn handleVideo(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []const u8, engine: *VideoEngine) !void {
+    return switch (engine.backend) {
+        .ltx => |e| handleVideoLtx(io, allocator, conn, body, e),
+        .h3 => |e| handleVideoH3(io, allocator, conn, body, e),
+    };
+}
+
+/// MiniMax-H3 text-to-audio-video.
+///
+/// The request surface is deliberately NARROWER than LTX's: H3 has no LoRA, no
+/// CFG scale and no pipeline mode, and its frame counts live on a 17k+5 ladder
+/// rather than 8N+1. Anything the client sends that this backend cannot honor
+/// is a NAMED 400 — a silently ignored field is the class the app's preset
+/// rules exist to prevent.
+fn handleVideoH3(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []const u8, engine: *H3VideoEngine) !void {
+    const prompt_raw = extractJsonString(body, "prompt") orelse return sendError(conn, 400, "missing 'prompt'");
+    const prompt = try jsonUnescape(allocator, prompt_raw);
+    defer allocator.free(prompt);
+    if (prompt.len == 0) return sendError(conn, 400, "empty 'prompt'");
+
+    for ([_][]const u8{ "lora_path", "cfg_scale", "stg_scale", "pipeline" }) |field| {
+        if (extractJsonString(body, field) != null or extractJsonInt(body, field) != null) {
+            return sendError(conn, 400, "MiniMax-H3 does not support this field; it has no LoRA, no classifier-free guidance and no pipeline modes");
+        }
+    }
+
+    const width: u32 = @intCast(extractJsonInt(body, "width") orelse 256);
+    const height: u32 = @intCast(extractJsonInt(body, "height") orelse 256);
+    const steps: u32 = @intCast(extractJsonInt(body, "steps") orelse 30);
+    const seed: u64 = @intCast(extractJsonInt(body, "seed") orelse 0);
+    const requested_frames: u32 = @intCast(extractJsonInt(body, "num_frames") orelse 56);
+
+    if (width % 32 != 0 or height % 32 != 0)
+        return sendError(conn, 400, "width and height must be multiples of 32");
+
+    // Snap to the model's own ladder and SAY SO: silently generating a
+    // different length than asked is how a client's audio mux drifts.
+    const shape = minimax_h3.temporalShape(requested_frames);
+    log.info("[video] minimax-h3 {d}x{d} {d}f (requested {d}, snapped to the 17k+5 ladder) steps={d}\n", .{ width, height, shape.frame_count, requested_frames, steps });
+
+    const paths = try engine.paths(allocator);
+    defer {
+        allocator.free(paths.text_encoder);
+        allocator.free(paths.dit);
+        allocator.free(paths.vae);
+        if (paths.audio_vae) |p| allocator.free(p);
+    }
+
+    var res = minimax_h3.generate(allocator, io, paths, .{
+        .prompt = prompt,
+        .width = width,
+        .height = height,
+        .frames = requested_frames,
+        .steps = steps,
+        .seed = seed,
+    }, mlx.gpuStream()) catch |e| {
+        log.err("[video] minimax-h3 generation failed: {any}\n", .{e});
+        return sendError(conn, 500, "MiniMax-H3 generation failed");
+    };
+    defer res.deinit();
+
+    try sendH3Video(allocator, conn, &res);
+}
+
+fn handleVideoLtx(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []const u8, engine: *LtxVideoEngine) !void {
     const prompt_raw = extractJsonString(body, "prompt") orelse return sendError(conn, 400, "missing 'prompt'");
     const prompt = try jsonUnescape(allocator, prompt_raw);
     defer allocator.free(prompt);

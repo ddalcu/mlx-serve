@@ -1,0 +1,4 @@
+- Route H3's quantized linears through dequant→bf16 GEMM at M≥2048. This is the single best change: it should make the 8-bit pack match bf16 speed, turning quantization back into a pure footprint win. The rule already exists in the repo for exactly this shape.
+- AdaLN modulation is weak code. Per block it does slice + multiply + add + concat per segment run, 6 modulation tensors × 2 applications × 50 blocks. That's a lot of small ops, and it's likely a real part of the gap to roofline. A fused kernel or a per-row gather would collapse it.
+- Precompute AdaLN across the whole schedule. Modulation depends only on the timestep, and there are ≤4 unique ones per step. Computing all of them up front (~1.2 GB for 30 steps) lets you drop the 13B AdaLN weights entirely — 39% of the model — and removes a 13 GB-per-step read. That's the "pruned" variant Comfy ships, and it's the one structural saving I left on the table.
+- Ref2V implementation

@@ -1897,6 +1897,53 @@ pub fn generate(
     };
 }
 
+// ── Output conversion ───────────────────────────────────────────────────────
+
+/// [1,3,F,H,W] in [-1,1] -> tightly packed [F,H,W,3] u8. Caller owns.
+pub fn pixelsToRgb8(allocator: std.mem.Allocator, res: *const GenResult, s: S) ![]u8 {
+    const p = try transpose(res.pixels, &[_]c_int{ 0, 2, 3, 4, 1 }, s);
+    defer _ = mlx.mlx_array_free(p);
+    const pc = try contig(p, s);
+    defer _ = mlx.mlx_array_free(pc);
+    const one = try scalarLike(1.0, pc, s);
+    defer _ = mlx.mlx_array_free(one);
+    const shifted = try addA(pc, one, s);
+    defer _ = mlx.mlx_array_free(shifted);
+    const k = try scalarLike(127.5, shifted, s);
+    defer _ = mlx.mlx_array_free(k);
+    const scaled = try mulA(shifted, k, s);
+    defer _ = mlx.mlx_array_free(scaled);
+    const u8a = try astype(scaled, mlx.mlx_dtype.uint8, s);
+    defer _ = mlx.mlx_array_free(u8a);
+    try mlx.check(mlx.mlx_array_eval(u8a));
+    const n: usize = @intCast(mlx.mlx_array_size(u8a));
+    const raw = mlx.mlx_array_data_uint8(u8a) orelse return error.NoPixelData;
+    return allocator.dupe(u8, raw[0..n]);
+}
+
+/// Stereo [2, L] f32 -> interleaved little-endian 16-bit PCM. Caller owns.
+pub fn audioToPcm16(allocator: std.mem.Allocator, wave: mlx.mlx_array, s: S) ![]u8 {
+    const t = try transpose(wave, &[_]c_int{ 1, 0 }, s);
+    defer _ = mlx.mlx_array_free(t);
+    const tc = try contig(t, s);
+    defer _ = mlx.mlx_array_free(tc);
+    const f = try astype(tc, mlx.mlx_dtype.float32, s);
+    defer _ = mlx.mlx_array_free(f);
+    try mlx.check(mlx.mlx_array_eval(f));
+    const n: usize = @intCast(mlx.mlx_array_size(f));
+    const raw = mlx.mlx_array_data_float32(f) orelse return error.NoAudioData;
+    const out = try allocator.alloc(u8, n * 2);
+    errdefer allocator.free(out);
+    for (0..n) |i| {
+        // The vocoder already clamps to [-1,1]; clamp again so a future change
+        // upstream cannot wrap a sample to the opposite rail.
+        const v = std.math.clamp(raw[i], -1.0, 1.0);
+        const q: i16 = @intFromFloat(v * 32767.0);
+        std.mem.writeInt(i16, out[i * 2 ..][0..2], q, .little);
+    }
+    return out;
+}
+
 // ── Tests ───────────────────────────────────────────────────────────────────
 
 const testing = std.testing;

@@ -403,7 +403,32 @@ struct VideoGenView: View {
     // becomes the mp4's soundtrack (guaranteed words — no hoping the joint
     // model nails quoted dialogue). Two sources: any audio file, or a line
     // synthesized by the local Qwen3-TTS voice right from this pane.
+    @ViewBuilder
     private var speechSection: some View {
+        // A backend that GENERATES its soundtrack takes no audio input, so the
+        // whole section is hidden rather than offered and refused. Declared by
+        // the preset, never inferred from the model id.
+        if !model.supportsAudioInput {
+            VStack(alignment: .leading, spacing: 6) {
+                HStack {
+                    Text("Sound").font(.subheadline.weight(.semibold))
+                    Spacer()
+                    Text(model.generatesAudio ? "generated with the video" : "not supported")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                if model.generatesAudio {
+                    Text("This model writes its own soundtrack. Describe it in the prompt after \"overall_soundscape:\" (and \"non_diegetic_music:\" for score).")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        } else {
+            audioInputSection
+        }
+    }
+
+    private var audioInputSection: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack {
                 Text("Speech & sound").font(.subheadline.weight(.semibold))
@@ -611,12 +636,15 @@ struct VideoGenView: View {
             Text("More steps refine the video further at the cost of speed. ~8 is fast, ~30 is the reference default.")
                 .font(.caption2).foregroundStyle(.secondary)
 
-            // CFG scale — always adjustable; the native engine honors it in
-            // every pipeline mode (one-stage and both two-stage variants).
-            sliderRow("CFG scale", value: $cfgScale, range: 1...10, step: 0.5,
-                      help: "Classifier-free guidance strength. LTX-2 default: 3.0; 1.0 = off (fastest).")
-            Text("Guidance strength — how closely the video follows your prompt. 1.0 = off: fastest and most natural-looking. Higher sticks to the prompt more strictly but is slower and can look over-saturated. LTX default is 3.0.")
-                .font(.caption2).foregroundStyle(.secondary)
+            // CFG is honored in every LTX pipeline mode, but a CFG-DISTILLED
+            // backend has no guidance pass to scale — showing the slider there
+            // would be a dead control (the Mage-Flow class).
+            if model.supportsCFG {
+                sliderRow("CFG scale", value: $cfgScale, range: 1...10, step: 0.5,
+                          help: "Classifier-free guidance strength. LTX-2 default: 3.0; 1.0 = off (fastest).")
+                Text("Guidance strength — how closely the video follows your prompt. 1.0 = off: fastest and most natural-looking. Higher sticks to the prompt more strictly but is slower and can look over-saturated. LTX default is 3.0.")
+                    .font(.caption2).foregroundStyle(.secondary)
+            }
 
             HStack {
                 numberField("Seed", value: $seed, step: 1)
@@ -627,6 +655,13 @@ struct VideoGenView: View {
                 .help("On: the model stays resident so the next generation is instant. Off (default): it's unloaded to free GPU memory.")
             residencyRow
 
+            if model.supportsLoRA { loraSection }
+        }
+    }
+
+    @ViewBuilder
+    private var loraSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
             Divider()
             Text("Style LoRA").font(.caption.weight(.semibold))
             if loraPath.isEmpty {

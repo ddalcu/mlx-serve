@@ -814,3 +814,71 @@ final class MediaGenServiceTests: XCTestCase {
         XCTAssertFalse(ImageModelPreset.krea2Turbo.supportsReferenceEdit)
     }
 }
+
+// MARK: - MiniMax-H3 declared capabilities
+
+extension MediaGenServiceTests {
+
+    /// H3 is not LTX-shaped, and the pane gates on the PRESET rather than on a
+    /// model id. Mage-Flow shipped five dead image controls before its preset
+    /// started declaring capabilities; this pins the video equivalent.
+    func testMiniMaxH3DeclaresTheCapabilitiesItActuallyHas() {
+        let h3 = VideoModelPreset.minimaxH3
+
+        // No adapter format, no guidance pass (CFG-distilled), no pipeline
+        // modes. The server answers a NAMED 400 for each, so offering them
+        // would be a control that can only fail.
+        XCTAssertFalse(h3.supportsLoRA)
+        XCTAssertFalse(h3.supportsCFG)
+        XCTAssertFalse(h3.supportsPipelineModes)
+
+        // It writes its own soundtrack jointly with the frames, so there is no
+        // audio INPUT to condition on.
+        XCTAssertFalse(h3.supportsAudioInput)
+        XCTAssertTrue(h3.generatesAudio)
+
+        // LTX keeps every capability — the defaults must not have moved.
+        let ltx = VideoModelPreset.ltx23Q4
+        XCTAssertTrue(ltx.supportsLoRA)
+        XCTAssertTrue(ltx.supportsCFG)
+        XCTAssertTrue(ltx.supportsPipelineModes)
+        XCTAssertTrue(ltx.supportsAudioInput)
+    }
+
+    /// H3's ladder is 17k+5, LTX's is 8N+1. Offering a count off the ladder
+    /// means the server snaps it and the clip is a different length than the
+    /// one requested — which silently desynchronizes an external audio mux.
+    func testMiniMaxH3FrameLadderIs17kPlus5() {
+        let h3 = VideoModelPreset.minimaxH3
+        XCTAssertFalse(h3.frameOptions.isEmpty)
+        for n in h3.frameOptions {
+            XCTAssertEqual(n % 17, 5, "\(n) is not on the 17k+5 ladder")
+            XCTAssertLessThanOrEqual(n, h3.maxFrames)
+        }
+        XCTAssertEqual(h3.frameOptions.first, 5)
+        XCTAssertTrue(h3.frameOptions.contains(56))
+        XCTAssertTrue(h3.frameOptions.contains(124))
+
+        // Every quality preset's frame count must land ON the ladder, or the
+        // Frames picker renders blank for that tier.
+        for q in QualityPreset.allCases {
+            let n = h3.settings(q).numFrames
+            XCTAssertTrue(h3.frameOptions.contains(n),
+                          "\(q) frame count \(n) is off the ladder")
+        }
+
+        // LTX's ladder is a DIFFERENT rule and must not have been changed.
+        for n in VideoModelPreset.ltx23Q4.frameOptions {
+            XCTAssertEqual(n % 8, 1, "\(n) is not on LTX's 8N+1 ladder")
+        }
+    }
+
+    /// Every H3 canvas must be a multiple of 32: the DiT patchifies 2x2 over a
+    /// 16x-compressed latent, so an off-grid size cannot be expressed.
+    func testMiniMaxH3ResolutionsAreOn32PixelGrid() {
+        for r in VideoModelPreset.minimaxH3.resolutions {
+            XCTAssertEqual(r.width % 32, 0, "width \(r.width) is off the 32 grid")
+            XCTAssertEqual(r.height % 32, 0, "height \(r.height) is off the 32 grid")
+        }
+    }
+}

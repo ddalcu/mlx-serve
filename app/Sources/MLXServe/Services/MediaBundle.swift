@@ -144,6 +144,40 @@ extension MediaBundle {
     /// SOUND track — the `dgrauet/ltx-2.3-mlx-q4` repo ships both. They're
     /// deliberately NOT ready markers: a checkpoint without them still completes
     /// and plays (silently). The server loads both from the model dir.
+    /// MiniMax-H3: ONE self-contained repo — DiT, text encoder, both VAEs and
+    /// the tokenizer. Upstream splits these across `Comfy-Org` (weights, no
+    /// tokenizer) and `MiniMaxAI` (tokenizer); our converted mirror bundles
+    /// them so there is no second component to keep in sync.
+    ///
+    /// `audio_vae.safetensors` is allowlisted but is NOT a ready marker, the
+    /// same call the LTX bundle makes: without it the server still generates,
+    /// the clip is just silent.
+    static func minimaxH3(repo: String, displayName: String) -> MediaBundle {
+        MediaBundle(
+            id: "minimax-h3:\(repo)",
+            displayName: displayName,
+            components: [
+                MediaComponent(
+                    repo: repo,
+                    selection: FileSelection(keepSafetensors: [
+                        "transformer.safetensors", "text_encoder.safetensors",
+                        "video_vae.safetensors", "audio_vae.safetensors",
+                    ]),
+                    readyMarkers: [
+                        "config.json", "transformer.safetensors",
+                        "text_encoder.safetensors", "video_vae.safetensors",
+                        // The tokenizer is a ready marker BECAUSE it ships in
+                        // this repo: without it there is no prompt to encode,
+                        // and upstream does not provide one alongside the
+                        // weights.
+                        "tokenizer.json",
+                    ]
+                ),
+            ],
+            sizeEstimateGB: 69
+        )
+    }
+
     static func ltx(repo: String, displayName: String) -> MediaBundle {
         MediaBundle(
             id: "ltx:\(repo)",
@@ -325,7 +359,10 @@ extension AudioModelPreset {
 
 extension VideoModelPreset {
     var bundle: MediaBundle {
-        .ltx(repo: repo, displayName: name)
+        switch backend {
+        case .ltx:       return .ltx(repo: repo, displayName: name)
+        case .minimaxH3: return .minimaxH3(repo: repo, displayName: name)
+        }
     }
 }
 

@@ -351,6 +351,14 @@ struct VideoQualitySettings: Hashable {
     let numFrames: Int
 }
 
+/// Which server-side engine arm serves this preset. Explicit rather than
+/// sniffed from the id: the download bundle and the request surface both
+/// dispatch on it, and a magic-string check in two places is how they drift.
+enum VideoBackendKind: String, Hashable {
+    case ltx
+    case minimaxH3
+}
+
 struct VideoModelPreset: Identifiable, Hashable {
     let id: String
     let name: String
@@ -367,6 +375,28 @@ struct VideoModelPreset: Identifiable, Hashable {
     let frameOptions: [Int]
     /// Plain-English explanation shown under the model in the Media pane.
     let description: String
+
+    // What the BACKEND can actually do. Declared, never inferred — the pane
+    // gates on these instead of assuming every video model is LTX-shaped.
+    // Mage-Flow shipped with five dead image controls before its preset started
+    // declaring capabilities; these exist so the video pane cannot repeat it.
+    // Defaults describe LTX, so existing presets are unchanged.
+
+    /// Which engine arm serves it.
+    var backend: VideoBackendKind = .ltx
+    /// Runtime LoRA adapters. MiniMax-H3 has no adapter format; the server
+    /// answers a named 400 rather than silently ignoring the field.
+    var supportsLoRA: Bool = true
+    /// Classifier-free guidance. H3 is CFG-DISTILLED — there is no guidance
+    /// pass to scale, so a CFG slider would be a dead control.
+    var supportsCFG: Bool = true
+    /// One-stage / two-stage / two-stage-HQ pipelines. LTX-only.
+    var supportsPipelineModes: Bool = true
+    /// Audio-to-video conditioning from an attached clip. H3 GENERATES its
+    /// soundtrack jointly with the frames and takes no audio input on FL2VA.
+    var supportsAudioInput: Bool = true
+    /// Whether the model produces its own soundtrack.
+    var generatesAudio: Bool = false
 
     static func == (lhs: Self, rhs: Self) -> Bool { lhs.id == rhs.id }
     func hash(into hasher: inout Hasher) { hasher.combine(id) }
@@ -432,7 +462,71 @@ struct VideoModelPreset: Identifiable, Hashable {
         )
     }()
 
-    static let all: [VideoModelPreset] = [.ltx23Q4]
+    /// MiniMax-H3 canvases. Every axis must be a multiple of 32, and cost is
+    /// roughly quadratic in the pixel count because the DiT attends over one
+    /// packed sequence — so the labels carry rough wall-clock, since the jump
+    /// from 256² to 480p is minutes to most of an hour on an M4 Max.
+    private static let h3Resolutions: [ResolutionOption] = [
+        .init(width: 256,  height: 256, label: "256 × 256 (square) — fastest"),
+        .init(width: 384,  height: 256, label: "384 × 256 (landscape 3:2)"),
+        .init(width: 448,  height: 256, label: "448 × 256 (widescreen 16:9)"),
+        .init(width: 512,  height: 512, label: "512 × 512 (square) — slow"),
+        .init(width: 864,  height: 480, label: "864 × 480 (480p 16:9) — very slow"),
+    ]
+
+    /// MiniMax-H3's frame ladder is `17k + 5`, NOT LTX's `8N + 1`: its VAE
+    /// folds 17 source frames into 5 latent tokens. The picker must only offer
+    /// these, or the server snaps the count and the clip is a different length
+    /// than the one requested.
+    private static func h3FrameLadder(maxFrames: Int) -> [Int] {
+        var out: [Int] = []
+        var n = 5
+        while n <= maxFrames {
+            out.append(n)
+            n += 17
+        }
+        return out
+    }
+
+    static let minimaxH3: VideoModelPreset = {
+        // The model's own trained range is ~124-362 frames; below 124 is
+        // off-distribution but generates fine and is far faster.
+        let cap = 124
+        return VideoModelPreset(
+            id: "ddalcu/MiniMax-H3-FL2VA-MLX-Serve-8bit",
+            name: "MiniMax-H3 (Hailuo 3.0) 8-bit — video + native audio",
+            repo: "ddalcu/MiniMax-H3-FL2VA-MLX-Serve-8bit",
+            approxDownloadGB: 69,
+            // Self-contained: weights, both VAEs and the tokenizer ship in the
+            // one repo, so there is no separate text-encoder pull.
+            approxFirstRunDownloadGB: 69,
+            // The text encoder and the DiT are staged sequentially (they cannot
+            // both be resident), so the peak is the larger of the two plus
+            // activations, not their sum.
+            approxRAMGB: 44,
+            resolutions: h3Resolutions,
+            defaultResolution: h3Resolutions[0],
+            fps: 24,
+            qualityProfiles: [
+                .fast:         .init(mode: .oneStage, steps: 16, cfgScale: 1.0, stgScale: 0.0, numFrames: 56),
+                .good:         .init(mode: .oneStage, steps: 30, cfgScale: 1.0, stgScale: 0.0, numFrames: 56),
+                .quality:      .init(mode: .oneStage, steps: 40, cfgScale: 1.0, stgScale: 0.0, numFrames: 73),
+                .superQuality: .init(mode: .oneStage, steps: 50, cfgScale: 1.0, stgScale: 0.0, numFrames: 124),
+            ],
+            defaultQuality: .good,
+            maxFrames: cap,
+            frameOptions: h3FrameLadder(maxFrames: cap),
+            description: "Generates video with a matching stereo soundtrack from one prompt — the sound is produced jointly with the picture, not dubbed on after. Describe the scene, then the audio you want after 'overall_soundscape:'. Compute-heavy: a couple of minutes at 256 × 256, considerably longer at 480p.",
+            backend: .minimaxH3,
+            supportsLoRA: false,
+            supportsCFG: false,
+            supportsPipelineModes: false,
+            supportsAudioInput: false,
+            generatesAudio: true
+        )
+    }()
+
+    static let all: [VideoModelPreset] = [.ltx23Q4, .minimaxH3]
 }
 
 // MARK: - Audio presets (TTS / voice cloning)
