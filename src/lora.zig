@@ -192,6 +192,11 @@ const flux2_table = [_]AliasRow{
     t("transformer_blocks.{}.ff.linear_out", "transformer_blocks.{}.ff.linear_out"),
     t("transformer_blocks.{}.ff_context.linear_in", "transformer_blocks.{}.ff_context.linear_in"),
     t("transformer_blocks.{}.ff_context.linear_out", "transformer_blocks.{}.ff_context.linear_out"),
+    // BFL-style double-block MLP keys (ai-toolkit exports)
+    t("transformer_blocks.{}.ff.linear_in", "double_blocks.{}.img_mlp.0"),
+    t("transformer_blocks.{}.ff.linear_out", "double_blocks.{}.img_mlp.2"),
+    t("transformer_blocks.{}.ff_context.linear_in", "double_blocks.{}.txt_mlp.0"),
+    t("transformer_blocks.{}.ff_context.linear_out", "double_blocks.{}.txt_mlp.2"),
     // Single-stream blocks (fused on both sides — no split)
     t("single_transformer_blocks.{}.attn.to_qkv_mlp_proj", "single_transformer_blocks.{}.attn.to_qkv_mlp_proj"),
     t("single_transformer_blocks.{}.attn.to_qkv_mlp_proj", "single_blocks.{}.linear1"),
