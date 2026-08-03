@@ -62,10 +62,10 @@ linear ~10.7 PF, attention ~3.7 PF, AdaLN ~0.002 PF, VAE ~0.6 PF.
 - [ ] **No `tests/test_minimax_h3.sh`.** Every other media backend has one. It
       should boot a server over the converted dir and assert: `/v1/models`
       advertises `video`, a small generation returns rgb8 + pcm_s16le of the
-      right lengths, the four named 400s fire (`lora_path`, `cfg_scale`,
-      `stg_scale`, `pipeline`), a non-32-multiple size 400s, and a chat request
-      against it 400s with the media-modality message. Add it to
-      `tests/CLAUDE.md`'s matrix.
+      right lengths, `lora_path` 400s (the one field that cannot be honored in
+      any form), a non-32-multiple size 400s, a chat request against it 400s
+      with the media-modality message, and `stream:true` emits progress events
+      followed by a `complete` event. Add it to `tests/CLAUDE.md`'s matrix.
 - [ ] **No `docs/reference.md` section.** The growth policy requires one per
       subsystem (Layout row + reference section); only the Layout row exists.
 - [ ] **VAE encode is unimplemented**, so first/last-frame conditioning (the
