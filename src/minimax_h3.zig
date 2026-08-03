@@ -1691,6 +1691,9 @@ pub const GenPaths = struct {
     text_encoder: []const u8,
     dit: []const u8,
     vae: []const u8,
+    /// Audio VAE. Optional: absent means the clip is silent rather than
+    /// failing, since the video stream is complete without it.
+    audio_vae: ?[]const u8 = null,
 };
 
 pub const GenResult = struct {
@@ -1698,6 +1701,8 @@ pub const GenResult = struct {
     pixels: mlx.mlx_array,
     /// Final audio latent [1, 32, 2, audio_t], still in latent space.
     audio_latent: mlx.mlx_array,
+    /// Decoded stereo waveform [2, L] at 32 kHz, when an audio VAE was given.
+    audio: ?mlx.mlx_array = null,
     frame_count: u32,
     width: u32,
     height: u32,
@@ -1705,6 +1710,7 @@ pub const GenResult = struct {
     pub fn deinit(self: *GenResult) void {
         _ = mlx.mlx_array_free(self.pixels);
         _ = mlx.mlx_array_free(self.audio_latent);
+        if (self.audio) |a| _ = mlx.mlx_array_free(a);
     }
 };
 
@@ -1865,11 +1871,26 @@ pub fn generate(
     const apc = try contig(ap, s);
     defer _ = mlx.mlx_array_free(apc);
     const audio_latent = try reshape(apc, &[_]c_int{ 1, 32, 2, at }, s);
+    errdefer _ = mlx.mlx_array_free(audio_latent);
+
+    // ── 5. audio VAE (optional) ──
+    var audio_wave: ?mlx.mlx_array = null;
+    if (paths.audio_vae) |apath| {
+        const audio_mod = @import("minimax_h3_audio.zig");
+        var aw = try model_mod.loadWeightsSingleFile(allocator, apath);
+        defer aw.deinit();
+        const wave = try audio_mod.decode(allocator, &aw, audio_latent, dt, s);
+        try mlx.check(mlx.mlx_array_eval(wave));
+        audio_wave = wave;
+        _ = mlx.mlx_clear_cache();
+        log.info("[minimax-h3] audio decoded: {d} samples/ch at {d} Hz\n", .{ mlx.getShape(wave)[1], audio_mod.SAMPLE_RATE });
+    }
 
     const pshape = mlx.getShape(pixels);
     return .{
         .pixels = pixels,
         .audio_latent = audio_latent,
+        .audio = audio_wave,
         .frame_count = @intCast(pshape[2]),
         .height = @intCast(pshape[3]),
         .width = @intCast(pshape[4]),
@@ -1931,6 +1952,8 @@ test "minimax h3 live: generates a clip" {
     defer a.free(dit);
     const vae = try std.fmt.allocPrint(a, "{s}/src/vae/minimax_h3_video_vae_fp16.safetensors", .{dir});
     defer a.free(vae);
+    const avae = try std.fmt.allocPrint(a, "{s}/src/vae/minimax_h3_audio_vae_fp32.safetensors", .{dir});
+    defer a.free(avae);
     const tokdir = try std.fmt.allocPrint(a, "{s}/src_orig/FL2VA/processor", .{dir});
     defer a.free(tokdir);
 
@@ -1944,6 +1967,7 @@ test "minimax h3 live: generates a clip" {
         .text_encoder = te,
         .dit = dit,
         .vae = vae,
+        .audio_vae = avae,
     }, .{
         .prompt = prompt,
         .width = size,
@@ -1962,6 +1986,17 @@ test "minimax h3 live: generates a clip" {
     try testing.expectEqual(size, res.height);
 
     try writeFrames(a, io, &res, out_dir, s);
+
+    // Audio must be finite AND non-silent: an all-zero waveform passes every
+    // shape assertion and is exactly what a broken vocoder produces.
+    const wave = res.audio orelse return error.MissingAudio;
+    try testing.expect(try allFinite(wave, s));
+    const peak = try absMax(wave, s);
+    std.debug.print("[minimax-h3] audio peak {d:.4}\n", .{peak});
+    try testing.expect(peak > 0.001);
+    try testing.expect(peak <= 1.0); // the vocoder clamps
+    try writeWav(a, io, wave, out_dir, s);
+
     std.debug.print("[minimax-h3] wrote {d} frames {d}x{d} to {s}\n", .{ res.frame_count, res.width, res.height, out_dir });
 }
 
@@ -2038,6 +2073,46 @@ fn writeFrames(a: std.mem.Allocator, io: std.Io, res: *const GenResult, out_dir:
 
 fn oneLike(like: mlx.mlx_array, s: S) !mlx.mlx_array {
     return scalarLike(1.0, like, s);
+}
+
+fn absMax(x: mlx.mlx_array, s: S) !f32 {
+    var ab = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ab);
+    try mlx.check(mlx.mlx_abs(&ab, x, s));
+    var mx = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(mx);
+    try mlx.check(mlx.mlx_max(&mx, ab, false, s));
+    try mlx.check(mlx.mlx_array_eval(mx));
+    var v: f32 = 0;
+    try mlx.check(mlx.mlx_array_item_float32(&v, mx));
+    return v;
+}
+
+/// Stereo [2, L] f32 -> interleaved 16-bit WAV at 32 kHz.
+fn writeWav(a: std.mem.Allocator, io: std.Io, wave: mlx.mlx_array, out_dir: []const u8, s: S) !void {
+    const wav = @import("wav.zig");
+    const audio_mod = @import("minimax_h3_audio.zig");
+    // [2, L] -> [L, 2] interleaved, which is what encodePcm16 expects.
+    const t = try transpose(wave, &[_]c_int{ 1, 0 }, s);
+    defer _ = mlx.mlx_array_free(t);
+    const tc = try contig(t, s);
+    defer _ = mlx.mlx_array_free(tc);
+    const f = try astype(tc, mlx.mlx_dtype.float32, s);
+    defer _ = mlx.mlx_array_free(f);
+    try mlx.check(mlx.mlx_array_eval(f));
+    const n: usize = @intCast(mlx.mlx_array_size(f));
+    const raw = mlx.mlx_array_data_float32(f) orelse return error.NoAudioData;
+    const bytes = try wav.encodePcm16(a, raw[0..n], audio_mod.SAMPLE_RATE, 2);
+    defer a.free(bytes);
+
+    var d = try std.Io.Dir.cwd().openDir(io, out_dir, .{});
+    defer d.close(io);
+    var fh = try d.createFile(io, "audio.wav", .{});
+    defer fh.close(io);
+    var wbuf: [4096]u8 = undefined;
+    var w = fh.writer(io, &wbuf);
+    try w.interface.writeAll(bytes);
+    try w.interface.flush();
 }
 
 test "minimax h3: constants match the reference" {
