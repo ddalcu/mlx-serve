@@ -59,13 +59,6 @@ linear ~10.7 PF, attention ~3.7 PF, AdaLN ~0.002 PF, VAE ~0.6 PF.
 
 **These are real defects, not polish. Do them before any perf work.**
 
-- [ ] **No SSE progress.** `handleVideoH3` ignores `stream` and answers with one
-      `sendBytesJson` at the end. A 22-minute generation therefore shows the app
-      a dead progress card, which is exactly the "a media generation shows a
-      meter or it reads as a hang" rule in `app/CLAUDE.md`. Wire `sse.Progress`
-      through `minimax_h3.generate`'s step loop (it already logs per step) and
-      emit the same event shape the LTX path does. **Highest-value item in this
-      file** — it is user-visible on every single run.
 - [ ] **No `tests/test_minimax_h3.sh`.** Every other media backend has one. It
       should boot a server over the converted dir and assert: `/v1/models`
       advertises `video`, a small generation returns rgb8 + pcm_s16le of the
@@ -177,6 +170,15 @@ Ordered by expected value given what is already known.
   purpose** (discovery must not import mlx) and drifted once already, producing
   a 400 for a model the server could serve. `gen.media_model_types` plus its
   bidirectional test is the guard; extend the list, not one predicate.
+- **Hiding a control is not the same as not sending its field.** The pane
+  gated H3's CFG/LoRA/pipeline controls, but `VideoGenService.requestBody`
+  still put `pipeline` in the body unconditionally, so every H3 generation
+  carried a field that backend has no concept of and the server's named 400
+  fired on all of them. The request builder now gates on the same declared
+  capabilities the view does. Corollary learned the hard way: a server-side
+  400 on the mere PRESENCE of a field is brittle when a shared client always
+  sends it — reject only what cannot be honored in any form (LoRA), and ignore
+  what is merely inapplicable (CFG on a distilled model).
 - **A readiness marker belongs to a BACKEND, never to a modality.**
   `detectModality` gated the whole `.video` modality on LTX's
   `connector.safetensors`. H3 has no connector, so detection returned null and

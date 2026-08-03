@@ -2219,7 +2219,7 @@ pub fn videoGuiderDefaults(pipeline: VideoPipeline, cfg_video: ?f32, cfg_audio: 
 /// H3 result -> the SAME wire shape the LTX path emits (base64 rgb8 frames plus
 /// interleaved pcm_s16le), so the Swift client's existing decode and
 /// AVAssetWriter mux need no new branch.
-fn sendH3Video(allocator: std.mem.Allocator, conn: *Conn, res: *const minimax_h3.GenResult) !void {
+fn sendH3Video(allocator: std.mem.Allocator, conn: *Conn, res: *const minimax_h3.GenResult, want_stream: bool) !void {
     const s = mlx.gpuStream();
     const audio_mod = @import("minimax_h3_audio.zig");
 
@@ -2246,7 +2246,8 @@ fn sendH3Video(allocator: std.mem.Allocator, conn: *Conn, res: *const minimax_h3
 
     var out: std.ArrayList(u8) = .empty;
     defer out.deinit(allocator);
-    const head = try std.fmt.allocPrint(allocator, "{{\"created\":0,\"frames\":{d},\"height\":{d},\"width\":{d},\"fps\":24,\"format\":\"rgb8\",\"data\":\"", .{ res.frame_count, res.height, res.width });
+    const prefix = if (want_stream) "data: {\"type\":\"complete\"," else "{\"created\":0,";
+    const head = try std.fmt.allocPrint(allocator, "{s}\"frames\":{d},\"height\":{d},\"width\":{d},\"fps\":24,\"format\":\"rgb8\",\"data\":\"", .{ prefix, res.frame_count, res.height, res.width });
     defer allocator.free(head);
     try out.appendSlice(allocator, head);
     try out.appendSlice(allocator, b64);
@@ -2258,7 +2259,8 @@ fn sendH3Video(allocator: std.mem.Allocator, conn: *Conn, res: *const minimax_h3
         try out.appendSlice(allocator, ab);
         try out.appendSlice(allocator, "\"");
     }
-    try out.appendSlice(allocator, "}");
+    try out.appendSlice(allocator, if (want_stream) "}\n\n" else "}");
+    if (want_stream) return conn.writeAll(out.items);
     return sendBytesJson(conn, allocator, out.items);
 }
 
@@ -2294,10 +2296,16 @@ fn handleVideoH3(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []
     defer allocator.free(prompt);
     if (prompt.len == 0) return sendError(conn, 400, "empty 'prompt'");
 
-    for ([_][]const u8{ "lora_path", "cfg_scale", "stg_scale", "pipeline" }) |field| {
-        if (extractJsonString(body, field) != null or extractJsonInt(body, field) != null) {
-            return sendError(conn, 400, "MiniMax-H3 does not support this field; it has no LoRA, no classifier-free guidance and no pipeline modes");
-        }
+    // Only LoRA is refused, because only LoRA is a request the server cannot
+    // honor in any form. `cfg_scale` / `stg_scale` / `pipeline` are NOT
+    // rejected: the app sends them unconditionally for every video backend,
+    // so 400-ing on their PRESENCE made every H3 request fail. Hiding a
+    // control is not the same as not sending the field. They are ignored,
+    // which is honest here — H3 is CFG-distilled and single-pipeline, so
+    // there is no setting they could have selected that we silently dropped.
+    if (extractJsonString(body, "lora_path")) |lp| {
+        if (lp.len > 0)
+            return sendError(conn, 400, "MiniMax-H3 has no LoRA adapter format");
     }
 
     const width: u32 = @intCast(extractJsonInt(body, "width") orelse 256);
@@ -2312,7 +2320,14 @@ fn handleVideoH3(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []
     // Snap to the model's own ladder and SAY SO: silently generating a
     // different length than asked is how a client's audio mux drifts.
     const shape = minimax_h3.temporalShape(requested_frames);
-    log.info("[video] minimax-h3 {d}x{d} {d}f (requested {d}, snapped to the 17k+5 ladder) steps={d}\n", .{ width, height, shape.frame_count, requested_frames, steps });
+    const want_stream = sse.bodyWantsTrue(body, "stream");
+    log.info("[video] minimax-h3 {d}x{d} {d}f (requested {d}, snapped to the 17k+5 ladder) steps={d} stream={}\n", .{ width, height, shape.frame_count, requested_frames, steps, want_stream });
+
+    // Generations here run for MINUTES, so a silent socket is indistinguishable
+    // from a wedged server; the client drives its meter off these events.
+    var sctx = sse.StreamCtx{ .conn = conn };
+    const prog: ?sse.Progress = if (want_stream) sctx.progress() else null;
+    if (want_stream) try conn.writeAll(sse.headers);
 
     const paths = try engine.paths(allocator);
     defer {
@@ -2329,13 +2344,16 @@ fn handleVideoH3(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []
         .frames = requested_frames,
         .steps = steps,
         .seed = seed,
-    }, mlx.gpuStream()) catch |e| {
+    }, prog, mlx.gpuStream()) catch |e| {
         log.err("[video] minimax-h3 generation failed: {any}\n", .{e});
+        // Mid-stream the headers are already out, so an error must be an SSE
+        // event, not a status line the client will never parse.
+        if (want_stream) return sse.sendError(conn, "MiniMax-H3 generation failed");
         return sendError(conn, 500, "MiniMax-H3 generation failed");
     };
     defer res.deinit();
 
-    try sendH3Video(allocator, conn, &res);
+    try sendH3Video(allocator, conn, &res, want_stream);
 }
 
 fn handleVideoLtx(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []const u8, engine: *LtxVideoEngine) !void {

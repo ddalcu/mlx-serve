@@ -31,6 +31,7 @@ const mlx = @import("mlx.zig");
 const model_mod = @import("model.zig");
 const log = @import("log.zig");
 const mage_flow = @import("mage_flow.zig");
+const gen_sse = @import("gen_sse.zig");
 
 const Weights = model_mod.Weights;
 const S = mlx.mlx_stream;
@@ -1732,6 +1733,7 @@ pub fn generate(
     io: std.Io,
     paths: GenPaths,
     req: GenRequest,
+    progress: ?gen_sse.Progress,
     s: S,
 ) !GenResult {
     const vae_mod = @import("minimax_h3_vae.zig");
@@ -1754,6 +1756,8 @@ pub fn generate(
     defer allocator.free(ids);
     for (ids_u32, 0..) |v, i| ids[i] = @intCast(v);
     log.info("[minimax-h3] prompt -> {d} tokens\n", .{ids.len});
+
+    if (progress) |p| p.emit("Encoding prompt", 0, req.steps);
 
     // ── 2. text encoder, then FREE it before the DiT loads ──
     const text_hidden: mlx.mlx_array = blk: {
@@ -1827,6 +1831,12 @@ pub fn generate(
 
             try mlx.check(mlx.mlx_array_eval(video_x));
             try mlx.check(mlx.mlx_array_eval(audio_x));
+            if (progress) |p| {
+                // Poll BEFORE emitting: a vanished client should stop the GPU,
+                // not have one more step charged to it first.
+                if (p.cancelled()) return error.Cancelled;
+                p.emit("Generating", @intCast(i + 1), req.steps);
+            }
             // Every denoise loop owes a periodic cache clear: MLX's pool is
             // unbounded and these shapes repeat, so without it the process
             // footprint ratchets across steps.
@@ -1853,6 +1863,7 @@ pub fn generate(
     const zlat = try reshape(vpc, &[_]c_int{ 1, c24, @intCast(shape.latent_t), @intCast(lat_h), @intCast(lat_w) }, s);
     defer _ = mlx.mlx_array_free(zlat);
 
+    if (progress) |p| p.emit("Decoding video", req.steps, req.steps);
     var vw = try model_mod.loadWeightsSingleFile(allocator, paths.vae);
     defer vw.deinit();
     var dec = try vae_mod.Decoder.load(allocator, &vw, .{}, dt, s);
@@ -1876,6 +1887,7 @@ pub fn generate(
     // ── 5. audio VAE (optional) ──
     var audio_wave: ?mlx.mlx_array = null;
     if (paths.audio_vae) |apath| {
+        if (progress) |p| p.emit("Decoding audio", req.steps, req.steps);
         const audio_mod = @import("minimax_h3_audio.zig");
         var aw = try model_mod.loadWeightsSingleFile(allocator, apath);
         defer aw.deinit();
@@ -2042,7 +2054,7 @@ test "minimax h3 live: generates a clip" {
         .height = size,
         .frames = frames,
         .steps = steps,
-    }, s);
+    }, null, s);
     defer res.deinit();
 
     // The pipeline can produce a plausible-looking tensor full of NaN; a

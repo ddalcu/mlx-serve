@@ -332,15 +332,22 @@ final class VideoGenService: ObservableObject {
             "model": model, "prompt": prompt, "num_frames": request.numFrames,
             "height": request.height, "width": request.width, "steps": request.steps,
             "seed": request.seed,
-            "pipeline": pipeline,
         ]
-        if !dropGuidance {
+        // Send only what the BACKEND declares it can honor. Hiding a control is
+        // not the same as not sending its field: `pipeline` used to go out
+        // unconditionally, which meant every MiniMax-H3 request carried a field
+        // that backend has no concept of. Gating the request against the same
+        // capabilities the pane gates its controls on keeps the two honest.
+        if request.model.supportsPipelineModes {
+            body["pipeline"] = pipeline
+        }
+        if request.model.supportsCFG, !dropGuidance {
             body["cfg_scale"] = request.cfgScale
             body["stg_scale"] = request.stgScale
         }
         if let firstFrameB64 { body["first_frame_image"] = firstFrameB64 }
-        if hasAudio, let audioB64 { body["audio"] = audioB64 }
-        if let lora = request.loraPath, !lora.isEmpty {
+        if request.model.supportsAudioInput, hasAudio, let audioB64 { body["audio"] = audioB64 }
+        if request.model.supportsLoRA, let lora = request.loraPath, !lora.isEmpty {
             body["lora_path"] = lora
             if request.loraScale != 1.0 { body["lora_scale"] = request.loraScale }
         }

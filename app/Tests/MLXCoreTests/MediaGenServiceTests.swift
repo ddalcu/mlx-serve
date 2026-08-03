@@ -899,3 +899,42 @@ extension MediaGenServiceTests {
         }
     }
 }
+
+extension MediaGenServiceTests {
+
+    /// The request must carry only what the backend declares it can honor.
+    /// REGRESSION: `pipeline` was added to the body unconditionally, so every
+    /// MiniMax-H3 generation shipped a field that backend has no concept of and
+    /// the server refused it — the pane's controls were hidden, but the request
+    /// builder had not been told.
+    func testRequestOmitsFieldsTheBackendDoesNotSupport() {
+        let h3 = VideoGenRequest(
+            model: .minimaxH3, prompt: "a cat", width: 256, height: 256,
+            numFrames: 56, fps: 24, mode: .oneStage, steps: 30,
+            cfgScale: 1.0, loraPath: "/tmp/some.safetensors")
+        let body = VideoGenService.requestBody(
+            model: "m", prompt: "a cat", request: h3,
+            firstFrameB64: nil, audioB64: nil)
+
+        XCTAssertNil(body["pipeline"], "H3 has no pipeline modes")
+        XCTAssertNil(body["cfg_scale"], "H3 is CFG-distilled")
+        XCTAssertNil(body["stg_scale"])
+        XCTAssertNil(body["lora_path"], "H3 has no adapter format")
+        // The fields every backend needs must still be there.
+        for k in ["model", "prompt", "num_frames", "height", "width", "steps", "seed"] {
+            XCTAssertNotNil(body[k], "\(k) must always be sent")
+        }
+
+        // LTX keeps all of them — the gating must not have narrowed it.
+        let ltx = VideoGenRequest(
+            model: .ltx23Q4, prompt: "a cat", width: 704, height: 480,
+            numFrames: 97, fps: 24, mode: .oneStage, steps: 12,
+            cfgScale: 3.0, loraPath: "/tmp/some.safetensors")
+        let lbody = VideoGenService.requestBody(
+            model: "m", prompt: "a cat", request: ltx,
+            firstFrameB64: nil, audioB64: nil)
+        XCTAssertNotNil(lbody["pipeline"])
+        XCTAssertNotNil(lbody["cfg_scale"])
+        XCTAssertNotNil(lbody["lora_path"])
+    }
+}
