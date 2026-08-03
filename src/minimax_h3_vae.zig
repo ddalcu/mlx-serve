@@ -15,10 +15,12 @@
 //!     equivalent.
 //!   * SPATIAL TILING at 256 PIXELS. `create_token_ids` normalizes coordinates
 //!     over whatever extent it is handed, so a tile's positions differ from the
-//!     same region's positions in an untiled pass. At or below a 256-pixel
-//!     extent `split_tiles` returns a single tile and the two agree; above it
-//!     they do not, so `decode` REFUSES rather than silently producing
-//!     off-distribution output (see `TilingUnsupported`).
+//!     same region's positions in an untiled pass — decoding a 864-wide canvas
+//!     in one go is a DIFFERENT computation, not an approximation of the tiled
+//!     one. At or below 256 px `splitTiles` returns a single tile and the two
+//!     agree; above it `decodeSpatial` walks the grid, cross-fades each tile
+//!     into its up/left neighbours and trims so the kept extents tile the
+//!     canvas exactly.
 //!
 //! Ported from ComfyUI `comfy/ldm/minimax/vae.py`.
 
@@ -160,11 +162,57 @@ fn padFrames(z_len: u32, pad_tokens: u32) u32 {
     return sum;
 }
 
-/// Whether a pixel extent decodes as ONE spatial tile. Above this the
-/// reference's tiled path renormalizes each tile's rope coordinates, which we
-/// do not implement — see the file header.
+/// Whether a pixel extent decodes as ONE spatial tile.
 pub fn fitsSingleTile(pixel_extent: u32) bool {
     return TILE_SIZE >= pixel_extent;
+}
+
+/// Minimum tile overlap in pixels (`vae_tile_overlap_min`).
+pub const TILE_OVERLAP_MIN: u32 = 64;
+
+/// Spatial tile plan for one axis, in PIXELS. Mirrors `split_tiles`.
+///
+/// Tiles are all TILE_SIZE long; the overlaps absorb the difference, are grown
+/// in whole `vae_ratio` units so every boundary lands on a latent row, and are
+/// spread round-robin so no single seam carries the slack.
+pub const TilePlan = struct {
+    starts: []u32,
+    overlaps: []u32,
+    len: u32, // every tile is this long
+    allocator: std.mem.Allocator,
+
+    pub fn deinit(self: *TilePlan) void {
+        self.allocator.free(self.starts);
+        self.allocator.free(self.overlaps);
+    }
+    pub fn count(self: *const TilePlan) usize {
+        return self.starts.len;
+    }
+};
+
+pub fn splitTiles(allocator: std.mem.Allocator, input_len: u32) !TilePlan {
+    if (TILE_SIZE >= input_len) {
+        const starts = try allocator.alloc(u32, 1);
+        starts[0] = 0;
+        return .{ .starts = starts, .overlaps = try allocator.alloc(u32, 0), .len = input_len, .allocator = allocator };
+    }
+    var n: u32 = (input_len + TILE_SIZE - 1) / TILE_SIZE;
+    var remaining: i64 = 0;
+    while (true) {
+        remaining = @as(i64, TILE_SIZE) * n - @as(i64, TILE_OVERLAP_MIN) * (n - 1) - @as(i64, input_len);
+        if (remaining < 0) n += 1 else break;
+    }
+    const overlaps = try allocator.alloc(u32, n - 1);
+    errdefer allocator.free(overlaps);
+    @memset(overlaps, TILE_OVERLAP_MIN);
+    const units: u32 = @intCast(@divFloor(remaining, @as(i64, VAE_RATIO)));
+    for (0..units) |i| overlaps[i % overlaps.len] += VAE_RATIO;
+
+    const starts = try allocator.alloc(u32, n);
+    errdefer allocator.free(starts);
+    starts[0] = 0;
+    for (0..n - 1) |i| starts[i + 1] = starts[i] + TILE_SIZE - overlaps[i];
+    return .{ .starts = starts, .overlaps = overlaps, .len = TILE_SIZE, .allocator = allocator };
 }
 
 // ── mlx helpers ─────────────────────────────────────────────────────────────
@@ -609,16 +657,18 @@ pub const Decoder = struct {
 
 /// Cross-fade `a`'s tail into `b`'s head over `extent` frames on axis 2.
 /// Linear ramp, matching `blend`.
-fn blendFrames(a_arr: mlx.mlx_array, b_arr: mlx.mlx_array, extent: u32, alloc: std.mem.Allocator, dt: mlx.mlx_dtype, s: S) !mlx.mlx_array {
-    const an: u32 = @intCast(mlx.getShape(a_arr)[2]);
-    const bn: u32 = @intCast(mlx.getShape(b_arr)[2]);
+fn blendAxis(a_arr: mlx.mlx_array, b_arr: mlx.mlx_array, extent: u32, axis: usize, alloc: std.mem.Allocator, dt: mlx.mlx_dtype, s: S) !mlx.mlx_array {
+    const an: u32 = @intCast(mlx.getShape(a_arr)[axis]);
+    const bn: u32 = @intCast(mlx.getShape(b_arr)[axis]);
     const e = @min(@min(an, bn), extent);
     if (e == 0) return contig(b_arr, s);
 
     const wbuf = try alloc.alloc(f32, e);
     defer alloc.free(wbuf);
     for (0..e) |i| wbuf[i] = @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(e));
-    const wshape = [_]c_int{ 1, 1, @intCast(e), 1, 1 };
+    // Broadcast the ramp along `axis` only.
+    var wshape = [_]c_int{ 1, 1, 1, 1, 1 };
+    wshape[axis] = @intCast(e);
     const wb_arr = mlx.mlx_array_new_data(wbuf.ptr, &wshape, 5, mlx.mlx_dtype.float32);
     defer _ = mlx.mlx_array_free(wb_arr);
     const wb = try astype(wb_arr, dt, s);
@@ -629,9 +679,9 @@ fn blendFrames(a_arr: mlx.mlx_array, b_arr: mlx.mlx_array, extent: u32, alloc: s
     defer _ = mlx.mlx_array_free(wa);
     try mlx.check(mlx.mlx_subtract(&wa, one, wb, s));
 
-    const a_tail = try sliceAxis(a_arr, 2, @intCast(an - e), @intCast(an), s);
+    const a_tail = try sliceAxis(a_arr, axis, @intCast(an - e), @intCast(an), s);
     defer _ = mlx.mlx_array_free(a_tail);
-    const b_head = try sliceAxis(b_arr, 2, 0, @intCast(e), s);
+    const b_head = try sliceAxis(b_arr, axis, 0, @intCast(e), s);
     defer _ = mlx.mlx_array_free(b_head);
     const ta = try mulA(a_tail, wa, s);
     defer _ = mlx.mlx_array_free(ta);
@@ -640,27 +690,144 @@ fn blendFrames(a_arr: mlx.mlx_array, b_arr: mlx.mlx_array, extent: u32, alloc: s
     const mixed = try addA(ta, tb, s);
     defer _ = mlx.mlx_array_free(mixed);
     if (bn == e) return contig(mixed, s);
-    const rest = try sliceAxis(b_arr, 2, @intCast(e), @intCast(bn), s);
+    const rest = try sliceAxis(b_arr, axis, @intCast(e), @intCast(bn), s);
     defer _ = mlx.mlx_array_free(rest);
-    return concat(&[_]mlx.mlx_array{ mixed, rest }, 2, s);
+    return concat(&[_]mlx.mlx_array{ mixed, rest }, @intCast(axis), s);
+}
+
+/// One latent chunk -> pixels, spatially TILED when the canvas exceeds the
+/// 256-px tile extent.
+///
+/// Tiles are decoded independently (each renormalizes its own rope coordinates,
+/// which is why this is not equivalent to one big pass), cross-faded into their
+/// up/left neighbours over the planned overlap, then trimmed so the kept extents
+/// tile the canvas exactly. Row-major assembly by concatenation rather than
+/// writes into a mutable canvas.
+fn decodeSpatial(dec: *const Decoder, z: mlx.mlx_array, alloc: std.mem.Allocator, s: S) !mlx.mlx_array {
+    const shp = mlx.getShape(z);
+    const lat_h: u32 = @intCast(shp[3]);
+    const lat_w: u32 = @intCast(shp[4]);
+    const px_h = lat_h * VAE_RATIO;
+    const px_w = lat_w * VAE_RATIO;
+    if (fitsSingleTile(px_h) and fitsSingleTile(px_w)) return dec.decodePixels(z, s);
+
+    var yp = try splitTiles(alloc, px_h);
+    defer yp.deinit();
+    var xp = try splitTiles(alloc, px_w);
+    defer xp.deinit();
+
+    // Bottom strips of the previous row, one per column, captured BEFORE that
+    // row's tiles were blended (matching the reference's clone order).
+    var row_tails = try alloc.alloc(?mlx.mlx_array, xp.count());
+    defer alloc.free(row_tails);
+    @memset(row_tails, null);
+    defer for (row_tails) |t| if (t) |v| {
+        _ = mlx.mlx_array_free(v);
+    };
+
+    var rows = try alloc.alloc(mlx.mlx_array, yp.count());
+    defer alloc.free(rows);
+    var rows_built: usize = 0;
+    errdefer for (rows[0..rows_built]) |r| {
+        _ = mlx.mlx_array_free(r);
+    };
+
+    for (yp.starts, 0..) |y0, i| {
+        const zi = y0 / VAE_RATIO;
+        const zl = yp.len / VAE_RATIO;
+        var new_tails = try alloc.alloc(?mlx.mlx_array, xp.count());
+        defer alloc.free(new_tails);
+        @memset(new_tails, null);
+
+        var cols = try alloc.alloc(mlx.mlx_array, xp.count());
+        defer alloc.free(cols);
+        var cols_built: usize = 0;
+        errdefer for (cols[0..cols_built]) |c| {
+            _ = mlx.mlx_array_free(c);
+        };
+        var left_tail: ?mlx.mlx_array = null;
+        defer if (left_tail) |v| {
+            _ = mlx.mlx_array_free(v);
+        };
+
+        for (xp.starts, 0..) |x0, j| {
+            const zj = x0 / VAE_RATIO;
+            const zw = xp.len / VAE_RATIO;
+            const sub_h = try sliceAxis(z, 3, @intCast(zi), @intCast(zi + zl), s);
+            defer _ = mlx.mlx_array_free(sub_h);
+            const sub = try sliceAxis(sub_h, 4, @intCast(zj), @intCast(zj + zw), s);
+            defer _ = mlx.mlx_array_free(sub);
+            var tile = try dec.decodePixels(sub, s);
+            errdefer _ = mlx.mlx_array_free(tile);
+
+            // Capture the strips the NEXT row/column will blend against, taken
+            // from the unblended tile.
+            const th: u32 = @intCast(mlx.getShape(tile)[3]);
+            const tw: u32 = @intCast(mlx.getShape(tile)[4]);
+            if (i + 1 < yp.count()) {
+                new_tails[j] = try sliceAxis(tile, 3, @intCast(th - yp.overlaps[i]), @intCast(th), s);
+            }
+            var next_left: ?mlx.mlx_array = null;
+            if (j + 1 < xp.count()) {
+                next_left = try sliceAxis(tile, 4, @intCast(tw - xp.overlaps[j]), @intCast(tw), s);
+            }
+
+            if (i > 0) {
+                if (row_tails[j]) |prev| {
+                    const b = try blendAxis(prev, tile, yp.overlaps[i - 1], 3, alloc, dec.dtype, s);
+                    _ = mlx.mlx_array_free(tile);
+                    tile = b;
+                }
+            }
+            if (j > 0) {
+                if (left_tail) |prev| {
+                    const b = try blendAxis(prev, tile, xp.overlaps[j - 1], 4, alloc, dec.dtype, s);
+                    _ = mlx.mlx_array_free(tile);
+                    tile = b;
+                }
+            }
+            if (left_tail) |v| _ = mlx.mlx_array_free(v);
+            left_tail = next_left;
+
+            // Trim the overlap that the next tile will own.
+            if (i + 1 < yp.count()) {
+                const h2: u32 = @intCast(mlx.getShape(tile)[3]);
+                const t2 = try sliceAxis(tile, 3, 0, @intCast(h2 - yp.overlaps[i]), s);
+                _ = mlx.mlx_array_free(tile);
+                tile = t2;
+            }
+            if (j + 1 < xp.count()) {
+                const w2: u32 = @intCast(mlx.getShape(tile)[4]);
+                const t2 = try sliceAxis(tile, 4, 0, @intCast(w2 - xp.overlaps[j]), s);
+                _ = mlx.mlx_array_free(tile);
+                tile = t2;
+            }
+            cols[j] = tile;
+            cols_built += 1;
+        }
+        rows[i] = try concat(cols, 4, s);
+        rows_built += 1;
+        for (cols) |c| _ = mlx.mlx_array_free(c);
+
+        for (row_tails, 0..) |t, k| {
+            if (t) |v| _ = mlx.mlx_array_free(v);
+            row_tails[k] = new_tails[k];
+            new_tails[k] = null;
+        }
+    }
+    const outp = try concat(rows, 3, s);
+    for (rows) |r| _ = mlx.mlx_array_free(r);
+    rows_built = 0;
+    return outp;
 }
 
 /// Full decode: normalized latents [1,24,T,H,W] -> pixels [1,3,frames,H*16,W*16]
 /// in [-1, 1].
-///
-/// REFUSES a canvas that would need spatial tiling rather than silently
-/// decoding it untiled — the reference renormalizes each tile's rope
-/// coordinates, so an untiled pass at 864 wide is a different computation, not
-/// an approximation of the same one.
 pub fn decode(dec: *const Decoder, z_norm: mlx.mlx_array, alloc: std.mem.Allocator, s: S) !mlx.mlx_array {
     const shp = mlx.getShape(z_norm);
     const latent_t: u32 = @intCast(shp[2]);
     const lat_h: u32 = @intCast(shp[3]);
     const lat_w: u32 = @intCast(shp[4]);
-    if (!fitsSingleTile(lat_h * VAE_RATIO) or !fitsSingleTile(lat_w * VAE_RATIO)) {
-        log.err("[minimax-h3-vae] {d}x{d} px needs spatial tiling (tile {d}); not implemented\n", .{ lat_w * VAE_RATIO, lat_h * VAE_RATIO, TILE_SIZE });
-        return error.TilingUnsupported;
-    }
 
     // Denormalize: z * std + mean, then the 1x1x1 post-quant mix.
     const zf = try astype(z_norm, mlx.mlx_dtype.float32, s);
@@ -727,7 +894,7 @@ pub fn decode(dec: *const Decoder, z_norm: mlx.mlx_array, alloc: std.mem.Allocat
         if (t_start >= t_end) continue;
         const clip_z = try sliceAxis(z, 2, @intCast(t_start), @intCast(t_end), s);
         defer _ = mlx.mlx_array_free(clip_z);
-        const clip_dec = try dec.decodePixels(clip_z, s);
+        const clip_dec = try decodeSpatial(dec, clip_z, alloc, s);
         defer _ = mlx.mlx_array_free(clip_dec);
         const clip_frames: u32 = @intCast(mlx.getShape(clip_dec)[2]);
 
@@ -745,7 +912,7 @@ pub fn decode(dec: *const Decoder, z_norm: mlx.mlx_array, alloc: std.mem.Allocat
                     defer _ = mlx.mlx_array_free(o);
                     defer _ = mlx.mlx_array_free(piece);
                     overlap = null;
-                    const blended = try blendFrames(o, piece, FRAME_OVERLAP, alloc, dec.dtype, s);
+                    const blended = try blendAxis(o, piece, FRAME_OVERLAP, 2, alloc, dec.dtype, s);
                     try parts.append(alloc, blended);
                 } else {
                     try parts.append(alloc, piece);
@@ -846,6 +1013,46 @@ test "minimax h3 vae: the shortest clip still forms one chunk" {
     try testing.expectEqual(@as(u32, 1), plan.num_chunks);
     try testing.expect(plan.pad_tokens >= TOKENS_CHUNK_SIZE);
     try testing.expectEqual(@as(u32, 5), plan.output_frames);
+}
+
+test "minimax h3 vae: tile plans cover the canvas exactly" {
+    const a = testing.allocator;
+    // Every canvas we can generate must be covered with no gap and no double
+    // count: sum(tile_len) - sum(overlaps) has to equal the extent, or the
+    // assembled rows are the wrong width and the concat shape-errors.
+    for ([_]u32{ 256, 288, 480, 512, 768, 864, 1024, 1344, 2048 }) |extent| {
+        var plan = try splitTiles(a, extent);
+        defer plan.deinit();
+        try testing.expect(plan.count() >= 1);
+        try testing.expectEqual(plan.count() - 1, plan.overlaps.len);
+
+        // Sum the KEPT extent per tile, exactly as decodeSpatial trims it:
+        // every tile but the last gives up its overlap to the next one.
+        // Accumulating additively also means a wrong plan reports a wrong
+        // number rather than wrapping a u32 subtraction into nonsense.
+        var covered: u32 = 0;
+        for (0..plan.count()) |j| {
+            covered += if (j + 1 < plan.count()) plan.len - plan.overlaps[j] else plan.len;
+        }
+        testing.expectEqual(extent, covered) catch |e| {
+            std.debug.print("extent {d}: {d} tiles of {d}, overlaps {any}, covered {d}\n", .{ extent, plan.count(), plan.len, plan.overlaps, covered });
+            return e;
+        };
+
+        // Boundaries must land on LATENT rows, or the latent slice is not
+        // expressible and the tile decodes a shifted region.
+        for (plan.starts) |st| try testing.expectEqual(@as(u32, 0), st % VAE_RATIO);
+        for (plan.overlaps) |o| {
+            try testing.expectEqual(@as(u32, 0), o % VAE_RATIO);
+            // A blend needs something to blend, and it must not consume a whole
+            // tile.
+            try testing.expect(o >= TILE_OVERLAP_MIN);
+            try testing.expect(o < plan.len);
+        }
+        // Tiles advance strictly, and the last one ends exactly at the extent.
+        for (1..plan.count()) |i| try testing.expect(plan.starts[i] > plan.starts[i - 1]);
+        try testing.expectEqual(extent, plan.starts[plan.count() - 1] + plan.len);
+    }
 }
 
 test "minimax h3 vae: single-tile gate matches the reference's split" {

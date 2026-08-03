@@ -1946,15 +1946,36 @@ test "minimax h3 live: generates a clip" {
     const steps = envU32("MINIMAX_H3_STEPS", 30);
     const out_dir = envStr("MINIMAX_H3_OUT") orelse "/tmp/h3out";
 
-    const te = try std.fmt.allocPrint(a, "{s}/src/text_encoders/qwen3vl_32b_minimax_h3_bf16.safetensors", .{dir});
+    // Two layouts are accepted so the SAME test covers both: the raw staging
+    // tree of upstream bf16 files, and a converted model dir from
+    // tests/convert_minimax_h3_weights.py (which is also what the app will
+    // ship). Both load through MfLinear's one geometry solve — running the
+    // quantized dir here is what proves that.
+    const converted = envStr("MINIMAX_H3_MODEL");
+    const te = if (converted) |m|
+        try std.fmt.allocPrint(a, "{s}/text_encoder.safetensors", .{m})
+    else
+        try std.fmt.allocPrint(a, "{s}/src/text_encoders/qwen3vl_32b_minimax_h3_bf16.safetensors", .{dir});
     defer a.free(te);
-    const dit = try std.fmt.allocPrint(a, "{s}/src/diffusion_models/minimax_h3_fl2va_bf16.safetensors", .{dir});
+    const dit = if (converted) |m|
+        try std.fmt.allocPrint(a, "{s}/transformer.safetensors", .{m})
+    else
+        try std.fmt.allocPrint(a, "{s}/src/diffusion_models/minimax_h3_fl2va_bf16.safetensors", .{dir});
     defer a.free(dit);
-    const vae = try std.fmt.allocPrint(a, "{s}/src/vae/minimax_h3_video_vae_fp16.safetensors", .{dir});
+    const vae = if (converted) |m|
+        try std.fmt.allocPrint(a, "{s}/video_vae.safetensors", .{m})
+    else
+        try std.fmt.allocPrint(a, "{s}/src/vae/minimax_h3_video_vae_fp16.safetensors", .{dir});
     defer a.free(vae);
-    const avae = try std.fmt.allocPrint(a, "{s}/src/vae/minimax_h3_audio_vae_fp32.safetensors", .{dir});
+    const avae = if (converted) |m|
+        try std.fmt.allocPrint(a, "{s}/audio_vae.safetensors", .{m})
+    else
+        try std.fmt.allocPrint(a, "{s}/src/vae/minimax_h3_audio_vae_fp32.safetensors", .{dir});
     defer a.free(avae);
-    const tokdir = try std.fmt.allocPrint(a, "{s}/src_orig/FL2VA/processor", .{dir});
+    const tokdir = if (converted) |m|
+        try std.fmt.allocPrint(a, "{s}", .{m})
+    else
+        try std.fmt.allocPrint(a, "{s}/src_orig/FL2VA/processor", .{dir});
     defer a.free(tokdir);
 
     const prompt = envStr("MINIMAX_H3_PROMPT") orelse
@@ -1970,7 +1991,7 @@ test "minimax h3 live: generates a clip" {
         .audio_vae = avae,
     }, .{
         .prompt = prompt,
-        .width = size,
+        .width = envU32("MINIMAX_H3_WIDTH", size),
         .height = size,
         .frames = frames,
         .steps = steps,
@@ -1982,7 +2003,7 @@ test "minimax h3 live: generates a clip" {
     const finite = try allFinite(res.pixels, s);
     try testing.expect(finite);
     try testing.expectEqual(alignFrameCount(@max(5, frames)), res.frame_count);
-    try testing.expectEqual(size, res.width);
+    try testing.expectEqual(envU32("MINIMAX_H3_WIDTH", size), res.width);
     try testing.expectEqual(size, res.height);
 
     try writeFrames(a, io, &res, out_dir, s);
