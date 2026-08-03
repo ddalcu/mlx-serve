@@ -667,7 +667,9 @@ const BlockW = struct {
     norm2: mlx.mlx_array,
     attn: AttnW,
     mlp: MlpW,
-    adaln: AdalnW,
+    /// Null after AdaLN precompute has folded this block's modulation into
+    /// `Model.adaln_tables` and released the 260M-param weight.
+    adaln: ?AdalnW,
 
     fn load(w: *const Weights, a: std.mem.Allocator, idx: u32, cfg: Config, dt: mlx.mlx_dtype, s: S) !BlockW {
         const pfx = try std.fmt.allocPrint(a, "blocks.{d}", .{idx});
@@ -693,7 +695,7 @@ const BlockW = struct {
         _ = mlx.mlx_array_free(self.norm2);
         self.attn.deinit();
         self.mlp.deinit();
-        self.adaln.deinit();
+        if (self.adaln) |*ad| ad.deinit();
     }
 };
 
@@ -830,9 +832,120 @@ pub fn applyRopePub(x: mlx.mlx_array, rope: RopeTables, half: c_int, head_dim: c
     return concat(&[_]mlx.mlx_array{ o1, o2, tail }, 3, s);
 }
 
+/// Sparse attention core over post-rope [1, H, S, hd] q/k/v.
+///
+/// Strip queries (rows [0, video_start)) keep FULL attention; video queries
+/// attend to their pattern's video keys PLUS the strip, via batched SDPA with
+/// the frame/stripe axis folded into the batch dim. Key order inside a
+/// subset differs from the dense order — softmax is permutation-invariant
+/// over keys up to fp rounding, which is inside the sanctioned class.
+fn sparseAttend(q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, spec: SparseSpec, scale: f32, s: S) !mlx.mlx_array {
+    const shp = mlx.getShape(q);
+    const nh = shp[1];
+    const seq = shp[2];
+    const hd = shp[3];
+    const g: c_int = @intCast(spec.video_start);
+    const t: c_int = @intCast(spec.t);
+    const f: c_int = @intCast(spec.f);
+    std.debug.assert(g + t * f == seq);
+    const null_a = mlx.mlx_array{ .ctx = null };
+
+    // Strip queries: full attention over every key.
+    const qg = try sliceAxis4(q, 2, 0, g, s);
+    defer _ = mlx.mlx_array_free(qg);
+    var og = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(og);
+    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&og, qg, k, v, scale, "", null_a, null_a, s));
+
+    // Video split + strip keys.
+    const qv = try sliceAxis4(q, 2, g, seq, s);
+    defer _ = mlx.mlx_array_free(qv);
+    const kv = try sliceAxis4(k, 2, g, seq, s);
+    defer _ = mlx.mlx_array_free(kv);
+    const vv = try sliceAxis4(v, 2, g, seq, s);
+    defer _ = mlx.mlx_array_free(vv);
+    const kg = try sliceAxis4(k, 2, 0, g, s);
+    defer _ = mlx.mlx_array_free(kg);
+    const vg = try sliceAxis4(v, 2, 0, g, s);
+    defer _ = mlx.mlx_array_free(vg);
+
+    // [1,H,Sv,hd] -> [B, H, L, hd] with the pattern axis folded into batch:
+    // spatial B=t, L=f (perm keeps (t) outermost); temporal B=f, L=t.
+    const fold = struct {
+        fn go(x: mlx.mlx_array, nh_: c_int, t_: c_int, f_: c_int, hd_: c_int, mode: SparseMode, s_: S) !mlx.mlx_array {
+            const r = try reshape(x, &[_]c_int{ nh_, t_, f_, hd_ }, s_);
+            defer _ = mlx.mlx_array_free(r);
+            const perm: [4]c_int = if (mode == .spatial) .{ 1, 0, 2, 3 } else .{ 2, 0, 1, 3 };
+            const tr = try transpose(r, &perm, s_);
+            defer _ = mlx.mlx_array_free(tr);
+            return contig(tr, s_);
+        }
+    }.go;
+    const qb = try fold(qv, nh, t, f, hd, spec.mode, s);
+    defer _ = mlx.mlx_array_free(qb);
+    const kb = try fold(kv, nh, t, f, hd, spec.mode, s);
+    defer _ = mlx.mlx_array_free(kb);
+    const vb = try fold(vv, nh, t, f, hd, spec.mode, s);
+    defer _ = mlx.mlx_array_free(vb);
+
+    // Strip keys broadcast to every batch element and appended to the keys.
+    const nb: c_int = if (spec.mode == .spatial) t else f;
+    const bshape = [_]c_int{ nb, nh, g, hd };
+    const bc = struct {
+        fn go(x: mlx.mlx_array, shape: []const c_int, s_: S) !mlx.mlx_array {
+            const r3 = try reshape(x, &[_]c_int{ 1, shape[1], shape[2], shape[3] }, s_);
+            defer _ = mlx.mlx_array_free(r3);
+            var b = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(b);
+            try mlx.check(mlx.mlx_broadcast_to(&b, r3, shape.ptr, shape.len, s_));
+            return contig(b, s_);
+        }
+    }.go;
+    const kgb = try bc(kg, &bshape, s);
+    defer _ = mlx.mlx_array_free(kgb);
+    const vgb = try bc(vg, &bshape, s);
+    defer _ = mlx.mlx_array_free(vgb);
+    const kcat = try concat(&[_]mlx.mlx_array{ kb, kgb }, 2, s);
+    defer _ = mlx.mlx_array_free(kcat);
+    const vcat = try concat(&[_]mlx.mlx_array{ vb, vgb }, 2, s);
+    defer _ = mlx.mlx_array_free(vcat);
+
+    var ob = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ob);
+    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&ob, qb, kcat, vcat, scale, "", null_a, null_a, s));
+
+    // Unfold back to [1, H, Sv, hd] in packed row order.
+    const inv_perm: [4]c_int = if (spec.mode == .spatial) .{ 1, 0, 2, 3 } else .{ 1, 2, 0, 3 };
+    const otr = try transpose(ob, &inv_perm, s);
+    defer _ = mlx.mlx_array_free(otr);
+    const oc = try contig(otr, s);
+    defer _ = mlx.mlx_array_free(oc);
+    const ov = try reshape(oc, &[_]c_int{ 1, nh, t * f, hd }, s);
+    defer _ = mlx.mlx_array_free(ov);
+
+    return concat(&[_]mlx.mlx_array{ og, ov }, 2, s);
+}
+
+/// sliceAxis for the fixed 4-D case (keeps the [1,H,·,hd] shape).
+fn sliceAxis4(x: mlx.mlx_array, axis: usize, lo: c_int, hi: c_int, s: S) !mlx.mlx_array {
+    const shp = mlx.getShape(x);
+    var start = [_]c_int{ 0, 0, 0, 0 };
+    var stop = [_]c_int{ shp[0], shp[1], shp[2], shp[3] };
+    const step = [_]c_int{ 1, 1, 1, 1 };
+    start[axis] = lo;
+    stop[axis] = hi;
+    var o = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(o);
+    try mlx.check(mlx.mlx_slice(&o, x, &start, 4, &stop, 4, &step, 4, s));
+    return contig(o, s);
+}
+
 /// x [S, hidden] -> [S, hidden]. Full bidirectional attention (no mask): this
 /// is a diffusion transformer, every token sees every other.
-fn attnForward(aw: *const AttnW, x: mlx.mlx_array, cfg: Config, rope: ?RopeTables, s: S) !mlx.mlx_array {
+///
+/// `ablate` is `.none` everywhere except the profile ladder; `.sdpa` passes v
+/// through in place of the attention output (same shape, projections intact).
+fn attnForward(aw: *const AttnW, x: mlx.mlx_array, cfg: Config, rope: ?RopeTables, ablate: Ablate, sparse: ?SparseSpec, s: S) !mlx.mlx_array {
     const n: c_int = @intCast(mlx.getShape(x)[0]);
     const h: c_int = @intCast(cfg.num_attention_heads);
     const hd: c_int = @intCast(cfg.attention_head_dim);
@@ -888,10 +1001,27 @@ fn attnForward(aw: *const AttnW, x: mlx.mlx_array, cfg: Config, rope: ?RopeTable
     };
 
     const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(cfg.attention_head_dim)));
-    var attn = mlx.mlx_array_new();
+    var attn: mlx.mlx_array = undefined;
+    if (ablate == .sdpa) {
+        attn = try contig(t[2], s);
+    } else if (ablate == .sdpa_dep) {
+        const sum_qk = try addA(t[0], t[1], s);
+        defer _ = mlx.mlx_array_free(sum_qk);
+        const sum3 = try addA(sum_qk, t[2], s);
+        defer _ = mlx.mlx_array_free(sum3);
+        const third = try scalarLike(1.0 / 3.0, sum3, s);
+        defer _ = mlx.mlx_array_free(third);
+        attn = try mulA(sum3, third, s);
+    } else if (sparse != null and sparse.?.mode != .dense) {
+        attn = try sparseAttend(t[0], t[1], t[2], sparse.?, scale, s);
+    } else {
+        var o = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(o);
+        const null_a = mlx.mlx_array{ .ctx = null };
+        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&o, t[0], t[1], t[2], scale, "", null_a, null_a, s));
+        attn = o;
+    }
     defer _ = mlx.mlx_array_free(attn);
-    const null_a = mlx.mlx_array{ .ctx = null };
-    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn, t[0], t[1], t[2], scale, "", null_a, null_a, s));
 
     // [1,H,S,hd] -> [S, inner]
     const back = try transpose(attn, &[_]c_int{ 0, 2, 1, 3 }, s);
@@ -1072,12 +1202,241 @@ pub fn buildTimestepPlan(
     return .{ .unique_t = uniq, .n_unique = n, .runs = runs, .allocator = allocator };
 }
 
+// ── Profiling ablation ──────────────────────────────────────────────────────
+//
+// Phase-0 cost attribution WITHOUT inserting syncs: an arm removes one
+// component from the step graph while keeping every shape, so the step-time
+// delta against the `.none` baseline prices that component at the loop's own
+// eval cadence. The per-phase-eval profiler lesson (MLX_SERVE_DECODE_PROFILE)
+// is exactly what this avoids — inserted evals destroy pipelining and inflate
+// what they measure.
+
+pub const Ablate = enum {
+    /// Full forward — the baseline arm.
+    none,
+    /// SDPA passes v through: prices the attention KERNEL alone (projections
+    /// run) — but q/k become DEAD and lazy-graph pruning removes their norm/
+    /// rope/transpose chains too, so this arm OVERSTATES the kernel.
+    sdpa,
+    /// SDPA replaced by (q+k+v)/3: every input branch stays LIVE, only the
+    /// attention kernel itself is removed. The honest SDPA price is
+    /// (none - sdpa_dep); (sdpa_dep - sdpa) is the q/k branch cost the plain
+    /// arm silently pruned.
+    sdpa_dep,
+    /// The whole attention block is identity: prices qkv/SDPA/out together.
+    attn,
+    /// The MLP is identity: prices fc1/SwiGLU/fc2.
+    mlp,
+    /// Block AdaLN replaced by zero modulation: prices the 13B AdaLN weight
+    /// read + its GEMM.
+    adaln,
+};
+
+pub const AblateMode = union(enum) { off, ladder, fixed: Ablate };
+
+/// MINIMAX_H3_ABLATE: "ladder" cycles arms inside ONE run (one TE+DiT load),
+/// a bare arm name pins it, anything else is off. The caller logs a warning on
+/// junk — a typo'd env measuring the wrong thing is the silent-flag-eater class.
+pub fn ablateModeFrom(raw: ?[]const u8) AblateMode {
+    const v = raw orelse return .off;
+    if (v.len == 0) return .off;
+    if (std.mem.eql(u8, v, "ladder")) return .ladder;
+    inline for (@typeInfo(Ablate).@"enum".field_names) |n| {
+        if (std.mem.eql(u8, v, n)) return .{ .fixed = @field(Ablate, n) };
+    }
+    return .off;
+}
+
+/// Ladder schedule: 2 warmup steps (graph build + JIT land in step 0), then 3
+/// steps per arm starting with a measured `.none` baseline; past the ladder it
+/// degrades to `.none` so an over-long STEPS setting stays harmless.
+pub fn ladderArmForStep(i: usize) Ablate {
+    if (i < 2) return .none;
+    const arms = [_]Ablate{ .none, .sdpa, .attn, .mlp, .adaln };
+    const idx = (i - 2) / 3;
+    return if (idx < arms.len) arms[idx] else .none;
+}
+
+/// `buildTimestepPlan`, but with every run's modulation row remapped into a
+/// GLOBAL sorted schedule table — the shape AdaLN precompute serves rows from.
+/// A timestep missing from the table is a LOUD error, never a wrong row.
+pub fn buildTimestepPlanGlobal(
+    allocator: std.mem.Allocator,
+    layout: *const PackedLayout,
+    sigma_v: f64,
+    shift_v: f64,
+    shift_a: f64,
+    aug: CondNoiseAug,
+    global_ts: []const f64,
+) !TimestepPlan {
+    var p = try buildTimestepPlan(allocator, layout, sigma_v, shift_v, shift_a, aug);
+    errdefer p.deinit();
+    for (p.runs) |*r| {
+        const t = p.unique_t[r.mod_row / 3];
+        const tag = r.mod_row % 3;
+        const gi = for (global_ts, 0..) |g, i| {
+            if (g == t) break i;
+        } else return error.TimestepNotInSchedule;
+        r.mod_row = @as(u32, @intCast(gi)) * 3 + tag;
+    }
+    return p;
+}
+
+/// The union of every step's unique timesteps, sorted ascending — computed by
+/// running the SAME per-step plan arithmetic, so the f64s are bit-identical to
+/// what the sampling loop will look up.
+pub fn collectScheduleTs(
+    allocator: std.mem.Allocator,
+    layout: *const PackedLayout,
+    sigmas: []const f64,
+    shift_v: f64,
+    shift_a: f64,
+    aug: CondNoiseAug,
+) ![]f64 {
+    var list: std.ArrayList(f64) = .empty;
+    errdefer list.deinit(allocator);
+    for (sigmas) |sig| {
+        var p = try buildTimestepPlan(allocator, layout, sig, shift_v, shift_a, aug);
+        defer p.deinit();
+        for (p.unique_t[0..p.n_unique]) |t| {
+            const seen = for (list.items) |e| {
+                if (e == t) break true;
+            } else false;
+            if (!seen) try list.append(allocator, t);
+        }
+    }
+    const out = try list.toOwnedSlice(allocator);
+    std.mem.sort(f64, out, {}, std.sort.asc(f64));
+    return out;
+}
+
+// ── Sparse video attention (training-free, SVG/STA-style) ───────────────────
+//
+// Full attention over the packed sequence is O(S²) and ~70% of a 768p step.
+// Video-DiT attention mass concentrates in two patterns: SPATIAL (within the
+// same frame) and TEMPORAL (same patch across frames). Each video query can
+// attend to its pattern's keys plus the GLOBAL STRIP (text/cond/audio rows —
+// they are few and carry the conditioning), while strip queries keep full
+// attention. Softmax is over the reduced key set — a training-free
+// approximation whose quality is judged by clips, not asserted.
+//
+// Layer policy (`MINIMAX_H3_SPARSE_ATTN`): "mix" alternates spatial/temporal
+// per layer with dense anchor layers at the ends and middle; "spatial"/
+// "temporal" force one pattern everywhere (debug); unset/"" = off.
+
+pub const SparseMode = enum { dense, spatial, temporal };
+
+pub const SparsePolicy = enum { off, mix, spatial, temporal };
+
+pub fn sparsePolicyFrom(raw: ?[]const u8) SparsePolicy {
+    const v = raw orelse return .off;
+    if (v.len == 0 or std.mem.eql(u8, v, "0")) return .off;
+    if (std.mem.eql(u8, v, "mix")) return .mix;
+    if (std.mem.eql(u8, v, "spatial")) return .spatial;
+    if (std.mem.eql(u8, v, "temporal")) return .temporal;
+    return .off;
+}
+
+/// Which pattern a layer runs under a policy. Anchor layers (first two,
+/// middle two, last two) stay DENSE under "mix" — they re-integrate global
+/// structure the sparse layers cannot see.
+pub fn sparseModeForLayer(layer: usize, n_layers: usize, policy: SparsePolicy) SparseMode {
+    switch (policy) {
+        .off => return .dense,
+        .spatial => return .spatial,
+        .temporal => return .temporal,
+        .mix => {
+            const mid = n_layers / 2;
+            if (layer < 2 or layer + 2 >= n_layers or layer == mid or layer == mid + 1) return .dense;
+            return if (layer % 2 == 0) .spatial else .temporal;
+        },
+    }
+}
+
+/// Geometry the sparse core needs: the video segment is the LAST `t*f` rows
+/// of the packed sequence; everything before it is the global strip.
+pub const SparseSpec = struct {
+    mode: SparseMode,
+    /// Latent frames.
+    t: u32,
+    /// Rows per frame (h/2 * w/2).
+    f: u32,
+    /// First video row == strip length.
+    video_start: u32,
+};
+
+// ── Attention broadcast (PAB-style) ─────────────────────────────────────────
+//
+// Video-DiT attention outputs drift SLOWLY across adjacent mid-schedule steps
+// (Pyramid Attention Broadcast's finding, reproduced here by the step-cache's
+// own gate statistics), while modulation and the MLP react faster. On
+// non-refresh steps every block reuses its cached attention OUTPUT (post
+// out-proj) and skips norm1/mod/qkv/SDPA/out entirely — at 768p that branch
+// is ~70% of the step. Gating stays per-STEP and deterministic: warmup and
+// tail steps always recompute (structure forms early, detail lands late).
+
+pub const AttnBroadcast = struct {
+    allocator: std.mem.Allocator,
+    /// Per block: the cached attention output [S, hidden]; null ctx = empty.
+    blocks: []mlx.mlx_array,
+
+    pub fn init(allocator: std.mem.Allocator, n_blocks: usize) !AttnBroadcast {
+        const blocks = try allocator.alloc(mlx.mlx_array, n_blocks);
+        for (blocks) |*b| b.* = .{ .ctx = null };
+        return .{ .allocator = allocator, .blocks = blocks };
+    }
+    pub fn deinit(self: *AttnBroadcast) void {
+        for (self.blocks) |b| if (b.ctx != null) {
+            _ = mlx.mlx_array_free(b);
+        };
+        self.allocator.free(self.blocks);
+    }
+};
+
+/// Refresh schedule: k<=1 disables broadcast (always refresh); otherwise the
+/// first 4 and last 2 steps always recompute, and every k-th step in between.
+pub fn attnBroadcastRefresh(i: usize, steps: u32, k: u32) bool {
+    if (k <= 1) return true;
+    if (i < 4) return true;
+    if (i + 2 >= steps) return true;
+    return (i - 4) % k == 0;
+}
+
 // ── Model ───────────────────────────────────────────────────────────────────
+
+/// Whole-schedule AdaLN tables: per block, the 6 modulation arrays evaluated
+/// at EVERY timestep the sampling schedule will visit ([n_ts*3, hidden] each,
+/// rows indexed `global_t_row * 3 + modality`), plus the final layer's pair.
+/// ~12 MB/block bf16 at 30 steps — against the 13.04B AdaLN parameters (39%
+/// of the model) they replace. A MEMORY lever, not a speed one: the per-step
+/// AdaLN cost measured ~0 in the Phase-0 ladder.
+pub const AdalnTables = struct {
+    allocator: std.mem.Allocator,
+    ts: []f64,
+    blocks: [][6]mlx.mlx_array,
+    final: [2]mlx.mlx_array,
+
+    pub fn deinit(self: *AdalnTables) void {
+        for (self.blocks) |*six| {
+            for (six) |a2| _ = mlx.mlx_array_free(a2);
+        }
+        self.allocator.free(self.blocks);
+        for (self.final) |a2| _ = mlx.mlx_array_free(a2);
+        self.allocator.free(self.ts);
+        self.* = undefined;
+    }
+};
 
 pub const Model = struct {
     allocator: std.mem.Allocator,
     cfg: Config,
     dtype: mlx.mlx_dtype,
+    /// Profiling arm for the NEXT forward; `.none` in production (the field is
+    /// only ever set by the profile ladder in `generate`).
+    ablate: Ablate,
+    /// Sparse-attention layer policy (`MINIMAX_H3_SPARSE_ATTN`); `.off` until
+    /// `generate` opts in.
+    sparse_policy: SparsePolicy,
 
     video_patch_w: mlx.mlx_array, // fp32 island
     video_patch_b: mlx.mlx_array,
@@ -1097,7 +1456,11 @@ pub const Model = struct {
     blocks: []BlockW,
 
     final_norm: mlx.mlx_array,
-    final_adaln: AdalnW,
+    /// Null after AdaLN precompute (folded into `adaln_tables.final`).
+    final_adaln: ?AdalnW,
+    /// Whole-schedule AdaLN tables (see `precomputeAdaln`); null = per-step
+    /// weight-based modulation, the load-time default until generate opts in.
+    adaln_tables: ?AdalnTables,
     video_out_w: mlx.mlx_array, // fp32 island
     video_out_b: mlx.mlx_array,
     audio_out_w: mlx.mlx_array,
@@ -1108,6 +1471,8 @@ pub const Model = struct {
         m.allocator = allocator;
         m.cfg = cfg;
         m.dtype = dt;
+        m.ablate = .none;
+        m.sparse_policy = .off;
 
         const f32t = mlx.mlx_dtype.float32;
         // These stay fp32 because the CHECKPOINT stores them fp32 — the patch
@@ -1135,6 +1500,7 @@ pub const Model = struct {
 
         m.final_norm = try ownWeightAs(w, allocator, "final_layer.norm", ".weight", dt, s);
         m.final_adaln = try AdalnW.load(w, allocator, "final_layer.adaln_proj", cfg, 2, 1, dt, s);
+        m.adaln_tables = null;
         m.video_out_w = try ownWeightAs(w, allocator, "final_layer.video_out", ".weight", f32t, s);
         m.video_out_b = try ownWeightAs(w, allocator, "final_layer.video_out", ".bias", f32t, s);
         m.audio_out_w = try ownWeightAs(w, allocator, "final_layer.audio_out", ".weight", f32t, s);
@@ -1154,7 +1520,117 @@ pub const Model = struct {
         self.allocator.free(self.refiner);
         for (self.blocks) |*b| b.deinit();
         self.allocator.free(self.blocks);
-        self.final_adaln.deinit();
+        if (self.final_adaln) |*fa| fa.deinit();
+        if (self.adaln_tables) |*t| t.deinit();
+    }
+
+    /// Force-materialize every weight in ONE eval. Without this the load is
+    /// lazy and the 35-64 GB read lands inside step 1, which both hides the
+    /// load phase from any profile and makes the first step read as a
+    /// regression. Explicit rather than reflective: a missed field here only
+    /// shifts a few ms of attribution, never a budget (unlike the dsv4 case).
+    pub fn evalWeights(self: *const Model) !void {
+        const vec = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(vec);
+        const push = struct {
+            fn arr(v: mlx.mlx_vector_array, x: mlx.mlx_array) void {
+                if (x.ctx != null) _ = mlx.mlx_vector_array_append_value(v, x);
+            }
+            fn lin(v: mlx.mlx_vector_array, l: *const MfLinear) void {
+                arr(v, l.w);
+                arr(v, l.scales);
+                arr(v, l.biases);
+            }
+            fn at(v: mlx.mlx_vector_array, w: *const AttnW) void {
+                lin(v, &w.qkv);
+                arr(v, w.q_norm);
+                arr(v, w.k_norm);
+                lin(v, &w.out);
+            }
+            fn ml(v: mlx.mlx_vector_array, w: *const MlpW) void {
+                lin(v, &w.fc1);
+                lin(v, &w.fc2);
+            }
+        };
+        for ([_]mlx.mlx_array{
+            self.video_patch_w, self.video_patch_b, self.audio_patch_w, self.audio_patch_b,
+            self.condition_bias, self.te_in_w,      self.te_in_b,       self.te_out_w,
+            self.te_out_b,      self.inv_freq,      self.final_norm,    self.video_out_w,
+            self.video_out_b,   self.audio_out_w,   self.audio_out_b,   self.refiner_final_norm,
+        }) |x| push.arr(vec, x);
+        push.lin(vec, &self.condition_proj);
+        for (self.refiner) |*b| {
+            push.arr(vec, b.norm1);
+            push.arr(vec, b.norm2);
+            push.at(vec, &b.attn);
+            push.ml(vec, &b.mlp);
+        }
+        for (self.blocks) |*b| {
+            push.arr(vec, b.norm1);
+            push.arr(vec, b.norm2);
+            push.at(vec, &b.attn);
+            push.ml(vec, &b.mlp);
+            if (b.adaln) |*ad| {
+                push.lin(vec, &ad.linear);
+                push.arr(vec, ad.bias);
+            }
+        }
+        if (self.final_adaln) |*fa| {
+            push.lin(vec, &fa.linear);
+            push.arr(vec, fa.bias);
+        }
+        try mlx.check(mlx.mlx_eval(vec));
+    }
+
+    /// Materialize AdaLN for the whole schedule and RELEASE the 13B AdaLN
+    /// weights. Must run while the trunk is still LAZY (before `evalWeights`):
+    /// each block's AdaLN weight materializes only inside its own forward here
+    /// and is freed immediately after, so the transient peak is one block's
+    /// 260M params — never the 13 GB the weights would cost resident.
+    ///
+    /// NOT bit-identical to per-step modulation: the AdaLN GEMM runs at
+    /// M = n_ts instead of M = 2-3, and kernel selection differs by shape
+    /// (the sanctioned qmv-vs-qmm class). Kill: MINIMAX_H3_ADALN_PRECOMPUTE=0.
+    pub fn precomputeAdaln(self: *Model, ts: []const f64, s: S) !void {
+        std.debug.assert(self.adaln_tables == null);
+        const a = self.allocator;
+        const t_emb32 = try self.timeEmbed(ts, s);
+        defer _ = mlx.mlx_array_free(t_emb32);
+        const t_emb = try astype(t_emb32, self.dtype, s);
+        defer _ = mlx.mlx_array_free(t_emb);
+
+        var tables = try a.alloc([6]mlx.mlx_array, self.blocks.len);
+        errdefer a.free(tables);
+        var built: usize = 0;
+        errdefer for (tables[0..built]) |*six| {
+            for (six) |x| _ = mlx.mlx_array_free(x);
+        };
+        for (self.blocks) |*b| {
+            var mods: [6]mlx.mlx_array = undefined;
+            try b.adaln.?.forward(t_emb, self.cfg, true, &mods, s);
+            const vec = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(vec);
+            for (mods) |m2| _ = mlx.mlx_vector_array_append_value(vec, m2);
+            try mlx.check(mlx.mlx_eval(vec));
+            tables[built] = mods;
+            built += 1;
+            // Free the weight NOW so only one block's AdaLN is ever resident.
+            b.adaln.?.deinit();
+            b.adaln = null;
+        }
+        var fmods: [2]mlx.mlx_array = undefined;
+        try self.final_adaln.?.forward(t_emb, self.cfg, true, &fmods, s);
+        const fvec = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(fvec);
+        for (fmods) |m2| _ = mlx.mlx_vector_array_append_value(fvec, m2);
+        try mlx.check(mlx.mlx_eval(fvec));
+        self.final_adaln.?.deinit();
+        self.final_adaln = null;
+        _ = mlx.mlx_clear_cache();
+
+        const ts_copy = try a.dupe(f64, ts);
+        errdefer a.free(ts_copy);
+        self.adaln_tables = .{ .allocator = a, .ts = ts_copy, .blocks = tables, .final = fmods };
     }
 
     /// Sinusoidal timestep embedding, fp32 throughout, COS BEFORE SIN.
@@ -1193,7 +1669,7 @@ pub const Model = struct {
         for (self.refiner) |*b| {
             const n1 = try rmsNormLast(h, b.norm1, self.cfg.norm_eps, s);
             defer _ = mlx.mlx_array_free(n1);
-            const at = try attnForward(&b.attn, n1, self.cfg, null, s);
+            const at = try attnForward(&b.attn, n1, self.cfg, null, .none, null, s);
             defer _ = mlx.mlx_array_free(at);
             const h2 = try addA(h, at, s);
             _ = mlx.mlx_array_free(h);
@@ -1240,6 +1716,8 @@ pub const Model = struct {
         sigma_v: f64,
         shift_v: f64,
         shift_a: f64,
+        attn_bcast: ?*AttnBroadcast,
+        attn_refresh: bool,
         s: S,
     ) !Output {
         const a = self.allocator;
@@ -1284,24 +1762,79 @@ pub const Model = struct {
         for (pieces) |p| _ = mlx.mlx_array_free(p);
         errdefer _ = mlx.mlx_array_free(h);
 
-        const t_emb32 = try self.timeEmbed(plan.unique_t[0..plan.n_unique], s);
-        defer _ = mlx.mlx_array_free(t_emb32);
-        const t_emb = try astype(t_emb32, self.dtype, s);
-        defer _ = mlx.mlx_array_free(t_emb);
+        // t_emb is only needed when modulation still runs from weights; with
+        // precomputed tables neither the embedder nor any AdalnW exists.
+        var t_emb = mlx.mlx_array{ .ctx = null };
+        defer if (t_emb.ctx != null) {
+            _ = mlx.mlx_array_free(t_emb);
+        };
+        if (self.adaln_tables == null) {
+            const t_emb32 = try self.timeEmbed(plan.unique_t[0..plan.n_unique], s);
+            defer _ = mlx.mlx_array_free(t_emb32);
+            t_emb = try astype(t_emb32, self.dtype, s);
+        }
 
-        for (self.blocks) |*b| {
+        // The `.adaln` profile arm replaces every block's modulation with one
+        // shared zero tensor (shift=scale=gate=0, rows cover any mod_row), so
+        // the arm's saving is exactly the AdaLN weight read + GEMM.
+        var zero_mods = mlx.mlx_array{ .ctx = null };
+        defer if (zero_mods.ctx != null) {
+            _ = mlx.mlx_array_free(zero_mods);
+        };
+        if (self.ablate == .adaln) {
+            const zrows: c_int = if (self.adaln_tables) |tt| @intCast(tt.ts.len * 3) else @intCast(MAX_UNIQUE_T * 3);
+            try mlx.check(mlx.mlx_zeros(&zero_mods, &[_]c_int{ zrows, @intCast(cfg.hidden_size) }, 2, self.dtype, s));
+        }
+
+        for (self.blocks, 0..) |*b, bi| {
             var mods: [6]mlx.mlx_array = undefined;
-            try b.adaln.forward(t_emb, cfg, true, &mods, s);
-            defer for (&mods) |*p| {
+            var mods_owned = true;
+            if (self.ablate == .adaln) {
+                for (&mods) |*p| p.* = try contig(zero_mods, s);
+            } else if (self.adaln_tables) |tt| {
+                mods = tt.blocks[bi]; // borrowed from the table
+                mods_owned = false;
+            } else {
+                try b.adaln.?.forward(t_emb, cfg, true, &mods, s);
+            }
+            defer if (mods_owned) for (&mods) |*p| {
                 _ = mlx.mlx_array_free(p.*);
             };
             // 0..5 = shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp
-            const n1 = try rmsNormLast(h, b.norm1, cfg.norm_eps, s);
-            defer _ = mlx.mlx_array_free(n1);
-            const m1 = try modScaleShift(n1, mods[0], mods[1], plan.runs, a, s);
-            defer _ = mlx.mlx_array_free(m1);
-            const at = try attnForward(&b.attn, m1, cfg, rope, s);
-            defer _ = mlx.mlx_array_free(at);
+            //
+            // Attention branch: on a broadcast (non-refresh) step the whole
+            // branch — norm1, modulation, qkv, SDPA, out-proj — is replaced by
+            // the block's cached output from the last refresh; only the GATE
+            // is re-applied at the current timestep (PAB semantics). Profile
+            // arms bypass the cache so ablation stays honest.
+            var at: mlx.mlx_array = undefined;
+            var at_owned = true;
+            const cacheable = attn_bcast != null and self.ablate == .none;
+            if (cacheable and !attn_refresh and attn_bcast.?.blocks[bi].ctx != null) {
+                at = attn_bcast.?.blocks[bi];
+                at_owned = false;
+            } else {
+                const n1 = try rmsNormLast(h, b.norm1, cfg.norm_eps, s);
+                defer _ = mlx.mlx_array_free(n1);
+                const m1 = try modScaleShift(n1, mods[0], mods[1], plan.runs, a, s);
+                defer _ = mlx.mlx_array_free(m1);
+                const smode = if (self.ablate == .none) sparseModeForLayer(bi, self.blocks.len, self.sparse_policy) else SparseMode.dense;
+                const spec: ?SparseSpec = if (smode == .dense) null else .{
+                    .mode = smode,
+                    .t = layout.latent_t,
+                    .f = (layout.latent_h / PATCH_H) * (layout.latent_w / PATCH_W),
+                    .video_start = layout.videoSegment().start,
+                };
+                at = if (self.ablate == .attn) try contig(m1, s) else try attnForward(&b.attn, m1, cfg, rope, self.ablate, spec, s);
+                if (cacheable) {
+                    if (attn_bcast.?.blocks[bi].ctx != null) _ = mlx.mlx_array_free(attn_bcast.?.blocks[bi]);
+                    attn_bcast.?.blocks[bi] = at;
+                    at_owned = false;
+                }
+            }
+            defer if (at_owned) {
+                _ = mlx.mlx_array_free(at);
+            };
             const h1 = try modGate(h, mods[2], at, plan.runs, a, s);
             _ = mlx.mlx_array_free(h);
             h = h1;
@@ -1310,7 +1843,7 @@ pub const Model = struct {
             defer _ = mlx.mlx_array_free(n2);
             const m2 = try modScaleShift(n2, mods[3], mods[4], plan.runs, a, s);
             defer _ = mlx.mlx_array_free(m2);
-            const mo = try mlpForward(&b.mlp, m2, s);
+            const mo = if (self.ablate == .mlp) try contig(m2, s) else try mlpForward(&b.mlp, m2, s);
             defer _ = mlx.mlx_array_free(mo);
             const h2 = try modGate(h, mods[5], mo, plan.runs, a, s);
             _ = mlx.mlx_array_free(h);
@@ -1320,8 +1853,14 @@ pub const Model = struct {
 
         // Final layer: 1 modality, so the mod row is just the timestep row.
         var fmods: [2]mlx.mlx_array = undefined;
-        try self.final_adaln.forward(t_emb, cfg, true, &fmods, s);
-        defer for (&fmods) |*p| {
+        var fmods_owned = true;
+        if (self.adaln_tables) |tt| {
+            fmods = tt.final;
+            fmods_owned = false;
+        } else {
+            try self.final_adaln.?.forward(t_emb, cfg, true, &fmods, s);
+        }
+        defer if (fmods_owned) for (&fmods) |*p| {
             _ = mlx.mlx_array_free(p.*);
         };
         const vseg = layout.videoSegment();
@@ -1674,6 +2213,15 @@ pub fn sigmaSchedule(allocator: std.mem.Allocator, steps: u32, shift: f64) ![]f6
     return out;
 }
 
+/// A first/last-frame conditioning image for fl2va. `pixels` is
+/// [1, 3, 1, H, W] in [-1, 1] at the TARGET canvas (the caller resizes:
+/// stretch for `.first` — the geometry anchor — and center-cover for `.last`,
+/// per the reference node). Caller owns the array.
+pub const Keyframe = struct {
+    anchor: KeyframeAnchor,
+    pixels: mlx.mlx_array,
+};
+
 pub const GenRequest = struct {
     prompt: []const u8,
     width: u32 = 256,
@@ -1684,7 +2232,35 @@ pub const GenRequest = struct {
     seed: u64 = 0,
     shift_video: f64 = SIGMA_SHIFT_VIDEO,
     shift_audio: f64 = SIGMA_SHIFT_AUDIO,
+    /// Fast recipe switch: null/true = ON (the default), false = full-quality
+    /// per-step compute (every forward, dense attention branch every step).
+    fast: ?bool = null,
+    /// fl2va keyframes (0-2: first and/or last). NOTE the DEVIATION from the
+    /// reference presentation: ComfyUI also splices each keyframe into the
+    /// Qwen text encoding as a `<Picture i>: <vision block>` (tag-0 spans);
+    /// this port conditions through the VAE latents only until the Qwen3-VL
+    /// vision tower lands with ref2va (Phase 4 of the brief).
+    keyframes: []const Keyframe = &.{},
 };
+
+pub const SpeedConfig = struct { step_cache: f64, bcast_k: u32 };
+
+/// The 2026-08-03 eyeball verdict on the same-seed capstone pair made the
+/// fast recipe (velocity cache 0.05 + attention broadcast k=2 — 2.83x at the
+/// trained config) DEFAULT-ON, with `"fast": false` on the request as the
+/// off switch for final renders ("non fast just a smidge better"). Env vars
+/// stay the STRONGEST knob — set means set, including "0" — so every A/B
+/// harness keeps its arms.
+pub fn resolveSpeed(fast: ?bool, env_sc: ?[]const u8, env_bk: ?[]const u8) SpeedConfig {
+    const want_fast = fast orelse true;
+    var out = SpeedConfig{
+        .step_cache = if (want_fast) 0.05 else 0,
+        .bcast_k = if (want_fast) 2 else 0,
+    };
+    if (env_sc) |raw| out.step_cache = std.fmt.parseFloat(f64, raw) catch out.step_cache;
+    if (env_bk) |raw| out.bcast_k = std.fmt.parseInt(u32, raw, 10) catch out.bcast_k;
+    return out;
+}
 
 pub const GenPaths = struct {
     /// Directory holding tokenizer.json.
@@ -1715,6 +2291,23 @@ pub const GenResult = struct {
     }
 };
 
+/// Monotonic lap clock over std.Io (this Zig nightly has no std.time.Timer).
+const LapClock = struct {
+    io: std.Io,
+    start: std.Io.Timestamp,
+    mark_ns: u64 = 0,
+    fn init(io: std.Io) LapClock {
+        return .{ .io = io, .start = std.Io.Timestamp.now(io, .boot) };
+    }
+    /// ms since the previous lap (or init).
+    fn lapMs(self: *LapClock) u64 {
+        const cum: u64 = @intCast(self.start.untilNow(self.io, .boot).nanoseconds);
+        const d = cum - self.mark_ns;
+        self.mark_ns = cum;
+        return d / 1_000_000;
+    }
+};
+
 fn randomNormal(shape: []const c_int, seed: u64, dt: mlx.mlx_dtype, s: S) !mlx.mlx_array {
     var key = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(key);
@@ -1723,6 +2316,26 @@ fn randomNormal(shape: []const c_int, seed: u64, dt: mlx.mlx_dtype, s: S) !mlx.m
     defer _ = mlx.mlx_array_free(o);
     try mlx.check(mlx.mlx_random_normal(&o, shape.ptr, shape.len, mlx.mlx_dtype.float32, 0.0, 1.0, key, s));
     return astype(o, dt, s);
+}
+
+/// [1, C, T, H, W] -> [T*(H/2)*(W/2), C*1*2*2] rows, (t,h,w)-major, each row
+/// [c, pt, ph, pw]-flattened — the reference's `patchify_video` einsum
+/// (`nctrhpwq -> nthwcrpq`). Shared by the target latents and the fl2va
+/// keyframe condition rows, so both sides patchify identically by construction.
+pub fn patchifyVideo(x: mlx.mlx_array, s: S) !mlx.mlx_array {
+    const shp = mlx.getShape(x);
+    const c = shp[1];
+    const t = shp[2];
+    const h2 = @divExact(shp[3], @as(c_int, @intCast(PATCH_H)));
+    const w2 = @divExact(shp[4], @as(c_int, @intCast(PATCH_W)));
+    const x8 = try reshape(x, &[_]c_int{ 1, c, t, 1, h2, @intCast(PATCH_H), w2, @intCast(PATCH_W) }, s);
+    defer _ = mlx.mlx_array_free(x8);
+    // n c t r h p w q -> n t h w c r p q
+    const tr = try transpose(x8, &[_]c_int{ 0, 2, 4, 6, 1, 3, 5, 7 }, s);
+    defer _ = mlx.mlx_array_free(tr);
+    const trc = try contig(tr, s);
+    defer _ = mlx.mlx_array_free(trc);
+    return reshape(trc, &[_]c_int{ t * h2 * w2, c * @as(c_int, @intCast(PATCH_H * PATCH_W)) }, s);
 }
 
 /// Text-to-audio-video, with STAGED residency: the 50-layer text encoder
@@ -1746,6 +2359,18 @@ pub fn generate(
         req.width, req.height, shape.frame_count, shape.latent_t, shape.audio_t, req.steps,
     });
 
+    var phase_timer = LapClock.init(io);
+
+    // H3's DiT runs EVERY forward at prefill width (~9K rows at 480p), where
+    // the wide-M dequant+GEMM route measured −13%/step on the 8-bit pack
+    // (2/2 adjacent pairs, 2026-08-03). Default it ON for THIS backend only —
+    // MageFlow keeps its own default until it has its own A/B — and let the
+    // env always win (MLX_SERVE_MF_DQ_GEMM=0 kills, =N sets the floor).
+    const dq_override_prev = mage_flow.mf_dq_gemm_override;
+    if (std.c.getenv("MLX_SERVE_MF_DQ_GEMM") == null)
+        mage_flow.mf_dq_gemm_override = @as(?usize, 2048);
+    defer mage_flow.mf_dq_gemm_override = dq_override_prev;
+
     // ── 1. tokenize (raw ids, NO special tokens and no chat template) ──
     const tok_mod = @import("tokenizer.zig");
     var tok = try tok_mod.loadTokenizerAny(io, allocator, paths.tokenizer_dir);
@@ -1755,7 +2380,59 @@ pub fn generate(
     const ids = try allocator.alloc(i32, ids_u32.len);
     defer allocator.free(ids);
     for (ids_u32, 0..) |v, i| ids[i] = @intCast(v);
-    log.info("[minimax-h3] prompt -> {d} tokens\n", .{ids.len});
+    log.info("[minimax-h3] prompt -> {d} tokens ({d} ms)\n", .{ ids.len, phase_timer.lapMs() });
+
+    // ── 1.5 keyframes -> condition rows (encoder loaded and FREED before the
+    //       text encoder, keeping the staged-residency peak unchanged) ──
+    var cond_rows: ?mlx.mlx_array = null;
+    defer if (cond_rows) |cr| {
+        _ = mlx.mlx_array_free(cr);
+    };
+    var anchors_buf: [2]KeyframeAnchor = undefined;
+    var anchors: []const KeyframeAnchor = &.{};
+    if (req.keyframes.len > 0) {
+        if (req.keyframes.len > 2) return error.TooManyKeyframes;
+        var vw0 = try model_mod.loadWeightsSingleFile(allocator, paths.vae);
+        defer vw0.deinit();
+        var enc = try vae_mod.Encoder.load(allocator, &vw0, s);
+        defer enc.deinit();
+        var rows_list: [2]mlx.mlx_array = undefined;
+        var nrows: usize = 0;
+        defer for (rows_list[0..nrows]) |r| {
+            _ = mlx.mlx_array_free(r);
+        };
+        for (req.keyframes, 0..) |kf, ki| {
+            anchors_buf[ki] = kf.anchor;
+            const lat = try enc.encodeImage(kf.pixels, allocator, s);
+            defer _ = mlx.mlx_array_free(lat);
+            rows_list[nrows] = try patchifyVideo(lat, s);
+            nrows += 1;
+        }
+        anchors = anchors_buf[0..req.keyframes.len];
+        const cat = if (nrows == 1) try contig(rows_list[0], s) else try concat(rows_list[0..nrows], 0, s);
+        defer _ = mlx.mlx_array_free(cat);
+        // Condition noise augmentation: r = aug*r + (1-aug)*noise, aug 0.999,
+        // CONSTANT for the whole generation (the reference restarts the same
+        // RNG stream every forward, which is the same thing). mlx RNG, not
+        // torch's — seeds are not portable across implementations, the same
+        // class as the initial latents.
+        const noise = try randomNormal(mlx.getShape(cat), req.seed, mlx.mlx_dtype.float32, s);
+        defer _ = mlx.mlx_array_free(noise);
+        const aug = try scalarLike(@floatCast(VISUAL_COND_TIMESTEP), cat, s);
+        defer _ = mlx.mlx_array_free(aug);
+        const one_m = try scalarLike(@floatCast(1.0 - VISUAL_COND_TIMESTEP), cat, s);
+        defer _ = mlx.mlx_array_free(one_m);
+        const ra = try mulA(cat, aug, s);
+        defer _ = mlx.mlx_array_free(ra);
+        const na2 = try mulA(noise, one_m, s);
+        defer _ = mlx.mlx_array_free(na2);
+        cond_rows = try addA(ra, na2, s);
+        try mlx.check(mlx.mlx_array_eval(cond_rows.?));
+        _ = mlx.mlx_clear_cache();
+        log.info("[minimax-h3] {d} keyframe(s) encoded -> {d} cond rows ({d} ms, encoder released)\n", .{
+            req.keyframes.len, mlx.getShape(cond_rows.?)[0], phase_timer.lapMs(),
+        });
+    }
 
     if (progress) |p| p.emit("Encoding prompt", 0, req.steps);
 
@@ -1771,10 +2448,11 @@ pub fn generate(
     };
     defer _ = mlx.mlx_array_free(text_hidden);
     _ = mlx.mlx_clear_cache();
-    log.info("[minimax-h3] text encoded, encoder released\n", .{});
+    const te_ms = phase_timer.lapMs();
+    log.info("[minimax-h3] text encoded, encoder released ({d} ms load+encode)\n", .{te_ms});
 
     // ── 3. DiT sampling ──
-    var layout = try PackedLayout.init(allocator, @intCast(ids.len), shape.latent_t, lat_h, lat_w, shape.audio_t, &.{}, shape.frame_count);
+    var layout = try PackedLayout.init(allocator, @intCast(ids.len), shape.latent_t, lat_h, lat_w, shape.audio_t, anchors, shape.frame_count);
     defer layout.deinit();
 
     const n_video_rows: c_int = @intCast(shape.latent_t * (lat_h / PATCH_H) * (lat_w / PATCH_W));
@@ -1789,25 +2467,161 @@ pub fn generate(
     const sigmas = try sigmaSchedule(allocator, req.steps, req.shift_video);
     defer allocator.free(sigmas);
 
+    // Profiling arms: never set by any server path; the live-test harness and
+    // profile drivers own the env. A non-empty junk value is LOUDLY off.
+    const abl_raw = envStr("MINIMAX_H3_ABLATE");
+    const abl_mode = ablateModeFrom(abl_raw);
+    if (abl_raw != null and std.meta.activeTag(abl_mode) == .off)
+        log.warn("[minimax-h3] MINIMAX_H3_ABLATE='{s}' not recognized; profiling arms OFF\n", .{abl_raw.?});
+
     {
-        var dw = try model_mod.loadWeightsSingleFile(allocator, paths.dit);
-        defer dw.deinit();
-        var model = try Model.load(allocator, &dw, .{}, dt, s);
+        // The weights MAP must not outlive Model.load: it holds +1 refs on
+        // every raw file-backed array, so anything the model later FREES (the
+        // 13 GB of AdaLN under precompute) would stay resident until scope
+        // end. Lazy graphs keep their inputs alive internally, so dropping
+        // the map right away is safe — caught live by the `dit resident` log
+        // reading 33.4 GB where ~22 was expected.
+        var model = blk: {
+            var dw = try model_mod.loadWeightsSingleFile(allocator, paths.dit);
+            defer dw.deinit();
+            break :blk try Model.load(allocator, &dw, .{}, dt, s);
+        };
         defer model.deinit();
+        // AdaLN precompute must run while the trunk is still lazy — see
+        // precomputeAdaln. Default ON: it is what keeps the DiT residency at
+        // ~22 GB instead of ~35 on the 8-bit pack.
+        const precompute_on = blk: {
+            const raw = envStr("MINIMAX_H3_ADALN_PRECOMPUTE") orelse break :blk true;
+            break :blk !std.mem.eql(u8, raw, "0");
+        };
+        if (precompute_on) {
+            const ts = try collectScheduleTs(allocator, &layout, sigmas[0..req.steps], req.shift_video, req.shift_audio, .{});
+            defer allocator.free(ts);
+            try model.precomputeAdaln(ts, s);
+            log.info("[minimax-h3] adaln precomputed for {d} timesteps; 13B modulation weights released\n", .{ts.len});
+        }
+        try model.evalWeights();
+        var active_bytes: usize = 0;
+        _ = mlx.mlx_get_active_memory(&active_bytes);
+        const load_ms = phase_timer.lapMs();
+        log.info("[minimax-h3] dit resident: {d:.2} GB mlx-active\n", .{@as(f64, @floatFromInt(active_bytes)) / (1024.0 * 1024.0 * 1024.0)});
 
         const refined = try model.refineText(text_hidden, s);
         defer _ = mlx.mlx_array_free(refined);
 
         var rope = try buildRope(allocator, &layout, model.inv_freq, dt, s);
         defer rope.deinit();
+        try mlx.check(mlx.mlx_array_eval(refined));
+        log.info("[minimax-h3] dit loaded in {d} ms, text refined in {d} ms\n", .{ load_ms, phase_timer.lapMs() });
+
+        // ── sparse attention (OPT-IN) ──
+        model.sparse_policy = sparsePolicyFrom(envStr("MINIMAX_H3_SPARSE_ATTN"));
+        if (model.sparse_policy != .off)
+            log.info("[minimax-h3] sparse attention policy: {s}\n", .{@tagName(model.sparse_policy)});
+
+        // ── attention broadcast (PAB-style, OPT-IN) ──
+        // MINIMAX_H3_ATTN_BCAST=<k> recomputes every block's attention branch
+        // only on every k-th mid-schedule step and reuses the cached output
+        // between — the branch is ~70% of a 768p step. Cache cost: one
+        // [S, hidden] bf16 per block (~20 GB at 768p, ~1.4 GB at 256px).
+        const speed = resolveSpeed(req.fast, envStr("MINIMAX_H3_STEP_CACHE"), envStr("MINIMAX_H3_ATTN_BCAST"));
+        log.info("[minimax-h3] speed recipe: step-cache {d:.3}, attn-broadcast k={d} (fast={any})\n", .{ speed.step_cache, speed.bcast_k, req.fast });
+        const bcast_k: u32 = speed.bcast_k;
+        var attn_bcast: ?AttnBroadcast = if (bcast_k > 1) try AttnBroadcast.init(allocator, model.blocks.len) else null;
+        defer if (attn_bcast) |*ab| ab.deinit();
+        var bcast_reused: u32 = 0;
+
+        // ── step cache (TeaCache-style velocity reuse, OPT-IN) ──
+        // Adjacent steps at high sigma produce highly-correlated velocities
+        // (the shift-12 schedule clusters steps near sigma 1). When the
+        // ACCUMULATED relative input change since the last real forward stays
+        // under the threshold, reuse the previous velocity instead of running
+        // the 50-block DiT. The audio velocity is re-scaled to the current
+        // sigma's slope so the reuse stays on the audio stream's true ODE.
+        // MINIMAX_H3_STEP_CACHE=<thresh> opts in (0.08 is a sane start);
+        // never skips the first two or the last step, caps consecutive skips.
+        const sc_thresh: f64 = speed.step_cache;
+        var sc_v_video: ?mlx.mlx_array = null;
+        defer if (sc_v_video) |x| {
+            _ = mlx.mlx_array_free(x);
+        };
+        var sc_a_raw: ?mlx.mlx_array = null; // audio velocity DIVIDED by its slope
+        defer if (sc_a_raw) |x| {
+            _ = mlx.mlx_array_free(x);
+        };
+        var sc_acc: f64 = 0;
+        var sc_consec: u32 = 0;
+        var sc_skipped: u32 = 0;
 
         for (0..req.steps) |i| {
+            model.ablate = switch (abl_mode) {
+                .off => .none,
+                .ladder => ladderArmForStep(i),
+                .fixed => |f| f,
+            };
+            var step_timer = LapClock.init(io);
             const sigma = sigmas[i];
             const dsigma = sigmas[i + 1] - sigmas[i];
-            var plan = try buildTimestepPlan(allocator, &layout, sigma, req.shift_video, req.shift_audio, .{});
+
+            // Step-cache gate: the relative input move this step would make
+            // with the CACHED velocity is known without any forward.
+            var sc_skip = false;
+            if (sc_thresh > 0 and sc_v_video != null and i >= 2 and i + 1 < req.steps and sc_consec < 2) {
+                const vmag = try meanAbs(sc_v_video.?, s);
+                const xmag = try meanAbs(video_x, s);
+                const rel = @abs(dsigma) * @as(f64, vmag) / @max(@as(f64, xmag), 1e-8);
+                if (sc_acc + rel < sc_thresh) {
+                    sc_acc += rel;
+                    sc_skip = true;
+                }
+            }
+            if (sc_skip) {
+                const dv = try scalarLike(@floatCast(dsigma), sc_v_video.?, s);
+                defer _ = mlx.mlx_array_free(dv);
+                const stepv = try mulA(sc_v_video.?, dv, s);
+                defer _ = mlx.mlx_array_free(stepv);
+                const nv = try addA(video_x, stepv, s);
+                _ = mlx.mlx_array_free(video_x);
+                video_x = nv;
+                const slope_i = timeShiftSlope(sigma, req.shift_video, req.shift_audio);
+                const da = try scalarLike(@floatCast(dsigma * slope_i), sc_a_raw.?, s);
+                defer _ = mlx.mlx_array_free(da);
+                const stepa = try mulA(sc_a_raw.?, da, s);
+                defer _ = mlx.mlx_array_free(stepa);
+                const na = try addA(audio_x, stepa, s);
+                _ = mlx.mlx_array_free(audio_x);
+                audio_x = na;
+                try mlx.check(mlx.mlx_array_eval(video_x));
+                try mlx.check(mlx.mlx_array_eval(audio_x));
+                sc_consec += 1;
+                sc_skipped += 1;
+                if (progress) |p| {
+                    if (p.cancelled()) return error.Cancelled;
+                    p.emit("Generating", @intCast(i + 1), req.steps);
+                }
+                log.info("[minimax-h3] step {d}/{d} sigma {d:.4} (cached velocity, {d} ms)\n", .{ i + 1, req.steps, sigma, step_timer.lapMs() });
+                continue;
+            }
+            var plan = if (model.adaln_tables) |tt|
+                try buildTimestepPlanGlobal(allocator, &layout, sigma, req.shift_video, req.shift_audio, .{}, tt.ts)
+            else
+                try buildTimestepPlan(allocator, &layout, sigma, req.shift_video, req.shift_audio, .{});
             defer plan.deinit();
 
-            var out = try model.forward(&layout, &plan, refined, video_x, audio_x, rope, sigma, req.shift_video, req.shift_audio, s);
+            // The forward consumes EVERY video-stream row in packed order:
+            // constant condition rows first (fl2va keyframes), then the noisy
+            // target — the reference's `all_video_rows[~img_update] = cond`.
+            const video_in = if (cond_rows) |cr|
+                try concat(&[_]mlx.mlx_array{ cr, video_x }, 0, s)
+            else
+                video_x;
+            defer if (cond_rows != null) {
+                _ = mlx.mlx_array_free(video_in);
+            };
+
+            const refresh = attnBroadcastRefresh(i, req.steps, bcast_k);
+            if (attn_bcast != null and !refresh) bcast_reused += 1;
+            var out = try model.forward(&layout, &plan, refined, video_in, audio_x, rope, sigma, req.shift_video, req.shift_audio, if (attn_bcast) |*ab| ab else null, refresh, s);
             defer out.deinit();
 
             // Euler on the flat ODE: x += model_output * dsigma. The audio
@@ -1829,6 +2643,20 @@ pub fn generate(
             _ = mlx.mlx_array_free(audio_x);
             audio_x = na;
 
+            if (sc_thresh > 0) {
+                const slope_f = timeShiftSlope(sigma, req.shift_video, req.shift_audio);
+                if (slope_f > 1e-9) {
+                    if (sc_v_video) |x| _ = mlx.mlx_array_free(x);
+                    sc_v_video = try contig(out.video, s);
+                    const inv_slope = try scalarLike(@floatCast(1.0 / slope_f), out.audio, s);
+                    defer _ = mlx.mlx_array_free(inv_slope);
+                    if (sc_a_raw) |x| _ = mlx.mlx_array_free(x);
+                    sc_a_raw = try mulA(out.audio, inv_slope, s);
+                }
+                sc_acc = 0;
+                sc_consec = 0;
+            }
+
             try mlx.check(mlx.mlx_array_eval(video_x));
             try mlx.check(mlx.mlx_array_eval(audio_x));
             if (progress) |p| {
@@ -1841,11 +2669,20 @@ pub fn generate(
             // unbounded and these shapes repeat, so without it the process
             // footprint ratchets across steps.
             _ = mlx.mlx_clear_cache();
-            log.info("[minimax-h3] step {d}/{d} sigma {d:.4}\n", .{ i + 1, req.steps, sigma });
+            const step_ms = step_timer.lapMs();
+            if (std.meta.activeTag(abl_mode) != .off) {
+                log.info("[h3-prof] arm={s} step={d} ms={d}\n", .{ @tagName(model.ablate), i, step_ms });
+            } else {
+                log.info("[minimax-h3] step {d}/{d} sigma {d:.4} ({d} ms)\n", .{ i + 1, req.steps, sigma, step_ms });
+            }
         }
+        if (sc_skipped > 0)
+            log.info("[minimax-h3] step-cache reused velocity on {d}/{d} steps (thresh {d:.3})\n", .{ sc_skipped, req.steps, sc_thresh });
+        if (bcast_reused > 0)
+            log.info("[minimax-h3] attn-broadcast reused attention on {d}/{d} steps (k={d})\n", .{ bcast_reused, req.steps, bcast_k });
     }
     _ = mlx.mlx_clear_cache();
-    log.info("[minimax-h3] sampling done, DiT released\n", .{});
+    log.info("[minimax-h3] sampling done in {d} ms, DiT released\n", .{phase_timer.lapMs()});
 
     // ── 4. VAE decode ──
     // Unpatchify the video rows back to a latent volume: rows are
@@ -1864,6 +2701,7 @@ pub fn generate(
     defer _ = mlx.mlx_array_free(zlat);
 
     if (progress) |p| p.emit("Decoding video", req.steps, req.steps);
+    _ = phase_timer.lapMs();
     var vw = try model_mod.loadWeightsSingleFile(allocator, paths.vae);
     defer vw.deinit();
     var dec = try vae_mod.Decoder.load(allocator, &vw, .{}, dt, s);
@@ -1872,6 +2710,7 @@ pub fn generate(
     errdefer _ = mlx.mlx_array_free(pixels);
     try mlx.check(mlx.mlx_array_eval(pixels));
     _ = mlx.mlx_clear_cache();
+    log.info("[minimax-h3] video decoded in {d} ms (load+decode)\n", .{phase_timer.lapMs()});
 
     // Audio rows [ch*T, 32] -> [1, 32, 2, T]
     const at: c_int = @intCast(shape.audio_t);
@@ -1895,7 +2734,7 @@ pub fn generate(
         try mlx.check(mlx.mlx_array_eval(wave));
         audio_wave = wave;
         _ = mlx.mlx_clear_cache();
-        log.info("[minimax-h3] audio decoded: {d} samples/ch at {d} Hz\n", .{ mlx.getShape(wave)[1], audio_mod.SAMPLE_RATE });
+        log.info("[minimax-h3] audio decoded: {d} samples/ch at {d} Hz ({d} ms)\n", .{ mlx.getShape(wave)[1], audio_mod.SAMPLE_RATE, phase_timer.lapMs() });
     }
 
     const pshape = mlx.getShape(pixels);
@@ -1996,6 +2835,7 @@ fn jsonU32(v: std.json.Value) u32 {
 // matching how the LTX path already delivers video.
 test "minimax h3 live: generates a clip" {
     const dir = envStr("MINIMAX_H3_DIR") orelse return error.SkipZigTest;
+    log.enableStderr(); // the phase/step lines are this harness's output
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
     const s = mlx.gpuStream();
@@ -2155,6 +2995,19 @@ fn oneLike(like: mlx.mlx_array, s: S) !mlx.mlx_array {
     return scalarLike(1.0, like, s);
 }
 
+fn meanAbs(x: mlx.mlx_array, s: S) !f32 {
+    var ab = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ab);
+    try mlx.check(mlx.mlx_abs(&ab, x, s));
+    var mv = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(mv);
+    try mlx.check(mlx.mlx_mean(&mv, ab, false, s));
+    try mlx.check(mlx.mlx_array_eval(mv));
+    var v: f32 = 0;
+    try mlx.check(mlx.mlx_array_item_float32(&v, mv));
+    return v;
+}
+
 fn absMax(x: mlx.mlx_array, s: S) !f32 {
     var ab = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(ab);
@@ -2193,6 +3046,107 @@ fn writeWav(a: std.mem.Allocator, io: std.Io, wave: mlx.mlx_array, out_dir: []co
     var w = fh.writer(io, &wbuf);
     try w.interface.writeAll(bytes);
     try w.interface.flush();
+}
+
+test "minimax h3: patchifyVideo matches the reference einsum order" {
+    const s = mlx.gpuStream();
+    // [1, C=2, T=1, H=2, W=2] with v[c,y,x] = c*100 + y*10 + x. One row of 8,
+    // ordered [c, pt, ph, pw]-flattened per the reference's
+    // `nctrhpwq -> nthwcrpq`: c0 quad then c1 quad, row-major within the patch.
+    var buf: [8]f32 = .{ 0, 1, 10, 11, 100, 101, 110, 111 };
+    const sh = [_]c_int{ 1, 2, 1, 2, 2 };
+    const x = mlx.mlx_array_new_data(&buf, &sh, 5, mlx.mlx_dtype.float32);
+    defer _ = mlx.mlx_array_free(x);
+    const rows = try patchifyVideo(x, s);
+    defer _ = mlx.mlx_array_free(rows);
+    const rshp = mlx.getShape(rows);
+    try testing.expectEqual(@as(c_int, 1), rshp[0]);
+    try testing.expectEqual(@as(c_int, 8), rshp[1]);
+    try mlx.check(mlx.mlx_array_eval(rows));
+    const data = mlx.mlx_array_data_float32(rows).?;
+    const want = [_]f32{ 0, 1, 10, 11, 100, 101, 110, 111 };
+    for (want, 0..) |v, i| try testing.expectEqual(v, data[i]);
+}
+
+test "minimax h3: timestep plan can index a GLOBAL schedule table" {
+    // AdaLN precompute materializes modulations for the WHOLE schedule up
+    // front, so per-step runs must index rows of the global sorted t table,
+    // not the forward's own 2-3 element set.
+    const a = testing.allocator;
+    var layout = try PackedLayout.init(a, 4, 2, 4, 4, 3, &.{}, 5);
+    defer layout.deinit();
+
+    const sigma = 0.5;
+    var local = try buildTimestepPlan(a, &layout, sigma, 12.0, 3.0, .{});
+    defer local.deinit();
+
+    // A global table containing the step's ts plus others, sorted.
+    const t_v = 1.0 - sigma;
+    const t_a = 1.0 - timeShiftSigma(sigma, 12.0, 3.0);
+    const global = [_]f64{ 0.1, t_a, 0.3, t_v, 0.9 };
+    var g = try buildTimestepPlanGlobal(a, &layout, sigma, 12.0, 3.0, .{}, &global);
+    defer g.deinit();
+
+    // Same runs, but rows resolve into the GLOBAL table: t_a sits at global
+    // index 1, t_v at 3 (the layout has text/audio/video segments only).
+    try testing.expectEqual(local.runs.len, g.runs.len);
+    for (g.runs, local.runs) |gr, lr| {
+        try testing.expectEqual(lr.start, gr.start);
+        try testing.expectEqual(lr.end, gr.end);
+        const tag = lr.mod_row % 3;
+        const local_t = local.unique_t[lr.mod_row / 3];
+        try testing.expectEqual(tag, gr.mod_row % 3);
+        try testing.expectEqual(local_t, global[gr.mod_row / 3]);
+    }
+}
+
+test "minimax h3: schedule t-set collects every step's unique timesteps" {
+    const a = testing.allocator;
+    var layout = try PackedLayout.init(a, 4, 2, 4, 4, 3, &.{}, 5);
+    defer layout.deinit();
+    const sigmas = try sigmaSchedule(a, 4, 12.0);
+    defer a.free(sigmas);
+    const ts = try collectScheduleTs(a, &layout, sigmas[0..4], 12.0, 3.0, .{});
+    defer a.free(ts);
+    // 4 steps x 2 timesteps (video, audio) minus the sigma=1 step, where both
+    // schedules coincide at t=0: 7 distinct values, sorted ascending.
+    try testing.expectEqual(@as(usize, 7), ts.len);
+    for (1..ts.len) |i| try testing.expect(ts[i] > ts[i - 1]);
+    // Every step's plan resolves inside the collected set.
+    for (0..4) |i| {
+        var p = try buildTimestepPlanGlobal(a, &layout, sigmas[i], 12.0, 3.0, .{}, ts);
+        defer p.deinit();
+        for (p.runs) |r| try testing.expect(r.mod_row / 3 < ts.len);
+    }
+}
+
+test "minimax h3: profile ladder arm schedule" {
+    // Steps 0-1 are warmup (graph build + JIT land in step 0), then each arm
+    // gets 3 consecutive steps; past the ladder the run degrades to .none so a
+    // too-long STEPS setting stays harmless.
+    try testing.expectEqual(Ablate.none, ladderArmForStep(0));
+    try testing.expectEqual(Ablate.none, ladderArmForStep(1));
+    try testing.expectEqual(Ablate.none, ladderArmForStep(2)); // measured baseline arm
+    try testing.expectEqual(Ablate.none, ladderArmForStep(4));
+    try testing.expectEqual(Ablate.sdpa, ladderArmForStep(5));
+    try testing.expectEqual(Ablate.sdpa, ladderArmForStep(7));
+    try testing.expectEqual(Ablate.attn, ladderArmForStep(8));
+    try testing.expectEqual(Ablate.mlp, ladderArmForStep(11));
+    try testing.expectEqual(Ablate.adaln, ladderArmForStep(14));
+    try testing.expectEqual(Ablate.adaln, ladderArmForStep(16));
+    try testing.expectEqual(Ablate.none, ladderArmForStep(17));
+    try testing.expectEqual(Ablate.none, ladderArmForStep(100));
+}
+
+test "minimax h3: ablate mode parses off / ladder / fixed arms" {
+    try testing.expectEqual(AblateMode.off, ablateModeFrom(null));
+    try testing.expectEqual(AblateMode.off, ablateModeFrom(""));
+    try testing.expectEqual(AblateMode.ladder, ablateModeFrom("ladder"));
+    try testing.expectEqual(AblateMode{ .fixed = .sdpa }, ablateModeFrom("sdpa"));
+    try testing.expectEqual(AblateMode{ .fixed = .adaln }, ablateModeFrom("adaln"));
+    // Junk must not silently become an arm — a profile run with a typo'd env
+    // measuring the WRONG thing is the silent-flag-eater class.
+    try testing.expectEqual(AblateMode.off, ablateModeFrom("bogus"));
 }
 
 test "minimax h3: constants match the reference" {
@@ -2605,7 +3559,7 @@ test "minimax h3: DiT block matches the reference transcription" {
         defer _ = mlx.mlx_array_free(attn_in);
         const want = try ownWeight(&w, "x.attn_out");
         defer _ = mlx.mlx_array_free(want);
-        const got = try attnForward(&attn, attn_in, cfg, rope, s);
+        const got = try attnForward(&attn, attn_in, cfg, rope, .none, null, s);
         defer _ = mlx.mlx_array_free(got);
         const cos_v = try cosineSim(got, want, s);
         try testing.expect(std.math.isFinite(cos_v));
@@ -2654,7 +3608,7 @@ test "minimax h3: DiT block matches the reference transcription" {
         defer _ = mlx.mlx_array_free(n1);
         const m1 = try modScaleShift(n1, mods[0], mods[1], runs, a, s);
         defer _ = mlx.mlx_array_free(m1);
-        const at = try attnForward(&attn, m1, cfg, rope, s);
+        const at = try attnForward(&attn, m1, cfg, rope, .none, null, s);
         defer _ = mlx.mlx_array_free(at);
         const h1 = try modGate(h_in, mods[2], at, runs, a, s);
         defer _ = mlx.mlx_array_free(h1);
@@ -2762,4 +3716,145 @@ test "minimax h3: video temporal grid cycles 1,4,4,4,4" {
         for (0..n) |k| spans += videoTSpan(k);
         try testing.expectApproxEqRel(jsonF64(o.get("spans_sum").?), spans, 1e-9);
     }
+}
+
+test "minimax h3 live: sdpa shape ubench" {
+    // Phase-0 flagged SDPA at [1,56,S,128] costing ~10 s/step at 480p where
+    // its raw FLOPs say ~0.2 s. This times the EXACT call in isolation through
+    // OUR libmlx (the pip-mlx probe cross-checks a different build).
+    const raw = std.c.getenv("MINIMAX_H3_SDPA_UBENCH") orelse return error.SkipZigTest;
+    const seq: c_int = std.fmt.parseInt(c_int, std.mem.sliceTo(raw, 0), 10) catch 9266;
+    log.enableStderr();
+    const s = mlx.gpuStream();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const h: c_int = 56;
+    const hd: c_int = 128;
+    const q = try randomNormal(&[_]c_int{ 1, h, seq, hd }, 1, mlx.mlx_dtype.bfloat16, s);
+    defer _ = mlx.mlx_array_free(q);
+    const k = try randomNormal(&[_]c_int{ 1, h, seq, hd }, 2, mlx.mlx_dtype.bfloat16, s);
+    defer _ = mlx.mlx_array_free(k);
+    const v = try randomNormal(&[_]c_int{ 1, h, seq, hd }, 3, mlx.mlx_dtype.bfloat16, s);
+    defer _ = mlx.mlx_array_free(v);
+    try mlx.check(mlx.mlx_array_eval(q));
+    try mlx.check(mlx.mlx_array_eval(k));
+    try mlx.check(mlx.mlx_array_eval(v));
+    const scale: f32 = 1.0 / @sqrt(@as(f32, 128.0));
+    const null_a = mlx.mlx_array{ .ctx = null };
+    for (0..4) |it| {
+        var clock = LapClock.init(io);
+        var o = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(o);
+        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&o, q, k, v, scale, "", null_a, null_a, s));
+        try mlx.check(mlx.mlx_array_eval(o));
+        const ms = clock.lapMs();
+        const fl: f64 = 4.0 * 56.0 * @as(f64, @floatFromInt(seq)) * @as(f64, @floatFromInt(seq)) * 128.0;
+        log.info("[sdpa-ubench] iter {d}: S={d} {d} ms ({d:.2} TFLOPS eff)\n", .{ it, seq, ms, fl / (@as(f64, @floatFromInt(@max(ms, 1))) / 1000.0) / 1e12 });
+    }
+}
+
+test "minimax h3: attention-broadcast refresh schedule" {
+    // k<=1 = off (every step refreshes).
+    for (0..10) |i| try testing.expect(attnBroadcastRefresh(i, 30, 0));
+    for (0..10) |i| try testing.expect(attnBroadcastRefresh(i, 30, 1));
+    // k=2: warmup 0-3 and the last two steps always refresh; alternating between.
+    for (0..4) |i| try testing.expect(attnBroadcastRefresh(i, 30, 2));
+    try testing.expect(attnBroadcastRefresh(4, 30, 2));
+    try testing.expect(!attnBroadcastRefresh(5, 30, 2));
+    try testing.expect(attnBroadcastRefresh(6, 30, 2));
+    try testing.expect(attnBroadcastRefresh(28, 30, 2));
+    try testing.expect(attnBroadcastRefresh(29, 30, 2));
+    // k=3 skips two of three mid-schedule steps.
+    try testing.expect(attnBroadcastRefresh(4, 30, 3));
+    try testing.expect(!attnBroadcastRefresh(5, 30, 3));
+    try testing.expect(!attnBroadcastRefresh(6, 30, 3));
+    try testing.expect(attnBroadcastRefresh(7, 30, 3));
+}
+
+test "minimax h3: sparse-attention layer policy" {
+    try testing.expectEqual(SparsePolicy.off, sparsePolicyFrom(null));
+    try testing.expectEqual(SparsePolicy.off, sparsePolicyFrom(""));
+    try testing.expectEqual(SparsePolicy.off, sparsePolicyFrom("junk"));
+    try testing.expectEqual(SparsePolicy.mix, sparsePolicyFrom("mix"));
+    // mix on 50 layers: dense anchors at 0,1,25,26,48,49; even=spatial,
+    // odd=temporal elsewhere.
+    for ([_]usize{ 0, 1, 25, 26, 48, 49 }) |l|
+        try testing.expectEqual(SparseMode.dense, sparseModeForLayer(l, 50, .mix));
+    try testing.expectEqual(SparseMode.spatial, sparseModeForLayer(2, 50, .mix));
+    try testing.expectEqual(SparseMode.temporal, sparseModeForLayer(3, 50, .mix));
+    try testing.expectEqual(SparseMode.spatial, sparseModeForLayer(24, 50, .mix));
+    try testing.expectEqual(SparseMode.temporal, sparseModeForLayer(47, 50, .mix));
+    // forced policies ignore anchors
+    try testing.expectEqual(SparseMode.spatial, sparseModeForLayer(0, 50, .spatial));
+    try testing.expectEqual(SparseMode.temporal, sparseModeForLayer(49, 50, .temporal));
+    // off = dense everywhere
+    for (0..50) |l| try testing.expectEqual(SparseMode.dense, sparseModeForLayer(l, 50, .off));
+}
+
+test "minimax h3: sparseAttend attends exactly its subset (uniform-score closed form)" {
+    // q = k = 0 makes every score 0, so softmax is UNIFORM over each row's
+    // key subset and the output row is the MEAN of v over that subset — a
+    // wrong subset is a wrong mean, exactly. T=2 frames, F=3 rows/frame,
+    // G=2 strip rows, H=1, hd=4, v[row] = row (all dims), f32 so the small
+    // integer means are exact.
+    const s = mlx.gpuStream();
+    const seq: usize = 8;
+    var zeros_buf: [seq * 4]f32 = @splat(0);
+    var v_buf: [seq * 4]f32 = undefined;
+    for (0..seq) |r| for (0..4) |d| {
+        v_buf[r * 4 + d] = @floatFromInt(r);
+    };
+    const shape = [_]c_int{ 1, 1, seq, 4 };
+    const q = mlx.mlx_array_new_data(&zeros_buf, &shape, 4, mlx.mlx_dtype.float32);
+    defer _ = mlx.mlx_array_free(q);
+    const k = mlx.mlx_array_new_data(&zeros_buf, &shape, 4, mlx.mlx_dtype.float32);
+    defer _ = mlx.mlx_array_free(k);
+    const v = mlx.mlx_array_new_data(&v_buf, &shape, 4, mlx.mlx_dtype.float32);
+    defer _ = mlx.mlx_array_free(v);
+
+    const cases = [_]struct { mode: SparseMode, want: [8]f32 }{
+        // spatial: strip rows (0,1) see all 8 -> 3.5; frame0 rows {2,3,4}+strip
+        // -> 2.0; frame1 rows {5,6,7}+strip -> 3.8.
+        .{ .mode = .spatial, .want = .{ 3.5, 3.5, 2.0, 2.0, 2.0, 3.8, 3.8, 3.8 } },
+        // temporal: stripe fi = {2+fi, 5+fi}+strip -> (2+5+0+1)/4=2.0,
+        // (3+6+0+1)/4=2.5, (4+7+0+1)/4=3.0 for both frames.
+        .{ .mode = .temporal, .want = .{ 3.5, 3.5, 2.0, 2.5, 3.0, 2.0, 2.5, 3.0 } },
+    };
+    for (cases) |case| {
+        const spec = SparseSpec{ .mode = case.mode, .t = 2, .f = 3, .video_start = 2 };
+        const out = try sparseAttend(q, k, v, spec, 0.5, s);
+        defer _ = mlx.mlx_array_free(out);
+        const of = try astype(out, mlx.mlx_dtype.float32, s);
+        defer _ = mlx.mlx_array_free(of);
+        try mlx.check(mlx.mlx_array_eval(of));
+        const data = mlx.mlx_array_data_float32(of).?;
+        for (0..seq) |r| {
+            try testing.expectApproxEqAbs(case.want[r], data[r * 4], 1e-5);
+            try testing.expectApproxEqAbs(case.want[r], data[r * 4 + 3], 1e-5);
+        }
+    }
+}
+
+test "minimax h3: resolveSpeed — fast default on, request off-switch, env strongest" {
+    // Defaults: fast recipe on.
+    var c = resolveSpeed(null, null, null);
+    try testing.expectEqual(@as(f64, 0.05), c.step_cache);
+    try testing.expectEqual(@as(u32, 2), c.bcast_k);
+    c = resolveSpeed(true, null, null);
+    try testing.expectEqual(@as(u32, 2), c.bcast_k);
+    // "fast": false is the user's off switch.
+    c = resolveSpeed(false, null, null);
+    try testing.expectEqual(@as(f64, 0), c.step_cache);
+    try testing.expectEqual(@as(u32, 0), c.bcast_k);
+    // Env set means SET — including "0" (the A/B harness arms), and it beats
+    // the request field in BOTH directions.
+    c = resolveSpeed(null, "0", "0");
+    try testing.expectEqual(@as(f64, 0), c.step_cache);
+    try testing.expectEqual(@as(u32, 0), c.bcast_k);
+    c = resolveSpeed(false, "0.1", "3");
+    try testing.expectEqual(@as(f64, 0.1), c.step_cache);
+    try testing.expectEqual(@as(u32, 3), c.bcast_k);
+    // Junk env falls back to the resolved default, never to a surprise arm.
+    c = resolveSpeed(null, "junk", "junk");
+    try testing.expectEqual(@as(f64, 0.05), c.step_cache);
+    try testing.expectEqual(@as(u32, 2), c.bcast_k);
 }

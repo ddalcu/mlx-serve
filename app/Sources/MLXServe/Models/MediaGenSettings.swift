@@ -181,6 +181,8 @@ struct VideoGenSettings: Codable, Equatable {
     var stgScale: Double = 0.0
     var seed: Int = 42
     var keepResident: Bool = false
+    /// Max-quality opt-out of the server's fast recipe (H3).
+    var bestQuality: Bool = false
     /// Style LoRA (Advanced): sticky adapter path ("" = none) + strength.
     var loraPath: String = ""
     var loraScale: Double = 1.0

@@ -2253,6 +2253,36 @@ fn doLoadGenOnInferenceThread(sch: *Scheduler, params: anytype, modality: gen_mo
     log.info("[gen] loading {s} engine: {s}\n", .{ @tagName(modality), params.model_dir });
     const entry = params.entry;
 
+    // Media preflight, mirroring the MLX path's — a Metal OOM during engine
+    // build or the first generation is uncatchable, so refuse up front. The
+    // bill is per-BACKEND: a staged-residency model (minimax_h3 frees its text
+    // encoder before the DiT loads) is billed its true peak, not the sum of
+    // every safetensors in the dir, which refused loads that would have worked.
+    if (!skip_mem_preflight) {
+        // The stub config's model_type is a MODALITY static ("AudioVideo" for
+        // every video backend — the per-modality-vs-per-backend class), so the
+        // per-BACKEND residency estimate must re-peek the dir's actual type,
+        // the same authority the engine dispatch itself uses. Caught live:
+        // the H3 boot billed the 64.5 GB sum while claiming "staged".
+        const peeked = gen_mod.peekModelType(sch.io, sch.allocator, params.model_dir);
+        defer if (peeked) |p| sch.allocator.free(p);
+        const backend_type = peeked orelse params.config.model_type;
+        const peak = gen_mod.estimatePeakResidentBytes(sch.io, params.model_dir, backend_type);
+        const avail = effectiveAvailableBytes(status.getAvailableMemBytes(), status.getProcAvailableMemBytes());
+        const gb = 1024.0 * 1024.0 * 1024.0;
+        log.info("[preflight] media peak ~{d:.2} GB (staged residency), available {d:.2} GB\n", .{
+            @as(f64, @floatFromInt(peak)) / gb,
+            @as(f64, @floatFromInt(avail)) / gb,
+        });
+        if (memInsufficientForLoad(peak, avail)) {
+            log.err("Insufficient memory for this media model: generation peaks at ~{d:.1} GB but only {d:.1} GB is free. Close other models/apps and retry; pass --skip-mem-preflight to override.\n", .{
+                @as(f64, @floatFromInt(peak)) / gb,
+                @as(f64, @floatFromInt(avail)) / gb,
+            });
+            return error.InsufficientMemory;
+        }
+    }
+
     // Build the engine FIRST. On failure the engine's own errdefer cleans up
     // its partial state, the slot stays null, and the stub config (still owned
     // by the caller, not yet installed below) is freed by the caller's

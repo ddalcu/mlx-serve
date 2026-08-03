@@ -95,6 +95,25 @@ pub fn sendError(conn: *Conn, msg: []const u8) void {
     conn.writeAll(ev) catch {};
 }
 
+/// Tri-state bool: null when the key is absent or unreadable, else its value.
+pub fn bodyBool(body: []const u8, key: []const u8) ?bool {
+    var pat_buf: [64]u8 = undefined;
+    const pat = std.fmt.bufPrint(&pat_buf, "\"{s}\"", .{key}) catch return null;
+    const ki = std.mem.indexOf(u8, body, pat) orelse return null;
+    var i = ki + pat.len;
+    while (i < body.len and (body[i] == ' ' or body[i] == ':' or body[i] == '\t')) i += 1;
+    if (std.mem.startsWith(u8, body[i..], "true")) return true;
+    if (std.mem.startsWith(u8, body[i..], "false")) return false;
+    return null;
+}
+
+test "bodyBool is tri-state (absent != false)" {
+    try std.testing.expectEqual(@as(?bool, null), bodyBool("{}", "fast"));
+    try std.testing.expectEqual(@as(?bool, true), bodyBool("{\"fast\": true}", "fast"));
+    try std.testing.expectEqual(@as(?bool, false), bodyBool("{\"fast\":false}", "fast"));
+    try std.testing.expectEqual(@as(?bool, null), bodyBool("{\"fast\": \"yes\"}", "fast"));
+}
+
 /// True if the JSON body contains `"key": true`.
 pub fn bodyWantsTrue(body: []const u8, key: []const u8) bool {
     var pat_buf: [64]u8 = undefined;

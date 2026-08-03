@@ -1441,6 +1441,26 @@ fn imageNativeSize(encoded: []const u8) ?struct { w: u32, h: u32 } {
 /// source window matching the target's aspect ratio — the image is never
 /// stretched; mismatched aspects lose edges to a center crop instead of
 /// distorting the subject. Returns null on decode failure.
+/// [1,3,H,W] in [0,1] (decodeImageToBCHW's cover output) -> [1,3,1,H,W] in
+/// [-1,1] f32 — the shape/range MiniMax-H3's keyframe encoder consumes.
+fn unitToPm1BCFHW(bchw: mlx.mlx_array, target_h: u32, target_w: u32, s: mlx.mlx_stream) !mlx.mlx_array {
+    const two = mlx.mlx_array_new_float(2.0);
+    defer _ = mlx.mlx_array_free(two);
+    const one = mlx.mlx_array_new_float(1.0);
+    defer _ = mlx.mlx_array_free(one);
+    var scaled = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(scaled);
+    try mlx.check(mlx.mlx_multiply(&scaled, bchw, two, s));
+    var pm1 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(pm1);
+    try mlx.check(mlx.mlx_subtract(&pm1, scaled, one, s));
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    const shape5 = [_]c_int{ 1, 3, 1, @intCast(target_h), @intCast(target_w) };
+    try mlx.check(mlx.mlx_reshape(&out, pm1, &shape5, 5, s));
+    return out;
+}
+
 fn decodeImageToBCHW(allocator: std.mem.Allocator, encoded: []const u8, target_h: u32, target_w: u32) ?mlx.mlx_array {
     var w: c_int = 0;
     var h: c_int = 0;
@@ -2323,6 +2343,39 @@ fn handleVideoH3(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []
     const want_stream = sse.bodyWantsTrue(body, "stream");
     log.info("[video] minimax-h3 {d}x{d} {d}f (requested {d}, snapped to the 17k+5 ladder) steps={d} stream={}\n", .{ width, height, shape.frame_count, requested_frames, steps, want_stream });
 
+    // fl2va keyframes. NOT graceful (the a2vid rule: the user asked for THIS
+    // frame): an undecodable image is a named 400, never a silent t2va. The
+    // reference's resize policy per anchor: first = plain STRETCH to the
+    // canvas (the geometry anchor), last = aspect-preserving center-COVER.
+    var keyframes_buf: [2]minimax_h3.Keyframe = undefined;
+    var n_kf: usize = 0;
+    defer for (keyframes_buf[0..n_kf]) |kf| {
+        _ = mlx.mlx_array_free(kf.pixels);
+    };
+    inline for (.{ .{ "first_frame_image", minimax_h3.KeyframeAnchor.first }, .{ "last_frame_image", minimax_h3.KeyframeAnchor.last } }) |spec| {
+        if (extractJsonString(body, spec[0])) |raw_img| {
+            const b64 = try jsonUnescape(allocator, raw_img);
+            defer allocator.free(b64);
+            if (b64.len > 0) {
+                const img_bytes = base64DecodeAlloc(allocator, b64) catch
+                    return sendError(conn, 400, "keyframe image is not valid base64");
+                defer allocator.free(img_bytes);
+                const arr: ?mlx.mlx_array = switch (spec[1]) {
+                    .first => decodeImageToBCFHW(allocator, img_bytes, height, width, mlx.gpuStream()),
+                    .last => blk: {
+                        const bchw = decodeImageToBCHW(allocator, img_bytes, height, width) orelse break :blk null;
+                        defer _ = mlx.mlx_array_free(bchw);
+                        break :blk unitToPm1BCFHW(bchw, height, width, mlx.gpuStream()) catch null;
+                    },
+                };
+                if (arr == null) return sendError(conn, 400, "keyframe image could not be decoded (PNG/JPEG expected)");
+                keyframes_buf[n_kf] = .{ .anchor = spec[1], .pixels = arr.? };
+                n_kf += 1;
+                log.info("[video] minimax-h3 {s} keyframe conditioning engaged ({d}x{d})\n", .{ @tagName(spec[1]), width, height });
+            }
+        }
+    }
+
     // Generations here run for MINUTES, so a silent socket is indistinguishable
     // from a wedged server; the client drives its meter off these events.
     var sctx = sse.StreamCtx{ .conn = conn };
@@ -2344,6 +2397,8 @@ fn handleVideoH3(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []
         .frames = requested_frames,
         .steps = steps,
         .seed = seed,
+        .fast = sse.bodyBool(body, "fast"),
+        .keyframes = keyframes_buf[0..n_kf],
     }, prog, mlx.gpuStream()) catch |e| {
         log.err("[video] minimax-h3 generation failed: {any}\n", .{e});
         // Mid-stream the headers are already out, so an error must be an SSE
@@ -2808,8 +2863,13 @@ pub fn freeStubCpuState(allocator: std.mem.Allocator, s: *StubCpuState) void {
 /// transformer/, vae/, text_encoder/; LTX keeps them top-level). Returns 0 on
 /// any read failure (treated as "unknown" → the registry skips the byte cap).
 pub fn estimateResidentBytes(io: std.Io, model_dir: []const u8) u64 {
+    if (model_dir.len == 0 or model_dir[0] != '/') return 0; // openDirAbsolute UB class
     var dir = std.Io.Dir.openDirAbsolute(io, model_dir, .{ .iterate = true }) catch return 0;
     defer dir.close(io);
+    return sumSafetensorsIn(io, dir);
+}
+
+fn sumSafetensorsIn(io: std.Io, dir: std.Io.Dir) u64 {
     var total: u64 = 0;
     var it = dir.iterate();
     while (it.next(io) catch null) |entry| {
@@ -2828,6 +2888,44 @@ pub fn estimateResidentBytes(io: std.Io, model_dir: []const u8) u64 {
         }
     }
     return total;
+}
+
+/// MiniMax-H3's staged residency plan, as a bill: `minimax_h3.generate` loads
+/// the text encoder, runs it and FREES it before the DiT loads, so the two
+/// never coexist and the load peak is max(TE, DiT). The VAEs load after the
+/// DiT is released but are billed ADDITIVELY as the direction-safe margin for
+/// decode-phase activations — an under-bill here is an uncatchable Metal OOM.
+pub fn h3PeakBytes(te: u64, dit: u64, video_vae: u64, audio_vae: u64) u64 {
+    return @max(te, dit) + video_vae + audio_vae;
+}
+
+/// Per-backend generation-peak estimate for the media load preflight. A
+/// backend with a STAGED residency plan declares it here; every other type
+/// keeps the sum-of-safetensors default — over-billing fails safe (a refused
+/// load names its numbers), under-billing kills the process mid-request.
+pub fn estimatePeakResidentBytesIn(io: std.Io, dir: std.Io.Dir, model_type: []const u8) u64 {
+    if (std.mem.eql(u8, model_type, "minimax_h3")) {
+        const sz = struct {
+            fn f(io_: std.Io, d: std.Io.Dir, name: []const u8) u64 {
+                const st = d.statFile(io_, name, .{}) catch return 0;
+                return @intCast(st.size);
+            }
+        }.f;
+        return h3PeakBytes(
+            sz(io, dir, "text_encoder.safetensors"),
+            sz(io, dir, "transformer.safetensors"),
+            sz(io, dir, "video_vae.safetensors"),
+            sz(io, dir, "audio_vae.safetensors"),
+        );
+    }
+    return sumSafetensorsIn(io, dir);
+}
+
+pub fn estimatePeakResidentBytes(io: std.Io, model_dir: []const u8, model_type: []const u8) u64 {
+    if (model_dir.len == 0 or model_dir[0] != '/') return 0; // openDirAbsolute UB class
+    var dir = std.Io.Dir.openDirAbsolute(io, model_dir, .{ .iterate = true }) catch return 0;
+    defer dir.close(io);
+    return estimatePeakResidentBytesIn(io, dir, model_type);
 }
 
 // ── HTTP response helpers (self-contained; mirror the old *_server.zig) ──
@@ -3779,6 +3877,42 @@ test "media model types: discovery and modality dispatch agree" {
         try std.testing.expect(!discovery.isMediaModelType(mt));
         try std.testing.expect(modalityFromType(mt) == null);
     }
+}
+
+test "h3 staged-residency peak bills max(TE,DiT)+VAEs, never their sum" {
+    const GB: u64 = 1024 * 1024 * 1024;
+    // The TE is loaded, run and FREED before the DiT loads — they never
+    // coexist, so billing their sum refuses a 48 GB Mac that would work.
+    try std.testing.expectEqual(41 * GB, h3PeakBytes(28 * GB, 35 * GB, 5 * GB, 1 * GB));
+    // Whichever staged component is larger sets the peak.
+    try std.testing.expectEqual(54 * GB, h3PeakBytes(48 * GB, 35 * GB, 5 * GB, 1 * GB));
+    // All-unknown must stay 0: the preflight treats 0 as "unknown, never block".
+    try std.testing.expectEqual(@as(u64, 0), h3PeakBytes(0, 0, 0, 0));
+}
+
+test "estimatePeakResidentBytes: minimax_h3 stages, other types keep the sum" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    const b300: [300]u8 = @splat('x');
+    const b500: [500]u8 = @splat('x');
+    const b120: [120]u8 = @splat('x');
+    const b30: [30]u8 = @splat('x');
+    const b1000: [1000]u8 = @splat('x');
+    try tmp.dir.writeFile(io, .{ .sub_path = "text_encoder.safetensors", .data = &b300 });
+    try tmp.dir.writeFile(io, .{ .sub_path = "transformer.safetensors", .data = &b500 });
+    try tmp.dir.writeFile(io, .{ .sub_path = "video_vae.safetensors", .data = &b120 });
+    try tmp.dir.writeFile(io, .{ .sub_path = "audio_vae.safetensors", .data = &b30 });
+    // A file H3's residency plan never loads: billed by the default sum,
+    // never by the staged estimate.
+    try tmp.dir.writeFile(io, .{ .sub_path = "extra.safetensors", .data = &b1000 });
+
+    // H3: max(300, 500) + 120 + 30.
+    try std.testing.expectEqual(@as(u64, 650), estimatePeakResidentBytesIn(io, tmp.dir, "minimax_h3"));
+    // Any other media type: the plain sum over the dir (the safe default —
+    // a backend without a declared residency plan must not under-bill).
+    try std.testing.expectEqual(@as(u64, 1950), estimatePeakResidentBytesIn(io, tmp.dir, "flux2"));
 }
 
 test "media markers are per-TYPE, not per-modality" {

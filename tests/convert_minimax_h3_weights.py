@@ -47,7 +47,9 @@ import time
 import mlx.core as mx
 
 GROUP_SIZE = 64
-BITS = 8
+BITS = 8  # default; --bits 4 builds the small pack (compute-neutral under
+          # dq-gemm — the DiT is GEMM-bound — so 4-bit buys FOOTPRINT: DiT
+          # resident ~11 GB after AdaLN precompute, pack ~38 GB vs 69)
 
 # Substrings that must NEVER be quantized. Two classes:
 #   * GATHERED tables (read with take_axis, not a matmul) — packing them is
@@ -179,7 +181,7 @@ Modified by: mlx-serve (https://github.com/ddalcu/mlx-serve)
 What changed:
 
 * `transformer.safetensors` and `text_encoder.safetensors` are QUANTIZED from
-  the original bfloat16 releases to MLX affine 8-bit, group size 64. Gathered
+  the original bfloat16 releases to MLX affine {bits}-bit, group size 64. Gathered
   embedding tables and the checkpoint's fp32 islands (patch projections, output
   heads, time embedder, rope inverse frequencies) are left dense.
 * `video_vae.safetensors` and `audio_vae.safetensors` are byte-for-byte copies
@@ -208,9 +210,9 @@ tags:
 - audio-video-generation
 ---
 
-# MiniMax-H3 FL2VA — MLX-Serve 8-bit
+# MiniMax-H3 FL2VA — MLX-Serve {bits}-bit
 
-8-bit affine (group size 64) conversion of MiniMax-H3's FL2VA checkpoint for
+{bits}-bit affine (group size 64) conversion of MiniMax-H3's FL2VA checkpoint for
 [mlx-serve](https://github.com/ddalcu/mlx-serve), running natively on Apple
 Silicon. Text-to-audio-video: the DiT denoises video and stereo audio jointly
 in one packed sequence.
@@ -229,7 +231,7 @@ compute-bound at roughly 192,000 FLOPs per weight byte.
 ## Modifications
 
 These are MODIFIED files. The transformer and text encoder are quantized to
-8-bit; see MODIFICATIONS.md for the full list. The VAEs and tokenizer are
+{bits}-bit; see MODIFICATIONS.md for the full list. The VAEs and tokenizer are
 unmodified copies.
 
 ## License
@@ -247,11 +249,21 @@ your jurisdiction permits you to use these files before downloading them.
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--bits", type=int, default=8, choices=(4, 8),
+                    help="affine bits for every quantized linear (default 8)")
+    ap.add_argument("--cpu", action="store_true",
+                    help="quantize on the CPU stream (lets a conversion run while the GPU is busy)")
     ap.add_argument("--src", required=True, help="dir holding the Comfy-Org bf16 files")
     ap.add_argument("--tokenizer", required=True, help="dir holding tokenizer.json")
     ap.add_argument("--out", required=True)
     ap.add_argument("--skip-existing", action="store_true", default=True)
     args = ap.parse_args()
+
+    global BITS
+    BITS = args.bits
+    CONFIG["quantization"]["bits"] = BITS
+    if args.cpu:
+        mx.set_default_device(mx.cpu)
 
     src = os.path.expanduser(args.src)
     out = os.path.expanduser(args.out)
@@ -308,11 +320,11 @@ def main():
     with open(os.path.join(out, "NOTICE"), "w") as f:
         f.write(NOTICE)
     with open(os.path.join(out, "MODIFICATIONS.md"), "w") as f:
-        f.write(MODIFICATIONS)
+        f.write(MODIFICATIONS.replace("{bits}", str(BITS)))
     with open(os.path.join(out, "config.json"), "w") as f:
         json.dump(CONFIG, f, indent=2)
     with open(os.path.join(out, "README.md"), "w") as f:
-        f.write(README)
+        f.write(README.replace("{bits}", str(BITS)))
 
     print(f"\nDONE -> {out}  ({total:.1f} GB)", flush=True)
     return 0

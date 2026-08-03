@@ -285,3 +285,33 @@ AGENT-LOOP cell. The loop metric is **max consecutive identical tool calls**
 across a multi-turn agent run; reusable harness:
 `~/claude-tmp/iq2-week/bench3/loop_stats.py` + the bench4.sh pattern
 (paired arms, same tasks, token budgets + loop stats per run).
+
+## The weights MAP pins everything a staged loader frees (MiniMax-H3 AdaLN precompute, 2026-08-03)
+
+H3's AdaLN precompute tables the whole schedule's modulations and frees each
+block's 260M-param AdaLN weight right after its table evals — a designed
+~13 GB residency win on the 8-bit pack. The first live run showed `dit
+resident: 33.36 GB` where ~20 was expected, and the OFF-arm control read the
+same 32.8 GB, proving the free was a no-op. Cause: `generate` kept the
+safetensors `Weights` map alive (`defer dw.deinit()` at scope end), and the
+map holds +1 refs on every raw file-backed array — the model's frees only
+dropped the model's handles. mlx lazy graphs keep their inputs alive
+internally, so the map can be dropped the moment `Model.load` returns; scoping
+it inside a blk took residency to 19.95 GB measured. Two durable lessons: any
+STAGED-residency loader owes the same scoping, and the fix was only visible
+because the load path logs `mlx_get_active_memory` — a memory claim without a
+resident log line is a hope, not a design.
+
+## The stub model_type is a MODALITY static — the per-backend preflight must re-peek (2026-08-03)
+
+`buildStubCpuState(modality)` stamps `modality.modelType()` ("AudioVideo" for
+every video backend) on the stub config, so the new media preflight keyed on
+`params.config.model_type` never matched "minimax_h3" and billed the 64.5 GB
+sum-of-safetensors — while printing a log line that CLAIMED staged billing,
+and while the unit tests for the estimator (called directly with the right
+type) stayed green. Second bite of "a marker belongs to a BACKEND, never a
+modality". Fix: `doLoadGenOnInferenceThread` re-peeks the dir's real type via
+`gen.peekModelType`, the same authority `VideoEngine.load` dispatches on. The
+guard lesson: `tests/test_minimax_h3.sh` now asserts the printed NUMBER sits
+in the staged band — the line's presence proved nothing, which is the same
+class as spec-decode engagement counts vs output equality.

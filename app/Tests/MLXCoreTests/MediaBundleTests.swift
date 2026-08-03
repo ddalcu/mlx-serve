@@ -600,4 +600,24 @@ final class MediaBundleTests: XCTestCase {
         let bytes = UInt64(ImageModelPreset.krea2Turbo.approxRAMGB) * 1_073_741_824
         XCTAssertTrue(ImageModelPreset.krea2Turbo.meetsSystemRequirements(physicalMemoryBytes: bytes))
     }
+    func testMiniMaxH3FourBitPresetIsALowRAMAlternative() {
+        let all = VideoModelPreset.all
+        XCTAssertTrue(all.contains(where: { $0.id == VideoModelPreset.minimaxH3.id }))
+        guard let q4 = all.first(where: { $0.repo == "ddalcu/MiniMax-H3-FL2VA-MLX-Serve-4bit" }) else {
+            return XCTFail("no 4-bit H3 preset in VideoModelPreset.all")
+        }
+        XCTAssertNotEqual(q4.id, VideoModelPreset.minimaxH3.id)
+        // The point of the pack: it fits small Macs. Staged residency peaks at
+        // ~24.5 GB billed, so the guidance must sit well under the 8-bit's 44.
+        XCTAssertLessThanOrEqual(q4.approxRAMGB, 28)
+        XCTAssertLessThanOrEqual(q4.approxDownloadGB, 41)
+        // Same engine, same recipe surface as the 8-bit preset.
+        XCTAssertEqual(q4.backend, .minimaxH3)
+        XCTAssertTrue(q4.supportsFastRecipe)
+        XCTAssertTrue(q4.generatesAudio)
+        XCTAssertFalse(q4.supportsLoRA)
+        // Bundle rides the SAME minimax factory keyed on the 4-bit repo.
+        XCTAssertEqual(q4.bundle.id, "minimax-h3:ddalcu/MiniMax-H3-FL2VA-MLX-Serve-4bit")
+    }
+
 }

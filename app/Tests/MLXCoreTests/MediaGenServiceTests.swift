@@ -53,6 +53,26 @@ final class MediaGenServiceTests: XCTestCase {
         XCTAssertNil(body["first_frame_image"])
     }
 
+    func testH3FastRecipeDefaultOnWithOffSwitch() {
+        // David's eyeball verdict on the same-seed 768p capstone pair: the
+        // fast recipe (server-side step cache + attention broadcast, 2.83x)
+        // is DEFAULT-ON, so the app sends NO field in the default case and
+        // "fast": false only when the user opts into max quality.
+        var req = VideoGenRequest(model: .minimaxH3, prompt: "p", width: 256, height: 256,
+                                  numFrames: 56, fps: 24, mode: .oneStage, steps: 30, cfgScale: 1.0)
+        var body = VideoGenService.requestBody(model: "m", prompt: "p", request: req, firstFrameB64: nil)
+        XCTAssertNil(body["fast"], "default must ride the server's fast default, not restate it")
+        req.bestQuality = true
+        body = VideoGenService.requestBody(model: "m", prompt: "p", request: req, firstFrameB64: nil)
+        XCTAssertEqual(body["fast"] as? Bool, false)
+        // LTX has no fast recipe — the field never appears, toggled or not.
+        var ltx = VideoGenRequest(model: .ltx23Q4, prompt: "p", width: 704, height: 480,
+                                  numFrames: 9, fps: 24, mode: .oneStage, steps: 8, cfgScale: 1.0)
+        ltx.bestQuality = true
+        let lbody = VideoGenService.requestBody(model: "m", prompt: "p", request: ltx, firstFrameB64: nil)
+        XCTAssertNil(lbody["fast"])
+    }
+
     func testRequestBodyPipelineModeMapping() {
         func pipeline(_ mode: VideoPipelineMode) -> String? {
             let req = VideoGenRequest(model: .ltx23Q4, prompt: "p", width: 704, height: 480,

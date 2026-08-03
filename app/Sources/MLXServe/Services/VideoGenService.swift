@@ -346,6 +346,9 @@ final class VideoGenService: ObservableObject {
             body["stg_scale"] = request.stgScale
         }
         if let firstFrameB64 { body["first_frame_image"] = firstFrameB64 }
+        // The fast recipe is the SERVER's default — the app only speaks up to
+        // opt OUT, and only on a backend that has the recipe at all.
+        if request.model.supportsFastRecipe, request.bestQuality { body["fast"] = false }
         if request.model.supportsAudioInput, hasAudio, let audioB64 { body["audio"] = audioB64 }
         if request.model.supportsLoRA, let lora = request.loraPath, !lora.isEmpty {
             body["lora_path"] = lora

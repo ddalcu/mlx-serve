@@ -525,6 +525,41 @@ fn ownOpt(w: *const Weights, key: []const u8) ?mlx.mlx_array {
 /// the shapes alone. Shared with `minimax_h3.zig`: both backends must load the
 /// bf16 releases AND our affine-quantized mirrors through ONE path, and a
 /// second copy of this is a second place for the bits/group-size solve to drift.
+/// Wide-M route for quantized MfLinear: dequantize to the compute dtype and run
+/// the steel GEMM instead of `quantized_matmul`. Media DiTs run EVERY forward at
+/// prefill-like widths (H3 at 480p is ~9K rows), where stock qmm_t sits in the
+/// same tile dead zone `prefillDqGemm` exists for on the text side. Opt-in per
+/// backend A/B (the prefill-perf-kernel rule): `MLX_SERVE_MF_DQ_GEMM=1` enables
+/// at the 2048-row floor, `=N` sets an explicit floor, unset/`0` = off.
+const OptFloor = ?usize;
+/// Test seam: `some(null)` forces off, `some(f)` forces floor `f`.
+pub var mf_dq_gemm_override: ?OptFloor = null;
+var mf_dq_gemm_env_done: bool = false;
+var mf_dq_gemm_env_val: OptFloor = null;
+/// Engagement is COUNTED, never inferred from output equality (a rejected
+/// guard is a silent no-op that is output-identical to the fallback).
+pub var mf_dq_gemm_engaged: u64 = 0;
+var mf_dq_gemm_logged: bool = false;
+
+const MF_DQ_GEMM_DEFAULT_MIN_M: usize = 2048;
+
+fn mfDqGemmFloorFrom(raw: ?[]const u8) ?usize {
+    const v = raw orelse return null;
+    if (v.len == 0 or std.mem.eql(u8, v, "0")) return null;
+    if (std.mem.eql(u8, v, "1")) return MF_DQ_GEMM_DEFAULT_MIN_M;
+    return std.fmt.parseInt(usize, v, 10) catch null;
+}
+
+fn mfDqGemmFloor() ?usize {
+    if (mf_dq_gemm_override) |v| return v;
+    if (!mf_dq_gemm_env_done) {
+        const raw = std.c.getenv("MLX_SERVE_MF_DQ_GEMM");
+        mf_dq_gemm_env_val = mfDqGemmFloorFrom(if (raw) |r| std.mem.sliceTo(r, 0) else null);
+        mf_dq_gemm_env_done = true;
+    }
+    return mf_dq_gemm_env_val;
+}
+
 pub const MfLinear = struct {
     quantized: bool,
     /// quantized: packed u32 [out, in*bits/32] (`transpose_w=true` at use).
@@ -601,6 +636,7 @@ pub const MfLinear = struct {
         const xc = try astype(x, self.dtype, s);
         defer _ = mlx.mlx_array_free(xc);
         if (!self.quantized) return linearT(xc, self.w, bias, s);
+        if (try self.dqGemmWide(xc, bias, s)) |y| return y;
         var o = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_quantized_matmul(
             &o,
@@ -617,6 +653,41 @@ pub const MfLinear = struct {
         if (bias) |b| {
             defer _ = mlx.mlx_array_free(o);
             return addA(o, b, s);
+        }
+        return o;
+    }
+
+    /// The wide-M dequant+GEMM route; null when the call must stay on qmm.
+    fn dqGemmWide(self: *const MfLinear, xc: mlx.mlx_array, bias: ?mlx.mlx_array, s: S) !?mlx.mlx_array {
+        const min_m = mfDqGemmFloor() orelse return null;
+        switch (self.bits) {
+            2, 3, 4, 5, 6, 8 => {},
+            else => return null,
+        }
+        const shp = mlx.getShape(xc);
+        if (shp.len == 0) return null;
+        const last: usize = @intCast(shp[shp.len - 1]);
+        if (last == 0) return null;
+        const rows = mlx.mlx_array_size(xc) / last;
+        if (rows < min_m) return null;
+
+        var dq = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(dq);
+        try mlx.check(mlx.mlx_dequantize(&dq, self.w, self.scales, self.biases, mlx.mlx_optional_int.some(@intCast(self.group_size)), mlx.mlx_optional_int.some(@intCast(self.bits)), "affine", .{ .ctx = null }, mlx.mlx_optional_dtype{ .value = self.dtype, .has_value = true }, s));
+        var dq_t = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(dq_t);
+        try mlx.check(mlx.mlx_transpose(&dq_t, dq, s));
+        var o = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(o);
+        try mlx.check(mlx.mlx_matmul(&o, xc, dq_t, s));
+        mf_dq_gemm_engaged += 1;
+        if (!mf_dq_gemm_logged) {
+            mf_dq_gemm_logged = true;
+            log.info("[mf-linear] dq-gemm engaged (rows={d}, floor={d})\n", .{ rows, min_m });
+        }
+        if (bias) |b| {
+            defer _ = mlx.mlx_array_free(o);
+            return try addA(o, b, s);
         }
         return o;
     }
@@ -4525,6 +4596,98 @@ fn retainedBytes(
     var after: usize = 0;
     try mlx.check(mlx.mlx_get_active_memory(&after));
     return if (after > before) after - before else 0;
+}
+
+test "MfLinear dq-gemm: floor parsing is opt-in with a 2048 default" {
+    // Unset and "0" mean OFF — the wide-M route is opt-in until each backend
+    // has its own A/B (the prefill-perf-kernel rule). "1" opts in at the
+    // shared 2048 floor; an explicit integer sets its own floor; junk is off.
+    try testing.expectEqual(@as(?usize, null), mfDqGemmFloorFrom(null));
+    try testing.expectEqual(@as(?usize, null), mfDqGemmFloorFrom("0"));
+    try testing.expectEqual(@as(?usize, 2048), mfDqGemmFloorFrom("1"));
+    try testing.expectEqual(@as(?usize, 4096), mfDqGemmFloorFrom("4096"));
+    try testing.expectEqual(@as(?usize, null), mfDqGemmFloorFrom("junk"));
+}
+
+test "MfLinear wide-M dq-gemm: engages and is no worse than qmm vs fp32 ground truth" {
+    const s = mlx.mlx_default_gpu_stream_new();
+    const rows: c_int = 2048;
+    const in_f: c_int = 1024;
+    const out_f: c_int = 384;
+
+    // Random fp32 weight + bf16 activations at a contraction dim near the real
+    // one (the fused-QKV lesson: a 256-wide contraction can agree by luck).
+    var key = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(key);
+    try mlx.check(mlx.mlx_random_key(&key, 7));
+    var wf = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(wf);
+    try mlx.check(mlx.mlx_random_normal(&wf, &[_]c_int{ out_f, in_f }, 2, .float32, 0.0, 1.0, key, s));
+    var key2 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(key2);
+    try mlx.check(mlx.mlx_random_key(&key2, 11));
+    var xf = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(xf);
+    try mlx.check(mlx.mlx_random_normal(&xf, &[_]c_int{ rows, in_f }, 2, .float32, 0.0, 1.0, key2, s));
+    const xb = try astype(xf, .bfloat16, s);
+    defer _ = mlx.mlx_array_free(xb);
+
+    // Quantize 8-bit / gs64 (the shipped H3 pack's geometry).
+    var triple = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(triple);
+    try mlx.check(mlx.mlx_quantize(&triple, wf, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(8), "affine", .{ .ctx = null }, s));
+    var wq = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(wq);
+    var sc = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sc);
+    var bi = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(bi);
+    try mlx.check(mlx.mlx_vector_array_get(&wq, triple, 0));
+    try mlx.check(mlx.mlx_vector_array_get(&sc, triple, 1));
+    try mlx.check(mlx.mlx_vector_array_get(&bi, triple, 2));
+    const scb = try astype(sc, .bfloat16, s);
+    const bib = try astype(bi, .bfloat16, s);
+
+    var lin = MfLinear{ .quantized = true, .w = wq, .scales = scb, .biases = bib, .dtype = .bfloat16, .bits = 8, .group_size = 64 };
+    defer {
+        // lin.w aliases wq which the outer defers free; null it out so
+        // deinit only releases the casts it owns.
+        lin.w = mlx.mlx_array_new();
+        lin.deinit();
+    }
+
+    // Ground truth: fp32 dequant matmul (the kernel-testing rule — never
+    // kernel-vs-kernel agreement).
+    var dqf = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(dqf);
+    try mlx.check(mlx.mlx_dequantize(&dqf, wq, sc, bi, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(8), "affine", .{ .ctx = null }, mlx.mlx_optional_dtype{ .value = .float32, .has_value = true }, s));
+    var dqf_t = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(dqf_t);
+    try mlx.check(mlx.mlx_transpose(&dqf_t, dqf, s));
+    var ref = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ref);
+    try mlx.check(mlx.mlx_matmul(&ref, xf, dqf_t, s));
+
+    // Arm A: stock qmm (force the route off).
+    mf_dq_gemm_override = @as(?usize, null);
+    defer mf_dq_gemm_override = null;
+    const y_qmm = try lin.forward(xb, null, s);
+    defer _ = mlx.mlx_array_free(y_qmm);
+
+    // Arm B: dq-gemm forced on for any M — engagement is COUNTED, never
+    // inferred from output equality (the silent-fallback class).
+    const engaged_before = mf_dq_gemm_engaged;
+    mf_dq_gemm_override = @as(?usize, 1);
+    const y_dq = try lin.forward(xb, null, s);
+    defer _ = mlx.mlx_array_free(y_dq);
+    try testing.expect(mf_dq_gemm_engaged > engaged_before);
+
+    const err_qmm = try maxAbsDiff(y_qmm, ref, s);
+    const err_dq = try maxAbsDiff(y_dq, ref, s);
+    // Both are bf16 roundings of the same product; dq-gemm must not be
+    // meaningfully worse than the kernel it replaces.
+    try testing.expect(std.math.isFinite(err_dq));
+    try testing.expect(err_dq <= err_qmm * 1.25 + 0.05);
 }
 
 test "materializing helpers hand back every array they take" {

@@ -397,6 +397,10 @@ struct VideoModelPreset: Identifiable, Hashable {
     var supportsAudioInput: Bool = true
     /// Whether the model produces its own soundtrack.
     var generatesAudio: Bool = false
+    /// Server-side fast recipe (H3: step cache + attention broadcast, 2.83x
+    /// at 768p). DEFAULT-ON server-side; the pane offers a max-quality
+    /// opt-out that sends "fast": false.
+    var supportsFastRecipe: Bool = false
 
     static func == (lhs: Self, rhs: Self) -> Bool { lhs.id == rhs.id }
     func hash(into hasher: inout Hasher) { hasher.combine(id) }
@@ -488,22 +492,26 @@ struct VideoModelPreset: Identifiable, Hashable {
         return out
     }
 
-    static let minimaxH3: VideoModelPreset = {
+    /// Both H3 packs share everything except repo/size/RAM: same engine, same
+    /// frame ladder, same fast recipe. One factory so they cannot drift.
+    private static func minimaxH3Preset(repo: String, name: String,
+                                        downloadGB: Int, ramGB: Int,
+                                        description: String) -> VideoModelPreset {
         // The model's own trained range is ~124-362 frames; below 124 is
         // off-distribution but generates fine and is far faster.
         let cap = 124
         return VideoModelPreset(
-            id: "ddalcu/MiniMax-H3-FL2VA-MLX-Serve-8bit",
-            name: "MiniMax-H3 (Hailuo 3.0) 8-bit — video + native audio",
-            repo: "ddalcu/MiniMax-H3-FL2VA-MLX-Serve-8bit",
-            approxDownloadGB: 69,
+            id: repo,
+            name: name,
+            repo: repo,
+            approxDownloadGB: downloadGB,
             // Self-contained: weights, both VAEs and the tokenizer ship in the
             // one repo, so there is no separate text-encoder pull.
-            approxFirstRunDownloadGB: 69,
+            approxFirstRunDownloadGB: downloadGB,
             // The text encoder and the DiT are staged sequentially (they cannot
             // both be resident), so the peak is the larger of the two plus
             // activations, not their sum.
-            approxRAMGB: 44,
+            approxRAMGB: ramGB,
             resolutions: h3Resolutions,
             defaultResolution: h3Resolutions[0],
             fps: 24,
@@ -516,17 +524,36 @@ struct VideoModelPreset: Identifiable, Hashable {
             defaultQuality: .good,
             maxFrames: cap,
             frameOptions: h3FrameLadder(maxFrames: cap),
-            description: "Generates video with a matching stereo soundtrack from one prompt — the sound is produced jointly with the picture, not dubbed on after. Describe the scene, then the audio you want after 'overall_soundscape:'. Compute-heavy: a couple of minutes at 256 × 256, considerably longer at 480p.",
+            description: description,
             backend: .minimaxH3,
             supportsLoRA: false,
             supportsCFG: false,
             supportsPipelineModes: false,
             supportsAudioInput: false,
-            generatesAudio: true
+            generatesAudio: true,
+            supportsFastRecipe: true
         )
-    }()
+    }
 
-    static let all: [VideoModelPreset] = [.ltx23Q4, .minimaxH3]
+    static let minimaxH3: VideoModelPreset = minimaxH3Preset(
+        repo: "ddalcu/MiniMax-H3-FL2VA-MLX-Serve-8bit",
+        name: "MiniMax-H3 (Hailuo 3.0) 8-bit — video + native audio",
+        downloadGB: 69,
+        ramGB: 44,
+        description: "Generates video with a matching stereo soundtrack from one prompt — the sound is produced jointly with the picture, not dubbed on after. Describe the scene, then the audio you want after 'overall_soundscape:'. Compute-heavy: a couple of minutes at 256 × 256, considerably longer at 480p."
+    )
+
+    /// The 4-bit pack: same speed (the DiT is compute-bound), ~40 GB download
+    /// and a ~25 GB staged peak — the pick for 32-48 GB Macs.
+    static let minimaxH3Q4: VideoModelPreset = minimaxH3Preset(
+        repo: "ddalcu/MiniMax-H3-FL2VA-MLX-Serve-4bit",
+        name: "MiniMax-H3 (Hailuo 3.0) 4-bit — video + native audio, low RAM",
+        downloadGB: 40,
+        ramGB: 26,
+        description: "The 4-bit build of MiniMax-H3: same generation speed, a 40 GB download instead of 69, and it fits comfortably on 32 GB Macs. Slightly softer detail than the 8-bit build — pick that one if you have 48 GB or more."
+    )
+
+    static let all: [VideoModelPreset] = [.ltx23Q4, .minimaxH3, .minimaxH3Q4]
 }
 
 // MARK: - Audio presets (TTS / voice cloning)
@@ -1125,6 +1152,9 @@ struct VideoGenRequest {
     var audioPath: String? = nil
     /// Keep the model resident after this generation (default off → unload).
     var keepResident: Bool = false
+    /// Max-quality opt-out of the server's fast recipe ("fast": false — every
+    /// forward dense, ~2.8x slower at 768p, "just a smidge better").
+    var bestQuality: Bool = false
     /// Set when the pane picked a network model: the LAN routing id
     /// (`<model>@<peer>`). The gen service then skips local resolve/load/
     /// unload — the hosting Mac loads on demand and manages its own memory.
@@ -1152,6 +1182,9 @@ struct AudioGenRequest {
     var temperature: Double = 0.7
     /// Keep the model resident after this generation (default off → unload).
     var keepResident: Bool = false
+    /// Max-quality opt-out of the server's fast recipe ("fast": false — every
+    /// forward dense, ~2.8x slower at 768p, "just a smidge better").
+    var bestQuality: Bool = false
     /// Set when the pane picked a network model: the LAN routing id
     /// (`<model>@<peer>`). The gen service then skips local resolve/load/
     /// unload — the hosting Mac loads on demand and manages its own memory.
@@ -1176,6 +1209,9 @@ struct MusicGenRequest {
     var seed: Int = -1
     /// Keep the model resident after this generation (default off → unload).
     var keepResident: Bool = false
+    /// Max-quality opt-out of the server's fast recipe ("fast": false — every
+    /// forward dense, ~2.8x slower at 768p, "just a smidge better").
+    var bestQuality: Bool = false
     /// Set when the pane picked a network model: the LAN routing id
     /// (`<model>@<peer>`). The gen service then skips local resolve/load/
     /// unload — the hosting Mac loads on demand and manages its own memory.
@@ -1197,6 +1233,9 @@ struct Model3DGenRequest {
     var seed: Int = -1
     /// Keep the model resident after this generation (default off → unload).
     var keepResident: Bool = false
+    /// Max-quality opt-out of the server's fast recipe ("fast": false — every
+    /// forward dense, ~2.8x slower at 768p, "just a smidge better").
+    var bestQuality: Bool = false
     /// Set when the pane picked a network model: the LAN routing id
     /// (`<model>@<peer>`). The gen service then skips local resolve/load/
     /// unload — the hosting Mac loads on demand and manages its own memory.

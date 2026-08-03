@@ -207,6 +207,13 @@ fn writeToSink(bytes: []const u8) void {
 /// Flip it locally (see the file-sink test) when a test must assert on logging.
 var stderr_enabled: bool = !builtin.is_test;
 
+/// Env-gated live-test harnesses (generation runs driven through the test
+/// binary) opt back into stderr logging: the phase/step lines ARE the
+/// harness's observable output, and a profile run without them is blind.
+pub fn enableStderr() void {
+    stderr_enabled = true;
+}
+
 /// Format once, fan out to stderr and (when open) the file.
 fn emit(comptime fmt: []const u8, args: anytype) void {
     if (stderr_enabled) std.debug.print(fmt, args);

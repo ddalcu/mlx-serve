@@ -55,6 +55,7 @@ struct VideoGenView: View {
     @State private var player: AVPlayer?
     /// Keep the model resident after generating (default off → unload).
     @State private var keepResident: Bool = false
+    @State private var bestQuality: Bool = false
     /// Hydration guard — see ImageGenView for the full rationale.
     @State private var hydrating: Bool = false
     @State private var didHydrate: Bool = false
@@ -650,6 +651,11 @@ struct VideoGenView: View {
                 numberField("Seed", value: $seed, step: 1)
                 Spacer()
             }
+            if model.supportsFastRecipe {
+                Toggle("Max quality (slower)", isOn: $bestQuality)
+                    .font(.caption)
+                    .help("Off (default): the fast recipe — step caching + attention reuse, about 2.8x faster at 768p. On: every denoising step is fully computed; marginally better detail for final renders.")
+            }
             Toggle("Keep model loaded after generating", isOn: $keepResident)
                 .font(.caption)
                 .help("On: the model stays resident so the next generation is instant. Off (default): it's unloaded to free GPU memory.")
@@ -919,6 +925,7 @@ struct VideoGenView: View {
         stgScale = s.stgScale
         seed = s.seed
         keepResident = s.keepResident
+        bestQuality = s.bestQuality
         loraPath = s.loraPath
         // The LoRA file may have moved since last session — drop a stale path.
         if !loraPath.isEmpty && !FileManager.default.fileExists(atPath: loraPath) {
@@ -940,6 +947,7 @@ struct VideoGenView: View {
         s.stgScale = stgScale
         s.seed = seed
         s.keepResident = keepResident
+        s.bestQuality = bestQuality
         s.loraPath = loraPath
         s.save()
     }
@@ -996,6 +1004,7 @@ struct VideoGenView: View {
             firstFrameImagePath: firstFrameImageURL?.path,
             audioPath: audioURL?.path,
             keepResident: keepResident,
+            bestQuality: bestQuality,
             lanModelId: lanModel,
             loraPath: loraPath.isEmpty ? nil : loraPath
         )

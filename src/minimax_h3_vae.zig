@@ -167,6 +167,26 @@ pub fn fitsSingleTile(pixel_extent: u32) bool {
     return TILE_SIZE >= pixel_extent;
 }
 
+// ── Encoder geometry (EncoderFCN3D: ch=128, ch_mult (1,2,2,4,4,8)) ──────────
+
+pub const ENC_LEVELS: u32 = 6;
+pub const ENC_CH: u32 = 128;
+pub const ENC_CH_MULT = [ENC_LEVELS]u32{ 1, 2, 2, 4, 4, 8 };
+pub const ENC_SPACE_DOWN = [ENC_LEVELS]u32{ 2, 2, 2, 2, 1, 1 };
+pub const ENC_TIME_DOWN = [ENC_LEVELS]u32{ 1, 2, 2, 1, 1, 1 };
+pub const ENC_RES_BLOCKS: u32 = 2;
+
+pub fn encBlockMid(level: usize) u32 {
+    return ENC_CH * ENC_CH_MULT[level];
+}
+pub fn encBlockIn(level: usize) u32 {
+    return if (level == 0) encBlockMid(0) else encBlockMid(level - 1);
+}
+/// A level carries a downsample conv iff space*time strides > 1.
+pub fn encHasDown(level: usize) bool {
+    return ENC_SPACE_DOWN[level] * ENC_TIME_DOWN[level] > 1;
+}
+
 /// Minimum tile overlap in pixels (`vae_tile_overlap_min`).
 pub const TILE_OVERLAP_MIN: u32 = 64;
 
@@ -1076,4 +1096,740 @@ test "minimax h3 vae: decoder geometry matches the checkpoint" {
     try testing.expect(cfg.rotDim() < cfg.head_dim);
     // proj_out width: 3 channels x 4 frames x 16 x 16.
     try testing.expectEqual(@as(u32, 3072), cfg.outPatchDim());
+}
+
+test "minimax h3 vae live: tiled decode seam energy stays at ambient level" {
+    // The blend/trim path of `decodeSpatial` was only ever validated by "the
+    // 480p clip looked right". This pins it numerically: a smooth synthetic
+    // latent decoded through the TILED path (384px canvas -> 2x2 tiles, one
+    // seam per axis at pixel 128) must show NO gradient spike at the seams —
+    // broken blending (hard concat, off-by-one trim) reads as a step edge
+    // there. Tiles are SEMANTIC (each renormalizes rope over its own extent),
+    // so tile outputs genuinely differ and an unblended seam is visible.
+    const raw_model = std.c.getenv("MINIMAX_H3_MODEL") orelse return error.SkipZigTest;
+    const model_dir = std.mem.sliceTo(raw_model, 0);
+    if (model_dir.len == 0) return error.SkipZigTest;
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const s = mlx.gpuStream();
+
+    const vae_path = try std.fmt.allocPrint(a, "{s}/video_vae.safetensors", .{model_dir});
+    defer a.free(vae_path);
+    var vw = try model_mod.loadWeightsSingleFile(a, vae_path);
+    defer vw.deinit();
+    var dec = try Decoder.load(a, &vw, .{}, mlx.mlx_dtype.bfloat16, s);
+    defer dec.deinit();
+    _ = io;
+
+    // Smooth low-frequency latent [1,24,2,24,24] -> 384x384, 5 frames. Channel
+    // phases vary so every tile sees different content (a constant latent
+    // makes all tiles identical and the seam check vacuous).
+    const lat: u32 = 24;
+    const lt: u32 = 2;
+    const buf = try a.alloc(f32, 24 * lt * lat * lat);
+    defer a.free(buf);
+    for (0..24) |c| {
+        const phase = @as(f64, @floatFromInt(c)) * 0.37;
+        for (0..lt) |t| {
+            for (0..lat) |y| {
+                for (0..lat) |x| {
+                    const fx = @as(f64, @floatFromInt(x)) / @as(f64, @floatFromInt(lat));
+                    const fy = @as(f64, @floatFromInt(y)) / @as(f64, @floatFromInt(lat));
+                    const v = 0.6 * @sin(2.0 * std.math.pi * (fx + phase)) * @cos(2.0 * std.math.pi * (fy - phase));
+                    buf[((c * lt + t) * lat + y) * lat + x] = @floatCast(v);
+                }
+            }
+        }
+    }
+    const zshape = [_]c_int{ 1, 24, @intCast(lt), @intCast(lat), @intCast(lat) };
+    const z = mlx.mlx_array_new_data(buf.ptr, &zshape, 5, mlx.mlx_dtype.float32);
+    defer _ = mlx.mlx_array_free(z);
+
+    const pixels = try decode(&dec, z, a, s);
+    defer _ = mlx.mlx_array_free(pixels);
+    const pf = try astype(pixels, mlx.mlx_dtype.float32, s);
+    defer _ = mlx.mlx_array_free(pf);
+    try mlx.check(mlx.mlx_array_eval(pf));
+
+    const shp = mlx.getShape(pf);
+    const frames: usize = @intCast(shp[2]);
+    const ph: usize = @intCast(shp[3]);
+    const pw: usize = @intCast(shp[4]);
+    try testing.expectEqual(@as(usize, 384), ph);
+    try testing.expectEqual(@as(usize, 384), pw);
+    const data = mlx.mlx_array_data_float32(pf) orelse return error.NoPixelData;
+    const n_px = 3 * frames * ph * pw;
+
+    // Column-gradient energy g[x] = mean |p[..,x+1] - p[..,x]|, and the row
+    // analogue. splitTiles(384) = starts [0,128], overlap 128 -> the assembled
+    // seam sits between columns 127|128 (gradient index 127).
+    const gcol = try a.alloc(f64, pw - 1);
+    defer a.free(gcol);
+    @memset(gcol, 0);
+    const grow = try a.alloc(f64, ph - 1);
+    defer a.free(grow);
+    @memset(grow, 0);
+    var ci: usize = 0;
+    while (ci < n_px) : (ci += ph * pw) {
+        const plane = data[ci .. ci + ph * pw];
+        for (0..ph) |y| {
+            for (0..pw - 1) |x| gcol[x] += @abs(@as(f64, plane[y * pw + x + 1]) - @as(f64, plane[y * pw + x]));
+        }
+        for (0..ph - 1) |y| {
+            for (0..pw) |x| grow[y] += @abs(@as(f64, plane[(y + 1) * pw + x]) - @as(f64, plane[y * pw + x]));
+        }
+    }
+
+    const med = struct {
+        fn f(alloc2: std.mem.Allocator, v: []const f64) !f64 {
+            const c2 = try alloc2.dupe(f64, v);
+            defer alloc2.free(c2);
+            std.mem.sort(f64, c2, {}, std.sort.asc(f64));
+            return c2[c2.len / 2];
+        }
+    }.f;
+    const col_med = try med(a, gcol);
+    const row_med = try med(a, grow);
+    const seam = 127;
+    std.debug.print("[h3-vae-seam] col seam={d:.5} med={d:.5}  row seam={d:.5} med={d:.5}\n", .{ gcol[seam], col_med, grow[seam], row_med });
+    // A correct cross-fade leaves the seam column statistically ordinary; a
+    // hard concat measured ~an order of magnitude over the ambient median.
+    try testing.expect(gcol[seam] <= col_med * 3.0);
+    try testing.expect(grow[seam] <= row_med * 3.0);
+}
+
+// ── Encoder (3D causal CNN, SINGLE-FRAME path) ──────────────────────────────
+//
+// fl2va keyframes are single frames, and for T==1 the reference's causal
+// temporal padding is all zeros ("truncate the temporal taps instead of
+// convolving zero frames" — vae.py CausalConv3d), so every CausalConv3d
+// collapses EXACTLY to a 2D conv with the LAST temporal tap of its kernel:
+// the zero frames contribute nothing and the bias is applied once either way.
+// The full-T encoder (ref2va reference videos) is deliberately not built yet.
+//
+// Runs f32 end to end: one frame is cheap and the moments anchor the whole
+// generation, so precision is the safe default here.
+
+inline fn subA(a: mlx.mlx_array, b: mlx.mlx_array, s: S) !mlx.mlx_array {
+    var o = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_subtract(&o, a, b, s));
+    return o;
+}
+inline fn divA(a: mlx.mlx_array, b: mlx.mlx_array, s: S) !mlx.mlx_array {
+    var o = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_divide(&o, a, b, s));
+    return o;
+}
+
+/// ImageNet statistics — non-persistent buffers in the reference, so they are
+/// NOT in the checkpoint and live here as the reference's own constants.
+const PIXEL_MEAN = [3]f32{ 0.485, 0.456, 0.406 };
+const PIXEL_STD = [3]f32{ 0.229, 0.224, 0.225 };
+
+/// Reflect-pad H and W by 1 on [1, H, W, C] (torch reflect: mirror EXCLUDING
+/// the edge sample).
+fn reflectPad1HW(x: mlx.mlx_array, s: S) !mlx.mlx_array {
+    const shp = mlx.getShape(x);
+    const h = shp[1];
+    const w = shp[2];
+    const top = try sliceAxis(x, 1, 1, 2, s);
+    defer _ = mlx.mlx_array_free(top);
+    const bot = try sliceAxis(x, 1, h - 2, h - 1, s);
+    defer _ = mlx.mlx_array_free(bot);
+    const xv = try concat(&[_]mlx.mlx_array{ top, x, bot }, 1, s);
+    defer _ = mlx.mlx_array_free(xv);
+    const left = try sliceAxis(xv, 2, 1, 2, s);
+    defer _ = mlx.mlx_array_free(left);
+    const right = try sliceAxis(xv, 2, w - 2, w - 1, s);
+    defer _ = mlx.mlx_array_free(right);
+    return concat(&[_]mlx.mlx_array{ left, xv, right }, 2, s);
+}
+
+/// Reflect-pad bottom+right by 1 (the reference Downsample3D's (0,1,0,1) pad).
+fn reflectPadBR(x: mlx.mlx_array, s: S) !mlx.mlx_array {
+    const shp = mlx.getShape(x);
+    const h = shp[1];
+    const w = shp[2];
+    const bot = try sliceAxis(x, 1, h - 2, h - 1, s);
+    defer _ = mlx.mlx_array_free(bot);
+    const xv = try concat(&[_]mlx.mlx_array{ x, bot }, 1, s);
+    defer _ = mlx.mlx_array_free(xv);
+    const right = try sliceAxis(xv, 2, w - 2, w - 1, s);
+    defer _ = mlx.mlx_array_free(right);
+    return concat(&[_]mlx.mlx_array{ xv, right }, 2, s);
+}
+
+fn conv2dBias(x: mlx.mlx_array, w: mlx.mlx_array, b: mlx.mlx_array, stride: c_int, s: S) !mlx.mlx_array {
+    var o = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(o);
+    try mlx.check(mlx.mlx_conv2d(&o, x, w, stride, stride, 0, 0, 1, 1, 1, s));
+    return addA(o, b, s);
+}
+
+/// Per-frame GroupNorm(32, eps 1e-6, affine) on [1, H, W, C]. T==1 so the
+/// reference's TemporalIsolatedGroupNorm is plain GroupNorm.
+fn groupNorm32(x: mlx.mlx_array, w: mlx.mlx_array, b: mlx.mlx_array, s: S) !mlx.mlx_array {
+    const shp = mlx.getShape(x);
+    const h = shp[1];
+    const w_ = shp[2];
+    const c = shp[3];
+    const g = try reshape(x, &[_]c_int{ 1, h, w_, 32, @divExact(c, 32) }, s);
+    defer _ = mlx.mlx_array_free(g);
+    const axes = [_]c_int{ 1, 2, 4 };
+    var mean = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(mean);
+    try mlx.check(mlx.mlx_mean_axes(&mean, g, &axes, axes.len, true, s));
+    const diff = try subA(g, mean, s);
+    defer _ = mlx.mlx_array_free(diff);
+    const sq = try mulA(diff, diff, s);
+    defer _ = mlx.mlx_array_free(sq);
+    var vr = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(vr);
+    try mlx.check(mlx.mlx_mean_axes(&vr, sq, &axes, axes.len, true, s));
+    const eps = mlx.mlx_array_new_float(1e-6);
+    defer _ = mlx.mlx_array_free(eps);
+    const ve = try addA(vr, eps, s);
+    defer _ = mlx.mlx_array_free(ve);
+    var rs = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(rs);
+    try mlx.check(mlx.mlx_rsqrt(&rs, ve, s));
+    const nrm = try mulA(diff, rs, s);
+    defer _ = mlx.mlx_array_free(nrm);
+    const back = try reshape(nrm, &[_]c_int{ 1, h, w_, c }, s);
+    defer _ = mlx.mlx_array_free(back);
+    const sc = try mulA(back, w, s);
+    defer _ = mlx.mlx_array_free(sc);
+    return addA(sc, b, s);
+}
+
+const EncRes = struct {
+    norm1_w: mlx.mlx_array,
+    norm1_b: mlx.mlx_array,
+    conv1_w: mlx.mlx_array,
+    conv1_b: mlx.mlx_array,
+    norm2_w: mlx.mlx_array,
+    norm2_b: mlx.mlx_array,
+    conv2_w: mlx.mlx_array,
+    conv2_b: mlx.mlx_array,
+    /// 1x1 shortcut as a pre-transposed [in, out] matmul weight; null ctx when
+    /// in == out.
+    nin_wt: mlx.mlx_array = .{ .ctx = null },
+    nin_b: mlx.mlx_array = .{ .ctx = null },
+
+    fn deinit(self: *EncRes) void {
+        for ([_]mlx.mlx_array{ self.norm1_w, self.norm1_b, self.conv1_w, self.conv1_b, self.norm2_w, self.norm2_b, self.conv2_w, self.conv2_b }) |a2| _ = mlx.mlx_array_free(a2);
+        if (self.nin_wt.ctx != null) _ = mlx.mlx_array_free(self.nin_wt);
+        if (self.nin_b.ctx != null) _ = mlx.mlx_array_free(self.nin_b);
+    }
+};
+
+const EncLevel = struct {
+    blocks: [ENC_RES_BLOCKS]EncRes,
+    down_w: mlx.mlx_array = .{ .ctx = null },
+    down_b: mlx.mlx_array = .{ .ctx = null },
+
+    fn deinit(self: *EncLevel) void {
+        for (&self.blocks) |*bk| bk.deinit();
+        if (self.down_w.ctx != null) _ = mlx.mlx_array_free(self.down_w);
+        if (self.down_b.ctx != null) _ = mlx.mlx_array_free(self.down_b);
+    }
+};
+
+pub const Encoder = struct {
+    allocator: std.mem.Allocator,
+    conv_in_w: mlx.mlx_array,
+    conv_in_b: mlx.mlx_array,
+    levels: [ENC_LEVELS]EncLevel,
+    norm_out_w: mlx.mlx_array,
+    norm_out_b: mlx.mlx_array,
+    conv_out_w: mlx.mlx_array,
+    conv_out_b: mlx.mlx_array,
+    quant_wt: mlx.mlx_array, // [48, 48] pre-transposed [in, out]
+    quant_b: mlx.mlx_array,
+    latents_mean: mlx.mlx_array,
+    latents_std: mlx.mlx_array,
+
+    /// [O, I, kt, kh, kw] -> f32 [O, kh, kw, I] using the LAST temporal tap
+    /// (exact for T==1 — the causal front pads are zeros).
+    fn convTap(w: *const Weights, a: std.mem.Allocator, comptime fmt: []const u8, args: anytype, s: S) !mlx.mlx_array {
+        const name = try std.fmt.allocPrint(a, fmt, args);
+        defer a.free(name);
+        const raw = try ownWeight(w, name);
+        defer _ = mlx.mlx_array_free(raw);
+        const shp = mlx.getShape(raw);
+        const kt = shp[2];
+        const tap = try sliceAxis(raw, 2, kt - 1, kt, s);
+        defer _ = mlx.mlx_array_free(tap);
+        const sq = try reshape(tap, &[_]c_int{ shp[0], shp[1], shp[3], shp[4] }, s);
+        defer _ = mlx.mlx_array_free(sq);
+        const tr = try transpose(sq, &[_]c_int{ 0, 2, 3, 1 }, s);
+        defer _ = mlx.mlx_array_free(tr);
+        const trc = try contig(tr, s);
+        defer _ = mlx.mlx_array_free(trc);
+        return astype(trc, mlx.mlx_dtype.float32, s);
+    }
+
+    fn vec1(w: *const Weights, a: std.mem.Allocator, comptime fmt: []const u8, args: anytype, s: S) !mlx.mlx_array {
+        const name = try std.fmt.allocPrint(a, fmt, args);
+        defer a.free(name);
+        const raw = try ownWeight(w, name);
+        defer _ = mlx.mlx_array_free(raw);
+        return astype(raw, mlx.mlx_dtype.float32, s);
+    }
+
+    /// 1x1x1 conv weight [O, I, 1, 1, 1] -> pre-transposed f32 [I, O].
+    fn oneByOne(w: *const Weights, a: std.mem.Allocator, comptime fmt: []const u8, args: anytype, s: S) !mlx.mlx_array {
+        const name = try std.fmt.allocPrint(a, fmt, args);
+        defer a.free(name);
+        const raw = try ownWeight(w, name);
+        defer _ = mlx.mlx_array_free(raw);
+        const shp = mlx.getShape(raw);
+        const sq = try reshape(raw, &[_]c_int{ shp[0], shp[1] }, s);
+        defer _ = mlx.mlx_array_free(sq);
+        const tr = try transpose(sq, &[_]c_int{ 1, 0 }, s);
+        defer _ = mlx.mlx_array_free(tr);
+        const trc = try contig(tr, s);
+        defer _ = mlx.mlx_array_free(trc);
+        return astype(trc, mlx.mlx_dtype.float32, s);
+    }
+
+    pub fn load(allocator: std.mem.Allocator, w: *const Weights, s: S) !Encoder {
+        var self: Encoder = undefined;
+        self.allocator = allocator;
+        self.conv_in_w = try convTap(w, allocator, "encoder.conv_in.weight", .{}, s);
+        self.conv_in_b = try vec1(w, allocator, "encoder.conv_in.bias", .{}, s);
+        for (0..ENC_LEVELS) |lv| {
+            var level: EncLevel = .{ .blocks = undefined };
+            for (0..ENC_RES_BLOCKS) |bi| {
+                var blk: EncRes = .{
+                    .norm1_w = try vec1(w, allocator, "encoder.down.{d}.block.{d}.norm1.weight", .{ lv, bi }, s),
+                    .norm1_b = try vec1(w, allocator, "encoder.down.{d}.block.{d}.norm1.bias", .{ lv, bi }, s),
+                    .conv1_w = try convTap(w, allocator, "encoder.down.{d}.block.{d}.conv1.weight", .{ lv, bi }, s),
+                    .conv1_b = try vec1(w, allocator, "encoder.down.{d}.block.{d}.conv1.bias", .{ lv, bi }, s),
+                    .norm2_w = try vec1(w, allocator, "encoder.down.{d}.block.{d}.norm2.weight", .{ lv, bi }, s),
+                    .norm2_b = try vec1(w, allocator, "encoder.down.{d}.block.{d}.norm2.bias", .{ lv, bi }, s),
+                    .conv2_w = try convTap(w, allocator, "encoder.down.{d}.block.{d}.conv2.weight", .{ lv, bi }, s),
+                    .conv2_b = try vec1(w, allocator, "encoder.down.{d}.block.{d}.conv2.bias", .{ lv, bi }, s),
+                };
+                // in != out only on the first block of a widening level.
+                const in_ch = if (bi == 0) encBlockIn(lv) else encBlockMid(lv);
+                if (in_ch != encBlockMid(lv)) {
+                    blk.nin_wt = try oneByOne(w, allocator, "encoder.down.{d}.block.{d}.nin_shortcut.weight", .{ lv, bi }, s);
+                    blk.nin_b = try vec1(w, allocator, "encoder.down.{d}.block.{d}.nin_shortcut.bias", .{ lv, bi }, s);
+                }
+                level.blocks[bi] = blk;
+            }
+            if (encHasDown(lv)) {
+                level.down_w = try convTap(w, allocator, "encoder.down.{d}.downsample.conv.weight", .{lv}, s);
+                level.down_b = try vec1(w, allocator, "encoder.down.{d}.downsample.conv.bias", .{lv}, s);
+            }
+            self.levels[lv] = level;
+        }
+        self.norm_out_w = try vec1(w, allocator, "encoder.norm_out.weight", .{}, s);
+        self.norm_out_b = try vec1(w, allocator, "encoder.norm_out.bias", .{}, s);
+        self.conv_out_w = try convTap(w, allocator, "encoder.conv_out.weight", .{}, s);
+        self.conv_out_b = try vec1(w, allocator, "encoder.conv_out.bias", .{}, s);
+        self.quant_wt = try oneByOne(w, allocator, "quant_conv.weight", .{}, s);
+        self.quant_b = try vec1(w, allocator, "quant_conv.bias", .{}, s);
+        self.latents_mean = try vec1(w, allocator, "latents_mean", .{}, s);
+        self.latents_std = try vec1(w, allocator, "latents_std", .{}, s);
+        return self;
+    }
+
+    pub fn deinit(self: *Encoder) void {
+        for ([_]mlx.mlx_array{
+            self.conv_in_w,  self.conv_in_b,  self.norm_out_w,   self.norm_out_b,
+            self.conv_out_w, self.conv_out_b, self.quant_wt,     self.quant_b,
+            self.latents_mean, self.latents_std,
+        }) |a2| _ = mlx.mlx_array_free(a2);
+        for (&self.levels) |*lv| lv.deinit();
+    }
+
+    fn resBlock(self: *const Encoder, blk: *const EncRes, x: mlx.mlx_array, s: S) !mlx.mlx_array {
+        _ = self;
+        const n1 = try groupNorm32(x, blk.norm1_w, blk.norm1_b, s);
+        defer _ = mlx.mlx_array_free(n1);
+        const a1 = try siluA(n1, s);
+        defer _ = mlx.mlx_array_free(a1);
+        const p1 = try reflectPad1HW(a1, s);
+        defer _ = mlx.mlx_array_free(p1);
+        const h1 = try conv2dBias(p1, blk.conv1_w, blk.conv1_b, 1, s);
+        defer _ = mlx.mlx_array_free(h1);
+        const n2 = try groupNorm32(h1, blk.norm2_w, blk.norm2_b, s);
+        defer _ = mlx.mlx_array_free(n2);
+        const a2 = try siluA(n2, s);
+        defer _ = mlx.mlx_array_free(a2);
+        const p2 = try reflectPad1HW(a2, s);
+        defer _ = mlx.mlx_array_free(p2);
+        const h2 = try conv2dBias(p2, blk.conv2_w, blk.conv2_b, 1, s);
+        defer _ = mlx.mlx_array_free(h2);
+        var sc = x;
+        var sc_owned = false;
+        if (blk.nin_wt.ctx != null) {
+            sc = try linT(x, blk.nin_wt, blk.nin_b, s);
+            sc_owned = true;
+        }
+        defer if (sc_owned) {
+            _ = mlx.mlx_array_free(sc);
+        };
+        return addA(h2, sc, s);
+    }
+
+    /// One tile [1, th, tw, 3] (already pixel-normalized) -> moments
+    /// [1, 48, 1, th/16, tw/16].
+    fn encodeMoments(self: *const Encoder, x: mlx.mlx_array, s: S) !mlx.mlx_array {
+        const p0 = try reflectPad1HW(x, s);
+        defer _ = mlx.mlx_array_free(p0);
+        var h = try conv2dBias(p0, self.conv_in_w, self.conv_in_b, 1, s);
+        errdefer _ = mlx.mlx_array_free(h);
+        for (0..ENC_LEVELS) |lv| {
+            const level = &self.levels[lv];
+            for (0..ENC_RES_BLOCKS) |bi| {
+                const nh = try self.resBlock(&level.blocks[bi], h, s);
+                _ = mlx.mlx_array_free(h);
+                h = nh;
+            }
+            if (level.down_w.ctx != null) {
+                const pd = try reflectPadBR(h, s);
+                defer _ = mlx.mlx_array_free(pd);
+                const nh = try conv2dBias(pd, level.down_w, level.down_b, 2, s);
+                _ = mlx.mlx_array_free(h);
+                h = nh;
+            }
+        }
+        // `h` owns the live value throughout; the errdefer above frees it
+        // exactly once on any error path.
+        const step = struct {
+            fn adv(cur: *mlx.mlx_array, next: mlx.mlx_array) void {
+                _ = mlx.mlx_array_free(cur.*);
+                cur.* = next;
+            }
+        }.adv;
+        step(&h, try groupNorm32(h, self.norm_out_w, self.norm_out_b, s));
+        step(&h, try siluA(h, s));
+        step(&h, try reflectPad1HW(h, s));
+        step(&h, try conv2dBias(h, self.conv_out_w, self.conv_out_b, 1, s));
+        step(&h, try linT(h, self.quant_wt, self.quant_b, s));
+        // [1, lh, lw, 48] -> [1, 48, 1, lh, lw]
+        const qs0 = mlx.getShape(h)[1];
+        const qs1 = mlx.getShape(h)[2];
+        step(&h, try transpose(h, &[_]c_int{ 0, 3, 1, 2 }, s));
+        step(&h, try contig(h, s));
+        const out = try reshape(h, &[_]c_int{ 1, 48, 1, qs0, qs1 }, s);
+        _ = mlx.mlx_array_free(h);
+        return out;
+    }
+
+    /// Single keyframe image -> NORMALIZED latent.
+    /// `pixels` [1, 3, 1, H, W] f32 in [-1, 1] at the target canvas;
+    /// returns [1, 24, 1, H/16, W/16] f32.
+    ///
+    /// Spatially TILED above the 256-px tile extent like the decoder — and for
+    /// the same reason: tiles renormalize their rope... no rope here, but the
+    /// reference encodes tiled ALWAYS (`tiling=True`), blending MOMENTS at
+    /// latent granularity against the RAW neighbours, so parity means doing
+    /// the same.
+    pub fn encodeImage(self: *const Encoder, pixels: mlx.mlx_array, alloc: std.mem.Allocator, s: S) !mlx.mlx_array {
+        const pshp = mlx.getShape(pixels);
+        const ph: u32 = @intCast(pshp[3]);
+        const pw: u32 = @intCast(pshp[4]);
+
+        // [1,3,1,H,W] -> [1,H,W,3], then [-1,1] -> ImageNet normalization.
+        const t5 = try transpose(pixels, &[_]c_int{ 0, 2, 3, 4, 1 }, s);
+        defer _ = mlx.mlx_array_free(t5);
+        const t5c = try contig(t5, s);
+        defer _ = mlx.mlx_array_free(t5c);
+        const nhwc_raw = try reshape(t5c, &[_]c_int{ 1, @intCast(ph), @intCast(pw), 3 }, s);
+        defer _ = mlx.mlx_array_free(nhwc_raw);
+        const f32x = try astype(nhwc_raw, mlx.mlx_dtype.float32, s);
+        defer _ = mlx.mlx_array_free(f32x);
+        const half = mlx.mlx_array_new_float(0.5);
+        defer _ = mlx.mlx_array_free(half);
+        const unit01a = try mulA(f32x, half, s);
+        defer _ = mlx.mlx_array_free(unit01a);
+        const unit01 = try addA(unit01a, half, s);
+        defer _ = mlx.mlx_array_free(unit01);
+        const msh = [_]c_int{ 1, 1, 1, 3 };
+        const pm = mlx.mlx_array_new_data(&PIXEL_MEAN, &msh, 4, mlx.mlx_dtype.float32);
+        defer _ = mlx.mlx_array_free(pm);
+        const psd = mlx.mlx_array_new_data(&PIXEL_STD, &msh, 4, mlx.mlx_dtype.float32);
+        defer _ = mlx.mlx_array_free(psd);
+        const cen = try subA(unit01, pm, s);
+        defer _ = mlx.mlx_array_free(cen);
+        const nhwc = try divA(cen, psd, s);
+        defer _ = mlx.mlx_array_free(nhwc);
+
+        var moments: mlx.mlx_array = undefined;
+        if (fitsSingleTile(ph) and fitsSingleTile(pw)) {
+            moments = try self.encodeMoments(nhwc, s);
+        } else {
+            moments = try self.encodeTiled(nhwc, alloc, s);
+        }
+        defer _ = mlx.mlx_array_free(moments);
+
+        // mean = first 24 channels; normalize by the latent statistics.
+        const mean24 = try sliceAxis(moments, 1, 0, 24, s);
+        defer _ = mlx.mlx_array_free(mean24);
+        const csh = [_]c_int{ 1, 24, 1, 1, 1 };
+        const lm = try reshape(self.latents_mean, &csh, s);
+        defer _ = mlx.mlx_array_free(lm);
+        const ls = try reshape(self.latents_std, &csh, s);
+        defer _ = mlx.mlx_array_free(ls);
+        const centered = try subA(mean24, lm, s);
+        defer _ = mlx.mlx_array_free(centered);
+        return divA(centered, ls, s);
+    }
+
+    /// Reference `tiled_encode`: encode raw pixel tiles, blend each against its
+    /// RAW up/left neighbour at LATENT granularity, trim, assemble.
+    fn encodeTiled(self: *const Encoder, nhwc: mlx.mlx_array, alloc: std.mem.Allocator, s: S) !mlx.mlx_array {
+        const shp = mlx.getShape(nhwc);
+        const ph: u32 = @intCast(shp[1]);
+        const pw: u32 = @intCast(shp[2]);
+        var yp = try splitTiles(alloc, ph);
+        defer yp.deinit();
+        var xp = try splitTiles(alloc, pw);
+        defer xp.deinit();
+        const ny = yp.count();
+        const nx = xp.count();
+
+        var raw = try alloc.alloc(mlx.mlx_array, ny * nx);
+        defer alloc.free(raw);
+        var built: usize = 0;
+        defer for (raw[0..built]) |r| {
+            _ = mlx.mlx_array_free(r);
+        };
+        for (yp.starts, 0..) |y0, i| {
+            for (xp.starts, 0..) |x0, j| {
+                const th = try sliceAxis(nhwc, 1, @intCast(y0), @intCast(y0 + yp.len), s);
+                defer _ = mlx.mlx_array_free(th);
+                const tile = try sliceAxis(th, 2, @intCast(x0), @intCast(x0 + xp.len), s);
+                defer _ = mlx.mlx_array_free(tile);
+                raw[i * nx + j] = try self.encodeMoments(tile, s);
+                built += 1;
+            }
+        }
+
+        var rows = try alloc.alloc(mlx.mlx_array, ny);
+        defer alloc.free(rows);
+        var rows_built: usize = 0;
+        errdefer for (rows[0..rows_built]) |r| {
+            _ = mlx.mlx_array_free(r);
+        };
+        for (0..ny) |i| {
+            var cols = try alloc.alloc(mlx.mlx_array, nx);
+            defer alloc.free(cols);
+            var cols_built: usize = 0;
+            errdefer for (cols[0..cols_built]) |c2| {
+                _ = mlx.mlx_array_free(c2);
+            };
+            for (0..nx) |j| {
+                var tile = try contig(raw[i * nx + j], s);
+                errdefer _ = mlx.mlx_array_free(tile);
+                if (i > 0) {
+                    const b = try blendAxis(raw[(i - 1) * nx + j], tile, yp.overlaps[i - 1] / VAE_RATIO, 3, alloc, mlx.mlx_dtype.float32, s);
+                    _ = mlx.mlx_array_free(tile);
+                    tile = b;
+                }
+                if (j > 0) {
+                    const b = try blendAxis(raw[i * nx + (j - 1)], tile, xp.overlaps[j - 1] / VAE_RATIO, 4, alloc, mlx.mlx_dtype.float32, s);
+                    _ = mlx.mlx_array_free(tile);
+                    tile = b;
+                }
+                if (i + 1 < ny) {
+                    const h2: c_int = mlx.getShape(tile)[3];
+                    const t2 = try sliceAxis(tile, 3, 0, h2 - @as(c_int, @intCast(yp.overlaps[i] / VAE_RATIO)), s);
+                    _ = mlx.mlx_array_free(tile);
+                    tile = t2;
+                }
+                if (j + 1 < nx) {
+                    const w2: c_int = mlx.getShape(tile)[4];
+                    const t2 = try sliceAxis(tile, 4, 0, w2 - @as(c_int, @intCast(xp.overlaps[j] / VAE_RATIO)), s);
+                    _ = mlx.mlx_array_free(tile);
+                    tile = t2;
+                }
+                cols[j] = tile;
+                cols_built += 1;
+            }
+            rows[i] = try concat(cols, 4, s);
+            rows_built += 1;
+            for (cols) |c2| _ = mlx.mlx_array_free(c2);
+        }
+        const outp = try concat(rows, 3, s);
+        for (rows) |r| _ = mlx.mlx_array_free(r);
+        rows_built = 0;
+        return outp;
+    }
+};
+
+test "minimax h3 vae: encoder geometry ladder matches the reference config" {
+    // block_in = [mid[0]] ++ mid[:-1]; mid = ch * ch_mult.
+    const want_in = [_]u32{ 128, 128, 256, 256, 512, 512 };
+    const want_mid = [_]u32{ 128, 256, 256, 512, 512, 1024 };
+    for (0..ENC_LEVELS) |lv| {
+        try testing.expectEqual(want_in[lv], encBlockIn(lv));
+        try testing.expectEqual(want_mid[lv], encBlockMid(lv));
+    }
+    // Downsamples on levels 0-3 only (space*time > 1); the spatial strides
+    // multiply to the 16x VAE ratio.
+    var space: u32 = 1;
+    for (0..ENC_LEVELS) |lv| {
+        try testing.expectEqual(lv < 4, encHasDown(lv));
+        space *= ENC_SPACE_DOWN[lv];
+    }
+    try testing.expectEqual(VAE_RATIO, space);
+}
+
+test "minimax h3 vae live: encoder parity vs the executed reference" {
+    // Fixture from tests/dump_minimax_h3_vae_encoder_fixture.py, which RUNS
+    // the reference conv encoder (plain torch — unlike the DiT, nothing here
+    // needs comfy_kitchen). Two cases: a single-tile 128px image and a TILED
+    // 384px one, so the moment-blend assembly is pinned against the
+    // reference's own tiled_encode output.
+    const raw_model = std.c.getenv("MINIMAX_H3_MODEL") orelse return error.SkipZigTest;
+    const raw_fix = std.c.getenv("MINIMAX_H3_VAE_ENC_FIXTURE") orelse return error.SkipZigTest;
+    const model_dir = std.mem.sliceTo(raw_model, 0);
+    const fix_path = std.mem.sliceTo(raw_fix, 0);
+    // An EMPTY env var must skip like an absent one: getenv("")-style unset
+    // (`VAR= binary`) reaches here as "", and load_safetensors("") is an
+    // uncatchable MLX error that killed a whole live-test run.
+    if (model_dir.len == 0 or fix_path.len == 0) return error.SkipZigTest;
+    const a = testing.allocator;
+    const s = mlx.gpuStream();
+
+    const vae_path = try std.fmt.allocPrint(a, "{s}/video_vae.safetensors", .{model_dir});
+    defer a.free(vae_path);
+    var vw = try model_mod.loadWeightsSingleFile(a, vae_path);
+    defer vw.deinit();
+    var enc = try Encoder.load(a, &vw, s);
+    defer enc.deinit();
+
+    var fx = try model_mod.loadWeightsSingleFile(a, fix_path);
+    defer fx.deinit();
+
+    for ([_][2][]const u8{ .{ "x", "latent" }, .{ "x_tiled", "latent_tiled" } }) |pair| {
+        const x = try ownWeight(&fx, pair[0]);
+        defer _ = mlx.mlx_array_free(x);
+        const want = try ownWeight(&fx, pair[1]);
+        defer _ = mlx.mlx_array_free(want);
+        const got = try enc.encodeImage(x, a, s);
+        defer _ = mlx.mlx_array_free(got);
+        const cos = try cosineSimV(got, want, s);
+        std.debug.print("[h3-vae-enc] {s}: cos={d:.6}\n", .{ pair[0], cos });
+        try testing.expect(cos > 0.999);
+    }
+}
+
+fn cosineSimV(a_arr: mlx.mlx_array, b_arr: mlx.mlx_array, s: S) !f32 {
+    const af = try astype(a_arr, mlx.mlx_dtype.float32, s);
+    defer _ = mlx.mlx_array_free(af);
+    const bf = try astype(b_arr, mlx.mlx_dtype.float32, s);
+    defer _ = mlx.mlx_array_free(bf);
+    const ab = try mulA(af, bf, s);
+    defer _ = mlx.mlx_array_free(ab);
+    const aa = try mulA(af, af, s);
+    defer _ = mlx.mlx_array_free(aa);
+    const bb = try mulA(bf, bf, s);
+    defer _ = mlx.mlx_array_free(bb);
+    var dot = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(dot);
+    var na = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(na);
+    var nb = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(nb);
+    try mlx.check(mlx.mlx_sum(&dot, ab, false, s));
+    try mlx.check(mlx.mlx_sum(&na, aa, false, s));
+    try mlx.check(mlx.mlx_sum(&nb, bb, false, s));
+    try mlx.check(mlx.mlx_array_eval(dot));
+    var d: f32 = 0;
+    var x1: f32 = 0;
+    var x2: f32 = 0;
+    try mlx.check(mlx.mlx_array_item_float32(&d, dot));
+    try mlx.check(mlx.mlx_array_item_float32(&x1, na));
+    try mlx.check(mlx.mlx_array_item_float32(&x2, nb));
+    return d / (@sqrt(x1) * @sqrt(x2) + 1e-12);
+}
+
+test "minimax h3 vae live: encode->decode round trip preserves orientation" {
+    // fl2va's first live run produced a MIRRORED first frame (left/right means
+    // inverted vs the keyframe). The encoder is pinned against the executed
+    // reference, but the decoder never was — and a W-flip in a video decoder
+    // is invisible on organic content (a cat at a window mirrors cleanly).
+    // A pure encode->decode round trip of a hard left/right split image
+    // discriminates: mirrored output = VAE-side flip; clean output = the flip
+    // lives in the DiT cond wiring instead.
+    const raw_model = std.c.getenv("MINIMAX_H3_MODEL") orelse return error.SkipZigTest;
+    const model_dir = std.mem.sliceTo(raw_model, 0);
+    const a = testing.allocator;
+    const s = mlx.gpuStream();
+
+    const vae_path = try std.fmt.allocPrint(a, "{s}/video_vae.safetensors", .{model_dir});
+    defer a.free(vae_path);
+    var vw = try model_mod.loadWeightsSingleFile(a, vae_path);
+    defer vw.deinit();
+    var enc = try Encoder.load(a, &vw, s);
+    defer enc.deinit();
+    var dec = try Decoder.load(a, &vw, .{}, mlx.mlx_dtype.bfloat16, s);
+    defer dec.deinit();
+
+    // [1,3,1,128,128] in [-1,1]: left dark (-0.9), right bright (+0.9), and a
+    // dark TOP band (rows 0..16) so the H axis is checked too.
+    const px = 128;
+    const buf = try a.alloc(f32, 3 * px * px);
+    defer a.free(buf);
+    for (0..px) |y| {
+        for (0..px) |x| {
+            var v: f32 = if (x < px / 2) -0.9 else 0.9;
+            if (y < 16) v = -0.9;
+            for (0..3) |c| buf[c * px * px + y * px + x] = v;
+        }
+    }
+    const shape5 = [_]c_int{ 1, 3, 1, px, px };
+    const img = mlx.mlx_array_new_data(buf.ptr, &shape5, 5, mlx.mlx_dtype.float32);
+    defer _ = mlx.mlx_array_free(img);
+
+    const lat = try enc.encodeImage(img, a, s);
+    defer _ = mlx.mlx_array_free(lat);
+    const pixels = try decode(&dec, lat, a, s);
+    defer _ = mlx.mlx_array_free(pixels);
+    const pf = try astype(pixels, mlx.mlx_dtype.float32, s);
+    defer _ = mlx.mlx_array_free(pf);
+    try mlx.check(mlx.mlx_array_eval(pf));
+
+    const shp = mlx.getShape(pf);
+    const oh: usize = @intCast(shp[3]);
+    const ow: usize = @intCast(shp[4]);
+    const data = mlx.mlx_array_data_float32(pf) orelse return error.NoPixelData;
+    // Means over frame 0, channel 0, below the top band.
+    var left: f64 = 0;
+    var right: f64 = 0;
+    var top: f64 = 0;
+    var bottom: f64 = 0;
+    var nl: f64 = 0;
+    var nt: f64 = 0;
+    for (0..oh) |y| {
+        for (0..ow) |x| {
+            const v: f64 = data[y * ow + x];
+            if (y >= 24) {
+                if (x < ow / 2) {
+                    left += v;
+                    nl += 1;
+                } else right += v;
+            }
+            if (x >= ow / 2) {
+                if (y < 8) {
+                    top += v;
+                    nt += 1;
+                } else if (y >= 24) bottom += v;
+            }
+        }
+    }
+    const lm = left / nl;
+    const rm = right / nl;
+    const tm = top / nt;
+    const bm = bottom / (nl - nt + 1);
+    std.debug.print("[h3-vae-rt] left={d:.3} right={d:.3} top={d:.3} bottomish={d:.3}\n", .{ lm, rm, tm, bm });
+    // Input: left dark, right bright, top dark. A mirror flips the sign.
+    try testing.expect(rm - lm > 0.5);
+    try testing.expect(tm < rm - 0.5);
 }
