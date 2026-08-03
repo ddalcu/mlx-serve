@@ -1637,6 +1637,23 @@ pub fn handleImage(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: 
                 return sendError(conn, 400, "could not decode 'image' (PNG/JPEG supported)");
             edit_imgs_n = 1;
             log.info("[image] edit: reference {d}x{d} -> {d}x{d} (in-context conditioning)\n", .{ nat.w, nat.h, rd.w, rd.h });
+            // Output grid (independent of the reference's own conditioning grid
+            // above). NO size in the request = "Match source": the reference's
+            // own resolution IS the output target, same contract the byte-based
+            // backend already honors above. An explicit size keeps the
+            // reference's aspect ratio and treats the request as the pixel
+            // budget to fit it into. Without this, `width`/`height` stay at
+            // the 1024x1024 default from earlier and every edit comes back
+            // square regardless of what the client asked to match.
+            const fit = if (size_given)
+                resolveEditTargetSize(nat.w, nat.h, width, height, engine.maxDim())
+            else
+                resolveEditTargetSize(nat.w, nat.h, nat.w, nat.h, engine.maxDim());
+            const nz = engine.normalizeSize(fit.w, fit.h);
+            if (nz.w != width or nz.h != height)
+                log.info("[image] edit: target {d}x{d} -> {d}x{d} (primary reference is {d}x{d}, size {s})\n", .{ width, height, nz.w, nz.h, nat.w, nat.h, if (size_given) "requested" else "matched to source" });
+            width = nz.w;
+            height = nz.h;
         } else {
             // Variation shares the output's latent grid — cover + center-crop
             // to the output dims (never stretched).
