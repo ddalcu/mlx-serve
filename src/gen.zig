@@ -212,16 +212,36 @@ fn isMageFlowRepo(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u
 /// for a regular LM/embedding arch. The video (LTX "AudioVideo") branch
 /// additionally requires `connector.safetensors` so a generic "AudioVideo"
 /// config without the LTX bundle isn't misrouted.
+/// A file that must be present for `model_type` to be accepted as that media
+/// backend, or null when the `model_type` alone is sufficient.
+///
+/// This is keyed on the TYPE, not the modality. It used to be
+/// `if (modality == .video) require connector.safetensors` — a marker that
+/// belongs to LTX only. The moment a second video backend existed, that guard
+/// rejected it, `detectModality` returned null, and the loader fell through to
+/// the MLX TEXT path: it globbed all four of MiniMax-H3's safetensors into one
+/// weight map and died on `model.norm.weight`. A per-MODALITY guard cannot
+/// survive a modality growing a second backend.
+pub fn requiredMarkerFor(model_type: []const u8) ?[]const u8 {
+    // LTX: distinguishes the real bundle from any other "AudioVideo" config
+    // and proves the text path can load.
+    if (std.mem.eql(u8, model_type, "AudioVideo")) return "connector.safetensors";
+    // MiniMax-H3: our converted layout always writes this next to config.json.
+    if (std.mem.eql(u8, model_type, "minimax_h3")) return "transformer.safetensors";
+    return null;
+}
+
 pub fn detectModality(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) ?Modality {
     const mt = peekModelType(io, allocator, model_dir) orelse return null;
     defer allocator.free(mt);
     const modality = modalityFromType(mt) orelse return null;
-    if (modality == .video) {
-        // Require the connector — distinguishes the LTX bundle from any other
-        // "AudioVideo" config and ensures the text path can load.
-        const conn_path = std.fmt.allocPrintSentinel(allocator, "{s}/connector.safetensors", .{model_dir}, 0) catch return null;
-        defer allocator.free(conn_path);
-        if (!fileExists(io, conn_path)) return null;
+    if (requiredMarkerFor(mt)) |marker| {
+        const p = std.fmt.allocPrintSentinel(allocator, "{s}/{s}", .{ model_dir, marker }, 0) catch return null;
+        defer allocator.free(p);
+        if (!fileExists(io, p)) {
+            log.warn("[gen] {s} at {s} is missing {s}; not treating it as a media model\n", .{ mt, model_dir, marker });
+            return null;
+        }
     }
     return modality;
 }
@@ -3741,4 +3761,31 @@ test "media model types: discovery and modality dispatch agree" {
         try std.testing.expect(!discovery.isMediaModelType(mt));
         try std.testing.expect(modalityFromType(mt) == null);
     }
+}
+
+test "media markers are per-TYPE, not per-modality" {
+    // REGRESSION. `detectModality` guarded the whole `.video` modality on
+    // LTX's `connector.safetensors`. MiniMax-H3 has no such file, so detection
+    // returned null and the loader fell through to the MLX TEXT path — it
+    // globbed all four H3 safetensors into one weight map and failed on
+    // `model.norm.weight`, a Qwen tensor H3 does not have.
+    //
+    // The invariant: a marker belongs to a BACKEND. Requiring one backend's
+    // file from every model in its modality breaks the next backend added.
+    try std.testing.expectEqualStrings("connector.safetensors", requiredMarkerFor("AudioVideo").?);
+    try std.testing.expectEqualStrings("transformer.safetensors", requiredMarkerFor("minimax_h3").?);
+    // H3 must NOT be gated on LTX's file.
+    try std.testing.expect(!std.mem.eql(u8, requiredMarkerFor("minimax_h3").?, "connector.safetensors"));
+
+    // Every media type either declares its own marker or needs none; none may
+    // inherit another backend's.
+    for (media_model_types) |mt| {
+        if (requiredMarkerFor(mt)) |m| {
+            try std.testing.expect(m.len > 0);
+            if (!std.mem.eql(u8, mt, "AudioVideo"))
+                try std.testing.expect(!std.mem.eql(u8, m, "connector.safetensors"));
+        }
+    }
+    // A non-media type never carries one.
+    try std.testing.expect(requiredMarkerFor("gemma4") == null);
 }
