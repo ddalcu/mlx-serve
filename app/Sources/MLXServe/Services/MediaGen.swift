@@ -965,11 +965,17 @@ extension ImageModelPreset {
     /// only way to discover that it can produce a depth map or de-rain a photo
     /// is to be shown the sentence that does it.
     func promptExamples(editing: Bool) -> [ImagePromptExampleGroup] {
-        guard editing && supportsReferenceEdit else { return ImagePromptExamples.textToImage }
-        switch variant {
-        case .mageFlowEditTurbo: return ImagePromptExamples.mageFlowEdit
-        default: return ImagePromptExamples.genericEdit
+        let builtin: [ImagePromptExampleGroup]
+        if !(editing && supportsReferenceEdit) {
+            builtin = ImagePromptExamples.textToImage
+        } else {
+            switch variant {
+            case .mageFlowEditTurbo: builtin = ImagePromptExamples.mageFlowEdit
+            default: builtin = ImagePromptExamples.genericEdit
+            }
         }
+        let custom = CustomPromptExamples.load(for: editing && supportsReferenceEdit ? "image-edit" : "image")
+        return builtin + custom
     }
 
     /// The resolution menu for the current mode. In EDIT mode an edit-capable
