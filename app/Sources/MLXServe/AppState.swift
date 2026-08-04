@@ -673,6 +673,18 @@ class AppState: ObservableObject {
         saveChatHistory()
     }
 
+    /// Drops every message from `count` onward, keeping only the first `count`.
+    /// Used by regenerate (drop the old user turn + reply so `runTurn` can
+    /// re-append a fresh copy) and by edit-and-resend (drop everything from
+    /// the edited message onward before resubmitting its new text).
+    func truncateMessages(in sessionId: UUID, keepingFirst count: Int) {
+        guard let sIdx = chatSessions.firstIndex(where: { $0.id == sessionId }),
+              count < chatSessions[sIdx].messages.count else { return }
+        chatSessions[sIdx].messages.removeSubrange(count...)
+        chatSessions[sIdx].updatedAt = Date()
+        saveChatHistory()
+    }
+
     func updateLastMessage(in sessionId: UUID, content: String? = nil, reasoning: String? = nil, streaming: Bool? = nil, usage: TokenUsage? = nil) {
         guard let sIdx = chatSessions.firstIndex(where: { $0.id == sessionId }),
               !chatSessions[sIdx].messages.isEmpty else { return }

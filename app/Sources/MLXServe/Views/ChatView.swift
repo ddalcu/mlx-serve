@@ -680,6 +680,7 @@ struct ChatDetailView: View {
     @EnvironmentObject var chatEngine: ChatTurnEngine
     @Environment(\.openWindow) private var openWindow
     @State private var inputText = ""
+    @State private var isNearBottom: Bool = true
     // The three toolbar toggles mirror the visible session's persisted state
     // (`ChatSession.enableThinking` / `.mode` / `.useMCP`). They're loaded from
     // the session on appear AND on every `sessionId` change, and written back on
@@ -1195,10 +1196,17 @@ struct ChatDetailView: View {
         (session?.messages.isEmpty ?? true) && composerState != .generatingHere
     }
 
+    /// Which reply Cmd+R / the footer's Regenerate button targets — the
+    /// last assistant message, so the button only ever shows on that one.
+    private var lastAssistantMessageId: UUID? {
+        session?.messages.last { $0.role == .assistant }?.id
+    }
+
     /// Greeting + discovery chips, one fixed-height block. The vertical slack
     /// lives OUTSIDE this view (two sibling Spacers in the body) — a Spacer
     /// nested in here shares space unevenly with the body's own trailing one,
     /// which is what pinned the whole group to the bottom of the window.
+
     private var emptyState: some View {
         VStack(spacing: 8) {
             Text("How can I help you today?")
@@ -1253,7 +1261,13 @@ struct ChatDetailView: View {
                                     },
                                     onDelete: {
                                         appState.deleteMessage(in: sessionId, messageId: m.id)
-                                    })
+                                    },
+                                    onEdit: (m.role == .user && session?.isExternalBridge != true)
+                                        ? { newText in editAndResend(messageId: m.id, newText: newText) }
+                                        : nil,
+                                    onRegenerate: (m.role == .assistant && m.id == lastAssistantMessageId)
+                                        ? { regenerateLastResponse() }
+                                        : nil)
                                 .id(m.id)
                             case .toolCall(let call, let results):
                                 ToolCallRow(call: call, results: results).id(call.id)
@@ -1405,6 +1419,18 @@ struct ChatDetailView: View {
             // The top spacer's sibling — see the empty-state branch above.
             if isEmptyConversation { Spacer(minLength: 0) }
         }
+        // Cmd+R — regenerate the last reply. A zero-size hidden button rather
+        // than a window-level `.commands` entry: it needs THIS tab's session
+        // and toolbar state, and disabling it here (rather than graying out a
+        // menu item elsewhere) is what keeps it from firing mid-stream or on
+        // an empty chat.
+        .background(
+            Button(action: regenerateLastResponse) { EmptyView() }
+                .keyboardShortcut("r", modifiers: .command)
+                .disabled(!canRegenerate)
+                .frame(width: 0, height: 0)
+                .opacity(0)
+        )
         .onDrop(of: [.image, .pdf, .audio], isTargeted: nil) { providers in
             for provider in providers {
                 if provider.hasItemConformingToTypeIdentifier(UTType.pdf.identifier) {
@@ -2176,9 +2202,18 @@ struct ChatDetailView: View {
             text = text.isEmpty ? pdfText : pdfText + "\n\n" + text
         }
 
-        // The toolbar toggles are this surface's DEFAULTS; the tab's agent (if
-        // any) overrides what it declared. One builder, so no field is read from
-        // a global here — see ChatTurnEngine.TurnConfig.
+        chatEngine.runTurn(sessionId: sessionId, userText: text,
+                           images: attachedImages, audio: attachedAudio,
+                           config: buildTurnConfig(),
+                           approval: { await requestToolApproval($0) })
+    }
+
+    /// The toolbar toggles are this surface's DEFAULTS; the tab's agent (if
+    /// any) overrides what it declared. One builder, so no field is read from
+    /// a global here — see ChatTurnEngine.TurnConfig. Shared by send, Cmd+R
+    /// regenerate, and edit-and-resend so all three run under identical
+    /// settings.
+    private func buildTurnConfig() -> ChatTurnEngine.TurnConfig {
         let resolved = appState.resolvedAgentSettings(
             agentId: session?.agentId,
             toolsEnabled: isAgentMode,
@@ -2187,11 +2222,44 @@ struct ChatDetailView: View {
             autoApprove: false,
             workingDirectory: session?.workingDirectory,
             disabledTools: ChatSession.disabledToolKinds(session?.disabledTools ?? []))
-        let config = ChatTurnEngine.TurnConfig.from(
+        return ChatTurnEngine.TurnConfig.from(
             resolved, documentIndex: appState.documentIndexes[sessionId])
-        chatEngine.runTurn(sessionId: sessionId, userText: text,
-                           images: attachedImages, audio: attachedAudio,
-                           config: config,
+    }
+
+    /// Cmd+R — regenerate the last reply. Mirrors the footer's Regenerate
+    /// button; both funnel through `ChatTurnEngine.regenerate`, which drops
+    /// the last user turn and resubmits it fresh.
+    private var canRegenerate: Bool {
+        server.status == .running && composerState != .generatingHere
+            && session?.isExternalBridge != true
+            && (session?.messages.contains { $0.role == .user } ?? false)
+    }
+
+    private func regenerateLastResponse() {
+        guard canRegenerate else { return }
+        isNearBottom = true
+        chatEngine.regenerate(sessionId: sessionId, config: buildTurnConfig(),
+                               approval: { await requestToolApproval($0) })
+    }
+
+    /// Edit a past user message in place, then resend it: everything from
+    /// that message onward (its old reply, any tool chain) is dropped and the
+    /// edited text runs as a brand-new turn — the standard "edit and resend"
+    /// behaviour rather than silently rewriting history the model already
+    /// answered.
+    private func editAndResend(messageId: UUID, newText: String) {
+        let trimmed = newText.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty,
+              let msgs = session?.messages,
+              let idx = msgs.firstIndex(where: { $0.id == messageId })
+        else { return }
+        let images = msgs[idx].images
+        let audio = msgs[idx].audio
+        isNearBottom = true
+        appState.truncateMessages(in: sessionId, keepingFirst: idx)
+        chatEngine.runTurn(sessionId: sessionId, userText: trimmed,
+                           images: images, audio: audio,
+                           config: buildTurnConfig(),
                            approval: { await requestToolApproval($0) })
         // Your own message always wins: sending from halfway up the history used
         // to leave you exactly there, because auto-follow was off and nothing
@@ -2387,8 +2455,18 @@ struct MessageBubble: View {
     /// a task run's transcript is a record, so it has no delete affordance
     /// rather than one that silently does nothing.
     var onDelete: (() -> Void)?
+    /// Edit this (user) message's text and resend it, dropping everything
+    /// that followed. nil for assistant messages and read-only surfaces —
+    /// same reasoning as `onDelete`.
+    var onEdit: ((String) -> Void)?
+    /// Regenerate this reply. Only ever set on the LAST assistant message —
+    /// the caller decides that, so the bubble itself doesn't need to know its
+    /// position in the transcript.
+    var onRegenerate: (() -> Void)?
     /// Explicit so the accordion HEADER can drive it, not just the chevron.
     @State private var thinkingExpanded = false
+    @State private var isEditing = false
+    @State private var editDraft = ""
 
     var body: some View {
         // A failure notice is not model output: it renders as its own card
@@ -2482,7 +2560,9 @@ struct MessageBubble: View {
                 // tables — and boxing it wastes the column's width and fights
                 // every block that wants the full measure. A tool-call summary
                 // keeps its card so it still reads as machinery, not prose.
-                if !message.content.isEmpty || message.isStreaming {
+                if isEditing, onEdit != nil {
+                    editingContent
+                } else if !message.content.isEmpty || message.isStreaming {
                     VStack(alignment: .leading, spacing: 4) {
                         if message.isAgentSummary {
                             Label("Tool Call", systemImage: "wrench.and.screwdriver")
@@ -2500,6 +2580,20 @@ struct MessageBubble: View {
                             GeneratingIndicator()
                         }
                     }
+                    // `.highPriorityGesture`, not `.onTapGesture` — the `Text`
+                    // above has `.textSelection(.enabled)`, which installs its
+                    // OWN double-click-to-select-word handling. A plain
+                    // `.onTapGesture(count: 2)` sits behind that in the
+                    // gesture hierarchy and never sees the second click, so
+                    // double-click silently did nothing. `highPriorityGesture`
+                    // makes this the one that wins.
+                    .highPriorityGesture(
+                        TapGesture(count: 2).onEnded {
+                            if onEdit != nil {
+                                startEditing()
+                            }
+                        }
+                    )
                     .padding(.horizontal, isBare ? 0 : ChatMetrics.bubblePaddingH)
                     .padding(.vertical, isBare ? 0 : ChatMetrics.bubblePaddingV)
                     .background(bubbleBackground)
@@ -2522,10 +2616,67 @@ struct MessageBubble: View {
         }
         .contextMenu {
             Button("Copy Message") { copyMessage() }
+            if onEdit != nil {
+                Button("Edit Message") { startEditing() }
+            }
+            if onRegenerate != nil {
+                Button("Regenerate") { onRegenerate?() }
+            }
             if onDelete != nil {
                 Button("Delete Message", role: .destructive) { onDelete?() }
             }
         }
+    }
+
+    /// Replaces the static bubble while editing: a growing multi-line field
+    /// pre-filled with the message's current text, Cancel / Save beneath it.
+    /// Save hands the new text to `onEdit`, which drops this message and
+    /// everything after it and resubmits — same shape as a fresh send.
+    private var editingContent: some View {
+        VStack(alignment: .trailing, spacing: 8) {
+            TextEditor(text: $editDraft)
+                .font(.body)
+                .scrollContentBackground(.hidden)
+                .frame(minHeight: 44, maxHeight: 220)
+                .padding(8)
+                .background(Color(nsColor: .controlBackgroundColor)) // Distinct surface fill
+                .clipShape(RoundedRectangle(cornerRadius: 10))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 10)
+                        .stroke(Color.accentColor.opacity(0.6), lineWidth: 1.5) // Glowing outline
+                )
+                .shadow(color: Color.black.opacity(0.25), radius: 6, x: 0, y: 3) // Depth
+            
+            HStack(spacing: 8) {
+                Button("Cancel") { cancelEdit() }
+                    .buttonStyle(.plain)
+                    .foregroundStyle(.secondary)
+                    .keyboardShortcut(.cancelAction)
+                
+                Button("Save") { commitEdit() }
+                    .buttonStyle(.borderedProminent)
+                    .disabled(editDraft.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+            .font(.caption)
+        }
+        .padding(4)
+        .frame(maxWidth: .infinity, alignment: .trailing)
+    }
+
+    private func startEditing() {
+        editDraft = message.content
+        isEditing = true
+    }
+
+    private func cancelEdit() {
+        isEditing = false
+        editDraft = ""
+    }
+
+    private func commitEdit() {
+        let text = editDraft
+        isEditing = false
+        onEdit?(text)
     }
 
     // MARK: - Bubble vs bare
@@ -2575,6 +2726,10 @@ struct MessageBubble: View {
 
             HStack(spacing: 2) {
                 footerButton("doc.on.doc", help: "Copy this reply") { copyMessage() }
+                if let onRegenerate {
+                    footerButton("arrow.clockwise", help: "Regenerate this reply (⌘R)",
+                                 action: onRegenerate)
+                }
                 if let onDelete {
                     footerButton("trash", help: "Delete this message from the conversation",
                                  action: onDelete)
