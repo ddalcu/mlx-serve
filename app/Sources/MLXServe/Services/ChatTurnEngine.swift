@@ -430,6 +430,24 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
         }
     }
 
+    /// Regenerate the last reply: drop the last user turn (and whatever
+    /// followed it — the old assistant reply, any tool-call chain) and
+    /// resubmit that same user text as a fresh turn. Reuses `runTurn` rather
+    /// than duplicating the plain/agent branching, so a regenerated turn is
+    /// indistinguishable from a freshly sent one.
+    func regenerate(sessionId: UUID, config: TurnConfig,
+                     approval: @escaping (APIClient.ToolCall) async -> Bool) {
+        guard let msgs = session(sessionId)?.messages,
+              let lastUserIdx = msgs.lastIndex(where: { $0.role == .user })
+        else { return }
+        let text = msgs[lastUserIdx].content
+        let images = msgs[lastUserIdx].images
+        let audio = msgs[lastUserIdx].audio
+        appState.truncateMessages(in: sessionId, keepingFirst: lastUserIdx)
+        runTurn(sessionId: sessionId, userText: text, images: images, audio: audio,
+                config: config, approval: approval)
+    }
+
     // MARK: - Plain chat
 
     private func runPlainTurn(sessionId: UUID, text: String,
