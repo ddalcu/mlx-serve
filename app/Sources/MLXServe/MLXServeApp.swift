@@ -298,6 +298,48 @@ struct MLXCoreApp: App {
                     NSWorkspace.shared.open(URL(fileURLWithPath: path))
                 }
             }
+
+            // Menu-bar twin of the chat's empty-state discovery chips
+            // (ChatEmptyState): every feature that otherwise lives only in
+            // the tray popover, reachable from the menu bar and Help-menu
+            // search. The media section iterates the SAME catalog as the
+            // chips so the two lists cannot drift.
+            CommandMenu("Tools") {
+                Button("Browse Models…") { openAndFocus("modelBrowser") }
+                    .keyboardShortcut("m", modifiers: [.command, .shift])
+
+                Button("Scheduled Tasks…") { openAndFocus("tasks") }
+                    .keyboardShortcut("t", modifiers: [.command, .shift])
+
+                Divider()
+
+                ForEach(ChatEmptyState.mediaItems) { item in
+                    if let windowId = item.windowId {
+                        Button("\(item.title)…") { openAndFocus(windowId) }
+                    }
+                }
+
+                Divider()
+
+                // DMG builds only — the MAS build can't detect or launch
+                // other apps' CLIs (same gate as the tray's Code button).
+                if BuildFeatures.current.cliLauncher {
+                    Button("Launch Claude Code…") {
+                        launchClaudeCodeWithPicker(
+                            baseURL: appState.server.baseURL,
+                            serverContextLength: appState.server.modelInfo?.contextLength)
+                    }
+                }
+
+                // No .keyboardShortcut here: ⌃Space is registered as a GLOBAL
+                // Carbon hotkey (QuickLauncherController); a menu key
+                // equivalent on the same combo would race it while the app is
+                // frontmost, so the combo rides the title instead.
+                Button("Quick Launcher (\(QuickLauncherHotKey.display))") {
+                    if !appState.quickLauncherEnabled { appState.quickLauncherEnabled = true }
+                    appState.quickLauncher.show()
+                }
+            }
         }
     }
 }

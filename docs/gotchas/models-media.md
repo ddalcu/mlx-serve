@@ -315,3 +315,52 @@ modality". Fix: `doLoadGenOnInferenceThread` re-peeks the dir's real type via
 guard lesson: `tests/test_minimax_h3.sh` now asserts the printed NUMBER sits
 in the staged band — the line's presence proved nothing, which is the same
 class as spec-decode engagement counts vs output equality.
+
+## The weight prefix was a config GUESS, and LFM2.5 nests without saying so (2026-08-04)
+
+`mlx-community/LFM2.5-2.6B-8bit` (and the nvfp4 sibling) refused to load:
+
+```
+Model: lfm2 (30 layers, 2048-dim, head_dim=64, 32h/8kv, 8-bit affine quant)
+Loaded 600 weights from 1 file(s)
+MISSING WEIGHT: model.embed_tokens.weight
+```
+
+All 600 weights were there. They just lived under `language_model.model.*`.
+
+`parseConfigFromJson`'s lfm2 arm picks the prefix the same way the gemma4 arm
+does — `if (root.get("text_config") != null) "language_model.model" else
+"model"` — and this config has NO `text_config`. It declares
+`architectures: ["Lfm2ForCausalLM"]`, a text-only 2.6B, and the only hint that
+anything is nested is an EMPTY `"vision_config": {}`. Reading nesting out of
+that is a coin flip: an empty vision_config is exactly as plausible on a flat
+checkpoint, and the same class already shipped in the opposite direction
+(a nested guess against flat weights).
+
+So the guess stops being the authority. `model.resolveWeightPrefix` runs at
+both trunk load sites (main.zig offline, scheduler.zig serve), right after
+`loadWeights` and before `Transformer.init`, and re-points the config when the
+configured prefix holds NOTHING and the other nesting has weights. Three things
+keep it from being able to break a checkpoint that loads today:
+
+- it only ever alternates between `model` and `language_model.model` — an arch
+  with its own prefix (`backbone`, `model.llm`, `""`) returns immediately;
+- it fires only when the configured prefix matches ZERO keys, so a real VL
+  checkpoint carrying both keeps what the config said;
+- the prefix match requires a `.` boundary, so `model_extra.*` is not a hit for
+  `model`.
+
+Same shape as `hy3ExpertContainer`: when two converters disagree about a name
+and config.json cannot settle it, probe the tensors.
+
+Both variants load and generate after the fix (8-bit 148 tok/s, nvfp4 247
+tok/s on an M-series 128 GB), thinking splits correctly into
+`reasoning_content` under `reasoning_effort`.
+
+Still open, and a SEPARATE gap: LFM2.5 tool calling. Its template emits
+Python-call syntax — `<|tool_call_start|>[get_weather(city="Paris")]<|tool_call_end|>` —
+which no arm of the parse chain knows, so a tools request comes back with
+empty content and no `tool_calls`. Its template also `raise_exception`s on
+tool-call `arguments` passed as a JSON STRING, which is what
+`serializeMessagesJson` emits — the Inkling rule in reverse, and a raise is the
+silent-fallback class.

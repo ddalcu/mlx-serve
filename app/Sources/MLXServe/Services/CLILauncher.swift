@@ -277,9 +277,6 @@ struct CLILauncherButton: View {
     /// the window; the window focuses a running session or starts one.
     let openSandboxAgent: (String) -> Void
 
-    private var budget: AgentBudget.Budget { AgentBudget.forServerContext(serverContextLength) }
-    private var entries: [AgentModelEntry] { AgentModelEntry.chatEntries(from: models) }
-
     @StateObject private var detector = CLILauncher()
 
     var body: some View {
@@ -290,27 +287,11 @@ struct CLILauncherButton: View {
                 Color.clear.frame(width: 0, height: 0)
             } else {
                 Menu {
-                    if !detector.available.isEmpty {
-                        Section("On this Mac") {
-                            ForEach(detector.available) { cli in
-                                Button {
-                                    detector.launchWithPicker(cli, baseURL: baseURL, servedModelId: servedModelId,
-                                                              budget: budget, entries: entries)
-                                } label: {
-                                    Label(cli.displayName, systemImage: cli.iconSystemName ?? "terminal")
-                                }
-                            }
-                        }
-                    }
-                    Section("In the sandbox") {
-                        ForEach(SandboxAgentRegistry.all) { spec in
-                            Button {
-                                openSandboxAgent(spec.id)
-                            } label: {
-                                Label("\(spec.displayName) in Sandbox", systemImage: "shippingbox")
-                            }
-                        }
-                    }
+                    CLILauncherMenuItems(detector: detector, baseURL: baseURL,
+                                         servedModelId: servedModelId,
+                                         serverContextLength: serverContextLength,
+                                         models: models,
+                                         openSandboxAgent: openSandboxAgent)
                 } label: {
                     HStack(spacing: TrayFooterMetrics.iconSpacing) {
                         Image(systemName: "terminal")
@@ -330,5 +311,46 @@ struct CLILauncherButton: View {
             }
         }
         .task { await detector.refresh() }
+    }
+}
+
+/// The launcher dropdown's BODY — the detected host CLIs plus the sandboxed
+/// agents. Shared by the tray's Code button and the chat empty state's Code
+/// Launcher chip: one list, so the two surfaces cannot drift (a CLI the tray
+/// gains that the chip never offers is the silent-hole class).
+@MainActor
+struct CLILauncherMenuItems: View {
+    @ObservedObject var detector: CLILauncher
+    let baseURL: String
+    let servedModelId: String
+    let serverContextLength: Int?
+    let models: [ModelInfo]
+    let openSandboxAgent: (String) -> Void
+
+    private var budget: AgentBudget.Budget { AgentBudget.forServerContext(serverContextLength) }
+    private var entries: [AgentModelEntry] { AgentModelEntry.chatEntries(from: models) }
+
+    var body: some View {
+        if !detector.available.isEmpty {
+            Section("On this Mac") {
+                ForEach(detector.available) { cli in
+                    Button {
+                        detector.launchWithPicker(cli, baseURL: baseURL, servedModelId: servedModelId,
+                                                  budget: budget, entries: entries)
+                    } label: {
+                        Label(cli.displayName, systemImage: cli.iconSystemName ?? "terminal")
+                    }
+                }
+            }
+        }
+        Section("In the sandbox") {
+            ForEach(SandboxAgentRegistry.all) { spec in
+                Button {
+                    openSandboxAgent(spec.id)
+                } label: {
+                    Label("\(spec.displayName) in Sandbox", systemImage: "shippingbox")
+                }
+            }
+        }
     }
 }

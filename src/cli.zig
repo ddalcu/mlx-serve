@@ -529,7 +529,7 @@ pub fn cmdList(allocator: std.mem.Allocator, io: std.Io) !void {
     var count: usize = 0;
     var it = dir.iterate();
     while (it.next(io) catch null) |entry| {
-        if (entry.kind != .directory) continue;
+        if (!treeEntryDescends(entry.kind)) continue;
         if (entry.name.len == 0 or entry.name[0] == '.') continue;
         var sub = dir.openDir(io, entry.name, .{ .iterate = true }) catch continue;
         defer sub.close(io);
@@ -541,7 +541,7 @@ pub fn cmdList(allocator: std.mem.Allocator, io: std.Io) !void {
         // org/ level: one more hop down.
         var sub_it = sub.iterate();
         while (sub_it.next(io) catch null) |sub_entry| {
-            if (sub_entry.kind != .directory) continue;
+            if (!treeEntryDescends(sub_entry.kind)) continue;
             var leaf = sub.openDir(io, sub_entry.name, .{ .iterate = true }) catch continue;
             defer leaf.close(io);
             if (!isModelDir(io, allocator, &leaf)) continue;
@@ -554,6 +554,14 @@ pub fn cmdList(allocator: std.mem.Allocator, io: std.Io) !void {
     if (count == 0) {
         try w.print("(none) — try: mlx-serve pull gemma4\n", .{});
     }
+}
+
+/// A tree-walk entry worth descending into: a real directory OR a symlink
+/// (a checkpoint moved to an external drive and linked back — the H3 mirrors
+/// live that way; openDir resolves the link, and model_discovery's own walk
+/// already accepts both kinds).
+fn treeEntryDescends(kind: std.Io.File.Kind) bool {
+    return kind == .directory or kind == .sym_link;
 }
 
 fn isModelDir(io: std.Io, allocator: std.mem.Allocator, dir: *std.Io.Dir) bool {
@@ -1137,4 +1145,30 @@ test "cli: an unparsed argument is classified, never silently ignored" {
         try testing.expect(r.hint().len > 0);
     }
     try testing.expect(std.mem.indexOf(u8, ArgReject.equals_form.hint(), "separate argument") != null);
+}
+
+test "cli: list tree walk descends into symlinked model dirs" {
+    // Moving a big checkpoint to an external drive and symlinking it back is
+    // a supported layout (the H3 mirrors live that way): model_discovery's
+    // walk accepts .sym_link entries, but `list` had its own private walk
+    // that silently skipped them — both MiniMax mirrors vanished from `list`
+    // while the server kept serving them. Both loops route through ONE
+    // predicate now.
+    try testing.expect(treeEntryDescends(.directory));
+    try testing.expect(treeEntryDescends(.sym_link));
+    try testing.expect(!treeEntryDescends(.file));
+
+    // Source scan: the org-level and leaf-level loops in listModels must both
+    // consult the predicate — a reintroduced raw `!= .directory` check is the
+    // regression this pins. Needle split so the scan cannot match itself.
+    const src = @embedFile("cli.zig");
+    const needle = "treeEntry" ++ "Descends(";
+    var found: usize = 0;
+    var idx: usize = 0;
+    while (std.mem.indexOfPos(u8, src, idx, needle)) |p| {
+        found += 1;
+        idx = p + needle.len;
+    }
+    // 1 definition + 3 in this test + at least 2 call sites in the walk.
+    try testing.expect(found >= 6);
 }

@@ -1216,6 +1216,7 @@ pub fn main(init: std.process.Init) !void {
         else
             try model_mod.loadWeights(io, allocator, model_dir);
         defer weights.deinit();
+        model_mod.resolveWeightPrefix(config, &weights);
 
         var xfm = try transformer_mod.Transformer.init(io, allocator, config.*, &weights);
         defer xfm.deinit();

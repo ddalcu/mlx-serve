@@ -257,7 +257,9 @@ struct VideoGenView: View {
         let durationSec = Double(s.numFrames) / Double(model.fps)
         // With a clip attached, a one-stage preset runs two-stage on the wire
         // (audio-to-video requires it) — say so instead of lying "1-stage".
-        let label = (audioURL != nil && s.mode == .oneStage) ? "2-stage (audio-to-video)" : modeLabel(s.mode)
+        // Gated on the capability so a stale clip can't make H3 claim it.
+        let label = (model.supportsAudioInput && audioURL != nil && s.mode == .oneStage)
+            ? "2-stage (audio-to-video)" : modeLabel(s.mode)
         return "\(label), \(s.steps) steps, \(s.numFrames) frames (~\(String(format: "%.1f", durationSec))s)"
     }
 
@@ -958,6 +960,16 @@ struct VideoGenView: View {
         quality = model.defaultQuality
         resolution = model.defaultResolution
         fps = model.fps
+        // A clip attached under LTX must not survive a switch to a backend
+        // that takes no audio input: the section hides, so the user can't
+        // clear it, the quality hint claims "audio-to-video", and an
+        // unreadable file still hard-errors a generate it wouldn't reach.
+        // (The first-frame image deliberately survives — every backend
+        // supports keyframe conditioning.)
+        if !model.supportsAudioInput {
+            clearAudio()
+            audioSource = .none
+        }
         applyQualityDefaults()
     }
 
@@ -978,9 +990,13 @@ struct VideoGenView: View {
     /// cap (`8N+1` ladder) — but no RAM-based clamping anymore. The user
     /// gets a soft warning instead.
     private func clampFramesToRAM() {
-        if numFrames > model.maxFrames,
-           let snap = model.frameOptions.last(where: { $0 <= model.maxFrames }) {
-            numFrames = snap
+        guard let lo = model.frameOptions.first, let hi = model.frameOptions.last else { return }
+        if numFrames > hi {
+            numFrames = model.frameOptions.last(where: { $0 <= hi }) ?? hi
+        } else if numFrames < lo {
+            // Stale persisted value below a raised floor (e.g. H3's 5→124) —
+            // the slider can't self-correct since it only reads `numFrames`.
+            numFrames = lo
         }
     }
 
@@ -1002,7 +1018,10 @@ struct VideoGenView: View {
             cfgScale: cfgScale,
             stgScale: stgScale,
             firstFrameImagePath: firstFrameImageURL?.path,
-            audioPath: audioURL?.path,
+            // Belt-and-braces with the requestBody gate: a clip must never
+            // reach the transcode (whose failure is a hard error) on a
+            // backend that generates its own soundtrack.
+            audioPath: model.supportsAudioInput ? audioURL?.path : nil,
             keepResident: keepResident,
             bestQuality: bestQuality,
             lanModelId: lanModel,

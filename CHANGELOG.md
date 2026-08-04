@@ -1,5 +1,39 @@
 # Changelog
 
+## v26.8.2 — MiniMax-H3 video with its own soundtrack, LFM2.5
+
+### MiniMax-H3 (Hailuo 3.0) generates video and audio together
+
+- One prompt gives you a clip and a matching stereo soundtrack, produced in the same pass rather than dubbed on afterwards. Describe the scene, then what you want to hear after `overall_soundscape:`.
+- Two builds on Hugging Face: 8-bit at a 69 GB download (44 GB while running) and 4-bit at 40 GB (26 GB), which fits a 32 GB Mac. Same generation speed either way, the 4-bit is a little softer.
+- It is genuinely slow. The recommended 1344x768 at 124 frames takes about 50 minutes on an M4 Max, and 209 frames closer to two hours. That is with the fast recipe on, which is the default and about 2.8x quicker than turning it off in Settings.
+
+### LFM2.5 support
+
+- Liquid AI's LFM2.5 runs end to end: chat, thinking and tool calls.
+- It writes tool calls in Python syntax rather than JSON, so numbers, lists and true/false now arrive as the types your tool actually declared instead of strings.
+- The mlx-community 8-bit and nvfp4 builds load now. They used to stop at startup with a missing-weight error.
+
+### Thinking no longer shows up as your answer
+
+- Gemma could reply to a short question with an empty message and file the actual answer as its private reasoning. "What is 23 times 17" came back blank.
+- LFM2.5 streamed its entire chain of thought as the visible reply, with and without tools.
+- Both were streaming only, so the same question answered correctly if you turned streaming off. Fixed in both directions.
+
+### An empty chat shows what else the app does
+
+- Media generation, the Model Browser, Tasks and the coding-agent launcher only lived in the menu-bar tray, and people told us they never found them.
+- They are chips under the greeting now, and they disappear as soon as the conversation starts.
+
+### Fixes
+
+- Checkpoints kept on an external drive and linked back show up in `mlx-serve list` again. The server was already serving them.
+- Picking a LAN-shared video model now uses that model's own resolutions and frame counts instead of whatever was selected locally, which could produce bad clips that looked like a model problem.
+- Video generation shows a live progress bar again instead of a dead card for the whole run, and cancelling actually stops the GPU.
+- Loading MiniMax-H3 in the app read it as a chat model and failed on a missing tensor.
+
+---
+
 ## v26.8.1 - New DeepseekV4 Flash optimizations, Qwen3 embeddings
 
 - **DeepSeek V4 got a lot faster on our engine.** Serial decode went from 22.6 to about 30 tokens per second on an M4 Max (31.8 with fast decode on), and prefill roughly doubled to about 270 tokens per second at 8K. DSpark was retuned and now also works on sampled requests, which is what agent CLIs actually send: with it on, code, lists and editing decode at **54-68 tokens per second, about twice serial.**

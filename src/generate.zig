@@ -4169,7 +4169,10 @@ pub const Generator = struct {
 
     /// Draft-proposal sampler for a round: greedy targets keep greedy drafts
     /// (temp-0 identity contract); stochastic targets draft from the fixed
-    /// sharpened distribution unless greedy is forced.
+    /// sharpened distribution unless greedy is forced. The constants are not
+    /// tunable: swept 2026-08-04 on the oQ4e head (prose@0.6, forced depth 3,
+    /// sampled drafts) at draft temp 0.6/0.7/0.85/1.0 and per-draft
+    /// acceptance was flat at 49.7-56.9% — no arm beat 0.6.
     pub fn mtpDraftSamplingFor(target: SamplingParams, force_greedy: bool) SamplingParams {
         var d = target;
         if (force_greedy or target.temperature <= 0.01) {

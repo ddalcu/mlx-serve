@@ -204,8 +204,18 @@ struct VideoGenSettings: Codable, Equatable {
 }
 
 extension VideoGenSettings {
+    /// A persisted LAN pick ("lan:<model>@<peer>") whose base id matches a
+    /// local preset resolves to THAT preset — the pane gates ladders,
+    /// resolutions and request capability-gating on this value, and the old
+    /// blanket LTX fallback sent a remote H3 off-canvas sizes and frame
+    /// counts below its trained floor.
     var resolvedModel: VideoModelPreset {
-        VideoModelPreset.all.first { $0.id == modelId } ?? .ltx23Q4
+        if let local = VideoModelPreset.all.first(where: { $0.id == modelId }) { return local }
+        if let lan = LanPick.lanId(modelId),
+           let matched = VideoModelPreset.all.first(where: { $0.id == LanPick.base(of: lan) }) {
+            return matched
+        }
+        return .ltx23Q4
     }
 
     func resolvedResolution(for m: VideoModelPreset) -> ResolutionOption {
@@ -226,6 +236,7 @@ extension VideoGenSettings {
         if let v = try c.decodeIfPresent(Double.self, forKey: .stgScale) { stgScale = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .seed) { seed = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .keepResident) { keepResident = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .bestQuality) { bestQuality = v }
         if let v = try c.decodeIfPresent(String.self, forKey: .loraPath) { loraPath = v }
         if let v = try c.decodeIfPresent(Double.self, forKey: .loraScale) { loraScale = v }
     }

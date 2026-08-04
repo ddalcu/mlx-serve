@@ -161,6 +161,24 @@ run_model() {
 
     echo -e "${BLUE}=== [$logical] $display ===${NC}"
 
+    # The table's path is one PLACE the checkpoint may live, not the only one:
+    # the same model is equally at home under ~/.mlx-serve/models (the app's
+    # single download root) or ~/.lmstudio/models. A matrix arm that skips
+    # because a model sits in the other root is silently missing coverage —
+    # the gemma4-e4b arm skipped for exactly that reason while the checkpoint
+    # was present (2026-08-04). Try the sibling root before giving up.
+    if [ ! -e "$path" ]; then
+        case "$path" in
+            "$HOME/.lmstudio/models/"*) alt="$HOME/.mlx-serve/models/${path#$HOME/.lmstudio/models/}" ;;
+            "$HOME/.mlx-serve/models/"*) alt="$HOME/.lmstudio/models/${path#$HOME/.mlx-serve/models/}" ;;
+            *) alt="" ;;
+        esac
+        if [ -n "$alt" ] && [ -e "$alt" ]; then
+            echo -e "${DIM:-}  (found under the sibling model root)${NC}"
+            path="$alt"
+        fi
+    fi
+
     if [ "$engine" = "gguf" ] && [ ! -f "$path" ]; then
         echo -e "${YELLOW}SKIP${NC}: GGUF not found: $path"
         return 0

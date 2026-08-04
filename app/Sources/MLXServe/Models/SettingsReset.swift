@@ -30,9 +30,10 @@ enum SettingsReset {
     static func fields(for category: SettingsCategory) -> [SettingsFieldReset] {
         switch category {
         // Model Folders' extra scan path lives on `DownloadManager.customRoot`,
-        // not in ServerOptions; Updates holds no settings. Neither offers a
-        // Reset button (`isResettable`), rather than a button that does nothing.
-        case .modelFolders, .updates:
+        // not in ServerOptions; Updates holds no settings, and About is links
+        // only. None offers a Reset button (`isResettable`), rather than a
+        // button that does nothing.
+        case .modelFolders, .updates, .about:
             return []
 
         case .server:

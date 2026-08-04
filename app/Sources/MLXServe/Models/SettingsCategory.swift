@@ -27,6 +27,10 @@ enum SettingsCategory: String, CaseIterable, Identifiable, Hashable {
     case sandbox
     case messaging
     case updates
+    /// Links out to the project. Deliberately its own category rather than
+    /// rows inside Updates: that section is `selfUpdate`-gated, so on a Mac
+    /// App Store build these would never render.
+    case about
 
     var id: String { rawValue }
 
@@ -46,6 +50,7 @@ enum SettingsCategory: String, CaseIterable, Identifiable, Hashable {
         case .sandbox:           return "Agent Sandbox"
         case .messaging:         return "Messaging — Telegram bot"
         case .updates:           return "Updates"
+        case .about:             return "About mlx-serve"
         }
     }
 
@@ -76,6 +81,7 @@ enum SettingsCategory: String, CaseIterable, Identifiable, Hashable {
         case .sandbox:           return "shield.lefthalf.filled"
         case .messaging:         return "paperplane"
         case .updates:           return "arrow.down.circle"
+        case .about:             return "star"
         }
     }
 

@@ -875,9 +875,15 @@ extension MediaGenServiceTests {
             XCTAssertEqual(n % 17, 5, "\(n) is not on the 17k+5 ladder")
             XCTAssertLessThanOrEqual(n, h3.maxFrames)
         }
-        XCTAssertEqual(h3.frameOptions.first, 5)
-        XCTAssertTrue(h3.frameOptions.contains(56))
+        // Floor is 124 (the reference node's own trained-range start), not
+        // the raw ladder's mathematical floor of 5 — below it the model
+        // generates off-distribution, so the picker must not offer it.
+        XCTAssertEqual(h3.frameOptions.first, 124)
         XCTAssertTrue(h3.frameOptions.contains(124))
+        // Ceiling is our own validated max: the frame count behind the
+        // confirmed-good rap demo at 1344x768, not the reference docs' wider
+        // (untested-by-us) 362 claim.
+        XCTAssertTrue(h3.frameOptions.contains(209))
 
         // Every quality preset's frame count must land ON the ladder, or the
         // Frames picker renders blank for that tier.
@@ -932,14 +938,17 @@ extension MediaGenServiceTests {
             model: .minimaxH3, prompt: "a cat", width: 256, height: 256,
             numFrames: 56, fps: 24, mode: .oneStage, steps: 30,
             cfgScale: 1.0, loraPath: "/tmp/some.safetensors")
+        // audioB64 present: a stale in-memory clip from an earlier LTX pick
+        // must never reach a backend that generates its own soundtrack.
         let body = VideoGenService.requestBody(
             model: "m", prompt: "a cat", request: h3,
-            firstFrameB64: nil, audioB64: nil)
+            firstFrameB64: nil, audioB64: "QUJD")
 
         XCTAssertNil(body["pipeline"], "H3 has no pipeline modes")
         XCTAssertNil(body["cfg_scale"], "H3 is CFG-distilled")
         XCTAssertNil(body["stg_scale"])
         XCTAssertNil(body["lora_path"], "H3 has no adapter format")
+        XCTAssertNil(body["audio"], "H3 takes no audio input")
         // The fields every backend needs must still be there.
         for k in ["model", "prompt", "num_frames", "height", "width", "steps", "seed"] {
             XCTAssertNotNil(body[k], "\(k) must always be sent")

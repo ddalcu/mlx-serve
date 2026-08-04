@@ -6052,7 +6052,14 @@ fn handleStreamingGeneration(
 
     // Template-opened think block (Qwen 3.5/3.6): unclosed buffered output is
     // reasoning, never content (mirrors the non-streaming split policy).
-    const opens_think = enable_thinking and promptOpensThink(allocator, lm, tok, prompt_ids);
+    // `prompt_opened_think` drops the `enable_thinking` conjunct on purpose:
+    // whether the prompt ends inside a think block is a property of the
+    // RENDERED BYTES. LFM2.5 pre-opens `<think>` unconditionally, so with
+    // thinking off its reasoning is tag-free prose the gate flushed as the
+    // visible answer (live 2026-08-04). Families that gate the opener on
+    // enable_thinking render the closed signature and stay false here.
+    const prompt_opened_think = promptOpensThink(allocator, lm, tok, prompt_ids);
+    const opens_think = enable_thinking and prompt_opened_think;
 
     // Pick the speculative-decoding mode (regular / PLD / drafter). The
     // per-token state machine below is driven by `StreamingTokenStream`,
@@ -6145,6 +6152,14 @@ fn handleStreamingGeneration(
     defer think_buf.deinit(allocator);
     var think_close_tag: []const u8 = "</think>"; // will be updated if Gemma 4 format detected
     var skipped_think_open = false; // track if we've skipped the initial think tag
+    // Positive evidence the model itself emitted a think OPENER. Distinct
+    // from `skipped_think_open`, whose else-branch also fires for "no known
+    // opener — the template must have injected one", which is the very case
+    // that has to be told apart at the end-of-stream flush below.
+    var saw_think_open = false;
+    // Bytes of THIS turn's reasoning already streamed. The tools path emits the
+    // thought incrementally now, so every later emit site sends the remainder.
+    var reasoning_streamed: usize = 0;
     var think_tokens: i32 = 0; // count of tokens generated in think block
     var budget_exhausted = false; // true when reasoning budget hit
 
@@ -6260,9 +6275,30 @@ fn handleStreamingGeneration(
                 // must be held, a completed think block to split, or visible
                 // prose to flush. Hermetically pinned per recorded model family
                 // by the format corpus streaming-gate test.
-                switch (chat_mod.streamThinkGate(buf, enable_thinking, think_closed)) {
+                switch (chat_mod.streamThinkGate2(buf, enable_thinking, think_closed, prompt_opened_think)) {
                     .hold_thinking => {
-                        // Incomplete thinking block — keep buffering until closed
+                        // Stream the thought AS IT ARRIVES instead of holding the
+                        // whole block. Safe here by construction:
+                        // `streamShouldBufferForTools` returned false just above,
+                        // so the buffer carries no tool markup and no partial
+                        // marker at its tail — these bytes are reasoning and
+                        // nothing else. Without it a tools request shows NOTHING
+                        // until `</think>` (measured 4.4 s on a 2.6B, and it grows
+                        // with the thought) while the no-tools path is already
+                        // streaming at 0.05 s.
+                        //
+                        // A reasoning BUDGET keeps the old buffering: capping what
+                        // the client is allowed to see cannot be reconciled with
+                        // having already sent it.
+                        if (enable_thinking and reasoning_budget < 0) {
+                            const so_far = chat_mod.splitThinkBlock(buf, true, opens_think);
+                            if (so_far.reasoning_content) |rc| {
+                                if (chat_mod.unstreamedReasoning(rc, reasoning_streamed)) |fresh| {
+                                    try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = fresh }, null, null, null);
+                                    reasoning_streamed = rc.len;
+                                }
+                            }
+                        }
                     },
                     .split_think => {
                         // Complete thinking block — split into reasoning + content
@@ -6273,9 +6309,14 @@ fn handleStreamingGeneration(
                         think_closed = true;
                         if (enable_thinking) {
                             if (split.reasoning_content) |rc| {
-                                try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = rc }, null, null, null);
+                                if (chat_mod.unstreamedReasoning(rc, reasoning_streamed)) |fresh| {
+                                    try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = fresh }, null, null, null);
+                                }
                             }
                         }
+                        // Block done and `text_buf` was just cleared — a thought
+                        // re-opened later in the turn starts counting from zero.
+                        reasoning_streamed = 0;
                         if (split.content.len > 0) {
                             try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = split.content }, null, null, null);
                         }
@@ -6294,6 +6335,41 @@ fn handleStreamingGeneration(
                 }
             }
             // Otherwise keep buffering — tool call may be in progress
+        } else if (!enable_thinking and prompt_opened_think and !think_closed) {
+            // Thinking OFF, but the TEMPLATE opened a think block anyway.
+            // LFM2.5 renders `…assistant\n<think>` unconditionally (no
+            // enable_thinking branch exists in it), so the model always
+            // reasons and the opener never appears in the OUTPUT — this
+            // stream used to fall through to the plain-content arm below and
+            // deliver the entire chain-of-thought as the answer (live
+            // 2026-08-04; non-streaming was always correct because the
+            // `</think>` is present by the time the text is split).
+            //
+            // Deliberately its OWN arm rather than a widened condition on the
+            // reasoning arm below: that one EMITS reasoning_content, and with
+            // thinking off the block must be DROPPED. Nothing here can run
+            // when thinking is on, so the reasoning path is untouched.
+            //
+            // Only the `</think>` family is checked for the close because
+            // `promptTailOpensThink` only matches `<think`-family OPENERS —
+            // Gemma's `<|channel>thought` never sets the flag, so this arm is
+            // unreachable for it. Pinned by "promptTailOpensThink does not
+            // match Gemma's channel opener": extend that detection and this
+            // close check needs `<channel|>` too, or a channel-family model
+            // would hold its whole turn waiting for a tag that never arrives.
+            defer allocator.free(token_text);
+            try think_buf.appendSlice(allocator, token_text);
+            if (chat_mod.indexOfThinkCloseTag(think_buf.items, 0)) |close| {
+                const after = std.mem.trimStart(u8, think_buf.items[close.pos + close.len ..], "\n \t\r");
+                think_closed = true;
+                in_think_block = false;
+                if (after.len > 0) {
+                    try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = after }, null, null, null);
+                }
+                think_buf.clearRetainingCapacity();
+            }
+            // No close tag yet (or the generation was cut inside the block):
+            // emit nothing. A truncated thought is never content.
         } else if (enable_thinking and in_think_block) {
             // Inside <think> block — stream as reasoning_content with </think> detection
             defer allocator.free(token_text);
@@ -6308,6 +6384,7 @@ fn handleStreamingGeneration(
                 if (chat_mod.thinkOpenTagLenAt(think_buf.items)) |olen| {
                     // Remove the opener (<think> or the Hy3-suffixed form) and
                     // any leading newline.
+                    saw_think_open = true;
                     var skip: usize = olen;
                     while (skip < think_buf.items.len and think_buf.items[skip] == '\n') skip += 1;
                     const remaining = try allocator.dupe(u8, think_buf.items[skip..]);
@@ -6318,6 +6395,7 @@ fn handleStreamingGeneration(
                 } else if (std.mem.startsWith(u8, think_buf.items, "<|content_thinking|>")) {
                     // Inkling thinking message (opener is ONE special token) —
                     // the message closes with <|end_message|>.
+                    saw_think_open = true;
                     think_close_tag = "<|end_message|>";
                     var skip: usize = "<|content_thinking|>".len;
                     while (skip < think_buf.items.len and think_buf.items[skip] == '\n') skip += 1;
@@ -6328,6 +6406,7 @@ fn handleStreamingGeneration(
                     skipped_think_open = true;
                 } else if (think_buf.items.len >= 17 and std.mem.startsWith(u8, think_buf.items, "<|channel>thought")) {
                     // Gemma 4 think format — switch close tag
+                    saw_think_open = true;
                     think_close_tag = "<channel|>";
                     var skip: usize = 17; // len of "<|channel>thought"
                     while (skip < think_buf.items.len and think_buf.items[skip] == '\n') skip += 1;
@@ -6456,8 +6535,14 @@ fn handleStreamingGeneration(
 
     // Flush any remaining think buffer
     if (!client_gone and enable_thinking and think_buf.items.len > 0) {
-        if (in_think_block) {
-            // Never found </think> — flush as reasoning
+        // No close tag arrived. Reasoning ONLY with positive evidence a block
+        // was open — the prompt injected the opener, or the model emitted one.
+        // `in_think_block` alone is not that evidence: it STARTS true whenever
+        // thinking was requested, so a Gemma turn answered directly (its
+        // template renders a bare `<|turn>model` and lets the model decide)
+        // shipped its whole answer as reasoning with EMPTY content, while
+        // non-streaming returned it correctly (live 2026-08-04).
+        if (chat_mod.streamTailIsReasoning(in_think_block, prompt_opened_think, saw_think_open)) {
             try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = think_buf.items }, null, null, null);
         } else {
             try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = think_buf.items }, null, null, null);
@@ -6501,7 +6586,7 @@ fn handleStreamingGeneration(
             // Emit reasoning_content before tool calls if thinking is enabled
             if (enable_thinking) {
                 const think_split = chat_mod.splitThinkBlock(gen_text, true, opens_think and !think_closed);
-                if (think_split.reasoning_content) |reasoning| {
+                if (chat_mod.unstreamedReasoning(think_split.reasoning_content orelse "", reasoning_streamed)) |reasoning| {
                     // Apply reasoning budget truncation if set
                     const final_reasoning = if (reasoning_budget >= 0) blk: {
                         const r_ids = try tok.encode(allocator, reasoning);
@@ -6556,7 +6641,7 @@ fn handleStreamingGeneration(
                 defer if (flush_norm) |n| allocator.free(n);
                 const flush_text: []const u8 = flush_norm orelse full_text.items;
                 const think_split = chat_mod.splitThinkBlock(flush_text, true, opens_think and !think_closed);
-                if (think_split.reasoning_content) |reasoning| {
+                if (chat_mod.unstreamedReasoning(think_split.reasoning_content orelse "", reasoning_streamed)) |reasoning| {
                     // Apply reasoning budget truncation if set
                     const final_reasoning = if (reasoning_budget >= 0) blk: {
                         const r_ids = try tok.encode(allocator, reasoning);
@@ -9340,7 +9425,10 @@ fn handleAnthropicStreaming(
     // the generation prompt): the output's thinking carries NO opener tag.
     // Needed up front by the tools branch — by the time the close tag is the
     // only evidence, visible-text flushing has already leaked the thoughts.
-    const opens_think = enable_thinking and promptOpensThink(allocator, lm, tok, prompt_ids);
+    // See the streaming chat site for why the prompt fact is NOT ANDed with
+    // enable_thinking (LFM2.5's unconditional pre-opened `<think>`).
+    const prompt_opened_think = promptOpensThink(allocator, lm, tok, prompt_ids);
+    const opens_think = enable_thinking and prompt_opened_think;
     // Set once the buffered think block has been split + emitted (tools
     // branch). Releases the buffer hold AND tells the end-of-stream split
     // that the remaining text has no template-opened semantics.
@@ -9456,7 +9544,7 @@ fn handleAnthropicStreaming(
                 // streamed as visible text_deltas and a raw `</think>` leaked
                 // into Claude Code transcripts). Hermetically pinned per
                 // recorded model family by the corpus streaming-gate test.
-                switch (chat_mod.streamThinkGate(buf, enable_thinking, think_closed)) {
+                switch (chat_mod.streamThinkGate2(buf, enable_thinking, think_closed, prompt_opened_think)) {
                     .hold_thinking => {
                         // Incomplete thinking — keep buffering until closed
                     },

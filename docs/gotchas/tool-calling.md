@@ -183,3 +183,238 @@ needs an allocation the alloc-free `ThinkSplit` contract doesn't have, and Gemma
 template strips history reasoning, so it is a rendering wart, not a prompt
 contaminant). Second gap: streaming with NO tools declared has no buffer to cut from,
 so a model emitting call markup unprompted still streams it.
+
+## LFM2.5: a pythonic call grammar, and a template that always thinks (2026-08-04)
+
+Two separate bugs, both surfaced by getting `mlx-community/LFM2.5-2.6B-8bit`
+serving. Neither is a parser tolerance failure — both are cases where a new
+template family carries a fact our pipeline had no way to learn.
+
+### 1. The tool-call grammar
+
+A tools request came back with empty content and no `tool_calls`. Raw output,
+captured by rendering the model's own template offline and posting it to
+`/v1/completions` so nothing in the tool pipeline could touch it:
+
+```
+</think><|tool_call_start|>[get_weather(city='Paris', days=3, metric=True, tags=['trip', 'eu'])]<|tool_call_end|>
+```
+
+Nothing in `parseToolCalls` speaks that. The wrapper was being cut by
+`trimLeakedToolMarkup` (it already lists the `<|tool_call` prefix for Gemma),
+which is why the failure presented as empty content rather than a leak — the
+safety net did its job and there was nothing behind it.
+
+The load-bearing detail is the VALUES. `format_arg_value` in the template
+renders strings as Python reprs but containers via `tojson`, so a reasonable
+guess is "strings are pythonic, everything else is JSON". The model does not
+agree: it emits `True` and `['trip', 'eu']`, full repr. A JSON-only value
+reader gets the boolean and the array — the two commonest non-string argument
+types — wrong on the first real call. So `pythonicLiteral` parses the literal
+set (quoted strings either way, `True`/`False`/`None`, ints, floats, lists,
+dicts) and types the value at parse time. In this grammar the type is
+knowable from the spelling, so the schema never has to be consulted.
+
+Everything structural runs through one quote-and-depth-aware scanner
+(`pythonicScan`), because the arg separator, the `=`, the dict `:` and the
+closing paren all need the same blindness to a separator sitting inside a
+value — `shell(cmd='ls -la (tmp), [x]')` breaks a naive scan in three places
+at once.
+
+Additive by construction, which was the whole point given how much live
+tolerance the existing arms encode: `<|tool_call_start|>` is emitted by no
+other family, the generic `<tool` scan never sees it (Gemma keys the exact
+`<|tool_call>`, with the `>`), and both the streaming buffer gate and the
+leaked-markup cut already covered it through the `<|tool_call` prefix. The
+only wiring was one call in `parseToolCalls`.
+
+### 2. The template thinks whether or not you asked
+
+With the parser in, streaming still delivered the model's entire
+chain-of-thought as the answer — with and without tools — while non-streaming
+was clean. The split:
+
+```
+{%- if add_generation_prompt -%}
+    {{- "<|im_start|>assistant\n<think>" -}}
+{%- endif -%}
+```
+
+No `enable_thinking` branch anywhere in the template. LFM2.5 always reasons.
+So with thinking off the opener is in the PROMPT and never in the output, and
+the model's first tokens are tag-free prose that happens to be reasoning.
+Non-streaming survives because by the time it splits, the `</think>` has
+arrived and the leading strip finds it. Streaming has to decide live, and
+`streamThinkGate`'s only signal was `enable_thinking`.
+
+`server.promptOpensThink` already computed exactly the missing fact, but every
+call site ANDed it with `enable_thinking` — so the one case that needed it was
+the one case it was suppressed in. Whether a prompt ends inside a think block
+is a property of the rendered bytes, not of our request flag.
+
+Two changes, both shaped for containment because this is the layer that must
+not move:
+
+- `chat.streamThinkGate2` takes the fact as a 4th argument; the 3-arg
+  `streamThinkGate` stays as "no prompt opener", so every existing call site
+  and test pins the behavior it always had (a test asserts the two agree over
+  the old cases, both flags, both directions).
+- The thinking-OFF case gets its OWN stream arm rather than widening the
+  reasoning arm — that one EMITS `reasoning_content`, and with thinking off
+  the block must be dropped. Nothing in the new arm can run when thinking is
+  on.
+
+The term can only fire on thinking-OFF plus a literal open tag at the prompt
+tail. A scan of every local checkpoint's template found LFM2.5 is the only one
+where that combination is reachable — everything else renders the closed
+`<think></think>` signature when thinking is off, which `promptTailOpensThink`
+already returns false for. Verified live on Qwen3.6-27B across all four
+stream × thinking × tools combinations, plus `test_thinking_streaming.sh`
+(13/13), `test_thinking_tools.sh` (27/27) and
+`test_messages_stream_thinking_tools.sh` (6/6).
+
+Lesson for the next family: check whether its think opener is CONDITIONAL
+before assuming the request flag describes what the model is doing.
+
+### 3. Issue #94 was a stale comment
+
+Filed against `coerceToolArgsToSchema` on the strength of its doc comment
+("Contract: only SCALARS are touched"). The array/object arm had shipped in
+60ba5ec two weeks earlier; the comment never got updated. The container
+coercion is now pinned by a test named for the issue, and the comment
+describes the code. A contract comment is read as a specification — by people
+and by whatever is comparing your implementation against another engine's.
+
+## `in_think_block` started from the request flag, not the prompt (Gemma, 2026-08-04)
+
+Found while regression-testing the LFM2.5 work against `gemma-4-e4b-it-4bit`.
+Streaming and non-streaming disagreed on the same request:
+
+```
+enable_thinking: true, "What is 17 * 23? Just the number after thinking."
+  non-stream → content '391', reasoning None      # correct
+  stream     → content '',    reasoning '391'     # the whole answer misfiled
+```
+
+The streaming loop initialises `in_think_block = enable_thinking` — it ASSUMES
+the model begins inside a think block whenever thinking was requested. That is
+true only for templates that pre-inject the opener. Gemma renders a bare
+`<|turn>model\n` and lets the MODEL decide, so a turn it answers directly
+carries no think markup at all: no opener to recognise, no close tag to split
+on, and at end-of-stream the buffer was flushed as `reasoning_content` on the
+strength of `in_think_block` alone. Content came back EMPTY. Any client
+rendering `content` showed nothing.
+
+Note the shape of the miss: the answer was short ("391"), so the opener-skip
+logic — gated on `think_buf.items.len >= 7` — never even ran. A longer
+non-thinking answer would have reached its final else ("not a known opener —
+the template must have injected one") and been misfiled just the same, for a
+different reason.
+
+The non-streaming path had it right all along, because `splitThinkBlock` asks
+for evidence: no opener + no close + not template-opened ⇒ content. So the fix
+is to make the stream flush use the same rule
+(`chat.streamTailIsReasoning(in_think_block, prompt_opened_think,
+saw_think_open)`) — reasoning only with POSITIVE evidence a block was open:
+the prompt opened one, or the model emitted a literal opener.
+
+`saw_think_open` is new and deliberately distinct from the existing
+`skipped_think_open`, whose else-branch also fires for "no known opener, assume
+the template injected one" — precisely the case that has to be told apart. It
+is set only in the three branches that recognise a REAL opener (`<think`
+family, Inkling's `<|content_thinking|>`, Gemma's `<|channel>thought`).
+
+Truncated thoughts are unaffected: a pre-injecting template sets
+`prompt_opened_think`, so a thought cut by max_tokens is still reasoning and
+still never leaks into content.
+
+### The tests were asserting model behavior
+
+Three integration assertions failed on models that were behaving correctly, all
+the same class — asserting what the MODEL chooses rather than what the server
+guarantees:
+
+- `test_thinking_streaming.sh` Test 2 demanded reasoning >50 chars. Gemma
+  answers that prompt directly. Now: either a streamed think block, or a direct
+  answer as content — never the broken third state (answer filed as reasoning
+  with empty content), which is what the old assertion let through unnoticed.
+- `test_thinking_tools.sh` Test 2 demanded content. Laguna-XS spends >500
+  tokens thinking about 15x17 and ends at `finish_reason: length` still inside
+  the block — empty content is the truncated-thought rule working.
+- Tests 4/8 demanded reasoning before a tool call. Laguna-XS closes its
+  pre-opened block empty and calls the tool in ~35 tokens; LFM2.5 sometimes
+  spends the whole budget thinking and emits neither (~2 runs in 3, so the arm
+  was also nondeterministic).
+
+Each now asserts the invariant and branches on the model's choice. The general
+rule: an integration assertion that a model MUST think, MUST answer, or MUST
+call a tool is a checkpoint-specific expectation wearing a server test's
+clothes — and it either fails on the next family or, worse, passes while
+hiding a real defect.
+
+`test_format_matrix.sh` also learned to look under the sibling model root
+(`~/.mlx-serve/models` vs `~/.lmstudio/models`): its gemma4-e4b arm had been
+skipping while the checkpoint was present, which is missing coverage that reads
+as a pass.
+
+## `.hold_thinking` was an empty block, so tools+thinking streamed nothing for seconds (2026-08-04)
+
+Reported as "with tools and thinking, streaming takes a long time before I see
+anything; without tools I see content right away". Measured on LFM2.5-2.6B:
+
+```
+                            1st reasoning   1st content   prefill
+thinking ON,  no tools           0.05s          n/a         8ms
+thinking ON,  WITH tools         4.40s          n/a        27ms
+```
+
+Prefill is 8-52 ms in every combination, so the wait was not prefill. With
+`tools` present every token goes into a buffer for tool-call detection, and the
+think gate returns `.hold_thinking` until `</think>` arrives — and that arm was
+literally empty:
+
+```zig
+.hold_thinking => {
+    // Incomplete thinking block — keep buffering until closed
+},
+```
+
+So the whole thought landed in ONE delta at the end. 4.4 s here, and it scales
+with the length of the thought.
+
+The fix is small because **the tool side was already fine-grained**:
+`streamShouldBufferForTools` runs immediately above and holds on partial
+prefixes down to a bare `<`. Reaching the gate at all therefore PROVES the
+buffer contains no tool markup and no partial marker at its tail — those bytes
+are reasoning and nothing else, and they can go out now. 4.40 s → 0.09 s,
+matching the no-tools path.
+
+What the change actually has to get right is not the emission, it is that
+**three other sites emit reasoning for the same turn**: the `.split_think` arm,
+the end-of-stream tool-call path, and the end-of-stream no-tool-call path. Each
+now sends only the remainder via `chat.unstreamedReasoning(reasoning,
+reasoning_streamed)`. Its one interesting case is a split that SHRINKS — a tool
+marker appearing mid-thought moves `trimLeakedToolMarkup`'s cut backwards, so
+the reasoning gets shorter than what was already sent. It returns null there:
+an SSE delta cannot be retracted, so sending nothing further is honest, and
+resending from the top would duplicate the entire thought.
+
+A reasoning BUDGET keeps the old buffering. Capping what the client is allowed
+to see cannot be reconciled with having already streamed it, and the guard
+(`reasoning_budget < 0`) also means `reasoning_streamed` is only ever advanced
+when no budget is set — which is what leaves the budget-truncation branches at
+the two end sites provably untouched.
+
+Verification worth copying: stream vs non-stream reasoning compared
+BYTE-IDENTICAL at temperature 0 on LFM2.5 and Gemma, including the tool-call
+turn. That comparison is UNSOUND on Qwen3.6-27B-4bit — INT4 near-tie argmax
+plus MTP makes two temp-0 runs diverge past ~30-80 tokens (documented), and the
+diff looks alarming until you notice the two runs generated different text. For
+that model the property to test is self-duplication within ONE stream (the
+reasoning must not contain its own head twice): 637 reasoning deltas, head
+count 1, no tag leak, tool calls intact.
+
+This is a stopgap for the symptom. The real fix — an incremental parser that
+emits diffs and holds back only the minimal ambiguous suffix, which is what
+vLLM's `extract_tool_calls_streaming` and llama.cpp's `common/chat.cpp` partial
+parse do — is in TODO.md.

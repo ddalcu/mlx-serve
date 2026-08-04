@@ -5,8 +5,14 @@ import Foundation
 /// Verifies the spawn-time fast-fail path: when an MCP server dies during init (as docker-mcp does
 /// when the Docker daemon is down), `startEnabled` must return promptly with a clear error — not
 /// hang for 30s+ waiting for an `initialize` reply that will never arrive.
+///
+/// Fully hermetic — nothing here talks to Docker (or any real MCP server): the dying server is a
+/// local shell script that reproduces docker-mcp's stderr + exit. The file was named
+/// MCPDockerSpawnTests and printed the captured error on every run, which read as a Docker
+/// dependency failing in CI output; renamed (and de-printed) 2026-08-04 so it can't be mistaken
+/// for one again.
 @MainActor
-final class MCPDockerSpawnTests: XCTestCase {
+final class MCPFailFastTests: XCTestCase {
 
     /// Sandbox the mcp.json path so tests never clobber the user's real `~/.mlx-serve/mcp.json`.
     /// Honored by `MCPConfigStore.path` via the `MCP_CONFIG_PATH` env var.
@@ -71,7 +77,6 @@ final class MCPDockerSpawnTests: XCTestCase {
             || lower.contains("exited")
             || lower.contains("docker")
         XCTAssertTrue(mentionsRoot, "Error message doesn't surface the underlying cause: \(err)")
-        print("[test] elapsed=\(String(format: "%.2f", elapsed))s, error=\(String(err.prefix(400)))")
     }
 
     /// Case A: the user configured an MCP server whose command isn't on PATH at all.
@@ -96,7 +101,6 @@ final class MCPDockerSpawnTests: XCTestCase {
         }
         XCTAssertTrue(err.contains("not found"), "Error should say 'not found'; got: \(err)")
         XCTAssertTrue(err.contains("definitely-not-a-real-binary-xyz"), "Error should name the missing command; got: \(err)")
-        print("[test] missing-command elapsed=\(String(format: "%.2f", elapsed))s, error=\(String(err.prefix(200)))")
     }
 
     /// Case B: the command exists (npx) but the package it's asked to run doesn't.
@@ -129,7 +133,6 @@ final class MCPDockerSpawnTests: XCTestCase {
         let lower = err.lowercased()
         let recognized = lower.contains("exit") || lower.contains("404") || lower.contains("not found") || lower.contains("error")
         XCTAssertTrue(recognized, "Error should surface npm failure; got: \(err)")
-        print("[test] missing-package elapsed=\(String(format: "%.2f", elapsed))s, error=\(String(err.prefix(400)))")
         #endif
     }
 

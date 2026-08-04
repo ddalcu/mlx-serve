@@ -1168,11 +1168,19 @@ struct ChatDetailView: View {
         (session?.messages.isEmpty ?? true) && composerState != .generatingHere
     }
 
+    /// Greeting + discovery chips, one fixed-height block. The vertical slack
+    /// lives OUTSIDE this view (two sibling Spacers in the body) — a Spacer
+    /// nested in here shares space unevenly with the body's own trailing one,
+    /// which is what pinned the whole group to the bottom of the window.
     private var emptyState: some View {
-        VStack(spacing: 10) {
-            Spacer()
+        VStack(spacing: 8) {
             Text("How can I help you today?")
-                .font(.system(size: 26, weight: .semibold, design: .rounded))
+                .font(.system(size: 30, weight: .semibold, design: .rounded))
+                // Subtle top-to-bottom fade for depth; primary-based so it
+                // reads in both appearances without picking a color.
+                .foregroundStyle(LinearGradient(
+                    colors: [.primary, .primary.opacity(0.55)],
+                    startPoint: .top, endPoint: .bottom))
             if server.status != .running {
                 Text("Start the server to begin.")
                     .font(.callout)
@@ -1182,13 +1190,26 @@ struct ChatDetailView: View {
                     .font(.callout)
                     .foregroundStyle(.secondary)
             }
+            // Discovery chips: the features that otherwise live only in the
+            // menu-bar tray (media generation, Model Browser, Tasks, the CLI
+            // launcher). Under the greeting, gone once the conversation starts.
+            if session?.isExternalBridge != true {
+                EmptyStateChipRow()
+                    .padding(.top, 18)
+            }
         }
         .frame(maxWidth: .infinity)
+        .padding(.horizontal, ChatMetrics.gutter)
+        .padding(.bottom, 14)
     }
 
     var body: some View {
         VStack(spacing: 0) {
             if isEmptyConversation {
+                // Two SIBLING spacers (this one + the trailing one below the
+                // composer) split the slack evenly, so greeting + chips +
+                // composer sit as one group in the middle of the window.
+                Spacer(minLength: 0)
                 emptyState
             } else {
             // Messages
@@ -1354,10 +1375,8 @@ struct ChatDetailView: View {
             }
             .padding(.horizontal, ChatMetrics.gutter)
             .padding(.vertical, 8)
-            // Balances the greeting's leading spacer so the greeting and the
-            // composer center as ONE group. Without it the pair sits at the
-            // bottom of an otherwise blank window.
-            if isEmptyConversation { Spacer() }
+            // The top spacer's sibling — see the empty-state branch above.
+            if isEmptyConversation { Spacer(minLength: 0) }
         }
         .onDrop(of: [.image, .pdf, .audio], isTargeted: nil) { providers in
             for provider in providers {

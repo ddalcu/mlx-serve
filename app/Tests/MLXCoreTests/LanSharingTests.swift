@@ -1,4 +1,5 @@
 import XCTest
+import SwiftUI
 @testable import MLXCore
 
 /// LAN model sharing, app side: /v1/models entries badged `lan_peer` become
@@ -32,6 +33,39 @@ final class LanSharingTests: XCTestCase {
         XCTAssertEqual(LanPick.persisted(lanModel: "m@p", presetId: "x"), "lan:m@p")
         XCTAssertEqual(LanPick.persisted(lanModel: nil, presetId: "x"), "x")
         XCTAssertEqual(LanPick.peer(of: "gemma-4-e4b-it-4bit@Studio"), "Studio")
+        // `base(of:)` is peer(of:)'s mirror — the model id without the peer.
+        XCTAssertEqual(LanPick.base(of: "ddalcu/MiniMax-H3-FL2VA-MLX-Serve-8bit@Studio"),
+                       "ddalcu/MiniMax-H3-FL2VA-MLX-Serve-8bit")
+        XCTAssertEqual(LanPick.base(of: "no-peer-suffix"), "no-peer-suffix")
+    }
+
+    /// A LAN pick whose base id matches a local preset must adopt that preset:
+    /// `model` is what the pane gates EVERYTHING on (resolutions, frame
+    /// ladder, request capability gating), so leaving it on the previous local
+    /// pick sent a remote H3 the local LTX's canvas and 8N+1 frame counts —
+    /// below H3's trained floor, at an off-distribution size (bad output that
+    /// looks like a model-quality problem). An unknown remote id keeps
+    /// today's behavior: local preset untouched, request routed by lanModel.
+    func testLanPickAdoptsTheMatchingLocalPreset() {
+        var model = VideoModelPreset.ltx23Q4
+        var lan: String? = nil
+        var persisted = 0
+        let selection = LanPick.selection(
+            model: Binding(get: { model }, set: { model = $0 }),
+            lanModel: Binding(get: { lan }, set: { lan = $0 }),
+            resolve: { id in VideoModelPreset.all.first { $0.id == id } },
+            persist: { persisted += 1 })
+
+        selection.wrappedValue = "lan:" + VideoModelPreset.minimaxH3.id + "@studio"
+        XCTAssertEqual(lan, VideoModelPreset.minimaxH3.id + "@studio")
+        XCTAssertEqual(model.id, VideoModelPreset.minimaxH3.id,
+                       "the pane must gate on the remote model's own preset")
+        XCTAssertGreaterThan(persisted, 0)
+
+        // Unknown remote → the local preset stays where it was.
+        selection.wrappedValue = "lan:someone/custom-video@studio"
+        XCTAssertEqual(lan, "someone/custom-video@studio")
+        XCTAssertEqual(model.id, VideoModelPreset.minimaxH3.id)
     }
 
     @MainActor

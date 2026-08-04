@@ -117,6 +117,13 @@ const bash_tool_schema =
     \\[{"type":"function","function":{"name":"bash","description":"Run a shell command","parameters":{"type":"object","properties":{"command":{"type":"string"}},"required":["command"]}}}]
 ;
 
+/// Mixed-type weather tool — used by the lfm2 pythonic entries. The three
+/// non-string types are the point: `days` integer, `metric` boolean and `tags`
+/// array are what a JSON-only value reader gets wrong in this grammar.
+const pythonic_weather_tool_schema =
+    \\[{"type":"function","function":{"name":"get_weather","description":"Get weather","parameters":{"type":"object","properties":{"city":{"type":"string"},"days":{"type":"integer"},"metric":{"type":"boolean"},"tags":{"type":"array","items":{"type":"string"}}},"required":["city"]}}}]
+;
+
 const corpus = [_]Expect{
     // ── Qwen 3.5/3.6 (<think> family, template-injected opener) ─────────────
     .{
@@ -1232,6 +1239,58 @@ const corpus = [_]Expect{
         .tool_count = 1,
         .tool_name = "bash",
         .tool_arg_key = "command",
+    },
+
+    // ── lfm2 (LFM2.5) — pythonic call expressions ──────────────────────
+    // Verbatim from mlx-community/LFM2.5-2.6B-8bit via /v1/completions
+    // against its own rendered template (2026-08-04). Values are PYTHON
+    // literals, so this family is the corpus's only source of natively-typed
+    // arguments — the declared-type invariant reads them without any coercion
+    // firing, which is the property a JSON-only value reader would break.
+    .{
+        .family = "lfm2",
+        .name = "pythonic call after a template-opened think block",
+        .raw = "The user wants weather for Paris. I need the get_weather function.</think><|tool_call_start|>[get_weather(city='Paris', days=3, metric=True, tags=['trip', 'eu'])]<|tool_call_end|>",
+        .thinking = true,
+        .opened_by_template = true,
+        .tools_json = pythonic_weather_tool_schema,
+        .tool_count = 1,
+        .tool_name = "get_weather",
+        .tool_arg_key = "city",
+        .tool_arg_value = "Paris",
+        .tool_bool_key = "metric",
+        .tool_bool_value = true,
+        .reasoning_contains = "weather for Paris",
+    },
+    .{
+        // Parallel calls share ONE bracket list — the separator sits between
+        // `)` and the next name, not between wrappers.
+        .family = "lfm2",
+        .name = "two calls in one bracket list keep their own args",
+        .raw = "<|tool_call_start|>[get_weather(city='Paris'), get_weather(city='Berlin')]<|tool_call_end|>",
+        .tools_json = pythonic_weather_tool_schema,
+        .tool_count = 2,
+        .tool_name = "get_weather",
+        .tool_arg_key = "city",
+        .tool_arg_value = "Paris",
+        .last_tool_arg_value = "Berlin",
+    },
+    .{
+        // Cut inside an argument VALUE: name survives, the fragment does not.
+        .family = "lfm2",
+        .name = "truncated pythonic call salvages name, drops the fragment",
+        .raw = "<|tool_call_start|>[write(path='a.html', content='<!DOCTYPE html>\n<p>cut mid-",
+        .tools_json = write_read_tools_schema,
+        .tool_name = "write",
+        .tool_arg_absent = "content",
+    },
+    .{
+        // Prose describing a call is not a call — the marker is required.
+        .family = "lfm2",
+        .name = "prose naming a python call is not a tool call",
+        .raw = "You can call get_weather(city='Paris') yourself, or ask me to.",
+        .no_tool_calls = true,
+        .content_contains = "get_weather(city='Paris')",
     },
 };
 

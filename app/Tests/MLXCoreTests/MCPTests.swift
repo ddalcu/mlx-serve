@@ -477,7 +477,7 @@ final class MCPTests: XCTestCase {
     /// already running", so with zero sessions it must not touch the config's
     /// enabled entries (not even to record a spawn failure).
     @MainActor func testSandboxRestartNoOpsWhenNothingIsRunning() async throws {
-        // Sandbox the mcp.json path (same pattern as MCPDockerSpawnTests) so the
+        // Sandbox the mcp.json path (same pattern as MCPFailFastTests) so the
         // test never clobbers the user's real config.
         let dir = NSTemporaryDirectory().appending("mcp-restart-\(UUID().uuidString)")
         try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)

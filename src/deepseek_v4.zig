@@ -2691,8 +2691,9 @@ test "dsv4: forwardPrefill on the REAL mirror continues 'The capital of France i
     // expectation is weights-pinned, so a checkpoint OR quant-recipe bump
     // re-derives it from the oracle before anyone calls a diff a bug.
     // imx-2-3-8bit (imatrix gs128, 2026-08-01): 11111, 16 = ' Paris', '.'.
-    // The superseded mixed-2-3-8bit (minmax gs64) continued 11111, 66910
-    // ('.",') — same first token, near-tie second.
+    // iQ-MLX-3.3bpw (greedy late-layer 3b plan, 2026-08-03): re-derived,
+    // SAME 11111, 16. The superseded mixed-2-3-8bit (minmax gs64) continued
+    // 11111, 66910 ('.",') — same first token, near-tie second.
     const want = [_]u32{ 11111, 16 };
     for (want) |w| {
         const logits = try forwardPrefill(&mdl, allocator, ids.items);

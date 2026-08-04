@@ -129,8 +129,22 @@ curl -sN "$BASE/v1/chat/completions" \
   -d '{"model":"mlx-serve","messages":[{"role":"user","content":"What is 17 * 23? Just the number after thinking."}],"max_tokens":1500,"temperature":0.3,"stream":true,"enable_thinking":true}' \
   > /tmp/think_stream_2.txt 2>&1
 eval "$(analyze_stream /tmp/think_stream_2.txt t2)"
-check "streaming reasoning_content populated (>50)" "$([ ${t2_reasoning_len:-0} -gt 50 ] && echo true || echo false)" "got $t2_reasoning_len"
-check "streaming reasoning chunks > 1 (live streaming)" "$([ ${t2_reasoning_chunks:-0} -gt 1 ] && echo true || echo false)" "chunks=$t2_reasoning_chunks"
+# Whether the model thinks at all is a MODEL choice on families whose template
+# has no enable_thinking hook: Gemma 4 renders a bare `<|turn>model\n` and
+# decides for itself, and on this prompt e4b answers "391" directly. Templates
+# that pre-inject the opener (Qwen 3.5/3.6, LFM2.5) always produce a block.
+# So assert the invariant that holds either way — a turn is EITHER a streamed
+# think block, OR a direct answer as content — and never the broken third
+# state this test used to pass through: the whole answer filed as
+# reasoning_content with empty content (live Gemma 2026-08-04, streaming only;
+# non-streaming had it right, which is what made the two paths disagree).
+if [ ${t2_reasoning_len:-0} -gt 0 ]; then
+  check "streaming reasoning_content populated (>50)" "$([ ${t2_reasoning_len:-0} -gt 50 ] && echo true || echo false)" "got $t2_reasoning_len"
+  check "streaming reasoning chunks > 1 (live streaming)" "$([ ${t2_reasoning_chunks:-0} -gt 1 ] && echo true || echo false)" "chunks=$t2_reasoning_chunks"
+else
+  check "no-think turn: answer arrives as CONTENT, not reasoning" "$([ ${t2_content_len:-0} -gt 0 ] && echo true || echo false)" "content_len=$t2_content_len"
+  check "no-think turn: reasoning_content stays empty" "$([ ${t2_reasoning_chunks:-0} -eq 0 ] && echo true || echo false)" "chunks=$t2_reasoning_chunks"
+fi
 check "streaming reasoning_content has no leaked tags" "$([ "$t2_reasoning_has_tag" = "False" ] && echo true || echo false)" ""
 check "streaming content has no leaked tags" "$([ "$t2_content_has_tag" = "False" ] && echo true || echo false)" ""
 

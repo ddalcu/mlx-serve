@@ -2033,6 +2033,49 @@ pub const Weights = struct {
     }
 };
 
+/// The two nestings a text trunk ships under. `parseConfigFromJson` picks
+/// between them from config KEYS; this probe corrects it from the checkpoint.
+const FLAT_PREFIX = "model";
+const NESTED_PREFIX = "language_model.model";
+
+fn hasWeightsUnder(weights: *const Weights, prefix: []const u8) bool {
+    var it = weights.map.keyIterator();
+    while (it.next()) |k| {
+        const key = k.*;
+        if (key.len > prefix.len and key[prefix.len] == '.' and std.mem.startsWith(u8, key, prefix)) return true;
+    }
+    return false;
+}
+
+/// Re-point `config.weight_prefix` at the nesting the CHECKPOINT actually uses.
+///
+/// Which of the two a converter emits is not reliably declared in config.json,
+/// so `parseConfigFromJson` guesses from `text_config` presence — wrong for any
+/// checkpoint that nests without declaring one (mlx-community LFM2.5-2.6B:
+/// `Lfm2ForCausalLM`, an EMPTY `vision_config`, every weight under
+/// `language_model.model.*`; the guess picked `model` and the load died on
+/// `MISSING WEIGHT: model.embed_tokens.weight`). The class has now shipped in
+/// both directions, so the weights get the last word.
+///
+/// Conservative by construction: it only ever alternates between those two
+/// prefixes (never an arch with its own — `backbone`, `model.llm`, `""`), and
+/// only when the configured one holds NOTHING, so every checkpoint that
+/// already loaded binds byte-identically.
+pub fn resolveWeightPrefix(config: *ModelConfig, weights: *const Weights) void {
+    const alt = if (std.mem.eql(u8, config.weight_prefix, FLAT_PREFIX))
+        NESTED_PREFIX
+    else if (std.mem.eql(u8, config.weight_prefix, NESTED_PREFIX))
+        FLAT_PREFIX
+    else
+        return;
+
+    if (hasWeightsUnder(weights, config.weight_prefix)) return;
+    if (!hasWeightsUnder(weights, alt)) return;
+
+    log.info("weight prefix: config implies \"{s}\", checkpoint uses \"{s}\" — using the checkpoint's\n", .{ config.weight_prefix, alt });
+    config.weight_prefix = alt;
+}
+
 /// Load all safetensors files from model_dir.
 /// When `load_vision` is true, vision_tower and multi_modal_projector weights are included.
 pub fn loadWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !Weights {
@@ -2359,6 +2402,74 @@ test "loadWeights on a weightless dir (incomplete download) errors clearly, not 
         error.NoWeightFiles,
         loadWeightsFromOpenDir(io, allocator, tmp.dir, "/incomplete-model", false),
     );
+}
+
+test "resolveWeightPrefix: the CHECKPOINT decides the nesting, not the config keys" {
+    // mlx-community/LFM2.5-2.6B-{8bit,nvfp4} declare `Lfm2ForCausalLM` with NO
+    // text_config (just an empty `vision_config`), yet ship every weight under
+    // `language_model.model.*`. The config-key guess picked "model" and the
+    // load died on `MISSING WEIGHT: model.embed_tokens.weight` (live
+    // 2026-08-04). The same class shipped in the opposite direction before, so
+    // the probe corrects either way.
+    const allocator = testing.allocator;
+    const put = struct {
+        fn add(w: *Weights, alloc: std.mem.Allocator, key: []const u8) !void {
+            const k = try alloc.dupe(u8, key);
+            try w.map.put(k, mlx.mlx_array_new());
+        }
+    }.add;
+
+    // Nested checkpoint, flat guess → re-pointed (the LFM2.5 crash).
+    {
+        var w = Weights.init(allocator);
+        defer w.deinit();
+        try put(&w, allocator, "language_model.model.embed_tokens.weight");
+        try put(&w, allocator, "language_model.model.layers.0.self_attn.q_proj.weight");
+        var config = ModelConfig{ .model_type = "lfm2", .weight_prefix = "model" };
+        resolveWeightPrefix(&config, &w);
+        try testing.expectEqualStrings("language_model.model", config.weight_prefix);
+    }
+    // Flat checkpoint, nested guess → re-pointed the other way.
+    {
+        var w = Weights.init(allocator);
+        defer w.deinit();
+        try put(&w, allocator, "model.embed_tokens.weight");
+        var config = ModelConfig{ .model_type = "lfm2", .weight_prefix = "language_model.model" };
+        resolveWeightPrefix(&config, &w);
+        try testing.expectEqualStrings("model", config.weight_prefix);
+    }
+    // Both present (a real VL checkpoint) → the configured prefix stands, so
+    // nothing that loads today can be re-pointed by this probe.
+    {
+        var w = Weights.init(allocator);
+        defer w.deinit();
+        try put(&w, allocator, "model.embed_tokens.weight");
+        try put(&w, allocator, "language_model.model.embed_tokens.weight");
+        var config = ModelConfig{ .model_type = "lfm2", .weight_prefix = "language_model.model" };
+        resolveWeightPrefix(&config, &w);
+        try testing.expectEqualStrings("language_model.model", config.weight_prefix);
+    }
+    // An arch with its OWN prefix is never touched, even when it holds nothing
+    // (a genuinely broken checkpoint must stay a clear MISSING WEIGHT).
+    {
+        var w = Weights.init(allocator);
+        defer w.deinit();
+        try put(&w, allocator, "language_model.model.embed_tokens.weight");
+        var config = ModelConfig{ .model_type = "nemotron_h", .weight_prefix = "backbone" };
+        resolveWeightPrefix(&config, &w);
+        try testing.expectEqualStrings("backbone", config.weight_prefix);
+    }
+    // A prefix that is a strict PREFIX of the key's first segment must not
+    // count as a hit ("model" vs "model_extra.*").
+    {
+        var w = Weights.init(allocator);
+        defer w.deinit();
+        try put(&w, allocator, "model_extra.embed_tokens.weight");
+        try put(&w, allocator, "language_model.model.embed_tokens.weight");
+        var config = ModelConfig{ .model_type = "lfm2", .weight_prefix = "model" };
+        resolveWeightPrefix(&config, &w);
+        try testing.expectEqualStrings("language_model.model", config.weight_prefix);
+    }
 }
 
 test "applyDsv4ReferenceSampling: the source's wild signature resolves to the reference's temp 0.6" {

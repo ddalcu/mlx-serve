@@ -139,6 +139,20 @@ struct SettingsView: View {
                         }
                     }
 
+                    // Not folded into Updates: that section is gated on
+                    // `selfUpdate`, so on a Mac App Store build these links
+                    // would never render.
+                    SettingsSection(
+                        category: .about,
+                        subtitle: "mlx-serve is free and open source, built by one person. Star it, follow along, or just say hello — questions and bug reports are welcome."
+                    ) {
+                        ForEach(CommunityLinks.all) { item in
+                            SettingsRow(title: item.title, explainer: item.explainer) {
+                                Link(item.actionLabel, destination: item.url)
+                            }
+                        }
+                    }
+
                     if filtering && visibleRows == 0 {
                         NoSearchResults(query: searchQuery) { searchQuery = "" }
                     }

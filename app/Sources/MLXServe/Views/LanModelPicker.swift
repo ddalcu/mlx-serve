@@ -23,10 +23,23 @@ enum LanPick {
         return String(id[id.index(after: at)...])
     }
 
+    /// `peer(of:)`'s mirror: the model id without the peer suffix.
+    static func base(of id: String) -> String {
+        guard let at = id.lastIndex(of: "@") else { return id }
+        return String(id[..<at])
+    }
+
     /// One string binding driving both selections. Local picks flow into
     /// `model` (whose `.onChange` keeps applying preset defaults + persisting,
-    /// exactly as before); LAN picks land in `lanModel` and persist directly —
-    /// there is no preset change for `.onChange` to observe.
+    /// exactly as before); LAN picks land in `lanModel` and persist directly.
+    /// A LAN pick whose BASE id matches a local preset also adopts that preset
+    /// into `model` — the pane gates everything (resolutions, frame ladders,
+    /// request capability-gating) on `model`, and leaving it on the previous
+    /// local pick sent a remote MiniMax-H3 the local LTX's canvas and 8N+1
+    /// frame counts (below H3's trained floor = bad output that reads as a
+    /// model-quality problem). The adoption flows through `model`'s own
+    /// `.onChange`, so preset defaults apply exactly as a local pick's would;
+    /// an unknown remote id changes nothing.
     static func selection<P: Identifiable>(
         model: Binding<P>, lanModel: Binding<String?>,
         resolve: @escaping (String) -> P?, persist: @escaping () -> Void
@@ -36,6 +49,7 @@ enum LanPick {
             set: { picked in
                 if let lan = lanId(picked) {
                     lanModel.wrappedValue = lan
+                    if let p = resolve(base(of: lan)) { model.wrappedValue = p }
                     persist()
                 } else {
                     let hadLan = lanModel.wrappedValue != nil

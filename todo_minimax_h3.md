@@ -10,19 +10,26 @@ both suites are green (branch `feature/minmax-h3`).
 `comfy/ldm/minimax/*` + `comfy_extras/nodes_minimax_h3.py`, mirrored at
 `~/claude-tmp/h3-ref/`. It is the spec; read it before changing behaviour.
 
-**Measured baseline (M4 Max, 128 GB), so you can tell a regression from noise:**
+**Measured baselines (M4 Max, 128 GB), so you can tell a regression from
+noise. Two eras — the fast recipe (velocity cache + attention broadcast +
+dq-gemm) is DEFAULT-ON since 2026-08-03:**
 
-| config | weights | wall clock |
-|---|---|---|
-| 256x256, 56f, 30 steps | bf16 | ~4 min |
-| 864x480, 73f, 30 steps | 8-bit | ~22 min |
+| config | weights | pre-session | current defaults |
+|---|---|---|---|
+| 256x256, 56f, 30 steps | 8-bit | ~4 min | ~1.5 min sampling |
+| 864x480, 73f, 30 steps | 8-bit | ~22 min | ~9 min |
+| 1344x768, 124f, 30 steps | 8-bit | 2 h 19 m | **49 min** (measured, same seed) |
+| 1344x768, 209f, 30 steps | 8-bit | ~6 h (projected) | 1 h 57 m |
+
+`"fast": false` on the request (or `MINIMAX_H3_STEP_CACHE=0` +
+`MINIMAX_H3_ATTN_BCAST=0`) restores the dense per-step arms for A/Bs.
 
 Run one with:
 
 ```bash
 MINIMAX_H3_DIR=~/claude-tmp/h3-build \
 MINIMAX_H3_MODEL=~/.mlx-serve/models/ddalcu/MiniMax-H3-FL2VA-MLX-Serve-8bit \
-MINIMAX_H3_OUT=/tmp/h3out MINIMAX_H3_SIZE=256 MINIMAX_H3_FRAMES=56 MINIMAX_H3_STEPS=30 \
+MINIMAX_H3_OUT=~/claude-tmp/h3out MINIMAX_H3_SIZE=256 MINIMAX_H3_FRAMES=56 MINIMAX_H3_STEPS=30 \
 zig build test -Doptimize=ReleaseFast -Dtest-filter="minimax h3 live"
 ```
 
@@ -168,19 +175,22 @@ upstream).
 Ordered by expected value given what is already known.
 
 - [~] **Fewer steps.** Ladder RUN 2026-08-03 (256px, same seed): 30 vs 20 vs
-      16 clips muxed and sent to David (`~/claude-tmp/h3-prof/h3_s{20,16}.mp4`
-      vs `h3_new.mp4`). PSNR-to-30-step is ~21-22 dB — trajectory divergence,
-      meaningless for quality; the default change WAITS ON THE EYEBALL.
-- [~] **Step cache (TeaCache-style velocity reuse), NEW lever**: reuse the
-      previous velocity when the accumulated relative input change stays under
-      a threshold (audio velocity re-scaled to the current sigma's slope).
-      `MINIMAX_H3_STEP_CACHE=0.08` skipped 15/30 forwards = **2.0x sampling**
-      (146 -> 73 s at 256px). OPT-IN until the eyeball verdict on
-      `h3_sc08.mp4`; if it holds, this stacks with a lower step count.
+      16 clips sent (`h3_s{20,16}.mp4` vs `h3_new.mp4`); no eyeball ruling
+      yet. LOWER PRIORITY now the fast recipe landed — the step cache already
+      harvests the adjacent-step redundancy that fewer steps would, so the
+      incremental win is smaller than it looked pre-recipe; if judged, it
+      stacks (would compose to ~4x).
+- [x] **Step cache (TeaCache-style velocity reuse)**: reuse the previous
+      velocity when the accumulated relative input change stays under a
+      threshold (audio velocity re-scaled to the current sigma's slope).
+      0.08 skipped 15/30 forwards = 2.0x sampling at 256px. DEFAULT-ON at
+      thresh 0.05 since the capstone eyeball verdict (see below), via
+      `resolveSpeed`; `MINIMAX_H3_STEP_CACHE` overrides both ways.
 - [x] **dequant -> bf16 GEMM at M>=2048**: LANDED, default-on for the H3 path
       (−13%/step at 480p, 2/2 adjacent pairs, u8-identical output; see
       Phase 0). MageFlow keeps its own default until its own A/B.
-- [~] **Attention broadcast (PAB-style), NEW lever** 2026-08-03: per-block
+- [x] **Attention broadcast (PAB-style)** 2026-08-03, DEFAULT-ON at k=2 via
+      `resolveSpeed` since the capstone verdict (env overrides): per-block
       attention OUTPUTS are cached and the whole branch (norm1/mod/qkv/SDPA/
       out — ~70% of a 768p step) skipped on non-refresh steps; gate re-applied
       at the current timestep. `MINIMAX_H3_ATTN_BCAST=<k>` (warmup 4 + last 2
@@ -188,8 +198,9 @@ Ordered by expected value given what is already known.
       (the ladder's attention-total removed exactly); 256px k=2 PSNR 26.6 dB
       vs baseline = INSIDE the sanctioned numeric-drift band (26.8), k=3
       22.6 dB. Extrapolated 768p: k=2 ~1.4x, k=3 ~1.6x. Cache cost one
-      [S,hidden] bf16 per block (~20 GB at 768p — opt-in, document).
-      Clips: h3_pab2/h3_pab3.mp4.
+      [S,hidden] bf16 per block (~20 GB at 768p/124f, ~34 GB at 209f —
+      measured fine on 128 GB; budget it before raising k or frames on
+      smaller Macs). Clips: h3_pab2/h3_pab3.mp4.
 - [~] **Sparse video attention (training-free, SVG/STA-style), NEW lever**:
       per-layer spatial (within-frame) / temporal (same-patch stripe)
       attention with the GLOBAL STRIP (text/cond/audio rows) concatenated into

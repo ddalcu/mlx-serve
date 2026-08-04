@@ -297,8 +297,23 @@ final class MediaToolArgsTests: XCTestCase {
                                           saved: VideoModelPreset.ltx23Q4.defaultResolution,
                                           keepResident: false, lanId: nil)
         XCTAssertEqual(req.mode, .oneStage)
-        XCTAssertEqual(req.steps, MediaChatDefaults.videoSteps)
+        XCTAssertEqual(req.steps, MediaChatDefaults.videoSteps(for: .ltx23Q4))
         XCTAssertEqual(req.numFrames, MediaToolArgs.videoFrames(nil, model: .ltx23Q4))
+    }
+
+    /// Chat previews run each model's own FAST tier, never a shared constant:
+    /// 8 steps is LTX's fast preset, but H3 is not step-distilled — its
+    /// validated floor is 16 — so the LTX-shaped constant produced a bad clip
+    /// after 15+ minutes of GPU. LTX stays byte-identical at 8.
+    func testVideoStepsFollowTheModelsOwnFastTier() throws {
+        XCTAssertEqual(MediaChatDefaults.videoSteps(for: .ltx23Q4), 8)
+        XCTAssertEqual(MediaChatDefaults.videoSteps(for: .minimaxH3),
+                       VideoModelPreset.minimaxH3.settings(.fast).steps)
+        let h3 = try MediaToolArgs.video(["prompt": "clouds"], model: .minimaxH3,
+                                         saved: VideoModelPreset.minimaxH3.defaultResolution,
+                                         keepResident: false, lanId: nil)
+        XCTAssertEqual(h3.steps, VideoModelPreset.minimaxH3.settings(.fast).steps)
+        XCTAssertGreaterThanOrEqual(h3.steps, 16, "below H3's validated floor")
     }
 
     func testVideoSizeSnapsToATrainedBucket() throws {

@@ -64,8 +64,26 @@ final class MediaGenSettingsTests: XCTestCase {
         s.stgScale = 1.0
         s.seed = 99
         s.keepResident = true
+        // REGRESSION: the tolerant decoder listed every field EXCEPT
+        // bestQuality, so H3's "Max quality" toggle silently reset to off on
+        // every app relaunch (saved, then dropped on load).
+        s.bestQuality = true
         let decoded = try JSONDecoder().decode(VideoGenSettings.self, from: try JSONEncoder().encode(s))
         XCTAssertEqual(decoded, s)
+    }
+
+    /// A persisted LAN pick ("lan:<model>@<peer>") whose base id matches a
+    /// local preset resolves to THAT preset, not the LTX fallback — the pane
+    /// gates ladders, resolutions and request fields on `resolvedModel`, so
+    /// falling back to LTX sent a remote H3 off-canvas sizes and frame counts
+    /// below its trained floor (the cross-pollution class).
+    func testVideoResolvesLanModelToItsMatchingPreset() {
+        var s = VideoGenSettings()
+        s.modelId = "lan:" + VideoModelPreset.minimaxH3.id + "@studio"
+        XCTAssertEqual(s.resolvedModel.id, VideoModelPreset.minimaxH3.id)
+        // An unknown remote model keeps today's LTX fallback.
+        s.modelId = "lan:someone/custom-video@studio"
+        XCTAssertEqual(s.resolvedModel.id, VideoModelPreset.ltx23Q4.id)
     }
 
     // MARK: - Reconstruct preset / resolution by id

@@ -2543,6 +2543,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     else
         try model_mod.loadWeights(sch.io, sch.allocator, params.model_dir);
     errdefer weights_ptr.deinit();
+    model_mod.resolveWeightPrefix(params.config, weights_ptr);
 
     // Transformer — owns the bulk of the GPU memory.
     const xfm_ptr = try sch.allocator.create(Transformer);

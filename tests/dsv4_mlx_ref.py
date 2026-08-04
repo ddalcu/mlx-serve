@@ -407,8 +407,12 @@ class Dsv4Ref:
         wts = wts / wts.sum(axis=-1, keepdims=True)
         wts = wts * self.route_scale
 
+        # Per-PROJECTION configs: iQ-MLX plans size w1/w2/w3 independently
+        # (the old recipes always had w1 == w3, which is why a shared qc
+        # survived until the first per-projection mirror).
         qc = self.qcfg[pfx + ".experts.w1"]
         qc2 = self.qcfg[pfx + ".experts.w2"]
+        qc3 = self.qcfg[pfx + ".experts.w3"]
         xe = mx.expand_dims(x, (1, 2))          # [s, 1, 1, d]
         ind = mx.array(indices.astype(np.int32))
         lim = self.swiglu_limit
@@ -417,7 +421,7 @@ class Dsv4Ref:
                              group_size=qc["group_size"], bits=qc["bits"])
         up = mx.gather_qmm(xe, w[pfx + ".experts.w3.weight"], w[pfx + ".experts.w3.scales"],
                            w[pfx + ".experts.w3.biases"], rhs_indices=ind, transpose=True,
-                           group_size=qc["group_size"], bits=qc["bits"])
+                           group_size=qc3["group_size"], bits=qc3["bits"])
         gate = gate.astype(mx.float32)
         up = mx.clip(up.astype(mx.float32), -lim, lim)
         gate = mx.minimum(gate, lim)

@@ -1643,7 +1643,23 @@ fn inklingSegmentCouldBeToolName(buf: []const u8) bool {
 /// gets misfiled as reasoning (the pi hidden-answer bug).
 pub const StreamThinkGate = enum { flush_text, hold_thinking, split_think };
 
+/// The gate WITHOUT a prompt-opened think block — every family whose template
+/// gates its `<think>` on `enable_thinking` renders the closed `<think></think>`
+/// signature (or no tag at all) when thinking is off, so the flag is false for
+/// them and this stays their exact behavior.
 pub fn streamThinkGate(buf: []const u8, enable_thinking: bool, think_closed: bool) StreamThinkGate {
+    return streamThinkGate2(buf, enable_thinking, think_closed, false);
+}
+
+/// `prompt_opened_think`: the rendered generation prompt ended with an OPEN
+/// think tag (`server.promptOpensThink`). That is a fact about the prompt
+/// BYTES, not about our request flag — LFM2.5's template pre-opens `<think>`
+/// unconditionally, so with thinking off the model's reasoning arrives as
+/// tag-free prose and the 3-arg gate flushed the whole chain-of-thought as the
+/// visible answer (live 2026-08-04). It can only ever ADD a hold: when
+/// thinking is on `enable_thinking` already held, and once `think_closed` the
+/// term is dropped so the answer after the block still flushes.
+pub fn streamThinkGate2(buf: []const u8, enable_thinking: bool, think_closed: bool, prompt_opened_think: bool) StreamThinkGate {
     // Inkling channels decide early: every marker is a SINGLE special token,
     // so a leading <|content_text|> is a whole marker (the flush path's
     // marker-token skip keeps it out of visible deltas), and a thinking
@@ -1655,7 +1671,7 @@ pub fn streamThinkGate(buf: []const u8, enable_thinking: bool, think_closed: boo
             return if (std.mem.indexOf(u8, ihead, INKLING_END_TAG) != null) .split_think else .hold_thinking;
         }
     }
-    const has_thinking = (enable_thinking and !think_closed) or
+    const has_thinking = ((enable_thinking or prompt_opened_think) and !think_closed) or
         std.mem.indexOf(u8, buf, "<|channel>thought") != null or
         indexOfThinkOpenTag(buf, 0) != null or
         (std.mem.startsWith(u8, buf, "<|channel>") and buf.len < 18) or
@@ -1668,6 +1684,39 @@ pub fn streamThinkGate(buf: []const u8, enable_thinking: bool, think_closed: boo
     const has_close = std.mem.indexOf(u8, buf, "<channel|>") != null or
         indexOfThinkCloseTag(buf, 0) != null;
     return if (has_close) .split_think else .hold_thinking;
+}
+
+/// End-of-stream classification for a think buffer that never saw a close tag:
+/// is it reasoning, or was it content all along?
+///
+/// The streaming loop starts `in_think_block` from `enable_thinking`, i.e. it
+/// ASSUMES the model begins inside a think block whenever thinking was
+/// requested. That holds only for templates that pre-inject the opener. Gemma 4
+/// renders a bare `<|turn>model\n` and lets the MODEL decide, so a turn it
+/// answers directly ("391") carries no think markup at all — and the whole
+/// answer was flushed as `reasoning_content` with EMPTY content, while the
+/// non-streaming path (`splitThinkBlock`, no opener + no close + not
+/// template-opened ⇒ content) returned it correctly (live 2026-08-04).
+///
+/// So require POSITIVE evidence a block was open: the PROMPT opened one, or the
+/// model emitted a literal opener. This is what makes the two paths agree.
+pub fn streamTailIsReasoning(in_think_block: bool, prompt_opened_think: bool, saw_think_open: bool) bool {
+    return in_think_block and (prompt_opened_think or saw_think_open);
+}
+
+/// The reasoning bytes not yet streamed, or null when there is nothing new.
+///
+/// The tools streaming path emits reasoning INCREMENTALLY (see the
+/// `.hold_thinking` arm), so every later site that emits reasoning for the same
+/// turn must send only the remainder or the client sees the thought twice.
+///
+/// `already >= reasoning.len` returns null rather than underflowing: the split
+/// can SHRINK when a tool marker appears mid-thought and `trimLeakedToolMarkup`
+/// cuts the tail. An SSE delta cannot be retracted, so the honest behavior is to
+/// send nothing further — never to resend from the top.
+pub fn unstreamedReasoning(reasoning: []const u8, already: usize) ?[]const u8 {
+    if (already >= reasoning.len) return null;
+    return reasoning[already..];
 }
 
 /// Parse tool calls from model output text.
@@ -1721,6 +1770,10 @@ pub fn parseToolCalls(allocator: std.mem.Allocator, text: []const u8) !?[]Parsed
     // marker no other family emits, and the generic `<tool` scan never sees
     // it (the byte before "tool_calls" is `｜`, not `<`).
     try parseDsmlToolCalls(allocator, effective_text, &calls);
+    // LFM2.5 pythonic (`<|tool_call_start|>[fn(a='x')]<|tool_call_end|>`):
+    // distinctive marker no other family emits, and the generic `<tool` scan
+    // never sees it (the opener is `<|tool_call_start|>`, not `<|tool_call>`).
+    try parsePythonicToolCalls(allocator, effective_text, &calls);
     // Hy3 (Hunyuan 3) SUFFIXED tag format is tried FIRST among the tag
     // families: its wrapper (`<tool_calls:opensource>`) would also trip the
     // generic `<tool` scan below, which would misread the non-JSON
@@ -2407,11 +2460,18 @@ pub fn requiredParamIsBuried(
 /// was already correct. The tool schema is the only disambiguator, and it is
 /// already threaded to every parse site as `tools_json`.
 ///
-/// Contract: only SCALARS are touched, only where the schema declares a type,
-/// and only when the spelling is unambiguous. An undecidable value is left
-/// alone so the client's validation error stays honest. Correct calls from
-/// strong models are byte-unchanged (nothing re-serializes unless a coercion
-/// actually fired).
+/// Contract: only where the schema declares a type, and only when the spelling
+/// is unambiguous. An undecidable value is left alone so the client's
+/// validation error stays honest. Correct calls from strong models are
+/// byte-unchanged (nothing re-serializes unless a coercion actually fired).
+///
+/// Scalars AND containers: a tag format types nothing, so a declared
+/// `array`/`object` arrives as a string of JSON and `coerceValueToType` parses
+/// it back (strict, then one tolerant repair re-validated strictly). This
+/// comment used to say "only SCALARS are touched" — it was two weeks stale by
+/// the time it was read as a spec and filed as issue #94. A contract comment is
+/// load-bearing documentation: pin it with a test (`issue #94: a container
+/// param carried as literal TEXT…`), don't let it drift.
 pub fn coerceToolArgsToSchema(
     allocator: std.mem.Allocator,
     calls: []ParsedToolCall,
@@ -3310,6 +3370,229 @@ fn parseInklingToolCalls(allocator: std.mem.Allocator, text: []const u8, calls: 
         }
         const arguments = args_json orelse try allocator.dupe(u8, "{}");
         try calls.append(allocator, .{ .name = name, .arguments = arguments, .inferred = false });
+    }
+}
+
+// ── Pythonic tool calls (LFM2.5 / `lfm2`) ──────────────────────────────
+//
+//   <|tool_call_start|>[get_weather(city='Paris', days=3, metric=True,
+//                                   tags=['trip', 'eu'])]<|tool_call_end|>
+//
+// A CALL-EXPRESSION grammar, not a JSON one: values are Python literals. The
+// model emits full repr — `True`, single-quoted lists — even though its own
+// template renders history containers via `tojson`, so a JSON-only value
+// reader mis-reads the two most common non-string types. Parsing the literals
+// here (rather than shipping them as text for `coerceToolArgsToSchema` to
+// rescue) is what keeps a declared `array`/`boolean` parameter from arriving
+// as a string — the value types are knowable from the SPELLING in this
+// grammar, so the schema never has to be consulted.
+//
+// Marker-gated: `<|tool_call_start|>` is emitted by no other family, and the
+// generic `<tool` scan never sees it, so this arm cannot touch existing
+// traffic. The Gemma 4 arm keys on the exact `<|tool_call>` (with `>`), which
+// this never matches.
+const PYTHONIC_CALL_START = "<|tool_call_start|>";
+const PYTHONIC_CALL_END = "<|tool_call_end|>";
+
+fn pythonicIsNameChar(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '_' or c == '.' or c == '-';
+}
+
+/// Index of the first byte in `s` at nesting depth 0 that satisfies `pred`,
+/// skipping anything inside a quoted string or a nested ()/[]/{} group.
+/// One scanner for every structural search in this grammar — the arg
+/// separator, the `=`, the dict `:`, and the closing paren all need the same
+/// blindness to separators that live inside a value.
+fn pythonicScan(s: []const u8, start: usize, pred: *const fn (u8, i32) bool) ?usize {
+    var depth: i32 = 0;
+    var quote: u8 = 0;
+    var i = start;
+    while (i < s.len) : (i += 1) {
+        const c = s[i];
+        if (quote != 0) {
+            if (c == '\\') {
+                i += 1;
+            } else if (c == quote) {
+                quote = 0;
+            }
+            continue;
+        }
+        if (c == '\'' or c == '"') {
+            quote = c;
+            continue;
+        }
+        if (c == '(' or c == '[' or c == '{') {
+            depth += 1;
+        } else if (c == ')' or c == ']' or c == '}') {
+            if (pred(c, depth)) return i;
+            depth -= 1;
+            continue;
+        }
+        if (pred(c, depth)) return i;
+    }
+    return null;
+}
+
+fn pythonicIsCloser(c: u8, depth: i32) bool {
+    return c == ')' and depth == 0;
+}
+fn pythonicIsComma(c: u8, depth: i32) bool {
+    return c == ',' and depth == 0;
+}
+fn pythonicIsEquals(c: u8, depth: i32) bool {
+    return c == '=' and depth == 0;
+}
+fn pythonicIsColon(c: u8, depth: i32) bool {
+    return c == ':' and depth == 0;
+}
+
+/// Unescape a Python string literal body. Unknown escapes keep the backslash,
+/// which is Python's own behavior (`'\d' == '\\d'`) and the forgiving reading
+/// of a model that under-escaped a path.
+fn pythonicUnescape(arena: std.mem.Allocator, body: []const u8) ![]const u8 {
+    var out = std.ArrayList(u8).empty;
+    var i: usize = 0;
+    while (i < body.len) : (i += 1) {
+        if (body[i] != '\\' or i + 1 >= body.len) {
+            try out.append(arena, body[i]);
+            continue;
+        }
+        i += 1;
+        switch (body[i]) {
+            'n' => try out.append(arena, '\n'),
+            'r' => try out.append(arena, '\r'),
+            't' => try out.append(arena, '\t'),
+            '\\', '\'', '"' => try out.append(arena, body[i]),
+            else => {
+                try out.append(arena, '\\');
+                try out.append(arena, body[i]);
+            },
+        }
+    }
+    return out.toOwnedSlice(arena);
+}
+
+/// A Python literal → its JSON value. Anything undecidable stays a string
+/// VERBATIM rather than being guessed at, so a client's own validation error
+/// stays honest (the `coerceToolArgsToSchema` contract, one layer down).
+fn pythonicLiteral(arena: std.mem.Allocator, raw: []const u8) !std.json.Value {
+    const s = std.mem.trim(u8, raw, " \t\n\r");
+    if (s.len == 0) return .{ .string = "" };
+
+    if ((s[0] == '\'' or s[0] == '"') and s.len >= 2 and s[s.len - 1] == s[0]) {
+        return .{ .string = try pythonicUnescape(arena, s[1 .. s.len - 1]) };
+    }
+    if (std.mem.eql(u8, s, "True")) return .{ .bool = true };
+    if (std.mem.eql(u8, s, "False")) return .{ .bool = false };
+    if (std.mem.eql(u8, s, "None")) return .null;
+
+    if (s[0] == '[' and s[s.len - 1] == ']') {
+        var arr = std.json.Array.init(arena);
+        var it = PythonicParts{ .s = s[1 .. s.len - 1] };
+        while (it.next()) |part| {
+            if (std.mem.trim(u8, part, " \t\n\r").len == 0) continue;
+            try arr.append(try pythonicLiteral(arena, part));
+        }
+        return .{ .array = arr };
+    }
+    if (s[0] == '{' and s[s.len - 1] == '}') {
+        var obj: std.json.ObjectMap = .empty;
+        var it = PythonicParts{ .s = s[1 .. s.len - 1] };
+        while (it.next()) |part| {
+            const colon = pythonicScan(part, 0, pythonicIsColon) orelse continue;
+            const key_v = try pythonicLiteral(arena, part[0..colon]);
+            const key = switch (key_v) {
+                .string => |k| k,
+                else => continue,
+            };
+            if (key.len == 0 or obj.getEntry(key) != null) continue;
+            try obj.put(arena, key, try pythonicLiteral(arena, part[colon + 1 ..]));
+        }
+        return .{ .object = obj };
+    }
+
+    if (std.fmt.parseInt(i64, s, 10)) |n| return .{ .integer = n } else |_| {}
+    if (std.fmt.parseFloat(f64, s)) |f| return .{ .float = f } else |_| {}
+    return .{ .string = s };
+}
+
+/// Iterator over top-level comma-separated parts.
+const PythonicParts = struct {
+    s: []const u8,
+    i: usize = 0,
+
+    fn next(self: *PythonicParts) ?[]const u8 {
+        if (self.i > self.s.len) return null;
+        if (self.i == self.s.len) {
+            self.i += 1;
+            return self.s[self.s.len..];
+        }
+        const start = self.i;
+        if (pythonicScan(self.s, start, pythonicIsComma)) |c| {
+            self.i = c + 1;
+            return self.s[start..c];
+        }
+        self.i = self.s.len + 1;
+        return self.s[start..];
+    }
+};
+
+fn parsePythonicToolCalls(allocator: std.mem.Allocator, text: []const u8, calls: *std.ArrayList(ParsedToolCall)) !void {
+    var pos: usize = 0;
+    while (std.mem.indexOfPos(u8, text, pos, PYTHONIC_CALL_START)) |p| {
+        const body_start = p + PYTHONIC_CALL_START.len;
+        const close = std.mem.indexOfPos(u8, text, body_start, PYTHONIC_CALL_END);
+        pos = if (close) |c| c + PYTHONIC_CALL_END.len else text.len;
+
+        // A dropped end marker (truncation, or the weak-model delimiter-drop
+        // class) must not cost the call — the body simply runs to the end.
+        var body = std.mem.trim(u8, text[body_start .. close orelse text.len], " \t\n\r");
+        if (body.len > 0 and body[0] == '[') body = body[1..];
+        if (body.len > 0 and body[body.len - 1] == ']') body = body[0 .. body.len - 1];
+
+        var arena_state = std.heap.ArenaAllocator.init(allocator);
+        defer arena_state.deinit();
+        const arena = arena_state.allocator();
+
+        var i: usize = 0;
+        while (i < body.len) {
+            while (i < body.len and (std.ascii.isWhitespace(body[i]) or body[i] == ',')) i += 1;
+            const name_start = i;
+            while (i < body.len and pythonicIsNameChar(body[i])) i += 1;
+            const name = body[name_start..i];
+            if (name.len == 0) break;
+
+            while (i < body.len and std.ascii.isWhitespace(body[i])) i += 1;
+            // No `(`, or no matching `)`: the cut landed inside the call. Ship
+            // the NAME with EMPTY args — never a partial value (a half-written
+            // file body is worse than a re-issued call).
+            const args = blk: {
+                if (i >= body.len or body[i] != '(') break :blk null;
+                const arg_start = i + 1;
+                const arg_end = pythonicScan(body, arg_start, pythonicIsCloser) orelse break :blk null;
+                i = arg_end + 1;
+                break :blk body[arg_start..arg_end];
+            };
+
+            var args_map: std.json.ObjectMap = .empty;
+            if (args) |a| {
+                var parts = PythonicParts{ .s = a };
+                while (parts.next()) |part| {
+                    const eq = pythonicScan(part, 0, pythonicIsEquals) orelse continue;
+                    const key = std.mem.trim(u8, part[0..eq], " \t\n\r");
+                    if (key.len == 0 or args_map.getEntry(key) != null) continue;
+                    try args_map.put(arena, key, try pythonicLiteral(arena, part[eq + 1 ..]));
+                }
+            }
+
+            const args_str = try std.json.Stringify.valueAlloc(allocator, std.json.Value{ .object = args_map }, .{});
+            errdefer allocator.free(args_str);
+            const name_owned = try allocator.dupe(u8, name);
+            errdefer allocator.free(name_owned);
+            try calls.append(allocator, .{ .name = name_owned, .arguments = args_str });
+
+            if (args == null) break;
+        }
     }
 }
 
@@ -5758,6 +6041,158 @@ test "parseToolCalls DSV4 plural-tag with attribute: <tool_calls name=\"X\">{arg
     try testing.expectEqualStrings("webSearch", calls[0].name);
 }
 
+test "pythonic: the real LFM2.5 capture, with every literal type" {
+    // Verbatim from mlx-community/LFM2.5-2.6B-8bit via /v1/completions
+    // (2026-08-04). The model emits full Python repr — note `True` and the
+    // SINGLE-quoted list, which is NOT the `tojson` form its own template
+    // renders history with. A JSON-only value reader gets both wrong.
+    const allocator = testing.allocator;
+    const text = "...I should call the get_weather function.</think>" ++
+        "<|tool_call_start|>[get_weather(city='Paris', days=3, metric=True, tags=['trip', 'eu'])]<|tool_call_end|>";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer freeParsedCalls(calls);
+
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("get_weather", calls[0].name);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    const o = parsed.value.object;
+    try testing.expectEqualStrings("Paris", o.get("city").?.string);
+    try testing.expectEqual(@as(i64, 3), o.get("days").?.integer);
+    // A schema `boolean` must arrive as a real bool, not the string "True".
+    try testing.expectEqual(true, o.get("metric").?.bool);
+    // A schema `array` must arrive as a real array — the #94 defect in the
+    // grammar where it is easiest to ship: the value is literal text.
+    const tags = o.get("tags").?.array;
+    try testing.expectEqual(@as(usize, 2), tags.items.len);
+    try testing.expectEqualStrings("trip", tags.items[0].string);
+    try testing.expectEqualStrings("eu", tags.items[1].string);
+}
+
+test "pythonic: several calls in one bracket list, and None/float/dict values" {
+    const allocator = testing.allocator;
+    const text = "<|tool_call_start|>[read_file(path='a.txt'), " ++
+        "plot(scale=1.5, title=None, opts={'grid': True, 'dpi': 96})]<|tool_call_end|>";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer freeParsedCalls(calls);
+
+    try testing.expectEqual(@as(usize, 2), calls.len);
+    try testing.expectEqualStrings("read_file", calls[0].name);
+    try testing.expectEqualStrings("plot", calls[1].name);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[1].arguments, .{});
+    defer parsed.deinit();
+    const o = parsed.value.object;
+    try testing.expectEqual(@as(f64, 1.5), o.get("scale").?.float);
+    try testing.expectEqual(std.json.Value.null, o.get("title").?);
+    try testing.expectEqual(true, o.get("opts").?.object.get("grid").?.bool);
+    try testing.expectEqual(@as(i64, 96), o.get("opts").?.object.get("dpi").?.integer);
+}
+
+test "pythonic: separators inside a string value are not separators" {
+    // `)` `,` `[` inside the quoted value must not end the arg or the call —
+    // the delimiter-drop class in reverse (a naive scan cuts here).
+    const allocator = testing.allocator;
+    const text = "<|tool_call_start|>[shell(cmd='ls -la (tmp), [x]', dir='/a')]<|tool_call_end|>";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer freeParsedCalls(calls);
+
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("ls -la (tmp), [x]", parsed.value.object.get("cmd").?.string);
+    try testing.expectEqualStrings("/a", parsed.value.object.get("dir").?.string);
+}
+
+test "pythonic: escapes are unescaped, and a double-quoted string is accepted" {
+    const allocator = testing.allocator;
+    const text = "<|tool_call_start|>[write(body='line1\\nit\\'s \\\\ done', path=\"b.txt\")]<|tool_call_end|>";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer freeParsedCalls(calls);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("line1\nit's \\ done", parsed.value.object.get("body").?.string);
+    try testing.expectEqualStrings("b.txt", parsed.value.object.get("path").?.string);
+}
+
+test "pythonic: a truncated call recovers the NAME with EMPTY args, never a partial value" {
+    // max_tokens cut mid-argument. Shipping half a file body is worse than
+    // re-issuing the call (the truncated-opener rule); the name is enough for
+    // the client to see a tool_calls finish and retry.
+    const allocator = testing.allocator;
+    const text = "<|tool_call_start|>[write_file(path='a.html', content='<!DOCTYPE html>\\n<p>cut mid-";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer freeParsedCalls(calls);
+
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("write_file", calls[0].name);
+    try testing.expectEqualStrings("{}", calls[0].arguments);
+}
+
+test "pythonic: tolerates a dropped outer bracket and a dropped end marker" {
+    const allocator = testing.allocator;
+    // No `[`, no `<|tool_call_end|>` — one delimiter drop must not cost the call.
+    const calls = (try parseToolCalls(allocator, "<|tool_call_start|>get_time(tz='UTC')")).?;
+    defer freeParsedCalls(calls);
+
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("get_time", calls[0].name);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("UTC", parsed.value.object.get("tz").?.string);
+}
+
+test "pythonic: an unparseable value stays honest as a string, and keys dedup" {
+    const allocator = testing.allocator;
+    const text = "<|tool_call_start|>[run(mode=fast, mode=slow)]<|tool_call_end|>";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer freeParsedCalls(calls);
+
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    // Bare identifier is not a Python literal — kept verbatim rather than
+    // guessed at, so a client's own validation error stays honest. First wins.
+    try testing.expectEqualStrings("fast", parsed.value.object.get("mode").?.string);
+}
+
+test "pythonic: the marker is required — prose that mentions a call is not one" {
+    const allocator = testing.allocator;
+    try testing.expect((try parseToolCalls(allocator, "Call get_weather(city='Paris') to do that.")) == null);
+}
+
+test "issue #94: a container param carried as literal TEXT coerces to a real array/object" {
+    // #94 reports this as an open gap on the strength of the doc comment
+    // ("only SCALARS are touched"), which was stale — `coerceValueToType` has
+    // had its array/object arm since 60ba5ec (2026-07-09), two weeks before
+    // the issue was filed. Pinned as a TEST rather than left as a code read,
+    // so the claim is settled by evidence and cannot silently regress.
+    const allocator = testing.allocator;
+    const tools =
+        \\[{"type":"function","function":{"name":"stats","parameters":{"type":"object","properties":{"nums":{"type":"array","items":{"type":"integer"}},"opts":{"type":"object"},"label":{"type":"string"}}}}}]
+    ;
+    var calls = [_]ParsedToolCall{.{
+        .name = try allocator.dupe(u8, "stats"),
+        .arguments = try allocator.dupe(u8, "{\"nums\":\"[1, 2, 3]\",\"opts\":\"{\\\"grid\\\": true}\",\"label\":\"[not an array]\"}"),
+    }};
+    defer {
+        allocator.free(calls[0].name);
+        allocator.free(calls[0].arguments);
+    }
+
+    try coerceToolArgsToSchema(allocator, &calls, tools);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    const o = parsed.value.object;
+
+    const nums = o.get("nums").?.array;
+    try testing.expectEqual(@as(usize, 3), nums.items.len);
+    try testing.expectEqual(@as(i64, 2), nums.items[1].integer);
+    try testing.expectEqual(true, o.get("opts").?.object.get("grid").?.bool);
+    // A STRING param whose content merely looks bracket-y is untouched — the
+    // schema decides, never the spelling.
+    try testing.expectEqualStrings("[not an array]", o.get("label").?.string);
+}
+
 test "parseToolCalls DSV4 nested <tool name=\"X\"> inside <tool_calls> wrapper" {
     // Real capture from DSV4-Flash:
     //   <tool_calls>
@@ -7940,6 +8375,96 @@ test "streamThinkGate: partial opener at the buffer tail holds" {
 
 test "streamThinkGate: plain prose with thinking off flushes" {
     try testing.expectEqual(StreamThinkGate.flush_text, streamThinkGate("17 × 23 = 391.", false, false));
+}
+
+test "streamThinkGate: a prompt-opened block is held even with thinking OFF" {
+    // LFM2.5 renders `…assistant\n<think>` UNCONDITIONALLY — there is no
+    // enable_thinking branch in its template, so the model always reasons and
+    // the opener is never in the OUTPUT. The gate saw tag-free prose with
+    // thinking off and flushed the entire chain-of-thought as the answer
+    // (live 2026-08-04, streaming only — non-streaming strips it because the
+    // `</think>` is present by the time the text is split).
+    //
+    // Whether the prompt ends inside a think block is a fact about the
+    // RENDERED BYTES, not about our request flag, which is why it needs its
+    // own argument rather than riding `enable_thinking`.
+    try testing.expectEqual(StreamThinkGate.hold_thinking, streamThinkGate2("The user wants me to say hi in 5 words.", false, false, true));
+    try testing.expectEqual(StreamThinkGate.split_think, streamThinkGate2("The user wants 5 words.</think>Hi there, how are you?", false, false, true));
+
+    // Containment, both directions. Same buffers with the prompt flag FALSE
+    // behave exactly as before — every other family's template renders the
+    // closed `<think></think>` signature (or no tag) when thinking is off, so
+    // `promptTailOpensThink` is false for them and this term can never fire.
+    try testing.expectEqual(StreamThinkGate.flush_text, streamThinkGate2("The user wants me to say hi in 5 words.", false, false, false));
+    // And once the block has closed, a prompt-opened flag must not re-hold the
+    // visible answer — that would hide every reply after the first.
+    try testing.expectEqual(StreamThinkGate.flush_text, streamThinkGate2("Hi there, how are you?", false, true, true));
+}
+
+test "unstreamedReasoning: only the remainder, and never a resend" {
+    try testing.expectEqualStrings("cde", unstreamedReasoning("abcde", 2).?);
+    try testing.expectEqualStrings("abcde", unstreamedReasoning("abcde", 0).?);
+    // Nothing new since the last delta.
+    try testing.expect(unstreamedReasoning("abcde", 5) == null);
+    // The split SHRANK (a tool marker appeared mid-thought and the leaked-markup
+    // cut took the tail). Deltas cannot be retracted, so send nothing more —
+    // resending from the top would duplicate the whole thought.
+    try testing.expect(unstreamedReasoning("ab", 5) == null);
+    try testing.expect(unstreamedReasoning("", 0) == null);
+}
+
+test "streamTailIsReasoning: an unopened block was content all along" {
+    // Gemma 4 with enable_thinking:true answering "391" directly — no opener
+    // in the prompt (its template renders a bare `<|turn>model\n`) and none in
+    // the output. Streamed, the whole answer arrived as reasoning_content with
+    // EMPTY content while non-streaming returned it as content (live
+    // 2026-08-04). Content is the correct reading: nothing ever opened.
+    try testing.expect(!streamTailIsReasoning(true, false, false));
+
+    // A template-opened block that never closed IS reasoning — the truncated
+    // thought must not leak into content (Qwen/LFM2.5 pre-inject the opener).
+    try testing.expect(streamTailIsReasoning(true, true, false));
+    // A model-emitted opener is the same evidence (Gemma's `<|channel>thought`,
+    // Inkling's `<|content_thinking|>`), even with no prompt opener.
+    try testing.expect(streamTailIsReasoning(true, false, true));
+    // Already closed and split ⇒ the tail is the visible answer.
+    try testing.expect(!streamTailIsReasoning(false, true, true));
+}
+
+test "promptTailOpensThink does not match Gemma's channel opener" {
+    // The containment boundary for the prompt-opened-think stream arm: it
+    // detects the close with `</think>` ONLY, which is sound exactly because
+    // the flag can only be set by a `<think`-family opener. Gemma 4 opens with
+    // `<|channel>thought` and closes with `<channel|>`, so it never enters
+    // that arm and its streaming is byte-unchanged.
+    //
+    // If `thinkOpenTagLenAt` ever grows the channel opener, this test fails —
+    // and `server.zig`'s arm then needs `<channel|>` in its close check, or a
+    // Gemma turn would be held forever waiting for a tag that never arrives.
+    try testing.expect(!promptTailOpensThink("<|turn>model\n<|channel>thought\n"));
+    try testing.expect(!promptTailOpensThink("<|turn>model\n"));
+    // The `<think>` family it DOES match — bare and suffixed (hy3).
+    try testing.expect(promptTailOpensThink("<|im_start|>assistant\n<think>"));
+    try testing.expect(promptTailOpensThink("<|im_start|>assistant\n<think:opensource>"));
+}
+
+test "streamThinkGate: the 3-arg form is the 4-arg form with no prompt opener" {
+    // The old signature is kept as the no-prompt-opener case so every existing
+    // call site and test pins the SAME behavior it always did.
+    const cases = [_][]const u8{
+        "The user is asking about their system specs.",
+        "The user is asking.\n</think>\n\nI don't have direct access.",
+        "<think>hmm",
+        "17 × 23 = 391.",
+        "The answer is 391.\n<|channel>",
+    };
+    for (cases) |c| {
+        for ([_]bool{ true, false }) |think| {
+            for ([_]bool{ true, false }) |closed| {
+                try testing.expectEqual(streamThinkGate(c, think, closed), streamThinkGate2(c, think, closed, false));
+            }
+        }
+    }
 }
 
 test "parseToolCalls: self-closing <tool name=... arguments=... />" {

@@ -466,25 +466,34 @@ struct VideoModelPreset: Identifiable, Hashable {
         )
     }()
 
-    /// MiniMax-H3 canvases. Every axis must be a multiple of 32, and cost is
-    /// roughly quadratic in the pixel count because the DiT attends over one
-    /// packed sequence — so the labels carry rough wall-clock, since the jump
-    /// from 256² to 480p is minutes to most of an hour on an M4 Max.
+    /// The server sends width/height straight to the DiT with no resampling,
+    /// so these must already be on the model's trained canvas — no smaller
+    /// tier exists (MiniMax's H3-Base generates natively at 768p; 2K needs a
+    /// separate regenerate stage we haven't converted). Computed via
+    /// `adapt_canvas`/`minimax_h3.adaptCanvas`'s own math (768px short edge,
+    /// ≤768×1344 area, /32) over MiniMax's stated six aspect ratios (21:9 to
+    /// 9:16). 1344×768 is the reference node's default and the confirmed-good
+    /// rap demo's resolution. Speed labels are pixel-count ratios vs the
+    /// smallest option (768×768 = 0.59MP), squared — the DiT attends over one
+    /// packed sequence, so cost is roughly quadratic in pixel count: 4:3/3:4
+    /// (0.79MP) ≈1.8x, and 16:9/9:16/21:9 all land on the same area cap
+    /// (1.03MP) ≈3.1x. Estimates, not measured per-resolution timings.
     private static let h3Resolutions: [ResolutionOption] = [
-        .init(width: 256,  height: 256, label: "256 × 256 (square) — fastest"),
-        .init(width: 384,  height: 256, label: "384 × 256 (landscape 3:2)"),
-        .init(width: 448,  height: 256, label: "448 × 256 (widescreen 16:9)"),
-        .init(width: 512,  height: 512, label: "512 × 512 (square) — slow"),
-        .init(width: 864,  height: 480, label: "864 × 480 (480p 16:9) — very slow"),
+        .init(width: 1344, height: 768,  label: "1344 × 768 (16:9 widescreen) — recommended, 3x slower"),
+        .init(width: 768,  height: 768,  label: "768 × 768 (square) — fastest"),
+        .init(width: 1024, height: 768,  label: "1024 × 768 (4:3 landscape) — 2x slower"),
+        .init(width: 768,  height: 1024, label: "768 × 1024 (3:4 portrait) — 2x slower"),
+        .init(width: 768,  height: 1344, label: "768 × 1344 (9:16 portrait) — 3x slower"),
+        .init(width: 1536, height: 672,  label: "1536 × 672 (21:9 cinematic) — 3x slower"),
     ]
 
-    /// MiniMax-H3's frame ladder is `17k + 5`, NOT LTX's `8N + 1`: its VAE
-    /// folds 17 source frames into 5 latent tokens. The picker must only offer
-    /// these, or the server snaps the count and the clip is a different length
-    /// than the one requested.
-    private static func h3FrameLadder(maxFrames: Int) -> [Int] {
+    /// H3's frame ladder is `17k + 5`, NOT LTX's `8N + 1` (its VAE folds 17
+    /// source frames into 5 latent tokens) — offering a count off it means the
+    /// server silently snaps it. Floor is 124, the reference node's own
+    /// trained-range start; shorter is off-distribution, not just "fast".
+    private static func h3FrameLadder(minFrames: Int, maxFrames: Int) -> [Int] {
         var out: [Int] = []
-        var n = 5
+        var n = minFrames
         while n <= maxFrames {
             out.append(n)
             n += 17
@@ -497,9 +506,10 @@ struct VideoModelPreset: Identifiable, Hashable {
     private static func minimaxH3Preset(repo: String, name: String,
                                         downloadGB: Int, ramGB: Int,
                                         description: String) -> VideoModelPreset {
-        // The model's own trained range is ~124-362 frames; below 124 is
-        // off-distribution but generates fine and is far faster.
-        let cap = 124
+        // Trained range is ~124-362 (reference tooltip); 209 is our own
+        // validated ceiling (the rap demo), not the untested-by-us 362.
+        let minF = 124
+        let cap = 209
         return VideoModelPreset(
             id: repo,
             name: name,
@@ -515,15 +525,17 @@ struct VideoModelPreset: Identifiable, Hashable {
             resolutions: h3Resolutions,
             defaultResolution: h3Resolutions[0],
             fps: 24,
+            // .good = the eyeballed capstone A/B; .quality = the rap demo's
+            // longer 209-frame run.
             qualityProfiles: [
-                .fast:         .init(mode: .oneStage, steps: 16, cfgScale: 1.0, stgScale: 0.0, numFrames: 56),
-                .good:         .init(mode: .oneStage, steps: 30, cfgScale: 1.0, stgScale: 0.0, numFrames: 56),
-                .quality:      .init(mode: .oneStage, steps: 40, cfgScale: 1.0, stgScale: 0.0, numFrames: 73),
-                .superQuality: .init(mode: .oneStage, steps: 50, cfgScale: 1.0, stgScale: 0.0, numFrames: 124),
+                .fast:         .init(mode: .oneStage, steps: 16, cfgScale: 1.0, stgScale: 0.0, numFrames: minF),
+                .good:         .init(mode: .oneStage, steps: 30, cfgScale: 1.0, stgScale: 0.0, numFrames: minF),
+                .quality:      .init(mode: .oneStage, steps: 30, cfgScale: 1.0, stgScale: 0.0, numFrames: cap),
+                .superQuality: .init(mode: .oneStage, steps: 50, cfgScale: 1.0, stgScale: 0.0, numFrames: cap),
             ],
             defaultQuality: .good,
             maxFrames: cap,
-            frameOptions: h3FrameLadder(maxFrames: cap),
+            frameOptions: h3FrameLadder(minFrames: minF, maxFrames: cap),
             description: description,
             backend: .minimaxH3,
             supportsLoRA: false,
@@ -540,7 +552,7 @@ struct VideoModelPreset: Identifiable, Hashable {
         name: "MiniMax-H3 (Hailuo 3.0) 8-bit — video + native audio",
         downloadGB: 69,
         ramGB: 44,
-        description: "Generates video with a matching stereo soundtrack from one prompt — the sound is produced jointly with the picture, not dubbed on after. Describe the scene, then the audio you want after 'overall_soundscape:'. Compute-heavy: a couple of minutes at 256 × 256, considerably longer at 480p."
+        description: "Generates video with a matching stereo soundtrack from one prompt — the sound is produced jointly with the picture, not dubbed on after. Describe the scene, then the audio you want after 'overall_soundscape:'. Slow: with the fast recipe on (default), the recommended 1344 × 768 / 124 frames takes about 50 minutes on an M4 Max; 209 frames takes roughly 2 hours. Off, both take 2-6x longer."
     )
 
     /// The 4-bit pack: same speed (the DiT is compute-bound), ~40 GB download

@@ -83,7 +83,14 @@ enum MediaChatDefaults {
     /// preview and every extra second is another ~30 s of GPU.
     static let videoSeconds: Double = 2
     static let videoMaxSeconds: Double = 4
-    static let videoSteps = 8
+    /// Preview steps are the MODEL's own fast tier, never a shared constant:
+    /// the old `videoSteps = 8` was LTX's fast preset applied to everything,
+    /// and H3 is not step-distilled — its validated floor is 16, so a chat
+    /// preview burned 15+ minutes of GPU on an off-recipe clip. LTX still
+    /// resolves to 8.
+    static func videoSteps(for model: VideoModelPreset) -> Int {
+        model.settings(.fast).steps
+    }
     static let videoMode: VideoPipelineMode = .oneStage
 }
 
@@ -372,7 +379,7 @@ enum MediaToolArgs {
             numFrames: videoFrames(args["seconds"], model: model),
             fps: model.fps,
             mode: MediaChatDefaults.videoMode,
-            steps: MediaChatDefaults.videoSteps,
+            steps: MediaChatDefaults.videoSteps(for: model),
             cfgScale: 1.0,
             keepResident: keepResident,
             lanModelId: lanId)

@@ -17,9 +17,13 @@ final class VideoGenA2VWiringTests: XCTestCase {
 
     func testAttachedAudioReachesTheRequest() throws {
         let source = try videoGenViewSource()
+        // Capability-gated on purpose: the clip must reach the request on a
+        // backend that takes audio input (LTX), and must NOT reach the
+        // transcode — whose failure is a hard error — on one that generates
+        // its own soundtrack (MiniMax-H3).
         XCTAssertTrue(
-            source.contains("audioPath: audioURL?.path"),
-            "VideoGenView must pass the attached clip into VideoGenRequest.audioPath — otherwise a2vid silently degrades to generated audio"
+            source.contains("audioPath: model.supportsAudioInput ? audioURL?.path : nil"),
+            "VideoGenView must pass the attached clip into VideoGenRequest.audioPath (gated on supportsAudioInput) — otherwise a2vid silently degrades to generated audio, or a stale clip hard-errors an H3 generate"
         )
     }
 
