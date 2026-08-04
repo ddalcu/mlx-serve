@@ -255,6 +255,13 @@ struct MLXCoreApp: App {
         }
         .defaultSize(width: 900, height: 620)
         .commands {
+            CommandGroup(replacing: .newItem) {
+                    Button("New Chat") {
+                        openAndFocus("chat")
+                        _ = appState.newChatSession()
+                    }
+                    .keyboardShortcut("n", modifiers: [.command])
+                }
             CommandMenu("Agent") {
                 Button("Agents…") { openAndFocus("agents") }
                     .keyboardShortcut("a", modifiers: [.command, .shift])
