@@ -3464,7 +3464,7 @@ fileprivate struct GrowingTextEditor: NSViewRepresentable {
     var isIdle: Bool
     var onSend: () -> Void
 
-    let inset = NSSize(width: 7, height: 8)
+    let inset = NSSize(width: 2, height: 8)
 
     func makeCoordinator() -> Coordinator { Coordinator(self) }
 
