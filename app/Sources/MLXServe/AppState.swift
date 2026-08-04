@@ -656,6 +656,27 @@ class AppState: ObservableObject {
         saveChatHistory()
     }
 
+    /// Batch delete — the sidebar's multi-select "Delete" action. Mirrors
+    /// `deleteSession` per id (killing background processes, dropping
+    /// bookmarks, stopping orphaned turns) rather than calling it in a loop,
+    /// so history is only saved once at the end.
+    func deleteSessions(_ ids: Set<UUID>) {
+        guard !ids.isEmpty else { return }
+        for id in ids {
+            processRegistry.killSession(id)
+            documentIndexes[id]?.cancel()
+            documentIndexes.removeValue(forKey: id)
+            SecurityScopedBookmark.clear(name: SecurityScopedBookmark.workingFolderName(id))
+            SecurityScopedBookmark.clear(name: SecurityScopedBookmark.attachedFolderName(id))
+        }
+        chatSessions.removeAll { ids.contains($0.id) }
+        chatEngine.stopIfOrphaned()
+        if let active = activeChatId, ids.contains(active) {
+            activeChatId = chatSessions.first?.id
+        }
+        saveChatHistory()
+    }
+
     func updateLastMessage(in sessionId: UUID, content: String? = nil, reasoning: String? = nil, streaming: Bool? = nil, usage: TokenUsage? = nil) {
         guard let sIdx = chatSessions.firstIndex(where: { $0.id == sessionId }),
               !chatSessions[sIdx].messages.isEmpty else { return }

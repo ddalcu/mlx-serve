@@ -476,12 +476,35 @@ struct ChatSidebar: View {
     @EnvironmentObject var appState: AppState
     @Environment(\.openWindow) private var openWindow
     @State private var hoveredSessionId: UUID?
+    /// Bulk-delete mode: checkboxes replace the hover-only delete glyph and
+    /// row taps toggle membership in `selectedForDeletion` instead of opening
+    /// the chat. A separate mode (rather than repurposing the List's own
+    /// `UUID?` selection, which drives `activeChatId` app-wide) so entering it
+    /// can never change what chat is open underneath.
+    @State private var isSelecting = false
+    @State private var selectedForDeletion: Set<UUID> = []
+    @State private var showBulkDeleteConfirm = false
 
     var body: some View {
         List(selection: $appState.activeChatId) {
             ForEach(appState.visibleChatSessions) { session in
                 let isSelected = session.id == appState.activeChatId
                 HStack(spacing: 0) {
+                    if isSelecting {
+                        Button {
+                            toggleSelection(session.id)
+                        } label: {
+                            Image(systemName: selectedForDeletion.contains(session.id)
+                                  ? "checkmark.circle.fill" : "circle")
+                                .font(.system(size: 15))
+                                .symbolRenderingMode(.hierarchical)
+                                .foregroundStyle(selectedForDeletion.contains(session.id)
+                                                  ? Color.accentColor
+                                                  : (isSelected ? .white.opacity(0.8) : .secondary))
+                        }
+                        .buttonStyle(.plain)
+                        .padding(.trailing, 8)
+                    }
                     VStack(alignment: .leading, spacing: 2) {
                         HStack(spacing: 4) {
                             if session.isExternalBridge {
@@ -521,7 +544,7 @@ struct ChatSidebar: View {
                         }
                     }
                     Spacer(minLength: 4)
-                    if hoveredSessionId == session.id {
+                    if !isSelecting, hoveredSessionId == session.id {
                         Button {
                             appState.deleteSession(session.id)
                         } label: {
@@ -534,13 +557,30 @@ struct ChatSidebar: View {
                         .help("Delete chat")
                     }
                 }
+                .contentShape(Rectangle())
                 .tag(session.id)
+                .onTapGesture {
+                    if isSelecting { 
+                        toggleSelection(session.id) 
+                    } else if NSEvent.modifierFlags.contains(.shift) {
+                        isSelecting = true
+                        selectedForDeletion = selectionRange(to: session.id)
+                    } else {
+                        // gotta do this manually now since the tap gesture 
+                        // intercepts the default list selection
+                        appState.activeChatId = session.id
+                    }
+                }
                 .onHover { isHovered in
                     hoveredSessionId = isHovered ? session.id : nil
                 }
                 .listRowBackground(
                     Group {
-                        if isSelected {
+                        if isSelecting && selectedForDeletion.contains(session.id) {
+                            RoundedRectangle(cornerRadius: 8)
+                                .fill(Color.accentColor.opacity(0.25))
+                                .padding(.horizontal, 6)
+                        } else if isSelected {
                             RoundedRectangle(cornerRadius: 8)
                                 .fill(Color.accentColor)
                                 .padding(.horizontal, 6)
@@ -553,6 +593,10 @@ struct ChatSidebar: View {
                 .contextMenu {
                     Button("Delete", role: .destructive) {
                         appState.deleteSession(session.id)
+                    }
+                    Button("Select Multiple…") {
+                        isSelecting = true
+                        selectedForDeletion = [session.id]
                     }
                 }
             }
@@ -570,25 +614,118 @@ struct ChatSidebar: View {
         // control it configures. The sidebar is the conversation list, and a
         // second route to the same two windows only competed with it.
         .safeAreaInset(edge: .bottom) {
-            HStack(spacing: 8) {
-                Button {
-                    _ = appState.newChatSession()
-                } label: {
-                    Label("New Chat", systemImage: "plus")
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                        .contentShape(Rectangle())
+            if isSelecting {
+                bulkDeleteBar
+            } else {
+                HStack(spacing: 8) {
+                    Button {
+                        _ = appState.newChatSession()
+                    } label: {
+                        Label("New Chat", systemImage: "plus")
+                            .frame(maxWidth: .infinity, maxHeight: .infinity)
+                            .contentShape(Rectangle())
+                    }
+                    // `.plain` + our own frame and background, NOT `.bordered` —
+                    // see `ChatMetrics.sidebarButtonHeight`. It is the only way the
+                    // two controls are the same height by construction rather than
+                    // by whatever a style style decides their labels are worth.
+                    .buttonStyle(.plain)
+                    .sidebarActionButton()
+                    newAgentChatMenu
                 }
-                // `.plain` + our own frame and background, NOT `.bordered` —
-                // see `ChatMetrics.sidebarButtonHeight`. It is the only way the
-                // two controls are the same height by construction rather than
-                // by whatever a style style decides their labels are worth.
-                .buttonStyle(.plain)
-                .sidebarActionButton()
-                newAgentChatMenu
+                .padding(.horizontal, 12)
+                .padding(.vertical, 10)
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 10)
         }
+        .confirmationDialog(
+            selectedForDeletion.count == 1
+                ? "Delete this chat?"
+                : "Delete \(selectedForDeletion.count) chats?",
+            isPresented: $showBulkDeleteConfirm,
+            titleVisibility: .visible
+        ) {
+            Button("Delete \(selectedForDeletion.count == 1 ? "Chat" : "\(selectedForDeletion.count) Chats")",
+                   role: .destructive) {
+                appState.deleteSessions(selectedForDeletion)
+                selectedForDeletion.removeAll()
+                isSelecting = false
+            }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("This can't be undone.")
+        }
+    }
+
+    /// Replaces the New Chat bar while `isSelecting` is on: Cancel exits the
+    /// mode, Select All toggles between all-selected and none, and Delete
+    /// fires the confirmation before actually removing anything (a bulk
+    /// action deserves the extra guard a single delete's context menu skips).
+    private var bulkDeleteBar: some View {
+        HStack(spacing: 8) {
+            Button("Cancel") {
+                isSelecting = false
+                selectedForDeletion.removeAll()
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.secondary)
+            // .cancelAction binds this to Esc, same as the edit bubble's
+            // Cancel button — only live while this bar is on screen, i.e.
+            // only while `isSelecting` is true.
+            .keyboardShortcut(.cancelAction)
+
+            Spacer()
+
+            Button(selectedForDeletion.count == appState.visibleChatSessions.count
+                   ? "Deselect All" : "Select All") {
+                if selectedForDeletion.count == appState.visibleChatSessions.count {
+                    selectedForDeletion.removeAll()
+                } else {
+                    selectedForDeletion = Set(appState.visibleChatSessions.map(\.id))
+                }
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.secondary)
+
+            Button {
+                showBulkDeleteConfirm = true
+            } label: {
+                Label("Delete\(selectedForDeletion.isEmpty ? "" : " (\(selectedForDeletion.count))")",
+                      systemImage: "trash")
+            }
+            .buttonStyle(.plain)
+            .foregroundStyle(.red)
+            .disabled(selectedForDeletion.isEmpty)
+        }
+        .font(.subheadline)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+    }
+
+    private func toggleSelection(_ id: UUID) {
+        if selectedForDeletion.contains(id) {
+            selectedForDeletion.remove(id)
+        } else {
+            selectedForDeletion.insert(id)
+        }
+    }
+
+    /// Shift-click's range: everything between the chat that's currently
+    /// open and the row that was shift-clicked, inclusive, in the sidebar's
+    /// own order — not just the two endpoints. Anchored on `activeChatId`
+    /// (the open chat) rather than wherever a previous shift-click landed,
+    /// since that's the reference point the person can actually see. Falls
+    /// back to just the clicked row if there's no open chat to anchor on
+    /// (e.g. nothing selected yet) or either end can't be located.
+    private func selectionRange(to targetId: UUID) -> Set<UUID> {
+        let sessions = appState.visibleChatSessions
+        guard let anchorId = appState.activeChatId,
+              let anchorIndex = sessions.firstIndex(where: { $0.id == anchorId }),
+              let targetIndex = sessions.firstIndex(where: { $0.id == targetId })
+        else {
+            return [targetId]
+        }
+        let range = anchorIndex <= targetIndex ? anchorIndex...targetIndex : targetIndex...anchorIndex
+        return Set(sessions[range].map(\.id))
     }
 
     /// Start a chat AS an agent.
@@ -1175,6 +1312,10 @@ struct ChatDetailView: View {
     }
 
     private var emptyState: some View {
+        // Was a single LEADING Spacer, so the greeting hugged the bottom of
+        // whatever box the outer layout gave this view — i.e. sat just above
+        // the composer with a tall gap above it. A trailing Spacer balances
+        // it so the text centers in that box instead of pinning to its floor.
         VStack(spacing: 10) {
             Spacer()
             Text("How can I help you today?")
@@ -1188,8 +1329,9 @@ struct ChatDetailView: View {
                     .font(.callout)
                     .foregroundStyle(.secondary)
             }
+            Spacer()
         }
-        .frame(maxWidth: .infinity)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
     var body: some View {
