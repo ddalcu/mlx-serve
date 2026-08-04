@@ -58,10 +58,19 @@ struct VideoGenView: View {
     /// Hydration guard — see ImageGenView for the full rationale.
     @State private var hydrating: Bool = false
     @State private var didHydrate: Bool = false
+    /// True while a drag carrying a file hovers the window — drives the
+    /// dashed-border drop overlay (see ImageGenView, same idiom).
+    @State private var isDropTargeted: Bool = false
 
     var body: some View {
         readyView
         .frame(minWidth: 880, minHeight: 660)
+        // Drop an image anywhere in the window to set it as the first frame —
+        // not just onto the "Choose image..." button.
+        .onDrop(of: [.fileURL], isTargeted: $isDropTargeted) { providers in
+            handleImageDrop(providers)
+        }
+        .overlay { dropOverlay }
         .onAppear {
             if !didHydrate {
                 hydrating = true
@@ -144,6 +153,18 @@ struct VideoGenView: View {
         }
     }
 
+    /// Dashed highlight shown while a drag is over the window.
+    @ViewBuilder
+    private var dropOverlay: some View {
+        if isDropTargeted {
+            RoundedRectangle(cornerRadius: 8)
+                .strokeBorder(Color.accentColor, style: StrokeStyle(lineWidth: 3, dash: [8]))
+                .background(Color.accentColor.opacity(0.06))
+                .allowsHitTesting(false)
+                .padding(6)
+        }
+    }
+
     // MARK: - Sections
 
     private var promptSection: some View {
@@ -154,6 +175,19 @@ struct VideoGenView: View {
                 Menu("Examples") {
                     ForEach(Self.examplePrompts, id: \.title) { ex in
                         Button(ex.title) { prompt = ex.body }
+                    }
+                    // User-dropped prompts from ~/.mlx-serve/examples/video/
+                    // — read fresh on every menu open, so no restart needed
+                    // to pick up a newly-added file.
+                    let custom = CustomPromptExamples.load(for: "video")
+                        if !custom.isEmpty {
+                            ForEach(custom, id: \.name) { group in
+                                Section(group.name) {
+                                    ForEach(group.examples, id: \.title) { ex in
+                                        Button(ex.title) { prompt = ex.body }
+                                }
+                            }
+                        }
                     }
                 }
                 .menuStyle(.borderlessButton)
@@ -718,6 +752,27 @@ struct VideoGenView: View {
         if AppActivation.runModal(panel) == .OK, let url = panel.url {
             firstFrameImageURL = url
         }
+    }
+
+    /// Entry point for `.onDrop`: only one image slot exists on this pane
+    /// (the first frame), so unlike ImageGen's source/reference routing this
+    /// is just "the dropped image becomes — or replaces — the first frame."
+    /// Item providers resolve asynchronously off the UI thread, so the
+    /// actual assignment happens back on the main actor.
+    private func handleImageDrop(_ providers: [NSItemProvider]) -> Bool {
+        let candidates = providers.filter { $0.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) }
+        guard let provider = candidates.first else { return false }
+        provider.loadObject(ofClass: URL.self) { url, _ in
+            guard let url, Self.isImageFile(url) else { return }
+            DispatchQueue.main.async { firstFrameImageURL = url }
+        }
+        return true
+    }
+
+    /// Same extension allow-list as ImageGenView's drop handling.
+    private static func isImageFile(_ url: URL) -> Bool {
+        let ext = url.pathExtension.lowercased()
+        return ["png", "jpg", "jpeg", "heic", "heif", "webp", "tiff", "tif", "gif", "bmp"].contains(ext)
     }
 
     private func numberField(_ label: String, value: Binding<Int>, step: Int) -> some View {
