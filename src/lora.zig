@@ -322,11 +322,17 @@ pub const CanonMatch = struct { canon: []const u8, split: Split };
 /// table recognizes it, so unlisted-but-already-compatible names and
 /// genuinely-unknown ones both degrade to today's behavior rather than
 /// silently dropping the tensor.
-pub fn canonicalize(module: []const u8, flat: bool, arch: Arch, bufs: *[MAX_FANOUT]CanonBuf) []CanonMatch {
-    var out: [MAX_FANOUT]CanonMatch = undefined;
+pub fn canonicalize(
+    module: []const u8,
+    flat: bool,
+    arch: Arch,
+    bufs: *[MAX_FANOUT]CanonBuf,
+    out: *[MAX_FANOUT]CanonMatch,
+) []CanonMatch {
     var n: usize = 0;
     var fbuf_alias: [128]u8 = undefined;
     var fbuf_canon: [128]u8 = undefined;
+
     for (archTable(arch)) |row| {
         if (n >= MAX_FANOUT) break;
         const block = if (flat) blk: {
@@ -336,13 +342,16 @@ pub fn canonicalize(module: []const u8, flat: bool, arch: Arch, bufs: *[MAX_FANO
             if (matchTemplate(module, fc)) |b| break :blk b;
             continue;
         } else (matchTemplate(module, row.alias) orelse continue);
+
         out[n] = .{ .canon = formatCanonical(&bufs[n], row.canonical, block), .split = row.split };
         n += 1;
     }
+
     if (n == 0) {
         out[0] = .{ .canon = formatCanonical(&bufs[0], module, ""), .split = .none };
         n = 1;
     }
+
     return out[0..n];
 }
 
@@ -600,7 +609,8 @@ pub fn loadFile(allocator: std.mem.Allocator, path: []const u8, arch: Arch) !Fil
         // EVERY match needs its own Entry, or two of every three fused
         // targets (to_k/to_v) would silently never get an adapter attached.
         var canon_bufs: [MAX_FANOUT]CanonBuf = undefined;
-        const matches = canonicalize(e.key_ptr.*, p.flat, arch, &canon_bufs);
+        var canon_out: [MAX_FANOUT]CanonMatch = undefined;
+        const matches = canonicalize(e.key_ptr.*, p.flat, arch, &canon_bufs, &canon_out);
         for (matches) |m| {
             const idx = splitIndex(m.split);
             const at = try prepTransposed(p.a, s);
@@ -836,13 +846,14 @@ test "loadFile: rank-divisible-by-3 fused source shares full-rank A across every
 test "canonicalize resolves Kohya flat-scheme module names, not just dotted ones" {
     // Dotted BFL-style key, e.g. from a diffusers/BFL export.
     var bufs: [MAX_FANOUT]CanonBuf = undefined;
-    const dotted = canonicalize("double_blocks.3.img_attn.qkv", false, .flux2, &bufs);
+    var out: [MAX_FANOUT]CanonMatch = undefined;
+    const dotted = canonicalize("double_blocks.3.img_attn.qkv", false, .flux2, &bufs, &out);
     try testing.expectEqual(@as(usize, 3), dotted.len); // fused qkv fans out to q/k/v
     try testing.expectEqualStrings("transformer_blocks.3.attn.to_q", dotted[0].canon);
 
     // The same tensor, but as it actually appears in a Kohya `lora_unet_...`
     // flat export: dots replaced with underscores in the module portion.
-    const flat = canonicalize("double_blocks_3_img_attn_qkv", true, .flux2, &bufs);
+    const flat = canonicalize("double_blocks_3_img_attn_qkv", true, .flux2, &bufs, &out);
     try testing.expectEqual(@as(usize, 3), flat.len);
     try testing.expectEqualStrings("transformer_blocks.3.attn.to_q", flat[0].canon);
 }
