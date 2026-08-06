@@ -33,6 +33,16 @@ struct BuildFeatures: Equatable {
     let ociPull: Bool
     /// AppleScript / AppleEvents automation.
     let appleEvents: Bool
+    /// Point the model library at folders outside the app's own storage.
+    ///
+    /// Not an App Review rule — a sandbox one. Under MAS the server helper is
+    /// signed `com.apple.security.inherit`, which inherits the app's CONTAINER
+    /// but NOT its security-scoped grants, so the app could pick a folder that
+    /// the process which actually reads the weights cannot open. (Today's path
+    /// works precisely because inside the sandbox `~` IS the container, so both
+    /// processes resolve `~/.mlx-serve/models` to the same place.) A setting
+    /// that silently breaks model loading is worse than one that isn't there.
+    let customModelFolders: Bool
 
     let guest: GuestCapability
 
@@ -66,12 +76,12 @@ struct BuildFeatures: Equatable {
 
     static let developerID = BuildFeatures(
         selfUpdate: true, cliInstaller: true, cliLauncher: true,
-        hostShell: true, ociPull: true, appleEvents: true,
+        hostShell: true, ociPull: true, appleEvents: true, customModelFolders: true,
         guest: .init(packageManagers: .live, mcpServers: .fetched))
 
     static let mas = BuildFeatures(
         selfUpdate: false, cliInstaller: false, cliLauncher: false,
-        hostShell: false, ociPull: false, appleEvents: false,
+        hostShell: false, ociPull: false, appleEvents: false, customModelFolders: false,
         guest: .init(packageManagers: .live, mcpServers: .prebaked))
 
     static let current: BuildFeatures = {

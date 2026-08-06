@@ -11,12 +11,19 @@ agreement with the reference's own output, not with a transcription.
 The T==1 causal semantics: the front temporal pads are all zeros, so a full
 zero-pad + conv3d is bit-equivalent to the reference's `autopad="causal_zero"`
 tap truncation (zero frames contribute nothing; the bias is applied once
-either way). We implement the zero-pad form because it needs no comfy.ops.
+either way). We implement the zero-pad form because it needs no comfy.ops —
+and it is ALSO the reference's own T>1 branch verbatim, so one implementation
+covers both.
 
-Two cases are dumped:
+Cases:
   x        [1,3,1,128,128]  — single tile (128 <= 256)
   x_tiled  [1,3,1,384,384]  — exercises the reference's own tiled_encode
                               (split [0,128] overlap 128, latent blend + trim)
+  v5       [1,3,5,96,96]    — one 17-frame clip after repeat-padding, 2 tokens
+  v22      [1,3,22,64,64]   — TWO clips, so the chunk seam is exercised, 7 tokens
+
+The video frames MOVE (a translating pattern): a static clip makes every
+temporal error invisible, exactly like a permutation-invariant checksum.
 
 Inputs are in [-1, 1] like the server's request path; the dump applies the
 same pixel normalization `encode()` does.
@@ -46,6 +53,8 @@ LATENTS_STD_KEY = "latents_std"
 TILE_SIZE = 256
 TILE_OVERLAP_MIN = 64
 VAE_RATIO = 16
+CLIP_LENGTH = 17
+TOKEN_DROP = 3
 
 
 class CausalConv3d(nn.Conv3d):
@@ -219,6 +228,38 @@ def tiled_encode(encode_moments, x):
     return torch.cat(result_rows, dim=-2)
 
 
+def encode_temporal(adaptive_encode, x):
+    """The reference's own `encode_temporal`: repeat-pad the tail to a whole
+    number of 17-frame clips, encode each clip INDEPENDENTLY (the VAE was
+    trained on 17-frame clips — this is semantic, not a memory optimization),
+    concatenate, then drop the trailing `token_drop` latent frames."""
+    if x.shape[2] % CLIP_LENGTH != 0:
+        pad_size = (-x.shape[2]) % CLIP_LENGTH
+        x = torch.cat([x, x[:, :, -1:].repeat(1, 1, pad_size, 1, 1)], dim=2)
+    num_chunks = x.shape[2] // CLIP_LENGTH
+    z = torch.cat([adaptive_encode(x[:, :, i * CLIP_LENGTH:(i + 1) * CLIP_LENGTH])
+                   for i in range(num_chunks)], dim=2)
+    if TOKEN_DROP > 0:
+        z = z[:, :, :-TOKEN_DROP]
+    return z
+
+
+def synth_video(size, frames, seed):
+    """A MOVING pattern: the phase advances per frame, so a port that collapses
+    the temporal axis, reverses it, or mis-strides it cannot match. A static
+    clip would pass all three."""
+    y = torch.linspace(0, 1, size).view(1, 1, 1, size, 1)
+    x = torch.linspace(0, 1, size).view(1, 1, 1, 1, size)
+    t = torch.arange(frames, dtype=torch.float32).view(1, 1, frames, 1, 1) / max(1, frames)
+    c0 = torch.sin(2 * math.pi * (x * 3 + t * 2 + seed * 0.1)) * torch.cos(2 * math.pi * (y * 2 - t))
+    c1 = ((x + t * 0.5) % 1.0 > 0.5).float() * 2 - 1
+    c2 = torch.sin(2 * math.pi * (x + y + t * 3) * 5)
+    img = torch.cat([c0.expand(1, 1, frames, size, size),
+                     c1.expand(1, 1, frames, size, size),
+                     c2.expand(1, 1, frames, size, size)], dim=1) * 0.8
+    return img.float().contiguous()
+
+
 def synth_image(size, seed):
     """Deterministic structured test image in [-1,1] — smooth + edges so the
     convs see real gradients, reproducible without torch RNG portability."""
@@ -261,10 +302,16 @@ def main():
         with torch.no_grad():
             return quant(enc(x))
 
+    def adaptive_encode(x):
+        return tiled_encode(encode_moments, x)
+
     def encode(x_pm1):
         x = (x_pm1 + 1.0) * 0.5
         x = (x - mean) / std
-        moments = tiled_encode(encode_moments, x)
+        if x.shape[2] == 1:
+            moments = adaptive_encode(x)
+        else:
+            moments = encode_temporal(adaptive_encode, x)
         m = torch.chunk(moments, 2, dim=1)[0]
         return (m - lm) / ls
 
@@ -275,6 +322,17 @@ def main():
         out[name] = img.contiguous()
         out["latent" + ("_tiled" if size == 384 else "")] = lat.float().contiguous()
         print(f"{name}: {tuple(img.shape)} -> {tuple(lat.shape)} "
+              f"mean {lat.mean().item():+.4f} std {lat.std().item():.4f}")
+
+    # Video: 5 frames is ONE clip after repeat-padding (17 -> 5 tokens, 2 after
+    # the drop); 22 frames is TWO clips, which is the only way to exercise the
+    # seam between independently-encoded clips.
+    for name, size, frames in (("v5", 96, 5), ("v22", 64, 22)):
+        vid = synth_video(size, frames, seed=11 if frames == 5 else 13)
+        lat = encode(vid)
+        out[name] = vid
+        out["latent_" + name] = lat.float().contiguous()
+        print(f"{name}: {tuple(vid.shape)} -> {tuple(lat.shape)} "
               f"mean {lat.mean().item():+.4f} std {lat.std().item():.4f}")
 
     save_file(out, args.out)

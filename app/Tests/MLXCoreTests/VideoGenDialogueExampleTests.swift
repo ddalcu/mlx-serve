@@ -1,45 +1,41 @@
 import XCTest
+@testable import MLXCore
 
-/// LTX only generates speech when the prompt contains quoted dialogue (the
-/// official prompting guide: put the spoken words between quotation marks,
-/// with acting directions between phrases). Without it the soundtrack is
-/// ambient noise — the exact "audio works but nobody talks" report. The
-/// video pane's Examples menu and placeholder are the only prompting
-/// guidance users see, so they must demonstrate the dialogue format.
+/// A video model only generates SPEECH when the prompt asks for it in that
+/// model's own notation, and the pane's Examples menu plus placeholder are the
+/// only prompting guidance users see — so they must demonstrate it.
 ///
-/// MLXCore is an executable target (no @testable import), and these are UI
-/// string constants — so this test reads the view source directly, the
-/// InfoPlistTests pattern.
+/// The two engines spell it differently, which is the whole reason this is a
+/// per-format guard now:
+///   LTX  — the spoken words between quotation marks, acting directions
+///          between phrases (its official prompting guide). Without it the
+///          soundtrack is ambient noise, the exact "audio works but nobody
+///          talks" report.
+///   H3   — `<d>[English] …</d>` spoken by a numbered speaker `(S1)`, inside
+///          `integrated_multimodal_description:` / `detailed_description:`.
+///
+/// These strings used to live in `VideoGenView` and this test read the view
+/// source; they moved to `H3PromptExamples` when the guidance became
+/// per-backend, so it reads the API instead — a source scan would now pass
+/// vacuously off unrelated text in the view.
 final class VideoGenDialogueExampleTests: XCTestCase {
-    private func videoGenViewSource() throws -> String {
-        let url = URL(fileURLWithPath: #filePath)
-            .deletingLastPathComponent() // MLXCoreTests
-            .deletingLastPathComponent() // Tests
-            .deletingLastPathComponent() // Tests → app root
-            .appendingPathComponent("Sources/MLXServe/Views/VideoGenView.swift")
-        return try String(contentsOf: url, encoding: .utf8)
+
+    func testLtxExamplesDemonstrateQuotedDialogue() {
+        let spoken = H3PromptExamples.ltx.filter { $0.body.contains("says") && $0.body.contains("\"") }
+        XCTAssertFalse(spoken.isEmpty,
+                       "No LTX example demonstrates quoted dialogue — without one, users never learn the format that makes LTX characters speak")
     }
 
-    func testExamplesIncludeQuotedDialoguePrompt() throws {
-        let source = try videoGenViewSource()
-        // An example body with spoken words in (escaped) quotes — the marker
-        // of the dialogue prompt format. `says` + `\"` must appear in the
-        // examplePrompts block.
-        let examplesBlock = try XCTUnwrap(
-            source.range(of: "examplePrompts").map { String(source[$0.lowerBound...]) },
-            "VideoGenView lost its examplePrompts list"
-        )
-        XCTAssertTrue(
-            examplesBlock.contains("says") && examplesBlock.contains("\\\""),
-            "No example prompt demonstrates quoted dialogue — without one, users never learn the format that makes LTX characters speak"
-        )
+    func testLtxPlaceholderMentionsDialogueInQuotes() {
+        XCTAssertTrue(H3PromptExamples.placeholder(for: .ltx).contains("dialogue in quotes"),
+                      "The LTX placeholder should tell users to put spoken dialogue in quotes — it's the only way LTX generates speech")
     }
 
-    func testPlaceholderMentionsDialogueInQuotes() throws {
-        let source = try videoGenViewSource()
-        XCTAssertTrue(
-            source.contains("dialogue in quotes"),
-            "The prompt placeholder should tell users to put spoken dialogue in quotes — it's the only way LTX generates speech"
-        )
+    func testH3ExamplesDemonstrateItsOwnDialogueMarkup() {
+        // H3 does NOT take quoted dialogue: speech rides `<d>[Language] …</d>`
+        // with a speaker id. An example rewritten into LTX-style quotes would
+        // teach the wrong notation for the model it is shown under.
+        let spoken = H3PromptExamples.h3Base.filter { $0.body.contains("<d>[English]") && $0.body.contains("(S1)") }
+        XCTAssertFalse(spoken.isEmpty, "No H3 example demonstrates <d>[English] …</d> dialogue with a speaker id")
     }
 }

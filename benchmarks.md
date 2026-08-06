@@ -3,7 +3,7 @@
 **Update rules — read before editing:**
 - Results go into the tables ONLY. No text, no commentary, no per-release notes — the CSVs in `docs/perf-csvs/` and `docs/gotchas/` carry the stories.
 - **Apple M4 Max 128 GB ONLY.** Do not update these tables from any other machine (e.g. the M4 mini) — numbers across hardware are not comparable and one mixed column poisons the whole history.
-- Methodology: `tests/bench.sh` code cell — decode tok/s, temp 0, max_tokens 128, ctx 4096, thinking off, mlx-serve ReleaseFast. Per-cell medians where repeated. `·` = not measured / not in the matrix that release. The `speedup` column is first measured column vs latest; recompute it when adding a release column.
+- Methodology: `tests/bench.sh` headline decode tok/s, mlx-serve ReleaseFast. Columns through 26.7.12 come from the in-repo harness (temp 0, max_tokens 128, ctx 4096, thinking off, per-cell medians); columns from 26.8 on come from llmprobe (`--bench-only`, warmup discarded, median of 3, its own code-completion prompt, engine on shipping defaults). **The two are not comparable cell to cell** — a `speedup` spanning the switch measures the harness as much as the engine. `·` = not measured / not in the matrix that release.
 
 ## Best config (MTP / drafter / PLD — speculative decoding on where it wins)
 

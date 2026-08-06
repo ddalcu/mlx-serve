@@ -230,7 +230,7 @@ pub const SubmitParams = struct {
     drafter: ?*DrafterModel = null,
     drafter_block_size: u32 = 4,
     enable_mtp: bool = false,
-    mtp: ?*mtp_mod.MtpModel = null,
+    mtp: ?generate_mod.MtpHeadRef = null,
     /// 0 = auto (see generate_mod.resolveMtpDepthCap).
     mtp_depth: u32 = 0,
     pld_draft_len: u32 = 5,
@@ -351,7 +351,7 @@ pub const Slot = struct {
     drafter: ?*DrafterModel,
     drafter_block_size: u32,
     enable_mtp: bool,
-    mtp: ?*mtp_mod.MtpModel,
+    mtp: ?generate_mod.MtpHeadRef,
     mtp_depth: u32,
     pld_draft_len: u32,
     pld_key_len: u32,
@@ -375,6 +375,16 @@ pub const Slot = struct {
     finished: bool,
     error_code: ?[]const u8,
     finish_reason: []const u8,
+    /// Set ONLY by the degenerate-tail guard. `finish_reason` stays "length"
+    /// (see `loopStopReason`) — this is the sibling signal that says WHICH
+    /// kind of "length" it was, so a client can tell a server-cut loop from a
+    /// genuine max_tokens truncation without log archaeology. Static string,
+    /// never freed.
+    finish_details: ?[]const u8,
+    /// Index into the emitted tokens where the degenerate span begins;
+    /// everything from here on is the loop. Non-streaming responses are cut
+    /// here so the client cannot round-trip the loop into the next prompt.
+    loop_trim_start: ?usize,
     cancelled: std.atomic.Value(bool),
 
     // ── Stats (filled by inference thread, safe to read after finish). ──
@@ -527,6 +537,8 @@ pub const Slot = struct {
             .finished = false,
             .error_code = null,
             .finish_reason = "length",
+            .finish_details = null,
+            .loop_trim_start = null,
             .cancelled = std.atomic.Value(bool).init(false),
             .prompt_tokens = 0,
             .completion_tokens = 0,
@@ -1442,6 +1454,24 @@ pub const Scheduler = struct {
         for (self.decoding.items) |slot| slot.cancel();
     }
 
+    /// The media residency bill for an entry, or 0 when it is not a media
+    /// model. The backend type must come from the DIRECTORY, never from the
+    /// entry's stub config, whose `model_type` is the MODALITY static
+    /// ("AudioVideo" for every video backend) and would bill the sum.
+    /// `arch_hint` is discovery's own read of config.json — the same authority
+    /// `gen.peekModelType` is — so it is used when present and the peek is the
+    /// fallback for an entry registered without one.
+    fn mediaPeakFor(self: *Scheduler, entry: *LoadedModel) u64 {
+        if (entry.arch_hint.len > 0) {
+            if (gen_mod.modalityFromType(entry.arch_hint) == null) return 0;
+            return gen_mod.estimatePeakResidentBytes(self.io, entry.path, entry.arch_hint);
+        }
+        const peeked = gen_mod.peekModelType(self.io, self.allocator, entry.path) orelse return 0;
+        defer self.allocator.free(peeked);
+        if (gen_mod.modalityFromType(peeked) == null) return 0;
+        return gen_mod.estimatePeakResidentBytes(self.io, entry.path, peeked);
+    }
+
     /// Plan 05 Phase D: resolve `id_or_empty` ("" / "mlx-serve" → default)
     /// to a refcounted, ready `*LoadedModel`. Cold-loads on demand: if the
     /// entry is `.unloaded`, parses CPU state, picks an LRU victim if
@@ -1499,6 +1529,10 @@ pub const Scheduler = struct {
         var victims_buf: [16]*LoadedModel = undefined;
         var n_victims: usize = 0;
 
+        // Peeked OUTSIDE the registry mutex — it stats the model dir, and no
+        // other load should block on our filesystem.
+        const media_peak = self.mediaPeakFor(entry);
+
         // ── Stage 1 (registry mutex): claim .loading, plan eviction.
         {
             self.registry.mutex.lockUncancelable(self.io);
@@ -1527,17 +1561,9 @@ pub const Scheduler = struct {
             // Claim the slot.
             std.debug.assert(self.registry.tryBeginLoadLocked(entry));
 
-            // Estimate post-load bytes. We use the same estimator
-            // `doLoadOnInferenceThread` does (entry.bytes_on_disk; else a
-            // layers × hidden fallback). Adds 10% headroom for KV / vision
-            // / drafter overhead — close enough for the eviction gate.
-            const estimated: u64 = blk: {
-                const base: u64 = if (entry.bytes_on_disk) |b|
-                    b
-                else
-                    @as(u64, owned.config.num_hidden_layers) * @as(u64, owned.config.hidden_size) * 4 * 4;
-                break :blk base + base / 10;
-            };
+            // Estimate post-load bytes (see `gateEstimateBytes` for why a media
+            // entry cannot be billed by its directory's size).
+            const estimated: u64 = gateEstimateBytes(media_peak, entry.bytes_on_disk, owned.config.num_hidden_layers, owned.config.hidden_size);
 
             // Reserve this load's estimate BEFORE planning eviction, so a
             // concurrent loader sees the pending allocation in its own gate.
@@ -1551,6 +1577,18 @@ pub const Scheduler = struct {
             // by an in-flight request — roll back and surface a 503 instead of
             // loading anyway and crashing.
             const n = self.registry.planEvictionsLocked(entry.id, &victims_buf) orelse {
+                // Name the numbers. A refusal that logs NOTHING sends the user
+                // hunting for a concurrent request that does not exist: on an
+                // idle server the cause is always the static cap (#126), and
+                // the flag that moves it is not otherwise discoverable.
+                const gb = 1024.0 * 1024.0 * 1024.0;
+                log.err("Refusing to load {s}: needs ~{d:.2} GB but --max-resident-mem is {d:.2} GB ({d:.2} GB already resident across {d} model(s), none evictable). Raise or disable the cap with --max-resident-mem <size>|0.\n", .{
+                    entry.id,
+                    @as(f64, @floatFromInt(estimated)) / gb,
+                    @as(f64, @floatFromInt(self.registry.max_resident_mem)) / gb,
+                    @as(f64, @floatFromInt(self.registry.current_resident_bytes)) / gb,
+                    self.registry.countLoadedLocked(),
+                });
                 self.registry.markUnloadedLocked(entry); // releases the reservation
                 self.registry.mutex.unlock(self.io);
                 return error.NotEnoughMemory;
@@ -1800,11 +1838,13 @@ pub fn modelBatchable(cfg: *const model_mod.ModelConfig) bool {
 /// request's state and both then append tokens to the ONE state (live
 /// 2026-08-02: an app chat leaked into a pi stream, every word doubled).
 /// Serial-tick interleave stays safe for per-slot-state archs (laguna/hy3)
-/// — key on the transformer's dsv4 pointer (mirrors runPrefill's is_dsv4),
-/// NEVER on !modelBatchable.
+/// — ask the transformer which archs own their decode state, NEVER key on
+/// !modelBatchable, and never name ONE arch here: when a second module-owned
+/// arch arrived, this function's hardcoded `dsv4` check silently never
+/// reached the gate for it.
 fn modelExclusiveDecode(model: *const model_registry_mod.LoadedModel) bool {
     const t = model.transformer orelse return false;
-    return t.dsv4 != null;
+    return t.ownsModuleDecodeState();
 }
 
 /// One pending-drain candidate (or live decoding slot), reduced to what
@@ -2244,6 +2284,39 @@ fn doLoadLlamaOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     sch.hot_prefix_cache = null;
 }
 
+/// The post-load residency bill the eviction gate reserves, in bytes.
+///
+/// A media entry is billed by its BACKEND: a staged-residency model
+/// (`minimax_h3` runs its text encoder and FREES it before the DiT loads) never
+/// holds the sum of every safetensors in its directory. The gate runs BEFORE
+/// the media preflight that already knows this, so a disagreement here is a
+/// refusal the preflight never gets to overturn — H3's 37.55 GiB sum against a
+/// 48 GB Mac's 30.0 GiB auto cap made the model permanently unloadable while
+/// its real 22.83 GiB peak fit with 7 GB to spare (#126).
+///
+/// `media_peak == 0` means "not a media model, or a directory we could not
+/// read" and keeps the original ladder byte-for-byte. 10% headroom on top for
+/// KV / vision / drafter overhead — close enough for an eviction gate.
+pub fn gateEstimateBytes(media_peak: u64, bytes_on_disk: ?u64, num_hidden_layers: u32, hidden_size: u32) u64 {
+    const base: u64 = if (media_peak > 0)
+        media_peak
+    else if (bytes_on_disk) |b|
+        b
+    else
+        @as(u64, num_hidden_layers) * @as(u64, hidden_size) * 4 * 4;
+    return base + base / 10;
+}
+
+/// What a media load COMMITS to the residency budget once ready. Same estimator
+/// the gate reserved against, so reserve and commit can only differ by the
+/// gate's headroom: committing the dir sum instead parked H3 in the budget at
+/// 14.7 GB more than it can ever hold, evicting live LLMs for bytes nobody was
+/// using (#126, secondary 1).
+pub fn genLoadResidentBytes(media_peak: u64, bytes_on_disk: u64) u64 {
+    if (media_peak > 0) return media_peak;
+    return bytes_on_disk;
+}
+
 /// Media-gen load on the inference thread. Mirrors `doLoadDs4OnInferenceThread`:
 /// build the modality engine (its mlx ops bind to this thread's GPU stream from
 /// t0), install it on the entry, move the stub config/tok/chat_config over, and
@@ -2306,11 +2379,24 @@ fn doLoadGenOnInferenceThread(sch: *Scheduler, params: anytype, modality: gen_mo
     entry.drafter_path = "";
     entry.prefix_cache = null;
 
+    // The SAME per-backend estimator the eviction gate reserved against — see
+    // `genLoadResidentBytes`. Peeked here rather than reused from the preflight
+    // block above because `--skip-mem-preflight` skips that block entirely, and
+    // the residency budget is not a preflight.
     const bytes_resident: u64 = blk: {
-        if (entry.bytes_on_disk) |b| {
-            if (b > 0) break :blk b;
-        }
-        break :blk gen_mod.estimateResidentBytes(sch.io, params.model_dir);
+        const peeked = gen_mod.peekModelType(sch.io, sch.allocator, params.model_dir);
+        defer if (peeked) |p| sch.allocator.free(p);
+        const media_peak: u64 = if (peeked) |p|
+            gen_mod.estimatePeakResidentBytes(sch.io, params.model_dir, p)
+        else
+            0;
+        const on_disk: u64 = on_disk_blk: {
+            if (entry.bytes_on_disk) |b| {
+                if (b > 0) break :on_disk_blk b;
+            }
+            break :on_disk_blk gen_mod.estimateResidentBytes(sch.io, params.model_dir);
+        };
+        break :blk genLoadResidentBytes(media_peak, on_disk);
     };
 
     sch.registry.mutex.lockUncancelable(sch.io);
@@ -2417,6 +2503,73 @@ fn memInsufficientForLoad(weights_bytes: u64, avail_bytes: u64) bool {
     const HEADROOM_CAP: u64 = 6 * 1024 * 1024 * 1024;
     const headroom: u64 = @min(weights_bytes / 8, HEADROOM_CAP) + 1024 * 1024 * 1024;
     return avail_bytes < weights_bytes + headroom;
+}
+
+test "the eviction gate bills a media entry its BACKEND peak, never the dir's safetensors sum" {
+    // #126. MiniMax-H3's four safetensors sum to 37.55 GiB, but the text
+    // encoder RUNS AND IS FREED before the DiT loads, so the real staged peak
+    // is 22.83 GiB. `doLoadGenOnInferenceThread`'s preflight already bills it
+    // correctly — and never gets the chance, because this gate runs first and
+    // billed the sum. On a 48 GB Mac (auto cap = 80% of a 38338 MB wired limit
+    // = 30.0 GiB) that refused every load, permanently, on an idle server with
+    // nothing to evict and nothing to wait for.
+    const disk_sum: u64 = 40_316_668_515; // te + dit + video_vae + audio_vae
+    const staged_peak: u64 = 24_511_876_594; // max(te, dit) + both vaes
+    const cap: u64 = 30 * 1024 * 1024 * 1024;
+
+    try testing.expect(gateEstimateBytes(0, disk_sum, 0, 0) > cap); // the bug
+    try testing.expect(gateEstimateBytes(staged_peak, disk_sum, 0, 0) <= cap); // the fix
+
+    // A media peak OUTRANKS bytes_on_disk — the whole point is that the two
+    // disagree. It must not be averaged, summed or maxed with it.
+    try testing.expectEqual(staged_peak + staged_peak / 10, gateEstimateBytes(staged_peak, disk_sum, 0, 0));
+
+    // Non-media entries are BYTE-UNCHANGED: a zero peak means "not a media
+    // model" (or a dir we could not read), and the old ladder stands.
+    try testing.expectEqual(@as(u64, 1100), gateEstimateBytes(0, 1000, 0, 0));
+    try testing.expectEqual(@as(u64, 0), gateEstimateBytes(0, 0, 0, 0));
+    // No bytes_on_disk → the layers × hidden × 16 fallback, unchanged.
+    const fallback: u64 = 32 * 4096 * 16;
+    try testing.expectEqual(fallback + fallback / 10, gateEstimateBytes(0, null, 32, 4096));
+}
+
+test "the gate and the media preflight read ONE estimator" {
+    // The class bug in #126 is not the formula, it is that two sites computed
+    // the same bill differently and the stricter one ran first. Both call
+    // `gen.estimatePeakResidentBytes`; the gate reaches it through
+    // `mediaPeakFor`, which is the only place allowed to decide "is this a
+    // media entry, and what backend is it". Needles are ++-split so this
+    // test's own source cannot satisfy the scan.
+    const src = @embedFile("scheduler.zig");
+    const peek = "const media_peak = self.mediaPeak" ++ "For(entry);";
+    try testing.expect(std.mem.indexOf(u8, src, peek) != null);
+    const gate = "gateEstimateBytes(media_peak, entry.bytes_on" ++ "_disk,";
+    try testing.expect(std.mem.indexOf(u8, src, gate) != null);
+    // The raw-bytes_on_disk shape the gate used to have must be GONE.
+    const old = "const base: u64 = if (entry.bytes_on" ++ "_disk) |b|";
+    try testing.expect(std.mem.indexOf(u8, src, old) == null);
+    // Both the preflight and the committed residency go through the estimator.
+    var n: usize = 0;
+    var i: usize = 0;
+    const needle = "gen_mod.estimatePeakResident" ++ "Bytes(";
+    while (std.mem.indexOfPos(u8, src, i, needle)) |p| : (i = p + needle.len) n += 1;
+    try testing.expect(n >= 2);
+}
+
+test "a media model commits the residency the gate reserved" {
+    // Secondary #1 of the issue: the gate reserved the staged peak and then
+    // `markReadyLocked` committed the DIR SUM, so H3 sat in the budget at
+    // 37.55 GB — 14.7 GB more than it can ever hold — and would evict a
+    // genuinely-resident LLM to make room for bytes nobody was using.
+    // Reserve-then-commit must read the same estimator, so the only difference
+    // between them is the gate's 10% headroom.
+    const staged_peak: u64 = 24_511_876_594;
+    const disk_sum: u64 = 40_316_668_515;
+    try testing.expectEqual(staged_peak, genLoadResidentBytes(staged_peak, disk_sum));
+    // A backend with no staged plan keeps the sum (peak == sum there anyway).
+    try testing.expectEqual(disk_sum, genLoadResidentBytes(0, disk_sum));
+    // Neither known → 0, as before.
+    try testing.expectEqual(@as(u64, 0), genLoadResidentBytes(0, 0));
 }
 
 test "memInsufficientForLoad: headroom + unknown-query guards" {
@@ -2550,6 +2703,10 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     errdefer sch.allocator.destroy(xfm_ptr);
     xfm_ptr.* = try Transformer.init(sch.io, sch.allocator, params.config.*, weights_ptr);
     errdefer xfm_ptr.deinit();
+
+    // Reserved-token suppression mask (never sample `<|fim_hole|>`-class
+    // specials): derived per model from tokenizer + template + eos.
+    generate_mod.installSuppressMask(xfm_ptr, params.tok, params.chat_config.chat_template, params.config.eosTokenSlice());
 
     // Propagate the kv-quant config to the Transformer's own cache. Slot
     // caches in serve mode honor this independently in `Slot.init`; this
@@ -2828,7 +2985,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     entry.vision_encoder = vision_ptr;
     entry.drafter = drafter_ptr;
     entry.drafter_block_size = sch.drafter_block_size;
-    entry.mtp = mtp_ptr;
+    entry.mtp = if (mtp_ptr) |h| generate_mod.MtpHeadRef{ .qwen = h } else null;
     // Resolve the auto (0) cap here so every downstream reader of
     // `lm.mtp_depth` (server log lines, slot params) sees the real value.
     entry.mtp_depth = generate_mod.Generator.resolveMtpDepthCapForProfile(params.mtp_depth, mtp_cost_profile);
@@ -3526,12 +3683,12 @@ fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
         // allocator's bookkeeping stays clean.
         gen_ptr.ssm_checkpoint_alloc.?.free(ssm_cps_slice);
     }
-    hc.commitWithSsm(&slot.cache, total_tokens, slot.has_tools, ssm_cps_opt) catch |err| {
+    hc.commitWithState(&slot.cache, total_tokens, slot.has_tools, ssm_cps_opt) catch |err| {
         log.warn("[hot-cache] commit failed: {s}\n", .{@errorName(err)});
         // Commit failed — we still own the checkpoints. Free them so they
         // don't leak.
+        const a = gen_ptr.ssm_checkpoint_alloc orelse sch.allocator;
         if (ssm_cps_opt) |cps| {
-            const a = gen_ptr.ssm_checkpoint_alloc orelse sch.allocator;
             for (cps) |*cp| cp.deinit(a);
             a.free(cps);
         }
@@ -3554,18 +3711,41 @@ fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
 /// its recovery fires. Live 2026-07-14 (plang/php.html): "stop" became
 /// "tool_calls", presenting a server-cut fragment as a model-completed write.
 pub fn loopStopReason(generated_ids: []const u32) ?[]const u8 {
-    if (generate_mod.isDegenerateTailLoop(
-        generated_ids,
-        generate_mod.degenerate_loop_max_period,
-        generate_mod.degenerate_loop_reps,
-    )) return "length";
-    if (generate_mod.isDegenerateTailLoopRange(
-        generated_ids,
-        generate_mod.degenerate_loop_max_period + 1,
-        generate_mod.degenerate_loop_long_max_period,
-        generate_mod.degenerate_loop_long_reps,
-    )) return "length";
-    return null;
+    const d = loopStopDecision(generated_ids) orelse return null;
+    return d.finish_reason;
+}
+
+/// What a loop cut tells the rest of the server. `finish_reason` is the wire
+/// value (always "length" — see above); `finish_details` is the sibling
+/// signal that names the CAUSE, and `trim_start` is where the client's copy
+/// of the answer should end.
+pub const LoopStop = struct {
+    finish_reason: []const u8 = "length",
+    /// The `finish_details.type` value. One string for all three tiers: a
+    /// client's decision ("this turn is unusable, don't feed it back") is the
+    /// same whichever tier convicted, and the tier is in the log.
+    finish_details: []const u8 = "repetition_loop",
+    tier: generate_mod.DegenerateTail.Tier,
+    trim_start: usize,
+};
+
+/// Pure decision + trim point. The three tiers live in generate.zig
+/// (`degenerateTail`); this is where their verdict becomes server behaviour.
+pub fn loopStopDecision(generated_ids: []const u32) ?LoopStop {
+    const d = generate_mod.degenerateTail(generated_ids) orelse return null;
+    return .{ .tier = d.tier, .trim_start = d.start };
+}
+
+var loop_trim_env: ?bool = null;
+/// `MLX_SERVE_LOOP_TRIM=0` keeps the whole degenerate tail in the response —
+/// the A/B arm, and the escape hatch for anyone who needs to see exactly what
+/// the model emitted. The cut itself is unaffected either way.
+pub fn loopTrimEnabled() bool {
+    if (loop_trim_env) |v| return v;
+    const raw = std.c.getenv("MLX_SERVE_LOOP_TRIM");
+    const enabled = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
+    loop_trim_env = enabled;
+    return enabled;
 }
 
 fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
@@ -4010,14 +4190,32 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     // mode (stage-bearing checkpoint + clean-greedy request) or zero
     // everything. skip_lazy_preforward deliberately ignores the intent bit:
     // a non-armed dsv4 request keeps today's synchronous-t1 serial init.
-    const is_dsv4 = slot.model.transformer != null and slot.model.transformer.?.dsv4 != null;
-    const use_mtp = !is_dsv4 and slot.enable_mtp and slot.mtp != null;
-    const use_drafter = !use_mtp and !is_dsv4 and slot.enable_drafter and slot.drafter != null;
-    const use_pld = !use_mtp and !use_drafter and !is_dsv4 and slot.enable_pld;
-    // DSpark rides the MTP flag alone (the "model's native head" semantics):
-    // the server defaults enable_mtp ON for a stage-bearing dsv4, the n-gram
-    // prompt gate never touches it, and enable_mtp:false opts out.
-    const dsv4_spec_intent = is_dsv4 and slot.enable_mtp;
+    // A module-owned arch that CAN rewind (`moduleStateSpecRollback`) may run
+    // its own MTP head; PLD/drafter stay off there for the reasons in
+    // `specInitWiring`. DSpark rides the MTP flag alone (the
+    // "model's native head" semantics): the server defaults enable_mtp ON for a
+    // stage-bearing dsv4, the n-gram prompt gate never touches it, and
+    // enable_mtp:false opts out.
+    const owns_module_state = slot.model.transformer != null and
+        slot.model.transformer.?.ownsModuleDecodeState();
+    const has_native_draft = slot.model.transformer != null and
+        slot.model.transformer.?.dsv4 != null;
+    const module_spec_rollback = slot.model.transformer != null and
+        slot.model.transformer.?.moduleStateSpecRollback();
+    const wiring = specInitWiring(
+        owns_module_state,
+        module_spec_rollback,
+        has_native_draft,
+        slot.enable_mtp,
+        slot.mtp != null,
+        slot.enable_drafter,
+        slot.drafter != null,
+        slot.enable_pld,
+    );
+    const use_mtp = wiring.use_mtp;
+    const use_drafter = wiring.use_drafter;
+    const use_pld = wiring.use_pld;
+    const dsv4_spec_intent = wiring.native_intent;
 
     // Phase A6: prefill source-of-truth is `slot.full_prompt` — the conn
     // thread's `reuseKVCache` may have trimmed `slot.prompt_ids` based on
@@ -4202,6 +4400,61 @@ fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
     }
 }
 
+/// What `runPrefill` arms in a slot's Generator init options.
+pub const SpecInitWiring = struct {
+    use_mtp: bool,
+    use_drafter: bool,
+    use_pld: bool,
+    /// The request's spec INTENT, forwarded to the Generator chokepoint for a
+    /// module-owned arch that has its OWN draft mode (dsv4 → DSpark). Rides
+    /// `pld_enabled` alongside `use_pld`.
+    native_intent: bool,
+};
+
+/// Per-site spec gating for one slot, as a pure function.
+///
+/// Speculative decode must be able to ROLL BACK a rejected tail, and the shell
+/// rolls back what it owns: the slot's KVCache and ssm_entries. A MODULE-OWNED
+/// arch uses neither — by the time a verify forward returns, its own state has
+/// already absorbed every draft token, and the shell's snapshot/truncate run
+/// over an empty entries array. So every shell-driven spec mode is off there.
+///
+/// This used to be three hand-written `!is_dsv4` conjuncts. A second
+/// module-owned arch arrived with the same `Model.state` shape and a 0-layer
+/// shell cache, got no conjunct, and `--pld` drove verify forwards straight
+/// through it. One predicate, one place to extend.
+pub fn specInitWiring(
+    owns_module_state: bool,
+    module_spec_rollback: bool,
+    has_native_draft: bool,
+    enable_mtp: bool,
+    has_mtp: bool,
+    enable_drafter: bool,
+    has_drafter: bool,
+    enable_pld: bool,
+) SpecInitWiring {
+    if (owns_module_state) return .{
+        // A module-owned arch that CAN rewind its state across a verify runs
+        // its own MTP head like any other target. PLD and the drafter
+        // stay off regardless: the drafter needs a Gemma sidecar, and PLD's
+        // win case is echo-shaped traffic the n-gram gate rarely opens on a
+        // head this cheap — neither has been measured on this family, and an
+        // unmeasured spec mode is worse than none.
+        .use_mtp = module_spec_rollback and enable_mtp and has_mtp,
+        .use_drafter = false,
+        .use_pld = false,
+        .native_intent = has_native_draft and enable_mtp,
+    };
+    const use_mtp = enable_mtp and has_mtp;
+    const use_drafter = !use_mtp and enable_drafter and has_drafter;
+    return .{
+        .use_mtp = use_mtp,
+        .use_drafter = use_drafter,
+        .use_pld = !use_mtp and !use_drafter and enable_pld,
+        .native_intent = false,
+    };
+}
+
 /// Which spec mode a decode tick drives for a slot.
 pub const SpecTickMode = enum { dspark, mtp, drafter, pld, regular };
 
@@ -4262,13 +4515,18 @@ fn runSingleDecodeTick(sch: *Scheduler, slot: *Slot) !void {
     // with no repeat penalty by default and a generous max_tokens, nothing else
     // halts it until the cap. Checked here, before this tick's step, so it
     // covers the regular, PLD, and drafter paths uniformly.
-    if (loopStopReason(gen.generated_ids.items)) |reason| {
+    if (loopStopDecision(gen.generated_ids.items)) |stop| {
         // Never cut silently: the 2026-07-14 php.html post-mortem took log
-        // archaeology because this guard left no trace of having fired.
-        log.warn("[loop-stop] degenerate tail loop cut after {d} generated tokens (finish_reason={s})\n", .{
-            gen.generated_ids.items.len, reason,
+        // archaeology because this guard left no trace of having fired. The
+        // tier and the trim point are logged too — five cuts in a row is a
+        // different diagnosis from one, and the trim is what breaks the chain.
+        log.warn("[loop-stop] degenerate tail loop cut after {d} generated tokens (finish_reason={s} details={s} tier={s} trim_start={d})\n", .{
+            gen.generated_ids.items.len, stop.finish_reason, stop.finish_details,
+            @tagName(stop.tier),          stop.trim_start,
         });
-        finishSlot(sch, slot, reason);
+        slot.finish_details = stop.finish_details;
+        if (loopTrimEnabled()) slot.loop_trim_start = stop.trim_start;
+        finishSlot(sch, slot, stop.finish_reason);
         return;
     }
 
@@ -4499,7 +4757,11 @@ fn runBatchedDecodeTick(sch: *Scheduler, active: []*Slot) !void {
     for (batch, 0..) |slot, i| {
         if (slot.cancelled.load(.acquire)) continue;
         const gen = &slot.legacy_gen.?;
-        const lazy = generate_mod.sampleTokenLazy(logits_arr[i], slot.sampling, xfm_ptr.s);
+        // `gen.sampling`, not `slot.sampling`: the Generator's copy passed
+        // the initWithOptions chokepoint and carries the model's
+        // reserved-token suppression mask; the slot's copy is the raw
+        // request params.
+        const lazy = generate_mod.sampleTokenLazy(logits_arr[i], gen.sampling, xfm_ptr.s);
         try mlx.check(mlx.mlx_array_eval(lazy));
         var val: i32 = 0;
         try mlx.check(mlx.mlx_array_item_int32(&val, lazy));
@@ -4710,6 +4972,20 @@ test "inferenceLoop pending drain routes through admitPendingTick" {
     try testing.expect(std.mem.indexOf(u8, src, old) == null);
 }
 
+test "modelExclusiveDecode asks the transformer, never one hardcoded arch" {
+    // The 2026-08-02 dsv4 fix hardcoded `t.dsv4 != null` here. When a second
+    // module-owned arch arrived — same `Model.state` shape, same
+    // `reset = cache.step == 0` rebuild — the gate did not follow, and two
+    // concurrent requests shared one state. The predicate now lives beside the fields it reads
+    // (`Transformer.module_owned_state_fields`), and this pins the delegation.
+    // Needles are ++-split so this test's source can't satisfy the scan.
+    const src = @embedFile("scheduler.zig");
+    const delegated = "t.ownsModuleDecode" ++ "State()";
+    try testing.expect(std.mem.indexOf(u8, src, delegated) != null);
+    const hardcoded = "return t.dsv4 " ++ "!= null;";
+    try testing.expect(std.mem.indexOf(u8, src, hardcoded) == null);
+}
+
 test "buildGgufStubCpuState: llama stub carries gguf model_type + ctx sizing" {
     const a = std.testing.allocator;
     // No --ctx-size → the same 8192 default runLlamaServe uses (the GGUF's
@@ -4820,6 +5096,33 @@ test "loopStopReason: a LONG-period sentence loop is cut at the second tier" {
     try testing.expectEqualStrings("length", reason);
 }
 
+test "loopStopDecision: the wire reason stays length, the CAUSE rides beside it" {
+    // The reason must not move to "stop" or a new value — clients key on
+    // "length" for truncation recovery, and "tool_calls" on a server-cut
+    // fragment is the 2026-07-14 php.html failure. The cause is a SIBLING
+    // field, so pi keeps rendering "maximum output token limit" while a
+    // client that reads finish_details can tell the two apart.
+    var ids = std.ArrayList(u32).empty;
+    defer ids.deinit(testing.allocator);
+    try ids.appendSlice(testing.allocator, &[_]u32{ 5, 6, 7 });
+    for (0..generate_mod.degenerate_loop_reps + 4) |_| {
+        try ids.appendSlice(testing.allocator, &[_]u32{ 101, 102, 103 });
+    }
+
+    const stop = loopStopDecision(ids.items) orelse return error.TestExpectedLoopCut;
+    try testing.expectEqualStrings("length", stop.finish_reason);
+    try testing.expectEqualStrings("repetition_loop", stop.finish_details);
+    try testing.expectEqual(generate_mod.DegenerateTail.Tier.exact_cycle, stop.tier);
+    // Trimmed to the honest prefix plus one copy of the cycle.
+    try testing.expectEqual(@as(usize, 6), stop.trim_start);
+
+    // Healthy output decides nothing at all — no reason, and nothing to trim.
+    var healthy: [512]u32 = undefined;
+    for (&healthy, 0..) |*v, i| v.* = @intCast(i);
+    try testing.expect(loopStopDecision(&healthy) == null);
+    try testing.expect(loopStopReason(&healthy) == null);
+}
+
 test "loopStopReason: periods past the long tier stay uncut" {
     // A 70-token exact cycle (> long-tier max 64) repeated many times is
     // outside both tiers — the guard stays scoped rather than judging whole
@@ -4830,6 +5133,127 @@ test "loopStopReason: periods past the long tier stay uncut" {
     for (&cycle, 0..) |*v, i| v.* = @as(u32, @intCast(2000 + i));
     for (0..12) |_| try ids.appendSlice(testing.allocator, &cycle);
     try testing.expect(loopStopReason(ids.items) == null);
+}
+
+test "loopStopReason: a VARIED-phrasing restatement loop is cut at the near-repeat tier" {
+    // The agent-traffic shape (2026-08-04): the same intent restated forever in
+    // slightly different words. No exact cycle exists, so tiers 1 and 2 are
+    // blind and this ran to max_tokens.
+    var ids = std.ArrayList(u32).empty;
+    defer ids.deinit(testing.allocator);
+    const phrasings = [_][]const u32{
+        &[_]u32{ 40, 41, 42, 43, 44, 45, 46 },
+        &[_]u32{ 40, 41, 42, 43, 44, 46 },
+        &[_]u32{ 40, 41, 42, 43, 44, 45, 47, 48, 46 },
+        &[_]u32{ 49, 40, 41, 42, 43, 44, 45, 46 },
+        &[_]u32{ 40, 41, 42, 43, 44, 45, 50, 46 },
+    };
+    var i: usize = 0;
+    while (ids.items.len < generate_mod.near_repeat_window + 32) : (i += 1) {
+        try ids.appendSlice(testing.allocator, phrasings[i % phrasings.len]);
+    }
+    const reason = loopStopReason(ids.items) orelse return error.TestExpectedLoopCut;
+    try testing.expectEqualStrings("length", reason);
+
+    // A long answer that keeps introducing new material is untouched, however
+    // repetitive its scaffolding.
+    var healthy = std.ArrayList(u32).empty;
+    defer healthy.deinit(testing.allocator);
+    var line: u32 = 0;
+    while (healthy.items.len < generate_mod.near_repeat_window + 32) : (line += 1) {
+        try healthy.appendSlice(testing.allocator, &[_]u32{ 10, 11, 12 });
+        try healthy.append(testing.allocator, 1000 + line);
+        try healthy.appendSlice(testing.allocator, &[_]u32{ 13, 14 });
+    }
+    try testing.expect(loopStopReason(healthy.items) == null);
+}
+
+test "specInitWiring: a module-owned arch only gets the spec modes it can roll back" {
+    // Spec decode must be able to ROLL BACK a rejected tail. The shell rolls
+    // back its KVCache/ssm_entries — which a module-owned arch does not use, so
+    // by the time the verify returns, the module has already absorbed every
+    // draft and the shell's snapshot/truncate run over an EMPTY entries array.
+    // dsv4 got a hand-written `is_dsv4` conjunct on each of the three lines;
+    // the next module-owned arch (0-layer shell cache, state on the module)
+    // got none, so `--pld` drove verify forwards straight through it. The
+    // predicate is now per-ARCH CAPABILITY (`moduleStateSpecRollback`), not ownership.
+    // Args: (owns_module_state, module_spec_rollback, has_native_draft,
+    //        enable_mtp, has_mtp, enable_drafter, has_drafter, enable_pld)
+
+    // Plain arch: today's precedence, unchanged.
+    {
+        const w = specInitWiring(false, false, false, true, true, true, true, true);
+        try testing.expect(w.use_mtp and !w.use_drafter and !w.use_pld and !w.native_intent);
+    }
+    {
+        const w = specInitWiring(false, false, false, true, false, true, true, true);
+        try testing.expect(!w.use_mtp and w.use_drafter and !w.use_pld);
+    }
+    {
+        const w = specInitWiring(false, false, false, false, false, false, false, true);
+        try testing.expect(!w.use_mtp and !w.use_drafter and w.use_pld and !w.native_intent);
+    }
+    // A flag with no loaded handle never arms.
+    {
+        const w = specInitWiring(false, false, false, true, false, false, false, false);
+        try testing.expect(!w.use_mtp and !w.use_drafter and !w.use_pld);
+    }
+
+    // Module-owned with NO rollback and no native draft mode: everything off,
+    // and no intent bit either — nothing downstream can arm a draft path.
+    {
+        const w = specInitWiring(true, false, false, true, true, true, true, true);
+        try testing.expect(!w.use_mtp and !w.use_drafter and !w.use_pld and !w.native_intent);
+    }
+
+    // Module-owned WITH rollback: its own MTP head arms; the two shell
+    // spec modes stay off because neither has been measured on this family.
+    {
+        const w = specInitWiring(true, true, false, true, true, true, true, true);
+        try testing.expect(w.use_mtp and !w.use_drafter and !w.use_pld and !w.native_intent);
+    }
+    // Rollback capability alone never arms a head that is not loaded.
+    {
+        const w = specInitWiring(true, true, false, true, false, true, true, true);
+        try testing.expect(!w.use_mtp and !w.use_drafter and !w.use_pld);
+    }
+    // ...nor one the request opted out of.
+    {
+        const w = specInitWiring(true, true, false, false, true, true, true, true);
+        try testing.expect(!w.use_mtp);
+    }
+
+    // Module-owned WITH a native draft mode (dsv4/DSpark) and no rollback: the
+    // shell paths stay off, but the request's MTP intent still reaches the
+    // Generator chokepoint.
+    {
+        const w = specInitWiring(true, false, true, true, true, true, true, true);
+        try testing.expect(!w.use_mtp and !w.use_drafter and !w.use_pld);
+        try testing.expect(w.native_intent);
+    }
+    // enable_mtp:false opts out of DSpark; PLD intent alone never arms it.
+    {
+        const w = specInitWiring(true, false, true, false, false, false, false, true);
+        try testing.expect(!w.native_intent);
+    }
+}
+
+test "runPrefill gates spec through specInitWiring, not per-arch conjuncts" {
+    // A pure predicate nobody calls is a silent no-op. Needles are ++-split so
+    // this test's own source cannot satisfy the scan.
+    const src = @embedFile("scheduler.zig");
+    // Keyed on the call site's own bindings, not on a `specInitWiring(` prefix
+    // this test's own arms would satisfy.
+    inline for (.{ "const use_mtp = wiring" ++ ".use_mtp;", "const use_drafter = wiring" ++ ".use_drafter;", "const use_pld = wiring" ++ ".use_pld;", "const dsv4_spec_intent = wiring" ++ ".native_intent;" }) |needle| {
+        try testing.expect(std.mem.indexOf(u8, src, needle) != null);
+    }
+    // The exclusion must come from the shared predicate, not a new arch list.
+    const from_predicate = "transformer.?.ownsModuleDecode" ++ "State()";
+    try testing.expect(std.mem.indexOf(u8, src, from_predicate) != null);
+    // The hand-written per-arch conjuncts must be GONE — their survival is how
+    // a second module-owned arch gets missed.
+    const old_pld = "and !is_dsv4 and slot." ++ "enable_pld";
+    try testing.expect(std.mem.indexOf(u8, src, old_pld) == null);
 }
 
 test "specTickMode: every spec arm requires the GENERATOR's armed state, not the slot flag alone" {

@@ -13,6 +13,11 @@ class DownloadManager: ObservableObject {
     /// scoped to that one quant instead of the whole folder (which may already
     /// hold quants downloaded earlier). The first entry is the primary shard.
     private var activeGgufShards: [String: [String]] = [:]
+    /// The destination repoId an in-flight MLX-variant transfer is writing to
+    /// (`<org>/<repo>-4bit`), keyed by the SOURCE repo the progress row belongs
+    /// to. Same reason as `activeGgufShards`: a cancel must take down the one
+    /// variant being fetched, never the sibling quants already on disk.
+    private var activeVariantDest: [String: String] = [:]
 
     struct DownloadState {
         var progress: Double = 0
@@ -43,14 +48,60 @@ class DownloadManager: ObservableObject {
         }
     }
 
-    let modelsDir: String
+    /// Where new downloads land. `~/.mlx-serve/models` unless the user has
+    /// chosen a folder in Settings (Developer ID builds only — see
+    /// `BuildFeatures.customModelFolders`).
+    ///
+    /// Cached rather than computed per read: a transfer in flight must not have
+    /// its destination move out from under it because the user opened Settings.
+    /// `refreshRoots()` is the one place it changes.
+    @Published private(set) var modelsDir: String
+
+    /// Set only by the test initializer. When present it PINS the destination —
+    /// a test driving the download loop against a temp dir must not be steered
+    /// by whatever the developer happens to have configured.
+    private let pinnedRoot: String?
 
     /// `modelsRoot` exists so the download loop can be driven against a temp
-    /// dir in tests; the app always takes the default. Kept in sync with the
-    /// Zig resolver — `~/.mlx-serve/models` is the single source of truth.
-    init(modelsRoot: String = NSString(string: "~/.mlx-serve/models").expandingTildeInPath) {
-        try? FileManager.default.createDirectory(atPath: modelsRoot, withIntermediateDirectories: true)
-        modelsDir = modelsRoot
+    /// dir in tests; the app takes the configured destination. Kept in sync
+    /// with the Zig resolver via `ModelRoots`, which is the single source of
+    /// truth for both this and what the server is told to scan.
+    init(modelsRoot: String? = nil) {
+        if modelsRoot == nil { Self.reactivateDownloadFolderAccess() }
+        let root = modelsRoot ?? ModelRoots().downloadRoot
+        try? FileManager.default.createDirectory(atPath: root, withIntermediateDirectories: true)
+        modelsDir = root
+        pinnedRoot = modelsRoot
+    }
+
+    /// Security-scoped bookmark for the chosen download folder, re-armed at the
+    /// point the destination is adopted. A no-op in the unsandboxed Developer
+    /// ID build (which is the only build that can pick a folder today), and the
+    /// convention every other picked path here follows — a bookmark stored and
+    /// never started is a folder that works until relaunch.
+    static let downloadFolderBookmarkName = "modelDownloadFolder"
+
+    private static func reactivateDownloadFolderAccess() {
+        guard ModelRoots().configuredDownloadRoot != nil else { return }
+        _ = SecurityScopedBookmark.startAccessOnce(name: downloadFolderBookmarkName)
+    }
+
+    /// Re-read the configured download folder. Called when the setting changes;
+    /// a transfer already running keeps the destination it started with, which
+    /// is the only way a partial file and its `.parts` sidecar stay together.
+    func refreshRoots() {
+        guard pinnedRoot == nil else { return }
+        Self.reactivateDownloadFolderAccess()
+        let root = ModelRoots().downloadRoot
+        guard root != modelsDir else { return }
+        try? FileManager.default.createDirectory(atPath: root, withIntermediateDirectories: true)
+        modelsDir = root
+    }
+
+    /// Every folder to scan, download destination first. This is what the
+    /// server is handed, one `--model-dir` per entry.
+    func scanRoots() -> [String] {
+        ModelRoots().scanRoots(lmStudioRoot: lmStudioRoot)
     }
 
     // MARK: - Path resolution
@@ -159,11 +210,16 @@ class DownloadManager: ObservableObject {
         return entries.compactMap { file -> (String, Int64)? in
             guard let path = file["path"] as? String,
                   let ftype = file["type"] as? String, ftype == "file" else { return nil }
-            // Depth gate. Chat default: top-level files + the MTP sidecar
-            // (native `mtp/` dir, or OptiQ's single `optiq/mtp.safetensors`).
-            // Media (recursive): keep nested weight subdirs (FLUX's
-            // transformer/vae/text_encoder, TTS's speech_tokenizer).
-            if !selection.recursive {
+            // Depth gate. Variant: exactly the named subfolder's own files
+            // (`4bit/config.json`), never anything deeper. Chat default:
+            // top-level files + the MTP sidecar (native `mtp/` dir, or OptiQ's
+            // single `optiq/mtp.safetensors`). Media (recursive): keep nested
+            // weight subdirs (FLUX's transformer/vae/text_encoder, TTS's
+            // speech_tokenizer).
+            if let sub = selection.subfolder {
+                guard path.hasPrefix(sub + "/") else { return nil }
+                guard !path.dropFirst(sub.count + 1).contains("/") else { return nil }
+            } else if !selection.recursive {
                 guard !path.contains("/") || path.hasPrefix("mtp/") || path == "optiq/mtp.safetensors" else { return nil }
             }
             let ext = (path as NSString).pathExtension.lowercased()
@@ -433,7 +489,11 @@ class DownloadManager: ObservableObject {
     /// LM Studio's downloads root, resolved once at app launch.
     /// Reads `~/.lmstudio/settings.json`'s `downloadsFolder` field; falls back to
     /// `~/.lmstudio/models`. nil if LM Studio isn't installed or the folder is unreachable.
-    let lmStudioRoot: String? = {
+    let lmStudioRoot: String? = DownloadManager.lmStudioRootPath()
+
+    /// The same resolution, reachable from `nonisolated` code — the launch-flag
+    /// builder needs it and cannot touch this `@MainActor` instance.
+    nonisolated static func lmStudioRootPath() -> String? {
         let settingsPath = NSString(string: "~/.lmstudio/settings.json").expandingTildeInPath
         let configured: String? = {
             guard let data = FileManager.default.contents(atPath: settingsPath),
@@ -447,7 +507,7 @@ class DownloadManager: ObservableObject {
         var isDir: ObjCBool = false
         guard FileManager.default.fileExists(atPath: candidate, isDirectory: &isDir), isDir.boolValue else { return nil }
         return candidate
-    }()
+    }
 
     /// The Hugging Face hub cache root, resolved once at app launch — where
     /// `huggingface_hub` (and therefore `mlx_lm.load` / `huggingface-cli`)
@@ -536,15 +596,18 @@ class DownloadManager: ObservableObject {
         existingModelDir(for: repoId) ?? newLayoutDir(for: repoId)
     }
 
+    /// `destRepoId` splits WHERE the files land from WHICH repo they come from.
+    /// Only a multi-variant MLX quant uses it: the bytes come from
+    /// `LiquidAI/LFM2.5-2.6B-MLX` but the model must sit in its own 2-level dir
+    /// (`LiquidAI/LFM2.5-2.6B-MLX-4bit`) for the server to discover it. Progress
+    /// stays keyed on `repoId` — the row the user clicked is the repo's.
     func download(repoId: String, selection: FileSelection = .chatDefault,
-                  alertOnFailure: Bool = true) async {
-        let destDir = newLayoutDir(for: repoId)
+                  alertOnFailure: Bool = true, destRepoId: String? = nil) async {
+        let destDir = newLayoutDir(for: destRepoId ?? repoId)
 
         downloads[repoId] = DownloadState(status: .downloading, statusText: "Fetching file list...")
 
         do {
-            try FileManager.default.createDirectory(atPath: destDir, withIntermediateDirectories: true)
-
             // `?recursive=true` so the listing includes nested sidecars — most
             // importantly the `mtp/` multi-token-prediction head. Without it HF
             // returns `mtp` as a bare directory entry and the file filter skips
@@ -557,6 +620,19 @@ class DownloadManager: ObservableObject {
             }
 
             let neededFiles = Self.selectNeededFiles(from: files, selection: selection)
+
+            // A download that matches NOTHING must say so. `LiquidAI/LFM2.5-2.6B-MLX`
+            // keeps every model in a quant subfolder and has no loadable file at
+            // its root, so the whole-repo path used to create an empty
+            // `models/LiquidAI/LFM2.5-2.6B-MLX/` and report "Complete" — a
+            // finished download with nothing in it. The directory is created
+            // AFTER this, so a refusal leaves no folder behind either.
+            guard !neededFiles.isEmpty else {
+                throw NSError(domain: "MLXServe.Download", code: 1, userInfo: [
+                    NSLocalizedDescriptionKey: "No downloadable files in \(repoId). This repo may keep its models in subfolders — pick a quantization from the model's menu.",
+                ])
+            }
+            try FileManager.default.createDirectory(atPath: destDir, withIntermediateDirectories: true)
 
             let totalSize = neededFiles.reduce(Int64(0)) { $0 + $1.1 }
             var downloadedSize: Int64 = 0
@@ -572,7 +648,7 @@ class DownloadManager: ObservableObject {
             }
 
             for (idx, (filePath, fileSize)) in neededFiles.enumerated() {
-                let destPath = (destDir as NSString).appendingPathComponent(filePath)
+                let destPath = (destDir as NSString).appendingPathComponent(selection.localPath(forRemote: filePath))
                 let partialPath = destPath + ".partial"
 
                 // Create subdirectories if needed
@@ -874,6 +950,39 @@ class DownloadManager: ObservableObject {
         }
     }
 
+    // MARK: - Multi-variant MLX repos
+
+    /// MLX-variant analogue of `startGguf(repoId:quant:)`: fetch ONE quant
+    /// subfolder of a shelf repo into its own model dir.
+    ///
+    /// Progress is tracked under the SOURCE repoId (that's the row the user
+    /// clicked, and the menu reads it), while the bytes land in
+    /// `<org>/<repo>-<folder>`. Cancellation is scoped to that one variant —
+    /// the generic whole-folder wipe would be aimed at the parent repo, which
+    /// holds nothing, leaving the interrupted variant behind.
+    func startMlxVariant(repoId: String, variant: MlxVariant, onFinish: @escaping @MainActor () -> Void) {
+        activeTasks[repoId]?.cancel()
+        let dest = MlxVariantScan.localRepoId(repoId: repoId, folder: variant.folder)
+        activeVariantDest[repoId] = dest
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.download(repoId: repoId, selection: .mlxVariant(variant.folder), destRepoId: dest)
+            self.finalizeIfCancelledVariant(repoId: repoId, dest: dest)
+            self.activeVariantDest.removeValue(forKey: repoId)
+            self.activeTasks.removeValue(forKey: repoId)
+            onFinish()
+        }
+        activeTasks[repoId] = task
+    }
+
+    /// Post-await cleanup for `startMlxVariant` — wipes the VARIANT's dir, not
+    /// the repo's, so a cancelled 8-bit never takes a finished 4-bit with it.
+    private func finalizeIfCancelledVariant(repoId: String, dest: String) {
+        guard Task.isCancelled else { return }
+        downloads.removeValue(forKey: repoId)
+        Self.removeModelFiles(at: newLayoutDir(for: dest), roots: [modelsDir])
+    }
+
     /// Convenience for callers that name a single-file quant directly (the
     /// built-in ds4/GGUF catalog entries). Wraps it as a one-file shard group.
     func startGguf(repoId: String, ggufFilename: String, onFinish: @escaping @MainActor () -> Void) {
@@ -911,7 +1020,12 @@ class DownloadManager: ObservableObject {
             // A GGUF folder can hold quants from earlier downloads — those are
             // finished models, not this transfer's remnants, so the whole-folder
             // wipe must not run over them.
-            if let shards = activeGgufShards[repoId], let primary = shards.first {
+            if let dest = activeVariantDest[repoId] {
+                // Same scoping as GGUF: the repo is a shelf, so wipe the one
+                // variant's dir rather than anything under the repo's name.
+                Self.removeModelFiles(at: newLayoutDir(for: dest), roots: [modelsDir])
+                activeVariantDest.removeValue(forKey: repoId)
+            } else if let shards = activeGgufShards[repoId], let primary = shards.first {
                 let dir = existingModelDir(for: repoId) ?? newLayoutDir(for: repoId)
                 removeGgufQuant(at: (dir as NSString).appendingPathComponent(primary))
                 activeGgufShards.removeValue(forKey: repoId)

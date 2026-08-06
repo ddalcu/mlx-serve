@@ -329,11 +329,11 @@ Stateful chains via `previous_response_id`, full streaming SSE with per-event `s
 
 ## Performance
 
-Apple M4 Max, identical weights per engine, ctx=4096, temp=0. Both charts are regenerated per release by `tests/bench.sh`; CSVs live in [`docs/perf-csvs/`](docs/perf-csvs/), and [benchmarks.md](benchmarks.md) tracks decode speed release by release.
+Apple M4 Max, identical weights per engine. Both charts are regenerated per release by `tests/bench.sh`, which boots each engine in turn and lets [llmprobe](https://github.com/ddalcu/llmprobe) take the numbers: warmup discarded, median of three, same protocol for everyone. CSVs live in [`docs/perf-csvs/`](docs/perf-csvs/), and [benchmarks.md](benchmarks.md) tracks decode speed release by release. The v26.7.12 pair below was measured with the in-repo harness that preceded llmprobe, so read it against its own history rather than against a fresh run.
 
 ![mlx-serve vs LM Studio (GGUF + MLX) · oMLX · MTPLX — Gemma 4 + Qwen 3.6, code completion (M4 Max)](docs/perf-pngs/perf-vs-lmstudio-omlx-all-26.7.12.png)
 
-*Code completion decode tok/s, v26.7.12. Baseline is **LM Studio GGUF**, the llama.cpp path most LM Studio users actually run, with LM Studio MLX (0.4.19), oMLX and MTPLX beside it. The blue bar is mlx-serve's best configuration for that model, with the winning speculative mode named in the label. MTPLX shows 0 where it can't run (it needs its own MTP artifacts). The Qwen 3.6 27B cell runs oMLX's own oQ4e checkpoint with their native Lightning MTP enabled on both engines: same weights, mlx-serve still wins. Geomean across the six models: **2.0× LM Studio's fastest engine per model**, +81% on the five cells where LM Studio loads the identical MLX weights, +18% with all speculation off. Reproduce with `./tests/bench.sh --family all --lmstudio --omlx --mtplx`.*
+*Code completion decode tok/s, v26.7.12. Baseline is **LM Studio GGUF**, the llama.cpp path most LM Studio users actually run, with LM Studio MLX (0.4.19), oMLX and MTPLX beside it. The blue bar is mlx-serve's best configuration for that model, with the winning speculative mode named in the label. MTPLX shows 0 where it can't run (it needs its own MTP artifacts). The Qwen 3.6 27B cell runs oMLX's own oQ4e checkpoint with their native Lightning MTP enabled on both engines: same weights, mlx-serve still wins. Geomean across the six models: **2.0× LM Studio's fastest engine per model**, +81% on the five cells where LM Studio loads the identical MLX weights, +18% with all speculation off. The bench is `./tests/bench.sh --family all --lmstudio --omlx --mtplx --full`.*
 
 ![Native MTP context ladder — MLX-serve vs oMLX & MTPLX (Qwen3.6-27B), 0.5K–64K prefill + decode](docs/perf-pngs/perf-mtp-ladder-26.7.12.png)
 

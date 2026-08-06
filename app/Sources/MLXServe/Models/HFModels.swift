@@ -96,6 +96,13 @@ struct HFModel: Identifiable, Codable {
     /// Largest non-mmproj GGUF in the repo (bytes). See `ggufMinSizeBytes`.
     var ggufMaxSizeBytes: Int64? = nil
 
+    /// The per-quant subfolders a multi-variant MLX repo publishes, smallest
+    /// first — empty for every ordinary repo. Populated by `HFSearchService`
+    /// from the tree fetch it already runs for the size column (such a repo
+    /// carries no `safetensors` metadata: HF computes that from a ROOT index,
+    /// which a subfoldered repo doesn't have, so the fetch always happens).
+    var mlxVariants: [MlxVariant] = []
+
     enum CodingKeys: String, CodingKey {
         case id, downloads, likes, lastModified, tags, safetensors
         case pipelineTag = "pipeline_tag"
@@ -135,6 +142,11 @@ struct HFModel: Identifiable, Codable {
     var isGgufRepo: Bool {
         (tags ?? []).contains { $0.lowercased() == "gguf" }
     }
+
+    /// True when this repo ships one complete MLX model PER SUBFOLDER — a shelf
+    /// of quants, like a GGUF repo. The row offers a quant menu instead of a
+    /// plain Download, and each pick lands in its own model dir.
+    var isMlxVariantRepo: Bool { !mlxVariants.isEmpty }
 
     /// The FP quantization this repo uses that the server CANNOT load, if any.
     /// Since v26.6.10 (issue #24) the server loads nvfp4/mxfp4/mxfp8
@@ -229,9 +241,10 @@ struct HFModel: Identifiable, Codable {
     /// modes (mxfp6) deliberately don't match here — they surface via
     /// `incompatibleReason`, not as a misleading badge.
     var quantization: String? {
-        // GGUF repos host multiple quants in separate files; the repo ID alone
-        // doesn't identify one, so surface "Multi" rather than "—".
-        if isGgufRepo { return Self.quantizationLabel(forId: id) ?? "Multi" }
+        // GGUF repos host multiple quants in separate files, multi-variant MLX
+        // repos in separate subfolders; the repo ID alone doesn't identify one,
+        // so surface "Multi" rather than "—".
+        if isGgufRepo || isMlxVariantRepo { return Self.quantizationLabel(forId: id) ?? "Multi" }
         return Self.quantizationLabel(forId: id)
     }
 
@@ -312,6 +325,12 @@ struct HFModel: Identifiable, Codable {
     /// more honest than a single number. Single-file repos (safetensors or
     /// single GGUF) get the existing single-value formatting.
     var ramEstimate: String {
+        // A multi-variant MLX repo hasn't been narrowed to one quant either —
+        // and its `estimatedSizeBytes` is 0 (no root safetensors metadata), so
+        // without this it reads "Unknown".
+        if let lo = mlxVariants.map(\.sizeBytes).min(), let hi = mlxVariants.map(\.sizeBytes).max(), lo < hi {
+            return MemoryInfo.formatRange(Int64(Double(lo) * 1.2), Int64(Double(hi) * 1.2))
+        }
         if let minB = ggufMinSizeBytes, let maxB = ggufMaxSizeBytes, minB < maxB {
             let lo = Int64(Double(minB) * 1.2)
             let hi = Int64(Double(maxB) * 1.2)
@@ -329,6 +348,9 @@ struct HFModel: Identifiable, Codable {
     /// colors as won't-fit rather than misleading-green on its smallest
     /// quant. Single-value paths are unchanged.
     var ramEstimateBytes: Int64 {
+        if let maxV = mlxVariants.map(\.sizeBytes).max() {
+            return Int64(Double(maxV) * 1.2)
+        }
         if let maxB = ggufMaxSizeBytes {
             return Int64(Double(maxB) * 1.2)
         }

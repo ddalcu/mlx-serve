@@ -118,6 +118,7 @@ def load_reference(ref_dir):
     nodes = _exec_module_prefix(nodes_path, "h3_nodes", [
         "align_frame_count", "video_latent_t", "temporal_shape", "adapt_canvas",
         "CANVAS_MULTIPLE", "BASE_SHORT_EDGE", "MAX_PIXELS", "FPS", "AUDIO_LATENT_FPS",
+        "REF_IMAGE_SHORT_EDGE",
     ])
     return model, nodes
 
@@ -282,6 +283,148 @@ def dump_packed_layout(M, N):
     return cases
 
 
+def dump_ref_sizing(N):
+    """How a reference IMAGE and a reference VIDEO are sized before encoding.
+
+    Executed from the node's own module-level constants and `adapt_canvas`.
+    Two independent rules that are easy to conflate:
+
+      image: `match` scales (DOWN only) to the generation's pixel AREA, `max`
+             to a 2048 short edge — then each axis rounds to 32. `max` is
+             several times slower because reference tokens ride through every
+             sampling step.
+      video: `adapt_canvas` normalizes to the 768 short edge, which UPSCALES a
+             small clip; the node then refuses that (`if vw*vh < cw*ch`) and
+             falls back to the plain /32 rounding, so a reference video is
+             never upscaled.
+    """
+    def size_image(w, h, gen_w, gen_h, mode):
+        if mode == "match":
+            scale = min(1.0, math.sqrt((gen_w * gen_h) / (w * h)))
+        else:
+            scale = min(1.0, N.REF_IMAGE_SHORT_EDGE / min(w, h))
+        tw = max(N.CANVAS_MULTIPLE, round(w * scale / N.CANVAS_MULTIPLE) * N.CANVAS_MULTIPLE)
+        th = max(N.CANVAS_MULTIPLE, round(h * scale / N.CANVAS_MULTIPLE) * N.CANVAS_MULTIPLE)
+        return tw, th
+
+    def size_video(vw, vh):
+        cw, ch = N.adapt_canvas(vw, vh)
+        if vw * vh < cw * ch:
+            cw = max(N.CANVAS_MULTIPLE, round(vw / N.CANVAS_MULTIPLE) * N.CANVAS_MULTIPLE)
+            ch = max(N.CANVAS_MULTIPLE, round(vh / N.CANVAS_MULTIPLE) * N.CANVAS_MULTIPLE)
+        return cw, ch
+
+    images = []
+    for w, h in [(4032, 3024), (1024, 1024), (640, 480), (3000, 500), (100, 100)]:
+        for gen_w, gen_h in [(864, 480), (1344, 768)]:
+            for mode in ("match", "max"):
+                tw, th = size_image(w, h, gen_w, gen_h, mode)
+                images.append({"in_w": w, "in_h": h, "gen_w": gen_w, "gen_h": gen_h,
+                               "mode": mode, "out_w": tw, "out_h": th})
+    videos = []
+    for vw, vh in [(1920, 1080), (640, 480), (256, 144), (1344, 768), (3000, 500)]:
+        cw, ch = size_video(vw, vh)
+        videos.append({"in_w": vw, "in_h": vh, "out_w": cw, "out_h": ch})
+
+    # Frame counts snap DOWN for references (a reference is trimmed, never
+    # padded with frames the user did not supply), with a 5-frame floor.
+    frames = []
+    for n in [4, 5, 6, 21, 22, 23, 100, 124, 400]:
+        v = n
+        ok = v >= 5
+        if ok:
+            while v % 17 != 5:
+                v -= 1
+        frames.append({"requested": n, "aligned": v if ok else 0})
+
+    return {"REF_IMAGE_SHORT_EDGE": int(N.REF_IMAGE_SHORT_EDGE),
+            "images": images, "videos": videos, "frames": frames}
+
+
+def dump_ref_layout(M, N):
+    """ref2va: the `refs` branch of PackedLayout, block by block.
+
+    Four things here are silent when wrong and only a fixture can see them:
+      - the cursor advances by a DIFFERENT amount per kind (1.0 per image,
+        ref_audio_t per standalone audio, max(audio_t, sum of video spans) per
+        video block),
+      - a video block's soundtrack rows pack IMMEDIATELY BEFORE its video rows
+        and share the block's cursor origin,
+      - that soundtrack's w coordinates are pinned to the BLOCK's own grid
+        extremes, while a standalone audio uses the TARGET's,
+      - the target streams still start at the cursor the refs left behind.
+    """
+    cases = []
+    frames, width, height, text_len = 56, 864, 480, 128
+    frame_count, latent_t, audio_t = N.temporal_shape(frames)
+    lat_h, lat_w = height // 16, width // 16
+
+    def img(h, w):
+        return {"kind": "image", "latent_h": h // 16, "latent_w": w // 16}
+
+    def vid(h, w, vt, rt=0):
+        return {"kind": "video_audio" if rt else "video", "latent_t": vt,
+                "latent_h": h // 16, "latent_w": w // 16, "ref_audio_t": rt}
+
+    def aud(rt):
+        return {"kind": "audio", "ref_audio_t": rt}
+
+    # Every reference here is deliberately a DIFFERENT aspect from the 864x480
+    # target. A reference that happens to match the target cannot distinguish
+    # "the block's own w extremes" from "the target's", so a case built that way
+    # passes whichever the port picks — verified by red-on-revert, which stayed
+    # green until these aspects diverged.
+    specs = [
+        ("ref_one_image", [img(512, 512)]),
+        # two images: the cursor advances 1.0 apiece, so the second block's t
+        # differs from the first by exactly one
+        ("ref_two_images", [img(512, 512), img(320, 576)]),
+        ("ref_one_video", [vid(320, 576, 7)]),
+        # a soundtracked video: its <Audio j> rows precede its <Video k> rows
+        # and take the BLOCK's w extremes, not the target's
+        ("ref_video_audio", [vid(512, 512, 7, rt=12)]),
+        ("ref_standalone_audio", [aud(20)]),
+        # the reference's fixed order: images, then videos, then standalone audio
+        ("ref_mixed", [img(512, 512), img(320, 576), vid(512, 512, 7, rt=12), aud(20)]),
+    ]
+    for name, refs in specs:
+        layout = M.PackedLayout(text_len, latent_t, lat_h, lat_w, audio_t,
+                                refs=refs, frame_count=frame_count)
+        cases.append({
+            "name": name,
+            "text_len": text_len,
+            "frame_count": frame_count,
+            "width": width, "height": height,
+            "latent_t": latent_t, "latent_h": lat_h, "latent_w": lat_w,
+            "audio_t": audio_t,
+            "refs": refs,
+            "seq_len": int(layout.seq_len),
+            "segments": [[int(a), int(b), k] for a, b, k in layout.segments],
+            "pos_first": [float(v) for v in layout.position_ids[0]],
+            "pos_last": [float(v) for v in layout.position_ids[-1]],
+            "pos_sum": [float(layout.position_ids[:, i].sum()) for i in range(3)],
+            "pos_weighted": [
+                float((layout.position_ids[:, i] * _row_weights(layout)).sum())
+                for i in range(3)
+            ],
+            "seg_first_pos": [
+                [float(v) for v in layout.position_ids[a]]
+                for a, _, _ in layout.segments
+            ],
+            # the LAST row of each segment too: a block whose interior grid is
+            # right at its first row can still run off the end of its own span
+            "seg_last_pos": [
+                [float(v) for v in layout.position_ids[b - 1]]
+                for _, b, _ in layout.segments
+            ],
+            "img_update_true": int(layout.img_update.sum()),
+            "audio_update_true": int(layout.audio_update.sum()),
+            "img_rows": int(layout.img_update.shape[0]),
+            "audio_rows": int(layout.audio_update.shape[0]),
+        })
+    return cases
+
+
 def dump_rope_freqs(M):
     """[S,3] positions -> [S,96] angles: per-axis 16 freqs, concat(t,h,w), duplicated."""
     import torch
@@ -340,6 +483,8 @@ def main():
         "video_t_grid": dump_t_grid(M),
         "rope_freqs": dump_rope_freqs(M),
         "packed_layout": dump_packed_layout(M, N),
+        "ref_layout": dump_ref_layout(M, N),
+        "ref_sizing": dump_ref_sizing(N),
     }
 
     os.makedirs(os.path.dirname(args.out), exist_ok=True)
@@ -350,6 +495,9 @@ def main():
     for k, v in data.items():
         if isinstance(v, list):
             print(f"  {k}: {len(v)} cases")
+    for c in data["ref_layout"]:
+        kinds = "+".join(k for _, _, k in c["segments"])
+        print(f"  {c['name']}: seq_len={c['seq_len']} [{kinds}]")
     # A layout whose sequence length we cannot explain is a layout we cannot port.
     for c in data["packed_layout"]:
         print(f"  {c['name']}: seq_len={c['seq_len']} "

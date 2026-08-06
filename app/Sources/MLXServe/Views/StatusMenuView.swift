@@ -608,8 +608,8 @@ struct StatusMenuView: View {
                 if BuildFeatures.current.cliLauncher {
                     CLILauncherButton(
                         baseURL: server.baseURL,
-                        servedModelId: server.modelInfo?.name ?? "mlx-serve",
-                        serverContextLength: server.modelInfo?.contextLength,
+                        servedModelId: server.chatModelId ?? "mlx-serve",
+                        serverContextLength: server.chatModelInfo?.contextLength,
                         models: server.allModels,
                         isEnabled: server.status == .running,
                         openSandboxAgent: { agentId in
@@ -623,8 +623,8 @@ struct StatusMenuView: View {
                 } else {
                     CLISetupInstructionsButton(
                         baseURL: server.baseURL,
-                        servedModelId: server.modelInfo?.name ?? "mlx-serve",
-                        serverContextLength: server.modelInfo?.contextLength,
+                        servedModelId: server.chatModelId ?? "mlx-serve",
+                        serverContextLength: server.chatModelInfo?.contextLength,
                         isEnabled: server.status == .running
                     )
                 }

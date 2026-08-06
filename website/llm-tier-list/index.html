@@ -88,6 +88,203 @@
     }
     .vote-note.warn { color: #b25000; }
 
+    /* ─── quant playground (setup calculator) ─── */
+    .rig {
+      border: 1px solid var(--border); border-radius: var(--radius);
+      background: var(--white); box-shadow: var(--shadow-card);
+      margin-bottom: 22px; overflow: hidden;
+    }
+    .rig-head {
+      display: flex; align-items: flex-start; gap: 16px;
+      padding: 16px 20px; border-bottom: 1px solid var(--border);
+      background: linear-gradient(120deg, var(--accent-soft), transparent 62%);
+    }
+    .rig-title { font-size: 17px; font-weight: 700; letter-spacing: -0.01em; }
+    .rig-title .grad {
+      background: linear-gradient(90deg, var(--accent), var(--accent2));
+      -webkit-background-clip: text; background-clip: text; color: transparent;
+    }
+    .rig-sub { font-size: 12.5px; color: var(--text-secondary); margin-top: 3px; max-width: 720px; line-height: 1.5; }
+    .rig-toggle {
+      font: inherit; font-size: 12px; font-weight: 600; cursor: pointer; margin-left: auto;
+      padding: 5px 12px; border-radius: 100px; border: 1px solid var(--border);
+      background: var(--white); color: var(--text-secondary); white-space: nowrap;
+    }
+    .rig-toggle:hover { border-color: var(--accent); color: var(--text-primary); }
+    .rig[data-open="0"] .rig-body { display: none; }
+
+    .rig-body { display: grid; grid-template-columns: 1fr 1fr 1.05fr; gap: 0; }
+    .rig-col { padding: 16px 20px; display: flex; flex-direction: column; gap: 7px; }
+    .rig-col + .rig-col { border-left: 1px solid var(--border); }
+    .rig-k {
+      font-size: 10.5px; font-weight: 700; letter-spacing: 0.06em; text-transform: uppercase;
+      color: var(--text-tertiary); margin-top: 5px;
+    }
+    .rig-k:first-child { margin-top: 0; }
+    .seg-sm { gap: 4px; }
+    /* fixed button height so a wrapped row is a KNOWN 2 x 26 + 4 gap = 56px */
+    .seg-sm button {
+      height: 26px; padding: 0 10px; font-size: 12px; border-radius: 7px;
+      display: inline-flex; align-items: center;
+    }
+    .seg-sm button[disabled] { opacity: 0.32; cursor: not-allowed; }
+    .seg-sm button[disabled]:hover { border-color: var(--border); color: var(--text-secondary); }
+    /* ── reserved heights: the panel is a 3-column grid, so ONE block growing
+       a line moves every column and the whole board below it. Each figure is
+       the measured worst case, and the character caps that keep them valid
+       are asserted in tests/website_tier_list_logic.mjs — copy that outgrows
+       them starts the jumping again.
+         rig-ram    : 2..5 buttons depending on chip = 1 or 2 rows
+         rig-spec   : up to 52 mono chars = 2 lines
+         mem-legend : up to 80 mono chars = 2 lines
+         rig-verdict: up to 114 chars = 3 lines                              */
+    #rig-ram { min-height: 56px; align-content: flex-start; }
+    /* the trigger keeps ONE line whatever the model is called — a name that
+       wrapped would resize the column it sits in */
+    #rig-model {
+      font: inherit; font-size: 13px; padding: 0 10px; width: 100%; height: 44px;
+      display: flex; align-items: center; gap: 8px; text-align: left; cursor: pointer;
+      border-radius: 8px; border: 1px solid var(--border); background: var(--white);
+      color: var(--text-primary); outline: none; overflow: hidden;
+    }
+    #rig-model:hover { border-color: var(--accent); }
+    #rig-model:focus-visible { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+    .pick-name { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .pick-meta {
+      font-size: 11.5px; font-family: var(--mono); color: var(--text-tertiary);
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    .pick-caret {
+      margin-left: auto; flex: none; font-size: 11px; font-weight: 600;
+      color: var(--accent); background: var(--accent-soft);
+      border-radius: 100px; padding: 3px 9px;
+    }
+
+    /* ─── model chooser modal ─── */
+    .modal { position: fixed; inset: 0; z-index: 300; display: flex; align-items: center; justify-content: center; }
+    .modal[hidden] { display: none; }
+    .modal-backdrop { position: absolute; inset: 0; background: rgba(20, 20, 26, 0.5); backdrop-filter: blur(3px); }
+    .modal-panel {
+      position: relative; display: flex; flex-direction: column;
+      width: min(94vw, 900px); max-height: min(86vh, 760px);
+      background: var(--white); border-radius: var(--radius);
+      box-shadow: var(--shadow-elevated); overflow: hidden;
+    }
+    .modal-head {
+      display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+      padding: 16px 20px; border-bottom: 1px solid var(--border);
+    }
+    .modal-head h3 { font-size: 17px; font-weight: 700; letter-spacing: -0.01em; }
+    .modal-sub { font-size: 12px; color: var(--text-tertiary); margin-top: 2px; }
+    .modal-tools {
+      display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+      padding: 10px 20px; border-bottom: 1px solid var(--border); background: var(--bg-alt);
+    }
+    .modal-tools .rig-k { margin-top: 0; }
+    #model-modal-search {
+      font: inherit; font-size: 13px; padding: 7px 14px; min-width: 180px; margin-left: auto;
+      border-radius: 100px; border: 1px solid var(--border); background: var(--white); outline: none;
+    }
+    #model-modal-search:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+    .modal-x {
+      font: inherit; font-size: 14px; cursor: pointer; flex: none;
+      width: 30px; height: 30px; border-radius: 50%;
+      border: 1px solid var(--border); background: var(--white); color: var(--text-secondary);
+    }
+    .modal-x:hover { border-color: var(--accent); color: var(--text-primary); }
+    .modal-body { overflow-y: auto; padding: 16px 20px 20px; }
+    .card-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(232px, 1fr)); gap: 10px; }
+    .modal-foot { font-size: 11px; color: var(--text-tertiary); line-height: 1.5; margin-top: 14px; }
+
+    .mcard {
+      font: inherit; text-align: left; cursor: pointer; display: flex; flex-direction: column; gap: 6px;
+      border: 1px solid var(--border); border-radius: var(--radius-sm);
+      background: var(--white); padding: 11px 12px; transition: all 0.14s ease;
+    }
+    .mcard:hover { border-color: var(--accent); box-shadow: var(--shadow-card); transform: translateY(-1px); }
+    .mcard.on { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-soft); }
+    .mcard.nofit { opacity: 0.55; }
+    .mcard-fit.tight { color: #8a5200; }
+    .mcard-name {
+      font-size: 13.5px; font-weight: 600; letter-spacing: -0.01em; line-height: 1.3;
+      /* two lines reserved: a long name must not make its card taller */
+      min-height: 35px; overflow: hidden;
+    }
+    .mcard-sub { font-size: 11px; font-family: var(--mono); color: var(--text-tertiary); }
+    .mcard-nums { display: flex; gap: 6px; }
+    .mcard-num {
+      flex: 1; background: var(--bg-alt); border-radius: 6px; padding: 5px 6px; text-align: center; min-width: 0;
+    }
+    .mcard-num b { display: block; font-family: var(--mono); font-size: 13px; font-weight: 700; color: var(--text-primary); }
+    .mcard-num span { display: block; font-size: 9px; color: var(--text-tertiary); margin-top: 1px; }
+    .mcard-bar { display: flex; height: 6px; border-radius: 100px; overflow: hidden; background: var(--bg-alt); }
+    .mcard-bar span { display: block; height: 100%; }
+    .mcard-foot { display: flex; align-items: center; gap: 5px; flex-wrap: wrap; min-height: 18px; }
+    .mcard-fit { font-size: 10px; font-weight: 700; letter-spacing: 0.03em; text-transform: uppercase; color: #0e8a4f; }
+    .mcard-fit.no { color: #c22e26; }
+    .rig-spec {
+      font-size: 11.5px; color: var(--text-tertiary); font-family: var(--mono);
+      margin-top: 4px; line-height: 1.5; min-height: 35px;
+    }
+
+    .rig-out { background: var(--bg-alt); }
+    .rig-stats { display: flex; gap: 8px; }
+    .stat {
+      flex: 1; background: var(--white); border: 1px solid var(--border);
+      border-radius: var(--radius-sm); padding: 9px 10px; text-align: center; min-width: 0;
+    }
+    .stat-v {
+      display: block; font-family: var(--mono); font-size: 21px; font-weight: 700;
+      letter-spacing: -0.02em; line-height: 1.15;
+      background: linear-gradient(90deg, var(--accent), var(--accent2));
+      -webkit-background-clip: text; background-clip: text; color: transparent;
+    }
+    .stat-k { display: block; font-size: 10px; color: var(--text-tertiary); margin-top: 3px; line-height: 1.3; }
+    .stat-est { line-height: 1;
+      font-size: 9px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase;
+      color: var(--text-tertiary); background: var(--bg-alt);
+      border-radius: 4px; padding: 1px 4px; margin-left: 4px; vertical-align: 2px;
+      -webkit-text-fill-color: var(--text-tertiary);
+    }
+    .mem-bar {
+      display: flex; height: 9px; border-radius: 100px; overflow: hidden;
+      background: var(--white); border: 1px solid var(--border); margin-top: 4px;
+    }
+    .mem-bar span { display: block; height: 100%; }
+    .mem-w { background: var(--accent); }
+    .mem-kv { background: var(--accent2); }
+    /* intelligence: solid = what this quant keeps, hatched = what it costs
+       against the same bar, so the price of 2-bit is visible not just stated */
+    .iq-have { background: linear-gradient(90deg, var(--accent), var(--accent2)); }
+    .iq-lost { background: repeating-linear-gradient(45deg, #d8d8dc, #d8d8dc 3px, #f0f0f2 3px, #f0f0f2 6px); }
+    .mem-over { background: repeating-linear-gradient(45deg, #ff6961, #ff6961 4px, #ffb3ae 4px, #ffb3ae 8px); }
+    .mem-legend {
+      font-size: 11px; color: var(--text-tertiary); font-family: var(--mono);
+      line-height: 1.5; min-height: 33px;
+    }
+    .rig-verdict {
+      font-size: 12.5px; font-weight: 600; line-height: 1.45;
+      border-radius: var(--radius-sm); padding: 8px 10px; min-height: 73px;
+      background: #e4f8ea; color: #0e6b3f; border: 1px solid #bfe9cd;
+    }
+    .rig-verdict.bad { background: #ffe9e7; color: #a8261e; border-color: #f5c2be; }
+    .rig-verdict.warn { background: #fff4e0; color: #8a5200; border-color: #f2ddb4; }
+    .rig-cmd {
+      display: block; font-family: var(--mono); font-size: 11.5px; color: var(--text-secondary);
+      background: var(--white); border: 1px solid var(--border); border-radius: var(--radius-sm);
+      padding: 7px 9px; overflow-x: auto; white-space: nowrap;
+    }
+    .rig-foot {
+      font-size: 11px; color: var(--text-tertiary); line-height: 1.5;
+      padding: 10px 20px; border-top: 1px solid var(--border); background: var(--bg-alt);
+    }
+    .rig-foot a { color: var(--text-secondary); }
+
+    @media (max-width: 900px) {
+      .rig-body { grid-template-columns: 1fr; }
+      .rig-col + .rig-col { border-left: none; border-top: 1px solid var(--border); }
+    }
+
     /* ─── tier rows ─── */
     .tier-row {
       display: flex; align-items: stretch; gap: 0;
@@ -192,6 +389,7 @@
       100% { transform: scale(1); box-shadow: 0 0 0 18px transparent; }
     }
     .model-chip.promoted { animation: promote-pop 1.4s cubic-bezier(0.2, 0.9, 0.3, 1.2); border-color: var(--accent); }
+    body.modal-open { overflow: hidden; }
     .toast {
       position: fixed; left: 50%; bottom: 28px; transform: translateX(-50%);
       background: var(--ink); color: #fff; font-size: 13.5px; font-weight: 600;
@@ -256,6 +454,91 @@
         <p class="page-sub">Community-voted rankings of the LLMs that run locally on Apple Silicon — auto-updated from Hugging Face, filtered to your Mac's unified memory. One Google account, one vote per model.</p>
       </div>
 
+      <div class="rig" id="rig" data-open="1">
+        <div class="rig-head">
+          <div>
+            <h2 class="rig-title">Quant playground<span class="grad">.</span></h2>
+            <p class="rig-sub">Build a setup the way you'd build a quant: pick a Mac, pick a model, drop it to 3-bit, quantize the KV cache, switch on speculative decoding. Every number is computed live from a roofline model fitted to <a href="../#performance">our own published benchmarks</a>. No download, no waiting.</p>
+          </div>
+          <button class="rig-toggle" id="rig-toggle" aria-expanded="true" aria-controls="rig-body">Hide</button>
+        </div>
+
+        <div class="rig-body" id="rig-body">
+          <div class="rig-col">
+            <span class="rig-k">Chip</span>
+            <div class="seg seg-sm" id="rig-gen"></div>
+            <div class="seg seg-sm" id="rig-tier"></div>
+            <span class="rig-k">Unified memory</span>
+            <div class="seg seg-sm" id="rig-ram"></div>
+            <p class="rig-spec" id="rig-spec"></p>
+          </div>
+
+          <div class="rig-col">
+            <span class="rig-k">Model</span>
+            <button id="rig-model" aria-haspopup="dialog">
+              <span class="pick-name" id="rig-model-name">—</span>
+              <span class="pick-meta" id="rig-model-meta"></span>
+              <span class="pick-caret">Change</span>
+            </button>
+            <span class="rig-k">Weights</span>
+            <div class="seg seg-sm" id="rig-bits"></div>
+            <span class="rig-k">KV cache</span>
+            <div class="seg seg-sm" id="rig-kv"></div>
+            <span class="rig-k">Context</span>
+            <div class="seg seg-sm" id="rig-ctx"></div>
+            <span class="rig-k">Speculative decoding</span>
+            <div class="seg seg-sm" id="rig-mode"></div>
+            <span class="rig-k">Workload</span>
+            <div class="seg seg-sm" id="rig-workload"></div>
+          </div>
+
+          <div class="rig-col rig-out">
+            <div class="rig-stats">
+              <div class="stat"><span class="stat-v" id="out-decode">—</span><span class="stat-k">tok/s generated</span></div>
+              <div class="stat"><span class="stat-v" id="out-prefill">—</span><span class="stat-k">tok/s prompt</span></div>
+              <div class="stat"><span class="stat-v" id="out-iq">—</span><span class="stat-k">intelligence</span></div>
+            </div>
+            <span class="rig-k">Intelligence</span>
+            <div class="mem-bar" id="out-iq-bar"></div>
+            <p class="mem-legend" id="out-iq-legend"></p>
+            <span class="rig-k">Memory</span>
+            <div class="mem-bar" id="out-bar"></div>
+            <p class="mem-legend" id="out-mem"></p>
+            <p class="rig-verdict" id="out-verdict"></p>
+            <code class="rig-cmd" id="out-cmd"></code>
+          </div>
+        </div>
+
+        <p class="rig-foot" id="rig-foot"></p>
+      </div>
+
+      <!-- model chooser: every card is scored on the Mac and the settings
+           currently selected in the panel, so the grid is a like-for-like
+           comparison rather than a list of names -->
+      <div class="modal" id="model-modal" hidden>
+        <div class="modal-backdrop" id="model-modal-backdrop"></div>
+        <div class="modal-panel" role="dialog" aria-modal="true" aria-labelledby="model-modal-title">
+          <div class="modal-head">
+            <div>
+              <h3 id="model-modal-title">Pick a model</h3>
+              <p class="modal-sub" id="model-modal-sub"></p>
+            </div>
+            <button class="modal-x" id="model-modal-close" aria-label="Close">✕</button>
+          </div>
+          <div class="modal-tools">
+            <span class="rig-k">Sort</span>
+            <div class="seg seg-sm" id="model-sort"></div>
+            <input id="model-modal-search" type="search" placeholder="Filter models…" aria-label="Filter models">
+          </div>
+          <div class="modal-body">
+            <div class="card-grid" id="model-grid"></div>
+            <!-- static, so the grid never resizes under the cursor -->
+            <p class="modal-foot">Speed and memory are computed for the settings above. An intelligence
+              score marked <b>*</b> is estimated from scale, because Artificial Analysis has not scored that model.</p>
+          </div>
+        </div>
+      </div>
+
       <div class="controls reveal">
         <div class="controls-row">
           <span class="controls-label">My Mac has</span>
@@ -306,7 +589,7 @@
         <h2>Not yet ranked</h2>
         <input id="unranked-search" type="search" placeholder="Filter models…" aria-label="Filter unranked models">
       </div>
-      <p class="unranked-sub">The first community vote puts a model on the board. Same hardware filters as above; rows hold their position while you vote.</p>
+      <p class="unranked-sub">Models with no published Artificial Analysis score. Real enough to run, not yet measured, so they aren't placed on a guess. Vote them up anyway: your votes are what will rank this board. Same hardware filters as above; rows hold their position while you vote.</p>
       <div class="table-wrap">
         <table id="unranked-table">
           <thead>
@@ -326,7 +609,7 @@
     </div>
     <div class="mini-grid">
       <div class="mini-card reveal"><span class="mini-k">Voting</span><h4>One account, one vote per model</h4><p>Sign in with Google, then ▲ or ▼ any model. Click the same arrow again to take your vote back, or the other one to flip it. Your votes are keyed to your account — refreshing, reinstalling, or switching devices can't double-count you.</p></div>
-      <div class="mini-card reveal"><span class="mini-k">Tiers</span><h4>Wilson score, not raw sums</h4><p>Tiers come from the lower bound of the Wilson confidence interval on the up-ratio — a first vote enters a model cautiously (C), and it needs consistent upvotes to climb toward S. Ten early fans can't out-rank a hundred mixed reviews.</p></div>
+      <div class="mini-card reveal"><span class="mini-k">Tiers</span><h4>Benchmarked now, voted later</h4><p>Nobody has voted yet, and a board where every model sits unranked helps no one, so tiers currently come from the <a href="https://artificialanalysis.ai/models/open-source" target="_blank" rel="noopener">Artificial Analysis Intelligence Index</a>. Models it hasn't scored stay in the table below rather than being placed on a guess. Once the votes are in, the board switches to community ranking: the lower bound of the Wilson confidence interval on the up-ratio, so ten early fans can't out-rank a hundred mixed reviews.</p></div>
       <div class="mini-card reveal"><span class="mini-k">Hardware</span><h4>The filter is about fitting</h4><p>Each model lists its approximate quantized footprint; the RAM filter hides anything that wouldn't leave your Mac room to breathe (weights ≲ 75% of unified memory). Votes are global — the filter changes what you see, not the scores.</p></div>
       <div class="mini-card reveal"><span class="mini-k">Privacy</span><h4>No emails stored, ever</h4><p>Votes are stored against an opaque account id in Firestore. The public data is just <i>model → up/down counts</i>; your name and email never leave the sign-in widget in your own browser.</p></div>
     </div>
@@ -367,17 +650,22 @@
   //   sizeGb  : approx 4-bit quantized footprint (weights on disk ≈ in RAM)
   //   minRam  : smallest unified-memory tier it's comfortable on
   //   tags    : vision | moe | fast
+  //   paramsB / activeB : NUMERIC billions, total and per-token-active. The
+  //     `params` string above is prose for the chip; the setup calculator
+  //     reads these and must never re-parse a display label.
   // ════════════════════════════════════════════════════════════════════════
   const SEED_MODELS = [
-    { id: "gemma-4-e2b",      name: "Gemma 4 E2B",       params: "5B (2B act)",  sizeGb: 2.4, minRam: 8,   tags: ["fast", "vision"], downloads: 0 },
-    { id: "gemma-4-e4b",      name: "Gemma 4 E4B",       params: "8B (4B act)",  sizeGb: 4.2, minRam: 8,   tags: ["fast", "vision"], downloads: 0 },
-    { id: "gemma-4-12b",      name: "Gemma 4 12B",       params: "12B",          sizeGb: 7.0, minRam: 16,  tags: ["vision"], downloads: 0 },
-    { id: "gemma-4-26b-a4b",  name: "Gemma 4 26B-A4B",   params: "26B (4B act)", sizeGb: 15,  minRam: 24,  tags: ["moe", "vision", "fast"], downloads: 0 },
-    { id: "qwen3.6-27b",      name: "Qwen3.6 27B",       params: "27B",          sizeGb: 15.5, minRam: 24, tags: [], downloads: 0 },
-    { id: "qwen3.6-35b-a3b",  name: "Qwen3.6 35B-A3B",   params: "35B (3B act)", sizeGb: 20,  minRam: 32,  tags: ["moe", "fast"], downloads: 0 },
-    { id: "llama-3.3-70b",    name: "Llama 3.3 70B",     params: "70B",          sizeGb: 40,  minRam: 64,  tags: [], downloads: 0 },
-    { id: "deepseek-v4-flash", name: "DeepSeek-V4-Flash", params: "MoE · GGUF",  sizeGb: 81,  minRam: 128, tags: ["moe"], downloads: 0 },
-    { id: "hy3",              name: "Hunyuan 3 295B",    params: "295B MoE",     sizeGb: 95,  minRam: 128, tags: ["moe"], downloads: 0 },
+    { id: "gemma-4-e2b",      name: "Gemma 4 E2B",       params: "5B (2B act)",  sizeGb: 2.4, minRam: 8,   tags: ["fast", "vision"], downloads: 0, paramsB: 5,   activeB: 2 },
+    { id: "gemma-4-e4b",      name: "Gemma 4 E4B",       params: "8B (4B act)",  sizeGb: 4.2, minRam: 8,   tags: ["fast", "vision"], downloads: 0, paramsB: 8,   activeB: 4 },
+    { id: "gemma-4-12b",      name: "Gemma 4 12B",       params: "12B",          sizeGb: 7.0, minRam: 16,  tags: ["vision"], downloads: 0, paramsB: 12,  activeB: 12 },
+    { id: "gemma-4-26b-a4b",  name: "Gemma 4 26B-A4B",   params: "26B (4B act)", sizeGb: 15,  minRam: 24,  tags: ["moe", "vision", "fast"], downloads: 0, paramsB: 25.2, activeB: 3.8 },
+    { id: "gemma-4-31b",      name: "Gemma 4 31B",       params: "31B",          sizeGb: 17.4, minRam: 32, tags: ["vision"], downloads: 0, paramsB: 30.7, activeB: 30.7 },
+    { id: "qwen3.6-27b",      name: "Qwen3.6 27B",       params: "27B",          sizeGb: 15.5, minRam: 24, tags: [], downloads: 0, paramsB: 27.8, activeB: 27.8 },
+    { id: "qwen3.6-35b-a3b",  name: "Qwen3.6 35B-A3B",   params: "35B (3B act)", sizeGb: 20,  minRam: 32,  tags: ["moe", "fast"], downloads: 0, paramsB: 36, activeB: 3 },
+    { id: "llama-3.3-70b",    name: "Llama 3.3 70B",     params: "70B",          sizeGb: 40,  minRam: 64,  tags: [], downloads: 0, paramsB: 70,  activeB: 70 },
+    { id: "ling-3.0-flash",   name: "Ling 3.0 Flash",    params: "124B (5B act)", sizeGb: 70, minRam: 96,  tags: ["moe", "fast"], downloads: 0, paramsB: 124, activeB: 5.1 },
+    { id: "deepseek-v4-flash", name: "DeepSeek-V4-Flash", params: "284B (13B act)", sizeGb: 115, minRam: 128, tags: ["moe"], downloads: 0, paramsB: 284, activeB: 13 },
+    { id: "hy3",              name: "Hunyuan 3 295B",    params: "295B MoE",     sizeGb: 95,  minRam: 128, tags: ["moe"], downloads: 0, paramsB: 295, activeB: 13 },
   ];
   const TAG_LABELS = { vision: "Vision", moe: "MoE", fast: "Fast" };
 
@@ -460,8 +748,25 @@
     const sizes = (basename.match(/\d+(\.\d+)?b(?![a-z0-9])/ig) || []).map(parseFloat);
     return sizes.length ? Math.max(...sizes) * 1e9 : 0;
   }
+  // ── how much of a Mac's memory a model may actually have ─────────────────
+  // NOT a flat percentage. macOS/Metal hold back a roughly FIXED amount, so a
+  // 75% rule that looks sane at 8 GB is badly wrong at 128 GB: it would give
+  // 96 GB where Metal's own max_recommended_working_set_size is ~115 GB (the
+  // figure src/server.zig's #64 note records on a real 128 GB Mac). Getting
+  // this wrong hid our own 115.4 GB DeepSeek mirror from every 128 GB Mac.
+  // ONE rule feeds the board's RAM tiers AND the playground's verdict.
+  function usableRamGb(ramGb) { return ramGb - Math.max(3, Math.min(13, ramGb * 0.28)); }
+  // Past the recommended working set is not the same as impossible: the
+  // weights still fit in RAM, and with a raised wired limit and nothing else
+  // running they serve. That is "tight", and it is how a 284B model runs on a
+  // 128 GB Mac — so it must not be reported as "won't fit".
+  function maxRamGb(ramGb) { return ramGb * 0.94; }
+  function ramVerdict(totalGb, ramGb) {
+    if (totalGb <= usableRamGb(ramGb)) return "ok";
+    return totalGb <= maxRamGb(ramGb) ? "tight" : "no";
+  }
   function minRamFor(sizeGb) {
-    for (const tier of RAM_TIERS) if (sizeGb <= tier * 0.75) return tier;
+    for (const tier of RAM_TIERS) if (sizeGb <= usableRamGb(tier)) return tier;
     return RAM_TIERS[RAM_TIERS.length - 1];
   }
   function paramsLabel(params, activeM) {
@@ -504,10 +809,13 @@
       if (g.vision) tags.push("vision");
       if (moe) tags.push("moe");
       if (sizeGb <= 5 || (activeM && parseFloat(activeM[1]) <= 5.5)) tags.push("fast");
+      const paramsB = g.params / 1e9;
       out.push({
         id: g.id, name: prettyName(g.base), params: paramsLabel(g.params, activeM),
         sizeGb, minRam: minRamFor(sizeGb), tags, downloads: g.downloads,
         isNew: now - g.created < NEW_WINDOW_MS,
+        // numeric twins of the `params` label, for the setup calculator
+        paramsB, activeB: activeM ? parseFloat(activeM[1]) : paramsB,
       });
     }
     out.sort((a, b) => b.downloads - a.downloads);
@@ -582,6 +890,292 @@
     if (w >= 0.46) return "B";
     if (w >= 0.30) return "C";
     return "D";
+  }
+
+  // ── which ranking the board is running on ────────────────────────────────
+  // A Wilson board with an empty vote table is an all-U board — nothing to
+  // look at, and nothing to persuade anyone to vote. So until the community
+  // has voted, the board ranks on the published Artificial Analysis index.
+  // TO RESTORE COMMUNITY VOTING: set this to "votes". That is the whole
+  // change — tierForModel is the only place either ranking is decided, and a
+  // source scan in tests/website_tier_list_logic.mjs keeps it that way.
+  const TIER_MODE = "intelligence";
+  // Cutoffs on the AA index. Sized against the current snapshot so no tier is
+  // empty and S stays scarce (a tier list where everything is S ranks nothing).
+  const INTEL_TIERS = [["S", 45], ["A", 35], ["B", 25], ["C", 15]];
+  function tierForModel(model, tally, mode) {
+    if ((mode || TIER_MODE) === "votes") return tierFor(tally.up, tally.down);
+    // Rank on the PUBLISHED score only: an estimate is a guess from parameter
+    // count, and guesses do not belong on a ranking board. Unscored models
+    // wait in the table below, where they can still be voted on.
+    const score = aaScoreFor(model.id);
+    if (score == null) return "U";
+    for (const [tier, floor] of INTEL_TIERS) if (score >= floor) return tier;
+    return "D";
+  }
+
+  // ════════════════════════════════════════════════════════════════════════
+  // SETUP CALCULATOR — "what would this model do on my Mac?"
+  //
+  // Everything below is a ROOFLINE MODEL fitted to our own published
+  // benchmarks, not a lookup table of vibes:
+  //
+  //   decode  is memory-bandwidth bound. One token reads the active weights
+  //           plus the whole KV cache, so tok/s = achieved GB/s ÷ bytes/token.
+  //   prefill is compute bound (GEMM roofline): tok/s = achieved FLOP/s ÷
+  //           2·active_params. It does NOT vary with context length.
+  //
+  // The two efficiency pairs below are the only fitted constants, and they
+  // are fitted against four cells of docs/perf-csvs/all-26.7.12.csv measured
+  // on an Apple M4 Max 128 GB. tests/website_tier_list_logic.mjs replays
+  // those four measurements through this code and fails if it stops
+  // reproducing them — so the numbers on this page stay tied to a bench we
+  // actually ran. Everything else (bandwidth, GPU cores) is published spec.
+  // ════════════════════════════════════════════════════════════════════════
+
+  // Dense projections stream contiguously; MoE decode GATHERS scattered
+  // expert rows and measures far off peak (our own kernel notes read ~175
+  // GB/s on the expert path against ~412 GB/s for dense in the same forward).
+  const BW_EFF_DENSE = 0.80, BW_EFF_MOE = 0.47;
+  const FLOP_EFF_DENSE = 0.80, FLOP_EFF_MOE = 0.58;
+  // GPU clock (GHz) and the AI-matmul factor per generation. M5 puts a Neural
+  // Accelerator in every GPU core; we have only measured its spec-decode lane
+  // directly, so its prefill factor is an ESTIMATE and is labelled as one.
+  const GEN_CLOCK = { M1: 1.278, M2: 1.398, M3: 1.40, M4: 1.58, M5: 1.70 };
+  const GEN_AI = { M1: 1, M2: 1, M3: 1, M4: 1, M5: 1.6 };
+  const ENGINE_OVERHEAD_GB = 1.2;   // runtime + activations floor
+
+  // Apple ships the low-memory Max/Ultra ONLY on a cut-down die, so the RAM
+  // choice really does pick the GPU. `binned` names those configs rather than
+  // hiding the 25% difference in a footnote.
+  const MAC_CHIPS = [
+    { id: "m1",       gen: "M1", tier: "",      cores: 8,  bw: 68,  ram: [8, 16] },
+    { id: "m1-pro",   gen: "M1", tier: "Pro",   cores: 16, bw: 200, ram: [16, 32] },
+    { id: "m1-max",   gen: "M1", tier: "Max",   cores: 32, bw: 400, ram: [32, 64] },
+    { id: "m1-ultra", gen: "M1", tier: "Ultra", cores: 64, bw: 800, ram: [64, 128] },
+    { id: "m2",       gen: "M2", tier: "",      cores: 10, bw: 100, ram: [8, 16, 24] },
+    { id: "m2-pro",   gen: "M2", tier: "Pro",   cores: 19, bw: 200, ram: [16, 32] },
+    { id: "m2-max",   gen: "M2", tier: "Max",   cores: 38, bw: 400, ram: [32, 64, 96] },
+    { id: "m2-ultra", gen: "M2", tier: "Ultra", cores: 76, bw: 800, ram: [64, 128, 192] },
+    { id: "m3",       gen: "M3", tier: "",      cores: 10, bw: 100, ram: [8, 16, 24] },
+    { id: "m3-pro",   gen: "M3", tier: "Pro",   cores: 18, bw: 150, ram: [18, 36] },
+    { id: "m3-max",   gen: "M3", tier: "Max",   cores: 40, bw: 400, ram: [36, 48, 64, 96, 128],
+      binned: { ram: [36], cores: 30, bw: 300 } },
+    { id: "m3-ultra", gen: "M3", tier: "Ultra", cores: 80, bw: 819, ram: [96, 256, 512],
+      binned: { ram: [96], cores: 60 } },
+    { id: "m4",       gen: "M4", tier: "",      cores: 10, bw: 120, ram: [16, 24, 32] },
+    { id: "m4-pro",   gen: "M4", tier: "Pro",   cores: 20, bw: 273, ram: [24, 48, 64] },
+    { id: "m4-max",   gen: "M4", tier: "Max",   cores: 40, bw: 546, ram: [36, 48, 64, 128],
+      binned: { ram: [36], cores: 32, bw: 410 } },
+    // no M4 Ultra: Apple never shipped one
+    { id: "m5",       gen: "M5", tier: "",      cores: 10, bw: 153, ram: [16, 24, 32] },
+    { id: "m5-pro",   gen: "M5", tier: "Pro",   cores: 20, bw: 307, ram: [24, 48, 64] },
+    { id: "m5-max",   gen: "M5", tier: "Max",   cores: 40, bw: 614, ram: [36, 48, 64, 128],
+      binned: { ram: [36], cores: 32, bw: 460 } },
+    // no M5 Ultra yet: not announced as of this page's data snapshot
+  ];
+  function chipConfig(chip, ramGb) {
+    const b = chip.binned && chip.binned.ram.includes(ramGb) ? chip.binned : null;
+    const cores = b ? b.cores : chip.cores;
+    const bw = b && b.bw ? b.bw : chip.bw;
+    return {
+      id: chip.id, gen: chip.gen, tier: chip.tier, cores, bw, ram: ramGb,
+      binned: !!b,
+      // 128 ALUs/core, 2 FLOP per ALU-clock (FMA)
+      tflops: cores * 128 * 2 * GEN_CLOCK[chip.gen] / 1000,
+      aiFactor: GEN_AI[chip.gen],
+    };
+  }
+  const MAC_GENS = ["M1", "M2", "M3", "M4", "M5"];
+  const MAC_TIERS = ["", "Pro", "Max", "Ultra"];
+  function chipFor(gen, tier) {
+    return MAC_CHIPS.find((c) => c.gen === gen && c.tier === tier) || null;
+  }
+  // Switching chip must never strand a RAM size the new chip can't be bought
+  // with (a 512 GB M3 Ultra does not become a 512 GB M1).
+  function nearestRam(chip, ramGb) {
+    return chip.ram.reduce((best, r) =>
+      Math.abs(r - ramGb) < Math.abs(best - ramGb) ? r : best, chip.ram[0]);
+  }
+
+  // MLX affine quantization stores a scale AND a bias per group of 64
+  // weights, so the real cost is bits + 0.5. 4-bit = 0.5625 B/weight, which
+  // is the same constant the board already sizes models with.
+  // "mix" = the recipe large-MoE mirrors actually ship: low-bit experts with
+  // an 8-bit spine/embeddings/head. Ours is
+  // ddalcu/DeepSeek-V4-Flash-0731-MLX-Serve-mixed-2-3-8bit — 115.4 GB for
+  // 284B params, i.e. 0.406 B/weight, CHEAPER than uniform 3-bit because most
+  // experts sit at 2 bits. It is the only reason a 284B model runs on a
+  // 128 GB Mac, so a uniform-only ladder misreports the hardware needed.
+  const QUANT_BITS = [2, "mix", 3, 4, 6, 8, 16];
+  const MIXED_BYTES_PER_PARAM = 0.406;
+  // Quality sits between uniform 3-bit and 4-bit: imatrix calibration and
+  // keeping the last layers at 4-bit is what stopped low-bit experts sending
+  // agents into turn-level repetition loops.
+  const QUANT_LOSS = { 2: 0.28, mix: 0.055, 3: 0.10, 4: 0.035, 6: 0.015, 8: 0.005, 16: 0 };
+  function bytesPerParam(bits) {
+    if (bits === "mix") return MIXED_BYTES_PER_PARAM;
+    return bits === 16 ? 2 : (bits + 0.5) / 8;
+  }
+  // Quantizing experts harder than the spine only means anything when there
+  // ARE experts — never offer it on a dense model.
+  function quantAvailable(bits, model) {
+    return bits !== "mix" || (model.tags || []).includes("moe");
+  }
+  // Low bit widths hurt a small model far more than a big one — there is less
+  // redundancy to spend. (Our own 2-bit experience: uniform 2-bit sent an
+  // agent into turn-level repetition loops that 4-bit tail layers fixed.)
+  function quantQuality(bits, paramsB) {
+    const loss = (QUANT_LOSS[bits] || 0) * (1 + 3 / Math.sqrt(Math.max(1, paramsB)));
+    return Math.max(0.15, 1 - loss);
+  }
+
+  // KV bytes per token, anchored on the 27.8B dense measurement implied by the
+  // 64k ladder in docs/perf-csvs/mtp-ladder-26.7.12.csv. KV scales with the
+  // model's DIMENSIONS, not its expert count, so an MoE is billed on
+  // sqrt(total x active) — which lands within a few percent of the real
+  // layer x kv_head x head_dim product for the MoEs we ship.
+  const KV_REF_KB = 195, KV_REF_B = 27.8;
+  // Architectures whose KV does not grow like a plain dense cache: Gemma
+  // interleaves 5 local-window layers per global one, DeepSeek-V4 keeps MQA
+  // over one 512-d latent, Ling runs recurrent KDA on 35 of its 42 layers.
+  const KV_FACTOR = [
+    [/^gemma/, 0.3], [/^deepseek-v4/, 0.05], [/^ling-/, 0.35], [/^minimax-m/, 0.5],
+  ];
+  function kvFactorFor(id) {
+    for (const [re, f] of KV_FACTOR) if (re.test(id || "")) return f;
+    return 1;
+  }
+  function kvKbPerToken(model, kvBits) {
+    const dim = Math.sqrt(Math.max(0.1, model.paramsB) * Math.max(0.1, model.activeB));
+    const scale = Math.pow(dim / KV_REF_B, 2 / 3);
+    return KV_REF_KB * scale * kvFactorFor(model.id) * (bytesPerParam(kvBits) / 2);
+  }
+
+  const isMoeModel = (m) => (m.tags || []).includes("moe");
+
+  // Gemma's E-series is a MatFormer with per-layer embeddings: "4B active"
+  // describes the COMPUTE, but a decode step still touches the elastic
+  // model's full weights (the PLE table is a per-token lookup). Billing E4B
+  // on its active count over-predicts decode by ~68% against our own bench,
+  // so this class reads on total params instead.
+  const DECODE_READS_FULL = [/^gemma-\d+-e\d/];
+  function decodeParamsB(model) {
+    return DECODE_READS_FULL.some((re) => re.test(model.id || "")) ? model.paramsB : model.activeB;
+  }
+
+  // Measured speculative-decoding multipliers. Draft acceptance is a property
+  // of the TEXT, so the workload picker is not a nicety — it is the honest
+  // range. Sources: docs/perf-csvs/all-26.7.12.csv (PLD/drafter/MTP columns)
+  // and the DSpark / Ling MTP rounds in our engine notes.
+  const SPEC_GAIN = {
+    none:    { prose: 1.00, code: 1.00, agent: 1.00 },
+    pld:     { prose: 1.05, code: 1.25, agent: 1.80 },
+    drafter: { prose: 1.15, code: 1.30, agent: 1.55 },
+    mtp:     { prose: 1.40, code: 2.00, agent: 2.60 },
+  };
+  // A trained multi-token-prediction head ships INSIDE a checkpoint — it is
+  // not a runtime flag you can turn on for any model.
+  const MTP_FAMILIES = [/^qwen3\.[56]/, /^ling-/, /^deepseek-v4/, /^glm-5/];
+  function specSupported(mode, model) {
+    if (mode !== "mtp") return true;
+    return MTP_FAMILIES.some((re) => re.test(model.id || ""));
+  }
+  function specMultiplier(mode, workload, model) {
+    const row = SPEC_GAIN[mode] || SPEC_GAIN.none;
+    return row[workload] || row.code;
+  }
+
+  function estimateDecodeTps(model, hw, o) {
+    const moe = isMoeModel(model);
+    const gbPerS = hw.bw * (moe ? BW_EFF_MOE : BW_EFF_DENSE);
+    const weightsGb = decodeParamsB(model) * bytesPerParam(o.bits);
+    const kvGb = (o.ctx || 0) * kvKbPerToken(model, o.kvBits) / 1e6;
+    const base = gbPerS / (weightsGb + kvGb);
+    return base * specMultiplier(o.spec || "none", o.workload || "code", model);
+  }
+  function estimatePrefillTps(model, hw, o) {
+    const moe = isMoeModel(model);
+    const flops = hw.tflops * 1e12 * (moe ? FLOP_EFF_MOE : FLOP_EFF_DENSE) * hw.aiFactor;
+    return flops / (2 * model.activeB * 1e9);
+  }
+  function estimateMemoryGb(model, o) {
+    // Every expert has to be resident even though only a few are read per
+    // token, so the footprint is billed on TOTAL params while decode speed is
+    // billed on active ones.
+    const weights = model.paramsB * bytesPerParam(o.bits);
+    const kv = (o.ctx || 0) * kvKbPerToken(model, o.kvBits) / 1e6;
+    // activations scale with what a step COMPUTES, so an MoE's dormant
+    // experts must not be billed runtime they never touch
+    const overhead = ENGINE_OVERHEAD_GB + 0.04 * model.activeB;
+    return { weights, kv, overhead, total: weights + kv + overhead };
+  }
+  function fitsRam(totalGb, ramGb) { return ramVerdict(totalGb, ramGb) === "ok"; }
+
+  // ── card ordering ────────────────────────────────────────────────────────
+  // Every mode falls through to NAME, so the grid has no arbitrary order:
+  // two models tied on downloads (or on a rounded score) land the same way
+  // every render instead of swapping places under the cursor.
+  const SORT_MODES = [["popular", "Popular"], ["name", "Name"],
+    ["intel", "Intelligence"], ["speed", "Speed"]];
+  const SORT_KEYS = {
+    popular: (a, b) => (b.model.downloads || 0) - (a.model.downloads || 0),
+    name: () => 0,
+    intel: (a, b) => b.iq - a.iq,
+    speed: (a, b) => b.decode - a.decode,
+  };
+  function sortModelEntries(entries, mode) {
+    const key = SORT_KEYS[mode] || SORT_KEYS.name;
+    return entries.slice().sort((a, b) => key(a, b) || a.model.name.localeCompare(b.model.name));
+  }
+
+  // ── intelligence ─────────────────────────────────────────────────────────
+  // Artificial Analysis Intelligence Index, snapshot 2026-08-05 from
+  // artificialanalysis.ai/models/open-source (+ /small). Quoted verbatim for
+  // models AA has actually scored; anything else is ESTIMATED from scale and
+  // must be badged as such — a made-up citation is worse than no number.
+  const AA_SNAPSHOT = "2026-08-05";
+  const AA_INDEX = {
+    "kimi-k3": 57, "glm-5.2": 51, "deepseek-v4-flash": 50, "minimax-m3": 44,
+    "mimo-v2.5-pro": 42, "inkling": 41, "nemotron-3-ultra-550b-a55b": 38,
+    "qwen3.6-27b": 37, "qwen3.6-35b-a3b": 32, "g9v3-39a5b": 31,
+    "mistral-medium-3.5": 30, "gemma-4-31b": 29, "gemma-4-26b-a4b": 26,
+    "qwen3.5-35b-a3b": 24, "gpt-oss-120b": 24, "command-a": 23,
+    "gemma-4-12b": 22, "qwen3.5-9b": 21, "apriel-v1.6-15b-thinker": 21,
+    "llama-4-maverick": 14, "gemma-4-e4b": 12, "ministral-3-14b": 11,
+    "llama-4-scout": 10, "llama-3.3-70b": 9, "llama-3.1-405b": 9,
+    "granite-4.1-30b": 9, "ministral-3-8b": 9, "olmo-3.1-32b": 8,
+    "granite-4.1-8b": 7, "ministral-3-3b": 7,
+  };
+  // The intelligence bar's ceiling. Derived from the table so adding a
+  // stronger model rescales the bar instead of leaving it pinned at a stale
+  // hardcoded max.
+  const AA_MAX = Math.max(...Object.values(AA_INDEX));
+  function aaScoreFor(id) {
+    if (AA_INDEX[id] != null) return AA_INDEX[id];
+    // a key may be the release-family prefix of a dated repo id
+    // (deepseek-v4-flash-0731). Require a "-" boundary so kimi-k3 can never
+    // answer for kimi-k3.5.
+    let best = null;
+    for (const k of Object.keys(AA_INDEX)) {
+      if ((id || "").startsWith(k + "-") && (!best || k.length > best.length)) best = k;
+    }
+    return best ? AA_INDEX[best] : null;
+  }
+  // Fallback for unscored models: a regression of the scored set against
+  // sqrt(total x active) params. Scatter is roughly +/-10 points, which is
+  // why the UI badges it "est." instead of printing it like a citation.
+  function estimateIntelligence(model) {
+    const eff = Math.sqrt(Math.max(0.1, model.paramsB) * Math.max(0.1, model.activeB));
+    return Math.max(3, Math.min(60, 22.7 * Math.log10(eff) - 5.1));
+  }
+  function intelligenceFor(model, bits) {
+    const published = aaScoreFor(model.id);
+    const base = published != null ? published : estimateIntelligence(model);
+    return {
+      base, est: published == null,
+      score: base * quantQuality(bits, model.paramsB),
+    };
   }
 
   // ── state ────────────────────────────────────────────────────────────────
@@ -723,7 +1317,7 @@
     const transitions = [];
     for (const m of activeModels) {
       const t = state.tallies[m.id] || { up: 0, down: 0 };
-      const tier = tierFor(t.up, t.down);
+      const tier = tierForModel(m, t);
       transitions.push({ id: m.id, tier, m });
       if (!fits(m)) continue;
       if (tier === "U") {
@@ -732,8 +1326,13 @@
         placed[tier].push({ m, t });
       }
     }
+    // order WITHIN a tier follows whatever ranked it, so the strongest entry
+    // in a row is always the leftmost one
+    const rank = TIER_MODE === "votes"
+      ? (x) => wilsonLower(x.t.up, x.t.down)
+      : (x) => aaScoreFor(x.m.id) || 0;
     for (const [tier, list] of Object.entries(placed)) {
-      list.sort((x, y) => wilsonLower(y.t.up, y.t.down) - wilsonLower(x.t.up, x.t.down)
+      list.sort((x, y) => rank(y) - rank(x)
         || (y.t.up - y.t.down) - (x.t.up - x.t.down)
         || (y.m.downloads || 0) - (x.m.downloads || 0));
       if (list.length === 0) {
@@ -759,6 +1358,11 @@
     promoted.forEach((p, i) => celebratePromotion(p.m, p.tier, i));
     if (backend && backend.demo) {
       note("Community voting isn't wired up yet — votes below stay in this browser only. (Site owner: paste the Firebase config to go live.)", true);
+    } else if (TIER_MODE === "intelligence") {
+      // say plainly what is ranking the board right now, and what changes it
+      note(state.user
+        ? "Signed in. Your votes are recorded. Tiers currently come from the Artificial Analysis Intelligence Index; once enough votes land, the board switches to community ranking."
+        : "Tiers currently come from the Artificial Analysis Intelligence Index, because the community hasn't voted yet. Sign in with Google to vote; once enough votes land, the board switches to community ranking.");
     } else if (state.user) {
       note("Signed in — your votes are live. Click an arrow again to undo it.");
     } else {
@@ -849,6 +1453,288 @@
     el.className = "vote-note" + (warn ? " warn" : "");
   }
 
+  // ── quant playground: wiring ─────────────────────────────────────────────
+  // Defaults describe the machine this project's benchmarks were measured on,
+  // so a first-time visitor lands on numbers we can actually vouch for.
+  const rig = {
+    gen: "M4", tier: "Max", ram: 64, modelId: null,
+    bits: 4, kvBits: 16, ctx: 8192, spec: "none", workload: "code",
+    sort: "popular",   // the board's own ordering; persists across opens
+  };
+  const CTX_CHOICES = [[4096, "4K"], [8192, "8K"], [32768, "32K"], [131072, "128K"]];
+  const KV_CHOICES = [[16, "bf16"], [8, "8-bit"], [4, "4-bit"]];
+  const MODE_CHOICES = [["none", "Off"], ["pld", "PLD"], ["drafter", "Drafter"], ["mtp", "MTP"]];
+  const WORKLOAD_CHOICES = [["prose", "Prose"], ["code", "Code"], ["agent", "Agent / edits"]];
+  const BITS_LABEL = { 2: "2-bit", mix: "Mixed", 3: "3-bit", 4: "4-bit", 6: "6-bit", 8: "8-bit", 16: "bf16" };
+
+  const $ = (id) => document.getElementById(id);
+  function segButtons(host, choices, isOn, onPick, isOff) {
+    host.innerHTML = "";
+    for (const [value, label] of choices) {
+      const b = document.createElement("button");
+      b.textContent = label;
+      if (isOn(value)) b.classList.add("on");
+      if (isOff && isOff(value)) b.disabled = true;
+      else b.addEventListener("click", () => onPick(value));
+      host.appendChild(b);
+    }
+  }
+  function rigModel() {
+    return activeModels.find((m) => m.id === rig.modelId) || activeModels[0];
+  }
+  function fmtTps(v) {
+    if (v >= 1000) return Math.round(v).toLocaleString();
+    return v >= 100 ? Math.round(v) + "" : v.toFixed(1);
+  }
+  function fmtGb(v) { return (v >= 100 ? Math.round(v) : Math.round(v * 10) / 10) + " GB"; }
+
+  function renderRig() {
+    const model = rigModel();
+    if (!model) return;
+    rig.modelId = model.id;
+    const chip = chipFor(rig.gen, rig.tier);
+    if (!chip) return;
+    if (!chip.ram.includes(rig.ram)) rig.ram = nearestRam(chip, rig.ram);
+    const hw = chipConfig(chip, rig.ram);
+
+    // hardware pickers
+    segButtons($("rig-gen"), MAC_GENS.map((g) => [g, g]), (g) => g === rig.gen, (g) => {
+      rig.gen = g;
+      if (!chipFor(g, rig.tier)) rig.tier = chipFor(g, "Max") ? "Max" : "";
+      renderRig();
+    });
+    segButtons($("rig-tier"), MAC_TIERS.map((t) => [t, t || "Base"]),
+      (t) => t === rig.tier,
+      (t) => { rig.tier = t; renderRig(); },
+      (t) => !chipFor(rig.gen, t));
+    segButtons($("rig-ram"), chip.ram.map((r) => [r, r + " GB"]), (r) => r === rig.ram, (r) => {
+      rig.ram = r;
+      // your Mac is your Mac: the board's own filter follows the rig
+      state.ram = r;
+      document.querySelectorAll("#ram-filter button").forEach((x) =>
+        x.classList.toggle("on", parseInt(x.dataset.ram, 10) === nearestBoardRam(r)));
+      renderRig();
+      render();
+    });
+    $("rig-spec").textContent = hw.cores + "-core GPU · " + hw.bw + " GB/s memory bandwidth" +
+      (hw.binned ? " · binned die" : "");
+
+    // model trigger — the full comparison lives in the card modal
+    $("rig-model-name").textContent = model.name;
+    $("rig-model-meta").textContent = model.params;
+    // mixed precision is an EXPERT recipe — greyed out on a dense model
+    if (!quantAvailable(rig.bits, model)) rig.bits = 4;
+    segButtons($("rig-bits"), QUANT_BITS.map((b) => [b, BITS_LABEL[b]]),
+      (b) => b === rig.bits, (b) => { rig.bits = b; renderRig(); },
+      (b) => !quantAvailable(b, model));
+    segButtons($("rig-kv"), KV_CHOICES, (b) => b === rig.kvBits,
+      (b) => { rig.kvBits = b; renderRig(); });
+    segButtons($("rig-ctx"), CTX_CHOICES, (c) => c === rig.ctx,
+      (c) => { rig.ctx = c; renderRig(); });
+    // MTP is a head baked into a checkpoint — greyed out, never silently ignored
+    if (rig.spec === "mtp" && !specSupported("mtp", model)) rig.spec = "none";
+    segButtons($("rig-mode"), MODE_CHOICES, (m) => m === rig.spec,
+      (m) => { rig.spec = m; renderRig(); },
+      (m) => !specSupported(m, model));
+    segButtons($("rig-workload"), WORKLOAD_CHOICES, (w) => w === rig.workload,
+      (w) => { rig.workload = w; renderRig(); });
+
+    // results
+    const o = { bits: rig.bits, kvBits: rig.kvBits, ctx: rig.ctx, spec: rig.spec, workload: rig.workload };
+    const decode = estimateDecodeTps(model, hw, o);
+    const prefill = estimatePrefillTps(model, hw, o);
+    const iq = intelligenceFor(model, rig.bits);
+    const mem = estimateMemoryGb(model, o);
+    const usable = usableRamGb(rig.ram);
+    const verdict = ramVerdict(mem.total, rig.ram);
+
+    $("out-decode").textContent = fmtTps(decode);
+    $("out-prefill").textContent = fmtTps(prefill);
+    $("out-iq").innerHTML = Math.round(iq.score) +
+      (iq.est ? '<span class="stat-est">est</span>' : "");
+
+    const segInto = (host, cls, part, whole) => {
+      const s = document.createElement("span");
+      s.className = cls;
+      s.style.width = Math.max(0, Math.min(100, (part / whole) * 100)) + "%";
+      host.appendChild(s);
+    };
+
+    // intelligence bar: same scale for every model, so switching models moves
+    // the fill instead of re-scaling the axis under you. The ceiling is the
+    // top score in the AA snapshot, which is what makes the number legible.
+    const iqBar = $("out-iq-bar");
+    iqBar.innerHTML = "";
+    segInto(iqBar, "iq-have", iq.score, AA_MAX);
+    segInto(iqBar, "iq-lost", iq.base - iq.score, AA_MAX);
+    const lost = iq.base - iq.score;
+    $("out-iq-legend").textContent =
+      Math.round(iq.score) + " of " + AA_MAX + " · " +
+      (lost < 0.05 ? "no quantization loss" : BITS_LABEL[rig.bits] + " costs " + lost.toFixed(1) + " pts") +
+      " · bar ends at the best open-weights score";
+
+    const bar = $("out-bar");
+    bar.innerHTML = "";
+    const seg = (cls, gb) => segInto(bar, cls, gb, usable);
+    if (verdict === "ok") {
+      seg("mem-w", mem.weights);
+      seg("mem-kv", mem.kv + mem.overhead);
+    } else {
+      seg("mem-over", usable);
+    }
+    $("out-mem").textContent = fmtGb(mem.weights) + " weights + " + fmtGb(mem.kv) + " KV @ " +
+      (rig.ctx / 1024) + "K + " + fmtGb(mem.overhead) + " runtime = " + fmtGb(mem.total) +
+      " of " + fmtGb(usable) + " usable";
+
+    const v = $("out-verdict");
+    const ttft = rig.ctx / prefill;
+    if (verdict === "no") {
+      v.className = "rig-verdict bad";
+      v.textContent = "Won't fit. " + fmtGb(mem.total) + " needed, " + fmtGb(usable) +
+        " usable on " + rig.ram + " GB. Drop the quant, shorten the context, or pick a smaller model.";
+    } else if (verdict === "tight") {
+      // past Metal's recommended working set but still resident — the state
+      // our own 284B mirror runs a 128 GB Mac in
+      v.className = "rig-verdict warn";
+      v.textContent = "Runs, but tight: " + fmtGb(mem.total) + " against " + fmtGb(usable) +
+        " recommended. Raise the wired limit, keep the Mac to itself.";
+    } else if (mem.total > usable * 0.85) {
+      v.className = "rig-verdict warn";
+      v.textContent = "Tight but runs. " + fmtGb(usable - mem.total) + " spare, so expect pressure with a browser open. " +
+        "A " + Math.round(rig.ctx / 1024) + "K prompt starts answering in ~" + ttft.toFixed(1) + "s.";
+    } else {
+      v.className = "rig-verdict";
+      v.textContent = "Fits comfortably, " + fmtGb(usable - mem.total) + " to spare. A full " +
+        Math.round(rig.ctx / 1024) + "K prompt starts answering in ~" + ttft.toFixed(1) + "s.";
+    }
+    $("out-cmd").textContent = "mlx-serve run " + model.id +
+      (rig.spec === "mtp" ? " --mtp" : rig.spec === "pld" ? " --pld" : rig.spec === "drafter" ? " --drafter" : "") +
+      (rig.kvBits !== 16 ? " --kv-quant " + rig.kvBits : "") +
+      " --ctx-size " + rig.ctx;
+
+    // CONSTANT by design — this panel is a 3-column grid, so a footnote that
+    // grew a line on some selections resized the whole page under the cursor.
+    // Every caveat that used to be conditional is stated unconditionally.
+    $("rig-foot").innerHTML =
+      "Decode is modelled as bandwidth-bound (active weights + KV read per token), prefill as compute-bound " +
+      "(2·active params per token), fitted to our M4 Max benchmark runs and re-checked against them on every " +
+      "build. Expect ±10% on decode and ±25% on prefill; a real checkpoint's mileage moves with its converter. " +
+      "M5 puts a Neural Accelerator in every GPU core: we have measured its speculative-decoding lane but not " +
+      "general prefill, so M5 prompt figures are the one extrapolation here. " +
+      "Intelligence is the <a href=\"https://artificialanalysis.ai/models/open-source\" target=\"_blank\" rel=\"noopener\">" +
+      "Artificial Analysis Intelligence Index</a> (snapshot " + AA_SNAPSHOT + ") scaled by a quantization-quality " +
+      "curve; models AA hasn't scored are marked <b>est</b> and inferred from scale alone (±10 points). " +
+      "<b>This data is hard to keep current.</b> New Macs ship, Artificial Analysis re-bases its index, and "  +
+      "better quants land constantly. If a number here is wrong, a pull request to fix it would be appreciated: " +
+      "<a href=\"https://github.com/ddalcu/mlx-serve/edit/main/website/llm-tier-list/index.html\" target=\"_blank\" " +
+      "rel=\"noopener\">edit this page on GitHub</a>. The chip table, the AA scores and the model list are all in that one file.";
+  }
+  // the board's RAM filter has coarser tiers than Apple's real configs
+  function nearestBoardRam(r) {
+    return RAM_TIERS.reduce((best, t) => (t <= r && t > best ? t : best), RAM_TIERS[0]);
+  }
+  // ── model chooser modal ──────────────────────────────────────────────────
+  // Every card is scored against the Mac and settings already chosen in the
+  // panel, so the grid answers "which of these should I run?" instead of
+  // "what are these called".
+  let modelQuery = "";
+  // one scoring pass per model, shared by the SORT and the card it renders —
+  // sorting on numbers a card doesn't show is how a grid ends up looking
+  // mis-ordered
+  function modelEntry(m) {
+    const hw = chipConfig(chipFor(rig.gen, rig.tier), rig.ram);
+    const o = { bits: rig.bits, kvBits: rig.kvBits, ctx: rig.ctx, spec: rig.spec, workload: rig.workload };
+    // a card shows what THIS model would run at: a dense model has no mixed
+    // recipe, so it is priced at 4-bit rather than at a width it can't have
+    if (!quantAvailable(o.bits, m)) o.bits = 4;
+    const mem = estimateMemoryGb(m, o);
+    const iqFull = intelligenceFor(m, o.bits);
+    const spec = specSupported(rig.spec, m) ? rig.spec : "none";
+    return {
+      model: m, hw, o, mem, iqFull, iq: iqFull.score,
+      verdict: ramVerdict(mem.total, rig.ram), fits: ramVerdict(mem.total, rig.ram) !== "no",
+      decode: estimateDecodeTps(m, hw, { ...o, spec }),
+      prefill: estimatePrefillTps(m, hw, o),
+    };
+  }
+  function modelCard(e) {
+    const { model: m, o, mem, iqFull: iq, fits, decode } = e;
+    const el = document.createElement("button");
+    el.className = "mcard" + (m.id === rig.modelId ? " on" : "") + (fits ? "" : " nofit");
+    el.dataset.model = m.id;
+    el.innerHTML =
+      '<span class="mcard-name"></span>' +
+      '<span class="mcard-sub">' + m.params + " · " + fmtGb(mem.total) + " at " + BITS_LABEL[o.bits] + "</span>" +
+      '<span class="mcard-nums">' +
+        '<span class="mcard-num"><b>' + fmtTps(decode) + "</b><span>tok/s</span></span>" +
+        '<span class="mcard-num"><b>' + fmtTps(e.prefill) + "</b><span>prompt</span></span>" +
+        '<span class="mcard-num"><b>' + Math.round(iq.score) + (iq.est ? "*" : "") + "</b><span>intel</span></span>" +
+      "</span>" +
+      '<span class="mcard-bar">' +
+        '<span class="iq-have" style="width:' + (iq.score / AA_MAX) * 100 + '%"></span>' +
+        '<span class="iq-lost" style="width:' + ((iq.base - iq.score) / AA_MAX) * 100 + '%"></span>' +
+      "</span>" +
+      '<span class="mcard-foot">' +
+        '<span class="mcard-fit' + { ok: "", tight: " tight", no: " no" }[e.verdict] + '">' +
+          { ok: "Fits " + rig.ram + " GB", tight: "Tight on " + rig.ram + " GB",
+            no: "Needs " + minRamFor(mem.total) + " GB" }[e.verdict] + "</span>" +
+        (m.tags || []).map((t) => '<span class="mc-tag">' + TAG_LABELS[t] + "</span>").join("") +
+      "</span>";
+    el.querySelector(".mcard-name").textContent = m.name;
+    el.addEventListener("click", () => {
+      rig.modelId = m.id;
+      closeModelModal();
+      renderRig();
+    });
+    return el;
+  }
+  function renderModelGrid() {
+    const grid = $("model-grid");
+    grid.innerHTML = "";
+    const entries = sortModelEntries(
+      activeModels.filter((m) => matchesQuery(m, modelQuery)).map(modelEntry), rig.sort);
+    for (const e of entries) grid.appendChild(modelCard(e));
+    segButtons($("model-sort"), SORT_MODES, (s) => s === rig.sort,
+      (s) => { rig.sort = s; renderModelGrid(); });
+    const chip = chipFor(rig.gen, rig.tier);
+    $("model-modal-sub").textContent = entries.length + " models · scored on " +
+      (chip.gen + " " + (chip.tier || "base")).trim() + " · " + rig.ram + " GB · " +
+      BITS_LABEL[rig.bits] + " · " + (rig.ctx / 1024) + "K context";
+  }
+  let modalOpener = null;
+  function openModelModal() {
+    modalOpener = document.activeElement;
+    modelQuery = "";
+    $("model-modal-search").value = "";
+    renderModelGrid();
+    $("model-modal").hidden = false;
+    document.body.classList.add("modal-open");
+    $("model-modal-search").focus();
+  }
+  function closeModelModal() {
+    $("model-modal").hidden = true;
+    document.body.classList.remove("modal-open");
+    if (modalOpener && modalOpener.focus) modalOpener.focus();
+  }
+  document.getElementById("rig-model").addEventListener("click", openModelModal);
+  document.getElementById("model-modal-close").addEventListener("click", closeModelModal);
+  document.getElementById("model-modal-backdrop").addEventListener("click", closeModelModal);
+  document.getElementById("model-modal-search").addEventListener("input", (e) => {
+    modelQuery = e.target.value;
+    renderModelGrid();
+  });
+  document.addEventListener("keydown", (e) => {
+    if (e.key === "Escape" && !$("model-modal").hidden) closeModelModal();
+  });
+  document.getElementById("rig-toggle").addEventListener("click", () => {
+    const el = document.getElementById("rig");
+    const open = el.dataset.open === "1" ? "0" : "1";
+    el.dataset.open = open;
+    const btn = document.getElementById("rig-toggle");
+    btn.textContent = open === "1" ? "Hide" : "Show";
+    btn.setAttribute("aria-expanded", open === "1" ? "true" : "false");
+  });
+
   // ── filters ──────────────────────────────────────────────────────────────
   document.querySelectorAll("#ram-filter button").forEach((b) => {
     b.addEventListener("click", () => {
@@ -907,6 +1793,11 @@
       const c = hfCached(); // stale ranking beats the static seed
       if (c) setActiveModels(mergeWithSeed(c.models, SEED_MODELS));
     }
+    // the playground opens on a model we have actually benchmarked
+    const preferred = ["qwen3.6-27b", "gemma-4-26b-a4b", "qwen3.6-35b-a3b"];
+    rig.modelId = (preferred.find((id) => activeModels.some((m) => m.id === id)) ||
+      (activeModels[0] && activeModels[0].id));
+    renderRig();
     try {
       backend = FIREBASE_READY ? await firestoreBackend() : localBackend();
     } catch (e) {

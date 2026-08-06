@@ -584,6 +584,60 @@ pub fn discoverModels(io: std.Io, allocator: std.mem.Allocator, model_dir: []con
     return discoverModelsInDir(io, allocator, dir, model_dir);
 }
 
+/// Scan several roots and merge them into ONE result, first-root-wins on a
+/// repeated id.
+///
+/// De-dup is load-bearing, not tidiness: `registerStubWithArch` answers
+/// `error.DuplicateId` and `ModelRegistry.registerDiscovered` does `try`, so
+/// two roots holding the same `org/name` would fail the whole registry init —
+/// the server would not start. First wins because the caller orders the roots
+/// and the first is where downloads land, so a stale copy on a second disk must
+/// never shadow the live one.
+///
+/// A root that cannot be opened is SKIPPED with a warning rather than failing:
+/// the second folder can live on an external drive, and unplugging it must not
+/// stop the server serving everything else.
+pub fn discoverModelsMany(io: std.Io, allocator: std.mem.Allocator, roots: []const []const u8) !DiscoveryResult {
+    var merged = std.ArrayList(DiscoveredModel).empty;
+    errdefer {
+        for (merged.items) |*m| {
+            allocator.free(m.id);
+            allocator.free(m.path);
+            if (m.model_type.len > 0) allocator.free(m.model_type);
+        }
+        merged.deinit(allocator);
+    }
+
+    for (roots) |root| {
+        const one = discoverModels(io, allocator, root) catch |err| {
+            log.warn("--model-dir scan failed ({s}): {s}\n", .{ root, @errorName(err) });
+            continue;
+        };
+        // Transfer ownership per model, freeing only the ones we drop — the
+        // whole result's `deinit` would free the strings we just handed over.
+        defer allocator.free(one.models);
+        for (one.models) |m| {
+            var dup = false;
+            for (merged.items) |seen| {
+                if (std.mem.eql(u8, seen.id, m.id)) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (dup) {
+                log.warn("[discovery] {s}: already found in an earlier --model-dir, skipping {s}\n", .{ m.id, m.path });
+                allocator.free(m.id);
+                allocator.free(m.path);
+                if (m.model_type.len > 0) allocator.free(m.model_type);
+                continue;
+            }
+            try merged.append(allocator, m);
+        }
+    }
+
+    return .{ .models = try merged.toOwnedSlice(allocator), .allocator = allocator };
+}
+
 /// Core scan over an already-open root. Two layouts are recognized:
 ///   <root>/<model>/config.json               → id "<model>"
 ///   <root>/<org>/<model>/config.json         → id "<org>/<model>"
@@ -1040,6 +1094,77 @@ test "discoverModels finds flat and org/repo model dirs" {
     try std.testing.expectEqualStrings("mlx-community/nested-model", result.models[1].id);
     try std.testing.expectEqualStrings("/models-root/mlx-community/nested-model", result.models[1].path);
     try std.testing.expectEqualStrings("qwen3", result.models[1].model_type);
+}
+
+test "discoverModelsMany merges roots in order and de-dups by id" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var a_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer a_dir.cleanup();
+    var b_dir = std.testing.tmpDir(.{ .iterate = true });
+    defer b_dir.cleanup();
+
+    // Same id in BOTH roots. The registry answers `error.DuplicateId` and
+    // `registerDiscovered` does `try`, so an un-deduped merge does not produce
+    // a duplicate entry — it fails the whole registry init, i.e. the server
+    // does not start. De-dup is not tidiness here.
+    try a_dir.dir.createDirPath(io, "org/shared");
+    try a_dir.dir.writeFile(io, .{ .sub_path = "org/shared/config.json", .data = "{\"model_type\":\"qwen3\"}" });
+    try a_dir.dir.createDirPath(io, "org/only-in-a");
+    try a_dir.dir.writeFile(io, .{ .sub_path = "org/only-in-a/config.json", .data = "{\"model_type\":\"gemma3\"}" });
+    try b_dir.dir.createDirPath(io, "org/shared");
+    try b_dir.dir.writeFile(io, .{ .sub_path = "org/shared/config.json", .data = "{\"model_type\":\"llama\"}" });
+    try b_dir.dir.createDirPath(io, "org/only-in-b");
+    try b_dir.dir.writeFile(io, .{ .sub_path = "org/only-in-b/config.json", .data = "{\"model_type\":\"mistral\"}" });
+
+    // `discoverModels` opens by ABSOLUTE path (the openDirAbsolute UB class),
+    // and a testing tmpDir is `<cwd>/.zig-cache/tmp/<sub_path>`.
+    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd_ptr = std.c.getcwd(&cwd_buf, cwd_buf.len) orelse return error.NoCwd;
+    const cwd = std.mem.span(@as([*:0]const u8, @ptrCast(cwd_ptr)));
+    const a_path = try std.fmt.allocPrint(allocator, "{s}/.zig-cache/tmp/{s}", .{ cwd, a_dir.sub_path });
+    defer allocator.free(a_path);
+    const b_path = try std.fmt.allocPrint(allocator, "{s}/.zig-cache/tmp/{s}", .{ cwd, b_dir.sub_path });
+    defer allocator.free(b_path);
+
+    var result = try discoverModelsMany(io, allocator, &.{ a_path, b_path });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 3), result.models.len);
+    // FIRST root wins the shared id: roots are ordered by the caller and the
+    // first is the one downloads land in, so a stale copy elsewhere must not
+    // shadow the live one.
+    var shared_type: []const u8 = "";
+    var saw_a = false;
+    var saw_b = false;
+    for (result.models) |m| {
+        if (std.mem.eql(u8, m.id, "org/shared")) shared_type = m.model_type;
+        if (std.mem.eql(u8, m.id, "org/only-in-a")) saw_a = true;
+        if (std.mem.eql(u8, m.id, "org/only-in-b")) saw_b = true;
+        // Every path must be absolute and under the root it came from, or the
+        // registry stores a path nothing can open.
+        try std.testing.expect(m.path.len > 0 and m.path[0] == '/');
+    }
+    try std.testing.expectEqualStrings("qwen3", shared_type);
+    try std.testing.expect(saw_a and saw_b);
+
+    // One root behaves exactly like `discoverModels` — the multi path is the
+    // only path, so the single-root case cannot be left behind.
+    var one = try discoverModelsMany(io, allocator, &.{a_path});
+    defer one.deinit();
+    try std.testing.expectEqual(@as(usize, 2), one.models.len);
+
+    // A root that does not exist is SKIPPED, not fatal: a user can unplug the
+    // external drive their second folder lives on, and that must not stop the
+    // server from serving everything else.
+    var with_missing = try discoverModelsMany(io, allocator, &.{ a_path, "/nope/not/here", b_path });
+    defer with_missing.deinit();
+    try std.testing.expectEqual(@as(usize, 3), with_missing.models.len);
+
+    // No roots at all is an empty result, never an error.
+    var none = try discoverModelsMany(io, allocator, &.{});
+    defer none.deinit();
+    try std.testing.expectEqual(@as(usize, 0), none.models.len);
 }
 
 test "discoverModels finds GGUF dirs without config.json (issue #59)" {

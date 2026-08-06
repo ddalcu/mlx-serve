@@ -279,7 +279,7 @@ class TestServer {
         let contextLength: Int
         if appState.contextSize > 0 {
             contextLength = appState.contextSize
-        } else if let modelCtx = appState.server.modelInfo?.contextLength, modelCtx > 0 {
+        } else if let modelCtx = appState.server.chatModelInfo?.contextLength, modelCtx > 0 {
             contextLength = modelCtx
         } else {
             contextLength = 32768
@@ -395,7 +395,7 @@ class TestServer {
                     appState.updateLastMessage(in: sessionId, reasoning: text)
                 case .usage(let usage):
                     appState.updateLastMessage(in: sessionId, usage: usage)
-                case .toolCalls, .maxTokensReached, .done:
+                case .toolCalls, .truncated, .done:
                     break
                 }
             }
@@ -494,7 +494,7 @@ class TestServer {
             // Build history using shared engine
             let contextLength = AgentEngine.effectiveContextLength(
                 appContextSize: appState.contextSize,
-                modelContextLength: appState.server.modelInfo?.contextLength
+                modelContextLength: appState.server.chatModelInfo?.contextLength
             )
             let session = appState.chatSessions.first(where: { $0.id == sessionId })
             var history = AgentEngine.buildAgentHistory(
@@ -544,9 +544,9 @@ class TestServer {
                         appState.updateLastMessage(in: sessionId, usage: usage)
                     case .toolCalls(let calls):
                         receivedToolCalls = calls
-                    case .maxTokensReached:
+                    case .truncated(let cause):
                         maxTokensHit = true
-                        appState.updateLastMessage(in: sessionId, content: "\n\n⚠️ *Output truncated — max tokens reached.*")
+                        appState.updateLastMessage(in: sessionId, content: TruncationNotice.text(cause: cause, maxTokens: 0))
                     case .done:
                         break
                     }

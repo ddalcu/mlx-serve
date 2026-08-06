@@ -386,8 +386,7 @@ class AppState: ObservableObject {
         if !selectedModelPath.isEmpty {
             server.start(modelPath: selectedModelPath, options: serverOptions)
         } else {
-            let root = NSString(string: "~/.mlx-serve/models").expandingTildeInPath
-            server.startHeadless(modelsDir: root, options: serverOptions)
+            server.startHeadless(modelsDir: ServerManager.modelsRoot, options: serverOptions)
         }
     }
 

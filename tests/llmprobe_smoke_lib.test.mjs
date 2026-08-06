@@ -47,12 +47,21 @@ test("familyKey folds _text siblings onto the base arch and splits MoE out", () 
     familyKey(model("a", "gemma4", { meta: { architecture: "gemma4", is_moe: true } })),
     "gemma4-moe",
   );
+  // Ling is the same shape: `bailing_hybrid` carries no _moe suffix, so only
+  // is_moe puts it in the MoE bucket — and the MoE bucket is what defaults its
+  // MTP and drafter cells OFF.
+  assert.equal(
+    familyKey(model("a", "bailing_hybrid", { meta: { architecture: "bailing_hybrid", is_moe: true } })),
+    "bailing_hybrid-moe",
+  );
 });
 
 // ── what we probe ──────────────────────────────────────────────────────────
 
 test("isProbeable takes MLX chat models only — no gguf, ds4, encoders or media", () => {
   assert.ok(isProbeable(model("ok", "gemma4")));
+
+  assert.ok(isProbeable(model("ling", "bailing_hybrid")));
 
   // Engine-served GGUF (llama.cpp / ds4) — out of scope by request.
   assert.ok(!isProbeable(model("g", "gguf")));

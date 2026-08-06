@@ -12,7 +12,10 @@ enum SSEEvent {
     case reasoning(String)
     case usage(TokenUsage)
     case toolCalls([APIClient.ToolCall])
-    case maxTokensReached
+    /// The reply was CUT — `finish_reason: "length"`, whose cause comes from
+    /// the server's sibling `finish_details` (a max_tokens cap and a
+    /// degenerate-tail loop cut share the one OpenAI value).
+    case truncated(TruncationNotice.Cause)
     case done
 }
 
@@ -298,6 +301,23 @@ class APIClient {
         let rawArguments: String
     }
 
+    /// Read a cut's CAUSE out of one streamed choice. `finish_reason: "length"`
+    /// is the only OpenAI value for both a max_tokens cap and the server's
+    /// degenerate-tail loop cut, so the cause comes from the sibling
+    /// `finish_details` object the server emits beside it. An older server (or
+    /// any other OpenAI-compatible backend) sends no such field and reads as
+    /// `.maxTokens`, which is exactly the behaviour this replaced.
+    ///
+    /// Static and dictionary-shaped so it is testable without a live stream.
+    static func truncationCause(fromChoice choice: [String: Any]?) -> TruncationNotice.Cause? {
+        guard let choice, let fr = choice["finish_reason"] as? String, fr == "length" else { return nil }
+        if let details = choice["finish_details"] as? [String: Any],
+           let type = details["type"] as? String, type == "repetition_loop" {
+            return .repetitionLoop
+        }
+        return .maxTokens
+    }
+
     /// Per-request overrides that come from the user's saved ServerOptions.
     /// Each field is optional — `nil` = leave it out of the request body and
     /// let the server's default win. Pre-built once at the call site (usually
@@ -315,9 +335,19 @@ class APIClient {
 
         /// Build from the user's saved settings: per-request TriState overrides
         /// translate to optional booleans; numeric defaults are forwarded only
-        /// when they differ from the canonical "off" value (e.g. topK=0 stays
-        /// nil — the server already treats 0 as disabled and we want to avoid
-        /// gratuitously bloating every request body).
+        /// when they differ from the canonical "off" value.
+        ///
+        /// topK=0 stays nil, and OMITTING it is not the same as sending 0 —
+        /// the earlier comment here had that backwards. The server resolves an
+        /// absent field through body > launch flags > the model's own
+        /// `generation_config.json` (`resolveSamplingDefault`), so omitting
+        /// hands the checkpoint's recommended cut to the request, while
+        /// sending 0 DISABLES the cut. That matters more than it sounds:
+        /// measured 2026-08-05 on a collapse-prone 4-bit MoE, off-distribution
+        /// tokens spliced into generated code at 1.20 per 1000 tokens with
+        /// top_k 0 against 0.04 with the card's top_k 20 — same model, same
+        /// temperature. Omitting is the behaviour we want; the reason is the
+        /// opposite of what was written here.
         static func from(_ opts: ServerOptions) -> RequestDefaults {
             var r = RequestDefaults()
             r.topP = opts.defaultTopP
@@ -609,9 +639,10 @@ class APIClient {
                 }
             }
 
-            // Check finish_reason
-            if let fr = choices.first?["finish_reason"] as? String, fr == "length" {
-                continuation.yield(.maxTokensReached)
+            // Check finish_reason. "length" is both the max_tokens cap and the
+            // server's own loop cut; `finish_details` is what tells them apart.
+            if let cause = Self.truncationCause(fromChoice: choices.first) {
+                continuation.yield(.truncated(cause))
             }
             // "length" + accumulated calls = a TRUNCATED tool call (max_tokens or
             // server stall-timeout cut it mid-args). Deliver the salvaged calls so

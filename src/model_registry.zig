@@ -29,6 +29,7 @@ const model_discovery = @import("model_discovery.zig");
 const arch_ds4 = if (@import("build_options").ios) @import("arch/ds4_stub.zig") else @import("arch/ds4.zig");
 const arch_llama = if (@import("build_options").ios) @import("arch/llama_stub.zig") else @import("arch/llama.zig");
 const gen_mod = @import("gen.zig");
+const generate_mod = @import("generate.zig");
 const log = @import("log.zig");
 
 const Transformer = transformer_mod.Transformer;
@@ -123,9 +124,10 @@ pub const LoadedModel = struct {
     /// path; empty when no drafter is loaded. Allocator-owned dupe.
     drafter_path: []const u8,
     drafter_block_size: u32,
-    /// Qwen native MTP head, auto-loaded when the model dir ships an
-    /// `mtp/weights.safetensors` sidecar that binds to this trunk.
-    mtp: ?*MtpModel = null,
+    /// The model's MTP head, when it has one: a Qwen sidecar / in-checkpoint
+    /// head auto-loaded from the model dir, or an arch whose head is part of
+    /// its own trunk. Null when neither is present.
+    mtp: ?generate_mod.MtpHeadRef = null,
     /// Default draft depth for MTP rounds (CLI `--mtp-depth`).
     mtp_depth: u32 = mtp_mod.DEFAULT_DEPTH,
     /// Per-model hot prefix cache — plan 05 drops the module-global hot
@@ -270,8 +272,15 @@ pub const LoadedModel = struct {
         }
         self.gen_busy = false;
         if (self.mtp) |h| {
-            h.deinit();
-            self.allocator.destroy(h);
+            // Only the Qwen sidecar is a separately allocated object; an
+            // in-trunk head would be owned by the Transformer and freed with
+            // it — destroying it here would double-free the whole model.
+            switch (h) {
+                .qwen => |q| {
+                    q.deinit();
+                    self.allocator.destroy(q);
+                },
+            }
             self.mtp = null;
         }
         if (self.drafter) |d| {
@@ -362,8 +371,15 @@ pub const LoadedModel = struct {
         }
         self.gen_busy = false;
         if (self.mtp) |h| {
-            h.deinit();
-            self.allocator.destroy(h);
+            // Only the Qwen sidecar is a separately allocated object; an
+            // in-trunk head would be owned by the Transformer and freed with
+            // it — destroying it here would double-free the whole model.
+            switch (h) {
+                .qwen => |q| {
+                    q.deinit();
+                    self.allocator.destroy(q);
+                },
+            }
             self.mtp = null;
         }
         if (self.drafter) |d| {

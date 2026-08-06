@@ -1,5 +1,90 @@
 # Changelog
 
+## v26.8.3 — MiniMax-H3 makes videos from your pictures, clips and audio
+
+### MiniMax-H3 makes videos from your pictures, clips and audio
+
+- Attach pictures, short clips or audio files and the model builds the new video around them. A clip brings its own soundtrack; a standalone audio file can drive the scene.
+- Refer to attachments in the prompt by number: `<Picture 1>`, `<Video 1>`, `<Audio 1>`.
+- This needs the REF2VA build of the model. The app only shows the references section when the loaded build supports them, and the server refuses references on a build that would silently ignore them.
+- Prompting this model is its own skill. The video panel has worked examples one click away, and MiniMax's own prompt-writing guides are linked from the panel.
+
+### The app now says why a reply stopped
+
+- When the server cuts a reply because the model went in circles, the app said "reached the maximum output token limit" while the context bar showed most of the window free. Both readings were technically true and together they were useless. The cut now carries its cause: a repetition-loop cut is labeled as one, and only a real out-of-room cut suggests raising the limit.
+- On the API this is a `finish_details: {"type": "repetition_loop"}` object beside `finish_reason` on chat and completions, streaming and not. `finish_reason` itself stays `"length"`, because clients key on it.
+- Non-streaming replies also get the loop itself trimmed to a single occurrence, so an agent that re-sends the reply as history does not teach the model its own loop. Streaming replies keep what was already sent; a delta cannot be retracted.
+
+### Logprobs. Fixed.
+
+If you ask the server for token probabilities, you were getting three different kinds of wrong at once, on every model:
+
+- The numbers moved when you changed the temperature, because they were measured after your sampling settings were applied instead of being the model's own. At temperature 0 that made almost everything report 100% confident.
+- The alternative tokens were matched to their probabilities by comparing floating-point numbers, so any tie handed back an arbitrary token.
+- The whole list was **off by one**: each token came back with the *next* token's alternatives. A one-word "OK" reply reported an end-of-turn marker as its most likely token.
+
+None of this changed the text any model produced. It matters if you score outputs, route on confidence, or build evals. It also cost us a day of chasing a quantization ghost that this field invented.
+
+`/v1/completions` ignored its `logprobs` field entirely, returning an empty object rather than saying it never asked. That works now too, in the shape the OpenAI legacy API defines.
+
+### Tool calls no longer vanish when an argument mentions a think tag
+
+- Ask any thinking model to write a file whose contents mention `</think>` and the whole tool call disappeared, with fragments leaking into the reply as text. Coding agents write files about prompts, so this was reachable. Affects every thinking model we serve.
+
+### Reserved tokens can no longer be sampled
+
+- A model whose output distribution collapses at some position can put tokens like `<|fim_hole|>` at the top, and greedy decoding will print them. A fill-in-the-middle marker in a chat reply is always wrong, whatever produced it.
+- The server now builds a per-model suppression list at load: every token the tokenizer flags as special, minus the stop tokens and minus anything the model's own chat template can legitimately emit (thinking tags, tool markers). Derived per model, never a hardcoded list, so tool calling and thinking are untouched.
+- Logprobs still report the model's real distribution. The mask changes what gets picked, not what gets reported. Kill switch: `MLX_SERVE_SUPPRESS_RESERVED=0`.
+- This was part of trying to implement Ling-3.0-flash, ended up ripping out all of that code, more info here https://x.com/ddalcu/status/2085228036010496170
+
+### Multi-variant MLX repos: pick your quant
+
+- Some publishers ship every quantization of a model in one repo as subfolders (`4bit/`, `8bit/`, `mxfp4/`, ...). The app used to treat that as one model; now it is a picker, like GGUF repos already had: each variant shows its own size and downloads, loads and deletes independently.
+
+### Chat scrolling follows generation properly
+
+- The transcript follows a streaming reply, and stops following the moment you scroll up, on every input: wheel, trackpad, scroller-thumb drag, keyboard, window resize. The old detection was an app-global scroll-wheel monitor that saw scrolls in other windows and missed everything that was not a wheel.
+
+### Seed is a text field you can paste into
+
+- The seed control in the image and video panes was a stepper with no text entry at all — the only way to change it was clicking +1 or -1, so pasting a 7-digit seed meant several million clicks. Both are now normal text fields, matching the music pane.
+- Paste is forgiving: `Seed: 3,847,592` or a filename works, not just bare digits. In the image pane an empty box still means random.
+- A dice button beside the field rolls a new seed. It always gives you a concrete number you can read off and paste back — never the "random each time" setting, which would defeat the point.
+
+### Model folders: pick where downloads go, and every folder is actually served
+
+- **New: Settings ▸ Model Folders ▸ Default folder.** Choose where new downloads are saved. Everything already downloaded keeps working — the old folder stays in the scan list, so nothing disappears from the picker.
+- **Custom folder now does what it looks like it does.** It was scan-only in a narrower sense than that sounds: the server was only ever told about ONE folder, so a model in your custom folder showed up in the app's own list and was missing from `/v1/models`. Switching to one cost a full server restart instead of an instant swap. `--model-dir` is repeatable now and every folder you list is served.
+- If the same model exists in two folders, the download folder's copy wins. A folder that isn't reachable (an external drive that's unplugged) is skipped with a warning instead of stopping the server.
+
+### Video models would not load on a 48 GB Mac (#126)
+
+- MiniMax-H3 was refused with `503 out_of_memory` on an idle server with nothing loaded, so there was nothing to "retry after current requests complete" as the message suggested. Thanks to funk80rus for the report and the diagnosis, which was correct in every detail.
+- The cause: the registry's memory gate billed the model the sum of every file in its folder, 37.55 GB. The real peak is 22.83 GB, because the text encoder runs and is released before the picture model loads. The code that knows this ran too late to matter. Both now use the same number.
+- A video model also no longer sits in the memory budget at its full download size while holding almost nothing, which was pushing chat models out for no reason.
+- When a load genuinely does not fit, the error now names `--max-resident-mem` and the server log prints the estimate, the cap and what is currently resident.
+
+### MiniMax-H3 clips can now be 15 seconds
+
+- The length slider stopped at 209 frames. The model does 362 (15.1 seconds at 24 fps) and we had already run one; the limit was a note-to-self that went stale. Quality presets still default to the shorter length — the slider is how you go longer.
+- Under the Generate button there is now a live time estimate that updates as you change resolution, length and steps. It is worth watching: at the same length, the widescreen canvas costs about 2.9x what 960 x 544 does, and picking the longest clip at the largest size is a multi-hour job. Once you have run a generation the estimate switches to your own machine's measured speed.
+- During a generation the progress line says how much time is left, from that run's actual pace.
+- The memory warning is real now. It was using LTX-Video's formula, which on H3 either never fired or always fired depending on how much RAM you had; it now uses H3's own numbers and tells you what the run needs, what your Mac has, and what length would fit.
+- If you run out of memory, turning **Max quality** ON is the fix, which is backwards from how it sounds: it switches off the step cache that speeds generation up, and that cache is what most of the memory is. The warning now says so.
+- The Steps slider used to show LTX's advice and go down to 4. On H3 it starts at 16, which is the lowest setting we have actually judged.
+- Seven canvas sizes to pick from, with honest speed labels next to each. 1344x768 has the most detail, 960x544 is the fastest and the one to use for long clips.
+- Reference generations (REF2VA) now stop at 12 files total, which is MiniMax's own limit. Before, you could attach 15 and get a refusal only at generate time.
+
+### Fixes
+
+- The MiniMax-H3 fast recipe silently did nothing on short runs. A 4-step generation logged that it was on and then ran four full steps anyway. Anything under about 8 steps was paying full price.
+- Added a repetition guard for loops that reword themselves. The existing guards only caught exact repeats, so a model going in circles while varying its phrasing ran until it hit the token limit.
+- `/detokenize` returned bodies that no JSON parser would accept if any token contained a control byte.
+- Streaming a long thinking block cost CPU that grew with the length of the thought: the think-tag scanner re-read the whole accumulated text on every token. It now scans each byte once, so long thinking replies no longer slow the server down as they grow.
+
+---
+
 ## v26.8.2 — MiniMax-H3 video with its own soundtrack, LFM2.5
 
 ### MiniMax-H3 (Hailuo 3.0) generates video and audio together

@@ -2921,19 +2921,67 @@ fn freeDitBlock(b: *DitBlockW) void {
 // built in the SAME merge order so the merger's 4-token grouping aligns.
 // ══════════════════════════════════════════════════════════════════════════
 
-const VIT_HIDDEN: c_int = 1024;
-const VIT_HEADS: c_int = 16;
-const VIT_HEAD_DIM: c_int = 64; // hidden / heads
-const VIT_INTER: c_int = 4096;
-const VIT_DEPTH = 24;
+// These four are shared by every Qwen3-VL tower (`QWEN3VL_VISION_COMMON`), so
+// they stay file constants; everything that varies with the LM size lives in
+// VitConfig below.
 const VIT_MERGE: c_int = 2;
-const VIT_MERGE_HID: c_int = VIT_HIDDEN * VIT_MERGE * VIT_MERGE; // 4096
-const VIT_OUT: c_int = 2560;
 const VIT_GRID_SIDE: usize = 48; // sqrt(num_position_embeddings 2304)
 const VIT_PATCH_IN: c_int = 1536; // in_ch(3)*temporal(2)*patch(16)*patch(16)
-const VIT_ROT_HALF: usize = 16; // (head_dim//2)//2 — rotary inv_freq length
 const VIT_THETA: f64 = 10000.0;
-const VIT_DEEPSTACK = [3]usize{ 5, 11, 17 };
+
+/// Per-checkpoint tower geometry. Qwen3-VL ships ONE vision design across LM
+/// sizes and changes only these numbers, so a second consumer (MiniMax H3's
+/// 32B conditioner) is a config, not a second implementation. Getting `depth`
+/// or `deepstack` wrong is silent — the tower loads and conditions on features
+/// tapped at the wrong layers.
+pub const VitConfig = struct {
+    hidden: c_int,
+    heads: c_int,
+    inter: c_int,
+    depth: usize,
+    /// Merged-token width, i.e. the LM's hidden size.
+    out: c_int,
+    /// Layers whose output feeds the LM's first three blocks (DeepStack).
+    deepstack: [3]usize,
+    /// Weight-name prefix, INCLUDING the trailing dot's parent
+    /// ("model.visual" for MageFlow's repack, "visual" for H3's).
+    prefix: []const u8,
+
+    pub fn headDim(self: VitConfig) c_int {
+        return @divExact(self.hidden, self.heads);
+    }
+    /// Rotary inv_freq length: (head_dim/2)/2, because the 2-D rotary lays out
+    /// [h, w, h, w] over the head.
+    pub fn rotHalf(self: VitConfig) usize {
+        return @intCast(@divExact(self.headDim(), 4));
+    }
+    pub fn mergeHid(self: VitConfig) c_int {
+        return self.hidden * VIT_MERGE * VIT_MERGE;
+    }
+};
+
+/// Mage-Flow's Qwen3-VL-4B-shaped tower.
+pub const MAGEFLOW_VIT = VitConfig{
+    .hidden = 1024,
+    .heads = 16,
+    .inter = 4096,
+    .depth = 24,
+    .out = 2560,
+    .deepstack = .{ 5, 11, 17 },
+    .prefix = "model.visual",
+};
+
+/// MiniMax H3's conditioner is Qwen3-VL-32B, whose tower is the 8B/32B shape
+/// (hidden 1152, depth 27, DeepStack at 8/16/24) merging to the LM's 5120.
+pub const H3_VIT = VitConfig{
+    .hidden = 1152,
+    .heads = 16,
+    .inter = 4304,
+    .depth = 27,
+    .out = 5120,
+    .deepstack = .{ 8, 16, 24 },
+    .prefix = "visual",
+};
 
 const VitBlockW = struct {
     n1w: mlx.mlx_array,
@@ -2969,36 +3017,36 @@ const VitMergerW = struct {
     }
 };
 
-fn loadVitBlock(w: *const Weights, a: std.mem.Allocator, i: usize, dtype: mlx.mlx_dtype, s: S) !VitBlockW {
-    const n1 = try std.fmt.allocPrint(a, "model.visual.blocks.{d}.norm1", .{i});
+fn loadVitBlock(w: *const Weights, a: std.mem.Allocator, cfg: VitConfig, i: usize, dtype: mlx.mlx_dtype, s: S) !VitBlockW {
+    const n1 = try std.fmt.allocPrint(a, "{s}.blocks.{d}.norm1", .{ cfg.prefix, i });
     defer a.free(n1);
-    const n2 = try std.fmt.allocPrint(a, "model.visual.blocks.{d}.norm2", .{i});
+    const n2 = try std.fmt.allocPrint(a, "{s}.blocks.{d}.norm2", .{ cfg.prefix, i });
     defer a.free(n2);
-    const qkv = try std.fmt.allocPrint(a, "model.visual.blocks.{d}.attn.qkv", .{i});
+    const qkv = try std.fmt.allocPrint(a, "{s}.blocks.{d}.attn.qkv", .{ cfg.prefix, i });
     defer a.free(qkv);
-    const proj = try std.fmt.allocPrint(a, "model.visual.blocks.{d}.attn.proj", .{i});
+    const proj = try std.fmt.allocPrint(a, "{s}.blocks.{d}.attn.proj", .{ cfg.prefix, i });
     defer a.free(proj);
-    const fc1 = try std.fmt.allocPrint(a, "model.visual.blocks.{d}.mlp.linear_fc1", .{i});
+    const fc1 = try std.fmt.allocPrint(a, "{s}.blocks.{d}.mlp.linear_fc1", .{ cfg.prefix, i });
     defer a.free(fc1);
-    const fc2 = try std.fmt.allocPrint(a, "model.visual.blocks.{d}.mlp.linear_fc2", .{i});
+    const fc2 = try std.fmt.allocPrint(a, "{s}.blocks.{d}.mlp.linear_fc2", .{ cfg.prefix, i });
     defer a.free(fc2);
     return .{
         .n1w = try loadVec(w, a, n1, "weight", s),
         .n1b = try loadVec(w, a, n1, "bias", s),
         .n2w = try loadVec(w, a, n2, "weight", s),
         .n2b = try loadVec(w, a, n2, "bias", s),
-        .qkv_w = try MfLinear.load(w, a, qkv, VIT_HIDDEN, dtype, s),
+        .qkv_w = try MfLinear.load(w, a, qkv, @intCast(cfg.hidden), dtype, s),
         .qkv_b = try loadVecDt(w, a, qkv, "bias", dtype, s),
-        .proj_w = try MfLinear.load(w, a, proj, VIT_HIDDEN, dtype, s),
+        .proj_w = try MfLinear.load(w, a, proj, @intCast(cfg.hidden), dtype, s),
         .proj_b = try loadVecDt(w, a, proj, "bias", dtype, s),
-        .fc1_w = try MfLinear.load(w, a, fc1, VIT_HIDDEN, dtype, s),
+        .fc1_w = try MfLinear.load(w, a, fc1, @intCast(cfg.hidden), dtype, s),
         .fc1_b = try loadVecDt(w, a, fc1, "bias", dtype, s),
-        .fc2_w = try MfLinear.load(w, a, fc2, VIT_INTER, dtype, s),
+        .fc2_w = try MfLinear.load(w, a, fc2, @intCast(cfg.inter), dtype, s),
         .fc2_b = try loadVecDt(w, a, fc2, "bias", dtype, s),
     };
 }
 
-fn loadVitMerger(w: *const Weights, a: std.mem.Allocator, prefix: []const u8, dtype: mlx.mlx_dtype, s: S) !VitMergerW {
+fn loadVitMerger(w: *const Weights, a: std.mem.Allocator, cfg: VitConfig, prefix: []const u8, dtype: mlx.mlx_dtype, s: S) !VitMergerW {
     const nm = try std.fmt.allocPrint(a, "{s}.norm", .{prefix});
     defer a.free(nm);
     const fc1 = try std.fmt.allocPrint(a, "{s}.linear_fc1", .{prefix});
@@ -3008,10 +3056,10 @@ fn loadVitMerger(w: *const Weights, a: std.mem.Allocator, prefix: []const u8, dt
     return .{
         .norm_w = try loadVec(w, a, nm, "weight", s),
         .norm_b = try loadVec(w, a, nm, "bias", s),
-        // Both merger linears consume the 2×2-shuffled patch block: 1024×4.
-        .fc1_w = try MfLinear.load(w, a, fc1, VIT_MERGE_HID, dtype, s),
+        // Both merger linears consume the 2×2-shuffled patch block: hidden×4.
+        .fc1_w = try MfLinear.load(w, a, fc1, @intCast(cfg.mergeHid()), dtype, s),
         .fc1_b = try loadVecDt(w, a, fc1, "bias", dtype, s),
-        .fc2_w = try MfLinear.load(w, a, fc2, VIT_MERGE_HID, dtype, s),
+        .fc2_w = try MfLinear.load(w, a, fc2, @intCast(cfg.mergeHid()), dtype, s),
         .fc2_b = try loadVecDt(w, a, fc2, "bias", dtype, s),
     };
 }
@@ -3020,13 +3068,14 @@ fn loadVitMerger(w: *const Weights, a: std.mem.Allocator, prefix: []const u8, dt
 /// `visual.patch_embed.proj.weight` is OITHW [hidden,3,2,16,16]; transpose to
 /// OHWI-3d [hidden,2,16,16,3] (T,H,W,I order — matches the reference reshape of
 /// the pixel patch), flatten kernel dims, then transpose to [1536, hidden].
-fn loadVitPatchEmbed(w: *const Weights, a: std.mem.Allocator, dtype: mlx.mlx_dtype, s: S) !mlx.mlx_array {
-    _ = a;
-    const raw = try ownWeight(w, "model.visual.patch_embed.proj.weight");
+fn loadVitPatchEmbed(w: *const Weights, a: std.mem.Allocator, cfg: VitConfig, dtype: mlx.mlx_dtype, s: S) !mlx.mlx_array {
+    const key = try std.fmt.allocPrint(a, "{s}.patch_embed.proj.weight", .{cfg.prefix});
+    defer a.free(key);
+    const raw = try ownWeight(w, key);
     defer _ = mlx.mlx_array_free(raw);
     const t = try transpose(raw, &[_]c_int{ 0, 2, 3, 4, 1 }, s); // [H,2,16,16,3]
     defer _ = mlx.mlx_array_free(t);
-    const flat = try reshape(t, &[_]c_int{ VIT_HIDDEN, VIT_PATCH_IN }, s);
+    const flat = try reshape(t, &[_]c_int{ cfg.hidden, VIT_PATCH_IN }, s);
     defer _ = mlx.mlx_array_free(flat);
     const tt = try transpose(flat, &[_]c_int{ 1, 0 }, s); // [1536, hidden]
     defer _ = mlx.mlx_array_free(tt);
@@ -3039,35 +3088,53 @@ pub const VisionTower = struct {
     allocator: std.mem.Allocator,
     s: S,
     dtype: mlx.mlx_dtype,
+    cfg: VitConfig,
     patch_w: mlx.mlx_array, // [1536, hidden]
     patch_b: mlx.mlx_array, // [hidden]
     pos_embed: mlx.mlx_array, // [2304, hidden] embedding table
-    blocks: [VIT_DEPTH]VitBlockW,
+    blocks: []VitBlockW,
     merger: VitMergerW, // use_postshuffle_norm=false
-    deepstack: [3]VitMergerW, // use_postshuffle_norm=true, blocks [5,11,17]
+    deepstack: [3]VitMergerW, // use_postshuffle_norm=true, at cfg.deepstack
 
+    /// Mage-Flow's layout: the tower lives in the `text_encoder/` component dir.
     pub fn load(io: std.Io, allocator: std.mem.Allocator, s: S, model_dir: []const u8, dtype: mlx.mlx_dtype) !VisionTower {
         const dir = try std.fmt.allocPrint(allocator, "{s}/text_encoder", .{model_dir});
         defer allocator.free(dir);
         var w = try model_mod.loadWeights(io, allocator, dir);
         defer w.deinit();
+        return loadFrom(allocator, s, &w, MAGEFLOW_VIT, dtype);
+    }
+
+    /// Load from an ALREADY-OPEN weight map. H3 keeps its tower in the same
+    /// single `text_encoder.safetensors` as the LM, and re-opening a 28 GB file
+    /// to read 529 tensors out of it would double the staged-residency peak the
+    /// whole backend is built around.
+    pub fn loadFrom(allocator: std.mem.Allocator, s: S, w: *const Weights, cfg: VitConfig, dtype: mlx.mlx_dtype) !VisionTower {
         const a = allocator;
         var self: VisionTower = undefined;
         self.allocator = allocator;
         self.s = s;
         self.dtype = dtype;
+        self.cfg = cfg;
 
-        self.patch_w = try loadVitPatchEmbed(&w, a, dtype, s);
-        self.patch_b = try loadVecDt(&w, a, "model.visual.patch_embed.proj", "bias", dtype, s);
-        const pe = try ownWeight(&w, "model.visual.pos_embed.weight");
+        self.patch_w = try loadVitPatchEmbed(w, a, cfg, dtype, s);
+        const pe_pfx = try std.fmt.allocPrint(a, "{s}.patch_embed.proj", .{cfg.prefix});
+        defer a.free(pe_pfx);
+        self.patch_b = try loadVecDt(w, a, pe_pfx, "bias", dtype, s);
+        const pos_key = try std.fmt.allocPrint(a, "{s}.pos_embed.weight", .{cfg.prefix});
+        defer a.free(pos_key);
+        const pe = try ownWeight(w, pos_key);
         defer _ = mlx.mlx_array_free(pe);
         self.pos_embed = try astype(pe, dtype, s);
-        for (0..VIT_DEPTH) |i| self.blocks[i] = try loadVitBlock(&w, a, i, dtype, s);
-        self.merger = try loadVitMerger(&w, a, "model.visual.merger", dtype, s);
+        self.blocks = try a.alloc(VitBlockW, cfg.depth);
+        for (0..cfg.depth) |i| self.blocks[i] = try loadVitBlock(w, a, cfg, i, dtype, s);
+        const mg = try std.fmt.allocPrint(a, "{s}.merger", .{cfg.prefix});
+        defer a.free(mg);
+        self.merger = try loadVitMerger(w, a, cfg, mg, dtype, s);
         for (0..3) |i| {
-            const pfx = try std.fmt.allocPrint(a, "model.visual.deepstack_merger_list.{d}", .{i});
+            const pfx = try std.fmt.allocPrint(a, "{s}.deepstack_merger_list.{d}", .{ cfg.prefix, i });
             defer a.free(pfx);
-            self.deepstack[i] = try loadVitMerger(&w, a, pfx, dtype, s);
+            self.deepstack[i] = try loadVitMerger(w, a, cfg, pfx, dtype, s);
         }
         return self;
     }
@@ -3076,7 +3143,8 @@ pub const VisionTower = struct {
         _ = mlx.mlx_array_free(self.patch_w);
         _ = mlx.mlx_array_free(self.patch_b);
         _ = mlx.mlx_array_free(self.pos_embed);
-        for (&self.blocks) |*b| b.deinit();
+        for (self.blocks) |*b| b.deinit();
+        self.allocator.free(self.blocks);
         self.merger.deinit();
         for (&self.deepstack) |*m| m.deinit();
     }
@@ -3098,6 +3166,7 @@ pub const VisionTower = struct {
         defer _ = mlx.mlx_array_free(pvt);
         const pvf = try reshape(pvt, &[_]c_int{ np, VIT_PATCH_IN }, s);
         defer _ = mlx.mlx_array_free(pvf);
+        const cfg = self.cfg;
         var hidden = try linearT(pvf, self.patch_w, self.patch_b, s); // [Np, hidden]
 
         // 2. Interpolated pos-embed (merge order) + add.
@@ -3110,7 +3179,7 @@ pub const VisionTower = struct {
         }
 
         // 3. 2D rotary cos/sin [Np, head_dim] (f32).
-        const rope = try buildVisionRope(a, grids, s);
+        const rope = try buildVisionRope(a, cfg, grids, s);
         defer _ = mlx.mlx_array_free(rope.cos);
         defer _ = mlx.mlx_array_free(rope.sin);
 
@@ -3127,18 +3196,18 @@ pub const VisionTower = struct {
 
         // 5. Blocks (+ DeepStack taps).
         var deepstack_out: [3]mlx.mlx_array = undefined;
-        for (&self.blocks, 0..) |*blk, i| {
-            const nxt = try vitBlockForward(blk, hidden, rope.cos, rope.sin, segs.items, s);
+        for (self.blocks, 0..) |*blk, i| {
+            const nxt = try vitBlockForward(blk, cfg, hidden, rope.cos, rope.sin, segs.items, s);
             _ = mlx.mlx_array_free(hidden);
             hidden = nxt;
-            inline for (VIT_DEEPSTACK, 0..) |di, k| {
-                if (i == di) deepstack_out[k] = try mergerForward(&self.deepstack[k], hidden, true, s);
+            for (cfg.deepstack, 0..) |di, k| {
+                if (i == di) deepstack_out[k] = try mergerForward(&self.deepstack[k], cfg, hidden, true, s);
             }
         }
         defer _ = mlx.mlx_array_free(hidden);
 
         // 6. Merger.
-        const merged = try mergerForward(&self.merger, hidden, false, s);
+        const merged = try mergerForward(&self.merger, cfg, hidden, false, s);
         return .{ .merged = merged, .deepstack = deepstack_out };
     }
 
@@ -3146,6 +3215,7 @@ pub const VisionTower = struct {
     fn buildPosEmbeds(self: *const VisionTower, grids: []const [3]i64) !mlx.mlx_array {
         const s = self.s;
         const a = self.allocator;
+        const cfg = self.cfg;
         var outputs: std.ArrayList(mlx.mlx_array) = .empty;
         defer {
             for (outputs.items) |o| _ = mlx.mlx_array_free(o);
@@ -3191,7 +3261,7 @@ pub const VisionTower = struct {
             var gathered = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(gathered);
             try mlx.check(mlx.mlx_take_axis(&gathered, self.pos_embed, idx_arr, 0, s)); // [4n, hidden]
-            const g3 = try reshape(gathered, &[_]c_int{ 4, @intCast(n), VIT_HIDDEN }, s);
+            const g3 = try reshape(gathered, &[_]c_int{ 4, @intCast(n), cfg.hidden }, s);
             defer _ = mlx.mlx_array_free(g3);
             const wt_shape = [_]c_int{ 4, @intCast(n), 1 };
             const wt_raw = mlx.mlx_array_new_data(wt.ptr, &wt_shape, 3, .float32);
@@ -3213,11 +3283,11 @@ pub const VisionTower = struct {
             defer if (free_tiled) {
                 _ = mlx.mlx_array_free(tiled);
             };
-            const r = try reshape(tiled, &[_]c_int{ @intCast(t), @intCast(gh / 2), VIT_MERGE, @intCast(gw / 2), VIT_MERGE, VIT_HIDDEN }, s);
+            const r = try reshape(tiled, &[_]c_int{ @intCast(t), @intCast(gh / 2), VIT_MERGE, @intCast(gw / 2), VIT_MERGE, cfg.hidden }, s);
             defer _ = mlx.mlx_array_free(r);
             const rt = try transpose(r, &[_]c_int{ 0, 1, 3, 2, 4, 5 }, s);
             defer _ = mlx.mlx_array_free(rt);
-            const merged_order = try reshape(rt, &[_]c_int{ @intCast(t * n), VIT_HIDDEN }, s);
+            const merged_order = try reshape(rt, &[_]c_int{ @intCast(t * n), cfg.hidden }, s);
             try outputs.append(a, merged_order);
         }
         if (outputs.items.len == 1) {
@@ -3239,17 +3309,20 @@ fn tileFrames(x: mlx.mlx_array, t: usize, s: S) !mlx.mlx_array {
 
 /// Vision 2D rotary cos/sin [Ntok, head_dim] (f32), built in spatial-merge order.
 /// Per token (h,w): angles interleave [h·f, w·f, h·f, w·f] over the 16-freq table.
-fn buildVisionRope(a: std.mem.Allocator, grids: []const [3]i64, s: S) !struct { cos: mlx.mlx_array, sin: mlx.mlx_array } {
+fn buildVisionRope(a: std.mem.Allocator, cfg: VitConfig, grids: []const [3]i64, s: S) !struct { cos: mlx.mlx_array, sin: mlx.mlx_array } {
     var ntok: usize = 0;
     for (grids) |g| ntok += @as(usize, @intCast(g[0])) * @as(usize, @intCast(g[1])) * @as(usize, @intCast(g[2]));
-    const hd: usize = @intCast(VIT_HEAD_DIM);
+    const hd: usize = @intCast(cfg.headDim());
+    const rot_half = cfg.rotHalf();
     const cosb = try a.alloc(f32, ntok * hd);
     defer a.free(cosb);
     const sinb = try a.alloc(f32, ntok * hd);
     defer a.free(sinb);
-    var inv_freq: [VIT_ROT_HALF]f64 = undefined;
-    const rot_dim: f64 = @floatFromInt(VIT_ROT_HALF * 2); // 32
-    for (0..VIT_ROT_HALF) |j| inv_freq[j] = 1.0 / std.math.pow(f64, VIT_THETA, @as(f64, @floatFromInt(2 * j)) / rot_dim);
+    // head_dim/4 frequencies; the 2-D rotary lays them out [h, w, h, w].
+    var inv_freq_buf: [64]f64 = undefined;
+    const inv_freq = inv_freq_buf[0..rot_half];
+    const rot_dim: f64 = @floatFromInt(rot_half * 2);
+    for (0..rot_half) |j| inv_freq[j] = 1.0 / std.math.pow(f64, VIT_THETA, @as(f64, @floatFromInt(2 * j)) / rot_dim);
     var tok: usize = 0;
     for (grids) |g| {
         const t: usize = @intCast(g[0]);
@@ -3269,17 +3342,17 @@ fn buildVisionRope(a: std.mem.Allocator, grids: []const [3]i64, s: S) !struct { 
                             const hpos: f64 = @floatFromInt(ai * m + ci);
                             const wpos: f64 = @floatFromInt(bi * m + d);
                             const base = tok * hd;
-                            for (0..VIT_ROT_HALF) |j| {
+                            for (0..rot_half) |j| {
                                 const ah = hpos * inv_freq[j];
                                 const aw = wpos * inv_freq[j];
                                 cosb[base + j] = @floatCast(@cos(ah));
-                                cosb[base + VIT_ROT_HALF + j] = @floatCast(@cos(aw));
-                                cosb[base + 2 * VIT_ROT_HALF + j] = @floatCast(@cos(ah));
-                                cosb[base + 3 * VIT_ROT_HALF + j] = @floatCast(@cos(aw));
+                                cosb[base + rot_half + j] = @floatCast(@cos(aw));
+                                cosb[base + 2 * rot_half + j] = @floatCast(@cos(ah));
+                                cosb[base + 3 * rot_half + j] = @floatCast(@cos(aw));
                                 sinb[base + j] = @floatCast(@sin(ah));
-                                sinb[base + VIT_ROT_HALF + j] = @floatCast(@sin(aw));
-                                sinb[base + 2 * VIT_ROT_HALF + j] = @floatCast(@sin(ah));
-                                sinb[base + 3 * VIT_ROT_HALF + j] = @floatCast(@sin(aw));
+                                sinb[base + rot_half + j] = @floatCast(@sin(aw));
+                                sinb[base + 2 * rot_half + j] = @floatCast(@sin(ah));
+                                sinb[base + 3 * rot_half + j] = @floatCast(@sin(aw));
                             }
                             tok += 1;
                         }
@@ -3340,10 +3413,10 @@ fn sliceLast3(x: mlx.mlx_array, start: c_int, end: c_int, s: S) !mlx.mlx_array {
 }
 
 /// One ViT block: h += attn(norm1(h)); h += mlp(norm2(h)) (gelu-tanh MLP).
-fn vitBlockForward(bw: *const VitBlockW, hidden: mlx.mlx_array, cos: mlx.mlx_array, sin: mlx.mlx_array, segs: []const c_int, s: S) !mlx.mlx_array {
+fn vitBlockForward(bw: *const VitBlockW, cfg: VitConfig, hidden: mlx.mlx_array, cos: mlx.mlx_array, sin: mlx.mlx_array, segs: []const c_int, s: S) !mlx.mlx_array {
     const n1 = try layerNormLast(hidden, bw.n1w, bw.n1b, 1e-6, s);
     defer _ = mlx.mlx_array_free(n1);
-    const attn = try visionAttn(bw, n1, cos, sin, segs, s);
+    const attn = try visionAttn(bw, cfg, n1, cos, sin, segs, s);
     defer _ = mlx.mlx_array_free(attn);
     const h1 = try addA(hidden, attn, s);
     defer _ = mlx.mlx_array_free(h1);
@@ -3359,11 +3432,11 @@ fn vitBlockForward(bw: *const VitBlockW, hidden: mlx.mlx_array, cos: mlx.mlx_arr
 }
 
 /// Full self-attention per cu_seqlens segment, 2D rotary on q/k.
-fn visionAttn(bw: *const VitBlockW, x: mlx.mlx_array, cos: mlx.mlx_array, sin: mlx.mlx_array, segs: []const c_int, s: S) !mlx.mlx_array {
+fn visionAttn(bw: *const VitBlockW, cfg: VitConfig, x: mlx.mlx_array, cos: mlx.mlx_array, sin: mlx.mlx_array, segs: []const c_int, s: S) !mlx.mlx_array {
     const np = mlx.getShape(x)[0];
     const qkv = try bw.qkv_w.forward(x, bw.qkv_b, s); // [Np, 3*hidden]
     defer _ = mlx.mlx_array_free(qkv);
-    const qkv5 = try reshape(qkv, &[_]c_int{ np, 3, VIT_HEADS, VIT_HEAD_DIM }, s);
+    const qkv5 = try reshape(qkv, &[_]c_int{ np, 3, cfg.heads, cfg.headDim() }, s);
     defer _ = mlx.mlx_array_free(qkv5);
     var parts: [3]mlx.mlx_array = undefined;
     try splitEqual(qkv5, 3, 1, &parts, s); // each [Np,1,heads,hd]
@@ -3383,7 +3456,7 @@ fn visionAttn(bw: *const VitBlockW, x: mlx.mlx_array, cos: mlx.mlx_array, sin: m
     defer _ = mlx.mlx_array_free(q);
     defer _ = mlx.mlx_array_free(k);
 
-    const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(VIT_HEAD_DIM)));
+    const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(cfg.headDim())));
     const a = std.heap.page_allocator;
     var outs: std.ArrayList(mlx.mlx_array) = .empty;
     defer {
@@ -3393,18 +3466,18 @@ fn visionAttn(bw: *const VitBlockW, x: mlx.mlx_array, cos: mlx.mlx_array, sin: m
     for (0..segs.len - 1) |i| {
         const start = segs[i];
         const end = segs[i + 1];
-        const o = try visionSegAttn(q, k, v, start, end, scale, s);
+        const o = try visionSegAttn(q, k, v, cfg, start, end, scale, s);
         try outs.append(a, o);
     }
     const cat = if (outs.items.len == 1) try contig(outs.items[0], s) else try concat(outs.items, 0, s);
     defer _ = mlx.mlx_array_free(cat);
-    const flat = try reshape(cat, &[_]c_int{ np, VIT_HIDDEN }, s);
+    const flat = try reshape(cat, &[_]c_int{ np, cfg.hidden }, s);
     defer _ = mlx.mlx_array_free(flat);
     return bw.proj_w.forward(flat, bw.proj_b, s);
 }
 
 /// SDPA over one segment q/k/v [Np,heads,hd] sliced to [start,end) → [seg,heads,hd].
-fn visionSegAttn(q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, start: c_int, end: c_int, scale: f32, s: S) !mlx.mlx_array {
+fn visionSegAttn(q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, cfg: VitConfig, start: c_int, end: c_int, scale: f32, s: S) !mlx.mlx_array {
     const qs = try sliceSeq3(q, start, end, s);
     defer _ = mlx.mlx_array_free(qs);
     const ks = try sliceSeq3(k, start, end, s);
@@ -3419,18 +3492,18 @@ fn visionSegAttn(q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, start: c_
     defer _ = mlx.mlx_array_free(kt);
     const vt = try transpose(vs, &[_]c_int{ 1, 0, 2 }, s);
     defer _ = mlx.mlx_array_free(vt);
-    const q4 = try reshape(qt, &[_]c_int{ 1, VIT_HEADS, seg, VIT_HEAD_DIM }, s);
+    const q4 = try reshape(qt, &[_]c_int{ 1, cfg.heads, seg, cfg.headDim() }, s);
     defer _ = mlx.mlx_array_free(q4);
-    const k4 = try reshape(kt, &[_]c_int{ 1, VIT_HEADS, seg, VIT_HEAD_DIM }, s);
+    const k4 = try reshape(kt, &[_]c_int{ 1, cfg.heads, seg, cfg.headDim() }, s);
     defer _ = mlx.mlx_array_free(k4);
-    const v4 = try reshape(vt, &[_]c_int{ 1, VIT_HEADS, seg, VIT_HEAD_DIM }, s);
+    const v4 = try reshape(vt, &[_]c_int{ 1, cfg.heads, seg, cfg.headDim() }, s);
     defer _ = mlx.mlx_array_free(v4);
     var attn = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(attn);
     const null_a = mlx.mlx_array{ .ctx = null };
     try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn, q4, k4, v4, scale, "", null_a, null_a, s));
     // [1,heads,seg,hd] → [seg,heads,hd]
-    const a3 = try reshape(attn, &[_]c_int{ VIT_HEADS, seg, VIT_HEAD_DIM }, s);
+    const a3 = try reshape(attn, &[_]c_int{ cfg.heads, seg, cfg.headDim() }, s);
     defer _ = mlx.mlx_array_free(a3);
     return transpose(a3, &[_]c_int{ 1, 0, 2 }, s);
 }
@@ -3446,18 +3519,18 @@ fn sliceSeq3(x: mlx.mlx_array, start: c_int, end: c_int, s: S) !mlx.mlx_array {
 
 /// Patch merger: (optional post-shuffle) LayerNorm → reshape 4-token group →
 /// linear_fc1 → gelu-tanh → linear_fc2. Input [N, hidden] → [N/4, 2560].
-fn mergerForward(mw: *const VitMergerW, hidden: mlx.mlx_array, postshuffle: bool, s: S) !mlx.mlx_array {
+fn mergerForward(mw: *const VitMergerW, cfg: VitConfig, hidden: mlx.mlx_array, postshuffle: bool, s: S) !mlx.mlx_array {
     const n = mlx.getShape(hidden)[0];
     const grouped = @divExact(n, VIT_MERGE * VIT_MERGE);
     var x: mlx.mlx_array = undefined;
     if (postshuffle) {
-        const r = try reshape(hidden, &[_]c_int{ grouped, VIT_MERGE_HID }, s);
+        const r = try reshape(hidden, &[_]c_int{ grouped, cfg.mergeHid() }, s);
         defer _ = mlx.mlx_array_free(r);
         x = try layerNormLast(r, mw.norm_w, mw.norm_b, 1e-6, s);
     } else {
         const nrm = try layerNormLast(hidden, mw.norm_w, mw.norm_b, 1e-6, s);
         defer _ = mlx.mlx_array_free(nrm);
-        x = try reshape(nrm, &[_]c_int{ grouped, VIT_MERGE_HID }, s);
+        x = try reshape(nrm, &[_]c_int{ grouped, cfg.mergeHid() }, s);
     }
     defer _ = mlx.mlx_array_free(x);
     const fc1 = try mw.fc1_w.forward(x, mw.fc1_b, s);

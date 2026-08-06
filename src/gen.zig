@@ -920,7 +920,7 @@ pub const VideoEngine = struct {
         if (peekModelType(io, allocator, model_dir)) |mt| {
             defer allocator.free(mt);
             if (std.mem.eql(u8, mt, "minimax_h3")) {
-                self.backend = .{ .h3 = try H3VideoEngine.load(allocator, model_dir) };
+                self.backend = .{ .h3 = try H3VideoEngine.load(io, allocator, model_dir) };
                 return self;
             }
         }
@@ -946,17 +946,55 @@ pub const VideoEngine = struct {
     }
 };
 
+/// `h3ConfigDeclaresRef2va` over a model dir's own `config.json`.
+fn h3DirDeclaresRef2va(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) bool {
+    if (model_dir.len == 0 or !std.fs.path.isAbsolute(model_dir)) return false;
+    const path = std.fmt.allocPrint(allocator, "{s}/config.json", .{model_dir}) catch return false;
+    defer allocator.free(path);
+    const file = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return false;
+    defer file.close(io);
+    var rb: [4096]u8 = undefined;
+    var rs = file.reader(io, &rb);
+    const content = rs.interface.allocRemaining(allocator, .limited(1024 * 1024)) catch return false;
+    defer allocator.free(content);
+    return h3ConfigDeclaresRef2va(allocator, content);
+}
+
+/// True when a MiniMax-H3 `config.json` declares the `ref2va` task. The two
+/// partitions share the text encoder, both VAEs and every geometry number, so
+/// nothing about the files themselves tells them apart — only the converter's
+/// declared task list does, and an FL2VA pack handed references would generate
+/// while silently ignoring them.
+fn h3ConfigDeclaresRef2va(allocator: std.mem.Allocator, config_json: []const u8) bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, config_json, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+    const tasks = parsed.value.object.get("tasks") orelse return false;
+    if (tasks != .array) return false;
+    for (tasks.array.items) |t| {
+        if (t == .string and std.mem.eql(u8, t.string, "ref2va")) return true;
+    }
+    return false;
+}
+
 /// MiniMax-H3 video+audio. Holds only paths: `minimax_h3.generate` stages the
 /// text encoder and the DiT sequentially because they cannot both be resident,
 /// so there is nothing useful to keep loaded between requests.
 pub const H3VideoEngine = struct {
     allocator: std.mem.Allocator,
     model_dir: []u8,
+    /// Whether this pack is the REF2VA partition (read from its config's task
+    /// list at load — the file layout is identical either way).
+    supports_refs: bool = false,
 
-    pub fn load(allocator: std.mem.Allocator, model_dir: []const u8) !*H3VideoEngine {
+    pub fn load(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !*H3VideoEngine {
         const self = try allocator.create(H3VideoEngine);
         errdefer allocator.destroy(self);
-        self.* = .{ .allocator = allocator, .model_dir = try allocator.dupe(u8, model_dir) };
+        self.* = .{
+            .allocator = allocator,
+            .model_dir = try allocator.dupe(u8, model_dir),
+            .supports_refs = h3DirDeclaresRef2va(io, allocator, model_dir),
+        };
         return self;
     }
 
@@ -2303,6 +2341,275 @@ pub fn handleVideo(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: 
     };
 }
 
+/// Base64-decode a JSON string value (unescaping `\/` first — Swift clients
+/// escape every slash) into an owned buffer.
+fn jsonB64Alloc(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
+    const unescaped = try jsonUnescape(allocator, raw);
+    defer allocator.free(unescaped);
+    return base64DecodeAlloc(allocator, unescaped);
+}
+
+/// One reference's bytes, before `resolveRefs` has decided its canvas. Images
+/// and video frames stay ENCODED — the canvas is not known yet and the server
+/// resizes by decoding AT a size, so there is nothing useful to decode into.
+const PendingRefs = struct {
+    allocator: std.mem.Allocator,
+    images: std.ArrayList([]u8) = .empty,
+    /// Per reference video: its encoded frames, then its 32 kHz stereo
+    /// soundtrack (interleaved) if it carries one.
+    video_frames: std.ArrayList(std.ArrayList([]u8)) = .empty,
+    video_audio: std.ArrayList(?[]f32) = .empty,
+    audios: std.ArrayList([]f32) = .empty,
+
+    fn deinit(self: *PendingRefs) void {
+        const a = self.allocator;
+        for (self.images.items) |b| a.free(b);
+        self.images.deinit(a);
+        for (self.video_frames.items) |*fr| {
+            for (fr.items) |b| a.free(b);
+            fr.deinit(a);
+        }
+        self.video_frames.deinit(a);
+        for (self.video_audio.items) |p| if (p) |x| a.free(x);
+        self.video_audio.deinit(a);
+        for (self.audios.items) |p| a.free(p);
+        self.audios.deinit(a);
+    }
+};
+
+/// Decode a base64 WAV to 32 kHz STEREO interleaved f32 — the audio VAE's rate.
+/// The VAE is not sensitive to sub-sample resample accuracy, so the linear
+/// resampler the a2vid conditioning path already uses is enough here too.
+fn refWavTo32kStereo(allocator: std.mem.Allocator, raw_b64: []const u8) ![]f32 {
+    const wav_bytes = try jsonB64Alloc(allocator, raw_b64);
+    defer allocator.free(wav_bytes);
+    const dec = try wav_mod.decode(allocator, wav_bytes);
+    defer allocator.free(dec.pcm);
+    const stereo = try wav_mod.toStereoInterleaved(allocator, dec.pcm, dec.channels);
+    defer allocator.free(stereo);
+    return wav_mod.resampleLinear(allocator, stereo, 2, dec.sample_rate, minimax_h3.audio_mod.SAMPLE_RATE);
+}
+
+/// `[2, L]` f32 in [-1, 1] from interleaved stereo — the audio encoder's shape
+/// (the stereo channels ride the BATCH axis; the encoder itself is mono).
+fn stereoInterleavedToArray(allocator: std.mem.Allocator, pcm: []const f32) !mlx.mlx_array {
+    const frames = pcm.len / 2;
+    const planar = try allocator.alloc(f32, frames * 2);
+    defer allocator.free(planar);
+    for (0..frames) |i| {
+        planar[i] = pcm[i * 2];
+        planar[frames + i] = pcm[i * 2 + 1];
+    }
+    const shp = [_]c_int{ 2, @intCast(frames) };
+    return mlx.mlx_array_new_data(planar.ptr, &shp, 2, mlx.mlx_dtype.float32);
+}
+
+/// Parse and decode the ref2va reference fields into `out` (caller owns every
+/// entry). Returns null on success, or the NAMED 400 message to send — a
+/// reference the server cannot use must never be silently dropped, because the
+/// generation then succeeds while ignoring what the user asked it to follow.
+///
+/// `err_buf` backs the messages that name an index; the rest are literals.
+fn parseH3Refs(
+    allocator: std.mem.Allocator,
+    body: []const u8,
+    gen_w: u32,
+    gen_h: u32,
+    gen_frames: u32,
+    out: *std.ArrayList(minimax_h3.RefMedia),
+    err_buf: []u8,
+) !?[]const u8 {
+    const mode: minimax_h3.RefImageSizing = blk: {
+        const raw = extractJsonString(body, "ref_image_size") orelse break :blk .match;
+        if (std.mem.eql(u8, raw, "match")) break :blk .match;
+        if (std.mem.eql(u8, raw, "max")) break :blk .max;
+        return "'ref_image_size' must be \"match\" or \"max\"";
+    };
+
+    var pend = PendingRefs{ .allocator = allocator };
+    defer pend.deinit();
+
+    if (iterJsonStringArray(body, "ref_images")) |it0| {
+        var it = it0;
+        while (it.next()) |b64| {
+            const bytes = jsonB64Alloc(allocator, b64) catch
+                return std.fmt.bufPrint(err_buf, "'ref_images'[{d}] is not valid base64", .{pend.images.items.len}) catch
+                    "a 'ref_images' entry is not valid base64";
+            try pend.images.append(allocator, bytes);
+        }
+        if (it.bad) return "'ref_images' must be an array of base64 PNG/JPEG strings";
+    }
+
+    if (iterJsonObjectArray(body, "ref_videos")) |it0| {
+        var it = it0;
+        while (it.next()) |obj| {
+            const vi = pend.video_frames.items.len;
+            // Handed to `pend` EMPTY and filled through its own slot: every
+            // rejection below is a named 400, i.e. a NORMAL return, so an
+            // errdefer would not fire and the frames decoded so far would leak.
+            try pend.video_frames.append(allocator, .empty);
+            const frames = &pend.video_frames.items[vi];
+            var fit = iterJsonStringArray(obj, "frames") orelse
+                return std.fmt.bufPrint(err_buf, "'ref_videos'[{d}] needs a 'frames' array of base64 PNG/JPEG strings", .{vi}) catch
+                    "a 'ref_videos' entry needs a 'frames' array";
+            while (fit.next()) |b64| {
+                const bytes = jsonB64Alloc(allocator, b64) catch
+                    return std.fmt.bufPrint(err_buf, "'ref_videos'[{d}].frames[{d}] is not valid base64", .{ vi, frames.items.len }) catch
+                        "a 'ref_videos' frame is not valid base64";
+                try frames.append(allocator, bytes);
+            }
+            if (fit.bad)
+                return std.fmt.bufPrint(err_buf, "'ref_videos'[{d}].frames must be an array of base64 PNG/JPEG strings", .{vi}) catch
+                    "a 'ref_videos' frames array is malformed";
+            // The soundtrack is a FIELD on its own video object, so a missing
+            // one cannot shift the pairing the way a parallel array's hole did.
+            var track: ?[]f32 = null;
+            if (extractJsonString(obj, "audio")) |raw| {
+                if (raw.len > 0) {
+                    track = refWavTo32kStereo(allocator, raw) catch
+                        return std.fmt.bufPrint(err_buf, "'ref_videos'[{d}].audio must be a PCM16/PCM24/float32 WAV", .{vi}) catch
+                            "a 'ref_videos' soundtrack could not be decoded";
+                }
+            }
+            try pend.video_audio.append(allocator, track);
+        }
+        if (it.bad) return "'ref_videos' must be an array of {\"frames\":[…],\"audio\":\"…\"} objects";
+    }
+
+    if (iterJsonStringArray(body, "ref_audios")) |it0| {
+        var it = it0;
+        while (it.next()) |b64| {
+            const pcm = refWavTo32kStereo(allocator, b64) catch
+                return std.fmt.bufPrint(err_buf, "'ref_audios'[{d}] must be a PCM16/PCM24/float32 WAV", .{pend.audios.items.len}) catch
+                    "a 'ref_audios' entry could not be decoded";
+            try pend.audios.append(allocator, pcm);
+        }
+        if (it.bad) return "'ref_audios' must be an array of base64 WAV strings";
+    }
+
+    const n_total = pend.images.items.len + pend.video_frames.items.len + pend.audios.items.len;
+    if (n_total == 0) return null;
+
+    // Source dimensions, which is all `resolveRefs` sizes from. A reference
+    // whose pixels cannot even be measured is a 400 here rather than a decode
+    // failure three steps later with no field name attached to it.
+    var inputs_i = try allocator.alloc(minimax_h3.RefInput, pend.images.items.len);
+    defer allocator.free(inputs_i);
+    for (pend.images.items, 0..) |bytes, i| {
+        const sz = imageNativeSize(bytes) orelse
+            return std.fmt.bufPrint(err_buf, "could not decode 'ref_images'[{d}] (PNG/JPEG expected)", .{i}) catch
+                "a 'ref_images' entry could not be decoded (PNG/JPEG expected)";
+        inputs_i[i] = .{ .kind = .image, .w = sz.w, .h = sz.h };
+    }
+    var inputs_v = try allocator.alloc(minimax_h3.RefInput, pend.video_frames.items.len);
+    defer allocator.free(inputs_v);
+    for (pend.video_frames.items, 0..) |fr, i| {
+        if (fr.items.len == 0)
+            return std.fmt.bufPrint(err_buf, "'ref_videos'[{d}] has no frames", .{i}) catch "a 'ref_videos' entry has no frames";
+        const sz = imageNativeSize(fr.items[0]) orelse
+            return std.fmt.bufPrint(err_buf, "could not decode 'ref_videos'[{d}].frames[0] (PNG/JPEG expected)", .{i}) catch
+                "a 'ref_videos' frame could not be decoded (PNG/JPEG expected)";
+        // The reference node truncates a reference longer than the generation
+        // before snapping it to the ladder; a clip the output cannot span
+        // costs sampling rows for footage the model can never reach.
+        const supplied: u32 = @intCast(fr.items.len);
+        inputs_v[i] = .{
+            .kind = .video,
+            .w = sz.w,
+            .h = sz.h,
+            .frames = @min(supplied, gen_frames),
+            .audio_samples = 0,
+            .soundtrack_samples = if (pend.video_audio.items[i]) |p| @intCast(p.len / 2) else null,
+        };
+    }
+    var inputs_a = try allocator.alloc(minimax_h3.RefInput, pend.audios.items.len);
+    defer allocator.free(inputs_a);
+    for (pend.audios.items, 0..) |pcm, i| {
+        inputs_a[i] = .{ .kind = .audio, .audio_samples = @intCast(pcm.len / 2) };
+    }
+
+    var res = switch (try minimax_h3.resolveRefs(allocator, inputs_i, inputs_v, inputs_a, gen_w, gen_h, mode)) {
+        .ok => |r| r,
+        .reject => |why| return why.message(),
+    };
+    defer res.deinit();
+
+    // Decode at the canvases the resolver picked — the VAE canvas for the DiT
+    // payload, and the Qwen canvas for the vision tower. Two decodes rather
+    // than one resize, because the server has no image resampler.
+    for (res.refs) |r| {
+        // Appended EMPTY first and filled through the caller's own slot: a
+        // named-400 return is a NORMAL return, so an errdefer would not fire
+        // and a second decode failing would strand the first array. The
+        // caller's deinit loop owns every partially-filled entry.
+        try out.append(allocator, .{ .ref = r });
+        const media = &out.items[out.items.len - 1];
+        switch (r.kind) {
+            .image => {
+                const bytes = pend.images.items[r.src_index];
+                const vfit = minimax_h3.h3v.fitCanvas(r.canvas.h, r.canvas.w);
+                const bad = std.fmt.bufPrint(err_buf, "could not decode 'ref_images'[{d}] (PNG/JPEG expected)", .{r.src_index}) catch
+                    "a 'ref_images' entry could not be decoded (PNG/JPEG expected)";
+                media.pixels = decodeImageToBCFHW(allocator, bytes, r.canvas.h, r.canvas.w, mlx.gpuStream()) orelse return bad;
+                media.vision = decodeImageToBCFHW(allocator, bytes, vfit.h, vfit.w, mlx.gpuStream()) orelse return bad;
+            },
+            .video => {
+                const fr = pend.video_frames.items[r.src_index].items;
+                const vfit = minimax_h3.h3v.fitCanvas(r.canvas.h, r.canvas.w);
+                const bad = std.fmt.bufPrint(err_buf, "could not decode a 'ref_videos'[{d}] frame (PNG/JPEG expected)", .{r.src_index}) catch
+                    "a 'ref_videos' frame could not be decoded (PNG/JPEG expected)";
+                media.pixels = try decodeRefVideoFrames(allocator, fr[0..r.frames], r.canvas.h, r.canvas.w, 1, 2) orelse return bad;
+                media.vision = try decodeRefVideoFrames(allocator, fr[0..r.frames], vfit.h, vfit.w, minimax_h3.qwenFrameStride(), 0) orelse return bad;
+                if (pend.video_audio.items[r.src_index]) |pcm|
+                    media.waveform = try stereoInterleavedToArray(allocator, pcm);
+            },
+            .audio => media.waveform = try stereoInterleavedToArray(allocator, pend.audios.items[r.src_index]),
+        }
+    }
+    return null;
+}
+
+/// Decode every `stride`-th encoded frame at `th`x`tw` and stack them.
+/// `cat_axis` 2 gives the VAE's `[1,3,T,H,W]`; 0 gives the vision tower's
+/// `[n,3,H,W]`. Null when any frame fails to decode.
+fn decodeRefVideoFrames(
+    allocator: std.mem.Allocator,
+    frames: []const []u8,
+    th: u32,
+    tw: u32,
+    stride: u32,
+    cat_axis: c_int,
+) !?mlx.mlx_array {
+    var parts: std.ArrayList(mlx.mlx_array) = .empty;
+    defer {
+        for (parts.items) |p| _ = mlx.mlx_array_free(p);
+        parts.deinit(allocator);
+    }
+    var i: usize = 0;
+    while (i < frames.len) : (i += stride) {
+        const bcfhw = decodeImageToBCFHW(allocator, frames[i], th, tw, mlx.gpuStream()) orelse return null;
+        if (cat_axis == 2) {
+            try parts.append(allocator, bcfhw);
+        } else {
+            // [1,3,1,H,W] -> [1,3,H,W] so the stack lands on the frame axis.
+            defer _ = mlx.mlx_array_free(bcfhw);
+            var four = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(four);
+            const shp4 = [_]c_int{ 1, 3, @intCast(th), @intCast(tw) };
+            try mlx.check(mlx.mlx_reshape(&four, bcfhw, &shp4, 4, mlx.gpuStream()));
+            try parts.append(allocator, four);
+        }
+    }
+    if (parts.items.len == 0) return null;
+    const vec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(vec);
+    for (parts.items) |p| _ = mlx.mlx_vector_array_append_value(vec, p);
+    var o = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(o);
+    try mlx.check(mlx.mlx_concatenate_axis(&o, vec, cat_axis, mlx.gpuStream()));
+    return o;
+}
+
 /// MiniMax-H3 text-to-audio-video.
 ///
 /// The request surface is deliberately NARROWER than LTX's: H3 has no LoRA, no
@@ -2351,7 +2658,15 @@ fn handleVideoH3(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []
     var n_kf: usize = 0;
     defer for (keyframes_buf[0..n_kf]) |kf| {
         _ = mlx.mlx_array_free(kf.pixels);
+        if (kf.vision) |v| _ = mlx.mlx_array_free(v);
     };
+    // The keyframe also enters the Qwen conditioning as a `<Picture i>` block,
+    // which has its OWN canvas rule (multiple of 32 above a 3136-pixel floor).
+    // On every servable target the two agree and the VAE copy is reused; below
+    // the floor they diverge, so decode a second copy at the vision canvas
+    // rather than patchify pixels whose grid says something else.
+    const vfit = minimax_h3.h3v.fitCanvas(height, width);
+    const vision_differs = vfit.h != height or vfit.w != width;
     inline for (.{ .{ "first_frame_image", minimax_h3.KeyframeAnchor.first }, .{ "last_frame_image", minimax_h3.KeyframeAnchor.last } }) |spec| {
         if (extractJsonString(body, spec[0])) |raw_img| {
             const b64 = try jsonUnescape(allocator, raw_img);
@@ -2360,19 +2675,61 @@ fn handleVideoH3(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []
                 const img_bytes = base64DecodeAlloc(allocator, b64) catch
                     return sendError(conn, 400, "keyframe image is not valid base64");
                 defer allocator.free(img_bytes);
-                const arr: ?mlx.mlx_array = switch (spec[1]) {
-                    .first => decodeImageToBCFHW(allocator, img_bytes, height, width, mlx.gpuStream()),
-                    .last => blk: {
-                        const bchw = decodeImageToBCHW(allocator, img_bytes, height, width) orelse break :blk null;
-                        defer _ = mlx.mlx_array_free(bchw);
-                        break :blk unitToPm1BCFHW(bchw, height, width, mlx.gpuStream()) catch null;
-                    },
-                };
+                const decodeAt = struct {
+                    fn f(a: std.mem.Allocator, bytes: []const u8, anchor: minimax_h3.KeyframeAnchor, th: u32, tw: u32) ?mlx.mlx_array {
+                        return switch (anchor) {
+                            // first = geometry anchor, plain STRETCH;
+                            // last = follower, aspect-preserving center-COVER.
+                            .first => decodeImageToBCFHW(a, bytes, th, tw, mlx.gpuStream()),
+                            .last => blk: {
+                                const bchw = decodeImageToBCHW(a, bytes, th, tw) orelse break :blk null;
+                                defer _ = mlx.mlx_array_free(bchw);
+                                break :blk unitToPm1BCFHW(bchw, th, tw, mlx.gpuStream()) catch null;
+                            },
+                        };
+                    }
+                }.f;
+                const arr = decodeAt(allocator, img_bytes, spec[1], height, width);
                 if (arr == null) return sendError(conn, 400, "keyframe image could not be decoded (PNG/JPEG expected)");
-                keyframes_buf[n_kf] = .{ .anchor = spec[1], .pixels = arr.? };
+                const vis: ?mlx.mlx_array = if (!vision_differs) null else blk: {
+                    const v = decodeAt(allocator, img_bytes, spec[1], vfit.h, vfit.w);
+                    if (v == null) {
+                        _ = mlx.mlx_array_free(arr.?);
+                        return sendError(conn, 400, "keyframe image could not be decoded (PNG/JPEG expected)");
+                    }
+                    break :blk v;
+                };
+                keyframes_buf[n_kf] = .{ .anchor = spec[1], .pixels = arr.?, .vision = vis };
                 n_kf += 1;
-                log.info("[video] minimax-h3 {s} keyframe conditioning engaged ({d}x{d})\n", .{ @tagName(spec[1]), width, height });
+                log.info("[video] minimax-h3 {s} keyframe conditioning engaged ({d}x{d}, vision block {d}x{d})\n", .{ @tagName(spec[1]), width, height, vfit.w, vfit.h });
             }
+        }
+    }
+
+    // ── ref2va references ──
+    // Refused on an FL2VA pack rather than ignored: both partitions ship the
+    // same files and the same geometry, so nothing downstream would notice, and
+    // the generation would come back looking like the model ignored the user.
+    var refs: std.ArrayList(minimax_h3.RefMedia) = .empty;
+    defer {
+        for (refs.items) |*m| m.deinit();
+        refs.deinit(allocator);
+    }
+    const has_ref_fields = std.mem.indexOf(u8, body, "\"ref_images\"") != null or
+        std.mem.indexOf(u8, body, "\"ref_videos\"") != null or
+        std.mem.indexOf(u8, body, "\"ref_audios\"") != null;
+    if (has_ref_fields and !engine.supports_refs)
+        return sendError(conn, 400, "this MiniMax-H3 pack does not support references (it declares no 'ref2va' task) — load a REF2VA checkpoint");
+    if (has_ref_fields) {
+        var err_buf: [256]u8 = undefined;
+        if (try parseH3Refs(allocator, body, width, height, shape.frame_count, &refs, &err_buf)) |msg|
+            return sendError(conn, 400, msg);
+        for (refs.items) |m| {
+            log.info("[video] minimax-h3 reference {s} #{d}: {d}x{d} {d}f, latent {d}x{d}x{d}, audio_t {d}\n", .{
+                @tagName(m.ref.kind), m.ref.ordinal, m.ref.canvas.w, m.ref.canvas.h,
+                m.ref.frames,        m.ref.latent_t, m.ref.latent_h, m.ref.latent_w,
+                m.ref.audio_t,
+            });
         }
     }
 
@@ -2399,6 +2756,7 @@ fn handleVideoH3(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []
         .seed = seed,
         .fast = sse.bodyBool(body, "fast"),
         .keyframes = keyframes_buf[0..n_kf],
+        .refs = refs.items,
     }, prog, mlx.gpuStream()) catch |e| {
         log.err("[video] minimax-h3 generation failed: {any}\n", .{e});
         // Mid-stream the headers are already out, so an error must be an SSE
@@ -3117,6 +3475,75 @@ const JsonStringArrayIter = struct {
     }
 };
 
+/// Walks an array of JSON OBJECTS, handing back each element's raw `{…}` slice
+/// so the caller can read its fields with the same scanners it uses on a whole
+/// body. Brace-balanced and string-aware, which is what keeps one element's
+/// fields from leaking into the next one's.
+const JsonObjectArrayIter = struct {
+    rest: []const u8,
+    bad: bool = false,
+
+    fn next(self: *JsonObjectArrayIter) ?[]const u8 {
+        var i: usize = 0;
+        while (i < self.rest.len) : (i += 1) {
+            switch (self.rest[i]) {
+                '{' => break,
+                ']' => return null,
+                ',', ' ', '\t', '\n', '\r' => continue,
+                else => {
+                    self.bad = true;
+                    return null;
+                },
+            }
+        }
+        if (i >= self.rest.len) {
+            self.bad = true; // ran out before the closing ']'
+            return null;
+        }
+        const start = i;
+        var depth: usize = 0;
+        var in_str = false;
+        while (i < self.rest.len) : (i += 1) {
+            const c = self.rest[i];
+            if (in_str) {
+                if (c == '\\') {
+                    i += 1;
+                } else if (c == '"') {
+                    in_str = false;
+                }
+                continue;
+            }
+            switch (c) {
+                '"' => in_str = true,
+                '{', '[' => depth += 1,
+                '}', ']' => {
+                    depth -= 1;
+                    if (depth == 0) {
+                        const v = self.rest[start .. i + 1];
+                        self.rest = self.rest[i + 1 ..];
+                        return v;
+                    }
+                },
+                else => {},
+            }
+        }
+        self.bad = true; // unterminated object
+        return null;
+    }
+};
+
+/// Position an iterator at the first element of the `key` JSON object array.
+/// Null when the key is absent or its value is not an array.
+fn iterJsonObjectArray(body: []const u8, key: []const u8) ?JsonObjectArrayIter {
+    var key_pat_buf: [64]u8 = undefined;
+    const key_pat = std.fmt.bufPrint(&key_pat_buf, "\"{s}\"", .{key}) catch return null;
+    const ki = std.mem.indexOf(u8, body, key_pat) orelse return null;
+    var i = ki + key_pat.len;
+    while (i < body.len and (body[i] == ' ' or body[i] == ':' or body[i] == '\t')) i += 1;
+    if (i >= body.len or body[i] != '[') return null;
+    return .{ .rest = body[i + 1 ..] };
+}
+
 /// Position an iterator at the first element of the `key` JSON string array.
 /// Null when the key is absent or its value is not an array.
 fn iterJsonStringArray(body: []const u8, key: []const u8) ?JsonStringArrayIter {
@@ -3799,6 +4226,147 @@ test "iterJsonStringArray walks ref_images entries" {
     var b = iterJsonStringArray("{\"ref_images\":[1,2]}", "ref_images").?;
     try testing.expect(b.next() == null);
     try testing.expect(b.bad);
+}
+
+test "a named-400 on a reference set frees everything decoded before it" {
+    // Every rejection here is a NORMAL return carrying a message, not a Zig
+    // error, so `errdefer` does NOT fire — anything already decoded has to be
+    // owned by something the caller frees. The test allocator is the assertion:
+    // pre-fix each of these stranded the entries decoded before the bad one.
+    const a = testing.allocator;
+    var buf: [256]u8 = undefined;
+    const cases = [_]struct { body: []const u8, needle: []const u8 }{
+        // A valid entry, then an un-decodable base64 one.
+        .{ .body = "{\"ref_images\":[\"QUJD\",\"!!!!\"]}", .needle = "'ref_images'[1]" },
+        .{ .body = "{\"ref_videos\":[{\"frames\":[\"QUJD\",\"QUJD\",\"!!!!\"]}]}", .needle = "frames[2]" },
+        .{ .body = "{\"ref_audios\":[\"!!!!\"]}", .needle = "'ref_audios'[0]" },
+        // A whole video's frames decoded, then the SOUNDTRACK is unusable.
+        .{ .body = "{\"ref_videos\":[{\"frames\":[\"QUJD\"],\"audio\":\"QUJD\"}]}", .needle = "'ref_videos'[0].audio" },
+        // Malformed containers, and a sizing mode that is not one of the two.
+        .{ .body = "{\"ref_videos\":[{\"frames\":[\"QUJD\",1]}]}", .needle = "'ref_videos'[0].frames" },
+        .{ .body = "{\"ref_images\":[\"QUJD\"],\"ref_image_size\":\"huge\"}", .needle = "ref_image_size" },
+        // Decodable base64 that is not an image: the entry is NAMED, and the
+        // bytes already staged for it are freed.
+        .{ .body = "{\"ref_images\":[\"QUJDRA==\"]}", .needle = "could not decode 'ref_images'[0]" },
+    };
+    for (cases) |c| {
+        var out: std.ArrayList(minimax_h3.RefMedia) = .empty;
+        defer {
+            for (out.items) |*m| m.deinit();
+            out.deinit(a);
+        }
+        const msg = (try parseH3Refs(a, c.body, 864, 480, 124, &out, &buf)) orelse {
+            std.debug.print("expected a rejection for {s}\n", .{c.body});
+            return error.ExpectedRejection;
+        };
+        try testing.expect(std.mem.indexOf(u8, msg, c.needle) != null);
+    }
+    // No reference fields at all is not a rejection — the feature is simply off.
+    var none: std.ArrayList(minimax_h3.RefMedia) = .empty;
+    defer none.deinit(a);
+    try testing.expect((try parseH3Refs(a, "{\"prompt\":\"x\"}", 864, 480, 124, &none, &buf)) == null);
+    try testing.expectEqual(@as(usize, 0), none.items.len);
+}
+
+test "reference audio arrives as 32 kHz stereo in the encoder's planar shape" {
+    const a = testing.allocator;
+    // The audio VAE is MONO and takes the stereo channels on the BATCH axis, so
+    // interleaved -> [2, L] is a de-interleave, not a reshape. A reshape here
+    // runs, produces the right shape, and encodes a channel-swapped chirp.
+    var inter = [_]f32{ 0.0, 0.5, 0.1, 0.6, 0.2, 0.7 };
+    const arr = try stereoInterleavedToArray(a, &inter);
+    defer _ = mlx.mlx_array_free(arr);
+    const shp = mlx.getShape(arr);
+    try testing.expectEqual(@as(c_int, 2), shp[0]);
+    try testing.expectEqual(@as(c_int, 3), shp[1]);
+    try mlx.check(mlx.mlx_array_eval(arr));
+    const d = mlx.mlx_array_data_float32(arr).?;
+    const want = [_]f32{ 0.0, 0.1, 0.2, 0.5, 0.6, 0.7 };
+    for (want, 0..) |v, i| try testing.expectApproxEqAbs(v, d[i], 1e-6);
+
+    // A 16 kHz mono clip must come back at the VAE's 32 kHz, in stereo — the
+    // rate is what the latent-frame count is computed from, so a clip left at
+    // its own rate silently halves the reference's length.
+    var mono: [1600]f32 = undefined;
+    for (&mono, 0..) |*v, i| v.* = @as(f32, @floatFromInt(i % 100)) / 100.0;
+    const wav_bytes = try wav_mod.encodePcm16(a, &mono, 16000, 1);
+    defer a.free(wav_bytes);
+    const b64 = try a.alloc(u8, std.base64.standard.Encoder.calcSize(wav_bytes.len));
+    defer a.free(b64);
+    _ = std.base64.standard.Encoder.encode(b64, wav_bytes);
+    const pcm = try refWavTo32kStereo(a, b64);
+    defer a.free(pcm);
+    try testing.expectEqual(@as(usize, 3200 * 2), pcm.len);
+    // Duplicated, not summed: both channels carry the mono signal.
+    try testing.expectApproxEqAbs(pcm[0], pcm[1], 1e-6);
+    try testing.expectApproxEqAbs(pcm[200], pcm[201], 1e-6);
+}
+
+test "h3ConfigDeclaresRef2va reads the pack's own task list" {
+    const a = testing.allocator;
+    // The converter writes the partition's task list; ref2va and fl2va share
+    // every geometry number, so the DiT file is the ONLY thing that differs and
+    // this is the only way to tell an FL2VA pack from a REF2VA one.
+    try testing.expect(h3ConfigDeclaresRef2va(a, "{\"model_type\":\"minimax_h3\",\"tasks\":[\"t2va\",\"ref2va\"]}"));
+    try testing.expect(!h3ConfigDeclaresRef2va(a, "{\"model_type\":\"minimax_h3\",\"tasks\":[\"t2va\",\"fl2va\"]}"));
+    // Absent / malformed / wrong-typed → NOT ref2va. A pack that cannot say it
+    // supports references must not be handed them: it would generate happily
+    // and ignore every one of them.
+    try testing.expect(!h3ConfigDeclaresRef2va(a, "{\"model_type\":\"minimax_h3\"}"));
+    try testing.expect(!h3ConfigDeclaresRef2va(a, "{\"tasks\":\"ref2va\"}"));
+    try testing.expect(!h3ConfigDeclaresRef2va(a, "not json"));
+    // A substring match on the whole file would pass on the README-ish text a
+    // config can legally carry; only the task LIST counts.
+    try testing.expect(!h3ConfigDeclaresRef2va(a, "{\"note\":\"ref2va\",\"tasks\":[\"t2va\",\"fl2va\"]}"));
+}
+
+test "iterJsonObjectArray walks ref_videos entries" {
+    // A reference video is an OBJECT — `{"frames":[…],"audio":"…"}` — so the
+    // soundtrack is a field on the video it belongs to. The original shape was
+    // a parallel `ref_video_audios` array, where a null hole silently
+    // mis-pairs a soundtrack with the wrong clip.
+    const body =
+        "{\"ref_videos\":[ {\"frames\":[\"QQ==\",\"Qg==\"],\"audio\":\"Ug==\"} , {\"frames\":[\"Qw==\"]} ],\"seed\":3}";
+    var it = iterJsonObjectArray(body, "ref_videos").?;
+    const o1 = it.next().?;
+    var f1 = iterJsonStringArray(o1, "frames").?;
+    try testing.expectEqualStrings("QQ==", f1.next().?);
+    try testing.expectEqualStrings("Qg==", f1.next().?);
+    try testing.expect(f1.next() == null);
+    try testing.expectEqualStrings("Ug==", extractJsonString(o1, "audio").?);
+    const o2 = it.next().?;
+    // The second object must NOT see the first one's audio — an unbalanced
+    // scan that overruns is exactly how a soundtrack lands on the wrong clip.
+    try testing.expect(extractJsonString(o2, "audio") == null);
+    var f2 = iterJsonStringArray(o2, "frames").?;
+    try testing.expectEqualStrings("Qw==", f2.next().?);
+    try testing.expect(it.next() == null);
+    try testing.expect(!it.bad);
+
+    // A brace inside a quoted string does not close the object.
+    var q = iterJsonObjectArray("{\"ref_videos\":[{\"audio\":\"a}b\",\"frames\":[\"QQ==\"]}]}", "ref_videos").?;
+    const qo = q.next().?;
+    try testing.expectEqualStrings("a}b", extractJsonString(qo, "audio").?);
+    try testing.expect(q.next() == null);
+    try testing.expect(!q.bad);
+
+    // Empty array: no entries, not malformed.
+    var e = iterJsonObjectArray("{\"ref_videos\":[]}", "ref_videos").?;
+    try testing.expect(e.next() == null);
+    try testing.expect(!e.bad);
+
+    // Absent key / non-array value → null (feature off, not a 400).
+    try testing.expect(iterJsonObjectArray("{\"seed\":1}", "ref_videos") == null);
+    try testing.expect(iterJsonObjectArray("{\"ref_videos\":\"x\"}", "ref_videos") == null);
+
+    // A non-object element and an unterminated array flag bad, so the handler
+    // 400s by name instead of generating while ignoring what was asked for.
+    var b = iterJsonObjectArray("{\"ref_videos\":[\"QQ==\"]}", "ref_videos").?;
+    try testing.expect(b.next() == null);
+    try testing.expect(b.bad);
+    var u = iterJsonObjectArray("{\"ref_videos\":[{\"frames\":[", "ref_videos").?;
+    try testing.expect(u.next() == null);
+    try testing.expect(u.bad);
 }
 
 test "extractCondWeights accepts a JSON array or a separated string" {

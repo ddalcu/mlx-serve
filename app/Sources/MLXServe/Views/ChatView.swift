@@ -3,16 +3,6 @@ import PDFKit
 import UniformTypeIdentifiers
 import AppKit
 
-private struct ContentBottomKey: PreferenceKey {
-    static var defaultValue: CGFloat = 0
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = nextValue() }
-}
-
-private struct ScrollViewHeightKey: PreferenceKey {
-    static var defaultValue: CGFloat = 0
-    static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = nextValue() }
-}
-
 /// A tool-call awaiting user approval. The agent loop suspends on
 /// `continuation` while the SwiftUI sheet shows the request; the sheet's
 /// buttons resume it with the user's choice.
@@ -667,10 +657,13 @@ struct ChatDetailView: View {
     @State private var showMCPMarketplace = false
     @State private var showThinkingInAgentConfirm = false
     @State private var executingPlanMessageId: UUID?
-    @State private var isNearBottom = true
-    @State private var scrollViewHeight: CGFloat = 0
-    @State private var contentBottom: CGFloat = 0
-    @State private var scrollMonitor: Any?
+    // Follow-the-newest-line. The decision core is pure (`ChatScrollState`,
+    // pinned by ChatScrollTests); the model holds it in a class so per-frame
+    // scroll geometry doesn't re-evaluate the whole chat body — only the
+    // pinned flag is published. `scrollPosition` is the one handle that moves
+    // the transcript, so no view needs a `ScrollViewProxy` passed around.
+    @StateObject private var scrollModel = ChatScrollModel()
+    @State private var scrollPosition = ScrollPosition(idType: Never.self, edge: .bottom)
     @State private var pasteMonitor: Any?
     @State private var pendingImages: [NSImage] = []
     @State private var pendingPDFs: [(name: String, text: String)] = []
@@ -1213,7 +1206,6 @@ struct ChatDetailView: View {
                 emptyState
             } else {
             // Messages
-            ScrollViewReader { proxy in
                 ScrollView {
                     LazyVStack(spacing: 12) {
                         ForEach(ChatRowBuilder.rows(from: session?.messages ?? [])) { row in
@@ -1245,21 +1237,9 @@ struct ChatDetailView: View {
                             MediaProgressCard(progress: progress)
                                 .id("mediaProgress")
                         }
-                        // Bottom anchor — its position relative to the scroll viewport
-                        // tells us whether the user has scrolled to the bottom.
-                        Color.clear.frame(height: 1).id("bottom")
-                            .background(
-                                GeometryReader { geo in
-                                    Color.clear.preference(
-                                        key: ContentBottomKey.self,
-                                        value: geo.frame(in: .named("chatScroll")).maxY
-                                    )
-                                }
-                            )
                     }
                     .padding(ChatMetrics.gutter)
                 }
-                .coordinateSpace(name: "chatScroll")
                 // Transcript text used to run straight into the floating model
                 // picker. The toolbar band's own full-width background stays
                 // hidden (the cluster carries its own material — that's what
@@ -1268,37 +1248,50 @@ struct ChatDetailView: View {
                 // drawn by the scroll view itself so nothing new can intercept
                 // a click.
                 .scrollEdgeEffectStyle(.soft, for: .top)
-                .background(
-                    GeometryReader { scrollFrame in
-                        Color.clear.preference(
-                            key: ScrollViewHeightKey.self,
-                            value: scrollFrame.size.height
-                        )
+                // The transcript is moved from exactly one place — `applyScroll`
+                // — and only ever by a decision `ChatScrollState` made.
+                .scrollPosition($scrollPosition)
+                // While following, the scroll view keeps its own bottom edge
+                // glued as the content grows, so a streamed token costs NOTHING:
+                // no scroll command, no second layout pass, no state change.
+                // Measured over 40 growths (~/claude-tmp/chatscroll-probe):
+                // this anchor emitted ONE geometry event, while re-issuing
+                // `scrollTo(edge:)` per growth emitted two per token (the drift,
+                // then the correction). Flipping the value to nil starts the
+                // drift again, which is how the anchor is known to react to a
+                // CHANGING value rather than being read once at creation — so
+                // the moment the user takes over, growth stops dragging them.
+                .defaultScrollAnchor(scrollModel.isPinnedToBottom ? .bottom : nil,
+                                     for: .sizeChanges)
+                // The scroll view's OWN geometry says how far the end sits below
+                // the fold. This replaces a preference key published by a 1pt
+                // anchor view, which raced the layout it was measuring and could
+                // not see the viewport at all without a second preference key.
+                .onScrollGeometryChange(for: CGFloat.self) {
+                    ChatScrollState.distanceFromBottom($0)
+                } action: { _, distance in
+                    applyScroll(.geometryChanged(distanceFromBottom: distance))
+                }
+                // Who is moving it. The predecessor was an app-global NSEvent
+                // scroll-wheel monitor: it fired for every other window in the
+                // app, disengaged on a single upward notch (including the
+                // rubber-band settle after flinging TO the bottom, which is why
+                // auto-follow so often refused to come back), and was blind to
+                // scroller drags, keyboard scrolling and window resizes.
+                .onScrollPhaseChange { _, phase in
+                    applyScroll(.driverChanged(ChatScrollDriver(phase)))
+                }
+                .overlay(alignment: .bottom) {
+                    // The old affordance was a 4pt accent strip with hit-testing
+                    // off: it reported the state and offered no way out of it.
+                    Group {
+                        if !scrollModel.isPinnedToBottom {
+                            jumpToLatestButton
+                                .transition(.opacity.combined(with: .scale(scale: 0.85)))
+                        }
                     }
-                )
-                .onPreferenceChange(ScrollViewHeightKey.self) { scrollViewHeight = $0 }
-                .onPreferenceChange(ContentBottomKey.self) { bottom in
-                    contentBottom = bottom
-                    guard scrollViewHeight > 0 else { return }
-                    // Re-engage auto-scroll when content bottom is near viewport bottom
-                    if bottom - scrollViewHeight < 60 { isNearBottom = true }
+                    .animation(.easeInOut(duration: 0.18), value: scrollModel.isPinnedToBottom)
                 }
-                .onChange(of: session?.messages.count) { _, _ in
-                    if isNearBottom { scrollToBottom(proxy) }
-                }
-                .onChange(of: session?.messages.last?.content) { _, _ in
-                    if isNearBottom { scrollToBottom(proxy) }
-                }
-                .overlay(alignment: .trailing) {
-                    // Right-edge strip: accent tint when auto-scroll is on, fades out when off.
-                    RoundedRectangle(cornerRadius: 2)
-                        .fill(Color.accentColor.opacity(isNearBottom ? 0.4 : 0))
-                        .frame(width: 4)
-                        .padding(.vertical, 4)
-                        .animation(.easeInOut(duration: 0.3), value: isNearBottom)
-                        .allowsHitTesting(false)
-                }
-            }
             // The divider belongs to the transcript — against the empty
             // state's greeting it would draw a line across mid-window.
             Divider()
@@ -1472,20 +1465,7 @@ struct ChatDetailView: View {
             inputFocused = true
             syncTogglesFromSession()
             restoreAttachedFolderIfNeeded()
-            scrollMonitor = NSEvent.addLocalMonitorForEvents(matching: .scrollWheel) { event in
-                if event.scrollingDeltaY > 0 {
-                    // Scrolling up — disengage auto-scroll
-                    isNearBottom = false
-                } else if event.scrollingDeltaY < -1 {
-                    // Scrolling down — re-engage if content bottom is near viewport bottom.
-                    // The preference handler catches this when content changes, but during
-                    // generation pauses the user needs scroll events to re-engage.
-                    if scrollViewHeight > 0 && contentBottom - scrollViewHeight < 80 {
-                        isNearBottom = true
-                    }
-                }
-                return event
-            }
+            applyScroll(.transcriptShown)
             // Cmd+V into the focused chat input: if the clipboard holds an image,
             // PDF, or folder, attach it (same as the attach button / drag-drop)
             // and swallow the paste; plain text still pastes into the field.
@@ -1501,11 +1481,7 @@ struct ChatDetailView: View {
             // Generation lives on the app-level engine now — closing the chat
             // window must NOT cancel an in-flight turn (the voice assistant may
             // be driving it with no window open). Only tear down this view's
-            // scroll monitor.
-            if let monitor = scrollMonitor {
-                NSEvent.removeMonitor(monitor)
-                scrollMonitor = nil
-            }
+            // paste monitor.
             if let monitor = pasteMonitor {
                 NSEvent.removeMonitor(monitor)
                 pasteMonitor = nil
@@ -1564,6 +1540,11 @@ struct ChatDetailView: View {
             // switches (a session re-arms only when its Agent toggle goes off).
             syncTogglesFromSession()
             restoreAttachedFolderIfNeeded()
+            // Scroll state is per-view, and the view is reused across tabs — so
+            // without this, leaving one chat scrolled up opened the next one
+            // unpinned at whatever offset the previous conversation's content
+            // happened to leave behind.
+            applyScroll(.transcriptShown)
         }
     }
 
@@ -1621,6 +1602,7 @@ struct ChatDetailView: View {
         if showsContextPill {
             ContextPill(stats: contextStats,
                         modelName: server.chatModelInfo?.name,
+                        decodeSpeed: lastDecodeSpeed,
                         isLive: composerState == .generatingHere)
                 .frame(height: ChatMetrics.composerControlSize)
         }
@@ -1911,10 +1893,48 @@ struct ChatDetailView: View {
 
     // MARK: - Helpers
 
-    private func scrollToBottom(_ proxy: ScrollViewProxy) {
-        withAnimation(.easeOut(duration: 0.15)) {
-            proxy.scrollTo("bottom", anchor: .bottom)
+    /// Route one event through the decision core and carry out whatever it asks
+    /// for. The ONLY place in this view that moves the transcript.
+    private func applyScroll(_ event: ChatScrollEvent) {
+        switch scrollModel.apply(event) {
+        case .none:
+            break
+        case .toBottom(let animated):
+            if animated {
+                // A discrete jump the user asked for (their own message, the
+                // button) — the movement is the feedback that it landed.
+                withAnimation(.easeOut(duration: 0.2)) {
+                    scrollPosition.scrollTo(edge: .bottom)
+                }
+            } else {
+                // Following the stream is a direct offset set, explicitly
+                // unanimated: this used to run a 0.15s `withAnimation` per
+                // STREAMED TOKEN, so dozens of animations a second each started
+                // over the top of the one still running. That is the stutter,
+                // and it got worse the longer the transcript grew.
+                var instant = Transaction()
+                instant.disablesAnimations = true
+                withTransaction(instant) {
+                    scrollPosition.scrollTo(edge: .bottom)
+                }
+            }
         }
+    }
+
+    /// Shown only while auto-follow is off — its absence is how the transcript
+    /// says it is already following.
+    private var jumpToLatestButton: some View {
+        Button { applyScroll(.jumpTapped) } label: {
+            Image(systemName: "arrow.down")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(.primary)
+                .frame(width: 28, height: 28)
+                .background(.regularMaterial, in: Circle())
+                .overlay(Circle().strokeBorder(.separator, lineWidth: 0.5))
+        }
+        .buttonStyle(.plain)
+        .help("Jump to the latest message")
+        .padding(.bottom, 12)
     }
 
 
@@ -1963,6 +1983,16 @@ struct ChatDetailView: View {
                 ?? AgentEngine.effectiveContextLength(appContextSize: appState.contextSize,
                                                       modelContextLength: server.chatModelInfo?.contextLength),
             overflow: lastOverflowNotice)
+    }
+
+    /// Decode speed of the most recent reply that was actually timed.
+    ///
+    /// Mirrors `contextUsage`'s shape above: the LAST message carrying a real
+    /// figure, not the last message — a turn that errored or is still streaming
+    /// has none, and falling back to "no reading" there would blank a number the
+    /// previous reply legitimately produced.
+    private var lastDecodeSpeed: Double? {
+        session?.messages.last { ($0.tokensPerSecond ?? 0) > 0 }?.tokensPerSecond
     }
 
     /// Hidden until there's something true to report — a pill reading 0.0%
@@ -2101,8 +2131,6 @@ struct ChatDetailView: View {
     }
 
     private func proceedSend() {
-        isNearBottom = true // snap to bottom on send
-
         var text = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
         let attachedImages = consumePendingImages()
         let attachedAudio = consumePendingAudio()
@@ -2131,6 +2159,10 @@ struct ChatDetailView: View {
                            images: attachedImages, audio: attachedAudio,
                            config: config,
                            approval: { await requestToolApproval($0) })
+        // Your own message always wins: sending from halfway up the history used
+        // to leave you exactly there, because auto-follow was off and nothing
+        // else scrolled.
+        applyScroll(.userSentMessage)
     }
 
     /// Ask the user to approve a single tool call. Returns true on Allow /

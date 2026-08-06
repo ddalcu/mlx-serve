@@ -508,6 +508,18 @@ struct ServerOptions: Codable, Equatable {
 
     func toCLIArgs(modelDirOverride: String? = nil,
                    physicalMemoryBytes: UInt64 = ProcessInfo.processInfo.physicalMemory) -> [String] {
+        toCLIArgs(modelDirs: modelDirOverride.map { [$0] } ?? [],
+                  physicalMemoryBytes: physicalMemoryBytes)
+    }
+
+    /// `--model-dir` is REPEATABLE server-side, and a library can live in more
+    /// than one folder (the download destination, the folder it used to be, an
+    /// LM Studio tree). With one flag the others were listed by the app's own
+    /// picker and absent from `/v1/models`, so switching to one cost a full
+    /// server restart instead of a hot swap. Order matters: the server takes
+    /// the FIRST folder's copy of a repeated model id.
+    func toCLIArgs(modelDirs: [String],
+                   physicalMemoryBytes: UInt64 = ProcessInfo.processInfo.physicalMemory) -> [String] {
         // The host field is free text in Settings — a cleared field must not
         // launch `--host ""` (the server would fail to bind).
         let trimmedHost = host.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -521,7 +533,7 @@ struct ServerOptions: Codable, Equatable {
         if !logToFile {
             args += ["--log-file", "off"]
         }
-        if let dir = modelDirOverride, !dir.isEmpty {
+        for dir in modelDirs where !dir.isEmpty {
             args += ["--model-dir", dir]
         }
         if ctxSize > 0 {

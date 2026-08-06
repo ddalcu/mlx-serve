@@ -220,3 +220,288 @@ Where to block, and where NOT to: `submit()` already single-flights llama (`llam
 Fix shape (`src/scheduler.zig`): pure `admitPendingTick(cands, active, out)` (the `specTickMode` pattern — contract-tested decision fn + a source-scan pinning the call site) gates the pending drain in `inferenceLoop` step 1, under `queue_mu`. An exclusive candidate admits only if its model is neither among live decoding slots nor claimed by an earlier admitted exclusive candidate this tick (same-tick siblings aren't in `decoding` yet — the claim covers the window). `modelExclusiveDecode` keys on the transformer's dsv4 pointer, mirroring `runPrefill`'s `is_dsv4` — NOT on `!modelBatchable` (would wrongly serialize laguna/hy3) and NOT on a model_type string. Non-exclusive candidates always admit, and a candidate for another model behind a held exclusive one still admits — no head-of-line blocking. No release bookkeeping: the busy signal IS presence in `decoding`; step-5 culls finished slots under the same mutex, and the loop never blocks while `pending` is non-empty, so a held slot admits on the first tick after the active one is culled.
 
 Repro/guard: `tests/test_dsv4.sh` [7] — greedy solo baseline, then the same request with a short marker chat ("Reply with exactly: Kangaroo") fired mid-generation. Pre-fix RED reproduced the exact incident signature: the concurrent long output truncated and LITERALLY contained "Kangaroo" (`… 2, 3, 5, 7, "Kangaroo`). Post-fix: byte-equal to solo, marker answered after queueing, no leak — 17/17.
+
+---
+
+## Logprobs were misleading, not missing — three defects, one broken instrument (2026-08-05)
+
+Found while chasing a model-quality artifact. The hunt ate a day partly because
+an early read of "logprob -0.004, therefore the model is 99.6% confident" came
+straight out of this field. It was wrong in three independent ways, all on
+main, all model-agnostic.
+
+**1. The values were post-temperature.** `sampleToken` threads its WORKING
+logits into `computeLogprobs`, and by that point they carry the client's
+temperature (and any repeat/presence penalty). So the same prompt, the same
+chosen token, reported `-0.2129 / -0.0607 / -2.1566` at temp 0 / 0.6 / 2.0 — a
+number that belongs to the model moving with a knob the client set. Worse, at
+temp 0 there is no division at all and `log_softmax` over raw logits SATURATES:
+many entries report exactly `0.0` (p = 1.0), which reads as certainty and is
+actually just the absence of scaling. OpenAI's logprobs are the model's, so
+they now read the position's raw logits — before temperature, penalties and
+top-k/top-p.
+
+**2. Token ids were recovered by scanning the vocab for float equality.** For
+each `mlx_topk` value the producer walked all 157k entries looking for a slot
+whose logprob compared `==`, skipping ids it had already used. Under the
+saturation above, ties are everywhere and the winner is whichever id the scan
+reached first. The same comment claimed `mlx_topk` returns values "in
+descending order" — it does not (argpartition class) — and the caller then kept
+the first `top_n` of `top_n + 1` unordered candidates, so the true argmax could
+be the one dropped. Ids now travel WITH their values: `mlx_argpartition_axis`
+on the negated logprobs, slice the leading k, `mlx_take_axis` the values, sort
+host-side (ties break on the lower id so the ranking is deterministic).
+
+**3. The result was paired with the NEXT token.** This is the one that made the
+output look like a broken RANKING rather than a broken PAIRING. The decode loop
+returns `next_token_id` and, in the same call, forwards it to sample its
+successor — then published THAT `sampleToken` result as `last_logprob`, which
+the scheduler appends and `formatLogprobsObject` zips with token ids by index.
+So every entry carried the distribution of the token that FOLLOWED it. A
+one-token "OK" reply came back as:
+
+```
+token "OK"  logprob 0.0   top_logprobs[0] = { "<|role_end|>", 0.0 }
+```
+
+which is exactly what the model wants AFTER "OK" — both values 0.0 because the
+chosen id being reported was `<|role_end|>`'s, not "OK"'s.
+
+Fix is a one-token delay: `Generator.pending_logprob` holds the freshly sampled
+result and `last_logprob` is only ever assigned from it. The first returned
+token needs a seed, because t1 is sampled from the PREFILL's final forward,
+which the decode loop never sees — `firstTokenLogprobs` reads that distribution
+in `initWithOptions` (both branches), against the id the lazy sampler actually
+drew rather than re-sampling (which would disagree at any temperature > 0).
+
+Observable bar, and the one to re-run: at temp 0 the emitted token IS the
+argmax, so `top_logprobs` rank 1 must equal it. Measured 0 of 5 positions on a
+trivial prompt before; after, every position agrees and the values are real
+(-0.547 on a first token instead of a saturated 0.0). Guards: two hermetic
+tests in generate.zig (a tie-saturated distribution whose rank 1 must be the
+argmax; three temperatures against one independently computed log_softmax
+value), a source-scan class guard pinning that `last_logprob` may only be
+assigned from `pending_logprob`, and `tests/test_ling.sh` [11] live on both the
+chat and completions surfaces.
+
+## `/v1/completions` ignored its `logprobs` field (2026-08-05)
+
+Same session. The handler hardcoded `logprobs_n = 0` and still emitted a
+`logprobs` key in the response — the silently-ignored-field class, which reads
+to a client as "this model has no opinion" rather than "this server never
+asked". Two things differ from chat and both matter:
+
+- the request field is an INTEGER (how many alternatives per token), not a bool
+  plus a separate `top_logprobs` count;
+- the response is four PARALLEL ARRAYS — `tokens`, `token_logprobs`,
+  `top_logprobs`, `text_offset` — where `text_offset` is each token's byte
+  offset within the completion text (what a FIM client uses to align
+  alternatives with its buffer).
+
+`top_logprobs` there is a MAP keyed by token TEXT. That is OpenAI's own shape
+and we reproduce it, but it means two byte-fragment token ids that both render
+as U+FFFD COLLIDE and the larger value is lost. The first pass of the
+collapse metric was built on this surface and manufactured a run of fake
+`p = 0.000%` positions out of exactly that. **Any measurement over logprobs
+must use the chat surface**, whose `top_logprobs` is a list.
+
+## `/detokenize` emitted raw control bytes (2026-08-04)
+
+The handler hand-rolled a five-character escape table (`"`, `\`, `\n`, `\r`,
+`\t`) and passed every other byte through verbatim. Any token whose bytes are
+below 0x20 — and a byte-level BPE vocab has plenty — therefore produced a body
+that NO JSON parser accepts, from an endpoint whose entire job is to hand text
+back to a client.
+
+Same class as the tool-calling `appendJsonString` rule, one surface over: a
+literal is arbitrary bytes too, and there is exactly one correct escaper in the
+tree. `detokenizeResponseJson` now routes through `chat.appendJsonString`, with
+a test that feeds it a control byte and parses the result.
+
+The general form: any handler that builds JSON with `allocPrint` and a string
+it did not escape at a SINK is one unusual input away from an unparseable
+response. Grep for hand-rolled escape tables when a client reports "invalid
+JSON" from an endpoint that is otherwise working.
+
+
+## The streaming think gate was O(buffer) per token (2026-08-05)
+
+`chat.streamThinkGate2` runs `indexOf(buf, "<|channel>thought")`,
+`indexOf(buf, "<channel|>")`, `indexOfThinkOpenTag(buf, 0)` and
+`indexOfThinkCloseTag(buf, 0)` over the WHOLE accumulated buffer on every token,
+for as long as thinking markup is present and no close has arrived. That is
+O(n²) over a reasoning block. Hermetic bench, 4000 tokens growing to 113 KB:
+
+```
+no close in buffer:  47.99 us/token   (every scan runs to the end)
+close present early: 16.98 us/token   (the close scan stops at ~byte 14)
+```
+
+0.3% at ~15 ms/token, ~1% on a 5 ms/token model with a long unclosed
+thought, and it grows with the buffer — a 32K-token thought is 8x this bench.
+
+**What makes a cursor exact.** `tagSuffixChar` excludes `<`, so every recognized
+marker contains exactly ONE `<`, at its start. A marker straddling the
+scanned/unscanned boundary must therefore begin at the LAST `<` in the buffer —
+and if that `<` can no longer grow into a marker (`isPartialSuffixedTag`, or a
+strict prefix of the two channel spellings), nothing straddles the boundary at
+all. No overlap constant to get wrong, and no length bound needed even for an
+arbitrarily long `</think:suffix>`. The plain substring needles get a fixed
+16-byte overlap (`<|channel>thought` is the longest at 17).
+
+**The close tag is the one value that cannot be latched.**
+`thinkCloseIsToolCallPayload` looks FORWARD past the close for a `</tool_call`,
+so a close that is a real block close at token N is reclassified as argument
+payload at token N+k. Latching it diverged from the fresh gate at prefix 104 of
+
+```
+<think>plan<tool_call>f<arg_key>k</arg_key><arg_value>closes with </think> inside</arg_value></tool_call>done</think>visible
+```
+
+— the incremental arm said `.split_think` where the fresh gate said
+`.hold_thinking`. So the latch is gated on "no `tool_call` substring seen yet",
+and once tool markup appears the scan falls back to the exact full
+`indexOfThinkCloseTag(buf, 0)` every call. That costs a handful of tokens, not a
+block: the caller latches `think_closed` immediately after a split.
+
+Measured after: 203 MB scanned → 164 KB over the same 4000 tokens (1238x), and
+the memoized total is ~1.6 passes over the final buffer, i.e. linear.
+
+Pinned by three tests — prefix-by-prefix equivalence against the fresh gate over
+every marker family (which IS the split-across-arrivals case, at every possible
+split point), a flat-cost invariant on `last_scan_span`, and a reset test for
+the buffer the stream loop clears at every emit. Plus a wiring scan: both
+streaming handlers must hold a persistent `ThinkScan` and reset it where they
+call `text_buf.clearRetainingCapacity()`, because a memoization nobody threads
+through is output-identical to no memoization at all.
+
+## A gate that runs before the estimator that knows better IS the estimator (#126, 2026-08-05)
+
+`ddalcu/MiniMax-H3-FL2VA-MLX-Serve-4bit` was unloadable on a 48 GB M5 Pro. Every
+`POST /v1/load-model` came back:
+
+```
+HTTP 503 {"error":{"message":"Not enough memory to load model; retry after
+current requests complete","type":"out_of_memory"}}
+```
+
+on an idle server, zero models loaded, RSS 21 MB — so the advice was
+unactionable, and nothing was logged at the point of refusal.
+
+The numbers, from the reporter:
+
+| file | bytes |
+|---|---|
+| `text_encoder.safetensors` | 15,804,791,921 |
+| `transformer.safetensors` | 18,698,813,290 |
+| `video_vae.safetensors` | 5,207,808,496 |
+| `audio_vae.safetensors` | 605,254,808 |
+| sum | 40,316,668,515 (37.55 GiB) |
+
+`ensureLoaded`'s eviction gate estimated post-load bytes from `entry.bytes_on_disk`
+regardless of backend and added 10%: **41.30 GiB**, against a
+`--max-resident-mem auto` of 80% of the 38338 MB wired limit = **30.0 GiB**.
+`planEvictionsLocked` found no victim (nothing was loaded), returned null, and
+the load became `error.NotEnoughMemory`.
+
+The correct number already existed twenty lines further down the call chain.
+`gen.h3PeakBytes` bills `max(TE, DiT) + video_vae + audio_vae` = **22.83 GiB**,
+because `minimax_h3.generate` runs the text encoder and FREES it before the DiT
+loads. The staged-residency fix had landed in the media PREFLIGHT, which runs on
+the inference thread — after the registry gate. For H3 the gate always won, so
+on any machine where `sum x 1.1 > max_resident_mem` the model was permanently
+unloadable: every 48 GB Mac at stock settings. `--skip-mem-preflight` did not
+help (it bypasses the free-RAM preflights, not the registry cap) and the app
+passes no `--max-resident-mem` at all, so there was no way out from the UI.
+
+The class is not the formula, it is that **two sites computed the same bill
+differently and the stricter one ran first**. Both now read one estimator:
+`scheduler.mediaPeakFor` (peeks the dir's real backend type — `arch_hint` when
+discovery supplied one, `gen.peekModelType` otherwise, because a media stub's
+`config.model_type` is the MODALITY static "AudioVideo") feeding
+`gateEstimateBytes`. The peek happens OUTSIDE the registry mutex: it stats the
+model dir and no other load should block on our filesystem.
+
+Two secondaries from the same report:
+
+- **The commit disagreed with the reservation.** `doLoadGenOnInferenceThread`
+  called `markReadyLocked` with `bytes_on_disk`, so after a successful load H3
+  sat in the residency budget at 37.55 GB while holding almost nothing (the
+  engine holds only paths until a generation arrives — the hermetic guard's
+  `200 OK` on four SPARSE files is that fact, reproduced). A media model parked
+  at 14.7 GB more than it can ever hold evicts genuinely-resident LLMs for bytes
+  nobody is using. `genLoadResidentBytes` reads the same estimator, so reserve
+  and commit now differ only by the gate's 10% headroom.
+- **The refusal named the wrong subsystem and logged nothing.** "retry after
+  current requests complete" points at concurrency; the cause is a static cap.
+  The message is one constant now (`server.not_enough_memory_message`, both 503
+  sites) naming `--max-resident-mem`, and the gate logs estimate / cap /
+  currently-resident / model count before returning.
+
+Guard: `tests/test_media_eviction_gate.sh`, hermetic — the "model" is four sparse
+files (`dd seek=`) carrying the real pack's byte sizes plus a `config.json`
+naming the backend. Nothing is ever read, so the load fails at engine build, and
+WHICH failure it is is the assertion: past the gate the answer is no longer the
+gate's 503. Verified red-on-revert, where it reproduces the reporter's 41.30 GiB
+exactly.
+
+## A loop cut that says only "length" reads as a limit nobody set (2026-08-05)
+
+A pi session against a collapse-prone 4-bit MoE repeated itself and then died with
+"Model stopped because it reached the maximum output token limit", while its own
+status bar read `32.4%/66k` — two thirds of the context free. The two readings
+look contradictory. They are not: **context and output are different budgets,
+and neither one is what stopped it.**
+
+End to end:
+
+1. A garbage token landed in a file the agent was writing:
+   `v(cx - 5, 6, cz + z, C.roofRedDark);!placeholder`. That is the checkpoint's
+   own logit collapse, not a server bug — correct sampling (the card's top_k)
+   and the reserved-token suppression mask are what move its rate.
+2. The model spotted its own corruption and could not repair it, restating the
+   same intent with different wording — the near-repeat shape
+   `generate.isNearRepeatTailLoop` exists for.
+3. The server cut it, five times, at 1254 / 1071 / 1079 / 102 / 58 generated
+   tokens. **The shrinking lengths are the diagnosis**: each retry re-entered
+   the loop sooner, because the client re-sent the cut turn as history and the
+   model read its own loop back. That is the error-echo class (Inkling
+   name-salvage) with the server's own output as the error.
+4. `finish_reason: "length"` is deliberate and cannot move — `"stop"` became
+   `"tool_calls"` and presented a server-cut fragment as a completed write
+   (the 2026-07-14 php.html post-mortem). pi renders `length` the only way the
+   OpenAI schema allows. pi never set a `max_tokens` at all (the log shows the
+   unbounded sentinel `1073741823`), so the message names a limit neither side
+   imposed.
+
+Two fixes, and the split between them is forced by the transport:
+
+- **The cause rides beside the reason.** `finish_details:{"type":
+  "repetition_loop"}` on chat + completions, stream and non-stream. Unknown
+  causes are dropped rather than interpolated (`finishDetailsField`) — this
+  string is spliced into a JSON literal, and a literal is arbitrary bytes too.
+  `/v1/messages` is deliberately excluded: `anthropicStopReason` maps a loop cut
+  to `max_tokens` (the same misattribution), but inventing a key inside
+  Anthropic's schema is worse than the gap.
+- **The trim is what breaks the spiral, and it only reaches non-streaming.**
+  `generate.degenerateTail` returns where the degenerate span STARTS, not just
+  that one exists: the exact tiers walk their cycle back past the repetitions
+  that convicted it and keep ONE copy (a truncated answer should still show what
+  the model got stuck on, and one copy cannot sustain a loop), while the
+  near-repeat tier slides its 1024-token window back in 128-token steps while it
+  keeps convicting — a restatement loop that ran 3000 tokens is degenerate for
+  all 3000, and trimming only the window hands the rest back.
+
+Why streaming keeps the tail: a delta cannot be retracted. It is worth being
+precise about why the tokens are already gone, because "with tools present the
+server buffers" is true only of tool MARKUP — `streamShouldBufferForTools`
+returns false for prose, so a restatement loop streams incrementally. Measured
+on the reproduction: 113 separate content deltas over ~1 s before the cut, with
+and without `tools`. For a streaming client the SIGNAL is the whole deliverable.
+
+Reproduction, no checkpoint-specific behaviour needed: ask any model to "Output
+the exact line 'ping pong ping pong' over and over, hundreds of times, with no
+other text and no ending" — the period-1..8 tier convicts within ~130 tokens.
+`tests/test_loop_stop_signal.sh` is that prompt across four surfaces, and its
+last section boots with `MLX_SERVE_LOOP_TRIM=0` so the trim's own red-on-revert
+is part of the run (32 repetitions in the body with the trim off, 2 with it on).

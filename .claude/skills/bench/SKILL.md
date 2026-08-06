@@ -1,10 +1,30 @@
 ---
 name: bench
-description: mlx-serve benchmarking methodology — bench.sh usage, comparison-trap rules (same-methodology CSVs only, spec-decode variance, thermal lies, engine naming), perf-claim etiquette. Use before running benchmarks or making any performance claim.
+description: mlx-serve benchmarking methodology — bench.sh/llmprobe usage, comparison-trap rules (same-methodology CSVs only, spec-decode variance, thermal lies, engine naming), perf-claim etiquette. Use before running benchmarks or making any performance claim.
 ---
 
 ## Benchmarking
 
-**GOTCHA — never wait on a port you don't kill (bench.sh `stop_all_engines`, fixed 2026-07-16; it made every bench ~2.2× slower).** `stop_all_engines` kills `SERVER_PORT`/`OMLX_PORT`/`MTPLX_PORT` then waits (≤30 s) for the ports to free, because pkill returns before the kernel reaps the socket. The wait list ALSO contained `LMS_PORT` — but LM Studio's server is a **persistent daemon the bench deliberately never kills** (its MODEL is freed by `lms unload --all`, not by dropping the socket). So once `--lmstudio` started that daemon, the loop could never break: it burned the full 30 s timeout **+ the unconditional `sleep 5` on EVERY `start_engine`**. Measured: `--family all --lmstudio` = 20 min of which only **4.7 min was generation** and **~11 min was this dead wait** (17 starts × ~40 s); one e4b row went **233.5 s → 55.5 s (4.2×)** when `LMS_PORT` was dropped from the wait, output identical. The full 4-engine `--family all --lmstudio --omlx --mtplx` now runs in **12.5 min** — MORE engines than the old 2-engine 20 min run. **Rule: the wait list must equal the kill list.** Symptom signature: a bench whose wall clock is dominated by fixed ~40 s stalls between cells regardless of model size (a 3 GB e4b "boot" taking 42 s), and which is FAST when the comparison engines are off. Diagnose by timestamping the run (`| python3 -u -c` line-delta filter) — the stall shows as a constant Δ per `>>` cell header, not one proportional to the model.
+**llmprobe is the measurement layer.** `tests/bench.sh` drives engines (boot, warm, kill, settle) and llmprobe takes every number: `--bench-only` per engine per model, saved as JSON, converted by `tests/bench_csv.py` into ONE CSV that both charts render from. We do not hand-roll timing loops any more — llmprobe discards a warmup per scenario, reports median-of-3 as `median (min-max)`, refuses to fabricate a number when usage is missing, records the machine, and applies the identical protocol to every engine.
 
-Run `./tests/bench.sh --family all` after major features/optimizations; CSVs go in `docs/perf-csvs/`, narrative summary in `BenchmarkLog.md`. Pass `--lmstudio`/`--omlx`/`--mtplx` to add comparison engines (the combined chart renders via `plot_vs_lmstudio_omlx.py --family all`; `--lmstudio` includes the LM Studio GGUF cell, the chart's baseline); `--concurrent N` adds a batched-throughput row per cell. Default run is mlx-serve only with one shared boot per model and CODE as the only decode cell (echo and free-form are opt-in via `--echo`/`--freeform`; 2026-07-14 speed passes: ~3× less wall time from shared boots, ~2× fewer decode cells) — fast enough for tight dev loops.
+```
+./tests/bench.sh                                   # mlx-serve only, all models (~did we regress)
+./tests/bench.sh --only qwen36-27b                 # one model row
+./tests/bench.sh --lmstudio --omlx --mtplx --full  # the release / marketing run
+```
+
+Artifacts, all from ONE run: `docs/perf-csvs/probe-<tag>.csv`, `docs/perf-pngs/perf-vs-lmstudio-omlx-all-<tag>.png` (headline bars), `docs/perf-pngs/perf-mtp-ladder-<tag>.png` (context ladder). The ladder is llmprobe's `contextScaling` block out of the same run — there is no second protocol to keep in sync.
+
+**One boot = one cell, on shipping defaults.** llmprobe measures the server that is running, so there is no spec sweep and no "best config" collapse. mlx-serve picks its own speculative mode per checkpoint; the bar is what a user gets out of the box, and llmprobe's speculative probe reports what that turned out to be (ratio + tokens/step land in the CSV as `spec_ratio` / `tok_per_step`). To A/B a flag, boot mlx-serve yourself and compare cells — a kill-switch A/B beats a cross-version absolute diff, always.
+
+### Comparison traps (these cost real days)
+
+- **Diff only against same-methodology CSVs.** `probe-*.csv` (llmprobe) and `all-*.csv` / `mtp-ladder-*.csv` (the pre-2026-08 hand-rolled bench.sh) are DIFFERENT methodologies — different prompts, different warmup, different rate math. Never diff across the two families; the old CSVs are frozen history, kept for their charts.
+- **"Reproducible ≠ not variance"** for spec-decode cells — sample across runs and boot orders before any regression claim. A cell that reads the same twice can still be variance.
+- **Attribute before believing.** Check whether the change could physically reach the cell that moved; reachability is faster to check than another bench and is what makes a repeat a confirmation.
+- **Never quote a win without naming the engine it is over** — vs LM-GGUF a row reads +33%; vs oMLX the same row is +1.6%.
+- **Thermal soak lies harder than drift** — same-session ratios only. llmprobe's own sustained-load check catches drift WITHIN a cell; bench.sh runs mlx-serve first on every row so drift that builds across a row lands on the comparison engines, not on us.
+- **An A/B arm is proven by ENGAGEMENT lines in its own log, never by its launch env.** zsh does not word-split `env $VAR`, so a multi-switch arm's first switch swallowed the rest as its value and the "composed" arm silently ran the fast path — reading a 2x win as "neutral" for half a session (live 2026-07-30, story in docs/qwentts-cache.md).
+- **A bench's port wait-list must equal its kill-list.** `stop_all_engines` waits only on ports it kills. LM Studio's server is a persistent daemon we deliberately never kill (its MODEL is freed by `lms unload --all`), so LMS_PORT in the wait list burned the full 30 s timeout on every stop — measured 11 of 20 min on a `--family all --lmstudio` run, one row 233.5 s → 55.5 s when dropped. Symptom: wall clock dominated by fixed ~40 s stalls between cells regardless of model size, and fast when comparison engines are off.
+
+The record IS the artifacts: CSVs → `docs/perf-csvs/`, charts → `docs/perf-pngs/`. `BenchmarkLog.md` is retired as a hand-maintained narrative — don't add entries.

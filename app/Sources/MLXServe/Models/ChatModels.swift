@@ -431,6 +431,14 @@ struct ModelInfo {
         return nil
     }
 
+    /// Whether this entry can answer a chat request at all. A generator
+    /// advertises only its OUTPUT modality ("image" / "video" / "audio") and an
+    /// encoder only "embeddings"; a multimodal chat model advertises "chat"
+    /// alongside its input modalities, so `slotKind` already draws this line —
+    /// including the "no capabilities at all" tolerance for pre-Phase-G servers
+    /// and loaded GGUFs.
+    var servesChat: Bool { slotKind == .chat }
+
     /// Classify a registry entry into a tray slot from its capabilities.
     /// "chat" wins first: a multimodal chat model also advertises "vision"/
     /// "audio" (input modalities), while gen engines advertise ONLY their

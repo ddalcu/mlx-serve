@@ -30,6 +30,13 @@ struct VideoGenView: View {
     /// Style LoRA (Advanced): .safetensors adapter path ("" = none).
     @State private var loraPath: String = ""
     @State private var firstFrameImageURL: URL? = nil
+    // ref2va references, kept across preset changes like firstFrameImageURL —
+    // `requestBody` gates the fields on the pack's own capability, so state
+    // left behind by a preset switch can never reach an FL2VA request.
+    @State private var refImageURLs: [URL] = []
+    @State private var refVideoURLs: [URL] = []
+    @State private var refAudioURLs: [URL] = []
+    @State private var refImageSize: RefImageSizing = .match
     // ── Speech & sound (audio-to-video) ──
     /// Where the conditioning clip comes from. `.none` → the model invents a
     /// soundtrack from the prompt; `.file`/`.speech` freeze a real clip.
@@ -119,6 +126,7 @@ struct VideoGenView: View {
                     resolutionSection
                     framesSection
                     firstFrameSection
+                    referencesSection
                     speechSection
                     if showAdvanced { advancedSection } else { advancedToggle }
                     actionRow
@@ -153,14 +161,14 @@ struct VideoGenView: View {
                 Text("Prompt").font(.subheadline.weight(.semibold))
                 Spacer()
                 Menu("Examples") {
-                    ForEach(Self.examplePrompts, id: \.title) { ex in
+                    ForEach(examplePrompts, id: \.title) { ex in
                         Button(ex.title) { prompt = ex.body }
                     }
                 }
                 .menuStyle(.borderlessButton)
                 .fixedSize()
                 .font(.caption)
-                Link(destination: URL(string: "https://docs.ltx.video/api-documentation/prompting-guide")!) {
+                Link(destination: H3PromptExamples.tipsURL(for: model.promptFormat)) {
                     Label("Prompt tips", systemImage: "arrow.up.right.square")
                         .font(.caption)
                 }
@@ -173,7 +181,7 @@ struct VideoGenView: View {
                         RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.3), lineWidth: 0.5)
                     )
                 if prompt.isEmpty {
-                    Text("Describe your shot like a cinematographer — subject, action, camera movement, lighting, setting. 4–8 sentences. Put spoken dialogue in quotes to make characters talk. Click Examples above for a starting point.")
+                    Text(H3PromptExamples.placeholder(for: model.promptFormat))
                         .font(.body)
                         .foregroundStyle(.secondary.opacity(0.6))
                         .padding(.horizontal, 5)
@@ -181,37 +189,25 @@ struct VideoGenView: View {
                         .allowsHitTesting(false)
                 }
             }
-            if let hint = promptLengthHint {
+            if let hint = promptHint {
                 Text(hint).font(.caption2).foregroundStyle(.orange)
             }
         }
     }
 
-    /// Soft warning when the prompt is too short for LTX's taste. Official
-    /// guidance is 4–8 sentences (~80–180 words); anything under ~15 words
-    /// reliably produces incoherent motion.
-    private var promptLengthHint: String? {
-        let words = prompt.split(whereSeparator: { $0.isWhitespace || $0.isNewline }).count
-        guard words > 0, words < 15 else { return nil }
-        return "LTX-Video performs best with detailed 4–8 sentence prompts. Try Examples or Prompt tips above."
+    /// Soft caption under the prompt field. Per-BACKEND: LTX's "4–8 sentences"
+    /// is advice for a different engine on an H3 model, where the thing the
+    /// user cannot guess is the section labels. Pure logic in
+    /// `H3PromptExamples` so it is testable.
+    private var promptHint: String? {
+        H3PromptExamples.hint(for: model.promptFormat, prompt: prompt)
     }
 
-    /// Canonical LTX-style example prompts seeded into the Examples menu.
-    /// Dense, cinematographer-style, covering four common shot types. The
-    /// dialogue example matters most: LTX only generates speech when the
-    /// spoken words appear in quotes (short phrases, acting directions
-    /// between them, per the official prompting guide) — without it the
-    /// soundtrack is ambient noise only.
-    private static let examplePrompts: [(title: String, body: String)] = [
-        ("Talking character (dialogue)",
-         "Medium close-up of a woman in her thirties with short auburn hair, seated at a kitchen table in warm morning light. She looks into the camera and says warmly, \"Good morning. I made coffee — it's still hot.\" She pauses, glancing toward the window, then adds with a small smile, \"Come sit with me for a minute.\" Her voice is clear and natural, speaking English. Soft room tone with a faint clink of a cup. The camera holds steady at eye level."),
-        ("Cinematic character",
-         "Medium shot of a young woman with dark curly hair and freckles, wearing a beige wool coat, walking slowly down a rain-slicked cobblestone street at dusk. She holds a folded paper map in one hand and glances up at the glowing shop windows. The camera tracks her from the side at eye level, then slowly dollies in as she stops. Warm amber light spills from the windows onto the wet stones, contrasting with the deep blue-grey sky. Light rain falls continuously, catching the light."),
-        ("Nature aerial",
-         "A wide aerial shot sweeps low over a pine forest at sunrise, mist clinging to the treetops in thick white ribbons. The camera glides forward steadily, revealing a narrow river cutting through the valley below, its surface catching the gold of the early sun. A flock of birds lifts off in a loose spiral. Lighting is soft, warm, and directional from the right. Colors are saturated emerald greens and amber golds."),
-        ("Product close-up",
-         "Close-up of hands in a sunlit kitchen kneading bread dough on a floured wooden counter. The camera holds steady at a low angle, focused tight on the rhythmic press-and-fold motion. Flour dust rises and catches in the shaft of morning light from a window on the left. The hands belong to an older man in a rolled blue shirt, skin weathered and dusted white. Warm natural backlight, muted earth tones."),
-    ]
+    /// Example prompts for the selected model's format — LTX prose, H3's
+    /// three-field base format, or H3 REF2VA's six sections.
+    private var examplePrompts: [VideoPromptExample] {
+        H3PromptExamples.examples(for: model.promptFormat)
+    }
 
     private var modelSection: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -336,17 +332,61 @@ struct VideoGenView: View {
     /// Soft hint when the chosen length looks too aggressive for the Mac's
     /// total RAM at the current resolution. Doesn't block — the user might
     /// know better (e.g. they just freed memory).
+    ///
+    /// On H3 it also says the NUMBER and the two ways out, because "may exceed
+    /// your RAM" on a job this long is a shrug: the memory is dominated by the
+    /// fast recipe's step cache, so turning Max quality ON is the low-memory
+    /// mode — backwards from every other quality toggle, and impossible to
+    /// guess.
     private var frameRAMWarning: String? {
+        let total = RAMChecker.totalGB
         let cap = RAMChecker.safeFrameCap(
             model: model,
             width: resolution.width,
             height: resolution.height,
-            available: RAMChecker.totalGB
+            available: total,
+            fast: !bestQuality
         )
-        if numFrames > cap {
-            return "May exceed your Mac's RAM (\(RAMChecker.totalGB) GB total) at this length."
+        guard model.backend == .minimaxH3 else {
+            guard numFrames > cap else { return nil }
+            return "May exceed your Mac's RAM (\(total) GB total) at this length."
         }
-        return nil
+        // Ask whether THIS configuration fits, not whether it is longer than
+        // the cap: the cap has a floor, so "cap == 124" means both "124 frames
+        // fits" and "nothing fits", and a Mac too small to load the pack saw
+        // no warning at all at exactly 124 frames.
+        guard !H3Plan.fits(model: model, width: resolution.width, height: resolution.height,
+                           frames: numFrames, fast: !bestQuality, availableGB: total) else { return nil }
+        let gib = 1024.0 * 1024.0 * 1024.0
+        let need = Double(H3Plan.peakBytes(model: model, width: resolution.width, height: resolution.height,
+                                           frames: numFrames, fast: !bestQuality)) / gib
+        var out = String(format: "Needs about %.0f GB at this size and length; your Mac has %d GB. ", need, total)
+        let floorFits = H3Plan.fits(model: model, width: resolution.width, height: resolution.height,
+                                    frames: cap, fast: !bestQuality, availableGB: total)
+        out += floorFits && cap < numFrames ? "About \(cap) frames fits here" : "Try a smaller resolution"
+        if !bestQuality {
+            let slow = Double(H3Plan.peakBytes(model: model, width: resolution.width, height: resolution.height,
+                                               frames: numFrames, fast: false)) / gib
+            if slow < need - 2 {
+                out += String(format: ", or turn on Max quality to drop the step cache (%.0f GB, but several times slower)", slow)
+            }
+        }
+        return out + "."
+    }
+
+    /// "about 50 min — estimated for M4 Max", under the Generate button.
+    ///
+    /// H3 only: it is the one backend where the options change the answer by an
+    /// order of magnitude (20 minutes to three hours on the same Mac), so
+    /// "generate and find out" is not an acceptable interface. Recomputed as
+    /// the controls move, which is the whole point — it is how you learn that
+    /// the widescreen canvas costs 2.9x, not 2x.
+    private var timeEstimate: String? {
+        guard model.backend == .minimaxH3, lanModel == nil else { return nil }
+        return H3TimeEstimate.describeBest(
+            model: model, width: resolution.width, height: resolution.height,
+            frames: numFrames, steps: steps, fast: !bestQuality
+        )
     }
 
     // Image-to-video is always available: the native mlx-serve engine supports
@@ -398,6 +438,117 @@ struct VideoGenView: View {
                 .help("Select an image to use as the first frame of the video.")
             }
         }
+    }
+
+    // ── ref2va references ──
+    // Only the REF2VA pack has the DiT for this; FL2VA would generate while
+    // ignoring every reference, so the whole section is hidden rather than
+    // offered and refused. Declared by the preset, never inferred from the id.
+    @ViewBuilder
+    private var referencesSection: some View {
+        if model.supportsReferences {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    Text("References").font(.subheadline.weight(.semibold))
+                    Spacer()
+                    Text("optional — the generation follows them")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                Text("Refer to them in the prompt as <Picture 1>, <Video 1>, <Audio 1> — the numbering is per type, in the order below.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+
+                refList(title: "Images", limit: H3RefLimits.images, urls: $refImageURLs,
+                        addLabel: "Add image...", systemImage: "photo.on.rectangle.angled") {
+                    chooseRefFiles(types: [.image, .png, .jpeg, .heic],
+                                   limit: refRemaining(perType: H3RefLimits.images, current: refImageURLs.count),
+                                   into: $refImageURLs)
+                }
+                refList(title: "Clips", limit: H3RefLimits.videos, urls: $refVideoURLs,
+                        addLabel: "Add clip...", systemImage: "film") {
+                    chooseRefFiles(types: [.movie, .mpeg4Movie, .quickTimeMovie],
+                                   limit: refRemaining(perType: H3RefLimits.videos, current: refVideoURLs.count),
+                                   into: $refVideoURLs)
+                }
+                refList(title: "Audio", limit: H3RefLimits.audios, urls: $refAudioURLs,
+                        addLabel: "Add audio...", systemImage: "waveform") {
+                    chooseRefFiles(types: [.audio, .mp3, .wav, .mpeg4Audio],
+                                   limit: refRemaining(perType: H3RefLimits.audios, current: refAudioURLs.count),
+                                   into: $refAudioURLs)
+                }
+                if let note = H3RefLimits.totalNote(attached: refFilesAttached) {
+                    Text(note).font(.caption2).foregroundStyle(.orange)
+                }
+
+                if !refImageURLs.isEmpty {
+                    Picker("Image detail", selection: $refImageSize) {
+                        ForEach(RefImageSizing.allCases, id: \.self) { s in
+                            Text(s.label).tag(s)
+                        }
+                    }
+                    .font(.caption)
+                    // Reference tokens ride through EVERY sampling step, so
+                    // this is a real time cost, not a quality knob.
+                    .help("How large each reference image is fed to the model. Maximum detail keeps identity better and is several times slower — every reference token is re-read on every sampling step.")
+                }
+            }
+        }
+    }
+
+    /// One removable reference list. Same shape for all three types so a
+    /// fourth cannot pick up different behaviour by accident.
+    @ViewBuilder
+    private func refList(title: String, limit: Int, urls: Binding<[URL]>,
+                         addLabel: String, systemImage: String,
+                         add: @escaping () -> Void) -> some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack {
+                Text(title).font(.caption.weight(.medium)).foregroundStyle(.secondary)
+                Spacer()
+                Text("\(urls.wrappedValue.count)/\(limit)")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+            ForEach(Array(urls.wrappedValue.enumerated()), id: \.element) { idx, url in
+                HStack(spacing: 8) {
+                    Text("\(idx + 1).").font(.caption2.monospacedDigit()).foregroundStyle(.secondary)
+                    Text(url.lastPathComponent)
+                        .font(.caption)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Spacer()
+                    Button {
+                        urls.wrappedValue.removeAll { $0 == url }
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                    }
+                    .buttonStyle(.borderless)
+                    .foregroundStyle(.secondary)
+                    .help("Remove this reference")
+                }
+            }
+            // Room is the tighter of this list's cap and the COMBINED 12-file
+            // budget, so a full set hides Add on an empty list too — with the
+            // note under the section saying why.
+            if refRemaining(perType: limit, current: urls.wrappedValue.count) > 0 {
+                Button(action: add) {
+                    Label(addLabel, systemImage: systemImage)
+                        .font(.caption)
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+            }
+        }
+    }
+
+    /// Files attached across all three reference lists.
+    private var refFilesAttached: Int {
+        refImageURLs.count + refVideoURLs.count + refAudioURLs.count
+    }
+
+    private func refRemaining(perType: Int, current: Int) -> Int {
+        H3RefLimits.remaining(perType: perType, current: current, totalAttached: refFilesAttached)
     }
 
     // ── Speech & sound (audio-to-video) ──
@@ -634,9 +785,13 @@ struct VideoGenView: View {
                 .foregroundStyle(.secondary)
             }
             // Steps — more steps = more detail/smoother motion, but slower.
-            intSliderRow("Steps", value: $steps, range: 4...50,
-                         help: "Denoising steps. More = more detail and smoother motion, but slower. LTX runs well from ~8 (fast) to ~30 (reference quality).")
-            Text("More steps refine the video further at the cost of speed. ~8 is fast, ~30 is the reference default.")
+            // The range and the copy are the PRESET's: the old ones were LTX's
+            // ("runs well from ~8"), shown verbatim on a backend where 8 steps
+            // is below anything we have a verdict on and the fast recipe's
+            // warmup/tail windows cover the whole schedule.
+            intSliderRow("Steps", value: $steps, range: model.stepsRange,
+                         help: "Denoising steps. More = more detail and smoother motion, but slower.")
+            Text(model.stepsHelp)
                 .font(.caption2).foregroundStyle(.secondary)
 
             // CFG is honored in every LTX pipeline mode, but a CFG-DISTILLED
@@ -650,7 +805,8 @@ struct VideoGenView: View {
             }
 
             HStack {
-                numberField("Seed", value: $seed, step: 1)
+                SeedField(label: "Seed", placeholder: "42", range: 0...Int.max, value: $seed,
+                          help: "Same seed + same settings reproduces the clip. Paste one to rerun someone else's.")
                 Spacer()
             }
             if model.supportsFastRecipe {
@@ -752,6 +908,30 @@ struct VideoGenView: View {
         }
     }
 
+    /// Append picked files to a reference list, never past its cap — the
+    /// server rejects an over-cap set by name, and a picker that lets you build
+    /// one only to fail at generate time is a worse version of the same 400.
+    /// `room` is how many more files may be added — the tighter of this list's
+    /// own cap and what is left of the combined 12-file budget, not the list's
+    /// absolute limit. A multi-select that overshoots is truncated here rather
+    /// than earning a 400 at generate time.
+    private func chooseRefFiles(types: [UTType], limit room: Int, into urls: Binding<[URL]>) {
+        guard room > 0 else { return }
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = types
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = true
+        guard AppActivation.runModal(panel) == .OK else { return }
+        var added = 0
+        for url in panel.urls where added < room {
+            if !urls.wrappedValue.contains(url) {
+                urls.wrappedValue.append(url)
+                added += 1
+            }
+        }
+    }
+
     private func chooseFirstFrameImage() {
         let panel = NSOpenPanel()
         panel.allowedContentTypes = [.image, .png, .jpeg, .heic]
@@ -760,15 +940,6 @@ struct VideoGenView: View {
         panel.allowsMultipleSelection = false
         if AppActivation.runModal(panel) == .OK, let url = panel.url {
             firstFrameImageURL = url
-        }
-    }
-
-    private func numberField(_ label: String, value: Binding<Int>, step: Int) -> some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text(label).font(.caption)
-            Stepper(value: value, step: step) {
-                Text(String(value.wrappedValue))
-            }
         }
     }
 
@@ -835,6 +1006,12 @@ struct VideoGenView: View {
                     .keyboardShortcut(.return, modifiers: [.command])
                     .disabled(prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || (lanModel == nil && !downloads.bundleReady(model.bundle)))
                 }
+            }
+            if !service.isRunning, let est = timeEstimate {
+                Text(est)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .help("Estimated from measured runs and this Mac's GPU. Actual time varies with what else is using the GPU.")
             }
         }
     }
@@ -922,7 +1099,7 @@ struct VideoGenView: View {
         mode = s.mode
         // Clamp into the slider ranges — a value persisted by the old wider
         // steppers (Steps unbounded, CFG 0…20) would otherwise sit off-scale.
-        steps = min(50, max(4, s.steps))
+        steps = min(model.stepsRange.upperBound, max(model.stepsRange.lowerBound, s.steps))
         cfgScale = min(10, max(1, s.cfgScale))
         stgScale = s.stgScale
         seed = s.seed
@@ -976,7 +1153,9 @@ struct VideoGenView: View {
     private func applyQualityDefaults() {
         let s = model.settings(quality)
         mode = s.mode
-        steps = s.steps
+        // Clamp into the backend's range: a preset switch carrying a value the
+        // new model's slider cannot show leaves the control off-scale.
+        steps = min(model.stepsRange.upperBound, max(model.stepsRange.lowerBound, s.steps))
         cfgScale = s.cfgScale
         stgScale = s.stgScale
         numFrames = s.numFrames
@@ -1025,7 +1204,14 @@ struct VideoGenView: View {
             keepResident: keepResident,
             bestQuality: bestQuality,
             lanModelId: lanModel,
-            loraPath: loraPath.isEmpty ? nil : loraPath
+            loraPath: loraPath.isEmpty ? nil : loraPath,
+            // Belt-and-braces with the requestBody gate, same as `audioPath`
+            // above: reference files must never reach the reader (whose
+            // failure is a hard error) on a pack that cannot use them.
+            refImagePaths: model.supportsReferences ? refImageURLs.map(\.path) : [],
+            refVideoPaths: model.supportsReferences ? refVideoURLs.map(\.path) : [],
+            refAudioPaths: model.supportsReferences ? refAudioURLs.map(\.path) : [],
+            refImageSize: refImageSize
         )
         persist()
 

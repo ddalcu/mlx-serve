@@ -418,3 +418,52 @@ This is a stopgap for the symptom. The real fix — an incremental parser that
 emits diffs and holds back only the minimal ambiguous suffix, which is what
 vLLM's `extract_tool_calls_streaming` and llama.cpp's `common/chat.cpp` partial
 parse do — is in TODO.md.
+
+---
+
+## A `</think>` inside a tool ARGUMENT destroyed the whole call (2026-08-05)
+
+Found by WRITING a corpus family, not by a live failure — which is the point of
+having one.
+
+Writing a `format_corpus_test.zig` family for a GLM-tag arch, one entry gave a tool call a
+realistic argument value: a model writing a file about its own prompt format.
+
+```
+<tool_call>write
+<arg_key>content</arg_key>
+<arg_value>The model closes a thought with </think> and "quotes" it.</arg_value>
+</tool_call>
+```
+
+Expected a parsed call; got `expected a tool call, got none`, with the raw text
+falling through as content.
+
+The parse chain works on POST-think text, and `chat.indexOfThinkCloseTag` is
+the single scan every surface uses to find the block boundary — split, strip,
+and the streaming gate. It takes the FIRST syntactically valid `</think>`
+anywhere in the text, with no reference to what encloses it. So the split cut
+through the middle of the call: everything before the close became reasoning
+(or was dropped, thinking-off), and the fragments after it leaked as content.
+The call was simply gone.
+
+This is general to every `<think>` family — qwen, laguna, dsv4 — and the
+traffic that hits it is ordinary: coding agents write files about prompts.
+
+Fix (`chat.thinkCloseIsToolCallPayload`): a close is payload iff the nearest
+preceding `<tool_call`-family opener is still OPEN at that point (no
+`</tool_call` between them) AND the block does close afterwards. Both halves
+are load-bearing and each protects a case the other breaks:
+
+- **Without the first**, a call the model emitted and CLOSED inside its thought
+  (`<think>let me try <tool_call>read</tool_call> hmm</think>The answer is 4.`)
+  would make the real `</think>` after it look like payload, and the answer
+  would vanish into reasoning.
+- **Without the second**, an unclosed opener inside a thought — the documented
+  leaked-markup case that `trimLeakedToolMarkup` handles downstream —
+  (`<think>starting <tool_call>partial</think>Answer.`) would swallow the answer
+  that follows the close.
+
+Only the `<tool_call` family is considered: it is the one whose bodies carry
+free-form argument text. Ordinary shapes (`<think>r</think>a`, and a think
+block followed by a real call) are untouched, pinned in the unit test.

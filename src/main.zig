@@ -259,6 +259,10 @@ fn printUsage(io: std.Io) void {
         \\                        Discovered siblings appear in /v1/models and
         \\                        can be loaded on-demand via /v1/load-model
         \\                        (or by sending a request with model=<id>).
+        \\                        REPEATABLE (up to 8) — pass it once per folder
+        \\                        your models live in. Scanned in order; the
+        \\                        first folder wins a repeated model id, and a
+        \\                        folder that can't be opened is skipped.
         \\  --max-resident-models <n>
         \\                      Maximum loaded models in memory (default: 3).
         \\                        ensureLoaded evicts LRU before exceeding.
@@ -391,6 +395,11 @@ pub fn main(init: std.process.Init) !void {
 
     var model_dir: []const u8 = DEFAULT_MODEL_DIR;
     var models_root: ?[]const u8 = null; // --model-dir for plan 05 discovery
+    // Additional `--model-dir` folders, scanned after the first. Fixed-size:
+    // a handful of library folders is the shape this serves, and a bound the
+    // parser enforces beats an allocation the arg loop has to unwind.
+    var extra_roots: [7][]const u8 = undefined;
+    var extra_roots_n: usize = 0;
     var port: u16 = 11234;
     var host: []const u8 = "0.0.0.0";
     // `--log-file <path|off>`. null = default (`~/.mlx-serve/logs/mlx-serve-<port>.log`).
@@ -674,8 +683,22 @@ pub fn main(init: std.process.Init) !void {
             i += 1;
             server_mod.max_concurrent = std.fmt.parseInt(u32, args[i], 10) catch 1;
         } else if (std.mem.eql(u8, args[i], "--model-dir") and i + 1 < args.len) {
+            // REPEATABLE. A user's library can live in more than one place (the
+            // app's download folder, an external drive, an LM Studio tree), and
+            // with one root the others are invisible to /v1/models even though
+            // the picker lists them. Extras past the cap are refused loudly —
+            // silently dropping a folder the user asked us to scan is the
+            // silent-flag-eater class.
             i += 1;
-            models_root = args[i];
+            if (models_root == null) {
+                models_root = args[i];
+            } else if (extra_roots_n < extra_roots.len) {
+                extra_roots[extra_roots_n] = args[i];
+                extra_roots_n += 1;
+            } else {
+                log.err("--model-dir: at most {d} folders (got one more: {s})\n", .{ extra_roots.len + 1, args[i] });
+                std.process.exit(1);
+            }
         } else if (std.mem.eql(u8, args[i], "--max-resident-models") and i + 1 < args.len) {
             // Plan 05 Phase D: cap on .ready entries in the registry.
             // ensureLoaded evicts LRU before loading when this would be exceeded.
@@ -823,12 +846,23 @@ pub fn main(init: std.process.Init) !void {
     var discovery_storage: ?model_discovery.DiscoveryResult = null;
     defer if (discovery_storage) |*d| d.deinit();
     if (models_root) |root| {
-        discovery_storage = model_discovery.discoverModels(io, allocator, root) catch |err| blk: {
-            log.warn("--model-dir scan failed ({s}): {s}\n", .{ root, @errorName(err) });
+        // Every `--model-dir`, first-wins on a repeated id (see
+        // `discoverModelsMany` for why de-dup is not optional here).
+        var roots_buf: [8][]const u8 = undefined;
+        roots_buf[0] = root;
+        for (extra_roots[0..extra_roots_n], 0..) |r, n| roots_buf[n + 1] = r;
+        const roots = roots_buf[0 .. 1 + extra_roots_n];
+        discovery_storage = model_discovery.discoverModelsMany(io, allocator, roots) catch |err| blk: {
+            log.warn("--model-dir scan failed: {s}\n", .{@errorName(err)});
             break :blk null;
         };
         if (discovery_storage) |*d| {
-            log.info("Discovered {d} model(s) under {s}:\n", .{ d.models.len, root });
+            if (roots.len == 1) {
+                log.info("Discovered {d} model(s) under {s}:\n", .{ d.models.len, root });
+            } else {
+                log.info("Discovered {d} model(s) under {d} folders:\n", .{ d.models.len, roots.len });
+                for (roots) |r| log.info("  (scanning {s})\n", .{r});
+            }
             for (d.models) |m| {
                 if (m.bytes_on_disk) |b| {
                     log.info("  - {s} ({d:.1} GB)\n", .{ m.id, @as(f64, @floatFromInt(b)) / 1_073_741_824.0 });
@@ -1220,6 +1254,9 @@ pub fn main(init: std.process.Init) !void {
 
         var xfm = try transformer_mod.Transformer.init(io, allocator, config.*, &weights);
         defer xfm.deinit();
+
+        // Reserved-token suppression, same derivation as the serve path.
+        generate_mod.installSuppressMask(&xfm, tok, chat_config.chat_template, config.eosTokenSlice());
 
         // Honor --kv-quant in offline mode too. The serve path threads this
         // through Slot caches via the scheduler; here we swap the

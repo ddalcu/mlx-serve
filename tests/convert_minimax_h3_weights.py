@@ -30,12 +30,24 @@ distilled model's conditioning path is the MageFlow precision class.
 Memory: source tensors are read LAZILY one at a time, so the 62 GB DiT never
 lands in RAM; peak is roughly the size of the output being accumulated.
 
+MiniMax ships TWO checkpoints — FL2VA (first/last-frame conditioning) and
+REF2VA (reference images / videos / audio). They share this layout and differ
+only in the DiT file and what `config.json` declares, so `--partition` selects
+which one is being built; nothing downstream branches on the file NAME.
+
 Usage:
     uv run --with mlx --with safetensors --with numpy \
         tests/convert_minimax_h3_weights.py \
         --src ~/claude-tmp/h3-build/src \
         --tokenizer ~/claude-tmp/h3-build/src_orig/FL2VA/processor \
         --out ~/.mlx-serve/models/ddalcu/MiniMax-H3-FL2VA-MLX-Serve-8bit
+
+    # the reference-conditioning checkpoint
+    uv run --with mlx --with safetensors --with numpy \
+        tests/convert_minimax_h3_weights.py --partition ref2va \
+        --src ~/claude-tmp/h3-build/src \
+        --tokenizer ~/claude-tmp/h3-build/src_orig/REF2VA/processor \
+        --out ~/.mlx-serve/models/ddalcu/MiniMax-H3-REF2VA-MLX-Serve-8bit
 """
 
 import argparse
@@ -133,7 +145,7 @@ def convert_file(src_path, dst_path, label):
         # carry a prominent notice that they were modified. The sidecar
         # MODIFICATIONS.md is the human-readable copy; this travels INSIDE the
         # file, so it survives being moved out of the directory.
-        "modified_from": "MiniMaxAI/MiniMax-H3 (FL2VA)",
+        "modified_from": PARTITIONS[CONFIG["partition"]]["upstream"],
         "modified_by": "mlx-serve tests/convert_minimax_h3_weights.py",
         "modification": f"quantized to MLX affine {BITS}-bit group size {GROUP_SIZE}",
         "license": "MiniMax H3 Community License Agreement",
@@ -143,6 +155,27 @@ def convert_file(src_path, dst_path, label):
           f"in {time.time()-t0:.0f}s", flush=True)
     return total
 
+
+# Per-partition facts. The DiT filename and the declared task list are the ONLY
+# things that differ; the text encoder, both VAEs and every geometry number are
+# shared, which is why one converter builds both.
+PARTITIONS = {
+    "fl2va": {
+        "dit_file": "minimax_h3_fl2va_bf16.safetensors",
+        "tasks": ["t2va", "fl2va"],
+        "upstream": "MiniMaxAI/MiniMax-H3 (FL2VA)",
+        "title": "MiniMax-H3 FL2VA",
+        "blurb": "Text-to-audio-video with optional first/last-frame conditioning.",
+    },
+    "ref2va": {
+        "dit_file": "minimax_h3_ref2va_bf16.safetensors",
+        "tasks": ["t2va", "ref2va"],
+        "upstream": "MiniMaxAI/MiniMax-H3 (REF2VA)",
+        "title": "MiniMax-H3 REF2VA",
+        "blurb": ("Text-to-audio-video conditioned on reference images, videos "
+                  "and audio, for character / style / scene continuity."),
+    },
+}
 
 CONFIG = {
     "model_type": "minimax_h3",
@@ -173,8 +206,9 @@ NOTICE = (
 # same statement goes into each safetensors file's own metadata.
 MODIFICATIONS = """# Modifications to MiniMax H3
 
-These files are MODIFIED versions of the MiniMax H3 Works, redistributed under
-the MiniMax H3 Community License Agreement (see LICENSE and NOTICE).
+These files are MODIFIED versions of the MiniMax H3 Works ({upstream}),
+redistributed under the MiniMax H3 Community License Agreement (see LICENSE and
+NOTICE).
 
 Modified by: mlx-serve (https://github.com/ddalcu/mlx-serve)
 
@@ -210,12 +244,13 @@ tags:
 - audio-video-generation
 ---
 
-# MiniMax-H3 FL2VA — MLX-Serve {bits}-bit
+# {title} — MLX-Serve {bits}-bit
 
-{bits}-bit affine (group size 64) conversion of MiniMax-H3's FL2VA checkpoint for
+{bits}-bit affine (group size 64) conversion of {upstream} for
 [mlx-serve](https://github.com/ddalcu/mlx-serve), running natively on Apple
-Silicon. Text-to-audio-video: the DiT denoises video and stereo audio jointly
-in one packed sequence.
+Silicon. The DiT denoises video and stereo audio jointly in one packed sequence.
+
+{blurb}
 
 Self-contained: weights, both VAEs and the tokenizer in one directory. Upstream
 splits these across `Comfy-Org/MiniMax-H3` (weights, no tokenizer) and
@@ -249,6 +284,8 @@ your jurisdiction permits you to use these files before downloading them.
 
 def main():
     ap = argparse.ArgumentParser()
+    ap.add_argument("--partition", default="fl2va", choices=tuple(PARTITIONS),
+                    help="which MiniMax checkpoint is being converted (default fl2va)")
     ap.add_argument("--bits", type=int, default=8, choices=(4, 8),
                     help="affine bits for every quantized linear (default 8)")
     ap.add_argument("--cpu", action="store_true",
@@ -262,6 +299,9 @@ def main():
     global BITS
     BITS = args.bits
     CONFIG["quantization"]["bits"] = BITS
+    part = PARTITIONS[args.partition]
+    CONFIG["partition"] = args.partition
+    CONFIG["tasks"] = part["tasks"]
     if args.cpu:
         mx.set_default_device(mx.cpu)
 
@@ -270,19 +310,22 @@ def main():
     os.makedirs(out, exist_ok=True)
 
     jobs = [
-        ("transformer", f"{src}/diffusion_models/minimax_h3_fl2va_bf16.safetensors",
+        ("transformer", f"{src}/diffusion_models/{part['dit_file']}",
          f"{out}/transformer.safetensors"),
         ("text_encoder", f"{src}/text_encoders/qwen3vl_32b_minimax_h3_bf16.safetensors",
          f"{out}/text_encoder.safetensors"),
     ]
     total = 0.0
     for label, s, d in jobs:
-        if not os.path.exists(s):
-            raise SystemExit(f"missing source: {s}")
+        # Destination first: the fetch driver DELETES each source once it has
+        # been converted, so demanding a source for an output that already
+        # exists makes every resumed run fail on the work it already finished.
         if args.skip_existing and os.path.exists(d):
             print(f"[{label}] exists, skipping", flush=True)
             total += os.path.getsize(d) / 1e9
             continue
+        if not os.path.exists(s):
+            raise SystemExit(f"missing source: {s}")
         print(f"[{label}] {s} -> {d}", flush=True)
         total += convert_file(s, d, label)
 
@@ -319,12 +362,18 @@ def main():
     shutil.copyfile(lic_src, os.path.join(out, "LICENSE"))
     with open(os.path.join(out, "NOTICE"), "w") as f:
         f.write(NOTICE)
+    def fill(t):
+        return (t.replace("{bits}", str(BITS))
+                 .replace("{upstream}", part["upstream"])
+                 .replace("{title}", part["title"])
+                 .replace("{blurb}", part["blurb"]))
+
     with open(os.path.join(out, "MODIFICATIONS.md"), "w") as f:
-        f.write(MODIFICATIONS.replace("{bits}", str(BITS)))
+        f.write(fill(MODIFICATIONS))
     with open(os.path.join(out, "config.json"), "w") as f:
         json.dump(CONFIG, f, indent=2)
     with open(os.path.join(out, "README.md"), "w") as f:
-        f.write(README.replace("{bits}", str(BITS)))
+        f.write(fill(README))
 
     print(f"\nDONE -> {out}  ({total:.1f} GB)", flush=True)
     return 0

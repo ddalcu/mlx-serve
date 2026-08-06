@@ -21,13 +21,29 @@ class ServerManager: ObservableObject {
     /// The model id chat requests should carry: the LAN selection when set,
     /// else the local default. Every chat surface reads THIS, never
     /// `modelInfo?.name` directly, so a LAN selection applies everywhere.
-    var chatModelId: String? { lanChatModelId ?? modelInfo?.name }
+    var chatModelId: String? { lanChatModelId ?? residentChatModel?.name }
     /// Metadata for the chat model (context length, vision, architecture):
     /// the LAN entry when one is selected and discovered, else the local
-    /// default's info.
+    /// model that can actually hold a conversation.
     var chatModelInfo: ModelInfo? {
         if let lan = lanChatModelId, let info = allModels.first(where: { $0.name == lan }) { return info }
-        return modelInfo
+        return residentChatModel
+    }
+    /// The local entry that can ANSWER a chat request.
+    ///
+    /// Media generators share this registry — the image/video/audio panes load
+    /// one through `prepareGenModel`, and the server sorts its default first,
+    /// so `modelInfo` (= `allModels.first`) is regularly a model that would
+    /// 400 a chat turn. Before this the chat pill named it and dotted it green
+    /// while every surface reading `chatModelId` addressed the turn to it; the
+    /// picker's LIST was already chat-only, the resolution under it was not.
+    ///
+    /// Nothing chat-capable resident ⇒ nil, never a stand-in: an unloaded stub
+    /// is a model you could load, and the pill's dot keys on nil to stay amber
+    /// rather than claim ready.
+    private var residentChatModel: ModelInfo? {
+        if let m = modelInfo, m.servesChat { return m }
+        return allModels.first { $0.servesChat && $0.loaded && $0.lanPeer == nil }
     }
     /// Discovered LAN models advertising `capability` ("chat", "image",
     /// "video", "music", "audio", "3d"). Empty when the server is down or
@@ -120,8 +136,7 @@ class ServerManager: ObservableObject {
         // (`<root>/<org>/<model>`); the selected model still loads via `--model`
         // and dedups against its discovered entry by path. (Was: the selected
         // model's parent dir, which scoped discovery to one org.)
-        let modelDir = Self.discoveryModelDir(selectedModel: resolvedModel, modelsRoot: Self.modelsRoot)
-        args += options.toCLIArgs(modelDirOverride: modelDir.isEmpty ? nil : modelDir)
+        args += options.toCLIArgs(modelDirs: Self.launchModelDirs(selectedModel: resolvedModel))
         launch(args: args, options: options)
     }
 
@@ -166,7 +181,12 @@ class ServerManager: ObservableObject {
     func startHeadless(modelsDir: String, options: ServerOptions) {
         guard status != .running, status != .starting else { return }
         currentModelPath = ""
-        let args = options.toCLIArgs(modelDirOverride: modelsDir.isEmpty ? nil : modelsDir)
+        // `modelsDir` is the caller's primary root; the rest of the library's
+        // folders ride along so a headless boot discovers everything the picker
+        // shows, not just one folder (`launchModelDirs` de-dups).
+        var dirs = ModelRoots().scanRoots(lmStudioRoot: DownloadManager.lmStudioRootPath())
+        if !modelsDir.isEmpty, !dirs.contains(modelsDir) { dirs.insert(modelsDir, at: 0) }
+        let args = options.toCLIArgs(modelDirs: Array(dirs.prefix(ModelRoots.serverRootLimit)))
         launch(args: args, options: options)
     }
 
@@ -629,8 +649,7 @@ class ServerManager: ObservableObject {
         _ = dir
         if status == .running { return port }
         if status != .starting {
-            let modelsRoot = NSString(string: "~/.mlx-serve/models").expandingTildeInPath
-            startHeadless(modelsDir: modelsRoot, options: lastLaunchedOptions ?? ServerOptions())
+            startHeadless(modelsDir: Self.modelsRoot, options: lastLaunchedOptions ?? ServerOptions())
         }
         try await waitUntilRunning(timeout: 240)
         return port
@@ -654,21 +673,35 @@ class ServerManager: ObservableObject {
 
     /// The canonical download store — the SINGLE source of truth for models the
     /// app manages. `--model-dir` points here so discovery sees everything.
-    nonisolated static let modelsRoot = NSString(string: "~/.mlx-serve/models").expandingTildeInPath
+    /// Where the app's own downloads live. Reads the configured destination
+    /// (`ModelRoots`) rather than hardcoding the path a second time — this was
+    /// a private copy of `DownloadManager`'s string, and two copies of a path
+    /// the user can now change is one that gets missed.
+    nonisolated static var modelsRoot: String { ModelRoots().downloadRoot }
 
-    /// The `--model-dir` to launch with so the registry discovers the user's
-    /// whole library (making `/v1/models` match the model dropdown), not just
-    /// the selected model's org folder. When the selected model lives under the
-    /// models root, scan the WHOLE root (`<root>/<org>/<model>` two-level
-    /// discovery). When it lives OUTSIDE (LM Studio / a custom folder the app
-    /// can point at), fall back to its parent so at least its siblings surface —
-    /// the server takes a single `--model-dir`, so the mlx-serve root is the
-    /// right default for everything the app itself downloaded. Pure + testable.
-    nonisolated static func discoveryModelDir(selectedModel: String, modelsRoot: String) -> String {
+    /// Every `--model-dir` a launch should carry: all configured library
+    /// folders, plus the selected model's own parent when it lives outside all
+    /// of them.
+    ///
+    /// That last clause is what `discoveryModelDir` used to do ALONE, and it
+    /// was an either/or: pointing the server at an outside model's parent meant
+    /// the whole `~/.mlx-serve/models` library stopped being discovered, and
+    /// pointing it at the library meant an outside model never reached
+    /// `/v1/models` at all. `--model-dir` is repeatable now, so it is both.
+    nonisolated static func launchModelDirs(selectedModel: String,
+                                            roots: [String]? = nil) -> [String] {
+        var dirs = roots ?? ModelRoots().scanRoots(lmStudioRoot: DownloadManager.lmStudioRootPath())
         let model = (selectedModel as NSString).standardizingPath
-        let root = (modelsRoot as NSString).standardizingPath
-        if model == root || model.hasPrefix(root + "/") { return modelsRoot }
-        return (selectedModel as NSString).deletingLastPathComponent
+        guard !model.isEmpty else { return dirs }
+        let covered = dirs.contains { root in
+            let r = (root as NSString).standardizingPath
+            return model == r || model.hasPrefix(r + "/")
+        }
+        if !covered, dirs.count < ModelRoots.serverRootLimit {
+            let parent = (selectedModel as NSString).deletingLastPathComponent
+            if !parent.isEmpty, !dirs.contains(parent) { dirs.append(parent) }
+        }
+        return dirs
     }
 
     /// Resolve a HuggingFace repo id to its local model directory under

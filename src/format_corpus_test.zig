@@ -966,6 +966,129 @@ const corpus = [_]Expect{
         .tool_arg_value = "novel.txt",
         .tool_arg_absent = "content",
     },
+    // ── Bare-opener GLM tag family (`<tool_call>NAME<arg_key>…` pairs) ──────
+    // Its template renders the BARE-opener arg_key/arg_value shape (the same
+    // sub-format Laguna's GLM parser arm reads), with a newline after the NAME
+    // and after each `</arg_key>` — no plural wrapper, no `<tool_sep>`, no
+    // suffixes. Thinking is `<think>…</think>` and, unlike Qwen, the MODEL
+    // emits the opener (`<role>ASSISTANT</role>\n` ends the prompt), so
+    // opened_by_template is false throughout.
+    .{
+        .family = "glm-bare",
+        .name = "bare opener, newline-separated arg pairs, string→bool coercion",
+        .raw = "<tool_call>get_weather\n" ++
+            "<arg_key>city</arg_key>\n" ++
+            "<arg_value>Tokyo</arg_value>\n" ++
+            "<arg_key>celsius</arg_key>\n" ++
+            "<arg_value>true</arg_value>\n" ++
+            "</tool_call>",
+        .tools_json = weather_tool_schema,
+        .tool_name = "get_weather",
+        .tool_arg_key = "city",
+        .tool_arg_value = "Tokyo",
+        .tool_bool_key = "celsius",
+        .tool_bool_value = true,
+    },
+    .{
+        // Thinking-on renders `<role>ASSISTANT</role>\n<think>`, so the opener
+        // is in the PROMPT and the output starts inside the block.
+        .family = "glm-bare",
+        .name = "template-opened thought then a call: the thought never rides out as content",
+        .raw = "The user wants Tokyo's weather. I'll call the tool.</think>\n" ++
+            "<tool_call>get_weather\n" ++
+            "<arg_key>city</arg_key>\n" ++
+            "<arg_value>Tokyo</arg_value>\n" ++
+            "</tool_call>",
+        .thinking = true,
+        .opened_by_template = true,
+        .tools_json = weather_tool_schema,
+        .reasoning_contains = "wants Tokyo's weather",
+        .tool_name = "get_weather",
+        .tool_arg_key = "city",
+        .tool_arg_value = "Tokyo",
+    },
+    .{
+        // Truncated inside the template-opened thought: nothing visible, and
+        // the partial reasoning is never filed as the answer.
+        .family = "glm-bare",
+        .name = "template-opened truncated thinking stays out of content",
+        .raw = "Let me work out 17 x 24 step by step. 17 x 20 = 340, and",
+        .thinking = true,
+        .opened_by_template = true,
+        .content_exact = "",
+        .reasoning_contains = "step by step",
+    },
+    .{
+        // Thinking OFF renders the closed `<think></think>` signature, so the
+        // output is plain prose with no markup at all.
+        .family = "glm-bare",
+        .name = "thinking off answers directly, nothing filed as reasoning",
+        .raw = "17 x 24 = **408**.",
+        .content_contains = "408",
+    },
+    .{
+        .family = "glm-bare",
+        .name = "back-to-back calls with no wrapper each keep their own args",
+        .raw = "<tool_call>read\n<arg_key>path</arg_key>\n<arg_value>a.txt</arg_value>\n</tool_call>\n" ++
+            "<tool_call>read\n<arg_key>path</arg_key>\n<arg_value>b.txt</arg_value>\n</tool_call>",
+        .tools_json = write_read_tools_schema,
+        .tool_count = 2,
+        .tool_name = "read",
+        .tool_arg_key = "path",
+        .tool_arg_value = "a.txt",
+        .last_tool_arg_value = "b.txt",
+    },
+    .{
+        // Truncation class at this shape: max_tokens landed inside the last
+        // value. The closed pair survives, the fragment is dropped.
+        .family = "glm-bare",
+        .name = "truncated mid-arg_value recovers name + closed args, drops the fragment",
+        .raw = "<tool_call>write\n" ++
+            "<arg_key>path</arg_key>\n" ++
+            "<arg_value>novel.txt</arg_value>\n" ++
+            "<arg_key>content</arg_key>\n" ++
+            "<arg_value>Chapter 1. It was a dark and stormy night and the",
+        .tools_json = write_read_tools_schema,
+        .tool_name = "write",
+        .tool_arg_key = "path",
+        .tool_arg_value = "novel.txt",
+        .tool_arg_absent = "content",
+    },
+    .{
+        // A value carrying the OTHER family's markup: `</think>` inside an
+        // argument must survive verbatim into the JSON, not re-trigger the
+        // think splitter or leak a tag.
+        .family = "glm-bare",
+        .name = "markup-bearing argument value round-trips into valid JSON args",
+        .raw = "<tool_call>write\n" ++
+            "<arg_key>path</arg_key>\n" ++
+            "<arg_value>notes.md</arg_value>\n" ++
+            "<arg_key>content</arg_key>\n" ++
+            "<arg_value>The model closes a thought with </think> and \"quotes\" it.</arg_value>\n" ++
+            "</tool_call>",
+        .tools_json = write_read_tools_schema,
+        .tool_name = "write",
+        .tool_arg_key = "path",
+        .tool_arg_value = "notes.md",
+    },
+    .{
+        .family = "glm-bare",
+        .name = "prose about the format is not a tool call",
+        .raw = "The model emits each argument as an arg_key/arg_value pair inside the call block.",
+        .tools_json = write_read_tools_schema,
+        .no_tool_calls = true,
+        .content_contains = "arg_key/arg_value pair",
+    },
+    .{
+        // Prompt-side control tags. `<role>HUMAN</role>` / `<|role_end|>` are
+        // the template's own turn markers; a model that echoes one must not
+        // ship it as visible content (the universal no-tag-leak invariant is
+        // what enforces it — this entry is the family's exposure to it).
+        .family = "glm-bare",
+        .name = "answer with a trailing role marker leaks no tag",
+        .raw = "17 x 24 = **408**.<|role_end|>",
+        .content_contains = "408",
+    },
     .{
         // Prose mentioning the format's pieces (without an actual opener tag —
         // the control tags are special tokens a real generation can't casually
@@ -1110,7 +1233,6 @@ const corpus = [_]Expect{
         .no_tool_calls = true,
         .content_contains = "arg_key/arg_value pair",
     },
-
     // ── Inkling (inkling_mm_model, Thinking Machines Inkling Small) ────────
     // The model emits role-less MESSAGES, each `<|channel marker|>…<|end_message|>`;
     // thinking, text and tool-invoke are separate messages. Captured live from

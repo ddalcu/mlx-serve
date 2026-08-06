@@ -434,6 +434,18 @@ pub const HotPrefixCache = struct {
         has_tools: bool,
         ssm_cps: ?[]SSMCheckpoint,
     ) !void {
+        return self.commitWithState(source_cache, tokens, has_tools, ssm_cps);
+    }
+
+    /// Commit with SSM checkpoints; ownership of the payload transfers to
+    /// the entry.
+    pub fn commitWithState(
+        self: *HotPrefixCache,
+        source_cache: *const KVCache,
+        tokens: []const u32,
+        has_tools: bool,
+        ssm_cps: ?[]SSMCheckpoint,
+    ) !void {
         const quant_config = source_cache.config;
 
         var replace_idx: ?usize = null;
@@ -533,7 +545,7 @@ pub const HotPrefixCache = struct {
             };
 
             // Free everything the old entry owned EXCEPT the (now-detached)
-            // ssm_checkpoints, which were moved into `merged_cps` above.
+            // ssm_checkpoints, which were moved above.
             self.allocator.free(e.tokens);
             e.snapshot.deinit();
             self.current_kv_bytes -|= e.kv_bytes;
@@ -543,7 +555,6 @@ pub const HotPrefixCache = struct {
             if (merged_cps) |cps| {
                 for (cps) |*cp| merged_ssm_bytes += ssmCheckpointBytes(cp);
             }
-
             e.tokens = tokens_owned;
             e.snapshot = new_snap;
             e.has_tools = has_tools;

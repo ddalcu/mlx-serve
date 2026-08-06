@@ -327,7 +327,7 @@ struct MLXCoreApp: App {
                     Button("Launch Claude Code…") {
                         launchClaudeCodeWithPicker(
                             baseURL: appState.server.baseURL,
-                            serverContextLength: appState.server.modelInfo?.contextLength)
+                            serverContextLength: appState.server.chatModelInfo?.contextLength)
                     }
                 }
 

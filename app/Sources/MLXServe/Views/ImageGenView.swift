@@ -397,7 +397,11 @@ struct ImageGenView: View {
             // is fixed — it's the Advanced panel, and the hint says the cost.
             HStack {
                 numberField("Steps", value: $steps, step: 1)
-                numberField("Seed (-1 = random)", value: $seed, step: 1)
+                // -1 is the random sentinel and renders as an EMPTY box, so the
+                // placeholder explains it instead of a literal -1 that reads as
+                // a broken value.
+                SeedField(label: "Seed", placeholder: "random", range: -1...Int.max, value: $seed,
+                          help: "Same seed + same settings reproduces the image. Paste one to rerun someone else's; leave it empty for a new one each time.")
             }
             if model.stepsAreFixed {
                 Text("This model is distilled for \(model.fixedSteps) steps; other values cost time without adding detail.")

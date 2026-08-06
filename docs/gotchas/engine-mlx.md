@@ -1731,3 +1731,121 @@ Expectation to keep: the stochastic arm's speedup is CONTENT-DEPENDENT with a fl
 ### Addendum: the prefill guard's CHUNK term is arch-owned too (2026-08-01, the class's third bite)
 
 Minutes into the first real pi session on stochastic DSpark, a 7514-token prompt 400'd: "requires ~4069MB but only ~3610MB available". Not pi's fault and not fixable with pi-side limits (7.5k is a normal agent prompt); with the stages resident the box really does sit at ~3.6-6 GB slack — but the bill was wrong, in both directions at once. The generic estimator charges `3 × mlp(chunk)` with `chunk` from `effectivePrefillChunk` (the 4096 MoE cap) — dsv4's `extendState` sub-chunks internally at `prefillSub()` (512), so the real MLP envelope is 8x smaller (~2.6 GB of phantom bill). Meanwhile the fp16 score-scratch term (42 MB) misses the arch's REAL attention transient: the `[C, tk, latent]` f32 gathered-K set (~670 MB — the very allocation PREFILL_SUB exists to bound). `server.dsv4PrefillMemoryNeeded` now bills f32 module-owned state (raw latents + ~half again for the compressed arms; kv-quant never applies here), the f32 gather, and the sub-chunk MLP — ~2.3 GB for the failed request, admitted. It reads the LIVE `dsv4_mod.prefillSub()` (env-overridable — billing a stale constant while `MLX_SERVE_DSV4_PREFILL_SUB` raises the width would under-bill into an uncatchable OOM), and the call site is scan-pinned with `++`-split needles so the scan test cannot match its own source. Live-verified: an 11.2k-token prompt prefills clean with the stages resident. Physics unchanged: DSpark's 11 GB of stages still caps agent prompts around ~12-16k on a 128 GB box (bill is kv-linear, ~132 KB/token) — the pi launcher config sets `contextWindow: 16384` so pi compacts before the wall; full-window 40k sessions want a serial (no `--dspark`) boot.
+
+---
+
+
+## Sparse video attention is dead by measurement, and the frames are what said so (MiniMax-H3, 2026-08-05)
+
+Attention is 25% of an H3 step at 480p and 59% at 768p, and MiniMax deliberately
+withheld their own sparse implementation from the release. So a training-free
+SVG/STA-style pattern looked like the one large FLOP saving left on a DiT whose
+every other component is already at the compute roofline.
+
+It is dead. Not "needs tuning" — dead.
+
+**The machinery is fine.** Per-layer spatial (within-frame) / temporal
+(same-patch stripe) attention, with the GLOBAL STRIP (text/cond/audio rows)
+concatenated into every tile's key set and strip queries keeping full attention,
+dense anchor layers at the ends and middle. Pure mlx ops — batched SDPA with the
+pattern axis folded into batch, no custom kernel. The subset selection is PROVEN
+by a uniform-score closed-form test (q = k = 0 makes each output row the mean of
+exactly its subset, so the test reads the pattern directly rather than trusting
+it).
+
+**Three numbers, in the order they arrived, and only the last one mattered.**
+
+1. The µbench said **15x**. It was measuring the attention op in isolation at
+   the sparse shapes, which is exactly what it was asked to measure.
+2. Live, in the step graph, it measured **1.33x**. Same class as the lm_head
+   prune and the fused QK-norm+RoPE: an isolated kernel win that the surrounding
+   graph does not pay out, because the GPU was already overlapping the work and
+   because attention shares the step with linears that did not get faster.
+3. The rendered frames are **visibly smeared tiles**.
+
+**The quality failure is structural, not a tuning miss.** The temporal arm sets
+`nb = f` — one "batch" entry per frame — so on those layers two adjacent SPATIAL
+positions are in different batch entries and never exchange information at all.
+A video DiT cannot reconstruct local spatial structure from the dense anchor
+layers alone, so the tuning ladder everyone reaches for (denser anchor cadence,
+spatial-only sparse layers, SVG-style per-head online classification) is being
+asked to repair a hole the pattern puts there by construction. At a 1.33x
+ceiling it is not worth finding out how much of it can be repaired.
+
+**Two instruments pointed the right way before anyone looked at a frame** and
+both were treated as soft: PSNR vs the same-seed dense run was 9.8 dB, and the
+sparse clip x264-compressed at **10x** the control's bitrate — the classic
+added-noise tell, since noise is what a video codec cannot compress. The eyeball
+pair (`h3_sp480q` vs `h3_d480q`) is what settled it, which is the same precedent
+as every other quality call on this backend: **metrics flag, clips decide.**
+
+### Corollary: no kernel work is justified on this DiT at all
+
+Measured the same session, and it retires the whole category rather than one
+lever:
+
+| what | effective | ceiling |
+|---|---|---|
+| SDPA at `[1,56,9266,128]` | ~13.3 TFLOPS | ~15 TFLOPS dense bf16 |
+| linears under dq-gemm | ~13.6 TFLOPS | ~15 TFLOPS dense bf16 |
+
+Both are within ~12% of the machine's dense-bf16 roofline, so a *perfect* kernel
+is worth ~15% of the step and a realistic one is worth single digits. bf16
+weights buy 6.5% for 2x the footprint — declined. Wall-clock on this backend now
+only moves by doing FEWER forwards (steps, step cache, attention broadcast), not
+by making a forward faster.
+
+Also found while measuring, and worth more than the sparse result: **the fast
+recipe's gate was a NO-OP at <= 6 steps.** `attnBroadcastWarmup` + the tail
+always-refresh window together cover the entire schedule at small step counts,
+so every few-step run was silently getting the dense path while being credited
+with the recipe. A gate whose windows scale with the schedule needs a test at
+the SHORT end of that schedule, not only at the 30 steps it was tuned on.
+
+## The near-repeat loop tier convicted a voxel scene (2026-08-05)
+
+The tier shipped on 2026-08-04 to catch a loop that rephrases itself. One day
+later it destroyed a legitimate generation: asked for "a very creative,
+elaborate, and detailed voxel art scene of a pagoda in a beautiful garden", a
+pi session was cut at **16241 generated tokens** and wrote no file at all.
+
+The output was fine. Its tail was `fillBox(-5, 7, -5, 5, 7, 5, C.orangeTile);`
+lines with fresh coordinates on every one. The problem is that both of the
+tier's ratios measure a VOCABULARY, and procedurally generated scene code has a
+loop's vocabulary by construction: one call template plus a small colour
+palette. Measured on the artifact itself: distinct-token ratio **0.068** against
+a 0.12 bar, distinct-4-gram ratio **0.351** against a 0.35 bar — it escaped
+conviction by 0.001, and the generation's own tail did not escape.
+
+The separator is PROGRESS, not vocabulary. A loop stops introducing material; a
+scene keeps adding geometry. Measured as "what fraction of the window's
+second-half 4-grams did its first half never contain":
+
+| content | tokens | 4-grams | novelty |
+|---|---|---|---|
+| the cut voxel artifact | 0.068 | 0.351 | **0.632** |
+| dense procedural scene code | 0.021 | 0.304 | **0.298** |
+| a markdown table | 0.016 | 0.541 | **0.827** |
+| restatement loop | 0.024 | 0.052 | **0.019** |
+| file-repair restatement loop | 0.041 | 0.092 | **0.022** |
+
+Two orders of magnitude apart, so the bar is 0.10 — ~4.5x above the loops,
+~3x below the closest healthy case. All three ratios must now be low.
+
+Three things worth keeping:
+
+- **The direction of the error matters.** A missed loop still ends at
+  `max_tokens`; a false cut destroys work that was going fine and, on a tools
+  request, returns nothing at all. Every ambiguity in this tier resolves toward
+  acquittal.
+- **The known miss is honest.** A restatement loop that carries a changing
+  counter ("Attempt 1…", "Attempt 2…") scores 0.651 and is acquitted — by this
+  measure it IS progressing. Catching it needs a different signal, not a lower
+  bar.
+- **The regression fixture is derived, not invented.** The first attempt at it
+  interleaved template and varying tokens and did NOT convict, i.e. it was a
+  test that could not fail. The shape that reproduces the bug puts the template
+  tokens in a CONTIGUOUS run followed by the coordinates, so most 4-gram windows
+  sit entirely inside the fixed run and repeat every line (0.033 / 0.316). The
+  parameters were swept numerically against the measured artifact before being
+  written into the test.

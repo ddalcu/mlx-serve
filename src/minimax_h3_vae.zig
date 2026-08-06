@@ -1198,17 +1198,23 @@ test "minimax h3 vae live: tiled decode seam energy stays at ambient level" {
     try testing.expect(grow[seam] <= row_med * 3.0);
 }
 
-// ── Encoder (3D causal CNN, SINGLE-FRAME path) ──────────────────────────────
+// ── Encoder (3D causal CNN) ─────────────────────────────────────────────────
 //
-// fl2va keyframes are single frames, and for T==1 the reference's causal
-// temporal padding is all zeros ("truncate the temporal taps instead of
-// convolving zero frames" — vae.py CausalConv3d), so every CausalConv3d
-// collapses EXACTLY to a 2D conv with the LAST temporal tap of its kernel:
-// the zero frames contribute nothing and the bias is applied once either way.
-// The full-T encoder (ref2va reference videos) is deliberately not built yet.
+// ONE path serves fl2va keyframes (T==1) and ref2va reference videos (T>1).
+// The reference's CausalConv3d has a T==1 branch that truncates the temporal
+// taps instead of convolving zero frames — but that is an OPTIMIZATION, not a
+// different semantic: the causal front padding is all zeros, so the taps it
+// skips contribute exactly 0.0. Running the zero-pad form at every T is
+// therefore the same arithmetic with one implementation, which is worth more
+// than the frames of multiply-by-zero it costs on a keyframe.
 //
-// Runs f32 end to end: one frame is cheap and the moments anchor the whole
-// generation, so precision is the safe default here.
+// Two things are semantic and must not be "optimized":
+//   - temporal CHUNKING (17-frame clips, the length the VAE was trained on),
+//     which is why a long video is not one pass, and
+//   - spatial TILING, for the same reason on the decode side.
+//
+// Runs f32 end to end: the moments anchor the whole generation, so precision
+// is the safe default here.
 
 inline fn subA(a: mlx.mlx_array, b: mlx.mlx_array, s: S) !mlx.mlx_array {
     var o = mlx.mlx_array_new();
@@ -1226,56 +1232,77 @@ inline fn divA(a: mlx.mlx_array, b: mlx.mlx_array, s: S) !mlx.mlx_array {
 const PIXEL_MEAN = [3]f32{ 0.485, 0.456, 0.406 };
 const PIXEL_STD = [3]f32{ 0.229, 0.224, 0.225 };
 
-/// Reflect-pad H and W by 1 on [1, H, W, C] (torch reflect: mirror EXCLUDING
-/// the edge sample).
+/// Reflect-pad H and W by 1 on [1, T, H, W, C] (torch reflect: mirror
+/// EXCLUDING the edge sample).
 fn reflectPad1HW(x: mlx.mlx_array, s: S) !mlx.mlx_array {
     const shp = mlx.getShape(x);
-    const h = shp[1];
-    const w = shp[2];
-    const top = try sliceAxis(x, 1, 1, 2, s);
+    const h = shp[2];
+    const w = shp[3];
+    const top = try sliceAxis(x, 2, 1, 2, s);
     defer _ = mlx.mlx_array_free(top);
-    const bot = try sliceAxis(x, 1, h - 2, h - 1, s);
+    const bot = try sliceAxis(x, 2, h - 2, h - 1, s);
     defer _ = mlx.mlx_array_free(bot);
-    const xv = try concat(&[_]mlx.mlx_array{ top, x, bot }, 1, s);
+    const xv = try concat(&[_]mlx.mlx_array{ top, x, bot }, 2, s);
     defer _ = mlx.mlx_array_free(xv);
-    const left = try sliceAxis(xv, 2, 1, 2, s);
+    const left = try sliceAxis(xv, 3, 1, 2, s);
     defer _ = mlx.mlx_array_free(left);
-    const right = try sliceAxis(xv, 2, w - 2, w - 1, s);
+    const right = try sliceAxis(xv, 3, w - 2, w - 1, s);
     defer _ = mlx.mlx_array_free(right);
-    return concat(&[_]mlx.mlx_array{ left, xv, right }, 2, s);
+    return concat(&[_]mlx.mlx_array{ left, xv, right }, 3, s);
 }
 
 /// Reflect-pad bottom+right by 1 (the reference Downsample3D's (0,1,0,1) pad).
 fn reflectPadBR(x: mlx.mlx_array, s: S) !mlx.mlx_array {
     const shp = mlx.getShape(x);
-    const h = shp[1];
-    const w = shp[2];
-    const bot = try sliceAxis(x, 1, h - 2, h - 1, s);
+    const h = shp[2];
+    const w = shp[3];
+    const bot = try sliceAxis(x, 2, h - 2, h - 1, s);
     defer _ = mlx.mlx_array_free(bot);
-    const xv = try concat(&[_]mlx.mlx_array{ x, bot }, 1, s);
+    const xv = try concat(&[_]mlx.mlx_array{ x, bot }, 2, s);
     defer _ = mlx.mlx_array_free(xv);
-    const right = try sliceAxis(xv, 2, w - 2, w - 1, s);
+    const right = try sliceAxis(xv, 3, w - 2, w - 1, s);
     defer _ = mlx.mlx_array_free(right);
-    return concat(&[_]mlx.mlx_array{ xv, right }, 2, s);
+    return concat(&[_]mlx.mlx_array{ xv, right }, 3, s);
 }
 
-fn conv2dBias(x: mlx.mlx_array, w: mlx.mlx_array, b: mlx.mlx_array, stride: c_int, s: S) !mlx.mlx_array {
+/// CAUSAL temporal padding: `n` ZERO frames at the FRONT only, on
+/// [1, T, H, W, C]. Front-only is the whole point — a symmetric pad would let
+/// a frame see its own future, which is what makes the chunked encode
+/// inconsistent with a single pass.
+fn causalPadFront(x: mlx.mlx_array, n: c_int, s: S) !mlx.mlx_array {
+    if (n == 0) return contig(x, s);
+    const shp = mlx.getShape(x);
+    const zshape = [_]c_int{ shp[0], n, shp[2], shp[3], shp[4] };
+    var z = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(z);
+    try mlx.check(mlx.mlx_zeros(&z, &zshape, zshape.len, mlx.mlx_array_dtype(x), s));
+    return concat(&[_]mlx.mlx_array{ z, x }, 1, s);
+}
+
+fn conv3dBias(x: mlx.mlx_array, w: mlx.mlx_array, b: mlx.mlx_array, st: c_int, ss: c_int, s: S) !mlx.mlx_array {
     var o = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(o);
-    try mlx.check(mlx.mlx_conv2d(&o, x, w, stride, stride, 0, 0, 1, 1, 1, s));
+    const xc = try contig(x, s);
+    defer _ = mlx.mlx_array_free(xc);
+    try mlx.check(mlx.mlx_conv3d(&o, xc, w, st, ss, ss, 0, 0, 0, 1, 1, 1, 1, s));
     return addA(o, b, s);
 }
 
-/// Per-frame GroupNorm(32, eps 1e-6, affine) on [1, H, W, C]. T==1 so the
-/// reference's TemporalIsolatedGroupNorm is plain GroupNorm.
+/// The reference's `TemporalIsolatedGroupNorm`: GroupNorm(32, eps 1e-6,
+/// affine) with statistics computed PER FRAME (time folded into the batch), on
+/// [1, T, H, W, C]. Sharing statistics across frames is the obvious-looking
+/// simplification and it is wrong — it couples frames the chunked encode has
+/// already decided are independent.
 fn groupNorm32(x: mlx.mlx_array, w: mlx.mlx_array, b: mlx.mlx_array, s: S) !mlx.mlx_array {
     const shp = mlx.getShape(x);
-    const h = shp[1];
-    const w_ = shp[2];
-    const c = shp[3];
-    const g = try reshape(x, &[_]c_int{ 1, h, w_, 32, @divExact(c, 32) }, s);
+    const t = shp[1];
+    const h = shp[2];
+    const w_ = shp[3];
+    const c = shp[4];
+    const g = try reshape(x, &[_]c_int{ 1, t, h, w_, 32, @divExact(c, 32) }, s);
     defer _ = mlx.mlx_array_free(g);
-    const axes = [_]c_int{ 1, 2, 4 };
+    // NOT axis 1: the statistics are per (batch, FRAME, group).
+    const axes = [_]c_int{ 2, 3, 5 };
     var mean = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(mean);
     try mlx.check(mlx.mlx_mean_axes(&mean, g, &axes, axes.len, true, s));
@@ -1295,7 +1322,7 @@ fn groupNorm32(x: mlx.mlx_array, w: mlx.mlx_array, b: mlx.mlx_array, s: S) !mlx.
     try mlx.check(mlx.mlx_rsqrt(&rs, ve, s));
     const nrm = try mulA(diff, rs, s);
     defer _ = mlx.mlx_array_free(nrm);
-    const back = try reshape(nrm, &[_]c_int{ 1, h, w_, c }, s);
+    const back = try reshape(nrm, &[_]c_int{ 1, t, h, w_, c }, s);
     defer _ = mlx.mlx_array_free(back);
     const sc = try mulA(back, w, s);
     defer _ = mlx.mlx_array_free(sc);
@@ -1349,20 +1376,15 @@ pub const Encoder = struct {
     latents_mean: mlx.mlx_array,
     latents_std: mlx.mlx_array,
 
-    /// [O, I, kt, kh, kw] -> f32 [O, kh, kw, I] using the LAST temporal tap
-    /// (exact for T==1 — the causal front pads are zeros).
+    /// [O, I, kt, kh, kw] -> f32 [O, kt, kh, kw, I], the layout mlx_conv3d
+    /// wants. Kept in FULL (not tap-truncated) so one weight set serves both
+    /// the keyframe and the reference-video paths.
     fn convTap(w: *const Weights, a: std.mem.Allocator, comptime fmt: []const u8, args: anytype, s: S) !mlx.mlx_array {
         const name = try std.fmt.allocPrint(a, fmt, args);
         defer a.free(name);
         const raw = try ownWeight(w, name);
         defer _ = mlx.mlx_array_free(raw);
-        const shp = mlx.getShape(raw);
-        const kt = shp[2];
-        const tap = try sliceAxis(raw, 2, kt - 1, kt, s);
-        defer _ = mlx.mlx_array_free(tap);
-        const sq = try reshape(tap, &[_]c_int{ shp[0], shp[1], shp[3], shp[4] }, s);
-        defer _ = mlx.mlx_array_free(sq);
-        const tr = try transpose(sq, &[_]c_int{ 0, 2, 3, 1 }, s);
+        const tr = try transpose(raw, &[_]c_int{ 0, 2, 3, 4, 1 }, s);
         defer _ = mlx.mlx_array_free(tr);
         const trc = try contig(tr, s);
         defer _ = mlx.mlx_array_free(trc);
@@ -1445,27 +1467,35 @@ pub const Encoder = struct {
         for (&self.levels) |*lv| lv.deinit();
     }
 
+    /// One CausalConv3d with `padding=1` on every axis: reflect in space,
+    /// ZERO and FRONT-ONLY in time.
+    fn causalConv(x: mlx.mlx_array, w: mlx.mlx_array, b: mlx.mlx_array, s: S) !mlx.mlx_array {
+        const sp = try reflectPad1HW(x, s);
+        defer _ = mlx.mlx_array_free(sp);
+        const tp = try causalPadFront(sp, 2, s);
+        defer _ = mlx.mlx_array_free(tp);
+        return conv3dBias(tp, w, b, 1, 1, s);
+    }
+
     fn resBlock(self: *const Encoder, blk: *const EncRes, x: mlx.mlx_array, s: S) !mlx.mlx_array {
         _ = self;
         const n1 = try groupNorm32(x, blk.norm1_w, blk.norm1_b, s);
         defer _ = mlx.mlx_array_free(n1);
         const a1 = try siluA(n1, s);
         defer _ = mlx.mlx_array_free(a1);
-        const p1 = try reflectPad1HW(a1, s);
-        defer _ = mlx.mlx_array_free(p1);
-        const h1 = try conv2dBias(p1, blk.conv1_w, blk.conv1_b, 1, s);
+        const h1 = try causalConv(a1, blk.conv1_w, blk.conv1_b, s);
         defer _ = mlx.mlx_array_free(h1);
         const n2 = try groupNorm32(h1, blk.norm2_w, blk.norm2_b, s);
         defer _ = mlx.mlx_array_free(n2);
         const a2 = try siluA(n2, s);
         defer _ = mlx.mlx_array_free(a2);
-        const p2 = try reflectPad1HW(a2, s);
-        defer _ = mlx.mlx_array_free(p2);
-        const h2 = try conv2dBias(p2, blk.conv2_w, blk.conv2_b, 1, s);
+        const h2 = try causalConv(a2, blk.conv2_w, blk.conv2_b, s);
         defer _ = mlx.mlx_array_free(h2);
         var sc = x;
         var sc_owned = false;
         if (blk.nin_wt.ctx != null) {
+            // A 1x1x1 conv is a per-position linear on the channel axis, so it
+            // needs no padding and works at any rank.
             sc = try linT(x, blk.nin_wt, blk.nin_b, s);
             sc_owned = true;
         }
@@ -1475,12 +1505,10 @@ pub const Encoder = struct {
         return addA(h2, sc, s);
     }
 
-    /// One tile [1, th, tw, 3] (already pixel-normalized) -> moments
-    /// [1, 48, 1, th/16, tw/16].
+    /// One tile [1, T, th, tw, 3] (already pixel-normalized) -> moments
+    /// [1, 48, T_lat, th/16, tw/16].
     fn encodeMoments(self: *const Encoder, x: mlx.mlx_array, s: S) !mlx.mlx_array {
-        const p0 = try reflectPad1HW(x, s);
-        defer _ = mlx.mlx_array_free(p0);
-        var h = try conv2dBias(p0, self.conv_in_w, self.conv_in_b, 1, s);
+        var h = try causalConv(x, self.conv_in_w, self.conv_in_b, s);
         errdefer _ = mlx.mlx_array_free(h);
         for (0..ENC_LEVELS) |lv| {
             const level = &self.levels[lv];
@@ -1490,9 +1518,14 @@ pub const Encoder = struct {
                 h = nh;
             }
             if (level.down_w.ctx != null) {
-                const pd = try reflectPadBR(h, s);
+                // Downsample3D: reflect-pad BOTTOM+RIGHT only (never all four
+                // sides), then a causal conv with the level's own strides. Its
+                // padding is (1,0,0) — temporal only, no spatial pad here.
+                const pd = if (ENC_SPACE_DOWN[lv] == 2) try reflectPadBR(h, s) else try contig(h, s);
                 defer _ = mlx.mlx_array_free(pd);
-                const nh = try conv2dBias(pd, level.down_w, level.down_b, 2, s);
+                const tp = try causalPadFront(pd, 2, s);
+                defer _ = mlx.mlx_array_free(tp);
+                const nh = try conv3dBias(tp, level.down_w, level.down_b, @intCast(ENC_TIME_DOWN[lv]), @intCast(ENC_SPACE_DOWN[lv]), s);
                 _ = mlx.mlx_array_free(h);
                 h = nh;
             }
@@ -1507,15 +1540,11 @@ pub const Encoder = struct {
         }.adv;
         step(&h, try groupNorm32(h, self.norm_out_w, self.norm_out_b, s));
         step(&h, try siluA(h, s));
-        step(&h, try reflectPad1HW(h, s));
-        step(&h, try conv2dBias(h, self.conv_out_w, self.conv_out_b, 1, s));
+        step(&h, try causalConv(h, self.conv_out_w, self.conv_out_b, s));
         step(&h, try linT(h, self.quant_wt, self.quant_b, s));
-        // [1, lh, lw, 48] -> [1, 48, 1, lh, lw]
-        const qs0 = mlx.getShape(h)[1];
-        const qs1 = mlx.getShape(h)[2];
-        step(&h, try transpose(h, &[_]c_int{ 0, 3, 1, 2 }, s));
-        step(&h, try contig(h, s));
-        const out = try reshape(h, &[_]c_int{ 1, 48, 1, qs0, qs1 }, s);
+        // [1, T_lat, lh, lw, 48] -> [1, 48, T_lat, lh, lw]
+        step(&h, try transpose(h, &[_]c_int{ 0, 4, 1, 2, 3 }, s));
+        const out = try contig(h, s);
         _ = mlx.mlx_array_free(h);
         return out;
     }
@@ -1530,18 +1559,29 @@ pub const Encoder = struct {
     /// latent granularity against the RAW neighbours, so parity means doing
     /// the same.
     pub fn encodeImage(self: *const Encoder, pixels: mlx.mlx_array, alloc: std.mem.Allocator, s: S) !mlx.mlx_array {
+        return self.encodeVideo(pixels, alloc, s);
+    }
+
+    /// `pixels` [1, 3, T, H, W] f32 in [-1, 1] -> NORMALIZED latents
+    /// [1, 24, T_lat, H/16, W/16].
+    ///
+    /// T == 1 is the fl2va keyframe (T_lat 1); T > 1 is a ref2va reference
+    /// video, encoded in 17-FRAME CLIPS with the tail repeat-padded and the
+    /// last `TOKEN_DROP` latent frames discarded. `videoLatentT` is the same
+    /// ladder read from the other end, so a caller that snapped its frame
+    /// count to 17k+5 gets exactly `5k+2` latent frames back.
+    pub fn encodeVideo(self: *const Encoder, pixels: mlx.mlx_array, alloc: std.mem.Allocator, s: S) !mlx.mlx_array {
         const pshp = mlx.getShape(pixels);
+        const pt: u32 = @intCast(pshp[2]);
         const ph: u32 = @intCast(pshp[3]);
         const pw: u32 = @intCast(pshp[4]);
 
-        // [1,3,1,H,W] -> [1,H,W,3], then [-1,1] -> ImageNet normalization.
+        // [1,3,T,H,W] -> [1,T,H,W,3], then [-1,1] -> ImageNet normalization.
         const t5 = try transpose(pixels, &[_]c_int{ 0, 2, 3, 4, 1 }, s);
         defer _ = mlx.mlx_array_free(t5);
         const t5c = try contig(t5, s);
         defer _ = mlx.mlx_array_free(t5c);
-        const nhwc_raw = try reshape(t5c, &[_]c_int{ 1, @intCast(ph), @intCast(pw), 3 }, s);
-        defer _ = mlx.mlx_array_free(nhwc_raw);
-        const f32x = try astype(nhwc_raw, mlx.mlx_dtype.float32, s);
+        const f32x = try astype(t5c, mlx.mlx_dtype.float32, s);
         defer _ = mlx.mlx_array_free(f32x);
         const half = mlx.mlx_array_new_float(0.5);
         defer _ = mlx.mlx_array_free(half);
@@ -1549,22 +1589,20 @@ pub const Encoder = struct {
         defer _ = mlx.mlx_array_free(unit01a);
         const unit01 = try addA(unit01a, half, s);
         defer _ = mlx.mlx_array_free(unit01);
-        const msh = [_]c_int{ 1, 1, 1, 3 };
-        const pm = mlx.mlx_array_new_data(&PIXEL_MEAN, &msh, 4, mlx.mlx_dtype.float32);
+        const msh = [_]c_int{ 1, 1, 1, 1, 3 };
+        const pm = mlx.mlx_array_new_data(&PIXEL_MEAN, &msh, 5, mlx.mlx_dtype.float32);
         defer _ = mlx.mlx_array_free(pm);
-        const psd = mlx.mlx_array_new_data(&PIXEL_STD, &msh, 4, mlx.mlx_dtype.float32);
+        const psd = mlx.mlx_array_new_data(&PIXEL_STD, &msh, 5, mlx.mlx_dtype.float32);
         defer _ = mlx.mlx_array_free(psd);
         const cen = try subA(unit01, pm, s);
         defer _ = mlx.mlx_array_free(cen);
-        const nhwc = try divA(cen, psd, s);
-        defer _ = mlx.mlx_array_free(nhwc);
+        const nthwc = try divA(cen, psd, s);
+        defer _ = mlx.mlx_array_free(nthwc);
 
-        var moments: mlx.mlx_array = undefined;
-        if (fitsSingleTile(ph) and fitsSingleTile(pw)) {
-            moments = try self.encodeMoments(nhwc, s);
-        } else {
-            moments = try self.encodeTiled(nhwc, alloc, s);
-        }
+        const moments = if (pt == 1)
+            try self.adaptiveEncode(nthwc, ph, pw, alloc, s)
+        else
+            try self.encodeTemporal(nthwc, pt, ph, pw, alloc, s);
         defer _ = mlx.mlx_array_free(moments);
 
         // mean = first 24 channels; normalize by the latent statistics.
@@ -1580,12 +1618,63 @@ pub const Encoder = struct {
         return divA(centered, ls, s);
     }
 
+    /// Single pass or spatially tiled, per the reference's `_adaptive_encode`.
+    fn adaptiveEncode(self: *const Encoder, x: mlx.mlx_array, ph: u32, pw: u32, alloc: std.mem.Allocator, s: S) !mlx.mlx_array {
+        if (fitsSingleTile(ph) and fitsSingleTile(pw)) return self.encodeMoments(x, s);
+        return self.encodeTiled(x, alloc, s);
+    }
+
+    /// The reference's `encode_temporal`. The 17-frame clip is what the VAE was
+    /// TRAINED on, so encoding a long video in one pass is not an optimization
+    /// that was skipped — it is a different (wrong) computation. The tail is
+    /// repeat-padded with the LAST frame, never zero-padded or truncated.
+    fn encodeTemporal(self: *const Encoder, x: mlx.mlx_array, pt: u32, ph: u32, pw: u32, alloc: std.mem.Allocator, s: S) !mlx.mlx_array {
+        var padded = try contig(x, s);
+        defer _ = mlx.mlx_array_free(padded);
+        const rem = pt % CLIP_LENGTH;
+        var total = pt;
+        if (rem != 0) {
+            const pad_n = CLIP_LENGTH - rem;
+            const last = try sliceAxis(padded, 1, @intCast(pt - 1), @intCast(pt), s);
+            defer _ = mlx.mlx_array_free(last);
+            var parts = try alloc.alloc(mlx.mlx_array, pad_n + 1);
+            defer alloc.free(parts);
+            parts[0] = padded;
+            for (1..pad_n + 1) |i| parts[i] = last;
+            const cat = try concat(parts, 1, s);
+            _ = mlx.mlx_array_free(padded);
+            padded = cat;
+            total = pt + pad_n;
+        }
+
+        const chunks = total / CLIP_LENGTH;
+        var outs = try alloc.alloc(mlx.mlx_array, chunks);
+        defer alloc.free(outs);
+        var built: usize = 0;
+        defer for (outs[0..built]) |o| {
+            _ = mlx.mlx_array_free(o);
+        };
+        for (0..chunks) |i| {
+            const lo: c_int = @intCast(i * CLIP_LENGTH);
+            const clip = try sliceAxis(padded, 1, lo, lo + @as(c_int, @intCast(CLIP_LENGTH)), s);
+            defer _ = mlx.mlx_array_free(clip);
+            outs[i] = try self.adaptiveEncode(clip, ph, pw, alloc, s);
+            built += 1;
+        }
+        const cat = if (chunks == 1) try contig(outs[0], s) else try concat(outs, 2, s);
+        defer _ = mlx.mlx_array_free(cat);
+        // Drop the trailing TOKEN_DROP latent frames — the tail the repeat-pad
+        // fabricated, plus the clip's own causal warm-up.
+        const n_lat: c_int = mlx.getShape(cat)[2];
+        return sliceAxis(cat, 2, 0, n_lat - @as(c_int, @intCast(TOKEN_DROP)), s);
+    }
+
     /// Reference `tiled_encode`: encode raw pixel tiles, blend each against its
     /// RAW up/left neighbour at LATENT granularity, trim, assemble.
     fn encodeTiled(self: *const Encoder, nhwc: mlx.mlx_array, alloc: std.mem.Allocator, s: S) !mlx.mlx_array {
         const shp = mlx.getShape(nhwc);
-        const ph: u32 = @intCast(shp[1]);
-        const pw: u32 = @intCast(shp[2]);
+        const ph: u32 = @intCast(shp[2]);
+        const pw: u32 = @intCast(shp[3]);
         var yp = try splitTiles(alloc, ph);
         defer yp.deinit();
         var xp = try splitTiles(alloc, pw);
@@ -1601,9 +1690,10 @@ pub const Encoder = struct {
         };
         for (yp.starts, 0..) |y0, i| {
             for (xp.starts, 0..) |x0, j| {
-                const th = try sliceAxis(nhwc, 1, @intCast(y0), @intCast(y0 + yp.len), s);
+                // Input is [1, T, H, W, C]: the spatial axes are 2 and 3.
+                const th = try sliceAxis(nhwc, 2, @intCast(y0), @intCast(y0 + yp.len), s);
                 defer _ = mlx.mlx_array_free(th);
-                const tile = try sliceAxis(th, 2, @intCast(x0), @intCast(x0 + xp.len), s);
+                const tile = try sliceAxis(th, 3, @intCast(x0), @intCast(x0 + xp.len), s);
                 defer _ = mlx.mlx_array_free(tile);
                 raw[i * nx + j] = try self.encodeMoments(tile, s);
                 built += 1;
@@ -1683,9 +1773,14 @@ test "minimax h3 vae: encoder geometry ladder matches the reference config" {
 test "minimax h3 vae live: encoder parity vs the executed reference" {
     // Fixture from tests/dump_minimax_h3_vae_encoder_fixture.py, which RUNS
     // the reference conv encoder (plain torch — unlike the DiT, nothing here
-    // needs comfy_kitchen). Two cases: a single-tile 128px image and a TILED
-    // 384px one, so the moment-blend assembly is pinned against the
-    // reference's own tiled_encode output.
+    // needs comfy_kitchen). Four cases: a single-tile 128px image, a TILED
+    // 384px one (so the moment-blend assembly is pinned against the
+    // reference's own tiled_encode output), and two VIDEOS — 5 frames (one
+    // 17-frame clip after repeat-padding) and 22 (TWO clips, the only case
+    // that exercises the seam between independently-encoded clips).
+    //
+    // The video frames MOVE, so a port that collapses, reverses or mis-strides
+    // the temporal axis cannot pass; a static clip would let all three through.
     const raw_model = std.c.getenv("MINIMAX_H3_MODEL") orelse return error.SkipZigTest;
     const raw_fix = std.c.getenv("MINIMAX_H3_VAE_ENC_FIXTURE") orelse return error.SkipZigTest;
     const model_dir = std.mem.sliceTo(raw_model, 0);
@@ -1707,16 +1802,52 @@ test "minimax h3 vae live: encoder parity vs the executed reference" {
     var fx = try model_mod.loadWeightsSingleFile(a, fix_path);
     defer fx.deinit();
 
-    for ([_][2][]const u8{ .{ "x", "latent" }, .{ "x_tiled", "latent_tiled" } }) |pair| {
+    for ([_][2][]const u8{
+        .{ "x", "latent" },
+        .{ "x_tiled", "latent_tiled" },
+        .{ "v5", "latent_v5" },
+        .{ "v22", "latent_v22" },
+    }) |pair| {
         const x = try ownWeight(&fx, pair[0]);
         defer _ = mlx.mlx_array_free(x);
         const want = try ownWeight(&fx, pair[1]);
         defer _ = mlx.mlx_array_free(want);
-        const got = try enc.encodeImage(x, a, s);
+        const got = try enc.encodeVideo(x, a, s);
         defer _ = mlx.mlx_array_free(got);
+        // Shape first: a temporal ladder that is one token off still scores a
+        // high cosine on the overlapping rows, and cosineSimV would compare
+        // different element counts.
+        const gs = mlx.getShape(got);
+        const ws = mlx.getShape(want);
+        testing.expectEqual(ws.len, gs.len) catch |e| {
+            std.debug.print("[h3-vae-enc] {s}: rank {d} vs {d}\n", .{ pair[0], gs.len, ws.len });
+            return e;
+        };
+        for (ws, gs, 0..) |wv, gv, i| {
+            testing.expectEqual(wv, gv) catch |e| {
+                std.debug.print("[h3-vae-enc] {s}: axis {d} = {d}, want {d}\n", .{ pair[0], i, gv, wv });
+                return e;
+            };
+        }
         const cos = try cosineSimV(got, want, s);
-        std.debug.print("[h3-vae-enc] {s}: cos={d:.6}\n", .{ pair[0], cos });
+        std.debug.print("[h3-vae-enc] {s}: shape ok, cos={d:.6}\n", .{ pair[0], cos });
         try testing.expect(cos > 0.999);
+    }
+}
+
+test "minimax h3 vae: the encode ladder is videoLatentT read backwards" {
+    // encodeTemporal produces ceil(T/17)*TOKENS_CHUNK_SIZE - TOKEN_DROP latent
+    // frames. A caller that snapped its frame count to the 17k+5 ladder must
+    // get exactly what `videoLatentT` promises the DiT — the two are computed
+    // by different code and a disagreement is a shape error minutes into a
+    // generation, not at the call.
+    for ([_]u32{ 5, 22, 39, 56, 124, 209, 362 }) |frames| {
+        const chunks = (frames + CLIP_LENGTH - 1) / CLIP_LENGTH;
+        const encoded = chunks * TOKENS_CHUNK_SIZE - TOKEN_DROP;
+        try testing.expectEqual(h3.videoLatentT(frames), encoded);
+        // and every case really is ON the ladder, so the equality above is not
+        // being checked against counts the server would never produce
+        try testing.expectEqual(@as(u32, 5), frames % CLIP_LENGTH);
     }
 }
 

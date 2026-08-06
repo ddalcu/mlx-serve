@@ -53,6 +53,102 @@ final class MediaGenServiceTests: XCTestCase {
         XCTAssertNil(body["first_frame_image"])
     }
 
+    func testRef2vaFieldsAreGatedOnTheModelsOwnCapability() {
+        // Hiding a control is not the same as not sending its field — the class
+        // that made every H3 request carry `pipeline` and 400. FL2VA has no
+        // reference conditioning, so a request against it must carry no ref_*
+        // field even when the state is populated (a preset switch leaves it).
+        let payload = VideoRefPayloads(
+            images: ["QQ==", "Qg=="],
+            videos: [.init(frames: ["Rg==", "Rw=="], audio: "Uw==")],
+            audios: ["VA=="]
+        )
+        var fl2va = VideoGenRequest(model: .minimaxH3, prompt: "p", width: 256, height: 256,
+                                    numFrames: 124, fps: 24, mode: .oneStage, steps: 30, cfgScale: 1.0)
+        fl2va.refImageSize = .max
+        let fbody = VideoGenService.requestBody(model: "m", prompt: "p", request: fl2va,
+                                                firstFrameB64: nil, refs: payload)
+        XCTAssertNil(fbody["ref_images"])
+        XCTAssertNil(fbody["ref_videos"])
+        XCTAssertNil(fbody["ref_audios"])
+        XCTAssertNil(fbody["ref_image_size"])
+
+        var ref = VideoGenRequest(model: .minimaxH3Ref2VA, prompt: "p", width: 256, height: 256,
+                                  numFrames: 124, fps: 24, mode: .oneStage, steps: 30, cfgScale: 1.0)
+        let rbody = VideoGenService.requestBody(model: "m", prompt: "p", request: ref,
+                                                firstFrameB64: nil, refs: payload)
+        XCTAssertEqual(rbody["ref_images"] as? [String], ["QQ==", "Qg=="])
+        XCTAssertEqual(rbody["ref_audios"] as? [String], ["VA=="])
+        // A reference video is an OBJECT carrying its own soundtrack, so a
+        // clip without audio cannot shift the pairing of the ones that have it.
+        let vids = rbody["ref_videos"] as? [[String: Any]]
+        XCTAssertEqual(vids?.count, 1)
+        XCTAssertEqual(vids?.first?["frames"] as? [String], ["Rg==", "Rw=="])
+        XCTAssertEqual(vids?.first?["audio"] as? String, "Uw==")
+        // Default sizing is the server's own default, so it is not restated.
+        XCTAssertNil(rbody["ref_image_size"])
+        ref.refImageSize = .max
+        let mbody = VideoGenService.requestBody(model: "m", prompt: "p", request: ref,
+                                                firstFrameB64: nil, refs: payload)
+        XCTAssertEqual(mbody["ref_image_size"] as? String, "max")
+
+        // Empty payloads send nothing at all, on either pack.
+        let ebody = VideoGenService.requestBody(model: "m", prompt: "p", request: ref,
+                                                firstFrameB64: nil, refs: VideoRefPayloads())
+        XCTAssertNil(ebody["ref_images"])
+        XCTAssertNil(ebody["ref_videos"])
+        XCTAssertNil(ebody["ref_audios"])
+
+        // A video with no soundtrack omits the key rather than sending null.
+        let silent = VideoRefPayloads(videos: [.init(frames: ["Rg=="], audio: nil)])
+        let sbody = VideoGenService.requestBody(model: "m", prompt: "p", request: ref,
+                                                firstFrameB64: nil, refs: silent)
+        let svids = sbody["ref_videos"] as? [[String: Any]]
+        XCTAssertEqual(svids?.count, 1)
+        XCTAssertNil(svids?.first?["audio"])
+    }
+
+    func testRefVideoFrameCountSnapsToTheModelsOwnLadder() {
+        // H3's frame ladder is 17k+5 and the server snaps DOWN, so extracting
+        // frames the server will throw away is pure payload — a 124-frame clip
+        // is ~10 MB of base64 before anything is generated.
+        XCTAssertEqual(VideoGenService.refVideoFrameCount(available: 130, cap: 209), 124)
+        XCTAssertEqual(VideoGenService.refVideoFrameCount(available: 124, cap: 209), 124)
+        XCTAssertEqual(VideoGenService.refVideoFrameCount(available: 22, cap: 209), 22)
+        XCTAssertEqual(VideoGenService.refVideoFrameCount(available: 21, cap: 209), 5)
+        // The generation's own length is the ceiling: the server truncates a
+        // longer reference before snapping it.
+        XCTAssertEqual(VideoGenService.refVideoFrameCount(available: 400, cap: 124), 124)
+        // Below the floor there is not one latent frame to condition on, so
+        // the clip is refused rather than padded into something meaningless.
+        XCTAssertEqual(VideoGenService.refVideoFrameCount(available: 4, cap: 209), 0)
+        XCTAssertEqual(VideoGenService.refVideoFrameCount(available: 0, cap: 209), 0)
+    }
+
+    func testRefFrameTimesRunAtTheModelsFixedFrameRate() {
+        // 24 fps is fixed for H3; the timestamps the model reads are derived
+        // from the frame INDEX, so sampling at any other rate silently
+        // stretches the reference's motion.
+        let t = VideoGenService.refFrameTimes(count: 5, fps: 24)
+        XCTAssertEqual(t.count, 5)
+        XCTAssertEqual(t[0], 0.0, accuracy: 1e-9)
+        XCTAssertEqual(t[1], 1.0 / 24.0, accuracy: 1e-9)
+        XCTAssertEqual(t[4], 4.0 / 24.0, accuracy: 1e-9)
+        XCTAssertTrue(VideoGenService.refFrameTimes(count: 0, fps: 24).isEmpty)
+    }
+
+    func testRef2vaPresetIsTheOnlyOneAdvertisingReferences() {
+        // The factory takes the flag as a parameter precisely so the two FL2VA
+        // presets cannot drift into claiming a capability their DiT lacks.
+        XCTAssertTrue(VideoModelPreset.minimaxH3Ref2VA.supportsReferences)
+        for p in VideoModelPreset.all where p.id != VideoModelPreset.minimaxH3Ref2VA.id {
+            XCTAssertFalse(p.supportsReferences, "\(p.id) must not advertise references")
+        }
+        // REF2VA has no first/last-frame conditioning and FL2VA has no
+        // references — two checkpoints, not two modes of one.
+        XCTAssertTrue(VideoModelPreset.all.contains { $0.id == VideoModelPreset.minimaxH3Ref2VA.id })
+    }
+
     func testH3FastRecipeDefaultOnWithOffSwitch() {
         // David's eyeball verdict on the same-seed 768p capstone pair: the
         // fast recipe (server-side step cache + attention broadcast, 2.83x)
@@ -71,6 +167,165 @@ final class MediaGenServiceTests: XCTestCase {
         ltx.bestQuality = true
         let lbody = VideoGenService.requestBody(model: "m", prompt: "p", request: ltx, firstFrameB64: nil)
         XCTAssertNil(lbody["fast"])
+    }
+
+    // MARK: - Prompt guidance (the pane's examples / placeholder / hint / link)
+
+    func testPromptFormatFollowsTheModelsOwnCapabilities() {
+        // One chokepoint, derived from what the preset already declares — an
+        // id-sniffing copy is how the pane ends up giving LTX advice on an H3
+        // model, which is the state this replaced.
+        XCTAssertEqual(VideoModelPreset.ltx23Q4.promptFormat, .ltx)
+        XCTAssertEqual(VideoModelPreset.minimaxH3.promptFormat, .h3Base)
+        XCTAssertEqual(VideoModelPreset.minimaxH3Q4.promptFormat, .h3Base)
+        XCTAssertEqual(VideoModelPreset.minimaxH3Ref2VA.promptFormat, .h3Reference)
+        // Every shipped preset resolves — a new one can't land without a format.
+        for p in VideoModelPreset.all {
+            XCTAssertEqual(p.promptFormat == .ltx, p.backend == .ltx, "\(p.id)")
+        }
+    }
+
+    func testEveryH3ExampleCarriesItsFormatsSectionsInOrder() {
+        // The format IS the feature: H3 was trained on labelled documents, and
+        // an example that drops a section (or writes them out of order) teaches
+        // the shape wrong. Order matters — the release's own guides fix it.
+        for ex in H3PromptExamples.h3Base {
+            XCTAssertTrue(H3PromptExamples.carriesSections(ex.body, H3PromptExamples.baseSections),
+                          "base example '\(ex.title)' is missing a section or has them out of order")
+        }
+        for ex in H3PromptExamples.h3Reference {
+            XCTAssertTrue(H3PromptExamples.carriesSections(ex.body, H3PromptExamples.referenceSections),
+                          "reference example '\(ex.title)' is missing a section or has them out of order")
+        }
+        // retention_analysis is the only place a reference's ROLE is stated, so
+        // every reference example must actually use one of the fixed markers.
+        let markers = ["fully_preserved", "partially_preserved", "attribute_transfer",
+                       "weak_reference", "fully_copy", "partially_copy", "reference -"]
+        for ex in H3PromptExamples.h3Reference {
+            XCTAssertTrue(markers.contains { ex.body.contains($0) },
+                          "reference example '\(ex.title)' states no retention marker")
+        }
+    }
+
+    func testNoLtxExampleLeaksIntoTheH3ListsOrViceVersa() {
+        let ltxBodies = Set(H3PromptExamples.ltx.map(\.body))
+        let h3Bodies = Set((H3PromptExamples.h3Base + H3PromptExamples.h3Reference).map(\.body))
+        XCTAssertTrue(ltxBodies.isDisjoint(with: h3Bodies))
+        // An LTX example is prose — it must carry none of H3's section labels,
+        // or it would read as format guidance for a model that has no format.
+        for ex in H3PromptExamples.ltx {
+            for label in H3PromptExamples.referenceSections + H3PromptExamples.baseSections {
+                XCTAssertFalse(ex.body.contains(label), "LTX example '\(ex.title)' carries \(label)")
+            }
+        }
+        // And the base list must not carry the full-reference-only sections:
+        // those name attachments an FL2VA pack cannot take.
+        for ex in H3PromptExamples.h3Base {
+            for label in ["subject_definitions:", "retention_analysis:", "detailed_description:"] {
+                XCTAssertFalse(ex.body.contains(label), "base example '\(ex.title)' carries \(label)")
+            }
+        }
+        XCTAssertEqual(H3PromptExamples.examples(for: .ltx).count, H3PromptExamples.ltx.count)
+        XCTAssertEqual(H3PromptExamples.examples(for: .h3Base).count, H3PromptExamples.h3Base.count)
+        XCTAssertEqual(H3PromptExamples.examples(for: .h3Reference).count, H3PromptExamples.h3Reference.count)
+    }
+
+    func testHintAndTipsLinkAreSelectedPerBackend() {
+        // LTX keeps its own guidance verbatim, including the 15-word floor.
+        XCTAssertEqual(H3PromptExamples.hint(for: .ltx, prompt: "a cat"),
+                       "LTX-Video performs best with detailed 4–8 sentence prompts. Try Examples or Prompt tips above.")
+        XCTAssertNil(H3PromptExamples.hint(for: .ltx, prompt: H3PromptExamples.ltx[0].body))
+        XCTAssertNil(H3PromptExamples.hint(for: .ltx, prompt: ""), "an empty field shows the placeholder, not a warning")
+
+        // H3 flags the missing FORMAT, which is the thing a user cannot guess —
+        // and never quotes LTX's sentence advice at an H3 model.
+        let bare = "a low aerial shot over a volcanic coastline at golden hour"
+        let baseHint = H3PromptExamples.hint(for: .h3Base, prompt: bare)
+        XCTAssertNotNil(baseHint)
+        XCTAssertTrue(baseHint!.contains("integrated_multimodal_description:"))
+        XCTAssertFalse(baseHint!.contains("LTX"))
+        let refHint = H3PromptExamples.hint(for: .h3Reference, prompt: bare)
+        XCTAssertNotNil(refHint)
+        XCTAssertTrue(refHint!.contains("subject_definitions:"))
+        XCTAssertFalse(refHint!.contains("LTX"))
+
+        // A prompt already written in the format is never nagged.
+        XCTAssertNil(H3PromptExamples.hint(for: .h3Base, prompt: H3PromptExamples.h3Base[0].body))
+        XCTAssertNil(H3PromptExamples.hint(for: .h3Reference, prompt: H3PromptExamples.h3Reference[0].body))
+
+        // "Prompt tips" must not send an H3 user to LTX's site.
+        XCTAssertEqual(H3PromptExamples.tipsURL(for: .ltx).host, "docs.ltx.video")
+        for f in [VideoPromptFormat.h3Base, .h3Reference] {
+            let url = H3PromptExamples.tipsURL(for: f)
+            XCTAssertNotEqual(url.host, "docs.ltx.video")
+            // MiniMax's own guides — we do not ship a copy of them.
+            XCTAssertTrue(url.absoluteString.contains("MiniMax-H3"), "\(url)")
+        }
+
+        // The placeholder NAMES the labels — it is the only surface that can.
+        XCTAssertTrue(H3PromptExamples.placeholder(for: .h3Base).contains("integrated_multimodal_description:"))
+        XCTAssertTrue(H3PromptExamples.placeholder(for: .h3Reference).contains("retention_analysis:"))
+        XCTAssertFalse(H3PromptExamples.placeholder(for: .ltx).contains("integrated_multimodal_description:"))
+
+        // It renders INSIDE the 110pt prompt editor, so it has a length budget:
+        // the first draft listed one section per line and was clipped exactly
+        // where the last labels were — the part that can't be guessed. ~320
+        // chars is about six lines at the pane's minimum width; a longer
+        // placeholder needs a taller editor, not a silent clip.
+        for f in [VideoPromptFormat.ltx, .h3Base, .h3Reference] {
+            let p = H3PromptExamples.placeholder(for: f)
+            XCTAssertLessThanOrEqual(p.count, 320, "\(f) placeholder is too long for the prompt editor")
+            XCTAssertFalse(p.contains("\n"), "\(f) placeholder must wrap, not hard-break — line breaks blow the height budget")
+        }
+    }
+
+    func testH3ExamplesMatchTheMeasuredContextIRProfile() {
+        // These bars come from MiniMax's OWN expansion stage, not from taste:
+        // five H3-Context-IR expansions (2026-08-06) run ~1000-1530 chars of
+        // body for a 5-second shot, while the hand-written examples they
+        // replaced ran ~710. The main body IS the prompt, and the thin version
+        // is what a transcription of the guide drifts toward.
+        func body(_ text: String, after label: String, upTo next: String) -> String {
+            guard let a = text.range(of: label), let b = text.range(of: next, range: a.upperBound..<text.endIndex)
+            else { return "" }
+            return String(text[a.upperBound..<b.lowerBound])
+        }
+        for ex in H3PromptExamples.h3Base {
+            let main = body(ex.body, after: "integrated_multimodal_description:", upTo: "overall_soundscape:")
+            XCTAssertGreaterThan(main.count, 700, "base example '\(ex.title)' body is too thin")
+            let sound = body(ex.body, after: "overall_soundscape:", upTo: "non_diegetic_music:")
+            XCTAssertGreaterThan(sound.count, 150, "base example '\(ex.title)' soundscape is too abstract")
+            // Fields are separated by a SINGLE newline: the guide's example
+            // shows blank lines, the production stage that the model trained on
+            // does not.
+            XCTAssertFalse(ex.body.contains("\n\n\(H3PromptExamples.baseSections[1])"),
+                           "base example '\(ex.title)' uses a blank line before overall_soundscape:")
+        }
+        for ex in H3PromptExamples.h3Reference {
+            let main = body(ex.body, after: "detailed_description:", upTo: "overall_soundscape:")
+            XCTAssertGreaterThan(main.count, 1000, "reference example '\(ex.title)' detailed_description is too thin")
+        }
+        // Camera behaviour is NAMED (motion type), not just modified. Real
+        // expansions say "static shot" / "slow push in"; the version this
+        // replaced only ever said "with small amplitude at slow speed".
+        let motion = ["static shot", "push in", "pull out", "tracking shot", "pedestal",
+                      "zoom in", "zoom out", "pan left", "pan right", "truck", "tilt", "arc shot", "roll"]
+        for ex in H3PromptExamples.h3Base + H3PromptExamples.h3Reference {
+            let low = ex.body.lowercased()
+            XCTAssertTrue(motion.contains { low.contains($0) },
+                          "example '\(ex.title)' names no camera motion type")
+        }
+    }
+
+    func testCarriesSectionsRejectsOutOfOrderAndMissingLabels() {
+        // The helper is what the example guard rests on, so pin its two failure
+        // modes directly rather than trusting it via the examples.
+        let ok = "subject_definitions:\na\n\nsummary:\nb"
+        XCTAssertTrue(H3PromptExamples.carriesSections(ok, ["subject_definitions:", "summary:"]))
+        XCTAssertFalse(H3PromptExamples.carriesSections(ok, ["summary:", "subject_definitions:"]),
+                       "reversed order must fail")
+        XCTAssertFalse(H3PromptExamples.carriesSections("summary:\nb", ["subject_definitions:", "summary:"]),
+                       "a missing label must fail")
     }
 
     func testRequestBodyPipelineModeMapping() {
@@ -299,6 +554,89 @@ final class MediaGenServiceTests: XCTestCase {
         let decoded = VideoGenService.decodeFrames(obj)
         XCTAssertNotNil(decoded)
         XCTAssertNil(decoded?.audioPCM)
+    }
+
+    func testRefPayloadsBuildFromREALFilesOnDisk() throws {
+        // Every other ref2va test constructs `VideoRefPayloads` by hand, so the
+        // half a user actually exercises — picked file on disk → decode →
+        // base64 on the wire — was covered nowhere. That half is the one with
+        // AVAssetImageGenerator, JPEG re-encoding and audio extraction in it.
+        let tmp = FileManager.default.temporaryDirectory
+        let stem = UUID().uuidString
+
+        // A real clip WITH a soundtrack: 2 s so the ladder has room (5 frames
+        // needs ~0.21 s, the next rung 22 needs ~0.92 s).
+        let fps = 24, w = 32, h = 32, nf = 48
+        let rgb = Data(repeating: 90, count: nf * w * h * 3)
+        let sr = 16000, ch = 2, aFrames = sr * 2
+        var pcm = Data(count: aFrames * ch * 2)
+        pcm.withUnsafeMutableBytes { raw in
+            let p = raw.bindMemory(to: Int16.self)
+            for i in 0..<aFrames { let v = Int16(1500.0 * sin(Double(i) * 0.05)); p[i*2] = v; p[i*2+1] = v }
+        }
+        let clip = tmp.appendingPathComponent("mlxserve-ref-\(stem).mp4")
+        try VideoGenService.writeMP4(rgb: rgb, frames: nf, width: w, height: h, fps: fps, to: clip,
+                                     audioPCM: pcm, audioSampleRate: sr, audioChannels: ch)
+
+        // A real PNG.
+        let png = tmp.appendingPathComponent("mlxserve-ref-\(stem).png")
+        let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: 64, pixelsHigh: 64,
+                                   bitsPerSample: 8, samplesPerPixel: 3, hasAlpha: false, isPlanar: false,
+                                   colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)!
+        try XCTUnwrap(rep.representation(using: .png, properties: [:])).write(to: png)
+        defer { for u in [clip, png] { try? FileManager.default.removeItem(at: u) } }
+
+        var req = VideoGenRequest(model: .minimaxH3Ref2VA, prompt: "p", width: 960, height: 544,
+                                  numFrames: 124, fps: 24, mode: .oneStage, steps: 30, cfgScale: 1.0)
+        req.refImagePaths = [png.path]
+        req.refVideoPaths = [clip.path]
+        req.refAudioPaths = [clip.path]      // audio is extracted from any AV-readable file
+
+        let refs = try XCTUnwrap(VideoGenService.refPayloads(for: req), "a readable picked file must not fail the build")
+
+        // Image rides through UNCHANGED — the server resizes, so re-encoding here
+        // would only throw away what the "max" sizing mode exists to keep.
+        XCTAssertEqual(refs.images.count, 1)
+        XCTAssertEqual(Data(base64Encoded: refs.images[0])?.prefix(4), Data([0x89, 0x50, 0x4E, 0x47]), "not a PNG")
+
+        // Clip → JPEG frames on the server's own 17k+5 ladder, plus its sound.
+        XCTAssertEqual(refs.videos.count, 1)
+        let v = refs.videos[0]
+        XCTAssertGreaterThanOrEqual(v.frames.count, 5)
+        XCTAssertEqual(v.frames.count % 17, 5, "frame count \(v.frames.count) is off the 17k+5 ladder the server snaps to")
+        XCTAssertEqual(Data(base64Encoded: v.frames[0])?.prefix(2), Data([0xFF, 0xD8]), "frames must be JPEG, not PNG")
+        let sound = try XCTUnwrap(v.audio, "the clip has a soundtrack, so it must ride as the video's own audio")
+        XCTAssertEqual(Data(base64Encoded: sound)?.prefix(4), Data("RIFF".utf8), "soundtrack is not a WAV")
+
+        XCTAssertEqual(refs.audios.count, 1)
+        XCTAssertEqual(Data(base64Encoded: refs.audios[0])?.prefix(4), Data("RIFF".utf8))
+
+        // And the wire body actually carries them.
+        let body = VideoGenService.requestBody(model: "m", prompt: "p", request: req, firstFrameB64: nil, refs: refs)
+        XCTAssertEqual((body["ref_images"] as? [String])?.count, 1)
+        XCTAssertEqual((body["ref_videos"] as? [[String: Any]])?.count, 1)
+        XCTAssertEqual((body["ref_audios"] as? [String])?.count, 1)
+
+        // Same picked files against an FL2VA preset resolve to NOTHING — the
+        // capability gate, proven on real input rather than on a struct.
+        var fl = req; fl.model = .minimaxH3
+        let none = try XCTUnwrap(VideoGenService.refPayloads(for: fl))
+        XCTAssertTrue(none.images.isEmpty && none.videos.isEmpty && none.audios.isEmpty)
+    }
+
+    func testRefPayloadsFailRatherThanSilentlyDroppingAnUnreadableFile() throws {
+        // "Generated, but quietly without your reference" is the worst outcome:
+        // it looks like the feature not working rather than the file not being
+        // readable, and it costs a full generation to find out.
+        var req = VideoGenRequest(model: .minimaxH3Ref2VA, prompt: "p", width: 960, height: 544,
+                                  numFrames: 124, fps: 24, mode: .oneStage, steps: 30, cfgScale: 1.0)
+        req.refImagePaths = ["/nonexistent/\(UUID().uuidString).png"]
+        XCTAssertNil(VideoGenService.refPayloads(for: req))
+
+        var bad = VideoGenRequest(model: .minimaxH3Ref2VA, prompt: "p", width: 960, height: 544,
+                                  numFrames: 124, fps: 24, mode: .oneStage, steps: 30, cfgScale: 1.0)
+        bad.refVideoPaths = ["/nonexistent/\(UUID().uuidString).mp4"]
+        XCTAssertNil(VideoGenService.refPayloads(for: bad))
     }
 
     func testWriteMP4WithAudioProducesAnAudioTrack() async throws {
@@ -880,10 +1218,26 @@ extension MediaGenServiceTests {
         // generates off-distribution, so the picker must not offer it.
         XCTAssertEqual(h3.frameOptions.first, 124)
         XCTAssertTrue(h3.frameOptions.contains(124))
-        // Ceiling is our own validated max: the frame count behind the
-        // confirmed-good rap demo at 1344x768, not the reference docs' wider
-        // (untested-by-us) 362 claim.
+        // Ceiling is the top of the model's own ladder: MiniMax states 4-15 s
+        // at 24 fps, and 362 frames (15.1 s) is a run we have done in ONE
+        // generation. It used to stop at 209 — the rap demo's length, i.e. the
+        // longest clip we had shipped a verdict on — behind a comment calling
+        // 362 "untested-by-us" that was already out of date. What actually
+        // bounds length is memory and time, and both are modelled now
+        // (`H3PlanningTests`), so the picker offers the range and says the cost.
+        XCTAssertEqual(h3.frameOptions.last, 362)
         XCTAssertTrue(h3.frameOptions.contains(209))
+        XCTAssertEqual(h3.maxFrames, 362)
+        // No quality TIER may pick the top of the ladder: a preset is a
+        // default, and 362 frames at 1344x768 is a five-hour job that nobody
+        // should start by choosing "Quality". The slider reaches it; the tiers
+        // stop at the length we have shipped a verdict on.
+        for q in QualityPreset.allCases {
+            XCTAssertLessThanOrEqual(h3.settings(q).numFrames, 209,
+                                     "\(q) defaults past the validated length")
+        }
+        // 15.1 s at 24 fps — the top of MiniMax's stated 4-15 s range.
+        XCTAssertEqual(Double(h3.frameOptions.last!) / Double(h3.fps), 15.08, accuracy: 0.05)
 
         // Every quality preset's frame count must land ON the ladder, or the
         // Frames picker renders blank for that tier.
@@ -905,6 +1259,30 @@ extension MediaGenServiceTests {
         for r in VideoModelPreset.minimaxH3.resolutions {
             XCTAssertEqual(r.width % 32, 0, "width \(r.width) is off the 32 grid")
             XCTAssertEqual(r.height % 32, 0, "height \(r.height) is off the 32 grid")
+        }
+    }
+
+    /// 960x544 is the long-form canvas, and a relative speed label is a claim
+    /// about pixel count that has to stay true when the list grows.
+    ///
+    /// Field measurement on an M5 Max (2026-08-04, our engine): 362 frames —
+    /// the top of the 17k+5 ladder — in ONE generation at 139.6 s/step, and
+    /// 2.9x faster than 1344x768 at a matched 124 frames while costing 1.98x
+    /// fewer pixels. Adding it below 768x768 makes the old "fastest" label on
+    /// that entry false, which is exactly the drift this guard catches.
+    func testMiniMaxH3ResolutionLabelsMatchTheirPixelCost() {
+        let rs = VideoModelPreset.minimaxH3.resolutions
+        XCTAssertTrue(rs.contains { $0.id == "960x544" }, "the long-form canvas is missing")
+        let cheapest = rs.min { $0.width * $0.height < $1.width * $1.height }!
+        XCTAssertEqual(cheapest.id, "960x544")
+        for r in rs where r.label.lowercased().contains("fastest") {
+            XCTAssertEqual(r.id, cheapest.id,
+                           "\(r.id) claims fastest but \(cheapest.id) has fewer pixels")
+        }
+        // Every canvas stays inside the model's own area cap (768*1344): past
+        // it the server's own normalize would scale the request down.
+        for r in rs {
+            XCTAssertLessThanOrEqual(r.width * r.height, 768 * 1344, "\(r.id) exceeds the area cap")
         }
     }
 }

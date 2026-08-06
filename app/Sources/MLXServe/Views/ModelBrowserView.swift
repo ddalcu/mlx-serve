@@ -1277,12 +1277,23 @@ private struct ModelBrowserRow: View {
 
     @ViewBuilder
     private var actionCell: some View {
+        // Same shelf shape as GGUF, in directories instead of files: some MLX
+        // repos publish every quant as a subfolder (`LiquidAI/LFM2.5-2.6B-MLX`).
+        // Checked first — such a repo carries no `gguf` tag, so the two can't
+        // both match.
+        if model.isMlxVariantRepo, action != .unsupported {
+            if case .downloading(let progress) = action {
+                downloadingCell(progress: progress)
+            } else {
+                MlxVariantMenu(repoId: model.id, variants: model.mlxVariants, state: state)
+            }
+        }
         // A GGUF repo is a FOLDER OF QUANTS, not a model, so it never reaches a
         // terminal "on disk" state: owning Q4_K_M says nothing about whether you
         // also want Q8_0. Its cell stays a menu that marks what you have and
         // keeps offering what you don't — the old `.onDisk` collapse to
         // "✓ On disk" + trash left no way back to the quant picker.
-        if model.isGgufRepo, action != .unsupported {
+        else if model.isGgufRepo, action != .unsupported {
             if case .downloading(let progress) = action {
                 downloadingCell(progress: progress)
             } else {
@@ -1488,6 +1499,108 @@ private struct GgufQuantMenu: View {
             }
         } message: { quant in
             Text("Delete the \(quant.label) quant? Other quants of this model stay on disk.")
+        }
+    }
+}
+
+/// The action cell for a multi-variant MLX repo — the directory-shaped twin of
+/// `GgufQuantMenu`.
+///
+/// The repo publishes one complete model per quant subfolder, so like a GGUF
+/// shelf this control never "completes": variants on disk carry a ✓ and load on
+/// click, the rest download on click, each deletes on its own. Nothing is
+/// fetched here — the variant list came back with the search row (the same tree
+/// call that fills the RAM column), so the menu opens instantly.
+private struct MlxVariantMenu: View {
+    let repoId: String
+    let variants: [MlxVariant]
+    let state: DownloadManager.DownloadState?
+    @EnvironmentObject var downloads: DownloadManager
+    @EnvironmentObject var appState: AppState
+    @State private var pendingDelete: MlxVariant?
+
+    /// Each variant is its own ordinary model dir — see `MlxVariantScan.localRepoId`.
+    private func localId(_ v: MlxVariant) -> String {
+        MlxVariantScan.localRepoId(repoId: repoId, folder: v.folder)
+    }
+    private func path(of v: MlxVariant) -> String? { downloads.existingModelDir(for: localId(v)) }
+
+    private var menu: MlxVariantMenuModel.Menu {
+        MlxVariantMenuModel.build(
+            remote: variants,
+            onDisk: Set(variants.filter { downloads.isReady(localId($0)) }.map(\.folder))
+        )
+    }
+
+    private func title(_ v: MlxVariant) -> String {
+        v.sizeLabel.isEmpty ? v.label : "\(v.label) · \(v.sizeLabel)"
+    }
+
+    var body: some View {
+        let m = menu
+        Menu {
+            if !m.onDisk.isEmpty {
+                Section("On this Mac") {
+                    ForEach(m.onDisk) { v in
+                        Button {
+                            guard let p = path(of: v) else { return }
+                            Task { _ = await appState.useModelAndAwaitReady(atPath: p) }
+                        } label: {
+                            let selected = path(of: v) == appState.selectedModelPath
+                            Label(
+                                selected ? "\(v.label) — in use" : "\(v.label) — use",
+                                systemImage: selected ? "checkmark.circle.fill" : "checkmark"
+                            )
+                        }
+                    }
+                }
+            }
+
+            Section(m.onDisk.isEmpty ? "Choose a quantization" : "Download another") {
+                if m.available.isEmpty {
+                    Text("Every quantization is downloaded")
+                } else {
+                    ForEach(m.available) { v in
+                        Button(title(v)) {
+                            downloads.startMlxVariant(repoId: repoId, variant: v) {
+                                appState.refreshModels()
+                            }
+                        }
+                    }
+                }
+            }
+
+            if !m.onDisk.isEmpty {
+                // Deletes remove ONE variant. Its siblings are separate models
+                // the user didn't ask to delete.
+                Menu("Delete") {
+                    ForEach(m.onDisk) { v in
+                        Button(v.label, role: .destructive) { pendingDelete = v }
+                    }
+                }
+            }
+        } label: {
+            Text(MlxVariantMenuModel.buttonLabel(
+                onDisk: m.onDisk,
+                failed: state?.status == .failed,
+                hasPartial: variants.contains { downloads.hasPartialDownload(localId($0)) }
+            ))
+        }
+        .font(.callout)
+        .controlSize(.small)
+        .fixedSize()
+        .alert("Delete Quantization", isPresented: .init(
+            get: { pendingDelete != nil },
+            set: { if !$0 { pendingDelete = nil } }
+        ), presenting: pendingDelete) { v in
+            Button("Cancel", role: .cancel) { pendingDelete = nil }
+            Button("Delete", role: .destructive) {
+                downloads.deleteModel(repoId: localId(v))
+                pendingDelete = nil
+                appState.refreshModels()
+            }
+        } message: { v in
+            Text("Delete the \(v.label) build? Other quantizations of this model stay on disk.")
         }
     }
 }

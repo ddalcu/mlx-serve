@@ -224,6 +224,7 @@ pub extern "c" fn mlx_copy(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
 pub extern "c" fn mlx_sort_axis(res: *mlx_array, a: mlx_array, axis: c_int, s: mlx_stream) c_int;
 pub extern "c" fn mlx_argsort_axis(res: *mlx_array, a: mlx_array, axis: c_int, s: mlx_stream) c_int;
 pub extern "c" fn mlx_topk(res: *mlx_array, a: mlx_array, k: c_int, s: mlx_stream) c_int;
+pub extern "c" fn mlx_topk_axis(res: *mlx_array, a: mlx_array, k: c_int, axis: c_int, s: mlx_stream) c_int;
 pub extern "c" fn mlx_cumsum(res: *mlx_array, a: mlx_array, axis: c_int, reverse: bool, inclusive: bool, s: mlx_stream) c_int;
 
 pub extern "c" fn mlx_mean_axis(res: *mlx_array, a: mlx_array, axis: c_int, keepdims: bool, s: mlx_stream) c_int;

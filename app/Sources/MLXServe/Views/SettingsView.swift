@@ -74,7 +74,7 @@ struct SettingsView: View {
                 VStack(alignment: .leading, spacing: 0) {
                     SettingsSection(
                         category: .modelFolders,
-                        subtitle: "Always scans ~/.mlx-serve/models and ~/.lmstudio/models. Add one more folder here if your models live elsewhere — no restart needed."
+                        subtitle: "Choose where downloads are saved, and add a folder to scan if some of your models live elsewhere. Every folder listed here is served — restart the server after changing them."
                     ) {
                         ModelFoldersSectionContent()
                     }
@@ -660,15 +660,101 @@ private struct ModelFoldersSectionContent: View {
     @EnvironmentObject var downloads: DownloadManager
 
     private static let explainer = "Accepts both flat layout (<name>/config.json) and 2-level layout (<author>/<name>/config.json)."
+    private static let defaultExplainer = "Where new downloads are saved. Everything already downloaded keeps working — the old folder stays in the scan list. Restart the server to apply."
+
+    /// Re-read after a pick so the row repaints without an @Published mirror of
+    /// a value that lives in UserDefaults.
+    @State private var downloadFolderTick = 0
 
     var body: some View {
+        if BuildFeatures.current.customModelFolders { defaultFolderRow }
+        customFolderRow
+    }
+
+    // MARK: - Default (download destination)
+
+    @ViewBuilder
+    private var defaultFolderRow: some View {
+        let roots = ModelRoots()
+        let configured = roots.configuredDownloadRoot
+        let unavailable = roots.downloadRootIsUnavailable
+        SearchableRow(searchText: ["Default folder", "download", Self.defaultExplainer]) {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(alignment: .firstTextBaseline) {
+                    Text("Default folder")
+                        .font(.body)
+                    Spacer(minLength: 12)
+                    HStack(spacing: 8) {
+                        Text(configured ?? roots.downloadRoot)
+                            .font(.caption.monospaced())
+                            // An unreachable folder is shown in the warning
+                            // colour rather than swapped for the fallback: the
+                            // path the user chose is the thing they need to see
+                            // to understand where their downloads went instead.
+                            .foregroundStyle(unavailable ? AnyShapeStyle(.orange) : AnyShapeStyle(configured == nil ? .secondary : .primary))
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                            .frame(maxWidth: 220, alignment: .trailing)
+                        Button("Choose…") { chooseDownloadFolder() }
+                            .buttonStyle(.bordered)
+                        Button("Reset") {
+                            SecurityScopedBookmark.clear(name: DownloadManager.downloadFolderBookmarkName)
+                            ModelRoots().configuredDownloadRoot = nil
+                            applyFolderChange()
+                        }
+                        .buttonStyle(.bordered)
+                        .disabled(configured == nil)
+                    }
+                }
+                Text(unavailable
+                     ? "That folder isn't reachable right now, so downloads are going to \(ModelRoots.builtInRoot) instead."
+                     : Self.defaultExplainer)
+                    .font(.caption2)
+                    .foregroundStyle(unavailable ? .orange : .secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .id(downloadFolderTick)
+        }
+    }
+
+    private func chooseDownloadFolder() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Choose"
+        panel.message = "New model downloads will be saved here."
+        if let existing = ModelRoots().configuredDownloadRoot {
+            panel.directoryURL = URL(fileURLWithPath: (existing as NSString).expandingTildeInPath)
+        }
+        guard AppActivation.runModal(panel) == .OK, let url = panel.url else { return }
+        // Store the bookmark while the panel's grant is still live — the same
+        // rule the agent-workspace picker follows.
+        SecurityScopedBookmark.store(url, name: DownloadManager.downloadFolderBookmarkName)
+        SecurityScopedBookmark.startAccessOnce(name: DownloadManager.downloadFolderBookmarkName)
+        ModelRoots().configuredDownloadRoot = url.path
+        applyFolderChange()
+    }
+
+    /// One place for "the library's folders changed": the downloader re-reads
+    /// its destination, the app rescans, and the server needs a restart to pick
+    /// up the new `--model-dir` set (the banner at the top of Settings says so).
+    private func applyFolderChange() {
+        downloads.refreshRoots()
+        appState.refreshModels()
+        downloadFolderTick += 1
+    }
+
+    // MARK: - Custom (extra scan folder)
+
+    private var customFolderRow: some View {
         let pathText: String = {
             let raw = downloads.customRoot?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             return raw.isEmpty ? "(none)" : raw
         }()
         let hasPath = !(downloads.customRoot?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
 
-        SearchableRow(searchText: ["Custom folder", Self.explainer]) {
+        return SearchableRow(searchText: ["Custom folder", Self.explainer]) {
             VStack(alignment: .leading, spacing: 4) {
                 HStack(alignment: .firstTextBaseline) {
                     Text("Custom folder")
