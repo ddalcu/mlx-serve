@@ -14083,9 +14083,19 @@ fn moeRouterSource(comptime mode: RouterMode) [:0]const u8 {
             "",
         if (sigmoid)
             // MLX's `Sigmoid` unary op, verbatim (unary_ops.h): the two-sided
-            // form, not 1/(1+exp(-x)) — they differ in the last ulp.
+            // form, not 1/(1+exp(-x)) — they differ in the last ulp. `exp` is
+            // spelled PRECISE because copying upstream's TEXT is not copying
+            // its ARITHMETIC: MLX's metallib is built `-fno-fast-math`
+            // (kernels/CMakeLists.txt), so its bare `metal::exp` is the precise
+            // one, while this source is JIT-compiled at MathMode::Safe where
+            // the same spelling lowers to the fast variant. Measured 13.8% of
+            // 1M random f32 sigmoids 1 ulp apart, and 6.1% of the routing
+            // weights that come out of them; precise is 0/1M. The softmax arm
+            // below spells `fast::exp` for the mirror-image reason (softmax.h
+            // asks for fast explicitly). Costs ~1% of the kernel at an 8192-row
+            // prefill width and nothing measurable at decode.
             \\  float l = float(logits[rbase + e]);
-            \\  float sy = 1.0f / (1.0f + metal::exp(metal::abs(l)));
+            \\  float sy = 1.0f / (1.0f + metal::precise::exp(metal::abs(l)));
             \\  float sg = (l < 0.0f) ? sy : (1.0f - sy);
             \\  rk[e] = sg + float(bias[e]);
             \\  rw[e] = sg;
@@ -18883,6 +18893,11 @@ test "fused GROUPED MoE router reproduces groupLimitedRouting at the SHIPPED 512
     // triggered by an avoidable numerical change). The geometry is the SHIPPED
     // one on purpose — a group limit tuned at a toy 4x4 cannot see a mask that
     // is right for 4 groups and wrong for 8.
+    //
+    // ROWS is a SAMPLE SIZE, and a bit-equality bar is worth exactly its
+    // sample: at 4 rows this compared 32 weights, which dodged a live
+    // 6.1%-of-weights divergence on the dev GPU and hit it on CI's (the
+    // JIT-vs-metallib `exp` above). 256 rows is 2048 weights.
     const s = mlx.gpuStream();
     const allocator = testing.allocator;
     var prng = std.Random.DefaultPrng.init(0x11_6C_0DE);
@@ -18890,7 +18905,7 @@ test "fused GROUPED MoE router reproduces groupLimitedRouting at the SHIPPED 512
     moe_router_fused_override = true;
     defer moe_router_fused_override = null;
 
-    const ROWS: c_int = 4;
+    const ROWS: c_int = 256;
     const E: c_int = 512;
     const K: c_int = 8;
     const NG: c_int = 8;
