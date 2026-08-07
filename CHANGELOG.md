@@ -27,6 +27,8 @@
 - None of this changed the text any model produced. It matters if you score outputs, route on confidence, or build evals.
 - `/v1/completions` ignored its `logprobs` field entirely. It works now, in the shape the OpenAI legacy API defines.
 - Streaming ignored it too, on both chat and `/v1/completions` — and it cost you speed to do it, because asking for logprobs turns off speculative decoding whether or not you get anything back. Streaming now returns the same numbers as non-streaming, token for token.
+- On a model that thinks, the numbers described the thinking, not the reply. `logprobs.content` is the tokens of the answer, but it was built from the whole generation, so the first entry was the opening token of the model's reasoning and the list lined up with nothing you could see — 186 entries against an 8-character answer on Qwen3.6. It now covers exactly what comes back in `content`, streaming and not.
+- A reply could come back unreadable. Tokens are fragments, so one can hold half an emoji, and those raw bytes went into the JSON — the whole response then failed to parse, not just the logprobs. The token text now shows the standard replacement character and the `bytes` field beside it still carries the exact bytes.
 
 ### Also new
 

@@ -49,11 +49,25 @@ def ck(name, cond, detail=""):
     print(("  \033[32mPASS\033[0m  " if cond else "  \033[31mFAIL\033[0m  ") + name + ("  " + detail if not cond else ""))
     if not cond: fails.append(name)
 
+# A token is a BPE fragment, so it can carry HALF a multi-byte character — and
+# the token STRINGS go out in the JSON. Raw bytes there make the whole body
+# invalid UTF-8, i.e. unparseable, not merely degraded. Checked on EVERY
+# response this script makes rather than in one place, since which request
+# happens to draw a split candidate into its top-5 is luck.
+utf8_bad = []
+
 def post(path, body, stream=False):
     req = urllib.request.Request(BASE + path, data=json.dumps(body).encode(),
                                  headers={"Content-Type": "application/json"})
     r = urllib.request.urlopen(req, timeout=600)
-    return r if stream else json.load(r)
+    if stream:
+        return r
+    raw = r.read()
+    try:
+        return json.loads(raw.decode("utf-8"))
+    except UnicodeDecodeError as e:
+        utf8_bad.append((path, e.start, bytes(raw[e.start:e.start + 2])))
+        return json.loads(raw.decode("utf-8", "replace"))
 
 MSG = [{"role": "user", "content": "Count from one to eight in words."}]
 REQ = {"model": MODEL, "messages": MSG, "max_tokens": 48, "temperature": 0,
@@ -73,7 +87,7 @@ def entries_ok(label, content):
            for e in content))
     ck(f"[{label}] every entry carries bytes", all("bytes" in e for e in content))
 
-print("── [1/4] chat non-streaming ──")
+print("── [1/7] chat non-streaming ──")
 r = post("/v1/chat/completions", {**REQ, "stream": False})
 ns = (r["choices"][0].get("logprobs") or {}).get("content") or []
 ck("[non-stream] logprobs present", bool(ns), f"got {r['choices'][0].get('logprobs')}")
@@ -83,7 +97,7 @@ if ns:
        len(ns) == r["usage"]["completion_tokens"],
        f"{len(ns)} entries vs {r['usage']['completion_tokens']} tokens")
 
-print("── [2/4] temperature must not move the model's own distribution ──")
+print("── [2/7] temperature must not move the model's own distribution ──")
 a = post("/v1/chat/completions", {**REQ, "max_tokens": 1, "stream": False})["choices"][0]["logprobs"]["content"][0]
 b = post("/v1/chat/completions", {**REQ, "max_tokens": 1, "temperature": 2.0, "top_k": 1,
                                   "stream": False})["choices"][0]["logprobs"]["content"][0]
@@ -94,7 +108,7 @@ ck("distribution not saturated to 0.0 at temp 0",
    any(abs(t["logprob"]) > 1e-4 for t in a["top_logprobs"][1:]),
    f"{[round(t['logprob'],6) for t in a['top_logprobs']]}")
 
-print("── [3/4] /v1/completions: integer logprobs, four parallel arrays ──")
+print("── [3/7] /v1/completions: integer logprobs, four parallel arrays ──")
 r = post("/v1/completions", {"model": MODEL, "prompt": "Count from one to five:",
                              "max_tokens": 24, "temperature": 0, "logprobs": 5})
 lp = r["choices"][0].get("logprobs")
@@ -115,7 +129,7 @@ if lp:
                if m and abs(max(m.values()) - v) > 1e-4]
         ck("[completions] emitted token is the max of its map at temp 0", not bad, f"{bad[:3]}")
 
-print("── [4/4] STREAMING chat must carry the same logprobs ──")
+print("── [4/7] STREAMING chat must carry the same logprobs ──")
 resp = post("/v1/chat/completions", {**REQ, "stream": True}, stream=True)
 st = []
 for raw in resp:
@@ -137,7 +151,7 @@ if st:
     lp_mismatch = [i for i in range(n) if abs(st[i]["logprob"] - ns[i]["logprob"]) > 1e-6]
     ck("[stream] logprob VALUES match non-streaming", not lp_mismatch, f"{lp_mismatch[:5]}")
 
-print("── [5/5] STREAMING /v1/completions carries the legacy shape ──")
+print("── [5/7] STREAMING /v1/completions carries the legacy shape ──")
 CREQ = {"model": MODEL, "prompt": "Count from one to five:", "max_tokens": 24,
         "temperature": 0, "logprobs": 5}
 ns = post("/v1/completions", {**CREQ, "stream": False})["choices"][0]
@@ -179,6 +193,59 @@ if toks:
            len(tlp) == len(nlp["token_logprobs"])
            and all(abs(a - b) < 1e-6 for a, b in zip(tlp, nlp["token_logprobs"])),
            "values differ")
+
+print("── [6/7] logprobs describe message.content, not the reasoning we strip ──")
+# OpenAI defines `logprobs.content` as the tokens of the message CONTENT. We
+# built it from the whole generation, so on every model that thinks the array
+# described the reasoning block — text the client never receives — and entry 0
+# was the first token of the thought. Measured on Qwen3.6-27B (3 builds),
+# Qwen3.6-35B-A3B, gemma-4-31b, gemma-4-e4b, Qwen3-4B and LFM2.5: 37-186
+# entries against 8 characters of content.
+TMSG = [{"role": "user", "content": "The capital of Australia is which city? Reply with just the city."}]
+TREQ = {"model": MODEL, "messages": TMSG, "max_tokens": 300, "temperature": 0,
+        "logprobs": True, "top_logprobs": 5, "enable_thinking": True}
+r = post("/v1/chat/completions", {**TREQ, "stream": False})
+tch = r["choices"][0]
+tcontent = tch["message"].get("content") or ""
+treasoning = tch["message"].get("reasoning_content") or ""
+tents = (tch.get("logprobs") or {}).get("content") or []
+tjoined = "".join(e["token"] for e in tents)
+ck("[think non-stream] logprobs present", bool(tents))
+if tents:
+    ck("[think non-stream] entries reconstruct message.content",
+       tjoined.strip() == tcontent.strip(),
+       f"{len(tents)} entries -> {tjoined[:44]!r} vs content {tcontent[:44]!r}")
+    # Red-on-revert: pre-fix this equalled completion_tokens exactly, because
+    # every generated token got an entry whether or not it survived the split.
+    if treasoning.strip():
+        ck("[think non-stream] reasoning tokens are NOT in the array",
+           len(tents) < r["usage"]["completion_tokens"],
+           f"{len(tents)} entries vs {r['usage']['completion_tokens']} generated"
+           f" ({len(treasoning)} chars of reasoning stripped)")
+    else:
+        print("  \033[33mNOTE\033[0m  model emitted no reasoning; count check skipped")
+
+sc, sents = "", []
+for raw in post("/v1/chat/completions",
+                {**TREQ, "stream": True, "stream_options": {"include_usage": True}}, stream=True):
+    line = raw.decode().strip()
+    if not line.startswith("data: ") or line == "data: [DONE]":
+        continue
+    for ch in json.loads(line[6:]).get("choices", []):
+        sc += (ch.get("delta") or {}).get("content") or ""
+        sents.extend((ch.get("logprobs") or {}).get("content") or [])
+sjoined = "".join(e["token"] for e in sents)
+ck("[think stream] logprobs present", bool(sents), "streaming emitted NO logprobs")
+if sents:
+    # Streaming has its own content (the gate trims differently), so it is held
+    # to ITS deltas — the invariant is that entries describe what was sent.
+    ck("[think stream] entries reconstruct the content deltas",
+       sjoined.strip() == sc.strip(),
+       f"{len(sents)} entries -> {sjoined[:44]!r} vs deltas {sc[:44]!r}")
+
+print("── [7/7] every response body is valid UTF-8 ──")
+ck("no response carried a split multi-byte token as raw bytes", not utf8_bad,
+   f"{len(utf8_bad)} bodies failed to decode: {utf8_bad[:2]}")
 
 print(f"\n{checks - len(fails)}/{checks} passed")
 if fails:

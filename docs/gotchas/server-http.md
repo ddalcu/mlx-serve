@@ -580,3 +580,111 @@ bytes are interpolated into the chunk).
 **Rule of thumb this leaves behind:** when a request field costs something to
 honour, check that the cost buys delivery. A field that disables an
 optimisation and then is not emitted is strictly worse than one that 400s.
+
+---
+
+## `logprobs.content` described the thought, not the answer (2026-08-07)
+
+Found while checking an outside report that llmprobe's fidelity score could not
+rank eight local checkpoints. The report blamed the metric. Half of it was ours.
+
+### The symptom
+
+`logprobs.content` is defined by OpenAI as the tokens of the message CONTENT.
+We built it from the raw `token_ids` of the generation, which also carries the
+reasoning block, leaked tool markup, and anything the loop-trim cuts. So on any
+model that thinks, the array described text the client never received:
+
+| model | reasoning | content | logprobs entries |
+|---|---|---|---|
+| Qwen3.6-27B (3 builds) | 693 ch | 8 ch | 186 |
+| Qwen3.6-35B-A3B distill | 404 ch | 8 ch | 105 |
+| gemma-4-31b | 138 ch | 8 ch | 37 |
+| gemma-4-e4b | 303 ch | 8 ch | 79 |
+| Qwen3-4B | 443 ch | 8 ch | 104 |
+| LFM2.5-2.6B | 186 ch | 8 ch | 44 |
+
+`logprobs.content[0]` came back as `'Here'` / `'Thinking'` / `'<|channel>'` /
+`'<think>'` — the opening token of the model's reasoning. LFM2.5 does it with
+thinking OFF as well, because its template opens `<think>` unconditionally, so
+the block exists and is stripped regardless of the request flag.
+
+This is why an outside fidelity probe read `'The'` (from "The user is asking
+for…") as the answer token on every item of its battery, and concluded the
+measurement was saturated. It was pointed at the wrong position.
+
+### Why nothing caught it
+
+Same shape as the streaming drop above. Output-equality tests see identical
+text either way. The conformance suite that would have noticed reads
+`logprobs.content[0]` and trusts it — it has no independent idea of where the
+answer starts. And on a model that does NOT think, the array is correct, so any
+spot-check against Gemma answering directly looks fine.
+
+### The fix, and the trap inside it
+
+Non-streaming is arithmetic: the split helpers return raw slices into the
+generated text, so `contentTokenRange` recovers the content's byte offset by
+pointer comparison and walks per-token decoded lengths to a token index. A
+content slice it cannot locate (a future transform that rewrites rather than
+cuts) keeps the FULL range — an array we cannot align still beats no array.
+
+Streaming cannot use that directly, because the emit sites fire on the gate's
+cadence and the pending window does not correspond to any one buffer. So it is
+structural instead:
+
+- reasoning emitters never drain (they pass `.{}`);
+- a content chunk emitted after a block calls `StreamLogprobs.skipToContent`
+  first, which indexes `ids`/`lens` — complete by construction — rather than the
+  pending window, so a token whose logprob has not published yet still has a
+  length and cannot skew the boundary.
+
+**The trap: empty content.** A think block that closes with nothing after it
+emits no content chunk at all. `skipToContent` returning early on empty content
+therefore left the entire thought pending, and it rode the NEXT chunk — measured
+42 entries on a one-character delta. Four sites needed the `dropPending` arm,
+and the first three attempts at this fix were verified against the wrong code
+path entirely: the model in hand routes through the prompt-opened-think arm, not
+`.split_think`, and dumping the raw SSE frames was the only thing that showed
+which chunk actually carried the entries. **Read the wire before deciding which
+branch to patch.**
+
+The emitter scan is now two-sided: a content emitter must drain, a reasoning
+emitter must not. A one-sided guard would have accepted the version that shipped
+the thought's entries alongside the answer.
+
+## A logprobs token string is a BPE fragment (2026-08-07)
+
+A single token can carry HALF a multi-byte character; the rest arrives in the
+next token. `jsonEscape` passes every byte >= 0x20 through verbatim, so a
+`top_logprobs` candidate of `b"\xf0\x9f"` — the leading half of a 4-byte emoji,
+seen on Jundot/Qwen3.6-27B-oQ4e-mtp — went into the JSON string as raw bytes:
+
+```
+"bytes":[10,10]},{"token":"\xf0\x9f","logprob":-15.000000,"bytes":[240,15…
+                           ^ byte 75009 of a 77211-byte body
+UnicodeDecodeError: 'utf-8' codec can't decode bytes in position 75009-75010
+```
+
+The whole response fails to parse. Not a degraded field — an unusable response,
+from one candidate in one top-5 list. It surfaced as a bare decode error while
+sweeping models for the alignment bug, on one model out of seven.
+
+`jsonEscapeLossy` emits U+FFFD per invalid sequence, using the maximal-subpart
+rule so a character split across two tokens costs one replacement rather than
+one per byte. `bytes` is untouched and still carries the exact bytes, which is
+OpenAI's own shape and lets a client reassemble across tokens.
+
+Two things not to do:
+
+- **Do not widen it to `jsonEscape` or `appendJsonString`.** Every other string
+  we emit is complete decoded text and valid UTF-8 by construction; the fragment
+  problem is unique to per-token decodes.
+- **Do not "fix" the legacy collision.** `/v1/completions` keys `top_logprobs`
+  by token TEXT, so two invalid candidates both render U+FFFD and collide into
+  one key. That is OpenAI's shape reproduced faithfully; a test that pins it away
+  would be pinning our own invention.
+
+The integration guard checks EVERY response body the script produces rather than
+one crafted request, because which request happens to draw a split candidate
+into its top-5 is luck.

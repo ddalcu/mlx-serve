@@ -5763,11 +5763,17 @@ fn handleNonStreamingGeneration(
     const escaped_text = escaped.slice;
     defer if (escaped.owned) allocator.free(escaped.slice);
 
-    // Build logprobs JSON if requested
+    // Build logprobs JSON if requested. The array describes `message.content`,
+    // so it stops at the tokens that survived the think split — see
+    // `contentTokenRange`.
     var logprobs_json: []const u8 = "null";
     var logprobs_allocated = false;
     if (result.logprobs) |lps| {
-        logprobs_json = try formatLogprobsObject(allocator, tok, result.token_ids, lps);
+        const n = @min(result.token_ids.len, lps.len);
+        const r = contentTokenRange(allocator, tok, result.token_ids[0..n], final_text, content_text);
+        const a = @min(r.start, n);
+        const b = @min(@max(r.end, a), n);
+        logprobs_json = try formatLogprobsObject(allocator, tok, result.token_ids[a..b], lps[a..b]);
         logprobs_allocated = true;
     }
     defer if (logprobs_allocated) allocator.free(logprobs_json);
@@ -6423,7 +6429,7 @@ fn handleStreamingGeneration(
                             const so_far = chat_mod.splitThinkBlock(buf, true, opens_think);
                             if (so_far.reasoning_content) |rc| {
                                 if (chat_mod.unstreamedReasoning(rc, reasoning_streamed)) |fresh| {
-                                    try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = fresh }, null, null, null, .{ .logprobs_json = try lps.take() });
+                                    try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = fresh }, null, null, null, .{});
                                     reasoning_streamed = rc.len;
                                 }
                             }
@@ -6432,6 +6438,14 @@ fn handleStreamingGeneration(
                     .split_think => {
                         // Complete thinking block — split into reasoning + content
                         const split = chat_mod.splitThinkBlock(buf, enable_thinking, opens_think);
+                        // The thought's tokens never reach the client, so their
+                        // entries must not ride the content chunk below — the
+                        // reasoning emitters above deliberately do not drain.
+                        // Empty content means the block closed with nothing
+                        // after it: everything buffered so far was reasoning,
+                        // and leaving it pending hands it to the NEXT chunk
+                        // (measured: 42 entries on a 1-char delta).
+                        if (split.content.len > 0) lps.skipToContent(buf, split.content) else lps.dropPending();
                         for (token_texts.items) |tt| allocator.free(tt);
                         token_texts.clearRetainingCapacity();
                         text_buf.clearRetainingCapacity();
@@ -6440,7 +6454,7 @@ fn handleStreamingGeneration(
                         if (enable_thinking) {
                             if (split.reasoning_content) |rc| {
                                 if (chat_mod.unstreamedReasoning(rc, reasoning_streamed)) |fresh| {
-                                    try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = fresh }, null, null, null, .{ .logprobs_json = try lps.take() });
+                                    try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = fresh }, null, null, null, .{});
                                 }
                             }
                         }
@@ -6494,7 +6508,12 @@ fn handleStreamingGeneration(
                 think_closed = true;
                 in_think_block = false;
                 if (after.len > 0) {
+                    // The dropped block's tokens are not content — their
+                    // entries must not ride this chunk.
+                    lps.skipToContent(think_buf.items, after);
                     try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = after }, null, null, null, .{ .logprobs_json = try lps.take() });
+                } else {
+                    lps.dropPending();
                 }
                 think_buf.clearRetainingCapacity();
             }
@@ -6563,7 +6582,7 @@ fn handleStreamingGeneration(
                 budget_exhausted = true;
                 // Flush all buffered reasoning
                 if (think_buf.items.len > 0) {
-                    try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = think_buf.items }, null, null, null, .{ .logprobs_json = try lps.take() });
+                    try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = think_buf.items }, null, null, null, .{});
                 }
                 think_buf.clearRetainingCapacity();
                 in_think_block = false;
@@ -6602,7 +6621,7 @@ fn handleStreamingGeneration(
 
             if (close_match) |m| {
                 if (m.pos > 0) {
-                    try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = think_buf.items[0..m.pos] }, null, null, null, .{ .logprobs_json = try lps.take() });
+                    try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = think_buf.items[0..m.pos] }, null, null, null, .{});
                 }
                 const after = m.pos + m.len;
                 var content_after = std.mem.trimStart(u8, think_buf.items[after..], "\n ");
@@ -6619,7 +6638,12 @@ fn handleStreamingGeneration(
                 if (std.mem.indexOf(u8, content_after, "<|end_message|>")) |em| content_after = content_after[0..em];
                 content_after = std.mem.trimStart(u8, content_after, "\n ");
                 if (content_after.len > 0) {
+                    // The reasoning above this point never reaches the client,
+                    // so its entries stop here rather than riding the answer.
+                    lps.skipToContent(think_buf.items, content_after);
                     try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = content_after }, null, null, null, .{ .logprobs_json = try lps.take() });
+                } else {
+                    lps.dropPending();
                 }
                 think_buf.clearRetainingCapacity();
                 in_think_block = false;
@@ -6634,7 +6658,7 @@ fn handleStreamingGeneration(
                 var safe_len = think_buf.items.len - chat_mod.partialThinkCloseSuffixLen(think_buf.items);
                 while (safe_len > 0 and safe_len < think_buf.items.len and (think_buf.items[safe_len] & 0xC0) == 0x80) safe_len -= 1;
                 if (safe_len > 0) {
-                    try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = think_buf.items[0..safe_len] }, null, null, null, .{ .logprobs_json = try lps.take() });
+                    try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = think_buf.items[0..safe_len] }, null, null, null, .{});
                     const remaining = try allocator.dupe(u8, think_buf.items[safe_len..]);
                     think_buf.clearRetainingCapacity();
                     try think_buf.appendSlice(allocator, remaining);
@@ -6673,7 +6697,7 @@ fn handleStreamingGeneration(
         // shipped its whole answer as reasoning with EMPTY content, while
         // non-streaming returned it correctly (live 2026-08-04).
         if (chat_mod.streamTailIsReasoning(in_think_block, prompt_opened_think, saw_think_open)) {
-            try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = think_buf.items }, null, null, null, .{ .logprobs_json = try lps.take() });
+            try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = think_buf.items }, null, null, null, .{});
         } else {
             try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = think_buf.items }, null, null, null, .{ .logprobs_json = try lps.take() });
         }
@@ -6725,13 +6749,13 @@ fn handleStreamingGeneration(
                         if (r_ids.len > budget_usize) {
                             const truncated = try tok.decode(allocator, r_ids[0..budget_usize], false);
                             defer allocator.free(truncated);
-                            try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = truncated }, null, null, null, .{ .logprobs_json = try lps.take() });
+                            try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = truncated }, null, null, null, .{});
                             break :blk @as(?[]const u8, null);
                         }
                         break :blk @as(?[]const u8, reasoning);
                     } else @as(?[]const u8, reasoning);
                     if (final_reasoning) |r| {
-                        try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = r }, null, null, null, .{ .logprobs_json = try lps.take() });
+                        try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = r }, null, null, null, .{});
                     }
                 }
             }
@@ -6780,17 +6804,27 @@ fn handleStreamingGeneration(
                         if (r_ids.len > budget_usize) {
                             const truncated = try tok.decode(allocator, r_ids[0..budget_usize], false);
                             defer allocator.free(truncated);
-                            try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = truncated }, null, null, null, .{ .logprobs_json = try lps.take() });
+                            try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = truncated }, null, null, null, .{});
                             break :blk @as(?[]const u8, null);
                         }
                         break :blk @as(?[]const u8, reasoning);
                     } else @as(?[]const u8, reasoning);
                     if (final_reasoning) |r| {
-                        try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = r }, null, null, null, .{ .logprobs_json = try lps.take() });
+                        try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = r }, null, null, null, .{});
                     }
                 }
                 if (think_split.content.len > 0) {
+                    // Locate against the RAW concatenation: it is always a true
+                    // suffix of the generation, where `flush_text` may be a
+                    // normalized rewrite. If the content cannot be found there
+                    // (normalization moved it) nothing is skipped, which is the
+                    // old behaviour rather than a wrong boundary.
+                    lps.skipToContent(full_text.items, think_split.content);
                     try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = think_split.content }, null, null, null, .{ .logprobs_json = try lps.take() });
+                } else {
+                    // All reasoning, no content: those entries describe text the
+                    // client never received.
+                    lps.dropPending();
                 }
             } else {
                 // Thinking off: the held tail flushes verbatim. It was held
@@ -6806,7 +6840,10 @@ fn handleStreamingGeneration(
                 }
                 const visible = chat_mod.trimLeakedToolMarkup(flush_text.items);
                 if (visible.len > 0) {
+                    lps.skipToContent(flush_text.items, visible);
                     try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = visible }, null, null, null, .{ .logprobs_json = try lps.take() });
+                } else {
+                    lps.dropPending();
                 }
             }
         }
@@ -6879,6 +6916,12 @@ const StreamLogprobs = struct {
     /// How many entries have already ridden a chunk.
     emitted: usize = 0,
     ids: std.ArrayList(u32) = .empty,
+    /// Decoded byte length of each noted token, so a byte offset in the
+    /// generated text converts to a token index WITHOUT re-decoding and without
+    /// depending on how far entry publication has lagged behind `ids`.
+    lens: std.ArrayList(usize) = .empty,
+    /// Total decoded bytes noted so far — the generation's length.
+    bytes_noted: usize = 0,
     entries: std.ArrayList(generate_mod.LogprobResult) = .empty,
     /// The last rendered JSON, owned here and freed on the next drain — the
     /// caller passes it straight into a chunk and never sees the lifetime.
@@ -6892,6 +6935,7 @@ const StreamLogprobs = struct {
     fn deinit(self: *StreamLogprobs) void {
         if (self.rendered) |r| self.allocator.free(r);
         self.ids.deinit(self.allocator);
+        self.lens.deinit(self.allocator);
         self.entries.deinit(self.allocator);
     }
 
@@ -6900,6 +6944,52 @@ const StreamLogprobs = struct {
     fn note(self: *StreamLogprobs, id: u32) !void {
         if (!self.enabled) return;
         try self.ids.append(self.allocator, id);
+        const text = self.tok.decode(self.allocator, &[_]u32{id}, false) catch "";
+        defer if (text.len > 0) self.allocator.free(text);
+        try self.lens.append(self.allocator, text.len);
+        self.bytes_noted += text.len;
+    }
+
+    /// Drop the entries for tokens whose bytes never reach the client.
+    ///
+    /// `logprobs.content` describes `message.content`, and the think gate cuts
+    /// the reasoning block out of the stream — so without this the entries
+    /// shipped alongside the answer were the model's *thinking*. `tail` is the
+    /// gate's buffer (always a suffix of the generation, since it is only ever
+    /// cleared wholesale) and `content` the part of it that survives.
+    ///
+    /// Indexes `ids`/`lens`, which are complete, rather than the pending
+    /// window — a token whose logprob has not been published yet still has a
+    /// length, so a lagging publisher cannot skew the boundary.
+    fn skipToContent(self: *StreamLogprobs, tail: []const u8, content: []const u8) void {
+        if (!self.enabled or content.len == 0) return;
+        const base = @intFromPtr(tail.ptr);
+        const cptr = @intFromPtr(content.ptr);
+        const off_in_tail = if (cptr >= base and cptr + content.len <= base + tail.len)
+            cptr - base
+        else
+            std.mem.indexOf(u8, tail, content) orelse return;
+        if (self.bytes_noted < tail.len) return;
+        const abs = self.bytes_noted - tail.len + off_in_tail;
+
+        var off: usize = 0;
+        for (self.lens.items, 0..) |len, i| {
+            // A token straddling the boundary put bytes into content, so it is
+            // the first content token rather than the last reasoning one.
+            if (off + len > abs) {
+                if (i > self.emitted) self.emitted = i;
+                return;
+            }
+            off += len;
+        }
+        self.emitted = self.ids.items.len;
+    }
+
+    /// Retire every pending entry unshipped — the turn produced no content, so
+    /// nothing pending describes text the client received.
+    fn dropPending(self: *StreamLogprobs) void {
+        if (!self.enabled) return;
+        self.emitted = self.ids.items.len;
     }
 
     /// Render everything new, or null when logprobs weren't requested or
@@ -7623,22 +7713,49 @@ test "every streaming chat emitter carries logprobs (silently-ignored-field guar
     const fn_end = fn_start + 8 + (std.mem.indexOf(u8, rest, "\nfn ") orelse rest.len);
     const body = src[fn_start..fn_end];
 
+    // The rule has two halves, because `logprobs.content` describes
+    // `message.content`. A CONTENT emitter must drain, or the field is built
+    // and dropped. A REASONING emitter must NOT: the thought is cut before the
+    // client sees it, so entries riding a reasoning chunk describe text that
+    // was never delivered — which is how `logprobs.content[0]` came to be the
+    // first token of the model's thinking on every model that thinks.
     const needle = "sendSSEChunk" ++ "(allocator";
     const bare = ", ." ++ "{});";
+    const reasoning = ".reasoning" ++ "_content = ";
     var i: usize = 0;
-    var emitters: usize = 0;
+    var content_emitters: usize = 0;
+    var reasoning_emitters: usize = 0;
     while (std.mem.indexOfPos(u8, body, i, needle)) |at| {
         const line_end = std.mem.indexOfScalarPos(u8, body, at, '\n') orelse body.len;
         const line = body[at..line_end];
-        emitters += 1;
-        if (std.mem.indexOf(u8, line, bare) != null) {
-            std.debug.print("streaming emitter drops logprobs: {s}\n", .{line});
-            return error.StreamingEmitterDropsLogprobs;
+        const is_reasoning = std.mem.indexOf(u8, line, reasoning) != null;
+        const is_bare = std.mem.indexOf(u8, line, bare) != null;
+        if (is_reasoning) {
+            reasoning_emitters += 1;
+            if (!is_bare) {
+                std.debug.print("reasoning emitter ships CONTENT logprobs: {s}\n", .{line});
+                return error.ReasoningEmitterShipsLogprobs;
+            }
+        } else {
+            content_emitters += 1;
+            if (is_bare) {
+                std.debug.print("streaming emitter drops logprobs: {s}\n", .{line});
+                return error.StreamingEmitterDropsLogprobs;
+            }
         }
         i = line_end;
     }
-    // A zero here would pass the loop vacuously — the shape it guards must exist.
-    try std.testing.expect(emitters >= 20);
+    // Zeroes would pass the loops vacuously — both shapes must exist.
+    try std.testing.expect(content_emitters >= 10);
+    try std.testing.expect(reasoning_emitters >= 5);
+
+    // The boundary itself: a content chunk emitted after a think block has to
+    // move the cursor past the reasoning tokens first, or the answer's chunk
+    // ships the whole thought's entries (measured: 42 on a 1-char delta).
+    const skips = "lps.skipToContent" ++ "(";
+    const drops = "lps.dropPending" ++ "(";
+    try std.testing.expect(std.mem.indexOf(u8, body, skips) != null);
+    try std.testing.expect(std.mem.indexOf(u8, body, drops) != null);
 
     // Both halves of the path to the wire, or the field is built and dropped:
     // sendSSEChunk must READ the extra, and the rendered bytes must be
@@ -8008,6 +8125,49 @@ fn jsonEscape(allocator: std.mem.Allocator, input: []const u8) ![]const u8 {
     return result.toOwnedSlice(allocator);
 }
 
+/// `jsonEscape` for text that is NOT guaranteed to be valid UTF-8.
+///
+/// A single token is a BPE fragment, so it can carry only PART of a multi-byte
+/// character — the rest arrives in the next token. `jsonEscape` passes every
+/// byte >= 0x20 through verbatim, so those raw bytes landed in the JSON string
+/// and the WHOLE response body stopped being valid UTF-8: unparseable, not
+/// merely degraded. Live on Qwen3.6-27B, a `b"\xf0\x9f"` candidate (the first
+/// half of a 4-byte emoji) inside `top_logprobs`.
+///
+/// The `bytes` array beside it carries the exact bytes, so the string is the
+/// lossy view — one U+FFFD per invalid sequence, which is the shape OpenAI
+/// documents. Only the logprobs token strings need this: every other string we
+/// emit is complete decoded text, valid UTF-8 by construction.
+fn jsonEscapeLossy(allocator: std.mem.Allocator, input: []const u8) ![]const u8 {
+    if (std.unicode.utf8ValidateSlice(input)) return jsonEscape(allocator, input);
+
+    const replacement = "\u{FFFD}";
+    var clean = std.ArrayList(u8).empty;
+    defer clean.deinit(allocator);
+
+    var i: usize = 0;
+    while (i < input.len) {
+        const len = std.unicode.utf8ByteSequenceLength(input[i]) catch {
+            try clean.appendSlice(allocator, replacement);
+            i += 1;
+            continue;
+        };
+        if (i + len <= input.len and std.unicode.utf8ValidateSlice(input[i .. i + len])) {
+            try clean.appendSlice(allocator, input[i .. i + len]);
+            i += len;
+            continue;
+        }
+        // Consume the lead plus the continuation bytes that follow it as ONE
+        // maximal subpart, so a character split across two tokens costs a
+        // single replacement rather than one per byte.
+        var j = i + 1;
+        while (j < input.len and j < i + len and input[j] & 0xC0 == 0x80) j += 1;
+        try clean.appendSlice(allocator, replacement);
+        i = j;
+    }
+    return jsonEscape(allocator, clean.items);
+}
+
 /// Build logprobs JSON for a single token (for both streaming and non-streaming).
 /// Returns a string like: {"token":"hello","logprob":-1.23,"bytes":[104,101],"top_logprobs":[...]}
 fn formatTokenLogprob(
@@ -8024,7 +8184,7 @@ fn formatTokenLogprob(
     const token_text = try tok.decode(allocator, &[_]u32{token_id}, strip and false);
     defer allocator.free(token_text);
 
-    const escaped_token = try jsonEscape(allocator, token_text);
+    const escaped_token = try jsonEscapeLossy(allocator, token_text);
     defer allocator.free(escaped_token);
 
     // Build bytes array
@@ -8048,7 +8208,7 @@ fn formatTokenLogprob(
 
         const tlp_text = try tok.decode(allocator, &[_]u32{tlp.token_id}, strip and false);
         defer allocator.free(tlp_text);
-        const escaped_tlp = try jsonEscape(allocator, tlp_text);
+        const escaped_tlp = try jsonEscapeLossy(allocator, tlp_text);
         defer allocator.free(escaped_tlp);
 
         // Bytes for this token
@@ -8117,7 +8277,7 @@ fn formatCompletionsLogprobs(
         }
         const text = try tok.decode(allocator, &[_]u32{token_ids[i]}, false);
         defer allocator.free(text);
-        const esc = try jsonEscape(allocator, text);
+        const esc = try jsonEscapeLossy(allocator, text);
         defer allocator.free(esc);
         try toks.appendSlice(allocator, esc);
 
@@ -8131,7 +8291,7 @@ fn formatCompletionsLogprobs(
             if (j > 0) try tops.appendSlice(allocator, ",");
             const ttext = try tok.decode(allocator, &[_]u32{t.token_id}, false);
             defer allocator.free(ttext);
-            const tesc = try jsonEscape(allocator, ttext);
+            const tesc = try jsonEscapeLossy(allocator, ttext);
             defer allocator.free(tesc);
             try tops.appendSlice(allocator, tesc);
             try tops.appendSlice(allocator, ":");
@@ -8148,6 +8308,53 @@ fn formatCompletionsLogprobs(
     return try std.fmt.allocPrint(allocator,
         \\{{"tokens":{s},"token_logprobs":{s},"top_logprobs":{s},"text_offset":{s}}}
     , .{ toks.items, lps.items, tops.items, offs.items });
+}
+
+/// The half-open token range whose decoded text lands inside `content`.
+const ContentTokenRange = struct { start: usize, end: usize };
+
+/// Which of the generated tokens survive into `message.content`.
+///
+/// OpenAI defines `logprobs.content` as the tokens of the message CONTENT, but
+/// the generation also carries the reasoning block, any leaked tool markup and
+/// a loop-trimmed tail — all cut before the text reaches the client. Emitting
+/// entries for cut text makes the array correspond to nothing the client can
+/// see: on every model that thinks, `logprobs.content[0]` was the first token
+/// of the reasoning.
+///
+/// The split helpers return raw slices into `full_text`, so the offset is exact
+/// pointer arithmetic. A content that is not a slice of it (a future transform
+/// that rewrites rather than cuts) falls back to a search, and failing that to
+/// the full range — an array we cannot align is still better than none.
+fn contentTokenRange(
+    allocator: std.mem.Allocator,
+    tok: *const Tokenizer,
+    token_ids: []const u32,
+    full_text: []const u8,
+    content: []const u8,
+) ContentTokenRange {
+    const all = ContentTokenRange{ .start = 0, .end = token_ids.len };
+    if (content.len == 0) return .{ .start = 0, .end = 0 };
+
+    const base = @intFromPtr(full_text.ptr);
+    const cptr = @intFromPtr(content.ptr);
+    const start_off = if (cptr >= base and cptr + content.len <= base + full_text.len)
+        cptr - base
+    else
+        std.mem.indexOf(u8, full_text, content) orelse return all;
+    const end_off = start_off + content.len;
+
+    var start: ?usize = null;
+    var off: usize = 0;
+    for (token_ids, 0..) |id, i| {
+        if (off >= end_off) return .{ .start = start orelse i, .end = i };
+        const text = tok.decode(allocator, &[_]u32{id}, false) catch return all;
+        defer allocator.free(text);
+        // A token straddling the boundary belongs to content: it put bytes there.
+        if (start == null and off + text.len > start_off) start = i;
+        off += text.len;
+    }
+    return .{ .start = start orelse token_ids.len, .end = token_ids.len };
 }
 
 /// Build the full logprobs object for a non-streaming response.
@@ -14640,4 +14847,139 @@ test "formatCompletionsLogprobs: legacy shape, byte-aligned offsets, escaped tok
     try std.testing.expectEqual(@as(usize, 2), top0.count());
     try std.testing.expect(top0.get("Paris") != null);
     try std.testing.expect(top0.get("a\x01\"b") != null);
+}
+
+test "logprobs token strings are valid UTF-8 — a split multi-byte token can't break the body" {
+    // A single token is a BPE fragment, so it can carry HALF a multi-byte
+    // character; `jsonEscape` passes every byte >= 0x20 through verbatim, so
+    // those raw bytes landed in the JSON string and the WHOLE response body
+    // stopped being valid UTF-8 — not a degraded field, an unparseable
+    // response. Live on Jundot/Qwen3.6-27B-oQ4e-mtp: a `b"\xf0\x9f"` candidate
+    // (the first 2 bytes of a 4-byte emoji) in `top_logprobs`.
+    //
+    // `bytes` already carries the truth, so the string is the lossy view:
+    // U+FFFD per invalid sequence, which is what OpenAI's own shape does.
+    const allocator = std.testing.allocator;
+
+    var tok = Tokenizer.initEmptyForTests(allocator, .byte_level_bpe);
+    defer tok.vocab.deinit();
+    defer tok.id_to_token.deinit();
+    defer tok.merge_ranks.deinit();
+    defer tok.special_tokens.deinit();
+    defer tok.unicode_to_byte.deinit();
+    // Byte-level BPE stores its vocab in the byte-to-unicode alphabet, so the
+    // split sequence has to come out of `decode`, not sit in the vocab: map
+    // three placeholder codepoints back onto the raw bytes.
+    try tok.unicode_to_byte.put('A', 0xf0);
+    try tok.unicode_to_byte.put('B', 0x9f);
+    try tok.unicode_to_byte.put('C', 0xe2);
+    try tok.unicode_to_byte.put('D', 0x82);
+    try tok.id_to_token.put(1, "ok");
+    // Leading half of U+1F600, exactly as the live checkpoint emitted it.
+    try tok.id_to_token.put(2, "AB");
+    // A lone continuation byte, and a 3-byte lead truncated to 2.
+    try tok.id_to_token.put(3, "B");
+    try tok.id_to_token.put(4, "CD");
+
+    var t0 = [_]generate_mod.TokenLogprob{
+        .{ .token_id = 1, .logprob = -0.1 },
+        .{ .token_id = 2, .logprob = -9.0 },
+        .{ .token_id = 3, .logprob = -9.5 },
+        .{ .token_id = 4, .logprob = -9.9 },
+    };
+    const token_ids = [_]u32{1};
+
+    // Chat shape.
+    const chat_json = try formatTokenLogprob(allocator, &tok, 2, -9.0, &t0);
+    defer allocator.free(chat_json);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(chat_json));
+    const chat_parsed = try std.json.parseFromSlice(std.json.Value, allocator, chat_json, .{});
+    defer chat_parsed.deinit();
+    // The lossy string stands in for the split character...
+    try std.testing.expectEqualStrings("\u{FFFD}", chat_parsed.value.object.get("token").?.string);
+    // ...while `bytes` still reports exactly what the model emitted, so a
+    // client that cares can reassemble it across tokens.
+    const bytes = chat_parsed.value.object.get("bytes").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), bytes.len);
+    try std.testing.expectEqual(@as(i64, 0xf0), bytes[0].integer);
+    try std.testing.expectEqual(@as(i64, 0x9f), bytes[1].integer);
+
+    // Legacy /v1/completions shape — same escaper, same guarantee. Its
+    // `top_logprobs` is a map keyed by token TEXT, so it carries ONE invalid
+    // candidate here: two would both render as U+FFFD and collide into a single
+    // key. That collision is OpenAI's own shape reproduced faithfully, not a
+    // defect this test should pin away.
+    var comp_top = [_]generate_mod.TokenLogprob{
+        .{ .token_id = 1, .logprob = -0.1 },
+        .{ .token_id = 2, .logprob = -9.0 },
+    };
+    const comp_lps = [_]generate_mod.LogprobResult{.{ .token_logprob = -0.1, .top_logprobs = &comp_top }};
+    var tbase: usize = 0;
+    const comp_json = try formatCompletionsLogprobs(allocator, &tok, &token_ids, &comp_lps, &tbase);
+    defer allocator.free(comp_json);
+    try std.testing.expect(std.unicode.utf8ValidateSlice(comp_json));
+    const comp_parsed = try std.json.parseFromSlice(std.json.Value, allocator, comp_json, .{});
+    defer comp_parsed.deinit();
+    // text_offset stays on the RAW byte length — it indexes the completion the
+    // client received, which is unaffected by how the string renders.
+    try std.testing.expectEqual(@as(usize, 2), tbase);
+
+    // Valid UTF-8 is untouched, including multi-byte that arrives whole.
+    try tok.id_to_token.put(5, "é€");
+    const clean = try formatTokenLogprob(allocator, &tok, 5, -1.0, &[_]generate_mod.TokenLogprob{});
+    defer allocator.free(clean);
+    const clean_parsed = try std.json.parseFromSlice(std.json.Value, allocator, clean, .{});
+    defer clean_parsed.deinit();
+    try std.testing.expectEqualStrings("é€", clean_parsed.value.object.get("token").?.string);
+}
+
+test "contentTokenRange: logprobs cover the CONTENT, not the reasoning we stripped" {
+    // `logprobs.content` is defined as the tokens of the message content, but we
+    // built it from the whole generation — so on every model that thinks, entry
+    // 0 was the first token of the *reasoning* and the array lined up with
+    // nothing the client could see. Measured on Qwen3.6-27B (3 builds),
+    // Qwen3.6-35B-A3B, gemma-4-31b, gemma-4-e4b, Qwen3-4B and LFM2.5.
+    const allocator = std.testing.allocator;
+
+    var tok = Tokenizer.initEmptyForTests(allocator, .byte_level_bpe);
+    defer tok.vocab.deinit();
+    defer tok.id_to_token.deinit();
+    defer tok.merge_ranks.deinit();
+    defer tok.special_tokens.deinit();
+    defer tok.unicode_to_byte.deinit();
+    try tok.id_to_token.put(1, "<think>");
+    try tok.id_to_token.put(2, "\nBecause.\n");
+    try tok.id_to_token.put(3, "</think>");
+    try tok.id_to_token.put(4, "Can");
+    try tok.id_to_token.put(5, "berra");
+
+    const token_ids = [_]u32{ 1, 2, 3, 4, 5 };
+    const full = "<think>\nBecause.\n</think>Canberra";
+    const content = full[("<think>\nBecause.\n</think>").len..];
+    try std.testing.expectEqualStrings("Canberra", content);
+
+    const r = contentTokenRange(allocator, &tok, &token_ids, full, content);
+    try std.testing.expectEqual(@as(usize, 3), r.start);
+    try std.testing.expectEqual(@as(usize, 5), r.end);
+
+    // Whole text as content (a model that did not think) keeps every entry.
+    const all = contentTokenRange(allocator, &tok, &token_ids, full, full);
+    try std.testing.expectEqual(@as(usize, 0), all.start);
+    try std.testing.expectEqual(@as(usize, 5), all.end);
+
+    // Empty content (a turn that was all reasoning) emits no entries rather
+    // than the reasoning's.
+    const none = contentTokenRange(allocator, &tok, &token_ids, full, full[0..0]);
+    try std.testing.expectEqual(@as(usize, 0), none.start);
+    try std.testing.expectEqual(@as(usize, 0), none.end);
+
+    // A content slice we cannot locate keeps the full range: an array we can't
+    // align is still better than dropping it silently.
+    const foreign = contentTokenRange(allocator, &tok, &token_ids, full, "not in there");
+    try std.testing.expectEqual(@as(usize, 0), foreign.start);
+    try std.testing.expectEqual(@as(usize, 5), foreign.end);
+
+    // A token straddling the boundary belongs to content — it put bytes there.
+    const mid = contentTokenRange(allocator, &tok, &token_ids, full, full[("<think>\nBecause.\n</thi").len..]);
+    try std.testing.expectEqual(@as(usize, 2), mid.start);
 }
