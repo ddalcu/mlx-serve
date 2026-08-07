@@ -83,13 +83,27 @@ final class ModelRootsTests: XCTestCase {
     /// The historical root does not stop being scanned when the destination
     /// moves. Everything downloaded before the change lives there, and dropping
     /// it would make a user's whole library vanish from the picker.
+    ///
+    /// `scanRoots` only emits folders that EXIST, so this rule is invisible on
+    /// a machine that has never downloaded anything — which is every CI runner,
+    /// and where this asserted a developer's own disk rather than the code
+    /// (`NSHomeDirectory()` ignores a `HOME` override, so the folder cannot be
+    /// faked away either). Create it, and take it back if it wasn't already
+    /// there.
     func testTheBuiltInFolderIsStillScannedAfterTheDestinationMoves() {
+        let builtIn = ModelRoots.builtInRoot
+        let preexisting = FileManager.default.fileExists(atPath: builtIn)
+        if !preexisting {
+            try? FileManager.default.createDirectory(atPath: builtIn, withIntermediateDirectories: true)
+        }
+        defer { if !preexisting { try? FileManager.default.removeItem(atPath: builtIn) } }
+
         let dest = tempDir("dest")
         var roots = ModelRoots(defaults: defaults)
         roots.configuredDownloadRoot = dest
         let all = roots.scanRoots(lmStudioRoot: nil)
         XCTAssertEqual(all.first, dest)
-        XCTAssertTrue(all.contains(NSString(string: "~/.mlx-serve/models").expandingTildeInPath),
+        XCTAssertTrue(all.contains(builtIn),
                       "models downloaded before the move must stay visible")
     }
 
