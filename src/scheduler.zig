@@ -618,8 +618,32 @@ pub const Slot = struct {
 
     /// Inference thread: enqueue a generated token for the consumer.
     fn pushToken(self: *Slot, t: u32) void {
+        self.pushTokenWithLogprob(t, null);
+    }
+
+    /// Publish one token and, when the request asked for logprobs, the entry
+    /// describing it — in ONE critical section.
+    ///
+    /// Both must move under `out_mu` together. The streaming path reads entry
+    /// i as soon as it is handed token i, so an append outside the lock races
+    /// the reader two ways: the entry may not be visible yet (a silently
+    /// missing trailing logprob), and a concurrent grow reallocates the
+    /// backing array under a reader mid-copy. Non-streaming consumes the whole
+    /// buffer at completion and is blind to both, which is why the streaming
+    /// gap survived: it is invisible to output-equality tests AND to llmprobe,
+    /// which probes logprobs non-streaming only.
+    fn pushTokenWithLogprob(self: *Slot, t: u32, lp: ?generate_mod.LogprobResult) void {
         self.out_mu.lockUncancelable(self.io);
         defer self.out_mu.unlock(self.io);
+        if (lp) |entry| {
+            // Degrade to error like the token append below — and do NOT return:
+            // the broadcast at the bottom is what wakes a reader blocked on the
+            // condvar, so an early exit here trades an OOM for a hang.
+            self.logprobs_buf.append(self.allocator, entry) catch |err| {
+                self.error_code = self.allocator.dupe(u8, @errorName(err)) catch null;
+                self.state = .errored;
+            };
+        }
         self.out_buf.append(self.allocator, t) catch |err| {
             // Allocation failure: degrade to error.
             self.error_code = self.allocator.dupe(u8, @errorName(err)) catch null;
@@ -627,6 +651,29 @@ pub const Slot = struct {
         };
         self.out_cond.broadcast(self.io);
         self.out_event.set(self.io);
+    }
+
+    /// Connection thread: copy logprob entries produced since `cursor` into
+    /// `out`, returning the new cursor. Under `out_mu`, so it cannot observe a
+    /// half-written entry or a reallocating buffer.
+    ///
+    /// The COPY is shallow and that is deliberate: each entry's `top_logprobs`
+    /// is its own allocation, stable for the life of the slot, and owned by
+    /// the slot (`Slot.deinit` frees it). The caller borrows and must not free
+    /// — only the ArrayList's backing array is at risk from a concurrent grow,
+    /// and that is exactly what the lock covers.
+    pub fn copyLogprobsFrom(
+        self: *Slot,
+        allocator: std.mem.Allocator,
+        cursor: usize,
+        out: *std.ArrayList(generate_mod.LogprobResult),
+    ) !usize {
+        self.out_mu.lockUncancelable(self.io);
+        defer self.out_mu.unlock(self.io);
+        const items = self.logprobs_buf.items;
+        if (cursor >= items.len) return cursor;
+        try out.appendSlice(allocator, items[cursor..]);
+        return items.len;
     }
 
     /// Inference thread: signal normal completion. Safe to call multiple
@@ -4646,21 +4693,21 @@ fn runSingleDecodeTick(sch: *Scheduler, slot: *Slot) !void {
         return;
     }
     const t = tok_opt.?;
-    slot.pushToken(t);
-    if (t != 0) slot.was_pad_only = false;
-    slot.completion_tokens = gen.completion_tokens;
-    // Phase A5: capture per-token logprob for the conn thread to consume at
-    // completion. `gen.last_logprob` ownership transfers into slot.logprobs_buf
-    // (gen sets the field, we null it after taking it).
+    // Phase A5: capture per-token logprob. `gen.last_logprob` ownership
+    // transfers into slot.logprobs_buf (gen sets the field, we null it here).
+    // Published in the SAME critical section as the token so a streaming
+    // reader that has been handed token i can read entry i — see
+    // `pushTokenWithLogprob`.
+    var lp_take: ?generate_mod.LogprobResult = null;
     if (slot.logprobs_n > 0) {
         if (gen.last_logprob) |lp| {
-            slot.logprobs_buf.append(slot.allocator, lp) catch |err| {
-                slot.markError(@errorName(err));
-                return;
-            };
+            lp_take = lp;
             gen.last_logprob = null;
         }
     }
+    slot.pushTokenWithLogprob(t, lp_take);
+    if (t != 0) slot.was_pad_only = false;
+    slot.completion_tokens = gen.completion_tokens;
 }
 
 /// Batched decode kernel for >=2 active slots. All slots must have already

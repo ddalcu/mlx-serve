@@ -310,7 +310,30 @@ lms unload --all >/dev/null 2>&1 || true
 # ── Artifacts ──
 DEPTH_NOTE="$([[ $FULL -eq 1 ]] && echo "llmprobe --bench-only --full (median of 3/rung, to 64k)" \
                                  || echo "llmprobe --bench-only (one run/rung, to 16k)")"
+# Engine versions ride into the CSV so both charts can name the BUILD each bar
+# came from — "+23% vs oMLX" ages into a claim about whatever oMLX is today.
+# llmprobe's reports carry none, and each engine reports its own differently.
+engine_versions() {
+    local out=""
+    local mine; mine="$("$BINARY" --version 2>/dev/null | grep -oE 'mlx-serve [0-9.]+' | awk '{print $2}')"
+    [ -n "$mine" ] && out="mlx-serve=$mine"
+    if [ -x "$OMLX_BIN" ]; then
+        local v; v="$(defaults read /Applications/oMLX.app/Contents/Info.plist CFBundleShortVersionString 2>/dev/null)"
+        [ -n "$v" ] && out="$out omlx=$v"
+    fi
+    if [ -x "$MTPLX_BIN" ]; then
+        local v; v="$("$MTPLX_BIN" --version 2>&1 | head -1 | awk '{print $2}')"
+        [ -n "$v" ] && out="$out mtplx=$v"
+    fi
+    if [ "$INCLUDE_LMSTUDIO" -eq 1 ]; then
+        local v; v="$(defaults read "/Applications/LM Studio.app/Contents/Info.plist" CFBundleShortVersionString 2>/dev/null)"
+        [ -n "$v" ] && out="$out lmstudio=$v"
+    fi
+    echo "$out"
+}
+
 if ! python3 "$SCRIPT_DIR/bench_csv.py" "$JSON_DIR" --out "$CSV_OUT" \
+    --engines "$(engine_versions)" \
     --note "$(date '+%Y-%m-%d') · $DEPTH_NOTE · engines booted with shipping defaults"; then
     echo "no CSV written — nothing measured" >&2
     exit 1

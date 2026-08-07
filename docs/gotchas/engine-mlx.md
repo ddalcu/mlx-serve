@@ -1849,3 +1849,156 @@ Three things worth keeping:
   sit entirely inside the fixed run and repeat every line (0.033 / 0.316). The
   parameters were swept numerically against the measured artifact before being
   written into the test.
+
+## A prefix-cache hit is bit-exact on attention and is not on a hybrid (2026-08-07)
+
+Surfaced by llmprobe's determinism check during 26.8.3 pre-release validation:
+`greedy runs diverged at char 275 (det-echo-sentence, 3 runs) — non-determinism
+at temperature 0`, on LFM2.5-2.6B-8bit.
+
+**The shape of the evidence.** Four identical temp-0 requests, same boot:
+
+| arm | run 1 | runs 2-4 |
+|---|---|---|
+| defaults | A | B B B |
+| `--no-pld` | A | B B B |
+| `--no-pld --prefix-cache-entries 0` | C | C C C |
+| `--prefix-cache-entries 0` | C | C C C |
+
+Run 1 is cold, runs 2+ are warm. `--no-pld` changes nothing, so it is NOT spec
+decode — which is the first thing everyone suspects, and the reason to run the
+kill-switch A/B before theorising. Turning the prefix cache off makes every run
+identical. Note there are THREE distinct outputs, not two: the cold-with-cache
+answer also differs from the no-cache answer, because merely enabling the cache
+changes the prefill shape (the SSM snapshot sits `SSM_SNAPSHOT_BACKOFF` = 30
+tokens before the prompt end, splitting the pass).
+
+**Is it corruption or rounding?** Answered with the logprobs, not by eyeballing
+the text — which is a good use for the field the same release had just fixed:
+
+```
+first divergence at token index 44
+  prefix: ' why determinism matters for inference engines. I must follow the'
+  cold: chose ' instructions' lp=-1.242188  rank1-rank2 gap=0.125000
+  warm: chose ' rules'        lp=-1.335938  rank1-rank2 gap=0.000000
+pre-divergence logprob agreement over 40 tokens: max|delta|=4.6875e-02  mean=2.76e-03
+```
+
+The warm path shows an EXACT tie between the two candidates. The two paths
+agree to a mean of 2.8e-3 for the whole run up to that point, with a worst case
+of 0.047 — which is exactly bf16 rounding scale (~8 mantissa bits on logits of
+magnitude 10-20). A restore defect smears the whole distribution; this does
+not. Not corruption.
+
+**Mechanism.** For a pure-attention arch, a warm restore replays STORED KV
+values — nothing is recomputed, so it is bit-exact. gemma-4-e4b-it-4bit through
+the identical probe: `NO DIVERGENCE over 220 shared tokens`, with a full
+38-of-38-token reuse. A hybrid instead restores the conv/SSM state at the
+checkpoint position and RE-RUNS the recurrence over the remaining prompt — the
+cold pass ran positions 0..40 as one block, the warm pass runs 10..40, and a
+sequential recurrence in a different block size is the same mathematics in a
+different reduction order.
+
+**Not a storage bug.** `captureSsmCheckpoint` copies through
+`materializedOwnedCopy`, which preserves dtype; there is no narrowing anywhere
+on that path.
+
+**Why the existing guard is green.** `test_hybrid_reuse_equivalence.sh` asserts
+warm output is byte-identical to cold and passes on this very model — its
+prompt is 1391 cached tokens and its generation happens to land on no near-tie.
+The exposing shape is the opposite: a SHORT prompt (so the 30-token backoff is
+a large fraction of it) with a LONG generation (so the run has many chances to
+hit a tie). A byte-equality test over one prompt samples one path through the
+distribution; it cannot stand in for a determinism claim.
+
+**Standing rule.** Byte-stable long greedy on a hybrid requires
+`--prefix-cache-entries 0`, exactly as it requires no-spec + `--kv-quant off/8`
+for the INT4 near-tie class. Both are properties of the arithmetic, not bugs to
+fix, and both belong in any determinism claim we make.
+
+## One request killed the server: a borrowed-handle cache that freed a live entry (2026-08-07)
+
+Found during 26.8.3 pre-release validation, by the conformance sweep rather
+than by any test — and it had already corrupted a benchmark row nobody would
+have questioned.
+
+**How it presented.** The `qwen3_5_moe` family row scored **33.3% engine
+conformance**: `responses 0/26`, `messages 0/27`, `completions 0/1`, and
+**0% model capability** with every knowledge question 0/1 — a model that
+apparently could not name a chemical symbol. That reading is the tell. Whole
+surfaces at exactly 0/N, plus a capability floor of 0, is not a weak
+checkpoint; it is a **dead process**. The server log confirmed it: 13 requests
+where every other cell logged 34, ending mid-request with no shutdown line.
+
+**Two crash reports, one function.**
+
+```
+SIGSEGV  mlx::core::array::~array < mlx_vector_array_free
+                                  < verifyQmm < qmatmulBits < qmatmul
+                                  < gatedDeltaNet < forwardMoeWith
+                                  < Generator.nextPld      (decode / PLD verify)
+
+SIGBUS   vector<array>::__emplace_back_slow_path < mlx_vector_array_new_data
+                                  < verifyQmm < ...
+                                  < Generator.initWithOptions  (prefill)
+```
+
+**Root cause.** `cachedScalarInt` caches 0-d int scalars for the kernels' K/N
+inputs in 16 slots, and evicted slot 0 unconditionally:
+
+```zig
+_ = mlx.mlx_array_free(vqmm_scalar_cache[0].arr);
+vqmm_scalar_cache[0] = .{ .v = v, .arr = arr };
+```
+
+All six call sites do this:
+
+```zig
+const K_arr = cachedScalarInt(K);
+const N_arr = cachedScalarInt(N);
+const inputs_arr = [_]mlx.mlx_array{ x, w, sc, bi, K_arr, N_arr };
+```
+
+Once the cache is full: the K call evicts slot 0 and lands there; the N call
+frees slot 0 again — now K's array — and `inputs_arr` carries a freed handle
+into mlx.
+
+The code carried a comment asserting this was safe: *"in-flight lazy graph
+nodes hold their own refs to the old array; this only drops OUR handle."* That
+is true, and it is irrelevant. The array has not reached a graph node yet. It
+is sitting in the caller's stack array, one line above.
+
+**Why it stayed hidden.** Eviction only happens after **more than 16 distinct
+(K, N) values**. Most checkpoints never get there. A 40-layer MoE with
+GatedDeltaNet, MoE expert widths and a 248k vocab does. Nothing about it is
+model-specific — any checkpoint with enough distinct geometries is exposed, and
+it fires on both the prefill and decode paths.
+
+**Fix.** LRU eviction (`vqmmScalarEvictIndex`): pick the entry with the oldest
+tick. Correct by construction — the scalars a call site is still holding are by
+definition the two most recently ticked, and the cache is 16 while the most any
+site takes is 2, so they can never be the minimum.
+
+**Before / after, same command:**
+
+| | pre-fix | post-fix |
+|---|---|---|
+| engine conformance | 33.3% | 99.5% |
+| chat / responses / messages | 34/54, 0/26, 0/27 | 65/65, 62/62, 60/61 |
+| model capability | 0% | 97.2% (strong) |
+| server | dead | alive |
+
+pi agentic tasks on the same checkpoint then ran 3/3 with PLD engaging 12
+times — `nextPld → verifyQmm` being the exact path that segfaulted.
+
+**Two lessons worth keeping.**
+
+1. *A comment asserting safety is not safety.* This one was written
+   confidently, was half-right, and cost a server-killing crash. The question
+   it answered ("does the graph hold a ref?") was not the question that
+   mattered ("has it reached the graph yet?").
+2. *A bench harness reports whatever the engine returns.* llmprobe measured and
+   charted a decode rate for a process that had already crashed. The corrupted
+   row's numbers looked ordinary. What gave it away was structural — its log
+   was a third the length of every other cell's, and it had no shutdown line.
+   Worth checking cell logs for uniformity before trusting a bench row.

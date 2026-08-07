@@ -505,3 +505,78 @@ other text and no ending" — the period-1..8 tier convicts within ~130 tokens.
 `tests/test_loop_stop_signal.sh` is that prompt across four surfaces, and its
 last section boots with `MLX_SERVE_LOOP_TRIM=0` so the trim's own red-on-revert
 is part of the run (32 repetitions in the body with the trim off, 2 with it on).
+
+## Streaming chat accepted `logprobs`, paid for them, and dropped them (2026-08-07)
+
+Found during pre-release validation of 26.8.3, by a hand-written probe rather
+than by the conformance suite — which is the point of the story.
+
+**Symptom.** `POST /v1/chat/completions` with `"logprobs": true, "stream": true`
+returned a well-formed SSE stream with no `logprobs` anywhere in it. The
+non-streaming form of the same request was perfect.
+
+**What made it expensive rather than merely absent.** Requesting logprobs
+disables every speculative path (`pickStreamMode` — PLD/drafter/MTP all gate on
+`logprobs_n == 0`, because a spec round has no per-step distribution to report).
+So the request paid the full serial-decode cost to honour a field that was then
+thrown away. Worst of both ends.
+
+**Why nothing caught it.**
+
+- Output-equality tests are structurally blind: the content deltas are
+  byte-identical whether or not the logprobs ride along.
+- `llmprobe` probes logprobs on the NON-streaming surface only. In the same
+  session it scored this server `Logprob consistency 100% — 36/36 items:
+  emitted token = argmax, valid distribution` while streaming returned nothing
+  at all. **A conformance suite's silence is not coverage** — a green run says
+  what it checked passed, never that the surface works.
+- The three logprobs defects fixed on 2026-08-05 (temperature-scaled logits,
+  float-equality id recovery, the one-token offset) were all found and fixed
+  non-streaming, and their guards live there too.
+
+**Root cause.** There is exactly ONE chat streaming chunk template, and its
+choice object was `{"index":0,"delta":…,"finish_reason":…}` — no `logprobs`
+field had ever existed on it. `formatLogprobsObject` was called from the
+non-streaming handler only.
+
+**Fix, and the three things that were not obvious.**
+
+1. `logprobs` is a SIBLING of `delta` on the choice, not a field inside it.
+   Added as `ChunkExtras` (defaulted, so all 22 existing emitters keep their
+   exact bytes — a stream that did not ask for logprobs is byte-unchanged,
+   which is what makes the change additive).
+2. Entries cannot be paired 1:1 with chunks. The think gate and tool detection
+   buffer many tokens into one delta, and some tokens produce no chunk at all.
+   So `StreamLogprobs` drains against a HIGH-WATER MARK (`emitted`), and each
+   entry ships EXACTLY once: a delta cannot be retracted, so a re-send is as
+   wrong as a drop.
+3. The publish is a THREAD-SAFETY problem, not a formatting one.
+   `slot.logprobs_buf` is written by the inference thread and was documented
+   as conn-thread-readable *at completion*. Reading it mid-stream races two
+   ways: the entry for token i may not be visible when token i is handed over
+   (the append sat AFTER `pushToken`, whose mutex release is what publishes),
+   and a concurrent grow reallocates the backing array under a reader
+   mid-copy. Both fixed by moving token and entry into ONE critical section
+   (`Slot.pushTokenWithLogprob`) and copying out under the same lock
+   (`Slot.copyLogprobsFrom`). The copy is shallow on purpose: each entry's
+   `top_logprobs` is its own allocation, stable for the life of the slot and
+   owned by the slot; only the ArrayList's backing array is at risk, and that
+   is exactly what the lock covers.
+
+Safe by construction on the concurrency side: `Scheduler.batchable` returns
+false when `logprobs_n > 0`, so such a slot always runs `runSingleDecodeTick`
+and appends exactly one entry per token, in order.
+
+**Guards.** `tests/test_logprobs.sh` section [4] asserts streaming carries
+logprobs AND agrees with non-streaming token-for-token and VALUE-for-value on
+the same greedy request — which is what catches a partial drain, a duplicated
+one, or an off-by-one high-water mark, none of which "is the field present?"
+can see. Class guard: a source scan (`every streaming chat emitter carries
+logprobs`) rejects a bare `.{}` on any `sendSSEChunk` inside the streaming
+handler, so a NEW emitter cannot silently forget, plus an assertion that both
+halves of the path to the wire still exist (the extra is read, and the rendered
+bytes are interpolated into the chunk).
+
+**Rule of thumb this leaves behind:** when a request field costs something to
+honour, check that the cost buys delivery. A field that disables an
+optimisation and then is not emitted is strictly worse than one that 400s.

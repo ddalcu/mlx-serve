@@ -29,6 +29,9 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 
+sys.path.insert(0, str(Path(__file__).parent))
+from bench_engines import label_with_version, parse_engine_versions  # noqa: E402
+
 
 # Chart layout. Each variant tuple is:
 #   (variant_filter, spec, label, color, is_baseline, show_delta, short)
@@ -42,7 +45,13 @@ import numpy as np
 #   bars self-identify without the reader chasing the top-of-figure legend.
 FAMILIES = {
     "all": {
-        "title": "MLX-serve vs LM Studio · oMLX · MTPLX — Gemma 4 + Qwen 3.6 (Apple Silicon, decode tok/s)",
+        # `{engines}` is filled from the engines the CSV ACTUALLY carries. It
+        # used to be the hardcoded full list, so a run where an engine was
+        # absent (LM Studio not installed) still shipped a chart claiming to
+        # compare against it — bars correctly dropped, headline still lying.
+        # Same rule as "never quote a win without naming the engine it is
+        # over": do not name an engine you did not measure.
+        "title": "MLX-serve vs {engines} — Gemma 4 + Qwen 3.6 (Apple Silicon, decode tok/s)",
         # Panels stack vertically (2 rows x 1 col) so every model group gets
         # the full figure width — bars are wide enough to carry their engine
         # short-label legibly.
@@ -104,7 +113,7 @@ FAMILIES = {
 }
 
 
-def load_csv(path: Path, hardware_filter: str | None = None) -> tuple[dict, set[str], str]:
+def load_csv(path: Path, hardware_filter: str | None = None) -> tuple[dict, set[str], str, dict]:
     """Returns ({(model, engine, spec): {code, prefill}}, hardware_seen, run_note).
 
     Reads the `headline` rows of the probe CSV written by tests/bench_csv.py:
@@ -121,6 +130,8 @@ def load_csv(path: Path, hardware_filter: str | None = None) -> tuple[dict, set[
     hardware_seen: set[str] = set()
     run_note = ""
     with open(path) as f:
+        engine_versions = parse_engine_versions(f)
+        f.seek(0)
         for line in f:
             line = line.rstrip("\n")
             if line.startswith("#"):
@@ -144,7 +155,32 @@ def load_csv(path: Path, hardware_filter: str | None = None) -> tuple[dict, set[
                     data[key][field] = float(value)
                 except ValueError:
                     pass
-    return data, hardware_seen, run_note
+    return data, hardware_seen, run_note, engine_versions
+
+
+# Two LM Studio bars share one name in prose; a chart that measured both
+# should still say "LM Studio" once.
+LMSTUDIO_KEYS = {"lmstudio-alt", "lmstudio-baseline"}
+
+
+def comparison_engine_label(variants, measured_engines) -> str:
+    """The competitor names to put in the title — only those actually measured.
+
+    `variants` is the family's engine spec (ordered); `measured_engines` is the
+    set of engine keys the CSV carries. Ours is never listed (the title already
+    leads with it), and the two LM Studio variants collapse to one name.
+    Returns "nothing" when only mlx-serve ran, so a solo perf-gate run renders
+    an honest headline instead of claiming a comparison that did not happen.
+    """
+    names, seen = [], set()
+    for key, _spec, label, *_rest in variants:
+        if key == "mlx-serve" or key not in measured_engines:
+            continue
+        name = "LM Studio" if key in LMSTUDIO_KEYS else label
+        if name not in seen:
+            seen.add(name)
+            names.append(name)
+    return " \u00b7 ".join(names) if names else "nothing"
 
 
 def render(csv_path: Path, png_out: Path, family: str = "all",
@@ -152,7 +188,7 @@ def render(csv_path: Path, png_out: Path, family: str = "all",
     if family not in FAMILIES:
         sys.exit(f"Unknown family '{family}'; pick one of: {', '.join(FAMILIES)}")
     cfg = dict(FAMILIES[family])
-    data, hardware_seen, run_note = load_csv(csv_path, hardware_filter=hardware)
+    data, hardware_seen, run_note, engine_versions = load_csv(csv_path, hardware_filter=hardware)
     if not data:
         sys.exit(f"No headline rows in {csv_path} (did the bench run produce a bench block?)")
     # Reject mixed-hardware CSVs without explicit --hardware: combining M1 Pro
@@ -164,7 +200,11 @@ def render(csv_path: Path, png_out: Path, family: str = "all",
             f"{sorted(real_hardware)}. Pick one with --hardware <tag>."
         )
     title_hw = hardware or (next(iter(real_hardware)) if real_hardware else None)
+    measured_engines = {e for (_m, e, _s) in data}
     title = cfg["title"]
+    if "{engines}" in title:
+        title = title.replace("{engines}", comparison_engine_label(
+            cfg["variants"], measured_engines))
     if title_hw:
         title = f"{title} · {title_hw}"
 
@@ -241,6 +281,14 @@ def render(csv_path: Path, png_out: Path, family: str = "all",
     variants = [
         v for v in cfg["variants"]
         if any(cell_has_data(m, v) for m in cfg["model_order"])
+    ]
+    # Stamp each legend label with the build that produced its bars. "+23% vs
+    # oMLX" ages into a claim about whatever oMLX is today; "vs oMLX 0.5.2"
+    # does not. Versions come from the CSV's `# engines:` line, so the chart
+    # cannot claim a build the data did not record.
+    variants = [
+        (key, spec, label_with_version(label, key, engine_versions), *rest)
+        for (key, spec, label, *rest) in variants
     ]
 
     # Spread model groups further apart so the bars per group breathe.

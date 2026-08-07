@@ -26,6 +26,7 @@
 - Three things were wrong at once, on every model: the numbers moved when you changed the temperature instead of being the model's own, ties handed back an arbitrary token, and the whole list was off by one so each token came back with the *next* token's alternatives.
 - None of this changed the text any model produced. It matters if you score outputs, route on confidence, or build evals.
 - `/v1/completions` ignored its `logprobs` field entirely. It works now, in the shape the OpenAI legacy API defines.
+- Streaming ignored it too, on both chat and `/v1/completions` — and it cost you speed to do it, because asking for logprobs turns off speculative decoding whether or not you get anything back. Streaming now returns the same numbers as non-streaming, token for token.
 
 ### Also new
 

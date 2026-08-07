@@ -29,6 +29,9 @@ import sys
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+
+sys.path.insert(0, str(Path(__file__).parent))
+from bench_engines import label_with_version, parse_engine_versions  # noqa: E402
 import numpy as np
 
 SUBTITLE = ("Context ladder from the same llmprobe run as the headline chart · "
@@ -45,7 +48,20 @@ ENGINES = [
     ("mlx-serve",         "MLX-serve",        "#2563eb", "#1f2937", False),
 ]
 
-DEFAULT_TITLE = "Context ladder — prefill and decode from 0.5K to 64K"
+DEFAULT_TITLE = "Context ladder — prefill and decode"
+
+
+def ladder_span_label(rows) -> str:
+    """`"0.5k to 16k"` from the rungs actually measured.
+
+    The title used to hardcode "0.5K to 64K" while a default-depth run stops at
+    16k — a chart claiming a reach its data does not have, same class as naming
+    an engine that never ran. Derived, so it cannot drift from the CSV.
+    """
+    ctxs = [r.get("context") for r in rows if r.get("context")]
+    if not ctxs:
+        return ""
+    return f"{ctxs[0]} to {ctxs[-1]}" if len(ctxs) > 1 else str(ctxs[0])
 # Percent-delta annotation: (engine whose bar gets the label, engine it is
 # compared against).
 DEFAULT_DELTA = ("mlx-serve", "omlx")
@@ -65,7 +81,7 @@ def parse_engines(spec: str) -> list[tuple]:
     return out
 
 
-def load_csv(path: Path, model: str | None = None) -> tuple[list[dict], set[str], str]:
+def load_csv(path: Path, model: str | None = None) -> tuple[list[dict], set[str], str, dict]:
     """Probe CSV → ([{context, <engine>_prefill, <engine>_decode}], engines, note).
 
     Ladder rows only (the `headline` rows belong to the other chart). Rungs keep
@@ -79,6 +95,8 @@ def load_csv(path: Path, model: str | None = None) -> tuple[list[dict], set[str]
     models_seen: set[str] = set()
     note = ""
     with open(path) as f:
+        engine_versions = parse_engine_versions(f)
+        f.seek(0)
         for line in f:
             line = line.rstrip("\n")
             if line.startswith("#"):
@@ -112,13 +130,20 @@ def load_csv(path: Path, model: str | None = None) -> tuple[list[dict], set[str]
     if model is None and len(models_seen) > 1:
         sys.exit(f"{path} holds {len(models_seen)} models: {sorted(models_seen)}. "
                  f"Pick one with --model <name>.")
-    return [by_rung[c] for c in order], engines, note
+    return [by_rung[c] for c in order], engines, note, engine_versions
 
 
 def render(csv_path: Path, png_out: Path, engines: list[tuple] = ENGINES,
            title: str = DEFAULT_TITLE, subtitle: str | None = None,
            delta: tuple = DEFAULT_DELTA, model: str | None = None) -> None:
-    rows, present, note = load_csv(csv_path, model=model)
+    rows, present, note, engine_versions = load_csv(csv_path, model=model)
+    span = ladder_span_label(rows)
+    if span and "to" not in title:
+        title = f"{title} ({span})"
+
+    # Name the BUILD each lane came from — see tests/bench_engines.py.
+    engines = [(key, label_with_version(label, key, engine_versions), *rest)
+               for (key, label, *rest) in engines]
     contexts = [r["context"] for r in rows]
     # Drop lanes the CSV has nothing for, so a partial run renders cleanly
     # instead of laying a flat zero bar over every rung.

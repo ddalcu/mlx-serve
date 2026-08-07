@@ -749,3 +749,53 @@ named 400 server-side and `H3RefLimits` stops the picker offering past it,
 including on an empty list whose own cap has room.
 
 
+
+## `chat_template` has two legal shapes, and reading the wrong one is a PANIC (2026-08-07)
+
+Found during 26.8.3 pre-release validation, on a family nobody had exercised
+recently: **Mistral-7B-Instruct-v0.3-4bit could not be loaded at all.**
+
+```
+thread 9501346 panic: access of union field 'string' while field 'array' is active
+src/chat.zig:115:33 in loadChatConfig
+```
+
+`loadChatConfig` did `try allocator.dupe(u8, v.string)` on
+`tokenizer_config.json`'s `chat_template`. HF permits that key to be either:
+
+- a bare template string (what almost everything ships), or
+- a LIST of `{"name": ..., "template": ...}` objects.
+
+Mistral v0.3 ships the list form, with two entries — `default` and `tool_use`:
+
+```python
+[{"name": "default",  "template": "..."},   # no tools
+ {"name": "tool_use", "template": "..."}]   # tools
+```
+
+A Zig tagged-union field access on the wrong active field is not a recoverable
+error, so this was not "the template failed to load and we fell back" — it was
+the process dying during model load. One of eight local checkpoints with a
+`chat_template` uses this shape, which is exactly why it went unnoticed.
+
+**Fix.** `chatTemplateFromValue` handles both shapes and selects the entry named
+`"default"`, matching transformers (`apply_chat_template` uses `default` unless
+the caller names another template). Falls back to the first usable entry when
+none is named `default`, and returns null for any other shape so the caller
+drops to its `chat_template.jinja` / family fallback rather than panicking.
+
+**On not selecting `tool_use`.** Only that variant references `tools`, so the
+obvious worry is that tool calling breaks. It does not: our pipeline passes
+`tools_json` into the render and has its own parse/repair chain, and llmprobe
+scores Mistral **8/8** on the tool checks (serialization, streamed argument
+reassembly, results accepted back, parallel calls, `tool_choice: "none"`,
+`parallel_tool_calls: false`, typed arguments). Per-request template selection
+by name is a feature worth having; it is not what a load-time panic needed.
+
+Result: Mistral went from *cannot load* to **99.5% engine conformance**
+(chat 64/64, responses 62/62, messages 57/58, embeddings 4/4, completions 3/3).
+
+**The general rule this leaves:** in a `std.json.Value` reader, `.string` on a
+field you have not shape-checked is a crash, not a graceful miss. Any new
+tokenizer_config/config reader owes both shapes — or an explicit switch whose
+`else` returns null.

@@ -80,7 +80,7 @@ If you're already on LM Studio, Ollama, or `mlx-lm` and wondering whether to swi
 | OpenAI Responses API + WebSockets | ✅ | 🟡 partial² | ❌ | ❌ |
 | DeepSeek V4 Flash (284B) | ✅ via ds4 | ❌ | ❌ | ❌ |
 | Speculative decoding (PLD + drafter + native MTP) | ✅ | ❌ | partial | drafter only |
-| Decode speed (geomean vs LM Studio, identical weights) | **+81%** (MLX) | baseline | ~−15% (GGUF, est.¹) | +11% (MLX) |
+| Decode speed (geomean vs LM Studio, identical weights) | **+26%** (MLX, shipping defaults) | baseline | ~−15% (GGUF, est.¹) | +11% (MLX) |
 | KV-cache quantization (4/8-bit + TurboQuant) | ✅ | ❌ | partial | ✅ |
 | Continuous batching | ✅ | ❌ | ✅ | ❌ |
 | Built-in agent loop + MCP client | ✅ 10 tools | ❌ | ❌ | ❌ |
@@ -111,7 +111,7 @@ Numbers and charts in [Performance](#performance).
 - **Ollama-grade CLI** — `mlx-serve run gemma4` downloads (resumable), serves, and drops you into a streaming chat REPL; `pull` / `list` / `serve` manage a shared `~/.mlx-serve/models` store the GUI app uses too.
 - **Built-in web console** — open the server's address in a browser (http://localhost:11234 by default) and you get a chat playground against any model on the box, a live Monitor page, image generation and editing, speech and music tools, and the full API reference. Renders with no model loaded, so it works on a fresh headless box too.
 - **Speculative decoding** — PLD (model-agnostic n-gram lookup, on by default) + the Gemma 4 cross-attention drafter. Adaptive prompt-time and runtime gates keep novel-content workloads at parity; agentic code loops see up to 1.6×.
-- **Native multi-token prediction (Qwen 3.5/3.6)** — checkpoints shipping a trained MTP sidecar (like [Qwen3.6-27B-4bit-MTP](https://huggingface.co/ddalcu/Qwen3.6-27B-4bit-MTP-MLX-Serve), or [MTPLX](https://github.com/youssofal/MTPLX)-published artifacts, loaded unmodified) speculate with the model's own head automatically: 3 drafts per round with a self-tuning depth controller, +15–26% on coding-agent loops, MoE sidecars (35B-A3B) supported, and oMLX oQ-format checkpoints load their in-checkpoint MTP heads directly. In same-checkpoint head-to-heads, mlx-serve out-decodes both reference MTP runtimes at all 8 ladder rungs from 0.5K to 64K: 15–38% over MTPLX 2.3.0 with prefill ahead at all 8, and 15–52% over oMLX with its Lightning MTP on oMLX's own oQ4e checkpoint.
+- **Native multi-token prediction (Qwen 3.5/3.6)** — checkpoints shipping a trained MTP sidecar (like [Qwen3.6-27B-4bit-MTP](https://huggingface.co/ddalcu/Qwen3.6-27B-4bit-MTP-MLX-Serve), or [MTPLX](https://github.com/youssofal/MTPLX)-published artifacts, loaded unmodified) speculate with the model's own head automatically: 3 drafts per round with a self-tuning depth controller, +15–26% on coding-agent loops, MoE sidecars (35B-A3B) supported, and oMLX oQ-format checkpoints load their in-checkpoint MTP heads directly. In same-checkpoint head-to-heads on shipping defaults, mlx-serve out-decodes both reference MTP runtimes: **+10% decode and +17% prefill over MTPLX 2.5.3** on its own MTPLX-Optimized build, and **+25% to +36% decode over oMLX 0.5.2** with its Lightning MTP at every ladder rung from 0.5K to 16K on oMLX's own oQ4e checkpoint.
 - **Long-context prefill that flies** — a custom flash-attention Metal kernel handles Gemma's sliding-window layers during prefill, skipping everything outside the attention window: 2.4× prefill (299 → 715 tok/s) on a ~100K-token prompt with *less* peak memory. Qwen 3.5/3.6 long prompts prefill in architecture-tuned chunks: ~5% faster with peak memory down ~9 GB on the 27B.
 - **KV-cache quantization** — 4-bit / 8-bit / TurboQuant variants shrink KV memory ~4× / ~2× / further still, so 16K contexts fit on hardware that couldn't hold them dense.
 - **Continuous batching** — `--max-concurrent N` batches decode requests through one forward pass for ~1.6× throughput at 4-way parallel.
@@ -166,7 +166,7 @@ And it goes well beyond text-to-X:
 | Feature | Default | Other options | Approx. RAM |
 |---|---|---|---|
 | Image | FLUX.2-klein 4B 4-bit (mflux, ~5 GB pre-quantized) | FLUX.2-klein 9B (10 GB), Krea-2-Turbo, Mage-Flow Turbo / Edit 8-bit (8.5 / 9.1 GB) | 8 / 12 / 16 GB |
-| Video | LTX-Video 2.3 Q4 | — | 24 GB RAM, ~50 GB first-run download (LTX 41 GB + Gemma 8 GB) |
+| Video | LTX-Video 2.3 Q4 | MiniMax-H3 (Hailuo 3.0) 4-bit / 8-bit, video **and** matching soundtrack in one pass | LTX 24 GB RAM (~50 GB download); H3 26 GB (40 GB) or 44 GB (69 GB) |
 | Speech | Qwen3-TTS 1.7b (voice cloning) | Qwen3-TTS 0.6b, Kokoro-82M (54 voices, ~345 MB) | 8 GB RAM, ~3.5 GB first-run download |
 | Music | ACE-Step 1.5 XL Turbo 8-bit | — | 8 GB RAM, ~6.2 GB first-run download |
 | 3D | Hunyuan3D-2.1 8-bit (shape + PBR texture) | — | 16 GB RAM |
@@ -181,17 +181,19 @@ Outputs go to `~/.mlx-serve/generations/` under per-modality, per-date folders.
 
 | Architecture | `model_type` | Examples | Chat Format | Vision |
 |---|---|---|---|---|
-| **Gemma 4** | `gemma4` | `gemma-4-e2b-it-4bit`, `gemma-4-e4b-it-8bit`, `gemma-4-26b-a4b-it-4bit` | Gemma turns | SigLIP |
+| **Gemma 4** | `gemma4`, `gemma4_unified` | `gemma-4-e2b-it-4bit`, `gemma-4-e4b-it-8bit`, `gemma-4-26b-a4b-it-4bit`, `gemma-4-12b-unified` | Gemma turns | SigLIP (unified adds audio) |
 | **Gemma 3** | `gemma3` | `gemma-3-12b-it-qat-4bit` | Gemma turns | -- |
 | **DiffusionGemma** | `diffusion_gemma` | `diffusiongemma-26B-A4B-it-4bit` | Gemma turns (block diffusion) | -- |
-| **Qwen 3 / 3.5 / 3.6** | `qwen3`, `qwen3_5`, `qwen3_5_moe`, `qwen3_next` | `Qwen3-4B`, `Qwen3.5-4B`, `Qwen3.6-35B-A3B` | ChatML | Qwen3-VL |
+| **Qwen 2 / 3 / 3.5 / 3.6** | `qwen2`, `qwen3`, `qwen3_moe`, `qwen3_5`, `qwen3_5_moe`, `qwen3_next` | `Qwen3-4B`, `Qwen3.5-4B`, `Qwen3.6-27B`, `Qwen3.6-35B-A3B` | ChatML | Qwen3-VL |
+| **DeepSeek V4 Flash** | `deepseek_v4` | DeepSeek-V4-Flash-0731 (284B-A13B, 1M ctx) — **native MLX** for safetensors builds, embedded [ds4](https://github.com/antirez/ds4) for `.gguf` | DSV4 + DSML tools | -- |
+| **Inkling Small** | `inkling_mm_model` | Thinking Machines Inkling Small (276B-A12B MoE, 2-bit) | role-less channel messages | -- |
 | **Hunyuan 3** | `hy_v3` | `Hy3-295B-Instruct` (295B-A21B MoE, 2-bit) | Hunyuan tags | -- |
-| **Laguna** | `laguna` | poolside Laguna S 2.1 (117.6B-A8.5B MoE coder, nvfp4) | GLM tags, pre-opened think | -- |
+| **Laguna** | `laguna` | poolside Laguna S 2.1 / XS (117.6B-A8.5B MoE coder, nvfp4) | GLM tags, pre-opened think | -- |
 | **Nemotron-H** | `nemotron_h` | Nemotron-3-Nano-4B | ChatML | -- |
-| **LFM2** | `lfm2` | LFM2.5-350M | ChatML | -- |
+| **LFM2 / LFM2.5** | `lfm2` | LFM2.5-2.6B (8-bit, bf16, nvfp4, mxfp4) | ChatML, Pythonic tool calls | -- |
 | **Llama** | `llama` | Llama 3, Llama 3.1, Llama 3.2 | Llama-3 | -- |
-| **Mistral** | `mistral` | Mistral 7B | ChatML | -- |
-| **DeepSeek V4 Flash** | `deepseek_v4` (GGUF) | DeepSeek-V4-Flash | DSV4 | -- |
+| **Mistral** | `mistral` | Mistral 7B Instruct v0.3 | Mistral turns | -- |
+| **Embeddings** | `bert`, `gemma3_text`, `qwen3` | bge, EmbeddingGemma, Qwen3-Embedding (pooling read from the checkpoint) | n/a | -- |
 | **Anything else as GGUF** | via embedded llama.cpp | any `.gguf` on HuggingFace | per-template | -- |
 
 Any quantized MLX model using one of the above architectures works natively. Anything else can be served as GGUF through the embedded llama.cpp engine — just pick the `.gguf` file in the Model Browser and the server auto-routes by format. Models with unsupported architectures are flagged in the Model Browser but can still be downloaded.
@@ -329,15 +331,15 @@ Stateful chains via `previous_response_id`, full streaming SSE with per-event `s
 
 ## Performance
 
-Apple M4 Max, identical weights per engine. Both charts are regenerated per release by `tests/bench.sh`, which boots each engine in turn and lets [llmprobe](https://github.com/ddalcu/llmprobe) take the numbers: warmup discarded, median of three, same protocol for everyone. CSVs live in [`docs/perf-csvs/`](docs/perf-csvs/), and [benchmarks.md](benchmarks.md) tracks decode speed release by release. The v26.7.12 pair below was measured with the in-repo harness that preceded llmprobe, so read it against its own history rather than against a fresh run.
+Apple M4 Max, identical weights per engine. Both charts are regenerated per release by `tests/bench.sh`, which boots each engine in turn and lets [llmprobe](https://github.com/ddalcu/llmprobe) take the numbers: warmup discarded, median of three, same protocol for everyone. CSVs live in [`docs/perf-csvs/`](docs/perf-csvs/), and [benchmarks.md](benchmarks.md) tracks decode speed release by release. Every engine's version is recorded in the CSV and printed in the chart legend, so a number here always says which build it beat.
 
-![mlx-serve vs LM Studio (GGUF + MLX) · oMLX · MTPLX — Gemma 4 + Qwen 3.6, code completion (M4 Max)](docs/perf-pngs/perf-vs-lmstudio-omlx-all-26.7.12.png)
+![mlx-serve vs LM Studio · oMLX · MTPLX — Gemma 4 + Qwen 3.6, code completion (M4 Max)](docs/perf-pngs/perf-vs-lmstudio-omlx-all-26.8.3.png)
 
-*Code completion decode tok/s, v26.7.12. Baseline is **LM Studio GGUF**, the llama.cpp path most LM Studio users actually run, with LM Studio MLX (0.4.19), oMLX and MTPLX beside it. The blue bar is mlx-serve's best configuration for that model, with the winning speculative mode named in the label. MTPLX shows 0 where it can't run (it needs its own MTP artifacts). The Qwen 3.6 27B cell runs oMLX's own oQ4e checkpoint with their native Lightning MTP enabled on both engines: same weights, mlx-serve still wins. Geomean across the six models: **2.0× LM Studio's fastest engine per model**, +81% on the five cells where LM Studio loads the identical MLX weights, +18% with all speculation off. The bench is `./tests/bench.sh --family all --lmstudio --omlx --mtplx --full`.*
+*Code completion decode tok/s, v26.8.3, against LM Studio 0.4.19+2, oMLX 0.5.2 and MTPLX 2.5.3. Every bar is that engine on its **shipping defaults** — llmprobe measures the server that is running, so there is no best-config collapse and no per-model tuning. All four engines load the identical MLX weight files. MTPLX shows 0 where it can't run (it needs its own MTP artifacts), and LM Studio is absent on two rows it has no copy of. Geomean decode: **+26% over LM Studio** across the four shared models and **+25% over oMLX** across all six, with prefill +36% and +10%. The two head-to-heads that matter are on the competitors' own checkpoints: **+23% decode over oMLX** on its oQ4e (prefill level), and **+10% decode / +17% prefill over MTPLX** on its own MTPLX-Optimized build. The bench is `./tests/bench.sh --family all --lmstudio --omlx --mtplx`.*
 
-![Native MTP context ladder — MLX-serve vs oMLX & MTPLX (Qwen3.6-27B), 0.5K–64K prefill + decode](docs/perf-pngs/perf-mtp-ladder-26.7.12.png)
+![Native MTP context ladder — MLX-serve vs oMLX (Qwen3.6-27B), 0.5K–16K prefill + decode](docs/perf-pngs/perf-mtp-ladder-26.8.3.png)
 
-*Two same-checkpoint head-to-heads on one ladder, coding-agent prompts, fresh boots, cold prompts. Against [MTPLX](https://github.com/youssofal/MTPLX) 2.3.0 on its own [Qwen3.6-27B-MTPLX-Optimized-Speed](https://huggingface.co/Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed) checkpoint, mlx-serve decodes 15–38% faster at all 8 rungs and prefills 18–95% faster at all 8. Against oMLX 0.5.2 with its Lightning MTP on its own oQ4e checkpoint, mlx-serve decodes 15–52% faster at all 8 rungs, with prefill ahead at the four short rungs and within 5% at the four long ones.*
+*Same-checkpoint head-to-head, coding-agent prompts, fresh boots, cold prompts. Against oMLX 0.5.2 running its native Lightning MTP on its own oQ4e checkpoint, mlx-serve decodes **25–36% faster at every rung** from 0.5K to 16K, with prefill ahead at all four (+2% to +8%). Both engines speculate with the checkpoint's own MTP head, so this is engine against engine on identical weights. The ladder reaches 64K under `--full`; this release shipped the default depth.*
 
 ### Speculative decoding
 
@@ -372,7 +374,9 @@ Building from source? **Always `zig build -Doptimize=ReleaseFast`.** A bare `zig
 <details>
 <summary><b>Is mlx-serve faster than LM Studio?</b></summary>
 
-Yes, where it counts. On the v26.7.12 code-completion matrix (Gemma 4 E4B/31B/26B-A4B-MoE and Qwen 3.6 27B/35B-A3B-MoE, M4 Max, vs LM Studio 0.4.19), mlx-serve's best configuration decodes at **2.0× geomean over LM Studio's fastest engine per model**, and **+81%** on the five cells where LM Studio loads the identical MLX weights. Recent LM Studio builds have caught up on raw single-stream Gemma decode (+18% geomean with all speculation off), so the lead comes from speculative decoding: the Gemma drafter is **+53%** over LM Studio MLX on E4B code (+98% over its GGUF), native MTP is **+154%** on Qwen 3.6 35B-A3B, and the 35B MoE also decodes **+70%** raw (153 vs 90 tok/s). E4B prefill is ~1.9× on top.
+Yes, though it depends what you run. On the v26.8.3 matrix (M4 Max, LM Studio 0.4.19+2, identical MLX weight files, **both engines on shipping defaults**), mlx-serve decodes **+26% geomean** and prefills **+36% geomean** across the four models LM Studio also has.
+
+The shape matters more than the average. On dense Gemma, raw single-stream decode is now a wash (−0.5% on E4B, −0.8% on 31B) — LM Studio has caught up there. The separation is prefill, which is +117% on E4B and +35% on the 26B-A4B MoE, and speculative decoding: on Qwen 3.6 27B mlx-serve loads the checkpoint's MTP head and LM Studio does not, which is **+145%** decode on the same file. Earlier releases quoted a larger geomean by picking the best speculative configuration per model; this one is defaults against defaults, which is the number you actually get.
 
 </details>
 
@@ -442,7 +446,7 @@ Yes — the largest open model mlx-serve runs. The 2-bit mixed-precision build (
 <details>
 <summary><b>How does it compare to MTPLX for Qwen MTP models?</b></summary>
 
-[MTPLX](https://github.com/youssofal/MTPLX) is a focused Python runtime built around Qwen's native multi-token-prediction heads, and it set the bar here. mlx-serve loads the same MTP sidecar artifacts (including MTPLX-published ones) with zero setup and, in a same-machine head-to-head on the identical checkpoint, prompts, and sampling (v26.7.12 vs MTPLX 2.3.0), decodes 15–38% faster at all 8 ladder contexts from 0.5K to 64K, with prefill ahead at all 8 as well (+18% at 64K up to +95% at 0.5K). You also get the rest of the stack — OpenAI/Anthropic/Ollama APIs, GGUF, the agent app — in one binary with no Python.
+[MTPLX](https://github.com/youssofal/MTPLX) is a focused Python runtime built around Qwen's native multi-token-prediction heads, and it set the bar here. mlx-serve loads the same MTP sidecar artifacts (including MTPLX-published ones) with zero setup and, in a same-machine head-to-head on the identical checkpoint, prompts, and sampling (v26.8.3 vs MTPLX 2.5.3, both on shipping defaults), decodes **+10%** faster with **+17%** prefill and a third of the time to first token (494 ms vs 1528 ms). You also get the rest of the stack — OpenAI/Anthropic/Ollama APIs, GGUF, the agent app — in one binary with no Python.
 
 </details>
 

@@ -756,24 +756,102 @@ fn getVerifyQmmKernel(m: c_int) !mlx.mlx_fast_metal_kernel {
 /// only a handful of distinct layer geometries exist per model, and the
 /// verify path builds ~300 kernel nodes per round (inference thread only,
 /// same single-caller discipline as the kernel caches above).
-var vqmm_scalar_cache: [16]struct { v: c_int, arr: mlx.mlx_array } = undefined;
+const VqmmScalar = struct { v: c_int, arr: mlx.mlx_array, tick: u64 };
+var vqmm_scalar_cache: [16]VqmmScalar = undefined;
 var vqmm_scalar_count: usize = 0;
+var vqmm_scalar_tick: u64 = 0;
+
+/// Which slot may be evicted: the LEAST RECENTLY USED one, never a fixed slot.
+///
+/// The old policy always evicted slot 0, and that is a use-after-free. Every
+/// caller takes TWO scalars back to back (`K_arr` then `N_arr`) and holds BOTH
+/// in one `inputs_arr`. With the cache full, the K call evicts slot 0 and lands
+/// there; the N call then frees slot 0 again — which is now K's array — so the
+/// caller carried a dangling handle into `mlx_vector_array_new_data`. Observed
+/// live 2026-08-07 on a 40-layer qwen3_5_moe (GatedDeltaNet + MoE + a 248k
+/// vocab: enough distinct (K, N) pairs to overflow 16 slots) as SIGBUS building
+/// the vector and SIGSEGV freeing it — one request killed the server, and the
+/// surfaces probed after it all read as 0%.
+///
+/// The old comment claimed eviction was safe because "in-flight lazy graph
+/// nodes hold their own refs". True, and irrelevant: the array has not reached
+/// a graph node yet, it is still sitting in the caller's local array.
+///
+/// LRU is correct by construction here — the scalars a call site is still
+/// holding are by definition the most recently ticked, so they can never be
+/// the minimum while the cache (16) is far larger than the most any one site
+/// takes (2).
+fn vqmmScalarEvictIndex(entries: []const VqmmScalar) usize {
+    var best: usize = 0;
+    for (entries, 0..) |e, i| {
+        if (e.tick < entries[best].tick) best = i;
+    }
+    return best;
+}
 
 fn cachedScalarInt(v: c_int) mlx.mlx_array {
-    for (vqmm_scalar_cache[0..vqmm_scalar_count]) |e| {
-        if (e.v == v) return e.arr;
+    vqmm_scalar_tick += 1;
+    for (vqmm_scalar_cache[0..vqmm_scalar_count]) |*e| {
+        if (e.v == v) {
+            e.tick = vqmm_scalar_tick;
+            return e.arr;
+        }
     }
     const arr = mlx.mlx_array_new_int(v);
     if (vqmm_scalar_count < vqmm_scalar_cache.len) {
-        vqmm_scalar_cache[vqmm_scalar_count] = .{ .v = v, .arr = arr };
+        vqmm_scalar_cache[vqmm_scalar_count] = .{ .v = v, .arr = arr, .tick = vqmm_scalar_tick };
         vqmm_scalar_count += 1;
     } else {
-        // Evict slot 0 (safe: in-flight lazy graph nodes hold their own
-        // refs to the old array; this only drops OUR handle).
-        _ = mlx.mlx_array_free(vqmm_scalar_cache[0].arr);
-        vqmm_scalar_cache[0] = .{ .v = v, .arr = arr };
+        const victim = vqmmScalarEvictIndex(vqmm_scalar_cache[0..vqmm_scalar_count]);
+        _ = mlx.mlx_array_free(vqmm_scalar_cache[victim].arr);
+        vqmm_scalar_cache[victim] = .{ .v = v, .arr = arr, .tick = vqmm_scalar_tick };
     }
     return arr;
+}
+
+test "vqmm scalar cache never evicts a scalar the caller is still holding" {
+    // The live crash, as a pure decision: every verifyQmm-family call site
+    // takes K then N back to back and holds BOTH handles in one `inputs_arr`.
+    // The old policy evicted slot 0 unconditionally, so the N call freed the
+    // array the K call had just been handed — a dangling entry that killed the
+    // server inside mlx_vector_array_new_data / _free.
+    var cache: [16]VqmmScalar = undefined;
+    for (&cache, 0..) |*e, i| {
+        e.* = .{ .v = @intCast(i), .arr = .{ .ctx = null }, .tick = @intCast(i + 1) };
+    }
+
+    // Call 1 (K): the cache is full, so something is evicted and K takes its
+    // slot with the newest tick.
+    const k_slot = vqmmScalarEvictIndex(&cache);
+    try std.testing.expectEqual(@as(usize, 0), k_slot); // oldest tick == slot 0 here
+    cache[k_slot] = .{ .v = 1000, .arr = .{ .ctx = null }, .tick = 17 };
+
+    // Call 2 (N): the victim must NOT be the slot K just took — the caller is
+    // still holding that handle. Under the old always-slot-0 policy this
+    // returned 0 and freed K.
+    const n_slot = vqmmScalarEvictIndex(&cache);
+    try std.testing.expect(n_slot != k_slot);
+    cache[n_slot] = .{ .v = 2000, .arr = .{ .ctx = null }, .tick = 18 };
+
+    // And it generalizes: after any run of insertions, the two most recently
+    // ticked entries are never the next victim.
+    var tick: u64 = 19;
+    var round: usize = 0;
+    while (round < 40) : (round += 1) {
+        const victim = vqmmScalarEvictIndex(&cache);
+        var newest: u64 = 0;
+        var second: u64 = 0;
+        for (cache) |e| {
+            if (e.tick > newest) {
+                second = newest;
+                newest = e.tick;
+            } else if (e.tick > second) second = e.tick;
+        }
+        try std.testing.expect(cache[victim].tick != newest);
+        try std.testing.expect(cache[victim].tick != second);
+        cache[victim] = .{ .v = @intCast(3000 + round), .arr = .{ .ctx = null }, .tick = tick };
+        tick += 1;
+    }
 }
 
 var verify_qmm_enabled_cache: ?bool = null;

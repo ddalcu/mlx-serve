@@ -25,6 +25,9 @@ import json
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).parent))
+from bench_engines import format_engines_note  # noqa: E402
+
 HEADER = ("model|engine|spec|context|prefill_tps|decode_tps|ttft_ms|"
           "tok_per_step|spec_ratio|checkpoint|hardware|notes")
 
@@ -110,6 +113,12 @@ def main() -> None:
     p.add_argument("json_dir", type=Path, help="directory of llmprobe --save reports")
     p.add_argument("--out", type=Path, required=True, help="CSV to write")
     p.add_argument("--note", default="", help="run note recorded in the CSV header comment")
+    p.add_argument(
+        "--engines", default="",
+        help="engine versions for the charts, e.g. "
+             "'mlx-serve=26.8.3 omlx=0.5.2 mtplx=2.5.3 lmstudio=0.4.19+2'. "
+             "Written as a SECOND '#' line; readers take the run note from the "
+             "first '#' only, so this is additive and old CSVs still parse.")
     args = p.parse_args()
 
     reports = sorted(args.json_dir.glob("*__*__*.json"))
@@ -137,6 +146,15 @@ def main() -> None:
     with open(args.out, "w") as f:
         if args.note:
             f.write(f"# {clean(args.note)}\n")
+        if args.engines:
+            # A chart that names oMLX has to name WHICH oMLX, or the claim
+            # ages badly. llmprobe's reports carry no engine version, so it
+            # rides here and both plot scripts read it off the CSV.
+            versions = dict(
+                tok.split("=", 1) for tok in args.engines.split() if "=" in tok)
+            note = format_engines_note(versions)
+            if note:
+                f.write(f"# {clean(note)}\n")
         f.write(HEADER + "\n")
         f.write("\n".join(rows) + "\n")
 

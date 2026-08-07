@@ -93,6 +93,79 @@ fn dirModelTypeIs(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u
     return mt == .string and std.mem.eql(u8, mt.string, want);
 }
 
+/// The `chat_template` entry of tokenizer_config.json, as a string.
+///
+/// HF allows TWO shapes and we only handled one: a bare string, or a LIST of
+/// `{name, template}` objects (Mistral-7B-Instruct-v0.3 ships `default` +
+/// `tool_use`). Reading the list as `v.string` is not a graceful failure — it
+/// is a Zig union panic that kills the process at LOAD, so the checkpoint
+/// could not be served at all (live 2026-08-07: `access of union field
+/// 'string' while field 'array' is active`).
+///
+/// Selection follows transformers: the entry named "default", which is what
+/// `apply_chat_template` uses unless the caller names another. Falls back to
+/// the first entry when nothing is named "default", and returns null for any
+/// other shape so the caller drops to its chat_template.jinja / family
+/// fallback instead of panicking.
+fn chatTemplateFromValue(v: ?std.json.Value) ?[]const u8 {
+    const val = v orelse return null;
+    switch (val) {
+        .string => |s| return s,
+        .array => |arr| {
+            var first: ?[]const u8 = null;
+            for (arr.items) |entry| {
+                if (entry != .object) continue;
+                const tpl = entry.object.get("template") orelse continue;
+                if (tpl != .string) continue;
+                if (first == null) first = tpl.string;
+                const name = entry.object.get("name") orelse continue;
+                if (name == .string and std.mem.eql(u8, name.string, "default")) return tpl.string;
+            }
+            return first;
+        },
+        else => return null,
+    }
+}
+
+test "chat_template accepts HF's list-of-named-templates shape" {
+    // Mistral-7B-Instruct-v0.3 ships a LIST (`default` + `tool_use`). Reading
+    // it as `.string` panicked the process at load, so the checkpoint could
+    // not be served at all.
+    const a = std.testing.allocator;
+
+    {   // the shape that panicked: pick the entry named "default"
+        const json =
+            \\{"chat_template":[{"name":"tool_use","template":"TOOLS"},
+            \\{"name":"default","template":"PLAIN"}]}
+        ;
+        var p = try std.json.parseFromSlice(std.json.Value, a, json, .{});
+        defer p.deinit();
+        try std.testing.expectEqualStrings("PLAIN", chatTemplateFromValue(p.value.object.get("chat_template")).?);
+    }
+    {   // no "default" named: fall back to the first usable entry
+        const json = \\{"chat_template":[{"name":"tool_use","template":"TOOLS"}]}
+        ;
+        var p = try std.json.parseFromSlice(std.json.Value, a, json, .{});
+        defer p.deinit();
+        try std.testing.expectEqualStrings("TOOLS", chatTemplateFromValue(p.value.object.get("chat_template")).?);
+    }
+    {   // the ordinary string shape is untouched
+        const json = \\{"chat_template":"BARE"}
+        ;
+        var p = try std.json.parseFromSlice(std.json.Value, a, json, .{});
+        defer p.deinit();
+        try std.testing.expectEqualStrings("BARE", chatTemplateFromValue(p.value.object.get("chat_template")).?);
+    }
+    {   // junk shapes return null so the caller uses its jinja/family fallback
+        const json = \\{"chat_template":[{"name":"x"},{"nope":1}]}
+        ;
+        var p = try std.json.parseFromSlice(std.json.Value, a, json, .{});
+        defer p.deinit();
+        try std.testing.expect(chatTemplateFromValue(p.value.object.get("chat_template")) == null);
+    }
+    try std.testing.expect(chatTemplateFromValue(null) == null);
+}
+
 /// Load chat template configuration from tokenizer_config.json.
 pub fn loadChatConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !ChatConfig {
     const path = try std.fmt.allocPrint(allocator, "{s}/tokenizer_config.json", .{model_dir});
@@ -111,8 +184,8 @@ pub fn loadChatConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []con
 
     const root = parsed.value.object;
 
-    const chat_template: []const u8 = if (root.get("chat_template")) |v|
-        try allocator.dupe(u8, v.string)
+    const chat_template: []const u8 = if (chatTemplateFromValue(root.get("chat_template"))) |t|
+        try allocator.dupe(u8, t)
     else blk: {
         // Fall back to chat_template.jinja file (e.g. Qwen3.5 models)
         const jinja_path = try std.fmt.allocPrint(allocator, "{s}/chat_template.jinja", .{model_dir});
