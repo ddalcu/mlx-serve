@@ -379,10 +379,22 @@ final class VideoGenService: ObservableObject {
         // The fast recipe is the SERVER's default — the app only speaks up to
         // opt OUT, and only on a backend that has the recipe at all.
         if request.model.supportsFastRecipe, request.bestQuality { body["fast"] = false }
+        // Turbo + chained windows: capability-gated like every H3 field above,
+        // and emitted only when engaged — the server's defaults are the
+        // absent-field behavior.
+        if request.model.supportsTurbo, request.turbo { body["turbo"] = true }
+        if request.model.supportsChainedWindows, request.chainWindows > 1 {
+            body["chain_windows"] = request.chainWindows
+        }
         if request.model.supportsAudioInput, hasAudio, let audioB64 { body["audio"] = audioB64 }
-        if request.model.supportsLoRA, let lora = request.loraPath, !lora.isEmpty {
-            body["lora_path"] = lora
-            if request.loraScale != 1.0 { body["lora_scale"] = request.loraScale }
+        // Stacked style LoRAs (adapters sum, so several can attach at once —
+        // see ImageGenService.requestJson for the same pattern). Capability-
+        // gated like every other field: a preset switch leaves the rows in
+        // state, and a backend without LoRA support must not see the arrays.
+        let loras = request.loras.filter { !$0.path.isEmpty }
+        if request.model.supportsLoRA, !loras.isEmpty {
+            body["lora_paths"] = loras.map(\.path)
+            body["lora_scales"] = loras.map(\.scale)
         }
         // ref2va. Gated on the pack's own capability for the same reason as
         // `pipeline` above: an FL2VA checkpoint handed references 400s, and a

@@ -812,6 +812,46 @@ class DownloadManager: ObservableObject {
         await download(repoId: drafter, alertOnFailure: false)
     }
 
+    // MARK: - Turbo LoRA (on demand)
+
+    /// Fetch the H3 Turbo adapter into a pack that is already on disk.
+    ///
+    /// It ships inside the bundle now, so a fresh download brings it; this is
+    /// for the installs that predate it, where re-downloading 69 GB to collect
+    /// one 744 MB file is not an answer. Same repo the pack came from, so the
+    /// destination is the pack's own directory and `download`'s size-matching
+    /// skip leaves every other file alone.
+    ///
+    /// Idempotent while in flight: a second call (toggle, then Generate)
+    /// attaches to the running task instead of starting a second transfer.
+    /// `onFinish` runs on completion OR failure — the caller decides what a
+    /// failure means.
+    ///
+    /// Failures DO alert here, unlike the companion drafter above: the user
+    /// ticked a box asking for this, so silence just moves the discovery to
+    /// Generate, minutes later, as the server's 400. That reasoning only holds
+    /// once the mirrors actually carry the file — before then every tick
+    /// alerted on a 404 nobody could fix.
+    func startTurboLora(repoId: String, onFinish: @escaping @MainActor () -> Void = {}) {
+        if let running = activeTasks[repoId] {
+            Task { @MainActor in
+                _ = await running.value
+                onFinish()
+            }
+            return
+        }
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.download(repoId: repoId,
+                                selection: FileSelection(keepSafetensors: [TurboLoraFetch.fileName]),
+                                alertOnFailure: true)
+            self.finalizeIfCancelled(repoId: repoId)
+            self.activeTasks.removeValue(forKey: repoId)
+            onFinish()
+        }
+        activeTasks[repoId] = task
+    }
+
     // MARK: - Media bundles
     //
     // A media model + its dependencies, downloaded as a unit (LTX → LTX +

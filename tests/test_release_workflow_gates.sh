@@ -135,5 +135,18 @@ check(tz_pin(wf_text) is not None, "release.yml pins the CalVer timezone")
 check(tz_pin(wf_text) == tz_pin(build_sh),
       "release.yml and app/build.sh compute CalVer in the SAME timezone")
 
+# ── Third-party attribution must travel WITH the binaries. The shipped binary
+# links Apache-2.0 code (MTPLX/dflash/oMLX Metal kernels, jinja.cpp), and
+# section 4 conditions redistribution on the recipient getting the license text
+# and the NOTICE attributions. Nothing pinned that those files leave the repo,
+# and for months they did not: every packaging path shipped the binary alone.
+for name, text in (("release.yml CLI tarball + app bundle", wf_text),
+                   ("app/build.sh", build_sh)):
+    for f in ("LICENSE-APACHE-2.0", "NOTICE"):
+        check(f in text, f"{name} packages {f}")
+# Two copies in release.yml: one per artifact (tarball and .app).
+check(wf_text.count("LICENSE-APACHE-2.0") >= 2,
+      "release.yml packages the licenses into BOTH the tarball and the .app")
+
 sys.exit(FAIL)
 EOF

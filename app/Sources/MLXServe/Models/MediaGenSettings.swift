@@ -1,5 +1,42 @@
 import Foundation
 
+/// One stacked LoRA adapter: a `.safetensors` path plus its strength. Several
+/// can attach at once (mirrors mflux's `lora_paths`/`lora_scales`, sent to
+/// the server as JSON arrays of the same names) — their effects sum at
+/// generation time rather than merging into the base weights, so order
+/// doesn't matter. `id` is NOT persisted (see `CodingKeys`) — it exists only
+/// to give SwiftUI's `ForEach` stable row identity while the list is edited.
+struct LoraAdapter: Codable, Equatable, Identifiable {
+    var id: UUID = UUID()
+    /// Absolute path to a `.safetensors` adapter. Empty rows (mid-edit, e.g.
+    /// right after tapping "+") are dropped before the request is sent.
+    var path: String = ""
+    /// Strength multiplier on top of the file's own alpha/rank scale.
+    var scale: Double = 1.0
+
+    private enum CodingKeys: String, CodingKey { case path, scale }
+}
+
+/// Keys for the pre-multi-LoRA single `loraPath`/`loraScale` fields, kept
+/// only so `ImageGenSettings`/`VideoGenSettings` can migrate an old
+/// UserDefaults blob into the new `loras` array. Not tied to any stored
+/// property, so it can't be part of either struct's synthesized CodingKeys.
+private enum LegacyLoraCodingKeys: String, CodingKey { case loraPath, loraScale }
+
+/// Bounds for a drag-resizable prompt editor. The height is persisted, so a
+/// value dragged on a taller window — or a garbage one — must never come back
+/// as an editor too small to type in or taller than the pane.
+enum PromptEditorHeight {
+    static let minHeight: Double = 70
+    static let maxHeight: Double = 600
+    static let defaultHeight: Double = 110
+
+    static func clamp(_ h: Double) -> Double {
+        guard h.isFinite else { return defaultHeight }
+        return Swift.min(maxHeight, Swift.max(minHeight, h))
+    }
+}
+
 /// Sticky last-used settings for the three media-generation panels.
 ///
 /// The Image/Audio/Video windows keep their controls as view `@State`, so a
@@ -35,9 +72,9 @@ struct ImageGenSettings: Codable, Equatable {
     /// Conditioning rebalance (Advanced): global gain + weights text.
     var condGain: Double = 1.0
     var condWeightsText: String = ""
-    /// Style LoRA (Advanced): sticky adapter path ("" = none) + strength.
-    var loraPath: String = ""
-    var loraScale: Double = 1.0
+    /// Style LoRAs (Advanced): sticky stack of adapter path + strength pairs.
+    /// Empty = none attached.
+    var loras: [LoraAdapter] = []
 
     private static let storageKey = "imageGenSettings"
 
@@ -84,8 +121,16 @@ extension ImageGenSettings {
         if let v = try c.decodeIfPresent(Bool.self, forKey: .editMode) { editMode = v }
         if let v = try c.decodeIfPresent(Double.self, forKey: .condGain) { condGain = v }
         if let v = try c.decodeIfPresent(String.self, forKey: .condWeightsText) { condWeightsText = v }
-        if let v = try c.decodeIfPresent(String.self, forKey: .loraPath) { loraPath = v }
-        if let v = try c.decodeIfPresent(Double.self, forKey: .loraScale) { loraScale = v }
+        if let v = try c.decodeIfPresent([LoraAdapter].self, forKey: .loras), !v.isEmpty {
+            loras = v
+        } else {
+            // Pre-multi-LoRA blob: a single "loraPath"/"loraScale" pair, not
+            // backed by a stored property anymore, so read it via its own key.
+            let legacy = try decoder.container(keyedBy: LegacyLoraCodingKeys.self)
+            let lp = try legacy.decodeIfPresent(String.self, forKey: .loraPath) ?? ""
+            let ls = try legacy.decodeIfPresent(Double.self, forKey: .loraScale) ?? 1.0
+            if !lp.isEmpty { loras = [LoraAdapter(path: lp, scale: ls)] }
+        }
     }
 }
 
@@ -183,9 +228,13 @@ struct VideoGenSettings: Codable, Equatable {
     var keepResident: Bool = false
     /// Max-quality opt-out of the server's fast recipe (H3).
     var bestQuality: Bool = false
-    /// Style LoRA (Advanced): sticky adapter path ("" = none) + strength.
-    var loraPath: String = ""
-    var loraScale: Double = 1.0
+    /// Turbo distillation LoRA (H3 fl2va): 4-step sampling.
+    var turbo: Bool = false
+    /// Style LoRAs (Advanced): sticky stack of adapter path + strength pairs.
+    /// Empty = none attached.
+    var loras: [LoraAdapter] = []
+    /// Height of the drag-resizable prompt editor.
+    var promptHeight: Double = PromptEditorHeight.defaultHeight
 
     private static let storageKey = "videoGenSettings"
 
@@ -237,8 +286,18 @@ extension VideoGenSettings {
         if let v = try c.decodeIfPresent(Int.self, forKey: .seed) { seed = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .keepResident) { keepResident = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .bestQuality) { bestQuality = v }
-        if let v = try c.decodeIfPresent(String.self, forKey: .loraPath) { loraPath = v }
-        if let v = try c.decodeIfPresent(Double.self, forKey: .loraScale) { loraScale = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .turbo) { turbo = v }
+        if let v = try c.decodeIfPresent(Double.self, forKey: .promptHeight) {
+            promptHeight = PromptEditorHeight.clamp(v)
+        }
+        if let v = try c.decodeIfPresent([LoraAdapter].self, forKey: .loras), !v.isEmpty {
+            loras = v
+        } else {
+            let legacy = try decoder.container(keyedBy: LegacyLoraCodingKeys.self)
+            let lp = try legacy.decodeIfPresent(String.self, forKey: .loraPath) ?? ""
+            let ls = try legacy.decodeIfPresent(Double.self, forKey: .loraScale) ?? 1.0
+            if !lp.isEmpty { loras = [LoraAdapter(path: lp, scale: ls)] }
+        }
     }
 }
 

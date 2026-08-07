@@ -14,6 +14,11 @@ struct VideoGenView: View {
     @EnvironmentObject var downloads: DownloadManager
 
     @State private var prompt: String = ""
+    /// Height of the prompt editor — dragged by `promptResizeHandle`, sticky.
+    @State private var promptHeight: Double = PromptEditorHeight.defaultHeight
+    /// Height when the current drag began (nil = not dragging); `translation`
+    /// is cumulative from the gesture's start, so it needs an anchor.
+    @State private var promptHeightAtDragStart: Double? = nil
     @State private var showAdvanced: Bool = false
     @State private var model: VideoModelPreset = .ltx23Q4
     /// Selected network model's routing id (`<model>@<peer>`); nil = local.
@@ -27,8 +32,9 @@ struct VideoGenView: View {
     @State private var cfgScale: Double = 1.0
     @State private var stgScale: Double = 0.0
     @State private var seed: Int = 42
-    /// Style LoRA (Advanced): .safetensors adapter path ("" = none).
-    @State private var loraPath: String = ""
+    /// Style LoRAs (Advanced): stacked `.safetensors` adapters ([] = none).
+    /// Several can attach at once — their effects sum, so order doesn't matter.
+    @State private var loras: [LoraAdapter] = []
     @State private var firstFrameImageURL: URL? = nil
     // ref2va references, kept across preset changes like firstFrameImageURL —
     // `requestBody` gates the fields on the pack's own capability, so state
@@ -63,6 +69,8 @@ struct VideoGenView: View {
     /// Keep the model resident after generating (default off → unload).
     @State private var keepResident: Bool = false
     @State private var bestQuality: Bool = false
+    /// Turbo distillation LoRA (H3 fl2va): 4-step sampling, recipe off.
+    @State private var turbo: Bool = false
     /// Hydration guard — see ImageGenView for the full rationale.
     @State private var hydrating: Bool = false
     @State private var didHydrate: Bool = false
@@ -176,7 +184,7 @@ struct VideoGenView: View {
             ZStack(alignment: .topLeading) {
                 TextEditor(text: $prompt)
                     .font(.body)
-                    .frame(height: 110)
+                    .frame(height: promptHeight)
                     .overlay(
                         RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.3), lineWidth: 0.5)
                     )
@@ -189,10 +197,40 @@ struct VideoGenView: View {
                         .allowsHitTesting(false)
                 }
             }
+            promptResizeHandle
             if let hint = promptHint {
                 Text(hint).font(.caption2).foregroundStyle(.orange)
             }
         }
+    }
+
+    /// Drag strip under the prompt editor. H3's format is a multi-section
+    /// document, so 110pt is a keyhole — full width so it's easy to grab, and
+    /// the height sticks (clamped on the way in and out, so a value dragged on
+    /// a taller window can't come back unusable).
+    private var promptResizeHandle: some View {
+        Capsule()
+            .fill(Color.secondary.opacity(0.35))
+            .frame(width: 36, height: 4)
+            .frame(maxWidth: .infinity)
+            .padding(.vertical, 3)
+            .contentShape(Rectangle())
+            .gesture(
+                DragGesture(minimumDistance: 1)
+                    .onChanged { v in
+                        let base = promptHeightAtDragStart ?? promptHeight
+                        if promptHeightAtDragStart == nil { promptHeightAtDragStart = base }
+                        promptHeight = PromptEditorHeight.clamp(base + v.translation.height)
+                    }
+                    .onEnded { _ in
+                        promptHeightAtDragStart = nil
+                        persist()
+                    }
+            )
+            .onHover { inside in
+                if inside { NSCursor.resizeUpDown.push() } else { NSCursor.pop() }
+            }
+            .help("Drag to resize the prompt box.")
     }
 
     /// Soft caption under the prompt field. Per-BACKEND: LTX's "4–8 sentences"
@@ -337,6 +375,18 @@ struct VideoGenView: View {
     /// your RAM" on a job this long is a shrug: the memory is dominated by the
     /// fast recipe's step cache, so turning Max quality ON is the low-memory
     /// mode — backwards from every other quality toggle, and impossible to
+    /// Turbo only counts on a preset that declares it — the state survives
+    /// preset switches (the `firstFrameImageURL` convention), and a stale
+    /// `true` must not shape another backend's requests or estimates.
+    private var turboEngaged: Bool { turbo && model.supportsTurbo }
+    /// What the server's recipe actually runs: turbo forces it off, so every
+    /// plan/estimate call reads THIS, never `!bestQuality` alone.
+    private var effectiveFast: Bool { !bestQuality && !turboEngaged }
+    /// The steps slider under turbo offers the LoRA's own trained range.
+    private var effectiveStepsRange: ClosedRange<Int> {
+        turboEngaged ? 4...16 : model.stepsRange
+    }
+
     /// guess.
     private var frameRAMWarning: String? {
         let total = RAMChecker.totalGB
@@ -345,7 +395,7 @@ struct VideoGenView: View {
             width: resolution.width,
             height: resolution.height,
             available: total,
-            fast: !bestQuality
+            fast: effectiveFast
         )
         guard model.backend == .minimaxH3 else {
             guard numFrames > cap else { return nil }
@@ -356,15 +406,15 @@ struct VideoGenView: View {
         // fits" and "nothing fits", and a Mac too small to load the pack saw
         // no warning at all at exactly 124 frames.
         guard !H3Plan.fits(model: model, width: resolution.width, height: resolution.height,
-                           frames: numFrames, fast: !bestQuality, availableGB: total) else { return nil }
+                           frames: numFrames, fast: effectiveFast, turbo: turboEngaged, availableGB: total) else { return nil }
         let gib = 1024.0 * 1024.0 * 1024.0
         let need = Double(H3Plan.peakBytes(model: model, width: resolution.width, height: resolution.height,
-                                           frames: numFrames, fast: !bestQuality)) / gib
+                                           frames: numFrames, fast: effectiveFast, turbo: turboEngaged)) / gib
         var out = String(format: "Needs about %.0f GB at this size and length; your Mac has %d GB. ", need, total)
         let floorFits = H3Plan.fits(model: model, width: resolution.width, height: resolution.height,
-                                    frames: cap, fast: !bestQuality, availableGB: total)
+                                    frames: cap, fast: effectiveFast, turbo: turboEngaged, availableGB: total)
         out += floorFits && cap < numFrames ? "About \(cap) frames fits here" : "Try a smaller resolution"
-        if !bestQuality {
+        if effectiveFast {
             let slow = Double(H3Plan.peakBytes(model: model, width: resolution.width, height: resolution.height,
                                                frames: numFrames, fast: false)) / gib
             if slow < need - 2 {
@@ -385,7 +435,7 @@ struct VideoGenView: View {
         guard model.backend == .minimaxH3, lanModel == nil else { return nil }
         return H3TimeEstimate.describeBest(
             model: model, width: resolution.width, height: resolution.height,
-            frames: numFrames, steps: steps, fast: !bestQuality
+            frames: numFrames, steps: steps, fast: effectiveFast
         )
     }
 
@@ -789,9 +839,9 @@ struct VideoGenView: View {
             // ("runs well from ~8"), shown verbatim on a backend where 8 steps
             // is below anything we have a verdict on and the fast recipe's
             // warmup/tail windows cover the whole schedule.
-            intSliderRow("Steps", value: $steps, range: model.stepsRange,
+            intSliderRow("Steps", value: $steps, range: effectiveStepsRange,
                          help: "Denoising steps. More = more detail and smoother motion, but slower.")
-            Text(model.stepsHelp)
+            Text(turboEngaged ? "4 steps is sharp on this adapter and is the floor; more steps still help a little. If the picture shows over-sharp grain, drop the LoRA scale to 0.8-0.95; if it ghosts, raise it to 1.05-1.2." : model.stepsHelp)
                 .font(.caption2).foregroundStyle(.secondary)
 
             // CFG is honored in every LTX pipeline mode, but a CFG-DISTILLED
@@ -809,10 +859,39 @@ struct VideoGenView: View {
                           help: "Same seed + same settings reproduces the clip. Paste one to rerun someone else's.")
                 Spacer()
             }
+            if model.supportsTurbo {
+                Toggle("Turbo (distilled 4-step sampling)", isOn: $turbo)
+                    .font(.caption)
+                    .help("Runs the Turbo distillation LoRA: 4 steps instead of 30, about twice as fast end to end. Slightly softer detail and harder light than a full render. The adapter ships with the model; packs downloaded before it existed fetch it once, on the first run with this on.")
+                    .onChange(of: turbo) { _, on in
+                        guard !hydrating else { return }
+                        // Snap steps into the mode's own range: 4 is what the
+                        // adapter is distilled for, 30 the full render default.
+                        steps = on ? 4 : min(model.stepsRange.upperBound, max(model.stepsRange.lowerBound, 30))
+                        persist()
+                        // Fetch the adapter the moment it is asked for rather
+                        // than at Generate: 744 MB discovered 30 seconds into
+                        // a job reads as a hang, and this way the Downloads
+                        // pane shows it while the user finishes their prompt.
+                        if on, turboFetchDecision == .fetch {
+                            downloads.startTurboLora(repoId: model.repo)
+                        }
+                    }
+                if turboFetchDecision == .fetch {
+                    Text("Turbo needs a \(TurboLoraFetch.approxMB) MB adapter this pack predates — it downloads once, and Generate waits for it.")
+                        .font(.caption2).foregroundStyle(.secondary)
+                } else if turboFetchDecision == .unavailableRemotely {
+                    Text("Turbo runs on the Mac hosting this model; it needs the adapter in ITS copy of the pack.")
+                        .font(.caption2).foregroundStyle(.secondary)
+                }
+            }
             if model.supportsFastRecipe {
                 Toggle("Max quality (slower)", isOn: $bestQuality)
                     .font(.caption)
                     .help("Off (default): the fast recipe — step caching + attention reuse, about 2.8x faster at 768p. On: every denoising step is fully computed; marginally better detail for final renders.")
+                    // Under turbo the recipe is already off server-side; a
+                    // toggle that could not change anything is a dead control.
+                    .disabled(turboEngaged)
             }
             Toggle("Keep model loaded after generating", isOn: $keepResident)
                 .font(.caption)
@@ -827,39 +906,60 @@ struct VideoGenView: View {
     private var loraSection: some View {
         VStack(alignment: .leading, spacing: 10) {
             Divider()
-            Text("Style LoRA").font(.caption.weight(.semibold))
-            if loraPath.isEmpty {
+            HStack {
+                Text("Style LoRAs").font(.caption.weight(.semibold))
+                Spacer()
+                Button {
+                    chooseLora()
+                } label: {
+                    Image(systemName: "plus.circle")
+                }
+                .buttonStyle(.borderless)
+                .disabled(loras.count >= maxLoras)
+                .help(loras.count >= maxLoras ? "Maximum \(maxLoras) LoRAs" : "Add another LoRA")
+            }
+            if loras.isEmpty {
                 Button {
                     chooseLora()
                 } label: {
                     Label("Choose .safetensors…", systemImage: "paintpalette")
                         .font(.caption)
                 }
-                Text("Apply a LoRA adapter to the video model for a custom style.")
+                Text("Apply one or more LoRA adapters to the video model for a custom style. Several can stack at once.")
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             } else {
-                HStack(spacing: 8) {
-                    Image(systemName: "paintpalette")
+                ForEach(Array(loras.enumerated()), id: \.element.id) { index, lora in
+                    HStack(spacing: 8) {
+                        Image(systemName: "paintpalette")
+                            .foregroundStyle(.secondary)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text(URL(fileURLWithPath: lora.path).lastPathComponent)
+                                .font(.caption)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                                .help(lora.path)
+                            Stepper(value: $loras[index].scale, in: 0...2, step: 0.05) {
+                                Text("scale \(String(format: "%.2f", lora.scale))")
+                                    .font(.caption2)
+                                    .foregroundStyle(.secondary)
+                            }
+                            .onChange(of: loras[index].scale) { _, _ in guard !hydrating else { return }; persist() }
+                        }
+                        Spacer()
+                        Button {
+                            loras.remove(at: index)
+                            persist()
+                        } label: {
+                            Image(systemName: "xmark.circle.fill")
+                        }
+                        .buttonStyle(.borderless)
                         .foregroundStyle(.secondary)
-                    Text(URL(fileURLWithPath: loraPath).lastPathComponent)
-                        .font(.caption)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                        .help(loraPath)
-                    Spacer()
-                    Button {
-                        loraPath = ""
-                        persist()
-                    } label: {
-                        Image(systemName: "xmark.circle.fill")
+                        .help("Remove this LoRA")
                     }
-                    .buttonStyle(.borderless)
-                    .foregroundStyle(.secondary)
-                    .help("Remove the LoRA")
+                    .padding(6)
+                    .background(RoundedRectangle(cornerRadius: 6).fill(Color.secondary.opacity(0.08)))
                 }
-                .padding(6)
-                .background(RoundedRectangle(cornerRadius: 6).fill(Color.secondary.opacity(0.08)))
             }
         }
     }
@@ -894,16 +994,22 @@ struct VideoGenView: View {
         return "Model not loaded"
     }
 
+    /// Max simultaneously-attached LoRAs — mirrors the server's `lora.MAX_LORAS`.
+    private let maxLoras = 8
+
     private func chooseLora() {
+        guard loras.count < maxLoras else { return }
         let panel = NSOpenPanel()
         if let st = UTType(filenameExtension: "safetensors") {
             panel.allowedContentTypes = [st]
         }
         panel.canChooseFiles = true
         panel.canChooseDirectories = false
-        panel.allowsMultipleSelection = false
-        if AppActivation.runModal(panel) == .OK, let url = panel.url {
-            loraPath = url.path
+        panel.allowsMultipleSelection = true
+        if AppActivation.runModal(panel) == .OK {
+            for url in panel.urls.prefix(maxLoras - loras.count) {
+                loras.append(LoraAdapter(path: url.path))
+            }
             persist()
         }
     }
@@ -1097,19 +1203,21 @@ struct VideoGenView: View {
         numFrames = s.numFrames
         fps = s.fps
         mode = s.mode
+        // Turbo restores BEFORE the steps clamp: its range reaches below the
+        // preset's floor, and clamping first would bounce a saved 8 up to 16.
+        turbo = s.turbo && model.supportsTurbo
         // Clamp into the slider ranges — a value persisted by the old wider
         // steppers (Steps unbounded, CFG 0…20) would otherwise sit off-scale.
-        steps = min(model.stepsRange.upperBound, max(model.stepsRange.lowerBound, s.steps))
+        steps = min(effectiveStepsRange.upperBound, max(effectiveStepsRange.lowerBound, s.steps))
         cfgScale = min(10, max(1, s.cfgScale))
         stgScale = s.stgScale
         seed = s.seed
         keepResident = s.keepResident
         bestQuality = s.bestQuality
-        loraPath = s.loraPath
-        // The LoRA file may have moved since last session — drop a stale path.
-        if !loraPath.isEmpty && !FileManager.default.fileExists(atPath: loraPath) {
-            loraPath = ""
-        }
+        promptHeight = PromptEditorHeight.clamp(s.promptHeight)
+        loras = s.loras
+        // A LoRA file may have moved since last session — drop stale entries.
+        loras.removeAll { !FileManager.default.fileExists(atPath: $0.path) }
         clampFramesToRAM()
     }
 
@@ -1127,7 +1235,9 @@ struct VideoGenView: View {
         s.seed = seed
         s.keepResident = keepResident
         s.bestQuality = bestQuality
-        s.loraPath = loraPath
+        s.turbo = turbo
+        s.promptHeight = PromptEditorHeight.clamp(promptHeight)
+        s.loras = loras
         s.save()
     }
 
@@ -1153,6 +1263,10 @@ struct VideoGenView: View {
     private func applyQualityDefaults() {
         let s = model.settings(quality)
         mode = s.mode
+        // A quality tier describes a FULL render — its step counts are the
+        // non-turbo schedule's — so picking one turns turbo off rather than
+        // clamping the tier's 30 steps into turbo's 16-step ceiling.
+        turbo = false
         // Clamp into the backend's range: a preset switch carrying a value the
         // new model's slider cannot show leaves the control off-scale.
         steps = min(model.stepsRange.upperBound, max(model.stepsRange.lowerBound, s.steps))
@@ -1204,7 +1318,10 @@ struct VideoGenView: View {
             keepResident: keepResident,
             bestQuality: bestQuality,
             lanModelId: lanModel,
-            loraPath: loraPath.isEmpty ? nil : loraPath,
+            loras: loras,
+            // Belt-and-braces with the requestBody gate (turbo state survives
+            // preset switches, like the reference files below).
+            turbo: turboEngaged,
             // Belt-and-braces with the requestBody gate, same as `audioPath`
             // above: reference files must never reach the reader (whose
             // failure is a hard error) on a pack that cannot use them.
@@ -1224,7 +1341,29 @@ struct VideoGenView: View {
             return
         }
 
+        // Belt-and-braces with the toggle's own fetch: turbo can be persisted
+        // ON from a previous session, or the fetch it started can still be in
+        // flight. `startTurboLora` attaches to a running transfer rather than
+        // starting a second one, so both paths converge on one download.
+        if turboFetchDecision == .fetch {
+            downloads.startTurboLora(repoId: model.repo) {
+                service.generate(req, server: server)
+            }
+            return
+        }
+
         service.generate(req, server: server)
+    }
+
+    /// Whether this pane's current selection needs the Turbo adapter fetched.
+    /// The file lives in the pack, so a LAN model's is not ours to complete.
+    private var turboFetchDecision: TurboLoraFetch.Decision {
+        TurboLoraFetch.decide(
+            turboRequested: turbo,
+            backendSupportsTurbo: model.supportsTurbo,
+            isRemote: lanModel != nil,
+            fileOnDisk: TurboLoraFetch.isOnDisk(modelDir: ServerManager.resolveModelDir(repo: model.repo))
+        )
     }
 
     private func showLogWindow() {

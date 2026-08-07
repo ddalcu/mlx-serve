@@ -57,6 +57,10 @@ enum H3Plan {
     /// rather than measured, and rounded UP for the reason in the type comment.
     static let activationBytesPerRow: UInt64 = 96 * 1024
 
+    /// The Turbo LoRA rides resident beside the DiT when engaged (744 MB bf16
+    /// on disk, rounded up — the server bills the real file the same way).
+    static let turboLoraBytes: UInt64 = 800 * 1024 * 1024
+
     /// Peak unified memory for one generation, in bytes.
     ///
     /// During sampling the text encoder is already freed, so the resident set is
@@ -64,14 +68,19 @@ enum H3Plan {
     /// (`max(TE, DiT) + VAEs`, the preset's `approxRAMGB`) is the floor — a run
     /// that samples cheaply still had to get the weights in.
     static func peakBytes(model: VideoModelPreset, width: Int, height: Int,
-                          frames: Int, fast: Bool, promptTokens: Int = 250) -> UInt64 {
+                          frames: Int, fast: Bool, turbo: Bool = false,
+                          promptTokens: Int = 250) -> UInt64 {
         let gb: UInt64 = 1024 * 1024 * 1024
         let stagedGB = model.stagedPeakGB > 0 ? model.stagedPeakGB : Double(model.approxRAMGB)
         let loadPeak = UInt64(stagedGB * Double(gb))
         guard model.backend == .minimaxH3 else { return UInt64(model.approxRAMGB) * gb }
         let r = rows(width: width, height: height, frames: frames, promptTokens: promptTokens)
+        // Turbo forces the fast recipe off server-side, so its callers pass
+        // fast=false and the broadcast cache never bills; the LoRA itself
+        // rides beside the DiT.
         let sampling = UInt64(Double(model.ditResidentGB) * Double(gb))
             + (fast ? pabCacheBytes(rows: r) : 0)
+            + (turbo ? turboLoraBytes : 0)
             + UInt64(r) * activationBytesPerRow
         return max(loadPeak, sampling)
     }
@@ -92,8 +101,8 @@ enum H3Plan {
     /// "nothing fits". A Mac too small to load the pack at all would otherwise
     /// see no warning at exactly 124 frames.
     static func fits(model: VideoModelPreset, width: Int, height: Int,
-                     frames: Int, fast: Bool, availableGB: Int) -> Bool {
-        peakBytes(model: model, width: width, height: height, frames: frames, fast: fast)
+                     frames: Int, fast: Bool, turbo: Bool = false, availableGB: Int) -> Bool {
+        peakBytes(model: model, width: width, height: height, frames: frames, fast: fast, turbo: turbo)
             <= budgetBytes(availableGB: availableGB)
     }
 
@@ -431,5 +440,51 @@ struct H3RunHistory: Codable {
         var h = load(defaults: defaults)
         h.record(predictedOnAnchor: predicted, measured: measuredSeconds)
         h.save(defaults: defaults)
+    }
+}
+
+// MARK: - Turbo LoRA acquisition
+
+/// Where the Turbo distillation adapter comes from, and whether this request
+/// needs one fetched.
+///
+/// The adapter is allowlisted in the H3 bundle, so a pack downloaded from now
+/// on arrives with it. Everyone who already has the pack does NOT — and they
+/// are precisely the people who will turn Turbo on. Re-downloading 69 GB to
+/// collect one 744 MB file is not an answer, so the app fetches that file into
+/// the pack it already has, from the same repo the pack came from.
+enum TurboLoraFetch {
+    /// The name the SERVER resolves (`<pack dir>/turbo_lora.safetensors`) and
+    /// the bundle allowlists. One constant so a rename cannot land the file
+    /// where nothing reads it.
+    static let fileName = "turbo_lora.safetensors"
+
+    /// Roughly what it costs, for the sentence shown before it starts. The
+    /// file is 744 MB; this is only ever prose.
+    static let approxMB = 744
+
+    enum Decision: Equatable {
+        /// The adapter is on disk — generate.
+        case ready
+        /// Missing locally: pull it from the pack's own repo first.
+        case fetch
+        /// Turbo isn't wanted, or this preset cannot use it at all.
+        case notNeeded
+        /// The model is on another Mac. Its pack is not ours to complete; that
+        /// server answers its own named 400 (which the app now surfaces).
+        case unavailableRemotely
+    }
+
+    static func decide(turboRequested: Bool, backendSupportsTurbo: Bool,
+                       isRemote: Bool, fileOnDisk: Bool) -> Decision {
+        guard turboRequested, backendSupportsTurbo else { return .notNeeded }
+        if isRemote { return .unavailableRemotely }
+        return fileOnDisk ? .ready : .fetch
+    }
+
+    /// Whether the adapter is already sitting in `modelDir`.
+    static func isOnDisk(modelDir: String?) -> Bool {
+        guard let modelDir else { return false }
+        return FileManager.default.fileExists(atPath: (modelDir as NSString).appendingPathComponent(fileName))
     }
 }

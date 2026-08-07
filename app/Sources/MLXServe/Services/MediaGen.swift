@@ -384,8 +384,10 @@ struct VideoModelPreset: Identifiable, Hashable {
 
     /// Which engine arm serves it.
     var backend: VideoBackendKind = .ltx
-    /// Runtime LoRA adapters. MiniMax-H3 has no adapter format; the server
-    /// answers a named 400 rather than silently ignoring the field.
+    /// Runtime LoRA adapters (stacked: several attach at once and their
+    /// deltas sum). Every video backend takes them — H3's are the same
+    /// `lora_paths`/`lora_scales` fields, resolved against its own module
+    /// names, and they stack with the engine-owned Turbo adapter.
     var supportsLoRA: Bool = true
     /// Classifier-free guidance. H3 is CFG-DISTILLED — there is no guidance
     /// pass to scale, so a CFG slider would be a dead control.
@@ -406,6 +408,15 @@ struct VideoModelPreset: Identifiable, Hashable {
     /// while ignoring every reference, so the server 400s and the pane hides
     /// the controls AND stops sending the fields.
     var supportsReferences: Bool = false
+    /// Engine-owned Turbo distillation LoRA (larryvrh/MiniMax-H3-Turbo-Lora):
+    /// 4-step sampling instead of 30, the server's fast recipe off. Needs
+    /// `turbo_lora.safetensors` beside the pack's weights — absent, the server
+    /// answers a named 400 saying where to get it. FL2VA packs only until the
+    /// LoRA has been eyeballed on the REF2VA DiT.
+    var supportsTurbo: Bool = false
+    /// Chained-window long clips (server `chain_windows`): N windows joined by
+    /// fl2va keyframe conditioning, so the REF2VA pack cannot serve it.
+    var supportsChainedWindows: Bool = false
     /// Denoising-step range the Steps slider offers. LTX's is the default; a
     /// backend whose floor is higher declares it, because a slider that goes
     /// somewhere the model does not work is a dead range, not a fast option.
@@ -609,13 +620,23 @@ struct VideoModelPreset: Identifiable, Hashable {
             frameOptions: h3FrameLadder(minFrames: minF, maxFrames: cap),
             description: description,
             backend: .minimaxH3,
-            supportsLoRA: false,
+            // Both partitions take stacked adapters: the server resolves them
+            // against H3's own module names and sums them with Turbo. No
+            // community H3 LoRA exists yet beyond the distillation, so this is
+            // a capability, not a recommendation.
+            supportsLoRA: true,
             supportsCFG: false,
             supportsPipelineModes: false,
             supportsAudioInput: false,
             generatesAudio: true,
             supportsFastRecipe: true,
             supportsReferences: supportsReferences,
+            // Turbo and chaining both ride fl2va machinery (the LoRA is
+            // untested on the REF2VA DiT; a reference has no keyframe row to
+            // chain through), so both flags are the partition's complement —
+            // derived here so the two fl2va presets cannot drift apart.
+            supportsTurbo: !supportsReferences,
+            supportsChainedWindows: !supportsReferences,
             // MiniMax publishes no step count at all — no default, no range, no
             // maximum — so this range is OURS. 16 is the lowest tier we have a
             // verdict on, and below ~6 the fast recipe's warmup and tail windows
@@ -1129,11 +1150,10 @@ struct ImageGenRequest {
     /// the user typed them — comma/space separated, `condWeightCount` values
     /// (12 for Krea, 3 for FLUX). Empty = off.
     var condWeightsText: String = ""
-    /// Style LoRA (Advanced): absolute path to a .safetensors adapter applied
-    /// to the DiT at runtime. nil = none.
-    var loraPath: String? = nil
-    /// LoRA strength multiplier (on top of the file's own alpha/rank scale).
-    var loraScale: Double = 1.0
+    /// Style LoRAs (Advanced): stacked `.safetensors` adapters applied to the
+    /// DiT at runtime (sent as `lora_paths`/`lora_scales` — mirrors mflux).
+    /// Empty = none. Rows with an empty `path` are dropped before sending.
+    var loras: [LoraAdapter] = []
 }
 
 extension ImageModelPreset {
@@ -1271,11 +1291,15 @@ struct VideoGenRequest {
     /// (`<model>@<peer>`). The gen service then skips local resolve/load/
     /// unload — the hosting Mac loads on demand and manages its own memory.
     var lanModelId: String? = nil
-    /// Style LoRA (Advanced): absolute path to a .safetensors adapter applied
-    /// to the DiT at runtime. nil = none.
-    var loraPath: String? = nil
-    /// LoRA strength multiplier (on top of the file's own alpha/rank scale).
-    var loraScale: Double = 1.0
+    /// Style LoRAs (Advanced): stacked `.safetensors` adapters applied to the
+    /// DiT at runtime (sent as `lora_paths`/`lora_scales` — mirrors mflux).
+    /// Empty = none. Rows with an empty `path` are dropped before sending.
+    var loras: [LoraAdapter] = []
+    /// Turbo distillation LoRA (H3 fl2va): 4-step sampling, fast recipe off.
+    var turbo: Bool = false
+    /// Chained windows (H3 fl2va): number of `numFrames`-frame windows joined
+    /// by keyframe conditioning. 1 = a single ordinary window.
+    var chainWindows: Int = 1
     /// ref2va references (REF2VA pack only). Images the generation follows for
     /// character/style, clips for motion and scene, audio for voice and score.
     /// Paths, resolved to base64 at request time.

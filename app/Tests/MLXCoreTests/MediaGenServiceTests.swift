@@ -149,6 +149,83 @@ final class MediaGenServiceTests: XCTestCase {
         XCTAssertTrue(VideoModelPreset.all.contains { $0.id == VideoModelPreset.minimaxH3Ref2VA.id })
     }
 
+    func testTurboAndChainingAreFl2vaOnlyAndGateTheirFields() {
+        // Capability side: both ride fl2va machinery (the LoRA is untested on
+        // the REF2VA DiT; a reference has no keyframe row to chain through),
+        // derived in the shared factory so the two FL2VA presets cannot drift.
+        XCTAssertTrue(VideoModelPreset.minimaxH3.supportsTurbo)
+        XCTAssertTrue(VideoModelPreset.minimaxH3Q4.supportsTurbo)
+        XCTAssertFalse(VideoModelPreset.minimaxH3Ref2VA.supportsTurbo)
+        XCTAssertTrue(VideoModelPreset.minimaxH3.supportsChainedWindows)
+        XCTAssertFalse(VideoModelPreset.minimaxH3Ref2VA.supportsChainedWindows)
+        for p in VideoModelPreset.all where p.backend != .minimaxH3 {
+            XCTAssertFalse(p.supportsTurbo, "\(p.id) must not advertise turbo")
+            XCTAssertFalse(p.supportsChainedWindows, "\(p.id) must not advertise chaining")
+        }
+
+        // Wire side: emitted only when engaged AND declared — hiding a control
+        // is not the same as not sending its field (the `pipeline` class).
+        var req = VideoGenRequest(model: .minimaxH3, prompt: "p", width: 960, height: 544,
+                                  numFrames: 124, fps: 24, mode: .oneStage, steps: 8, cfgScale: 1.0)
+        var body = VideoGenService.requestBody(model: "m", prompt: "p", request: req, firstFrameB64: nil)
+        XCTAssertNil(body["turbo"], "off by default")
+        XCTAssertNil(body["chain_windows"], "a single window sends nothing")
+
+        req.turbo = true
+        req.chainWindows = 2
+        body = VideoGenService.requestBody(model: "m", prompt: "p", request: req, firstFrameB64: nil)
+        XCTAssertEqual(body["turbo"] as? Bool, true)
+        XCTAssertEqual(body["chain_windows"] as? Int, 2)
+
+        // A preset switch leaves the state populated; the REF2VA pack must
+        // never see either field (the server 400s chaining there by name).
+        var ref = VideoGenRequest(model: .minimaxH3Ref2VA, prompt: "p", width: 960, height: 544,
+                                  numFrames: 124, fps: 24, mode: .oneStage, steps: 30, cfgScale: 1.0)
+        ref.turbo = true
+        ref.chainWindows = 3
+        body = VideoGenService.requestBody(model: "m", prompt: "p", request: ref, firstFrameB64: nil)
+        XCTAssertNil(body["turbo"])
+        XCTAssertNil(body["chain_windows"])
+    }
+
+    func testTurboBillsTheLoraBesideTheDiT() {
+        // Turbo forces the recipe off (fast: false) and adds the resident
+        // LoRA to the sampling term. On the REAL packs the staged load floor
+        // (max(TE, DiT) + VAEs) already covers it at every servable geometry —
+        // billing must still be monotone there — so the exact +lora mechanism
+        // is pinned on a mutated preset whose sampling term dominates.
+        let base = H3Plan.peakBytes(model: .minimaxH3, width: 960, height: 544,
+                                    frames: 124, fast: false)
+        let turboReal = H3Plan.peakBytes(model: .minimaxH3, width: 960, height: 544,
+                                         frames: 124, fast: false, turbo: true)
+        XCTAssertGreaterThanOrEqual(turboReal, base)
+
+        var tiny = VideoModelPreset.minimaxH3
+        tiny.stagedPeakGB = 1
+        tiny.ditResidentGB = 1
+        let b = H3Plan.peakBytes(model: tiny, width: 960, height: 544, frames: 124, fast: false)
+        let t = H3Plan.peakBytes(model: tiny, width: 960, height: 544, frames: 124, fast: false, turbo: true)
+        XCTAssertEqual(t - b, H3Plan.turboLoraBytes)
+    }
+
+    func testStreamStartFailureSurfacesTheServersOwnMessage() {
+        // The server's named 400s exist to tell the user what to do ("this
+        // pack has no turbo_lora.safetensors — download …"); the stream path
+        // used to throw a hardcoded "stream start failed" without reading the
+        // body, so the Failed card pointed at nothing (live 2026-08-06).
+        let named = #"{"error":{"message":"this pack has no turbo_lora.safetensors — download it"}}"#
+        XCTAssertEqual(APIError.errorDetail(fromBody: Data(named.utf8)),
+                       "this pack has no turbo_lora.safetensors — download it")
+        // A non-JSON body degrades to a trimmed snippet, and an empty one to
+        // the generic line — never an empty detail.
+        XCTAssertEqual(APIError.errorDetail(fromBody: Data("  plain text  ".utf8)), "plain text")
+        XCTAssertEqual(APIError.errorDetail(fromBody: Data()), "stream start failed")
+        // And the rendering carries a separator — "mlx-servestream start
+        // failed" is what shipping without one looked like.
+        let desc = APIError.badStatus(code: 400, detail: "x").errorDescription ?? ""
+        XCTAssertTrue(desc.contains("mlx-serve: x"), desc)
+    }
+
     func testH3FastRecipeDefaultOnWithOffSwitch() {
         // David's eyeball verdict on the same-seed 768p capstone pair: the
         // fast recipe (server-side step cache + attention broadcast, 2.83x)
@@ -295,11 +372,19 @@ final class MediaGenServiceTests: XCTestCase {
             XCTAssertGreaterThan(main.count, 700, "base example '\(ex.title)' body is too thin")
             let sound = body(ex.body, after: "overall_soundscape:", upTo: "non_diegetic_music:")
             XCTAssertGreaterThan(sound.count, 150, "base example '\(ex.title)' soundscape is too abstract")
-            // Fields are separated by a SINGLE newline: the guide's example
-            // shows blank lines, the production stage that the model trained on
-            // does not.
-            XCTAssertFalse(ex.body.contains("\n\n\(H3PromptExamples.baseSections[1])"),
-                           "base example '\(ex.title)' uses a blank line before overall_soundscape:")
+            // Laid out like the reference examples: label on its own line,
+            // blank line between fields. The production expansion stage emits
+            // one inline run per field, which is a WALL in the prompt box for a
+            // ~1500-char description; MiniMax's own written guide shows blank
+            // lines, so this stays in-format and is the readable half of it.
+            for label in H3PromptExamples.baseSections {
+                XCTAssertTrue(ex.body.contains("\(label)\n"),
+                              "base example '\(ex.title)' keeps \(label) inline with its value")
+            }
+            for label in H3PromptExamples.baseSections.dropFirst() {
+                XCTAssertTrue(ex.body.contains("\n\n\(label)"),
+                              "base example '\(ex.title)' has no blank line before \(label)")
+            }
         }
         for ex in H3PromptExamples.h3Reference {
             let main = body(ex.body, after: "detailed_description:", upTo: "overall_soundscape:")
@@ -342,16 +427,25 @@ final class MediaGenServiceTests: XCTestCase {
     func testRequestBodyCarriesLoraWhenSet() {
         var req = VideoGenRequest(model: .ltx23Q4, prompt: "p", width: 704, height: 480,
                                   numFrames: 9, fps: 24, mode: .oneStage, steps: 8, cfgScale: 1.0)
-        req.loraPath = "/tmp/style.safetensors"
-        req.loraScale = 0.8
+        req.loras = [LoraAdapter(path: "/tmp/style.safetensors", scale: 0.8)]
         let body = VideoGenService.requestBody(model: "m", prompt: "p", request: req, firstFrameB64: nil)
-        XCTAssertEqual(body["lora_path"] as? String, "/tmp/style.safetensors")
-        XCTAssertEqual(body["lora_scale"] as? Double, 0.8)
-        // No LoRA → fields absent (a missing lora_path means detach server-side).
-        req.loraPath = nil
+        XCTAssertEqual(body["lora_paths"] as? [String], ["/tmp/style.safetensors"])
+        XCTAssertEqual(body["lora_scales"] as? [Double], [0.8])
+        // Stacking: a second adapter appends to both arrays, in order.
+        req.loras.append(LoraAdapter(path: "/tmp/second.safetensors", scale: 1.2))
+        let stacked = VideoGenService.requestBody(model: "m", prompt: "p", request: req, firstFrameB64: nil)
+        XCTAssertEqual(stacked["lora_paths"] as? [String], ["/tmp/style.safetensors", "/tmp/second.safetensors"])
+        XCTAssertEqual(stacked["lora_scales"] as? [Double], [0.8, 1.2])
+        // No LoRA → fields absent (missing lora_paths means detach server-side).
+        req.loras = []
         let bare = VideoGenService.requestBody(model: "m", prompt: "p", request: req, firstFrameB64: nil)
-        XCTAssertNil(bare["lora_path"])
-        XCTAssertNil(bare["lora_scale"])
+        XCTAssertNil(bare["lora_paths"])
+        XCTAssertNil(bare["lora_scales"])
+        // A half-filled row (no path chosen yet) is dropped, not sent as "".
+        req.loras = [LoraAdapter(path: "", scale: 1.0)]
+        let empty = VideoGenService.requestBody(model: "m", prompt: "p", request: req, firstFrameB64: nil)
+        XCTAssertNil(empty["lora_paths"])
+        XCTAssertNil(empty["lora_scales"])
     }
 
     func testCancelledErrorsMapToCancellationNotFailure() {
@@ -1035,7 +1129,7 @@ final class MediaGenServiceTests: XCTestCase {
         XCTAssertNil(json["strength"])
         XCTAssertNil(json["cond_gain"])
         XCTAssertNil(json["cond_weights"])
-        XCTAssertNil(json["lora_path"])
+        XCTAssertNil(json["lora_paths"])
     }
 
     func testImageRequestJsonIncludesImg2ImgFields() throws {
@@ -1066,14 +1160,28 @@ final class MediaGenServiceTests: XCTestCase {
         var req = ImageGenRequest(model: .krea2Turbo, prompt: "x", width: 1024, height: 1024, steps: 8)
         req.condGain = 1.5
         req.condWeightsText = "1, 1 1 1 1 1 0.5 1 1 1 1 2"
-        req.loraPath = "/tmp/style.safetensors"
+        req.loras = [
+            LoraAdapter(path: "/tmp/style.safetensors", scale: 1.0),
+            LoraAdapter(path: "/tmp/character.safetensors", scale: 0.6),
+        ]
         let json = ImageGenService.requestJson(for: req, modelName: "m", seed: 1)
         XCTAssertEqual(json["cond_gain"] as? Double, 1.5)
         let w = json["cond_weights"] as? [Double]
         XCTAssertEqual(w?.count, 12)
         XCTAssertEqual(w?[6], 0.5)
         XCTAssertEqual(w?[11], 2)
-        XCTAssertEqual(json["lora_path"] as? String, "/tmp/style.safetensors")
+        XCTAssertEqual(json["lora_paths"] as? [String], ["/tmp/style.safetensors", "/tmp/character.safetensors"])
+        XCTAssertEqual(json["lora_scales"] as? [Double], [1.0, 0.6])
+    }
+
+    func testImageRequestJsonDropsHalfFilledLoraRows() {
+        // A row added by tapping "+" but never given a path must never reach
+        // the server as an empty string — it's silently dropped.
+        var req = ImageGenRequest(model: .krea2Turbo, prompt: "x", width: 1024, height: 1024, steps: 8)
+        req.loras = [LoraAdapter(path: "", scale: 1.0), LoraAdapter(path: "/tmp/ok.safetensors", scale: 0.9)]
+        let json = ImageGenService.requestJson(for: req, modelName: "m", seed: 1)
+        XCTAssertEqual(json["lora_paths"] as? [String], ["/tmp/ok.safetensors"])
+        XCTAssertEqual(json["lora_scales"] as? [Double], [0.9])
     }
 
     func testParseCondWeightsAcceptsCommasAndSpacesRejectsGarbage() {
@@ -1183,12 +1291,15 @@ extension MediaGenServiceTests {
     func testMiniMaxH3DeclaresTheCapabilitiesItActuallyHas() {
         let h3 = VideoModelPreset.minimaxH3
 
-        // No adapter format, no guidance pass (CFG-distilled), no pipeline
-        // modes. The server answers a NAMED 400 for each, so offering them
-        // would be a control that can only fail.
-        XCTAssertFalse(h3.supportsLoRA)
+        // No guidance pass (CFG-distilled), no pipeline modes. The server
+        // answers a NAMED 400 for each, so offering them would be a control
+        // that can only fail.
         XCTAssertFalse(h3.supportsCFG)
         XCTAssertFalse(h3.supportsPipelineModes)
+        // Adapters it DOES take: the server resolves `lora_paths` against H3's
+        // own module names and sums them with the Turbo distillation.
+        XCTAssertTrue(h3.supportsLoRA)
+        XCTAssertTrue(VideoModelPreset.minimaxH3Ref2VA.supportsLoRA)
 
         // It writes its own soundtrack jointly with the frames, so there is no
         // audio INPUT to condition on.
@@ -1315,7 +1426,7 @@ extension MediaGenServiceTests {
         let h3 = VideoGenRequest(
             model: .minimaxH3, prompt: "a cat", width: 256, height: 256,
             numFrames: 56, fps: 24, mode: .oneStage, steps: 30,
-            cfgScale: 1.0, loraPath: "/tmp/some.safetensors")
+            cfgScale: 1.0, loras: [LoraAdapter(path: "/tmp/some.safetensors")])
         // audioB64 present: a stale in-memory clip from an earlier LTX pick
         // must never reach a backend that generates its own soundtrack.
         let body = VideoGenService.requestBody(
@@ -1325,8 +1436,9 @@ extension MediaGenServiceTests {
         XCTAssertNil(body["pipeline"], "H3 has no pipeline modes")
         XCTAssertNil(body["cfg_scale"], "H3 is CFG-distilled")
         XCTAssertNil(body["stg_scale"])
-        XCTAssertNil(body["lora_path"], "H3 has no adapter format")
         XCTAssertNil(body["audio"], "H3 takes no audio input")
+        // Adapters DO travel — H3 resolves them against its own module names.
+        XCTAssertEqual(body["lora_paths"] as? [String], ["/tmp/some.safetensors"])
         // The fields every backend needs must still be there.
         for k in ["model", "prompt", "num_frames", "height", "width", "steps", "seed"] {
             XCTAssertNotNil(body[k], "\(k) must always be sent")
@@ -1336,12 +1448,13 @@ extension MediaGenServiceTests {
         let ltx = VideoGenRequest(
             model: .ltx23Q4, prompt: "a cat", width: 704, height: 480,
             numFrames: 97, fps: 24, mode: .oneStage, steps: 12,
-            cfgScale: 3.0, loraPath: "/tmp/some.safetensors")
+            cfgScale: 3.0, loras: [LoraAdapter(path: "/tmp/some.safetensors")])
         let lbody = VideoGenService.requestBody(
             model: "m", prompt: "a cat", request: ltx,
             firstFrameB64: nil, audioB64: nil)
         XCTAssertNotNil(lbody["pipeline"])
         XCTAssertNotNil(lbody["cfg_scale"])
-        XCTAssertNotNil(lbody["lora_path"])
+        XCTAssertEqual(lbody["lora_paths"] as? [String], ["/tmp/some.safetensors"])
+        XCTAssertEqual(lbody["lora_scales"] as? [Double], [1.0])
     }
 }

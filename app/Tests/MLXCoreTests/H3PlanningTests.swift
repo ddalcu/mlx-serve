@@ -370,3 +370,116 @@ final class H3PlanningTests: XCTestCase {
         XCTAssertEqual(H3TimeEstimate.liveEta(stepDurations: Array(repeating: 60.0, count: 31), totalSteps: 30) ?? -1, 0)
     }
 }
+
+// MARK: - Turbo LoRA acquisition
+
+extension H3PlanningTests {
+
+    /// The adapter ships INSIDE our packs now, so a fresh download brings it.
+    /// Everyone who already has the pack does not — and they are exactly the
+    /// people who will flip Turbo on. The decision of what to do about that is
+    /// pure so it can be pinned without a network or a 20 GB checkout.
+    func testTurboLoraFetchDecision() {
+        // The ordinary case that motivated the feature: pack on disk from
+        // before the adapter shipped, user flips Turbo → fetch it.
+        XCTAssertEqual(
+            TurboLoraFetch.decide(turboRequested: true, backendSupportsTurbo: true,
+                                  isRemote: false, fileOnDisk: false),
+            .fetch)
+        // Already there: never re-fetch 744 MB.
+        XCTAssertEqual(
+            TurboLoraFetch.decide(turboRequested: true, backendSupportsTurbo: true,
+                                  isRemote: false, fileOnDisk: true),
+            .ready)
+        // Turbo off: the adapter is not needed, so nothing is downloaded on a
+        // toggle the user did not flip.
+        XCTAssertEqual(
+            TurboLoraFetch.decide(turboRequested: false, backendSupportsTurbo: true,
+                                  isRemote: false, fileOnDisk: false),
+            .notNeeded)
+        // A preset that cannot use it (REF2VA today, and every LTX preset)
+        // must never trigger a download — turbo state survives preset switches.
+        XCTAssertEqual(
+            TurboLoraFetch.decide(turboRequested: true, backendSupportsTurbo: false,
+                                  isRemote: false, fileOnDisk: false),
+            .notNeeded)
+        // A LAN model lives on someone else's Mac: we cannot put a file in
+        // their pack, and downloading it into OURS would fix nothing. The
+        // server there answers its own named 400.
+        XCTAssertEqual(
+            TurboLoraFetch.decide(turboRequested: true, backendSupportsTurbo: true,
+                                  isRemote: true, fileOnDisk: false),
+            .unavailableRemotely)
+    }
+
+    func testTurboLoraFileNameMatchesWhatTheServerLooksFor() {
+        // The server resolves `<pack dir>/turbo_lora.safetensors` and the
+        // bundle allowlists the same name; a rename on either side is a
+        // download that lands where nothing reads it.
+        XCTAssertEqual(TurboLoraFetch.fileName, "turbo_lora.safetensors")
+        XCTAssertTrue(MediaBundle.minimaxH3(repo: "r", displayName: "d")
+            .components[0].selection.keepSafetensors?.contains(TurboLoraFetch.fileName) ?? false)
+        // NOT a ready marker: a pack downloaded before the adapter shipped
+        // must keep reading as complete, or the pane offers a re-download of
+        // the whole 69 GB.
+        XCTAssertFalse(MediaBundle.minimaxH3(repo: "r", displayName: "d")
+            .components[0].readyMarkers.contains(TurboLoraFetch.fileName))
+    }
+}
+
+extension H3PlanningTests {
+
+    /// The on-demand fetch asks for ONE file out of a 69 GB repo. If the
+    /// allowlist let the transformer through, "download the missing adapter"
+    /// would re-pull the whole pack — the exact outcome this feature exists to
+    /// avoid for people who already have it.
+    func testTurboLoraSelectionPicksTheAdapterAndNoOtherWeights() {
+        let entries: [[String: Any]] = [
+            ["path": "config.json", "type": "file", "size": 900],
+            ["path": "tokenizer.json", "type": "file", "size": 19_000_000],
+            ["path": "transformer.safetensors", "type": "file", "size": 20_000_000_000],
+            ["path": "text_encoder.safetensors", "type": "file", "size": 15_000_000_000],
+            ["path": "video_vae.safetensors", "type": "file", "size": 5_000_000_000],
+            ["path": "audio_vae.safetensors", "type": "file", "size": 600_000_000],
+            ["path": TurboLoraFetch.fileName, "type": "file", "size": 744_000_000],
+        ]
+        let picked = DownloadManager.selectNeededFiles(
+            from: entries,
+            selection: FileSelection(keepSafetensors: [TurboLoraFetch.fileName]))
+        let paths = Set(picked.map { $0.0 })
+
+        XCTAssertTrue(paths.contains(TurboLoraFetch.fileName))
+        for heavy in ["transformer.safetensors", "text_encoder.safetensors",
+                      "video_vae.safetensors", "audio_vae.safetensors"] {
+            XCTAssertFalse(paths.contains(heavy), "\(heavy) must not ride along with the adapter")
+        }
+        // Whatever small json it also takes is already on disk and gets
+        // size-skipped, so the transfer is the adapter alone.
+        let bytes = picked.reduce(Int64(0)) { $0 + $1.1 }
+        XCTAssertLessThan(bytes, 1_000_000_000)
+    }
+}
+
+extension H3PlanningTests {
+
+    /// The adapter's NAME is a contract between three places that cannot see
+    /// each other: the server resolves `<pack>/turbo_lora.safetensors`, the
+    /// bundle allowlists it for new installs, and the on-demand fetch asks HF
+    /// for it. A rename in one of them downloads a file nothing loads, or
+    /// looks for one nothing downloads — with no error, just Turbo quietly
+    /// 400ing forever. Scanning the Zig source is the only way to hold the
+    /// two languages together.
+    func testTurboLoraFileNameIsPinnedAgainstTheServer() throws {
+        let repo = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()  // MLXCoreTests
+            .deletingLastPathComponent()  // Tests
+            .deletingLastPathComponent()  // app
+            .deletingLastPathComponent()  // repo root
+        let genZig = repo.appendingPathComponent("src/gen.zig")
+        // NOT a skip on failure: a skip reads as a pass, and the whole point
+        // is to notice a rename nobody would otherwise see.
+        let source = try String(contentsOf: genZig, encoding: .utf8)
+        XCTAssertTrue(source.contains(TurboLoraFetch.fileName),
+                      "src/gen.zig no longer spells \(TurboLoraFetch.fileName) — the app would fetch a file the server never looks for")
+    }
+}

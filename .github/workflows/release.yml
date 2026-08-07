@@ -201,6 +201,14 @@ jobs:
           mkdir -p "$STAGING/lib"
 
           cp zig-out/bin/mlx-serve "$STAGING/"
+
+          # License + third-party attributions. The tarball links Apache-2.0
+          # code (MTPLX/dflash/oMLX kernels, jinja.cpp) whose section 4 wants
+          # the license text and the NOTICE attributions to reach whoever
+          # receives the binary — a NOTICE that only lives in the git repo
+          # reaches nobody who downloads a release.
+          cp LICENSE LICENSE-APACHE-2.0 NOTICE "$STAGING/"
+
           # Self-built mlx + mlx-c (scripts/build-mlx.sh): libmlxc + libmlx +
           # sibling deps like libjaccl (@rpath-referenced — missing them causes
           # a "no such file" dyld error at startup) + the NAX-enabled metallib.
@@ -275,6 +283,11 @@ jobs:
 
           # App resources (tray icon etc.)
           cp -R app/Sources/MLXServe/Resources/* "$CONTENTS/Resources/" 2>/dev/null || true
+
+          # License + third-party attributions inside the bundle (same reason
+          # as the CLI tarball above: the .app embeds the same Apache-2.0
+          # kernels and jinja.cpp). Mirrors app/build.sh.
+          cp LICENSE LICENSE-APACHE-2.0 NOTICE "$CONTENTS/Resources/"
 
           # vz-agent guest binary — required in EVERY build variant or the
           # sandbox boots the legacy console shell and MCP servers can never

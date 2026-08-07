@@ -104,5 +104,94 @@ else
 fi
 stop
 
+# ── [3] Turbo LoRA request surface: both 400s fire BEFORE any weight is read,
+# so the sparse pack exercises them hermetically. A missing turbo_lora file is
+# a NAMED 400 (never a silent slow render — the silent-flag-eater class), and
+# the 4-step floor is the distillation's own.
+LOG3="$TMP/turbo.log"
+boot 30GB "$LOG3" || exit 1
+CODE=$(curl -s -o "$TMP/b3.json" -w '%{http_code}' -X POST "http://127.0.0.1:$PORT/v1/video/generations" \
+  -H 'Content-Type: application/json' \
+  -d "{\"model\":\"$MODEL_ID\",\"prompt\":\"x\",\"turbo\":true}")
+if [ "$CODE" = "400" ] && grep -q "turbo_lora.safetensors" "$TMP/b3.json"; then
+  echo "PASS: turbo without the LoRA file is a named 400"
+else
+  echo "FAIL: expected a named 400 for turbo without turbo_lora.safetensors, got $CODE: $(cat "$TMP/b3.json" | head -c 200)"; rc=1
+fi
+sparse turbo_lora.safetensors 744000000
+CODE=$(curl -s -o "$TMP/b4.json" -w '%{http_code}' -X POST "http://127.0.0.1:$PORT/v1/video/generations" \
+  -H 'Content-Type: application/json' \
+  -d "{\"model\":\"$MODEL_ID\",\"prompt\":\"x\",\"turbo\":true,\"steps\":2}")
+if [ "$CODE" = "400" ] && grep -q "at least 4 steps" "$TMP/b4.json"; then
+  echo "PASS: turbo below the 4-step floor is a named 400"
+else
+  echo "FAIL: expected the 4-step-floor 400, got $CODE: $(cat "$TMP/b4.json" | head -c 200)"; rc=1
+fi
+# With the file present and steps legal the probe must PASS — the request then
+# dies inside generate() on the sparse weights (500), which is the proof the
+# 400s above were the probe and not something later.
+CODE=$(curl -s -o "$TMP/b5.json" -w '%{http_code}' -X POST "http://127.0.0.1:$PORT/v1/video/generations" \
+  -H 'Content-Type: application/json' \
+  -d "{\"model\":\"$MODEL_ID\",\"prompt\":\"x\",\"turbo\":true}")
+if [ "$CODE" != "400" ]; then
+  echo "PASS: turbo with the file present clears the probe (got $CODE from the sparse weights)"
+else
+  echo "FAIL: turbo still 400s with turbo_lora.safetensors present: $(cat "$TMP/b5.json" | head -c 200)"; rc=1
+fi
+
+# ── [3b] Stacked style LoRAs on H3: the request surface is the SAME
+# `lora_paths`/`lora_scales` grammar the image and LTX handlers take, so a
+# malformed one is a named 400 from the shared parser rather than a field
+# H3 silently ignores.
+CODE=$(curl -s -o "$TMP/b5b.json" -w '%{http_code}' -X POST "http://127.0.0.1:$PORT/v1/video/generations" \
+  -H 'Content-Type: application/json' \
+  -d "{\"model\":\"$MODEL_ID\",\"prompt\":\"x\",\"lora_paths\":\"not-an-array\"}")
+if [ "$CODE" = "400" ] && grep -q "lora_paths" "$TMP/b5b.json"; then
+  echo "PASS: malformed lora_paths on H3 is a named 400 (shared parser reached)"
+else
+  echo "FAIL: expected the lora_paths 400 on H3, got $CODE: $(cat "$TMP/b5b.json" | head -c 200)"; rc=1
+fi
+# A relative path must never reach mlx's loader (an MLX error kills the
+# process, the BadLoraPath class) — it is a 400 naming the requirement.
+CODE=$(curl -s -o "$TMP/b5c.json" -w '%{http_code}' -X POST "http://127.0.0.1:$PORT/v1/video/generations" \
+  -H 'Content-Type: application/json' \
+  -d "{\"model\":\"$MODEL_ID\",\"prompt\":\"x\",\"lora_paths\":[\"rel/style.safetensors\"]}")
+if [ "$CODE" = "400" ] && grep -q "absolute" "$TMP/b5c.json"; then
+  echo "PASS: a relative LoRA path on H3 is a named 400, never handed to mlx"
+else
+  echo "FAIL: expected the absolute-path 400 on H3, got $CODE: $(cat "$TMP/b5c.json" | head -c 200)"; rc=1
+fi
+
+# ── [4] Chained-window request surface (same server; both 400s pre-load).
+CODE=$(curl -s -o "$TMP/b6.json" -w '%{http_code}' -X POST "http://127.0.0.1:$PORT/v1/video/generations" \
+  -H 'Content-Type: application/json' \
+  -d "{\"model\":\"$MODEL_ID\",\"prompt\":\"x\",\"chain_windows\":7}")
+if [ "$CODE" = "400" ] && grep -q "chain_windows must be 1-6" "$TMP/b6.json"; then
+  echo "PASS: out-of-range chain_windows is a named 400"
+else
+  echo "FAIL: expected the chain_windows-range 400, got $CODE: $(cat "$TMP/b6.json" | head -c 200)"; rc=1
+fi
+# A REF2VA pack cannot chain (no keyframe row to chain through) — refused by
+# name, never a generation that silently ignores the request.
+REFDIR="$TMP/models/fake/MiniMax-H3-Ref"
+mkdir -p "$REFDIR"
+for f in text_encoder transformer video_vae audio_vae; do
+  dd if=/dev/zero of="$REFDIR/$f.safetensors" bs=1 count=0 seek=1000000 2>/dev/null
+done
+cat >"$REFDIR/config.json" <<'JSON'
+{"model_type":"minimax_h3","partition":"ref2va","tasks":["t2va","ref2va"],"fps":24}
+JSON
+stop
+boot 30GB "$TMP/turbo2.log" || exit 1
+CODE=$(curl -s -o "$TMP/b7.json" -w '%{http_code}' -X POST "http://127.0.0.1:$PORT/v1/video/generations" \
+  -H 'Content-Type: application/json' \
+  -d "{\"model\":\"fake/MiniMax-H3-Ref\",\"prompt\":\"x\",\"chain_windows\":2}")
+if [ "$CODE" = "400" ] && grep -q "REF2VA pack cannot serve" "$TMP/b7.json"; then
+  echo "PASS: chaining on a REF2VA pack is a named 400"
+else
+  echo "FAIL: expected the ref2va-chain 400, got $CODE: $(cat "$TMP/b7.json" | head -c 200)"; rc=1
+fi
+stop
+
 [ $rc -eq 0 ] && echo "ALL PASS" || echo "SOME FAILURES"
 exit $rc

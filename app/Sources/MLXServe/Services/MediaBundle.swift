@@ -180,6 +180,14 @@ extension MediaBundle {
                     selection: FileSelection(keepSafetensors: [
                         "transformer.safetensors", "text_encoder.safetensors",
                         "video_vae.safetensors", "audio_vae.safetensors",
+                        // The Turbo distillation adapter (~744 MB): 4-step
+                        // sampling instead of 30. Allowlisted but NOT a ready
+                        // marker, the same call `audio_vae` makes — a pack
+                        // downloaded before it shipped must keep reading as
+                        // complete rather than offering a 69 GB re-download.
+                        // Those installs get it on demand instead, see
+                        // `TurboLoraFetch`.
+                        TurboLoraFetch.fileName,
                     ]),
                     readyMarkers: [
                         "config.json", "transformer.safetensors",
@@ -192,7 +200,7 @@ extension MediaBundle {
                     ]
                 ),
             ],
-            sizeEstimateGB: 69
+            sizeEstimateGB: 70 // 69 + the Turbo adapter
         )
     }
 

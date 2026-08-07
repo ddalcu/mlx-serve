@@ -485,7 +485,15 @@ The MLX Core app self-updates by checking the GitHub releases feed. CLI: `brew u
 
 mlx-serve stands on a lot of open-source shoulders. Huge thanks to all of these projects.
 
-**Inference + math** — [MLX](https://github.com/ml-explore/mlx) · [mlx-c](https://github.com/ml-explore/mlx-c) · [mlx-lm](https://github.com/ml-explore/mlx-lm) · [llama.cpp](https://github.com/ggerganov/llama.cpp) · [nlohmann/json](https://github.com/nlohmann/json) · [antirez/ds4](https://github.com/antirez/ds4) · [MTPLX](https://github.com/youssofal/MTPLX)
+**Inference + math** — [MLX](https://github.com/ml-explore/mlx) · [mlx-c](https://github.com/ml-explore/mlx-c) · [mlx-lm](https://github.com/ml-explore/mlx-lm) · [llama.cpp](https://github.com/ggerganov/llama.cpp) · [nlohmann/json](https://github.com/nlohmann/json) · [antirez/ds4](https://github.com/antirez/ds4) · [jinja.cpp](https://github.com/wangzhaode/jinja.cpp)
+
+**Metal kernels we ported** — some of the fastest paths in the engine started as
+someone else's work, and the source says so at every one of them:
+
+- [MTPLX](https://github.com/youssofal/mtplx) by Youssof Altoukhi (Apache-2.0), the verify-width split-K quantized matmul family and the M5 NAX tensor-ops tile. Their own preferred credit line: *Powered by MTPLX by Youssof Altoukhi.*
+- [dflash-mlx](https://github.com/bstnxbt/dflash-mlx) (Apache-2.0), the matmul2d convention the NAX tile is built on, reached through MTPLX.
+- oMLX by jundot (Apache-2.0), the GatedDeltaNet blocked-sequence prefill kernel and the chunked-dispatch budget that keeps long-context prefill off the macOS preemption cliff.
+- [mlxfast-challenge](https://github.com/Layr-Labs/mlxfast-challenge) by Layr Labs (MIT), the certified lm_head prune.
 
 **Model architectures + tokenizers** — [Google Gemma](https://ai.google.dev/gemma) · [Qwen](https://huggingface.co/Qwen) · [Meta Llama](https://www.llama.com/) · [Mistral AI](https://mistral.ai/) · [NVIDIA Nemotron-H](https://huggingface.co/nvidia) · [Liquid LFM2.5](https://www.liquid.ai/) · [DeepSeek](https://www.deepseek.com/) · [Tencent Hunyuan](https://huggingface.co/tencent) · [poolside](https://poolside.ai/) · [HuggingFace tokenizers](https://github.com/huggingface/tokenizers)
 
@@ -494,6 +502,8 @@ mlx-serve stands on a lot of open-source shoulders. Huge thanks to all of these 
 **MLX Core (Swift app)** — [Anthropic swift-sdk](https://github.com/anthropics/swift-sdk) · [Model Context Protocol Swift SDK](https://github.com/modelcontextprotocol/swift-sdk) · Apple frameworks (PDFKit, WKWebView, AVFoundation, AppKit, SwiftUI)
 
 **Build + ship** — [Zig](https://ziglang.org) · [Homebrew](https://brew.sh/)
+
+Full licenses and the required attributions are in [NOTICE](NOTICE).
 
 If we missed you, please open a PR — happy to add anyone who landed code, fixtures, or a fix here.
 
@@ -534,7 +544,12 @@ Subscribing, following, and starring the repo cost nothing and genuinely help th
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT, see [LICENSE](LICENSE).
+
+mlx-serve bundles third-party code that stays under its own license, including
+some Apache-2.0 Metal kernels and the Jinja engine that renders chat templates.
+[NOTICE](NOTICE) lists all of it with the required attributions, and
+[LICENSE-APACHE-2.0](LICENSE-APACHE-2.0) is the Apache License text.
 
 ---
 

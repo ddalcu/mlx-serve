@@ -12,6 +12,13 @@ class MlxServe < Formula
     libexec.install Dir["lib/*"]
     bin.install "mlx-serve"
 
+    # Apache-2.0 section 4 wants the license text and the NOTICE attributions to
+    # reach whoever receives the binary, and the binary links Apache-2.0 Metal
+    # kernels plus jinja.cpp. Guarded so an older tarball still installs.
+    %w[LICENSE LICENSE-APACHE-2.0 NOTICE].each do |f|
+      doc.install f if File.exist?(f)
+    end
+
     # Fix rpaths to use bundled libs in libexec (avoids conflicts with mlx/mlx-c)
     system "install_name_tool", "-change",
            "@executable_path/lib/libmlxc.dylib",

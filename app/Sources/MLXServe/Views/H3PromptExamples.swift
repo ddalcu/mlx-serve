@@ -118,41 +118,66 @@ enum H3PromptExamples {
     /// prose is a better example than any transcription of the guide.
     ///
     /// What they show that hand-writing kept missing: the body runs ~1000-1500
-    /// characters for a 5-second shot; fields are separated by a SINGLE newline
-    /// (the guide's example shows blank lines, the production stage does not);
-    /// soundscapes are physical and specific ("rhythmic, heavy thuds of the
-    /// dough impacting the board", not "kitchen sounds"); the shot opens with
-    /// style plus a named camera behaviour ("static shot", "slow push in");
-    /// and `non_diegetic_music` states instrumentation, tempo and dynamics.
+    /// characters for a 5-second shot; soundscapes are physical and specific
+    /// ("rhythmic, heavy thuds of the dough impacting the board", not "kitchen
+    /// sounds"); the shot opens with style plus a named camera behaviour
+    /// ("static shot", "slow push in"); and `non_diegetic_music` states
+    /// instrumentation, tempo and dynamics.
+    ///
+    /// WORDS verbatim, LAYOUT ours: the expansion stage runs each field as one
+    /// inline line, which lands in the prompt box as a single ~1500-character
+    /// wall — the format is only useful if you can see its parts. Label on its
+    /// own line and a blank line between fields, matching `h3Reference` below,
+    /// which is also how MiniMax's written guide shows the format.
     ///
     /// The keyframe example is OURS — that mode needs a reference image, which
     /// Context-IR takes as a URL we have nothing to point at.
     static let h3Base: [VideoPromptExample] = [
         .init(title: "Character speaking (dialogue)",
               body: """
-integrated_multimodal_description: [Shot 1] Cinematic, medium close-up, static shot. An on-screen woman in her early thirties (S1) sits in the center of the frame at a rustic wooden kitchen table. She has warm brown eyes, loose wavy brunette hair tied in a messy bun, and wears an oversized, cream-colored chunky knit sweater. The modern farmhouse kitchen behind her features white subway tile, a silver espresso machine, and a hanging pothos plant softly blurred in the background. Bright, warm morning sunlight pours in from an off-frame window to the left, casting a soft, golden glow across the side of her face and illuminating the steam rising from a white ceramic mug resting on the table. Looking directly into the camera lens with a relaxed, welcoming smile, the woman (S1) leans forward slightly, gently resting her forearms on the table, and says in a warm, conversational tone, <d>[English] Good morning. I made coffee. Come sit with me.</d> As she finishes speaking, she tilts her head slightly and maintains her gaze, her shoulders visibly relaxing.
-overall_soundscape: Faint, continuous ambient chirping of birds sets a morning tone, accompanied by the distinct rustle of heavy knit fabric as the woman shifts forward. A subtle, dull thud is heard as her forearms rest against the wooden table, followed by her clear, foreground spoken dialogue.
-non_diegetic_music: Solo acoustic guitar, slow tempo, playing a sparse and repetitive fingerpicking pattern with soft dynamics that sits quietly beneath the dialogue.
+integrated_multimodal_description:
+[Shot 1] Cinematic, medium close-up, static shot. An on-screen woman in her early thirties (S1) sits in the center of the frame at a rustic wooden kitchen table. She has warm brown eyes, loose wavy brunette hair tied in a messy bun, and wears an oversized, cream-colored chunky knit sweater. The modern farmhouse kitchen behind her features white subway tile, a silver espresso machine, and a hanging pothos plant softly blurred in the background. Bright, warm morning sunlight pours in from an off-frame window to the left, casting a soft, golden glow across the side of her face and illuminating the steam rising from a white ceramic mug resting on the table. Looking directly into the camera lens with a relaxed, welcoming smile, the woman (S1) leans forward slightly, gently resting her forearms on the table, and says in a warm, conversational tone, <d>[English] Good morning. I made coffee. Come sit with me.</d> As she finishes speaking, she tilts her head slightly and maintains her gaze, her shoulders visibly relaxing.
+
+overall_soundscape:
+Faint, continuous ambient chirping of birds sets a morning tone, accompanied by the distinct rustle of heavy knit fabric as the woman shifts forward. A subtle, dull thud is heard as her forearms rest against the wooden table, followed by her clear, foreground spoken dialogue.
+
+non_diegetic_music:
+Solo acoustic guitar, slow tempo, playing a sparse and repetitive fingerpicking pattern with soft dynamics that sits quietly beneath the dialogue.
 """),
         .init(title: "Scene with its own soundtrack",
               body: """
-integrated_multimodal_description: [Shot 1] Cinematic, low aerial wide shot, the camera continuously moving forward while it pedestals up and rolls gently clockwise over a rugged, dark volcanic coastline. Warm, low-angle golden hour sunlight streams in from the left, casting long shadows and highlighting the jagged textures of parallel black basalt ribs that stretch from the bottom foreground out into the vast, deep blue-green ocean. Heavy, rhythmic ocean swells roll in from the background, colliding violently with the solid rock formations. The continuous impact sends explosive bursts of bright white surf and fine, golden-lit mist high into the air. As the camera steadily climbs and banks, the turbulent white water churns vigorously, spilling back over the dark, grooved stones into the sea, revealing a wider expanse of the jagged shoreline fading into the horizon under the vibrant sunset light.
-overall_soundscape: A pronounced, continuous roar of heavy wind rushing past the microphone, layered over the deep, booming thuds of massive ocean swells crashing against solid rock, followed immediately by the loud, hissing splash of churning surf and water continuously cascading back into the sea.
-non_diegetic_music: N/A
+integrated_multimodal_description:
+[Shot 1] Cinematic, low aerial wide shot, the camera continuously moving forward while it pedestals up and rolls gently clockwise over a rugged, dark volcanic coastline. Warm, low-angle golden hour sunlight streams in from the left, casting long shadows and highlighting the jagged textures of parallel black basalt ribs that stretch from the bottom foreground out into the vast, deep blue-green ocean. Heavy, rhythmic ocean swells roll in from the background, colliding violently with the solid rock formations. The continuous impact sends explosive bursts of bright white surf and fine, golden-lit mist high into the air. As the camera steadily climbs and banks, the turbulent white water churns vigorously, spilling back over the dark, grooved stones into the sea, revealing a wider expanse of the jagged shoreline fading into the horizon under the vibrant sunset light.
+
+overall_soundscape:
+A pronounced, continuous roar of heavy wind rushing past the microphone, layered over the deep, booming thuds of massive ocean swells crashing against solid rock, followed immediately by the loud, hissing splash of churning surf and water continuously cascading back into the sea.
+
+non_diegetic_music:
+N/A
 """),
         .init(title: "Close-up with texture and sound",
               body: """
-integrated_multimodal_description: [Shot 1] Cinematic, close-up shot with a slow push in, framing a thick, worn oak wooden counter generously dusted with fine white flour. An older man's weathered, wrinkled hands, emerging from faded blue rolled-up linen sleeves, dominate the center of the frame. The hands rhythmically press into a smooth, elastic ball of bread dough with the heels of the palms, folding the soft mass over itself and giving it a quarter turn with steady, practiced precision. Strong, warm morning sunlight streams in diagonally from the upper left, casting deep, textured shadows and intensely backlighting the scene. The directional light catches vibrant, powdery clouds of flour dust that float and swirl gracefully in the air above the counter. With each firm push of the dough, a small puff of dry flour scatters across the wooden surface, and the elastic dough slightly springs back as the hands momentarily release their pressure, while the softly blurred background implies the rustic warmth of a traditional kitchen.
-overall_soundscape: Rhythmic, heavy thuds of the dough impacting the solid wooden board dominate the foreground, accompanied by the dry, powdery friction of skin sliding over scattered flour. A faint, slightly sticky stretching sound is clearly heard each time the dough is folded back on itself, layered over a quiet, airy room tone.
-non_diegetic_music: Solo acoustic guitar, slow tempo, featuring warm, steady fingerpicking that gently underscores the steady rhythm of the kneading.
+integrated_multimodal_description:
+[Shot 1] Cinematic, close-up shot with a slow push in, framing a thick, worn oak wooden counter generously dusted with fine white flour. An older man's weathered, wrinkled hands, emerging from faded blue rolled-up linen sleeves, dominate the center of the frame. The hands rhythmically press into a smooth, elastic ball of bread dough with the heels of the palms, folding the soft mass over itself and giving it a quarter turn with steady, practiced precision. Strong, warm morning sunlight streams in diagonally from the upper left, casting deep, textured shadows and intensely backlighting the scene. The directional light catches vibrant, powdery clouds of flour dust that float and swirl gracefully in the air above the counter. With each firm push of the dough, a small puff of dry flour scatters across the wooden surface, and the elastic dough slightly springs back as the hands momentarily release their pressure, while the softly blurred background implies the rustic warmth of a traditional kitchen.
+
+overall_soundscape:
+Rhythmic, heavy thuds of the dough impacting the solid wooden board dominate the foreground, accompanied by the dry, powdery friction of skin sliding over scattered flour. A faint, slightly sticky stretching sound is clearly heard each time the dough is folded back on itself, layered over a quiet, airy room tone.
+
+non_diegetic_music:
+Solo acoustic guitar, slow tempo, featuring warm, steady fingerpicking that gently underscores the steady rhythm of the kneading.
 """),
         .init(title: "From an attached first frame",
               body: """
 For the target video, at 0.00 seconds into the target video, <Picture 1> (from [Shot 1]) is fully referenced.
 
-integrated_multimodal_description: [Shot 1] Cinematic, medium shot with a slow push in, opening on the exact composition, subjects and lighting of <Picture 1> and holding their appearance throughout. The subject begins to move within the frame while the light direction, colour palette and background stay continuous with the reference image. The camera pushes in with small amplitude at slow speed, closing the distance without cutting, so the framing tightens gradually around the subject as the action develops. Small physical details continue moving throughout: fabric settles, hair shifts, and the light on the subject's face changes slightly as the distance closes. The shot holds its final framing for the last moment without a cut.
-overall_soundscape: A quiet, continuous room tone matching the location, with the close, dry sounds of the subject's own movement in the foreground: fabric brushing, a soft footfall, and the faint rustle of clothing as the pose changes.
-non_diegetic_music: N/A
+integrated_multimodal_description:
+[Shot 1] Cinematic, medium shot with a slow push in, opening on the exact composition, subjects and lighting of <Picture 1> and holding their appearance throughout. The subject begins to move within the frame while the light direction, colour palette and background stay continuous with the reference image. The camera pushes in with small amplitude at slow speed, closing the distance without cutting, so the framing tightens gradually around the subject as the action develops. Small physical details continue moving throughout: fabric settles, hair shifts, and the light on the subject's face changes slightly as the distance closes. The shot holds its final framing for the last moment without a cut.
+
+overall_soundscape:
+A quiet, continuous room tone matching the location, with the close, dry sounds of the subject's own movement in the foreground: fabric brushing, a soft footfall, and the faint rustle of clothing as the pose changes.
+
+non_diegetic_music:
+N/A
 """),
     ]
 

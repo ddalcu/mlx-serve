@@ -40,8 +40,23 @@ enum APIError: LocalizedError {
             if detail.isEmpty {
                 return "HTTP \(code) from mlx-serve. Check the server log (menu bar → log icon)."
             }
-            return "HTTP \(code) from mlx-serve\(detail)"
+            return "HTTP \(code) from mlx-serve: \(detail)"
         }
+    }
+
+    /// The server's error bodies are `{"error":{"message":"…"}}`, and its
+    /// named 400s exist to tell the user what to do — extract the message,
+    /// degrade to a trimmed snippet for foreign bodies, and never return
+    /// empty (an empty detail renders as a bare status code).
+    static func errorDetail(fromBody data: Data) -> String {
+        if let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let err = obj["error"] as? [String: Any],
+           let msg = err["message"] as? String, !msg.isEmpty {
+            return msg
+        }
+        let s = String(data: data, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return s.isEmpty ? "stream start failed" : String(s.prefix(300))
     }
 
     private static func looksLikeContextOverflow(_ detail: String) -> Bool {
@@ -237,7 +252,17 @@ class APIClient {
                     req.timeoutInterval = 900
                     let (bytes, resp) = try await URLSession.shared.bytes(for: req)
                     let code = (resp as? HTTPURLResponse)?.statusCode ?? -1
-                    guard code == 200 else { throw APIError.badStatus(code: code, detail: "stream start failed") }
+                    guard code == 200 else {
+                        // Read the error body: the server's named 400s say
+                        // what to do, and throwing without them left the
+                        // Failed card pointing at nothing.
+                        var raw = Data()
+                        for try await b in bytes {
+                            raw.append(b)
+                            if raw.count > 2048 { break }
+                        }
+                        throw APIError.badStatus(code: code, detail: APIError.errorDetail(fromBody: raw))
+                    }
                     for try await line in bytes.lines {
                         guard line.hasPrefix("data: ") else { continue }
                         let payload = String(line.dropFirst(6))

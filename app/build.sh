@@ -138,6 +138,12 @@ cp "$SWIFT_BIN" "$CONTENTS/MacOS/MLXCore"
 # App resources (tray icon etc.)
 cp -R "$SCRIPT_DIR/Sources/MLXServe/Resources/"* "$CONTENTS/Resources/" 2>/dev/null || true
 
+# License + third-party attributions. The bundled mlx-serve binary links
+# Apache-2.0 code (MTPLX/dflash/oMLX Metal kernels, jinja.cpp) whose section 4
+# wants the license text and NOTICE attributions to travel with the binary, not
+# just live in the git repo. Mirrors release.yml.
+cp "$PROJECT_ROOT/LICENSE" "$PROJECT_ROOT/LICENSE-APACHE-2.0" "$PROJECT_ROOT/NOTICE" "$CONTENTS/Resources/"
+
 # mlx-serve Zig binary
 cp "$PROJECT_ROOT/$MLX_BIN" "$CONTENTS/MacOS/mlx-serve"
 

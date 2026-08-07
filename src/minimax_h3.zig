@@ -31,6 +31,9 @@ const mlx = @import("mlx.zig");
 const model_mod = @import("model.zig");
 const log = @import("log.zig");
 const mage_flow = @import("mage_flow.zig");
+/// Runtime LoRA adapters, shared with the image/LTX backends — ONE loader for
+/// every adapter format we accept, Turbo included.
+const lora_mod = @import("lora.zig");
 const gen_sse = @import("gen_sse.zig");
 /// Vision presentation math (grids, adaLN tags, mRoPE), pinned against
 /// ComfyUI's own output by `fixtures/minimax_h3_vision.json`.
@@ -1035,11 +1038,45 @@ pub const Config = struct {
 
 // ── Weights ─────────────────────────────────────────────────────────────────
 
+/// The low-rank adapters attached to ONE linear, applied at RUN TIME:
+/// `y = base(x) + Σᵢ scaleᵢ·(x @ Aᵀᵢ) @ Bᵀᵢ`. Never folded into the base
+/// weight — the reference node is explicit that merging rounds the delta away
+/// in bf16 and requantizes it away on quantized bases, and both our packs are
+/// quantized.
+///
+/// Non-owning, exactly like flux/krea: the arrays belong to the `lora.Stack`
+/// the generation holds, which outlives the model. The Turbo LoRA is simply
+/// the first file in that stack — it IS a LoRA, so it gets no private path.
+const LoraSlot = struct {
+    refs: [lora_mod.MAX_LORAS]lora_mod.Ref = undefined,
+    count: u8 = 0,
+
+    fn set(self: *LoraSlot, refs: []const lora_mod.Ref) void {
+        self.count = @intCast(refs.len);
+        @memcpy(self.refs[0..refs.len], refs);
+    }
+    fn active(self: *const LoraSlot) []const lora_mod.Ref {
+        return self.refs[0..self.count];
+    }
+};
+
+/// `y + Σ deltas` when anything is attached; `y` unchanged otherwise.
+/// Consumes `y` either way, so call sites stay one-line.
+fn loraAdd(y: mlx.mlx_array, x: mlx.mlx_array, slot: LoraSlot, s: S) !mlx.mlx_array {
+    if (slot.count == 0) return y;
+    defer _ = mlx.mlx_array_free(y);
+    const d = try lora_mod.deltaSum(x, slot.active(), s);
+    defer _ = mlx.mlx_array_free(d);
+    return addA(y, d, s);
+}
+
 const AttnW = struct {
     qkv: MfLinear,
     q_norm: mlx.mlx_array,
     k_norm: mlx.mlx_array,
     out: MfLinear,
+    qkv_lora: LoraSlot = .{},
+    out_lora: LoraSlot = .{},
 
     fn load(w: *const Weights, a: std.mem.Allocator, prefix: []const u8, cfg: Config, dt: mlx.mlx_dtype, s: S) !AttnW {
         const qkv_p = try std.fmt.allocPrint(a, "{s}.qkv_proj", .{prefix});
@@ -1066,6 +1103,8 @@ const AttnW = struct {
 const MlpW = struct {
     fc1: MfLinear, // [2*ffn, hidden] — gate and up FUSED
     fc2: MfLinear,
+    fc1_lora: LoraSlot = .{},
+    fc2_lora: LoraSlot = .{},
 
     fn load(w: *const Weights, a: std.mem.Allocator, prefix: []const u8, cfg: Config, dt: mlx.mlx_dtype, s: S) !MlpW {
         const p1 = try std.fmt.allocPrint(a, "{s}.fc1", .{prefix});
@@ -1092,6 +1131,11 @@ const AdalnW = struct {
     expand: u32,
     /// 3 for a DiT block (video/text/audio), 1 for the final layer.
     modalities: u32,
+    /// Turbo delta on the projection. Input is silu(t_emb) — exactly what the
+    /// reference node re-injects on pruned bases — so hooking `forward` covers
+    /// BOTH the precompute path and the per-step MINIMAX_H3_ADALN_PRECOMPUTE=0
+    /// path, and the pair is freed with the weight after precompute.
+    lora: LoraSlot = .{},
 
     fn load(w: *const Weights, a: std.mem.Allocator, prefix: []const u8, cfg: Config, expand: u32, modalities: u32, dt: mlx.mlx_dtype, s: S) !AdalnW {
         const p = try std.fmt.allocPrint(a, "{s}.linear", .{prefix});
@@ -1117,7 +1161,8 @@ const AdalnW = struct {
         std.debug.assert(out.len == self.expand);
         const inp = if (apply_silu) try siluA(t_emb, s) else try contig(t_emb, s);
         defer _ = mlx.mlx_array_free(inp);
-        const y = try self.linear.forward(inp, self.bias, s);
+        const y_base = try self.linear.forward(inp, self.bias, s);
+        const y = try loraAdd(y_base, inp, self.lora, s);
         defer _ = mlx.mlx_array_free(y);
         const m: c_int = @intCast(mlx.getShape(y)[0]);
         const rows = m * @as(c_int, @intCast(self.modalities));
@@ -1417,7 +1462,8 @@ fn attnForward(aw: *const AttnW, x: mlx.mlx_array, cfg: Config, rope: ?RopeTable
     const hd: c_int = @intCast(cfg.attention_head_dim);
     const half: c_int = @intCast(cfg.rotDim() / 2);
 
-    const qkv = try aw.qkv.forward(x, null, s);
+    const qkv_base = try aw.qkv.forward(x, null, s);
+    const qkv = try loraAdd(qkv_base, x, aw.qkv_lora, s);
     defer _ = mlx.mlx_array_free(qkv);
     var parts: [3]mlx.mlx_array = undefined;
     try splitEqual(qkv, 3, 1, &parts, s);
@@ -1496,12 +1542,14 @@ fn attnForward(aw: *const AttnW, x: mlx.mlx_array, cfg: Config, rope: ?RopeTable
     defer _ = mlx.mlx_array_free(bc);
     const flat = try reshape(bc, &[_]c_int{ n, h * hd }, s);
     defer _ = mlx.mlx_array_free(flat);
-    return aw.out.forward(flat, null, s);
+    const out_base = try aw.out.forward(flat, null, s);
+    return loraAdd(out_base, flat, aw.out_lora, s);
 }
 
 /// fc1 emits gate and up FUSED as [S, 2*ffn]; SwiGLU is silu(gate) * up.
 fn mlpForward(mw: *const MlpW, x: mlx.mlx_array, s: S) !mlx.mlx_array {
-    const y = try mw.fc1.forward(x, null, s);
+    const y_base = try mw.fc1.forward(x, null, s);
+    const y = try loraAdd(y_base, x, mw.fc1_lora, s);
     defer _ = mlx.mlx_array_free(y);
     var halves: [2]mlx.mlx_array = undefined;
     try splitEqual(y, 2, 1, &halves, s);
@@ -1512,7 +1560,8 @@ fn mlpForward(mw: *const MlpW, x: mlx.mlx_array, s: S) !mlx.mlx_array {
     defer _ = mlx.mlx_array_free(g);
     const act = try mulA(g, halves[1], s);
     defer _ = mlx.mlx_array_free(act);
-    return mw.fc2.forward(act, null, s);
+    const o_base = try mw.fc2.forward(act, null, s);
+    return loraAdd(o_base, act, mw.fc2_lora, s);
 }
 
 // ── Modulation over packed segments ─────────────────────────────────────────
@@ -2063,10 +2112,20 @@ pub const Model = struct {
                 arr(v, w.q_norm);
                 arr(v, w.k_norm);
                 lin(v, &w.out);
+                lp(v, w.qkv_lora);
+                lp(v, w.out_lora);
             }
             fn ml(v: mlx.mlx_vector_array, w: *const MlpW) void {
                 lin(v, &w.fc1);
                 lin(v, &w.fc2);
+                lp(v, w.fc1_lora);
+                lp(v, w.fc2_lora);
+            }
+            fn lp(v: mlx.mlx_vector_array, slot: LoraSlot) void {
+                for (slot.active()) |r| {
+                    arr(v, r.at);
+                    arr(v, r.bt);
+                }
             }
         };
         for ([_]mlx.mlx_array{
@@ -2090,13 +2149,69 @@ pub const Model = struct {
             if (b.adaln) |*ad| {
                 push.lin(vec, &ad.linear);
                 push.arr(vec, ad.bias);
+                push.lp(vec, ad.lora);
             }
         }
         if (self.final_adaln) |*fa| {
             push.lin(vec, &fa.linear);
             push.arr(vec, fa.bias);
+            push.lp(vec, fa.lora);
         }
         try mlx.check(mlx.mlx_eval(vec));
+    }
+
+    /// Every linear a LoRA may target, in ONE list, so attach and the
+    /// completeness check below cannot disagree about what "all of them" is.
+    /// The 259 modules the Turbo LoRA ships: 50 blocks x (qkv, out, fc1, fc2,
+    /// adaln) + 2 refiner blocks x (qkv, out, fc1, fc2) + the final adaln.
+    pub const LORA_TARGETS: u32 = 259;
+
+    /// Attach every adapter in `stack` to the module it names, summed at
+    /// forward time (`lora.deltaSum`). NON-OWNING: `stack` must outlive the
+    /// model. Must run BEFORE `precomputeAdaln` — the adaln delta has to be
+    /// in place while the tables are built, since the weights are freed after.
+    /// Returns per-file attachment counts (index = position in the stack), so
+    /// the caller can hold a file to its own expectation: a Turbo file that
+    /// attaches to fewer than `LORA_TARGETS` modules is a broken artifact, not
+    /// a smaller speedup, while a style LoRA targeting a subset is ordinary.
+    pub fn attachLoras(self: *Model, stack: *const lora_mod.Stack) ![lora_mod.MAX_LORAS]u32 {
+        var counts: [lora_mod.MAX_LORAS]u32 = @splat(0);
+        var buf: [96]u8 = undefined;
+        var rbuf: [lora_mod.MAX_LORAS]lora_mod.Ref = undefined;
+
+        // `Stack.findAll` inlined, because the per-FILE attribution is the
+        // point: a whole-stack total cannot tell "the style LoRA matched 40
+        // modules" from "the Turbo file is missing 40 of its own".
+        const bind = struct {
+            fn f(st: *const lora_mod.Stack, key: []const u8, slot: *LoraSlot, rb: *[lora_mod.MAX_LORAS]lora_mod.Ref, cnt: *[lora_mod.MAX_LORAS]u32) void {
+                var n: usize = 0;
+                for (st.files[0..st.count], st.scales[0..st.count], 0..) |*fl, user_scale, fi| {
+                    const e = fl.find(key) orelse continue;
+                    rb[n] = .{ .at = e.at, .bt = e.bt, .scale = e.scale * user_scale };
+                    n += 1;
+                    cnt[fi] += 1;
+                }
+                if (n > 0) slot.set(rb[0..n]);
+            }
+        }.f;
+
+        for (self.blocks, 0..) |*b, i| {
+            const ad = if (b.adaln) |*ad| ad else return error.LoraAfterAdalnPrecompute;
+            bind(stack, try std.fmt.bufPrint(&buf, "blocks.{d}.attn.qkv_proj", .{i}), &b.attn.qkv_lora, &rbuf, &counts);
+            bind(stack, try std.fmt.bufPrint(&buf, "blocks.{d}.attn.out_proj", .{i}), &b.attn.out_lora, &rbuf, &counts);
+            bind(stack, try std.fmt.bufPrint(&buf, "blocks.{d}.mlp.fc1", .{i}), &b.mlp.fc1_lora, &rbuf, &counts);
+            bind(stack, try std.fmt.bufPrint(&buf, "blocks.{d}.mlp.fc2", .{i}), &b.mlp.fc2_lora, &rbuf, &counts);
+            bind(stack, try std.fmt.bufPrint(&buf, "blocks.{d}.adaln_proj.linear", .{i}), &ad.lora, &rbuf, &counts);
+        }
+        for (self.refiner, 0..) |*b, i| {
+            bind(stack, try std.fmt.bufPrint(&buf, "token_refiner.blocks.{d}.attn.qkv_proj", .{i}), &b.attn.qkv_lora, &rbuf, &counts);
+            bind(stack, try std.fmt.bufPrint(&buf, "token_refiner.blocks.{d}.attn.out_proj", .{i}), &b.attn.out_lora, &rbuf, &counts);
+            bind(stack, try std.fmt.bufPrint(&buf, "token_refiner.blocks.{d}.mlp.fc1", .{i}), &b.mlp.fc1_lora, &rbuf, &counts);
+            bind(stack, try std.fmt.bufPrint(&buf, "token_refiner.blocks.{d}.mlp.fc2", .{i}), &b.mlp.fc2_lora, &rbuf, &counts);
+        }
+        const fa = if (self.final_adaln) |*fa| fa else return error.LoraAfterAdalnPrecompute;
+        bind(stack, "final_layer.adaln_proj.linear", &fa.lora, &rbuf, &counts);
+        return counts;
     }
 
     /// Materialize AdaLN for the whole schedule and RELEASE the 13B AdaLN
@@ -3073,6 +3188,30 @@ pub const GenRequest = struct {
     /// Fast recipe switch: null/true = ON (the default), false = full-quality
     /// per-step compute (every forward, dense attention branch every step).
     fast: ?bool = null,
+    /// Turbo distillation LoRA (larryvrh/MiniMax-H3-Turbo-Lora): 4-8 step
+    /// sampling instead of ~30. Requires `paths.turbo_lora`; forces the fast
+    /// recipe OFF (its slow-drift premise is false at giant steps) and switches
+    /// the audio stream to EXACT Δσ_audio integration — see `audioStepFactor`.
+    /// Loaded as the FIRST file of the same stack the user's adapters ride —
+    /// it is a LoRA, so it gets no private code path.
+    turbo: bool = false,
+    /// Style LoRAs stacked on the DiT: absolute `.safetensors` paths and their
+    /// strengths (parallel arrays; a missing scale is 1.0 at the caller). They
+    /// sum with each other and with Turbo, never merge — order is irrelevant
+    /// to the result. Loaded and freed with the model, since H3 stages its
+    /// weights per generation and keeps nothing resident between requests.
+    lora_paths: []const []const u8 = &.{},
+    lora_scales: []const f32 = &.{},
+    /// Chained-window long clips: N back-to-back `frames`-frame windows, each
+    /// conditioned on its predecessor's last decoded frame through the
+    /// ordinary fl2va path. `frames` is the PER-WINDOW count; the clip
+    /// delivers `chainDeliveredFrames(chain_windows, frames)` frames (the
+    /// duplicate join frames are dropped) with a one-frame equal-power audio
+    /// cross-fade at each seam. Caps the packed sequence — and so the
+    /// attention S² term and the broadcast-cache footprint — at the WINDOW
+    /// size regardless of clip length. FL2VA only (a reference has no
+    /// keyframe row to chain through).
+    chain_windows: u32 = 1,
     /// fl2va keyframes (0-2: first and/or last), conditioned through their VAE
     /// latents as cond rows.
     ///
@@ -3096,8 +3235,13 @@ pub const SpeedConfig = struct { step_cache: f64, bcast_k: u32 };
 /// off switch for final renders ("non fast just a smidge better"). Env vars
 /// stay the STRONGEST knob — set means set, including "0" — so every A/B
 /// harness keeps its arms.
-pub fn resolveSpeed(fast: ?bool, env_sc: ?[]const u8, env_bk: ?[]const u8) SpeedConfig {
-    const want_fast = fast orelse true;
+///
+/// Turbo and the fast recipe are ALTERNATIVES, not a stack: at 4-8 steps the
+/// velocity cache's slow-drift premise is false (every step is a giant leap)
+/// and the broadcast gates cover most of the schedule anyway, so `turbo`
+/// forces both off regardless of `fast` — env still wins for A/B harnesses.
+pub fn resolveSpeed(fast: ?bool, turbo: bool, env_sc: ?[]const u8, env_bk: ?[]const u8) SpeedConfig {
+    const want_fast = !turbo and (fast orelse true);
     var out = SpeedConfig{
         .step_cache = if (want_fast) 0.05 else 0,
         .bcast_k = if (want_fast) 2 else 0,
@@ -3105,6 +3249,26 @@ pub fn resolveSpeed(fast: ?bool, env_sc: ?[]const u8, env_bk: ?[]const u8) Speed
     if (env_sc) |raw| out.step_cache = std.fmt.parseFloat(f64, raw) catch out.step_cache;
     if (env_bk) |raw| out.bcast_k = std.fmt.parseInt(u32, raw, 10) catch out.bcast_k;
     return out;
+}
+
+/// What the audio latent is advanced by this step, per unit of the
+/// slope-scaled velocity the forward returns (`Output.audio` carries
+/// d(sigma_a)/d(sigma_v) at the CURRENT sigma).
+///
+/// Default path: `Δσ_video` — first-order in the audio clock, byte-identical
+/// to what every ≥30-step render was validated with, where the error is
+/// second-order and negligible.
+///
+/// Turbo path: the EXACT mapped delta `(σa(next) − σa(cur)) / slope(cur)` —
+/// the reference node's own arithmetic, and the entire reason its custom
+/// sampler exists: at 4 steps the last video leg (0.8 → 0 at shift 12/3) is
+/// 0.5 in the audio clock but 1.25 first-order, a 2.5x over-step that is the
+/// "audio blown out at low steps" failure its README describes.
+pub fn audioStepFactor(turbo: bool, sigma_cur: f64, sigma_next: f64, shift_v: f64, shift_a: f64) f64 {
+    if (!turbo) return sigma_next - sigma_cur;
+    const sa_c = timeShiftSigma(sigma_cur, shift_v, shift_a);
+    const sa_n = timeShiftSigma(sigma_next, shift_v, shift_a);
+    return (sa_n - sa_c) / timeShiftSlope(@max(sigma_cur, 1e-6), shift_v, shift_a);
 }
 
 pub const GenPaths = struct {
@@ -3116,6 +3280,10 @@ pub const GenPaths = struct {
     /// Audio VAE. Optional: absent means the clip is silent rather than
     /// failing, since the video stream is complete without it.
     audio_vae: ?[]const u8 = null,
+    /// Turbo LoRA file (`turbo_lora.safetensors` in the pack dir). Optional:
+    /// absent just means `turbo` requests fail with a named error — the
+    /// handler 400s before generate() ever runs.
+    turbo_lora: ?[]const u8 = null,
 };
 
 pub const GenResult = struct {
@@ -3183,10 +3351,25 @@ pub fn patchifyVideo(x: mlx.mlx_array, s: S) !mlx.mlx_array {
     return reshape(trc, &[_]c_int{ t * h2 * w2, c * @as(c_int, @intCast(PATCH_H * PATCH_W)) }, s);
 }
 
-/// Text-to-audio-video, with STAGED residency: the 50-layer text encoder
-/// (~48 GB bf16) and the DiT (~62 GB bf16) cannot both be resident on a 128 GB
-/// machine, so the encoder is loaded, run, and freed before the DiT loads.
+/// Text-to-audio-video. Dispatches: `chain_windows > 1` runs N single-window
+/// generations chained by fl2va keyframes (`generateChain`); everything else
+/// is one window (`generateOne`).
 pub fn generate(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    paths: GenPaths,
+    req: GenRequest,
+    progress: ?gen_sse.Progress,
+    s: S,
+) !GenResult {
+    if (req.chain_windows > 1) return generateChain(allocator, io, paths, req, progress, s);
+    return generateOne(allocator, io, paths, req, progress, s);
+}
+
+/// One window, with STAGED residency: the 50-layer text encoder (~48 GB bf16)
+/// and the DiT (~62 GB bf16) cannot both be resident on a 128 GB machine, so
+/// the encoder is loaded, run, and freed before the DiT loads.
+fn generateOne(
     allocator: std.mem.Allocator,
     io: std.Io,
     paths: GenPaths,
@@ -3537,6 +3720,27 @@ pub fn generate(
         log.warn("[minimax-h3] MINIMAX_H3_ABLATE='{s}' not recognized; profiling arms OFF\n", .{abl_raw.?});
 
     {
+        // Adapters are loaded BEFORE the DiT and outlive it (declared first ⇒
+        // its `defer` runs last), because every attached `Ref` points into
+        // this stack. Turbo is file 0 when asked for, then the user's, so a
+        // style LoRA and the distillation sum on the same linears.
+        var stack: lora_mod.Stack = .{ .allocator = allocator };
+        defer stack.deinit();
+        if (req.turbo) {
+            const tp = paths.turbo_lora orelse return error.TurboLoraMissing;
+            stack.files[stack.count] = try lora_mod.loadFile(allocator, tp, .minimax_h3);
+            stack.paths[stack.count] = try allocator.dupe(u8, tp);
+            stack.scales[stack.count] = 1.0; // the file's alpha == rank
+            stack.count += 1;
+        }
+        if (req.lora_paths.len + stack.count > lora_mod.MAX_LORAS) return error.TooManyLoras;
+        for (req.lora_paths, 0..) |p, i| {
+            stack.files[stack.count] = try lora_mod.loadFile(allocator, p, .minimax_h3);
+            stack.paths[stack.count] = try allocator.dupe(u8, p);
+            stack.scales[stack.count] = if (i < req.lora_scales.len) req.lora_scales[i] else 1.0;
+            stack.count += 1;
+        }
+
         // The weights MAP must not outlive Model.load: it holds +1 refs on
         // every raw file-backed array, so anything the model later FREES (the
         // 13 GB of AdaLN under precompute) would stay resident until scope
@@ -3549,6 +3753,28 @@ pub fn generate(
             break :blk try Model.load(allocator, &dw, .{}, dt, s);
         };
         defer model.deinit();
+        if (stack.count > 0) {
+            // Attach BEFORE precomputeAdaln so the adaln delta folds into the
+            // tables (after it, the modulation weights are gone).
+            const counts = try model.attachLoras(&stack);
+            for (stack.paths[0..stack.count], stack.scales[0..stack.count], counts[0..stack.count], 0..) |p, sc, n, i| {
+                const is_turbo = req.turbo and i == 0;
+                // Engagement is COUNTED and logged per file: a rejected or
+                // half-matching adapter is otherwise a silent no-op that looks
+                // exactly like a working one.
+                log.info("[minimax-h3] lora {d}/{d}: {d}/{d} modules, scale {d:.2}{s} — {s}\n", .{
+                    i + 1,          stack.count, n, Model.LORA_TARGETS, sc,
+                    if (is_turbo) " (turbo)" else "", std.fs.path.basename(p),
+                });
+                // The Turbo file names every target; anything less is a broken
+                // artifact, not a smaller speedup. A style LoRA legitimately
+                // targets a subset, but matching NOTHING means the file is for
+                // another architecture and the user would wait an hour for an
+                // unchanged render.
+                if (is_turbo and n < Model.LORA_TARGETS) return error.TurboLoraIncomplete;
+                if (n == 0) return error.LoraNoMatch;
+            }
+        }
         // AdaLN precompute must run while the trunk is still lazy — see
         // precomputeAdaln. Default ON: it is what keeps the DiT residency at
         // ~22 GB instead of ~35 on the 8-bit pack.
@@ -3586,8 +3812,8 @@ pub fn generate(
         // only on every k-th mid-schedule step and reuses the cached output
         // between — the branch is ~70% of a 768p step. Cache cost: one
         // [S, hidden] bf16 per block (~20 GB at 768p, ~1.4 GB at 256px).
-        const speed = resolveSpeed(req.fast, envStr("MINIMAX_H3_STEP_CACHE"), envStr("MINIMAX_H3_ATTN_BCAST"));
-        log.info("[minimax-h3] speed recipe: step-cache {d:.3}, attn-broadcast k={d} (fast={any})\n", .{ speed.step_cache, speed.bcast_k, req.fast });
+        const speed = resolveSpeed(req.fast, req.turbo, envStr("MINIMAX_H3_STEP_CACHE"), envStr("MINIMAX_H3_ATTN_BCAST"));
+        log.info("[minimax-h3] speed recipe: step-cache {d:.3}, attn-broadcast k={d} (fast={any}, turbo={})\n", .{ speed.step_cache, speed.bcast_k, req.fast, req.turbo });
         const bcast_k: u32 = speed.bcast_k;
         var attn_bcast: ?AttnBroadcast = if (bcast_k > 1) try AttnBroadcast.init(allocator, model.blocks.len) else null;
         defer if (attn_bcast) |*ab| ab.deinit();
@@ -3645,8 +3871,16 @@ pub fn generate(
                 const nv = try addA(video_x, stepv, s);
                 _ = mlx.mlx_array_free(video_x);
                 video_x = nv;
-                const slope_i = timeShiftSlope(sigma, req.shift_video, req.shift_audio);
-                const da = try scalarLike(@floatCast(dsigma * slope_i), sc_a_raw.?, s);
+                // `sc_a_raw` is the RAW audio-clock velocity (already divided
+                // by its forward's slope), so its exact advance is the mapped
+                // Δσa itself; the non-turbo arm keeps the validated
+                // first-order form (this path is only reachable under turbo
+                // when the env forces the cache back on).
+                const askip = if (req.turbo)
+                    timeShiftSigma(sigmas[i + 1], req.shift_video, req.shift_audio) - timeShiftSigma(sigma, req.shift_video, req.shift_audio)
+                else
+                    dsigma * timeShiftSlope(sigma, req.shift_video, req.shift_audio);
+                const da = try scalarLike(@floatCast(askip), sc_a_raw.?, s);
                 defer _ = mlx.mlx_array_free(da);
                 const stepa = try mulA(sc_a_raw.?, da, s);
                 defer _ = mlx.mlx_array_free(stepa);
@@ -3698,7 +3932,10 @@ pub fn generate(
 
             // Euler on the flat ODE: x += model_output * dsigma. The audio
             // velocity already carries d(sigma_a)/d(sigma_v), so both streams
-            // integrate against the SAME video-schedule step.
+            // integrate against the SAME video-schedule step — except under
+            // turbo, where the audio advance is the EXACT mapped Δσa
+            // (`audioStepFactor`): at 4-8 steps the first-order form
+            // over-steps the audio clock by up to 2.5x on the last leg.
             const dv = try scalarLike(@floatCast(dsigma), out.video, s);
             defer _ = mlx.mlx_array_free(dv);
             const stepv = try mulA(out.video, dv, s);
@@ -3707,7 +3944,7 @@ pub fn generate(
             _ = mlx.mlx_array_free(video_x);
             video_x = nv;
 
-            const da = try scalarLike(@floatCast(dsigma), out.audio, s);
+            const da = try scalarLike(@floatCast(audioStepFactor(req.turbo, sigma, sigmas[i + 1], req.shift_video, req.shift_audio)), out.audio, s);
             defer _ = mlx.mlx_array_free(da);
             const stepa = try mulA(out.audio, da, s);
             defer _ = mlx.mlx_array_free(stepa);
@@ -3808,6 +4045,302 @@ pub fn generate(
         .frame_count = @intCast(pshape[2]),
         .height = @intCast(pshape[3]),
         .width = @intCast(pshape[4]),
+    };
+}
+
+// ── Chained windows ─────────────────────────────────────────────────────────
+
+/// Unique frames a chained clip delivers: each seam drops the duplicate frame
+/// (window N+1's frame 0 reproduces its conditioning keyframe).
+pub fn chainDeliveredFrames(windows: u32, window_frames: u32) u32 {
+    return windows * window_frames - (windows - 1);
+}
+
+/// One video frame of audio — the cross-fade width at each seam.
+pub const CHAIN_OVERLAP_SAMPLES: usize = audio_mod.SAMPLE_RATE / FPS;
+
+/// [1,3,F,H,W] -> [1,3,hi-lo,H,W]. The frame slice is never row-contiguous
+/// (channel planes are strided across it), so `contig` materializes a REAL
+/// copy and the window's 0.7 GB pixel buffer is not pinned by a view.
+fn sliceFrames(x: mlx.mlx_array, lo: c_int, hi: c_int, s: S) !mlx.mlx_array {
+    const shp = mlx.getShape(x);
+    const start = [_]c_int{ 0, 0, lo, 0, 0 };
+    const stop = [_]c_int{ shp[0], shp[1], hi, shp[3], shp[4] };
+    const step = [_]c_int{ 1, 1, 1, 1, 1 };
+    var o = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(o);
+    try mlx.check(mlx.mlx_slice(&o, x, &start, 5, &stop, 5, &step, 5, s));
+    return contig(o, s);
+}
+
+/// Equal-power cross-fade join of mono sample runs: `out` is seg0, then each
+/// later segment fades in over `overlap` samples of what was already written
+/// (weights cos/sin at t=(j+0.5)/ov·π/2) and appends its remainder. Pure host
+/// math so the seam is unit-testable; the caller applies it per channel.
+pub fn crossfadeJoin(allocator: std.mem.Allocator, segs: []const []const f32, overlap: usize) ![]f32 {
+    var total: usize = 0;
+    for (segs, 0..) |sg, i| {
+        total += sg.len;
+        if (i > 0) total -= @min(overlap, sg.len);
+    }
+    var out = try allocator.alloc(f32, total);
+    errdefer allocator.free(out);
+    var pos: usize = 0;
+    for (segs, 0..) |sg, i| {
+        if (i == 0) {
+            @memcpy(out[0..sg.len], sg);
+            pos = sg.len;
+            continue;
+        }
+        const ov = @min(overlap, @min(sg.len, pos));
+        const base = pos - ov;
+        for (0..ov) |j| {
+            const t = (@as(f32, @floatFromInt(j)) + 0.5) / @as(f32, @floatFromInt(ov)) * (std.math.pi / 2.0);
+            out[base + j] = out[base + j] * @cos(t) + sg[j] * @sin(t);
+        }
+        @memcpy(out[pos .. pos + (sg.len - ov)], sg[ov..]);
+        pos += sg.len - ov;
+    }
+    std.debug.assert(pos == total);
+    return out;
+}
+
+/// Stereo [2, L] waves -> one [2, L_total] f32 array joined per channel with
+/// `crossfadeJoin`. Waves are pulled to the host (the PCM writer does the same
+/// pull later; a seam is a few thousand samples of scalar math).
+fn joinWavesCrossfade(allocator: std.mem.Allocator, waves: []const mlx.mlx_array, overlap: usize, s: S) !mlx.mlx_array {
+    var planes = try allocator.alloc([]f32, waves.len);
+    var built: usize = 0;
+    defer {
+        for (planes[0..built]) |p| allocator.free(p);
+        allocator.free(planes);
+    }
+    var lens = try allocator.alloc(usize, waves.len);
+    defer allocator.free(lens);
+    for (waves, 0..) |wv, i| {
+        const c = try contig(wv, s);
+        defer _ = mlx.mlx_array_free(c);
+        const f = try astype(c, mlx.mlx_dtype.float32, s);
+        defer _ = mlx.mlx_array_free(f);
+        try mlx.check(mlx.mlx_array_eval(f));
+        const n: usize = @intCast(mlx.mlx_array_size(f));
+        const raw = mlx.mlx_array_data_float32(f) orelse return error.NoAudioData;
+        planes[i] = try allocator.dupe(f32, raw[0..n]);
+        built += 1;
+        lens[i] = n / 2;
+    }
+    var ch_out: [2][]f32 = undefined;
+    var ch_built: usize = 0;
+    defer for (ch_out[0..ch_built]) |p| allocator.free(p);
+    for (0..2) |ch| {
+        var segs = try allocator.alloc([]const f32, waves.len);
+        defer allocator.free(segs);
+        for (planes, 0..) |p, i| segs[i] = p[ch * lens[i] .. (ch + 1) * lens[i]];
+        ch_out[ch] = try crossfadeJoin(allocator, segs, overlap);
+        ch_built += 1;
+    }
+    const lt = ch_out[0].len;
+    std.debug.assert(ch_out[1].len == lt);
+    const buf = try allocator.alloc(f32, 2 * lt);
+    defer allocator.free(buf);
+    @memcpy(buf[0..lt], ch_out[0]);
+    @memcpy(buf[lt..], ch_out[1]);
+    const shp = [_]c_int{ 2, @intCast(lt) };
+    return mlx.mlx_array_new_data(buf.ptr, &shp, 2, mlx.mlx_dtype.float32);
+}
+
+/// Progress adapter: prefixes the stage with "Window w/n" and remaps
+/// determinate bars onto the whole chain so the client's meter is monotone
+/// across windows instead of restarting at every seam.
+const ChainProgress = struct {
+    inner: gen_sse.Progress,
+    window: u32,
+    windows: u32,
+
+    fn cb(ptr: *anyopaque, stage: []const u8, step: u32, total: u32) void {
+        const self: *ChainProgress = @ptrCast(@alignCast(ptr));
+        var buf: [96]u8 = undefined;
+        const label = std.fmt.bufPrint(&buf, "Window {d}/{d}: {s}", .{ self.window + 1, self.windows, stage }) catch stage;
+        if (total > 0)
+            self.inner.emit(label, self.window * total + step, self.windows * total)
+        else
+            self.inner.emit(label, step, 0);
+    }
+    fn cancelledCb(ptr: *anyopaque) bool {
+        const self: *ChainProgress = @ptrCast(@alignCast(ptr));
+        return self.inner.cancelled();
+    }
+    fn progress(self: *ChainProgress) gen_sse.Progress {
+        return .{ .ctx = self, .cb = cb, .cancelled_cb = cancelledCb };
+    }
+};
+
+/// N single-window generations chained by fl2va keyframes: window N's last
+/// decoded frame is VAE-encoded as window N+1's `.first` keyframe (the
+/// ordinary conditioning path), the duplicate frame is dropped at the join and
+/// the pieces butt-join in pixel space with a one-frame equal-power audio
+/// cross-fade. The user's own `.first` keyframe applies to window 0, their
+/// `.last` to the final window. v1 reloads the staged pipeline per window —
+/// the whole validated single-window path runs byte-for-byte unchanged, at the
+/// cost of the TE/DiT load time once per window.
+fn generateChain(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    paths: GenPaths,
+    req: GenRequest,
+    progress: ?gen_sse.Progress,
+    s: S,
+) !GenResult {
+    const n = req.chain_windows;
+    std.debug.assert(n >= 2);
+    // A reference has no keyframe row to chain through; the handler rejects
+    // this by name, the engine refuses to silently produce it.
+    if (req.refs.len > 0) return error.ChainWithRefs;
+
+    var user_first: ?Keyframe = null;
+    var user_last: ?Keyframe = null;
+    for (req.keyframes) |kf| switch (kf.anchor) {
+        .first => user_first = kf,
+        .last => user_last = kf,
+    };
+
+    var pixel_segs: std.ArrayList(mlx.mlx_array) = .empty;
+    defer {
+        for (pixel_segs.items) |x| _ = mlx.mlx_array_free(x);
+        pixel_segs.deinit(allocator);
+    }
+    var waves: std.ArrayList(mlx.mlx_array) = .empty;
+    defer {
+        for (waves.items) |x| _ = mlx.mlx_array_free(x);
+        waves.deinit(allocator);
+    }
+    var have_audio = true;
+    var final_latent: ?mlx.mlx_array = null;
+    errdefer if (final_latent) |x| {
+        _ = mlx.mlx_array_free(x);
+    };
+    var prev_last: ?mlx.mlx_array = null;
+    defer if (prev_last) |x| {
+        _ = mlx.mlx_array_free(x);
+    };
+    var out_w: u32 = 0;
+    var out_h: u32 = 0;
+
+    for (0..n) |w| {
+        var kfs: [2]Keyframe = undefined;
+        var nk: usize = 0;
+        if (w == 0) {
+            if (user_first) |kf| {
+                kfs[nk] = kf;
+                nk += 1;
+            }
+        } else {
+            kfs[nk] = .{ .anchor = .first, .pixels = prev_last.?, .vision = null };
+            nk += 1;
+        }
+        if (w == n - 1) {
+            if (user_last) |kf| {
+                kfs[nk] = kf;
+                nk += 1;
+            }
+        }
+
+        var wreq = req;
+        wreq.chain_windows = 1;
+        // Window 0 must reproduce the single-window generation exactly (same
+        // seed); later windows shift by 2 because generateOne draws seed and
+        // seed+1 (video/audio).
+        wreq.seed = req.seed +% 2 * @as(u64, @intCast(w));
+        wreq.keyframes = kfs[0..nk];
+
+        var cp: ChainProgress = undefined;
+        var wprog: ?gen_sse.Progress = null;
+        if (progress) |p| {
+            cp = .{ .inner = p, .window = @intCast(w), .windows = n };
+            wprog = cp.progress();
+        }
+
+        const res = try generateOne(allocator, io, paths, wreq, wprog, s);
+        // Deconstructed rather than deinit'd: the join takes the parts. `rp`
+        // nulls out as ownership moves so no error path can double-free.
+        const rframes: c_int = @intCast(res.frame_count);
+        out_w = res.width;
+        out_h = res.height;
+        var rp: ?mlx.mlx_array = res.pixels;
+        errdefer if (rp) |x| {
+            _ = mlx.mlx_array_free(x);
+        };
+        if (res.audio) |wave| {
+            waves.append(allocator, wave) catch |e| {
+                _ = mlx.mlx_array_free(wave);
+                _ = mlx.mlx_array_free(res.audio_latent);
+                return e;
+            };
+        } else have_audio = false;
+        if (w == n - 1) {
+            final_latent = res.audio_latent;
+        } else {
+            _ = mlx.mlx_array_free(res.audio_latent);
+        }
+
+        if (w + 1 < n) {
+            if (prev_last) |x| _ = mlx.mlx_array_free(x);
+            prev_last = try sliceFrames(rp.?, rframes - 1, rframes, s);
+            try mlx.check(mlx.mlx_array_eval(prev_last.?));
+        }
+        // Drop the duplicate join frame: window w>0's frame 0 reproduces the
+        // keyframe that conditioned it, which the previous window already
+        // delivered as its last frame.
+        const seg = if (w == 0) blk: {
+            const p = rp.?;
+            rp = null;
+            break :blk p;
+        } else blk: {
+            const sl = try sliceFrames(rp.?, 1, rframes, s);
+            errdefer _ = mlx.mlx_array_free(sl);
+            try mlx.check(mlx.mlx_array_eval(sl));
+            _ = mlx.mlx_array_free(rp.?);
+            rp = null;
+            break :blk sl;
+        };
+        pixel_segs.append(allocator, seg) catch |e| {
+            _ = mlx.mlx_array_free(seg);
+            return e;
+        };
+        _ = mlx.mlx_clear_cache();
+        log.info("[minimax-h3] chain window {d}/{d} done ({d} frames{s})\n", .{ w + 1, n, res.frame_count, if (w > 0) " — join frame dropped" else "" });
+    }
+
+    const joined = blk: {
+        const vec = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(vec);
+        for (pixel_segs.items) |p| _ = mlx.mlx_vector_array_append_value(vec, p);
+        var o = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(o);
+        try mlx.check(mlx.mlx_concatenate_axis(&o, vec, 2, s));
+        try mlx.check(mlx.mlx_array_eval(o));
+        break :blk o;
+    };
+    errdefer _ = mlx.mlx_array_free(joined);
+
+    var audio_joined: ?mlx.mlx_array = null;
+    if (have_audio and waves.items.len == n) {
+        audio_joined = try joinWavesCrossfade(allocator, waves.items, CHAIN_OVERLAP_SAMPLES, s);
+    }
+    errdefer if (audio_joined) |x| {
+        _ = mlx.mlx_array_free(x);
+    };
+    _ = mlx.mlx_clear_cache();
+
+    const pshape = mlx.getShape(joined);
+    log.info("[minimax-h3] chain joined: {d} windows -> {d} frames, audio {s}\n", .{ n, pshape[2], if (audio_joined != null) "cross-faded" else "absent" });
+    return .{
+        .pixels = joined,
+        .audio_latent = final_latent orelse return error.ChainNoWindows,
+        .audio = audio_joined,
+        .frame_count = @intCast(pshape[2]),
+        .height = out_h,
+        .width = out_w,
     };
 }
 
@@ -5686,25 +6219,324 @@ test "minimax h3: sparseAttend attends exactly its subset (uniform-score closed 
 
 test "minimax h3: resolveSpeed — fast default on, request off-switch, env strongest" {
     // Defaults: fast recipe on.
-    var c = resolveSpeed(null, null, null);
+    var c = resolveSpeed(null, false, null, null);
     try testing.expectEqual(@as(f64, 0.05), c.step_cache);
     try testing.expectEqual(@as(u32, 2), c.bcast_k);
-    c = resolveSpeed(true, null, null);
+    c = resolveSpeed(true, false, null, null);
     try testing.expectEqual(@as(u32, 2), c.bcast_k);
     // "fast": false is the user's off switch.
-    c = resolveSpeed(false, null, null);
+    c = resolveSpeed(false, false, null, null);
     try testing.expectEqual(@as(f64, 0), c.step_cache);
     try testing.expectEqual(@as(u32, 0), c.bcast_k);
     // Env set means SET — including "0" (the A/B harness arms), and it beats
     // the request field in BOTH directions.
-    c = resolveSpeed(null, "0", "0");
+    c = resolveSpeed(null, false, "0", "0");
     try testing.expectEqual(@as(f64, 0), c.step_cache);
     try testing.expectEqual(@as(u32, 0), c.bcast_k);
-    c = resolveSpeed(false, "0.1", "3");
+    c = resolveSpeed(false, false, "0.1", "3");
     try testing.expectEqual(@as(f64, 0.1), c.step_cache);
     try testing.expectEqual(@as(u32, 3), c.bcast_k);
     // Junk env falls back to the resolved default, never to a surprise arm.
-    c = resolveSpeed(null, "junk", "junk");
+    c = resolveSpeed(null, false, "junk", "junk");
     try testing.expectEqual(@as(f64, 0.05), c.step_cache);
     try testing.expectEqual(@as(u32, 2), c.bcast_k);
+}
+
+test "minimax h3: resolveSpeed — turbo forces the recipe off, env still strongest" {
+    // Turbo and the fast recipe are alternatives: turbo wins even over an
+    // explicit "fast": true (the recipe's slow-drift premise is false at
+    // giant steps, and serving it anyway would be the silent-flag-eater
+    // class — logged as engaged while doing nothing useful).
+    var c = resolveSpeed(null, true, null, null);
+    try testing.expectEqual(@as(f64, 0), c.step_cache);
+    try testing.expectEqual(@as(u32, 0), c.bcast_k);
+    c = resolveSpeed(true, true, null, null);
+    try testing.expectEqual(@as(f64, 0), c.step_cache);
+    try testing.expectEqual(@as(u32, 0), c.bcast_k);
+    // Env stays the strongest knob in both directions, turbo included.
+    c = resolveSpeed(null, true, "0.05", "2");
+    try testing.expectEqual(@as(f64, 0.05), c.step_cache);
+    try testing.expectEqual(@as(u32, 2), c.bcast_k);
+}
+
+test "minimax h3: audioStepFactor — exact mapped delta under turbo, first-order otherwise" {
+    const sv = SIGMA_SHIFT_VIDEO; // 12
+    const sa = SIGMA_SHIFT_AUDIO; // 3
+    // Non-turbo: byte-identical to the validated ≥30-step arithmetic.
+    try testing.expectEqual(@as(f64, -0.25), audioStepFactor(false, 0.75, 0.5, sv, sa));
+
+    // Turbo, last leg of the 4-step schedule (sigma 0.8 -> 0 at shift 12/3).
+    // Hand-derived, not computed through the functions under test:
+    //   base(0.8)   = 0.8 / (12 - 8.8)      = 0.25
+    //   σa(0.8)     = 3*0.25 / 1.5          = 0.5 ; σa(0) = 0
+    //   slope(0.8)  = 3*(1+11*.25)² / (12*(1+2*.25)²) = 3*14.0625/27 = 1.5625
+    //   factor      = (0 - 0.5) / 1.5625    = -0.32
+    const f = audioStepFactor(true, 0.8, 0.0, sv, sa);
+    try testing.expect(@abs(f - (-0.32)) < 1e-12);
+    // The first-order form would advance by the full video delta (-0.8):
+    // 2.5x the exact audio move — the "audio blown out at 4 steps" failure.
+    try testing.expect(@abs(f) < 0.8 * 0.5);
+
+    // Small steps: the two forms converge (which is why the ≥30-step path
+    // never needed the exact form).
+    const fine_exact = audioStepFactor(true, 0.5, 0.49, sv, sa);
+    const fine_first = audioStepFactor(false, 0.5, 0.49, sv, sa);
+    try testing.expect(@abs(fine_exact - fine_first) < @abs(fine_first) * 0.02);
+}
+
+test "minimax h3: chain math — delivered frames, overlap width, cross-fade seam" {
+    // Each seam drops the duplicate join frame.
+    try testing.expectEqual(@as(u32, 124), chainDeliveredFrames(1, 124));
+    try testing.expectEqual(@as(u32, 247), chainDeliveredFrames(2, 124));
+    try testing.expectEqual(@as(u32, 370), chainDeliveredFrames(3, 124));
+    // One video frame of audio at 32 kHz / 24 fps.
+    try testing.expectEqual(@as(usize, 1333), CHAIN_OVERLAP_SAMPLES);
+
+    const a = testing.allocator;
+    // Two constant segments, overlap 2: length = 4 + 4 − 2, the seam blends
+    // cos/sin at t = (j+0.5)/2 · π/2, and both flanks stay verbatim.
+    const s1 = [_]f32{ 1, 1, 1, 1 };
+    const s2 = [_]f32{ 2, 2, 2, 2 };
+    const joined = try crossfadeJoin(a, &.{ &s1, &s2 }, 2);
+    defer a.free(joined);
+    try testing.expectEqual(@as(usize, 6), joined.len);
+    try testing.expectEqual(@as(f32, 1), joined[0]);
+    try testing.expectEqual(@as(f32, 1), joined[1]);
+    const t0 = 0.25 * std.math.pi / 2.0;
+    const t1 = 0.75 * std.math.pi / 2.0;
+    try testing.expectApproxEqAbs(@cos(@as(f32, t0)) + 2 * @sin(@as(f32, t0)), joined[2], 1e-6);
+    try testing.expectApproxEqAbs(@cos(@as(f32, t1)) + 2 * @sin(@as(f32, t1)), joined[3], 1e-6);
+    try testing.expectEqual(@as(f32, 2), joined[4]);
+    try testing.expectEqual(@as(f32, 2), joined[5]);
+
+    // Three segments chain seam after seam; an overlap wider than a segment
+    // clamps instead of reading out of bounds.
+    const s3 = [_]f32{3};
+    const j2 = try crossfadeJoin(a, &.{ &s1, &s2, &s3 }, 2);
+    defer a.free(j2);
+    try testing.expectEqual(@as(usize, 6 + 1 - 1), j2.len);
+
+    // A single segment is passed through verbatim.
+    const j3 = try crossfadeJoin(a, &.{&s1}, 2);
+    defer a.free(j3);
+    try testing.expectEqualSlices(f32, &s1, j3);
+}
+
+test "minimax h3: loraAdd sums every attached adapter onto the base output" {
+    const s = mlx.gpuStream();
+    const f32t = mlx.mlx_dtype.float32;
+
+    // Aᵀ [in=3, r=2] / Bᵀ [r=2, out=4] (already transposed, as `loadFile`
+    // hands them over), x [2,3]. Small integers so every f32 product is
+    // exact and the expectation can be equality, not tolerance.
+    const AT = [_]f32{ 1, -1, 2, 0, 3, 2 };
+    const BT = [_]f32{ 1, 0, 2, 1, 0, 1, -1, 1 };
+    const X = [_]f32{ 1, -1, 2, 0, 3, 1 };
+
+    const shAT = [_]c_int{ 3, 2 };
+    const shBT = [_]c_int{ 2, 4 };
+    const at = mlx.mlx_array_new_data(@constCast(@ptrCast(&AT)), &shAT, 2, f32t);
+    defer _ = mlx.mlx_array_free(at);
+    const bt = mlx.mlx_array_new_data(@constCast(@ptrCast(&BT)), &shBT, 2, f32t);
+    defer _ = mlx.mlx_array_free(bt);
+    const shX = [_]c_int{ 2, 3 };
+    const x = mlx.mlx_array_new_data(@constCast(@ptrCast(&X)), &shX, 2, f32t);
+    defer _ = mlx.mlx_array_free(x);
+
+    // Turbo at 1.0 plus a style adapter at 0.5 — the stacking case, on the
+    // same linear. expected[m][o] = 1.5 * Σ_r (Σ_i X[m][i]·AT[i][r])·BT[r][o].
+    var slot: LoraSlot = .{};
+    slot.set(&[_]lora_mod.Ref{
+        .{ .at = at, .bt = bt, .scale = 1.0 },
+        .{ .at = at, .bt = bt, .scale = 0.5 },
+    });
+
+    const zbuf = [_]f32{ 0, 0, 0, 0, 0, 0, 0, 0 }; // zero base: the deltas alone come back
+    const shZ = [_]c_int{ 2, 4 };
+    const zero = mlx.mlx_array_new_data(@constCast(@ptrCast(&zbuf)), &shZ, 2, f32t);
+    const got = try loraAdd(zero, x, slot, s); // consumes `zero`
+    defer _ = mlx.mlx_array_free(got);
+    try mlx.check(mlx.mlx_array_eval(got));
+    const raw = mlx.mlx_array_data_float32(got) orelse return error.NoData;
+
+    for (0..2) |m| for (0..4) |o| {
+        var acc: f32 = 0;
+        for (0..2) |r| {
+            var xa: f32 = 0;
+            for (0..3) |i| xa += X[m * 3 + i] * AT[i * 2 + r];
+            acc += xa * BT[r * 4 + o];
+        }
+        try testing.expectApproxEqAbs(acc * 1.5, raw[m * 4 + o], 1e-5);
+    };
+
+    // An empty slot is the identity — and returns the SAME handle, since the
+    // no-adapter path must cost nothing on a 50-block DiT.
+    const empty: LoraSlot = .{};
+    const base2 = mlx.mlx_array_new_data(@constCast(@ptrCast(&zbuf)), &shZ, 2, f32t);
+    defer _ = mlx.mlx_array_free(base2);
+    const same = try loraAdd(base2, x, empty, s);
+    try testing.expectEqual(base2.ctx, same.ctx);
+}
+
+test "minimax h3: an adapter file resolves to our own module names, dotted or flattened" {
+    // H3's checkpoint names ARE our module names, so a reference-style file
+    // needs no translation; the arch table exists for the FLAT Kohya scheme,
+    // where a missing table would leave `blocks_0_attn_qkv_proj` unmatched
+    // and the render silently unchanged.
+    const a = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &pbuf);
+    const path = try std.fmt.allocPrint(a, "{s}/h3lora.safetensors", .{pbuf[0..root_len]});
+    defer a.free(path);
+
+    const tmap = mlx.mlx_map_string_to_array_new();
+    defer _ = mlx.mlx_map_string_to_array_free(tmap);
+    const av = [_]f32{ 0.1, 0.2, 0.3, 0.4 };
+    const bv = [_]f32{ 0.5, 0.6, 0.7, 0.8 };
+    const ash = [_]c_int{ 2, 2 };
+    const bsh = [_]c_int{ 2, 2 };
+    const aarr = mlx.mlx_array_new_data(@constCast(@ptrCast(&av)), &ash, 2, mlx.mlx_dtype.float32);
+    const barr = mlx.mlx_array_new_data(@constCast(@ptrCast(&bv)), &bsh, 2, mlx.mlx_dtype.float32);
+    defer _ = mlx.mlx_array_free(aarr);
+    defer _ = mlx.mlx_array_free(barr);
+    // One module under the reference's own key shape (ComfyUI writes the
+    // `diffusion_model.` prefix that `parseKey` strips), one under Kohya's.
+    _ = mlx.mlx_map_string_to_array_insert(tmap, "diffusion_model.blocks.3.attn.qkv_proj.lora_A.weight", aarr);
+    _ = mlx.mlx_map_string_to_array_insert(tmap, "diffusion_model.blocks.3.attn.qkv_proj.lora_B.weight", barr);
+    _ = mlx.mlx_map_string_to_array_insert(tmap, "lora_unet_token_refiner_blocks_1_mlp_fc1.lora_down.weight", aarr);
+    _ = mlx.mlx_map_string_to_array_insert(tmap, "lora_unet_token_refiner_blocks_1_mlp_fc1.lora_up.weight", barr);
+    const mmap = mlx.mlx_map_string_to_string_new();
+    defer _ = mlx.mlx_map_string_to_string_free(mmap);
+    const pathz = try a.dupeSentinel(u8, path, 0);
+    defer a.free(pathz);
+    try mlx.check(mlx.mlx_save_safetensors(pathz, tmap, mmap));
+
+    var file = try lora_mod.loadFile(a, path, .minimax_h3);
+    defer file.deinit();
+    // Both spell modules `attachLoras` actually queries.
+    try testing.expect(file.find("blocks.3.attn.qkv_proj") != null);
+    try testing.expect(file.find("token_refiner.blocks.1.mlp.fc1") != null);
+    // No stray entries under the raw file spellings.
+    try testing.expect(file.find("blocks_3_attn_qkv_proj") == null);
+    try testing.expectEqual(@as(usize, 2), file.entries.len);
+}
+
+test "minimax h3: turbo lora — runtime bypass equals a W_eff-folded forward" {
+    // The contract the reference node states: bypass output == the forward of
+    // a base whose weight is W + B@A. In our dense pre-transposed layout the
+    // fold is simply w_eff = w + Aᵀ@Bᵀ, so the toy fixture gives an exact
+    // W_eff oracle we can execute (the full DiT reference cannot run here).
+    // Not bit-identical — (x@Aᵀ)@Bᵀ vs x@(Aᵀ@Bᵀ) associate differently — so
+    // the bar is cosine + rms ratio (a cosine alone cannot see a scale error).
+    const a = testing.allocator;
+    const s = mlx.gpuStream();
+    const f32t = mlx.mlx_dtype.float32;
+
+    var w = model_mod.loadWeightsSingleFile(a, "src/fixtures/minimax_h3_dit.safetensors") catch |e| {
+        std.debug.print("skip: fixture unreadable ({any})\n", .{e});
+        return error.SkipZigTest;
+    };
+    defer w.deinit();
+    const cfg = Config{
+        .hidden_size = 256,
+        .num_attention_heads = 4,
+        .attention_head_dim = 32,
+        .ffn_hidden_size = 128,
+        .time_embed_dim = 32,
+        .timestep_input_dim = 32,
+        .rope_inv_freq_len = 4,
+    };
+
+    const mk = struct {
+        // Deterministic small factors in the STORED (pre-transposed) form;
+        // the loader's transpose is pinned by the naming test above.
+        fn pair(alloc: std.mem.Allocator, in: usize, out: usize, r: usize, seed: u32) !lora_mod.Ref {
+            return .{
+                .at = try fill(alloc, in, r, seed),
+                .bt = try fill(alloc, r, out, seed +% 17),
+                .scale = 1.0,
+            };
+        }
+        fn fill(alloc: std.mem.Allocator, rows: usize, cols: usize, seed: u32) !mlx.mlx_array {
+            const buf = try alloc.alloc(f32, rows * cols);
+            defer alloc.free(buf);
+            var state: u32 = seed;
+            for (buf) |*v| {
+                state = state *% 1664525 +% 1013904223;
+                v.* = (@as(f32, @floatFromInt(state >> 8)) / 16777216.0 - 0.5) * 0.1;
+            }
+            const shp = [_]c_int{ @intCast(rows), @intCast(cols) };
+            return mlx.mlx_array_new_data(buf.ptr, &shp, 2, mlx.mlx_dtype.float32);
+        }
+        fn fold(lin: *MfLinear, p: lora_mod.Ref, st: S) !void {
+            std.debug.assert(!lin.quantized); // toy fixture is dense f32
+            var delta = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(delta);
+            try mlx.check(mlx.mlx_matmul(&delta, p.at, p.bt, st));
+            const neww = try addA(lin.w, delta, st);
+            _ = mlx.mlx_array_free(lin.w);
+            lin.w = neww;
+        }
+    };
+
+    var attn = try AttnW.load(&w, a, "attn", cfg, f32t, s);
+    defer attn.deinit();
+    var attn_folded = try AttnW.load(&w, a, "attn", cfg, f32t, s);
+    defer attn_folded.deinit();
+    var mlp_l = try MlpW.load(&w, a, "mlp", cfg, f32t, s);
+    defer mlp_l.deinit();
+    var mlp_folded = try MlpW.load(&w, a, "mlp", cfg, f32t, s);
+    defer mlp_folded.deinit();
+
+    const inner = cfg.innerDim(); // 128
+    // Refs are non-owning in production (the Stack owns the arrays); here the
+    // test owns them and frees them at the end.
+    var refs: [4]lora_mod.Ref = .{
+        try mk.pair(a, cfg.hidden_size, 3 * inner, 4, 1),
+        try mk.pair(a, inner, cfg.hidden_size, 4, 2),
+        try mk.pair(a, cfg.hidden_size, 2 * cfg.ffn_hidden_size, 4, 3),
+        try mk.pair(a, cfg.ffn_hidden_size, cfg.hidden_size, 4, 4),
+    };
+    defer for (&refs) |*r| {
+        _ = mlx.mlx_array_free(r.at);
+        _ = mlx.mlx_array_free(r.bt);
+    };
+    attn.qkv_lora.set(refs[0..1]);
+    attn.out_lora.set(refs[1..2]);
+    mlp_l.fc1_lora.set(refs[2..3]);
+    mlp_l.fc2_lora.set(refs[3..4]);
+    try mk.fold(&attn_folded.qkv, refs[0], s);
+    try mk.fold(&attn_folded.out, refs[1], s);
+    try mk.fold(&mlp_folded.fc1, refs[2], s);
+    try mk.fold(&mlp_folded.fc2, refs[3], s);
+
+    const x = try ownWeight(&w, "x.attn_in");
+    defer _ = mlx.mlx_array_free(x);
+
+    inline for (.{ "attn", "mlp" }) |which| {
+        const got = if (comptime std.mem.eql(u8, which, "attn"))
+            try attnForward(&attn, x, cfg, null, .none, null, s)
+        else
+            try mlpForward(&mlp_l, x, s);
+        defer _ = mlx.mlx_array_free(got);
+        const want = if (comptime std.mem.eql(u8, which, "attn"))
+            try attnForward(&attn_folded, x, cfg, null, .none, null, s)
+        else
+            try mlpForward(&mlp_folded, x, s);
+        defer _ = mlx.mlx_array_free(want);
+
+        const cos_v = try cosineSim(got, want, s);
+        try testing.expect(std.math.isFinite(cos_v)); // finiteness BEFORE the diff
+        if (cos_v < 0.99999) std.debug.print("{s} lora bypass-vs-fold cos={d:.7}\n", .{ which, cos_v });
+        try testing.expect(cos_v > 0.99999);
+        const rg = try meanAbs(got, s);
+        const rw = try meanAbs(want, s);
+        try testing.expect(std.math.isFinite(rg) and std.math.isFinite(rw) and rw > 0);
+        const ratio = rg / rw;
+        if (ratio < 0.999 or ratio > 1.001) std.debug.print("{s} lora rms ratio={d:.6}\n", .{ which, ratio });
+        try testing.expect(ratio > 0.999 and ratio < 1.001);
+    }
 }
