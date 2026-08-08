@@ -52,18 +52,27 @@ curl -s "http://127.0.0.1:$PORT/v1/models" | grep -q '"video"' \
   || { echo "FAIL: /v1/models missing video capability"; rc=1; }
 # The NUMBER is the assertion, not the line: the line printed happily while
 # the stub's modality-static model_type routed the bill to the 64.5 GB sum.
+# The three stages are DISJOINT (TE freed before the DiT loads, DiT freed
+# before the VAEs), and the DiT sheds its AdaLN weights, so the 8-bit pack's
+# bill is max(TE 26.28, DiT 32.83x0.65 + turbo 0.73 + 6 activations) = 28.06 —
+# against a 64.5 GB sum and the 38.97 this used to read.
 PEAK=$(grep -m1 "media peak" "$LOG" | sed -E 's/.*media peak ~([0-9.]+) GB.*/\1/')
-if [ -n "$PEAK" ] && python3 -c "import sys; sys.exit(0 if 30.0 < float('$PEAK') < 50.0 else 1)"; then
-  echo "PASS: media preflight billed the staged peak (~$PEAK GB, not the ~64.5 sum)"
+if [ -n "$PEAK" ] && python3 -c "import sys; sys.exit(0 if 24.0 < float('$PEAK') < 32.0 else 1)"; then
+  echo "PASS: media preflight billed the biggest stage (~$PEAK GB, not the ~64.5 sum)"
 else
-  echo "FAIL: media preflight peak '$PEAK' GB is not the staged max(TE,DiT)+VAEs"; rc=1
+  echo "FAIL: media preflight peak '$PEAK' GB is not the staged bill"; rc=1
 fi
 
 # [2] the named-400 surface — all cheap, so they run before any generation
 code=$(curl -s -X POST "http://127.0.0.1:$PORT/v1/video/generations" -H 'Content-Type: application/json' \
   -d '{"prompt":"x","lora_path":"/tmp/nope.safetensors"}' -o /tmp/h3_lora.json -w "%{http_code}")
-if [ "$code" = "400" ] && grep -q "LoRA" /tmp/h3_lora.json; then
-  echo "PASS: lora_path -> named 400"
+# H3 takes stacked LoRAs since 4ffc69b, so the assertion is no longer "the
+# backend cannot honor this field" — it is that an unusable PATH is a named 400
+# that says which field, checked BEFORE the DiT loads (its own loadFile check
+# is reached minutes too late for a 400). This arm had asserted the old wording
+# and been failing since stacked LoRAs shipped.
+if [ "$code" = "400" ] && grep -q "lora_path" /tmp/h3_lora.json; then
+  echo "PASS: unreadable lora_path -> named 400 naming the field"
 else
   echo "FAIL: lora_path returned $code ($(head -c 120 /tmp/h3_lora.json))"; rc=1
 fi
@@ -117,6 +126,23 @@ assert abs(adur - vdur) < 0.06, f"audio {adur:.3f}s vs video {vdur:.3f}s"
 print(f"PASS: generation -> {F}f {W}x{H} rgb8 range {lo}..{hi}, audio {adur:.3f}s @{sr}Hz stereo")
 PY
   [ $? -eq 0 ] || rc=1
+fi
+
+# The staged bill above is a claim about a runtime nobody can check unless each
+# stage reports what it actually held — the DiT term was 12 GiB wrong for months
+# with only the DiT's own line to catch it. Both stages log, and the DiT's must
+# land BELOW its file size (precomputeAdaln frees the AdaLN weights).
+DITR=$(grep -m1 "dit resident" "$LOG" | sed -E 's/.*dit resident: ([0-9.]+) GB.*/\1/')
+if grep -q "encoder resident" "$LOG" && [ -n "$DITR" ]; then
+  echo "PASS: both staged loads report their residency (dit ${DITR} GB)"
+else
+  echo "FAIL: a stage bill with no residency line is uncheckable"; rc=1
+fi
+DITFILE=$(python3 -c "import os;print(f\"{os.path.getsize('$MODEL/transformer.safetensors')/1024**3:.2f}\")" 2>/dev/null)
+if [ -n "$DITR" ] && [ -n "$DITFILE" ] && python3 -c "import sys; sys.exit(0 if float('$DITR') < float('$DITFILE') else 1)"; then
+  echo "PASS: DiT settles below its file size (${DITR} < ${DITFILE} GB) — the bill's 65% is real"
+else
+  echo "FAIL: DiT resident ${DITR} GB vs file ${DITFILE} GB — the shed AdaLN weights are still there"; rc=1
 fi
 
 # [4] frame-count snapping is honest: 40 requested must come back 56 (17k+5),

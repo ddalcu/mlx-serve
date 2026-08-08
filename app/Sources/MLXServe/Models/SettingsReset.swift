@@ -52,6 +52,7 @@ enum SettingsReset {
                 f("apiKey") { $0.apiKey = $1.apiKey },
                 f("toolAutocorrect") { $0.toolAutocorrect = $1.toolAutocorrect },
                 f("skipMemPreflight") { $0.skipMemPreflight = $1.skipMemPreflight },
+                f("maxResidentMemGB") { $0.maxResidentMemGB = $1.maxResidentMemGB },
             ]
 
         case .lanSharing:

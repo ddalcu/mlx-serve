@@ -1003,6 +1003,22 @@ private struct ServerSectionContent: View {
                     .toggleStyle(.switch)
             }
         }
+        if let m = meta["maxResidentMemGB"] {
+            SettingsRow(
+                title: m.title,
+                explainer: m.explainer,
+                isDirty: dirty.dirty(\.maxResidentMemGB)
+            ) {
+                let gb = appState.serverOptions.maxResidentMemGB
+                snappingSlider(
+                    presets: ServerOptions.residentMemPresets(
+                        physicalMemoryBytes: ProcessInfo.processInfo.physicalMemory),
+                    current: gb,
+                    set: { appState.serverOptions.maxResidentMemGB = $0 },
+                    label: gb == 0 ? "Auto" : "\(gb) GB"
+                )
+            }
+        }
         if let m = meta["skipMemPreflight"] {
             SettingsRow(
                 title: m.title,
@@ -1924,48 +1940,6 @@ private struct RequestDefaultsSectionContent: View {
         }
     }
 
-    /// Build a snapping slider over a discrete preset list. The slider's float
-    /// value is the index into `presets`; rounding pins to the nearest entry.
-    /// `label` is the textual readout shown next to the slider.
-    @ViewBuilder
-    private func snappingSlider(
-        presets: [Int],
-        current: Int,
-        set: @escaping (Int) -> Void,
-        label: String
-    ) -> some View {
-        let safePresets = presets.isEmpty ? [0] : presets
-        let currentIdx = Self.closestIndex(in: safePresets, to: current)
-        HStack(spacing: 8) {
-            Slider(
-                value: Binding(
-                    get: { Double(currentIdx) },
-                    set: { raw in
-                        let i = Int(raw.rounded())
-                        let clamped = max(0, min(i, safePresets.count - 1))
-                        set(safePresets[clamped])
-                    }
-                ),
-                in: 0...Double(max(1, safePresets.count - 1)),
-                step: 1
-            )
-            .frame(width: 200)
-            Text(label)
-                .font(.body.monospacedDigit())
-                .frame(minWidth: 70, alignment: .trailing)
-        }
-    }
-
-    /// Find the index of the preset closest to `value`, so a stored value not
-    /// on the snap grid still positions the slider sensibly.
-    private static func closestIndex(in presets: [Int], to value: Int) -> Int {
-        if let exact = presets.firstIndex(of: value) { return exact }
-        var best = 0
-        for i in 1..<presets.count where abs(presets[i] - value) < abs(presets[best] - value) {
-            best = i
-        }
-        return best
-    }
 }
 
 // MARK: - Voice (wake phrase) section
@@ -2604,4 +2578,51 @@ private struct UpdatesSectionContent: View {
             return "Releases are published at github.com/\(UpdateChecker.repo)/releases."
         }
     }
+}
+
+// MARK: - Shared numeric control
+
+/// A slider that snaps to a discrete preset list — the float value is the index
+/// into `presets`, rounding pins to the nearest entry. Shared: a setting whose
+/// useful values are a ladder (memory caps, token budgets) reads better as this
+/// than as a free-text field, and a value picked off a ladder cannot be a typo
+/// the launcher has to defend against.
+@ViewBuilder
+private func snappingSlider(
+    presets: [Int],
+    current: Int,
+    set: @escaping (Int) -> Void,
+    label: String
+) -> some View {
+    let safePresets = presets.isEmpty ? [0] : presets
+    let currentIdx = closestPresetIndex(in: safePresets, to: current)
+    HStack(spacing: 8) {
+        Slider(
+            value: Binding(
+                get: { Double(currentIdx) },
+                set: { raw in
+                    let i = Int(raw.rounded())
+                    let clamped = max(0, min(i, safePresets.count - 1))
+                    set(safePresets[clamped])
+                }
+            ),
+            in: 0...Double(max(1, safePresets.count - 1)),
+            step: 1
+        )
+        .frame(width: 200)
+        Text(label)
+            .font(.body.monospacedDigit())
+            .frame(minWidth: 70, alignment: .trailing)
+    }
+}
+
+/// Index of the preset closest to `value`, so a stored value not on the snap
+/// grid still positions the slider sensibly.
+private func closestPresetIndex(in presets: [Int], to value: Int) -> Int {
+    if let exact = presets.firstIndex(of: value) { return exact }
+    var best = 0
+    for i in 1..<presets.count where abs(presets[i] - value) < abs(presets[best] - value) {
+        best = i
+    }
+    return best
 }

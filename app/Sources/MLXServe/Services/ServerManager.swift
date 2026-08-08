@@ -263,6 +263,27 @@ class ServerManager: ObservableObject {
         }
     }
 
+    /// The server is a CHILD PROCESS, so quitting the app has to signal it or
+    /// it survives with the whole model resident (#133: ⌘Q and the Quit menu
+    /// left `mlx-serve` holding gigabytes; the tray's power button was the only
+    /// path that worked, because it was the only one calling `stop()` first).
+    /// The teardown belongs here rather than on a button or in the app
+    /// delegate: this object spawned the process, and there is exactly one of
+    /// it, so every quit route is covered by construction.
+    ///
+    /// `queue: nil` on purpose — delivered synchronously on the posting thread
+    /// (AppKit posts this on the main one). `.main` would ENQUEUE the teardown
+    /// for a runloop turn that, during termination, may never come.
+    init() {
+        quitObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.willTerminateNotification, object: nil, queue: nil
+        ) { [weak self] _ in
+            MainActor.assumeIsolated { self?.stop() }
+        }
+    }
+
+    private var quitObserver: NSObjectProtocol?
+
     func stop() {
         pollSource?.cancel()
         pollSource = nil
@@ -782,7 +803,12 @@ class ServerManager: ObservableObject {
         return "mlx-serve"
     }
 
+    /// Note this never runs at app exit — a `@StateObject` is not deallocated
+    /// on termination, the process simply goes away. That is why killing the
+    /// child on quit rides `willTerminateNotification` (see `init`) and not
+    /// this; deinit only covers a ServerManager that is genuinely discarded.
     deinit {
+        if let o = quitObserver { NotificationCenter.default.removeObserver(o) }
         pollSource?.cancel()
         healthTask?.cancel()
         healthTimer?.invalidate()

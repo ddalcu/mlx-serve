@@ -1926,8 +1926,8 @@ pub fn handleImage(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: 
 
     const want_stream = sse.bodyWantsTrue(body, "stream");
     log.info("[image] generating {d}x{d} steps={d} stream={}: {d} chars\n", .{ width, height, steps, want_stream, prompt.len });
-    var sctx = sse.StreamCtx{ .conn = conn };
-    const prog: ?sse.Progress = if (want_stream) sctx.progress() else null;
+    var sctx = sse.StreamCtx{ .conn = conn, .stream = want_stream };
+    const prog: ?sse.Progress = sctx.progress();
     if (want_stream) try conn.writeAll(sse.headers);
 
     const gen_opts = ImageGenOpts{
@@ -2055,8 +2055,8 @@ pub fn handleAudio(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
 
     const want_stream = sse.bodyWantsTrue(body, "stream");
     log.info("[audio] synthesizing {d} chars stream={} clone={}\n", .{ text.len, want_stream, ref_samples != null });
-    var sctx = sse.StreamCtx{ .conn = conn };
-    const prog: ?sse.Progress = if (want_stream) sctx.progress() else null;
+    var sctx = sse.StreamCtx{ .conn = conn, .stream = want_stream };
+    const prog: ?sse.Progress = sctx.progress();
     if (want_stream) try conn.writeAll(sse.headers);
 
     const wav = synth.synthesizeWav(text, 2048, prog, ref_samples) catch |err| {
@@ -2204,8 +2204,8 @@ pub fn handleMusic(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
 
     const want_stream = sse.bodyWantsTrue(body, "stream");
     log.info("[music] generating {d}s seed={d} lyrics={d}ch stream={}\n", .{ duration, seed, lyrics.len, want_stream });
-    var sctx = sse.StreamCtx{ .conn = conn };
-    const prog: ?sse.Progress = if (want_stream) sctx.progress() else null;
+    var sctx = sse.StreamCtx{ .conn = conn, .stream = want_stream };
+    const prog: ?sse.Progress = sctx.progress();
     if (want_stream) try conn.writeAll(sse.headers);
 
     const req = acestep.MusicRequest{
@@ -2834,9 +2834,13 @@ fn handleVideoH3(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []
     }
 
     // Generations here run for MINUTES, so a silent socket is indistinguishable
-    // from a wedged server; the client drives its meter off these events.
-    var sctx = sse.StreamCtx{ .conn = conn };
-    const prog: ?sse.Progress = if (want_stream) sctx.progress() else null;
+    // from a wedged server; the client drives its meter off these events. The
+    // progress sink is handed over on BOTH paths — a non-streaming request
+    // emits nothing but still gets the disconnect probe, or a client that gives
+    // up (or times out: a 1344x768 clip outlasts most default timeouts) leaves
+    // the GPU running to the end with every queued request behind it.
+    var sctx = sse.StreamCtx{ .conn = conn, .stream = want_stream };
+    const prog: ?sse.Progress = sctx.progress();
     if (want_stream) try conn.writeAll(sse.headers);
 
     const paths = try engine.paths(allocator);
@@ -2863,6 +2867,12 @@ fn handleVideoH3(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []
         .keyframes = keyframes_buf[0..n_kf],
         .refs = refs.items,
     }, prog, mlx.gpuStream()) catch |e| {
+        // Client hung up mid-generation — there is nobody to answer, and
+        // saying "generation failed" would be a lie about a job we stopped.
+        if (e == error.Cancelled) {
+            log.info("[video] generation cancelled — client disconnected\n", .{});
+            return;
+        }
         // The LoRA failures are the user's to fix and each has a distinct
         // remedy, so they are named 400s rather than one opaque 500 — the
         // whole reason a wrong-architecture adapter is worth detecting at all.
@@ -3045,8 +3055,8 @@ fn handleVideoLtx(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: [
         }
     }
 
-    var sctx = sse.StreamCtx{ .conn = conn };
-    const prog: ?ltx.Progress = if (want_stream) sctx.progress() else null;
+    var sctx = sse.StreamCtx{ .conn = conn, .stream = want_stream };
+    const prog: ?ltx.Progress = sctx.progress();
     if (want_stream) try conn.writeAll(sse.headers);
 
     var frames = switch (pipeline) {
@@ -3213,8 +3223,8 @@ pub fn handleMesh(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, e
 
     const want_stream = sse.bodyWantsTrue(body, "stream");
     log.info("[mesh] generating steps={d} res={d} guidance={d:.1} seed={d} texture={} stream={} from {d}x{d} image\n", .{ steps, res, guidance, seed, want_texture, want_stream, img.w, img.h });
-    var sctx = sse.StreamCtx{ .conn = conn };
-    const prog: ?sse.Progress = if (want_stream) sctx.progress() else null;
+    var sctx = sse.StreamCtx{ .conn = conn, .stream = want_stream };
+    const prog: ?sse.Progress = sctx.progress();
     if (want_stream) try conn.writeAll(sse.headers);
 
     const opts = hy3d.MeshOpts{ .steps = steps, .guidance = guidance, .seed = seed, .octree_resolution = res };
@@ -3380,13 +3390,89 @@ fn sumSafetensorsIn(io: std.Io, dir: std.Io.Dir) u64 {
     return total;
 }
 
-/// MiniMax-H3's staged residency plan, as a bill: `minimax_h3.generate` loads
-/// the text encoder, runs it and FREES it before the DiT loads, so the two
-/// never coexist and the load peak is max(TE, DiT). The VAEs load after the
-/// DiT is released but are billed ADDITIVELY as the direction-safe margin for
-/// decode-phase activations — an under-bill here is an uncatchable Metal OOM.
-pub fn h3PeakBytes(te: u64, dit: u64, video_vae: u64, audio_vae: u64) u64 {
-    return @max(te, dit) + video_vae + audio_vae;
+/// Peak resident bytes for a backend whose parts do NOT all coexist.
+/// `resident` is what the engine holds for its whole lifetime; `stages` are
+/// DISJOINT — each is loaded, used and released before the next runs, so only
+/// the biggest is ever on top of `resident`. A stage that GENERATES carries its
+/// own transients inside its number, because they are not uniform across stages
+/// (a text-encoder pass over a few hundred rows allocates nothing like a
+/// 124-frame denoise).
+///
+/// Sum-of-directory is what a backend gets when it declares no plan, and it is
+/// the RIGHT answer for the resident-engine backends (krea, mage_flow,
+/// hunyuan3d, acestep, tts all hold text-encoder + DiT + VAE on one struct for
+/// the engine's lifetime). It goes wrong in BOTH directions the moment a
+/// backend loads something it later frees, or reads weights from outside its
+/// own directory — see `ltxPeakBytes` for one backend doing each.
+pub fn stagedPeakBytes(resident: u64, stages: []const u64) u64 {
+    var biggest: u64 = 0;
+    for (stages) |st| biggest = @max(biggest, st);
+    return resident + biggest;
+}
+
+/// LTX's plan. Its engine is RESIDENT (transformer + connector + VAEs + audio
+/// stay on `LtxVideoEngine` for its lifetime), with two corrections the
+/// directory sum cannot make:
+///
+///   `spare_transformer` — packs ship `transformer-dev` AND
+///   `transformer-distilled` (~10.5 GiB each) and `ensureTransformer` frees one
+///   BEFORE loading the other, precisely so they never coexist. The sum bills a
+///   phantom.
+///
+///   `text_encoder` — the Gemma encoder is a SEPARATE shared repo, loaded by
+///   `ltx_video.gemmaCapture` per generation and freed when it returns. Being
+///   outside the model dir, the sum bills 7.5 GiB at zero, and it is resident
+///   on top of the whole engine while it runs.
+///
+/// No activation term: nothing has been measured for this backend, and
+/// inventing one would newly refuse loads that work today.
+pub fn ltxPeakBytes(dir_sum: u64, spare_transformer: u64, text_encoder: u64) u64 {
+    return stagedPeakBytes(dir_sum -| spare_transformer, &.{text_encoder});
+}
+
+/// Percent of `transformer.safetensors` still resident once `precomputeAdaln`
+/// has tabled and FREED the 13B modulation weights (~39% of the DiT's
+/// parameters, so the share barely moves with quant width). Measured 0.615 on
+/// the 8-bit pack (32.83 → 20.19 GiB) and 0.623 on the 4-bit (17.41 → 10.84);
+/// billed at 0.65 so a pack whose AdaLN share is smaller than ours still fails
+/// safe.
+pub const H3_DIT_RESIDENT_PCT: u64 = 65;
+
+/// Transients the two GENERATING stages carry on top of their weights: the
+/// packed [text|cond|audio|video] sequence's activations while sampling, and
+/// the VAE decode's frame buffers. Measured 4.0-5.0 GiB at 768x448 / 124f
+/// (process peak minus self-reported DiT residency, both packs); billed at 6.
+/// It scales with pixels x frames, which a per-MODEL load gate cannot see —
+/// bounding a specific request is not something this estimator can do, and
+/// the old formula's incidental margin was the same order.
+///
+/// The TEXT-ENCODER stage gets none of it: that is one forward over a few
+/// hundred prompt rows, so a shared "+ activations" on the max of all three
+/// stages bills the biggest stage for transients it never allocates — which
+/// is what refused the 8-bit pack on every Mac under ~96 GB.
+pub const H3_ACTIVATION_BYTES: u64 = 6 * 1024 * 1024 * 1024;
+
+/// The DiT term of the H3 bill. `precompute` mirrors
+/// MINIMAX_H3_ADALN_PRECOMPUTE: with it off the modulation weights are never
+/// freed and the whole file stays resident, so the shed size would under-bill
+/// by ~12 GiB into an uncatchable Metal OOM.
+pub fn h3DitResidentBytes(dit_file: u64, precompute: bool) u64 {
+    if (!precompute) return dit_file;
+    return dit_file * H3_DIT_RESIDENT_PCT / 100;
+}
+
+/// MiniMax-H3's staged residency plan, as a bill. `minimax_h3.generate` runs
+/// three DISJOINT stages: the text encoder is loaded, run and FREED before the
+/// DiT loads (`Model.load` is scoped), and the DiT is released before the VAEs
+/// load — so the peak is the BIGGEST stage, never a sum. The two VAEs are one
+/// stage: the video decoder is still resident when the audio one loads.
+/// `dit_resident` is post-AdaLN-precompute (`h3DitResidentBytes`), which the
+/// file size overstates by ~39%.
+pub fn h3PeakBytes(te: u64, dit_resident: u64, video_vae: u64, audio_vae: u64) u64 {
+    const vaes = video_vae + audio_vae;
+    const generating = @max(dit_resident, vaes);
+    if (te == 0 and generating == 0) return 0; // unknown dir → never block
+    return stagedPeakBytes(0, &.{ te, generating + H3_ACTIVATION_BYTES });
 }
 
 /// Per-backend generation-peak estimate for the media load preflight. A
@@ -3394,31 +3480,77 @@ pub fn h3PeakBytes(te: u64, dit: u64, video_vae: u64, audio_vae: u64) u64 {
 /// keeps the sum-of-safetensors default — over-billing fails safe (a refused
 /// load names its numbers), under-billing kills the process mid-request.
 pub fn estimatePeakResidentBytesIn(io: std.Io, dir: std.Io.Dir, model_type: []const u8) u64 {
+    const sz = struct {
+        fn f(io_: std.Io, d: std.Io.Dir, name: []const u8) u64 {
+            const st = d.statFile(io_, name, .{}) catch return 0;
+            return @intCast(st.size);
+        }
+    }.f;
     if (std.mem.eql(u8, model_type, "minimax_h3")) {
-        const sz = struct {
-            fn f(io_: std.Io, d: std.Io.Dir, name: []const u8) u64 {
-                const st = d.statFile(io_, name, .{}) catch return 0;
-                return @intCast(st.size);
-            }
-        }.f;
         // The Turbo LoRA (when the pack ships one) is resident ALONGSIDE the
-        // DiT, so it rides the DiT term — billed whenever present, since the
-        // gate estimate is per-model, not per-request.
+        // DiT and precompute does not free it, so it rides the DiT term at
+        // full size — billed whenever present, since the gate estimate is
+        // per-model, not per-request.
+        const dit = h3DitResidentBytes(
+            sz(io, dir, "transformer.safetensors"),
+            minimax_h3.adalnPrecomputeOn(),
+        ) + sz(io, dir, "turbo_lora.safetensors");
         return h3PeakBytes(
             sz(io, dir, "text_encoder.safetensors"),
-            sz(io, dir, "transformer.safetensors") + sz(io, dir, "turbo_lora.safetensors"),
+            dit,
             sz(io, dir, "video_vae.safetensors"),
             sz(io, dir, "audio_vae.safetensors"),
         );
     }
+    if (std.mem.eql(u8, model_type, "AudioVideo")) {
+        // Both variants ship; only one is ever loaded. Subtract the smaller so
+        // an asymmetric future pack still bills its larger one.
+        const spare = @min(
+            sz(io, dir, "transformer-dev.safetensors"),
+            sz(io, dir, "transformer-distilled.safetensors"),
+        );
+        return ltxPeakBytes(sumSafetensorsIn(io, dir), spare, 0);
+    }
     return sumSafetensorsIn(io, dir);
+}
+
+/// Sum of the `.safetensors` under an absolute path, or 0 if it is not
+/// readable — 0 means "unknown", which every caller treats as "do not block".
+fn sumSafetensorsAt(io: std.Io, path: []const u8) u64 {
+    if (path.len == 0 or path[0] != '/') return 0; // openDirAbsolute UB class
+    var d = std.Io.Dir.openDirAbsolute(io, path, .{ .iterate = true }) catch return 0;
+    defer d.close(io);
+    return sumSafetensorsIn(io, d);
+}
+
+/// LTX's text encoder, resolved the way `resolveGemmaDir` does but without an
+/// allocator (this runs inside the load gate). Absent → 0.
+fn ltxTextEncoderBytes(io: std.Io) u64 {
+    var buf: [1024]u8 = undefined;
+    if (std.c.getenv("LTX_GEMMA_DIR")) |env| {
+        const e = std.mem.span(env);
+        if (std.fs.path.isAbsolute(e)) return sumSafetensorsAt(io, e);
+    }
+    const home = std.mem.span(std.c.getenv("HOME") orelse return 0);
+    for ([_][]const u8{ LTX_GEMMA_REPO_DIR, "gemma-3-12b-it-4bit" }) |rel| {
+        const p = std.fmt.bufPrint(&buf, "{s}/.mlx-serve/models/{s}", .{ home, rel }) catch continue;
+        const n = sumSafetensorsAt(io, p);
+        if (n > 0) return n;
+    }
+    return 0;
 }
 
 pub fn estimatePeakResidentBytes(io: std.Io, model_dir: []const u8, model_type: []const u8) u64 {
     if (model_dir.len == 0 or model_dir[0] != '/') return 0; // openDirAbsolute UB class
     var dir = std.Io.Dir.openDirAbsolute(io, model_dir, .{ .iterate = true }) catch return 0;
     defer dir.close(io);
-    return estimatePeakResidentBytesIn(io, dir, model_type);
+    const in_dir = estimatePeakResidentBytesIn(io, dir, model_type);
+    // LTX reads its text encoder from a DIFFERENT repo, so it is a stage the
+    // model dir cannot see. Every other backend's weights are all in its own
+    // directory; if that stops being true, it belongs here beside this one.
+    if (in_dir > 0 and std.mem.eql(u8, model_type, "AudioVideo"))
+        return stagedPeakBytes(in_dir, &.{ltxTextEncoderBytes(io)});
+    return in_dir;
 }
 
 // ── HTTP response helpers (self-contained; mirror the old *_server.zig) ──
@@ -4648,15 +4780,79 @@ test "media model types: discovery and modality dispatch agree" {
     }
 }
 
-test "h3 staged-residency peak bills max(TE,DiT)+VAEs, never their sum" {
+test "stagedPeakBytes: disjoint stages never sum, and resident always carries" {
     const GB: u64 = 1024 * 1024 * 1024;
-    // The TE is loaded, run and FREED before the DiT loads — they never
-    // coexist, so billing their sum refuses a 48 GB Mac that would work.
-    try std.testing.expectEqual(41 * GB, h3PeakBytes(28 * GB, 35 * GB, 5 * GB, 1 * GB));
-    // Whichever staged component is larger sets the peak.
-    try std.testing.expectEqual(54 * GB, h3PeakBytes(48 * GB, 35 * GB, 5 * GB, 1 * GB));
+    // The whole point: stages are loaded and freed in turn, so only the
+    // biggest is ever on top of what the engine holds for its lifetime.
+    try std.testing.expectEqual(12 * GB, stagedPeakBytes(4 * GB, &.{ 8 * GB, 3 * GB, 1 * GB }));
+    try std.testing.expectEqual(4 * GB, stagedPeakBytes(4 * GB, &.{}));
+    try std.testing.expectEqual(8 * GB, stagedPeakBytes(0, &.{ 8 * GB, 3 * GB }));
+    // Nothing known → 0, which the preflight reads as "unknown, never block".
+    try std.testing.expectEqual(@as(u64, 0), stagedPeakBytes(0, &.{ 0, 0 }));
+}
+
+test "LTX bills ONE transformer variant, plus the text encoder its dir cannot see" {
+    const MB: u64 = 1024 * 1024;
+    // Real dgrauet/ltx-2.3-mlx-q4 sizes. Both transformer variants ship at
+    // 10.54 GiB and `ensureTransformer` frees one BEFORE loading the other, so
+    // the sum bills a phantom. The Gemma text encoder is a SEPARATE repo
+    // (mlx-community/gemma-3-12b-it-4bit, 7.5 GiB) loaded per generation on top
+    // of the resident engine, so the dir sum bills it at zero.
+    const dir_sum: u64 = 30_318 * MB; // all eight files
+    const variant: u64 = 10_793 * MB;
+    const gemma: u64 = 7_680 * MB;
+
+    const peak = ltxPeakBytes(dir_sum, variant, gemma);
+    try std.testing.expectEqual(dir_sum - variant + gemma, peak);
+    // Strictly below the sum-of-dir bill it replaces on a two-variant pack…
+    try std.testing.expect(peak < dir_sum + dir_sum / 10);
+    // …but a one-variant pack must go UP, not down: the text encoder is real
+    // and was billed at nothing. Under-billing is the uncatchable-OOM side.
+    try std.testing.expect(ltxPeakBytes(dir_sum - variant, 0, gemma) > dir_sum - variant);
+    // A missing/unfound encoder dir contributes nothing rather than guessing.
+    try std.testing.expectEqual(dir_sum - variant, ltxPeakBytes(dir_sum, variant, 0));
+}
+
+test "h3 staged-residency peak bills the BIGGEST stage, never a sum of disjoint ones" {
+    const GB: u64 = 1024 * 1024 * 1024;
+    const act = H3_ACTIVATION_BYTES;
+    // Three disjoint stages: the TE is freed before the DiT loads, the DiT is
+    // freed before the VAEs load. Billing any two together refuses a Mac that
+    // would work — the VAEs used to be added to the DiT term.
+    try std.testing.expectEqual(35 * GB + act, h3PeakBytes(28 * GB, 35 * GB, 5 * GB, 1 * GB));
+    // The two VAEs DO coexist (the video decoder is still resident when the
+    // audio one loads), so they are one stage.
+    try std.testing.expectEqual(9 * GB + act, h3PeakBytes(4 * GB, 3 * GB, 5 * GB, 4 * GB));
+    // The TE stage carries no generation transients — one forward over a few
+    // hundred prompt rows. Adding them to it is what refused the 8-bit pack.
+    try std.testing.expectEqual(48 * GB, h3PeakBytes(48 * GB, 35 * GB, 5 * GB, 1 * GB));
     // All-unknown must stay 0: the preflight treats 0 as "unknown, never block".
     try std.testing.expectEqual(@as(u64, 0), h3PeakBytes(0, 0, 0, 0));
+
+    // The real 8-bit pack on a 48 GB Mac (auto cap 29.95 GiB): 26.28 TE,
+    // 32.83 DiT + 0.73 turbo, 4.85 + 0.56 VAEs. Measured process peak 26 GB.
+    const MB: u64 = 1024 * 1024;
+    const real = h3PeakBytes(
+        26_910 * MB,
+        h3DitResidentBytes(33_618 * MB, true) + 747 * MB,
+        4_966 * MB,
+        573 * MB,
+    );
+    try std.testing.expect(real < 29 * GB); // fits the 48 GB Mac's auto cap
+    try std.testing.expect(real > 24 * GB); // and stays above the measured peak
+}
+
+test "h3 DiT term sheds the AdaLN weights precompute frees — unless it is off" {
+    const GB: u64 = 1024 * 1024 * 1024;
+    // Measured: the 8-bit pack's 32.83 GiB transformer.safetensors settles at
+    // 20.19 GiB resident once precomputeAdaln frees the 13B modulation
+    // weights, so the file size over-bills the DiT by ~12 GiB.
+    const eight_bit: u64 = 32 * GB;
+    try std.testing.expect(h3DitResidentBytes(eight_bit, true) < eight_bit);
+    try std.testing.expect(h3DitResidentBytes(eight_bit, true) >= 20 * GB);
+    // MINIMAX_H3_ADALN_PRECOMPUTE=0 never frees them, so the whole file stays
+    // resident and billing the shed size would be an uncatchable OOM.
+    try std.testing.expectEqual(eight_bit, h3DitResidentBytes(eight_bit, false));
 }
 
 test "estimatePeakResidentBytes: minimax_h3 stages, other types keep the sum" {
@@ -4677,15 +4873,24 @@ test "estimatePeakResidentBytes: minimax_h3 stages, other types keep the sum" {
     // never by the staged estimate.
     try tmp.dir.writeFile(io, .{ .sub_path = "extra.safetensors", .data = &b1000 });
 
-    // H3: max(300, 500) + 120 + 30.
-    try std.testing.expectEqual(@as(u64, 650), estimatePeakResidentBytesIn(io, tmp.dir, "minimax_h3"));
+    // LTX (`AudioVideo`): the dir sum MINUS the transformer variant that never
+    // coexists with the other. Its text encoder lives in a different repo, so
+    // it is added by the outer `estimatePeakResidentBytes`, not here.
+    try tmp.dir.writeFile(io, .{ .sub_path = "transformer-dev.safetensors", .data = &b500 });
+    try tmp.dir.writeFile(io, .{ .sub_path = "transformer-distilled.safetensors", .data = &b500 });
+    try std.testing.expectEqual(@as(u64, 2450), estimatePeakResidentBytesIn(io, tmp.dir, "AudioVideo"));
+    tmp.dir.deleteFile(io, "transformer-dev.safetensors") catch {};
+    tmp.dir.deleteFile(io, "transformer-distilled.safetensors") catch {};
+
+    // H3: max(TE 300, DiT 500*65% + activations, VAEs 120+30 + activations).
+    try std.testing.expectEqual(325 + H3_ACTIVATION_BYTES, estimatePeakResidentBytesIn(io, tmp.dir, "minimax_h3"));
 
     // A pack shipping the Turbo LoRA bills it on the DiT term (it is resident
-    // ALONGSIDE the DiT), whenever present — the gate estimate is per-model,
-    // not per-request, and over-billing 2% fails safe.
+    // ALONGSIDE the DiT and precompute does not free it), whenever present —
+    // the gate estimate is per-model, not per-request.
     const b80: [80]u8 = @splat('x');
     try tmp.dir.writeFile(io, .{ .sub_path = "turbo_lora.safetensors", .data = &b80 });
-    try std.testing.expectEqual(@as(u64, 730), estimatePeakResidentBytesIn(io, tmp.dir, "minimax_h3"));
+    try std.testing.expectEqual(405 + H3_ACTIVATION_BYTES, estimatePeakResidentBytesIn(io, tmp.dir, "minimax_h3"));
     tmp.dir.deleteFile(io, "turbo_lora.safetensors") catch {};
     // Any other media type: the plain sum over the dir (the safe default —
     // a backend without a declared residency plan must not under-bill).

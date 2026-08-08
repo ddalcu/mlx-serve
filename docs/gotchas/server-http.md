@@ -688,3 +688,147 @@ Two things not to do:
 The integration guard checks EVERY response body the script produces rather than
 one crafted request, because which request happens to draw a split candidate
 into its top-5 is luck.
+
+## The H3 residency bill: a staged plan billed as if it were not one (2026-08-07)
+
+Reported as two issues against the app: "MLX Core.app can't reach the workaround"
+and "the staged-peak formula still overcounts, by a lot". Both were right.
+
+The `h3PeakBytes` shipped with #126 was `max(TE, DiT) + video_vae + audio_vae`,
+and its own doc comment admitted the VAE term was not an accounting claim but a
+"direction-safe margin for decode-phase activations". Two overcounts rode on
+that:
+
+1. **The VAEs are billed against the DiT.** `minimax_h3.generate` scopes the DiT
+   in a block that closes before the VAE decode — its own log narrates the whole
+   chain (`encoder released` → `dit resident` → `DiT released` → `video decoded
+   (load+decode)`). The two VAEs DO coexist (the video decoder's `defer` runs at
+   function scope, so it is still resident when the audio VAE loads), which is
+   why they stay one stage.
+
+2. **`transformer.safetensors` is a bad proxy for DiT residency.**
+   `precomputeAdaln` tables the whole schedule's modulation and frees the 13B
+   AdaLN weights — roughly 39% of the DiT's parameters, so the surviving share
+   barely moves with quant width. Measured 32.83 → 20.19 GiB on the 8-bit pack
+   and 17.41 → 10.84 on the 4-bit. The comment right above the call already said
+   "~22 GB instead of ~35"; the estimator two files away had never heard.
+
+On the real 8-bit pack that is 38.97 GiB, ×1.1 = 42.87 against a 48 GB Mac's
+29.95 GiB auto cap, for a process whose measured peak (`footprint --sample 2`,
+768×448/124f) is 26 GB. Refused, permanently, on every Mac under ~96 GB.
+
+### What the fix could NOT be
+
+The obvious replacement — `max(te, dit_resident + lora, vaes)` — drops the only
+slack covering generation transients, which are real: the reporter's own 4-bit
+row shows a 17 GB process peak against 10.84 GiB of DiT weights. Those transients
+scale with pixels × frames (1344×768 is 3× the area of the measured cell), and a
+per-MODEL load gate cannot see a request's shape, so the allowance is a
+judgement call rather than a derivation. What it is NOT is uniform across stages:
+the TE stage is one forward over a few hundred prompt rows. A shared
+`max(stages) + activations` bills the biggest stage for transients it never
+allocates — which, with the TE at 26.28 GiB, is exactly what kept the 8-bit pack
+refused even after the first two fixes.
+
+So: `max(te, max(dit_resident, vaes) + H3_ACTIVATION_BYTES)`, with the allowance
+at 6 GiB against a measured 4.0–5.0.
+
+`h3DitResidentBytes` takes `precompute` as a PARAMETER and the caller reads
+`minimax_h3.adalnPrecomputeOn()` — the same predicate `generate` branches on. A
+bill that assumes the weights are shed while `MINIMAX_H3_ADALN_PRECOMPUTE=0` runs
+the full DiT under-bills by ~12 GiB, and an under-bill here is an uncatchable
+Metal OOM, not a 400.
+
+### The 10% that was double-counted
+
+`gateEstimateBytes` added 10% headroom "for KV / vision / drafter overhead" to
+every bill including a media peak. Those are text-model concepts — a media engine
+has no KV cache and no drafter — and the media estimator now carries an explicit
+transient term of its own. The commit side (`genLoadResidentBytes`) had never
+taken the 10%, so removing it from the gate also makes reserve and commit agree
+exactly, which is what that function's comment always claimed.
+
+Real packs, gate estimate before → after: FL2VA-8bit 42.87 → 28.06 GiB,
+REF2VA-8bit 42.87 → 27.34, FL2VA-4bit 25.11 → 17.32. All three now clear a 48 GB
+Mac's auto cap; the 8-bit bill still sits ~4 GiB above the measured peak.
+
+### Why it was uncheckable
+
+The DiT term was wrong for months because the only number anyone could compare it
+against was the DiT's own `dit resident` log line — added when a weights map
+outliving `Model.load` pinned 13 GB. The TE stage had no such line, so its bill
+(its full file size, still) is now logged the same way. A staged bill whose stages
+do not each report their residency is not auditable, and the audit is the only
+thing that catches this class.
+
+## A cancellation signal that only exists on one response shape (2026-08-07)
+
+Same report: "a disconnected client leaves an orphan job that holds the server
+queue until finished."
+
+`StreamCtx` latched `cancelled` when an SSE progress write FAILED. That is the
+only cancellation media generation ever had, so a non-streaming request — no
+progress writes, nothing to fail — had none. The connection thread is parked in
+`Scheduler.runGeneration` while the job runs on the inference thread, so a client
+that hangs up (or trips its own timeout — a 1344×768 H3 clip outlasts most
+defaults) leaves the GPU producing a video nobody will receive, with every other
+request queued behind it.
+
+The fix is the sink on both paths: `stream = false` no-ops `cb` (an SSE event
+spliced into a single JSON body is unparseable) and keeps only the probe. The
+probe is `Conn.peerClosed`, which the text-generation paths have used for years
+and which media never adopted — and it fixes the streaming path too, where a
+failed write is a LATE signal because TCP send buffers absorb hundreds of events
+after the peer's FIN.
+
+Scope, honestly: only backends that POLL `Progress.cancelled` can be stopped —
+H3, LTX, hunyuan3d, acestep. The image backends never poll it, so a FLUX/Krea
+generation still runs to completion. Those are seconds to a minute; the class is
+the same and the fix would be per-backend loop wiring.
+
+The audit turned up a second thing: `src/gen_sse.zig` was never listed in
+`src/tests.zig`, so its tests had never run. A filter that matches no test still
+reports "1/1 tests passed" (the other test step's), which is why nobody noticed —
+when checking that a new test is red, check it against a deliberately bogus
+filter too.
+
+### Does the H3 shape generalize? Not by itself — and LTX proved it
+
+Asked directly after the fix: does this work for LTX, and for future backends?
+No. `estimatePeakResidentBytesIn` had one `if (model_type == "minimax_h3")` arm
+and everything else fell through to `sumSafetensorsIn`, so the answer for every
+other backend was still "assume nothing is ever freed and everything lives in
+this directory".
+
+For most of them that assumption holds. krea, mage_flow, hunyuan3d, acestep and
+tts each keep text-encoder + DiT + VAE as fields on one Engine struct for the
+engine's lifetime, all inside the model dir — the sum IS their peak.
+
+LTX breaks it twice, in opposite directions (measured on
+`dgrauet/ltx-2.3-mlx-q4`, 29.61 GiB of safetensors):
+
+- `transformer-dev.safetensors` and `transformer-distilled.safetensors` are
+  10.54 GiB each and BOTH ship. `LtxVideoEngine.ensureTransformer` frees the
+  resident one before loading the other, with a comment saying exactly why
+  ("so dev + distilled (11 GB each) never coexist"). The sum bills a phantom
+  10.54 GiB.
+- The Gemma text encoder is not in the model dir at all. `resolveGemmaDir`
+  points at the shared `mlx-community/gemma-3-12b-it-4bit` repo (7.5 GiB), and
+  `ltx_video.gemmaCapture` loads it per generation, uses it, and frees it on
+  return — on top of the entire resident engine. The sum bills it at zero.
+
+The two errors partially cancel on a two-variant pack, which is why nothing had
+been reported. They do NOT cancel on a pack shipping one variant: there the sum
+under-bills by the whole encoder, and under-billing is the uncatchable-OOM side.
+
+So the fix was to name the shape rather than add a second special case:
+`stagedPeakBytes(resident, stages)` — `resident` for what the engine holds
+forever, `stages` for groups that are loaded and freed and therefore never
+coexist, peak = resident + the biggest stage. H3 is `stagedPeakBytes(0, {TE, DiT
++ act, VAEs + act})`; LTX is `stagedPeakBytes(dir_sum − spare_variant, {gemma})`.
+Out-of-dir stages resolve in the OUTER `estimatePeakResidentBytes` so the
+per-directory function stays hermetically testable.
+
+LTX gets NO activation term. H3's 6 GiB is derived from H3 measurements; LTX has
+none, and a fabricated allowance would newly refuse loads that work today. An
+unmeasured number is not a safe default just because it is conservative.

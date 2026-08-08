@@ -2342,12 +2342,19 @@ fn doLoadLlamaOnInferenceThread(sch: *Scheduler, params: anytype) !void {
 /// its real 22.83 GiB peak fit with 7 GB to spare (#126).
 ///
 /// `media_peak == 0` means "not a media model, or a directory we could not
-/// read" and keeps the original ladder byte-for-byte. 10% headroom on top for
-/// KV / vision / drafter overhead — close enough for an eviction gate.
+/// read" and keeps the original ladder byte-for-byte: a text bill is weights
+/// only, so it takes 10% headroom for KV / vision / drafter overhead.
+///
+/// A media peak takes NONE. Those are text-model concepts — a media engine has
+/// no KV cache and no drafter — and `gen.estimatePeakResidentBytes` already
+/// carries an explicit transient term for the stage that generates. Stacking a
+/// second blanket margin on it billed H3's 8-bit pack ~27% over its measured
+/// peak, which is the difference between loading and not on a 48 GB Mac. It
+/// also makes the gate agree with `genLoadResidentBytes`, which has always
+/// committed the bare peak.
 pub fn gateEstimateBytes(media_peak: u64, bytes_on_disk: ?u64, num_hidden_layers: u32, hidden_size: u32) u64 {
-    const base: u64 = if (media_peak > 0)
-        media_peak
-    else if (bytes_on_disk) |b|
+    if (media_peak > 0) return media_peak;
+    const base: u64 = if (bytes_on_disk) |b|
         b
     else
         @as(u64, num_hidden_layers) * @as(u64, hidden_size) * 4 * 4;
@@ -2568,8 +2575,12 @@ test "the eviction gate bills a media entry its BACKEND peak, never the dir's sa
     try testing.expect(gateEstimateBytes(staged_peak, disk_sum, 0, 0) <= cap); // the fix
 
     // A media peak OUTRANKS bytes_on_disk — the whole point is that the two
-    // disagree. It must not be averaged, summed or maxed with it.
-    try testing.expectEqual(staged_peak + staged_peak / 10, gateEstimateBytes(staged_peak, disk_sum, 0, 0));
+    // disagree. It must not be averaged, summed or maxed with it, and it takes
+    // no headroom: the KV/vision/drafter margin is a TEXT concept, the media
+    // estimator carries its own transient term, and the commit
+    // (`genLoadResidentBytes`) has always parked the bare peak.
+    try testing.expectEqual(staged_peak, gateEstimateBytes(staged_peak, disk_sum, 0, 0));
+    try testing.expectEqual(gateEstimateBytes(staged_peak, disk_sum, 0, 0), genLoadResidentBytes(staged_peak, disk_sum));
 
     // Non-media entries are BYTE-UNCHANGED: a zero peak means "not a media
     // model" (or a dir we could not read), and the old ladder stands.

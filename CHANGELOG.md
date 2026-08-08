@@ -7,7 +7,7 @@
 - Attach pictures, clips or audio and the video is built around them. Refer to them in the prompt by number: `<Picture 1>`, `<Video 1>`, `<Audio 1>`. This needs the REF2VA build, so the app only offers it when that build is loaded and the server refuses references on a build that would silently ignore them.
 - **Turbo** renders in 4 steps instead of 30, about twice as fast end to end, with slightly softer detail. It ships with the model now, and packs downloaded before it existed fetch it once when you tick the box. Thanks to [larryvrh](https://huggingface.co/larryvrh/MiniMax-H3-Turbo-Lora) for the adapter.
 - Clips reach 15 seconds. Under the Generate button there is a live time estimate that updates as you change size, length and steps, and the memory warning now uses H3's own numbers instead of LTX's.
-- Video models no longer refuse to load on a 48 GB Mac (#126). The memory gate billed the sum of every file in the folder, 37.55 GB, where the real peak is 22.83 GB. Thanks to funk80rus for the report and the diagnosis.
+- Video models no longer refuse to load on a 48 GB Mac (#126). The memory gate billed the sum of every file in the folder, 37.55 GB, when the parts are never all in memory at once. Thanks to funk80rus for the report and the diagnosis.
 - Over the API, long clips can be generated as chained windows (`chain_windows`), each continuing from the last frame of the one before.
 
 ### LoRAs
@@ -40,6 +40,11 @@
 
 ### Fixes
 
+- Quitting the app left `mlx-serve` running with the model still loaded (#133). ⌘Q, the Quit menu and Dock ▸ Quit all went straight to termination without stopping it, so it kept holding the memory until you killed it by hand. The power button in the menu bar was the only route that worked. Stopping the server is part of quitting now, whichever way you quit. Thanks to freppair for the report.
+- The 8-bit video models still would not load on a 48 GB Mac. The gate had stopped billing the whole folder but was still adding up parts that never exist at the same time, and still charging the transformer its file size when nearly 40% of it is released the moment a generation starts. It bills the largest stage on its own now: 28 GB instead of 43 for the 8-bit MiniMax-H3 build, against a measured peak of 26. The largest sizes can still run out of memory mid-render on a 48 GB Mac, but the model loads and works.
+- **Settings ▸ Server ▸ Model memory cap**, a slider, Auto by default. The setting that decides whether a model is allowed to load at all was reachable only from the command line, so when the automatic cap refused a model you knew would fit there was nothing to do about it in the app. "Skip memory pre-flight check" does not help here, because the cap is checked before that.
+- LTX video was billed for a transformer it never loads (packs ship two, only one is ever in memory) and not billed at all for its text encoder, which lives in a separate folder.
+- A video or music generation kept running after the client hung up, with everything else queued behind it for the rest of the run. Requests that do not stream progress had no way to notice at all, which is most API clients. Note that long renders need a generous client timeout either way: 1344x768 can take well over 45 minutes.
 - Reserved tokens such as `<|fim_hole|>` can no longer be sampled into a reply. The list is built per model from its own tokenizer and chat template, so thinking tags and tool markers are untouched.
 - Tool calls no longer vanish when an argument mentions `</think>`. Coding agents write files about prompts, so this was reachable on every thinking model.
 - The transcript follows a streaming reply and stops the moment you scroll up, on every input rather than only the mouse wheel.
@@ -47,6 +52,8 @@
 - Added a repetition guard for loops that reword themselves; the existing guards only caught exact repeats.
 - Streaming a long thinking block no longer costs CPU that grows with the length of the thought.
 - `/detokenize` returned bodies that no JSON parser would accept if any token contained a control byte.
+
+Thanks [@h9q2cyxvgm-ui](https://github.com/h9q2cyxvgm-ui), [@funk80rus](https://github.com/funk80rus) and [@AideYu](https://github.com/AideYu) for testing and finding a bunch of problems! It really helps ! 
 
 ---
 

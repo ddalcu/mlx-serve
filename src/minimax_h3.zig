@@ -3669,6 +3669,7 @@ fn generateOne(
     try present.append(allocator, .{ .text = ids });
 
     // ── 3. text encoder, then FREE it before the DiT loads ──
+    var te_active: usize = 0;
     var enc: EncodedPrompt = blk: {
         var tw = try model_mod.loadWeightsSingleFile(allocator, paths.text_encoder);
         defer tw.deinit();
@@ -3684,6 +3685,10 @@ fn generateOne(
         var e = try te.encodeItems(allocator, present.items, s);
         errdefer e.deinit();
         try mlx.check(mlx.mlx_array_eval(e.hidden));
+        // Read while the encoder is still resident: this stage is one term of
+        // `gen.h3PeakBytes`, and a bill nobody can check against the running
+        // process is how the DiT term stayed 12 GiB wrong for months.
+        _ = mlx.mlx_get_active_memory(&te_active);
         break :blk e;
     };
     defer enc.deinit();
@@ -3691,7 +3696,12 @@ fn generateOne(
     _ = mlx.mlx_clear_cache();
     const te_len: u32 = @intCast(mlx.getShape(text_hidden)[0]);
     const te_ms = phase_timer.lapMs();
-    log.info("[minimax-h3] text encoded ({d} rows, {d} vision), encoder released ({d} ms load+encode)\n", .{ te_len, te_len - @as(u32, @intCast(ids.len)), te_ms });
+    log.info("[minimax-h3] text encoded ({d} rows, {d} vision), encoder resident {d:.2} GB, released ({d} ms load+encode)\n", .{
+        te_len,
+        te_len - @as(u32, @intCast(ids.len)),
+        @as(f64, @floatFromInt(te_active)) / (1024.0 * 1024.0 * 1024.0),
+        te_ms,
+    });
 
     // ── 4. DiT sampling ──
     var layout = try PackedLayout.initFull(allocator, te_len, shape.latent_t, lat_h, lat_w, shape.audio_t, anchors, shape.frame_count, ref_blocks);
@@ -3778,11 +3788,7 @@ fn generateOne(
         // AdaLN precompute must run while the trunk is still lazy — see
         // precomputeAdaln. Default ON: it is what keeps the DiT residency at
         // ~22 GB instead of ~35 on the 8-bit pack.
-        const precompute_on = blk: {
-            const raw = envStr("MINIMAX_H3_ADALN_PRECOMPUTE") orelse break :blk true;
-            break :blk !std.mem.eql(u8, raw, "0");
-        };
-        if (precompute_on) {
+        if (adalnPrecomputeOn()) {
             const ts = try collectScheduleTs(allocator, &layout, sigmas[0..req.steps], req.shift_video, req.shift_audio, .{});
             defer allocator.free(ts);
             try model.precomputeAdaln(ts, s);
@@ -4526,6 +4532,14 @@ fn envStr(name: [:0]const u8) ?[]const u8 {
 fn envU32(name: [:0]const u8, dflt: u32) u32 {
     const v = envStr(name) orelse return dflt;
     return std.fmt.parseInt(u32, v, 10) catch dflt;
+}
+
+/// Whether `generate` will table and free the DiT's AdaLN weights. Shared with
+/// `gen.estimatePeakResidentBytes`: a residency bill computed against the OTHER
+/// answer is either an OOM (billed shed, ran full) or a refused load.
+pub fn adalnPrecomputeOn() bool {
+    const raw = envStr("MINIMAX_H3_ADALN_PRECOMPUTE") orelse return true;
+    return !std.mem.eql(u8, raw, "0");
 }
 
 fn allFinite(x: mlx.mlx_array, s: S) !bool {
