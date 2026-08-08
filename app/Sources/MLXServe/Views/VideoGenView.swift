@@ -74,6 +74,9 @@ struct VideoGenView: View {
     /// Hydration guard — see ImageGenView for the full rationale.
     @State private var hydrating: Bool = false
     @State private var didHydrate: Bool = false
+    /// True while a drag carrying a file hovers the first-frame section —
+    /// drives that section's dashed-border highlight (see ImageGenView).
+    @State private var isDropTargeted: Bool = false
 
     var body: some View {
         readyView
@@ -486,7 +489,23 @@ struct VideoGenView: View {
                 }
                 .buttonStyle(.bordered)
                 .help("Select an image to use as the first frame of the video.")
+                Text("or drag an image here")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .frame(maxWidth: .infinity)
             }
+        }
+        .padding(6)
+        // Drops land on this section rather than the whole window; contentShape
+        // makes the gaps between rows hit-testable so a drop there doesn't fall
+        // through to the ScrollView behind.
+        .contentShape(RoundedRectangle(cornerRadius: 8))
+        .onDrop(of: [.fileURL], isTargeted: $isDropTargeted) { handleImageDrop($0) }
+        .overlay {
+            RoundedRectangle(cornerRadius: 8)
+                .strokeBorder(Color.accentColor, style: StrokeStyle(lineWidth: 2, dash: [6]))
+                .opacity(isDropTargeted ? 1 : 0)
+                .allowsHitTesting(false)
         }
     }
 
@@ -1046,6 +1065,36 @@ struct VideoGenView: View {
         panel.allowsMultipleSelection = false
         if AppActivation.runModal(panel) == .OK, let url = panel.url {
             firstFrameImageURL = url
+        }
+    }
+
+    /// Entry point for `.onDrop`: only one image slot exists on this pane
+    /// (the first frame), so unlike ImageGen's source/reference routing this
+    /// is just "the dropped image becomes — or replaces — the first frame."
+    /// Item providers resolve asynchronously off the UI thread, so the
+    /// actual assignment happens back on the main actor.
+    private func handleImageDrop(_ providers: [NSItemProvider]) -> Bool {
+        let candidates = providers.filter { $0.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) }
+        guard let provider = candidates.first else { return false }
+        provider.loadObject(ofClass: URL.self) { url, _ in
+            guard let url, Self.isImageFile(url) else { return }
+            DispatchQueue.main.async { firstFrameImageURL = url }
+        }
+        return true
+    }
+
+    /// Same extension allow-list as ImageGenView's drop handling.
+    private static func isImageFile(_ url: URL) -> Bool {
+        let ext = url.pathExtension.lowercased()
+        return ["png", "jpg", "jpeg", "heic", "heif", "webp", "tiff", "tif", "gif", "bmp"].contains(ext)
+    }
+
+    private func numberField(_ label: String, value: Binding<Int>, step: Int) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(label).font(.caption)
+            Stepper(value: value, step: step) {
+                Text(String(value.wrappedValue))
+            }
         }
     }
 
