@@ -94,4 +94,41 @@ final class TruncationNoticeTests: XCTestCase {
         XCTAssertNil(APIClient.truncationCause(fromChoice: nil))
         XCTAssertNil(APIClient.truncationCause(fromChoice: [:]))
     }
+
+    // MARK: - One cut, one event (live 2026-08-08)
+
+    func testACutIsAnnouncedOnceEvenThoughTheServerStatesItTwice() {
+        // The server states the ending TWICE on a stream that asked for usage:
+        // the final chunk carries `finish_reason` + `finish_details`, and the
+        // `stream_options.include_usage` chunk repeats both beside the usage
+        // object (src/server.zig, the two sendSSEChunk calls at the end of
+        // handleStreamingGeneration). Yielding per chunk put two identical
+        // loop banners in a plain chat.
+        var gate = APIClient.TruncationGate()
+        let choice: [String: Any] = [
+            "finish_reason": "length",
+            "finish_details": ["type": "repetition_loop"],
+        ]
+        XCTAssertEqual(gate.admit(APIClient.truncationCause(fromChoice: choice)), .repetitionLoop)
+        XCTAssertNil(gate.admit(APIClient.truncationCause(fromChoice: choice)),
+                     "the same ending restated carries no new information")
+    }
+
+    func testTheGateIsSilentUntilThereIsACut() {
+        // Every content chunk passes through it with finish_reason null.
+        var gate = APIClient.TruncationGate()
+        XCTAssertNil(gate.admit(nil))
+        XCTAssertNil(gate.admit(nil))
+        XCTAssertEqual(gate.admit(.maxTokens), .maxTokens)
+        XCTAssertNil(gate.admit(.maxTokens))
+    }
+
+    func testEachStreamGetsItsOwnGate() {
+        // One gate per stream, so the next round in an agent turn can report
+        // its own cut.
+        var first = APIClient.TruncationGate()
+        XCTAssertEqual(first.admit(.maxTokens), .maxTokens)
+        var second = APIClient.TruncationGate()
+        XCTAssertEqual(second.admit(.maxTokens), .maxTokens)
+    }
 }

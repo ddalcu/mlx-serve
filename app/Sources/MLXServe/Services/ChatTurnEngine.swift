@@ -517,6 +517,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                 modelId: server.chatModelId
             )
             var coalescer = StreamCoalescer()
+            var truncationCause: TruncationNotice.Cause? = nil
             beginLiveTokenCount(for: sessionId)
             for try await event in stream {
                 try Task.checkCancellation()
@@ -532,16 +533,22 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                 case .toolCalls:
                     break
                 case .truncated(let cause):
-                    // Plain chat is a single, always-terminal response — show the
-                    // notice immediately (no agent loop to stack it). Flush any
-                    // buffered text first so the notice lands after it, in order.
-                    applyStreamBatch(coalescer.drain(), to: sessionId)
-                    appState.updateLastMessage(in: sessionId, content: TruncationNotice.text(cause: cause, maxTokens: turnMaxTokens(config)))
+                    // Just record it — the notice is appended ONCE below, after
+                    // the stream ends. `updateLastMessage(content:)` appends, so
+                    // an append per event is an append per restatement of the
+                    // same ending (the agent path has recorded-then-shown for
+                    // this reason; plain chat had not).
+                    truncationCause = cause
                 case .done:
                     break
                 }
             }
             applyStreamBatch(coalescer.drain(), to: sessionId)   // flush the trailing batch
+            // Plain chat is a single, always-terminal response: one cut, one
+            // notice, landing after the reply it explains.
+            if let cause = truncationCause {
+                appState.updateLastMessage(in: sessionId, content: TruncationNotice.text(cause: cause, maxTokens: turnMaxTokens(config)))
+            }
         } catch is CancellationError {
             // Stopped by user (`stop(sessionId:)`) or superseded by a new
             // submission — either way that path already cleared the streaming

@@ -333,6 +333,34 @@ class APIClient {
     /// any other OpenAI-compatible backend) sends no such field and reads as
     /// `.maxTokens`, which is exactly the behaviour this replaced.
     ///
+    /// One cut, one event — no matter how many times the stream states it.
+    ///
+    /// The server states the ending TWICE on any stream that asked for usage:
+    /// the final chunk carries `finish_reason` + `finish_details`, and the
+    /// `stream_options.include_usage` chunk (which the app always requests)
+    /// repeats both beside the usage object — `src/server.zig`, the two
+    /// `sendSSEChunk` calls that close `handleStreamingGeneration`. That is
+    /// fine on the wire, where restating an ending is idempotent, and wrong
+    /// for a consumer that APPENDS on the event: plain chat put two identical
+    /// "the model started repeating itself" banners under one reply (live
+    /// 2026-08-08, dolphin3.0-llama3.2-3B asked to repeat a word 1000 times).
+    ///
+    /// Latching here rather than at each consumer keeps the rule where the
+    /// duplication is: a restated ending carries no new information, and no
+    /// backend — ours or another OpenAI-compatible one — can stack a banner by
+    /// saying it again. One gate per stream (see `performStream`).
+    struct TruncationGate {
+        private var fired = false
+
+        /// Pass the chunk's cause through the first time it appears; `nil`
+        /// afterwards, and `nil` for every chunk that carries no cut at all.
+        mutating func admit(_ cause: TruncationNotice.Cause?) -> TruncationNotice.Cause? {
+            guard let cause, !fired else { return nil }
+            fired = true
+            return cause
+        }
+    }
+
     /// Static and dictionary-shaped so it is testable without a live stream.
     static func truncationCause(fromChoice choice: [String: Any]?) -> TruncationNotice.Cause? {
         guard let choice, let fr = choice["finish_reason"] as? String, fr == "length" else { return nil }
@@ -568,6 +596,9 @@ class APIClient {
         // recovery when the server streams <tool_call> blocks as plain content
         // (e.g. some Qwen MoE outputs an older binary failed to parse).
         var contentAccumulator = ""
+        // One per stream: the final chunk and the usage chunk both carry the
+        // same finish_reason, and a cut is announced once.
+        var truncationGate = TruncationGate()
 
         for try await line in bytes.lines {
             guard line.hasPrefix("data: ") else { continue }
@@ -666,7 +697,8 @@ class APIClient {
 
             // Check finish_reason. "length" is both the max_tokens cap and the
             // server's own loop cut; `finish_details` is what tells them apart.
-            if let cause = Self.truncationCause(fromChoice: choices.first) {
+            // Gated: the usage chunk restates the same ending (see TruncationGate).
+            if let cause = truncationGate.admit(Self.truncationCause(fromChoice: choices.first)) {
                 continuation.yield(.truncated(cause))
             }
             // "length" + accumulated calls = a TRUNCATED tool call (max_tokens or
