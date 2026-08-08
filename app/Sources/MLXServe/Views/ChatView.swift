@@ -468,9 +468,10 @@ struct ChatSidebar: View {
     @State private var hoveredSessionId: UUID?
 
     var body: some View {
-        List(selection: $appState.activeChatId) {
+        List(selection: $appState.sidebarSelection) {
             ForEach(appState.visibleChatSessions) { session in
                 let isSelected = session.id == appState.activeChatId
+                let isMultiSelected = appState.sidebarSelection.contains(session.id)
                 HStack(spacing: 0) {
                     VStack(alignment: .leading, spacing: 2) {
                         HStack(spacing: 4) {
@@ -531,8 +532,16 @@ struct ChatSidebar: View {
                 .listRowBackground(
                     Group {
                         if isSelected {
+                            // Active chat keeps the full accent fill so it remains
+                            // visible while the user makes a multi-selection.
                             RoundedRectangle(cornerRadius: 8)
                                 .fill(Color.accentColor)
+                                .padding(.horizontal, 6)
+                        } else if isMultiSelected {
+                            // Native multi-selection visual: a softer tint so the
+                            // active row's strong accent still reads clearly.
+                            RoundedRectangle(cornerRadius: 8)
+                                .fill(Color.accentColor.opacity(0.25))
                                 .padding(.horizontal, 6)
                         } else {
                             Color.clear
@@ -541,13 +550,38 @@ struct ChatSidebar: View {
                 )
                 .listRowSeparator(.visible)
                 .contextMenu {
-                    Button("Delete", role: .destructive) {
-                        appState.deleteSession(session.id)
+                    if appState.sidebarSelection.contains(session.id) && appState.sidebarSelection.count > 1 {
+                        Button("Delete \(appState.sidebarSelection.count) Chats", role: .destructive) {
+                            appState.deleteSessions(appState.sidebarSelection)
+                        }
+                    } else {
+                        Button("Delete", role: .destructive) {
+                            appState.deleteSession(session.id)
+                        }
                     }
                 }
             }
         }
         .listStyle(.sidebar)
+        .onChange(of: appState.sidebarSelection) { newSelection in
+            // When the sidebar's selection becomes a single id, make that the
+            // active chat so the detail column follows the user's intent.
+            if newSelection.count == 1, let id = newSelection.first {
+                if appState.activeChatId != id { appState.activeChatId = id }
+            }
+        }
+        .onChange(of: appState.activeChatId) { newActive in
+            // Keep the sidebar selection in sync when other parts of the app
+            // change the active chat (open-from-tray, quick launcher, etc.).
+            if let id = newActive { appState.sidebarSelection = [id] }
+            else { appState.sidebarSelection.removeAll() }
+        }
+        .onDeleteCommand {
+            // Delete either the explicit sidebar selection, or fall back to the
+            // active chat when nothing is selected in the sidebar.
+            let toDelete: Set<UUID> = appState.sidebarSelection.isEmpty ? (appState.activeChatId.map { Set([$0]) } ?? Set()) : appState.sidebarSelection
+            if !toDelete.isEmpty { appState.deleteSessions(toDelete) }
+        }
         // The platform's own scroll-edge effect at BOTH ends: rows pass under
         // the window's top edge and under the New Chat row (a `safeAreaInset`,
         // so content scrolls beneath it), and a soft edge is how macOS frosts

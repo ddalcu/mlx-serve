@@ -87,6 +87,9 @@ class AppState: ObservableObject {
     }
     @Published var chatSessions: [ChatSession] = []
     @Published var activeChatId: UUID?
+    /// Sidebar selection (multi-select). Bind the sidebar List to this set so
+    /// macOS-style multi-selection (Cmd/Shift click, drag) works naturally.
+    @Published var sidebarSelection: Set<UUID> = []
     /// Set when a task notification is tapped — the Tasks window observes this to
     /// focus the relevant task, then clears it.
     @Published var pendingTaskDeepLink: UUID?
@@ -575,6 +578,33 @@ class AppState: ObservableObject {
         if activeChatId == id {
             activeChatId = chatSessions.first?.id
         }
+        saveChatHistory()
+    }
+
+    /// Bulk-delete a set of sessions (used by the sidebar's multi-select).
+    /// Keeps the same cleanup invariants as deleteSession(_:): stop any
+    /// session-owned processes, remove attached indexes/bookmarks and
+    /// security-scoped access, then drop the session objects. Finally, if the
+    /// active chat was deleted, adopt the first visible session.
+    func deleteSessions(_ ids: Set<UUID>) {
+        guard !ids.isEmpty else { return }
+        for id in ids {
+            processRegistry.killSession(id)
+            documentIndexes[id]?.cancel()
+            documentIndexes.removeValue(forKey: id)
+            SecurityScopedBookmark.clear(name: SecurityScopedBookmark.workingFolderName(id))
+            SecurityScopedBookmark.clear(name: SecurityScopedBookmark.attachedFolderName(id))
+        }
+        chatSessions.removeAll { ids.contains($0.id) }
+        // Stop any orphaned turns left running.
+        chatEngine.stopIfOrphaned()
+        // If the active chat was deleted, pick the first visible one (keeps
+        // sidebar and detail column consistent with filters).
+        if let active = activeChatId, ids.contains(active) {
+            activeChatId = visibleChatSessions.first?.id
+        }
+        // Remove deleted ids from the sidebar selection so UI state stays sane.
+        sidebarSelection.subtract(ids)
         saveChatHistory()
     }
 
