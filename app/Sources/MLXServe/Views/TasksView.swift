@@ -4,17 +4,50 @@ import SwiftUI
 /// selected task's run history + transcript on the right. The unattended "claw"
 /// surface — create a goal, give it autonomy and (optionally) a schedule, and let it
 /// run in the background.
+/// The Tasks surface: a list of scheduled/on-demand agent tasks, and the
+/// selected task's run history + transcript. The unattended "claw" surface —
+/// create a goal, give it autonomy and (optionally) a schedule, and let it run
+/// in the background.
+///
+/// It has no shell of its own. It was a `Window`, then briefly a two-pane HStack
+/// inside the chat window's detail column; it is now the CONTENT and DETAIL
+/// columns of that window's own three-column split (`ChatView.tasksSplitView`),
+/// because a list of tasks is navigation and belongs beside the app's sidebar
+/// rather than inside the area it navigates. Selection therefore lives on
+/// `AppState` — neither column can own the other's state.
 struct TasksView: View {
     @EnvironmentObject var appState: AppState
     @EnvironmentObject var server: ServerManager
     @EnvironmentObject var scheduler: TaskScheduler
 
-    @State private var selectedTaskId: UUID?
     @State private var showNewTask = false
 
-    var body: some View {
-        NavigationSplitView {
-            List(selection: $selectedTaskId) {
+    /// Unused: the two panes are consumed directly as columns. Kept so the type
+    /// still satisfies `View` for callers that render it whole (previews).
+    var body: some View { taskList }
+
+    var taskList: some View {
+        taskListBody
+        .sheet(isPresented: $showNewTask) {
+            NewTaskSheet { newTask in
+                scheduler.addTask(newTask)
+                appState.selectedTaskId = newTask.id
+            }
+        }
+        // A tapped task notification lands here (the pane is always present
+        // while Tasks is up; the detail column may be showing nothing yet).
+        .onChange(of: appState.pendingTaskDeepLink) { _, taskId in
+            if let taskId { appState.selectedTaskId = taskId; appState.pendingTaskDeepLink = nil }
+        }
+        .onAppear {
+            if let taskId = appState.pendingTaskDeepLink {
+                appState.selectedTaskId = taskId; appState.pendingTaskDeepLink = nil
+            }
+        }
+    }
+
+    private var taskListBody: some View {
+        List(selection: $appState.selectedTaskId) {
                 if scheduler.tasks.isEmpty {
                     Text("No tasks yet.\nTap + to create one.")
                         .font(.callout)
@@ -29,40 +62,35 @@ struct TasksView: View {
                         .tag(task.id)
                 }
             }
-            .navigationSplitViewColumnWidth(min: 240, ideal: 300)
-            .toolbar {
-                ToolbarItem {
+            // The create control rides the pane's own header rather than a
+            // ToolbarItem: this is a middle column of the chat window's split
+            // now, and that window's toolbar belongs to the chat.
+            .safeAreaInset(edge: .top) {
+                HStack {
+                    Text("Tasks").font(.subheadline.weight(.semibold))
+                    Spacer()
                     Button { showNewTask = true } label: { Image(systemName: "plus") }
+                        .buttonStyle(.borderless)
                         .help("New task")
                 }
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+                .background(.bar)
             }
-        } detail: {
-            if let id = selectedTaskId, let task = scheduler.tasks.first(where: { $0.id == id }) {
+    }
+
+    @ViewBuilder
+    var taskDetail: some View {
+
+            if let id = appState.selectedTaskId, let task = scheduler.tasks.first(where: { $0.id == id }) {
                 TaskDetailView(task: task)
             } else {
                 ContentUnavailableView("Select a task",
                                        systemImage: "clock.badge.checkmark",
                                        description: Text("Pick a task to see its runs, or create a new one."))
             }
-        }
-        .sheet(isPresented: $showNewTask) {
-            NewTaskSheet { newTask in
-                scheduler.addTask(newTask)
-                selectedTaskId = newTask.id
-            }
-        }
-        .onChange(of: appState.pendingTaskDeepLink) { _, taskId in
-            if let taskId { selectedTaskId = taskId; appState.pendingTaskDeepLink = nil }
-        }
-        .onAppear {
-            if let taskId = appState.pendingTaskDeepLink {
-                selectedTaskId = taskId; appState.pendingTaskDeepLink = nil
-            }
-        }
     }
 }
-
-// MARK: - Sidebar row
 
 private struct TaskRow: View {
     let task: ScheduledTask

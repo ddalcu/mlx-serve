@@ -21,10 +21,20 @@ struct ChatModelPill: View {
     /// capsule around the model picker, voice and settings together — a second
     /// capsule inside it reads as a button inside a button.
     var showsBackground: Bool = true
+    /// Composer placement: sized and weighted like the rest of that row (which
+    /// is where the picker lives now — it configures the message you are about
+    /// to send, not the window), and it carries the download affordances a
+    /// toolbar pill had no room for.
+    var compact: Bool = false
+
+    @EnvironmentObject private var downloads: DownloadManager
 
     /// Hard cap on the name's width. The pill's size is what keeps it safe in
     /// the toolbar, so this is a contract, not a nicety.
     private static let maxNameWidth: CGFloat = 210
+    /// Tighter cap in the composer row, which has its own budget — see the
+    /// toolbar-eviction note above; the same discipline applies here.
+    private static let compactNameWidth: CGFloat = 150
 
     /// What the PILL shows: the model name without its org.
     ///
@@ -83,26 +93,63 @@ struct ChatModelPill: View {
         )
     }
 
+    /// A live transfer for the model this chat is pointed at, if any. The pill
+    /// is where the user is already looking when they wonder why nothing
+    /// answers, so a download in flight belongs here rather than only in the
+    /// browser two clicks away.
+    private var activeDownload: DownloadManager.DownloadState? {
+        guard server.lanChatModelId == nil else { return nil }
+        return downloads.downloads.values.first { $0.status == .downloading }
+    }
+
+    /// True when this Mac has nothing chat-pickable on disk — the state where
+    /// the pill's job is to offer the download, not a list to choose from.
+    private var needsDownload: Bool {
+        server.lanChatModelId == nil && pickableModels.isEmpty && activeDownload == nil
+    }
+
     var body: some View {
         Menu {
             menuContent
         } label: {
-            HStack(spacing: 5) {
-                Image(systemName: "cpu")
-                    .font(.system(size: 11, weight: .medium))
-                    .foregroundStyle(.secondary)
-                Text(Self.headerName(displayName))
-                    .font(.callout.weight(.medium))
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                    .frame(maxWidth: Self.maxNameWidth, alignment: .leading)
-                    .fixedSize(horizontal: false, vertical: true)
-                Image(systemName: "chevron.up.chevron.down")
-                    .font(.system(size: 8, weight: .semibold))
-                    .foregroundStyle(.secondary)
-                Circle()
-                    .fill(statusColor)
-                    .frame(width: 6, height: 6)
+            VStack(alignment: .leading, spacing: 2) {
+                HStack(spacing: 5) {
+                    Image(systemName: "cpu")
+                        .font(.system(size: 11, weight: .medium))
+                        .foregroundStyle(.secondary)
+                    Text(Self.headerName(displayName))
+                        .font(compact ? .caption.weight(.medium) : .callout.weight(.medium))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .frame(maxWidth: compact ? Self.compactNameWidth : Self.maxNameWidth,
+                               alignment: .leading)
+                        .fixedSize(horizontal: false, vertical: true)
+                    Image(systemName: "chevron.up.chevron.down")
+                        .font(.system(size: 8, weight: .semibold))
+                        .foregroundStyle(.secondary)
+                    if needsDownload {
+                        // Nothing on disk: the one thing to do is get one, so
+                        // say it with the symbol rather than a dot that only
+                        // reports.
+                        Image(systemName: "arrow.down.circle.fill")
+                            .font(.system(size: 11))
+                            .foregroundStyle(Color.accentColor)
+                    } else {
+                        Circle()
+                            .fill(statusColor)
+                            .frame(width: 6, height: 6)
+                    }
+                }
+                if let active = activeDownload {
+                    // Deliberately wordless: a hairline that fills. The figures
+                    // live in the browser; here it only has to say "something is
+                    // arriving, that's why it can't answer yet".
+                    ProgressView(value: max(0, min(1, active.fileProgress)))
+                        .progressViewStyle(.linear)
+                        .tint(.green)
+                        .frame(height: 2)
+                        .frame(maxWidth: compact ? Self.compactNameWidth : Self.maxNameWidth)
+                }
             }
             .padding(.horizontal, showsBackground ? 10 : 4)
             .padding(.vertical, 4)
@@ -147,8 +194,13 @@ struct ChatModelPill: View {
             }
             Divider()
         }
+        Divider()
         Button("Manage Models…") {
-            AppActivation.openWindow(id: "modelBrowser", using: openWindow)
+            // A MODE of this window now, not a window of its own — so the
+            // picker's "manage" route lands beside the picker rather than on
+            // top of it. AppState.showModels is the one way in, and it is the
+            // LAST row: everything above it is a model you can pick right now.
+            appState.showModels()
         }
     }
 

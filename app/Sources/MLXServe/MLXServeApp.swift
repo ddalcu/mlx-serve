@@ -86,14 +86,14 @@ struct MLXCoreApp: App {
         MenuBarExtra {
             StatusMenuView(
                 openChat: { openAndFocus("chat") },
-                openModelBrowser: { openAndFocus("modelBrowser") },
-                openImageGen: { openAndFocus("imageGen") },
-                openVideoGen: { openAndFocus("videoGen") },
-                openAudioGen: { openAndFocus("audioGen") },
-                openModel3DGen: { openAndFocus("model3dGen") },
-                openSettings: { openAndFocus("settings") },
+                openModelBrowser: { appState.showModels() },
+                openImageGen: { appState.showCreate(.image) },
+                openVideoGen: { appState.showCreate(.video) },
+                openAudioGen: { appState.showCreate(.audio) },
+                openModel3DGen: { appState.showCreate(.model3d) },
+                openSettings: { appState.showSettings() },
                 openServerLog: { openAndFocus("serverLog") },
-                openTasks: { openAndFocus("tasks") },
+                openTasks: { appState.showTasks() },
                 openAgents: { openAndFocus("agents") },
                 openSandboxTerminal: { openAndFocus("sandboxTerminal") }
             )
@@ -110,24 +110,41 @@ struct MLXCoreApp: App {
                 // A tapped task notification deep-links here; open the Tasks window
                 // (the label is always present, so this fires even with no window open).
                 .onChange(of: appState.pendingTaskDeepLink) { _, taskId in
-                    if taskId != nil { openAndFocus("tasks") }
+                    // A tapped task notification: the Tasks pane is part of the
+                    // chat window now, so this brings that window up on it and
+                    // TasksView consumes the id in .onAppear/.onChange.
+                    if taskId != nil { appState.showTasks() }
                 }
                 // Quick launcher "Open in chat" (⌘↩): same always-present bridge —
                 // the launcher panel can't reach SwiftUI's openWindow itself.
                 .onChange(of: appState.pendingChatOpenTick) { _, _ in
                     openAndFocus("chat")
                 }
-                // Welcome window's "Browse Models" nudge: same bridge — it's a
-                // bare NSHostingView outside the Scene graph.
-                .onChange(of: appState.pendingModelBrowserOpenTick) { _, _ in
-                    openAndFocus("modelBrowser")
-                }
+
         }
         .menuBarExtraStyle(.window)
 
         Window("MLX Core", id: "chat") {
             ChatView()
                 .environmentObject(appState)
+                // The Model Browser is a MODE of this window now
+                // (`ChatWorkspace`), so everything its panes read has to be
+                // injected HERE — there is no second window to inject it into,
+                // and SwiftUI reports a missing one as a render-time trap, not
+                // a compile error (live crash 2026-08-08 on `downloads`).
+                // Pinned by `testTheChatWindowInjectsEveryObjectTheBrowserPaneReads`.
+                .environmentObject(hfSearch)
+                .environmentObject(appState.downloads)
+                // The four media generators are PAGES of this window now
+                // (`ChatWorkspace.create`), not windows of their own.
+                .environmentObject(appState.imageGen)
+                .environmentObject(appState.videoGen)
+                .environmentObject(appState.audioGen)
+                .environmentObject(appState.musicGen)
+                .environmentObject(appState.model3dGen)
+                // Settings and Tasks render here as modes too, so their
+                // objects ride this scene (`ChatWorkspace`).
+                .environmentObject(appState.taskScheduler)
                 .environmentObject(appState.server)
                 .environmentObject(appState.toolExecutor)
                 .environmentObject(appState.agentMemory)
@@ -140,77 +157,15 @@ struct MLXCoreApp: App {
                     Task { await appState.mcpManager.stopAll() }
                 }
         }
-        .defaultSize(width: 900, height: 650)
+        // Roomier than the old 900x650: this window is three things now
+        // (transcript, model browser, media generators) and the two it gained
+        // were 960pt-wide windows in their own right.
+        .defaultSize(width: 1160, height: 780)
 
         Window("Browser", id: "browser") {
             BrowserView()
         }
         .defaultSize(width: 1024, height: 768)
-
-        Window("Model Browser", id: "modelBrowser") {
-            ModelBrowserView()
-                .environmentObject(hfSearch)
-                .environmentObject(appState)
-                .environmentObject(appState.downloads)
-                // Lets model rows tell "selected" from "actually loaded" — the
-                // In-use badge reads `server.status`.
-                .environmentObject(appState.server)
-                // Floor derived from sidebar + detail minimums — a smaller
-                // literal here caps the window's reported minimum and lets
-                // the Discover table clip off the right edge.
-                .frame(minWidth: ModelBrowserMetrics.minWindowWidth, minHeight: 400)
-        }
-        .defaultSize(width: ModelBrowserMetrics.defaultWindowWidth,
-                     height: ModelBrowserMetrics.defaultWindowHeight)
-
-        Window("Image Generation", id: "imageGen") {
-            ImageGenView()
-                .environmentObject(appState.imageGen)
-                .environmentObject(appState.server)
-                .environmentObject(appState.downloads)
-                .environmentObject(appState)
-        }
-        .defaultSize(width: 960, height: 700)
-
-        Window("Video Generation", id: "videoGen") {
-            VideoGenView()
-                .environmentObject(appState.videoGen)
-                .environmentObject(appState.server)
-                .environmentObject(appState.downloads)
-                .environmentObject(appState)
-        }
-        .defaultSize(width: 960, height: 700)
-
-        Window("Audio Generation", id: "audioGen") {
-            AudioGenView()
-                .environmentObject(appState.audioGen)
-                .environmentObject(appState.musicGen)
-                .environmentObject(appState.server)
-                .environmentObject(appState.downloads)
-                .environmentObject(appState)
-        }
-        .defaultSize(width: 900, height: 660)
-
-        Window("3D Generation", id: "model3dGen") {
-            Model3DGenView()
-                .environmentObject(appState.model3dGen)
-                .environmentObject(appState.server)
-                .environmentObject(appState.downloads)
-                .environmentObject(appState)
-        }
-        .defaultSize(width: 960, height: 700)
-
-        Window("Settings", id: "settings") {
-            SettingsView()
-                .environmentObject(appState)
-                .environmentObject(appState.server)
-                .environmentObject(appState.downloads)
-                // Wider since the category sidebar landed: it takes ~200pt, and
-                // the form's rows (label + explainer + control) were already
-                // tight at the old 720 minimum.
-                .frame(minWidth: 900, minHeight: 560)
-        }
-        .defaultSize(width: 1020, height: 700)
 
         // Dedicated terminal-style window for the server's live stderr.
         // The inline log on the tray popover is still there for a glance;
@@ -245,15 +200,6 @@ struct MLXCoreApp: App {
         }
         .defaultSize(width: 900, height: 640)
 
-        // Scheduled / on-demand agent tasks — the unattended "claw" surface.
-        Window("Tasks", id: "tasks") {
-            TasksView()
-                .environmentObject(appState)
-                .environmentObject(appState.server)
-                .environmentObject(appState.taskScheduler)
-                .frame(minWidth: 720, minHeight: 480)
-        }
-        .defaultSize(width: 900, height: 620)
         .commands {
             CommandMenu("Agent") {
                 Button("Agents…") { openAndFocus("agents") }
@@ -262,7 +208,7 @@ struct MLXCoreApp: App {
                 Button("Browser") { openAndFocus("browser") }
                     .keyboardShortcut("b", modifiers: [.command, .shift])
 
-                Button("Settings…") { openAndFocus("settings") }
+                Button("Settings…") { appState.showSettings() }
                     .keyboardShortcut(",", modifiers: [.command])
 
                 Button("Edit System Prompt") {
@@ -305,10 +251,10 @@ struct MLXCoreApp: App {
             // search. The media section iterates the SAME catalog as the
             // chips so the two lists cannot drift.
             CommandMenu("Tools") {
-                Button("Browse Models…") { openAndFocus("modelBrowser") }
+                Button("Browse Models…") { appState.showModels() }
                     .keyboardShortcut("m", modifiers: [.command, .shift])
 
-                Button("Scheduled Tasks…") { openAndFocus("tasks") }
+                Button("Scheduled Tasks…") { appState.showTasks() }
                     .keyboardShortcut("t", modifiers: [.command, .shift])
 
                 Divider()

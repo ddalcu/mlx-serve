@@ -203,12 +203,94 @@ class AppState: ObservableObject {
     /// near-identical tick: they want the same window.
     @Published var pendingChatOpenTick = 0
 
-    /// Bumped by the welcome window's "Browse Models" nudge (shown when no
-    /// chat model is downloaded yet) — the welcome window is a bare
-    /// `NSHostingView` outside the SwiftUI Scene graph, so it can't reach
-    /// `openWindow` itself. Same always-present-menu-bar-label bridge as
-    /// `pendingChatOpenTick`.
-    @Published var pendingModelBrowserOpenTick = 0
+    /// What the chat window's detail column is showing: the transcript, or the
+    /// model browser (`ChatWorkspace`). App-level rather than view-local
+    /// because the surfaces that ask for the browser live OUTSIDE that window —
+    /// the tray popover, the welcome screen, the Tools menu.
+    @Published var chatWorkspace: ChatWorkspace = .conversation
+    /// The task showing in the Tasks pane's detail column. App-level because the
+    /// list and the detail are SEPARATE columns of the chat window's own
+    /// `NavigationSplitView` — neither can own the other's state.
+    @Published var selectedTaskId: UUID?
+
+    /// Show the model browser — the ONE way in.
+    ///
+    /// It used to be `openAndFocus("modelBrowser")`, repeated at five call
+    /// sites. Both halves are required and neither is optional: setting the
+    /// mode without opening the window switches a window nobody is looking at,
+    /// and opening the window without the mode lands on a transcript. The tick
+    /// is the same always-present-menu-bar-label bridge the Quick Launcher and
+    /// the welcome window use, since neither can reach SwiftUI's `openWindow`.
+    func showModels(_ section: ModelBrowserSection = .recommended) {
+        chatWorkspace = .models(section)
+        pendingChatOpenTick += 1
+    }
+
+    /// Show the Tasks pane — the one way in, same shape as `showModels()`.
+    func showTasks() {
+        chatWorkspace = .tasks
+        pendingChatOpenTick += 1
+    }
+
+    /// Show Settings in the content area — the sidebar's row. ⌘, from the menu
+    /// bar still opens the WINDOW: that shortcut is a macOS convention, and a
+    /// window is what people expect it to produce.
+    func showSettings() {
+        chatWorkspace = .settings
+        pendingChatOpenTick += 1
+    }
+
+    /// Switch the browser's section. Deliberately a NO-OP outside the models
+    /// pane: this is the section bar's setter, and a section bar that could
+    /// also ENTER the pane would be a second door in — one that doesn't bring
+    /// the window forward. Entering is `showModels()`, and only `showModels()`.
+    func selectModelSection(_ section: ModelBrowserSection) {
+        guard chatWorkspace.isModels else { return }
+        chatWorkspace = .models(section)
+    }
+
+    /// Show a media generator — the ONE way in, same shape as `showModels()`.
+    /// The four used to be four `Window` scenes; they are pages of this window
+    /// now, so a request has to both pick the page and bring the window up.
+    func showCreate(_ experiment: GenExperiment = .image) {
+        chatWorkspace = .create(experiment)
+        pendingChatOpenTick += 1
+    }
+
+    /// Switch generator page. A no-op outside create mode, for the same reason
+    /// `selectModelSection` is: the page list must not be a second door in.
+    func selectCreatePage(_ experiment: GenExperiment) {
+        guard chatWorkspace.isCreate else { return }
+        chatWorkspace = .create(experiment)
+    }
+
+    /// "Send to Chat" on a Create-pane result: open a NEW conversation holding
+    /// it, and switch to Chats so the user SEES where it went.
+    ///
+    /// A new chat, not the active one, for two reasons (`GeneratedMediaHandoff`):
+    /// Create is iterative, so whichever thread happens to be open is rarely the
+    /// one you meant; and a render appearing mid-way through an unrelated
+    /// conversation is exactly the kind of surprise a hand-off should not spring.
+    /// Switching modes is not a nicety either — a message appended to a chat you
+    /// are not looking at is indistinguishable from nothing happening.
+    @discardableResult
+    func sendGeneratedMediaToNewChat(path: String, prompt: String,
+                                     kind: ChatMediaRef.Kind) -> UUID {
+        let sessionId = newChatSession(agentId: defaultAgentId)
+        if let idx = chatSessions.firstIndex(where: { $0.id == sessionId }) {
+            chatSessions[idx].messages.append(
+                GeneratedMediaHandoff.message(path: path, prompt: prompt, kind: kind))
+            saveChatHistory()
+        }
+        showConversation()
+        return sessionId
+    }
+
+    /// Back to the transcript. Selecting a conversation does this too — the
+    /// sidebar's mode switcher is the visible version of it.
+    func showConversation() {
+        chatWorkspace = .conversation
+    }
 
     /// Owns the global hotkey + floating panel. App-level like the voice
     /// controller so it works with every window closed.
@@ -336,7 +418,7 @@ class AppState: ObservableObject {
                     appState: self,
                     hasChatModels: hasChat,
                     onDismiss: { Self._welcomeWindow?.close() },
-                    onOpenModelBrowser: { self.pendingModelBrowserOpenTick += 1 },
+                    onOpenModelBrowser: { self.showModels() },
                     onOpenChat: { self.pendingChatOpenTick += 1 }
                 )
             }
@@ -721,6 +803,7 @@ class AppState: ObservableObject {
                                onOpenChat: onOpenChat)
             .environmentObject(appState)
             .environmentObject(appState.downloads)
+            .environmentObject(appState.server)
         let hostingView = NSHostingView(rootView: view)
 
         // Let SwiftUI compute the intrinsic size

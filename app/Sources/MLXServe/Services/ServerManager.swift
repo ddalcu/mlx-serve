@@ -316,6 +316,16 @@ class ServerManager: ObservableObject {
         return lines.last ?? "exit code \(exitCode)"
     }
 
+    /// Whether a crashed server's log is a memory failure — either our own
+    /// pre-flight refusal or a Metal GPU out-of-memory. Mirrors the two
+    /// memory branches of `summarizeCrash`; drives the "here's what's using
+    /// memory" advice in the crash alert. Pure + testable.
+    nonisolated static func isMemoryFailure(_ log: String) -> Bool {
+        if log.contains("Insufficient memory to load model") { return true }
+        return log.contains("kIOGPUCommandBufferCallbackErrorOutOfMemory")
+            || (log.contains("[METAL]") && log.localizedCaseInsensitiveContains("Insufficient Memory"))
+    }
+
     private func handleTermination(exitCode: Int32) {
         pollSource?.cancel()
         pollSource = nil
@@ -436,7 +446,22 @@ class ServerManager: ObservableObject {
     private func presentCrashAlert(title: String, log: String, exitCode: Int32) {
         let alert = NSAlert()
         alert.messageText = title
-        alert.informativeText = "Exit code \(exitCode). Full server log below — select & copy, or use the Copy Log button."
+
+        var info = ""
+        // A memory failure is fixable from here, so lead with what to do about
+        // it — which apps to quit (with how much that frees), and the two other
+        // levers — before the raw exit-code/log line.
+        if Self.isMemoryFailure(log) {
+            let apps = RunningAppsMemory.topApps(limit: 4)
+            if apps.isEmpty {
+                info = "Not enough free memory to load the model. Quit some other apps to free memory, or turn on Settings ▸ Skip memory preflight, or pick a smaller model.\n\n"
+            } else {
+                let freed = MemoryInfo.format(RunningAppsMemory.totalBytes(apps))
+                info = "Not enough free memory to load the model. Using the most right now: \(RunningAppsMemory.summaryLine(apps)) — quitting these frees about \(freed). You can also turn on Settings ▸ Skip memory preflight, or pick a smaller model.\n\n"
+            }
+        }
+        info += "Exit code \(exitCode). Full server log below — select & copy, or use the Copy Log button."
+        alert.informativeText = info
         alert.alertStyle = .warning
 
         // Scrollable, selectable, monospaced log view as the accessory.

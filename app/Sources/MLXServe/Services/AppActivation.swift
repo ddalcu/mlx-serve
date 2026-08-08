@@ -66,14 +66,7 @@ enum AppActivation {
     static func windowTitle(for id: String) -> String {
         switch id {
         case "chat":         return "MLX Core"
-        case "modelBrowser": return "Model Browser"
-        case "imageGen":     return "Image Generation"
-        case "videoGen":     return "Video Generation"
-        case "audioGen":     return "Audio Generation"
-        case "model3dGen":   return "3D Generation"
-        case "settings":     return "Settings"
         case "serverLog":    return "Server Log"
-        case "tasks":        return "Tasks"
         // Base title only — a live session retitles to "pi — MLX Sandbox";
         // the identifier fallback in windowMatches covers that state.
         case "sandboxTerminal": return "MLX Sandbox"

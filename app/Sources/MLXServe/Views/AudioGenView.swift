@@ -109,6 +109,9 @@ struct VoiceGenView: View {
     @EnvironmentObject var service: AudioGenService
     @EnvironmentObject var server: ServerManager
     @EnvironmentObject var downloads: DownloadManager
+    /// For "Send to Chat" — the hand-off opens a new conversation and switches
+    /// the window to it (`AppState.sendGeneratedMediaToNewChat`).
+    @EnvironmentObject var appState: AppState
 
     @StateObject private var recorder = AudioRecorder()
 
@@ -286,25 +289,41 @@ struct VoiceGenView: View {
         dictating = false
     }
 
+    /// Best-per-capability up front, everything else behind "Other Models", and
+    /// the Download button ON the model — see `MediaModelChooser`.
     private var modelSection: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text("Model").font(.subheadline.weight(.semibold))
-            Picker("", selection: LanPick.selection(
-                model: $model, lanModel: $lanModel,
-                resolve: { id in AudioModelPreset.all.first { $0.id == id } },
-                persist: persist)
-            ) {
-                ForEach(AudioModelPreset.all) { preset in
-                    Text(preset.name).tag(preset.id)
+        let featured = MediaModelPicks.featured(
+            AudioModelPreset.all,
+            physicalMemoryBytes: ProcessInfo.processInfo.physicalMemory,
+            capabilityOf: \.capabilityLabel)
+        return MediaModelChooser(
+            featured: featured,
+            others: MediaModelPicks.others(AudioModelPreset.all, featured: featured),
+            selectedId: model.id,
+            lanModel: lanModel,
+            capabilityOf: { $0.capabilityLabel },
+            isDownloaded: { downloads.bundleReady($0.bundle) },
+            downloadLabel: { "Download \($0.bundle.approxSizeLabel)" },
+            onSelect: { preset in
+                lanModel = nil
+                model = preset
+            },
+            onDownload: { preset in
+                // Downloading also selects — you fetch the one you mean to use.
+                lanModel = nil
+                model = preset
+                downloads.startBundle(preset.bundle) { appState.refreshModels() }
+            },
+            lanCapability: "audio",
+            onSelectLan: { id in
+                lanModel = id
+                if let base = AudioModelPreset.all.first(where: { $0.id == LanPick.base(of: id) }) {
+                    model = base
                 }
-                LanModelPickerRows(capability: "audio")
+                persist()
             }
-            .labelsHidden()
-            .pickerStyle(.menu)
-            Text("~\(model.approxRAMGB) GB RAM • zero-shot voice cloning")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-        }
+        )
+        .onChange(of: model) { _, _ in guard !hydrating else { return }; persist() }
     }
 
     private var referenceSection: some View {
@@ -409,7 +428,7 @@ struct VoiceGenView: View {
     private var actionRow: some View {
         VStack(spacing: 8) {
             if lanModel == nil && !downloads.bundleReady(model.bundle) {
-                BundleDownloadBar(bundle: model.bundle)
+                BundleDownloadBar(bundle: model.bundle, showsStartButton: false)
             }
             HStack {
                 if service.isRunning {
@@ -488,6 +507,15 @@ struct VoiceGenView: View {
                     NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
                 } label: { Image(systemName: "folder") }
                 .buttonStyle(.borderless).help("Reveal in Finder")
+                // The one bridge from the workshop to a conversation. It opens
+                // a NEW chat and switches to it — see
+                // `AppState.sendGeneratedMediaToNewChat`.
+                Button {
+                    appState.sendGeneratedMediaToNewChat(
+                        path: path, prompt: text, kind: .audio)
+                } label: { Image(systemName: "bubble.left.and.text.bubble.right") }
+                .buttonStyle(.borderless)
+                .help("Send to Chat — opens a new conversation with this attached")
             }
         }
         .padding(16)
@@ -603,7 +631,14 @@ struct VoiceGenView: View {
     }
 
     private func showLogWindow() {
-        let logText = service.log.joined(separator: "\n")
+        // The pane's own log holds the STREAM. A model that failed to LOAD
+        // never streamed anything, so this was empty for exactly the failure
+        // people click it for — see ImageGenView.
+        let own = service.log.joined(separator: "\n")
+        let serverTail = String(server.currentServerLogSnapshot().suffix(6000))
+        let logText = own.isEmpty
+            ? serverTail
+            : own + "\n\n——— server log ———\n" + serverTail
         let alert = NSAlert()
         alert.messageText = "Audio generation log"
         alert.informativeText = logText.isEmpty ? "(no output)" : logText

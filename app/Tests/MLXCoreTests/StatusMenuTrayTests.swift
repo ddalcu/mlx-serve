@@ -46,8 +46,11 @@ final class StatusMenuTrayTests: XCTestCase {
             .appendingPathComponent("Sources/MLXServe/Views/StatusMenuView.swift")
         let lines = try String(contentsOf: source, encoding: .utf8)
             .components(separatedBy: "\n")
+        // The branch reads `if hasNoUsableModels {` — a computed property over
+        // the pure `trayHasNoUsableModels(_:lanChatModelCount:)` above, since
+        // the redesign needs the same answer in two places.
         let ifIdx = try XCTUnwrap(
-            lines.firstIndex { $0.contains("if trayHasNoUsableModels(") })
+            lines.firstIndex { $0.contains("if hasNoUsableModels {") })
         let gearIdx = try XCTUnwrap(
             lines.firstIndex { $0.contains("openSettings()") })
         // Gear before the branch is trivially unconditional; after it, the

@@ -7,6 +7,45 @@ import XCTest
 /// graph, and a sheet over a window.
 final class FirstRunFlowTests: XCTestCase {
 
+    // MARK: - Leaving the welcome window
+
+    /// Live dead end: "Browse all models" dismissed the welcome window and
+    /// opened ONLY the Model Browser. Close that browser — or download a model
+    /// without noticing its "Use" button — and the user is left with an empty
+    /// desktop and an app that lives in the menu bar, with no way back to the
+    /// window they came from (it's `.floating` and already closed). The welcome
+    /// screen exists to end in a working chat; EVERY way out of it must open
+    /// one.
+    func testEveryWelcomeExitOpensChat() {
+        for exit in WelcomeExit.allCases {
+            XCTAssertTrue(exit.opensChat, """
+                \(exit) leaves the welcome window without opening Chat — the \
+                dead end this enum exists to make impossible.
+                """)
+        }
+    }
+
+    /// Browse is the only exit that also opens the browser, and it opens chat
+    /// UNDERNEATH it — so closing the browser lands on a composer.
+    func testBrowseExitOpensTheModelBrowserOverChat() {
+        XCTAssertTrue(WelcomeExit.browseModels.opensModelBrowser)
+        XCTAssertTrue(WelcomeExit.browseModels.opensChat)
+        XCTAssertFalse(WelcomeExit.startChatting.opensModelBrowser)
+        XCTAssertFalse(WelcomeExit.useModel.opensModelBrowser)
+    }
+
+    /// A route that dismissed the window without dismissing it is the other
+    /// half of the same bug: the welcome floats above every other window, so a
+    /// chat opened behind a welcome that stayed up is invisible.
+    func testEveryWelcomeExitClosesTheWindow() {
+        for exit in WelcomeExit.allCases {
+            XCTAssertTrue(exit.closesWelcome, """
+                \(exit) leaves the welcome window on screen — it is a \
+                .floating window, so whatever it opens renders behind it.
+                """)
+        }
+    }
+
     private func model(_ name: String, type: String = "gemma4_text", kind: ModelKind = .base) -> LocalModel {
         LocalModel(
             id: name,

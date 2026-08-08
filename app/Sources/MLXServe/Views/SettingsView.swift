@@ -38,23 +38,49 @@ struct SettingsView: View {
                                  selfUpdate: BuildFeatures.current.selfUpdate)
     }
 
+    /// True when this renders inside the chat window's detail column
+    /// (`ChatWorkspace.settings`). A `NavigationSplitView` nested inside another
+    /// fights the outer sidebar for column behaviour, so the embedded shell is a
+    /// plain two-pane HStack — same category list, same form. Identical split to
+    /// `TasksView.embedded`.
+    var embedded: Bool = false
+
     var body: some View {
-        NavigationSplitView {
-            SettingsSidebar(categories: categories, selection: $selection) {
-                // Picking a category clears the search: the two are alternative
-                // ways to narrow, and letting them stack strands the user on an
-                // empty pane with a stale query they can't see.
-                searchQuery = ""
-            }
-        } detail: {
-            form
-        }
+        shell
         .navigationTitle("Settings")
         // An engine switch can retire the selected category (load a GGUF model
         // while "MLX Performance" is selected) — fall back to All rather than
         // leave a blank pane.
         .onChange(of: categories) { _, visible in
             selection = SettingsSelection.reconciled(selection, visible: visible)
+        }
+    }
+
+    @ViewBuilder
+    private var shell: some View {
+        if embedded {
+            HStack(spacing: 0) {
+                categoryList
+                    .frame(width: 210)
+                Divider()
+                form
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+            }
+        } else {
+            NavigationSplitView {
+                categoryList
+            } detail: {
+                form
+            }
+        }
+    }
+
+    private var categoryList: some View {
+        SettingsSidebar(categories: categories, selection: $selection) {
+            // Picking a category clears the search: the two are alternative
+            // ways to narrow, and letting them stack strands the user on an
+            // empty pane with a stale query they can't see.
+            searchQuery = ""
         }
     }
 

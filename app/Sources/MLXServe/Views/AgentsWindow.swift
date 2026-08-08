@@ -550,7 +550,7 @@ private struct AgentEditor: View {
                         .foregroundStyle(.orange).font(.caption)
                     Spacer()
                     Button("Open Model Browser") {
-                        appState.pendingModelBrowserOpenTick += 1
+                        appState.showModels()
                     }
                     .controlSize(.small)
                     .help("This agent can't answer until \((path as NSString).lastPathComponent) is on disk. Nothing is downloaded automatically.")

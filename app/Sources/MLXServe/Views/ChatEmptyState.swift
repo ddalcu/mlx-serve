@@ -17,6 +17,9 @@ import SwiftUI
 enum ChatEmptyState {
     enum Action: Equatable {
         case window(String)   // a Window scene id, opened via AppActivation
+        case models           // switches THIS window to the model browser
+        case tasks            // …and to the Tasks pane
+        case create(GenExperiment)  // …and to one of the media generators
         case mediaMenu        // chip renders as a Menu over `mediaItems`
         case codeLauncher     // chip renders the tray's CLI launcher dropdown
     }
@@ -41,13 +44,13 @@ enum ChatEmptyState {
     /// Tools menu's media section (same array, deliberately).
     static let mediaItems: [Item] = [
         Item(id: "media-image", title: "Image Generation", systemImage: "photo",
-             tint: .purple, action: .window("imageGen")),
+             tint: .purple, action: .create(.image)),
         Item(id: "media-video", title: "Video Generation", systemImage: "film",
-             tint: .indigo, action: .window("videoGen")),
+             tint: .indigo, action: .create(.video)),
         Item(id: "media-audio", title: "Audio & Music", systemImage: "waveform",
-             tint: .pink, action: .window("audioGen")),
+             tint: .pink, action: .create(.audio)),
         Item(id: "media-3d", title: "3D Model", systemImage: "cube",
-             tint: .brown, action: .window("model3dGen")),
+             tint: .brown, action: .create(.model3d)),
     ]
 
     /// The chip row. The Code Launcher is DMG-only — the MAS build can't
@@ -59,10 +62,10 @@ enum ChatEmptyState {
                  tint: .purple, action: .mediaMenu,
                  help: "Generate images, video, audio, or 3D models"),
             Item(id: "models", title: "Browse Models", systemImage: "magnifyingglass",
-                 tint: .blue, action: .window("modelBrowser"),
+                 tint: .blue, action: .models,
                  help: "Search and download models"),
             Item(id: "tasks", title: "Tasks", systemImage: "clock.badge.checkmark",
-                 tint: .orange, action: .window("tasks"),
+                 tint: .orange, action: .tasks,
                  help: "Scheduled and background agent tasks"),
         ]
         if cliLauncherAvailable {
@@ -86,6 +89,12 @@ enum ChatEmptyState {
 
 /// Discovery chips rendered under the empty conversation's greeting.
 struct EmptyStateChipRow: View {
+    /// Set by the chat, which turns a media chip into a COMPOSER MODE rather
+    /// than a jump to the Create page: the whole point of the chip is that you
+    /// stay where you are. nil (the menu-bar twin, which has no session in
+    /// hand) falls back to opening the page.
+    var onCreateInChat: ((GenExperiment) -> Void)?
+
     @EnvironmentObject var appState: AppState
     @EnvironmentObject var server: ServerManager
     @Environment(\.openWindow) private var openWindow
@@ -121,7 +130,7 @@ struct EmptyStateChipRow: View {
                                 AppActivation.openWindow(id: "sandboxTerminal", using: openWindow)
                             })
                     }
-                case .window:
+                case .models, .create, .tasks, .window:
                     Button { open(item) } label: {
                         EmptyStateChipLabel(item: item)
                     }
@@ -155,8 +164,22 @@ struct EmptyStateChipRow: View {
     }
 
     private func open(_ item: ChatEmptyState.Item) {
-        if case .window(let id) = item.action {
+        switch item.action {
+        case .window(let id):
             AppActivation.openWindow(id: id, using: openWindow)
+        case .models:
+            // Not a window — the browser is this window's other mode.
+            appState.showModels()
+        case .tasks:
+            appState.showTasks()
+        case .create(let experiment):
+            if let onCreateInChat {
+                onCreateInChat(experiment)
+            } else {
+                appState.showCreate(experiment)
+            }
+        case .mediaMenu, .codeLauncher:
+            break  // rendered as menus; nothing to open on click
         }
     }
 }

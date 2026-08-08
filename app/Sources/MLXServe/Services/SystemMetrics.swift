@@ -82,6 +82,53 @@ enum SystemMetrics {
         return (free &+ inactive) &* UInt64(vm_kernel_page_size)
     }
 
+    /// Bytes available for a NEW large allocation (a model load), using the
+    /// SAME formula as the server's pre-flight (`status.zig` `computeAvailableBytes`):
+    /// total minus the non-reclaimable resident set — wired + compressed +
+    /// anonymous, less reclaimable purgeable. This matches the "Available RAM"
+    /// the tray shows from a running server, so the meter reads the same with or
+    /// without one (the tray prefers the live server value when present).
+    static func availableForModelBytes() -> UInt64 {
+        var totalMem: UInt64 = 0
+        var len = MemoryLayout<UInt64>.size
+        guard sysctlbyname("hw.memsize", &totalMem, &len, nil, 0) == 0, totalMem > 0 else { return 0 }
+
+        var pageSize: vm_size_t = 0
+        guard host_page_size(mach_host_self(), &pageSize) == KERN_SUCCESS, pageSize > 0 else { return 0 }
+
+        var stats = vm_statistics64()
+        var count = mach_msg_type_number_t(MemoryLayout<vm_statistics64>.size / MemoryLayout<Int32>.size)
+        let result = withUnsafeMutablePointer(to: &stats) { ptr in
+            ptr.withMemoryRebound(to: integer_t.self, capacity: Int(count)) { intPtr in
+                host_statistics64(mach_host_self(), HOST_VM_INFO64, intPtr, &count)
+            }
+        }
+        guard result == KERN_SUCCESS else { return 0 }
+
+        return computeAvailableForModel(
+            totalBytes: totalMem,
+            wirePages: UInt64(stats.wire_count),
+            compressorPages: UInt64(stats.compressor_page_count),
+            internalPages: UInt64(stats.internal_page_count),
+            purgeablePages: UInt64(stats.purgeable_count),
+            pageSize: UInt64(pageSize)
+        )
+    }
+
+    /// Pure counterpart of `availableForModelBytes` — the exact arithmetic of
+    /// `status.zig`'s `computeAvailableBytes`, so it's unit-tested without the
+    /// live Mach call. Purgeable is reclaimable, so it's excluded from the
+    /// resident anon set (saturating, never underflowing). Returns 0 on a bad
+    /// query or when used ≥ total.
+    static func computeAvailableForModel(totalBytes: UInt64, wirePages: UInt64,
+                                         compressorPages: UInt64, internalPages: UInt64,
+                                         purgeablePages: UInt64, pageSize: UInt64) -> UInt64 {
+        let residentAnon = internalPages >= purgeablePages ? internalPages - purgeablePages : 0
+        let usedBytes = (wirePages + compressorPages + residentAnon) &* pageSize
+        if totalBytes == 0 || usedBytes >= totalBytes { return 0 }
+        return totalBytes - usedBytes
+    }
+
     // MARK: - Process identity (was: /bin/ps -o comm=)
 
     /// Absolute executable path, or nil if the process is gone or unreadable

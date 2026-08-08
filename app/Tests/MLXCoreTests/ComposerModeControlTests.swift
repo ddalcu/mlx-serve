@@ -234,15 +234,17 @@ final class ComposerModeControlTests: XCTestCase {
                       "model / workspace / voice all live outside the turn")
     }
 
-    func testTheAgentPickerSitsNextToNewChat() throws {
-        let source = try chatViewSource()
-        let sidebar = try XCTUnwrap(source.range(of: "struct ChatSidebar: View {"))
-        let rest = source[sidebar.upperBound...]
-        let body = String(rest[..<(rest.range(of: "\n// MARK:")?.lowerBound ?? rest.endIndex)])
-        XCTAssertTrue(body.contains("newAgentChatMenu"),
-                      "the sidebar owns the agent picker now")
-        XCTAssertTrue(body.contains("startChat(withAgent:"),
+    func testTheAgentPickerLivesOnTheAgentsDestination() throws {
+        let chat = try chatViewSource()
+        // It moved off the icon button beside New Chat and onto the sidebar's
+        // Agents row — but it MOVED, it wasn't dropped: starting a chat as
+        // somebody is the only moment a session's agent can be decided.
+        XCTAssertTrue(chat.contains("private var agentsRow"),
+                      "the sidebar's Agents destination owns the agent picker now")
+        XCTAssertTrue(chat.contains("appState.startChat(withAgent: agent.id)"),
                       "picking an agent starts a chat as that agent")
+        XCTAssertTrue(chat.contains("Button(\"Manage Agents…\")"),
+                      "…and the editor stays reachable from the same row")
     }
 
     // MARK: - Content passing under floating chrome
@@ -279,8 +281,16 @@ final class ComposerModeControlTests: XCTestCase {
             hiding the band leaves the scroll-edge effect with nothing to attach \
             to — content then runs straight into the floating controls.
             """)
+        // EVERY column of every split view in this file, not a fixed two: Tasks
+        // renders as a three-column split (sidebar / task list / task detail),
+        // and a column that opts out of the material shows a seam where the bar
+        // should be continuous.
         let visible = source.components(separatedBy: ".toolbarBackground(.visible, for: .windowToolbar)").count - 1
-        XCTAssertEqual(visible, 2, "the sidebar and the detail column must agree — the bar is one surface")
+        let splits = source.components(separatedBy: "NavigationSplitView(").count - 1
+        let columns = splits + (source.components(separatedBy: "} content: {").count - 1)
+            + (source.components(separatedBy: "} detail: {").count - 1)
+        XCTAssertEqual(visible, columns,
+                       "every split-view column must carry the material — the bar is one surface")
     }
 
     // MARK: - Hover card dismissal

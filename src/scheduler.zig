@@ -1619,10 +1619,10 @@ pub const Scheduler = struct {
         req.done_mu.unlock(self.io);
 
         if (req.error_name) |name| {
-            self.allocator.free(name);
+            defer self.allocator.free(name);
             // On success the inference thread took ownership of cpu_state;
             // on failure it didn't, so we still hold it.
-            return error.LoadFailed;
+            return loadErrorFor(name);
         }
 
         // Success — inference thread installed cpu_state onto the entry.
@@ -1849,6 +1849,31 @@ fn signalStarted(sch: *Scheduler) void {
     defer sch.started_mu.unlock(sch.io);
     sch.started.store(true, .release);
     sch.started_cond.broadcast(sch.io);
+}
+
+/// Which error a failed load reports to the HTTP layer.
+///
+/// The name was being FREED and every failure collapsed to `LoadFailed`, so a
+/// refusal the server had a precise sentence for ("needs ~5.8 GB free, 5.4 GB
+/// available") reached the client as "Model load failed" and the app showed
+/// that. Memory is the one load failure a user can act on, so it keeps its own
+/// error — and its own status code — all the way out.
+pub fn loadErrorFor(error_name: []const u8) anyerror {
+    if (std.mem.eql(u8, error_name, "InsufficientMemory")) return error.NotEnoughMemory;
+    if (std.mem.eql(u8, error_name, "OutOfMemory")) return error.NotEnoughMemory;
+    return error.LoadFailed;
+}
+
+test "a memory refusal keeps its own error out to the client" {
+    // Live 2026-08-08: the image engine refused for memory, the name was freed,
+    // and the pane showed a generic "Model load failed" with an empty log — the
+    // one failure the user could have fixed, rendered unactionable.
+    try std.testing.expectEqual(error.NotEnoughMemory, loadErrorFor("InsufficientMemory"));
+    try std.testing.expectEqual(error.NotEnoughMemory, loadErrorFor("OutOfMemory"));
+    // Everything else stays a load failure — guessing a diagnosis is worse than
+    // reporting the honest generic one.
+    try std.testing.expectEqual(error.LoadFailed, loadErrorFor("FileNotFound"));
+    try std.testing.expectEqual(error.LoadFailed, loadErrorFor("unknown"));
 }
 
 /// Set the load_error_name + flip load_failed. Best-effort dupe; on OOM the
@@ -2275,7 +2300,8 @@ fn doLoadGenOnInferenceThread(sch: *Scheduler, params: anytype, modality: gen_mo
             @as(f64, @floatFromInt(avail)) / gb,
         });
         if (memInsufficientForLoad(peak, avail)) {
-            log.err("Insufficient memory for this media model: generation peaks at ~{d:.1} GB but only {d:.1} GB is free. Close other models/apps and retry; pass --skip-mem-preflight to override.\n", .{
+            log.err("Insufficient memory for this media model: needs ~{d:.1} GB free ({d:.1} GB for the model plus headroom for warmup buffers) but only {d:.1} GB is available. Unload the chat model or close other apps and retry; pass --skip-mem-preflight to override.\n", .{
+                @as(f64, @floatFromInt(loadRequirementBytes(peak))) / gb,
                 @as(f64, @floatFromInt(peak)) / gb,
                 @as(f64, @floatFromInt(avail)) / gb,
             });
@@ -2414,9 +2440,44 @@ fn memInsufficientForLoad(weights_bytes: u64, avail_bytes: u64) bool {
     // served 6.7K-token prefills with ~8.6 GB to spare. 6 GB keeps the original
     // margin for every model under 48 GB (where it was tuned) and stays inside
     // the measured envelope above it.
+    return avail_bytes < loadRequirementBytes(weights_bytes);
+}
+
+/// Total free memory a load demands: the model's own peak plus the headroom the
+/// guard wants for warmup buffers and a baseline KV cache.
+///
+/// It exists so a REFUSAL can quote the number it actually compared. The media
+/// preflight used to say "generation peaks at ~4.3 GB but only 5.4 GB is free"
+/// — two figures that, read together, say the load should have worked. It was
+/// refused for the headroom, which the sentence never mentioned, so the user
+/// went hunting for a problem that wasn't there (live 2026-08-08). Same class as
+/// the context-overflow 400: a rejection has to state the bar it set.
+pub fn loadRequirementBytes(weights_bytes: u64) u64 {
     const HEADROOM_CAP: u64 = 6 * 1024 * 1024 * 1024;
     const headroom: u64 = @min(weights_bytes / 8, HEADROOM_CAP) + 1024 * 1024 * 1024;
-    return avail_bytes < weights_bytes + headroom;
+    return weights_bytes + headroom;
+}
+
+test "a refusal quotes the number it actually compared" {
+    const GB: u64 = 1024 * 1024 * 1024;
+    const MB: u64 = 1024 * 1024;
+
+    // Live report 2026-08-08: FLUX.2-klein 4B refused with "generation peaks at
+    // ~4.3 GB but only 5.4 GB is free" — two numbers that say the load should
+    // have worked. The guard was right (it also wants ~1.5 GB of headroom for
+    // warmup buffers) but the message quoted the PEAK, so the user went looking
+    // for a problem that wasn't there and then tried the same prompt in the
+    // other pane. What a refusal must state is the TOTAL it demanded.
+    const peak: u64 = 4300 * MB;
+    const avail: u64 = 5400 * MB;
+    try std.testing.expect(memInsufficientForLoad(peak, avail));
+    try std.testing.expect(loadRequirementBytes(peak) > avail);
+
+    // The requirement IS the comparison — not a second formula that can drift
+    // from it. At exactly the requirement a load is allowed; a byte under is not.
+    try std.testing.expect(!memInsufficientForLoad(peak, loadRequirementBytes(peak)));
+    try std.testing.expect(memInsufficientForLoad(peak, loadRequirementBytes(peak) - 1));
+    try std.testing.expect(!memInsufficientForLoad(42 * GB, loadRequirementBytes(42 * GB)));
 }
 
 test "memInsufficientForLoad: headroom + unknown-query guards" {

@@ -408,6 +408,39 @@ struct ChatView: View {
     }
 
     var body: some View {
+        // Tasks gets a THIRD column: its list belongs beside the app's sidebar,
+        // not inside the content area — a list of tasks is navigation, and
+        // nesting it in the detail column made the window look like it had two
+        // unrelated sidebars stacked horizontally.
+        if appState.chatWorkspace.isTasks {
+            tasksSplitView
+        } else {
+            standardSplitView
+        }
+    }
+
+    private var tasksSplitView: some View {
+        NavigationSplitView(columnVisibility: $columnVisibility) {
+            ChatSidebar()
+                .navigationSplitViewColumnWidth(min: 180, ideal: 220, max: 280)
+                .toolbarBackground(.visible, for: .windowToolbar)
+        } content: {
+            TasksView().taskList
+                .environmentObject(appState.taskScheduler)
+                .navigationSplitViewColumnWidth(min: 240, ideal: 280, max: 340)
+                // Every column carries the material — the bar is ONE surface
+                // across the window, and a column that opts out shows a seam.
+                .toolbarBackground(.visible, for: .windowToolbar)
+        } detail: {
+            TasksView().taskDetail
+                .environmentObject(appState.taskScheduler)
+                .toolbarBackground(.visible, for: .windowToolbar)
+        }
+        .navigationTitle("")
+        .onAppear { AppActivation.focus() }
+    }
+
+    private var standardSplitView: some View {
         NavigationSplitView(columnVisibility: $columnVisibility) {
             ChatSidebar()
                 .navigationSplitViewColumnWidth(min: 180, ideal: 220, max: 280)
@@ -417,7 +450,24 @@ struct ChatView: View {
                 // scroll-edge effect attaches to.
                 .toolbarBackground(.visible, for: .windowToolbar)
         } detail: {
-            if let sessionId = appState.activeChatId,
+            // Two modes in one column: the transcript, or the model browser
+            // (`ChatWorkspace`). The browser used to be its own Window, so
+            // every route to it was a route OUT of this one — and a window the
+            // user then had to find their own way back from.
+            if case .models(let section) = appState.chatWorkspace {
+                // Content only — the sections and the way back are the SIDEBAR
+                // while this mode is up (`ChatSidebar.modelsRow`).
+                ModelBrowserPane(section: Binding(
+                    get: { section },
+                    set: { appState.selectModelSection($0) }))
+            } else if appState.chatWorkspace.isSettings {
+                SettingsView(embedded: true)
+            } else if case .create(let experiment) = appState.chatWorkspace {
+                // The four generators were four Window scenes; they are pages
+                // of this window now. Each keeps its own view untouched — only
+                // the hosting moved.
+                createPane(experiment)
+            } else if let sessionId = appState.activeChatId,
                appState.chatSessions.contains(where: { $0.id == sessionId }) {
                 ChatDetailView(sessionId: sessionId)
             } else {
@@ -438,8 +488,17 @@ struct ChatView: View {
         // Blocking: the setter drops SwiftUI's own dismissals, so nothing but
         // Cancel takes this sheet down. The getter is recomputed every update,
         // so it also clears ITSELF the moment a chat model lands.
-        .sheet(isPresented: Binding(get: { gateIsBlocking && !gateCancelled },
-                                    set: { _ in })) {
+        // …and it stands down over the models pane: the browser it is asking
+        // the user to go and use now lives behind it, in this window
+        // (`ChatWorkspace.gateShouldPresent`). Deferred, not dismissed — it
+        // returns the moment they go back to a conversation with no model.
+        .sheet(isPresented: Binding(
+            get: {
+                ChatWorkspace.gateShouldPresent(gateIsBlocking: gateIsBlocking,
+                                                cancelled: gateCancelled,
+                                                workspace: appState.chatWorkspace)
+            },
+            set: { _ in })) {
             ChatModelGateSheet(pick: starterPick, onCancel: cancelGate)
                 .environmentObject(appState)
                 .environmentObject(appState.downloads)
@@ -460,6 +519,21 @@ struct ChatView: View {
         }
     }
 
+    /// One generator page. `GenExperiment` is the shared catalogue (tray tiles,
+    /// discovery chips, Tools menu), so this switch is the only place that maps
+    /// a case to its view and cannot fall out of sync with what is offered.
+    @ViewBuilder
+    private func createPane(_ experiment: GenExperiment) -> some View {
+        switch experiment {
+        case .image:   ImageGenView().environmentObject(appState.imageGen)
+        case .video:   VideoGenView().environmentObject(appState.videoGen)
+        case .audio:   AudioGenView()
+                           .environmentObject(appState.audioGen)
+                           .environmentObject(appState.musicGen)
+        case .model3d: Model3DGenView().environmentObject(appState.model3dGen)
+        }
+    }
+
     /// Cancel on the gate: end the sheet, THEN close the window. Both halves
     /// are required and the order is load-bearing — a window with an attached
     /// sheet can't be closed, and dismissing to the composer underneath is the
@@ -470,18 +544,72 @@ struct ChatView: View {
     }
 }
 
+/// A sidebar destination's chrome: nothing drawn until you hover it, and the
+/// SAME gray when it is the selected one.
+///
+/// The rows used to carry a permanent `sidebarActionButton()` fill, which made
+/// six always-highlighted blocks and left selection with nothing to say. Gray
+/// now means exactly one thing in this panel — "this is the row you are on, or
+/// the row you are pointing at" — and the conversation rows below use it too.
+struct DestinationRowButton<Label: View>: View {
+    let selected: Bool
+    let action: () -> Void
+    @ViewBuilder var label: Label
+
+    @State private var hovering = false
+
+    var body: some View {
+        Button(action: action) { label }
+            .buttonStyle(.plain)
+            .frame(height: ChatMetrics.sidebarButtonHeight)
+            .background(
+                RoundedRectangle(cornerRadius: ChatMetrics.sidebarButtonCornerRadius)
+                    .fill(SidebarRowStyle.fill(selected: selected, hovering: hovering))
+            )
+            .onHover { hovering = $0 }
+    }
+}
+
+/// The one place the panel's row fill is decided — destinations and
+/// conversations both read it, so "selected" cannot look like two things.
+enum SidebarRowStyle {
+    static func fill(selected: Bool, hovering: Bool) -> Color {
+        if selected { return Color.primary.opacity(0.10) }
+        return hovering ? Color.primary.opacity(0.05) : Color.clear
+    }
+}
+
 // MARK: - Sidebar
 
 struct ChatSidebar: View {
     @EnvironmentObject var appState: AppState
     @Environment(\.openWindow) private var openWindow
     @State private var hoveredSessionId: UUID?
+    /// Scans for installed agent CLIs — the Code Launcher row renders the tray's
+    /// shared menu body, which needs it.
+    @StateObject private var cliDetector = CLILauncher()
 
     var body: some View {
-        List(selection: $appState.activeChatId) {
+        conversationsSidebar
+    }
+
+    private var conversationsSidebar: some View {
+        // No `selection:` binding: a List draws its own selection tint UNDER
+        // `listRowBackground`, which is the double highlight — two grays, the
+        // inner one a different value from the destinations above, and an accent
+        // agent label sitting on whichever won. Selection is ours now, drawn by
+        // the one `SidebarRowStyle` both halves of this panel read.
+        List {
             ForEach(appState.visibleChatSessions) { session in
                 let isSelected = session.id == appState.activeChatId
                 HStack(spacing: 0) {
+                    // A REAL button, beside the delete button — never a tap
+                    // gesture wrapped around the row: on macOS that swallows
+                    // the child button's clicks silently.
+                    Button {
+                        appState.showConversation()
+                        appState.activeChatId = session.id
+                    } label: {
                     VStack(alignment: .leading, spacing: 2) {
                         HStack(spacing: 4) {
                             if session.isExternalBridge {
@@ -493,7 +621,7 @@ struct ChatSidebar: View {
                             Text(session.title)
                                 .font(.subheadline.weight(isSelected ? .semibold : .regular))
                                 .lineLimit(1)
-                                .foregroundStyle(isSelected ? .white : .primary)
+                                .foregroundStyle(.primary)
                         }
                         // Who this chat is talking to, when it isn't the app
                         // defaults. Sits on the timestamp line rather than the
@@ -501,26 +629,30 @@ struct ChatSidebar: View {
                         // title, which is what the row is FOR — and it answers
                         // "why does this thread behave differently" without
                         // opening it.
-                        HStack(spacing: 4) {
-                            if let agent = appState.agents.agent(id: session.agentId) {
+                        // The subtitle line exists only to answer "why does
+                        // this thread behave differently" — i.e. which agent
+                        // it belongs to. The timestamp answered nothing the
+                        // list's own order didn't already say, and it put a
+                        // second line under every row to say it.
+                        if let agent = appState.agents.agent(id: session.agentId) {
+                            HStack(spacing: 4) {
                                 Image(systemName: agent.symbol)
                                     .font(.system(size: 9))
-                                    .foregroundStyle(isSelected ? Color.white.opacity(0.85) : Color.accentColor)
+                                    .foregroundStyle(Color.accentColor)
                                 Text(agent.name)
                                     .font(.caption2)
                                     .lineLimit(1)
                                     .truncationMode(.tail)
-                                    .foregroundStyle(isSelected ? Color.white.opacity(0.85) : Color.accentColor)
-                                Text("·")
-                                    .font(.caption2)
-                                    .foregroundStyle(isSelected ? Color.white.opacity(0.5) : Color.secondary.opacity(0.4))
+                                    .foregroundStyle(Color.accentColor)
                             }
-                            Text(relativeTime(session.updatedAt))
-                                .font(.caption2)
-                                .foregroundStyle(isSelected ? Color.white.opacity(0.7) : Color.secondary.opacity(0.5))
                         }
+                        Spacer(minLength: 0)
                     }
-                    Spacer(minLength: 4)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+
                     if hoveredSessionId == session.id {
                         Button {
                             appState.deleteSession(session.id)
@@ -528,28 +660,33 @@ struct ChatSidebar: View {
                             Image(systemName: "xmark.circle.fill")
                                 .font(.system(size: 14))
                                 .symbolRenderingMode(.hierarchical)
-                                .foregroundStyle(isSelected ? .white.opacity(0.8) : .secondary)
+                                .foregroundStyle(.secondary)
                         }
                         .buttonStyle(.plain)
                         .help("Delete chat")
                     }
                 }
-                .tag(session.id)
+                .padding(.leading, 8)
+                .padding(.trailing, 6)
+                .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .contentShape(Rectangle())
                 .onHover { isHovered in
                     hoveredSessionId = isHovered ? session.id : nil
                 }
+                // One meaning for gray in this panel: destinations and
+                // conversations share `SidebarRowStyle` (the accent-filled,
+                // white-text row made a selected chat look like a different
+                // KIND of thing from a selected destination).
                 .listRowBackground(
-                    Group {
-                        if isSelected {
-                            RoundedRectangle(cornerRadius: 8)
-                                .fill(Color.accentColor)
-                                .padding(.horizontal, 6)
-                        } else {
-                            Color.clear
-                        }
-                    }
+                    RoundedRectangle(cornerRadius: ChatMetrics.sidebarButtonCornerRadius)
+                        .fill(SidebarRowStyle.fill(selected: isSelected,
+                                                   hovering: hoveredSessionId == session.id))
                 )
-                .listRowSeparator(.visible)
+                .listRowInsets(EdgeInsets(top: 1, leading: 8, bottom: 1, trailing: 8))
+                // No rules between conversations: the rows are separated by
+                // their own hover/selection shape, and a hairline under every
+                // one of them read as a table.
+                .listRowSeparator(.hidden)
                 .contextMenu {
                     Button("Delete", role: .destructive) {
                         appState.deleteSession(session.id)
@@ -564,42 +701,115 @@ struct ChatSidebar: View {
         // that overlap. Not a hand-drawn band — a custom strip pulled into this
         // area once looked native and swallowed every click in it.
         .scrollEdgeEffectStyle(.soft, for: [.top, .bottom])
-        // No Agents / Models entries here: both windows are reachable from the
-        // chat toolbar now — "Manage Agents…" in the composer's agent chip and
-        // "Manage Models…" in the model picker — and each sat next to the
-        // control it configures. The sidebar is the conversation list, and a
-        // second route to the same two windows only competed with it.
-        .safeAreaInset(edge: .bottom) {
-            HStack(spacing: 8) {
-                Button {
+        // Selecting a conversation is also how you leave the models pane — the
+        // list is the way back, which is the whole reason the browser stopped
+        // being a window.
+        .onChange(of: appState.activeChatId) { _, _ in
+            appState.showConversation()
+        }
+        // No Agents entry here: "Manage Agents…" lives in the composer's agent
+        // chip, next to the control it configures, and a second route to the
+        // same window only competed with the conversation list. Models is a
+        // different animal — it is not a window any more but a MODE of this
+        // one, so this row is the mode switch, not a duplicate route.
+        // Destinations above the conversation list, in one column: what the
+        // window can BE, then what you've said. Selecting any of them changes
+        // only the content area — the sidebar never rearranges itself, so the
+        // list of places stays where the eye learned it.
+        .safeAreaInset(edge: .top) {
+            VStack(spacing: 2) {
+                // No agent button beside New Chat: the Agents row below owns
+                // that now, and two routes to the same place in adjacent
+                // controls is the duplication the destination list removed.
+                destinationRow("New Chat", icon: "square.and.pencil",
+                               selected: false) {
+                    appState.showConversation()
                     _ = appState.newChatSession()
-                } label: {
-                    Label("New Chat", systemImage: "plus")
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                        .contentShape(Rectangle())
                 }
-                // `.plain` + our own frame and background, NOT `.bordered` —
-                // see `ChatMetrics.sidebarButtonHeight`. It is the only way the
-                // two controls are the same height by construction rather than
-                // by whatever a style style decides their labels are worth.
-                .buttonStyle(.plain)
-                .sidebarActionButton()
-                newAgentChatMenu
+                // Agents and Settings still open their own windows: each is a
+                // NavigationSplitView of its own, and one nested inside this
+                // window's would fight it for column behaviour. Embedding them
+                // is the same shell refactor TasksView just took.
+                agentsRow
+                destinationRow("Tasks", icon: "clock.badge.checkmark",
+                               selected: appState.chatWorkspace.isTasks) {
+                    appState.chatWorkspace.isTasks ? appState.showConversation() : appState.showTasks()
+                }
+                // A launcher is a CHOICE of CLI, so the row is the menu it has
+                // always been (the tray's own list, shared) rather than an
+                // invented pane with one list in it.
+                codeLauncherRow
+                destinationRow("Models", icon: "square.stack.3d.up",
+                               selected: appState.chatWorkspace.isModels,
+                               badge: activeDownloadCount) {
+                    appState.chatWorkspace.isModels ? appState.showConversation() : appState.showModels()
+                }
+                destinationRow("Settings", icon: "gearshape",
+                               selected: appState.chatWorkspace.isSettings) {
+                    appState.chatWorkspace.isSettings ? appState.showConversation() : appState.showSettings()
+                }
+
+                HStack {
+                    Text("Recent")
+                        .font(.caption.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                    Spacer()
+                }
+                .padding(.top, 10)
+                .padding(.leading, 6)
+                .padding(.bottom, 2)
             }
-            .padding(.horizontal, 12)
-            .padding(.vertical, 10)
+            .padding(.horizontal, 8)
+            .padding(.top, 10)
+            .padding(.bottom, 4)
         }
     }
 
-    /// Start a chat AS an agent.
+    /// One destination row. All of them are the same shape by construction —
+    /// the mockup's point is that this column reads as ONE list of places, not
+    /// as a pile of controls that happen to be stacked.
+    private func destinationRow(_ title: String, icon: String, selected: Bool,
+                                badge: Int = 0,
+                                action: @escaping () -> Void) -> some View {
+        DestinationRowButton(selected: selected, action: action) {
+            destinationLabel(title, icon: icon, selected: selected, badge: badge)
+        }
+    }
+
+    @ViewBuilder
+    private func destinationLabel(_ title: String, icon: String, selected: Bool,
+                                  badge: Int = 0) -> some View {
+        HStack(spacing: 7) {
+            Image(systemName: icon)
+                .font(.system(size: 12, weight: .medium))
+                .frame(width: 16)
+            Text(title).font(.subheadline.weight(.medium))
+            Spacer(minLength: 4)
+            if badge > 0 {
+                Text("\(badge)")
+                    .font(.caption2.monospacedDigit())
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 1)
+                    .background(.quaternary, in: Capsule())
+            }
+        }
+        .foregroundStyle(Color.primary)
+        .padding(.leading, 8)
+        .padding(.trailing, 6)
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+        .contentShape(Rectangle())
+    }
+
+    /// The Agents row. A MENU, because "Agents" is two things: the agents you
+    /// can start a conversation as, and the editor for them.
     ///
-    /// Next to New Chat because that is WHEN the choice is made: a session's
-    /// agent is fixed once the session exists (there is no `setAgent` any more),
-    /// so this is the only place it can be picked. It used to be a chip in the
-    /// composer, where it configured the whole conversation from the row that
-    /// configures one message — and a mid-thread switch silently re-pointed the
-    /// prompt, tools, model and voice of a conversation already underway.
-    private var newAgentChatMenu: some View {
+    /// Starting a chat as somebody has to live here — it is the ONLY moment it
+    /// can be decided (`AppState.startChat(withAgent:)`; a session's agent is
+    /// fixed once the session exists, there is no `setAgent`). It used to be an
+    /// icon button beside New Chat; deleting that button without moving the menu
+    /// would have quietly removed the capability, not just the control.
+    @ViewBuilder
+    private var agentsRow: some View {
         Menu {
             if appState.agents.allAgents.isEmpty {
                 Text("No agents yet")
@@ -607,10 +817,11 @@ struct ChatSidebar: View {
             ForEach(appState.agents.allAgents) { agent in
                 let decision = appState.agentModelDecision(for: agent)
                 Button {
+                    appState.showConversation()
                     appState.startChat(withAgent: agent.id)
                 } label: {
-                    // Same rule as the old chip: an agent whose pinned model
-                    // isn't downloaded says so rather than failing at send.
+                    // An agent whose pinned model isn't downloaded says so
+                    // rather than failing at send.
                     Label(AgentModelSwitch.isSelectable(decision)
                           ? agent.name : "\(agent.name) — model not downloaded",
                           systemImage: agent.symbol)
@@ -622,27 +833,45 @@ struct ChatSidebar: View {
                 AppActivation.openWindow(id: "agents", using: openWindow)
             }
         } label: {
-            Image(systemName: "person.badge.plus")
-                .frame(width: 34, height: ChatMetrics.sidebarButtonHeight)
-                .contentShape(Rectangle())
+            destinationLabel("Agents", icon: "person.2", selected: false)
         }
         .menuStyle(.button)
         .buttonStyle(.plain)
         .menuIndicator(.hidden)
-        .sidebarActionButton()
-        .help("New chat with an agent — its prompt, tools, model and voice")
+        .frame(height: ChatMetrics.sidebarButtonHeight)
     }
 
-    private func relativeTime(_ date: Date) -> String {
-        let seconds = Int(-date.timeIntervalSinceNow)
-        if seconds < 60 { return "just now" }
-        let minutes = seconds / 60
-        if minutes < 60 { return "\(minutes)m ago" }
-        let hours = minutes / 60
-        if hours < 24 { return "\(hours)h ago" }
-        let days = hours / 24
-        return "\(days)d ago"
+    /// The Code Launcher row: the tray's own CLI list, so the two can't drift.
+    /// DMG-only — the App Store build can't detect or launch other apps' CLIs,
+    /// and a row that can only fail is the dead-control class.
+    @ViewBuilder
+    private var codeLauncherRow: some View {
+        if BuildFeatures.current.cliLauncher {
+            Menu {
+                CLILauncherMenuItems(
+                    detector: cliDetector,
+                    baseURL: appState.server.baseURL,
+                    servedModelId: appState.server.modelInfo?.name ?? "mlx-serve",
+                    serverContextLength: appState.server.modelInfo?.contextLength,
+                    models: appState.server.allModels,
+                    openSandboxAgent: { agentId in
+                        appState.pendingSandboxAgentLaunch = .init(agentId: agentId)
+                        AppActivation.openWindow(id: "sandboxTerminal", using: openWindow)
+                    })
+            } label: {
+                destinationLabel("Code Launcher", icon: "terminal", selected: false)
+            }
+            .menuStyle(.button)
+            .buttonStyle(.plain)
+            .menuIndicator(.hidden)
+            .frame(height: ChatMetrics.sidebarButtonHeight)
+        }
     }
+
+    private var activeDownloadCount: Int {
+        appState.downloads.downloads.values.filter { $0.status == .downloading }.count
+    }
+
 }
 
 // MARK: - Chat Detail
@@ -692,6 +921,28 @@ struct ChatDetailView: View {
     // post-generation code set it true to (re)focus the field.
     @State private var inputFocused = false
     @State private var composerHeight: CGFloat = 36
+    /// The composer's create mode (`ChatCreateMode`) — nil for plain chat.
+    /// Mirrors `ChatSession.createMode`; see `syncTogglesFromSession`.
+    @State private var createMode: ChatCreateMode?
+    /// Live progress of a create-mode generation, rendered above the composer.
+    /// Not the engine's `mediaProgress`: that one belongs to a TURN the model
+    /// drove, and this is the user driving directly with no turn at all.
+    @State private var createProgress: MediaGenProgress?
+    /// Expanded state of the create-mode settings disclosure.
+    @State private var showCreateSettings = false
+    /// Last create-mode failure, shown inline instead of thrown away.
+    @State private var createError: String?
+    /// A prompt typed before its model was on disk. Held (never dropped) while
+    /// the download runs, then generated — see `ChatCreateSend`.
+    @State private var heldCreatePrompt: HeldCreatePrompt?
+
+    struct HeldCreatePrompt: Equatable {
+        let prompt: String
+        let sourcePath: String?
+        /// True once the transfer is under way, so the row can stop offering a
+        /// second Download press.
+        var downloading: Bool = false
+    }
     // Pre-send intent nudge: when a message looks agentic / MCP-bound but the
     // matching mode is off, confirm before sending. `intentSuppress` remembers a
     // per-session "Send anyway" so we stop nagging that chat (keyed by session
@@ -721,6 +972,16 @@ struct ChatDetailView: View {
         isAgentMode = session?.mode == .agent
         enableThinking = session?.enableThinking ?? false
         mcpMode = session?.useMCP ?? false
+        createMode = ChatCreateMode.from(session?.createMode)
+    }
+
+    /// Enter or leave the composer's create mode, persisting it on the session
+    /// (the view is reused across tabs, so this cannot live in `@State` alone).
+    private func setCreateMode(_ mode: ChatCreateMode?) {
+        createMode = mode
+        guard let idx = appState.chatSessions.firstIndex(where: { $0.id == sessionId }) else { return }
+        appState.chatSessions[idx].createMode = mode?.rawValue
+        appState.saveChatHistory()
     }
 
     /// True when the visible session mirrors a Telegram conversation. The
@@ -790,7 +1051,10 @@ struct ChatDetailView: View {
         // the conversation you're having, not the window — and it freed this
         // cluster's width budget.
         HStack(spacing: 4) {
-            ChatModelPill(showsBackground: false)
+            // The model picker moved to the COMPOSER row: it configures the
+            // message being written, not the window — the same argument that
+            // moved Think/Tools/MCP out of here — and down there it has the
+            // width for a download control and a progress hairline.
             // The server being down is discovered HERE — you type and nothing
             // answers — so the fix is offered here too, next to the picker,
             // instead of only in the tray. Transient by construction: it is
@@ -799,7 +1063,7 @@ struct ChatDetailView: View {
             serverStartControl
             Divider().frame(height: 14)
             Button {
-                AppActivation.openWindow(id: "settings", using: openWindow)
+                appState.showSettings()
             } label: {
                 Image(systemName: "gear")
                     .font(.system(size: 12))
@@ -857,7 +1121,8 @@ struct ChatDetailView: View {
     }
 
     // The per-tab agent PICKER used to sit here, between the paperclip and the
-    // mode discs. It's next to New Chat now (`ChatSidebar.newAgentChatMenu`):
+    // mode discs. Starting a chat as an agent lives in the sidebar's Agents
+    // destination now:
     // it configures the whole conversation rather than the message being
     // written, and a session's agent is fixed once the session exists — a
     // mid-thread switch left half a conversation running under someone else's
@@ -1194,13 +1459,28 @@ struct ChatDetailView: View {
             // menu-bar tray (media generation, Model Browser, Tasks, the CLI
             // launcher). Under the greeting, gone once the conversation starts.
             if session?.isExternalBridge != true {
-                EmptyStateChipRow()
+                EmptyStateChipRow(onCreateInChat: { experiment in
+                    // Stay in the chat: the chip turns the COMPOSER into a
+                    // generator rather than throwing the user into the Create
+                    // page's form (`ChatCreateMode`). 3D has no chat mode —
+                    // the transcript can't show a mesh — so it still opens the
+                    // page, which is the only place that can.
+                    if let mode = ChatCreateMode(rawValue: experiment.rawValue) {
+                        withAnimation(.easeInOut(duration: 0.15)) { setCreateMode(mode) }
+                        inputFocused = true
+                    } else {
+                        appState.showCreate(experiment)
+                    }
+                })
                     .padding(.top, 18)
             }
         }
+        // Same column as the transcript and the composer below it, so the
+        // greeting sits over the field rather than spanning the window.
+        .frame(maxWidth: ChatMetrics.contentMaxWidth)
         .frame(maxWidth: .infinity)
         .padding(.horizontal, ChatMetrics.gutter)
-        .padding(.bottom, 14)
+        .padding(.bottom, 22)
     }
 
     var body: some View {
@@ -1215,7 +1495,7 @@ struct ChatDetailView: View {
             // Messages
             ScrollViewReader { proxy in
                 ScrollView {
-                    LazyVStack(spacing: 12) {
+                    LazyVStack(spacing: ChatMetrics.transcriptSpacing) {
                         ForEach(ChatRowBuilder.rows(from: session?.messages ?? [])) { row in
                             switch row {
                             case .message(let m):
@@ -1223,7 +1503,7 @@ struct ChatDetailView: View {
                                     message: m,
                                     sources: sourcesFor(m),
                                     onIncreaseContext: {
-                                        AppActivation.openWindow(id: "settings", using: openWindow)
+                                        appState.showSettings()
                                     },
                                     onDelete: {
                                         appState.deleteMessage(in: sessionId, messageId: m.id)
@@ -1245,6 +1525,14 @@ struct ChatDetailView: View {
                             MediaProgressCard(progress: progress)
                                 .id("mediaProgress")
                         }
+                        // Create mode's own generation. It belongs HERE, under
+                        // the prompt that started it — in the banner above the
+                        // composer it read as chrome, and the transcript just
+                        // sat there looking like nothing had happened.
+                        if let createProgress {
+                            MediaProgressCard(progress: createProgress)
+                                .id("createProgress")
+                        }
                         // Bottom anchor — its position relative to the scroll viewport
                         // tells us whether the user has scrolled to the bottom.
                         Color.clear.frame(height: 1).id("bottom")
@@ -1257,7 +1545,12 @@ struct ChatDetailView: View {
                                 }
                             )
                     }
-                    .padding(ChatMetrics.gutter)
+                    // The reading measure. The window is free to be as wide as
+                    // the user wants; the prose is not (`ChatMetrics`).
+                    .frame(maxWidth: ChatMetrics.contentMaxWidth)
+                    .frame(maxWidth: .infinity)
+                    .padding(.horizontal, ChatMetrics.gutter)
+                    .padding(.vertical, 20)
                 }
                 .coordinateSpace(name: "chatScroll")
                 // Transcript text used to run straight into the floating model
@@ -1348,6 +1641,11 @@ struct ChatDetailView: View {
                 // Renders nothing while voice is off.
                 VoiceOrbView(controller: appState.voice, sessionId: sessionId)
 
+                // Create mode: what the composer is about to do with what you
+                // type, plus its settings and progress. Above the input, so it
+                // is read before the prompt is written.
+                createModeBanner
+
                 // One rounded container, two rows: the input on top with the
                 // full width of the column, its controls beneath — inside the
                 // same border, so they read as belonging to it.
@@ -1373,8 +1671,16 @@ struct ChatDetailView: View {
                 .composerTipOverlay()
               }   // end else (non-Telegram composer)
             }
+            .frame(maxWidth: ChatMetrics.contentMaxWidth)
+            .frame(maxWidth: .infinity)
             .padding(.horizontal, ChatMetrics.gutter)
-            .padding(.vertical, 8)
+            .padding(.vertical, 10)
+            // Once the transcript exists, the composer is the window's bottom
+            // BAR and reads as one: a material band under a full-width divider
+            // (the divider belongs to the transcript, above). In the empty
+            // state it is a floating field under the greeting, so no band —
+            // a bar across the middle of a blank window is a seam.
+            .background(isEmptyConversation ? AnyShapeStyle(.clear) : AnyShapeStyle(.bar))
             // The top spacer's sibling — see the empty-state branch above.
             if isEmptyConversation { Spacer(minLength: 0) }
         }
@@ -1570,6 +1876,12 @@ struct ChatDetailView: View {
     /// The input field. No background or border of its own — the composer
     /// container draws those around both rows. NSTextView-backed so a big paste
     /// stays smooth and the mouse wheel scrolls once it grows past the cap.
+    /// What the input asks for. In create mode it must NOT say "Message" — the
+    /// field looks identical and nothing is being sent to anyone.
+    private var composerPlaceholder: String {
+        createMode?.placeholder ?? "Ask me anything…"
+    }
+
     private var composerField: some View {
         GrowingTextEditor(text: $inputText,
                           isFocused: $inputFocused,
@@ -1581,7 +1893,7 @@ struct ChatDetailView: View {
             .disabled(server.status != .running)
             .overlay(alignment: .topLeading) {
                 if inputText.isEmpty {
-                    Text("Ask me anything…")
+                    Text(composerPlaceholder)
                         .font(.body)
                         .foregroundStyle(.secondary)
                         .padding(.leading, 9)
@@ -1612,6 +1924,12 @@ struct ChatDetailView: View {
         thinkToggle
         agentToggle
         mcpToggle
+
+        // The model answering, right of the discs and left of the gauge. It
+        // belongs to the MESSAGE — which model writes the reply — the same
+        // reason Think/Tools/MCP moved down here, and it has room for the
+        // download affordances the toolbar never did.
+        ChatModelPill(compact: true)
 
         Spacer(minLength: 8)
 
@@ -2031,6 +2349,327 @@ struct ChatDetailView: View {
         Task { _ = await appState.voice.begin() }   // on permission failure the orb shows the error
     }
 
+    // MARK: - Create mode
+
+    /// The banner above the composer while a create mode is on. It has to say
+    /// that the chat model is not reading this — the composer looks exactly like
+    /// chat, and "why didn't it answer me?" is the one bad outcome this mode can
+    /// produce.
+    @ViewBuilder
+    private var createModeBanner: some View {
+        if let mode = createMode {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack(spacing: 8) {
+                    Image(systemName: mode.experiment.icon)
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(Color.accentColor)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text(mode.title).font(.subheadline.weight(.semibold))
+                        // The model doing the work — the one fact that changes
+                        // with the asset type and the only one the user can act
+                        // on. It replaced a paragraph explaining the mode.
+                        HStack(spacing: 5) {
+                            Text(createModelName(mode))
+                                .font(.caption2)
+                                .foregroundStyle(.secondary)
+                                .lineLimit(1)
+                            if !createModelReady(mode) {
+                                Text("not downloaded")
+                                    .font(.caption2.weight(.medium))
+                                    .padding(.horizontal, 5)
+                                    .padding(.vertical, 1)
+                                    .background(.quaternary, in: Capsule())
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                    Spacer(minLength: 8)
+                    Button {
+                        withAnimation(.easeInOut(duration: 0.15)) {
+                            showCreateSettings.toggle()
+                        }
+                    } label: {
+                        Label("Settings", systemImage: "slider.horizontal.3")
+                            .font(.caption)
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .help("Model and size for this mode")
+                    // Leaving is a real control, not a second click on the chip
+                    // that got you here — that chip is scrolled away by now.
+                    Button {
+                        setCreateMode(nil)
+                    } label: {
+                        Image(systemName: "xmark")
+                            .font(.system(size: 10, weight: .semibold))
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .help("Back to chatting")
+                }
+                if showCreateSettings {
+                    createSettings(mode)
+                }
+                if let held = heldCreatePrompt {
+                    // The prompt is HELD, not thrown away: pressing Generate
+                    // without the model is answered here, and what was typed
+                    // runs the moment the bytes land.
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("\(createModelName(mode)) isn't downloaded yet.")
+                            .font(.caption.weight(.medium))
+                        Text("“\(held.prompt)” will generate as soon as it finishes.")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(2)
+                        HStack(spacing: 8) {
+                            Button {
+                                startHeldDownload(mode)
+                            } label: {
+                                Text("Download \(createDownloadSize(mode)) & Generate")
+                                    .font(.caption.weight(.semibold))
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .controlSize(.small)
+                            Button("Cancel") {
+                                // Give the words back rather than dropping them.
+                                inputText = held.prompt
+                                heldCreatePrompt = nil
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                        }
+                    }
+                    .padding(8)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(RoundedRectangle(cornerRadius: 8).fill(Color.primary.opacity(0.05)))
+                }
+                if let createError {
+                    Label(createError, systemImage: "exclamationmark.triangle.fill")
+                        .font(.caption)
+                        .foregroundStyle(.orange)
+                        .textSelection(.enabled)
+                }
+            }
+            .padding(10)
+            .background(
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .fill(Color.accentColor.opacity(0.08))
+            )
+            .overlay(
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .strokeBorder(Color.accentColor.opacity(0.25), lineWidth: 1)
+            )
+        }
+    }
+
+    /// The "minor adjustments" — the model (same control the Create pane uses)
+    /// and the output size. Everything else stays at the pane's saved settings,
+    /// which is what makes this mode and that pane the SAME configuration rather
+    /// than two that drift.
+    @ViewBuilder
+    private func createSettings(_ mode: ChatCreateMode) -> some View {
+        switch mode {
+        case .image:
+            let settings = ImageGenSettings.load()
+            let featured = MediaModelPicks.featured(
+                ImageModelPreset.all,
+                physicalMemoryBytes: ProcessInfo.processInfo.physicalMemory,
+                capabilityOf: \.capabilityLabel)
+            VStack(alignment: .leading, spacing: 8) {
+                MediaModelChooser(
+                    featured: featured,
+                    others: MediaModelPicks.others(ImageModelPreset.all, featured: featured),
+                    selectedId: settings.resolvedModel.id,
+                    lanModel: nil,
+                    capabilityOf: { $0.capabilityLabel },
+                    isDownloaded: { appState.downloads.bundleReady($0.bundle) },
+                    downloadLabel: { "Download \($0.bundle.approxSizeLabel)" },
+                    onSelect: { preset in
+                        var s = ImageGenSettings.load()
+                        s.modelId = preset.id
+                        s.resolutionId = preset.defaultResolution.id
+                        s.save()
+                    },
+                    onDownload: { preset in
+                        appState.downloads.startBundle(preset.bundle) { appState.refreshModels() }
+                    },
+                    lanCapability: "image")
+                Text("Size: \(settings.resolvedResolution(for: settings.resolvedModel).label) — change it in Create ▸ Image for the full set of controls.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+        case .video, .audio:
+            Text("Uses your saved settings from Create ▸ \(mode.experiment.title). Open that page for the full set of controls.")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    /// The model this mode will use, from the same saved settings its Create
+    /// page reads — one configuration, two surfaces.
+    private func createModelName(_ mode: ChatCreateMode) -> String {
+        switch mode {
+        case .image: return ImageGenSettings.load().resolvedModel.name
+        case .video: return VideoGenSettings.load().resolvedModel.name
+        case .audio: return AudioGenSettings.load().resolvedModel.name
+        }
+    }
+
+    private func createModelReady(_ mode: ChatCreateMode) -> Bool {
+        switch mode {
+        case .image: return appState.downloads.bundleReady(ImageGenSettings.load().resolvedModel.bundle)
+        case .video: return appState.downloads.bundleReady(VideoGenSettings.load().resolvedModel.bundle)
+        case .audio: return appState.downloads.bundleReady(AudioGenSettings.load().resolvedModel.bundle)
+        }
+    }
+
+    private func createDownloadSize(_ mode: ChatCreateMode) -> String {
+        switch mode {
+        case .image: return ImageGenSettings.load().resolvedModel.bundle.approxSizeLabel
+        case .video: return VideoGenSettings.load().resolvedModel.bundle.approxSizeLabel
+        case .audio: return AudioGenSettings.load().resolvedModel.bundle.approxSizeLabel
+        }
+    }
+
+    /// Fetch the missing model, then run what was already typed. The completion
+    /// hook is the ONLY thing that starts the generation — a held prompt whose
+    /// download fails stays held rather than silently disappearing.
+    private func startHeldDownload(_ mode: ChatCreateMode) {
+        guard var held = heldCreatePrompt, !held.downloading else { return }
+        held.downloading = true
+        heldCreatePrompt = held
+        let bundle: MediaBundle
+        switch mode {
+        case .image: bundle = ImageGenSettings.load().resolvedModel.bundle
+        case .video: bundle = VideoGenSettings.load().resolvedModel.bundle
+        case .audio: bundle = AudioGenSettings.load().resolvedModel.bundle
+        }
+        appState.downloads.startBundle(bundle) {
+            appState.refreshModels()
+            guard let pending = heldCreatePrompt, pending.downloading else { return }
+            heldCreatePrompt = nil
+            runCreateGeneration(mode, prompt: pending.prompt, sourcePath: pending.sourcePath)
+        }
+    }
+
+    /// Generate directly from the composer — no turn, no model reading the
+    /// prompt, no tool call. The user message is what they typed; the result is
+    /// a media message, exactly the shape the in-chat tools already produce.
+    private func generateInChat(_ mode: ChatCreateMode) {
+        let prompt = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
+        switch ChatCreateSend.decide(prompt: prompt,
+                                     modelReady: createModelReady(mode),
+                                     busy: createProgress != nil) {
+        case .ignore:
+            return
+        case .offerDownload:
+            // Typing is never blocked on a download. Hold what was written and
+            // offer to fetch the model; the words come back on Cancel.
+            let sourceImages = consumePendingImages()
+            heldCreatePrompt = .init(
+                prompt: prompt,
+                sourcePath: sourceImages?.first.flatMap { try? ChatImagePreview.writeTempFile($0).path })
+            inputText = ""
+            createError = nil
+        case .generate:
+            let sourceImages = consumePendingImages()
+            let sourcePath = sourceImages?.first.flatMap { try? ChatImagePreview.writeTempFile($0).path }
+            inputText = ""
+            runCreateGeneration(mode, prompt: prompt, sourcePath: sourcePath,
+                                sourceImages: sourceImages)
+        }
+    }
+
+    /// Run it. Split from `generateInChat` because a held prompt reaches this
+    /// from the download's completion hook, with no composer state left to read.
+    private func runCreateGeneration(_ mode: ChatCreateMode, prompt: String,
+                                     sourcePath: String?, sourceImages: [ChatImage]? = nil) {
+        createError = nil
+        isNearBottom = true
+
+        var userMessage = ChatMessage(role: .user, content: prompt)
+        userMessage.images = sourceImages
+        appendCreateMessage(userMessage)
+
+        Task { @MainActor in
+            createProgress = MediaGenProgress(kind: mode.progressKind, step: 0, total: 0,
+                                              message: "Starting…", startedAt: Date())
+            defer { createProgress = nil }
+            do {
+                let path = try await runCreate(mode, prompt: prompt, sourcePath: sourcePath)
+                guard let kind = GeneratedMediaHandoff.kind(for: mode.experiment) else { return }
+                var result = ChatMessage(role: .assistant, content: "")
+                result.media = [ChatMediaRef(kind: kind, path: path, prompt: prompt)]
+                if kind == .image, let data = FileManager.default.contents(atPath: path) {
+                    // Both, like the in-chat tool path: the bytes the transcript
+                    // draws AND the ref that gives it a Reveal-in-Finder row.
+                    result.images = [ChatImage(data: data)]
+                }
+                appendCreateMessage(result)
+            } catch {
+                createError = error.localizedDescription
+            }
+        }
+    }
+
+    /// One switch, one place: each mode's request is built from the SAME saved
+    /// settings its Create page uses, and run through the service's
+    /// `generateForAgent` — the entry point that deliberately does not touch a
+    /// pane's own phase/task/recent state.
+    private func runCreate(_ mode: ChatCreateMode, prompt: String,
+                           sourcePath: String?) async throws -> String {
+        switch mode {
+        case .image:
+            let settings = ImageGenSettings.load()
+            let preset = settings.resolvedModel
+            let resolution = settings.resolvedResolution(for: preset)
+            let steps = preset.stepsAreFixed
+                ? preset.fixedSteps
+                : preset.settings(settings.quality).steps
+            var request = ImageGenRequest(
+                model: preset, prompt: prompt, seed: -1,
+                width: resolution.width, height: resolution.height, steps: steps)
+            if let sourcePath {
+                request.initImagePath = sourcePath
+                // An editor edits; a variation model renoises. Same rule the
+                // pane uses — a source image MEANS edit where editing exists.
+                request.editMode = preset.supportsReferenceEdit
+            }
+            return try await appState.imageGen.generateForAgent(
+                request, server: server, onProgress: { createProgress = $0 })
+        case .video:
+            let settings = VideoGenSettings.load()
+            let preset = settings.resolvedModel
+            let resolution = settings.resolvedResolution(for: preset)
+            // The pane's own saved frame count, clamped to what this model can
+            // actually render — a preset switch can leave a ladder value the new
+            // model has no bucket for.
+            let frames = min(settings.numFrames, preset.maxFrames)
+            var request = VideoGenRequest(
+                model: preset, prompt: prompt,
+                width: resolution.width, height: resolution.height,
+                numFrames: frames, fps: preset.fps,
+                mode: settings.mode,
+                steps: settings.steps,
+                cfgScale: settings.cfgScale)
+            request.firstFrameImagePath = sourcePath
+            return try await appState.videoGen.generateForAgent(
+                request, server: server, onProgress: { createProgress = $0 })
+        case .audio:
+            let settings = AudioGenSettings.load()
+            let request = AudioGenRequest(model: settings.resolvedModel, text: prompt)
+            return try await appState.audioGen.generateForAgent(
+                request, server: server, onProgress: { createProgress = $0 })
+        }
+    }
+
+    private func appendCreateMessage(_ message: ChatMessage) {
+        guard let idx = appState.chatSessions.firstIndex(where: { $0.id == sessionId }) else { return }
+        appState.chatSessions[idx].messages.append(message)
+        appState.chatSessions[idx].updatedAt = Date()
+        appState.saveChatHistory()
+    }
+
     // MARK: - Send Message
 
     /// Thin wrapper: build the turn config from the toolbar @State, consume the
@@ -2101,6 +2740,12 @@ struct ChatDetailView: View {
     }
 
     private func proceedSend() {
+        // Create mode: the composer drives the generator directly. No turn, no
+        // model reading the prompt — see `generateInChat`.
+        if let createMode {
+            generateInChat(createMode)
+            return
+        }
         isNearBottom = true // snap to bottom on send
 
         var text = inputText.trimmingCharacters(in: .whitespacesAndNewlines)

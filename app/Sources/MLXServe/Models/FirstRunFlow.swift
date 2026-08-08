@@ -33,6 +33,39 @@ enum LaunchDecision: Equatable {
     static let suppressDefaultsKey = "suppressWelcomeWindow"
 }
 
+// MARK: - Leaving the welcome window
+
+/// Every way out of the welcome window, and what each one leaves on screen.
+///
+/// Live dead end: "Browse all models" dismissed the window and opened ONLY the
+/// Model Browser. Close that browser — or download a model without spotting its
+/// "Use" button — and you are looking at an empty desktop with the app in the
+/// menu bar, unable to get back to the screen you started from: the welcome
+/// window is `.floating`, `_welcomeWindow` is already closed, and nothing
+/// re-opens it until the next launch.
+///
+/// So the rule is a TYPE, not a habit: an exit always opens Chat and always
+/// closes the window. Browse opens the browser too, on top of the chat window
+/// it just queued, which is why closing the browser now lands on a composer.
+enum WelcomeExit: CaseIterable, Equatable {
+    /// The footer's primary button.
+    case startChatting
+    /// A model row's Get/Use control, once the model is loaded.
+    case useModel
+    /// "Browse all models" in the Run-models panel.
+    case browseModels
+
+    /// Deliberately constant: it is the invariant, and a test asserts it over
+    /// `allCases` so a new exit can't opt out by forgetting.
+    var opensChat: Bool { true }
+
+    var opensModelBrowser: Bool { self == .browseModels }
+
+    /// Also constant — see the type comment: the window floats above
+    /// everything, so anything it opens is invisible until it closes.
+    var closesWelcome: Bool { true }
+}
+
 // MARK: - The chat gate
 
 /// Whether the chat window must block on "you need a model first", and what

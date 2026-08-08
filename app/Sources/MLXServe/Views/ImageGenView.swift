@@ -15,6 +15,9 @@ struct ImageGenView: View {
     @EnvironmentObject var service: ImageGenService
     @EnvironmentObject var server: ServerManager
     @EnvironmentObject var downloads: DownloadManager
+    /// For "Send to Chat" — the hand-off opens a new conversation and switches
+    /// the window to it (`AppState.sendGeneratedMediaToNewChat`).
+    @EnvironmentObject var appState: AppState
 
     @State private var prompt: String = ""
     @State private var showAdvanced: Bool = false
@@ -284,26 +287,43 @@ struct ImageGenView: View {
         }
     }
 
+    /// Best-per-capability up front, everything else behind "Other Models", and
+    /// the Download button ON the model — see `MediaModelChooser`.
     private var modelSection: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text("Model").font(.subheadline.weight(.semibold))
-            Picker("", selection: LanPick.selection(
-                model: $model, lanModel: $lanModel,
-                resolve: { id in ImageModelPreset.all.first { $0.id == id } },
-                persist: persist)
-            ) {
-                ForEach(ImageModelPreset.all) { preset in
-                    Text(preset.name).tag(preset.id)
+        let featured = MediaModelPicks.featured(
+            ImageModelPreset.all,
+            physicalMemoryBytes: ProcessInfo.processInfo.physicalMemory,
+            capabilityOf: \.capabilityLabel)
+        return MediaModelChooser(
+            featured: featured,
+            others: MediaModelPicks.others(ImageModelPreset.all, featured: featured),
+            selectedId: model.id,
+            lanModel: lanModel,
+            capabilityOf: { $0.capabilityLabel },
+            isDownloaded: { downloads.bundleReady($0.bundle) },
+            downloadLabel: { "Download \($0.bundle.approxSizeLabel)" },
+            onSelect: { preset in
+                lanModel = nil
+                model = preset
+            },
+            onDownload: { preset in
+                // Downloading also selects: you fetch the one you mean to use,
+                // and a progress bar under a row you then have to click would
+                // be the same two-step the old bottom-of-pane button was.
+                lanModel = nil
+                model = preset
+                downloads.startBundle(preset.bundle) { appState.refreshModels() }
+            },
+            lanCapability: "image",
+            onSelectLan: { id in
+                lanModel = id
+                if let base = ImageModelPreset.all.first(where: { $0.id == LanPick.base(of: id) }) {
+                    model = base
                 }
-                LanModelPickerRows(capability: "image")
+                persist()
             }
-            .labelsHidden()
-            .pickerStyle(.menu)
-            .onChange(of: model) { _, _ in guard !hydrating else { return }; applyModelDefaults(); persist() }
-            Text(lanModel.map { "Runs on \(LanPick.peer(of: $0)) over your network — nothing to download." } ?? "~\(model.approxRAMGB) GB RAM")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-        }
+        )
+        .onChange(of: model) { _, _ in guard !hydrating else { return }; applyModelDefaults(); persist() }
     }
 
     @ViewBuilder
@@ -561,8 +581,11 @@ struct ImageGenView: View {
 
     private var actionRow: some View {
         VStack(spacing: 8) {
+            // Progress only — the Download BUTTON lives on the model row above
+            // (`MediaModelChooser`). Two buttons stacked here, one to fetch and
+            // one to run, was the pane's most confusing moment.
             if lanModel == nil && !downloads.bundleReady(model.bundle) {
-                BundleDownloadBar(bundle: model.bundle)
+                BundleDownloadBar(bundle: model.bundle, showsStartButton: false)
             }
             HStack {
                 if service.isRunning {
@@ -638,6 +661,15 @@ struct ImageGenView: View {
                 } label: { Image(systemName: "folder") }
                 .buttonStyle(.borderless)
                 .help("Reveal in Finder")
+                // The one bridge from the workshop to a conversation. It opens
+                // a NEW chat and switches to it — see
+                // `AppState.sendGeneratedMediaToNewChat`.
+                Button {
+                    appState.sendGeneratedMediaToNewChat(
+                        path: path, prompt: prompt, kind: .image)
+                } label: { Image(systemName: "bubble.left.and.text.bubble.right") }
+                .buttonStyle(.borderless)
+                .help("Send to Chat — opens a new conversation with this attached")
             }
         }
         .padding(8)
@@ -755,7 +787,15 @@ struct ImageGenView: View {
     }
 
     private func showLogWindow() {
-        let text = service.log.joined(separator: "\n")
+        // The pane's own log holds the STREAM (progress lines). A model that
+        // failed to LOAD never streamed anything, so this was empty for exactly
+        // the failure people click it for — the reason was in the server's log
+        // all along (live 2026-08-08: a memory refusal showed "(no output)").
+        let own = service.log.joined(separator: "\n")
+        let serverTail = String(server.currentServerLogSnapshot().suffix(6000))
+        let text = own.isEmpty
+            ? serverTail
+            : own + "\n\n——— server log ———\n" + serverTail
         let alert = NSAlert()
         alert.messageText = "Image generation log"
         alert.informativeText = text.isEmpty ? "(no output)" : text

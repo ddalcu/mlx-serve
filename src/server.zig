@@ -1780,7 +1780,7 @@ fn handleConnection(
             return;
         },
         error.NotEnoughMemory => {
-            try sendErrorResponse(allocator, stream, "503 Service Unavailable", "out_of_memory", "Not enough memory to load model; retry after current requests complete", 503);
+            try sendErrorResponse(allocator, stream, "503 Service Unavailable", "out_of_memory", "Not enough memory to load this model. Unload the model you are chatting with (tray > Models > eject) or close other apps, then retry. The server log names the exact figures.", 503);
             return;
         },
         error.LoadFailed => {
@@ -3392,7 +3392,7 @@ fn handleLoadModelStrict(allocator: std.mem.Allocator, stream: *Conn, request_bo
             return;
         },
         error.NotEnoughMemory => {
-            try sendErrorResponse(allocator, stream, "503 Service Unavailable", "out_of_memory", "Not enough memory to load model; retry after current requests complete", 503);
+            try sendErrorResponse(allocator, stream, "503 Service Unavailable", "out_of_memory", "Not enough memory to load this model. Unload the model you are chatting with (tray > Models > eject) or close other apps, then retry. The server log names the exact figures.", 503);
             return;
         },
         error.LoadFailed => {

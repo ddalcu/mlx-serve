@@ -14,6 +14,9 @@ struct Model3DGenView: View {
     @EnvironmentObject var service: Model3DGenService
     @EnvironmentObject var server: ServerManager
     @EnvironmentObject var downloads: DownloadManager
+    /// For the model row's Download button (`MediaModelChooser`) — a completed
+    /// transfer has to re-scan the models directory.
+    @EnvironmentObject var appState: AppState
 
     @State private var photoURL: URL? = nil
     @State private var model: Model3DModelPreset = .hunyuan3d21_8bit
@@ -123,25 +126,41 @@ struct Model3DGenView: View {
         }
     }
 
+    /// Best-per-capability up front, everything else behind "Other Models", and
+    /// the Download button ON the model — see `MediaModelChooser`.
     private var modelSection: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            Text("Model").font(.subheadline.weight(.semibold))
-            Picker("", selection: LanPick.selection(
-                model: $model, lanModel: $lanModel,
-                resolve: { id in Model3DModelPreset.all.first { $0.id == id } },
-                persist: persist)
-            ) {
-                ForEach(Model3DModelPreset.all) { preset in
-                    Text(preset.name).tag(preset.id)
+        let featured = MediaModelPicks.featured(
+            Model3DModelPreset.all,
+            physicalMemoryBytes: ProcessInfo.processInfo.physicalMemory,
+            capabilityOf: \.capabilityLabel)
+        return MediaModelChooser(
+            featured: featured,
+            others: MediaModelPicks.others(Model3DModelPreset.all, featured: featured),
+            selectedId: model.id,
+            lanModel: lanModel,
+            capabilityOf: { $0.capabilityLabel },
+            isDownloaded: { downloads.bundleReady($0.bundle) },
+            downloadLabel: { "Download \($0.bundle.approxSizeLabel)" },
+            onSelect: { preset in
+                lanModel = nil
+                model = preset
+            },
+            onDownload: { preset in
+                // Downloading also selects — you fetch the one you mean to use.
+                lanModel = nil
+                model = preset
+                downloads.startBundle(preset.bundle) { appState.refreshModels() }
+            },
+            lanCapability: "3d",
+            onSelectLan: { id in
+                lanModel = id
+                if let base = Model3DModelPreset.all.first(where: { $0.id == LanPick.base(of: id) }) {
+                    model = base
                 }
-                LanModelPickerRows(capability: "3d")
+                persist()
             }
-            .labelsHidden()
-            .pickerStyle(.menu)
-            Text("~\(model.approxRAMGB) GB RAM • single image → 3D mesh")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-        }
+        )
+        .onChange(of: model) { _, _ in guard !hydrating else { return }; persist() }
     }
 
     private var advancedToggle: some View {
@@ -195,7 +214,7 @@ struct Model3DGenView: View {
             if lanModel == nil && !downloads.bundleReady(model.bundle) {
                 // Local-only models have no HF download yet — steer the user to
                 // the on-device conversion instead of a Download button.
-                if model.isLocalOnly { convertHint } else { BundleDownloadBar(bundle: model.bundle) }
+                if model.isLocalOnly { convertHint } else { BundleDownloadBar(bundle: model.bundle, showsStartButton: false) }
             }
             HStack {
                 if service.isRunning {
@@ -380,7 +399,14 @@ struct Model3DGenView: View {
     }
 
     private func showLogWindow() {
-        let logText = service.log.joined(separator: "\n")
+        // The pane's own log holds the STREAM. A model that failed to LOAD
+        // never streamed anything, so this was empty for exactly the failure
+        // people click it for — see ImageGenView.
+        let own = service.log.joined(separator: "\n")
+        let serverTail = String(server.currentServerLogSnapshot().suffix(6000))
+        let logText = own.isEmpty
+            ? serverTail
+            : own + "\n\n——— server log ———\n" + serverTail
         let alert = NSAlert()
         alert.messageText = "3D generation log"
         alert.informativeText = logText.isEmpty ? "(no output)" : logText

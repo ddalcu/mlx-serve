@@ -8,15 +8,24 @@ import SwiftUI
 /// Discover marks what you own instead of hiding it, Downloads is a first-class
 /// queue rather than rows stapled to the top of a list, and My Models shows
 /// everything the tray picker offers rather than only what we fetched ourselves.
-struct ModelBrowserView: View {
+/// The model browser, as the chat window's second mode.
+///
+/// It used to be a `Window` with its own `NavigationSplitView` sidebar. It now
+/// renders inside the chat window's detail column (`ChatWorkspace`) and owns
+/// NOTHING but content: the five sections are the chat window's own SIDEBAR
+/// while this mode is up (`ChatSidebar.modelsSidebar`), which is where a mode
+/// switch belongs and what gives the table back the full width it needs.
+struct ModelBrowserPane: View {
+    /// Which section is showing. The pane's own bar drives it: the sidebar is
+    /// the conversation list (plus the Models row that gets you here), so the
+    /// sub-items live across the top of the content area.
+    @Binding var section: ModelBrowserSection
+
     @EnvironmentObject var searchService: HFSearchService
     @EnvironmentObject var downloads: DownloadManager
     @EnvironmentObject var appState: AppState
 
-    @State private var selection: ModelBrowserSection? = .recommended
     @State private var localFilter = ""
-
-    private var section: ModelBrowserSection { selection ?? .recommended }
 
     /// Downloading *or* failed — both belong in the queue and both earn a badge.
     private var activeDownloads: [(repoId: String, state: DownloadManager.DownloadState)] {
@@ -26,65 +35,40 @@ struct ModelBrowserView: View {
             .map { (repoId: $0.key, state: $0.value) }
     }
 
-    /// Media bundles fully on disk, across all four modality catalogs.
-    private var mediaReadyCount: Int {
+    /// Counts beside the section names, from the ONE shared builder so they
+    /// cannot drift from what the panes list.
+    private var badges: ModelBrowserBadgeCounts {
         func readyCount<P: MediaModelPreset>(_ presets: [P]) -> Int {
             presets.filter { downloads.bundleReady($0.bundle) }.count
         }
-        return readyCount(ImageModelPreset.all) + readyCount(AudioModelPreset.allIncludingVoiceOnly)
-            + readyCount(VideoModelPreset.all) + readyCount(MusicModelPreset.all)
-    }
-
-    private var badges: ModelBrowserBadgeCounts {
-        ModelBrowserBadgeCounts(
-            myModels: appState.localModels.count,
-            activeDownloads: activeDownloads.count,
-            mediaReady: mediaReadyCount
-        )
+        let media = readyCount(ImageModelPreset.all)
+            + readyCount(AudioModelPreset.allIncludingVoiceOnly)
+            + readyCount(VideoModelPreset.all)
+            + readyCount(MusicModelPreset.all)
+        return .live(localModelCount: appState.localModels.count,
+                     activeDownloadCount: activeDownloads.count,
+                     mediaReadyCount: media)
     }
 
     var body: some View {
-        NavigationSplitView {
-            List(ModelBrowserSection.allCases, selection: $selection) { item in
-                NavigationLink(value: item) {
-                    Label {
-                        HStack(spacing: 6) {
-                            Text(item.title)
-                            Spacer(minLength: 4)
-                            if item == .downloads, !activeDownloads.isEmpty {
-                                ProgressView()
-                                    .controlSize(.small)
-                                    .scaleEffect(0.6)
-                            }
-                            if let badge = badges.badge(for: item) {
-                                Text(badge)
-                                    .font(.caption2.monospacedDigit())
-                                    .foregroundStyle(.secondary)
-                                    .padding(.horizontal, 6)
-                                    .padding(.vertical, 1)
-                                    .background(.quaternary, in: Capsule())
-                            }
-                        }
-                    } icon: {
-                        Image(systemName: item.systemImage)
-                    }
-                }
-            }
-            .navigationSplitViewColumnWidth(
-                min: ModelBrowserMetrics.sidebarMinWidth,
-                ideal: ModelBrowserMetrics.sidebarIdealWidth,
-                max: ModelBrowserMetrics.sidebarMaxWidth
-            )
-        } detail: {
+        VStack(spacing: 0) {
+            ModelBrowserSectionBar(section: $section, badges: badges,
+                                   isDownloading: !activeDownloads.isEmpty)
+            Divider()
             detail
-                .frame(minWidth: ModelBrowserMetrics.minDetailWidth)
         }
+        // The floor the browser's table needs, asserted from INSIDE the chat
+        // window's detail column: below it the action cell clips off the right
+        // edge (`ModelBrowserMetrics`). On the pane rather than the window, so
+        // it only applies while the browser is up — a chat transcript is happy
+        // much narrower.
+        .frame(minWidth: ModelBrowserMetrics.minDetailWidth)
         .task {
             if searchService.models.isEmpty {
                 await searchService.search()
             }
         }
-        .onChange(of: selection) { _, _ in appState.refreshModels() }
+        .onChange(of: section) { _, _ in appState.refreshModels() }
         // Live-refresh on-disk sizes while a disk-state pane is showing and a
         // download is in flight, so completion + growing size show up without
         // the user navigating away and back. The task id flips when the section
@@ -114,6 +98,68 @@ struct ModelBrowserView: View {
     }
 }
 
+// MARK: - Section bar
+
+/// The browser's five sections, across the top of the content area.
+///
+/// Real buttons rather than a `.segmented` Picker: the Downloads section
+/// carries a live spinner and three of them carry counts, and a segmented
+/// control holds text only — losing those would cost the pane its at-a-glance
+/// state. No Done button: the sidebar's Models row is the way back, and it is
+/// visible the whole time.
+private struct ModelBrowserSectionBar: View {
+    @Binding var section: ModelBrowserSection
+    let badges: ModelBrowserBadgeCounts
+    let isDownloading: Bool
+
+    var body: some View {
+        HStack(spacing: 6) {
+            ForEach(ModelBrowserSection.allCases) { item in
+                chip(item)
+            }
+            Spacer(minLength: 8)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+    }
+
+    private func chip(_ item: ModelBrowserSection) -> some View {
+        let isSelected = section == item
+        return Button {
+            section = item
+        } label: {
+            HStack(spacing: 5) {
+                Image(systemName: item.systemImage)
+                    .font(.system(size: 11, weight: .medium))
+                Text(item.title).font(.callout).lineLimit(1)
+                if item == .downloads, isDownloading {
+                    ProgressView()
+                        .controlSize(.small)
+                        .scaleEffect(0.55)
+                        .frame(width: 10)
+                }
+                if let badge = badges.badge(for: item) {
+                    Text(badge)
+                        .font(.caption2.monospacedDigit())
+                        .foregroundStyle(isSelected ? .primary : .secondary)
+                        .padding(.horizontal, 5)
+                        .padding(.vertical, 1)
+                        .background(.quaternary, in: Capsule())
+                }
+            }
+            .foregroundStyle(isSelected ? Color.accentColor : Color.primary)
+            .padding(.horizontal, 9)
+            .padding(.vertical, 5)
+            .background(
+                RoundedRectangle(cornerRadius: 7, style: .continuous)
+                    .fill(isSelected ? Color.accentColor.opacity(0.14) : Color.clear)
+            )
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+    }
+}
+
 // MARK: - Recommended
 
 /// Every curated Gemma 4 / Qwen 3.5-3.6 checkpoint, grouped by family and
@@ -126,215 +172,213 @@ private struct RecommendedPane: View {
     /// model used to mean choosing a vendor taxonomy before you could chat, and
     /// the answer for someone who has downloaded nothing is one model, not
     /// fourteen across four sections.
-    @State private var showsOtherModels = false
-
-    private var physicalMemory: UInt64 { ProcessInfo.processInfo.physicalMemory }
-    private var ramLabel: String { MemoryInfo.format(Int64(physicalMemory)) }
+    private var memory: SystemMemoryInfo { SystemMemoryInfo.current() }
     private var starter: RecommendedModelPick {
-        RecommendedModelPick.starterPick(physicalMemoryBytes: physicalMemory)
+        RecommendedModelPick.starterPick(physicalMemoryBytes: memory.totalBytes)
     }
 
     var body: some View {
         ScrollView {
-            VStack(alignment: .leading, spacing: 20) {
-                VStack(alignment: .leading, spacing: 4) {
-                    Text("Your Mac has \(ramLabel) of memory")
-                        .font(.title3.weight(.semibold))
-                    Text("\(starter.name) is the best fit — download it and start chatting.")
-                        .font(.callout)
-                        .foregroundStyle(.secondary)
-                }
-                .padding(.top, 4)
-
-                // The recommendation, as a full row: same bars, same RAM
-                // warning, same Download/Use control as everything below it.
-                ModelGroupSection(
-                    title: "Best for your Mac",
-                    subtitle: "Matched to this Mac's memory. Everything else is below.",
-                    systemImage: "sparkles",
-                    tint: .accentColor
-                ) {
-                    RecommendedModelListRow(pick: starter, physicalMemoryBytes: physicalMemory)
-                }
-
-                Button {
-                    withAnimation { showsOtherModels.toggle() }
-                } label: {
-                    HStack(spacing: 6) {
-                        Image(systemName: showsOtherModels ? "chevron.down" : "chevron.right")
-                            .font(.caption.weight(.semibold))
-                        Text("Other models")
-                            .font(.subheadline.weight(.semibold))
-                        Spacer()
-                    }
-                    .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-
-                if showsOtherModels {
-                    otherModels
-                }
+            VStack(alignment: .leading, spacing: 18) {
+                MemorySummaryCard(memory: memory, recommended: starter)
+                RecommendedModelTable(memory: memory, recommendedId: starter.id)
             }
             .padding(16)
         }
         .navigationTitle("Recommended")
     }
+}
 
-    @ViewBuilder private var otherModels: some View {
-        VStack(alignment: .leading, spacing: 20) {
-            ModelGroupSection(
-                title: "Gemma 4",
-                subtitle: "Google's Gemma 4 family.",
-                systemImage: "g.circle",
-                tint: .blue
-            ) {
-                RecommendedFamilyRows(picks: RecommendedModelPick.gemmaCatalog, physicalMemoryBytes: physicalMemory)
+/// The "what does this Mac have, and how much can a model use?" summary at the
+/// top of the Recommended pane: total RAM, the usable-for-models budget (the
+/// Metal working-set ceiling), a capacity bar, and the one recommended pick.
+private struct MemorySummaryCard: View {
+    let memory: SystemMemoryInfo
+    let recommended: RecommendedModelPick
+    @EnvironmentObject var server: ServerManager
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack(spacing: 12) {
+                Image(systemName: "memorychip")
+                    .font(.title2)
+                    .foregroundStyle(.tint)
+                    .frame(width: 26)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Your Mac")
+                        .font(.headline)
+                    Text("\(memory.totalLabel) of memory · about \(memory.usableLabel) usable for models")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                }
+                Spacer(minLength: 0)
             }
 
-            ModelGroupSection(
-                title: "Qwen",
-                subtitle: "Alibaba's Qwen 3.5/3.6 family — the larger checkpoints ship a native speed boost.",
-                systemImage: "q.circle",
-                tint: .teal
-            ) {
-                RecommendedFamilyRows(picks: RecommendedModelPick.qwenCatalog, physicalMemoryBytes: physicalMemory)
-            }
+            // The same GPU + Available RAM meter the menu bar shows.
+            MemoryMeter.live(server: server.memoryInfo)
 
-            ModelGroupSection(
-                title: "Laguna",
-                subtitle: "poolside's Laguna 2.1 coding models — mixture-of-experts specialists for code and agent work.",
-                systemImage: "chevron.left.forwardslash.chevron.right",
-                tint: .purple
-            ) {
-                RecommendedFamilyRows(picks: RecommendedModelPick.poolsideCatalog, physicalMemoryBytes: physicalMemory)
+            HStack(spacing: 6) {
+                Image(systemName: "sparkles")
+                    .font(.caption)
+                    .foregroundStyle(.tint)
+                Text("Recommended for your Mac:")
+                    .foregroundStyle(.secondary)
+                Text(recommended.name)
+                    .fontWeight(.semibold)
+                Spacer(minLength: 0)
             }
-
-            ModelGroupSection(
-                title: "Largest models (96 GB+ RAM)",
-                subtitle: "The biggest models this app runs — DeepSeek-V4-Flash (native MLX) and Tencent's 295B Hunyuan 3 — for Macs with a lot of memory.",
-                systemImage: "memorychip",
-                tint: .red
-            ) {
-                RecommendedFamilyRows(picks: RecommendedModelPick.largestCatalog, physicalMemoryBytes: physicalMemory)
-            }
+            .font(.callout)
         }
+        .padding(16)
+        .background(RoundedRectangle(cornerRadius: 12).fill(.quaternary.opacity(0.22)))
     }
 }
 
-/// A family's rows, split into what this Mac's RAM covers and what it
-/// doesn't. The first group renders inline; the second sits behind a
-/// collapsed "Requires more RAM" disclosure — nothing is ever dropped from
-/// the list, it's just deferred until the user asks to see it, rather than
-/// cluttering the default view (or, as an earlier iteration did, rendering
-/// inline at reduced opacity).
-private struct RecommendedFamilyRows: View {
-    let picks: [RecommendedModelPick]
-    let physicalMemoryBytes: UInt64
-    @State private var showsRequiresMoreRAM = false
-
-    var body: some View {
-        let split = picks.partitionedByRequirements(physicalMemoryBytes: physicalMemoryBytes)
-
-        ForEach(split.fits) { pick in
-            RecommendedModelListRow(pick: pick, physicalMemoryBytes: physicalMemoryBytes)
-            Divider().padding(.horizontal, 12)
-        }
-
-        if !split.requiresMoreRAM.isEmpty {
-            Button {
-                withAnimation { showsRequiresMoreRAM.toggle() }
-            } label: {
-                HStack(spacing: 6) {
-                    Image(systemName: showsRequiresMoreRAM ? "chevron.down" : "chevron.right")
-                        .font(.caption2.weight(.semibold))
-                    Text("Requires more RAM (\(split.requiresMoreRAM.count))")
-                        .font(.caption.weight(.medium))
-                    Spacer()
-                }
-                .foregroundStyle(.secondary)
-                .padding(.horizontal, 12)
-                .padding(.vertical, 8)
-                .contentShape(Rectangle())
-            }
-            .buttonStyle(.plain)
-            Divider().padding(.horizontal, 12)
-
-            if showsRequiresMoreRAM {
-                ForEach(split.requiresMoreRAM) { pick in
-                    RecommendedModelListRow(pick: pick, physicalMemoryBytes: physicalMemoryBytes)
-                    Divider().padding(.horizontal, 12)
-                }
-            }
-        }
-    }
+/// Column widths shared by the table header and every row so they stay
+/// aligned. The Model column flexes; the rest are fixed.
+private enum RecTableMetrics {
+    static let capability: CGFloat = 92
+    static let size: CGFloat = 62
+    static let memory: CGFloat = 140
+    static let action: CGFloat = 116
+    static let spacing: CGFloat = 10
+    static let hPad: CGFloat = 12
 }
 
-/// The three comparative bars under a recommendation: Intelligence, Speed,
-/// Context. They replaced capability chips ("Fast replies", "Balanced",
-/// "Coding help") that repeated the blurb and said nothing about how one pick
-/// compares to the one above it — which is the only question this pane exists
-/// to answer.
-///
-/// No number is drawn. The scores are a hand-maintained comparison between
-/// these picks (see `RecommendedModels.swift`'s header for where each comes
-/// from), and printing "62" would claim a precision they don't have. An
-/// estimated intelligence score says so in the label instead of quietly
-/// reading like a measurement.
-private struct CapabilityBars: View {
-    let pick: RecommendedModelPick
+/// The Recommended pane's model table: a column header, then every curated pick
+/// grouped by family. Each row shows its capability, download size, and — the
+/// point of this pane — exactly how its memory requirement fits THIS Mac. Every
+/// model is visible (no "requires more RAM" disclosure): the fit badge is what
+/// makes the comparison scannable at a glance.
+private struct RecommendedModelTable: View {
+    let memory: SystemMemoryInfo
+    let recommendedId: String
 
-    var body: some View {
-        VStack(alignment: .leading, spacing: 3) {
-            bar("Intelligence", pick.intelligenceBar, .blue,
-                note: pick.intelligenceIsEstimated ? "estimated" : nil,
-                help: pick.intelligenceIsEstimated
-                    ? "Our estimate — this model has no Artificial Analysis Intelligence Index entry."
-                    : "Artificial Analysis Intelligence Index, for the original weights.")
-            bar("Speed", pick.speedBar, .green, note: nil,
-                help: "Roughly how fast it replies on an Apple Silicon Mac, relative to the other models here.")
-            bar("Context", pick.contextBar, .orange, note: nil,
-                help: "How much text it can hold at once. Your Mac's memory may lower this in practice.")
-        }
+    private struct Family: Identifiable {
+        let id: String
+        let title: String
+        let systemImage: String
+        let tint: Color
+        let picks: [RecommendedModelPick]
     }
 
-    private func bar(_ label: String, _ fill: Double, _ tint: Color, note: String?, help: String) -> some View {
-        HStack(spacing: 6) {
-            Text(label)
-                .font(.system(size: 9))
-                .foregroundStyle(.secondary)
-                .frame(width: 62, alignment: .leading)
-            GeometryReader { geo in
-                ZStack(alignment: .leading) {
-                    Capsule().fill(.quaternary)
-                    Capsule().fill(tint.opacity(0.75))
-                        .frame(width: max(2, geo.size.width * fill))
+    private var families: [Family] {
+        [
+            Family(id: "gemma", title: "Gemma 4", systemImage: "g.circle", tint: .blue,
+                   picks: RecommendedModelPick.gemmaCatalog),
+            Family(id: "qwen", title: "Qwen", systemImage: "q.circle", tint: .teal,
+                   picks: RecommendedModelPick.qwenCatalog),
+            Family(id: "laguna", title: "Laguna", systemImage: "chevron.left.forwardslash.chevron.right", tint: .purple,
+                   picks: RecommendedModelPick.poolsideCatalog),
+            Family(id: "largest", title: "Largest models", systemImage: "memorychip", tint: .red,
+                   picks: RecommendedModelPick.largestCatalog),
+        ]
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            RecommendedTableHeader()
+            Divider()
+            ForEach(families) { family in
+                familyHeader(family)
+                ForEach(family.picks) { pick in
+                    Divider().padding(.leading, RecTableMetrics.hPad)
+                    RecommendedModelTableRow(
+                        pick: pick,
+                        memory: memory,
+                        isRecommended: pick.id == recommendedId
+                    )
                 }
             }
-            .frame(height: 4)
-            .frame(maxWidth: 120)
-            if let note {
-                Text(note)
-                    .font(.system(size: 9))
-                    .foregroundStyle(.tertiary)
-            }
+        }
+        .background(RoundedRectangle(cornerRadius: 10).fill(.quaternary.opacity(0.15)))
+        .overlay(RoundedRectangle(cornerRadius: 10).strokeBorder(.quaternary.opacity(0.4)))
+    }
+
+    private func familyHeader(_ family: Family) -> some View {
+        HStack(spacing: 7) {
+            Image(systemName: family.systemImage)
+                .font(.caption)
+                .foregroundStyle(family.tint)
+            Text(family.title)
+                .font(.caption.weight(.semibold))
+                .foregroundStyle(.secondary)
             Spacer(minLength: 0)
         }
-        .help(help)
+        .padding(.horizontal, RecTableMetrics.hPad)
+        .padding(.vertical, 7)
+        .background(.quaternary.opacity(0.12))
     }
 }
 
-/// One list row for a chat-model recommendation: name, tagline, a plain-
-/// English description underneath, the three capability bars, and the
-/// Download/Use action — the list-style analogue of the Media pane's
-/// `MediaModelRow`, with the richer copy this pane needs.
-private struct RecommendedModelListRow: View {
+/// The column titles, aligned to the row columns via `RecTableMetrics`.
+private struct RecommendedTableHeader: View {
+    var body: some View {
+        HStack(spacing: RecTableMetrics.spacing) {
+            Text("Model")
+                .frame(maxWidth: .infinity, alignment: .leading)
+            Text("Capability")
+                .frame(width: RecTableMetrics.capability, alignment: .leading)
+            Text("Size")
+                .frame(width: RecTableMetrics.size, alignment: .trailing)
+            Text("Memory needed")
+                .frame(width: RecTableMetrics.memory, alignment: .leading)
+            Color.clear
+                .frame(width: RecTableMetrics.action, height: 1)
+        }
+        .font(.caption2.weight(.semibold))
+        .foregroundStyle(.secondary)
+        .textCase(.uppercase)
+        .padding(.horizontal, RecTableMetrics.hPad)
+        .padding(.vertical, 8)
+    }
+}
+
+/// Two thin comparative bars — intelligence (blue) over speed (green) — the
+/// compact, table-cell form of the retired `CapabilityBars`. No number is
+/// drawn: the scores are a hand-maintained comparison between these picks (see
+/// `RecommendedModels.swift`'s header), and printing "62" would claim a
+/// precision they don't have. The tooltip names the two bars and flags an
+/// estimated intelligence score.
+private struct MiniCapability: View {
     let pick: RecommendedModelPick
-    let physicalMemoryBytes: UInt64
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            bar(pick.intelligenceBar, .blue)
+            bar(pick.speedBar, .green)
+        }
+        .help("Top bar: intelligence\(pick.intelligenceIsEstimated ? " (our estimate)" : ""). Bottom bar: speed. Both relative to the models here.")
+    }
+
+    private func bar(_ fill: Double, _ tint: Color) -> some View {
+        GeometryReader { geo in
+            ZStack(alignment: .leading) {
+                Capsule().fill(.quaternary)
+                Capsule().fill(tint.opacity(0.8))
+                    .frame(width: max(2, geo.size.width * fill))
+            }
+        }
+        .frame(height: 4)
+    }
+}
+
+/// One table row for a chat-model recommendation: name + tagline, compact
+/// capability bars, download size, the memory-fit cell (the pane's whole
+/// point), and the Download/Use action. The full plain-English blurb moves to
+/// the row's hover tooltip so the table stays scannable.
+private struct RecommendedModelTableRow: View {
+    let pick: RecommendedModelPick
+    let memory: SystemMemoryInfo
+    let isRecommended: Bool
 
     @EnvironmentObject var downloads: DownloadManager
     @EnvironmentObject var appState: AppState
     @EnvironmentObject var server: ServerManager
     @State private var confirmDelete = false
+
+    /// How this pick's memory requirement fits the Mac's usable budget.
+    private var fit: MemoryFit { memory.fit(neededGB: pick.approxRAMNeededGB) }
 
     /// For a GGUF pick, the specific quant file on disk (the repo ships many);
     /// nil until the folder resolves. Drives ready/use so a *different* quant of
@@ -352,14 +396,6 @@ private struct RecommendedModelListRow: View {
     }
     private var state: DownloadManager.DownloadState? { downloads.downloads[pick.repoId] }
 
-    /// Soft signal only — sorts the pick behind the family's "Requires more
-    /// RAM" disclosure and explains why there. Never blocks downloading or
-    /// using it (same "warn, don't gate" policy as Discover's RAM-fitness dot
-    /// and ImageGenView's oversized-model alert).
-    private var meetsRequirements: Bool {
-        pick.meetsSystemRequirements(physicalMemoryBytes: physicalMemoryBytes)
-    }
-
     /// The on-disk model this row's repo resolves to, once downloaded —
     /// mirrors `ModelBrowserRow.usableModel`.
     private var usableModel: LocalModel? {
@@ -370,44 +406,83 @@ private struct RecommendedModelListRow: View {
     }
 
     var body: some View {
-        HStack(alignment: .top, spacing: 12) {
-            VStack(alignment: .leading, spacing: 3) {
+        HStack(spacing: RecTableMetrics.spacing) {
+            // Model — name + tagline; the full blurb is on hover.
+            VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 6) {
                     Text(pick.name)
                         .font(.callout.weight(.medium))
-                    Text(pick.tagline)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                    if isRecommended {
+                        Text("Recommended")
+                            .font(.caption2.weight(.semibold))
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 1)
+                            .background(Capsule().fill(Color.accentColor.opacity(0.18)))
+                            .foregroundStyle(.tint)
+                    }
                 }
-
-                Text(pick.blurb)
+                Text(pick.tagline)
                     .font(.caption)
                     .foregroundStyle(.secondary)
-                    .fixedSize(horizontal: false, vertical: true)
-
-                CapabilityBars(pick: pick)
-                    .padding(.top, 2)
-
-                if !meetsRequirements {
-                    Label(
-                        "Needs about \(String(format: "%.0f", pick.approxRAMNeededGB)) GB of RAM — your Mac has \(MemoryInfo.format(Int64(physicalMemoryBytes)))",
-                        systemImage: "exclamationmark.triangle"
-                    )
-                    .font(.caption2.weight(.medium))
-                    .foregroundStyle(.orange)
-                }
+                    .lineLimit(1)
             }
             .frame(maxWidth: .infinity, alignment: .leading)
+            .help(pick.blurb)
 
-            VStack(alignment: .trailing, spacing: 4) {
-                Text(pick.sizeLabel)
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
-                actionControl
-            }
+            // Capability — intelligence over speed.
+            MiniCapability(pick: pick)
+                .frame(width: RecTableMetrics.capability, alignment: .leading)
+
+            // Download size (on disk).
+            Text(SystemMemoryInfo.preciseGB(pick.sizeGB))
+                .font(.caption.monospacedDigit())
+                .foregroundStyle(.secondary)
+                .frame(width: RecTableMetrics.size, alignment: .trailing)
+
+            // Memory needed + fit against this Mac's usable budget.
+            memoryCell
+                .frame(width: RecTableMetrics.memory, alignment: .leading)
+
+            // Download / Use / progress.
+            actionControl
+                .frame(width: RecTableMetrics.action, alignment: .trailing)
         }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 8)
+        .padding(.horizontal, RecTableMetrics.hPad)
+        .padding(.vertical, 9)
+        .background(isRecommended ? Color.accentColor.opacity(0.07) : Color.clear)
+    }
+
+    /// The memory column: how much RAM the model needs, and a colored badge for
+    /// how that fits what this Mac can give a model.
+    private var memoryCell: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(SystemMemoryInfo.preciseGB(pick.approxRAMNeededGB))
+                .font(.caption.monospacedDigit().weight(.medium))
+            HStack(spacing: 3) {
+                Image(systemName: fitIcon)
+                    .font(.system(size: 9))
+                Text(fit.label)
+                    .font(.caption2)
+            }
+            .foregroundStyle(fitColor)
+        }
+        .help("Needs about \(SystemMemoryInfo.preciseGB(pick.approxRAMNeededGB)) — your Mac can use about \(memory.usableLabel) for a model.")
+    }
+
+    private var fitIcon: String {
+        switch fit {
+        case .comfortable: return "checkmark.circle.fill"
+        case .tight:       return "exclamationmark.circle.fill"
+        case .exceeds:     return "xmark.circle.fill"
+        }
+    }
+
+    private var fitColor: Color {
+        switch fit {
+        case .comfortable: return .green
+        case .tight:       return .orange
+        case .exceeds:     return .red
+        }
     }
 
     @ViewBuilder

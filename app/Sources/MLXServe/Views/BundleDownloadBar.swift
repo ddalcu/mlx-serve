@@ -8,6 +8,11 @@ import SwiftUI
 /// encoder — all surfaced here as one action.
 struct BundleDownloadBar: View {
     let bundle: MediaBundle
+    /// When false the bar reports progress and failures but offers no START
+    /// button — the Create panes moved that onto the model row itself
+    /// (`MediaModelChooser`), so having one here too put two ways to fetch the
+    /// same model on screen at once, one of them beside Generate.
+    var showsStartButton: Bool = true
     @EnvironmentObject var downloads: DownloadManager
     @EnvironmentObject var appState: AppState
 
@@ -25,10 +30,14 @@ struct BundleDownloadBar: View {
         }
     }
 
+    @ViewBuilder
     private var notStartedRow: some View {
         VStack(alignment: .leading, spacing: 5) {
-            Text("This model isn't downloaded yet.")
+            Text(showsStartButton
+                 ? "This model isn't downloaded yet."
+                 : "This model isn't downloaded yet — use Download above.")
                 .font(.caption).foregroundStyle(.secondary)
+            if showsStartButton {
             Button {
                 downloads.startBundle(bundle) { appState.refreshModels() }
             } label: {
@@ -36,6 +45,7 @@ struct BundleDownloadBar: View {
                     .frame(maxWidth: .infinity)
             }
             .buttonStyle(.borderedProminent)
+            }
             if bundle.components.count > 1 {
                 Text("Includes \(bundle.components.count) models (e.g. the text encoder).")
                     .font(.caption2).foregroundStyle(.tertiary)
