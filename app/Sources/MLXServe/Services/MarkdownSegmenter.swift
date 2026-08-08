@@ -5,7 +5,7 @@ import Foundation
 /// The renderer needs this because prose and code want different surfaces: a
 /// run of prose becomes ONE NSTextView (so drag-selection crosses paragraphs,
 /// lists and tables in a single motion) while a code block becomes a view with
-/// a language header, a line-number gutter and a copy button.
+/// a language header and a copy button.
 ///
 /// So segmentation happens at FENCES, not at markdown blocks — consecutive
 /// prose blocks must stay in one segment or selection breaks at every heading.

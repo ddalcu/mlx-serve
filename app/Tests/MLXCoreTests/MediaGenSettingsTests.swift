@@ -233,4 +233,30 @@ final class MediaGenSettingsTests: XCTestCase {
         XCTAssertEqual(decoded.resolution, Model3DGenSettings().resolution)
         XCTAssertEqual(decoded.turntable, Model3DGenSettings().turntable)
     }
+
+    // MARK: - Resizable prompt editor
+
+    /// A dragged height is persisted, so a value from a different window size —
+    /// or a garbage one — must never leave the editor unusable or off-screen.
+    func testPromptEditorHeightIsClampedBothWays() {
+        XCTAssertEqual(PromptEditorHeight.clamp(4000), PromptEditorHeight.maxHeight)
+        XCTAssertEqual(PromptEditorHeight.clamp(0), PromptEditorHeight.minHeight)
+        XCTAssertEqual(PromptEditorHeight.clamp(-50), PromptEditorHeight.minHeight)
+        XCTAssertEqual(PromptEditorHeight.clamp(.nan), PromptEditorHeight.defaultHeight)
+        XCTAssertEqual(PromptEditorHeight.clamp(240), 240)
+    }
+
+    func testVideoSettingsClampAStalePromptHeightOnDecode() throws {
+        var obj = try JSONSerialization.jsonObject(
+            with: try JSONEncoder().encode(VideoGenSettings())) as! [String: Any]
+        obj["promptHeight"] = 9999.0
+        let decoded = try JSONDecoder().decode(
+            VideoGenSettings.self, from: try JSONSerialization.data(withJSONObject: obj))
+        XCTAssertEqual(decoded.promptHeight, PromptEditorHeight.maxHeight)
+        // Absent key = an older build's blob → the default, not zero.
+        obj.removeValue(forKey: "promptHeight")
+        let old = try JSONDecoder().decode(
+            VideoGenSettings.self, from: try JSONSerialization.data(withJSONObject: obj))
+        XCTAssertEqual(old.promptHeight, PromptEditorHeight.defaultHeight)
+    }
 }

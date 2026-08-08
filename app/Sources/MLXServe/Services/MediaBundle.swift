@@ -17,9 +17,27 @@ struct FileSelection: Equatable {
     /// LoRAs, upscalers, and alternate transformers. Non-safetensors (json/txt)
     /// follow the normal extension rule.
     var keepSafetensors: Set<String>? = nil
+    /// When set, pull ONLY this immediate subfolder's files and write them at
+    /// the destination ROOT. A multi-variant MLX repo ships one complete model
+    /// per quant subfolder (see `MlxVariant`); each is fetched into its own
+    /// model dir, so the prefix must come off on the way to disk.
+    var subfolder: String? = nil
 
     /// Chat-model default: top-level files + `mtp/`, all needed extensions.
     static let chatDefault = FileSelection()
+
+    /// One quant subfolder of a multi-variant MLX repo.
+    static func mlxVariant(_ folder: String) -> FileSelection {
+        FileSelection(subfolder: folder)
+    }
+
+    /// Where a fetched file lands, relative to the destination dir. Only a
+    /// variant selection rewrites anything — everything else is pass-through,
+    /// so the `mtp/` sidecar keeps its directory.
+    func localPath(forRemote path: String) -> String {
+        guard let subfolder, path.hasPrefix(subfolder + "/") else { return path }
+        return String(path.dropFirst(subfolder.count + 1))
+    }
 }
 
 /// One downloadable piece of a media bundle: a HF repo + how to pull it + how
@@ -162,6 +180,14 @@ extension MediaBundle {
                     selection: FileSelection(keepSafetensors: [
                         "transformer.safetensors", "text_encoder.safetensors",
                         "video_vae.safetensors", "audio_vae.safetensors",
+                        // The Turbo distillation adapter (~744 MB): 4-step
+                        // sampling instead of 30. Allowlisted but NOT a ready
+                        // marker, the same call `audio_vae` makes — a pack
+                        // downloaded before it shipped must keep reading as
+                        // complete rather than offering a 69 GB re-download.
+                        // Those installs get it on demand instead, see
+                        // `TurboLoraFetch`.
+                        TurboLoraFetch.fileName,
                     ]),
                     readyMarkers: [
                         "config.json", "transformer.safetensors",
@@ -174,7 +200,7 @@ extension MediaBundle {
                     ]
                 ),
             ],
-            sizeEstimateGB: 69
+            sizeEstimateGB: 70 // 69 + the Turbo adapter
         )
     }
 

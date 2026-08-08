@@ -1,5 +1,62 @@
 # Changelog
 
+## v26.8.3 — MiniMax-H3 references and Turbo, stacked LoRAs, model folders
+
+### MiniMax-H3: references, Turbo, longer clips
+
+- Attach pictures, clips or audio and the video is built around them. Refer to them in the prompt by number: `<Picture 1>`, `<Video 1>`, `<Audio 1>`. This needs the REF2VA build, so the app only offers it when that build is loaded and the server refuses references on a build that would silently ignore them.
+- **Turbo** renders in 4 steps instead of 30, about twice as fast end to end, with slightly softer detail. It ships with the model now, and packs downloaded before it existed fetch it once when you tick the box. Thanks to [larryvrh](https://huggingface.co/larryvrh/MiniMax-H3-Turbo-Lora) for the adapter.
+- Clips reach 15 seconds. Under the Generate button there is a live time estimate that updates as you change size, length and steps, and the memory warning now uses H3's own numbers instead of LTX's.
+- Video models no longer refuse to load on a 48 GB Mac (#126). The memory gate billed the sum of every file in the folder, 37.55 GB, when the parts are never all in memory at once. Thanks to funk80rus for the report and the diagnosis.
+- Over the API, long clips can be generated as chained windows (`chain_windows`), each continuing from the last frame of the one before.
+
+### LoRAs
+
+- Attach several style adapters at once, on any image or video model. Their effects add up, so the order does not matter. Thanks to Justin ([@justinluque](https://github.com/justinluque)) for the multi-adapter work (#118).
+- Adapters now run at the strength their own file declares. Anything exported by PEFT or diffusers was running up to 8x too strong, which renders as static rather than a stronger style. If you dialled one down to compensate, put it back up.
+- MiniMax-H3 takes them too, stacked on top of Turbo.
+
+### Model folders: pick where downloads go
+
+- **Settings ▸ Model Folders ▸ Default folder** chooses where new downloads land. Everything already downloaded keeps working, because the old folder stays in the scan list.
+- Custom folders are actually served now. `--model-dir` is repeatable, so every folder you list shows up in `/v1/models` instead of only in the app's own picker. If the same model sits in two folders the download folder wins, and a folder that is not reachable is skipped with a warning instead of stopping the server.
+
+### Logprobs. Fixed.
+
+- Three things were wrong at once, on every model: the numbers moved when you changed the temperature instead of being the model's own, ties handed back an arbitrary token, and the whole list was off by one so each token came back with the *next* token's alternatives.
+- None of this changed the text any model produced. It matters if you score outputs, route on confidence, or build evals.
+- `/v1/completions` ignored its `logprobs` field entirely. It works now, in the shape the OpenAI legacy API defines.
+- Streaming ignored it too, on both chat and `/v1/completions` — and it cost you speed to do it, because asking for logprobs turns off speculative decoding whether or not you get anything back. Streaming now returns the same numbers as non-streaming, token for token.
+- On a model that thinks, the numbers described the thinking, not the reply. `logprobs.content` is the tokens of the answer, but it was built from the whole generation, so the first entry was the opening token of the model's reasoning and the list lined up with nothing you could see — 186 entries against an 8-character answer on Qwen3.6. It now covers exactly what comes back in `content`, streaming and not.
+- A reply could come back unreadable. Tokens are fragments, so one can hold half an emoji, and those raw bytes went into the JSON — the whole response then failed to parse, not just the logprobs. The token text now shows the standard replacement character and the `bytes` field beside it still carries the exact bytes.
+
+### Also new
+
+- **Pick your quant from a multi-variant repo.** Publishers who ship every quantization in one repo as subfolders used to read as a single model; each variant now shows its own size and downloads, loads and deletes independently, like GGUF repos already did.
+- **The seed is a text field you can paste into** in the image and video panes, with a dice button beside it that gives you a concrete number to read off and paste back.
+- **The app says why a reply stopped.** A cut caused by the model going in circles is labeled as one instead of claiming you hit the output limit. On the API that is `finish_details: {"type": "repetition_loop"}` beside `finish_reason`.
+- **A quant playground on the website**: pick a Mac, a model, a quantization and a context length, and see the speed you can expect and whether it fits in RAM.
+- LICENSE, NOTICE and the Apache-2.0 text now ship with the CLI tarball, the app bundle and the Homebrew install, crediting the kernels and libraries mlx-serve builds on.
+
+### Fixes
+
+- Quitting the app left `mlx-serve` running with the model still loaded (#133). ⌘Q, the Quit menu and Dock ▸ Quit all went straight to termination without stopping it, so it kept holding the memory until you killed it by hand. The power button in the menu bar was the only route that worked. Stopping the server is part of quitting now, whichever way you quit. Thanks to freppair for the report.
+- The 8-bit video models still would not load on a 48 GB Mac. The gate had stopped billing the whole folder but was still adding up parts that never exist at the same time, and still charging the transformer its file size when nearly 40% of it is released the moment a generation starts. It bills the largest stage on its own now: 28 GB instead of 43 for the 8-bit MiniMax-H3 build, against a measured peak of 26. The largest sizes can still run out of memory mid-render on a 48 GB Mac, but the model loads and works.
+- **Settings ▸ Server ▸ Model memory cap**, a slider, Auto by default. The setting that decides whether a model is allowed to load at all was reachable only from the command line, so when the automatic cap refused a model you knew would fit there was nothing to do about it in the app. "Skip memory pre-flight check" does not help here, because the cap is checked before that.
+- LTX video was billed for a transformer it never loads (packs ship two, only one is ever in memory) and not billed at all for its text encoder, which lives in a separate folder.
+- A video or music generation kept running after the client hung up, with everything else queued behind it for the rest of the run. Requests that do not stream progress had no way to notice at all, which is most API clients. Note that long renders need a generous client timeout either way: 1344x768 can take well over 45 minutes.
+- Reserved tokens such as `<|fim_hole|>` can no longer be sampled into a reply. The list is built per model from its own tokenizer and chat template, so thinking tags and tool markers are untouched.
+- Tool calls no longer vanish when an argument mentions `</think>`. Coding agents write files about prompts, so this was reachable on every thinking model.
+- The transcript follows a streaming reply and stops the moment you scroll up, on every input rather than only the mouse wheel.
+- The MiniMax-H3 fast recipe silently did nothing on runs of about 8 steps or fewer while still reporting that it was on.
+- Added a repetition guard for loops that reword themselves; the existing guards only caught exact repeats.
+- Streaming a long thinking block no longer costs CPU that grows with the length of the thought.
+- `/detokenize` returned bodies that no JSON parser would accept if any token contained a control byte.
+
+Thanks [@h9q2cyxvgm-ui](https://github.com/h9q2cyxvgm-ui), [@funk80rus](https://github.com/funk80rus) and [@AideYu](https://github.com/AideYu) for testing and finding a bunch of problems! It really helps ! 
+
+---
+
 ## v26.8.2 — MiniMax-H3 video with its own soundtrack, LFM2.5
 
 ### MiniMax-H3 (Hailuo 3.0) generates video and audio together

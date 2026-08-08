@@ -438,6 +438,14 @@ struct ModelInfo {
         return nil
     }
 
+    /// Whether this entry can answer a chat request at all. A generator
+    /// advertises only its OUTPUT modality ("image" / "video" / "audio") and an
+    /// encoder only "embeddings"; a multimodal chat model advertises "chat"
+    /// alongside its input modalities, so `slotKind` already draws this line —
+    /// including the "no capabilities at all" tolerance for pre-Phase-G servers
+    /// and loaded GGUFs.
+    var servesChat: Bool { slotKind == .chat }
+
     /// Classify a registry entry into a tray slot from its capabilities.
     /// "chat" wins first: a multimodal chat model also advertises "vision"/
     /// "audio" (input modalities), while gen engines advertise ONLY their
@@ -717,6 +725,10 @@ struct LocalModel: Identifiable, Hashable {
     /// discovery emits one `LocalModel` per file and `path` points at the file.
     /// nil for MLX checkpoints, whose `path` is the directory.
     var quantFile: String? = nil
+    /// The quant's menu label as `GgufQuant.groupQuants` resolved it — which is
+    /// the only place that can see the SIBLINGS, and so the only place that can
+    /// tell two builds of one scheme apart. nil ⇒ derive it from the filename.
+    var quantLabel: String? = nil
 
     var isSupportedArchitecture: Bool {
         supportedModelTypes.contains(modelType) || isMediaModelType(modelType)
@@ -822,9 +834,13 @@ struct LocalModel: Identifiable, Hashable {
     /// name plus the quant it is (`unsloth/Qwen3.5-4B-GGUF · Q4_K_M`) — sibling
     /// quants share a `name`, so the name alone can't tell them apart, and
     /// `name` has to stay the repo name because filters and grouping key off it.
+    ///
+    /// The resolved `quantLabel` wins: the bare token is a property of ONE
+    /// filename and two builds of the same scheme reduce to the same one, which
+    /// is how the picker ended up with two identical titles.
     var displayLabel: String {
         guard let quantFile else { return name }
-        return "\(name) · \(DownloadManager.quantLabel(forFilename: quantFile))"
+        return "\(name) · \(quantLabel ?? DownloadManager.quantLabel(forFilename: quantFile))"
     }
 
     /// Display labels shared by more than one model. macOS `.menu` Pickers key

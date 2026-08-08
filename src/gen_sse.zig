@@ -35,9 +35,18 @@ pub const headers = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache
 /// can abort instead of finishing a video nobody will receive.
 pub const StreamCtx = struct {
     conn: *Conn,
+    /// False for a non-streaming request. Such a job still needs the
+    /// CANCELLATION half — a media generation runs for minutes on the
+    /// inference thread with every other request queued behind it, so a
+    /// client that hangs up must not leave the GPU finishing a video nobody
+    /// will receive — but its response is one JSON body, and an SSE event
+    /// spliced into that is unparseable. So `cb` no-ops and only the probe
+    /// runs.
+    stream: bool = true,
     cancelled: bool = false,
     pub fn cb(ptr: *anyopaque, stage: []const u8, step: u32, total: u32) void {
         const self: *StreamCtx = @ptrCast(@alignCast(ptr));
+        if (!self.stream) return;
         var buf: [256]u8 = undefined;
         const ev = std.fmt.bufPrint(&buf, "data: {{\"type\":\"progress\",\"stage\":\"{s}\",\"step\":{d},\"total\":{d}}}\n\n", .{ stage, step, total }) catch return;
         self.conn.writeAll(ev) catch {
@@ -46,7 +55,16 @@ pub const StreamCtx = struct {
     }
     fn cancelledCb(ptr: *anyopaque) bool {
         const self: *StreamCtx = @ptrCast(@alignCast(ptr));
-        return self.cancelled;
+        if (self.cancelled) return true;
+        // A failed write is a LATE signal even when streaming: TCP send
+        // buffers absorb hundreds of events after the client's FIN. The
+        // socket probe is prompt, and for a non-streaming job it is the only
+        // signal there is.
+        if (self.conn.peerClosed()) {
+            self.cancelled = true;
+            return true;
+        }
+        return false;
     }
     pub fn progress(self: *StreamCtx) Progress {
         return .{ .ctx = self, .cb = StreamCtx.cb, .cancelled_cb = StreamCtx.cancelledCb };
@@ -177,4 +195,34 @@ test "Progress.cancelled defaults false, reads the probe when set" {
     try std.testing.expect(!p.cancelled());
     h.flag = true;
     try std.testing.expect(p.cancelled());
+}
+
+test "a NON-streaming job still gets a cancellation probe, and writes no SSE" {
+    // A media generation runs for MINUTES on the inference thread while the
+    // connection thread blocks in `Scheduler.runGeneration`, so a client that
+    // hangs up leaves the GPU producing a video nobody will receive — and
+    // every queued request waits behind it. Streaming requests latch on a
+    // failed progress write; a non-streaming one has no write to fail, so it
+    // used to have no cancellation at all.
+    var sv: [2]std.posix.fd_t = undefined;
+    try std.testing.expect(std.c.socketpair(1, 1, 0, &sv) == 0); // AF_UNIX, SOCK_STREAM
+    var conn: Conn = undefined;
+    conn.stream = .{ .socket = .{ .handle = sv[0], .address = undefined } };
+    conn.ollama_sink = null;
+
+    var sctx = StreamCtx{ .conn = &conn, .stream = false };
+    const p = sctx.progress();
+    try std.testing.expect(!p.cancelled());
+
+    // Emitting must put NOTHING on the wire: this response is a single JSON
+    // body, and an SSE event spliced into it is unparseable.
+    p.emit("Generating", 1, 15);
+    var peek: [1]u8 = undefined;
+    const n = std.c.recv(sv[1], &peek, peek.len, std.posix.MSG.PEEK | std.posix.MSG.DONTWAIT);
+    try std.testing.expect(n <= 0);
+
+    _ = std.c.close(sv[1]); // client hangs up mid-generation
+    const cancelled = p.cancelled();
+    _ = std.c.close(sv[0]);
+    try std.testing.expect(cancelled);
 }

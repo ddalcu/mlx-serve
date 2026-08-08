@@ -79,6 +79,9 @@ nav {
   color: var(--text-tertiary); padding: 2px 7px;
   border: 1px solid var(--border); border-radius: 100px; margin-left: 2px;
 }
+/* assets/version.js fills this from the latest GitHub release; until it does
+   (or if the call fails) there is nothing to show, so show nothing. */
+.nav-ver:empty { display: none; }
 .nav-links .nav-current { color: var(--text-primary); font-weight: 600; }
 
 /* mobile hamburger toggle — checkbox hack, no JS */

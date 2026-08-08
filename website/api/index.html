@@ -67,7 +67,7 @@
     <a href="../" class="nav-logo">
       <img src="../appiconb.png" alt="MLX Core" class="nav-logo-img">
       <span>mlx-serve</span>
-      <span class="nav-ver">v26.7.12</span>
+      <span class="nav-ver"></span>
     </a>
     <input type="checkbox" id="nav-toggle" class="nav-toggle-input">
     <ul class="nav-links" onclick="if(event.target.closest('a')) document.getElementById('nav-toggle').checked=false">
@@ -107,6 +107,7 @@
       <a href="#ollama">Ollama API</a>
       <a href="#media">Media generation</a>
       <a href="#management">Model management</a>
+      <a href="#utilities">Utilities</a>
       <a href="#observability">Metrics &amp; auth</a>
     </div>
 
@@ -134,19 +135,22 @@ print(r.choices[0].message.content)</pre></div>
     <table class="ep-table">
       <tr><th>Endpoint</th><th>What it does</th></tr>
       <tr><td><span class="method m-get">GET</span><code>/health</code></td><td>Liveness probe — <code>200</code> when the server is up.</td></tr>
-      <tr><td><span class="method m-get">GET</span><code>/v1/models</code></td><td>Every model the server can serve — loaded or discoverable — with a <code>capabilities</code> array (<code>chat</code>, <code>embeddings</code>, <code>image</code>, <code>audio</code>, <code>music</code>, <code>video</code>, <code>3d</code>) so clients know what each one can do.</td></tr>
-      <tr><td><span class="method m-post">POST</span><code>/v1/chat/completions</code></td><td>Chat with streaming (SSE), tool calling, vision (image parts on multimodal models), JSON mode / <code>response_format</code>, and thinking models. The workhorse endpoint.</td></tr>
-      <tr><td><span class="method m-post">POST</span><code>/v1/completions</code></td><td>Raw text completion (no chat template) — FIM / code-completion friendly.</td></tr>
-      <tr><td><span class="method m-post">POST</span><code>/v1/embeddings</code></td><td>Batched embeddings from encoder models (e.g. <code>bge-small-en-v1.5-8bit</code>) — the whole input array runs as one padded GPU forward.</td></tr>
+      <tr><td><span class="method m-get">GET</span><code>/v1/models</code></td><td>Every model the server can serve — loaded or discoverable — with a <code>capabilities</code> array (<code>chat</code>, <code>tool_use</code>, <code>streaming</code>, <code>vision</code>, <code>audio</code>, <code>reasoning</code>, <code>json_schema</code>, <code>embeddings</code>, <code>image</code>, <code>music</code>, <code>video</code>, <code>3d</code>) so clients know what each one can do.</td></tr>
+      <tr><td><span class="method m-post">POST</span><code>/v1/chat/completions</code></td><td>Chat with streaming (SSE), tool calling, vision (image parts on multimodal models), JSON mode / <code>response_format</code>, <code>logprobs</code> / <code>top_logprobs</code>, and thinking models. The workhorse endpoint.</td></tr>
+      <tr><td><span class="method m-post">POST</span><code>/v1/completions</code></td><td>Raw text completion (no chat template) — FIM / code-completion friendly. <code>logprobs</code> here is an integer and returns OpenAI's legacy four-array shape.</td></tr>
+      <tr><td><span class="method m-post">POST</span><code>/v1/embeddings</code></td><td>Batched embeddings from encoder models (BERT/bge, EmbeddingGemma, Qwen3-Embedding) — the whole input array runs as one padded GPU forward. Pooling is read from the checkpoint, and <code>dimensions</code> truncates + renormalizes like <code>text-embedding-3</code>.</td></tr>
     </table>
+    <p>Every response carries <code>usage.prompt_tokens_details.cached_tokens</code>, so you can see what the prefix cache saved. <code>stream_options: {"include_usage": true}</code> adds the usage chunk at the end of a stream. When a reply is cut because the model went in circles, <code>finish_details: {"type": "repetition_loop"}</code> sits beside <code>finish_reason</code> instead of the cut being reported as a plain length stop.</p>
 
     <h2 id="extensions">Request extensions beyond OpenAI</h2>
     <p>All optional; every endpoint stays spec-compatible without them.</p>
     <table class="ep-table">
       <tr><th>Field</th><th>Meaning</th></tr>
       <tr><td><code>enable_thinking</code></td><td>Toggle thinking/reasoning on models that support it; reasoning arrives as <code>reasoning_content</code>, never leaked into the visible text.</td></tr>
-      <tr><td><code>reasoning_budget</code></td><td>Cap thinking tokens per request.</td></tr>
+      <tr><td><code>reasoning_effort</code></td><td>OpenAI's <code>"low"</code> / <code>"medium"</code> / <code>"high"</code>, mapped to a thinking budget (or to the model's own effort setting where it has one, like DeepSeek V4).</td></tr>
+      <tr><td><code>reasoning_budget_tokens</code></td><td>Cap thinking tokens per request. An explicit value outranks <code>reasoning_effort</code>.</td></tr>
       <tr><td><code>kv_quant</code></td><td>Per-request KV-cache quantization: <code>"off"</code>, <code>4</code>, <code>8</code>, <code>"turbo2"</code>, <code>"turbo4"</code>.</td></tr>
+      <tr><td><code>kv_attn_mode</code></td><td>Read path for a quantized KV cache: <code>"auto"</code> (default), <code>"dense"</code>, <code>"fused"</code>. Fused reads the packed cache in place and pays off at long context.</td></tr>
       <tr><td><code>enable_pld</code> / <code>enable_drafter</code> / <code>enable_mtp</code></td><td>Per-request control over the three speculative-decoding paths (<a href="../speculative-decoding/">deep dive</a>). Defaults are already sensible — outputs stay equivalent either way.</td></tr>
     </table>
     <p class="note">Sampling defaults resolve in this order: request body → server launch flags → the model's own <code>generation_config.json</code> → engine defaults. Clients that omit <code>temperature</code>/<code>top_p</code>/<code>top_k</code> get what the model's authors recommend.</p>
@@ -181,24 +185,34 @@ claude   <span class="c"># Claude Code now talks to your Mac</span></pre></div>
     <p>Each media endpoint accepts <code>"stream": true</code> for SSE progress events ending in a base64 <code>complete</code> payload; without it the response is the finished artifact. Load and unload media models like any other (<a href="#management">below</a>) — chat and media coexist in one process.</p>
 
     <h3><span class="method m-post">POST</span><code>/v1/images/generations</code></h3>
-    <p>FLUX.2-klein and Krea-2-Turbo (<a href="../image-generation/">deep dive</a>). Returns base64 PNG.</p>
+    <p>FLUX.2-klein (4B and 9B), Krea-2-Turbo and Mage-Flow Turbo / Edit (<a href="../image-generation/">deep dive</a>). Returns base64 PNG.</p>
     <table class="ep-table">
       <tr><th>Field</th><th>Meaning</th></tr>
       <tr><td><code>prompt</code></td><td>Required.</td></tr>
-      <tr><td><code>size</code></td><td><code>"WxH"</code>. Krea: any multiple of 16 in 256–2048; FLUX: 1024×1024.</td></tr>
-      <tr><td><code>image</code> + <code>mode</code></td><td>Base64 source image with <code>"variation"</code> (img2img, plus <code>strength</code> 0–1) or <code>"edit"</code> (FLUX.2 instruction edit — "make the hair blue" keeps subject and scene).</td></tr>
+      <tr><td><code>size</code></td><td><code>"WxH"</code>, rounded to the backend's own grid: FLUX to a multiple of 32 in 256–1536, Krea and Mage-Flow to a multiple of 16 in 256–2048. Omitted in <code>"edit"</code> mode means "match the source".</td></tr>
+      <tr><td><code>image</code> + <code>mode</code></td><td>Base64 source image with <code>"variation"</code> (img2img, plus <code>strength</code> 0–1) or <code>"edit"</code> (instruction edit on FLUX.2 or Mage-Flow Edit — "make the hair blue" keeps subject and scene).</td></tr>
       <tr><td><code>ref_images</code></td><td>Up to 3 extra base64 reference images beside <code>image</code> in <code>"edit"</code> mode — refer to them by number in the prompt: <i>"replace the face of the man in image 1 with the face from image 2"</i>. Each keeps its own aspect ratio.</td></tr>
-      <tr><td><code>lora_path</code> / <code>lora_scale</code></td><td>Runtime style LoRA (<code>.safetensors</code>, diffusers layout) — no re-quantization, applied unfused.</td></tr>
+      <tr><td><code>lora_paths</code> / <code>lora_scales</code></td><td>Runtime style LoRAs (<code>.safetensors</code>, diffusers / kohya / PEFT layouts), up to 8, absolute paths. They stack: every adapter is summed at forward time, never merged, so nothing is re-quantized. Each file's own declared alpha is honored. The singular <code>lora_path</code> / <code>lora_scale</code> still works.</td></tr>
       <tr><td><code>cond_gain</code> / <code>cond_weights</code></td><td>Text-conditioning rebalance knobs.</td></tr>
       <tr><td><code>steps</code>, <code>seed</code>, <code>safety</code></td><td>Sampler steps, reproducibility, NSFW filter (<code>false</code> to disable per request).</td></tr>
     </table>
 
+    <h3><span class="method m-post">POST</span><code>/v1/images/edits</code></h3>
+    <p>The OpenAI SDK's edit shape, so <code>client.images.edit(image=…, prompt=…)</code> works unchanged against any edit-capable model you have loaded. This one is <code>multipart/form-data</code>, not JSON, and it is pure translation into the <code>mode:"edit"</code> body above — there is no second inference path.</p>
+    <div class="code-doc"><pre>client.images.edit(
+    model="mage-flow-edit-turbo-8bit",
+    image=[open("room.png","rb"), open("chair.png","rb")],   <span class="c"># repeated image[] = multi-reference</span>
+    prompt="put the chair from image 2 into image 1")</pre></div>
+    <p>Accepted fields: <code>model</code>, <code>prompt</code>, <code>image</code> / <code>image[]</code> (up to 4), <code>size</code>. Anything we can't honor is a named <code>400</code> rather than a silent no-op: <code>mask</code> (the editors are maskless), <code>n</code> &gt; 1, <code>response_format: "url"</code>, an <code>output_format</code> other than <code>png</code>, and <code>stream</code>.</p>
+
     <h3><span class="method m-post">POST</span><code>/v1/audio/speech</code></h3>
-    <p>Qwen3-TTS text-to-speech and zero-shot voice cloning (<a href="../voice-cloning/">deep dive</a>). Returns WAV bytes.</p>
+    <p>Qwen3-TTS (voice cloning) or Kokoro-82M (54 built-in voices), whichever is loaded (<a href="../voice-cloning/">deep dive</a>). Returns WAV bytes. The two backends share the endpoint but not the controls, and asking one for the other's control is a named <code>400</code> rather than a quietly plain-voiced answer.</p>
     <table class="ep-table">
       <tr><th>Field</th><th>Meaning</th></tr>
-      <tr><td><code>input</code></td><td>The text to speak. Required.</td></tr>
-      <tr><td><code>ref_audio</code></td><td>Optional base64 WAV (24 kHz mono) — a few seconds of any voice clones it zero-shot, no transcript needed.</td></tr>
+      <tr><td><code>input</code></td><td>The text to speak. Required (<code>text</code> also accepted).</td></tr>
+      <tr><td><code>ref_audio</code></td><td>Qwen3-TTS only. Base64 WAV (24 kHz mono) — a few seconds of any voice clones it zero-shot, no transcript needed. <code>{"warm_only": true}</code> with a <code>ref_audio</code> caches the speaker embedding without synthesizing, so the first sentence of a session isn't cold.</td></tr>
+      <tr><td><code>voice</code></td><td>Kokoro only. One of the 54 packs (default <code>af_heart</code>); a comma-separated list blends them, e.g. <code>"af_bella,af_sky"</code>. An unknown name is a <code>400</code>.</td></tr>
+      <tr><td><code>speed</code> / <code>seed</code></td><td>Kokoro only. Speaking rate in (0, 5], default 1.0; seed for reproducibility.</td></tr>
     </table>
 
     <h3><span class="method m-post">POST</span><code>/v1/audio/music-generations</code></h3>
@@ -213,7 +227,10 @@ claude   <span class="c"># Claude Code now talks to your Mac</span></pre></div>
     </table>
 
     <h3><span class="method m-post">POST</span><code>/v1/video/generations</code></h3>
-    <p>LTX-Video — text, image, or audio to video with synced sound (<a href="../video-generation/">deep dive</a>).</p>
+    <p>One endpoint, two backends: <b>LTX-Video</b> (text, image or audio to video with synced sound) and <b>MiniMax-H3 / Hailuo 3.0</b> (video and its stereo soundtrack denoised jointly in one pass). Whichever is loaded serves the request, and the field a backend can't honor is a named <code>400</code> rather than a silently dropped setting (<a href="../video-generation/">deep dive</a>).</p>
+    <p>The response is raw frames plus raw audio, not a container: <code>{"frames": N, "width", "height", "fps": 24, "format": "rgb8", "data": "&lt;base64&gt;"}</code>, and when the model produced sound, <code>audio_format: "pcm_s16le"</code>, <code>audio_channels: 2</code>, <code>audio_sample_rate</code> and <code>audio_data</code> beside it. Mux to MP4 on your side. These runs take minutes, so use <code>"stream": true</code> for progress and give your client a generous timeout.</p>
+
+    <p><b>LTX-Video</b></p>
     <table class="ep-table">
       <tr><th>Field</th><th>Meaning</th></tr>
       <tr><td><code>prompt</code></td><td>Required. Quoted lines become spoken dialogue.</td></tr>
@@ -222,6 +239,22 @@ claude   <span class="c"># Claude Code now talks to your Mac</span></pre></div>
       <tr><td><code>first_frame_image</code></td><td>Base64 photo pinned as frame 0 — image-to-video.</td></tr>
       <tr><td><code>audio</code></td><td>Base64 WAV soundtrack the video performs to (two-stage only); the original clip is muxed into the MP4.</td></tr>
       <tr><td><code>cfg_scale</code> / <code>stg_scale</code> / <code>cfg_audio_scale</code> / <code>steps</code> / <code>stage2_steps</code> / <code>seed</code></td><td>Guidance and sampler knobs; sensible per-pipeline defaults.</td></tr>
+      <tr><td><code>lora_paths</code> / <code>lora_scales</code></td><td>Same stacked-LoRA grammar as the image endpoint.</td></tr>
+    </table>
+
+    <p><b>MiniMax-H3</b> — narrower on purpose: no CFG scale and no pipeline mode (it is CFG-distilled and single-pipeline), and frame counts live on its own ladder. New in v26.8.2. It ships as two partitions that carry the same files and differ only in which conditioning they were trained for, so the server reads the pack's declared <code>tasks</code> and refuses what that build would ignore: FL2VA does keyframes and chained windows, REF2VA does references.</p>
+    <table class="ep-table">
+      <tr><th>Field</th><th>Meaning</th></tr>
+      <tr><td><code>prompt</code></td><td>Required. Describe the scene, then the sound after <code>overall_soundscape:</code>.</td></tr>
+      <tr><td><code>width</code> / <code>height</code></td><td>Multiples of 32, default 256. 1344×768 is the recommended size and takes about 50 minutes for 124 frames on an M4 Max.</td></tr>
+      <tr><td><code>num_frames</code></td><td>Snapped to the model's 17k+5 ladder and the delivered count is reported back, so an audio mux can't drift. 24 fps, up to 15 seconds.</td></tr>
+      <tr><td><code>turbo</code></td><td><code>true</code> attaches the 4-step distillation adapter (about 2× faster end to end, slightly softer). <code>steps</code> then defaults to 4 and 4 is the floor; without turbo the default is 30.</td></tr>
+      <tr><td><code>fast</code></td><td>The fast recipe (velocity cache + attention broadcast, about 2.8× at 768p) is on by default. <code>false</code> keeps every forward dense.</td></tr>
+      <tr><td><code>first_frame_image</code> / <code>last_frame_image</code></td><td>FL2VA only. Base64 photo anchoring the start and/or end of the clip. An undecodable image is a <code>400</code>, never a silent text-to-video.</td></tr>
+      <tr><td><code>chain_windows</code></td><td>FL2VA only, 1–6. Generates that many back-to-back windows of <code>num_frames</code>, each continuing from the last frame of the one before, for a longer clip.</td></tr>
+      <tr><td><code>ref_images</code> / <code>ref_videos</code> / <code>ref_audios</code></td><td>REF2VA only. Base64 PNG/JPEG strings, <code>{"frames": […], "audio": "…"}</code> objects, and WAV strings. Refer to them in the prompt by number: <code>&lt;Picture 1&gt;</code>, <code>&lt;Video 1&gt;</code>, <code>&lt;Audio 1&gt;</code>. <code>ref_image_size</code> is <code>"match"</code> (default) or <code>"max"</code>.</td></tr>
+      <tr><td><code>lora_paths</code> / <code>lora_scales</code></td><td>Same stacked grammar again, and turbo is simply file 0 of that stack, so a style LoRA rides on top of it.</td></tr>
+      <tr><td><code>steps</code> / <code>seed</code></td><td>Sampler steps and reproducibility.</td></tr>
     </table>
 
     <h3><span class="method m-post">POST</span><code>/v1/3d/generations</code></h3>
@@ -242,6 +275,15 @@ claude   <span class="c"># Claude Code now talks to your Mac</span></pre></div>
       <tr><td><span class="method m-post">POST</span><code>/v1/unload-model</code></td><td><code>{"model": "&lt;id&gt;"}</code> — free a model's memory now.</td></tr>
     </table>
     <p class="note">Requests are queued per model and batch-decode together where the architecture allows; a media generation runs on the same GPU and briefly pauses chat decode — one machine, one memory budget, no surprises.</p>
+    <p><code>--model-dir</code> is repeatable, so a server can serve several folders at once. They merge first-wins, and every one of them shows up in <code>/v1/models</code>.</p>
+
+    <h2 id="utilities">Utility endpoints</h2>
+    <table class="ep-table">
+      <tr><th>Endpoint</th><th>What it does</th></tr>
+      <tr><td><span class="method m-post">POST</span><code>/tokenize</code></td><td><code>{"content": "…"}</code> — token ids for a string, from the loaded model's own tokenizer.</td></tr>
+      <tr><td><span class="method m-post">POST</span><code>/detokenize</code></td><td><code>{"tokens": [1,2,3]}</code> — back to text.</td></tr>
+      <tr><td><span class="method m-get">GET</span><code>/props</code></td><td>llama.cpp-style server properties: chat template, context length, live memory counters. Keeps answering on a server with no chat model loaded.</td></tr>
+    </table>
 
     <h2 id="observability">Metrics &amp; auth</h2>
     <p>Both are opt-in and independent. Start the server with <code>--metrics</code>, <code>--api-key</code>, or neither — the app exposes the same two switches in Settings.</p>
@@ -280,6 +322,7 @@ curl "http://mac.local:11234/v1/models?api_key=&lt;key&gt;"</pre></div>
     <p class="footer-copy">MIT License · mlx-serve · built for Apple Silicon</p>
   </footer>
 
+  <script src="../assets/version.js"></script>
   <script src="../assets/feature.js"></script>
 </body>
 </html>

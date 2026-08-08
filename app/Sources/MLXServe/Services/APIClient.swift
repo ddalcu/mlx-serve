@@ -12,7 +12,10 @@ enum SSEEvent {
     case reasoning(String)
     case usage(TokenUsage)
     case toolCalls([APIClient.ToolCall])
-    case maxTokensReached
+    /// The reply was CUT — `finish_reason: "length"`, whose cause comes from
+    /// the server's sibling `finish_details` (a max_tokens cap and a
+    /// degenerate-tail loop cut share the one OpenAI value).
+    case truncated(TruncationNotice.Cause)
     case done
 }
 
@@ -37,8 +40,23 @@ enum APIError: LocalizedError {
             if detail.isEmpty {
                 return "HTTP \(code) from mlx-serve. Check the server log (menu bar → log icon)."
             }
-            return "HTTP \(code) from mlx-serve\(detail)"
+            return "HTTP \(code) from mlx-serve: \(detail)"
         }
+    }
+
+    /// The server's error bodies are `{"error":{"message":"…"}}`, and its
+    /// named 400s exist to tell the user what to do — extract the message,
+    /// degrade to a trimmed snippet for foreign bodies, and never return
+    /// empty (an empty detail renders as a bare status code).
+    static func errorDetail(fromBody data: Data) -> String {
+        if let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let err = obj["error"] as? [String: Any],
+           let msg = err["message"] as? String, !msg.isEmpty {
+            return msg
+        }
+        let s = String(data: data, encoding: .utf8)?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        return s.isEmpty ? "stream start failed" : String(s.prefix(300))
     }
 
     private static func looksLikeContextOverflow(_ detail: String) -> Bool {
@@ -234,7 +252,17 @@ class APIClient {
                     req.timeoutInterval = 900
                     let (bytes, resp) = try await URLSession.shared.bytes(for: req)
                     let code = (resp as? HTTPURLResponse)?.statusCode ?? -1
-                    guard code == 200 else { throw APIError.badStatus(code: code, detail: "stream start failed") }
+                    guard code == 200 else {
+                        // Read the error body: the server's named 400s say
+                        // what to do, and throwing without them left the
+                        // Failed card pointing at nothing.
+                        var raw = Data()
+                        for try await b in bytes {
+                            raw.append(b)
+                            if raw.count > 2048 { break }
+                        }
+                        throw APIError.badStatus(code: code, detail: APIError.errorDetail(fromBody: raw))
+                    }
                     for try await line in bytes.lines {
                         guard line.hasPrefix("data: ") else { continue }
                         let payload = String(line.dropFirst(6))
@@ -298,6 +326,23 @@ class APIClient {
         let rawArguments: String
     }
 
+    /// Read a cut's CAUSE out of one streamed choice. `finish_reason: "length"`
+    /// is the only OpenAI value for both a max_tokens cap and the server's
+    /// degenerate-tail loop cut, so the cause comes from the sibling
+    /// `finish_details` object the server emits beside it. An older server (or
+    /// any other OpenAI-compatible backend) sends no such field and reads as
+    /// `.maxTokens`, which is exactly the behaviour this replaced.
+    ///
+    /// Static and dictionary-shaped so it is testable without a live stream.
+    static func truncationCause(fromChoice choice: [String: Any]?) -> TruncationNotice.Cause? {
+        guard let choice, let fr = choice["finish_reason"] as? String, fr == "length" else { return nil }
+        if let details = choice["finish_details"] as? [String: Any],
+           let type = details["type"] as? String, type == "repetition_loop" {
+            return .repetitionLoop
+        }
+        return .maxTokens
+    }
+
     /// Per-request overrides that come from the user's saved ServerOptions.
     /// Each field is optional — `nil` = leave it out of the request body and
     /// let the server's default win. Pre-built once at the call site (usually
@@ -315,9 +360,19 @@ class APIClient {
 
         /// Build from the user's saved settings: per-request TriState overrides
         /// translate to optional booleans; numeric defaults are forwarded only
-        /// when they differ from the canonical "off" value (e.g. topK=0 stays
-        /// nil — the server already treats 0 as disabled and we want to avoid
-        /// gratuitously bloating every request body).
+        /// when they differ from the canonical "off" value.
+        ///
+        /// topK=0 stays nil, and OMITTING it is not the same as sending 0 —
+        /// the earlier comment here had that backwards. The server resolves an
+        /// absent field through body > launch flags > the model's own
+        /// `generation_config.json` (`resolveSamplingDefault`), so omitting
+        /// hands the checkpoint's recommended cut to the request, while
+        /// sending 0 DISABLES the cut. That matters more than it sounds:
+        /// measured 2026-08-05 on a collapse-prone 4-bit MoE, off-distribution
+        /// tokens spliced into generated code at 1.20 per 1000 tokens with
+        /// top_k 0 against 0.04 with the card's top_k 20 — same model, same
+        /// temperature. Omitting is the behaviour we want; the reason is the
+        /// opposite of what was written here.
         static func from(_ opts: ServerOptions) -> RequestDefaults {
             var r = RequestDefaults()
             r.topP = opts.defaultTopP
@@ -609,9 +664,10 @@ class APIClient {
                 }
             }
 
-            // Check finish_reason
-            if let fr = choices.first?["finish_reason"] as? String, fr == "length" {
-                continuation.yield(.maxTokensReached)
+            // Check finish_reason. "length" is both the max_tokens cap and the
+            // server's own loop cut; `finish_details` is what tells them apart.
+            if let cause = Self.truncationCause(fromChoice: choices.first) {
+                continuation.yield(.truncated(cause))
             }
             // "length" + accumulated calls = a TRUNCATED tool call (max_tokens or
             // server stall-timeout cut it mid-args). Deliver the salvaged calls so

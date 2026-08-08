@@ -4,6 +4,42 @@ const io_util = @import("io_util.zig");
 
 pub const TokenizerType = enum { sentencepiece_bpe, byte_level_bpe, wordpiece };
 
+/// An added token flagged `special: true` in tokenizer.json.
+pub const FlaggedSpecial = struct { id: u32, content: []const u8 };
+
+/// The ids a sampler must never draw: added tokens flagged `special: true`,
+/// MINUS the ones that are legitimate output. Legitimacy is DERIVED, never a
+/// hardcoded list (which would break thinking/tool-calling on the next arch):
+///   - EOS/stop ids (`exempt_ids`) stay reachable, and
+///   - any special whose literal text appears in the chat template source
+///     stays reachable — thinking tags, tool markers and role markers all
+///     ride their model's own template.
+/// An empty `template_source` disables suppression entirely (returns no ids):
+/// with no template to consult, "what can this model legitimately emit" has
+/// no honest answer, and fallback-formatted models keep pre-change behavior.
+/// A reserved marker like `<|fim_hole|>` in chat output is always a bug
+/// regardless of what produced it (a collapsed distribution can rank one top-5 at a
+/// degenerate position); the substring rule errs toward exemption, which can
+/// only ever keep a token reachable.
+pub fn reservedOutputIds(
+    allocator: std.mem.Allocator,
+    flagged: []const FlaggedSpecial,
+    template_source: []const u8,
+    exempt_ids: []const u32,
+) ![]u32 {
+    if (template_source.len == 0) return allocator.alloc(u32, 0);
+    var out = std.ArrayList(u32).empty;
+    errdefer out.deinit(allocator);
+    outer: for (flagged) |sp| {
+        for (exempt_ids) |e| {
+            if (sp.id == e) continue :outer;
+        }
+        if (std.mem.indexOf(u8, template_source, sp.content) != null) continue;
+        try out.append(allocator, sp.id);
+    }
+    return out.toOwnedSlice(allocator);
+}
+
 /// BPE tokenizer supporting both SentencePiece (Gemma) and byte-level (GPT-2/Qwen3) modes.
 pub const Tokenizer = struct {
     /// Token string -> id
@@ -35,6 +71,14 @@ pub const Tokenizer = struct {
     /// speedup on Gemma-class tokenizers (262k vocab + 514k merges).
     parsed_json: ?std.json.Parsed(std.json.Value) = null,
 
+    /// Added tokens flagged `special: true` in tokenizer.json — the
+    /// candidate set for reserved-output suppression. NOT the same as
+    /// `special_tokens`, which deliberately holds ALL added tokens
+    /// (`special: false` entries like `<think>` are atomic-encode units but
+    /// perfectly legitimate output). Content slices borrow `parsed_json`'s
+    /// arena; the slice itself is owned and freed in deinit.
+    flagged_specials: []const FlaggedSpecial = &.{},
+
     const MergePair = struct {
         left: []const u8,
         right: []const u8,
@@ -53,11 +97,31 @@ pub const Tokenizer = struct {
         }
     };
 
+    /// A decode-capable tokenizer with EMPTY maps, for tests in other modules
+    /// that need to turn ids into text without a checkpoint on disk. The caller
+    /// owns every map and must `deinit` them; nothing here reads tokenizer.json,
+    /// so encode is not meaningfully usable — populate `id_to_token` and decode.
+    pub fn initEmptyForTests(allocator: std.mem.Allocator, tok_type: TokenizerType) Tokenizer {
+        return .{
+            .vocab = std.StringHashMap(u32).init(allocator),
+            .id_to_token = std.AutoHashMap(u32, []const u8).init(allocator),
+            .merge_ranks = std.HashMap(MergePair, u32, MergePairContext, std.hash_map.default_max_load_percentage).init(allocator),
+            .allocator = allocator,
+            .special_tokens = std.StringHashMap(u32).init(allocator),
+            .tok_type = tok_type,
+            .byte_to_unicode = buildBytesToUnicode(),
+            .unicode_to_byte = std.AutoHashMap(u21, u8).init(allocator),
+            .bos_id = null,
+            .eos_id = null,
+        };
+    }
+
     pub fn deinit(self: *Tokenizer) void {
         // Map keys/values either point into `parsed_json`'s arena (no
         // per-entry free needed) or were duped explicitly when no parsed
         // JSON is held (e.g., the test-only constructors). Freeing the
         // parsed JSON deinits its arena in one shot.
+        if (self.flagged_specials.len > 0) self.allocator.free(self.flagged_specials);
         if (self.parsed_json) |*p| {
             self.vocab.deinit();
             self.id_to_token.deinit();
@@ -201,6 +265,13 @@ pub const Tokenizer = struct {
     /// Look up a special token ID by its string representation.
     pub fn specialTokenId(self: *const Tokenizer, name: []const u8) ?u32 {
         return self.special_tokens.get(name);
+    }
+
+    /// Reserved-output ids for this tokenizer: `reservedOutputIds` over the
+    /// `special: true` added tokens recorded at load. See that function for
+    /// the derivation rules.
+    pub fn reservedIds(self: *const Tokenizer, allocator: std.mem.Allocator, template_source: []const u8, exempt_ids: []const u32) ![]u32 {
+        return reservedOutputIds(allocator, self.flagged_specials, template_source, exempt_ids);
     }
 
     // ── SentencePiece BPE (Gemma-style) ──
@@ -997,6 +1068,8 @@ fn parseTokenizerContent(io: std.Io, allocator: std.mem.Allocator, content: []co
 
     // Parse added_tokens
     var special_tokens = std.StringHashMap(u32).init(allocator);
+    var flagged = std.ArrayList(FlaggedSpecial).empty;
+    errdefer flagged.deinit(allocator);
     var bos_id: ?u32 = null;
     var eos_id: ?u32 = null;
 
@@ -1009,6 +1082,13 @@ fn parseTokenizerContent(io: std.Io, allocator: std.mem.Allocator, content: []co
             // so they are tokenized as single atomic units. The string is
             // borrowed from `parsed`'s arena — no per-entry dupe.
             try special_tokens.put(content_str, id);
+            // `special: true` entries additionally feed reserved-output
+            // suppression (see `reservedOutputIds`).
+            if (obj.get("special")) |sv| {
+                if (sv == .bool and sv.bool) {
+                    try flagged.append(allocator, .{ .id = id, .content = content_str });
+                }
+            }
             if (!vocab.contains(content_str)) {
                 try vocab.put(content_str, id);
                 try id_to_token.put(id, content_str);
@@ -1044,6 +1124,7 @@ fn parseTokenizerContent(io: std.Io, allocator: std.mem.Allocator, content: []co
         .merge_ranks = merge_ranks,
         .allocator = allocator,
         .special_tokens = special_tokens,
+        .flagged_specials = try flagged.toOwnedSlice(allocator),
         .tok_type = tok_type,
         .digit_group = if (root.get("pre_tokenizer")) |pt| digitGroupFromPreTokenizer(pt) else 1,
         .byte_to_unicode = byte_to_unicode,
@@ -1784,4 +1865,51 @@ test "parseMergePair handles both array and space-joined-string formats" {
         defer p.deinit();
         try testing.expect(parseMergePair(p.value) == null);
     }
+}
+
+test "reservedOutputIds: specials minus template markers minus eos" {
+    // A reserved marker (`<|fim_hole|>` at a collapsed position) in
+    // chat output is always a bug; the suppression set is every `special:
+    // true` added token MINUS legitimate output. Legitimacy is DERIVED, never
+    // hardcoded: EOS/stop ids stay, and so does any special whose literal
+    // text appears in the chat template source (thinking tags, tool markers,
+    // role markers) — a hardcoded list breaks thinking/tool-calling on the
+    // next arch.
+    const alloc = testing.allocator;
+    const flagged = [_]FlaggedSpecial{
+        .{ .id = 10, .content = "<|fim_hole|>" },
+        .{ .id = 11, .content = "<|fim_begin|>" },
+        .{ .id = 20, .content = "<think>" },
+        .{ .id = 21, .content = "</think>" },
+        .{ .id = 22, .content = "<tool_call>" },
+        .{ .id = 30, .content = "<|endoftext|>" },
+        .{ .id = 31, .content = "<|role_end|>" },
+    };
+    const template = "<role>HUMAN</role>{{ content }}<|role_end|>" ++
+        "<role>ASSISTANT</role>\n<think></think>{% if tools %}<tool_call>{% endif %}";
+    const eos = [_]u32{30};
+
+    const ids = try reservedOutputIds(alloc, &flagged, template, &eos);
+    defer alloc.free(ids);
+    // Only the FIM markers survive: think/tool/role markers appear in the
+    // template, <|endoftext|> is EOS.
+    try testing.expectEqualSlices(u32, &[_]u32{ 10, 11 }, ids);
+
+    // No template at all => suppression disabled entirely (fallback-formatted
+    // models keep pre-change behavior; ChatML markers are not in any template
+    // source we could consult).
+    const none = try reservedOutputIds(alloc, &flagged, "", &eos);
+    defer alloc.free(none);
+    try testing.expectEqual(@as(usize, 0), none.len);
+}
+
+test "reservedOutputIds: every flagged special exempt yields empty set" {
+    const alloc = testing.allocator;
+    const flagged = [_]FlaggedSpecial{
+        .{ .id = 5, .content = "<eos>" },
+        .{ .id = 6, .content = "<think>" },
+    };
+    const ids = try reservedOutputIds(alloc, &flagged, "x<think>y", &[_]u32{5});
+    defer alloc.free(ids);
+    try testing.expectEqual(@as(usize, 0), ids.len);
 }

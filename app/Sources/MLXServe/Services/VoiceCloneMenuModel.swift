@@ -106,7 +106,7 @@ enum VoiceCloneMenuModel {
     @MainActor
     private static func bundleOnDisk(_ preset: AudioModelPreset) -> Bool {
         preset.bundle.components.allSatisfy {
-            DownloadManager.componentReady($0, modelsRoot: ServerManager.modelsRoot)
+            DownloadManager.componentReady($0, roots: ModelRoots().ownedRoots)
         }
     }
 

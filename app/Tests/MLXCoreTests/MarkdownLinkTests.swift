@@ -59,3 +59,25 @@ final class MarkdownLinkTests: XCTestCase {
         XCTAssertTrue(links(in: "read `CHANGELOG.md` and run build.sh").isEmpty)
     }
 }
+
+/// Rendered prose runs are remembered across the ~20 re-renders a second that a
+/// streamed reply triggers, so the cache has to be keyed on the whole source —
+/// a run whose text merely STARTS the same must not be served the other one's
+/// rendering, and a second call must not return something different from the
+/// first.
+final class MarkdownRenderCacheTests: XCTestCase {
+
+    func testTwoSourcesSharingAPrefixRenderDifferently() {
+        let a = MarkdownText.attributedString(for: "# Title\n\nfirst paragraph")
+        let b = MarkdownText.attributedString(for: "# Title\n\nfirst paragraph and more")
+        XCTAssertNotEqual(a.string, b.string)
+        XCTAssertTrue(b.string.hasPrefix("Title"))
+    }
+
+    func testRepeatedCallsAgree() {
+        let source = "**bold** and `code` and [a link](https://example.dev)\n\n- one\n- two"
+        let first = MarkdownText.attributedString(for: source)
+        let second = MarkdownText.attributedString(for: source)
+        XCTAssertTrue(first.isEqual(to: second))
+    }
+}

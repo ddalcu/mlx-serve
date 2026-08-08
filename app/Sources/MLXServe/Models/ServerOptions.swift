@@ -161,6 +161,15 @@ struct ServerOptions: Codable, Equatable {
     var enablePrefixCacheDisk: Bool = false
     /// Disk budget when `enablePrefixCacheDisk` is on. `10GB`, `2GB`, etc.
     var prefixCacheDisk: String = "10GB"
+    /// Registry residency cap (`--max-resident-mem`), in GiB. 0 = Auto, the
+    /// server's own default of 80% of the wired limit at startup. This is the
+    /// gate that decides whether a cold load is admitted AT ALL, and it runs
+    /// BEFORE the memory pre-flight — so `skipMemPreflight` cannot overturn
+    /// it, and without this field a model the auto cap refuses was unloadable
+    /// from the app at any setting. A NUMBER off a slider rather than typed
+    /// text: `main.zig` exits on a `--max-resident-mem` it cannot parse, and a
+    /// value that cannot be malformed needs no validator to drop it.
+    var maxResidentMemGB: Int = 0
     /// When true, launch with `--skip-mem-preflight` so the MLX loader skips the
     /// free-RAM pre-flight that would otherwise refuse a model whose weights +
     /// warmup headroom look too big for current free memory. The check is
@@ -465,6 +474,7 @@ struct ServerOptions: Codable, Equatable {
         prefixCacheMem == other.prefixCacheMem &&
         enablePrefixCacheDisk == other.enablePrefixCacheDisk &&
         prefixCacheDisk == other.prefixCacheDisk &&
+        maxResidentMemGB == other.maxResidentMemGB &&
         skipMemPreflight == other.skipMemPreflight &&
         llamaKvQuant == other.llamaKvQuant &&
         llamaCacheEntries == other.llamaCacheEntries &&
@@ -496,6 +506,15 @@ struct ServerOptions: Codable, Equatable {
     /// the entry count is the reliable lever — the byte cap under-counts the
     /// true retained allocation. An explicit 0 (disable) is preserved.
     ///   ≤18 GB (16 GB Macs): 1   ≤36 GB (24/32 GB): 8   else: uncapped.
+    /// Snap points for the model memory cap slider, in GiB. 0 is Auto and is
+    /// always first. The ladder stops at the machine's RAM — a cap above it
+    /// can never be reached, so offering it is theatre.
+    static func residentMemPresets(physicalMemoryBytes: UInt64) -> [Int] {
+        let ram = Int(physicalMemoryBytes / 1_073_741_824)
+        return [0] + [4, 8, 12, 16, 24, 32, 48, 64, 96, 128, 192, 256, 384, 512]
+            .filter { $0 <= max(ram, 8) }
+    }
+
     static func ramCappedPrefixCacheEntries(_ requested: Int, physicalMemoryBytes: UInt64) -> Int {
         if requested <= 0 { return requested }
         let gib = physicalMemoryBytes / 1_073_741_824
@@ -507,6 +526,18 @@ struct ServerOptions: Codable, Equatable {
     }
 
     func toCLIArgs(modelDirOverride: String? = nil,
+                   physicalMemoryBytes: UInt64 = ProcessInfo.processInfo.physicalMemory) -> [String] {
+        toCLIArgs(modelDirs: modelDirOverride.map { [$0] } ?? [],
+                  physicalMemoryBytes: physicalMemoryBytes)
+    }
+
+    /// `--model-dir` is REPEATABLE server-side, and a library can live in more
+    /// than one folder (the download destination, the folder it used to be, an
+    /// LM Studio tree). With one flag the others were listed by the app's own
+    /// picker and absent from `/v1/models`, so switching to one cost a full
+    /// server restart instead of a hot swap. Order matters: the server takes
+    /// the FIRST folder's copy of a repeated model id.
+    func toCLIArgs(modelDirs: [String],
                    physicalMemoryBytes: UInt64 = ProcessInfo.processInfo.physicalMemory) -> [String] {
         // The host field is free text in Settings — a cleared field must not
         // launch `--host ""` (the server would fail to bind).
@@ -521,7 +552,7 @@ struct ServerOptions: Codable, Equatable {
         if !logToFile {
             args += ["--log-file", "off"]
         }
-        if let dir = modelDirOverride, !dir.isEmpty {
+        for dir in modelDirs where !dir.isEmpty {
             args += ["--model-dir", dir]
         }
         if ctxSize > 0 {
@@ -622,6 +653,13 @@ struct ServerOptions: Codable, Equatable {
             args += ["--prefix-cache-disk", trimmedPrefixDisk]
         } else {
             args += ["--prefix-cache-disk", "off"]
+        }
+        // The registry residency cap. Emitted only when the user set a value
+        // the server can parse: `main.zig` EXITS on a bad one, and bricking
+        // the launch over a typo in a text field is worse than falling back
+        // to the auto cap it would have used anyway.
+        if maxResidentMemGB > 0 {
+            args += ["--max-resident-mem", "\(maxResidentMemGB)GB"]
         }
         // GGUF-only performance knobs. Emitted unconditionally when not
         // the default — the server silently ignores them on the MLX path
@@ -770,6 +808,7 @@ extension ServerOptions {
         if let v = try c.decodeIfPresent(String.self, forKey: .prefixCacheMem) { prefixCacheMem = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .enablePrefixCacheDisk) { enablePrefixCacheDisk = v }
         if let v = try c.decodeIfPresent(String.self, forKey: .prefixCacheDisk) { prefixCacheDisk = v }
+        if let v = try c.decodeIfPresent(Int.self, forKey: .maxResidentMemGB) { maxResidentMemGB = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .skipMemPreflight) { skipMemPreflight = v }
         if let v = try c.decodeIfPresent(LlamaKVQuant.self, forKey: .llamaKvQuant) { llamaKvQuant = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .llamaCacheEntries) { llamaCacheEntries = v }
@@ -988,6 +1027,10 @@ extension ServerOptions {
         "prefixCacheDisk": .init(
             title: "SSD cache size",
             explainer: "Disk budget for the SSD prefix cache when enabled. Accepts '10GB', '2GB', etc. LRU-evicted to this cap. Only used when 'SSD prefix cache' is on.",
+            needsRestart: true),
+        "maxResidentMemGB": .init(
+            title: "Model memory cap",
+            explainer: "Total RAM the server will hold in loaded models before it evicts one — or refuses the load when there is nothing to evict. Auto = 80% of what Metal recommends for this Mac. Raise it when a model you know fits is refused with \"not enough memory\" on an idle server; the refusal in the log names the estimate it used. Passes --max-resident-mem.",
             needsRestart: true),
         "skipMemPreflight": .init(
             title: "Skip memory pre-flight check",

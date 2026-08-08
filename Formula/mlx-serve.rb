@@ -1,8 +1,8 @@
 class MlxServe < Formula
   desc "Native LLM server for Apple Silicon with OpenAI & Anthropic compatible APIs"
   homepage "https://github.com/ddalcu/mlx-serve"
-  version "26.8.2"
-  sha256 "f075abd46894c46898eed8912af536feb2d12acb7abf5b5b793377816540ba0b"
+  version "26.8.3"
+  sha256 "71ea02a3559779eb0c2ff59f384a7618f3adb8b4f0fb6e446590c4f9a0f2fd45"
   url "https://github.com/ddalcu/mlx-serve/releases/download/v#{version}/mlx-serve-bin-macos-arm64.tar.gz"
 
   depends_on macos: :sonoma
@@ -11,6 +11,13 @@ class MlxServe < Formula
   def install
     libexec.install Dir["lib/*"]
     bin.install "mlx-serve"
+
+    # Apache-2.0 section 4 wants the license text and the NOTICE attributions to
+    # reach whoever receives the binary, and the binary links Apache-2.0 Metal
+    # kernels plus jinja.cpp. Guarded so an older tarball still installs.
+    %w[LICENSE LICENSE-APACHE-2.0 NOTICE].each do |f|
+      doc.install f if File.exist?(f)
+    end
 
     # Fix rpaths to use bundled libs in libexec (avoids conflicts with mlx/mlx-c)
     system "install_name_tool", "-change",

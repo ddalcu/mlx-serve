@@ -74,10 +74,14 @@ struct GgufQuant: Identifiable, Equatable, Hashable {
     // MARK: - Label disambiguation
     //
     // A repo can ship several files that reduce to the SAME quant token
-    // (`quantLabel`) while differing in tier, calibration, or variant —
-    // antirez/deepseek-v4-gguf has four IQ2XXS files (Flash/Pro × imatrix/static).
-    // When labels collide, append the distinguishing filename tokens so the
-    // dropdown is unambiguous.
+    // (`quantLabel`) while differing in tier, calibration, variant, or the build
+    // they were quantized from — antirez/deepseek-v4-gguf ships every scheme
+    // twice (pre-0731 and 0731) on top of four IQ2XXS files (Flash/Pro ×
+    // imatrix/static). Three passes, in order: append the tokens that tell a
+    // collision apart, always show a build stamp, then break whatever still
+    // ties. The last one is the INVARIANT — two identical rows in the dropdown
+    // is the failure this whole thing exists to prevent, and a categorical rule
+    // alone can't promise it.
 
     /// Filename tokens that identify a model TIER — the most useful
     /// disambiguator (e.g. Flash 86 GB vs Pro 465 GB). Lowercased.
@@ -89,24 +93,71 @@ struct GgufQuant: Identifiable, Equatable, Hashable {
         "imatrix", "fixed", "thinking", "reasoning", "distill", "distilled",
     ]
 
+    /// A BUILD STAMP — an all-digit token long enough to be a date or version
+    /// (`0731`, `20260731`), never a layer index (`Layers-31`) or a `chat-v2`
+    /// format marker. Shard indices are stripped before this ever sees them
+    /// (`namingBasename`), or every split quant would read `· 00001 · 00002`.
+    private static func isBuildStamp(_ token: String) -> Bool {
+        token.count >= 4 && token.allSatisfy(\.isNumber)
+    }
+
     private static func disambiguateLabels(_ quants: [GgufQuant]) -> [GgufQuant] {
         var indicesByLabel: [String: [Int]] = [:]
         for (i, q) in quants.enumerated() { indicesByLabel[q.label, default: []].append(i) }
         var out = quants
+
         for (_, idxs) in indicesByLabel where idxs.count > 1 {
-            let tokenLists = idxs.map { tokens(of: (quants[$0].filename as NSString).lastPathComponent) }
+            let tokenLists = idxs.map { disambiguationTokens(of: quants[$0].filename) }
             let common = commonTokens(tokenLists)
             for (k, i) in idxs.enumerated() {
-                let extra = distinguishingTokens(tokenLists[k], common: common)
+                let extra = distinguishingTokens(tokenLists[k], common: common, label: quants[i].label)
                 guard !extra.isEmpty else { continue }   // the "base" file keeps the plain label
-                out[i] = GgufQuant(
-                    filename: quants[i].filename,
-                    label: ([quants[i].label] + extra).joined(separator: " · "),
-                    shards: quants[i].shards
-                )
+                out[i] = quants[i].relabelled(([quants[i].label] + extra).joined(separator: " · "))
             }
         }
+
+        // A build stamp shows even with nothing to disambiguate against: a repo
+        // that re-quantized against new weights has files whose ONLY difference
+        // from the ones you already know is which release they came from, and
+        // the one scheme published just once ("is this the 0731 mxfp4?") is
+        // exactly the question a unique-but-silent label can't answer.
+        for i in out.indices {
+            guard let stamp = buildStamp(of: out[i].filename) else { continue }
+            out[i] = out[i].relabelled("\(out[i].label) · \(stamp)")
+        }
+
+        breakRemainingTies(&out)
         return out
+    }
+
+    /// The categorical pick is CAPPED so a label stays readable, so two files
+    /// differing only in tokens the cap dropped can still land on one label.
+    /// Re-derive "what is different" over just the survivors of a collision and
+    /// append that. The one member with nothing left to add is the base and is
+    /// left alone — it becomes unique as soon as its siblings grow. Two such
+    /// members means the basenames tokenize identically (the same name in two
+    /// subfolders), and the only thing that differs is the path, which IS unique
+    /// because it's the group key.
+    private static func breakRemainingTies(_ out: inout [GgufQuant]) {
+        var indicesByLabel: [String: [Int]] = [:]
+        for (i, q) in out.enumerated() { indicesByLabel[q.label, default: []].append(i) }
+        for (_, idxs) in indicesByLabel where idxs.count > 1 {
+            let tokenLists = idxs.map { disambiguationTokens(of: out[$0].filename) }
+            let common = commonTokens(tokenLists)
+            let extras = tokenLists.map { dedupPreservingOrder($0.filter { !common.contains($0.lowercased()) }) }
+            let bare = extras.filter(\.isEmpty).count
+            for (k, i) in idxs.enumerated() {
+                if !extras[k].isEmpty {
+                    out[i] = out[i].relabelled(([out[i].label] + extras[k]).joined(separator: " · "))
+                } else if bare > 1 {
+                    out[i] = out[i].relabelled("\(out[i].label) · \(namingBasename(out[i].filename))")
+                }
+            }
+        }
+    }
+
+    private func relabelled(_ newLabel: String) -> GgufQuant {
+        GgufQuant(filename: filename, label: newLabel, shards: shards)
     }
 
     /// Split an extension-stripped basename into `-`/`_`/`.`/space tokens.
@@ -116,6 +167,28 @@ struct GgufQuant: Identifiable, Equatable, Hashable {
             .filter { !$0.isEmpty }
     }
 
+    /// The part of a path that NAMES the quant: the basename with its extension
+    /// and any `-NNNNN-of-MMMMM` shard suffix removed. Extension first — a name
+    /// carrying a dot (`Qwen3.5-4B`) loses half of itself the other way round.
+    private static func namingBasename(_ path: String) -> String {
+        let base = ((path as NSString).lastPathComponent as NSString).deletingPathExtension
+        guard let r = base.range(of: "-[0-9]+-of-[0-9]+$", options: [.regularExpression, .caseInsensitive]) else {
+            return base
+        }
+        return String(base[base.startIndex..<r.lowerBound])
+    }
+
+    /// Naming tokens minus the build stamp, which is appended unconditionally
+    /// later — leaving it in would let it be picked here and printed twice.
+    private static func disambiguationTokens(of path: String) -> [String] {
+        tokens(of: namingBasename(path)).filter { !isBuildStamp($0) }
+    }
+
+    /// Trailing by convention, so the LAST stamp-shaped token wins.
+    private static func buildStamp(of path: String) -> String? {
+        tokens(of: namingBasename(path)).last { isBuildStamp($0) }
+    }
+
     private static func commonTokens(_ lists: [[String]]) -> Set<String> {
         guard var acc = lists.first.map({ Set($0.map { $0.lowercased() }) }) else { return [] }
         for l in lists.dropFirst() { acc.formIntersection(l.map { $0.lowercased() }) }
@@ -123,23 +196,26 @@ struct GgufQuant: Identifiable, Equatable, Hashable {
     }
 
     /// Up to two tokens that best distinguish this file from its collision
-    /// siblings: tier first, then variant markers, else the first unique token.
-    /// Original casing preserved; deduped in order.
-    private static func distinguishingTokens(_ fileTokens: [String], common: Set<String>) -> [String] {
-        var seen = Set<String>()
-        let unique = fileTokens.filter { tok in
-            let lower = tok.lowercased()
-            guard !common.contains(lower) else { return false }
-            return seen.insert(lower).inserted
-        }
+    /// siblings: tier first, then variant markers, else the first unique token
+    /// that isn't just the label again (`Q4KExperts · Q4KExperts` says nothing
+    /// twice). Original casing preserved; deduped in order.
+    private static func distinguishingTokens(_ fileTokens: [String], common: Set<String>, label: String) -> [String] {
+        let unique = dedupPreservingOrder(fileTokens.filter { !common.contains($0.lowercased()) })
         guard !unique.isEmpty else { return [] }
         var picks: [String] = []
         if let tier = unique.first(where: { tierTokens.contains($0.lowercased()) }) { picks.append(tier) }
         for tok in unique where qualityTokens.contains(tok.lowercased()) && !picks.contains(tok) {
             picks.append(tok)
         }
-        if picks.isEmpty, let first = unique.first { picks.append(first) }
+        if picks.isEmpty {
+            picks.append(unique.first { $0.caseInsensitiveCompare(label) != .orderedSame } ?? unique[0])
+        }
         return Array(picks.prefix(2))
+    }
+
+    private static func dedupPreservingOrder(_ tokens: [String]) -> [String] {
+        var seen = Set<String>()
+        return tokens.filter { seen.insert($0.lowercased()).inserted }
     }
 
     /// The key that folds a split quant's shards together: the path with its

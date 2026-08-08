@@ -1,31 +1,26 @@
 #!/usr/bin/env python3
-"""plot_mtp_ladder.py — render the native-MTP context ladder (LM Studio vs
-MTPLX vs MLX-serve) from a pipe-delimited CSV.
+"""plot_mtp_ladder.py — render the context ladder for one model from the probe
+CSV `tests/bench.sh` writes.
 
-Input CSV columns (header row required):
-  context|lms_prefill|mtplx_prefill|ours_prefill|lms_decode|mtplx_decode|ours_decode
+The ladder comes out of the SAME llmprobe run as the headline chart (its
+`contextScaling` block), so there is no second protocol to keep in sync: one
+boot per engine, a discarded warmup, and one rung per prompt size (median of
+three per rung under `--full`, which also climbs to 32k/64k).
 
-One row per context rung (0.5k … 64k). All three engines load the IDENTICAL
-checkpoint (Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed — 4-bit trunk + its
-calibrated MTP adapter); LM Studio has no MTP support and decodes plain AR.
-The numbers come from a manual head-to-head (fresh loads, AC power, best-of-N
-per cell on every engine) — there is no bench.sh mode that produces this CSV.
-LM Studio prefill is measured client-side (prompt_tokens / TTFT); the MTP
-engines report engine-side prefill (the difference is ~1-3% at these sizes).
+llmprobe's ladder measures agent work — a synthetic TypeScript codebase and a
+task that must use a constant planted mid-corpus — so a rung whose answer never
+references the constant is reported as such rather than counted. That matters
+here: timing generation with a large irrelevant prefix attached is not
+long-context work, and an echo-shaped ladder silently collects a speculation
+boost at every rung.
 
-COLD-PROMPT RULE (2026-07-12): the ladder prompts are NESTED (each rung
-shares 92-99% of the previous rung's bytes as a prefix), and LM Studio
-prompt-caches across requests at 2048-token-chunk granularity — an ascending
-same-session ladder inflates its 8K+ client pp ~1.5-1.7x (311/359/368/324
-where cold measures 239/227/215/189; verified: fresh load + 32K first = 214.7,
-immediate repeat = 0.87 s TTFT). Every LM Studio 8K+ cell here is COLD
-(fresh model load per rung, or its vendored `mlx_lm generate` CLI, which
-matches its server cold rate). Sub-8K rungs can't hit its cache (shared
-prefix < one 2048 chunk) so ascending-session values are already cold.
+Each engine is booted with its shipping defaults, so the lanes answer "how does
+this engine hold up as the KV cache grows", not "how does this flag combination
+score".
 
 Usage:
-  python3 tests/plot_mtp_ladder.py docs/perf-csvs/mtp-ladder-26.7.6.csv \
-      docs/perf-pngs/perf-mtp-ladder-26.7.6.png
+  python3 tests/plot_mtp_ladder.py docs/perf-csvs/probe-<tag>.csv \
+      docs/perf-pngs/perf-mtp-ladder-<tag>.png --model qwen36-27b
 
 Requires matplotlib; style matches tests/plot_vs_lmstudio_omlx.py.
 """
@@ -34,24 +29,42 @@ import sys
 from pathlib import Path
 
 import matplotlib.pyplot as plt
+
+sys.path.insert(0, str(Path(__file__).parent))
+from bench_engines import label_with_version, parse_engine_versions  # noqa: E402
 import numpy as np
 
-SUBTITLE = ("Identical checkpoint on all three engines: Qwen3.6-27B-MTPLX-Optimized-Speed "
-            "(4-bit + calibrated MTP adapter) · Apple M4 Max · coding-agent prompts · "
-            "temp 0.6 · fresh loads, COLD prompts, best-of-N per cell · MTPLX 2.0.2 · LM Studio 0.4.15 (no MTP)")
+SUBTITLE = ("Context ladder from the same llmprobe run as the headline chart · "
+            "one boot per engine on shipping defaults, discarded warmup, "
+            "agent-shaped coding task per rung")
 
-# Colors match the family charts: LM Studio = baseline gray, MTPLX = purple
-# (comparison engine), MLX-serve native MTP = the MLXS-MTP orange.
+# Same gray ramp as the headline chart: comparison engines muted, ours the one
+# saturated lane. Keys are the CSV's `engine` column.
 ENGINES = [
-    ("lms",   "LM Studio (no MTP, AR decode)", "#9ca3af", "#6b7280", True),
-    ("mtplx", "MTPLX (native MTP)",            "#a78bfa", "#1f2937", False),
-    ("ours",  "MLX-serve (native MTP)",        "#ea580c", "#1f2937", False),
+    ("lmstudio-alt",      "LM Studio (GGUF)", "#d1d5db", "#6b7280", True),
+    ("lmstudio-baseline", "LM Studio (MLX)",  "#9ca3af", "#6b7280", True),
+    ("omlx",              "oMLX",             "#6b7280", "#1f2937", False),
+    ("mtplx",             "MTPLX",            "#4b5563", "#1f2937", False),
+    ("mlx-serve",         "MLX-serve",        "#2563eb", "#1f2937", False),
 ]
 
-DEFAULT_TITLE = "Native MTP head-to-head — LM Studio vs MTPLX vs MLX-serve, 0.5K to 64K context"
+DEFAULT_TITLE = "Context ladder — prefill and decode"
+
+
+def ladder_span_label(rows) -> str:
+    """`"0.5k to 16k"` from the rungs actually measured.
+
+    The title used to hardcode "0.5K to 64K" while a default-depth run stops at
+    16k — a chart claiming a reach its data does not have, same class as naming
+    an engine that never ran. Derived, so it cannot drift from the CSV.
+    """
+    ctxs = [r.get("context") for r in rows if r.get("context")]
+    if not ctxs:
+        return ""
+    return f"{ctxs[0]} to {ctxs[-1]}" if len(ctxs) > 1 else str(ctxs[0])
 # Percent-delta annotation: (engine whose bar gets the label, engine it is
-# compared against). Legacy chart: ours vs MTPLX.
-DEFAULT_DELTA = ("ours", "mtplx")
+# compared against).
+DEFAULT_DELTA = ("mlx-serve", "omlx")
 
 
 def parse_engines(spec: str) -> list[tuple]:
@@ -68,25 +81,77 @@ def parse_engines(spec: str) -> list[tuple]:
     return out
 
 
-def load_csv(path: Path) -> list[dict]:
-    rows = []
+def load_csv(path: Path, model: str | None = None) -> tuple[list[dict], set[str], str, dict]:
+    """Probe CSV → ([{context, <engine>_prefill, <engine>_decode}], engines, note).
+
+    Ladder rows only (the `headline` rows belong to the other chart). Rungs keep
+    the order they were measured in — ascending prompt size, and a rung the
+    engine rejected ends the ladder, so a short lane means "not attempted", not
+    "zero".
+    """
+    by_rung: dict[str, dict] = {}
+    order: list[str] = []
+    engines: set[str] = set()
+    models_seen: set[str] = set()
+    note = ""
     with open(path) as f:
-        header = f.readline().rstrip("\n").split("|")
+        engine_versions = parse_engine_versions(f)
+        f.seek(0)
         for line in f:
-            parts = line.rstrip("\n").split("|")
-            if len(parts) != len(header) or not parts[0]:
+            line = line.rstrip("\n")
+            if line.startswith("#"):
+                note = note or line.lstrip("# ").strip()
                 continue
-            rows.append(dict(zip(header, parts)))
-    if not rows:
-        sys.exit(f"No data rows in {path}")
-    return rows
+            parts = line.split("|")
+            if len(parts) < 12 or parts[0] in ("model", ""):
+                continue
+            row_model, engine, _spec, context, prefill, decode = parts[:6]
+            if context == "headline":
+                continue
+            models_seen.add(row_model)
+            if model and row_model != model:
+                continue
+            if context not in by_rung:
+                by_rung[context] = {"context": context}
+                order.append(context)
+            if prefill or decode:
+                engines.add(engine)
+            if prefill:
+                by_rung[context][f"{engine}_prefill"] = prefill
+            if decode:
+                by_rung[context][f"{engine}_decode"] = decode
+
+    if not by_rung:
+        hint = f" (models in CSV: {sorted(models_seen)})" if models_seen else ""
+        sys.exit(f"No ladder rows for model '{model}' in {path}{hint}")
+    # A ladder is per model. Without --model on a multi-model CSV the rungs of
+    # six different checkpoints land in one lane, last row winning per rung —
+    # a chart that renders perfectly and means nothing.
+    if model is None and len(models_seen) > 1:
+        sys.exit(f"{path} holds {len(models_seen)} models: {sorted(models_seen)}. "
+                 f"Pick one with --model <name>.")
+    return [by_rung[c] for c in order], engines, note, engine_versions
 
 
 def render(csv_path: Path, png_out: Path, engines: list[tuple] = ENGINES,
-           title: str = DEFAULT_TITLE, subtitle: str = SUBTITLE,
-           delta: tuple = DEFAULT_DELTA) -> None:
-    rows = load_csv(csv_path)
+           title: str = DEFAULT_TITLE, subtitle: str | None = None,
+           delta: tuple = DEFAULT_DELTA, model: str | None = None) -> None:
+    rows, present, note, engine_versions = load_csv(csv_path, model=model)
+    span = ladder_span_label(rows)
+    if span and "to" not in title:
+        title = f"{title} ({span})"
+
+    # Name the BUILD each lane came from — see tests/bench_engines.py.
+    engines = [(key, label_with_version(label, key, engine_versions), *rest)
+               for (key, label, *rest) in engines]
     contexts = [r["context"] for r in rows]
+    # Drop lanes the CSV has nothing for, so a partial run renders cleanly
+    # instead of laying a flat zero bar over every rung.
+    engines = [e for e in engines if e[0] in present]
+    if not engines:
+        sys.exit(f"None of the known engine lanes are in {csv_path}: found {sorted(present)}")
+    if subtitle is None:
+        subtitle = f"{model} · {note}" if (model and note) else (note or SUBTITLE)
 
     plt.rcParams.update({
         "font.family": "sans-serif",
@@ -112,7 +177,10 @@ def render(csv_path: Path, png_out: Path, engines: list[tuple] = ENGINES,
     x = np.arange(len(contexts))
     width = 0.81 / len(engines)
     for ax, (key, panel_title, ylab) in zip(axes, panels):
-        series = {eng: [float(r[f"{eng}_{key}"]) for r in rows] for eng, *_ in engines}
+        # A rung a lane never reached is 0 here, and the bar-label loop below
+        # skips it — an absent rung must not be drawn as a measured floor.
+        series = {eng: [float(r.get(f"{eng}_{key}") or 0) for r in rows]
+                  for eng, *_ in engines}
         top = max(v for vals in series.values() for v in vals)
         for e_idx, (eng, label, color, edge, light) in enumerate(engines):
             vals = series[eng]
@@ -120,6 +188,8 @@ def render(csv_path: Path, png_out: Path, engines: list[tuple] = ENGINES,
             bars = ax.bar(x + offset, vals, width, label=label, color=color,
                           edgecolor=edge, linewidth=0.5, zorder=2)
             for bar, val in zip(bars, vals):
+                if val <= 0:
+                    continue
                 ax.text(bar.get_x() + bar.get_width() / 2,
                         bar.get_height() * 0.5, f"{val:.0f}",
                         ha="center", va="center", fontsize=8,
@@ -129,7 +199,7 @@ def render(csv_path: Path, png_out: Path, engines: list[tuple] = ENGINES,
             # rung — the head-to-head race the chart is about.
             if eng == delta[0] and delta[1] in series:
                 for bar, val, base in zip(bars, vals, series[delta[1]]):
-                    if base <= 0:
+                    if base <= 0 or val <= 0:
                         continue
                     gain = (val / base - 1) * 100
                     gcolor = ("#15803d" if gain >= 5 else
@@ -156,21 +226,26 @@ def render(csv_path: Path, png_out: Path, engines: list[tuple] = ENGINES,
 
 def main() -> None:
     p = argparse.ArgumentParser(
-        description="Render an MTP-ladder chart (default: the legacy LM Studio / "
-                    "MTPLX / MLX-serve trio; --engines re-targets the columns).")
+        description="Render the context-ladder chart for one model from the probe "
+                    "CSV produced by tests/bench.sh.")
     p.add_argument("csv", type=Path, help="input CSV path")
     p.add_argument("png", type=Path, help="output PNG path")
-    p.add_argument("--engines", help="key:Label:#color[:light],… — CSV column prefixes to plot")
-    p.add_argument("--title", default=DEFAULT_TITLE)
-    p.add_argument("--subtitle", default=SUBTITLE)
+    p.add_argument("--model", default=None,
+                   help="which model's ladder to plot (required when the CSV holds several)")
+    p.add_argument("--engines", help="key:Label:#color[:light],… — engine lanes to plot")
+    p.add_argument("--title", default=None)
+    p.add_argument("--subtitle", default=None,
+                   help="methodology line; defaults to the CSV's own '#' header")
     p.add_argument("--delta", default=":".join(DEFAULT_DELTA),
                    help="annotated:baseline engine keys for the percent labels")
     args = p.parse_args()
     if not args.csv.exists():
         sys.exit(f"CSV not found: {args.csv}")
     engines = parse_engines(args.engines) if args.engines else ENGINES
-    render(args.csv, args.png, engines=engines, title=args.title,
-           subtitle=args.subtitle, delta=tuple(args.delta.split(":", 1)))
+    title = args.title or (f"{DEFAULT_TITLE} — {args.model}" if args.model else DEFAULT_TITLE)
+    render(args.csv, args.png, engines=engines, title=title,
+           subtitle=args.subtitle, delta=tuple(args.delta.split(":", 1)),
+           model=args.model)
 
 
 if __name__ == "__main__":

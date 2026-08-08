@@ -141,3 +141,138 @@ final class ChatServerStartControlTests: XCTestCase {
         XCTAssertFalse(ChatServerStartControl.starting.isEnabled)
     }
 }
+
+/// A media generator lives in the SAME registry as chat models — the image /
+/// video / audio panes load one through `prepareGenModel`, and the server sorts
+/// its default first, so `modelInfo` (`allModels.first`) can be a model that
+/// cannot answer a single chat request.
+///
+/// Live 2026-08-05: with a media model loaded the chat window's pill named it,
+/// dotted GREEN ("loaded and ready to answer") and every chat surface reading
+/// `chatModelId` would have sent the turn to it. The picker's LIST was already
+/// chat-only — the resolution underneath it was not.
+final class ChatModelResolutionTests: XCTestCase {
+
+    private func info(_ id: String, _ caps: [String], loaded: Bool = true) -> ModelInfo {
+        APIClient.parseModelInfo(["id": id, "capabilities": caps, "loaded": loaded])
+    }
+
+    @MainActor
+    func testALoadedMediaModelIsNeverTheChatModel() {
+        let mgr = ServerManager()
+        defer { mgr.lanChatModelId = nil }
+        let video = info("ddalcu/MiniMax-H3-FL2VA-MLX-Serve-4bit", ["video"])
+        let chat = info("mlx-community/LFM2.5-2.6B-8bit", ["chat"])
+
+        mgr.allModels = [video, chat]
+        mgr.modelInfo = video   // the gen flow loaded it; the server sorts it first
+
+        XCTAssertEqual(mgr.chatModelInfo?.name, chat.name)
+        XCTAssertEqual(mgr.chatModelId, chat.name, "a chat turn must not be addressed to a video model")
+    }
+
+    /// Nothing that can chat ⇒ NOTHING. Naming the generator would earn a
+    /// "does not support this media modality" 400, and the pill's dot keys on
+    /// nil to stay amber instead of claiming ready.
+    @MainActor
+    func testAMediaOnlyServerHasNoChatModel() {
+        let mgr = ServerManager()
+        defer { mgr.lanChatModelId = nil }
+        let image = info("ddalcu/Krea-2-Turbo-MLX-Serve-mixed-4-8", ["image"])
+        mgr.allModels = [image]
+        mgr.modelInfo = image
+
+        XCTAssertNil(mgr.chatModelInfo)
+        XCTAssertNil(mgr.chatModelId)
+    }
+
+    /// An UNLOADED chat stub is not "the model answering" — it is a model you
+    /// could load. Reporting it would turn the pill's dot green on a server
+    /// holding nothing but a generator.
+    @MainActor
+    func testAnUnloadedChatStubDoesNotStandInForAResidentOne() {
+        let mgr = ServerManager()
+        defer { mgr.lanChatModelId = nil }
+        mgr.allModels = [info("ddalcu/Krea-2-Turbo-MLX-Serve-mixed-4-8", ["image"]),
+                         info("mlx-community/LFM2.5-2.6B-8bit", ["chat"], loaded: false)]
+        mgr.modelInfo = mgr.allModels[0]
+
+        XCTAssertNil(mgr.chatModelInfo)
+    }
+
+    /// An embedding model is in the registry too (folder indexing loads one)
+    /// and is just as unable to hold a conversation.
+    @MainActor
+    func testAnEmbeddingModelIsNotAChatModelEither() {
+        let mgr = ServerManager()
+        defer { mgr.lanChatModelId = nil }
+        let embed = info("mlx-community/bge-small-en-v1.5-8bit", ["embeddings"])
+        mgr.allModels = [embed]
+        mgr.modelInfo = embed
+
+        XCTAssertNil(mgr.chatModelId)
+    }
+
+    /// Unchanged where it already worked: a chat model that also takes images
+    /// and audio advertises those as INPUTS and is still the chat model, and a
+    /// LAN pick still wins over everything local.
+    @MainActor
+    func testAMultimodalChatModelAndALanPickAreUnaffected() {
+        let mgr = ServerManager()
+        defer { mgr.lanChatModelId = nil }
+        let gemma = info("mlx-community/gemma-4-e4b-it-4bit", ["chat", "vision", "audio"])
+        mgr.allModels = [gemma]
+        mgr.modelInfo = gemma
+        XCTAssertEqual(mgr.chatModelId, gemma.name)
+
+        // A LAN selection wins even before discovery lands it in `allModels`.
+        mgr.lanChatModelId = "big@studio"
+        XCTAssertEqual(mgr.chatModelId, "big@studio")
+    }
+
+    /// Pre-Phase-G / GGUF entries report no capabilities at all and still chat
+    /// (the same tolerance `slotKind` and `lanAdvertises` already carry).
+    @MainActor
+    func testAnEntryWithNoCapabilitiesStillCounts() {
+        let mgr = ServerManager()
+        defer { mgr.lanChatModelId = nil }
+        let old = info("some/gguf-model", [])
+        mgr.allModels = [old]
+        mgr.modelInfo = old
+        XCTAssertEqual(mgr.chatModelId, old.name)
+    }
+}
+
+/// Class guard for the same bug one hop out: every surface that hands a MODEL
+/// to something which will chat — the CLI launcher's generated agent configs,
+/// the setup instructions, the headless test harness — must resolve it through
+/// `chatModelId`/`chatModelInfo`, never `modelInfo` (which is whatever the
+/// server loaded last, media generators included). A config baked with a video
+/// model's id sends the CLI's first turn to a model that 400s.
+final class ChatSurfaceModelSourceTests: XCTestCase {
+
+    private static var sourcesRoot: URL {
+        URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()    // MLXCoreTests
+            .deletingLastPathComponent()    // Tests
+            .deletingLastPathComponent()    // app
+            .appendingPathComponent("Sources/MLXServe")
+    }
+
+    func testNoChatSurfaceBakesTheRawLoadedModelId() throws {
+        let fm = FileManager.default
+        let walker = try XCTUnwrap(fm.enumerator(at: Self.sourcesRoot, includingPropertiesForKeys: nil))
+        var offenders: [String] = []
+        for case let url as URL in walker where url.pathExtension == "swift" {
+            let text = try String(contentsOf: url, encoding: .utf8)
+            for line in text.split(separator: "\n", omittingEmptySubsequences: false) {
+                // The launcher's own parameter list is where the id is CONSUMED;
+                // only the call sites that supply one are being audited.
+                guard line.contains("servedModelId:"), line.contains("modelInfo?.name") else { continue }
+                offenders.append("\(url.lastPathComponent): \(line.trimmingCharacters(in: .whitespaces))")
+            }
+        }
+        XCTAssertTrue(offenders.isEmpty,
+                      "route through server.chatModelId — a media model would be handed to a chat CLI: \(offenders)")
+    }
+}

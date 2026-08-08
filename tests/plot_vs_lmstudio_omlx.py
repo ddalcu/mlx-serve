@@ -1,27 +1,22 @@
 #!/usr/bin/env python3
-"""plot_vs_lmstudio_omlx.py — render the MLX-serve vs LM Studio vs oMLX
-comparison chart from a CSV produced by tests/bench.sh.
+"""plot_vs_lmstudio_omlx.py — render the headline engine-comparison chart from
+the probe CSV `tests/bench.sh` writes (llmprobe measurements via bench_csv.py).
 
-The canonical `all` chart is a SINGLE code-completion panel (2026-07-14: the
-echo panel was retired with the bench's echo cell — verbatim recitation is
-spec-decode's synthetic best case; code completion is the honest workload).
-Its baseline is LM Studio GGUF (what LM Studio users actually run), with
-LM Studio MLX kept as a second comparison bar, and the four mlx-serve spec
-cells COLLAPSED into one "best config" bar per model (the winning spec is
-named in the delta label). The legacy families keep the old two-panel
-echo+code layout for old CSVs.
+A SINGLE code-completion panel (2026-07-14: the echo panel was retired —
+verbatim recitation is spec-decode's synthetic best case; code completion is
+the honest workload; llmprobe's headline decode figure is measured on code for
+the same reason). Baseline is LM Studio GGUF, what LM Studio users actually
+run, with LM Studio MLX beside it as a second comparison bar.
 
-Families:
-  all     → THE canonical chart: Gemma 4 + Qwen 3.6, one code panel.
-  gemma   → legacy per-family layout (side-by-side echo+code panels)
-  qwen36  → legacy per-family layout
+Each bar is one engine booted with its SHIPPING DEFAULTS — llmprobe measures
+what is running, so there is no spec sweep to collapse. mlx-serve picks its own
+speculative mode per checkpoint, which is what a user gets out of the box.
 
 Usage:
-  python3 tests/plot_vs_lmstudio_omlx.py <csv> <png_out> --family <all|gemma|qwen36>
+  python3 tests/plot_vs_lmstudio_omlx.py <csv> <png_out> [--subtitle ...]
 
-The `all` CSV is produced by `tests/bench.sh --family all` (or by
-concatenating a gemma and a qwen36 CSV). Engines with no rows in the CSV are
-dropped automatically, so partial runs render cleanly.
+Reads the `headline` rows of the CSV. Engines and models with no rows are
+dropped automatically, so `--only`/partial runs render cleanly.
 
 Requires matplotlib; install with `pip3 install --user matplotlib`
 (or `--break-system-packages` on PEP-668 systems).
@@ -34,12 +29,15 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 
+sys.path.insert(0, str(Path(__file__).parent))
+from bench_engines import label_with_version, parse_engine_versions  # noqa: E402
 
-# Family-specific layout. Each variant tuple is:
+
+# Chart layout. Each variant tuple is:
 #   (variant_filter, spec, label, color, is_baseline, show_delta, short)
-# - variant_filter matches the second '/' segment in the CSV `label` column
-#   ("lmstudio-baseline", "lmstudio-alt", "omlx", "mlx-serve-gguf", "mlx-serve")
-# - spec matches the third segment ("none", "pld", "drafter")
+# - variant_filter matches the CSV `engine` column
+#   ("lmstudio-baseline", "lmstudio-alt", "omlx", "mtplx", "mlx-serve")
+# - spec matches the CSV `spec` column ("default" — one boot, shipping config)
 # - is_baseline: this row is the reference for percentage deltas (one per family)
 # - show_delta: render a "+X%" label above the bar. False for comparison engines
 #   to halve label density; the bar height already shows the comparison visually.
@@ -47,7 +45,13 @@ import numpy as np
 #   bars self-identify without the reader chasing the top-of-figure legend.
 FAMILIES = {
     "all": {
-        "title": "MLX-serve vs LM Studio · oMLX · MTPLX — Gemma 4 + Qwen 3.6 (Apple Silicon, decode tok/s)",
+        # `{engines}` is filled from the engines the CSV ACTUALLY carries. It
+        # used to be the hardcoded full list, so a run where an engine was
+        # absent (LM Studio not installed) still shipped a chart claiming to
+        # compare against it — bars correctly dropped, headline still lying.
+        # Same rule as "never quote a win without naming the engine it is
+        # over": do not name an engine you did not measure.
+        "title": "MLX-serve vs {engines} — Gemma 4 + Qwen 3.6 (Apple Silicon, decode tok/s)",
         # Panels stack vertically (2 rows x 1 col) so every model group gets
         # the full figure width — bars are wide enough to carry their engine
         # short-label legibly.
@@ -88,131 +92,105 @@ FAMILIES = {
             ("code", "Code completion (decode tok/s)"),
         ],
         # Engine set. Baseline = LM Studio GGUF (the llama.cpp path LM Studio
-        # users actually run); LM Studio MLX stays as a comparison bar. The
-        # four mlx-serve spec cells collapse into ONE "best config" bar per
-        # model (spec "best" = max over none/pld/drafter/mtp; the winning
-        # spec is named in the delta label). The layout PACKS each model
-        # group — absent cells take no space; only MTPLX keeps a labeled
-        # zero-slot. The mtplxopt row has no GGUF counterpart, so its deltas
-        # fall back to the LM Studio MLX bar (see baseline_fallback).
+        # users actually run); LM Studio MLX stays as a comparison bar. Every
+        # bar is one engine on its shipping defaults — llmprobe measures the
+        # server that is running, so there is nothing to collapse. The layout
+        # PACKS each model group: absent cells take no space, only MTPLX keeps
+        # a labeled zero-slot. The mtplxopt row has no GGUF counterpart, so
+        # its deltas fall back to the LM Studio MLX bar (baseline_fallback).
         "variants": [
             # Competitors ride ONE neutral gray ramp (light → dark, in the order
             # they get harder to beat: LM-GGUF → LM-MLX → oMLX → MTPLX) so the
             # only saturated bar in the chart is ours. Tailwind gray 300/400/500/600.
-            ("lmstudio-alt",      "none", "LM Studio (GGUF, baseline)", "#d1d5db", True,  False, "LM-GGUF"),
-            ("lmstudio-baseline", "none", "LM Studio (MLX)",            "#9ca3af", False, False, "LM-MLX"),
-            ("omlx",              "none", "oMLX",                       "#6b7280", False, False, "oMLX"),
-            ("mtplx",             "auto", "MTPLX",                      "#4b5563", False, False, "MTPLX"),
-            ("mlx-serve",         "best", "MLX-serve (best config)",    "#2563eb", False, True,  "MLX-Serve"),
+            ("lmstudio-alt",      "default", "LM Studio (GGUF, baseline)", "#d1d5db", True,  False, "LM-GGUF"),
+            ("lmstudio-baseline", "default", "LM Studio (MLX)",            "#9ca3af", False, False, "LM-MLX"),
+            ("omlx",              "default", "oMLX",                       "#6b7280", False, False, "oMLX"),
+            ("mtplx",             "default", "MTPLX",                      "#4b5563", False, False, "MTPLX"),
+            ("mlx-serve",         "default", "MLX-serve",                  "#2563eb", False, True,  "MLX-Serve"),
         ],
-        "baseline_fallback": [("lmstudio-baseline", "none")],
-    },
-    "gemma": {
-        "title": "MLX-serve vs LM Studio — Gemma 4 (Apple Silicon, decode tok/s)",
-        "x_label": lambda key: {
-            "gemma4-e2b-4bit":              "E2B (4bit)",
-            "gemma4-e4b-4bit":              "E4B (4bit)",
-            "gemma4-31b-4bit":              "31B (4bit)",
-            "gemma4-26b-a4b-moe-4bit":      "26B-A4B-MoE (4bit)",
-            "gemma4-26b-a4b-moe-qat-4bit":  "26B-A4B-MoE (QAT 4bit)",
-        }.get(key, key),
-        "model_order": [
-            "gemma4-e4b-4bit",
-            "gemma4-31b-4bit",
-            "gemma4-26b-a4b-moe-qat-4bit",
-        ],
-        # Visual order: comparison engines (muted grays/cool) → mlx-serve
-        # variants (vivid). Percentage deltas only on the mlx-serve rows so
-        # the labels above tiny bars don't pile up.
-        "variants": [
-            ("lmstudio-baseline", "none",    "LM Studio (MLX, baseline)",   "#9ca3af", True,  False, "LM-MLX"),
-            ("lmstudio-alt",      "none",    "LM Studio (GGUF)",            "#d1d5db", False, False, "LM-GG"),
-            ("mlx-serve-gguf",    "none",    "MLX-serve (GGUF / llama.cpp)", "#a78bfa", False, False, "MLXS-GG"),
-            ("omlx",              "none",    "oMLX",                        "#6b7280", False, False, "oMLX"),
-            ("mtplx",             "auto",    "MTPLX (auto)",                "#4b5563", False, False, "MTPLX"),
-            ("mlx-serve",         "none",    "MLX-serve (MLX, --no-pld)",   "#2563eb", False, True,  "MLXS-NPLD"),
-            ("mlx-serve",         "pld",     "MLX-serve (MLX, --pld)",      "#16a34a", False, True,  "MLXS-PLD"),
-            ("mlx-serve",         "drafter", "MLX-serve (MLX, --drafter)",  "#ea580c", False, True,  "MLXS-DRFT"),
-        ],
-    },
-    "qwen36": {
-        "title": "MLX-serve vs LM Studio — Qwen 3.6 (Apple Silicon, decode tok/s)",
-        "x_label": lambda key: {
-            "qwen36-27b":          "27B (oQ4e, oMLX Lightning MTP)",
-            "qwen36-35b-a3b":      "35B-A3B (4bit)",
-            "qwen36-27b-mtplxopt": "27B (MTPLX-opt 4bit)",
-        }.get(key, key),
-        "model_order": [
-            "qwen36-27b",
-            "qwen36-35b-a3b",
-            "qwen36-27b-mtplxopt",
-        ],
-        "variants": [
-            ("lmstudio-baseline", "none", "LM Studio (MLX, baseline)",   "#9ca3af", True,  False, "LM-MLX"),
-            ("lmstudio-alt",      "none", "LM Studio (GGUF)",            "#d1d5db", False, False, "LM-GG"),
-            ("mlx-serve-gguf",    "none", "MLX-serve (GGUF / llama.cpp)", "#a78bfa", False, False, "MLXS-GG"),
-            ("omlx",              "none", "oMLX",                        "#6b7280", False, False, "oMLX"),
-            ("mtplx",             "auto", "MTPLX (auto)",                "#4b5563", False, False, "MTPLX"),
-            ("mlx-serve",         "none", "MLX-serve (MLX, --no-pld)",   "#2563eb", False, True,  "MLXS-NPLD"),
-            ("mlx-serve",         "pld",  "MLX-serve (MLX, --pld)",      "#16a34a", False, True,  "MLXS-PLD"),
-            ("mlx-serve",         "mtp",  "MLX-serve (MLX, native MTP)", "#ea580c", False, True,  "MLXS-MTP"),
-        ],
+        "baseline_fallback": [("lmstudio-baseline", "default")],
     },
 }
 
 
-def load_csv(path: Path, hardware_filter: str | None = None) -> tuple[dict, set[str]]:
-    """Returns ({(model_logical, variant, spec): {prefill,decode,echo}}, hardware_seen).
+def load_csv(path: Path, hardware_filter: str | None = None) -> tuple[dict, set[str], str, dict]:
+    """Returns ({(model, engine, spec): {code, prefill}}, hardware_seen, run_note).
 
-    Schema is `label|engine|model|spec|prompt|prefill|decode|pt|ct|hardware|notes`.
-    Older CSVs (pre-Phase-B, no hardware column) are accepted as-is and tagged
-    `unknown` for grouping. When `hardware_filter` is set, rows whose hardware
-    tag does not match are dropped before aggregation.
+    Reads the `headline` rows of the probe CSV written by tests/bench_csv.py:
+    `model|engine|spec|context|prefill_tps|decode_tps|ttft_ms|tok_per_step|
+     spec_ratio|checkpoint|hardware|notes`. Ladder rows (context 0.5k…64k) are
+    the ladder chart's business and skipped here.
+
+    llmprobe's headline decode figure is measured while generating code, which
+    is what the chart's one panel plots — hence the "code" key. An empty rate
+    is left ABSENT, not zeroed: a bar sitting on the floor reads as "this
+    engine is slow" when it means "this cell never ran".
     """
     data: dict = defaultdict(dict)
     hardware_seen: set[str] = set()
+    run_note = ""
     with open(path) as f:
+        engine_versions = parse_engine_versions(f)
+        f.seek(0)
         for line in f:
-            parts = line.rstrip("\n").split("|")
-            if len(parts) < 9 or parts[0] in ("label", ""):
+            line = line.rstrip("\n")
+            if line.startswith("#"):
+                run_note = run_note or line.lstrip("# ").strip()
                 continue
-            label, _engine, _model, _spec, prompt, pf, dc, _pt, _ct, *rest = parts
-            # Phase B added a hardware column before the trailing notes column.
-            # Old CSVs: rest = [notes]. New CSVs: rest = [hardware, notes].
-            if len(rest) >= 2:
-                hardware = rest[0] or "unknown"
-            else:
-                hardware = "unknown"
+            parts = line.split("|")
+            if len(parts) < 12 or parts[0] in ("model", ""):
+                continue
+            model, engine, spec, context, pf, dc = parts[:6]
+            if context != "headline":
+                continue
+            hardware = parts[10] or "unknown"
             hardware_seen.add(hardware)
             if hardware_filter and hardware != hardware_filter:
                 continue
-            bits = label.split("/")
-            if len(bits) < 3:
-                continue
-            logical, variant, spec = bits[0], bits[1], bits[2]
-            try:
-                pf_v = float(pf or 0)
-                dc_v = float(dc or 0)
-            except ValueError:
-                continue
-            key = (logical, variant, spec)
-            if prompt == "prefill":
-                data[key]["prefill"] = pf_v
-            elif prompt == "decode":
-                data[key]["decode"] = dc_v
-            elif prompt == "echo":
-                data[key]["echo"] = dc_v
-            elif prompt == "code":
-                data[key]["code"] = dc_v
-    return data, hardware_seen
+            key = (model, engine, spec)
+            for field, value in (("prefill", pf), ("code", dc)):
+                if not value:
+                    continue
+                try:
+                    data[key][field] = float(value)
+                except ValueError:
+                    pass
+    return data, hardware_seen, run_note, engine_versions
 
 
-def render(csv_path: Path, png_out: Path, family: str,
-           hardware: str | None = None) -> None:
+# Two LM Studio bars share one name in prose; a chart that measured both
+# should still say "LM Studio" once.
+LMSTUDIO_KEYS = {"lmstudio-alt", "lmstudio-baseline"}
+
+
+def comparison_engine_label(variants, measured_engines) -> str:
+    """The competitor names to put in the title — only those actually measured.
+
+    `variants` is the family's engine spec (ordered); `measured_engines` is the
+    set of engine keys the CSV carries. Ours is never listed (the title already
+    leads with it), and the two LM Studio variants collapse to one name.
+    Returns "nothing" when only mlx-serve ran, so a solo perf-gate run renders
+    an honest headline instead of claiming a comparison that did not happen.
+    """
+    names, seen = [], set()
+    for key, _spec, label, *_rest in variants:
+        if key == "mlx-serve" or key not in measured_engines:
+            continue
+        name = "LM Studio" if key in LMSTUDIO_KEYS else label
+        if name not in seen:
+            seen.add(name)
+            names.append(name)
+    return " \u00b7 ".join(names) if names else "nothing"
+
+
+def render(csv_path: Path, png_out: Path, family: str = "all",
+           hardware: str | None = None, subtitle: str | None = None) -> None:
     if family not in FAMILIES:
         sys.exit(f"Unknown family '{family}'; pick one of: {', '.join(FAMILIES)}")
-    cfg = FAMILIES[family]
-    data, hardware_seen = load_csv(csv_path, hardware_filter=hardware)
+    cfg = dict(FAMILIES[family])
+    data, hardware_seen, run_note, engine_versions = load_csv(csv_path, hardware_filter=hardware)
+    if not data:
+        sys.exit(f"No headline rows in {csv_path} (did the bench run produce a bench block?)")
     # Reject mixed-hardware CSVs without explicit --hardware: combining M1 Pro
     # and M4 Max numbers in one chart is exactly the bug Phase B fixed.
     real_hardware = {h for h in hardware_seen if h != "unknown"}
@@ -222,9 +200,26 @@ def render(csv_path: Path, png_out: Path, family: str,
             f"{sorted(real_hardware)}. Pick one with --hardware <tag>."
         )
     title_hw = hardware or (next(iter(real_hardware)) if real_hardware else None)
+    measured_engines = {e for (_m, e, _s) in data}
     title = cfg["title"]
+    if "{engines}" in title:
+        title = title.replace("{engines}", comparison_engine_label(
+            cfg["variants"], measured_engines))
     if title_hw:
         title = f"{title} · {title_hw}"
+
+    # Drop models the CSV has nothing for, so `--only` and partial runs render
+    # cleanly instead of reserving an empty group per unmeasured model.
+    measured = {model for (model, _e, _s) in data}
+    cfg["model_order"] = [m for m in cfg["model_order"] if m in measured]
+    if cfg.get("model_rows"):
+        cfg["model_rows"] = [
+            {**row, "models": [m for m in row["models"] if m in measured]}
+            for row in cfg["model_rows"]
+        ]
+        cfg["model_rows"] = [row for row in cfg["model_rows"] if row["models"]]
+    if not cfg["model_order"]:
+        sys.exit(f"No known models in {csv_path}; found {sorted(measured)}")
 
     # Style: clean grid, sans-serif, axis lines hidden except baseline.
     plt.rcParams.update({
@@ -265,28 +260,19 @@ def render(csv_path: Path, png_out: Path, family: str,
         else:
             fig, axes = plt.subplots(1, len(axis_specs), figsize=(22, 9.2))
     axes = np.atleast_1d(axes).ravel()
-    fig.suptitle(title, fontsize=15, fontweight="bold", color="#111827", y=0.98)
-
-    # mlx-serve spec cells a spec="best" variant collapses over, and the
-    # display name the delta label uses for the winning spec.
-    BEST_SPECS = {"none": "AR", "pld": "PLD", "drafter": "drafter", "mtp": "MTP"}
-    SPEC_DISPLAY_TO_KEY = {disp: s for s, disp in BEST_SPECS.items()}
+    fig.suptitle(title, fontsize=15, fontweight="bold", color="#111827", y=0.985)
+    # The methodology line travels WITH the chart: a bar chart with no protocol
+    # on it invites comparison against numbers taken a different way.
+    caption = subtitle or run_note
+    if caption:
+        fig.text(0.5, 0.955, caption, ha="center", fontsize=9, color="#4b5563")
 
     def cell_val(logical: str, variant: str, spec: str, key: str):
-        """(value, winning_spec_display) for one cell; spec 'best' takes the
-        max over the mlx-serve spec cells and names the winner."""
-        if spec == "best":
-            best_v, best_s = 0.0, None
-            for s, disp in BEST_SPECS.items():
-                v = data.get((logical, variant, s), {}).get(key, 0)
-                if v > best_v:
-                    best_v, best_s = v, disp
-            return best_v, best_s
+        """(value, None) for one cell. The second slot is vestigial from the
+        spec-sweep era: one boot per engine means there is no winner to name."""
         return data.get((logical, variant, spec), {}).get(key, 0), None
 
     def cell_has_data(logical: str, v: tuple) -> bool:
-        if v[1] == "best":
-            return any(data.get((logical, v[0], s)) for s in BEST_SPECS)
         return bool(data.get((logical, v[0], v[1])))
 
     # Drop variants with no data anywhere in this CSV (e.g. oMLX not run, or
@@ -295,6 +281,14 @@ def render(csv_path: Path, png_out: Path, family: str,
     variants = [
         v for v in cfg["variants"]
         if any(cell_has_data(m, v) for m in cfg["model_order"])
+    ]
+    # Stamp each legend label with the build that produced its bars. "+23% vs
+    # oMLX" ages into a claim about whatever oMLX is today; "vs oMLX 0.5.2"
+    # does not. Versions come from the CSV's `# engines:` line, so the chart
+    # cannot claim a build the data did not record.
+    variants = [
+        (key, spec, label_with_version(label, key, engine_versions), *rest)
+        for (key, spec, label, *rest) in variants
     ]
 
     # Spread model groups further apart so the bars per group breathe.
@@ -490,11 +484,7 @@ def render(csv_path: Path, png_out: Path, family: str,
             rows = []  # (color, short, prefill_value), top-to-bottom = variant order
             for vi in group_layout[mi]:
                 variant, spec, _label, color, _is_baseline, _show_delta, short = variants[vi]
-                val, win = cell_val(logical, variant, spec, workload_key)
-                if spec == "best" and win is not None:
-                    pf_val = data.get((logical, variant, SPEC_DISPLAY_TO_KEY[win]), {}).get("prefill", 0)
-                else:
-                    pf_val = cell_val(logical, variant, spec, "prefill")[0]
+                pf_val = cell_val(logical, variant, spec, "prefill")[0]
                 if pf_val > 0:
                     rows.append((color, short, pf_val))
             if not rows:
@@ -550,21 +540,24 @@ def render(csv_path: Path, png_out: Path, family: str,
 
 def main() -> None:
     p = argparse.ArgumentParser(
-        description="Render MLX-serve vs LM Studio vs oMLX comparison chart from a "
-                    "CSV produced by tests/bench.sh.",
+        description="Render the engine-comparison chart from the probe CSV "
+                    "produced by tests/bench.sh.",
     )
     p.add_argument("csv", type=Path, help="input CSV path")
     p.add_argument("png", type=Path, help="output PNG path")
-    p.add_argument("--family", required=True, choices=list(FAMILIES.keys()),
-                   help="model family (matches --family of tests/bench.sh)")
+    p.add_argument("--family", default="all", choices=list(FAMILIES.keys()),
+                   help="chart layout (only 'all' ships; models absent from the CSV are dropped)")
     p.add_argument("--hardware", default=None,
                    help="hardware tag to filter on (e.g. Apple-M1-Pro-32gb). "
                         "Required when the CSV mixes multiple machines.")
+    p.add_argument("--subtitle", default=None,
+                   help="methodology line under the title; defaults to the CSV's own '#' header")
     args = p.parse_args()
 
     if not args.csv.exists():
         sys.exit(f"CSV not found: {args.csv}")
-    render(args.csv, args.png, args.family, hardware=args.hardware)
+    render(args.csv, args.png, args.family, hardware=args.hardware,
+           subtitle=args.subtitle)
 
 
 if __name__ == "__main__":

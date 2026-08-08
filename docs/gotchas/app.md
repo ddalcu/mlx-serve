@@ -236,3 +236,87 @@ Fixes, both in `.github/workflows/release.yml`:
 Guard: `tests/test_release_workflow_gates.sh` — the stamp exists, uses `steps.version.outputs.version`, targets `$CONTENTS/Info.plist`, lands before `codesign`, and the two CalVer sites name the same zone. Hermetic (PyYAML parse, no runners). It folds backslash-continuations before scanning, because a guard should pin what a command does, not how it's wrapped.
 
 The `26.8.1` tag, release and Homebrew bump were deleted and the release re-cut as `v26.7.12` from a tag push, which takes the workflow's `else` branch (`version=${GITHUB_REF_NAME#v}`) and so never consults the clock at all.
+
+## The workaround the app could not reach (`--max-resident-mem`, 2026-08-07)
+
+The server has had a residency cap since Plan 05 Phase D, and every diagnosis of
+a refused load ends with "raise `--max-resident-mem`" — the 503 body says so, the
+refusal log says so. `ServerOptions.toCLIArgs` emitted forty-odd flags and not
+that one, and there is no extra-args passthrough, so from the GUI the cap was
+always `auto` (80% of Metal's recommended working set at startup) and a model
+that cap refuses was unloadable at any setting.
+
+`--skip-mem-preflight` looks like the escape hatch and is not: it gates
+`doLoadGenOnInferenceThread`'s media preflight and the MLX loader's, both of
+which run AFTER `ensureLoaded`'s registry gate. The gate is what returns the 503.
+
+Two things the field needed beyond the obvious:
+
+- **A value that cannot be malformed needs no validator.** `main.zig` calls
+  `std.process.exit(1)` on a `--max-resident-mem` it cannot parse, so a typo in a
+  free-text Settings field would stop the server from starting at all, with the
+  cause buried in a log nobody opens because the app never came up. The first cut
+  answered that with `ServerOptions.parsableSizeArg`, a Swift mirror of
+  `parseSizeArg`'s grammar (bare bytes, optional B/KB/MB/GB, `off`, `0`, plus
+  `auto` → omit) that dropped anything else. That is a second copy of a grammar,
+  in a second language, with its own test enumerating junk strings — all of it
+  defending a text field nobody needed. The field is a **slider** now:
+  `maxResidentMemGB: Int`, 0 = Auto, snapping to `residentMemPresets`, whose
+  ladder stops at the machine's physical RAM because a cap above it can never be
+  reached. The validator, its test, and the whole malformed-input class went with
+  it. Prefer deleting the input over defending it.
+
+  `snappingSlider` moved from `RequestDefaultsSectionContent` to file scope
+  rather than being copied — two sections render ladder-valued settings now, and
+  a second copy is how the two drift.
+
+- **A new `ServerOptions` field needs a `SettingsReset` section.**
+  `testEveryServerOptionsFieldBelongsToExactlyOneSection` fails otherwise — a
+  field owned by no section can never be restored by "Reset section to
+  defaults". Good tripwire; it caught this within one test run.
+
+## `mlx-serve` survived the app quitting it (#133, 2026-08-07)
+
+Reported against 26.8.2: quit MLX Core with ⌘Q or the Quit menu and the
+`mlx-serve` process stays up with a model loaded, holding gigabytes. The
+reporter also found the workaround, which is the diagnosis: "pressing the power
+button in the menubar pull-down menu quits the main GUI and closes mlx-serve."
+
+That button is the only quit path with an explicit teardown:
+
+```swift
+Button {
+    server.stop()
+    NSApplication.shared.terminate(nil)
+}
+```
+
+Every other route — ⌘Q, the app menu's Quit, Dock ▸ Quit, any other
+`terminate(nil)` — goes straight to termination, and nothing signals the child.
+
+`ServerManager.deinit` is the trap. It cancels the pollers and calls
+`proc.terminate()`, so it reads exactly like the safety net for this, and it is
+not: `ServerManager` is owned by an `AppState` held as a `@StateObject`, and
+those are not deallocated at app termination. The process image is torn down,
+`deinit` never runs, and the child is reparented to launchd still holding the
+model.
+
+The fix belongs to the object that spawned the process, not to a button:
+`ServerManager.init` observes `NSApplication.willTerminateNotification`. One
+`ServerManager` exists, so every quit route is covered by construction and a
+future quit affordance cannot forget the teardown.
+
+`queue: nil` is deliberate. `addObserver(forName:object:queue:)` with a queue
+ENQUEUES the block; during `applicationWillTerminate` the app may never turn its
+runloop again, so the teardown would be scheduled and then dropped — the same
+leak with extra steps. `queue: nil` delivers synchronously on the posting thread,
+which AppKit guarantees is the main one, so `MainActor.assumeIsolated` is sound.
+
+What makes the guard real rather than decorative: the test posts the
+notification and asserts `status == .stopped` with NO runloop turn, no `await`
+and no expectation in between. A `.main`-queued version of the fix fails it.
+
+`stop()` sends SIGTERM and the server handles it — verified against a running
+server with a model resident: it logs "Shutting down gracefully..." and exits.
+The tray button keeps its explicit `stop()`; it is idempotent, and belt-and-
+braces on the one path users already know works is cheap.

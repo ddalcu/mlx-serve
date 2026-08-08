@@ -1087,4 +1087,35 @@ extension ServerOptionsTests {
         let empty = try JSONDecoder().decode(ServerOptions.self, from: Data("{}".utf8))
         XCTAssertNil(empty.decodeAttnQuantChoice)
     }
+
+    /// The registry's residency cap was reachable only from a hand-launched
+    /// server: the app emitted no `--max-resident-mem` and has no extra-args
+    /// passthrough, so every GUI launch ran the auto cap (80% of the wired
+    /// limit) and a model the auto cap refuses was unloadable at any setting.
+    /// `--skip-mem-preflight` does not help — the registry gate runs first.
+    func testMaxResidentMemIsEmittedWhenSetAndOmittedOtherwise() {
+        var opts = ServerOptions()
+        XCTAssertEqual(opts.maxResidentMemGB, 0)  // 0 = Auto (the server's own cap)
+        XCTAssertFalse(opts.toCLIArgs().contains("--max-resident-mem"))
+
+        opts.maxResidentMemGB = 48
+        XCTAssertTrue(contains(opts.toCLIArgs(), flag: "--max-resident-mem", value: "48GB"))
+    }
+
+    /// The slider's snap points. `main.zig` EXITS on a value it cannot parse,
+    /// which is why this is a number picked off a ladder rather than typed
+    /// text — there is no unparseable value to guard against. The ladder must
+    /// always offer Auto, and must not offer a cap the machine cannot back.
+    func testResidentMemPresetsAlwaysOfferAutoAndNeverExceedRAM() {
+        for gb in [8, 16, 36, 48, 64, 128, 512] {
+            let presets = ServerOptions.residentMemPresets(physicalMemoryBytes: UInt64(gb) * Self.GiB)
+            XCTAssertEqual(presets.first, 0, "\(gb) GB Mac: Auto must be reachable")
+            XCTAssertEqual(presets, presets.sorted(), "\(gb) GB Mac: snap points must ascend")
+            XCTAssertFalse(presets.contains { $0 > gb },
+                           "\(gb) GB Mac: offers a cap above physical RAM \(presets)")
+            XCTAssertGreaterThan(presets.count, 1, "\(gb) GB Mac: Auto is the only choice")
+        }
+        // Unknown RAM must still produce a usable ladder, not just [Auto].
+        XCTAssertGreaterThan(ServerOptions.residentMemPresets(physicalMemoryBytes: 0).count, 1)
+    }
 }

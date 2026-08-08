@@ -187,6 +187,12 @@ pub const ModelConfig = struct {
 
     // Hybrid attention
     full_attention_interval: u32 = 0,
+    // Hybrid archs: layers at or past this index are ALWAYS full
+    // attention, whatever the interval says. The reference's rule is
+    // `(idx+1) % group == 0 OR idx >= n_layers // group * group`, i.e. the
+    // ragged tail after the last WHOLE group never gets linear attention.
+    // 0 = no tail bound, which is every other hybrid arch (qwen3_next, lfm2).
+    linear_attn_tail_from: u32 = 0,
     partial_rotary_factor: f32 = 1.0,
     attn_output_gate: bool = false,
 
@@ -534,7 +540,16 @@ pub const ModelConfig = struct {
 
     pub fn isLinearLayer(self: ModelConfig, layer_idx: u32) bool {
         if (self.full_attention_interval == 0) return false;
+        if (self.linear_attn_tail_from != 0 and layer_idx >= self.linear_attn_tail_from) return false;
         return ((layer_idx + 1) % self.full_attention_interval) != 0;
+    }
+
+    /// How many layers hold an attention KV cache. A hybrid MLA arch can
+    /// carry attention on a fraction of its layers; every current arch
+    /// caches on all of them. Used by the prefill preflight, which otherwise
+    /// bills a uniform arch's footprint for a model carrying less.
+    pub fn attnCacheLayerCount(self: *const ModelConfig) u32 {
+        return self.num_hidden_layers;
     }
 
     pub fn isMoe(self: *const ModelConfig) bool {
@@ -611,6 +626,33 @@ pub const ModelConfig = struct {
     /// known chat-terminator on "config provided no eos".
     pub fn ensureHy3Terminators(self: *ModelConfig) void {
         if (!self.isEosToken(120025)) self.addEosToken(120025);
+    }
+
+    /// The head width the PREFILL SCORE tensor is actually built at. Normally
+    /// `head_dim`, but an arch can score at a different width than it stores
+    /// values at (an MLA q.k can contract over nope+rope widths while
+    /// `head_dim` stays the value width) — reading `head_dim` there puts such
+    /// an arch under the `<= 128` "fused SDPA covers it" early-out, so the
+    /// score budget that exists for exactly this materializing path never
+    /// applies. A new arch scoring wider than it stores adds its arm here.
+    pub fn prefillScoreHeadDim(self: *const ModelConfig) u32 {
+        return self.head_dim;
+    }
+
+    /// Whether a chat request that names NO thinking preference should render
+    /// with thinking on. Our server always passes `enable_thinking` explicitly,
+    /// so a template whose own default is 'on' is silently overridden to off
+    /// for every client that omits the field — the vendor's default mode
+    /// becomes unreachable without a vendor-specific flag. An EXPLICIT request
+    /// value always outranks this (see `server.resolveEnableThinking`); it
+    /// only fills a silent request.
+    ///
+    /// Opt-in per arch, and only where the vendor documents thinking-on AND
+    /// the shipped template agrees — never inferred from "the template mentions
+    /// enable_thinking".
+    pub fn defaultEnableThinking(self: *const ModelConfig) bool {
+        _ = self;
+        return false;
     }
 
     /// Fill still-null sampling recommendations with the FAMILY's documented
@@ -2541,6 +2583,7 @@ test "applyFamilySamplingDefaults: qwen family gets top_k 20 / top_p 0.95 when t
     try testing.expectEqual(@as(?u32, null), inkling.gen_top_k);
     try testing.expectEqual(@as(?f32, 0.95), inkling.gen_top_p);
     try testing.expectEqual(@as(?f32, null), inkling.gen_temperature);
+
 }
 
 test "applyFamilySamplingDefaults never overrides explicit generation_config values" {
@@ -2560,6 +2603,15 @@ test "applyFamilySamplingDefaults never overrides explicit generation_config val
     partial.applyFamilySamplingDefaults();
     try testing.expectEqual(@as(?u32, 20), partial.gen_top_k);
     try testing.expectEqual(@as(?f32, 0.8), partial.gen_top_p);
+}
+
+test "defaultEnableThinking: opt-in per arch, and every existing arch stays off" {
+    // No arch opts in today — including the families whose templates merely
+    // MENTION enable_thinking, which is not evidence of a thinking-on default.
+    for ([_][]const u8{ "qwen3", "qwen3_5_moe", "gemma4", "gemma3_text", "laguna", "deepseek_v4", "inkling_mm_model", "llama", "hy_v3", "lfm2" }) |t| {
+        const c = ModelConfig{ .model_type = t };
+        try testing.expect(!c.defaultEnableThinking());
+    }
 }
 
 test "ModelConfig addEosToken" {
@@ -2700,6 +2752,32 @@ test "ModelConfig isLinearLayer" {
     try testing.expect(!config.isLinearLayer(7));
     // Layer 4: (4+1) % 4 == 1 → linear
     try testing.expect(config.isLinearLayer(4));
+}
+
+test "linear_attn_tail_from forces full attention past the last whole group" {
+    // A layer count that is NOT a multiple of the group size is where the
+    // reference's second clause bites: with 40 layers, 40//6*6 = 36, so layers
+    // 36..39 are ALL full attention even though (idx+1) % 6 != 0. Dropping the
+    // clause would run four layers through the wrong attention type silently.
+    var config = ModelConfig{};
+    config.num_hidden_layers = 40;
+    config.full_attention_interval = 6;
+    config.linear_attn_tail_from = 40 / 6 * 6; // 36
+    try testing.expect(config.isLinearLayer(34));
+    try testing.expect(!config.isLinearLayer(35)); // (35+1) % 6 == 0
+    try testing.expect(!config.isLinearLayer(36)); // tail clause
+    try testing.expect(!config.isLinearLayer(37));
+    try testing.expect(!config.isLinearLayer(38));
+    try testing.expect(!config.isLinearLayer(39));
+}
+
+test "linear_attn_tail_from is off by default so no existing arch moves" {
+    // qwen3_next/lfm2 set full_attention_interval without a tail bound.
+    var config = ModelConfig{};
+    config.full_attention_interval = 4;
+    try testing.expectEqual(@as(u32, 0), config.linear_attn_tail_from);
+    try testing.expect(config.isLinearLayer(100));
+    try testing.expect(config.isLinearLayer(1000));
 }
 
 test "ModelConfig isLinearLayer disabled" {

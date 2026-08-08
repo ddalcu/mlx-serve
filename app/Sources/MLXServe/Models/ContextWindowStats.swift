@@ -83,4 +83,23 @@ struct ContextWindowStats: Equatable {
         if n >= 1_000 { return String(format: "%.1fK", Double(n) / 1_000) }
         return "\(n)"
     }
+
+    /// Decode speed for the popover, or nil when there is nothing to report.
+    ///
+    /// The VALUE is the server's own `timings.predicted_per_second`, measured
+    /// around its forward passes (`APIClient` prefers it over wall-clock). That
+    /// distinction is the whole reason this is trustworthy: a client cannot time
+    /// our own stream — with `tools` present the server buffers tokens for
+    /// tool-call detection and flushes at the end, so every SSE delta lands at
+    /// once and a wall-clock rate reads ~937 tok/s on a 2B.
+    ///
+    /// A non-positive rate is a MISSING measurement, not a slow model, and
+    /// renders as nothing: "0 tok/s" next to a model that just answered reads as
+    /// a fault in the model. Sub-1 rates keep a decimal for the same reason —
+    /// they are real on a large model at long context.
+    static func speedText(_ tokensPerSecond: Double?) -> String? {
+        guard let r = tokensPerSecond, r > 0 else { return nil }
+        if r < 1 { return String(format: "%.1f tok/s", r) }
+        return "\(Int(r.rounded())) tok/s"
+    }
 }

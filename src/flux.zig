@@ -147,7 +147,10 @@ const QLinear = struct {
     add_bias: ?mlx.mlx_array = null, // optional additive bias (VAE attn)
     bits: u32 = 4,
     group_size: u32 = 64,
-    lora: ?lora_mod.Ref = null, // runtime adapter (non-owning; gen.zig owns the File)
+    // Runtime adapters (non-owning; gen.zig's lora.Stack owns the arrays).
+    // Fixed-capacity so attach/forward never allocate.
+    lora_refs: [lora_mod.MAX_LORAS]lora_mod.Ref = undefined,
+    lora_count: u8 = 0,
 
     fn load(w: *const Weights, a: std.mem.Allocator, prefix: []const u8) !QLinear {
         const wk = try fmtKey(a, "{s}.weight", .{prefix});
@@ -183,14 +186,24 @@ const QLinear = struct {
             _ = mlx.mlx_array_free(o);
             o = r;
         }
-        if (self.lora) |lr| {
-            const d = try lora_mod.delta(x, lr, s);
+        if (self.lora_count > 0) {
+            const d = try lora_mod.deltaSum(x, self.lora_refs[0..self.lora_count], s);
             defer _ = mlx.mlx_array_free(d);
             const r = try addA(o, d, s);
             _ = mlx.mlx_array_free(o);
             o = r;
         }
         return o;
+    }
+
+    /// Install the stacked adapter Refs for this linear (from `Stack.findAll`).
+    fn setLoraRefs(self: *QLinear, refs: []const lora_mod.Ref) void {
+        self.lora_count = @intCast(refs.len);
+        @memcpy(self.lora_refs[0..refs.len], refs);
+    }
+
+    fn clearLoraRefs(self: *QLinear) void {
+        self.lora_count = 0;
     }
 };
 
@@ -1029,12 +1042,16 @@ pub fn loadDit(io: std.Io, allocator: std.mem.Allocator, s: S, model_dir: []cons
     return d;
 }
 
-/// Attach runtime LoRA adapters from `lf` to every matching DiT linear.
-/// Non-owning: `lf` must outlive the attach. Returns the match count.
-pub fn attachLora(dit: *Dit, lf: *const lora_mod.File, user_scale: f32) u32 {
+/// Attach every adapter in `stack` to its matching DiT linear (summed at
+/// forward time — see `lora.deltaSum`). Non-owning: `stack` must outlive
+/// the attach. Returns the number of (module, matched-adapter) attachments
+/// across the whole stack, i.e. a module hit by two stacked LoRAs counts
+/// twice — useful as a "did anything match" / logging signal.
+pub fn attachLora(dit: *Dit, stack: *const lora_mod.Stack) u32 {
     detachLora(dit);
     var matched: u32 = 0;
     var kbuf: [128]u8 = undefined;
+    var rbuf: [lora_mod.MAX_LORAS]lora_mod.Ref = undefined;
     for (dit.doubles, 0..) |*b, i| {
         const mods = .{
             .{ "attn.to_q", &b.q },           .{ "attn.to_k", &b.k },
@@ -1046,9 +1063,10 @@ pub fn attachLora(dit: *Dit, lf: *const lora_mod.File, user_scale: f32) u32 {
         };
         inline for (mods) |m| {
             const key = std.fmt.bufPrint(&kbuf, "transformer_blocks.{d}.{s}", .{ i, m[0] }) catch "";
-            if (lf.find(key)) |e| {
-                m[1].lora = .{ .at = e.at, .bt = e.bt, .scale = e.scale * user_scale };
-                matched += 1;
+            const refs = stack.findAll(key, &rbuf);
+            if (refs.len > 0) {
+                m[1].setLoraRefs(refs);
+                matched += @intCast(refs.len);
             }
         }
     }
@@ -1056,9 +1074,10 @@ pub fn attachLora(dit: *Dit, lf: *const lora_mod.File, user_scale: f32) u32 {
         const mods = .{ .{ "attn.to_qkv_mlp_proj", &b.qkv_mlp }, .{ "attn.to_out", &b.o } };
         inline for (mods) |m| {
             const key = std.fmt.bufPrint(&kbuf, "single_transformer_blocks.{d}.{s}", .{ i, m[0] }) catch "";
-            if (lf.find(key)) |e| {
-                m[1].lora = .{ .at = e.at, .bt = e.bt, .scale = e.scale * user_scale };
-                matched += 1;
+            const refs = stack.findAll(key, &rbuf);
+            if (refs.len > 0) {
+                m[1].setLoraRefs(refs);
+                matched += @intCast(refs.len);
             }
         }
     }
@@ -1067,11 +1086,11 @@ pub fn attachLora(dit: *Dit, lf: *const lora_mod.File, user_scale: f32) u32 {
 
 pub fn detachLora(dit: *Dit) void {
     for (dit.doubles) |*b| {
-        inline for (.{ &b.q, &b.k, &b.v, &b.o, &b.add_q, &b.add_k, &b.add_v, &b.add_o, &b.ff_in, &b.ff_out, &b.ffc_in, &b.ffc_out }) |ql| ql.lora = null;
+        inline for (.{ &b.q, &b.k, &b.v, &b.o, &b.add_q, &b.add_k, &b.add_v, &b.add_o, &b.ff_in, &b.ff_out, &b.ffc_in, &b.ffc_out }) |ql| ql.clearLoraRefs();
     }
     for (dit.singles) |*b| {
-        b.qkv_mlp.lora = null;
-        b.o.lora = null;
+        b.qkv_mlp.clearLoraRefs();
+        b.o.clearLoraRefs();
     }
 }
 

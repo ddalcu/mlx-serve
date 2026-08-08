@@ -274,6 +274,30 @@ final class GgufQuantTests: XCTestCase {
         XCTAssertTrue(models.allSatisfy { $0.name == "unsloth/Qwen3.5-4B-GGUF" })
     }
 
+    /// Discovery already groups through `groupQuants`, so the disambiguated
+    /// label exists — and was thrown away, `displayLabel` recomputing the bare
+    /// quant token from the filename. That put two identical rows in the tray
+    /// picker for a repo shipping the same scheme twice, which is worse there
+    /// than in Discover: the picker keys its checkmark by TITLE, so both render
+    /// selected and picking one loads whichever the sort happened to put first.
+    func testTwoBuildsOfOneSchemeAreTellableApartInTheTrayToo() throws {
+        let dir = try makeGgufRepo("antirez/deepseek-v4-gguf", files: [
+            "DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf",
+            "DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf",
+        ])
+        let models = DownloadManager.makeLocalModels(
+            atDir: dir, displayName: "antirez/deepseek-v4-gguf",
+            idKey: "antirez/deepseek-v4-gguf", source: .mlxServe
+        )
+
+        XCTAssertEqual(Set(models.map(\.displayLabel)), [
+            "antirez/deepseek-v4-gguf · IQ2XXS · 0731",
+            "antirez/deepseek-v4-gguf · IQ2XXS",
+        ])
+        XCTAssertTrue(LocalModel.duplicateNames(in: models).isEmpty,
+                      "distinct titles ⇒ the picker's checkmark lands on exactly one row")
+    }
+
     func testSafetensorsDiscoveryStillReturnsExactlyOneModel() throws {
         let dir = (tempRoot as NSString).appendingPathComponent("mlx-community/demo-4bit")
         try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
@@ -466,6 +490,98 @@ final class GgufQuantTests: XCTestCase {
             "IQ2XXS · Pro",
         ])
     }
+
+    /// The repo re-published every quant against the 0731 weights and kept the
+    /// originals, so each scheme now ships TWICE under names that differ by one
+    /// trailing token. The categorical pick is capped at two tokens, which the
+    /// tier + imatrix markers already spend — so both members of each pair
+    /// reduced to the same label and the dropdown offered several identical
+    /// entries with no way to tell which one was 0731.
+    ///
+    /// Verbatim `antirez/deepseek-v4-gguf` listing (sidecars dropped by
+    /// `groupQuants`), so this fails the moment the labels stop being tellable
+    /// apart on the real repo — not on a reduced fixture that happens to work.
+    func testEveryQuantOfTheRealDatedRepoIsTellableApart() {
+        let quants = GgufQuant.groupQuants(Self.antirezDeepSeekV4Listing)
+        let labels = quants.map(\.label)
+
+        XCTAssertEqual(Set(labels).count, labels.count,
+                       "two quants share a label — the menu can't say which is which: \(labels.sorted())")
+        // The whole point: the dated rebuild says so, and its undated twin doesn't.
+        for q in quants {
+            let isDated = (q.filename as NSString).deletingPathExtension.hasSuffix("-0731")
+            XCTAssertEqual(q.label.contains("0731"), isDated,
+                           "\(q.filename) → \(q.label)")
+        }
+    }
+
+    /// A quant token the label regex can't see is the same bug one step earlier:
+    /// `…-MXFP4Experts-F16HC-…` reduced to "F16HC", naming a 16-bit scheme for a
+    /// 4-bit file. `MXFP`/`NVFP` are real quant families, not an `F`-then-digit
+    /// accident, so they win the leftmost match like every other token does.
+    func testQuantLabelReadsAnFpFamilyToken() {
+        XCTAssertEqual(
+            DownloadManager.quantLabel(forFilename: "DeepSeek-V4-Flash-MXFP4Experts-F16HC-F16Compressor-chat-v2-mxfp4-0731.gguf"),
+            "MXFP4Experts"
+        )
+        XCTAssertEqual(DownloadManager.quantLabel(forFilename: "Model-NVFP4.gguf"), "NVFP4")
+        // Unchanged for everything that already worked.
+        XCTAssertEqual(DownloadManager.quantLabel(forFilename: "Qwen3.5-4B-Q4_K_M.gguf"), "Q4_K_M")
+        XCTAssertEqual(DownloadManager.quantLabel(forFilename: "Hy3-IQ1_M-00001-of-00002.gguf"), "IQ1_M")
+        XCTAssertEqual(DownloadManager.quantLabel(forFilename: "mmproj-F16.gguf"), "F16")
+    }
+
+    /// A build stamp shows whether or not anything collides — "is this the 0731
+    /// one?" is unanswerable from a label that is merely unique. `chat-v2` and a
+    /// layer index must NOT read as one: a prompt-format marker and a layer
+    /// number are not builds, and a split quant's shard indices are bookkeeping.
+    func testABuildStampAlwaysShowsAndFillerNumbersNever() {
+        XCTAssertEqual(GgufQuant.groupQuants(["Model-MXFP4Experts-chat-v2-mxfp4-0731.gguf"]).map(\.label),
+                       ["MXFP4Experts · 0731"], "the only file of its scheme still has to say which build")
+        XCTAssertEqual(GgufQuant.groupQuants(["Model-Q4K-Layers-31-output.gguf"]).map(\.label), ["Q4K"])
+        XCTAssertEqual(GgufQuant.groupQuants([
+            "Hy3-IQ1_M/Hy3-IQ1_M-00001-of-00002.gguf",
+            "Hy3-IQ1_M/Hy3-IQ1_M-00002-of-00002.gguf",
+        ]).map(\.label), ["IQ1_M"], "shard indices are not a build stamp")
+    }
+
+    /// The categorical pick is capped so labels stay readable, which means two
+    /// files differing only in a token the cap dropped land on the same label —
+    /// the dated rebuilds, exactly. Whatever actually differs gets appended; the
+    /// member with nothing left to add is the base and keeps its plain label
+    /// rather than growing a suffix that says nothing.
+    func testACollisionSurvivingTheCategoricalPickIsBrokenByWhatActuallyDiffers() {
+        let quants = GgufQuant.groupQuants([
+            "Model-IQ2XXS-alpha-imatrix-fixed.gguf",
+            "Model-IQ2XXS-beta-imatrix-fixed.gguf",
+            "Model-IQ2XXS.gguf",
+        ])
+        XCTAssertEqual(Set(quants.map(\.label)), [
+            "IQ2XXS · imatrix · fixed · alpha",
+            "IQ2XXS · imatrix · fixed · beta",
+            "IQ2XXS",
+        ])
+    }
+
+    /// Real listing of `antirez/deepseek-v4-gguf`, 2026-08-08.
+    private static let antirezDeepSeekV4Listing = [
+        "DeepSeek-V4-Flash-DSpark-support-0731.gguf",
+        "DeepSeek-V4-Flash-DSpark-support.gguf",
+        "DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf",
+        "DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix.gguf",
+        "DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2.gguf",
+        "DeepSeek-V4-Flash-Layers37-42Q4KExperts-OtherExpertLayersIQ2XXSGateUp-Q2KDown-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-fixed-0731.gguf",
+        "DeepSeek-V4-Flash-Layers37-42Q4KExperts-OtherExpertLayersIQ2XXSGateUp-Q2KDown-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-fixed.gguf",
+        "DeepSeek-V4-Flash-MTP-Q4K-Q8_0-F32.gguf",
+        "DeepSeek-V4-Flash-MXFP4Experts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-mxfp4-0731.gguf",
+        "DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix-0731.gguf",
+        "DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2-imatrix.gguf",
+        "DeepSeek-V4-Flash-Q4KExperts-F16HC-F16Compressor-F16Indexer-Q8Attn-Q8Shared-Q8Out-chat-v2.gguf",
+        "DeepSeek-V4-Pro-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-Instruct-imatrix.gguf",
+        "DeepSeek-V4-Pro-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-Instruct.gguf",
+        "DeepSeek-V4-Pro-Q4K-Layers-31-output.gguf",
+        "DeepSeek-V4-Pro-Q4K-Layers00-30.gguf",
+    ]
 
     func testGroupQuantsImatrixOnlyDifference() {
         // The base (no imatrix) keeps the plain label; only the imatrix one is tagged.

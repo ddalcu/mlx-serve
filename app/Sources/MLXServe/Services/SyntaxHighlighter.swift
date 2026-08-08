@@ -63,21 +63,6 @@ enum SyntaxLanguage: String, Sendable, CaseIterable {
         }
     }
 
-    /// Label shown in the code block's header bar.
-    var displayName: String {
-        switch self {
-        case .swift: "Swift"
-        case .javascript: "JavaScript"
-        case .python: "Python"
-        case .json: "JSON"
-        case .shell: "Shell"
-        case .markup: "HTML"
-        case .cFamily: "C"
-        case .zig: "Zig"
-        case .rust: "Rust"
-        case .go: "Go"
-        }
-    }
 }
 
 /// Single-pass lexer producing `SyntaxSpan`s for a code block.
@@ -433,75 +418,6 @@ enum SyntaxHighlighter {
                 j += 1
             }
             i = min(j + 1, n)
-        }
-        return out
-    }
-}
-
-/// One styled run of a code line. `kind == nil` is text the tokenizer made no
-/// claim about — it renders in the block's default color.
-struct CodeRun: Equatable, Sendable {
-    let text: String
-    let kind: SyntaxKind?
-}
-
-/// One rendered row: its gutter number and the runs that make it up.
-struct CodeLine: Identifiable, Equatable, Sendable {
-    let number: Int
-    let runs: [CodeRun]
-    var id: Int { number }
-}
-
-/// Cuts whole-block syntax spans into per-line runs.
-///
-/// The tokenizer works on the whole block because comments and triple-quoted
-/// strings legitimately cross newlines, but the view draws one row per line so
-/// gutter numbers stay aligned with their code. Every multi-line span therefore
-/// has to be split at each newline — and no run may CARRY a newline, or it
-/// prints as an extra blank row and knocks every later line out of step with
-/// its number.
-enum CodeLayout {
-
-    static func lines(code: String, language: SyntaxLanguage?) -> [CodeLine] {
-        let spans = language.map { SyntaxHighlighter.spans(code, language: $0) } ?? []
-        let ns = code as NSString
-        var out: [CodeLine] = []
-        var lineStart = 0          // UTF-16 offset of the current line
-        var spanIndex = 0
-
-        for (number, text) in code.components(separatedBy: "\n").enumerated() {
-            let lineLength = (text as NSString).length
-            let lineEnd = lineStart + lineLength
-            var runs: [CodeRun] = []
-            var cursor = lineStart
-
-            // Spans are sorted and non-overlapping (pinned by the highlighter's
-            // own invariant test), so one forward walk covers every line.
-            while spanIndex < spans.count, spans[spanIndex].start < lineEnd {
-                let span = spans[spanIndex]
-                let spanEnd = span.start + span.length
-                let from = max(span.start, cursor)
-                let to = min(spanEnd, lineEnd)
-                if to > from {
-                    if from > cursor {
-                        runs.append(CodeRun(text: ns.substring(with: NSRange(location: cursor, length: from - cursor)),
-                                            kind: nil))
-                    }
-                    runs.append(CodeRun(text: ns.substring(with: NSRange(location: from, length: to - from)),
-                                        kind: span.kind))
-                    cursor = to
-                }
-                // A span reaching past this line stays current for the next one.
-                if spanEnd > lineEnd { break }
-                spanIndex += 1
-            }
-            if cursor < lineEnd {
-                runs.append(CodeRun(text: ns.substring(with: NSRange(location: cursor, length: lineEnd - cursor)),
-                                    kind: nil))
-            }
-            if runs.isEmpty { runs = [CodeRun(text: "", kind: nil)] }
-            out.append(CodeLine(number: number + 1, runs: runs))
-            lineStart = lineEnd + 1   // skip the newline itself
         }
         return out
     }

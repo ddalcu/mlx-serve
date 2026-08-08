@@ -29,10 +29,11 @@ enum SettingsReset {
     /// sections with nothing of their own to reset.
     static func fields(for category: SettingsCategory) -> [SettingsFieldReset] {
         switch category {
-        // Model Folders' extra scan path lives on `DownloadManager.customRoot`,
-        // not in ServerOptions; Updates holds no settings, and About is links
-        // only. None offers a Reset button (`isResettable`), rather than a
-        // button that does nothing.
+        // Model Folders' two paths live in `ModelRoots` (UserDefaults), not in
+        // ServerOptions, and each row carries its own Clear/Reset button beside
+        // the path it clears; Updates holds no settings, and About is links
+        // only. None offers a section Reset button (`isResettable`), rather
+        // than a button that does nothing.
         case .modelFolders, .updates, .about:
             return []
 
@@ -51,6 +52,7 @@ enum SettingsReset {
                 f("apiKey") { $0.apiKey = $1.apiKey },
                 f("toolAutocorrect") { $0.toolAutocorrect = $1.toolAutocorrect },
                 f("skipMemPreflight") { $0.skipMemPreflight = $1.skipMemPreflight },
+                f("maxResidentMemGB") { $0.maxResidentMemGB = $1.maxResidentMemGB },
             ]
 
         case .lanSharing:

@@ -1731,3 +1731,294 @@ Expectation to keep: the stochastic arm's speedup is CONTENT-DEPENDENT with a fl
 ### Addendum: the prefill guard's CHUNK term is arch-owned too (2026-08-01, the class's third bite)
 
 Minutes into the first real pi session on stochastic DSpark, a 7514-token prompt 400'd: "requires ~4069MB but only ~3610MB available". Not pi's fault and not fixable with pi-side limits (7.5k is a normal agent prompt); with the stages resident the box really does sit at ~3.6-6 GB slack — but the bill was wrong, in both directions at once. The generic estimator charges `3 × mlp(chunk)` with `chunk` from `effectivePrefillChunk` (the 4096 MoE cap) — dsv4's `extendState` sub-chunks internally at `prefillSub()` (512), so the real MLP envelope is 8x smaller (~2.6 GB of phantom bill). Meanwhile the fp16 score-scratch term (42 MB) misses the arch's REAL attention transient: the `[C, tk, latent]` f32 gathered-K set (~670 MB — the very allocation PREFILL_SUB exists to bound). `server.dsv4PrefillMemoryNeeded` now bills f32 module-owned state (raw latents + ~half again for the compressed arms; kv-quant never applies here), the f32 gather, and the sub-chunk MLP — ~2.3 GB for the failed request, admitted. It reads the LIVE `dsv4_mod.prefillSub()` (env-overridable — billing a stale constant while `MLX_SERVE_DSV4_PREFILL_SUB` raises the width would under-bill into an uncatchable OOM), and the call site is scan-pinned with `++`-split needles so the scan test cannot match its own source. Live-verified: an 11.2k-token prompt prefills clean with the stages resident. Physics unchanged: DSpark's 11 GB of stages still caps agent prompts around ~12-16k on a 128 GB box (bill is kv-linear, ~132 KB/token) — the pi launcher config sets `contextWindow: 16384` so pi compacts before the wall; full-window 40k sessions want a serial (no `--dspark`) boot.
+
+---
+
+
+## Sparse video attention is dead by measurement, and the frames are what said so (MiniMax-H3, 2026-08-05)
+
+Attention is 25% of an H3 step at 480p and 59% at 768p, and MiniMax deliberately
+withheld their own sparse implementation from the release. So a training-free
+SVG/STA-style pattern looked like the one large FLOP saving left on a DiT whose
+every other component is already at the compute roofline.
+
+It is dead. Not "needs tuning" — dead.
+
+**The machinery is fine.** Per-layer spatial (within-frame) / temporal
+(same-patch stripe) attention, with the GLOBAL STRIP (text/cond/audio rows)
+concatenated into every tile's key set and strip queries keeping full attention,
+dense anchor layers at the ends and middle. Pure mlx ops — batched SDPA with the
+pattern axis folded into batch, no custom kernel. The subset selection is PROVEN
+by a uniform-score closed-form test (q = k = 0 makes each output row the mean of
+exactly its subset, so the test reads the pattern directly rather than trusting
+it).
+
+**Three numbers, in the order they arrived, and only the last one mattered.**
+
+1. The µbench said **15x**. It was measuring the attention op in isolation at
+   the sparse shapes, which is exactly what it was asked to measure.
+2. Live, in the step graph, it measured **1.33x**. Same class as the lm_head
+   prune and the fused QK-norm+RoPE: an isolated kernel win that the surrounding
+   graph does not pay out, because the GPU was already overlapping the work and
+   because attention shares the step with linears that did not get faster.
+3. The rendered frames are **visibly smeared tiles**.
+
+**The quality failure is structural, not a tuning miss.** The temporal arm sets
+`nb = f` — one "batch" entry per frame — so on those layers two adjacent SPATIAL
+positions are in different batch entries and never exchange information at all.
+A video DiT cannot reconstruct local spatial structure from the dense anchor
+layers alone, so the tuning ladder everyone reaches for (denser anchor cadence,
+spatial-only sparse layers, SVG-style per-head online classification) is being
+asked to repair a hole the pattern puts there by construction. At a 1.33x
+ceiling it is not worth finding out how much of it can be repaired.
+
+**Two instruments pointed the right way before anyone looked at a frame** and
+both were treated as soft: PSNR vs the same-seed dense run was 9.8 dB, and the
+sparse clip x264-compressed at **10x** the control's bitrate — the classic
+added-noise tell, since noise is what a video codec cannot compress. The eyeball
+pair (`h3_sp480q` vs `h3_d480q`) is what settled it, which is the same precedent
+as every other quality call on this backend: **metrics flag, clips decide.**
+
+### Corollary: no kernel work is justified on this DiT at all
+
+Measured the same session, and it retires the whole category rather than one
+lever:
+
+| what | effective | ceiling |
+|---|---|---|
+| SDPA at `[1,56,9266,128]` | ~13.3 TFLOPS | ~15 TFLOPS dense bf16 |
+| linears under dq-gemm | ~13.6 TFLOPS | ~15 TFLOPS dense bf16 |
+
+Both are within ~12% of the machine's dense-bf16 roofline, so a *perfect* kernel
+is worth ~15% of the step and a realistic one is worth single digits. bf16
+weights buy 6.5% for 2x the footprint — declined. Wall-clock on this backend now
+only moves by doing FEWER forwards (steps, step cache, attention broadcast), not
+by making a forward faster.
+
+Also found while measuring, and worth more than the sparse result: **the fast
+recipe's gate was a NO-OP at <= 6 steps.** `attnBroadcastWarmup` + the tail
+always-refresh window together cover the entire schedule at small step counts,
+so every few-step run was silently getting the dense path while being credited
+with the recipe. A gate whose windows scale with the schedule needs a test at
+the SHORT end of that schedule, not only at the 30 steps it was tuned on.
+
+## The near-repeat loop tier convicted a voxel scene (2026-08-05)
+
+The tier shipped on 2026-08-04 to catch a loop that rephrases itself. One day
+later it destroyed a legitimate generation: asked for "a very creative,
+elaborate, and detailed voxel art scene of a pagoda in a beautiful garden", a
+pi session was cut at **16241 generated tokens** and wrote no file at all.
+
+The output was fine. Its tail was `fillBox(-5, 7, -5, 5, 7, 5, C.orangeTile);`
+lines with fresh coordinates on every one. The problem is that both of the
+tier's ratios measure a VOCABULARY, and procedurally generated scene code has a
+loop's vocabulary by construction: one call template plus a small colour
+palette. Measured on the artifact itself: distinct-token ratio **0.068** against
+a 0.12 bar, distinct-4-gram ratio **0.351** against a 0.35 bar — it escaped
+conviction by 0.001, and the generation's own tail did not escape.
+
+The separator is PROGRESS, not vocabulary. A loop stops introducing material; a
+scene keeps adding geometry. Measured as "what fraction of the window's
+second-half 4-grams did its first half never contain":
+
+| content | tokens | 4-grams | novelty |
+|---|---|---|---|
+| the cut voxel artifact | 0.068 | 0.351 | **0.632** |
+| dense procedural scene code | 0.021 | 0.304 | **0.298** |
+| a markdown table | 0.016 | 0.541 | **0.827** |
+| restatement loop | 0.024 | 0.052 | **0.019** |
+| file-repair restatement loop | 0.041 | 0.092 | **0.022** |
+
+Two orders of magnitude apart, so the bar is 0.10 — ~4.5x above the loops,
+~3x below the closest healthy case. All three ratios must now be low.
+
+Three things worth keeping:
+
+- **The direction of the error matters.** A missed loop still ends at
+  `max_tokens`; a false cut destroys work that was going fine and, on a tools
+  request, returns nothing at all. Every ambiguity in this tier resolves toward
+  acquittal.
+- **The known miss is honest.** A restatement loop that carries a changing
+  counter ("Attempt 1…", "Attempt 2…") scores 0.651 and is acquitted — by this
+  measure it IS progressing. Catching it needs a different signal, not a lower
+  bar.
+- **The regression fixture is derived, not invented.** The first attempt at it
+  interleaved template and varying tokens and did NOT convict, i.e. it was a
+  test that could not fail. The shape that reproduces the bug puts the template
+  tokens in a CONTIGUOUS run followed by the coordinates, so most 4-gram windows
+  sit entirely inside the fixed run and repeat every line (0.033 / 0.316). The
+  parameters were swept numerically against the measured artifact before being
+  written into the test.
+
+## A prefix-cache hit is bit-exact on attention and is not on a hybrid (2026-08-07)
+
+Surfaced by llmprobe's determinism check during 26.8.3 pre-release validation:
+`greedy runs diverged at char 275 (det-echo-sentence, 3 runs) — non-determinism
+at temperature 0`, on LFM2.5-2.6B-8bit.
+
+**The shape of the evidence.** Four identical temp-0 requests, same boot:
+
+| arm | run 1 | runs 2-4 |
+|---|---|---|
+| defaults | A | B B B |
+| `--no-pld` | A | B B B |
+| `--no-pld --prefix-cache-entries 0` | C | C C C |
+| `--prefix-cache-entries 0` | C | C C C |
+
+Run 1 is cold, runs 2+ are warm. `--no-pld` changes nothing, so it is NOT spec
+decode — which is the first thing everyone suspects, and the reason to run the
+kill-switch A/B before theorising. Turning the prefix cache off makes every run
+identical. Note there are THREE distinct outputs, not two: the cold-with-cache
+answer also differs from the no-cache answer, because merely enabling the cache
+changes the prefill shape (the SSM snapshot sits `SSM_SNAPSHOT_BACKOFF` = 30
+tokens before the prompt end, splitting the pass).
+
+**Is it corruption or rounding?** Answered with the logprobs, not by eyeballing
+the text — which is a good use for the field the same release had just fixed:
+
+```
+first divergence at token index 44
+  prefix: ' why determinism matters for inference engines. I must follow the'
+  cold: chose ' instructions' lp=-1.242188  rank1-rank2 gap=0.125000
+  warm: chose ' rules'        lp=-1.335938  rank1-rank2 gap=0.000000
+pre-divergence logprob agreement over 40 tokens: max|delta|=4.6875e-02  mean=2.76e-03
+```
+
+The warm path shows an EXACT tie between the two candidates. The two paths
+agree to a mean of 2.8e-3 for the whole run up to that point, with a worst case
+of 0.047 — which is exactly bf16 rounding scale (~8 mantissa bits on logits of
+magnitude 10-20). A restore defect smears the whole distribution; this does
+not. Not corruption.
+
+**Mechanism.** For a pure-attention arch, a warm restore replays STORED KV
+values — nothing is recomputed, so it is bit-exact. gemma-4-e4b-it-4bit through
+the identical probe: `NO DIVERGENCE over 220 shared tokens`, with a full
+38-of-38-token reuse. A hybrid instead restores the conv/SSM state at the
+checkpoint position and RE-RUNS the recurrence over the remaining prompt — the
+cold pass ran positions 0..40 as one block, the warm pass runs 10..40, and a
+sequential recurrence in a different block size is the same mathematics in a
+different reduction order.
+
+**Not a storage bug.** `captureSsmCheckpoint` copies through
+`materializedOwnedCopy`, which preserves dtype; there is no narrowing anywhere
+on that path.
+
+**Why the existing guard is green.** `test_hybrid_reuse_equivalence.sh` asserts
+warm output is byte-identical to cold and passes on this very model — its
+prompt is 1391 cached tokens and its generation happens to land on no near-tie.
+The exposing shape is the opposite: a SHORT prompt (so the 30-token backoff is
+a large fraction of it) with a LONG generation (so the run has many chances to
+hit a tie). A byte-equality test over one prompt samples one path through the
+distribution; it cannot stand in for a determinism claim.
+
+**Standing rule.** Byte-stable long greedy on a hybrid requires
+`--prefix-cache-entries 0`, exactly as it requires no-spec + `--kv-quant off/8`
+for the INT4 near-tie class. Both are properties of the arithmetic, not bugs to
+fix, and both belong in any determinism claim we make.
+
+## One request killed the server: a borrowed-handle cache that freed a live entry (2026-08-07)
+
+Found during 26.8.3 pre-release validation, by the conformance sweep rather
+than by any test — and it had already corrupted a benchmark row nobody would
+have questioned.
+
+**How it presented.** The `qwen3_5_moe` family row scored **33.3% engine
+conformance**: `responses 0/26`, `messages 0/27`, `completions 0/1`, and
+**0% model capability** with every knowledge question 0/1 — a model that
+apparently could not name a chemical symbol. That reading is the tell. Whole
+surfaces at exactly 0/N, plus a capability floor of 0, is not a weak
+checkpoint; it is a **dead process**. The server log confirmed it: 13 requests
+where every other cell logged 34, ending mid-request with no shutdown line.
+
+**Two crash reports, one function.**
+
+```
+SIGSEGV  mlx::core::array::~array < mlx_vector_array_free
+                                  < verifyQmm < qmatmulBits < qmatmul
+                                  < gatedDeltaNet < forwardMoeWith
+                                  < Generator.nextPld      (decode / PLD verify)
+
+SIGBUS   vector<array>::__emplace_back_slow_path < mlx_vector_array_new_data
+                                  < verifyQmm < ...
+                                  < Generator.initWithOptions  (prefill)
+```
+
+**Root cause.** `cachedScalarInt` caches 0-d int scalars for the kernels' K/N
+inputs in 16 slots, and evicted slot 0 unconditionally:
+
+```zig
+_ = mlx.mlx_array_free(vqmm_scalar_cache[0].arr);
+vqmm_scalar_cache[0] = .{ .v = v, .arr = arr };
+```
+
+All six call sites do this:
+
+```zig
+const K_arr = cachedScalarInt(K);
+const N_arr = cachedScalarInt(N);
+const inputs_arr = [_]mlx.mlx_array{ x, w, sc, bi, K_arr, N_arr };
+```
+
+Once the cache is full: the K call evicts slot 0 and lands there; the N call
+frees slot 0 again — now K's array — and `inputs_arr` carries a freed handle
+into mlx.
+
+The code carried a comment asserting this was safe: *"in-flight lazy graph
+nodes hold their own refs to the old array; this only drops OUR handle."* That
+is true, and it is irrelevant. The array has not reached a graph node yet. It
+is sitting in the caller's stack array, one line above.
+
+**Why it stayed hidden.** Eviction only happens after **more than 16 distinct
+(K, N) values**. Most checkpoints never get there. A 40-layer MoE with
+GatedDeltaNet, MoE expert widths and a 248k vocab does. Nothing about it is
+model-specific — any checkpoint with enough distinct geometries is exposed, and
+it fires on both the prefill and decode paths.
+
+**Fix.** LRU eviction (`vqmmScalarEvictIndex`): pick the entry with the oldest
+tick. Correct by construction — the scalars a call site is still holding are by
+definition the two most recently ticked, and the cache is 16 while the most any
+site takes is 2, so they can never be the minimum.
+
+**Before / after, same command:**
+
+| | pre-fix | post-fix |
+|---|---|---|
+| engine conformance | 33.3% | 99.5% |
+| chat / responses / messages | 34/54, 0/26, 0/27 | 65/65, 62/62, 60/61 |
+| model capability | 0% | 97.2% (strong) |
+| server | dead | alive |
+
+pi agentic tasks on the same checkpoint then ran 3/3 with PLD engaging 12
+times — `nextPld → verifyQmm` being the exact path that segfaulted.
+
+**Two lessons worth keeping.**
+
+1. *A comment asserting safety is not safety.* This one was written
+   confidently, was half-right, and cost a server-killing crash. The question
+   it answered ("does the graph hold a ref?") was not the question that
+   mattered ("has it reached the graph yet?").
+2. *A bench harness reports whatever the engine returns.* llmprobe measured and
+   charted a decode rate for a process that had already crashed. The corrupted
+   row's numbers looked ordinary. What gave it away was structural — its log
+   was a third the length of every other cell's, and it had no shutdown line.
+   Worth checking cell logs for uniformity before trusting a bench row.
+
+## The prefill-chunk cap must read the width the SCORE is contracted at (`prefillScoreHeadDim`)
+
+An arch can score at a different width than it stores values at (an MLA q·k contracting over nope+rope while `head_dim` stays the value width), and `boundedPrefillChunk`'s `<= 128` "fused SDPA covers it" early-out then silently exempts exactly the arch whose composed path materializes the biggest score tensors. `ModelConfig.prefillScoreHeadDim` is the width the cap must read. The two hd-256-MEASURED policy branches (the fused-kernel early return, the 2048 composed cap) stay keyed on 256 EXACTLY; neither generalizes. A new arch scoring wider than it stores adds its arm to `prefillScoreHeadDim`. A cap that trades throughput for reach is the usual expectation; measure before assuming you are paying for it.
+
+## A per-arch spec exclusion written as a hand-rolled conjunct is a list of ONE (2026-08-05)
+
+The dsv4 fixes both named dsv4 IN PLACE — `modelExclusiveDecode` returned `t.dsv4 != null`, and runPrefill spelled `!is_dsv4` on each of the three `use_mtp`/`use_drafter`/`use_pld` lines. A second module-owned arch arrived with the SAME shape (module-owned `Model.state`, `reset = ctx.cache.step == 0`, a 0-layer shell `KVCache` so snapshot/truncate are no-ops) and got neither: two concurrent requests shared one state, and `--pld` drove verify forwards straight through it with nothing to roll back. Both now read ONE predicate — `Transformer.ownsModuleDecodeState()` over the named `module_owned_state_fields`, and `scheduler.specInitWiring` (pure, `owns_module_state` in / the three use_* + a `native_intent` bit for an arch with its OWN draft mode out). Guards: a class scan asserting every `?*<x>_mod.<Y>` field on Transformer is in the list, delegation scans on both call sites, and `specInitWiring`'s table.
+
+Corollary 1 — the exclusion is per-arch CAPABILITY, not ownership (`Transformer.moduleStateSpecRollback`): an arch earns spec modes by shipping per-position state capture plus a rewind, pinned against fresh forwards at EVERY accepted count (bit equality is the wrong bar — a verify projects 1+m rows in one matmul, a reference one at a time, and MLX picks its GEMM by M; assert the error RATIO between correct and off-by-one instead). dsv4 cannot roll back (rings/compressed caches have no per-position capture) and keeps every shell spec mode off; it has DSpark for drafting.
+
+Corollary 2 — a module-owned forward that ignores `ctx.capture_hidden` hands spec decode an EMPTY hidden: `forwardWithCaptureAll` only sets the ctx fields and calls `forwardWith`, so an arch that never reads them silently captures nothing — and the MTP round then drafts from a null handle rather than failing. The fix is the `skip_lm_head` seam: run the trunk without the head, publish last-row + all-rows, project afterwards. (Found on the since-removed ling port; the wiring obligation stands for any new module-owned arch that wants spec decode.)
+
+## Kokoro port: the SineGen no-op, load/layout traps, and the vocab invariant
+
+**Reproducing an upstream NO-OP faithfully means NOT doing it**: the reference adds a random initial phase at SAMPLE 0 then linear-downsamples by 1/300 with `align_corners=False`, which reads position 149.5 — so the offset is never read and the round trip is bit-identical with and without it (verified max abs diff 0.0). This port collapses that identity round trip and works at the frame rate, where adding it is REAL. Cost: waveform cosine 0.477 instead of 0.997. Caught only by measuring the reference's OWN seed-to-seed self-similarity (0.9941–0.9960) instead of accepting "it's a stochastic vocoder" as licence for a loose threshold — a stochastic component excuses thousandths, not halves. Any port that simplifies a reference's resample/round-trip owes that measurement.
+
+**Load/layout traps**: safetensors READ on the CPU stream (mlx `Load` has no GPU impl — uncatchable `[Load::eval_gpu] Not implemented`); a DEPTHWISE `ConvTranspose1d` transposes `{0,2,1}`, NOT `ltx_audio`'s groups=1 `{1,2,0}`; mlx-c has no "build a complex array from two reals" op, so the iSTFT spectrum is `re + im·i` via `mlx_array_new_complex`; `AdaIN1d` declares `affine=True` but the checkpoint ships NO `norm.weight/bias` (loaded `strict=False`), so it is pure instance norm — read the CHECKPOINT, not the reference source.
+
+**Vocab**: Kokoro's vocab includes uppercase ASCII as diphthongs (A I O W Y Q S T), so "no ASCII letters in the phonemes" is a WRONG assertion — `həlˈO` is correct. The real invariant is that every emitted symbol is IN the vocab, because `Vocab.encode` silently DROPS unknowns (an unexpanded number just vanishes from the speech rather than erroring).

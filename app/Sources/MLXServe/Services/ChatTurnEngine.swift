@@ -531,12 +531,12 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                     setLiveTokens(usage.completionTokens, for: sessionId)   // reconcile to the authoritative count
                 case .toolCalls:
                     break
-                case .maxTokensReached:
+                case .truncated(let cause):
                     // Plain chat is a single, always-terminal response — show the
                     // notice immediately (no agent loop to stack it). Flush any
                     // buffered text first so the notice lands after it, in order.
                     applyStreamBatch(coalescer.drain(), to: sessionId)
-                    appState.updateLastMessage(in: sessionId, content: TruncationNotice.text(maxTokens: turnMaxTokens(config)))
+                    appState.updateLastMessage(in: sessionId, content: TruncationNotice.text(cause: cause, maxTokens: turnMaxTokens(config)))
                 case .done:
                     break
                 }
@@ -781,6 +781,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
             // Stream model response with tools
             var receivedToolCalls: [APIClient.ToolCall] = []
             var maxTokensHit = false
+            var truncationCause: TruncationNotice.Cause? = nil
             let combinedToolsJSON = Self.combinedToolsJSON(
                 tools: config.advertisedTools,
                 mcpToolsJSON: mcpToolsJSON,
@@ -805,9 +806,10 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
             // sit silent for minutes between events. The user keeps the Stop
             // button as the manual cancel; URLSession's own resource timeout
             // (set in APIClient) handles a truly broken socket.
-            let streamTask = Task<(tcs: [APIClient.ToolCall], maxHit: Bool), Error> {
+            let streamTask = Task<(tcs: [APIClient.ToolCall], maxHit: Bool, cause: TruncationNotice.Cause?), Error> {
                 var tcs: [APIClient.ToolCall] = []
                 var maxHit = false
+                var cause: TruncationNotice.Cause? = nil
                 var coalescer = StreamCoalescer()
                 self.beginLiveTokenCount(for: sessionId)
                 for try await event in stream {
@@ -823,12 +825,13 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                         self.setLiveTokens(usage.completionTokens, for: sessionId)   // reconcile to the authoritative count
                     case .toolCalls(let calls):
                         tcs = calls
-                    case .maxTokensReached:
+                    case .truncated(let c):
                         // Just record it. The notice is surfaced once at the
                         // turn's terminal exit (see below) — appending here, per
                         // iteration, is what stacked duplicate banners on a
                         // multi-step agent turn.
                         maxHit = true
+                        cause = c
                     case .done:
                         break
                     }
@@ -836,7 +839,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                 // Flush the trailing batch so the message content is complete
                 // before the post-stream truncation/pad checks read it back.
                 self.applyStreamBatch(coalescer.drain(), to: sessionId)
-                return (tcs, maxHit)
+                return (tcs, maxHit, cause)
             }
             // Wire the user's Stop button through to the inner stream task.
             do {
@@ -847,10 +850,25 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                 }
                 receivedToolCalls = result.tcs
                 maxTokensHit = result.maxHit
+                truncationCause = result.cause
             } catch is CancellationError {
                 throw CancellationError()
             }
             appState.updateLastMessage(in: sessionId, streaming: false)
+
+            // A repetition-loop cut ENDS the turn, ahead of every recovery path
+            // below. The loop's text is already in the transcript — a streamed
+            // delta cannot be retracted, so the server's own trim never reaches
+            // a streaming client — and the next round would send it back as
+            // history for the model to read and resume. That is the error-echo
+            // class with our own transcript as the error, and from the server it
+            // looks like five cuts in a row, each firing sooner than the last
+            // (live 2026-08-05, under pi). Every other "length" cause keeps
+            // its recovery: the reply was fine and simply ran out of room.
+            if TruncationNotice.endsTurn(cause: truncationCause) {
+                appState.updateLastMessage(in: sessionId, content: TruncationNotice.text(cause: .repetitionLoop, maxTokens: turnMaxTokens(config)))
+                return
+            }
 
             // Truncation recovery: if max_tokens was hit AND tool calls were received,
             // the tool call args are likely truncated (incomplete JSON). Don't execute them —
@@ -955,7 +973,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                 // was cut off by the cap, surface the truncation notice exactly
                 // once here — not per iteration in the stream loop above.
                 if TruncationNotice.shouldShow(maxTokensHit: maxTokensHit, turnEnding: true, willRetry: false) {
-                    appState.updateLastMessage(in: sessionId, content: TruncationNotice.text(maxTokens: turnMaxTokens(config)))
+                    appState.updateLastMessage(in: sessionId, content: TruncationNotice.text(cause: truncationCause ?? .maxTokens, maxTokens: turnMaxTokens(config)))
                 }
                 return
             }

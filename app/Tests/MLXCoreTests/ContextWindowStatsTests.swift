@@ -116,3 +116,36 @@ final class ContextWindowStatsTests: XCTestCase {
         XCTAssertEqual(stats(prompt: 4200, context: 4096).pressure, .over)
     }
 }
+
+// MARK: - Decode speed
+
+/// The popover's speed row. The FIGURE is the server's own
+/// `timings.predicted_per_second` (APIClient prefers it over wall-clock — a
+/// client cannot time our own stream: with tools present the server buffers for
+/// tool-call detection and every SSE delta lands at once, which read as 937
+/// tok/s on a 2B). These pin only the presentation: a rate we don't have must
+/// render as nothing rather than as zero.
+extension ContextWindowStatsTests {
+
+    func testSpeedTextIsAbsentUntilAReplyHasBeenTimed() {
+        XCTAssertNil(ContextWindowStats.speedText(nil))
+    }
+
+    /// A zero or negative rate is a MISSING measurement, not a slow model —
+    /// "0 tok/s" beside a model that just answered reads as a bug in the model.
+    func testANonPositiveRateReadsAsMissingNotAsZero() {
+        XCTAssertNil(ContextWindowStats.speedText(0))
+        XCTAssertNil(ContextWindowStats.speedText(-1))
+    }
+
+    func testSpeedTextRoundsToWholeTokensPerSecond() {
+        XCTAssertEqual(ContextWindowStats.speedText(96.1), "96 tok/s")
+        XCTAssertEqual(ContextWindowStats.speedText(67.5), "68 tok/s")
+    }
+
+    /// Sub-1 tok/s is a real reading on a huge model at long context, and
+    /// truncating it to "0 tok/s" would say the same thing as no measurement.
+    func testSubOneRateKeepsADecimalRatherThanCollapsingToZero() {
+        XCTAssertEqual(ContextWindowStats.speedText(0.4), "0.4 tok/s")
+    }
+}

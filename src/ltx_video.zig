@@ -84,11 +84,12 @@ pub const LtxConfig = struct {
 pub const Component = struct {
     map: std.StringHashMap(mlx.mlx_array),
     allocator: std.mem.Allocator,
-    // Runtime LoRA (non-owning; gen.VideoEngine owns the File and re-installs
-    // the pointer after every transformer swap). Checked by dQLin only — the
-    // DiT projections are the modules video LoRAs target.
-    lora: ?*const lora_mod.File = null,
-    lora_scale: f32 = 1.0,
+    // Runtime LoRA (non-owning; gen.VideoEngine owns the Stack and
+    // re-installs the pointer after every transformer swap). Checked by
+    // dQLin only — the DiT projections are the modules video LoRAs target.
+    // A Stack may hold several simultaneously-attached adapters; their
+    // deltas are summed (lora.deltaSum), never merged.
+    lora: ?*const lora_mod.Stack = null,
 
     pub fn deinit(self: *Component) void {
         var it = self.map.iterator();
@@ -1646,13 +1647,17 @@ fn dQLin(comp: *const Component, alloc: std.mem.Allocator, x: mlx.mlx_array, bas
     const bi = comp.get(bk) orelse return error.MissingDitWeight;
     var mm = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_quantized_matmul(&mm, x, wq, sc, bi, true, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(4), "affine", s));
-    if (loraRefFor(comp, base)) |ref| {
-        const d = try lora_mod.delta(x, ref, s);
-        defer _ = mlx.mlx_array_free(d);
-        var summed = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_add(&summed, mm, d, s));
-        _ = mlx.mlx_array_free(mm);
-        mm = summed;
+    if (comp.lora != null) {
+        var rbuf: [lora_mod.MAX_LORAS]lora_mod.Ref = undefined;
+        const refs = loraRefsFor(comp, base, &rbuf);
+        if (refs.len > 0) {
+            const d = try lora_mod.deltaSum(x, refs, s);
+            defer _ = mlx.mlx_array_free(d);
+            var summed = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_add(&summed, mm, d, s));
+            _ = mlx.mlx_array_free(mm);
+            mm = summed;
+        }
     }
     if (comp.get(lbk)) |lb| {
         var out = mlx.mlx_array_new();
@@ -1663,20 +1668,28 @@ fn dQLin(comp: *const Component, alloc: std.mem.Allocator, x: mlx.mlx_array, bas
     return mm;
 }
 
-/// LoRA adapter for a dQLin base key, or null. Adapter modules are keyed with
-/// wrapper prefixes stripped (`lora.parseKey` drops `transformer.` /
-/// `diffusion_model.`), so drop our `transformer.` prefix before matching;
-/// diffusers FF naming (`ff.net.0.proj` / `ff.net.2`) is accepted as an alias
-/// for this checkpoint's `ff.proj_in` / `ff.proj_out`.
-fn loraRefFor(comp: *const Component, base: []const u8) ?lora_mod.Ref {
-    const lf = comp.lora orelse return null;
+/// LoRA adapters for a dQLin base key, across every file in the attached
+/// Stack. Adapter modules are keyed with wrapper prefixes stripped
+/// (`lora.parseKey` drops `transformer.` / `diffusion_model.`), so drop our
+/// `transformer.` prefix before matching; diffusers FF naming
+/// (`ff.net.0.proj` / `ff.net.2`) is accepted as an alias for this
+/// checkpoint's `ff.proj_in` / `ff.proj_out`. Each file in the stack is
+/// tried under the primary name first, falling back to the FF alias for
+/// that same file — a file that doesn't have either is simply skipped, not
+/// an error (some LoRAs only retrain a subset of projections).
+fn loraRefsFor(comp: *const Component, base: []const u8, out: *[lora_mod.MAX_LORAS]lora_mod.Ref) []lora_mod.Ref {
+    const stack = comp.lora orelse return out[0..0];
     var mod = base;
     if (std.mem.startsWith(u8, mod, "transformer.")) mod = mod["transformer.".len..];
-    const e = lf.find(mod) orelse blk: {
-        var buf: [512]u8 = undefined;
-        break :blk lf.find(ffAlias(&buf, mod) orelse return null) orelse return null;
-    };
-    return .{ .at = e.at, .bt = e.bt, .scale = e.scale * comp.lora_scale };
+    var abuf: [512]u8 = undefined;
+    const alias = ffAlias(&abuf, mod);
+    var n: usize = 0;
+    for (stack.files[0..stack.count], stack.scales[0..stack.count]) |*f, user_scale| {
+        const e = f.find(mod) orelse (if (alias) |al| f.find(al) else null) orelse continue;
+        out[n] = .{ .at = e.at, .bt = e.bt, .scale = e.scale * user_scale };
+        n += 1;
+    }
+    return out[0..n];
 }
 
 /// Map between our FF projection names and diffusers' (both directions):
@@ -1695,12 +1708,15 @@ fn ffAlias(buf: []u8, mod: []const u8) ?[]const u8 {
     return null;
 }
 
-/// Count adapter entries in `lf` that target a projection present in this
-/// component — setLora uses it to reject wrong-architecture LoRA files.
-pub fn countLoraMatches(comp: *const Component, lf: *const lora_mod.File) u32 {
+/// Count adapter entries across every file in `stack` that target a
+/// projection present in this component — setLoras uses it to reject a
+/// stack where NOTHING matched (wrong architecture for every adapter).
+pub fn countLoraMatches(comp: *const Component, stack: *const lora_mod.Stack) u32 {
     var n: u32 = 0;
-    for (lf.entries) |*e| {
-        if (loraModulePresent(comp, e.module)) n += 1;
+    for (stack.files[0..stack.count]) |*f| {
+        for (f.entries) |*e| {
+            if (loraModulePresent(comp, e.module)) n += 1;
+        }
     }
     return n;
 }

@@ -172,23 +172,45 @@ else
 fi
 
 # ── 8: ONE shared header on every page ──────────────────────────────────────
-# Every page carries the same nav: version pill (= the CHANGELOG's newest
-# entry — catches stale-version drift at release time), a Tier list link,
-# and the Download CTA.
-CL_VER=$(grep -m1 '^## v' CHANGELOG.md | sed -E 's/^## (v[0-9.]+).*/\1/')
-if [ -n "$CL_VER" ]; then
+# Every page carries the same nav: an EMPTY version pill, a Tier list link, and
+# the Download CTA.
+#
+# The pill is empty in the markup on purpose. It used to be hardcoded and
+# checked against the CHANGELOG's newest entry here, which meant every release
+# had to rewrite 18 files and the guard sat red in between (it did, through
+# 26.8.1/2/3). assets/version.js now fills it from the latest GitHub release —
+# the same source the version-free Download CTA points at — so drift is
+# impossible by construction and the only thing left to guard is that nobody
+# pastes a literal version back in.
+for f in "$DOCS"/index.html "$DOCS"/*/index.html; do
+  page=$(basename "$(dirname "$f")")
+  check "$f" 'class="nav-ver"></span>' "$page: nav version pill (empty, filled at runtime)"
+  check "$f" 'assets/version.js'       "$page: nav version resolver script"
+  check "$f" 'class="nav-dl '          "$page: nav Download CTA"
+  check "$f" 'nav-dl-desktop"'         "$page: nav Download CTA (desktop variant)"
+  check "$f" 'class="nav-appstore"'    "$page: nav App Store CTA (mobile variant)"
+  check "$f" 'appstore.svg'            "$page: nav App Store badge asset ref"
+  check "$f" '>Tier list<'             "$page: nav Tier list link"
+  if grep -qE 'nav-ver">v?[0-9]' "$f"; then
+    fail "$page: version hardcoded in the nav pill — assets/version.js resolves it"
+  else
+    pass
+  fi
+done
+
+# The resolver itself: reads the repo's latest release, hides on failure rather
+# than showing a stale or wrong version, and caches so a visit doesn't burn
+# GitHub's 60/hour unauthenticated budget on every page view.
+VJS="$DOCS/assets/version.js"
+if [ -f "$VJS" ]; then
   pass
-  for f in "$DOCS"/index.html "$DOCS"/*/index.html; do
-    page=$(basename "$(dirname "$f")")
-    check "$f" "nav-ver\">$CL_VER<" "$page: nav version pill = CHANGELOG top ($CL_VER)"
-    check "$f" 'class="nav-dl '     "$page: nav Download CTA"
-    check "$f" 'nav-dl-desktop"'    "$page: nav Download CTA (desktop variant)"
-    check "$f" 'class="nav-appstore"' "$page: nav App Store CTA (mobile variant)"
-    check "$f" 'appstore.svg'       "$page: nav App Store badge asset ref"
-    check "$f" '>Tier list<'        "$page: nav Tier list link"
-  done
+  check "$VJS" 'releases/latest'   "version.js: reads the latest release"
+  check "$VJS" 'tag_name'          "version.js: takes the release tag"
+  check "$VJS" 'localStorage'      "version.js: caches the lookup"
+  check "$DOCS/assets/feature.css" '.nav-ver:empty' "feature.css: unresolved pill renders as nothing"
+  check "$DOCS/index.html"         '.nav-ver:empty' "index: unresolved pill renders as nothing"
 else
-  fail "could not read top version from CHANGELOG.md"
+  fail "version resolver missing ($VJS)"
 fi
 
 # ── 9: anchor links must land clear of the fixed 52px nav ───────────────────

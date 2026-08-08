@@ -51,6 +51,7 @@ test {
     _ = @import("ltx_video.zig");
     _ = @import("ltx_audio.zig");
     _ = @import("minimax_h3.zig");
+    _ = @import("minimax_h3_vision.zig");
     _ = @import("minimax_h3_vae.zig");
     _ = @import("minimax_h3_audio.zig");
     _ = @import("png.zig");
@@ -66,6 +67,7 @@ test {
     _ = @import("bake.zig");
     _ = @import("multipart.zig");
     _ = @import("gen.zig");
+    _ = @import("gen_sse.zig");
     _ = @import("ollama.zig");
     _ = @import("cli.zig");
     _ = @import("lan.zig");

@@ -93,6 +93,79 @@ fn dirModelTypeIs(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u
     return mt == .string and std.mem.eql(u8, mt.string, want);
 }
 
+/// The `chat_template` entry of tokenizer_config.json, as a string.
+///
+/// HF allows TWO shapes and we only handled one: a bare string, or a LIST of
+/// `{name, template}` objects (Mistral-7B-Instruct-v0.3 ships `default` +
+/// `tool_use`). Reading the list as `v.string` is not a graceful failure — it
+/// is a Zig union panic that kills the process at LOAD, so the checkpoint
+/// could not be served at all (live 2026-08-07: `access of union field
+/// 'string' while field 'array' is active`).
+///
+/// Selection follows transformers: the entry named "default", which is what
+/// `apply_chat_template` uses unless the caller names another. Falls back to
+/// the first entry when nothing is named "default", and returns null for any
+/// other shape so the caller drops to its chat_template.jinja / family
+/// fallback instead of panicking.
+fn chatTemplateFromValue(v: ?std.json.Value) ?[]const u8 {
+    const val = v orelse return null;
+    switch (val) {
+        .string => |s| return s,
+        .array => |arr| {
+            var first: ?[]const u8 = null;
+            for (arr.items) |entry| {
+                if (entry != .object) continue;
+                const tpl = entry.object.get("template") orelse continue;
+                if (tpl != .string) continue;
+                if (first == null) first = tpl.string;
+                const name = entry.object.get("name") orelse continue;
+                if (name == .string and std.mem.eql(u8, name.string, "default")) return tpl.string;
+            }
+            return first;
+        },
+        else => return null,
+    }
+}
+
+test "chat_template accepts HF's list-of-named-templates shape" {
+    // Mistral-7B-Instruct-v0.3 ships a LIST (`default` + `tool_use`). Reading
+    // it as `.string` panicked the process at load, so the checkpoint could
+    // not be served at all.
+    const a = std.testing.allocator;
+
+    {   // the shape that panicked: pick the entry named "default"
+        const json =
+            \\{"chat_template":[{"name":"tool_use","template":"TOOLS"},
+            \\{"name":"default","template":"PLAIN"}]}
+        ;
+        var p = try std.json.parseFromSlice(std.json.Value, a, json, .{});
+        defer p.deinit();
+        try std.testing.expectEqualStrings("PLAIN", chatTemplateFromValue(p.value.object.get("chat_template")).?);
+    }
+    {   // no "default" named: fall back to the first usable entry
+        const json = \\{"chat_template":[{"name":"tool_use","template":"TOOLS"}]}
+        ;
+        var p = try std.json.parseFromSlice(std.json.Value, a, json, .{});
+        defer p.deinit();
+        try std.testing.expectEqualStrings("TOOLS", chatTemplateFromValue(p.value.object.get("chat_template")).?);
+    }
+    {   // the ordinary string shape is untouched
+        const json = \\{"chat_template":"BARE"}
+        ;
+        var p = try std.json.parseFromSlice(std.json.Value, a, json, .{});
+        defer p.deinit();
+        try std.testing.expectEqualStrings("BARE", chatTemplateFromValue(p.value.object.get("chat_template")).?);
+    }
+    {   // junk shapes return null so the caller uses its jinja/family fallback
+        const json = \\{"chat_template":[{"name":"x"},{"nope":1}]}
+        ;
+        var p = try std.json.parseFromSlice(std.json.Value, a, json, .{});
+        defer p.deinit();
+        try std.testing.expect(chatTemplateFromValue(p.value.object.get("chat_template")) == null);
+    }
+    try std.testing.expect(chatTemplateFromValue(null) == null);
+}
+
 /// Load chat template configuration from tokenizer_config.json.
 pub fn loadChatConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !ChatConfig {
     const path = try std.fmt.allocPrint(allocator, "{s}/tokenizer_config.json", .{model_dir});
@@ -111,8 +184,8 @@ pub fn loadChatConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []con
 
     const root = parsed.value.object;
 
-    const chat_template: []const u8 = if (root.get("chat_template")) |v|
-        try allocator.dupe(u8, v.string)
+    const chat_template: []const u8 = if (chatTemplateFromValue(root.get("chat_template"))) |t|
+        try allocator.dupe(u8, t)
     else blk: {
         // Fall back to chat_template.jinja file (e.g. Qwen3.5 models)
         const jinja_path = try std.fmt.allocPrint(allocator, "{s}/chat_template.jinja", .{model_dir});
@@ -1035,10 +1108,53 @@ fn indexOfThinkOpenTag(text: []const u8, from: usize) ?TagAt {
 pub fn indexOfThinkCloseTag(text: []const u8, from: usize) ?TagAt {
     var i = from;
     while (std.mem.indexOfPos(u8, text, i, "</think")) |p| {
-        if (thinkCloseTagLenAt(text[p..])) |l| return .{ .pos = p, .len = l };
+        if (thinkCloseTagLenAt(text[p..])) |l| {
+            if (!thinkCloseIsToolCallPayload(text, p)) return .{ .pos = p, .len = l };
+        }
         i = p + "</think".len;
     }
     return null;
+}
+
+/// Whether a `</think>` at `pos` is an ARGUMENT VALUE rather than a block close.
+///
+/// The think split runs before tool parse, and this is the shared close-tag
+/// scan every surface uses — so a model writing about its own prompt format
+/// (`<arg_value>…closes a thought with </think>…</arg_value>`) had the split cut
+/// straight through the call, losing it entirely and leaking the fragments.
+/// Agent traffic writes files about prompts.
+///
+/// Payload ⟺ the nearest tool opener before `pos` is still OPEN there (no
+/// `</tool_call` between it and `pos`) AND the block does close afterwards.
+/// Both halves are load-bearing:
+///   • without the first, a call the model emitted and CLOSED inside its
+///     thought would make the real `</think>` after it look like payload;
+///   • without the second, an unclosed opener inside a thought (the leaked-
+///     markup case, which `trimLeakedToolMarkup` handles downstream) would
+///     swallow the answer that follows the close.
+fn thinkCloseIsToolCallPayload(text: []const u8, pos: usize) bool {
+    // `streamThinkGate2` calls the close scan once per TOKEN on a growing
+    // buffer, so the common case — text with no tool markup at all — must cost
+    // one substring scan, not a walk per opener spelling. Both spellings share
+    // this needle.
+    if (std.mem.indexOf(u8, text[0..pos], "tool_call") == null) return false;
+    // Nearest `<tool_call`-family opener before `pos`. Only this family is
+    // considered: it is the one whose bodies carry free-form argument text.
+    var open: ?usize = null;
+    for ([_][]const u8{ "<tool_call", "<|tool_call" }) |m| {
+        var i: usize = 0;
+        while (std.mem.indexOfPos(u8, text, i, m)) |p| {
+            if (p >= pos) break;
+            if (open == null or p > open.?) open = p;
+            i = p + 1;
+        }
+    }
+    const o = open orelse return false;
+    if (std.mem.indexOfPos(u8, text, o, "</tool_call")) |c| {
+        if (c < pos) return false; // that call already closed — a real block close
+        return true;
+    }
+    return false; // never closes — treat as leaked markup, not payload
 }
 
 /// Length of the trailing bytes of `buf` that could still GROW into a think
@@ -1659,6 +1775,137 @@ pub fn streamThinkGate(buf: []const u8, enable_thinking: bool, think_closed: boo
 /// visible answer (live 2026-08-04). It can only ever ADD a hold: when
 /// thinking is on `enable_thinking` already held, and once `think_closed` the
 /// term is dropped so the answer after the block still flushes.
+/// Memoized marker scan for the streaming think gate, owned BESIDE the stream
+/// buffer and reset with it.
+///
+/// Without it `streamThinkGate2` re-scans the whole accumulated buffer on every
+/// token for as long as thinking markup is present and no close has arrived —
+/// O(buffer) per token, O(n²) over a reasoning block. Measured on a hermetic
+/// 4000-token stream growing to 113 KB: 47.99 µs/token with no close in the
+/// buffer (every scan runs to the end), 16.98 µs/token with a close near the
+/// front (the close scan stops early). ~0.3% of a 15 ms/token model, ~1% at
+/// 5 ms/token, and it GROWS with the thought.
+///
+/// Exactness rests on one property of the marker grammar: `tagSuffixChar`
+/// excludes `<`, so every recognized marker contains exactly ONE `<`, at its
+/// start. A marker straddling the scanned/unscanned boundary must therefore
+/// begin at the LAST `<` in the buffer — and if that `<` cannot still grow into
+/// a marker, nothing straddles the boundary at all. So the resume point is
+/// exact and bounded, with no overlap constant to get wrong.
+pub const ThinkScan = struct {
+    /// Bytes already examined. Never trusted when the buffer is SHORTER than
+    /// this (the loop reset the buffer without resetting the scan).
+    checked_upto: usize = 0,
+    /// Index of the last `<` seen, or null. The only position a marker can
+    /// straddle the boundary from.
+    last_lt: ?usize = null,
+    saw_channel_thought: bool = false,
+    saw_open: bool = false,
+    saw_channel_close: bool = false,
+    /// Tool markup anywhere in the buffer. This is what makes a found close
+    /// UNSTABLE and therefore un-latchable: `thinkCloseIsToolCallPayload`
+    /// reclassifies a close as an argument value once a `</tool_call` arrives
+    /// AFTER it, so a close that was real at token N is payload at token N+k.
+    /// With no tool markup the close is stable and latching is exact.
+    saw_tool_marker: bool = false,
+    /// First real close tag, once found and stable.
+    close: ?TagAt = null,
+    /// Bytes examined by the last call, INCLUDING the exact full re-scan the
+    /// tool-markup case falls back to. Test-visible: the invariant is that this
+    /// stays FLAT as the buffer grows for traffic with no tool markup — which
+    /// is the arm the 47.99 µs/token bench measured.
+    last_scan_span: usize = 0,
+
+    /// Longest plain substring needle minus one — the overlap a windowed
+    /// substring search needs so a needle split across two arrivals is caught.
+    /// `<|channel>thought` is the longest at 17.
+    const substr_overlap: usize = 16;
+
+    pub fn reset(self: *ThinkScan) void {
+        self.* = .{};
+    }
+
+    /// Where the next scan must start so no marker spanning the boundary is
+    /// missed: the last `<` if it can still grow into a tag (see the type's
+    /// doc comment for why no earlier `<` can), and far enough back for the
+    /// plain substring needles either way.
+    fn resumeFrom(self: *const ThinkScan, buf: []const u8) usize {
+        const upto = @min(self.checked_upto, buf.len);
+        const substr_from = upto -| substr_overlap;
+        const lt = self.last_lt orelse return substr_from;
+        if (lt >= upto) return substr_from;
+        const tail = buf[lt..upto];
+        const growing = isPartialSuffixedTag(tail, "<think") or
+            isPartialSuffixedTag(tail, "</think") or
+            (tail.len < "<|channel>thought".len and std.mem.startsWith(u8, "<|channel>thought", tail)) or
+            (tail.len < "<channel|>".len and std.mem.startsWith(u8, "<channel|>", tail));
+        return if (growing) @min(lt, substr_from) else substr_from;
+    }
+
+    fn advance(self: *ThinkScan, buf: []const u8) void {
+        if (buf.len < self.checked_upto) self.reset(); // buffer was cleared under us
+        if (buf.len == self.checked_upto and self.checked_upto != 0) {
+            self.last_scan_span = 0;
+        } else {
+            const from = self.resumeFrom(buf);
+            self.last_scan_span = buf.len - from;
+            const win = buf[from..];
+            if (std.mem.lastIndexOfScalar(u8, win, '<')) |rel| self.last_lt = from + rel;
+            if (!self.saw_channel_thought and std.mem.indexOf(u8, win, "<|channel>thought") != null)
+                self.saw_channel_thought = true;
+            if (!self.saw_channel_close and std.mem.indexOf(u8, win, "<channel|>") != null)
+                self.saw_channel_close = true;
+            if (!self.saw_tool_marker and std.mem.indexOf(u8, win, "tool_call") != null)
+                self.saw_tool_marker = true;
+            // The open scan takes the FULL buffer with a start offset: it
+            // consults nothing before the match, but a windowed slice would
+            // shift the reported position. Monotone — a complete opener stays
+            // one — so latching is exact.
+            if (!self.saw_open and indexOfThinkOpenTag(buf, from) != null) self.saw_open = true;
+            if (self.close == null and !self.saw_tool_marker)
+                self.close = indexOfThinkCloseTag(buf, from);
+            self.checked_upto = buf.len;
+        }
+        if (self.saw_tool_marker) {
+            // Exact, and only here: the payload classification looks FORWARD
+            // past the close for a `</tool_call`, so it must be recomputed on
+            // the whole buffer. The caller latches `think_closed` right after a
+            // split, so this runs for a handful of tokens, not a whole block.
+            self.close = indexOfThinkCloseTag(buf, 0);
+            self.last_scan_span = buf.len;
+        }
+    }
+};
+
+/// `streamThinkGate2` with the per-token rescan memoized. Byte-identical
+/// verdicts — pinned prefix-by-prefix against the fresh gate over a corpus that
+/// includes every marker family, a close buried in a tool argument, and a
+/// suffix longer than the partial-scan's tail window.
+pub fn streamThinkGateScan(
+    buf: []const u8,
+    enable_thinking: bool,
+    think_closed: bool,
+    prompt_opened_think: bool,
+    scan: *ThinkScan,
+) StreamThinkGate {
+    {
+        const ihead = inklingStripMessageHead(buf);
+        if (std.mem.startsWith(u8, ihead, INKLING_TEXT_TAG)) return .flush_text;
+        if (std.mem.startsWith(u8, ihead, INKLING_THINKING_TAG)) {
+            return if (std.mem.indexOf(u8, ihead, INKLING_END_TAG) != null) .split_think else .hold_thinking;
+        }
+    }
+    scan.advance(buf);
+    const has_thinking = ((enable_thinking or prompt_opened_think) and !think_closed) or
+        scan.saw_channel_thought or
+        scan.saw_open or
+        (std.mem.startsWith(u8, buf, "<|channel>") and buf.len < 18) or
+        (std.mem.startsWith(u8, buf, "<think") and buf.len < 7) or
+        endsWithPartialThinkOpen(buf);
+    if (!has_thinking) return .flush_text;
+    return if (scan.saw_channel_close or scan.close != null) .split_think else .hold_thinking;
+}
+
 pub fn streamThinkGate2(buf: []const u8, enable_thinking: bool, think_closed: bool, prompt_opened_think: bool) StreamThinkGate {
     // Inkling channels decide early: every marker is a SINGLE special token,
     // so a leading <|content_text|> is a whole marker (the flush path's
@@ -4951,6 +5198,30 @@ test "stripThinkBlock removes think tags" {
 
 test "stripThinkBlock returns empty for open think tag" {
     try testing.expectEqualStrings("", stripThinkBlock("<think>still thinking..."));
+}
+
+test "indexOfThinkCloseTag: a close inside an OPEN tool call is argument payload, not a block close" {
+    // Agent traffic writes files about prompts, and the think split runs
+    // BEFORE the tool parse — so this cut used to destroy the whole call.
+    const payload = "<tool_call>write\n<arg_key>content</arg_key>\n" ++
+        "<arg_value>a thought ends with </think> here</arg_value>\n</tool_call>";
+    try testing.expect(indexOfThinkCloseTag(payload, 0) == null);
+
+    // A call the model emitted and CLOSED inside its thought: the `</think>`
+    // after it is a REAL close and the answer stays content.
+    const in_thought = "<think>let me try <tool_call>read</tool_call> hmm</think>The answer is 4.";
+    const c = indexOfThinkCloseTag(in_thought, 0) orelse return error.MissingClose;
+    try testing.expectEqualStrings("The answer is 4.", in_thought[c.pos + c.len ..]);
+    try testing.expectEqualStrings("The answer is 4.", stripThinkBlock(in_thought));
+
+    // An opener that NEVER closes is leaked markup, not a payload container:
+    // the close still ends the block, and trimLeakedToolMarkup takes the tail.
+    const unclosed = "<think>starting <tool_call>partial</think>Answer.";
+    try testing.expect(indexOfThinkCloseTag(unclosed, 0) != null);
+
+    // Ordinary shapes are untouched.
+    try testing.expect(indexOfThinkCloseTag("<think>r</think>a", 0).?.pos == 8);
+    try testing.expect(indexOfThinkCloseTag("<think>r</think>a<tool_call>x</tool_call>", 0).?.pos == 8);
 }
 
 test "stripThinkBlock returns text when no think tags" {
@@ -10083,4 +10354,141 @@ test "renderChatTemplate: dsv4 template renders tools + DSML history + tool_resu
         try testing.expect(std.mem.startsWith(u8, rendered, "<｜begin▁of▁sentence｜>\n\n## Tools"));
         try testing.expect(std.mem.indexOf(u8, rendered, "tool name and parameter schemas to invoke tool calls.\n<｜User｜>hi") != null);
     }
+}
+
+test "ThinkScan: incremental gate matches the fresh gate at every prefix length" {
+    // The gate is O(buffer) per token today (measured 47.99 us/token at 113 KB
+    // with no close in the buffer), i.e. O(n^2) over a reasoning block. A
+    // cursor makes it O(new bytes) — but only if it is EXACT, and the failure
+    // a naive cursor introduces is a marker split across two token arrivals.
+    // Feeding prefix-by-prefix IS that case, at every possible split point.
+    const corpus = [_][]const u8{
+        "plain visible prose with no markup at all",
+        "<think>reasoning here</think>the answer",
+        "<think:opensource>hy3 reasoning</think:opensource>answer",
+        // A </think> inside a tool ARGUMENT is payload, not a block close.
+        "<think>plan<tool_call>f<arg_key>k</arg_key><arg_value>closes with </think> inside</arg_value></tool_call>done</think>visible",
+        "<|channel>thought hidden<channel|>visible",
+        "prose where a < b and nothing else happens",
+        "trailing partial opener at the end <thi",
+        "trailing partial close </thin",
+        // A suffix longer than the 32-byte tail window the partial-scan uses:
+        // the fresh scan still recognizes it, so the cursor must too.
+        "<think>x</think:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa>tail",
+        "<|message_thinking|>inkling thought<|end_message|>after",
+        "<|message_text|>inkling visible",
+    };
+    const flags = [_][2]bool{ .{ true, false }, .{ false, false }, .{ false, true } };
+    for (corpus) |full| {
+        for (flags) |f| {
+            const enable_thinking = f[0];
+            const prompt_opened = f[1];
+            var scan: ThinkScan = .{};
+            var n: usize = 0;
+            while (n <= full.len) : (n += 1) {
+                const buf = full[0..n];
+                const want = streamThinkGate2(buf, enable_thinking, false, prompt_opened);
+                const got = streamThinkGateScan(buf, enable_thinking, false, prompt_opened, &scan);
+                if (want != got) {
+                    std.debug.print("prefix {d} of \"{s}\" (think={}, opened={}): {any} != {any}\n", .{ n, full, enable_thinking, prompt_opened, got, want });
+                    return error.IncrementalGateDiverged;
+                }
+            }
+        }
+    }
+}
+
+test "ThinkScan: per-token work is FLAT in buffer size, not linear" {
+    // The whole point. A smaller constant is not the fix — the re-examined
+    // span must not grow with the buffer, or a 32K-token thought pays 8x what
+    // the 113 KB bench measured.
+    var scan: ThinkScan = .{};
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(testing.allocator);
+    var max_span: usize = 0;
+    var i: usize = 0;
+    while (i < 4000) : (i += 1) {
+        // A think block that never closes — the expensive arm of the bench.
+        try buf.appendSlice(testing.allocator, if (i == 0) "<think>" else "token words and more ");
+        _ = streamThinkGateScan(buf.items, true, false, false, &scan);
+        if (i > 0 and scan.last_scan_span > max_span) max_span = scan.last_scan_span;
+    }
+    try testing.expect(buf.items.len > 60_000);
+    // Bounded by one token's bytes plus the trailing partial-marker candidate.
+    try testing.expect(max_span <= 64);
+
+    // A growing partial marker at the tail is re-examined, and only it.
+    var scan2: ThinkScan = .{};
+    var buf2 = std.ArrayList(u8).empty;
+    defer buf2.deinit(testing.allocator);
+    try buf2.appendSlice(testing.allocator, "<think>");
+    var j: usize = 0;
+    while (j < 500) : (j += 1) try buf2.appendSlice(testing.allocator, "filler ");
+    _ = streamThinkGateScan(buf2.items, true, false, false, &scan2);
+    for ("</think:opensou") |c| {
+        try buf2.append(testing.allocator, c);
+        _ = streamThinkGateScan(buf2.items, true, false, false, &scan2);
+        try testing.expect(scan2.last_scan_span <= 64);
+    }
+}
+
+test "ThinkScan: reset() re-arms the cursor when the stream buffer is cleared" {
+    // The buffer is NOT append-only — the stream loop trims and resets it at
+    // every emit. A stale cursor then points past the end or into different
+    // bytes, which is the second failure mode a naive cursor introduces.
+    var scan: ThinkScan = .{};
+    const first = "<think>reasoning</think>";
+    try testing.expectEqual(StreamThinkGate.split_think, streamThinkGateScan(first, true, false, false, &scan));
+    scan.reset();
+    // Same scan struct, fresh (shorter) buffer: must not carry the old close.
+    try testing.expectEqual(StreamThinkGate.hold_thinking, streamThinkGateScan("<think>more", true, false, false, &scan));
+}
+
+test "the streaming handlers route the think gate through a persistent ThinkScan" {
+    // A memoized scan nobody threads through is a silent no-op that is
+    // output-identical to the unmemoized gate — the exact shape of the
+    // hardcoded-use_drafter=false class. Both streaming surfaces must hold a
+    // scan beside their buffer AND reset it where they clear that buffer.
+    // Needles are ++-split so this test's own source cannot satisfy the scan.
+    const src = @embedFile("server.zig");
+    const call = "streamThinkGateScan(buf, enable_thinking, think_closed, prompt_opened_think, &think" ++ "_scan)";
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, src, call));
+    // The unmemoized 4-arg gate must be GONE from the streaming paths.
+    const old = "chat_mod.streamThinkGate2(" ++ "buf,";
+    try testing.expect(std.mem.indexOf(u8, src, old) == null);
+    // One reset per buffer clear in those handlers.
+    const reset = "think_scan" ++ ".reset();";
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, src, reset));
+}
+
+test "bench: streaming think gate scans BYTES, memoized vs fresh" {
+    // The 5.10 acceptance bar is that per-token work is FLAT in buffer size,
+    // not merely smaller. Wall clock is unavailable in a hermetic test under
+    // Zig 0.17 (clocks live under std.Io) and would be noise anyway — bytes
+    // examined is the thing that was quadratic, and it is deterministic.
+    // Mirrors the 4b.4 harness: 4000 tokens growing to ~104 KB.
+    const a = testing.allocator;
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(a);
+    var scan: ThinkScan = .{};
+    try buf.appendSlice(a, "<think>");
+    var memo_bytes: u64 = 0;
+    var fresh_bytes: u64 = 0;
+    var i: usize = 0;
+    while (i < 4000) : (i += 1) {
+        try buf.appendSlice(a, "some reasoning words here ");
+        const g = streamThinkGateScan(buf.items, true, false, false, &scan);
+        try testing.expectEqual(StreamThinkGate.hold_thinking, g);
+        memo_bytes += scan.last_scan_span;
+        // What the unmemoized gate re-reads every token: the whole buffer, and
+        // more than once (open scan + close scan + two substring scans).
+        fresh_bytes += buf.items.len;
+    }
+    std.debug.print(
+        "[think-gate] {d} tokens to {d} KB: fresh >= {d} KB scanned, memoized {d} KB ({d}x)\n",
+        .{ 4000, buf.items.len / 1024, fresh_bytes / 1024, memo_bytes / 1024, fresh_bytes / @max(memo_bytes, 1) },
+    );
+    // Linear-in-total, not quadratic: the memoized scan reads each byte a
+    // bounded number of times.
+    try testing.expect(memo_bytes < buf.items.len * 4);
 }

@@ -364,3 +364,464 @@ empty content and no `tool_calls`. Its template also `raise_exception`s on
 tool-call `arguments` passed as a JSON STRING, which is what
 `serializeMessagesJson` emits — the Inkling rule in reverse, and a raise is the
 silent-fallback class.
+
+## The hybrid layer-init path demanded scales, so it could not load its own arch dense (2026-08-04)
+
+`mlx-community/LFM2.5-2.6B-bf16` refused to load, one line past the prefix
+probe that fixed its 8-bit sibling:
+
+```
+MISSING WEIGHT: language_model.model.layers.0.conv.in_proj.scales
+```
+
+The checkpoint is dense bf16 — no `.scales`, no `.biases`, anywhere. 266
+tensors, all present.
+
+`initHybridLayers` fetched all 17 of its scales tensors with `getLayerWeight`,
+the MANDATORY getter whose miss is `log.err` + `unreachable`. The other two
+layer-init paths never did: `initStandardLayers` and `initMoeLayers` both read
+scales with `getLayerWeightOpt(...) orelse mlx_array_new()`, and `qmatmulBits`
+has had a plain-`mlx_matmul` arm on null-ctx scales since the Unsloth Dynamic
+mixed checkpoints (which leave a SUBSET of layers unquantized — so "the config
+declares no quantization" is not the right gate either; absence is per-tensor).
+The hybrid path was simply written against quantized checkpoints and never
+revisited, which is invisible for as long as every published checkpoint of
+that arch is quantized.
+
+Two halves to the fix, and the second is the one that would have produced
+silent garbage instead of an honest abort:
+
+- scales fetch through `getLayerScaleOpt` (absent ⇒ null-ctx);
+- every weight a matmul CONTRACTS gets `maybeTransposeForBf16`, because the
+  dense arm expects `[in, out]` while the checkpoint stores `[out, in]`. In a
+  hybrid layer that is in_proj/out_proj (gated conv), q/k/v/o, mamba2's
+  in_proj/out_proj, the simple MLP's up/down and the LFM2 SwiGLU's w1/w2/w3 —
+  and NOT `conv.conv.weight` (depthwise kernel, read by `conv1dWithCache`) or
+  any SSM state tensor (`A_log`, `D`, `dt_bias`). Transposing those would
+  either crash in the conv or quietly compute the wrong thing.
+
+`initHybridLayers` now returns `owned_bf16` like its two siblings, wired into
+the same `moe_owned_bf16` list `Transformer.deinit` frees — a transposed array
+is a NEW array, and the load path is the only place that can hand it to the
+teardown.
+
+Guards, both proven red-on-revert:
+
+- a synthetic 2-layer dense lfm2 `Weights` map through `initHybridLayers`,
+  asserting null-ctx scales, `[in, out]` on the matmul operands and an
+  UNTOUCHED conv kernel (instance);
+- a source scan over every `.scales")` fetch in transformer.zig rejecting the
+  mandatory getter (class) — a new arch arm that reaches for scales the same
+  way breaks dense checkpoints of that arch, and a quantized checkpoint of the
+  same arch would pass either way.
+
+Live after the fix: bf16 82.6 tok/s decode, 8-bit 148, nvfp4 247 on a 128 GB
+M-series; `test_hybrid_reuse_equivalence.sh` green on the bf16 (warm reuse
+13.3x, byte-identical) and unchanged on the 8-bit.
+
+---
+
+
+## An fp override INSIDE the fp family is invisible to a scales-dtype rule (2026-08-05)
+
+`LiquidAI/LFM2.5-2.6B-MLX/mxfp4` killed the server on its first request:
+
+```
+MLX error: [dequantize] Shape of scales does not match the matrix given the
+quantization parameters. Provided matrix of shape (1,512) and scales of shape (1,64).
+```
+
+Its config declares a model-wide mode AND a per-tensor override:
+
+```json
+"quantization": { "group_size": 32, "bits": 4, "mode": "mxfp4",
+                  "model.embed_tokens": { "group_size": 32, "bits": 8, "mode": "mxfp8" } }
+```
+
+`computeQuantParams` resolves per weight off the SCALES DTYPE — uint8 ⇒ the
+config's fp mode, float ⇒ affine with (bits, gs) solved from the activation's
+inner dim. That rule was written for the mixed shape that existed at the time:
+an *affine* override inside an *fp* model, where the two are told apart by
+their scales (bf16 + biases vs uint8, bias-less). Here BOTH sides are fp —
+MXFP4 and MXFP8 scales are the same uint8 E8M0 byte — so the dtype says
+nothing, the embedding resolved at the model-wide 4 bits, and `mlx_dequantize`
+rejected the shapes. An MLX error is not a Zig error: one request, whole
+process gone. The shape in the message is the GATHERED row (`embedding()` takes
+rows before dequantizing), which is why it reads (1,512) rather than the
+table's [128000, 512].
+
+The geometry states the answer exactly, so `fpParamsFromGeometry` solves it the
+same way the affine arm already solves off-config sidecar quants: a row holds
+`w_cols * 32` packed bits over `in_dim` values ⇒ bits; `s_cols` scales cover
+them ⇒ group size. For the embedding that is `512*32/2048 = 8` bits and
+`2048/64 = 32`; for every linear in the same file, `256*32/2048 = 4` and 32.
+
+Two things keep it conservative:
+
+- it returns **null when the solve AGREES with the config**, so a consistent
+  checkpoint resolves byte-for-byte as it did before this existed (nvfp4 and
+  affine checkpoints re-smoked: unchanged);
+- the mode comes from `fpQuantModeFor`, and each fp format DEFINES its block
+  size (MXFP8/MXFP4 = 32, NVFP4 = 16), so the solved pair names exactly one of
+  them. A pair matching none returns null — the checkpoint's own declaration
+  stands and a genuinely broken file still fails honestly, rather than being
+  relabelled into a mode we invented for it.
+
+Live: mxfp4 serves at 239 tok/s, coherent, alongside the 4-bit variant of the
+same repo (234). Guard: the `computeQuantParams` fp-override test, which pins
+the override, the untouched sibling linear, an nvfp4 model, an unmappable
+geometry and the no-hint path.
+
+## The H3 `<Picture i>` splice: a faithful port that made the model worse (2026-08-05)
+
+MiniMax-H3's reference (`comfy/text_encoders/minimax.py`) splices every fl2va
+keyframe into the Qwen3-VL conditioning as `<Picture i>: <vision block>`, on top
+of conditioning through its VAE latent. Our port had shipped with only the VAE
+path and a `KNOWN DEVIATION` comment. Closing that deviation was supposed to
+improve keyframe fidelity on a checkpoint already on disk.
+
+It inverted it.
+
+### The measurement
+
+Same seed, 256px, 12 steps, `fast: false`, conditioned on a hard 20/235
+left/right split; the numbers are frame 0's left and right half means.
+
+| arm | frame 0 | delta |
+|---|---|---|
+| vision blocks OFF (pre-change) | 16.1 / 231.4 | **+215** |
+| ON, plain 1-D rope | 43.0 / 119.5 | +77 |
+| ON, interleaved mRoPE, no DeepStack | 48.5 / 105.2 | +57 |
+| ON, mRoPE + DeepStack | 150.6 / 53.0 | **-98, INVERTED** |
+
+Turning off EITHER contributor restores the correct polarity. That pattern is
+the whole diagnosis: if one component were broken, disabling the OTHER would not
+help. It is interference.
+
+### The port is not the bug, and proving that took the right instrument
+
+Everything was pinned against ComfyUI's own output before concluding anything:
+patch order (`cos 1.000000`), the tower (`cos 0.999987` merged, ~0.99999 on all
+three DeepStack taps), the mRoPE position ids (exact, including row-index-
+weighted checksums), the interleaved-mRoPE axis map, and the vision delimiter
+ids against H3's actual vocab.
+
+**The instrument that was missing was scale.** A cosine is scale-invariant, and
+a tower whose features came out 40x too large would have scored a perfect 1.0
+while destroying every sequence it was spliced into. Adding `rms_ratio` to the
+parity test answered the real question: `1.0000`.
+
+Which surfaced the actual mechanism. The reference's own merged vision rows
+carry a norm of **61.0** against **1.49** for a token embedding — 41x. Qwen's
+per-layer RMSNorm absorbs most of that on the way into attention, but the
+RESIDUAL stream keeps it, so 64 vision rows dominate a 9-token prompt's
+contribution to what the DiT receives as context. On fl2va that conditioning has
+nothing to add: the keyframe is ALREADY pinned by its VAE cond rows, which is
+why the un-spliced arm reproduces the input almost exactly (16/231 vs 20/235).
+The second path is not extra information, it is a competing one.
+
+### What shipped
+
+Default OFF for fl2va (`MINIMAX_H3_VISION_BLOCKS=1` re-enables for A/Bs), ON for
+ref2va — where a reference image has no cond row to compete with and the prompt
+ADDRESSES it as `<Picture i>`, so the tower is the entire mechanism rather than a
+second opinion.
+
+**The rule: a reference implementation is a spec for what to build, not a
+promise that turning it on helps your checkpoint.** The deviation comment was
+right to exist; what it needed was a measurement, not a fix.
+
+Bisect arms are kept in-tree (`MINIMAX_H3_VISION_BLOCKS`,
+`MINIMAX_H3_VISION_MROPE`, `MINIMAX_H3_VISION_DEEPSTACK`) because the three-way
+split above is what made the interference legible, and any future attempt to
+turn this back on will need exactly the same three.
+
+---
+
+## H3 ref2va: two partitions, one file layout, and a cond stream ordered by the layout (2026-08-05)
+
+Ref2VA is MiniMax-H3's reference-conditioning checkpoint: up to 9 images, 3
+clips and 3 audio references that the generation follows for character, style
+and scene continuity. Landing it turned up three classes worth writing down.
+
+### The two partitions are indistinguishable from their files
+
+FL2VA and REF2VA share the text encoder, both VAEs, the tokenizer and every
+geometry number. The Comfy-Org repo ships one text-encoder file that serves
+both. Only the DiT weights differ — and a DiT does not announce what it was
+trained for. So an FL2VA pack handed `ref_images` would load, run, generate a
+perfectly good clip, and ignore every reference the user attached.
+
+The only honest discriminator is the task list our own converter writes into
+`config.json` (`["t2va","ref2va"]` vs `["t2va","fl2va"]`), read once at engine
+load (`gen.h3ConfigDeclaresRef2va`). Absent, malformed or wrong-typed reads as
+NOT ref2va: a pack that cannot say it supports references must not be handed
+them. The server 400s by name; the app's preset carries `supportsReferences`
+through the shared `minimaxH3Preset` factory so the two FL2VA presets cannot
+drift into claiming it; and `requestBody` gates the FIELDS on it rather than
+only the controls — hiding a control is not the same as not sending its field,
+which is the class that once made every H3 request carry `pipeline` and 400.
+
+The integration script reads the same list to pick which half of its assertions
+to run. Asserting fl2va keyframe adherence against a REF2VA DiT would be a
+checkpoint expectation in a server test's clothes.
+
+### The cond stream is ordered by the LAYOUT, not by the request
+
+`PackedLayout` fills its `img_update` / `audio_update` false rows in SEGMENT
+order — keyframe conds, then each reference block in resolver order, then the
+target — and the forward drops the concatenated condition rows straight into
+them. Assemble those rows in REQUEST order instead and every reference lands on
+the wrong block's positions: the model conditions on a smear, the generation
+succeeds, and nothing reports it.
+
+The ordinals are a contract with the checkpoint for the same reason. The prompt
+refers to `<Picture 2>`, and a video's soundtrack consumes an `<Audio j>`
+ordinal emitted BEFORE its own `<Video k>` — so one soundtracked clip plus one
+standalone audio makes the standalone `<Audio 2>`, not `<Audio 1>`.
+
+One function decides order and ordinals (`resolveRefs`); the DiT block is
+DERIVED from a resolved reference through the same function `resolveRefs` itself
+uses (`refBlockFor`), so a second hand-rolled mapping cannot drift from it —
+the class that put the dsv4 spec exclusion in three places.
+
+And the ENGINE consumes that decision rather than re-deriving it. That is forced
+rather than chosen: a reference's canvas comes OUT of the resolver, and the
+server has no image resampler — it resizes by decoding AT a size. So the caller
+must resolve before it can decode, which makes the caller the only place the
+decision can live. It is also why each visual reference carries two decodes: one
+at the VAE canvas for the DiT payload, one at `h3v.fitCanvas` of it for the
+vision tower.
+
+Two details that look like oversights and are not: audio condition rows ride in
+CLEAN (`AUDIO_COND_TIMESTEP` is 1.0 and the reference only augments below 1.0,
+so no noise is ever drawn), and vision blocks are ON for references while they
+are OFF for fl2va keyframes — a reference has no cond row competing with the
+tower, and the prompt addresses it by name.
+
+### The upstream layout was not what the driver assumed
+
+`tests/fetch_convert_minimax_h3_ref2va.py` had been written ahead of the
+release. Two of its assumptions were wrong, and both are the kind that read as
+"upstream did not publish this":
+
+* the Comfy-Org repo has **no `split_files/` prefix** — the paths are
+  `diffusion_models/`, `text_encoders/`, `vae/`;
+* MiniMaxAI's tree is spelled **`Ref2VA/`**, not `REF2VA/`.
+
+A repo listing settles both in seconds and is the right first move before
+concluding a file is unpublished — **but the listing has to be read
+case-INSENSITIVELY.** A `f.startswith("REF2VA")` filter over the same listing
+returned nothing and produced a confident "upstream publishes no REF2VA tree,
+so the partitions must share FL2VA's tokenizer". The conclusion happened to be
+right — `Ref2VA/processor/tokenizer.json` and `chat_template.json` are
+byte-identical to FL2VA's (sha256 a5d85b6d… / 5c72a170…) — which is exactly
+what makes this the dangerous shape: a wrong premise that a correct-looking
+result never contradicts. Hash the two files; do not infer identity from an
+absence you did not actually observe. The driver now also takes `--reuse-from
+<pack>` and CLONES the shared text encoder and both VAEs from an
+already-converted pack (APFS `cp -c`: instant, no extra space), so a second
+partition is one 66 GB download and one conversion instead of two — 21 minutes
+wall clock instead of hours. Copying a proven shard is also the CORRECT move
+rather than merely the fast one: reconversion is not byte-stable across
+converter sessions (the DSV4 mirror round measured 59/149 tensors drifting at
+rounding level).
+
+One ordering bug fell out of the same work: the converter checked its SOURCE
+before its destination, so every resumed run failed on the shard it had already
+finished — the driver deletes each source once converted, by design.
+
+## H3 length planning: a stale cap, a borrowed memory model, and what actually bounds a clip (2026-08-05)
+
+Asked whether the app exposes what MiniMax-H3 supports, three answers came back
+and only one of them was "yes".
+
+**Resolutions: complete.** The card states short side 768 and ratios "21:9,
+16:9, 4:3, 1:1, 3:4, 9:16"; `h3Resolutions` carries all six plus our own
+sub-native 960x544 long-form canvas. The only missing tier is 2K, which needs
+H3-Regenerate-2K — a checkpoint we have not converted.
+
+**Steps: MiniMax publishes nothing.** No default, no range, no maximum; the
+reference Comfy node leaves it to the KSampler. So the range was ours and had
+never been said out loud: the slider was `4...50` with LTX's help text ("LTX runs
+well from ~8") rendered on H3, where 8 steps is below anything we have a verdict
+on and — worse — below the point where the fast recipe's warmup and tail windows
+cover the whole schedule, so those runs pay full price per step while looking
+like the cheap option. Now `stepsRange` / `stepsHelp` are per preset, 16...50 on
+H3.
+
+**Frames: we were short of the model.** MiniMax states 4-15 s at 24 fps; the
+ladder is 17k+5, so 15 s is 362 frames. The picker stopped at 209 — the rap
+demo's length, the longest clip we had shipped a verdict on — behind:
+
+```
+// Trained range is ~124-362 (reference tooltip); 209 is our own
+// validated ceiling (the rap demo), not the untested-by-us 362.
+```
+
+which `MediaGenServiceTests` had already disproved in a comment of its own:
+*"Field measurement on an M5 Max (2026-08-04, our engine): 362 frames — the top
+of the 17k+5 ladder — in ONE generation at 139.6 s/step"*. A cap standing in for
+"we have not measured this" goes stale silently, because nothing fails when the
+measurement finally happens.
+
+### What actually bounds a clip
+
+`RAMChecker.safeFrameCap` was LTX's formula — a fixed load cost plus ~12 GB per
+megapixel per 100 frames of VAE decode staging — applied to every video backend.
+On H3 that is not an approximation but a different model, and it produced two
+useless readings: 677 frames on a 128 GB Mac (so the warning never fired) and 32
+on a 48 GB one (below H3's own 124 floor, so it fired always).
+
+H3's frame-dependent term is the fast recipe's attention-broadcast cache: one
+`[S, hidden]` bf16 per block, held for the whole run.
+
+```
+latent_t = ((frames - 5) / 17) * 5 + 2
+S        = latent_t * (w/32) * (h/32) + 2 * round(frames * 5/3) + text
+cache    = S * 5376 * 2 * 50 blocks
+```
+
+Audio is STEREO — `n_audio_rows = audio_t * 2` — which is easy to drop and worth
+~0.4 GB at 768p. The cache is LINEAR in rows: SDPA is fused, so the `[S, S]`
+score matrix is never materialized, which is the only reason a 108k-row sequence
+exists at all (it would be 1.3 PB). The formula reproduces both measured points
+— 20.4 and 34.1 decimal GB at 124 and 209 frames, 1344x768 — which is what makes
+it worth trusting at 362, where nobody has measured.
+
+Three things fell out of writing it down:
+
+- **"Max quality (slower)" is also the LOW-MEMORY mode.** `bcast_k = 1` never
+  allocates the cache, so 1344x768 x 362f goes from ~85 GiB to the 38 GiB staged
+  load peak, in exchange for roughly 4x the runtime. That is backwards from
+  every other quality toggle in the app and impossible to guess, so the
+  over-budget warning now offers it by name.
+- **The load floor is the pack's MEASURED staged peak, not `approxRAMGB`.**
+  `approxRAMGB` is that number rounded up (26 vs 22.82 GiB for the 4-bit pack)
+  and drives the coarse "does this Mac have enough RAM at all" alert, where
+  erring high is free. In the frame model it is not free: 26 against a 32 GB
+  Mac's 0.8 budget of 25.6 refuses the pack that exists for 32 GB Macs.
+- **A cap with a FLOOR cannot answer "does anything fit".** `frameCap` never
+  returns below the ladder's 124 (below it the model is off-distribution, so a
+  smaller number is not a usable answer), which makes `cap == 124` mean both
+  "124 frames fits" and "nothing fits" — and a 24 GB Mac, which cannot load the
+  8-bit pack at all, saw no warning at exactly 124 frames. `H3Plan.fits` answers
+  the configuration, and the warning asks it.
+
+Ladder reach and quality-TIER defaults also had to be separated. Raising `cap`
+to 362 silently moved `.quality` and `.superQuality` there too, i.e. picking
+"Quality" would have started a five-hour job; `tierMax` stays 209 and the slider
+reaches 362.
+
+### Time
+
+`c + a*S + b*S^2`, fitted on two M4 Max dense measurements (36.6 s/step at
+864x480 x 73f, 275.7 s/step at 1344x768 x 124f). The square term is load-bearing:
+at a matched 124 frames, 1344x768 measured **2.9x** the time of 960x544 for
+**1.98x** the pixels, so a linear-in-pixels model under-promises the wide canvas
+by about half.
+
+The fast recipe is priced from the engine's OWN broadcast schedule
+(`attnBroadcastRefresh`, mirrored) rather than a flat 1/2.83, because those
+windows SCALE with the schedule — at <=6 steps they cover the whole run and the
+recipe is a no-op, so a flat factor would promise a short run 3x faster than it
+can go. Velocity caching then removes a further share of what is left; 0.55
+reproduces the capstone's measured 14-of-30 cached steps.
+
+Reproduces the anchors end to end (measured / modelled): 49 / 51 min at 124f
+fast, 1 h 57 / 1 h 58 at 209f, 2 h 19 / 2 h 21 dense.
+
+Three provenance tiers, because a number extrapolated from someone else's Mac
+and a number measured on yours are different claims: `H3Hardware.current` scans
+`gpu-core-count` off the IORegistry and the chip name off sysctl (the step is at
+the compute roofline — SDPA and the linears both ~13 TFLOPS against ~15 — so
+cores is the figure that tracks); `H3RunHistory` fits ONE scalar (this machine
+vs the anchor) from completed runs, MEDIAN so a thermally-throttled run does not
+own every later estimate, keeping 20; and `H3StepClock` gives a live ETA from
+the run's own cadence, discarding step 0 (graph build + Metal JIT) and taking a
+median rather than the last lap, since a velocity-cached step takes ~0.02 s and
+would make the remaining run look instant.
+
+Also fixed while in here: the card caps ref2va at **12 files across all types**,
+while the three per-type caps (9/3/3) sum to 15 — so a set could clear every
+per-type cap and still be one the model was never given. `MAX_REF_TOTAL` is a
+named 400 server-side and `H3RefLimits` stops the picker offering past it,
+including on an empty list whose own cap has room.
+
+
+
+## `chat_template` has two legal shapes, and reading the wrong one is a PANIC (2026-08-07)
+
+Found during 26.8.3 pre-release validation, on a family nobody had exercised
+recently: **Mistral-7B-Instruct-v0.3-4bit could not be loaded at all.**
+
+```
+thread 9501346 panic: access of union field 'string' while field 'array' is active
+src/chat.zig:115:33 in loadChatConfig
+```
+
+`loadChatConfig` did `try allocator.dupe(u8, v.string)` on
+`tokenizer_config.json`'s `chat_template`. HF permits that key to be either:
+
+- a bare template string (what almost everything ships), or
+- a LIST of `{"name": ..., "template": ...}` objects.
+
+Mistral v0.3 ships the list form, with two entries — `default` and `tool_use`:
+
+```python
+[{"name": "default",  "template": "..."},   # no tools
+ {"name": "tool_use", "template": "..."}]   # tools
+```
+
+A Zig tagged-union field access on the wrong active field is not a recoverable
+error, so this was not "the template failed to load and we fell back" — it was
+the process dying during model load. One of eight local checkpoints with a
+`chat_template` uses this shape, which is exactly why it went unnoticed.
+
+**Fix.** `chatTemplateFromValue` handles both shapes and selects the entry named
+`"default"`, matching transformers (`apply_chat_template` uses `default` unless
+the caller names another template). Falls back to the first usable entry when
+none is named `default`, and returns null for any other shape so the caller
+drops to its `chat_template.jinja` / family fallback rather than panicking.
+
+**On not selecting `tool_use`.** Only that variant references `tools`, so the
+obvious worry is that tool calling breaks. It does not: our pipeline passes
+`tools_json` into the render and has its own parse/repair chain, and llmprobe
+scores Mistral **8/8** on the tool checks (serialization, streamed argument
+reassembly, results accepted back, parallel calls, `tool_choice: "none"`,
+`parallel_tool_calls: false`, typed arguments). Per-request template selection
+by name is a feature worth having; it is not what a load-time panic needed.
+
+Result: Mistral went from *cannot load* to **99.5% engine conformance**
+(chat 64/64, responses 62/62, messages 57/58, embeddings 4/4, completions 3/3).
+
+**The general rule this leaves:** in a `std.json.Value` reader, `.string` on a
+field you have not shape-checked is a crash, not a graceful miss. Any new
+tokenizer_config/config reader owes both shapes — or an explicit switch whose
+`else` returns null.
+
+## An adapter's alpha lives wherever its exporter put it (`lora.fileAlphaScale`, 2026-08-06)
+
+A LoRA's net strength is alpha/rank, and four real community files ship four conventions — a kohya per-module `.alpha` TENSOR, a PEFT JSON document inside one `lora_adapter_metadata` metadata string (`transformer.lora_alpha`/`transformer.r`), flat `lora_alpha`+`lora_rank`|`r` pairs, kohya's `ss_network_alpha`/`ss_network_dim` — plus files declaring none at all (alpha baked into the weights, 1.0 is correct). Reading only the tensor ran every PEFT export at 1.0 = rank/alpha = **8x too strong** for the common 4/32 pairing, which renders PURE STATIC. Resolution order is nested-JSON > flat > `ss_*` > none, per-module tensor still WINS (more specific), and a non-finite/non-positive alpha or rank is DECLINED — a scale we had to guess at is the bug. The resolved scale is logged per file (`[lora] <file>: scale …`) so a wrong one is visible instead of silent; `lora_scales` stays a MULTIPLIER on top of it.
+
+**The test lesson is the bigger half**: `test_multi_lora.sh`'s 56 checks were all green through this — its exact stacking maths (`d+d == 2d` byte-for-byte, zero-B transparency, order independence) is satisfied by noise, and a second real adapter passed only by being weak enough to survive 8x. Renders now go through `tests/lora_noise.py` (mean abs difference of horizontally adjacent pixels, bar 20: real 4-8, static 43-50) and `tests/test_real_loras.sh` runs published adapters on all four backends asserting scale + attach counts + usable output. A guard that asks "did the bytes change?" must be paired with one that LOOKS.
+
+## A sampler must never draw a RESERVED special (`tokenizer.reservedOutputIds`)
+
+`<|fim_hole|>`-class FIM markers can be EMITTED at temp 0 by a checkpoint whose distribution collapses. Per-model mask = `special: true` added tokens MINUS EOS ids MINUS specials whose text appears in the chat template source (thinking/tool/role markers ride each model's own template; no template ⇒ off, so fallback-formatted models are untouched). The legit-output set is DERIVED, never hardcoded. Built once at load (`generate.installSuppressMask`, `[suppress]` engagement log, `MLX_SERVE_SUPPRESS_RESERVED=0`), sized to the LOGITS dim (`unpadded_vocab_size` when set — inkling), riding `SamplingParams.suppress_mask` through the `initWithOptions` chokepoint into BOTH samplers + both stochastic-verify filters (`mlx_where` + -inf, fully lazy, no host sync; the batched tick reads `gen.sampling`, not `slot.sampling`). Logprobs stay the RAW distribution — under suppression rank 1 may differ from the emitted token BY DESIGN (the field reports the model; the mask is policy).
+
+## The degenerate-tail loop guard needs a LONG-period tier (dsv4, 2026-08-02)
+
+A two-sentence ~58-token cycle repeated 26x sailed through the 8-token scan; `loopStopReason` also fires on periods 9..64 at 10 exact reps (`isDegenerateTailLoopRange` — long periods demand fewer reps: identical long lines in real code repeat a handful of times, not ten).
+
+## A tiled decoder's tiles are not slices of an untiled pass (H3 visual VAE)
+
+`create_token_ids` maps each axis to `(arange(0.5,n)/n)*2-1`, so a 256-px tile's coordinates differ from that region's coordinates in a full-canvas pass — tiling is SEMANTIC, not a memory optimization. `minimax_h3_vae.decode` refuses above the 256-px tile extent (`fitsSingleTile` → `error.TilingUnsupported`) rather than silently decoding untiled and producing off-distribution output that looks like a quality problem. Same reason its TEMPORAL chunking (5-token chunks, 2 overlap, 3-frame pre-pad drop, 5-frame cross-fade) cannot be collapsed into one pass: the VAE was trained on 17-frame clips.
+
+## An oracle that cannot execute the reference must say so (H3 DiT parity)
+
+The reference block calls comfy_kitchen CUDA kernels that do not run on a Mac, so `tests/dump_minimax_h3_fixtures.py` is a TRANSCRIPTION and its header states that a green test proves agreement with an independently written implementation, not with the reference. Where the reference CAN run (`dump_minimax_h3_layout.py` — pure layout/schedule math) it is executed directly, with import stubs that RAISE on attribute access so no golden value can be produced by a mock. Prefer executing the reference; when you cannot, say which one you built.
+
+## A permutation-invariant checksum cannot see a permutation (H3 layout fixture)
+
+The per-axis position SUM passes unchanged when the two stereo channels' pinned `w` coordinates are swapped. Pair any column checksum with a row-index-WEIGHTED one (`pos_weighted`) — found by doing red-on-revert properly rather than by inspection.

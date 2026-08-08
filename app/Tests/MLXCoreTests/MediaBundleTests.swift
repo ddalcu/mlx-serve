@@ -615,7 +615,8 @@ final class MediaBundleTests: XCTestCase {
         XCTAssertEqual(q4.backend, .minimaxH3)
         XCTAssertTrue(q4.supportsFastRecipe)
         XCTAssertTrue(q4.generatesAudio)
-        XCTAssertFalse(q4.supportsLoRA)
+        XCTAssertTrue(q4.supportsLoRA)
+        XCTAssertTrue(q4.supportsTurbo)
         // Bundle rides the SAME minimax factory keyed on the 4-bit repo.
         XCTAssertEqual(q4.bundle.id, "minimax-h3:ddalcu/MiniMax-H3-FL2VA-MLX-Serve-4bit")
     }

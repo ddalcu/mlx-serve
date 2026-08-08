@@ -119,8 +119,8 @@ struct EmptyStateChipRow: View {
                         CLILauncherMenuItems(
                             detector: cliDetector,
                             baseURL: server.baseURL,
-                            servedModelId: server.modelInfo?.name ?? "mlx-serve",
-                            serverContextLength: server.modelInfo?.contextLength,
+                            servedModelId: server.chatModelId ?? "mlx-serve",
+                            serverContextLength: server.chatModelInfo?.contextLength,
                             models: server.allModels,
                             openSandboxAgent: { agentId in
                                 // Post the request FIRST — the Sandbox window

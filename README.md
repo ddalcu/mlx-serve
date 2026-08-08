@@ -80,7 +80,7 @@ If you're already on LM Studio, Ollama, or `mlx-lm` and wondering whether to swi
 | OpenAI Responses API + WebSockets | ✅ | 🟡 partial² | ❌ | ❌ |
 | DeepSeek V4 Flash (284B) | ✅ via ds4 | ❌ | ❌ | ❌ |
 | Speculative decoding (PLD + drafter + native MTP) | ✅ | ❌ | partial | drafter only |
-| Decode speed (geomean vs LM Studio, identical weights) | **+81%** (MLX) | baseline | ~−15% (GGUF, est.¹) | +11% (MLX) |
+| Decode speed (geomean vs LM Studio, identical weights) | **+26%** (MLX, shipping defaults) | baseline | ~−15% (GGUF, est.¹) | +11% (MLX) |
 | KV-cache quantization (4/8-bit + TurboQuant) | ✅ | ❌ | partial | ✅ |
 | Continuous batching | ✅ | ❌ | ✅ | ❌ |
 | Built-in agent loop + MCP client | ✅ 10 tools | ❌ | ❌ | ❌ |
@@ -111,14 +111,15 @@ Numbers and charts in [Performance](#performance).
 - **Ollama-grade CLI** — `mlx-serve run gemma4` downloads (resumable), serves, and drops you into a streaming chat REPL; `pull` / `list` / `serve` manage a shared `~/.mlx-serve/models` store the GUI app uses too.
 - **Built-in web console** — open the server's address in a browser (http://localhost:11234 by default) and you get a chat playground against any model on the box, a live Monitor page, image generation and editing, speech and music tools, and the full API reference. Renders with no model loaded, so it works on a fresh headless box too.
 - **Speculative decoding** — PLD (model-agnostic n-gram lookup, on by default) + the Gemma 4 cross-attention drafter. Adaptive prompt-time and runtime gates keep novel-content workloads at parity; agentic code loops see up to 1.6×.
-- **Native multi-token prediction (Qwen 3.5/3.6)** — checkpoints shipping a trained MTP sidecar (like [Qwen3.6-27B-4bit-MTP](https://huggingface.co/ddalcu/Qwen3.6-27B-4bit-MTP-MLX-Serve), or [MTPLX](https://github.com/youssofal/MTPLX)-published artifacts, loaded unmodified) speculate with the model's own head automatically: 3 drafts per round with a self-tuning depth controller, +15–26% on coding-agent loops, MoE sidecars (35B-A3B) supported, and oMLX oQ-format checkpoints load their in-checkpoint MTP heads directly. In same-checkpoint head-to-heads, mlx-serve out-decodes both reference MTP runtimes at all 8 ladder rungs from 0.5K to 64K: 15–38% over MTPLX 2.3.0 with prefill ahead at all 8, and 15–52% over oMLX with its Lightning MTP on oMLX's own oQ4e checkpoint.
+- **Native multi-token prediction (Qwen 3.5/3.6)** — checkpoints shipping a trained MTP sidecar (like [Qwen3.6-27B-4bit-MTP](https://huggingface.co/ddalcu/Qwen3.6-27B-4bit-MTP-MLX-Serve), or [MTPLX](https://github.com/youssofal/MTPLX)-published artifacts, loaded unmodified) speculate with the model's own head automatically: 3 drafts per round with a self-tuning depth controller, +15–26% on coding-agent loops, MoE sidecars (35B-A3B) supported, and oMLX oQ-format checkpoints load their in-checkpoint MTP heads directly. In same-checkpoint head-to-heads on shipping defaults, mlx-serve out-decodes both reference MTP runtimes: **+10% decode and +17% prefill over MTPLX 2.5.3** on its own MTPLX-Optimized build, and **+25% to +36% decode over oMLX 0.5.2** with its Lightning MTP at every ladder rung from 0.5K to 16K on oMLX's own oQ4e checkpoint.
 - **Long-context prefill that flies** — a custom flash-attention Metal kernel handles Gemma's sliding-window layers during prefill, skipping everything outside the attention window: 2.4× prefill (299 → 715 tok/s) on a ~100K-token prompt with *less* peak memory. Qwen 3.5/3.6 long prompts prefill in architecture-tuned chunks: ~5% faster with peak memory down ~9 GB on the 27B.
 - **KV-cache quantization** — 4-bit / 8-bit / TurboQuant variants shrink KV memory ~4× / ~2× / further still, so 16K contexts fit on hardware that couldn't hold them dense.
 - **Continuous batching** — `--max-concurrent N` batches decode requests through one forward pass for ~1.6× throughput at 4-way parallel.
 - **LAN model sharing** — `--lan-share all` lets other Macs on your network run inference on this Mac's models; `--lan-discover` mirrors peers' models into `/v1/models` as `model@peer` and proxies requests transparently, so Claude Code on a MacBook chats with the Studio's 27B through plain `localhost`. Off by default, zero configuration (Bonjour), share list enforced server-side, and only inference is ever exposed.
 - **Prefix cache** — shared system-prompt KV reuse across turns and across conversations. v26.5.7 adds an LRU of llama.cpp KV sessions so multi-doc agent loops stay warm.
 - **Tokenize cache** — chat-template render + tokenize cached per request; the second hit on a long conversation is a memcpy. Warm TTFT 7.7× faster on 1.8K-token prompts.
-- **Vision** — Gemma 4 SigLIP encoder; send images via `image_url` content blocks.
+- **Vision** — Gemma 4 SigLIP and Qwen3-VL encoders; send images via `image_url` content blocks.
+- **Logprobs** — `logprobs` / `top_logprobs` on chat, and the legacy integer shape on `/v1/completions`, streaming and not. Pre-temperature, ids travel with values, and the entry belongs to the token that was actually returned.
 - **Reasoning / thinking** — full streaming of thinking tokens as `reasoning_content`.
 - **No Python** — single Zig binary, no `pip`, no venv. The MLX Core app ships everything signed and notarized.
 
@@ -142,11 +143,11 @@ Menu-bar app that wraps the server with a full UI:
 - **Prompt-based skills** — drop `.md` files into `~/.mlx-serve/skills/` with YAML frontmatter to teach the agent custom capabilities triggered by keywords.
 - **Engine-aware Settings window** (Cmd+,) — every server-launch flag and per-request default, with sections that show only the knobs relevant to the engine you've loaded (MLX vs GGUF vs ds4).
 - **Server management** — start/stop, live log buffer, restart-on-flag-change banner.
-- **Image / Video / Music / Speech / 3D generation** — FLUX.2, Krea-2, Mage-Flow, LTX-Video 2.3, ACE-Step, Qwen3-TTS, Kokoro and Hunyuan3D, all native via the mlx-serve zig server.
+- **Image / Video / Music / Speech / 3D generation** — FLUX.2, Krea-2, Mage-Flow, LTX-Video 2.3, MiniMax-H3, ACE-Step, Qwen3-TTS, Kokoro and Hunyuan3D, all native via the mlx-serve zig server.
 
 ### Image / Video / Music / Speech / 3D Generation
 
-One server, five modalities — the tray has **ImageGen**, **VideoGen**, **AudioGen** (speech + music) and **3D** panels that run [FLUX.2](https://huggingface.co/black-forest-labs) / Krea-2 / Microsoft Mage-Flow, [LTX-Video 2.3](https://github.com/dgrauet/ltx-2-mlx), [ACE-Step 1.5](https://huggingface.co/ddalcu/ACE-Step-1.5-XL-Turbo-MLX-Serve-8bit), [Qwen3-TTS](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-Base) / [Kokoro-82M](https://huggingface.co/ddalcu/Kokoro-82M-MLX-Serve), and [Hunyuan3D-2.1](https://huggingface.co/ddalcu/Hunyuan3D-2.1-MLX-Serve-8bit) natively on MLX. Click a panel, hit **Download**, generate. Each panel remembers your last-used model, quality, resolution, steps and seed between sessions.
+One server, five modalities — the tray has **ImageGen**, **VideoGen**, **AudioGen** (speech + music) and **3D** panels that run [FLUX.2](https://huggingface.co/black-forest-labs) / Krea-2 / Microsoft Mage-Flow, [LTX-Video 2.3](https://github.com/dgrauet/ltx-2-mlx) / [MiniMax-H3](https://huggingface.co/ddalcu/MiniMax-H3-FL2VA-MLX-Serve-8bit), [ACE-Step 1.5](https://huggingface.co/ddalcu/ACE-Step-1.5-XL-Turbo-MLX-Serve-8bit), [Qwen3-TTS](https://huggingface.co/Qwen/Qwen3-TTS-12Hz-1.7B-Base) / [Kokoro-82M](https://huggingface.co/ddalcu/Kokoro-82M-MLX-Serve), and [Hunyuan3D-2.1](https://huggingface.co/ddalcu/Hunyuan3D-2.1-MLX-Serve-8bit) natively on MLX. Click a panel, hit **Download**, generate. Each panel remembers your last-used model, quality, resolution, steps and seed between sessions.
 
 You can also **generate media straight from chat**: ask for an image, a spoken line, a music track or a short clip and it renders inline in the conversation with a progress bar, using your saved settings for that modality. Attach a photo and say "make it winter" and the edit comes back in the same thread. Double-click any chat image to open it full-size in Preview.
 
@@ -159,14 +160,15 @@ And it goes well beyond text-to-X:
 - **Clone a voice from seconds of audio** — record or pick a clip in Settings ▸ Voice and Qwen3-TTS speaks in that voice — in the AudioGen panel, in hands-free Voice Mode, everywhere.
 - **Compose full music tracks** — ACE-Step 1.5 turns a style prompt (and optional lyrics) into a 48 kHz stereo track: a 30-second song renders in about 4 seconds.
 - **Turn a photo into a 3D model** — Hunyuan3D-2.1 converts an image into a watertight GLB mesh, optionally with full PBR textures — drops straight into a game engine or slicer.
-- **Style LoRAs** — attach any diffusers-format LoRA `.safetensors` to restyle LTX, FLUX, or Krea generations at runtime — no re-quantization, zero quality loss on the base weights.
+- **Video with its own soundtrack** — MiniMax-H3 (Hailuo 3.0) denoises the clip and a stereo soundtrack together in one pass, so the sound is produced with the video rather than dubbed on after. Describe the scene, then what you want to hear after `overall_soundscape:`. The REF2VA build builds the clip around pictures, clips or audio you attach (`<Picture 1>`, `<Video 1>`, `<Audio 1>` in the prompt); the FL2VA build takes first/last keyframes and chains windows into longer clips. **Turbo** renders in 4 steps instead of 30. It is slow either way: 1344×768 at 124 frames is about 50 minutes on an M4 Max.
+- **Style LoRAs** — attach diffusers, kohya or PEFT `.safetensors` adapters to restyle FLUX, Krea, Mage-Flow, LTX or MiniMax-H3 generations at runtime. Up to 8 at once, summed rather than merged, so nothing is re-quantized and there is zero quality loss on the base weights. Each adapter runs at the strength its own file declares.
 
 **Models:**
 
 | Feature | Default | Other options | Approx. RAM |
 |---|---|---|---|
 | Image | FLUX.2-klein 4B 4-bit (mflux, ~5 GB pre-quantized) | FLUX.2-klein 9B (10 GB), Krea-2-Turbo, Mage-Flow Turbo / Edit 8-bit (8.5 / 9.1 GB) | 8 / 12 / 16 GB |
-| Video | LTX-Video 2.3 Q4 | — | 24 GB RAM, ~50 GB first-run download (LTX 41 GB + Gemma 8 GB) |
+| Video | LTX-Video 2.3 Q4 | MiniMax-H3 (Hailuo 3.0) 4-bit / 8-bit, video **and** matching soundtrack in one pass | LTX 24 GB RAM (~50 GB download); H3 26 GB (40 GB) or 44 GB (69 GB) |
 | Speech | Qwen3-TTS 1.7b (voice cloning) | Qwen3-TTS 0.6b, Kokoro-82M (54 voices, ~345 MB) | 8 GB RAM, ~3.5 GB first-run download |
 | Music | ACE-Step 1.5 XL Turbo 8-bit | — | 8 GB RAM, ~6.2 GB first-run download |
 | 3D | Hunyuan3D-2.1 8-bit (shape + PBR texture) | — | 16 GB RAM |
@@ -181,18 +183,22 @@ Outputs go to `~/.mlx-serve/generations/` under per-modality, per-date folders.
 
 | Architecture | `model_type` | Examples | Chat Format | Vision |
 |---|---|---|---|---|
-| **Gemma 4** | `gemma4` | `gemma-4-e2b-it-4bit`, `gemma-4-e4b-it-8bit`, `gemma-4-26b-a4b-it-4bit` | Gemma turns | SigLIP |
+| **Gemma 4** | `gemma4`, `gemma4_unified` | `gemma-4-e2b-it-4bit`, `gemma-4-e4b-it-8bit`, `gemma-4-26b-a4b-it-4bit`, `gemma-4-12b-unified` | Gemma turns | SigLIP (unified adds audio) |
 | **Gemma 3** | `gemma3` | `gemma-3-12b-it-qat-4bit` | Gemma turns | -- |
 | **DiffusionGemma** | `diffusion_gemma` | `diffusiongemma-26B-A4B-it-4bit` | Gemma turns (block diffusion) | -- |
-| **Qwen 3 / 3.5 / 3.6** | `qwen3`, `qwen3_5`, `qwen3_5_moe`, `qwen3_next` | `Qwen3-4B`, `Qwen3.5-4B`, `Qwen3.6-35B-A3B` | ChatML | Qwen3-VL |
+| **Qwen 2 / 3 / 3.5 / 3.6** | `qwen2`, `qwen3`, `qwen3_moe`, `qwen3_5`, `qwen3_5_moe`, `qwen3_next` | `Qwen3-4B`, `Qwen3.5-4B`, `Qwen3.6-27B`, `Qwen3.6-35B-A3B` | ChatML | Qwen3-VL |
+| **DeepSeek V4 Flash** | `deepseek_v4` | DeepSeek-V4-Flash-0731 (284B-A13B, 1M ctx) — **native MLX** for safetensors builds, embedded [ds4](https://github.com/antirez/ds4) for `.gguf` | DSV4 + DSML tools | -- |
+| **Inkling Small** | `inkling_mm_model` | Thinking Machines Inkling Small (276B-A12B MoE, 2-bit) | role-less channel messages | -- |
 | **Hunyuan 3** | `hy_v3` | `Hy3-295B-Instruct` (295B-A21B MoE, 2-bit) | Hunyuan tags | -- |
-| **Laguna** | `laguna` | poolside Laguna S 2.1 (117.6B-A8.5B MoE coder, nvfp4) | GLM tags, pre-opened think | -- |
+| **Laguna** | `laguna` | poolside Laguna S 2.1 / XS (117.6B-A8.5B MoE coder, nvfp4) | GLM tags, pre-opened think | -- |
 | **Nemotron-H** | `nemotron_h` | Nemotron-3-Nano-4B | ChatML | -- |
-| **LFM2** | `lfm2` | LFM2.5-350M | ChatML | -- |
+| **LFM2 / LFM2.5** | `lfm2` | LFM2.5-2.6B (8-bit, bf16, nvfp4, mxfp4) | ChatML, Pythonic tool calls | -- |
 | **Llama** | `llama` | Llama 3, Llama 3.1, Llama 3.2 | Llama-3 | -- |
-| **Mistral** | `mistral` | Mistral 7B | ChatML | -- |
-| **DeepSeek V4 Flash** | `deepseek_v4` (GGUF) | DeepSeek-V4-Flash | DSV4 | -- |
+| **Mistral** | `mistral` | Mistral 7B Instruct v0.3 | Mistral turns | -- |
+| **Embeddings** | `bert`, `gemma3_text`, `qwen3` | bge, mxbai, EmbeddingGemma, Qwen3-Embedding (pooling read from the checkpoint) | n/a | -- |
 | **Anything else as GGUF** | via embedded llama.cpp | any `.gguf` on HuggingFace | per-template | -- |
+
+Media models live in the same registry and are classified the same way: FLUX.2, Krea-2 and Mage-Flow (image), Qwen3-TTS, Kokoro and ACE-Step (speech + music), LTX-Video and MiniMax-H3 (video), Hunyuan3D-2.1 (3D). A chat request naming one of them gets a 400 that names the endpoint to use instead.
 
 Any quantized MLX model using one of the above architectures works natively. Anything else can be served as GGUF through the embedded llama.cpp engine — just pick the `.gguf` file in the Model Browser and the server auto-routes by format. Models with unsupported architectures are flagged in the Model Browser but can still be downloaded.
 
@@ -244,6 +250,7 @@ mlx-serve --model /path/to/model --prompt "What is 2+2?"
 | `--max-tokens N` | `100` | Maximum tokens to generate |
 | `--temp F` | `0.0` | Sampling temperature (0 = greedy) |
 | `--ctx-size N` | auto | Context window size (auto = computed from GPU memory) |
+| `--embedding-max-length N` | auto | Per-input token ceiling for `/v1/embeddings` (auto = the model's declared window; over-limit inputs get a 400, never silent truncation) |
 | `--timeout N` | `300` | Stall timeout — seconds *without a new token* (a request that keeps producing never times out) |
 | `--reasoning-budget N` | `-1` | Thinking token budget (`-1` = unlimited, `0` = no thinking) |
 | `--no-vision` | off | Disable vision encoder even if model supports it |
@@ -252,8 +259,9 @@ mlx-serve --model /path/to/model --prompt "What is 2+2?"
 | `--pld-key-len N` | `3` | N-gram match key length for PLD |
 | `--drafter DIR` | none | Gemma 4 assistant drafter checkpoint (e.g. `gemma-4-E4B-it-assistant-bf16`) |
 | `--draft-block-size N` | `4` | Drafts per round for the Gemma 4 drafter |
-| `--no-mtp` | on when sidecar present | Disable the Qwen native MTP head |
+| `--no-mtp` / `--mtp` | on when sidecar present | Disable / force the native MTP head (MoE trunks default off) |
 | `--mtp-depth N` | `3` | Max tokens drafted per MTP round (adaptive controller tunes within `[1, N]`) |
+| `--dspark` | off | DeepSeek V4's own block-parallel draft stages (~11 GB on top of the model) |
 | `--no-decode-attn-quant` | on | Disable the decode-only requant of dense bf16 attention weights (the "Fast decode for bf16-attention models" toggle) |
 | `--kv-quant {off,4,8,turbo2,turbo4}` | off | KV-cache quantization scheme (MLX path) |
 | `--kv-attn-mode {auto,dense,fused}` | auto | Decode read path for quantized KV: `fused` reads the packed cache in place, `auto` engages it from 8K prompt tokens (only at `--kv-quant 4/8`; per-request `kv_attn_mode` overrides) |
@@ -269,15 +277,20 @@ mlx-serve --model /path/to/model --prompt "What is 2+2?"
 | `--lan-share <all\|id,...>` | off | Share the listed models (or all) with your local network over Bonjour — only inference is exposed, model management stays host-local |
 | `--lan-discover` | off | Discover models other Macs share: they appear in `/v1/models` as `model@peer` and requests proxy to that Mac |
 | `--lan-name NAME` | hostname | The Bonjour name other Macs see |
-| `--model-dir PATH` | none | Discover and serve every model in a folder (LRU resident set) |
+| `--model-dir PATH` | none | Discover and serve every model in a folder (LRU resident set). Repeatable — folders merge first-wins |
+| `--max-resident-mem N{MB,GB}` | auto | Summed memory cap across loaded models; decides whether a model may load at all (auto = 80% of the MLX wired limit, `0` disables) |
+| `--max-resident-models N` | `3` | How many models stay loaded at once (LRU-evicted) |
+| `--skip-mem-preflight` | off | Skip the free-RAM pre-flight on load (the cap above is checked first, and still applies) |
+| `--no-tool-autocorrect` | off | Turn off schema-driven repair of model-emitted tool arguments |
 | `--log-level` | `info` | Log level (error, warn, info, debug) |
+| `--log-file PATH` | `~/.mlx-serve/logs/` | Where the server log goes |
 
 ## API
 
 ### POST /v1/chat/completions
 
 ```bash
-curl http://localhost:8080/v1/chat/completions \
+curl http://localhost:11234/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "messages": [{"role": "user", "content": "Write a haiku about programming."}],
@@ -286,12 +299,12 @@ curl http://localhost:8080/v1/chat/completions \
   }'
 ```
 
-Supports `messages`, `max_tokens`, `temperature`, `top_p`, `top_k`, `stream`, `tools`, `repetition_penalty`, `presence_penalty`, `logprobs`, plus per-request `kv_quant` and `kv_attn_mode` overrides. Messages can include `image_url` content blocks (base64 or URL) for vision-capable models.
+Supports `messages`, `max_tokens`, `temperature`, `top_p`, `top_k`, `stream`, `stream_options`, `tools`, `response_format`, `repetition_penalty`, `presence_penalty`, `logprobs` / `top_logprobs`, `reasoning_effort` / `enable_thinking` / `reasoning_budget_tokens`, plus per-request `kv_quant` and `kv_attn_mode` overrides. Messages can include `image_url` content blocks (base64 or URL) for vision-capable models. Usage always carries `prompt_tokens_details.cached_tokens`, and a reply cut short because the model went in circles reports `finish_details: {"type": "repetition_loop"}` beside `finish_reason`.
 
 ### POST /v1/messages (Anthropic)
 
 ```bash
-curl http://localhost:8080/v1/messages \
+curl http://localhost:11234/v1/messages \
   -H "Content-Type: application/json" \
   -H "anthropic-version: 2023-06-01" \
   -d '{
@@ -301,12 +314,12 @@ curl http://localhost:8080/v1/messages \
   }'
 ```
 
-Compatible with Claude Code (`ANTHROPIC_BASE_URL=http://localhost:8080 claude`) and Anthropic SDKs. Supports streaming, tool calling, and extended thinking.
+Compatible with Claude Code (`ANTHROPIC_BASE_URL=http://localhost:11234 claude`) and Anthropic SDKs. Supports streaming, tool calling, and extended thinking.
 
 ### POST /v1/responses (OpenAI Responses API)
 
 ```bash
-curl http://localhost:8080/v1/responses \
+curl http://localhost:11234/v1/responses \
   -H "Content-Type: application/json" \
   -d '{
     "model": "mlx-serve",
@@ -323,21 +336,30 @@ Stateful chains via `previous_response_id`, full streaming SSE with per-event `s
 - `GET /health` — health check
 - `GET /v1/models` — list loaded models with capabilities + engine info
 - `POST /v1/completions` — text completions
-- `POST /v1/embeddings` — text embeddings (BERT, EmbeddingGemma, and last-token pooling models like Qwen3-Embedding; pooling follows the checkpoint's sentence-transformers metadata)
+- `POST /v1/embeddings` — text embeddings (BERT, EmbeddingGemma, and last-token pooling models like Qwen3-Embedding; pooling follows the checkpoint's sentence-transformers metadata, `dimensions` truncates and renormalizes)
 - `POST /v1/images/generations`, `POST /v1/images/edits` — image generation and instruction edits; the edits endpoint speaks the OpenAI SDK's multipart shape (`client.images.edit`), including repeated `image[]` for multi-reference
+- `POST /v1/audio/speech` — Qwen3-TTS (`ref_audio` clones a voice) or Kokoro (`voice` picks or blends one of 54), WAV out
+- `POST /v1/audio/music-generations` — ACE-Step text-to-music, 48 kHz stereo WAV
+- `POST /v1/video/generations` — LTX-Video or MiniMax-H3; base64 `rgb8` frames plus `pcm_s16le` audio, mux on your side
+- `POST /v1/3d/generations` — Hunyuan3D-2.1, base64 GLB
+- `POST /v1/load-model`, `POST /v1/unload-model` — load a discovered model (or one by absolute path), free one now
+- `POST /tokenize`, `POST /detokenize`, `GET /props` — tokenizer round-trip and llama.cpp-style server props
+- `GET /metrics`, `GET /metrics.json` — Prometheus + JSON (needs `--metrics`)
 - `GET /v1/responses/{id}`, `DELETE /v1/responses/{id}` — fetch / delete stored responses
+
+Every media endpoint takes `"stream": true` for SSE progress ending in a base64 `complete` payload. Media LoRAs use one grammar everywhere: `lora_paths` + `lora_scales`, up to 8, stacked.
 
 ## Performance
 
-Apple M4 Max, identical weights per engine, ctx=4096, temp=0. Both charts are regenerated per release by `tests/bench.sh`; CSVs live in [`docs/perf-csvs/`](docs/perf-csvs/), and [benchmarks.md](benchmarks.md) tracks decode speed release by release.
+Apple M4 Max, identical weights per engine. Both charts are regenerated per release by `tests/bench.sh`, which boots each engine in turn and lets [llmprobe](https://github.com/ddalcu/llmprobe) take the numbers: warmup discarded, median of three, same protocol for everyone. CSVs live in [`docs/perf-csvs/`](docs/perf-csvs/), and [benchmarks.md](benchmarks.md) tracks decode speed release by release. Every engine's version is recorded in the CSV and printed in the chart legend, so a number here always says which build it beat.
 
-![mlx-serve vs LM Studio (GGUF + MLX) · oMLX · MTPLX — Gemma 4 + Qwen 3.6, code completion (M4 Max)](docs/perf-pngs/perf-vs-lmstudio-omlx-all-26.7.12.png)
+![mlx-serve vs LM Studio · oMLX · MTPLX — Gemma 4 + Qwen 3.6, code completion (M4 Max)](docs/perf-pngs/perf-vs-lmstudio-omlx-all-26.8.3.png)
 
-*Code completion decode tok/s, v26.7.12. Baseline is **LM Studio GGUF**, the llama.cpp path most LM Studio users actually run, with LM Studio MLX (0.4.19), oMLX and MTPLX beside it. The blue bar is mlx-serve's best configuration for that model, with the winning speculative mode named in the label. MTPLX shows 0 where it can't run (it needs its own MTP artifacts). The Qwen 3.6 27B cell runs oMLX's own oQ4e checkpoint with their native Lightning MTP enabled on both engines: same weights, mlx-serve still wins. Geomean across the six models: **2.0× LM Studio's fastest engine per model**, +81% on the five cells where LM Studio loads the identical MLX weights, +18% with all speculation off. Reproduce with `./tests/bench.sh --family all --lmstudio --omlx --mtplx`.*
+*Code completion decode tok/s, v26.8.3, against LM Studio 0.4.19+2, oMLX 0.5.2 and MTPLX 2.5.3. Every bar is that engine on its **shipping defaults** — llmprobe measures the server that is running, so there is no best-config collapse and no per-model tuning. All four engines load the identical MLX weight files. MTPLX shows 0 where it can't run (it needs its own MTP artifacts), and LM Studio is absent on two rows it has no copy of. Geomean decode: **+26% over LM Studio** across the four shared models and **+25% over oMLX** across all six, with prefill +36% and +10%. The two head-to-heads that matter are on the competitors' own checkpoints: **+23% decode over oMLX** on its oQ4e (prefill level), and **+10% decode / +17% prefill over MTPLX** on its own MTPLX-Optimized build. The bench is `./tests/bench.sh --family all --lmstudio --omlx --mtplx`.*
 
-![Native MTP context ladder — MLX-serve vs oMLX & MTPLX (Qwen3.6-27B), 0.5K–64K prefill + decode](docs/perf-pngs/perf-mtp-ladder-26.7.12.png)
+![Native MTP context ladder — MLX-serve vs oMLX (Qwen3.6-27B), 0.5K–16K prefill + decode](docs/perf-pngs/perf-mtp-ladder-26.8.3.png)
 
-*Two same-checkpoint head-to-heads on one ladder, coding-agent prompts, fresh boots, cold prompts. Against [MTPLX](https://github.com/youssofal/MTPLX) 2.3.0 on its own [Qwen3.6-27B-MTPLX-Optimized-Speed](https://huggingface.co/Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed) checkpoint, mlx-serve decodes 15–38% faster at all 8 rungs and prefills 18–95% faster at all 8. Against oMLX 0.5.2 with its Lightning MTP on its own oQ4e checkpoint, mlx-serve decodes 15–52% faster at all 8 rungs, with prefill ahead at the four short rungs and within 5% at the four long ones.*
+*Same-checkpoint head-to-head, coding-agent prompts, fresh boots, cold prompts. Against oMLX 0.5.2 running its native Lightning MTP on its own oQ4e checkpoint, mlx-serve decodes **25–36% faster at every rung** from 0.5K to 16K, with prefill ahead at all four (+2% to +8%). Both engines speculate with the checkpoint's own MTP head, so this is engine against engine on identical weights. The ladder reaches 64K under `--full`; this release shipped the default depth.*
 
 ### Speculative decoding
 
@@ -372,7 +394,9 @@ Building from source? **Always `zig build -Doptimize=ReleaseFast`.** A bare `zig
 <details>
 <summary><b>Is mlx-serve faster than LM Studio?</b></summary>
 
-Yes, where it counts. On the v26.7.12 code-completion matrix (Gemma 4 E4B/31B/26B-A4B-MoE and Qwen 3.6 27B/35B-A3B-MoE, M4 Max, vs LM Studio 0.4.19), mlx-serve's best configuration decodes at **2.0× geomean over LM Studio's fastest engine per model**, and **+81%** on the five cells where LM Studio loads the identical MLX weights. Recent LM Studio builds have caught up on raw single-stream Gemma decode (+18% geomean with all speculation off), so the lead comes from speculative decoding: the Gemma drafter is **+53%** over LM Studio MLX on E4B code (+98% over its GGUF), native MTP is **+154%** on Qwen 3.6 35B-A3B, and the 35B MoE also decodes **+70%** raw (153 vs 90 tok/s). E4B prefill is ~1.9× on top.
+Yes, though it depends what you run. On the v26.8.3 matrix (M4 Max, LM Studio 0.4.19+2, identical MLX weight files, **both engines on shipping defaults**), mlx-serve decodes **+26% geomean** and prefills **+36% geomean** across the four models LM Studio also has.
+
+The shape matters more than the average. On dense Gemma, raw single-stream decode is now a wash (−0.5% on E4B, −0.8% on 31B) — LM Studio has caught up there. The separation is prefill, which is +117% on E4B and +35% on the 26B-A4B MoE, and speculative decoding: on Qwen 3.6 27B mlx-serve loads the checkpoint's MTP head and LM Studio does not, which is **+145%** decode on the same file. Earlier releases quoted a larger geomean by picking the best speculative configuration per model; this one is defaults against defaults, which is the number you actually get.
 
 </details>
 
@@ -421,14 +445,14 @@ All work — anything that talks the OpenAI chat-completions or Anthropic Messag
 <details>
 <summary><b>Can mlx-serve run DeepSeek V4 Flash locally?</b></summary>
 
-Yes, on 96 GB+ Apple Silicon Macs. Open the MLX Core Model Browser, pick DeepSeek-V4-Flash, hit Download — the server routes the GGUF through the embedded ds4 engine (native Metal kernels, byte-validated against the reference forward). Agent mode and MCP tools work on DSV4 too.
+Yes, on 128 GB+ Apple Silicon Macs. Open the MLX Core Model Browser, pick DeepSeek-V4-Flash, hit Download. Since v26.7.12 the safetensors build runs on our own MLX engine rather than through GGUF: 284B with 13B active, 1M context, chat, thinking, tool calls and streaming, about 30 tok/s serial decode on an M4 Max and roughly twice that with DSpark (`--dspark`, the checkpoint's own draft stages). `.gguf` builds still route to the embedded [ds4](https://github.com/antirez/ds4) engine. Agent mode and MCP tools work on DSV4 too. It needs the 0731 release of the checkpoint; the earlier preview is turned away at load.
 
 </details>
 
 <details>
 <summary><b>What models are supported?</b></summary>
 
-Native MLX dispatch for Gemma 3/4, Qwen 3 / 3.5 / 3.6 / 3-Next, Tencent Hunyuan 3 (295B), poolside Laguna S 2.1, Llama 3.x, Mistral, Nemotron-H, LFM2.5, and DeepSeek V4 Flash. Anything else as GGUF via embedded llama.cpp — Qwen, Llama, Mistral, Gemma, DeepSeek, Phi, Yi, and thousands more available on HuggingFace.
+Native MLX dispatch for Gemma 3/4, DiffusionGemma, Qwen 3 / 3.5 / 3.6 / 3-Next, Tencent Hunyuan 3 (295B), Thinking Machines Inkling Small (276B), poolside Laguna S 2.1, Llama 3.x, Mistral, Nemotron-H, LFM2.5, and DeepSeek V4 Flash. Anything else as GGUF via embedded llama.cpp — Qwen, Llama, Mistral, Gemma, DeepSeek, Phi, Yi, and thousands more available on HuggingFace.
 
 </details>
 
@@ -442,7 +466,7 @@ Yes — the largest open model mlx-serve runs. The 2-bit mixed-precision build (
 <details>
 <summary><b>How does it compare to MTPLX for Qwen MTP models?</b></summary>
 
-[MTPLX](https://github.com/youssofal/MTPLX) is a focused Python runtime built around Qwen's native multi-token-prediction heads, and it set the bar here. mlx-serve loads the same MTP sidecar artifacts (including MTPLX-published ones) with zero setup and, in a same-machine head-to-head on the identical checkpoint, prompts, and sampling (v26.7.12 vs MTPLX 2.3.0), decodes 15–38% faster at all 8 ladder contexts from 0.5K to 64K, with prefill ahead at all 8 as well (+18% at 64K up to +95% at 0.5K). You also get the rest of the stack — OpenAI/Anthropic/Ollama APIs, GGUF, the agent app — in one binary with no Python.
+[MTPLX](https://github.com/youssofal/MTPLX) is a focused Python runtime built around Qwen's native multi-token-prediction heads, and it set the bar here. mlx-serve loads the same MTP sidecar artifacts (including MTPLX-published ones) with zero setup and, in a same-machine head-to-head on the identical checkpoint, prompts, and sampling (v26.8.3 vs MTPLX 2.5.3, both on shipping defaults), decodes **+10%** faster with **+17%** prefill and a third of the time to first token (494 ms vs 1528 ms). You also get the rest of the stack — OpenAI/Anthropic/Ollama APIs, GGUF, the agent app — in one binary with no Python.
 
 </details>
 
@@ -485,7 +509,15 @@ The MLX Core app self-updates by checking the GitHub releases feed. CLI: `brew u
 
 mlx-serve stands on a lot of open-source shoulders. Huge thanks to all of these projects.
 
-**Inference + math** — [MLX](https://github.com/ml-explore/mlx) · [mlx-c](https://github.com/ml-explore/mlx-c) · [mlx-lm](https://github.com/ml-explore/mlx-lm) · [llama.cpp](https://github.com/ggerganov/llama.cpp) · [nlohmann/json](https://github.com/nlohmann/json) · [antirez/ds4](https://github.com/antirez/ds4) · [MTPLX](https://github.com/youssofal/MTPLX)
+**Inference + math** — [MLX](https://github.com/ml-explore/mlx) · [mlx-c](https://github.com/ml-explore/mlx-c) · [mlx-lm](https://github.com/ml-explore/mlx-lm) · [llama.cpp](https://github.com/ggerganov/llama.cpp) · [nlohmann/json](https://github.com/nlohmann/json) · [antirez/ds4](https://github.com/antirez/ds4) · [jinja.cpp](https://github.com/wangzhaode/jinja.cpp)
+
+**Metal kernels we ported** — some of the fastest paths in the engine started as
+someone else's work, and the source says so at every one of them:
+
+- [MTPLX](https://github.com/youssofal/mtplx) by Youssof Altoukhi (Apache-2.0), the verify-width split-K quantized matmul family and the M5 NAX tensor-ops tile. Their own preferred credit line: *Powered by MTPLX by Youssof Altoukhi.*
+- [dflash-mlx](https://github.com/bstnxbt/dflash-mlx) (Apache-2.0), the matmul2d convention the NAX tile is built on, reached through MTPLX.
+- oMLX by jundot (Apache-2.0), the GatedDeltaNet blocked-sequence prefill kernel and the chunked-dispatch budget that keeps long-context prefill off the macOS preemption cliff.
+- [mlxfast-challenge](https://github.com/Layr-Labs/mlxfast-challenge) by Layr Labs (MIT), the certified lm_head prune.
 
 **Model architectures + tokenizers** — [Google Gemma](https://ai.google.dev/gemma) · [Qwen](https://huggingface.co/Qwen) · [Meta Llama](https://www.llama.com/) · [Mistral AI](https://mistral.ai/) · [NVIDIA Nemotron-H](https://huggingface.co/nvidia) · [Liquid LFM2.5](https://www.liquid.ai/) · [DeepSeek](https://www.deepseek.com/) · [Tencent Hunyuan](https://huggingface.co/tencent) · [poolside](https://poolside.ai/) · [HuggingFace tokenizers](https://github.com/huggingface/tokenizers)
 
@@ -494,6 +526,8 @@ mlx-serve stands on a lot of open-source shoulders. Huge thanks to all of these 
 **MLX Core (Swift app)** — [Anthropic swift-sdk](https://github.com/anthropics/swift-sdk) · [Model Context Protocol Swift SDK](https://github.com/modelcontextprotocol/swift-sdk) · Apple frameworks (PDFKit, WKWebView, AVFoundation, AppKit, SwiftUI)
 
 **Build + ship** — [Zig](https://ziglang.org) · [Homebrew](https://brew.sh/)
+
+Full licenses and the required attributions are in [NOTICE](NOTICE).
 
 If we missed you, please open a PR — happy to add anyone who landed code, fixtures, or a fix here.
 
@@ -534,7 +568,12 @@ Subscribing, following, and starring the repo cost nothing and genuinely help th
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT, see [LICENSE](LICENSE).
+
+mlx-serve bundles third-party code that stays under its own license, including
+some Apache-2.0 Metal kernels and the Jinja engine that renders chat templates.
+[NOTICE](NOTICE) lists all of it with the required attributions, and
+[LICENSE-APACHE-2.0](LICENSE-APACHE-2.0) is the Apache License text.
 
 ---
 

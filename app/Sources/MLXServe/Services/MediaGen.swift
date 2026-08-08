@@ -384,8 +384,10 @@ struct VideoModelPreset: Identifiable, Hashable {
 
     /// Which engine arm serves it.
     var backend: VideoBackendKind = .ltx
-    /// Runtime LoRA adapters. MiniMax-H3 has no adapter format; the server
-    /// answers a named 400 rather than silently ignoring the field.
+    /// Runtime LoRA adapters (stacked: several attach at once and their
+    /// deltas sum). Every video backend takes them — H3's are the same
+    /// `lora_paths`/`lora_scales` fields, resolved against its own module
+    /// names, and they stack with the engine-owned Turbo adapter.
     var supportsLoRA: Bool = true
     /// Classifier-free guidance. H3 is CFG-DISTILLED — there is no guidance
     /// pass to scale, so a CFG slider would be a dead control.
@@ -401,12 +403,60 @@ struct VideoModelPreset: Identifiable, Hashable {
     /// at 768p). DEFAULT-ON server-side; the pane offers a max-quality
     /// opt-out that sends "fast": false.
     var supportsFastRecipe: Bool = false
+    /// ref2va reference conditioning (images / videos / audio the generation
+    /// follows). Only the REF2VA pack has it — the FL2VA DiT would generate
+    /// while ignoring every reference, so the server 400s and the pane hides
+    /// the controls AND stops sending the fields.
+    var supportsReferences: Bool = false
+    /// Engine-owned Turbo distillation LoRA (larryvrh/MiniMax-H3-Turbo-Lora):
+    /// 4-step sampling instead of 30, the server's fast recipe off. Needs
+    /// `turbo_lora.safetensors` beside the pack's weights — absent, the server
+    /// answers a named 400 saying where to get it. FL2VA packs only until the
+    /// LoRA has been eyeballed on the REF2VA DiT.
+    var supportsTurbo: Bool = false
+    /// Chained-window long clips (server `chain_windows`): N windows joined by
+    /// fl2va keyframe conditioning, so the REF2VA pack cannot serve it.
+    var supportsChainedWindows: Bool = false
+    /// Denoising-step range the Steps slider offers. LTX's is the default; a
+    /// backend whose floor is higher declares it, because a slider that goes
+    /// somewhere the model does not work is a dead range, not a fast option.
+    var stepsRange: ClosedRange<Int> = 4...50
+    /// One sentence under the Steps slider. Per-backend for the same reason —
+    /// LTX's "runs well from ~8" is wrong advice on any other engine.
+    var stepsHelp: String = "More steps refine the video further at the cost of speed. ~8 is fast, ~30 is the reference default."
+    /// Weights resident DURING sampling, in GB. Distinct from `approxRAMGB`,
+    /// which is the staged LOAD peak (`max(TE, DiT) + VAEs`): by the time the
+    /// DiT is stepping, the text encoder has been run and freed. Only the H3
+    /// memory model reads it; 0 means "not modelled".
+    var ditResidentGB: Double = 0
+    /// The staged LOAD peak from the pack's actual file sizes, in GiB.
+    /// `approxRAMGB` is the rounded-up version of this and drives the coarse
+    /// "does this Mac have enough RAM at all" alert, where erring high is free.
+    /// The frame model is not that: rounding 22.8 up to 26 costs a 32 GB Mac
+    /// the 4-bit pack it exists for. 0 falls back to `approxRAMGB`.
+    var stagedPeakGB: Double = 0
 
     static func == (lhs: Self, rhs: Self) -> Bool { lhs.id == rhs.id }
     func hash(into hasher: inout Hasher) { hasher.combine(id) }
 
     func settings(_ q: QualityPreset) -> VideoQualitySettings {
         qualityProfiles[q] ?? qualityProfiles[defaultQuality]!
+    }
+
+    /// Which prompt FORMAT this model expects — the one chokepoint the pane's
+    /// examples, placeholder, hint and tips link all read. Derived from the
+    /// capabilities the preset already declares, never sniffed from the id.
+    ///
+    /// H3 is not prompted in prose: MiniMax's own pipeline expands the user's
+    /// request into a labelled document (H3-Context-IR, API-only) before the
+    /// DiT ever sees it, and we send the prompt verbatim. The REF2VA pack takes
+    /// the six-section full-reference format, the FL2VA packs the three-field
+    /// base format. See `H3PromptExamples`.
+    var promptFormat: VideoPromptFormat {
+        switch backend {
+        case .ltx: return .ltx
+        case .minimaxH3: return supportsReferences ? .h3Reference : .h3Base
+        }
     }
 
     /// Frame count that COVERS an attached audio clip: the smallest ladder
@@ -478,13 +528,29 @@ struct VideoModelPreset: Identifiable, Hashable {
     /// packed sequence, so cost is roughly quadratic in pixel count: 4:3/3:4
     /// (0.79MP) ≈1.8x, and 16:9/9:16/21:9 all land on the same area cap
     /// (1.03MP) ≈3.1x. Estimates, not measured per-resolution timings.
+    /// Speed labels are RELATIVE TO 960x544, the cheapest canvas on the list.
+    ///
+    /// Cost is not proportional to pixels: the DiT runs full bidirectional
+    /// attention over the packed [text | cond | audio | video] sequence, so the
+    /// projections scale with the row count and attention scales with its
+    /// SQUARE. Measured on an M5 Max at a matched 124 frames, 1344x768 costs
+    /// 2.9x the time of 960x544 for 1.98x the pixels — the gap is the S² term.
+    /// The remaining ratios come from that same model (row count = w/32 × h/32
+    /// per latent frame), which reproduces the measured pair within 6%.
+    ///
+    /// 960x544 is below the model's 768 native short edge, which is why it is
+    /// offered as the long-form canvas rather than made the default: at 124
+    /// frames 1344x768 resolves genuinely more detail (+25% high-frequency
+    /// energy at matched display size). It is what makes the top of the 17k+5
+    /// ladder — 362 frames, 15 s in ONE generation — practical at all.
     private static let h3Resolutions: [ResolutionOption] = [
-        .init(width: 1344, height: 768,  label: "1344 × 768 (16:9 widescreen) — recommended, 3x slower"),
-        .init(width: 768,  height: 768,  label: "768 × 768 (square) — fastest"),
-        .init(width: 1024, height: 768,  label: "1024 × 768 (4:3 landscape) — 2x slower"),
-        .init(width: 768,  height: 1024, label: "768 × 1024 (3:4 portrait) — 2x slower"),
-        .init(width: 768,  height: 1344, label: "768 × 1344 (9:16 portrait) — 3x slower"),
-        .init(width: 1536, height: 672,  label: "1536 × 672 (21:9 cinematic) — 3x slower"),
+        .init(width: 1344, height: 768,  label: "1344 × 768 (16:9 widescreen) — most detail, 2.9x slower"),
+        .init(width: 960,  height: 544,  label: "960 × 544 (16:9 widescreen) — fastest, best for long clips"),
+        .init(width: 768,  height: 768,  label: "768 × 768 (square) — 1.2x slower"),
+        .init(width: 1024, height: 768,  label: "1024 × 768 (4:3 landscape) — 1.8x slower"),
+        .init(width: 768,  height: 1024, label: "768 × 1024 (3:4 portrait) — 1.8x slower"),
+        .init(width: 768,  height: 1344, label: "768 × 1344 (9:16 portrait) — 2.9x slower"),
+        .init(width: 1536, height: 672,  label: "1536 × 672 (21:9 cinematic) — 2.9x slower"),
     ]
 
     /// H3's frame ladder is `17k + 5`, NOT LTX's `8N + 1` (its VAE folds 17
@@ -504,12 +570,28 @@ struct VideoModelPreset: Identifiable, Hashable {
     /// Both H3 packs share everything except repo/size/RAM: same engine, same
     /// frame ladder, same fast recipe. One factory so they cannot drift.
     private static func minimaxH3Preset(repo: String, name: String,
-                                        downloadGB: Int, ramGB: Int,
-                                        description: String) -> VideoModelPreset {
-        // Trained range is ~124-362 (reference tooltip); 209 is our own
-        // validated ceiling (the rap demo), not the untested-by-us 362.
+                                        downloadGB: Int, ramGB: Int, ditGB: Double, stagedGB: Double,
+                                        description: String,
+                                        supportsReferences: Bool = false) -> VideoModelPreset {
+        // The model's own range: MiniMax states 4-15 s at 24 fps, and the
+        // reference node's trained range is ~124-362 on the 17k+5 ladder. The
+        // floor stays 124 — below it the model is off-distribution, which is a
+        // quality cliff, not a fast option.
+        //
+        // The ceiling used to be 209 (the rap demo, the longest clip we had
+        // shipped a verdict on) with a comment calling 362 "untested-by-us" —
+        // stale by the time it was read: 362 frames at 960x544 ran in ONE
+        // generation on an M5 Max at 139.6 s/step. Length is bounded by MEMORY
+        // and TIME, and both are now modelled and shown (`H3Plan`,
+        // `H3TimeEstimate`) instead of hidden behind a cap.
         let minF = 124
-        let cap = 209
+        let cap = 362
+        // What the quality TIERS pick. Deliberately not `cap`: the ladder going
+        // to 362 is the slider's reach, but a preset is a default, and at
+        // 1344x768 the top of the ladder is a five-hour job. Picking "Quality"
+        // must not silently start one — the user gets there by moving the
+        // slider, with the estimate under it saying what it costs.
+        let tierMax = 209
         return VideoModelPreset(
             id: repo,
             name: name,
@@ -530,20 +612,40 @@ struct VideoModelPreset: Identifiable, Hashable {
             qualityProfiles: [
                 .fast:         .init(mode: .oneStage, steps: 16, cfgScale: 1.0, stgScale: 0.0, numFrames: minF),
                 .good:         .init(mode: .oneStage, steps: 30, cfgScale: 1.0, stgScale: 0.0, numFrames: minF),
-                .quality:      .init(mode: .oneStage, steps: 30, cfgScale: 1.0, stgScale: 0.0, numFrames: cap),
-                .superQuality: .init(mode: .oneStage, steps: 50, cfgScale: 1.0, stgScale: 0.0, numFrames: cap),
+                .quality:      .init(mode: .oneStage, steps: 30, cfgScale: 1.0, stgScale: 0.0, numFrames: tierMax),
+                .superQuality: .init(mode: .oneStage, steps: 50, cfgScale: 1.0, stgScale: 0.0, numFrames: tierMax),
             ],
             defaultQuality: .good,
             maxFrames: cap,
             frameOptions: h3FrameLadder(minFrames: minF, maxFrames: cap),
             description: description,
             backend: .minimaxH3,
-            supportsLoRA: false,
+            // Both partitions take stacked adapters: the server resolves them
+            // against H3's own module names and sums them with Turbo. No
+            // community H3 LoRA exists yet beyond the distillation, so this is
+            // a capability, not a recommendation.
+            supportsLoRA: true,
             supportsCFG: false,
             supportsPipelineModes: false,
             supportsAudioInput: false,
             generatesAudio: true,
-            supportsFastRecipe: true
+            supportsFastRecipe: true,
+            supportsReferences: supportsReferences,
+            // Turbo and chaining both ride fl2va machinery (the LoRA is
+            // untested on the REF2VA DiT; a reference has no keyframe row to
+            // chain through), so both flags are the partition's complement —
+            // derived here so the two fl2va presets cannot drift apart.
+            supportsTurbo: !supportsReferences,
+            supportsChainedWindows: !supportsReferences,
+            // MiniMax publishes no step count at all — no default, no range, no
+            // maximum — so this range is OURS. 16 is the lowest tier we have a
+            // verdict on, and below ~6 the fast recipe's warmup and tail windows
+            // cover the whole schedule, so those runs pay full price per step
+            // while looking like the cheap option.
+            stepsRange: 16...50,
+            stepsHelp: "More steps mean more detail and steadier motion, and cost time in direct proportion. 16 is the fast tier, 30 is the default, 50 is for a final render.",
+            ditResidentGB: ditGB,
+            stagedPeakGB: stagedGB
         )
     }
 
@@ -552,7 +654,9 @@ struct VideoModelPreset: Identifiable, Hashable {
         name: "MiniMax-H3 (Hailuo 3.0) 8-bit — video + native audio",
         downloadGB: 69,
         ramGB: 44,
-        description: "Generates video with a matching stereo soundtrack from one prompt — the sound is produced jointly with the picture, not dubbed on after. Describe the scene, then the audio you want after 'overall_soundscape:'. Slow: with the fast recipe on (default), the recommended 1344 × 768 / 124 frames takes about 50 minutes on an M4 Max; 209 frames takes roughly 2 hours. Off, both take 2-6x longer."
+        ditGB: 20.46,
+        stagedGB: 38.24,
+        description: "Generates video with a matching stereo soundtrack from one prompt — the sound is produced jointly with the picture, not dubbed on after. Describe the scene, then the audio you want after 'overall_soundscape:'. Clips run from 5 to 15 seconds. It is slow, and how slow depends heavily on the settings — the estimate under the Generate button is live, and 960 × 544 is several times quicker than the widescreen canvas."
     )
 
     /// The 4-bit pack: same speed (the DiT is compute-bound), ~40 GB download
@@ -562,10 +666,27 @@ struct VideoModelPreset: Identifiable, Hashable {
         name: "MiniMax-H3 (Hailuo 3.0) 4-bit — video + native audio, low RAM",
         downloadGB: 40,
         ramGB: 26,
+        ditGB: 11.11,
+        stagedGB: 22.82,
         description: "The 4-bit build of MiniMax-H3: same generation speed, a 40 GB download instead of 69, and it fits comfortably on 32 GB Macs. Slightly softer detail than the 8-bit build — pick that one if you have 48 GB or more."
     )
 
-    static let all: [VideoModelPreset] = [.ltx23Q4, .minimaxH3, .minimaxH3Q4]
+    /// The REF2VA partition: same engine and geometry, a DiT trained to follow
+    /// reference images / videos / audio for character, style and scene
+    /// continuity. It cannot do first/last-frame conditioning, and FL2VA cannot
+    /// do references — they are two checkpoints, not two modes of one.
+    static let minimaxH3Ref2VA: VideoModelPreset = minimaxH3Preset(
+        repo: "ddalcu/MiniMax-H3-REF2VA-MLX-Serve-8bit",
+        name: "MiniMax-H3 (Hailuo 3.0) REF2VA 8-bit — references + native audio",
+        downloadGB: 69,
+        ramGB: 44,
+        ditGB: 20.46,
+        stagedGB: 38.24,
+        description: "The reference-conditioned MiniMax-H3: attach up to 9 images, 3 clips and 3 audio references and the generation follows them for character, style and scene continuity. Refer to them in the prompt as <Picture 1>, <Video 1>, <Audio 1>. Same speed and soundtrack as the standard pack; every reference adds tokens to every sampling step, so more references means slower.",
+        supportsReferences: true
+    )
+
+    static let all: [VideoModelPreset] = [.ltx23Q4, .minimaxH3, .minimaxH3Q4, .minimaxH3Ref2VA]
 }
 
 // MARK: - Audio presets (TTS / voice cloning)
@@ -1029,11 +1150,10 @@ struct ImageGenRequest {
     /// the user typed them — comma/space separated, `condWeightCount` values
     /// (12 for Krea, 3 for FLUX). Empty = off.
     var condWeightsText: String = ""
-    /// Style LoRA (Advanced): absolute path to a .safetensors adapter applied
-    /// to the DiT at runtime. nil = none.
-    var loraPath: String? = nil
-    /// LoRA strength multiplier (on top of the file's own alpha/rank scale).
-    var loraScale: Double = 1.0
+    /// Style LoRAs (Advanced): stacked `.safetensors` adapters applied to the
+    /// DiT at runtime (sent as `lora_paths`/`lora_scales` — mirrors mflux).
+    /// Empty = none. Rows with an empty `path` are dropped before sending.
+    var loras: [LoraAdapter] = []
 }
 
 extension ImageModelPreset {
@@ -1171,11 +1291,57 @@ struct VideoGenRequest {
     /// (`<model>@<peer>`). The gen service then skips local resolve/load/
     /// unload — the hosting Mac loads on demand and manages its own memory.
     var lanModelId: String? = nil
-    /// Style LoRA (Advanced): absolute path to a .safetensors adapter applied
-    /// to the DiT at runtime. nil = none.
-    var loraPath: String? = nil
-    /// LoRA strength multiplier (on top of the file's own alpha/rank scale).
-    var loraScale: Double = 1.0
+    /// Style LoRAs (Advanced): stacked `.safetensors` adapters applied to the
+    /// DiT at runtime (sent as `lora_paths`/`lora_scales` — mirrors mflux).
+    /// Empty = none. Rows with an empty `path` are dropped before sending.
+    var loras: [LoraAdapter] = []
+    /// Turbo distillation LoRA (H3 fl2va): 4-step sampling, fast recipe off.
+    var turbo: Bool = false
+    /// Chained windows (H3 fl2va): number of `numFrames`-frame windows joined
+    /// by keyframe conditioning. 1 = a single ordinary window.
+    var chainWindows: Int = 1
+    /// ref2va references (REF2VA pack only). Images the generation follows for
+    /// character/style, clips for motion and scene, audio for voice and score.
+    /// Paths, resolved to base64 at request time.
+    var refImagePaths: [String] = []
+    var refVideoPaths: [String] = []
+    var refAudioPaths: [String] = []
+    /// How a reference IMAGE is sized. `.match` scales it (down only) to the
+    /// generation's pixel area; `.max` uses a 2048 short edge for identity
+    /// fidelity and is several times slower — reference tokens ride through
+    /// every sampling step.
+    var refImageSize: RefImageSizing = .match
+}
+
+/// ref2va references already encoded for the wire. Kept apart from
+/// `VideoGenRequest` (which holds PATHS) so `requestBody` stays pure — reading
+/// files and pulling frames out of a movie is the caller's job.
+struct VideoRefPayloads {
+    /// One reference clip: its base64 PNG frames and, optionally, the base64
+    /// WAV soundtrack that belongs to it. The soundtrack rides ON the clip
+    /// rather than in a parallel array, so a silent clip cannot shift the
+    /// pairing of the ones that have sound.
+    struct Video {
+        var frames: [String]
+        var audio: String?
+    }
+    var images: [String] = []
+    var videos: [Video] = []
+    var audios: [String] = []
+
+    var isEmpty: Bool { images.isEmpty && videos.isEmpty && audios.isEmpty }
+}
+
+/// `ref_image_size` on the wire.
+enum RefImageSizing: String, CaseIterable, Hashable {
+    case match, max
+
+    var label: String {
+        switch self {
+        case .match: return "Match generation size"
+        case .max:   return "Maximum detail (several times slower)"
+        }
+    }
 }
 
 struct AudioGenRequest {
@@ -1279,12 +1445,22 @@ enum RAMChecker {
         return Int(bytes / (1024 * 1024 * 1024))
     }
 
-    /// Frame count an LTX run can safely fit at the chosen resolution.
-    /// Linear in pixels × frames after a fixed model-load cost.
-    static func safeFrameCap(model: VideoModelPreset, width: Int, height: Int, available: Int) -> Int {
-        // Model load alone takes `approxRAMGB`. Each megapixel × 100 frames
-        // costs roughly 12 GB on top of that for ltx-2-mlx — the VAE decode
-        // staging pushes memory harder than the diffusers path did.
+    /// Frame count a run can safely fit at the chosen resolution.
+    ///
+    /// The formula below is LTX's — a fixed load cost plus roughly 12 GB per
+    /// megapixel per 100 frames of VAE decode staging — and it was applied to
+    /// EVERY video backend. On H3 that is not an approximation, it is a
+    /// different model: the frame-dependent term there is the fast recipe's
+    /// attention-broadcast cache, so the LTX formula computed 677 frames on a
+    /// 128 GB Mac (warning never fires) and 32 on a 48 GB one (below H3's own
+    /// 124-frame floor, so it fires always). A backend with its own memory
+    /// model answers for itself.
+    static func safeFrameCap(model: VideoModelPreset, width: Int, height: Int, available: Int,
+                             fast: Bool = true) -> Int {
+        if model.backend == .minimaxH3 {
+            return H3Plan.frameCap(model: model, width: width, height: height,
+                                   availableGB: available, fast: fast)
+        }
         let pixelMP = Double(width * height) / 1_000_000.0
         let headroom = max(0, available - model.approxRAMGB)
         let perHundred = max(2.0, pixelMP * 12.0)

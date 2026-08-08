@@ -3,7 +3,7 @@
 Full histories: live failures, measurements, diagnosis ladders, dead ends. The distilled RULES live in the root CLAUDE.md "Rules" section — when a rule changes, update the story here too. New gotchas in this domain: add the 1-3 line rule to root, the full story here.
 
 ### A client-supplied path handed straight to mlx is a one-request server kill (lora_path)
-Found by a test that expected a 400 and got `000` — curl couldn't complete, because the server was gone. `POST /v1/images/generations` with `{"lora_path":"/tmp/nope.safetensors"}` flows into `lora.loadFile` → `mlx_load_safetensors`, which for a missing file raises an MLX error; mlx-c errors are FATAL, so the process dies. Log's last line is `MLX error: [load_safetensors] Failed to open file …` and nothing after it. This isn't a MageFlow issue — it's every image backend, and every client on the box loses its connection because one request named a moved or mistyped adapter. The path check that existed (`isAbsolute`, added for the `openFileAbsolute` UB class) proves the shape of the string, not that a file is there. Fix: open + stat before mlx sees it, and require a REGULAR FILE — a directory opens fine and would die one layer deeper — returning `error.BadLoraPath` → the existing 400. General rule: any request-supplied path that flows into an mlx loader must be validated on OUR side of that boundary, the same way `textGenRejectReason` 400s before prefill rather than letting a null transformer deref take the server down. Guards: two `loadFile` unit tests (missing file, directory) and the LoRA case in `tests/test_mageflow_edit.sh`.
+Found by a test that expected a 400 and got `000` — curl couldn't complete, because the server was gone. `POST /v1/images/generations` with `{"lora_path":"/tmp/nope.safetensors"}` flows into `lora.loadFile` → `mlx_load_safetensors`, which for a missing file raises an MLX error; mlx-c errors are FATAL, so the process dies. Log's last line is `MLX error: [load_safetensors] Failed to open file …` and nothing after it. This isn't a MageFlow issue — it's every image backend, and every client on the box loses its connection because one request named a moved or mistyped adapter. The path check that existed (`isAbsolute`, added for the `openFileAbsolute` UB class) proves the shape of the string, not that a file is there. Fix: open + stat before mlx sees it, and require a REGULAR FILE — a directory opens fine and would die one layer deeper — returning `error.BadLoraPath` → the existing 400. General rule: any request-supplied path that flows into an mlx loader must be validated on OUR side of that boundary, the same way `textGenRejectReason` 400s before prefill rather than letting a null transformer deref take the server down. Guards: two `loadFile` unit tests (missing file, directory) and the LoRA case in `tests/test_mageflow_edit.sh`. Multi-LoRA (`lora_paths`, an array) goes through the same `loadFile` per entry in `ImageEngine.setLoras`/`VideoEngine.setLoras` — a bad path anywhere in the array 400s before any adapter in that request attaches (partial stacks never install; `lora.Stack.deinit` unwinds whatever loaded before the failing entry).
 
 ### An error message that quotes a field value is not a JSON string (media-gen 400 bodies)
 Found live while checking that a MageFlow txt2img checkpoint correctly refuses an edit request: the 400 came back as `{"error":{"message":"instruction editing (mode:"edit") requires a FLUX.2 or Mage-Flow-Edit model"}}` — raw double quotes inside a JSON string, so every client sees a parse error instead of the (perfectly good) explanation. The Zig source reads `"… (mode:\"edit\") …"`, which is a Zig escape producing a real `"` byte; `gen.sendError` then interpolated it with `{s}` straight into a JSON body. Six messages in `gen.zig` had it (`'mode' must be "edit" or "variation"`, the edit/variation gates, `'ref_images' requires mode:"edit"`, the content-filter refusal), and the SSE variant shared the flaw. A second failure hid behind the same line: both senders build into a fixed 256-byte buffer with `bufPrint(...) catch return`, so a message longer than the buffer sent NO body at all — a bare status code with an empty payload. Fix is at the SINK, not the literals (a future message must not be able to reintroduce it): `gen_sse.jsonEscapeMessage(out, msg)` escapes `"` `\` and the control bytes, maps other sub-0x20 bytes to a space, and TRUNCATES to fit while backing off to a UTF-8 boundary so the tail can never be a torn sequence; both `gen.sendError` and `gen_sse.sendError` route through it into a 640-byte body buffer. Pinned by a hermetic test that feeds the exact live message through a real `std.json` parse. Same class as the tool-calling `appendJsonString` rule — the mistake there is trusting model output, here it's trusting your own literal; both are just bytes going into a JSON string.
@@ -220,3 +220,631 @@ Where to block, and where NOT to: `submit()` already single-flights llama (`llam
 Fix shape (`src/scheduler.zig`): pure `admitPendingTick(cands, active, out)` (the `specTickMode` pattern — contract-tested decision fn + a source-scan pinning the call site) gates the pending drain in `inferenceLoop` step 1, under `queue_mu`. An exclusive candidate admits only if its model is neither among live decoding slots nor claimed by an earlier admitted exclusive candidate this tick (same-tick siblings aren't in `decoding` yet — the claim covers the window). `modelExclusiveDecode` keys on the transformer's dsv4 pointer, mirroring `runPrefill`'s `is_dsv4` — NOT on `!modelBatchable` (would wrongly serialize laguna/hy3) and NOT on a model_type string. Non-exclusive candidates always admit, and a candidate for another model behind a held exclusive one still admits — no head-of-line blocking. No release bookkeeping: the busy signal IS presence in `decoding`; step-5 culls finished slots under the same mutex, and the loop never blocks while `pending` is non-empty, so a held slot admits on the first tick after the active one is culled.
 
 Repro/guard: `tests/test_dsv4.sh` [7] — greedy solo baseline, then the same request with a short marker chat ("Reply with exactly: Kangaroo") fired mid-generation. Pre-fix RED reproduced the exact incident signature: the concurrent long output truncated and LITERALLY contained "Kangaroo" (`… 2, 3, 5, 7, "Kangaroo`). Post-fix: byte-equal to solo, marker answered after queueing, no leak — 17/17.
+
+---
+
+## Logprobs were misleading, not missing — three defects, one broken instrument (2026-08-05)
+
+Found while chasing a model-quality artifact. The hunt ate a day partly because
+an early read of "logprob -0.004, therefore the model is 99.6% confident" came
+straight out of this field. It was wrong in three independent ways, all on
+main, all model-agnostic.
+
+**1. The values were post-temperature.** `sampleToken` threads its WORKING
+logits into `computeLogprobs`, and by that point they carry the client's
+temperature (and any repeat/presence penalty). So the same prompt, the same
+chosen token, reported `-0.2129 / -0.0607 / -2.1566` at temp 0 / 0.6 / 2.0 — a
+number that belongs to the model moving with a knob the client set. Worse, at
+temp 0 there is no division at all and `log_softmax` over raw logits SATURATES:
+many entries report exactly `0.0` (p = 1.0), which reads as certainty and is
+actually just the absence of scaling. OpenAI's logprobs are the model's, so
+they now read the position's raw logits — before temperature, penalties and
+top-k/top-p.
+
+**2. Token ids were recovered by scanning the vocab for float equality.** For
+each `mlx_topk` value the producer walked all 157k entries looking for a slot
+whose logprob compared `==`, skipping ids it had already used. Under the
+saturation above, ties are everywhere and the winner is whichever id the scan
+reached first. The same comment claimed `mlx_topk` returns values "in
+descending order" — it does not (argpartition class) — and the caller then kept
+the first `top_n` of `top_n + 1` unordered candidates, so the true argmax could
+be the one dropped. Ids now travel WITH their values: `mlx_argpartition_axis`
+on the negated logprobs, slice the leading k, `mlx_take_axis` the values, sort
+host-side (ties break on the lower id so the ranking is deterministic).
+
+**3. The result was paired with the NEXT token.** This is the one that made the
+output look like a broken RANKING rather than a broken PAIRING. The decode loop
+returns `next_token_id` and, in the same call, forwards it to sample its
+successor — then published THAT `sampleToken` result as `last_logprob`, which
+the scheduler appends and `formatLogprobsObject` zips with token ids by index.
+So every entry carried the distribution of the token that FOLLOWED it. A
+one-token "OK" reply came back as:
+
+```
+token "OK"  logprob 0.0   top_logprobs[0] = { "<|role_end|>", 0.0 }
+```
+
+which is exactly what the model wants AFTER "OK" — both values 0.0 because the
+chosen id being reported was `<|role_end|>`'s, not "OK"'s.
+
+Fix is a one-token delay: `Generator.pending_logprob` holds the freshly sampled
+result and `last_logprob` is only ever assigned from it. The first returned
+token needs a seed, because t1 is sampled from the PREFILL's final forward,
+which the decode loop never sees — `firstTokenLogprobs` reads that distribution
+in `initWithOptions` (both branches), against the id the lazy sampler actually
+drew rather than re-sampling (which would disagree at any temperature > 0).
+
+Observable bar, and the one to re-run: at temp 0 the emitted token IS the
+argmax, so `top_logprobs` rank 1 must equal it. Measured 0 of 5 positions on a
+trivial prompt before; after, every position agrees and the values are real
+(-0.547 on a first token instead of a saturated 0.0). Guards: two hermetic
+tests in generate.zig (a tie-saturated distribution whose rank 1 must be the
+argmax; three temperatures against one independently computed log_softmax
+value), a source-scan class guard pinning that `last_logprob` may only be
+assigned from `pending_logprob`, and `tests/test_ling.sh` [11] live on both the
+chat and completions surfaces.
+
+## `/v1/completions` ignored its `logprobs` field (2026-08-05)
+
+Same session. The handler hardcoded `logprobs_n = 0` and still emitted a
+`logprobs` key in the response — the silently-ignored-field class, which reads
+to a client as "this model has no opinion" rather than "this server never
+asked". Two things differ from chat and both matter:
+
+- the request field is an INTEGER (how many alternatives per token), not a bool
+  plus a separate `top_logprobs` count;
+- the response is four PARALLEL ARRAYS — `tokens`, `token_logprobs`,
+  `top_logprobs`, `text_offset` — where `text_offset` is each token's byte
+  offset within the completion text (what a FIM client uses to align
+  alternatives with its buffer).
+
+`top_logprobs` there is a MAP keyed by token TEXT. That is OpenAI's own shape
+and we reproduce it, but it means two byte-fragment token ids that both render
+as U+FFFD COLLIDE and the larger value is lost. The first pass of the
+collapse metric was built on this surface and manufactured a run of fake
+`p = 0.000%` positions out of exactly that. **Any measurement over logprobs
+must use the chat surface**, whose `top_logprobs` is a list.
+
+## `/detokenize` emitted raw control bytes (2026-08-04)
+
+The handler hand-rolled a five-character escape table (`"`, `\`, `\n`, `\r`,
+`\t`) and passed every other byte through verbatim. Any token whose bytes are
+below 0x20 — and a byte-level BPE vocab has plenty — therefore produced a body
+that NO JSON parser accepts, from an endpoint whose entire job is to hand text
+back to a client.
+
+Same class as the tool-calling `appendJsonString` rule, one surface over: a
+literal is arbitrary bytes too, and there is exactly one correct escaper in the
+tree. `detokenizeResponseJson` now routes through `chat.appendJsonString`, with
+a test that feeds it a control byte and parses the result.
+
+The general form: any handler that builds JSON with `allocPrint` and a string
+it did not escape at a SINK is one unusual input away from an unparseable
+response. Grep for hand-rolled escape tables when a client reports "invalid
+JSON" from an endpoint that is otherwise working.
+
+
+## The streaming think gate was O(buffer) per token (2026-08-05)
+
+`chat.streamThinkGate2` runs `indexOf(buf, "<|channel>thought")`,
+`indexOf(buf, "<channel|>")`, `indexOfThinkOpenTag(buf, 0)` and
+`indexOfThinkCloseTag(buf, 0)` over the WHOLE accumulated buffer on every token,
+for as long as thinking markup is present and no close has arrived. That is
+O(n²) over a reasoning block. Hermetic bench, 4000 tokens growing to 113 KB:
+
+```
+no close in buffer:  47.99 us/token   (every scan runs to the end)
+close present early: 16.98 us/token   (the close scan stops at ~byte 14)
+```
+
+0.3% at ~15 ms/token, ~1% on a 5 ms/token model with a long unclosed
+thought, and it grows with the buffer — a 32K-token thought is 8x this bench.
+
+**What makes a cursor exact.** `tagSuffixChar` excludes `<`, so every recognized
+marker contains exactly ONE `<`, at its start. A marker straddling the
+scanned/unscanned boundary must therefore begin at the LAST `<` in the buffer —
+and if that `<` can no longer grow into a marker (`isPartialSuffixedTag`, or a
+strict prefix of the two channel spellings), nothing straddles the boundary at
+all. No overlap constant to get wrong, and no length bound needed even for an
+arbitrarily long `</think:suffix>`. The plain substring needles get a fixed
+16-byte overlap (`<|channel>thought` is the longest at 17).
+
+**The close tag is the one value that cannot be latched.**
+`thinkCloseIsToolCallPayload` looks FORWARD past the close for a `</tool_call`,
+so a close that is a real block close at token N is reclassified as argument
+payload at token N+k. Latching it diverged from the fresh gate at prefix 104 of
+
+```
+<think>plan<tool_call>f<arg_key>k</arg_key><arg_value>closes with </think> inside</arg_value></tool_call>done</think>visible
+```
+
+— the incremental arm said `.split_think` where the fresh gate said
+`.hold_thinking`. So the latch is gated on "no `tool_call` substring seen yet",
+and once tool markup appears the scan falls back to the exact full
+`indexOfThinkCloseTag(buf, 0)` every call. That costs a handful of tokens, not a
+block: the caller latches `think_closed` immediately after a split.
+
+Measured after: 203 MB scanned → 164 KB over the same 4000 tokens (1238x), and
+the memoized total is ~1.6 passes over the final buffer, i.e. linear.
+
+Pinned by three tests — prefix-by-prefix equivalence against the fresh gate over
+every marker family (which IS the split-across-arrivals case, at every possible
+split point), a flat-cost invariant on `last_scan_span`, and a reset test for
+the buffer the stream loop clears at every emit. Plus a wiring scan: both
+streaming handlers must hold a persistent `ThinkScan` and reset it where they
+call `text_buf.clearRetainingCapacity()`, because a memoization nobody threads
+through is output-identical to no memoization at all.
+
+## A gate that runs before the estimator that knows better IS the estimator (#126, 2026-08-05)
+
+`ddalcu/MiniMax-H3-FL2VA-MLX-Serve-4bit` was unloadable on a 48 GB M5 Pro. Every
+`POST /v1/load-model` came back:
+
+```
+HTTP 503 {"error":{"message":"Not enough memory to load model; retry after
+current requests complete","type":"out_of_memory"}}
+```
+
+on an idle server, zero models loaded, RSS 21 MB — so the advice was
+unactionable, and nothing was logged at the point of refusal.
+
+The numbers, from the reporter:
+
+| file | bytes |
+|---|---|
+| `text_encoder.safetensors` | 15,804,791,921 |
+| `transformer.safetensors` | 18,698,813,290 |
+| `video_vae.safetensors` | 5,207,808,496 |
+| `audio_vae.safetensors` | 605,254,808 |
+| sum | 40,316,668,515 (37.55 GiB) |
+
+`ensureLoaded`'s eviction gate estimated post-load bytes from `entry.bytes_on_disk`
+regardless of backend and added 10%: **41.30 GiB**, against a
+`--max-resident-mem auto` of 80% of the 38338 MB wired limit = **30.0 GiB**.
+`planEvictionsLocked` found no victim (nothing was loaded), returned null, and
+the load became `error.NotEnoughMemory`.
+
+The correct number already existed twenty lines further down the call chain.
+`gen.h3PeakBytes` bills `max(TE, DiT) + video_vae + audio_vae` = **22.83 GiB**,
+because `minimax_h3.generate` runs the text encoder and FREES it before the DiT
+loads. The staged-residency fix had landed in the media PREFLIGHT, which runs on
+the inference thread — after the registry gate. For H3 the gate always won, so
+on any machine where `sum x 1.1 > max_resident_mem` the model was permanently
+unloadable: every 48 GB Mac at stock settings. `--skip-mem-preflight` did not
+help (it bypasses the free-RAM preflights, not the registry cap) and the app
+passes no `--max-resident-mem` at all, so there was no way out from the UI.
+
+The class is not the formula, it is that **two sites computed the same bill
+differently and the stricter one ran first**. Both now read one estimator:
+`scheduler.mediaPeakFor` (peeks the dir's real backend type — `arch_hint` when
+discovery supplied one, `gen.peekModelType` otherwise, because a media stub's
+`config.model_type` is the MODALITY static "AudioVideo") feeding
+`gateEstimateBytes`. The peek happens OUTSIDE the registry mutex: it stats the
+model dir and no other load should block on our filesystem.
+
+Two secondaries from the same report:
+
+- **The commit disagreed with the reservation.** `doLoadGenOnInferenceThread`
+  called `markReadyLocked` with `bytes_on_disk`, so after a successful load H3
+  sat in the residency budget at 37.55 GB while holding almost nothing (the
+  engine holds only paths until a generation arrives — the hermetic guard's
+  `200 OK` on four SPARSE files is that fact, reproduced). A media model parked
+  at 14.7 GB more than it can ever hold evicts genuinely-resident LLMs for bytes
+  nobody is using. `genLoadResidentBytes` reads the same estimator, so reserve
+  and commit now differ only by the gate's 10% headroom.
+- **The refusal named the wrong subsystem and logged nothing.** "retry after
+  current requests complete" points at concurrency; the cause is a static cap.
+  The message is one constant now (`server.not_enough_memory_message`, both 503
+  sites) naming `--max-resident-mem`, and the gate logs estimate / cap /
+  currently-resident / model count before returning.
+
+Guard: `tests/test_media_eviction_gate.sh`, hermetic — the "model" is four sparse
+files (`dd seek=`) carrying the real pack's byte sizes plus a `config.json`
+naming the backend. Nothing is ever read, so the load fails at engine build, and
+WHICH failure it is is the assertion: past the gate the answer is no longer the
+gate's 503. Verified red-on-revert, where it reproduces the reporter's 41.30 GiB
+exactly.
+
+## A loop cut that says only "length" reads as a limit nobody set (2026-08-05)
+
+A pi session against a collapse-prone 4-bit MoE repeated itself and then died with
+"Model stopped because it reached the maximum output token limit", while its own
+status bar read `32.4%/66k` — two thirds of the context free. The two readings
+look contradictory. They are not: **context and output are different budgets,
+and neither one is what stopped it.**
+
+End to end:
+
+1. A garbage token landed in a file the agent was writing:
+   `v(cx - 5, 6, cz + z, C.roofRedDark);!placeholder`. That is the checkpoint's
+   own logit collapse, not a server bug — correct sampling (the card's top_k)
+   and the reserved-token suppression mask are what move its rate.
+2. The model spotted its own corruption and could not repair it, restating the
+   same intent with different wording — the near-repeat shape
+   `generate.isNearRepeatTailLoop` exists for.
+3. The server cut it, five times, at 1254 / 1071 / 1079 / 102 / 58 generated
+   tokens. **The shrinking lengths are the diagnosis**: each retry re-entered
+   the loop sooner, because the client re-sent the cut turn as history and the
+   model read its own loop back. That is the error-echo class (Inkling
+   name-salvage) with the server's own output as the error.
+4. `finish_reason: "length"` is deliberate and cannot move — `"stop"` became
+   `"tool_calls"` and presented a server-cut fragment as a completed write
+   (the 2026-07-14 php.html post-mortem). pi renders `length` the only way the
+   OpenAI schema allows. pi never set a `max_tokens` at all (the log shows the
+   unbounded sentinel `1073741823`), so the message names a limit neither side
+   imposed.
+
+Two fixes, and the split between them is forced by the transport:
+
+- **The cause rides beside the reason.** `finish_details:{"type":
+  "repetition_loop"}` on chat + completions, stream and non-stream. Unknown
+  causes are dropped rather than interpolated (`finishDetailsField`) — this
+  string is spliced into a JSON literal, and a literal is arbitrary bytes too.
+  `/v1/messages` is deliberately excluded: `anthropicStopReason` maps a loop cut
+  to `max_tokens` (the same misattribution), but inventing a key inside
+  Anthropic's schema is worse than the gap.
+- **The trim is what breaks the spiral, and it only reaches non-streaming.**
+  `generate.degenerateTail` returns where the degenerate span STARTS, not just
+  that one exists: the exact tiers walk their cycle back past the repetitions
+  that convicted it and keep ONE copy (a truncated answer should still show what
+  the model got stuck on, and one copy cannot sustain a loop), while the
+  near-repeat tier slides its 1024-token window back in 128-token steps while it
+  keeps convicting — a restatement loop that ran 3000 tokens is degenerate for
+  all 3000, and trimming only the window hands the rest back.
+
+Why streaming keeps the tail: a delta cannot be retracted. It is worth being
+precise about why the tokens are already gone, because "with tools present the
+server buffers" is true only of tool MARKUP — `streamShouldBufferForTools`
+returns false for prose, so a restatement loop streams incrementally. Measured
+on the reproduction: 113 separate content deltas over ~1 s before the cut, with
+and without `tools`. For a streaming client the SIGNAL is the whole deliverable.
+
+Reproduction, no checkpoint-specific behaviour needed: ask any model to "Output
+the exact line 'ping pong ping pong' over and over, hundreds of times, with no
+other text and no ending" — the period-1..8 tier convicts within ~130 tokens.
+`tests/test_loop_stop_signal.sh` is that prompt across four surfaces, and its
+last section boots with `MLX_SERVE_LOOP_TRIM=0` so the trim's own red-on-revert
+is part of the run (32 repetitions in the body with the trim off, 2 with it on).
+
+## Streaming chat accepted `logprobs`, paid for them, and dropped them (2026-08-07)
+
+Found during pre-release validation of 26.8.3, by a hand-written probe rather
+than by the conformance suite — which is the point of the story.
+
+**Symptom.** `POST /v1/chat/completions` with `"logprobs": true, "stream": true`
+returned a well-formed SSE stream with no `logprobs` anywhere in it. The
+non-streaming form of the same request was perfect.
+
+**What made it expensive rather than merely absent.** Requesting logprobs
+disables every speculative path (`pickStreamMode` — PLD/drafter/MTP all gate on
+`logprobs_n == 0`, because a spec round has no per-step distribution to report).
+So the request paid the full serial-decode cost to honour a field that was then
+thrown away. Worst of both ends.
+
+**Why nothing caught it.**
+
+- Output-equality tests are structurally blind: the content deltas are
+  byte-identical whether or not the logprobs ride along.
+- `llmprobe` probes logprobs on the NON-streaming surface only. In the same
+  session it scored this server `Logprob consistency 100% — 36/36 items:
+  emitted token = argmax, valid distribution` while streaming returned nothing
+  at all. **A conformance suite's silence is not coverage** — a green run says
+  what it checked passed, never that the surface works.
+- The three logprobs defects fixed on 2026-08-05 (temperature-scaled logits,
+  float-equality id recovery, the one-token offset) were all found and fixed
+  non-streaming, and their guards live there too.
+
+**Root cause.** There is exactly ONE chat streaming chunk template, and its
+choice object was `{"index":0,"delta":…,"finish_reason":…}` — no `logprobs`
+field had ever existed on it. `formatLogprobsObject` was called from the
+non-streaming handler only.
+
+**Fix, and the three things that were not obvious.**
+
+1. `logprobs` is a SIBLING of `delta` on the choice, not a field inside it.
+   Added as `ChunkExtras` (defaulted, so all 22 existing emitters keep their
+   exact bytes — a stream that did not ask for logprobs is byte-unchanged,
+   which is what makes the change additive).
+2. Entries cannot be paired 1:1 with chunks. The think gate and tool detection
+   buffer many tokens into one delta, and some tokens produce no chunk at all.
+   So `StreamLogprobs` drains against a HIGH-WATER MARK (`emitted`), and each
+   entry ships EXACTLY once: a delta cannot be retracted, so a re-send is as
+   wrong as a drop.
+3. The publish is a THREAD-SAFETY problem, not a formatting one.
+   `slot.logprobs_buf` is written by the inference thread and was documented
+   as conn-thread-readable *at completion*. Reading it mid-stream races two
+   ways: the entry for token i may not be visible when token i is handed over
+   (the append sat AFTER `pushToken`, whose mutex release is what publishes),
+   and a concurrent grow reallocates the backing array under a reader
+   mid-copy. Both fixed by moving token and entry into ONE critical section
+   (`Slot.pushTokenWithLogprob`) and copying out under the same lock
+   (`Slot.copyLogprobsFrom`). The copy is shallow on purpose: each entry's
+   `top_logprobs` is its own allocation, stable for the life of the slot and
+   owned by the slot; only the ArrayList's backing array is at risk, and that
+   is exactly what the lock covers.
+
+Safe by construction on the concurrency side: `Scheduler.batchable` returns
+false when `logprobs_n > 0`, so such a slot always runs `runSingleDecodeTick`
+and appends exactly one entry per token, in order.
+
+**Guards.** `tests/test_logprobs.sh` section [4] asserts streaming carries
+logprobs AND agrees with non-streaming token-for-token and VALUE-for-value on
+the same greedy request — which is what catches a partial drain, a duplicated
+one, or an off-by-one high-water mark, none of which "is the field present?"
+can see. Class guard: a source scan (`every streaming chat emitter carries
+logprobs`) rejects a bare `.{}` on any `sendSSEChunk` inside the streaming
+handler, so a NEW emitter cannot silently forget, plus an assertion that both
+halves of the path to the wire still exist (the extra is read, and the rendered
+bytes are interpolated into the chunk).
+
+**Rule of thumb this leaves behind:** when a request field costs something to
+honour, check that the cost buys delivery. A field that disables an
+optimisation and then is not emitted is strictly worse than one that 400s.
+
+---
+
+## `logprobs.content` described the thought, not the answer (2026-08-07)
+
+Found while checking an outside report that llmprobe's fidelity score could not
+rank eight local checkpoints. The report blamed the metric. Half of it was ours.
+
+### The symptom
+
+`logprobs.content` is defined by OpenAI as the tokens of the message CONTENT.
+We built it from the raw `token_ids` of the generation, which also carries the
+reasoning block, leaked tool markup, and anything the loop-trim cuts. So on any
+model that thinks, the array described text the client never received:
+
+| model | reasoning | content | logprobs entries |
+|---|---|---|---|
+| Qwen3.6-27B (3 builds) | 693 ch | 8 ch | 186 |
+| Qwen3.6-35B-A3B distill | 404 ch | 8 ch | 105 |
+| gemma-4-31b | 138 ch | 8 ch | 37 |
+| gemma-4-e4b | 303 ch | 8 ch | 79 |
+| Qwen3-4B | 443 ch | 8 ch | 104 |
+| LFM2.5-2.6B | 186 ch | 8 ch | 44 |
+
+`logprobs.content[0]` came back as `'Here'` / `'Thinking'` / `'<|channel>'` /
+`'<think>'` — the opening token of the model's reasoning. LFM2.5 does it with
+thinking OFF as well, because its template opens `<think>` unconditionally, so
+the block exists and is stripped regardless of the request flag.
+
+This is why an outside fidelity probe read `'The'` (from "The user is asking
+for…") as the answer token on every item of its battery, and concluded the
+measurement was saturated. It was pointed at the wrong position.
+
+### Why nothing caught it
+
+Same shape as the streaming drop above. Output-equality tests see identical
+text either way. The conformance suite that would have noticed reads
+`logprobs.content[0]` and trusts it — it has no independent idea of where the
+answer starts. And on a model that does NOT think, the array is correct, so any
+spot-check against Gemma answering directly looks fine.
+
+### The fix, and the trap inside it
+
+Non-streaming is arithmetic: the split helpers return raw slices into the
+generated text, so `contentTokenRange` recovers the content's byte offset by
+pointer comparison and walks per-token decoded lengths to a token index. A
+content slice it cannot locate (a future transform that rewrites rather than
+cuts) keeps the FULL range — an array we cannot align still beats no array.
+
+Streaming cannot use that directly, because the emit sites fire on the gate's
+cadence and the pending window does not correspond to any one buffer. So it is
+structural instead:
+
+- reasoning emitters never drain (they pass `.{}`);
+- a content chunk emitted after a block calls `StreamLogprobs.skipToContent`
+  first, which indexes `ids`/`lens` — complete by construction — rather than the
+  pending window, so a token whose logprob has not published yet still has a
+  length and cannot skew the boundary.
+
+**The trap: empty content.** A think block that closes with nothing after it
+emits no content chunk at all. `skipToContent` returning early on empty content
+therefore left the entire thought pending, and it rode the NEXT chunk — measured
+42 entries on a one-character delta. Four sites needed the `dropPending` arm,
+and the first three attempts at this fix were verified against the wrong code
+path entirely: the model in hand routes through the prompt-opened-think arm, not
+`.split_think`, and dumping the raw SSE frames was the only thing that showed
+which chunk actually carried the entries. **Read the wire before deciding which
+branch to patch.**
+
+The emitter scan is now two-sided: a content emitter must drain, a reasoning
+emitter must not. A one-sided guard would have accepted the version that shipped
+the thought's entries alongside the answer.
+
+## A logprobs token string is a BPE fragment (2026-08-07)
+
+A single token can carry HALF a multi-byte character; the rest arrives in the
+next token. `jsonEscape` passes every byte >= 0x20 through verbatim, so a
+`top_logprobs` candidate of `b"\xf0\x9f"` — the leading half of a 4-byte emoji,
+seen on Jundot/Qwen3.6-27B-oQ4e-mtp — went into the JSON string as raw bytes:
+
+```
+"bytes":[10,10]},{"token":"\xf0\x9f","logprob":-15.000000,"bytes":[240,15…
+                           ^ byte 75009 of a 77211-byte body
+UnicodeDecodeError: 'utf-8' codec can't decode bytes in position 75009-75010
+```
+
+The whole response fails to parse. Not a degraded field — an unusable response,
+from one candidate in one top-5 list. It surfaced as a bare decode error while
+sweeping models for the alignment bug, on one model out of seven.
+
+`jsonEscapeLossy` emits U+FFFD per invalid sequence, using the maximal-subpart
+rule so a character split across two tokens costs one replacement rather than
+one per byte. `bytes` is untouched and still carries the exact bytes, which is
+OpenAI's own shape and lets a client reassemble across tokens.
+
+Two things not to do:
+
+- **Do not widen it to `jsonEscape` or `appendJsonString`.** Every other string
+  we emit is complete decoded text and valid UTF-8 by construction; the fragment
+  problem is unique to per-token decodes.
+- **Do not "fix" the legacy collision.** `/v1/completions` keys `top_logprobs`
+  by token TEXT, so two invalid candidates both render U+FFFD and collide into
+  one key. That is OpenAI's shape reproduced faithfully; a test that pins it away
+  would be pinning our own invention.
+
+The integration guard checks EVERY response body the script produces rather than
+one crafted request, because which request happens to draw a split candidate
+into its top-5 is luck.
+
+## The H3 residency bill: a staged plan billed as if it were not one (2026-08-07)
+
+Reported as two issues against the app: "MLX Core.app can't reach the workaround"
+and "the staged-peak formula still overcounts, by a lot". Both were right.
+
+The `h3PeakBytes` shipped with #126 was `max(TE, DiT) + video_vae + audio_vae`,
+and its own doc comment admitted the VAE term was not an accounting claim but a
+"direction-safe margin for decode-phase activations". Two overcounts rode on
+that:
+
+1. **The VAEs are billed against the DiT.** `minimax_h3.generate` scopes the DiT
+   in a block that closes before the VAE decode — its own log narrates the whole
+   chain (`encoder released` → `dit resident` → `DiT released` → `video decoded
+   (load+decode)`). The two VAEs DO coexist (the video decoder's `defer` runs at
+   function scope, so it is still resident when the audio VAE loads), which is
+   why they stay one stage.
+
+2. **`transformer.safetensors` is a bad proxy for DiT residency.**
+   `precomputeAdaln` tables the whole schedule's modulation and frees the 13B
+   AdaLN weights — roughly 39% of the DiT's parameters, so the surviving share
+   barely moves with quant width. Measured 32.83 → 20.19 GiB on the 8-bit pack
+   and 17.41 → 10.84 on the 4-bit. The comment right above the call already said
+   "~22 GB instead of ~35"; the estimator two files away had never heard.
+
+On the real 8-bit pack that is 38.97 GiB, ×1.1 = 42.87 against a 48 GB Mac's
+29.95 GiB auto cap, for a process whose measured peak (`footprint --sample 2`,
+768×448/124f) is 26 GB. Refused, permanently, on every Mac under ~96 GB.
+
+### What the fix could NOT be
+
+The obvious replacement — `max(te, dit_resident + lora, vaes)` — drops the only
+slack covering generation transients, which are real: the reporter's own 4-bit
+row shows a 17 GB process peak against 10.84 GiB of DiT weights. Those transients
+scale with pixels × frames (1344×768 is 3× the area of the measured cell), and a
+per-MODEL load gate cannot see a request's shape, so the allowance is a
+judgement call rather than a derivation. What it is NOT is uniform across stages:
+the TE stage is one forward over a few hundred prompt rows. A shared
+`max(stages) + activations` bills the biggest stage for transients it never
+allocates — which, with the TE at 26.28 GiB, is exactly what kept the 8-bit pack
+refused even after the first two fixes.
+
+So: `max(te, max(dit_resident, vaes) + H3_ACTIVATION_BYTES)`, with the allowance
+at 6 GiB against a measured 4.0–5.0.
+
+`h3DitResidentBytes` takes `precompute` as a PARAMETER and the caller reads
+`minimax_h3.adalnPrecomputeOn()` — the same predicate `generate` branches on. A
+bill that assumes the weights are shed while `MINIMAX_H3_ADALN_PRECOMPUTE=0` runs
+the full DiT under-bills by ~12 GiB, and an under-bill here is an uncatchable
+Metal OOM, not a 400.
+
+### The 10% that was double-counted
+
+`gateEstimateBytes` added 10% headroom "for KV / vision / drafter overhead" to
+every bill including a media peak. Those are text-model concepts — a media engine
+has no KV cache and no drafter — and the media estimator now carries an explicit
+transient term of its own. The commit side (`genLoadResidentBytes`) had never
+taken the 10%, so removing it from the gate also makes reserve and commit agree
+exactly, which is what that function's comment always claimed.
+
+Real packs, gate estimate before → after: FL2VA-8bit 42.87 → 28.06 GiB,
+REF2VA-8bit 42.87 → 27.34, FL2VA-4bit 25.11 → 17.32. All three now clear a 48 GB
+Mac's auto cap; the 8-bit bill still sits ~4 GiB above the measured peak.
+
+### Why it was uncheckable
+
+The DiT term was wrong for months because the only number anyone could compare it
+against was the DiT's own `dit resident` log line — added when a weights map
+outliving `Model.load` pinned 13 GB. The TE stage had no such line, so its bill
+(its full file size, still) is now logged the same way. A staged bill whose stages
+do not each report their residency is not auditable, and the audit is the only
+thing that catches this class.
+
+## A cancellation signal that only exists on one response shape (2026-08-07)
+
+Same report: "a disconnected client leaves an orphan job that holds the server
+queue until finished."
+
+`StreamCtx` latched `cancelled` when an SSE progress write FAILED. That is the
+only cancellation media generation ever had, so a non-streaming request — no
+progress writes, nothing to fail — had none. The connection thread is parked in
+`Scheduler.runGeneration` while the job runs on the inference thread, so a client
+that hangs up (or trips its own timeout — a 1344×768 H3 clip outlasts most
+defaults) leaves the GPU producing a video nobody will receive, with every other
+request queued behind it.
+
+The fix is the sink on both paths: `stream = false` no-ops `cb` (an SSE event
+spliced into a single JSON body is unparseable) and keeps only the probe. The
+probe is `Conn.peerClosed`, which the text-generation paths have used for years
+and which media never adopted — and it fixes the streaming path too, where a
+failed write is a LATE signal because TCP send buffers absorb hundreds of events
+after the peer's FIN.
+
+Scope, honestly: only backends that POLL `Progress.cancelled` can be stopped —
+H3, LTX, hunyuan3d, acestep. The image backends never poll it, so a FLUX/Krea
+generation still runs to completion. Those are seconds to a minute; the class is
+the same and the fix would be per-backend loop wiring.
+
+The audit turned up a second thing: `src/gen_sse.zig` was never listed in
+`src/tests.zig`, so its tests had never run. A filter that matches no test still
+reports "1/1 tests passed" (the other test step's), which is why nobody noticed —
+when checking that a new test is red, check it against a deliberately bogus
+filter too.
+
+### Does the H3 shape generalize? Not by itself — and LTX proved it
+
+Asked directly after the fix: does this work for LTX, and for future backends?
+No. `estimatePeakResidentBytesIn` had one `if (model_type == "minimax_h3")` arm
+and everything else fell through to `sumSafetensorsIn`, so the answer for every
+other backend was still "assume nothing is ever freed and everything lives in
+this directory".
+
+For most of them that assumption holds. krea, mage_flow, hunyuan3d, acestep and
+tts each keep text-encoder + DiT + VAE as fields on one Engine struct for the
+engine's lifetime, all inside the model dir — the sum IS their peak.
+
+LTX breaks it twice, in opposite directions (measured on
+`dgrauet/ltx-2.3-mlx-q4`, 29.61 GiB of safetensors):
+
+- `transformer-dev.safetensors` and `transformer-distilled.safetensors` are
+  10.54 GiB each and BOTH ship. `LtxVideoEngine.ensureTransformer` frees the
+  resident one before loading the other, with a comment saying exactly why
+  ("so dev + distilled (11 GB each) never coexist"). The sum bills a phantom
+  10.54 GiB.
+- The Gemma text encoder is not in the model dir at all. `resolveGemmaDir`
+  points at the shared `mlx-community/gemma-3-12b-it-4bit` repo (7.5 GiB), and
+  `ltx_video.gemmaCapture` loads it per generation, uses it, and frees it on
+  return — on top of the entire resident engine. The sum bills it at zero.
+
+The two errors partially cancel on a two-variant pack, which is why nothing had
+been reported. They do NOT cancel on a pack shipping one variant: there the sum
+under-bills by the whole encoder, and under-billing is the uncatchable-OOM side.
+
+So the fix was to name the shape rather than add a second special case:
+`stagedPeakBytes(resident, stages)` — `resident` for what the engine holds
+forever, `stages` for groups that are loaded and freed and therefore never
+coexist, peak = resident + the biggest stage. H3 is `stagedPeakBytes(0, {TE, DiT
++ act, VAEs + act})`; LTX is `stagedPeakBytes(dir_sum − spare_variant, {gemma})`.
+Out-of-dir stages resolve in the OUTER `estimatePeakResidentBytes` so the
+per-directory function stays hermetically testable.
+
+LTX gets NO activation term. H3's 6 GiB is derived from H3 measurements; LTX has
+none, and a fabricated allowance would newly refuse loads that work today. An
+unmeasured number is not a safe default just because it is conservative.
+
+## `--model-dir` is REPEATABLE, and a scan path the SERVER never hears about is a browse-only folder (2026-08-06)
+
+The flag took one directory, so the app's "Custom folder" fed only its OWN picker — a model there was absent from `/v1/models`, and selecting it made `discoveryModelDir` point the server at that model's parent INSTEAD of the library, so the choice was always either/or. `model_discovery.discoverModelsMany` merges N roots FIRST-WINS on a repeated id (not tidiness: `registerStubWithArch` answers `error.DuplicateId` and `registerDiscovered` does `try`, so an un-deduped merge fails registry init and the server does not start), skips an unopenable root with a warning (the second folder can be on an unplugged drive), and the arg loop REFUSES a 9th folder by name rather than dropping it.
+
+App side: `ModelRoots` is the one answer to both "where do downloads go" and "what does the server scan" — the destination is a real setting now (`ServerManager.modelsRoot` was a second hardcoded copy of `DownloadManager`'s path), it leads the scan list so its copy wins a duplicate, and the built-in root stays in that list forever so a moved destination never hides the library already on disk. Gated to Developer ID (`BuildFeatures.customModelFolders`): under MAS the helper is signed `com.apple.security.inherit`, which inherits the app's CONTAINER but NOT its security-scoped grants, so the app could pick a folder the process that reads the weights cannot open. Guards: `tests/test_multi_model_dir.sh`, `ModelRootsTests` (incl. a source scan that only `ServerOptions` may spell `--model-dir` and only `ModelRoots` may build the models root).
+
+**Second bite (2026-08-08): the SERVER kept both roots, the APP's own reads did not.** `scanRoots` (what `--model-dir` gets) kept the built-in root after a destination move, but every app-side read resolved against `modelsDir` alone: `discoverLocalModels` (the whole pre-move library vanished from the picker while `/v1/models` was still serving it), `existingModelDir(for:)`/`isReady` (browser rows offered a re-download of models already on disk), `ServerManager.resolveModelDir` + `componentReady` (a media pack downloaded pre-move read `.modelMissing` — a 69 GB re-download offer), `discoverDrafters`, and `deleteModel`'s root scoping (the trash rendered for a built-in-root model and silently did nothing — dead-control class). Fix: `ModelRoots.ownedRoots` / `DownloadManager.ownedRoots` — destination first, built-in second, FIRST root winning a repeated id (the server's own first-wins rule) — behind every read named above. Three deliberate exclusions: WRITES stay on `modelsDir` (`newLayoutDir` — downloads go where the setting says), CANCEL cleanup stays destination-scoped (a cancel cleans what THIS transfer wrote, never a same-named quant in the built-in root; transfers only ever write into `modelsDir`), and a test-pinned `DownloadManager` keeps `ownedRoots == [modelsDir]` so a temp-dir test can never resolve into — or delete from — the developer's real library. Guards: `OwnedRootDiscoveryTests` (first-wins dedup, built-in fallback, media-gen resolution, pinned-root hermeticity) + the `ownedRoots` case in `ModelRootsTests`.
+
+## Console voice mode = browser STT + Kokoro TTS
+
+`#chat-voice` lives in the COMPOSER row, hidden when `sttSupported` is false — never a button that cannot work. The mic runs ONLY in the `listening` state: leave it live during playback and the page transcribes the assistant's own voice and answers its own sentence. Replies go through `speakableChunks` (markdown STRIPPED not escaped — a fence is announced as "(code block)", a bare URL as "a link") and are synthesized one chunk ahead of playback so the first sentence starts while the rest generates.
+
+## Context-overflow 400s name BOTH counts (`contextOverflowMessage`)
+
+All four text-gen surfaces: "Prompt exceeds maximum context length: N tokens requested, M available". The legacy sentence stays the PREFIX (clients key on it); the counts are only knowable server-side, since the request is rejected before any usage is reported, and without them a client can only say "too long" instead of offering the one action that fixes it. bufPrint failure falls back to the bare sentence rather than sending no body (the media-gen fixed-buffer class). The app renders it as a card.

@@ -100,7 +100,7 @@ struct SettingsView: View {
                 VStack(alignment: .leading, spacing: 0) {
                     SettingsSection(
                         category: .modelFolders,
-                        subtitle: "Always scans ~/.mlx-serve/models and ~/.lmstudio/models. Add one more folder here if your models live elsewhere — no restart needed."
+                        subtitle: "Choose where downloads are saved, and add a folder to scan if some of your models live elsewhere. Every folder listed here is served — restart the server after changing them."
                     ) {
                         ModelFoldersSectionContent()
                     }
@@ -686,15 +686,101 @@ private struct ModelFoldersSectionContent: View {
     @EnvironmentObject var downloads: DownloadManager
 
     private static let explainer = "Accepts both flat layout (<name>/config.json) and 2-level layout (<author>/<name>/config.json)."
+    private static let defaultExplainer = "Where new downloads are saved. Everything already downloaded keeps working — the old folder stays in the scan list. Restart the server to apply."
+
+    /// Re-read after a pick so the row repaints without an @Published mirror of
+    /// a value that lives in UserDefaults.
+    @State private var downloadFolderTick = 0
 
     var body: some View {
+        if BuildFeatures.current.customModelFolders { defaultFolderRow }
+        customFolderRow
+    }
+
+    // MARK: - Default (download destination)
+
+    @ViewBuilder
+    private var defaultFolderRow: some View {
+        let roots = ModelRoots()
+        let configured = roots.configuredDownloadRoot
+        let unavailable = roots.downloadRootIsUnavailable
+        SearchableRow(searchText: ["Default folder", "download", Self.defaultExplainer]) {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(alignment: .firstTextBaseline) {
+                    Text("Default folder")
+                        .font(.body)
+                    Spacer(minLength: 12)
+                    HStack(spacing: 8) {
+                        Text(configured ?? roots.downloadRoot)
+                            .font(.caption.monospaced())
+                            // An unreachable folder is shown in the warning
+                            // colour rather than swapped for the fallback: the
+                            // path the user chose is the thing they need to see
+                            // to understand where their downloads went instead.
+                            .foregroundStyle(unavailable ? AnyShapeStyle(.orange) : AnyShapeStyle(configured == nil ? .secondary : .primary))
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                            .frame(maxWidth: 220, alignment: .trailing)
+                        Button("Choose…") { chooseDownloadFolder() }
+                            .buttonStyle(.bordered)
+                        Button("Reset") {
+                            SecurityScopedBookmark.clear(name: DownloadManager.downloadFolderBookmarkName)
+                            ModelRoots().configuredDownloadRoot = nil
+                            applyFolderChange()
+                        }
+                        .buttonStyle(.bordered)
+                        .disabled(configured == nil)
+                    }
+                }
+                Text(unavailable
+                     ? "That folder isn't reachable right now, so downloads are going to \(ModelRoots.builtInRoot) instead."
+                     : Self.defaultExplainer)
+                    .font(.caption2)
+                    .foregroundStyle(unavailable ? .orange : .secondary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+            .id(downloadFolderTick)
+        }
+    }
+
+    private func chooseDownloadFolder() {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.prompt = "Choose"
+        panel.message = "New model downloads will be saved here."
+        if let existing = ModelRoots().configuredDownloadRoot {
+            panel.directoryURL = URL(fileURLWithPath: (existing as NSString).expandingTildeInPath)
+        }
+        guard AppActivation.runModal(panel) == .OK, let url = panel.url else { return }
+        // Store the bookmark while the panel's grant is still live — the same
+        // rule the agent-workspace picker follows.
+        SecurityScopedBookmark.store(url, name: DownloadManager.downloadFolderBookmarkName)
+        SecurityScopedBookmark.startAccessOnce(name: DownloadManager.downloadFolderBookmarkName)
+        ModelRoots().configuredDownloadRoot = url.path
+        applyFolderChange()
+    }
+
+    /// One place for "the library's folders changed": the downloader re-reads
+    /// its destination, the app rescans, and the server needs a restart to pick
+    /// up the new `--model-dir` set (the banner at the top of Settings says so).
+    private func applyFolderChange() {
+        downloads.refreshRoots()
+        appState.refreshModels()
+        downloadFolderTick += 1
+    }
+
+    // MARK: - Custom (extra scan folder)
+
+    private var customFolderRow: some View {
         let pathText: String = {
             let raw = downloads.customRoot?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
             return raw.isEmpty ? "(none)" : raw
         }()
         let hasPath = !(downloads.customRoot?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
 
-        SearchableRow(searchText: ["Custom folder", Self.explainer]) {
+        return SearchableRow(searchText: ["Custom folder", Self.explainer]) {
             VStack(alignment: .leading, spacing: 4) {
                 HStack(alignment: .firstTextBaseline) {
                     Text("Custom folder")
@@ -941,6 +1027,22 @@ private struct ServerSectionContent: View {
                 Toggle("", isOn: $appState.serverOptions.logToFile)
                     .labelsHidden()
                     .toggleStyle(.switch)
+            }
+        }
+        if let m = meta["maxResidentMemGB"] {
+            SettingsRow(
+                title: m.title,
+                explainer: m.explainer,
+                isDirty: dirty.dirty(\.maxResidentMemGB)
+            ) {
+                let gb = appState.serverOptions.maxResidentMemGB
+                snappingSlider(
+                    presets: ServerOptions.residentMemPresets(
+                        physicalMemoryBytes: ProcessInfo.processInfo.physicalMemory),
+                    current: gb,
+                    set: { appState.serverOptions.maxResidentMemGB = $0 },
+                    label: gb == 0 ? "Auto" : "\(gb) GB"
+                )
             }
         }
         if let m = meta["skipMemPreflight"] {
@@ -1864,48 +1966,6 @@ private struct RequestDefaultsSectionContent: View {
         }
     }
 
-    /// Build a snapping slider over a discrete preset list. The slider's float
-    /// value is the index into `presets`; rounding pins to the nearest entry.
-    /// `label` is the textual readout shown next to the slider.
-    @ViewBuilder
-    private func snappingSlider(
-        presets: [Int],
-        current: Int,
-        set: @escaping (Int) -> Void,
-        label: String
-    ) -> some View {
-        let safePresets = presets.isEmpty ? [0] : presets
-        let currentIdx = Self.closestIndex(in: safePresets, to: current)
-        HStack(spacing: 8) {
-            Slider(
-                value: Binding(
-                    get: { Double(currentIdx) },
-                    set: { raw in
-                        let i = Int(raw.rounded())
-                        let clamped = max(0, min(i, safePresets.count - 1))
-                        set(safePresets[clamped])
-                    }
-                ),
-                in: 0...Double(max(1, safePresets.count - 1)),
-                step: 1
-            )
-            .frame(width: 200)
-            Text(label)
-                .font(.body.monospacedDigit())
-                .frame(minWidth: 70, alignment: .trailing)
-        }
-    }
-
-    /// Find the index of the preset closest to `value`, so a stored value not
-    /// on the snap grid still positions the slider sensibly.
-    private static func closestIndex(in presets: [Int], to value: Int) -> Int {
-        if let exact = presets.firstIndex(of: value) { return exact }
-        var best = 0
-        for i in 1..<presets.count where abs(presets[i] - value) < abs(presets[best] - value) {
-            best = i
-        }
-        return best
-    }
 }
 
 // MARK: - Voice (wake phrase) section
@@ -2544,4 +2604,51 @@ private struct UpdatesSectionContent: View {
             return "Releases are published at github.com/\(UpdateChecker.repo)/releases."
         }
     }
+}
+
+// MARK: - Shared numeric control
+
+/// A slider that snaps to a discrete preset list — the float value is the index
+/// into `presets`, rounding pins to the nearest entry. Shared: a setting whose
+/// useful values are a ladder (memory caps, token budgets) reads better as this
+/// than as a free-text field, and a value picked off a ladder cannot be a typo
+/// the launcher has to defend against.
+@ViewBuilder
+private func snappingSlider(
+    presets: [Int],
+    current: Int,
+    set: @escaping (Int) -> Void,
+    label: String
+) -> some View {
+    let safePresets = presets.isEmpty ? [0] : presets
+    let currentIdx = closestPresetIndex(in: safePresets, to: current)
+    HStack(spacing: 8) {
+        Slider(
+            value: Binding(
+                get: { Double(currentIdx) },
+                set: { raw in
+                    let i = Int(raw.rounded())
+                    let clamped = max(0, min(i, safePresets.count - 1))
+                    set(safePresets[clamped])
+                }
+            ),
+            in: 0...Double(max(1, safePresets.count - 1)),
+            step: 1
+        )
+        .frame(width: 200)
+        Text(label)
+            .font(.body.monospacedDigit())
+            .frame(minWidth: 70, alignment: .trailing)
+    }
+}
+
+/// Index of the preset closest to `value`, so a stored value not on the snap
+/// grid still positions the slider sensibly.
+private func closestPresetIndex(in presets: [Int], to value: Int) -> Int {
+    if let exact = presets.firstIndex(of: value) { return exact }
+    var best = 0
+    for i in 1..<presets.count where abs(presets[i] - value) < abs(presets[best] - value) {
+        best = i
+    }
+    return best
 }

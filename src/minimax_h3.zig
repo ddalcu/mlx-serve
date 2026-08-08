@@ -31,7 +31,14 @@ const mlx = @import("mlx.zig");
 const model_mod = @import("model.zig");
 const log = @import("log.zig");
 const mage_flow = @import("mage_flow.zig");
+/// Runtime LoRA adapters, shared with the image/LTX backends — ONE loader for
+/// every adapter format we accept, Turbo included.
+const lora_mod = @import("lora.zig");
 const gen_sse = @import("gen_sse.zig");
+/// Vision presentation math (grids, adaLN tags, mRoPE), pinned against
+/// ComfyUI's own output by `fixtures/minimax_h3_vision.json`.
+pub const h3v = @import("minimax_h3_vision.zig");
+pub const audio_mod = @import("minimax_h3_audio.zig");
 
 const Weights = model_mod.Weights;
 const S = mlx.mlx_stream;
@@ -69,6 +76,17 @@ pub const PATCH_W: u32 = 2;
 pub fn alignFrameCount(n: u32) u32 {
     var v = n;
     while (v % 17 != 5) v += 1;
+    return v;
+}
+
+/// Snap DOWN to the same ladder, with the model's 5-frame floor. A ref2va
+/// reference video is TRIMMED rather than padded — the reference node drops
+/// frames off the end (`while n % 17 != 5: n -= 1`) because inventing frames
+/// for a reference would condition on content the user never supplied.
+pub fn alignRefFrameCount(n: u32) u32 {
+    if (n < 5) return 0; // below the floor: not a usable reference
+    var v = n;
+    while (v % 17 != 5) v -= 1;
     return v;
 }
 
@@ -123,6 +141,274 @@ pub fn adaptCanvas(w: u32, h: u32) Canvas {
         .w = @max(CANVAS_MULTIPLE, @as(u32, @intFromFloat(roundHalfEven(nom_w / m) * m))),
         .h = @max(CANVAS_MULTIPLE, @as(u32, @intFromFloat(roundHalfEven(nom_h / m) * m))),
     };
+}
+
+/// ref2va reference-image sizing. `match` scales (DOWN only) to the
+/// generation's pixel AREA; `max` scales to a 2048 short edge for identity
+/// fidelity. Reference tokens ride through EVERY sampling step, so `max` is
+/// several times slower — that is a user-facing fact, not an implementation
+/// detail, and the request docs say so.
+pub const RefImageSizing = enum { match, max };
+pub const REF_IMAGE_SHORT_EDGE: u32 = 2048;
+
+fn snap32(v: f64) u32 {
+    const m: f64 = @floatFromInt(CANVAS_MULTIPLE);
+    const r = roundHalfEven(v / m) * m;
+    return @max(CANVAS_MULTIPLE, @as(u32, @intFromFloat(r)));
+}
+
+/// The canvas a reference IMAGE is resized to before it is VAE-encoded and fed
+/// to the vision tower. Never upscales (`min(1.0, …)`) — inventing detail for
+/// a reference is worse than giving the model fewer tokens.
+pub fn refImageCanvas(w: u32, h: u32, gen_w: u32, gen_h: u32, mode: RefImageSizing) Canvas {
+    const fw: f64 = @floatFromInt(w);
+    const fh: f64 = @floatFromInt(h);
+    const scale = switch (mode) {
+        .match => @min(1.0, @sqrt((@as(f64, @floatFromInt(gen_w)) * @as(f64, @floatFromInt(gen_h))) / (fw * fh))),
+        .max => @min(1.0, @as(f64, @floatFromInt(REF_IMAGE_SHORT_EDGE)) / @as(f64, @floatFromInt(@min(w, h)))),
+    };
+    return .{ .w = snap32(fw * scale), .h = snap32(fh * scale) };
+}
+
+/// The canvas a reference VIDEO is resized to. `adaptCanvas` normalizes to the
+/// model's 768 short edge, which UPSCALES a small clip; the reference node
+/// declines that and falls back to plain /32 rounding, so a reference video is
+/// never enlarged.
+pub fn refVideoCanvas(w: u32, h: u32) Canvas {
+    const c = adaptCanvas(w, h);
+    if (w * h < c.w * c.h) {
+        return .{ .w = snap32(@floatFromInt(w)), .h = snap32(@floatFromInt(h)) };
+    }
+    return c;
+}
+
+// ── ref2va request resolution ───────────────────────────────────────────────
+//
+// Turning a request's reference list into the block list `PackedLayout` wants
+// is pure arithmetic, and it is where the ORDER and the ORDINALS are decided —
+// both of which are a contract with the checkpoint, since the prompt addresses
+// references as `<Picture i>` / `<Video k>` / `<Audio j>`. Kept separate from
+// any decoding so it can be tested without pixels.
+
+pub const MAX_REF_IMAGES: usize = 9;
+pub const MAX_REF_VIDEOS: usize = 3;
+pub const MAX_REF_AUDIOS: usize = 3;
+/// MiniMax's own limit is 12 files ACROSS all types, which the three per-type
+/// caps do not express — they sum to 15, so a set can clear every one of them
+/// and still be a set the model was never given.
+pub const MAX_REF_TOTAL: usize = 12;
+/// The reference node's floor: below 5 frames (~0.2 s at 24 fps) there is not
+/// one latent frame to condition on.
+pub const MIN_REF_VIDEO_FRAMES: u32 = 5;
+
+/// Why a reference set cannot be served. Every arm is a NAMED 400 — a silently
+/// dropped reference is worse than a refusal, because the generation succeeds
+/// and simply ignores what the user asked it to follow.
+pub const RefReject = enum {
+    too_many_images,
+    too_many_videos,
+    too_many_audios,
+    too_many_refs,
+    video_too_short,
+    empty_video,
+
+    pub fn message(self: RefReject) []const u8 {
+        return switch (self) {
+            .too_many_images => "too many reference images ('ref_images' takes at most 9)",
+            .too_many_videos => "too many reference videos ('ref_videos' takes at most 3)",
+            .too_many_audios => "too many reference audios ('ref_audios' takes at most 3)",
+            .too_many_refs => "too many references: at most 12 files across 'ref_images', 'ref_videos' and 'ref_audios' combined",
+            .video_too_short => "a reference video needs at least 5 frames (~0.2s at 24 fps)",
+            .empty_video => "a 'ref_videos' entry has no frames",
+        };
+    }
+};
+
+/// One reference as the REQUEST describes it, before anything is decoded.
+pub const RefInput = struct {
+    kind: enum { image, video, audio },
+    /// image / video: the supplied pixel dimensions.
+    w: u32 = 0,
+    h: u32 = 0,
+    /// video: how many source frames were supplied (at 24 fps).
+    frames: u32 = 0,
+    /// audio (standalone, or a video's soundtrack): samples AT THE VAE's
+    /// 32 kHz rate, i.e. after any resample.
+    audio_samples: u32 = 0,
+    /// video only: index into the request's `ref_video_audios`, if one was
+    /// supplied for this video.
+    soundtrack_samples: ?u32 = null,
+};
+
+/// A reference resolved to everything the layout, the presentation and the
+/// encoders need.
+pub const ResolvedRef = struct {
+    kind: enum { image, video, audio },
+    /// 1-based and PER TYPE: the prompt says `<Picture 2>` for the second
+    /// image even if a video came between them.
+    ordinal: u32,
+    /// Index back into the request's own per-type list, so the caller can find
+    /// the bytes it must decode.
+    src_index: usize,
+    canvas: Canvas = .{ .w = 0, .h = 0 },
+    /// video: frames after snapping DOWN to the 17k+5 ladder.
+    frames: u32 = 0,
+    latent_t: u32 = 0,
+    latent_h: u32 = 0,
+    latent_w: u32 = 0,
+    /// Latent audio frames: a video's soundtrack or a standalone audio.
+    audio_t: u32 = 0,
+    /// The `<Audio j>` ordinal a video's soundtrack takes — a soundtrack is
+    /// LABELLED like a standalone audio and shares its counter.
+    audio_ordinal: u32 = 0,
+};
+
+/// The DiT block a resolved reference becomes. `resolveRefs` builds its own
+/// `blocks` through this, so the generation path can go ref -> block without a
+/// second mapping that could drift from it.
+pub fn refBlockFor(r: ResolvedRef) RefBlock {
+    return switch (r.kind) {
+        .image => .{ .kind = .image, .latent_h = r.latent_h, .latent_w = r.latent_w },
+        .audio => .{ .kind = .audio, .audio_t = r.audio_t },
+        .video => .{
+            .kind = .video,
+            .latent_t = r.latent_t,
+            .latent_h = r.latent_h,
+            .latent_w = r.latent_w,
+            .audio_t = r.audio_t,
+        },
+    };
+}
+
+pub const RefResolution = struct {
+    allocator: std.mem.Allocator,
+    refs: []ResolvedRef,
+    blocks: []RefBlock,
+
+    pub fn deinit(self: *RefResolution) void {
+        self.allocator.free(self.refs);
+        self.allocator.free(self.blocks);
+    }
+};
+
+/// Latent audio frames for a sample count — the encoder right-pads to a whole
+/// frame, so this rounds UP.
+fn audioLatentFrames(samples: u32) u32 {
+    const hop: u32 = 800; // minimax_h3_audio.HOP_LENGTH
+    return (samples + hop - 1) / hop;
+}
+
+/// Resolve a request's references into presentation order and DiT blocks.
+///
+/// The order is FIXED by the reference node and is not a preference: images,
+/// then videos (each soundtrack's `<Audio j>` label emitted immediately before
+/// its `<Video k>`), then standalone audio. Ordinals are 1-based per type, and
+/// a video's soundtrack consumes an `<Audio j>` ordinal — so a request with one
+/// soundtracked video and one standalone audio has `<Audio 1>` on the
+/// soundtrack and `<Audio 2>` standalone, not the other way round.
+pub fn resolveRefs(
+    allocator: std.mem.Allocator,
+    images: []const RefInput,
+    videos: []const RefInput,
+    audios: []const RefInput,
+    gen_w: u32,
+    gen_h: u32,
+    mode: RefImageSizing,
+) !union(enum) { ok: RefResolution, reject: RefReject } {
+    // Per-type first: "too many images" is more actionable than "too many
+    // files" when it is one list that is over.
+    if (images.len > MAX_REF_IMAGES) return .{ .reject = .too_many_images };
+    if (videos.len > MAX_REF_VIDEOS) return .{ .reject = .too_many_videos };
+    if (audios.len > MAX_REF_AUDIOS) return .{ .reject = .too_many_audios };
+    if (images.len + videos.len + audios.len > MAX_REF_TOTAL) return .{ .reject = .too_many_refs };
+    for (videos) |v| {
+        if (v.frames == 0) return .{ .reject = .empty_video };
+        if (v.frames < MIN_REF_VIDEO_FRAMES) return .{ .reject = .video_too_short };
+    }
+
+    var refs: std.ArrayList(ResolvedRef) = .empty;
+    errdefer refs.deinit(allocator);
+    var blocks: std.ArrayList(RefBlock) = .empty;
+    errdefer blocks.deinit(allocator);
+
+    var n_img: u32 = 0;
+    var n_vid: u32 = 0;
+    var n_aud: u32 = 0;
+
+    for (images, 0..) |img, i| {
+        n_img += 1;
+        const c = refImageCanvas(img.w, img.h, gen_w, gen_h, mode);
+        const r: ResolvedRef = .{
+            .kind = .image,
+            .ordinal = n_img,
+            .src_index = i,
+            .canvas = c,
+            .latent_h = c.h / VAE_SPATIAL,
+            .latent_w = c.w / VAE_SPATIAL,
+        };
+        try refs.append(allocator, r);
+        try blocks.append(allocator, refBlockFor(r));
+    }
+
+    for (videos, 0..) |vid, i| {
+        n_vid += 1;
+        const c = refVideoCanvas(vid.w, vid.h);
+        const aligned = alignRefFrameCount(vid.frames);
+        if (aligned == 0) return .{ .reject = .video_too_short };
+        var audio_t: u32 = 0;
+        var audio_ord: u32 = 0;
+        if (vid.soundtrack_samples) |smp| {
+            audio_t = audioLatentFrames(smp);
+            n_aud += 1;
+            audio_ord = n_aud;
+        }
+        const r: ResolvedRef = .{
+            .kind = .video,
+            .ordinal = n_vid,
+            .src_index = i,
+            .canvas = c,
+            .frames = aligned,
+            .latent_t = videoLatentT(aligned),
+            .latent_h = c.h / VAE_SPATIAL,
+            .latent_w = c.w / VAE_SPATIAL,
+            .audio_t = audio_t,
+            .audio_ordinal = audio_ord,
+        };
+        try refs.append(allocator, r);
+        try blocks.append(allocator, refBlockFor(r));
+    }
+
+    for (audios, 0..) |aud, i| {
+        n_aud += 1;
+        const r: ResolvedRef = .{
+            .kind = .audio,
+            .ordinal = n_aud,
+            .src_index = i,
+            .audio_t = audioLatentFrames(aud.audio_samples),
+            .audio_ordinal = n_aud,
+        };
+        try refs.append(allocator, r);
+        try blocks.append(allocator, refBlockFor(r));
+    }
+
+    return .{ .ok = .{
+        .allocator = allocator,
+        .refs = try refs.toOwnedSlice(allocator),
+        .blocks = try blocks.toOwnedSlice(allocator),
+    } };
+}
+
+/// Source-frame indices Qwen sees for a reference video: every 12th frame, i.e.
+/// 2 fps out of 24. The DiT sees ALL the frames through the VAE; the vision
+/// tower sees this subsample with timestamps, which is what the `<T.T seconds>`
+/// labels count.
+pub fn qwenFrameStride() u32 {
+    return FPS / 2;
+}
+
+pub fn qwenSampledFrames(aligned_frames: u32) u32 {
+    const stride = qwenFrameStride();
+    return (aligned_frames + stride - 1) / stride;
 }
 
 /// Python's `round`, i.e. half-to-even — NOT Zig's `@round`, which rounds half
@@ -241,6 +527,23 @@ pub const Segment = struct { start: u32, end: u32, kind: SegmentKind };
 /// so do we (an interior anchor has no defined temporal coordinate).
 pub const KeyframeAnchor = enum { first, last };
 
+/// One ref2va reference block, in REQUEST order. The reference orders them
+/// images → videos → standalone audio, and a video's soundtrack packs
+/// immediately BEFORE its own video rows (sharing the block's cursor origin),
+/// which is why a soundtracked video is one block and not two.
+pub const RefBlock = struct {
+    kind: enum { image, audio, video },
+    /// image / video: the block's OWN latent grid, which need not match the
+    /// target's — every reference carries its own aspect.
+    latent_h: u32 = 0,
+    latent_w: u32 = 0,
+    /// video only.
+    latent_t: u32 = 0,
+    /// Audio latent frames: a video block's soundtrack, or a standalone audio.
+    /// Zero means the block contributes no audio rows at all.
+    audio_t: u32 = 0,
+};
+
 /// Static packed-sequence structure for one shape + conditioning signature.
 ///
 /// Layout is `[text | cond... | audio | video]`, and the target audio/video are
@@ -257,6 +560,12 @@ pub const PackedLayout = struct {
     /// denoised, false = a condition row that is re-injected every step.
     img_update: []bool,
     audio_update: []bool,
+    /// AdaLN modality tag per TEXT row, or empty for a uniform text span.
+    /// BORROWED from the encoded prompt — the layout does not free it, and it
+    /// must outlive the layout. Non-empty only when the presentation spliced
+    /// vision blocks into the prompt, which is the one case where the text
+    /// segment is NOT uniform in modality.
+    text_tags: []const u8 = &.{},
     text_len: u32,
     latent_t: u32,
     latent_h: u32,
@@ -273,6 +582,20 @@ pub const PackedLayout = struct {
         keyframes: []const KeyframeAnchor,
         frame_count: u32,
     ) !PackedLayout {
+        return initFull(allocator, text_len, latent_t, latent_h, latent_w, audio_t, keyframes, frame_count, &.{});
+    }
+
+    pub fn initFull(
+        allocator: std.mem.Allocator,
+        text_len: u32,
+        latent_t: u32,
+        latent_h: u32,
+        latent_w: u32,
+        audio_t: u32,
+        keyframes: []const KeyframeAnchor,
+        frame_count: u32,
+        refs: []const RefBlock,
+    ) !PackedLayout {
         const area = @sqrt(@as(f64, @floatFromInt(latent_h)) * @as(f64, @floatFromInt(latent_w)));
         const h_axis = try axisFromSqrtArea(allocator, latent_h, PATCH_H, area);
         defer allocator.free(h_axis);
@@ -283,21 +606,51 @@ pub const PackedLayout = struct {
         const n_cond: u32 = @intCast(keyframes.len);
         const n_audio_rows = audio_t * 2;
         const n_video_rows = latent_t * frame_rows;
-        const seq_len = text_len + n_cond * frame_rows + n_audio_rows + n_video_rows;
 
-        var segments = try std.ArrayList(Segment).initCapacity(allocator, 3 + n_cond);
+        // Reference rows, counted before anything is allocated so the row
+        // budgets cannot disagree with what the loop below writes.
+        var ref_img_rows: u32 = 0;
+        var ref_audio_rows: u32 = 0;
+        var ref_segments: u32 = 0;
+        for (refs) |b| {
+            switch (b.kind) {
+                .image => {
+                    ref_img_rows += refFrameRows(b);
+                    ref_segments += 1;
+                },
+                .audio => {
+                    if (b.audio_t > 0) {
+                        ref_audio_rows += b.audio_t * 2;
+                        ref_segments += 1;
+                    }
+                },
+                .video => {
+                    if (b.audio_t > 0) {
+                        ref_audio_rows += b.audio_t * 2;
+                        ref_segments += 1;
+                    }
+                    ref_img_rows += b.latent_t * refFrameRows(b);
+                    ref_segments += 1;
+                },
+            }
+        }
+
+        const seq_len = text_len + n_cond * frame_rows + ref_img_rows + ref_audio_rows + n_audio_rows + n_video_rows;
+
+        var segments = try std.ArrayList(Segment).initCapacity(allocator, 3 + n_cond + ref_segments);
         errdefer segments.deinit(allocator);
         const position_ids = try allocator.alloc(f64, @as(usize, seq_len) * 3);
         errdefer allocator.free(position_ids);
-        const img_update = try allocator.alloc(bool, n_cond * frame_rows + n_video_rows);
+        const img_update = try allocator.alloc(bool, n_cond * frame_rows + ref_img_rows + n_video_rows);
         errdefer allocator.free(img_update);
-        const audio_update = try allocator.alloc(bool, n_audio_rows);
+        const audio_update = try allocator.alloc(bool, ref_audio_rows + n_audio_rows);
         errdefer allocator.free(audio_update);
 
         @memset(position_ids, 0);
 
         var row: u32 = 0;
         var img_row: u32 = 0;
+        var audio_row: u32 = 0;
 
         // text: t = 0..text_len-1, h = w = 0
         try segments.append(allocator, .{ .start = 0, .end = text_len, .kind = .text });
@@ -306,7 +659,7 @@ pub const PackedLayout = struct {
 
         // The cursor the target streams share. Without refs it stays at
         // text_len; the ref2va branch advances it per reference block.
-        const cursor: f64 = @floatFromInt(text_len);
+        var cursor: f64 = @floatFromInt(text_len);
 
         // fl2va keyframe condition rows, sharing the target spatial grid.
         for (keyframes) |anchor| {
@@ -330,10 +683,83 @@ pub const PackedLayout = struct {
         }
         _ = frame_count; // only the anchor matters; kept for call-site symmetry
 
+        // ref2va blocks, in request order. Each ADVANCES THE CURSOR by its own
+        // amount, so the target streams start after everything the references
+        // occupy — a wrong advance overlaps a reference with the target in
+        // position space and the model conditions on a smear.
+        const target_w_low = w_axis[0];
+        const target_w_high = w_axis[w_axis.len - 1];
+        for (refs) |b| {
+            switch (b.kind) {
+                .image => {
+                    var g = try RefGrid.init(allocator, b);
+                    defer g.deinit(allocator);
+                    try segments.append(allocator, .{ .start = row, .end = row + g.rows, .kind = .ref_img });
+                    writeFrameGrid(position_ids, row, cursor, g.h_axis, g.w_axis);
+                    for (0..g.rows) |_| {
+                        img_update[img_row] = false;
+                        img_row += 1;
+                    }
+                    row += g.rows;
+                    cursor += 1.0;
+                },
+                .audio => {
+                    if (b.audio_t > 0) {
+                        const n = b.audio_t * 2;
+                        try segments.append(allocator, .{ .start = row, .end = row + n, .kind = .ref_audio });
+                        // A STANDALONE audio has no grid of its own, so it is
+                        // pinned to the TARGET's w extremes.
+                        writeAudioGrid(position_ids, row, cursor, b.audio_t, target_w_low, target_w_high);
+                        for (0..n) |_| {
+                            audio_update[audio_row] = false;
+                            audio_row += 1;
+                        }
+                        row += n;
+                    }
+                    cursor += @floatFromInt(b.audio_t);
+                },
+                .video => {
+                    var g = try RefGrid.init(allocator, b);
+                    defer g.deinit(allocator);
+                    if (b.audio_t > 0) {
+                        const n = b.audio_t * 2;
+                        try segments.append(allocator, .{ .start = row, .end = row + n, .kind = .ref_audio });
+                        // A soundtrack takes ITS OWN video's w extremes, not
+                        // the target's — the two differ whenever the reference
+                        // has a different aspect.
+                        writeAudioGrid(position_ids, row, cursor, b.audio_t, g.w_axis[0], g.w_axis[g.w_axis.len - 1]);
+                        for (0..n) |_| {
+                            audio_update[audio_row] = false;
+                            audio_row += 1;
+                        }
+                        row += n;
+                    }
+                    const n_rows = b.latent_t * g.rows;
+                    try segments.append(allocator, .{ .start = row, .end = row + n_rows, .kind = .ref_img });
+                    const rt_grid = try videoTGrid(allocator, b.latent_t, cursor);
+                    defer allocator.free(rt_grid);
+                    for (rt_grid, 0..) |tv, f| {
+                        writeFrameGrid(position_ids, row + @as(u32, @intCast(f)) * g.rows, tv, g.h_axis, g.w_axis);
+                    }
+                    for (0..n_rows) |_| {
+                        img_update[img_row] = false;
+                        img_row += 1;
+                    }
+                    row += n_rows;
+                    var spans: f64 = 0;
+                    for (0..b.latent_t) |k| spans += videoTSpan(k);
+                    cursor += @max(@as(f64, @floatFromInt(b.audio_t)), spans);
+                },
+            }
+        }
+
         // Target audio, then target video — always the last two segments.
         try segments.append(allocator, .{ .start = row, .end = row + n_audio_rows, .kind = .audio });
-        writeAudioGrid(position_ids, row, cursor, audio_t, w_axis[0], w_axis[w_axis.len - 1]);
-        @memset(audio_update, true);
+        writeAudioGrid(position_ids, row, cursor, audio_t, target_w_low, target_w_high);
+        for (0..n_audio_rows) |_| {
+            audio_update[audio_row] = true;
+            audio_row += 1;
+        }
         row += n_audio_rows;
 
         try segments.append(allocator, .{ .start = row, .end = row + n_video_rows, .kind = .video });
@@ -349,6 +775,8 @@ pub const PackedLayout = struct {
         row += n_video_rows;
 
         std.debug.assert(row == seq_len);
+        std.debug.assert(img_row == img_update.len);
+        std.debug.assert(audio_row == audio_update.len);
         return .{
             .allocator = allocator,
             .seq_len = seq_len,
@@ -381,6 +809,33 @@ pub const PackedLayout = struct {
     /// The target audio segment — second to last by construction.
     pub fn audioSegment(self: *const PackedLayout) Segment {
         return self.segments[self.segments.len - 2];
+    }
+};
+
+/// Rows one latent frame of a reference block contributes.
+fn refFrameRows(b: RefBlock) u32 {
+    return (b.latent_h / PATCH_H) * (b.latent_w / PATCH_W);
+}
+
+/// A reference block's OWN area-normalized position axes. Every reference keeps
+/// its own aspect, so it cannot borrow the target's grid — the coordinates are
+/// normalized over each block's own extent.
+const RefGrid = struct {
+    h_axis: []f64,
+    w_axis: []f64,
+    rows: u32,
+
+    fn init(allocator: std.mem.Allocator, b: RefBlock) !RefGrid {
+        const area = @sqrt(@as(f64, @floatFromInt(b.latent_h)) * @as(f64, @floatFromInt(b.latent_w)));
+        const h = try axisFromSqrtArea(allocator, b.latent_h, PATCH_H, area);
+        errdefer allocator.free(h);
+        const w = try axisFromSqrtArea(allocator, b.latent_w, PATCH_W, area);
+        return .{ .h_axis = h, .w_axis = w, .rows = @intCast(h.len * w.len) };
+    }
+
+    fn deinit(self: *RefGrid, allocator: std.mem.Allocator) void {
+        allocator.free(self.h_axis);
+        allocator.free(self.w_axis);
     }
 };
 
@@ -473,6 +928,20 @@ fn sliceRows(x: mlx.mlx_array, lo: c_int, hi: c_int, s: S) !mlx.mlx_array {
     var o = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(o);
     try mlx.check(mlx.mlx_slice(&o, x, &start, 2, &stop, 2, &step, 2, s));
+    return contig(o, s);
+}
+/// Slice `[lo, hi)` on axis 0 of an array of any rank, materialized.
+fn sliceAxis0(x: mlx.mlx_array, lo: c_int, hi: c_int, s: S) !mlx.mlx_array {
+    const shp = mlx.getShape(x);
+    var start: [8]c_int = @splat(0);
+    var stop: [8]c_int = undefined;
+    var step: [8]c_int = @splat(1);
+    for (shp, 0..) |d, i| stop[i] = @intCast(d);
+    start[0] = lo;
+    stop[0] = hi;
+    var o = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(o);
+    try mlx.check(mlx.mlx_slice(&o, x, &start, shp.len, &stop, shp.len, &step, shp.len, s));
     return contig(o, s);
 }
 /// Slice the last axis of a 4-D array, materialized.
@@ -569,11 +1038,45 @@ pub const Config = struct {
 
 // ── Weights ─────────────────────────────────────────────────────────────────
 
+/// The low-rank adapters attached to ONE linear, applied at RUN TIME:
+/// `y = base(x) + Σᵢ scaleᵢ·(x @ Aᵀᵢ) @ Bᵀᵢ`. Never folded into the base
+/// weight — the reference node is explicit that merging rounds the delta away
+/// in bf16 and requantizes it away on quantized bases, and both our packs are
+/// quantized.
+///
+/// Non-owning, exactly like flux/krea: the arrays belong to the `lora.Stack`
+/// the generation holds, which outlives the model. The Turbo LoRA is simply
+/// the first file in that stack — it IS a LoRA, so it gets no private path.
+const LoraSlot = struct {
+    refs: [lora_mod.MAX_LORAS]lora_mod.Ref = undefined,
+    count: u8 = 0,
+
+    fn set(self: *LoraSlot, refs: []const lora_mod.Ref) void {
+        self.count = @intCast(refs.len);
+        @memcpy(self.refs[0..refs.len], refs);
+    }
+    fn active(self: *const LoraSlot) []const lora_mod.Ref {
+        return self.refs[0..self.count];
+    }
+};
+
+/// `y + Σ deltas` when anything is attached; `y` unchanged otherwise.
+/// Consumes `y` either way, so call sites stay one-line.
+fn loraAdd(y: mlx.mlx_array, x: mlx.mlx_array, slot: LoraSlot, s: S) !mlx.mlx_array {
+    if (slot.count == 0) return y;
+    defer _ = mlx.mlx_array_free(y);
+    const d = try lora_mod.deltaSum(x, slot.active(), s);
+    defer _ = mlx.mlx_array_free(d);
+    return addA(y, d, s);
+}
+
 const AttnW = struct {
     qkv: MfLinear,
     q_norm: mlx.mlx_array,
     k_norm: mlx.mlx_array,
     out: MfLinear,
+    qkv_lora: LoraSlot = .{},
+    out_lora: LoraSlot = .{},
 
     fn load(w: *const Weights, a: std.mem.Allocator, prefix: []const u8, cfg: Config, dt: mlx.mlx_dtype, s: S) !AttnW {
         const qkv_p = try std.fmt.allocPrint(a, "{s}.qkv_proj", .{prefix});
@@ -600,6 +1103,8 @@ const AttnW = struct {
 const MlpW = struct {
     fc1: MfLinear, // [2*ffn, hidden] — gate and up FUSED
     fc2: MfLinear,
+    fc1_lora: LoraSlot = .{},
+    fc2_lora: LoraSlot = .{},
 
     fn load(w: *const Weights, a: std.mem.Allocator, prefix: []const u8, cfg: Config, dt: mlx.mlx_dtype, s: S) !MlpW {
         const p1 = try std.fmt.allocPrint(a, "{s}.fc1", .{prefix});
@@ -626,6 +1131,11 @@ const AdalnW = struct {
     expand: u32,
     /// 3 for a DiT block (video/text/audio), 1 for the final layer.
     modalities: u32,
+    /// Turbo delta on the projection. Input is silu(t_emb) — exactly what the
+    /// reference node re-injects on pruned bases — so hooking `forward` covers
+    /// BOTH the precompute path and the per-step MINIMAX_H3_ADALN_PRECOMPUTE=0
+    /// path, and the pair is freed with the weight after precompute.
+    lora: LoraSlot = .{},
 
     fn load(w: *const Weights, a: std.mem.Allocator, prefix: []const u8, cfg: Config, expand: u32, modalities: u32, dt: mlx.mlx_dtype, s: S) !AdalnW {
         const p = try std.fmt.allocPrint(a, "{s}.linear", .{prefix});
@@ -651,7 +1161,8 @@ const AdalnW = struct {
         std.debug.assert(out.len == self.expand);
         const inp = if (apply_silu) try siluA(t_emb, s) else try contig(t_emb, s);
         defer _ = mlx.mlx_array_free(inp);
-        const y = try self.linear.forward(inp, self.bias, s);
+        const y_base = try self.linear.forward(inp, self.bias, s);
+        const y = try loraAdd(y_base, inp, self.lora, s);
         defer _ = mlx.mlx_array_free(y);
         const m: c_int = @intCast(mlx.getShape(y)[0]);
         const rows = m * @as(c_int, @intCast(self.modalities));
@@ -951,7 +1462,8 @@ fn attnForward(aw: *const AttnW, x: mlx.mlx_array, cfg: Config, rope: ?RopeTable
     const hd: c_int = @intCast(cfg.attention_head_dim);
     const half: c_int = @intCast(cfg.rotDim() / 2);
 
-    const qkv = try aw.qkv.forward(x, null, s);
+    const qkv_base = try aw.qkv.forward(x, null, s);
+    const qkv = try loraAdd(qkv_base, x, aw.qkv_lora, s);
     defer _ = mlx.mlx_array_free(qkv);
     var parts: [3]mlx.mlx_array = undefined;
     try splitEqual(qkv, 3, 1, &parts, s);
@@ -1030,12 +1542,14 @@ fn attnForward(aw: *const AttnW, x: mlx.mlx_array, cfg: Config, rope: ?RopeTable
     defer _ = mlx.mlx_array_free(bc);
     const flat = try reshape(bc, &[_]c_int{ n, h * hd }, s);
     defer _ = mlx.mlx_array_free(flat);
-    return aw.out.forward(flat, null, s);
+    const out_base = try aw.out.forward(flat, null, s);
+    return loraAdd(out_base, flat, aw.out_lora, s);
 }
 
 /// fc1 emits gate and up FUSED as [S, 2*ffn]; SwiGLU is silu(gate) * up.
 fn mlpForward(mw: *const MlpW, x: mlx.mlx_array, s: S) !mlx.mlx_array {
-    const y = try mw.fc1.forward(x, null, s);
+    const y_base = try mw.fc1.forward(x, null, s);
+    const y = try loraAdd(y_base, x, mw.fc1_lora, s);
     defer _ = mlx.mlx_array_free(y);
     var halves: [2]mlx.mlx_array = undefined;
     try splitEqual(y, 2, 1, &halves, s);
@@ -1046,7 +1560,8 @@ fn mlpForward(mw: *const MlpW, x: mlx.mlx_array, s: S) !mlx.mlx_array {
     defer _ = mlx.mlx_array_free(g);
     const act = try mulA(g, halves[1], s);
     defer _ = mlx.mlx_array_free(act);
-    return mw.fc2.forward(act, null, s);
+    const o_base = try mw.fc2.forward(act, null, s);
+    return loraAdd(o_base, act, mw.fc2_lora, s);
 }
 
 // ── Modulation over packed segments ─────────────────────────────────────────
@@ -1182,9 +1697,14 @@ pub fn buildTimestepPlan(
         }
     }.f;
 
-    var runs = try allocator.alloc(ModRun, layout.segments.len);
+    // One run per segment, EXCEPT a text segment carrying vision blocks: those
+    // rows mix modalities, so the reference resolves them into tag runs here.
+    // Sized for the worst case (every text row its own run) and trimmed.
+    const cap = layout.segments.len + layout.text_tags.len;
+    var runs = try allocator.alloc(ModRun, cap);
     errdefer allocator.free(runs);
-    for (layout.segments, 0..) |seg, i| {
+    var nr: usize = 0;
+    for (layout.segments) |seg| {
         const t = switch (seg.kind) {
             .text, .video => t_v,
             .audio => t_a,
@@ -1193,12 +1713,28 @@ pub fn buildTimestepPlan(
         };
         // Row = t_row * modalities + tag. The `* 3` is the AdaLN reshape's
         // modality stride, not an arbitrary constant.
-        runs[i] = .{
-            .start = seg.start,
-            .end = seg.end,
-            .mod_row = rowOf(uniq[0..n], t) * 3 + seg.kind.modalityTag(),
-        };
+        const row_base = rowOf(uniq[0..n], t) * 3;
+        if (seg.kind == .text and layout.text_tags.len == seg.end - seg.start) {
+            const tags = layout.text_tags;
+            var run_start: u32 = 0;
+            var i: u32 = 1;
+            while (i <= tags.len) : (i += 1) {
+                if (i == tags.len or tags[i] != tags[run_start]) {
+                    runs[nr] = .{
+                        .start = seg.start + run_start,
+                        .end = seg.start + i,
+                        .mod_row = row_base + tags[run_start],
+                    };
+                    nr += 1;
+                    run_start = i;
+                }
+            }
+            continue;
+        }
+        runs[nr] = .{ .start = seg.start, .end = seg.end, .mod_row = row_base + seg.kind.modalityTag() };
+        nr += 1;
     }
+    runs = try allocator.realloc(runs, nr);
     return .{ .unique_t = uniq, .n_unique = n, .runs = runs, .allocator = allocator };
 }
 
@@ -1393,13 +1929,43 @@ pub const AttnBroadcast = struct {
     }
 };
 
+/// Steps at the head of the schedule that always recompute in full.
+/// Scale a gate that is `at_30` steps wide on the 30-step schedule down to
+/// short runs, never below 1 and never ABOVE its 30-step width.
+///
+/// The width has to follow the run length: as literals, warmup 4 + tail 2 are
+/// the whole of a 6-step run, so the fast recipe silently did nothing at or
+/// below that (live 2026-08-04 — a 4-step 768p run logged "attn-broadcast k=2"
+/// and then four identical full steps). Clamping at the 30-step value means no
+/// schedule anyone has eyeballed moves: 30 and 50 are bit-identical to the
+/// literals, only shorter runs change.
+fn scaledGate(steps: u32, at_30: u32) usize {
+    return @max(1, @min(at_30, steps * at_30 / 30));
+}
+
+fn attnBroadcastWarmup(steps: u32) usize {
+    return scaledGate(steps, 4);
+}
+
+/// Steps at the tail that always recompute in full.
+fn attnBroadcastTail(steps: u32) usize {
+    return scaledGate(steps, 2);
+}
+
+/// Steps before the velocity cache may reuse a previous forward. Never 0 —
+/// step 0 has no previous velocity to reuse.
+pub fn stepCacheWarmup(steps: u32) usize {
+    return scaledGate(steps, 2);
+}
+
 /// Refresh schedule: k<=1 disables broadcast (always refresh); otherwise the
-/// first 4 and last 2 steps always recompute, and every k-th step in between.
+/// warmup and tail steps always recompute, and every k-th step in between.
 pub fn attnBroadcastRefresh(i: usize, steps: u32, k: u32) bool {
     if (k <= 1) return true;
-    if (i < 4) return true;
-    if (i + 2 >= steps) return true;
-    return (i - 4) % k == 0;
+    const warm = attnBroadcastWarmup(steps);
+    if (i < warm) return true;
+    if (i + attnBroadcastTail(steps) >= steps) return true;
+    return (i - warm) % k == 0;
 }
 
 // ── Model ───────────────────────────────────────────────────────────────────
@@ -1546,10 +2112,20 @@ pub const Model = struct {
                 arr(v, w.q_norm);
                 arr(v, w.k_norm);
                 lin(v, &w.out);
+                lp(v, w.qkv_lora);
+                lp(v, w.out_lora);
             }
             fn ml(v: mlx.mlx_vector_array, w: *const MlpW) void {
                 lin(v, &w.fc1);
                 lin(v, &w.fc2);
+                lp(v, w.fc1_lora);
+                lp(v, w.fc2_lora);
+            }
+            fn lp(v: mlx.mlx_vector_array, slot: LoraSlot) void {
+                for (slot.active()) |r| {
+                    arr(v, r.at);
+                    arr(v, r.bt);
+                }
             }
         };
         for ([_]mlx.mlx_array{
@@ -1573,13 +2149,69 @@ pub const Model = struct {
             if (b.adaln) |*ad| {
                 push.lin(vec, &ad.linear);
                 push.arr(vec, ad.bias);
+                push.lp(vec, ad.lora);
             }
         }
         if (self.final_adaln) |*fa| {
             push.lin(vec, &fa.linear);
             push.arr(vec, fa.bias);
+            push.lp(vec, fa.lora);
         }
         try mlx.check(mlx.mlx_eval(vec));
+    }
+
+    /// Every linear a LoRA may target, in ONE list, so attach and the
+    /// completeness check below cannot disagree about what "all of them" is.
+    /// The 259 modules the Turbo LoRA ships: 50 blocks x (qkv, out, fc1, fc2,
+    /// adaln) + 2 refiner blocks x (qkv, out, fc1, fc2) + the final adaln.
+    pub const LORA_TARGETS: u32 = 259;
+
+    /// Attach every adapter in `stack` to the module it names, summed at
+    /// forward time (`lora.deltaSum`). NON-OWNING: `stack` must outlive the
+    /// model. Must run BEFORE `precomputeAdaln` — the adaln delta has to be
+    /// in place while the tables are built, since the weights are freed after.
+    /// Returns per-file attachment counts (index = position in the stack), so
+    /// the caller can hold a file to its own expectation: a Turbo file that
+    /// attaches to fewer than `LORA_TARGETS` modules is a broken artifact, not
+    /// a smaller speedup, while a style LoRA targeting a subset is ordinary.
+    pub fn attachLoras(self: *Model, stack: *const lora_mod.Stack) ![lora_mod.MAX_LORAS]u32 {
+        var counts: [lora_mod.MAX_LORAS]u32 = @splat(0);
+        var buf: [96]u8 = undefined;
+        var rbuf: [lora_mod.MAX_LORAS]lora_mod.Ref = undefined;
+
+        // `Stack.findAll` inlined, because the per-FILE attribution is the
+        // point: a whole-stack total cannot tell "the style LoRA matched 40
+        // modules" from "the Turbo file is missing 40 of its own".
+        const bind = struct {
+            fn f(st: *const lora_mod.Stack, key: []const u8, slot: *LoraSlot, rb: *[lora_mod.MAX_LORAS]lora_mod.Ref, cnt: *[lora_mod.MAX_LORAS]u32) void {
+                var n: usize = 0;
+                for (st.files[0..st.count], st.scales[0..st.count], 0..) |*fl, user_scale, fi| {
+                    const e = fl.find(key) orelse continue;
+                    rb[n] = .{ .at = e.at, .bt = e.bt, .scale = e.scale * user_scale };
+                    n += 1;
+                    cnt[fi] += 1;
+                }
+                if (n > 0) slot.set(rb[0..n]);
+            }
+        }.f;
+
+        for (self.blocks, 0..) |*b, i| {
+            const ad = if (b.adaln) |*ad| ad else return error.LoraAfterAdalnPrecompute;
+            bind(stack, try std.fmt.bufPrint(&buf, "blocks.{d}.attn.qkv_proj", .{i}), &b.attn.qkv_lora, &rbuf, &counts);
+            bind(stack, try std.fmt.bufPrint(&buf, "blocks.{d}.attn.out_proj", .{i}), &b.attn.out_lora, &rbuf, &counts);
+            bind(stack, try std.fmt.bufPrint(&buf, "blocks.{d}.mlp.fc1", .{i}), &b.mlp.fc1_lora, &rbuf, &counts);
+            bind(stack, try std.fmt.bufPrint(&buf, "blocks.{d}.mlp.fc2", .{i}), &b.mlp.fc2_lora, &rbuf, &counts);
+            bind(stack, try std.fmt.bufPrint(&buf, "blocks.{d}.adaln_proj.linear", .{i}), &ad.lora, &rbuf, &counts);
+        }
+        for (self.refiner, 0..) |*b, i| {
+            bind(stack, try std.fmt.bufPrint(&buf, "token_refiner.blocks.{d}.attn.qkv_proj", .{i}), &b.attn.qkv_lora, &rbuf, &counts);
+            bind(stack, try std.fmt.bufPrint(&buf, "token_refiner.blocks.{d}.attn.out_proj", .{i}), &b.attn.out_lora, &rbuf, &counts);
+            bind(stack, try std.fmt.bufPrint(&buf, "token_refiner.blocks.{d}.mlp.fc1", .{i}), &b.mlp.fc1_lora, &rbuf, &counts);
+            bind(stack, try std.fmt.bufPrint(&buf, "token_refiner.blocks.{d}.mlp.fc2", .{i}), &b.mlp.fc2_lora, &rbuf, &counts);
+        }
+        const fa = if (self.final_adaln) |*fa| fa else return error.LoraAfterAdalnPrecompute;
+        bind(stack, "final_layer.adaln_proj.linear", &fa.lora, &rbuf, &counts);
+        return counts;
     }
 
     /// Materialize AdaLN for the whole schedule and RELEASE the 13B AdaLN
@@ -1956,18 +2588,62 @@ const TeLayerW = struct {
     }
 };
 
+/// `MINIMAX_H3_VISION_DEEPSTACK=0` drops the DeepStack taps — a BISECT arm for
+/// the vision conditioning, since the taps are the one part of it that writes
+/// into the LM's own residual stream rather than into its input.
+fn deepstackEnabled() bool {
+    const raw = std.c.getenv("MINIMAX_H3_VISION_DEEPSTACK") orelse return true;
+    return !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
+}
+
+/// One 2-frame patch block entering the ViT. A still image repeats itself to
+/// fill the temporal patch and a video pair carries two distinct frames — the
+/// reference's `process_qwen2vl_images` and `process_video_block` differ ONLY
+/// in what fills those two slots, so both arrive here as the same shape.
+pub const VisionBlock = struct {
+    /// [2, 3, H, W] in [-1, 1], already at the block's Qwen canvas.
+    frames: mlx.mlx_array,
+    grid: h3v.Grid,
+};
+
+/// The Qwen presentation stream: raw token ids interleaved with vision blocks.
+/// NOT chat-templated — no special tokens beyond the vision delimiters, which
+/// this encoder emits itself so a caller cannot forget one.
+pub const PresentItem = union(enum) {
+    text: []const i32,
+    vision: VisionBlock,
+};
+
+pub const EncodedPrompt = struct {
+    allocator: std.mem.Allocator,
+    /// [seq, hidden] — layer-50 hidden state, deliberately NOT final-normed.
+    hidden: mlx.mlx_array,
+    /// AdaLN modality tag per row (1 text, 0 vision). Feeds the text segment's
+    /// run split in `buildTimestepPlan`.
+    tags: []u8,
+
+    pub fn deinit(self: *EncodedPrompt) void {
+        _ = mlx.mlx_array_free(self.hidden);
+        self.allocator.free(self.tags);
+    }
+};
+
 pub const TextEncoder = struct {
     allocator: std.mem.Allocator,
     cfg: TeConfig,
     dtype: mlx.mlx_dtype,
     embed_table: mlx.mlx_array,
     layers: []TeLayerW,
+    /// Loaded only when a caller intends to present vision blocks — the tower
+    /// is 529 tensors of the same file and costs ~1 GB resident.
+    vision: ?mage_flow.VisionTower = null,
 
     pub fn load(allocator: std.mem.Allocator, w: *const Weights, cfg: TeConfig, dt: mlx.mlx_dtype, s: S) !TextEncoder {
         var self: TextEncoder = undefined;
         self.allocator = allocator;
         self.cfg = cfg;
         self.dtype = dt;
+        self.vision = null;
         const raw = try ownWeight(w, "model.embed_tokens.weight");
         defer _ = mlx.mlx_array_free(raw);
         self.embed_table = try astype(raw, dt, s);
@@ -2007,10 +2683,19 @@ pub const TextEncoder = struct {
         return self;
     }
 
+    /// Load the Qwen3-VL vision tower out of the SAME weight map. Separate from
+    /// `load` because a t2va request never touches it, and the tower is 529
+    /// tensors we would otherwise pay for on every generation.
+    pub fn loadVision(self: *TextEncoder, w: *const Weights, s: S) !void {
+        if (self.vision != null) return;
+        self.vision = try mage_flow.VisionTower.loadFrom(self.allocator, s, w, mage_flow.H3_VIT, self.dtype);
+    }
+
     pub fn deinit(self: *TextEncoder) void {
         _ = mlx.mlx_array_free(self.embed_table);
         for (self.layers) |*l| l.deinit();
         self.allocator.free(self.layers);
+        if (self.vision) |*v| v.deinit();
     }
 
     /// Raw prompt ids (NO special tokens) -> [L, hidden] layer-50 hidden state.
@@ -2044,18 +2729,188 @@ pub const TextEncoder = struct {
         return out;
     }
 
+    /// Raw prompt ids + vision blocks -> [seq, hidden] conditioning + adaLN tags.
+    ///
+    /// This is the reference presentation (`MiniMaxH3Tokenizer.tokenize_with_weights`
+    /// + `Qwen3VL.forward`), which differs from the text-only path in three ways
+    /// that all matter and none of which error when missed:
+    ///   - the LM positions become INTERLEAVED 3-axis mRoPE (a vision block
+    ///     collapses to one t position and shifts everything after it),
+    ///   - the tower's three DeepStack taps are ADDED into the LM's first three
+    ///     layers at the vision rows, and
+    ///   - the vision rows carry adaLN modality tag 0 in the DiT, widened over
+    ///     the flanking delimiters.
+    pub fn encodeItems(self: *const TextEncoder, allocator: std.mem.Allocator, items: []const PresentItem, s: S) !EncodedPrompt {
+        const cfg = self.cfg;
+        var n_vision: usize = 0;
+        for (items) |it| if (it == .vision) {
+            n_vision += 1;
+        };
+        if (n_vision > 0 and self.vision == null) return error.VisionTowerNotLoaded;
+
+        // 1. Walk the stream once: sequence length and the vision spans.
+        var spans: std.ArrayList(h3v.Span) = .empty;
+        defer spans.deinit(allocator);
+        var seq_u: u32 = 0;
+        for (items) |it| switch (it) {
+            .text => |ids| seq_u += @intCast(ids.len),
+            .vision => |vb| {
+                const size = vb.grid.mergedTokens();
+                // <|vision_start|> pad… <|vision_end|>: the span index is the
+                // FIRST pad row, one past the opener.
+                try spans.append(allocator, .{ .index = seq_u + 1, .size = size, .grid = vb.grid });
+                seq_u += size + 2;
+            },
+        };
+        const seq: c_int = @intCast(seq_u);
+
+        // 2. Run the tower per block, then assemble embeds by concatenation —
+        //    every segment is contiguous, so no scatter is needed.
+        var merged: std.ArrayList(mlx.mlx_array) = .empty;
+        var ds_blocks: std.ArrayList([3]mlx.mlx_array) = .empty;
+        defer {
+            for (merged.items) |m| _ = mlx.mlx_array_free(m);
+            merged.deinit(allocator);
+            for (ds_blocks.items) |d| for (d) |x| {
+                _ = mlx.mlx_array_free(x);
+            };
+            ds_blocks.deinit(allocator);
+        }
+        for (items) |it| if (it == .vision) {
+            const vb = it.vision;
+            const rows = try visionPatchRows(vb.frames, vb.grid, s);
+            defer _ = mlx.mlx_array_free(rows);
+            const g = [3]i64{ vb.grid.t, vb.grid.gh, vb.grid.gw };
+            const out = try self.vision.?.forward(rows, &[_][3]i64{g});
+            try merged.append(allocator, out.merged);
+            try ds_blocks.append(allocator, out.deepstack);
+        };
+
+        var pieces: std.ArrayList(mlx.mlx_array) = .empty;
+        defer {
+            for (pieces.items) |p| _ = mlx.mlx_array_free(p);
+            pieces.deinit(allocator);
+        }
+        var vi: usize = 0;
+        for (items) |it| switch (it) {
+            .text => |ids| try pieces.append(allocator, try self.embedIds(ids, s)),
+            .vision => {
+                try pieces.append(allocator, try self.embedIds(&[_]i32{h3v.VISION_START}, s));
+                try pieces.append(allocator, try astype(merged.items[vi], self.dtype, s));
+                try pieces.append(allocator, try self.embedIds(&[_]i32{h3v.VISION_END}, s));
+                vi += 1;
+            },
+        };
+        const flat = if (pieces.items.len == 1) try contig(pieces.items[0], s) else try concat(pieces.items, 0, s);
+        defer _ = mlx.mlx_array_free(flat);
+        var x = try reshape(flat, &[_]c_int{ 1, seq, cfg.hidden }, s);
+        errdefer _ = mlx.mlx_array_free(x);
+
+        // 3. Positions: plain 1-D when text-only, interleaved mRoPE otherwise.
+        //    `MINIMAX_H3_VISION_MROPE=0` forces plain 1-D even with vision
+        //    blocks present — a BISECT arm, since the mRoPE switch changes the
+        //    conditioning of the WHOLE prompt, not just the vision rows.
+        const mrope_on = blk2: {
+            const raw = std.c.getenv("MINIMAX_H3_VISION_MROPE") orelse break :blk2 true;
+            break :blk2 !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
+        };
+        const positions = if (mrope_on) try h3v.mropePositions(allocator, seq_u, spans.items) else null;
+        defer if (positions) |p| allocator.free(p);
+        var rope = try self.buildRopeFrom(seq, positions, s);
+        defer rope.deinit();
+        const mask = try causalMask(seq, self.dtype, s);
+        defer _ = mlx.mlx_array_free(mask);
+
+        // 4. Layers, with the DeepStack taps folded in after the first three.
+        for (self.layers, 0..) |*layer, li| {
+            const nx = try self.layerForward(layer, x, mask, rope, seq, s);
+            _ = mlx.mlx_array_free(x);
+            x = nx;
+            if (li < 3 and spans.items.len > 0 and deepstackEnabled()) {
+                const pad = try self.deepstackPadded(allocator, seq_u, spans.items, ds_blocks.items, li, s);
+                defer _ = mlx.mlx_array_free(pad);
+                const summed = try addA(x, pad, s);
+                _ = mlx.mlx_array_free(x);
+                x = summed;
+            }
+        }
+        const out = try reshape(x, &[_]c_int{ seq, cfg.hidden }, s);
+        _ = mlx.mlx_array_free(x);
+        errdefer _ = mlx.mlx_array_free(out);
+        return .{
+            .allocator = allocator,
+            .hidden = out,
+            .tags = try h3v.tokenTags(allocator, seq_u, spans.items),
+        };
+    }
+
+    fn embedIds(self: *const TextEncoder, ids: []const i32, s: S) !mlx.mlx_array {
+        const shape = [_]c_int{@intCast(ids.len)};
+        const arr = mlx.mlx_array_new_data(ids.ptr, &shape, 1, mlx.mlx_dtype.int32);
+        defer _ = mlx.mlx_array_free(arr);
+        var emb = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_take_axis(&emb, self.embed_table, arr, 0, s));
+        return emb;
+    }
+
+    /// [1, seq, hidden] that is ZERO everywhere except the vision rows, where it
+    /// carries DeepStack tap `li`. The reference writes it with a boolean mask;
+    /// spans are contiguous here, so a concat of zero blocks and tap slices is
+    /// the same tensor without a scatter.
+    fn deepstackPadded(
+        self: *const TextEncoder,
+        allocator: std.mem.Allocator,
+        seq_u: u32,
+        spans: []const h3v.Span,
+        ds: []const [3]mlx.mlx_array,
+        li: usize,
+        s: S,
+    ) !mlx.mlx_array {
+        var parts: std.ArrayList(mlx.mlx_array) = .empty;
+        defer {
+            for (parts.items) |p| _ = mlx.mlx_array_free(p);
+            parts.deinit(allocator);
+        }
+        var cursor: u32 = 0;
+        for (spans, 0..) |sp, i| {
+            if (sp.index > cursor) try parts.append(allocator, try self.zeroRows(sp.index - cursor, s));
+            try parts.append(allocator, try astype(ds[i][li], self.dtype, s));
+            cursor = sp.end();
+        }
+        if (cursor < seq_u) try parts.append(allocator, try self.zeroRows(seq_u - cursor, s));
+        const cat = if (parts.items.len == 1) try contig(parts.items[0], s) else try concat(parts.items, 0, s);
+        defer _ = mlx.mlx_array_free(cat);
+        return reshape(cat, &[_]c_int{ 1, @intCast(seq_u), self.cfg.hidden }, s);
+    }
+
+    fn zeroRows(self: *const TextEncoder, n: u32, s: S) !mlx.mlx_array {
+        const shape = [_]c_int{ @intCast(n), self.cfg.hidden };
+        var o = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_zeros(&o, &shape, 2, self.dtype, s));
+        return o;
+    }
+
     fn buildRope(self: *const TextEncoder, seq: c_int, s: S) !RopeTables {
+        return self.buildRopeFrom(seq, null, s);
+    }
+
+    /// `positions` is the axis-major [3 * seq] mRoPE table, or null for the
+    /// text-only case where all three axes share the running index and the
+    /// interleave collapses to plain 1-D rope (which is what the reference's
+    /// own `position_ids.shape[0] > 1` branch says).
+    fn buildRopeFrom(self: *const TextEncoder, seq: c_int, positions: ?[]const f64, s: S) !RopeTables {
         const hd: usize = @intCast(self.cfg.head_dim);
         const half = hd / 2;
         const n: usize = @intCast(seq);
+        const ang = try h3v.ropeAngles(self.allocator, @intCast(n), positions, hd, self.cfg.theta);
+        defer self.allocator.free(ang);
         const buf = try self.allocator.alloc(f32, n * half * 2);
         defer self.allocator.free(buf);
         for (0..n) |i| {
             for (0..half) |j| {
-                const inv = 1.0 / std.math.pow(f64, self.cfg.theta, @as(f64, @floatFromInt(2 * j)) / @as(f64, @floatFromInt(hd)));
-                const ang = @as(f64, @floatFromInt(i)) * inv;
-                buf[i * half * 2 + j] = @floatCast(@cos(ang));
-                buf[i * half * 2 + half + j] = @floatCast(@sin(ang));
+                const a = ang[i * half + j];
+                buf[i * half * 2 + j] = @floatCast(@cos(a));
+                buf[i * half * 2 + half + j] = @floatCast(@sin(a));
             }
         }
         const shape = [_]c_int{ n_c(n), @intCast(half * 2) };
@@ -2146,6 +3001,70 @@ inline fn n_c(v: usize) c_int {
     return @intCast(v);
 }
 
+/// `[2, 3, H, W]` in [-1, 1] -> `[gh*gw, 1536]` ViT patch rows.
+///
+/// The reference's reshape+permute verbatim: `(1, temporal=2, C=3, gh/2, 2, 16,
+/// gw/2, 2, 16)` then `permute(0,3,6,4,7,2,1,5,8)`. Two things ride on it —
+/// rows come out in SPATIAL-MERGE order (so the merger's 4-token grouping and
+/// the pos-embed/rotary tables, which are built in that same order, line up),
+/// and each row is `[C, T, ph, pw]`-flattened, which is the layout
+/// `VisionTower.forward` un-flattens on the way in.
+fn visionPatchRows(frames: mlx.mlx_array, grid: h3v.Grid, s: S) !mlx.mlx_array {
+    const p: c_int = @intCast(h3v.PATCH);
+    const m: c_int = @intCast(h3v.MERGE);
+    const gh: c_int = @intCast(grid.gh);
+    const gw: c_int = @intCast(grid.gw);
+    const x9 = try reshape(frames, &[_]c_int{ 1, @intCast(h3v.TEMPORAL_PATCH), 3, @divExact(gh, m), m, p, @divExact(gw, m), m, p }, s);
+    defer _ = mlx.mlx_array_free(x9);
+    const tr = try transpose(x9, &[_]c_int{ 0, 3, 6, 4, 7, 2, 1, 5, 8 }, s);
+    defer _ = mlx.mlx_array_free(tr);
+    const flat = try reshape(tr, &[_]c_int{ gh * gw, @intCast(3 * h3v.TEMPORAL_PATCH * h3v.PATCH * h3v.PATCH) }, s);
+    defer _ = mlx.mlx_array_free(flat);
+    return contig(flat, s);
+}
+
+/// The reference's `pack_audio`: normalized audio latents `[1, C, ch, T]` ->
+/// `[ch*T, C]` channel-major rows, i.e. the packed sequence's audio-stream
+/// layout. Used for ref2va condition rows; `audioRowsToLatent` is its inverse
+/// and unpacks the target stream on the way out.
+pub fn audioLatentToRows(z: mlx.mlx_array, s: S) !mlx.mlx_array {
+    const shp = mlx.getShape(z);
+    const c = shp[1];
+    const ch = shp[2];
+    const t = shp[3];
+    const z3 = try reshape(z, &[_]c_int{ c, ch, t }, s);
+    defer _ = mlx.mlx_array_free(z3);
+    const tr = try transpose(z3, &[_]c_int{ 1, 2, 0 }, s);
+    defer _ = mlx.mlx_array_free(tr);
+    const trc = try contig(tr, s);
+    defer _ = mlx.mlx_array_free(trc);
+    return reshape(trc, &[_]c_int{ ch * t, c }, s);
+}
+
+/// The reference's `unpack_audio`: `[ch*T, C]` rows -> `[1, C, ch, T]`.
+pub fn audioRowsToLatent(rows: mlx.mlx_array, audio_t: u32, s: S) !mlx.mlx_array {
+    const c = mlx.getShape(rows)[1];
+    const t: c_int = @intCast(audio_t);
+    const a3 = try reshape(rows, &[_]c_int{ 2, t, c }, s);
+    defer _ = mlx.mlx_array_free(a3);
+    const ap = try transpose(a3, &[_]c_int{ 2, 0, 1 }, s);
+    defer _ = mlx.mlx_array_free(ap);
+    const apc = try contig(ap, s);
+    defer _ = mlx.mlx_array_free(apc);
+    return reshape(apc, &[_]c_int{ 1, c, 2, t }, s);
+}
+
+/// A still image duplicated into the 2-frame temporal patch: `[1,3,1,H,W]` (the
+/// keyframe shape) or `[3,H,W]` -> `[2,3,H,W]`.
+pub fn stillAsFramePair(img: mlx.mlx_array, s: S) !mlx.mlx_array {
+    const shp = mlx.getShape(img);
+    const h = shp[shp.len - 2];
+    const w = shp[shp.len - 1];
+    const one = try reshape(img, &[_]c_int{ 1, 3, h, w }, s);
+    defer _ = mlx.mlx_array_free(one);
+    return concat(&[_]mlx.mlx_array{ one, one }, 0, s);
+}
+
 /// Standard rotate-half RoPE on [1, H, seq, head_dim].
 fn ropeHalf(x: mlx.mlx_array, rope: RopeTables, head_dim: c_int, s: S) !mlx.mlx_array {
     const half = @divExact(head_dim, 2);
@@ -2220,6 +3139,40 @@ pub fn sigmaSchedule(allocator: std.mem.Allocator, steps: u32, shift: f64) ![]f6
 pub const Keyframe = struct {
     anchor: KeyframeAnchor,
     pixels: mlx.mlx_array,
+    /// The SAME image at the Qwen vision canvas (`h3v.fitCanvas` of the target),
+    /// `[1, 3, 1, qh, qw]` in [-1, 1], for the `<Picture i>` block spliced into
+    /// the conditioning. Optional only because the two canvases are identical
+    /// whenever the target is a /32 multiple above the 3136-pixel floor, which
+    /// every servable canvas is; below it they diverge and `pixels` cannot
+    /// stand in, so `generate` rejects rather than patchifying the wrong shape.
+    vision: ?mlx.mlx_array = null,
+};
+
+/// One decoded ref2va reference, paired with the resolution the CALLER made.
+///
+/// The caller resolves BEFORE it decodes, because a reference's canvas comes
+/// out of `resolveRefs` and the server has no image resampler — it decodes AT a
+/// size. So `generate` consumes that decision rather than re-deriving it, which
+/// keeps ordinals and canvases decided in exactly one place.
+pub const RefMedia = struct {
+    ref: ResolvedRef,
+    /// image `[1,3,1,H,W]` / video `[1,3,T,H,W]` at `ref.canvas`, in [-1, 1].
+    /// Null for a standalone audio.
+    pixels: ?mlx.mlx_array = null,
+    /// What the vision tower sees, at the QWEN canvas (`h3v.fitCanvas` of
+    /// `ref.canvas`): an image is `[1,3,1,qh,qw]`, a video is `[n,3,qh,qw]`
+    /// with the `qwenSampledFrames(ref.frames)` frames sampled at
+    /// `qwenFrameStride()`. Null for a standalone audio.
+    vision: ?mlx.mlx_array = null,
+    /// 32 kHz stereo `[2, L]`: a standalone audio, or a video's soundtrack.
+    waveform: ?mlx.mlx_array = null,
+
+    pub fn deinit(self: *RefMedia) void {
+        if (self.pixels) |x| _ = mlx.mlx_array_free(x);
+        if (self.vision) |x| _ = mlx.mlx_array_free(x);
+        if (self.waveform) |x| _ = mlx.mlx_array_free(x);
+        self.* = undefined;
+    }
 };
 
 pub const GenRequest = struct {
@@ -2235,12 +3188,43 @@ pub const GenRequest = struct {
     /// Fast recipe switch: null/true = ON (the default), false = full-quality
     /// per-step compute (every forward, dense attention branch every step).
     fast: ?bool = null,
-    /// fl2va keyframes (0-2: first and/or last). NOTE the DEVIATION from the
-    /// reference presentation: ComfyUI also splices each keyframe into the
-    /// Qwen text encoding as a `<Picture i>: <vision block>` (tag-0 spans);
-    /// this port conditions through the VAE latents only until the Qwen3-VL
-    /// vision tower lands with ref2va (Phase 4 of the brief).
+    /// Turbo distillation LoRA (larryvrh/MiniMax-H3-Turbo-Lora): 4-8 step
+    /// sampling instead of ~30. Requires `paths.turbo_lora`; forces the fast
+    /// recipe OFF (its slow-drift premise is false at giant steps) and switches
+    /// the audio stream to EXACT Δσ_audio integration — see `audioStepFactor`.
+    /// Loaded as the FIRST file of the same stack the user's adapters ride —
+    /// it is a LoRA, so it gets no private code path.
+    turbo: bool = false,
+    /// Style LoRAs stacked on the DiT: absolute `.safetensors` paths and their
+    /// strengths (parallel arrays; a missing scale is 1.0 at the caller). They
+    /// sum with each other and with Turbo, never merge — order is irrelevant
+    /// to the result. Loaded and freed with the model, since H3 stages its
+    /// weights per generation and keeps nothing resident between requests.
+    lora_paths: []const []const u8 = &.{},
+    lora_scales: []const f32 = &.{},
+    /// Chained-window long clips: N back-to-back `frames`-frame windows, each
+    /// conditioned on its predecessor's last decoded frame through the
+    /// ordinary fl2va path. `frames` is the PER-WINDOW count; the clip
+    /// delivers `chainDeliveredFrames(chain_windows, frames)` frames (the
+    /// duplicate join frames are dropped) with a one-frame equal-power audio
+    /// cross-fade at each seam. Caps the packed sequence — and so the
+    /// attention S² term and the broadcast-cache footprint — at the WINDOW
+    /// size regardless of clip length. FL2VA only (a reference has no
+    /// keyframe row to chain through).
+    chain_windows: u32 = 1,
+    /// fl2va keyframes (0-2: first and/or last), conditioned through their VAE
+    /// latents as cond rows.
+    ///
+    /// The reference ALSO splices each into the Qwen encoding as a
+    /// `<Picture i>: <vision block>`. That path is built and parity-tested but
+    /// DEFAULT-OFF here: it measured worse on this checkpoint (see the A/B
+    /// table in `generate`). `MINIMAX_H3_VISION_BLOCKS=1` turns it on.
     keyframes: []const Keyframe = &.{},
+    /// ref2va references in `resolveRefs` order, already decoded at the
+    /// canvases it resolved. Unlike the fl2va keyframes these DO carry vision
+    /// blocks: a reference has no cond row of its own competing with the tower,
+    /// and the prompt addresses it as `<Picture i>` / `<Video k>` / `<Audio j>`.
+    refs: []const RefMedia = &.{},
 };
 
 pub const SpeedConfig = struct { step_cache: f64, bcast_k: u32 };
@@ -2251,8 +3235,13 @@ pub const SpeedConfig = struct { step_cache: f64, bcast_k: u32 };
 /// off switch for final renders ("non fast just a smidge better"). Env vars
 /// stay the STRONGEST knob — set means set, including "0" — so every A/B
 /// harness keeps its arms.
-pub fn resolveSpeed(fast: ?bool, env_sc: ?[]const u8, env_bk: ?[]const u8) SpeedConfig {
-    const want_fast = fast orelse true;
+///
+/// Turbo and the fast recipe are ALTERNATIVES, not a stack: at 4-8 steps the
+/// velocity cache's slow-drift premise is false (every step is a giant leap)
+/// and the broadcast gates cover most of the schedule anyway, so `turbo`
+/// forces both off regardless of `fast` — env still wins for A/B harnesses.
+pub fn resolveSpeed(fast: ?bool, turbo: bool, env_sc: ?[]const u8, env_bk: ?[]const u8) SpeedConfig {
+    const want_fast = !turbo and (fast orelse true);
     var out = SpeedConfig{
         .step_cache = if (want_fast) 0.05 else 0,
         .bcast_k = if (want_fast) 2 else 0,
@@ -2260,6 +3249,26 @@ pub fn resolveSpeed(fast: ?bool, env_sc: ?[]const u8, env_bk: ?[]const u8) Speed
     if (env_sc) |raw| out.step_cache = std.fmt.parseFloat(f64, raw) catch out.step_cache;
     if (env_bk) |raw| out.bcast_k = std.fmt.parseInt(u32, raw, 10) catch out.bcast_k;
     return out;
+}
+
+/// What the audio latent is advanced by this step, per unit of the
+/// slope-scaled velocity the forward returns (`Output.audio` carries
+/// d(sigma_a)/d(sigma_v) at the CURRENT sigma).
+///
+/// Default path: `Δσ_video` — first-order in the audio clock, byte-identical
+/// to what every ≥30-step render was validated with, where the error is
+/// second-order and negligible.
+///
+/// Turbo path: the EXACT mapped delta `(σa(next) − σa(cur)) / slope(cur)` —
+/// the reference node's own arithmetic, and the entire reason its custom
+/// sampler exists: at 4 steps the last video leg (0.8 → 0 at shift 12/3) is
+/// 0.5 in the audio clock but 1.25 first-order, a 2.5x over-step that is the
+/// "audio blown out at low steps" failure its README describes.
+pub fn audioStepFactor(turbo: bool, sigma_cur: f64, sigma_next: f64, shift_v: f64, shift_a: f64) f64 {
+    if (!turbo) return sigma_next - sigma_cur;
+    const sa_c = timeShiftSigma(sigma_cur, shift_v, shift_a);
+    const sa_n = timeShiftSigma(sigma_next, shift_v, shift_a);
+    return (sa_n - sa_c) / timeShiftSlope(@max(sigma_cur, 1e-6), shift_v, shift_a);
 }
 
 pub const GenPaths = struct {
@@ -2271,6 +3280,10 @@ pub const GenPaths = struct {
     /// Audio VAE. Optional: absent means the clip is silent rather than
     /// failing, since the video stream is complete without it.
     audio_vae: ?[]const u8 = null,
+    /// Turbo LoRA file (`turbo_lora.safetensors` in the pack dir). Optional:
+    /// absent just means `turbo` requests fail with a named error — the
+    /// handler 400s before generate() ever runs.
+    turbo_lora: ?[]const u8 = null,
 };
 
 pub const GenResult = struct {
@@ -2338,10 +3351,25 @@ pub fn patchifyVideo(x: mlx.mlx_array, s: S) !mlx.mlx_array {
     return reshape(trc, &[_]c_int{ t * h2 * w2, c * @as(c_int, @intCast(PATCH_H * PATCH_W)) }, s);
 }
 
-/// Text-to-audio-video, with STAGED residency: the 50-layer text encoder
-/// (~48 GB bf16) and the DiT (~62 GB bf16) cannot both be resident on a 128 GB
-/// machine, so the encoder is loaded, run, and freed before the DiT loads.
+/// Text-to-audio-video. Dispatches: `chain_windows > 1` runs N single-window
+/// generations chained by fl2va keyframes (`generateChain`); everything else
+/// is one window (`generateOne`).
 pub fn generate(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    paths: GenPaths,
+    req: GenRequest,
+    progress: ?gen_sse.Progress,
+    s: S,
+) !GenResult {
+    if (req.chain_windows > 1) return generateChain(allocator, io, paths, req, progress, s);
+    return generateOne(allocator, io, paths, req, progress, s);
+}
+
+/// One window, with STAGED residency: the 50-layer text encoder (~48 GB bf16)
+/// and the DiT (~62 GB bf16) cannot both be resident on a 128 GB machine, so
+/// the encoder is loaded, run, and freed before the DiT loads.
+fn generateOne(
     allocator: std.mem.Allocator,
     io: std.Io,
     paths: GenPaths,
@@ -2382,78 +3410,305 @@ pub fn generate(
     for (ids_u32, 0..) |v, i| ids[i] = @intCast(v);
     log.info("[minimax-h3] prompt -> {d} tokens ({d} ms)\n", .{ ids.len, phase_timer.lapMs() });
 
-    // ── 1.5 keyframes -> condition rows (encoder loaded and FREED before the
-    //       text encoder, keeping the staged-residency peak unchanged) ──
+    // ── 1.5 keyframes + ref2va references -> condition rows (both encoders
+    //       loaded and FREED before the text encoder, keeping the staged
+    //       residency peak at max(TE, DiT) + VAEs rather than the sum) ──
+    //
+    // Both cond streams are built in SEGMENT order, because that is the order
+    // `PackedLayout` fills its `img_update` / `audio_update` false rows in and
+    // the forward drops the concatenation straight into them: keyframe conds,
+    // then each reference block, then the target. A cond row assembled in
+    // REQUEST order instead lands on the wrong reference and the model
+    // conditions on a smear with nothing to report it.
     var cond_rows: ?mlx.mlx_array = null;
     defer if (cond_rows) |cr| {
         _ = mlx.mlx_array_free(cr);
     };
+    var audio_cond_rows: ?mlx.mlx_array = null;
+    defer if (audio_cond_rows) |cr| {
+        _ = mlx.mlx_array_free(cr);
+    };
+    var ref_blocks = try allocator.alloc(RefBlock, req.refs.len);
+    defer allocator.free(ref_blocks);
+    for (req.refs, 0..) |m, i| ref_blocks[i] = refBlockFor(m.ref);
+
     var anchors_buf: [2]KeyframeAnchor = undefined;
     var anchors: []const KeyframeAnchor = &.{};
-    if (req.keyframes.len > 0) {
+    if (req.keyframes.len > 0 or req.refs.len > 0) {
         if (req.keyframes.len > 2) return error.TooManyKeyframes;
-        var vw0 = try model_mod.loadWeightsSingleFile(allocator, paths.vae);
-        defer vw0.deinit();
-        var enc = try vae_mod.Encoder.load(allocator, &vw0, s);
-        defer enc.deinit();
-        var rows_list: [2]mlx.mlx_array = undefined;
-        var nrows: usize = 0;
-        defer for (rows_list[0..nrows]) |r| {
-            _ = mlx.mlx_array_free(r);
-        };
-        for (req.keyframes, 0..) |kf, ki| {
-            anchors_buf[ki] = kf.anchor;
-            const lat = try enc.encodeImage(kf.pixels, allocator, s);
-            defer _ = mlx.mlx_array_free(lat);
-            rows_list[nrows] = try patchifyVideo(lat, s);
-            nrows += 1;
+        var rows_list: std.ArrayList(mlx.mlx_array) = .empty;
+        defer {
+            for (rows_list.items) |r| _ = mlx.mlx_array_free(r);
+            rows_list.deinit(allocator);
         }
-        anchors = anchors_buf[0..req.keyframes.len];
-        const cat = if (nrows == 1) try contig(rows_list[0], s) else try concat(rows_list[0..nrows], 0, s);
-        defer _ = mlx.mlx_array_free(cat);
-        // Condition noise augmentation: r = aug*r + (1-aug)*noise, aug 0.999,
-        // CONSTANT for the whole generation (the reference restarts the same
-        // RNG stream every forward, which is the same thing). mlx RNG, not
-        // torch's — seeds are not portable across implementations, the same
-        // class as the initial latents.
-        const noise = try randomNormal(mlx.getShape(cat), req.seed, mlx.mlx_dtype.float32, s);
-        defer _ = mlx.mlx_array_free(noise);
-        const aug = try scalarLike(@floatCast(VISUAL_COND_TIMESTEP), cat, s);
-        defer _ = mlx.mlx_array_free(aug);
-        const one_m = try scalarLike(@floatCast(1.0 - VISUAL_COND_TIMESTEP), cat, s);
-        defer _ = mlx.mlx_array_free(one_m);
-        const ra = try mulA(cat, aug, s);
-        defer _ = mlx.mlx_array_free(ra);
-        const na2 = try mulA(noise, one_m, s);
-        defer _ = mlx.mlx_array_free(na2);
-        cond_rows = try addA(ra, na2, s);
-        try mlx.check(mlx.mlx_array_eval(cond_rows.?));
+        var arows_list: std.ArrayList(mlx.mlx_array) = .empty;
+        defer {
+            for (arows_list.items) |r| _ = mlx.mlx_array_free(r);
+            arows_list.deinit(allocator);
+        }
+
+        var needs_visual = req.keyframes.len > 0;
+        var needs_audio = false;
+        for (req.refs) |m| {
+            if (m.ref.kind != .audio) needs_visual = true;
+            if (m.ref.audio_t > 0) needs_audio = true;
+        }
+
+        if (needs_visual) {
+            var vw0 = try model_mod.loadWeightsSingleFile(allocator, paths.vae);
+            defer vw0.deinit();
+            var enc = try vae_mod.Encoder.load(allocator, &vw0, s);
+            defer enc.deinit();
+            for (req.keyframes, 0..) |kf, ki| {
+                anchors_buf[ki] = kf.anchor;
+                const lat = try enc.encodeImage(kf.pixels, allocator, s);
+                defer _ = mlx.mlx_array_free(lat);
+                try rows_list.append(allocator, try patchifyVideo(lat, s));
+            }
+            anchors = anchors_buf[0..req.keyframes.len];
+            for (req.refs) |m| {
+                if (m.ref.kind == .audio) continue;
+                const px = m.pixels orelse return error.RefMissingPixels;
+                // encodeImage IS encodeVideo at T == 1; naming the two apart
+                // keeps the call site readable, not the behaviour different.
+                const lat = try enc.encodeVideo(px, allocator, s);
+                defer _ = mlx.mlx_array_free(lat);
+                const got_t: u32 = @intCast(mlx.getShape(lat)[2]);
+                const want_t: u32 = if (m.ref.kind == .image) 1 else m.ref.latent_t;
+                // The layout budgeted rows from `latent_t`; a VAE that returned
+                // a different depth would silently shift every later segment.
+                if (got_t != want_t) return error.RefLatentDepthMismatch;
+                try rows_list.append(allocator, try patchifyVideo(lat, s));
+            }
+        }
+        if (needs_audio) {
+            const apath = paths.audio_vae orelse return error.RefAudioNeedsAudioVae;
+            var aw = try model_mod.loadWeightsSingleFile(allocator, apath);
+            defer aw.deinit();
+            for (req.refs) |m| {
+                if (m.ref.audio_t == 0) continue;
+                const wav = m.waveform orelse return error.RefMissingAudio;
+                const z = try audio_mod.encode(allocator, &aw, wav, s);
+                defer _ = mlx.mlx_array_free(z);
+                if (@as(u32, @intCast(mlx.getShape(z)[3])) != m.ref.audio_t)
+                    return error.RefAudioLengthMismatch;
+                try arows_list.append(allocator, try audioLatentToRows(z, s));
+            }
+            // AUDIO_COND_TIMESTEP is 1.0 and the reference only augments below
+            // 1.0, so the audio conditions ride in CLEAN — no noise is drawn.
+            audio_cond_rows = if (arows_list.items.len == 1)
+                try contig(arows_list.items[0], s)
+            else
+                try concat(arows_list.items, 0, s);
+            try mlx.check(mlx.mlx_array_eval(audio_cond_rows.?));
+        }
+        if (rows_list.items.len > 0) {
+            const cat = if (rows_list.items.len == 1) try contig(rows_list.items[0], s) else try concat(rows_list.items, 0, s);
+            defer _ = mlx.mlx_array_free(cat);
+            // Condition noise augmentation: r = aug*r + (1-aug)*noise, aug
+            // 0.999, CONSTANT for the whole generation (the reference restarts
+            // the same RNG stream every forward, which is the same thing). mlx
+            // RNG, not torch's — seeds are not portable across implementations,
+            // the same class as the initial latents.
+            const noise = try randomNormal(mlx.getShape(cat), req.seed, mlx.mlx_dtype.float32, s);
+            defer _ = mlx.mlx_array_free(noise);
+            const aug = try scalarLike(@floatCast(VISUAL_COND_TIMESTEP), cat, s);
+            defer _ = mlx.mlx_array_free(aug);
+            const one_m = try scalarLike(@floatCast(1.0 - VISUAL_COND_TIMESTEP), cat, s);
+            defer _ = mlx.mlx_array_free(one_m);
+            const ra = try mulA(cat, aug, s);
+            defer _ = mlx.mlx_array_free(ra);
+            const na2 = try mulA(noise, one_m, s);
+            defer _ = mlx.mlx_array_free(na2);
+            cond_rows = try addA(ra, na2, s);
+            try mlx.check(mlx.mlx_array_eval(cond_rows.?));
+        }
         _ = mlx.mlx_clear_cache();
-        log.info("[minimax-h3] {d} keyframe(s) encoded -> {d} cond rows ({d} ms, encoder released)\n", .{
-            req.keyframes.len, mlx.getShape(cond_rows.?)[0], phase_timer.lapMs(),
+        log.info("[minimax-h3] {d} keyframe(s) + {d} reference(s) encoded -> {d} visual / {d} audio cond rows ({d} ms, encoders released)\n", .{
+            req.keyframes.len,
+            req.refs.len,
+            if (cond_rows) |cr| mlx.getShape(cr)[0] else 0,
+            if (audio_cond_rows) |cr| mlx.getShape(cr)[0] else 0,
+            phase_timer.lapMs(),
         });
     }
 
     if (progress) |p| p.emit("Encoding prompt", 0, req.steps);
 
-    // ── 2. text encoder, then FREE it before the DiT loads ──
-    const text_hidden: mlx.mlx_array = blk: {
+    // ── 2. presentation: "<Picture i>: " + vision block per keyframe, then the
+    //       prompt. Frame pairs are built here (outside the encoder) so the
+    //       weights map below can be scoped to the encode itself.
+    var present: std.ArrayList(PresentItem) = .empty;
+    defer present.deinit(allocator);
+    var label_ids: std.ArrayList([]i32) = .empty;
+    var pairs: std.ArrayList(mlx.mlx_array) = .empty;
+    defer {
+        for (label_ids.items) |li| allocator.free(li);
+        label_ids.deinit(allocator);
+        for (pairs.items) |p| _ = mlx.mlx_array_free(p);
+        pairs.deinit(allocator);
+    }
+    // Encode one presentation label and append it as a text item. The label
+    // text is the CONTRACT with the checkpoint — the prompt refers to
+    // `<Picture 2>` and the conditioning must carry the matching marker.
+    const addLabel = struct {
+        fn f(
+            a: std.mem.Allocator,
+            t: *tok_mod.Tokenizer,
+            items: *std.ArrayList(PresentItem),
+            owned: *std.ArrayList([]i32),
+            text: []const u8,
+        ) !void {
+            const u = try t.encode(a, text);
+            defer a.free(u);
+            const buf = try a.alloc(i32, u.len);
+            errdefer a.free(buf);
+            for (u, 0..) |v, i| buf[i] = @intCast(v);
+            try owned.append(a, buf);
+            try items.append(a, .{ .text = buf });
+        }
+    }.f;
+    // Splicing keyframes into the Qwen encoding is the REFERENCE presentation
+    // (`<Picture i>: <vision block>`), and it is DEFAULT-OFF for fl2va because
+    // it measured WORSE on this checkpoint. Same-seed 256px A/B, frame-0
+    // left/right means against a 20/235 split keyframe:
+    //
+    //   vision blocks OFF                 16.1 / 231.4   delta +215  <- shipped
+    //   ON, plain 1-D rope                43.0 / 119.5   delta  +77
+    //   ON, mRoPE, no DeepStack           48.5 / 105.2   delta  +57
+    //   ON, mRoPE + DeepStack             150.6 / 53.0   delta  -98 (INVERTED)
+    //
+    // The port is not the problem: the tower reproduces the reference in both
+    // direction AND magnitude (cos 0.999987, rms_ratio 1.0000 — see the vision
+    // tower parity test, which asserts the ratio precisely because a cosine
+    // cannot see a 40x scale error). What the numbers say is that on the FL2VA
+    // checkpoint the VAE cond rows already carry the keyframe, and adding a
+    // second conditioning path 41x the norm of a token embedding competes with
+    // them rather than reinforcing them.
+    //
+    // ref2va is different by construction — a reference image has no keyframe
+    // cond row to compete with, and the prompt ADDRESSES it as `<Picture i>`,
+    // so the tower is the whole mechanism there and stays on.
+    // `MINIMAX_H3_VISION_BLOCKS=1` re-enables it for fl2va A/Bs.
+    const vision_blocks_on = blk: {
+        const raw = std.c.getenv("MINIMAX_H3_VISION_BLOCKS") orelse break :blk false;
+        break :blk !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
+    };
+    var label_buf: [32]u8 = undefined;
+    for (req.keyframes, 0..) |kf, ki| {
+        if (!vision_blocks_on) break;
+        const src = kf.vision orelse kf.pixels;
+        const shp = mlx.getShape(src);
+        const ph: u32 = @intCast(shp[shp.len - 2]);
+        const pw: u32 = @intCast(shp[shp.len - 1]);
+        const fit = h3v.fitCanvas(ph, pw);
+        // A canvas the vision policy would resize cannot be patchified as-is:
+        // the grid and the pixels would describe different images.
+        if (fit.h != ph or fit.w != pw) return error.KeyframeCanvasNotVisionReady;
+        try addLabel(allocator, &tok, &present, &label_ids, try h3v.labelFor(&label_buf, .image, @intCast(ki + 1)));
+        try pairs.append(allocator, try stillAsFramePair(src, s));
+        try present.append(allocator, .{ .vision = .{ .frames = pairs.items[pairs.items.len - 1], .grid = h3v.gridFor(ph, pw) } });
+    }
+
+    // ref2va references, in `resolveRefs` order. Unlike the keyframes above the
+    // vision blocks are unconditional here — see the comment on that switch.
+    for (req.refs) |m| {
+        switch (m.ref.kind) {
+            .audio => try addLabel(allocator, &tok, &present, &label_ids, try h3v.labelFor(&label_buf, .audio, m.ref.ordinal)),
+            .image => {
+                const src = m.vision orelse return error.RefMissingVision;
+                const shp = mlx.getShape(src);
+                const ph: u32 = @intCast(shp[shp.len - 2]);
+                const pw: u32 = @intCast(shp[shp.len - 1]);
+                const fit = h3v.fitCanvas(ph, pw);
+                if (fit.h != ph or fit.w != pw) return error.RefCanvasNotVisionReady;
+                try addLabel(allocator, &tok, &present, &label_ids, try h3v.labelFor(&label_buf, .image, m.ref.ordinal));
+                try pairs.append(allocator, try stillAsFramePair(src, s));
+                try present.append(allocator, .{ .vision = .{ .frames = pairs.items[pairs.items.len - 1], .grid = h3v.gridFor(ph, pw) } });
+            },
+            .video => {
+                // A soundtrack is LABELLED like a standalone audio and emitted
+                // BEFORE its video's own label — it consumes an `<Audio j>`
+                // ordinal, which is why the two counters interleave.
+                if (m.ref.audio_t > 0)
+                    try addLabel(allocator, &tok, &present, &label_ids, try h3v.labelFor(&label_buf, .audio, m.ref.audio_ordinal));
+                try addLabel(allocator, &tok, &present, &label_ids, try h3v.labelFor(&label_buf, .video, m.ref.ordinal));
+
+                const src = m.vision orelse return error.RefMissingVision;
+                const vshp = mlx.getShape(src);
+                const n: u32 = @intCast(vshp[0]);
+                const ph: u32 = @intCast(vshp[vshp.len - 2]);
+                const pw: u32 = @intCast(vshp[vshp.len - 1]);
+                const fit = h3v.fitCanvas(ph, pw);
+                if (fit.h != ph or fit.w != pw) return error.RefCanvasNotVisionReady;
+                if (n != qwenSampledFrames(m.ref.frames)) return error.RefVisionFrameCountMismatch;
+                const grid = h3v.gridFor(ph, pw);
+                // Qwen sees the clip at 2 fps in 2-FRAME blocks, each announced
+                // by the midpoint of its own two timestamps. An odd sampled
+                // count repeat-pads its last frame (and its timestamp with it),
+                // so the final block's midpoint is that frame's own time.
+                var i: u32 = 0;
+                while (i < n) : (i += 2) {
+                    const t0: f64 = @as(f64, @floatFromInt(i)) / 2.0;
+                    const t1: f64 = @as(f64, @floatFromInt(@min(i + 1, n - 1))) / 2.0;
+                    try addLabel(allocator, &tok, &present, &label_ids, try h3v.timestampLabel(&label_buf, (t0 + t1) / 2.0));
+                    const lo: c_int = @intCast(i);
+                    const pair = if (i + 1 < n)
+                        try sliceAxis0(src, lo, lo + 2, s)
+                    else blk: {
+                        const last = try sliceAxis0(src, lo, lo + 1, s);
+                        defer _ = mlx.mlx_array_free(last);
+                        break :blk try concat(&[_]mlx.mlx_array{ last, last }, 0, s);
+                    };
+                    try pairs.append(allocator, pair);
+                    try present.append(allocator, .{ .vision = .{ .frames = pair, .grid = grid } });
+                }
+            },
+        }
+    }
+    try present.append(allocator, .{ .text = ids });
+
+    // ── 3. text encoder, then FREE it before the DiT loads ──
+    var te_active: usize = 0;
+    var enc: EncodedPrompt = blk: {
         var tw = try model_mod.loadWeightsSingleFile(allocator, paths.text_encoder);
         defer tw.deinit();
         var te = try TextEncoder.load(allocator, &tw, .{}, dt, s);
         defer te.deinit();
-        const h = try te.encode(ids, s);
-        try mlx.check(mlx.mlx_array_eval(h));
-        break :blk h;
+        // The tower is 1.2 GB and only the presentation knows whether anything
+        // needs it — a keyframe with vision blocks off, or an audio-only ref
+        // set, does not.
+        for (present.items) |it| if (it == .vision) {
+            try te.loadVision(&tw, s);
+            break;
+        };
+        var e = try te.encodeItems(allocator, present.items, s);
+        errdefer e.deinit();
+        try mlx.check(mlx.mlx_array_eval(e.hidden));
+        // Read while the encoder is still resident: this stage is one term of
+        // `gen.h3PeakBytes`, and a bill nobody can check against the running
+        // process is how the DiT term stayed 12 GiB wrong for months.
+        _ = mlx.mlx_get_active_memory(&te_active);
+        break :blk e;
     };
-    defer _ = mlx.mlx_array_free(text_hidden);
+    defer enc.deinit();
+    const text_hidden = enc.hidden;
     _ = mlx.mlx_clear_cache();
+    const te_len: u32 = @intCast(mlx.getShape(text_hidden)[0]);
     const te_ms = phase_timer.lapMs();
-    log.info("[minimax-h3] text encoded, encoder released ({d} ms load+encode)\n", .{te_ms});
+    log.info("[minimax-h3] text encoded ({d} rows, {d} vision), encoder resident {d:.2} GB, released ({d} ms load+encode)\n", .{
+        te_len,
+        te_len - @as(u32, @intCast(ids.len)),
+        @as(f64, @floatFromInt(te_active)) / (1024.0 * 1024.0 * 1024.0),
+        te_ms,
+    });
 
-    // ── 3. DiT sampling ──
-    var layout = try PackedLayout.init(allocator, @intCast(ids.len), shape.latent_t, lat_h, lat_w, shape.audio_t, anchors, shape.frame_count);
+    // ── 4. DiT sampling ──
+    var layout = try PackedLayout.initFull(allocator, te_len, shape.latent_t, lat_h, lat_w, shape.audio_t, anchors, shape.frame_count, ref_blocks);
     defer layout.deinit();
+    // BORROWED from `enc`, which outlives the layout. Empty for a pure t2va
+    // prompt; non-empty makes the text segment split into modality runs.
+    layout.text_tags = enc.tags;
 
     const n_video_rows: c_int = @intCast(shape.latent_t * (lat_h / PATCH_H) * (lat_w / PATCH_W));
     const n_audio_rows: c_int = @intCast(shape.audio_t * 2);
@@ -2475,6 +3730,27 @@ pub fn generate(
         log.warn("[minimax-h3] MINIMAX_H3_ABLATE='{s}' not recognized; profiling arms OFF\n", .{abl_raw.?});
 
     {
+        // Adapters are loaded BEFORE the DiT and outlive it (declared first ⇒
+        // its `defer` runs last), because every attached `Ref` points into
+        // this stack. Turbo is file 0 when asked for, then the user's, so a
+        // style LoRA and the distillation sum on the same linears.
+        var stack: lora_mod.Stack = .{ .allocator = allocator };
+        defer stack.deinit();
+        if (req.turbo) {
+            const tp = paths.turbo_lora orelse return error.TurboLoraMissing;
+            stack.files[stack.count] = try lora_mod.loadFile(allocator, tp, .minimax_h3);
+            stack.paths[stack.count] = try allocator.dupe(u8, tp);
+            stack.scales[stack.count] = 1.0; // the file's alpha == rank
+            stack.count += 1;
+        }
+        if (req.lora_paths.len + stack.count > lora_mod.MAX_LORAS) return error.TooManyLoras;
+        for (req.lora_paths, 0..) |p, i| {
+            stack.files[stack.count] = try lora_mod.loadFile(allocator, p, .minimax_h3);
+            stack.paths[stack.count] = try allocator.dupe(u8, p);
+            stack.scales[stack.count] = if (i < req.lora_scales.len) req.lora_scales[i] else 1.0;
+            stack.count += 1;
+        }
+
         // The weights MAP must not outlive Model.load: it holds +1 refs on
         // every raw file-backed array, so anything the model later FREES (the
         // 13 GB of AdaLN under precompute) would stay resident until scope
@@ -2487,14 +3763,32 @@ pub fn generate(
             break :blk try Model.load(allocator, &dw, .{}, dt, s);
         };
         defer model.deinit();
+        if (stack.count > 0) {
+            // Attach BEFORE precomputeAdaln so the adaln delta folds into the
+            // tables (after it, the modulation weights are gone).
+            const counts = try model.attachLoras(&stack);
+            for (stack.paths[0..stack.count], stack.scales[0..stack.count], counts[0..stack.count], 0..) |p, sc, n, i| {
+                const is_turbo = req.turbo and i == 0;
+                // Engagement is COUNTED and logged per file: a rejected or
+                // half-matching adapter is otherwise a silent no-op that looks
+                // exactly like a working one.
+                log.info("[minimax-h3] lora {d}/{d}: {d}/{d} modules, scale {d:.2}{s} — {s}\n", .{
+                    i + 1,          stack.count, n, Model.LORA_TARGETS, sc,
+                    if (is_turbo) " (turbo)" else "", std.fs.path.basename(p),
+                });
+                // The Turbo file names every target; anything less is a broken
+                // artifact, not a smaller speedup. A style LoRA legitimately
+                // targets a subset, but matching NOTHING means the file is for
+                // another architecture and the user would wait an hour for an
+                // unchanged render.
+                if (is_turbo and n < Model.LORA_TARGETS) return error.TurboLoraIncomplete;
+                if (n == 0) return error.LoraNoMatch;
+            }
+        }
         // AdaLN precompute must run while the trunk is still lazy — see
         // precomputeAdaln. Default ON: it is what keeps the DiT residency at
         // ~22 GB instead of ~35 on the 8-bit pack.
-        const precompute_on = blk: {
-            const raw = envStr("MINIMAX_H3_ADALN_PRECOMPUTE") orelse break :blk true;
-            break :blk !std.mem.eql(u8, raw, "0");
-        };
-        if (precompute_on) {
+        if (adalnPrecomputeOn()) {
             const ts = try collectScheduleTs(allocator, &layout, sigmas[0..req.steps], req.shift_video, req.shift_audio, .{});
             defer allocator.free(ts);
             try model.precomputeAdaln(ts, s);
@@ -2524,8 +3818,8 @@ pub fn generate(
         // only on every k-th mid-schedule step and reuses the cached output
         // between — the branch is ~70% of a 768p step. Cache cost: one
         // [S, hidden] bf16 per block (~20 GB at 768p, ~1.4 GB at 256px).
-        const speed = resolveSpeed(req.fast, envStr("MINIMAX_H3_STEP_CACHE"), envStr("MINIMAX_H3_ATTN_BCAST"));
-        log.info("[minimax-h3] speed recipe: step-cache {d:.3}, attn-broadcast k={d} (fast={any})\n", .{ speed.step_cache, speed.bcast_k, req.fast });
+        const speed = resolveSpeed(req.fast, req.turbo, envStr("MINIMAX_H3_STEP_CACHE"), envStr("MINIMAX_H3_ATTN_BCAST"));
+        log.info("[minimax-h3] speed recipe: step-cache {d:.3}, attn-broadcast k={d} (fast={any}, turbo={})\n", .{ speed.step_cache, speed.bcast_k, req.fast, req.turbo });
         const bcast_k: u32 = speed.bcast_k;
         var attn_bcast: ?AttnBroadcast = if (bcast_k > 1) try AttnBroadcast.init(allocator, model.blocks.len) else null;
         defer if (attn_bcast) |*ab| ab.deinit();
@@ -2566,7 +3860,7 @@ pub fn generate(
             // Step-cache gate: the relative input move this step would make
             // with the CACHED velocity is known without any forward.
             var sc_skip = false;
-            if (sc_thresh > 0 and sc_v_video != null and i >= 2 and i + 1 < req.steps and sc_consec < 2) {
+            if (sc_thresh > 0 and sc_v_video != null and i >= stepCacheWarmup(req.steps) and i + 1 < req.steps and sc_consec < 2) {
                 const vmag = try meanAbs(sc_v_video.?, s);
                 const xmag = try meanAbs(video_x, s);
                 const rel = @abs(dsigma) * @as(f64, vmag) / @max(@as(f64, xmag), 1e-8);
@@ -2583,8 +3877,16 @@ pub fn generate(
                 const nv = try addA(video_x, stepv, s);
                 _ = mlx.mlx_array_free(video_x);
                 video_x = nv;
-                const slope_i = timeShiftSlope(sigma, req.shift_video, req.shift_audio);
-                const da = try scalarLike(@floatCast(dsigma * slope_i), sc_a_raw.?, s);
+                // `sc_a_raw` is the RAW audio-clock velocity (already divided
+                // by its forward's slope), so its exact advance is the mapped
+                // Δσa itself; the non-turbo arm keeps the validated
+                // first-order form (this path is only reachable under turbo
+                // when the env forces the cache back on).
+                const askip = if (req.turbo)
+                    timeShiftSigma(sigmas[i + 1], req.shift_video, req.shift_audio) - timeShiftSigma(sigma, req.shift_video, req.shift_audio)
+                else
+                    dsigma * timeShiftSlope(sigma, req.shift_video, req.shift_audio);
+                const da = try scalarLike(@floatCast(askip), sc_a_raw.?, s);
                 defer _ = mlx.mlx_array_free(da);
                 const stepa = try mulA(sc_a_raw.?, da, s);
                 defer _ = mlx.mlx_array_free(stepa);
@@ -2618,15 +3920,28 @@ pub fn generate(
             defer if (cond_rows != null) {
                 _ = mlx.mlx_array_free(video_in);
             };
+            // Same contract on the AUDIO stream, which only ref2va exercises:
+            // the reference audio rows sit at `~audio_update`, ahead of the
+            // target's.
+            const audio_in = if (audio_cond_rows) |cr|
+                try concat(&[_]mlx.mlx_array{ cr, audio_x }, 0, s)
+            else
+                audio_x;
+            defer if (audio_cond_rows != null) {
+                _ = mlx.mlx_array_free(audio_in);
+            };
 
             const refresh = attnBroadcastRefresh(i, req.steps, bcast_k);
             if (attn_bcast != null and !refresh) bcast_reused += 1;
-            var out = try model.forward(&layout, &plan, refined, video_in, audio_x, rope, sigma, req.shift_video, req.shift_audio, if (attn_bcast) |*ab| ab else null, refresh, s);
+            var out = try model.forward(&layout, &plan, refined, video_in, audio_in, rope, sigma, req.shift_video, req.shift_audio, if (attn_bcast) |*ab| ab else null, refresh, s);
             defer out.deinit();
 
             // Euler on the flat ODE: x += model_output * dsigma. The audio
             // velocity already carries d(sigma_a)/d(sigma_v), so both streams
-            // integrate against the SAME video-schedule step.
+            // integrate against the SAME video-schedule step — except under
+            // turbo, where the audio advance is the EXACT mapped Δσa
+            // (`audioStepFactor`): at 4-8 steps the first-order form
+            // over-steps the audio clock by up to 2.5x on the last leg.
             const dv = try scalarLike(@floatCast(dsigma), out.video, s);
             defer _ = mlx.mlx_array_free(dv);
             const stepv = try mulA(out.video, dv, s);
@@ -2635,7 +3950,7 @@ pub fn generate(
             _ = mlx.mlx_array_free(video_x);
             video_x = nv;
 
-            const da = try scalarLike(@floatCast(dsigma), out.audio, s);
+            const da = try scalarLike(@floatCast(audioStepFactor(req.turbo, sigma, sigmas[i + 1], req.shift_video, req.shift_audio)), out.audio, s);
             defer _ = mlx.mlx_array_free(da);
             const stepa = try mulA(out.audio, da, s);
             defer _ = mlx.mlx_array_free(stepa);
@@ -2712,22 +4027,13 @@ pub fn generate(
     _ = mlx.mlx_clear_cache();
     log.info("[minimax-h3] video decoded in {d} ms (load+decode)\n", .{phase_timer.lapMs()});
 
-    // Audio rows [ch*T, 32] -> [1, 32, 2, T]
-    const at: c_int = @intCast(shape.audio_t);
-    const a3 = try reshape(audio_x, &[_]c_int{ 2, at, 32 }, s);
-    defer _ = mlx.mlx_array_free(a3);
-    const ap = try transpose(a3, &[_]c_int{ 2, 0, 1 }, s);
-    defer _ = mlx.mlx_array_free(ap);
-    const apc = try contig(ap, s);
-    defer _ = mlx.mlx_array_free(apc);
-    const audio_latent = try reshape(apc, &[_]c_int{ 1, 32, 2, at }, s);
+    const audio_latent = try audioRowsToLatent(audio_x, shape.audio_t, s);
     errdefer _ = mlx.mlx_array_free(audio_latent);
 
     // ── 5. audio VAE (optional) ──
     var audio_wave: ?mlx.mlx_array = null;
     if (paths.audio_vae) |apath| {
         if (progress) |p| p.emit("Decoding audio", req.steps, req.steps);
-        const audio_mod = @import("minimax_h3_audio.zig");
         var aw = try model_mod.loadWeightsSingleFile(allocator, apath);
         defer aw.deinit();
         const wave = try audio_mod.decode(allocator, &aw, audio_latent, dt, s);
@@ -2745,6 +4051,302 @@ pub fn generate(
         .frame_count = @intCast(pshape[2]),
         .height = @intCast(pshape[3]),
         .width = @intCast(pshape[4]),
+    };
+}
+
+// ── Chained windows ─────────────────────────────────────────────────────────
+
+/// Unique frames a chained clip delivers: each seam drops the duplicate frame
+/// (window N+1's frame 0 reproduces its conditioning keyframe).
+pub fn chainDeliveredFrames(windows: u32, window_frames: u32) u32 {
+    return windows * window_frames - (windows - 1);
+}
+
+/// One video frame of audio — the cross-fade width at each seam.
+pub const CHAIN_OVERLAP_SAMPLES: usize = audio_mod.SAMPLE_RATE / FPS;
+
+/// [1,3,F,H,W] -> [1,3,hi-lo,H,W]. The frame slice is never row-contiguous
+/// (channel planes are strided across it), so `contig` materializes a REAL
+/// copy and the window's 0.7 GB pixel buffer is not pinned by a view.
+fn sliceFrames(x: mlx.mlx_array, lo: c_int, hi: c_int, s: S) !mlx.mlx_array {
+    const shp = mlx.getShape(x);
+    const start = [_]c_int{ 0, 0, lo, 0, 0 };
+    const stop = [_]c_int{ shp[0], shp[1], hi, shp[3], shp[4] };
+    const step = [_]c_int{ 1, 1, 1, 1, 1 };
+    var o = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(o);
+    try mlx.check(mlx.mlx_slice(&o, x, &start, 5, &stop, 5, &step, 5, s));
+    return contig(o, s);
+}
+
+/// Equal-power cross-fade join of mono sample runs: `out` is seg0, then each
+/// later segment fades in over `overlap` samples of what was already written
+/// (weights cos/sin at t=(j+0.5)/ov·π/2) and appends its remainder. Pure host
+/// math so the seam is unit-testable; the caller applies it per channel.
+pub fn crossfadeJoin(allocator: std.mem.Allocator, segs: []const []const f32, overlap: usize) ![]f32 {
+    var total: usize = 0;
+    for (segs, 0..) |sg, i| {
+        total += sg.len;
+        if (i > 0) total -= @min(overlap, sg.len);
+    }
+    var out = try allocator.alloc(f32, total);
+    errdefer allocator.free(out);
+    var pos: usize = 0;
+    for (segs, 0..) |sg, i| {
+        if (i == 0) {
+            @memcpy(out[0..sg.len], sg);
+            pos = sg.len;
+            continue;
+        }
+        const ov = @min(overlap, @min(sg.len, pos));
+        const base = pos - ov;
+        for (0..ov) |j| {
+            const t = (@as(f32, @floatFromInt(j)) + 0.5) / @as(f32, @floatFromInt(ov)) * (std.math.pi / 2.0);
+            out[base + j] = out[base + j] * @cos(t) + sg[j] * @sin(t);
+        }
+        @memcpy(out[pos .. pos + (sg.len - ov)], sg[ov..]);
+        pos += sg.len - ov;
+    }
+    std.debug.assert(pos == total);
+    return out;
+}
+
+/// Stereo [2, L] waves -> one [2, L_total] f32 array joined per channel with
+/// `crossfadeJoin`. Waves are pulled to the host (the PCM writer does the same
+/// pull later; a seam is a few thousand samples of scalar math).
+fn joinWavesCrossfade(allocator: std.mem.Allocator, waves: []const mlx.mlx_array, overlap: usize, s: S) !mlx.mlx_array {
+    var planes = try allocator.alloc([]f32, waves.len);
+    var built: usize = 0;
+    defer {
+        for (planes[0..built]) |p| allocator.free(p);
+        allocator.free(planes);
+    }
+    var lens = try allocator.alloc(usize, waves.len);
+    defer allocator.free(lens);
+    for (waves, 0..) |wv, i| {
+        const c = try contig(wv, s);
+        defer _ = mlx.mlx_array_free(c);
+        const f = try astype(c, mlx.mlx_dtype.float32, s);
+        defer _ = mlx.mlx_array_free(f);
+        try mlx.check(mlx.mlx_array_eval(f));
+        const n: usize = @intCast(mlx.mlx_array_size(f));
+        const raw = mlx.mlx_array_data_float32(f) orelse return error.NoAudioData;
+        planes[i] = try allocator.dupe(f32, raw[0..n]);
+        built += 1;
+        lens[i] = n / 2;
+    }
+    var ch_out: [2][]f32 = undefined;
+    var ch_built: usize = 0;
+    defer for (ch_out[0..ch_built]) |p| allocator.free(p);
+    for (0..2) |ch| {
+        var segs = try allocator.alloc([]const f32, waves.len);
+        defer allocator.free(segs);
+        for (planes, 0..) |p, i| segs[i] = p[ch * lens[i] .. (ch + 1) * lens[i]];
+        ch_out[ch] = try crossfadeJoin(allocator, segs, overlap);
+        ch_built += 1;
+    }
+    const lt = ch_out[0].len;
+    std.debug.assert(ch_out[1].len == lt);
+    const buf = try allocator.alloc(f32, 2 * lt);
+    defer allocator.free(buf);
+    @memcpy(buf[0..lt], ch_out[0]);
+    @memcpy(buf[lt..], ch_out[1]);
+    const shp = [_]c_int{ 2, @intCast(lt) };
+    return mlx.mlx_array_new_data(buf.ptr, &shp, 2, mlx.mlx_dtype.float32);
+}
+
+/// Progress adapter: prefixes the stage with "Window w/n" and remaps
+/// determinate bars onto the whole chain so the client's meter is monotone
+/// across windows instead of restarting at every seam.
+const ChainProgress = struct {
+    inner: gen_sse.Progress,
+    window: u32,
+    windows: u32,
+
+    fn cb(ptr: *anyopaque, stage: []const u8, step: u32, total: u32) void {
+        const self: *ChainProgress = @ptrCast(@alignCast(ptr));
+        var buf: [96]u8 = undefined;
+        const label = std.fmt.bufPrint(&buf, "Window {d}/{d}: {s}", .{ self.window + 1, self.windows, stage }) catch stage;
+        if (total > 0)
+            self.inner.emit(label, self.window * total + step, self.windows * total)
+        else
+            self.inner.emit(label, step, 0);
+    }
+    fn cancelledCb(ptr: *anyopaque) bool {
+        const self: *ChainProgress = @ptrCast(@alignCast(ptr));
+        return self.inner.cancelled();
+    }
+    fn progress(self: *ChainProgress) gen_sse.Progress {
+        return .{ .ctx = self, .cb = cb, .cancelled_cb = cancelledCb };
+    }
+};
+
+/// N single-window generations chained by fl2va keyframes: window N's last
+/// decoded frame is VAE-encoded as window N+1's `.first` keyframe (the
+/// ordinary conditioning path), the duplicate frame is dropped at the join and
+/// the pieces butt-join in pixel space with a one-frame equal-power audio
+/// cross-fade. The user's own `.first` keyframe applies to window 0, their
+/// `.last` to the final window. v1 reloads the staged pipeline per window —
+/// the whole validated single-window path runs byte-for-byte unchanged, at the
+/// cost of the TE/DiT load time once per window.
+fn generateChain(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    paths: GenPaths,
+    req: GenRequest,
+    progress: ?gen_sse.Progress,
+    s: S,
+) !GenResult {
+    const n = req.chain_windows;
+    std.debug.assert(n >= 2);
+    // A reference has no keyframe row to chain through; the handler rejects
+    // this by name, the engine refuses to silently produce it.
+    if (req.refs.len > 0) return error.ChainWithRefs;
+
+    var user_first: ?Keyframe = null;
+    var user_last: ?Keyframe = null;
+    for (req.keyframes) |kf| switch (kf.anchor) {
+        .first => user_first = kf,
+        .last => user_last = kf,
+    };
+
+    var pixel_segs: std.ArrayList(mlx.mlx_array) = .empty;
+    defer {
+        for (pixel_segs.items) |x| _ = mlx.mlx_array_free(x);
+        pixel_segs.deinit(allocator);
+    }
+    var waves: std.ArrayList(mlx.mlx_array) = .empty;
+    defer {
+        for (waves.items) |x| _ = mlx.mlx_array_free(x);
+        waves.deinit(allocator);
+    }
+    var have_audio = true;
+    var final_latent: ?mlx.mlx_array = null;
+    errdefer if (final_latent) |x| {
+        _ = mlx.mlx_array_free(x);
+    };
+    var prev_last: ?mlx.mlx_array = null;
+    defer if (prev_last) |x| {
+        _ = mlx.mlx_array_free(x);
+    };
+    var out_w: u32 = 0;
+    var out_h: u32 = 0;
+
+    for (0..n) |w| {
+        var kfs: [2]Keyframe = undefined;
+        var nk: usize = 0;
+        if (w == 0) {
+            if (user_first) |kf| {
+                kfs[nk] = kf;
+                nk += 1;
+            }
+        } else {
+            kfs[nk] = .{ .anchor = .first, .pixels = prev_last.?, .vision = null };
+            nk += 1;
+        }
+        if (w == n - 1) {
+            if (user_last) |kf| {
+                kfs[nk] = kf;
+                nk += 1;
+            }
+        }
+
+        var wreq = req;
+        wreq.chain_windows = 1;
+        // Window 0 must reproduce the single-window generation exactly (same
+        // seed); later windows shift by 2 because generateOne draws seed and
+        // seed+1 (video/audio).
+        wreq.seed = req.seed +% 2 * @as(u64, @intCast(w));
+        wreq.keyframes = kfs[0..nk];
+
+        var cp: ChainProgress = undefined;
+        var wprog: ?gen_sse.Progress = null;
+        if (progress) |p| {
+            cp = .{ .inner = p, .window = @intCast(w), .windows = n };
+            wprog = cp.progress();
+        }
+
+        const res = try generateOne(allocator, io, paths, wreq, wprog, s);
+        // Deconstructed rather than deinit'd: the join takes the parts. `rp`
+        // nulls out as ownership moves so no error path can double-free.
+        const rframes: c_int = @intCast(res.frame_count);
+        out_w = res.width;
+        out_h = res.height;
+        var rp: ?mlx.mlx_array = res.pixels;
+        errdefer if (rp) |x| {
+            _ = mlx.mlx_array_free(x);
+        };
+        if (res.audio) |wave| {
+            waves.append(allocator, wave) catch |e| {
+                _ = mlx.mlx_array_free(wave);
+                _ = mlx.mlx_array_free(res.audio_latent);
+                return e;
+            };
+        } else have_audio = false;
+        if (w == n - 1) {
+            final_latent = res.audio_latent;
+        } else {
+            _ = mlx.mlx_array_free(res.audio_latent);
+        }
+
+        if (w + 1 < n) {
+            if (prev_last) |x| _ = mlx.mlx_array_free(x);
+            prev_last = try sliceFrames(rp.?, rframes - 1, rframes, s);
+            try mlx.check(mlx.mlx_array_eval(prev_last.?));
+        }
+        // Drop the duplicate join frame: window w>0's frame 0 reproduces the
+        // keyframe that conditioned it, which the previous window already
+        // delivered as its last frame.
+        const seg = if (w == 0) blk: {
+            const p = rp.?;
+            rp = null;
+            break :blk p;
+        } else blk: {
+            const sl = try sliceFrames(rp.?, 1, rframes, s);
+            errdefer _ = mlx.mlx_array_free(sl);
+            try mlx.check(mlx.mlx_array_eval(sl));
+            _ = mlx.mlx_array_free(rp.?);
+            rp = null;
+            break :blk sl;
+        };
+        pixel_segs.append(allocator, seg) catch |e| {
+            _ = mlx.mlx_array_free(seg);
+            return e;
+        };
+        _ = mlx.mlx_clear_cache();
+        log.info("[minimax-h3] chain window {d}/{d} done ({d} frames{s})\n", .{ w + 1, n, res.frame_count, if (w > 0) " — join frame dropped" else "" });
+    }
+
+    const joined = blk: {
+        const vec = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(vec);
+        for (pixel_segs.items) |p| _ = mlx.mlx_vector_array_append_value(vec, p);
+        var o = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(o);
+        try mlx.check(mlx.mlx_concatenate_axis(&o, vec, 2, s));
+        try mlx.check(mlx.mlx_array_eval(o));
+        break :blk o;
+    };
+    errdefer _ = mlx.mlx_array_free(joined);
+
+    var audio_joined: ?mlx.mlx_array = null;
+    if (have_audio and waves.items.len == n) {
+        audio_joined = try joinWavesCrossfade(allocator, waves.items, CHAIN_OVERLAP_SAMPLES, s);
+    }
+    errdefer if (audio_joined) |x| {
+        _ = mlx.mlx_array_free(x);
+    };
+    _ = mlx.mlx_clear_cache();
+
+    const pshape = mlx.getShape(joined);
+    log.info("[minimax-h3] chain joined: {d} windows -> {d} frames, audio {s}\n", .{ n, pshape[2], if (audio_joined != null) "cross-faded" else "absent" });
+    return .{
+        .pixels = joined,
+        .audio_latent = final_latent orelse return error.ChainNoWindows,
+        .audio = audio_joined,
+        .frame_count = @intCast(pshape[2]),
+        .height = out_h,
+        .width = out_w,
     };
 }
 
@@ -2932,6 +4534,14 @@ fn envU32(name: [:0]const u8, dflt: u32) u32 {
     return std.fmt.parseInt(u32, v, 10) catch dflt;
 }
 
+/// Whether `generate` will table and free the DiT's AdaLN weights. Shared with
+/// `gen.estimatePeakResidentBytes`: a residency bill computed against the OTHER
+/// answer is either an OOM (billed shed, ran full) or a refused load.
+pub fn adalnPrecomputeOn() bool {
+    const raw = envStr("MINIMAX_H3_ADALN_PRECOMPUTE") orelse return true;
+    return !std.mem.eql(u8, raw, "0");
+}
+
 fn allFinite(x: mlx.mlx_array, s: S) !bool {
     var isf = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(isf);
@@ -3024,7 +4634,6 @@ fn absMax(x: mlx.mlx_array, s: S) !f32 {
 /// Stereo [2, L] f32 -> interleaved 16-bit WAV at 32 kHz.
 fn writeWav(a: std.mem.Allocator, io: std.Io, wave: mlx.mlx_array, out_dir: []const u8, s: S) !void {
     const wav = @import("wav.zig");
-    const audio_mod = @import("minimax_h3_audio.zig");
     // [2, L] -> [L, 2] interleaved, which is what encodePcm16 expects.
     const t = try transpose(wave, &[_]c_int{ 1, 0 }, s);
     defer _ = mlx.mlx_array_free(t);
@@ -3066,6 +4675,62 @@ test "minimax h3: patchifyVideo matches the reference einsum order" {
     const data = mlx.mlx_array_data_float32(rows).?;
     const want = [_]f32{ 0, 1, 10, 11, 100, 101, 110, 111 };
     for (want, 0..) |v, i| try testing.expectEqual(v, data[i]);
+}
+
+test "minimax h3: audio latents pack to the rows the DiT unpacks back" {
+    // The reference's `pack_audio` is `latent[0].permute(1,2,0)` and its
+    // `unpack_audio` is the inverse. We already SHIPPED the unpack (the target
+    // audio latent at the end of `generate`); the ref2va cond rows need the
+    // other direction, and a wrong permutation there produces a plausibly
+    // shaped array that silently interleaves the stereo channels.
+    const s = mlx.gpuStream();
+    // [1, C=2, ch=2, T=3], v[c, ch, t] = c*100 + ch*10 + t.
+    var buf: [12]f32 = .{ 0, 1, 2, 10, 11, 12, 100, 101, 102, 110, 111, 112 };
+    const sh = [_]c_int{ 1, 2, 2, 3 };
+    const z = mlx.mlx_array_new_data(&buf, &sh, 4, mlx.mlx_dtype.float32);
+    defer _ = mlx.mlx_array_free(z);
+
+    const rows = try audioLatentToRows(z, s);
+    defer _ = mlx.mlx_array_free(rows);
+    // ch-major: (ch0 t0, ch0 t1, ch0 t2, ch1 t0, …), each row [C].
+    const rshp = mlx.getShape(rows);
+    try testing.expectEqual(@as(c_int, 6), rshp[0]);
+    try testing.expectEqual(@as(c_int, 2), rshp[1]);
+    try mlx.check(mlx.mlx_array_eval(rows));
+    const rd = mlx.mlx_array_data_float32(rows).?;
+    const want = [_]f32{ 0, 100, 1, 101, 2, 102, 10, 110, 11, 111, 12, 112 };
+    for (want, 0..) |v, i| try testing.expectEqual(v, rd[i]);
+
+    // …and round-trips through the shipped unpack, which is what the target
+    // audio latent is built with.
+    const back = try audioRowsToLatent(rows, 3, s);
+    defer _ = mlx.mlx_array_free(back);
+    try mlx.check(mlx.mlx_array_eval(back));
+    const bd = mlx.mlx_array_data_float32(back).?;
+    for (buf, 0..) |v, i| try testing.expectEqual(v, bd[i]);
+}
+
+test "minimax h3: a ref block is DERIVED from its resolved reference" {
+    // `resolveRefs` hands back refs and blocks as parallel arrays, and the
+    // generation path needs to go from one to the other (it encodes per ref and
+    // must lay out per block). Deriving the block from the ref through the ONE
+    // function `resolveRefs` itself uses is what keeps the two from drifting —
+    // a second hand-rolled mapping is the class that put the dsv4 exclusion in
+    // three places.
+    const a = testing.allocator;
+    const images = [_]RefInput{.{ .kind = .image, .w = 1024, .h = 768 }};
+    const videos = [_]RefInput{
+        .{ .kind = .video, .w = 640, .h = 480, .frames = 39 },
+        .{ .kind = .video, .w = 1920, .h = 1080, .frames = 56, .soundtrack_samples = 48000 },
+    };
+    const audios = [_]RefInput{.{ .kind = .audio, .audio_samples = 32000 }};
+    var res = switch (try resolveRefs(a, &images, &videos, &audios, 864, 480, .match)) {
+        .ok => |r| r,
+        .reject => return error.UnexpectedReject,
+    };
+    defer res.deinit();
+    try testing.expectEqual(res.refs.len, res.blocks.len);
+    for (res.refs, res.blocks) |r, b| try testing.expectEqual(b, refBlockFor(r));
 }
 
 test "minimax h3: timestep plan can index a GLOBAL schedule table" {
@@ -3408,6 +5073,469 @@ test "minimax h3: packed layout matches the reference segment table" {
     }
 }
 
+// Vision-tower parity vs the EXECUTED reference
+// (tests/dump_minimax_h3_vision_tower_fixture.py — ComfyUI's Qwen3-VL tower
+// reproduced verbatim and run on OUR dequantized weights, so a diff is a
+// layout/math bug and never quantization error).
+//
+//   MINIMAX_H3_MODEL=~/.mlx-serve/models/ddalcu/MiniMax-H3-FL2VA-MLX-Serve-8bit \
+//   MINIMAX_H3_VIT_FIXTURE=~/claude-tmp/h3-build/minimax_h3_vit_fixture.safetensors \
+//   zig build test -Doptimize=ReleaseFast -Dtest-filter="vision tower parity"
+test "minimax h3 live: vision tower parity vs the executed reference" {
+    const raw_model = std.c.getenv("MINIMAX_H3_MODEL") orelse return error.SkipZigTest;
+    const raw_fix = std.c.getenv("MINIMAX_H3_VIT_FIXTURE") orelse return error.SkipZigTest;
+    const model_dir = std.mem.sliceTo(raw_model, 0);
+    const fix_path = std.mem.sliceTo(raw_fix, 0);
+    if (model_dir.len == 0 or fix_path.len == 0) return error.SkipZigTest;
+    const a = testing.allocator;
+    const s = mlx.gpuStream();
+
+    var fx = try model_mod.loadWeightsSingleFile(a, fix_path);
+    defer fx.deinit();
+    const te_path = try std.fmt.allocPrint(a, "{s}/text_encoder.safetensors", .{model_dir});
+    defer a.free(te_path);
+    var tw = try model_mod.loadWeightsSingleFile(a, te_path);
+    defer tw.deinit();
+
+    // BOTH dtypes: f32 isolates the math, bf16 is what actually serves. A
+    // parity test that only runs the convenient precision does not cover the
+    // shipped path (the mage_flow dtype-promotion class).
+    for ([_]mlx.mlx_dtype{ mlx.mlx_dtype.float32, mlx.mlx_dtype.bfloat16 }) |tdt| {
+        try towerParityAt(a, &tw, &fx, tdt, s);
+    }
+}
+
+fn towerParityAt(a: std.mem.Allocator, tw: *const Weights, fx: *const Weights, tdt: mlx.mlx_dtype, s: S) !void {
+    var tower = try mage_flow.VisionTower.loadFrom(a, s, tw, mage_flow.H3_VIT, tdt);
+    defer tower.deinit();
+    const tag = if (tdt == mlx.mlx_dtype.float32) "f32" else "bf16";
+
+    // Patchify from the SAME [2,3,H,W] frames the fixture fed its reference, so
+    // this compares the tower and not two different patch orders.
+    const frames = fx.get("frames") orelse return error.MissingFixtureTensor;
+    const fshp = mlx.getShape(frames);
+    const grid = h3v.Grid{
+        .t = 1,
+        .gh = @intCast(@divExact(fshp[2], @as(c_int, @intCast(h3v.PATCH)))),
+        .gw = @intCast(@divExact(fshp[3], @as(c_int, @intCast(h3v.PATCH)))),
+    };
+    const rows = try visionPatchRows(frames, grid, s);
+    defer _ = mlx.mlx_array_free(rows);
+
+    // The patch rows themselves first: if these differ, every later number is
+    // explained by that and the tower is innocent.
+    const want_pv = fx.get("pixel_values") orelse return error.MissingFixtureTensor;
+    const pv_cos = try cosineSim(rows, want_pv, s);
+    std.debug.print("[h3-vit/{s}] pixel_values cos={d:.6}\n", .{ tag, pv_cos });
+    try testing.expect(pv_cos > 0.9999);
+
+    const out = try tower.forward(rows, &[_][3]i64{.{ grid.t, grid.gh, grid.gw }});
+    defer _ = mlx.mlx_array_free(out.merged);
+    defer for (out.deepstack) |d| {
+        _ = mlx.mlx_array_free(d);
+    };
+
+    const want_merged = fx.get("merged") orelse return error.MissingFixtureTensor;
+    const m_cos = try cosineSim(out.merged, want_merged, s);
+    // MAGNITUDE, not just angle. Cosine is scale-invariant, so a merger that
+    // produced features 40x too large (or small) would score a perfect 1.0 here
+    // while completely unbalancing the LM sequence it is spliced into — the
+    // reference's own rows carry ~41x the norm of a token embedding, so the
+    // ratio is load-bearing and must be reproduced, not just the direction.
+    const m_ratio = try rmsRatio(out.merged, want_merged, s);
+    std.debug.print("[h3-vit/{s}] merged cos={d:.6} rms_ratio={d:.4}\n", .{ tag, m_cos, m_ratio });
+    try testing.expect(m_ratio > 0.97 and m_ratio < 1.03);
+    for (0..3) |i| {
+        var buf: [24]u8 = undefined;
+        const key = try std.fmt.bufPrint(&buf, "deepstack_{d}", .{i});
+        const want = fx.get(key) orelse return error.MissingFixtureTensor;
+        const c = try cosineSim(out.deepstack[i], want, s);
+        std.debug.print("[h3-vit/{s}] deepstack_{d} cos={d:.6}\n", .{ tag, i, c });
+        try testing.expect(c > 0.999);
+    }
+    try testing.expect(m_cos > 0.999);
+}
+
+test "minimax h3: reference sizing matches the reference node" {
+    const a = testing.allocator;
+    var parsed = try loadFixture(a);
+    defer parsed.deinit();
+    const rs = parsed.value.object.get("ref_sizing").?.object;
+
+    try testing.expectEqual(REF_IMAGE_SHORT_EDGE, jsonU32(rs.get("REF_IMAGE_SHORT_EDGE").?));
+
+    for (rs.get("images").?.array.items) |item| {
+        const o = item.object;
+        const mode: RefImageSizing = if (std.mem.eql(u8, o.get("mode").?.string, "match")) .match else .max;
+        const got = refImageCanvas(
+            jsonU32(o.get("in_w").?),
+            jsonU32(o.get("in_h").?),
+            jsonU32(o.get("gen_w").?),
+            jsonU32(o.get("gen_h").?),
+            mode,
+        );
+        testing.expectEqual(jsonU32(o.get("out_w").?), got.w) catch |e| {
+            std.debug.print("image {d}x{d} gen {d}x{d} {s}: w {d}\n", .{
+                jsonU32(o.get("in_w").?), jsonU32(o.get("in_h").?),
+                jsonU32(o.get("gen_w").?), jsonU32(o.get("gen_h").?),
+                o.get("mode").?.string, got.w,
+            });
+            return e;
+        };
+        try testing.expectEqual(jsonU32(o.get("out_h").?), got.h);
+        // The SCALE never enlarges (`min(1.0, …)`) — a reference gets fewer
+        // tokens rather than invented detail. The output can still exceed the
+        // source by less than one 32-px step, because the /32 snap rounds
+        // half-to-EVEN and may round up (3000 -> 3008); bounding on the source
+        // alone would be a wrong invariant that fails on a real aspect.
+        try testing.expect(got.w <= @max(CANVAS_MULTIPLE, jsonU32(o.get("in_w").?) + CANVAS_MULTIPLE));
+        try testing.expect(got.h <= @max(CANVAS_MULTIPLE, jsonU32(o.get("in_h").?) + CANVAS_MULTIPLE));
+    }
+
+    for (rs.get("videos").?.array.items) |item| {
+        const o = item.object;
+        const got = refVideoCanvas(jsonU32(o.get("in_w").?), jsonU32(o.get("in_h").?));
+        testing.expectEqual(jsonU32(o.get("out_w").?), got.w) catch |e| {
+            std.debug.print("video {d}x{d}: w {d}\n", .{ jsonU32(o.get("in_w").?), jsonU32(o.get("in_h").?), got.w });
+            return e;
+        };
+        try testing.expectEqual(jsonU32(o.get("out_h").?), got.h);
+    }
+
+    for (rs.get("frames").?.array.items) |item| {
+        const o = item.object;
+        // A reference video is TRIMMED to the ladder, never padded — and below
+        // the 5-frame floor it is not a usable reference at all.
+        try testing.expectEqual(jsonU32(o.get("aligned").?), alignRefFrameCount(jsonU32(o.get("requested").?)));
+    }
+}
+
+test "minimax h3: ref2va request resolution orders and numbers references" {
+    const a = testing.allocator;
+
+    // The reference's fixed order and per-type ordinals: two images, a
+    // soundtracked video, a bare video, one standalone audio.
+    const images = [_]RefInput{
+        .{ .kind = .image, .w = 1024, .h = 1024 },
+        .{ .kind = .image, .w = 640, .h = 480 },
+    };
+    const videos = [_]RefInput{
+        .{ .kind = .video, .w = 640, .h = 480, .frames = 40, .soundtrack_samples = 32000 },
+        .{ .kind = .video, .w = 1920, .h = 1080, .frames = 22 },
+    };
+    const audios = [_]RefInput{.{ .kind = .audio, .audio_samples = 16000 }};
+
+    var res = switch (try resolveRefs(a, &images, &videos, &audios, 864, 480, .match)) {
+        .ok => |r| r,
+        .reject => |why| {
+            std.debug.print("unexpected reject: {s}\n", .{why.message()});
+            return error.TestUnexpectedResult;
+        },
+    };
+    defer res.deinit();
+
+    try testing.expectEqual(@as(usize, 5), res.refs.len);
+    try testing.expectEqual(res.refs.len, res.blocks.len);
+
+    // Order: images, then videos, then standalone audio.
+    for ([_]u32{ 1, 2 }, 0..) |ord, i| {
+        try testing.expect(res.refs[i].kind == .image);
+        try testing.expectEqual(ord, res.refs[i].ordinal);
+        try testing.expectEqual(i, res.refs[i].src_index);
+    }
+    try testing.expect(res.refs[2].kind == .video);
+    try testing.expectEqual(@as(u32, 1), res.refs[2].ordinal);
+    try testing.expect(res.refs[3].kind == .video);
+    try testing.expectEqual(@as(u32, 2), res.refs[3].ordinal);
+    try testing.expect(res.refs[4].kind == .audio);
+
+    // A soundtrack CONSUMES an <Audio j> ordinal, and it is emitted before the
+    // standalone audio — so the standalone is <Audio 2>, not <Audio 1>.
+    try testing.expectEqual(@as(u32, 1), res.refs[2].audio_ordinal);
+    try testing.expectEqual(@as(u32, 0), res.refs[3].audio_ordinal); // no soundtrack
+    try testing.expectEqual(@as(u32, 2), res.refs[4].ordinal);
+
+    // Video frames snap DOWN to the ladder: 40 -> 39, 22 -> 22.
+    try testing.expectEqual(@as(u32, 39), res.refs[2].frames);
+    try testing.expectEqual(videoLatentT(39), res.refs[2].latent_t);
+    try testing.expectEqual(@as(u32, 22), res.refs[3].frames);
+
+    // A 640x480 reference video is NOT upscaled to the 768 short edge.
+    try testing.expectEqual(@as(u32, 640), res.refs[2].canvas.w);
+    try testing.expectEqual(@as(u32, 480), res.refs[2].canvas.h);
+
+    // Audio rounds UP to a whole latent frame (32000/800 = 40; 16000 -> 20).
+    try testing.expectEqual(@as(u32, 40), res.refs[2].audio_t);
+    try testing.expectEqual(@as(u32, 20), res.refs[4].audio_t);
+
+    // The blocks are exactly what PackedLayout consumes, in the same order —
+    // and a soundtracked video is ONE block carrying its audio, never two.
+    try testing.expect(res.blocks[2].kind == .video);
+    try testing.expectEqual(@as(u32, 40), res.blocks[2].audio_t);
+    try testing.expect(res.blocks[3].kind == .video);
+    try testing.expectEqual(@as(u32, 0), res.blocks[3].audio_t);
+    try testing.expect(res.blocks[4].kind == .audio);
+
+    // And the layout built from them is well-formed: the target streams stay
+    // last, and every reference row is a CONDITION row.
+    var layout = try PackedLayout.initFull(a, 64, 17, 30, 54, 93, &.{}, 56, res.blocks);
+    defer layout.deinit();
+    try testing.expectEqual(SegmentKind.video, layout.videoSegment().kind);
+    try testing.expectEqual(SegmentKind.audio, layout.audioSegment().kind);
+    var img_false: u32 = 0;
+    for (layout.img_update) |v| img_false += @intFromBool(!v);
+    try testing.expect(img_false > 0);
+}
+
+test "minimax h3: ref2va rejects what it cannot honor, by name" {
+    const a = testing.allocator;
+    const img = RefInput{ .kind = .image, .w = 512, .h = 512 };
+    const vid = RefInput{ .kind = .video, .w = 512, .h = 512, .frames = 22 };
+    const aud = RefInput{ .kind = .audio, .audio_samples = 16000 };
+
+    const rep = struct {
+        fn f(comptime n: usize, v: RefInput) [n]RefInput {
+            var b: [n]RefInput = undefined;
+            for (&b) |*e| e.* = v;
+            return b;
+        }
+    }.f;
+    const many_img = rep(MAX_REF_IMAGES + 1, img);
+    const many_vid = rep(MAX_REF_VIDEOS + 1, vid);
+    const many_aud = rep(MAX_REF_AUDIOS + 1, aud);
+    const short = [_]RefInput{.{ .kind = .video, .w = 512, .h = 512, .frames = 4 }};
+    const empty = [_]RefInput{.{ .kind = .video, .w = 512, .h = 512, .frames = 0 }};
+
+    const cases = [_]struct { i: []const RefInput, v: []const RefInput, au: []const RefInput, want: RefReject }{
+        .{ .i = &many_img, .v = &.{}, .au = &.{}, .want = .too_many_images },
+        .{ .i = &.{}, .v = &many_vid, .au = &.{}, .want = .too_many_videos },
+        .{ .i = &.{}, .v = &.{}, .au = &many_aud, .want = .too_many_audios },
+        .{ .i = &.{}, .v = &short, .au = &.{}, .want = .video_too_short },
+        .{ .i = &.{}, .v = &empty, .au = &.{}, .want = .empty_video },
+    };
+    for (cases) |c| {
+        switch (try resolveRefs(a, c.i, c.v, c.au, 864, 480, .match)) {
+            .ok => |r| {
+                var rr = r;
+                rr.deinit();
+                std.debug.print("expected reject {s}\n", .{@tagName(c.want)});
+                return error.TestUnexpectedResult;
+            },
+            .reject => |why| try testing.expectEqual(c.want, why),
+        }
+        // Every message must actually name the field the client sent, or a 400
+        // tells them nothing they can act on.
+        try testing.expect(c.want.message().len > 20);
+    }
+
+    // The caps are INCLUSIVE — exactly at the limit must be served.
+    const at_cap_i = rep(MAX_REF_IMAGES, img);
+    const at_cap_v = rep(MAX_REF_VIDEOS, vid);
+    var ok = switch (try resolveRefs(a, &at_cap_i, &at_cap_v, &.{}, 864, 480, .max)) {
+        .ok => |r| r,
+        .reject => return error.TestUnexpectedResult,
+    };
+    defer ok.deinit();
+    try testing.expectEqual(MAX_REF_TOTAL, ok.refs.len);
+}
+
+test "minimax h3: the reference set has a TOTAL cap, not just per-type ones" {
+    // The three per-type caps sum to 15, but MiniMax's own limit is 12 files
+    // across all types — so every per-type cap could pass while the set as a
+    // whole is one the model was never given. A cap that is only ever checked
+    // per type is not the cap the card states.
+    const a = testing.allocator;
+    const img = RefInput{ .kind = .image, .w = 512, .h = 512 };
+    const vid = RefInput{ .kind = .video, .w = 512, .h = 512, .frames = 22 };
+    const aud = RefInput{ .kind = .audio, .audio_samples = 32000 };
+    const rep = struct {
+        fn f(comptime n: usize, v: RefInput) [n]RefInput {
+            var b: [n]RefInput = undefined;
+            for (&b) |*e| e.* = v;
+            return b;
+        }
+    }.f;
+
+    try testing.expectEqual(@as(usize, 12), MAX_REF_TOTAL);
+    try testing.expect(MAX_REF_TOTAL < MAX_REF_IMAGES + MAX_REF_VIDEOS + MAX_REF_AUDIOS);
+
+    // 9 + 3 + 3 = 15: every per-type cap holds, the set does not.
+    const over_i = rep(9, img);
+    const over_v = rep(3, vid);
+    const over_a = rep(3, aud);
+    switch (try resolveRefs(a, &over_i, &over_v, &over_a, 864, 480, .max)) {
+        .ok => return error.TestUnexpectedResult,
+        .reject => |r| {
+            try testing.expectEqual(RefReject.too_many_refs, r);
+            // The message must name the number, or the client cannot know
+            // which of its files to drop.
+            try testing.expect(std.mem.indexOf(u8, r.message(), "12") != null);
+        },
+    }
+
+    // 13 is over by one; 12 in the same shape is served.
+    const twelve_i = rep(6, img);
+    const three_v = rep(3, vid);
+    const four_a = rep(4, aud); // over the per-type cap too — that wins, it is more specific
+    switch (try resolveRefs(a, &twelve_i, &three_v, &four_a, 864, 480, .max)) {
+        .ok => return error.TestUnexpectedResult,
+        .reject => |r| try testing.expectEqual(RefReject.too_many_audios, r),
+    }
+    const six_i = rep(6, img);
+    const three_a = rep(3, aud);
+    var ok = switch (try resolveRefs(a, &six_i, &three_v, &three_a, 864, 480, .max)) {
+        .ok => |r| r,
+        .reject => return error.TestUnexpectedResult,
+    };
+    defer ok.deinit();
+    try testing.expectEqual(@as(usize, 12), ok.refs.len);
+}
+
+test "minimax h3: Qwen sees a reference video at 2 fps" {
+    // The DiT sees every frame through the VAE; the vision tower sees every
+    // 12th (24 fps / 2). The `<T.T seconds>` labels count THAT subsample, so a
+    // stride error mislabels every timestamp in the presentation.
+    try testing.expectEqual(@as(u32, 12), qwenFrameStride());
+    try testing.expectEqual(@as(u32, 1), qwenSampledFrames(5));
+    try testing.expectEqual(@as(u32, 2), qwenSampledFrames(22));
+    try testing.expectEqual(@as(u32, 4), qwenSampledFrames(39));
+    try testing.expectEqual(@as(u32, 11), qwenSampledFrames(124));
+}
+
+test "minimax h3: ref2va block layout matches the reference" {
+    const a = testing.allocator;
+    var parsed = try loadFixture(a);
+    defer parsed.deinit();
+
+    for (parsed.value.object.get("ref_layout").?.array.items) |item| {
+        const o = item.object;
+        const name = o.get("name").?.string;
+
+        const raw_refs = o.get("refs").?.array.items;
+        const refs = try a.alloc(RefBlock, raw_refs.len);
+        defer a.free(refs);
+        for (raw_refs, 0..) |rv, i| {
+            const r = rv.object;
+            const kind = r.get("kind").?.string;
+            refs[i] = .{
+                .kind = if (std.mem.eql(u8, kind, "image"))
+                    .image
+                else if (std.mem.eql(u8, kind, "audio"))
+                    .audio
+                else
+                    .video,
+                .latent_h = if (r.get("latent_h")) |v| jsonU32(v) else 0,
+                .latent_w = if (r.get("latent_w")) |v| jsonU32(v) else 0,
+                .latent_t = if (r.get("latent_t")) |v| jsonU32(v) else 0,
+                .audio_t = if (r.get("ref_audio_t")) |v| jsonU32(v) else 0,
+            };
+        }
+
+        var layout = try PackedLayout.initFull(
+            a,
+            jsonU32(o.get("text_len").?),
+            jsonU32(o.get("latent_t").?),
+            jsonU32(o.get("latent_h").?),
+            jsonU32(o.get("latent_w").?),
+            jsonU32(o.get("audio_t").?),
+            &.{},
+            jsonU32(o.get("frame_count").?),
+            refs,
+        );
+        defer layout.deinit();
+
+        testing.expectEqual(jsonU32(o.get("seq_len").?), layout.seq_len) catch |e| {
+            std.debug.print("case {s}: seq_len {d} vs {d}\n", .{ name, layout.seq_len, jsonU32(o.get("seq_len").?) });
+            return e;
+        };
+
+        const want_segs = o.get("segments").?.array.items;
+        testing.expectEqual(want_segs.len, layout.segments.len) catch |e| {
+            std.debug.print("case {s}: {d} segments vs {d}\n", .{ name, layout.segments.len, want_segs.len });
+            return e;
+        };
+        for (want_segs, 0..) |ws, i| {
+            const arr = ws.array.items;
+            testing.expectEqual(SegmentKind.fromString(arr[2].string).?, layout.segments[i].kind) catch |e| {
+                std.debug.print("case {s}: segment {d} kind {s} vs {s}\n", .{
+                    name, i, @tagName(layout.segments[i].kind), arr[2].string,
+                });
+                return e;
+            };
+            try testing.expectEqual(jsonU32(arr[0]), layout.segments[i].start);
+            try testing.expectEqual(jsonU32(arr[1]), layout.segments[i].end);
+        }
+
+        const pf = o.get("pos_first").?.array.items;
+        const pl = o.get("pos_last").?.array.items;
+        const last = (layout.seq_len - 1) * 3;
+        for (0..3) |k| {
+            try testing.expectApproxEqAbs(jsonF64(pf[k]), layout.position_ids[k], 1e-9);
+            try testing.expectApproxEqAbs(jsonF64(pl[k]), layout.position_ids[last + k], 1e-9);
+        }
+
+        const ps = o.get("pos_sum").?.array.items;
+        const pw = o.get("pos_weighted").?.array.items;
+        for (0..3) |k| {
+            var sum: f64 = 0;
+            var weighted: f64 = 0;
+            var i: usize = 0;
+            while (i < layout.seq_len) : (i += 1) {
+                const v = layout.position_ids[i * 3 + k];
+                sum += v;
+                weighted += v * @as(f64, @floatFromInt(i + 1));
+            }
+            testing.expectApproxEqRel(jsonF64(ps[k]), sum, 1e-9) catch |e| {
+                std.debug.print("case {s}: axis {d} checksum\n", .{ name, k });
+                return e;
+            };
+            // The order-sensitive companion — swapping a block's stereo channels
+            // or reversing a frame's rows leaves the plain sum untouched.
+            testing.expectApproxEqRel(jsonF64(pw[k]), weighted, 1e-9) catch |e| {
+                std.debug.print("case {s}: axis {d} ORDER\n", .{ name, k });
+                return e;
+            };
+        }
+
+        // Both ENDS of every segment: a block whose first row is right can still
+        // run off the end of its own span (the cursor-advance class).
+        const sfp = o.get("seg_first_pos").?.array.items;
+        const slp = o.get("seg_last_pos").?.array.items;
+        for (0..layout.segments.len) |si| {
+            const seg = layout.segments[si];
+            const fbase = @as(usize, seg.start) * 3;
+            const lbase = @as(usize, seg.end - 1) * 3;
+            for (0..3) |k| {
+                testing.expectApproxEqAbs(jsonF64(sfp[si].array.items[k]), layout.position_ids[fbase + k], 1e-9) catch |e| {
+                    std.debug.print("case {s}: seg {d} ({s}) axis {d} FIRST\n", .{ name, si, @tagName(seg.kind), k });
+                    return e;
+                };
+                testing.expectApproxEqAbs(jsonF64(slp[si].array.items[k]), layout.position_ids[lbase + k], 1e-9) catch |e| {
+                    std.debug.print("case {s}: seg {d} ({s}) axis {d} LAST\n", .{ name, si, @tagName(seg.kind), k });
+                    return e;
+                };
+            }
+        }
+
+        // Reference rows are CONDITION rows: never denoised, and they must be
+        // counted into the update masks the forward slices by.
+        try testing.expectEqual(jsonU32(o.get("img_rows").?), @as(u32, @intCast(layout.img_update.len)));
+        try testing.expectEqual(jsonU32(o.get("audio_rows").?), @as(u32, @intCast(layout.audio_update.len)));
+        var img_true: u32 = 0;
+        for (layout.img_update) |v| img_true += @intFromBool(v);
+        try testing.expectEqual(jsonU32(o.get("img_update_true").?), img_true);
+        var aud_true: u32 = 0;
+        for (layout.audio_update) |v| aud_true += @intFromBool(v);
+        try testing.expectEqual(jsonU32(o.get("audio_update_true").?), aud_true);
+
+        // The target streams stay the last two segments no matter how many
+        // references precede them — the final layer slices on that promise.
+        try testing.expectEqual(SegmentKind.video, layout.videoSegment().kind);
+        try testing.expectEqual(SegmentKind.audio, layout.audioSegment().kind);
+        try testing.expectEqual(layout.seq_len, layout.videoSegment().end);
+    }
+}
+
 test "minimax h3: timestep plan assigns modulation rows" {
     const a = testing.allocator;
 
@@ -3455,6 +5583,65 @@ test "minimax h3: timestep plan assigns modulation rows" {
         cursor = r.end;
     }
     try testing.expectEqual(l2.seq_len, cursor);
+}
+
+test "minimax h3: a vision-carrying text span splits into tag runs" {
+    const a = testing.allocator;
+
+    var l = try PackedLayout.init(a, 10, 2, 8, 8, 3, &.{}, 5);
+    defer l.deinit();
+
+    // Uniform text: exactly one run per segment, the pre-vision behaviour.
+    {
+        var p = try buildTimestepPlan(a, &l, 0.5, SIGMA_SHIFT_VIDEO, SIGMA_SHIFT_AUDIO, .{});
+        defer p.deinit();
+        try testing.expectEqual(l.segments.len, p.runs.len);
+        try testing.expectEqual(@as(u32, 0 * 3 + 1), p.runs[0].mod_row);
+    }
+
+    // A spliced vision block makes the text span mixed-modality: text rows keep
+    // tag 1, the vision pads take tag 0 (video) at the SAME timestep row. Get
+    // this wrong and the pads are modulated with text statistics — silent.
+    const tags = [_]u8{ 1, 1, 0, 0, 0, 0, 1, 1, 1, 1 };
+    l.text_tags = &tags;
+    var p = try buildTimestepPlan(a, &l, 0.5, SIGMA_SHIFT_VIDEO, SIGMA_SHIFT_AUDIO, .{});
+    defer p.deinit();
+
+    // 3 text runs + audio + video.
+    try testing.expectEqual(@as(usize, 5), p.runs.len);
+    try testing.expectEqual(ModRun{ .start = 0, .end = 2, .mod_row = 1 }, p.runs[0]);
+    try testing.expectEqual(ModRun{ .start = 2, .end = 6, .mod_row = 0 }, p.runs[1]);
+    try testing.expectEqual(ModRun{ .start = 6, .end = 10, .mod_row = 1 }, p.runs[2]);
+
+    // Still an exact tiling — a split that drops or doubles a row is the whole
+    // risk of resolving runs at forward time.
+    var cursor: u32 = 0;
+    for (p.runs) |r| {
+        try testing.expectEqual(cursor, r.start);
+        try testing.expect(r.end > r.start);
+        cursor = r.end;
+    }
+    try testing.expectEqual(l.seq_len, cursor);
+
+    // A tag array that does not match the text length is IGNORED rather than
+    // trusted: a mismatched split would silently mis-modulate every later row.
+    const short = [_]u8{ 1, 0 };
+    l.text_tags = &short;
+    var p2 = try buildTimestepPlan(a, &l, 0.5, SIGMA_SHIFT_VIDEO, SIGMA_SHIFT_AUDIO, .{});
+    defer p2.deinit();
+    try testing.expectEqual(l.segments.len, p2.runs.len);
+}
+
+/// RMS(a) / RMS(b) — the scale companion to a cosine, which cannot see it.
+fn rmsRatio(a_arr: mlx.mlx_array, b_arr: mlx.mlx_array, s: S) !f32 {
+    const af = try astype(a_arr, mlx.mlx_dtype.float32, s);
+    defer _ = mlx.mlx_array_free(af);
+    const bf = try astype(b_arr, mlx.mlx_dtype.float32, s);
+    defer _ = mlx.mlx_array_free(bf);
+    const na = try sumAll(try mulOwned(af, af, s), s);
+    const nb = try sumAll(try mulOwned(bf, bf, s), s);
+    if (!std.math.isFinite(na) or !std.math.isFinite(nb) or nb <= 0) return std.math.nan(f32);
+    return @sqrt(na) / @sqrt(nb);
 }
 
 /// Cosine similarity between two arrays, with a FINITENESS check first.
@@ -3752,6 +5939,161 @@ test "minimax h3 live: sdpa shape ubench" {
     }
 }
 
+test "minimax h3 live: sparse attention ubench" {
+    // Prices `sparseAttend` against dense SDPA at the two REAL packed shapes.
+    //
+    // The geometry says sparse should be 17-32x cheaper in key-visits (5.6%/3.1%
+    // of dense at 1344x768/124f; 5.7%/5.0% at 960x544/362f), so any wall-clock
+    // short of that is OVERHEAD — and the overhead is visible in the shapes:
+    // the strip keys are BROADCAST into every batch element, so temporal mode
+    // (nb = f, the rows per frame) materializes an 8.8-10.8 GB kcat where
+    // spatial (nb = t, the latent frames) needs 0.8-2.9 GB. Fewer FLOPs, far
+    // more bytes. This test is what turns that reading into a number.
+    if (std.c.getenv("MINIMAX_H3_SPARSE_UBENCH") == null) return error.SkipZigTest;
+    log.enableStderr();
+    const s = mlx.gpuStream();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const nh: c_int = 56;
+    const hd: c_int = 128;
+    const scale: f32 = 1.0 / @sqrt(@as(f32, 128.0));
+    const null_a = mlx.mlx_array{ .ctx = null };
+
+    const cfgs = [_]struct { n: []const u8, t: u32, f: u32, g: u32 }{
+        .{ .n = "1344x768/124f", .t = 37, .f = 1008, .g = 573 },
+        .{ .n = " 960x544/362f", .t = 107, .f = 510, .g = 1365 },
+    };
+    for (cfgs) |c| {
+        const seq: c_int = @intCast(c.g + c.t * c.f);
+        const q = try randomNormal(&[_]c_int{ 1, nh, seq, hd }, 1, mlx.mlx_dtype.bfloat16, s);
+        defer _ = mlx.mlx_array_free(q);
+        const k = try randomNormal(&[_]c_int{ 1, nh, seq, hd }, 2, mlx.mlx_dtype.bfloat16, s);
+        defer _ = mlx.mlx_array_free(k);
+        const v = try randomNormal(&[_]c_int{ 1, nh, seq, hd }, 3, mlx.mlx_dtype.bfloat16, s);
+        defer _ = mlx.mlx_array_free(v);
+        try mlx.check(mlx.mlx_array_eval(q));
+        try mlx.check(mlx.mlx_array_eval(k));
+        try mlx.check(mlx.mlx_array_eval(v));
+
+        var dense_ms: u64 = std.math.maxInt(u64);
+        for (0..3) |_| {
+            var cl = LapClock.init(io);
+            var o = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&o, q, k, v, scale, "", null_a, null_a, s));
+            try mlx.check(mlx.mlx_array_eval(o));
+            _ = mlx.mlx_array_free(o);
+            dense_ms = @min(dense_ms, cl.lapMs());
+        }
+        const fseq: f64 = @floatFromInt(seq);
+        log.info("[sparse-ubench] {s} S={d}  dense {d} ms\n", .{ c.n, seq, dense_ms });
+
+        inline for (.{ SparseMode.spatial, SparseMode.temporal }) |mode| {
+            const spec = SparseSpec{ .mode = mode, .t = c.t, .f = c.f, .video_start = c.g };
+            var best: u64 = std.math.maxInt(u64);
+            for (0..3) |_| {
+                var cl = LapClock.init(io);
+                const o = try sparseAttend(q, k, v, spec, scale, s);
+                try mlx.check(mlx.mlx_array_eval(o));
+                _ = mlx.mlx_array_free(o);
+                best = @min(best, cl.lapMs());
+            }
+            // Key-visits per head, the honest FLOP proxy for a reduced softmax.
+            const gs: f64 = @floatFromInt(c.g);
+            const tf: f64 = @floatFromInt(c.t * c.f);
+            const grp: f64 = if (mode == .spatial) @floatFromInt(c.f) else @floatFromInt(c.t);
+            const visits = gs * fseq + tf * (grp + gs);
+            const flop_pct = 100.0 * visits / (fseq * fseq);
+            const speedup = @as(f64, @floatFromInt(dense_ms)) / @as(f64, @floatFromInt(@max(best, 1)));
+            log.info("[sparse-ubench] {s} {s:<8} {d} ms  speedup {d:.2}x  (FLOPs {d:.2}% of dense => ceiling {d:.1}x)\n", .{ c.n, @tagName(mode), best, speedup, flop_pct, 100.0 / flop_pct });
+            _ = mlx.mlx_clear_cache();
+        }
+        _ = mlx.mlx_clear_cache();
+    }
+}
+
+test "minimax h3 live: projection gemm ubench" {
+    // The companion to the SDPA ubench. That one measured attention at 11.2-13.0
+    // TFLOPS (78-90% of this box's GEMM rate), which leaves the LINEARS as the
+    // only unmeasured half of a step — and the honest way to price them is to
+    // run them, not to subtract attention from the wall clock. Subtracting is
+    // exactly how attention got mis-attributed at ~9.5 TFLOPS in the first
+    // place; a derived number is not a measurement.
+    //
+    // Times the REAL path (`MfLinear.forward` over an 8-bit affine g64 weight,
+    // the checkpoint's own recipe, wide-M dq-gemm and all) against a dense bf16
+    // `mlx_matmul` of identical dimensions as the ceiling. Gap = what a kernel
+    // could theoretically win; no gap = nothing to write.
+    const raw = std.c.getenv("MINIMAX_H3_GEMM_UBENCH") orelse return error.SkipZigTest;
+    const seq: c_int = std.fmt.parseInt(c_int, std.mem.sliceTo(raw, 0), 10) catch 19444;
+    log.enableStderr();
+    const a = std.testing.allocator;
+    const s = mlx.gpuStream();
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    // (name, in, out) — the four projections in every one of the 50 DiT blocks.
+    const shapes = [_]struct { n: []const u8, in: c_int, out: c_int }{
+        .{ .n = "qkv ", .in = 5376, .out = 21504 },
+        .{ .n = "out ", .in = 7168, .out = 5376 },
+        .{ .n = "fc1 ", .in = 5376, .out = 28672 },
+        .{ .n = "fc2 ", .in = 14336, .out = 5376 },
+    };
+
+    for (shapes) |sh| {
+        const x = try randomNormal(&[_]c_int{ seq, sh.in }, 11, mlx.mlx_dtype.bfloat16, s);
+        defer _ = mlx.mlx_array_free(x);
+        // [out, in] bf16 -> affine 8-bit g64, the shape MfLinear.load solves from.
+        const wb = try randomNormal(&[_]c_int{ sh.out, sh.in }, 12, mlx.mlx_dtype.bfloat16, s);
+        defer _ = mlx.mlx_array_free(wb);
+        var qv = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(qv);
+        try mlx.check(mlx.mlx_quantize(&qv, wb, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(8), "affine", .{ .ctx = null }, s));
+        var qw = mlx.mlx_array_new();
+        var qs = mlx.mlx_array_new();
+        var qbs = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_vector_array_get(&qw, qv, 0));
+        try mlx.check(mlx.mlx_vector_array_get(&qs, qv, 1));
+        try mlx.check(mlx.mlx_vector_array_get(&qbs, qv, 2));
+        var ww = model_mod.Weights.init(a);
+        defer ww.deinit();
+        try ww.map.put(try a.dupe(u8, "p.weight"), qw);
+        try ww.map.put(try a.dupe(u8, "p.scales"), qs);
+        try ww.map.put(try a.dupe(u8, "p.biases"), qbs);
+        var lin = try MfLinear.load(&ww, a, "p", @intCast(sh.in), .bfloat16, s);
+        defer lin.deinit();
+        try testing.expect(lin.quantized);
+        // Dense ceiling: the SAME contraction as [seq,in] x [in,out].
+        const wt = try transpose(wb, &[_]c_int{ 1, 0 }, s);
+        defer _ = mlx.mlx_array_free(wt);
+        const wtc = try contig(wt, s);
+        defer _ = mlx.mlx_array_free(wtc);
+        try mlx.check(mlx.mlx_array_eval(x));
+        try mlx.check(mlx.mlx_array_eval(wtc));
+
+        const fl: f64 = 2.0 * @as(f64, @floatFromInt(seq)) *
+            @as(f64, @floatFromInt(sh.in)) * @as(f64, @floatFromInt(sh.out));
+        var q_best: u64 = std.math.maxInt(u64);
+        var d_best: u64 = std.math.maxInt(u64);
+        // 3 iterations, keep the BEST: the first pays Metal JIT, and a slow
+        // tail is thermal, not the kernel.
+        for (0..3) |_| {
+            var c1 = LapClock.init(io);
+            const y = try lin.forward(x, null, s);
+            try mlx.check(mlx.mlx_array_eval(y));
+            _ = mlx.mlx_array_free(y);
+            q_best = @min(q_best, c1.lapMs());
+
+            var c2 = LapClock.init(io);
+            var d = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_matmul(&d, x, wtc, s));
+            try mlx.check(mlx.mlx_array_eval(d));
+            _ = mlx.mlx_array_free(d);
+            d_best = @min(d_best, c2.lapMs());
+        }
+        const qt = fl / (@as(f64, @floatFromInt(@max(q_best, 1))) / 1000.0) / 1e12;
+        const dt = fl / (@as(f64, @floatFromInt(@max(d_best, 1))) / 1000.0) / 1e12;
+        log.info("[gemm-ubench] S={d} {s} [{d}x{d}] q8: {d} ms ({d:.2} TFLOPS) | dense bf16: {d} ms ({d:.2} TFLOPS) | ratio {d:.2}x\n", .{ seq, sh.n, sh.in, sh.out, q_best, qt, d_best, dt, dt / @max(qt, 0.001) });
+    }
+}
+
 test "minimax h3: attention-broadcast refresh schedule" {
     // k<=1 = off (every step refreshes).
     for (0..10) |i| try testing.expect(attnBroadcastRefresh(i, 30, 0));
@@ -3768,6 +6110,61 @@ test "minimax h3: attention-broadcast refresh schedule" {
     try testing.expect(!attnBroadcastRefresh(5, 30, 3));
     try testing.expect(!attnBroadcastRefresh(6, 30, 3));
     try testing.expect(attnBroadcastRefresh(7, 30, 3));
+}
+
+test "minimax h3: the broadcast schedule scales down to few-step runs" {
+    // Live 2026-08-04: warmup (4) and tail (2) were LITERALS, so a run of <=6
+    // steps is entirely warmup+tail and every step force-refreshes — the fast
+    // recipe becomes a silent no-op while the server still logs
+    // "attn-broadcast k=2". The log of a 4-step 768p run shows it: four
+    // identical ~133 s steps and no reuse. Same silent-flag-eater class as
+    // runHeadlessServe eating the PLD flags.
+    var bcast4: usize = 0;
+    for (0..4) |i| {
+        if (!attnBroadcastRefresh(i, 4, 2)) bcast4 += 1;
+    }
+    try testing.expect(bcast4 >= 1);
+    var bcast8: usize = 0;
+    for (0..8) |i| {
+        if (!attnBroadcastRefresh(i, 8, 2)) bcast8 += 1;
+    }
+    try testing.expect(bcast8 >= 3);
+    // Two invariants no step count may break: step 0 has nothing cached to
+    // reuse, and the last step is where detail lands.
+    inline for (.{ 4, 8, 12, 16 }) |n| {
+        try testing.expect(attnBroadcastRefresh(0, n, 2));
+        try testing.expect(attnBroadcastRefresh(n - 1, n, 2));
+    }
+}
+
+test "minimax h3: the measured >=30-step schedules are unchanged" {
+    // The fast recipe's 2.67x was measured at 30 steps (and 50 is the app's
+    // .superQuality preset) — scaling the gates for short runs must not move
+    // a schedule anyone has already validated by eye.
+    const bcast30 = [_]usize{ 5, 7, 9, 11, 13, 15, 17, 19, 21, 23, 25, 27 };
+    for (0..30) |i| {
+        const is_bcast = !attnBroadcastRefresh(i, 30, 2);
+        try testing.expectEqual(std.mem.indexOfScalar(usize, &bcast30, i) != null, is_bcast);
+    }
+    for (0..4) |i| try testing.expect(attnBroadcastRefresh(i, 50, 2));
+    try testing.expect(!attnBroadcastRefresh(5, 50, 2));
+    try testing.expect(attnBroadcastRefresh(48, 50, 2));
+    try testing.expect(attnBroadcastRefresh(49, 50, 2));
+}
+
+test "minimax h3: the step-cache warmup scales the same way" {
+    // The velocity cache carries the same fixed-literal bug (`i >= 2`), and it
+    // is the BIGGER half of the recipe: at 30 steps the broadcast accounts for
+    // ~40% of steps while the measured 2.66x needs ~48% of steps skipped
+    // outright. At 4 steps only i==2 could ever qualify.
+    try testing.expectEqual(@as(usize, 2), stepCacheWarmup(30));
+    try testing.expectEqual(@as(usize, 2), stepCacheWarmup(50));
+    try testing.expectEqual(@as(usize, 1), stepCacheWarmup(16));
+    try testing.expectEqual(@as(usize, 1), stepCacheWarmup(4));
+    // Never 0: step 0 has no previous velocity to reuse.
+    inline for (.{ 1, 2, 4, 8, 16, 30, 50 }) |n| {
+        try testing.expect(stepCacheWarmup(n) >= 1);
+    }
 }
 
 test "minimax h3: sparse-attention layer policy" {
@@ -3836,25 +6233,324 @@ test "minimax h3: sparseAttend attends exactly its subset (uniform-score closed 
 
 test "minimax h3: resolveSpeed — fast default on, request off-switch, env strongest" {
     // Defaults: fast recipe on.
-    var c = resolveSpeed(null, null, null);
+    var c = resolveSpeed(null, false, null, null);
     try testing.expectEqual(@as(f64, 0.05), c.step_cache);
     try testing.expectEqual(@as(u32, 2), c.bcast_k);
-    c = resolveSpeed(true, null, null);
+    c = resolveSpeed(true, false, null, null);
     try testing.expectEqual(@as(u32, 2), c.bcast_k);
     // "fast": false is the user's off switch.
-    c = resolveSpeed(false, null, null);
+    c = resolveSpeed(false, false, null, null);
     try testing.expectEqual(@as(f64, 0), c.step_cache);
     try testing.expectEqual(@as(u32, 0), c.bcast_k);
     // Env set means SET — including "0" (the A/B harness arms), and it beats
     // the request field in BOTH directions.
-    c = resolveSpeed(null, "0", "0");
+    c = resolveSpeed(null, false, "0", "0");
     try testing.expectEqual(@as(f64, 0), c.step_cache);
     try testing.expectEqual(@as(u32, 0), c.bcast_k);
-    c = resolveSpeed(false, "0.1", "3");
+    c = resolveSpeed(false, false, "0.1", "3");
     try testing.expectEqual(@as(f64, 0.1), c.step_cache);
     try testing.expectEqual(@as(u32, 3), c.bcast_k);
     // Junk env falls back to the resolved default, never to a surprise arm.
-    c = resolveSpeed(null, "junk", "junk");
+    c = resolveSpeed(null, false, "junk", "junk");
     try testing.expectEqual(@as(f64, 0.05), c.step_cache);
     try testing.expectEqual(@as(u32, 2), c.bcast_k);
+}
+
+test "minimax h3: resolveSpeed — turbo forces the recipe off, env still strongest" {
+    // Turbo and the fast recipe are alternatives: turbo wins even over an
+    // explicit "fast": true (the recipe's slow-drift premise is false at
+    // giant steps, and serving it anyway would be the silent-flag-eater
+    // class — logged as engaged while doing nothing useful).
+    var c = resolveSpeed(null, true, null, null);
+    try testing.expectEqual(@as(f64, 0), c.step_cache);
+    try testing.expectEqual(@as(u32, 0), c.bcast_k);
+    c = resolveSpeed(true, true, null, null);
+    try testing.expectEqual(@as(f64, 0), c.step_cache);
+    try testing.expectEqual(@as(u32, 0), c.bcast_k);
+    // Env stays the strongest knob in both directions, turbo included.
+    c = resolveSpeed(null, true, "0.05", "2");
+    try testing.expectEqual(@as(f64, 0.05), c.step_cache);
+    try testing.expectEqual(@as(u32, 2), c.bcast_k);
+}
+
+test "minimax h3: audioStepFactor — exact mapped delta under turbo, first-order otherwise" {
+    const sv = SIGMA_SHIFT_VIDEO; // 12
+    const sa = SIGMA_SHIFT_AUDIO; // 3
+    // Non-turbo: byte-identical to the validated ≥30-step arithmetic.
+    try testing.expectEqual(@as(f64, -0.25), audioStepFactor(false, 0.75, 0.5, sv, sa));
+
+    // Turbo, last leg of the 4-step schedule (sigma 0.8 -> 0 at shift 12/3).
+    // Hand-derived, not computed through the functions under test:
+    //   base(0.8)   = 0.8 / (12 - 8.8)      = 0.25
+    //   σa(0.8)     = 3*0.25 / 1.5          = 0.5 ; σa(0) = 0
+    //   slope(0.8)  = 3*(1+11*.25)² / (12*(1+2*.25)²) = 3*14.0625/27 = 1.5625
+    //   factor      = (0 - 0.5) / 1.5625    = -0.32
+    const f = audioStepFactor(true, 0.8, 0.0, sv, sa);
+    try testing.expect(@abs(f - (-0.32)) < 1e-12);
+    // The first-order form would advance by the full video delta (-0.8):
+    // 2.5x the exact audio move — the "audio blown out at 4 steps" failure.
+    try testing.expect(@abs(f) < 0.8 * 0.5);
+
+    // Small steps: the two forms converge (which is why the ≥30-step path
+    // never needed the exact form).
+    const fine_exact = audioStepFactor(true, 0.5, 0.49, sv, sa);
+    const fine_first = audioStepFactor(false, 0.5, 0.49, sv, sa);
+    try testing.expect(@abs(fine_exact - fine_first) < @abs(fine_first) * 0.02);
+}
+
+test "minimax h3: chain math — delivered frames, overlap width, cross-fade seam" {
+    // Each seam drops the duplicate join frame.
+    try testing.expectEqual(@as(u32, 124), chainDeliveredFrames(1, 124));
+    try testing.expectEqual(@as(u32, 247), chainDeliveredFrames(2, 124));
+    try testing.expectEqual(@as(u32, 370), chainDeliveredFrames(3, 124));
+    // One video frame of audio at 32 kHz / 24 fps.
+    try testing.expectEqual(@as(usize, 1333), CHAIN_OVERLAP_SAMPLES);
+
+    const a = testing.allocator;
+    // Two constant segments, overlap 2: length = 4 + 4 − 2, the seam blends
+    // cos/sin at t = (j+0.5)/2 · π/2, and both flanks stay verbatim.
+    const s1 = [_]f32{ 1, 1, 1, 1 };
+    const s2 = [_]f32{ 2, 2, 2, 2 };
+    const joined = try crossfadeJoin(a, &.{ &s1, &s2 }, 2);
+    defer a.free(joined);
+    try testing.expectEqual(@as(usize, 6), joined.len);
+    try testing.expectEqual(@as(f32, 1), joined[0]);
+    try testing.expectEqual(@as(f32, 1), joined[1]);
+    const t0 = 0.25 * std.math.pi / 2.0;
+    const t1 = 0.75 * std.math.pi / 2.0;
+    try testing.expectApproxEqAbs(@cos(@as(f32, t0)) + 2 * @sin(@as(f32, t0)), joined[2], 1e-6);
+    try testing.expectApproxEqAbs(@cos(@as(f32, t1)) + 2 * @sin(@as(f32, t1)), joined[3], 1e-6);
+    try testing.expectEqual(@as(f32, 2), joined[4]);
+    try testing.expectEqual(@as(f32, 2), joined[5]);
+
+    // Three segments chain seam after seam; an overlap wider than a segment
+    // clamps instead of reading out of bounds.
+    const s3 = [_]f32{3};
+    const j2 = try crossfadeJoin(a, &.{ &s1, &s2, &s3 }, 2);
+    defer a.free(j2);
+    try testing.expectEqual(@as(usize, 6 + 1 - 1), j2.len);
+
+    // A single segment is passed through verbatim.
+    const j3 = try crossfadeJoin(a, &.{&s1}, 2);
+    defer a.free(j3);
+    try testing.expectEqualSlices(f32, &s1, j3);
+}
+
+test "minimax h3: loraAdd sums every attached adapter onto the base output" {
+    const s = mlx.gpuStream();
+    const f32t = mlx.mlx_dtype.float32;
+
+    // Aᵀ [in=3, r=2] / Bᵀ [r=2, out=4] (already transposed, as `loadFile`
+    // hands them over), x [2,3]. Small integers so every f32 product is
+    // exact and the expectation can be equality, not tolerance.
+    const AT = [_]f32{ 1, -1, 2, 0, 3, 2 };
+    const BT = [_]f32{ 1, 0, 2, 1, 0, 1, -1, 1 };
+    const X = [_]f32{ 1, -1, 2, 0, 3, 1 };
+
+    const shAT = [_]c_int{ 3, 2 };
+    const shBT = [_]c_int{ 2, 4 };
+    const at = mlx.mlx_array_new_data(@constCast(@ptrCast(&AT)), &shAT, 2, f32t);
+    defer _ = mlx.mlx_array_free(at);
+    const bt = mlx.mlx_array_new_data(@constCast(@ptrCast(&BT)), &shBT, 2, f32t);
+    defer _ = mlx.mlx_array_free(bt);
+    const shX = [_]c_int{ 2, 3 };
+    const x = mlx.mlx_array_new_data(@constCast(@ptrCast(&X)), &shX, 2, f32t);
+    defer _ = mlx.mlx_array_free(x);
+
+    // Turbo at 1.0 plus a style adapter at 0.5 — the stacking case, on the
+    // same linear. expected[m][o] = 1.5 * Σ_r (Σ_i X[m][i]·AT[i][r])·BT[r][o].
+    var slot: LoraSlot = .{};
+    slot.set(&[_]lora_mod.Ref{
+        .{ .at = at, .bt = bt, .scale = 1.0 },
+        .{ .at = at, .bt = bt, .scale = 0.5 },
+    });
+
+    const zbuf = [_]f32{ 0, 0, 0, 0, 0, 0, 0, 0 }; // zero base: the deltas alone come back
+    const shZ = [_]c_int{ 2, 4 };
+    const zero = mlx.mlx_array_new_data(@constCast(@ptrCast(&zbuf)), &shZ, 2, f32t);
+    const got = try loraAdd(zero, x, slot, s); // consumes `zero`
+    defer _ = mlx.mlx_array_free(got);
+    try mlx.check(mlx.mlx_array_eval(got));
+    const raw = mlx.mlx_array_data_float32(got) orelse return error.NoData;
+
+    for (0..2) |m| for (0..4) |o| {
+        var acc: f32 = 0;
+        for (0..2) |r| {
+            var xa: f32 = 0;
+            for (0..3) |i| xa += X[m * 3 + i] * AT[i * 2 + r];
+            acc += xa * BT[r * 4 + o];
+        }
+        try testing.expectApproxEqAbs(acc * 1.5, raw[m * 4 + o], 1e-5);
+    };
+
+    // An empty slot is the identity — and returns the SAME handle, since the
+    // no-adapter path must cost nothing on a 50-block DiT.
+    const empty: LoraSlot = .{};
+    const base2 = mlx.mlx_array_new_data(@constCast(@ptrCast(&zbuf)), &shZ, 2, f32t);
+    defer _ = mlx.mlx_array_free(base2);
+    const same = try loraAdd(base2, x, empty, s);
+    try testing.expectEqual(base2.ctx, same.ctx);
+}
+
+test "minimax h3: an adapter file resolves to our own module names, dotted or flattened" {
+    // H3's checkpoint names ARE our module names, so a reference-style file
+    // needs no translation; the arch table exists for the FLAT Kohya scheme,
+    // where a missing table would leave `blocks_0_attn_qkv_proj` unmatched
+    // and the render silently unchanged.
+    const a = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io = std.testing.io;
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &pbuf);
+    const path = try std.fmt.allocPrint(a, "{s}/h3lora.safetensors", .{pbuf[0..root_len]});
+    defer a.free(path);
+
+    const tmap = mlx.mlx_map_string_to_array_new();
+    defer _ = mlx.mlx_map_string_to_array_free(tmap);
+    const av = [_]f32{ 0.1, 0.2, 0.3, 0.4 };
+    const bv = [_]f32{ 0.5, 0.6, 0.7, 0.8 };
+    const ash = [_]c_int{ 2, 2 };
+    const bsh = [_]c_int{ 2, 2 };
+    const aarr = mlx.mlx_array_new_data(@constCast(@ptrCast(&av)), &ash, 2, mlx.mlx_dtype.float32);
+    const barr = mlx.mlx_array_new_data(@constCast(@ptrCast(&bv)), &bsh, 2, mlx.mlx_dtype.float32);
+    defer _ = mlx.mlx_array_free(aarr);
+    defer _ = mlx.mlx_array_free(barr);
+    // One module under the reference's own key shape (ComfyUI writes the
+    // `diffusion_model.` prefix that `parseKey` strips), one under Kohya's.
+    _ = mlx.mlx_map_string_to_array_insert(tmap, "diffusion_model.blocks.3.attn.qkv_proj.lora_A.weight", aarr);
+    _ = mlx.mlx_map_string_to_array_insert(tmap, "diffusion_model.blocks.3.attn.qkv_proj.lora_B.weight", barr);
+    _ = mlx.mlx_map_string_to_array_insert(tmap, "lora_unet_token_refiner_blocks_1_mlp_fc1.lora_down.weight", aarr);
+    _ = mlx.mlx_map_string_to_array_insert(tmap, "lora_unet_token_refiner_blocks_1_mlp_fc1.lora_up.weight", barr);
+    const mmap = mlx.mlx_map_string_to_string_new();
+    defer _ = mlx.mlx_map_string_to_string_free(mmap);
+    const pathz = try a.dupeSentinel(u8, path, 0);
+    defer a.free(pathz);
+    try mlx.check(mlx.mlx_save_safetensors(pathz, tmap, mmap));
+
+    var file = try lora_mod.loadFile(a, path, .minimax_h3);
+    defer file.deinit();
+    // Both spell modules `attachLoras` actually queries.
+    try testing.expect(file.find("blocks.3.attn.qkv_proj") != null);
+    try testing.expect(file.find("token_refiner.blocks.1.mlp.fc1") != null);
+    // No stray entries under the raw file spellings.
+    try testing.expect(file.find("blocks_3_attn_qkv_proj") == null);
+    try testing.expectEqual(@as(usize, 2), file.entries.len);
+}
+
+test "minimax h3: turbo lora — runtime bypass equals a W_eff-folded forward" {
+    // The contract the reference node states: bypass output == the forward of
+    // a base whose weight is W + B@A. In our dense pre-transposed layout the
+    // fold is simply w_eff = w + Aᵀ@Bᵀ, so the toy fixture gives an exact
+    // W_eff oracle we can execute (the full DiT reference cannot run here).
+    // Not bit-identical — (x@Aᵀ)@Bᵀ vs x@(Aᵀ@Bᵀ) associate differently — so
+    // the bar is cosine + rms ratio (a cosine alone cannot see a scale error).
+    const a = testing.allocator;
+    const s = mlx.gpuStream();
+    const f32t = mlx.mlx_dtype.float32;
+
+    var w = model_mod.loadWeightsSingleFile(a, "src/fixtures/minimax_h3_dit.safetensors") catch |e| {
+        std.debug.print("skip: fixture unreadable ({any})\n", .{e});
+        return error.SkipZigTest;
+    };
+    defer w.deinit();
+    const cfg = Config{
+        .hidden_size = 256,
+        .num_attention_heads = 4,
+        .attention_head_dim = 32,
+        .ffn_hidden_size = 128,
+        .time_embed_dim = 32,
+        .timestep_input_dim = 32,
+        .rope_inv_freq_len = 4,
+    };
+
+    const mk = struct {
+        // Deterministic small factors in the STORED (pre-transposed) form;
+        // the loader's transpose is pinned by the naming test above.
+        fn pair(alloc: std.mem.Allocator, in: usize, out: usize, r: usize, seed: u32) !lora_mod.Ref {
+            return .{
+                .at = try fill(alloc, in, r, seed),
+                .bt = try fill(alloc, r, out, seed +% 17),
+                .scale = 1.0,
+            };
+        }
+        fn fill(alloc: std.mem.Allocator, rows: usize, cols: usize, seed: u32) !mlx.mlx_array {
+            const buf = try alloc.alloc(f32, rows * cols);
+            defer alloc.free(buf);
+            var state: u32 = seed;
+            for (buf) |*v| {
+                state = state *% 1664525 +% 1013904223;
+                v.* = (@as(f32, @floatFromInt(state >> 8)) / 16777216.0 - 0.5) * 0.1;
+            }
+            const shp = [_]c_int{ @intCast(rows), @intCast(cols) };
+            return mlx.mlx_array_new_data(buf.ptr, &shp, 2, mlx.mlx_dtype.float32);
+        }
+        fn fold(lin: *MfLinear, p: lora_mod.Ref, st: S) !void {
+            std.debug.assert(!lin.quantized); // toy fixture is dense f32
+            var delta = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(delta);
+            try mlx.check(mlx.mlx_matmul(&delta, p.at, p.bt, st));
+            const neww = try addA(lin.w, delta, st);
+            _ = mlx.mlx_array_free(lin.w);
+            lin.w = neww;
+        }
+    };
+
+    var attn = try AttnW.load(&w, a, "attn", cfg, f32t, s);
+    defer attn.deinit();
+    var attn_folded = try AttnW.load(&w, a, "attn", cfg, f32t, s);
+    defer attn_folded.deinit();
+    var mlp_l = try MlpW.load(&w, a, "mlp", cfg, f32t, s);
+    defer mlp_l.deinit();
+    var mlp_folded = try MlpW.load(&w, a, "mlp", cfg, f32t, s);
+    defer mlp_folded.deinit();
+
+    const inner = cfg.innerDim(); // 128
+    // Refs are non-owning in production (the Stack owns the arrays); here the
+    // test owns them and frees them at the end.
+    var refs: [4]lora_mod.Ref = .{
+        try mk.pair(a, cfg.hidden_size, 3 * inner, 4, 1),
+        try mk.pair(a, inner, cfg.hidden_size, 4, 2),
+        try mk.pair(a, cfg.hidden_size, 2 * cfg.ffn_hidden_size, 4, 3),
+        try mk.pair(a, cfg.ffn_hidden_size, cfg.hidden_size, 4, 4),
+    };
+    defer for (&refs) |*r| {
+        _ = mlx.mlx_array_free(r.at);
+        _ = mlx.mlx_array_free(r.bt);
+    };
+    attn.qkv_lora.set(refs[0..1]);
+    attn.out_lora.set(refs[1..2]);
+    mlp_l.fc1_lora.set(refs[2..3]);
+    mlp_l.fc2_lora.set(refs[3..4]);
+    try mk.fold(&attn_folded.qkv, refs[0], s);
+    try mk.fold(&attn_folded.out, refs[1], s);
+    try mk.fold(&mlp_folded.fc1, refs[2], s);
+    try mk.fold(&mlp_folded.fc2, refs[3], s);
+
+    const x = try ownWeight(&w, "x.attn_in");
+    defer _ = mlx.mlx_array_free(x);
+
+    inline for (.{ "attn", "mlp" }) |which| {
+        const got = if (comptime std.mem.eql(u8, which, "attn"))
+            try attnForward(&attn, x, cfg, null, .none, null, s)
+        else
+            try mlpForward(&mlp_l, x, s);
+        defer _ = mlx.mlx_array_free(got);
+        const want = if (comptime std.mem.eql(u8, which, "attn"))
+            try attnForward(&attn_folded, x, cfg, null, .none, null, s)
+        else
+            try mlpForward(&mlp_folded, x, s);
+        defer _ = mlx.mlx_array_free(want);
+
+        const cos_v = try cosineSim(got, want, s);
+        try testing.expect(std.math.isFinite(cos_v)); // finiteness BEFORE the diff
+        if (cos_v < 0.99999) std.debug.print("{s} lora bypass-vs-fold cos={d:.7}\n", .{ which, cos_v });
+        try testing.expect(cos_v > 0.99999);
+        const rg = try meanAbs(got, s);
+        const rw = try meanAbs(want, s);
+        try testing.expect(std.math.isFinite(rg) and std.math.isFinite(rw) and rw > 0);
+        const ratio = rg / rw;
+        if (ratio < 0.999 or ratio > 1.001) std.debug.print("{s} lora rms ratio={d:.6}\n", .{ which, ratio });
+        try testing.expect(ratio > 0.999 and ratio < 1.001);
+    }
 }
