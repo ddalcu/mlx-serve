@@ -59,6 +59,9 @@ struct ImageGenView: View {
     @State private var hydrating: Bool = false
     /// Hydrate exactly once per window lifetime (the first `.onAppear`).
     @State private var didHydrate: Bool = false
+    /// True while a drag carrying a file is hovering the source-image section
+    /// — drives that section's dashed-border highlight and the well's fill.
+    @State private var isDropTargeted: Bool = false
 
     var body: some View {
         readyView
@@ -255,17 +258,50 @@ struct ImageGenView: View {
                     }
                 }
             } else {
-                Button {
-                    chooseSourceImage()
-                } label: {
-                    Label(sourceImageButtonLabel, systemImage: "photo.badge.plus")
-                        .font(.caption)
-                }
+                dropWell
                 Text(sourceImageHint)
                     .font(.caption2)
                     .foregroundStyle(.secondary)
             }
         }
+        .padding(6)
+        // Drops land on the source-image section rather than the whole window.
+        // Without contentShape the gaps between rows aren't hit-testable and a
+        // drop there falls through to the ScrollView behind. Routed in
+        // placeDroppedImage: first drop becomes the source, later drops become
+        // references (or replace the source outright in variation mode) — and
+        // because the section grows once a source is set, the target grows to
+        // cover the thumbnail and reference rows, which is exactly where those
+        // later drops are aimed.
+        .contentShape(RoundedRectangle(cornerRadius: 8))
+        .onDrop(of: [.fileURL], isTargeted: $isDropTargeted) { handleImageDrop($0) }
+        .overlay {
+            RoundedRectangle(cornerRadius: 8)
+                .strokeBorder(Color.accentColor, style: StrokeStyle(lineWidth: 2, dash: [6]))
+                .opacity(isDropTargeted ? 1 : 0)
+                .allowsHitTesting(false)
+        }
+    }
+
+    /// Empty state: a target you can see and aim at, rather than a bare button
+    /// sitting inside an invisible drop region.
+    private var dropWell: some View {
+        VStack(spacing: 6) {
+            Image(systemName: "photo.badge.plus")
+                .font(.title2)
+                .foregroundStyle(.secondary)
+            Button(sourceImageButtonLabel) { chooseSourceImage() }
+                .buttonStyle(.link)
+                .font(.caption)
+            Text("or drag one here")
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+        }
+        .frame(maxWidth: .infinity, minHeight: 84)
+        .background(
+            RoundedRectangle(cornerRadius: 8)
+                .fill(Color.secondary.opacity(isDropTargeted ? 0.12 : 0.06))
+        )
     }
 
     /// What a source image is FOR on this model — instruction editing, a
@@ -564,6 +600,51 @@ struct ImageGenView: View {
 
     /// Max simultaneously-attached LoRAs — mirrors the server's `lora.MAX_LORAS`.
     private let maxLoras = 8
+    /// Entry point for `.onDrop`: pulls a file URL out of each provider and,
+    /// once resolved, hands it to `placeDroppedImage` on the main actor (item
+    /// providers resolve asynchronously, off the UI thread). Returns whether
+    /// the drop was even worth accepting — SwiftUI uses this to animate the
+    /// drop away or bounce it back.
+    private func handleImageDrop(_ providers: [NSItemProvider]) -> Bool {
+        let candidates = providers.filter { $0.hasItemConformingToTypeIdentifier(UTType.fileURL.identifier) }
+        guard !candidates.isEmpty else { return false }
+        for provider in candidates {
+            provider.loadObject(ofClass: URL.self) { url, _ in
+                guard let url, Self.isImageFile(url) else { return }
+                DispatchQueue.main.async { placeDroppedImage(url) }
+            }
+        }
+        return true
+    }
+
+    /// A dropped file counts as an image by extension, matching the panel's
+    /// `allowedContentTypes` (png/jpeg/heic) plus the couple of common
+    /// formats NSImage also opens fine (webp, tiff, gif, bmp).
+    private static func isImageFile(_ url: URL) -> Bool {
+        let ext = url.pathExtension.lowercased()
+        return ["png", "jpg", "jpeg", "heic", "heif", "webp", "tiff", "tif", "gif", "bmp"].contains(ext)
+    }
+
+    /// Where a dropped image lands, in priority order:
+    /// 1. No source yet → it becomes the source (same as "Choose image…").
+    /// 2. Source set, edit mode, room left in the 3-reference cap → it joins
+    ///    `refImageURLs` (same as "Add reference image…").
+    /// 3. Source set, plain variation mode (single image slot, no references
+    ///    exist in that mode) → it replaces the source.
+    /// 4. Source set, edit mode, references already full → dropped, no-op;
+    ///    the user would need to remove one first, same as the picker button
+    ///    disappearing at 3.
+    private func placeDroppedImage(_ url: URL) {
+        if initImageURL == nil {
+            initImageURL = url
+            return
+        }
+        if effectiveEditMode && model.supportsReferenceEdit {
+            if refImageURLs.count < 3 { refImageURLs.append(url) }
+            return
+        }
+        initImageURL = url
+    }
 
     private func chooseLora() {
         guard loras.count < maxLoras else { return }
