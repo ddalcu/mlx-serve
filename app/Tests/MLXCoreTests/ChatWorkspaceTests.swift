@@ -292,16 +292,11 @@ final class ChatWorkspaceTests: XCTestCase {
             full row rect and ignores `listRowInsets`, which is exactly the \
             edge-to-edge selection this test exists to prevent.
             """)
-        XCTAssertTrue(body.contains(".listRowBackground(Color.clear)"), """
-            The row's own backdrop must be clear, or the list draws a second \
-            edge-to-edge surface under the inset one.
-            """)
-
-        // …and it sits inside the panel's shared gutter, which is what makes it
-        // the same width as a destination's. The constants themselves are
-        // pinned by `testEverySidebarRowSharesOneGutterAndOneInset`.
-        XCTAssertTrue(body.contains("ChatMetrics.sidebarGutter"), """
-            The conversation rows must take the panel's gutter from the shared \
+        // …and it fills the row INSIDE the stack's gutter, which is what makes
+        // it the same width as a destination's. The gutter itself is pinned by
+        // `testEverySidebarRowSharesOneGutterAndOneInset`.
+        XCTAssertTrue(body.contains("ChatMetrics.sidebarRowInset"), """
+            The conversation rows must take their inner inset from the shared \
             constant — a literal here is how this drifted from the destinations.
             """)
     }
@@ -359,14 +354,27 @@ final class ChatWorkspaceTests: XCTestCase {
             .map { $0.trimmingCharacters(in: .whitespaces).hasPrefix("//") ? "" : String($0) }
             .joined(separator: "\n")
 
-        // The conversation rows must not take the gutter through listRowInsets,
-        // which is the modifier that measures from the wrong edge.
-        XCTAssertTrue(chat.contains(".listRowInsets(EdgeInsets())"), """
-            The conversation rows must zero their listRowInsets and apply \
-            ChatMetrics.sidebarGutter themselves — listRowInsets measures from \
-            the list's own (already inset) content area, so it cannot line up \
-            with the destinations above.
-            """)
+        // The conversations are NOT a List. Its `.sidebar` style wraps content
+        // in a margin of its own that holds every row ~18pt in from the panel
+        // edge, `listRowInsets` does not control it (zeroing them changed
+        // nothing on screen), and no API removes it. These rows draw their own
+        // background, hover, selection and separators, so the List was
+        // contributing only that margin.
+        guard let list = chat.range(of: "private var conversationsSidebar"),
+              let end = chat.range(of: "private func sectionHeader",
+                                   range: list.upperBound..<chat.endIndex) else {
+            return XCTFail("the sidebar's conversation list moved — update this audit")
+        }
+        let sidebar = String(chat[list.upperBound..<end.lowerBound])
+        for listism in ["List {", ".listStyle(", ".listRowInsets(", ".listRowBackground(", ".listRowSeparator("] {
+            XCTAssertFalse(sidebar.contains(listism), """
+                The conversation column is back on a List (`\(listism)`). Its \
+                style adds a horizontal margin the destinations above don't \
+                have, which is the misalignment this replaced — and nothing in \
+                listRowInsets can take it back off.
+                """)
+        }
+
         for literal in ["leading: 8", "trailing: 8", "trailing: 6"] {
             XCTAssertFalse(chat.contains(literal), """
                 A sidebar row still carries the hand-written inset `\(literal)`. \
@@ -375,11 +383,14 @@ final class ChatWorkspaceTests: XCTestCase {
                 the two halves drifted apart.
                 """)
         }
-        // Both halves read the constants — the destinations' column, the rows,
-        // and the section headings.
-        XCTAssertGreaterThanOrEqual(
-            chat.components(separatedBy: "ChatMetrics.sidebarGutter").count - 1, 3,
-            "the gutter constant should be read by the destination column, the rows and the headers")
+
+        // Both halves are plain stacks taking the SAME gutter — that is what
+        // makes them line up, rather than two numbers talked into agreeing.
+        XCTAssertEqual(
+            chat.components(separatedBy: ".padding(.horizontal, ChatMetrics.sidebarGutter)").count - 1, 2,
+            "exactly two columns take the gutter: the destination stack and the conversation stack")
+        // …and the row's own inner inset is shared with the destination label
+        // and the section headings, so every label starts on one line.
         XCTAssertGreaterThanOrEqual(
             chat.components(separatedBy: "ChatMetrics.sidebarRowInset").count - 1, 3,
             "the row inset should be read by the destination label, the rows and the headers")

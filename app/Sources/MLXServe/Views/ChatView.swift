@@ -604,29 +604,36 @@ struct ChatSidebar: View {
         // inner one a different value from the destinations above, and an accent
         // agent label sitting on whichever won. Selection is ours now, drawn by
         // the one `SidebarRowStyle` both halves of this panel read.
-        List {
+        // A ScrollView, not a List. These rows draw everything themselves —
+        // background, hover, selection, separators — so the only thing
+        // `.listStyle(.sidebar)` still contributed was its own horizontal
+        // margin around the content, which held every row ~18pt in from the
+        // panel edge while the destinations above sat at the 8pt gutter. That
+        // margin is NOT what `listRowInsets` controls (zeroing those changed
+        // nothing), and there is no API to remove it. A plain stack takes the
+        // same `.padding(.horizontal, sidebarGutter)` the destination column
+        // takes, so the two halves line up because they are laid out the same
+        // way — not because two numbers were talked into agreeing.
+        ScrollView {
             // Two sections, one row builder. Agent threads sit above the plain
             // chats — the section is HIDDEN when there are none, because an
             // empty heading is a promise of content that isn't there.
             let groups = SidebarSessionGroups.split(appState.visibleChatSessions)
-            if !groups.agents.isEmpty {
-                Section {
+            LazyVStack(alignment: .leading, spacing: 2) {
+                if !groups.agents.isEmpty {
+                    sectionHeader("Agents")
                     ForEach(groups.agents) { session in
                         sessionRow(session)
                     }
-                } header: {
-                    sectionHeader("Agents")
                 }
-            }
-            Section {
+                sectionHeader("Chats")
                 ForEach(groups.chats) { session in
                     sessionRow(session)
                 }
-            } header: {
-                sectionHeader("Chats")
             }
+            .padding(.horizontal, ChatMetrics.sidebarGutter)
+            .padding(.bottom, 8)
         }
-        .listStyle(.sidebar)
         // The platform's own scroll-edge effect at BOTH ends: rows pass under
         // the window's top edge and under the New Chat row (a `safeAreaInset`,
         // so content scrolls beneath it), and a soft edge is how macOS frosts
@@ -709,10 +716,11 @@ struct ChatSidebar: View {
             .font(.caption.weight(.semibold))
             .foregroundStyle(.secondary)
             .frame(maxWidth: .infinity, alignment: .leading)
-            .padding(.horizontal, ChatMetrics.sidebarGutter + ChatMetrics.sidebarRowInset)
-            .padding(.top, 8)
+            // The stack owns the gutter; the heading owes only the row's inner
+            // inset, so it sits on the same left line as the labels under it.
+            .padding(.horizontal, ChatMetrics.sidebarRowInset)
+            .padding(.top, 10)
             .padding(.bottom, 2)
-            .listRowInsets(EdgeInsets())
     }
 
     /// One conversation row, shared by both sections.
@@ -800,18 +808,11 @@ struct ChatSidebar: View {
         // text. `minHeight` is the floor, never a fixed height.
         .frame(maxWidth: .infinity, minHeight: ChatMetrics.sidebarButtonHeight,
                alignment: .leading)
-        // One meaning for gray in this panel: destinations and
-        // conversations share `SidebarRowStyle` (the accent-filled,
-        // white-text row made a selected chat look like a different
-        // KIND of thing from a selected destination).
-        //
-        // One SHAPE too, and that is why the fill rides the row's own
-        // CONTENT: as a `listRowBackground` it filled the whole row
-        // rect, because that modifier is the row's backdrop and the
-        // `listRowInsets` beside it move only the content — so a
-        // selected chat ran edge to edge under a column of
-        // destinations inset 8pt. Here it sits inside the same insets
-        // and matches a destination's `.background` exactly.
+        // One meaning for gray in this panel, and one SHAPE: the fill rides the
+        // row's own content inside the stack's gutter, exactly as a
+        // destination's `.background` does. (It was a `listRowBackground` once,
+        // which fills the whole row rect and ignores the insets beside it — a
+        // selected chat ran edge to edge under a column of inset destinations.)
         .background(
             RoundedRectangle(cornerRadius: ChatMetrics.sidebarButtonCornerRadius)
                 .fill(SidebarRowStyle.fill(selected: isSelected,
@@ -821,28 +822,11 @@ struct ChatSidebar: View {
         .onHover { isHovered in
             hoveredSessionId = isHovered ? session.id : nil
         }
-        // The gutter is applied HERE, not through `listRowInsets`, because
-        // those measure from the list's own content area — which a
-        // `.sidebar` list has already inset — so the same number produced a
-        // narrower, further-right row than the destinations above. Zeroing
-        // the insets puts the row's own edge on the panel's, and one
-        // constant then sets both columns' width.
-        .padding(.horizontal, ChatMetrics.sidebarGutter)
-        .padding(.vertical, 1)
-        // The row's own backdrop must be CLEAR, or the list draws a
-        // second edge-to-edge surface under the inset one.
-        .listRowBackground(Color.clear)
-        .listRowInsets(EdgeInsets())
-        // No rules between conversations: the rows are separated by
-        // their own hover/selection shape, and a hairline under every
-        // one of them read as a table.
-        .listRowSeparator(.hidden)
         .contextMenu {
             Button("Delete", role: .destructive) {
                 appState.deleteSession(session.id)
             }
         }
-
     }
 
     /// One destination row. All of them are the same shape by construction —
