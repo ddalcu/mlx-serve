@@ -71,11 +71,6 @@ final class AgentEditorLayoutTests: XCTestCase {
     func testTheEditorColumnIsCappedAndPadded() {
         XCTAssertGreaterThan(AgentEditorMetrics.contentMaxWidth, 400)
         XCTAssertGreaterThan(AgentEditorMetrics.contentPadding, 0)
-        XCTAssertEqual(AgentEditorMetrics.columnWidth(available: 2000),
-                       AgentEditorMetrics.contentMaxWidth,
-                       "a wide window caps at the measure")
-        XCTAssertGreaterThan(AgentEditorMetrics.columnWidth(available: 320), 0,
-                             "a narrow column never asks for a non-positive width")
     }
 
     // MARK: The chrome is shared

@@ -4,47 +4,34 @@ import SwiftUI
 
 /// A silent, looping, chrome-free video — a demo, not a player.
 ///
-/// `AVPlayerView` is the wrong tool here: it brings transport controls, a
-/// scrubber and a focus ring for something the user is meant to watch rather
-/// than operate. This is a bare `AVPlayerLayer` in an `NSView`, driven by an
-/// `AVQueuePlayer` + `AVPlayerLooper` — the looper is what makes the wrap
-/// seamless, where the usual "seek to zero on `didPlayToEndTime`" leaves a
-/// visible hitch every cycle.
-///
-/// Muted at the player AND with the item's audio tracks disabled: a welcome
-/// screen that starts making noise on launch is the thing everyone remembers
-/// about an app, and only one of those two is enough on its own for a file
-/// whose audio track is absent anyway.
+/// `AVPlayerView` would bring transport controls to something you watch rather
+/// than operate, so this is a bare `AVPlayerLayer`. `AVPlayerLooper` owns the
+/// queue (hence the empty `AVQueuePlayer`) and is what makes the wrap seamless
+/// — seek-to-zero on `didPlayToEndTime` hitches every cycle.
 struct LoopingVideoView: NSViewRepresentable {
     let url: URL
-    /// Fill the frame (cropping) or fit inside it. A demo of a UI is usually
-    /// `.resizeAspect` — cropping a screen recording cuts off the thing being
-    /// demonstrated.
     var gravity: AVLayerVideoGravity = .resizeAspect
 
     func makeNSView(context: Context) -> NSView {
-        let view = PlayerContainerView()
-        let item = AVPlayerItem(url: url)
-        let queue = AVQueuePlayer(items: [item])
-        queue.isMuted = true
-        queue.actionAtItemEnd = .advance
-        // Held on the coordinator: an AVPlayerLooper that nobody retains stops
-        // looping the moment it is collected, which reads as "the video played
-        // once and froze".
-        context.coordinator.looper = AVPlayerLooper(player: queue, templateItem: item)
-        context.coordinator.player = queue
+        let player = AVQueuePlayer()
+        player.isMuted = true
+        // Held by the coordinator: a looper nobody retains stops looping when
+        // it is collected, which reads as "played once and froze".
+        context.coordinator.looper = AVPlayerLooper(player: player,
+                                                    templateItem: AVPlayerItem(url: url))
+        context.coordinator.player = player
 
-        let layer = AVPlayerLayer(player: queue)
+        let view = PlayerContainerView()
+        view.wantsLayer = true
+        let layer = AVPlayerLayer(player: player)
         layer.videoGravity = gravity
         view.playerLayer = layer
-        view.wantsLayer = true
         view.layer?.addSublayer(layer)
-        queue.play()
+        player.play()
         return view
     }
 
     func updateNSView(_ nsView: NSView, context: Context) {
-        context.coordinator.player?.isMuted = true
         (nsView as? PlayerContainerView)?.playerLayer?.videoGravity = gravity
     }
 
@@ -61,17 +48,15 @@ struct LoopingVideoView: NSViewRepresentable {
         var looper: AVPlayerLooper?
     }
 
-    /// The layer has to be resized by hand: a sublayer added to a view's layer
-    /// gets no autoresizing, so without this the video stays at its birth size
-    /// while the panel around it grows.
+    /// A sublayer gets no autoresizing, so the layer is sized by hand or it
+    /// stays at its birth size while the panel grows. Actions disabled: the
+    /// implicit animation makes it chase the view during a live resize.
     final class PlayerContainerView: NSView {
         var playerLayer: AVPlayerLayer?
 
         override func layout() {
             super.layout()
             CATransaction.begin()
-            // The implicit animation makes the layer chase the view a frame
-            // behind during a live window resize.
             CATransaction.setDisableActions(true)
             playerLayer?.frame = bounds
             CATransaction.commit()
@@ -79,23 +64,25 @@ struct LoopingVideoView: NSViewRepresentable {
     }
 }
 
-/// Where a bundled non-image asset lives, across the three shapes this app is
-/// built in: a signed .app, an SPM resource bundle, and a dev build running
-/// from source. Mirrors `WelcomeView.loadBundledImage`'s candidate list — the
-/// two are the same question asked about different file types.
+/// Where a bundled asset lives, across the three shapes this app is built in: a
+/// signed .app, an SPM resource bundle, and a dev build running from source.
+/// ONE lookup — `WelcomeView` and the menu-bar icon had their own copies, and
+/// the dev branch of one pointed at `app/<name>` instead of the Resources
+/// folder, which is why a stray duplicate asset had to sit there to satisfy it.
 enum BundledAsset {
     static func url(_ name: String) -> URL? {
-        let candidates: [URL?] = [
+        let candidates = [
             Bundle.main.resourceURL?.appendingPathComponent(name),
             Bundle.main.bundleURL.appendingPathComponent("MLXCore_MLXCore.bundle/Resources/\(name)"),
             URL(fileURLWithPath: #filePath)
-                .deletingLastPathComponent()          // Views
-                .deletingLastPathComponent()          // MLXServe
+                .deletingLastPathComponent()   // Views
+                .deletingLastPathComponent()   // MLXServe
                 .appendingPathComponent("Resources/\(name)"),
         ]
-        for case let url? in candidates where FileManager.default.fileExists(atPath: url.path) {
-            return url
-        }
-        return nil
+        return candidates.compactMap { $0 }.first { FileManager.default.fileExists(atPath: $0.path) }
+    }
+
+    static func image(_ name: String) -> NSImage? {
+        url(name).flatMap { NSImage(contentsOf: $0) }
     }
 }

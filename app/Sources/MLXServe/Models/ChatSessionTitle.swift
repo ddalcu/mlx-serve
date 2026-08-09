@@ -47,7 +47,7 @@ enum ChatSessionTitle {
     /// load-time migration could, and it self-corrects in both directions if a
     /// thread's agent is set or cleared.
     static func display(title: String, agentName: String?) -> String {
-        if let named = trimmedName(agentName) { return named }
+        if let named = agentName?.trimmedNonEmpty { return named }
         return isPlaceholder(title) ? placeholder(hasAgent: agentName != nil) : title
     }
 
@@ -61,18 +61,8 @@ enum ChatSessionTitle {
     /// title line) and nil for a thread that hasn't said anything yet, since a
     /// caption repeating the placeholder says nothing twice.
     static func subject(title: String, agentName: String?) -> String? {
-        guard trimmedName(agentName) != nil, !isPlaceholder(title) else { return nil }
-        let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? nil : trimmed
-    }
-
-    /// An agent whose name is blank (half-saved, or mid-rename) can't name a
-    /// row — the caller falls back to the placeholder rather than drawing an
-    /// empty one.
-    private static func trimmedName(_ name: String?) -> String? {
-        guard let name else { return nil }
-        let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? nil : trimmed
+        guard agentName?.trimmedNonEmpty != nil else { return nil }
+        return isPlaceholder(title) ? nil : title.trimmedNonEmpty
     }
 
     /// The title a first user message earns the thread.
@@ -86,5 +76,15 @@ enum ChatSessionTitle {
         // measure and tested on another puts an ellipsis on a title that fits.
         guard trimmed.count > limit else { return trimmed }
         return String(trimmed.prefix(limit)) + "..."
+    }
+}
+
+extension String {
+    /// Trimmed, or nil when that leaves nothing. Blank is not a value: a
+    /// half-saved agent name can't title a row and an empty brief can't caption
+    /// one, so every such field goes through here.
+    var trimmedNonEmpty: String? {
+        let t = trimmingCharacters(in: .whitespacesAndNewlines)
+        return t.isEmpty ? nil : t
     }
 }

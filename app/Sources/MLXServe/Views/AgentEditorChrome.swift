@@ -1,41 +1,27 @@
 import SwiftUI
 
-/// The Agents editor's geometry — ONE source of truth for the numbers that have
-/// to agree across a column of independently-written sections.
+/// The Agents editor's geometry — one source of truth for numbers that must
+/// agree across independently-written sections.
 ///
-/// These used to belong to a grouped `Form`, which was the problem: a Form owns
-/// the card radius, the row insets, the label typography and the section
-/// spacing, so none of it could be specified, and it right-aligns a TextField's
-/// text — which put the agent's own NAME hard against the trailing edge of its
-/// field. Owning the numbers means they can now drift, so the relationships
-/// between them are pinned by `AgentEditorLayoutTests` rather than left as
-/// literals scattered through a view body.
-///
-/// Derived from the design frame (Figma `agents-config-panel`), retyped to
-/// macOS control sizes: the frame is drawn in Inter at web scale, where 14pt
-/// body reads as SF 13 — so the geometry is the frame's and the type is the
-/// platform's semantic scale (`.title3` section titles, `.headline` labels,
-/// `.subheadline` captions), which is also the only way this survives a
-/// Dynamic Type change.
+/// They used to belong to a grouped `Form`, which owned the radii, insets,
+/// label typography and section spacing — and right-aligns a TextField's text,
+/// which put the agent's own name against the trailing edge of its field.
+/// Owning them means they can drift, so the relationships are pinned by
+/// `AgentEditorLayoutTests`. Geometry is the design frame's; type is the
+/// platform's semantic scale, which is what survives a Dynamic Type change.
 enum AgentEditorMetrics {
-    /// Column edge → content. The frame's 32 at 861pt wide; the detail column
-    /// here can be half that, where 32 is a sixth of the width.
+    /// Column edge → content.
     static let contentPadding: CGFloat = 24
 
-    /// The reading measure, the same idea as `ChatMetrics.contentMaxWidth`: a
-    /// form field run the whole way across a 1400pt window is a field you scan
-    /// rather than read, and the frame's own content is 797pt wide.
+    /// The reading measure (cf. `ChatMetrics.contentMaxWidth`).
     static let contentMaxWidth: CGFloat = 760
 
     /// Between one section and the next.
     static let sectionSpacing: CGFloat = 24
-    /// Between a label (or a section title) and the thing it names. Strictly
-    /// less than `sectionSpacing`, or the column reads as one undifferentiated
-    /// list of settings — which is exactly what it did.
+    /// Label → the thing it names. Strictly less than `sectionSpacing`.
     static let labelSpacing: CGFloat = 12
 
-    /// Every card in the editor: the surface a group of related controls sits
-    /// on.
+    /// Every card in the editor.
     static let cardRadius: CGFloat = 16
     static let cardPadding: CGFloat = 18
     /// Between rows inside one card.
@@ -46,25 +32,15 @@ enum AgentEditorMetrics {
     static let wellRadius: CGFloat = 12
     static let wellPadding: CGFloat = 10
 
-    /// The prompt editor's floor. It is the one field you write paragraphs in.
+    /// The prompt editor's floor — the one field you write paragraphs in.
     static let promptMinHeight: CGFloat = 132
 
-    /// The symbol, and the card it sits in beside the name.
+    /// The symbol, and the card beside the name.
     static let avatarSize: CGFloat = 44
     static let avatarPadding: CGFloat = 12
 
-    /// The primary action. Sized rather than stretched: a full-width button
-    /// reads as a bar, and this one sits in the flow of the column.
+    /// Sized, not stretched: a full-width button reads as a bar.
     static let primaryMaxWidth: CGFloat = 260
-
-    /// The column's actual width for a given available width — the measure, or
-    /// what the window gives minus its padding when that is narrower. Never
-    /// non-positive: a negative frame width is a crash in some SwiftUI
-    /// containers and a silently invisible column in the rest, and layout does
-    /// report zero.
-    static func columnWidth(available: CGFloat) -> CGFloat {
-        max(1, min(contentMaxWidth, available - contentPadding * 2))
-    }
 }
 
 // MARK: - Surfaces

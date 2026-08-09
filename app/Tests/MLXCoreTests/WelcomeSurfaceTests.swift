@@ -25,8 +25,13 @@ final class WelcomeSurfaceTests: XCTestCase {
     func testEverySurfaceHasCopyAndAnIcon() {
         for surface in WelcomeSurface.ordered {
             XCTAssertFalse(surface.title.isEmpty, "\(surface) needs a title")
-            XCTAssertFalse(surface.caption.isEmpty, "\(surface) needs a caption")
             XCTAssertFalse(surface.icon.isEmpty, "\(surface) needs an SF Symbol")
+        }
+        // Only Terminal has no constant caption: its line is live, and a copy
+        // here would be a second one that silently stops matching.
+        XCTAssertNil(WelcomeSurface.terminal.caption)
+        for surface in WelcomeSurface.ordered where surface != .terminal {
+            XCTAssertNotNil(surface.caption, "\(surface) needs a caption")
         }
     }
 

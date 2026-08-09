@@ -7,18 +7,15 @@ struct WelcomeView: View {
     /// one-time snapshot taken when the window is shown (this window isn't
     /// live-updating), not a reactive binding.
     let hasChatModels: Bool
-    /// Calls `AppState.showModels()` — this window is a bare
-    /// `NSHostingView` outside the SwiftUI Scene graph, so it can't call
-    /// `openWindow` itself.
+    /// Calls `AppState.showModels()`.
     let onOpenModelBrowser: () -> Void
     /// Bumps `AppState.pendingChatOpenTick`, same bridge. Fired on dismiss and
     /// once the starter download has the server up — the window's job is to end
     /// in a chat, not in a closed window.
     let onOpenChat: () -> Void
 
-    /// The downloads/app state the starter card drives. Injected as environment
-    /// objects by `AppState.showWelcomeWindow` (an `NSHostingView` gets none by
-    /// default).
+    /// Injected AT THE SHEET (see the chat scene) — a sheet does not inherit
+    /// the environment of the view it hangs on.
     @EnvironmentObject var appState: AppState
     /// For the live memory meter (GPU bar shows when a model is loaded).
     @EnvironmentObject var server: ServerManager
@@ -36,25 +33,9 @@ struct WelcomeView: View {
     @State private var cliInstalling = false
     @State private var cliError: String?
 
-    private static func loadBundledImage(_ name: String) -> NSImage? {
-        let candidates: [URL?] = [
-            Bundle.main.resourceURL?.appendingPathComponent(name),
-            Bundle.main.bundleURL.appendingPathComponent("MLXCore_MLXCore.bundle/Resources/\(name)"),
-            // Dev builds: look relative to source
-            URL(fileURLWithPath: #filePath)
-                .deletingLastPathComponent().deletingLastPathComponent()
-                .deletingLastPathComponent().deletingLastPathComponent()
-                .appendingPathComponent(name),
-        ]
-        for case let url? in candidates {
-            if let img = NSImage(contentsOf: url) { return img }
-        }
-        return nil
-    }
-
     /// The white monochrome mark (not the colored app icon) — reads cleanly on
     /// the dark welcome surface.
-    private static let logoImage: NSImage? = loadBundledImage("mlx-white.png")
+    private static let logoImage: NSImage? = BundledAsset.image("mlx-white.png")
 
     /// Derived from `UpdateChecker.repo` (the app's single source of truth
     /// for the GitHub repo) so the star link can never drift from it.
@@ -62,11 +43,8 @@ struct WelcomeView: View {
 
     // MARK: - Layout constants
 
-    // The window is sized from `NSHostingView.fittingSize`, so pinning BOTH
-    // dimensions here makes that size deterministic (a flexible dimension in a
-    // `.fixedSize` context yields a degenerate fitting size and the window
-    // never appears). With the frame fixed, the interior is free to use
-    // flexible/centered layout.
+    // Both dimensions are pinned so the sheet has a deterministic size; the
+    // interior is free to use flexible/centered layout inside it.
     private static let windowWidth: CGFloat = 850
     private static let windowHeight: CGFloat = 550
     private static let leftColumnWidth: CGFloat = 292
@@ -127,9 +105,8 @@ struct WelcomeView: View {
     /// The ONE way out of this window. Chat is opened first so that when Browse
     /// also opens the Model Browser, the browser lands in front of a chat
     /// window that's already there — closing it drops the user on a composer
-    /// instead of an empty desktop (`WelcomeExit`, live dead end 2026-08-08).
-    /// The window is closed last: it is `.floating`, so anything opened while
-    /// it is still up renders behind it.
+    /// instead of an empty desktop (`WelcomeExit`, live dead end 2026-08-08 —
+    /// unbuildable now that this is a sheet ON the chat window).
     private func leave(_ exit: WelcomeExit) {
         if exit.opensChat { onOpenChat() }
         if exit.opensModelBrowser { onOpenModelBrowser() }
@@ -306,15 +283,14 @@ struct WelcomeView: View {
         .background(RoundedRectangle(cornerRadius: 10).fill(Color.primary.opacity(0.05)))
     }
 
-    /// The Terminal row's caption is live (where the link would go, whether a
-    /// password is needed, any failure); the other two are constants.
+    /// Terminal has no constant caption — its line is live (`cliCaption`).
     private func caption(for surface: WelcomeSurface) -> String {
-        surface.shipsWithTheApp ? surface.caption : cliCaption
+        surface.caption ?? cliCaption
     }
 
     private func captionStyle(for surface: WelcomeSurface) -> AnyShapeStyle {
-        if !surface.shipsWithTheApp, cliError != nil { return AnyShapeStyle(Color.red) }
-        return AnyShapeStyle(.secondary)
+        surface.caption == nil && cliError != nil
+            ? AnyShapeStyle(Color.red) : AnyShapeStyle(.secondary)
     }
 
     /// Stated, not offered: these two are the app itself.
